@@ -656,6 +656,27 @@ impl ReclaimQueue {
     /// entry — "entered the reclaim engine" — so the field ledger's
     /// `queued ≡ displaced blocks` identity holds in all arms.
     pub async fn enqueue(self: &Arc<Self>, entry: ReclaimEntry) {
+        // DLM S5 (spec §6.8 item 1 / §6.3's "Reclaim and discard"
+        // obligation): "offsets stay non-reallocatable until reclaimed" is
+        // a PER-PROCESS invariant about SHARED hardware. A reader's
+        // reclaimer would issue `BLKDISCARD` / `PUNCH_HOLE` against ranges
+        // the live writer owns — the one hazard in the whole reader
+        // surface that destroys data rather than merely reading it stale.
+        // Nothing is ever queued on a read-only mount, and the queue is
+        // latched halted at arm (`ro_coherence::arm_reader_data_plane`) so
+        // a straggler entry from a racing teardown cannot issue either.
+        //
+        // Deliberately BEFORE the `queued` counter: the ledger identity is
+        // "queued ≡ displaced blocks", and a reader displaces none.
+        if crate::fuse_client::read_only_mount() {
+            log::error!(
+                "{}",
+                crate::fuse_client::read_only_refusal("device reclaim (discard/punch)")
+            );
+            self.halt_device_reclaims();
+            drop(entry);
+            return;
+        }
         METRICS
             .block_free_reclaim_queued
             .fetch_add(1, Ordering::Relaxed);

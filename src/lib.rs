@@ -86,6 +86,9 @@ pub(crate) mod placed_core;
 pub(crate) mod placed_sever;
 pub mod read_lane;
 pub(crate) mod refcount_core;
+/// DLM stage S5 — read-only coherent mounts (reader revalidation cadence,
+/// purge-on-revalidation, the node-cache revalidation seam).
+pub mod ro_coherence;
 pub mod routing;
 
 #[macro_export]

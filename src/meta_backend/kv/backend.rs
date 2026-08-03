@@ -668,9 +668,17 @@ pub struct KvMetaBackend {
     /// Deferred-mode flush flag: commits set it; the checkpoint task's
     /// tick barrier clears it (the v2 flusher discipline).
     needs_flush: AtomicBool,
-    /// The §4.11 unknown-`features_ro` write gate (K6a hand-off): reads
-    /// serve, every mutation is withheld.
+    /// The write gate (K6a hand-off): reads serve, every mutation is
+    /// withheld. Two causes reach it — see [`ReadOnlyCause`].
     read_only: bool,
+    /// WHY this volume is read-only. The write gate and the guarantee-class
+    /// row both need to tell a §4.11 forward-compatibility degradation
+    /// (unknown `features_ro` bits — an accident of the format) apart from
+    /// an operator-requested **reader mount** (`-o ro` / `--read-only`,
+    /// DLM S5): the refusal texts differ, the guard classes differ
+    /// (`flock` vs `reader`), and conflating them is how a reader would end
+    /// up reported as a guarded writer.
+    ro_cause: ReadOnlyCause,
     /// §4.4 pt 4 fail-stop latch + its consecutive-failure counter.
     failed: AtomicBool,
     journal_failures: AtomicU64,
@@ -1094,6 +1102,89 @@ impl KvMetaBackend {
         Ok(be)
     }
 
+    /// **DLM stage S5 — open one volume as a READER** (`-o ro` /
+    /// `--read-only`; pre-RC engineering spec §6.8 item 1, §6.9 S5).
+    ///
+    /// §6.4 verified why this could not exist before: [`Self::open`] takes
+    /// `flock(LOCK_EX | LOCK_NB)` **unconditionally, before any read/write
+    /// classification**, and the only thing that ever set `read_only` was
+    /// `sb.unknown_ro() != 0` — a forward-compatibility degradation, not a
+    /// mount option. Cross-host, a would-be reader was additionally refused
+    /// `FreshForeign` by the D0 Layer-B2 gate.
+    ///
+    /// What this open does, and what it deliberately does NOT do:
+    ///
+    /// | Step of [`Self::open`] | Reader |
+    /// |---|---|
+    /// | Layer A `flock(LOCK_EX)` | **not taken.** `flock(LOCK_SH)` runs as a released probe (classification only — [`Self::probe_shared_lock`]) |
+    /// | DUR-5 primary-superblock repair | **skipped** — it WRITES sector 0 |
+    /// | Bootstrap replay (SB → ledger → bitmap → RAM journal replay) | same, verbatim (torn-tolerant, read-only by construction) |
+    /// | Layer B2 claim classification (`FreshForeign` refusal) | **bypassed** — a reader cannot conflict with a writer it never writes against |
+    /// | Layer B1 PR register + Write-Exclusive acquire | **not performed** — no registrant appears on the namespace |
+    /// | `writer_claim` commit + barrier | **never written** |
+    /// | checkpoint + times-drain tasks | **not spawned** (both write) |
+    ///
+    /// The result is a mount that is *orthogonal* to D0 rather than a hole
+    /// in it: the writer's ladder is byte-identical, a second writer is
+    /// still refused, and N readers coexist with each other and with the
+    /// writer. Its guarantee class is its own row —
+    /// [`Self::writer_guard_mode`] returns `"reader"`.
+    ///
+    /// **Consistency model** (stated, never implied — §6.12): this mount
+    /// serves the metadata snapshot its bootstrap read, and
+    /// [`crate::ro_coherence`] polls the A/B root ledger at the checkpoint
+    /// cadence to detect the writer advancing. Readers therefore lag by at
+    /// most one checkpoint interval **once the node-cache revalidation arm
+    /// lands** (§6.8 item 2, `feat/mw-node-cache-coherence`); until then
+    /// the metadata view is frozen at mount time and the mount says so
+    /// loudly. See `docs/operations.md` §Read-only coherent mounts.
+    pub async fn open_read_only(path: &Path) -> std::result::Result<Arc<Self>, KvError> {
+        match Self::probe_shared_lock(path) {
+            SharedProbe::LocalExclusiveHolder => log::info!(
+                "meta volume {}: read-only mount — a LOCAL exclusive holder (write mount or \
+                 guarded offline verb) holds this volume; the reader takes no lock and \
+                 refuses nothing",
+                path.display()
+            ),
+            SharedProbe::NoLocalExclusiveHolder => log::info!(
+                "meta volume {}: read-only mount — no local exclusive holder (the writer, if \
+                 any, is on another host)",
+                path.display()
+            ),
+            SharedProbe::Unknown => {}
+        }
+        let mut inner = Self::open_inner(path).await?;
+        // The mount-option cause OVERRIDES the §4.11 one only in its
+        // reporting: `read_only` is already true when unknown-ro bits are
+        // present, and a reader is read-only either way.
+        inner.read_only = true;
+        inner.ro_cause = ReadOnlyCause::ReaderMount;
+        let be = Arc::new(inner);
+        // PR M7: no commit can ever run here, but the conveyor identity is
+        // part of construction (a commit without it fails loud, never UB).
+        let _ = be.conveyor_self.set(Arc::downgrade(&be));
+        be.trace_guard_event("reader_admitted");
+        log::warn!(
+            "meta volume {}: mounted READ-ONLY (DLM S5). No writer_claim, no NVMe \
+             reservation, no checkpoint task — this mount cannot and will not write. \
+             Guarantee class: {}",
+            path.display(),
+            be.writer_guard_mode()
+        );
+        Ok(be)
+    }
+
+    /// Whether this volume withholds mutations, and why.
+    pub fn read_only_cause(&self) -> ReadOnlyCause {
+        self.ro_cause
+    }
+
+    /// Whether this volume withholds every mutation (a reader mount, or the
+    /// §4.11 unknown-ro-feature-bits degradation).
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
     async fn open_inner(path: &Path) -> std::result::Result<Self, KvError> {
         let t0 = std::time::Instant::now();
 
@@ -1463,6 +1554,13 @@ impl KvMetaBackend {
         };
         let strict = crate::meta_backend::resolve_flush_interval_ms() == 0;
         let read_only = sb.unknown_ro() != 0;
+        // DLM S5: `open_read_only` re-stamps this to `ReaderMount`. Here it
+        // can only be the §4.11 degradation (or writable).
+        let ro_cause = if read_only {
+            ReadOnlyCause::UnknownRoFeatureBits
+        } else {
+            ReadOnlyCause::Writable
+        };
         let layout_deltas_stamped =
             sb.features_incompat & super::superblock::FEATURE_INCOMPAT_KV_LAYOUT_DELTAS != 0;
         // DLM S2 (bit 7, presence OPTIONAL): un-stamped volumes keep the
@@ -1516,6 +1614,7 @@ impl KvMetaBackend {
             strict,
             needs_flush: AtomicBool::new(false),
             read_only,
+            ro_cause,
             failed: AtomicBool::new(false),
             journal_failures: AtomicU64::new(0),
             stalls: AtomicU64::new(0),
@@ -2839,6 +2938,40 @@ enum FlockOutcome {
     Io(std::io::Error),
 }
 
+/// Why a mounted volume withholds mutations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadOnlyCause {
+    /// Writable (the write gate passes).
+    Writable,
+    /// §4.11: the superblock carries unknown read-only feature bits — a
+    /// forward-compatibility degradation of a WRITE mount (Layer A is
+    /// still held; no claim is written because this mount cannot advance
+    /// the journal).
+    UnknownRoFeatureBits,
+    /// DLM S5: an operator-requested **reader mount** (`-o ro` /
+    /// `--read-only`). Takes no Layer-A lock, writes no `writer_claim`,
+    /// registers no PR key, spawns no checkpoint task — and therefore
+    /// neither weakens nor blocks the single-writer guard.
+    ReaderMount,
+}
+
+/// The reader's Layer-A classification (DLM S5). `flock(LOCK_SH)` is taken
+/// as a PROBE and released immediately — see
+/// [`KvMetaBackend::probe_shared_lock`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedProbe {
+    /// No exclusive holder on this host: no local write mount, no offline
+    /// guarded verb running.
+    NoLocalExclusiveHolder,
+    /// An exclusive holder (a local write mount, `claim clear`, `format`,
+    /// …) holds the volume on this host. Purely informational for a
+    /// reader — it changes nothing about what the reader may do.
+    LocalExclusiveHolder,
+    /// The probe itself could not run (permissions, I/O). Never fatal: a
+    /// reader's admission does not depend on it.
+    Unknown,
+}
+
 /// Compose the `(claim: id=…, pid=…, boot=…, age=…s)` holder suffix for
 /// refusal messages (design §6: refusals name the holder).
 fn holder_suffix(holder: &Option<(WriterClaim, u64)>) -> String {
@@ -2919,6 +3052,66 @@ impl KvMetaBackend {
             });
         }
         Ok(fd)
+    }
+
+    /// **DLM S5 — the reader's Layer-A probe** (`flock(LOCK_SH | LOCK_NB)`,
+    /// spec §6.8 item 1).
+    ///
+    /// Taken and **released immediately**: the reader retains no lock for
+    /// the mount's lifetime. That is the whole design decision, and it is
+    /// deliberate — a RETAINED `LOCK_SH` conflicts with the writer's
+    /// `LOCK_EX`, so an attached reader would refuse a legitimate write
+    /// mount on the same host (and, order-reversed, a write mount would
+    /// refuse every local reader). The D0 guarantee is that a second
+    /// **writer** is refused; a reader must be ORTHOGONAL to it, not a hole
+    /// in it and not a tax on it. A reader mutates no plane, so it needs no
+    /// exclusion and grants none — pinned by
+    /// `tests/readonly_mount_tests.rs::a_reader_never_refuses_a_writer_mount`.
+    ///
+    /// What the probe still buys, and why it is not merely skipped: the
+    /// shared-mode acquisition is the ONE local question a reader can
+    /// answer for free — whether an exclusive holder (a write mount, or an
+    /// offline guarded verb like `format` / `claim clear`) is running on
+    /// THIS host. That classification goes in the mount log beside the
+    /// guarantee class, so an operator reading a reader's log knows whether
+    /// the writer it lags behind is local or remote.
+    fn probe_shared_lock(path: &Path) -> SharedProbe {
+        let fd = match std::fs::OpenOptions::new().read(true).open(path) {
+            Ok(fd) => fd,
+            Err(e) => {
+                log::warn!(
+                    "{}: read-only mount could not open the volume for the shared-lock \
+                     probe ({e}) — proceeding (a reader's admission never depends on it)",
+                    path.display()
+                );
+                return SharedProbe::Unknown;
+            }
+        };
+        // SAFETY: flock on an owned, open fd; NB never blocks. LOCK_UN
+        // below releases before the fd is dropped, so nothing of this
+        // probe outlives the call — no lock is retained.
+        let rc = unsafe {
+            libc::flock(
+                std::os::fd::AsRawFd::as_raw_fd(&fd),
+                libc::LOCK_SH | libc::LOCK_NB,
+            )
+        };
+        if rc != 0 {
+            let e = std::io::Error::last_os_error();
+            return if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                SharedProbe::LocalExclusiveHolder
+            } else {
+                SharedProbe::Unknown
+            };
+        }
+        // SAFETY: same owned fd; releasing a lock we hold.
+        unsafe {
+            libc::flock(
+                std::os::fd::AsRawFd::as_raw_fd(&fd),
+                libc::LOCK_UN | libc::LOCK_NB,
+            );
+        }
+        SharedProbe::NoLocalExclusiveHolder
     }
 
     /// Layer A teardown-race absorption (2026-07-26; pinned by
@@ -3386,10 +3579,20 @@ impl KvMetaBackend {
     /// The guarantee class this volume actually mounted with
     /// (`writer_guard_mode` on the stats surface, design §9):
     /// `"flock+pr"` (PR-capable namespace — enforcement-grade cross-host),
-    /// `"flock+claim"` (detection-grade cross-host), `"flock"` (read-only
-    /// mount: no claim is written), or `"unguarded"` (probe backends —
-    /// never mounted, never in stats).
+    /// `"flock+claim"` (detection-grade cross-host), `"flock"` (a WRITE
+    /// mount degraded read-only by unknown-ro feature bits: Layer A held,
+    /// no claim written), **`"reader"`** (DLM S5 `-o ro`: no lock retained,
+    /// no claim, no PR registrant — orthogonal to the writer's exclusion,
+    /// see `docs/operations.md` §Read-only coherent mounts), or
+    /// `"unguarded"` (probe backends — never mounted, never in stats).
     pub fn writer_guard_mode(&self) -> &'static str {
+        // The reader row is decided by CAUSE, not by lock state: it holds
+        // no lock by design, and reporting it as `unguarded` (the probe
+        // class) would hide a live, FUSE-serving mount inside a class that
+        // means "not a mount at all".
+        if self.ro_cause == ReadOnlyCause::ReaderMount {
+            return "reader";
+        }
         let guarded = self.guard_fd.lock().unwrap().is_some();
         match (guarded, &self.reservations) {
             (false, _) => "unguarded",
@@ -4096,12 +4299,22 @@ impl KvMetaBackend {
     /// fail-stop, shutdown refusal).
     fn write_gate(&self) -> Result<()> {
         if self.read_only {
-            return Err(crate::error::SqueezefsError::InvalidOperation(format!(
-                "meta volume {} carries unknown read-only feature bits {:#x}: mounted \
-                 read-only (§4.11); mutations withheld",
-                self.path.display(),
-                self.sb.unknown_ro()
-            )));
+            return Err(match self.ro_cause {
+                // DLM S5: the operator asked for a reader. The refusal
+                // names the surface that produced it, so an application
+                // error is traceable to the mount option and not to a
+                // format accident.
+                ReadOnlyCause::ReaderMount => crate::fuse_client::read_only_refusal(&format!(
+                    "metadata mutation on meta volume {}",
+                    self.path.display()
+                )),
+                _ => crate::error::SqueezefsError::InvalidOperation(format!(
+                    "meta volume {} carries unknown read-only feature bits {:#x}: mounted \
+                     read-only (§4.11); mutations withheld",
+                    self.path.display(),
+                    self.sb.unknown_ro()
+                )),
+            });
         }
         if self.is_failed() {
             return Err(self.eio(

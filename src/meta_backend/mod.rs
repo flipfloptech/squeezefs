@@ -208,7 +208,7 @@ pub(crate) fn v2_unsupported_error(path: &str) -> crate::error::SqueezefsError {
 pub async fn open_volume_for_mount(
     path: &str,
 ) -> Result<std::sync::Arc<kv::backend::KvMetaBackend>> {
-    open_volume_gated(path, false).await
+    open_volume_gated(path, OpenMode::Write).await
 }
 
 /// [`open_volume_for_mount`]'s **read-only probe** twin (same version-gate
@@ -216,12 +216,38 @@ pub async fn open_volume_for_mount(
 /// nothing is ever written — the bootstrap config read and status paths
 /// use it and drop the backend when done.
 pub async fn open_volume_probe(path: &str) -> Result<std::sync::Arc<kv::backend::KvMetaBackend>> {
-    open_volume_gated(path, true).await
+    open_volume_gated(path, OpenMode::Probe).await
+}
+
+/// **DLM S5** — [`open_volume_for_mount`]'s **reader** twin (`-o ro` /
+/// `--read-only`, pre-RC engineering spec §6.8 item 1): the same version
+/// gate, the same bootstrap + RAM replay, but no Layer-A `LOCK_EX`, no
+/// claim gate (so no `FreshForeign` refusal), no PR registration, no
+/// superblock repair and no checkpoint task. Unlike
+/// [`open_volume_probe`] this mount LATCHES read-only, so every mutation
+/// refuses loud for the mount's whole life instead of relying on the
+/// caller to drop the handle.
+pub async fn open_volume_read_only(
+    path: &str,
+) -> Result<std::sync::Arc<kv::backend::KvMetaBackend>> {
+    open_volume_gated(path, OpenMode::ReadOnlyMount).await
+}
+
+/// How [`open_volume_gated`] opens a version-gated volume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenMode {
+    /// The D0-guarded write mount.
+    Write,
+    /// A transient read-only probe (no latch, no tasks — the caller drops
+    /// it when done).
+    Probe,
+    /// DLM S5: a read-only MOUNT (latched, serves FUSE for its lifetime).
+    ReadOnlyMount,
 }
 
 async fn open_volume_gated(
     path: &str,
-    probe: bool,
+    mode: OpenMode,
 ) -> Result<std::sync::Arc<kv::backend::KvMetaBackend>> {
     match kv::superblock::classify_volume(std::path::Path::new(path)).await? {
         kv::superblock::VolumeFormat::Blank => {
@@ -233,10 +259,10 @@ async fn open_volume_gated(
         kv::superblock::VolumeFormat::V2Legacy => Err(v2_unsupported_error(path)),
         kv::superblock::VolumeFormat::V3(_) => {
             let p = std::path::Path::new(path);
-            Ok(if probe {
-                kv::backend::KvMetaBackend::open_probe(p).await?
-            } else {
-                kv::backend::KvMetaBackend::open(p).await?
+            Ok(match mode {
+                OpenMode::Probe => kv::backend::KvMetaBackend::open_probe(p).await?,
+                OpenMode::ReadOnlyMount => kv::backend::KvMetaBackend::open_read_only(p).await?,
+                OpenMode::Write => kv::backend::KvMetaBackend::open(p).await?,
             })
         }
     }
@@ -296,6 +322,37 @@ pub async fn open_routed_meta_set(paths: &[String]) -> Result<std::sync::Arc<Rou
     Ok(std::sync::Arc::new(
         RoutedMetaBackend::with_slot_map_and_natives(
             backends,
+            disc.routing_width,
+            disc.slot_to_volume,
+            disc.native_slots,
+        )?,
+    ))
+}
+
+/// **DLM S5** — [`open_routed_meta_set`]'s **reader** twin (`-o ro` /
+/// `--read-only`): the same §5.5.1a stamp discovery, the same canonical
+/// member ordering and slot-map validation, opened through
+/// [`open_volume_read_only`] per volume.
+///
+/// No guard is taken on any member, so there is nothing to release on a
+/// mid-set failure — the whole rollback ladder
+/// [`open_meta_volume_set`] needs is structurally absent for a reader.
+pub async fn open_routed_meta_set_read_only(
+    paths: &[String],
+) -> Result<std::sync::Arc<RoutedMetaBackend>> {
+    let disc = discover_meta_set(paths).await?;
+    validate_slot_map(
+        disc.ordered_paths.len(),
+        disc.routing_width,
+        &disc.slot_to_volume,
+    )?;
+    let mut vols = Vec::with_capacity(disc.ordered_paths.len());
+    for path in &disc.ordered_paths {
+        vols.push(open_volume_read_only(path).await?);
+    }
+    Ok(std::sync::Arc::new(
+        RoutedMetaBackend::with_slot_map_and_natives(
+            vols,
             disc.routing_width,
             disc.slot_to_volume,
             disc.native_slots,

@@ -250,9 +250,32 @@ impl Default for KernelCacheTtls {
 }
 
 impl KernelCacheTtls {
-    /// Launch-time env knobs (milliseconds). Read once at filesystem
-    /// construction — never on the per-op path.
-    pub fn from_env() -> Self {
+    /// **DLM S5 item 4 — TTL alignment.** A reader's coherence horizon IS
+    /// the writer's checkpoint cadence (the reader revalidates against the
+    /// A/B root ledger, so it lags by at most one checkpoint interval), so
+    /// every kernel TTL class DERIVES from that cadence instead of the
+    /// write-mount 1 s default. Nothing is hardcoded and nothing is
+    /// clamped: strict mode (cadence 0 — checkpoint per commit) means the
+    /// kernel may cache nothing, which is the honest answer, and a long
+    /// cadence honestly lengthens the horizon it already has.
+    ///
+    /// These are DEFAULTS. Precedence is unchanged (the env-knob law):
+    /// derived default → `SQUEEZEFS_FUSE_*_TTL_MS` → `-o *_timeout=`, later
+    /// wins verbatim.
+    pub fn read_only_defaults(checkpoint_cadence: Duration) -> Self {
+        Self {
+            attr: checkpoint_cadence,
+            entry: checkpoint_cadence,
+            dir_entry: checkpoint_cadence,
+            negative: checkpoint_cadence,
+        }
+    }
+
+    /// Launch-time env knobs (milliseconds), over `base` as the default
+    /// set (the write mount passes [`Self::default`], a reader passes
+    /// [`Self::read_only_defaults`]). Read once at filesystem construction
+    /// — never on the per-op path.
+    pub fn from_env_over(base: Self) -> Self {
         fn env_ms(key: &str, default: Duration) -> Duration {
             std::env::var(key)
                 .ok()
@@ -260,13 +283,19 @@ impl KernelCacheTtls {
                 .map(Duration::from_millis)
                 .unwrap_or(default)
         }
-        let d = Self::default();
+        let d = base;
         Self {
             attr: env_ms("SQUEEZEFS_FUSE_ATTR_TTL_MS", d.attr),
             entry: env_ms("SQUEEZEFS_FUSE_ENTRY_TTL_MS", d.entry),
             dir_entry: env_ms("SQUEEZEFS_FUSE_DIR_ENTRY_TTL_MS", d.dir_entry),
             negative: env_ms("SQUEEZEFS_FUSE_NEGATIVE_TTL_MS", d.negative),
         }
+    }
+
+    /// [`Self::from_env_over`] with the write-mount defaults — the
+    /// historical spelling, unchanged for every write mount.
+    pub fn from_env() -> Self {
+        Self::from_env_over(Self::default())
     }
 
     /// Apply `-o` mount-option overrides (libfuse-style float seconds:
@@ -482,8 +511,125 @@ fn inplace_overwrite_cell() -> &'static std::sync::atomic::AtomicBool {
 
 /// Whether eligible full-block overwrites land in place (default false —
 /// substrate-measured; see `inplace_overwrite_cell`'s doc).
+///
+/// **DLM S5**: a read-only mount never overwrites anything, in place or
+/// otherwise — the latch wins over the knob (spec §6.8 item 6).
 pub fn inplace_overwrite_enabled() -> bool {
-    inplace_overwrite_cell().load(Ordering::Relaxed)
+    !read_only_mount() && inplace_overwrite_cell().load(Ordering::Relaxed)
+}
+
+// ---------------------------------------------------------------------------
+// DLM stage S5 — the read-only coherent mount latch
+// (pre-RC engineering spec §6.8 items 1/4/5/6, §6.9 S5)
+// ---------------------------------------------------------------------------
+
+/// The mount-wide read-only posture (`-o ro` / `--read-only`).
+///
+/// One process-global relaxed flag, exactly the `WRITE_VERIFICATION`
+/// convention and for the same reason: a daemon process serves ONE mount,
+/// the posture is fixed for the mount's whole life, and every write-path
+/// gate must be able to read it with `&self`-free, allocation-free,
+/// lock-free code from `block_allocator` / `block_reclaim` / the handler
+/// lanes. The cost on a WRITE mount is one relaxed load feeding a
+/// never-taken, perfectly-predicted branch — a reader feature must not tax
+/// writers (`benches/write_path_bench.rs`, group `ro_gate`).
+///
+/// This is deliberately NOT the metadata `read_only` latch: that one
+/// (`KvMetaBackend::write_gate`) covers the *metadata* plane and also
+/// fires for the §4.11 unknown-ro-feature-bits degradation. This latch is
+/// what extends the gate past metadata to the DATA plane — the block
+/// allocator, the reclaim queue, the W1 patch, the in-place-overwrite
+/// lever and `recover_active_blocks_v3`'s free-completing arm (spec §6.8
+/// item 1's list).
+static READ_ONLY_MOUNT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this mount is read-only (a **reader**: no leases, no claim, no
+/// mutation of any plane). Library code calls this rather than re-reading
+/// CLI/mount options — the `write_verification_enabled()` convention.
+#[inline]
+pub fn read_only_mount() -> bool {
+    READ_ONLY_MOUNT.load(Ordering::Relaxed)
+}
+
+/// Arm/disarm the read-only mount posture. Called ONCE from the mount
+/// path before any volume is opened (and by tests, which restore it).
+pub fn set_read_only_mount(on: bool) {
+    READ_ONLY_MOUNT.store(on, Ordering::Relaxed);
+}
+
+/// The standard refusal for a data-plane mutation attempted on a reader.
+/// One text, so every plane's refusal names the same cause and remedy.
+pub(crate) fn read_only_refusal(what: &str) -> crate::error::SqueezefsError {
+    crate::error::SqueezefsError::InvalidOperation(format!(
+        "{what} refused: this mount is read-only (`-o ro` / `--read-only` — DLM stage S5, \
+         one writer plus N coherent readers). A reader mutates no plane: no metadata, no \
+         block allocation, no frees, no device reclaim, no in-place patch. Mount without \
+         `-o ro` to write."
+    ))
+}
+
+/// The shipped daemon dentry/attr-cache horizon (`dir_entry_cache_v3`,
+/// `attr_cache` and the POSIX-4 parent memo all age out on it). A reader
+/// cuts it to the checkpoint cadence; a writer keeps it verbatim.
+pub const DAEMON_CACHE_TTL_SECS: u64 = 300;
+
+/// **DLM S5 item 4.** The daemon-side cache horizon for a READER:
+/// `dir_entry_cache_v3`'s 300 s TTL cut to the checkpoint cadence —
+/// "keyed on a process-local generation" is exactly the §6.3 obligation a
+/// second writer breaks, and the cadence is the interval the reader can
+/// actually prove freshness over.
+///
+/// Capped by the shipped horizon: a very large `--meta-flush-interval`
+/// (the "park the timer" idiom) must never LENGTHEN a cache beyond what a
+/// write mount ships with.
+pub fn reader_daemon_cache_ttl(checkpoint_cadence: Duration) -> Duration {
+    checkpoint_cadence.min(Duration::from_secs(DAEMON_CACHE_TTL_SECS))
+}
+
+/// **DLM S5 item 2's cadence** (the driver is [`crate::ro_coherence`]):
+/// how often a reader polls each volume's A/B root ledger. Derived from
+/// the writer's checkpoint cadence — the roots cannot advance faster than
+/// they are written — with a PHYSICAL floor: one 4 KiB device read per
+/// volume per pass, so strict mode (cadence 0) polls at the floor instead
+/// of spinning.
+pub fn reader_revalidate_interval(checkpoint_cadence: Duration) -> Duration {
+    /// Physical minimum: one 4 KiB ledger read per volume per pass.
+    const FLOOR: Duration = Duration::from_millis(10);
+    checkpoint_cadence.max(FLOOR)
+}
+
+/// Resolve the read-only posture for one mount from the CLI flag and the
+/// `-o` option string — ONE resolution point for both spellings (the
+/// `resolve_interception_posture` precedent).
+///
+/// `-o ro` is the kernel-conventional spelling and `--read-only` the CLI
+/// one; either arms the reader. An explicit `-o rw` combined with either
+/// is a contradiction and refuses LOUD rather than silently picking a
+/// side (the KD-11 writeback-conflict precedent).
+pub fn read_only_from_options(
+    custom_opts: Option<&str>,
+    cli_flag: bool,
+) -> std::result::Result<bool, String> {
+    let mut opt_ro = false;
+    let mut opt_rw = false;
+    if let Some(opts) = custom_opts {
+        for opt in opts.split(',') {
+            match opt.trim() {
+                "ro" => opt_ro = true,
+                "rw" => opt_rw = true,
+                _ => {}
+            }
+        }
+    }
+    let read_only = opt_ro || cli_flag;
+    if read_only && opt_rw {
+        return Err(
+            "mount option conflict: a read-only mount (`-o ro` / `--read-only`) cannot be \
+             combined with an explicit `-o rw`. Drop one of the two options."
+                .to_string(),
+        );
+    }
+    Ok(read_only)
 }
 
 /// TEST SEAM (`SQUEEZEFS_TEST_UPLOAD_STALL_MS`, Idea 2 —
@@ -3480,6 +3626,24 @@ pub struct Metrics {
     /// discards orphan active blocks", applied live instead of the
     /// NotFound retry spin (FIND-M11-A's second face).
     pub writeback_orphan_discards: Align64<AtomicU64>,
+    // ---- DLM S5: read-only coherent mounts (spec §6.8, `ro_coherence`) ----
+    /// Reader revalidation passes run (one 4 KiB root-ledger read per
+    /// volume per pass). Structurally 0 on a write mount.
+    pub ro_revalidate_passes: Align64<AtomicU64>,
+    /// Passes that observed the writer's roots ADVANCED past the snapshot
+    /// this reader serves — the staleness instrument. `epochs == 0` across
+    /// a window in which the writer is known to be committing means the
+    /// reader's poll is not seeing checkpoints (investigate before trusting
+    /// the one-interval lag claim).
+    pub ro_revalidate_epochs: Align64<AtomicU64>,
+    /// Block keys dropped by the §6.8 item-5 purge-on-revalidation pass —
+    /// the trigger's engagement gauge (`purge_block_key`, all five stores).
+    pub ro_purged_block_keys: Align64<AtomicU64>,
+    /// Nodes dropped by the §6.8 item-2 node-cache revalidation arm.
+    /// **0 while that arm is not installed** (`feat/mw-node-cache-
+    /// coherence`), which is exactly the signal that a reader's METADATA
+    /// view is frozen at mount time rather than lagging by one interval.
+    pub ro_node_cache_nodes_dropped: Align64<AtomicU64>,
     /// Copy-on-write duplications of an active-block accumulation buffer
     /// forced by a live reader snapshot (zero-copy write-path design §5.2).
     /// Sequential streams never pay this; spikes mean read/write contention
@@ -5049,22 +5213,35 @@ impl SqueezefsFilesystem {
         sys.refresh_memory();
         let total_memory = sys.total_memory();
         let dir_entry_capacity = std::cmp::max(50_000, total_memory / 200_000);
+        // DLM S5 item 4 — TTL alignment (spec §6.8: "`dir_entry_cache_v3`'s
+        // 300 s TTL cut to match"). §6.3 lists this cache first among the
+        // coherence obligations precisely because its TTL is 300 s and its
+        // key is a PROCESS-LOCAL generation: a reader's `dir_gen` never
+        // moves when the writer creates a file, so nothing else would ever
+        // age the snapshot out. On a reader the horizon becomes the
+        // checkpoint cadence — the interval the reader can actually prove
+        // freshness over — and a write mount keeps the shipped 300 s.
+        let daemon_cache_ttl = if read_only_mount() {
+            reader_daemon_cache_ttl(crate::ro_coherence::checkpoint_cadence())
+        } else {
+            Duration::from_secs(DAEMON_CACHE_TTL_SECS)
+        };
         let dir_entry_cache_v3 = moka::sync::Cache::builder()
             .max_capacity(dir_entry_capacity)
-            .time_to_live(Duration::from_secs(300))
+            .time_to_live(daemon_cache_ttl)
             .build();
         // POSIX-4: the `..` parent memo — one u64 per hot directory, so
         // it rides the dentry-cache sizing derivation (never a fixed
         // constant) and ages out on the same horizon.
         let parent_memo = moka::sync::Cache::builder()
             .max_capacity(dir_entry_capacity)
-            .time_to_live(Duration::from_secs(300))
+            .time_to_live(daemon_cache_ttl)
             .build_with_hasher(ahash::RandomState::new());
         // P1-4: bound attr cache growth (was unbounded DashMap).
         let attr_capacity = std::cmp::max(10_000, total_memory / 100_000);
         let attr_cache = moka::sync::Cache::builder()
             .max_capacity(attr_capacity)
-            .time_to_live(Duration::from_secs(300))
+            .time_to_live(daemon_cache_ttl)
             .build_with_hasher(ahash::RandomState::new());
         Self {
             router,
@@ -5119,7 +5296,16 @@ impl SqueezefsFilesystem {
             open_inodes: std::sync::Arc::new(dashmap::DashMap::with_hasher(
                 ahash::RandomState::new(),
             )),
-            kernel_ttls: KernelCacheTtls::from_env(),
+            // DLM S5 item 4: a reader's TTL DEFAULTS derive from the
+            // checkpoint cadence; env + `-o` still layer on top (the
+            // env-knob precedence law).
+            kernel_ttls: if read_only_mount() {
+                KernelCacheTtls::from_env_over(KernelCacheTtls::read_only_defaults(
+                    crate::ro_coherence::checkpoint_cadence(),
+                ))
+            } else {
+                KernelCacheTtls::from_env()
+            },
             reclaim_inflight: std::sync::Arc::new(scc::HashSet::new()),
             killpriv_clean: std::sync::Arc::new(scc::HashSet::new()),
             reclaim_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
@@ -6415,6 +6601,12 @@ impl SqueezefsFilesystem {
                 "writeback_superseded_noops": METRICS.writeback_superseded_noops.load(Ordering::Relaxed),
                 "writeback_stale_token_retries": METRICS.writeback_stale_token_retries.load(Ordering::Relaxed),
                 "writeback_orphan_discards": METRICS.writeback_orphan_discards.load(Ordering::Relaxed),
+                // DLM S5 — the reader-coherence family (0 on write mounts).
+                "read_only_mount": read_only_mount(),
+                "ro_revalidate_passes": METRICS.ro_revalidate_passes.load(Ordering::Relaxed),
+                "ro_revalidate_epochs": METRICS.ro_revalidate_epochs.load(Ordering::Relaxed),
+                "ro_purged_block_keys": METRICS.ro_purged_block_keys.load(Ordering::Relaxed),
+                "ro_node_cache_nodes_dropped": METRICS.ro_node_cache_nodes_dropped.load(Ordering::Relaxed),
                 "active_block_cow_copies": METRICS.active_block_cow_copies.load(Ordering::Relaxed),
                 "write_through_blocks": METRICS.write_through_blocks.load(Ordering::Relaxed),
                 "write_through_bytes": METRICS.write_through_bytes.load(Ordering::Relaxed),
@@ -7897,6 +8089,17 @@ impl SqueezefsFilesystem {
     /// [`CLIENT_STALE_TTL_SECS`] is treated as stale (kill -9 leaves no chance to
     /// unregister). Best-effort; never fails a caller.
     pub async fn refresh_client_registration(&self) {
+        // DLM S5: a reader writes NOTHING, including its own registration.
+        // The `client:` record is an xattr commit on ino 1 under an
+        // exclusive `I{1}` guard (spec §6.5 pt 3), so a reader could not
+        // write it even if it wanted to — attempting it every 10 s would
+        // just log a refusal per beat. The consequence is stated in
+        // docs/operations.md: `squeezefs clients` does not list readers.
+        // Making readers visible cluster-wide is S6's membership plane
+        // (lease-based liveness), not a reader's write.
+        if read_only_mount() {
+            return;
+        }
         let client_id_str = self.client_id.lock().unwrap().clone();
         if client_id_str.is_empty() {
             return;
@@ -12206,6 +12409,30 @@ impl SqueezefsFilesystem {
         }
     }
 
+    /// **DLM S5 — the reader's FUSE door** (spec §6.8 item 6): every
+    /// mutating handler refuses `EROFS` on a read-only mount.
+    ///
+    /// The kernel already refuses these on an `-o ro` mount (the reader
+    /// mounts with `MS_RDONLY`), so on the kernel path this is
+    /// defense-in-depth. It is NOT redundant on the interception path: an
+    /// `LD_PRELOAD` / SDK client's ring writes reach the daemon **without
+    /// traversing the VFS at all** (design-preload-interception §5.5.2), so
+    /// the daemon-side gate is the only thing standing between a shim
+    /// client and a mutation on a reader. The ring write path funnels
+    /// through the same handler surface plus the allocator/reclaim gates
+    /// underneath it.
+    ///
+    /// `EROFS` (not `EPERM`, not `EACCES`) is what applications and every
+    /// POSIX test suite expect from a read-only filesystem.
+    #[inline]
+    fn ro_gate(&self, op: &str) -> Result<(), Errno> {
+        if read_only_mount() {
+            debug!("FUSE {op} refused: read-only mount (EROFS — DLM S5)");
+            return Err(Errno::from(libc::EROFS));
+        }
+        Ok(())
+    }
+
     /// Per-class dentry TTL (survey P1-C, the DAOS dir-vs-file split):
     /// directory dentries get `dir_entry` (their invalidation cost covers
     /// whole subtrees), everything else `entry`.
@@ -13288,8 +13515,25 @@ impl Filesystem for SqueezefsFilesystem {
             crate::mem_budget::spawn_sampler();
         }
 
+        // DLM S5 (spec §6.8 item 6 — reader-side data-plane lockdown):
+        // every writer-side background engine below is skipped on a
+        // read-only mount. None of them has anything to do (nothing can
+        // ever be dirty, staged, parked or freed on a reader) and each
+        // would otherwise sit on a channel it can never receive from, or —
+        // worse — run a mount-time sweep that MUTATES: the extent-record
+        // recovery pass adopts/discards `active_block_ext:` records, and
+        // the reclaim pool issues device discards.
+        let reader_mount = read_only_mount();
+        if reader_mount {
+            info!(
+                "Read-only mount: writeback flusher, extent-record recovery, fold worker \
+                 and reclaim pool are NOT armed (nothing on a reader can be dirty, staged \
+                 or freed)"
+            );
+        }
+
         // Start background active writes flusher task
-        {
+        if !reader_mount {
             let mut rx_guard = self.writeback_rx.lock().unwrap();
             if let Some(writeback_rx) = rx_guard.take() {
                 let router = self.router.clone();
@@ -13311,20 +13555,40 @@ impl Filesystem for SqueezefsFilesystem {
             }
         }
 
+        // DLM S5 items 2/5/6: the reader's own machinery — the data-plane
+        // lockdown latch on the reclaim queue, then the revalidation
+        // cadence (root-ledger poll → purge-on-revalidation → the
+        // node-cache revalidation seam). Both replace the writer engines
+        // skipped above; the task stops on the dismount notify.
+        if reader_mount {
+            crate::ro_coherence::arm_reader_data_plane(&self.router);
+            if let Some(routed) = self.meta_backend.as_ref() {
+                crate::ro_coherence::spawn_reader_revalidation(
+                    routed.volumes.clone(),
+                    self.router.clone(),
+                    self.dismount_done.clone(),
+                );
+            }
+        }
+
         // W2 (§5.2): mount-time extent-record sweep — validate + loudly
         // report kill-9 residue (clean shutdowns drain every record), and
         // arm the background fold worker.
-        self.recover_extent_records().await;
-        self.ensure_fold_worker();
+        if !reader_mount {
+            self.recover_extent_records().await;
+            self.ensure_fold_worker();
+        }
 
         // Start background GC/reclaim worker pool
-        let mut reclaim_rx_guard = self.reclaim_rx.lock().unwrap();
-        if let Some(reclaim_rx) = reclaim_rx_guard.take() {
-            let self_clone = self.clone();
-            let reclaim_concurrency = self.reclaim_semaphore.available_permits();
-            tokio::spawn(async move {
-                run_reclaim_worker_pool(reclaim_rx, self_clone, reclaim_concurrency).await;
-            });
+        if !reader_mount {
+            let mut reclaim_rx_guard = self.reclaim_rx.lock().unwrap();
+            if let Some(reclaim_rx) = reclaim_rx_guard.take() {
+                let self_clone = self.clone();
+                let reclaim_concurrency = self.reclaim_semaphore.available_permits();
+                tokio::spawn(async move {
+                    run_reclaim_worker_pool(reclaim_rx, self_clone, reclaim_concurrency).await;
+                });
+            }
         }
 
         // Desired INIT max_write = the volume BLOCK SIZE, floored at the
@@ -13584,6 +13848,7 @@ impl Filesystem for SqueezefsFilesystem {
         mode: u32,
         rdev: u32,
     ) -> FuseResult<ReplyEntry> {
+        self.ro_gate("mknod")?;
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
         check_component_name_len(name)?;
@@ -13637,6 +13902,7 @@ impl Filesystem for SqueezefsFilesystem {
         mode: u32,
         flags: u32,
     ) -> FuseResult<ReplyCreated> {
+        self.ro_gate("create")?;
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
         crate::coz_progress!("fuse_create");
@@ -13725,6 +13991,17 @@ impl Filesystem for SqueezefsFilesystem {
         // VL8 item 2: register (the live wedge held 4 opens invisibly).
         let _prof = OpProf::begin(FuseOpKind::Open, inode);
         debug!("FUSE Open: inode = {}, flags = {:#o}", inode, flags);
+
+        // DLM S5: refuse write INTENT at the door on a reader, so an
+        // application fails at `open` (where POSIX programs check) instead
+        // of at the first `write`. The virtual `.stats`/`.config` inodes
+        // below are exempt: they are synthesized read payloads and are
+        // opened O_RDONLY by every consumer.
+        const WRITE_INTENT: u32 =
+            (libc::O_WRONLY | libc::O_RDWR | libc::O_TRUNC | libc::O_APPEND | libc::O_CREAT) as u32;
+        if inode != STATS_INODE && inode != CONFIG_INODE && flags & WRITE_INTENT != 0 {
+            self.ro_gate("open(write intent)")?;
+        }
 
         if inode == STATS_INODE || inode == CONFIG_INODE {
             let content = if inode == STATS_INODE {
@@ -14319,6 +14596,7 @@ impl Filesystem for SqueezefsFilesystem {
         write_flags: u32,
         _flags: u32,
     ) -> FuseResult<ReplyWrite> {
+        self.ro_gate("write")?;
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         crate::coz_progress!("fuse_write");
         debug!(
@@ -14664,6 +14942,7 @@ impl Filesystem for SqueezefsFilesystem {
         mode: u32,
         umask: u32,
     ) -> FuseResult<ReplyEntry> {
+        self.ro_gate("mkdir")?;
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
         check_component_name_len(name)?;
@@ -14706,6 +14985,7 @@ impl Filesystem for SqueezefsFilesystem {
     }
 
     async fn rmdir(&self, _req: Request, parent: u64, name: &OsStr) -> FuseResult<()> {
+        self.ro_gate("rmdir")?;
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
         check_component_name_len(name)?;
@@ -14763,6 +15043,7 @@ impl Filesystem for SqueezefsFilesystem {
         _fh: Option<u64>,
         set_attr: SetAttr,
     ) -> FuseResult<ReplyAttr> {
+        self.ro_gate("setattr")?;
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
         debug!("FUSE SetAttr: ino = {}, set_attr = {:?}", ino, set_attr);
@@ -15006,6 +15287,7 @@ impl Filesystem for SqueezefsFilesystem {
         name: &OsStr,
         link: &OsStr,
     ) -> FuseResult<ReplyEntry> {
+        self.ro_gate("symlink")?;
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
         check_component_name_len(name)?;
@@ -15114,6 +15396,7 @@ impl Filesystem for SqueezefsFilesystem {
         new_parent: u64,
         new_name: &OsStr,
     ) -> FuseResult<ReplyEntry> {
+        self.ro_gate("link")?;
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
         check_component_name_len(new_name)?;
@@ -15158,6 +15441,7 @@ impl Filesystem for SqueezefsFilesystem {
     }
 
     async fn unlink(&self, _req: Request, parent: u64, name: &OsStr) -> FuseResult<()> {
+        self.ro_gate("unlink")?;
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
         crate::coz_progress!("fuse_unlink");
@@ -15202,6 +15486,7 @@ impl Filesystem for SqueezefsFilesystem {
         new_parent: u64,
         new_name: &OsStr,
     ) -> FuseResult<()> {
+        self.ro_gate("rename")?;
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
         check_component_name_len(name)?;
@@ -15298,6 +15583,7 @@ impl Filesystem for SqueezefsFilesystem {
         new_name: &OsStr,
         flags: u32,
     ) -> FuseResult<()> {
+        self.ro_gate("rename2")?;
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
         check_component_name_len(name)?;
@@ -15599,6 +15885,7 @@ impl Filesystem for SqueezefsFilesystem {
         length: u64,
         _flags: u64,
     ) -> FuseResult<ReplyCopyFileRange> {
+        self.ro_gate("copy_file_range")?;
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
         // VL8 item 2: register BEFORE the guards — the live wedge's stuck
@@ -16382,6 +16669,7 @@ impl Filesystem for SqueezefsFilesystem {
         length: u64,
         mode: u32,
     ) -> FuseResult<()> {
+        self.ro_gate("fallocate")?;
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         // VL8 item 2: register BEFORE the inode guard (watchdog visibility).
         let _prof = OpProf::begin(FuseOpKind::Fallocate, ino);
@@ -16752,6 +17040,7 @@ impl Filesystem for SqueezefsFilesystem {
         _flags: u32,
         _position: u32,
     ) -> FuseResult<()> {
+        self.ro_gate("setxattr")?;
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         let name_str = match name.to_str() {
             Some(s) => s,
@@ -16902,6 +17191,7 @@ impl Filesystem for SqueezefsFilesystem {
     }
 
     async fn removexattr(&self, _req: Request, inode: Inode, name: &OsStr) -> FuseResult<()> {
+        self.ro_gate("removexattr")?;
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         let name_str = match name.to_str() {
             Some(s) => s,
@@ -17469,6 +17759,24 @@ pub async fn start_mount<P: AsRef<Path>>(
     allow_other: bool,
     custom_opts: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // DLM S5 item 4 — TTL alignment. The reader's DERIVED TTL base (the
+    // writer's checkpoint cadence) is installed at construction
+    // (`SqueezefsFilesystem::new`); the env and `-o` layers below apply on
+    // top of it, unchanged: derived → env → mount option, later wins
+    // verbatim. A write mount's TTLs are untouched.
+    let read_only = read_only_mount();
+    if read_only {
+        info!(
+            "Read-only mount (DLM S5): kernel cache TTLs derive from the writer's \
+             checkpoint cadence ({:?}) — attr {:?}, entry {:?}, dir-entry {:?}, negative {:?}",
+            crate::ro_coherence::checkpoint_cadence(),
+            fs.kernel_ttls.attr,
+            fs.kernel_ttls.entry,
+            fs.kernel_ttls.dir_entry,
+            fs.kernel_ttls.negative
+        );
+    }
+
     // Survey P1-C: consume operator TTL overrides (`-o attr_timeout=…`,
     // `entry_timeout=`, `dir_entry_timeout=`, `negative_timeout=`) into
     // the per-mount TTL config. Pre-M5 these keys were silently DROPPED;
@@ -17510,7 +17818,18 @@ pub async fn start_mount<P: AsRef<Path>>(
         options.gid(gid);
     }
     options.allow_other(allow_other);
-    options.write_back(posture.write_back);
+    // DLM S5 item 4 — "writeback cache off for readers". The kernel
+    // writeback cache acks buffered writes the daemon has not seen; a
+    // reader has nowhere to put them, and the flag also makes the kernel
+    // author cmtime locally. Off, unconditionally, whatever was requested
+    // (the mount is `MS_RDONLY` anyway — this is the honest flag).
+    options.write_back(posture.write_back && !read_only);
+    // Item 1's operator surface at the kernel boundary: `ro` in the
+    // fusermount option string + `MS_RDONLY` on the root path. The VFS
+    // then refuses every mutating syscall before it reaches the daemon —
+    // the outermost of the reader's three gates (VFS, FUSE handler
+    // `ro_gate`, allocator/reclaim latch).
+    options.read_only(read_only);
     options.default_permissions(true);
     // FUSE_HANDLE_KILLPRIV_V2 (killpriv campaign): the daemon implements
     // the clearing law (write/open/setattr handlers +

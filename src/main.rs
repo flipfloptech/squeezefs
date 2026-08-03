@@ -482,6 +482,26 @@ enum Commands {
         #[arg(long, alias = "allow-others")]
         allow_other: bool,
 
+        // Anchors: docs/pre-rc-engineering-spec.md §6.8 (the S5
+        // increment), docs/operations.md §Read-only coherent mounts.
+        /// Mount read-only — a coherent READER (DLM stage S5)
+        ///
+        /// Equivalent to `-o ro`. A reader takes no write lease, no
+        /// `writer_claim` and no NVMe reservation, so it neither weakens
+        /// nor blocks the single-writer guard: one writer plus N readers
+        /// of the same volume set is the supported shape, and a second
+        /// WRITER is still refused. Every plane refuses mutations
+        /// (metadata, block allocation, frees, device reclaim, in-place
+        /// patch/overwrite) and the kernel mounts the filesystem
+        /// `MS_RDONLY`.
+        ///
+        /// Consistency: a reader revalidates against the writer's A/B
+        /// root ledger on the checkpoint cadence and its kernel/dentry
+        /// TTLs derive from that cadence — see docs/operations.md for the
+        /// guarantee class and the exact staleness bound.
+        #[arg(long)]
+        read_only: bool,
+
         /// Validate backend storage connectivity on startup
         #[arg(long)]
         check_storage: bool,
@@ -4419,6 +4439,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             interception,
             admin_uid,
             allow_other,
+            read_only,
             check_storage: _check_storage,
             options,
             read_cache_size,
@@ -4459,6 +4480,34 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let m_point = PathBuf::from(&args[args.len() - 1]);
                 (m_lvs, m_point)
             };
+
+            // DLM S5 — resolve the read-only posture FIRST (pre-RC
+            // engineering spec §6.8 item 1). It must be latched before the
+            // metadata set is opened, because it decides which open runs
+            // (`open_routed_meta_set_read_only` takes no Layer-A lock, no
+            // claim and no PR registration) and because every data-plane
+            // gate downstream reads the latch. `-o ro` and `--read-only`
+            // resolve through ONE function; `-o rw` alongside either
+            // refuses loud rather than picking a side.
+            let reader_mount =
+                match squeezefs::fuse_client::read_only_from_options(options.as_deref(), read_only)
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("\x1b[91mERROR\x1b[0m mount refused: {e}");
+                        return Err(e.into());
+                    }
+                };
+            squeezefs::fuse_client::set_read_only_mount(reader_mount);
+            if reader_mount {
+                println!(
+                    "Mounting READ-ONLY (DLM stage S5): this mount takes no write lease, \
+                     writes no writer_claim and mutates no plane. One writer plus N \
+                     readers is the supported shape; see docs/operations.md \
+                     §Read-only coherent mounts for the guarantee class and the \
+                     staleness bound."
+                );
+            }
 
             // Version-gated bootstrap (PR K6a): root-inode presence and
             // the format config are read off the SLOT-0 HOST's KV trees
@@ -4776,14 +4825,22 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // of URI order; legacy sets keep URI order verbatim.
             // Disagreements (torn epochs, missing members, duplicate
             // positions) refuse LOUD naming the volumes.
-            let routed_meta_backend =
-                match squeezefs::meta_backend::open_routed_meta_set(&meta_lvs).await {
-                    Ok(routed) => routed,
-                    Err(e) => {
-                        eprintln!("\x1b[91mERROR\x1b[0m mount refused: {e}");
-                        return Err(e.into());
-                    }
-                };
+            // DLM S5: a reader opens the same discovered, canonically
+            // ordered, slot-map-validated set — through the reader open,
+            // which is where the §6.4 `LOCK_EX`-before-classification and
+            // the Layer-B2 `FreshForeign` refusal are bypassed. The write
+            // path below is byte-identical to what it always was.
+            let routed_meta_backend = match if reader_mount {
+                squeezefs::meta_backend::open_routed_meta_set_read_only(&meta_lvs).await
+            } else {
+                squeezefs::meta_backend::open_routed_meta_set(&meta_lvs).await
+            } {
+                Ok(routed) => routed,
+                Err(e) => {
+                    eprintln!("\x1b[91mERROR\x1b[0m mount refused: {e}");
+                    return Err(e.into());
+                }
+            };
             for be in &routed_meta_backend.volumes {
                 // §10 mount log: format version, ledger seq chosen,
                 // replay entries/dropped/ms, free extents — plus BOTH
@@ -4844,6 +4901,24 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // of the accounting, off by default because running it would
             // pay the very walk the durable records exist to delete. fsck
             // runs it unconditionally (class C8).
+            //
+            // DLM S5 (spec §6.8 item 1, the walk's free-completing arm): a
+            // READER runs neither the durable seed nor the derived walk.
+            // The walk's `recover_block` declares every gap below the
+            // cursor FREE, which on a snapshot view fabricates a free list
+            // over the live writer's blocks; the durable seed is
+            // pointless because a reader allocates nothing; and the
+            // backfill WRITES. The allocator refuses every mutation on a
+            // reader anyway (`BlockAllocator::reader_gate`) — this skip
+            // keeps the mount from paying a full inode-tree walk to
+            // populate state it may not use.
+            if reader_mount {
+                log::info!(
+                    "Read-only mount: block-ownership recovery skipped entirely (a reader \
+                     allocates nothing and frees nothing; the walk's free-completing arm \
+                     must never run on a snapshot view)"
+                );
+            } else {
             match fs_engine
                 .router
                 .backend_router
@@ -4903,6 +4978,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Err(e) => log::error!("durable block-reference recovery failed: {e:?}"),
             }
+            }
             fs_engine.meta_backend = Some(routed_meta_backend.clone());
             fs_engine.dismount_wait = resolved_dismount_wait;
 
@@ -4910,6 +4986,21 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // duty-cycle throttle, crash-resume adoption). Local pool
             // sized like the L4 service posture; `--job-cpu-limit` is
             // the default throttle for jobs submitted without one.
+            //
+            // DLM S5 (spec §6.8 item 6): a READER arms neither the job
+            // fabric nor the job wire nor the frag-gauge worker. Every job
+            // type MUTATES (evacuate, rebalance, defrag, fsck repair) and
+            // the fabric's own `JobRecord`/`ShardRecord` state is durable
+            // `job:` xattrs on ino 1 — the coordinator role belongs to the
+            // D0 writer-claim holder by definition (VL2/VL2b), which a
+            // reader is not and must never appear to be.
+            if reader_mount {
+                log::info!(
+                    "Read-only mount: job fabric, job wire and the frag-gauge worker are \
+                     NOT armed (maintenance jobs are the writer-claim holder's; a reader \
+                     cannot write their durable records)"
+                );
+            } else {
             let fabric_workers = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(8)
@@ -4988,6 +5079,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 log::info!(
                     "job wire: endpoint {advertised} (published via the mount registration)"
                 );
+            }
             }
 
             let opt_idle = if resolved_fuse_io_uring_sqpoll_idle_ms > 0 {

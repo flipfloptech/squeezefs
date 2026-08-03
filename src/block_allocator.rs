@@ -299,6 +299,36 @@ impl BlockAllocator {
     }
 
     // -----------------------------------------------------------------
+    // DLM S5 — the reader gate (pre-RC engineering spec §6.8 item 1: "the
+    // write gate extended past metadata to cover the block allocator, the
+    // reclaim queue, W1 and in-place overwrite, and
+    // `recover_active_blocks_v3`'s free-completing arm")
+    // -----------------------------------------------------------------
+
+    /// Refuse a data-plane mutation on a read-only mount.
+    ///
+    /// Every arm of this allocator that changes ownership of a device
+    /// offset — mint, terminal free, specific claim, the recovery walk's
+    /// free completion, the W1 patch's incarnation retire — routes through
+    /// here. On a WRITE mount this is one relaxed atomic load feeding a
+    /// never-taken branch (`benches/write_path_bench.rs`, group
+    /// `ro_gate`); the whole point of the latch's shape is that a reader
+    /// feature costs writers nothing measurable.
+    ///
+    /// Associated (not `&self`) deliberately: the posture is the MOUNT's,
+    /// never one allocator's, so no per-volume state can drift out of
+    /// agreement with it.
+    #[inline]
+    fn reader_gate(what: &str) -> Result<()> {
+        if crate::fuse_client::read_only_mount() {
+            let e = crate::fuse_client::read_only_refusal(what);
+            log::error!("{e}");
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
     // Idea 4 — discard-elision debt (design-rewrite-program §3; contracts
     // in tests/discard_elision_tests.rs)
     // -----------------------------------------------------------------
@@ -669,6 +699,22 @@ impl BlockAllocator {
     /// back-off/error paths) restores stability under a NEW generation so
     /// no fill that snapshotted the old generation can validate.
     pub fn begin_patch_sole_owner(&self, offset: u64) -> bool {
+        // DLM S5 (spec §6.8 item 1 / §6.3's W1 paragraph): this predicate
+        // reads a PROCESS-LOCAL refcount map, so on a reader it can prove
+        // nothing about a block a live writer may have cloned — and a
+        // reader has no business rewriting bytes in place at all. Refuse
+        // before the incarnation word is even retired (the refusal must
+        // not perturb a live writer's fill validation).
+        //
+        // No `patch_ineligible_*` counter joins the §5.4 decision ledger
+        // here on purpose: a reader's write path is closed at the FUSE
+        // door (EROFS) and at the allocator, so this arm is structurally
+        // unreachable in production — a counter that can only ever read 0
+        // is exactly the dead weight the ledger's rot-detection value
+        // depends on not having.
+        if Self::reader_gate("W1 in-place sub-block patch").is_err() {
+            return false;
+        }
         self.mark_incarnation_unstable(offset);
         crate::patch_clone_core::cross_word_fence();
         self.refcount(offset) == Some(1)
@@ -796,6 +842,9 @@ impl BlockAllocator {
     }
 
     pub async fn allocate_block(&self) -> Result<u64> {
+        if let Err(e) = Self::reader_gate("block allocation") {
+            return Err(e);
+        }
         let first = self.try_allocate_block();
         let Err(e) = first else { return first };
         if !is_storage_full(&e) || self.space_valve.get().is_none() {
@@ -934,6 +983,7 @@ impl BlockAllocator {
     /// `DashSet::remove` is the atomic claim; a lost race falls through to
     /// the next candidate.
     pub fn allocate_block_below(&self, below_idx: u64) -> Option<u64> {
+        Self::reader_gate("block allocation (contiguity pick)").ok()?;
         let mut cands: Vec<u64> = self
             .free_blocks
             .iter()
@@ -956,6 +1006,7 @@ impl BlockAllocator {
     /// rewrite's convergence invariant). Full `allocate_block`
     /// discipline; `StorageFull` propagates from the fresh-mint path.
     pub fn allocate_block_at_or_above(&self, min_idx: u64) -> Result<u64> {
+        Self::reader_gate("block allocation (ascending pick)")?;
         let mut cands: Vec<u64> = self
             .free_blocks
             .iter()
@@ -995,6 +1046,9 @@ impl BlockAllocator {
     /// remaining legitimate caller (fsck's C2Leaked apply refuses untracked
     /// offsets itself before freeing).
     pub fn begin_free(&self, offset: u64) -> bool {
+        if Self::reader_gate("terminal block free").is_err() {
+            return false;
+        }
         let should_free = if let Some(terminal) = self
             .refcounts
             .read_sync(&offset, |_, v| crate::refcount_core::release(v))
@@ -1082,6 +1136,11 @@ impl BlockAllocator {
     /// Release one reference and, when terminal, immediately publish the
     /// offset for reuse (begin + finish with no destructive work between).
     pub async fn free_block(&self, offset: u64) -> Result<()> {
+        // DLM S5: gated explicitly rather than left to `begin_free`'s
+        // `false`, because a `false` here is indistinguishable from a
+        // legitimate NON-TERMINAL release — and a reader reaching this path
+        // at all is a bug worth a loud error, not a silent `Ok`.
+        Self::reader_gate("block free")?;
         if self.begin_free(offset) {
             self.finish_free(offset);
         }
@@ -1108,6 +1167,7 @@ impl BlockAllocator {
     }
 
     pub async fn allocate_specific_block(&self, block_idx: u64) -> Result<()> {
+        Self::reader_gate("specific block allocation")?;
         let cur_highest = self.highest_block.load(Ordering::Relaxed);
         if block_idx >= cur_highest {
             for idx in cur_highest..block_idx {
@@ -1225,6 +1285,15 @@ impl BlockAllocator {
         kv: &crate::meta_backend::kv::backend::KvMetaBackend,
         backend_router: &crate::routing::BackendRouter,
     ) -> Result<()> {
+        // DLM S5 (spec §6.8 item 1, the walk's **free-completing arm**):
+        // `recover_block` declares every gap below the cursor FREE, so the
+        // walk does not merely *observe* ownership — it manufactures a
+        // free list from the tree it happened to see. On a reader that
+        // tree is a snapshot of one checkpoint, and the offsets a live
+        // writer allocated after it would be free-listed here. A reader
+        // allocates nothing and frees nothing, so the whole pass is
+        // refused rather than made "harmless".
+        Self::reader_gate("block-ownership recovery walk")?;
         // Two passes' worth of work in one: collect the owned indices
         // under the walk (which borrows `self` immutably), then seed.
         // `recover_block` is `async`, so it cannot run inside the

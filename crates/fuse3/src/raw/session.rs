@@ -476,6 +476,11 @@ enum ReadResult {
         header_buffer: Vec<u8>,
         data_buffer: Vec<u8>,
         uring_payload: Option<Bytes>,
+        /// FUSE-3g: body bytes the transport actually WROTE into
+        /// `data_buffer` (`read_vectored`'s `n` minus the 40-byte header;
+        /// 0 on every error arm). The dispatch loop bounds `data_ref` by
+        /// this, never by `in_header.len` — see [`validated_body`].
+        filled: usize,
         /// Where this delivery's reply must be committed (FUSE-2 ⊕
         /// PERF-16) — the ring slot it arrived on, or `Classical`.
         reply_slot: ReplySlot,
@@ -876,7 +881,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let header_buffer = vec![0; FUSE_IN_HEADER_SIZE];
         let data_buffer = vec![0; FUSE_MIN_READ_BUFFER_SIZE];
 
-        let (data_buffer, in_header) = match self
+        let (data_buffer, in_header, filled) = match self
             .read_fuse_request(fuse_connection, header_buffer, data_buffer)
             .await
         {
@@ -890,10 +895,11 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             ReadResult::Request {
                 in_header,
                 data_buffer,
+                filled,
                 ..
             } => {
                 let in_header = in_header?;
-                (data_buffer, in_header)
+                (data_buffer, in_header, filled)
             }
         };
 
@@ -919,8 +925,23 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             return Err(IoError::other(format!("unexpected opcode {opcode:?}")));
         }
 
-        let data_size = in_header.len as usize - FUSE_IN_HEADER_SIZE;
-        let data_ref = &data_buffer[..data_size];
+        // FUSE-3g: bound INIT's body by the bytes that were filled. A
+        // short/lying INIT header refuses the SESSION (there is nothing to
+        // reply to yet — the mount fails loud rather than negotiating
+        // against stale buffer bytes).
+        let data_ref = match validated_body(in_header.len, filled, 0, data_buffer.len()) {
+            BodyBounds::Valid(n) => &data_buffer[..n],
+            refused => {
+                error!(
+                    "FUSE_INIT body bounds refused ({refused:?}): in_header.len {} filled {filled}",
+                    in_header.len
+                );
+                return Err(IoError::new(
+                    ErrorKind::InvalidData,
+                    "FUSE_INIT declares a body the transport did not deliver",
+                ));
+            }
+        };
 
         self.handle_init(request, data_ref, fuse_connection, fs)
             .await
@@ -980,6 +1001,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     header_buffer,
                     data_buffer,
                     uring_payload,
+                    filled: 0,
                     reply_slot,
                 };
             }
@@ -1002,6 +1024,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 header_buffer,
                 data_buffer,
                 uring_payload,
+                filled: 0,
                 reply_slot,
             };
         }
@@ -1015,6 +1038,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     header_buffer,
                     data_buffer,
                     uring_payload,
+                    filled: 0,
                     reply_slot,
                 };
             }
@@ -1027,6 +1051,10 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             header_buffer,
             data_buffer,
             uring_payload,
+            // FUSE-3g: `n` is header + body; the body is what the
+            // transport FILLED, and the dispatch loop may never present
+            // more than this to a handler.
+            filled: n - FUSE_IN_HEADER_SIZE,
             reply_slot,
         }
     }
@@ -1049,6 +1077,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         loop {
             let uring_payload;
             let reply_slot;
+            let filled;
             let in_header = match self
                 .read_fuse_request(&fuse_connection, header_buffer, data_buffer)
                 .await
@@ -1064,11 +1093,13 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     header_buffer: header_buf,
                     data_buffer: data_buf,
                     uring_payload: payload,
+                    filled: body_filled,
                     reply_slot: slot,
                 } => {
                     header_buffer = header_buf;
                     data_buffer = data_buf;
                     uring_payload = payload;
+                    filled = body_filled;
                     reply_slot = slot;
 
                     match in_header {
@@ -1102,8 +1133,33 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
             debug!("receive opcode {}", opcode);
 
-            let data_size = in_header.len as usize - FUSE_IN_HEADER_SIZE;
-            let data_ref = &data_buffer[..data_size];
+            // FUSE-3g: the body is the bytes the transport FILLED, never
+            // what the header claims. `in_header.len` is kernel-supplied
+            // input: below 40 it UNDERFLOWS the subtraction (release
+            // profile: a ~2^64 slice length, an instant panic on this
+            // dispatch task — every in-flight request on the session loses
+            // its reply), and above `40 + filled` it extends the slice over
+            // the PREVIOUS request's bytes still sitting in this reused
+            // buffer. Either way: reply EINVAL, never present the slice.
+            // (The §5.4 zero-copy WRITE body legitimately rides
+            // `uring_payload` and is counted as available — see
+            // `validated_body`.)
+            let payload_len = uring_payload.as_ref().map_or(0, Bytes::len);
+            let data_ref =
+                match validated_body(in_header.len, filled, payload_len, data_buffer.len()) {
+                    BodyBounds::Valid(n) => &data_buffer[..n],
+                    refused => {
+                        error!(
+                            "delivery body bounds refused ({refused:?}): unique {} opcode {} \
+                             in_header.len {} filled {filled} payload {payload_len}",
+                            in_header.unique, in_header.opcode, in_header.len
+                        );
+                        reply_error_in_place(libc::EINVAL.into(), request, self.reply_tx(&request))
+                            .await;
+
+                        continue;
+                    }
+                };
 
             match opcode {
                 fuse_opcode::FUSE_INIT => {
@@ -4906,6 +4962,57 @@ fn notify_retrieve_body(data: &[u8], size: usize) -> Option<&[u8]> {
 /// Same dispatch-task blast radius as [`notify_retrieve_body`].
 fn batch_forget_body(data: &[u8]) -> Option<&[u8]> {
     data.get(FUSE_BATCH_FORGET_IN_SIZE..)
+}
+
+/// FUSE-3g: the verdict on one delivery's body bounds — what the request
+/// header CLAIMS versus what the transport actually FILLED.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BodyBounds {
+    /// The body is `.0` bytes of the session data buffer, and every one of
+    /// them belongs to THIS request.
+    Valid(usize),
+    /// `in_header.len` is below the 40-byte `fuse_in_header` itself. The
+    /// historical `in_header.len as usize - FUSE_IN_HEADER_SIZE` UNDERFLOWS
+    /// here (release build: a ~2^64 `data_size` and an instant slice panic
+    /// on the dispatch task, i.e. the whole session).
+    ShortHeader,
+    /// The header declares more body than the transport delivered. The
+    /// historical code sized `data_ref` from the header anyway, so the
+    /// tail of the slice was whatever the PREVIOUS request on this
+    /// dispatch loop left in the reused buffer — stale bytes presented to
+    /// a handler as this request's own.
+    Overdeclared { declared: usize, available: usize },
+}
+
+/// FUSE-3g: bound one delivery's body by what was actually filled.
+///
+/// * `header_len` — `in_header.len` (whole request, header included).
+/// * `filled` — body bytes the transport wrote into the session data
+///   buffer (`read_vectored`'s `n` minus the header).
+/// * `payload_len` — body bytes delivered OUT OF BAND instead: the §5.4
+///   FUSE_WRITE zero-copy payload lease (`uring_payload`). The kernel
+///   counts those in `in_header.len`, so they are legitimately "available"
+///   even though they were never copied into the data buffer — but they
+///   are NOT part of the returned slice, which is why the WRITE handler
+///   reads its body from the payload `Bytes` and not from `data_ref`.
+/// * `buf_len` — the data buffer's own capacity (the last bound).
+fn validated_body(
+    header_len: u32,
+    filled: usize,
+    payload_len: usize,
+    buf_len: usize,
+) -> BodyBounds {
+    let Some(declared) = (header_len as usize).checked_sub(FUSE_IN_HEADER_SIZE) else {
+        return BodyBounds::ShortHeader;
+    };
+    let available = filled.saturating_add(payload_len);
+    if declared > available {
+        return BodyBounds::Overdeclared {
+            declared,
+            available,
+        };
+    }
+    BodyBounds::Valid(declared.min(filled).min(buf_len))
 }
 
 /// One handler-lane future (boxed for the lane channels).

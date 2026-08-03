@@ -8,6 +8,49 @@
 
 ---
 
+## 0. Program summary (live)
+
+**Dev has taken 162 commits since the program began** (`402ca77` → present). Every composed tip was gated: `cargo check`, `cargo clippy --all-targets --all-features -- -D warnings` (a gate that inspected *nothing* before ENG-1), `cargo fmt`, targeted suites, and bench smoke. The full `cargo test` and the three external POSIX suites are deliberately **not yet run** — deferred by ruling D7, and they are the remaining step before "RC-ready" is a true statement.
+
+| Metric | Then | Now |
+|---|---|---|
+| P0 items closed | 0 / 17 | **24** (the census grew as agents found items the spec missed) |
+| `cargo audit` vulnerabilities | 5, one with **no upstream fix** | **1** (a lockfile bump) |
+| Clippy coverage | 0 lints across 142 k LOC | full gate, `-D warnings` green |
+| Loom models | 55 | **61** |
+| Fuzz targets | 0 | **9** (~75 M executions, 1 real find) |
+| Dead subsystems | p2p/DHT (~500 LOC), recovery stub, mock family | deleted (**−1,148 lines** from the mock family alone) |
+
+### Bugs found that the specification did not contain
+
+The strongest evidence the program worked is what it discovered *while* implementing:
+
+| Found | By | Severity |
+|---|---|---|
+| `BsetView::parse` sized a Vec from an attacker-controlled `u32` — a 32-byte checksum-valid image requests **128 GiB**; under any `RLIMIT_AS` it is `SIGABRT` | fuzzing (TEST-4) | Daemon kill from one corrupt sector, in a decoder contracted to *detect* corruption |
+| A dropped fsync leader left `flushing = true` **forever**, wedging every subsequent barrier on that meta volume — and DUR-3's reclamation watermarks ride those barriers | contract tests (TEST-9) | Data-loss-adjacent. **The spec's §8 lists `SyncCoalescer` as an invariant "examined for defects and none found"** |
+| `squeezefs clone` was a silent no-op **and actively destructive** — its throwaway wiring pointed a `TieredCache` at the user's default staging dir, discarding 26 GB of another session's read cache before doing nothing | DLM S2 + loose-ends | A documented CLI verb that destroyed data and reported success |
+| `KvError::NoSpace` returned **EINVAL** to `write(2)` — the spec cited a substring rule that never matched (the message reads lowercase `no space`) | POSIX-6 | Out-of-space reported as an invalid argument |
+| `StorageFull` fell through to **EIO** | POSIX-6 | A full filesystem reported as a device failure |
+| `statfs` missed ~63 of every 64 creates (dynamic routing mints from guest cursors; the in-RAM test constructor's `W ≤ 1` identity hid it) | POSIX-1 | `df -i` unusable; the in-process fix passed while the mount leg failed |
+| readdir's `..` synthesis scanned the whole dentry tree **per directory** — 15.5 ms at 16 k dentries, linear in the volume's total | POSIX-4 | Every `ls`/`find`/`du`/`rsync`/`tar` walk. Fixed: **56,600×** |
+
+### Places the specification was wrong, and implementation proved it
+
+| Item | Spec said | Reality |
+|---|---|---|
+| FUSE-3c | Count a queue registered only after `depth` REGISTER **CQEs** reap | **Would deadlock the mount** — a REGISTER's CQE fires on request *delivery*, impossible before arm. Submission-counting is structurally necessary |
+| DUR-4 | Promote the generation guard to **refuse** the write | **Would wedge forever** — a cycle that wrote its pages then failed leaves `checkpoint_seq` unadvanced, so the retry arrives with the same seq. It raises instead, loudly |
+| MEM-2 | A `JoinSet` **or** an owning handle | **Both are required** — tokio abort is cooperative, so a task mid-`memcpy` finishes its poll segment and still races the pool recycle |
+| RES-13 | Add removal paths to four unbounded maps | Two are correct as-is: `block_allocator.incarnations` **must not** have one (a reclaimed entry restarts at generation 0 and lets a stale in-flight fill pass its after-check — the generic/074 family) |
+| RES-10 | The tombstone leak lets the R5 Red clamp fail to clamp | Does not reproduce — both budgets scale with the queue that holds the tombstones. The real leak underneath was found and fixed |
+| POSIX-7 | The shim "cannot refuse mmap" | Half-stale — mmap has been interposed since the L4 wave; the real gap was that the unbind was point-in-time |
+| DLM §6.11 | A durable term closes it | Insufficient — clean unmount **deletes** the claim, so a claim-only term re-issues a crashed predecessor's tokens. A second never-deleted `writer_term` record is load-bearing |
+
+Two spec `[A]` suspicions were also verified **benign** rather than "fixed" (the `sync_key` hash-coincidence reading does not hold; `MS_ASYNC` is covered by the shard `sync_all`), and every §7 line anchor had drifted — several by thousands of lines.
+
+---
+
 ## 1. Disposition table
 
 Status values: **LANDED** (fix + repro merged) · **IN FLIGHT** (agent working) · **OPEN** · **ADJUDICATED** (written decision not to fix, with rationale).

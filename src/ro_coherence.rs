@@ -84,17 +84,28 @@ pub struct ReaderEpoch {
     pub node_cache_revalidated: bool,
 }
 
-/// **The §6.8 item-2 seam.** The node-cache revalidation arm
-/// (`feat/mw-node-cache-coherence`) installs an implementation with
-/// [`install_node_cache_revalidator`]; the reader cadence below calls it
-/// once per pass whose roots advanced.
+/// **The §6.8 item-2 seam — a PLACEHOLDER with a known replacement.**
 ///
-/// Contract expected of an implementation: given the volume and the newest
-/// ledger sequence just observed, drop every cached node not covered by
-/// the new roots and re-root the reader's trees, returning the number of
-/// nodes dropped. It runs on the revalidation task (never on a handler
-/// lane), takes no DLM lease (readers take none — §6.8), and must be safe
-/// to call concurrently with reads in flight.
+/// The node-cache revalidation arm landed in parallel on
+/// `feat/mw-node-cache-coherence` (`src/meta_backend/kv/revalidate.rs` +
+/// `node_cache.rs`), and its API is a superset of this trait. **Delete this
+/// trait, [`install_node_cache_revalidator`],
+/// [`node_cache_revalidation_available`] and the
+/// `NODE_CACHE_REVALIDATOR` cell at merge** (no dead code): the wiring is
+/// mechanical and is written out here so the merge needs no redesign.
+///
+/// | This branch | Its replacement on `feat/mw-node-cache-coherence` |
+/// |---|---|
+/// | `install_node_cache_revalidator` | `KvMetaBackend::arm_reader_revalidation(Some(sink))`, called once per volume right after [`arm_reader_data_plane`] |
+/// | [`revalidate_volume`] (the ledger poll) | `RevalidationPoller::derived()` + `poller.poll_at(&vol, Instant::now())` — its poller deliberately **owns no task**, so [`spawn_reader_revalidation`]'s loop below is exactly the driver it expects |
+/// | [`purge_reader_block_keys`] (item 5) | passed in as the `EpochPurgeSink`. Its `TieredEpochPurge` purges keys a data-path site *registered* as suspect; this module's pass purges the whole census. Merged form: keep the census pass as the sink's fallback while the registration site is unbuilt, so `keys_purged` can never be silently 0 |
+/// | [`crate::fuse_client::reader_revalidate_interval`] | `revalidate::resolve_revalidate_interval_ms` — strictly better (`max(writer cadence, CHECKPOINT_MAX_AGE_MS)`; strict mode reads as the checkpoint task's own tick). Note the TTL consequence: this branch derives kernel/dentry TTLs from the raw flush cadence, which is **≤** that bound, so the shipped TTLs are conservative (shorter than the staleness they cover) — at merge, re-base them on `poller.staleness_bound()` |
+///
+/// Until that merge, an implementation of this trait must: drop every
+/// cached node not covered by the new roots, re-root the reader's trees,
+/// and return the number of nodes dropped. It runs on the revalidation
+/// task (never a handler lane), takes no DLM lease (readers take none —
+/// §6.8), and must be safe to call with reads in flight.
 pub trait NodeCacheRevalidate: Send + Sync {
     fn revalidate_to_newest_roots(&self, volume: &KvMetaBackend, ledger_seq: u64) -> u64;
 }

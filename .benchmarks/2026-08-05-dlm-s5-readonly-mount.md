@@ -137,17 +137,39 @@ acknowledgement-channel blocker.
 condition + counters ≈ days; the reader ack half is S3/S6-shaped ≈ weeks, which
 matches the spec's own "2 and 3 are weeks" classification.
 
+## 4b. The item-2 merge, pre-worked
+
+Item 2 landed in parallel (`feat/mw-node-cache-coherence` @ `1c52244f`:
+`src/meta_backend/kv/revalidate.rs` + `node_cache.rs`). Its API and this
+branch's seam were designed against each other and compose without redesign —
+its poller **owns no task** ("the RO mount's own loop calls `poll_at`"), which
+is precisely this branch's `spawn_reader_revalidation` loop, and its
+`EpochPurgeSink` is precisely this branch's item-5 trigger. The wiring, which
+belongs to whoever merges second:
+
+| This branch | Replacement | Action |
+|---|---|---|
+| `install_node_cache_revalidator` / `NodeCacheRevalidate` / `node_cache_revalidation_available` | `KvMetaBackend::arm_reader_revalidation(Some(sink))` | call it per volume beside `arm_reader_data_plane`; **delete the placeholder trait and its cell** (no dead code) |
+| `revalidate_volume` (the 4 KiB ledger poll) | `RevalidationPoller::derived()` + `poll_at(&vol, Instant::now())` | swap inside the existing loop; keep the loop, the stop discipline and the detached-panic containment |
+| `purge_reader_block_keys` | `EpochPurgeSink` implementation | pass it as the sink. Its `TieredEpochPurge` purges only keys a data-path site *registered* as suspect (its own note says that registration site is unbuilt); the census pass here is the complete-but-unscoped answer, so the merged sink should fall back to it — otherwise `meta_kv_revalidate_keys_purged` reads 0 while epochs grow |
+| `fuse_client::reader_revalidate_interval` | `revalidate::resolve_revalidate_interval_ms` | theirs is strictly better (`max(writer cadence, CHECKPOINT_MAX_AGE_MS)`; strict mode reads as the checkpoint tick). **TTL consequence:** this branch derives the kernel/dentry TTLs from the raw flush cadence, which is **≤** that bound — so the shipped TTLs are conservative (shorter than the staleness they cover, never longer). Re-base them on `poller.staleness_bound()` at merge |
+
+Nothing in the tables above changes a guarantee this branch documents; the
+merge only makes the METADATA row of §Consistency in `docs/operations.md`
+upgrade from "snapshot at mount" to "lags by one interval", which is the
+sentence that section is already written to accept.
+
 ## 5. What remains before N readers can be demonstrated on a real cluster
 
 In dependency order — nothing below is a change of plan, all of it is stated in
 §6.8/§6.9:
 
-1. **Item 2, node-cache revalidation** (`feat/mw-node-cache-coherence`): until
-   its arm is installed through the `NodeCacheRevalidate` seam, a reader's
-   METADATA view is a mount-time snapshot. A cluster demo of "N readers see the
-   writer's new files" is impossible without it; a demo of "N readers stream
-   existing files while a writer works" is possible today. The mount logs the
-   difference loudly and `ro_node_cache_nodes_dropped == 0` is its signature.
+1. **Item 2, node-cache revalidation** — landed in parallel; needs the §4b
+   merge wiring. Until its arm is installed, a reader's METADATA view is a
+   mount-time snapshot. A cluster demo of "N readers see the writer's new
+   files" is impossible without it; a demo of "N readers stream existing files
+   while a writer works" is possible today. The mount logs the difference
+   loudly and `ro_node_cache_nodes_dropped == 0` is its signature.
 2. **A capability row** — §6.9's S5 gate is "N readers × cached stat/s". It
    needs the tcp substrate (`SQZ_DEVSUB_TRANSPORT=tcp`, the two-substrate rule)
    or a real fabric, one writer host and N reader hosts sharing the namespaces,

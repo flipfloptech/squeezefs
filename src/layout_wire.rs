@@ -192,15 +192,103 @@ pub fn is_layout_delta(payload: &[u8]) -> bool {
 
 /// Spec §6.2 item 9 — the `(base_version, version)` peek of a layout
 /// delta record, `None` for the unversioned (pre-item-9) wire. The
-/// fields sit at FIXED offsets right after the flags byte, so the
-/// commit gate can read the durable chain head's versions without a
-/// full record decode. `None` for anything that is not a well-formed
-/// versioned layout delta prefix (the caller treats that exactly like
-/// an unversioned record — the fold's own strict decode is where
-/// garbage dies loud).
-pub fn layout_delta_versions(_payload: &[u8]) -> Option<(u64, u64)> {
-    // Scaffold (tests-first): the versioned wire does not exist yet.
-    None
+/// fields sit at FIXED offsets right after the flags byte (bytes
+/// `3..19`), so the commit gate can read the durable chain head's
+/// versions without a full record decode. `None` for anything that is
+/// not a well-formed versioned layout delta prefix (the caller treats
+/// that exactly like an unversioned record — the fold's own strict
+/// decode is where garbage dies loud).
+pub fn layout_delta_versions(payload: &[u8]) -> Option<(u64, u64)> {
+    if payload.len() < 19 || !is_layout_delta(payload) || payload[2] & F_VERSIONED == 0 {
+        return None;
+    }
+    let base_version = u64::from_le_bytes(payload[3..11].try_into().unwrap());
+    let version = u64::from_le_bytes(payload[11..19].try_into().unwrap());
+    // 0 is the reserved unversioned value; a wire carrying it under the
+    // flag is malformed and dies in `decode` — the peek just declines.
+    (version != 0).then_some((base_version, version))
+}
+
+/// The §6.2 item-9 **commit-gate verdict** for one delta admission on a
+/// `KV_LAYOUT_VERSIONS` volume — pure (unit-testable), called by the
+/// backend's merge paths with the delta's own version pair, the durable
+/// chain depth, and the durable head link's pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutVersionGate {
+    /// The claim joins the durable chain: stage the delta.
+    Stage,
+    /// The link is unverifiable or the segment must terminate — fall
+    /// back to the always-correct full `Put` (convergent by
+    /// construction: the full layout IS the writer's absolute state).
+    /// Covers: an unversioned delta on a versioned volume, a claim-0
+    /// writer (unknown provenance after a refetch), any claim against a
+    /// bare-`Put` head (compaction legitimately collapses a chain
+    /// underneath a live writer's RAM provenance — that shape must
+    /// never be fatal), and claim-0 against a pre-stamp unversioned
+    /// head (the first-touch upgrade rule).
+    Rebase,
+    /// A NONZERO claim that is not the durable head: two writers
+    /// genuinely disagree about the chain tip. REFUSED loud — staging
+    /// would make the fold produce a layout neither writer computed
+    /// ("divergent chains fold to divergent layouts"), and a silent
+    /// full-`Put` fallback would let a stale-based writer clobber the
+    /// head it never saw. `head == 0` names an unversioned head link.
+    Diverged { claimed: u64, head: u64 },
+}
+
+/// Decide one versioned-volume delta admission (see
+/// [`LayoutVersionGate`]): `delta_versions` is the record's own pair
+/// (`None` = unversioned record), `chain_depth` the durable delta count
+/// above the newest base, `head_versions` the newest link's pair
+/// (`None` = bare `Put` head when `chain_depth == 0`, an unversioned
+/// head link otherwise).
+pub fn layout_version_gate(
+    delta_versions: Option<(u64, u64)>,
+    chain_depth: u32,
+    head_versions: Option<(u64, u64)>,
+) -> LayoutVersionGate {
+    let Some((claimed, _version)) = delta_versions else {
+        // An unversioned record must never join a versioned volume's
+        // chain (segment homogeneity — the fold's law); the mint's
+        // exhaustion valve also lands here.
+        return LayoutVersionGate::Rebase;
+    };
+    match (chain_depth, head_versions) {
+        // Bare `Put` head: only the unverifiable-by-construction first
+        // link (claim 0) may START a segment. A nonzero claim names a
+        // state the `Put` may well BE (a compacted chain folds into its
+        // base), so it re-bases rather than refuses.
+        (0, _) => {
+            if claimed == 0 {
+                LayoutVersionGate::Stage
+            } else {
+                LayoutVersionGate::Rebase
+            }
+        }
+        // Versioned head: the claim must BE the head.
+        (_, Some((_, head_version))) => {
+            if claimed == head_version {
+                LayoutVersionGate::Stage
+            } else if claimed == 0 {
+                LayoutVersionGate::Rebase
+            } else {
+                LayoutVersionGate::Diverged {
+                    claimed,
+                    head: head_version,
+                }
+            }
+        }
+        // Unversioned head link (a pre-stamp chain): claim 0 terminates
+        // the segment with a re-base; a nonzero claim names a versioned
+        // base that provably is not there.
+        (_, None) => {
+            if claimed == 0 {
+                LayoutVersionGate::Rebase
+            } else {
+                LayoutVersionGate::Diverged { claimed, head: 0 }
+            }
+        }
+    }
 }
 
 /// Layout-wire errors. Mapped to `KvError::Corrupt` by the fold layer.
@@ -263,7 +351,13 @@ const F_BLOCK_MAP_ID: u8 = 1 << 0;
 const F_BLOCK_PREFIX: u8 = 1 << 1;
 const F_FILE_ID: u8 = 1 << 2;
 const F_DATA_KEY: u8 = 1 << 3;
-const F_KNOWN: u8 = F_BLOCK_MAP_ID | F_BLOCK_PREFIX | F_FILE_ID | F_DATA_KEY;
+/// Spec §6.2 item 9: the record carries `(base_version, version)` at
+/// fixed offsets `3..19` (right after the flags byte — the peek's law).
+/// A pre-item-9 binary's decode refuses this bit as an unknown flag,
+/// which is why emission is gated on the `KV_LAYOUT_VERSIONS` incompat
+/// bit (a stamped volume refuses those binaries at mount instead).
+const F_VERSIONED: u8 = 1 << 4;
+const F_KNOWN: u8 = F_BLOCK_MAP_ID | F_BLOCK_PREFIX | F_FILE_ID | F_DATA_KEY | F_VERSIONED;
 
 impl LayoutDelta {
     /// Build the delta representing `final_state` (the post-merge
@@ -329,8 +423,12 @@ impl LayoutDelta {
         self.encode_inner(false)
     }
 
-    fn encode_inner(&self, _keep_versions: bool) -> Vec<u8> {
+    fn encode_inner(&self, keep_versions: bool) -> Vec<u8> {
         debug_assert!(self.file_type.len() <= u8::MAX as usize);
+        // §6.2 item 9: the pair encodes iff this record IS versioned
+        // (`version != 0`) and the caller's volume admits the versioned
+        // wire (`keep_versions` — the KV_LAYOUT_VERSIONS strip seam).
+        let versioned = keep_versions && self.version != 0;
         let mut flags = 0u8;
         if self.block_map_id.is_some() {
             flags |= F_BLOCK_MAP_ID;
@@ -344,12 +442,19 @@ impl LayoutDelta {
         if self.data_key.is_some() {
             flags |= F_DATA_KEY;
         }
+        if versioned {
+            flags |= F_VERSIONED;
+        }
         let mut out = Vec::with_capacity(
-            32 + self.file_type.len()
+            48 + self.file_type.len()
                 + self.entries.iter().map(|(_, k)| 6 + k.len()).sum::<usize>(),
         );
         out.extend_from_slice(&LAYOUT_DELTA_MAGIC.to_le_bytes());
         out.push(flags);
+        if versioned {
+            out.extend_from_slice(&self.base_version.to_le_bytes());
+            out.extend_from_slice(&self.version.to_le_bytes());
+        }
         out.push(self.file_type.len() as u8);
         out.extend_from_slice(self.file_type.as_bytes());
         out.extend_from_slice(&self.size.to_le_bytes());
@@ -390,6 +495,21 @@ impl LayoutDelta {
                 "unknown flag bits {flags:#04x}"
             )));
         }
+        // §6.2 item 9: the version pair sits right after the flags (the
+        // fixed-offset peek's law). `version == 0` is the reserved
+        // unversioned value and cannot ride the flag.
+        let (base_version, version) = if flags & F_VERSIONED != 0 {
+            let b = r.u64("base_version")?;
+            let v = r.u64("version")?;
+            if v == 0 {
+                return Err(LayoutWireError::Malformed(
+                    "versioned flag with version 0 (the reserved unversioned value)".into(),
+                ));
+            }
+            (b, v)
+        } else {
+            (0, 0)
+        };
         let ft_len = r.u8("file_type len")? as usize;
         let file_type = r.str_exact(ft_len, "file_type")?;
         let size = r.u64("size")?;
@@ -427,8 +547,8 @@ impl LayoutDelta {
             file_id,
             data_key,
             entries,
-            base_version: 0,
-            version: 0,
+            base_version,
+            version,
         })
     }
 

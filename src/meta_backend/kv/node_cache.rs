@@ -808,16 +808,21 @@ impl NodeSnapshot {
         Ok(look)
     }
 
-    /// **DUR-8b** — how many `Delta` records are stacked above the key's
-    /// newest base (`Put`/`Delete`) in THIS snapshot, i.e. the DURABLE
-    /// chain depth a fold would have to apply. The publish path's chain
-    /// cap was a RAM-only counter that a metadata-cache refill reset to
-    /// zero, so the durable chain was bounded only by node compaction —
-    /// not by the knob that claims to bound it.
+    /// **DUR-8b + spec §6.2 item 9** — the key's durable delta-chain
+    /// probe: how many `Delta` records are stacked above the newest
+    /// base (`Put`/`Delete`) in THIS snapshot (the DURABLE chain depth
+    /// a fold would have to apply — the publish chain cap's input,
+    /// because the caller's RAM counter is reset by every
+    /// metadata-cache refill), plus the newest link's §6.2 item-9
+    /// `(base_version, version)` pair (`None` when the chain is empty
+    /// or its head is an unversioned record) — the commit gate's
+    /// durable-head name.
     ///
-    /// Same gather as [`Self::lookup`], newest-first, counting only
-    /// (never decoding): the deltas above the base are exactly the chain.
-    pub fn delta_depth(&self, key: &[u8]) -> u32 {
+    /// Same gather as [`Self::lookup`], newest-first, counting only —
+    /// the versions ride the fixed-offset peek
+    /// ([`crate::layout_wire::layout_delta_versions`]), never a record
+    /// decode.
+    pub fn delta_chain_probe(&self, key: &[u8]) -> (u32, Option<(u64, u64)>) {
         let tg = Self::run_group(&self.tail, key);
         let sg = Self::run_group(&self.stable, key);
         let bg = self.base.group_bounds(key);
@@ -828,13 +833,19 @@ impl NodeSnapshot {
             .chain(sg.clone().rev().map(|i| self.stable[i].record_ref()))
             .chain(bg.map(|i| self.base.record_ref(i)));
         let mut depth = 0u32;
+        let mut head: Option<(u64, u64)> = None;
         for r in gather {
             match r.kind {
-                super::record::RecordKind::Delta => depth += 1,
+                super::record::RecordKind::Delta => {
+                    if depth == 0 {
+                        head = crate::layout_wire::layout_delta_versions(r.value);
+                    }
+                    depth += 1;
+                }
                 _ => break,
             }
         }
-        depth
+        (depth, head)
     }
 
     /// Map a fold's borrowed value back to its provider for a zero-copy

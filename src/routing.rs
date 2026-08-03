@@ -5302,8 +5302,12 @@ impl DataRouter {
                 .as_deref()
                 .is_some_and(|id| id.starts_with("indirect:"));
         let t_commit = std::time::Instant::now();
+        // Spec §6.2 item 9: the link this save will stage, if the delta
+        // path engages — declared out here so the republish below can
+        // stamp the RAM provenance to exactly what was persisted.
+        let mut minted_version = 0u64;
         let delta_used = if delta_eligible {
-            let delta = crate::layout_wire::LayoutDelta::from_final_state(
+            let mut delta = crate::layout_wire::LayoutDelta::from_final_state(
                 &layout.file_type,
                 m.size,
                 layout.block_map_id.as_deref(),
@@ -5314,6 +5318,15 @@ impl DataRouter {
                     .expect("delta_eligible requires entries")
                     .to_vec(),
             );
+            // §6.2 item 9: name the base DURABLY — the delta claims the
+            // version of the persisted state this RAM entry descends
+            // from (0 = unknown provenance ⇒ the backend re-bases on a
+            // versioned volume) and carries its own freshly-minted,
+            // era-composed link version. The mint always runs (cheap);
+            // the backend strips the pair on un-stamped volumes so
+            // their wire stays byte-identical.
+            minted_version = crate::dlm::mint_layout_version();
+            delta.set_versions(m.layout_version, minted_version);
             // The full layout moves as `Bytes` (Lever B: the aggregated
             // conveyor parks it as the always-correct fallback — a move,
             // never a per-save copy).
@@ -5400,6 +5413,14 @@ impl DataRouter {
         // Lever A (2026-08-01): the republished entry IS the just-
         // persisted state — coherent with the save's fencing era.
         cached.layout_base_token = fencing_token;
+        // §6.2 item 9: the RAM provenance follows the persisted head —
+        // a delta save's next link claims the version just staged; a
+        // full save re-based to a bare Put, whose next link claims 0
+        // (the only claim the gate stages onto a bare base). If the
+        // backend fell back to a full Put (`delta_used == false` from a
+        // versioned-volume re-base or any eligibility miss), the minted
+        // version was never persisted and must not be claimed.
+        cached.layout_version = if delta_used { minted_version } else { 0 };
         self.metadata_cache.insert(ino, cached);
 
         if let Some(ref old_key) = old_indirect_to_free {

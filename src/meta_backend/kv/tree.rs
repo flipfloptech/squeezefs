@@ -508,13 +508,18 @@ impl KvTree {
         }
     }
 
-    /// **DUR-8b** — the DURABLE delta-chain depth of `key`: how many
-    /// `Delta` records sit above its newest base. The publish path's
-    /// chain cap consults this instead of trusting a RAM counter that a
-    /// metadata-cache refill zeroes.
-    pub async fn delta_depth(&self, key: &[u8]) -> Result<u32, KvError> {
+    /// **DUR-8b + spec §6.2 item 9** — the DURABLE delta-chain probe of
+    /// `key`: how many `Delta` records sit above its newest base (the
+    /// chain cap consults this instead of trusting a RAM counter a
+    /// metadata-cache refill zeroes) plus the newest link's item-9
+    /// `(base_version, version)` pair (the commit gate's durable-head
+    /// name; `None` = bare base or unversioned head).
+    pub async fn delta_chain_probe(
+        &self,
+        key: &[u8],
+    ) -> Result<(u32, Option<(u64, u64)>), KvError> {
         let leaf = self.resolve_leaf(key).await?;
-        Ok(leaf.snapshot().delta_depth(key))
+        Ok(leaf.snapshot().delta_chain_probe(key))
     }
 
     // -----------------------------------------------------------------

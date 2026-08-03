@@ -852,15 +852,64 @@ fn fold_deltas_onto_put(base_value: &[u8], deltas: &[RecordRef<'_>]) -> Result<V
         let x = XattrValue::decode(base_value)?;
         let mut layout = layout_wire::decode_base_layout(&x.value).map_err(corrupt)?;
         // Ascending seq order: oldest delta first, newest last wins.
+        //
+        // Spec §6.2 item 9 — the chain-link law (KV_LAYOUT_VERSIONS
+        // volumes; unversioned records never trip it): within one base
+        // segment the links are HOMOGENEOUS (all versioned or all
+        // unversioned — the commit gate re-bases before a versioned
+        // link can join a pre-stamp chain), the first versioned link
+        // claims base 0 (the bare `Put` carries no stamp, and the gate
+        // stages nothing else onto one), and every later link's
+        // `base_version` must BE the previous link's `version`. A
+        // violated law is a fork two writers staged against one base —
+        // folding it would produce a layout NEITHER computed, so it
+        // refuses loud instead ("divergent chains fold to divergent
+        // layouts"). Tie-duplicate records (same seq presented across
+        // sources — the node-bset/replay-window overlap this fold's
+        // input law explicitly allows for identical-effect records)
+        // re-apply idempotently and skip the link check.
+        let mut prev_version: Option<u64> = None;
+        let mut saw_unversioned = false;
+        let mut last_seq: Option<u64> = None;
         for d in deltas.iter().rev() {
             if !layout_wire::is_layout_delta(d.value) {
                 return Err(KvError::Corrupt(
                     "mixed delta classes in one key's chain".into(),
                 ));
             }
-            LayoutDelta::decode(d.value)
-                .map_err(corrupt)?
-                .apply_to(&mut layout);
+            let dec = LayoutDelta::decode(d.value).map_err(corrupt)?;
+            let duplicate = last_seq == Some(d.seq);
+            last_seq = Some(d.seq);
+            if !duplicate {
+                if dec.version != 0 {
+                    if saw_unversioned {
+                        return Err(KvError::Corrupt(format!(
+                            "layout-delta chain mixes a versioned link (seq {}) above \
+                             unversioned ones (spec §6.2 item 9)",
+                            d.seq
+                        )));
+                    }
+                    let want = prev_version.unwrap_or(0);
+                    if dec.base_version != want {
+                        return Err(KvError::Corrupt(format!(
+                            "divergent layout-delta chain (spec §6.2 item 9): link seq {} \
+                             names base version {:#x} but folds onto {:#x}",
+                            d.seq, dec.base_version, want
+                        )));
+                    }
+                    prev_version = Some(dec.version);
+                } else {
+                    if prev_version.is_some() {
+                        return Err(KvError::Corrupt(format!(
+                            "layout-delta chain mixes an unversioned link (seq {}) above a \
+                             versioned one (spec §6.2 item 9)",
+                            d.seq
+                        )));
+                    }
+                    saw_unversioned = true;
+                }
+            }
+            dec.apply_to(&mut layout);
         }
         super::META_KV_LAYOUT_DELTA_FOLDS
             .fetch_add(deltas.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1048,6 +1097,17 @@ impl FoldedHead {
 /// byte. The equivalence property `fold_forward ≡ fold_newest_first` over
 /// randomized histories is pinned by proptest below (both delta classes)
 /// and by `tests/kv_fold_slimming_tests.rs` end-to-end (risk R7).
+///
+/// **§6.2 item-9 note:** this incremental step is deliberately
+/// version-BLIND — a materialized head carries no memory of the last
+/// link's `version`, so the chain-link law cannot be evaluated here.
+/// That is sound because the COMMIT GATE
+/// (`KvMetaBackend::admit_versioned_delta`) is what keeps divergent
+/// links off the durable chain in the first place, and every
+/// from-scratch fold ([`fold_newest_first`], [`compact_fold`] — read
+/// folds, compaction, replay reads) runs the strict law in
+/// `fold_deltas_onto_put`; a gate-bypassing chain therefore refuses
+/// loud at the latest by its next cold fold or compaction pass.
 pub fn fold_forward(
     prev: &FoldedHead,
     kind: RecordKind,

@@ -6739,7 +6739,15 @@ impl KvMetaBackend {
                 .await;
         }
         let (done, rx) = tokio::sync::oneshot::channel();
-        let delta_wire = Bytes::from(delta.encode());
+        // Spec §6.2 item 9: the versioned wire rides ONLY volumes whose
+        // superblock carries KV_LAYOUT_VERSIONS — an un-stamped volume
+        // strips the pair at encode and stays byte-identical to the
+        // shipped bit-5 wire (a pre-item-9 binary keeps reading it).
+        let delta_wire = Bytes::from(if self.layout_versions_stamped() {
+            delta.encode()
+        } else {
+            delta.encode_unversioned()
+        });
         let weight = (delta_wire.len() + full_layout.len()) as u64;
         // Enqueue-then-elect with no await between (the conveyor_core
         // no-lost-wakeup protocol).
@@ -6884,6 +6892,14 @@ impl KvMetaBackend {
             tokio::sync::oneshot::Sender<crate::error::Result<bool>>,
             crate::error::SqueezefsError,
         )> = Vec::new();
+        // Spec §6.2 item 9 (versioned volumes): the tree probe reads the
+        // COMMITTED chain, but this pass stages several members into ONE
+        // tx — a second member for the SAME ino must gate against the
+        // head this pass just staged, or two links naming one base could
+        // enter one commit (the exact fork the gate exists to refuse).
+        let versions_stamped = self.layout_versions_stamped();
+        let mut batch_heads: std::collections::HashMap<Ino, (u32, Option<(u64, u64)>)> =
+            std::collections::HashMap::new();
         for op in batch {
             let t_iread = std::time::Instant::now();
             let v = match self.read_inode_value(op.ino).await {
@@ -6921,6 +6937,7 @@ impl KvMetaBackend {
             // The backend eligibility half, per member: a live non-JSON
             // base + the durable incompat ratchet.
             let mut use_delta = false;
+            let mut probe_depth = 0u32;
             if existing {
                 match self.xattrs.lookup(&key).await {
                     Ok(Some(cur)) => {
@@ -6930,17 +6947,40 @@ impl KvMetaBackend {
                         // DUR-8b (aggregated twin of the direct path):
                         // the cap must bound the DURABLE chain, not the
                         // caller's RAM counter, which a metadata-cache
-                        // refill resets to 0.
+                        // refill resets to 0. An earlier member of THIS
+                        // pass already moved the ino's head: its staged
+                        // state wins over the committed probe.
                         let max_chain = crate::routing::layout_delta_max_chain();
-                        let depth = match self.xattrs.delta_depth(&key).await {
-                            Ok(d) => d,
-                            Err(e) => {
-                                failed.push((op.done, e.into()));
-                                continue;
-                            }
+                        let (depth, head_versions) = match batch_heads.get(&op.ino) {
+                            Some(&h) => h,
+                            None => match self.xattrs.delta_chain_probe(&key).await {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    failed.push((op.done, e.into()));
+                                    continue;
+                                }
+                            },
                         };
+                        probe_depth = depth;
                         if base_ok && max_chain > 0 && depth < max_chain {
                             use_delta = self.layout_deltas_ready().await;
+                        }
+                        // Spec §6.2 item 9: the durable base-name gate —
+                        // Stage / re-base / REFUSE loud (per member: a
+                        // diverged claim fails ALONE, survivors commit).
+                        if use_delta && versions_stamped {
+                            match self.admit_versioned_delta(
+                                op.ino,
+                                crate::layout_wire::layout_delta_versions(&op.delta_wire),
+                                depth,
+                                head_versions,
+                            ) {
+                                Ok(stage) => use_delta = stage,
+                                Err(e) => {
+                                    failed.push((op.done, e));
+                                    continue;
+                                }
+                            }
                         }
                     }
                     Ok(None) => {}
@@ -6951,6 +6991,22 @@ impl KvMetaBackend {
                 }
             }
             publish_phase_record(PublishPhase::CommitSlotProbe, t_slot);
+            if versions_stamped {
+                // Record the head THIS member is about to stage for any
+                // later same-ino member of the pass (delta: one deeper,
+                // head = this wire's pair; full Put: a bare re-base).
+                batch_heads.insert(
+                    op.ino,
+                    if use_delta {
+                        (
+                            probe_depth.saturating_add(1),
+                            crate::layout_wire::layout_delta_versions(&op.delta_wire),
+                        )
+                    } else {
+                        (0, None)
+                    },
+                );
+            }
             if use_delta {
                 super::META_KV_LAYOUT_DELTA_BYTES
                     .fetch_add(op.delta_wire.len() as u64, Ordering::Relaxed);
@@ -7061,15 +7117,27 @@ impl KvMetaBackend {
                 // not by `SQUEEZEFS_LAYOUT_DELTA_MAX_CHAIN`. One extra
                 // leaf resolve on the publish path, no record decodes.
                 let max_chain = crate::routing::layout_delta_max_chain();
-                let under_cap = max_chain > 0 && self.xattrs.delta_depth(&key).await? < max_chain;
-                if base_ok && under_cap {
+                let (depth, head_versions) = self.xattrs.delta_chain_probe(&key).await?;
+                if base_ok && max_chain > 0 && depth < max_chain {
                     use_delta = self.layout_deltas_ready().await;
+                }
+                // Spec §6.2 item 9: the durable base-name gate — Stage /
+                // re-base / REFUSE loud (see `admit_versioned_delta`).
+                if use_delta && self.layout_versions_stamped() {
+                    let dv = (delta.version != 0).then_some((delta.base_version, delta.version));
+                    use_delta = self.admit_versioned_delta(ino, dv, depth, head_versions)?;
                 }
             }
         }
         publish_phase_record(PublishPhase::CommitSlotProbe, t_slot);
         if use_delta {
-            let wire = delta.encode();
+            // §6.2 item 9 strip seam: only a KV_LAYOUT_VERSIONS volume
+            // stores the versioned wire (see `merge_layout_and_size`).
+            let wire = if self.layout_versions_stamped() {
+                delta.encode()
+            } else {
+                delta.encode_unversioned()
+            };
             super::META_KV_LAYOUT_DELTA_BYTES.fetch_add(wire.len() as u64, Ordering::Relaxed);
             super::META_KV_LAYOUT_DELTA_COMMITS.fetch_add(1, Ordering::Relaxed);
             tx.stage_delta_raw(TREE_XATTRS, key, wire);
@@ -7091,6 +7159,65 @@ impl KvMetaBackend {
         self.commit_tx(tx).await?;
         publish_phase_record(PublishPhase::CommitTxWait, t_tx);
         Ok(use_delta)
+    }
+
+    /// Spec §6.2 item 9: whether this volume carries the
+    /// `KV_LAYOUT_VERSIONS` incompat bit — the OPEN-time superblock
+    /// snapshot, deliberately with NO mount-time ratchet (ruling D9:
+    /// nothing stamps the bit in production; the offline
+    /// [`super::superblock::set_layout_versions_bit`] verb is the
+    /// Phase-8 upgrade path), so version emission can never race the
+    /// bit's durability: the bit is on disk strictly before the first
+    /// versioned record.
+    fn layout_versions_stamped(&self) -> bool {
+        self.sb.features_incompat & super::superblock::FEATURE_INCOMPAT_KV_LAYOUT_VERSIONS != 0
+    }
+
+    /// Spec §6.2 item 9 — the durable base-name **commit gate** for one
+    /// delta admission on a versioned volume (the pure verdict lives in
+    /// [`crate::layout_wire::layout_version_gate`]; this is the loud
+    /// half). `Ok(true)` = stage the delta; `Ok(false)` = fall back to
+    /// the always-correct full `Put` (the convergent re-base — the
+    /// refetched-writer, compaction-collapse, and pre-stamp first-touch
+    /// shapes); `Err` = a NONZERO base claim that is not the durable
+    /// chain head — the "divergent chains fold to divergent layouts"
+    /// hazard, refused loud and staged NEVER (a silent full-`Put`
+    /// fallback here would let a stale-based writer clobber a head it
+    /// never saw).
+    ///
+    /// The refusal is UNREACHABLE from this daemon's own publish path
+    /// by construction: every local layout persist funnels through
+    /// `save_metadata_to_backend_ext`, whose republish stamps the RAM
+    /// provenance (`CachedMetadata::layout_version`) to exactly the
+    /// link it staged (or 0 on a full save), all under
+    /// `INODE_META_LOCKS` + this backend's own 4a I-guard. What it
+    /// exists to catch is the FOREIGN half: an S8/S9 shipped publish
+    /// whose co-writer's notion of the base disagrees with this
+    /// authority's durable chain — the error crosses the publish wire
+    /// back to the co-writer, which must refetch and recompute rather
+    /// than have its stale base silently folded or clobbered in.
+    fn admit_versioned_delta(
+        &self,
+        ino: Ino,
+        delta_versions: Option<(u64, u64)>,
+        chain_depth: u32,
+        head_versions: Option<(u64, u64)>,
+    ) -> Result<bool> {
+        use crate::layout_wire::LayoutVersionGate;
+        match crate::layout_wire::layout_version_gate(delta_versions, chain_depth, head_versions) {
+            LayoutVersionGate::Stage => Ok(true),
+            LayoutVersionGate::Rebase => Ok(false),
+            LayoutVersionGate::Diverged { claimed, head } => {
+                Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                    "layout publish for ino {ino} REFUSED (spec §6.2 item 9): the delta names \
+                     base version {claimed:#x} but the durable chain head on meta volume {} is \
+                     {head:#x} (depth {chain_depth}) — divergent chains fold to divergent \
+                     layouts, so the writer must refetch its base and recompute; nothing was \
+                     staged",
+                    self.path.display()
+                )))
+            }
+        }
     }
 
     /// The one-time `KV_LAYOUT_DELTAS` ratchet (KD-14 ordering: the bit

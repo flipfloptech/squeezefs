@@ -340,10 +340,11 @@ struct LanePartition {
     /// Lane bitmask this mount may mint in: its own lane always, plus any
     /// lane [`BlockAllocator::adopt_lane`] has adopted under a drain proof.
     owned: AtomicU64,
-    /// The durable reservation frontier (exclusive block index) of the
-    /// **own** lane — raised through [`Self::sink`] before any mint reaches
-    /// it, so a successor's [`crate::data_alloc_lane::recover_lane_floor`]
-    /// starts above every index this mount could have minted.
+    /// The durable reservation frontier (exclusive, **dense** block index) —
+    /// raised through [`Self::sink`] for every owned lane before any mint
+    /// reaches it, so a successor's
+    /// [`crate::data_alloc_lane::recover_lane_floor`] starts above every
+    /// index this mount could have minted.
     reserved_upto: AtomicU64,
     /// Fresh blocks one raise covers
     /// ([`crate::data_alloc_lane::reserve_grain_blocks`], resolved once at
@@ -511,7 +512,7 @@ impl BlockAllocator {
         self.lanes.get().map(|l| l.owned.load(Ordering::Acquire))
     }
 
-    /// The own lane's durable reservation frontier (exclusive block index).
+    /// The durable reservation frontier (exclusive, dense block index).
     pub fn lane_reserved_upto(&self) -> Option<u64> {
         self.lanes
             .get()
@@ -541,10 +542,18 @@ impl BlockAllocator {
     /// The witness is S7's [`crate::data_custody::DeadEpoch`], i.e. the
     /// SAME drain proof [`Self::release_quarantine`] demands — a landed
     /// WERO preempt of the dead lane's host on a PR substrate, recovery's
-    /// proof of death otherwise. Adoption needs **no durable record**
-    /// because the reservation watermark is keyed on the LANE, not the
-    /// holder: minting in an adopted lane raises that lane's own watermark,
-    /// so any future holder of it recovers above us.
+    /// proof of death otherwise. Adoption needs **no new durable
+    /// structure** because the reservation watermark is keyed on the LANE,
+    /// not the holder: [`Self::reserve_lane_frontier`] declares the dense
+    /// frontier for every owned lane, so any future holder of an adopted
+    /// lane recovers above the indices we minted in it.
+    ///
+    /// The adopted lane's frontier starts from OUR dense cursor rather than
+    /// from the dead holder's record, which can write that lane's record
+    /// backwards. That is sound precisely because adoption demands a proof
+    /// of death: nothing the dead holder minted can still be written, and
+    /// our own subsequent raises dominate our own mints. It is also why a
+    /// LIVE peer's lane is never adoptable.
     ///
     /// `false` ⇔ nothing changed (unpartitioned, own lane, out of range, or
     /// already adopted).
@@ -621,12 +630,19 @@ impl BlockAllocator {
         }
     }
 
-    /// Raise the own lane's durable reservation so it covers `block_idx`,
-    /// **before that offset is handed to a caller**. One `await`ed commit
-    /// per [`crate::data_alloc_lane::reserve_grain_blocks`] fresh blocks;
-    /// free-list reuse never reaches here (a freed index is dominated by the
-    /// derived floor, so it needs no new watermark) — which is what keeps
-    /// the rewrite hot path at zero reservation work.
+    /// Raise the durable reservation so it covers `block_idx`, **before that
+    /// offset is handed to a caller**. One `await`ed commit per
+    /// [`crate::data_alloc_lane::reserve_grain_blocks`] fresh blocks **per
+    /// owned lane**; free-list reuse never reaches here (a freed index is
+    /// dominated by the derived floor, so it needs no new watermark) — which
+    /// is what keeps the rewrite hot path at zero reservation work.
+    ///
+    /// The frontier is a **dense** index bound, and a raise declares the same
+    /// bound for **every lane this mount owns** — so an adopted lane's future
+    /// holder also recovers above the indices we minted in it. One commit on
+    /// the shipped shape (a mount owns exactly its own lane); an adopting
+    /// mount pays one per adopted lane per grain, which is the price of
+    /// reaching a dead writer's space.
     async fn reserve_lane_frontier(&self, block_idx: u64) -> Result<()> {
         let Some(lanes) = self.lanes.get() else {
             return Ok(());
@@ -635,12 +651,18 @@ impl BlockAllocator {
             return Ok(());
         }
         let want = block_idx.saturating_add(lanes.grain).saturating_add(1);
+        let owned = lanes.owned.load(Ordering::Acquire);
         match lanes.sink.get() {
             Some(sink) => {
-                sink(lanes.part.writer_id(), want).await?;
-                crate::fuse_client::METRICS
-                    .alloc_lane_reservations
-                    .fetch_add(1, Ordering::Relaxed);
+                for lane in 0..lanes.part.writers() {
+                    if owned & (1u64 << lane) == 0 {
+                        continue;
+                    }
+                    sink(lane, want).await?;
+                    crate::fuse_client::METRICS
+                        .alloc_lane_reservations
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
             None => {
                 // No durable sink (offline tools, unit fixtures): the
@@ -1463,11 +1485,8 @@ impl BlockAllocator {
                 return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
                     std::io::ErrorKind::StorageFull,
                     format!(
-                        "data volume '{}' full: {} of {} blocks allocated{}",
-                        self._volume_id,
-                        cur,
-                        cap,
-                        self.lane_full_context()
+                        "data volume '{}' full: {} of {} blocks allocated",
+                        self._volume_id, cur, cap
                     ),
                 )));
             }
@@ -1481,26 +1500,36 @@ impl BlockAllocator {
         }
     }
 
-    /// The lane clause of a `StorageFull` message: empty when
-    /// unpartitioned, and otherwise the honest statement an operator needs
-    /// — *this lane is out of blocks, N free blocks belong to other lanes,
-    /// and the way to reach them is a proven-dead lane adoption*
-    /// (`docs/operations.md` §Multi-writer capacity planning).
-    fn lane_full_context(&self) -> String {
+    /// Enrich a `StorageFull` refusal with the lane diagnosis — *this lane is
+    /// out of blocks, N free blocks belong to other lanes, and the way to
+    /// reach them is a proven-dead lane adoption* (`docs/operations.md`
+    /// §Multi-writer capacity planning) — and count it.
+    ///
+    /// Runs **once per refused allocation**, at the single exit of
+    /// [`Self::allocate_block`], never inside `next_fresh_block`: the ENOSPC
+    /// pressure valve retries up to `ENOSPC_VALVE_MAX_ATTEMPTS` times, and
+    /// the free-list scan this performs is exactly the wrong thing to repeat
+    /// on a store whose free supply is large but foreign. The
+    /// [`std::io::ErrorKind::StorageFull`] class is preserved verbatim, so
+    /// the valve, the reclaim ladder and every caller behave identically.
+    fn refuse_lane_enospc(&self, e: crate::error::SqueezefsError) -> crate::error::SqueezefsError {
         let Some(lanes) = self.lanes.get() else {
-            return String::new();
+            return e;
         };
         let foreign = self.foreign_lane_free_blocks();
         crate::fuse_client::METRICS
             .alloc_lane_enospc_refusals
             .fetch_add(1, Ordering::Relaxed);
-        format!(
-            " — lane {} of {} is exhausted while {foreign} free block(s) belong to lanes this \
+        let msg = format!(
+            "{e} — lane {} of {} is exhausted while {foreign} free block(s) belong to lanes this \
              mount does not own (alloc_lane_enospc_refusals; reach them by adopting a lane whose \
-             holder is proven dead, or grow the volume set)",
+             holder is proven dead, or grow the volume set — docs/operations.md §Multi-writer \
+             capacity planning)",
             lanes.part.writer_id(),
             lanes.part.writers()
-        )
+        );
+        log::error!("{msg}");
+        crate::error::SqueezefsError::Io(std::io::Error::new(std::io::ErrorKind::StorageFull, msg))
     }
 
     /// The reservation gate between a claimed index and its caller (DLM S9
@@ -1532,6 +1561,15 @@ impl BlockAllocator {
     }
 
     pub async fn allocate_block(&self) -> Result<u64> {
+        match self.allocate_block_inner().await {
+            // DLM S9: the lane diagnosis is attached ONCE, here, at the
+            // single exit — never inside the valve's retry loop.
+            Err(e) if is_storage_full(&e) => Err(self.refuse_lane_enospc(e)),
+            other => other,
+        }
+    }
+
+    async fn allocate_block_inner(&self) -> Result<u64> {
         if let Err(e) = Self::reader_gate("block allocation") {
             return Err(e);
         }

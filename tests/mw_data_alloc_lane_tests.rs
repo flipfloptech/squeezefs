@@ -804,6 +804,46 @@ async fn adopting_a_proven_dead_lane_reclaims_its_space_and_shrinks_the_bound() 
     assert!(!plain.adopt_lane(1, proof));
 }
 
+/// Contract: a reservation raise declares the dense frontier for **every**
+/// owned lane — so a future holder of an ADOPTED lane also recovers above
+/// the indices we minted in it, and adoption needs no new durable structure.
+/// On the shipped shape (one owned lane) this is one commit, unchanged.
+#[tokio::test]
+async fn a_raise_declares_the_frontier_for_every_owned_lane() {
+    let _serial = serial();
+    let a = allocator("lane-adopt-reserve", 0).await;
+    a.engage_alloc_lanes(part(2, 0)).expect("engage");
+    let rec = Arc::new(Recorder::default());
+    a.set_lane_reserve_sink(rec.sink());
+
+    a.allocate_block().await.expect("mint");
+    assert_eq!(
+        rec.raises().iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+        vec![0],
+        "one owned lane, one commit"
+    );
+
+    let proof = declare_dead_epoch("test: adopt then reserve");
+    assert!(a.adopt_lane(1, proof));
+    // Force the next raise (the grain is large, so drain the frontier by
+    // asking for a far-away index through the ascending pick's refusal path
+    // instead: simplest is to allocate until the frontier is passed).
+    let frontier = a.lane_reserved_upto().expect("engaged");
+    while a.highest_block_index() <= frontier {
+        a.allocate_block().await.expect("mint");
+    }
+    let lanes: std::collections::BTreeSet<u16> =
+        rec.raises().iter().skip(1).map(|(l, _)| *l).collect();
+    assert_eq!(
+        lanes,
+        [0u16, 1].into_iter().collect(),
+        "after adoption a raise declares BOTH owned lanes: {:?}",
+        rec.raises()
+    );
+    let ups: Vec<u64> = rec.raises().iter().rev().take(2).map(|(_, u)| *u).collect();
+    assert_eq!(ups[0], ups[1], "and it is the same dense frontier for both");
+}
+
 /// Contract (design requirement 5): the stranded capacity is a published
 /// formula, not a vibe — `cap − Σ owned lane shares`, with the two readings
 /// `docs/operations.md` states (the reachability bound and the `W − 1`

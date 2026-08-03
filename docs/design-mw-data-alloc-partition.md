@@ -162,9 +162,16 @@ Five deliberate choices:
   set position, so a volume removed and re-added cannot inherit a stranger's
   watermark;
 * **keyed on the LANE, never on writer identity.** This is what makes
-  adoption (§4) free of new durable state: an adopting writer raises the
-  adopted lane's own watermark as it mints there, so any future holder of
-  that lane recovers above it;
+  adoption (§4) free of any new durable structure: the frontier is a *dense*
+  index bound and a raise declares it for **every lane this mount owns**, so
+  a future holder of an adopted lane also recovers above the indices we
+  minted in it. One commit per grain on the shipped shape (a mount owns one
+  lane); an adopting mount pays one per adopted lane, which is the price of
+  reaching a dead writer's space. An adopted lane's frontier starts from our
+  own dense cursor rather than from the dead holder's record, so that
+  record can be written backwards — sound precisely because adoption demands
+  a proof of death (nothing the dead holder minted can still be written), and
+  the reason a LIVE peer's lane is never adoptable;
 * **versioned and checksummed** even though it rides a whole-tx-atomic
   record: a torn or bit-flipped watermark that decoded *silently* would place
   the floor BELOW a live peer's offsets, which is the one failure the record

@@ -176,6 +176,19 @@ pub static TEST_PENDING_FREE_CAP: AtomicU64 = AtomicU64::new(0);
 /// on µs-commit sandboxes. One relaxed load per pass; zero-cost unset.
 pub static TEST_LAYOUT_MERGE_HOLD_MS: AtomicU64 = AtomicU64::new(0);
 
+/// Test seam (the 2026-08 wedge-crumb fix): disable
+/// [`KvMetaBackend::cover_bring_up_residue`] at open. The cover IS "the
+/// first post-mount durable checkpoint" the §2-A mount-gate law names,
+/// so on the product path the re-parked replayed frees are discharged
+/// before `open` returns — correct, but it makes the park/drain
+/// progression invisible to the pins that keep §2-A red-stays-red
+/// (`tests/kv_smo_crash_completeness_tests.rs`). Those suites arm this
+/// to observe the parked window and drive the drain themselves;
+/// production always covers. `false` = off (one relaxed load per open —
+/// a control-plane path).
+pub static TEST_BRING_UP_COVER_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// `SQUEEZEFS_TIMEOUT` as the D1.b watchdog/escalation threshold
 /// (design-metadata-throughput §6): read per `open` (control-plane —
 /// never on an op path), default 30 s. Deliberately NOT process-memoized:
@@ -1115,6 +1128,21 @@ impl KvMetaBackend {
             // batch failure's rollback + hole checkpoint ran inside the
             // pass, before its fan-out woke us), so releasing the lock
             // here is exactly the drop-order release, made synchronous.
+            drop(be.guard_fd.lock().unwrap().take());
+            return Err(e);
+        }
+
+        // (6) Cover the bring-up residue BEFORE the volume serves (and
+        // before the cadence task exists — same inline-guarded-cycles
+        // posture as `preclaim_ring_recovery`): the claim tx just
+        // committed above must not sit committed-but-uncovered, or its
+        // bytes become the D1.b wedge-crumb (see
+        // [`Self::cover_bring_up_residue`]). A refusal tears down like a
+        // gate refusal: the claim record stays (crash-equivalent — the
+        // same-host dead-pid proof reclaims it instantly), the PR and
+        // flock release deterministically.
+        if let Err(e) = be.cover_bring_up_residue().await {
+            be.release_reservation().await;
             drop(be.guard_fd.lock().unwrap().take());
             return Err(e);
         }
@@ -2912,6 +2940,73 @@ impl KvMetaBackend {
             "checkpoint tail failed to clear the journal hole ending at {pos} after 8 \
              cycles (tail stuck at {}) — replay would walk into the hole",
             self.last_ledger_tail.load(Ordering::Acquire)
+        )))
+    }
+
+    /// Cover this volume's **bring-up journal residue**: barriered
+    /// checkpoint cycles until `reusable_upto == head`, so the volume
+    /// SERVES with an empty replay window and a ZERO reclaimable tail.
+    ///
+    /// **Why this is load-bearing (the 2026-08 merge-wave wedge-crumb
+    /// regression, pinned by `tests/fuse_watchdog_teardown_tests.rs`
+    /// `fresh_write_mount_serves_with_zero_reclaimable_journal_residue`):**
+    /// every bring-up commit — the D0 `writer_claim` tx (since DLM S2
+    /// carrying the `writer_term` record too), and at the routed layer
+    /// the S3.5 intent roll-forward + retirement — used to be left
+    /// committed-but-uncovered. On a wedged-not-failed ring (the D1.b
+    /// audit-row-2 class) the first checkpoint tick then covered that
+    /// residue and released exactly its size as admission budget: a
+    /// one-shot crumb that let any parked committer with a small enough
+    /// entry slip through the park-escalation lattice and commit
+    /// silently — and the entry-write success reset `journal_failures`,
+    /// erasing the crossings already tripped. S2 grew the claim tx from
+    /// 186 B to 249 B, past a 195 B create entry, and the pinned
+    /// escalation law fell. Zero residue at serve-start closes the
+    /// CLASS (every committer size, every bring-up commit) instead of
+    /// re-tuning sizes, and makes bring-up symmetric with shutdown's
+    /// `tail == head` law (an empty replay window at both ends).
+    ///
+    /// Read-only backends never write and never claimed — nothing to
+    /// cover, and covering would violate the §4.11 withhold. The
+    /// fixpoint loop is the shutdown final-cycle discipline verbatim
+    /// (`checkpoint.rs`): a cycle's flush pass may itself journal (SMO
+    /// claims/frees land past the tail it was computed from), so iterate
+    /// — convergence is bounded by the SMO cascade height; the bound is
+    /// defensive and a stuck tail fails the mount loud.
+    pub async fn cover_bring_up_residue(&self) -> std::result::Result<(), KvError> {
+        // The preclaim-recovery bound, not the shutdown fixpoint's 16: a
+        // crash-remount's residue includes the whole replay window (the
+        // wedged pinned-floor shapes recover HERE now — remount IS
+        // recovery), and every cycle is progress-audited (clause b), so
+        // a genuine wedge fails loud long before the bound.
+        const BRING_UP_COVER_CYCLES: u32 = 64;
+        if self.read_only {
+            return Ok(());
+        }
+        if TEST_BRING_UP_COVER_DISABLED.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        {
+            let core = self.ring.core();
+            if core.head() == core.reusable_upto() {
+                return Ok(());
+            }
+        }
+        let mut smo = self.smo.lock().await;
+        for _ in 0..BRING_UP_COVER_CYCLES {
+            self.checkpoint_cycle(&mut smo, true).await?;
+            let core = self.ring.core();
+            if core.head() == core.reusable_upto() {
+                return Ok(());
+            }
+        }
+        Err(KvError::Corrupt(format!(
+            "{}: bring-up journal residue did not cover within \
+             {BRING_UP_COVER_CYCLES} barriered cycles (head={}, reusable_upto={}) — \
+             refusing to serve with a reclaimable tail (the D1.b wedge-crumb class)",
+            self.path.display(),
+            self.ring.core().head(),
+            self.ring.core().reusable_upto(),
         )))
     }
 

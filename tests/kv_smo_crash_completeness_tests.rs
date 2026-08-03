@@ -19,7 +19,9 @@
 //! the process-crash equivalent: every device write is buffered (page
 //! cache), so a fresh `open` of the same file sees exactly the bytes a
 //! post-kill remount would.
-use squeezefs::meta_backend::kv::backend::{KvMetaBackend, TEST_PENDING_FREE_CAP};
+use squeezefs::meta_backend::kv::backend::{
+    KvMetaBackend, TEST_BRING_UP_COVER_DISABLED, TEST_PENDING_FREE_CAP,
+};
 use squeezefs::meta_backend::kv::builder::{digest_backend, format_v3, FormatV3Options};
 use squeezefs::meta_backend::kv::record::TREE_INODES;
 use squeezefs::meta_backend::kv::tree::{
@@ -769,9 +771,16 @@ async fn mount_side_replayed_free_parks_until_post_mount_checkpoint() {
     impl Drop for Cleanup {
         fn drop(&mut self) {
             std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+            TEST_BRING_UP_COVER_DISABLED.store(false, Ordering::SeqCst);
         }
     }
     std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    // Hold the wedge-crumb bring-up cover off: on the product path it IS
+    // the "first post-mount durable checkpoint" this pin names, running
+    // inside `open` — correct, but it would discharge the parked window
+    // before this test can observe it. The seam keeps the §2-A
+    // park-then-drain progression observable and red-stays-red.
+    TEST_BRING_UP_COVER_DISABLED.store(true, Ordering::SeqCst);
     let _cleanup = Cleanup;
 
     let (routed, kv, file) = sandbox().await;
@@ -1251,10 +1260,17 @@ async fn pending_free_wedged_shape_reopen_recovers_and_drains() {
         fn drop(&mut self) {
             std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
             TEST_PENDING_FREE_CAP.store(0, Ordering::SeqCst);
+            TEST_BRING_UP_COVER_DISABLED.store(false, Ordering::SeqCst);
         }
     }
     std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
     TEST_PENDING_FREE_CAP.store(2, Ordering::SeqCst);
+    // Hold the wedge-crumb bring-up cover off (see
+    // `mount_side_replayed_free_parks_until_post_mount_checkpoint`): on
+    // the product path `open` itself now runs the recovering cycles —
+    // remount IS recovery — but this pin drives and observes the §2-A
+    // re-park + drain progression explicitly.
+    TEST_BRING_UP_COVER_DISABLED.store(true, Ordering::SeqCst);
     let _cleanup = Cleanup;
 
     let (routed, kv, file) = sandbox().await;

@@ -851,9 +851,13 @@ async fn v3_mount_replays_journal_window_into_the_cache() {
     let (b, inos) = describe_v3();
     b.build(file.path(), V3_VOL_LEN).await.unwrap();
 
-    // A clean image replays nothing.
+    // A clean image replays nothing. Observed through a PROBE open —
+    // probes never write, so the built image's ledger tail stays where
+    // the raw ring writes below assume it (a full write `open` commits
+    // the claim tx AND covers its bring-up residue with a checkpoint
+    // since the wedge-crumb fix, superseding the built ledger slot).
     let (next_ino_before, sb, ledger) = {
-        let be = KvMetaBackend::open(file.path()).await.unwrap();
+        let be = KvMetaBackend::open_probe(file.path()).await.unwrap();
         let stats = be.replay_stats();
         assert_eq!(
             (stats.entries, stats.dropped_torn),

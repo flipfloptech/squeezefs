@@ -333,6 +333,15 @@ pub async fn open_routed_meta_set(paths: &[String]) -> Result<std::sync::Arc<Rou
     // and finds nothing on a healthy set. A failure to recover refuses the
     // open loud rather than serving a half-applied transaction (DUR-7).
     crossvol_tx::recover_open_intents(&routed).await?;
+    // The recovery hook is bring-up too: its roll-forward + retirement
+    // commits are exactly the committed-but-uncovered residue class the
+    // per-volume opens just closed for the claim tx (the D1.b
+    // wedge-crumb — `KvMetaBackend::cover_bring_up_residue`). Cover it
+    // per volume before the set serves; a no-op read on every volume
+    // recovery did not touch.
+    for vol in &routed.volumes {
+        vol.cover_bring_up_residue().await?;
+    }
     Ok(routed)
 }
 

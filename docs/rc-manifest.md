@@ -325,9 +325,21 @@ class C10, in flight:
 | `nlink` too high (a `link` that counted but never inserted the name) | the inode and its blocks can never be reclaimed — a permanent leak that looks healthy | a name exists, so C9 is correctly silent |
 | `nlink` too low, or `nlink == 0` with a live name (an `unlink` that counted but left the name) | **data loss, not a leak**: ordinary reclaim is entitled to destroy an inode a live path can still resolve. Reachable on field volumes today | same — a name exists |
 
-S3.5's `24ef223c` made a dangling dentry *removable*; nothing **finds** one. That
-is C10's job, and the second row is the reason it is a safety item rather than
-hygiene.
+S3.5's `24ef223c` made a dangling dentry *removable*; nothing **found** one
+until **C10 LANDED** (`src/fsck.rs`, 16 contracts). Both directions ship, with
+the asymmetric repair the danger demands: **raising a count is safe, lowering
+one requires a third independent pass, and names are never dropped to match a
+low count**. The red run found a load-bearing ordering before it could become a
+bug: the census skips `nlink == 0` records, so a zero-count-with-a-name inode's
+blocks read as C2-*leaked* — and freeing them would destroy exactly the data
+the raise restores. C10 therefore repairs **before** the block classes, pinned.
+The count extension is ≈ free on the field norm (no hardlinks ⇒ both maps
+empty; the multi map rides `InoBitmap::mark`'s newly-set return). Follow-ons it
+named rather than absorbed: directory `nlink` (2 + subdirs — a different
+aggregation), hardening C9 with the same `(nlink, ctime)` witness against
+rename skew, the C3 repair's latent lease-order self-deadlock (acquires
+ascending by *ino*, not stripe index), and an orphan-xattr class for a
+destroyed inode's leftover records.
 
 ---
 

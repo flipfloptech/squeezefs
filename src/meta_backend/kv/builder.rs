@@ -698,6 +698,16 @@ pub struct BuiltImage {
 /// **excluded**: it is per-mount guard state, unique to every mount *by
 /// design* (fresh writer id + heartbeat), not user-visible content — two
 /// replays of one filesystem under different mounts must digest equal.
+///
+/// `writer_term` (DLM S2, spec §6.11) is excluded for the **same reason and
+/// it is not optional**: the gate bumps the durable fencing era on every
+/// claim and the record is never deleted, so including it makes the digest
+/// change on every mount by construction — which is precisely what the
+/// sentence above forbids. Leaving it in broke
+/// `crash_contract_tests::test_kv_v3_torn_newest_ledger_mount_serves_predecessor`
+/// (post-fold digest mismatch) and two `kv_backend` tests. **Any future
+/// per-mount control record belongs on this exclusion list**; the general
+/// rule is `is_pinned_control_record`-shaped state, never user content.
 pub async fn digest_walk(trees: &[&KvTree]) -> Result<u64, KvError> {
     const WALK_PAGE: usize = 1024;
     let mut h = xxhash_rust::xxh3::Xxh3::new();
@@ -713,7 +723,10 @@ pub async fn digest_walk(trees: &[&KvTree]) -> Result<u64, KvError> {
             for (k, v) in &page {
                 if tree.tree_id() == TREE_XATTRS
                     && XattrValue::decode(v)
-                        .map(|x| x.name == super::backend::WRITER_CLAIM_XATTR.as_bytes())
+                        .map(|x| {
+                            x.name == super::backend::WRITER_CLAIM_XATTR.as_bytes()
+                                || x.name == super::backend::WRITER_TERM_XATTR.as_bytes()
+                        })
                         .unwrap_or(false)
                 {
                     continue; // mount-guard state, not filesystem content

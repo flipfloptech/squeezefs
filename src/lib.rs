@@ -41,6 +41,11 @@ pub mod assembly_tasks;
 pub mod bench;
 pub mod bg_admit;
 pub mod cache;
+// DLM stage S3 (pre-rc spec §6.7 *Transport*, §6.9 S3): the ONE cluster
+// transport — binary framing, zero-config storage-trust mutual authn with a
+// per-frame session MAC, DISC-1 peer auto-discovery, and the pinned
+// owner-side RPC venue. `job_wire` rides it; S4's lock verbs plug into it.
+pub mod cluster_wire;
 pub mod config_ops;
 pub(crate) mod cow_core;
 pub mod cpu;

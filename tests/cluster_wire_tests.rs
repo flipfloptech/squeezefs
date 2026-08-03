@@ -136,25 +136,50 @@ fn framing_is_binary_and_smaller_than_the_json_it_replaces() {
     // §6.5's 10 µs custody budget. A binary codec is not a preference,
     // it is the budget.
     let rt = rt();
-    let frame = mover_shard_frame();
-    let mut wire: Vec<u8> = Vec::new();
-    rt.block_on(cw::write_plain_frame(
-        &mut wire,
-        cw::FrameClass::Bulk,
-        &frame,
-    ))
-    .expect("encode");
-    assert!(wire.len() > 4, "a frame is a length prefix plus a body");
-    let body = &wire[4..];
+    let encode = |frame: &cw::RpcFrame| -> Vec<u8> {
+        let mut wire: Vec<u8> = Vec::new();
+        rt.block_on(cw::write_plain_frame(
+            &mut wire,
+            cw::FrameClass::Bulk,
+            frame,
+        ))
+        .expect("encode");
+        assert!(wire.len() > 4, "a frame is a length prefix plus a body");
+        wire[4..].to_vec()
+    };
+
+    // A frame whose fields are all text: JSON would have to emit its
+    // structure as braces, quotes and field names. Binary framing emits
+    // none of them.
+    let handshake = cw::RpcFrame::Challenge {
+        schema: cw::CLUSTER_WIRE_SCHEMA,
+        server_nonce: "0f1c2d3e-4a5b-6c7d-8e9f-a0b1c2d3e4f5".into(),
+        freshness_ms: 30_000,
+    };
+    let body = encode(&handshake);
+    for token in [b'{', b'}', b'"'] {
+        assert!(
+            !body.contains(&token),
+            "JSON structure in the body means the codec did not change: {:?}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+    for name in ["schema", "server_nonce", "freshness_ms", "Challenge"] {
+        assert!(
+            !String::from_utf8_lossy(&body).contains(name),
+            "a binary frame carries no field NAMES ({name} found)"
+        );
+    }
+
+    // And on the shape the 32.6 µs row was measured on, it is smaller
+    // than the JSON it replaces — fewer bytes to move and to parse.
+    let shard = mover_shard_frame();
+    let binary = encode(&shard);
+    let json = serde_json::to_vec(&shard).expect("json for the comparison");
     assert!(
-        !body.contains(&b'{') && !body.contains(&b'"'),
-        "the body must be BINARY — JSON tokens in it mean the codec did not change"
-    );
-    let json = serde_json::to_vec(&frame).expect("json for the comparison");
-    assert!(
-        body.len() < json.len(),
+        binary.len() < json.len(),
         "binary framing must be smaller than the JSON it replaces: {} vs {} B",
-        body.len(),
+        binary.len(),
         json.len()
     );
 }
@@ -238,7 +263,8 @@ fn oversize_frame_refuses_on_both_sides_naming_the_cap() {
             .await
             .expect_err("an oversize frame is never emitted");
         assert!(
-            err.to_string().contains(cw::FrameClass::Handshake.cap_name()),
+            err.to_string()
+                .contains(cw::FrameClass::Handshake.cap_name()),
             "the encode refusal names its class cap: {err}"
         );
         assert!(buf.is_empty(), "nothing is written when the cap refuses");
@@ -246,11 +272,13 @@ fn oversize_frame_refuses_on_both_sides_naming_the_cap() {
         // Decode side: a length prefix past the cap is a comparison, not
         // an allocation.
         let mut cur = std::io::Cursor::new((cw::FrameClass::Bulk.cap() + 1).to_be_bytes().to_vec());
-        let err = cw::read_plain_frame::<_, cw::RpcFrame>(&mut cur, cw::FrameClass::Bulk.cap(), None)
-            .await
-            .expect_err("a length prefix past the cap refuses");
+        let err =
+            cw::read_plain_frame::<_, cw::RpcFrame>(&mut cur, cw::FrameClass::Bulk.cap(), None)
+                .await
+                .expect_err("a length prefix past the cap refuses");
         assert!(
-            err.to_string().contains(&cw::FrameClass::Bulk.cap().to_string()),
+            err.to_string()
+                .contains(&cw::FrameClass::Bulk.cap().to_string()),
             "the decode refusal names the cap it enforced: {err}"
         );
     });
@@ -503,7 +531,13 @@ fn session_key_binds_the_secret_both_nonces_the_peer_and_the_channel() {
         cw::session_key(SECRET, "peer-b", "s-nonce", "p-nonce", None),
         cw::session_key(SECRET, "peer-a", "s-nonce-2", "p-nonce", None),
         cw::session_key(SECRET, "peer-a", "s-nonce", "p-nonce-2", None),
-        cw::session_key(SECRET, "peer-a", "s-nonce", "p-nonce", Some(b"tls-exporter")),
+        cw::session_key(
+            SECRET,
+            "peer-a",
+            "s-nonce",
+            "p-nonce",
+            Some(b"tls-exporter"),
+        ),
     ] {
         assert_ne!(
             base, other,
@@ -663,17 +697,21 @@ fn a_ca_less_security_config_is_refused_not_downgraded() {
     // `ClusterSecurityConfig` used to install `.dangerous()` client-side
     // and `with_no_client_auth()` server-side; on this wire it refuses.
     use squeezefs::tiering::cluster_tls::ClusterSecurityConfig;
-    let err = cw::tls_acceptor(&ClusterSecurityConfig::default())
-        .expect_err("a CA-less TLS config must refuse, never install a dangerous verifier");
+    let err = match cw::tls_acceptor(&ClusterSecurityConfig::default()) {
+        Err(e) => e,
+        Ok(_) => panic!("a CA-less TLS config must refuse, never install a dangerous verifier"),
+    };
     assert!(
         format!("{err}").contains("ca_key") || format!("{err}").contains("CA"),
         "the refusal names what is missing: {err}"
     );
-    let err = cw::tls_connector(&ClusterSecurityConfig {
+    let err = match cw::tls_connector(&ClusterSecurityConfig {
         ca_cert: Some(vec![1, 2, 3]),
         ca_key: None,
-    })
-    .expect_err("a CA cert with no key can never make an authenticated channel");
+    }) {
+        Err(e) => e,
+        Ok(_) => panic!("a CA cert with no key can never make an authenticated channel"),
+    };
     assert!(format!("{err}").contains("ca_key") || format!("{err}").contains("CA key"));
 }
 
@@ -842,7 +880,11 @@ async fn discovery_reads_the_records_the_shared_volume_already_carries() {
         .expect("write a non-coordinator registration");
 
     let peers = cw::discover_peers(&routed, None).await;
-    assert_eq!(peers.len(), 1, "one endpoint-carrying live record: {peers:?}");
+    assert_eq!(
+        peers.len(),
+        1,
+        "one endpoint-carrying live record: {peers:?}"
+    );
     assert_eq!(peers[0].endpoint, "127.0.0.1:7100");
     assert_eq!(
         cw::discover_endpoint(&routed).await.as_deref(),
@@ -871,12 +913,8 @@ fn listener_cfg() -> cw::RpcListenerConfig {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_authenticated_peer_round_trips_rpc_over_the_wire() {
-    let host = cw::RpcListener::start(
-        listener_cfg(),
-        SECRET.to_vec(),
-        Arc::new(cw::PingService::default()),
-    )
-    .expect("listener starts");
+    let host = cw::RpcListener::start(listener_cfg(), SECRET.to_vec(), Arc::new(cw::PingService))
+        .expect("listener starts");
     let endpoint = host.endpoint().to_string();
 
     let mut client = cw::RpcClient::connect(&endpoint, SECRET, "peer-1", None)
@@ -906,12 +944,8 @@ async fn an_authenticated_peer_round_trips_rpc_over_the_wire() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_peer_without_the_storage_secret_is_refused() {
-    let host = cw::RpcListener::start(
-        listener_cfg(),
-        SECRET.to_vec(),
-        Arc::new(cw::PingService::default()),
-    )
-    .expect("listener starts");
+    let host = cw::RpcListener::start(listener_cfg(), SECRET.to_vec(), Arc::new(cw::PingService))
+        .expect("listener starts");
     let endpoint = host.endpoint().to_string();
     let err = cw::RpcClient::connect(&endpoint, b"not-the-secret", "impostor", None)
         .await
@@ -928,7 +962,10 @@ async fn a_peer_without_the_storage_secret_is_refused() {
             assert_eq!(s.sessions_admitted, 0);
             break;
         }
-        assert!(std::time::Instant::now() < deadline, "refusal not counted: {s:?}");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "refusal not counted: {s:?}"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     host.shutdown();
@@ -938,12 +975,8 @@ async fn a_peer_without_the_storage_secret_is_refused() {
 async fn concurrent_connections_are_capped_and_handles_pruned() {
     let mut cfg = listener_cfg();
     cfg.max_connections = 2;
-    let host = cw::RpcListener::start(
-        cfg,
-        SECRET.to_vec(),
-        Arc::new(cw::PingService::default()),
-    )
-    .expect("listener starts");
+    let host = cw::RpcListener::start(cfg, SECRET.to_vec(), Arc::new(cw::PingService))
+        .expect("listener starts");
     let endpoint = host.endpoint().to_string();
     let mut held = Vec::new();
     for i in 0..2 {
@@ -978,12 +1011,8 @@ async fn rtt_instrument_reports_a_counted_loopback_floor() {
     // ~9,100 ops/s to 6.7–20 k/s at 50–150 µs RTT). Loopback is the
     // FLOOR: it measures framing + authn + wake, with the fabric term
     // set to ~0. A fabric row needs the venue (see the evidence note).
-    let host = cw::RpcListener::start(
-        listener_cfg(),
-        SECRET.to_vec(),
-        Arc::new(cw::PingService::default()),
-    )
-    .expect("listener starts");
+    let host = cw::RpcListener::start(listener_cfg(), SECRET.to_vec(), Arc::new(cw::PingService))
+        .expect("listener starts");
     let report = cw::measure_rtt(&host.endpoint().to_string(), SECRET, "rtt-probe", 64, 0)
         .await
         .expect("the instrument runs");
@@ -996,8 +1025,9 @@ async fn rtt_instrument_reports_a_counted_loopback_floor() {
     assert!(report.p99_us <= report.max_us);
     assert_eq!(
         host.stats().requests_served,
-        64,
-        "every sample is a real authenticated round trip, not a local loop"
+        65,
+        "every sample is a real authenticated round trip, not a local loop \
+         (64 counted + the deliberately discarded warm-up)"
     );
     host.shutdown();
 }
@@ -1009,12 +1039,8 @@ async fn a_hostile_peer_costs_the_listener_one_bounded_handshake() {
     // length spends a chunk, not the cap.
     let mut cfg = listener_cfg();
     cfg.handshake_timeout = Duration::from_millis(200);
-    let host = cw::RpcListener::start(
-        cfg,
-        SECRET.to_vec(),
-        Arc::new(cw::PingService::default()),
-    )
-    .expect("listener starts");
+    let host = cw::RpcListener::start(cfg, SECRET.to_vec(), Arc::new(cw::PingService))
+        .expect("listener starts");
     let endpoint = host.endpoint();
 
     let mut silent = tokio::net::TcpStream::connect(endpoint)
@@ -1025,14 +1051,12 @@ async fn a_hostile_peer_costs_the_listener_one_bounded_handshake() {
         cw::read_plain_frame(&mut silent, cw::FrameClass::Handshake.cap(), None)
             .await
             .expect("the coordinator issues the challenge first");
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut buf = [0u8; 1];
-    let closed = tokio::time::timeout(Duration::from_secs(5), async {
-        use tokio::io::AsyncReadExt;
-        silent.read(&mut buf).await
-    })
-    .await
-    .expect("the deadline fires well inside the test budget")
-    .expect("read");
+    let closed = tokio::time::timeout(Duration::from_secs(5), silent.read(&mut buf))
+        .await
+        .expect("the deadline fires well inside the test budget")
+        .expect("read");
     assert_eq!(closed, 0, "a silent peer is dropped, not parked forever");
 
     let mut liar = tokio::net::TcpStream::connect(endpoint)
@@ -1042,7 +1066,6 @@ async fn a_hostile_peer_costs_the_listener_one_bounded_handshake() {
         cw::read_plain_frame(&mut liar, cw::FrameClass::Handshake.cap(), None)
             .await
             .expect("challenge");
-    use tokio::io::AsyncWriteExt;
     liar.write_all(&u32::MAX.to_be_bytes())
         .await
         .expect("lie about the length");
@@ -1050,7 +1073,10 @@ async fn a_hostile_peer_costs_the_listener_one_bounded_handshake() {
         .await
         .expect("the class cap refuses promptly")
         .expect("read");
-    assert_eq!(n, 0, "a pre-authn frame past the hello class cap is dropped");
+    assert_eq!(
+        n, 0,
+        "a pre-authn frame past the hello class cap is dropped"
+    );
     host.shutdown();
 }
 
@@ -1086,7 +1112,10 @@ async fn rpc_service_calls_execute_on_the_pinned_pool() {
         .await
         .expect("enroll");
     for _ in 0..4 {
-        client.call(cw::VERB_PING, vec![1, 2, 3]).await.expect("call");
+        client
+            .call(cw::VERB_PING, vec![1, 2, 3])
+            .await
+            .expect("call");
     }
     assert_eq!(svc.on_pool.load(Ordering::SeqCst), 4);
     assert_eq!(

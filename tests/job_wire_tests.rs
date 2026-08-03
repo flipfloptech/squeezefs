@@ -38,6 +38,17 @@
 //! channel (CA-pinned mTLS) instead of `transport == "tls"`. The
 //! decode-side bounds live in `tests/job_wire_bounds_tests.rs`.
 //!
+//! **DLM S3 (`cluster_wire`)**: every one of those legs still holds, on
+//! the same assertions, through a transport that is now shared with the
+//! rest of the cluster program — binary framing, a per-frame session MAC
+//! after enrollment, and one authn gate. Exactly ONE leg changed its
+//! expected outcome, deliberately and in the strengthening direction:
+//! `ca_less_tls_is_refused_not_admitted_as_a_lesser_class` (was
+//! `unauthenticated_tls_is_plaintext_class_for_the_ladder`) — the
+//! accept-everything certificate verifier the old leg described is gone,
+//! so that configuration refuses the listener instead of being admitted
+//! at a lower rung.
+//!
 //! NOT here (G-VL-7 rig rows, VL3+ — the 2-node devsub mount rig; do not
 //! fake them in cargo): remote-worker **kill-9 mid-shard ⇒ TTL ⇒ reclaim
 //! ⇒ converge ×10**, the **SIGSTOP-past-TTL / reassign / SIGCONT
@@ -813,36 +824,54 @@ async fn wero_fence_acquires_preempts_and_releases_over_the_wire() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn unauthenticated_tls_is_plaintext_class_for_the_ladder() {
-    // With `ca_cert: None` the client installs an accept-everything
-    // certificate verifier via `.dangerous()` and the server uses
+async fn ca_less_tls_is_refused_not_admitted_as_a_lesser_class() {
+    // VAL-6 landed this leg as `unauthenticated_tls_is_plaintext_class_for
+    // _the_ladder`: with `ca_cert: None` the client installed an
+    // accept-everything verifier via `.dangerous()` and the server took
     // `with_no_client_auth()` — a TLS OBJECT, not an authenticated
-    // channel. That configuration used to be permitted to sample
-    // verify-reads below 100 % because the ladder keyed on
-    // `transport == "tls"`. It is plaintext-class now.
+    // channel — and the ladder was taught to treat it as plaintext-class.
+    //
+    // DLM **S3 strengthened the outcome**: that verifier no longer exists
+    // anywhere in the tree (`cluster_tls` builds rustls configs only from
+    // a COMPLETE `ClusterCa`), so the configuration is REFUSED at listener
+    // start instead of being admitted at a lower rung. The property the
+    // old leg protected — a CA-less TLS config can never buy verify-read
+    // sampling — holds a fortiori: there is no such listener to sample on.
     let (meta, _mf) = meta_fixture().await;
     let fab = fabric(&meta, 0).await;
     let mut cfg = wire_cfg(30_000, 10_000);
     cfg.security = Some(squeezefs::tiering::cluster_tls::ClusterSecurityConfig::default());
     cfg.verify_sample_permille = 100; // ask for 10 % sampling…
-    let host = JobWireHost::start(fab, cfg, FakeShardDevice::new(0, 0))
+    let err = JobWireHost::start(fab, cfg, FakeShardDevice::new(0, 0))
         .await
-        .expect("host start");
-    assert_eq!(
-        host.transport_mode(),
-        "tls-unauthenticated",
-        "a CA-less TLS object is named for what it is"
+        .expect_err("a CA-less TLS config must refuse the listener");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("ca_cert") && msg.contains("ca_key"),
+        "the refusal names the CA pair it requires: {msg}"
     );
     assert!(
+        msg.contains("accept-everything") || msg.contains("plaintext"),
+        "…and says what the honest alternatives are: {msg}"
+    );
+
+    // The two postures that DO exist: plaintext (authenticated by the
+    // storage-trust proof + session MAC, mandatory-100 % verify-reads
+    // because it is not confidential) and CA-pinned mTLS (sampling
+    // sanctioned). Nothing in between.
+    let (meta2, _mf2) = meta_fixture().await;
+    let fab2 = fabric(&meta2, 0).await;
+    let mut plain = wire_cfg(30_000, 10_000);
+    plain.verify_sample_permille = 100;
+    let host = JobWireHost::start(fab2, plain, FakeShardDevice::new(0, 0))
+        .await
+        .expect("plaintext still starts");
+    assert_eq!(host.transport_mode(), "plaintext");
+    assert!(
         !host.channel_authenticated(),
-        "no CA pin ⇒ no authenticated channel"
+        "plaintext is authenticated but NOT confidential — the sampling rung stays shut"
     );
-    assert_eq!(
-        host.verify_permille(),
-        1000,
-        "the ladder refuses to sample on an unauthenticated channel \
-         (plaintext-class ⇒ mandatory-100 % verify-reads)"
-    );
+    assert_eq!(host.verify_permille(), 1000);
     host.shutdown().await;
 }
 

@@ -19,13 +19,19 @@
 //!   **coordinator-issued** [`WireFrame::Challenge`] nonce — the wire
 //!   proves and grants exactly what shared-storage access already
 //!   grants, and only once per challenge (VAL-6, below).
-//! - **Transport**: length-prefixed schema-versioned frames
-//!   ([`WIRE_SCHEMA`]) over tokio TCP; TLS via **tokio-rustls** reusing
-//!   `ClusterSecurityConfig`'s cert/CA/verifier construction
-//!   (`tiering::cluster_tls`). Without a security config the listener runs
-//!   **plaintext** (OQ-A default-permissive) with ONE loud log line at
-//!   start. Network TCP/TLS is the sanctioned non-uring exception
-//!   (AGENTS "Not uring" row).
+//! - **Transport**: **[`crate::cluster_wire`]** (DLM stage S3) — the ONE
+//!   cluster transport. This module no longer owns a codec, a connection
+//!   cap, an accept-backoff ladder, a nonce registry, a proof MAC or a TLS
+//!   construction: it owns the job-shard VOCABULARY and rides cluster_wire
+//!   for all of it. What that changed, concretely: frames are **binary**
+//!   (bincode, [`WIRE_SCHEMA`] 3 — `serde_json` decode was 32.6 µs on the
+//!   64-checksum shard against §6.5's 10 µs custody budget), every
+//!   post-enrollment frame carries a **session MAC** derived from the
+//!   `job:enroll` secret (enrollment authenticated the handshake; the MAC
+//!   authenticates the session), and a **CA-less TLS config is refused**
+//!   rather than admitted as a lesser class — the accept-everything
+//!   verifier is deleted from the tree. Network TCP/TLS is the sanctioned
+//!   non-uring exception (AGENTS "Not uring" row).
 //! - **Shard leases + fencing**: `{holder, lease_expiry (TTL 30 s),
 //!   shard_fencing}` per shard; heartbeats every 10 s renew; expiry ⇒
 //!   fencing bump + reassignment — **always with freshly allocated
@@ -49,13 +55,15 @@
 //! destination/verification machinery is exercised today against
 //! [`FakeShardDevice`], the harness-surface-in-the-lib precedent).
 //!
-//! # VAL-6 — the INTERIM hardening of an open port (pre-RC, P0)
+//! # VAL-6 — closed by the S3 port, not patched in place
 //!
 //! Execution-plan ruling **D2**: the listener stays **configurable and
-//! default-bound `0.0.0.0`** with auto-discovered peers, so the fix is
-//! not "close the port" — it is "make the open port safe" until stage
-//! **S3 `cluster_wire`** lands the zero-config mutual-authn redesign.
-//! What this module now enforces on attacker-reachable input:
+//! default-bound `0.0.0.0`** with auto-discovered peers, so the fix was
+//! never "close the port" — it is "make the open port safe". VAL-6 did
+//! that here as an interim; **S3 moved every one of those bounds into
+//! [`crate::cluster_wire`]**, where the next ten stages inherit them
+//! instead of re-deriving them. The bounds an attacker-reachable listener
+//! still enforces, now once for the whole cluster:
 //!
 //! - **Bounded framing**: body memory is committed only as bytes
 //!   arrive ([`FRAME_CHUNK_BYTES`] per round), so a lying length prefix
@@ -84,42 +92,49 @@
 //!   listener's own warning recommended a configuration the binary
 //!   could not express.
 //!
-//! **Deliberately left to S3 `cluster_wire`** (not fixable inside this
-//! transport's shape): per-frame authentication after enrollment, a
-//! session key derived from the storage secret (TLS-PSK or an
-//! exporter-bound per-frame MAC), deletion of the accept-everything
-//! verifier itself (it lives in `tiering::dht`, shared with the DHT),
-//! the literal `"localhost"` server name, and peer auto-discovery
-//! (DISC-1).
+//! **What S3 closed that VAL-6 deliberately left open**: per-frame
+//! authentication after enrollment (the session MAC), a session key
+//! derived from the storage secret and bound to the TLS exporter where
+//! there is one, deletion of the accept-everything verifier itself, and
+//! peer auto-discovery ([`crate::cluster_wire::discover_peers`] — DISC-1).
+//! Still open by design: the literal `"localhost"` server name in the
+//! dial-side TLS handshake, which is what the `cluster_tls` node certs
+//! carry as SANs (a real SAN plan is its own change, and the CA pin plus
+//! the storage-trust proof are what actually authenticate the peer).
 
+use crate::cluster_wire::{
+    self, session_framers, AuthnConfig, AuthnGate, ChannelClass, ClusterStream, ConnGate,
+    FrameClass, FrameTx, ProofClaim, SessionAuthn, SessionKey, Verdict,
+};
 use crate::error::{Result, SqueezefsError};
 use crate::fuse_client::METRICS;
 use crate::jobs::{job_throttle_sleep, JobCtl, JobFabric, JobType};
 use crate::meta_backend::reservation::{register_ladder, resolve_for_mount, ReservationClient};
 use crate::meta_backend::{Metadata, RoutedMetaBackend};
-use crate::tiering::cluster_tls::{
-    rustls_client_config, rustls_server_config, ClusterSecurityConfig,
-};
+use crate::tiering::cluster_tls::ClusterSecurityConfig;
 
-use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use xxhash_rust::xxh3::xxh3_64;
 
 /// The wire frame schema this build speaks. A hello carrying any other
 /// value refuses loud, naming the field.
 ///
-/// `2` = the VAL-6 challenge handshake (coordinator-issued single-use
-/// nonce). A schema-1 worker's self-chosen-nonce hello is refused loud
-/// rather than admitted on a replayable proof.
-pub const WIRE_SCHEMA: u32 = 2;
+/// * `1` — the original self-chosen-nonce hello (replayable proof).
+/// * `2` — the VAL-6 challenge handshake (coordinator-issued single-use
+///   nonce), still JSON-framed.
+/// * `3` — the **S3 `cluster_wire` port**: binary framing and a per-frame
+///   session MAC. A schema-2 peer's JSON hello does not even decode as a
+///   frame here, which is the honest outcome for a protocol whose byte
+///   layout changed; the version field makes the refusal legible when the
+///   bytes happen to parse.
+pub const WIRE_SCHEMA: u32 = 3;
 
 /// The per-fabric enrollment-secret record on ino 1 (`job:` prefix ⇒
 /// behind the VL2 reserved-namespace FUSE screen; readable only through
@@ -131,51 +146,26 @@ pub const LEASE_TTL: Duration = Duration::from_secs(30);
 /// Default worker heartbeat cadence (§5.1.6: 10 s).
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Frame size cap — shard descriptors and heartbeats are KB-scale
-/// (blocks move over shared storage, not the wire); anything larger is
-/// a protocol violation, refused loud. This is the **post-enrollment**
-/// class; see [`MAX_HELLO_FRAME_BYTES`] for what an unauthenticated
-/// peer gets to spend.
-pub const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
+/// The **post-enrollment** frame class: shard descriptors and result
+/// proposals (blocks move over shared storage, not the wire). This is
+/// cluster_wire's bulk class — one cap for every protocol on the wire.
+pub const MAX_FRAME_BYTES: u32 = cluster_wire::BULK_MAX_FRAME_BYTES;
 
-/// The **pre-enrollment** frame class cap (VAL-6). A `Challenge`/
-/// `Enroll` pair is a few hundred bytes; nothing an unauthenticated
-/// peer sends legitimately approaches this, and the body is streamed
-/// in [`FRAME_CHUNK_BYTES`] rounds anyway.
-pub const MAX_HELLO_FRAME_BYTES: u32 = 8 * 1024;
+/// The **pre-enrollment** frame class cap: what an unauthenticated peer
+/// gets to spend (cluster_wire's handshake class).
+pub const MAX_HELLO_FRAME_BYTES: u32 = cluster_wire::HANDSHAKE_MAX_FRAME_BYTES;
 
-/// Frame bodies are committed to memory this much at a time (VAL-6).
-/// The length prefix is a *claim*, not an allocation authority: a peer
-/// that declares [`MAX_FRAME_BYTES`] and sends nothing costs one chunk.
-pub const FRAME_CHUNK_BYTES: usize = 64 * 1024;
+/// The frame class a job-shard session speaks after enrollment.
+const SESSION_CLASS: FrameClass = FrameClass::Bulk;
 
-/// First rung of the accept-error backoff ladder (VAL-6: the old arm
-/// `continue`d, so a persistent `EMFILE`/`ENFILE` spun a core).
-pub const ACCEPT_BACKOFF_START: Duration = Duration::from_millis(5);
-
-/// Backoff ceiling — small enough that a transient fd exhaustion
-/// recovers promptly once the pressure lifts.
-pub const ACCEPT_BACKOFF_MAX: Duration = Duration::from_millis(1000);
-
-/// The accept-error backoff ladder: doubling from [`ACCEPT_BACKOFF_START`],
-/// saturating at [`ACCEPT_BACKOFF_MAX`]. `None` = the first error after a
-/// successful accept.
-pub fn next_accept_backoff(prev: Option<Duration>) -> Duration {
-    match prev {
-        None => ACCEPT_BACKOFF_START,
-        Some(d) => (d.saturating_mul(2)).min(ACCEPT_BACKOFF_MAX),
-    }
-}
+pub use crate::cluster_wire::{
+    next_accept_backoff, ACCEPT_BACKOFF_MAX, ACCEPT_BACKOFF_START, FRAME_CHUNK_BYTES,
+};
 
 /// Worker-side bound on the enrollment exchange (dial → challenge →
 /// hello → reply). The coordinator's own gate is
 /// `JobWireConfig::handshake_timeout`.
 const ENROLL_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Cap on an enrolling peer's self-declared identity — it lands in log
-/// lines and the durable shard records, so it is bounded like every
-/// other attacker-chosen field.
-const MAX_WORKER_ID_BYTES: usize = 256;
 
 /// Worker-side DMA/task batch size for per-batch lease re-validation
 /// (§5.1.6 rung 1: a woken zombie aborts before its next batch).
@@ -224,9 +214,15 @@ pub struct ShardDescriptor {
     pub lease_ttl_ms: u64,
 }
 
-/// The §5.1.6 wire frames (`wire_schema: 1`).
+/// The §5.1.6 job-shard wire vocabulary — the frames, not the transport
+/// (that is [`crate::cluster_wire`]).
+///
+/// Externally tagged **by requirement**: the S3 codec is bincode, which is
+/// a non-self-describing format, so serde's internally tagged
+/// representation (`#[serde(tag = "frame")]`, what the JSON era used)
+/// cannot round-trip through it — it needs `deserialize_any`. The variant
+/// index is the discriminant on the wire now.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(tag = "frame", rename_all = "snake_case")]
 pub enum WireFrame {
     /// The coordinator speaks first (VAL-6): a single-use nonce inside
     /// a freshness window. The worker cannot choose its own challenge,
@@ -286,30 +282,27 @@ pub enum WireFrame {
     },
 }
 
-/// Write one length-prefixed JSON frame (u32-BE length prefix).
+/// Write one **unauthenticated** length-prefixed binary frame at the bulk
+/// class — the handshake direction, and what the raw-connection tests
+/// speak. Post-enrollment frames ride [`FrameTx`] instead, which adds the
+/// session MAC.
 pub async fn write_frame<W: AsyncWrite + Unpin>(
     w: &mut W,
     frame: &WireFrame,
 ) -> std::io::Result<()> {
-    let body = serde_json::to_vec(frame).map_err(std::io::Error::other)?;
-    if body.len() as u32 > MAX_FRAME_BYTES {
-        return Err(std::io::Error::other("frame exceeds MAX_FRAME_BYTES"));
-    }
-    w.write_all(&(body.len() as u32).to_be_bytes()).await?;
-    w.write_all(&body).await?;
-    w.flush().await
+    cluster_wire::write_plain_frame(w, SESSION_CLASS, frame).await
 }
 
-/// Read one frame at the post-enrollment class ([`MAX_FRAME_BYTES`], no
-/// body deadline); `Ok(None)` on clean EOF at a frame boundary.
+/// Read one **unauthenticated** frame at the bulk class
+/// ([`MAX_FRAME_BYTES`], no body deadline); `Ok(None)` on clean EOF at a
+/// frame boundary.
 pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Option<WireFrame>> {
     read_frame_limited(r, MAX_FRAME_BYTES, None).await
 }
 
 /// Read one frame under an explicit **class cap** and optional **body
-/// deadline** (VAL-6).
-///
-/// Two properties the caller gets that the old `read_frame` did not:
+/// deadline** — cluster_wire's reader, so the two properties VAL-6 added
+/// hold for every protocol on the wire rather than for this one:
 ///
 /// 1. The length prefix is a claim, never an allocation authority — the
 ///    body Vec grows [`FRAME_CHUNK_BYTES`] at a time *as bytes arrive*,
@@ -324,97 +317,26 @@ pub async fn read_frame_limited<R: AsyncRead + Unpin>(
     max_len: u32,
     body_timeout: Option<Duration>,
 ) -> std::io::Result<Option<WireFrame>> {
-    let mut len_buf = [0u8; 4];
-    match r.read_exact(&mut len_buf).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    }
-    let len = u32::from_be_bytes(len_buf);
-    if len > max_len {
-        return Err(std::io::Error::other(format!(
-            "frame length {len} exceeds the {max_len} B cap"
-        )));
-    }
-    let body = match body_timeout {
-        Some(d) => tokio::time::timeout(d, read_body_chunked(r, len as usize))
-            .await
-            .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("frame body of {len} B did not arrive within {d:?}"),
-                )
-            })??,
-        None => read_body_chunked(r, len as usize).await?,
-    };
-    serde_json::from_slice(&body)
-        .map(Some)
-        .map_err(|e| std::io::Error::other(format!("undecodable frame: {e}")))
-}
-
-/// Commit body memory only as it arrives: at most one
-/// [`FRAME_CHUNK_BYTES`] round is outstanding ahead of the peer.
-async fn read_body_chunked<R: AsyncRead + Unpin>(
-    r: &mut R,
-    len: usize,
-) -> std::io::Result<Vec<u8>> {
-    let mut body: Vec<u8> = Vec::with_capacity(len.min(FRAME_CHUNK_BYTES));
-    while body.len() < len {
-        let want = (len - body.len()).min(FRAME_CHUNK_BYTES);
-        let start = body.len();
-        body.resize(start + want, 0);
-        r.read_exact(&mut body[start..]).await?;
-    }
-    Ok(body)
+    cluster_wire::read_plain_frame(r, max_len, body_timeout).await
 }
 
 /// The enrollment proof: hex `HMAC-SHA256(secret, worker_id ‖
 /// server_nonce ‖ endpoint_nonce ‖ "hello")` — computable only by a
 /// principal that can read the meta volume's `job:enroll` record, and
-/// (VAL-6) bound to the coordinator's single-use challenge, so a
-/// captured proof is not a reusable credential.
+/// bound to the coordinator's single-use challenge, so a captured proof
+/// is not a reusable credential.
+///
+/// This IS [`cluster_wire::proof_mac`]: the S3 port did not change what a
+/// worker computes, so a same-commit worker's proof is byte-identical
+/// across the port. The name survives because the job-wire vocabulary and
+/// its tests speak it.
 pub fn enroll_hmac(
     secret: &[u8],
     worker_id: &str,
     server_nonce: &str,
     endpoint_nonce: &str,
 ) -> String {
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts any key length");
-    mac.update(worker_id.as_bytes());
-    mac.update(server_nonce.as_bytes());
-    mac.update(endpoint_nonce.as_bytes());
-    mac.update(b"hello");
-    hex_encode(&mac.finalize().into_bytes())
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
-
-fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
-        return None;
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
-        .collect()
-}
-
-/// Constant-time-ish comparison for the enrollment proof (both sides
-/// are fixed-length hex MACs; XOR-accumulate, never short-circuit).
-fn mac_eq(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.bytes()
-        .zip(b.bytes())
-        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-        == 0
+    cluster_wire::proof_mac(secret, worker_id, server_nonce, endpoint_nonce)
 }
 
 // ---------------------------------------------------------------------------
@@ -710,37 +632,22 @@ pub async fn read_enroll_secret(meta: &Arc<RoutedMetaBackend>) -> Result<Vec<u8>
         .get("secret")
         .and_then(|s| s.as_str())
         .ok_or_else(|| SqueezefsError::InvalidOperation("job:enroll carries no secret".into()))?;
-    hex_decode(hexs)
+    cluster_wire::hex_decode(hexs)
         .ok_or_else(|| SqueezefsError::InvalidOperation("job:enroll secret is not hex".into()))
 }
 
-/// The address a coordinator advertises in its mount registration: the
-/// interface the default route would use (the UDP-connect trick — no
-/// packet is sent), falling back to loopback on isolated boxes (where
-/// same-host workers still reach it).
-pub fn local_advertise_ip() -> std::net::IpAddr {
-    std::net::UdpSocket::bind(("0.0.0.0", 0))
-        .and_then(|s| {
-            s.connect(("192.0.2.1", 9))?; // TEST-NET-1: route lookup only
-            Ok(s.local_addr()?.ip())
-        })
-        .unwrap_or_else(|_| std::net::IpAddr::from([127, 0, 0, 1]))
-}
-
-/// Discover the live coordinator's job endpoint from the mount
-/// registrations (the `job_endpoint` additive field on the coordinator's
-/// `client:{id}` heartbeat record). Read-only; safe on probe backends.
+/// Discover the live coordinator's job endpoint — **DISC-1**, which is
+/// [`cluster_wire::discover_endpoint`]: the shared volume IS the
+/// rendezvous, so this is an enumeration of the `client:{uuid}` records
+/// the mount heartbeat already writes, not a discovery protocol. Kept as a
+/// job-wire spelling because the `job worker` verb reads as one line.
+///
+/// The projection tightened in the S3 port: cluster_wire dedupes by
+/// registration id (records are per-volume, so an N-volume set shows the
+/// same peer N times) and orders deterministically, where this used to
+/// return whichever xattr enumeration reached a fresh endpoint first.
 pub async fn discover_endpoint(meta: &Arc<RoutedMetaBackend>) -> Option<String> {
-    for vol in &meta.volumes {
-        for reg in vol.mount_registrations().await {
-            if reg.kind == "client" && reg.heartbeat_fresh {
-                if let Some(ep) = reg.job_endpoint {
-                    return Some(ep);
-                }
-            }
-        }
-    }
-    None
+    cluster_wire::discover_endpoint(meta).await
 }
 
 // ---------------------------------------------------------------------------
@@ -857,7 +764,7 @@ impl Default for JobWireConfig {
 /// cluster machinery presents is signed by the CA key, so a CA cert
 /// without its key cannot produce an authenticated channel at all.
 pub fn channel_authenticated(security: &ClusterSecurityConfig) -> bool {
-    security.ca_cert.is_some() && security.ca_key.is_some()
+    security.ca_pair().is_some()
 }
 
 impl JobWireConfig {
@@ -1078,17 +985,15 @@ fn derive_ca_cert(ca_key_der: &[u8]) -> Result<Vec<u8>> {
     Ok(cert.der().to_vec())
 }
 
-/// A type-erased duplex stream (plaintext TCP or TLS).
-trait Duplex: AsyncRead + AsyncWrite + Send + Unpin {}
-impl<T: AsyncRead + AsyncWrite + Send + Unpin> Duplex for T {}
-type BoxedStream = Box<dyn Duplex>;
-
-/// One enrolled worker session.
+/// One enrolled worker session. Its writer is **authenticated**: every
+/// frame the coordinator sends after enrollment carries the session MAC
+/// (S3), so the shard descriptors and acks a worker acts on cannot be
+/// forged or reordered by anything on the path.
 struct Session {
     id: u64,
     worker_id: String,
     pr_key: Option<u64>,
-    writer: Arc<tokio::sync::Mutex<tokio::io::WriteHalf<BoxedStream>>>,
+    writer: Arc<tokio::sync::Mutex<AuthedWriter>>,
     /// Holds an assigned shard right now.
     busy: AtomicBool,
     /// Lease expired while holding a shard — never assignable again
@@ -1122,87 +1027,17 @@ struct WeroFence {
     holds: Vec<Arc<dyn ReservationClient>>,
 }
 
-/// Outcome of consuming a challenge nonce (VAL-6 freshness).
-enum NonceOutcome {
-    /// Issued by this coordinator, inside its window, first use.
-    Fresh,
-    /// Issued, but the freshness window has closed.
-    Expired,
-    /// Never issued, or already used — a replay.
-    UnknownOrReplayed,
+/// The authenticated write half of a session: the stream half plus its
+/// [`FrameTx`] sequence. One object, so no call site can accidentally
+/// write a session frame WITHOUT its MAC.
+struct AuthedWriter {
+    half: tokio::io::WriteHalf<ClusterStream>,
+    tx: FrameTx,
 }
 
-/// The challenge registry: single-use nonces inside a freshness window,
-/// bounded in memory (an unauthenticated peer can only make the
-/// coordinator hold `cap` of these, and the connection cap bounds the
-/// rate at which it can try).
-struct NonceRegistry {
-    issued: HashMap<String, tokio::time::Instant>,
-    order: std::collections::VecDeque<String>,
-    cap: usize,
-}
-
-impl NonceRegistry {
-    fn new(cap: usize) -> Self {
-        Self {
-            issued: HashMap::new(),
-            order: std::collections::VecDeque::new(),
-            cap: cap.max(1),
-        }
-    }
-
-    fn issue(&mut self, freshness: Duration) -> String {
-        let now = tokio::time::Instant::now();
-        self.prune(now, freshness);
-        let nonce = uuid::Uuid::new_v4().to_string();
-        self.issued.insert(nonce.clone(), now);
-        self.order.push_back(nonce.clone());
-        nonce
-    }
-
-    /// Single use: a fresh nonce is REMOVED as it is accepted, so the
-    /// second presentation of the same hello is a replay.
-    fn consume(&mut self, nonce: &str, freshness: Duration) -> NonceOutcome {
-        let now = tokio::time::Instant::now();
-        match self.issued.remove(nonce) {
-            Some(issued) if now.duration_since(issued) <= freshness => NonceOutcome::Fresh,
-            Some(_) => NonceOutcome::Expired,
-            None => NonceOutcome::UnknownOrReplayed,
-        }
-    }
-
-    fn outstanding(&self) -> usize {
-        self.issued.len()
-    }
-
-    fn prune(&mut self, now: tokio::time::Instant, freshness: Duration) {
-        while let Some(front) = self.order.front() {
-            let stale = self
-                .issued
-                .get(front)
-                .is_none_or(|t| now.duration_since(*t) > freshness);
-            let over_cap = self.issued.len() > self.cap;
-            if stale || over_cap {
-                if let Some(n) = self.order.pop_front() {
-                    self.issued.remove(&n);
-                }
-            } else {
-                break;
-            }
-        }
-    }
-}
-
-/// One admitted connection's slot in the [`JobWireConfig::max_connections`]
-/// budget: RAII, so every exit path (TLS failure, hello timeout, clean
-/// departure, panic) returns it.
-struct ConnPermit {
-    live: Arc<AtomicU64>,
-}
-
-impl Drop for ConnPermit {
-    fn drop(&mut self) {
-        self.live.fetch_sub(1, Ordering::SeqCst);
+impl AuthedWriter {
+    async fn send(&mut self, frame: &WireFrame) -> std::io::Result<()> {
+        self.tx.send(&mut self.half, SESSION_CLASS, frame).await
     }
 }
 
@@ -1213,7 +1048,11 @@ pub struct JobWireHost {
     seam: Arc<dyn ShardDeviceSeam>,
     cfg: JobWireConfig,
     endpoint: SocketAddr,
-    secret: Vec<u8>,
+    /// The ONE authn ladder ([`AuthnGate`]): the storage secret, the
+    /// server-issued single-use challenge registry, its freshness window,
+    /// and the session-key derivation — all of it cluster_wire's, so this
+    /// module cannot drift from the RPC surface S4 adds beside it.
+    gate: Arc<AuthnGate>,
     transport: &'static str,
     /// CA-pinned mTLS — the predicate the verification-strength ladder
     /// keys on (VAL-6), never `transport == "tls"`.
@@ -1224,12 +1063,10 @@ pub struct JobWireHost {
     listening: bool,
     /// Resolved idle bound for an enrolled session.
     session_idle: Duration,
-    /// VAL-6 challenge registry (single-use nonces, freshness-windowed).
-    nonces: parking_lot::Mutex<NonceRegistry>,
-    /// Connection accounting: the cap gauge, its refusals, and the
-    /// accept-error backoff engagement counter (must stay 0 on a
-    /// healthy host).
-    live_conns: Arc<AtomicU64>,
+    /// Connection accounting: cluster_wire's [`ConnGate`] (the cap gauge),
+    /// its refusals, and the accept-error backoff engagement counter
+    /// (must stay 0 on a healthy host).
+    conns: ConnGate,
     conns_refused: AtomicU64,
     accept_backoffs: AtomicU64,
     next_session: AtomicU64,
@@ -1273,43 +1110,38 @@ impl JobWireHost {
         // the reserved-namespace screen.
         let mut secret = vec![0u8; 32];
         rand::Rng::fill(&mut rand::thread_rng(), &mut secret[..]);
-        let record = serde_json::json!({ "schema": 1, "secret": hex_encode(&secret) });
+        let record =
+            serde_json::json!({ "schema": 1, "secret": cluster_wire::hex_encode(&secret) });
         fabric
             .meta_handle()
             .setxattr(1, JOB_ENROLL_XATTR, record.to_string().as_bytes())
             .await?;
 
-        // The verification-strength ladder keys on an AUTHENTICATED
-        // channel (VAL-6), never on the presence of a TLS object.
-        let (tls, transport, authenticated) = match cfg.security.as_ref() {
-            Some(sec) => {
-                if sec.ca_cert.is_some() && sec.ca_key.is_none() {
-                    // `rustls_{server,client}_config` unwrap the CA key
-                    // whenever a cert is present — refuse here, loud,
-                    // instead of panicking on the first connection.
-                    return Err(SqueezefsError::InvalidOperation(
-                        "job wire: ClusterSecurityConfig carries a CA cert with no ca_key — \
-                         the node certificate is signed by the CA key, so this configuration \
-                         can never produce an authenticated channel"
-                            .into(),
-                    ));
-                }
-                let server_cfg = rustls_server_config(sec)?;
-                let authed = channel_authenticated(sec);
-                (
-                    Some(tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg))),
-                    if authed {
-                        "mtls"
-                    } else {
-                        "tls-unauthenticated"
-                    },
-                    authed,
-                )
-            }
-            None => (None, "plaintext", false),
+        // The channel class. S3: a TLS configuration that is not a
+        // complete CA pair is REFUSED here (`cluster_wire::tls_acceptor`),
+        // naming the missing half — it used to install an
+        // accept-everything verifier client-side and take no client auth
+        // server-side, which VAL-6 then had to special-case out of the
+        // ladder. There is no "tls-unauthenticated" class any more.
+        let (tls, channel) = match cfg.security.as_ref() {
+            Some(sec) => (
+                Some(cluster_wire::tls_acceptor(sec)?),
+                ChannelClass::MutualTls,
+            ),
+            None => (None, ChannelClass::Plaintext),
         };
-        // The Issue-30 law, restated on the authenticated-channel
-        // predicate: anything but CA-pinned mTLS is plaintext-class.
+        // Every admitted session on this wire is authenticated (storage
+        // proof + per-frame MAC). The Issue-30 verify-read ladder needs
+        // more than authentication — it needs CONFIDENTIALITY, because
+        // sampling trades reads for trust in what crossed the wire — so
+        // its predicate is `verify_sampling_admissible()`, i.e. mTLS.
+        let authn = SessionAuthn {
+            channel,
+            proof_verified: true,
+            mac_engaged: true,
+        };
+        let transport = channel.name();
+        let authenticated = authn.verify_sampling_admissible();
         let verify_permille = if authenticated {
             cfg.verify_sample_permille.clamp(1, 1000)
         } else {
@@ -1329,25 +1161,19 @@ impl JobWireHost {
         };
         if listener.is_some() {
             match transport {
-                // OQ-A default-permissive: the ONE loud line. HMAC gates
-                // enrollment (integrity of enrollment, not of frames);
-                // the Issue-30 law makes every mutating publish 100 %
-                // verify-read, so a hijacked session cannot publish bytes
-                // the coordinator has not itself read and checksummed.
+                // OQ-A default-permissive: the ONE loud line. Since S3
+                // the session MAC means a plaintext session cannot be
+                // hijacked or forged either — what plaintext still lacks
+                // is confidentiality, and the Issue-30 law keeps every
+                // mutating publish 100 % verify-read there.
                 "plaintext" => log::warn!(
                     "job wire: listener {endpoint} is PLAINTEXT TCP (no ClusterSecurityConfig) \
-                     — enrollment is challenge-HMAC-gated only; mutating publishes pay \
+                     — sessions are AUTHENTICATED (storage-trust challenge proof + per-frame \
+                     session MAC, S3 cluster_wire) but not private, so mutating publishes pay \
                      mandatory-100 % verify-reads (Issue-30; ≈2× device reads on \
                      remote-mutated bytes). Set SQUEEZEFS_JOB_WIRE_CA_KEY (+ optional \
                      SQUEEZEFS_JOB_WIRE_CA_CERT) for CA-pinned mTLS + sampled verification, \
                      or SQUEEZEFS_JOB_WIRE_BIND to narrow/disable the listener."
-                ),
-                "tls-unauthenticated" => log::warn!(
-                    "job wire: listener {endpoint} runs TLS with NO CA pin — the client side \
-                     installs an accept-everything certificate verifier and the server takes \
-                     no client auth, so this is an UNAUTHENTICATED channel: it is refused for \
-                     the verification-strength ladder and pinned to mandatory-100 % \
-                     verify-reads. Set SQUEEZEFS_JOB_WIRE_CA_KEY for CA-pinned mTLS."
                 ),
                 _ => {
                     log::info!(
@@ -1382,15 +1208,24 @@ impl JobWireHost {
             fabric,
             seam,
             endpoint,
-            secret,
+            gate: Arc::new(AuthnGate::new(
+                secret,
+                AuthnConfig {
+                    freshness: cfg.enroll_freshness,
+                    // One outstanding challenge per admitted connection,
+                    // plus slack for reconnect churn inside one window.
+                    nonce_cap,
+                    schema: WIRE_SCHEMA,
+                    ..AuthnConfig::default()
+                },
+            )),
             transport,
             authenticated,
             verify_permille,
             tls,
             listening: listener.is_some(),
             session_idle,
-            nonces: parking_lot::Mutex::new(NonceRegistry::new(nonce_cap)),
-            live_conns: Arc::new(AtomicU64::new(0)),
+            conns: ConnGate::new(cfg.max_connections),
             conns_refused: AtomicU64::new(0),
             accept_backoffs: AtomicU64::new(0),
             next_session: AtomicU64::new(1),
@@ -1426,9 +1261,14 @@ impl JobWireHost {
         self.transport
     }
 
-    /// Is the channel AUTHENTICATED (CA-pinned mTLS)? The
-    /// verification-strength ladder keys on this — never on the
-    /// presence of a TLS object (VAL-6).
+    /// The verification-strength ladder's predicate: an authenticated
+    /// **and confidential** channel, i.e. CA-pinned mTLS — never the mere
+    /// presence of a TLS object (VAL-6), and never `true` for plaintext.
+    ///
+    /// S3 nuance worth keeping straight: since the session MAC landed,
+    /// EVERY admitted session is authenticated (`SessionAuthn`), plaintext
+    /// included. What sampling needs on top of that is confidentiality,
+    /// which is what this reports.
     pub fn channel_authenticated(&self) -> bool {
         self.authenticated
     }
@@ -1441,7 +1281,7 @@ impl JobWireHost {
     /// Live accepted connections (the [`JobWireConfig::max_connections`]
     /// gauge).
     pub fn live_connections(&self) -> u64 {
-        self.live_conns.load(Ordering::SeqCst)
+        self.conns.live()
     }
 
     /// Connections closed unserved because the cap was full.
@@ -1463,7 +1303,7 @@ impl JobWireHost {
 
     /// Outstanding (issued, unanswered, unexpired) enrollment challenges.
     pub fn outstanding_challenges(&self) -> usize {
-        self.nonces.lock().outstanding()
+        self.gate.outstanding_challenges()
     }
 
     /// Effective verify-read sampling (‰). **1000 on every channel that
@@ -1536,7 +1376,7 @@ impl JobWireHost {
             // The concurrent-connection cap (VAL-6). Claim the slot
             // BEFORE spawning anything: over-cap peers cost one accept
             // and one close, never a task or a buffer.
-            let permit = match self.try_admit() {
+            let permit = match self.conns.try_admit() {
                 Some(p) => p,
                 None => {
                     self.conns_refused.fetch_add(1, Ordering::SeqCst);
@@ -1554,11 +1394,18 @@ impl JobWireHost {
             let handshake = self.cfg.handshake_timeout;
             let h = tokio::spawn(async move {
                 let _permit = permit;
-                let stream: BoxedStream = match host.tls.clone() {
-                    // The handshake itself is attacker-paced: bound it.
+                // The handshake itself is attacker-paced: bound it. The
+                // TLS **exporter** output is captured here and mixed into
+                // the session key, so an mTLS session's per-frame MAC is
+                // channel-bound (a key cannot be lifted onto another
+                // connection).
+                let (stream, binding): (ClusterStream, Option<[u8; 32]>) = match host.tls.clone() {
                     Some(acceptor) => {
                         match tokio::time::timeout(handshake, acceptor.accept(tcp)).await {
-                            Ok(Ok(s)) => Box::new(s),
+                            Ok(Ok(s)) => {
+                                let binding = cluster_wire::server_exporter(s.get_ref().1);
+                                (Box::new(s), binding)
+                            }
                             Ok(Err(e)) => {
                                 log::warn!("job wire: TLS handshake with {peer} failed: {e}");
                                 return;
@@ -1572,9 +1419,9 @@ impl JobWireHost {
                             }
                         }
                     }
-                    None => Box::new(tcp),
+                    None => (Box::new(tcp), None),
                 };
-                host.serve_conn(stream, peer).await;
+                host.serve_conn(stream, peer, binding).await;
             });
             // RES-5: `handles` was push-only — one JoinHandle retained
             // per connection ever accepted. Prune the finished ones on
@@ -1587,45 +1434,28 @@ impl JobWireHost {
         }
     }
 
-    /// Claim a connection slot, or `None` at the cap.
-    fn try_admit(&self) -> Option<ConnPermit> {
-        let cap = self.cfg.max_connections as u64;
-        let mut live = self.live_conns.load(Ordering::SeqCst);
-        loop {
-            if live >= cap {
-                return None;
-            }
-            match self.live_conns.compare_exchange_weak(
-                live,
-                live + 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => {
-                    return Some(ConnPermit {
-                        live: Arc::clone(&self.live_conns),
-                    })
-                }
-                Err(observed) => live = observed,
-            }
-        }
-    }
-
-    /// One connection: the VAL-6 challenge, the enrollment gate, then
-    /// the session frame loop. Everything before enrollment runs under
-    /// `handshake_timeout` at the [`MAX_HELLO_FRAME_BYTES`] class.
-    async fn serve_conn(self: &Arc<Self>, stream: BoxedStream, peer: SocketAddr) {
+    /// One connection: the coordinator-issued challenge, the enrollment
+    /// gate, then the **authenticated** session frame loop. Everything
+    /// before enrollment runs under `handshake_timeout` at the
+    /// [`MAX_HELLO_FRAME_BYTES`] class; everything after it carries the
+    /// session MAC.
+    async fn serve_conn(
+        self: &Arc<Self>,
+        stream: ClusterStream,
+        peer: SocketAddr,
+        binding: Option<[u8; 32]>,
+    ) {
         let mut stream = stream;
         let deadline = self.cfg.handshake_timeout;
 
         // The coordinator speaks first: a single-use, freshness-windowed
-        // nonce the worker cannot choose (VAL-6). A captured hello is
-        // therefore not a credential.
-        let server_nonce = self.nonces.lock().issue(self.cfg.enroll_freshness);
+        // nonce the worker cannot choose. A captured hello is therefore
+        // not a credential.
+        let issued = self.gate.issue_challenge();
         let challenge = WireFrame::Challenge {
-            wire_schema: WIRE_SCHEMA,
-            server_nonce: server_nonce.clone(),
-            freshness_ms: self.cfg.enroll_freshness.as_millis() as u64,
+            wire_schema: issued.schema,
+            server_nonce: issued.server_nonce.clone(),
+            freshness_ms: issued.freshness_ms,
         };
         match tokio::time::timeout(deadline, write_frame(&mut stream, &challenge)).await {
             Ok(Ok(())) => {}
@@ -1680,91 +1510,36 @@ impl JobWireHost {
             .await;
             return;
         };
-        if wire_schema != WIRE_SCHEMA {
-            METRICS
-                .job_remote_enroll_refused
-                .fetch_add(1, Ordering::Relaxed);
-            log::warn!(
-                "job wire: {peer}: worker {worker_id} speaks wire_schema {wire_schema}, \
-                 this coordinator speaks {WIRE_SCHEMA} — refused"
-            );
-            let _ = write_frame(
-                &mut stream,
-                &WireFrame::EnrollRefused {
-                    reason: format!(
-                        "wire_schema {wire_schema} not supported (coordinator speaks {WIRE_SCHEMA})"
-                    ),
-                },
-            )
-            .await;
-            return;
-        }
-        if worker_id.len() > MAX_WORKER_ID_BYTES {
-            METRICS
-                .job_remote_enroll_refused
-                .fetch_add(1, Ordering::Relaxed);
-            log::warn!(
-                "job wire: {peer}: worker id of {} B exceeds the {MAX_WORKER_ID_BYTES} B cap \
-                 — refused",
-                worker_id.len()
-            );
-            let _ = write_frame(
-                &mut stream,
-                &WireFrame::EnrollRefused {
-                    reason: format!("worker_id exceeds {MAX_WORKER_ID_BYTES} B"),
-                },
-            )
-            .await;
-            return;
-        }
-        let expected = enroll_hmac(&self.secret, &worker_id, &presented_nonce, &endpoint_nonce);
-        if !mac_eq(&expected, &hmac) {
-            METRICS
-                .job_remote_enroll_refused
-                .fetch_add(1, Ordering::Relaxed);
-            log::warn!(
-                "job wire: {peer}: worker {worker_id} failed the storage-membership HMAC — \
-                 refused (job_remote_enroll_refused)"
-            );
-            let _ = write_frame(
-                &mut stream,
-                &WireFrame::EnrollRefused {
-                    reason: "hmac invalid (storage-membership proof failed)".into(),
-                },
-            )
-            .await;
-            return;
-        }
-        // Freshness (VAL-6): the proof must answer a challenge THIS
-        // coordinator issued, inside its window, and only once. A valid
-        // MAC over a stale or already-spent nonce is a replay.
-        let outcome = self
-            .nonces
-            .lock()
-            .consume(&presented_nonce, self.cfg.enroll_freshness);
-        let refusal = match outcome {
-            NonceOutcome::Fresh => None,
-            NonceOutcome::Expired => Some(format!(
-                "enrollment challenge expired (freshness window {:?}) — reconnect",
-                self.cfg.enroll_freshness
-            )),
-            NonceOutcome::UnknownOrReplayed => Some(
-                "enrollment nonce is unknown or already spent (replayed hello) — challenges \
-                 are single-use"
-                    .to_string(),
-            ),
+        // ONE ladder, cluster_wire's: schema, then the identity bound,
+        // then the constant-time proof compare, and only then the
+        // single-use/freshness nonce consume — so a peer that cannot
+        // produce a valid proof can never spend the challenge of the
+        // honest connection it raced. On success both ends hold the same
+        // session key (derived from the storage secret, both nonces, the
+        // worker id and — under mTLS — the channel binding).
+        let key = match self.gate.verify(
+            ProofClaim {
+                schema: wire_schema,
+                peer_id: &worker_id,
+                server_nonce: &presented_nonce,
+                peer_nonce: &endpoint_nonce,
+                mac: &hmac,
+            },
+            binding.as_ref().map(|b| &b[..]),
+        ) {
+            Verdict::Admit(key) => key,
+            Verdict::Refuse(reason) => {
+                METRICS
+                    .job_remote_enroll_refused
+                    .fetch_add(1, Ordering::Relaxed);
+                log::warn!(
+                    "job wire: {peer}: worker {worker_id} refused: {reason} \
+                     (job_remote_enroll_refused)"
+                );
+                let _ = write_frame(&mut stream, &WireFrame::EnrollRefused { reason }).await;
+                return;
+            }
         };
-        if let Some(reason) = refusal {
-            METRICS
-                .job_remote_enroll_refused
-                .fetch_add(1, Ordering::Relaxed);
-            log::warn!(
-                "job wire: {peer}: worker {worker_id} presented a bad challenge nonce: \
-                 {reason} (job_remote_enroll_refused)"
-            );
-            let _ = write_frame(&mut stream, &WireFrame::EnrollRefused { reason }).await;
-            return;
-        }
 
         // Admitted.
         METRICS
@@ -1788,12 +1563,15 @@ impl JobWireHost {
             return;
         }
 
+        // EnrollOk was the last UNAUTHENTICATED frame on this
+        // connection: from here both directions carry the session MAC.
         let (mut rd, wr) = tokio::io::split(stream);
+        let (tx, mut rx) = session_framers(&key, cluster_wire::Role::Coordinator);
         let session = Arc::new(Session {
             id: self.next_session.fetch_add(1, Ordering::SeqCst),
             worker_id: worker_id.clone(),
             pr_key,
-            writer: Arc::new(tokio::sync::Mutex::new(wr)),
+            writer: Arc::new(tokio::sync::Mutex::new(AuthedWriter { half: wr, tx })),
             busy: AtomicBool::new(false),
             expired: AtomicBool::new(false),
         });
@@ -1802,20 +1580,32 @@ impl JobWireHost {
             .insert(session.id, Arc::clone(&session));
         log::info!(
             "job wire: worker {worker_id} enrolled from {peer} (session {}, pr_key {:?}, \
-             fence {})",
+             fence {}, channel {}{})",
             session.id,
             pr_key,
-            self.fence_mode()
+            self.fence_mode(),
+            self.transport,
+            if binding.is_some() {
+                ", exporter-bound session MAC"
+            } else {
+                ", session MAC"
+            }
         );
 
         // Session frame loop. Post-enrollment classes: the full frame
-        // cap, a body deadline once a length prefix lands, and an idle
-        // bound (a session that stops speaking entirely is closed —
-        // its slot is a capped resource).
+        // cap, a body deadline once a length prefix lands, an idle bound
+        // (a session that stops speaking entirely is closed — its slot is
+        // a capped resource), and the **session MAC** on every frame: a
+        // shard result is custody-bearing, so an unauthenticated frame in
+        // this position ends the session rather than being interpreted.
         loop {
             let frame = match tokio::time::timeout(
                 self.session_idle,
-                read_frame_limited(&mut rd, MAX_FRAME_BYTES, Some(self.cfg.frame_body_timeout)),
+                rx.recv::<_, WireFrame>(
+                    &mut rd,
+                    MAX_FRAME_BYTES,
+                    Some(self.cfg.frame_body_timeout),
+                ),
             )
             .await
             {
@@ -1840,12 +1630,9 @@ impl JobWireHost {
                 WireFrame::Heartbeat { .. } => {
                     self.renew_lease(&session);
                     let mut w = session.writer.lock().await;
-                    if write_frame(
-                        &mut *w,
-                        &WireFrame::HeartbeatAck {
-                            lease_ttl_ms: self.cfg.lease_ttl.as_millis() as u64,
-                        },
-                    )
+                    if w.send(&WireFrame::HeartbeatAck {
+                        lease_ttl_ms: self.cfg.lease_ttl.as_millis() as u64,
+                    })
                     .await
                     .is_err()
                     {
@@ -2075,7 +1862,7 @@ impl JobWireHost {
             lease_ttl_ms: self.cfg.lease_ttl.as_millis() as u64,
         };
         let mut w = session.writer.lock().await;
-        write_frame(&mut *w, &WireFrame::ShardAssign { shard: descriptor })
+        w.send(&WireFrame::ShardAssign { shard: descriptor })
             .await
             .map_err(SqueezefsError::from)
     }
@@ -2322,14 +2109,12 @@ impl JobWireHost {
         self.fabric.remote_complete(&job_id, &shard.ctl).await;
 
         let mut w = session.writer.lock().await;
-        let _ = write_frame(
-            &mut *w,
-            &WireFrame::ResultAck {
+        let _ = w
+            .send(&WireFrame::ResultAck {
                 job_id: job_id.clone(),
                 shard: shard_no,
-            },
-        )
-        .await;
+            })
+            .await;
     }
 
     /// Verify-read `dests` against the submitted checksums. Plaintext ⇒
@@ -2401,15 +2186,13 @@ impl JobWireHost {
 /// refusal has nowhere to land, which is fine: fencing already holds).
 async fn refuse_submit(session: &Arc<Session>, job_id: &str, shard: u32, reason: String) {
     let mut w = session.writer.lock().await;
-    let _ = write_frame(
-        &mut *w,
-        &WireFrame::ResultRefused {
+    let _ = w
+        .send(&WireFrame::ResultRefused {
             job_id: job_id.to_string(),
             shard,
             reason,
-        },
-    )
-    .await;
+        })
+        .await;
 }
 
 /// Acquire WERO (rtype 2) on every path. `Some` only when EVERY
@@ -2511,11 +2294,14 @@ pub struct WorkerReport {
     pub shards_aborted: u64,
 }
 
-/// An enrolled remote worker (client side of the wire).
+/// An enrolled remote worker (client side of the wire). Carries the
+/// derived session key: enrollment is the LAST unauthenticated exchange,
+/// and every frame after it is MAC'd in both directions.
 pub struct JobWireWorker {
-    stream: BoxedStream,
+    stream: ClusterStream,
     opts: WorkerOptions,
     heartbeat: Duration,
+    key: SessionKey,
 }
 
 impl std::fmt::Debug for JobWireWorker {
@@ -2533,35 +2319,27 @@ impl JobWireWorker {
     /// coordinator's reason.
     pub async fn connect(endpoint: &str, secret: &[u8], opts: WorkerOptions) -> Result<Self> {
         let tcp = tokio::net::TcpStream::connect(endpoint).await?;
-        let mut stream: BoxedStream = match opts.security.as_ref() {
+        // S3: a CA-less TLS config REFUSES here (`tls_connector`) instead
+        // of warning and presenting the storage secret's proof into a pipe
+        // whose far end was never validated.
+        let (mut stream, binding): (ClusterStream, Option<[u8; 32]>) = match opts.security.as_ref()
+        {
             Some(sec) => {
-                if !channel_authenticated(sec) {
-                    // The dial side of the VAL-6 ladder: without a CA
-                    // pin `rustls_client_config` installs an
-                    // accept-everything verifier — say so out loud
-                    // rather than presenting the storage secret's proof
-                    // into an unauthenticated pipe silently.
-                    log::warn!(
-                        "job worker: TLS with no CA pin — the server certificate is NOT \
-                         validated (accept-everything verifier). Configure the cluster CA \
-                         for an authenticated channel."
-                    );
-                }
-                let cfg = rustls_client_config(sec)?;
-                let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
+                let connector = cluster_wire::tls_connector(sec)?;
                 // The ClusterSecurityConfig node certs carry
                 // localhost/127.0.0.1 SANs (cluster_tls.rs construction).
                 let name = rustls::pki_types::ServerName::try_from("localhost")
                     .expect("literal server name")
                     .to_owned();
-                Box::new(connector.connect(name, tcp).await?)
+                let tls = connector.connect(name, tcp).await?;
+                let binding = cluster_wire::client_exporter(tls.get_ref().1);
+                (Box::new(tls), binding)
             }
-            None => Box::new(tcp),
+            None => (Box::new(tcp), None),
         };
-        // The coordinator speaks first (VAL-6 schema 2): its challenge
-        // nonce is what the proof is bound to. Bounded read at the
-        // hello class — a hostile "coordinator" gets no allocation
-        // authority either.
+        // The coordinator speaks first: its challenge nonce is what the
+        // proof is bound to. Bounded read at the hello class — a hostile
+        // "coordinator" gets no allocation authority either.
         let server_nonce = match tokio::time::timeout(
             ENROLL_DIAL_TIMEOUT,
             read_frame_limited(
@@ -2619,11 +2397,24 @@ impl JobWireWorker {
                 wire_schema: _,
                 heartbeat_ms,
                 lease_ttl_ms: _,
-            }) => Ok(Self {
-                stream,
-                opts,
-                heartbeat: Duration::from_millis(heartbeat_ms.max(1)),
-            }),
+            }) => {
+                // Derived, never transmitted: the same inputs the
+                // coordinator used (secret, both nonces, worker id, and
+                // the channel binding under mTLS).
+                let key = cluster_wire::session_key(
+                    secret,
+                    &opts.worker_id,
+                    &server_nonce,
+                    &nonce,
+                    binding.as_ref().map(|b| &b[..]),
+                );
+                Ok(Self {
+                    stream,
+                    opts,
+                    heartbeat: Duration::from_millis(heartbeat_ms.max(1)),
+                    key,
+                })
+            }
             Some(WireFrame::EnrollRefused { reason }) => Err(SqueezefsError::InvalidOperation(
                 format!("enrollment refused by the coordinator: {reason}"),
             )),
@@ -2642,9 +2433,13 @@ impl JobWireWorker {
             stream,
             opts,
             heartbeat,
+            key,
         } = self;
         let (mut rd, wr) = tokio::io::split(stream);
-        let writer = Arc::new(tokio::sync::Mutex::new(wr));
+        // Both directions authenticated from here (the peer half of the
+        // coordinator's framers).
+        let (tx, mut rx) = session_framers(&key, cluster_wire::Role::Peer);
+        let writer = Arc::new(tokio::sync::Mutex::new(AuthedWriter { half: wr, tx }));
 
         let (assign_tx, mut assign_rx) = tokio::sync::mpsc::channel::<ShardDescriptor>(4);
         let (resp_tx, mut resp_rx) =
@@ -2659,7 +2454,10 @@ impl JobWireWorker {
         // coordinator observes the departure EOF).
         let read_task = AbortOnDrop(tokio::spawn(async move {
             loop {
-                match read_frame(&mut rd).await {
+                match rx
+                    .recv::<_, WireFrame>(&mut rd, MAX_FRAME_BYTES, None)
+                    .await
+                {
                     Ok(Some(WireFrame::ShardAssign { shard })) => {
                         if assign_tx.send(shard).await.is_err() {
                             return;
@@ -2700,12 +2498,9 @@ impl JobWireWorker {
                     continue;
                 }
                 let mut w = hb_writer.lock().await;
-                if write_frame(
-                    &mut *w,
-                    &WireFrame::Heartbeat {
-                        worker_id: hb_opts.worker_id.clone(),
-                    },
-                )
+                if w.send(&WireFrame::Heartbeat {
+                    worker_id: hb_opts.worker_id.clone(),
+                })
                 .await
                 .is_err()
                 {
@@ -2839,15 +2634,12 @@ impl JobWireWorker {
 
             {
                 let mut w = writer.lock().await;
-                if write_frame(
-                    &mut *w,
-                    &WireFrame::ResultSubmit {
-                        job_id: shard.job_id.clone(),
-                        shard: shard.shard,
-                        shard_fencing: shard.shard_fencing,
-                        checksums,
-                    },
-                )
+                if w.send(&WireFrame::ResultSubmit {
+                    job_id: shard.job_id.clone(),
+                    shard: shard.shard,
+                    shard_fencing: shard.shard_fencing,
+                    checksums,
+                })
                 .await
                 .is_err()
                 {
@@ -2896,7 +2688,7 @@ impl Drop for AbortOnDrop {
 async fn revalidate_lease(
     lease_rx: &mut tokio::sync::watch::Receiver<tokio::time::Instant>,
     assigned_deadline: tokio::time::Instant,
-    writer: &Arc<tokio::sync::Mutex<tokio::io::WriteHalf<BoxedStream>>>,
+    writer: &Arc<tokio::sync::Mutex<AuthedWriter>>,
     opts: &WorkerOptions,
     ttl: Duration,
 ) -> bool {
@@ -2913,12 +2705,9 @@ async fn revalidate_lease(
         // to move the deadline before committing the next batch.
         {
             let mut w = writer.lock().await;
-            if write_frame(
-                &mut *w,
-                &WireFrame::Heartbeat {
-                    worker_id: opts.worker_id.clone(),
-                },
-            )
+            if w.send(&WireFrame::Heartbeat {
+                worker_id: opts.worker_id.clone(),
+            })
             .await
             .is_err()
             {

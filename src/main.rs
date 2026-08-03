@@ -4925,6 +4925,17 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // verify sampling, connection cap, challenge freshness).
             // Unset ⇒ ruling D2's default verbatim: bind `0.0.0.0:0`,
             // plaintext, mandatory-100 % verify-reads.
+            //
+            // DLM **S3**: this listener now rides `cluster_wire` — the ONE
+            // cluster transport (binary framing, storage-trust mutual
+            // authn with a per-frame session MAC, one bounds
+            // implementation, DISC-1 discovery). The knob family keeps its
+            // `SQUEEZEFS_JOB_WIRE_*` spelling deliberately: it is the same
+            // listener on the same port, the operator docs and the VAL-6
+            // evidence key on these names, and a rename would be a
+            // retired-spelling migration with no behavior behind it. S4's
+            // lock verbs arrive as an `RpcService` on this same transport,
+            // not as a second port.
             let wire_cfg = squeezefs::job_wire::JobWireConfig::from_env(
                 resolved_data_lvs
                     .iter()
@@ -4942,7 +4953,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             if wire.listening() {
                 let advertised = format!(
                     "{}:{}",
-                    squeezefs::job_wire::local_advertise_ip(),
+                    squeezefs::cluster_wire::local_advertise_ip(),
                     wire.endpoint().port()
                 );
                 let _ = fs_engine.job_wire_endpoint.set(advertised.clone());

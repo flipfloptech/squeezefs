@@ -1,7 +1,7 @@
 //! **Per-writer ino lanes** — pre-RC engineering spec §6.2 **item 5**
 //! ("`next_ino` is a per-mount atomic over a shared namespace … duplicate
 //! inos alias files immediately; also silently underpins IPC binding
-//! identity"), behind incompat bit 10, ruling **D9** (built, NOT stamped).
+//! identity"), behind incompat bit 12, ruling **D9** (built, NOT stamped).
 //! Design: `docs/design-mw-cursors-and-incarnation.md`.
 //!
 //! This is the [`AppendPartition`]-aware face of [`crate::lane_core`]: the

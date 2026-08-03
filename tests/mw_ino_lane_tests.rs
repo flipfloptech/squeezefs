@@ -1,6 +1,6 @@
 //! **Per-writer ino lanes** — pre-RC engineering spec §6.2 **item 5**
 //! (rulings **D8**/**D9**; design
-//! `docs/design-mw-cursors-and-incarnation.md`), behind incompat bit 10,
+//! `docs/design-mw-cursors-and-incarnation.md`), behind incompat bit 12,
 //! built but **NOT stamped**.
 //!
 //! The assumption being broken: `next_ino` is a per-mount atomic over a
@@ -56,7 +56,7 @@ fn part(writers: u16, writer: u16) -> AppendPartition {
     AppendPartition::new(writers, writer).expect("legal partition")
 }
 
-/// Format the way `squeezefs format` does today — **without** bit 10
+/// Format the way `squeezefs format` does today — **without** bit 12
 /// (ruling D9: build the bit, do not stamp it).
 async fn format_meta(path: &std::path::Path) {
     format_v3(path, META_LEN, &opts())
@@ -68,8 +68,8 @@ async fn format_meta(path: &std::path::Path) {
 async fn format_meta_laned(path: &std::path::Path) {
     format_meta(path).await;
     assert!(
-        set_ino_lanes_bit(path).await.expect("stamp bit 10"),
-        "a fresh format must NOT already carry bit 10 — stamping is the \
+        set_ino_lanes_bit(path).await.expect("stamp bit 12"),
+        "a fresh format must NOT already carry bit 12 — stamping is the \
          Phase-8 window's act, not format's"
     );
 }
@@ -250,22 +250,45 @@ fn laned_locals_keep_global_ino_stability() {
 /// **The bit ledger.** A sibling wave had two agents independently claim
 /// bit 8, which is silent on-disk ALIASING, not a merge inconvenience — so
 /// the four multi-writer format bits are pinned here: partitioned append 8,
-/// durable block refcounts 9, ino lanes 10, block-key incarnation 11,
+/// durable block refcounts 9, ino lanes 12, block-key incarnation 13,
 /// pairwise disjoint, all understood by this binary, and none of them
 /// stamped by `format`.
+///
+/// **Bits 12/13, not 10/11** — the same collision, caught a second time:
+/// bits **10** (writer-scoped staging keys, §6.2 item 8) and **11** (the S7
+/// data-plane fence) were claimed by branches authored in parallel with
+/// this one, so this wave moved up rather than alias them. The reservation
+/// is asserted below as a MASK, not as a pair of constants this tree does
+/// not yet contain: whichever branch lands first, the wave's two bits must
+/// stay outside `1 << 10 | 1 << 11` forever.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_multi_writer_format_bits_are_disjoint_and_unstamped() {
     assert_eq!(FEATURE_INCOMPAT_KV_PARTITIONED_APPEND, 1 << 8);
     assert_eq!(FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS, 1 << 9);
     assert_eq!(
         FEATURE_INCOMPAT_KV_INO_LANES,
-        1 << 10,
-        "the §6.2 item-5 bit is 10 (8 = partitioned append, 9 = durable block refs)"
+        1 << 12,
+        "the §6.2 item-5 bit is 12 (8 = partitioned append, 9 = durable block \
+         refs, 10 = writer-scoped staging, 11 = the S7 data-plane fence)"
     );
     assert_eq!(
         FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION,
-        1 << 11,
-        "the §6.2 item-6 bit is 11"
+        1 << 13,
+        "the §6.2 item-6 bit is 13"
+    );
+    // The parallel-branch reservation, as a mask: bits 10 and 11 belong to
+    // writer-scoped staging and the S7 data-plane fence. Their constants
+    // live on other branches, so aliasing them can only be prevented from
+    // here — and a mask assertion survives their landing, where an
+    // enumerated equality would not.
+    const RESERVED_PARALLEL: u64 = (1 << 10) | (1 << 11);
+    assert_eq!(
+        (FEATURE_INCOMPAT_KV_INO_LANES | FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION)
+            & RESERVED_PARALLEL,
+        0,
+        "this wave must not claim bit 10 (writer-scoped staging) or bit 11 \
+         (S7 data-plane fence) — two definitions of one bit is silent on-disk \
+         aliasing, not a merge inconvenience"
     );
     let bits = [
         FEATURE_INCOMPAT_KV_PARTITIONED_APPEND,
@@ -294,7 +317,7 @@ async fn the_multi_writer_format_bits_are_disjoint_and_unstamped() {
         sb.features_incompat
             & (FEATURE_INCOMPAT_KV_INO_LANES | FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION),
         0,
-        "format must stamp neither bit 10 nor bit 11 — the batched Phase-8 reformat \
+        "format must stamp neither bit 12 nor bit 13 — the batched Phase-8 reformat \
          window owns that act (ruling D9)"
     );
 }
@@ -332,7 +355,7 @@ async fn an_unstamped_volume_mints_dense_and_refuses_a_lane() {
         .expect_err("a lane on an un-stamped volume must be refused");
     let msg = format!("{err}");
     assert!(
-        msg.contains("bit 10") && msg.contains("lane"),
+        msg.contains("bit 12") && msg.contains("lane"),
         "the refusal must name the missing format bit, not fail obscurely: {msg}"
     );
 

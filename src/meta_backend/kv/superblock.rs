@@ -338,7 +338,7 @@ pub const FEATURE_INCOMPAT_KV_WRITER_SCOPED_STAGING: u64 = 1 << WRITER_SCOPED_ST
 /// the next one a red gate instead of silent on-disk aliasing.
 pub const FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA: u64 = 1 << 11;
 
-/// `features_incompat` bit 10: **per-writer ino lanes** — the volume's ino
+/// `features_incompat` bit 12: **per-writer ino lanes** — the volume's ino
 /// namespace is partitioned into one monotone LANE per appender, so two
 /// writers can mint concurrently without ever producing the same ino
 /// (pre-RC engineering spec §6.2 **item 5**, "cheapest of the five";
@@ -363,16 +363,25 @@ pub const FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA: u64 = 1 << 11;
 /// non-solo lane is REFUSED loud on it (pinned by
 /// `tests/mw_ino_lane_tests.rs`).
 ///
-/// Old binaries refuse a bit-10 volume loud via their own
+/// Old binaries refuse a bit-12 volume loud via their own
 /// [`FEATURES_INCOMPAT_KNOWN`] gate — exactly right: a lane-unaware writer
 /// mints DENSE inos over every peer's lane, and a peer resuming from its
 /// own durable watermark would then re-mint an ino that writer already
 /// used. Duplicate inos alias files immediately, and the daemon's IPC
 /// binding table rests on the monotonic never-reused ino law, so the alias
 /// reaches fd bindings too.
-pub const FEATURE_INCOMPAT_KV_INO_LANES: u64 = 1 << 10;
+///
+/// **Bit 12, not 10 — and 10/11 are RESERVED, not free.** Bit 10 is
+/// writer-scoped staging keys (§6.2 item 8) and bit 11 the S7 data-plane
+/// fence; both were authored on branches parallel to this one, so items 5
+/// and 6 moved up to 12/13 rather than alias them. The mask gap below 12 is
+/// therefore deliberate: never fill 10 or 11 from here. (Third occurrence
+/// of the bit-8 collision class — two definitions of one bit is silent
+/// on-disk aliasing, pinned by
+/// `tests/mw_ino_lane_tests.rs::the_multi_writer_format_bits_are_disjoint_and_unstamped`.)
+pub const FEATURE_INCOMPAT_KV_INO_LANES: u64 = 1 << 12;
 
-/// `features_incompat` bit 11: **`offset ‖ incarnation` block keys** — a
+/// `features_incompat` bit 13: **`offset ‖ incarnation` block keys** — a
 /// persisted block key names not just WHERE a block lives but WHICH
 /// lifetime of that device offset it is (pre-RC engineering spec §6.2
 /// **item 6**, rationale §6.3 "block-key binding"; design
@@ -411,10 +420,14 @@ pub const FEATURE_INCOMPAT_KV_INO_LANES: u64 = 1 << 10;
 /// **Presence is OPTIONAL and this binary NEVER STAMPS IT** (ruling D9):
 /// [`SuperblockV3::plan`] does not set it, mount does not set it,
 /// [`set_block_key_incarnation_bit`] is the Phase-8 path. Old binaries
-/// refuse a bit-11 volume loud — exactly right: they would mint bare keys
+/// refuse a bit-13 volume loud — exactly right: they would mint bare keys
 /// onto a volume whose keys name lifetimes, and free/patch offsets whose
 /// stale-binding refusals they cannot perform.
-pub const FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION: u64 = 1 << 11;
+///
+/// **Bit 13, not 11** — see the reservation note on
+/// [`FEATURE_INCOMPAT_KV_INO_LANES`]: bits 10 and 11 belong to parallel
+/// branches (writer-scoped staging, the S7 data-plane fence).
+pub const FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION: u64 = 1 << 13;
 
 /// Incompat feature bits this binary understands. Any other set bit
 /// refuses the mount naming the bit (§6.1).
@@ -1420,7 +1433,7 @@ pub async fn set_block_key_incarnation_bit(path: &Path) -> Result<bool, KvError>
     };
     if sb.features_incompat & FEATURE_INCOMPAT_KV_DURABLE_TERM == 0 {
         return Err(KvError::Corrupt(format!(
-            "{}: refusing to stamp block-key incarnations (bit 11) on a volume without the \
+            "{}: refusing to stamp block-key incarnations (bit 13) on a volume without the \
              durable writer term (bit 7) — the incarnation stamp is \
              `(writer_term << {}) | lane_seq`, so without a durable era it would restart at \
              every mount and a stale key would MATCH the offset's new lifetime (spec §6.2 \

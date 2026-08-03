@@ -1,7 +1,7 @@
 //! **`offset ‖ incarnation` block keys** — pre-RC engineering spec §6.2
 //! **item 6**, whose rationale is §6.3's *block-key binding* paragraph
 //! (rulings **D8**/**D9**; design
-//! `docs/design-mw-cursors-and-incarnation.md`), behind incompat bit 11,
+//! `docs/design-mw-cursors-and-incarnation.md`), behind incompat bit 13,
 //! built but **NOT stamped**.
 //!
 //! The assumption being broken: block keys are bare, reusable device
@@ -77,15 +77,15 @@ async fn format_meta(path: &std::path::Path) {
         .expect("format v3 meta volume");
 }
 
-/// [`format_meta`] plus the Phase-8 stamp (bit 11). Fresh formats already
-/// carry the durable term (bit 7), which bit 11 REQUIRES.
+/// [`format_meta`] plus the Phase-8 stamp (bit 13). Fresh formats already
+/// carry the durable term (bit 7), which bit 13 REQUIRES.
 async fn format_meta_stamped(path: &std::path::Path) {
     format_meta(path).await;
     assert!(
         set_block_key_incarnation_bit(path)
             .await
-            .expect("stamp bit 11"),
-        "a fresh format must NOT already carry bit 11 — stamping is the \
+            .expect("stamp bit 13"),
+        "a fresh format must NOT already carry bit 13 — stamping is the \
          Phase-8 window's act, not format's (ruling D9)"
     );
 }
@@ -699,7 +699,7 @@ async fn stamping_incarnations_without_a_durable_term_is_refused() {
 
     let err = set_block_key_incarnation_bit(meta.path())
         .await
-        .expect_err("bit 11 without bit 7 must be refused");
+        .expect_err("bit 13 without bit 7 must be refused");
     let msg = format!("{err}");
     assert!(
         msg.contains("bit 7") && msg.contains("term"),

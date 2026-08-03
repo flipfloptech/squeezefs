@@ -3357,7 +3357,7 @@ pub struct Metrics {
     /// the stale binding would have served (or freed) that file's block.
     /// MUST STAY 0: on a single-writer mount every republish precedes its
     /// free, so a live map can never name a dead lifetime. Growth means a
-    /// binding outlived its block (and, before incompat bit 11, was silent
+    /// binding outlived its block (and, before incompat bit 13, was silent
     /// on a passthrough volume).
     pub block_key_incarnation_refusals: Align64<AtomicU64>,
     /// Spec §6.2 item 6: keys served whose incarnation could not be
@@ -3365,7 +3365,7 @@ pub struct Metrics {
     /// — §6.3's honest degradation ("`UNKNOWN_STABLE` for any offset this
     /// node did not itself allocate"). This is the SIZE of the gap a shared
     /// custody authority (§6.9 S9) has to close; 0 on volumes without
-    /// incompat bit 11, since their keys name no lifetime at all.
+    /// incompat bit 13, since their keys name no lifetime at all.
     pub block_key_incarnation_unknown: Align64<AtomicU64>,
     /// Spec §6.2 item 6: the per-mount lifetime-stamp sequence space
     /// (2^40 allocations) ran out, so keys degraded to unstamped —

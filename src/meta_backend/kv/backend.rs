@@ -645,7 +645,7 @@ pub struct KvMetaBackend {
     /// §4.8 monotonic watermark, recovered at mount; the create path
     /// `fetch_add`s it.
     next_ino: AtomicU64,
-    /// Pre-RC spec §6.2 item 5 (incompat bit 10): **per-writer ino lane
+    /// Pre-RC spec §6.2 item 5 (incompat bit 12): **per-writer ino lane
     /// cursors**, keyed `(writer id, space)` where the space is the
     /// volume's native watermark or a hosted guest slot
     /// ([`super::ino_lane::InoSpace`]). One cell per lane the mount
@@ -653,7 +653,7 @@ pub struct KvMetaBackend {
     ///
     /// EMPTY on every mount today and on every un-stamped volume — solo
     /// minting keeps using `next_ino` / `guest_cursors` verbatim, so the
-    /// shipped hot path is untouched (ruling D9: nothing stamps bit 10).
+    /// shipped hot path is untouched (ruling D9: nothing stamps bit 12).
     /// The `lanes_live` latch below is what keeps the read side
     /// ([`Self::next_ino`], [`Self::live_inodes`]) at one relaxed load
     /// instead of an `scc` walk when no lane exists.
@@ -1935,10 +1935,10 @@ impl KvMetaBackend {
     }
 
     /// `true` ⇔ this volume's format expresses `offset ‖ incarnation`
-    /// block keys (incompat bit 11 — spec §6.2 item 6) AND this mount has a
+    /// block keys (incompat bit 13 — spec §6.2 item 6) AND this mount has a
     /// durable writer era to compose stamps from (incompat bit 7's term,
     /// which the stamping path requires and a read-only/probe mount does
-    /// not have). Nothing stamps bit 11 today (ruling D9), so this is
+    /// not have). Nothing stamps bit 13 today (ruling D9), so this is
     /// `false` on every production volume and every key stays bare.
     pub fn block_key_incarnation_engaged(&self) -> bool {
         self.sb.features_incompat & super::superblock::FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION
@@ -1947,7 +1947,7 @@ impl KvMetaBackend {
     }
 
     /// `true` ⇔ this volume's format expresses per-writer ino lanes
-    /// (incompat bit 10 — spec §6.2 item 5). Nothing stamps it today
+    /// (incompat bit 12 — spec §6.2 item 5). Nothing stamps it today
     /// (ruling D9), so this is `false` on every production volume and a
     /// non-solo lane is refused.
     pub fn ino_lanes_stamped(&self) -> bool {
@@ -1959,7 +1959,7 @@ impl KvMetaBackend {
     ///
     /// `part == AppendPartition::SOLO` is exactly [`Self::allocate_ino`]
     /// (the shipped path, one `fetch_add`); any other partition requires
-    /// incompat bit 10 and mints from the lane cursor, whose floor is the
+    /// incompat bit 12 and mints from the lane cursor, whose floor is the
     /// smallest lane value at or above the recovered dense watermark.
     pub fn allocate_ino_in(
         &self,
@@ -2029,7 +2029,7 @@ impl KvMetaBackend {
         if !part.is_solo() && !self.ino_lanes_stamped() {
             return Err(KvError::Corrupt(format!(
                 "{}: refusing to mint inos as appender {} of {} — this volume's format does \
-                 not express per-writer ino lanes (incompat bit 10 absent, spec §6.2 item 5). \
+                 not express per-writer ino lanes (incompat bit 12 absent, spec §6.2 item 5). \
                  A lane-unaware peer mints DENSE inos across every lane, and duplicate inos \
                  alias files immediately.",
                 self.path.display(),

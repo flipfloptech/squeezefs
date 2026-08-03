@@ -67,7 +67,6 @@ async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
 
 struct H {
     fs: SqueezefsFilesystem,
-    dlm: DlmClient,
     req: Request,
     _b: NamedTempFile,
     _m: NamedTempFile,
@@ -152,7 +151,6 @@ async fn make_ext(uuid: [u8; 16], alloc_ns: &str, compressed: bool, staging: boo
     };
     H {
         fs,
-        dlm,
         req,
         _b: b,
         _m: m,
@@ -933,18 +931,14 @@ async fn fold_revalidates_fencing_per_attempt_and_never_livelocks() {
         "extents parked (premise)"
     );
 
-    // Bump the ino's fencing generation (a lease re-acquisition — the
-    // FIND-M11-A shape: staging-era stamps go stale while custody lives).
-    // A ranged lock on the same ino shares the file's fencing generator
-    // (ObjectKey::fencing_identity) without contending with the FS's held
-    // whole-file lease — the INCR is the generation bump.
+    // Bump the ino's fencing generation (the FIND-M11-A shape:
+    // staging-era stamps go stale while custody lives). The DLM's
+    // generation-bump seam advances the file's generator WITHOUT
+    // disturbing the FS's held whole-file lease — pre-S11 this was a
+    // ranged lock on the same ino, which byte-range custody now
+    // (correctly) treats as a conflict with that live lease.
     let path = squeezefs::keys::inode_path(ino);
-    let lease = h
-        .dlm
-        .acquire_lock(&path, Some((0, 1)), std::time::Duration::from_secs(5))
-        .await
-        .unwrap();
-    lease.release().await.unwrap();
+    squeezefs::dlm::test_bump_fencing_generation(&path);
 
     // fsync must fold everything under the CURRENT generation — no
     // livelock, no drop.

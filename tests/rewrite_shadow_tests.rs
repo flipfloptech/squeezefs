@@ -502,16 +502,12 @@ async fn fenced_close_publishes_nothing_and_frees_nothing() {
     quiesce(&h).await;
     assert!(open_epochs() > 0, "premise: the epoch is open");
 
-    // A STALE token (the wt_fencing pattern: a range lock shares the
-    // file's fencing generator).
+    // A STALE token (the wt_fencing pattern). The DLM generation-bump seam
+    // advances the file's generator under the write path's live whole-file
+    // lease; pre-S11 this was a `(0,1)` range lock, which byte-range
+    // custody now (correctly) treats as a conflict with that lease.
     let path = squeezefs::keys::inode_path(ino);
-    let lease =
-        h.fs.dlm()
-            .acquire_lock(&path, Some((0, 1)), std::time::Duration::from_secs(5))
-            .await
-            .unwrap();
-    let stale = lease.fencing_token() - 1;
-    drop(lease);
+    let stale = squeezefs::dlm::test_bump_fencing_generation(&path) - 1;
 
     let (f0, fd0) = (terminal_frees(), shadow_fence_drops());
     let res = h.fs.router.close_rewrite_epoch(ino, stale).await;

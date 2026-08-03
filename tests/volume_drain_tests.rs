@@ -488,6 +488,9 @@ async fn test_drain_evacuates_retires_and_preserves_bytes_w1_ledger_zero() {
             + METRICS.patch_ineligible_unaligned.load(Ordering::Relaxed)
             + METRICS.patch_ineligible_overlay.load(Ordering::Relaxed)
             + METRICS.patch_ineligible_shared.load(Ordering::Relaxed)
+            + METRICS
+                .patch_ineligible_range_shared
+                .load(Ordering::Relaxed)
             + METRICS.patch_ineligible_transform.load(Ordering::Relaxed)
             + METRICS.patch_ineligible_adjacent.load(Ordering::Relaxed)
             + METRICS.patch_ineligible_oversize.load(Ordering::Relaxed)

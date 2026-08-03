@@ -182,11 +182,17 @@ async fn held_read_equals_lease_snapshot() {
     lease.release().await.unwrap();
 }
 
-/// 4b. Pin (green both sides): a byte-range mint shares the file's
-/// fencing generator and is visible through the whole-file read WHILE
-/// HELD — the wt_fencing / merge-primitive stale-token pattern
-/// (tests/write_through_tests.rs) constructs `stale = range_token - 1`
-/// and expects the router's whole-file fence read to reject it.
+/// 4b. Pin: a byte-range mint shares the FILE's fencing generator and is
+/// visible through the whole-file read WHILE HELD — the wt_fencing /
+/// merge-primitive stale-token pattern (tests/write_through_tests.rs)
+/// constructs `stale = range_token - 1` and expects the router's
+/// whole-file fence read to reject it.
+///
+/// S11 note: the two leases are taken in SEQUENCE, not nested. Byte-range
+/// custody now conflicts with whole-file custody (that is the stage's
+/// point), while the fencing decision it deliberately did NOT change is
+/// the one pinned here — ranges keep sharing the file's generator, so the
+/// ~24-site census keeps reading file identities.
 #[tokio::test]
 async fn range_mint_visible_through_file_identity_while_held() {
     let dlm = DlmClient::new().unwrap();
@@ -194,11 +200,13 @@ async fn range_mint_visible_through_file_identity_while_held() {
         .acquire_lock("inode_60000002", None, Duration::from_secs(5))
         .await
         .unwrap();
+    let whole_token = whole.fencing_token();
+    whole.release().await.unwrap();
     let range = dlm
         .acquire_lock("inode_60000002", Some((0, 1)), Duration::from_secs(5))
         .await
         .unwrap();
-    assert!(range.fencing_token() > whole.fencing_token());
+    assert!(range.fencing_token() > whole_token);
     let read = dlm.get_fencing_token_ino(60000002);
     assert!(
         read >= range.fencing_token(),
@@ -207,7 +215,6 @@ async fn range_mint_visible_through_file_identity_while_held() {
         range.fencing_token()
     );
     range.release().await.unwrap();
-    whole.release().await.unwrap();
 }
 
 /// 4c. Pin (green both sides): after every lease is released, the

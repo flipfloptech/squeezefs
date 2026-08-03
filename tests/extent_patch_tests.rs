@@ -277,6 +277,7 @@ struct Snap {
     unaligned: u64,
     overlay: u64,
     shared: u64,
+    range_shared: u64,
     transform: u64,
     adjacent: u64,
     oversize: u64,
@@ -302,6 +303,7 @@ fn snap() -> Snap {
         unaligned: l(&METRICS.patch_ineligible_unaligned),
         overlay: l(&METRICS.patch_ineligible_overlay),
         shared: l(&METRICS.patch_ineligible_shared),
+        range_shared: l(&METRICS.patch_ineligible_range_shared),
         transform: l(&METRICS.patch_ineligible_transform),
         adjacent: l(&METRICS.patch_ineligible_adjacent),
         oversize: l(&METRICS.patch_ineligible_oversize),
@@ -744,6 +746,130 @@ async fn exclusion_overlay_present_ram_and_staged() {
     purge_read_tiers(&h, ino).await;
     let got = read_at(&h, ino, 0, want.len()).await;
     assert_bytes(&got, &want, "overlay fallback byte-exactness (durable)");
+}
+
+/// **W1 clause 7 — range-shared custody** ⇒ `patch_ineligible_range_shared`
+/// (spec §6.7: *"the W1 patch predicate requires whole-inode exclusive
+/// custody, so range-shared custody needs a seventh clause in the existing
+/// decision ledger … to keep predicate rot visible"*; §6.3's W1 paragraph
+/// is the cross-node face of the same hazard, DLM stage S11).
+///
+/// The patch mutates a whole block's bytes in place under nothing but a
+/// per-block flush lock and a refcount==1 proof. The refcount proves the
+/// block is not CLONE-shared; it says nothing about a second writer holding
+/// custody of some of the block's BYTES. Under byte-range custody that
+/// second writer exists, so the clause refuses unless the patching writer's
+/// own custody covers the whole block:
+///
+/// - a foreign live range overlapping the block ⇒ refuse, counted;
+/// - the writer's OWN range covering the block ⇒ patch (the clause is a
+///   custody test, not a blanket "ranges disable W1");
+/// - the shipped shape (a whole-file lease, which IS whole-inode custody)
+///   ⇒ the clause is inert — every other test in this file is that proof.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn exclusion_range_shared_custody() {
+    let _g = serial().await;
+    let h = make(*b"rw2-rangeshr-001", "rw2_ns_rsh").await;
+    let (ino, mut want) = durable_striped(&h, "rsh.dat", 4, 0x16).await;
+    let path = squeezefs::keys::inode_path(ino);
+    let size = want.len() as u64;
+
+    // The write path caches a whole-file lease per open-for-write episode.
+    // Whole-file custody and a byte range are mutually exclusive by design
+    // (S11), so drop it before taking range custody — this is exactly why
+    // the clause's firing arm is driven through `write_file_staged` (the
+    // handler would re-take the whole-file lease and, correctly, conflict).
+    h.fs.invalidate_local_lease(ino);
+
+    // (a) FOREIGN range custody over part of block 1 ⇒ the aligned in-block
+    // overwrite of block 1 must NOT patch.
+    let foreign_client = DlmClient::new().unwrap();
+    let foreign = foreign_client
+        .acquire_lock(
+            &path,
+            Some((BS, BS + 4096)),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("foreign range custody");
+    let token = h.fs.router.dlm.get_fencing_token_ino(ino);
+
+    let before = snap();
+    let p = pattern(4096, 0xC1);
+    h.fs.write_file_staged(ino, BS + 8192, bytes::Bytes::from(p.clone()), size, token)
+        .await
+        .expect("write under foreign range custody");
+    want[(BS + 8192) as usize..(BS + 8192) as usize + 4096].copy_from_slice(&p);
+    let after = snap();
+    assert_eq!(
+        delta!(after, before, range_shared),
+        1,
+        "a block whose bytes are under FOREIGN byte-range custody must \
+         refuse the in-place patch and count patch_ineligible_range_shared"
+    );
+    assert_eq!(
+        delta!(after, before, patch_writes),
+        0,
+        "no patch may happen under foreign range custody"
+    );
+    assert_eq!(
+        delta!(after, before, shared),
+        0,
+        "the refusal is clause 7, not the clone-shared bucket (exactly one \
+         bucket per refusal — the ledger reconciles against invocations)"
+    );
+    foreign.release().await.expect("release foreign");
+
+    // (b) the writer's OWN range custody, covering the whole block ⇒ the
+    // patch proceeds: the clause is a custody test, not a range veto.
+    let mine =
+        h.fs.router
+            .dlm
+            .acquire_lock(
+                &path,
+                Some((2 * BS, 3 * BS)),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("own range custody");
+    let before = snap();
+    let p2 = pattern(4096, 0xC2);
+    h.fs.write_file_staged(
+        ino,
+        2 * BS + 16384,
+        bytes::Bytes::from(p2.clone()),
+        size,
+        mine.fencing_token(),
+    )
+    .await
+    .expect("write under own covering range custody");
+    want[(2 * BS + 16384) as usize..(2 * BS + 16384) as usize + 4096].copy_from_slice(&p2);
+    let after = snap();
+    assert_eq!(
+        delta!(after, before, range_shared),
+        0,
+        "own custody covering the whole block is whole-block custody: the \
+         clause must not fire (predicate rot would show up here)"
+    );
+    assert_eq!(
+        delta!(after, before, patch_writes),
+        1,
+        "the patch must still ride when the writer owns the block's bytes"
+    );
+    mine.release().await.expect("release own");
+
+    // Both arms are byte-exact, hot and durable.
+    h.fs.force_flush_all_staged_data()
+        .await
+        .expect("teardown-grade flush");
+    fsync(&h, ino).await;
+    purge_read_tiers(&h, ino).await;
+    let got = read_at(&h, ino, 0, want.len()).await;
+    assert_bytes(
+        &got,
+        &want,
+        "range-shared fallback byte-exactness (durable)",
+    );
 }
 
 /// Clone-shared blocks (refcount > 1) ⇒ `patch_ineligible_shared`, CoW

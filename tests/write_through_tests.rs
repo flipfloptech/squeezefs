@@ -1066,16 +1066,13 @@ async fn test_fencing_expiry_converges_transiently_and_stays_loud_below() {
     let ino = create(&h, "fencing.bin").await;
     make_striped(&h, ino, BS as usize + 1, 17).await;
 
-    // Bump the fencing token past the write path's cached lease. A range
-    // lock takes a distinct lock key (the whole-file lease stays held by the
-    // write path) while sharing the file's fencing generator.
+    // Bump the fencing token past the write path's cached lease. The DLM
+    // generation-bump seam raises the file's generator while the write
+    // path's whole-file lease stays HELD; pre-S11 this was a `(0,1)` range
+    // lock, which byte-range custody now (correctly) treats as a conflict
+    // with that live lease.
     let path = squeezefs::keys::inode_path(ino);
-    let lease =
-        h.fs.dlm()
-            .acquire_lock(&path, Some((0, 1)), Duration::from_secs(5))
-            .await
-            .unwrap();
-    drop(lease);
+    squeezefs::dlm::test_bump_fencing_generation(&path);
 
     // The handler-level write CONVERGES across the transient bump.
     let p1 = pattern(BS as usize, 1);
@@ -1090,13 +1087,7 @@ async fn test_fencing_expiry_converges_transiently_and_stays_loud_below() {
     assert_eq!(read_at(&h, ino, 0, p1.len() as u32).await, p1);
 
     // The router layer stays loud on a genuinely stale token.
-    let lease2 =
-        h.fs.dlm()
-            .acquire_lock(&path, Some((0, 1)), Duration::from_secs(5))
-            .await
-            .unwrap();
-    let stale = lease2.fencing_token() - 1;
-    drop(lease2);
+    let stale = squeezefs::dlm::test_bump_fencing_generation(&path) - 1;
     let res =
         h.fs.router
             .write_file(&path, 0, bytes::Bytes::from(pattern(BS as usize, 3)), stale)
@@ -1124,12 +1115,7 @@ async fn test_merge_primitive_rejects_stale_fencing_token() {
     make_striped(&h, ino, BS as usize + 1, 19).await;
 
     let path = squeezefs::keys::inode_path(ino);
-    let lease =
-        h.fs.dlm()
-            .acquire_lock(&path, Some((0, 1)), Duration::from_secs(5))
-            .await
-            .unwrap();
-    let stale = lease.fencing_token() - 1;
+    let stale = squeezefs::dlm::test_bump_fencing_generation(&path) - 1;
     let res =
         h.fs.router
             .merge_block_mappings(

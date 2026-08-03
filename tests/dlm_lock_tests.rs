@@ -150,8 +150,17 @@ async fn test_fencing_token_monotonic_and_readable() {
     assert_eq!(d.get_fencing_token("inode_930001"), l2.fencing_token());
 }
 
-/// Contract 4: whole-file and range locks are distinct lock objects; the
-/// same exact range conflicts with itself.
+/// Contract 4 (S11 — byte-range custody): whole-file custody conflicts
+/// with every byte range, and an identical range conflicts with itself.
+///
+/// **This contract inverted at S11.** Pre-S11 a range rode the lock KEY,
+/// so `Some((0,4096))` was a different lock *object* than `None` and was
+/// granted straight through a held whole-file lease — two writers could
+/// believe they owned the same bytes. The lock table is now keyed by FILE
+/// and carries the file's live spans, so whole-file custody (the strongest
+/// custody, and what the write path's `get_or_acquire_lease` takes) is
+/// mutually exclusive with every span. Disjoint spans still proceed in
+/// parallel — `tests/dlm_range_custody_tests.rs` owns that half.
 #[tokio::test]
 async fn test_range_and_whole_file_locks_are_distinct() {
     let d = dlm();
@@ -162,33 +171,44 @@ async fn test_range_and_whole_file_locks_are_distinct() {
         .await
         .expect("whole-file acquire");
 
-    // A range lock on the same path is a different object: must not block.
+    // A range on the same file is inside whole-file custody: it must
+    // arbitrate, with a *bounded* failure while the whole-file lease is
+    // held. With no churn anywhere, a wakeup-counting waiter has nothing to
+    // count and hangs forever — the wait budget must be time (the ttl
+    // parameter), not wakeups.
+    match tokio::time::timeout(
+        Duration::from_secs(3),
+        e.acquire_lock("inode_940001", Some((0, 4096)), Duration::from_millis(300)),
+    )
+    .await
+    {
+        Err(_) => panic!(
+            "conflicting acquire hung unbounded (300ms ttl, no churn): wait budget must be time-based"
+        ),
+        Ok(Ok(_)) => panic!("a byte range must not be granted under a held whole-file lease"),
+        Ok(Err(_)) => {} // bounded, loud — correct
+    }
+    whole.release().await.expect("release whole");
+
+    // With whole-file custody gone the span is grantable, and the exact
+    // same span from another client then conflicts with itself.
     let range = tokio::time::timeout(
         Duration::from_secs(2),
         e.acquire_lock("inode_940001", Some((0, 4096)), Duration::from_secs(5)),
     )
     .await
-    .expect("range acquire hung against whole-file lock")
+    .expect("range acquire hung after the whole-file release")
     .expect("range acquire failed");
-
-    // The exact same range from another client must conflict with a
-    // *bounded* failure while held. With no churn anywhere, a wakeup-counting
-    // waiter has nothing to count and hangs forever — the wait budget must be
-    // time (the ttl parameter), not wakeups.
-    let same_range = tokio::time::timeout(
+    match tokio::time::timeout(
         Duration::from_secs(3),
-        e.acquire_lock("inode_940001", Some((0, 4096)), Duration::from_millis(300)),
+        d.acquire_lock("inode_940001", Some((0, 4096)), Duration::from_millis(300)),
     )
-    .await;
-    match same_range {
-        Err(_) => panic!(
-            "conflicting acquire hung unbounded (300ms ttl, no churn): wait budget must be time-based"
-        ),
+    .await
+    {
+        Err(_) => panic!("identical-range acquire hung unbounded (300ms ttl, no churn)"),
         Ok(Ok(_)) => panic!("identical range must conflict while held"),
-        Ok(Err(_)) => {} // bounded, loud — correct
+        Ok(Err(_)) => {}
     }
-
-    whole.release().await.expect("release whole");
     range.release().await.expect("release range");
 }
 

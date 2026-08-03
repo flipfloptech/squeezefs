@@ -738,6 +738,7 @@ struct PatchLedger {
     ineligible_unaligned: u64,
     ineligible_overlay: u64,
     ineligible_shared: u64,
+    ineligible_range_shared: u64,
     ineligible_transform: u64,
     ineligible_adjacent: u64,
     ineligible_oversize: u64,
@@ -754,6 +755,7 @@ fn ledger() -> PatchLedger {
         ineligible_unaligned: l(&METRICS.patch_ineligible_unaligned),
         ineligible_overlay: l(&METRICS.patch_ineligible_overlay),
         ineligible_shared: l(&METRICS.patch_ineligible_shared),
+        ineligible_range_shared: l(&METRICS.patch_ineligible_range_shared),
         ineligible_transform: l(&METRICS.patch_ineligible_transform),
         ineligible_adjacent: l(&METRICS.patch_ineligible_adjacent),
         ineligible_oversize: l(&METRICS.patch_ineligible_oversize),
@@ -871,6 +873,11 @@ async fn w1_patch_unaffected_while_placement_prefers_other_backend() {
             after.ineligible_overlay,
         ),
         ("shared", before.ineligible_shared, after.ineligible_shared),
+        (
+            "range_shared",
+            before.ineligible_range_shared,
+            after.ineligible_range_shared,
+        ),
         (
             "transform",
             before.ineligible_transform,

@@ -192,18 +192,18 @@ async fn durable_striped(h: &H, name: &str, blocks: u64, tag: u8) -> u64 {
     ino
 }
 
-/// Mint one fencing generation for `ino` via a real lease acquisition (a
-/// byte-range lock shares the file's fencing generator without contending
-/// with the write path's cached whole-file lease) and return the token.
-async fn mint_era(dlm: &DlmClient, ino: u64) -> u64 {
+/// Mint one fencing generation for `ino` and return the token.
+///
+/// This uses the DLM's documented generation-bump seam rather than a lease
+/// acquisition: since S11 (byte-range custody) a byte-range lock CONFLICTS
+/// with the write path's cached whole-file lease — which is the point of
+/// that stage — so the pre-S11 "acquire `(0,1)` to bump the generator"
+/// trick would now wait out its budget. The seam advances the object's
+/// generation without disturbing live custody, which is exactly what this
+/// fixture wants.
+async fn mint_era(_dlm: &DlmClient, ino: u64) -> u64 {
     let path = squeezefs::keys::inode_path(ino);
-    let lease = dlm
-        .acquire_lock(&path, Some((0, 1)), std::time::Duration::from_secs(5))
-        .await
-        .expect("era mint acquire");
-    let token = lease.fencing_token();
-    lease.release().await.expect("era mint release");
-    token
+    squeezefs::dlm::test_bump_fencing_generation(&path)
 }
 
 /// Plant a staged `active_block_ext:` record for (ino, block) stamped with

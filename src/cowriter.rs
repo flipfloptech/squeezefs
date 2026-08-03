@@ -21,7 +21,8 @@
 //! | metadata | **none locally.** Every mutation is SHIPPED to the volume's authority (S8 ownership + S9's publish vocabulary) | [`crate::meta_backend::kv::backend::KvMetaBackend::open_co_writer`] latches the volume read-only with cause `CoWriterMount`, so `write_gate` refuses a local commit naming the shipped path |
 //! | data (DMA) | **yes, under a granted custody lease.** The bytes never funnel through the authority — only the custody travels | [`crate::data_custody::authorize_dma`], the ONE authorization point, under the epoch the grant established |
 //! | fresh block ALLOCATION | **yes, from the lane the authority granted** (DLM S9's allocation-lane grant): a residue class no peer mints in, whose durable reservation the authority commits ahead of every hand-out | [`crate::alloc_lane_grant`] + `BlockAllocator`'s `alloc_plane_gate` |
-//! | ownership accounting (terminal free / specific claim / W1 incarnation retire / device reclaim) | **none.** The durable truth of "who owns this offset" is metadata (`TREE_BLOCK_REFS`), and metadata authority is the authority's | `BlockAllocator`'s gate, whose co-writer class names what it may not do |
+//! | terminal FREE of a displaced block | **yes, by SHIPPING** (DLM S9's co-writer free path): the durable delete already rode the layout publish, and the accounting ladder travels as a verb the AUTHORITY executes — `begin_free` → purge → reclaim → `finish_free`, grace ring and quarantine composing inside | [`ship_displaced_frees`] (client) + [`execute_shipped_frees`] (owner), `(lease_epoch, request_id)` dedup window |
+//! | ownership accounting (specific claim / W1 incarnation retire / device reclaim / the recovery walk) | **none.** The durable truth of "who owns this offset" is metadata (`TREE_BLOCK_REFS`), and metadata authority is the authority's | `BlockAllocator`'s gate, whose co-writer class names what it may not do |
 //!
 //! That split is the honest reading of the blocker: *"a co-writer holding a
 //! valid S9 grant has authority for the data plane while having none for
@@ -112,13 +113,19 @@
 //!   a device whose low blocks are live.
 //!
 //! What stays refused is everything whose durable home is metadata this mount
-//! cannot commit: the **terminal free** and `free_block` (a free's durable
-//! effect is the authority's `TREE_BLOCK_REFS` delete, and its device reclaim
-//! is ceased here), `allocate_specific_block` (lane-BLIND by design — a
-//! clone/recovery path naming an index it already owns durably), the **W1
-//! incarnation retire**, and the **ownership recovery walk**. Those are what
-//! `cowriter.accounting_refusals` keeps counting; allocation no longer
-//! appears there.
+//! cannot commit **and whose act does not ship**: `allocate_specific_block`
+//! (lane-BLIND by design — a clone/recovery path naming an index it already
+//! owns durably), the **W1 incarnation retire** (a lifetime retire is durable
+//! ownership state, §6.2 item 6, and the §5.1 clone/patch fence is a two-word
+//! process-local protocol no wire can compose — a co-writer's small overwrite
+//! rides CoW-rewrite + shipped free instead, and the RTT a shipped retire
+//! would put inside the one-DMA-zero-metadata path is self-defeating), the
+//! **ownership recovery walk**, direct **device reclaim** (its queue is
+//! ceased here — the authority's reclaimer runs the shipped frees'), and any
+//! ALLOCATOR-level free reached without the router. Those are what
+//! `cowriter.accounting_refusals` keeps counting; allocation and the
+//! router-level terminal free no longer appear there — the free SHIPS
+//! ([`ship_displaced_frees`], the module block at the end of this file).
 
 use crate::error::{Result, SqueezefsError};
 use crate::fuse_client::METRICS;
@@ -1035,9 +1042,12 @@ pub async fn arm(
     })?;
     crate::data_grant::install_custody_client(Arc::clone(&client));
 
-    // The accounting latch: a co-writer frees nothing and deallocates
-    // nothing (§6.3's reclaim/discard hazard applies verbatim — the
-    // offsets belong to the authority's ledger).
+    // The accounting latch: a co-writer DEALLOCATES nothing locally —
+    // §6.3's reclaim/discard hazard applies verbatim, and the offsets
+    // belong to the authority's ledger. Its terminal frees SHIP
+    // (`ship_displaced_frees`, wired at the router's free seam), and the
+    // device reclaim they imply runs on the AUTHORITY's reclaimer — so
+    // this queue is ceased, not merely idle.
     router.backend_router.reclaim_cease();
 
     // DLM S9 blocker #3's ADMISSION (`crate::alloc_lane_grant`): the lease we
@@ -1132,6 +1142,372 @@ fn spawn_custody_renewal(
             }
         },
     ))
+}
+
+// ===========================================================================
+// DLM S9 — the co-writer FREE path (the displaced half of a rewrite).
+//
+// Contracts: `tests/mw_cowriter_free_tests.rs`. Wire:
+// `crate::meta_ship::publish` (`PublishCall::FreeBlocks`). Operator story:
+// `docs/operations.md` §Multi-writer co-writer mounts.
+//
+// The split, in one paragraph: a free's DURABLE effect (the
+// `TREE_BLOCK_REFS` delete) already rides the layout publish that displaced
+// the block — shipped, whole-tx, the ordering point. What is left is the
+// ACCOUNTING ladder (`begin_free` → tier purge → reclaim enqueue →
+// `finish_free`, with §6.8 item 3's grace ring and S7's quarantine composing
+// inside `finish_free`), whose durable home is the authority's ledger and
+// whose device reclaimer is live only there. So a co-writer's router-level
+// terminal free SHIPS as a verb and the AUTHORITY executes the whole ladder
+// exactly as if it had freed locally; the freed offset re-enters the free
+// supply of whichever lane the arithmetic (`b % W`) names — frees stay
+// lane-blind, which is the partition's own law.
+// ===========================================================================
+
+tokio::task_local! {
+    /// The **authority-accounting venue marker**: set for exactly one task
+    /// tree — the shipped-free executor's ([`execute_shipped_frees`]) —
+    /// and read only on the never-taken co-writer branch of the ownership-
+    /// accounting gates (`BlockAllocator::plane_gate`, the reclaim
+    /// enqueue, the router's free seam).
+    ///
+    /// Why it exists: the mount-posture latch is PROCESS-scoped (correct —
+    /// one process is one mount), but the owner-side executor acts with
+    /// the AUTHORITY's accounting authority for the SET, on behalf of a
+    /// validated peer request. In production the two coincide (the
+    /// authority's posture is `writer`, so the gates never consult this);
+    /// in any venue where one process plays both nodes, this marker is
+    /// what keeps the executor's ladder from being mistaken for the
+    /// co-writer's own — and it is NEVER ambiently active (pinned:
+    /// `authority_solo_and_reader_free_paths_are_unchanged_and_w1_stays_refused`).
+    static AUTHORITY_FREE_SCOPE: ();
+}
+
+/// Run `fut` under the authority-accounting scope. The ONE caller is the
+/// shipped-free executor; nothing else may enter it (a second caller would
+/// be a bypass of the ownership-accounting gate, not a venue).
+pub async fn with_authority_accounting<F>(fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    AUTHORITY_FREE_SCOPE.scope((), fut).await
+}
+
+/// `true` ⇔ the current task runs under [`with_authority_accounting`].
+/// Cost discipline: consulted only AFTER a posture latch already said
+/// reader/co-writer, so a write mount never pays the task-local probe.
+pub fn authority_accounting_scope_active() -> bool {
+    AUTHORITY_FREE_SCOPE.try_with(|_| ()).is_ok()
+}
+
+/// The free verb's client-side request ids: monotone per process. The
+/// witness is `(lease_epoch, request_id)` — the epoch scopes the id, so a
+/// restarted co-writer (a new join = a new epoch) can never alias a prior
+/// incarnation's ids.
+static FREE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Bounded resend budget for one free verb. A protocol constant, not a
+/// resource cap (nothing here derives from machine size): each resend is
+/// absorbed exactly-once by the owner's dedup window, and past the budget
+/// the abandon is the LEAK-SAFE direction (durably free, returned by the
+/// authority's next derivation) — counted loud on `free_ship_failures`.
+const FREE_SHIP_ATTEMPTS: u32 = 3;
+
+/// **Ship a batch of displaced-block terminal frees to the authority** —
+/// the co-writer arm of [`crate::routing::BackendRouter::free_block`] /
+/// `free_blocks` (the write path's displacement calls, truncate's and
+/// unlink's).
+///
+/// Per key, in order:
+/// 1. the same resolution the local ladder runs (decoration strip, parse,
+///    stale-incarnation refusal, unknown-backend skip);
+/// 2. the verb ships — `(vol_tag, block_idx)`, the durable identity, never
+///    a path or a key string — under the CURRENT lease epoch and one fresh
+///    request id, with bounded epoch-stable retries (see below);
+/// 3. only after the authority's acknowledgement: the LOCAL non-accounting
+///    hygiene — the read-tier purge and the local tracking retire — so a
+///    free that never shipped leaves this mount's state untouched
+///    (leak-safe, re-derivable).
+///
+/// **A retry never re-keys.** It carries the SAME `(epoch, id)`; if the
+/// lease epoch moves under it (revocation → re-join) the free is ABANDONED,
+/// because a resend under the new epoch would be a new act the window
+/// cannot correlate — the freed-then-reallocated ABA window. The abandoned
+/// offset is durably unreferenced and recovery owns it.
+pub async fn ship_displaced_frees(
+    router: &crate::routing::BackendRouter,
+    block_keys: &[&str],
+) -> Result<()> {
+    struct FreeGroup {
+        alloc: Arc<crate::block_allocator::BlockAllocator>,
+        vol_tag: u64,
+        /// `(cleaned key, offset, block_idx)` per displaced block.
+        entries: Vec<(String, u64, u64)>,
+    }
+    let mut groups: Vec<FreeGroup> = Vec::new();
+    let mut first_err: Option<SqueezefsError> = None;
+    for &key in block_keys {
+        let cleaned = crate::routing::clean_block_key(key);
+        let parts = match router.parse_block_key_parts(&cleaned) {
+            Ok(p) => p,
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+                continue;
+            }
+        };
+        // Spec §6.2 item 6: the same stale-lifetime refusal the local free
+        // runs — a free under a dead incarnation is the §6.3 hazard's
+        // destructive face wherever it executes.
+        if !router.block_key_incarnation_ok(&cleaned) {
+            if first_err.is_none() {
+                first_err = Some(SqueezefsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "block key '{key}' names a dead incarnation of its device offset (spec \
+                         §6.2 item 6) — refusing to ship its free"
+                    ),
+                )));
+            }
+            continue;
+        }
+        let Some(alloc) = router.allocator_for_be_id(&parts.be_id) else {
+            // Unknown/offline backend: the local ladder's silent skip.
+            continue;
+        };
+        let vol_tag = crate::meta_backend::kv::block_refs::volume_tag(alloc.volume_id());
+        let idx = parts.offset / alloc.chunk_size().max(1);
+        match groups
+            .iter_mut()
+            .find(|g| g.vol_tag == vol_tag && Arc::ptr_eq(&g.alloc, &alloc))
+        {
+            Some(g) => g.entries.push((cleaned, parts.offset, idx)),
+            None => groups.push(FreeGroup {
+                alloc,
+                vol_tag,
+                entries: vec![(cleaned, parts.offset, idx)],
+            }),
+        }
+    }
+    if groups.is_empty() {
+        return match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        };
+    }
+
+    let Some(client) = crate::data_grant::custody_client() else {
+        let blocks: u64 = groups.iter().map(|g| g.entries.len() as u64).sum();
+        crate::meta_ship::publish::note_free_ship_failure(blocks);
+        let msg = format!(
+            "S9: {} displaced-block free(s) cannot ship — this co-writer holds no custody \
+             client, so there is no lease epoch to present and no authority to execute the \
+             ladder. Nothing moved locally (leak-safe: the offsets are durably unreferenced and \
+             the authority's next derivation returns them); arm the co-writer mount, which \
+             installs the client",
+            blocks
+        );
+        log::error!("{msg}");
+        return Err(SqueezefsError::InvalidOperation(msg));
+    };
+    let endpoint = client.endpoint().to_string();
+
+    for group in groups {
+        let epoch = client.lease_epoch();
+        let request_id = FREE_SEQ.fetch_add(1, Ordering::AcqRel) + 1;
+        let idxs: Vec<u64> = group.entries.iter().map(|(_, _, idx)| *idx).collect();
+        let mut attempt = 0u32;
+        let shipped = loop {
+            match crate::meta_ship::publish::ship_free_blocks(
+                &endpoint,
+                group.vol_tag,
+                idxs.clone(),
+                epoch,
+                request_id,
+            )
+            .await
+            {
+                Ok(verdicts) => break Ok(verdicts),
+                Err(e) => {
+                    attempt += 1;
+                    // A retry NEVER re-keys: if the lease epoch moved (a
+                    // revocation → re-join happened under us), abandon —
+                    // the window cannot correlate a new epoch's resend
+                    // with the old one's possible execution, and the
+                    // ABA-safe direction is the leak-safe one.
+                    if client.lease_epoch() != epoch || attempt >= FREE_SHIP_ATTEMPTS {
+                        break Err(e);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }
+        };
+        match shipped {
+            Ok(_verdicts) => {
+                // The authority owns the accounting now; retire this
+                // mount's local, non-accounting view of the displaced
+                // blocks — the read tiers (a reused offset must never
+                // tier-hit the dead incarnation's bytes) and the local
+                // refcount/incarnation tracking.
+                for (key, offset, _idx) in &group.entries {
+                    router.purge_read_tiers(key);
+                    group.alloc.retire_shipped_free_tracking(*offset);
+                }
+            }
+            Err(e) => {
+                crate::meta_ship::publish::note_free_ship_failure(group.entries.len() as u64);
+                log::error!(
+                    "S9: ABANDONING {} displaced-block free(s) on vol_tag {:#016x} after \
+                     {attempt} attempt(s) ({e}). The blocks are durably unreferenced (the \
+                     publish landed) and stay out of every free list until the authority's \
+                     next derivation — the leak-safe direction (free_ship_failures)",
+                    group.entries.len(),
+                    group.vol_tag,
+                );
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// **The owner half: execute a peer's shipped frees** against this
+/// authority's data plane — the [`crate::meta_ship::publish::FreeExecutor`]
+/// body. Runs under [`with_authority_accounting`], because this ladder IS
+/// the authority's own accounting act (in production the posture latch
+/// already says `writer`; the scope is what keeps that true in any venue
+/// where one process plays both nodes).
+///
+/// Per block, the verdict derivation — RAM first, the durable ledger for
+/// what RAM never tracked:
+///
+/// * **RAM-tracked** (the authority minted or recovered it): the standard
+///   [`crate::routing::BackendRouter::free_block`] ladder runs and the
+///   refcount decides terminal vs not — byte-identical to a local free;
+/// * **untracked, ledger population > 0**: `NonTerminal` — the reference
+///   release already happened durably on the publish, and there is no RAM
+///   state to move;
+/// * **untracked, population 0, not already free/graced/quarantined/
+///   mid-reclaim**: seed ONE reference ([`crate::block_allocator::
+///   BlockAllocator::seed_shipped_free_reference`] — deliberately NOT
+///   `recover_block`, whose gap-filling arm would declare a live peer's
+///   unpublished tail free) and run the ladder — `Freed`;
+/// * **anything else**: the double-release lineage — routed through the
+///   ladder UNSEEDED so the existing untracked-free tripwire counts it,
+///   and answered `Refused`.
+pub async fn execute_shipped_frees(
+    backend: &Arc<crate::routing::BackendRouter>,
+    meta: &Arc<RoutedMetaBackend>,
+    vol_tag: u64,
+    blocks: &[u64],
+) -> Result<Vec<crate::meta_ship::publish::FreeVerdict>> {
+    use crate::meta_ship::publish::FreeVerdict;
+    let Some((be_id, alloc)) = backend.allocator_for_volume_tag(vol_tag) else {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "S9: a shipped free names data volume tag {vol_tag:#016x}, which this authority \
+             routes no allocator for — refusing rather than freeing on a guessed volume"
+        )));
+    };
+    let backend = Arc::clone(backend);
+    let meta = Arc::clone(meta);
+    let blocks = blocks.to_vec();
+    with_authority_accounting(async move {
+        let chunk = alloc.chunk_size();
+        let mut verdicts = Vec::with_capacity(blocks.len());
+        for idx in blocks {
+            let offset = idx.saturating_mul(chunk);
+            let key = backend.persist_block_key(&be_id, offset);
+            let verdict = match alloc.refcount(offset) {
+                Some(n) if n > 0 => {
+                    backend.free_block(&key).await?;
+                    if n == 1 {
+                        FreeVerdict::Freed
+                    } else {
+                        FreeVerdict::NonTerminal
+                    }
+                }
+                Some(_) => {
+                    // A zero-count entry is the transient window of a
+                    // racing terminal release: the OTHER free won, ours is
+                    // the double-release lineage. Refuse without poking a
+                    // mid-transition entry.
+                    log::error!(
+                        "S9: shipped free of block {idx} (vol_tag {vol_tag:#016x}) raced a \
+                         terminal release mid-transition — refused (double-release lineage)"
+                    );
+                    crate::fuse_client::METRICS
+                        .block_untracked_free_refusals
+                        .fetch_add(1, Ordering::Relaxed);
+                    FreeVerdict::Refused
+                }
+                None => {
+                    let population = durable_block_refcount(&meta, vol_tag, idx).await?;
+                    if population > 0 {
+                        FreeVerdict::NonTerminal
+                    } else if alloc.free_list_contains(idx)
+                        || alloc.grace_holds(offset)
+                        || alloc.is_quarantined(offset)
+                        || alloc.inflight_contains(offset)
+                    {
+                        // Already free (or owed to grace / a dead epoch /
+                        // the reclaimer): the double-release lineage. The
+                        // UNSEEDED ladder refuses it on the existing
+                        // untracked tripwire — never a second free.
+                        backend.free_block(&key).await?;
+                        FreeVerdict::Refused
+                    } else {
+                        alloc.seed_shipped_free_reference(offset);
+                        backend.free_block(&key).await?;
+                        FreeVerdict::Freed
+                    }
+                }
+            };
+            verdicts.push(verdict);
+        }
+        Ok(verdicts)
+    })
+    .await
+}
+
+/// A [`crate::meta_ship::publish::FreeExecutor`] over this authority's data
+/// router + metadata set — what `multi_writer::arm_multi_writer` installs
+/// beside the frontier source (and the rigs install directly).
+pub fn router_free_executor(
+    backend: Arc<crate::routing::BackendRouter>,
+    meta: Arc<RoutedMetaBackend>,
+) -> crate::meta_ship::publish::FreeExecutor {
+    Arc::new(move |vol_tag: u64, blocks: Vec<u64>| {
+        let backend = Arc::clone(&backend);
+        let meta = Arc::clone(&meta);
+        Box::pin(async move { execute_shipped_frees(&backend, &meta, vol_tag, &blocks).await })
+    })
+}
+
+/// The durable reference population of one block across the metadata set —
+/// `refcount(block) == records under the (vol_tag, block_idx) prefix`
+/// (`TREE_BLOCK_REFS`'s own law). The shipped-free executor's owner-side
+/// validation, and the census the free-path tests read back.
+pub async fn durable_block_refcount(
+    meta: &Arc<RoutedMetaBackend>,
+    vol_tag: u64,
+    block_idx: u64,
+) -> Result<usize> {
+    let mut population = 0usize;
+    for kv in &meta.volumes {
+        population += kv.block_ref_count(vol_tag, block_idx).await.map_err(|e| {
+            SqueezefsError::InvalidOperation(format!(
+                "durable block-reference count failed on {} while serving a shipped free: {e}",
+                kv.device_path().display()
+            ))
+        })?;
+    }
+    Ok(population)
 }
 
 /// The `cowriter` stats-inode object. Every field is inert (`off` / 0) on

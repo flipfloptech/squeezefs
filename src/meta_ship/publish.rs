@@ -49,6 +49,7 @@
 //!   inside one transaction (that is S3.5, and S8's `cross_owner_error` is
 //!   the refusal wherever it can be reached).
 
+use super::service::DedupWindow;
 use super::wire::{WireDirEntry, WireError, WireInode};
 use crate::cluster_wire::{
     RpcAsyncService, RpcClient, RpcRequest, RpcResponse, RPC_OK, RPC_UNKNOWN_VERB,
@@ -73,7 +74,13 @@ use std::sync::Arc;
 /// honest answer is `PUBLISH_SCHEMA_MISMATCH` naming both numbers at the
 /// first frame — not an undecodable body refused as malformed halfway
 /// through a mount's first allocation.
-pub const PUBLISH_SCHEMA: u32 = 2;
+///
+/// **3 since the co-writer FREE path landed** (`FreeBlocks` +
+/// [`PublishReply::FreeVerdicts`] joined). Same reasoning: a peer that
+/// speaks 2 cannot serve a shipped free, and a co-writer whose displaced
+/// frees silently vanished would leak every rewritten block until the
+/// authority's next recovery.
+pub const PUBLISH_SCHEMA: u32 = 3;
 
 /// First verb of S9's publish block. S3's ping is 0, S8's metadata verbs
 /// are 16/17, S6's membership owns `0x0100..=0x01FF`, S9's custody
@@ -99,6 +106,13 @@ pub const PUBLISH_PANIC: u16 = 0x54;
 /// width the authority does not run, or a lease that is not custody — the
 /// **must-stay-0** class (`alloc_lane_raise_refusals`).
 pub const PUBLISH_LANE_REFUSED: u16 = 0x55;
+/// Status: a FREE verb presented a lease epoch that is not custody on this
+/// authority (revoked, swept, or minted by a previous era) — the fencing
+/// refusal of the co-writer free path (`free_stale_refusals`). Refused
+/// BEFORE the dedup window on purpose: a dead era's replay must never be
+/// answered from a cached outcome, and a dead era's first attempt must
+/// never execute.
+pub const PUBLISH_STALE_LEASE: u16 = 0x56;
 
 /// One durable block-reference operation on the wire — a mirror of
 /// [`BlockRefOp`] on purpose: the internal struct may gain fields without
@@ -216,6 +230,57 @@ pub enum PublishCall {
         /// self-asserted.
         lease_epoch: u64,
     },
+    /// **Release displaced blocks' ACCOUNTING** — the co-writer FREE path
+    /// (DLM S9; contracts `tests/mw_cowriter_free_tests.rs`).
+    ///
+    /// The durable half of a free — the `TREE_BLOCK_REFS` delete — already
+    /// rode the layout publish that displaced the block, so this verb
+    /// carries only what is left: the request that the AUTHORITY run its
+    /// own free ladder (`begin_free` → tier purge → reclaim enqueue →
+    /// `finish_free`, with the §6.8 item-3 grace ring and S7's quarantine
+    /// composing inside `finish_free` exactly as they do for a local
+    /// free). Frees are lane-blind (`b % W` derives the owner), so unlike
+    /// `RaiseAllocLane` there is no lane check — the owner-side validation
+    /// is the DURABLE LEDGER itself: a block the ledger still references
+    /// is answered `NonTerminal` and nothing moves.
+    ///
+    /// **This verb is retried, and that is safe here alone**: the owner
+    /// keys a dedup window on `(lease_epoch, request_id)` — S8's window,
+    /// reused — so a resend after a lost reply answers the winner's own
+    /// cached outcome. `lease_epoch` is minted by the authority, monotone
+    /// and never reused, and a retry NEVER re-keys under a fresh epoch (a
+    /// re-joined mount abandons its old-epoch frees, which the era gate
+    /// refuses anyway) — that is what closes the freed-then-reallocated
+    /// ABA window a cross-epoch retry would open.
+    FreeBlocks {
+        /// The durable data-volume identity (KD-5, as above).
+        vol_tag: u64,
+        /// Dense block indices (`offset / chunk`) — the identity
+        /// `TREE_BLOCK_REFS` keys on, never device offsets or key strings.
+        blocks: Vec<u64>,
+        /// The custody lease epoch the caller holds — the era gate's input
+        /// and half of the idempotence witness.
+        lease_epoch: u64,
+        /// Client-chosen, monotone per process — the witness's other half.
+        request_id: u64,
+    },
+}
+
+/// One block's outcome inside a served [`PublishCall::FreeBlocks`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FreeVerdict {
+    /// The terminal release ran: the authority's ladder owns the offset
+    /// through reclaim, and it re-enters the free supply of the lane the
+    /// arithmetic names.
+    Freed,
+    /// The durable ledger (or the authority's live refcount) still holds
+    /// references: the release already happened durably on the publish,
+    /// and nothing else is owed.
+    NonTerminal,
+    /// The block is already free / in grace / quarantined / mid-reclaim —
+    /// the double-release lineage, refused LOUD on the authority's own
+    /// untracked-free tripwire (never a silent second free).
+    Refused,
 }
 
 impl PublishCall {
@@ -231,6 +296,7 @@ impl PublishCall {
             Self::XattrValueCap { .. } => "xattr_value_cap",
             Self::ReaddirStream { .. } => "readdir_stream",
             Self::RaiseAllocLane { .. } => "raise_alloc_lane",
+            Self::FreeBlocks { .. } => "free_blocks",
         }
     }
 
@@ -248,8 +314,10 @@ impl PublishCall {
             // The reservation record lives on ino 1 (KD-2's plane), so the
             // authority check is the same check every other verb gets: the
             // node serving it must hold authority over the volume ino 1
-            // routes to.
-            Self::RaiseAllocLane { .. } => vec![1],
+            // routes to. The FREE verb keys on the same plane: block
+            // ownership accounting is set-level state, and the node that
+            // owns ino 1's volume is the D0 claim holder whose ladder runs.
+            Self::RaiseAllocLane { .. } | Self::FreeBlocks { .. } => vec![1],
         }
     }
 }
@@ -269,6 +337,8 @@ pub enum PublishReply {
     /// `raise_alloc_lane`: the durable reservation frontier now in force for
     /// that lane — an exclusive block-index bound this lane may mint below.
     LaneFrontier(u64),
+    /// `free_blocks`: one verdict per shipped block, in request order.
+    FreeVerdicts(Vec<FreeVerdict>),
 }
 
 /// A publish request frame.
@@ -329,6 +399,13 @@ static SERVED: AtomicU64 = AtomicU64::new(0);
 static REFUSALS: AtomicU64 = AtomicU64::new(0);
 static NOT_OWNER: AtomicU64 = AtomicU64::new(0);
 static PANICS: AtomicU64 = AtomicU64::new(0);
+// The co-writer FREE path's own rows (DLM S9; every one is 0 on every
+// shipped mount by construction — nothing installs the verb's halves).
+static FREE_SHIPPED_BLOCKS: AtomicU64 = AtomicU64::new(0);
+static FREE_SERVED_BLOCKS: AtomicU64 = AtomicU64::new(0);
+static FREE_REPLAYS: AtomicU64 = AtomicU64::new(0);
+static FREE_STALE_REFUSALS: AtomicU64 = AtomicU64::new(0);
+static FREE_SHIP_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 /// The publish path's shipped-vs-local ledger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -348,6 +425,29 @@ pub struct PublishStats {
     pub not_owner: u64,
     /// Owner-side executions that UNWOUND (**must stay 0**).
     pub panics: u64,
+    /// Displaced blocks whose FREE travelled as a verb (client side) — the
+    /// co-writer rewrite path's engagement instrument: on a rewriting
+    /// co-writer this tracks its displaced-block count, and 0 beside a
+    /// growing `layout_publish` stream means displaced frees are leaking.
+    pub free_shipped_blocks: u64,
+    /// Blocks whose terminal ladder actually RAN for a peer (owner side) —
+    /// `Freed` verdicts only, so shipped − served − non-terminal − refused
+    /// closes per row.
+    pub free_served_blocks: u64,
+    /// Free verbs answered from the dedup window instead of re-applied —
+    /// the exactly-once witness's engagement (a lost-reply retry landing
+    /// here is the mechanism WORKING, not a fault).
+    pub free_replays: u64,
+    /// Free verbs refused by ERA (the presented lease epoch is not
+    /// custody) — the fencing gate's row. Growth on a healthy co-writer is
+    /// 0; growth around a revocation is the gate composing.
+    pub free_stale_refusals: u64,
+    /// Shipped frees ABANDONED by the client (transport exhausted, or the
+    /// lease epoch died under the retry): each is a durably-free offset
+    /// that stays out of every free list until the authority's next
+    /// derivation (mount recovery / fsck C6) — the leak-safe direction,
+    /// but **≈ 0** is the healthy reading.
+    pub free_ship_failures: u64,
 }
 
 /// Read the publish ledger.
@@ -359,6 +459,11 @@ pub fn stats() -> PublishStats {
         refusals: REFUSALS.load(Ordering::Relaxed),
         not_owner: NOT_OWNER.load(Ordering::Relaxed),
         panics: PANICS.load(Ordering::Relaxed),
+        free_shipped_blocks: FREE_SHIPPED_BLOCKS.load(Ordering::Relaxed),
+        free_served_blocks: FREE_SERVED_BLOCKS.load(Ordering::Relaxed),
+        free_replays: FREE_REPLAYS.load(Ordering::Relaxed),
+        free_stale_refusals: FREE_STALE_REFUSALS.load(Ordering::Relaxed),
+        free_ship_failures: FREE_SHIP_FAILURES.load(Ordering::Relaxed),
     }
 }
 
@@ -374,6 +479,11 @@ pub fn stats_json() -> serde_json::Value {
         "refusals": s.refusals,
         "not_owner_refusals": s.not_owner,
         "owner_panics": s.panics,
+        "free_shipped_blocks": s.free_shipped_blocks,
+        "free_served_blocks": s.free_served_blocks,
+        "free_replays": s.free_replays,
+        "free_stale_refusals": s.free_stale_refusals,
+        "free_ship_failures": s.free_ship_failures,
     })
 }
 
@@ -842,6 +952,109 @@ pub async fn raise_alloc_lane(
     }
 }
 
+// ---------------------------------------------------------------------------
+// DLM S9 — the co-writer FREE path (contracts tests/mw_cowriter_free_tests.rs;
+// operator story docs/operations.md §Multi-writer co-writer mounts). Kept in
+// its own block like the lane raise above: the free verb is the SECOND
+// metadata-plane act a co-writer's data path performs, and — unlike every
+// other call here — it is RETRIED, which only the dedup window makes safe.
+// ---------------------------------------------------------------------------
+
+/// The owner-side FREE executor: `(vol_tag, block indices)` → one verdict
+/// per block, produced by running the AUTHORITY's own free ladder
+/// ([`crate::cowriter::execute_shipped_frees`] over its data-plane router).
+///
+/// Installed by the multi-writer AUTHORITY arm beside the frontier source
+/// (`crate::multi_writer::arm_multi_writer`); a served free with no
+/// executor refuses loud — the ownership plane armed without its free half
+/// is the same class as the missing-publish-client refusal below.
+pub type FreeExecutor = Arc<
+    dyn Fn(u64, Vec<u64>) -> Pin<Box<dyn Future<Output = Result<Vec<FreeVerdict>>> + Send>>
+        + Send
+        + Sync,
+>;
+
+static FREE_EXECUTOR: Lazy<arc_swap::ArcSwapOption<FreeExecutor>> =
+    Lazy::new(arc_swap::ArcSwapOption::empty);
+
+/// Install the process's shipped-free executor (the authority arm's act).
+pub fn install_free_executor(exec: FreeExecutor) {
+    FREE_EXECUTOR.store(Some(Arc::new(exec)));
+}
+
+/// Uninstall it (disarm / unmount / test teardown).
+pub fn uninstall_free_executor() {
+    FREE_EXECUTOR.store(None);
+}
+
+fn free_executor() -> Option<FreeExecutor> {
+    FREE_EXECUTOR.load_full().map(|e| (*e).clone())
+}
+
+/// Count `blocks` abandoned shipped frees (`free_ship_failures` — the
+/// leak-safe direction, loud). The one caller is
+/// [`crate::cowriter::ship_displaced_frees`]'s abandon arm.
+pub(crate) fn note_free_ship_failure(blocks: u64) {
+    FREE_SHIP_FAILURES.fetch_add(blocks, Ordering::Relaxed);
+}
+
+/// **Ship one displaced-free verb** to the authority at `endpoint` and
+/// return its per-block verdicts.
+///
+/// The idempotence witness travels verbatim: `(lease_epoch, request_id)` is
+/// the owner's dedup key, so a caller MAY resend this exact call after a
+/// lost reply — and MUST NOT re-key it (a fresh id, or the same id under a
+/// fresh epoch, is a new act; the retry ladder in
+/// [`crate::cowriter::ship_displaced_frees`] is the one sanctioned caller).
+pub async fn ship_free_blocks(
+    endpoint: &str,
+    vol_tag: u64,
+    blocks: Vec<u64>,
+    lease_epoch: u64,
+    request_id: u64,
+) -> Result<Vec<FreeVerdict>> {
+    let count = blocks.len() as u64;
+    let Some(client) = CLIENT.load_full() else {
+        REFUSALS.fetch_add(1, Ordering::Relaxed);
+        let msg = format!(
+            "S9: a displaced-block free for vol_tag {vol_tag:#016x} cannot be published — no \
+             publish client is installed. Freeing locally would mutate ownership accounting \
+             whose durable home is the authority's ledger, so this refuses instead (arm the \
+             co-writer mount, which installs both halves)"
+        );
+        log::error!("{msg}");
+        return Err(SqueezefsError::InvalidOperation(msg));
+    };
+    let call = PublishCall::FreeBlocks {
+        vol_tag,
+        blocks,
+        lease_epoch,
+        request_id,
+    };
+    match client.ship(endpoint, call).await? {
+        PublishReply::FreeVerdicts(verdicts) => {
+            FREE_SHIPPED_BLOCKS.fetch_add(count, Ordering::Relaxed);
+            let refused = verdicts
+                .iter()
+                .filter(|v| **v == FreeVerdict::Refused)
+                .count();
+            if refused > 0 {
+                log::error!(
+                    "S9: the authority refused {refused} shipped free(s) (vol_tag \
+                     {vol_tag:#016x}, request {request_id}): already free/graced/quarantined — \
+                     the double-release lineage, surfaced on the authority's own tripwire"
+                );
+            }
+            Ok(verdicts)
+        }
+        other => Err(protocol_error(
+            "free_blocks",
+            &format!("{other:?}"),
+            "per-block free verdicts",
+        )),
+    }
+}
+
 /// Routed [`RoutedMetaBackend::readdir_stream`].
 pub async fn readdir_stream(
     be: &Arc<RoutedMetaBackend>,
@@ -892,6 +1105,11 @@ pub struct PublishService {
     inner: Arc<RoutedMetaBackend>,
     runtime: tokio::runtime::Handle,
     authority: Vec<bool>,
+    /// The FREE verb's exactly-once witness: `(lease_epoch, request_id)` →
+    /// the winner's own outcome — S8's [`DedupWindow`], reused (never a
+    /// third idempotence pattern). Only `free_blocks` consumes entries;
+    /// every other publish call keeps the vocabulary's no-retry law.
+    free_dedup: DedupWindow<std::result::Result<Vec<FreeVerdict>, WireError>>,
     self_ref: std::sync::OnceLock<std::sync::Weak<PublishService>>,
 }
 
@@ -930,6 +1148,7 @@ impl PublishService {
             inner,
             runtime,
             authority,
+            free_dedup: DedupWindow::new(crate::meta_ship::service::dedup_cap()),
             self_ref: std::sync::OnceLock::new(),
         });
         let _ = me.self_ref.set(Arc::downgrade(&me));
@@ -1015,6 +1234,27 @@ impl PublishService {
                 return Self::refuse(req.id, PUBLISH_LANE_REFUSED, reason);
             }
         }
+        // The co-writer FREE path: the ONE retried verb, served through the
+        // era gate and then the dedup window — never through the generic
+        // dispatch below, whose no-retry law it would otherwise weaken.
+        if let PublishCall::FreeBlocks {
+            lease_epoch,
+            request_id,
+            ..
+        } = &frame.call
+        {
+            // The era gate FIRST, before the window: a dead era must be
+            // refused whether or not its id once executed — answering a
+            // dead era's replay from cache would tell a fenced mount its
+            // custody still speaks.
+            if let Err(reason) = crate::data_grant::validate_free(&frame.client, *lease_epoch) {
+                FREE_STALE_REFUSALS.fetch_add(1, Ordering::Relaxed);
+                return Self::refuse(req.id, PUBLISH_STALE_LEASE, reason);
+            }
+            return self
+                .serve_free(req.id, *lease_epoch, *request_id, frame.call)
+                .await;
+        }
         let Some(me) = self.owned() else {
             return Self::refuse(
                 req.id,
@@ -1054,6 +1294,92 @@ impl PublishService {
                 body,
             },
             Err(e) => Self::refuse(req.id, PUBLISH_MALFORMED, format!("reply encode: {e}")),
+        }
+    }
+
+    /// Serve one [`PublishCall::FreeBlocks`] through the dedup window: the
+    /// winner of `(lease_epoch, request_id)` executes on the backend's
+    /// runtime under the installed [`FreeExecutor`]; every duplicate —
+    /// a lost-reply retry, or an overlapping resend — awaits the winner's
+    /// own outcome and is counted (`free_replays`). The era gate already
+    /// ran in [`Self::serve`].
+    async fn serve_free(
+        &self,
+        req_id: u64,
+        lease_epoch: u64,
+        request_id: u64,
+        call: PublishCall,
+    ) -> RpcResponse {
+        let PublishCall::FreeBlocks {
+            vol_tag, blocks, ..
+        } = call
+        else {
+            return Self::refuse(
+                req_id,
+                PUBLISH_MALFORMED,
+                "serve_free dispatched a non-free call".into(),
+            );
+        };
+        let Some(exec) = free_executor() else {
+            return Self::refuse(
+                req_id,
+                PUBLISH_MALFORMED,
+                "S9: a shipped free arrived but no free executor is installed — the ownership \
+                 plane is armed without its FREE half. Executing it against the metadata set \
+                 alone would strand the device reclaim and the free list; arm the multi-writer \
+                 authority (which installs the executor beside the frontier source)"
+                    .to_string(),
+            );
+        };
+        let (slot, owns) = self.free_dedup.slot((lease_epoch, request_id));
+        if !owns {
+            FREE_REPLAYS.fetch_add(1, Ordering::Relaxed);
+        }
+        let runtime = self.runtime.clone();
+        let outcome = slot
+            .get_or_init(|| async move {
+                // The venue rule, verbatim: the ladder runs on the runtime
+                // that owns the backend's tasks (the reclaim queue's worker
+                // and the conveyor live there), never inline on a
+                // `sqz-cluster-svc{n}` lane.
+                match runtime.spawn(exec(vol_tag, blocks)).await {
+                    Ok(Ok(verdicts)) => {
+                        FREE_SERVED_BLOCKS.fetch_add(
+                            verdicts
+                                .iter()
+                                .filter(|v| **v == FreeVerdict::Freed)
+                                .count() as u64,
+                            Ordering::Relaxed,
+                        );
+                        Ok(verdicts)
+                    }
+                    Ok(Err(e)) => Err(WireError::from_error(&e)),
+                    Err(e) => {
+                        // RES-7/RES-8: the unwind is recorded — and CACHED,
+                        // so a replay answers the same loud failure instead
+                        // of re-running half a ladder.
+                        PANICS.fetch_add(1, Ordering::Relaxed);
+                        log::error!("S9 publish owner-side free execution unwound: {e}");
+                        Err(WireError::from_error(&SqueezefsError::InvalidOperation(
+                            format!("S9 shipped-free execution panicked: {e}"),
+                        )))
+                    }
+                }
+            })
+            .await
+            .clone();
+        SERVED.fetch_add(1, Ordering::Relaxed);
+        let frame = PublishReplyFrame {
+            schema: PUBLISH_SCHEMA,
+            outcome: outcome.map(PublishReply::FreeVerdicts),
+        };
+        match encode(&frame, "free_blocks") {
+            Ok(body) => RpcResponse {
+                id: req_id,
+                status: PUBLISH_OK,
+                body,
+            },
+            Err(e) => Self::refuse(req_id, PUBLISH_MALFORMED, format!("reply encode: {e}")),
         }
     }
 
@@ -1177,6 +1503,17 @@ impl PublishService {
                      vol_tag {vol_tag:#016x} (asked {upto}, frontier now {frontier})"
                 );
                 Ok(PublishReply::LaneFrontier(frontier))
+            }
+            PublishCall::FreeBlocks { .. } => {
+                // Unreachable by construction: `serve` routes every free
+                // through `serve_free`'s era gate + dedup window. Refusing
+                // (never executing) keeps that construction a fact rather
+                // than a convention.
+                Err(SqueezefsError::InvalidOperation(
+                    "S9: free_blocks is served only through the dedup window (serve_free) — \
+                     dispatching it here would bypass the exactly-once witness"
+                        .to_string(),
+                ))
             }
         }
     }

@@ -86,16 +86,23 @@ pub fn dedup_cap() -> usize {
 }
 
 /// One dedup slot: the winner initializes it, duplicates await it.
-type DedupSlot = Arc<tokio::sync::OnceCell<MetaOpResult>>;
+type DedupSlot<T> = Arc<tokio::sync::OnceCell<T>>;
 
-struct DedupWindow {
-    slots: scc::HashMap<(u64, u64), DedupSlot>,
+/// The idempotency window: `(epoch, id)` → the winner's own outcome.
+///
+/// Generic over the cached outcome (`pub(crate)`) since the S9 co-writer
+/// FREE verb: `meta_ship::publish` keys the same window on
+/// `(lease_epoch, request_id)` — the spec's instruction is *reuse S8's
+/// window or S3.5's post-images, never a third pattern*, and this is that
+/// reuse. The semantics are byte-identical for the S8 instantiation.
+pub(crate) struct DedupWindow<T> {
+    slots: scc::HashMap<(u64, u64), DedupSlot<T>>,
     order: parking_lot::Mutex<VecDeque<(u64, u64)>>,
     cap: usize,
 }
 
-impl DedupWindow {
-    fn new(cap: usize) -> Self {
+impl<T> DedupWindow<T> {
+    pub(crate) fn new(cap: usize) -> Self {
         Self {
             slots: scc::HashMap::new(),
             order: parking_lot::Mutex::new(VecDeque::with_capacity(cap.min(4096))),
@@ -109,11 +116,11 @@ impl DedupWindow {
     /// (and at most one pop). It is not a data-path lock: the op it guards
     /// is about to pay a network round trip and a journal commit, and FIFO
     /// order *is* the window's definition.
-    fn slot(&self, key: (u64, u64)) -> (DedupSlot, bool) {
+    pub(crate) fn slot(&self, key: (u64, u64)) -> (DedupSlot<T>, bool) {
         if let Some(slot) = self.slots.read_sync(&key, |_, v| Arc::clone(v)) {
             return (slot, false);
         }
-        let fresh: DedupSlot = Arc::new(tokio::sync::OnceCell::new());
+        let fresh: DedupSlot<T> = Arc::new(tokio::sync::OnceCell::new());
         match self.slots.insert_sync(key, Arc::clone(&fresh)) {
             Ok(()) => {
                 let retire = {
@@ -177,7 +184,7 @@ pub struct MetaShipService {
     authority: Vec<bool>,
     term: AtomicU64,
     grace_until: parking_lot::Mutex<Option<Instant>>,
-    dedup: DedupWindow,
+    dedup: DedupWindow<MetaOpResult>,
     frames: AtomicU64,
     served: AtomicU64,
     dedup_hits: AtomicU64,

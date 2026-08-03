@@ -684,7 +684,14 @@ impl ReclaimQueue {
             drop(entry);
             return;
         }
-        if crate::fuse_client::co_writer_mount() {
+        // DLM S9 free path: the scope probe marks the shipped-free
+        // EXECUTOR — the authority's own ladder enqueuing here for a
+        // validated peer request (`crate::cowriter::
+        // with_authority_accounting`). A co-writer's OWN paths still land
+        // in this refusal, and still latch the halt.
+        if crate::fuse_client::co_writer_mount()
+            && !crate::cowriter::authority_accounting_scope_active()
+        {
             log::error!(
                 "{}",
                 crate::fuse_client::co_writer_refusal("device reclaim (discard/punch)")

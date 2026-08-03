@@ -669,6 +669,15 @@ pub(crate) fn read_only_refusal(what: &str) -> crate::error::SqueezefsError {
 /// So an allocation arm reaching this text means this mount holds **no lane**
 /// on that volume, which is exactly what an authority that has enrolled no
 /// co-writer grants.
+///
+/// **Terminal frees are no longer on the PRODUCT path's list either** (DLM
+/// S9's co-writer free path — `crate::cowriter::ship_displaced_frees`): the
+/// router-level free SHIPS to the authority, which runs the whole ladder.
+/// The allocator-level arms below the router keep refusing here as
+/// defense-in-depth (no product surface reaches them on this posture), so
+/// this counter's steady state is the arms that stay local by DECISION:
+/// the specific claim, the W1 incarnation retire, the recovery walk, and
+/// direct device reclaim.
 pub(crate) fn co_writer_refusal(what: &str) -> crate::error::SqueezefsError {
     METRICS
         .cowriter_accounting_refusals
@@ -678,14 +687,15 @@ pub(crate) fn co_writer_refusal(what: &str) -> crate::error::SqueezefsError {
          mutations shipped to the authority, data read-write under a granted custody lease). A \
          co-writer holds DATA authority, not ownership-ACCOUNTING authority: which device \
          offsets are OWNED is durable metadata (TREE_BLOCK_REFS) on volumes this mount cannot \
-         commit to, so freeing an offset, retiring an incarnation or claiming a named block here \
-         would be this node inventing an answer about shared hardware. Fresh ALLOCATION is the \
-         one exception, and it is admitted from the data-plane allocation LANE the authority \
-         grants on the custody lease (docs/design-mw-data-alloc-partition.md) — so if this was \
-         an allocation, this mount holds no lane on this volume: an authority that has enrolled \
-         no co-writer (SQUEEZEFS_MW_MEMBERS) grants none, and a member enrolled after the \
-         authority armed gets one only in a new era. Mount this node as the authority (unset \
-         SQUEEZEFS_MW_ROLE) to own the accounting here."
+         commit to, so retiring an incarnation or claiming a named block here would be this \
+         node inventing an answer about shared hardware. Fresh ALLOCATION is admitted from the \
+         data-plane allocation LANE the authority grants on the custody lease \
+         (docs/design-mw-data-alloc-partition.md) — so if this was an allocation, this mount \
+         holds no lane on this volume. A TERMINAL FREE is admitted too, by SHIPPING: the \
+         router-level free travels as a publish verb and the authority runs the ladder — so a \
+         free reaching this text came through an allocator-level arm no product path uses on \
+         this posture. Mount this node as the authority (unset SQUEEZEFS_MW_ROLE) to own the \
+         accounting here."
     ))
 }
 
@@ -3957,12 +3967,18 @@ pub struct Metrics {
     /// that should be admitted is the operator's signal to read the log:
     /// every refusal names its rung, what is missing, and the remedy.
     pub cowriter_admission_refusals: Align64<AtomicU64>,
-    /// Ownership-ACCOUNTING mutations refused on a co-writer (block
-    /// allocation, terminal free, the W1 incarnation retire, the ownership
-    /// recovery walk). Growth is expected and honest until the data-plane
-    /// allocation partition lands: it is the count of writes a co-writer
-    /// could not place itself, and it is what makes that gap visible
-    /// instead of silent.
+    /// Ownership-ACCOUNTING mutations refused on a co-writer. Since the
+    /// allocation-lane grant AND the shipped free path landed, the arms
+    /// this counts are the ones that stay local by DECISION: the specific
+    /// claim (`allocate_specific_block` — lane-blind), the **W1
+    /// incarnation retire** (a lifetime retire is durable ownership state
+    /// and the §5.1 fence is process-local — a co-writer's small
+    /// overwrite rides CoW-rewrite + shipped free instead), the ownership
+    /// recovery walk, direct device reclaim, and any ALLOCATOR-level free
+    /// a surface reaches without the router (the product write path never
+    /// does — its displaced frees SHIP, `meta_ship_publish.
+    /// free_shipped_blocks`). **Steady growth on a rewriting co-writer is
+    /// therefore a bug again**, not the honest gap it used to be.
     pub cowriter_accounting_refusals: Align64<AtomicU64>,
     /// LOCAL metadata commits refused on a co-writer — the mutations that
     /// reached the backend's write gate instead of the shipped publish

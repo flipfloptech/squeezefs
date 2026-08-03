@@ -2847,6 +2847,58 @@ impl BackendRouter {
         }
     }
 
+    /// The allocator behind one parsed backend id (DLM S9 — the co-writer
+    /// free path's client-side resolution, `crate::cowriter::
+    /// ship_displaced_frees`). `None` = unknown/offline backend, the same
+    /// silent skip the local free ladder takes.
+    pub fn allocator_for_be_id(
+        &self,
+        be_id: &str,
+    ) -> Option<std::sync::Arc<crate::block_allocator::BlockAllocator>> {
+        if be_id == "backend_0" {
+            return Some(self.default_allocator.clone());
+        }
+        self.backends
+            .get(be_id)
+            .map(|be| be.block_allocator.clone())
+    }
+
+    /// The `(be_id, allocator)` pair whose volume decodes to the durable
+    /// `vol_tag` (KD-5) — DLM S9's owner-side resolution for a shipped
+    /// free (`crate::cowriter::execute_shipped_frees`): the wire carries
+    /// the tag `TREE_BLOCK_REFS` keys on, never a path or an ordinal.
+    pub fn allocator_for_volume_tag(
+        &self,
+        vol_tag: u64,
+    ) -> Option<(
+        String,
+        std::sync::Arc<crate::block_allocator::BlockAllocator>,
+    )> {
+        let tag_of = |alloc: &crate::block_allocator::BlockAllocator| {
+            crate::meta_backend::kv::block_refs::volume_tag(alloc.volume_id())
+        };
+        for entry in self.backends.iter() {
+            if tag_of(&entry.value().block_allocator) == vol_tag {
+                return Some((entry.key().clone(), entry.value().block_allocator.clone()));
+            }
+        }
+        if tag_of(&self.default_allocator) == vol_tag {
+            return Some(("backend_0".to_string(), self.default_allocator.clone()));
+        }
+        None
+    }
+
+    /// Sweep the read tiers under one block key (DLM S9 — the co-writer
+    /// free path's LOCAL hygiene): the same purge the terminal free runs
+    /// inside [`Self::free_block`], exposed for the posture whose
+    /// accounting ladder executes on the AUTHORITY while its caches live
+    /// here. A router with no wired tiers (bare fixtures) is a no-op.
+    pub fn purge_read_tiers(&self, block_key: &str) {
+        if let Some(purge) = self.read_tier_purge.get() {
+            purge(block_key);
+        }
+    }
+
     /// Owner's durable device write for this block-key incarnation completed;
     /// validated cache fills may now publish bytes for it.
     pub fn publish_block(&self, block_key: &str) {
@@ -2898,6 +2950,18 @@ impl BackendRouter {
     /// on this path: free ACCOUNTING is synchronous; only space RETURN is
     /// deferred.
     pub async fn free_block(&self, block_key: &str) -> Result<()> {
+        // DLM S9 — the co-writer FREE path: a terminal free's accounting
+        // ladder belongs to the AUTHORITY's ledger, so on a co-writer this
+        // SHIPS as a verb instead of refusing at `begin_free`'s gate (the
+        // pre-branch shape was a silent local leak: Ok(()) with nothing
+        // freed anywhere, forever). The scope check keeps the owner-side
+        // executor's own ladder — which runs THROUGH this function — off
+        // the ship branch (`crate::cowriter` owns both halves).
+        if crate::fuse_client::co_writer_mount()
+            && !crate::cowriter::authority_accounting_scope_active()
+        {
+            return crate::cowriter::ship_displaced_frees(self, &[block_key]).await;
+        }
         // Decoration-tolerant: size-carrying mappings (`bk:off:len` — see
         // `parse_block_mapping`) free their BASE block; a raw parse of the
         // decorated string would err and silently leak the block.
@@ -3061,6 +3125,14 @@ impl BackendRouter {
     }
 
     pub async fn free_blocks(&self, block_keys: &[&str]) -> Result<()> {
+        // DLM S9: the batch form ships ONE free verb per data volume
+        // instead of one per displaced block (see `free_block` above).
+        if crate::fuse_client::co_writer_mount()
+            && !crate::cowriter::authority_accounting_scope_active()
+        {
+            let _ = crate::cowriter::ship_displaced_frees(self, block_keys).await;
+            return Ok(());
+        }
         for &block_key in block_keys {
             let _ = self.free_block(block_key).await;
         }

@@ -725,7 +725,16 @@ impl BlockAllocator {
             log::error!("{e}");
             return Err(e);
         }
-        if crate::fuse_client::co_writer_mount() {
+        // DLM S9 free path: the scope probe runs only INSIDE the co-writer
+        // branch (a write mount never pays it). It marks the ONE venue that
+        // legitimately runs this gate's arms while the process latch says
+        // co-writer — the shipped-free EXECUTOR, i.e. the authority's own
+        // accounting act for the set (`crate::cowriter::
+        // with_authority_accounting`; in production the authority's posture
+        // is `writer` and the probe never fires).
+        if crate::fuse_client::co_writer_mount()
+            && !crate::cowriter::authority_accounting_scope_active()
+        {
             let e = crate::fuse_client::co_writer_refusal(what);
             log::error!("{e}");
             return Err(e);
@@ -1377,6 +1386,56 @@ impl BlockAllocator {
     pub fn refcount(&self, offset: u64) -> Option<u32> {
         self.refcounts
             .read_sync(&offset, |_, v| crate::refcount_core::peek(v))
+    }
+
+    // -----------------------------------------------------------------
+    // DLM S9 — the co-writer FREE path's two allocator seams
+    // (`crate::cowriter`; contracts tests/mw_cowriter_free_tests.rs).
+    // -----------------------------------------------------------------
+
+    /// `true` ⇔ `block_idx` is on the free list — the shipped-free
+    /// executor's already-free probe (one lock-free contains, beside
+    /// [`Self::grace_holds`] / [`Self::is_quarantined`] /
+    /// [`Self::inflight_contains`], the other three states a
+    /// double-released offset can be found in).
+    pub fn free_list_contains(&self, block_idx: u64) -> bool {
+        self.free_blocks.contains(&block_idx)
+    }
+
+    /// **Seed ONE reference for a peer-minted block whose terminal free
+    /// this authority is about to execute** (the shipped-free executor's
+    /// untracked arm): the co-writer minted the offset in its own lane, so
+    /// this allocator never tracked it — and `begin_free`'s untracked
+    /// refusal (correct everywhere else: it is the double-release
+    /// tripwire) would otherwise refuse a legitimate first release.
+    ///
+    /// Deliberately NOT [`Self::recover_block`]: its gap-filling arm
+    /// free-lists every index between the cursor and the target, and on a
+    /// partitioned device those gaps are LIVE PEERS' residue classes —
+    /// declaring a live co-writer's minted-but-unpublished tail "free" is
+    /// exactly the §3.1 zombie window the lane reservation exists to
+    /// close. This seeds the one entry and nothing else: no cursor move,
+    /// no gap fill.
+    ///
+    /// `true` ⇔ seeded; `false` ⇔ an entry already exists (a racing seed
+    /// or a live count — the caller's `begin_free` arbitrates).
+    pub fn seed_shipped_free_reference(&self, offset: u64) -> bool {
+        self.refcounts
+            .insert_sync(offset, AtomicU32::new(1))
+            .is_ok()
+    }
+
+    /// **Retire a co-writer's LOCAL view of a displaced block whose free
+    /// SHIPPED** (`crate::cowriter::ship_displaced_frees`, after the
+    /// authority's acknowledgement): drop the local refcount entry (the
+    /// accounting lives on the authority now) and retire the local
+    /// incarnation word, so a straggler validated fill of the dead
+    /// binding fails its seqlock re-check here exactly as it would on the
+    /// authority. Touches NO free list and NO device — this is the free's
+    /// local *hygiene*, never its accounting.
+    pub fn retire_shipped_free_tracking(&self, offset: u64) {
+        let _ = self.refcounts.remove_sync(&offset);
+        self.mark_incarnation_unstable(offset);
     }
 
     /// W1 patch fence, steps 1a+1b of the §5.1 mechanism (the normative

@@ -2369,6 +2369,45 @@ impl KvMetaBackend {
         Ok(out)
     }
 
+    /// The durable reference population of **one block** — the ordered
+    /// range count over the `(vol_tag, block_idx)` prefix
+    /// ([`super::block_refs::block_range`]): `refcount(block) == records
+    /// in range`, the tree's own law. DLM S9's shipped-free executor is
+    /// the consumer (`crate::cowriter::durable_block_refcount`): the
+    /// owner-side validation of a peer's terminal free is the ledger, not
+    /// the peer's claim.
+    ///
+    /// `Ok(0)` on a volume with no engaged tree, exactly as
+    /// [`Self::block_ref_scan`] answers empty — a caller that must
+    /// distinguish asks [`Self::block_refs_engaged`].
+    pub async fn block_ref_count(
+        &self,
+        vol_tag: u64,
+        block_idx: u64,
+    ) -> std::result::Result<usize, KvError> {
+        let Some(tree) = self.block_refs.as_ref() else {
+            return Ok(0);
+        };
+        let (mut cursor, end) = super::block_refs::block_range(vol_tag, block_idx);
+        let mut population = 0usize;
+        loop {
+            let page = tree.range(&cursor, &end, 512).await?;
+            let Some((last_key, _)) = page.last() else {
+                break;
+            };
+            cursor = key_successor(last_key);
+            for (k, v) in &page {
+                // Decode both halves (the block_ref_scan discipline): a
+                // malformed accounting record is loud corruption, never a
+                // silently skipped — or silently COUNTED — reference.
+                let _ = super::block_refs::decode_block_ref_key(k)?;
+                let _ = super::block_refs::decode_block_ref_value(v)?;
+                population += 1;
+            }
+        }
+        Ok(population)
+    }
+
     /// The resolved OQ 2 contract class for every v3 volume:
     /// `meta_volume_atomicity = "cow-checksummed"` — satisfied by
     /// construction (§4.10; every unit checksummed, never-overwrite-live),

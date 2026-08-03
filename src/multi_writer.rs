@@ -287,6 +287,10 @@ impl MultiWriterArm {
         // (`install_mount_partition` refuses a swap), and the offsets it has
         // minted are in it.
         crate::alloc_lane_grant::uninstall_frontier_source();
+        // The shipped-free EXECUTOR dies with the authority too: a served
+        // free with no executor refuses loud rather than stranding half a
+        // ladder on a disarmed mount.
+        publish::uninstall_free_executor();
         if let Some(hold) = self.wero.take() {
             data_custody::release_hold(hold).await;
         }
@@ -541,10 +545,24 @@ pub async fn arm_multi_writer(
         crate::alloc_lane_grant::install_frontier_source(
             crate::alloc_lane_grant::router_frontier_source(Arc::clone(backend)),
         );
+        // The shipped-free EXECUTOR (DLM S9's co-writer free path,
+        // `crate::cowriter::execute_shipped_frees`): a co-writer's
+        // displaced-block terminal frees travel as publish verbs, and this
+        // is the owner half that runs the full ladder — RAM release, tier
+        // purge, reclaim enqueue, finish_free with the grace ring and the
+        // quarantine composing inside it — against THIS mount's data
+        // plane. Installed with the lane machinery because they are the
+        // two halves of one rewrite: a lane grants the NEW block, the
+        // executor retires the DISPLACED one.
+        publish::install_free_executor(crate::cowriter::router_free_executor(
+            Arc::clone(backend),
+            Arc::clone(meta),
+        ));
         if let Err(e) =
             crate::alloc_lane_grant::engage_authority_lanes(authority_lane, backend, meta).await
         {
             crate::alloc_lane_grant::uninstall_frontier_source();
+            publish::uninstall_free_executor();
             if let Some(hold) = wero {
                 data_custody::release_hold(hold).await;
             }

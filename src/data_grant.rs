@@ -961,6 +961,52 @@ impl WriteCustodyOwner {
         }
     }
 
+    /// **Validate a shipped displaced-block FREE** (the co-writer free
+    /// path's era gate, served in [`crate::meta_ship::publish`]): the
+    /// presented lease epoch must be LIVE custody on this authority.
+    ///
+    /// Keyed on the **epoch alone**, deliberately — three reasons, each
+    /// load-bearing:
+    ///
+    /// * the epoch IS the witness: this authority minted it, it is
+    ///   monotone and never reused, and it travelled only to the member it
+    ///   names over the authenticated wire — while the publish frame's
+    ///   `client` string is documented *"logs and audit only"*, so keying
+    ///   the gate on it would authenticate against a self-assertion;
+    /// * frees are **lane-blind** (the partition's own law: `b % W`
+    ///   derives the owner), so unlike the lane raise there is no
+    ///   per-client assignment to match the caller against — ANY member
+    ///   holding live custody may release a reference its publish already
+    ///   dropped, exactly as any local writer may free a peer's block;
+    /// * the threat the gate exists for is the FENCED mount: a revoked or
+    ///   swept lease's epoch is out of this map, so its in-flight frees
+    ///   refuse by era regardless of what the frame claims about itself.
+    ///
+    /// `Err(reason)` is the operator-facing refusal text (`client` is the
+    /// audit string it names).
+    pub fn check_free(&self, client: &str, lease_epoch: u64) -> std::result::Result<(), String> {
+        let mut live = false;
+        self.clients.iter_sync(|_, l| {
+            if l.epoch == lease_epoch {
+                live = true;
+                return false;
+            }
+            true
+        });
+        if !live {
+            return Err(format!(
+                "S9: refusing a displaced-block free from '{client}': lease epoch {lease_epoch} \
+                 is not custody on authority '{}' (revoked, swept past its TTL, or minted by a \
+                 previous era). The mount must self-fence and re-join; its unfreed displaced \
+                 blocks stay durably unreferenced and the next derivation (mount recovery / \
+                 fsck C6) returns them to the free supply — the leak-safe direction, never a \
+                 free executed for a fenced era",
+                self.id
+            ));
+        }
+        Ok(())
+    }
+
     /// Admit a co-writer (fresh, or a re-join that lost its lease view).
     pub fn join(&self, req: &JoinFrame) -> Result<LeaseFrame> {
         if req.client.is_empty() {
@@ -2288,6 +2334,28 @@ pub fn validate_lane_raise(
         ));
     };
     owner.check_lane_raise(client, lease_epoch, lane, writers)
+}
+
+/// **Validate a peer's displaced-block free** against the installed
+/// authority ([`WriteCustodyOwner::check_free`]) — the era gate S9's
+/// publish owner runs BEFORE the free verb's dedup window.
+///
+/// With **no authority installed** the free is refused for the same reason
+/// the lane raise is: a node serving the publish vocabulary without a
+/// custody authority minted no lease epochs, so it has nothing to check
+/// the presented one against — and executing a free for an unverifiable
+/// era is exactly the act the fence exists to prevent.
+pub fn validate_free(client: &str, lease_epoch: u64) -> std::result::Result<(), String> {
+    let Some(owner) = custody_owner() else {
+        return Err(format!(
+            "S9: refusing a displaced-block free from '{client}': this node serves the publish \
+             vocabulary but has no custody authority armed, so lease epoch {lease_epoch} cannot \
+             be verified as live custody. Arm the multi-writer authority \
+             (SQUEEZEFS_MULTI_WRITER=1 + SQUEEZEFS_MW_BIND) — a free executed for an \
+             unverifiable era is a fenced zombie's free"
+        ));
+    };
+    owner.check_free(client, lease_epoch)
 }
 
 /// **S4's foreign-home seam, resolved.**

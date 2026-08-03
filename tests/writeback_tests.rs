@@ -614,6 +614,15 @@ async fn test_write_block_from_staging_transform_leg_drops_guard_before_dma() {
         .staged_dma_source(&key)
         .expect("staged_dma_source must resolve a staged active block");
     let crypto = CryptoCompressState::new("lz4".to_string(), "none".to_string(), None);
+    // Derive the DUR-8e plaintext bound from THIS fixture's block size,
+    // exactly as a mount does (`DataRouter::set_crypto` →
+    // `init_scratch_pool(block_size)`). Without this the un-installed
+    // state's `max_plaintext_len()` falls back to the PROCESS-ambient
+    // `default_block_size()` env read — and sibling tests in this binary
+    // legitimately set `SQUEEZEFS_DEFAULT_BLOCK_SIZE=4096` for their own
+    // fixtures, which made this test's 64 KiB image refuse decode in
+    // whole-file order only (the §3c known-red; rc-manifest.md).
+    crypto.init_scratch_pool(squeezefs::block_allocator::CHUNK_SIZE as usize);
     // The transform is deterministic: compute the expected on-device image
     // from an independent copy of the plaintext.
     let expected = crypto

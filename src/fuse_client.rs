@@ -20,6 +20,86 @@ use tokio::runtime::Builder;
 pub const CONFIG_INODE: u64 = 0xffff_ffff_ffff_fffe;
 pub const STATS_INODE: u64 = 0xffff_ffff_ffff_fffd;
 
+/// Per-lookup virtual-inode GENERATION range (the 2026-08-04 wb-cache
+/// torn-JSON fix, third mechanism): every `.stats`/`.config` LOOKUP mints
+/// a FRESH kernel inode from this range. Under FUSE_WRITEBACK_CACHE (the
+/// default-mount negotiation) the kernel OWNS `i_size` for regular files
+/// and DISCARDS the size in every attr reply after inode instantiation —
+/// measured live: daemon GETATTR replies 71352→71350→71349 while the
+/// kernel served a frozen 71352, so `cat` (splice) clamped there and tore
+/// the JSON mid-string (39/40 under counter churn). A fresh ino gets a
+/// fresh kernel inode whose size authority initializes from the LOOKUP
+/// entry's attr size and never needs to change: that generation's payload
+/// is IMMUTABLE — coherent under every kernel cache posture, and it also
+/// deletes the last-open-wins residual the fixed-ino OPEN pin documented.
+///
+/// Disjointness (pinned by
+/// `metrics_tests::stats_lookup_mints_fresh_generation_inos_wb_cache_face`):
+/// real inos are monotonic-from-1 with no reuse (v3 metadata; the ino cap
+/// is ≥ 100 M ≪ 2^32, and this range starts at 2^64 − 2^32), and the
+/// range ends below the canonical `STATS_INODE`/`CONFIG_INODE`.
+pub const VIRTUAL_GEN_INO_FIRST: u64 = 0xffff_ffff_0000_0000;
+pub const VIRTUAL_GEN_INO_LAST: u64 = 0xffff_ffff_ffff_fff0;
+
+/// Which virtual payload a virtual ino names — the class survives
+/// registry eviction because the generation mint encodes it in bit 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtualClass {
+    Stats,
+    Config,
+}
+
+/// Classify a virtual ino: the canonical fixed inos AND the per-lookup
+/// generation range. Every `== STATS_INODE || == CONFIG_INODE` handler
+/// guard routes through this (or [`virtual_gen_class`]) so a generation
+/// ino can never fall into a real-inode path (e.g. a meta-backend getattr
+/// on a bogus ino).
+pub fn is_virtual_ino(ino: u64) -> bool {
+    virtual_class(ino).is_some()
+}
+
+/// Class extraction for ANY virtual ino (canonical or generation);
+/// `None` for real inos.
+pub fn virtual_class(ino: u64) -> Option<VirtualClass> {
+    match ino {
+        STATS_INODE => Some(VirtualClass::Stats),
+        CONFIG_INODE => Some(VirtualClass::Config),
+        _ => virtual_gen_class(ino),
+    }
+}
+
+/// Class extraction for per-lookup GENERATION inos only (bit 0 is the
+/// class the mint encoded); `None` outside the reserved range.
+pub fn virtual_gen_class(ino: u64) -> Option<VirtualClass> {
+    if (VIRTUAL_GEN_INO_FIRST..=VIRTUAL_GEN_INO_LAST).contains(&ino) {
+        if ino & 1 == 0 {
+            Some(VirtualClass::Stats)
+        } else {
+            Some(VirtualClass::Config)
+        }
+    } else {
+        None
+    }
+}
+
+/// One minted `.stats`/`.config` generation: the immutable payload its
+/// kernel inode serves for the inode's whole life.
+pub struct VirtualGenEntry {
+    /// The generation's payload — size = `payload.len()`, always.
+    pub payload: std::sync::Arc<Vec<u8>>,
+    /// Mint sequence: the cap-eviction order (oldest mint evicts first).
+    seq: u64,
+}
+
+/// Safety cap on live generations. The registry is bounded in practice by
+/// kernel dentry lifetime + the zero entry TTL (every path walk
+/// revalidates, FORGET retires), but a kernel that never FORGETs must not
+/// grow it unbounded: 256 × the field-measured ~72 KiB `.stats` payload
+/// ≈ 18 MiB worst case. A fixed count (not a derived budget) is
+/// deliberate — this is a safety rail against a misbehaving kernel, sized
+/// by that worst-case arithmetic, never a tuning knob.
+const VIRTUAL_GEN_REGISTRY_CAP: usize = 256;
+
 /// §4.5 dir-entry-cache policy (PR K7): only directories with at most
 /// this many entries are snapshotted into `dir_entry_cache_v3` — an
 /// `Arc<[…]>` of a 1 M-entry listing is ~60 MB, and moka's capacity
@@ -5439,8 +5519,21 @@ pub struct SqueezefsFilesystem {
     /// different generations (`cat` clamped at the stale size and tore
     /// the JSON mid-string on every busy mount) and could mint the same
     /// fh on two queues.
-    pub open_virtual_files: std::sync::Arc<dashmap::DashMap<u64, Vec<u8>, ahash::RandomState>>,
+    pub open_virtual_files:
+        std::sync::Arc<dashmap::DashMap<u64, std::sync::Arc<Vec<u8>>, ahash::RandomState>>,
     pub next_virtual_fh: std::sync::Arc<AtomicU64>,
+    /// Per-lookup generation registry (gen ino → immutable payload) — the
+    /// wb-cache torn-JSON fix. Shared across handler clones (`Arc`, the
+    /// same one-cell law as the fields above: LOOKUP mints on one queue,
+    /// GETATTR/OPEN/READ serve on any other). FORGET/BATCH_FORGET retire
+    /// entries; [`VIRTUAL_GEN_REGISTRY_CAP`] bounds a never-FORGETting
+    /// kernel.
+    pub virtual_gen_payloads:
+        std::sync::Arc<dashmap::DashMap<u64, VirtualGenEntry, ahash::RandomState>>,
+    /// Generation-ino mint counter — one cell across clones (a split
+    /// counter could mint the SAME gen ino on two queues, handing two
+    /// different payloads one kernel inode: the exact bug class again).
+    pub next_virtual_gen: std::sync::Arc<AtomicU64>,
     pub latest_stats_json: std::sync::Arc<arc_swap::ArcSwap<Option<std::sync::Arc<Vec<u8>>>>>,
     pub latest_config_json: std::sync::Arc<arc_swap::ArcSwap<Option<std::sync::Arc<Vec<u8>>>>>,
     /// Byte length of the most recently PUBLISHED (lookup/first-touch) or
@@ -5615,6 +5708,8 @@ impl Clone for SqueezefsFilesystem {
             // copies/split cells are the 2026-08-04 cross-clone tear.
             open_virtual_files: self.open_virtual_files.clone(),
             next_virtual_fh: self.next_virtual_fh.clone(),
+            virtual_gen_payloads: self.virtual_gen_payloads.clone(),
+            next_virtual_gen: self.next_virtual_gen.clone(),
             latest_stats_json: self.latest_stats_json.clone(),
             latest_config_json: self.latest_config_json.clone(),
             latest_stats_size: self.latest_stats_size.clone(),
@@ -5759,6 +5854,10 @@ impl SqueezefsFilesystem {
             next_virtual_fh: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 0x1000_0000_0000_0000,
             )),
+            virtual_gen_payloads: std::sync::Arc::new(dashmap::DashMap::with_hasher(
+                ahash::RandomState::new(),
+            )),
+            next_virtual_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             latest_stats_json: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(
                 None,
             ))),
@@ -5946,7 +6045,7 @@ impl SqueezefsFilesystem {
     }
 
     pub fn queue_reclaim_inode(&self, ino: u64) {
-        if ino <= 1 || ino == CONFIG_INODE || ino == STATS_INODE {
+        if ino <= 1 || is_virtual_ino(ino) {
             return;
         }
         if self.is_open(ino) {
@@ -8144,6 +8243,109 @@ impl SqueezefsFilesystem {
             gid: self.gid,
             rdev: 0,
             blksize: 4096,
+        }
+    }
+
+    /// Mint a per-lookup generation ino for `payload` and register it.
+    /// The class rides bit 0 (see [`virtual_gen_class`]) so it survives
+    /// registry eviction; the mint counter is one cell across clones.
+    /// The counter wraps modulo the range's slot count (~2.1 G mints per
+    /// class — years of 10 Hz stats polling; any prior same-ino kernel
+    /// inode was FORGETted eons before a wrap can reuse its slot).
+    fn mint_virtual_gen_ino(&self, class: VirtualClass, payload: std::sync::Arc<Vec<u8>>) -> u64 {
+        // Safety-cap eviction (see VIRTUAL_GEN_REGISTRY_CAP): a kernel
+        // that never FORGETs must not grow the registry unbounded — drop
+        // the oldest mint (its reader, if any, still serves from the fh
+        // pin in `open_virtual_files`; a later GETATTR answers ESTALE and
+        // the zero entry TTL re-mints on the next path walk).
+        if self.virtual_gen_payloads.len() >= VIRTUAL_GEN_REGISTRY_CAP {
+            let oldest = self
+                .virtual_gen_payloads
+                .iter()
+                .min_by_key(|e| e.value().seq)
+                .map(|e| *e.key());
+            if let Some(k) = oldest {
+                self.virtual_gen_payloads.remove(&k);
+            }
+        }
+        let seq = self.next_virtual_gen.fetch_add(1, Ordering::Relaxed);
+        let slots = (VIRTUAL_GEN_INO_LAST - VIRTUAL_GEN_INO_FIRST + 1) / 2;
+        let class_bit = match class {
+            VirtualClass::Stats => 0,
+            VirtualClass::Config => 1,
+        };
+        let ino = VIRTUAL_GEN_INO_FIRST + (seq % slots) * 2 + class_bit;
+        self.virtual_gen_payloads
+            .insert(ino, VirtualGenEntry { payload, seq });
+        ino
+    }
+
+    /// The attr a virtual ino reports: the class attr shape with the ino
+    /// field naming the GENERATION ino (the canonical builders hardcode
+    /// their fixed inos).
+    fn virtual_gen_attr(&self, ino: u64, class: VirtualClass, size: u64) -> FileAttr {
+        let mut attr = match class {
+            VirtualClass::Stats => self.get_stats_attr(size),
+            VirtualClass::Config => self.get_config_attr(size),
+        };
+        attr.ino = ino;
+        attr
+    }
+
+    /// Attr resolution for ANY virtual ino — `None` if `ino` is not
+    /// virtual (caller falls through to the real-inode path). Generation
+    /// inos report their registry payload's length (frozen for the
+    /// inode's life — the wb-cache contract) or ESTALE once retired; the
+    /// canonical fixed inos keep the legacy published-size protocol
+    /// (first touch generates and publishes, never
+    /// regenerate-and-republish afterward — pinned by
+    /// `metrics_tests::stats_snapshot_getattr_size_matches_served_bytes_under_churn`).
+    async fn virtual_ino_attr(&self, ino: u64) -> Option<Result<FileAttr, Errno>> {
+        if let Some(class) = virtual_gen_class(ino) {
+            return Some(
+                match self
+                    .virtual_gen_payloads
+                    .get(&ino)
+                    .map(|e| e.payload.len() as u64)
+                {
+                    Some(size) => Ok(self.virtual_gen_attr(ino, class, size)),
+                    // Retired (FORGET / cap eviction): the generation is
+                    // gone and its payload is unrecoverable — ESTALE, and
+                    // the zero entry TTL mints fresh on the next walk.
+                    None => Err(Errno::from(libc::ESTALE)),
+                },
+            );
+        }
+        match ino {
+            CONFIG_INODE => {
+                let published = self.latest_config_size.load(Ordering::Acquire);
+                let size = if published > 0 {
+                    published
+                } else {
+                    let bytes = self.generate_config_json().await.into_bytes();
+                    let size = bytes.len() as u64;
+                    self.latest_config_json
+                        .store(std::sync::Arc::new(Some(std::sync::Arc::new(bytes))));
+                    self.latest_config_size.store(size, Ordering::Release);
+                    size
+                };
+                Some(Ok(self.get_config_attr(size)))
+            }
+            STATS_INODE => {
+                let published = self.latest_stats_size.load(Ordering::Acquire);
+                let size = if published > 0 {
+                    published
+                } else {
+                    let bytes = self.generate_stats_json().await.into_bytes();
+                    let size = bytes.len() as u64;
+                    self.latest_stats_json
+                        .store(std::sync::Arc::new(Some(std::sync::Arc::new(bytes))));
+                    self.latest_stats_size.store(size, Ordering::Release);
+                    size
+                };
+                Some(Ok(self.get_stats_attr(size)))
+            }
+            _ => None,
         }
     }
 
@@ -13594,7 +13796,7 @@ impl SqueezefsFilesystem {
 
         let mut admitted = Vec::with_capacity(inos.len());
         for ino in inos {
-            if ino <= 1 || ino == CONFIG_INODE || ino == STATS_INODE {
+            if ino <= 1 || is_virtual_ino(ino) {
                 continue;
             }
             // OPEN/RECLAIM HANDSHAKE (fstests generic/795 — the destroy-
@@ -14535,6 +14737,17 @@ impl Filesystem for SqueezefsFilesystem {
         // loud where they do not — never a fabricated parent).
         if name_str == "." || (parent == 1 && name_str == "..") {
             let target = if name_str == "." { parent } else { 1 };
+            // A virtual ino can be a reconnect target too (`LOOKUP(G, ".")`
+            // after handle decode): serve its class attr — falling through
+            // would hand the meta backend a bogus ino. Retired generations
+            // answer ESTALE like their GETATTR.
+            if let Some(attr) = self.virtual_ino_attr(target).await {
+                return Ok(ReplyEntry {
+                    ttl: Duration::from_secs(0),
+                    attr: attr?,
+                    generation: entry_generation(),
+                });
+            }
             let attr = self
                 .get_attr_internal(target)
                 .await
@@ -14548,35 +14761,36 @@ impl Filesystem for SqueezefsFilesystem {
             });
         }
 
+        // Per-lookup GENERATIONS (the 2026-08-04 wb-cache torn-JSON fix,
+        // third mechanism — see VIRTUAL_GEN_INO_FIRST): generate the
+        // payload ONCE, mint a fresh gen ino, and reply an entry whose
+        // attr size is that payload's length. The fresh kernel inode's
+        // wb-cache size authority initializes from THIS entry and never
+        // needs to change (the generation is immutable) — coherent for
+        // splice/cat under every cache posture, and the fixed-ino OPEN
+        // pin's last-open-wins residual is structurally gone (each
+        // lookup's reader opens its OWN inode).
         if parent == 1 && name_str == ".config" {
-            let config_data = self.generate_config_json().await;
-            let bytes = config_data.into_bytes();
-            let size = bytes.len() as u64;
-            self.latest_config_json
-                .store(std::sync::Arc::new(Some(std::sync::Arc::new(bytes))));
-            self.latest_config_size.store(size, Ordering::Release);
-            let attr = self.get_config_attr(size);
+            let payload = std::sync::Arc::new(self.generate_config_json().await.into_bytes());
+            let size = payload.len() as u64;
+            let gen_ino = self.mint_virtual_gen_ino(VirtualClass::Config, payload);
             return Ok(ReplyEntry {
-                // Zero TTL (like `.stats`): with exact-size payloads
-                // (no floor padding) every fstat must reach the daemon
-                // so the kernel's copy bound is never a stale size.
+                // Zero TTL (like `.stats`): every path walk revalidates,
+                // so each snapshot consumer gets its own fresh generation
+                // and FORGET retires the old ones promptly.
                 ttl: Duration::from_secs(0),
-                attr,
+                attr: self.virtual_gen_attr(gen_ino, VirtualClass::Config, size),
                 generation: entry_generation(),
             });
         }
 
         if parent == 1 && name_str == ".stats" {
-            let stats_data = self.generate_stats_json().await;
-            let bytes = stats_data.into_bytes();
-            let size = bytes.len() as u64;
-            self.latest_stats_json
-                .store(std::sync::Arc::new(Some(std::sync::Arc::new(bytes))));
-            self.latest_stats_size.store(size, Ordering::Release);
-            let attr = self.get_stats_attr(size);
+            let payload = std::sync::Arc::new(self.generate_stats_json().await.into_bytes());
+            let size = payload.len() as u64;
+            let gen_ino = self.mint_virtual_gen_ino(VirtualClass::Stats, payload);
             return Ok(ReplyEntry {
                 ttl: Duration::from_secs(0), // dynamic stats shouldn't be cached long
-                attr,
+                attr: self.virtual_gen_attr(gen_ino, VirtualClass::Stats, size),
                 generation: entry_generation(),
             });
         }
@@ -14647,52 +14861,28 @@ impl Filesystem for SqueezefsFilesystem {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         debug!("FUSE GetAttr: ino = {}", ino);
 
-        // Virtual inodes: GETATTR reports the PUBLISHED generation's size
-        // and must never regenerate-and-republish — the kernel copies
-        // exactly `i_size` bytes out of these files (`cat` →
-        // `copy_file_range`), so an fstat between open and read that
-        // republished a *different* size than the open-pinned generation
-        // tore every snapshot read under counter churn (the M2 acceptance
-        // session measured 9/10 torn phase snapshots with the rig's ~40 KB
-        // payload). First touch (never generated) generates once and
-        // publishes, so a bare `stat` keeps working. Pinned by
-        // `metrics_tests::stats_snapshot_getattr_size_matches_served_bytes_under_churn`.
-        if ino == CONFIG_INODE {
-            let published = self.latest_config_size.load(Ordering::Acquire);
-            let size = if published > 0 {
-                published
-            } else {
-                let bytes = self.generate_config_json().await.into_bytes();
-                let size = bytes.len() as u64;
-                self.latest_config_json
-                    .store(std::sync::Arc::new(Some(std::sync::Arc::new(bytes))));
-                self.latest_config_size.store(size, Ordering::Release);
-                size
-            };
-            let attr = self.get_config_attr(size);
+        // Virtual inodes (`virtual_ino_attr`): generation inos report
+        // their registry payload's length — FROZEN for the inode's life,
+        // which is the whole per-lookup-generation point — or ESTALE once
+        // retired; the canonical fixed inos (an old fd / handle-reconnect
+        // may still name them) keep the legacy published-size protocol:
+        // report the PUBLISHED generation's size, never
+        // regenerate-and-republish (the kernel copies exactly `i_size`
+        // bytes out of these files, so a republished different size tore
+        // every mid-churn snapshot — the M2 acceptance session measured
+        // 9/10 torn with the rig's ~40 KB payload). First touch generates
+        // once and publishes, so a bare `stat` keeps working. Pinned by
+        // `metrics_tests::stats_snapshot_getattr_size_matches_served_bytes_under_churn`
+        // and `metrics_tests::stats_lookup_mints_fresh_generation_inos_wb_cache_face`.
+        if let Some(attr) = self.virtual_ino_attr(ino).await {
+            let attr = attr?;
+            debug!(
+                "FUSE GetAttr virtual: ino = {ino}, replying size {}",
+                attr.size
+            );
             return Ok(ReplyAttr {
-                // Zero TTL (like `.stats`): exact-size payloads need
-                // every fstat served fresh from the published pin.
-                ttl: Duration::from_secs(0),
-                attr,
-            });
-        }
-
-        if ino == STATS_INODE {
-            let published = self.latest_stats_size.load(Ordering::Acquire);
-            let size = if published > 0 {
-                published
-            } else {
-                let bytes = self.generate_stats_json().await.into_bytes();
-                let size = bytes.len() as u64;
-                self.latest_stats_json
-                    .store(std::sync::Arc::new(Some(std::sync::Arc::new(bytes))));
-                self.latest_stats_size.store(size, Ordering::Release);
-                size
-            };
-            let attr = self.get_stats_attr(size);
-            debug!("FUSE GetAttr virtual .stats: replying size {size}");
-            return Ok(ReplyAttr {
+                // Zero TTL: every fstat reaches the daemon, so the
+                // kernel's copy bound is never a stale size.
                 ttl: Duration::from_secs(0),
                 attr,
             });
@@ -14881,84 +15071,64 @@ impl Filesystem for SqueezefsFilesystem {
         // opened O_RDONLY by every consumer.
         const WRITE_INTENT: u32 =
             (libc::O_WRONLY | libc::O_RDWR | libc::O_TRUNC | libc::O_APPEND | libc::O_CREAT) as u32;
-        if inode != STATS_INODE && inode != CONFIG_INODE && flags & WRITE_INTENT != 0 {
+        if !is_virtual_ino(inode) && flags & WRITE_INTENT != 0 {
             self.ro_gate("open(write intent)")?;
         }
 
-        if inode == STATS_INODE || inode == CONFIG_INODE {
-            let content = if inode == STATS_INODE {
-                let old_val = self.latest_stats_json.swap(std::sync::Arc::new(None));
-                if let Some(bytes_arc) = &*old_val {
-                    (**bytes_arc).clone()
-                } else {
-                    self.generate_stats_json().await.into_bytes()
+        if is_virtual_ino(inode) {
+            let content: std::sync::Arc<Vec<u8>> = if virtual_gen_class(inode).is_some() {
+                // Per-lookup generation: the open serves exactly the
+                // minted payload — no pin ceremony, no page purge needed
+                // (the OPEN-time notify_inval_inode_sync purge was the
+                // fixed-ino era's belt: a FRESH ino has no retained
+                // kernel pages by construction). A retired generation
+                // (FORGET / cap eviction) is ESTALE — the zero entry TTL
+                // means the caller's next path walk mints fresh.
+                match self.virtual_gen_payloads.get(&inode) {
+                    Some(e) => e.payload.clone(),
+                    None => return Err(Errno::from(libc::ESTALE)),
                 }
+            } else if inode == STATS_INODE {
+                // Legacy fixed-ino pin machinery (an old fd or handle
+                // reconnect may still name the canonical inos): consume
+                // the published generation or regenerate, then publish
+                // the pinned size so a subsequent fstat reports the bound
+                // the kernel will copy to. Single-reader snapshots are
+                // exact by construction; concurrent readers race
+                // last-open-wins (bounded, documented residual — gone on
+                // the generation path above).
+                let old_val = self.latest_stats_json.swap(std::sync::Arc::new(None));
+                let content = if let Some(bytes_arc) = &*old_val {
+                    bytes_arc.clone()
+                } else {
+                    std::sync::Arc::new(self.generate_stats_json().await.into_bytes())
+                };
+                self.latest_stats_size
+                    .store(content.len() as u64, Ordering::Release);
+                content
             } else {
                 let old_val = self.latest_config_json.swap(std::sync::Arc::new(None));
-                if let Some(bytes_arc) = &*old_val {
-                    (**bytes_arc).clone()
+                let content = if let Some(bytes_arc) = &*old_val {
+                    bytes_arc.clone()
                 } else {
-                    self.generate_config_json().await.into_bytes()
-                }
-            };
-            // PIN point: this open's fh serves exactly `content` — publish
-            // its size so a subsequent fstat (GETATTR, which never
-            // regenerates) reports the bound the kernel will copy to.
-            // Single-reader snapshots are exact by construction; concurrent
-            // readers race last-open-wins (bounded, documented residual).
-            let pinned_size = content.len() as u64;
-            if inode == STATS_INODE {
-                self.latest_stats_size.store(pinned_size, Ordering::Release);
-            } else {
+                    std::sync::Arc::new(self.generate_config_json().await.into_bytes())
+                };
                 self.latest_config_size
-                    .store(pinned_size, Ordering::Release);
-            }
+                    .store(content.len() as u64, Ordering::Release);
+                content
+            };
             let fh = self.next_virtual_fh.fetch_add(1, Ordering::Relaxed);
-            debug!("FUSE Open virtual: ino = {inode}, fh = {fh}, pinned {pinned_size} bytes");
+            debug!(
+                "FUSE Open virtual: ino = {inode}, fh = {fh}, pinned {} bytes",
+                content.len()
+            );
             self.open_virtual_files.insert(fh, content);
-            // Kernel-cache purge, SYNCHRONOUS before the OPEN reply (the
-            // 2026-08-04 torn-JSON fix's second half; the generic/451
-            // reply-is-the-barrier discipline via the same
-            // `notify_inval_inode_sync` sink): the 40-cat churn probe
-            // proved the kernel serves these inodes from retained pages
-            // regardless of the FOPEN_DIRECT_IO reply below on the
-            // patched over-uring kernel — and when two generations have
-            // EQUAL size (steady-state counter churn), AUTO_INVAL_DATA
-            // sees no size change, keeps the previous generation's
-            // pages, and splices stale-prefix + fresh-tail mid-string
-            // (39/40 torn reads live). Purging [0, EOF) under the open
-            // makes every reader serve exactly its own pinned
-            // generation. Loud-never-fatal like the DIO sink; pre-mount
-            // opens are impossible (no kernel OPEN before mount).
-            match self.session_connection.load().as_ref() {
-                Some(conn) => match conn.notify_inval_inode_sync(inode, 0, -1).await {
-                    Ok(purged) => {
-                        debug!("FUSE Open virtual: ino = {inode} page purge ok (purged={purged})")
-                    }
-                    Err(e) => {
-                        // ENOENT = the kernel holds no pages/attrs for the
-                        // ino (never read yet) — the expected cold case.
-                        if e.raw_os_error() != Some(libc::ENOENT) {
-                            log::warn!(
-                                "virtual-inode page purge failed for ino {inode}: {e} — a \
-                                 stale-page splice (torn snapshot JSON) is possible on \
-                                 this open"
-                            );
-                        }
-                    }
-                },
-                None => debug!(
-                    "FUSE Open virtual: ino = {inode} page purge SKIPPED (connection cell unarmed)"
-                ),
-            }
-            // FOPEN_DIRECT_IO: the payload is regenerated per open, but the
-            // kernel clamps buffered reads to i_size from a PREVIOUS
-            // generation's lookup — serving truncated (unparseable) JSON
-            // once the stats payload grows between generations. Direct I/O
-            // makes the kernel trust our read replies (short read = EOF)
-            // instead of the stale size. (Belt: the purge above is the
-            // load-bearing half on kernels where retained pages serve
-            // regardless — see the churn probe note.)
+            // FOPEN_DIRECT_IO: belt for plain-read consumers — the kernel
+            // trusts our read replies (short read = EOF) instead of a
+            // cached i_size. Generation inos are size-coherent either way
+            // (their kernel inode's size authority IS the entry size);
+            // the legacy fixed inos still need it (a stale kernel i_size
+            // from a previous generation's lookup clamps buffered reads).
             const FOPEN_DIRECT_IO: u32 = 1 << 0;
             return Ok(ReplyOpen {
                 fh,
@@ -15096,40 +15266,29 @@ impl Filesystem for SqueezefsFilesystem {
             lane_pre_fed: _req.unique == 0,
         };
 
-        if ino == CONFIG_INODE {
-            let bytes = if let Some(cached) = self.open_virtual_files.get(&fh) {
-                cached.clone()
-            } else {
-                self.generate_config_json().await.into_bytes()
-            };
-            if offset >= bytes.len() as u64 {
-                return Ok(ReplyData {
-                    data: Vec::new().into(),
-                    backing: None,
-                });
-            }
-            let start = offset as usize;
-            let end = std::cmp::min(bytes.len(), start + size as usize);
-            // SAFETY: start < bytes.len() checked on line 2144, and end is clamped to bytes.len()
-            let slice = unsafe { bytes.get_unchecked(start..end) };
-            return Ok(ReplyData {
-                data: slice.to_vec().into(),
-                backing: None,
-            });
-        }
-
-        if ino == STATS_INODE {
-            let cached_hit = self.open_virtual_files.get(&fh);
+        if is_virtual_ino(ino) {
+            // Serve priority: the OPEN's fh pin (one generation per open),
+            // then — generation inos — the registry payload verbatim
+            // (frozen size; ESTALE once retired), then — canonical fixed
+            // inos only — a fresh regenerate (the legacy fh-less serve an
+            // old consumer may still drive).
+            let bytes: std::sync::Arc<Vec<u8>> =
+                if let Some(cached) = self.open_virtual_files.get(&fh) {
+                    cached.value().clone()
+                } else if virtual_gen_class(ino).is_some() {
+                    match self.virtual_gen_payloads.get(&ino) {
+                        Some(e) => e.payload.clone(),
+                        None => return Err(Errno::from(libc::ESTALE)),
+                    }
+                } else if ino == STATS_INODE {
+                    std::sync::Arc::new(self.generate_stats_json().await.into_bytes())
+                } else {
+                    std::sync::Arc::new(self.generate_config_json().await.into_bytes())
+                };
             debug!(
-                "FUSE Read virtual: ino = {ino}, fh = {fh}, hit = {}, len = {:?}",
-                cached_hit.is_some(),
-                cached_hit.as_ref().map(|c| c.len())
+                "FUSE Read virtual: ino = {ino}, fh = {fh}, len = {}",
+                bytes.len()
             );
-            let bytes = if let Some(cached) = cached_hit {
-                cached.clone()
-            } else {
-                self.generate_stats_json().await.into_bytes()
-            };
             if offset >= bytes.len() as u64 {
                 return Ok(ReplyData {
                     data: Vec::new().into(),
@@ -15138,7 +15297,7 @@ impl Filesystem for SqueezefsFilesystem {
             }
             let start = offset as usize;
             let end = std::cmp::min(bytes.len(), start + size as usize);
-            // SAFETY: start < bytes.len() checked on line 2166, and end is clamped to bytes.len()
+            // SAFETY: start < bytes.len() checked above, and end is clamped to bytes.len()
             let slice = unsafe { bytes.get_unchecked(start..end) };
             return Ok(ReplyData {
                 data: slice.to_vec().into(),
@@ -15550,7 +15709,9 @@ impl Filesystem for SqueezefsFilesystem {
             }
         }
 
-        if ino == CONFIG_INODE || ino == STATS_INODE {
+        // Every virtual ino (canonical + per-lookup generations) refuses
+        // writes — falling through would hand the data path a bogus ino.
+        if is_virtual_ino(ino) {
             return Err(Errno::from(libc::EACCES));
         }
 
@@ -15993,7 +16154,10 @@ impl Filesystem for SqueezefsFilesystem {
         METRICS.meta_updates.fetch_add(1, Ordering::Relaxed);
         debug!("FUSE SetAttr: ino = {}, set_attr = {:?}", ino, set_attr);
 
-        if ino == CONFIG_INODE {
+        // Every virtual ino refuses attribute mutation (the guard used to
+        // name only CONFIG_INODE; STATS_INODE and the generation inos fell
+        // through to a meta-backend getattr on a bogus ino).
+        if is_virtual_ino(ino) {
             return Err(Errno::from(libc::EACCES));
         }
 
@@ -17266,6 +17430,16 @@ impl Filesystem for SqueezefsFilesystem {
             self.latest_stats_size.load(Ordering::Acquire)
         } else if ino == CONFIG_INODE {
             self.latest_config_size.load(Ordering::Acquire)
+        } else if virtual_gen_class(ino).is_some() {
+            // Generation ino: the frozen registry size; retired ⇒ ESTALE.
+            match self
+                .virtual_gen_payloads
+                .get(&ino)
+                .map(|e| e.payload.len() as u64)
+            {
+                Some(size) => size,
+                None => return Err(Errno::from(libc::ESTALE)),
+            }
         } else {
             self.get_attr_internal(ino)
                 .await
@@ -17283,7 +17457,7 @@ impl Filesystem for SqueezefsFilesystem {
                 offset: if seek_data { offset } else { size },
             })
         };
-        if ino == STATS_INODE || ino == CONFIG_INODE {
+        if is_virtual_ino(ino) {
             return all_data();
         }
 
@@ -17386,7 +17560,7 @@ impl Filesystem for SqueezefsFilesystem {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         debug!("FUSE Flush: ino = {}", ino);
 
-        if ino == STATS_INODE || ino == CONFIG_INODE {
+        if is_virtual_ino(ino) {
             return Ok(());
         }
 
@@ -17470,7 +17644,7 @@ impl Filesystem for SqueezefsFilesystem {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         debug!("FUSE Release: ino = {}", ino);
 
-        if ino == STATS_INODE || ino == CONFIG_INODE {
+        if is_virtual_ino(ino) {
             self.open_virtual_files.remove(&fh);
             return Ok(());
         }
@@ -17552,7 +17726,7 @@ impl Filesystem for SqueezefsFilesystem {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         debug!("FUSE Fsync: ino = {}, datasync = {}", ino, _datasync);
 
-        if ino == STATS_INODE || ino == CONFIG_INODE {
+        if is_virtual_ino(ino) {
             return Ok(());
         }
 
@@ -17713,6 +17887,15 @@ impl Filesystem for SqueezefsFilesystem {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         debug!("FUSE Forget: ino = {}, count = {}", ino, count);
         let _prof = OpProf::begin(FuseOpKind::Forget, ino);
+        // Per-lookup generation: the kernel dropping its dentry/inode IS
+        // the generation's death — retire the registry entry (a gen ino
+        // gets exactly ONE lookup reference, since every lookup mints
+        // fresh; no `return_lookups` accounting applies, and none of the
+        // real-inode bookkeeping below can name it).
+        if virtual_gen_class(ino).is_some() {
+            self.virtual_gen_payloads.remove(&ino);
+            return;
+        }
         // FUSE-3k: `count` is the number of LOOKUP references the kernel is
         // returning, not a signal that it dropped the inode. Evict only when
         // the last one comes back — `fuse_force_forget(1)` (a readdirplus
@@ -17744,6 +17927,13 @@ impl Filesystem for SqueezefsFilesystem {
             inodes.first().map(|(ino, _)| *ino).unwrap_or(0),
         );
         for &(ino, nlookup) in inodes {
+            // Per-lookup generation sweep — exactly like N FORGETs (and
+            // BATCH_FORGET is the drop_caches / memory-pressure path, i.e.
+            // exactly how a poller's accumulated generations mass-retire).
+            if virtual_gen_class(ino).is_some() {
+                self.virtual_gen_payloads.remove(&ino);
+                continue;
+            }
             // FUSE-3k: the per-entry `nlookup` the wire always carried and
             // this handler used to discard.
             if !self.return_lookups(ino, nlookup) {

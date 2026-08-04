@@ -406,8 +406,8 @@ async fn stats_snapshot_protocol_holds_across_handler_clones() {
         "clone C must serve exactly the generation clone A minted — a \
          split registry regenerates a different-size payload mid-churn"
     );
-    let _: serde_json::Value = serde_json::from_slice(&data.data)
-        .expect("cross-clone generation read must parse as JSON");
+    let _: serde_json::Value =
+        serde_json::from_slice(&data.data).expect("cross-clone generation read must parse as JSON");
     let _ = q_b.release(req, entry.attr.ino, og.fh, 0, 0, false).await;
 }
 
@@ -538,13 +538,17 @@ async fn stats_lookup_mints_fresh_generation_inos_wb_cache_face() {
     // inos and ino 1 sit outside it.
     const GEN_FIRST: u64 = 0xffff_ffff_0000_0000;
     const GEN_LAST: u64 = 0xffff_ffff_ffff_fff0;
-    assert!(STATS_INODE > GEN_LAST && CONFIG_INODE > GEN_LAST);
     for (label, e) in [("first", &e1), ("second", &e2)] {
         let ino = e.attr.ino;
         assert!(
             (GEN_FIRST..=GEN_LAST).contains(&ino),
             "{label} lookup's generation ino {ino:#x} must come from the \
              reserved range {GEN_FIRST:#x}..={GEN_LAST:#x}"
+        );
+        assert!(
+            ino < STATS_INODE,
+            "{label}: the range must end BELOW the canonical virtual inos \
+             (STATS_INODE is the lower of the two)"
         );
         assert_ne!(ino, STATS_INODE, "{label}: gen ino ≠ canonical stats");
         assert_ne!(ino, CONFIG_INODE, "{label}: gen ino ≠ canonical config");

@@ -775,6 +775,54 @@ pub fn set_test_upload_stall_ms(ms: u64) {
     test_upload_stall_cell().store(ms, Ordering::Relaxed);
 }
 
+/// TEST SEAM (`SQUEEZEFS_TEST_INVAL_TAIL_STALL_MS`, the 2026-08-04
+/// pipeline-tail race pin): stall the detached pipeline upload between
+/// its overlay retire and its invalidation tail — the window whose
+/// UNGUARDED form let the tail's second retire remove a concurrent
+/// writer's freshly-parked entry mid-hold (the squeeze-test 13:10
+/// battery daemon panic, `parked entry cannot vanish under the held
+/// block lock`; `tests/pipeline_inval_tail_race_tests.rs`). Load
+/// selects such schedules; this lever selects them deterministically.
+/// One relaxed load unset; never set in production.
+fn test_inval_tail_stall_cell() -> &'static std::sync::atomic::AtomicU64 {
+    static CELL: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        let v = std::env::var("SQUEEZEFS_TEST_INVAL_TAIL_STALL_MS")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        std::sync::atomic::AtomicU64::new(v)
+    })
+}
+
+/// Set the invalidation-tail stall seam (tests only; `0` disables).
+pub fn set_test_inval_tail_stall_ms(ms: u64) {
+    test_inval_tail_stall_cell().store(ms, Ordering::Relaxed);
+}
+
+/// TEST SEAM (`SQUEEZEFS_TEST_CHECKOUT_STALL_MS`): stall the write
+/// handler inside its BLOCK_FLUSH_LOCKS-held window, strictly after the
+/// overlay checkout/park and before the request-slice merge — the
+/// exact span the `parked entry cannot vanish under the held block
+/// lock` invariant covers. Paired with the inval-tail stall above it
+/// makes the field's tail-vs-writer overlap a deterministic schedule.
+/// One relaxed load unset; never set in production.
+fn test_checkout_stall_cell() -> &'static std::sync::atomic::AtomicU64 {
+    static CELL: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        let v = std::env::var("SQUEEZEFS_TEST_CHECKOUT_STALL_MS")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        std::sync::atomic::AtomicU64::new(v)
+    })
+}
+
+/// Set the checkout-stall test seam (tests only; `0` disables).
+pub fn set_test_checkout_stall_ms(ms: u64) {
+    test_checkout_stall_cell().store(ms, Ordering::Relaxed);
+}
+
 /// Stall-window entries (tests only — the seam's sequencing observable:
 /// a planted-stale schedule polls it to know the in-flight snapshots are
 /// parked in the window before landing the superseding write). Bumped
@@ -10305,6 +10353,14 @@ impl SqueezefsFilesystem {
                     self.park_overlay_entry(cache_key.clone(), seed);
                 }
                 write_phase_record(WritePhase::Checkout, wp_checkout);
+                // TEST SEAM: hold this write inside its guarded window
+                // (post-checkout, pre-merge) — see `set_test_checkout_stall_ms`.
+                {
+                    let stall = test_checkout_stall_cell().load(Ordering::Relaxed);
+                    if stall > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(stall)).await;
+                    }
+                }
 
                 // W2 one-authority extension: a full-repr buffer supersedes
                 // the block's staged extent record from birth — absorb its
@@ -10843,6 +10899,14 @@ impl SqueezefsFilesystem {
                         .write_through_bytes
                         .fetch_add(block_size, Ordering::Relaxed);
                     drop(block_guard);
+                    // TEST SEAM: the tail-vs-writer overlap window — see
+                    // `set_test_inval_tail_stall_ms`.
+                    {
+                        let stall = test_inval_tail_stall_cell().load(Ordering::Relaxed);
+                        if stall > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(stall)).await;
+                        }
+                    }
                     if let Err(e) = self.upload_invalidation_tail(ino, b).await {
                         warn!(
                             "pipeline upload invalidation tail for ino {ino} block {b} \

@@ -14691,6 +14691,7 @@ impl Filesystem for SqueezefsFilesystem {
                 size
             };
             let attr = self.get_stats_attr(size);
+            debug!("FUSE GetAttr virtual .stats: replying size {size}");
             return Ok(ReplyAttr {
                 ttl: Duration::from_secs(0),
                 attr,
@@ -14915,12 +14916,49 @@ impl Filesystem for SqueezefsFilesystem {
             let fh = self.next_virtual_fh.fetch_add(1, Ordering::Relaxed);
             debug!("FUSE Open virtual: ino = {inode}, fh = {fh}, pinned {pinned_size} bytes");
             self.open_virtual_files.insert(fh, content);
+            // Kernel-cache purge, SYNCHRONOUS before the OPEN reply (the
+            // 2026-08-04 torn-JSON fix's second half; the generic/451
+            // reply-is-the-barrier discipline via the same
+            // `notify_inval_inode_sync` sink): the 40-cat churn probe
+            // proved the kernel serves these inodes from retained pages
+            // regardless of the FOPEN_DIRECT_IO reply below on the
+            // patched over-uring kernel — and when two generations have
+            // EQUAL size (steady-state counter churn), AUTO_INVAL_DATA
+            // sees no size change, keeps the previous generation's
+            // pages, and splices stale-prefix + fresh-tail mid-string
+            // (39/40 torn reads live). Purging [0, EOF) under the open
+            // makes every reader serve exactly its own pinned
+            // generation. Loud-never-fatal like the DIO sink; pre-mount
+            // opens are impossible (no kernel OPEN before mount).
+            match self.session_connection.load().as_ref() {
+                Some(conn) => match conn.notify_inval_inode_sync(inode, 0, -1).await {
+                    Ok(purged) => {
+                        debug!("FUSE Open virtual: ino = {inode} page purge ok (purged={purged})")
+                    }
+                    Err(e) => {
+                        // ENOENT = the kernel holds no pages/attrs for the
+                        // ino (never read yet) — the expected cold case.
+                        if e.raw_os_error() != Some(libc::ENOENT) {
+                            log::warn!(
+                                "virtual-inode page purge failed for ino {inode}: {e} — a \
+                                 stale-page splice (torn snapshot JSON) is possible on \
+                                 this open"
+                            );
+                        }
+                    }
+                },
+                None => debug!(
+                    "FUSE Open virtual: ino = {inode} page purge SKIPPED (connection cell unarmed)"
+                ),
+            }
             // FOPEN_DIRECT_IO: the payload is regenerated per open, but the
             // kernel clamps buffered reads to i_size from a PREVIOUS
             // generation's lookup — serving truncated (unparseable) JSON
             // once the stats payload grows between generations. Direct I/O
             // makes the kernel trust our read replies (short read = EOF)
-            // instead of the stale size.
+            // instead of the stale size. (Belt: the purge above is the
+            // load-bearing half on kernels where retained pages serve
+            // regardless — see the churn probe note.)
             const FOPEN_DIRECT_IO: u32 = 1 << 0;
             return Ok(ReplyOpen {
                 fh,

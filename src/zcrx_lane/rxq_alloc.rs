@@ -257,6 +257,36 @@ mod tests {
     }
 
     #[test]
+    fn arbiter_serial_rearm_rotates_the_pool_before_reuse() {
+        // FINDING 2's engine (2026-08 field): the kernel's ifq teardown
+        // is ASYNC (ring-fd close defers the unregister in-kernel), so a
+        // freed rxq re-granted instantly re-registers into EEXIST. Serial
+        // re-arms must walk the WHOLE free pool (least-recently-freed
+        // reuse) before an index repeats.
+        let ifx = 0xBEE3;
+        let mut seen: Vec<u32> = Vec::new();
+        for i in 0..8 {
+            let l = acquire(ifx, "unit-nic-rot", 32, 1).expect("grant");
+            assert_eq!(l.queues().len(), 1);
+            let q = l.queues()[0];
+            assert!(
+                !seen.contains(&q),
+                "arm {i}: freed queue {q} reused while fresh queues remained \
+                 (the EEXIST-recycle class): {seen:?}"
+            );
+            seen.push(q);
+        }
+        assert_eq!(seen[0], 31, "first grant keeps the §8 pick parity");
+        // History exhausted: the 9th arm reuses the LEAST-recently-freed.
+        let l = acquire(ifx, "unit-nic-rot", 32, 1).expect("grant");
+        assert_eq!(
+            l.queues()[0],
+            seen[0],
+            "reuse order is least-recently-freed first"
+        );
+    }
+
+    #[test]
     fn arbiter_zero_want_refuses() {
         let err = acquire(0xBEC2, "unit-nic-g", 32, 0).expect_err("a lane with zero queues");
         assert!(err.contains("unit-nic-g"), "refusal names the NIC: {err}");

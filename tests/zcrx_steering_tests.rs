@@ -24,8 +24,8 @@
 //!    the PRISTINE table (recorded by the first armer).
 
 use squeezefs::zcrx_lane::steering::{
-    arm_steering, lane_queue_picks, reserved_loc_range, restricted_rss, FlowRule, NicControl,
-    STEERING_RESERVED_SLOTS,
+    arm_flow_rules, arm_rss_exclusion, arm_steering, lane_queue_picks, reserved_loc_range,
+    restricted_rss, FlowRule, NicControl, RX_CLS_LOC_ANY, STEERING_RESERVED_SLOTS,
 };
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -54,6 +54,11 @@ struct MockNic {
     channels: u32,
     hds_on: bool,
     ntuple_on: bool,
+    /// The mlx5-class lie (2026-08 field finding 1): advertise a 0-size
+    /// rule table while ACCEPTING inserts — auto-loc requests get
+    /// driver-assigned ids from the top of a hidden table.
+    advertise_zero_table: bool,
+    hidden_next_loc: u32,
     rss: Vec<u32>,
     table_size: u32,
     rules: BTreeMap<u32, FlowRule>,
@@ -70,6 +75,8 @@ impl MockNic {
             channels,
             hds_on: true,
             ntuple_on: true,
+            advertise_zero_table: false,
+            hidden_next_loc: 1023, // the field's observed auto-loc face
             rss,
             table_size: 1024,
             rules: BTreeMap::new(),
@@ -130,6 +137,9 @@ impl NicControl for MockNic {
         if self.fail_at == FailAt::TableSize {
             return Err("mock: table size refused".into());
         }
+        if self.advertise_zero_table {
+            return Ok(0);
+        }
         Ok(self.table_size)
     }
     fn ntuple_locs(&mut self) -> Result<Vec<u32>, String> {
@@ -139,19 +149,30 @@ impl NicControl for MockNic {
         }
         Ok(self.rules.keys().copied().collect())
     }
-    fn insert_ntuple(&mut self, loc: u32, rule: &FlowRule) -> Result<(), String> {
-        self.ops.push(format!("insert@{loc}"));
+    fn insert_ntuple(&mut self, loc: u32, rule: &FlowRule) -> Result<u32, String> {
+        if loc == RX_CLS_LOC_ANY {
+            self.ops.push("insert@any".into());
+        } else {
+            self.ops.push(format!("insert@{loc}"));
+        }
         let n = self.inserts_seen;
         self.inserts_seen += 1;
         if self.fail_at == FailAt::Insert(n) {
             return Err(format!("mock: insert {n} refused"));
         }
+        let effective = if loc == RX_CLS_LOC_ANY {
+            let l = self.hidden_next_loc;
+            self.hidden_next_loc -= 1;
+            l
+        } else {
+            loc
+        };
         assert!(
-            !self.rules.contains_key(&loc),
+            !self.rules.contains_key(&effective),
             "steering must never overwrite an occupied loc"
         );
-        self.rules.insert(loc, rule.clone());
-        Ok(())
+        self.rules.insert(effective, rule.clone());
+        Ok(effective)
     }
     fn delete_ntuple(&mut self, loc: u32) -> Result<(), String> {
         self.ops.push(format!("delete@{loc}"));
@@ -410,4 +431,122 @@ fn test_out_of_order_restore_converges_to_pristine_rss() {
         pristine,
         "the LAST restore returns the pristine table"
     );
+}
+
+// ------------------------------------- 2026-08 field findings (red-first)
+
+#[test]
+fn test_zero_advertised_table_arms_via_kernel_assigned_ids_and_restores() {
+    // FINDING 1: mlx5 advertises rule-table size 0 (ETHTOOL_GRXCLSRLCNT)
+    // with ntuple ON yet ACCEPTS inserts — empirically verified on
+    // squeeze-test (explicit `loc 8` insert OK; auto-loc returned rule
+    // ID 1023). The 0-advertisement must not refuse the arm: the
+    // KERNEL's insert verdict rules. Teardown must delete the RETURNED
+    // ids, and no range reap runs (no range identity exists — foreign
+    // rules must survive untouched).
+    let mut nic = MockNic::new("sm-lie-a", 32, 128);
+    nic.advertise_zero_table = true;
+    nic.rules.insert(3, flow(9999, 1)); // operator-owned; must survive
+    let pristine = nic.snapshot();
+    let flows = vec![flow(50001, 31), flow(50002, 30)];
+    let mut guard = arm_steering(&mut nic, &flows)
+        .expect("0-advertised table with ntuple ON must arm (kernel verdict rules)");
+    assert_eq!(nic.rules.len(), 3, "two lane rules + the foreign rule");
+    assert!(
+        nic.rules.contains_key(&1023) && nic.rules.contains_key(&1022),
+        "lane rules live at the DRIVER-assigned ids: {:?}",
+        nic.rules.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        nic.rules.contains_key(&3),
+        "foreign rule untouched — no reap without a range identity"
+    );
+    for v in &nic.rss {
+        assert!(![30u32, 31].contains(v), "lane queues excluded from RSS");
+    }
+    guard.restore(&mut nic).expect("restore");
+    assert_eq!(
+        nic.snapshot(),
+        pristine,
+        "teardown by RETURNED ids restores byte-identically"
+    );
+}
+
+#[test]
+fn test_zero_advertised_insert_failure_rolls_back_exactly() {
+    // FINDING 1, the loud-refusal half: on the kernel-assigned class the
+    // capacity verdict is the INSERT's — an EOPNOTSUPP/ENOSPC-class
+    // refusal fails the arm loud and rolls back byte-identically.
+    let mut nic = MockNic::new("sm-lie-b", 32, 128);
+    nic.advertise_zero_table = true;
+    nic.fail_at = FailAt::Insert(1);
+    let prior = nic.snapshot();
+    let flows = vec![flow(50001, 31), flow(50002, 30)];
+    let err = arm_steering(&mut nic, &flows).expect_err("kernel-refused insert fails the arm");
+    assert!(!err.is_empty());
+    assert_eq!(
+        nic.snapshot(),
+        prior,
+        "kernel-refused insert rolls back to byte-identical"
+    );
+}
+
+#[test]
+fn test_split_arm_rss_exclusion_precedes_any_rule_install() {
+    // FINDING 3 (ordering law): a queue with a bound zcrx ifq produces
+    // unreadable (net_iov) skbs — any HOST flow RSS-hashed onto it gets
+    // recv = EFAULT (the field's `ICResp read: Bad address` face). So
+    // RSS exclusion (phase A) must be installable BEFORE any ifq
+    // registration, with ZERO rule inserts; the flow rules (phase B —
+    // they need the post-connect ephemeral ports) join the SAME guard.
+    let mut nic = MockNic::new("sm-split-a", 32, 128);
+    let pristine = nic.snapshot();
+    let mut guard = arm_rss_exclusion(&mut nic, &[30, 31]).expect("phase A");
+    for v in &nic.rss {
+        assert!(
+            ![30u32, 31].contains(v),
+            "leased queues excluded BEFORE any ifq can exist"
+        );
+    }
+    assert!(
+        !nic.ops.iter().any(|o| o.starts_with("insert")),
+        "phase A installs no rules: {:?}",
+        nic.ops
+    );
+    assert!(nic.rules.is_empty());
+    arm_flow_rules(&mut nic, &mut guard, &[flow(50001, 31), flow(50002, 30)])
+        .expect("phase B installs the post-connect flow rules");
+    assert_eq!(nic.rules.len(), 2, "one rule per lane flow");
+    guard.restore(&mut nic).expect("restore");
+    assert_eq!(nic.snapshot(), pristine, "split arm restores byte-exactly");
+}
+
+#[test]
+fn test_split_arm_phase_b_failure_keeps_rss_excluded_until_restore() {
+    // FINDING 3's unwind law: a phase-B refusal rolls back ONLY its own
+    // rules — RSS stays excluded, because at that point the caller's
+    // ifqs are still bound and re-including the queues is exactly the
+    // EFAULT window. The caller tears the ifqs down and THEN restores.
+    let mut nic = MockNic::new("sm-split-b", 32, 128);
+    let pristine = nic.snapshot();
+    let mut guard = arm_rss_exclusion(&mut nic, &[31]).expect("phase A");
+    nic.fail_at = FailAt::Insert(1);
+    let err = arm_flow_rules(
+        &mut nic,
+        &mut guard,
+        &[flow(50001, 31), flow(50002, 31)],
+    )
+    .expect_err("second insert refused");
+    assert!(!err.is_empty());
+    assert!(
+        !guard.restored(),
+        "phase-B refusal must NOT restore RSS (ifqs may still be bound)"
+    );
+    assert!(nic.rules.is_empty(), "phase B's partial inserts rolled back");
+    assert!(
+        nic.rss.iter().all(|v| *v != 31),
+        "queue 31 stays RSS-excluded until the caller's teardown"
+    );
+    guard.restore(&mut nic).expect("restore after ifq teardown");
+    assert_eq!(nic.snapshot(), pristine, "byte-identical after full unwind");
 }

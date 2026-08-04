@@ -244,19 +244,22 @@ pub async fn arm_for_device(device_path: &str) -> Option<Arc<LaneSession>> {
     // flows ≡ queues 1:1, so the FREE rule-slot count (total reserved
     // minus live sessions' holdings) clamps the queue want the same way
     // the §8 pool does — a queue we cannot steer is a queue we must not
-    // claim.
-    let free_slots = steering::free_reserved_slots(&ifname, reserved);
-    if free_slots == 0 {
-        log::warn!(
-            "zcrx-lane: live lane sessions hold all {} reserved steering rule slots \
-             on {ifname} — lane not armed for {device_path}; kernel path serves",
-            reserved.1 - reserved.0
-        );
-        return None;
-    }
-    let slot_want = target
-        .io_queues
-        .min(free_slots.min(u32::from(u16::MAX)) as u16);
+    // claim. The kernel-assigned class (field finding 1: 0-advertised
+    // tables that accept inserts) has NO static bound — the kernel's
+    // insert verdict rules at steering, so the clamp never zeroes the
+    // want there.
+    let slot_want = match steering::free_reserved_slots(&ifname, &reserved) {
+        Some(0) => {
+            log::warn!(
+                "zcrx-lane: live lane sessions hold every reserved steering rule \
+                 slot on {ifname} — lane not armed for {device_path}; kernel path \
+                 serves"
+            );
+            return None;
+        }
+        Some(free) => target.io_queues.min(free.min(u32::from(u16::MAX)) as u16),
+        None => target.io_queues,
+    };
     // DISTINCT per-session RX queues from the NIC-derived pool — the
     // REGISTER_ZCRX_IFQ EEXIST fix (field row 3): the arbiter grants
     // queues no live session holds and frees them when the session (and

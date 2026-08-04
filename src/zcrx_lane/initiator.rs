@@ -360,6 +360,16 @@ pub struct ZcrxPlan {
     pub rxq_lease: Option<Arc<super::rxq_alloc::RxqLease>>,
 }
 
+impl ZcrxPlan {
+    /// The registration rxq for IO queue `qid` (1-based). This is the
+    /// ONLY source of rxq indices at `REGISTER_ZCRX_IFQ` time — the
+    /// arbiter's granted list riding the plan (field finding 2's
+    /// plumbing pin: registration never derives a queue itself).
+    pub fn rxq_for_qid(&self, qid: u16) -> Option<u32> {
+        self.rx_queues.get(qid as usize - 1).copied()
+    }
+}
+
 /// The armed NIC state a session must restore at disarm/unmount.
 struct SteeringHold {
     nic: super::ethtool::EthtoolNic,
@@ -556,7 +566,7 @@ impl LaneSession {
                     )));
                 }
                 LaneBackend::Zcrx(plan) => {
-                    let rxq = *plan.rx_queues.get(qid as usize - 1).ok_or_else(|| {
+                    let rxq = plan.rxq_for_qid(qid).ok_or_else(|| {
                         io_err(format!(
                             "zcrx plan has {} rx queues for IO queue {qid}",
                             plan.rx_queues.len()

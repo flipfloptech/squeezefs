@@ -1905,6 +1905,7 @@ async fn test_live_nvmet_tcp_association_and_read_roundtrip() {
 //       ntuple/capacity probe must run BEFORE bring-up, refuse loud ONCE
 //       per NIC, and name the exact operator remedy.
 
+use squeezefs::zcrx_lane::initiator::ZcrxPlan;
 use squeezefs::zcrx_lane::rxq_alloc;
 use squeezefs::zcrx_lane::steering::{self, NicControl};
 
@@ -2008,7 +2009,7 @@ impl NicControl for CapMock {
     fn ntuple_locs(&mut self) -> Result<Vec<u32>, String> {
         Ok(Vec::new())
     }
-    fn insert_ntuple(&mut self, _: u32, _: &steering::FlowRule) -> Result<(), String> {
+    fn insert_ntuple(&mut self, _: u32, _: &steering::FlowRule) -> Result<u32, String> {
         panic!("capacity gate must never mutate the NIC (rule insert)");
     }
     fn delete_ntuple(&mut self, _: u32) -> Result<(), String> {
@@ -2017,11 +2018,8 @@ impl NicControl for CapMock {
 }
 
 #[test]
-fn test_steering_capacity_gate_zero_slots_refuses_naming_the_remedy() {
-    // (2) The field shape: ntuple off (ethtool -K) reads as a 0-slot rule
-    // table. The gate must refuse BEFORE any flow rule, read-only, naming
-    // the exact remedy — and the arm ladder's loud-once-per-NIC cache
-    // keeps 10 fabric devices from printing it 10×.
+fn test_steering_capacity_gate_ntuple_off_refuses_zero_advertised_arms() {
+    // ntuple OFF keeps the remedy-naming refusal (unchanged law).
     let mut off = CapMock {
         name: "itest-cap-off",
         ntuple_on: false,
@@ -2033,25 +2031,41 @@ fn test_steering_capacity_gate_zero_slots_refuses_naming_the_remedy() {
         "refusal must name the exact remedy: {err}"
     );
 
+    // FINDING 1 (2026-08 field): a 0-size ADVERTISEMENT with ntuple ON
+    // is the mlx5-class driver lie (inserts empirically succeed — the
+    // remedy was applied and the lane still refused on every device).
+    // The gate must NOT refuse: the kernel's insert verdict rules.
     let mut zero = CapMock {
         name: "itest-cap-zero",
         ntuple_on: true,
         table: 0,
     };
-    let err = steering::steering_capacity_gate(&mut zero).expect_err("0-slot table must refuse");
-    assert!(
-        err.contains("0-slot") && err.contains("ethtool -K"),
-        "zero-capacity refusal must name the table size and a remedy: {err}"
+    assert_eq!(
+        steering::steering_capacity_gate(&mut zero)
+            .expect("0-advertised with ntuple ON must arm (kernel-assigned class)"),
+        steering::RuleSlots::KernelAssigned,
+        "the mlx5 class arms via kernel-assigned locs"
     );
 
-    // Healthy NIC: gate passes and returns the reserved range.
+    // Advertised tables keep the reserved-range law.
     let mut ok = CapMock {
         name: "itest-cap-ok",
         ntuple_on: true,
         table: 1024,
     };
-    let (lo, hi) = steering::steering_capacity_gate(&mut ok).expect("healthy gate");
-    assert_eq!((lo, hi), steering::reserved_loc_range(1024));
+    let (lo, hi) = steering::reserved_loc_range(1024);
+    assert_eq!(
+        steering::steering_capacity_gate(&mut ok).expect("healthy gate"),
+        steering::RuleSlots::Reserved { lo, hi }
+    );
+
+    // The kernel-assigned class must never zero the queue want (there is
+    // no static slot bound — capacity is the kernel's insert verdict).
+    assert_eq!(
+        steering::free_reserved_slots("itest-cap-zero", &steering::RuleSlots::KernelAssigned),
+        None,
+        "no static clamp exists on the kernel-assigned class"
+    );
 
     // Loud-once-per-NIC: first refusal reports, repeats are throttled;
     // a DIFFERENT NIC reports again.
@@ -2061,4 +2075,63 @@ fn test_steering_capacity_gate_zero_slots_refuses_naming_the_remedy() {
         "second refusal on one NIC must be throttled (10 devices ride one NIC)"
     );
     assert!(steering::note_arm_refusal_once("itest-once-b"));
+}
+
+#[test]
+fn test_rxq_arbiter_serial_rearm_rotates_pool_before_reuse() {
+    // FINDING 2's engine: kernel ifq teardown is ASYNC (ring-fd close
+    // defers the unregister), so a freed rxq re-granted instantly
+    // re-registers into EEXIST — the deployed field log shows rxq=31
+    // re-derived for every device's arm. Serial re-arms must walk the
+    // WHOLE free pool before reusing a freed index.
+    let ifx = 0xACF1;
+    let mut seen: Vec<u32> = Vec::new();
+    for i in 0..8 {
+        let l = rxq_alloc::acquire(ifx, "itest-nic-rot", 32, 1).expect("grant");
+        let q = l.queues()[0];
+        assert!(
+            !seen.contains(&q),
+            "arm {i}: freed queue {q} reused while fresh queues remained \
+             (the EEXIST-recycle class): {seen:?}"
+        );
+        seen.push(q);
+    }
+    // History exhausted: the 9th arm reuses the LEAST-recently-freed.
+    let l = rxq_alloc::acquire(ifx, "itest-nic-rot", 32, 1).expect("grant");
+    assert_eq!(
+        l.queues()[0],
+        seen[0],
+        "reuse order is least-recently-freed first"
+    );
+}
+
+#[test]
+fn test_registration_rxqs_come_from_the_arbiter_grant_disjoint_across_sessions() {
+    // FINDING 2's plumbing pin: the qid→rxq mapping the ring driver
+    // registers with (`ZcrxPlan::rxq_for_qid`) is fed EXCLUSIVELY by the
+    // arbiter's granted list — two sessions' plans on one NIC can never
+    // present the same rxq at REGISTER_ZCRX_IFQ time.
+    let ifx = 0xACF2;
+    let a = rxq_alloc::acquire(ifx, "itest-nic-w", 32, 2).expect("lease A");
+    let b = rxq_alloc::acquire(ifx, "itest-nic-w", 32, 2).expect("lease B");
+    let plan = |lease: std::sync::Arc<rxq_alloc::RxqLease>| ZcrxPlan {
+        ifname: "itest-nic-w".into(),
+        ifindex: ifx,
+        numa_node: None,
+        rx_queues: lease.queues().to_vec(),
+        rxq_lease: Some(lease),
+    };
+    let pa = plan(std::sync::Arc::new(a));
+    let pb = plan(std::sync::Arc::new(b));
+    for qa in 1..=2u16 {
+        let ra = pa.rxq_for_qid(qa).expect("A maps every qid");
+        for qb in 1..=2u16 {
+            let rb = pb.rxq_for_qid(qb).expect("B maps every qid");
+            assert_ne!(
+                ra, rb,
+                "sessions A qid{qa} and B qid{qb} would collide at registration"
+            );
+        }
+    }
+    assert_eq!(pa.rxq_for_qid(3), None, "beyond the grant maps to None");
 }

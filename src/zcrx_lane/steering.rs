@@ -29,6 +29,32 @@ use std::sync::{LazyLock, Mutex, MutexGuard};
 /// lane-owned, so a stale one is reapable and a foreign one is impossible.
 pub const STEERING_RESERVED_SLOTS: u32 = 64;
 
+/// `RX_CLS_LOC_ANY` (<linux/ethtool.h>): the special rule location that
+/// asks the DRIVER to pick a slot — the arm strategy for drivers whose
+/// advertised table size is a lie (the 2026-08 field finding: mlx5
+/// advertises 0 via `ETHTOOL_GRXCLSRLCNT` with ntuple ON, yet accepts
+/// inserts — auto-loc returned rule ID 1023). The kernel writes the
+/// assigned location back into `fs.location`.
+pub const RX_CLS_LOC_ANY: u32 = 0xffff_ffff;
+
+/// What the capacity gate learned about a NIC's flow-rule slots — the
+/// per-driver-class loc strategy (2026-08 field finding 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleSlots {
+    /// The driver advertises a rule table: the reserved-range law
+    /// applies (explicit locs in `[lo, hi)`, range-identified
+    /// crash-residue reap).
+    Reserved { lo: u32, hi: u32 },
+    /// The driver advertises a 0-size table with ntuple ON (the mlx5
+    /// class — the advertisement is a lie; inserts work empirically):
+    /// arm via kernel-assigned locs (`RX_CLS_LOC_ANY`), tear down by
+    /// the RETURNED rule IDs, and skip the range reap (no range
+    /// identity exists — residue from a crashed daemon on this class
+    /// is inert dead-4-tuple rules, operator-reapable via `ethtool
+    /// -U <if> delete`). Capacity is the KERNEL's verdict at insert.
+    KernelAssigned,
+}
+
 /// Per-NIC live-arm state — what makes a SECOND lane session on one NIC
 /// safe now that the rxq arbiter (`rxq_alloc`) hands out distinct queues
 /// (the pre-arbiter reap law assumed one session per NIC and would have
@@ -61,16 +87,22 @@ fn live_arms() -> MutexGuard<'static, HashMap<String, NicLive>> {
     LIVE_ARMS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Free reserved rule slots on `ifname` given the gate's reserved range
-/// (total minus live sessions' holdings) — the arm ladder's queue-want
-/// clamp (flows ≡ queues 1:1).
-pub fn free_reserved_slots(ifname: &str, reserved: (u32, u32)) -> u32 {
-    let total = reserved.1.saturating_sub(reserved.0);
-    let live = live_arms()
-        .get(ifname)
-        .map(|l| l.locs.len() as u32)
-        .unwrap_or(0);
-    total.saturating_sub(live)
+/// Free rule slots on `ifname` given the gate's verdict — the arm
+/// ladder's queue-want clamp (flows ≡ queues 1:1). `None` = no static
+/// bound exists (the kernel-assigned class: capacity is the kernel's
+/// verdict at insert, so the clamp must NOT zero the queue want).
+pub fn free_reserved_slots(ifname: &str, slots: &RuleSlots) -> Option<u32> {
+    match slots {
+        RuleSlots::Reserved { lo, hi } => {
+            let total = hi.saturating_sub(*lo);
+            let live = live_arms()
+                .get(ifname)
+                .map(|l| l.locs.len() as u32)
+                .unwrap_or(0);
+            Some(total.saturating_sub(live))
+        }
+        RuleSlots::KernelAssigned => None,
+    }
 }
 
 /// One lane connection's 4-tuple → queue steering rule.
@@ -109,8 +141,11 @@ pub trait NicControl {
     fn ntuple_table_size(&mut self) -> Result<u32, String>;
     /// Locations of ALL installed ntuple rules.
     fn ntuple_locs(&mut self) -> Result<Vec<u32>, String>;
-    /// Install a TCP 4-tuple rule at an explicit location.
-    fn insert_ntuple(&mut self, loc: u32, rule: &FlowRule) -> Result<(), String>;
+    /// Install a TCP 4-tuple rule at `loc` — or at a DRIVER-assigned
+    /// location when `loc == RX_CLS_LOC_ANY` (the mlx5-class arm).
+    /// Returns the EFFECTIVE location (the kernel writes it back), which
+    /// the caller must record for teardown.
+    fn insert_ntuple(&mut self, loc: u32, rule: &FlowRule) -> Result<u32, String>;
     fn delete_ntuple(&mut self, loc: u32) -> Result<(), String>;
 }
 
@@ -133,16 +168,17 @@ pub fn lane_queue_picks(channels: u32, want: u16) -> Vec<u32> {
     (pool.end - take..pool.end).collect()
 }
 
-/// Pre-arm steering-capacity gate (field row 3, 2026-08-04: the arm read
-/// `1 flows exceed the 0 reserved rule slots` AFTER connecting — ntuple
-/// was off via `ethtool -K`, so the driver advertised a 0-slot rule
-/// table and the refusal surfaced per-device with no remedy named):
-/// probe the ntuple FEATURE state and the rule-slot capacity BEFORE any
-/// flow rule (and, in the arm ladder, before any bring-up work). A
-/// zero-capacity NIC refuses with the exact operator remedy named on
-/// the line; the probe is READ-ONLY — the lane never flips NIC features
-/// itself. `Ok` carries the reserved loc range `[lo, hi)` (≥ 1 slot).
-pub fn steering_capacity_gate(nic: &mut dyn NicControl) -> Result<(u32, u32), String> {
+/// Pre-arm steering-capacity gate (field row 3, 2026-08-04 + the 2026-08
+/// field finding 1): probe the ntuple FEATURE state and the rule-slot
+/// capacity BEFORE any flow rule (and, in the arm ladder, before any
+/// bring-up work). Ntuple OFF refuses with the exact operator remedy
+/// named on the line; a 0-size ADVERTISEMENT with the feature ON is the
+/// mlx5-class driver lie (empirical: inserts succeed — auto-loc returned
+/// rule ID 1023 into a "0-sized" table) and arms via
+/// [`RuleSlots::KernelAssigned`] — the kernel's insert verdict rules,
+/// never the advertisement. The probe is READ-ONLY — the lane never
+/// flips NIC features itself.
+pub fn steering_capacity_gate(nic: &mut dyn NicControl) -> Result<RuleSlots, String> {
     let ifname = nic.ifname().to_string();
     let on = nic
         .ntuple_enabled()
@@ -160,15 +196,43 @@ pub fn steering_capacity_gate(nic: &mut dyn NicControl) -> Result<(u32, u32), St
         .map_err(|e| format!("ntuple table probe on {ifname}: {e}"))?;
     let (lo, hi) = reserved_loc_range(table);
     if hi - lo == 0 {
+        // RED PHASE (fix/zcrx-arm-field finding 1): the contract says
+        // Ok(RuleSlots::KernelAssigned) — the refusal below is the
+        // disproven law, kept failing-red until the fix commit.
         return Err(format!(
             "zcrx steering: {ifname} advertises a {table}-slot ntuple rule table — \
-             0 reserved lane rule slots; remedy: `ethtool -K {ifname} ntuple on` \
-             (drivers size the rule table when the feature arms), then remount; if \
-             ntuple is already on, this driver/firmware reserves no rule slots and \
-             the NIC cannot host the lane (kernel path serves)"
+             0 reserved lane rule slots (red-phase refusal)"
         ));
     }
-    Ok((lo, hi))
+    Ok(RuleSlots::Reserved { lo, hi })
+}
+
+/// Phase A of the split arm (finding 3): all probes (HDS, channels, the
+/// capacity gate) + RSS exclusion of the LEASED queues — run BEFORE any
+/// ifq registration, because a queue with a bound zcrx ifq produces
+/// unreadable (net_iov) skbs and every host flow RSS-hashed onto it
+/// gets `recv = EFAULT`. Returns the restore guard (no rules yet).
+pub fn arm_rss_exclusion(
+    nic: &mut dyn NicControl,
+    lane_queues: &[u32],
+) -> Result<SteeringGuard, String> {
+    // RED PHASE: contract pinned by tests/zcrx_steering_tests.rs.
+    let _ = (nic, lane_queues);
+    Err("zcrx steering: arm_rss_exclusion unimplemented".into())
+}
+
+/// Phase B of the split arm: install the lane flow rules (post-connect —
+/// the 4-tuples need the ephemeral ports) into the guard phase A
+/// returned. A refusal rolls back EVERYTHING (rules + registration +
+/// RSS) and the error names the failing step.
+pub fn arm_flow_rules(
+    nic: &mut dyn NicControl,
+    guard: &mut SteeringGuard,
+    flows: &[FlowRule],
+) -> Result<(), String> {
+    // RED PHASE: contract pinned by tests/zcrx_steering_tests.rs.
+    let _ = (nic, guard, flows);
+    Err("zcrx steering: arm_flow_rules unimplemented".into())
 }
 
 /// Loud-ONCE-per-NIC refusal throttle for the arm ladder (ten fabric
@@ -376,7 +440,18 @@ pub fn arm_steering(nic: &mut dyn NicControl, flows: &[FlowRule]) -> Result<Stee
         .map_err(|e| format!("channel probe on {}: {e}", nic.ifname()))?;
     // ntuple feature + rule-slot capacity BEFORE any flow rule (field
     // row 3 — the gate names the operator remedy; still probe-only).
-    let (lo, hi) = steering_capacity_gate(nic)?;
+    let (lo, hi) = match steering_capacity_gate(nic)? {
+        RuleSlots::Reserved { lo, hi } => (lo, hi),
+        RuleSlots::KernelAssigned => {
+            // RED PHASE (finding 1): the kernel-assigned arm lands with
+            // the fix commit; unreachable today (the gate never returns
+            // this variant yet).
+            return Err(format!(
+                "zcrx steering: kernel-assigned loc arm not implemented on {}",
+                nic.ifname()
+            ));
+        }
+    };
     let lane_queues: Vec<u32> = {
         let mut qs: Vec<u32> = flows.iter().map(|f| f.queue).collect();
         qs.sort_unstable();
@@ -474,16 +549,19 @@ pub fn arm_steering(nic: &mut dyn NicControl, flows: &[FlowRule]) -> Result<Stee
             }
         };
         cursor = loc + 1;
-        if let Err(e) = nic.insert_ntuple(loc, flow) {
-            let step = format!("ntuple insert @{loc} on {}: {e}", nic.ifname());
-            if let Err(rb) = guard.restore_locked(nic, &mut reg) {
-                return Err(format!("{step}; ROLLBACK ALSO FAILED: {rb}"));
+        let effective = match nic.insert_ntuple(loc, flow) {
+            Ok(eff) => eff,
+            Err(e) => {
+                let step = format!("ntuple insert @{loc} on {}: {e}", nic.ifname());
+                if let Err(rb) = guard.restore_locked(nic, &mut reg) {
+                    return Err(format!("{step}; ROLLBACK ALSO FAILED: {rb}"));
+                }
+                return Err(format!("{step} (rolled back — NIC untouched)"));
             }
-            return Err(format!("{step} (rolled back — NIC untouched)"));
-        }
-        guard.rule_locs.push(loc);
+        };
+        guard.rule_locs.push(effective);
         if let Some(l) = reg.get_mut(&ifname) {
-            l.locs.insert(loc);
+            l.locs.insert(effective);
         }
     }
     Ok(guard)

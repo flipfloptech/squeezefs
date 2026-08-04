@@ -320,14 +320,19 @@ impl NicControl for EthtoolNic {
         Ok(locs)
     }
 
-    fn insert_ntuple(&mut self, loc: u32, rule: &FlowRule) -> Result<(), String> {
+    fn insert_ntuple(&mut self, loc: u32, rule: &FlowRule) -> Result<u32, String> {
         let mut nfc = EthtoolRxnfc {
             cmd: ETHTOOL_SRXCLSRLINS,
             fs: Self::build_flow_spec(loc, rule)?,
             ..Default::default()
         };
         self.ethtool_ioctl(&mut nfc as *mut _ as *mut libc::c_void)
-            .map_err(|e| format!("SRXCLSRLINS @{loc}: {e}"))
+            .map_err(|e| format!("SRXCLSRLINS @{loc}: {e}"))?;
+        // The kernel writes the EFFECTIVE location back into fs.location
+        // — meaningful for `RX_CLS_LOC_ANY` (the mlx5-class arm, 2026-08
+        // field finding 1: 0-advertised tables accept driver-assigned
+        // inserts); an explicit loc echoes itself.
+        Ok(nfc.fs.location)
     }
 
     fn delete_ntuple(&mut self, loc: u32) -> Result<(), String> {

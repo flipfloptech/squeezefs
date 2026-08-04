@@ -3175,6 +3175,13 @@ pub struct Metrics {
     /// growth on a workload that never touches priv'd files means the
     /// known-clean latch regressed.
     pub fuse_killpriv_clears: Align64<AtomicU64>,
+    /// generic/451 — DIO-write page-coherence engagement: ranged kernel
+    /// page invalidations awaited before an O_DIRECT WRITE's reply on an
+    /// ino with buffered-open history (`post_dio_write_coherence`). 0 on
+    /// pure-DIO and pure-buffered workloads BY CONSTRUCTION (the
+    /// buffered-open gate / the O_DIRECT gate); growth prices exactly the
+    /// mixed buffered-read/DIO-write shape the law exists for.
+    pub fuse_dio_write_invals: Align64<AtomicU64>,
     pub meta_updates: Align64<AtomicU64>,
     pub put_obj: Align64<AtomicU64>,
     pub get_obj: Align64<AtomicU64>,
@@ -5093,6 +5100,15 @@ const fn regular_open_reply_flags() -> u32 {
     FOPEN_KEEP_CACHE | FOPEN_NOFLUSH | FOPEN_PARALLEL_DIRECT_WRITES
 }
 
+/// generic/451 — the DIO-write page-coherence sink: `(ino, offset, len)`
+/// = the written range, invalidated in the kernel's page cache BEFORE the
+/// WRITE reply (ack ⇒ coherent). Production wires the ranged
+/// FUSE_NOTIFY_INVAL_INODE push through the fuse3 Notify handle
+/// (`start_mount`, next to `kernel_notify`); tests inject recorders (the
+/// `ipc_service::Invalidator` hook precedent).
+pub type DioInvalSink =
+    std::sync::Arc<dyn Fn(u64, u64, u32) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+
 #[derive(Debug, Clone)]
 pub struct WritebackRequest {
     pub ino: u64,
@@ -5401,6 +5417,23 @@ pub struct SqueezefsFilesystem {
     /// priv-checked inos per mount; v3 never reuses inos, so no reclaim
     /// hook is needed.
     killpriv_clean: std::sync::Arc<scc::HashSet<u64>>,
+    /// generic/451 — buffered-open history: inos the kernel MAY hold page
+    /// cache for. Every regular open/create WITHOUT O_DIRECT inserts
+    /// (FOPEN_KEEP_CACHE makes retention outlive the handle, PERF-6), and
+    /// the final FORGET sweeps (the kernel cannot hold pages for an inode
+    /// it evicted — the RES-13 bound, `forget_side_maps`). Gates the
+    /// DIO-write page-coherence law (`post_dio_write_coherence`): pure-DIO
+    /// lineages pay ZERO sideband traffic. Residual (documented): pages
+    /// minted by mmap over an O_DIRECT-only fd are invisible to us — the
+    /// same mixing POSIX already declares incoherent for O_DIRECT.
+    page_cache_inos: std::sync::Arc<scc::HashSet<u64>>,
+    /// generic/451 — the DIO-write page-coherence sink cell: production
+    /// (`start_mount`) wires a ranged FUSE_NOTIFY_INVAL_INODE push through
+    /// the fuse3 Notify handle (the `kernel_notify` pattern); tests inject
+    /// recorders (the `ipc_service::Invalidator` hook precedent —
+    /// tests/dio_write_page_coherence_tests.rs). `None` = no kernel to
+    /// invalidate (in-process fixtures without the suite's recorder).
+    pub dio_inval_sink: std::sync::Arc<arc_swap::ArcSwap<Option<DioInvalSink>>>,
     pub next_dir_fh: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// L4 interception session host (design-preload-interception §5.2, PR
     /// L4-3): `None` on non-interception mounts. Shared across handler
@@ -5485,6 +5518,10 @@ impl Clone for SqueezefsFilesystem {
             reclaim_semaphore: self.reclaim_semaphore.clone(),
             reclaim_inflight: self.reclaim_inflight.clone(),
             killpriv_clean: self.killpriv_clean.clone(),
+            page_cache_inos: self.page_cache_inos.clone(),
+            // Share the one cell (kernel_notify precedent): the mounted
+            // handler clone must observe the sink start_mount arms.
+            dio_inval_sink: self.dio_inval_sink.clone(),
             dismount_once: self.dismount_once.clone(),
             dismount_complete: self.dismount_complete.clone(),
             dismount_done: self.dismount_done.clone(),
@@ -5629,6 +5666,8 @@ impl SqueezefsFilesystem {
             },
             reclaim_inflight: std::sync::Arc::new(scc::HashSet::new()),
             killpriv_clean: std::sync::Arc::new(scc::HashSet::new()),
+            page_cache_inos: std::sync::Arc::new(scc::HashSet::new()),
+            dio_inval_sink: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(None)),
             reclaim_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 reclaim_concurrency,
             )),
@@ -6674,6 +6713,7 @@ impl SqueezefsFilesystem {
                 "readdir_parent_memo_hits": METRICS.readdir_parent_memo_hits.load(Ordering::Relaxed),
                 "fuse_killpriv_negotiated": METRICS.fuse_killpriv_negotiated.load(Ordering::Relaxed),
                 "fuse_killpriv_clears": METRICS.fuse_killpriv_clears.load(Ordering::Relaxed),
+                "fuse_dio_write_invals": METRICS.fuse_dio_write_invals.load(Ordering::Relaxed),
                 "meta_updates": METRICS.meta_updates.load(Ordering::Relaxed),
                 "put_obj": METRICS.put_obj.load(Ordering::Relaxed),
                 "get_obj": METRICS.get_obj.load(Ordering::Relaxed),
@@ -8018,6 +8058,10 @@ impl SqueezefsFilesystem {
     fn forget_side_maps(&self, ino: u64) {
         self.dir_gen.remove_sync(&ino);
         self.killpriv_clean.remove_sync(&ino);
+        // generic/451: the kernel evicted the inode, so it holds no pages
+        // for it — the DIO-write coherence gate disarms until the next
+        // buffered open (what bounds the set, RES-13).
+        self.page_cache_inos.remove_sync(&ino);
     }
 
     /// Bump a directory's readdir-snapshot generation (PR M4 D1.c) — the
@@ -14549,6 +14593,12 @@ impl Filesystem for SqueezefsFilesystem {
             // tests/attr_refresh_tests.rs).
             self.refresh_attr_cache(parent).await;
             self.add_open(inode.ino);
+            // generic/451: CREATE is an open — same buffered-open gate as
+            // the open handler (aio-dio-cycle-write's init is O_DIRECT|
+            // O_CREAT, which must NOT arm it).
+            if flags & (libc::O_DIRECT as u32) == 0 {
+                let _ = self.page_cache_inos.insert_sync(inode.ino);
+            }
             // FUSE-3k: CREATE returns an entry AND a handle — one lookup
             // reference (the kernel forgets it like any other) plus the open
             // count `release` returns.
@@ -14681,6 +14731,12 @@ impl Filesystem for SqueezefsFilesystem {
         if self.reclaim_inflight.contains_sync(&inode) {
             self.remove_open(inode);
             return Err(Errno::from(libc::ENOENT));
+        }
+        // generic/451: a buffered open means the kernel may instantiate
+        // (and, under FOPEN_KEEP_CACHE, retain) pages for this ino — arm
+        // the DIO-write coherence gate. Swept at final FORGET.
+        if flags & (libc::O_DIRECT as u32) == 0 {
+            let _ = self.page_cache_inos.insert_sync(inode);
         }
         // File handle is just the inode number for simplicity in this design
         Ok(ReplyOpen {

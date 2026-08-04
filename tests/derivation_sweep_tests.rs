@@ -605,3 +605,139 @@ fn ipc_per_uid_session_cap_monotone_in_arena() {
         last = got;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Derivation-debt audit (2026-08-04; user directive verbatim: "nothing
+// should be a hard coded set number maybe a percentage or calculation but
+// never just 8..."): every remaining bare number either gets ONE
+// definition site (tied here, drift-is-red) or a documented reason on the
+// line. Evidence note: `.benchmarks/2026-08-04-derivation-debt-audit.md`.
+// ---------------------------------------------------------------------------
+
+/// DEBT-1 — the population target's ×8 is the EXA canon iodepth, and the
+/// canon now has ONE definition ([`mem_budget::EXA_CANON_QD`]): the fio
+/// canon files (`tests/fio/run_fio_row.sh` runner default + every
+/// `exa_client_perf.sh` battery row) must carry the SAME qd, so the "8"
+/// in the matched-inflight slope, the runner, and the battery can never
+/// drift apart silently. The canon itself is an external instrument's
+/// dims (shape parity with the DDN exa-client validation kit — a fact
+/// about the instrument, not tuning).
+#[test]
+fn exa_canon_qd_has_one_definition_tied_to_the_fio_canon() {
+    use mem_budget::{ipc_session_population_target, EXA_CANON_QD};
+    // The canon pin (an instrument fact — changing it is a canon change,
+    // which must be a conscious act across the fio files AND this const).
+    assert_eq!(EXA_CANON_QD, 8, "the EXA canon iodepth changed — re-derive");
+    // The population slope IS the canon: cpus × qd above the floor.
+    assert_eq!(
+        ipc_session_population_target(32),
+        32 * EXA_CANON_QD,
+        "the matched-inflight slope must be cpus × EXA_CANON_QD"
+    );
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    // The runner's default iodepth (tests/fio/run_fio_row.sh).
+    let runner = std::fs::read_to_string(root.join("tests/fio/run_fio_row.sh"))
+        .expect("tests/fio/run_fio_row.sh must exist — the fio canon moved?");
+    let runner_qd = runner
+        .lines()
+        .find_map(|l| {
+            let (_, rest) = l.split_once("IODEPTH=\"")?;
+            rest.split_once('"')?.0.parse::<u64>().ok()
+        })
+        .expect("run_fio_row.sh carries no IODEPTH=\"N\" default");
+    assert_eq!(
+        runner_qd, EXA_CANON_QD,
+        "run_fio_row.sh's IODEPTH default drifted from the canon const"
+    );
+    // Every exa battery row (exa_client_perf.sh: name|job|class|bs|qd|…).
+    let battery = std::fs::read_to_string(root.join("tests/fio/exa_client_perf.sh"))
+        .expect("tests/fio/exa_client_perf.sh must exist — the fio canon moved?");
+    let mut rows = 0;
+    for line in battery.lines() {
+        let mut f = line.split('|');
+        let name = f.next().unwrap_or("");
+        if !matches!(name, "write_bw" | "read_bw" | "randwrite" | "randread") {
+            continue;
+        }
+        let qd: u64 = f
+            .nth(3)
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| panic!("battery row {name} has no parseable qd column"));
+        assert_eq!(qd, EXA_CANON_QD, "battery row {name} drifted from the canon");
+        rows += 1;
+    }
+    assert_eq!(rows, 4, "the exa battery no longer carries its four canon rows");
+}
+
+/// DEBT-2 — the rewrite-epoch idle-close horizon really derives from the
+/// layout metadata cache's time-to-idle: both now read ONE constant
+/// (`routing::METADATA_CACHE_TTI_SECS`) instead of the pre-audit shape
+/// (the horizon spelled `300_000 / 10` while the cache builder carried
+/// its own bare `Duration::from_secs(300)` — a claimed derivation whose
+/// input had no definition site).
+#[test]
+fn metadata_cache_tti_has_one_definition_and_derives_the_idle_horizon() {
+    use squeezefs::routing;
+    // The horizon pin: a TTI change is a cache-posture change (time
+    // horizon, not a resource cap) and must be conscious.
+    assert_eq!(routing::METADATA_CACHE_TTI_SECS, 300);
+    // The derivation (KD-1.6): idle-close horizon = TTI ÷ 10.
+    assert_eq!(
+        routing::EPOCH_IDLE_HORIZON_MS,
+        routing::METADATA_CACHE_TTI_SECS * 1000 / 10
+    );
+    assert_eq!(routing::EPOCH_IDLE_HORIZON_MS, 30_000);
+}
+
+/// DEBT-3 — the read path's 256 KiB size-class boundary has ONE
+/// definition (`routing::READ_SIZE_CLASS_BOUNDARY_BYTES`): the R1b
+/// always-admit arm, the R4 RAM-LRU-vs-hot-tier split, and the read-lane
+/// hold's participation floor are the SAME boundary (design-read-path
+/// §5.3/§5.4; the hold's doc always said "mirrored" — mirroring by
+/// retyping the literal is exactly the drift class this audit deletes).
+#[test]
+fn read_size_class_boundary_has_one_definition() {
+    use squeezefs::{read_lane, routing};
+    assert_eq!(routing::READ_SIZE_CLASS_BOUNDARY_BYTES, 256 * 1024);
+    assert_eq!(
+        read_lane::READ_LANE_MIN_FILL_BYTES,
+        routing::READ_SIZE_CLASS_BOUNDARY_BYTES,
+        "the hold's participation floor must BE the read size-class boundary"
+    );
+}
+
+/// DEBT-4 — the zcrx lane's derived geometry is a PURE function of the
+/// process core count (`probe::lane_geometry`), pinned on the canonical
+/// shapes: queues = `clamp(cpus/8, 1, LANE_IO_QUEUES_MAX)` (the §8
+/// slope; the NIC-derived `nic_queues/4` ceiling applies at steering),
+/// depth = `clamp(cpus × 2, 4, 64)` (§8's `derived_inflight` clamp; the
+/// slope is the documented INTERIM stand-in for the unbuilt BDP probe,
+/// and CAP.MQES still clamps at connect).
+#[test]
+fn zcrx_lane_geometry_is_pinned_on_canonical_shapes() {
+    use squeezefs::zcrx_lane::probe::{lane_geometry, LANE_IO_QUEUES_MAX};
+    assert_eq!(lane_geometry(32), (4, 64), "field shape: 32-CPU client");
+    assert_eq!(lane_geometry(2), (1, 4), "floor shape: physical minima");
+    assert_eq!(lane_geometry(1), (1, 4));
+    assert_eq!(lane_geometry(8), (1, 16));
+    assert_eq!(
+        lane_geometry(192),
+        (LANE_IO_QUEUES_MAX, 64),
+        "big boxes rail at the pre-steering want bound"
+    );
+    assert_eq!(LANE_IO_QUEUES_MAX, 8, "want-bound drift — re-derive the area math");
+}
+
+/// DEBT-5 — the lane's per-command transfer cap IS the FUSE transport's
+/// payload face: `LANE_MAX_XFER_CAP_BYTES` is DEFINED from fuse3's
+/// [`PAYLOAD_BASE`] (yesterday's shipped 1 MiB ent — the largest single
+/// destination a lane dest-serve fills in one command today), so the two
+/// 1 MiB literals can never drift apart. The value pin makes a fuse3
+/// payload-floor change show up HERE as a conscious lane re-derivation.
+#[test]
+fn zcrx_lane_xfer_cap_is_the_transport_payload_face() {
+    use fuse3::raw::connection::fuse_over_uring::PAYLOAD_BASE;
+    use squeezefs::zcrx_lane::probe::LANE_MAX_XFER_CAP_BYTES;
+    assert_eq!(LANE_MAX_XFER_CAP_BYTES as usize, PAYLOAD_BASE);
+    assert_eq!(LANE_MAX_XFER_CAP_BYTES, 1024 * 1024, "Z2-benched MDTS face");
+}

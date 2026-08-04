@@ -10898,7 +10898,6 @@ impl SqueezefsFilesystem {
                     METRICS
                         .write_through_bytes
                         .fetch_add(block_size, Ordering::Relaxed);
-                    drop(block_guard);
                     // TEST SEAM: the tail-vs-writer overlap window — see
                     // `set_test_inval_tail_stall_ms`.
                     {
@@ -10907,12 +10906,30 @@ impl SqueezefsFilesystem {
                             tokio::time::sleep(std::time::Duration::from_millis(stall)).await;
                         }
                     }
+                    // The tail runs UNDER the still-held guard (the
+                    // 2026-08-04 field crash fix — the squeeze-test 13:10
+                    // battery, `tests/pipeline_inval_tail_race_tests.rs`):
+                    // dropped first, the tail's second overlay retire and
+                    // its staged-sibling remove raced a new same-block
+                    // writer that had taken the freed lock and parked a
+                    // fresh entry — retiring it out from under the held
+                    // lock (the `parked entry cannot vanish` handler
+                    // panic = a lost FUSE reply = mount death), or worse,
+                    // removing the new write's staged custody (silent
+                    // acked-byte loss). Every OTHER tail caller already
+                    // runs it under the caller's guard (the
+                    // upload_full_block_sized family) — this was the one
+                    // unguarded site. Lock-order: the tail takes only the
+                    // staging-shard hop + moka removes, both legal under
+                    // (3); the epoch close below stays OUTSIDE the guard
+                    // (it takes (3.5) and frees — the RES-1 posture).
                     if let Err(e) = self.upload_invalidation_tail(ino, b).await {
                         warn!(
                             "pipeline upload invalidation tail for ino {ino} block {b} \
                              failed ({e:?}); tiers converge via the purge-on-free law"
                         );
                     }
+                    drop(block_guard);
                     if epoch_coverage {
                         // Idea 1 full-coverage auto-close (KD-1.6).
                         if let Err(e) = self.router.close_rewrite_epoch(ino, fencing_token).await {

@@ -3359,6 +3359,15 @@ pub struct DataRouterInner {
     /// persists that map DRAINS it into the same transaction. A failed
     /// commit re-notes them, exactly like the dirty-layout refill.
     ///
+    /// **The drain law (Vector B, rc-manifest §3d item 4): notes drain
+    /// only into saves that persist the WHOLE map.** Their presence
+    /// forces a publish-class save off the O(batch) layout-delta path
+    /// (`save_metadata_to_backend_ext`'s eligibility ladder): a
+    /// delta-class commit persists only its own `publish_entries`, so
+    /// carrying the notes would durably claim releases/takes for shadow
+    /// bindings its folded map does not reflect — crash ⇒ fsck C8 drift
+    /// on a bit-8-stamped volume.
+    ///
     /// Bounded by inos with unsaved map changes × entries changed; drained
     /// by the persist that follows, and the drain removes the key.
     pub(crate) pending_block_refs:
@@ -5358,7 +5367,28 @@ impl DataRouter {
         // a site that mutated the map and left it dirty happened before the
         // save that persists it), so a take-then-release sequence on one
         // index keeps its order.
+        //
+        // **Vector B closure (rc-manifest §3d item 4, the 2026-08-04
+        // shadow-supersession finding's stamped-bit-8 crash window):
+        // deferred notes may drain only into a save that persists the WHOLE
+        // map.** The deferring site persisted nothing — its bindings live
+        // in the accumulated RAM map, not in this save's `publish_entries`
+        // — so a delta-class commit carrying the notes durably claims
+        // releases/takes its folded map does not reflect, and a crash
+        // inside that window leaves fsck C8 drift. Their presence therefore
+        // forces the save off the O(batch) delta path (the eligibility
+        // clause below): the caller must decide, because delta-vs-full is
+        // otherwise the BACKEND's verdict (`merge_layout_and_size` →
+        // `use_delta`), made after the refs are already staged into the tx
+        // — and leaving the notes pending instead would drift the OTHER way
+        // whenever the backend's fallback full-Put persisted the bindings
+        // without their ledger records. The forced full save is the notes'
+        // immediate carrier (no starvation window), and the next
+        // publish re-enters the delta economy with the chain re-based.
+        // Pinned by `tests/durable_block_refs_tests.rs` (the Vector B
+        // section).
         let deferred = self.take_block_ref_ops(ino);
+        let has_deferred_refs = !deferred.is_empty();
         let mut refs: Vec<crate::meta_backend::kv::block_refs::BlockRefOp> =
             Vec::with_capacity(deferred.len() + block_refs.len() + 2);
         refs.extend(deferred);
@@ -5392,6 +5422,10 @@ impl DataRouter {
 
         let max_chain = layout_delta_max_chain();
         let delta_eligible = publish_entries.is_some()
+            // Vector B: drained deferred notes describe map changes outside
+            // this save's entries — they ride full-save-class commits only
+            // (see the drain comment above).
+            && !has_deferred_refs
             && !needs_indirect
             && max_chain > 0
             && m.layout_delta_chain < max_chain

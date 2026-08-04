@@ -344,14 +344,7 @@ async fn stats_snapshot_protocol_holds_across_handler_clones() {
         .await
         .expect("head read");
     let tail = q_c
-        .read(
-            req,
-            STATS_INODE,
-            opened.fh,
-            4096,
-            16 * 1024 * 1024,
-            0,
-        )
+        .read(req, STATS_INODE, opened.fh, 4096, 16 * 1024 * 1024, 0)
         .await
         .expect("tail read");
     let mut joined = head.data.to_vec();

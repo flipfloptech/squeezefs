@@ -5428,10 +5428,21 @@ pub struct SqueezefsFilesystem {
     fold_tx: tokio::sync::mpsc::Sender<(u64, u32)>,
     fold_rx: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<(u64, u32)>>>>,
     fold_worker_started: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    pub open_virtual_files: dashmap::DashMap<u64, Vec<u8>, ahash::RandomState>,
-    pub next_virtual_fh: std::sync::atomic::AtomicU64,
-    pub latest_stats_json: arc_swap::ArcSwap<Option<std::sync::Arc<Vec<u8>>>>,
-    pub latest_config_json: arc_swap::ArcSwap<Option<std::sync::Arc<Vec<u8>>>>,
+    /// Virtual-inode snapshot state — ALL of it shared across handler
+    /// clones (`Arc`, the `kernel_notify` one-cell law; the 2026-08-04
+    /// cross-clone tear fix, pinned by
+    /// `metrics_tests::stats_snapshot_protocol_holds_across_handler_clones`):
+    /// the live session serves each over-uring queue from its own clone,
+    /// so an OPEN's pinned generation (fh → bytes), the published
+    /// last-generation cells, and the fh mint counter must be ONE
+    /// instance — split copies served GETATTR sizes and READ bytes from
+    /// different generations (`cat` clamped at the stale size and tore
+    /// the JSON mid-string on every busy mount) and could mint the same
+    /// fh on two queues.
+    pub open_virtual_files: std::sync::Arc<dashmap::DashMap<u64, Vec<u8>, ahash::RandomState>>,
+    pub next_virtual_fh: std::sync::Arc<AtomicU64>,
+    pub latest_stats_json: std::sync::Arc<arc_swap::ArcSwap<Option<std::sync::Arc<Vec<u8>>>>>,
+    pub latest_config_json: std::sync::Arc<arc_swap::ArcSwap<Option<std::sync::Arc<Vec<u8>>>>>,
     /// Byte length of the most recently PUBLISHED (lookup/first-touch) or
     /// PINNED (open) `.stats` generation — what GETATTR reports (0 = never
     /// generated). The kernel copies exactly `i_size` bytes out of a
@@ -5599,12 +5610,13 @@ impl Clone for SqueezefsFilesystem {
             fold_tx: self.fold_tx.clone(),
             fold_rx: self.fold_rx.clone(),
             fold_worker_started: self.fold_worker_started.clone(),
+            // Virtual-inode snapshot state: share the ONE instance (the
+            // kernel_notify one-cell law) — the pre-fix per-clone deep
+            // copies/split cells are the 2026-08-04 cross-clone tear.
             open_virtual_files: self.open_virtual_files.clone(),
-            next_virtual_fh: std::sync::atomic::AtomicU64::new(
-                self.next_virtual_fh.load(Ordering::Relaxed),
-            ),
-            latest_stats_json: arc_swap::ArcSwap::new(self.latest_stats_json.load_full()),
-            latest_config_json: arc_swap::ArcSwap::new(self.latest_config_json.load_full()),
+            next_virtual_fh: self.next_virtual_fh.clone(),
+            latest_stats_json: self.latest_stats_json.clone(),
+            latest_config_json: self.latest_config_json.clone(),
             latest_stats_size: self.latest_stats_size.clone(),
             latest_config_size: self.latest_config_size.clone(),
             inodes_limit: self.inodes_limit.clone(),
@@ -5741,10 +5753,18 @@ impl SqueezefsFilesystem {
             fold_tx,
             fold_rx: std::sync::Arc::new(std::sync::Mutex::new(Some(fold_rx))),
             fold_worker_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            open_virtual_files: dashmap::DashMap::with_hasher(ahash::RandomState::new()),
-            next_virtual_fh: std::sync::atomic::AtomicU64::new(0x1000_0000_0000_0000),
-            latest_stats_json: arc_swap::ArcSwap::new(std::sync::Arc::new(None)),
-            latest_config_json: arc_swap::ArcSwap::new(std::sync::Arc::new(None)),
+            open_virtual_files: std::sync::Arc::new(dashmap::DashMap::with_hasher(
+                ahash::RandomState::new(),
+            )),
+            next_virtual_fh: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                0x1000_0000_0000_0000,
+            )),
+            latest_stats_json: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(
+                None,
+            ))),
+            latest_config_json: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(
+                None,
+            ))),
             latest_stats_size: std::sync::Arc::new(AtomicU64::new(0)),
             latest_config_size: std::sync::Arc::new(AtomicU64::new(0)),
             inodes_limit: std::sync::Arc::new(std::sync::OnceLock::new()),

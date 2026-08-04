@@ -6,6 +6,7 @@
 //! safe; every test restores the env it touches.
 
 use squeezefs::zcrx_lane::{area, initiator::LaneTarget, pdu, probe, LaneBackend, LaneSession};
+use squeezefs_testkit::skip;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -127,8 +128,32 @@ async fn mock_conn(mut s: TcpStream, device: Arc<Vec<u8>>, cfg: MockCfg) -> Opti
                 let fctype = sqe[4];
                 match fctype {
                     0x01 => {
-                        // Connect: validate in-capsule data geometry.
-                        let data = &rest[64..64 + 4096];
+                        // Connect: validate in-capsule data geometry with real
+                        // nvmet's strictness (fabrics-cmd.c): the Connect data
+                        // is EXACTLY `sizeof(struct nvmf_connect_data)` = 1024
+                        // bytes, and `nvmet_check_transfer_len` refuses any
+                        // other SGL/transfer length with Data SGL Length
+                        // Invalid | DNR = 0x400f — the 2026-08-04 field
+                        // refusal this mock used to be too permissive to
+                        // catch (it accepted the retired 4096-byte blob).
+                        // The refusal is a CQE, never a mock panic: it is the
+                        // live-target behavior under test.
+                        assert_eq!(
+                            sqe[39], 0x01,
+                            "connect data must ride the in-capsule offset SGL"
+                        );
+                        let sgl_len = le32(&sqe[32..36]) as usize;
+                        let icd = &rest[64..];
+                        assert_eq!(
+                            icd.len(),
+                            sgl_len,
+                            "in-capsule bytes must match the SGL length"
+                        );
+                        if sgl_len != 1024 {
+                            s.write_all(&capsule_resp(cid, 0, 0x400F)).await.ok()?;
+                            continue;
+                        }
+                        let data = icd;
                         let subnqn = std::str::from_utf8(&data[256..512])
                             .unwrap()
                             .trim_end_matches('\0');
@@ -350,10 +375,21 @@ fn test_codec_common_header_roundtrip() {
 fn test_codec_connect_capsule_layout() {
     let hostid = [7u8; 16];
     let c = pdu::encode_connect_capsule(3, 63, 0, 9, &hostid, 0xBEEF, "nqn.sub", "nqn.host");
-    assert_eq!(c.len(), 72 + 4096);
+    // The Connect data blob is EXACTLY 1024 bytes — the NVMe-oF
+    // `struct nvmf_connect_data` (hostid 16 + cntlid 2 + resv 238 +
+    // subsysnqn 256 + hostnqn 256 + resv 256). Real nvmet enforces it
+    // (`nvmet_check_transfer_len`) and refuses anything else with
+    // 0x400f (Data SGL Length Invalid, DNR) — the 2026-08-04 field
+    // arm-refusal: the encoder shipped a 4096-byte blob.
+    assert_eq!(
+        pdu::CONNECT_DATA_LEN,
+        1024,
+        "sizeof(struct nvmf_connect_data)"
+    );
+    assert_eq!(c.len(), 72 + 1024);
     assert_eq!(c[0], pdu::PDU_CAPSULE_CMD);
     assert_eq!(c[3], 72, "pdo must point at the in-capsule data");
-    assert_eq!(u32::from_le_bytes([c[4], c[5], c[6], c[7]]), 72 + 4096);
+    assert_eq!(u32::from_le_bytes([c[4], c[5], c[6], c[7]]), 72 + 1024);
     let sqe = &c[8..72];
     assert_eq!(sqe[0], pdu::OPC_FABRICS);
     assert_eq!(sqe[4], pdu::FCTYPE_CONNECT);
@@ -362,11 +398,42 @@ fn test_codec_connect_capsule_layout() {
     assert_eq!(le16(&sqe[44..46]), 63, "sqsize (0-based)");
     assert_eq!(le32(&sqe[48..52]), 0, "kato");
     assert_eq!(sqe[39], 0x01, "in-capsule SGL descriptor type");
+    assert_eq!(
+        le32(&sqe[32..36]),
+        1024,
+        "SGL length = the connect data size"
+    );
     let data = &c[72..];
     assert_eq!(&data[0..16], &hostid);
     assert_eq!(le16(&data[16..18]), 0xBEEF, "cntlid rides the connect data");
     assert_eq!(&data[256..263], b"nqn.sub");
     assert_eq!(&data[512..520], b"nqn.host");
+}
+
+#[test]
+fn test_codec_status_decode_names_sct_sc_dnr() {
+    // The field session cost of a raw hex: "controller status 0x400f"
+    // named nothing. The decoder must render SCT/SC/DNR with the known
+    // names on the codes this initiator can actually meet.
+    let s = pdu::describe_status(0x400F);
+    assert!(s.contains("0x400f"), "raw hex stays greppable: {s}");
+    assert!(s.contains("Data SGL Length Invalid"), "{s}");
+    assert!(s.contains("SCT=0x0"), "{s}");
+    assert!(s.contains("SC=0x0f"), "{s}");
+    assert!(s.contains("DNR"), "{s}");
+
+    // The fabrics Connect refusal class (SCT=1, SC=0x82, DNR).
+    let s = pdu::describe_status(0x4182);
+    assert!(s.contains("Connect Invalid Parameters"), "{s}");
+    assert!(s.contains("SCT=0x1"), "{s}");
+    assert!(s.contains("SC=0x82"), "{s}");
+    assert!(s.contains("DNR"), "{s}");
+
+    // Unknown codes stay honest (no invented name), still decoded.
+    let s = pdu::describe_status(0x0177);
+    assert!(s.contains("SCT=0x1"), "{s}");
+    assert!(s.contains("SC=0x77"), "{s}");
+    assert!(!s.contains("DNR"), "no DNR bit set: {s}");
 }
 
 #[test]
@@ -1659,4 +1726,171 @@ async fn test_z3_dest_lane_error_falls_back_to_kernel_path() {
     );
     assert_eq!(zcrx_metric("dest_gather_bytes"), before_dest_gather);
     drop(dest_bytes);
+}
+
+// ------------------------------------------------ mock/nvmet strictness parity
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_mock_refuses_oversize_connect_data_like_nvmet() {
+    // The gap that let the 2026-08-04 field failure ship: the mock accepted
+    // ANY connect data length, while real nvmet checks the Connect transfer
+    // length against `sizeof(struct nvmf_connect_data)` = 1024 and refuses
+    // everything else with Data SGL Length Invalid | DNR = 0x400f
+    // (`nvmet_check_transfer_len`, fabrics-cmd.c). The tightened mock must
+    // refuse the RETIRED 4096-byte wire form with the field's exact status —
+    // a mock that stays permissive re-opens the gap.
+    let mock = MockTarget::start(MockCfg::default(), 4096).await;
+    let mut s = TcpStream::connect(("127.0.0.1", mock.port)).await.unwrap();
+    s.write_all(&pdu::encode_icreq()).await.unwrap();
+    let mut icresp = [0u8; 128];
+    s.read_exact(&mut icresp).await.unwrap();
+    pdu::parse_icresp(&icresp).expect("mock ICResp");
+
+    // The retired wire form: stretch the connect data blob to 4096 bytes
+    // and re-stamp plen + the in-capsule SGL length (byte-identical to what
+    // the pre-fix encoder shipped).
+    let mut old =
+        pdu::encode_connect_capsule(0, 31, 0, 7, &[9u8; 16], 0xFFFF, MOCK_SUBNQN, "nqn.host");
+    old.resize(72 + 4096, 0);
+    old[4..8].copy_from_slice(&((72 + 4096) as u32).to_le_bytes());
+    old[8 + 32..8 + 36].copy_from_slice(&4096u32.to_le_bytes());
+    s.write_all(&old).await.unwrap();
+
+    let mut resp = [0u8; 24];
+    s.read_exact(&mut resp).await.unwrap();
+    let ch = pdu::parse_common(&resp[..8]).unwrap();
+    assert_eq!(ch.pdu_type, pdu::PDU_CAPSULE_RESP);
+    let cqe = pdu::parse_cqe(&resp[8..24]).unwrap();
+    assert_eq!(cqe.cid, 7);
+    assert_eq!(
+        cqe.status,
+        0x400F,
+        "the mock must refuse the oversize connect data the way real nvmet \
+         does (Data SGL Length Invalid | DNR), got {}",
+        pdu::describe_status(cqe.status)
+    );
+}
+
+// ----------------------------------------------------- live nvmet-tcp venue
+
+/// Resolve a live NVMe/TCP lane target: the documented dev seam
+/// (`SQUEEZEFS_ZCRX_LANE_TARGET`) when set, else the kernel initiator's own
+/// sysfs attachment to a devsub-tcp namespace (`tests/dev_substrate.sh`
+/// under `SQZ_DEVSUB_TRANSPORT=tcp` — subsystem NQNs
+/// `nqn.2026-07.io.squeezefs:devsubtcp-*` on 127.0.0.1). Returns the target
+/// plus the kernel block device path when sysfs named one (the byte-parity
+/// witness for root runs).
+fn live_devsub_target() -> Option<(LaneTarget, Option<String>)> {
+    if let Some(t) = squeezefs::zcrx_lane::lane_target_override() {
+        return Some((t, None));
+    }
+    // Walk /sys/block for plain nvme<C>n<N> names (the multipath c-path
+    // `nvme<C>c<X>n<N>` children under the controller dir never match —
+    // the probe itself is /sys/block + /sys/class/nvme based).
+    let mut namespaces: Vec<String> = std::fs::read_dir("/sys/block")
+        .ok()?
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| {
+            n.strip_prefix("nvme").is_some_and(|r| {
+                r.split_once('n').is_some_and(|(c, ns)| {
+                    !c.is_empty()
+                        && !ns.is_empty()
+                        && c.bytes().all(|b| b.is_ascii_digit())
+                        && ns.bytes().all(|b| b.is_ascii_digit())
+                })
+            })
+        })
+        .collect();
+    namespaces.sort();
+    for ns in namespaces {
+        let Some((ctrl_num, _)) = ns.strip_prefix("nvme").and_then(|r| r.split_once('n')) else {
+            continue;
+        };
+        let dir = std::path::Path::new("/sys/class/nvme").join(format!("nvme{ctrl_num}"));
+        let read = |n: &str| {
+            std::fs::read_to_string(dir.join(n))
+                .ok()
+                .map(|s| s.trim().to_string())
+        };
+        if read("transport").as_deref() != Some("tcp") {
+            continue;
+        }
+        if !read("subsysnqn")
+            .is_some_and(|nqn| nqn.starts_with("nqn.2026-07.io.squeezefs:devsubtcp"))
+        {
+            continue;
+        }
+        let dev = format!("/dev/{ns}");
+        if let Some(t) = probe::nvme_tcp_target_for(&dev) {
+            return Some((t, Some(dev)));
+        }
+    }
+    None
+}
+
+/// The standing LOCAL venue for the 2026-08-04 field refusal ("admin Connect
+/// failed: controller status 0x400f" on every armable data device): REAL
+/// nvmet-tcp — not the mock — must accept the lane's association, and one
+/// read must round-trip. The red form of this test reproduced the field
+/// failure byte-exactly: the encoder shipped a 4096-byte Connect data blob
+/// where the NVMe-oF Connect data is EXACTLY 1024 bytes
+/// (`struct nvmf_connect_data`), which nvmet refuses with Data SGL Length
+/// Invalid | DNR (`nvmet_check_transfer_len`) while the then-permissive
+/// mock accepted it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_live_nvmet_tcp_association_and_read_roundtrip() {
+    let Some((mut target, dev_path)) = live_devsub_target() else {
+        skip!(
+            Hardware,
+            "no live devsub-tcp nvmet target (sudo SQZ_DEVSUB_TRANSPORT=tcp \
+             tests/dev_substrate.sh create) and no SQUEEZEFS_ZCRX_LANE_TARGET \
+             override"
+        );
+    };
+    // Test-scoped geometry: bounded bring-up on the shared substrate.
+    target.io_queues = 2;
+    target.queue_depth = 8;
+    let sess = LaneSession::connect(target.clone())
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "REAL nvmet refused the lane association against {}:{} ({}): {e} \
+                 — the 2026-08-04 field failure class (wherever this diverges \
+                 from the mock suite, the mock is too permissive)",
+                target.traddr, target.trsvcid, target.subnqn
+            )
+        });
+
+    let len = 2usize << target.lba_shift;
+    let mut first = vec![0u8; len];
+    sess.read_into_slice(0, &mut first)
+        .await
+        .expect("lane read against real nvmet");
+    let mut second = vec![0u8; len];
+    sess.read_into_slice(0, &mut second)
+        .await
+        .expect("second lane read against real nvmet");
+    assert_eq!(first, second, "lane reads of one LBA range must be stable");
+
+    // Byte-parity witness when the kernel initiator's device node is
+    // readable (root runs): the lane must serve the SAME bytes the kernel
+    // path serves.
+    if let Some(dev) = dev_path {
+        if let Ok(mut f) = std::fs::File::open(&dev) {
+            use std::io::Read;
+            let mut kernel_view = vec![0u8; len];
+            f.read_exact(&mut kernel_view)
+                .expect("kernel-initiator read of the same range");
+            assert_eq!(
+                first, kernel_view,
+                "lane bytes must equal the kernel initiator's view of {dev}"
+            );
+        }
+    }
+
+    assert!(!sess.poisoned(), "association must stay healthy");
+    let (free, total) = sess.cid_slots();
+    assert_eq!(free, total, "CID custody must close at quiescence");
+    sess.quiesce().await;
 }

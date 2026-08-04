@@ -201,8 +201,8 @@ impl FillTable {
         if cqe.status != 0 {
             if let Some(tx) = p.tx.take() {
                 let _ = tx.send(Err(io_err(format!(
-                    "lane read failed: controller status {:#06x}",
-                    cqe.status
+                    "lane read failed: {}",
+                    pdu::describe_status(cqe.status)
                 ))));
             }
             return Ok(());

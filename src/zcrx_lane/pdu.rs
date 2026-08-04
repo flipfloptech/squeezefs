@@ -252,6 +252,69 @@ pub fn encode_read_capsule(cid: u16, nsid: u32, slba: u64, nlb: u32, xfer_len: u
     pdu
 }
 
+/// Render a CQE Status Field ([`Cqe::status`] — post-phase-strip: DNR bit
+/// 14, MORE bit 13, SCT bits 10:8, SC bits 7:0) with its SCT/SC
+/// decomposition, the known name where this initiator's surface can meet
+/// the code, and the DNR/MORE bits. A raw hex cost a field session
+/// (2026-08-04: "controller status 0x400f" named nothing — it is nvmet's
+/// `nvmet_check_transfer_len` refusal, Data SGL Length Invalid + DNR).
+pub fn describe_status(sf: u16) -> String {
+    let sc = (sf & 0xFF) as u8;
+    let sct = ((sf >> 8) & 0x7) as u8;
+    let sct_name = match sct {
+        0 => "generic",
+        1 => "command-specific/fabrics",
+        2 => "media/data-integrity",
+        3 => "path-related",
+        7 => "vendor-specific",
+        _ => "reserved",
+    };
+    let mut out = format!("controller status {sf:#06x} (SCT={sct:#x} {sct_name}, SC={sc:#04x}");
+    if let Some(name) = status_name(sct, sc) {
+        out.push(' ');
+        out.push_str(name);
+    }
+    if sf & (1 << 13) != 0 {
+        out.push_str(", MORE");
+    }
+    if sf & (1 << 14) != 0 {
+        out.push_str(", DNR");
+    }
+    out.push(')');
+    out
+}
+
+/// Names for the status codes the lane's read-only fabrics surface can
+/// actually meet (the connect/property ladder + NVM Read) — honest `None`
+/// for the rest, never an invented name.
+fn status_name(sct: u8, sc: u8) -> Option<&'static str> {
+    match (sct, sc) {
+        (0, 0x00) => Some("Success"),
+        (0, 0x01) => Some("Invalid Command Opcode"),
+        (0, 0x02) => Some("Invalid Field in Command"),
+        (0, 0x03) => Some("Command ID Conflict"),
+        (0, 0x04) => Some("Data Transfer Error"),
+        (0, 0x06) => Some("Internal Error"),
+        (0, 0x0B) => Some("Invalid Namespace or Format"),
+        (0, 0x0C) => Some("Command Sequence Error"),
+        (0, 0x0D) => Some("Invalid SGL Segment Descriptor"),
+        (0, 0x0E) => Some("Invalid Number of SGL Descriptors"),
+        (0, 0x0F) => Some("Data SGL Length Invalid"),
+        (0, 0x10) => Some("Metadata SGL Length Invalid"),
+        (0, 0x11) => Some("SGL Descriptor Type Invalid"),
+        (0, 0x80) => Some("LBA Out of Range"),
+        (0, 0x81) => Some("Capacity Exceeded"),
+        (0, 0x82) => Some("Namespace Not Ready"),
+        (1, 0x80) => Some("Connect Incompatible Format"),
+        (1, 0x81) => Some("Connect Controller Busy"),
+        (1, 0x82) => Some("Connect Invalid Parameters"),
+        (1, 0x83) => Some("Connect Restart Discovery"),
+        (1, 0x84) => Some("Connect Invalid Host"),
+        (2, 0x81) => Some("Unrecovered Read Error"),
+        _ => None,
+    }
+}
+
 /// Completion queue entry (16 B inside a CapsuleResp).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cqe {

@@ -295,8 +295,8 @@ async fn ic_exchange(stream: &mut TcpStream) -> Result<pdu::IcResp> {
 fn check_status(op: &str, cqe: &pdu::Cqe) -> Result<()> {
     if cqe.status != 0 {
         return Err(io_err(format!(
-            "{op} failed: controller status {:#06x}",
-            cqe.status
+            "{op} failed: {}",
+            pdu::describe_status(cqe.status)
         )));
     }
     Ok(())
@@ -1191,8 +1191,8 @@ async fn reader_loop(
                 if cqe.status != 0 {
                     if let Some(tx) = p.tx.take() {
                         let _ = tx.send(Err(io_err(format!(
-                            "lane read failed: controller status {:#06x}",
-                            cqe.status
+                            "lane read failed: {}",
+                            pdu::describe_status(cqe.status)
                         ))));
                     }
                 } else {

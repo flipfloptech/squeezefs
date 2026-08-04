@@ -493,9 +493,14 @@ mod storm {
     impl Drop for Mount {
         fn drop(&mut self) {
             // Best-effort teardown if an assertion fired mid-test.
+            // Drop-time double-unmount: already-unmounted is the EXPECTED
+            // case — silence the mtab noise; the explicit unmount path
+            // stays loud.
             let _ = Command::new("fusermount3")
                 .arg("-uz")
                 .arg(&self.mnt)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .status();
             let _ = self.child.kill();
             let _ = self.child.wait();

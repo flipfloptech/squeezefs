@@ -591,9 +591,13 @@ impl CliMount {
 
 impl Drop for CliMount {
     fn drop(&mut self) {
+        // Drop-time double-unmount: already-unmounted is the EXPECTED case —
+        // silence the mtab noise; the explicit unmount path stays loud.
         let _ = std::process::Command::new("fusermount3")
             .arg("-uz")
             .arg(&self.mnt)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status();
         let _ = self.child.kill();
         let _ = self.child.wait();

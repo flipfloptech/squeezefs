@@ -516,6 +516,13 @@ receives nothing until the push closes. Measurement binaries deploy from the
 wave branch. The push's exit = the performance board below at target, then
 ONE full gate + the external suites sweep bugs before the wave merges.
 
+Quantified targets (user, 2026-08-04): "reads closer to writes, and iops
+closer to 1 Million" — i.e. cold/mixed seq-read toward the 36-38 GB/s write
+class (from 30-31), and rand-4k toward 1 M IOPS (kernel path from 280 k;
+warm il 1.017 M is already on record, G-L4-2). Both get RAW-CEILING pricing
+rows first — a target above the substrate's own ceiling is re-negotiated
+with the numbers, never chased.
+
 Performance board (exit criteria):
 1. **zcrx Z3 field rows** — Connect fix in, lane associates on real nvmet,
    engagement laws hold; acceptance = the D5 chain's CPU/byte drop on

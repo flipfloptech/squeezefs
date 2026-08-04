@@ -20,6 +20,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 
 const SIOCETHTOOL: libc::c_ulong = 0x8946;
 
+const ETHTOOL_GFLAGS: u32 = 0x25;
 const ETHTOOL_GCHANNELS: u32 = 0x3c;
 const ETHTOOL_GRXCLSRLCNT: u32 = 0x2e;
 const ETHTOOL_GRXCLSRLALL: u32 = 0x30;
@@ -30,6 +31,20 @@ const ETHTOOL_SRSSH: u32 = 0x47;
 
 const TCP_V4_FLOW: u32 = 0x01;
 const TCP_V6_FLOW: u32 = 0x05;
+
+/// `ETH_FLAG_NTUPLE` (<linux/ethtool.h>): the legacy flags word's ntuple
+/// bit. GFLAGS is the STABLE uapi face of the `rx-ntuple-filter` feature
+/// (the kernel synthesizes it from netdev features), so the on/off probe
+/// needs no ethtool-netlink string-set walk.
+const ETH_FLAG_NTUPLE: u32 = 1 << 27;
+
+/// `struct ethtool_value` — the GFLAGS/GRXCSUM-class 2-word command.
+#[repr(C)]
+#[derive(Default)]
+struct EthtoolValue {
+    cmd: u32,
+    data: u32,
+}
 
 #[repr(C)]
 #[derive(Default)]
@@ -100,6 +115,7 @@ impl Default for EthtoolRxnfc {
 // Layout law: the mirrors must match the kernel ABI byte-for-byte
 // (verified against a compiled C probe of <linux/ethtool.h>).
 const _: () = {
+    assert!(std::mem::size_of::<EthtoolValue>() == 8);
     assert!(std::mem::size_of::<EthtoolChannels>() == 36);
     assert!(std::mem::size_of::<EthtoolRxFlowSpec>() == 168);
     assert!(std::mem::offset_of!(EthtoolRxFlowSpec, ring_cookie) == 152);
@@ -250,8 +266,13 @@ impl NicControl for EthtoolNic {
     }
 
     fn ntuple_enabled(&mut self) -> Result<bool, String> {
-        // RED PHASE: real GFLAGS probe lands with the capacity-gate fix.
-        Err("ntuple feature probe unimplemented".into())
+        let mut v = EthtoolValue {
+            cmd: ETHTOOL_GFLAGS,
+            ..Default::default()
+        };
+        self.ethtool_ioctl(&mut v as *mut _ as *mut libc::c_void)
+            .map_err(|e| format!("GFLAGS: {e}"))?;
+        Ok(v.data & ETH_FLAG_NTUPLE != 0)
     }
 
     fn ntuple_table_size(&mut self) -> Result<u32, String> {

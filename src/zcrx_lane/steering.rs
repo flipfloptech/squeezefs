@@ -73,16 +73,42 @@ pub fn lane_queue_picks(channels: u32, want: u16) -> Vec<u32> {
     (channels - take..channels).collect()
 }
 
-/// Pre-arm steering-capacity gate (field row 3, 2026-08-04): probe the
-/// ntuple FEATURE state and the rule-slot capacity BEFORE any flow rule
-/// (and, in the arm ladder, before any bring-up work). A zero-capacity
-/// NIC refuses with the exact operator remedy named on the line; the
-/// probe is READ-ONLY — the lane never flips NIC features itself.
-/// `Ok` carries the reserved loc range `[lo, hi)` (≥ 1 slot).
+/// Pre-arm steering-capacity gate (field row 3, 2026-08-04: the arm read
+/// `1 flows exceed the 0 reserved rule slots` AFTER connecting — ntuple
+/// was off via `ethtool -K`, so the driver advertised a 0-slot rule
+/// table and the refusal surfaced per-device with no remedy named):
+/// probe the ntuple FEATURE state and the rule-slot capacity BEFORE any
+/// flow rule (and, in the arm ladder, before any bring-up work). A
+/// zero-capacity NIC refuses with the exact operator remedy named on
+/// the line; the probe is READ-ONLY — the lane never flips NIC features
+/// itself. `Ok` carries the reserved loc range `[lo, hi)` (≥ 1 slot).
 pub fn steering_capacity_gate(nic: &mut dyn NicControl) -> Result<(u32, u32), String> {
-    // RED PHASE: contract pinned by tests/zcrx_lane_tests.rs.
-    let _ = nic;
-    Ok((0, STEERING_RESERVED_SLOTS))
+    let ifname = nic.ifname().to_string();
+    let on = nic
+        .ntuple_enabled()
+        .map_err(|e| format!("ntuple feature probe on {ifname}: {e}"))?;
+    if !on {
+        return Err(format!(
+            "zcrx steering: ntuple flow steering is disabled on {ifname} — the lane \
+             cannot steer its flows to dedicated ZC queues; remedy: `ethtool -K \
+             {ifname} ntuple on`, then remount (the lane never flips NIC features \
+             itself — NIC left untouched, kernel path serves)"
+        ));
+    }
+    let table = nic
+        .ntuple_table_size()
+        .map_err(|e| format!("ntuple table probe on {ifname}: {e}"))?;
+    let (lo, hi) = reserved_loc_range(table);
+    if hi - lo == 0 {
+        return Err(format!(
+            "zcrx steering: {ifname} advertises a {table}-slot ntuple rule table — \
+             0 reserved lane rule slots; remedy: `ethtool -K {ifname} ntuple on` \
+             (drivers size the rule table when the feature arms), then remount; if \
+             ntuple is already on, this driver/firmware reserves no rule slots and \
+             the NIC cannot host the lane (kernel path serves)"
+        ));
+    }
+    Ok((lo, hi))
 }
 
 /// Loud-ONCE-per-NIC refusal throttle for the arm ladder (ten fabric
@@ -90,9 +116,12 @@ pub fn steering_capacity_gate(nic: &mut dyn NicControl) -> Result<(u32, u32), St
 /// not 10×; per-DEVICE refusal caching stays the caller's OnceCell).
 /// Returns `true` exactly once per interface name per process.
 pub fn note_arm_refusal_once(ifname: &str) -> bool {
-    // RED PHASE: contract pinned by tests/zcrx_lane_tests.rs.
-    let _ = ifname;
-    true
+    static WARNED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    WARNED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(ifname.to_string())
 }
 
 /// The reserved ntuple loc range `[lo, hi)`: the top
@@ -208,10 +237,9 @@ pub fn arm_steering(nic: &mut dyn NicControl, flows: &[FlowRule]) -> Result<Stee
     let channels = nic
         .combined_channels()
         .map_err(|e| format!("channel probe on {}: {e}", nic.ifname()))?;
-    let table_size = nic
-        .ntuple_table_size()
-        .map_err(|e| format!("ntuple table probe on {}: {e}", nic.ifname()))?;
-    let (lo, hi) = reserved_loc_range(table_size);
+    // ntuple feature + rule-slot capacity BEFORE any flow rule (field
+    // row 3 — the gate names the operator remedy; still probe-only).
+    let (lo, hi) = steering_capacity_gate(nic)?;
     if flows.len() as u32 > hi - lo {
         return Err(format!(
             "zcrx steering: {} flows exceed the {} reserved rule slots on {}",

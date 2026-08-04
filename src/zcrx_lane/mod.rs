@@ -211,19 +211,43 @@ pub async fn arm_for_device(device_path: &str) -> Option<Arc<LaneSession>> {
         log::warn!("zcrx-lane: no ifindex for {ifname} — lane not armed for {device_path}");
         return None;
     };
-    let channels = match ethtool::EthtoolNic::open(&ifname)
-        .and_then(|mut nic| steering::NicControl::combined_channels(&mut nic))
-    {
-        Ok(c) => c,
+    // ONE control-socket open for the remaining NIC probes: channel
+    // count + the steering-capacity gate (field row 3, 2026-08-04:
+    // ntuple state and rule-slot capacity probe BEFORE any bring-up
+    // work — a 0-capacity NIC used to surface as a per-session
+    // post-connect arm failure with no remedy named).
+    let probed = ethtool::EthtoolNic::open(&ifname).and_then(|mut nic| {
+        let channels = steering::NicControl::combined_channels(&mut nic)?;
+        let reserved = steering::steering_capacity_gate(&mut nic)?;
+        Ok((channels, reserved))
+    });
+    let (channels, reserved) = match probed {
+        Ok(v) => v,
         Err(e) => {
-            log::warn!(
-                "zcrx-lane: channel probe on {ifname} failed ({e}) — lane not armed \
-                 for {device_path}; kernel path serves"
-            );
+            // Loud ONCE per NIC (ten fabric devices ride one NIC — the
+            // remedy prints once, not 10×); the caller's OnceCell caches
+            // the per-device refusal, so this is never per-read.
+            if steering::note_arm_refusal_once(&ifname) {
+                log::warn!(
+                    "zcrx-lane: {e} — lane not armed for {device_path}; kernel path \
+                     serves (byte-identical)"
+                );
+            } else {
+                log::debug!(
+                    "zcrx-lane: {e} — lane not armed for {device_path} (refusal \
+                     already reported for {ifname})"
+                );
+            }
             return None;
         }
     };
-    let picks = steering::lane_queue_picks(channels, target.io_queues);
+    // flows ≡ queues 1:1, so the free rule-slot count clamps the queue
+    // want the same way the §8 pool does — a queue we cannot steer is a
+    // queue we must not claim.
+    let slot_want = target
+        .io_queues
+        .min((reserved.1 - reserved.0).min(u32::from(u16::MAX)) as u16);
+    let picks = steering::lane_queue_picks(channels, slot_want);
     if picks.is_empty() {
         log::warn!(
             "zcrx-lane: {ifname} has {channels} queues — too narrow to dedicate ZC \

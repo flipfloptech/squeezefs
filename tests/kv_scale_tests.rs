@@ -43,8 +43,8 @@ use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
 use squeezefs::fuse_client::{
-    SqueezefsFilesystem, CONFIG_INODE, DIR_ENTRY_CACHE_MAX_ENTRIES, READDIR_VIRTUAL_CONFIG_COOKIE,
-    READDIR_VIRTUAL_STATS_COOKIE, STATS_INODE,
+    SqueezefsFilesystem, DIR_ENTRY_CACHE_MAX_ENTRIES, READDIR_VIRTUAL_CONFIG_COOKIE,
+    READDIR_VIRTUAL_STATS_COOKIE,
 };
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::builder::{digest_backend, BuilderConfig, ImageBuilder, ROOT_INO};
@@ -607,20 +607,34 @@ async fn fuse_readdir_v3_emits_key_cookies_and_streams() {
             .any(|(n, _, _)| n == ".config" || n == ".stats"),
         "virtual control files must not be LISTED"
     );
+    // Per-lookup virtual generations (the 2026-08-04 torn-JSON fix,
+    // `.benchmarks/2026-08-04-stats-torn-json.md`): a lookup now mints a
+    // fresh generation ino in the reserved range — the fixed canonical
+    // inos remain valid for old handles but are no longer what LOOKUP
+    // replies (the wb-cache size-authority law made fixed-ino
+    // regenerating files structurally torn).
     let stats_ino =
         h.fs.lookup(req(), 1, std::ffi::OsStr::new(".stats"))
             .await
             .expect(".stats stays lookup-able")
             .attr
             .ino;
-    assert_eq!(stats_ino, STATS_INODE);
+    assert!(
+        squeezefs::fuse_client::virtual_gen_class(stats_ino)
+            == Some(squeezefs::fuse_client::VirtualClass::Stats),
+        "lookup(.stats) mints a stats-class generation ino (got {stats_ino:#x})"
+    );
     let config_ino =
         h.fs.lookup(req(), 1, std::ffi::OsStr::new(".config"))
             .await
             .expect(".config stays lookup-able")
             .attr
             .ino;
-    assert_eq!(config_ino, CONFIG_INODE);
+    assert!(
+        squeezefs::fuse_client::virtual_gen_class(config_ino)
+            == Some(squeezefs::fuse_client::VirtualClass::Config),
+        "lookup(.config) mints a config-class generation ino (got {config_ino:#x})"
+    );
     // The historical virtual cookies stay reserved above the real space
     // (a kernel resuming from a stale pre-hide cookie must terminate,
     // not re-list) — sign-bit-clear for the i64 FUSE surface.

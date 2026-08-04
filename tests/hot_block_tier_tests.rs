@@ -440,7 +440,18 @@ async fn validated_fills_land_hot_and_nvme_hits_never_repromote() {
             .cache
             .nvme
             .cache_read_block(&k1, bytes::Bytes::from(block1.clone()));
-    assert!(h.fs.router.cache.nvme.get_cached_read_block(&k1).is_some());
+    // §3d.3 (rc-manifest.md): poll-first — the preceding >64 KiB read's
+    // fill may ride PERF-11's DEFERRED disk-tier publish (single-flight
+    // guard on the blocking pool), so tier presence immediately after the
+    // read/seed is a bounded eventually (the budget-0 template below).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while h.fs.router.cache.nvme.get_cached_read_block(&k1).is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the seeded NVMe-tier entry never became visible"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     let d = read_at(&h, ino, BS + 64 * 1024, 64 * 1024).await;
     assert_eq!(&d[..], &block1[64 * 1024..128 * 1024]);
     assert!(

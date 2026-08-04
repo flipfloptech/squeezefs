@@ -639,10 +639,19 @@ async fn test_terminal_free_purges_read_tiers() {
         .cache_read_block(&k, stale.clone())
         .unwrap();
     h.fs.router.cache.read_lru.put(&k, stale);
-    assert!(
-        h.fs.router.cache.nvme.get_cached_read_block(&k).is_some(),
-        "harness: NVMe read-cache entry must exist before the free"
-    );
+    // §3d.3 (rc-manifest.md): tier presence after a >64 KiB fill/publish is
+    // a bounded EVENTUALLY, not an immediate — since PERF-11 the disk-tier
+    // publish is DEFERRED (it rides the single-flight guard on the blocking
+    // pool), so an immediate probe races it. Poll with deadline, then
+    // assert (the hot_block_tier_tests budget-0 template).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while h.fs.router.cache.nvme.get_cached_read_block(&k).is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "harness: NVMe read-cache entry must exist before the free"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 
     // Terminal free (refcount 1 -> 0).
     h.fs.router.backend_router.free_block(&k).await.unwrap();
@@ -681,7 +690,18 @@ async fn test_validated_read_cache_publish_incarnation_gate() {
         ),
         "stable-incarnation publish must stick"
     );
-    assert!(h.fs.router.cache.nvme.get_cached_read_block(&k).is_some());
+    // §3d.3 (rc-manifest.md): poll-first — tier visibility of a >64 KiB
+    // fill/publish is a bounded eventually under PERF-11's deferred
+    // disk-tier publish; an immediate probe races it. Poll with deadline,
+    // then assert (the hot_block_tier_tests budget-0 template).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while h.fs.router.cache.nvme.get_cached_read_block(&k).is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stable-incarnation publish never became tier-visible"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 
     // (b) Retired incarnation (terminal free): the publish must NOT stick —
     // a dehydration straggler carrying the dead incarnation's bytes.

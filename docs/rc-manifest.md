@@ -559,6 +559,26 @@ luck rather than design — recorded so they are chosen work, not surprises:
    Vector A (the in-session resurrection poison, all volumes) was already
    FIXED — `tests/rewrite_shadow_supersede_tests.rs`, KD-1.11.
 
+5. **Blob-custody ops in the full-save failure refill** (found during the
+   Vector-B fix, 2026-08-04): a `needs_indirect` full save that fails after
+   allocating its CoW blob re-notes the ENTIRE refs vector — including the
+   `BLOCK_INDEX_MAP_BLOB` take for a blob the `MintedBlockGuard` frees on
+   unwind, and the release of the old blob the durable layout still names; a
+   later save drains those into a commit (ledger take for a freed offset /
+   premature release, double-release on retry). Reachable only through the
+   full-save FAILURE path with an indirect map. Fix shape: restrict the
+   refill to the map-describing subset (`deferred + block_refs`).
+6. **Fixed-deadline teardown panics in 9 mount harnesses** (the
+   wall-clock-flake class, 2026-08-04): `cache_path_policy`,
+   `mount_owner_override`, `format_guard`, `encrypt_key_handling`,
+   `phantom_backend0`, `transport_ingress`, `transport_geometry`,
+   `transport_concurrency`, `multi_queue` all carry the copy-pasted
+   "mount daemon did not exit within 30s" hard panic that
+   `cli_clients_df_tests` just retired (pidfd_open + poll, 180 s
+   non-panicking failsafe on the testkit stderr channel). The recipe ports
+   verbatim; the deeper follow-up is the volume-drain adjudication's
+   "shared, not copy-pasted, harness" item.
+
 ---
 
 ## 4. Declared deviations (carry into user-facing docs)

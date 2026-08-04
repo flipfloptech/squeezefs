@@ -42,15 +42,29 @@ impl Drop for RxqLease {
     }
 }
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
-/// Leased queue indices per NIC. Keyed by ifindex (kernel-unique per
+/// One NIC's arbitration state. Keyed by ifindex (kernel-unique per
 /// NIC on this host — the same key `REGISTER_ZCRX_IFQ` collides on).
-static REGISTRY: LazyLock<Mutex<HashMap<u32, BTreeSet<u32>>>> =
+#[derive(Default)]
+struct NicPool {
+    /// Currently leased indices.
+    in_use: BTreeSet<u32>,
+    /// Freed indices in RELEASE order (front = least recently freed) —
+    /// the reuse-hygiene law (2026-08 field finding 2): the kernel's
+    /// ifq teardown is ASYNC (ring-fd close defers the unregister
+    /// in-kernel), so a just-freed rxq re-granted instantly
+    /// re-registers into EEXIST. Grants take FRESH queues first, then
+    /// reuse least-recently-freed — serial re-arms walk the whole pool
+    /// before any index repeats. Invariant: `retired ∩ in_use = ∅`.
+    retired: VecDeque<u32>,
+}
+
+static REGISTRY: LazyLock<Mutex<HashMap<u32, NicPool>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn registry() -> MutexGuard<'static, HashMap<u32, BTreeSet<u32>>> {
+fn registry() -> MutexGuard<'static, HashMap<u32, NicPool>> {
     // A panicked holder leaves plain collections in a valid state —
     // recover the inner map rather than poisoning every future arm.
     REGISTRY.lock().unwrap_or_else(|e| e.into_inner())
@@ -83,26 +97,42 @@ pub fn acquire(ifindex: u32, ifname: &str, channels: u32, want: u16) -> Result<R
         ));
     }
     let mut reg = registry();
-    let in_use = reg.entry(ifindex).or_default();
+    let entry = reg.entry(ifindex).or_default();
     let goal = u32::from(want).min(pool_len) as usize;
+    // FRESH = free AND not recently freed (the finding-2 reuse-hygiene
+    // law: a retired index is the LAST candidate — its kernel ifq
+    // teardown may still be in flight).
+    let fresh = |e: &NicPool, q: &u32| -> bool { !e.in_use.contains(q) && !e.retired.contains(q) };
     // Preferred grant: the pure §8 single-session picks…
     let mut grant: Vec<u32> = super::steering::lane_queue_picks(channels, want)
         .into_iter()
-        .filter(|q| !in_use.contains(q))
+        .filter(|q| fresh(entry, q))
         .collect();
-    // …contended: fill from the remaining free pool, highest-first.
+    // …contended: fill from the remaining FRESH pool, highest-first…
     if grant.len() < goal {
         for q in pool.clone().rev() {
             if grant.len() >= goal {
                 break;
             }
-            if !in_use.contains(&q) && !grant.contains(&q) {
+            if fresh(entry, &q) && !grant.contains(&q) {
                 grant.push(q);
             }
         }
     }
+    // …exhausted-fresh: reuse retired indices, LEAST-recently-freed
+    // first (their teardown has had the longest to complete).
+    while grant.len() < goal {
+        let pos = entry
+            .retired
+            .iter()
+            .position(|q| pool.contains(q) && !grant.contains(q));
+        match pos.and_then(|p| entry.retired.remove(p)) {
+            Some(q) => grant.push(q),
+            None => break,
+        }
+    }
     if grant.is_empty() {
-        let leased = in_use.len();
+        let leased = entry.in_use.len();
         return Err(format!(
             "zcrx rxq arbiter: {ifname} (ifindex {ifindex}) has {channels} RX queues \
              → {pool_len} lane-eligible (nic_queues/4, design §8: RSS keeps ≥ ¾ of \
@@ -118,11 +148,12 @@ pub fn acquire(ifindex: u32, ifname: &str, channels: u32, want: u16) -> Result<R
              ({} of the {pool_len}-queue pool leased by other sessions) — this \
              session degrades its queue count",
             grant.len(),
-            in_use.len()
+            entry.in_use.len()
         );
     }
     for q in &grant {
-        in_use.insert(*q);
+        entry.retired.retain(|r| r != q);
+        entry.in_use.insert(*q);
     }
     Ok(RxqLease {
         ifindex,
@@ -132,12 +163,17 @@ pub fn acquire(ifindex: u32, ifname: &str, channels: u32, want: u16) -> Result<R
 
 fn release(ifindex: u32, queues: &[u32]) {
     let mut reg = registry();
-    if let Some(set) = reg.get_mut(&ifindex) {
+    if let Some(entry) = reg.get_mut(&ifindex) {
         for q in queues {
-            set.remove(q);
-        }
-        if set.is_empty() {
-            reg.remove(&ifindex);
+            if entry.in_use.remove(q) {
+                // Re-freed indices move to the BACK (most recent) —
+                // the reuse-order history persists for the NIC's
+                // lifetime (one tiny entry per NIC, never dropped:
+                // dropping it would forget which ifq teardowns are
+                // still settling).
+                entry.retired.retain(|r| r != q);
+                entry.retired.push_back(*q);
+            }
         }
     }
 }

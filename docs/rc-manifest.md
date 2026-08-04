@@ -507,6 +507,31 @@ argument for the from-zero tier, in one finding.
 
 ---
 
+## 3f. Ruling D12 (2026-08-04, verbatim): "no gates until all performance is
+where we want it. then gates for bugs."
+
+Verification policy for the performance push: work stacks on
+`integrate/zcrx-wave` with TARGETED suites only (the D11 posture); dev
+receives nothing until the push closes. Measurement binaries deploy from the
+wave branch. The push's exit = the performance board below at target, then
+ONE full gate + the external suites sweep bugs before the wave merges.
+
+Performance board (exit criteria):
+1. **zcrx Z3 field rows** — Connect fix in, lane associates on real nvmet,
+   engagement laws hold; acceptance = the D5 chain's CPU/byte drop on
+   sustained cold seq-read (the RX-copy term), throughput no worse.
+2. **Full-fleet interception parity at bs=1M** — with population-derived
+   arenas admitting cpus×8 sessions, the shim rows must return to the
+   write_matrix parity law (kernel and IPC at minimum at par; the 80 MiB
+   lever row measured -33.6 % write / -21.1 % read at 256 sessions ÷ 8
+   service threads — the service-thread ceiling must scale with the same
+   population target or it becomes the next bottleneck-by-constant).
+3. **randread-shim residual** — shim ≥ kernel on rand-4k (the direct-drive
+   engine's single-ring/single-reaper term; local shape is +44 %, field is
+   -26 %).
+4. **A1 warm-serve copy adjudication** (third-party audit item) — ledger
+   split, build the tier-buffer handoff only if it prices in.
+
 ## 3d. Latent same-class flags from the known-red fixes (report-only, tracked)
 
 The §3c fixes flagged three populations of the same classes, green today by

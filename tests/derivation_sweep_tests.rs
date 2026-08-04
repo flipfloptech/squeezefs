@@ -285,15 +285,25 @@ fn parked_cap_derives_from_budget_over_block_size() {
 // ---------------------------------------------------------------------------
 
 /// The flat 64 MiB `SQUEEZEFS_IPC_ARENA_MB` default becomes
-/// `max(64 MiB, pmd_align_down(cap/128))`: cap/128 = the per-uid session
+/// `max(64 MiB, dma_align_down(cap/128))`: cap/128 = the per-uid session
 /// cap (64) × 2 safety — even a full per-uid population of default-size
-/// arenas fits in half the admission cap; PMD (2 MiB) alignment keeps
-/// the THP collapse law (`map_shared_pmd_aligned`) intact; floor 64 MiB
-/// = the shipped posture. Env stays absolute-verbatim (MiB).
+/// arenas fits in half the admission cap; alignment is the SLOT-SLAB DMA
+/// law (slots × 4 KiB = 4 MiB — also a PMD multiple, so the THP collapse
+/// law `map_shared_pmd_aligned` still holds); floor 64 MiB = the shipped
+/// posture. Env stays absolute-verbatim (MiB).
+///
+/// The 4 MiB (not 2 MiB) alignment is the 2026-08-04 cluster bounce
+/// regression's fix: an ODD 2 MiB-multiple arena makes the client slab
+/// `arena/1024 ≡ 2048 (mod 4096)`, so every odd slot's `slot × slab`
+/// arena offset fails `ipc_direct`'s 4 KiB DMA screen — EXACTLY half of
+/// all round-robin direct-drive reads bounced through the pooled-copy
+/// path on the fabric venue (randread-shim −15.4 % vs kernel; bounce
+/// rate 50.006 % measured, expected 0 per
+/// `.benchmarks/2026-07-26-ipc-direct-drive.md`).
 #[test]
 fn ipc_arena_default_derives_from_admission_cap() {
     use mem_budget::resolve_ipc_arena_bytes;
-    // Field: cap = 22 GiB ⇒ 176 MiB per session (PMD-aligned).
+    // Field: cap = 22 GiB ⇒ 176 MiB per session (4 MiB-aligned).
     assert_eq!(
         resolve_ipc_arena_bytes(None, mem_budget::ipc_arena_cap(FIELD_BUDGET)),
         176 * MIB
@@ -303,15 +313,40 @@ fn ipc_arena_default_derives_from_admission_cap() {
         resolve_ipc_arena_bytes(None, mem_budget::ipc_arena_cap(FLOOR_BUDGET)),
         64 * MIB
     );
-    // PMD alignment: a cap that derives to a non-2 MiB multiple rounds
+    // DMA alignment: a cap that derives to a non-4 MiB multiple rounds
     // DOWN (never over the cap fraction).
     assert_eq!(resolve_ipc_arena_bytes(None, 129 * 128 * MIB), 128 * MIB);
+    // THE BOUNCE SHAPE: cap/128 = 90 MiB — an odd 2 MiB multiple. The
+    // pre-fix PMD round-down kept 90 MiB (slab 92,160 B ≡ 2048 mod 4096
+    // ⇒ 50 % of slots DMA-ineligible); the DMA law rounds to 88 MiB.
+    assert_eq!(
+        resolve_ipc_arena_bytes(None, 90 * 128 * MIB),
+        88 * MIB,
+        "an odd 2 MiB-multiple arena is the 50 %-bounce shape — the \
+         derivation must round to the slot-slab DMA alignment"
+    );
+    // The derivation-wide invariant: every derived arena is slot-slab
+    // DMA-aligned (slots × 4 KiB).
+    let align = u64::from(squeezefs_ipc::layout::Geometry::default_v1().slots) * 4096;
+    assert_eq!(align, 4 * MIB, "geometry drift — re-derive the arena alignment");
+    for cap_mib in [1_u64, 300, 8192, 11_520, 22_528, 90 * 128, 129 * 128] {
+        let got = resolve_ipc_arena_bytes(None, cap_mib * MIB);
+        assert_eq!(
+            got % align,
+            0,
+            "derived arena {got} for cap {cap_mib} MiB is not slot-slab DMA-aligned"
+        );
+    }
     // Env verbatim (MiB), incl. the A0 lever.
     assert_eq!(resolve_ipc_arena_bytes(Some("64"), 22 * GIB), 64 * MIB);
     assert_eq!(
         resolve_ipc_arena_bytes(Some("junk"), FLOOR_BUDGET),
         64 * MIB
     );
+    // An EXPLICIT odd env value stays verbatim (explicit-wins law) — the
+    // CLIENT slab law (`Geometry::slot_slab`) is what keeps its slots
+    // DMA-eligible; see `slot_slab_is_dma_aligned` below.
+    assert_eq!(resolve_ipc_arena_bytes(Some("90"), 22 * GIB), 90 * MIB);
 }
 
 // ---------------------------------------------------------------------------

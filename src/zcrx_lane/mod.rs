@@ -97,7 +97,24 @@ pub async fn arm_for_device(device_path: &str) -> Option<Arc<LaneSession>> {
     }
     let target = match lane_target_override() {
         Some(t) => t,
-        None => probe::nvme_tcp_target_for(device_path)?,
+        None => match probe::nvme_tcp_target_for(device_path) {
+            Some(t) => t,
+            None => {
+                // The operator ARMED the master switch; a quiet probe
+                // refusal here cost a field session to diagnose (the
+                // 2026-08-04 unlimited-MDTS sentinel sat behind an
+                // all-zeros gauge family with no log line). Loud,
+                // once per device per mount (the OnceCell caches this
+                // None), kernel path serves byte-identical.
+                log::warn!(
+                    "zcrx-lane: SQUEEZEFS_ZCRX_LANE=1 but the sysfs probe refused \
+                     {device_path} (not a plain /dev/nvme<C>n<N> tcp attachment, or \
+                     a missing/garbage sysfs field) — kernel path serves \
+                     (byte-identical); see docs/design-zcrx-read-lane.md §4.1"
+                );
+                return None;
+            }
+        },
     };
     if lane_area_sim_backend() {
         // PR Z2 contract venue: the area/chunk/refill machinery over a

@@ -379,6 +379,284 @@ async fn stats_snapshot_protocol_holds_across_handler_clones() {
     );
     let _ = q_a.release(req, STATS_INODE, o1.fh, 0, 0, false).await;
     let _ = q_b.release(req, STATS_INODE, o2.fh, 0, 0, false).await;
+
+    // Per-lookup generations across clones (the wb-cache face's fix rides
+    // the SAME one-cell law): LOOKUP on clone A mints a generation ino;
+    // OPEN on clone B and READ on clone C must serve exactly the payload
+    // clone A minted — a per-clone registry would miss on B (ESTALE or a
+    // regenerated different-size payload, the torn-JSON face again).
+    let entry = q_a
+        .lookup(req, 1, std::ffi::OsStr::new(".stats"))
+        .await
+        .expect("lookup .stats on clone A");
+    METRICS
+        .parked_gate_timeouts
+        .fetch_add(222_222_222, Ordering::Relaxed);
+    let og = q_b
+        .open(req, entry.attr.ino, libc::O_RDONLY as u32, 0)
+        .await
+        .expect("open the clone-A-minted generation ino on clone B");
+    let data = q_c
+        .read(req, entry.attr.ino, og.fh, 0, 16 * 1024 * 1024, 0)
+        .await
+        .expect("read the generation ino on clone C");
+    assert_eq!(
+        data.data.len() as u64,
+        entry.attr.size,
+        "clone C must serve exactly the generation clone A minted — a \
+         split registry regenerates a different-size payload mid-churn"
+    );
+    let _: serde_json::Value = serde_json::from_slice(&data.data)
+        .expect("cross-clone generation read must parse as JSON");
+    let _ = q_b.release(req, entry.attr.ino, og.fh, 0, 0, false).await;
+}
+
+/// The 2026-08-04 WRITEBACK-CACHE face — the THIRD mechanism of the
+/// torn-`.stats` bug (after the cross-clone split and the retained kernel
+/// pages, both fixed on this branch): on default mounts the kernel
+/// negotiates FUSE_WRITEBACK_CACHE, under which the kernel OWNS `i_size`
+/// for regular files and DISCARDS the size in every attr reply after
+/// inode instantiation. Measured live: daemon GETATTR replies sized
+/// 71352 → 71350 → 71349 while the kernel kept serving a frozen 71352 —
+/// `cat` (the splice path) clamps at the frozen size and tears the JSON
+/// mid-string (39/40 torn under counter churn). No attr-reply protocol
+/// can fix a FIXED ino under that ownership; the fix is a FRESH kernel
+/// inode per LOOKUP, whose wb-cache size authority initializes from the
+/// LOOKUP entry's attr size and never needs to change — that generation's
+/// payload is IMMUTABLE.
+///
+/// Contract pinned here (the in-process wb-cache-shape pin):
+/// 1. every `.stats`/`.config` LOOKUP mints a DIFFERENT ino, from the
+///    reserved generation range `0xffff_ffff_0000_0000 ..=
+///    0xffff_ffff_ffff_fff0` — disjoint from real inos (v3 minting is
+///    monotonic-from-1, no reuse, ino cap ≥ 100 M ≪ 2^32) and from the
+///    canonical STATS_INODE / CONFIG_INODE / ino 1 (asserted with
+///    LITERALS so the reserved values themselves are the pin);
+/// 2. GETATTR / OPEN / READ (offset-sliced) on a generation ino serve
+///    exactly THAT generation's bytes — size frozen per ino, parsing as
+///    whole JSON — even under counter churn after the mint;
+/// 3. FORGET (and BATCH_FORGET) retire the generation: subsequent
+///    GETATTR / OPEN answer an error (ESTALE — the honest observable for
+///    registry removal; no test-only registry accessor needed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stats_lookup_mints_fresh_generation_inos_wb_cache_face() {
+    use fuse3::raw::prelude::Filesystem;
+    use squeezefs::block_allocator::BlockAllocator;
+    use squeezefs::cache::TieredCache;
+    use squeezefs::dlm::DlmClient;
+    use squeezefs::fuse_client::{SqueezefsFilesystem, CONFIG_INODE, STATS_INODE};
+    use squeezefs::nvme_dev::NvmeBlockDev;
+    use squeezefs::routing::DataRouter;
+    use std::sync::Arc;
+    use tempfile::NamedTempFile;
+
+    async fn open_v3_meta(
+        path: &std::path::Path,
+    ) -> Arc<squeezefs::meta_backend::kv::backend::KvMetaBackend> {
+        squeezefs::meta_backend::kv::builder::format_v3(
+            path,
+            256 * 1024 * 1024,
+            &squeezefs::meta_backend::kv::builder::FormatV3Options {
+                node_size: squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE,
+                journal_len_override: None,
+                force: true,
+                full_wipe: false,
+                format_config_xattr: None,
+            },
+        )
+        .await
+        .expect("format v3 meta volume");
+        squeezefs::meta_backend::kv::backend::KvMetaBackend::open(path)
+            .await
+            .expect("open v3 meta volume")
+    }
+
+    let dlm = DlmClient::new().unwrap();
+    let b = NamedTempFile::new().unwrap();
+    std::fs::File::create(b.path())
+        .unwrap()
+        .set_len(64 * 1024 * 1024)
+        .unwrap();
+    let nvme = Arc::new(NvmeBlockDev::new(b.path().to_str().unwrap()));
+    let ba = Arc::new(BlockAllocator::new("stats_gen_ino_test").await.unwrap());
+    let s = tempfile::tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![s.path().to_path_buf()],
+        Some("64MB"),
+        Some("64MB"),
+        Some("16MB"),
+        Some("32MB"),
+        ba.clone(),
+        nvme.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let router = DataRouter::new(dlm.clone(), cache, ba, nvme);
+    let mut fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);
+    let m = NamedTempFile::new().unwrap();
+    let routed = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![
+        open_v3_meta(m.path()).await,
+    ]));
+    fs.router.set_meta_backend(routed.clone());
+    fs.meta_backend = Some(routed);
+
+    let req = fuse3::raw::Request {
+        unique: 0,
+        uid: 1000,
+        gid: 1000,
+        pid: 1,
+        ..Default::default()
+    };
+
+    // 1. Two lookups with counter churn between — the wb-cache face: a
+    //    FIXED ino would hand the kernel a frozen size authority.
+    let e1 = fs
+        .lookup(req, 1, std::ffi::OsStr::new(".stats"))
+        .await
+        .expect("first lookup .stats");
+    METRICS
+        .parked_gate_timeouts
+        .fetch_add(987_654_321, Ordering::Relaxed);
+    METRICS
+        .prefetch_window_hwm
+        .fetch_add(123_456_789, Ordering::Relaxed);
+    let e2 = fs
+        .lookup(req, 1, std::ffi::OsStr::new(".stats"))
+        .await
+        .expect("second lookup .stats");
+    assert_ne!(
+        e1.attr.ino, e2.attr.ino,
+        "every .stats LOOKUP must mint a FRESH generation ino — a fixed \
+         ino hands the wb-cache kernel a frozen i_size authority that \
+         tears cat/splice reads mid-string under counter churn"
+    );
+
+    // Reserved-range disjointness (LITERALS on purpose — the reserved
+    // values are the contract): real inos are monotonic-from-1 with no
+    // reuse (v3), so the range can never collide; the canonical virtual
+    // inos and ino 1 sit outside it.
+    const GEN_FIRST: u64 = 0xffff_ffff_0000_0000;
+    const GEN_LAST: u64 = 0xffff_ffff_ffff_fff0;
+    assert!(STATS_INODE > GEN_LAST && CONFIG_INODE > GEN_LAST);
+    for (label, e) in [("first", &e1), ("second", &e2)] {
+        let ino = e.attr.ino;
+        assert!(
+            (GEN_FIRST..=GEN_LAST).contains(&ino),
+            "{label} lookup's generation ino {ino:#x} must come from the \
+             reserved range {GEN_FIRST:#x}..={GEN_LAST:#x}"
+        );
+        assert_ne!(ino, STATS_INODE, "{label}: gen ino ≠ canonical stats");
+        assert_ne!(ino, CONFIG_INODE, "{label}: gen ino ≠ canonical config");
+        assert!(ino > 1, "{label}: gen ino ≠ root");
+    }
+
+    // 2. Each generation ino serves EXACTLY its entry's bytes — size
+    //    frozen per ino, offset-sliced reads joining into one JSON —
+    //    under further churn (the payload is immutable by construction).
+    METRICS
+        .parked_gate_timeouts
+        .fetch_add(111_111_111, Ordering::Relaxed);
+    for (label, e) in [("first", &e1), ("second", &e2)] {
+        let ino = e.attr.ino;
+        let ga = fs
+            .getattr(req, ino, None, 0)
+            .await
+            .unwrap_or_else(|err| panic!("{label}: getattr gen ino: {err}"));
+        assert_eq!(
+            ga.attr.size, e.attr.size,
+            "{label}: a generation's size is FROZEN at its entry size — \
+             the whole point of per-lookup inos under wb-cache"
+        );
+        assert_eq!(ga.attr.ino, ino, "{label}: attr names the gen ino");
+        let opened = fs
+            .open(req, ino, libc::O_RDONLY as u32, 0)
+            .await
+            .unwrap_or_else(|err| panic!("{label}: open gen ino: {err}"));
+        let head = fs
+            .read(req, ino, opened.fh, 0, 4096, 0)
+            .await
+            .unwrap_or_else(|err| panic!("{label}: head read: {err}"));
+        let tail = fs
+            .read(req, ino, opened.fh, 4096, 16 * 1024 * 1024, 0)
+            .await
+            .unwrap_or_else(|err| panic!("{label}: tail read: {err}"));
+        let mut joined = head.data.to_vec();
+        joined.extend_from_slice(&tail.data);
+        assert_eq!(
+            joined.len() as u64,
+            e.attr.size,
+            "{label}: offset-sliced reads must total exactly the entry size"
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&joined).unwrap_or_else(|err| {
+            panic!("{label}: a generation's reads must join into whole JSON: {err}")
+        });
+        assert!(parsed.get("metrics").is_some(), "{label}: carries metrics");
+        fs.release(req, ino, opened.fh, 0, 0, false)
+            .await
+            .unwrap_or_else(|err| panic!("{label}: release: {err}"));
+    }
+
+    // 3. FORGET retires a generation (kernel dentry death is the
+    //    lifecycle; ESTALE afterward is the honest registry observable).
+    fs.forget(req, e1.attr.ino, 1).await;
+    assert!(
+        fs.getattr(req, e1.attr.ino, None, 0).await.is_err(),
+        "GETATTR on a FORGETted generation must fail (ESTALE) — the \
+         registry entry is retired with the kernel inode"
+    );
+    assert!(
+        fs.open(req, e1.attr.ino, libc::O_RDONLY as u32, 0)
+            .await
+            .is_err(),
+        "OPEN on a FORGETted generation must fail (ESTALE)"
+    );
+    // …and BATCH_FORGET must sweep exactly like N FORGETs.
+    fs.batch_forget(req, &[(e2.attr.ino, 1)]).await;
+    assert!(
+        fs.getattr(req, e2.attr.ino, None, 0).await.is_err(),
+        "GETATTR on a BATCH_FORGETted generation must fail (ESTALE)"
+    );
+
+    // `.config` mints from the same range, same protocol.
+    let c1 = fs
+        .lookup(req, 1, std::ffi::OsStr::new(".config"))
+        .await
+        .expect("first lookup .config");
+    let c2 = fs
+        .lookup(req, 1, std::ffi::OsStr::new(".config"))
+        .await
+        .expect("second lookup .config");
+    assert_ne!(
+        c1.attr.ino, c2.attr.ino,
+        ".config lookups must mint fresh generation inos too"
+    );
+    assert!(
+        (GEN_FIRST..=GEN_LAST).contains(&c1.attr.ino),
+        ".config generation ino comes from the reserved range"
+    );
+    assert_ne!(
+        c1.attr.ino, e2.attr.ino,
+        ".config and .stats generations never collide"
+    );
+    let opened = fs
+        .open(req, c1.attr.ino, libc::O_RDONLY as u32, 0)
+        .await
+        .expect("open .config gen ino");
+    let data = fs
+        .read(req, c1.attr.ino, opened.fh, 0, 16 * 1024 * 1024, 0)
+        .await
+        .expect("read .config gen ino");
+    assert_eq!(
+        data.data.len() as u64,
+        c1.attr.size,
+        ".config generation serves exactly its entry size"
+    );
+    let _: serde_json::Value =
+        serde_json::from_slice(&data.data).expect(".config generation parses as JSON");
+    fs.release(req, c1.attr.ino, opened.fh, 0, 0, false)
+        .await
+        .expect("release .config gen ino");
 }
 
 /// D3.a (PR M3, design-metadata-throughput §9): the `transport_commit_batch`

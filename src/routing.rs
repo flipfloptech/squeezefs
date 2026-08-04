@@ -4945,17 +4945,28 @@ impl DataRouter {
                     // belt): an open epoch's shadow bindings overlay the
                     // fetched (A) map, and the composed entry is DIRTY —
                     // the dirty-authority law then shields it from later
-                    // refills until the swap persists it.
+                    // refills until the swap persists it. Durable merges
+                    // evict superseded shadow entries under the same lock
+                    // (`supersede_shadow_bindings` — the 2026-08-04 field
+                    // fix), so the surviving overlay is coherent by
+                    // construction; an EMPTY shadow composes nothing and
+                    // must not dirty the entry (a spurious dirty would
+                    // shield a backend-true map from refills and force a
+                    // pointless save at close).
                     if let Some(epoch) = self.inner.rewrite_epochs.read_sync(&ino, |_, e| e.clone())
                     {
                         let mut map_arc = fetched.block_map.take().unwrap_or_default();
                         let map = std::sync::Arc::make_mut(&mut map_arc);
+                        let mut composed = false;
                         epoch.shadow.iter_sync(|b, k| {
                             map.insert(*b, k.clone());
+                            composed = true;
                             true
                         });
                         fetched.block_map = Some(map_arc);
-                        fetched.layout_dirty = true;
+                        if composed {
+                            fetched.layout_dirty = true;
+                        }
                     }
                     return Ok(Some(fetched));
                 }
@@ -8834,6 +8845,68 @@ impl DataRouter {
         }
     }
 
+    /// Supersession coherence for an open rewrite epoch (the 2026-08-04
+    /// field corruption fix — `tests/rewrite_shadow_supersede_tests.rs`):
+    /// a DURABLE map mutation of index `b` makes the epoch's RAM-only
+    /// `shadow[b]` binding stale — the durable save is now the authority
+    /// for `b`, and the shadow key it displaced is about to be (or was)
+    /// freed by the durable path's own displaced-free discipline. Left in
+    /// place, the stale entry poisons every later KD-1.9 refetch-compose:
+    /// the freed key resurrects as a dirty binding, persists (fsck
+    /// C2Lost — the deterministic read-EIO face), leaks the durable key
+    /// it clobbers (C2Leaked), and re-parks the freed key for a second
+    /// free (C3 + cross-file corruption once the offset is reallocated).
+    ///
+    /// Callers hold `INODE_META_LOCKS(ino)` — the same lock every shadow
+    /// record and every refetch-compose runs under, so removal is
+    /// race-free by construction. Cheap when no epoch is open (one scc
+    /// read miss); indexes without shadow entries are no-ops.
+    fn supersede_shadow_bindings<I: IntoIterator<Item = u32>>(&self, ino: u64, touched: I) {
+        let Some(epoch) = self.inner.rewrite_epochs.read_sync(&ino, |_, e| e.clone()) else {
+            return;
+        };
+        let mut superseded = 0u64;
+        for b in touched {
+            if epoch.shadow.remove_sync(&b).is_some() {
+                superseded += 1;
+            }
+        }
+        if superseded > 0 {
+            METRICS
+                .rewrite_shadow_superseded
+                .fetch_add(superseded, Ordering::Relaxed);
+        }
+    }
+
+    /// [`Self::supersede_shadow_bindings`] for the pruning ops
+    /// (`TruncateFrom`): every shadow index at or past the cut is stale,
+    /// including indexes the durable map never bound (a shadow-only
+    /// binding past the cut would otherwise resurrect on refill and
+    /// re-extend silently corrupt).
+    fn supersede_shadow_bindings_from(&self, ino: u64, new_size: u64, block_size: u64) {
+        let Some(epoch) = self.inner.rewrite_epochs.read_sync(&ino, |_, e| e.clone()) else {
+            return;
+        };
+        let mut stale: Vec<u32> = Vec::new();
+        epoch.shadow.iter_sync(|b, _| {
+            if (*b as u64) * block_size >= new_size {
+                stale.push(*b);
+            }
+            true
+        });
+        let mut superseded = 0u64;
+        for b in stale {
+            if epoch.shadow.remove_sync(&b).is_some() {
+                superseded += 1;
+            }
+        }
+        if superseded > 0 {
+            METRICS
+                .rewrite_shadow_superseded
+                .fetch_add(superseded, Ordering::Relaxed);
+        }
+    }
+
     /// Idea 1 — close the ino's rewrite epoch: THE SWAP (KD-1.4). One
     /// whole-tx save of the (dirty) RAM layout under `INODE_META_LOCKS`
     /// with fencing revalidation inside, then — strictly after the save —
@@ -9103,6 +9176,13 @@ impl DataRouter {
         };
         match op {
             BlockMapOp::Merge(entries) => {
+                // Supersession coherence (the 2026-08-04 field fix): this
+                // durable publish is now the authority for every index it
+                // names — evict the epoch's stale RAM-only shadow bindings
+                // so no KD-1.9 refetch-compose can resurrect a
+                // displaced-and-freed key
+                // (`tests/rewrite_shadow_supersede_tests.rs`).
+                self.supersede_shadow_bindings(ino, entries.iter().map(|(b, _)| *b));
                 for (b, new_key) in entries {
                     match block_map.insert(*b, new_key.clone()) {
                         Some(prev) if prev != *new_key => {
@@ -9128,6 +9208,10 @@ impl DataRouter {
                 }
             }
             BlockMapOp::MergeExpected(entries) => {
+                // Supersession coherence: only APPLIED entries evict shadow
+                // bindings — a skipped entry means the MOVER's view is
+                // stale, not the epoch's.
+                let mut applied_idxs: Vec<u32> = Vec::new();
                 for (b, expected, new_key) in entries {
                     match block_map.get(b) {
                         // Merge only where the mover's captured mapping is
@@ -9142,10 +9226,12 @@ impl DataRouter {
                             ref_changes.push((*b, prev.clone(), false));
                             ref_changes.push((*b, new_key.clone(), true));
                             displaced.push(prev);
+                            applied_idxs.push(*b);
                         }
                         _ => {}
                     }
                 }
+                self.supersede_shadow_bindings(ino, applied_idxs);
                 // Same size discipline as Merge.
                 current.size = std::cmp::max(current.size, min_size);
                 if let Some(cached) = self.metadata_cache.get(&ino) {
@@ -9156,6 +9242,11 @@ impl DataRouter {
             }
             BlockMapOp::TruncateFrom { new_size } => {
                 let block_size = self.block_size.load(Ordering::Relaxed);
+                // Supersession coherence: every shadow binding at or past
+                // the cut is stale — including shadow-ONLY indexes the
+                // durable map never bound (left in place they resurrect on
+                // refill and a later extend reads a freed key).
+                self.supersede_shadow_bindings_from(ino, new_size, block_size);
                 block_map.retain(|&b, bk| {
                     if (b as u64) * block_size >= new_size {
                         purge(bk);
@@ -9169,6 +9260,10 @@ impl DataRouter {
                 current.size = new_size;
             }
             BlockMapOp::RemoveBlocks(idxs) => {
+                // Supersession coherence: a punch kills the binding
+                // everywhere, shadow included (unconditional — a
+                // shadow-only binding for a punched index is stale too).
+                self.supersede_shadow_bindings(ino, idxs.iter().copied());
                 for &b in idxs {
                     if let Some(bk) = block_map.remove(&b) {
                         purge(&bk);
@@ -9499,6 +9594,12 @@ impl DataRouter {
                 continue;
             }
             let mut displaced: Vec<String> = Vec::new();
+            // Supersession coherence (the 2026-08-04 field fix — the
+            // primitive's rule, verbatim): this durable publish is the
+            // authority for every index it names; evict the epoch's stale
+            // shadow bindings so no refetch-compose resurrects a
+            // displaced-and-freed key.
+            self.supersede_shadow_bindings(ino, op.entries.iter().map(|(b, _)| *b));
             for (b, new_key) in &op.entries {
                 match block_map.insert(*b, new_key.clone()) {
                     Some(prev) if prev != *new_key => {

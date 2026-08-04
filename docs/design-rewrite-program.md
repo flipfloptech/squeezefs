@@ -408,6 +408,27 @@ publishing to cache — one hook site; a refilled entry can never lose B
 bindings structurally, so the idle-close is exposure-bounding, not
 correctness-bearing.
 
+**Supersession coherence (KD-1.11, the 2026-08-04 field fix —
+`tests/rewrite_shadow_supersede_tests.rs`):** a mid-epoch **durable**
+publish of a shadowed index (a flush-leg merge, a conveyor pass, a
+truncate/punch prune, a mover `MergeExpected` apply) makes the epoch's
+RAM-only `shadow[b]` binding stale — the durable path displaces and
+frees the shadow's B key on its own discipline. The durable primitive
+and `publish_pass` therefore **evict the superseded shadow entries under
+the same `INODE_META_LOCKS` section that mutates the map**
+(`supersede_shadow_bindings[_from]`, counted
+`rewrite_shadow_superseded`), so the KD-1.9 compose can never resurrect
+a displaced-and-freed key. Without this, the squeeze-test EXA overwrite
+storm resurrected freed bindings into dirty entries that persisted:
+fsck **C2Lost** (live map binds an allocator-untracked offset — the
+deterministic read-EIO face: the freed key's incarnation word stays
+retired for the whole session), **C2Leaked** (the clobbered durable key,
+allocated with zero referencers), **C3** + cross-file corruption once
+the double-freed offset reallocated (the run17 class), all healing on
+remount — pure in-session poison. The compose also dirties the refilled
+entry only when it actually inserted a binding (an empty shadow must not
+shield a backend-true map from refills).
+
 ### 5.4 D0 fencing law (KD-1.8)
 
 The swap's save presents the ino's CURRENT DLM token and revalidates
@@ -505,7 +526,7 @@ boundaries. Idea 8 names the classes (§9.3).
 | Idea 17 | `rewrite_user_bytes`, `rewrite_device_write_bytes`, `rewrite_blocks` | rewrite-class attribution: user bytes landing on already-mapped striped ranges; device write bytes submitted for displacing/in-place/shadow blocks; blocks displaced-or-replaced. Row validity: a rewrite row's deltas must account for its traffic. |
 | Idea 4 | `block_free_reclaim_elided`, `block_free_elided_debt_bytes` (gauge), `block_free_trim_discards`, `block_free_trim_bytes`, `block_free_debt_pressure_drains` | ledger identity `queued + elided ≡ terminal frees`; debt gauge returns toward 0 under trim/reuse; pressure drains ≈ 0 below watermark. |
 | Idea 2 | `write_pipeline_supersessions`, `write_pipeline_superseded_bytes` | stale in-flight completions that published nothing (the latest-wins engagement instrument, overlapping face). |
-| Idea 1 | `rewrite_shadow_swaps`, `rewrite_shadow_bytes`, `rewrite_shadow_fallbacks`, `rewrite_shadow_fence_drops`, `rewrite_shadow_open_epochs` (gauge), `rewrite_shadow_parked_bytes` (gauge) | swaps = closes that persisted; bytes = B bytes swapped; fallbacks = ENOSPC-degraded closes; fence_drops must stay 0 on healthy mounts; parked gauge = the VL preflight transient. |
+| Idea 1 | `rewrite_shadow_swaps`, `rewrite_shadow_bytes`, `rewrite_shadow_fallbacks`, `rewrite_shadow_fence_drops`, `rewrite_shadow_open_epochs` (gauge), `rewrite_shadow_parked_bytes` (gauge), `rewrite_shadow_superseded` | swaps = closes that persisted; bytes = B bytes swapped; fallbacks = ENOSPC-degraded closes; fence_drops must stay 0 on healthy mounts; parked gauge = the VL preflight transient; superseded = stale shadow bindings evicted by mid-epoch durable publishes (KD-1.11 — growth is the two machineries composing correctly). |
 
 ## 9. Design-only sections (implementation next campaign)
 
@@ -583,6 +604,7 @@ precedent) gaining a class column.
 | 4 | `tests/discard_elision_tests.rs` | elided-until-pressure (zero device commands during foreground); immediate reallocatability; claim-cancels-debt; trim protocol (claim-discard-reinsert; lost claim = skip); watermark engagement (debt > virgin ⇒ paced drain); ledger identity; `SQUEEZEFS_DISCARD_ELISION=0` verbatim old path; fence-halt |
 | 2 | `tests/write_supersession_tests.rs` | planted-stale-CQE (stall seam): stale completion publishes nothing + frees orphan + newest bytes win; entry-gone skip; fsync-race durability (flush leg wins ⇒ pipeline task no-ops); no-leak reconciliation; counters |
 | 1 | `tests/rewrite_shadow_tests.rs` | epoch open/record/RYW; ONE-commit swap (journal-entry delta); frees only post-swap (elided); W1 crash (drop-without-close ⇒ remount reads A, B blocks reclaimed, `fsck_findings` 0); W5 fence (stale token ⇒ nothing freed, loud); ENOSPC early-close + fallback counter; mid-epoch fsck composition (inflight-exempt); refetch-compose (eviction hole closed); gauges |
+| 1 (KD-1.11) | `tests/rewrite_shadow_supersede_tests.rs` | mid-epoch durable merge evicts the superseded shadow binding (refill resolves the durable key, never a freed one); the full field resurrection sequence cannot double-free or leak (every mapped offset stays allocator-tracked, read-back exact); truncate prunes shadowed indexes past the cut |
 
 Merge bar: clippy `-D warnings` + fmt; the write-path family
 (`write_through_coverage_tests`, `write_pipeline*`, reclaim/fence

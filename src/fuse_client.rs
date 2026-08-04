@@ -4082,6 +4082,12 @@ pub struct Metrics {
     /// GAUGE: parked displaced-A bytes across open epochs (the VL
     /// capacity-preflight transient — KD-1.7).
     pub rewrite_shadow_parked_bytes: Align64<AtomicU64>,
+    /// Stale shadow bindings evicted by mid-epoch DURABLE publishes of
+    /// the same indexes (the 2026-08-04 supersession-coherence fix —
+    /// `tests/rewrite_shadow_supersede_tests.rs`). Growth is the two
+    /// machineries composing correctly under flush-leg/ACK-path mixing;
+    /// the counter existing at 0 on a pure-shadow workload is normal.
+    pub rewrite_shadow_superseded: Align64<AtomicU64>,
     /// Write-commit-economy lever 1 (2026-07-30): publish-conveyor
     /// passes committed (one save each). With
     /// `layout_publish_batched_blocks` gives the live coalesce factor —
@@ -7136,6 +7142,7 @@ impl SqueezefsFilesystem {
                 "rewrite_shadow_fence_drops": METRICS.rewrite_shadow_fence_drops.load(Ordering::Relaxed),
                 "rewrite_shadow_open_epochs": METRICS.rewrite_shadow_open_epochs.load(Ordering::Relaxed),
                 "rewrite_shadow_parked_bytes": METRICS.rewrite_shadow_parked_bytes.load(Ordering::Relaxed),
+                "rewrite_shadow_superseded": METRICS.rewrite_shadow_superseded.load(Ordering::Relaxed),
                 // Residence decomposition (2026-07-31 write-wall
                 // campaign, conviction 2): ALWAYS-ON per-phase histograms
                 // — admission → detach → lock → crypto → allocate → DMA

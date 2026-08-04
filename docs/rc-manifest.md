@@ -376,6 +376,43 @@ scoreboard.
 
 ---
 
+## 3e. The deferred stack, discharged (2026-08-04)
+
+Ruling D11's deferred verification ran staged, each stage gating the next, and
+every leg is now green on the final binary (`e9dfabab`):
+
+| Leg | Verdict |
+|---|---|
+| From-zero `cargo test --all-features` (--test-threads=1) | **257 binaries, 0 failures** (acceptance re-run after 9 findings fixed red-first) |
+| loom | **71/71** (after restoring a merge-swallowed closure — the loom crate now gets `cargo check` at every merge touching it) |
+| require-mount gate | **PASS** — the twelve live-mount suites drove real FUSE-over-io_uring mounts; skip ledger = one honest root-class entry |
+| bench baseline | **99 judged, 0 regressions**; 375-median reference adopted (strixhalo @ 66bb4775) — the DLM era's written predictions are now nightly tripwires |
+| pjdfstests | **8,798/8,798, 238 files** |
+| LTP syscalls | **174 PASS, 0 FAIL, 0 BROKEN** |
+| fstests `-g auto`, from zero | **787 ran, 783 clean, 4 expected-shape (the standing adjudications), 0 unexpected** |
+
+The stack's findings, all fixed red-first with their mechanisms recorded:
+§3d0's wedge-crumb (a fail-stop pin green by a 9-byte accident), the PERF-11
+deferred-publish fixture races and the hybrid escalation contract, two
+census-style pins that broke when siblings did their jobs (both now monotone),
+the S5 help-register leak, the writeback env leak, and — the external tier's
+catch — **generic/451**: acked async O_DIRECT writes leaving stale kernel
+pages for racing buffered readers, unmasked by PERF-6's `FOPEN_KEEP_CACHE`
+(the invalidate-on-open it retired had been hiding the ghost class forever;
+AUTO_INVAL_DATA has a hole for same-mount kernel-path DIO because the kernel's
+own attr update absorbs the mtime change). The fix makes the WRITE ack itself
+the coherence barrier — a synchronous ranged inval, gated on buffered-open
+history, on the blocking pool (the inline-uring variant deadlocked live:
+invalidation parked on a folio whose READ the same lane family had to serve).
+Cargo pin `tests/dio_write_page_coherence_tests.rs`; generic/451 joined
+`SQUEEZEFS_FSTESTS_QUICK`.
+
+Remaining OUTSIDE the stack (unchanged): the scoreboard row for this tree
+(running as this lands), the Phase-8 stamping window, S10, the nightly fuzz
+targets, and the two-host demonstration on PR hardware.
+
+---
+
 ## 3c. Known-red at dev during the DLM push (D11 bookkeeping)
 
 Ruling D11 parks suite runs until N readers + N writers work, so failures found

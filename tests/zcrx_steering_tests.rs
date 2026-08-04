@@ -15,6 +15,13 @@
 //! 4. Crash residue: stale rules in the reserved loc range are reaped at arm;
 //!    rules OUTSIDE the range are never touched.
 //! 5. HDS (tcp-data-split) off ⇒ arm refuses loud with ZERO mutations.
+//! 6. Live-session coexistence (the rxq-arbiter follow-through: two lane
+//!    sessions on one NIC are now reachable): a second arm never reaps a
+//!    LIVE session's rules, allocates DISJOINT reserved locs, and free-slot
+//!    accounting subtracts live holders.
+//! 7. Out-of-order restore converges: a live peer's queues stay excluded
+//!    from RSS after another session's restore; the LAST restore returns
+//!    the PRISTINE table (recorded by the first armer).
 
 use squeezefs::zcrx_lane::steering::{
     arm_steering, lane_queue_picks, reserved_loc_range, restricted_rss, FlowRule, NicControl,
@@ -31,6 +38,7 @@ enum FailAt {
     None,
     Channels,
     Hds,
+    NtupleFeature,
     RssGet,
     RssSet,
     TableSize,
@@ -40,8 +48,12 @@ enum FailAt {
 }
 
 struct MockNic {
+    /// Unique per test: the process-wide live-arm registry keys on the
+    /// interface NAME, so shared names would couple tests.
+    name: String,
     channels: u32,
     hds_on: bool,
+    ntuple_on: bool,
     rss: Vec<u32>,
     table_size: u32,
     rules: BTreeMap<u32, FlowRule>,
@@ -51,11 +63,13 @@ struct MockNic {
 }
 
 impl MockNic {
-    fn new(channels: u32, rss_len: usize) -> Self {
+    fn new(name: &str, channels: u32, rss_len: usize) -> Self {
         let rss: Vec<u32> = (0..rss_len).map(|i| (i as u32) % channels).collect();
         MockNic {
+            name: name.to_string(),
             channels,
             hds_on: true,
+            ntuple_on: true,
             rss,
             table_size: 1024,
             rules: BTreeMap::new(),
@@ -73,7 +87,7 @@ impl MockNic {
 
 impl NicControl for MockNic {
     fn ifname(&self) -> &str {
-        "mock0"
+        &self.name
     }
     fn combined_channels(&mut self) -> Result<u32, String> {
         self.ops.push("channels".into());
@@ -88,6 +102,13 @@ impl NicControl for MockNic {
             return Err("mock: hds probe refused".into());
         }
         Ok(self.hds_on)
+    }
+    fn ntuple_enabled(&mut self) -> Result<bool, String> {
+        self.ops.push("ntuple_feature".into());
+        if self.fail_at == FailAt::NtupleFeature {
+            return Err("mock: ntuple feature probe refused".into());
+        }
+        Ok(self.ntuple_on)
     }
     fn rxfh_indir(&mut self) -> Result<Vec<u32>, String> {
         self.ops.push("rss_get".into());
@@ -196,7 +217,7 @@ fn test_restricted_rss_excludes_lane_queues_and_preserves_rest() {
 
 #[test]
 fn test_arm_applies_rss_restriction_and_reserved_rules() {
-    let mut nic = MockNic::new(16, 128);
+    let mut nic = MockNic::new("sm-arm-a", 16, 128);
     let flows = vec![flow(50001, 14), flow(50002, 15)];
     let guard = arm_steering(&mut nic, &flows).expect("arm");
 
@@ -212,7 +233,7 @@ fn test_arm_applies_rss_restriction_and_reserved_rules() {
     }
 
     // Law 2: restore is byte-exact.
-    let mut nic2 = MockNic::new(16, 128);
+    let mut nic2 = MockNic::new("sm-arm-b", 16, 128);
     let prior = nic2.snapshot();
     let flows2 = vec![flow(50001, 14), flow(50002, 15)];
     let mut g2 = arm_steering(&mut nic2, &flows2).expect("arm 2");
@@ -229,17 +250,22 @@ fn test_arm_applies_rss_restriction_and_reserved_rules() {
 #[test]
 fn test_arm_failure_at_every_step_leaves_nic_untouched() {
     let flows = vec![flow(50001, 14), flow(50002, 15)];
-    for fail in [
+    for (i, fail) in [
         FailAt::Channels,
         FailAt::Hds,
+        FailAt::NtupleFeature,
         FailAt::RssGet,
         FailAt::RssSet,
         FailAt::TableSize,
         FailAt::Locs,
         FailAt::Insert(0),
         FailAt::Insert(1),
-    ] {
-        let mut nic = MockNic::new(16, 128);
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("sm-fail-{i}");
+        let mut nic = MockNic::new(&name, 16, 128);
         // Pre-existing foreign rule OUTSIDE the reserved range must survive
         // every failure path.
         nic.rules.insert(3, flow(9999, 1));
@@ -259,7 +285,7 @@ fn test_arm_failure_at_every_step_leaves_nic_untouched() {
 
 #[test]
 fn test_crash_residue_reap_deletes_only_reserved_range_rules() {
-    let mut nic = MockNic::new(16, 128);
+    let mut nic = MockNic::new("sm-reap", 16, 128);
     let (lo, _hi) = reserved_loc_range(nic.table_size);
     // A stale lane rule from a crashed daemon (reserved range) and a foreign
     // rule (operator-owned, outside the range).
@@ -283,7 +309,7 @@ fn test_crash_residue_reap_deletes_only_reserved_range_rules() {
 
 #[test]
 fn test_hds_off_refuses_with_zero_mutations() {
-    let mut nic = MockNic::new(16, 128);
+    let mut nic = MockNic::new("sm-hds", 16, 128);
     nic.hds_on = false;
     let prior = nic.snapshot();
     let err = arm_steering(&mut nic, &[flow(50001, 15)]).expect_err("HDS off must refuse the arm");
@@ -303,18 +329,85 @@ fn test_hds_off_refuses_with_zero_mutations() {
 
 #[test]
 fn test_arm_refuses_empty_flows_and_full_reserved_range() {
-    let mut nic = MockNic::new(16, 128);
+    let mut nic = MockNic::new("sm-empty", 16, 128);
     assert!(
         arm_steering(&mut nic, &[]).is_err(),
         "no flows ⇒ nothing to steer ⇒ refuse (never a silent no-op arm)"
     );
 
     // More flows than reserved slots must refuse, untouched.
-    let mut nic = MockNic::new(16, 128);
+    let mut nic = MockNic::new("sm-full", 16, 128);
     let many: Vec<FlowRule> = (0..STEERING_RESERVED_SLOTS + 1)
         .map(|i| flow(50000 + i as u16, 15))
         .collect();
     let prior = nic.snapshot();
     assert!(arm_steering(&mut nic, &many).is_err());
     assert_eq!(nic.snapshot(), prior);
+}
+
+// ------------------------------------------------- live-session coexistence
+
+#[test]
+fn test_second_arm_on_one_nic_preserves_live_session_rules_and_locs() {
+    // Law 6 (the rxq-arbiter follow-through): the crash-residue reap's
+    // "a reserved-range rule is ALWAYS stale" assumption held only while
+    // one session per NIC was possible. With distinct-rxq sessions, a
+    // second arm must reap around LIVE locs and allocate DISJOINT ones —
+    // otherwise it silently unsteers a live peer (the design-§5 banned
+    // silent-degrade class).
+    let mut nic = MockNic::new("sm-live-a", 32, 128);
+    let g1 = arm_steering(&mut nic, &[flow(50001, 31)]).expect("first session arm");
+    let live_locs: Vec<u32> = nic.rules.keys().copied().collect();
+    assert_eq!(live_locs.len(), 1);
+
+    let g2 = arm_steering(&mut nic, &[flow(50002, 30)]).expect("second session arm");
+    for loc in &live_locs {
+        assert!(
+            nic.rules.contains_key(loc),
+            "second arm must NOT reap a live session's rule @{loc}"
+        );
+    }
+    assert_eq!(
+        nic.rules.len(),
+        2,
+        "two live sessions hold two DISJOINT reserved locs: {:?}",
+        nic.rules.keys().collect::<Vec<_>>()
+    );
+    // Both lane queues stay excluded from RSS while both sessions live.
+    for v in &nic.rss {
+        assert!(
+            ![30u32, 31].contains(v),
+            "RSS must exclude BOTH live sessions' lane queues"
+        );
+    }
+    drop(g2);
+    drop(g1);
+}
+
+#[test]
+fn test_out_of_order_restore_converges_to_pristine_rss() {
+    // Law 7: restores in ANY order end at the pristine table, and a live
+    // peer's queues stay excluded in the interim.
+    let mut nic = MockNic::new("sm-live-b", 32, 128);
+    let pristine = nic.snapshot();
+    let mut g1 = arm_steering(&mut nic, &[flow(50001, 31)]).expect("arm 1");
+    let mut g2 = arm_steering(&mut nic, &[flow(50002, 30)]).expect("arm 2");
+
+    // FIRST armer restores FIRST (out of LIFO order).
+    g1.restore(&mut nic).expect("restore 1");
+    assert!(
+        nic.rss.iter().all(|v| *v != 30),
+        "live session 2's queue must stay excluded after a peer's restore"
+    );
+    assert!(
+        nic.rules.len() == 1,
+        "session 1's rule gone, session 2's live"
+    );
+
+    g2.restore(&mut nic).expect("restore 2");
+    assert_eq!(
+        nic.snapshot(),
+        pristine,
+        "the LAST restore returns the pristine table"
+    );
 }

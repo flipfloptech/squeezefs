@@ -50,6 +50,11 @@ pub trait NicControl {
     fn rxfh_indir(&mut self) -> Result<Vec<u32>, String>;
     /// Replace the RSS indirection table (`ethtool -X weight …`).
     fn set_rxfh_indir(&mut self, indir: &[u32]) -> Result<(), String>;
+    /// ntuple feature state (`ethtool -k … ntuple`): the flow-steering
+    /// capability gate — a NIC with the feature off has no rule table to
+    /// steer into (field row 3, 2026-08-04: the arm read a 0-slot table
+    /// and refused per-session with no remedy named).
+    fn ntuple_enabled(&mut self) -> Result<bool, String>;
     /// ntuple rule table size (loc namespace bound).
     fn ntuple_table_size(&mut self) -> Result<u32, String>;
     /// Locations of ALL installed ntuple rules.
@@ -66,6 +71,28 @@ pub fn lane_queue_picks(channels: u32, want: u16) -> Vec<u32> {
     let cap = channels / 4;
     let take = (want as u32).min(cap);
     (channels - take..channels).collect()
+}
+
+/// Pre-arm steering-capacity gate (field row 3, 2026-08-04): probe the
+/// ntuple FEATURE state and the rule-slot capacity BEFORE any flow rule
+/// (and, in the arm ladder, before any bring-up work). A zero-capacity
+/// NIC refuses with the exact operator remedy named on the line; the
+/// probe is READ-ONLY — the lane never flips NIC features itself.
+/// `Ok` carries the reserved loc range `[lo, hi)` (≥ 1 slot).
+pub fn steering_capacity_gate(nic: &mut dyn NicControl) -> Result<(u32, u32), String> {
+    // RED PHASE: contract pinned by tests/zcrx_lane_tests.rs.
+    let _ = nic;
+    Ok((0, STEERING_RESERVED_SLOTS))
+}
+
+/// Loud-ONCE-per-NIC refusal throttle for the arm ladder (ten fabric
+/// devices ride one NIC — the capacity refusal + remedy must print once,
+/// not 10×; per-DEVICE refusal caching stays the caller's OnceCell).
+/// Returns `true` exactly once per interface name per process.
+pub fn note_arm_refusal_once(ifname: &str) -> bool {
+    // RED PHASE: contract pinned by tests/zcrx_lane_tests.rs.
+    let _ = ifname;
+    true
 }
 
 /// The reserved ntuple loc range `[lo, hi)`: the top

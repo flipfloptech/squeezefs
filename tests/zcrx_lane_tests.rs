@@ -1894,3 +1894,169 @@ async fn test_live_nvmet_tcp_association_and_read_roundtrip() {
     assert_eq!(free, total, "CID custody must close at quiescence");
     sess.quiesce().await;
 }
+
+// -------------------------------------------- rxq arbiter + capacity gate
+//
+// Field row 3 (D12 session, 2026-08-04) pinned red-first:
+//   (1) `REGISTER_ZCRX_IFQ (if_idx=6, rxq=31): File exists` — every lane
+//       session derived the SAME fixed rxq for a NIC; sessions must get
+//       DISTINCT queues from a process-wide per-NIC arbiter.
+//   (2) `zcrx steering: 1 flows exceed the 0 reserved rule slots` — the
+//       ntuple/capacity probe must run BEFORE bring-up, refuse loud ONCE
+//       per NIC, and name the exact operator remedy.
+
+use squeezefs::zcrx_lane::rxq_alloc;
+use squeezefs::zcrx_lane::steering::{self, NicControl};
+
+#[test]
+fn test_rxq_arbiter_two_sessions_on_one_nic_get_distinct_queues() {
+    // (1) Two sessions on one NIC (ifindex-keyed) must never share an rxq.
+    let ifx = 0xACE0;
+    let a = rxq_alloc::acquire(ifx, "itest-nic-a", 32, 4).expect("first lease");
+    assert_eq!(
+        a.queues(),
+        &[28, 29, 30, 31],
+        "first session keeps parity with the §8 highest-indexed picks"
+    );
+    let b = rxq_alloc::acquire(ifx, "itest-nic-a", 32, 4).expect("second lease");
+    for q in b.queues() {
+        assert!(
+            !a.queues().contains(q),
+            "distinct rxqs required (REGISTER_ZCRX_IFQ EEXIST class): {:?} vs {:?}",
+            b.queues(),
+            a.queues()
+        );
+    }
+    for q in a.queues().iter().chain(b.queues()) {
+        assert!((24..32).contains(q), "grants stay in the derived pool");
+    }
+}
+
+#[test]
+fn test_rxq_arbiter_exhaustion_refuses_with_derived_numbers() {
+    // (2 of the arbiter's laws) Exhaustion refusal must name the NIC, the
+    // probed queue count, the DERIVED pool, and the demand — never a bare
+    // errno-class line.
+    let ifx = 0xACE1;
+    let _hold = rxq_alloc::acquire(ifx, "itest-nic-b", 8, 2).expect("pool-filling lease");
+    let err = rxq_alloc::acquire(ifx, "itest-nic-b", 8, 1).expect_err("exhausted pool");
+    for needle in ["itest-nic-b", "8 RX queues", "2 lane-eligible", "demand for 1"] {
+        assert!(
+            err.contains(needle),
+            "refusal must carry {needle:?}: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_rxq_arbiter_release_then_reacquire_reuses_index() {
+    let ifx = 0xACE2;
+    let a = rxq_alloc::acquire(ifx, "itest-nic-c", 8, 2).expect("lease");
+    assert_eq!(a.queues(), &[6, 7]);
+    drop(a);
+    let b = rxq_alloc::acquire(ifx, "itest-nic-c", 8, 2).expect("reacquire");
+    assert_eq!(b.queues(), &[6, 7], "freed indices must be reused");
+}
+
+#[test]
+fn test_rxq_arbiter_range_derives_from_nic_queue_count() {
+    // The derivation law ("never just 8"): the usable rxq range is a
+    // FUNCTION of the probed queue count — channels/4 top slice (§8).
+    for channels in [8u32, 12, 32, 64] {
+        let ifx = 0xACE8 + channels;
+        let lease = rxq_alloc::acquire(ifx, "itest-nic-d", channels, u16::MAX)
+            .unwrap_or_else(|e| panic!("{channels}-queue NIC must grant: {e}"));
+        assert_eq!(lease.queues().len() as u32, channels / 4);
+        for q in lease.queues() {
+            assert!(*q >= channels - channels / 4 && *q < channels);
+        }
+    }
+}
+
+/// A minimal read-only NicControl for the capacity gate: every MUTATING
+/// verb refuses — pinning that the gate never touches NIC state.
+struct CapMock {
+    name: &'static str,
+    ntuple_on: bool,
+    table: u32,
+}
+
+impl NicControl for CapMock {
+    fn ifname(&self) -> &str {
+        self.name
+    }
+    fn combined_channels(&mut self) -> Result<u32, String> {
+        Ok(32)
+    }
+    fn tcp_data_split_on(&mut self) -> Result<bool, String> {
+        Ok(true)
+    }
+    fn ntuple_enabled(&mut self) -> Result<bool, String> {
+        Ok(self.ntuple_on)
+    }
+    fn rxfh_indir(&mut self) -> Result<Vec<u32>, String> {
+        Ok((0..64).collect())
+    }
+    fn set_rxfh_indir(&mut self, _: &[u32]) -> Result<(), String> {
+        panic!("capacity gate must never mutate the NIC (RSS write)");
+    }
+    fn ntuple_table_size(&mut self) -> Result<u32, String> {
+        Ok(self.table)
+    }
+    fn ntuple_locs(&mut self) -> Result<Vec<u32>, String> {
+        Ok(Vec::new())
+    }
+    fn insert_ntuple(&mut self, _: u32, _: &steering::FlowRule) -> Result<(), String> {
+        panic!("capacity gate must never mutate the NIC (rule insert)");
+    }
+    fn delete_ntuple(&mut self, _: u32) -> Result<(), String> {
+        panic!("capacity gate must never mutate the NIC (rule delete)");
+    }
+}
+
+#[test]
+fn test_steering_capacity_gate_zero_slots_refuses_naming_the_remedy() {
+    // (2) The field shape: ntuple off (ethtool -K) reads as a 0-slot rule
+    // table. The gate must refuse BEFORE any flow rule, read-only, naming
+    // the exact remedy — and the arm ladder's loud-once-per-NIC cache
+    // keeps 10 fabric devices from printing it 10×.
+    let mut off = CapMock {
+        name: "itest-cap-off",
+        ntuple_on: false,
+        table: 1024,
+    };
+    let err = steering::steering_capacity_gate(&mut off).expect_err("ntuple off must refuse");
+    assert!(
+        err.contains("ethtool -K itest-cap-off ntuple on"),
+        "refusal must name the exact remedy: {err}"
+    );
+
+    let mut zero = CapMock {
+        name: "itest-cap-zero",
+        ntuple_on: true,
+        table: 0,
+    };
+    let err = steering::steering_capacity_gate(&mut zero).expect_err("0-slot table must refuse");
+    assert!(
+        err.contains("0-slot") && err.contains("ethtool -K"),
+        "zero-capacity refusal must name the table size and a remedy: {err}"
+    );
+
+    // Healthy NIC: gate passes and returns the reserved range.
+    let mut ok = CapMock {
+        name: "itest-cap-ok",
+        ntuple_on: true,
+        table: 1024,
+    };
+    let (lo, hi) = steering::steering_capacity_gate(&mut ok).expect("healthy gate");
+    assert_eq!((lo, hi), steering::reserved_loc_range(1024));
+
+    // Loud-once-per-NIC: first refusal reports, repeats are throttled;
+    // a DIFFERENT NIC reports again.
+    assert!(steering::note_arm_refusal_once("itest-once-a"));
+    assert!(
+        !steering::note_arm_refusal_once("itest-once-a"),
+        "second refusal on one NIC must be throttled (10 devices ride one NIC)"
+    );
+    assert!(steering::note_arm_refusal_once("itest-once-b"));
+}

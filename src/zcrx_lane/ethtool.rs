@@ -249,6 +249,11 @@ impl NicControl for EthtoolNic {
             .map_err(|e| format!("SRSSH: {e}"))
     }
 
+    fn ntuple_enabled(&mut self) -> Result<bool, String> {
+        // RED PHASE: real GFLAGS probe lands with the capacity-gate fix.
+        Err("ntuple feature probe unimplemented".into())
+    }
+
     fn ntuple_table_size(&mut self) -> Result<u32, String> {
         let mut nfc = EthtoolRxnfc {
             cmd: ETHTOOL_GRXCLSRLCNT,

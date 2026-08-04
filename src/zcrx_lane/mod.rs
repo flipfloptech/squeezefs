@@ -21,6 +21,7 @@ pub mod initiator;
 pub mod pdu;
 pub mod pdu_stream;
 pub mod probe;
+pub mod rxq_alloc;
 pub mod steering;
 mod uring_zcrx;
 

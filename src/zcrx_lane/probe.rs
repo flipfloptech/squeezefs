@@ -76,7 +76,7 @@ pub fn nvme_tcp_target_for_with_root(device_path: &str, sysfs_root: &Path) -> Op
     if !lbs.is_power_of_two() {
         return None;
     }
-    let max_kb: u32 = read(&blk_dir.join("queue/max_hw_sectors_kb"))?
+    let max_kb: u64 = read(&blk_dir.join("queue/max_hw_sectors_kb"))?
         .parse()
         .ok()?;
     // Derived geometry (design §8): queues from possible CPUs, depth from a
@@ -86,17 +86,40 @@ pub fn nvme_tcp_target_for_with_root(device_path: &str, sysfs_root: &Path) -> Op
         .unwrap_or(1);
     let io_queues = (cpus / 8).clamp(1, 8) as u16;
     let queue_depth = ((cpus * 2).clamp(4, 64)) as u16;
+    // The 2026-08-04 field-refusal fix: fabrics controllers with UNLIMITED
+    // MDTS advertise `max_hw_sectors_kb = 2147483644` (the i32::MAX-class
+    // sentinel — measured on every nvme-tcp data controller of the
+    // squeeze-test fleet). The former u32 `checked_mul(1024)?` overflowed
+    // and SILENTLY refused the arm — `zcrx_lane_armed` could never leave 0
+    // on a real fabrics box, while the bounded dev-substrate backings never
+    // produced the sentinel. A huge device limit means the LANE's own
+    // per-command window is the binding constraint: saturate to
+    // [`LANE_MAX_XFER_CAP_BYTES`], floor one LBA (a zero/garbage sysfs
+    // value must not zero the area window downstream).
+    let max_xfer_bytes = max_kb
+        .saturating_mul(1024)
+        .clamp(1u64 << lbs.trailing_zeros(), LANE_MAX_XFER_CAP_BYTES as u64)
+        as u32;
     Some(LaneTarget {
         traddr: traddr?,
         trsvcid: trsvcid?,
         subnqn,
         nsid,
         lba_shift: lbs.trailing_zeros(),
-        max_xfer_bytes: max_kb.checked_mul(1024)?,
+        max_xfer_bytes,
         io_queues,
         queue_depth,
     })
 }
+
+/// The lane's own per-command transfer cap: 1 MiB — the FUSE transport's
+/// negotiated `max_write`/payload face (the largest single destination a
+/// lane dest-serve fills in one command today) and the Z2-benched
+/// MDTS-face class. A device advertising more (or the unlimited sentinel
+/// above) splits into sub-commands exactly as the kernel initiator would,
+/// and the cap bounds per-queue area sizing at `depth × 1 MiB`
+/// (`area_bytes_per_queue`).
+pub const LANE_MAX_XFER_CAP_BYTES: u32 = 1024 * 1024;
 
 /// Host identity (design §4.1): field parity with the kernel initiator when
 /// `/etc/nvme/{hostnqn,hostid}` exist, else a stable per-process identity.

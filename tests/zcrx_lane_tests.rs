@@ -466,7 +466,10 @@ fn test_probe_sysfs_discovery_tcp_and_refusals() {
     assert_eq!(t.subnqn, "nqn.test:sub");
     assert_eq!(t.nsid, 1);
     assert_eq!(t.lba_shift, 9);
-    assert_eq!(t.max_xfer_bytes, 4096 * 1024);
+    // 4 MiB device limit > the lane's own 1 MiB per-command cap ⇒ capped
+    // (the sentinel-fix law; bounded-below-cap devices keep theirs — see
+    // test_probe_unlimited_mdts_sentinel_arms_with_saturated_xfer_cap).
+    assert_eq!(t.max_xfer_bytes, probe::LANE_MAX_XFER_CAP_BYTES);
     assert!(t.io_queues >= 1 && t.queue_depth >= 4, "derived geometry");
 
     // Non-tcp transport is ineligible.
@@ -484,6 +487,55 @@ fn test_probe_sysfs_discovery_tcp_and_refusals() {
             "{p} must be ineligible"
         );
     }
+}
+
+/// The 2026-08-04 squeeze-test field refusal: fabrics controllers with
+/// UNLIMITED MDTS advertise `max_hw_sectors_kb = 2147483644` (the
+/// i32::MAX-class sentinel — measured verbatim on every nvme-tcp data
+/// controller of the field fleet). The probe computed `max_kb * 1024`
+/// in u32, `checked_mul` overflowed, and the `?` silently refused —
+/// `zcrx_lane_armed` stayed 0 on every REAL fabrics box while the
+/// bounded dev-substrate backings (null_blk/zram) never produced the
+/// sentinel. The transfer cap must SATURATE to the lane's own
+/// per-command bound instead: a huge device limit means the LANE's
+/// window is the binding constraint, never a refusal.
+#[test]
+fn test_probe_unlimited_mdts_sentinel_arms_with_saturated_xfer_cap() {
+    let root = tempfile::tempdir().unwrap();
+    let ctrl = root.path().join("class/nvme/nvme26");
+    let blk = root.path().join("block/nvme26n1/queue");
+    std::fs::create_dir_all(&ctrl).unwrap();
+    std::fs::create_dir_all(&blk).unwrap();
+    std::fs::write(ctrl.join("transport"), "tcp\n").unwrap();
+    std::fs::write(
+        ctrl.join("address"),
+        "traddr=10.181.177.196,trsvcid=4420,src_addr=10.181.177.194\n",
+    )
+    .unwrap();
+    std::fs::write(
+        ctrl.join("subsysnqn"),
+        "nqn.2026-07.io.squeezefs:aqs39-d0\n",
+    )
+    .unwrap();
+    std::fs::write(root.path().join("block/nvme26n1/nsid"), "1\n").unwrap();
+    std::fs::write(blk.join("logical_block_size"), "4096\n").unwrap();
+    // The field sentinel, byte-for-byte.
+    std::fs::write(blk.join("max_hw_sectors_kb"), "2147483644\n").unwrap();
+
+    let t = probe::nvme_tcp_target_for_with_root("/dev/nvme26n1", root.path())
+        .expect("an unlimited-MDTS fabrics controller must arm, not refuse");
+    assert_eq!(
+        t.max_xfer_bytes,
+        probe::LANE_MAX_XFER_CAP_BYTES,
+        "the sentinel saturates to the lane's own per-command cap"
+    );
+    assert_eq!(t.lba_shift, 12);
+
+    // A bounded device below the cap keeps its own limit verbatim.
+    std::fs::write(blk.join("max_hw_sectors_kb"), "128\n").unwrap();
+    let t = probe::nvme_tcp_target_for_with_root("/dev/nvme26n1", root.path())
+        .expect("bounded device resolves");
+    assert_eq!(t.max_xfer_bytes, 128 * 1024, "bounded limit kept verbatim");
 }
 
 // -------------------------------------------------- association + read laws

@@ -38,9 +38,12 @@
 //!    surviving ledger and the surviving layout agree (one tx = one
 //!    checksummed journal entry, §4.10).
 
+use fuse3::raw::prelude::Filesystem;
+use fuse3::raw::Request;
 use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
+use squeezefs::fuse_client::{SqueezefsFilesystem, METRICS};
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::block_refs::{self, BLOCK_INDEX_MAP_BLOB};
 use squeezefs::meta_backend::kv::builder::{format_v3, FormatV3Options};
@@ -1167,6 +1170,466 @@ async fn fsck_reports_no_durable_reference_drift_on_a_healthy_volume() {
     assert!(
         rig.drift().await.is_empty(),
         "the comparison itself must be exact"
+    );
+    rig.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 10. Vector B of the 2026-08-04 shadow-supersession finding
+//     (rc-manifest §3d item 4): pending block-ref notes must never drain
+//     into a commit that does not persist the bindings they describe.
+// ---------------------------------------------------------------------------
+//
+// The recorded bug: the rewrite-shadow ACK path mutates the RAM map only
+// and NOTES its durable-reference delta (release A / take B) into the
+// per-ino `pending_block_refs` accumulator; `save_metadata_to_backend_ext`
+// drains the ino's ENTIRE pending vector into whichever save runs next.
+// A DELTA-class publish (the coalesced conveyor's O(batch) layout-delta
+// save — the flush-leg venue) durably persists only its OWN
+// `publish_entries`, so the drained shadow notes ride a commit whose
+// folded durable map still binds A. Crash inside that window on a
+// bit-8-stamped volume: the ledger claims releases/takes the durable map
+// does not reflect — fsck C8 drift after remount.
+//
+// Venue note: a shadow epoch is only reachable through the FUSE-layer
+// ACK path (`rewrite_shadow_record` and `note_block_ref_ops` are
+// pub(crate) — the stamped `Rig` alone cannot create pending notes), so
+// this section drives a `SqueezefsFilesystem` harness (the
+// `rewrite_shadow_supersede_tests` shape) over this suite's STAMPED
+// formatter, and publishes mid-epoch through the public
+// `merge_block_mappings_coalesced` — the exact call the flush legs make
+// (`upload_block_publish_phase`'s non-shadow arm).
+//
+// The suite's default 4 MiB block size is kept on purpose (no
+// `SQUEEZEFS_DEFAULT_BLOCK_SIZE` mutation): this binary's `Rig` tests
+// derive their math from the un-overridden default, and the §3d item-1
+// env-leak class is exactly what a per-fixture override would reintroduce.
+
+/// Block size of the FUSE-harness fixtures (the process default — see
+/// the section note above).
+const FUSE_BLOCK: u64 = 4 * 1024 * 1024;
+
+/// The section's serialization (the `rewrite_shadow_supersede_tests`
+/// idiom): the rewrite-epoch gauge and the shadow lever are
+/// process-global, so the two harness tests must not overlap.
+static FS_SERIAL: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+async fn fs_serial() -> tokio::sync::MutexGuard<'static, ()> {
+    FS_SERIAL
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
+
+/// One FUSE-layer mount over the SAME meta/data files the `Rig` uses —
+/// the caller owns the files, so dropping the harness without a
+/// `shutdown()` is the crash-sim (the suite's power-cut/reopen pattern).
+struct FsH {
+    fs: Arc<SqueezefsFilesystem>,
+    req: Request,
+    alloc: Arc<BlockAllocator>,
+    routed: Arc<RoutedMetaBackend>,
+    _staging: TempDir,
+}
+
+async fn mount_fs(meta: &std::path::Path, data: &std::path::Path) -> FsH {
+    let kv = KvMetaBackend::open(meta)
+        .await
+        .expect("open v3 meta volume");
+    let routed = Arc::new(RoutedMetaBackend::new(vec![kv]));
+    let dlm = DlmClient::new().unwrap();
+    let nvme = Arc::new(NvmeBlockDev::new(data.to_str().unwrap()));
+    let alloc = Arc::new(BlockAllocator::new(DATA_VOL_ID).await.unwrap());
+    alloc.set_capacity_bytes(DATA_LEN);
+    let staging = tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![staging.path().to_path_buf()],
+        Some("64MB"),
+        Some("64MB"),
+        Some("16MB"),
+        Some("32MB"),
+        alloc.clone(),
+        nvme.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let router = DataRouter::new(dlm.clone(), cache, alloc.clone(), nvme);
+    let mut fs = SqueezefsFilesystem::new(router, dlm, 1000, 1000);
+    fs.router.set_meta_backend(routed.clone());
+    fs.meta_backend = Some(routed.clone());
+    let req = Request {
+        unique: 1,
+        uid: unsafe { libc::getuid() },
+        gid: unsafe { libc::getgid() },
+        pid: 1,
+        ..Default::default()
+    };
+    FsH {
+        fs: Arc::new(fs),
+        req,
+        alloc,
+        routed,
+        _staging: staging,
+    }
+}
+
+fn pattern(len: usize, seed: u8) -> Vec<u8> {
+    (0..len)
+        .map(|i| ((i as u64 * 7 + seed as u64) % 251) as u8)
+        .collect()
+}
+
+async fn fs_write_at(h: &FsH, ino: u64, off: u64, data: &[u8]) {
+    let w =
+        h.fs.write(
+            h.req,
+            ino,
+            0,
+            off,
+            bytes::Bytes::copy_from_slice(data),
+            0,
+            0,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("write off {off}: {e:?}"));
+    assert_eq!(w.written as usize, data.len(), "short write");
+}
+
+async fn fs_quiesce(h: &FsH) {
+    assert!(
+        h.fs.write_pipeline
+            .quiesce(std::time::Duration::from_secs(30))
+            .await,
+        "pipeline must drain"
+    );
+}
+
+/// Fresh striped fixture of `blocks` whole blocks, drained + fsync'd
+/// (the `rewrite_shadow_supersede_tests` idiom at this suite's block
+/// size — whole-block coverage rides write-through past staging).
+async fn fs_striped_fixture(h: &FsH, name: &str, blocks: u64, seed: u8) -> u64 {
+    let ino =
+        h.fs.create(
+            h.req,
+            1,
+            std::ffi::OsStr::new(name),
+            libc::S_IFREG | 0o644,
+            0,
+        )
+        .await
+        .expect("create")
+        .attr
+        .ino;
+    fs_write_at(h, ino, 0, &pattern((blocks * FUSE_BLOCK) as usize, seed)).await;
+    h.fs.fsync(h.req, ino, 0, false).await.expect("fsync");
+    fs_quiesce(h).await;
+    let path = squeezefs::keys::inode_path(ino);
+    h.fs.router.metadata_cache.remove(&ino);
+    let meta = h.fs.router.fetch_metadata(&path).await.expect("meta");
+    assert_eq!(meta.file_type, "striped", "fixture premise: striped");
+    assert_eq!(
+        meta.block_map.as_ref().map(|m| m.len()).unwrap_or(0),
+        blocks as usize,
+        "fixture premise: every block mapped"
+    );
+    ino
+}
+
+/// The RAM-authoritative map (what reads resolve through — mid-epoch it
+/// carries the shadow bindings by the KD-1.9 compose).
+async fn fs_ram_map(h: &FsH, ino: u64) -> std::collections::HashMap<u32, String> {
+    let path = squeezefs::keys::inode_path(ino);
+    (*h.fs
+        .router
+        .fetch_metadata(&path)
+        .await
+        .expect("meta")
+        .block_map
+        .expect("mapped"))
+    .clone()
+}
+
+fn open_epochs() -> u64 {
+    use std::sync::atomic::Ordering;
+    METRICS.rewrite_shadow_open_epochs.load(Ordering::Relaxed)
+}
+
+/// Mint a fresh published block on the harness allocator and return its
+/// backend-true key + offset (the flush-leg upload's DMA product, minus
+/// the device write — irrelevant to ledger/map coherence).
+async fn fs_mint_key(h: &FsH, template_key: &str) -> (String, u64) {
+    let offset = h.alloc.allocate_block().await.expect("allocate");
+    h.alloc.publish_block(offset);
+    let (be_id, _) =
+        h.fs.router
+            .backend_router
+            .parse_block_key(template_key)
+            .expect("parse template key");
+    (
+        h.fs.router.backend_router.persist_block_key(&be_id, offset),
+        offset,
+    )
+}
+
+fn fs_offset_of(h: &FsH, key: &str) -> u64 {
+    h.fs.router
+        .backend_router
+        .parse_block_key(key)
+        .expect("parse")
+        .1
+}
+
+/// Durable refcount of one block offset on the harness's live mount.
+async fn fs_durable_refcount(h: &FsH, offset: u64) -> u32 {
+    let tag = block_refs::volume_tag(DATA_VOL_ID);
+    let idx = offset / h.alloc.chunk_size();
+    h.routed.volumes[0]
+        .block_ref_scan(tag)
+        .await
+        .expect("durable reference scan")
+        .iter()
+        .filter(|r| r.block_idx == idx)
+        .count() as u32
+}
+
+/// Open a shadow epoch on `ino` (whole-block ACK-path overwrite of block
+/// 0 — displacing, so `rewrite_shadow_record` opens the epoch and NOTES
+/// the deferred {release A0, take B1} pair), then publish a DIFFERENT
+/// index (block 1) through the coalesced conveyor — the flush-leg venue,
+/// delta-eligible by every caller-half clause. Returns
+/// `(a0_key, b1_key, k_new)`.
+async fn fs_shadow_then_mid_epoch_publish(h: &FsH, ino: u64) -> (String, String, String) {
+    let map_a = fs_ram_map(h, ino).await;
+    let a0 = map_a.get(&0).expect("block 0 mapped").clone();
+
+    let ob = open_epochs();
+    fs_write_at(h, ino, 0, &pattern(FUSE_BLOCK as usize, 7)).await;
+    fs_quiesce(h).await;
+    assert_eq!(open_epochs() - ob, 1, "premise: the epoch is open");
+    let b1 = fs_ram_map(h, ino)
+        .await
+        .get(&0)
+        .expect("block 0 mapped")
+        .clone();
+    assert_ne!(&b1, &a0, "premise: the shadow rebound block 0");
+
+    // The mid-epoch flush-leg publish of block 1 (a DIFFERENT index —
+    // KD-1.11's supersession must not touch shadow[0], so the pending
+    // notes stay pending until a save drains them).
+    let (k_new, _) = fs_mint_key(h, &b1).await;
+    let token = h.fs.router.dlm.get_fencing_token_ino(ino);
+    let displaced =
+        h.fs.router
+            .merge_block_mappings_coalesced(
+                ino,
+                vec![(1, k_new.clone())],
+                0,
+                LayoutFlip::ToStripedKeepStagedIdentity,
+                token,
+            )
+            .await
+            .expect("mid-epoch coalesced publish");
+    // The flush leg frees its displaced key (upload_block_publish_phase's
+    // caller discipline).
+    for k in &displaced {
+        h.fs.router
+            .backend_router
+            .free_block(k)
+            .await
+            .expect("free displaced key");
+    }
+    (a0, b1, k_new)
+}
+
+/// **Vector B, the crash window itself**: a mid-epoch DELTA-class publish
+/// must not consume pending shadow notes — a commit may carry a
+/// reference delta only if it persists the bindings that justify it.
+///
+/// RED against the recorded bug: the coalesced publish of block 1 drains
+/// the epoch's {release A0, take B1} notes into an O(batch) layout-delta
+/// commit whose folded durable map still binds block 0 → A0. The
+/// crash-sim (drop without shutdown, the suite's power-cut/reopen
+/// pattern) then surfaces exactly the §3d item-4 state: a durable ledger
+/// claiming releases/takes the durable map does not reflect — the
+/// `drift()` oracle reports A0 (derived, no record) and B1 (recorded, no
+/// referencing layout).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mid_epoch_delta_publish_cannot_strand_pending_shadow_notes_across_a_crash() {
+    let _g = fs_serial().await;
+    let meta = NamedTempFile::new().unwrap();
+    format_meta_stamped(meta.path()).await;
+    let data = data_file();
+
+    {
+        let h = mount_fs(meta.path(), data.path()).await;
+        let ino = fs_striped_fixture(&h, "vecb_crash", 2, 1).await;
+        let ctl = fs_striped_fixture(&h, "vecb_ctl", 2, 2).await;
+
+        // Premise: the coalesced venue IS delta-capable on this volume —
+        // a control ino with NO epoch (and so no pending notes) takes the
+        // O(batch) layout-delta path. Without this the test could pass
+        // vacuously against a volume whose eligibility ladder never
+        // engages.
+        {
+            use std::sync::atomic::Ordering;
+            let before =
+                squeezefs::meta_backend::kv::META_KV_LAYOUT_DELTA_COMMITS.load(Ordering::Relaxed);
+            let tpl = fs_ram_map(&h, ctl).await.get(&0).unwrap().clone();
+            let (ctl_key, _) = fs_mint_key(&h, &tpl).await;
+            let token = h.fs.router.dlm.get_fencing_token_ino(ctl);
+            let displaced =
+                h.fs.router
+                    .merge_block_mappings_coalesced(
+                        ctl,
+                        vec![(1, ctl_key)],
+                        0,
+                        LayoutFlip::ToStripedKeepStagedIdentity,
+                        token,
+                    )
+                    .await
+                    .expect("control publish");
+            for k in &displaced {
+                h.fs.router.backend_router.free_block(k).await.unwrap();
+            }
+            assert!(
+                squeezefs::meta_backend::kv::META_KV_LAYOUT_DELTA_COMMITS.load(Ordering::Relaxed)
+                    > before,
+                "premise: an epoch-free coalesced publish on this volume rides the \
+                 layout-delta path (the venue Vector B needs)"
+            );
+        }
+
+        let (_a0, _b1, _k_new) = fs_shadow_then_mid_epoch_publish(&h, ino).await;
+
+        // CRASH mid-epoch: no shutdown, no checkpoint — the reopened
+        // volume sees only what the journal committed (§4.10). The
+        // shadow's RAM-only bindings are legitimately lost (the W1
+        // window); what must NOT survive is a ledger claiming them.
+        drop(h);
+    }
+
+    let rig = mount(meta.path(), data.path()).await;
+    rig.router
+        .backend_router
+        .recover_durable_block_refs(&rig.routed)
+        .await
+        .unwrap()
+        .expect("bit 8 is stamped, so the durable path must run");
+    let drift = rig.drift().await;
+    assert!(
+        drift.is_empty(),
+        "Vector B (rc-manifest §3d item 4): the surviving ledger and the surviving \
+         layouts disagree after a crash inside the mid-epoch delta-publish window — \
+         pending shadow notes rode a commit that did not persist the bindings they \
+         describe: {drift:?}"
+    );
+    rig.shutdown().await;
+}
+
+/// **The other edge of the same law — the notes still LAND.** Draining
+/// only into full-save-class commits must not starve the notes forever
+/// (never-drained notes are the opposite bug: a durable map naming B
+/// bindings the ledger never recorded, C2-leaked-in-ledger).
+///
+/// Pins, at every boundary a sound fix shape must satisfy:
+/// * after the mid-epoch publish (whatever save class it took), the LIVE
+///   oracle is already clean — the ledger never disagrees with the
+///   durable layouts at ANY commit boundary (RED against the recorded
+///   bug: the delta commit leaves durable block 0 → A0 while the ledger
+///   says B1);
+/// * after the epoch's close (the fsync trigger — the full-save
+///   carrier), the shadow binding's take and the displaced binding's
+///   release are DURABLE and exact;
+/// * a clean-shutdown remount seeded from records alone still agrees.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pending_shadow_notes_land_durably_by_the_epoch_close() {
+    let _g = fs_serial().await;
+    let meta = NamedTempFile::new().unwrap();
+    format_meta_stamped(meta.path()).await;
+    let data = data_file();
+
+    {
+        let h = mount_fs(meta.path(), data.path()).await;
+        let ino = fs_striped_fixture(&h, "vecb_close", 2, 3).await;
+
+        let (a0, b1, k_new) = fs_shadow_then_mid_epoch_publish(&h, ino).await;
+        let a0_off = fs_offset_of(&h, &a0);
+        let b1_off = fs_offset_of(&h, &b1);
+        let k_new_off = fs_offset_of(&h, &k_new);
+
+        // Boundary 1 — mid-epoch, post-publish: whatever save class the
+        // publish took, ledger == durable layouts EXACTLY.
+        let drift =
+            h.fs.router
+                .backend_router
+                .verify_durable_block_refs(&h.routed)
+                .await
+                .expect("verification pass");
+        assert!(
+            drift.is_empty(),
+            "the mid-epoch publish left the durable ledger disagreeing with the \
+             durable layouts (Vector B's window, observed live): {drift:?}"
+        );
+
+        // Boundary 2 — the close (fsync trigger): THE SWAP's whole-tx
+        // full save is the notes' natural carrier; nothing may starve.
+        let ob = open_epochs();
+        h.fs.fsync(h.req, ino, 0, false).await.expect("fsync close");
+        fs_quiesce(&h).await;
+        assert!(open_epochs() < ob + 1, "premise: the epoch closed");
+
+        assert_eq!(
+            fs_durable_refcount(&h, b1_off).await,
+            1,
+            "the shadow binding's TAKE must be durable after the close — a \
+             starved note is the C2-leaked-in-ledger direction"
+        );
+        assert_eq!(
+            fs_durable_refcount(&h, a0_off).await,
+            0,
+            "the displaced binding's RELEASE must be durable after the close"
+        );
+        assert_eq!(
+            fs_durable_refcount(&h, k_new_off).await,
+            1,
+            "the mid-epoch publish's own take is untouched by the drain discipline"
+        );
+        // The swap freed the parked displaced key (§5.2 — a durable save
+        // no longer references A0).
+        assert_eq!(
+            h.alloc.refcount(a0_off),
+            None,
+            "the close frees the parked displaced key"
+        );
+        let drift =
+            h.fs.router
+                .backend_router
+                .verify_durable_block_refs(&h.routed)
+                .await
+                .expect("verification pass");
+        assert!(
+            drift.is_empty(),
+            "post-close: durable == derived: {drift:?}"
+        );
+
+        h.routed.volumes[0]
+            .shutdown()
+            .await
+            .expect("clean shutdown");
+    }
+
+    // Boundary 3 — a remount seeded from records alone.
+    let rig = mount(meta.path(), data.path()).await;
+    rig.router
+        .backend_router
+        .recover_durable_block_refs(&rig.routed)
+        .await
+        .unwrap()
+        .expect("durable path");
+    assert!(
+        rig.drift().await.is_empty(),
+        "durable and derived must agree after the close + remount (no starved notes)"
     );
     rig.shutdown().await;
 }

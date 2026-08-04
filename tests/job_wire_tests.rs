@@ -1171,6 +1171,77 @@ async fn pre_enrollment_frames_ride_the_hello_class_cap() {
     host.shutdown().await;
 }
 
+/// The 2026-08-04 from-zero `task check` flake ("timed out after 15s
+/// waiting for: finished handles pruned"), pinned deterministically.
+///
+/// Mechanism: pruning ran ONLY inside the accept loop (retain-then-push
+/// per accept), so on a QUIET host — no accept after the last
+/// connection — every serve handle still unfinished at the last
+/// accept's retain was retained until shutdown. The sibling test's
+/// bounded wait was therefore structurally unbounded: it passed only
+/// when the scheduler finished all but ≤2 serve tasks before the 24th
+/// accept ran its prune, and froze above the bound forever otherwise.
+///
+/// This test forces the flake's schedule instead of hoping for it: hold
+/// EVERY connection open through its own accept (the last accept's
+/// retain can free nothing — all serve tasks are alive), then let them
+/// all finish on a host that never accepts again. The registry must
+/// drain to its base with NO further connection event — the serve
+/// task's own completion is the prune trigger. The poll deadline is a
+/// failsafe, not the synchronization.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quiet_host_releases_finished_handles_without_further_accepts() {
+    let (meta, _mf) = meta_fixture().await;
+    let fab = fabric(&meta, 0).await;
+    let mut cfg = wire_cfg(30_000, 10_000);
+    // Long enough that no serve task can time out during setup: the
+    // held connections keep all 12 tasks alive until the drop below,
+    // so the LAST accept's retain provably finds nothing finished.
+    cfg.handshake_timeout = Duration::from_secs(5);
+    cfg.max_connections = 32; // never refuse the held population
+    let host = JobWireHost::start(fab.clone(), cfg, FakeShardDevice::new(0, 0))
+        .await
+        .expect("host start");
+
+    let base = host.retained_task_handles();
+    let mut held = Vec::with_capacity(12);
+    for _ in 0..12 {
+        held.push(
+            tokio::net::TcpStream::connect(host.endpoint())
+                .await
+                .expect("connect"),
+        );
+    }
+    // All 12 handles registered, none finished (the connections are
+    // still open): the accept loop has run its last prune of this test.
+    poll_until(
+        "all 12 held serve handles registered",
+        Duration::from_secs(10),
+        || host.retained_task_handles() >= base + 12,
+    )
+    .await;
+    assert_eq!(
+        host.live_connections(),
+        12,
+        "every held connection must be a live serve task before the drop"
+    );
+
+    drop(held); // EOF — every serve task now finishes on a quiet host
+
+    poll_until(
+        "quiet host releases finished handles (failsafe deadline)",
+        Duration::from_secs(15),
+        || host.retained_task_handles() <= base,
+    )
+    .await;
+    assert_eq!(
+        host.accept_backoffs(),
+        0,
+        "a healthy accept loop never backs off"
+    );
+    host.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn finished_connection_handles_are_pruned() {
     // RES-5: `handles` was push-only — one `JoinHandle` retained per

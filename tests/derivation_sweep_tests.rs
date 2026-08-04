@@ -412,3 +412,86 @@ fn uring_fs_workers_derive_from_process_cores() {
     assert_eq!(resolve_worker_count(Some("999"), 32), 64, "env clamp");
     assert_eq!(resolve_worker_count(Some("junk"), 32), 8);
 }
+
+// ---------------------------------------------------------------------------
+// A12 — IPC per-uid session cap: session-budget derived, shipped floor
+// ---------------------------------------------------------------------------
+
+/// The bare `per_uid_session_cap: 64` becomes `clamp(arena_cap_bytes /
+/// arena_bytes, 64, 4096)` — the session population the R5 admission cap
+/// can actually hold (2026-08-04 field conviction: a matched-inflight
+/// 256-process fio battery on the squeeze-test cluster hit the literal —
+/// `ipc_admission_refusals` 125, ~192 of 256 jobs silently on the kernel
+/// lane, engagement 0.695 ⇒ INVALID row — while the box's own session
+/// budget, cap ≈ 22.5 GiB ÷ 176 MiB arenas ≈ 131, admitted twice the
+/// cap). Per-uid is a DoS tripwire, not an inter-uid fairness device
+/// (VAL-7d: single-tenant by declaration), so the budget IS the bound;
+/// floor 64 = the shipped posture (never-regress-below-shipped); rail
+/// 4096 = the ctl-thread exhaustion rail (`ctl_conn_cap_from` — every
+/// admitted session holds a ctl connection = one OS thread). No env
+/// knob: the cap was never operator-tunable, and the budget knobs it
+/// derives from (`SQUEEZEFS_IPC_MEM_{PCT,MAX}`, `SQUEEZEFS_IPC_ARENA_MB`)
+/// remain the operator levers.
+#[test]
+fn ipc_per_uid_session_cap_derives_from_session_budget() {
+    use mem_budget::{ipc_arena_cap, ipc_per_uid_session_cap, resolve_ipc_arena_bytes};
+    // Field shape: cap 22 GiB, derived arena 176 MiB ⇒ 128 sessions.
+    // The canonical derived pair divides exactly (arena = cap/128), so
+    // the budget admits DOUBLE the old literal; the field capture's
+    // measured pair (≈ 22.5 GiB / 176 MiB ⇒ ≈ 131) is the same class.
+    let field_cap = ipc_arena_cap(FIELD_BUDGET);
+    let field_arena = resolve_ipc_arena_bytes(None, field_cap);
+    assert_eq!(field_arena, 176 * MIB, "A9 anchor drifted — re-derive A12");
+    assert_eq!(
+        ipc_per_uid_session_cap(field_cap, field_arena),
+        128,
+        "field shape: the session budget holds 128 default arenas — the \
+         bare 64 refused half of them"
+    );
+    // Alignment round-down RAISES the quotient past 128 (the A9 bounce
+    // shape): cap 11.25 GiB ⇒ arena 88 MiB ⇒ 130.
+    assert_eq!(
+        ipc_per_uid_session_cap(90 * 128 * MIB, resolve_ipc_arena_bytes(None, 90 * 128 * MIB)),
+        130
+    );
+    // Floor shape: cap ≈ 358 MiB, arena at the 64 MiB shipped floor ⇒
+    // the budget holds 5 sessions — the floor keeps the shipped 64
+    // (never-regress-below-shipped; the budget admission at
+    // `arena_cap_bytes` still refuses the 6th arena first).
+    let floor_cap = ipc_arena_cap(FLOOR_BUDGET);
+    assert_eq!(
+        ipc_per_uid_session_cap(floor_cap, resolve_ipc_arena_bytes(None, floor_cap)),
+        64,
+        "floor shape: never regress below the shipped 64"
+    );
+    // Rail shape: an enormous cap (env-set SQUEEZEFS_IPC_MEM_MAX / tiny
+    // SQUEEZEFS_IPC_ARENA_MB) rails at 4096 — the daemon session store
+    // is an unbounded map and the shim's SESSION_REGISTRY_SLOTS (32)
+    // bounds a client PROCESS, not the uid population across processes,
+    // so the ctl-thread rail is the binding structural bound.
+    assert_eq!(ipc_per_uid_session_cap(u64::MAX, 64 * MIB), 4096);
+    assert_eq!(ipc_per_uid_session_cap(1024 * GIB, MIB), 4096);
+    // Defensive: a zero arena never divides-by-zero — the divisor floors
+    // at 1 (mirroring `ctl_conn_cap_from`'s `session_footprint.max(1)`),
+    // so nonsense geometry rails rather than panicking.
+    assert_eq!(ipc_per_uid_session_cap(100 * MIB, 0), 4096);
+}
+
+/// Coherence: growing the per-session arena at a fixed admission cap can
+/// only LOWER (never raise) the session population the budget holds —
+/// the cap must be monotone non-increasing in `arena_bytes`.
+#[test]
+fn ipc_per_uid_session_cap_monotone_in_arena() {
+    use mem_budget::ipc_per_uid_session_cap;
+    let cap = 22 * GIB;
+    let mut last = usize::MAX;
+    for arena_mib in [4_u64, 16, 64, 88, 176, 256, 1024, 4096, 22 * 1024] {
+        let got = ipc_per_uid_session_cap(cap, arena_mib * MIB);
+        assert!(
+            got <= last,
+            "fixed cap {cap}: growing the arena to {arena_mib} MiB RAISED \
+             the session cap ({got} > {last})"
+        );
+        last = got;
+    }
+}

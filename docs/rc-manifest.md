@@ -474,6 +474,31 @@ Loopback **floor**, qd1, engagement exact: **9.33 µs** median at 0 B (2,000 sam
 
 **The experiment that would settle it** (hours, no product code): on a rig with a real topology gradient, measure a raw userspace TCP block-serve hop against the nvme-tcp target hop for the same block, plus an N-client shared-hot-block bandwidth row. If peer-hop ≥ target-hop on a flat fabric — the prediction — the feature is definitionally a topology-and-bandwidth play and must be justified on a multi-rack venue, never on this one.
 
+### go-task → cargo xtask migration — deferred until the D12 board closes (user ruling 2026-08-04)
+
+**Ruling:** the user asked whether the build system can migrate from go-task
+to cargo and chose to land it **after** the D12 performance push closes —
+this supersedes-in-principle the 2026-07-25 "go-task is the packaged build
+path" directive, with execution deferred so tooling churn never rides the
+perf wave.
+
+**Shape (agreed):** the cargo-xtask pattern — a dep-light `crates/xtask`
+binary (std-only or `anyhow`) + a `.cargo/config.toml` alias, porting the
+Taskfile's verbs 1:1 (`build`, `build:{rocky8,rocky9,ubuntu2404,ubuntu2604,all}`
+container orchestration, `check`, `check:fuse3`, `check:docs`, `audit`,
+`check:require-mount`, `clean`). AGENTS.md Phase 5 already names
+`cargo xtask check` as an acceptable gate spelling. Motivation on record: the
+`task`-vs-`go-task` PATH/bootstrap snag (hit repeatedly in dev sessions, incl.
+2026-08-04), and CI's `curl | sh` taskfile.dev bootstrap step disappearing.
+
+**Touched surfaces when it lands:** delete `Taskfile.yml` (no dead code);
+`.github/workflows/{gate,nightly}.yml` swap `task check`/`task audit` for
+`cargo xtask …` and drop the bootstrap step; doc sweep (`AGENTS.md`,
+`README.md`, `QUICKSTART.md`, `docs/{cloud-benchmarking,design-read-path,pre-rc-execution-plan,rc-manifest,pre-rc-engineering-spec,reset-v5-window-plan}.md`,
+`tests/{run_rocky8_aio_repro,cloud_bench_cluster}.sh`, the tdd-workflow
+skill). Proof = one end-to-end `cargo xtask check` run + a command-sequence
+parity diff against the retired Taskfile.
+
 ---
 
 ## 3d0. The wedge-crumb finding (the from-zero suite's best catch)

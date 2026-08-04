@@ -5191,6 +5191,19 @@ const fn regular_open_reply_flags() -> u32 {
 pub type DioInvalSink =
     std::sync::Arc<dyn Fn(u64, u64, u32) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
 
+/// The daemon-initiated inode-invalidation recorder (the generic/683
+/// fallocate strip + the killpriv-v2 clear): `(ino, offset, len)` = the
+/// raw FUSE_NOTIFY_INVAL_INODE triple the site pushes, observed VERBATIM
+/// so a test can pin the form the kernel would receive — off/len encode
+/// scope per `fuse_reverse_inval_inode` (fs/fuse/inode.c): pages are
+/// touched only when `off >= 0` (`len <= 0` ⇒ to EOF), `off < 0` ⇒ drop
+/// the cached attrs (and ACLs) alone. Never armed in production — the
+/// sites fall through to the `kernel_notify` handle; tests inject
+/// recorders (the `dio_inval_sink` precedent —
+/// tests/attr_only_inval_tests.rs).
+pub type AttrInvalSink =
+    std::sync::Arc<dyn Fn(u64, i64, i64) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+
 #[derive(Debug, Clone)]
 pub struct WritebackRequest {
     pub ino: u64,
@@ -5516,6 +5529,12 @@ pub struct SqueezefsFilesystem {
     /// tests/dio_write_page_coherence_tests.rs). `None` = no kernel to
     /// invalidate (in-process fixtures without the suite's recorder).
     pub dio_inval_sink: std::sync::Arc<arc_swap::ArcSwap<Option<DioInvalSink>>>,
+    /// The daemon-initiated attr-invalidation recorder cell (the
+    /// `dio_inval_sink` pattern): `None` in production — the strip/
+    /// killpriv push falls through to `kernel_notify`; tests inject
+    /// recorders to pin the exact FUSE_NOTIFY_INVAL_INODE form
+    /// (tests/attr_only_inval_tests.rs).
+    pub attr_inval_sink: std::sync::Arc<arc_swap::ArcSwap<Option<AttrInvalSink>>>,
     pub next_dir_fh: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// L4 interception session host (design-preload-interception §5.2, PR
     /// L4-3): `None` on non-interception mounts. Shared across handler
@@ -5604,6 +5623,7 @@ impl Clone for SqueezefsFilesystem {
             // Share the one cell (kernel_notify precedent): the mounted
             // handler clone must observe the sink start_mount arms.
             dio_inval_sink: self.dio_inval_sink.clone(),
+            attr_inval_sink: self.attr_inval_sink.clone(),
             dismount_once: self.dismount_once.clone(),
             dismount_complete: self.dismount_complete.clone(),
             dismount_done: self.dismount_done.clone(),
@@ -5750,6 +5770,7 @@ impl SqueezefsFilesystem {
             killpriv_clean: std::sync::Arc::new(scc::HashSet::new()),
             page_cache_inos: std::sync::Arc::new(scc::HashSet::new()),
             dio_inval_sink: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(None)),
+            attr_inval_sink: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(None)),
             reclaim_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 reclaim_concurrency,
             )),
@@ -8265,6 +8286,22 @@ impl SqueezefsFilesystem {
         self.active_inode_locks.get_inode_lock(ino)
     }
 
+    /// Daemon-initiated kernel inode invalidation push (the generic/683
+    /// fallocate strip + the killpriv-v2 clear): tees the raw
+    /// FUSE_NOTIFY_INVAL_INODE triple to the injectable recorder
+    /// (`attr_inval_sink` — tests pin the exact form) and to the fuse3
+    /// `Notify` handle (production; absent handle = in-process fixture,
+    /// nothing to invalidate).
+    async fn push_kernel_inode_inval(&self, ino: u64, offset: i64, len: i64) {
+        if let Some(sink) = self.attr_inval_sink.load().as_ref() {
+            sink(ino, offset, len).await;
+        }
+        if let Some(notify) = self.kernel_notify.load().as_ref() {
+            let notify = notify.clone();
+            notify.invalid_inode(ino, offset, len).await;
+        }
+    }
+
     /// fstests generic/683 family (VL10 release gate): an UNPRIVILEGED
     /// data-modifying fallocate (prealloc/punch/zero — every arm) drops
     /// suid+sgid, both bits regardless of exec bits (the 5.19-era vfs
@@ -8308,10 +8345,7 @@ impl SqueezefsFilesystem {
         // attrs-only INVAL_INODE so the very next stat refetches. Awaited
         // inline: the reply to this FALLOCATE then strictly follows the
         // invalidation. Absent handle (in-process tests) skips.
-        if let Some(notify) = self.kernel_notify.load().as_ref() {
-            let notify = notify.clone();
-            notify.invalid_inode(ino, 0, 0).await;
-        }
+        self.push_kernel_inode_inval(ino, 0, 0).await;
         Ok(())
     }
 
@@ -8450,10 +8484,7 @@ impl SqueezefsFilesystem {
             // incore mode would show the pre-kill bits for an attr-TTL
             // window otherwise — the fallocate-strip precedent).
             self.refresh_attr_cache(ino).await;
-            if let Some(notify) = self.kernel_notify.load().as_ref() {
-                let notify = notify.clone();
-                notify.invalid_inode(ino, 0, 0).await;
-            }
+            self.push_kernel_inode_inval(ino, 0, 0).await;
         }
         Ok(())
     }

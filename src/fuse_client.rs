@@ -8286,19 +8286,44 @@ impl SqueezefsFilesystem {
         self.active_inode_locks.get_inode_lock(ino)
     }
 
-    /// Daemon-initiated kernel inode invalidation push (the generic/683
-    /// fallocate strip + the killpriv-v2 clear): tees the raw
-    /// FUSE_NOTIFY_INVAL_INODE triple to the injectable recorder
-    /// (`attr_inval_sink` — tests pin the exact form) and to the fuse3
-    /// `Notify` handle (production; absent handle = in-process fixture,
-    /// nothing to invalidate).
-    async fn push_kernel_inode_inval(&self, ino: u64, offset: i64, len: i64) {
+    /// Daemon-initiated **ATTRS-ONLY** kernel invalidation for `ino`
+    /// (the generic/683 fallocate strip + the killpriv-v2 clear): one
+    /// FUSE_NOTIFY_INVAL_INODE with **`off < 0`**, which
+    /// `fuse_reverse_inval_inode` (fs/fuse/inode.c) reads as "drop the
+    /// cached attrs (and ACLs), touch NO page" — pages are invalidated
+    /// only when `off >= 0`, and the `(0, 0)` this helper retires was a
+    /// WHOLE-FILE page invalidation (`len <= 0` ⇒ to EOF): an attr-only
+    /// change nuked a hot file's entire page cache. Same encoding as the
+    /// W1 hook's `InvalScope::AttrsOnly` arm (`start_mount` /
+    /// `ipc_service::InvalScope`); the fork passes the triple verbatim
+    /// (`crates/fuse3/src/notify.rs` `inval_inode_frame`). Hardcoded
+    /// HERE so a future attr-stakes site cannot get the form wrong —
+    /// the form is pinned by tests/attr_only_inval_tests.rs through the
+    /// injectable `attr_inval_sink` recorder.
+    ///
+    /// Ordering (adjudicated, the generic/451 follow-up sweep): this is
+    /// the fuse3 `Notify` ENQUEUE — the caller's own reply rides the
+    /// ring-commit lane and can overtake it (the generic/451 finding),
+    /// so the ack is NOT a barrier here. Tolerated by the stakes: the
+    /// change is attr-only (the next stat refetches), the race window is
+    /// the notify's delivery latency — strictly tighter than the
+    /// attr-TTL staleness that governs without the push — and the
+    /// strip/killpriv events are per-transition, never per-write. A law
+    /// that needs ack-ordering uses `notify_inval_inode_sync` (the
+    /// generic/451 page-coherence path) instead.
+    async fn push_attrs_only_inval(&self, ino: u64) {
+        // `off < 0` ⇒ attrs-only; `len` is ignored on that arm (0 by
+        // convention — libfuse's fuse_lowlevel_notify_inval_inode).
+        const ATTRS_ONLY_OFF: i64 = -1;
+        const ATTRS_ONLY_LEN: i64 = 0;
         if let Some(sink) = self.attr_inval_sink.load().as_ref() {
-            sink(ino, offset, len).await;
+            sink(ino, ATTRS_ONLY_OFF, ATTRS_ONLY_LEN).await;
         }
         if let Some(notify) = self.kernel_notify.load().as_ref() {
             let notify = notify.clone();
-            notify.invalid_inode(ino, offset, len).await;
+            notify
+                .invalid_inode(ino, ATTRS_ONLY_OFF, ATTRS_ONLY_LEN)
+                .await;
         }
     }
 
@@ -8342,10 +8367,11 @@ impl SqueezefsFilesystem {
         self.refresh_attr_cache(ino).await;
         // The kernel's incore mode still shows the pre-strip bits for an
         // attr-TTL window (fallocate replies carry no attrs) — push an
-        // attrs-only INVAL_INODE so the very next stat refetches. Awaited
-        // inline: the reply to this FALLOCATE then strictly follows the
-        // invalidation. Absent handle (in-process tests) skips.
-        self.push_kernel_inode_inval(ino, 0, 0).await;
+        // attrs-only INVAL_INODE so the very next stat refetches. The
+        // push is an enqueue, not an ack barrier (form + ordering
+        // adjudication live on `push_attrs_only_inval`); absent handle
+        // (in-process tests) only the injectable recorder observes it.
+        self.push_attrs_only_inval(ino).await;
         Ok(())
     }
 
@@ -8482,9 +8508,10 @@ impl SqueezefsFilesystem {
         if killed_perm != mode & 0o7777 {
             // The mode moved: re-seed caches + tell the kernel (its
             // incore mode would show the pre-kill bits for an attr-TTL
-            // window otherwise — the fallocate-strip precedent).
+            // window otherwise — the fallocate-strip precedent; form +
+            // ordering adjudication live on `push_attrs_only_inval`).
             self.refresh_attr_cache(ino).await;
-            self.push_kernel_inode_inval(ino, 0, 0).await;
+            self.push_attrs_only_inval(ino).await;
         }
         Ok(())
     }

@@ -663,10 +663,16 @@ fn exa_canon_qd_has_one_definition_tied_to_the_fio_canon() {
             .nth(3)
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or_else(|| panic!("battery row {name} has no parseable qd column"));
-        assert_eq!(qd, EXA_CANON_QD, "battery row {name} drifted from the canon");
+        assert_eq!(
+            qd, EXA_CANON_QD,
+            "battery row {name} drifted from the canon"
+        );
         rows += 1;
     }
-    assert_eq!(rows, 4, "the exa battery no longer carries its four canon rows");
+    assert_eq!(
+        rows, 4,
+        "the exa battery no longer carries its four canon rows"
+    );
 }
 
 /// DEBT-2 — the rewrite-epoch idle-close horizon really derives from the
@@ -725,7 +731,10 @@ fn zcrx_lane_geometry_is_pinned_on_canonical_shapes() {
         (LANE_IO_QUEUES_MAX, 64),
         "big boxes rail at the pre-steering want bound"
     );
-    assert_eq!(LANE_IO_QUEUES_MAX, 8, "want-bound drift — re-derive the area math");
+    assert_eq!(
+        LANE_IO_QUEUES_MAX, 8,
+        "want-bound drift — re-derive the area math"
+    );
 }
 
 /// DEBT-5 — the lane's per-command transfer cap IS the FUSE transport's

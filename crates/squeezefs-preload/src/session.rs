@@ -640,8 +640,10 @@ impl Session {
         }
         let my_generation = header.generation.load(Ordering::Acquire);
 
-        let slab = geometry.arena_bytes / u64::from(geometry.slots);
-        let slab = slab.min(u64::from(geometry.max_op_bytes));
+        // The ONE slab law (`Geometry::slot_slab` — shared with the
+        // daemon side): LBA-floored so every `slot × slab` arena offset
+        // stays DMA-eligible (the 2026-08-04 bounce fix).
+        let slab = geometry.slot_slab();
         if slab == 0 {
             // SAFETY: unmapping the mapping created above.
             unsafe { libc::munmap(base, layout.total_bytes as usize) };

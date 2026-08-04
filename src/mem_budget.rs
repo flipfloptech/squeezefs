@@ -729,17 +729,33 @@ pub fn resolve_ipc_arena_cap(
 /// box ran 64 MiB sessions before the 2026-08-04 derivation sweep).
 pub const IPC_ARENA_FLOOR_BYTES: u64 = 64 * 1024 * 1024;
 
+/// The derived arena's alignment: the SLOT-SLAB DMA law — `slots (1024,
+/// `Geometry::default_v1`) × the O_DIRECT LBA (4 KiB, `ipc_direct`'s
+/// screen)` = 4 MiB, tie-tested against the geometry in
+/// `tests/derivation_sweep_tests.rs`. Every 4 MiB multiple is also a
+/// PMD (2 MiB) multiple, so the arena-THP collapse law
+/// (`map_shared_pmd_aligned`) holds unchanged.
+///
+/// Why not PMD: the client slab is `arena / slots`; an ODD 2 MiB-multiple
+/// arena makes it `≡ 2048 (mod 4096)`, so every odd slot's `slot × slab`
+/// arena offset fails `ipc_direct`'s 4 KiB DMA screen — EXACTLY half of
+/// all round-robin direct-drive reads bounce through the pooled-copy
+/// path (the 2026-08-04 cluster randread-shim −15.4 %; bounce rate
+/// 50.006 % measured where the acceptance records expect 0). The 64 MiB
+/// floor masked this on small-budget boxes; the big-RAM fleet derived
+/// odd multiples.
+pub const IPC_ARENA_DMA_ALIGN_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Per-session IPC arena default resolution, pure (2026-08-04 derivation
-/// sweep): `SQUEEZEFS_IPC_ARENA_MB` explicit (MiB, > 0) wins verbatim;
-/// otherwise `max(64 MiB, pmd_align_down(admission_cap / 128))` —
-/// cap/128 is the per-uid session cap (64) × 2 safety margin, so even a
-/// full per-uid population of default-size arenas fits in HALF the
-/// admission cap; the PMD (2 MiB) round-down keeps the arena-THP
-/// collapse law (`map_shared_pmd_aligned`) intact and never exceeds the
-/// cap fraction. Garbage warns and falls through (knob-family
-/// convention).
+/// sweep): `SQUEEZEFS_IPC_ARENA_MB` explicit (MiB, > 0) wins verbatim
+/// (an odd explicit value stays DMA-eligible through the client-side
+/// slab law — `Geometry::slot_slab` floors to the LBA); otherwise
+/// `max(64 MiB, dma_align_down(admission_cap / 128))` — cap/128 is the
+/// per-uid session cap (64) × 2 safety margin, so even a full per-uid
+/// population of default-size arenas fits in HALF the admission cap;
+/// the round-down never exceeds the cap fraction. Garbage warns and
+/// falls through (knob-family convention).
 pub fn resolve_ipc_arena_bytes(arena_mb_env: Option<&str>, arena_cap_bytes: u64) -> u64 {
-    const PMD: u64 = 2 * 1024 * 1024;
     if let Some(raw) = arena_mb_env {
         match raw.trim().parse::<u64>() {
             Ok(mib) if mib > 0 => return mib.saturating_mul(1024 * 1024),
@@ -749,7 +765,8 @@ pub fn resolve_ipc_arena_bytes(arena_mb_env: Option<&str>, arena_cap_bytes: u64)
             }
         }
     }
-    (arena_cap_bytes / 128 / PMD * PMD).max(IPC_ARENA_FLOOR_BYTES)
+    (arena_cap_bytes / 128 / IPC_ARENA_DMA_ALIGN_BYTES * IPC_ARENA_DMA_ALIGN_BYTES)
+        .max(IPC_ARENA_FLOOR_BYTES)
 }
 
 /// Register the L4 `ipc_session_arenas` component (design-preload-

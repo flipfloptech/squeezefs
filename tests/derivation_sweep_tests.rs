@@ -328,7 +328,11 @@ fn ipc_arena_default_derives_from_admission_cap() {
     // The derivation-wide invariant: every derived arena is slot-slab
     // DMA-aligned (slots × 4 KiB).
     let align = u64::from(squeezefs_ipc::layout::Geometry::default_v1().slots) * 4096;
-    assert_eq!(align, 4 * MIB, "geometry drift — re-derive the arena alignment");
+    assert_eq!(
+        align,
+        4 * MIB,
+        "geometry drift — re-derive the arena alignment"
+    );
     for cap_mib in [1_u64, 300, 8192, 11_520, 22_528, 90 * 128, 129 * 128] {
         let got = resolve_ipc_arena_bytes(None, cap_mib * MIB);
         assert_eq!(
@@ -347,6 +351,41 @@ fn ipc_arena_default_derives_from_admission_cap() {
     // CLIENT slab law (`Geometry::slot_slab`) is what keeps its slots
     // DMA-eligible; see `slot_slab_is_dma_aligned` below.
     assert_eq!(resolve_ipc_arena_bytes(Some("90"), 22 * GIB), 90 * MIB);
+}
+
+/// The ONE slab law (`Geometry::slot_slab` — the client-side face of the
+/// same bounce fix): `arena / slots`, capped at `max_op_bytes`, floored
+/// to the 4 KiB DMA LBA whenever it is at least one LBA — so `slot ×
+/// slab` is page-aligned for EVERY slot regardless of the arena size an
+/// explicit env override picked. Sub-LBA slabs (toy test geometries)
+/// pass through verbatim: they can never DMA-align and always ride the
+/// bounce path by design.
+#[test]
+fn slot_slab_is_dma_aligned() {
+    use squeezefs_ipc::layout::Geometry;
+    let mk = |arena_mib: u64| {
+        let mut g = Geometry::default_v1();
+        g.arena_bytes = arena_mib * MIB;
+        g
+    };
+    // Shipped floor: 64 MiB / 1024 = 64 KiB — aligned, unchanged.
+    assert_eq!(mk(64).slot_slab(), 64 * 1024);
+    // THE BOUNCE SHAPE: 90 MiB / 1024 = 92,160 B (2048 mod 4096) —
+    // floored to 90,112 B (a 4 KiB multiple).
+    assert_eq!(
+        mk(90).slot_slab(),
+        90 * 1024 * 1024 / 1024 / 4096 * 4096,
+        "an odd 2 MiB-multiple arena's slab must floor to the DMA LBA"
+    );
+    assert_eq!(mk(90).slot_slab() % 4096, 0);
+    // max_op cap still applies (giant arenas).
+    let mut big = Geometry::default_v1();
+    big.arena_bytes = 8 * 1024 * MIB;
+    assert_eq!(big.slot_slab(), u64::from(big.max_op_bytes));
+    // Sub-LBA slab (toy geometry): verbatim, never zero.
+    let mut tiny = Geometry::default_v1();
+    tiny.arena_bytes = MIB;
+    assert_eq!(tiny.slot_slab(), MIB / 1024);
 }
 
 // ---------------------------------------------------------------------------

@@ -110,6 +110,27 @@ impl Geometry {
         }
     }
 
+    /// The ONE per-slot slab law (the 2026-08-04 bounce fix's client
+    /// half): `arena / slots`, capped at `max_op_bytes`, then floored to
+    /// the 4 KiB O_DIRECT LBA whenever it is at least one LBA — so
+    /// `slot × slab` is page-aligned for EVERY slot regardless of the
+    /// arena size (an explicit odd-MiB `SQUEEZEFS_IPC_ARENA_MB` would
+    /// otherwise make half the slot array fail the daemon's DMA screen
+    /// and bounce through the pooled-copy path). Sub-LBA slabs (toy test
+    /// geometries) pass through verbatim: they can never DMA-align and
+    /// deliberately ride the bounce path. Returns 0 only for degenerate
+    /// geometries (callers refuse those already).
+    pub fn slot_slab(&self) -> u64 {
+        const LBA: u64 = 4096;
+        let slab =
+            (self.arena_bytes / u64::from(self.slots.max(1))).min(u64::from(self.max_op_bytes));
+        if slab >= LBA {
+            slab / LBA * LBA
+        } else {
+            slab
+        }
+    }
+
     /// Validate every geometry rule (each refusal is a distinct variant —
     /// the daemon's bind refusal ledger wants attribution).
     pub fn validate(&self) -> Result<(), GeometryError> {

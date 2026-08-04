@@ -556,28 +556,45 @@ async fn lease_expiry_reassigns_to_local_pool_and_refuses_late_submit() {
     .await;
 
     // TTL 1 s, no heartbeats ⇒ the lease expires: fencing bumps and the
-    // shard requeues.
-    poll_until("lease expiry", Duration::from_secs(10), || {
-        METRICS.job_remote_lease_expiries.load(Ordering::Relaxed) == expiries0 + 1
-    })
+    // shard requeues. Wait on the LATER counter (reassignments bumps
+    // right after expiries), which subsumes the expiry itself.
+    poll_until(
+        "lease expiry + reassignment",
+        Duration::from_secs(10),
+        || METRICS.job_remote_reassignments.load(Ordering::Relaxed) == reassigns0 + 1,
+    )
     .await;
     assert_eq!(
-        METRICS.job_remote_reassignments.load(Ordering::Relaxed),
-        reassigns0 + 1,
-        "expired shard reassigned"
+        METRICS.job_remote_lease_expiries.load(Ordering::Relaxed),
+        expiries0 + 1,
+        "the reassignment was the expiry's"
     );
 
-    // The durable shard record carries the bumped fencing.
-    let raw = meta
-        .getxattr(ROOT, &format!("job:{job_id}:shard:0"))
-        .await
-        .unwrap()
-        .expect("shard record");
-    let rec: serde_json::Value = serde_json::from_slice(&raw).unwrap();
-    assert!(
-        rec["shard_fencing"].as_u64().expect("fencing") >= 1,
-        "expiry bumps shard_fencing: {rec}"
-    );
+    // The durable shard record carries the bumped fencing. The expiry
+    // counters bump at the TOP of expire_shard while the record commits
+    // near its bottom (persist_shard_record) — the metric is a wake-up,
+    // never the durability contract — so wait on the RECORD, the
+    // observable this assert is about (2026-08-04 flake class: a
+    // counter-gated getxattr slipped into that window and read
+    // shard_fencing 0). The deadline is a failsafe only.
+    let key = format!("job:{job_id}:shard:0");
+    let fencing_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let raw = meta
+            .getxattr(ROOT, &key)
+            .await
+            .unwrap()
+            .expect("shard record");
+        let rec: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        if rec["shard_fencing"].as_u64().expect("fencing") >= 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < fencing_deadline,
+            "expiry must persist the bumped shard_fencing (failsafe): {rec}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
     // Free the local pool: it picks the requeued job up and completes it
     // (reassignment to the LOCAL population — one protocol, two
@@ -649,10 +666,21 @@ async fn reassigned_shard_gets_fresh_destinations_and_expired_ones_quarantined()
     assert_eq!(first.len(), BLOCKS);
 
     // Expiry: the OLD destinations enter the do-not-publish quarantine.
-    poll_until("lease expiry", Duration::from_secs(10), || {
-        METRICS.job_remote_lease_expiries.load(Ordering::Relaxed) == expiries0 + 1
-    })
+    // Wait on the QUARANTINE SET itself — the observable under assert —
+    // not the expiry counter, which bumps at the top of expire_shard
+    // while the quarantine fills later in the same pass (the 2026-08-04
+    // counter-vs-effect flake class).
+    poll_until(
+        "expired destinations quarantined",
+        Duration::from_secs(10),
+        || host.quarantined_destinations().len() == BLOCKS,
+    )
     .await;
+    assert_eq!(
+        METRICS.job_remote_lease_expiries.load(Ordering::Relaxed),
+        expiries0 + 1,
+        "the quarantine was the expiry's"
+    );
     let mut quarantined = host.quarantined_destinations();
     quarantined.sort();
     let mut expected = first.clone();

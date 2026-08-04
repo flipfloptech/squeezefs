@@ -18839,7 +18839,16 @@ pub async fn start_mount<P: AsRef<Path>>(
             allow_dev: crate::ipc_host::allow_dev_lever(),
             geometry,
             arena_cap_bytes,
-            per_uid_session_cap: 64,
+            // Per-uid session cap: derived from the same two numbers —
+            // the session population the admission cap holds,
+            // clamp(cap/arena, 64 shipped floor, 4096 ctl-thread rail).
+            // The bare 64 refused sessions the box's own budget admitted
+            // (2026-08-04 field conviction — 256-process fio battery,
+            // `ipc_admission_refusals` 125, engagement 0.695 ⇒ INVALID).
+            per_uid_session_cap: crate::mem_budget::ipc_per_uid_session_cap(
+                arena_cap_bytes,
+                arena_bytes,
+            ),
             // §5.7 idle reap (PR L4-6), default 300 s; 0 disables.
             idle_secs: std::env::var("SQUEEZEFS_IPC_IDLE_SECS")
                 .ok()

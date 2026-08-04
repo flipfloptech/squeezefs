@@ -285,9 +285,11 @@ fn parked_cap_derives_from_budget_over_block_size() {
 // ---------------------------------------------------------------------------
 
 /// The flat 64 MiB `SQUEEZEFS_IPC_ARENA_MB` default becomes
-/// `max(64 MiB, dma_align_down(cap/128))`: cap/128 = the per-uid session
-/// cap (64) × 2 safety — even a full per-uid population of default-size
-/// arenas fits in half the admission cap; alignment is the SLOT-SLAB DMA
+/// `max(64 MiB, dma_align_down(cap/128))`: cap/128 sizes a default arena
+/// so the admission cap holds a 128-session population — the SAME two
+/// numbers the A12 per-uid session cap derives from, so a full per-uid
+/// population of default-size arenas fills the cap exactly; alignment is
+/// the SLOT-SLAB DMA
 /// law (slots × 4 KiB = 4 MiB — also a PMD multiple, so the THP collapse
 /// law `map_shared_pmd_aligned` still holds); floor 64 MiB = the shipped
 /// posture. Env stays absolute-verbatim (MiB).
@@ -451,7 +453,10 @@ fn ipc_per_uid_session_cap_derives_from_session_budget() {
     // Alignment round-down RAISES the quotient past 128 (the A9 bounce
     // shape): cap 11.25 GiB ⇒ arena 88 MiB ⇒ 130.
     assert_eq!(
-        ipc_per_uid_session_cap(90 * 128 * MIB, resolve_ipc_arena_bytes(None, 90 * 128 * MIB)),
+        ipc_per_uid_session_cap(
+            90 * 128 * MIB,
+            resolve_ipc_arena_bytes(None, 90 * 128 * MIB)
+        ),
         130
     );
     // Floor shape: cap ≈ 358 MiB, arena at the 64 MiB shipped floor ⇒

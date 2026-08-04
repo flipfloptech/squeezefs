@@ -750,11 +750,13 @@ pub const IPC_ARENA_DMA_ALIGN_BYTES: u64 = 4 * 1024 * 1024;
 /// sweep): `SQUEEZEFS_IPC_ARENA_MB` explicit (MiB, > 0) wins verbatim
 /// (an odd explicit value stays DMA-eligible through the client-side
 /// slab law — `Geometry::slot_slab` floors to the LBA); otherwise
-/// `max(64 MiB, dma_align_down(admission_cap / 128))` — cap/128 is the
-/// per-uid session cap (64) × 2 safety margin, so even a full per-uid
-/// population of default-size arenas fits in HALF the admission cap;
-/// the round-down never exceeds the cap fraction. Garbage warns and
-/// falls through (knob-family convention).
+/// `max(64 MiB, dma_align_down(admission_cap / 128))` — the /128
+/// fraction sizes a default arena so the admission cap holds a
+/// 128-session population, and [`ipc_per_uid_session_cap`] derives the
+/// per-uid cap from the SAME two numbers (`clamp(cap / arena, 64,
+/// 4096)`), so a full per-uid population of default-size arenas fills
+/// the admission cap exactly; the round-down never exceeds the cap
+/// fraction. Garbage warns and falls through (knob-family convention).
 pub fn resolve_ipc_arena_bytes(arena_mb_env: Option<&str>, arena_cap_bytes: u64) -> u64 {
     if let Some(raw) = arena_mb_env {
         match raw.trim().parse::<u64>() {
@@ -767,6 +769,42 @@ pub fn resolve_ipc_arena_bytes(arena_mb_env: Option<&str>, arena_cap_bytes: u64)
     }
     (arena_cap_bytes / 128 / IPC_ARENA_DMA_ALIGN_BYTES * IPC_ARENA_DMA_ALIGN_BYTES)
         .max(IPC_ARENA_FLOOR_BYTES)
+}
+
+/// The derived per-uid concurrent IPC session cap (DoS posture,
+/// design-preload-interception §11; wired at the one `IpcHostConfig`
+/// construction site): `clamp(arena_cap_bytes / arena_bytes, 64, 4096)`
+/// — the session population the R5 admission cap can actually hold.
+///
+/// The bare `64` it replaces refused sessions the box's own budget
+/// admitted (2026-08-04 field conviction: 176 GiB-budget cluster client,
+/// admission cap ≈ 22.5 GiB over 176 MiB derived arenas = a ~131-session
+/// budget; a matched-inflight 256-process fio battery hit the literal —
+/// `ipc_admission_refusals` 125, ~192 jobs silently on the kernel lane,
+/// engagement 0.695 ⇒ INVALID row). The mount posture is single-tenant
+/// by declaration (VAL-7d), so per-uid is a DoS tripwire, not an
+/// inter-uid fairness device — total admission is already bounded by
+/// `arena_cap_bytes`, and aligning the tripwire with that bound is what
+/// makes a refusal honest.
+///
+/// * floor 64: the shipped posture (never-regress-below-shipped, the
+///   `Q_DEPTH_FLOOR` house law);
+/// * rail 4096: the ctl-thread exhaustion rail (`ctl_conn_cap_from` in
+///   `src/ipc_host.rs` — every admitted session holds a ctl connection,
+///   i.e. one OS thread), so a pathological env pair (huge
+///   `SQUEEZEFS_IPC_MEM_MAX`, tiny `SQUEEZEFS_IPC_ARENA_MB`) cannot turn
+///   into thread exhaustion. No structural registry bound sits below
+///   it: the daemon session store is an unbounded map, and the shim's
+///   `sizing::SESSION_REGISTRY_SLOTS` (32) bounds one client PROCESS,
+///   never a uid's population across processes.
+///
+/// Deliberately **no env knob** (the cap was never operator-tunable);
+/// the budget knobs it derives from (`SQUEEZEFS_IPC_MEM_{PCT,MAX}`,
+/// `SQUEEZEFS_IPC_ARENA_MB`) remain the operator levers. The `.max(1)`
+/// divisor floor mirrors `ctl_conn_cap_from`'s — nonsense geometry
+/// rails, never panics (a mount-time panic is `abort`).
+pub fn ipc_per_uid_session_cap(arena_cap_bytes: u64, arena_bytes: u64) -> usize {
+    (arena_cap_bytes / arena_bytes.max(1)).clamp(64, 4096) as usize
 }
 
 /// Register the L4 `ipc_session_arenas` component (design-preload-

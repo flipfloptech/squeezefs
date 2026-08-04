@@ -3194,6 +3194,16 @@ pub struct Metrics {
     /// follow-up). Each increment is an averted wrong-block serve — the live
     /// detector for the free→reallocate ABA window.
     pub stale_binding_rebinds: Align64<AtomicU64>,
+    /// Rebind-ladder exhaustions on the READ path that escalated to the
+    /// SERIALIZED settle arm (block stripe (3) + `INODE_META_LOCKS` (3.5)
+    /// held across one device-direct fetch — an arm legal writer churn
+    /// cannot beat) instead of surfacing EIO (the 2026-08-04 field
+    /// rebind-starvation fix: a pure read must never EIO because writers
+    /// are busy). Growth = sustained displacement churn (writeback/fold
+    /// promotion backlog, copy_file_range rewrite loops) outrunning the
+    /// latch-free ladder — benign, a latency signal; pair with
+    /// `stale_binding_rebinds`.
+    pub stale_binding_escalations: Align64<AtomicU64>,
     /// Single-flight waiters served directly from their cohort's carried
     /// `FillResult` (R1a, docs/design-read-path.md §5.2) — the adoption
     /// signal that waiter correctness is publish-independent. Replaces the
@@ -6733,6 +6743,7 @@ impl SqueezefsFilesystem {
                 "cache_misses": misses,
                 "cache_hit_ratio": ratio,
                 "stale_binding_rebinds": METRICS.stale_binding_rebinds.load(Ordering::Relaxed),
+                "stale_binding_escalations": METRICS.stale_binding_escalations.load(Ordering::Relaxed),
                 "singleflight_waiter_result_serves": METRICS.singleflight_waiter_result_serves.load(Ordering::Relaxed),
                 "hot_block_hits": METRICS.hot_block_hits.load(Ordering::Relaxed),
                 "hot_block_misses": METRICS.hot_block_misses.load(Ordering::Relaxed),

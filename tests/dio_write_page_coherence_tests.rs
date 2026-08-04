@@ -93,7 +93,7 @@ async fn make() -> H {
         ImageBuilder::new(BuilderConfig {
             node_size: DEFAULT_NODE_SIZE,
             journal_len_override: None,
-            hash_seed: 0xD10_451_C0FF_EE00,
+            hash_seed: 0x0D10_4510_C0FF_EE00,
             uuid: *b"dio451-coherence",
         })
         .unwrap()

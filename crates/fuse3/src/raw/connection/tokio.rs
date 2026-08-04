@@ -776,6 +776,84 @@ impl FuseConnection {
         ((hdr, data, None, crate::raw::ReplySlot::Classical), res)
     }
 
+    /// generic/451 — the SYNCHRONOUS kernel page-invalidation push: write
+    /// one `FUSE_NOTIFY_INVAL_INODE` for `[offset, offset+len)` through
+    /// the device and return only after the kernel processed it
+    /// (`fuse_dev_do_write` runs `fuse_reverse_inval_inode` synchronously
+    /// inside the device write). This is the ORDERING primitive the
+    /// DIO-write page-coherence law needs: a reply committed AFTER this
+    /// returns — over-uring COMMIT included — is guaranteed to follow the
+    /// page invalidation, which the async
+    /// [`crate::notify::Notify::invalid_inode`] enqueue cannot promise
+    /// (it queues on the session reply channel while the request's own
+    /// ack rides the ring-commit lane and can overtake it — the residual
+    /// generic/451 window found live, 2026-08-03).
+    ///
+    /// **Venue law (the live wedge, 2026-08-03, kernel stacks on file):**
+    /// this write BLOCKS in `invalidate_inode_pages2_range` →
+    /// `folio_wait_bit_common` until every in-flight READ covering the
+    /// range completes, so it must never occupy a request-servicing lane.
+    /// The first cut submitted it through `write_vectored`'s classical
+    /// io_uring write from the WRITE handler's own task — inline-issued
+    /// at submit (`io_submit_sqes` → `io_write` → `fuse_dev_write`), it
+    /// parked the submitting thread inside `io_uring_enter` waiting on a
+    /// folio whose READ that very lane family had to service: writer,
+    /// readers and daemon all D-state. A **blocking-pool `write(2)` on a
+    /// dup'd device fd** keeps the folio wait off every handler lane; the
+    /// concurrently-running lanes serve the pending READs, the folios
+    /// unlock, the invalidation completes, and only then does the caller
+    /// get to reply. (This is deliberately NOT an exception to
+    /// always-use-io_uring's spirit: the write is a kernel-side ORDERING
+    /// BARRIER that can lawfully sleep for a full READ round trip, not an
+    /// I/O hot path — the same class as the mandated classical sideband.)
+    ///
+    /// `Ok(true)` = invalidated; `Ok(false)` = the kernel no longer knows
+    /// the ino (`-ENOENT` — a benign race with eviction: no inode means
+    /// no pages to serve stale).
+    #[cfg(target_os = "linux")]
+    pub async fn notify_inval_inode_sync(
+        &self,
+        inode: u64,
+        offset: i64,
+        len: i64,
+    ) -> io::Result<bool> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let frame = crate::notify::inval_inode_frame(inode, offset, len);
+        // Dup so the blocking task owns a fd that stays valid even if
+        // this future is cancelled and the connection torn down before
+        // the pool thread runs (a raw-fd capture could alias a reused
+        // number).
+        let dup = unsafe { libc::dup(self.as_fd().as_raw_fd()) };
+        if dup < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `dup` is a fresh fd this task exclusively owns.
+        let owned = unsafe { OwnedFd::from_raw_fd(dup) };
+        let res = tokio::task::spawn_blocking(move || {
+            loop {
+                // SAFETY: one whole-frame write of an initialized buffer
+                // on an owned /dev/fuse fd; the device consumes exactly
+                // one message per write (no partial-write handling).
+                let n =
+                    unsafe { libc::write(owned.as_raw_fd(), frame.as_ptr().cast(), frame.len()) };
+                if n >= 0 {
+                    return Ok(());
+                }
+                let err = io::Error::last_os_error();
+                if err.kind() != io::ErrorKind::Interrupted {
+                    return Err(err);
+                }
+            }
+        })
+        .await
+        .map_err(|e| io::Error::other(format!("notify_inval_inode_sync join: {e}")))?;
+        match res {
+            Ok(()) => Ok(true),
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Reply to one request. `slot` is the address the request was
     /// delivered on (FUSE-2 ⊕ PERF-16): a ring slot commits against that
     /// ent, [`crate::raw::ReplySlot::Classical`] takes the device write.

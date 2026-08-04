@@ -5082,6 +5082,17 @@ const FOPEN_NOFLUSH: u32 = 1 << 5;
 /// FLUSH-elision contract, killpriv-v2 is a write-time privilege law,
 /// and the virtual .stats/.config inodes reply FOPEN_DIRECT_IO
 /// separately (never through `regular_open_reply_flags`).
+///
+/// **Corrected 2026-08 (fstests generic/451)**: the original argument had
+/// one hole — same-mount kernel-path O_DIRECT writes. AUTO_INVAL_DATA
+/// cannot see them (the kernel authored the write, so its own attr update
+/// absorbs the mtime change), the kernel's async-DIO post-write
+/// invalidation cannot be ordered before io_getevents returns, and the
+/// invalidate-on-every-open this flag retired was what had been masking
+/// the resulting ghosts. The hole is closed daemon-side by the DIO-write
+/// page-coherence law (`post_dio_write_coherence` — a ranged
+/// FUSE_NOTIFY_INVAL_INODE awaited before every gated O_DIRECT WRITE
+/// reply), NOT by weakening this flag.
 const FOPEN_KEEP_CACHE: u32 = 1 << 1;
 
 /// Open/create reply flags for REGULAR files (the virtual .stats/.config
@@ -8229,6 +8240,52 @@ impl SqueezefsFilesystem {
             notify.invalid_inode(ino, 0, 0).await;
         }
         Ok(())
+    }
+
+    /// generic/451 — the DIO-write page-coherence law (the ONE enforcement
+    /// point; the write handler's reply edge is its only caller): **an
+    /// acked O_DIRECT WRITE is preceded by a kernel page-cache
+    /// invalidation of its written range whenever the ino has
+    /// buffered-open history** — the userspace mirror of the VFS's
+    /// `kiocb_invalidate_post_direct_write`.
+    ///
+    /// Why the daemon owes this: the kernel invalidates the range BEFORE
+    /// issuing DIO WRITEs (`fuse_direct_io`) but cannot order its
+    /// post-write invalidation before `io_getevents` returns on the async
+    /// path (absent or workqueue-deferred, kernel-line-dependent), so a
+    /// buffered reader racing the write re-instantiates pre-write pages
+    /// that outlive the ack. PERF-6's FOPEN_KEEP_CACHE removed the
+    /// invalidate-on-every-open that masked those ghosts (generic/451's
+    /// checker re-opens before its buffered pread). FUSE_AUTO_INVAL_DATA
+    /// does not cover the shape either: the kernel authored the write
+    /// itself, so its own attr update absorbs the mtime change.
+    ///
+    /// Ordering: AWAITED before the reply, so the ack itself is the
+    /// coherence barrier — the notify's device write returns only after
+    /// `fuse_reverse_inval_inode` ran, and a page instantiated after it
+    /// belongs to a READ served after this write's content landed (every
+    /// landing path publishes content before the handler tail). The gate's
+    /// own race closes the same way: this check runs AFTER the content
+    /// landed, and any reader able to cache a stale page completed its
+    /// open (the `page_cache_inos` insert) before issuing the READ that
+    /// faulted the page in.
+    ///
+    /// No deadlock class: this fires only for O_DIRECT writes (no locked
+    /// folio waits on THIS request — the buffered-write folio-lock hazard
+    /// cannot arise), the handler tail holds no inode/block locks, and
+    /// dirty-folio laundering triggered by the invalidation is served by
+    /// concurrent handler tasks (the strip-setid/killpriv awaited-notify
+    /// precedent).
+    async fn post_dio_write_coherence(&self, ino: u64, offset: u64, written: u32) {
+        if !self.page_cache_inos.contains_sync(&ino) {
+            return;
+        }
+        if let Some(sink) = self.dio_inval_sink.load().as_ref() {
+            METRICS
+                .fuse_dio_write_invals
+                .fetch_add(1, Ordering::Relaxed);
+            sink(ino, offset, written).await;
+        }
     }
 
     /// FUSE_HANDLE_KILLPRIV_V2 kill obligation for a flagged WRITE
@@ -15240,7 +15297,7 @@ impl Filesystem for SqueezefsFilesystem {
         offset: u64,
         data: bytes::Bytes,
         write_flags: u32,
-        _flags: u32,
+        flags: u32,
     ) -> FuseResult<ReplyWrite> {
         self.ro_gate("write")?;
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
@@ -15292,6 +15349,14 @@ impl Filesystem for SqueezefsFilesystem {
         if write_flags & fuse3::raw::flags::FUSE_WRITE_KILL_SUIDGID != 0 {
             self.apply_killpriv(ino).await?;
         }
+
+        // generic/451: kernel-path O_DIRECT write (the kernel echoes the
+        // writing fd's open flags in fuse_write_in.flags). Writeback-origin
+        // writes (FUSE_WRITE_CACHE) are the kernel cache writing ITSELF out
+        // — never gated, even when the kernel picked an O_DIRECT ff to
+        // carry them. Consumed at the reply edge below.
+        let dio_coherence = flags & (libc::O_DIRECT as u32) != 0
+            && write_flags & fuse3::raw::flags::FUSE_WRITE_CACHE == 0;
 
         // D1.d: this open generation now has flushable state.
         self.mark_handle_dirty(ino);
@@ -15575,6 +15640,14 @@ impl Filesystem for SqueezefsFilesystem {
                 {
                     debug!("FUSE Write: ino {ino} times refinement park skipped: {e}");
                 }
+            }
+            // generic/451 — the DIO-write page-coherence law (see
+            // `post_dio_write_coherence`): awaited at the reply edge, so
+            // the ack itself is the coherence barrier. Strictly after the
+            // data landed (whichever arm) and after every guard dropped.
+            if dio_coherence {
+                self.post_dio_write_coherence(ino, offset, bytes_written)
+                    .await;
             }
             Ok(ReplyWrite {
                 written: bytes_written,
@@ -18959,6 +19032,45 @@ pub async fn start_mount<P: AsRef<Path>>(
     // The general daemon-side notify (generic/683 setid strip et al).
     fs.kernel_notify
         .store(std::sync::Arc::new(Some(session.get_notify())));
+    // generic/451: arm the DIO-write page-coherence sink — a ranged
+    // FUSE_NOTIFY_INVAL_INODE per gated O_DIRECT write, awaited by the
+    // write handler before its reply (ack ⇒ coherent; the law and its
+    // rationale live on `post_dio_write_coherence`). The sink indirection
+    // is what lets the repro suite record the pushes in-process
+    // (tests/dio_write_page_coherence_tests.rs).
+    //
+    // SYNCHRONOUS by construction: `notify_inval_inode_sync` completes
+    // the classical device write (the kernel runs
+    // fuse_reverse_inval_inode inside it) before returning — the async
+    // `Notify` enqueue was tried first and lost the race live: it queues
+    // on the session reply channel while the WRITE's own ack rides the
+    // ring-commit lane and overtakes it. The connection cell is armed
+    // post-mount (below); a pre-mount fire is impossible (no kernel
+    // WRITE exists before mount).
+    {
+        let conn_cell = fs.session_connection.clone();
+        let sink: DioInvalSink = std::sync::Arc::new(move |ino, off, len| {
+            let conn_cell = conn_cell.clone();
+            Box::pin(async move {
+                if let Some(conn) = conn_cell.load().as_ref() {
+                    if let Err(e) = conn
+                        .notify_inval_inode_sync(ino, off as i64, len as i64)
+                        .await
+                    {
+                        // Loud, never fatal: a failed invalidation is a
+                        // coherence loss the kernel's own DIO path merely
+                        // WARNs about (dio_warn_stale_pagecache parity) —
+                        // the write itself is durable and acked.
+                        log::error!(
+                            "generic/451 DIO-write page invalidation failed for ino {ino} \
+                             [{off}, +{len}): {e}"
+                        );
+                    }
+                }
+            }) as futures::future::BoxFuture<'static, ()>
+        });
+        fs.dio_inval_sink.store(std::sync::Arc::new(Some(sink)));
+    }
 
     #[cfg(target_os = "linux")]
     let mut handle = if unsafe { libc::getuid() } == 0 {

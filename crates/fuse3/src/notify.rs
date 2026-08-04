@@ -18,6 +18,32 @@ use crate::raw::abi::{
 };
 use crate::raw::session::ReplyTx;
 
+/// Serialized `FUSE_NOTIFY_INVAL_INODE` frame — the exact bytes
+/// [`Notify::invalid_inode`] enqueues, factored out so the synchronous
+/// device-write path ([`crate::raw::connection::FuseConnection::
+/// notify_inval_inode_sync`], generic/451) shares ONE encoding with the
+/// async enqueue path and the two can never drift.
+pub(crate) fn inval_inode_frame(inode: u64, offset: i64, len: i64) -> Vec<u8> {
+    let out_header = fuse_out_header {
+        len: (FUSE_OUT_HEADER_SIZE + FUSE_NOTIFY_INVAL_INODE_OUT_SIZE) as u32,
+        error: fuse_notify_code::FUSE_NOTIFY_INVAL_INODE as i32,
+        unique: 0,
+    };
+    let invalid_inode_out = fuse_notify_inval_inode_out {
+        ino: inode,
+        off: offset,
+        len,
+    };
+    let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_NOTIFY_INVAL_INODE_OUT_SIZE);
+    get_bincode_config()
+        .serialize_into(&mut data, &out_header)
+        .expect("vec size is not enough");
+    get_bincode_config()
+        .serialize_into(&mut data, &invalid_inode_out)
+        .expect("vec size is not enough");
+    data
+}
+
 #[derive(Debug, Clone)]
 /// notify kernel there are something need to handle.
 pub struct Notify {
@@ -59,29 +85,9 @@ impl Notify {
             }
 
             NotifyKind::InvalidInode { inode, offset, len } => {
-                let out_header = fuse_out_header {
-                    len: (FUSE_OUT_HEADER_SIZE + FUSE_NOTIFY_INVAL_INODE_OUT_SIZE) as u32,
-                    error: fuse_notify_code::FUSE_NOTIFY_INVAL_INODE as i32,
-                    unique: 0,
-                };
-
-                let invalid_inode_out = fuse_notify_inval_inode_out {
-                    ino: *inode,
-                    off: *offset,
-                    len: *len,
-                };
-
-                let mut data =
-                    Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_NOTIFY_INVAL_INODE_OUT_SIZE);
-
-                get_bincode_config()
-                    .serialize_into(&mut data, &out_header)
-                    .expect("vec size is not enough");
-                get_bincode_config()
-                    .serialize_into(&mut data, &invalid_inode_out)
-                    .expect("vec size is not enough");
-
-                Either::Left(data)
+                // ONE encoding, shared with the synchronous device-write
+                // path (generic/451) — see `inval_inode_frame`.
+                Either::Left(inval_inode_frame(*inode, *offset, *len))
             }
 
             NotifyKind::InvalidEntry { parent, name } => {

@@ -588,13 +588,16 @@ EOF
 # (-o nosuid honored), 258 (pre-epoch timestamps), 426/467/477
 # (EXPORT_SUPPORT '.'/'..' revival), 525 (EFBIG size cap), 533
 # (removexattr ENODATA), 294/306/452 (the O(size) delete linger family —
-# rides the sparse_write_bounded cargo pin).
+# rides the sparse_write_bounded cargo pin), 451 (async-DIO write vs
+# buffered-read page coherence — the post-write kernel invalidation law,
+# rides the dio_write_page_coherence cargo pin).
 SQUEEZEFS_FSTESTS_QUICK=(
     generic/001 generic/003 generic/008 generic/009 generic/013
     generic/020 generic/035 generic/062 generic/069 generic/074
     generic/075 generic/091 generic/112 generic/127 generic/128
     generic/131 generic/213 generic/258 generic/263 generic/285
-    generic/294 generic/306 generic/316 generic/423 generic/426 generic/452
+    generic/294 generic/306 generic/316 generic/423 generic/426
+    generic/451 generic/452
     generic/464 generic/467 generic/469 generic/477 generic/478
     generic/504 generic/525 generic/533 generic/616 generic/617
     generic/618 generic/631 generic/683 generic/732 generic/795

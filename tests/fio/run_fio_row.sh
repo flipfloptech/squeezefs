@@ -260,6 +260,25 @@ keys = ["ipc_ops_read", "ipc_ops_write", "ipc_bytes_in", "ipc_bytes_out",
         "block_free_reclaim_cap_parks", "prefetch_issued", "ranged_reads"]
 print("  stats: " + " ".join(f"{k}={delta[k]}" for k in keys if delta.get(k)))
 EOF
+    # Must-stay-flat tripwires (the 2026-08-04 EXA corruption lesson —
+    # invariant_tripwires and its escalation siblings growing ACROSS a
+    # benchmark row means the daemon hit a designed-impossible concurrency
+    # outcome mid-row; the row's numbers are invalid and the run must not
+    # quietly continue to the next row).
+    TRIP="$(python3 - "$RESULTS/${LABEL}.stats_delta.json" <<'EOF'
+import json, sys
+delta = json.load(open(sys.argv[1]))
+watch = ["invariant_tripwires", "rewrite_shadow_fence_drops",
+         "write_pipeline_fence_drops", "data_dma_fence_refusals",
+         "detached_task_panics"]
+hits = {k: delta[k] for k in watch if delta.get(k)}
+print(" ".join(f"{k}=+{v}" for k, v in sorted(hits.items())))
+EOF
+)"
+    if [ -n "$TRIP" ]; then
+        journal "FAIL label=$LABEL tripwires: $TRIP"
+        fail "must-stay-flat tripwires grew across the row: $TRIP (stats delta: $RESULTS/${LABEL}.stats_delta.json)"
+    fi
 fi
 
 # ---- amplification columns (device bytes vs user bytes) -------------------

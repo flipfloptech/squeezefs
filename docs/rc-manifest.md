@@ -529,6 +529,19 @@ luck rather than design — recorded so they are chosen work, not surprises:
    latent flakes of the exact mem_budget class if their fills ride the >64 KiB
    deferred path. The poll-first pattern (`hot_block_tier_tests.rs:591`) is the
    fix template.
+4. **Vector B of the 2026-08-04 shadow-supersession finding (stamped-bit-8
+   crash window)**: a mid-epoch DELTA-class publish drains the ino's
+   `pending_block_refs` notes (release A / take B for shadow bindings) into a
+   commit whose `publish_entries` do not persist those bindings — durable
+   ledger and durable map disagree until the epoch's own full-save close. A
+   crash inside that window on a **bit-8-stamped** volume leaves the ledger
+   claiming releases the map still binds. Unreachable shipped (ruling D9:
+   bit 8 built-never-stamped; derived accounting re-walks the maps at mount
+   and cannot drift this way) — must be closed before any Phase-8 stamping
+   window: either drain notes only into saves that persist the bindings the
+   notes describe, or have delta-class saves persist composed shadow entries.
+   Vector A (the in-session resurrection poison, all volumes) is FIXED —
+   `tests/rewrite_shadow_supersede_tests.rs`, KD-1.11.
 
 ---
 

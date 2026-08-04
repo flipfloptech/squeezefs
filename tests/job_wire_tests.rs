@@ -1246,6 +1246,11 @@ async fn quiet_host_releases_finished_handles_without_further_accepts() {
 async fn finished_connection_handles_are_pruned() {
     // RES-5: `handles` was push-only — one `JoinHandle` retained per
     // connection ever accepted, all reachable before authentication.
+    // Since the 2026-08-04 quiet-host law the registry is SELF-DRAINING
+    // (a serve task's completion removes its own entry), so this wait
+    // is event-driven — it converges to exactly `base` once the 24
+    // serve tasks finish, with no further accept required. The poll
+    // deadline is a failsafe only, never the synchronization.
     let (meta, _mf) = meta_fixture().await;
     let fab = fabric(&meta, 0).await;
     let mut cfg = wire_cfg(30_000, 10_000);
@@ -1261,14 +1266,16 @@ async fn finished_connection_handles_are_pruned() {
             .expect("connect");
         drop(c); // immediate departure — the serve task finishes at once
     }
-    poll_until("finished handles pruned", Duration::from_secs(15), || {
-        host.retained_task_handles() <= base + 2
-    })
+    poll_until(
+        "finished handles pruned (failsafe deadline)",
+        Duration::from_secs(15),
+        || host.retained_task_handles() <= base,
+    )
     .await;
     assert!(
-        host.retained_task_handles() <= base + 2,
-        "24 finished connections must not each retain a JoinHandle forever \
-         (retained {} vs base {base})",
+        host.retained_task_handles() <= base,
+        "24 finished connections must not retain JoinHandles on a quiet \
+         host (retained {} vs base {base})",
         host.retained_task_handles()
     );
     assert_eq!(

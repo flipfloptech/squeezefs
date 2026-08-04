@@ -74,8 +74,11 @@
 //! - **Bounded connections**: `JobWireConfig::max_connections`
 //!   (derived from the core count, `SQUEEZEFS_JOB_WIRE_MAX_CONNS`
 //!   overrides absolute), an accept-error **backoff ladder** (the bare
-//!   `continue` turned `EMFILE` into a busy loop), and per-connection
-//!   `JoinHandle` **pruning** (RES-5: `handles` was push-only).
+//!   `continue` turned `EMFILE` into a busy loop), and a
+//!   **self-draining** per-connection `JoinHandle` registry (RES-5:
+//!   `handles` was push-only; the 2026-08-04 quiet-host law then made
+//!   the prune trigger the serve task's own completion, never a later
+//!   accept — `HandleReaper` on `JobWireHost`).
 //! - **Enrollment freshness**: the coordinator speaks first with a
 //!   [`WireFrame::Challenge`]; its nonce is **single-use** (replay
 //!   registry) inside a **freshness window**
@@ -1129,7 +1132,34 @@ pub struct JobWireHost {
     /// namespace).
     pr_mode: AtomicBool,
     shutdown: AtomicBool,
-    handles: parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Task registry: the accept/dispatcher/sweeper cores plus one entry
+    /// per live connection. **Self-draining** (the 2026-08-04 quiet-host
+    /// law): a serve task's own completion removes its entry
+    /// ([`HandleReaper`]), so finished handles are released the moment
+    /// their task ends — never parked until a later accept happens to
+    /// run a prune (the RES-5 retain-on-accept left a quiet host's last
+    /// arrivals retained until shutdown, which is exactly the schedule
+    /// the `task check` flake kept losing to).
+    handles: parking_lot::Mutex<HashMap<u64, tokio::task::JoinHandle<()>>>,
+    next_handle_id: AtomicU64,
+}
+
+/// Removes one serve task's registry entry when the task ENDS — on
+/// every exit: normal return, panic unwind, or the shutdown abort
+/// (where [`JobWireHost::shutdown`] already took the map, making the
+/// remove a no-op). Held as the serve task's first local, so the drop
+/// runs unconditionally. This is what makes
+/// [`JobWireHost::retained_task_handles`] converge on a quiet host: the
+/// completion itself is the prune trigger.
+struct HandleReaper {
+    host: Arc<JobWireHost>,
+    id: u64,
+}
+
+impl Drop for HandleReaper {
+    fn drop(&mut self) {
+        self.host.handles.lock().remove(&self.id);
+    }
 }
 
 impl std::fmt::Debug for JobWireHost {
@@ -1284,7 +1314,8 @@ impl JobWireHost {
             fence: tokio::sync::Mutex::new(None),
             pr_mode: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
-            handles: parking_lot::Mutex::new(Vec::new()),
+            handles: parking_lot::Mutex::new(HashMap::new()),
+            next_handle_id: AtomicU64::new(0),
             cfg,
         });
 
@@ -1294,7 +1325,13 @@ impl JobWireHost {
         }
         core.push(tokio::spawn(Self::dispatcher_loop(Arc::clone(&host))));
         core.push(tokio::spawn(Self::sweeper_loop(Arc::clone(&host))));
-        host.handles.lock().extend(core);
+        {
+            let mut handles = host.handles.lock();
+            for h in core {
+                let id = host.next_handle_id.fetch_add(1, Ordering::Relaxed);
+                handles.insert(id, h);
+            }
+        }
         Ok(host)
     }
 
@@ -1347,7 +1384,10 @@ impl JobWireHost {
     }
 
     /// Retained task handles (RES-5 gauge: this must NOT grow with the
-    /// number of connections ever accepted).
+    /// number of connections ever accepted — and, since the 2026-08-04
+    /// quiet-host law, it converges back to the core-task base as serve
+    /// tasks finish, with no further accept required: the registry is
+    /// self-draining via `HandleReaper`).
     pub fn retained_task_handles(&self) -> usize {
         self.handles.lock().len()
     }
@@ -1385,8 +1425,11 @@ impl JobWireHost {
     /// and release the WERO fence.
     pub async fn shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
-        let handles: Vec<_> = std::mem::take(&mut *self.handles.lock());
-        for h in handles {
+        // Take the whole map FIRST: every aborted serve task's reaper
+        // then removes against the fresh (empty) map — a no-op — while
+        // this loop owns joining the taken handles.
+        let handles = std::mem::take(&mut *self.handles.lock());
+        for h in handles.into_values() {
             h.abort();
             let _ = h.await;
         }
@@ -1443,7 +1486,19 @@ impl JobWireHost {
 
             let host = Arc::clone(&self);
             let handshake = self.cfg.handshake_timeout;
+            // Self-draining registry (RES-5 + the 2026-08-04 quiet-host
+            // law): the serve task's own completion removes its entry,
+            // so `retained_task_handles` converges without a further
+            // accept. The lock is held across spawn+insert — no `.await`
+            // inside — so the reaper's remove can never run before the
+            // insert it undoes.
+            let id = self.next_handle_id.fetch_add(1, Ordering::Relaxed);
+            let mut handles = self.handles.lock();
             let h = tokio::spawn(async move {
+                let _reaper = HandleReaper {
+                    host: Arc::clone(&host),
+                    id,
+                };
                 let _permit = permit;
                 // The handshake itself is attacker-paced: bound it. The
                 // TLS **exporter** output is captured here and mixed into
@@ -1474,14 +1529,8 @@ impl JobWireHost {
                 };
                 host.serve_conn(stream, peer, binding).await;
             });
-            // RES-5: `handles` was push-only — one JoinHandle retained
-            // per connection ever accepted. Prune the finished ones on
-            // every accept (the `admin_conns` pattern).
-            {
-                let mut handles = self.handles.lock();
-                handles.retain(|h| !h.is_finished());
-                handles.push(h);
-            }
+            handles.insert(id, h);
+            drop(handles);
         }
     }
 

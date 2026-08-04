@@ -186,6 +186,7 @@ pub static KNOBS: &[Knob] = &[
     k("SQUEEZEFS_FUSE_IO_URING_SQPOLL_IDLE_MS", int(0, MS_MAX), "off", "Enable SQPOLL on the transport rings with this idle timeout, ms (measured NOT recommended)."),
     k("SQUEEZEFS_FUSE_IO_URING_SQPOLL_CPU", int(0, 4095), "unpinned", "Pin the SQPOLL kernel thread to this CPU."),
     k("SQUEEZEFS_FUSE_PIN_SCOPE", Kind::Enum(&["node", "core"]), "node", "Transport thread affinity scope; `core` is the pre-campaign hard-pin posture."),
+    k("SQUEEZEFS_FUSE_SAME_LANE_DISPATCH", Kind::Bool, "1", "READ handler futures spawn_local on the dispatching TPC lane instead of round-robining to another lane (transport-ingress lever 1); `0` restores the rotation (A0 control)."),
     k("SQUEEZEFS_FUSE_KMBUF", Kind::Bool, "on", "kmbuf reply-buffer negotiation; 0 = the A/B control."),
     k("SQUEEZEFS_FUSE_ZC", Kind::Bool, "off", "FUSE_URING_ZERO_COPY negotiation face (serve integration is a staged follow-on)."),
     k("SQUEEZEFS_FUSE_NO_KILLPRIV", Kind::Bool, "off", "TESTING escape: refuse FUSE_HANDLE_KILLPRIV_V2 and restore the kernel's per-write GETXATTR probe."),

@@ -2616,7 +2616,9 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         // channel + the per-queue reply task — one task wake per op saved.
         let reply_conn = self.fuse_connection.clone();
 
-        spawn(debug_span!("fuse_read"), async move {
+        // Lever 1 (transport-ingress dispatch): same-lane spawn_local when
+        // this dispatch loop already runs on a TPC lane — see `spawn_read`.
+        spawn_read(debug_span!("fuse_read"), async move {
             crate::raw::read_phase::read_transport_phase_record(
                 crate::raw::read_phase::TransportPhase::DispatchLag,
                 dispatch_t0.elapsed(),
@@ -5183,6 +5185,10 @@ impl TpcScheduler {
                     if let Some(cpus) = lane_cpus {
                         crate::raw::affinity::set_current_affinity(&cpus);
                     }
+                    // Same-lane dispatch context mark (lever 1): READ
+                    // dispatchers probe this to spawn_local instead of
+                    // paying the cross-lane channel hop.
+                    IS_TPC_LANE.with(|c| c.set(true));
 
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
@@ -5309,6 +5315,64 @@ pub fn tpc_lane_redispatches() -> u64 {
 
 static TPC_SCHEDULER: once_cell::sync::Lazy<TpcScheduler> =
     once_cell::sync::Lazy::new(TpcScheduler::new);
+
+std::thread_local! {
+    /// `true` exactly on `fuse3-tpcN` lane threads (set once in the lane
+    /// body before its LocalSet runs) — the same-lane dispatch gate's
+    /// context probe. A thread-local, not a runtime probe: the lane
+    /// runtimes are `current_thread` and the probe must cost nothing on
+    /// the per-op path.
+    static IS_TPC_LANE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Transport-ingress lever 1 (2026-08-04 campaign; the §9.2 deferred
+/// item, venue named by the cluster randread-kernel row — 412 µs
+/// dispatch_lag at 256 in-flight): when the dispatcher already runs ON a
+/// TPC lane thread, spawn the handler future onto the CURRENT lane's
+/// LocalSet instead of round-robining it through another lane's channel
+/// — deleting one unbounded-channel hop and one cross-thread wake per
+/// op. The kernel already spreads load (qid ≈ submitting CPU ≈ lane), so
+/// same-lane keeps the spread while making the hand-off a local queue
+/// push. `SQUEEZEFS_FUSE_SAME_LANE_DISPATCH=0` restores the rotation
+/// (the A0 control + operational escape).
+fn same_lane_dispatch_enabled() -> bool {
+    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        // The ONE boolean convention (env_knob_core; the daemon-side
+        // registry gate in `squeezefs::env_knobs` refuses malformed
+        // values at startup — this read only ever sees vetted input,
+        // and defaults ON when absent).
+        let raw = std::env::var("SQUEEZEFS_FUSE_SAME_LANE_DISPATCH").ok();
+        crate::env_knob_core::parse_bool("SQUEEZEFS_FUSE_SAME_LANE_DISPATCH", raw.as_deref())
+            .ok()
+            .flatten()
+            .unwrap_or(true)
+    })
+}
+
+/// Spawn a handler future same-lane when legal (on a lane thread with
+/// the lever on), else through the global rotation. READ-path dispatch
+/// uses this; other opcodes keep the rotation until their venues are
+/// measured.
+#[inline]
+fn spawn_read<F>(span: Span, fut: F)
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    #[cfg(feature = "tokio-runtime")]
+    {
+        if same_lane_dispatch_enabled() && IS_TPC_LANE.with(|c| c.get()) {
+            tokio::task::spawn_local(async move {
+                let _ = fut.instrument(span).await;
+            });
+            return;
+        }
+        TPC_SCHEDULER.spawn(async move {
+            let _ = fut.instrument(span).await;
+        });
+    }
+}
 
 #[inline]
 fn spawn<F>(span: Span, fut: F)

@@ -238,6 +238,19 @@ if [ "$FIO_RC" -ne 0 ] || [ ! -s "$OUT" ]; then
     journal "FAIL label=$LABEL fio_rc=$FIO_RC"
     fail "fio exited $FIO_RC (log: $RESULTS/${LABEL}.fio_stderr.log)"
 fi
+# fio >= 3.4x prepends advisory "note: ..." lines to --output even in JSON
+# mode (e.g. "note: both iodepth >= 1 and synchronous I/O engine are
+# selected..." on the matched-inflight psync passes); fio 3.36 does not.
+# Strip everything before the first '{' so every downstream json.load sees
+# pure JSON regardless of the instrument's fio build.
+python3 - "$OUT" <<'EOF'
+import sys
+p = sys.argv[1]
+raw = open(p, "rb").read()
+i = raw.find(b"{")
+if i > 0:
+    open(p, "wb").write(raw[i:])
+EOF
 
 # ---- stats snapshot (after) + delta --------------------------------------
 if [ -n "$MOUNT" ]; then

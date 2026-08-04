@@ -203,6 +203,191 @@ async fn stats_snapshot_getattr_size_matches_served_bytes_under_churn() {
     }
 }
 
+/// The 2026-08-04 field tear (`dd` reads the full fresh payload while
+/// `cat` clamps at a stale size and tears mid-string on a busy mount):
+/// the live session serves each over-uring queue from its own
+/// `SqueezefsFilesystem` CLONE, and the Clone impl SPLIT the virtual-
+/// inode snapshot state per clone — `open_virtual_files` (DashMap deep
+/// copy: an fh pinned by queue A's OPEN misses on queue B's READ, which
+/// then regenerates PER READ CALL), `latest_stats_json` (split ArcSwap
+/// cells while `latest_stats_size` is genuinely shared — GETATTR's size
+/// and READ's bytes come from different generations: the exact
+/// torn-prefix face), and `next_virtual_fh` (split counter: two queues
+/// mint the SAME fh). The M2 pin above never caught it because it
+/// drives ONE instance.
+///
+/// Contract: the LOOKUP → OPEN → churn → GETATTR → READ → RELEASE
+/// snapshot protocol holds ACROSS handler clones — any queue may serve
+/// any step.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stats_snapshot_protocol_holds_across_handler_clones() {
+    use fuse3::raw::prelude::Filesystem;
+    use squeezefs::block_allocator::BlockAllocator;
+    use squeezefs::cache::TieredCache;
+    use squeezefs::dlm::DlmClient;
+    use squeezefs::fuse_client::{SqueezefsFilesystem, STATS_INODE};
+    use squeezefs::nvme_dev::NvmeBlockDev;
+    use squeezefs::routing::DataRouter;
+    use std::sync::Arc;
+    use tempfile::NamedTempFile;
+
+    async fn open_v3_meta(
+        path: &std::path::Path,
+    ) -> Arc<squeezefs::meta_backend::kv::backend::KvMetaBackend> {
+        squeezefs::meta_backend::kv::builder::format_v3(
+            path,
+            256 * 1024 * 1024,
+            &squeezefs::meta_backend::kv::builder::FormatV3Options {
+                node_size: squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE,
+                journal_len_override: None,
+                force: true,
+                full_wipe: false,
+                format_config_xattr: None,
+            },
+        )
+        .await
+        .expect("format v3 meta volume");
+        squeezefs::meta_backend::kv::backend::KvMetaBackend::open(path)
+            .await
+            .expect("open v3 meta volume")
+    }
+
+    let dlm = DlmClient::new().unwrap();
+    let b = NamedTempFile::new().unwrap();
+    std::fs::File::create(b.path())
+        .unwrap()
+        .set_len(64 * 1024 * 1024)
+        .unwrap();
+    let nvme = Arc::new(NvmeBlockDev::new(b.path().to_str().unwrap()));
+    let ba = Arc::new(BlockAllocator::new("stats_clone_coherence").await.unwrap());
+    let s = tempfile::tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![s.path().to_path_buf()],
+        Some("64MB"),
+        Some("64MB"),
+        Some("16MB"),
+        Some("32MB"),
+        ba.clone(),
+        nvme.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let router = DataRouter::new(dlm.clone(), cache, ba, nvme);
+    let mut fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);
+    let m = NamedTempFile::new().unwrap();
+    let routed = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![
+        open_v3_meta(m.path()).await,
+    ]));
+    fs.router.set_meta_backend(routed.clone());
+    fs.meta_backend = Some(routed);
+
+    // The session shape: one clone per queue (the dispatch loops clone
+    // the filesystem exactly like this).
+    let q_a = fs.clone();
+    let q_b = fs.clone();
+    let q_c = fs.clone();
+
+    let req = fuse3::raw::Request {
+        unique: 0,
+        uid: 1000,
+        gid: 1000,
+        pid: 1,
+        ..Default::default()
+    };
+
+    // cat's syscalls land on arbitrary queues: LOOKUP on A, OPEN on A,
+    // churn, fstat on B, READ on C, RELEASE on B.
+    let _entry = q_a
+        .lookup(req, 1, std::ffi::OsStr::new(".stats"))
+        .await
+        .expect("lookup .stats");
+    let opened = q_a
+        .open(req, STATS_INODE, libc::O_RDONLY as u32, 0)
+        .await
+        .expect("open .stats");
+    // Counter churn between the open and the reader's fstat (the busy-
+    // mount reality; digit growth changes the payload length).
+    METRICS
+        .parked_gate_timeouts
+        .fetch_add(987_654_321, Ordering::Relaxed);
+    METRICS
+        .prefetch_window_hwm
+        .fetch_add(123_456_789, Ordering::Relaxed);
+    let attr = q_b
+        .getattr(req, STATS_INODE, Some(opened.fh), 0)
+        .await
+        .expect("getattr .stats on another queue clone");
+    let first = q_c
+        .read(req, STATS_INODE, opened.fh, 0, 16 * 1024 * 1024, 0)
+        .await
+        .expect("read .stats on a third queue clone");
+    assert_eq!(
+        attr.attr.size,
+        first.data.len() as u64,
+        "fstat size (queue B) must equal the bytes the pinned fh serves \
+         (queue C) — a mismatch is the field's cat-clamp torn-JSON face"
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&first.data)
+        .expect("cross-clone full read of .stats must parse as JSON");
+    assert!(parsed.get("metrics").is_some(), "snapshot carries metrics");
+
+    // Multi-call read stability (dd's read loop, bs smaller than the
+    // payload): two reads on DIFFERENT clones against the same fh must
+    // serve ONE generation — a regenerate-per-call serve splices two
+    // generations mid-payload.
+    METRICS
+        .parked_gate_timeouts
+        .fetch_add(111_111_111, Ordering::Relaxed);
+    let head = q_b
+        .read(req, STATS_INODE, opened.fh, 0, 4096, 0)
+        .await
+        .expect("head read");
+    let tail = q_c
+        .read(
+            req,
+            STATS_INODE,
+            opened.fh,
+            4096,
+            16 * 1024 * 1024,
+            0,
+        )
+        .await
+        .expect("tail read");
+    let mut joined = head.data.to_vec();
+    joined.extend_from_slice(&tail.data);
+    assert_eq!(
+        joined.len() as u64,
+        attr.attr.size,
+        "split reads across clones must still total the pinned size"
+    );
+    let _: serde_json::Value = serde_json::from_slice(&joined).expect(
+        "split reads across clones must join into ONE parseable \
+         generation — a per-call regenerate splices two generations",
+    );
+    q_b.release(req, STATS_INODE, opened.fh, 0, 0, false)
+        .await
+        .expect("release .stats");
+
+    // Distinct fh minting across clones: split counters mint the SAME
+    // fh on two queues, cross-wiring two readers' pinned generations.
+    let o1 = q_a
+        .open(req, STATS_INODE, libc::O_RDONLY as u32, 0)
+        .await
+        .expect("open on A");
+    let o2 = q_b
+        .open(req, STATS_INODE, libc::O_RDONLY as u32, 0)
+        .await
+        .expect("open on B");
+    assert_ne!(
+        o1.fh, o2.fh,
+        "two clones minted the SAME virtual fh — split next_virtual_fh \
+         counters cross-wire concurrent readers' pinned generations"
+    );
+    let _ = q_a.release(req, STATS_INODE, o1.fh, 0, 0, false).await;
+    let _ = q_b.release(req, STATS_INODE, o2.fh, 0, 0, false).await;
+}
+
 /// D3.a (PR M3, design-metadata-throughput §9): the `transport_commit_batch`
 /// histogram — COMMIT_AND_FETCH SQEs per queue-worker ring flush — is wired
 /// to the `.stats` JSON with the labeled-bucket convention

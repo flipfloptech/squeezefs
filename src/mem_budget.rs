@@ -746,28 +746,42 @@ pub const IPC_ARENA_FLOOR_BYTES: u64 = 64 * 1024 * 1024;
 /// odd multiples.
 pub const IPC_ARENA_DMA_ALIGN_BYTES: u64 = 4 * 1024 * 1024;
 
+/// The EXA client-validation canon iodepth — the ONE definition of the
+/// house canon's `qd = 8` (derivation-debt audit 2026-08-04: the same 8
+/// lived independently in `tests/fio/run_fio_row.sh`'s `IODEPTH`
+/// default, every `exa_client_perf.sh` battery row, and the
+/// [`ipc_session_population_target`] slope; the tie test
+/// `exa_canon_qd_has_one_definition_tied_to_the_fio_canon` parses the
+/// fio canon files and makes drift red). The value is an EXTERNAL
+/// instrument's dims — shape parity with the DDN exa-client validation
+/// kit (libaio, direct=1, qd=8) — i.e. an instrument fact like a wire
+/// format, never tuning: changing it is a canon change across the fio
+/// files AND this constant, consciously.
+pub const EXA_CANON_QD: u64 = 8;
+
 /// The derived IPC session POPULATION the admission cap is sized to
-/// hold: `max(128, cpus × 8)` (2026-08-04 squeeze-test population fix;
-/// user directive verbatim: "we need to see how we make that some
-/// derived value from the system size (cpu/memory/threads) something so
-/// it's not a hard coded value").
+/// hold: `max(128, cpus × EXA_CANON_QD)` (2026-08-04 squeeze-test
+/// population fix; user directive verbatim: "we need to see how we make
+/// that some derived value from the system size (cpu/memory/threads)
+/// something so it's not a hard coded value").
 ///
-/// - `cpus × 8`: the matched-inflight client-fleet slope — one shim
+/// - `cpus × qd`: the matched-inflight client-fleet slope — one shim
 ///   session per client process, and the EXA fairness law runs psync
-///   fleets at `njobs × qd` with qd = 8 (the canon dims), so a box's
-///   honest concurrent client population scales with its cores. ×8 is
-///   the measured shape that refused, TWICE (two battery runs): 32 cpus
-///   → 256 fio processes against the ~128-session budget the retired
-///   /128 arena fraction implied — `ipc_admission_refusals` ~125/pass,
-///   ~half the fleet silently on the kernel lane, engagement 0.697 ⇒
-///   INVALID row — with the per-uid cap ALREADY derived (it correctly
-///   read ~131; the ARENA SIZE was the binding constraint).
+///   fleets at `njobs × qd` with qd = [`EXA_CANON_QD`] (the canon dims,
+///   ONE definition — see its doc), so a box's honest concurrent client
+///   population scales with its cores. The slope is the measured shape
+///   that refused, TWICE (two battery runs): 32 cpus → 256 fio
+///   processes against the ~128-session budget the retired /128 arena
+///   fraction implied — `ipc_admission_refusals` ~125/pass, ~half the
+///   fleet silently on the kernel lane, engagement 0.697 ⇒ INVALID row
+///   — with the per-uid cap ALREADY derived (it correctly read ~131;
+///   the ARENA SIZE was the binding constraint).
 /// - floor 128: never derive a population BELOW what the retired /128
 ///   fraction implied (never-regress-below-shipped, the `Q_DEPTH_FLOOR`
-///   house law) — on any box where `cpus × 8 < 128` the arena
+///   house law) — on any box where `cpus × qd < 128` the arena
 ///   arithmetic stays byte-identical to the shipped cap/128.
 pub fn ipc_session_population_target(cpus: usize) -> u64 {
-    (cpus as u64).saturating_mul(8).max(128)
+    (cpus as u64).saturating_mul(EXA_CANON_QD).max(128)
 }
 
 /// Per-session IPC arena default resolution, pure (2026-08-04 derivation

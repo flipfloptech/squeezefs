@@ -586,10 +586,24 @@ impl ReclaimQueue {
             worker_armed: AtomicBool::new(false),
             fence_signal: std::sync::OnceLock::new(),
             halted: AtomicBool::new(false),
+            // Defaults are MEASURED constants (derivation-sweep filing —
+            // honest measured evidence, never derivation theater):
+            // batch 64 blocks / 2 ms = the shipped coalesce shape of the
+            // async-reclaim campaign (`.benchmarks/2026-07-27-async-block-
+            // reclaim.md` — blocks ÷ `commands` is the live factor).
             batch_blocks: env_u64("SQUEEZEFS_RECLAIM_BATCH_BLOCKS", 64, 1, 1024),
             batch_ms: env_u64("SQUEEZEFS_RECLAIM_BATCH_MS", 2, 0, 600_000),
+            // 4096 = the deferred thin-space budget the write-wall rows ran
+            // (`.benchmarks/2026-07-31-write-wall.md`); the filed derivation
+            // thesis is aggregate data capacity (thin-space debt, not RAM)
+            // — pending its queue-cap sweep, the measured constant stands.
             max_queued: env_u64("SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS", 4096, 1, 1 << 20),
+            // 32 lanes = the write-wall width experiment's verdict (idle
+            // drain 2,700 → 5,900 cmd/s from 8 → 32 lanes/device; NO width
+            // sensitivity under foreground load — module doc, ibid.).
             lanes_per_dev: env_u64("SQUEEZEFS_RECLAIM_LANES_PER_DEV", 32, 1, 64),
+            // 1 s park bound = the park-don't-spill liveness horizon
+            // (write-wall iteration 1 — time horizon, not a resource cap).
             cap_park_ms: env_u64("SQUEEZEFS_RECLAIM_CAP_PARK_MS", 1000, 0, 60_000),
             fg_signal: std::sync::OnceLock::new(),
             fg_last: AtomicU64::new(0),

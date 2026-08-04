@@ -79,13 +79,12 @@ pub fn nvme_tcp_target_for_with_root(device_path: &str, sysfs_root: &Path) -> Op
     let max_kb: u64 = read(&blk_dir.join("queue/max_hw_sectors_kb"))?
         .parse()
         .ok()?;
-    // Derived geometry (design §8): queues from possible CPUs, depth from a
-    // conservative in-flight bound clamped by what CAP.MQES grants at connect.
-    let cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    let io_queues = (cpus / 8).clamp(1, 8) as u16;
-    let queue_depth = ((cpus * 2).clamp(4, 64)) as u16;
+    // Derived geometry (design §8, via the pure form below) from the
+    // PROCESS core mask — never the calling thread's
+    // `available_parallelism()` (the Hang-1 pinned-first-toucher sizing
+    // poison; the arm path runs on core-pinned tokio workers — the A10
+    // uring_fs precedent, derivation sweep 2026-08-04).
+    let (io_queues, queue_depth) = lane_geometry(crate::cpu::process_parallelism());
     // The 2026-08-04 field-refusal fix: fabrics controllers with UNLIMITED
     // MDTS advertise `max_hw_sectors_kb = 2147483644` (the i32::MAX-class
     // sentinel — measured on every nvme-tcp data controller of the
@@ -112,14 +111,56 @@ pub fn nvme_tcp_target_for_with_root(device_path: &str, sysfs_root: &Path) -> Op
     })
 }
 
-/// The lane's own per-command transfer cap: 1 MiB — the FUSE transport's
-/// negotiated `max_write`/payload face (the largest single destination a
-/// lane dest-serve fills in one command today) and the Z2-benched
-/// MDTS-face class. A device advertising more (or the unlimited sentinel
-/// above) splits into sub-commands exactly as the kernel initiator would,
-/// and the cap bounds per-queue area sizing at `depth × 1 MiB`
+/// Pre-steering ceiling on the DERIVED per-device lane-queue want
+/// (derivation-debt audit 2026-08-04 — named so the number has a
+/// definition site): at probe time the NIC is unknown, so the §8
+/// NIC-derived ceiling (`nic_queues / 4` — keep ≥ ¾ of the RSS set)
+/// cannot apply yet; it does at steering (`steering::lane_queue_picks`),
+/// where the device is known. Until then each wanted queue pins
+/// `queue_depth × LANE_MAX_XFER_CAP_BYTES`-class area RAM at arm, so
+/// this rail bounds the pre-steering pinned footprint at
+/// `8 × 64 × 1 MiB = 512 MiB`/device worst case — the largest geometry
+/// the Z2/Z3 acceptance venues exercised. Interim measured posture,
+/// filed with the §8 BDP follow-on; tie-tested in
+/// `tests/derivation_sweep_tests.rs`.
+pub const LANE_IO_QUEUES_MAX: u16 = 8;
+
+/// Derived lane geometry `(io_queues, queue_depth)` from the PROCESS
+/// core count — pure (pinned on the canonical box shapes by
+/// `tests/derivation_sweep_tests.rs::zcrx_lane_geometry_is_pinned_on_canonical_shapes`).
+///
+/// * `io_queues = clamp(cpus / 8, 1, LANE_IO_QUEUES_MAX)` — the §8
+///   possible-CPUs slope; floor 1 is the physical minimum (a lane with
+///   zero queues cannot exist); the ceiling is the pre-steering want
+///   rail (see [`LANE_IO_QUEUES_MAX`] — the real §8 ceiling is
+///   NIC-derived and applies at steering).
+/// * `queue_depth = clamp(cpus × 2, 4, 64)` — an INTERIM in-flight
+///   slope standing in for §8's BDP derivation (`bdp_bytes /
+///   block_size` from link speed × measured connect RTT — that probe is
+///   not built; filed follow-on, derivation-debt audit 2026-08-04).
+///   Floor 4 and cap 64 are §8's own `derived_inflight` clamp — the
+///   floor is the transport's never-regress `Q_DEPTH_FLOOR` class — and
+///   CAP.MQES still clamps the granted depth at connect
+///   (`initiator.rs`), so the cap never exceeds what the controller
+///   grants.
+pub fn lane_geometry(cpus: usize) -> (u16, u16) {
+    let io_queues = (cpus / 8).clamp(1, LANE_IO_QUEUES_MAX as usize) as u16;
+    let queue_depth = (cpus * 2).clamp(4, 64) as u16;
+    (io_queues, queue_depth)
+}
+
+/// The lane's own per-command transfer cap — the FUSE transport's payload
+/// face, ONE definition (derivation-debt audit 2026-08-04: defined FROM
+/// fuse3's [`PAYLOAD_BASE`](fuse3::raw::connection::fuse_over_uring::PAYLOAD_BASE)
+/// — yesterday's shipped 1 MiB ent, the largest single destination a
+/// lane dest-serve fills in one command today — instead of restating
+/// 1 MiB; the Z2 bracket benched exactly this MDTS-face class). A device
+/// advertising more (or the unlimited sentinel above) splits into
+/// sub-commands exactly as the kernel initiator would, and the cap
+/// bounds per-queue area sizing at `depth × 1 MiB`
 /// (`area_bytes_per_queue`).
-pub const LANE_MAX_XFER_CAP_BYTES: u32 = 1024 * 1024;
+pub const LANE_MAX_XFER_CAP_BYTES: u32 =
+    fuse3::raw::connection::fuse_over_uring::PAYLOAD_BASE as u32;
 
 /// Host identity (design §4.1): field parity with the kernel initiator when
 /// `/etc/nvme/{hostnqn,hostid}` exist, else a stable per-process identity.

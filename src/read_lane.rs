@@ -98,10 +98,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// custody.
 pub const READ_LANE_BUDGET_DIVISOR: u64 = 8;
 
-/// The R1b size boundary, mirrored: only fills above this participate
-/// in the lane/hold (the ≤ 256 KiB population keeps today's behavior
-/// verbatim — it already has a RAM tier).
-pub const READ_LANE_MIN_FILL_BYTES: usize = 256 * 1024;
+/// The R1b size boundary — the SAME constant, not a mirror (derivation-
+/// debt audit 2026-08-04: "mirrored" used to mean a retyped literal):
+/// only fills above [`crate::routing::READ_SIZE_CLASS_BOUNDARY_BYTES`]
+/// participate in the lane/hold (the at-or-below population keeps
+/// today's behavior verbatim — it already has a RAM tier).
+pub const READ_LANE_MIN_FILL_BYTES: usize = crate::routing::READ_SIZE_CLASS_BOUNDARY_BYTES;
 
 /// Per-stream lane AHEAD-issue depth, in blocks (pure — pinned by
 /// `tests/read_lane_tests.rs` depth tables). **Default 0 — ahead-issue

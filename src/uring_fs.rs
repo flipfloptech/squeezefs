@@ -36,6 +36,12 @@ use std::rc::Rc;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
+/// Per-worker request-queue bound — backpressure, not custody (the P1-6
+/// class: small request structs; payload bytes live with the caller
+/// until service). Same posture as `nvme_dev::URING_REQ_QUEUE_CAP` —
+/// filed in the derivation sweep's backpressure-bounds row (scale with
+/// offered concurrency; pending its saturation sweep, the shipped bound
+/// stands).
 const URING_FS_QUEUE_CAP: usize = 4096;
 /// Ring SQ depth per worker.
 const RING_ENTRIES: u32 = 512;

@@ -117,6 +117,21 @@ const LAYOUT_INLINE_HEADROOM: usize = 4096;
 /// `routing::LayoutMetadata` path keeps working.
 pub use crate::layout_wire::LayoutMetadata;
 
+/// The read path's size-class boundary, bytes — the ONE definition
+/// (derivation-debt audit 2026-08-04: the same 256 KiB lived as retyped
+/// literals at the R1b always-admit arm, the R4 RAM-LRU-vs-hot-tier
+/// split, and the read-lane hold's participation floor, which describes
+/// itself as this boundary "mirrored"). Fills at or below it are the
+/// small population that keeps the classic RAM LRU and always admits to
+/// the tier; fills above it ride the R4 hot tier / R1b governed
+/// admission / read-lane hold instead (design-read-path §5.3/§5.4).
+/// A MEASURED constant of the read-path program's counted rows (the
+/// same 256 KiB class as `SQUEEZEFS_READ_RANGED_THRESHOLD` and the NT
+/// floors — `.benchmarks/2026-08-01-read-lane.md` and the R4/R1b PR
+/// notes), never a derivation candidate: re-bracket on the fio-gap
+/// venue to move it. Tie-tested in `tests/derivation_sweep_tests.rs`.
+pub const READ_SIZE_CLASS_BOUNDARY_BYTES: usize = 256 * 1024;
+
 /// Bytes charged to one [`DataRouter::load_striped_block_keys`] entry:
 /// the `(u32, Option<String>)` tuple itself (32 B) plus the heap key the
 /// `Some` arm carries (`{prefix}/part_{n}`, ~64 B at the shipped prefix
@@ -636,11 +651,24 @@ fn epoch_coarse_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// The layout metadata cache's time-to-IDLE horizon, seconds — the ONE
+/// definition (derivation-debt audit 2026-08-04: the `metadata_cache`
+/// builder and [`EPOCH_IDLE_HORIZON_MS`]'s "TTI ÷ 10" claim each carried
+/// their own 300 — a derivation whose input had no definition site).
+/// A time horizon, not a resource cap (the derivation-sweep filing:
+/// warmth/liveness horizons stay measured time constants); the same
+/// 5-minute daemon-cache class as `fuse_client::DAEMON_CACHE_TTL_SECS`
+/// — deliberately a SEPARATE constant, because the layout cache and the
+/// dentry/attr caches are distinct surfaces whose horizons may diverge
+/// on measurement. Tie-tested in `tests/derivation_sweep_tests.rs`.
+pub const METADATA_CACHE_TTI_SECS: u64 = 300;
+
 /// The idle-close horizon (KD-1.6): derived as the metadata cache's
-/// time-to-idle ÷ 10 — the eviction horizon the idle close defends
-/// against (the refetch-compose hook is the correctness belt; this
-/// bounds the crash exposure of RAM-only bindings on a gone-quiet ino).
-const EPOCH_IDLE_HORIZON_MS: u64 = 300_000 / 10;
+/// time-to-idle ([`METADATA_CACHE_TTI_SECS`]) ÷ 10 — the eviction
+/// horizon the idle close defends against (the refetch-compose hook is
+/// the correctness belt; this bounds the crash exposure of RAM-only
+/// bindings on a gone-quiet ino).
+pub const EPOCH_IDLE_HORIZON_MS: u64 = METADATA_CACHE_TTI_SECS * 1000 / 10;
 
 /// One ino's open rewrite epoch (all mutation happens under that ino's
 /// `INODE_META_LOCKS` — records and closes serialize there; the fields
@@ -5643,6 +5671,14 @@ impl DataRouter {
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();
         let total_memory = sys.total_memory();
+        // Cache capacity in ENTRIES, derived from RAM: one cached layout
+        // entry per 200 KB of physical memory (an entry is a
+        // `CachedMetadata` + inline layout map — hundreds of bytes to a
+        // few KiB at shipped shapes, so worst case stays well under 1 %
+        // of RAM). Floor 10 k = the shipped small-box posture
+        // (never-regress-below-shipped). RAM here, not the R5 budget:
+        // this Lazy-free constructor can run before the budget resolves,
+        // and the moka cache self-evicts — R5 gauges it separately.
         let metadata_capacity = std::cmp::max(10_000, total_memory / 200_000);
 
         let router = Self {
@@ -5664,9 +5700,15 @@ impl DataRouter {
                 // residency.
                 metadata_cache: moka::sync::Cache::builder()
                     .max_capacity(metadata_capacity)
-                    .time_to_idle(std::time::Duration::from_secs(300))
+                    .time_to_idle(std::time::Duration::from_secs(METADATA_CACHE_TTI_SECS))
                     .build_with_hasher(ahash::RandomState::new()),
                 inflight_block_reads: std::sync::Arc::new(scc::HashMap::new()),
+                // R2 stream-lane tracking: entries are tiny lane structs,
+                // so the 100 k cap is a leak rail (≫ any honest live
+                // stream population), never a working-set budget, and the
+                // 30 s TTL is the stream-idle horizon — a lane silent that
+                // long is a finished stream (time horizon, not a resource
+                // cap; the prefetch window itself is budget-derived).
                 stream_lanes: moka::sync::Cache::builder()
                     .max_capacity(100000)
                     .time_to_live(std::time::Duration::from_secs(30))
@@ -6153,7 +6195,9 @@ impl DataRouter {
                                 .admission_governor
                                 .note_foreground(downloaded_bytes.len() as u64);
                         }
-                        let ghost_admit = if downloaded_bytes.len() <= 256 * 1024 {
+                        let ghost_admit = if downloaded_bytes.len()
+                            <= READ_SIZE_CLASS_BOUNDARY_BYTES
+                        {
                             true
                         } else {
                             match self.tier_admission {
@@ -6287,7 +6331,7 @@ impl DataRouter {
                         }
                         // Avoid flooding RAM LRU with full 4 MiB blocks under
                         // multi-GB sequential reads. Small blocks still cache.
-                        if downloaded_bytes.len() <= 256 * 1024 {
+                        if downloaded_bytes.len() <= READ_SIZE_CLASS_BOUNDARY_BYTES {
                             self.cache.read_lru.put(block_key, downloaded_bytes.clone());
                         } else {
                             // R4 (§5.4): the > 256 KiB population finally

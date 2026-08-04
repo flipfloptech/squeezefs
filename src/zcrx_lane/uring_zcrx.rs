@@ -247,7 +247,12 @@ impl Mmap {
     /// Typed pointer at a byte offset.
     fn at<T>(&self, off: u32) -> *mut T {
         debug_assert!(off as usize + std::mem::size_of::<T>() <= self.len);
-        // SAFETY: bounds-asserted; alignment guaranteed by kernel layout.
+        // SAFETY: `off` is a kernel-assigned ring/region offset (or the
+        // test fixture's own layout) — in-bounds by construction, and
+        // debug builds re-assert it above (the debug_assert compiles out
+        // in release; the bound holds because the kernel described the
+        // mapping it is describing offsets into). Alignment: ring words
+        // are laid at their natural alignment by the kernel.
         unsafe { self.ptr.add(off as usize) as *mut T }
     }
 }
@@ -426,6 +431,54 @@ fn cqe_span_offset(raw_off: u64, len: usize, area_len: usize) -> Option<usize> {
     let off = (raw_off & ((1u64 << IORING_ZCRX_AREA_SHIFT) - 1)) as usize;
     off.checked_add(len).filter(|end| *end <= area_len)?;
     Some(off)
+}
+
+/// Byte length of the user-memory region handed to `REGISTER_ZCRX_IFQ`:
+/// one leading page for the kernel's head/tail words plus 16 bytes per
+/// rqe, rounded up to whole pages (mmap grain). Pure — the page size is
+/// a parameter so the law is testable at any grain (design §8: no fixed
+/// constants; the grain is the runtime page size).
+fn refill_region_len(rq_entries: u32, page: usize) -> usize {
+    (page + rq_entries as usize * 16).div_ceil(page) * page
+}
+
+/// Build the three `REGISTER_ZCRX_IFQ` argument structs (design §5).
+///
+/// Everything the KERNEL writes back (`rq_area_token`, `mmap_offset`,
+/// `offsets`, the clamped `rq_entries` echo, `zcrx_id`) must go DOWN as
+/// zero — a stale value in an out-param field is undefined kernel
+/// behavior, which is why this is a function with a contract test and
+/// not three struct literals in the setup closure. Pointer wiring
+/// (`area_ptr`/`region_ptr`) happens at the call site AFTER the structs
+/// reach their final stack slots — a pointer taken in here would dangle
+/// the moment the values move out.
+fn build_ifq_registration(
+    area_base: u64,
+    area_len: u64,
+    region_addr: u64,
+    region_len: u64,
+    ifindex: u32,
+    rxq: u32,
+    rq_entries: u32,
+) -> (ZcrxAreaReg, RegionDesc, ZcrxIfqReg) {
+    let area_reg = ZcrxAreaReg {
+        addr: area_base,
+        len: area_len,
+        ..Default::default()
+    };
+    let region_desc = RegionDesc {
+        user_addr: region_addr,
+        size: region_len,
+        flags: IORING_MEM_REGION_TYPE_USER,
+        ..Default::default()
+    };
+    let ifq = ZcrxIfqReg {
+        if_idx: ifindex,
+        if_rxq: rxq,
+        rq_entries,
+        ..Default::default()
+    };
+    (area_reg, region_desc, ifq)
 }
 
 /// The registered refill ring view (region memory is ours; offsets are
@@ -616,30 +669,22 @@ fn drive(
     let setup = (|| -> Result<(RawRing, RefillRing, u32), String> {
         let ring = RawRing::new(cfg.sq_entries)?;
         let page = super::area::chunk_bytes_default();
-        let region_len = (page + cfg.rq_entries as usize * 16).div_ceil(page) * page;
+        let region_len = refill_region_len(cfg.rq_entries, page);
         let region = Mmap::anon(region_len)?;
         // The kernel writes back through area_ptr (rq_area_token),
         // region_ptr (mmap_offset) and the ifq struct itself (offsets,
         // clamped rq_entries, zcrx_id) — all three passed as mut.
-        let mut area_reg = ZcrxAreaReg {
-            addr: cfg.area.base() as u64,
-            len: cfg.area.len() as u64,
-            ..Default::default()
-        };
-        let mut region_desc = RegionDesc {
-            user_addr: region.ptr as u64,
-            size: region_len as u64,
-            flags: IORING_MEM_REGION_TYPE_USER,
-            ..Default::default()
-        };
-        let mut ifq = ZcrxIfqReg {
-            if_idx: cfg.ifindex,
-            if_rxq: cfg.rxq,
-            rq_entries: cfg.rq_entries,
-            area_ptr: &mut area_reg as *mut _ as u64,
-            region_ptr: &mut region_desc as *mut _ as u64,
-            ..Default::default()
-        };
+        let (mut area_reg, mut region_desc, mut ifq) = build_ifq_registration(
+            cfg.area.base() as u64,
+            cfg.area.len() as u64,
+            region.ptr as u64,
+            region_len as u64,
+            cfg.ifindex,
+            cfg.rxq,
+            cfg.rq_entries,
+        );
+        ifq.area_ptr = &mut area_reg as *mut _ as u64;
+        ifq.region_ptr = &mut region_desc as *mut _ as u64;
         ring.register(
             IORING_REGISTER_ZCRX_IFQ,
             &mut ifq as *mut _ as *const libc::c_void,
@@ -808,8 +853,12 @@ fn drive(
                             },
                         };
                         side[slot as usize] = (raw_off, res as u32);
-                        // SAFETY: slot ownership transferred from the
-                        // forgotten grant ref; released via AreaSlice drop.
+                        // SAFETY: the driver holds exactly one RAW ledger
+                        // ref for `slot` (taken via `into_raw_slot`, held
+                        // in `ready_slots`/the late-grant loop and popped
+                        // just above — never duplicated); this transfers
+                        // it back into RAII custody. Released via
+                        // AreaSlice/GrantRef drop after the parse.
                         let grant = unsafe { cfg.area.adopt_grant(slot) };
                         // SAFETY: span bounds checked against the area.
                         let ptr = unsafe { cfg.area.base().add(off) as *const u8 };
@@ -908,23 +957,49 @@ fn drive(
 //   * `RefillRing::post` is pure ring arithmetic over a region WE own;
 //   * `RingCmd` is an eventfd doorbell and a queue;
 //   * the two per-completion gates (`cqe_area_matches`,
-//     `cqe_span_offset`) are pure;
+//     `cqe_span_offset`) are pure — and they parse KERNEL-provided CQE
+//     words, so they carry the never-panic-on-arbitrary-input proptest
+//     (the `tests/decoder_property_tests.rs` law);
+//   * `refill_region_len` + `build_ifq_registration` are the pure
+//     halves of ifq registration (page-round law; kernel-out params
+//     zeroed);
 //   * `SlotBag`/`SendBufs` `Drop` are the exit-path laws (release every
 //     ledger ref; deliberately FORGET in-flight send buffers because the
-//     kernel may still reference them after ring-fd close);
+//     kernel may still reference them after ring-fd close), and the
+//     `adopt_grant` custody round-trip is the CQE-time transfer;
+//   * ring-fd close with an op in flight is the teardown/crash path;
 //   * the arm ladder's REFUSAL path (`REGISTER_ZCRX_IFQ` on a
 //     non-zcrx interface) is exactly what every dev box produces.
+//
+// Environment skips route through `squeezefs-testkit` (TEST-2's ledger
+// law — a kernel without the lane's ring flags is a *ledgered*
+// capability skip, promotable by `SQUEEZEFS_TEST_REQUIRE_CAPABILITY=1`,
+// never a silent green).
 //
 // What stays field-owed is the armed serve loop (`.benchmarks/
 // 2026-08-04-zcrx-z2.md` names it). Everything below runs anywhere.
 #[cfg(test)]
 mod tests {
     use super::*;
+    use squeezefs_testkit::{self as testkit, site, SkipClass};
 
-    fn io_uring_available() -> bool {
-        // A minimal probe: if the kernel refuses io_uring entirely
-        // (seccomp, io_uring_disabled=2), the ring legs cannot run.
-        RawRing::new(4).is_ok()
+    /// The ring gate: can THIS kernel set up the lane's exact ring
+    /// (CQE32 | SINGLE_ISSUER | DEFER_TASKRUN)? A refusal (seccomp,
+    /// `io_uring_disabled=2`, pre-6.0 kernel) is a **ledgered**
+    /// capability skip — TEST-2's law: never a silent `return`, so
+    /// `SQUEEZEFS_TEST_REQUIRE_CAPABILITY=1` can promote it to a
+    /// failure and the skip ledger records what did not run. The
+    /// `site` is captured by the test itself (`site!()` at the gate
+    /// call) so the ledger names the test, not this helper.
+    fn uring_or_skip(site: testkit::Site) -> bool {
+        match RawRing::new(4) {
+            Ok(_) => true,
+            Err(why) => testkit::declare(
+                site,
+                SkipClass::Capability,
+                &format!("io_uring (CQE32|SINGLE_ISSUER|DEFER_TASKRUN) unavailable: {why}"),
+            ),
+        }
     }
 
     // -- the two per-completion gates ----------------------------------
@@ -976,12 +1051,118 @@ mod tests {
         );
     }
 
+    // The never-panic-on-kernel-provided-words law (the
+    // `tests/decoder_property_tests.rs` posture applied to the CQE):
+    // `big0` and `res` come straight off a DMA'd completion ring — a
+    // buggy provider, a mis-steered flow, or ring corruption can put
+    // ANY bit pattern there, and the two gates are the only thing
+    // between that word and a pointer into the area. Total functions:
+    // a verdict, never a panic, and every ADMITTED span is in-bounds.
+    proptest::proptest! {
+        #[test]
+        fn cqe_gates_are_total_and_admit_only_in_area_spans(
+            raw_off in proptest::prelude::any::<u64>(),
+            token in proptest::prelude::any::<u64>(),
+            len in proptest::prelude::any::<usize>(),
+            area_len in proptest::prelude::any::<usize>(),
+        ) {
+            // Total: neither gate may panic on any input.
+            let matches = cqe_area_matches(raw_off, token);
+            let span = cqe_span_offset(raw_off, len, area_len);
+
+            // Provenance is exactly the high-16 comparison.
+            proptest::prop_assert_eq!(
+                matches,
+                raw_off >> IORING_ZCRX_AREA_SHIFT == token >> IORING_ZCRX_AREA_SHIFT
+            );
+            // An admitted span lies wholly inside the area and its
+            // offset is exactly the masked low bits — never rewritten.
+            if let Some(off) = span {
+                proptest::prop_assert_eq!(
+                    off as u64,
+                    raw_off & ((1u64 << IORING_ZCRX_AREA_SHIFT) - 1)
+                );
+                let end = off.checked_add(len);
+                proptest::prop_assert!(end.is_some(), "no admitted overflow");
+                proptest::prop_assert!(end.unwrap_or(usize::MAX) <= area_len);
+            } else {
+                // A refusal is honest: the masked span really escapes.
+                let off = (raw_off & ((1u64 << IORING_ZCRX_AREA_SHIFT) - 1)) as usize;
+                proptest::prop_assert!(
+                    off.checked_add(len).map(|e| e > area_len).unwrap_or(true)
+                );
+            }
+        }
+    }
+
+    // -- registration argument construction (design §5) ----------------
+
+    #[test]
+    fn refill_region_len_is_page_rounded_and_holds_ring_words_plus_rqes() {
+        for page in [4096usize, 16384, 65536] {
+            for entries in [1u32, 4, 16, 4096, 65536] {
+                let len = refill_region_len(entries, page);
+                assert_eq!(len % page, 0, "mmap grain (page={page} e={entries})");
+                assert!(
+                    len >= page + entries as usize * 16,
+                    "one page of head/tail words + 16 B per rqe must fit \
+                     (page={page} e={entries} len={len})"
+                );
+                assert!(
+                    len - (page + entries as usize * 16) < page,
+                    "no more than one page of rounding slack \
+                     (page={page} e={entries} len={len})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ifq_registration_args_echo_inputs_and_zero_every_kernel_out_param() {
+        let (area_reg, region_desc, ifq) =
+            build_ifq_registration(0xA000, 0x40_0000, 0xB000, 0x2000, 7, 3, 512);
+        // Inputs travel verbatim.
+        assert_eq!(area_reg.addr, 0xA000);
+        assert_eq!(area_reg.len, 0x40_0000);
+        assert_eq!(region_desc.user_addr, 0xB000);
+        assert_eq!(region_desc.size, 0x2000);
+        assert_eq!(
+            region_desc.flags, IORING_MEM_REGION_TYPE_USER,
+            "the region is caller memory — TYPE_USER, never a kernel \
+             allocation request"
+        );
+        assert_eq!((ifq.if_idx, ifq.if_rxq, ifq.rq_entries), (7, 3, 512));
+        // Everything the KERNEL writes back must go down zeroed: a stale
+        // value in an out-param is undefined kernel behavior.
+        assert_eq!(area_reg.rq_area_token, 0, "kernel-out: area token");
+        assert_eq!(area_reg.flags, 0, "no dmabuf/flags in the user-mem arm");
+        assert_eq!(area_reg.dmabuf_fd, 0);
+        assert_eq!(area_reg.resv2, [0; 2]);
+        assert_eq!(region_desc.mmap_offset, 0, "kernel-out: mmap offset");
+        assert_eq!(region_desc.id, 0);
+        assert_eq!(region_desc.resv, [0; 4]);
+        assert_eq!(ifq.zcrx_id, 0, "kernel-out: ifq id");
+        assert_eq!(ifq.rx_buf_len, 0, "0 = kernel default chunk grain");
+        assert_eq!(ifq.flags, 0);
+        assert_eq!(
+            (ifq.offsets.head, ifq.offsets.tail, ifq.offsets.rqes),
+            (0, 0, 0),
+            "kernel-out: refill ring offsets"
+        );
+        assert_eq!(ifq.resv, [0; 3]);
+        // Pointer wiring is the CALL SITE's job (after final placement).
+        assert_eq!(
+            (ifq.area_ptr, ifq.region_ptr),
+            (0, 0),
+            "a pointer minted inside the builder would dangle on move-out"
+        );
+    }
+
     // -- the raw ring: mmap arithmetic, CQE32 stride, head/tail --------
 
     #[test]
     fn raw_ring_setup_accepts_the_lane_flags_and_round_trips_a_cqe() {
-        if !io_uring_available() {
-            eprintln!("io_uring unavailable on this kernel — ring legs skipped");
+        if !uring_or_skip(site!()) {
             return;
         }
         // The lane's exact setup: CQE32 + SINGLE_ISSUER + DEFER_TASKRUN.
@@ -1013,7 +1194,7 @@ mod tests {
 
     #[test]
     fn raw_ring_sq_is_bounded_and_reports_full_rather_than_wrapping() {
-        if !io_uring_available() {
+        if !uring_or_skip(site!()) {
             return;
         }
         let ring = RawRing::new(4).expect("ring");
@@ -1039,6 +1220,71 @@ mod tests {
              (pushed {pushed})"
         );
         assert!(pushed >= 4, "a 4-entry ring must accept at least 4");
+    }
+
+    #[test]
+    fn raw_ring_indices_wrap_cleanly_across_many_times_the_capacity() {
+        if !uring_or_skip(site!()) {
+            return;
+        }
+        // 40 sequential round-trips on an 8-entry SQ (CQ = 32 under
+        // CQSIZE ×4): the SQ index wraps five times and the CQ index at
+        // least once — the `head & mask` / CQE32-stride arithmetic must
+        // hold across the wrap, not just on the first lap.
+        let ring = RawRing::new(8).expect("ring");
+        let cmds = RingCmd::new().expect("eventfd");
+        let mut buf = 0u64;
+        for i in 0..40u64 {
+            cmds.send(Vec::new()).expect("ring the doorbell");
+            ring.push_sqe(&Sqe {
+                opcode: IORING_OP_READ,
+                fd: cmds.doorbell.as_raw_fd(),
+                addr: &mut buf as *mut u64 as u64,
+                len: 8,
+                user_data: TAG_SEND_BASE + i,
+                ..Default::default()
+            })
+            .expect("one SQE always fits a drained ring");
+            ring.enter(1, 1).expect("submit + wait");
+            let (ud, res, _flags, big0) = ring.pop_cqe().expect("one CQE per lap");
+            assert_eq!(ud, TAG_SEND_BASE + i, "user_data survives lap {i}");
+            assert_eq!(res, 8, "eventfd read length on lap {i}");
+            assert_eq!(big0, 0, "READ leaves the big-CQE word zero (lap {i})");
+            assert_eq!(buf, 1, "each lap sees exactly its own doorbell count");
+            assert!(ring.pop_cqe().is_none(), "exactly one CQE per lap");
+        }
+    }
+
+    #[test]
+    fn ring_fd_close_with_an_op_in_flight_is_the_crash_path_and_must_not_hang() {
+        if !uring_or_skip(site!()) {
+            return;
+        }
+        // The driver's every error return drops RawRing with RECV_ZC (and
+        // possibly SENDs) still in flight — ring-fd close IS the teardown
+        // (design §5 registration-order law, reverse). Model it with a
+        // READ parked on a never-rung eventfd: submit without waiting,
+        // then drop the ring. The kernel cancels asynchronously.
+        let ring = RawRing::new(4).expect("ring");
+        let cmds = RingCmd::new().expect("eventfd");
+        // The buffer is deliberately LEAKED, mirroring the SendBufs law:
+        // ring-fd close cancels in-flight ops asynchronously, so kernel
+        // completion may race a freed stack slot. One 8-byte leak, test
+        // scope only.
+        let buf: &'static mut u64 = Box::leak(Box::new(0u64));
+        ring.push_sqe(&Sqe {
+            opcode: IORING_OP_READ,
+            fd: cmds.doorbell.as_raw_fd(),
+            addr: buf as *mut u64 as u64,
+            len: 8,
+            user_data: TAG_DOORBELL,
+            ..Default::default()
+        })
+        .expect("push");
+        let submitted = ring.enter(1, 0).expect("submit, do not wait");
+        assert_eq!(submitted, 1, "the op is genuinely in flight");
+        assert!(ring.pop_cqe().is_none(), "nothing completed — it is parked");
+        drop(ring); // must return promptly; a wedge here fails the harness
     }
 
     // -- the refill ring: pure ring arithmetic over our own region -----
@@ -1195,6 +1441,36 @@ mod tests {
     }
 
     #[test]
+    fn raw_slot_custody_round_trips_through_adopt_without_double_release() {
+        // The CQE-time custody transfer the serve loop performs: pop a
+        // raw slot (held in ready_slots), `adopt_grant` it back into
+        // RAII, wrap it in an AreaSlice, drop — exactly ONE ledger
+        // release, and the chunk is grantable again. This is the
+        // invariant the `unsafe { adopt_grant(slot) }` SAFETY comment
+        // stakes: one raw ref in, one RAII ref out, never both.
+        let area = super::super::area::ZcrxArea::new(128 * 1024, 64 * 1024, None).expect("area");
+        let total = area.free_chunks();
+        let g = area.try_grant_chunk().expect("grant");
+        let ptr = g.chunk_ptr() as *const u8;
+        let slot = g.into_raw_slot();
+        assert_eq!(area.free_chunks(), total - 1, "the raw ref is still held");
+        // SAFETY: `slot` is the one raw ref taken just above.
+        let grant = unsafe { area.adopt_grant(slot) };
+        // SAFETY (MEM-4): `ptr` is the grant's own chunk base; zero-length
+        // span, so no byte is ever dereferenced.
+        let slice = unsafe { AreaSlice::new(grant, ptr, 0) };
+        assert_eq!(area.free_chunks(), total - 1, "adoption is not a release");
+        drop(slice);
+        assert_eq!(
+            area.free_chunks(),
+            total,
+            "one raw ref in, one RAII drop out — the slot is grantable again"
+        );
+        let again = area.try_grant_chunk().expect("the recycled slot grants");
+        drop(again);
+    }
+
+    #[test]
     fn send_bufs_drop_forgets_in_flight_capsules_but_frees_completed_ones() {
         // The law (module docs): a buffer removed at CQE time drops
         // normally — the kernel is done with it. Whatever REMAINS at
@@ -1220,7 +1496,7 @@ mod tests {
 
     #[test]
     fn driver_reports_the_ifq_registration_refusal_and_poisons_the_lane() {
-        if !io_uring_available() {
+        if !uring_or_skip(site!()) {
             return;
         }
         // No dev box has a zcrx-capable NIC, so REGISTER_ZCRX_IFQ against
@@ -1275,7 +1551,7 @@ mod tests {
 
     #[test]
     fn driver_unwound_before_go_exits_clean_without_poisoning() {
-        if !io_uring_available() {
+        if !uring_or_skip(site!()) {
             return;
         }
         // The `go = false` path: steering could not be applied, so the

@@ -718,6 +718,14 @@ async fn set_format_config(h: &H, block_size: u64, comp: &str, enc: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn frame_marker_superset_of_pre_fix_encoding() {
     let state = CryptoCompressState::new("lz4".to_string(), "none".to_string(), None);
+    // §3d.1 (rc-manifest.md): derive the DUR-8e plaintext bound from the
+    // fixture geometry, exactly as a mount does (`DataRouter::set_crypto` →
+    // `init_scratch_pool(block_size)`). Without this the un-installed
+    // state's `max_plaintext_len()` falls back to the PROCESS-ambient
+    // `SQUEEZEFS_DEFAULT_BLOCK_SIZE` env read — and sibling tests in this
+    // binary set it per fixture, so a sub-96 KiB fixture landing earlier
+    // reintroduces the §3c writeback red (the env-leak class).
+    state.init_scratch_pool(CHUNK_SIZE as usize);
 
     // Pre-fix writer form for a COMPRESSIBLE payload (bit 31 always 0):
     // must decode unchanged (superset decoder).

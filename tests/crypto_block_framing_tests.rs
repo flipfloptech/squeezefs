@@ -258,6 +258,14 @@ async fn lz4_aes_cold_striped_reads_decode() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn frame_contract_padded_legacy_truncated_passthrough() {
     let state = CryptoCompressState::new("lz4".to_string(), "none".to_string(), None);
+    // §3d.1 (rc-manifest.md): pin the DUR-8e plaintext bound to THIS
+    // fixture's block size, exactly as a mount does (`DataRouter::set_crypto`
+    // → `init_scratch_pool(block_size)`). Without this the un-installed
+    // state's `max_plaintext_len()` falls back to the PROCESS-ambient
+    // `SQUEEZEFS_DEFAULT_BLOCK_SIZE` env read — sibling tests in this binary
+    // set it per fixture, so a sub-96 KiB fixture landing earlier
+    // reintroduces the §3c writeback red (the env-leak class).
+    state.init_scratch_pool(BS as usize);
     let data = bytes::Bytes::from(payload(96 * 1024));
     let img = state.process_write(data.clone()).unwrap();
 
@@ -278,9 +286,14 @@ async fn frame_contract_padded_legacy_truncated_passthrough() {
         "unframed legacy blobs must refuse loud (forward-only, no shim)"
     );
 
-    // Truncated frame — refuse loud.
+    // Truncated frame — refuse loud. The pooled writer the §3d.1 pin
+    // engages zero-pads the stored image to the DMA grain (PERF-10), so
+    // derive the FRAMED length from the header and trim into the frame
+    // itself — trimming the padded image's last byte only cuts pad, which
+    // the window tolerance above must (and does) decode.
+    let framed = 4 + (u32::from_le_bytes(img[..4].try_into().unwrap()) & 0x7FFF_FFFF) as usize;
     assert!(
-        state.process_read(&img[..img.len() - 1]).is_err(),
+        state.process_read(&img[..framed - 1]).is_err(),
         "truncated frame must refuse loud"
     );
     assert!(
@@ -290,6 +303,9 @@ async fn frame_contract_padded_legacy_truncated_passthrough() {
 
     // Passthrough: byte-identical, no frame.
     let pt = CryptoCompressState::new("none".to_string(), "none".to_string(), None);
+    // §3d.1: same env-leak screen for the passthrough leg (records the
+    // DUR-8e bound only — a passthrough state never allocates a pool).
+    pt.init_scratch_pool(BS as usize);
     let img = pt.process_write(data.clone()).unwrap();
     assert_eq!(img.as_ref(), data.as_ref(), "passthrough adds no frame");
     assert_eq!(pt.process_read(&img).unwrap().as_ref(), data.as_ref());

@@ -199,6 +199,11 @@ pub struct LaneSession {
     steering: std::sync::Mutex<Option<SteeringHold>>,
     /// Keeps the admin connection (and thus the association) alive.
     _admin_hold: tokio::task::JoinHandle<()>,
+    /// The rxq-arbiter grant backing this session's ifqs (real backend
+    /// only). Declared LAST: it drops after the queues close their
+    /// doorbells, so the indices return to the per-NIC pool only once
+    /// the session's teardown is underway.
+    _rxq_lease: Option<Arc<super::rxq_alloc::RxqLease>>,
 }
 
 impl LaneSession {
@@ -345,8 +350,14 @@ pub struct ZcrxPlan {
     pub ifname: String,
     pub ifindex: u32,
     pub numa_node: Option<usize>,
-    /// One dedicated RX queue per lane IO queue (highest-indexed picks).
+    /// One dedicated RX queue per lane IO queue — DISTINCT per session
+    /// on a shared NIC (the rxq arbiter's grant; qid N rides
+    /// `rx_queues[N - 1]`).
     pub rx_queues: Vec<u32>,
+    /// The arbiter lease backing `rx_queues` (RAII: the queues return to
+    /// the NIC's pool when the session — and thus its ifqs — goes away).
+    /// `None` only in direct unit constructions.
+    pub rxq_lease: Option<Arc<super::rxq_alloc::RxqLease>>,
 }
 
 /// The armed NIC state a session must restore at disarm/unmount.
@@ -669,6 +680,10 @@ impl LaneSession {
                 LaneBackend::Zcrx(_) => "zcrx RECV_ZC — PR Z2",
             },
         );
+        let rxq_lease = match &backend {
+            LaneBackend::Zcrx(plan) => plan.rxq_lease.clone(),
+            _ => None,
+        };
         Ok(Arc::new(LaneSession {
             target,
             queues,
@@ -676,6 +691,7 @@ impl LaneSession {
             poisoned,
             steering: std::sync::Mutex::new(steering_hold),
             _admin_hold: admin_hold,
+            _rxq_lease: rxq_lease,
         }))
     }
 

@@ -18,7 +18,10 @@
 
 /// One session's granted RX queues on one NIC. RAII: dropping the lease
 /// returns the indices to the NIC's pool (the session's ifqs close with
-/// it — the ring driver's fd close is the kernel-side unregister).
+/// it — the ring driver's fd close is the kernel-side unregister; a
+/// same-instant re-arm racing that async close can still see the
+/// kernel's EEXIST, which refuses THAT arm loud and leaves the mount on
+/// the kernel path — the kernel stays the cross-process/final arbiter).
 #[derive(Debug, PartialEq, Eq)]
 pub struct RxqLease {
     ifindex: u32,
@@ -39,19 +42,104 @@ impl Drop for RxqLease {
     }
 }
 
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{LazyLock, Mutex, MutexGuard};
+
+/// Leased queue indices per NIC. Keyed by ifindex (kernel-unique per
+/// NIC on this host — the same key `REGISTER_ZCRX_IFQ` collides on).
+static REGISTRY: LazyLock<Mutex<HashMap<u32, BTreeSet<u32>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn registry() -> MutexGuard<'static, HashMap<u32, BTreeSet<u32>>> {
+    // A panicked holder leaves plain collections in a valid state —
+    // recover the inner map rather than poisoning every future arm.
+    REGISTRY.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Grant `want` DISTINCT lane RX queues on the NIC `ifindex` names, from
-/// the §8-derived eligible pool of `channels`. Refuses loudly — naming
-/// the NIC, the derived pool numbers, and the demand — when the pool is
-/// exhausted (or the NIC is too narrow to dedicate ZC queues at all).
+/// the §8-derived eligible pool of `channels` (probed from THIS NIC —
+/// `steering::lane_eligible_queues`, never a constant). Grants prefer
+/// the pure `lane_queue_picks` slice (uncontended parity with the
+/// pre-arbiter behavior), fill highest-first from the remaining free
+/// pool under contention (a partial grant degrades the session's queue
+/// count — the same posture as the §8 ceiling clamp), and refuse loudly
+/// — naming the NIC, the probed queue count, the derived pool and the
+/// demand — when NO free queue exists (or the NIC is too narrow to
+/// dedicate ZC queues at all).
 pub fn acquire(ifindex: u32, ifname: &str, channels: u32, want: u16) -> Result<RxqLease, String> {
-    // RED PHASE (fix/zcrx-rxq-arbiter): contract pinned by the tests
-    // below + tests/zcrx_lane_tests.rs; implementation lands next.
-    let _ = (ifindex, ifname, channels, want);
-    Err("zcrx rxq arbiter: unimplemented".into())
+    if want == 0 {
+        return Err(format!(
+            "zcrx rxq arbiter: zero lane queues requested for {ifname} (ifindex \
+             {ifindex}) — a lane with no queues cannot exist (refusing)"
+        ));
+    }
+    let pool = super::steering::lane_eligible_queues(channels);
+    let pool_len = pool.end.saturating_sub(pool.start);
+    if pool_len == 0 {
+        return Err(format!(
+            "zcrx rxq arbiter: {ifname} (ifindex {ifindex}) has {channels} RX queues \
+             — too narrow to dedicate ZC queues (needs ≥ 4: the lane pool is \
+             nic_queues/4, design §8)"
+        ));
+    }
+    let mut reg = registry();
+    let in_use = reg.entry(ifindex).or_default();
+    let goal = u32::from(want).min(pool_len) as usize;
+    // Preferred grant: the pure §8 single-session picks…
+    let mut grant: Vec<u32> = super::steering::lane_queue_picks(channels, want)
+        .into_iter()
+        .filter(|q| !in_use.contains(q))
+        .collect();
+    // …contended: fill from the remaining free pool, highest-first.
+    if grant.len() < goal {
+        for q in pool.clone().rev() {
+            if grant.len() >= goal {
+                break;
+            }
+            if !in_use.contains(&q) && !grant.contains(&q) {
+                grant.push(q);
+            }
+        }
+    }
+    if grant.is_empty() {
+        let leased = in_use.len();
+        return Err(format!(
+            "zcrx rxq arbiter: {ifname} (ifindex {ifindex}) has {channels} RX queues \
+             → {pool_len} lane-eligible (nic_queues/4, design §8: RSS keeps ≥ ¾ of \
+             the NIC), all {leased} already leased by armed lane sessions — demand \
+             for {want} more refused; kernel path serves (free a lane session, or \
+             widen the NIC: ethtool -L {ifname} combined <N>)"
+        ));
+    }
+    grant.sort_unstable();
+    if grant.len() < goal {
+        log::warn!(
+            "zcrx rxq arbiter: {ifname} granted {} of {want} wanted lane queues \
+             ({} of the {pool_len}-queue pool leased by other sessions) — this \
+             session degrades its queue count",
+            grant.len(),
+            in_use.len()
+        );
+    }
+    for q in &grant {
+        in_use.insert(*q);
+    }
+    Ok(RxqLease {
+        ifindex,
+        queues: grant,
+    })
 }
 
 fn release(ifindex: u32, queues: &[u32]) {
-    let _ = (ifindex, queues);
+    let mut reg = registry();
+    if let Some(set) = reg.get_mut(&ifindex) {
+        for q in queues {
+            set.remove(q);
+        }
+        if set.is_empty() {
+            reg.remove(&ifindex);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -98,7 +186,12 @@ mod tests {
         let hold = acquire(ifx, "unit-nic-b", 8, 2).expect("pool-filling lease");
         assert_eq!(hold.queues(), &[6, 7]);
         let err = acquire(ifx, "unit-nic-b", 8, 1).expect_err("exhausted pool must refuse");
-        for needle in ["unit-nic-b", "8 RX queues", "2 lane-eligible", "demand for 1"] {
+        for needle in [
+            "unit-nic-b",
+            "8 RX queues",
+            "2 lane-eligible",
+            "demand for 1",
+        ] {
             assert!(
                 err.contains(needle),
                 "refusal must name the NIC, the queue count, the derived pool and \

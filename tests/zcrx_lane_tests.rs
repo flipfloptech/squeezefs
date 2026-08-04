@@ -1940,11 +1940,13 @@ fn test_rxq_arbiter_exhaustion_refuses_with_derived_numbers() {
     let ifx = 0xACE1;
     let _hold = rxq_alloc::acquire(ifx, "itest-nic-b", 8, 2).expect("pool-filling lease");
     let err = rxq_alloc::acquire(ifx, "itest-nic-b", 8, 1).expect_err("exhausted pool");
-    for needle in ["itest-nic-b", "8 RX queues", "2 lane-eligible", "demand for 1"] {
-        assert!(
-            err.contains(needle),
-            "refusal must carry {needle:?}: {err}"
-        );
+    for needle in [
+        "itest-nic-b",
+        "8 RX queues",
+        "2 lane-eligible",
+        "demand for 1",
+    ] {
+        assert!(err.contains(needle), "refusal must carry {needle:?}: {err}");
     }
 }
 

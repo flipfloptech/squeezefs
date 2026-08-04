@@ -241,27 +241,44 @@ pub async fn arm_for_device(device_path: &str) -> Option<Arc<LaneSession>> {
             return None;
         }
     };
-    // flows ≡ queues 1:1, so the free rule-slot count clamps the queue
-    // want the same way the §8 pool does — a queue we cannot steer is a
-    // queue we must not claim.
-    let slot_want = target
-        .io_queues
-        .min((reserved.1 - reserved.0).min(u32::from(u16::MAX)) as u16);
-    let picks = steering::lane_queue_picks(channels, slot_want);
-    if picks.is_empty() {
+    // flows ≡ queues 1:1, so the FREE rule-slot count (total reserved
+    // minus live sessions' holdings) clamps the queue want the same way
+    // the §8 pool does — a queue we cannot steer is a queue we must not
+    // claim.
+    let free_slots = steering::free_reserved_slots(&ifname, reserved);
+    if free_slots == 0 {
         log::warn!(
-            "zcrx-lane: {ifname} has {channels} queues — too narrow to dedicate ZC \
-             queues (needs ≥ 4); lane not armed for {device_path}"
+            "zcrx-lane: live lane sessions hold all {} reserved steering rule slots \
+             on {ifname} — lane not armed for {device_path}; kernel path serves",
+            reserved.1 - reserved.0
         );
         return None;
     }
+    let slot_want = target
+        .io_queues
+        .min(free_slots.min(u32::from(u16::MAX)) as u16);
+    // DISTINCT per-session RX queues from the NIC-derived pool — the
+    // REGISTER_ZCRX_IFQ EEXIST fix (field row 3): the arbiter grants
+    // queues no live session holds and frees them when the session (and
+    // thus its ifqs) tears down.
+    let lease = match rxq_alloc::acquire(ifindex, &ifname, channels, slot_want) {
+        Ok(l) => l,
+        Err(e) => {
+            log::warn!(
+                "zcrx-lane: {e} — lane not armed for {device_path}; kernel path \
+                 serves (byte-identical)"
+            );
+            return None;
+        }
+    };
     let mut target = target;
-    target.io_queues = picks.len() as u16;
+    target.io_queues = lease.queues().len() as u16;
     let plan = initiator::ZcrxPlan {
         numa_node: ethtool::nic_numa_node(&ifname),
         ifname,
         ifindex,
-        rx_queues: picks,
+        rx_queues: lease.queues().to_vec(),
+        rxq_lease: Some(Arc::new(lease)),
     };
     area::register_r5_component();
     match LaneSession::connect_with(target, LaneBackend::Zcrx(plan)).await {

@@ -746,18 +746,56 @@ pub const IPC_ARENA_FLOOR_BYTES: u64 = 64 * 1024 * 1024;
 /// odd multiples.
 pub const IPC_ARENA_DMA_ALIGN_BYTES: u64 = 4 * 1024 * 1024;
 
+/// The derived IPC session POPULATION the admission cap is sized to
+/// hold: `max(128, cpus × 8)` (2026-08-04 squeeze-test population fix;
+/// user directive verbatim: "we need to see how we make that some
+/// derived value from the system size (cpu/memory/threads) something so
+/// it's not a hard coded value").
+///
+/// - `cpus × 8`: the matched-inflight client-fleet slope — one shim
+///   session per client process, and the EXA fairness law runs psync
+///   fleets at `njobs × qd` with qd = 8 (the canon dims), so a box's
+///   honest concurrent client population scales with its cores. ×8 is
+///   the measured shape that refused, TWICE (two battery runs): 32 cpus
+///   → 256 fio processes against the ~128-session budget the retired
+///   /128 arena fraction implied — `ipc_admission_refusals` ~125/pass,
+///   ~half the fleet silently on the kernel lane, engagement 0.697 ⇒
+///   INVALID row — with the per-uid cap ALREADY derived (it correctly
+///   read ~131; the ARENA SIZE was the binding constraint).
+/// - floor 128: never derive a population BELOW what the retired /128
+///   fraction implied (never-regress-below-shipped, the `Q_DEPTH_FLOOR`
+///   house law) — on any box where `cpus × 8 < 128` the arena
+///   arithmetic stays byte-identical to the shipped cap/128.
+pub fn ipc_session_population_target(cpus: usize) -> u64 {
+    (cpus as u64).saturating_mul(8).max(128)
+}
+
 /// Per-session IPC arena default resolution, pure (2026-08-04 derivation
-/// sweep): `SQUEEZEFS_IPC_ARENA_MB` explicit (MiB, > 0) wins verbatim
-/// (an odd explicit value stays DMA-eligible through the client-side
-/// slab law — `Geometry::slot_slab` floors to the LBA); otherwise
-/// `max(64 MiB, dma_align_down(admission_cap / 128))` — the /128
-/// fraction sizes a default arena so the admission cap holds a
-/// 128-session population, and [`ipc_per_uid_session_cap`] derives the
-/// per-uid cap from the SAME two numbers (`clamp(cap / arena, 64,
-/// 4096)`), so a full per-uid population of default-size arenas fills
-/// the admission cap exactly; the round-down never exceeds the cap
-/// fraction. Garbage warns and falls through (knob-family convention).
-pub fn resolve_ipc_arena_bytes(arena_mb_env: Option<&str>, arena_cap_bytes: u64) -> u64 {
+/// sweep + the same-day population fix): `SQUEEZEFS_IPC_ARENA_MB`
+/// explicit (MiB, > 0) wins verbatim (an odd explicit value stays
+/// DMA-eligible through the client-side slab law — `Geometry::slot_slab`
+/// floors to the LBA); otherwise
+/// `max(64 MiB, dma_align_down(admission_cap / population_target))`,
+/// where the population target is [`ipc_session_population_target`]
+/// (`max(128, cpus × 8)`) — the fraction sizes a default arena so the
+/// admission cap holds the box's derived session population (the
+/// retired /128 literal was a legacy "per-uid cap 64 × 2 safety"
+/// population ASSUMPTION; see the target's doc for the field conviction
+/// it starved), and [`ipc_per_uid_session_cap`] derives the per-uid cap
+/// from the SAME two numbers (`clamp(cap / arena, 64, 4096)`), so a
+/// full per-uid population of default-size arenas fills the admission
+/// cap exactly (quotient ≈ the population target); the round-down never
+/// exceeds the cap fraction — it can only RAISE that quotient. `cpus`
+/// must be the PROCESS parallelism
+/// ([`crate::cpu::process_parallelism`]), never the calling thread's
+/// `available_parallelism()` (the Hang-1 pinned-first-toucher sizing
+/// poison — the mount-time caller runs on a core-pinned tokio worker).
+/// Garbage warns and falls through (knob-family convention).
+pub fn resolve_ipc_arena_bytes(
+    arena_mb_env: Option<&str>,
+    arena_cap_bytes: u64,
+    cpus: usize,
+) -> u64 {
     if let Some(raw) = arena_mb_env {
         match raw.trim().parse::<u64>() {
             Ok(mib) if mib > 0 => return mib.saturating_mul(1024 * 1024),
@@ -767,7 +805,8 @@ pub fn resolve_ipc_arena_bytes(arena_mb_env: Option<&str>, arena_cap_bytes: u64)
             }
         }
     }
-    (arena_cap_bytes / 128 / IPC_ARENA_DMA_ALIGN_BYTES * IPC_ARENA_DMA_ALIGN_BYTES)
+    (arena_cap_bytes / ipc_session_population_target(cpus) / IPC_ARENA_DMA_ALIGN_BYTES
+        * IPC_ARENA_DMA_ALIGN_BYTES)
         .max(IPC_ARENA_FLOOR_BYTES)
 }
 
@@ -785,7 +824,11 @@ pub fn resolve_ipc_arena_bytes(arena_mb_env: Option<&str>, arena_cap_bytes: u64)
 /// by declaration (VAL-7d), so per-uid is a DoS tripwire, not an
 /// inter-uid fairness device — total admission is already bounded by
 /// `arena_cap_bytes`, and aligning the tripwire with that bound is what
-/// makes a refusal honest.
+/// makes a refusal honest. With the same-day population fix the derived
+/// arena divides the cap by [`ipc_session_population_target`], so this
+/// quotient ≈ that target (256 on the 32-CPU cluster shape: 22 GiB /
+/// 88 MiB) — the two derivations are COHERENT by construction: same
+/// cap, same arena, no third number.
 ///
 /// * floor 64: the shipped posture (never-regress-below-shipped, the
 ///   `Q_DEPTH_FLOOR` house law);

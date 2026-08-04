@@ -19095,12 +19095,17 @@ pub async fn start_mount<P: AsRef<Path>>(
             std::env::var("SQUEEZEFS_IPC_MEM_MAX").ok().as_deref(),
             std::env::var("SQUEEZEFS_IPC_MEM_PCT").ok().as_deref(),
         );
-        // Per-session arena: derived from the admission cap (2026-08-04
-        // derivation sweep — max(64 MiB shipped floor, PMD-aligned
-        // cap/128); SQUEEZEFS_IPC_ARENA_MB explicit wins verbatim).
+        // Per-session arena: derived from the admission cap over the
+        // POPULATION TARGET (2026-08-04 derivation sweep + same-day
+        // population fix — max(64 MiB shipped floor, DMA-aligned
+        // cap / max(128, cpus × 8)); SQUEEZEFS_IPC_ARENA_MB explicit
+        // wins verbatim). cpus = the PROCESS mask, never the calling
+        // thread's available_parallelism() — this runs on a core-pinned
+        // tokio worker (the Hang-1 sizing poison).
         let arena_bytes = crate::mem_budget::resolve_ipc_arena_bytes(
             std::env::var("SQUEEZEFS_IPC_ARENA_MB").ok().as_deref(),
             arena_cap_bytes,
+            crate::cpu::process_parallelism(),
         );
         let max_op_bytes = std::env::var("SQUEEZEFS_IPC_MAX_OP_BYTES")
             .ok()

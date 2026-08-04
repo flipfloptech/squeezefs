@@ -167,10 +167,16 @@ fn sgl_transport(sqe: &mut [u8; 64], len: u32) {
     sqe[39] = 0x5A;
 }
 
-/// Connect data blob geometry (4096 B in-capsule).
-pub const CONNECT_DATA_LEN: usize = 4096;
+/// Connect data blob geometry: EXACTLY 1024 B in-capsule —
+/// `sizeof(struct nvmf_connect_data)` (hostid 16 + cntlid 2 + resv 238 +
+/// subsysnqn 256 + hostnqn 256 + resv 256). The length is load-bearing on
+/// the wire: nvmet validates the Connect transfer length against it
+/// (`nvmet_check_transfer_len`) and refuses anything else with Data SGL
+/// Length Invalid | DNR = 0x400f — the 2026-08-04 field arm-refusal, which
+/// shipped a 4096 B blob here.
+pub const CONNECT_DATA_LEN: usize = 1024;
 
-/// Fabrics Connect capsule: CH(72) + SQE + 4096 B connect data.
+/// Fabrics Connect capsule: CH(72) + SQE + 1024 B connect data.
 /// `cntlid` is 0xFFFF for the admin-queue connect (controller assigns) and
 /// the assigned id for IO-queue connects. `sqsize0` is 0-based.
 #[allow(clippy::too_many_arguments)]

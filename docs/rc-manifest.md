@@ -512,23 +512,25 @@ argument for the from-zero tier, in one finding.
 The §3c fixes flagged three populations of the same classes, green today by
 luck rather than design — recorded so they are chosen work, not surprises:
 
-1. **Env-leak into the DUR-8e fallback**: `crypto_incompressible_tests.rs:720`
-   and `crypto_block_framing_tests.rs:260,292` decode through directly-built,
-   never-installed `CryptoCompressState`s in binaries whose siblings set
-   `SQUEEZEFS_DEFAULT_BLOCK_SIZE` per fixture. A new sub-96 KiB fixture landing
-   earlier in either file reintroduces the exact writeback red. The one-line
-   `init_scratch_pool` fix applies.
+1. **Env-leak into the DUR-8e fallback** — **CLOSED** (`f3237c5f`): the
+   one-line `init_scratch_pool` fix (the writeback `ea29b100` precedent)
+   applied at all three flagged sites — `crypto_incompressible_tests.rs`
+   (`frame_marker_superset`, CHUNK_SIZE) and `crypto_block_framing_tests.rs`
+   (`frame_contract` both legs, the fixture's BS) — so the un-installed
+   decode states derive their plaintext bound per fixture instead of riding
+   the process-ambient `SQUEEZEFS_DEFAULT_BLOCK_SIZE` read.
 2. **A product-side process-global wearing a config costume**: `config_ops.rs:971`,
    `defrag.rs:598`, `fsck.rs:5532` use `std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", …)`
    as a runtime channel. Latent, not live (the shipped CLI is one-verb-one-process
    and every mount pins its crypto bound via `set_crypto`) — but two
    different-block-size volume sets in ONE process would fight over it.
    Registry-style cleanup owed.
-3. **Immediate-assert-after-read sites racing PERF-11's deferred publish**:
-   `reused_key_stale_fill_tests.rs:643,684`, `hot_block_tier_tests.rs:443` —
-   latent flakes of the exact mem_budget class if their fills ride the >64 KiB
-   deferred path. The poll-first pattern (`hot_block_tier_tests.rs:591`) is the
-   fix template.
+3. **Immediate-assert-after-read sites racing PERF-11's deferred publish** —
+   **CLOSED** (`00850b8b`): the poll-first template (the hot_block_tier
+   budget-0 leg — 10 s deadline, then assert) applied at the three flagged
+   sites in `reused_key_stale_fill_tests.rs` and `hot_block_tier_tests.rs`,
+   turning the tier-presence probes into bounded eventuallys with the
+   assertions unweakened.
 4. **Vector B of the 2026-08-04 shadow-supersession finding (stamped-bit-8
    crash window)**: a mid-epoch DELTA-class publish drains the ino's
    `pending_block_refs` notes (release A / take B for shadow bindings) into a

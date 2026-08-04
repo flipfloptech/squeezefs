@@ -109,12 +109,105 @@ struct Mount {
     mnt: PathBuf,
 }
 
+/// Teardown failsafe: bounds only a genuinely WEDGED daemon. Generous on
+/// purpose — the wait below is event-driven on process exit, so a slow
+/// box never pays this; the adjudicated 2026-08-04 flake was the old
+/// fixed 30 s wall-clock poll panicking at loadavg ≈ 10 while the daemon
+/// was legitimately draining its dismount
+/// (`.benchmarks/2026-08-04-volume-drain-flake.md` §5: "wait on process
+/// state, not a fixed timeout").
+const TEARDOWN_FAILSAFE: Duration = Duration::from_secs(180);
+
+/// Event-driven wait for a spawned daemon to exit: pidfd + `poll(2)` —
+/// the kernel wakes us ON the exit event (never a bare wall-clock sleep
+/// loop standing in for synchronization). Returns `true` when the child
+/// exited (and is reaped); `false` when `failsafe` expired with the
+/// child still alive — the CALLER owns that outcome (kill + loud note),
+/// this helper never panics on the deadline.
+fn wait_daemon_exit(child: &mut Child, failsafe: Duration) -> bool {
+    if child.try_wait().expect("try_wait").is_some() {
+        return true;
+    }
+    // SAFETY: `pidfd_open` on our own UNREAPED child — the pid cannot be
+    // recycled while its process (or zombie) exists, and nothing else in
+    // this process reaps it.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::c_long, 0i64) };
+    if pidfd < 0 {
+        // Kernel predates pidfd_open (< 5.3): degrade to a coarse
+        // process-state poll under the same failsafe — still no hard
+        // panic on the deadline.
+        let deadline = Instant::now() + failsafe;
+        loop {
+            if child.try_wait().expect("try_wait").is_some() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    let deadline = Instant::now() + failsafe;
+    let exited = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break false;
+        }
+        let timeout_ms = remaining.as_millis().clamp(1, i32::MAX as u128) as libc::c_int;
+        let mut pfd = libc::pollfd {
+            fd: pidfd as libc::c_int,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `pfd` is a valid pollfd for the duration of the call.
+        match unsafe { libc::poll(&mut pfd, 1, timeout_ms) } {
+            1 => break true, // process exit: the pidfd became readable
+            // Poll-window over (as_millis truncates below the failsafe)
+            // or EINTR: loop — the `remaining` check above terminates.
+            0 => continue,
+            _ if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) => continue,
+            rc => panic!(
+                "poll(pidfd) failed (rc {rc}): {}",
+                std::io::Error::last_os_error()
+            ),
+        }
+    };
+    // SAFETY: `pidfd` is an fd this function opened and still owns.
+    unsafe { libc::close(pidfd as libc::c_int) };
+    if exited {
+        let _ = child.wait(); // reap
+    }
+    exited
+}
+
+/// Loud, uncaptured teardown diagnostic — the testkit skip-ledger CHANNEL
+/// discipline (`crates/squeezefs-testkit`): a direct [`std::io::stderr`]
+/// handle write is not intercepted by libtest's capture, unlike
+/// `eprintln!`, so the note is visible without `--nocapture`. It is NOT a
+/// skip (the test's contract asserts already ran), so it carries its own
+/// marker instead of polluting the `##SQUEEZEFS-SKIP##` ledger classes.
+fn loud_teardown_note(msg: &str) {
+    use std::io::Write as _;
+    let mut err = std::io::stderr();
+    let _ = writeln!(err, "##SQUEEZEFS-TEARDOWN## {msg}");
+    let _ = err.flush();
+}
+
 impl Mount {
     fn daemon_pid(&self) -> u32 {
         self.child.id()
     }
 
-    /// Clean unmount through the real verb; waits for the daemon to exit.
+    /// Clean unmount through the real verb, then wait for the daemon to
+    /// EXIT — the event teardown actually awaits — via [`wait_daemon_exit`]
+    /// (pidfd, event-driven on process state). The adjudicated 2026-08-04
+    /// flake (`.benchmarks/2026-08-04-volume-drain-flake.md` §5) was this
+    /// wait as a fixed 30 s try_wait poll that hard-panicked under box
+    /// load while the daemon was legitimately draining its dismount. The
+    /// failsafe now bounds only a genuinely wedged daemon, and its expiry
+    /// is a LOUD kill-and-continue, never a panic: the test's contract
+    /// asserts are its own — teardown hygiene must not fail them on
+    /// wall-clock luck.
     fn unmount_clean(&mut self) {
         let out = Command::new(bin())
             .arg("umount")
@@ -127,17 +220,16 @@ impl Mount {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            match self.child.try_wait().expect("try_wait") {
-                Some(_) => break,
-                None if Instant::now() > deadline => {
-                    let _ = self.child.kill();
-                    let _ = self.child.wait();
-                    panic!("mount daemon did not exit within 30s of umount");
-                }
-                None => std::thread::sleep(Duration::from_millis(200)),
-            }
+        if !wait_daemon_exit(&mut self.child, TEARDOWN_FAILSAFE) {
+            let pid = self.child.id();
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            loud_teardown_note(&format!(
+                "mount daemon (pid {pid}, mnt {}) survived a successful umount past the \
+                 {TEARDOWN_FAILSAFE:?} failsafe — SIGKILLed by the harness; any offline \
+                 probe later in this test may be reading a non-quiesced volume",
+                self.mnt.display()
+            ));
         }
     }
 
@@ -724,6 +816,65 @@ fn test_df_answers_against_live_mounted_volume() {
 
     mount.unmount_clean();
     let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The teardown wait is EVENT-driven: it returns on the child's exit,
+/// not on a poll cadence and never on the failsafe. A child that exits
+/// promptly must be observed in a small fraction of the failsafe —
+/// otherwise the harness is back to waiting on wall clock
+/// (the adjudicated 2026-08-04 flake class).
+#[test]
+fn test_teardown_wait_returns_on_exit_event_not_deadline() {
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .expect("spawn short-lived child");
+    let started = Instant::now();
+    assert!(
+        wait_daemon_exit(&mut child, Duration::from_secs(60)),
+        "a child that exits must be observed as exited"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the wait must return on the exit EVENT, not sit out any part of \
+         the 60s failsafe (took {:?})",
+        started.elapsed()
+    );
+    // Reaped: a second try_wait on a reaped child errors or reports
+    // exited — it must never claim the child is still running.
+    assert!(
+        child.try_wait().map(|s| s.is_some()).unwrap_or(true),
+        "the exited child must be reaped by the wait"
+    );
+}
+
+/// Failsafe expiry is BOUNDED and non-panicking: a wedged daemon makes
+/// the wait return `false` (the caller kills + notes loudly) instead of
+/// panicking the test — the follow-up the 2026-08-04 adjudication names.
+#[test]
+fn test_teardown_failsafe_expiry_reports_instead_of_panicking() {
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "sleep 60"])
+        .spawn()
+        .expect("spawn wedged-daemon stand-in");
+    let started = Instant::now();
+    assert!(
+        !wait_daemon_exit(&mut child, Duration::from_millis(300)),
+        "a still-running child past the failsafe must report false, not panic"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(300),
+        "the failsafe must actually be waited out before reporting"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "failsafe expiry must be bounded near the failsafe itself \
+         (took {:?})",
+        started.elapsed()
+    );
+    // The caller's arm: kill + reap leaves no zombie behind.
+    child.kill().expect("kill the stand-in");
+    let _ = child.wait();
 }
 
 /// An unformatted volume fails LOUD (never fake numbers, never exit 0).

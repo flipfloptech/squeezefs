@@ -7518,8 +7518,18 @@ impl DataRouter {
     /// sites that may already hold this block's stripe (seed fetches
     /// under a held block guard; write-side RMW seeds) — the stripe is
     /// not reentrant.
-    /// Lock-order: acquires (3) only, after any caller-held (1) — legal
-    /// under the P1-9 order; nothing below takes (1)/(3)/(4).
+    ///
+    /// **Exhaustion (2026-08-04 field rebind-starvation fix):** for
+    /// `escalate_contended` callers — the pure-read posture — ladder
+    /// exhaustion hands off to the SERIALIZED settle arm
+    /// ([`Self::get_block_for_index_settled`]) instead of EIO: a pure
+    /// read must never fail because writers are busy. Non-escalating
+    /// callers (which may hold this block's stripe) keep the loud
+    /// exhaustion error.
+    /// Lock-order: the ladder acquires (3) only, after any caller-held
+    /// (1) — legal under the P1-9 order; nothing below takes
+    /// (1)/(3)/(4). The settle arm extends to (3) → (3.5), the write
+    /// path's own extended order (see `src/stripe_locks.rs`).
     pub async fn get_block_for_index(
         &self,
         file_path: &str,
@@ -7554,9 +7564,8 @@ impl DataRouter {
         escalate_contended: bool,
         fill_class_override: Option<FillClass>,
     ) -> Result<Option<crate::cache::pool::ReadBlockValue>> {
-        // Each retry re-resolves against the freshest map. Exhaustion
-        // fails loud rather than serving unproven bytes — but only after
-        // the FIND-RW5-A liveness ladder (the generic/464 dominant EIO
+        // Each retry re-resolves against the freshest map. The ladder is
+        // the FIND-RW5-A liveness sequence (the generic/464 dominant EIO
         // face: `fill_valid=false` on an UNCHANGED binding, 8 fast losses
         // → user EIO; diagnostic tape /tmp/rw5a_diag/):
         //
@@ -7573,10 +7582,33 @@ impl DataRouter {
         //     fetch (the `fetch_block_device_true` primitive) carries the
         //     full incarnation discipline, publishes nothing, and runs
         //     serialized — writers of this block that hold the stripe are
-        //     excluded for its whole window.
+        //     excluded for its whole window. NOTE: an escalated attempt
+        //     can still LOSE forever — its fetch key is a binding
+        //     snapshot taken OUTSIDE the guard, so under continuous legal
+        //     displacement the reader chases the writer one generation
+        //     behind (the 2026-08-04 field starvation);
+        //  3. exhaustion (escalating callers only): the SERIALIZED settle
+        //     arm — resolve-then-fetch under (3) + (3.5), the arm legal
+        //     churn cannot beat ([`Self::get_block_for_index_settled`]).
+        //     Non-escalating callers keep the loud EIO: their exhaustion
+        //     means a genuinely broken binding, not starvation (their
+        //     caller-held stripe already excludes stripe-abiding churn).
+        //
+        // The cap is a LATENCY knob for escalating callers (patience
+        // before serializing — kept at the pre-FIND-RW5-A-raise 8: after
+        // two stripe-held losses, more chases of the same shape rarely
+        // win, and the settle arm is one guaranteed fetch) and a
+        // CORRECTNESS envelope for non-escalating ones (24, the
+        // FIND-RW5-A posture, unchanged).
         const MAX_REBINDS: usize = 24;
+        const SETTLE_HANDOFF: usize = 8;
         const BACKOFF_AFTER: usize = 4;
         const CONTENDED_BEFORE_ESCALATE: usize = 2;
+        let ladder_cap = if escalate_contended {
+            SETTLE_HANDOFF
+        } else {
+            MAX_REBINDS
+        };
         // Fill provenance (the transient stream window, 2026-07-29):
         // computed ONCE per call — a file holding a fresh §5.3 streaming
         // classification fills as DemandStream (its ghost hits are
@@ -7612,7 +7644,7 @@ impl DataRouter {
             None => self.current_block_binding(file_path, b).await?,
         };
         let mut losses = 0usize;
-        for attempt in 0..MAX_REBINDS {
+        for attempt in 0..ladder_cap {
             let Some(cur_key) = key else {
                 return Ok(None);
             };
@@ -7696,8 +7728,158 @@ impl DataRouter {
             );
             key = current;
         }
+        if escalate_contended {
+            // Pure-read exhaustion = starvation under LEGAL writer churn,
+            // never an error (the 2026-08-04 field EIO): hand off to the
+            // arm that cannot lose. The caller declared it holds no
+            // stripe (`escalate_contended`), so the settle arm's (3)
+            // acquisition cannot self-deadlock.
+            return self.get_block_for_index_settled(file_path, b).await;
+        }
         Err(SqueezefsError::Io(std::io::Error::other(format!(
-            "block {b} of {file_path} did not settle after {MAX_REBINDS} binding rebinds"
+            "block {b} of {file_path} did not settle after {ladder_cap} binding rebinds"
+        ))))
+    }
+
+    /// The rebind-starvation SETTLE arm (2026-08-04 field fix): after the
+    /// latch-free ladder exhausts, ONE resolve-then-fetch serialized under
+    /// **both** custody domains a legal binding/incarnation mutator can
+    /// ride:
+    ///
+    /// - **(3) `BLOCK_FLUSH_LOCKS(ino, b)`** — excludes every
+    ///   stripe-holding custodian of THIS block (write-through checkout,
+    ///   writeback flush, fold, W1 patch, pipeline upload, mover) for the
+    ///   whole window;
+    /// - **(3.5) `INODE_META_LOCKS(ino)`** — the §5.3 one-merge domain:
+    ///   every striped-map publish funnels through
+    ///   `merge_block_mappings*` under this lock, INCLUDING the mutators
+    ///   that never take the per-block stripe (`write_striped`
+    ///   promotions, `copy_file_range`, `truncate_layout`'s prune, the
+    ///   Lever-B publish-conveyor pass).
+    ///
+    /// Acquisition order (3) → (3.5) is the write path's own extended
+    /// order (`src/stripe_locks.rs`: `write_file_staged`'s per-block
+    /// future takes `INODE_META_LOCKS` under the held block guard;
+    /// nothing acquires (3)/(1) while holding (3.5), so the order is
+    /// acyclic), and this arm frees nothing (RES-1 untouched). Because it
+    /// holds the same locks every publisher needs, it SERIALIZES with —
+    /// never spins against — the writer: the storm parks for one
+    /// device-fetch RTT and the reader provably wins. Cold by
+    /// construction (engages only after `SETTLE_HANDOFF` ladder losses —
+    /// zero cost on the hot path), counted in
+    /// `stale_binding_escalations`.
+    ///
+    /// Serve proof: the binding is resolved UNDER both locks (the merge
+    /// primitive's own base-read pattern — `fetch_metadata` would retake
+    /// (3.5) on refill, see `grow_layout_size`), and the device-direct
+    /// fetch carries the full incarnation discipline. For the serve to be
+    /// wrong the binding must move after that resolve: any legal move is
+    /// a merge (excluded by (3.5)) and any free/reuse of the resolved key
+    /// bumps its incarnation word (caught by the fetch's own seqlock
+    /// verdict) — so a valid fetch here IS the block's current content,
+    /// linearized inside the window. An invalid one is a mutator outside
+    /// both disciplines: loud tripwire (`invariant_tripwires`, RES-22),
+    /// bounded retries, then the honest genuinely-broken error — which is
+    /// also what a fetch/decode FAILURE means here (the binding is
+    /// current by construction, so the error propagates: the one EIO a
+    /// pure read may still return).
+    async fn get_block_for_index_settled(
+        &self,
+        file_path: &str,
+        b: u32,
+    ) -> Result<Option<crate::cache::pool::ReadBlockValue>> {
+        // Retries exist ONLY for the invariant-violation case (no legal
+        // mutator can force a loss under both locks) — small and loud.
+        const SETTLE_ATTEMPTS: usize = 4;
+        let ino = parse_inode_from_path(file_path);
+        METRICS
+            .stale_binding_escalations
+            .fetch_add(1, Ordering::Relaxed);
+        for attempt in 0..SETTLE_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(1u64 << (attempt - 1).min(3))).await;
+            }
+            let _block_guard = crate::fuse_client::block_lock_acquire(
+                ino,
+                b,
+                crate::fuse_client::BlockLockSite::ReadSettle,
+            )
+            .await;
+            let _map_guard = meta_lock_acquire(ino).await;
+            // Fresh resolve under both locks. NOTE: `fetch_metadata`
+            // would retake (3.5) on refill — use its refill's own
+            // sources directly (the `grow_layout_size` pattern): any
+            // cached entry is ≥ every completed merge (republished under
+            // the lock we hold); a miss reads the backend serialized ≥
+            // merges, exactly like the refill.
+            let meta = match self.metadata_cache.get(&ino) {
+                Some(m) => Some(m),
+                None => self.fetch_metadata_from_backend(ino).await?,
+            };
+            let Some(meta) = meta else {
+                // No layout at all — the block is a hole in the current
+                // (empty) map: zeros, linearized inside this window.
+                return Ok(None);
+            };
+            if meta.block_map.is_none()
+                && meta.block_map_id.is_none()
+                && meta.block_prefix.is_none()
+            {
+                // No striped layout (concurrent truncate/delete/layout
+                // flip landed before our window): every striped binding
+                // is gone — zeros.
+                return Ok(None);
+            }
+            let cur_key = match block_key_in(&meta, b) {
+                BlockKeyResolve::Key(k) => k.into_owned(),
+                BlockKeyResolve::Hole => return Ok(None),
+                BlockKeyResolve::NeedsAuthority => {
+                    match self
+                        .load_striped_block_keys(file_path, &meta, b, b)
+                        .await?
+                        .pop()
+                        .and_then(|(_, k)| k)
+                    {
+                        Some(k) => k,
+                        None => return Ok(None),
+                    }
+                }
+            };
+            // Test seam (same contract as the ladder's): with both locks
+            // held this window changes NOTHING — that immunity is exactly
+            // what the starvation repro proves.
+            let recheck_delay = TEST_BINDING_RECHECK_DELAY_MS.load(Ordering::Relaxed);
+            if recheck_delay > 0 {
+                tokio::time::sleep(Duration::from_millis(recheck_delay)).await;
+            }
+            match self.fetch_block_device_true(&cur_key).await {
+                Ok((val, true)) => return Ok(Some(val)),
+                Ok((_, false)) => {
+                    // The key's incarnation word moved while both custody
+                    // domains were held — a mutator outside the
+                    // stripe/merge disciplines (RES-22: loud, never
+                    // fatal; the retry re-resolves from scratch).
+                    crate::note_invariant_tripwire(
+                        "read_settle_lost_serialized",
+                        &format!(
+                            "block {b} of {file_path}: incarnation moved under \
+                             BLOCK_FLUSH_LOCKS + INODE_META_LOCKS (attempt {attempt})"
+                        ),
+                    );
+                }
+                Err(e) => {
+                    // The binding is CURRENT by construction (resolved and
+                    // held under both locks): a fetch/decode failure here
+                    // is a real device/corruption error on real current
+                    // state — the honest EIO that remains.
+                    return Err(e);
+                }
+            }
+        }
+        Err(SqueezefsError::Io(std::io::Error::other(format!(
+            "block {b} of {file_path} did not settle after {SETTLE_ATTEMPTS} serialized \
+             settle attempts (binding/incarnation mutator outside the stripe/merge \
+             disciplines — see invariant_tripwires)"
         ))))
     }
 

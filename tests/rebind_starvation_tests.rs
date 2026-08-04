@@ -293,12 +293,11 @@ async fn displace_once(h: &H, ino: u64, g: u64) {
             .await
             .unwrap();
     for bk in &displaced {
-        let _ = h
-            .fs
-            .router
-            .backend_router
-            .free_block(&clean_block_key(bk))
-            .await;
+        let _ =
+            h.fs.router
+                .backend_router
+                .free_block(&clean_block_key(bk))
+                .await;
     }
 }
 
@@ -515,10 +514,11 @@ async fn fetch_error_on_current_binding_stays_loud_eio() {
         .unwrap();
     purge_read_tiers(&h, ino).await;
 
-    let err = match
-        h.fs.router
-            .get_block_for_index(&file_path, BLK, None, false, true)
-            .await
+    let err = match h
+        .fs
+        .router
+        .get_block_for_index(&file_path, BLK, None, false, true)
+        .await
     {
         Err(e) => e,
         Ok(_) => panic!("a damaged CURRENT binding must fail loud, never serve"),

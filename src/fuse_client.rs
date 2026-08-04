@@ -1883,9 +1883,15 @@ pub enum BlockLockSite {
     /// (`pipeline_upload_parked_block`, 2026-07-27 campaign) — custody
     /// re-validation + write-through under the block's stripe.
     PipelineUpload = 10,
+    /// The rebind-starvation SETTLE arm
+    /// (`DataRouter::get_block_for_index_settled`, 2026-08-04 field fix):
+    /// after the read ladder exhausts, ONE device-direct fetch serialized
+    /// under this block's stripe (3) AND its ino's `INODE_META_LOCKS`
+    /// (3.5) — the arm legal writer churn cannot beat.
+    ReadSettle = 11,
 }
 
-const BLOCK_LOCK_SITES: usize = 11;
+const BLOCK_LOCK_SITES: usize = 12;
 const BLOCK_LOCK_SITE_NAMES: [&str; BLOCK_LOCK_SITES] = [
     "write_checkout",
     "spill_victim",
@@ -1898,6 +1904,7 @@ const BLOCK_LOCK_SITE_NAMES: [&str; BLOCK_LOCK_SITES] = [
     "fold",
     "read_escalate",
     "pipeline_upload",
+    "read_settle",
 ];
 
 struct WriteProfState {

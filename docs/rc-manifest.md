@@ -532,18 +532,32 @@ luck rather than design — recorded so they are chosen work, not surprises:
    turning the tier-presence probes into bounded eventuallys with the
    assertions unweakened.
 4. **Vector B of the 2026-08-04 shadow-supersession finding (stamped-bit-8
-   crash window)**: a mid-epoch DELTA-class publish drains the ino's
-   `pending_block_refs` notes (release A / take B for shadow bindings) into a
-   commit whose `publish_entries` do not persist those bindings — durable
-   ledger and durable map disagree until the epoch's own full-save close. A
-   crash inside that window on a **bit-8-stamped** volume leaves the ledger
-   claiming releases the map still binds. Unreachable shipped (ruling D9:
-   bit 8 built-never-stamped; derived accounting re-walks the maps at mount
-   and cannot drift this way) — must be closed before any Phase-8 stamping
-   window: either drain notes only into saves that persist the bindings the
-   notes describe, or have delta-class saves persist composed shadow entries.
-   Vector A (the in-session resurrection poison, all volumes) is FIXED —
-   `tests/rewrite_shadow_supersede_tests.rs`, KD-1.11.
+   crash window) — CLOSED (2026-08-04, red-first)**: a mid-epoch DELTA-class
+   publish drained the ino's `pending_block_refs` notes (release A / take B
+   for shadow bindings) into a commit whose `publish_entries` did not persist
+   those bindings — durable ledger and durable map disagreed until the
+   epoch's own full-save close. A crash inside that window on a
+   **bit-8-stamped** volume left the ledger claiming releases the map still
+   binds. Never reachable shipped (ruling D9: bit 8 built-never-stamped;
+   derived accounting re-walks the maps at mount and cannot drift this way),
+   closed ahead of any Phase-8 stamping window. **The fix is the drain law**:
+   pending notes drain only into saves that persist the WHOLE map — their
+   presence forces a publish-class save off the O(batch) delta path
+   (`save_metadata_to_backend_ext`'s eligibility ladder gained the
+   `has_deferred_refs` clause), because delta-vs-full is otherwise the
+   backend's verdict made after the refs are staged, and leaving the notes
+   pending instead would drift the OTHER way whenever the backend's fallback
+   full-Put persisted the bindings without their ledger records. The forced
+   full save is the notes' immediate carrier (no starvation window); the
+   next publish re-enters the delta economy re-based. Pinned red-first in
+   `tests/durable_block_refs_tests.rs`:
+   `mid_epoch_delta_publish_cannot_strand_pending_shadow_notes_across_a_crash`
+   (the crash window itself, with a delta-capability control ino) and
+   `pending_shadow_notes_land_durably_by_the_epoch_close` (the
+   anti-starvation edge: the live oracle clean at EVERY commit boundary, the
+   close's take/release durable and exact, a records-only remount agreeing).
+   Vector A (the in-session resurrection poison, all volumes) was already
+   FIXED — `tests/rewrite_shadow_supersede_tests.rs`, KD-1.11.
 
 ---
 

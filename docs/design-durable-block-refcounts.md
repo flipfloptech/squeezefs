@@ -490,6 +490,25 @@ take-then-release sequence on one index keeps its order; a failed commit
 re-notes them, the dirty-layout refill discipline. **Any future deferring site
 is correct by construction rather than by remembering.**
 
+**The drain law (Vector B, closed 2026-08-04 — rc-manifest §3d item 4): notes
+drain only into saves that persist the WHOLE map.** A publish-class save with
+pending notes is forced off the O(batch) layout-delta path
+(`save_metadata_to_backend_ext`'s `has_deferred_refs` eligibility clause): a
+delta-class commit persists only its own `publish_entries`, so carrying the
+notes would durably claim releases/takes for shadow bindings its folded map
+does not reflect — a crash inside that window on a stamped volume is exactly
+the C8 drift the ledger exists to prevent. The caller must make this call,
+not the backend: delta-vs-full is otherwise the backend's verdict
+(`merge_layout_and_size` → `use_delta`), reached after the refs are already
+staged into the tx — and the symmetric alternative (leave the notes pending
+across delta saves) is unsound because the backend's always-correct fallback
+full-Put would then persist the bindings *without* their ledger records,
+drifting in the take-missed direction. The forced full save is the notes'
+immediate carrier (no starvation window; the epoch close's own full save
+remains the terminal backstop), and the next publish re-enters the delta
+economy with the chain re-based. Pinned red-first by the Vector B section of
+`tests/durable_block_refs_tests.rs`.
+
 ### Completion criterion, met
 
 `fsck` class **C8 is ungated** — `meta_kv_block_refs_drift` is a live

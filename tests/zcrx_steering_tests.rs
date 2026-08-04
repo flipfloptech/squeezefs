@@ -531,18 +531,17 @@ fn test_split_arm_phase_b_failure_keeps_rss_excluded_until_restore() {
     let pristine = nic.snapshot();
     let mut guard = arm_rss_exclusion(&mut nic, &[31]).expect("phase A");
     nic.fail_at = FailAt::Insert(1);
-    let err = arm_flow_rules(
-        &mut nic,
-        &mut guard,
-        &[flow(50001, 31), flow(50002, 31)],
-    )
-    .expect_err("second insert refused");
+    let err = arm_flow_rules(&mut nic, &mut guard, &[flow(50001, 31), flow(50002, 31)])
+        .expect_err("second insert refused");
     assert!(!err.is_empty());
     assert!(
         !guard.restored(),
         "phase-B refusal must NOT restore RSS (ifqs may still be bound)"
     );
-    assert!(nic.rules.is_empty(), "phase B's partial inserts rolled back");
+    assert!(
+        nic.rules.is_empty(),
+        "phase B's partial inserts rolled back"
+    );
     assert!(
         nic.rss.iter().all(|v| *v != 31),
         "queue 31 stays RSS-excluded until the caller's teardown"

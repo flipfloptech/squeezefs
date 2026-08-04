@@ -196,43 +196,235 @@ pub fn steering_capacity_gate(nic: &mut dyn NicControl) -> Result<RuleSlots, Str
         .map_err(|e| format!("ntuple table probe on {ifname}: {e}"))?;
     let (lo, hi) = reserved_loc_range(table);
     if hi - lo == 0 {
-        // RED PHASE (fix/zcrx-arm-field finding 1): the contract says
-        // Ok(RuleSlots::KernelAssigned) — the refusal below is the
-        // disproven law, kept failing-red until the fix commit.
-        return Err(format!(
-            "zcrx steering: {ifname} advertises a {table}-slot ntuple rule table — \
-             0 reserved lane rule slots (red-phase refusal)"
-        ));
+        // The mlx5 class: feature ON, advertisement 0. Empirically the
+        // insert path works (field-verified: explicit `loc 8` insert OK,
+        // auto-loc returned rule ID 1023 into the "0-sized" table), so
+        // refusing here was the 2026-08 field bug — the KERNEL's insert
+        // verdict rules; a real EOPNOTSUPP/ENOSPC-class refusal surfaces
+        // loud at `arm_flow_rules` and unwinds the arm.
+        log::info!(
+            "zcrx steering: {ifname} advertises a 0-slot ntuple rule table with the \
+             feature ON (the mlx5-class advertisement lie) — arming via \
+             driver-assigned rule locations; the kernel's insert verdict rules"
+        );
+        return Ok(RuleSlots::KernelAssigned);
     }
     Ok(RuleSlots::Reserved { lo, hi })
 }
 
-/// Phase A of the split arm (finding 3): all probes (HDS, channels, the
-/// capacity gate) + RSS exclusion of the LEASED queues — run BEFORE any
-/// ifq registration, because a queue with a bound zcrx ifq produces
-/// unreadable (net_iov) skbs and every host flow RSS-hashed onto it
-/// gets `recv = EFAULT`. Returns the restore guard (no rules yet).
+/// Phase A of the split arm (field finding 3): all probes (HDS,
+/// channels, the capacity gate) + RSS exclusion of the LEASED queues —
+/// run BEFORE any ifq registration, because a queue with a bound zcrx
+/// ifq produces unreadable (net_iov) skbs and every host flow
+/// RSS-hashed onto it gets `recv = EFAULT` (the field's `ICResp read:
+/// Bad address` face). Returns the restore guard (no rules installed
+/// yet — those are phase B's, post-connect).
 pub fn arm_rss_exclusion(
     nic: &mut dyn NicControl,
     lane_queues: &[u32],
 ) -> Result<SteeringGuard, String> {
-    // RED PHASE: contract pinned by tests/zcrx_steering_tests.rs.
-    let _ = (nic, lane_queues);
-    Err("zcrx steering: arm_rss_exclusion unimplemented".into())
+    if lane_queues.is_empty() {
+        return Err(
+            "zcrx steering: no lane queues to exclude (refusing a silent no-op arm)".into(),
+        );
+    }
+    // Probes first — every gate refuses BEFORE any mutation.
+    let hds = nic
+        .tcp_data_split_on()
+        .map_err(|e| format!("HDS probe on {}: {e}", nic.ifname()))?;
+    if !hds {
+        return Err(format!(
+            "NIC {} has tcp-data-split OFF — zcrx requires HDS; arm refused \
+             (NIC untouched)",
+            nic.ifname()
+        ));
+    }
+    let channels = nic
+        .combined_channels()
+        .map_err(|e| format!("channel probe on {}: {e}", nic.ifname()))?;
+    let slots = steering_capacity_gate(nic)?;
+    let mut lanes = lane_queues.to_vec();
+    lanes.sort_unstable();
+    lanes.dedup();
+
+    // The mutation phase runs under the live-arm registry lock:
+    // concurrent arms on one NIC serialize, and live-session accounting
+    // can never skew mid-arm.
+    let mut reg = live_arms();
+    let ifname = nic.ifname().to_string();
+
+    // Reserved class: room for one rule per queue must exist UP FRONT
+    // (flows ≡ queues 1:1 — phase B would otherwise fail after the ifqs
+    // are bound). The kernel-assigned class has no static bound: the
+    // kernel's insert verdict rules at phase B.
+    if let RuleSlots::Reserved { lo, hi } = slots {
+        let live = reg.get(&ifname).map(|l| l.locs.len() as u32).unwrap_or(0);
+        let free = (hi - lo).saturating_sub(live);
+        if lanes.len() as u32 > free {
+            return Err(format!(
+                "zcrx steering: {} lane queues exceed the {} free of {} reserved \
+                 rule slots on {} ({} held by live lane sessions)",
+                lanes.len(),
+                free,
+                hi - lo,
+                nic.ifname(),
+                live
+            ));
+        }
+    }
+
+    // Record → restrict RSS: pristine is the FIRST armer's read; every
+    // arm writes pristine restricted to the UNION of live lane queues
+    // (peers' + this arm's).
+    let current = match nic.rxfh_indir() {
+        Ok(p) => p,
+        Err(e) => return Err(format!("RSS read on {}: {e}", nic.ifname())),
+    };
+    let (pristine, union) = match reg.get(&ifname) {
+        Some(l) => {
+            let mut u = l.queues.clone();
+            u.extend_from_slice(&lanes);
+            (l.pristine_rss.clone(), u)
+        }
+        None => (current.clone(), lanes.clone()),
+    };
+    let restricted = restricted_rss(&pristine, &union, channels);
+    if let Err(e) = nic.set_rxfh_indir(&restricted) {
+        return Err(format!("RSS restrict on {}: {e}", nic.ifname()));
+    }
+    let entry = reg.entry(ifname.clone()).or_insert_with(|| NicLive {
+        pristine_rss: current,
+        locs: BTreeSet::new(),
+        queues: Vec::new(),
+        sessions: 0,
+    });
+    entry.sessions += 1;
+    entry.queues.extend_from_slice(&lanes);
+    Ok(SteeringGuard {
+        ifname,
+        channels,
+        lane_queues: lanes,
+        rule_locs: Vec::new(),
+        slots,
+        rss_touched: true,
+        registered: true,
+        restored: false,
+    })
 }
 
 /// Phase B of the split arm: install the lane flow rules (post-connect —
 /// the 4-tuples need the ephemeral ports) into the guard phase A
-/// returned. A refusal rolls back EVERYTHING (rules + registration +
-/// RSS) and the error names the failing step.
+/// returned. Reserved class: crash-residue reap (skipping live locs) +
+/// explicit locs at the first free reserved slots. Kernel-assigned
+/// class: `RX_CLS_LOC_ANY` inserts, the RETURNED ids recorded for
+/// teardown, NO reap (no range identity exists). A refusal rolls back
+/// ONLY this call's inserts and leaves the guard armed — at that point
+/// the caller's ifqs may still be bound, and re-including the queues in
+/// RSS is exactly the EFAULT window; the caller tears the ifqs down and
+/// THEN restores.
 pub fn arm_flow_rules(
     nic: &mut dyn NicControl,
     guard: &mut SteeringGuard,
     flows: &[FlowRule],
 ) -> Result<(), String> {
-    // RED PHASE: contract pinned by tests/zcrx_steering_tests.rs.
-    let _ = (nic, guard, flows);
-    Err("zcrx steering: arm_flow_rules unimplemented".into())
+    if flows.is_empty() {
+        return Err("zcrx steering: no lane flows to steer (refusing a silent no-op arm)".into());
+    }
+    if guard.restored {
+        return Err(format!(
+            "zcrx steering: flow rules requested on a restored guard for {}",
+            guard.ifname
+        ));
+    }
+    let mut reg = live_arms();
+
+    // The per-flow REQUEST locs (explicit reserved slots, or the
+    // driver-assigned sentinel for the mlx5 class).
+    let requests: Vec<u32> = match guard.slots {
+        RuleSlots::Reserved { lo, hi } => {
+            let live_locs: BTreeSet<u32> = reg
+                .get(&guard.ifname)
+                .map(|l| l.locs.clone())
+                .unwrap_or_default();
+            let free = (hi - lo).saturating_sub(live_locs.len() as u32);
+            if flows.len() as u32 > free {
+                return Err(format!(
+                    "zcrx steering: {} flows exceed the {} free of {} reserved rule \
+                     slots on {} ({} held by live lane sessions)",
+                    flows.len(),
+                    free,
+                    hi - lo,
+                    nic.ifname(),
+                    live_locs.len()
+                ));
+            }
+            // Crash-residue reap (design §5): stale rules in the reserved
+            // range are lane-owned (dead 4-tuples — inert but must not
+            // leak) UNLESS a live session holds the loc; rules outside
+            // the range are operator-owned and never touched.
+            let existing = nic
+                .ntuple_locs()
+                .map_err(|e| format!("rule enumeration on {}: {e}", nic.ifname()))?;
+            for loc in existing
+                .iter()
+                .filter(|l| (lo..hi).contains(l) && !live_locs.contains(l))
+            {
+                nic.delete_ntuple(*loc)
+                    .map_err(|e| format!("stale lane rule reap @{loc} on {}: {e}", nic.ifname()))?;
+            }
+            let mut cursor = lo;
+            let mut picks = Vec::with_capacity(flows.len());
+            for _ in flows {
+                let loc = (cursor..hi)
+                    .find(|l| !live_locs.contains(l))
+                    .ok_or_else(|| {
+                        format!(
+                            "no free reserved loc on {} (slot accounting bug)",
+                            guard.ifname
+                        )
+                    })?;
+                cursor = loc + 1;
+                picks.push(loc);
+            }
+            picks
+        }
+        RuleSlots::KernelAssigned => vec![RX_CLS_LOC_ANY; flows.len()],
+    };
+
+    let mut installed: Vec<u32> = Vec::new();
+    for (flow, req) in flows.iter().zip(&requests) {
+        match nic.insert_ntuple(*req, flow) {
+            Ok(effective) => installed.push(effective),
+            Err(e) => {
+                let at = if *req == RX_CLS_LOC_ANY {
+                    "driver-assigned loc".to_string()
+                } else {
+                    format!("@{req}")
+                };
+                let step = format!("ntuple insert {at} on {}: {e}", nic.ifname());
+                let mut errs = Vec::new();
+                for loc in installed.drain(..) {
+                    if let Err(de) = nic.delete_ntuple(loc) {
+                        errs.push(format!("rollback delete @{loc}: {de}"));
+                    }
+                }
+                if errs.is_empty() {
+                    return Err(format!(
+                        "{step} (this arm's flow rules rolled back — RSS exclusion \
+                         held until the caller's ifq teardown)"
+                    ));
+                }
+                return Err(format!("{step}; ROLLBACK ALSO FAILED: {}", errs.join("; ")));
+            }
+        }
+    }
+    for effective in installed {
+        guard.rule_locs.push(effective);
+        if let Some(l) = reg.get_mut(&guard.ifname) {
+            l.locs.insert(effective);
+        }
+    }
+    Ok(())
 }
 
 /// Loud-ONCE-per-NIC refusal throttle for the arm ladder (ten fabric
@@ -286,6 +478,9 @@ pub struct SteeringGuard {
     channels: u32,
     lane_queues: Vec<u32>,
     rule_locs: Vec<u32>,
+    /// The gate's slot-class verdict (phase B keys its loc strategy —
+    /// explicit reserved slots vs driver-assigned — on it).
+    slots: RuleSlots,
     /// RSS was written by this arm; restore recomputes the table from
     /// the registry's pristine record + the surviving peers' queues.
     rss_touched: bool,
@@ -416,153 +611,25 @@ impl Drop for SteeringGuard {
     }
 }
 
-/// The arm state machine (design §5): HDS gate → channels → reap stale
-/// reserved-range rules → record + restrict RSS → install per-flow rules.
-/// Any refusal rolls back every applied step and returns the failing step
-/// loud; success returns the restore ledger.
+/// The ONE-SHOT arm: the composition of the split halves (phase A RSS
+/// exclusion + phase B flow rules) with TOTAL rollback on a phase-B
+/// refusal — the contract surface the steering suite pins the composed
+/// laws against, and the arm for callers whose flows are already
+/// connected. The PRODUCT bring-up uses the split halves directly
+/// (`arm_rss_exclusion` BEFORE ifq registration, `arm_flow_rules` after
+/// connect — the field-finding-3 EFAULT ordering law), with the ifq
+/// teardown between a failure and the guard restore.
 pub fn arm_steering(nic: &mut dyn NicControl, flows: &[FlowRule]) -> Result<SteeringGuard, String> {
     if flows.is_empty() {
         return Err("zcrx steering: no lane flows to steer (refusing a silent no-op arm)".into());
     }
-    // Probes first — every gate refuses BEFORE any mutation.
-    let hds = nic
-        .tcp_data_split_on()
-        .map_err(|e| format!("HDS probe on {}: {e}", nic.ifname()))?;
-    if !hds {
-        return Err(format!(
-            "NIC {} has tcp-data-split OFF — zcrx requires HDS; arm refused \
-             (NIC untouched)",
-            nic.ifname()
-        ));
-    }
-    let channels = nic
-        .combined_channels()
-        .map_err(|e| format!("channel probe on {}: {e}", nic.ifname()))?;
-    // ntuple feature + rule-slot capacity BEFORE any flow rule (field
-    // row 3 — the gate names the operator remedy; still probe-only).
-    let (lo, hi) = match steering_capacity_gate(nic)? {
-        RuleSlots::Reserved { lo, hi } => (lo, hi),
-        RuleSlots::KernelAssigned => {
-            // RED PHASE (finding 1): the kernel-assigned arm lands with
-            // the fix commit; unreachable today (the gate never returns
-            // this variant yet).
-            return Err(format!(
-                "zcrx steering: kernel-assigned loc arm not implemented on {}",
-                nic.ifname()
-            ));
+    let lane_queues: Vec<u32> = flows.iter().map(|f| f.queue).collect();
+    let mut guard = arm_rss_exclusion(nic, &lane_queues)?;
+    if let Err(e) = arm_flow_rules(nic, &mut guard, flows) {
+        if let Err(rb) = guard.restore(nic) {
+            return Err(format!("{e}; ROLLBACK ALSO FAILED: {rb}"));
         }
-    };
-    let lane_queues: Vec<u32> = {
-        let mut qs: Vec<u32> = flows.iter().map(|f| f.queue).collect();
-        qs.sort_unstable();
-        qs.dedup();
-        qs
-    };
-
-    // The whole mutation phase runs under the live-arm registry lock:
-    // concurrent arms on one NIC serialize, and live-session accounting
-    // can never skew mid-arm.
-    let mut reg = live_arms();
-    let ifname = nic.ifname().to_string();
-    let live_locs: BTreeSet<u32> = reg.get(&ifname).map(|l| l.locs.clone()).unwrap_or_default();
-    let free_slots = (hi - lo).saturating_sub(live_locs.len() as u32);
-    if flows.len() as u32 > free_slots {
-        return Err(format!(
-            "zcrx steering: {} flows exceed the {} free of {} reserved rule slots \
-             on {} ({} held by live lane sessions)",
-            flows.len(),
-            free_slots,
-            hi - lo,
-            nic.ifname(),
-            live_locs.len()
-        ));
-    }
-
-    // Crash-residue reap (design §5): stale rules in the reserved range
-    // are lane-owned (dead 4-tuples — inert but must not leak) UNLESS a
-    // live session holds the loc (the multi-session law: a reserved-range
-    // rule is residue only if nobody live owns it); rules outside the
-    // range are operator-owned and never touched.
-    let existing = nic
-        .ntuple_locs()
-        .map_err(|e| format!("rule enumeration on {}: {e}", nic.ifname()))?;
-    for loc in existing
-        .iter()
-        .filter(|l| (lo..hi).contains(l) && !live_locs.contains(l))
-    {
-        nic.delete_ntuple(*loc)
-            .map_err(|e| format!("stale lane rule reap @{loc} on {}: {e}", nic.ifname()))?;
-    }
-
-    // Record → restrict RSS: pristine is the FIRST armer's read; every
-    // arm writes pristine restricted to the UNION of live lane queues
-    // (peers' + this arm's).
-    let current = match nic.rxfh_indir() {
-        Ok(p) => p,
-        Err(e) => return Err(format!("RSS read on {}: {e}", nic.ifname())),
-    };
-    let (pristine, union) = match reg.get(&ifname) {
-        Some(l) => {
-            let mut u = l.queues.clone();
-            u.extend_from_slice(&lane_queues);
-            (l.pristine_rss.clone(), u)
-        }
-        None => (current.clone(), lane_queues.clone()),
-    };
-    let restricted = restricted_rss(&pristine, &union, channels);
-    if let Err(e) = nic.set_rxfh_indir(&restricted) {
-        return Err(format!("RSS restrict on {}: {e}", nic.ifname()));
-    }
-    let entry = reg.entry(ifname.clone()).or_insert_with(|| NicLive {
-        pristine_rss: current,
-        locs: BTreeSet::new(),
-        queues: Vec::new(),
-        sessions: 0,
-    });
-    entry.sessions += 1;
-    entry.queues.extend_from_slice(&lane_queues);
-    let mut guard = SteeringGuard {
-        ifname: ifname.clone(),
-        channels,
-        lane_queues,
-        rule_locs: Vec::new(),
-        rss_touched: true,
-        registered: true,
-        restored: false,
-    };
-
-    // Install per-flow rules at the first FREE reserved locs (skipping
-    // live peers'); any refusal rolls back EVERYTHING this arm applied
-    // (rules, registration, RSS — peers stay excluded).
-    let mut cursor = lo;
-    for flow in flows {
-        let loc = match (cursor..hi).find(|l| !live_locs.contains(l)) {
-            Some(l) => l,
-            None => {
-                // Structurally unreachable (free_slots admitted the
-                // flows) — refuse loud rather than trust the accounting.
-                let step = format!("no free reserved loc on {} (slot accounting bug)", ifname);
-                if let Err(rb) = guard.restore_locked(nic, &mut reg) {
-                    return Err(format!("{step}; ROLLBACK ALSO FAILED: {rb}"));
-                }
-                return Err(format!("{step} (rolled back — NIC untouched)"));
-            }
-        };
-        cursor = loc + 1;
-        let effective = match nic.insert_ntuple(loc, flow) {
-            Ok(eff) => eff,
-            Err(e) => {
-                let step = format!("ntuple insert @{loc} on {}: {e}", nic.ifname());
-                if let Err(rb) = guard.restore_locked(nic, &mut reg) {
-                    return Err(format!("{step}; ROLLBACK ALSO FAILED: {rb}"));
-                }
-                return Err(format!("{step} (rolled back — NIC untouched)"));
-            }
-        };
-        guard.rule_locs.push(effective);
-        if let Some(l) = reg.get_mut(&ifname) {
-            l.locs.insert(effective);
-        }
+        return Err(format!("{e} (rolled back — NIC untouched)"));
     }
     Ok(guard)
 }

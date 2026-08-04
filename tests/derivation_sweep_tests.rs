@@ -281,18 +281,64 @@ fn parked_cap_derives_from_budget_over_block_size() {
 }
 
 // ---------------------------------------------------------------------------
-// A9 — IPC per-session arena default: fraction of the admission cap
+// A9 — IPC per-session arena default: population-derived cap fraction
 // ---------------------------------------------------------------------------
 
+/// The derived IPC session POPULATION the admission cap is sized to
+/// hold: `max(128, cpus × 8)` (`mem_budget::ipc_session_population_target`
+/// — the 2026-08-04 squeeze-test population fix; user directive
+/// verbatim: "we need to see how we make that some derived value from
+/// the system size (cpu/memory/threads) something so it's not a hard
+/// coded value").
+///
+/// - `cpus × 8` is the matched-inflight client-fleet slope — one shim
+///   session per client process, and the EXA fairness law runs psync
+///   fleets at `njobs × qd` with qd = 8 (the canon dims), so a box's
+///   honest concurrent client population scales with its cores. ×8 is
+///   the measured shape that refused, TWICE (two battery runs on the
+///   176 GiB cluster): 32 cpus → 256 fio processes against the
+///   ~128-session budget the /128 arena implied —
+///   `ipc_admission_refusals` ~125/pass, ~half the fleet silently on
+///   the kernel lane, engagement 0.697 ⇒ INVALID row — with the per-uid
+///   cap ALREADY derived (it correctly read ~131; the ARENA SIZE was
+///   the binding constraint).
+/// - floor 128 = the population the retired /128 fraction implied
+///   (never-regress-below-shipped, the `Q_DEPTH_FLOOR` house law): on
+///   any box where `cpus × 8 < 128` the arena arithmetic stays
+///   byte-identical to the shipped cap/128.
+#[test]
+fn ipc_session_population_target_derives_from_cores() {
+    use mem_budget::ipc_session_population_target;
+    // Field shape: the 32-CPU cluster client ⇒ 256 — the refused
+    // battery's exact process count (njobs 32 × qd 8).
+    assert_eq!(ipc_session_population_target(32), 256);
+    // Floor region: ≤ 16 cpus keep the /128 population exactly (the
+    // never-regress pin — small boxes keep today's arithmetic).
+    assert_eq!(ipc_session_population_target(1), 128);
+    assert_eq!(ipc_session_population_target(8), 128);
+    assert_eq!(ipc_session_population_target(16), 128);
+    // Above the floor the slope is linear in cores.
+    assert_eq!(ipc_session_population_target(64), 512);
+    assert_eq!(ipc_session_population_target(192), 1536);
+}
+
 /// The flat 64 MiB `SQUEEZEFS_IPC_ARENA_MB` default becomes
-/// `max(64 MiB, dma_align_down(cap/128))`: cap/128 sizes a default arena
-/// so the admission cap holds a 128-session population — the SAME two
-/// numbers the A12 per-uid session cap derives from, so a full per-uid
-/// population of default-size arenas fills the cap exactly; alignment is
-/// the SLOT-SLAB DMA
+/// `max(64 MiB, dma_align_down(cap / population_target(cpus)))`: the
+/// fraction sizes a default arena so the admission cap holds the
+/// POPULATION TARGET above — the retired /128 literal was a legacy
+/// "per-uid cap 64 × 2 safety" population ASSUMPTION, not a derivation
+/// (see `ipc_session_population_target_derives_from_cores` for the
+/// field conviction it starved) — and these are the SAME two numbers
+/// the A12 per-uid session cap derives from, so a full per-uid
+/// population of default-size arenas fills the cap exactly; alignment
+/// is the SLOT-SLAB DMA
 /// law (slots × 4 KiB = 4 MiB — also a PMD multiple, so the THP collapse
 /// law `map_shared_pmd_aligned` still holds); floor 64 MiB = the shipped
-/// posture. Env stays absolute-verbatim (MiB).
+/// posture. Env stays absolute-verbatim (MiB). `cpus` is the PROCESS
+/// mask (`crate::cpu::process_parallelism`) at the one production call
+/// site — never the calling thread's `available_parallelism()` (the
+/// Hang-1 pinned-first-toucher sizing poison; the mount path runs on
+/// core-pinned tokio workers).
 ///
 /// The 4 MiB (not 2 MiB) alignment is the 2026-08-04 cluster bounce
 /// regression's fix: an ODD 2 MiB-multiple arena makes the client slab
@@ -305,30 +351,58 @@ fn parked_cap_derives_from_budget_over_block_size() {
 #[test]
 fn ipc_arena_default_derives_from_admission_cap() {
     use mem_budget::resolve_ipc_arena_bytes;
-    // Field: cap = 22 GiB ⇒ 176 MiB per session (4 MiB-aligned).
+    // THE FIELD SHAPE (red vs the /128): cap = 22 GiB, 32 cpus ⇒
+    // population 256 ⇒ 88 MiB per session (4 MiB-aligned; 256 × 88 MiB
+    // = 22 GiB — the whole matched-inflight battery fits the admission
+    // cap, where the /128's 176 MiB admitted only half of it).
     assert_eq!(
-        resolve_ipc_arena_bytes(None, mem_budget::ipc_arena_cap(FIELD_BUDGET)),
-        176 * MIB
+        resolve_ipc_arena_bytes(None, mem_budget::ipc_arena_cap(FIELD_BUDGET), 32),
+        88 * MIB,
+        "the 256-process battery must fit: cap / population(32 cpus) = 88 MiB"
+    );
+    // Small-box invariance (the never-regress pin): the population
+    // floors at 128 binds, so any box with cpus × 8 < 128 keeps
+    // today's cap/128 arithmetic byte-identical — same cap, 8 cpus.
+    assert_eq!(
+        resolve_ipc_arena_bytes(None, mem_budget::ipc_arena_cap(FIELD_BUDGET), 8),
+        176 * MIB,
+        "≤ 16-CPU boxes keep the shipped cap/128 value exactly"
     );
     // Floor shape: cap = 358 MiB ⇒ 2.8 MiB < 64 MiB ⇒ shipped floor.
     assert_eq!(
-        resolve_ipc_arena_bytes(None, mem_budget::ipc_arena_cap(FLOOR_BUDGET)),
+        resolve_ipc_arena_bytes(None, mem_budget::ipc_arena_cap(FLOOR_BUDGET), 2),
         64 * MIB
     );
-    // DMA alignment: a cap that derives to a non-4 MiB multiple rounds
-    // DOWN (never over the cap fraction).
-    assert_eq!(resolve_ipc_arena_bytes(None, 129 * 128 * MIB), 128 * MIB);
-    // THE BOUNCE SHAPE: cap/128 = 90 MiB — an odd 2 MiB multiple. The
-    // pre-fix PMD round-down kept 90 MiB (slab 92,160 B ≡ 2048 mod 4096
-    // ⇒ 50 % of slots DMA-ineligible); the DMA law rounds to 88 MiB.
+    // Floor-vs-population interaction: a many-core box whose cap cannot
+    // hold its population target at 64 MiB each still floors at the
+    // shipped 64 MiB (the floor is the last word; the admission cap —
+    // not a smaller arena — is what then bounds the population).
     assert_eq!(
-        resolve_ipc_arena_bytes(None, 90 * 128 * MIB),
+        resolve_ipc_arena_bytes(None, mem_budget::ipc_arena_cap(FIELD_BUDGET), 512),
+        64 * MIB,
+        "22 GiB / 4096-session target < the shipped floor ⇒ 64 MiB wins"
+    );
+    // DMA alignment: a cap that derives to a non-4 MiB multiple rounds
+    // DOWN (never over the cap fraction) — at the population floor…
+    assert_eq!(resolve_ipc_arena_bytes(None, 129 * 128 * MIB, 8), 128 * MIB);
+    // …and above it (the same shape scaled to the 32-CPU population).
+    assert_eq!(
+        resolve_ipc_arena_bytes(None, 129 * 256 * MIB, 32),
+        128 * MIB
+    );
+    // THE BOUNCE SHAPE: cap/population = 90 MiB — an odd 2 MiB multiple.
+    // The pre-fix PMD round-down kept 90 MiB (slab 92,160 B ≡ 2048 mod
+    // 4096 ⇒ 50 % of slots DMA-ineligible); the DMA law rounds to
+    // 88 MiB. Pinned at the population floor AND at the 32-CPU slope.
+    assert_eq!(
+        resolve_ipc_arena_bytes(None, 90 * 128 * MIB, 8),
         88 * MIB,
         "an odd 2 MiB-multiple arena is the 50 %-bounce shape — the \
          derivation must round to the slot-slab DMA alignment"
     );
+    assert_eq!(resolve_ipc_arena_bytes(None, 90 * 256 * MIB, 32), 88 * MIB);
     // The derivation-wide invariant: every derived arena is slot-slab
-    // DMA-aligned (slots × 4 KiB).
+    // DMA-aligned (slots × 4 KiB) at every core count.
     let align = u64::from(squeezefs_ipc::layout::Geometry::default_v1().slots) * 4096;
     assert_eq!(
         align,
@@ -336,23 +410,30 @@ fn ipc_arena_default_derives_from_admission_cap() {
         "geometry drift — re-derive the arena alignment"
     );
     for cap_mib in [1_u64, 300, 8192, 11_520, 22_528, 90 * 128, 129 * 128] {
-        let got = resolve_ipc_arena_bytes(None, cap_mib * MIB);
-        assert_eq!(
-            got % align,
-            0,
-            "derived arena {got} for cap {cap_mib} MiB is not slot-slab DMA-aligned"
-        );
+        for cpus in [1_usize, 2, 8, 16, 32, 64, 192, 512] {
+            let got = resolve_ipc_arena_bytes(None, cap_mib * MIB, cpus);
+            assert_eq!(
+                got % align,
+                0,
+                "derived arena {got} for cap {cap_mib} MiB / {cpus} cpus is \
+                 not slot-slab DMA-aligned"
+            );
+        }
     }
-    // Env verbatim (MiB), incl. the A0 lever.
-    assert_eq!(resolve_ipc_arena_bytes(Some("64"), 22 * GIB), 64 * MIB);
+    // Env verbatim (MiB), incl. the A0 lever, at any core count.
+    assert_eq!(resolve_ipc_arena_bytes(Some("64"), 22 * GIB, 32), 64 * MIB);
     assert_eq!(
-        resolve_ipc_arena_bytes(Some("junk"), FLOOR_BUDGET),
+        resolve_ipc_arena_bytes(Some("junk"), FLOOR_BUDGET, 2),
         64 * MIB
     );
+    // The field capture's measured operator escape stays verbatim
+    // (SQUEEZEFS_IPC_ARENA_MB=80: 256 × 80 MiB = 20 GiB ≤ cap) — the
+    // derivation makes it unnecessary, never overrides it.
+    assert_eq!(resolve_ipc_arena_bytes(Some("80"), 22 * GIB, 32), 80 * MIB);
     // An EXPLICIT odd env value stays verbatim (explicit-wins law) — the
     // CLIENT slab law (`Geometry::slot_slab`) is what keeps its slots
     // DMA-eligible; see `slot_slab_is_dma_aligned` below.
-    assert_eq!(resolve_ipc_arena_bytes(Some("90"), 22 * GIB), 90 * MIB);
+    assert_eq!(resolve_ipc_arena_bytes(Some("90"), 22 * GIB, 32), 90 * MIB);
 }
 
 /// The ONE slab law (`Geometry::slot_slab` — the client-side face of the
@@ -372,6 +453,11 @@ fn slot_slab_is_dma_aligned() {
     };
     // Shipped floor: 64 MiB / 1024 = 64 KiB — aligned, unchanged.
     assert_eq!(mk(64).slot_slab(), 64 * 1024);
+    // The cluster shape's POPULATION-derived arena (A9 field shape:
+    // 22 GiB cap / 256 sessions = 88 MiB): slab = 88 MiB / 1024 =
+    // 90,112 B — a 4 KiB multiple, so every slot stays DMA-eligible.
+    assert_eq!(mk(88).slot_slab(), 88 * 1024);
+    assert_eq!(mk(88).slot_slab() % 4096, 0);
     // THE BOUNCE SHAPE: 90 MiB / 1024 = 92,160 B (2048 mod 4096) —
     // floored to 90,112 B (a 4 KiB multiple).
     assert_eq!(
@@ -426,7 +512,11 @@ fn uring_fs_workers_derive_from_process_cores() {
 /// `ipc_admission_refusals` 125, ~192 of 256 jobs silently on the kernel
 /// lane, engagement 0.695 ⇒ INVALID row — while the box's own session
 /// budget, cap ≈ 22.5 GiB ÷ 176 MiB arenas ≈ 131, admitted twice the
-/// cap). Per-uid is a DoS tripwire, not an inter-uid fairness device
+/// cap). With the A9 population fix the derived arena divides the cap
+/// by `ipc_session_population_target(cpus)`, so the quotient here ≈
+/// that target (256 on the cluster shape) — the two derivations are
+/// COHERENT by construction: same cap, same arena, no third number.
+/// Per-uid is a DoS tripwire, not an inter-uid fairness device
 /// (VAL-7d: single-tenant by declaration), so the budget IS the bound;
 /// floor 64 = the shipped posture (never-regress-below-shipped); rail
 /// 4096 = the ctl-thread exhaustion rail (`ctl_conn_cap_from` — every
@@ -437,25 +527,40 @@ fn uring_fs_workers_derive_from_process_cores() {
 #[test]
 fn ipc_per_uid_session_cap_derives_from_session_budget() {
     use mem_budget::{ipc_arena_cap, ipc_per_uid_session_cap, resolve_ipc_arena_bytes};
-    // Field shape: cap 22 GiB, derived arena 176 MiB ⇒ 128 sessions.
-    // The canonical derived pair divides exactly (arena = cap/128), so
-    // the budget admits DOUBLE the old literal; the field capture's
-    // measured pair (≈ 22.5 GiB / 176 MiB ⇒ ≈ 131) is the same class.
+    // THE CLUSTER SHAPE (the two INVALID battery rows' box): cap
+    // 22 GiB, 32 cpus ⇒ population target 256 ⇒ derived arena 88 MiB ⇒
+    // uid cap 256 — the canonical pair divides exactly, so a full
+    // per-uid population of default arenas fills the admission cap
+    // exactly and the WHOLE 256-process matched-inflight battery binds.
     let field_cap = ipc_arena_cap(FIELD_BUDGET);
-    let field_arena = resolve_ipc_arena_bytes(None, field_cap);
-    assert_eq!(field_arena, 176 * MIB, "A9 anchor drifted — re-derive A12");
+    let field_arena = resolve_ipc_arena_bytes(None, field_cap, 32);
+    assert_eq!(field_arena, 88 * MIB, "A9 anchor drifted — re-derive A12");
     assert_eq!(
         ipc_per_uid_session_cap(field_cap, field_arena),
-        128,
-        "field shape: the session budget holds 128 default arenas — the \
-         bare 64 refused half of them"
+        256,
+        "cluster shape: cap/arena must equal the population target — the \
+         256-process battery binds in full"
     );
-    // Alignment round-down RAISES the quotient past 128 (the A9 bounce
-    // shape): cap 11.25 GiB ⇒ arena 88 MiB ⇒ 130.
+    // Population-floor coherence (the never-regress pin): a ≤ 16-CPU
+    // box keeps the shipped /128 pair — arena 176 MiB, uid cap 128
+    // (double the bare-64 literal this cap replaced; the field
+    // capture's measured pair ≈ 22.5 GiB / 176 MiB ⇒ ≈ 131 was the
+    // same class).
+    let small_arena = resolve_ipc_arena_bytes(None, field_cap, 8);
+    assert_eq!(small_arena, 176 * MIB, "small-box A9 anchor drifted");
+    assert_eq!(
+        ipc_per_uid_session_cap(field_cap, small_arena),
+        128,
+        "population floor: the session budget holds 128 default arenas — \
+         the bare 64 refused half of them"
+    );
+    // Alignment round-down RAISES the quotient past the target (the A9
+    // bounce shape at the population floor): cap 11.25 GiB ⇒ arena
+    // 88 MiB ⇒ 130.
     assert_eq!(
         ipc_per_uid_session_cap(
             90 * 128 * MIB,
-            resolve_ipc_arena_bytes(None, 90 * 128 * MIB)
+            resolve_ipc_arena_bytes(None, 90 * 128 * MIB, 8)
         ),
         130
     );
@@ -465,7 +570,7 @@ fn ipc_per_uid_session_cap_derives_from_session_budget() {
     // `arena_cap_bytes` still refuses the 6th arena first).
     let floor_cap = ipc_arena_cap(FLOOR_BUDGET);
     assert_eq!(
-        ipc_per_uid_session_cap(floor_cap, resolve_ipc_arena_bytes(None, floor_cap)),
+        ipc_per_uid_session_cap(floor_cap, resolve_ipc_arena_bytes(None, floor_cap, 2)),
         64,
         "floor shape: never regress below the shipped 64"
     );

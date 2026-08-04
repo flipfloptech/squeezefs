@@ -10,8 +10,9 @@ state machine + live ethtool/netlink surface, and the raw
 live-NIC execution field-owed — `.benchmarks/2026-08-04-zcrx-z2.md`);
 **PR Z3 (this branch) ships MEM-3 cancellation custody + gather-serve
 fusion** (`.benchmarks/2026-08-04-zcrx-z3.md`); default-on adjudication
-stays field-owed behind the D5 gate chain (MEM-3 ✓ → TEST-6 → Z3 field
-rows).
+stays field-owed behind the D5 gate chain (MEM-3 ✓ → TEST-6 ✓ — the
+in-module contract suite `src/zcrx_lane/uring_zcrx.rs::tests` — → Z3
+field rows, now the chain's remaining link).
 
 **Rev 3 amendments (Z3 as built):**
 
@@ -363,7 +364,8 @@ dest-read bytes). Ledger closure extension per §4.4.
   fused rows (sustained ≥ 60 s, both substrates), NUMA placement
   retune, Identify-verify hardening, derived-sizing retune vs real
   C2HData grain, and the default-on adjudication behind the D5 gate
-  chain (MEM-3 ✓ → TEST-6 → Z3 rows + engagement laws).
+  chain (MEM-3 ✓ → TEST-6 ✓ (`src/zcrx_lane/uring_zcrx.rs::tests`) →
+  Z3 rows + engagement laws — the field rows are the remaining link).
 
 ## 11. Residual risks (named)
 

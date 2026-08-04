@@ -221,7 +221,7 @@ Point by point, because this is the design's safety argument:
 
 ### 6.6 Geometry
 
-Arena-native apps will want more than the 64 MiB/session default (`SQUEEZEFS_IPC_ARENA_MB`). SDK-2 adds a HELLO-time geometry *request* (client asks, daemon clamps under the R5-derived admission cap — the 2026-08-02 derived-cap law, `mem_budget::ipc_arena_cap`; refusal degrades to the default geometry, never fails the session). Buffers larger than the granted arena fall back to plain-pointer ops (the boundary copy returns for that op — counted, `sdk_buf_fallback_ops`).
+Arena-native apps will want more than the derived per-session default (`SQUEEZEFS_IPC_ARENA_MB`; `max(64 MiB floor, DMA-aligned admission-cap ÷ max(128, cpus × 8))` — the population-derived fraction, preload design Rev 20). SDK-2 adds a HELLO-time geometry *request* (client asks, daemon clamps under the R5-derived admission cap — the 2026-08-02 derived-cap law, `mem_budget::ipc_arena_cap`; refusal degrades to the default geometry, never fails the session). Buffers larger than the granted arena fall back to plain-pointer ops (the boundary copy returns for that op — counted, `sdk_buf_fallback_ops`).
 
 ---
 

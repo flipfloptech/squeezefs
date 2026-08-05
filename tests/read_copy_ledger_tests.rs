@@ -227,6 +227,7 @@ impl Drop for AlignedDest {
 
 struct LedgerSnap {
     dest: u64,
+    warm: u64,
     bounce: u64,
     dest_dma: u64,
     fill_dma: u64,
@@ -235,6 +236,7 @@ struct LedgerSnap {
 fn snap() -> LedgerSnap {
     LedgerSnap {
         dest: METRICS.read_copy_dest_bytes.load(Ordering::Relaxed),
+        warm: METRICS.read_copy_warm_serve_bytes.load(Ordering::Relaxed),
         bounce: METRICS.read_copy_bounce_bytes.load(Ordering::Relaxed),
         dest_dma: METRICS.read_dest_dma_bytes.load(Ordering::Relaxed),
         fill_dma: METRICS.read_fill_dma_bytes.load(Ordering::Relaxed),
@@ -245,6 +247,7 @@ fn delta(s0: &LedgerSnap) -> LedgerSnap {
     let s1 = snap();
     LedgerSnap {
         dest: s1.dest - s0.dest,
+        warm: s1.warm - s0.warm,
         bounce: s1.bounce - s0.bounce,
         dest_dma: s1.dest_dma - s0.dest_dma,
         fill_dma: s1.fill_dma - s0.fill_dma,
@@ -474,6 +477,146 @@ async fn ledger_closes_and_cold_none_dest_slice_is_zero_copy() {
     assert_eq!(d.dest, 0, "phase E: no serve copy");
     assert_eq!(d.bounce, 0, "phase E: no bounce");
     assert_eq!(d.fill_dma, 0, "phase E: no pooled fill");
+    drop(data);
+}
+
+/// A1 warm-serve copy-ledger split (third-party read-audit adjudication
+/// 2026-08-04 + D12 board item 5): warm TIER-BUFFER serves into a dest
+/// are attributed to `read_copy_warm_serve_bytes` — a SUBSET of
+/// `read_copy_dest_bytes`, so every existing closure law (contract 1
+/// above; the AGENTS.md / design-read-path §Observability row-validity
+/// equations) is unchanged verbatim, and the COLD dest residual is
+/// `dest − warm_serve`. The split is the A1 pricing instrument: the
+/// tier-buffer handoff (zero-copy warm serves into the ring commit)
+/// gets BUILT only if warm-serve copies price in on a counted warm row.
+///
+/// Instrument-only: no serve-path behavior changes — every phase below
+/// also re-asserts the pre-split ledger shape it rides on.
+///
+/// Phases (one fixture, the suite's counter-isolation discipline):
+///  A. cold fill→dest slice-out — the RESIDUAL leg: warm stays 0 while
+///     dest counts (the pre-split aggregated bucket could not make this
+///     distinction — the red this test pins).
+///  B. hot-block tier serve into the dest — warm == dest == part
+///     (subset law), zero fill/DMA.
+///  C. NVMe read-cache tier serve into the dest — same law on the
+///     disk-tier arm (hot purged first so the ladder reaches it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn warm_tier_serves_split_out_of_the_dest_bucket() {
+    let h = make_with("524288", *b"rcledger-a1-2026", "rcl_ns_a1").await;
+    for i in 0..8 {
+        let _ = create(&h, &format!("a1salt{i}")).await;
+    }
+    let ino = create(&h, "a1_warm").await;
+    write_pattern(&h, ino, 12 * BS).await;
+    let map = make_cold(&h, ino).await;
+    let path = squeezefs::keys::inode_path(ino);
+    let part = 384 * 1024usize; // > ranged threshold (256 KiB), < BS
+    let dest = AlignedDest::new(BS as usize);
+
+    // ---- Phase A: cold fill + slice-out into the dest (block 5) —
+    // the cold residual: dest counts, warm must NOT.
+    let s0 = snap();
+    let (data, _backing) =
+        h.fs.router
+            .read_file_range_zero_copy_with_meta(
+                &path,
+                5 * BS,
+                part as u32,
+                Some(dest.dest()),
+                ReadClassHint::default(),
+                None,
+            )
+            .await
+            .expect("phase A cold read");
+    assert_eq!(data.len(), part);
+    let d = delta(&s0);
+    assert_eq!(d.fill_dma, BS, "phase A: one whole-block pooled fill");
+    assert_eq!(d.dest, part as u64, "phase A: the cold slice-out counts dest");
+    assert_eq!(
+        d.warm, 0,
+        "phase A: a COLD fill→dest slice-out must stay in the residual — \
+         warm_serve growth here would erase the split's meaning"
+    );
+    drop(data);
+
+    // ---- Phase B: hot-block tier serve into the dest (phase A's fill
+    // deposited block 5 in hot probation) — the A1 target population.
+    let s0 = snap();
+    let hot0 = METRICS.hot_block_hits.load(Ordering::Relaxed);
+    let (data, _backing) =
+        h.fs.router
+            .read_file_range_zero_copy_with_meta(
+                &path,
+                5 * BS,
+                part as u32,
+                Some(dest.dest()),
+                ReadClassHint::default(),
+                None,
+            )
+            .await
+            .expect("phase B warm read");
+    assert_eq!(data.len(), part);
+    assert!(
+        METRICS.hot_block_hits.load(Ordering::Relaxed) > hot0,
+        "phase B must serve from the hot tier"
+    );
+    let d = delta(&s0);
+    assert_eq!(d.fill_dma, 0, "phase B: warm — no device fetch");
+    assert_eq!(d.dest_dma, 0, "phase B: warm — no dest DMA");
+    assert_eq!(
+        d.dest, part as u64,
+        "phase B: the pre-split dest accounting is UNCHANGED (subset law)"
+    );
+    assert_eq!(
+        d.warm, part as u64,
+        "phase B: the hot-tier serve copy is attributed to \
+         read_copy_warm_serve_bytes — the A1 split's whole point"
+    );
+
+    // ---- Phase C: NVMe read-cache tier serve into the dest. Plant
+    // block 7's bytes in the disk read tier directly (the
+    // reused_key_stale_fill planting seam), leave hot/RAM cold for that
+    // key, and read: the ladder's disk-tier arm serves — warm counts.
+    let k7 = map.get(&7).expect("block 7 mapped").clone();
+    let block7: Vec<u8> = (0..BS).map(|i| pat(7 * BS + i)).collect();
+    h.fs.router
+        .cache
+        .nvme
+        .cache_read_block(&k7, bytes::Bytes::from(block7))
+        .expect("phase C: disk-tier plant must land");
+    let s0 = snap();
+    let (data, _backing) =
+        h.fs.router
+            .read_file_range_zero_copy_with_meta(
+                &path,
+                7 * BS,
+                part as u32,
+                Some(dest.dest()),
+                ReadClassHint::default(),
+                None,
+            )
+            .await
+            .expect("phase C tier read");
+    assert_eq!(data.len(), part);
+    assert!(
+        dest.slice(part)
+            .iter()
+            .enumerate()
+            .all(|(j, &x)| x == pat(7 * BS + j as u64)),
+        "phase C content (served from the planted tier entry)"
+    );
+    let d = delta(&s0);
+    assert_eq!(d.fill_dma, 0, "phase C: warm — no device fetch");
+    assert_eq!(
+        d.dest, part as u64,
+        "phase C: the pre-split dest accounting is UNCHANGED (subset law)"
+    );
+    assert_eq!(
+        d.warm, part as u64,
+        "phase C: the NVMe read-cache tier serve is attributed to \
+         read_copy_warm_serve_bytes (the disk-tier warm arm)"
+    );
     drop(data);
 }
 

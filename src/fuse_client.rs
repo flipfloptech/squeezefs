@@ -3522,6 +3522,22 @@ pub struct Metrics {
     /// ONE lawful serve copy on the kernel path (hot/hold/tier/cold
     /// slice-out arms).
     pub read_copy_dest_bytes: Align64<AtomicU64>,
+    /// A1 warm-serve split (third-party read-audit adjudication
+    /// 2026-08-04, D12 board item 5): the SUBSET of
+    /// `read_copy_dest_bytes` whose source was a WARM tier buffer — the
+    /// serve ladder's hot-block, read-lane-hold and NVMe read-cache
+    /// arms. A subset, deliberately: every existing closure equation
+    /// (`dest + bounce + dest_dma ≈ user bytes`; the il arena law) is
+    /// unchanged, and the COLD dest residual is `dest − warm_serve`
+    /// (fill→dest slice-outs, ranged bounce legs, assembly slices, and
+    /// the mixed-provenance fetch-loop arms, which stay in the residual
+    /// by design — the A1 handoff's target population is exactly the
+    /// tier-buffer arms this counter names). **The A1 decision rule:**
+    /// the tier-buffer lease into the ring commit gets BUILT only if
+    /// this counter's share of a warm row's dest bytes prices the
+    /// auditor's claim in — re-priced from this split, never the
+    /// +15–25 % blanket.
+    pub read_copy_warm_serve_bytes: Align64<AtomicU64>,
     /// POSIX-14: inodes that reached their FINAL forget (the kernel
     /// certifying it holds no reference, which requires every handle
     /// closed) with a nonzero daemon open count — i.e. a lost RELEASE.
@@ -7096,6 +7112,10 @@ impl SqueezefsFilesystem {
                 "read_lane_hold_bytes": self.router.cache.read_lane_hold.bytes(),
                 "read_lane_inflight_bytes": self.router.read_lane_inflight_bytes(),
                 "read_copy_dest_bytes": METRICS.read_copy_dest_bytes.load(Ordering::Relaxed),
+                // A1 warm-serve split: subset of read_copy_dest_bytes
+                // (warm tier-buffer serve arms; cold residual = dest −
+                // warm_serve). The A1 handoff's pricing instrument.
+                "read_copy_warm_serve_bytes": METRICS.read_copy_warm_serve_bytes.load(Ordering::Relaxed),
                 // FUSE-4e tripwire: must stay 0 (see the field doc).
                 "read_dest_overruns": METRICS.read_dest_overruns.load(Ordering::Relaxed),
                 // POSIX-14 tripwire: must stay 0 (lost RELEASE detector).

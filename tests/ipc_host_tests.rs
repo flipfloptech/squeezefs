@@ -2380,3 +2380,159 @@ fn admission_defers_arena_thp_prep_off_the_hello_path() {
     std::env::remove_var("SQUEEZEFS_TEST_THP_PREP_STALL_MS");
     host.shutdown();
 }
+
+/// Count this process's live session-shm mappings (`/proc/self/maps`
+/// lines naming the sealed memfd). The prep-liveness pinning face: a
+/// mapping that outlives its session's teardown is HELD memory the R5
+/// gauge no longer sees (`teardown_session` decrements `arena_bytes`
+/// while the pages stay mapped).
+fn session_shm_mappings() -> usize {
+    std::fs::read_to_string("/proc/self/maps")
+        .expect("/proc/self/maps")
+        .lines()
+        .filter(|l| l.contains("memfd:sqz-ipc-session"))
+        .count()
+}
+
+/// The field follow-on to the deferred-prep fix (fleet-parity round 2):
+/// `prep_done=113` ticked during a KERNEL row because the single-lane
+/// `sqz-ipc-thp` worker was still grinding jobs for sessions whose fio
+/// fleet had EXITED — and each queued job's mapping Arc PINNED the dead
+/// session's full arena (120 MiB × 256 queued ≈ 30 GiB held past
+/// teardown, `mem_budget_level=2`, the final il row collapsed to
+/// 3.24 GB/s under the Red admission clamp).
+///
+/// The pinned contract: a QUEUED (or stall-held) prep job must not keep
+/// a torn-down session's arena mapped — teardown's gauge decrement and
+/// the actual unmap must converge while the worker is still busy. The
+/// job may hold only a `Weak`; the strong ref exists only across an
+/// actually-running live prep.
+#[test]
+fn queued_prep_job_pins_no_arena_after_teardown() {
+    // Hold the worker mid-job long enough to observe the window; the
+    // teardown below lands while the job is stall-held.
+    std::env::set_var("SQUEEZEFS_TEST_THP_PREP_STALL_MS", "4000");
+    let baseline = session_shm_mappings();
+    let (host, cfg) = spawn_host("prep-pin");
+    let m = mount_file();
+    host.set_expected_st_dev(m.st_dev);
+    let fd = open_flags(&m.path, libc::O_RDWR);
+    let (sock, cs) = establish(&cfg, &host, fd.as_raw_fd());
+    assert_eq!(
+        session_shm_mappings(),
+        baseline + 2,
+        "one daemon-side + one client-side mapping while the session lives"
+    );
+    // Client death: drop OUR mapping first, then the ctl socket (EOF ⇒
+    // teardown_session on the daemon's ctl thread).
+    drop(cs);
+    drop(sock);
+    // Teardown must fully release the arena — gauge AND mapping — while
+    // the prep worker is still inside its stall with the job in hand.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if host.arena_bytes() == 0 && session_shm_mappings() == baseline {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a queued prep job pinned the dead session's arena: gauge={} \
+             mappings={} (baseline {}) after 3 s with the worker stall-held \
+             — the job must hold a Weak, never the mapping",
+            host.arena_bytes(),
+            session_shm_mappings(),
+            baseline
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::env::remove_var("SQUEEZEFS_TEST_THP_PREP_STALL_MS");
+    host.shutdown();
+}
+
+/// The liveness half of the same field finding: a prep job whose session
+/// was torn down must SKIP (a dead mapping needs no ordering protection —
+/// it needs the populate/collapse to not run), counted honestly so the
+/// ledger closes: `queued == done + skipped_dead + skipped_pressure`.
+/// `prep_done` ticking during the field's KERNEL row (113 dead-session
+/// preps ground after the fio fleet exited) is exactly what this pins
+/// away.
+#[test]
+fn reaped_session_prep_job_skips_and_the_ledger_closes() {
+    std::env::set_var("SQUEEZEFS_TEST_THP_PREP_STALL_MS", "1000");
+    let (host, cfg) = spawn_host("prep-skip");
+    let m = mount_file();
+    host.set_expected_st_dev(m.st_dev);
+    let fd = open_flags(&m.path, libc::O_RDWR);
+    let (sock, cs) = establish(&cfg, &host, fd.as_raw_fd());
+    let (queued, done, dead, pressure) = host.arena_prep_counts();
+    assert_eq!((queued, done, dead, pressure), (1, 0, 0, 0), "job queued, stall-held");
+    // Client death while the job is stall-held: EOF ⇒ teardown before
+    // the worker reaches the job.
+    drop(cs);
+    drop(sock);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while host.arena_bytes() != 0 {
+        assert!(Instant::now() < deadline, "teardown never landed");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // The worker reaches the job after the stall: it must SKIP-dead,
+    // never run the prep of a torn-down session.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (queued, done, dead, pressure) = host.arena_prep_counts();
+        if dead == 1 {
+            assert_eq!(
+                (queued, done, pressure),
+                (1, 0, 0),
+                "the ledger must close as queued == done + skipped_dead + \
+                 skipped_pressure with the dead job SKIPPED, not prepped"
+            );
+            break;
+        }
+        assert!(
+            done == 0,
+            "the worker ran populate/collapse for a torn-down session \
+             (done={done}) — the field's dead-session grind"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "dead-session skip never counted (ledger {:?})",
+            host.arena_prep_counts()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::env::remove_var("SQUEEZEFS_TEST_THP_PREP_STALL_MS");
+    host.shutdown();
+}
+
+/// Teardown is synchronous on the ctl thread and must never wait on the
+/// prep worker (the queue is fed forward only): a session's death
+/// completes promptly even with the worker stall-held mid-job.
+#[test]
+fn session_teardown_never_waits_for_prep() {
+    std::env::set_var("SQUEEZEFS_TEST_THP_PREP_STALL_MS", "5000");
+    let (host, cfg) = spawn_host("prep-nowait");
+    let m = mount_file();
+    host.set_expected_st_dev(m.st_dev);
+    let fd = open_flags(&m.path, libc::O_RDWR);
+    let (sock, cs) = establish(&cfg, &host, fd.as_raw_fd());
+    drop(cs);
+    let t0 = Instant::now();
+    drop(sock);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while host.arena_bytes() != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "teardown blocked ≥ 3 s behind a 5 s prep stall — reap must \
+             never wait on the prep lane"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        t0.elapsed() < Duration::from_secs(3),
+        "teardown took {:?} with the prep worker stalled",
+        t0.elapsed()
+    );
+    std::env::remove_var("SQUEEZEFS_TEST_THP_PREP_STALL_MS");
+    host.shutdown();
+}

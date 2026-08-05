@@ -473,6 +473,37 @@ impl LaneSession {
         let (hostnqn, hostid) = super::probe::host_identity();
         let addr = format!("{}:{}", target.traddr, target.trsvcid);
 
+        // FINDING 3 + round-4 FINDING G (the exclusion barrier): RSS must
+        // exclude the leased queues BEFORE any ifq binds one (a
+        // zcrx-bound queue produces unreadable net_iov skbs — any HOST
+        // flow RSS-hashed onto it gets recv = EFAULT), and — the round-4
+        // refinement — before ANY of this session's TCP connects exist,
+        // ADMIN included: the round-3 placement (post-admin, pre-qid)
+        // left every admin/CSTS flow established while the session's own
+        // queues were still RSS-included, and a hardware flow cache that
+        // latches an established flow's queue keeps delivering there
+        // after the indirection table changes — the surviving
+        // ICResp-EFAULT window on staggered arms. Cross-session
+        // visibility is the live-arm union law (peers' queues are
+        // excluded by every arm's phase A, mid-bring-up included).
+        // Failures between here and the bring-up scope converge via
+        // ArmedSteering::Drop with ZERO ifqs bound — clean by
+        // construction. Phase B (flow rules) stays post-connect
+        // (ephemeral ports).
+        let mut steering_hold: Option<SteeringHold> = None;
+        if let LaneBackend::Zcrx(plan) = &backend {
+            let ifname = plan.ifname.clone();
+            let lane_queues = plan.rx_queues.clone();
+            let hold = tokio::task::spawn_blocking(move || -> Result<SteeringHold> {
+                let nic = super::ethtool::EthtoolNic::open(&ifname).map_err(io_err)?;
+                super::steering::ArmedSteering::arm(nic, &lane_queues)
+                    .map_err(|e| io_err(format!("zcrx steering arm (RSS exclusion): {e}")))
+            })
+            .await
+            .map_err(|e| io_err(format!("steering join: {e}")))??;
+            steering_hold = Some(hold);
+        }
+
         let mut admin = TcpStream::connect(&addr)
             .await
             .map_err(|e| io_err(format!("lane admin connect {addr}: {e}")))?;
@@ -531,27 +562,6 @@ impl LaneSession {
         // Real-backend bring-up state (empty on the other backends).
         let mut go_txs: Vec<std::sync::mpsc::Sender<bool>> = Vec::new();
         let mut flows: Vec<super::steering::FlowRule> = Vec::new();
-
-        // FINDING 3 ordering law (2026-08 field): RSS must exclude the
-        // leased queues BEFORE any ifq binds one — a zcrx-bound queue
-        // produces unreadable (net_iov) skbs, and any HOST flow
-        // RSS-hashed onto it (a peer session's IC exchange, the kernel
-        // initiator's own nvme-tcp connections) gets recv = EFAULT (the
-        // field's `ICResp read: Bad address` face). Phase A runs HERE;
-        // the flow rules are phase B, post-connect (ephemeral ports).
-        let mut steering_hold: Option<SteeringHold> = None;
-        if let LaneBackend::Zcrx(plan) = &backend {
-            let ifname = plan.ifname.clone();
-            let lane_queues = plan.rx_queues.clone();
-            let hold = tokio::task::spawn_blocking(move || -> Result<SteeringHold> {
-                let nic = super::ethtool::EthtoolNic::open(&ifname).map_err(io_err)?;
-                super::steering::ArmedSteering::arm(nic, &lane_queues)
-                    .map_err(|e| io_err(format!("zcrx steering arm (RSS exclusion): {e}")))
-            })
-            .await
-            .map_err(|e| io_err(format!("steering join: {e}")))??;
-            steering_hold = Some(hold);
-        }
 
         // The whole post-phase-A bring-up unwinds through ONE failure
         // path (below): stop drivers → JOIN them → only then restore

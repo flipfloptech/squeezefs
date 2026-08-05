@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# tests/fio/fleet_parity_row.sh — D12 board item 2 field confirmation row
+# (2026-08-05, perf/shim-fleet-parity f19df263): bs=1M seq write + read,
+# fio psync PROCESS fleet (one shim session per process — the field shape),
+# numjobs=256, qd1, il vs kernel in alternating pairs (K-I, I-K, K-I), with
+# per-row engagement (ipc_ops_*, ipc_bytes_*) and the new arena-prep ledger
+# (ipc_arena_prep_{queued,done}) off the stats inode. A shim row whose
+# engagement deltas do not account for its ops is INVALID and printed so.
+#
+# usage: fleet_parity_row.sh --mount <mnt> [--njobs 256] [--size 512m]
+#        [--shim /scratch/tmp/libsqueezefs_il.so] [--out DIR]
+set -u
+MNT="" NJOBS=256 SIZE="512m" SHIM="/scratch/tmp/libsqueezefs_il.so"
+OUT="/tmp/fleet_parity_$(date +%Y%m%d_%H%M%S)"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --mount) MNT="$2"; shift 2 ;;
+        --njobs) NJOBS="$2"; shift 2 ;;
+        --size) SIZE="$2"; shift 2 ;;
+        --shim) SHIM="$2"; shift 2 ;;
+        --out) OUT="$2"; shift 2 ;;
+        *) echo "unknown arg $1" >&2; exit 2 ;;
+    esac
+done
+[ -n "$MNT" ] || { echo "--mount required" >&2; exit 2; }
+mkdir -p "$OUT"
+
+snap() {
+    for _ in 1 2 3 4 5; do
+        dd if="$MNT/.stats" of="$1" bs=1M status=none 2>/dev/null
+        python3 -c "import json;json.load(open('$1'))" 2>/dev/null && return 0
+        sleep 0.3
+    done
+    return 1
+}
+
+row() { # $1=arm(kern|il) $2=rw(write|read) $3=tag
+    local arm=$1 rw=$2 tag=$3 dir="$MNT/fleet_parity"
+    local env_prefix=()
+    [ "$arm" = il ] && env_prefix=(env LD_PRELOAD="$SHIM")
+    if [ "$rw" = write ]; then rm -rf "$dir"; fi
+    mkdir -p "$dir"
+    snap "$OUT/$tag.before.json"
+    "${env_prefix[@]}" fio --name=fp --directory="$dir" \
+        --filename_format='fp.$jobnum' --rw="$rw" --bs=1M --size="$SIZE" \
+        --numjobs="$NJOBS" --iodepth=1 --ioengine=psync \
+        --create_on_open=1 --group_reporting --output-format=json \
+        --output="$OUT/$tag.fio.json" >/dev/null 2>&1
+    snap "$OUT/$tag.after.json"
+    python3 - "$OUT/$tag" "$arm" "$rw" <<'EOF'
+import json, sys
+p, arm, rw = sys.argv[1], sys.argv[2], sys.argv[3]
+raw = open(f"{p}.fio.json", "rb").read()
+fio = json.loads(raw[raw.find(b"{"):])
+key = "read" if rw == "read" else "write"
+r = [j[key] for j in fio["jobs"]]
+bw = sum(x["bw_bytes"] for x in r) / 1e9
+user = sum(x["io_bytes"] for x in r)
+def m(f):
+    d = json.load(open(f)); return d.get("metrics", d)
+b, a = m(f"{p}.before.json"), m(f"{p}.after.json")
+def d(k): return a.get(k, 0) - b.get(k, 0)
+ops = d("ipc_ops_write") if rw == "write" else d("ipc_ops_read")
+ib = d("ipc_bytes_in") if rw == "write" else d("ipc_bytes_out")
+pq, pd = d("ipc_arena_prep_queued"), d("ipc_arena_prep_done")
+if arm == "il":
+    eng = ib / user if user else 0.0
+    verdict = "ENGAGED" if eng > 0.9 else f"INVALID(eng={eng:.3f})"
+else:
+    verdict = "n/a(kern)" if ops == 0 else f"LEAK(ops={ops})"
+print(f"  {p.split('/')[-1]}: {bw:.2f} GB/s user={user/1e9:.0f}GB "
+      f"ipc_ops={ops} prep_q={pq} prep_done={pd} {verdict}")
+EOF
+    rm -rf "$dir"
+}
+
+echo "== fleet parity row: njobs=$NJOBS size=$SIZE (K-I, I-K, K-I pairs) =="
+for pair in "kern il" "il kern" "kern il"; do
+    set -- $pair
+    for arm in $1 $2; do
+        row "$arm" write "w.$arm.$(date +%s)"
+    done
+done
+echo "== read twin (prefill once, then K-I, I-K, K-I on the same set) =="
+dir="$MNT/fleet_parity"; rm -rf "$dir"; mkdir -p "$dir"
+fio --name=pre --directory="$dir" --filename_format='fp.$jobnum' --rw=write \
+    --bs=1M --size="$SIZE" --numjobs="$NJOBS" --iodepth=1 --ioengine=psync \
+    --create_on_open=1 --group_reporting >/dev/null 2>&1
+read_row() { # $1=arm $2=tag  — reads never age the store: no rm
+    local arm=$1 tag=$2 dir="$MNT/fleet_parity"
+    local env_prefix=()
+    [ "$arm" = il ] && env_prefix=(env LD_PRELOAD="$SHIM")
+    snap "$OUT/$tag.before.json"
+    "${env_prefix[@]}" fio --name=fp --directory="$dir" \
+        --filename_format='fp.$jobnum' --rw=read --bs=1M --size="$SIZE" \
+        --numjobs="$NJOBS" --iodepth=1 --ioengine=psync \
+        --group_reporting --output-format=json \
+        --output="$OUT/$tag.fio.json" >/dev/null 2>&1
+    snap "$OUT/$tag.after.json"
+    python3 - "$OUT/$tag" "$arm" read <<'EOF'
+import json, sys
+p, arm, rw = sys.argv[1], sys.argv[2], sys.argv[3]
+raw = open(f"{p}.fio.json", "rb").read()
+fio = json.loads(raw[raw.find(b"{"):])
+r = [j["read"] for j in fio["jobs"]]
+bw = sum(x["bw_bytes"] for x in r) / 1e9
+user = sum(x["io_bytes"] for x in r)
+def m(f):
+    d = json.load(open(f)); return d.get("metrics", d)
+b, a = m(f"{p}.before.json"), m(f"{p}.after.json")
+def d(k): return a.get(k, 0) - b.get(k, 0)
+ops, ob = d("ipc_ops_read"), d("ipc_bytes_out")
+if arm == "il":
+    eng = ob / user if user else 0.0
+    verdict = "ENGAGED" if eng > 0.9 else f"INVALID(eng={eng:.3f})"
+else:
+    verdict = "n/a(kern)" if ops == 0 else f"LEAK(ops={ops})"
+print(f"  {p.split('/')[-1]}: {bw:.2f} GB/s user={user/1e9:.0f}GB "
+      f"ipc_ops={ops} {verdict}")
+EOF
+}
+for pair in "kern il" "il kern" "kern il"; do
+    set -- $pair
+    for arm in $1 $2; do
+        read_row "$arm" "r.$arm.$(date +%s)"
+    done
+done
+rm -rf "$MNT/fleet_parity"
+echo "artifacts: $OUT"

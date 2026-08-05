@@ -38,6 +38,15 @@ done
 [ -n "$MNT" ] || { echo "--mount required" >&2; exit 2; }
 DIR="${DIR:-$MNT/ingress_sweep}"
 OUT="/tmp/ingress_sweep_$(date +%Y%m%d_%H%M%S)_$LABEL"
+
+# A row against a bare directory is NO row (the 2026-08-05 fabricated-run
+# lesson: fio "succeeds" against local scratch and every number is
+# fiction). Fatal at start and re-checked before every point.
+require_mount() {
+    mountpoint -q "$MNT" || { echo "FATAL: $MNT is not a mountpoint — refusing to fabricate rows" >&2; exit 1; }
+    [ -e "$MNT/.stats" ] || { echo "FATAL: $MNT/.stats missing — not a squeezefs mount" >&2; exit 1; }
+}
+require_mount
 mkdir -p "$OUT" "$DIR"
 
 # Snapshot with parse-retry: on busy mounts the kernel can clamp a
@@ -103,7 +112,8 @@ fio --name=prefill --directory="$DIR" --filename_format='swp.$jobnum.$filenum' \
 printf "%-8s %-10s %-10s %s\n" "point" "IOPS" "clat_us" "phases"
 for p in $POINTS; do
     j=${p%%x*}; q=${p##*x}
-    snap "$OUT/$p.before.json"
+    require_mount
+    snap "$OUT/$p.before.json" || { echo "FATAL: no coherent .stats before $p — refusing the point" >&2; exit 1; }
     fio --name=rr --directory="$DIR" --filename_format='swp.$jobnum.$filenum' \
         --rw=randread --bs=4k --size="$SIZE" --numjobs="$j" --iodepth="$q" \
         --ioengine=libaio --direct=1 --time_based --runtime="$RUNTIME" \

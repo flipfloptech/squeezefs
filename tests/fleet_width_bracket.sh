@@ -66,6 +66,7 @@ snap_stats() {
 }
 
 KEYS="ipc_ops_write ipc_bytes_in ipc_async_handoffs ipc_service_parks \
+ipc_inval_notifies ipc_inval_attrs_only ipc_inval_suppressed \
 ipc_service_threads ipc_sessions_active ipc_sessions_total ipc_admission_refusals \
 ipc_cqe_wake_writes ipc_cqe_wake_elided ipc_severed_pool_hits ipc_severed_pool_misses \
 ipc_placed_severs placed_adoptions placed_merge_elides ipc_placed_sever_fallbacks \

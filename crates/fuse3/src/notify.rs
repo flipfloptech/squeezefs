@@ -23,7 +23,14 @@ use crate::raw::session::ReplyTx;
 /// device-write path ([`crate::raw::connection::FuseConnection::
 /// notify_inval_inode_sync`], generic/451) shares ONE encoding with the
 /// async enqueue path and the two can never drift.
-pub(crate) fn inval_inode_frame(inode: u64, offset: i64, len: i64) -> Vec<u8> {
+///
+/// `pub` + `doc(hidden)` (the bench-seam precedent —
+/// [`crate::get_bincode_config`]): the daemon's inval venue pins
+/// (`tests/ipc_inval_venue_tests.rs` in the root crate) assert the
+/// PRODUCTION hook delivers exactly this frame, so the expected bytes
+/// must come from the shipping encoder, not a lookalike.
+#[doc(hidden)]
+pub fn inval_inode_frame(inode: u64, offset: i64, len: i64) -> Vec<u8> {
     let out_header = fuse_out_header {
         len: (FUSE_OUT_HEADER_SIZE + FUSE_NOTIFY_INVAL_INODE_OUT_SIZE) as u32,
         error: fuse_notify_code::FUSE_NOTIFY_INVAL_INODE as i32,
@@ -305,4 +312,39 @@ enum NotifyKind {
         offset: u64,
         size: u32,
     },
+}
+
+/// `pub` + `doc(hidden)` test seam (the bench-seam precedent —
+/// [`crate::get_bincode_config`]): a [`Notify`] over an inspectable
+/// reply channel, for the daemon's inval **venue pins**
+/// (`tests/ipc_inval_venue_tests.rs` in the root crate). The pins'
+/// whole subject is *synchronous, runtime-free delivery*, which only a
+/// receiver polled without any executor can witness — a real session's
+/// reply task cannot.
+#[doc(hidden)]
+pub fn notify_test_channel() -> (Notify, NotifyTestRx) {
+    let (tx, rx) = futures_channel::mpsc::unbounded();
+    (Notify::new(ReplyTx::no_reply(tx)), NotifyTestRx { rx })
+}
+
+/// The receiving half of [`notify_test_channel`]: synchronous,
+/// executor-free frame pops.
+#[doc(hidden)]
+pub struct NotifyTestRx {
+    rx: futures_channel::mpsc::UnboundedReceiver<crate::raw::FuseReply>,
+}
+
+impl NotifyTestRx {
+    /// Pop the next enqueued notification frame's header bytes.
+    /// `None` = nothing is enqueued **right now** — i.e. for the venue
+    /// pins, delivery was not synchronous.
+    pub fn try_next_frame(&mut self) -> Option<Vec<u8>> {
+        match self.rx.try_recv() {
+            Ok(reply) => Some(match reply.data {
+                Either::Left(header) => header,
+                Either::Right((header, _body, _backing)) => header,
+            }),
+            Err(_) => None,
+        }
+    }
 }

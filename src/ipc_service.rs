@@ -402,6 +402,61 @@ impl Invalidator {
     }
 }
 
+/// The PRODUCTION W1 inval hook (§5.6.2, PR L4-6): pushes
+/// `FUSE_NOTIFY_INVAL_INODE` through the fuse3 [`Notify`] handle
+/// captured post-mount into `cell` (pre-mount fires are skipped — no
+/// kernel cache exists yet). Factored out of the mount path so the
+/// venue pins (`tests/ipc_inval_venue_tests.rs`) exercise the shipping
+/// dispatch, not a lookalike.
+///
+/// [`Notify`]: fuse3::notify::Notify
+pub fn make_inval_hook(
+    cell: Arc<arc_swap::ArcSwap<Option<fuse3::notify::Notify>>>,
+) -> Arc<dyn Fn(u64, InvalScope) + Send + Sync> {
+    let hook_runtime = tokio::runtime::Handle::current();
+    Arc::new(move |ino, scope| {
+        if let Some(notify) = cell.load().as_ref() {
+            let notify = notify.clone();
+            // Whole-inode shootdown: attrs + the full page range
+            // (off 0, len -1) — the kernel refetches size and
+            // data. POSIX-8's size refresh instead passes
+            // `off < 0`, which fs/fuse's
+            // `fuse_reverse_inval_inode` reads as "invalidate
+            // the attrs (and cached ACLs), touch no page" — the
+            // cheap refresh that makes it safe to fire on every
+            // size-changing ring write.
+            let (off, len) = match scope {
+                InvalScope::Whole => (0, -1),
+                InvalScope::AttrsOnly => (-1, 0),
+            };
+            // ORDERING (adjudicated 2026-08 — the generic/451
+            // follow-up sweep): deliberately FIRE-AND-FORGET.
+            // The spawn means a ring write's IPC completion can
+            // overtake the kernel-side invalidation; the design
+            // tolerates exactly that race by contract —
+            // §5.6.2 W1's stated residual is a BOUNDED staleness
+            // window for buffered kernel readers racing ring
+            // writes ("the same class and bound as today's
+            // attr-TTL staleness", design-preload-interception),
+            // KD-11's forced write-through closes the
+            // buffered-WRITER direction structurally, and the
+            // POSIX-8 attrs-only refresh is a bound TIGHTENER
+            // (delivery-latency-class instead of attr-TTL-class
+            // size staleness), not an ack barrier. Do NOT pull
+            // the generic/451 `notify_inval_inode_sync` device
+            // write onto this path: it would put a synchronous
+            // kernel round trip on EVERY size-growing ring write
+            // (every streaming append), and its Whole arm can
+            // lawfully sleep in `invalidate_inode_pages2_range`
+            // for a full READ round trip — the folio-wait venue
+            // law on that primitive.
+            hook_runtime.spawn(async move {
+                notify.invalid_inode(ino, off, len).await;
+            });
+        }
+    })
+}
+
 /// The production [`SessionSink`]: fast path + async handoff over one
 /// filesystem instance (the same instance the FUSE session serves).
 pub struct DataPlaneSink {

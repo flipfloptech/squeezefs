@@ -214,8 +214,10 @@ pub struct LaneSession {
     /// live in OnceCell statics for the mount lifetime).
     rxq_lease: std::sync::Mutex<Option<Arc<super::rxq_alloc::RxqLease>>>,
     /// The finding-F teardown latch (idempotence + the registry's
-    /// live-count instrument).
-    teardown_latch: AtomicBool,
+    /// live-count instrument). Arc'd: the admin watchdog holds a clone
+    /// (round 6 — an orderly post-teardown association close must be
+    /// unreadable as poison).
+    teardown_latch: Arc<AtomicBool>,
 }
 
 impl LaneSession {
@@ -748,10 +750,18 @@ impl LaneSession {
 
         // Park the admin socket: any read (data or EOF) after bring-up is an
         // association event — poison loud, the kernel path keeps serving.
+        // EXCEPT during teardown (round 6): the latch makes the target's
+        // orderly association unwind silent, never a poison.
+        let teardown_latch = Arc::new(AtomicBool::new(false));
         let admin_poison = Arc::clone(&poisoned);
+        let admin_latch = Arc::clone(&teardown_latch);
         let admin_hold = tokio::spawn(async move {
             let mut b = [0u8; 8];
-            match admin.read(&mut b).await {
+            let event = admin.read(&mut b).await;
+            if admin_latch.load(Ordering::SeqCst) {
+                return; // orderly teardown — not an association event
+            }
+            match event {
                 Ok(0) => log::error!(
                     "zcrx-lane: admin connection closed by target — session poisoned \
                      (kernel path serves; remount re-arms)"
@@ -790,7 +800,7 @@ impl LaneSession {
             steering: std::sync::Mutex::new(steering_hold),
             _admin_hold: admin_hold,
             rxq_lease: std::sync::Mutex::new(rxq_lease),
-            teardown_latch: AtomicBool::new(false),
+            teardown_latch,
         });
         super::register_session(&session);
         Ok(session)
@@ -832,6 +842,13 @@ impl LaneSession {
         if self.teardown_latch.swap(true, Ordering::SeqCst) {
             return;
         }
+        // Round 6 (gauge honesty): retire the admin watchdog FIRST —
+        // quiescing the IO queues makes the target unwind the
+        // association and close the admin connection, and that ORDERLY
+        // close must never be markable as poison (the field's
+        // poisoned=8-with-zero-poison-logs). The latch (checked by the
+        // watchdog) is the belt for an EOF racing this abort.
+        self._admin_hold.abort();
         self.quiesce().await;
         // The lease releases only AFTER the ifqs are joined (quiesce),
         // so a successor arm re-registers a freed queue, not a live one.

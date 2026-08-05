@@ -3591,7 +3591,9 @@ pub struct Metrics {
     /// (honest backpressure, never a mid-stream stall);
     /// `zcrx_lane_poisoned` = session poison transitions (mid-flight
     /// NIC/queue/framing death → drained + kernel path) — a must-stay-0
-    /// tripwire on healthy fabrics; `zcrx_recv_parks` = RECV_ZC
+    /// tripwire on healthy fabrics; REAL transport poison only: orderly
+    /// teardown and starvation failovers are NOT poison (round 6 —
+    /// the shutdown teardown's association unwind counted 8 here once); `zcrx_recv_parks` = RECV_ZC
     /// multishots parked on refill exhaustion (ENOMEM/ENOBUFS — the
     /// provider pool ran dry; field finding E, 2026-08) and re-armed on
     /// refill progress — flow control made visible, NEVER a poison;

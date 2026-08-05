@@ -109,7 +109,9 @@ offered in-flight demand — 2026-08 field finding E),
 `LANE_READ_TIMEOUT/32`: pending fills failed over to the kernel path —
 fallback, not poison — and reads bypassed the lane until recovery; the
 round-5 blast-radius instrument),
-`zcrx_lane_poisoned` (session poison transitions — must-stay-0
+`zcrx_lane_poisoned` (session poison transitions — REAL transport
+poison only: orderly teardown and refill-starvation failovers are NOT
+poison, round 6 — must-stay-0
   tripwire; poison also drops `zcrx_lane_armed` and the lane stays
   kernel-path for the mount lifetime).
 * **R5**: Red blocks NEW lane arms (`arm_admission` in the ladder);

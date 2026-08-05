@@ -264,9 +264,21 @@ pub async fn arm_for_device(device_path: &str) -> Option<Arc<LaneSession>> {
     let probed = ethtool::EthtoolNic::open(&ifname).and_then(|mut nic| {
         let channels = steering::NicControl::combined_channels(&mut nic)?;
         let reserved = steering::steering_capacity_gate(&mut nic)?;
-        Ok((channels, reserved))
+        let rx_descs = nic.rx_ring_descriptors().unwrap_or_else(|e| {
+            // Degrade LOUD (once per NIC): an unprobed ring means the
+            // area cannot cover its standing demand — the park governor
+            // bounds the damage, but sizing flies blind.
+            if steering::nic_note_once("ring-probe", steering::NicControl::ifname(&nic)) {
+                log::warn!(
+                    "zcrx-lane: RX ring probe failed ({e}) — area sized without \
+                     ring headroom; expect refill parks"
+                );
+            }
+            0
+        });
+        Ok((channels, reserved, rx_descs))
     });
-    let (channels, reserved) = match probed {
+    let (channels, reserved, rx_ring_descs) = match probed {
         Ok(v) => v,
         Err(e) => {
             // Loud ONCE per NIC (ten fabric devices ride one NIC — the
@@ -334,12 +346,22 @@ pub async fn arm_for_device(device_path: &str) -> Option<Arc<LaneSession>> {
     };
     let mut target = target;
     target.io_queues = lease.queues().len() as u16;
+    // Round 6: the RX ring's standing pool demand rides the plan (the
+    // kernel adjudication: the provider pool is the queue's ONLY buffer
+    // source once restarted onto it, and the driver fills its ring from
+    // that pool for the queue's lifetime — the area must cover it).
+    let ring_fill_bytes = area_queue::ring_standing_bytes(
+        rx_ring_descs,
+        ethtool::nic_mtu(&ifname),
+        area::chunk_bytes_default(),
+    );
     let plan = initiator::ZcrxPlan {
         numa_node: ethtool::nic_numa_node(&ifname),
         ifname,
         ifindex,
         rx_queues: lease.queues().to_vec(),
         rxq_lease: Some(Arc::new(lease)),
+        ring_fill_bytes,
     };
     area::register_r5_component();
     match LaneSession::connect_with(target, LaneBackend::Zcrx(plan)).await {

@@ -23,36 +23,37 @@ use tokio::sync::mpsc;
 /// Admission accounting grain (bytes per semaphore permit).
 pub(crate) const ADMISSION_UNIT: usize = 4096;
 
-/// Admission permits for an area: HALF the area for admitted payload,
-/// half for delivery slack (short-recv fragmentation, headers riding
-/// payload chunks), divided by the FILL-GRAIN AMPLIFICATION `amp` —
-/// derived from the area geometry, floor one chunk.
+/// Admission permits over the FILL WINDOW (the slice of the area the
+/// provider pool can actually hand to fills — the area minus the NIC
+/// ring's standing demand): HALF for admitted payload, half for
+/// delivery slack (short-recv fragmentation, headers riding payload
+/// chunks) — derived from the geometry, floor one chunk.
 ///
-/// `amp` (field round 5, task 3): the kernel provider pool spends
-/// buffers at WIRE-SEGMENT grain, not payload grain — one chunk-sized
-/// netmem per TCP segment worst case — so admitted payload bytes
-/// consume up to `chunk / mss` pool bytes each. Round 4's area/2 clamp
-/// admitted 32 MiB against a 64 MiB pool that a 1500-MTU wire drains
-/// at ~2.8×: structural exhaustion at first serve. Admission must
-/// clamp to the SAME quantity the kernel pool enforces.
-pub(crate) fn admission_permits(area_len: usize, chunk: usize, amp: u32) -> usize {
-    ((area_len / 2 / amp.max(1) as usize).max(chunk) / ADMISSION_UNIT).max(1)
+/// Round 6 kernel adjudication (io_uring/zcrx.c @ v6.19.14): the
+/// round-5 wire-grain `amp` model is DELETED — falsified by the field
+/// (MTU 9000 ⇒ amp 1, still instant exhaustion) and by the source
+/// (`io_zcrx_copy_chunk` packs fallback niovs FULLY via io_copy_page —
+/// no per-segment page burn). The real structural consumer is the NIC
+/// RX ring itself (see [`ring_standing_bytes`]).
+pub(crate) fn admission_permits(fill_window_len: usize, chunk: usize) -> usize {
+    ((fill_window_len / 2).max(chunk) / ADMISSION_UNIT).max(1)
 }
 
-/// The worst-case pool-bytes-per-payload-byte grain factor: one chunk
-/// per wire segment, `mss = mtu − 52` (IPv4 20 + TCP 20 + timestamps
-/// 12; v6 fleets are ≤ one grain step conservative and the park
-/// governor bounds any residual). `None`/unknown MTU degrades to 1 —
-/// the un-amplified clamp (the sim venue's chunk-grain recv is
-/// genuinely 1:1).
-pub(crate) fn fill_grain_amplification(chunk_bytes: usize, mtu: Option<u32>) -> u32 {
-    let Some(mtu) = mtu else {
-        return 1;
-    };
-    // mss = mtu − 52 (IPv4 20 + TCP 20 + the standing timestamp option
-    // 12). A payload byte can pin up to ceil(chunk / mss) pool bytes.
-    let mss = mtu.saturating_sub(52).max(1) as usize;
-    chunk_bytes.div_ceil(mss).max(1) as u32
+/// The NIC RX descriptor ring's STANDING demand on the provider pool
+/// (round 6): when the queue restarts onto the zcrx memory provider,
+/// the driver fills its RX ring FROM THE POOL — `rx_descs` descriptors
+/// × ⌈mtu / chunk⌉ chunk-sized buffers each (worst-case legacy-RQ
+/// geometry; striding-RQ fleets over-provision, the safe direction) —
+/// and holds that many buffers for the queue's lifetime. The area must
+/// cover this ON TOP of the fill window, or the pool is dry before the
+/// first packet (the field shape: 8192 descs × ⌈9000/4096⌉=3 pages =
+/// 96 MiB standing vs a 64 MiB round-5 area — instant ENOMEM, and
+/// failover releases could never satisfy it). Unknown MTU degrades to
+/// one chunk per descriptor (the floor the ring cannot be below).
+pub(crate) fn ring_standing_bytes(rx_descs: u32, mtu: Option<u32>, chunk: usize) -> u64 {
+    // RED PHASE skeleton: derivation pinned by the tests below.
+    let _ = (rx_descs, mtu, chunk);
+    0
 }
 
 pub(crate) fn admission_units(len: usize) -> u32 {
@@ -83,16 +84,15 @@ pub(crate) struct AreaShared {
 }
 
 impl AreaShared {
-    pub(crate) fn new(depth: u16, area: &ZcrxArea, fill_grain_amp: u32) -> Arc<AreaShared> {
+    pub(crate) fn new(depth: u16, area: &ZcrxArea, fill_window_len: usize) -> Arc<AreaShared> {
         Arc::new(AreaShared {
             table: FillTable::new(),
             free_cids: Arc::new(std::sync::Mutex::new((0..depth).collect())),
             cid_gate: Arc::new(tokio::sync::Semaphore::new(depth as usize)),
             cid_capacity: depth as usize,
             admission: Arc::new(tokio::sync::Semaphore::new(admission_permits(
-                area.len(),
+                fill_window_len,
                 area.chunk_bytes(),
-                fill_grain_amp,
             ))),
             poisoned: AtomicBool::new(false),
             starved: AtomicBool::new(false),
@@ -173,8 +173,8 @@ pub(crate) fn spawn_area_queue(
     area: Arc<ZcrxArea>,
     session_poison: Arc<AtomicBool>,
 ) -> AreaQueue {
-    // Sim recv is chunk-grain 1:1 — no wire-segment amplification.
-    let shared = AreaShared::new(depth, &area, 1);
+    // Sim: no NIC ring exists — the whole area IS the fill window.
+    let shared = AreaShared::new(depth, &area, area.len());
     let (read_half, write_half) = stream.into_split();
     let (tx, rx) = mpsc::unbounded_channel();
 
@@ -280,35 +280,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn admission_derives_from_the_amplified_pool_demand() {
-        // Field round-5 arithmetic (task 3): 64 MiB area, 4 KiB chunks,
-        // 1500-MTU wire ⇒ amp 3 ⇒ admitted payload ≤ area/2/3 — the
-        // quantity the kernel pool actually enforces at wire grain.
-        let area = 64 << 20;
-        let base = admission_permits(area, 4096, 1);
+    fn admission_derives_from_the_fill_window() {
+        let window = 64 << 20;
         assert_eq!(
-            base,
-            (area / 2) / ADMISSION_UNIT,
-            "amp 1 = the shipped clamp"
+            admission_permits(window, 4096),
+            (window / 2) / ADMISSION_UNIT,
+            "half the FILL WINDOW (never the whole area) admits payload"
         );
-        assert_eq!(
-            admission_permits(area, 4096, 3),
-            (area / 2 / 3) / ADMISSION_UNIT,
-            "amp divides the admitted-payload half"
-        );
-        assert!(admission_permits(4096, 4096, 64) >= 1, "floor one unit");
+        assert!(admission_permits(4096, 4096) >= 1, "floor one unit");
     }
 
     #[test]
-    fn fill_grain_amplification_derives_from_the_wire_mtu() {
-        // 1500 MTU: mss 1448 ⇒ ceil(4096/1448) = 3 (the field's ~2.8×
-        // exhaustion factor, rounded to the safe side).
-        assert_eq!(fill_grain_amplification(4096, Some(1500)), 3);
-        // Jumbo 9000: mss 8948 ≥ chunk ⇒ 1 (no amplification).
-        assert_eq!(fill_grain_amplification(4096, Some(9000)), 1);
-        // Unknown MTU degrades to the un-amplified clamp.
-        assert_eq!(fill_grain_amplification(4096, None), 1);
-        // Sim-grain chunks smaller than a segment: 1.
-        assert_eq!(fill_grain_amplification(512, Some(1500)), 1);
+    fn ring_standing_bytes_covers_the_field_geometry() {
+        // Round 6 kernel adjudication: the RX ring holds pool buffers
+        // for the queue's LIFETIME (io_uring/zcrx.c: the provider pool
+        // is the ONLY buffer source once the queue restarts onto it).
+        // Field rail: 8192 descriptors, MTU 9000, 4 KiB chunks ⇒
+        // 8192 × 3 × 4096 = 96 MiB standing — the instant-exhaustion
+        // arithmetic against the 64 MiB round-5 area, and why failover
+        // releases could never refill the pool.
+        assert_eq!(
+            ring_standing_bytes(8192, Some(9000), 4096),
+            8192 * 3 * 4096,
+            "the field rail's standing demand"
+        );
+        assert_eq!(
+            ring_standing_bytes(8192, Some(1500), 4096),
+            8192 * 4096,
+            "1500-MTU: one chunk per descriptor"
+        );
+        assert_eq!(
+            ring_standing_bytes(1024, None, 4096),
+            1024 * 4096,
+            "unknown MTU degrades to one chunk per descriptor (the floor)"
+        );
+        assert_eq!(ring_standing_bytes(0, Some(9000), 4096), 0, "no probe => 0");
     }
 }

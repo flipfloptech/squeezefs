@@ -378,6 +378,11 @@ pub struct ZcrxPlan {
     /// on a shared NIC (the rxq arbiter's grant; qid N rides
     /// `rx_queues[N - 1]`).
     pub rx_queues: Vec<u32>,
+    /// The NIC RX ring's standing provider-pool demand in bytes
+    /// (round 6: `ring_standing_bytes` over the arm-time ring/MTU
+    /// probe) — added to every queue's area so the pool survives the
+    /// driver's ring fill. 0 on the sim backend (no NIC ring exists).
+    pub ring_fill_bytes: u64,
     /// The arbiter lease backing `rx_queues` (RAII: the queues return to
     /// the NIC's pool when the session — and thus its ifqs — goes away).
     /// `None` only in direct unit constructions.
@@ -634,18 +639,20 @@ impl LaneSession {
                         // ring + ifq registration ON the driver thread
                         // (SINGLE_ISSUER law) → steering after ALL connects →
                         // RECV_ZC arms on the go signal.
+                        // Round-6 sizing law: the registered area must
+                        // cover the NIC RX ring's STANDING pool demand
+                        // (the plan carries it — probed at arm) ON TOP
+                        // of the fill window; admission clamps to the
+                        // fill window only.
+                        let fill_window =
+                            super::area::area_bytes_per_queue(depth, target.max_xfer_bytes);
                         let area = super::area::ZcrxArea::new(
-                            super::area::area_bytes_per_queue(depth, target.max_xfer_bytes),
+                            fill_window + plan.ring_fill_bytes,
                             super::area::chunk_bytes_default(),
                             plan.numa_node,
                         )?;
-                        // Admission clamps to the WIRE-grain pool demand
-                        // (round 5 task 3): amp derives from THIS NIC's MTU.
-                        let amp = super::area_queue::fill_grain_amplification(
-                            super::area::chunk_bytes_default(),
-                            super::ethtool::nic_mtu(&plan.ifname),
-                        );
-                        let shared = super::area_queue::AreaShared::new(depth, &area, amp);
+                        let shared =
+                            super::area_queue::AreaShared::new(depth, &area, fill_window as usize);
                         let cmds = super::uring_zcrx::RingCmd::new().map_err(io_err)?;
                         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
                         let (go_tx, go_rx) = std::sync::mpsc::channel();
@@ -791,6 +798,13 @@ impl LaneSession {
 
     pub fn poisoned(&self) -> bool {
         self.poisoned.load(Ordering::SeqCst)
+    }
+
+    /// Whether the admin watchdog task has finished (round-6 gauge-
+    /// honesty instrument: teardown must RETIRE the watchdog before the
+    /// target's orderly association close can be misread as poison).
+    pub fn admin_watchdog_finished(&self) -> bool {
+        self._admin_hold.is_finished()
     }
 
     /// Round-5 blast-radius law: any queue in a refill-starvation

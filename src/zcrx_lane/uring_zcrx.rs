@@ -656,11 +656,32 @@ impl RecvGovernor {
         true
     }
 
+    /// Is a starvation episode open? (Accounting + failover window; the
+    /// degraded latch and poll mode key off it.)
+    pub(crate) fn episode_active(&self) -> bool {
+        self.episode.is_some()
+    }
+
+    /// The queue drained while starved (no pending fills, no queued
+    /// returns): unlatch the probe gate — one read may re-enter to test
+    /// recovery — WITHOUT ending the accounting episode (round 6:
+    /// ending it here recounted a park every 200 µs retry —
+    /// zcrx_recv_parks hit 2,860,473). `true` once per episode.
+    pub(crate) fn on_idle_drain(&mut self) -> bool {
+        // RED PHASE skeleton — mirrors the round-5 drive bug (the
+        // structural-reset arm ended the episode).
+        self.on_progress()
+    }
+
     /// Must the driver poll bounded instead of blocking in enter?
-    /// EVERY parked state polls (200 µs against the 235 µs fabric-RTT
-    /// class; a parked queue is idle by definition, so the poll costs
-    /// nothing anyone is waiting on).
-    pub(crate) fn poll_bounded(&self) -> bool {
+    /// A parked queue WITH pending work polls (200 µs against the
+    /// 235 µs fabric-RTT class — retries + the failover window need a
+    /// clock); an idle-starved queue blocks in enter — data arrival
+    /// CQEs wake it, and there is nothing to retry FOR.
+    pub(crate) fn poll_bounded(&self, pending_work: bool) -> bool {
+        // RED PHASE skeleton — round-5 semantics (polled in every
+        // parked state, spinning forever on idle-starved queues).
+        let _ = pending_work;
         self.episode.is_some()
     }
 
@@ -936,8 +957,9 @@ fn drive(
             arm_recv(&ring)?;
             to_submit += 1;
         }
-        if gov.poll_bounded() {
-            if cfg.shared.table.is_empty() && deferred_returns.slots.is_empty() {
+        let pending_work = !cfg.shared.table.is_empty() || !deferred_returns.slots.is_empty();
+        if gov.episode_active() {
+            if !pending_work {
                 // Structurally reset: nothing pending, every span
                 // returned — end the episode optimistically. A pool
                 // that is STILL dry re-latches on the next read at
@@ -990,7 +1012,7 @@ fn drive(
         // partial fills — matched NEITHER of round 4's wake gates and
         // blocked here forever). 200 µs against the 235 µs fabric-RTT
         // class; the parked queue is idle by definition.
-        if gov.poll_bounded() {
+        if gov.poll_bounded(pending_work) {
             ring.enter(std::mem::take(&mut to_submit), 0)?;
             std::thread::sleep(std::time::Duration::from_micros(200));
         } else {
@@ -1223,16 +1245,45 @@ mod tests {
     }
 
     #[test]
-    fn recv_governor_polls_bounded_for_every_parked_state() {
+    fn recv_governor_polls_bounded_only_with_pending_work() {
+        // Round 6 refinement: a starved queue WITH pending fills polls
+        // (retries + the failover clock); an IDLE starved queue blocks
+        // in enter — data CQEs wake it, and a 200 µs spin with nothing
+        // to retry for burns a core for the row.
         let mut gov = RecvGovernor::new();
-        assert!(!gov.poll_bounded(), "armed and healthy ⇒ block in enter");
+        assert!(!gov.poll_bounded(true), "healthy ⇒ block in enter");
         gov.on_park(std::time::Instant::now());
+        assert!(gov.poll_bounded(true), "starved + pending fills ⇒ poll");
         assert!(
-            gov.poll_bounded(),
-            "EVERY parked state polls bounded — not just the              unpostable-returns state (the field's stuck shape had none)"
+            !gov.poll_bounded(false),
+            "starved + idle ⇒ block (nothing to retry for)"
         );
         assert!(gov.on_progress(), "payload ends the episode");
-        assert!(!gov.poll_bounded(), "recovered ⇒ block in enter again");
+        assert!(!gov.poll_bounded(true), "recovered ⇒ block in enter");
+    }
+
+    #[test]
+    fn recv_governor_idle_drain_keeps_the_episode_open() {
+        // Round 6 field: zcrx_recv_parks = 2,860,473 — the structural
+        // reset ended the episode, so every 200 µs retry re-park
+        // recounted. The law: on_idle_drain unlatches the probe gate
+        // WITHOUT ending the accounting episode; ONLY payload progress
+        // ends one — parks count STARVATION EPISODES.
+        let mut gov = RecvGovernor::new();
+        let t0 = std::time::Instant::now();
+        assert!(gov.on_park(t0));
+        assert!(gov.on_idle_drain(), "first idle drain unlatches the probe");
+        assert!(!gov.on_idle_drain(), "idempotent within an episode");
+        assert!(
+            gov.episode_active(),
+            "the episode SURVIVES the idle drain (accounting + failover window stay anchored)"
+        );
+        assert!(
+            !gov.on_park(t0),
+            "a retry re-park after the idle drain is the SAME episode — never recounted"
+        );
+        assert!(gov.on_progress(), "payload ends the episode");
+        assert!(!gov.episode_active());
     }
 
     #[test]

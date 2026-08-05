@@ -20,6 +20,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 
 const SIOCETHTOOL: libc::c_ulong = 0x8946;
 
+const ETHTOOL_GRINGPARAM: u32 = 0x10;
 const ETHTOOL_GFLAGS: u32 = 0x25;
 const ETHTOOL_GCHANNELS: u32 = 0x3c;
 const ETHTOOL_GRXCLSRLCNT: u32 = 0x2e;
@@ -44,6 +45,21 @@ const ETH_FLAG_NTUPLE: u32 = 1 << 27;
 struct EthtoolValue {
     cmd: u32,
     data: u32,
+}
+
+/// `struct ethtool_ringparam` (<linux/ethtool.h>).
+#[repr(C)]
+#[derive(Default)]
+struct EthtoolRingparam {
+    cmd: u32,
+    rx_max_pending: u32,
+    rx_mini_max_pending: u32,
+    rx_jumbo_max_pending: u32,
+    tx_max_pending: u32,
+    rx_pending: u32,
+    rx_mini_pending: u32,
+    rx_jumbo_pending: u32,
+    tx_pending: u32,
 }
 
 #[repr(C)]
@@ -116,6 +132,7 @@ impl Default for EthtoolRxnfc {
 // (verified against a compiled C probe of <linux/ethtool.h>).
 const _: () = {
     assert!(std::mem::size_of::<EthtoolValue>() == 8);
+    assert!(std::mem::size_of::<EthtoolRingparam>() == 36);
     assert!(std::mem::size_of::<EthtoolChannels>() == 36);
     assert!(std::mem::size_of::<EthtoolRxFlowSpec>() == 168);
     assert!(std::mem::offset_of!(EthtoolRxFlowSpec, ring_cookie) == 152);
@@ -161,6 +178,19 @@ impl EthtoolNic {
             ifname: ifname.to_string(),
             sock,
         })
+    }
+
+    /// Current RX descriptor-ring depth (`ethtool -g` current RX) — the
+    /// ring-standing-demand input (round 6). Inherent (not NicControl):
+    /// only the arm ladder's sizing consumes it.
+    pub fn rx_ring_descriptors(&mut self) -> Result<u32, String> {
+        let mut rp = EthtoolRingparam {
+            cmd: ETHTOOL_GRINGPARAM,
+            ..Default::default()
+        };
+        self.ethtool_ioctl(&mut rp as *mut _ as *mut libc::c_void)
+            .map_err(|e| format!("GRINGPARAM: {e}"))?;
+        Ok(rp.rx_pending)
     }
 
     /// One SIOCETHTOOL round-trip with `data` as the command block.

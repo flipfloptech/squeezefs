@@ -2126,6 +2126,7 @@ fn test_registration_rxqs_come_from_the_arbiter_grant_disjoint_across_sessions()
         numa_node: None,
         rx_queues: lease.queues().to_vec(),
         rxq_lease: Some(lease),
+        ring_fill_bytes: 0,
     };
     let pa = plan(std::sync::Arc::new(a));
     let pb = plan(std::sync::Arc::new(b));
@@ -2381,4 +2382,34 @@ async fn test_f_poisoned_session_tears_down_promptly() {
         squeezefs::zcrx_lane::live_lane_sessions(),
         before
     );
+}
+
+// --------------------------------------------- round 6: gauge honesty (red)
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_teardown_is_not_poison() {
+    // Round 6 field: zcrx_lane_poisoned = 8 with ZERO poison log lines —
+    // the shutdown teardown quiesced the queues, the TARGET then closed
+    // the admin connection, and the admin watchdog marked that ORDERLY
+    // close as a session poison. The design doc says poisoned is a
+    // must-stay-0 tripwire: it must count REAL transport poison only,
+    // so teardown retires the admin watchdog BEFORE the association
+    // unwinds.
+    let mock = MockTarget::start(MockCfg::default(), 1 << 20).await;
+    let before = zcrx_metric("poisoned");
+    let sess = LaneSession::connect_with(mock.target(1, 4), LaneBackend::AreaSim)
+        .await
+        .expect("arm");
+    sess.teardown().await;
+    assert!(
+        sess.admin_watchdog_finished(),
+        "teardown must retire the admin watchdog — a post-teardown \
+         target close must be unreadable as poison"
+    );
+    assert_eq!(
+        zcrx_metric("poisoned"),
+        before,
+        "an orderly teardown is NOT a poison transition"
+    );
+    assert!(sess.torn_down());
 }

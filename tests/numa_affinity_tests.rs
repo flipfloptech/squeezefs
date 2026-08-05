@@ -120,24 +120,70 @@ fn two_socket_lookups_match_the_field() {
     assert_eq!(t.owner_nodes(8), vec![0, 1, 0, 1, 0, 1, 0, 1]);
 }
 
+/// The 530k-ceiling law (2026-08-05, `perf/il-530k-ceiling`): the pick is
+/// **balance-first, locality-tiebreak** — `(load, distance, index)`. The
+/// prior `(distance, load, index)` order let distance strictly dominate,
+/// so a process fleet whose HELLO-instant inference clustered on ONE node
+/// (fork placement — 32 fio processes at fleet launch) was CONFINED to
+/// that node's owner subset: 4 of 8 service-thread lanes on the 2×16
+/// field box, 4-5 live `ipc_direct_shards`, and the ~530k rand-4k il
+/// service ceiling (clat doubling per qd step) while the derived drain
+/// width sat half dark. Balance across the derived width is a structural
+/// property; locality remains the zero-cost tiebreak (arena placement
+/// follows the CHOSEN owner, so daemon-side passes stay node-local by
+/// construction either way).
 #[test]
-fn two_socket_owner_pick_is_locality_first_load_second() {
+fn two_socket_owner_pick_is_balance_first_locality_tiebreak() {
     let t = field_two_socket();
     let owner_nodes = t.owner_nodes(8); // [0,1,0,1,0,1,0,1]
-                                        // Session on node1: only odd owner indices are distance-minimal;
-                                        // among them load breaks ties, then index.
-    let loads = [0, 5, 0, 4, 0, 4, 0, 6];
-    assert_eq!(
-        numa_core::pick_owner(&t, 1, &owner_nodes, &loads),
-        3,
-        "node1 session must pick the lightest node1 owner (idx 3, load 4)"
-    );
-    // Session on node0 ignores the loaded node1 owners entirely.
+
+    // Balance first: a node0 session must take an IDLE node1 owner over
+    // any loaded node0 owner (the confinement shape, inverted).
     let loads = [9, 0, 8, 0, 7, 0, 9, 0];
     assert_eq!(
         numa_core::pick_owner(&t, 0, &owner_nodes, &loads),
-        4,
-        "node0 session picks lightest node0 owner even when node1 idles"
+        1,
+        "node0 session must take the idle node1 owner — width beats locality"
+    );
+
+    // Locality tiebreak: at equal load the nearest owner still wins.
+    let loads = [0; 8];
+    assert_eq!(
+        numa_core::pick_owner(&t, 1, &owner_nodes, &loads),
+        1,
+        "all-idle: the nearest (node1) owner wins the tie"
+    );
+    // Among equal-load equal-distance candidates, lowest index (dense fill).
+    let loads = [1, 0, 1, 0, 1, 0, 1, 0];
+    assert_eq!(
+        numa_core::pick_owner(&t, 0, &owner_nodes, &loads),
+        1,
+        "equal-load node1 candidates resolve to the lowest index"
+    );
+}
+
+/// The field-fleet engagement contract: sequential same-node admissions
+/// (every session's inference says node 0 — the fork-clustered fleet
+/// launch) must engage EVERY owner of the derived width, nearest-first
+/// within each load level. Under the retired locality-first order this
+/// fill never leaves {0,2,4,6} — the 4-of-8 `ipc_direct_shards` field
+/// signature.
+#[test]
+fn two_socket_same_node_fleet_fill_engages_every_owner() {
+    let t = field_two_socket();
+    let owner_nodes = t.owner_nodes(8); // [0,1,0,1,0,1,0,1]
+    let mut loads = vec![0usize; 8];
+    let mut picks = Vec::new();
+    for _ in 0..8 {
+        let o = numa_core::pick_owner(&t, 0, &owner_nodes, &loads);
+        loads[o] += 1;
+        picks.push(o);
+    }
+    assert_eq!(
+        picks,
+        vec![0, 2, 4, 6, 1, 3, 5, 7],
+        "same-node fleet fill: local owners first at load 0, then the far \
+         node's owners — all 8 engaged, never confined to one node's subset"
     );
 }
 

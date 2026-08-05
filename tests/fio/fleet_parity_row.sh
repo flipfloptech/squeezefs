@@ -99,9 +99,11 @@ key = "read" if rw == "read" else "write"
 r = [j[key] for j in fio["jobs"]]
 user = sum(x["io_bytes"] for x in r)
 # Durable law: fio bw_bytes excludes the end_fsync stall. The honest
-# durable rate is user bytes / max job elapsed (submit -> fsync done).
-wall_ms = max((j.get("job_runtime") or j.get("elapsed", 0) * 1000) for j in fio["jobs"])
-bw = user / (wall_ms / 1000) / 1e9 if wall_ms else 0.0
+# durable rate is user bytes / WALL elapsed. NOT job_runtime: under
+# group_reporting fio SUMS job_runtime across all jobs (256x the wall,
+# the 0.12 GB/s fiction of run 9); "elapsed" is per-group wall seconds.
+wall_s = max(j.get("elapsed", 0) for j in fio["jobs"])
+bw = user / wall_s / 1e9 if wall_s else 0.0
 def m(f):
     d = json.load(open(f)); return d.get("metrics", d)
 b, a = m(f"{p}.before.json"), m(f"{p}.after.json")

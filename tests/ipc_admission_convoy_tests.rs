@@ -23,8 +23,9 @@
 //!    without a remount; the client-side connect share is the backlog's).
 
 use squeezefs::fuse_client::METRICS;
-use squeezefs::ipc_host::{ctl_listen_backlog, DataOp, IpcHost, IpcHostConfig, SessionSink,
-                          SlotCompletion};
+use squeezefs::ipc_host::{
+    ctl_listen_backlog, DataOp, IpcHost, IpcHostConfig, SessionSink, SlotCompletion,
+};
 use squeezefs_il::session::Session;
 use squeezefs_ipc::layout::Geometry;
 use squeezefs_ipc::wire::BootstrapBlob;

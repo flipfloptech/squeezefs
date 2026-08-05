@@ -1262,19 +1262,19 @@ impl IpcHost {
             .validate()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
         // Layout computes now so admission can charge the exact footprint.
-        SessionLayout::compute(&cfg.geometry)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-        // VAL-5d arithmetic FIRST: the listen backlog derives from the
-        // ctl connection cap (durable-write decomposition 2026-08-05 —
-        // the hardcoded 64 convoyed a 256-process fleet's simultaneous
-        // connect burst through 64-slot accept windows; connect(2) on a
-        // full SEQPACKET backlog BLOCKS, so the constant was a launch
-        // serialization stage, not a safety bound).
-        let pre_session_footprint = SessionLayout::compute(&cfg.geometry)
-            .expect("geometry validated above")
+        // VAL-5d: the connection bound rides the SAME session-footprint
+        // arithmetic admission uses.
+        let session_footprint = SessionLayout::compute(&cfg.geometry)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?
             .total_bytes;
-        let backlog =
-            ctl_listen_backlog(ctl_conn_cap_from(cfg.arena_cap_bytes, pre_session_footprint));
+        let ctl_cap = ctl_conn_cap_from(cfg.arena_cap_bytes, session_footprint);
+        // The listen backlog derives from that cap (durable-write
+        // decomposition 2026-08-05 — the hardcoded 64 convoyed a
+        // 256-process fleet's simultaneous connect burst through 64-slot
+        // accept windows; connect(2) on a full SEQPACKET backlog BLOCKS,
+        // so the constant was a launch serialization stage, not a safety
+        // bound).
+        let backlog = ctl_listen_backlog(ctl_cap);
         let listener_fd = abstract_listen(&cfg.socket_name, backlog)?;
         // OQ-6: the optional path rendezvous. Failure is loud but never
         // fatal — the mount (and same-netns interception) must not be
@@ -1299,12 +1299,6 @@ impl IpcHost {
         let service_threads = service_thread_count();
         let cfg_max_op_bytes = cfg.geometry.max_op_bytes;
         let cfg_arena_cap_bytes = cfg.arena_cap_bytes;
-        // VAL-5d: the connection bound rides the SAME session-footprint
-        // arithmetic admission uses.
-        let session_footprint = SessionLayout::compute(&cfg.geometry)
-            .expect("geometry validated above")
-            .total_bytes;
-        let ctl_cap = ctl_conn_cap_from(cfg_arena_cap_bytes, session_footprint);
         // VAL-5e: the fair per-pass quantum = one honest in-flight window.
         let cfg_slots = cfg.geometry.slots.max(1);
         let host = Arc::new(Self {

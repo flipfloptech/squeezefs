@@ -101,7 +101,16 @@ field rows, now the chain's remaining link).
 * **New gauges (§9 extension)**: `zcrx_area_bytes` (R5 `zcrx_area`
   component source), `zcrx_gather_bytes` (the priced completion pass),
   `zcrx_area_admission_waits` (honest backpressure),
-  `zcrx_gather_bytes` closure note (round 7): gather ≡ fill holds
+  No-harm posture (round 8): admission over-demand DECLINES to the
+kernel path immediately (`zcrx_area_admission_waits` counts declines,
+one per declined READ), and admission is WHOLE-READ ATOMIC — a read's
+segments admit in one try-acquire per queue, so a partial hold can
+never shred the window (per-segment admission let racing multi-segment
+reads each hold one segment while the sibling declined: the window
+admitted fewer whole reads than its arithmetic capacity, worst case
+zero); at any decline instant a full window's worth of whole reads is
+admitted and completing.
+`zcrx_gather_bytes` closure note (round 7): gather ≡ fill holds
 UNCONDITIONALLY — gather is counted at the whole-read success boundary,
 so a torn multi-segment read (poison/op-error mid-read) contributes to
 neither counter and a poisoned row still closes byte-exact.

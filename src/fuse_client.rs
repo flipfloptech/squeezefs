@@ -3587,8 +3587,10 @@ pub struct Metrics {
     /// `zcrx_gather_bytes` prices the ONE completion gather pass from area
     /// chunks into the pooled fill (≈ `zcrx_fill_bytes` in Z2; the Z3
     /// serve fusion collapses it into `read_copy_dest_bytes`);
-    /// `zcrx_area_admission_waits` = commands parked on area headroom
-    /// (honest backpressure, never a mid-stream stall);
+    /// `zcrx_area_admission_waits` = reads DECLINED to the kernel path
+    /// on area headroom (round 8: declines are free — the parked form
+    /// fed starvation churn; a decline is the lane shedding load
+    /// honestly, never a mid-stream stall);
     /// `zcrx_lane_poisoned` = session poison transitions (mid-flight
     /// NIC/queue/framing death → drained + kernel path) — a must-stay-0
     /// tripwire on healthy fabrics; REAL transport poison only: orderly

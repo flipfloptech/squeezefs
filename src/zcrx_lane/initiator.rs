@@ -450,6 +450,19 @@ impl LaneSession {
         (free, total)
     }
 
+    /// Available admission units summed over the session's area queues —
+    /// the round-8 decline-law instrument (0 = the window is fully
+    /// admitted and the next read DECLINES to the kernel path).
+    pub fn admission_units_available(&self) -> usize {
+        self.queues
+            .iter()
+            .map(|q| match q {
+                QueueHandle::Area(q) => q.shared.admission.available_permits(),
+                QueueHandle::Classic(_) => 0,
+            })
+            .sum()
+    }
+
     /// Area-chunk diagnostics `(free, total)` summed over the session's
     /// area queues — the refill-discipline instrument; (0, 0) on classic
     /// backends (no area exists).
@@ -1031,15 +1044,47 @@ impl LaneSession {
             )));
         }
         let cap = (self.target.max_xfer_bytes as usize).max(1 << self.target.lba_shift);
-        let mut futs = Vec::with_capacity(len.div_ceil(cap));
+        // Segment plan FIRST — queue assignment (the rotor) happens at
+        // plan time because admission is WHOLE-READ atomic (round 8,
+        // finding I): every area segment's units are taken in ONE
+        // try-acquire per queue before any capsule is issued. The
+        // per-segment grain it replaces let racing multi-segment reads
+        // shred the window with PARTIAL holds — each read holding one
+        // segment's units while its sibling declined — so under
+        // over-demand the window admitted FEWER whole reads than it can
+        // genuinely hold (worst case zero). Atomic per-read admission
+        // restores the arithmetic: a decline can only be witnessed
+        // while a full window's worth of whole reads is admitted.
+        let mut segs: Vec<(u64, SendMutPtr, usize, usize)> = Vec::with_capacity(len.div_ceil(cap));
         let mut done = 0usize;
         while done < len {
             let seg = cap.min(len - done);
             let seg_off = byte_offset + done as u64;
             let seg_dest = SendMutPtr(unsafe { dest.0.add(done) });
-            futs.push(self.read_segment(seg_off, seg_dest, seg, keepalive.clone()));
+            let qi = self.next_q.fetch_add(1, Ordering::Relaxed) % self.queues.len();
+            segs.push((seg_off, seg_dest, seg, qi));
             done += seg;
         }
+        let mut admissions = self.admit_whole_read(&segs)?;
+        let mut futs = Vec::with_capacity(segs.len());
+        for (seg_off, seg_dest, seg, qi) in segs {
+            let admission = match &self.queues[qi] {
+                QueueHandle::Area(_) => Some(
+                    admissions
+                        .get_mut(&qi)
+                        .and_then(|p| p.split(super::area_queue::admission_units(seg) as usize))
+                        .ok_or_else(|| {
+                            io_err("lane admission split under-provisioned (invariant)".into())
+                        })?,
+                ),
+                QueueHandle::Classic(_) => None,
+            };
+            futs.push(self.read_segment(seg_off, seg_dest, seg, qi, admission, keepalive.clone()));
+        }
+        // The per-queue parents are fully split (0 permits left) —
+        // dropping them here releases nothing; the segments' splits are
+        // what ride the fills.
+        drop(admissions);
         for r in futures::future::join_all(futs).await {
             r?;
         }
@@ -1078,15 +1123,71 @@ impl LaneSession {
         Ok(())
     }
 
+    /// Whole-read atomic admission (design §4.3, round 8 finding I):
+    /// bounded in-flight fills, and over-demand DECLINES to the kernel
+    /// path immediately — declines are free; the old park-until-permits
+    /// was the starvation churn (field: 648 waits vs 206 fills feeding
+    /// 41 × 937 ms episodes of held reads). The read's TOTAL units are
+    /// taken in ONE `try_acquire` per queue — never per segment: a
+    /// partial hold denies window to a read that could complete while
+    /// the holder itself goes on to decline (mutual window shredding —
+    /// under over-demand the observed admitted-read count fell BELOW
+    /// the window's genuine capacity, worst case zero). On any queue's
+    /// refusal every already-held permit drops (all-or-nothing across
+    /// queues; `try_acquire` never waits, so no deadlock) and the read
+    /// declines, counted ONCE per read in `zcrx_area_admission_waits`.
+    /// The OWNED permits are split per segment and ride the entries →
+    /// the fills (MEM-3): admission accounting stays exact under
+    /// cancellation — released when the fill drops, never early.
+    fn admit_whole_read(
+        &self,
+        segs: &[(u64, SendMutPtr, usize, usize)],
+    ) -> Result<std::collections::HashMap<usize, tokio::sync::OwnedSemaphorePermit>> {
+        use super::area_queue::admission_units;
+        let mut totals: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
+        for &(_, _, seg, qi) in segs {
+            if matches!(&self.queues[qi], QueueHandle::Area(_)) {
+                *totals.entry(qi).or_insert(0) += admission_units(seg);
+            }
+        }
+        let mut held = std::collections::HashMap::with_capacity(totals.len());
+        for (qi, units) in totals {
+            let QueueHandle::Area(q) = &self.queues[qi] else {
+                continue;
+            };
+            match Arc::clone(&q.shared.admission).try_acquire_many_owned(units) {
+                Ok(p) => {
+                    held.insert(qi, p);
+                }
+                Err(tokio::sync::TryAcquireError::NoPermits) => {
+                    // `held` drops here — every already-admitted queue's
+                    // units release immediately (nothing rode a fill yet).
+                    crate::fuse_client::METRICS
+                        .zcrx_area_admission_waits
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(SqueezefsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "lane admission window full — declined to the kernel path",
+                    )));
+                }
+                Err(tokio::sync::TryAcquireError::Closed) => {
+                    return Err(io_err("lane queue closed".into()));
+                }
+            }
+        }
+        Ok(held)
+    }
+
     async fn read_segment(
         &self,
         byte_offset: u64,
         dest: SendMutPtr,
         len: usize,
+        qi: usize,
+        admission: Option<tokio::sync::OwnedSemaphorePermit>,
         keepalive: Option<bytes::Bytes>,
     ) -> Result<()> {
-        let q = &self.queues[self.next_q.fetch_add(1, Ordering::Relaxed) % self.queues.len()];
-        match q {
+        match &self.queues[qi] {
             QueueHandle::Classic(q) => {
                 self.read_segment_classic(q, byte_offset, dest, len, keepalive)
                     .await
@@ -1094,7 +1195,13 @@ impl LaneSession {
             // Area backends never hand `dest` to a driver task — the
             // requester gathers at completion — so the entry needs no
             // destination keep-alive.
-            QueueHandle::Area(q) => self.read_segment_area(q, byte_offset, dest, len).await,
+            QueueHandle::Area(q) => {
+                let admission = admission.ok_or_else(|| {
+                    io_err("area segment issued without whole-read admission (invariant)".into())
+                })?;
+                self.read_segment_area(q, byte_offset, dest, len, admission)
+                    .await
+            }
         }
     }
 
@@ -1109,34 +1216,20 @@ impl LaneSession {
         byte_offset: u64,
         dest: SendMutPtr,
         len: usize,
+        admission: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<()> {
-        use super::area_queue::admission_units;
         let shared = &q.shared;
         if shared.poisoned.load(Ordering::SeqCst) {
             return Err(io_err("lane queue poisoned".into()));
         }
-        // Admission backpressure (design §4.3): bounded in-flight fills,
-        // never a mid-stream stall. Parking is counted honest. The
-        // OWNED permit rides the entry → the fill (MEM-3): admission
-        // accounting stays exact under cancellation — released when the
-        // fill drops (after the requester's gather, or inside the dead
-        // completion channel on a dropped future), never early.
-        let units = admission_units(len);
-        let admission = match Arc::clone(&shared.admission).try_acquire_many_owned(units) {
-            Ok(p) => p,
-            Err(tokio::sync::TryAcquireError::NoPermits) => {
-                crate::fuse_client::METRICS
-                    .zcrx_area_admission_waits
-                    .fetch_add(1, Ordering::Relaxed);
-                Arc::clone(&shared.admission)
-                    .acquire_many_owned(units)
-                    .await
-                    .map_err(|_| io_err("lane queue closed".into()))?
-            }
-            Err(tokio::sync::TryAcquireError::Closed) => {
-                return Err(io_err("lane queue closed".into()));
-            }
-        };
+        // Admission was taken WHOLE-READ atomic by the caller
+        // ([`Self::admit_whole_read`], round 8 finding I); this
+        // segment's split of the OWNED permit rides the entry → the
+        // fill (MEM-3): admission accounting stays exact under
+        // cancellation — released when the fill drops (after the
+        // requester's gather, or inside the dead completion channel on
+        // a dropped future), never early.
+        //
         // CID + depth-permit custody lives in the pending entry (MEM-3):
         // it returns when the driver destroys the entry — completion,
         // send-failure cancel, or poison drain — never on this

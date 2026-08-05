@@ -1163,16 +1163,20 @@ async fn test_z2_area_sim_funnel_engagement_and_gather_closure() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_z2_area_exhaustion_backpressures_admission_never_deadlocks() {
-    // Design §4.3/§5: area exhaustion applies backpressure at COMMAND
-    // admission — bounded in-flight fills — never a mid-stream stall.
-    // 16 × 512 KiB concurrent reads (each split into two 256 KiB
-    // sub-commands) against a 4 MiB single-queue area
-    // must all complete, with the parking visible in the gauge.
+    // Design §4.3/§5 as amended by ROUND 8: area exhaustion bounds
+    // in-flight fills at COMMAND admission — and over-demand DECLINES
+    // to the kernel path immediately (the round-5 park-until-permits
+    // law this test used to pin was the field's starvation churn: 648
+    // waits / 206 fills feeding 41 × 937 ms episodes of held reads).
+    // The invariants: every read either completes byte-correct or
+    // declines loud-and-fast; at least the window's worth completes;
+    // declines are visible in the gauge; nothing deadlocks; the
+    // quiesced area fully recycles.
     let mock = MockTarget::start(MockCfg::default(), 8 << 20).await;
     let sess = LaneSession::connect_with(mock.target(1, 16), LaneBackend::AreaSim)
         .await
         .expect("area-sim arm");
-    let before_waits = zcrx_metric("admission_waits");
+    let before_declines = zcrx_metric("admission_waits");
     let mut handles = Vec::new();
     for i in 0..16u64 {
         let sess = Arc::clone(&sess);
@@ -1180,18 +1184,59 @@ async fn test_z2_area_exhaustion_backpressures_admission_never_deadlocks() {
         handles.push(tokio::spawn(async move {
             let off = i * 512 * 1024;
             let mut buf = vec![0u8; 512 * 1024];
-            sess.read_into_slice(off, &mut buf).await.expect("read");
-            assert_eq!(&buf[..], &dev[off as usize..off as usize + 512 * 1024]);
+            match sess.read_into_slice(off, &mut buf).await {
+                Ok(()) => {
+                    assert_eq!(
+                        &buf[..],
+                        &dev[off as usize..off as usize + 512 * 1024],
+                        "an ADMITTED read must complete byte-correct"
+                    );
+                    true
+                }
+                Err(e) => {
+                    assert!(
+                        format!("{e}").contains("declined"),
+                        "an unadmitted read must DECLINE (never park, never \
+                         a foreign error): {e}"
+                    );
+                    false
+                }
+            }
         }));
     }
+    let mut completed = 0usize;
     for h in handles {
-        h.await
-            .expect("no wedged/panicked read under area pressure");
+        if h.await
+            .expect("no wedged/panicked read under area pressure")
+        {
+            completed += 1;
+        }
     }
+    // Floor derivation (whole-read ATOMIC admission, finding I): area =
+    // depth 16 × 256 KiB max_xfer = 4 MiB (PMD-exact); the sim fill
+    // window is the whole area, so `admission_permits` = 4 MiB / 2 =
+    // 2 MiB = 512 × 4 KiB units. One 512 KiB read = two 256 KiB
+    // segments = 128 units, taken in ONE try-acquire (single queue).
+    // Every holder therefore holds exactly 128 units, so a decline
+    // (available < 128 ⇒ held > 384) can only be witnessed while
+    // 512 / 128 = FOUR whole reads hold the window simultaneously — and
+    // every admitted read completes byte-correct on this healthy mock.
+    // Either nothing declines (all 16 complete) or ≥ 4 complete: the
+    // floor is the geometry's arithmetic, deterministic, never a tuned
+    // constant. (Per-SEGMENT admission broke exactly this: racing reads
+    // held one segment while the sibling declined, and the observed
+    // floor collapsed to 2–3 of 16.)
     assert!(
-        zcrx_metric("admission_waits") > before_waits,
-        "16 × 512 KiB in flight against a 2 MiB area must park admissions"
+        completed >= 4,
+        "at least the admission window's worth of reads completes \
+         (window 512 units / 128 units per read = 4; got {completed})"
     );
+    if completed < 16 {
+        assert!(
+            zcrx_metric("admission_waits") > before_declines,
+            "declines are visible in the gauge"
+        );
+    }
     sess.quiesce().await;
     let (free, total) = sess.area_chunks();
     assert_eq!(free, total, "quiesced area fully recycled");
@@ -2572,6 +2617,22 @@ async fn test_admission_overflow_declines_fast_never_parks() {
             sess.read_into_slice(i * 256 * 1024, &mut buf).await
         }));
     }
+    // Deterministic edge: the fifth read may only be issued once the
+    // four spawned reads provably HOLD the whole admission window —
+    // observed on the lane's own diagnostic (the mock's gate parks its
+    // serve loop, so wire-side counting cannot see reads 2..4).
+    // Bounded settle, no sleep-sync semantics.
+    for _ in 0..500 {
+        if sess.admission_units_available() == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        sess.admission_units_available(),
+        0,
+        "the four admitted reads must hold the whole window before the probe"
+    );
     // The four admitted reads are parked at the MOCK's gate (in flight,
     // permits held). The fifth must return WouldBlock promptly — 2 s is
     // the generous ceiling that distinguishes an immediate decline from

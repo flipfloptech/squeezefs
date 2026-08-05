@@ -1285,6 +1285,15 @@ impl NvmeBlockDev {
                     };
                     Some(Ok(b))
                 }
+                Err(crate::error::SqueezefsError::Io(e))
+                    if e.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    // Round-8 admission decline: the lane is FULL, not
+                    // broken — the kernel path serves (ineligibility
+                    // class: uncounted as fallback, counted in
+                    // zcrx_area_admission_waits at the decline site).
+                    None
+                }
                 Err(e) => {
                     // Partial gathers are harmless: the kernel-path retry
                     // overwrites the whole destination (idempotent reads).
@@ -1315,6 +1324,12 @@ impl NvmeBlockDev {
                 m.zcrx_fill_bytes
                     .fetch_add(size as u64, std::sync::atomic::Ordering::Relaxed);
                 Some(Ok(bytes.slice(0..size)))
+            }
+            Err(crate::error::SqueezefsError::Io(e))
+                if e.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                // Round-8 admission decline (see the dest arm above).
+                None
             }
             Err(e) => {
                 // Dropping `bytes` recycles the pooled buffer; the lane's

@@ -36,9 +36,7 @@ pub(crate) const ADMISSION_UNIT: usize = 4096;
 /// at ~2.8×: structural exhaustion at first serve. Admission must
 /// clamp to the SAME quantity the kernel pool enforces.
 pub(crate) fn admission_permits(area_len: usize, chunk: usize, amp: u32) -> usize {
-    // RED PHASE: the divisor law is pinned below; skeleton ignores amp.
-    let _ = amp;
-    ((area_len / 2).max(chunk) / ADMISSION_UNIT).max(1)
+    ((area_len / 2 / amp.max(1) as usize).max(chunk) / ADMISSION_UNIT).max(1)
 }
 
 /// The worst-case pool-bytes-per-payload-byte grain factor: one chunk
@@ -48,9 +46,13 @@ pub(crate) fn admission_permits(area_len: usize, chunk: usize, amp: u32) -> usiz
 /// the un-amplified clamp (the sim venue's chunk-grain recv is
 /// genuinely 1:1).
 pub(crate) fn fill_grain_amplification(chunk_bytes: usize, mtu: Option<u32>) -> u32 {
-    // RED PHASE skeleton: derivation pinned below.
-    let _ = (chunk_bytes, mtu);
-    1
+    let Some(mtu) = mtu else {
+        return 1;
+    };
+    // mss = mtu − 52 (IPv4 20 + TCP 20 + the standing timestamp option
+    // 12). A payload byte can pin up to ceil(chunk / mss) pool bytes.
+    let mss = mtu.saturating_sub(52).max(1) as usize;
+    chunk_bytes.div_ceil(mss).max(1) as u32
 }
 
 pub(crate) fn admission_units(len: usize) -> u32 {

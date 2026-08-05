@@ -1991,7 +1991,9 @@ pub enum BlockLockSite {
     FlushExit = 3,
     /// `punch_hole_range` whole-block drop arm.
     Punch = 4,
-    /// `drop_active_block_overlays_beyond` (truncate prune).
+    /// `drop_active_block_overlays_beyond` (truncate prune) +
+    /// `drop_parked_overlays_for_inos` (inode-reclaim prune — the
+    /// 2026-08-05 parked-leak fix).
     OverlayPrune = 5,
     /// The READ path's deferred-seed materialize (single-block read hitting
     /// an item-B deferred buffer) — a reader convoying with writers is
@@ -13914,6 +13916,26 @@ impl SqueezefsFilesystem {
             return;
         }
 
+        // RAM-parked overlay teardown FIRST (the 2026-08-05 field leak:
+        // 230 GiB of `parked_full_buffer_bytes` flat at idle, every entry
+        // keyed by a dead ino). `delete_file` below removes the STAGED
+        // overlay families and frees the mapped blocks, but the FUSE-layer
+        // `active_block_buffers` map — whose `ActiveBlockBuf` values
+        // RAII-charge the parked byte gauges — was never touched at
+        // reclaim: a block parked at rm time (partial coverage, or a
+        // close-time background flush that lost the race) was orphaned
+        // forever, unreachable by the R5 Red drain (its flush errors
+        // NotFound on the destroyed meta and the no-progress exit fires).
+        // Discarding here is the FIND-M11-A verified-orphan-discard law
+        // applied to RAM custody — the admitted set is `nlink == 0`,
+        // FORGET'd, not open, single-drive-claimed — never a loss of live
+        // acked data. Ordering is load-bearing: retiring the overlays
+        // BEFORE `delete_file`'s block-map walk closes the pipeline
+        // publish source (a detached upload revalidating under the block
+        // lock finds its entry retired and frees its orphan block) so the
+        // walk cannot miss a mapping published behind it.
+        self.drop_parked_overlays_for_inos(&admitted).await;
+
         // Data-path teardown per ino, before admission — log-and-proceed.
         for &ino in &admitted {
             let file_path = crate::keys::inode_path(ino);
@@ -13926,6 +13948,47 @@ impl SqueezefsFilesystem {
         }
 
         self.destroy_batch_bisect(backend, &admitted).await;
+    }
+
+    /// Retire EVERY RAM-parked overlay owned by the reclaim batch's inos —
+    /// the reclaim-time twin of `delete_file`'s staged-family sweep
+    /// (`reclaim_orphaned_batch` is the only caller; admission has already
+    /// verified `nlink == 0` + not-open + claimed, so the custody's file
+    /// is being destroyed and the discard is the FIND-M11-A reclaimed-ino
+    /// orphan-discard, not data loss).
+    ///
+    /// One map pass for the whole batch (the map is bounded by the parked
+    /// byte budget in the healthy state; in the leak state it IS the
+    /// backlog being fixed). Each retire runs under that block's
+    /// `BLOCK_FLUSH_LOCKS` guard (lock order 3, no inode guard needed:
+    /// no open handles exist, so no writer can re-park, and every other
+    /// custody mover — pipeline upload, flush exit, spill victim —
+    /// revalidates its entry under this same lock and treats a retired
+    /// entry as "another owner won", the established truncate-prune
+    /// posture). RES-1 holds: nothing here frees blocks or takes
+    /// `INODE_META_LOCKS`.
+    async fn drop_parked_overlays_for_inos(&self, inos: &[u64]) {
+        // O(1) gate: the common reclaim (no overlays anywhere) pays one
+        // atomic load, never a map scan.
+        if self
+            .parked_overlay_count
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 0
+        {
+            return;
+        }
+        let mut victims: Vec<(u64, u32, String)> = Vec::new();
+        for r in self.active_block_buffers.iter() {
+            if let Some((i, b)) = Self::parse_active_block_key(r.key()) {
+                if inos.contains(&i) {
+                    victims.push((i, b, r.key().clone()));
+                }
+            }
+        }
+        for (ino, b, key) in victims {
+            let _block_guard = block_lock_acquire(ino, b, BlockLockSite::OverlayPrune).await;
+            self.retire_parked_overlay(&key);
+        }
     }
 
     /// Destroy `inos` as one batch; on commit failure bisect and retry the

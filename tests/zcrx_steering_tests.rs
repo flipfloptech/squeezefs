@@ -505,20 +505,22 @@ fn test_zero_advertised_table_arms_via_kernel_assigned_ids_and_restores() {
 
 #[test]
 fn test_zero_advertised_insert_failure_rolls_back_exactly() {
-    // FINDING 1, the loud-refusal half: on the kernel-assigned class the
-    // capacity verdict is the INSERT's — an EOPNOTSUPP/ENOSPC-class
-    // refusal fails the arm loud and rolls back byte-identically.
+    // FINDING 1, the loud-refusal half — refined by round-3's ladder: a
+    // SINGLE @ANY refusal now legitimately falls back to explicit
+    // self-selection (finding A), so the arm-failing face is the
+    // kernel refusing EVERY insert (true ENOSPC/EOPNOTSUPP): the arm
+    // fails loud and rolls back byte-identically.
     let mut nic = MockNic::new("sm-lie-b", 32, 128);
     nic.advertise_zero_table = true;
-    nic.fail_at = FailAt::Insert(1);
+    nic.refuse_inserts = true;
     let prior = nic.snapshot();
     let flows = vec![flow(50001, 31), flow(50002, 30)];
-    let err = arm_steering(&mut nic, &flows).expect_err("kernel-refused insert fails the arm");
+    let err = arm_steering(&mut nic, &flows).expect_err("kernel-refused inserts fail the arm");
     assert!(!err.is_empty());
     assert_eq!(
         nic.snapshot(),
         prior,
-        "kernel-refused insert rolls back to byte-identical"
+        "kernel-refused inserts roll back to byte-identical"
     );
 }
 

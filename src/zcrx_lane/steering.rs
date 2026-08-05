@@ -408,33 +408,120 @@ pub fn arm_flow_rules(
             }
             picks
         }
-        RuleSlots::KernelAssigned => vec![RX_CLS_LOC_ANY; flows.len()],
+        RuleSlots::KernelAssigned => Vec::new(), // per-insert ladder below
     };
 
+    // Rollback of THIS call's inserts only (guard stays armed — the
+    // finding-3 unwind law: RSS re-inclusion waits for ifq teardown).
+    fn roll_back(nic: &mut dyn NicControl, installed: &mut Vec<u32>, step: String) -> String {
+        let mut errs = Vec::new();
+        for loc in installed.drain(..) {
+            if let Err(de) = nic.delete_ntuple(loc) {
+                errs.push(format!("rollback delete @{loc}: {de}"));
+            }
+        }
+        if errs.is_empty() {
+            format!(
+                "{step} (this arm's flow rules rolled back — RSS exclusion held \
+                 until the caller's ifq teardown)"
+            )
+        } else {
+            format!("{step}; ROLLBACK ALSO FAILED: {}", errs.join("; "))
+        }
+    }
+
     let mut installed: Vec<u32> = Vec::new();
-    for (flow, req) in flows.iter().zip(&requests) {
-        match nic.insert_ntuple(*req, flow) {
-            Ok(effective) => installed.push(effective),
-            Err(e) => {
-                let at = if *req == RX_CLS_LOC_ANY {
-                    "driver-assigned loc".to_string()
-                } else {
-                    format!("@{req}")
-                };
-                let step = format!("ntuple insert {at} on {}: {e}", nic.ifname());
-                let mut errs = Vec::new();
-                for loc in installed.drain(..) {
-                    if let Err(de) = nic.delete_ntuple(loc) {
-                        errs.push(format!("rollback delete @{loc}: {de}"));
+    match guard.slots {
+        RuleSlots::Reserved { .. } => {
+            for (flow, req) in flows.iter().zip(&requests) {
+                match nic.insert_ntuple(*req, flow) {
+                    Ok(effective) => installed.push(effective),
+                    Err(e) => {
+                        let step = format!("ntuple insert @{req} on {}: {e}", nic.ifname());
+                        return Err(roll_back(nic, &mut installed, step));
                     }
                 }
-                if errs.is_empty() {
-                    return Err(format!(
-                        "{step} (this arm's flow rules rolled back — RSS exclusion \
-                         held until the caller's ifq teardown)"
-                    ));
+            }
+        }
+        RuleSlots::KernelAssigned => {
+            // The ethtool-parity insert ladder (field finding A —
+            // rxclass.c `rxclass_rule_ins`): (1) probe the
+            // RX_CLS_LOC_SPECIAL support flag; (2) supported ⇒ try
+            // `@ANY` (the kernel assigns and echoes the id); (3)
+            // unsupported OR refused anyway (mlx5 bounces special
+            // values as ENOSPC) ⇒ SELF-SELECT the highest free explicit
+            // loc below the GRXCLSRLALL-reported table size — the size
+            // source ethtool scans from (mlx5 reports 1024 there while
+            // GRXCLSRLCNT advertises 0; that is why the ethtool binary
+            // lands at 'ID 1023' against this exact driver).
+            let use_any = nic
+                .special_loc_supported()
+                .map_err(|e| format!("special-loc probe on {}: {e}", nic.ifname()))?;
+            let mut taken: BTreeSet<u32> = nic
+                .ntuple_locs()
+                .map_err(|e| format!("rule enumeration on {}: {e}", nic.ifname()))?
+                .into_iter()
+                .collect();
+            if let Some(l) = reg.get(&guard.ifname) {
+                taken.extend(l.locs.iter().copied());
+            }
+            let mut size_hint: Option<u32> = None;
+            for flow in flows {
+                let mut effective: Option<u32> = None;
+                let mut any_refusal: Option<String> = None;
+                if use_any {
+                    match nic.insert_ntuple(RX_CLS_LOC_ANY, flow) {
+                        Ok(e) => effective = Some(e),
+                        Err(e) => any_refusal = Some(e), // fall through
+                    }
                 }
-                return Err(format!("{step}; ROLLBACK ALSO FAILED: {}", errs.join("; ")));
+                let effective = match effective {
+                    Some(e) => e,
+                    None => {
+                        let size = match size_hint {
+                            Some(sz) => sz,
+                            None => {
+                                let sz = nic.ntuple_table_size_hint().map_err(|e| {
+                                    format!("rule-table size probe on {}: {e}", nic.ifname())
+                                })?;
+                                size_hint = Some(sz);
+                                sz
+                            }
+                        };
+                        if size == 0 {
+                            let step = format!(
+                                "no rule-table size reported by {} (GRXCLSRLALL data 0) — \
+                                 cannot self-select an explicit loc{}",
+                                nic.ifname(),
+                                any_refusal
+                                    .map(|e| format!("; @ANY also refused: {e}"))
+                                    .unwrap_or_default()
+                            );
+                            return Err(roll_back(nic, &mut installed, step));
+                        }
+                        // Top-down first-free scan — ethtool
+                        // rxclass_find_empty_slot parity.
+                        let Some(loc) = (0..size).rev().find(|l| !taken.contains(l)) else {
+                            let step = format!("all {size} rule slots taken on {}", nic.ifname());
+                            return Err(roll_back(nic, &mut installed, step));
+                        };
+                        match nic.insert_ntuple(loc, flow) {
+                            Ok(e) => e,
+                            Err(e) => {
+                                let step = format!(
+                                    "ntuple insert @{loc} on {}: {e}{}",
+                                    nic.ifname(),
+                                    any_refusal
+                                        .map(|a| format!(" (@ANY refused first: {a})"))
+                                        .unwrap_or_default()
+                                );
+                                return Err(roll_back(nic, &mut installed, step));
+                            }
+                        }
+                    }
+                };
+                taken.insert(effective);
+                installed.push(effective);
             }
         }
     }

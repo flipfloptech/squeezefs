@@ -36,6 +36,13 @@ pub struct LaneTarget {
     pub queue_depth: u16,
 }
 
+/// The ONE lane read timeout (both read paths + the park-fail bound
+/// derive from it — never a fresh 30 s literal). The timeout arm stays
+/// the LAST-RESORT poison for genuinely wedged queues; refill
+/// starvation fails over at `uring_zcrx::park_fail_bound()` long before
+/// this can fire.
+pub(crate) const LANE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 fn io_err(msg: String) -> SqueezefsError {
     SqueezefsError::Io(std::io::Error::other(msg))
 }
@@ -632,7 +639,13 @@ impl LaneSession {
                             super::area::chunk_bytes_default(),
                             plan.numa_node,
                         )?;
-                        let shared = super::area_queue::AreaShared::new(depth, &area);
+                        // Admission clamps to the WIRE-grain pool demand
+                        // (round 5 task 3): amp derives from THIS NIC's MTU.
+                        let amp = super::area_queue::fill_grain_amplification(
+                            super::area::chunk_bytes_default(),
+                            super::ethtool::nic_mtu(&plan.ifname),
+                        );
+                        let shared = super::area_queue::AreaShared::new(depth, &area, amp);
                         let cmds = super::uring_zcrx::RingCmd::new().map_err(io_err)?;
                         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
                         let (go_tx, go_rx) = std::sync::mpsc::channel();
@@ -1040,7 +1053,7 @@ impl LaneSession {
             return Err(io_err("lane command sink gone".into()));
         }
 
-        match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+        match tokio::time::timeout(LANE_READ_TIMEOUT, rx).await {
             Ok(Ok(Ok(fill))) => {
                 // The gather law (design §4.4): ONE pass from refcounted
                 // area chunks into the destination; dropping the fill
@@ -1113,7 +1126,7 @@ impl LaneSession {
             return Err(io_err("lane writer task gone".into()));
         }
 
-        match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+        match tokio::time::timeout(LANE_READ_TIMEOUT, rx).await {
             Ok(Ok(r)) => r,
             Ok(Err(_)) => Err(io_err("lane completion channel dropped".into())),
             Err(_) => {

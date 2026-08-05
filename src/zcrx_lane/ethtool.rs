@@ -450,6 +450,17 @@ pub fn nic_numa_node(ifname: &str) -> Option<usize> {
     usize::try_from(node).ok()
 }
 
+/// The NIC's MTU from sysfs — the fill-grain amplification input (the
+/// round-5 admission derivation: the kernel pool spends buffers at
+/// wire-segment grain).
+pub fn nic_mtu(ifname: &str) -> Option<u32> {
+    std::fs::read_to_string(format!("/sys/class/net/{ifname}/mtu"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// The NIC's ifindex (`if_nametoindex`).
 pub fn nic_ifindex(ifname: &str) -> Option<u32> {
     let c = std::ffi::CString::new(ifname).ok()?;

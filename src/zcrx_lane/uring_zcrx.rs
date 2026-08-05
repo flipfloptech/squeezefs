@@ -594,6 +594,96 @@ pub(crate) struct RingDriverConfig {
 
 const TAG_RECV: u64 = 1;
 
+/// How long a refill-starvation park may hold the queue's in-flight
+/// fills before they fail over to the kernel path. Derived from the ONE
+/// lane read timeout (never a fresh literal): `LANE_READ_TIMEOUT / 32`
+/// ≈ 937 ms — ≥ ~4,000× the 235 µs fabric-RTT class (a genuine
+/// transient has thousands of round trips to clear) and ≤ ~3 % of the
+/// read timeout (a wedged pool costs a bounded slice of ONE op before
+/// the kernel path serves; the 30 s timeout-poison becomes unreachable
+/// under pure starvation — field round 5: 82 reads waited the full
+/// 30 s and every queue died by timeout-poison).
+pub(crate) fn park_fail_bound() -> std::time::Duration {
+    super::initiator::LANE_READ_TIMEOUT / 32
+}
+
+/// The parked-recv decision core (field round 5: THE PARK NEVER WOKE).
+/// Pure and driver-owned — `drive()` consumes verdicts; the laws are
+/// pinned in-module. Round 4's wake set was (a) the release-hook
+/// doorbell (consumers releasing chunks) and (b) a bounded poll gated
+/// on queued-but-unpostable returns — but the FIELD state was parked
+/// with the pool structurally dry, the rq ring not full, and every
+/// received span held by PARTIAL fills that could never complete:
+/// neither wake could ever fire, and the round-4 re-arm condition
+/// (refill progress) was unreachable. Deadlock by construction.
+pub(crate) struct RecvGovernor {
+    armed: bool,
+    /// The active starvation episode (start of the CURRENT failover
+    /// window; `Some` from first park until payload flows again).
+    episode: Option<std::time::Instant>,
+}
+
+impl RecvGovernor {
+    pub(crate) fn new() -> RecvGovernor {
+        RecvGovernor {
+            armed: true,
+            episode: None,
+        }
+    }
+
+    /// RECV_ZC ended in refill starvation. `true` ⇔ a NEW episode
+    /// starts (count the metric, arm the release wake) — retry re-parks
+    /// within an episode never recount.
+    pub(crate) fn on_park(&mut self, now: std::time::Instant) -> bool {
+        self.armed = false;
+        if self.episode.is_none() {
+            self.episode = Some(now);
+            return true;
+        }
+        false
+    }
+
+    /// Payload flowed. `true` ⇔ an episode ENDED (disarm the wake,
+    /// clear the degraded latch).
+    pub(crate) fn on_progress(&mut self) -> bool {
+        self.episode.take().is_some()
+    }
+
+    /// Loop-top: should the driver push a fresh RECV_ZC now?
+    pub(crate) fn rearm_due(&mut self) -> bool {
+        // RED PHASE skeleton — the round-4 semantics: parked queues
+        // waited for refill progress that the field shape can never
+        // produce. The pinned law: an unarmed recv ALWAYS retries (a
+        // dry-pool re-arm costs one cheap ENOMEM CQE at the bounded
+        // poll cadence).
+        false
+    }
+
+    /// Must the driver poll bounded instead of blocking in enter?
+    pub(crate) fn poll_bounded(&self) -> bool {
+        // RED PHASE skeleton — round 4 polled only in the
+        // parked-with-unpostable-returns state; the pinned law: EVERY
+        // parked state polls bounded (200 µs against a 235 µs RTT
+        // class; a parked queue is idle by definition).
+        false
+    }
+
+    /// Has THIS failover window expired? `true` fires at most once per
+    /// `bound` (the window restarts) — the caller fails the queue's
+    /// pending fills over to the kernel path and latches degraded.
+    pub(crate) fn failover_due(
+        &mut self,
+        now: std::time::Instant,
+        bound: std::time::Duration,
+    ) -> bool {
+        // RED PHASE skeleton — round 4 had no blast-radius bound (the
+        // field's 46-IOPS minute: every in-flight read served its full
+        // 30 s timeout against a parked queue).
+        let _ = (now, bound);
+        false
+    }
+}
+
 /// What a terminated RECV_ZC multishot (CQE without `F_MORE`) means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecvEnd {
@@ -1082,6 +1172,95 @@ mod tests {
                 &format!("io_uring (CQE32|SINGLE_ISSUER|DEFER_TASKRUN) unavailable: {why}"),
             ),
         }
+    }
+
+    // -- the park governor (field round 5: the park never woke) ---------
+
+    #[test]
+    fn recv_governor_cold_start_rearms_without_any_release() {
+        // THE deadlock shape: pool dry at first serve, every received
+        // span held by partial fills (nothing ever releases → the
+        // release hook can never fire), rq ring not full. The governor
+        // must retry the re-arm anyway — progress is a bonus, never the
+        // unlock condition.
+        let mut gov = RecvGovernor::new();
+        let t0 = std::time::Instant::now();
+        assert!(gov.on_park(t0), "first park starts the episode");
+        for _ in 0..3 {
+            assert!(
+                gov.rearm_due(),
+                "an unarmed recv ALWAYS retries — no release, no refill                  progress, no external event required"
+            );
+            assert!(!gov.rearm_due(), "one arm per park (armed until the CQE)");
+            assert!(!gov.on_park(t0), "re-parks within an episode never recount");
+        }
+    }
+
+    #[test]
+    fn recv_governor_polls_bounded_for_every_parked_state() {
+        let mut gov = RecvGovernor::new();
+        assert!(!gov.poll_bounded(), "armed and healthy ⇒ block in enter");
+        gov.on_park(std::time::Instant::now());
+        assert!(
+            gov.poll_bounded(),
+            "EVERY parked state polls bounded — not just the              unpostable-returns state (the field's stuck shape had none)"
+        );
+        assert!(gov.on_progress(), "payload ends the episode");
+        assert!(!gov.poll_bounded(), "recovered ⇒ block in enter again");
+    }
+
+    #[test]
+    fn recv_governor_counts_episodes_not_retries() {
+        let mut gov = RecvGovernor::new();
+        let t0 = std::time::Instant::now();
+        assert!(gov.on_park(t0));
+        let _ = gov.rearm_due();
+        assert!(!gov.on_park(t0), "retry re-park: same episode");
+        assert!(gov.on_progress());
+        assert!(!gov.on_progress(), "progress is idempotent");
+        assert!(gov.on_park(t0), "a NEW starvation after recovery recounts");
+    }
+
+    #[test]
+    fn recv_governor_failover_fires_once_per_bound_window() {
+        let mut gov = RecvGovernor::new();
+        let t0 = std::time::Instant::now();
+        let bound = std::time::Duration::from_millis(100);
+        gov.on_park(t0);
+        assert!(
+            !gov.failover_due(t0 + bound / 2, bound),
+            "inside the window: keep waiting"
+        );
+        assert!(
+            gov.failover_due(t0 + bound, bound),
+            "window expired: fail the pending fills over"
+        );
+        assert!(
+            !gov.failover_due(t0 + bound + bound / 2, bound),
+            "the window RESTARTS at failover — once per bound"
+        );
+        assert!(
+            gov.failover_due(t0 + bound * 2, bound),
+            "a still-starved queue fails over again a bound later"
+        );
+        assert!(gov.on_progress());
+        assert!(
+            !gov.failover_due(t0 + bound * 10, bound),
+            "no episode ⇒ no failover"
+        );
+    }
+
+    #[test]
+    fn park_fail_bound_derives_from_the_one_read_timeout() {
+        // One-definition tie: the bound is LANE_READ_TIMEOUT / 32 —
+        // never a fresh literal (the 30 s figure previously lived as
+        // two inline literals in the read paths).
+        assert_eq!(
+            park_fail_bound(),
+            crate::zcrx_lane::initiator::LANE_READ_TIMEOUT / 32
+        );
+        assert!(park_fail_bound() >= std::time::Duration::from_millis(500));
+        assert!(park_fail_bound() <= std::time::Duration::from_secs(2));
     }
 
     // -- the recv-end law (field finding E) -----------------------------
@@ -1608,7 +1787,7 @@ mod tests {
         // the lane is poisoned rather than left half-armed.
         let area =
             super::super::area::ZcrxArea::new(256 * 1024, 64 * 1024, None).expect("test area");
-        let shared = super::super::area_queue::AreaShared::new(4, &area);
+        let shared = super::super::area_queue::AreaShared::new(4, &area, 1);
         let cmds = RingCmd::new().expect("eventfd");
         let session_poison = Arc::new(AtomicBool::new(false));
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback listener");
@@ -1666,7 +1845,7 @@ mod tests {
         // go=false arm proper is field-owed with the armed serve loop.)
         let area =
             super::super::area::ZcrxArea::new(256 * 1024, 64 * 1024, None).expect("test area");
-        let shared = super::super::area_queue::AreaShared::new(4, &area);
+        let shared = super::super::area_queue::AreaShared::new(4, &area, 1);
         let cmds = RingCmd::new().expect("eventfd");
         let session_poison = Arc::new(AtomicBool::new(false));
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");

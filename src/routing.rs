@@ -3986,6 +3986,36 @@ pub struct StreamLane {
     /// Consecutive evicted-unconsumed detections without an intervening
     /// clean consume — exponent for the suppression span (capped).
     detect_streak: std::sync::atomic::AtomicU32,
+    /// Blocks ISSUED (R2 pipeline or the opt-in read-lane ahead arm —
+    /// both share the `next_prefetch_block` cursor) whose task has not
+    /// yet SETTLED — the evicted-unconsumed detector's parked-task
+    /// screen (the 2026-08-05 gate flake). Between the issue-side CAS
+    /// and the task's first poll a block is detector-visible but
+    /// findable NOWHERE (no registry entry, no deposit); from first
+    /// poll to settle it is continuously findable (registry entry until
+    /// the fill deposits, deposit until eviction), so membership here
+    /// means "no eviction verdict is expressible for this block" — a
+    /// parked task has fetched nothing, and §5.5 mechanism iii's event
+    /// is a block the pipeline ALREADY FETCHED that misses the tiers.
+    /// Inserted before spawn, removed at settle (every arm, including
+    /// shed-rollback); lock-free (scc, lazy-allocated — idle lanes pay
+    /// ~4 words), size bounded by the lane's in-flight count. Keys are
+    /// [`lane_pending_key`] `(generation, block)` composites so an
+    /// abandoned stream's late-settling task can never strip the NEW
+    /// generation's mark for a re-issued block number. The
+    /// eviction-while-unsettled shadow (deposit → evict → consume all
+    /// before settle) is nanoseconds against an eviction that needs a
+    /// full clock lap — an at-most-once-per-block statistical miss the
+    /// spiral detector absorbs by design.
+    pending_blocks: scc::HashSet<u64>,
+}
+
+/// The parked-task screen's set key: the lane generation's low 32 bits
+/// over the block index — a tag (generation wrap after 2³² lane resets
+/// aliases harmlessly: one suppressed verdict), never an identity.
+#[inline]
+fn lane_pending_key(generation: u64, block: u32) -> u64 {
+    (generation << 32) | u64::from(block)
 }
 
 /// §5.5 `active_streams` — a two-epoch activity gauge (the same sliding
@@ -4436,6 +4466,7 @@ impl StreamLanes {
             last_counted_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
             suppress_until_edge: std::sync::atomic::AtomicU32::new(0),
             detect_streak: std::sync::atomic::AtomicU32::new(0),
+            pending_blocks: scc::HashSet::new(),
         };
         Self {
             lanes: [mk(), mk(), mk(), mk()],
@@ -6690,7 +6721,22 @@ impl DataRouter {
                         // healthy lanes.
                         || (self.read_lane.enabled() && self.cache.read_lane_hold.contains(k))
                         || self.inflight_block_reads.read_sync(k, |_, _| ()).is_some();
-                    if !resident {
+                    if !resident
+                        && lane
+                            .pending_blocks
+                            .contains_sync(&lane_pending_key(generation, start_block))
+                    {
+                        // Issued but its task has not SETTLED (the
+                        // parked-task window — the 2026-08-05 gate
+                        // flake): nothing was fetched, so nothing can
+                        // have been evicted. NO verdict either way —
+                        // neither the spiral count (the counter must
+                        // not lie under a loaded scheduler) nor the
+                        // clean-consume streak reset (no residency
+                        // evidence). The foreground serve below dedupes
+                        // with the task through the single-flight
+                        // exactly as before.
+                    } else if !resident {
                         METRICS.prefetch_evicted_unconsumed.fetch_add(1, Relaxed);
                         let _ = lane
                             .window
@@ -6838,6 +6884,12 @@ impl DataRouter {
             METRICS
                 .prefetch_inflight_bytes
                 .fetch_add(block_size, Relaxed);
+            // Parked-task screen: mark BEFORE spawn (the task's settle
+            // removes; inserting after could lose the remove to a task
+            // that settled first, stranding a permanent suppression).
+            let _ = lane
+                .pending_blocks
+                .insert_sync(lane_pending_key(generation, next));
             if !self.spawn_prefetch_task(
                 file_path.to_string(),
                 meta.clone(),
@@ -6854,7 +6906,11 @@ impl DataRouter {
                 // `in_flight + unconsumed >= effective` forever). The
                 // block was not fetched: it stays foreground-served;
                 // `prefetch_wasted` balances the task ledger so
-                // `issued == completed + wasted` still converges.
+                // `issued == completed + wasted` still converges. The
+                // parked-task mark rolls back with it.
+                let _ = lane
+                    .pending_blocks
+                    .remove_sync(&lane_pending_key(generation, next));
                 lane.inflight.fetch_sub(1, Relaxed);
                 METRICS
                     .prefetch_inflight_bytes
@@ -6989,6 +7045,12 @@ impl DataRouter {
             }
             let lane = &lanes.lanes[lane_idx];
             let settle = |completed: bool| {
+                // Parked-task screen closure: from here on the block's
+                // findability is the tiers' own truth — an absence IS an
+                // eviction verdict again.
+                let _ = lane
+                    .pending_blocks
+                    .remove_sync(&lane_pending_key(generation, block));
                 lane.inflight.fetch_sub(1, Relaxed);
                 METRICS
                     .prefetch_inflight_bytes
@@ -7360,6 +7422,11 @@ impl DataRouter {
             }
             lane.rl_inflight.fetch_add(1, Relaxed);
             self.read_lane.add_inflight(block_size);
+            // Parked-task screen (the R2 issue-site rule verbatim —
+            // both arms share the cursor and the detector's span).
+            let _ = lane
+                .pending_blocks
+                .insert_sync(lane_pending_key(generation, next));
             if !self.spawn_read_lane_task(
                 file_path.to_string(),
                 meta.clone(),
@@ -7371,7 +7438,11 @@ impl DataRouter {
             ) {
                 // Admission shed the task un-run (foreground always
                 // wins): roll the issue accounting back HERE — the
-                // task's settle path never executes.
+                // task's settle path never executes. The parked-task
+                // mark rolls back with it.
+                let _ = lane
+                    .pending_blocks
+                    .remove_sync(&lane_pending_key(generation, next));
                 lane.rl_inflight.fetch_sub(1, Relaxed);
                 self.read_lane.sub_inflight(block_size);
                 METRICS.read_lane_wasted.fetch_add(1, Relaxed);
@@ -7402,6 +7473,10 @@ impl DataRouter {
         crate::bg_admit::spawn_bg(async move {
             let lane = &lanes.lanes[lane_idx];
             let settle = |completed: bool| {
+                // Parked-task screen closure (the R2 settle rule).
+                let _ = lane
+                    .pending_blocks
+                    .remove_sync(&lane_pending_key(generation, block));
                 lane.rl_inflight.fetch_sub(1, Relaxed);
                 router.read_lane.sub_inflight(block_size);
                 if !completed || lane.generation.load(Relaxed) != generation {

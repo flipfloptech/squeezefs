@@ -609,10 +609,9 @@ pub(crate) const KERNEL_MAX_CQ_ENTRIES: u32 = 2 * 32768;
 /// terminates -ENOSPC (zcrx.c:1280/:1317). The userspace contract is
 /// size-adequately + reap-promptly; there is no kernel-side recovery.
 pub(crate) fn cq_entries_for(depth: u16, max_xfer: u32, chunk: usize, sq_entries: u32) -> u32 {
-    // RED PHASE skeleton — the shipped implicit sizing (RawRing used
-    // cq = sq × 4, i.e. 512 CQEs against a 16,384-CQE demand).
-    let _ = (depth, max_xfer, chunk);
-    (sq_entries * 4).next_power_of_two()
+    let per_cmd = (max_xfer as u64).div_ceil(chunk.max(1) as u64).max(1);
+    let demand = depth as u64 * per_cmd + sq_entries as u64;
+    demand.next_power_of_two().min(KERNEL_MAX_CQ_ENTRIES as u64) as u32
 }
 
 /// The either/or honesty clamp (the round-5 admission law's shape): if
@@ -620,9 +619,7 @@ pub(crate) fn cq_entries_for(depth: u16, max_xfer: u32, chunk: usize, sq_entries
 /// to what the CQ can actually hold — `(cq − sq_headroom) × chunk × 2`
 /// (admission spends half its window on in-flight payload).
 pub(crate) fn cq_admitted_window_bytes(cq_entries: u32, sq_entries: u32, chunk: usize) -> u64 {
-    // RED PHASE skeleton — no clamp existed.
-    let _ = (cq_entries, sq_entries, chunk);
-    u64::MAX
+    (cq_entries.saturating_sub(sq_entries) as u64) * chunk as u64 * 2
 }
 
 /// How long a refill-starvation park may hold the queue's in-flight
@@ -769,7 +766,12 @@ pub(crate) enum RecvEnd {
 pub(crate) fn classify_recv_end(res: i32) -> RecvEnd {
     if res == 0 {
         RecvEnd::Eof
-    } else if res == -libc::ENOMEM || res == -libc::ENOBUFS {
+    } else if res == -libc::ENOMEM || res == -libc::ENOBUFS || res == -libc::ENOSPC {
+        // ENOSPC (round 7) = CQ-full (zcrx.c:1280/:1317): the data
+        // stays in the socket; reap-then-re-arm recovers. After the
+        // cq_entries_for sizing a park here means the reaper was
+        // transiently outpaced — bounded by the governor, visible in
+        // parks/failovers; never device death.
         RecvEnd::Park
     } else if res > 0 {
         RecvEnd::Rearm

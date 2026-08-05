@@ -652,7 +652,9 @@ impl LaneSession {
                         // cover the NIC RX ring's STANDING pool demand
                         // (the plan carries it — probed at arm) ON TOP
                         // of the fill window; admission clamps to the
-                        // fill window only.
+                        // fill window only — further shrunk (round 7,
+                        // the either/or law) to what a kernel-max CQ
+                        // can actually complete.
                         let fill_window =
                             super::area::area_bytes_per_queue(depth, target.max_xfer_bytes);
                         let area = super::area::ZcrxArea::new(
@@ -660,8 +662,21 @@ impl LaneSession {
                             super::area::chunk_bytes_default(),
                             plan.numa_node,
                         )?;
+                        let sq = (depth as u32 + 8).next_power_of_two();
+                        let cq = super::uring_zcrx::cq_entries_for(
+                            depth,
+                            target.max_xfer_bytes,
+                            super::area::chunk_bytes_default(),
+                            sq,
+                        );
+                        let admit_window =
+                            fill_window.min(super::uring_zcrx::cq_admitted_window_bytes(
+                                cq,
+                                sq,
+                                super::area::chunk_bytes_default(),
+                            ));
                         let shared =
-                            super::area_queue::AreaShared::new(depth, &area, fill_window as usize);
+                            super::area_queue::AreaShared::new(depth, &area, admit_window as usize);
                         let cmds = super::uring_zcrx::RingCmd::new().map_err(io_err)?;
                         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
                         let (go_tx, go_rx) = std::sync::mpsc::channel();
@@ -671,13 +686,8 @@ impl LaneSession {
                                 rxq,
                                 numa_node: plan.numa_node,
                                 rq_entries: super::area::rq_entries_for(area.chunk_count() as u64),
-                                sq_entries: (depth as u32 + 8).next_power_of_two(),
-                                cq_entries: super::uring_zcrx::cq_entries_for(
-                                    depth,
-                                    target.max_xfer_bytes,
-                                    super::area::chunk_bytes_default(),
-                                    (depth as u32 + 8).next_power_of_two(),
-                                ),
+                                sq_entries: sq,
+                                cq_entries: cq,
                                 area: Arc::clone(&area),
                                 shared: Arc::clone(&shared),
                                 cmds: Arc::clone(&cmds),
@@ -1032,6 +1042,21 @@ impl LaneSession {
         for r in futures::future::join_all(futs).await {
             r?;
         }
+        // The gather law's accounting boundary (round 7): count at the
+        // WHOLE-read success — per-segment passes sum to `len` on
+        // success (byte-identical to the old per-segment counting), and
+        // a torn multi-segment read contributes to NEITHER gather nor
+        // fill, so gather ≡ fill holds unconditionally (the field's
+        // +6.3 MB poisoned-row delta was completed segments of torn
+        // reads counted with no fill). Area sessions only — the classic
+        // (Z1 contract) backend performs no gather, and its rows must
+        // stay gather-silent (the backend-distinction law;
+        // `dest_serve_eligible` IS the all-area predicate).
+        if self.dest_serve_eligible() {
+            crate::fuse_client::METRICS
+                .zcrx_gather_bytes
+                .fetch_add(len as u64, Ordering::Relaxed);
+        }
         Ok(())
     }
 
@@ -1138,9 +1163,6 @@ impl LaneSession {
                 // destination window (read-path serve buffer); spans were
                 // bounds-validated at record time (`on_c2h_span`).
                 unsafe { fill.gather_into(dest.0) };
-                crate::fuse_client::METRICS
-                    .zcrx_gather_bytes
-                    .fetch_add(len as u64, Ordering::Relaxed);
                 Ok(())
             }
             Ok(Ok(Err(e))) => Err(e),

@@ -101,7 +101,11 @@ field rows, now the chain's remaining link).
 * **New gauges (§9 extension)**: `zcrx_area_bytes` (R5 `zcrx_area`
   component source), `zcrx_gather_bytes` (the priced completion pass),
   `zcrx_area_admission_waits` (honest backpressure),
-  `zcrx_recv_parks` (refill-starvation EPISODES — ENOMEM/ENOBUFS from
+  `zcrx_gather_bytes` closure note (round 7): gather ≡ fill holds
+UNCONDITIONALLY — gather is counted at the whole-read success boundary,
+so a torn multi-segment read (poison/op-error mid-read) contributes to
+neither counter and a poisoned row still closes byte-exact.
+`zcrx_recv_parks` (refill-starvation EPISODES — ENOMEM/ENOBUFS from
 the provider pool; the parked recv retries at poll cadence: flow
 control, never a poison; sustained growth = area undersized for the
 offered in-flight demand — 2026-08 field finding E),

@@ -54,6 +54,13 @@ pub struct ZcrxArea {
     /// Wakes grant waiters when a chunk recycles (sim backpressure edge;
     /// the real backend's kernel rq ring needs no waiter).
     freed: tokio::sync::Notify,
+    /// The ring driver's recv-park wake (field finding E): registered at
+    /// driver setup, ARMED only while the driver is parked on refill
+    /// exhaustion — a chunk release then rings the driver's doorbell so
+    /// it wakes to post rqes and re-arm RECV_ZC. One relaxed-class load
+    /// per release when disarmed.
+    release_wake: std::sync::OnceLock<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    wake_armed: std::sync::atomic::AtomicBool,
 }
 
 // SAFETY: the area is a process-private anonymous mapping; `base` is
@@ -99,6 +106,8 @@ impl ZcrxArea {
             chunk: chunk_bytes,
             ledger: SpanLedger::new(len / chunk_bytes),
             freed: tokio::sync::Notify::new(),
+            release_wake: std::sync::OnceLock::new(),
+            wake_armed: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -173,9 +182,26 @@ impl ZcrxArea {
         self.release_slot(slot);
     }
 
+    /// Register the recv-park wake (once per area; the ring driver's).
+    pub fn set_release_wake(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+        let _ = self.release_wake.set(wake);
+    }
+
+    /// Arm/disarm the recv-park wake (armed only while the driver is
+    /// parked on refill exhaustion — finding E).
+    pub fn arm_release_wake(&self, armed: bool) {
+        self.wake_armed
+            .store(armed, std::sync::atomic::Ordering::Release);
+    }
+
     fn release_slot(&self, slot: u32) {
         if self.ledger.release(slot) {
             self.freed.notify_waiters();
+            if self.wake_armed.load(std::sync::atomic::Ordering::Acquire) {
+                if let Some(wake) = self.release_wake.get() {
+                    wake();
+                }
+            }
         }
     }
 }

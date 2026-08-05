@@ -553,6 +553,12 @@ impl RingCmd {
         self.ring_doorbell();
     }
 
+    /// Wake the driver without a command (the area's recv-park release
+    /// hook — finding E).
+    pub(crate) fn wake(&self) {
+        self.ring_doorbell();
+    }
+
     fn ring_doorbell(&self) {
         let one: u64 = 1;
         // SAFETY: 8-byte write to our eventfd.
@@ -602,14 +608,19 @@ pub(crate) enum RecvEnd {
     Terminal,
 }
 
-/// Classify a final RECV_ZC result (field finding E pins the law).
+/// Classify a final RECV_ZC result (field finding E pins the law):
+/// -ENOMEM is the zcrx provider pool running dry (netmem/copy-fallback
+/// allocation — io_uring/zcrx.c) and -ENOBUFS the starved rq ring —
+/// both are REFILL EXHAUSTION, i.e. flow control: park, re-arm when the
+/// refill advances (the old immediate ENOBUFS re-arm could hot-loop on
+/// an empty pool; ENOMEM poisoned three queues at first serve in the
+/// field). Anything else negative is a real transport error.
 pub(crate) fn classify_recv_end(res: i32) -> RecvEnd {
-    // RED PHASE skeleton: mirrors the SHIPPED semantics (ENOMEM was
-    // terminal — the field's first-serve poison); the contract tests
-    // below pin the corrected law.
     if res == 0 {
         RecvEnd::Eof
-    } else if res == -libc::ENOBUFS || res > 0 {
+    } else if res == -libc::ENOMEM || res == -libc::ENOBUFS {
+        RecvEnd::Park
+    } else if res > 0 {
         RecvEnd::Rearm
     } else {
         RecvEnd::Terminal
@@ -753,6 +764,15 @@ fn drive(
         return Ok(());
     }
 
+    // The recv-park wake (finding E): when the driver parks on refill
+    // exhaustion, a consumer releasing a chunk rings this doorbell so
+    // the driver wakes to post rqes and re-arm RECV_ZC.
+    cfg.area.set_release_wake(std::sync::Arc::new({
+        let cmds = Arc::clone(&cfg.cmds);
+        move || cmds.wake()
+    }));
+    let mut recv_parked = false;
+
     let sock_fd = cfg.sock.as_raw_fd();
     let mut doorbell_buf = 0u64;
     let arm_doorbell = |ring: &RawRing, buf: &mut u64| -> Result<(), String> {
@@ -800,12 +820,17 @@ fn drive(
             return Ok(());
         }
 
-        // Returned spans → rqes → grantable records.
+        // Returned spans → rqes → grantable records. `refill_progress`
+        // (any rqe posted) is what un-parks a refill-starved recv
+        // (finding E): a posted return is exactly what lets the provider
+        // pool allocate again.
+        let mut refill_progress = false;
         for slot in std::mem::take(&mut deferred_returns.slots) {
             let (off, len) = side[slot as usize];
             if refill.post(off, len) {
                 side[slot as usize] = (0, 0);
                 ready_slots.slots.push(slot);
+                refill_progress = true;
             } else {
                 deferred_returns.slots.push(slot);
             }
@@ -820,9 +845,18 @@ fn drive(
             } else if refill.post(off, len) {
                 side[slot as usize] = (0, 0);
                 ready_slots.slots.push(slot);
+                refill_progress = true;
             } else {
                 deferred_returns.slots.push(slot);
             }
+        }
+        if recv_parked && refill_progress {
+            // The refill advanced — resume the multishot (park, never
+            // poison: finding E).
+            arm_recv(&ring)?;
+            to_submit += 1;
+            recv_parked = false;
+            cfg.area.arm_release_wake(false);
         }
 
         // Commands → SEND SQEs.
@@ -842,7 +876,16 @@ fn drive(
             to_submit += 1;
         }
 
-        ring.enter(std::mem::take(&mut to_submit), 1)?;
+        // Parked with returns still queued on a full rq ring: no kernel
+        // event fires when the pool consumes rqes, so poll bounded
+        // instead of blocking forever (rare; only while parked AND the
+        // ring is full — the release hook covers the consumer-held case).
+        if recv_parked && !deferred_returns.slots.is_empty() {
+            ring.enter(std::mem::take(&mut to_submit), 0)?;
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        } else {
+            ring.enter(std::mem::take(&mut to_submit), 1)?;
+        }
 
         while let Some((ud, res, flags, big0)) = ring.pop_cqe() {
             match ud {
@@ -912,24 +955,35 @@ fn drive(
                         }
                     }
                     if flags & IORING_CQE_F_MORE == 0 {
-                        if res == 0 {
-                            if cfg.shared.table.is_empty() {
-                                return Ok(());
+                        match classify_recv_end(res) {
+                            RecvEnd::Eof => {
+                                if cfg.shared.table.is_empty() {
+                                    return Ok(());
+                                }
+                                return Err("connection closed mid-operation".into());
                             }
-                            return Err("connection closed mid-operation".into());
-                        }
-                        if res == -libc::ENOBUFS {
-                            // rq starved: returns above free space; re-arm.
-                            arm_recv(&ring)?;
-                            to_submit += 1;
-                        } else if res < 0 {
-                            return Err(format!(
-                                "RECV_ZC terminal: {}",
-                                std::io::Error::from_raw_os_error(-res)
-                            ));
-                        } else {
-                            arm_recv(&ring)?;
-                            to_submit += 1;
+                            RecvEnd::Park => {
+                                // Refill exhaustion (finding E): flow
+                                // control, never device death — re-armed
+                                // at loop-top on refill progress; the
+                                // area release hook rings our doorbell
+                                // when consumers hold every chunk.
+                                crate::fuse_client::METRICS
+                                    .zcrx_recv_parks
+                                    .fetch_add(1, Ordering::Relaxed);
+                                recv_parked = true;
+                                cfg.area.arm_release_wake(true);
+                            }
+                            RecvEnd::Rearm => {
+                                arm_recv(&ring)?;
+                                to_submit += 1;
+                            }
+                            RecvEnd::Terminal => {
+                                return Err(format!(
+                                    "RECV_ZC terminal: {}",
+                                    std::io::Error::from_raw_os_error(-res)
+                                ));
+                            }
                         }
                     }
                 }

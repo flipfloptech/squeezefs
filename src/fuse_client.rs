@@ -3591,11 +3591,17 @@ pub struct Metrics {
     /// (honest backpressure, never a mid-stream stall);
     /// `zcrx_lane_poisoned` = session poison transitions (mid-flight
     /// NIC/queue/framing death → drained + kernel path) — a must-stay-0
-    /// tripwire on healthy fabrics.
+    /// tripwire on healthy fabrics; `zcrx_recv_parks` = RECV_ZC
+    /// multishots parked on refill exhaustion (ENOMEM/ENOBUFS — the
+    /// provider pool ran dry; field finding E, 2026-08) and re-armed on
+    /// refill progress — flow control made visible, NEVER a poison;
+    /// sustained growth means the area is undersized for the offered
+    /// in-flight demand.
     pub zcrx_area_bytes: Align64<AtomicU64>,
     pub zcrx_gather_bytes: Align64<AtomicU64>,
     pub zcrx_area_admission_waits: Align64<AtomicU64>,
     pub zcrx_lane_poisoned: Align64<AtomicU64>,
+    pub zcrx_recv_parks: Align64<AtomicU64>,
     /// PR Z3 (gather fusion): the subset of `zcrx_gather_bytes` whose ONE
     /// completion gather landed DIRECTLY in the funnel caller's registered
     /// destination (`dest_addr` reads — the routing raw full-block leg and
@@ -7052,6 +7058,7 @@ impl SqueezefsFilesystem {
                 "zcrx_gather_bytes": METRICS.zcrx_gather_bytes.load(Ordering::Relaxed),
                 "zcrx_area_admission_waits": METRICS.zcrx_area_admission_waits.load(Ordering::Relaxed),
                 "zcrx_lane_poisoned": METRICS.zcrx_lane_poisoned.load(Ordering::Relaxed),
+                "zcrx_recv_parks": METRICS.zcrx_recv_parks.load(Ordering::Relaxed),
                 "zcrx_dest_gather_bytes": METRICS.zcrx_dest_gather_bytes.load(Ordering::Relaxed),
                 "layout_inline_writes": METRICS.layout_inline_writes.load(Ordering::Relaxed),
                 "layout_staged_writes": METRICS.layout_staged_writes.load(Ordering::Relaxed),

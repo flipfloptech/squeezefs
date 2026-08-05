@@ -553,12 +553,6 @@ impl RingCmd {
         self.ring_doorbell();
     }
 
-    /// Wake the driver without a command (the area's recv-park release
-    /// hook — finding E).
-    pub(crate) fn wake(&self) {
-        self.ring_doorbell();
-    }
-
     fn ring_doorbell(&self) {
         let one: u64 = 1;
         // SAFETY: 8-byte write to our eventfd.
@@ -649,23 +643,25 @@ impl RecvGovernor {
         self.episode.take().is_some()
     }
 
-    /// Loop-top: should the driver push a fresh RECV_ZC now?
+    /// Loop-top: should the driver push a fresh RECV_ZC now? An unarmed
+    /// recv ALWAYS retries — progress is a bonus, never the unlock (the
+    /// round-4 wait-for-progress condition was unreachable in the field
+    /// shape); a dry-pool re-arm costs one cheap ENOMEM CQE at the
+    /// bounded poll cadence.
     pub(crate) fn rearm_due(&mut self) -> bool {
-        // RED PHASE skeleton — the round-4 semantics: parked queues
-        // waited for refill progress that the field shape can never
-        // produce. The pinned law: an unarmed recv ALWAYS retries (a
-        // dry-pool re-arm costs one cheap ENOMEM CQE at the bounded
-        // poll cadence).
-        false
+        if self.armed {
+            return false;
+        }
+        self.armed = true;
+        true
     }
 
     /// Must the driver poll bounded instead of blocking in enter?
+    /// EVERY parked state polls (200 µs against the 235 µs fabric-RTT
+    /// class; a parked queue is idle by definition, so the poll costs
+    /// nothing anyone is waiting on).
     pub(crate) fn poll_bounded(&self) -> bool {
-        // RED PHASE skeleton — round 4 polled only in the
-        // parked-with-unpostable-returns state; the pinned law: EVERY
-        // parked state polls bounded (200 µs against a 235 µs RTT
-        // class; a parked queue is idle by definition).
-        false
+        self.episode.is_some()
     }
 
     /// Has THIS failover window expired? `true` fires at most once per
@@ -676,11 +672,13 @@ impl RecvGovernor {
         now: std::time::Instant,
         bound: std::time::Duration,
     ) -> bool {
-        // RED PHASE skeleton — round 4 had no blast-radius bound (the
-        // field's 46-IOPS minute: every in-flight read served its full
-        // 30 s timeout against a parked queue).
-        let _ = (now, bound);
-        false
+        match self.episode {
+            Some(start) if now.duration_since(start) >= bound => {
+                self.episode = Some(now);
+                true
+            }
+            _ => false,
+        }
     }
 }
 
@@ -854,14 +852,11 @@ fn drive(
         return Ok(());
     }
 
-    // The recv-park wake (finding E): when the driver parks on refill
-    // exhaustion, a consumer releasing a chunk rings this doorbell so
-    // the driver wakes to post rqes and re-arm RECV_ZC.
-    cfg.area.set_release_wake(std::sync::Arc::new({
-        let cmds = Arc::clone(&cfg.cmds);
-        move || cmds.wake()
-    }));
-    let mut recv_parked = false;
+    // The parked-recv decision core (round 5: the round-4 release-hook
+    // wake could never fire in the field shape — partial fills hold
+    // every span and nothing releases — so the governor polls bounded
+    // in EVERY parked state instead; the hook machinery is deleted).
+    let mut gov = RecvGovernor::new();
 
     let sock_fd = cfg.sock.as_raw_fd();
     let mut doorbell_buf = 0u64;
@@ -910,17 +905,12 @@ fn drive(
             return Ok(());
         }
 
-        // Returned spans → rqes → grantable records. `refill_progress`
-        // (any rqe posted) is what un-parks a refill-starved recv
-        // (finding E): a posted return is exactly what lets the provider
-        // pool allocate again.
-        let mut refill_progress = false;
+        // Returned spans → rqes → grantable records.
         for slot in std::mem::take(&mut deferred_returns.slots) {
             let (off, len) = side[slot as usize];
             if refill.post(off, len) {
                 side[slot as usize] = (0, 0);
                 ready_slots.slots.push(slot);
-                refill_progress = true;
             } else {
                 deferred_returns.slots.push(slot);
             }
@@ -935,18 +925,47 @@ fn drive(
             } else if refill.post(off, len) {
                 side[slot as usize] = (0, 0);
                 ready_slots.slots.push(slot);
-                refill_progress = true;
             } else {
                 deferred_returns.slots.push(slot);
             }
         }
-        if recv_parked && refill_progress {
-            // The refill advanced — resume the multishot (park, never
-            // poison: finding E).
+        // Round-5 park law: an unarmed recv always retries (the kernel
+        // answers a dry pool with one cheap ENOMEM CQE — the retry IS
+        // the probe), and a starvation episode is bounded two ways:
+        if gov.rearm_due() {
             arm_recv(&ring)?;
             to_submit += 1;
-            recv_parked = false;
-            cfg.area.arm_release_wake(false);
+        }
+        if gov.poll_bounded() {
+            if cfg.shared.table.is_empty() && deferred_returns.slots.is_empty() {
+                // Structurally reset: nothing pending, every span
+                // returned — end the episode optimistically. A pool
+                // that is STILL dry re-latches on the next read at
+                // ≤ one bound's cost (the recovery probe).
+                if gov.on_progress() {
+                    cfg.shared.starved.store(false, Ordering::SeqCst);
+                    log::info!("zcrx-lane: refill episode drained — lane serves the next read");
+                }
+            } else if gov.failover_due(std::time::Instant::now(), park_fail_bound()) {
+                // Blast-radius bound (round 5): a parked queue must
+                // never hold reads hostage for the 30 s timeout — fail
+                // the pending fills over to the kernel path (fallback,
+                // NOT poison) and latch degraded so NEW reads bypass
+                // while the queue recovers. Failing the fills is ALSO
+                // the recovery mechanism: their spans release, the
+                // rqes post, the provider pool refills.
+                crate::fuse_client::METRICS
+                    .zcrx_recv_failovers
+                    .fetch_add(1, Ordering::Relaxed);
+                cfg.shared.starved.store(true, Ordering::SeqCst);
+                log::warn!(
+                    "zcrx-lane: refill starvation exceeded {:?} — failing this                      queue's in-flight fills over to the kernel path (the queue                      keeps recovering in the background)",
+                    park_fail_bound()
+                );
+                cfg.shared
+                    .table
+                    .fail_all("zcrx refill starvation — failed over to the kernel path");
+            }
         }
 
         // Commands → SEND SQEs.
@@ -966,11 +985,12 @@ fn drive(
             to_submit += 1;
         }
 
-        // Parked with returns still queued on a full rq ring: no kernel
-        // event fires when the pool consumes rqes, so poll bounded
-        // instead of blocking forever (rare; only while parked AND the
-        // ring is full — the release hook covers the consumer-held case).
-        if recv_parked && !deferred_returns.slots.is_empty() {
+        // EVERY parked state polls bounded (round 5: the field's stuck
+        // shape — pool dry, rq ring not full, every span held by
+        // partial fills — matched NEITHER of round 4's wake gates and
+        // blocked here forever). 200 µs against the 235 µs fabric-RTT
+        // class; the parked queue is idle by definition.
+        if gov.poll_bounded() {
             ring.enter(std::mem::take(&mut to_submit), 0)?;
             std::thread::sleep(std::time::Duration::from_micros(200));
         } else {
@@ -981,6 +1001,12 @@ fn drive(
             match ud {
                 TAG_RECV => {
                     if res > 0 {
+                        // Payload flowed: any active starvation episode
+                        // ends (cheap: one Option check).
+                        if gov.on_progress() && cfg.shared.starved.load(Ordering::SeqCst) {
+                            cfg.shared.starved.store(false, Ordering::SeqCst);
+                            log::info!("zcrx-lane: refill recovered — lane serves again");
+                        }
                         let raw_off = big0;
                         if !cqe_area_matches(raw_off, refill.area_token) {
                             crate::fuse_client::METRICS
@@ -1054,15 +1080,15 @@ fn drive(
                             }
                             RecvEnd::Park => {
                                 // Refill exhaustion (finding E): flow
-                                // control, never device death — re-armed
-                                // at loop-top on refill progress; the
-                                // area release hook rings our doorbell
-                                // when consumers hold every chunk.
-                                crate::fuse_client::METRICS
-                                    .zcrx_recv_parks
-                                    .fetch_add(1, Ordering::Relaxed);
-                                recv_parked = true;
-                                cfg.area.arm_release_wake(true);
+                                // control, never device death. The
+                                // governor retries at poll cadence and
+                                // bounds the episode (failover) —
+                                // parks count EPISODES, not retries.
+                                if gov.on_park(std::time::Instant::now()) {
+                                    crate::fuse_client::METRICS
+                                        .zcrx_recv_parks
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                             RecvEnd::Rearm => {
                                 arm_recv(&ring)?;

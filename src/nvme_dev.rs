@@ -1250,6 +1250,12 @@ impl NvmeBlockDev {
             sess.spawn_teardown();
             return None;
         }
+        if sess.refill_degraded() {
+            // Round 5: a refill-starved queue must never hold reads
+            // hostage — the lane declines while recovering; the kernel
+            // path serves (ineligibility class, uncounted).
+            return None;
+        }
         if !sess.range_eligible(offset, size) {
             return None;
         }

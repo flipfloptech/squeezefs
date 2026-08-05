@@ -101,10 +101,14 @@ field rows, now the chain's remaining link).
 * **New gauges (§9 extension)**: `zcrx_area_bytes` (R5 `zcrx_area`
   component source), `zcrx_gather_bytes` (the priced completion pass),
   `zcrx_area_admission_waits` (honest backpressure),
-  `zcrx_recv_parks` (RECV_ZC multishots parked on refill exhaustion —
-ENOMEM/ENOBUFS from the provider pool, re-armed on refill progress:
-flow control, never a poison; sustained growth = area undersized for
-the offered in-flight demand — 2026-08 field finding E),
+  `zcrx_recv_parks` (refill-starvation EPISODES — ENOMEM/ENOBUFS from
+the provider pool; the parked recv retries at poll cadence: flow
+control, never a poison; sustained growth = area undersized for the
+offered in-flight demand — 2026-08 field finding E),
+`zcrx_recv_failovers` (park episodes that exceeded
+`LANE_READ_TIMEOUT/32`: pending fills failed over to the kernel path —
+fallback, not poison — and reads bypassed the lane until recovery; the
+round-5 blast-radius instrument),
 `zcrx_lane_poisoned` (session poison transitions — must-stay-0
   tripwire; poison also drops `zcrx_lane_armed` and the lane stays
   kernel-path for the mount lifetime).

@@ -74,6 +74,10 @@ pub(crate) struct AreaShared {
     /// cancellation — the MEM-3 custody law's admission face).
     pub admission: Arc<tokio::sync::Semaphore>,
     pub poisoned: AtomicBool,
+    /// Round-5 blast-radius latch: a refill-starvation failover fired
+    /// and the queue is recovering — NEW reads bypass the lane (kernel
+    /// path serves) until payload flows or the episode drains.
+    pub starved: AtomicBool,
 }
 
 impl AreaShared {
@@ -89,6 +93,7 @@ impl AreaShared {
                 fill_grain_amp,
             ))),
             poisoned: AtomicBool::new(false),
+            starved: AtomicBool::new(false),
         })
     }
 
@@ -104,7 +109,7 @@ impl AreaShared {
             mark_session_poisoned(session_poison);
         }
         if drain {
-            self.table.fail_all(why);
+            self.table.fail_all(&format!("lane queue poisoned: {why}"));
         }
     }
 }

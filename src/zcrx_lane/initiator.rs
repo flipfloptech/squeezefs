@@ -793,6 +793,18 @@ impl LaneSession {
         self.poisoned.load(Ordering::SeqCst)
     }
 
+    /// Round-5 blast-radius law: any queue in a refill-starvation
+    /// failover window ⇒ the lane declines NEW reads (kernel path
+    /// serves, uncounted — the ineligibility class) while the driver
+    /// recovers in the background. Poison stays reserved for real
+    /// transport errors.
+    pub fn refill_degraded(&self) -> bool {
+        self.queues.iter().any(|q| match q {
+            QueueHandle::Area(q) => q.shared.starved.load(Ordering::SeqCst),
+            QueueHandle::Classic(_) => false,
+        })
+    }
+
     /// Whether this session's NIC/lease state has been released (the
     /// finding-F teardown latch).
     pub fn torn_down(&self) -> bool {

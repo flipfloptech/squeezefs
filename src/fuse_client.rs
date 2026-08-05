@@ -3602,6 +3602,13 @@ pub struct Metrics {
     pub zcrx_area_admission_waits: Align64<AtomicU64>,
     pub zcrx_lane_poisoned: Align64<AtomicU64>,
     pub zcrx_recv_parks: Align64<AtomicU64>,
+    /// `zcrx_recv_failovers` = park episodes that exceeded
+    /// `park_fail_bound()` (LANE_READ_TIMEOUT/32): the queue's pending
+    /// fills failed over to the kernel path (fallback, NOT poison) and
+    /// reads bypassed the lane until recovery — the round-5
+    /// blast-radius instrument (a sustained rate ≈ 1/bound means the
+    /// provider pool is structurally dysfunctional on this NIC).
+    pub zcrx_recv_failovers: Align64<AtomicU64>,
     /// PR Z3 (gather fusion): the subset of `zcrx_gather_bytes` whose ONE
     /// completion gather landed DIRECTLY in the funnel caller's registered
     /// destination (`dest_addr` reads — the routing raw full-block leg and
@@ -7059,6 +7066,7 @@ impl SqueezefsFilesystem {
                 "zcrx_area_admission_waits": METRICS.zcrx_area_admission_waits.load(Ordering::Relaxed),
                 "zcrx_lane_poisoned": METRICS.zcrx_lane_poisoned.load(Ordering::Relaxed),
                 "zcrx_recv_parks": METRICS.zcrx_recv_parks.load(Ordering::Relaxed),
+                "zcrx_recv_failovers": METRICS.zcrx_recv_failovers.load(Ordering::Relaxed),
                 "zcrx_dest_gather_bytes": METRICS.zcrx_dest_gather_bytes.load(Ordering::Relaxed),
                 "layout_inline_writes": METRICS.layout_inline_writes.load(Ordering::Relaxed),
                 "layout_staged_writes": METRICS.layout_staged_writes.load(Ordering::Relaxed),

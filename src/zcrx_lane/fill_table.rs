@@ -217,7 +217,7 @@ impl FillTable {
         let mut map = self.pending.lock().expect("fill table lock");
         for (_, mut p) in map.drain() {
             if let Some(tx) = p.tx.take() {
-                let _ = tx.send(Err(io_err(format!("lane queue poisoned: {why}"))));
+                let _ = tx.send(Err(io_err(why.to_string())));
             }
         }
     }

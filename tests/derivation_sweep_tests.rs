@@ -776,8 +776,9 @@ fn fuse_drain_group_width_is_the_cpus_over_4_slope_per_node() {
         1,
         "floor 1 — a context owns ≥ 1 queue"
     );
-    // The plan applies the slope PER NODE RUN: 96 possible over 2 nodes
-    // of 48 ⇒ 4 contexts of width 12 per node, never spanning a node.
+    // The plan applies the slope PER NODE MEMBERSHIP SET: 96 possible
+    // over 2 contiguous-block nodes of 48 ⇒ 4 contexts of width 12 per
+    // node, never spanning a node.
     let plan = drain_group_plan(
         96,
         TransportBufferMode::UserEnts,
@@ -788,11 +789,36 @@ fn fuse_drain_group_width_is_the_cpus_over_4_slope_per_node() {
     assert_eq!(plan.len(), 8, "2 nodes × 4 contexts");
     assert!(
         plan.iter().all(|g| g.len() == 12),
-        "width = node span / 4 on 48-CPU nodes"
+        "width = node population / 4 on 48-CPU nodes"
     );
     assert!(
-        plan.iter().all(|g| (g.start / 48) == ((g.end - 1) / 48)),
+        plan.iter()
+            .all(|g| g.iter().all(|&q| (q as usize / 48) == (g[0] as usize / 48))),
         "groups never span a node"
+    );
+    // THE FIELD SHAPE (2026-08-05 disengagement finding): INTERLEAVED
+    // node numbering — node0 = even qids, node1 = odd (squeeze-test's
+    // BIOS round-robin numbering). Membership grouping derives 8 groups
+    // of 4 on 32-possible/2-node; the contiguous-run plan derived 32
+    // singletons here (the A0 posture, structurally disengaged —
+    // portable-by-default covers arbitrary NUMBERINGS, not just
+    // arbitrary domain counts).
+    let plan = drain_group_plan(
+        32,
+        TransportBufferMode::UserEnts,
+        true,
+        |c| Some(c % 2),
+        None,
+    );
+    assert_eq!(
+        plan.len(),
+        8,
+        "interleaved 2×16: 8 groups, never 32 singletons"
+    );
+    assert!(plan.iter().all(|g| g.len() == 4), "width 16/4 = 4 per node");
+    assert!(
+        plan.iter().all(|g| g.iter().all(|&q| q % 2 == g[0] % 2)),
+        "groups never span a node on the interleaved numbering"
     );
     // Whole-node width must never be the DEFAULT (the counted bracket's
     // falsifier: one context per node collapsed −15 % on the

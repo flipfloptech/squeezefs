@@ -635,9 +635,10 @@ struct GroupHandle {
     /// L3 lever B at group scope; shared with every member queue's
     /// [`PayloadArena`] so lease drops elide through the same flag.
     wake_coalescer: Arc<WakeCoalescer>,
-    /// Member qids (ascending, contiguous, never spanning a NUMA node —
-    /// see [`drain_group_plan`]).
-    qids: std::ops::Range<u16>,
+    /// Member qids (ascending within the group; a node-membership SET,
+    /// not a contiguous range — interleaved node numberings are the
+    /// field norm; see [`drain_group_plan`]).
+    qids: Vec<u16>,
 }
 
 // ---------------------------------------------------------------------------
@@ -652,7 +653,7 @@ static DRAIN_GROUP_WIDTH_MAX: AtomicU64 = AtomicU64::new(0);
 
 /// Publish the armed plan's shape for the stats inode (called once per
 /// `try_start`; sim pools publish their singleton identity too).
-pub(crate) fn publish_drain_group_plan(plan: &[std::ops::Range<u16>]) {
+pub(crate) fn publish_drain_group_plan(plan: &[Vec<u16>]) {
     DRAIN_GROUPS.store(plan.len() as u64, Ordering::Relaxed);
     DRAIN_GROUP_WIDTH_MAX.store(
         plan.iter().map(|g| g.len()).max().unwrap_or(0) as u64,
@@ -711,7 +712,7 @@ fn drain_group_width_env() -> Option<usize> {
 }
 
 /// The drain-group plan (ingress-queue-spread lever 2): partition qids
-/// `0..nqueues` into ascending, contiguous groups — one drain context
+/// `0..nqueues` into groups by node MEMBERSHIP — one drain context
 /// (thread + io_uring + eventfd + coalescer) per group. The 2026-08-05
 /// evidence: with one context per possible CPU, IOPS scale NEGATIVELY
 /// with submitter spread at constant in-flight (32×8 = 273k vs 8×32 =
@@ -722,80 +723,98 @@ fn drain_group_width_env() -> Option<usize> {
 /// per-queue capacity are untouched, so submitter freedom is never
 /// constrained (the 8×32-pinned-hurts counter-row).
 ///
+/// MEMBERSHIP, never contiguity (the 2026-08-05 field disengagement):
+/// 2-socket boxes commonly number CPUs round-robin across sockets
+/// (node0 = even, node1 = odd), so contiguous node runs are length 1 and
+/// a run-based plan silently derives the A0 per-queue posture
+/// (`transport_drain_groups == queues`, width 1 — squeeze-test, live).
+/// The portable-by-default law covers arbitrary NUMBERINGS, not just
+/// arbitrary domain counts. Groups are qid-ascending within each node's
+/// membership list; exactly one group leads with qid 0 (its node's set
+/// starts at the global minimum), which is what the SQPOLL leader
+/// election keys on.
+///
 /// Width derivation:
-/// - default = [`drain_group_width`] evaluated PER NODE RUN — the house
-///   `cpus/4` drain-parallelism slope on the run's possible-CPU span
-///   (floor 1), so both the context count AND the width derive from
-///   machine shape (counted local bracket, 2026-08-05: the slope's value
-///   at the 32-possible shape — 8 — halved the per-op drain cost at IOPS
-///   par while whole-node widths collapsed on the single-thread drain
-///   ceiling; the function's doc carries the numbers);
-/// - clamped to the NUMA node span: groups never span a node, so every
-///   member arena stays local to its drain thread (`qid_is_cpu == false`
-///   has no qid↔CPU correspondence — no node info exists and the plan
-///   falls back to flat width-chunks, the per-queue placement law).
-///   Unknown-node HOLES (offline/isolated possible CPUs — sysfs node
-///   cpulists carry online CPUs only) join the current run instead of
-///   breaking it: a hole's queue is dormant (`task_cpu` never names an
-///   offline CPU), so it carries no locality cost, and breaking on holes
-///   fragments a single-node box into per-hole slivers;
+/// - default = [`drain_group_width`] evaluated PER NODE SET — the house
+///   `cpus/4` drain-parallelism slope on the set's visible possible-CPU
+///   population (floor 1), so both the context count AND the width derive
+///   from machine shape (counted local bracket, 2026-08-05: the slope's
+///   value at the 32-possible shape — 8 — halved the per-op drain cost at
+///   IOPS par while whole-node widths collapsed on the single-thread
+///   drain ceiling; the function's doc carries the numbers);
+/// - groups never span a node (membership partition — structural), so
+///   every member arena stays local to its drain thread;
+/// - the RESIDUAL set — unknown-node qids: offline/isolated possible CPUs
+///   (sysfs node cpulists carry online CPUs only), dormant by
+///   construction (`task_cpu` never names an offline CPU), plus the whole
+///   range under testing queue overrides (`qid_is_cpu == false`: no
+///   qid↔CPU correspondence, no node info — the per-queue placement law)
+///   — chunks at the MACHINE-span slope: no locality constraint exists,
+///   dormant queues cost one context per machine-width chunk instead of
+///   one each, and a later mass-online still lands on bounded-width
+///   contexts;
 /// - `BufRing` sessions keep width 1 (today's posture byte-identical):
 ///   the kmbuf fixed-headers/bufring registration is per-ring per-queue
 ///   in the sqz kernel surface — grouping under kmbuf is the named
 ///   follow-on, never a silent behavior fork;
 /// - `SQUEEZEFS_FUSE_DRAIN_GROUP` explicit width wins verbatim (still
-///   node-split: node containment is structural, not tuning).
+///   membership-partitioned: node containment is structural, not tuning).
 pub fn drain_group_plan(
     nqueues: usize,
     buffer_mode: TransportBufferMode,
     qid_is_cpu: bool,
     node_of: impl Fn(usize) -> Option<usize>,
     explicit_width: Option<usize>,
-) -> Vec<std::ops::Range<u16>> {
+) -> Vec<Vec<u16>> {
     // kmbuf: per-ring per-queue registration — singleton groups (an
     // explicit width never overrides the format constraint).
     let forced_width = match buffer_mode {
         TransportBufferMode::BufRing => Some(1),
         TransportBufferMode::UserEnts => explicit_width.map(|w| w.max(1)),
     };
-    // Pass 1: segment qids into maximal NODE RUNS — break ONLY when two
-    // KNOWN nodes disagree; unknown-node holes join (offline/isolated
-    // possible CPUs are dormant queues), and a hole-only run adopts the
-    // first known node it meets. Node consulted ONLY under the qid↔CPU
-    // correspondence (testing queue overrides carry no per-qid node
-    // meaning — the whole range is one flat span).
-    let mut runs: Vec<std::ops::Range<usize>> = Vec::new();
-    let mut start = 0usize;
-    let mut run_node: Option<usize> = None;
+    // Pass 1: partition qids by node MEMBERSHIP, order-preserving within
+    // each node's qid list — NEVER by contiguity (the 2026-08-05 field
+    // disengagement: interleaved node numbering — node0 even qids, node1
+    // odd — made every contiguous run length 1 and the whole lever derive
+    // the A0 posture; contiguity was never load-bearing, each member
+    // queue keeps its own SlotTable/ordering and the drain thread pins to
+    // the NODE its members genuinely share). BTreeMap for deterministic
+    // node order. Node consulted ONLY under the qid↔CPU correspondence
+    // (testing queue overrides carry no per-qid node meaning — the whole
+    // range is one flat residual set).
+    let mut node_sets: std::collections::BTreeMap<usize, Vec<u16>> =
+        std::collections::BTreeMap::new();
+    // The residual set: unknown-node qids — offline/isolated possible
+    // CPUs (sysfs node cpulists carry online CPUs only), dormant by
+    // construction (`task_cpu` never names an offline CPU) — plus the
+    // whole range when no qid↔CPU correspondence exists.
+    let mut residual: Vec<u16> = Vec::new();
     for qid in 0..nqueues {
-        let node = if qid_is_cpu { node_of(qid) } else { None };
-        if qid == start {
-            run_node = node;
-            continue;
-        }
-        if matches!((node, run_node), (Some(n), Some(r)) if n != r) {
-            runs.push(start..qid);
-            start = qid;
-            run_node = node;
-        } else if run_node.is_none() {
-            run_node = node;
+        match if qid_is_cpu { node_of(qid) } else { None } {
+            Some(n) => node_sets.entry(n).or_default().push(qid as u16),
+            None => residual.push(qid as u16),
         }
     }
-    if nqueues > start {
-        runs.push(start..nqueues);
-    }
-    // Pass 2: chunk each run at its own width — the explicit/kmbuf width
-    // verbatim, else the cpus/4 slope on the RUN's possible-CPU span
-    // (the run IS the node's contiguous span; queues == possible CPUs).
-    let mut plan: Vec<std::ops::Range<u16>> = Vec::new();
-    for run in runs {
-        let width = forced_width.unwrap_or_else(|| drain_group_width(run.len()));
-        let mut s = run.start;
-        while s < run.end {
-            let e = (s + width).min(run.end);
-            plan.push(s as u16..e as u16);
-            s = e;
+    // Pass 2: chunk each set at its own width — the explicit/kmbuf width
+    // verbatim, else the cpus/4 slope on the SET's population (the set IS
+    // the node's visible possible-CPU population; queues == possible
+    // CPUs). The residual set carries no locality constraint, so it rides
+    // the MACHINE-span slope — dormant queues cost one context per
+    // machine-width chunk instead of one each, and a later mass-online
+    // still has bounded-width contexts serving it.
+    let mut plan: Vec<Vec<u16>> = Vec::new();
+    let mut chunk = |set: Vec<u16>, width: usize| {
+        for c in set.chunks(width.max(1)) {
+            plan.push(c.to_vec());
         }
+    };
+    for (_node, set) in node_sets {
+        let width = forced_width.unwrap_or_else(|| drain_group_width(set.len()));
+        chunk(set, width);
+    }
+    if !residual.is_empty() {
+        let width = forced_width.unwrap_or_else(|| drain_group_width(nqueues));
+        chunk(residual, width);
     }
     plan
 }
@@ -2333,7 +2352,7 @@ impl FuseOverUring {
             let wake = unsafe { OwnedFd::from_raw_fd(efd) };
             let wake_fd = wake.as_raw_fd();
             wake_fds.push(wake_fd);
-            for qid in qids.clone() {
+            for &qid in qids.iter() {
                 group_of[qid as usize] = gi as u16;
             }
             group_handles.push(GroupHandle {
@@ -2396,11 +2415,13 @@ impl FuseOverUring {
             let err_tx = err_tx.clone();
             let qids = pool.groups[gi].qids.clone();
             // Thread-name compat: a singleton group keeps today's
-            // per-queue name (comm truncates at 15 chars anyway).
+            // per-queue name; multi-member groups carry first-last as a
+            // membership LABEL, not a range (comm truncates at 15 chars
+            // anyway).
             let name = if qids.len() == 1 {
-                format!("fuse-over-uring-{}", qids.start)
+                format!("fuse-over-uring-{}", qids[0])
             } else {
-                format!("fuse-over-uring-{}-{}", qids.start, qids.end - 1)
+                format!("fuse-over-uring-{}-{}", qids[0], qids[qids.len() - 1])
             };
             let h = std::thread::Builder::new()
                 .name(name)
@@ -2572,7 +2593,7 @@ impl FuseOverUring {
                 wake_fd,
                 _wake: wake,
                 wake_coalescer: Arc::new(WakeCoalescer::new()),
-                qids: qid..qid + 1,
+                qids: vec![qid],
             });
             commit_rxs.push(commit_rx);
         }
@@ -3301,20 +3322,20 @@ fn queue_worker(
     // (affinity home, SQPOLL leader election); per-request logs and reply
     // addressing always carry the member's REAL qid.
     let qids = pool.groups[group_idx].qids.clone();
-    let first_qid = qids.start;
+    let first_qid = qids[0];
     let g = qids.len();
     // The group's NUMA node (NUMA-affinity campaign 2026-07-31): the
     // kernel routes requests to the queue of the requester's CPU, so on
     // queue-per-possible-CPU sessions qid IS a kernel cpu id and the
-    // group's home node is a map lookup on any member (the plan never
-    // lets a group span nodes). Testing queue overrides break the
+    // group's home node is a map lookup on any member (the membership
+    // partition never lets a group span nodes; the residual set has no
+    // known node by construction). Testing queue overrides break the
     // correspondence — no per-queue node, no placement.
     let queue_node = if pool.qid_is_cpu {
-        // First member with a KNOWN node (offline-CPU holes report none —
-        // the plan lets them join a run, so the group's home is its first
-        // online member's node).
-        qids.clone()
-            .find_map(|q| crate::numa_core::topology().node_of_cpu(q as usize))
+        // First member with a KNOWN node (residual-set members report
+        // none — offline/unmapped possible CPUs).
+        qids.iter()
+            .find_map(|&q| crate::numa_core::topology().node_of_cpu(q as usize))
     } else {
         None
     };
@@ -3432,7 +3453,7 @@ fn queue_worker(
     }
     let wake_coalescer = Arc::clone(&pool.groups[group_idx].wake_coalescer);
     let mut members: Vec<MemberState> = Vec::with_capacity(g);
-    for qid in qids.clone() {
+    for &qid in qids.iter() {
         let member_node = if pool.qid_is_cpu {
             crate::numa_core::topology().node_of_cpu(qid as usize)
         } else {
@@ -3555,8 +3576,10 @@ fn queue_worker(
     // reply-address word this ring's SQEs carry (round-trip pinned by
     // `drain_group_tests::gent_user_data_round_trips`).
     let gent_of = |mi: usize, ent: usize| mi * depth + ent;
-    let member_of_qid =
-        |q: u16| -> Option<usize> { (qids.contains(&q)).then(|| (q - qids.start) as usize) };
+    // Membership lookup, not offset arithmetic: groups are node-membership
+    // SETS (interleaved numberings are the field norm). A linear scan over
+    // ≤ width members beats a map at these sizes.
+    let member_of_qid = |q: u16| -> Option<usize> { qids.iter().position(|&x| x == q) };
 
     // REGISTER shape per mode: classical = 2 iovecs (header + payload);
     // kmbuf = no iovecs, `init.flags = FUSE_URING_BUF_RING`,
@@ -6685,18 +6708,65 @@ mod drain_wait_tests {
 mod drain_group_tests {
     use super::*;
 
-    /// Two-node 32-CPU box (the field shape): the `cpus/4` slope on each
+    /// THE FIELD SHAPE (2026-08-05 disengagement finding): squeeze-test's
+    /// 2-socket node numbering is INTERLEAVED — node0 = even qids, node1 =
+    /// odd qids (a common BIOS round-robin numbering). The contiguous-run
+    /// plan derived 32 singleton groups there (every run length 1 —
+    /// `transport_drain_groups=32 width=1`, the A0 posture, structurally
+    /// disengaged). Grouping is by node MEMBERSHIP: two 16-qid sets, the
+    /// cpus/4 slope per set ⇒ 8 groups of 4, every group single-node —
+    /// the portable-by-default law applied to arbitrary NUMBERINGS, not
+    /// just arbitrary domain counts.
+    #[test]
+    fn interleaved_node_numbering_groups_by_membership() {
+        let node_of = |cpu: usize| Some(cpu % 2); // node0 even, node1 odd
+        let plan = drain_group_plan(32, TransportBufferMode::UserEnts, true, node_of, None);
+        assert_eq!(
+            plan.len(),
+            8,
+            "2 nodes × (16/4) contexts — never 32 singletons: {plan:?}"
+        );
+        assert!(
+            plan.iter().all(|g| g.len() == 4),
+            "width = node population / 4 on 16-possible nodes: {plan:?}"
+        );
+        // Node containment + qid order preserved within each group.
+        for g in &plan {
+            assert!(
+                g.iter().all(|&q| q % 2 == g[0] % 2),
+                "a group never spans nodes: {g:?}"
+            );
+            assert!(
+                g.windows(2).all(|w| w[0] < w[1]),
+                "qid order preserved within the group: {g:?}"
+            );
+        }
+        // The SQPOLL-leader law: exactly one group leads with qid 0.
+        assert_eq!(
+            plan.iter().filter(|g| g[0] == 0).count(),
+            1,
+            "exactly one group carries qid 0 as its first member"
+        );
+        // The first node's members are the even qids, chunked in order.
+        assert_eq!(plan[0], vec![0, 2, 4, 6]);
+    }
+
+    /// Two-node 32-CPU contiguous-block box: the `cpus/4` slope on each
     /// 16-possible node gives width 4 — four contexts per node, groups
     /// never spanning a node (member arenas stay node-local to their
-    /// drain thread).
+    /// drain thread). Contiguous boxes derive the SAME memberships the
+    /// run-based plan produced.
     #[test]
     fn default_width_is_the_cpus_over_4_slope_node_split() {
         let node_of = |cpu: usize| Some(cpu / 16); // 2 nodes × 16
         let plan = drain_group_plan(32, TransportBufferMode::UserEnts, true, node_of, None);
+        let expect: Vec<Vec<u16>> = (0u16..32)
+            .step_by(4)
+            .map(|s| (s..s + 4).collect())
+            .collect();
         assert_eq!(
-            plan,
-            vec![0u16..4, 4..8, 8..12, 12..16, 16..20, 20..24, 24..28, 28..32],
-            "width = node span / 4: 4 contexts per 16-possible node"
+            plan, expect,
+            "width = node population / 4: 4 contexts per 16-possible node"
         );
     }
 
@@ -6714,11 +6784,15 @@ mod drain_group_tests {
         // byte-identical to the counted bracket winner, so the A/B rows
         // carry over verbatim.
         let plan = drain_group_plan(32, TransportBufferMode::UserEnts, true, node_of, None);
-        assert_eq!(plan, vec![0u16..8, 8..16, 16..24, 24..32]);
+        let expect: Vec<Vec<u16>> = (0u16..32)
+            .step_by(8)
+            .map(|s| (s..s + 8).collect())
+            .collect();
+        assert_eq!(plan, expect);
         // Tiny boxes land on the floor: 4 possible CPUs ⇒ width 1 —
         // exactly today's per-queue posture.
         let plan = drain_group_plan(4, TransportBufferMode::UserEnts, true, node_of, None);
-        assert_eq!(plan, vec![0u16..1, 1..2, 2..3, 3..4]);
+        assert_eq!(plan, vec![vec![0u16], vec![1], vec![2], vec![3]]);
     }
 
     /// kmbuf sessions keep today's one-context-per-queue posture
@@ -6729,28 +6803,29 @@ mod drain_group_tests {
     fn bufring_mode_keeps_singleton_groups() {
         let node_of = |_cpu: usize| Some(0);
         let plan = drain_group_plan(4, TransportBufferMode::BufRing, true, node_of, None);
-        assert_eq!(plan, vec![0u16..1, 1..2, 2..3, 3..4]);
+        assert_eq!(plan, vec![vec![0u16], vec![1], vec![2], vec![3]]);
     }
 
     /// `SQUEEZEFS_FUSE_DRAIN_GROUP` explicit width wins verbatim (the
-    /// ipc-cap explicit-wins pattern) — still node-split, because node
-    /// containment is a structural property (arena locality), not tuning.
+    /// ipc-cap explicit-wins pattern) — still membership-partitioned,
+    /// because node containment is a structural property (arena
+    /// locality), not tuning.
     #[test]
     fn explicit_width_wins_verbatim_but_never_spans_a_node() {
         let node_of = |cpu: usize| Some(cpu / 4); // nodes of 4
         let plan = drain_group_plan(8, TransportBufferMode::UserEnts, true, node_of, Some(3));
         assert_eq!(
             plan,
-            vec![0u16..3, 3..4, 4..7, 7..8],
+            vec![vec![0u16, 1, 2], vec![3], vec![4, 5, 6], vec![7]],
             "width 3 chunks inside each 4-wide node"
         );
     }
 
     /// Testing queue overrides (`qid_is_cpu == false`) have no qid↔CPU
-    /// correspondence, so no node info exists: one flat span with the
-    /// slope evaluated on the whole range, exactly like the per-queue
-    /// NUMA placement law (no correspondence ⇒ no per-queue node
-    /// derivation).
+    /// correspondence, so no node info exists: the whole range is one
+    /// residual set with the slope evaluated on the machine span, exactly
+    /// like the per-queue NUMA placement law (no correspondence ⇒ no
+    /// per-queue node derivation).
     #[test]
     fn no_cpu_correspondence_falls_back_to_flat_chunks() {
         let node_of = |_cpu: usize| -> Option<usize> {
@@ -6758,54 +6833,61 @@ mod drain_group_tests {
         };
         // 5 queues: 5/4 = 1 ⇒ singleton groups (the floor posture).
         let plan = drain_group_plan(5, TransportBufferMode::UserEnts, false, node_of, None);
-        assert_eq!(plan, vec![0u16..1, 1..2, 2..3, 3..4, 4..5]);
+        assert_eq!(plan, vec![vec![0u16], vec![1], vec![2], vec![3], vec![4]]);
         // 32 queues flat: 32/4 = 8 ⇒ four chunks of 8.
         let plan = drain_group_plan(32, TransportBufferMode::UserEnts, false, node_of, None);
-        assert_eq!(plan, vec![0u16..8, 8..16, 16..24, 24..32]);
+        let expect: Vec<Vec<u16>> = (0u16..32)
+            .step_by(8)
+            .map(|s| (s..s + 8).collect())
+            .collect();
+        assert_eq!(plan, expect);
     }
 
-    /// Offline-CPU holes are node-AGNOSTIC, never run breakers: queues =
-    /// kernel POSSIBLE CPUs, but sysfs node cpulists carry only ONLINE
-    /// ones, so a box with offline/isolated CPUs hands back `None` holes
-    /// all through the qid range (the dev box: 25 online of 32 possible ⇒
-    /// 15 fragments instead of 4 groups). A hole's queue is dormant
-    /// (task_cpu never names an offline CPU), so it joins the current run
-    /// free of locality cost. (Explicit width 32 isolates the node law
-    /// from the width constant.)
+    /// Offline-CPU holes ride the RESIDUAL set, never fragmenting node
+    /// sets: queues = kernel POSSIBLE CPUs, but sysfs node cpulists carry
+    /// only ONLINE ones, so offline/isolated CPUs report no node. They
+    /// are dormant by construction (`task_cpu` never names an offline
+    /// CPU) and carry no locality constraint, so the residual set chunks
+    /// at the MACHINE-span slope — bounded contexts even under a later
+    /// mass-online, and never one thread+ring per dormant queue.
     #[test]
-    fn offline_cpu_holes_join_the_run_instead_of_fragmenting_it() {
+    fn offline_cpu_holes_ride_the_residual_set() {
         // The dev-box shape: one node, holes at 4, 6, 14, 16, 22, 24, 30.
-        let node_of = |cpu: usize| match cpu {
-            4 | 6 | 14 | 16 | 22 | 24 | 30 => None,
-            _ => Some(0),
+        let holes: [usize; 7] = [4, 6, 14, 16, 22, 24, 30];
+        let node_of = |cpu: usize| {
+            if holes.contains(&cpu) {
+                None
+            } else {
+                Some(0)
+            }
         };
-        let plan = drain_group_plan(32, TransportBufferMode::UserEnts, true, node_of, Some(32));
+        let plan = drain_group_plan(32, TransportBufferMode::UserEnts, true, node_of, None);
+        // node0 set = 25 online qids at width 25/4 = 6 ⇒ 5 chunks
+        // (6,6,6,6,1); residual = 7 dormant qids at the machine-span
+        // width 32/4 = 8 ⇒ ONE group of 7.
+        assert_eq!(plan.len(), 6, "5 node chunks + 1 residual group: {plan:?}");
+        let residual = plan.last().expect("nonempty plan");
         assert_eq!(
-            plan,
-            vec![0u16..32],
-            "unknown-node holes must not fragment a single-node box"
+            residual,
+            &holes.iter().map(|&c| c as u16).collect::<Vec<_>>(),
+            "the residual group is exactly the offline set, qid-ascending"
         );
-        // Holes at a node BOUNDARY still never merge two known nodes: the
-        // holes attach to the run they follow, and the next KNOWN node
-        // starts its own group.
-        let node_of = |cpu: usize| match cpu {
-            15 | 16 => None,
-            c => Some(c / 16),
-        };
-        let plan = drain_group_plan(32, TransportBufferMode::UserEnts, true, node_of, Some(32));
-        assert_eq!(
-            plan,
-            vec![0u16..17, 17..32],
-            "a hole may extend a run, but two known nodes never share a group"
+        assert!(
+            plan[..5]
+                .iter()
+                .all(|g| g.iter().all(|&q| node_of(q as usize) == Some(0))),
+            "node chunks carry only node members: {plan:?}"
         );
+        // Holes never fragment the node set (the pre-fix dev-box bug
+        // shape was 15 fragments).
+        assert_eq!(plan[0].len(), drain_group_width(25));
     }
 
-    /// Coverage + ordering law: every qid appears exactly once, in
-    /// ascending order, whatever the topology hands back (including
-    /// unknown-node holes) — the group worker's per-queue FIFO servicing
-    /// order rides this.
+    /// Coverage law: every qid appears exactly once whatever the topology
+    /// hands back (interleaved nodes + an unknown-node hole), and every
+    /// group is qid-ascending (the worker's member construction order).
     #[test]
-    fn plan_covers_every_qid_exactly_once_in_order() {
+    fn plan_covers_every_qid_exactly_once() {
         // Pathological map: alternating nodes + an unknown-node hole.
         let node_of = |cpu: usize| match cpu {
             7 => None,
@@ -6815,8 +6897,10 @@ mod drain_group_tests {
         let mut seen: Vec<u16> = Vec::new();
         for g in &plan {
             assert!(!g.is_empty(), "no empty groups");
+            assert!(g.windows(2).all(|w| w[0] < w[1]), "qid-ascending: {g:?}");
             seen.extend(g.clone());
         }
+        seen.sort_unstable();
         assert_eq!(seen, (0u16..17).collect::<Vec<_>>());
     }
 

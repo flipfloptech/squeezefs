@@ -31,17 +31,33 @@ the named follow-on).
 Width is **DERIVED, never a constant** (hard-constant ruling 2026-08-05):
 `drain_group_width(node_possible_cpus) = max(node_possible_cpus / 4, 1)`
 — the house `cpus/4` drain-parallelism SLOPE (`il_sessions_default` /
-`dd_shards_from` lineage), evaluated per NODE RUN (groups never span a
-NUMA node; offline-CPU holes join runs — sysfs node cpulists carry
-online CPUs only; floor 1 = a context owns at least one queue, and the
-node-span ceiling is implicit). On the bracket venue (32-possible/1-node)
-the slope evaluates to **8 — byte-identical to the counted bracket
-winner**, so the §3/§4 rows carry over verbatim for this shape; the
-field ladder re-grades the SLOPE, not a constant. Canonical shapes
-(drift-is-red tie test): 32-possible/1-node ⇒ 8; 96-possible/2-node ⇒ 12
-per node; 4-CPU box ⇒ 1 (today's per-queue posture).
-`SQUEEZEFS_FUSE_DRAIN_GROUP` (registry, 1..=512) wins verbatim; `=1` is
-the A0 per-queue-worker control.
+`dd_shards_from` lineage), evaluated per node MEMBERSHIP SET (floor 1 =
+a context owns at least one queue; the node-span ceiling is implicit).
+On the bracket venue (32-possible/1-node) the slope evaluates to **8 —
+byte-identical to the counted bracket winner**, so the §3/§4 rows carry
+over verbatim for this shape; the field ladder re-grades the SLOPE, not
+a constant. Canonical shapes (drift-is-red tie test): 32-possible/1-node
+⇒ 8; 96-possible/2-node ⇒ 12 per node; **interleaved 32-possible/2-node
+(node0 = even qids, node1 = odd) ⇒ 8 groups of 4**; 4-CPU box ⇒ 1
+(today's per-queue posture). `SQUEEZEFS_FUSE_DRAIN_GROUP` (registry,
+1..=512) wins verbatim; `=1` is the A0 per-queue-worker control.
+
+**Interleave fix (2026-08-05 field disengagement, `fix/drain-group-
+interleave`):** the first landing partitioned by CONTIGUOUS node runs;
+squeeze-test's BIOS numbers CPUs round-robin across sockets (node0 =
+0,2,…,30; node1 = 1,3,…,31), so every run was length 1 and the live
+mount read `transport_drain_groups=32 width=1` — the A0 posture,
+structurally disengaged (the portable-by-default law's failure class:
+arbitrary NUMBERINGS, not just arbitrary domain counts). Groups now form
+by node MEMBERSHIP (order-preserving per-node qid sets, chunked at the
+slope on the set's population); contiguity was never load-bearing —
+each member queue keeps its own `SlotTable`/ordering and the drain
+thread pins to the node its members genuinely share. Offline/unmapped
+possible CPUs form a RESIDUAL set chunked at the machine-span slope
+(dormant by construction — `task_cpu` never names an offline CPU — so
+they cost one context per machine-width chunk, never one each, and a
+later mass-online still lands on bounded-width contexts). Expected field
+gauges on redeploy: `transport_drain_groups=8 width=4`.
 
 ## 2. Protocol lesson (recorded so the next bracket does not repay it)
 

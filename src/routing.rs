@@ -3483,6 +3483,21 @@ pub static TEST_BINDING_RECHECK_DELAY_MS: std::sync::atomic::AtomicU64 =
 pub static TEST_FILL_PRE_DEPOSIT_STALL_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Test seam (same contract as [`TEST_TIER_PUBLISH_DELAY_MS`]): artificial
+/// delay, in milliseconds, at the FIRST POLL of a spawned §5.5 pipeline
+/// task — the deterministic stand-in for a LOADED box parking the task in
+/// the runtime's queue between the issue-side accounting (the
+/// `next_prefetch_block` CAS that puts its block inside the detector's
+/// `[issued_base, next_prefetch_block)` span) and the point the block
+/// becomes FINDABLE (the single-flight registry insert / RAM deposit).
+/// The 2026-08-05 gate flake lived exactly in that window: the consumer
+/// arrived first, probed every tier + the flight registry, found nothing,
+/// and counted a fill that never existed as `prefetch_evicted_unconsumed`
+/// (load selects such schedules; it never causes them). One relaxed load
+/// per spawned task, zero-cost when unset; never set in production.
+pub static TEST_PREFETCH_TASK_DELAY_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// R1b disk-tier admission mode (docs/design-read-path.md §5.3), resolved
 /// once per router from `SQUEEZEFS_READ_TIER_ADMISSION`
 /// (`always|second-touch|never`, default `second-touch`; unrecognized
@@ -6965,6 +6980,13 @@ impl DataRouter {
         use std::sync::atomic::Ordering::Relaxed;
         let router = self.clone();
         crate::bg_admit::spawn_bg(async move {
+            // TEST SEAM ([`TEST_PREFETCH_TASK_DELAY_MS`]): the parked-task
+            // window, held open deterministically — everything below this
+            // line is exactly what a loaded scheduler defers.
+            let seam_ms = TEST_PREFETCH_TASK_DELAY_MS.load(std::sync::atomic::Ordering::Relaxed);
+            if seam_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(seam_ms)).await;
+            }
             let lane = &lanes.lanes[lane_idx];
             let settle = |completed: bool| {
                 lane.inflight.fetch_sub(1, Relaxed);

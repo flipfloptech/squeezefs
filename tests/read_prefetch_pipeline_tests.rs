@@ -532,4 +532,58 @@ async fn pipeline_phases() {
         0,
         "in-flight gauge must return to zero after shed + resumed issue"
     );
+
+    drop(h5);
+
+    // ---- Phase H: parked-task false-positive control (the 2026-08-05
+    // gate flake, deterministic). A LOADED box can park a spawned
+    // pipeline task arbitrarily long between the issue-side accounting
+    // (the `next_prefetch_block` CAS that puts its block inside the
+    // detector's `[issued_base, next_prefetch_block)` span) and the
+    // task's first poll — the earliest point the block can become
+    // FINDABLE (single-flight registry insert, then the RAM deposit).
+    // A consumer arriving inside that window probes every tier + the
+    // flight registry, finds nothing, and — pre-fix — counted a fill
+    // that never existed as `prefetch_evicted_unconsumed`, halving the
+    // window and arming quiescence against a healthy lane. §5.5
+    // mechanism iii's law says the event is a block the pipeline
+    // "ALREADY FETCHED" that misses the tiers: a parked task has
+    // fetched nothing, so the verdict here must be silence, not a
+    // spiral count. The seam models the parked task deterministically
+    // (load selects such schedules; it never causes them — the
+    // SQUEEZEFS_TEST_WRITE_STALL_MS doctrine). Budget is the clean
+    // 64 MB default against a 4 MB stream: NOTHING can be evicted.
+    //
+    // Load recipe that surfaced the original flake (finding-only —
+    // this phase is the landed repro): 48 `while :; do :; done` shell
+    // busy-loops at nice 0 with the suite at nice 12 on a 32-CPU box
+    // (the gate box's foreign `nice -n -5 cargo build` shape), test
+    // binary looped `--test-threads=1`.
+    let h6 = make_with(*b"pipeline-h-pr5v3", "pipe_ns_h").await;
+    let ino_h = make_cold_file(&h6, "pipe_h", 8, 220).await;
+    let evicted0 = METRICS.prefetch_evicted_unconsumed.load(Ordering::Relaxed);
+    let wasted0 = METRICS.prefetch_wasted.load(Ordering::Relaxed);
+    squeezefs::routing::TEST_PREFETCH_TASK_DELAY_MS.store(400, Ordering::Relaxed);
+    stream_file(&h6, ino_h, 8, 220).await;
+    squeezefs::routing::TEST_PREFETCH_TASK_DELAY_MS.store(0, Ordering::Relaxed);
+    settle_pipeline().await;
+    assert_eq!(
+        METRICS.prefetch_evicted_unconsumed.load(Ordering::Relaxed) - evicted0,
+        0,
+        "a parked (issued-but-never-polled) pipeline task is NOT an \
+         eviction: nothing was fetched, nothing was lost — counting it \
+         makes the refetch-spiral detector lie under load and AIMD/\
+         quiesce a healthy lane (the 2026-08-05 gate flake)"
+    );
+    assert_eq!(
+        METRICS.prefetch_wasted.load(Ordering::Relaxed) - wasted0,
+        0,
+        "parked tasks resume into foreground-deposited blocks and settle \
+         completed — never wasted (task-ledger closure)"
+    );
+    assert_eq!(
+        METRICS.prefetch_inflight_bytes.load(Ordering::Relaxed),
+        0,
+        "in-flight gauge returns to zero after the parked tasks resume"
+    );
 }

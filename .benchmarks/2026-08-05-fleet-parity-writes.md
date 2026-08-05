@@ -54,7 +54,38 @@ not move with THP off. (An earlier ad-hoc THP-0 bracket was INVALID —
 28 % engagement from budget refusals with 15 s gaps; the instrument's
 settle exists for exactly this and the invalid rows are not cited.)
 
-## Open: the ~0.8× write residual
+## ADDENDUM (same day, runs 8–12): the DURABLE verdict — the relaxed rows measured absorption
+
+The attribution timeline (1 Hz `/proc/diskstats` under both arms) proved the
+relaxed rows' 17–26 GB/s ran over a device plane sustaining ~2.5–3 GB/s:
+buffered 137 GB fleets against 251 GB RAM measure page-cache/park
+ABSORPTION, not the write path. Per the RW6 law (durable rows govern write
+verdicts) the instrument now defaults to `end_fsync` with wall-clock rate
+(`user_bytes / max per-job job_runtime`; three fio-JSON traps documented
+in-file: bw_bytes excludes the fsync stall, group_reporting SUMS
+job_runtime, `elapsed` is integer seconds).
+
+**Durable rows (runs 10–12, ms precision, engagement exact, settles held):**
+
+| run | mode | il write | kern write | il/kern |
+|---|---|---|---|---|
+| 11 | THP on | 16.4 / 23.2 / 16.7 | 23.9–25.5 | ~0.66–0.72 |
+| 12 | THP off | 16.1 / 18.1 / 17.0 | 21.9–25.7 | ~0.70–0.75 |
+
+The relaxed-row variance (14–26 GB/s swings) VANISHED under fsync — it was
+absorption-race noise, never the write path. **Stable verdict: il durable
+write ≈ 0.70–0.75× kernel at the 256-proc psync bs=1M shape.** Prep-during-
+row falsified on BOTH shapes (relaxed and durable); inval venue falsified;
+R5/leak fixed and Green throughout. Durable READS: il +14..+25 % (kern
+~17–20, il ~20–25), consistent with every earlier run.
+
+Also found run 8→9: after ENOSPC + rm churn the LIVE statfs drifted ~190 GB
+high (319 GB "used" vs 128 GB of files, reclaim drained); remount converged
+instantly — on-disk accounting sound, live-gauge drift only. Report-only,
+filed for a red repro (ENOSPC-then-delete ⇒ statfs converges without
+remount).
+
+## Open: the durable-write decomposition (next)
 
 Facts to explain: (a) il write VARIANCE is large (14.7–23.1 GB/s across
 valid rows) while kernel rows are tight (19.5–26.1, mostly 22–23) — the

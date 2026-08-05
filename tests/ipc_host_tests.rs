@@ -2299,3 +2299,84 @@ fn a_saturating_session_cannot_starve_its_service_thread_siblings() {
     assert_eq!(slot_b.result(), 4096, "B's op is served, not just noticed");
     host.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// fleet-launch admission economy (perf/shim-fleet-parity, D12 board item 2)
+// ---------------------------------------------------------------------------
+
+/// The 256-session fleet regression (D12 board item 2): session admission
+/// paid the arena THP preparation — `MADV_POPULATE_WRITE` +
+/// `MADV_COLLAPSE` over the FULL arena (64–120 MiB) — synchronously on
+/// the ctl thread BEFORE `SessionOk`, so a fleet launch serialized
+/// O(width × arena_bytes) of memory work (populate fault+zero, collapse
+/// re-copy, huge-folio allocation → direct compaction on fragmented
+/// fleet boxes) in front of every client's first op. Local width bracket
+/// (nvmet-tcp devsub, fio psync process-fleet qd1 bs=1M, zero-buffers,
+/// 64 MiB arenas pinned): w256 il/kernel 0.914 with admission-time prep
+/// vs 1.074 without — the whole fleet-width knee.
+///
+/// The contract pinned here: SessionOk must NOT wait for the arena prep
+/// — the job is QUEUED at admission (observable before the reply lands,
+/// since the enqueue precedes the send) and RUNS on the deferred prep
+/// worker, off the hello path, while the session already serves. The
+/// prep itself still happens (the near-zero-copy campaign's PMD law is
+/// untouched — it just stopped being a fleet-launch head tax).
+#[test]
+fn admission_defers_arena_thp_prep_off_the_hello_path() {
+    // Test seam (the SQUEEZEFS_TEST_WRITE_STALL_MS pattern): stall each
+    // prep job long enough to observe the deferred window, short enough
+    // to also watch it complete.
+    std::env::set_var("SQUEEZEFS_TEST_THP_PREP_STALL_MS", "1500");
+    let (host, cfg) = spawn_host("thp-prep");
+    let m = mount_file();
+    host.set_expected_st_dev(m.st_dev);
+    let fd = open_flags(&m.path, libc::O_RDWR);
+
+    let t0 = Instant::now();
+    let (sock, _cs) = establish(&cfg, &host, fd.as_raw_fd());
+    let establish_elapsed = t0.elapsed();
+
+    // RED against the admission-time-prep code: nothing queues (the prep
+    // ran inline inside handle_hello_msg) — counts read (0, 0).
+    let (queued, done) = host.arena_prep_counts();
+    assert_eq!(
+        queued, 1,
+        "session admission must QUEUE the arena THP prep for the deferred \
+         worker (queued={queued}) — an inline populate+collapse before \
+         SessionOk is the fleet-launch head tax this test pins away"
+    );
+    assert_eq!(
+        done, 0,
+        "SessionOk arrived, so the prep must still be pending behind the \
+         stall seam — done={done} means admission WAITED for the prep"
+    );
+    assert!(
+        establish_elapsed < Duration::from_millis(1500),
+        "establish ({establish_elapsed:?}) must not absorb the stalled prep"
+    );
+
+    // The session is fully live while its prep is still pending: the ctl
+    // lane binds (control plane) — 4 KiB-paged arenas are correct by
+    // construction, the collapse is an upgrade, never a readiness gate.
+    match bind(&sock, fd.as_raw_fd()) {
+        CtlMsg::BindOk { .. } => {}
+        other => panic!("bind while prep pending: {other:?}"),
+    }
+
+    // The worker completes the prep after the stall (nothing was lost by
+    // deferring — the PMD-upgrade law still runs).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if host.arena_prep_counts().1 == 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "deferred arena prep never completed (queued=1, done stuck at {})",
+            host.arena_prep_counts().1
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::env::remove_var("SQUEEZEFS_TEST_THP_PREP_STALL_MS");
+    host.shutdown();
+}

@@ -622,6 +622,17 @@ pub(crate) fn cq_admitted_window_bytes(cq_entries: u32, sq_entries: u32, chunk: 
     (cq_entries.saturating_sub(sq_entries) as u64) * chunk as u64 * 2
 }
 
+/// How many CONSECUTIVE failover windows (no payload progress between
+/// them) make a starvation episode STRUCTURAL (finding J, round 8):
+/// the FIRST failover is the transient allowance — it releases every
+/// held span, which is the recovery mechanism itself; a SECOND
+/// consecutive window therefore proves the releases did NOT refill the
+/// pool, i.e. the starvation is structural by definition, and holding
+/// 1/32nd of the rail's RSS width for a lane that cannot serve violates
+/// the no-harm law (field: 0.08 % engagement while 8 excluded queues
+/// cost the kernel path ~40 % of the row).
+pub(crate) const REFILL_STRUCTURAL_FAILOVERS: u32 = 2;
+
 /// How long a refill-starvation park may hold the queue's in-flight
 /// fills before they fail over to the kernel path. Derived from the ONE
 /// lane read timeout (never a fresh literal): `LANE_READ_TIMEOUT / 32`
@@ -722,6 +733,15 @@ impl RecvGovernor {
     /// CQEs wake it, and there is nothing to retry FOR.
     pub(crate) fn poll_bounded(&self, pending_work: bool) -> bool {
         self.episode.is_some() && pending_work
+    }
+
+    /// Is the episode STRUCTURAL — [`REFILL_STRUCTURAL_FAILOVERS`]
+    /// consecutive failover windows without payload progress? The
+    /// caller escalates to full session teardown (RSS width restores;
+    /// prolonged-degraded ≡ poisoned in lifecycle terms).
+    pub(crate) fn structural(&self) -> bool {
+        // RED PHASE skeleton — no streak accounting existed.
+        false
     }
 
     /// Has THIS failover window expired? `true` fires at most once per
@@ -1387,6 +1407,38 @@ mod tests {
         );
         assert!(park_fail_bound() >= std::time::Duration::from_millis(500));
         assert!(park_fail_bound() <= std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn recv_governor_second_consecutive_failover_is_structural() {
+        // FINDING J (round 8, the no-harm law): one failover window is
+        // the transient allowance; a SECOND consecutive window without
+        // payload progress proves the releases did not refill the pool
+        // — structural by definition, so the session must RELEASE the
+        // NIC (RSS width restores) instead of holding rail width for a
+        // lane that cannot serve.
+        let mut gov = RecvGovernor::new();
+        let t0 = std::time::Instant::now();
+        let bound = std::time::Duration::from_millis(100);
+        gov.on_park(t0);
+        assert!(gov.failover_due(t0 + bound, bound));
+        assert!(!gov.structural(), "first failover: transient allowance");
+        assert!(gov.failover_due(t0 + bound * 2, bound));
+        assert!(
+            gov.structural(),
+            "second consecutive failover: STRUCTURAL — escalate to teardown"
+        );
+
+        let mut gov2 = RecvGovernor::new();
+        gov2.on_park(t0);
+        assert!(gov2.failover_due(t0 + bound, bound));
+        assert!(gov2.on_progress(), "payload between windows");
+        gov2.on_park(t0 + bound * 3);
+        assert!(gov2.failover_due(t0 + bound * 4, bound));
+        assert!(
+            !gov2.structural(),
+            "progress between windows resets the streak"
+        );
     }
 
     // -- the recv-end law (field finding E) -----------------------------

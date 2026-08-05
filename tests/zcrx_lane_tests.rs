@@ -2501,3 +2501,104 @@ async fn test_gather_fill_closure_holds_across_mid_read_poison() {
     );
     assert_eq!(fill_delta, 1 << 20, "exactly the one healthy read counted");
 }
+
+// ------------------------------------------- round 8: no-harm laws (red)
+
+#[test]
+fn test_poison_gauge_and_log_are_structurally_tied() {
+    // FINDING H (round 8): poisoned=3 in the field with ZERO canonical
+    // poison log lines — the third silent-poison burn. The structural
+    // tie (the skip-ledger source-scan precedent): the gauge increments
+    // ONLY through mark_session_poisoned, which REQUIRES a reason and
+    // ALWAYS logs it; and no site may pre-store a queue's poisoned flag
+    // outside the poison funnels (the 30 s-timeout arms' pre-store
+    // suppressed the queue-level log — a silent-poison vector).
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let initiator =
+        std::fs::read_to_string(root.join("src/zcrx_lane/initiator.rs")).expect("read initiator");
+    let sig_at = initiator
+        .find("fn mark_session_poisoned(")
+        .expect("the one poison funnel exists");
+    let sig = &initiator[sig_at..sig_at + 600];
+    assert!(
+        sig.contains("why: &str"),
+        "mark_session_poisoned must REQUIRE a reason (the funnel law)"
+    );
+    assert!(
+        sig.contains("log::error!"),
+        "the poison funnel must LOG the reason on the winning transition"
+    );
+    // The gauge moves only inside the funnel.
+    assert_eq!(
+        initiator.matches("zcrx_lane_poisoned").count(),
+        1,
+        "zcrx_lane_poisoned increments at exactly ONE site (the funnel)"
+    );
+    // No log-suppressing pre-store: `poisoned.store(true, …)` outside the
+    // funnels makes the poison's first-swap log unreachable.
+    let pre_stores = initiator.matches("poisoned.store(true").count();
+    assert_eq!(
+        pre_stores, 0,
+        "no site may pre-store a poisoned flag outside the poison funnels \
+         (found {pre_stores} — the silent-poison vector)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_admission_overflow_declines_fast_never_parks() {
+    // FINDING I (round 8): 648 admission waits vs 206 fills (>3/fill) —
+    // parked over-admission fed the starvation churn (41 episodes ×
+    // 937 ms of held reads). The law: a lane that can serve N concurrent
+    // fills admits N and DECLINES the rest to the kernel path
+    // immediately (declines are free) — never parks them.
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let cfg = MockCfg {
+        read_gate: Some(Arc::clone(&gate)),
+        ..Default::default()
+    };
+    let mock = MockTarget::start(cfg, 4 << 20).await;
+    // depth 8 × 256 KiB max_xfer ⇒ 2 MiB (PMD-rounded) sim area; the sim
+    // fill window is the whole area ⇒ 1 MiB admitted = FOUR 256 KiB
+    // segments in flight; the fifth must decline.
+    let sess = LaneSession::connect_with(mock.target(1, 8), LaneBackend::AreaSim)
+        .await
+        .expect("arm");
+    let mut held = Vec::new();
+    for i in 0..4u64 {
+        let sess = Arc::clone(&sess);
+        held.push(tokio::spawn(async move {
+            let mut buf = vec![0u8; 256 * 1024];
+            sess.read_into_slice(i * 256 * 1024, &mut buf).await
+        }));
+    }
+    // The four admitted reads are parked at the MOCK's gate (in flight,
+    // permits held). The fifth must return WouldBlock promptly — 2 s is
+    // the generous ceiling that distinguishes an immediate decline from
+    // the old park-until-permits behavior.
+    let mut buf5 = vec![0u8; 256 * 1024];
+    let fifth = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        sess.read_into_slice(1 << 20, &mut buf5),
+    )
+    .await;
+    match fifth {
+        Ok(Err(e)) => {
+            let msg = format!("{e}");
+            assert!(
+                msg.contains("declined"),
+                "the overflow read must DECLINE (kernel path serves): {msg}"
+            );
+        }
+        Ok(Ok(())) => panic!("the fifth read cannot complete while the gate holds all permits"),
+        Err(_) => panic!(
+            "the overflow read PARKED on admission (the 648-waits/206-fills \
+             starvation churn) — it must decline immediately"
+        ),
+    }
+    // Release the target; the admitted four complete normally.
+    gate.add_permits(64);
+    for h in held {
+        h.await.expect("join").expect("admitted read completes");
+    }
+    sess.teardown().await;
+}

@@ -44,6 +44,16 @@ ZERO="${SQZ_FW_ZERO:-0}"
 # becomes whole-block overwrite (CoW rewrite + displaced free) — identical
 # for both transports, so the il/kernel DELTA stays the instrument.
 RUNTIME="${SQZ_FW_RUNTIME:-0}"
+# SQZ_FW_DURABLE=1: durable rows — fio --end_fsync=1, per the RW6 law
+# (durable rows GOVERN write verdicts; the 2026-08-05 field addendum:
+# relaxed 137 GB fleets vs 251 GB RAM measured page-cache/park ABSORPTION,
+# not the write path). The three fio-JSON traps documented in
+# tests/fio/fleet_parity_row.sh apply verbatim: bw_bytes EXCLUDES the
+# fsync stall, group_reporting SUMS job_runtime across jobs, and
+# 'elapsed' is integer seconds. So durable rows run WITHOUT
+# group_reporting and the honest rate is user_bytes / max per-job
+# job_runtime (ms precision).
+DURABLE="${SQZ_FW_DURABLE:-0}"
 SQUEEZEFS_BIN="${SQUEEZEFS_BIN:-$TARGET_DIR/release/squeezefs}"
 SO="${SQZ_FW_SO:-$TARGET_DIR/preload-release/libsqueezefs_il.so}"
 MOUNT_ENV="${SQZ_FW_MOUNT_ENV:-}"      # extra daemon env, e.g. "SQUEEZEFS_IPC_SERVICE_THREADS=12"
@@ -126,8 +136,21 @@ mount_fs() {
 }
 
 fio_bw()   { python3 -c "import json;j=json.load(open('$1'));print(round(sum(job['write']['bw_bytes'] for job in j['jobs'])/1048576))"; }
+# Durable wall-clock rate (MiB/s): user bytes / max per-job job_runtime —
+# the fleet is done when its LAST job's fsync returns. Requires
+# per-job reporting (no group_reporting on durable rows).
+fio_bw_durable() { python3 -c "
+import json
+j = json.load(open('$1'))
+user = sum(job['write']['io_bytes'] for job in j['jobs'])
+wall_ms = max(job.get('job_runtime', 0) for job in j['jobs'])
+print(round(user / (wall_ms / 1000) / 1048576) if wall_ms else 0)"; }
 fio_ops()  { python3 -c "import json;j=json.load(open('$1'));print(sum(job['write']['total_ios'] for job in j['jobs']))"; }
-fio_el()   { python3 -c "import json;j=json.load(open('$1'));print(max(job['write']['runtime'] for job in j['jobs'])/1000.0)"; }
+fio_el()   { if [ "$DURABLE" = 1 ]; then
+                 python3 -c "import json;j=json.load(open('$1'));print(max(job.get('job_runtime',0) for job in j['jobs'])/1000.0)"
+             else
+                 python3 -c "import json;j=json.load(open('$1'));print(max(job['write'].get('runtime',0) for job in j['jobs'])/1000.0)"
+             fi; }
 
 daemon_pid() { pgrep -f " mount .* $MOUNT_DIR" | head -1; }
 
@@ -206,17 +229,27 @@ except KeyboardInterrupt:
     pass
 EOF
     local pstat=$!
+    # Durable rows: --end_fsync=1 and NO group_reporting (the fio-JSON
+    # traps — see the SQZ_FW_DURABLE block up top). Relaxed rows keep the
+    # original grouped form verbatim.
+    local grpflag=(--group_reporting)
+    [ "$DURABLE" = 1 ] && { grpflag=(--end_fsync=1); }
+    # Write-amp instrument (standing row requirement): per-row
+    # /proc/diskstats deltas on the DATA namespaces.
+    grep -E " nvme[0-9]+n[0-9]+ " /proc/diskstats > "$RESULTS/$label.r$rep.dsk.pre"
     "${pfx[@]}" fio --name="$label" --directory="$dir" \
         --filename_format='s_f$jobnum' --numjobs="$width" \
-        --group_reporting --ioengine=psync --rw=write --bs="$BS" \
+        "${grpflag[@]}" --ioengine=psync --rw=write --bs="$BS" \
         --direct="$DIRECT" --size="${per_mb}m" --fallocate=none "${zflag[@]}" \
         --output-format=json --output="$fioout" >/dev/null 2>&1 \
         || { kill $pstat 2>/dev/null; fail "fio $label rep$rep"; }
     kill $pstat 2>/dev/null; wait $pstat 2>/dev/null
+    grep -E " nvme[0-9]+n[0-9]+ " /proc/diskstats > "$RESULTS/$label.r$rep.dsk.post"
     snap_stats "$post"
     local sel; sel=$(diff_stats "$pre" "$post" "$RESULTS/$label.r$rep.delta.json")
     local bw ops el ipcw
-    bw=$(fio_bw "$fioout"); ops=$(fio_ops "$fioout"); el=$(fio_el "$fioout")
+    if [ "$DURABLE" = 1 ]; then bw=$(fio_bw_durable "$fioout"); else bw=$(fio_bw "$fioout"); fi
+    ops=$(fio_ops "$fioout"); el=$(fio_el "$fioout")
     ipcw=$(python3 -c "import json;print(json.load(open('$RESULTS/$label.r$rep.delta.json')).get('ipc_ops_write',0))")
     local engage="ok"
     if [ "$shim" = 1 ] && [ "$ipcw" -eq 0 ]; then engage="INVALID-passthrough"; INVALID=1; fi

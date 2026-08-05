@@ -1242,7 +1242,15 @@ impl NvmeBlockDev {
             .get_or_init(|| crate::zcrx_lane::arm_for_device(&self.device_path))
             .await
             .as_ref()?;
-        if sess.poisoned() || !sess.range_eligible(offset, size) {
+        if sess.poisoned() {
+            // FINDING F (2026-08 field): a poisoned session must release
+            // its ifqs/rules/RSS exclusion and arbiter lease PROMPTLY —
+            // not run the rest of the row at 75 % RSS width. Idempotent
+            // fire-and-forget; the kernel path serves this read.
+            sess.spawn_teardown();
+            return None;
+        }
+        if !sess.range_eligible(offset, size) {
             return None;
         }
         if let Some(addr) = dest_addr {

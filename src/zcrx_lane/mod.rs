@@ -30,20 +30,49 @@ pub use initiator::{LaneBackend, LaneSession, LaneTarget};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+/// Every session this process armed (Weak — the per-device OnceCells own
+/// the Arcs). Registered at connect; pruned on read.
+static SESSIONS: std::sync::LazyLock<std::sync::Mutex<Vec<std::sync::Weak<LaneSession>>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+pub(crate) fn register_session(sess: &Arc<LaneSession>) {
+    SESSIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(Arc::downgrade(sess));
+}
+
 /// Live (not-torn-down) lane sessions in this process — the finding-F
 /// teardown instrument (tests + the shutdown ladder's log line).
 pub fn live_lane_sessions() -> usize {
-    // RED PHASE skeleton: contract pinned by tests/zcrx_lane_tests.rs.
-    0
+    let mut reg = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    reg.retain(|w| w.strong_count() > 0);
+    reg.iter()
+        .filter_map(|w| w.upgrade())
+        .filter(|s| !s.torn_down())
+        .count()
 }
 
 /// Orderly teardown of EVERY live lane session (stop → join → restore →
 /// release leases) — the daemon-shutdown hook (finding F: sessions live
 /// in per-device OnceCell statics, which never drop at process exit, so
 /// ArmedSteering's Drop convergence is structurally unreachable on the
-/// NORMAL exit path without this).
+/// NORMAL exit path without this; kill-9 stays the documented residue).
 pub async fn teardown_all_lanes() {
-    // RED PHASE skeleton.
+    let live: Vec<Arc<LaneSession>> = {
+        let reg = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+        reg.iter().filter_map(|w| w.upgrade()).collect()
+    };
+    if live.is_empty() {
+        return;
+    }
+    log::info!(
+        "zcrx-lane: shutdown teardown — {} session(s) to quiesce/restore",
+        live.len()
+    );
+    for sess in live {
+        sess.teardown().await;
+    }
 }
 
 /// Opt-in master switch (design §6).

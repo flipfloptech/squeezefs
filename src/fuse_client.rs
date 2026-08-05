@@ -19775,6 +19775,16 @@ pub async fn start_mount<P: AsRef<Path>>(
         let _ = tokio::task::spawn_blocking(move || host.shutdown()).await;
     }
 
+    // FINDING F (zcrx, 2026-08 field): lane sessions live in per-device
+    // OnceCell statics — statics never drop at process exit, so without
+    // this hook the daemon exits with its NIC state in place (field: 16
+    // ntuple rules + RSS at 75 % width survived a clean unmount).
+    // Ordered per session: stop the wire → JOIN the ring drivers →
+    // restore steering → release the rxq lease. Kill-9 remains the
+    // documented residue case (next arm reaps reserved-range rules;
+    // RSS needs `ethtool -X <if> default`).
+    crate::zcrx_lane::teardown_all_lanes().await;
+
     // Clean up the mount by unmounting the session if it hasn't been done already.
     if let Err(e) = handle.unmount().await {
         debug!("Unmount on exit status (may already be unmounted): {:?}", e);

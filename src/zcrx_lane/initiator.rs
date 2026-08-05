@@ -202,8 +202,13 @@ pub struct LaneSession {
     /// The rxq-arbiter grant backing this session's ifqs (real backend
     /// only). Declared LAST: it drops after the queues close their
     /// doorbells, so the indices return to the per-NIC pool only once
-    /// the session's teardown is underway.
-    _rxq_lease: Option<Arc<super::rxq_alloc::RxqLease>>,
+    /// the session's teardown is underway. Mutex'd so [`Self::teardown`]
+    /// can release it WITHOUT dropping the session (finding F: sessions
+    /// live in OnceCell statics for the mount lifetime).
+    rxq_lease: std::sync::Mutex<Option<Arc<super::rxq_alloc::RxqLease>>>,
+    /// The finding-F teardown latch (idempotence + the registry's
+    /// live-count instrument).
+    teardown_latch: AtomicBool,
 }
 
 impl LaneSession {
@@ -747,15 +752,18 @@ impl LaneSession {
             LaneBackend::Zcrx(plan) => plan.rxq_lease.clone(),
             _ => None,
         };
-        Ok(Arc::new(LaneSession {
+        let session = Arc::new(LaneSession {
             target,
             queues,
             next_q: AtomicUsize::new(0),
             poisoned,
             steering: std::sync::Mutex::new(steering_hold),
             _admin_hold: admin_hold,
-            _rxq_lease: rxq_lease,
-        }))
+            rxq_lease: std::sync::Mutex::new(rxq_lease),
+            teardown_latch: AtomicBool::new(false),
+        });
+        super::register_session(&session);
+        Ok(session)
     }
 
     pub fn poisoned(&self) -> bool {
@@ -765,22 +773,34 @@ impl LaneSession {
     /// Whether this session's NIC/lease state has been released (the
     /// finding-F teardown latch).
     pub fn torn_down(&self) -> bool {
-        // RED PHASE skeleton: contract pinned by tests/zcrx_lane_tests.rs.
-        false
+        self.teardown_latch.load(Ordering::SeqCst)
     }
 
-    /// Ordered full teardown (stop → join → restore → release the rxq
-    /// lease): idempotent; the daemon-shutdown and poison paths share it.
+    /// Ordered full teardown — stop the wire, JOIN every driver, restore
+    /// steering (the finding-3 order), then release the rxq lease.
+    /// Idempotent; the daemon-shutdown and poison paths share it.
     pub async fn teardown(&self) {
-        // RED PHASE skeleton.
+        if self.teardown_latch.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.quiesce().await;
+        // The lease releases only AFTER the ifqs are joined (quiesce),
+        // so a successor arm re-registers a freed queue, not a live one.
+        self.rxq_lease.lock().expect("rxq lease lock").take();
     }
 
-    /// Fire-and-forget teardown for the poison path (the funnel calls it
-    /// on a poisoned session so NIC state releases PROMPTLY instead of
-    /// running the rest of the row at 75 % RSS width).
+    /// Fire-and-forget teardown for the poison path (finding F: the
+    /// funnel calls it on a poisoned session so ifqs/rules/RSS/lease
+    /// release PROMPTLY instead of running the rest of the row at 75 %
+    /// RSS width).
     pub fn spawn_teardown(self: &Arc<Self>) {
-        // RED PHASE skeleton.
-        let _ = self;
+        if self.torn_down() {
+            return;
+        }
+        let sess = Arc::clone(self);
+        tokio::spawn(async move {
+            sess.teardown().await;
+        });
     }
 
     pub fn target(&self) -> &LaneTarget {

@@ -672,6 +672,12 @@ impl LaneSession {
                                 numa_node: plan.numa_node,
                                 rq_entries: super::area::rq_entries_for(area.chunk_count() as u64),
                                 sq_entries: (depth as u32 + 8).next_power_of_two(),
+                                cq_entries: super::uring_zcrx::cq_entries_for(
+                                    depth,
+                                    target.max_xfer_bytes,
+                                    super::area::chunk_bytes_default(),
+                                    (depth as u32 + 8).next_power_of_two(),
+                                ),
                                 area: Arc::clone(&area),
                                 shared: Arc::clone(&shared),
                                 cmds: Arc::clone(&cmds),

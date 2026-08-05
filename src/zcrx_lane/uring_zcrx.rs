@@ -279,14 +279,14 @@ struct RawRing {
 }
 
 impl RawRing {
-    fn new(entries: u32) -> Result<RawRing, String> {
+    fn new(entries: u32, cq_entries: u32) -> Result<RawRing, String> {
         let mut p = IoUringParams {
             flags: IORING_SETUP_CQE32
                 | IORING_SETUP_SINGLE_ISSUER
                 | IORING_SETUP_DEFER_TASKRUN
                 | IORING_SETUP_CQSIZE
                 | IORING_SETUP_CLAMP,
-            cq_entries: entries * 4,
+            cq_entries,
             ..Default::default()
         };
         // SAFETY: io_uring_setup with an out-param struct.
@@ -578,6 +578,9 @@ pub(crate) struct RingDriverConfig {
     /// flight + the recv/doorbell arms + partial-send resubmits. No
     /// fixed constants (design §8).
     pub sq_entries: u32,
+    /// Derived CQ depth (round 7): the chunk-grain completion demand —
+    /// see [`cq_entries_for`].
+    pub cq_entries: u32,
     pub area: Arc<ZcrxArea>,
     pub shared: Arc<AreaShared>,
     pub cmds: Arc<RingCmd>,
@@ -587,6 +590,40 @@ pub(crate) struct RingDriverConfig {
 }
 
 const TAG_RECV: u64 = 1;
+
+/// `IORING_MAX_CQ_ENTRIES` = 2 × `IORING_MAX_ENTRIES` (32768) —
+/// io_uring.h:160–161 @ v6.19.14; with `IORING_SETUP_CQSIZE|CLAMP` the
+/// kernel clamps-then-rounds a larger ask (io_uring.c:3562–3567).
+pub(crate) const KERNEL_MAX_CQ_ENTRIES: u32 = 2 * 32768;
+
+/// The lane data ring's CQ size — derived from the CHUNK-GRAIN
+/// completion demand (round 7 field: 8 queues died `RECV_ZC terminal:
+/// ENOSPC` ~134 MB into the first healthy row): every admitted command
+/// can deliver its whole payload as chunk-grain CQEs between two reap
+/// passes, so `cq = depth × ⌈max_xfer / chunk⌉ + sq_entries` (send /
+/// doorbell / recv-end headroom), next pow2, clamped to the kernel max.
+/// Kernel law being sized for: a full CQ makes `io_cqe_cache_refill`
+/// (overflow=false) return false — zcrx NEVER takes the overflow path
+/// (`io_zcrx_queue_cqe` → `io_defer_get_uncommited_cqe` → `io_get_cqe`,
+/// io_uring.h:286–293 → :257–264 with overflow=false) — and the recv
+/// terminates -ENOSPC (zcrx.c:1280/:1317). The userspace contract is
+/// size-adequately + reap-promptly; there is no kernel-side recovery.
+pub(crate) fn cq_entries_for(depth: u16, max_xfer: u32, chunk: usize, sq_entries: u32) -> u32 {
+    // RED PHASE skeleton — the shipped implicit sizing (RawRing used
+    // cq = sq × 4, i.e. 512 CQEs against a 16,384-CQE demand).
+    let _ = (depth, max_xfer, chunk);
+    (sq_entries * 4).next_power_of_two()
+}
+
+/// The either/or honesty clamp (the round-5 admission law's shape): if
+/// the derived CQ hits the kernel max, the ADMISSION window must shrink
+/// to what the CQ can actually hold — `(cq − sq_headroom) × chunk × 2`
+/// (admission spends half its window on in-flight payload).
+pub(crate) fn cq_admitted_window_bytes(cq_entries: u32, sq_entries: u32, chunk: usize) -> u64 {
+    // RED PHASE skeleton — no clamp existed.
+    let _ = (cq_entries, sq_entries, chunk);
+    u64::MAX
+}
 
 /// How long a refill-starvation park may hold the queue's in-flight
 /// fills before they fail over to the kernel path. Derived from the ONE
@@ -820,7 +857,7 @@ fn drive(
 
     // Ring + ifq registration ON this thread (SINGLE_ISSUER law).
     let setup = (|| -> Result<(RawRing, RefillRing, u32), String> {
-        let ring = RawRing::new(cfg.sq_entries)?;
+        let ring = RawRing::new(cfg.sq_entries, cfg.cq_entries)?;
         let page = super::area::chunk_bytes_default();
         let region_len = refill_region_len(cfg.rq_entries, page);
         let region = Mmap::anon(region_len)?;
@@ -1222,7 +1259,7 @@ mod tests {
     /// `site` is captured by the test itself (`site!()` at the gate
     /// call) so the ledger names the test, not this helper.
     fn uring_or_skip(site: testkit::Site) -> bool {
-        match RawRing::new(4) {
+        match RawRing::new(4, 16) {
             Ok(_) => true,
             Err(why) => testkit::declare(
                 site,
@@ -1364,10 +1401,42 @@ mod tests {
         // empty pool). Real transport errors stay terminal.
         assert_eq!(classify_recv_end(-libc::ENOMEM), RecvEnd::Park);
         assert_eq!(classify_recv_end(-libc::ENOBUFS), RecvEnd::Park);
+        // Round 7: -ENOSPC is CQ-full (zcrx.c:1280/:1317 — the recv
+        // terminates; the DATA STAYS IN THE SOCKET, tcp_read_sock just
+        // stops consuming) — reap-then-re-arm recovers it, so it is the
+        // governor's flow-control class, not device death. After the
+        // cq_entries_for sizing a park here means the reaper was
+        // transiently outpaced; persistence shows in parks/failovers.
+        assert_eq!(classify_recv_end(-libc::ENOSPC), RecvEnd::Park);
         assert_eq!(classify_recv_end(0), RecvEnd::Eof);
         assert_eq!(classify_recv_end(4096), RecvEnd::Rearm);
         assert_eq!(classify_recv_end(-libc::ECONNRESET), RecvEnd::Terminal);
         assert_eq!(classify_recv_end(-libc::EFAULT), RecvEnd::Terminal);
+    }
+
+    #[test]
+    fn cq_sizing_derives_from_chunk_grain_completion_demand() {
+        // Round 7 field arithmetic: depth 64 × ⌈1 MiB / 4 KiB⌉ = 16,384
+        // chunk CQEs of standing demand + 128 sq headroom → 32,768
+        // (pow2), within the kernel max — vs the shipped implicit
+        // cq = sq × 4 = 512 that died ENOSPC ~134 MB into the row.
+        assert_eq!(cq_entries_for(64, 1 << 20, 4096, 128), 32768);
+        assert!(cq_entries_for(64, 1 << 20, 4096, 128) <= KERNEL_MAX_CQ_ENTRIES);
+        // A monster geometry clamps at the kernel max…
+        assert_eq!(
+            cq_entries_for(512, 4 << 20, 4096, 128),
+            KERNEL_MAX_CQ_ENTRIES,
+            "demand beyond the kernel max clamps (io_uring.h:161)"
+        );
+        // …and the admission window then shrinks to what the CQ holds.
+        let cap = cq_admitted_window_bytes(KERNEL_MAX_CQ_ENTRIES, 128, 4096);
+        assert_eq!(
+            cap,
+            (KERNEL_MAX_CQ_ENTRIES as u64 - 128) * 4096 * 2,
+            "admission window ≤ 2 × (cq − sq headroom) × chunk"
+        );
+        // Small ring floors sanely.
+        assert!(cq_entries_for(2, 4096, 4096, 16) >= 16);
     }
 
     // -- the two per-completion gates ----------------------------------
@@ -1534,7 +1603,7 @@ mod tests {
             return;
         }
         // The lane's exact setup: CQE32 + SINGLE_ISSUER + DEFER_TASKRUN.
-        let ring = RawRing::new(8).expect("the lane's ring flags must be accepted");
+        let ring = RawRing::new(8, 32).expect("the lane's ring flags must be accepted");
 
         // Drive the doorbell arm the driver uses: READ 8 bytes from an
         // eventfd that already holds a count. This exercises push_sqe
@@ -1565,7 +1634,7 @@ mod tests {
         if !uring_or_skip(site!()) {
             return;
         }
-        let ring = RawRing::new(4).expect("ring");
+        let ring = RawRing::new(4, 16).expect("ring");
         let mut buf = 0u64;
         let mut pushed = 0;
         // NOP-shaped SQEs (opcode 0) — never submitted, so nothing runs;
@@ -1599,7 +1668,7 @@ mod tests {
         // CQSIZE ×4): the SQ index wraps five times and the CQ index at
         // least once — the `head & mask` / CQE32-stride arithmetic must
         // hold across the wrap, not just on the first lap.
-        let ring = RawRing::new(8).expect("ring");
+        let ring = RawRing::new(8, 32).expect("ring");
         let cmds = RingCmd::new().expect("eventfd");
         let mut buf = 0u64;
         for i in 0..40u64 {
@@ -1633,7 +1702,7 @@ mod tests {
         // (design §5 registration-order law, reverse). Model it with a
         // READ parked on a never-rung eventfd: submit without waiting,
         // then drop the ring. The kernel cancels asynchronously.
-        let ring = RawRing::new(4).expect("ring");
+        let ring = RawRing::new(4, 16).expect("ring");
         let cmds = RingCmd::new().expect("eventfd");
         // The buffer is deliberately LEAKED, mirroring the SendBufs law:
         // ring-fd close cancels in-flight ops asynchronously, so kernel
@@ -1892,6 +1961,7 @@ mod tests {
                 numa_node: None,
                 rq_entries: 16,
                 sq_entries: 16,
+                cq_entries: 64,
                 area: Arc::clone(&area),
                 shared: Arc::clone(&shared),
                 cmds: Arc::clone(&cmds),
@@ -1948,6 +2018,7 @@ mod tests {
                 numa_node: None,
                 rq_entries: 16,
                 sq_entries: 16,
+                cq_entries: 64,
                 area,
                 shared,
                 cmds,

@@ -33,6 +33,14 @@ struct MockCfg {
     /// Drop the connection mid-C2HData payload (mid-flight death
     /// injection — the PR Z2 poison-lattice venue).
     die_mid_c2h: bool,
+    /// Answer the Nth read capsule of a connection (and only it) with
+    /// an ERROR status (0 = off): the round-7 closure venue — SOME
+    /// segments of a multi-segment read complete, one op-fails, and the
+    /// whole read tears WITHOUT a connection death (an abrupt-death
+    /// venue RSTs the socket with unread capsules queued and races away
+    /// the completed segment's delivery — nondeterministic by design of
+    /// TCP, so the torn-read class is pinned death-free).
+    fail_on_read_n: usize,
     /// Gate NVM Read service: each read acquires ONE permit before any
     /// C2HData/response is emitted (the MEM-3 cancellation venue — the
     /// test cancels the requester while the target withholds the
@@ -54,6 +62,7 @@ impl Default for MockCfg {
             corrupt_datao: false,
             c2h_pdo_pad: 0,
             die_mid_c2h: false,
+            fail_on_read_n: 0,
             read_gate: None,
             reads_seen: None,
         }
@@ -113,6 +122,7 @@ async fn mock_conn(mut s: TcpStream, device: Arc<Vec<u8>>, cfg: MockCfg) -> Opti
     s.write_all(&icresp).await.ok()?;
 
     let mut cc_enabled = false;
+    let mut conn_reads: usize = 0;
     loop {
         let mut ch = [0u8; 8];
         read_exact_or_eof(&mut s, &mut ch).await?;
@@ -197,6 +207,7 @@ async fn mock_conn(mut s: TcpStream, device: Arc<Vec<u8>>, cfg: MockCfg) -> Opti
             }
             0x02 => {
                 // NVM Read.
+                conn_reads += 1;
                 if let Some(seen) = &cfg.reads_seen {
                     seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
@@ -216,6 +227,13 @@ async fn mock_conn(mut s: TcpStream, device: Arc<Vec<u8>>, cfg: MockCfg) -> Opti
                 );
                 if let Some(status) = cfg.fail_status {
                     s.write_all(&capsule_resp(cid, 0, status)).await.ok()?;
+                    continue;
+                }
+                if cfg.fail_on_read_n > 0 && conn_reads == cfg.fail_on_read_n {
+                    // Round-7 closure venue: exactly this capsule op-fails
+                    // (LBA out of range class); the stream stays ordered
+                    // and alive — siblings before AND after it complete.
+                    s.write_all(&capsule_resp(cid, 0, 0x0080)).await.ok()?;
                     continue;
                 }
                 let start = (slba as usize) << MOCK_LBA_SHIFT;
@@ -2423,4 +2441,63 @@ async fn test_teardown_is_not_poison() {
             "cycle {cycle}: an orderly teardown is NOT a poison transition"
         );
     }
+}
+
+// ------------------------------------ round 7: gather/fill closure (red)
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_gather_fill_closure_holds_across_mid_read_poison() {
+    // Round 7 field: the FIRST healthy row broke the gather ≡ fill law
+    // (+6.3 MB) — gather counted PER SEGMENT inside read_segment_area,
+    // fill counts once per WHOLE funnel read; a poison mid-multi-segment
+    // read left the completed segments' gathers counted with no fill.
+    // The law decision: closure holds UNCONDITIONALLY — gather accounting
+    // moves to the whole-read success boundary (physically identical on
+    // success: the per-segment passes sum to the read), so torn reads
+    // contribute to NEITHER counter and the engagement instrument the
+    // row verdict keys on stays trustworthy on poisoned rows too.
+    let cfg = MockCfg {
+        fail_on_read_n: 6, // read 1 = capsules 1..4 (healthy); read 2's 2nd segment op-fails
+        ..Default::default()
+    };
+    let mock = MockTarget::start(cfg, 4 << 20).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("blockfile");
+    let content: Vec<u8> = (0..4 << 20).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&path, &content).unwrap();
+
+    let _env = LaneEnv::area_sim(&mock, 1, 8);
+    let gather0 = zcrx_metric("gather_bytes");
+    let fill0 = zcrx_metric("fill_bytes");
+    let dev = squeezefs::nvme_dev::NvmeBlockDev::new(path.to_str().unwrap());
+
+    // Read 1: 1 MiB = 4 × 256 KiB segments, all served — a healthy fill
+    // (MOCK namespace bytes ≠ file bytes: the structural-engagement
+    // check the funnel suite uses).
+    let got = dev.read_block(0, 1 << 20).await.expect("healthy lane read");
+    assert_eq!(&got[..], &mock.device[..1 << 20], "read 1 lane-served");
+    // Read 2: capsules 5/7/8 serve their segments fully, capsule 6
+    // op-fails — the WHOLE read tears (the field's poisoned-mid-fill
+    // class, pinned death-free for determinism) and fails over to the
+    // kernel path, which serves FILE bytes. Under the per-segment
+    // accounting this leaves 3 × 256 KiB of gathered-but-never-filled
+    // bytes — the field's +6.3 MB shape in miniature.
+    let got2 = dev
+        .read_block(1 << 20, 1 << 20)
+        .await
+        .expect("kernel-path serve after the torn read");
+    assert_eq!(
+        &got2[..],
+        &content[1 << 20..2 << 20],
+        "read 2 kernel-path-served after the torn read"
+    );
+
+    let gather_delta = zcrx_metric("gather_bytes") - gather0;
+    let fill_delta = zcrx_metric("fill_bytes") - fill0;
+    assert_eq!(
+        gather_delta, fill_delta,
+        "gather ≡ fill must hold ACROSS a mid-read poison — a torn \
+         read's completed segments contribute to neither counter"
+    );
+    assert_eq!(fill_delta, 1 << 20, "exactly the one healthy read counted");
 }

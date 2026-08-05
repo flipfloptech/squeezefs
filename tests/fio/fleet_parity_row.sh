@@ -34,6 +34,30 @@ snap() {
     return 1
 }
 
+settle() { # wait for the mount to quiesce between fleets: prep ledger
+    # closed (queued == done + skipped_*), reclaim queue drained, and the
+    # R5 level back to Green — so store aging/pressure from row N never
+    # contaminates row N+1 (either arm).
+    local t f="$OUT/.settle.json"
+    for t in $(seq 1 60); do
+        snap "$f" || { sleep 2; continue; }
+        python3 - "$f" <<'EOF' && return 0
+import json, sys
+m = json.load(open(sys.argv[1])); m = m.get("metrics", m)
+q = m.get("ipc_arena_prep_queued", 0)
+closed = q == (m.get("ipc_arena_prep_done", 0)
+               + m.get("ipc_arena_prep_skipped_dead", 0)
+               + m.get("ipc_arena_prep_skipped_pressure", 0))
+ok = (closed and m.get("block_free_reclaim_queue_bytes", 0) == 0
+      and m.get("mem_budget_level", 0) == 0)
+sys.exit(0 if ok else 1)
+EOF
+        sleep 2
+    done
+    echo "  (settle timed out after 120s — next row may be contaminated)" >&2
+    return 1
+}
+
 row() { # $1=arm(kern|il) $2=rw(write|read) $3=tag
     local arm=$1 rw=$2 tag=$3 dir="$MNT/fleet_parity"
     local env_prefix=()
@@ -79,6 +103,7 @@ for pair in "kern il" "il kern" "kern il"; do
     set -- $pair
     for arm in $1 $2; do
         row "$arm" write "w.$arm.$(date +%s)"
+        settle
     done
 done
 echo "== read twin (prefill once, then K-I, I-K, K-I on the same set) =="

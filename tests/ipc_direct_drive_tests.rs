@@ -951,6 +951,7 @@ async fn direct_drive_stats_fields_export() {
         "ipc_direct_ineligible_layout",
         "ipc_direct_ineligible_overlay",
         "ipc_direct_ineligible_backend",
+        "ipc_direct_shards",
     ] {
         assert!(m.get(key).is_some(), "stats inode must export {key}");
     }
@@ -1305,4 +1306,179 @@ fn governor_peek_is_non_reserving_and_counts_denials() {
          (non-reserving — the handler stays the only reservation site)"
     );
     TEST_ADMISSION_EPOCH_MS.store(0, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// 9. sharded rings + reapers (the D12 randread-shim residual, 2026-08-05):
+//    the single-shared-ring + single-reaper engine serialized EVERY
+//    CQE-side serve (revalidate + accounting + slot completion) on ONE
+//    unpinned thread — at the field's 235 µs fabric RTT and 256 in-flight
+//    (fio libaio rand-4k 32×qd8) that one wake-serve loop was the
+//    208k-IOPS-flat ceiling (~4.8 µs/op of reaper CPU) while the kernel
+//    FUSE path spread reply work over per-CPU queues (273–280k). The
+//    module's own docs recorded per-thread rings as the fallback "if SQ
+//    contention ever shows on a profile" — this section pins that shape,
+//    BY DERIVATION: shard width = the ONE drain-parallelism slope
+//    (`il_sessions_default`, the SAME function that ceilings the service
+//    threads feeding this engine), one lane per service thread, reapers
+//    pinned per the numa_core owner partition.
+// ---------------------------------------------------------------------------
+
+/// The derivation tie (drift-is-red, the ingest-economy paired-pin law):
+/// the shard width must ride `il_sessions_default` — never a constant —
+/// and the env form (`SQUEEZEFS_IPC_DD_SHARDS`) is an override/measurement
+/// lever with the service-ceiling clamp parity (1..=64), unparseable ⇒
+/// derived.
+#[test]
+fn dd_shard_width_derivation_ties_to_il_sessions_default() {
+    use squeezefs::ipc_direct::dd_shards_from;
+    use squeezefs_ipc::sizing::il_sessions_default;
+    for cpus in [1usize, 2, 4, 8, 16, 25, 32, 64, 128, 256] {
+        assert_eq!(
+            dd_shards_from(None, cpus),
+            il_sessions_default(cpus),
+            "shard width must ride the ONE drain-parallelism derivation \
+             (cpus={cpus}) — a flat constant is the DEFAULTS-MISMATCH class"
+        );
+    }
+    assert_eq!(dd_shards_from(Some("1"), 32), 1, "explicit wins verbatim");
+    assert_eq!(dd_shards_from(Some("12"), 32), 12);
+    assert_eq!(dd_shards_from(Some("999"), 32), 64, "env clamp ceiling 64");
+    assert_eq!(dd_shards_from(Some("0"), 32), 1, "env clamp floor 1");
+    assert_eq!(
+        dd_shards_from(Some("nope"), 32),
+        il_sessions_default(32),
+        "unparseable falls back to the derivation"
+    );
+}
+
+/// The structural contract: sessions pin to service threads (owners fill
+/// lightest-first ⇒ two sessions land owners 0 and 1), each service
+/// thread owns its own direct-drive LANE, so governed traffic through two
+/// sessions must engage TWO shard reapers — the pre-fix engine reads 1
+/// here (its single shared ring is the field ceiling's structure). Serves
+/// stay exact and byte-true on both lanes (engagement instruments never
+/// go dark across the sharding).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn distinct_service_lanes_engage_distinct_shards() {
+    let fx = Fixture::new("shards").await;
+    fx.salt_inos(74).await;
+    let ino_a = fx.create_striped("shard-a.bin", &[0, 1]).await;
+    let ino_b = fx.create_striped("shard-b.bin", &[0, 1]).await;
+    let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("repo-dir tempdir");
+    let fd_a = odirect_standin(&fx, &dir, "shard-a.bin", ino_a);
+    let fd_b = odirect_standin(&fx, &dir, "shard-b.bin", ino_b);
+    let (session_a, binding_a) = ClientSession::establish(&fx, &fd_a);
+    let (session_b, binding_b) = ClientSession::establish(&fx, &fd_b);
+    fx.fs.router.set_direct_device_true(true);
+
+    let shapes: &[(u64, usize)] = &[(4096, 4096), (64 * 1024, 16 * 1024)];
+    let before = snap();
+    let (got_a, got_b) = tokio::task::block_in_place(|| {
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        for (offset, len) in shapes {
+            a.push(session_a.ring_pread(binding_a, *offset, *len, 0, "lane A read"));
+            b.push(session_b.ring_pread(binding_b, *offset, *len, 0, "lane B read"));
+        }
+        (a, b)
+    });
+    let d = delta(&before);
+    fx.fs.router.set_direct_device_true(false);
+
+    for (i, (offset, len)) in shapes.iter().enumerate() {
+        assert_eq!(
+            got_a[i],
+            expect_bytes(0, *offset as usize, *len),
+            "byte parity on lane A shape {i}"
+        );
+        assert_eq!(
+            got_b[i],
+            expect_bytes(0, *offset as usize, *len),
+            "byte parity on lane B shape {i}"
+        );
+    }
+    let n = 2 * shapes.len() as u64;
+    assert_eq!(
+        d.dd_serves, n,
+        "every governed read on BOTH lanes must direct-drive"
+    );
+    assert_eq!(d.handoffs, 0, "no handler involvement on either lane");
+    assert_eq!(
+        METRICS.ipc_direct_shards.load(Ordering::Relaxed),
+        2,
+        "two service lanes must engage two direct-drive shard reapers \
+         (1 here = the single-shared-ring 208k-flat field structure)"
+    );
+    fx.shutdown();
+}
+
+/// Multi-shard teardown promptness + accounting closure: streams on two
+/// lanes, host shutdown mid-life joins EVERY shard reaper (drains
+/// in-flight CQEs first — bounded by device latency), and the engine's
+/// closure law `serves + fallbacks_post == submits` holds across shards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_joins_every_shard_reaper_promptly() {
+    let fx = Fixture::new("shard-teardown").await;
+    fx.salt_inos(84).await;
+    let ino_a = fx.create_striped("shard-td-a.bin", &[0, 1]).await;
+    let ino_b = fx.create_striped("shard-td-b.bin", &[0, 1]).await;
+    let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("repo-dir tempdir");
+    let fd_a = odirect_standin(&fx, &dir, "shard-td-a.bin", ino_a);
+    let fd_b = odirect_standin(&fx, &dir, "shard-td-b.bin", ino_b);
+    let (session_a, binding_a) = ClientSession::establish(&fx, &fd_a);
+    let (session_b, binding_b) = ClientSession::establish(&fx, &fd_b);
+    fx.fs.router.set_direct_device_true(true);
+
+    let submits0 = METRICS.ipc_direct_drive_submits.load(Ordering::Relaxed);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut drivers = Vec::new();
+    for (session, binding, name) in [
+        (session_a, binding_a, "lane A stream"),
+        (session_b, binding_b, "lane B stream"),
+    ] {
+        let stop2 = Arc::clone(&stop);
+        drivers.push(std::thread::spawn(move || {
+            let mut i = 0u64;
+            while !stop2.load(Ordering::Relaxed) {
+                let off = 4096 * (1 + (i % 512));
+                let _ = session.ring_pread(binding, off, 4096, 0, name);
+                i += 1;
+            }
+            drop(session);
+        }));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    stop.store(true, Ordering::Relaxed);
+    for d in drivers {
+        d.join().expect("driver thread must not panic");
+    }
+
+    assert_eq!(
+        METRICS.ipc_direct_shards.load(Ordering::Relaxed),
+        2,
+        "both lanes' shard reapers must be live before teardown"
+    );
+    let t0 = Instant::now();
+    fx.shutdown();
+    let took = t0.elapsed();
+    assert!(
+        took < Duration::from_secs(5),
+        "shutdown must join every shard reaper promptly (took {took:?})"
+    );
+    fx.fs.router.set_direct_device_true(false);
+
+    let submits = METRICS.ipc_direct_drive_submits.load(Ordering::Relaxed) - submits0;
+    assert!(submits > 0, "the streams must have exercised direct-drive");
+    // Closure across ALL shards: nothing stranded, nothing double-served.
+    let serves = METRICS.ipc_direct_drive_serves.load(Ordering::Relaxed);
+    let fallbacks = METRICS
+        .ipc_direct_drive_fallbacks_post
+        .load(Ordering::Relaxed);
+    let total_submits = METRICS.ipc_direct_drive_submits.load(Ordering::Relaxed);
+    assert_eq!(
+        serves + fallbacks,
+        total_submits,
+        "every submitted op resolves exactly once (serve or post-CQE fallback)"
+    );
 }

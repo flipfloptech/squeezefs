@@ -222,11 +222,13 @@ pub fn steering_capacity_gate(nic: &mut dyn NicControl) -> Result<RuleSlots, Str
         // refusing here was the 2026-08 field bug — the KERNEL's insert
         // verdict rules; a real EOPNOTSUPP/ENOSPC-class refusal surfaces
         // loud at `arm_flow_rules` and unwinds the arm.
-        log::info!(
-            "zcrx steering: {ifname} advertises a 0-slot ntuple rule table with the \
-             feature ON (the mlx5-class advertisement lie) — arming via \
-             driver-assigned rule locations; the kernel's insert verdict rules"
-        );
+        if nic_note_once("mlx5-lie", &ifname) {
+            log::info!(
+                "zcrx steering: {ifname} advertises a 0-slot ntuple rule table with \
+                 the feature ON (the mlx5-class advertisement lie) — arming via \
+                 driver-assigned rule locations; the kernel's insert verdict rules"
+            );
+        }
         return Ok(RuleSlots::KernelAssigned);
     }
     Ok(RuleSlots::Reserved { lo, hi })
@@ -540,9 +542,12 @@ pub fn arm_flow_rules(
 /// never consume each other's latch. Returns `true` exactly once per
 /// (tag, ifname).
 pub fn nic_note_once(tag: &str, ifname: &str) -> bool {
-    // RED PHASE skeleton: contract pinned by tests/zcrx_lane_tests.rs.
-    let _ = (tag, ifname);
-    true
+    static NOTED: LazyLock<Mutex<std::collections::HashSet<String>>> =
+        LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+    NOTED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(format!("{tag}:{ifname}"))
 }
 
 /// Loud-ONCE-per-NIC refusal throttle for the arm ladder (ten fabric
@@ -550,12 +555,7 @@ pub fn nic_note_once(tag: &str, ifname: &str) -> bool {
 /// not 10×; per-DEVICE refusal caching stays the caller's OnceCell).
 /// Returns `true` exactly once per interface name per process.
 pub fn note_arm_refusal_once(ifname: &str) -> bool {
-    static WARNED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-    WARNED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(ifname.to_string())
+    nic_note_once("arm-refusal", ifname)
 }
 
 /// The reserved ntuple loc range `[lo, hi)`: the top

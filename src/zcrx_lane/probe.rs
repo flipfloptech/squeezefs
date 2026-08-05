@@ -217,8 +217,25 @@ pub fn tcp_devices_via_nic_with(
 }
 
 fn is_namespace_of(ctrl: &str, name: &str) -> bool {
-    name.strip_prefix(ctrl)
-        .and_then(|rest| rest.strip_prefix('n'))
+    // BOTH namespace child shapes (field finding D): `nvme<C>n<N>`
+    // (multipath off) and `nvme<C>c<P>n<N>` (CONFIG_NVME_MULTIPATH
+    // c-paths — the modern default). Counting only the plain shape read
+    // 0 on the fleet, devices degraded to 1, and fair_queue_want
+    // collapsed to the full geometry want. Per-controller c-path
+    // counting can over-count a genuinely multi-path namespace — the
+    // safe direction (over-counting only widens the spread; the fleet
+    // runs one controller per subsystem).
+    let Some(mut rest) = name.strip_prefix(ctrl) else {
+        return false;
+    };
+    if let Some(r) = rest.strip_prefix('c') {
+        let digits = r.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return false;
+        }
+        rest = &r[digits..];
+    }
+    rest.strip_prefix('n')
         .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 

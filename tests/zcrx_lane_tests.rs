@@ -2209,3 +2209,176 @@ fn test_tcp_devices_via_nic_counts_namespaces_behind_the_route() {
         "a NIC no target routes through"
     );
 }
+
+// ------------------------------------------ round-4 field findings (red)
+
+#[test]
+fn test_census_counts_native_multipath_c_path_namespaces() {
+    // FINDING D root cause: on a CONFIG_NVME_MULTIPATH fleet (modern
+    // default) a controller's namespace children are nvme<C>c<P>n<N>
+    // ("c-paths"), not nvme<C>n<N> — the round-3 census counted 0, so
+    // devices degraded to 1 and fair_queue_want returned the FULL
+    // geometry want (4): exactly the field's 2×4-queues shape. Both
+    // shapes must count.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mk = |ctrl: &str, addr: &str, namespaces: &[&str]| {
+        let c = root.join("class/nvme").join(ctrl);
+        std::fs::create_dir_all(&c).unwrap();
+        std::fs::write(c.join("transport"), "tcp\n").unwrap();
+        std::fs::write(c.join("address"), format!("{addr}\n")).unwrap();
+        for ns in namespaces {
+            std::fs::create_dir_all(c.join(ns)).unwrap();
+        }
+    };
+    // The field fleet's shape: one controller per device, native
+    // multipath ⇒ c-path children.
+    for i in 0..10u32 {
+        let ctrl = format!("nvme{}", 10 + 2 * i);
+        let ns = format!("nvme{}c{}n1", 10 + 2 * i, 10 + 2 * i);
+        mk(&ctrl, "traddr=10.181.177.193,trsvcid=4420", &[ns.as_str()]);
+    }
+    // A non-multipath controller (both shapes coexist across fleets).
+    mk(
+        "nvme50",
+        "traddr=10.181.177.193,trsvcid=4420",
+        &["nvme50n1", "nvme50n2"],
+    );
+    let resolve = |ip: &std::net::IpAddr| -> Option<String> {
+        (ip.to_string() == "10.181.177.193").then(|| "ens1f0np0".to_string())
+    };
+    assert_eq!(
+        probe::tcp_devices_via_nic_with(root, "ens1f0np0", &resolve),
+        12,
+        "10 c-path namespaces + 2 plain namespaces"
+    );
+}
+
+#[test]
+fn test_ten_devices_one_nic_first_session_wants_one_queue() {
+    // FINDING D end-to-end (the composition the arm ladder runs): census
+    // → fair_queue_want → arbiter. Ten multipath devices behind one
+    // 32-queue NIC ⇒ the FIRST session registers 1 queue, not 4.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for i in 0..10u32 {
+        let ctrl = format!("nvme{i}");
+        let c = root.join("class/nvme").join(&ctrl);
+        std::fs::create_dir_all(c.join(format!("nvme{i}c{i}n1"))).unwrap();
+        std::fs::write(c.join("transport"), "tcp\n").unwrap();
+        std::fs::write(c.join("address"), "traddr=10.0.0.1,trsvcid=4420\n").unwrap();
+    }
+    let resolve =
+        |ip: &std::net::IpAddr| (ip.to_string() == "10.0.0.1").then(|| "mock-e2e".to_string());
+    let devices = probe::tcp_devices_via_nic_with(root, "mock-e2e", &resolve);
+    assert_eq!(devices, 10, "the census sees all ten devices");
+    let eligible = 32 / 4; // lane_eligible_queues(32) width — the §8 pool
+    let want = squeezefs::zcrx_lane::steering::fair_queue_want(eligible, devices, 4);
+    assert_eq!(want, 1, "clamp(8/10, 1, 4) = 1");
+    let lease = rxq_alloc::acquire(0xDD01, "mock-e2e", 32, want).expect("lease");
+    assert_eq!(
+        lease.queues().len(),
+        1,
+        "the first session registers ONE queue — 8 of 10 devices get a lane"
+    );
+}
+
+#[test]
+fn test_nic_note_once_latches_per_tag_and_nic() {
+    // The mlx5-lie INFO line printed ~40× in 30 s (round 4): every
+    // per-NIC notice rides ONE latch family, keyed (tag, ifname) so
+    // classes never consume each other's latch.
+    use squeezefs::zcrx_lane::steering::nic_note_once;
+    assert!(nic_note_once("mlx5-lie", "note-nic-a"));
+    assert!(
+        !nic_note_once("mlx5-lie", "note-nic-a"),
+        "second notice on one NIC is throttled"
+    );
+    assert!(
+        nic_note_once("arm-refusal", "note-nic-a"),
+        "a DIFFERENT tag on the same NIC still prints"
+    );
+    assert!(nic_note_once("mlx5-lie", "note-nic-b"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_f_shutdown_teardown_quiesces_and_releases_all_sessions() {
+    // FINDING F: sessions live in per-device OnceCell statics — statics
+    // never drop, so on the field the daemon exited with 16 rules + RSS
+    // crippled. The shutdown hook must tear down every live session
+    // (stop → join → restore → release), and the registry must SEE them.
+    let before = squeezefs::zcrx_lane::live_lane_sessions();
+    let mock = MockTarget::start(MockCfg::default(), 4 << 20).await;
+    let s1 = LaneSession::connect_with(mock.target(1, 4), LaneBackend::AreaSim)
+        .await
+        .expect("session 1");
+    let s2 = LaneSession::connect_with(mock.target(1, 4), LaneBackend::AreaSim)
+        .await
+        .expect("session 2");
+    assert_eq!(
+        squeezefs::zcrx_lane::live_lane_sessions(),
+        before + 2,
+        "every armed session registers as live"
+    );
+    squeezefs::zcrx_lane::teardown_all_lanes().await;
+    assert!(s1.torn_down() && s2.torn_down(), "both sessions torn down");
+    assert_eq!(
+        squeezefs::zcrx_lane::live_lane_sessions(),
+        before,
+        "shutdown leaves no live lane session"
+    );
+    let (free1, total1) = s1.cid_slots();
+    assert_eq!(free1, total1, "session 1 quiesced (no leaked CID)");
+    let (free2, total2) = s2.cid_slots();
+    assert_eq!(free2, total2, "session 2 quiesced (no leaked CID)");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_f_poisoned_session_tears_down_promptly() {
+    // FINDING F's poison half: a poisoned session held its ifqs, rules,
+    // RSS exclusion AND arbiter lease for the rest of the field row (75 %
+    // RSS width). The funnel must trigger the ordered teardown on the
+    // first read that observes the poison.
+    let cfg = MockCfg {
+        die_mid_c2h: true,
+        ..Default::default()
+    };
+    let mock = MockTarget::start(cfg, 1 << 20).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("blockfile");
+    let content: Vec<u8> = (0..1 << 20).map(|i| (i % 241) as u8).collect();
+    std::fs::write(&path, &content).unwrap();
+
+    let before = squeezefs::zcrx_lane::live_lane_sessions();
+    let _env = LaneEnv::area_sim(&mock, 1, 4);
+    let dev = squeezefs::nvme_dev::NvmeBlockDev::new(path.to_str().unwrap());
+    // First read: arms, dies mid-C2H, poisons, falls back to the kernel
+    // path (registered live at arm).
+    let got = dev.read_block(0, 65536).await.expect("kernel-path serve");
+    assert_eq!(&got[..], &content[..65536]);
+    assert_eq!(
+        squeezefs::zcrx_lane::live_lane_sessions(),
+        before + 1,
+        "the armed (now poisoned) session is registered live"
+    );
+    // Second read observes the poison — the funnel must fire teardown.
+    let _ = dev
+        .read_block(65536, 4096)
+        .await
+        .expect("kernel-path serve");
+    // Bounded settle for the spawned teardown (it joins driver tasks).
+    let mut torn = false;
+    for _ in 0..100 {
+        if squeezefs::zcrx_lane::live_lane_sessions() == before {
+            torn = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        torn,
+        "a poisoned session must release its NIC state promptly (live: {} vs before {})",
+        squeezefs::zcrx_lane::live_lane_sessions(),
+        before
+    );
+}

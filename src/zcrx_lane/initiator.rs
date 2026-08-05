@@ -762,6 +762,27 @@ impl LaneSession {
         self.poisoned.load(Ordering::SeqCst)
     }
 
+    /// Whether this session's NIC/lease state has been released (the
+    /// finding-F teardown latch).
+    pub fn torn_down(&self) -> bool {
+        // RED PHASE skeleton: contract pinned by tests/zcrx_lane_tests.rs.
+        false
+    }
+
+    /// Ordered full teardown (stop → join → restore → release the rxq
+    /// lease): idempotent; the daemon-shutdown and poison paths share it.
+    pub async fn teardown(&self) {
+        // RED PHASE skeleton.
+    }
+
+    /// Fire-and-forget teardown for the poison path (the funnel calls it
+    /// on a poisoned session so NIC state releases PROMPTLY instead of
+    /// running the rest of the row at 75 % RSS width).
+    pub fn spawn_teardown(self: &Arc<Self>) {
+        // RED PHASE skeleton.
+        let _ = self;
+    }
+
     pub fn target(&self) -> &LaneTarget {
         &self.target
     }

@@ -30,6 +30,22 @@ pub use initiator::{LaneBackend, LaneSession, LaneTarget};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+/// Live (not-torn-down) lane sessions in this process — the finding-F
+/// teardown instrument (tests + the shutdown ladder's log line).
+pub fn live_lane_sessions() -> usize {
+    // RED PHASE skeleton: contract pinned by tests/zcrx_lane_tests.rs.
+    0
+}
+
+/// Orderly teardown of EVERY live lane session (stop → join → restore →
+/// release leases) — the daemon-shutdown hook (finding F: sessions live
+/// in per-device OnceCell statics, which never drop at process exit, so
+/// ArmedSteering's Drop convergence is structurally unreachable on the
+/// NORMAL exit path without this).
+pub async fn teardown_all_lanes() {
+    // RED PHASE skeleton.
+}
+
 /// Opt-in master switch (design §6).
 pub fn lane_env_armed() -> bool {
     crate::env_knobs::bool_knob("SQUEEZEFS_ZCRX_LANE", false)

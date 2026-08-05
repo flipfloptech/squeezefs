@@ -587,6 +587,34 @@ pub(crate) struct RingDriverConfig {
 }
 
 const TAG_RECV: u64 = 1;
+
+/// What a terminated RECV_ZC multishot (CQE without `F_MORE`) means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecvEnd {
+    /// Orderly EOF (res == 0).
+    Eof,
+    /// Refill starvation — flow control, never device death: park the
+    /// recv and re-arm when the refill ring advances.
+    Park,
+    /// Multishot ended benignly — re-arm immediately.
+    Rearm,
+    /// A real transport error — the session poisons loud.
+    Terminal,
+}
+
+/// Classify a final RECV_ZC result (field finding E pins the law).
+pub(crate) fn classify_recv_end(res: i32) -> RecvEnd {
+    // RED PHASE skeleton: mirrors the SHIPPED semantics (ENOMEM was
+    // terminal — the field's first-serve poison); the contract tests
+    // below pin the corrected law.
+    if res == 0 {
+        RecvEnd::Eof
+    } else if res == -libc::ENOBUFS || res > 0 {
+        RecvEnd::Rearm
+    } else {
+        RecvEnd::Terminal
+    }
+}
 const TAG_DOORBELL: u64 = 2;
 const TAG_SEND_BASE: u64 = 0x1000;
 
@@ -1000,6 +1028,26 @@ mod tests {
                 &format!("io_uring (CQE32|SINGLE_ISSUER|DEFER_TASKRUN) unavailable: {why}"),
             ),
         }
+    }
+
+    // -- the recv-end law (field finding E) -----------------------------
+
+    #[test]
+    fn recv_end_classification_parks_not_poisons_on_pool_exhaustion() {
+        // FINDING E (2026-08 field, round 4): three queues died with
+        // `RECV_ZC terminal: Cannot allocate memory` in the same second
+        // as the arm — -ENOMEM is the zcrx provider pool running dry
+        // (io_uring/zcrx.c copy-fallback/netmem alloc), i.e. refill
+        // exhaustion: FLOW CONTROL, never device death. Park and re-arm
+        // when the refill advances; same for -ENOBUFS (uniform,
+        // spin-free — the old immediate re-arm could hot-loop on an
+        // empty pool). Real transport errors stay terminal.
+        assert_eq!(classify_recv_end(-libc::ENOMEM), RecvEnd::Park);
+        assert_eq!(classify_recv_end(-libc::ENOBUFS), RecvEnd::Park);
+        assert_eq!(classify_recv_end(0), RecvEnd::Eof);
+        assert_eq!(classify_recv_end(4096), RecvEnd::Rearm);
+        assert_eq!(classify_recv_end(-libc::ECONNRESET), RecvEnd::Terminal);
+        assert_eq!(classify_recv_end(-libc::EFAULT), RecvEnd::Terminal);
     }
 
     // -- the two per-completion gates ----------------------------------

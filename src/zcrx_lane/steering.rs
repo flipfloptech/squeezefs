@@ -534,6 +534,17 @@ pub fn arm_flow_rules(
     Ok(())
 }
 
+/// One latch per (tag, NIC): every per-NIC notice — refusal warns, the
+/// mlx5-lie INFO line (field round 4: it printed ~40× in 30 s), future
+/// classes — prints once per process. Keyed by BOTH so the classes can
+/// never consume each other's latch. Returns `true` exactly once per
+/// (tag, ifname).
+pub fn nic_note_once(tag: &str, ifname: &str) -> bool {
+    // RED PHASE skeleton: contract pinned by tests/zcrx_lane_tests.rs.
+    let _ = (tag, ifname);
+    true
+}
+
 /// Loud-ONCE-per-NIC refusal throttle for the arm ladder (ten fabric
 /// devices ride one NIC — the capacity refusal + remedy must print once,
 /// not 10×; per-DEVICE refusal caching stays the caller's OnceCell).

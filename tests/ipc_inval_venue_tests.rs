@@ -62,7 +62,9 @@ fn inval_hook_delivers_without_an_ambient_runtime() {
     );
 
     hook(42, InvalScope::Whole);
-    let frame = rx.try_next_frame().expect("Whole delivers synchronously too");
+    let frame = rx
+        .try_next_frame()
+        .expect("Whole delivers synchronously too");
     assert_eq!(
         frame,
         fuse3::notify::inval_inode_frame(42, 0, -1),
@@ -96,8 +98,7 @@ fn inval_hook_fires_from_a_plain_os_thread() {
 /// an empty cell dispatches nothing and panics nowhere.
 #[test]
 fn inval_hook_skips_pre_mount_fires() {
-    let cell: Arc<ArcSwap<Option<fuse3::notify::Notify>>> =
-        Arc::new(ArcSwap::from_pointee(None));
+    let cell: Arc<ArcSwap<Option<fuse3::notify::Notify>>> = Arc::new(ArcSwap::from_pointee(None));
     let hook = make_inval_hook(cell);
     hook(1, InvalScope::AttrsOnly);
     hook(1, InvalScope::Whole);

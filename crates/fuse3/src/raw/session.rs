@@ -131,6 +131,27 @@ impl ReplyTx {
         self.owed = false;
     }
 
+    /// Synchronous fire-and-forget enqueue for daemon-initiated
+    /// NOTIFICATIONS (no-reply handles): [`send`]'s happy path is exactly
+    /// this one `unbounded_send` — nothing in it suspends — so
+    /// notification callers need no task and no runtime (the 2026-08-05
+    /// il-write-residual venue law: the daemon used to spawn onto the
+    /// multi-thread runtime's global inject queue per size-growing ring
+    /// write purely to `.await` this). Never flips `owed` (a no-reply
+    /// handle owes nothing) and never falls back to a direct slot commit:
+    /// a notification has no slot address (`ReplySlot::Classical`, `conn`
+    /// `None`), and by the fire-and-forget contract a dead reply task
+    /// (session teardown) DROPS it — the async form's `let _ =` posture,
+    /// minus the request-abandoned count a notification never was.
+    ///
+    /// [`send`]: ReplyTx::send
+    pub(crate) fn send_detached(&self, data: FuseData) {
+        let _ = self.inner.unbounded_send(FuseReply {
+            data,
+            slot: self.slot,
+        });
+    }
+
     /// Send this request's reply. Never silently drops: a dead reply task
     /// falls back to a direct slot commit (rows 2 and 3).
     pub(crate) async fn send(&mut self, data: FuseData) -> Result<(), ()> {

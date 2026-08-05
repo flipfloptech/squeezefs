@@ -409,14 +409,27 @@ impl Invalidator {
 /// venue pins (`tests/ipc_inval_venue_tests.rs`) exercise the shipping
 /// dispatch, not a lookalike.
 ///
+/// **Venue law (2026-08-05, the il write residual — D12 board item 2):
+/// the dispatch is a SYNCHRONOUS enqueue in the caller's context — zero
+/// spawn, zero venue, zero runtime.** Every size-growing sequential
+/// ring write fires the POSIX-8 attrs-only arm, and the retired shape
+/// `Handle::spawn`ed each fire onto the multi-thread runtime's global
+/// inject queue — the exact venue the 2026-07-26 handoff-economy fix
+/// banned for ring handoffs (~130 µs/op measured queueing term) — for
+/// an await that never suspends ([`Notify::invalid_inode`] →
+/// `ReplyTx::send` is one `unbounded_send`). The write-path fires run
+/// on the fuse3 handler lanes (inside the handoff future), the
+/// bind/unbind arms on ipc ctl/service threads: both are one channel
+/// send here, and the notify still reaches the kernel via the reply
+/// task's classical device write, off every request lane.
+///
 /// [`Notify`]: fuse3::notify::Notify
+/// [`Notify::invalid_inode`]: fuse3::notify::Notify::invalid_inode
 pub fn make_inval_hook(
     cell: Arc<arc_swap::ArcSwap<Option<fuse3::notify::Notify>>>,
 ) -> Arc<dyn Fn(u64, InvalScope) + Send + Sync> {
-    let hook_runtime = tokio::runtime::Handle::current();
     Arc::new(move |ino, scope| {
         if let Some(notify) = cell.load().as_ref() {
-            let notify = notify.clone();
             // Whole-inode shootdown: attrs + the full page range
             // (off 0, len -1) — the kernel refetches size and
             // data. POSIX-8's size refresh instead passes
@@ -431,8 +444,8 @@ pub fn make_inval_hook(
             };
             // ORDERING (adjudicated 2026-08 — the generic/451
             // follow-up sweep): deliberately FIRE-AND-FORGET.
-            // The spawn means a ring write's IPC completion can
-            // overtake the kernel-side invalidation; the design
+            // The detached enqueue means a ring write's IPC completion
+            // can overtake the kernel-side invalidation; the design
             // tolerates exactly that race by contract —
             // §5.6.2 W1's stated residual is a BOUNDED staleness
             // window for buffered kernel readers racing ring
@@ -450,9 +463,7 @@ pub fn make_inval_hook(
             // lawfully sleep in `invalidate_inode_pages2_range`
             // for a full READ round trip — the folio-wait venue
             // law on that primitive.
-            hook_runtime.spawn(async move {
-                notify.invalid_inode(ino, off, len).await;
-            });
+            notify.invalid_inode_detached(ino, off, len);
         }
     })
 }

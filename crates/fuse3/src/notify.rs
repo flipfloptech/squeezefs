@@ -238,6 +238,26 @@ impl Notify {
             .await;
     }
 
+    /// Synchronous fire-and-forget `FUSE_NOTIFY_INVAL_INODE` enqueue —
+    /// the W1 interception invalidator's venue-free form (2026-08-05, the
+    /// il write residual): [`Notify::invalid_inode`]'s `.await` chain
+    /// never suspends (`ReplyTx::send` is one `unbounded_send`), so the
+    /// per-fire task the daemon used to spawn onto its multi-thread
+    /// runtime's **global inject queue** purely to enter async context
+    /// was pure venue tax — the same term the 2026-07-26 handoff-economy
+    /// fix banned for ring handoffs. This form runs the same ONE shared
+    /// encoding ([`inval_inode_frame`] — the generic/451 no-drift law)
+    /// into the same reply channel from the caller's context: any thread,
+    /// no runtime required, no clone (`&self`). Delivery stays
+    /// fire-and-forget by contract (§5.6.2 W1's bounded-staleness
+    /// adjudication lives at the daemon hook); a dead reply task
+    /// (teardown) drops the frame.
+    ///
+    pub fn invalid_inode_detached(&self, inode: u64, offset: i64, len: i64) {
+        self.sender
+            .send_detached(Either::Left(inval_inode_frame(inode, offset, len)));
+    }
+
     /// try to notify the invalidation about a directory entry.
     pub async fn invalid_entry(mut self, parent: u64, name: OsString) {
         let _ = self.notify(NotifyKind::InvalidEntry { parent, name }).await;
@@ -346,5 +366,53 @@ impl NotifyTestRx {
             }),
             Err(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::FutureExt;
+
+    /// The venue-free form's whole contract: called from a plain OS
+    /// thread with NO runtime anywhere, the frame is enqueued by the
+    /// time the call returns, byte-identical to the ONE shared encoder
+    /// (generic/451's no-drift law).
+    #[test]
+    fn invalid_inode_detached_enqueues_synchronously_without_a_runtime() {
+        let (notify, mut rx) = notify_test_channel();
+        std::thread::spawn(move || {
+            notify.invalid_inode_detached(9, -1, 0);
+        })
+        .join()
+        .expect("no runtime is required on the firing thread");
+        assert_eq!(
+            rx.try_next_frame()
+                .expect("the frame is enqueued when the call returns"),
+            inval_inode_frame(9, -1, 0),
+        );
+    }
+
+    /// The premise the detached form rests on, pinned: the ASYNC form's
+    /// `.await` chain never suspends (`ReplyTx::send` is one
+    /// `unbounded_send`), so one poll with a noop waker completes it —
+    /// and both forms enqueue the identical frame. If someone ever makes
+    /// the async enqueue genuinely suspend (a bounded channel, an
+    /// intermediate hop), `now_or_never` fails and the detached form
+    /// must be re-adjudicated rather than silently diverging.
+    #[test]
+    fn detached_and_async_forms_enqueue_identical_frames() {
+        let (notify, mut rx) = notify_test_channel();
+        notify.invalid_inode_detached(11, 0, -1);
+        let detached = rx.try_next_frame().expect("detached frame");
+
+        let (notify2, mut rx2) = notify_test_channel();
+        notify2
+            .invalid_inode(11, 0, -1)
+            .now_or_never()
+            .expect("the async enqueue must complete in one poll — it never suspends");
+        let asynchronous = rx2.try_next_frame().expect("async frame");
+
+        assert_eq!(detached, asynchronous, "ONE shared encoding, two forms");
     }
 }

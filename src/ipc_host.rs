@@ -1156,17 +1156,85 @@ pub struct IpcHost {
     /// zero prep threads — the spawn-on-bind law); taken (dropped) at
     /// shutdown so the worker's `recv` disconnects promptly.
     thp_prep_tx: Mutex<Option<std::sync::mpsc::Sender<ThpPrepJob>>>,
-    /// Prep ledger (host-local truth for the admission contract test;
-    /// the process-global mirrors are `ipc_arena_prep_{queued,done}`).
+    /// Prep ledger (host-local truth for the admission + liveness
+    /// contract tests; the process-global mirrors are
+    /// `ipc_arena_prep_{queued,done,skipped_dead,skipped_pressure}`).
+    /// Closure law: `queued == done + skipped_dead + skipped_pressure`
+    /// at quiesce.
     arena_prep_queued: AtomicU64,
     arena_prep_done: AtomicU64,
+    arena_prep_skipped_dead: AtomicU64,
+    arena_prep_skipped_pressure: AtomicU64,
 }
 
-/// One deferred arena-prep job: the mapping `Arc` keeps the shm alive
-/// until the prep lands (a session torn down mid-queue defers its
-/// `munmap` past the madvise — the §5.3.1 rule-4 accessor ordering).
+/// One deferred arena-prep job — a `Weak` on purpose (prep-liveness fix,
+/// fleet-parity round 2): the QUEUE must never own a session's memory.
+/// The field capture: fio fleets exit between rows, and every queued
+/// job's former mapping `Arc` pinned a dead session's full arena until
+/// the single-lane worker reached it (256 × 120 MiB ≈ 30 GiB held past
+/// teardown → R5 Red → the write-pipeline admission clamp). A dead
+/// mapping needs no ordering protection — it needs the prep to NOT run;
+/// the §5.3.1 rule-4 accessor ordering is preserved where it matters by
+/// the worker's `upgrade()`: the strong ref exists exactly across an
+/// actually-running live prep, so the madvise can never touch an
+/// unmapped range, and `munmap` follows the last accessor structurally.
 struct ThpPrepJob {
-    map: Arc<SessionMapping>,
+    session: std::sync::Weak<IpcSession>,
+}
+
+/// Why a prep job did not run (the ledger's skip arms). Pure decision
+/// form ([`prep_skip_reason`]) so the arms are unit-pinned without
+/// forcing the process-global R5 authority into Red.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrepSkip {
+    /// The session was reaped/torn down (or fully dropped) before the
+    /// worker reached the job — the fleet-exit shape.
+    Dead,
+    /// R5 read Red at run time: eager 64–120 MiB commits + huge-folio
+    /// allocation (compaction) under Red are anti-useful — prep follows
+    /// the house refuse-new-work posture. Yellow deliberately does NOT
+    /// skip: it is a common transient (enter ≥ 80 %), and permanently
+    /// forfeiting the session-lifetime PMD upgrade on a transient is a
+    /// bad trade; Red is the codebase's refuse-new-work line (jobs
+    /// pause, sessions refuse) and prep holds to the same law.
+    Pressure,
+}
+
+/// The run/skip decision for a job the worker just picked up.
+fn prep_skip_reason(torn_down: bool, level: crate::mem_budget::Level) -> Option<PrepSkip> {
+    if torn_down {
+        return Some(PrepSkip::Dead);
+    }
+    if level == crate::mem_budget::Level::Red {
+        return Some(PrepSkip::Pressure);
+    }
+    None
+}
+
+#[cfg(test)]
+mod prep_skip_tests {
+    use super::*;
+    use crate::mem_budget::Level;
+
+    /// The decision table: dead always skips (and outranks pressure —
+    /// the honest attribution when both hold), Red skips live jobs,
+    /// Yellow and Green run them.
+    #[test]
+    fn skip_arms_are_exactly_dead_and_red() {
+        assert_eq!(prep_skip_reason(true, Level::Green), Some(PrepSkip::Dead));
+        assert_eq!(prep_skip_reason(true, Level::Red), Some(PrepSkip::Dead));
+        assert_eq!(
+            prep_skip_reason(false, Level::Red),
+            Some(PrepSkip::Pressure)
+        );
+        assert_eq!(
+            prep_skip_reason(false, Level::Yellow),
+            None,
+            "Yellow is a common transient — forfeiting the session-lifetime \
+             PMD upgrade on it is a bad trade (Red is the refuse-new-work line)"
+        );
+        assert_eq!(prep_skip_reason(false, Level::Green), None);
+    }
 }
 
 impl IpcHost {
@@ -1242,6 +1310,8 @@ impl IpcHost {
             thp_prep_tx: Mutex::new(None),
             arena_prep_queued: AtomicU64::new(0),
             arena_prep_done: AtomicU64::new(0),
+            arena_prep_skipped_dead: AtomicU64::new(0),
+            arena_prep_skipped_pressure: AtomicU64::new(0),
         });
         // Spawn-on-bind (ingest-economy 2026-07-28): the gauge reports
         // SPAWNED service threads — 0 until a session admits. No thread
@@ -1428,7 +1498,7 @@ impl IpcHost {
         }
         // Drop the prep sender so the `sqz-ipc-thp` worker's recv
         // disconnects immediately (its 500 ms poll tick is the backstop);
-        // queued jobs drop with it — their mapping Arcs release then.
+        // queued jobs drop with it — Weaks, pinning nothing.
         self.thp_prep_tx
             .lock()
             .expect("thp prep sender mutex never poisons")
@@ -2117,7 +2187,9 @@ impl IpcHost {
         // BEFORE the SessionOk send — the enqueue is O(1), so a client
         // that observes SessionOk observes the job queued (the admission
         // contract test's ordering), while the prep WORK runs off-path.
-        self.enqueue_arena_prep(Arc::clone(&session.map));
+        // The job holds a Weak (prep-liveness): a session that dies in
+        // the queue costs nothing and skips at its turn.
+        self.enqueue_arena_prep(&session);
 
         if send_ctl(
             sock,
@@ -2261,15 +2333,6 @@ impl IpcHost {
     // or async handoff; PR L4-4)
     // ---------------------------------------------------------------
 
-    /// Spawn-on-bind (ingest-economy 2026-07-28): guarantee owner index
-    /// `owner`'s service thread exists before its first session
-    /// publishes. Owners fill lowest-first (the admission pick resolves
-    /// ties to the lowest index), so spawned threads stay DENSE — this
-    /// spawns every missing index up to `owner`. Serialized on the
-    /// `threads` mutex (which also orders it against `shutdown`'s
-    /// handle take: a spawn that wins the mutex before the take lands
-    /// its handle in the joined vec; one that loses observes
-    /// `shutting_down` and refuses — no leaked thread either way).
     /// Deferred session-arena THP prep (shim fleet parity, 2026-08-05 —
     /// the D12 board-item-2 fix): queue the arena's populate+collapse for
     /// the `sqz-ipc-thp` worker instead of running it on the ctl thread
@@ -2288,7 +2351,13 @@ impl IpcHost {
     ///
     /// Worker-spawn failure degrades loud: the session simply stays
     /// 4 KiB-paged (the pre-near-zero-copy posture), never a refusal.
-    fn enqueue_arena_prep(self: &Arc<Self>, map: Arc<SessionMapping>) {
+    ///
+    /// Prep-liveness (fleet-parity round 2): the job carries a **`Weak`**
+    /// on the SESSION — the queue owns no memory, a reaped session's
+    /// arena unmaps at teardown regardless of the backlog, and the
+    /// worker's upgrade-or-skip ladder (see [`ThpPrepJob`]) is what
+    /// keeps the madvise-on-live-mapping property.
+    fn enqueue_arena_prep(self: &Arc<Self>, session: &Arc<IpcSession>) {
         if !arena_thp_enabled() {
             return;
         }
@@ -2328,8 +2397,10 @@ impl IpcHost {
                 .ipc_arena_prep_queued
                 .fetch_add(1, Ordering::Relaxed);
             // A send on a disconnected worker (it observed shutdown) just
-            // drops the job — teardown owns the residue.
-            let _ = sender.send(ThpPrepJob { map });
+            // drops the job — a Weak, so nothing is pinned either way.
+            let _ = sender.send(ThpPrepJob {
+                session: Arc::downgrade(session),
+            });
         }
     }
 
@@ -2356,16 +2427,53 @@ impl IpcHost {
                     if self.shutting_down.load(Ordering::SeqCst) {
                         return;
                     }
+                    // Liveness ladder (prep-liveness fix): upgrade-or-skip.
+                    // A failed upgrade IS the dead arm (last accessor
+                    // already gone); a successful upgrade can still be a
+                    // torn-down session briefly kept alive by a stale
+                    // service-thread snapshot or an in-flight completion —
+                    // `torn_down` is the authoritative liveness word (set
+                    // first thing in `teardown_session`). While the
+                    // upgraded Arc is held, the mapping cannot unmap
+                    // (§5.3.1 rule-4 accessor ordering, now scoped to
+                    // exactly the running prep).
+                    let session = job.session.upgrade();
+                    let torn = session
+                        .as_ref()
+                        .map(|s| s.torn_down.load(Ordering::SeqCst))
+                        .unwrap_or(true);
+                    match prep_skip_reason(torn, crate::mem_budget::level()) {
+                        Some(PrepSkip::Dead) => {
+                            self.arena_prep_skipped_dead.fetch_add(1, Ordering::Relaxed);
+                            METRICS
+                                .ipc_arena_prep_skipped_dead
+                                .fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        Some(PrepSkip::Pressure) => {
+                            self.arena_prep_skipped_pressure
+                                .fetch_add(1, Ordering::Relaxed);
+                            METRICS
+                                .ipc_arena_prep_skipped_pressure
+                                .fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        None => {}
+                    }
+                    let map = &session
+                        .as_ref()
+                        .expect("live-arm session upgraded above (torn == false ⇒ Some)")
+                        .map;
                     let outcome = crate::thp::advise_hugepages(
-                        job.map.base,
-                        job.map.layout.total_bytes as usize,
+                        map.base,
+                        map.layout.total_bytes as usize,
                         crate::thp::ThpMode::PopulateCollapse,
                     );
                     log::debug!(
                         "ipc session shm THP (deferred): madvise_ok={} collapse_ok={} ({} bytes)",
                         outcome.madvise_ok,
                         outcome.collapse_ok,
-                        job.map.layout.total_bytes
+                        map.layout.total_bytes
                     );
                     self.arena_prep_done.fetch_add(1, Ordering::Relaxed);
                     METRICS.ipc_arena_prep_done.fetch_add(1, Ordering::Relaxed);
@@ -2376,15 +2484,28 @@ impl IpcHost {
         }
     }
 
-    /// Prep ledger snapshot `(queued, done)` — the admission contract
-    /// test's observable (`queued − done` = the live upgrade backlog).
-    pub fn arena_prep_counts(&self) -> (u64, u64) {
+    /// Prep ledger snapshot `(queued, done, skipped_dead,
+    /// skipped_pressure)` — the admission + liveness contract tests'
+    /// observable. Closure law: `queued == done + skipped_dead +
+    /// skipped_pressure` at quiesce; the difference is the live backlog.
+    pub fn arena_prep_counts(&self) -> (u64, u64, u64, u64) {
         (
             self.arena_prep_queued.load(Ordering::Relaxed),
             self.arena_prep_done.load(Ordering::Relaxed),
+            self.arena_prep_skipped_dead.load(Ordering::Relaxed),
+            self.arena_prep_skipped_pressure.load(Ordering::Relaxed),
         )
     }
 
+    /// Spawn-on-bind (ingest-economy 2026-07-28): guarantee owner index
+    /// `owner`'s service thread exists before its first session
+    /// publishes. Owners fill lowest-first (the admission pick resolves
+    /// ties to the lowest index), so spawned threads stay DENSE — this
+    /// spawns every missing index up to `owner`. Serialized on the
+    /// `threads` mutex (which also orders it against `shutdown`'s
+    /// handle take: a spawn that wins the mutex before the take lands
+    /// its handle in the joined vec; one that loses observes
+    /// `shutting_down` and refuses — no leaked thread either way).
     fn ensure_service_threads(self: &Arc<Self>, owner: usize) -> io::Result<()> {
         if owner < self.svc_spawned.load(Ordering::Acquire) {
             return Ok(());

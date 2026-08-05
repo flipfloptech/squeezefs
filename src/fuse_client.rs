@@ -4926,11 +4926,24 @@ pub struct Metrics {
     pub ipc_service_parks: Align64<AtomicU64>,
     /// Deferred session-arena THP prep (shim fleet parity, 2026-08-05):
     /// jobs queued at admission / completed by the `sqz-ipc-thp` worker.
-    /// `queued − done` is the live upgrade backlog; a backlog that never
-    /// drains means the prep worker died (logged loud at spawn failure).
-    /// Both 0 on `SQUEEZEFS_IPC_ARENA_THP=0` mounts.
+    /// Ledger law (prep-liveness fix, fleet-parity round 2):
+    /// `queued == done + skipped_dead + skipped_pressure` at quiesce —
+    /// `queued − (done + skipped_*)` is the live upgrade backlog; a
+    /// backlog that never drains means the prep worker died (logged loud
+    /// at spawn failure). All 0 on `SQUEEZEFS_IPC_ARENA_THP=0` mounts.
     pub ipc_arena_prep_queued: Align64<AtomicU64>,
     pub ipc_arena_prep_done: Align64<AtomicU64>,
+    /// Jobs whose session was torn down before the worker reached them —
+    /// the fleet-exit shape (the field's `prep_done` ticking during a
+    /// kernel row was 113 of these being RUN instead of skipped, each
+    /// pinning a dead 120 MiB arena in the queue).
+    pub ipc_arena_prep_skipped_dead: Align64<AtomicU64>,
+    /// Jobs dropped because R5 read Red at run time: eagerly committing
+    /// 64–120 MiB of cold shmem + allocating huge folios (compaction)
+    /// under Red is anti-useful — prep follows the house refuse-new-work
+    /// posture. The arena stays 4 KiB-paged (correct, pre-campaign
+    /// posture); never re-queued.
+    pub ipc_arena_prep_skipped_pressure: Align64<AtomicU64>,
     /// L4-6 lifecycle families (§5.7 / §5.6.2 W1). Idle sessions torn
     /// down past `SQUEEZEFS_IPC_IDLE_SECS` — growth on busy clients =
     /// idle-clock regression.
@@ -7613,6 +7626,8 @@ impl SqueezefsFilesystem {
                 "ipc_service_parks": METRICS.ipc_service_parks.load(Ordering::Relaxed),
                 "ipc_arena_prep_queued": METRICS.ipc_arena_prep_queued.load(Ordering::Relaxed),
                 "ipc_arena_prep_done": METRICS.ipc_arena_prep_done.load(Ordering::Relaxed),
+                "ipc_arena_prep_skipped_dead": METRICS.ipc_arena_prep_skipped_dead.load(Ordering::Relaxed),
+                "ipc_arena_prep_skipped_pressure": METRICS.ipc_arena_prep_skipped_pressure.load(Ordering::Relaxed),
                 "ipc_severed_pool_hits": METRICS.ipc_severed_pool_hits.load(Ordering::Relaxed),
                 "ipc_severed_pool_misses": METRICS.ipc_severed_pool_misses.load(Ordering::Relaxed),
                 "ipc_severed_pool_bytes": METRICS.ipc_severed_pool_bytes.load(Ordering::Relaxed),

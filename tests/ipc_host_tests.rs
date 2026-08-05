@@ -2338,7 +2338,7 @@ fn admission_defers_arena_thp_prep_off_the_hello_path() {
 
     // RED against the admission-time-prep code: nothing queues (the prep
     // ran inline inside handle_hello_msg) — counts read (0, 0).
-    let (queued, done) = host.arena_prep_counts();
+    let (queued, done, _dead, _pressure) = host.arena_prep_counts();
     assert_eq!(
         queued, 1,
         "session admission must QUEUE the arena THP prep for the deferred \
@@ -2465,7 +2465,11 @@ fn reaped_session_prep_job_skips_and_the_ledger_closes() {
     let fd = open_flags(&m.path, libc::O_RDWR);
     let (sock, cs) = establish(&cfg, &host, fd.as_raw_fd());
     let (queued, done, dead, pressure) = host.arena_prep_counts();
-    assert_eq!((queued, done, dead, pressure), (1, 0, 0, 0), "job queued, stall-held");
+    assert_eq!(
+        (queued, done, dead, pressure),
+        (1, 0, 0, 0),
+        "job queued, stall-held"
+    );
     // Client death while the job is stall-held: EOF ⇒ teardown before
     // the worker reaches the job.
     drop(cs);

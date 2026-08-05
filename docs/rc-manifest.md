@@ -576,12 +576,21 @@ luck rather than design — recorded so they are chosen work, not surprises:
    (`frame_contract` both legs, the fixture's BS) — so the un-installed
    decode states derive their plaintext bound per fixture instead of riding
    the process-ambient `SQUEEZEFS_DEFAULT_BLOCK_SIZE` read.
-2. **A product-side process-global wearing a config costume**: `config_ops.rs:971`,
-   `defrag.rs:598`, `fsck.rs:5532` use `std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", …)`
-   as a runtime channel. Latent, not live (the shipped CLI is one-verb-one-process
-   and every mount pins its crypto bound via `set_crypto`) — but two
-   different-block-size volume sets in ONE process would fight over it.
-   Registry-style cleanup owed.
+2. **A product-side process-global wearing a config costume** — **CLOSED**
+   (2026-08-05, red-first, `fix/wave-closeout`): `config_ops.rs:971`,
+   `defrag.rs:598`, `fsck.rs:5532` used `std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", …)`
+   as a runtime channel — latent, not live (one-verb-one-process CLI), but
+   two different-block-size volume sets in ONE process would have fought
+   over it. All three offline-router constructions now route the set's
+   block size through the router seams the mount path uses —
+   `set_block_size` (already present) plus an explicitly installed
+   passthrough `set_crypto` (the same state `get_crypto()` fell back to,
+   now with the DUR-8e plaintext bound pinned per router via
+   `init_scratch_pool` instead of the ambient env read). Teeth:
+   `tests/env_config_channel_tests.rs` — a census-style source scan makes
+   a fourth set_var site unrepresentable, and the behavioral pin runs
+   `fsck::run_offline` on a 64 KiB-block set asserting the process env
+   stays untouched.
 3. **Immediate-assert-after-read sites racing PERF-11's deferred publish** —
    **CLOSED** (`00850b8b`): the poll-first template (the hot_block_tier
    budget-0 leg — 10 s deadline, then assert) applied at the three flagged

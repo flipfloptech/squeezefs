@@ -967,9 +967,6 @@ async fn offline_drain_body(
         first_alloc.set_capacity_bytes(cap);
     }
     let first_dev = std::sync::Arc::new(crate::nvme_dev::NvmeBlockDev::new(&first.backing_dev));
-    if cfg.block_size > 0 {
-        std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", cfg.block_size.to_string());
-    }
     let cache = crate::cache::TieredCache::new(
         Vec::new(), // no staging dirs: per-mount isolated, not ours (see the verb doc)
         Some("64MB"),
@@ -982,7 +979,20 @@ async fn offline_drain_body(
     )
     .await?;
     let router = crate::routing::DataRouter::new(dlm.clone(), cache, first_alloc, first_dev);
+    // §3d.2 (rc-manifest): the set's block size rides the router seams —
+    // never a process-env write (the retired set_var-based
+    // SQUEEZEFS_DEFAULT_BLOCK_SIZE runtime channel: two
+    // different-block-size sets in one process fought over it). The
+    // explicit passthrough state is what `get_crypto()` falls back to
+    // anyway; installing it via `set_crypto` pins the DUR-8e plaintext
+    // bound to THIS set's block size (`init_scratch_pool` records it) —
+    // the mount path's exact discipline.
     router.set_block_size(cfg.block_size);
+    router.set_crypto(crate::crypto_compress::CryptoCompressState::new(
+        "none".to_string(),
+        "none".to_string(),
+        None,
+    ));
     for rec in &live {
         router.backend_router.register_backend(rec).await?;
     }

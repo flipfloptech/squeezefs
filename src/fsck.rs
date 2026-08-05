@@ -5534,9 +5534,6 @@ async fn run_offline_body(
         first_alloc.set_capacity_bytes(cap);
     }
     let first_dev = Arc::new(crate::nvme_dev::NvmeBlockDev::new(&first.backing_dev));
-    if cfg.block_size > 0 {
-        std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", cfg.block_size.to_string());
-    }
     let cache = crate::cache::TieredCache::new(
         Vec::new(), // never adopt/mutate the mount's staging dirs
         Some("64MB"),
@@ -5549,7 +5546,16 @@ async fn run_offline_body(
     )
     .await?;
     let router = crate::routing::DataRouter::new(dlm.clone(), cache, first_alloc, first_dev);
+    // §3d.2 (rc-manifest): block size rides the router seams, never a
+    // process-env write (see `config_ops::offline_drain_body` — the same
+    // retired runtime channel). The passthrough `set_crypto` pins the
+    // DUR-8e plaintext bound to this set's block size.
     router.set_block_size(cfg.block_size);
+    router.set_crypto(crate::crypto_compress::CryptoCompressState::new(
+        "none".to_string(),
+        "none".to_string(),
+        None,
+    ));
     for rec in &live {
         router.backend_router.register_backend(rec).await?;
     }

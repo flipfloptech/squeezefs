@@ -4782,6 +4782,16 @@ pub struct Metrics {
     pub ipc_sessions_active: Align64<AtomicU64>,
     /// Sessions ever established.
     pub ipc_sessions_total: Align64<AtomicU64>,
+    /// ALWAYS-ON per-admission latency (HELLO receipt → SessionOk sent;
+    /// refusals record nothing — they stay on the refusal counters).
+    /// The fleet-launch convoy instrument (durable-write decomposition,
+    /// 2026-08-05): a fleet row's delta counts the row's sessions and
+    /// names the daemon-side share of the launch term; the client-side
+    /// connect() share is the listen-backlog derivation's
+    /// (`ipc_host::ctl_listen_backlog`). One `Instant` + one bucket add
+    /// per SESSION — the always-on families' cost contract, paid per
+    /// admission rather than per op.
+    pub ipc_session_admission_ns: Align64<LatencyHistogram>,
     /// Successful per-fd binds.
     pub ipc_binds: Align64<AtomicU64>,
     /// The §5.2 daemon-side refusal ledger, by class. `version` growth =
@@ -7598,6 +7608,10 @@ impl SqueezefsFilesystem {
                 // (`ipc_descriptor_rejects`, `ipc_sessions_poisoned`).
                 "ipc_sessions_active": METRICS.ipc_sessions_active.load(Ordering::Relaxed),
                 "ipc_sessions_total": METRICS.ipc_sessions_total.load(Ordering::Relaxed),
+                // The fleet-launch convoy instrument (2026-08-05
+                // durable-write decomposition): per-admission
+                // HELLO→SessionOk latency, ALWAYS-ON.
+                "ipc_session_admission_ns": METRICS.ipc_session_admission_ns.to_json(),
                 "ipc_binds": METRICS.ipc_binds.load(Ordering::Relaxed),
                 "ipc_bind_refused_version": METRICS.ipc_bind_refused_version.load(Ordering::Relaxed),
                 "ipc_bind_refused_nonce": METRICS.ipc_bind_refused_nonce.load(Ordering::Relaxed),

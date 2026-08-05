@@ -249,6 +249,23 @@ fn ctl_conn_cap_from(arena_cap_bytes: u64, session_footprint: u64) -> usize {
     (sessions.saturating_mul(2).clamp(32, 4096)) as usize
 }
 
+/// The ctl socket listen(2) backlog — DERIVED from the ctl connection
+/// cap (durable-write decomposition, 2026-08-05: the former hardcoded
+/// 64 sat exactly at one quarter of the field's 256-process fleet, and
+/// a full SEQPACKET backlog makes connect(2) BLOCK — the fleet's
+/// simultaneous session burst convoyed through 64-slot accept windows,
+/// part of the measured ~150–190 ms per-process launch term at w256).
+///
+/// * floor 64: the pre-derivation shipped constant (the never-regress-
+///   below-shipped posture);
+/// * rail 4096: the `ctl_conn_cap_from` thread rail — a backlog deeper
+///   than the connections we would ever admit buys nothing;
+/// * the kernel additionally truncates to `net.core.somaxconn`
+///   (listen(2)) — that clamp stays kernel-owned, not ours.
+pub fn ctl_listen_backlog(ctl_cap: usize) -> libc::c_int {
+    ctl_cap.clamp(64, 4096) as libc::c_int
+}
+
 /// Host configuration (mount-time; tests construct directly).
 #[derive(Debug, Clone)]
 pub struct IpcHostConfig {
@@ -1247,13 +1264,24 @@ impl IpcHost {
         // Layout computes now so admission can charge the exact footprint.
         SessionLayout::compute(&cfg.geometry)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-        let listener_fd = abstract_listen(&cfg.socket_name)?;
+        // VAL-5d arithmetic FIRST: the listen backlog derives from the
+        // ctl connection cap (durable-write decomposition 2026-08-05 —
+        // the hardcoded 64 convoyed a 256-process fleet's simultaneous
+        // connect burst through 64-slot accept windows; connect(2) on a
+        // full SEQPACKET backlog BLOCKS, so the constant was a launch
+        // serialization stage, not a safety bound).
+        let pre_session_footprint = SessionLayout::compute(&cfg.geometry)
+            .expect("geometry validated above")
+            .total_bytes;
+        let backlog =
+            ctl_listen_backlog(ctl_conn_cap_from(cfg.arena_cap_bytes, pre_session_footprint));
+        let listener_fd = abstract_listen(&cfg.socket_name, backlog)?;
         // OQ-6: the optional path rendezvous. Failure is loud but never
         // fatal — the mount (and same-netns interception) must not be
         // held hostage by optional plumbing.
         let path_listener = cfg.socket_dir.as_ref().and_then(|dir| {
             let path = dir.join(format!("{}.sock", cfg.socket_name));
-            match path_listen(dir, &path) {
+            match path_listen(dir, &path, backlog) {
                 Ok(fd) => {
                     log::info!("ipc host: path ctl socket at {}", path.display());
                     Some((fd, path))
@@ -1950,6 +1978,11 @@ impl IpcHost {
         sock: &Arc<UnixStream>,
         first: (CtlMsg, Option<OwnedFd>),
     ) -> Option<Arc<IpcSession>> {
+        // The fleet-launch convoy instrument (durable-write decomposition
+        // 2026-08-05): HELLO receipt → SessionOk sent, recorded per
+        // ADMITTED session (refusals stay on the refusal counters). One
+        // Instant + one bucket add per SESSION — always-on.
+        let admit_t0 = Instant::now();
         let (msg, rx_fd) = first;
         let CtlMsg::Hello {
             abi,
@@ -2207,6 +2240,9 @@ impl IpcHost {
         // established) keeps the memory alive, and the client holds its
         // own fd. Zero persistent residue by construction.
         drop(memfd);
+        // Admission complete and acknowledged: record the establishment
+        // latency (the convoy instrument's sample).
+        METRICS.ipc_session_admission_ns.record(admit_t0.elapsed());
         Some(session)
     }
 
@@ -2886,7 +2922,7 @@ fn abstract_sockaddr(name: &str) -> io::Result<(libc::sockaddr_un, libc::socklen
     Ok((addr, len as libc::socklen_t))
 }
 
-fn abstract_listen(name: &str) -> io::Result<OwnedFd> {
+fn abstract_listen(name: &str, backlog: libc::c_int) -> io::Result<OwnedFd> {
     // SAFETY: socket(2); ownership taken immediately.
     let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
@@ -2906,8 +2942,9 @@ fn abstract_listen(name: &str) -> io::Result<OwnedFd> {
     {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: listen(2).
-    if unsafe { libc::listen(fd.as_raw_fd(), 64) } != 0 {
+    // SAFETY: listen(2). Backlog is the derived `ctl_listen_backlog`
+    // (the kernel truncates to net.core.somaxconn).
+    if unsafe { libc::listen(fd.as_raw_fd(), backlog) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(fd)
@@ -2956,7 +2993,11 @@ fn path_sockaddr(path: &std::path::Path) -> io::Result<(libc::sockaddr_un, libc:
 /// The socket file itself stays 0666 (connecting is not a credential —
 /// SO_PEERCRED + the §5.2 fd screen are the boundary); a same-name stale
 /// file is OUR crash residue (names embed pid+random) and is replaced.
-fn path_listen(dir: &std::path::Path, path: &std::path::Path) -> io::Result<OwnedFd> {
+fn path_listen(
+    dir: &std::path::Path,
+    path: &std::path::Path,
+    backlog: libc::c_int,
+) -> io::Result<OwnedFd> {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
     match std::fs::DirBuilder::new()
@@ -3030,8 +3071,9 @@ fn path_listen(dir: &std::path::Path, path: &std::path::Path) -> io::Result<Owne
     if unsafe { libc::fchmodat(dirfd.as_raw_fd(), cname.as_ptr(), 0o666, 0) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: listen(2).
-    if unsafe { libc::listen(fd.as_raw_fd(), 64) } != 0 {
+    // SAFETY: listen(2). Backlog is the derived `ctl_listen_backlog`
+    // (the kernel truncates to net.core.somaxconn).
+    if unsafe { libc::listen(fd.as_raw_fd(), backlog) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(fd)

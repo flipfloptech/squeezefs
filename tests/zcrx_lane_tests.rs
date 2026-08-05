@@ -2395,21 +2395,32 @@ async fn test_teardown_is_not_poison() {
     // must-stay-0 tripwire: it must count REAL transport poison only,
     // so teardown retires the admin watchdog BEFORE the association
     // unwinds.
+    // Determinism hardening (stop-ship flake, 2026-08): the single-shot
+    // form lost a schedule race ~1 in 5 — abort() only REQUESTS
+    // cancellation, and teardown() returned with no happens-before edge
+    // to the watchdog's completion, so is_finished() raced the runtime.
+    // 50 cycles at the measured 15 % loss rate ⇒ P(spurious green)
+    // ≈ 0.85^50 ≈ 3e-4: deterministically red against the racy
+    // implementation, and the standing regression pin for the fixed
+    // one (teardown OWNS the retirement — take, abort, AWAIT).
     let mock = MockTarget::start(MockCfg::default(), 1 << 20).await;
     let before = zcrx_metric("poisoned");
-    let sess = LaneSession::connect_with(mock.target(1, 4), LaneBackend::AreaSim)
-        .await
-        .expect("arm");
-    sess.teardown().await;
-    assert!(
-        sess.admin_watchdog_finished(),
-        "teardown must retire the admin watchdog — a post-teardown \
-         target close must be unreadable as poison"
-    );
-    assert_eq!(
-        zcrx_metric("poisoned"),
-        before,
-        "an orderly teardown is NOT a poison transition"
-    );
-    assert!(sess.torn_down());
+    for cycle in 0..50 {
+        let sess = LaneSession::connect_with(mock.target(1, 4), LaneBackend::AreaSim)
+            .await
+            .expect("arm");
+        sess.teardown().await;
+        assert!(
+            sess.admin_watchdog_finished(),
+            "cycle {cycle}: teardown must retire the admin watchdog — \
+             DETERMINISTICALLY, before it returns (a post-teardown \
+             target close must be unreadable as poison)"
+        );
+        assert!(sess.torn_down(), "cycle {cycle}: teardown latched");
+        assert_eq!(
+            zcrx_metric("poisoned"),
+            before,
+            "cycle {cycle}: an orderly teardown is NOT a poison transition"
+        );
+    }
 }

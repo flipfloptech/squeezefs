@@ -2599,6 +2599,11 @@ impl IpcHost {
         if let Some(&node) = self.owner_nodes.get(idx) {
             crate::numa::pin_service_thread(node);
         }
+        // Direct-drive lane (D12 randread-shim residual, 2026-08-05):
+        // this owner's governed submissions ride shard `idx % width` —
+        // one lane per service thread, the shard/reaper partition
+        // mirroring the owner partition above.
+        crate::ipc_direct::set_service_lane(idx);
         // Owned-session snapshot, re-collected ONLY when the registry
         // epoch moves (admission/teardown) — the drain hot pass is
         // registry-mutex-free (2026-07-26 service economy). Staleness

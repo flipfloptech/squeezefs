@@ -79,28 +79,104 @@
 //! reaper drains every in-flight CQE before exiting — bounded by device
 //! latency, keeping umount prompt.
 //!
+//! ## Sharding (D12 randread-shim residual, 2026-08-05)
+//!
+//! Rings + reapers shard by the DERIVED drain-parallelism width
+//! ([`dd_shards_from`] == `il_sessions_default`, the SAME `cpus/4`
+//! slope that ceilings the service threads feeding this engine), one
+//! lane per service thread (`set_service_lane` from the host's
+//! `service_loop`; the owner→node partition pins each shard's reaper
+//! alongside its submitter). The pre-shard single-shared-ring +
+//! single-unpinned-reaper shape serialized every CQE-side serve on ONE
+//! thread — the field's 208k-IOPS-flat rand-4k il ceiling at 235 µs
+//! fabric RTT × 256 in-flight (fio libaio 32×qd8) while the kernel
+//! path spread the same reply work over per-CPU queues (273–280k).
+//! Semantics are unchanged per shard: same prelude, same revalidation,
+//! same fallback ladder, same accounting.
+//!
 //! ## Loom posture
 //!
-//! No new lock-free protocol is introduced: submission and the
-//! in-flight table are guarded by ONE ordinary mutex, the CQ has a
-//! single consumer (the reaper thread) by construction, and completion
-//! reuses the existing loom-modeled slot machinery (`ipc_slot_core`).
+//! No new lock-free protocol is introduced: each shard's submission
+//! and in-flight table are guarded by ONE ordinary mutex, each shard's
+//! CQ has a single consumer (its reaper thread) by construction, and
+//! completion reuses the existing loom-modeled slot machinery
+//! (`ipc_slot_core`). The lane routing is a thread-local read.
 
 use crate::fuse_client::{IpcDirectSnapshot, SqueezefsFilesystem, METRICS};
 use crate::ipc_host::{DataOp, SlotCompletion};
 use io_uring::{opcode, types, IoUring};
 use std::collections::HashMap;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Reaper-wake sentinel (shutdown NOP) — never a slab index.
 const NOP_WAKE: u64 = u64::MAX;
 
-/// SQ/CQ entries. 512 in-flight direct reads ≫ any observed governed
-/// depth (t32qd32 offers ≤ 1024 across 8 service threads; SQ-full
+/// SQ/CQ entries PER SHARD. 512 in-flight direct reads ≫ any observed
+/// per-lane governed depth (t32qd32 offers ≤ 1024 across 8 service
+/// threads, and each service thread owns its own shard; SQ-full
 /// refusals fall back to the handler — counted, never stranded).
 const RING_ENTRIES: u32 = 512;
+
+/// Shard width: env lever wins verbatim (clamp 1..=64 — the
+/// `service_thread_ceiling_from` env-clamp parity), derived default =
+/// [`squeezefs_ipc::sizing::il_sessions_default`] — the ONE
+/// drain-parallelism slope (`clamp(cpus/4, 2, 16)`), the SAME function
+/// that ceilings the service threads feeding this engine, so lanes and
+/// service threads are 1:1 by construction (the ingest-economy
+/// paired-derivation law: two independent constants here would be the
+/// DEFAULTS-MISMATCH class again). Unit-pinned by
+/// `dd_shard_width_derivation_ties_to_il_sessions_default`.
+pub fn dd_shards_from(env: Option<&str>, cpus: usize) -> usize {
+    env.and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|n| n.clamp(1, 64))
+        .unwrap_or_else(|| squeezefs_ipc::sizing::il_sessions_default(cpus))
+}
+
+fn dd_shards() -> usize {
+    dd_shards_from(
+        std::env::var("SQUEEZEFS_IPC_DD_SHARDS").ok().as_deref(),
+        // PROCESS parallelism, never `available_parallelism()` — the
+        // engine spawns lazily from a service thread the NUMA partition
+        // may have pinned to one node (the Hang-1 pinned-first-toucher
+        // sizing poison, `uring_fs::resolve_worker_count`'s law).
+        crate::cpu::process_parallelism(),
+    )
+}
+
+thread_local! {
+    /// The submitting thread's direct-drive LANE. Service threads set
+    /// their owner index at loop start ([`set_service_lane`] from
+    /// `IpcHost::service_loop`); a foreign thread that ever submits
+    /// (tests, future callers) falls back to a dense round-robin
+    /// assignment on first use — spread, never stranded.
+    static DD_LANE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Foreign-thread fallback lane cursor (dense round-robin).
+static FALLBACK_LANE: AtomicUsize = AtomicUsize::new(0);
+
+/// Pin the calling thread's direct-drive lane to service-thread owner
+/// index `idx` (D12 randread-shim residual, 2026-08-05): governed
+/// submissions from this thread ride shard `idx % width`, so the shard
+/// partition mirrors the session→owner partition — submissions never
+/// cross service threads, and each shard's SQ mutex is effectively
+/// uncontended on the submit side.
+pub(crate) fn set_service_lane(idx: usize) {
+    DD_LANE.with(|c| c.set(Some(idx)));
+}
+
+fn current_lane() -> usize {
+    DD_LANE.with(|c| match c.get() {
+        Some(lane) => lane,
+        None => {
+            let lane = FALLBACK_LANE.fetch_add(1, Ordering::Relaxed);
+            c.set(Some(lane));
+            lane
+        }
+    })
+}
 
 /// The conservative LBA the ranged window rounds to (matches the
 /// handler's `get_block_range_for_index` — approved OQ #1 there).
@@ -141,51 +217,83 @@ struct VolSlot {
     raw: RawFd,
 }
 
-/// The ipc-host-owned direct-drive uring: one shared ring (submissions
-/// from the service threads under `state`'s mutex; completions reaped
-/// by ONE dedicated thread — profile said shared-ring-plus-mutex first,
-/// per-thread rings stay the recorded fallback if SQ contention ever
-/// shows on a profile).
-pub(crate) struct DirectDriveEngine {
-    fs: Arc<SqueezefsFilesystem>,
+/// One direct-drive SHARD: its own ring, in-flight slab, and (lazily
+/// spawned, NUMA-pinned) reaper thread. The pre-shard engine's "one
+/// shared ring + one reaper" shape — whose module doc recorded
+/// per-thread rings as the fallback "if SQ contention ever shows on a
+/// profile" — was the field's 208k-IOPS-flat rand-4k il ceiling
+/// (2026-08-05, D12 randread-shim residual): at 235 µs fabric RTT and
+/// 256 in-flight (fio libaio 32×qd8), ONE unpinned reaper serialized
+/// every CQE-side serve (~4.8 µs/op of revalidate + accounting + slot
+/// completion) while the kernel FUSE path spread the same work over
+/// per-CPU queues (273–280k). Shards are keyed to service-thread
+/// owners (lane = owner % width), so the submit-side mutex is
+/// single-writer in practice and reap work spreads over the derived
+/// drain-parallelism width.
+struct DdShard {
     ring: IoUring,
     /// Guards SQ pushes AND the in-flight slab (one lock, short holds,
-    /// never across I/O or a wait).
+    /// never across I/O or a wait; contended only by this shard's lane
+    /// owner and its reaper).
     state: Mutex<EngineState>,
+    /// Fixed-file registration outcome for THIS shard's ring.
+    use_fixed: bool,
+    /// SQEs pushed since the last `io_uring_enter` — the submit-batch
+    /// economy (the M3/transport-commit-batch lesson, re-learned here:
+    /// a per-op enter from every service thread was the measured
+    /// kernel-cycle governor at t32qd32). The host's drain pass calls
+    /// [`DirectDriveEngine::flush`] once per sweep; qd1 pays the same
+    /// one enter per op it always did.
+    pending_submits: std::sync::atomic::AtomicU32,
+    /// The shard's reaper thread — spawned on the shard's FIRST
+    /// governed submit (spawn-on-bind, the `ensure_service_threads`
+    /// precedent: a lane that never direct-drives owns no thread).
+    reaper: Mutex<Option<std::thread::JoinHandle<()>>>,
+    reaper_live: AtomicBool,
+    /// One-shot spawn-failure latch: refuse fast (handler fallback),
+    /// log once.
+    spawn_failed: AtomicBool,
+    /// The reaper's pin target — the `numa_core::owner_nodes` CPU-
+    /// weighted partition at this shard's index, mirroring the service
+    /// threads' own partition so a lane's reaper sits where its
+    /// submitter (and the session arenas it serves) live. `pin` is
+    /// gated inside `crate::numa::pin_service_thread`
+    /// (`SQUEEZEFS_NUMA=0` / single-node maps ⇒ no-op).
+    node: Option<usize>,
+}
+
+/// The ipc-host-owned direct-drive engine: `width` = [`dd_shards`]
+/// shards (rings + reapers), lane-routed by submitting service thread.
+pub(crate) struct DirectDriveEngine {
+    fs: Arc<SqueezefsFilesystem>,
+    shards: Vec<DdShard>,
     vols: HashMap<String, VolSlot>,
     /// Keeps the device fds open for the engine's lifetime.
     _files: Vec<std::fs::File>,
-    use_fixed: bool,
     /// Fallback request identity (the sink's ring-op identity).
     req_uid: u32,
     req_gid: u32,
     req_pid: u32,
     shutting_down: AtomicBool,
-    reaper: Mutex<Option<std::thread::JoinHandle<()>>>,
-    /// SQEs pushed since the last `io_uring_enter` — the submit-batch
-    /// economy (the M3/transport-commit-batch lesson, re-learned here:
-    /// a per-op enter from every service thread was the measured
-    /// kernel-cycle governor at t32qd32 — 4 saturated service threads,
-    /// dominant samples in the syscall path). The host's drain pass
-    /// calls [`Self::flush`] once per sweep; qd1 pays the same one
-    /// enter per op it always did.
-    pending_submits: std::sync::atomic::AtomicU32,
+    /// LIVE shard reapers — mirrored into the `ipc_direct_shards`
+    /// gauge (the sharding engagement instrument).
+    reapers_spawned: AtomicUsize,
 }
 
 impl DirectDriveEngine {
     /// Open the data volumes (O_DIRECT with buffered fallback — the
     /// `NvmeBlockDev` worker's own posture on file-backed substrates),
-    /// register them as fixed files where the kernel allows, and start
-    /// the reaper. Volumes added AFTER spawn are prelude-ineligible
-    /// (`ipc_direct_ineligible_backend`) — recorded residual.
+    /// build the derived-width shard set (each shard registers the
+    /// volumes as fixed files where the kernel allows). Reapers spawn
+    /// per shard on its first governed submit. Volumes added AFTER
+    /// spawn are prelude-ineligible (`ipc_direct_ineligible_backend`)
+    /// — recorded residual.
     pub(crate) fn spawn(
         fs: Arc<SqueezefsFilesystem>,
         req_uid: u32,
         req_gid: u32,
         req_pid: u32,
     ) -> std::io::Result<Arc<Self>> {
-        let ring = IoUring::new(RING_ENTRIES)?;
-
         let mut paths: Vec<(String, String)> = vec![(
             "backend_0".to_string(),
             fs.router.backend_router.default_device.device_path.clone(),
@@ -234,60 +342,124 @@ impl DirectDriveEngine {
             files.push(file);
         }
         let fds: Vec<RawFd> = files.iter().map(|f| f.as_raw_fd()).collect();
-        let use_fixed = if fds.is_empty() {
-            false
-        } else {
-            match ring.submitter().register_files(&fds) {
-                Ok(()) => true,
-                Err(e) => {
-                    log::debug!(
-                        "ipc direct-drive: fixed-file register failed ({e}) — using raw fds"
-                    );
-                    false
+
+        // Derived shard width + the CPU-weighted node partition (the
+        // service threads' own `owner_nodes` law at this pool's width —
+        // width == the service-thread ceiling by shared derivation, so
+        // lane i's reaper lands on lane i's submitter's node).
+        let width = dd_shards();
+        let nodes = crate::numa_core::topology().owner_nodes(width);
+        let mut shards = Vec::with_capacity(width);
+        for idx in 0..width {
+            let ring = IoUring::new(RING_ENTRIES)?;
+            let use_fixed = if fds.is_empty() {
+                false
+            } else {
+                match ring.submitter().register_files(&fds) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log::debug!(
+                            "ipc direct-drive: shard {idx} fixed-file register failed \
+                             ({e}) — using raw fds"
+                        );
+                        false
+                    }
                 }
-            }
-        };
+            };
+            shards.push(DdShard {
+                ring,
+                state: Mutex::new(EngineState {
+                    inflight: Vec::with_capacity(RING_ENTRIES as usize),
+                    free: Vec::new(),
+                    inflight_count: 0,
+                }),
+                use_fixed,
+                pending_submits: std::sync::atomic::AtomicU32::new(0),
+                reaper: Mutex::new(None),
+                reaper_live: AtomicBool::new(false),
+                spawn_failed: AtomicBool::new(false),
+                node: nodes.get(idx).copied(),
+            });
+        }
 
         let engine = Arc::new(Self {
             fs,
-            ring,
-            state: Mutex::new(EngineState {
-                inflight: Vec::with_capacity(RING_ENTRIES as usize),
-                free: Vec::new(),
-                inflight_count: 0,
-            }),
+            shards,
             vols,
             _files: files,
-            use_fixed,
             req_uid,
             req_gid,
             req_pid,
             shutting_down: AtomicBool::new(false),
-            reaper: Mutex::new(None),
-            pending_submits: std::sync::atomic::AtomicU32::new(0),
+            reapers_spawned: AtomicUsize::new(0),
         });
-        let reaper_engine = Arc::clone(&engine);
-        let handle = std::thread::Builder::new()
-            .name("sqz-ipc-dd".into())
-            .spawn(move || reaper_engine.reap_loop())?;
-        *engine
-            .reaper
-            .lock()
-            .expect("direct-drive reaper mutex never poisons") = Some(handle);
+        // Fresh engine: no shard reaper is live yet (spawn-on-first-
+        // submit) — the gauge reflects THIS engine from here on.
+        METRICS.ipc_direct_shards.store(0, Ordering::Relaxed);
         log::info!(
-            "ipc direct-drive engine up: {} volume(s), fixed_files={}, entries={}",
+            "ipc direct-drive engine up: {} volume(s), {} shard(s), entries={}/shard",
             engine.vols.len(),
-            use_fixed,
+            engine.shards.len(),
             RING_ENTRIES
         );
         Ok(engine)
     }
 
-    /// Submit one prelude-eligible op. `Err` returns the op for the
-    /// handler fallback (unknown/unhealthy volume, SQ full) — counted
-    /// in the `backend` ledger class by the caller's contract here.
+    /// Guarantee shard `idx`'s reaper exists (spawn-on-first-submit).
+    /// `false` = spawn failed or shutdown raced — the caller falls back
+    /// to the handler path (fallback-is-correctness).
+    fn ensure_reaper(self: &Arc<Self>, idx: usize) -> bool {
+        let shard = &self.shards[idx];
+        if shard.reaper_live.load(Ordering::Acquire) {
+            return true;
+        }
+        if shard.spawn_failed.load(Ordering::Relaxed) {
+            return false;
+        }
+        let mut guard = shard
+            .reaper
+            .lock()
+            .expect("direct-drive reaper mutex never poisons");
+        if shard.reaper_live.load(Ordering::Acquire) {
+            return true;
+        }
+        // Serialized against `shutdown`'s handle take on this mutex: a
+        // spawn that wins lands its handle for the join; one that loses
+        // observes the flag and refuses — no leaked reaper either way.
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return false;
+        }
+        let engine = Arc::clone(self);
+        match std::thread::Builder::new()
+            .name(format!("sqz-ipc-dd{idx}"))
+            .spawn(move || engine.reap_loop(idx))
+        {
+            Ok(handle) => {
+                *guard = Some(handle);
+                shard.reaper_live.store(true, Ordering::Release);
+                let live = self.reapers_spawned.fetch_add(1, Ordering::AcqRel) + 1;
+                METRICS
+                    .ipc_direct_shards
+                    .store(live as u64, Ordering::Relaxed);
+                true
+            }
+            Err(e) => {
+                shard.spawn_failed.store(true, Ordering::Relaxed);
+                log::warn!(
+                    "ipc direct-drive: shard {idx} reaper failed to spawn ({e}) — \
+                     this lane's governed reads stay on the handler path"
+                );
+                false
+            }
+        }
+    }
+
+    /// Submit one prelude-eligible op on the calling thread's LANE
+    /// shard. `Err` returns the op for the handler fallback (unknown/
+    /// unhealthy volume, SQ full, reaper spawn failure) — counted in
+    /// the `backend` ledger class by the caller's contract here.
     pub(crate) fn submit(
-        &self,
+        self: &Arc<Self>,
         op: DataOp,
         completion: SlotCompletion,
         snap: IpcDirectSnapshot,
@@ -381,9 +553,26 @@ impl DirectDriveEngine {
             bounce,
         };
 
-        // Slab insert + SQE push under the ONE engine mutex.
+        // Lane routing: this thread's shard (service threads pin their
+        // owner index; the shard partition mirrors the session→owner
+        // partition). The reaper must be live BEFORE the SQE publishes.
+        let lane = current_lane() % self.shards.len();
+        if !self.ensure_reaper(lane) {
+            METRICS
+                .ipc_direct_ineligible_backend
+                .fetch_add(1, Ordering::Relaxed);
+            // Un-count the submit that will not happen.
+            METRICS
+                .ipc_direct_drive_submits
+                .fetch_sub(1, Ordering::Relaxed);
+            let Pending { op, completion, .. } = pending;
+            return Err((op, completion));
+        }
+        let shard = &self.shards[lane];
+
+        // Slab insert + SQE push under the ONE shard mutex.
         {
-            let mut st = self
+            let mut st = shard
                 .state
                 .lock()
                 .expect("direct-drive state mutex never poisons");
@@ -394,7 +583,7 @@ impl DirectDriveEngine {
                     st.inflight.len() - 1
                 }
             };
-            let sqe = if self.use_fixed {
+            let sqe = if shard.use_fixed {
                 opcode::Read::new(types::Fixed(vol.fixed), dest_ptr, pending.window as u32)
                     .offset(dev_read_off)
                     .build()
@@ -407,16 +596,16 @@ impl DirectDriveEngine {
             };
             // SAFETY: SQ access is exclusive under `state`'s mutex (the
             // reaper never touches the SQ; §module docs).
-            let mut sq = unsafe { self.ring.submission_shared() };
+            let mut sq = unsafe { shard.ring.submission_shared() };
             let mut pushed = unsafe { sq.push(&sqe).is_ok() };
             if !pushed {
                 // SQ full: flush what's queued, retry once, else refuse
                 // (client backpressure via the handler path).
                 sq.sync();
                 drop(sq);
-                let _ = self.ring.submit();
+                let _ = shard.ring.submit();
                 // SAFETY: as above — still under the mutex.
-                let mut sq = unsafe { self.ring.submission_shared() };
+                let mut sq = unsafe { shard.ring.submission_shared() };
                 pushed = unsafe { sq.push(&sqe).is_ok() };
                 sq.sync();
             } else {
@@ -441,43 +630,56 @@ impl DirectDriveEngine {
         // thread's drain pass flushes ONCE per sweep (`flush`), so a
         // deep-qd burst pays one syscall per batch instead of one per
         // op. (The SQ-full path above already entered to make room.)
-        self.pending_submits.fetch_add(1, Ordering::Release);
+        shard.pending_submits.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
     /// Flush pushed-but-unsubmitted SQEs — one `io_uring_enter` per
-    /// drain sweep. Cheap when idle (one atomic load); concurrent
-    /// flushes are harmless (the kernel consumes the published tail).
+    /// shard with published work, per drain sweep. Cheap when idle
+    /// (one atomic load per shard, width ≤ 16 derived / 64 clamped);
+    /// concurrent flushes are harmless (the kernel consumes the
+    /// published tail). Flushing ALL shards (not just the caller's
+    /// lane) keeps the liveness rule thread-pairing-independent.
     pub(crate) fn flush(&self) {
-        if self.pending_submits.swap(0, Ordering::AcqRel) == 0 {
-            return;
-        }
-        for attempt in 0..3 {
-            match self.ring.submit() {
-                Ok(_) => return,
-                Err(e)
-                    if matches!(
-                        e.raw_os_error(),
-                        Some(libc::EINTR) | Some(libc::EAGAIN) | Some(libc::EBUSY)
-                    ) && attempt < 2 =>
-                {
-                    std::hint::spin_loop();
-                }
-                Err(e) => {
-                    // The SQEs are published; the reaper's own enter
-                    // carries them. Loud because it should not happen.
-                    log::error!("ipc direct-drive: io_uring submit failed: {e}");
-                    return;
+        for (lane, shard) in self.shards.iter().enumerate() {
+            if shard.pending_submits.swap(0, Ordering::AcqRel) == 0 {
+                continue;
+            }
+            for attempt in 0..3 {
+                match shard.ring.submit() {
+                    Ok(_) => break,
+                    Err(e)
+                        if matches!(
+                            e.raw_os_error(),
+                            Some(libc::EINTR) | Some(libc::EAGAIN) | Some(libc::EBUSY)
+                        ) && attempt < 2 =>
+                    {
+                        std::hint::spin_loop();
+                    }
+                    Err(e) => {
+                        // The SQEs are published; the reaper's own enter
+                        // carries them. Loud because it should not happen.
+                        log::error!("ipc direct-drive: shard {lane} io_uring submit failed: {e}");
+                        break;
+                    }
                 }
             }
         }
     }
 
-    /// The single CQ consumer: block in `io_uring_enter(GETEVENTS,
-    /// min_complete=1)`, complete slots straight from CQEs. Exits only
-    /// when shutdown is flagged AND the in-flight set is drained (every
-    /// pending op pins its session mapping until here — §5.3.1 rule 4).
-    fn reap_loop(self: Arc<Self>) {
+    /// Shard `idx`'s single CQ consumer: block in `io_uring_enter(
+    /// GETEVENTS, min_complete=1)`, complete slots straight from CQEs.
+    /// Exits only when shutdown is flagged AND the shard's in-flight
+    /// set is drained (every pending op pins its session mapping until
+    /// here — §5.3.1 rule 4). Pinned to the shard's partition node
+    /// (gated inside `pin_service_thread`: `SQUEEZEFS_NUMA=0` /
+    /// single-node maps ⇒ no-op) so the CQE-side revalidate + serve
+    /// run where the lane's submitter and session arenas live.
+    fn reap_loop(self: Arc<Self>, idx: usize) {
+        let shard = &self.shards[idx];
+        if let Some(node) = shard.node {
+            crate::numa::pin_service_thread(node);
+        }
         // MEM-7c escalation bound: consecutive failed enters while ops are
         // in flight. A permanently broken ring must neither unmap under DMA
         // nor hang `shutdown`'s join forever, so past this many 1 ms
@@ -488,7 +690,7 @@ impl DirectDriveEngine {
         let mut consecutive_stalls = 0u32;
         loop {
             {
-                let st = self
+                let st = shard
                     .state
                     .lock()
                     .expect("direct-drive state mutex never poisons");
@@ -496,7 +698,7 @@ impl DirectDriveEngine {
                     return;
                 }
             }
-            match self.ring.submitter().submit_and_wait(1) {
+            match shard.ring.submitter().submit_and_wait(1) {
                 Ok(_) => {}
                 Err(e) if e.raw_os_error() == Some(libc::EINTR) => {}
                 Err(e) => {
@@ -512,7 +714,7 @@ impl DirectDriveEngine {
                     // deliberately LEAKED mapping (below), never to an
                     // unmap under DMA.
                     let inflight = {
-                        let st = self
+                        let st = shard
                             .state
                             .lock()
                             .expect("direct-drive state mutex never poisons");
@@ -526,15 +728,15 @@ impl DirectDriveEngine {
                         .fetch_add(1, Ordering::Relaxed);
                     consecutive_stalls += 1;
                     log::error!(
-                        "ipc direct-drive: reaper enter failed: {e} ({inflight} op(s) \
-                         still in flight — their DMA destinations stay pinned, \
-                         stall {consecutive_stalls}/{REAP_STALL_LIMIT})"
+                        "ipc direct-drive: shard {idx} reaper enter failed: {e} \
+                         ({inflight} op(s) still in flight — their DMA destinations \
+                         stay pinned, stall {consecutive_stalls}/{REAP_STALL_LIMIT})"
                     );
                     if consecutive_stalls >= REAP_STALL_LIMIT {
                         // Leak the pins rather than unmap under DMA, and
                         // rather than hang the shutdown join forever.
                         let leaked = {
-                            let mut st = self
+                            let mut st = shard
                                 .state
                                 .lock()
                                 .expect("direct-drive state mutex never poisons");
@@ -549,7 +751,7 @@ impl DirectDriveEngine {
                             n
                         };
                         log::error!(
-                            "ipc direct-drive: ring unrecoverable after \
+                            "ipc direct-drive: shard {idx} ring unrecoverable after \
                              {REAP_STALL_LIMIT} failed enters — LEAKING {leaked} \
                              in-flight destination(s) (their pages stay mapped \
                              for the process's life; unmapping under kernel DMA \
@@ -561,9 +763,9 @@ impl DirectDriveEngine {
                 }
             }
             consecutive_stalls = 0;
-            // SAFETY: this thread is the ONLY CQ accessor (construction
-            // invariant; §module docs).
-            let mut cq = unsafe { self.ring.completion_shared() };
+            // SAFETY: this thread is the ONLY CQ accessor of THIS
+            // shard's ring (construction invariant; §module docs).
+            let mut cq = unsafe { shard.ring.completion_shared() };
             cq.sync();
             let cqes: Vec<(u64, i32)> = cq.by_ref().map(|c| (c.user_data(), c.result())).collect();
             drop(cq);
@@ -572,20 +774,23 @@ impl DirectDriveEngine {
                     continue;
                 }
                 let pending = {
-                    let mut st = self
+                    let mut st = shard
                         .state
                         .lock()
                         .expect("direct-drive state mutex never poisons");
-                    let idx = user_data as usize;
-                    let p = st.inflight.get_mut(idx).and_then(Option::take);
+                    let slot_idx = user_data as usize;
+                    let p = st.inflight.get_mut(slot_idx).and_then(Option::take);
                     if p.is_some() {
-                        st.free.push(idx);
+                        st.free.push(slot_idx);
                         st.inflight_count -= 1;
                     }
                     p
                 };
                 let Some(pending) = pending else {
-                    log::error!("ipc direct-drive: CQE for unknown slot {user_data} — dropped");
+                    log::error!(
+                        "ipc direct-drive: shard {idx} CQE for unknown slot \
+                         {user_data} — dropped"
+                    );
                     continue;
                 };
                 self.finish(pending, res);
@@ -663,31 +868,77 @@ impl DirectDriveEngine {
         drop(bounce);
     }
 
-    /// Flag shutdown, NOP-wake the reaper, join it (it drains every
-    /// in-flight CQE first — bounded by device latency).
+    /// Flag shutdown, NOP-wake EVERY spawned shard reaper, join them
+    /// (each drains its shard's in-flight CQEs first — bounded by
+    /// device latency). Never-engaged shards have no reaper and no
+    /// in-flight ops: nothing to wake, nothing to join.
     pub(crate) fn shutdown(&self) {
         if self.shutting_down.swap(true, Ordering::SeqCst) {
             return;
         }
-        {
-            let _st = self
-                .state
+        for shard in &self.shards {
+            // Take the handle under the reaper mutex — the same mutex
+            // `ensure_reaper` spawns under, so a racing spawn either
+            // lands its handle here or observes the flag and refuses.
+            let handle = shard
+                .reaper
                 .lock()
-                .expect("direct-drive state mutex never poisons");
-            let sqe = opcode::Nop::new().build().user_data(NOP_WAKE);
-            // SAFETY: SQ exclusive under the mutex.
-            let mut sq = unsafe { self.ring.submission_shared() };
-            let _ = unsafe { sq.push(&sqe) };
-            sq.sync();
+                .expect("direct-drive reaper mutex never poisons")
+                .take();
+            let Some(handle) = handle else { continue };
+            {
+                let _st = shard
+                    .state
+                    .lock()
+                    .expect("direct-drive state mutex never poisons");
+                let sqe = opcode::Nop::new().build().user_data(NOP_WAKE);
+                // SAFETY: SQ exclusive under the mutex.
+                let mut sq = unsafe { shard.ring.submission_shared() };
+                let _ = unsafe { sq.push(&sqe) };
+                sq.sync();
+            }
+            let _ = shard.ring.submit();
+            let _ = handle.join();
         }
-        let _ = self.ring.submit();
-        let handle = self
-            .reaper
-            .lock()
-            .expect("direct-drive reaper mutex never poisons")
-            .take();
-        if let Some(h) = handle {
-            let _ = h.join();
-        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Foreign threads (no service-lane pin) get a dense round-robin
+    /// lane on first use, stable for the thread's life — spread, never
+    /// stranded, never racing another thread's assignment.
+    #[test]
+    fn foreign_thread_lane_fallback_is_dense_and_stable() {
+        let lanes: Vec<usize> = (0..3)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let a = current_lane();
+                    let b = current_lane();
+                    assert_eq!(a, b, "a thread's lane must be stable");
+                    a
+                })
+                .join()
+                .expect("lane probe thread")
+            })
+            .collect();
+        let mut sorted = lanes.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 3, "three foreign threads get three lanes");
+    }
+
+    /// The service-lane pin wins over the fallback (the owner-partition
+    /// mapping `lane = owner % width` depends on it).
+    #[test]
+    fn service_lane_pin_wins() {
+        std::thread::spawn(|| {
+            set_service_lane(7);
+            assert_eq!(current_lane(), 7);
+        })
+        .join()
+        .expect("pin probe thread");
     }
 }

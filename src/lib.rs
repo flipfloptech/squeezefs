@@ -113,7 +113,7 @@ pub mod fuse_client;
 pub(crate) mod gauge_core;
 pub mod health;
 pub(crate) mod incarnation_core;
-pub(crate) mod ipc_direct;
+pub mod ipc_direct;
 pub mod ipc_host;
 pub mod ipc_service;
 pub mod job_wire;

@@ -38,21 +38,29 @@ require_mount() {
 }
 
 echo "== 0. raw ceilings (same-day grading rows) =="
-# Data namespaces: /dev/nvme{10,12,14,16,18,20,22,24,26,28}n1
+# Data namespaces: /dev/nvme{10,12,14,16,18,20,22,24,26,28}n1. Raw device
+# access needs root, and each device gets its own job (the first-session
+# row printed 4.19 GB/s: unprivileged opens + one job over a colon set —
+# instrument-junk, labeled so). If sudo is unavailable, label and skip —
+# grading falls back to the standing 41.8 GB/s / 3.36 M rows.
 DEVS=$(for i in 10 12 14 16 18 20 22 24 26 28; do printf "/dev/nvme%dn1:" $i; done | sed 's/:$//')
-fio --name=rawread --filename="$DEVS" --rw=read --bs=4m --iodepth=16 \
-    --numjobs=1 --ioengine=libaio --direct=1 --time_based --runtime=30 \
-    --group_reporting --output-format=json 2>/dev/null | python3 -c "
+if sudo -n true 2>/dev/null; then
+    sudo fio --name=rawread --filename="$DEVS" --rw=read --bs=4m --iodepth=16 \
+        --numjobs=10 --ioengine=libaio --direct=1 --time_based --runtime=30 \
+        --group_reporting --output-format=json 2>/dev/null | python3 -c "
 import json,sys
 raw=sys.stdin.buffer.read();d=json.loads(raw[raw.find(b'{'):])
 print('  raw seq-read: %.2f GB/s' % (sum(x['read']['bw_bytes'] for x in d['jobs'])/1e9))"
-fio --name=rawrand --filename="$DEVS" --rw=randread --bs=4k --iodepth=32 \
-    --numjobs=32 --ioengine=libaio --direct=1 --time_based --runtime=30 \
-    --group_reporting --output-format=json 2>/dev/null | python3 -c "
+    sudo fio --name=rawrand --filename="$DEVS" --rw=randread --bs=4k --iodepth=32 \
+        --numjobs=32 --ioengine=libaio --direct=1 --time_based --runtime=30 \
+        --group_reporting --output-format=json 2>/dev/null | python3 -c "
 import json,sys
 raw=sys.stdin.buffer.read();d=json.loads(raw[raw.find(b'{'):])
 r=[j['read'] for j in d['jobs']]
 print('  raw rand-4k: %s IOPS' % format(int(sum(x['iops'] for x in r)),','))"
+else
+    echo "  (no passwordless sudo — raw rows SKIPPED; grade against standing 41.8 GB/s / 3.36M)"
+fi
 
 require_mount
 echo "== 1. headline battery (kernel path, 60 s sustained each) =="

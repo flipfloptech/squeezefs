@@ -3287,6 +3287,20 @@ pub struct DataRouterInner {
     pub dlm: DlmClient,
     pub meta_backend:
         once_cell::sync::OnceCell<std::sync::Arc<crate::meta_backend::RoutedMetaBackend>>,
+    /// The inode-reclaim latch probe (the live-statfs ENOSPC-drift fix,
+    /// 2026-08-05): `true` ⇔ this ino's reclaim is IN FLIGHT — the FUSE
+    /// layer's single-drive `reclaim_inflight` claim, held across the
+    /// whole `delete_file` → `destroy_inodes` window. The layout-save
+    /// funnel refuses publishes for latched inos (NotFound class), so a
+    /// custody mover racing the reclaim can never publish a mapping into
+    /// the window between `delete_file`'s map snapshot and the destroy —
+    /// the shape that leaked its freshly-allocated block in the LIVE
+    /// accounting forever (on-disk self-healed at destroy, which is why a
+    /// remount converged instantly). `OnceCell` per the `dma_fence` /
+    /// `read_tier_purge` pattern: wired by `SqueezefsFilesystem::new`;
+    /// bare routers never latch, so nothing is refused.
+    pub(crate) reclaim_probe:
+        once_cell::sync::OnceCell<std::sync::Arc<dyn Fn(u64) -> bool + Send + Sync>>,
     pub cache: TieredCache,
     pub block_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
     pub nvme_writer: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
@@ -5190,6 +5204,37 @@ impl DataRouter {
             });
         }
 
+        // The inode-reclaim latch (live-statfs ENOSPC-drift fix,
+        // 2026-08-05; tests/statfs_live_accounting_tests.rs): a layout
+        // publish for an ino whose reclaim is IN FLIGHT must refuse. A
+        // custody mover (the flush unit is the canonical adversary —
+        // ENOSPC-valve-parked in `allocate_block`, woken by the very
+        // frees `delete_file` produced) could otherwise land its merge in
+        // the window between `delete_file`'s map snapshot and
+        // `destroy_inodes` — the save SUCCEEDS there (the record still
+        // exists), nothing ever frees the published block, and the LIVE
+        // allocator gauge (statfs) drifts until remount (the destroy
+        // erases the record without decoding layouts, so on-disk
+        // accounting self-heals — the field's "remount converges
+        // instantly" signature). The refusal is NotFound-class ON
+        // PURPOSE: every mover's merge-error arm already frees its
+        // freshly-allocated block and classifies NotFound through the
+        // FIND-M11-A verified-orphan ladder (pre-destroy attempts verify
+        // the record alive and requeue; post-destroy attempts
+        // verified-discard) — never-lossy, RES-1 untouched (no lock is
+        // held here that a free needs). Callers hold INODE_META_LOCKS
+        // across probe→save, and delete_file's serialization point
+        // orders every in-flight merge against the latch (see there).
+        if self.ino_reclaim_in_flight(ino) {
+            return Err(SqueezefsError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "Inode {ino} not found (reclaim in flight — layout publish refused; \
+                     the caller's orphan arm owns the block)"
+                ),
+            )));
+        }
+
         // Publish decomposition (2026-08-01): per-save spans record on
         // publish-class saves only (the pipeline hot path under test) —
         // plain layout persists stay unrecorded.
@@ -5685,6 +5730,7 @@ impl DataRouter {
             inner: std::sync::Arc::new(DataRouterInner {
                 dlm,
                 meta_backend: once_cell::sync::OnceCell::new(),
+                reclaim_probe: once_cell::sync::OnceCell::new(),
                 cache,
                 block_allocator,
                 nvme_writer,
@@ -5755,6 +5801,20 @@ impl DataRouter {
     /// Rehydrate a `DataRouter` from its inner Arc (merge-worker hook).
     pub(crate) fn from_inner(inner: std::sync::Arc<DataRouterInner>) -> Self {
         Self { inner }
+    }
+
+    /// Wire the inode-reclaim latch probe (see the field doc on
+    /// [`DataRouterInner::reclaim_probe`]). First wiring wins (the
+    /// established `read_tier_purge` posture).
+    pub fn set_reclaim_probe(&self, probe: std::sync::Arc<dyn Fn(u64) -> bool + Send + Sync>) {
+        let _ = self.reclaim_probe.set(probe);
+    }
+
+    /// `true` ⇔ `ino`'s reclaim (delete_file → destroy) is in flight and
+    /// layout publishes for it must refuse. Bare routers: always `false`.
+    #[inline]
+    pub(crate) fn ino_reclaim_in_flight(&self, ino: u64) -> bool {
+        self.reclaim_probe.get().is_some_and(|p| p(ino))
     }
 
     pub fn set_crypto(&self, crypto: crate::crypto_compress::CryptoCompressState) {
@@ -10591,7 +10651,7 @@ impl DataRouter {
                 block_map.insert(idx, key);
             }
 
-            let deferred = {
+            let commit_res = {
                 let _meta_guard = meta_lock_acquire(ino).await;
                 let fresh = self.metadata_cache.get(&ino);
                 let mut updated_meta = meta.clone();
@@ -10605,21 +10665,53 @@ impl DataRouter {
                     meta.block_map.as_deref(),
                     updated_meta.block_map.as_deref(),
                 );
-                self.save_metadata_to_backend_refs(ino, &updated_meta, fencing_token, &refs)
-                    .await?;
+                match self
+                    .save_metadata_to_backend_refs(ino, &updated_meta, fencing_token, &refs)
+                    .await
+                {
+                    Ok(()) => {
+                        self.cache.write_lru.remove(file_path);
+                        self.cache.read_lru.remove(file_path);
 
-                self.cache.write_lru.remove(file_path);
-                self.cache.read_lru.remove(file_path);
-
-                self.metadata_cache.insert(ino, updated_meta);
-                // The staged form is superseded: release its ring entry
-                // (budget) and any promoted/spilled durable copy.
-                self.release_superseded_staged(
-                    meta.file_id.as_deref(),
-                    fresh.as_ref().and_then(|f| f.block_map.as_deref()),
-                    None,
-                )
-                .await
+                        self.metadata_cache.insert(ino, updated_meta);
+                        // The staged form is superseded: release its ring
+                        // entry (budget) and any promoted/spilled durable
+                        // copy.
+                        Ok(self
+                            .release_superseded_staged(
+                                meta.file_id.as_deref(),
+                                fresh.as_ref().and_then(|f| f.block_map.as_deref()),
+                                None,
+                            )
+                            .await)
+                    }
+                    // The minted blocks never reached a persisted map —
+                    // free them before surfacing, or every failing commit
+                    // here (fencing expiry, the reclaim-latch NotFound
+                    // refusal, a NotFound after destroy) leaks the whole
+                    // batch's device space in the LIVE accounting (the
+                    // statfs ENOSPC-drift bug's second face; the map keys
+                    // are captured for the post-guard free — RES-1).
+                    Err(e) => Err((
+                        e,
+                        updated_meta
+                            .block_map
+                            .as_deref()
+                            .map(|m| m.values().cloned().collect::<Vec<_>>())
+                            .unwrap_or_default(),
+                    )),
+                }
+            };
+            // RES-1: guard dropped — orphan-free the failing commit's
+            // fresh mints now, then propagate.
+            let deferred = match commit_res {
+                Ok(d) => d,
+                Err((e, minted)) => {
+                    for key in &minted {
+                        let _ = self.backend_router.free_block(key).await;
+                    }
+                    return Err(e);
+                }
             };
             // RES-1: guard dropped — free the displaced keys now.
             self.free_deferred_keys(deferred).await;
@@ -13923,6 +14015,21 @@ impl DataRouter {
 
     /// Safely delete all underlying storage files/blocks associated with the file.
     pub async fn delete_file(&self, file_path: &str) -> Result<()> {
+        // Reclaim-latch serialization point (the live-statfs drift fix):
+        // the caller set the ino's reclaim latch BEFORE calling here
+        // (`reclaim_inflight` admission claim / fsck repair's exclusive
+        // guard). Acquiring-and-dropping the ino's meta lock orders every
+        // in-flight layout publish against that latch: a merge whose
+        // critical section began before this point commits before we read
+        // the map below (its mapping IS in the snapshot and gets freed); a
+        // merge entering after this point observes the latch inside
+        // `save_metadata_to_backend_ext` and refuses (its caller frees the
+        // orphan block). Without this fence a merge could probe the latch
+        // pre-insert yet commit post-snapshot — the leaked-refcount window.
+        // (fetch_metadata's fast path serves the RAM cache WITHOUT the
+        // lock, so it cannot be the fence itself.)
+        let ino_for_fence = parse_inode_from_path(file_path);
+        drop(meta_lock_acquire(ino_for_fence).await);
         let meta = self.fetch_metadata(file_path).await?;
 
         let mut blocks_to_free: Vec<String> = Vec::new();

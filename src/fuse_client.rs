@@ -5883,7 +5883,7 @@ impl SqueezefsFilesystem {
             .max_capacity(attr_capacity)
             .time_to_live(daemon_cache_ttl)
             .build_with_hasher(ahash::RandomState::new());
-        Self {
+        let fs = Self {
             router,
             dlm,
             meta_backend: None,
@@ -5979,7 +5979,22 @@ impl SqueezefsFilesystem {
             job_wire_endpoint: std::sync::Arc::new(std::sync::OnceLock::new()),
             write_pipeline: crate::write_pipeline::WritePipeline::for_mount(),
             placed_assemblies: std::sync::Arc::new(crate::placed_sever::PlacedSeverRegistry::new()),
+        };
+        // The inode-reclaim latch probe (live-statfs ENOSPC-drift fix,
+        // 2026-08-05): the layout-save funnel refuses publishes for inos
+        // whose reclaim is in flight — see
+        // `DataRouter::save_metadata_to_backend_ext` and
+        // `reclaim_orphaned_batch`. The probe shares the SAME single-drive
+        // claim set the reclaim admission uses, so latch lifetime is
+        // exactly the delete_file → destroy(+teardown) window.
+        {
+            let latch = fs.reclaim_inflight.clone();
+            fs.router
+                .set_reclaim_probe(std::sync::Arc::new(move |ino: u64| {
+                    latch.contains_sync(&ino)
+                }));
         }
+        fs
     }
 
     pub fn max_background_uploads(&self) -> usize {
@@ -20277,9 +20292,14 @@ async fn upload_active_block_bytes(
         "staging-refusal durable escalation",
     )?;
     let offset = block_allocator.allocate_block().await?;
+    // RES-9 mint guard: this unit runs inside the fsync/dismount flush
+    // fan-outs whose first-error unwind drops siblings mid-await (the
+    // live-statfs drift class — see flush_one_active_block).
+    let mut minted = crate::assembly_tasks::MintedBlockGuard::new(block_allocator.clone(), offset);
     // PR VL6a: live-owner registration for the allocate→merge window.
     let _inflight = block_allocator.inflight_register(offset);
     if let Err(e) = nvme_writer.write_block(offset, processed_block).await {
+        minted.disarm();
         let _ = block_allocator.free_block(offset).await;
         return Err(e);
     }
@@ -20302,10 +20322,13 @@ async fn upload_active_block_bytes(
         Err(e) => {
             // The uploaded block never reached the map: free it before
             // propagating (same leak rule as flush_one_active_block).
+            minted.disarm();
             let _ = block_allocator.free_block(offset).await;
             return Err(e);
         }
     };
+    // Publish landed: the map owns the block.
+    minted.disarm();
     for bk in displaced {
         let _ = router.backend_router.free_block(&bk).await;
     }
@@ -20334,9 +20357,12 @@ async fn fold_upload_block(
         "fold block upload",
     )?;
     let offset = block_allocator.allocate_block().await?;
+    // RES-9 mint guard (see upload_active_block_bytes).
+    let mut minted = crate::assembly_tasks::MintedBlockGuard::new(block_allocator.clone(), offset);
     // PR VL6a: live-owner registration for the allocate→merge window.
     let _inflight = block_allocator.inflight_register(offset);
     if let Err(e) = nvme_writer.write_block(offset, processed_block).await {
+        minted.disarm();
         let _ = block_allocator.free_block(offset).await;
         return Err(e);
     }
@@ -20360,10 +20386,13 @@ async fn fold_upload_block(
     {
         Ok(d) => d,
         Err(e) => {
+            minted.disarm();
             let _ = block_allocator.free_block(offset).await;
             return Err(e);
         }
     };
+    // Publish landed: the map owns the block.
+    minted.disarm();
     for bk in displaced {
         let _ = router.backend_router.free_block(&bk).await;
     }
@@ -20494,6 +20523,18 @@ async fn flush_one_active_block(
 
         let (be_id, block_allocator, nvme_writer) = router.backend_router.get_active_backend()?;
         let offset = block_allocator.allocate_block().await?;
+        // RES-9 mint guard (the live-statfs ENOSPC-drift fix,
+        // tests/statfs_live_accounting_tests.rs): the fsync flush fan-out
+        // (`flush_due_active_blocks_for_inode`'s `buffer_unordered` +
+        // first-error unwind) DROPS sibling units at their awaits — a
+        // cancel landing anywhere in this claim→publish window leaked
+        // the freshly-claimed offset in the LIVE accounting forever
+        // (refcount 1, no owner; on-disk state was never touched, which
+        // is why a remount converged instantly). Disarmed at every
+        // explicit-free arm (they stay the deterministic path) and at
+        // publish success (the map owns the block from there).
+        let mut minted =
+            crate::assembly_tasks::MintedBlockGuard::new(block_allocator.clone(), offset);
         // PR VL6a: the flush unit is THE canonical in-flight owner (the
         // retry-forever FIND-M11-A adversary the fsck registry exists
         // for) — registered per attempt across its allocate→merge window.
@@ -20504,6 +20545,7 @@ async fn flush_one_active_block(
             None => {
                 // Purged between probe and capture (truncate/punch/newer
                 // write): nothing to flush.
+                minted.disarm();
                 let _ = block_allocator.free_block(offset).await;
                 return Ok(());
             }
@@ -20531,6 +20573,7 @@ async fn flush_one_active_block(
                 "flush_one_active_block: Failed to upload block {} of inode {} to NVMe: {:?}",
                 b, ino, e
             );
+            minted.disarm();
             let _ = block_allocator.free_block(offset).await;
             return Err(e);
         }
@@ -20573,6 +20616,7 @@ async fn flush_one_active_block(
                 // propagating, or every retry of a failing merge (e.g. a
                 // superseded fencing token between release and reopen)
                 // leaks one published block of device space.
+                minted.disarm();
                 let _ = block_allocator.free_block(offset).await;
                 // NotFound face of FIND-M11-A: the merge's layout save
                 // fails `Io(NotFound "Inode N not found")` when the ino
@@ -20609,9 +20653,14 @@ async fn flush_one_active_block(
         let Some(displaced) = displaced else {
             // A prune invalidated this capture (hazard 2): the uploaded
             // block is unreachable — free it and re-capture.
+            minted.disarm();
             let _ = block_allocator.free_block(offset).await;
             continue;
         };
+        // Publish landed: the map owns the block (a cancel from here
+        // must not free it — the displaced-key frees below remain the
+        // narrower cancel residual, noted in the fix commit).
+        minted.disarm();
 
         // Cache in RAM (bypass entirely if file is striped layout). Promotion
         // puts a detached copy — never the guard-backed staging bytes (§5.5).

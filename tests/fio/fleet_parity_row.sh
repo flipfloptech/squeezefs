@@ -87,7 +87,7 @@ row() { # $1=arm(kern|il) $2=rw(write|read) $3=tag
     "${env_prefix[@]}" fio --name=fp --directory="$dir" \
         --filename_format='fp.$jobnum' --rw="$rw" --bs=1M --size="$SIZE" \
         --numjobs="$NJOBS" --iodepth=1 --ioengine=psync $durable \
-        --create_on_open=1 --group_reporting --output-format=json \
+        --create_on_open=1 --output-format=json \
         --output="$OUT/$tag.fio.json" >/dev/null 2>&1
     snap "$OUT/$tag.after.json"
     python3 - "$OUT/$tag" "$arm" "$rw" <<'EOF'
@@ -99,11 +99,16 @@ key = "read" if rw == "read" else "write"
 r = [j[key] for j in fio["jobs"]]
 user = sum(x["io_bytes"] for x in r)
 # Durable law: fio bw_bytes excludes the end_fsync stall. The honest
-# durable rate is user bytes / WALL elapsed. NOT job_runtime: under
-# group_reporting fio SUMS job_runtime across all jobs (256x the wall,
-# the 0.12 GB/s fiction of run 9); "elapsed" is per-group wall seconds.
-wall_s = max(j.get("elapsed", 0) for j in fio["jobs"])
-bw = user / wall_s / 1e9 if wall_s else 0.0
+# durable rate is user bytes / wall time. Precision ladder (both bugs
+# were shipped once): group_reporting SUMS job_runtime (256x, run 9);
+# "elapsed" is INTEGER seconds (run 10's identical 22.91x3 rows = 3 s
+# quantization, ratio error bars 0.56-1.0). So write rows run WITHOUT
+# group_reporting and wall = max per-job job_runtime (ms).
+if len(fio["jobs"]) > 1:
+    wall_ms = max(j.get("job_runtime", 0) for j in fio["jobs"])
+else:  # grouped fallback (read rows keep group_reporting)
+    wall_ms = max(j.get("elapsed", 0) for j in fio["jobs"]) * 1000
+bw = user / (wall_ms / 1000) / 1e9 if wall_ms else 0.0
 def m(f):
     d = json.load(open(f)); return d.get("metrics", d)
 b, a = m(f"{p}.before.json"), m(f"{p}.after.json")

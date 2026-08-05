@@ -211,7 +211,7 @@ impl LaneSession {
     fn restore_steering(&self) {
         if let Ok(mut hold) = self.steering.lock() {
             if let Some(mut h) = hold.take() {
-                h.restore();
+                h.restore_now();
             }
         }
     }
@@ -382,19 +382,11 @@ impl ZcrxPlan {
     }
 }
 
-/// The armed NIC state a session must restore at disarm/unmount.
-struct SteeringHold {
-    nic: super::ethtool::EthtoolNic,
-    guard: super::steering::SteeringGuard,
-}
-
-impl SteeringHold {
-    fn restore(&mut self) {
-        if let Err(e) = self.guard.restore(&mut self.nic) {
-            log::error!("zcrx-lane: {e}");
-        }
-    }
-}
+/// The armed NIC state a session must restore at disarm/unmount —
+/// [`super::steering::ArmedSteering`] over the live NIC control: ONE
+/// owner from birth, Drop-converging (field finding B — the arm future
+/// is cancellable, so no path may strand the guard).
+type SteeringHold = super::steering::ArmedSteering<super::ethtool::EthtoolNic>;
 
 impl LaneSession {
     /// [`Self::connect`] with an explicit receive backend.
@@ -547,10 +539,9 @@ impl LaneSession {
             let ifname = plan.ifname.clone();
             let lane_queues = plan.rx_queues.clone();
             let hold = tokio::task::spawn_blocking(move || -> Result<SteeringHold> {
-                let mut nic = super::ethtool::EthtoolNic::open(&ifname).map_err(io_err)?;
-                let guard = super::steering::arm_rss_exclusion(&mut nic, &lane_queues)
-                    .map_err(|e| io_err(format!("zcrx steering arm (RSS exclusion): {e}")))?;
-                Ok(SteeringHold { nic, guard })
+                let nic = super::ethtool::EthtoolNic::open(&ifname).map_err(io_err)?;
+                super::steering::ArmedSteering::arm(nic, &lane_queues)
+                    .map_err(|e| io_err(format!("zcrx steering arm (RSS exclusion): {e}")))
             })
             .await
             .map_err(|e| io_err(format!("steering join: {e}")))??;
@@ -686,12 +677,9 @@ impl LaneSession {
                 // not drop the guard here (RSS has to stay excluded until
                 // the unwind below has torn the ifqs down).
                 let (hold_back, rules_res) = tokio::task::spawn_blocking(move || {
-                    let res = super::steering::arm_flow_rules(
-                        &mut hold.nic,
-                        &mut hold.guard,
-                        &flows_owned,
-                    )
-                    .map_err(|e| io_err(format!("zcrx steering arm (flow rules): {e}")));
+                    let res = hold
+                        .flow_rules(&flows_owned)
+                        .map_err(|e| io_err(format!("zcrx steering arm (flow rules): {e}")));
                     (hold, res)
                 })
                 .await
@@ -718,7 +706,7 @@ impl LaneSession {
                 }
             }
             if let Some(mut hold) = steering_hold.take() {
-                let _ = tokio::task::spawn_blocking(move || hold.restore()).await;
+                let _ = tokio::task::spawn_blocking(move || hold.restore_now()).await;
             }
             return Err(e);
         }

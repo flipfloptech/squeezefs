@@ -760,6 +760,25 @@ impl<N: NicControl> ArmedSteering<N> {
     }
 }
 
+impl<N: NicControl> Drop for ArmedSteering<N> {
+    fn drop(&mut self) {
+        // FINDING B (2026-08 field): the arm future is cancellable, and
+        // a dropped-unrestored hold left the live NIC at 75 % RSS width
+        // for a whole run — worse, the next arm recorded the crippled
+        // table as its pristine. The ORDERED paths (join the ifqs, THEN
+        // restore) call `restore_now` explicitly first, making this a
+        // no-op; any other drop path converges the NIC right here
+        // (idempotent; sync ioctls). The transient net_iov window this
+        // accepts on ABNORMAL paths is bounded by the dying ring's fd
+        // close — permanent RSS damage is the field-proven worse
+        // outcome. This is what makes the SteeringGuard drop tripwire
+        // structurally unreachable in product code: every product guard
+        // is born inside an ArmedSteering (`arm`), and the hold restores
+        // on every exit.
+        self.restore_now();
+    }
+}
+
 /// The ONE-SHOT arm: the composition of the split halves (phase A RSS
 /// exclusion + phase B flow rules) with TOTAL rollback on a phase-B
 /// refusal — the contract surface the steering suite pins the composed

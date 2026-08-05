@@ -83,6 +83,12 @@ pub(crate) struct AreaShared {
     /// and the queue is recovering — NEW reads bypass the lane (kernel
     /// path serves) until payload flows or the episode drains.
     pub starved: AtomicBool,
+    /// Round-8 no-harm escalation: the starvation proved STRUCTURAL
+    /// ([`super::uring_zcrx::REFILL_STRUCTURAL_FAILOVERS`] consecutive
+    /// failover windows) — the funnel tears the session down so the
+    /// RSS width restores (prolonged-degraded ≡ poisoned in lifecycle
+    /// terms).
+    pub starved_structural: AtomicBool,
 }
 
 impl AreaShared {
@@ -98,6 +104,7 @@ impl AreaShared {
             ))),
             poisoned: AtomicBool::new(false),
             starved: AtomicBool::new(false),
+            starved_structural: AtomicBool::new(false),
         })
     }
 

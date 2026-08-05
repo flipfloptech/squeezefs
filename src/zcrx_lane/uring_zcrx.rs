@@ -662,6 +662,9 @@ pub(crate) struct RecvGovernor {
     episode: Option<std::time::Instant>,
     /// The idle-drain probe gate fired for this episode (once).
     probe_unlatched: bool,
+    /// Consecutive failover windows without payload progress (finding
+    /// J: 2 ⇒ structural — see [`REFILL_STRUCTURAL_FAILOVERS`]).
+    failover_streak: u32,
 }
 
 impl RecvGovernor {
@@ -670,6 +673,7 @@ impl RecvGovernor {
             armed: true,
             episode: None,
             probe_unlatched: false,
+            failover_streak: 0,
         }
     }
 
@@ -691,6 +695,7 @@ impl RecvGovernor {
     /// episodes, so nothing on the retry path may reset this).
     pub(crate) fn on_progress(&mut self) -> bool {
         self.probe_unlatched = false;
+        self.failover_streak = 0;
         self.episode.take().is_some()
     }
 
@@ -740,8 +745,7 @@ impl RecvGovernor {
     /// caller escalates to full session teardown (RSS width restores;
     /// prolonged-degraded ≡ poisoned in lifecycle terms).
     pub(crate) fn structural(&self) -> bool {
-        // RED PHASE skeleton — no streak accounting existed.
-        false
+        self.failover_streak >= REFILL_STRUCTURAL_FAILOVERS
     }
 
     /// Has THIS failover window expired? `true` fires at most once per
@@ -755,6 +759,7 @@ impl RecvGovernor {
         match self.episode {
             Some(start) if now.duration_since(start) >= bound => {
                 self.episode = Some(now);
+                self.failover_streak += 1;
                 true
             }
             _ => false,
@@ -1049,6 +1054,25 @@ fn drive(
                     .zcrx_recv_failovers
                     .fetch_add(1, Ordering::Relaxed);
                 cfg.shared.starved.store(true, Ordering::SeqCst);
+                if gov.structural() && !cfg.shared.starved_structural.swap(true, Ordering::SeqCst) {
+                    // FINDING J (the no-harm law): the FIRST failover's
+                    // releases ARE the recovery mechanism; a second
+                    // consecutive window proves they cannot refill the
+                    // pool — structural. Holding this queue's RSS
+                    // exclusion for a lane that cannot serve taxes the
+                    // kernel path's full width (field: 0.08 % engagement
+                    // vs a 25 % width hole). The funnel escalates to
+                    // FULL teardown: RSS restores, kernel path serves
+                    // this device at full width for the rest of the
+                    // mount (the lane stays opt-in; lazy re-arm is a
+                    // filed follow-on).
+                    log::error!(
+                        "zcrx-lane: refill starvation is STRUCTURAL \
+                         ({REFILL_STRUCTURAL_FAILOVERS} consecutive failover windows \
+                         without payload) — releasing the NIC (RSS width restores); \
+                         kernel path serves this device"
+                    );
+                }
                 log::warn!(
                     "zcrx-lane: refill starvation exceeded {:?} — failing this                      queue's in-flight fills over to the kernel path (the queue                      keeps recovering in the background)",
                     park_fail_bound()

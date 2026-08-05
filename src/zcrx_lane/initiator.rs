@@ -879,6 +879,17 @@ impl LaneSession {
         })
     }
 
+    /// Round-8 no-harm escalation: any queue whose refill starvation
+    /// proved STRUCTURAL (two consecutive failover windows without
+    /// payload) — the funnel tears the whole session down so the RSS
+    /// width restores; kernel path serves at full width.
+    pub fn refill_structural(&self) -> bool {
+        self.queues.iter().any(|q| match q {
+            QueueHandle::Area(q) => q.shared.starved_structural.load(Ordering::SeqCst),
+            QueueHandle::Classic(_) => false,
+        })
+    }
+
     /// Whether this session's NIC/lease state has been released (the
     /// finding-F teardown latch).
     pub fn torn_down(&self) -> bool {

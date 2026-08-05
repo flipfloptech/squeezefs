@@ -109,7 +109,12 @@ never shred the window (per-segment admission let racing multi-segment
 reads each hold one segment while the sibling declined: the window
 admitted fewer whole reads than its arithmetic capacity, worst case
 zero); at any decline instant a full window's worth of whole reads is
-admitted and completing.
+admitted and completing. A starvation episode surviving 2 consecutive
+failover windows without payload is STRUCTURAL and the funnel tears
+the session down — the RSS width restores within ~2 × the failover
+bound and the kernel path serves at full width for the rest of the
+mount (worst-case lane-on ≈ lane-off; lazy re-arm is a filed
+follow-on).
 `zcrx_gather_bytes` closure note (round 7): gather ≡ fill holds
 UNCONDITIONALLY — gather is counted at the whole-read success boundary,
 so a torn multi-segment read (poison/op-error mid-read) contributes to

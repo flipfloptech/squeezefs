@@ -1242,11 +1242,15 @@ impl NvmeBlockDev {
             .get_or_init(|| crate::zcrx_lane::arm_for_device(&self.device_path))
             .await
             .as_ref()?;
-        if sess.poisoned() {
-            // FINDING F (2026-08 field): a poisoned session must release
-            // its ifqs/rules/RSS exclusion and arbiter lease PROMPTLY —
-            // not run the rest of the row at 75 % RSS width. Idempotent
-            // fire-and-forget; the kernel path serves this read.
+        if sess.poisoned() || sess.refill_structural() {
+            // FINDING F + round-8 FINDING J: a poisoned session — and a
+            // session whose refill starvation proved STRUCTURAL
+            // (prolonged-degraded ≡ poisoned in lifecycle terms) — must
+            // release its ifqs/rules/RSS exclusion and arbiter lease
+            // PROMPTLY: the no-harm law is worst-case lane-on ≈
+            // lane-off, and the field showed a 25 % RSS-width hole
+            // taxing the kernel path ~40 % at 0.08 % lane engagement.
+            // Idempotent fire-and-forget; the kernel path serves.
             sess.spawn_teardown();
             return None;
         }

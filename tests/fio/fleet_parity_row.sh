@@ -25,6 +25,15 @@ done
 [ -n "$MNT" ] || { echo "--mount required" >&2; exit 2; }
 mkdir -p "$OUT"
 
+require_mount() { # a row against a bare directory is not a slow row — it
+    # is NO row (the 2026-08-05 invalid-run lesson: fio happily "succeeds"
+    # against local scratch and every number is fiction). Checked at start
+    # and before EVERY row; failure is fatal, never a warning.
+    mountpoint -q "$MNT" || { echo "FATAL: $MNT is not a mountpoint — refusing to fabricate rows" >&2; exit 1; }
+    [ -e "$MNT/.stats" ] || { echo "FATAL: $MNT/.stats missing — not a squeezefs mount" >&2; exit 1; }
+}
+require_mount
+
 snap() {
     for _ in 1 2 3 4 5; do
         dd if="$MNT/.stats" of="$1" bs=1M status=none 2>/dev/null
@@ -102,7 +111,7 @@ echo "== fleet parity row: njobs=$NJOBS size=$SIZE (K-I, I-K, K-I pairs) =="
 for pair in "kern il" "il kern" "kern il"; do
     set -- $pair
     for arm in $1 $2; do
-        row "$arm" write "w.$arm.$(date +%s)"
+        require_mount; row "$arm" write "w.$arm.$(date +%s)"
         settle
     done
 done
@@ -147,7 +156,7 @@ EOF
 for pair in "kern il" "il kern" "kern il"; do
     set -- $pair
     for arm in $1 $2; do
-        read_row "$arm" "r.$arm.$(date +%s)"
+        require_mount; read_row "$arm" "r.$arm.$(date +%s)"
     done
 done
 rm -rf "$MNT/fleet_parity"

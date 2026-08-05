@@ -73,10 +73,17 @@ row() { # $1=arm(kern|il) $2=rw(write|read) $3=tag
     [ "$arm" = il ] && env_prefix=(env LD_PRELOAD="$SHIM")
     if [ "$rw" = write ]; then rm -rf "$dir"; fi
     mkdir -p "$dir"
+    # DURABLE=1 (default): write rows are fsync-inclusive — the RW6 law
+    # (AGENTS.md scoreboard: durable rows GOVERN write verdicts). Without
+    # it a 137 GB fleet vs 251 GB RAM measures page-cache/park absorption,
+    # not the write path — the 2026-08-05 attribution timeline proved the
+    # device plane sustains ~2.5 GB/s while relaxed rows print 17-26.
+    local durable=""
+    [ "${DURABLE:-1}" = 1 ] && [ "$rw" = write ] && durable="--end_fsync=1"
     snap "$OUT/$tag.before.json"
     "${env_prefix[@]}" fio --name=fp --directory="$dir" \
         --filename_format='fp.$jobnum' --rw="$rw" --bs=1M --size="$SIZE" \
-        --numjobs="$NJOBS" --iodepth=1 --ioengine=psync \
+        --numjobs="$NJOBS" --iodepth=1 --ioengine=psync $durable \
         --create_on_open=1 --group_reporting --output-format=json \
         --output="$OUT/$tag.fio.json" >/dev/null 2>&1
     snap "$OUT/$tag.after.json"

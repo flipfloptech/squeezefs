@@ -37,6 +37,12 @@ pub const STEERING_RESERVED_SLOTS: u32 = 64;
 /// assigned location back into `fs.location`.
 pub const RX_CLS_LOC_ANY: u32 = 0xffff_ffff;
 
+/// `RX_CLS_LOC_SPECIAL` (<linux/ethtool.h>): the flag bit a driver sets
+/// in `GRXCLSRLCNT.data` to advertise special-location support, and the
+/// bit that must be MASKED out of that word when reading it as a table
+/// size (ethtool rxclass.c parity).
+pub const RX_CLS_LOC_SPECIAL: u32 = 0x8000_0000;
+
 /// What the capacity gate learned about a NIC's flow-rule slots — the
 /// per-driver-class loc strategy (2026-08 field finding 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,8 +143,22 @@ pub trait NicControl {
     /// steer into (field row 3, 2026-08-04: the arm read a 0-slot table
     /// and refused per-session with no remedy named).
     fn ntuple_enabled(&mut self) -> Result<bool, String>;
-    /// ntuple rule table size (loc namespace bound).
+    /// ntuple rule table size (loc namespace bound) as advertised by
+    /// `ETHTOOL_GRXCLSRLCNT`'s data word (the `RX_CLS_LOC_SPECIAL` flag
+    /// bit masked out).
     fn ntuple_table_size(&mut self) -> Result<u32, String>;
+    /// Driver support for SPECIAL rule locations (`RX_CLS_LOC_ANY` …):
+    /// `ETHTOOL_GRXCLSRLCNT`'s data flag `RX_CLS_LOC_SPECIAL` — the
+    /// ethtool-parity probe (rxclass.c `rxclass_rule_ins`). mlx5 does
+    /// NOT set it and refuses `@ANY` inserts with ENOSPC (field
+    /// finding A).
+    fn special_loc_supported(&mut self) -> Result<bool, String>;
+    /// The rule-table size as reported by `ETHTOOL_GRXCLSRLALL`'s data
+    /// word — the ethtool-parity size source when `GRXCLSRLCNT`
+    /// advertises 0 (mlx5 reports MAX_NUM_OF_ETHTOOL_RULES = 1024 here;
+    /// ethtool's rxclass_find_empty_slot derives its top-down scan from
+    /// exactly this field).
+    fn ntuple_table_size_hint(&mut self) -> Result<u32, String>;
     /// Locations of ALL installed ntuple rules.
     fn ntuple_locs(&mut self) -> Result<Vec<u32>, String>;
     /// Install a TCP 4-tuple rule at `loc` — or at a DRIVER-assigned
@@ -607,6 +627,48 @@ impl Drop for SteeringGuard {
                  leaked (next arm reaps reserved-range rules; RSS needs operator \
                  attention or a re-arm)"
             );
+        }
+    }
+}
+
+/// NIC-sharing-aware per-session queue want (field finding C): the
+/// eligible pool is a shared resource across every fabric device whose
+/// target routes through this NIC, and cold sequential fills spread
+/// across ALL namespaces — breadth beats depth.
+pub fn fair_queue_want(eligible: u32, devices: usize, geometry_want: u16) -> u16 {
+    // RED PHASE skeleton: derivation pinned by tests/zcrx_lane_tests.rs.
+    let _ = (eligible, devices);
+    geometry_want
+}
+
+/// An armed NIC + its restore guard as ONE owner (field finding B): the
+/// arm future is CANCELLABLE (the OnceCell init runs inside a read op's
+/// task and dies with it), so the hold must converge the NIC by itself
+/// on ANY drop path. Normal paths call [`Self::restore_now`] explicitly
+/// AFTER the ifq teardown (the finding-3 ordering law); Drop is the
+/// last-resort convergence.
+pub struct ArmedSteering<N: NicControl> {
+    nic: N,
+    guard: SteeringGuard,
+}
+
+impl<N: NicControl> ArmedSteering<N> {
+    /// Phase A under single ownership: the guard is born INSIDE the
+    /// hold — no drop window in which a bare guard can leak.
+    pub fn arm(mut nic: N, lane_queues: &[u32]) -> Result<Self, String> {
+        let guard = arm_rss_exclusion(&mut nic, lane_queues)?;
+        Ok(ArmedSteering { nic, guard })
+    }
+
+    /// Phase B against the held NIC (see [`arm_flow_rules`]).
+    pub fn flow_rules(&mut self, flows: &[FlowRule]) -> Result<(), String> {
+        arm_flow_rules(&mut self.nic, &mut self.guard, flows)
+    }
+
+    /// Explicit ordered restore (idempotent; errors logged loud).
+    pub fn restore_now(&mut self) {
+        if let Err(e) = self.guard.restore(&mut self.nic) {
+            log::error!("zcrx-lane: {e}");
         }
     }
 }

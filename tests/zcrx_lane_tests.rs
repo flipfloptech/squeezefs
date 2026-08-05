@@ -2006,6 +2006,12 @@ impl NicControl for CapMock {
     fn ntuple_table_size(&mut self) -> Result<u32, String> {
         Ok(self.table)
     }
+    fn special_loc_supported(&mut self) -> Result<bool, String> {
+        Ok(false)
+    }
+    fn ntuple_table_size_hint(&mut self) -> Result<u32, String> {
+        Ok(self.table)
+    }
     fn ntuple_locs(&mut self) -> Result<Vec<u32>, String> {
         Ok(Vec::new())
     }
@@ -2134,4 +2140,72 @@ fn test_registration_rxqs_come_from_the_arbiter_grant_disjoint_across_sessions()
         }
     }
     assert_eq!(pa.rxq_for_qid(3), None, "beyond the grant maps to None");
+}
+
+// ------------------------------------------- round-3: fair grant spread (C)
+
+#[test]
+fn test_fair_queue_want_derives_from_nic_sharing() {
+    // FINDING C: two want-4 sessions consumed all 8 eligible queues and
+    // 8 of 10 devices got nothing — for the cold seq shape fills spread
+    // across ALL namespaces, so breadth beats depth. The per-session
+    // want derives: clamp(eligible / devices_via_nic, 1, geometry want).
+    use squeezefs::zcrx_lane::steering::fair_queue_want;
+    assert_eq!(
+        fair_queue_want(8, 10, 4),
+        1,
+        "the field shape: 8 eligible / 10 devices → every device gets breadth"
+    );
+    assert_eq!(fair_queue_want(8, 2, 4), 4, "2 devices: full derived want");
+    assert_eq!(fair_queue_want(8, 4, 4), 2);
+    assert_eq!(fair_queue_want(8, 3, 4), 2, "integer share rounds down");
+    assert_eq!(fair_queue_want(8, 1, 4), 4, "sole device keeps its want");
+    assert_eq!(fair_queue_want(2, 100, 4), 1, "floor 1 = physical minimum");
+    assert_eq!(fair_queue_want(64, 2, 8), 8, "geometry want stays the cap");
+}
+
+#[test]
+fn test_tcp_devices_via_nic_counts_namespaces_behind_the_route() {
+    // FINDING C's input: devices-behind-this-NIC comes from the mount's
+    // OWN sysfs + route probe — never a constant. Fixture: two tcp
+    // controllers route via ens1 (3 namespaces total), one via ens2,
+    // one fc controller (ignored).
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mk = |ctrl: &str, transport: &str, addr: &str, namespaces: &[&str]| {
+        let c = root.join("class/nvme").join(ctrl);
+        std::fs::create_dir_all(&c).unwrap();
+        std::fs::write(c.join("transport"), format!("{transport}\n")).unwrap();
+        std::fs::write(c.join("address"), format!("{addr}\n")).unwrap();
+        for ns in namespaces {
+            std::fs::create_dir_all(c.join(ns)).unwrap();
+        }
+    };
+    mk(
+        "nvme0",
+        "tcp",
+        "traddr=10.0.0.1,trsvcid=4420",
+        &["nvme0n1", "nvme0n2"],
+    );
+    mk("nvme1", "tcp", "traddr=10.0.0.2,trsvcid=4420", &["nvme1n1"]);
+    mk("nvme2", "tcp", "traddr=10.0.1.1,trsvcid=4420", &["nvme2n1"]);
+    mk("nvme3", "fc", "traddr=nn-0x10,trsvcid=none", &["nvme3n1"]);
+    let resolve = |ip: &std::net::IpAddr| -> Option<String> {
+        match ip.to_string().as_str() {
+            "10.0.0.1" | "10.0.0.2" => Some("ens1".into()),
+            "10.0.1.1" => Some("ens2".into()),
+            _ => None,
+        }
+    };
+    assert_eq!(
+        probe::tcp_devices_via_nic_with(root, "ens1", &resolve),
+        3,
+        "namespaces behind ens1"
+    );
+    assert_eq!(probe::tcp_devices_via_nic_with(root, "ens2", &resolve), 1);
+    assert_eq!(
+        probe::tcp_devices_via_nic_with(root, "ens9", &resolve),
+        0,
+        "a NIC no target routes through"
+    );
 }

@@ -12,7 +12,7 @@
 //! (sizes/offsets in the layout assertions at the bottom — a drifted
 //! mirror fails `cargo test` before it can ever hit an ioctl).
 
-use super::steering::{FlowRule, NicControl};
+use super::steering::{FlowRule, NicControl, RX_CLS_LOC_SPECIAL};
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{AsRawFd, OwnedFd};
 
@@ -282,8 +282,49 @@ impl NicControl for EthtoolNic {
         };
         self.ethtool_ioctl(&mut nfc as *mut _ as *mut libc::c_void)
             .map_err(|e| format!("GRXCLSRLCNT: {e}"))?;
-        // `data` carries the table size (rule_cnt the installed count).
-        Ok(nfc.data as u32)
+        // `data` carries the table size (rule_cnt the installed count)
+        // — with the RX_CLS_LOC_SPECIAL support FLAG bit masked out
+        // (ethtool rxclass.c parity: the word is size + flag).
+        Ok(nfc.data as u32 & !RX_CLS_LOC_SPECIAL)
+    }
+
+    fn special_loc_supported(&mut self) -> Result<bool, String> {
+        let mut nfc = EthtoolRxnfc {
+            cmd: ETHTOOL_GRXCLSRLCNT,
+            ..Default::default()
+        };
+        self.ethtool_ioctl(&mut nfc as *mut _ as *mut libc::c_void)
+            .map_err(|e| format!("GRXCLSRLCNT: {e}"))?;
+        Ok(nfc.data as u32 & RX_CLS_LOC_SPECIAL != 0)
+    }
+
+    fn ntuple_table_size_hint(&mut self) -> Result<u32, String> {
+        // ETHTOOL_GRXCLSRLALL writes the table size into `data` even
+        // when GRXCLSRLCNT advertises 0 (mlx5e_ethtool_get_rxnfc sets
+        // `info->data = MAX_NUM_OF_ETHTOOL_RULES` = 1024) — the size
+        // source ethtool's rxclass_find_empty_slot scans from.
+        let mut cnt = EthtoolRxnfc {
+            cmd: ETHTOOL_GRXCLSRLCNT,
+            ..Default::default()
+        };
+        self.ethtool_ioctl(&mut cnt as *mut _ as *mut libc::c_void)
+            .map_err(|e| format!("GRXCLSRLCNT: {e}"))?;
+        let n = cnt.rule_cnt as usize;
+        let head = std::mem::size_of::<EthtoolRxnfc>() - 4;
+        let mut raw = vec![0u8; head + n * 4 + 4];
+        {
+            let nfc = raw.as_mut_ptr() as *mut EthtoolRxnfc;
+            // SAFETY: raw is sized ≥ the struct + tail; POD writes.
+            unsafe {
+                (*nfc).cmd = ETHTOOL_GRXCLSRLALL;
+                (*nfc).rule_cnt = n as u32;
+            }
+        }
+        self.ethtool_ioctl(raw.as_mut_ptr() as *mut libc::c_void)
+            .map_err(|e| format!("GRXCLSRLALL: {e}"))?;
+        // SAFETY: kernel wrote the size into the struct's data word.
+        let data = unsafe { (*(raw.as_ptr() as *const EthtoolRxnfc)).data };
+        Ok(data as u32 & !RX_CLS_LOC_SPECIAL)
     }
 
     fn ntuple_locs(&mut self) -> Result<Vec<u32>, String> {

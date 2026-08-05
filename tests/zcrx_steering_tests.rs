@@ -25,7 +25,7 @@
 
 use squeezefs::zcrx_lane::steering::{
     arm_flow_rules, arm_rss_exclusion, arm_steering, lane_queue_picks, reserved_loc_range,
-    restricted_rss, FlowRule, NicControl, RX_CLS_LOC_ANY, STEERING_RESERVED_SLOTS,
+    restricted_rss, ArmedSteering, FlowRule, NicControl, RX_CLS_LOC_ANY, STEERING_RESERVED_SLOTS,
 };
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -59,6 +59,13 @@ struct MockNic {
     /// driver-assigned ids from the top of a hidden table.
     advertise_zero_table: bool,
     hidden_next_loc: u32,
+    /// GRXCLSRLCNT's RX_CLS_LOC_SPECIAL flag (round-3 finding A):
+    /// drivers that DON'T set it refuse `@ANY` at the ioctl (mlx5).
+    special_loc: bool,
+    /// Refuse RX_CLS_LOC_ANY inserts with the mlx5-class ENOSPC.
+    refuse_any_insert: bool,
+    /// Refuse EVERY insert (the both-sessions-die-at-ENOSPC venue).
+    refuse_inserts: bool,
     rss: Vec<u32>,
     table_size: u32,
     rules: BTreeMap<u32, FlowRule>,
@@ -77,6 +84,9 @@ impl MockNic {
             ntuple_on: true,
             advertise_zero_table: false,
             hidden_next_loc: 1023, // the field's observed auto-loc face
+            special_loc: true,
+            refuse_any_insert: false,
+            refuse_inserts: false,
             rss,
             table_size: 1024,
             rules: BTreeMap::new(),
@@ -142,6 +152,16 @@ impl NicControl for MockNic {
         }
         Ok(self.table_size)
     }
+    fn special_loc_supported(&mut self) -> Result<bool, String> {
+        self.ops.push("special_loc".into());
+        Ok(self.special_loc)
+    }
+    fn ntuple_table_size_hint(&mut self) -> Result<u32, String> {
+        self.ops.push("table_size_hint".into());
+        // The GRXCLSRLALL data word: mlx5 reports the REAL size here
+        // even while GRXCLSRLCNT advertises 0.
+        Ok(1024)
+    }
     fn ntuple_locs(&mut self) -> Result<Vec<u32>, String> {
         self.ops.push("locs".into());
         if self.fail_at == FailAt::Locs {
@@ -159,6 +179,17 @@ impl NicControl for MockNic {
         self.inserts_seen += 1;
         if self.fail_at == FailAt::Insert(n) {
             return Err(format!("mock: insert {n} refused"));
+        }
+        if self.refuse_inserts {
+            return Err("mock: no space left on device (ENOSPC)".into());
+        }
+        if loc == RX_CLS_LOC_ANY && self.refuse_any_insert {
+            // mlx5e_ethtool_flow_replace bounds-checks location <
+            // MAX_NUM_OF_ETHTOOL_RULES — special locs bounce as ENOSPC.
+            return Err("mock: no space left on device (ENOSPC)".into());
+        }
+        if loc != RX_CLS_LOC_ANY && loc >= 1024 {
+            return Err("mock: rule location out of range (EINVAL)".into());
         }
         let effective = if loc == RX_CLS_LOC_ANY {
             let l = self.hidden_next_loc;
@@ -548,4 +579,235 @@ fn test_split_arm_phase_b_failure_keeps_rss_excluded_until_restore() {
     );
     guard.restore(&mut nic).expect("restore after ifq teardown");
     assert_eq!(nic.snapshot(), pristine, "byte-identical after full unwind");
+}
+
+// ---------------------------------------- round-3 field findings (red-first)
+
+/// A shared-handle mock: [`ArmedSteering`] OWNS its NIC, so the drop-
+/// convergence laws need a handle whose state outlives the hold.
+#[derive(Clone)]
+struct SharedNic {
+    name: String,
+    inner: std::sync::Arc<std::sync::Mutex<MockNic>>,
+}
+
+impl SharedNic {
+    fn new(name: &str, channels: u32, rss_len: usize) -> SharedNic {
+        SharedNic {
+            name: name.to_string(),
+            inner: std::sync::Arc::new(std::sync::Mutex::new(MockNic::new(
+                name, channels, rss_len,
+            ))),
+        }
+    }
+    fn lock(&self) -> std::sync::MutexGuard<'_, MockNic> {
+        self.inner.lock().unwrap()
+    }
+    fn snapshot(&self) -> (Vec<u32>, BTreeMap<u32, FlowRule>) {
+        self.lock().snapshot()
+    }
+    fn rss_excludes(&self, queues: &[u32]) -> bool {
+        self.lock().rss.iter().all(|v| !queues.contains(v))
+    }
+    fn set_refuse_inserts(&self, refuse: bool) {
+        self.lock().refuse_inserts = refuse;
+    }
+    fn rule_count(&self) -> usize {
+        self.lock().rules.len()
+    }
+}
+
+impl NicControl for SharedNic {
+    fn ifname(&self) -> &str {
+        &self.name
+    }
+    fn combined_channels(&mut self) -> Result<u32, String> {
+        self.lock().combined_channels()
+    }
+    fn tcp_data_split_on(&mut self) -> Result<bool, String> {
+        self.lock().tcp_data_split_on()
+    }
+    fn ntuple_enabled(&mut self) -> Result<bool, String> {
+        self.lock().ntuple_enabled()
+    }
+    fn rxfh_indir(&mut self) -> Result<Vec<u32>, String> {
+        self.lock().rxfh_indir()
+    }
+    fn set_rxfh_indir(&mut self, indir: &[u32]) -> Result<(), String> {
+        self.lock().set_rxfh_indir(indir)
+    }
+    fn ntuple_table_size(&mut self) -> Result<u32, String> {
+        self.lock().ntuple_table_size()
+    }
+    fn special_loc_supported(&mut self) -> Result<bool, String> {
+        self.lock().special_loc_supported()
+    }
+    fn ntuple_table_size_hint(&mut self) -> Result<u32, String> {
+        self.lock().ntuple_table_size_hint()
+    }
+    fn ntuple_locs(&mut self) -> Result<Vec<u32>, String> {
+        self.lock().ntuple_locs()
+    }
+    fn insert_ntuple(&mut self, loc: u32, rule: &FlowRule) -> Result<u32, String> {
+        self.lock().insert_ntuple(loc, rule)
+    }
+    fn delete_ntuple(&mut self, loc: u32) -> Result<(), String> {
+        self.lock().delete_ntuple(loc)
+    }
+}
+
+#[test]
+fn test_mlx5_triple_falls_back_to_explicit_top_down_locs() {
+    // FINDING A: mlx5 refuses RX_CLS_LOC_ANY at the ioctl (ENOSPC —
+    // mlx5e_ethtool_flow_replace bounds-checks location <
+    // MAX_NUM_OF_ETHTOOL_RULES = 1024, special values bounce), while the
+    // ethtool BINARY works: rxclass.c `rxclass_rule_ins` probes the
+    // RX_CLS_LOC_SPECIAL flag in GRXCLSRLCNT.data and, unsupported,
+    // self-selects the highest free EXPLICIT loc from the
+    // GRXCLSRLALL-reported size (→ "Added rule with ID 1023"). The lane
+    // must mirror that ladder. Behavior triple pinned: size-0
+    // advertisement + @ANY→ENOSPC + explicit loc ≤ 1023 accepted.
+    let mut nic = MockNic::new("sm-mlx5-a", 32, 128);
+    nic.advertise_zero_table = true;
+    nic.special_loc = false;
+    nic.refuse_any_insert = true;
+    nic.rules.insert(1023, flow(40001, 2)); // top slot occupied (foreign)
+    let pristine = nic.snapshot();
+    let flows = vec![flow(50001, 31), flow(50002, 30)];
+    let mut guard =
+        arm_steering(&mut nic, &flows).expect("the mlx5 triple must arm via the explicit ladder");
+    assert!(
+        !nic.ops.iter().any(|o| o == "insert@any"),
+        "special-loc unsupported ⇒ @ANY is never attempted: {:?}",
+        nic.ops
+    );
+    assert!(
+        nic.rules.contains_key(&1022) && nic.rules.contains_key(&1021),
+        "top-down explicit picks skip the occupied top slot: {:?}",
+        nic.rules.keys().collect::<Vec<_>>()
+    );
+    guard.restore(&mut nic).expect("restore");
+    assert_eq!(
+        nic.snapshot(),
+        pristine,
+        "teardown by the self-selected ids restores byte-identically"
+    );
+}
+
+#[test]
+fn test_any_refusal_despite_the_flag_falls_back_to_explicit() {
+    // Belt for drivers that ADVERTISE special-loc support yet refuse the
+    // insert anyway: the mlx5-class refusal triggers the same ladder.
+    let mut nic = MockNic::new("sm-mlx5-b", 32, 128);
+    nic.advertise_zero_table = true;
+    nic.special_loc = true; // advertised…
+    nic.refuse_any_insert = true; // …refused at the ioctl
+    let mut guard = arm_steering(&mut nic, &[flow(50001, 31)])
+        .expect("an @ANY refusal must fall back to explicit self-selection");
+    assert!(
+        nic.rules.contains_key(&1023),
+        "explicit fallback landed at the ethtool-parity slot: {:?}",
+        nic.rules.keys().collect::<Vec<_>>()
+    );
+    guard.restore(&mut nic).expect("restore");
+}
+
+#[test]
+fn test_hold_drop_converges_the_nic_without_explicit_restore() {
+    // FINDING B: the arm future is CANCELLABLE (it runs inside a read
+    // op's task via the per-device OnceCell) — the field run dropped the
+    // hold mid-arm and the RSS exclusion survived the whole run at 75 %
+    // NIC width. A dropped hold must converge the NIC by itself; the
+    // "guard dropped without restore" tripwire becomes structurally
+    // unreachable outside process-abort.
+    let shared = SharedNic::new("sm-conv-a", 32, 128);
+    let pristine = shared.snapshot();
+    let hold = ArmedSteering::arm(shared.clone(), &[30, 31]).expect("phase A");
+    assert!(
+        shared.rss_excludes(&[30, 31]),
+        "phase A excluded the queues"
+    );
+    drop(hold); // the cancellation face: NO explicit restore ran
+    assert_eq!(
+        shared.snapshot(),
+        pristine,
+        "a dropped hold must converge the NIC to pristine"
+    );
+}
+
+#[test]
+fn test_dropped_hold_cannot_poison_the_next_arms_pristine() {
+    // FINDING B's second-order damage: a leaked exclusion makes the NEXT
+    // arm record the crippled table as its pristine — after which even
+    // perfect restores converge to the crippled state (the field's end
+    // state: queues 24–31 missing after everything closed).
+    let shared = SharedNic::new("sm-conv-b", 32, 128);
+    let pristine = shared.snapshot();
+    let h1 = ArmedSteering::arm(shared.clone(), &[31]).expect("S1 phase A");
+    drop(h1); // leaked-by-cancellation face
+    let mut h2 = ArmedSteering::arm(shared.clone(), &[30, 31]).expect("S2 phase A");
+    h2.flow_rules(&[flow(50001, 31), flow(50002, 30)])
+        .expect("S2 phase B");
+    h2.restore_now();
+    assert_eq!(
+        shared.snapshot(),
+        pristine,
+        "once every session is gone the NIC is PRISTINE — a leaked \
+         predecessor must not poison the recorded pristine"
+    );
+}
+
+#[test]
+fn test_two_sessions_both_phase_b_enospc_converge_in_either_order() {
+    // FINDING B, the field shape exactly: two sessions share one NIC's
+    // exclusion state, BOTH die at phase-B ENOSPC — teardown in EACH
+    // order must end pristine.
+    for swapped in [false, true] {
+        let name = if swapped { "sm-conv-c1" } else { "sm-conv-c0" };
+        let shared = SharedNic::new(name, 32, 128);
+        let pristine = shared.snapshot();
+        let mut s1 = ArmedSteering::arm(shared.clone(), &[28, 29, 30, 31]).expect("S1 phase A");
+        let mut s2 = ArmedSteering::arm(shared.clone(), &[24, 25, 26, 27]).expect("S2 phase A");
+        shared.set_refuse_inserts(true); // the mlx5 ENOSPC face
+        s1.flow_rules(&[flow(50001, 31)]).expect_err("S1 ENOSPC");
+        s2.flow_rules(&[flow(50002, 24)]).expect_err("S2 ENOSPC");
+        let (mut first, mut second) = if swapped { (s2, s1) } else { (s1, s2) };
+        first.restore_now();
+        drop(first);
+        second.restore_now();
+        drop(second);
+        assert_eq!(
+            shared.snapshot(),
+            pristine,
+            "both-fail teardown (swapped={swapped}) must end pristine"
+        );
+    }
+}
+
+#[test]
+fn test_phase_b_failure_beside_a_live_armed_session_keeps_it_steered() {
+    // FINDING B: one session fails phase B while the other stays armed —
+    // the armed one's queues stay excluded and its rules stay installed;
+    // when it later closes, the NIC is pristine.
+    let shared = SharedNic::new("sm-conv-d", 32, 128);
+    let pristine = shared.snapshot();
+    let mut s1 = ArmedSteering::arm(shared.clone(), &[31]).expect("S1 phase A");
+    s1.flow_rules(&[flow(50001, 31)]).expect("S1 fully armed");
+    let mut s2 = ArmedSteering::arm(shared.clone(), &[30]).expect("S2 phase A");
+    shared.set_refuse_inserts(true);
+    s2.flow_rules(&[flow(50002, 30)]).expect_err("S2 ENOSPC");
+    shared.set_refuse_inserts(false);
+    drop(s2); // S2's unwind (post-ifq-teardown drop)
+    assert!(
+        shared.rss_excludes(&[31]),
+        "the LIVE session's queue stays excluded after a peer's failed arm"
+    );
+    assert!(
+        !shared.rss_excludes(&[30]),
+        "the FAILED session's queue returns to RSS once its hold is gone"
+    );
+    assert_eq!(shared.rule_count(), 1, "the live session's rule survives");
+    s1.restore_now();
+    drop(s1);
+    assert_eq!(shared.snapshot(), pristine, "last session out ⇒ pristine");
 }

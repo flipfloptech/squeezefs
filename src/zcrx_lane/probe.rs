@@ -162,6 +162,21 @@ pub fn lane_geometry(cpus: usize) -> (u16, u16) {
 pub const LANE_MAX_XFER_CAP_BYTES: u32 =
     fuse3::raw::connection::fuse_over_uring::PAYLOAD_BASE as u32;
 
+/// Field finding C: count the nvme-tcp NAMESPACES whose controller's
+/// `traddr` routes through `ifname` — the devices-behind-this-NIC input
+/// to the fair queue-want derivation. Sysfs-root + route-resolver
+/// injectable (the contract venue); the product wrapper rides the real
+/// `/sys` + UDP-connect route probe.
+pub fn tcp_devices_via_nic_with(
+    sysfs_root: &Path,
+    ifname: &str,
+    resolve: &dyn Fn(&std::net::IpAddr) -> Option<String>,
+) -> usize {
+    // RED PHASE skeleton: contract pinned by tests/zcrx_lane_tests.rs.
+    let _ = (sysfs_root, ifname, resolve);
+    1
+}
+
 /// Host identity (design §4.1): field parity with the kernel initiator when
 /// `/etc/nvme/{hostnqn,hostid}` exist, else a stable per-process identity.
 pub fn host_identity() -> (String, [u8; 16]) {

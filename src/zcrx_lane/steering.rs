@@ -722,10 +722,17 @@ impl Drop for SteeringGuard {
 /// eligible pool is a shared resource across every fabric device whose
 /// target routes through this NIC, and cold sequential fills spread
 /// across ALL namespaces — breadth beats depth.
+/// `clamp(eligible / devices, 1, geometry_want)` — the §8-eligible pool
+/// divided across the fabric devices routing through the NIC (field
+/// shape: `clamp(8/10, 1, 4) = 1` → 8 of 10 devices get a lane instead
+/// of 2×4). Floor 1 is the physical minimum (a lane with zero queues
+/// cannot exist — the ARBITER, not this derivation, refuses when the
+/// pool is truly exhausted); the ceiling is the derived geometry want
+/// (never grant more than the session would drive).
 pub fn fair_queue_want(eligible: u32, devices: usize, geometry_want: u16) -> u16 {
-    // RED PHASE skeleton: derivation pinned by tests/zcrx_lane_tests.rs.
-    let _ = (eligible, devices);
-    geometry_want
+    let devices = devices.max(1) as u32;
+    let share = (eligible / devices).max(1);
+    share.min(u32::from(geometry_want.max(1))) as u16
 }
 
 /// An armed NIC + its restore guard as ONE owner (field finding B): the

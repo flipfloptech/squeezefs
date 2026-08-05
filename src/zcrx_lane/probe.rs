@@ -172,9 +172,62 @@ pub fn tcp_devices_via_nic_with(
     ifname: &str,
     resolve: &dyn Fn(&std::net::IpAddr) -> Option<String>,
 ) -> usize {
-    // RED PHASE skeleton: contract pinned by tests/zcrx_lane_tests.rs.
-    let _ = (sysfs_root, ifname, resolve);
-    1
+    let Ok(ctrls) = std::fs::read_dir(sysfs_root.join("class/nvme")) else {
+        return 0;
+    };
+    let mut count = 0usize;
+    for ent in ctrls.flatten() {
+        let dir = ent.path();
+        let read = |name: &str| {
+            std::fs::read_to_string(dir.join(name))
+                .ok()
+                .map(|s| s.trim().to_string())
+        };
+        if read("transport").as_deref() != Some("tcp") {
+            continue;
+        }
+        let Some(address) = read("address") else {
+            continue;
+        };
+        let Some(traddr) = address
+            .split(',')
+            .find_map(|p| p.trim().strip_prefix("traddr=").map(str::to_string))
+        else {
+            continue;
+        };
+        let Ok(ip) = traddr.parse::<std::net::IpAddr>() else {
+            continue;
+        };
+        if resolve(&ip).as_deref() != Some(ifname) {
+            continue;
+        }
+        // Count the controller's NAMESPACES (`nvme<C>n<N>` children) —
+        // `arm_for_device` runs once per block device, so namespaces
+        // are the sharing unit. (Approximation by design: ineligible
+        // shapes still count — over-counting only widens the spread.)
+        let ctrl_name = ent.file_name().to_string_lossy().to_string();
+        if let Ok(children) = std::fs::read_dir(&dir) {
+            count += children
+                .flatten()
+                .filter(|c| is_namespace_of(&ctrl_name, &c.file_name().to_string_lossy()))
+                .count();
+        }
+    }
+    count
+}
+
+fn is_namespace_of(ctrl: &str, name: &str) -> bool {
+    name.strip_prefix(ctrl)
+        .and_then(|rest| rest.strip_prefix('n'))
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The product form of the census: real `/sys` + the UDP-connect route
+/// probe (`ethtool::route_ifname_for` — no packet sent, no NIC state).
+pub fn tcp_devices_via_nic(ifname: &str) -> usize {
+    tcp_devices_via_nic_with(Path::new("/sys"), ifname, &|ip| {
+        super::ethtool::route_ifname_for(ip)
+    })
 }
 
 /// Host identity (design §4.1): field parity with the kernel initiator when

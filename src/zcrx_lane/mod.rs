@@ -248,6 +248,19 @@ pub async fn arm_for_device(device_path: &str) -> Option<Arc<LaneSession>> {
     // tables that accept inserts) has NO static bound — the kernel's
     // insert verdict rules at steering, so the clamp never zeroes the
     // want there.
+    // FINDING C (round 3): NIC-sharing-aware queue want — the §8
+    // eligible pool is shared by every fabric device routing through
+    // this NIC, and cold sequential fills spread across ALL namespaces
+    // (breadth beats depth): want = clamp(eligible / devices_via_nic,
+    // 1, derived geometry want). The device count comes from the
+    // mount's OWN sysfs + route probe (never a constant); an empty or
+    // failed enumeration degrades to 1 — the sole-device posture.
+    let eligible = {
+        let pool = steering::lane_eligible_queues(channels);
+        pool.end.saturating_sub(pool.start)
+    };
+    let devices = probe::tcp_devices_via_nic(&ifname).max(1);
+    let fair_want = steering::fair_queue_want(eligible, devices, target.io_queues);
     let slot_want = match steering::free_reserved_slots(&ifname, &reserved) {
         Some(0) => {
             log::warn!(
@@ -257,8 +270,8 @@ pub async fn arm_for_device(device_path: &str) -> Option<Arc<LaneSession>> {
             );
             return None;
         }
-        Some(free) => target.io_queues.min(free.min(u32::from(u16::MAX)) as u16),
-        None => target.io_queues,
+        Some(free) => fair_want.min(free.min(u32::from(u16::MAX)) as u16),
+        None => fair_want,
     };
     // DISTINCT per-session RX queues from the NIC-derived pool — the
     // REGISTER_ZCRX_IFQ EEXIST fix (field row 3): the arbiter grants

@@ -109,8 +109,8 @@ impl AreaShared {
     /// drain discipline mirrored from the classic lane.
     pub(crate) fn poison(&self, why: &str, session_poison: &AtomicBool, drain: bool) {
         if !self.poisoned.swap(true, Ordering::SeqCst) {
-            log::error!("zcrx-lane: IO queue poisoned: {why} — lane disarms, kernel path serves");
-            mark_session_poisoned(session_poison);
+            log::error!("zcrx-lane: IO queue poisoned: {why}");
+            mark_session_poisoned(session_poison, why);
         }
         if drain {
             self.table.fail_all(&format!("lane queue poisoned: {why}"));

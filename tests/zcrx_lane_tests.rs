@@ -2528,9 +2528,10 @@ fn test_poison_gauge_and_log_are_structurally_tied() {
         sig.contains("log::error!"),
         "the poison funnel must LOG the reason on the winning transition"
     );
-    // The gauge moves only inside the funnel.
+    // The gauge moves only inside the funnel (count the CODE shape —
+    // the field-access increment — so doc prose cannot false-positive).
     assert_eq!(
-        initiator.matches("zcrx_lane_poisoned").count(),
+        initiator.matches("zcrx_lane_poisoned.fetch_add").count(),
         1,
         "zcrx_lane_poisoned increments at exactly ONE site (the funnel)"
     );

@@ -51,8 +51,13 @@ fn io_err(msg: String) -> SqueezefsError {
 /// idempotent; the winning transition counts the `zcrx_lane_poisoned`
 /// tripwire and drops the `zcrx_lane_armed` gauge — the funnel routes
 /// every subsequent op to the kernel path for the mount lifetime.
-pub(crate) fn mark_session_poisoned(flag: &AtomicBool) {
+pub(crate) fn mark_session_poisoned(flag: &AtomicBool, why: &str) {
     if !flag.swap(true, Ordering::SeqCst) {
+        // The gauge/log structural tie (round 8, the third silent-poison
+        // burn): the gauge moves ONLY here, and here ALWAYS logs the
+        // canonical line — a poisoned increment without a greppable
+        // reason is unrepresentable.
+        log::error!("zcrx-lane: session poisoned: {why} — lane disarms, kernel path serves");
         let m = &crate::fuse_client::METRICS;
         m.zcrx_lane_poisoned.fetch_add(1, Ordering::Relaxed);
         m.zcrx_lane_armed.store(0, Ordering::Relaxed);
@@ -161,8 +166,8 @@ impl QueueShared {
     /// 30 s timeouts instead (bounded, loud, never a recycled write).
     fn poison(&self, why: &str, session_poison: &AtomicBool, drain_pending: bool) {
         if !self.poisoned.swap(true, Ordering::SeqCst) {
-            log::error!("zcrx-lane: IO queue poisoned: {why} — lane disarms, kernel path serves");
-            mark_session_poisoned(session_poison);
+            log::error!("zcrx-lane: IO queue poisoned: {why}");
+            mark_session_poisoned(session_poison, why);
         }
         if !drain_pending {
             return;
@@ -784,23 +789,19 @@ impl LaneSession {
             if admin_latch.load(Ordering::SeqCst) {
                 return; // orderly teardown — not an association event
             }
-            match &event {
-                Ok(0) => log::error!(
-                    "zcrx-lane: admin connection closed by target — session poisoned \
-                     (kernel path serves; remount re-arms)"
-                ),
-                Ok(_) => {
-                    log::error!("zcrx-lane: unexpected admin PDU after bring-up — session poisoned")
-                }
-                Err(e) => log::error!("zcrx-lane: admin connection error: {e} — session poisoned"),
-            }
+            let why = match &event {
+                Ok(0) => "admin connection closed by target (association death; remount re-arms)"
+                    .to_string(),
+                Ok(_) => "unexpected admin PDU after bring-up".to_string(),
+                Err(e) => format!("admin connection error: {e}"),
+            };
             // The mark-site latch edge (belt): a teardown that began
             // AFTER the early check above must still not gain a poison
             // mark from this task. With teardown awaiting this handle,
             // a mark that wins here reflects a genuinely concurrent
             // pre-teardown association event — which IS poison.
             if !admin_latch.load(Ordering::SeqCst) {
-                mark_session_poisoned(&admin_poison);
+                mark_session_poisoned(&admin_poison, &why);
             }
         });
 
@@ -1171,9 +1172,10 @@ impl LaneSession {
                 // Quiescence law: drain (abort-and-join tasks / close +
                 // join the ring driver) so no lane context survives
                 // holding chunk refs, then poison loud (drain=true: the
-                // drivers are provably joined).
-                shared.poisoned.store(true, Ordering::SeqCst);
-                mark_session_poisoned(&self.poisoned);
+                // drivers are provably joined). No pre-store: the poison
+                // funnel owns the flag flip AND the log (round 8 — the
+                // pre-store suppressed the first-swap log: silent
+                // poison). drain() needs no flag — it closes the sink.
                 q.drain().await;
                 shared.poison("read timed out after 30 s", &self.poisoned, true);
                 Err(io_err(format!(
@@ -1233,8 +1235,8 @@ impl LaneSession {
                 // returns — and the caller's buffer can be dropped/recycled
                 // — abort AND join the queue's tasks so no writer survives;
                 // only then drain (dropping entry keep-alives).
-                q.shared.poisoned.store(true, Ordering::SeqCst);
-                mark_session_poisoned(&self.poisoned);
+                // No pre-store (round 8): the poison funnel owns the
+                // flag flip and the log; abort+join needs no flag.
                 let mut ts = q.tasks.lock().await;
                 for t in ts.iter() {
                     t.abort();

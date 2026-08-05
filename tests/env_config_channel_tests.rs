@@ -161,8 +161,8 @@ async fn offline_fsck_leaves_the_process_env_untouched() {
         "fresh volume set must fsck clean (fixture sanity)"
     );
 
-    let after = std::env::var("SQUEEZEFS_DEFAULT_BLOCK_SIZE")
-        .expect("the sentinel must still be present");
+    let after =
+        std::env::var("SQUEEZEFS_DEFAULT_BLOCK_SIZE").expect("the sentinel must still be present");
     assert_eq!(
         after, SENTINEL,
         "§3d.2: the offline verb mutated the process environment — \

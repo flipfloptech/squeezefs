@@ -212,7 +212,8 @@ async fn live_statfs_converges_after_enospc_and_rm_churn() {
         delete_and_drain(&h, &name, ino).await;
         let after = settle_to(&h, used0).await;
         assert_eq!(
-            after, used0,
+            after,
+            used0,
             "plain write+rm cycle {c}: live used must converge to the \
              remount-equivalent baseline (everything deleted, reclaim \
              drained) — a residue is the il-durable-write note's local \
@@ -249,7 +250,8 @@ async fn live_statfs_converges_after_enospc_and_rm_churn() {
         );
     }
     assert_eq!(
-        after_enospc, used0,
+        after_enospc,
+        used0,
         "ENOSPC + rm churn: live used must converge to the \
          remount-equivalent baseline without remounting — a residue here is \
          the fleet-parity addendum's field drift ({} B stuck; on-disk \

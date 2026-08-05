@@ -5804,7 +5804,7 @@ impl DataRouter {
     }
 
     /// Wire the inode-reclaim latch probe (see the field doc on
-    /// [`DataRouterInner::reclaim_probe`]). First wiring wins (the
+    /// `DataRouterInner::reclaim_probe`). First wiring wins (the
     /// established `read_tier_purge` posture).
     pub fn set_reclaim_probe(&self, probe: std::sync::Arc<dyn Fn(u64) -> bool + Send + Sync>) {
         let _ = self.reclaim_probe.set(probe);

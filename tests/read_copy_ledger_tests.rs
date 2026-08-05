@@ -532,7 +532,10 @@ async fn warm_tier_serves_split_out_of_the_dest_bucket() {
     assert_eq!(data.len(), part);
     let d = delta(&s0);
     assert_eq!(d.fill_dma, BS, "phase A: one whole-block pooled fill");
-    assert_eq!(d.dest, part as u64, "phase A: the cold slice-out counts dest");
+    assert_eq!(
+        d.dest, part as u64,
+        "phase A: the cold slice-out counts dest"
+    );
     assert_eq!(
         d.warm, 0,
         "phase A: a COLD fill→dest slice-out must stay in the residual — \

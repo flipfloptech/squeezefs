@@ -178,6 +178,13 @@ ENOSPC'd; remount converges) — the parent addendum's
 ENOSPC-then-delete drift shape reproduces locally without ENOSPC.
 Red-repro candidate remains open.
 
+> **CLOSED (2026-08-05, `fix/wave-closeout`)** — see the parent note's
+> closure addendum. Red repro + fix:
+> `tests/statfs_live_accounting_tests.rs` (the ENOSPC leg is what parks
+> flush units in the allocator valve; the cancel face needs only a
+> failing fsync flush fan-out, which is why the local shape fired
+> "without ENOSPC" — row 6's ENOSPC had already seeded the unwind).
+
 ## SHAs
 
 | commit | what |

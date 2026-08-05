@@ -85,6 +85,22 @@ instantly — on-disk accounting sound, live-gauge drift only. Report-only,
 filed for a red repro (ENOSPC-then-delete ⇒ statfs converges without
 remount).
 
+> **CLOSED (2026-08-05, `fix/wave-closeout`, red-first).** Repro:
+> `tests/statfs_live_accounting_tests.rs` (sandbox ENOSPC + rm churn; red
+> 5/6 runs, 1–6 chunks stuck with refcount 1 and no owner, flat over a
+> 240 s watch). Root cause: three faces of one class — (1) valve-parked
+> flush units publishing into the `delete_file`→`destroy_inodes` window
+> (the destroy never decodes layouts, so on-disk self-heals — the
+> "remount converges" signature — while the LIVE refcount leaks), (2)
+> fsync's `buffer_unordered` first-error unwind CANCELLING sibling flush
+> units inside their claim→publish window (no RAII on the mint), (3) the
+> sparse-promote caller `?`-escaping a failing layout commit without
+> freeing its freshly-minted batch. Fixes: the ino-reclaim latch probed
+> at the layout-save funnel (NotFound-class refusal riding the existing
+> FIND-M11-A orphan arms) + `delete_file`'s meta-lock serialization
+> point; RES-9 `MintedBlockGuard`s in the three flush-family units; the
+> promote's failing-commit orphan-free. Green ×30.
+
 ## Open: the durable-write decomposition (next)
 
 Facts to explain: (a) il write VARIANCE is large (14.7–23.1 GB/s across

@@ -271,6 +271,7 @@ pub static KNOBS: &[Knob] = &[
     k("SQUEEZEFS_TEST_UPLOAD_STALL_MS", int(0, MS_MAX), "0", "Test seam: stall each block upload, ms."),
     k("SQUEEZEFS_TEST_WRITE_STALL_MS", int(0, MS_MAX), "0", "Test seam: stall the write handler, ms (the transport-lease-overlong pin)."),
     k("SQUEEZEFS_TEST_RECLAIM_STALL_MS", int(0, MS_MAX), "0", "Test seam: stall each reclaim batch, ms."),
+    k("SQUEEZEFS_TEST_THP_PREP_STALL_MS", int(0, MS_MAX), "0", "Test seam: stall each deferred session-arena THP prep job, ms (the fleet-launch admission pin)."),
     k("SQUEEZEFS_TEST_INVAL_TAIL_STALL_MS", int(0, MS_MAX), "0", "Test seam: stall the detached pipeline upload before its invalidation tail, ms (the 2026-08-04 tail-vs-writer race pin)."),
     k("SQUEEZEFS_TEST_CHECKOUT_STALL_MS", int(0, MS_MAX), "0", "Test seam: stall the write handler post-checkout inside its held block-lock window, ms (pairs with the inval-tail stall)."),
     k("SQUEEZEFS_TEST_NVME_READ_TIMEOUT_MS", int(1, MS_MAX), "30000", "Test seam: NVMe read timeout, ms."),

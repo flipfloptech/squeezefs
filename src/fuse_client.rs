@@ -4924,6 +4924,13 @@ pub struct Metrics {
     /// longer covers the per-session inter-arrival gap (the 2026-07-26
     /// sessions-inversion engine: a park/wake cycle per burst).
     pub ipc_service_parks: Align64<AtomicU64>,
+    /// Deferred session-arena THP prep (shim fleet parity, 2026-08-05):
+    /// jobs queued at admission / completed by the `sqz-ipc-thp` worker.
+    /// `queued − done` is the live upgrade backlog; a backlog that never
+    /// drains means the prep worker died (logged loud at spawn failure).
+    /// Both 0 on `SQUEEZEFS_IPC_ARENA_THP=0` mounts.
+    pub ipc_arena_prep_queued: Align64<AtomicU64>,
+    pub ipc_arena_prep_done: Align64<AtomicU64>,
     /// L4-6 lifecycle families (§5.7 / §5.6.2 W1). Idle sessions torn
     /// down past `SQUEEZEFS_IPC_IDLE_SECS` — growth on busy clients =
     /// idle-clock regression.
@@ -7604,6 +7611,8 @@ impl SqueezefsFilesystem {
                 "ipc_hold_probe_misses": METRICS.ipc_hold_probe_misses.load(Ordering::Relaxed),
                 "ipc_service_threads": METRICS.ipc_service_threads.load(Ordering::Relaxed),
                 "ipc_service_parks": METRICS.ipc_service_parks.load(Ordering::Relaxed),
+                "ipc_arena_prep_queued": METRICS.ipc_arena_prep_queued.load(Ordering::Relaxed),
+                "ipc_arena_prep_done": METRICS.ipc_arena_prep_done.load(Ordering::Relaxed),
                 "ipc_severed_pool_hits": METRICS.ipc_severed_pool_hits.load(Ordering::Relaxed),
                 "ipc_severed_pool_misses": METRICS.ipc_severed_pool_misses.load(Ordering::Relaxed),
                 "ipc_severed_pool_bytes": METRICS.ipc_severed_pool_bytes.load(Ordering::Relaxed),

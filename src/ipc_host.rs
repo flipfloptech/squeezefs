@@ -1150,6 +1150,23 @@ pub struct IpcHost {
     /// The severed-write buffer recycle pool (one per host; every
     /// session's mapping holds an `Arc` conduit).
     severed_pool: Arc<SeveredPool>,
+    /// Deferred session-arena THP prep (shim fleet parity, 2026-08-05):
+    /// the sender feeding the lazily-spawned `sqz-ipc-thp` worker.
+    /// `None` until the first prep enqueues (a session-less host owns
+    /// zero prep threads — the spawn-on-bind law); taken (dropped) at
+    /// shutdown so the worker's `recv` disconnects promptly.
+    thp_prep_tx: Mutex<Option<std::sync::mpsc::Sender<ThpPrepJob>>>,
+    /// Prep ledger (host-local truth for the admission contract test;
+    /// the process-global mirrors are `ipc_arena_prep_{queued,done}`).
+    arena_prep_queued: AtomicU64,
+    arena_prep_done: AtomicU64,
+}
+
+/// One deferred arena-prep job: the mapping `Arc` keeps the shm alive
+/// until the prep lands (a session torn down mid-queue defers its
+/// `munmap` past the madvise — the §5.3.1 rule-4 accessor ordering).
+struct ThpPrepJob {
+    map: Arc<SessionMapping>,
 }
 
 impl IpcHost {
@@ -1222,6 +1239,9 @@ impl IpcHost {
             ctl_cap_logged: AtomicBool::new(false),
             drain_budget: cfg_slots,
             severed_pool: Arc::new(SeveredPool::new(cfg_max_op_bytes, cfg_arena_cap_bytes)),
+            thp_prep_tx: Mutex::new(None),
+            arena_prep_queued: AtomicU64::new(0),
+            arena_prep_done: AtomicU64::new(0),
         });
         // Spawn-on-bind (ingest-economy 2026-07-28): the gauge reports
         // SPAWNED service threads — 0 until a session admits. No thread
@@ -1406,6 +1426,13 @@ impl IpcHost {
         for s in sessions {
             self.teardown_session(&s, "host shutdown");
         }
+        // Drop the prep sender so the `sqz-ipc-thp` worker's recv
+        // disconnects immediately (its 500 ms poll tick is the backstop);
+        // queued jobs drop with it — their mapping Arcs release then.
+        self.thp_prep_tx
+            .lock()
+            .expect("thp prep sender mutex never poisons")
+            .take();
         let threads = std::mem::take(
             &mut *self
                 .threads
@@ -2086,6 +2113,12 @@ impl IpcHost {
             .entry(cred.uid)
             .or_insert(0) += 1;
 
+        // Deferred arena THP prep (shim fleet parity, 2026-08-05): queue
+        // BEFORE the SessionOk send — the enqueue is O(1), so a client
+        // that observes SessionOk observes the job queued (the admission
+        // contract test's ordering), while the prep WORK runs off-path.
+        self.enqueue_arena_prep(Arc::clone(&session.map));
+
         if send_ctl(
             sock,
             &CtlMsg::SessionOk {
@@ -2237,6 +2270,121 @@ impl IpcHost {
     /// handle take: a spawn that wins the mutex before the take lands
     /// its handle in the joined vec; one that loses observes
     /// `shutting_down` and refuses — no leaked thread either way).
+    /// Deferred session-arena THP prep (shim fleet parity, 2026-08-05 —
+    /// the D12 board-item-2 fix): queue the arena's populate+collapse for
+    /// the `sqz-ipc-thp` worker instead of running it on the ctl thread
+    /// inside the HELLO window. The admission-time posture serialized
+    /// `MADV_POPULATE_WRITE` + `MADV_COLLAPSE` over the FULL arena
+    /// (64–120 MiB — fault+zero, collapse re-copy, huge-folio allocation
+    /// → direct compaction on fragmented fleet boxes) in front of every
+    /// client's first op, O(width × arena_bytes) at every fleet launch:
+    /// the 256-session process-fleet knee (local width bracket, 64 MiB
+    /// arenas pinned: w256 il/kernel 0.914 inline vs 1.074 without —
+    /// falsifying nothing about the PMD law itself, which the worker
+    /// still delivers moments later). A 4 KiB-paged session is correct
+    /// by construction; the collapse is an upgrade, never a readiness
+    /// gate. Gated by the same `SQUEEZEFS_IPC_ARENA_THP` lever (off ⇒
+    /// nothing queues, exactly the old disabled arm).
+    ///
+    /// Worker-spawn failure degrades loud: the session simply stays
+    /// 4 KiB-paged (the pre-near-zero-copy posture), never a refusal.
+    fn enqueue_arena_prep(self: &Arc<Self>, map: Arc<SessionMapping>) {
+        if !arena_thp_enabled() {
+            return;
+        }
+        let mut tx = self
+            .thp_prep_tx
+            .lock()
+            .expect("thp prep sender mutex never poisons");
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return;
+        }
+        if tx.is_none() {
+            let (sender, rx) = std::sync::mpsc::channel::<ThpPrepJob>();
+            let worker_host = Arc::clone(self);
+            match std::thread::Builder::new()
+                .name("sqz-ipc-thp".into())
+                .spawn(move || worker_host.thp_prep_loop(rx))
+            {
+                Ok(handle) => {
+                    self.threads
+                        .lock()
+                        .expect("thread registry mutex never poisons")
+                        .push(handle);
+                    *tx = Some(sender);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "ipc host: arena THP prep worker failed to spawn ({e}) — \
+                         session arenas stay 4 KiB-paged this mount"
+                    );
+                    return;
+                }
+            }
+        }
+        if let Some(sender) = tx.as_ref() {
+            self.arena_prep_queued.fetch_add(1, Ordering::Relaxed);
+            METRICS
+                .ipc_arena_prep_queued
+                .fetch_add(1, Ordering::Relaxed);
+            // A send on a disconnected worker (it observed shutdown) just
+            // drops the job — teardown owns the residue.
+            let _ = sender.send(ThpPrepJob { map });
+        }
+    }
+
+    /// The `sqz-ipc-thp` worker: one prep at a time (deliberately —
+    /// bounding prep concurrency to 1 keeps a 256-session fleet launch
+    /// from thundering-herding populate/collapse across every ctl
+    /// thread, which was exactly the admission-time shape). Exits on
+    /// host shutdown (sender dropped in [`IpcHost::shutdown`], or the
+    /// flag observed on the poll tick).
+    fn thp_prep_loop(self: Arc<Self>, rx: std::sync::mpsc::Receiver<ThpPrepJob>) {
+        while !self.shutting_down.load(Ordering::SeqCst) {
+            match rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(job) => {
+                    // TEST SEAM (`SQUEEZEFS_TEST_THP_PREP_STALL_MS`, the
+                    // WRITE_STALL pattern): hold the job so the admission
+                    // contract test can observe the deferred window.
+                    if let Some(ms) = std::env::var("SQUEEZEFS_TEST_THP_PREP_STALL_MS")
+                        .ok()
+                        .and_then(|v| v.trim().parse::<u64>().ok())
+                        .filter(|ms| *ms > 0)
+                    {
+                        std::thread::sleep(Duration::from_millis(ms));
+                    }
+                    if self.shutting_down.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let outcome = crate::thp::advise_hugepages(
+                        job.map.base,
+                        job.map.layout.total_bytes as usize,
+                        crate::thp::ThpMode::PopulateCollapse,
+                    );
+                    log::debug!(
+                        "ipc session shm THP (deferred): madvise_ok={} collapse_ok={} ({} bytes)",
+                        outcome.madvise_ok,
+                        outcome.collapse_ok,
+                        job.map.layout.total_bytes
+                    );
+                    self.arena_prep_done.fetch_add(1, Ordering::Relaxed);
+                    METRICS.ipc_arena_prep_done.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        }
+    }
+
+    /// Prep ledger snapshot `(queued, done)` — the admission contract
+    /// test's observable (`queued − done` = the live upgrade backlog).
+    pub fn arena_prep_counts(&self) -> (u64, u64) {
+        (
+            self.arena_prep_queued.load(Ordering::Relaxed),
+            self.arena_prep_done.load(Ordering::Relaxed),
+        )
+    }
+
     fn ensure_service_threads(self: &Arc<Self>, owner: usize) -> io::Result<()> {
         if owner < self.svc_spawned.load(Ordering::Acquire) {
             return Ok(());
@@ -2528,35 +2676,27 @@ fn create_session_shm(
             }
         };
     // NUMA arena placement (NUMA-affinity campaign 2026-07-31): bind the
-    // session to prefer the peer's node BEFORE first touch, so the THP
-    // populate below faults the pages on the right node and the collapse
-    // keeps them there (compose order is load-bearing). Gated internally
-    // (`SQUEEZEFS_NUMA=0` / single-node maps); best-effort.
+    // session to prefer the peer's node BEFORE first touch, so the
+    // (deferred) THP populate faults the pages on the right node and the
+    // collapse keeps them there (compose order is load-bearing — the
+    // bind is on the DAEMON's vma, so the deferred populate AND the
+    // collapse's huge-folio allocation both follow it; a client
+    // first-touch racing the deferred populate places at most its first
+    // op's window, which the collapse then re-places per this policy).
+    // Gated internally (`SQUEEZEFS_NUMA=0` / single-node maps);
+    // best-effort.
     crate::numa::bind_session_arena(base as *mut u8, layout.total_bytes as usize, node_hint);
-    // Session-arena THP (near-zero-copy 2026-07-31): shmem is
-    // policy-gated separately from anon THP (`shmem_enabled` is `never`
-    // on the field fleet), so the daemon populates + collapses the
-    // session at admission — MADV_COLLAPSE bypasses the sysfs policy;
-    // one-time cost off the data path, bytes already budget-charged at
-    // full geometry (`ipc_arena_bytes`). Best-effort: a refusal leaves a
-    // fully-functional 4 KiB-paged session. `SQUEEZEFS_IPC_ARENA_THP=0`
-    // is the A/B lever.
-    if arena_thp_enabled() {
-        let outcome = crate::thp::advise_hugepages(
-            base as *mut u8,
-            layout.total_bytes as usize,
-            crate::thp::ThpMode::PopulateCollapse,
-        );
-        log::debug!(
-            "ipc session shm THP: madvise_ok={} collapse_ok={} ({} bytes)",
-            outcome.madvise_ok,
-            outcome.collapse_ok,
-            layout.total_bytes
-        );
-    }
+    // Session-arena THP (near-zero-copy 2026-07-31): DEFERRED to the
+    // host's `sqz-ipc-thp` prep worker (shim fleet parity, 2026-08-05 —
+    // see `IpcHost::enqueue_arena_prep`). Running populate+collapse here
+    // put O(fleet-width × arena_bytes) of memory work in front of every
+    // client's first op at fleet launch; a 4 KiB-paged session is
+    // correct by construction and the collapse is an upgrade, never a
+    // readiness gate.
+    //
     // The locality instrument's memory-node truth: where the arena's
-    // pages ACTUALLY landed (post-bind, post-populate — get_mempolicy
-    // faults the base page per the vma policy if still untouched). One
+    // pages ACTUALLY land (post-bind — get_mempolicy faults the base
+    // page per the vma policy while the arena is still untouched). One
     // syscall per admission, off the data path.
     let arena_node = crate::numa_core::topology().node_of_addr(base as *const u8);
     let map = SessionMapping {

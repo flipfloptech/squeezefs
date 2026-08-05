@@ -163,17 +163,25 @@ run_row() { # run_row <label> <shim 0|1> <width> <rep>
     sync -f "$MOUNT_DIR" 2>/dev/null || sync
     # Settle the async block reclaim (the rm's displaced frees) so the next
     # row never races the reclaimer into ENOSPC (capacity: 4×8G zram oss).
-    python3 - <<'EOF'
-import json, time
-for _ in range(60):
+    # TWO gates: reclaim queue drained AND statvfs available covers the
+    # row (+2 GiB margin) — the queue alone raced: the rm's frees may not
+    # be ENQUEUED yet when it samples 0 (the run-1 r3 ENOSPC).
+    python3 - "$MOUNT_DIR" "$TOTAL_MB" <<'EOF'
+import json, os, sys, time
+mnt, need_mb = sys.argv[1], int(sys.argv[2]) + 2048
+for _ in range(120):
     try:
-        m = json.load(open("/mnt/sqz_fleet_width/.stats"))["metrics"]
+        m = json.load(open(f"{mnt}/.stats"))["metrics"]
+        q = m.get("block_free_reclaim_queue_bytes", 0)
+        st = os.statvfs(mnt)
+        avail_mb = st.f_bavail * st.f_frsize // 1048576
+        if q == 0 and avail_mb >= need_mb:
+            break
     except Exception:
-        break
-    q = m.get("block_free_reclaim_queue_bytes", 0)
-    if q == 0:
-        break
+        pass
     time.sleep(0.5)
+else:
+    print(f"  (capacity settle timed out: avail={avail_mb}MB need={need_mb}MB)", file=sys.stderr)
 EOF
     sleep 1
     local pre="$RESULTS/$label.r$rep.pre.json" post="$RESULTS/$label.r$rep.post.json"

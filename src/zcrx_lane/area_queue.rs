@@ -51,9 +51,11 @@ pub(crate) fn admission_permits(fill_window_len: usize, chunk: usize) -> usize {
 /// failover releases could never satisfy it). Unknown MTU degrades to
 /// one chunk per descriptor (the floor the ring cannot be below).
 pub(crate) fn ring_standing_bytes(rx_descs: u32, mtu: Option<u32>, chunk: usize) -> u64 {
-    // RED PHASE skeleton: derivation pinned by the tests below.
-    let _ = (rx_descs, mtu, chunk);
-    0
+    let per_desc = match mtu {
+        Some(mtu) => (mtu as usize).div_ceil(chunk.max(1)).max(1),
+        None => 1,
+    };
+    rx_descs as u64 * per_desc as u64 * chunk as u64
 }
 
 pub(crate) fn admission_units(len: usize) -> u32 {

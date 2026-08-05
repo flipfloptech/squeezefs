@@ -670,20 +670,29 @@ pub fn drain_group_stats() -> (u64, u64) {
     )
 }
 
-/// Queues per drain context — the MEASURED batching constant (the
-/// `fold_fill`/`MINT_SPREAD` class: an amortization width, not a resource
-/// cap — context COUNT keeps scaling with possible CPUs). Counted local
-/// bracket (2026-08-05, tcp devsub, fio libaio randread-4k, one standing
-/// prefilled store + mount-only A-B-B-A alternation): widths 1–8 sit at
-/// IOPS par on this venue's ~340k 32×8 ceiling while width 8 halves the
-/// drain-context cost — commit batch mean 1.48 → 2.98 COMMIT_AND_FETCH
-/// SQEs per `io_uring_enter` (−54 % enters) and eventfd wakes/op
-/// 0.687 → 0.340 (elide ratio 31 % → 66 %) on the SAME 32×8 point — and
-/// whole-node width 32 collapses −15 % on the single-thread drain
-/// ceiling. 8 is the largest width this venue proves cost-halving with
-/// zero IOPS regression; the field ladder (2026-08-05 evidence note) is
-/// the re-grading venue for the IOPS half of the claim.
-pub const DRAIN_GROUP_WIDTH: usize = 8;
+/// Queues per drain context, DERIVED from the node's possible-CPU span:
+/// the house `cpus/4` drain-parallelism SLOPE — the SAME slope that
+/// ceilings the ipc service threads (`il_sessions_default`) and shards
+/// the direct-drive rings (`dd_shards_from`); two independent numbers
+/// here would be the ingest-economy DEFAULTS-MISMATCH class again. Floor
+/// 1 = the physical minimum (a drain context owns at least one queue);
+/// the node-span ceiling is implicit (`n/4 ≤ n`) and the counted bracket
+/// showed whole-node must never be the default (−15 % on the
+/// single-thread drain ceiling).
+///
+/// Bracket validation (2026-08-05, tcp devsub, fio libaio randread-4k,
+/// one standing prefilled store + mount-only A-B-B-A alternation) ran on
+/// a 32-possible-CPU single-node box, where the slope evaluates to 8 —
+/// **byte-identical to the counted bracket winner**, so the A/B rows
+/// carry over verbatim for this shape: widths 1–8 at IOPS par on the
+/// venue's ~340k ceiling while width 8 halves the drain cost — commit
+/// batch mean 1.48 → 2.98 COMMIT_AND_FETCH SQEs per `io_uring_enter`
+/// (−54 % enters), eventfd wakes/op 0.687 → 0.340 (elide 31 % → 66 %) on
+/// the SAME 32×8 point. The field ladder (the 2026-08-05 evidence note)
+/// re-grades the SLOPE, never a constant.
+pub fn drain_group_width(node_possible_cpus: usize) -> usize {
+    (node_possible_cpus / 4).max(1)
+}
 
 /// `SQUEEZEFS_FUSE_DRAIN_GROUP` — explicit queues-per-drain-context width,
 /// wins verbatim over the derivation (the ipc-cap explicit-wins pattern;
@@ -714,14 +723,13 @@ fn drain_group_width_env() -> Option<usize> {
 /// constrained (the 8×32-pinned-hurts counter-row).
 ///
 /// Width derivation:
-/// - default = [`DRAIN_GROUP_WIDTH`] — the measured batching constant
-///   (counted local bracket, 2026-08-05: widths {1, 4, 8, 16, 32} on the
-///   tcp devsub — 8 halves the per-op drain cost at IOPS par, whole-node
-///   widths collapse on the single-thread drain ceiling; the constant's
-///   doc carries the numbers). The context COUNT still scales with
-///   machine size (possible CPUs ÷ width per node) — the width is an
-///   amortization constant, the `fold_fill`/`MINT_SPREAD` class, not a
-///   resource cap;
+/// - default = [`drain_group_width`] evaluated PER NODE RUN — the house
+///   `cpus/4` drain-parallelism slope on the run's possible-CPU span
+///   (floor 1), so both the context count AND the width derive from
+///   machine shape (counted local bracket, 2026-08-05: the slope's value
+///   at the 32-possible shape — 8 — halved the per-op drain cost at IOPS
+///   par while whole-node widths collapsed on the single-thread drain
+///   ceiling; the function's doc carries the numbers);
 /// - clamped to the NUMA node span: groups never span a node, so every
 ///   member arena stays local to its drain thread (`qid_is_cpu == false`
 ///   has no qid↔CPU correspondence — no node info exists and the plan
@@ -744,40 +752,50 @@ pub fn drain_group_plan(
     node_of: impl Fn(usize) -> Option<usize>,
     explicit_width: Option<usize>,
 ) -> Vec<std::ops::Range<u16>> {
-    let width = match buffer_mode {
-        // kmbuf: per-ring per-queue registration — singleton groups.
-        TransportBufferMode::BufRing => 1,
-        TransportBufferMode::UserEnts => explicit_width.unwrap_or(DRAIN_GROUP_WIDTH).max(1),
+    // kmbuf: per-ring per-queue registration — singleton groups (an
+    // explicit width never overrides the format constraint).
+    let forced_width = match buffer_mode {
+        TransportBufferMode::BufRing => Some(1),
+        TransportBufferMode::UserEnts => explicit_width.map(|w| w.max(1)),
     };
-    let mut plan: Vec<std::ops::Range<u16>> = Vec::new();
+    // Pass 1: segment qids into maximal NODE RUNS — break ONLY when two
+    // KNOWN nodes disagree; unknown-node holes join (offline/isolated
+    // possible CPUs are dormant queues), and a hole-only run adopts the
+    // first known node it meets. Node consulted ONLY under the qid↔CPU
+    // correspondence (testing queue overrides carry no per-qid node
+    // meaning — the whole range is one flat span).
+    let mut runs: Vec<std::ops::Range<usize>> = Vec::new();
     let mut start = 0usize;
-    // The run's KNOWN node (`None` while the run has only hole members).
     let mut run_node: Option<usize> = None;
     for qid in 0..nqueues {
-        // Node consulted ONLY under the qid↔CPU correspondence (testing
-        // queue overrides carry no per-qid node meaning).
-        let node = if qid_is_cpu && width > 1 {
-            node_of(qid)
-        } else {
-            None
-        };
+        let node = if qid_is_cpu { node_of(qid) } else { None };
         if qid == start {
             run_node = node;
             continue;
         }
-        // Break on width, or when TWO KNOWN nodes disagree; holes join.
-        let node_break = matches!((node, run_node), (Some(n), Some(r)) if n != r);
-        if qid - start >= width || node_break {
-            plan.push(start as u16..qid as u16);
+        if matches!((node, run_node), (Some(n), Some(r)) if n != r) {
+            runs.push(start..qid);
             start = qid;
             run_node = node;
         } else if run_node.is_none() {
-            // A hole-only run adopts the first known node it meets.
             run_node = node;
         }
     }
     if nqueues > start {
-        plan.push(start as u16..nqueues as u16);
+        runs.push(start..nqueues);
+    }
+    // Pass 2: chunk each run at its own width — the explicit/kmbuf width
+    // verbatim, else the cpus/4 slope on the RUN's possible-CPU span
+    // (the run IS the node's contiguous span; queues == possible CPUs).
+    let mut plan: Vec<std::ops::Range<u16>> = Vec::new();
+    for run in runs {
+        let width = forced_width.unwrap_or_else(|| drain_group_width(run.len()));
+        let mut s = run.start;
+        while s < run.end {
+            let e = (s + width).min(run.end);
+            plan.push(s as u16..e as u16);
+            s = e;
+        }
     }
     plan
 }
@@ -6667,33 +6685,40 @@ mod drain_wait_tests {
 mod drain_group_tests {
     use super::*;
 
-    /// Two-node 32-CPU box (the field shape): width = the measured
-    /// batching constant (8 — the counted local bracket's optimum, see
-    /// [`DRAIN_GROUP_WIDTH`]), two contexts per 16-queue node, groups
+    /// Two-node 32-CPU box (the field shape): the `cpus/4` slope on each
+    /// 16-possible node gives width 4 — four contexts per node, groups
     /// never spanning a node (member arenas stay node-local to their
     /// drain thread).
     #[test]
-    fn default_width_is_the_measured_batching_constant_node_split() {
+    fn default_width_is_the_cpus_over_4_slope_node_split() {
         let node_of = |cpu: usize| Some(cpu / 16); // 2 nodes × 16
         let plan = drain_group_plan(32, TransportBufferMode::UserEnts, true, node_of, None);
         assert_eq!(
             plan,
-            vec![0u16..8, 8..16, 16..24, 24..32],
-            "width = min(DRAIN_GROUP_WIDTH, node span): 4 contexts on 2×16"
+            vec![0u16..4, 4..8, 8..12, 12..16, 16..20, 20..24, 24..28, 28..32],
+            "width = node span / 4: 4 contexts per 16-possible node"
         );
     }
 
-    /// The width is a MEASURED constant, never the whole node: the counted
-    /// bracket showed one context per node collapsing on the single-thread
-    /// drain ceiling (width-32 −15 % IOPS at every point vs widths 1–8 on
-    /// the clean venue), so wider nodes get MORE contexts, not wider
-    /// groups.
+    /// Wider nodes get MORE contexts at the same slope, never wider
+    /// whole-node groups: the counted bracket showed one context per node
+    /// collapsing on the single-thread drain ceiling (width-32 −15 % IOPS
+    /// at every point vs widths 1–8 on the clean venue).
     #[test]
-    fn width_never_exceeds_the_measured_constant() {
+    fn width_scales_with_the_node_never_the_whole_node() {
         let node_of = |_cpu: usize| Some(0);
         let plan = drain_group_plan(64, TransportBufferMode::UserEnts, true, node_of, None);
-        assert_eq!(plan.len(), 64 / DRAIN_GROUP_WIDTH);
-        assert!(plan.iter().all(|g| g.len() == DRAIN_GROUP_WIDTH));
+        assert_eq!(plan.len(), 4, "64-possible node: 4 contexts at cpus/4");
+        assert!(plan.iter().all(|g| g.len() == drain_group_width(64)));
+        // The bracket-validated shape: 32-possible/1-node ⇒ width 8 —
+        // byte-identical to the counted bracket winner, so the A/B rows
+        // carry over verbatim.
+        let plan = drain_group_plan(32, TransportBufferMode::UserEnts, true, node_of, None);
+        assert_eq!(plan, vec![0u16..8, 8..16, 16..24, 24..32]);
+        // Tiny boxes land on the floor: 4 possible CPUs ⇒ width 1 —
+        // exactly today's per-queue posture.
+        let plan = drain_group_plan(4, TransportBufferMode::UserEnts, true, node_of, None);
+        assert_eq!(plan, vec![0u16..1, 1..2, 2..3, 3..4]);
     }
 
     /// kmbuf sessions keep today's one-context-per-queue posture
@@ -6722,16 +6747,21 @@ mod drain_group_tests {
     }
 
     /// Testing queue overrides (`qid_is_cpu == false`) have no qid↔CPU
-    /// correspondence, so no node info exists: contiguous slices of the
-    /// derived width, exactly like the per-queue NUMA placement law
-    /// (no correspondence ⇒ no per-queue node derivation).
+    /// correspondence, so no node info exists: one flat span with the
+    /// slope evaluated on the whole range, exactly like the per-queue
+    /// NUMA placement law (no correspondence ⇒ no per-queue node
+    /// derivation).
     #[test]
     fn no_cpu_correspondence_falls_back_to_flat_chunks() {
         let node_of = |_cpu: usize| -> Option<usize> {
             panic!("node lookup must not be consulted without qid↔cpu correspondence")
         };
+        // 5 queues: 5/4 = 1 ⇒ singleton groups (the floor posture).
         let plan = drain_group_plan(5, TransportBufferMode::UserEnts, false, node_of, None);
-        assert_eq!(plan, vec![0u16..5]);
+        assert_eq!(plan, vec![0u16..1, 1..2, 2..3, 3..4, 4..5]);
+        // 32 queues flat: 32/4 = 8 ⇒ four chunks of 8.
+        let plan = drain_group_plan(32, TransportBufferMode::UserEnts, false, node_of, None);
+        assert_eq!(plan, vec![0u16..8, 8..16, 16..24, 24..32]);
     }
 
     /// Offline-CPU holes are node-AGNOSTIC, never run breakers: queues =

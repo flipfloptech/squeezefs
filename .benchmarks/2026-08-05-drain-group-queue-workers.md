@@ -28,11 +28,20 @@ owner). kmbuf (`BufRing`) sessions derive width 1 — today's posture
 byte-identical (per-ring per-queue registration; grouping under kmbuf is
 the named follow-on).
 
-Width = `DRAIN_GROUP_WIDTH` = **8**, a measured amortization constant
-(the `fold_fill`/`MINT_SPREAD` class), node-clamped (groups never span a
+Width is **DERIVED, never a constant** (hard-constant ruling 2026-08-05):
+`drain_group_width(node_possible_cpus) = max(node_possible_cpus / 4, 1)`
+— the house `cpus/4` drain-parallelism SLOPE (`il_sessions_default` /
+`dd_shards_from` lineage), evaluated per NODE RUN (groups never span a
 NUMA node; offline-CPU holes join runs — sysfs node cpulists carry
-online CPUs only). `SQUEEZEFS_FUSE_DRAIN_GROUP` (registry, 1..=512) wins
-verbatim; `=1` is the A0 per-queue-worker control.
+online CPUs only; floor 1 = a context owns at least one queue, and the
+node-span ceiling is implicit). On the bracket venue (32-possible/1-node)
+the slope evaluates to **8 — byte-identical to the counted bracket
+winner**, so the §3/§4 rows carry over verbatim for this shape; the
+field ladder re-grades the SLOPE, not a constant. Canonical shapes
+(drift-is-red tie test): 32-possible/1-node ⇒ 8; 96-possible/2-node ⇒ 12
+per node; 4-CPU box ⇒ 1 (today's per-queue posture).
+`SQUEEZEFS_FUSE_DRAIN_GROUP` (registry, 1..=512) wins verbatim; `=1` is
+the A0 per-queue-worker control.
 
 ## 2. Protocol lesson (recorded so the next bracket does not repay it)
 
@@ -58,8 +67,9 @@ orders** — no regression anywhere, including the 8×32 guard point. Width
 scan on the same standing store: width 4 ≈ par, width 16 ≈ par-to-−2 %,
 **width 32 (whole node, one context) −15 % at every point** (281k/292k/
 308k) — the single-thread drain ceiling, which is what falsified the
-first-draft `min(Q_DEPTH_DESIRED, node span)` derivation and pinned the
-width as a measured constant instead.
+first-draft `min(Q_DEPTH_DESIRED, node span)` (whole-node) derivation;
+the shipped `cpus/4`-per-node slope evaluates to the bracket winner (8)
+on this shape.
 
 ## 4. Mechanism engagement (same 32×8 point, per side)
 
@@ -83,9 +93,11 @@ Re-run the evidence note's ladder + pin discriminator on squeeze-test
 `transport_drain_groups`/`transport_commit_batch*`/`transport_wake_*`
 deltas per point. Expected: 32×8 moves toward the 8×32 357k class
 (wakes/op and enters/op halve at minimum — the mechanism rows above are
-venue-independent); 8×32 must not regress. If the field wants a wider or
-narrower constant, re-grade `DRAIN_GROUP_WIDTH` there — the local venue
-has proven it cannot rank widths 1–8 by IOPS.
+venue-independent); 8×32 must not regress. The field box (2 nodes × 16
+possible) derives width 4 per node — if its ladder ranks a different
+width, re-grade the **SLOPE** in `drain_group_width` (and its canonical-
+shape tie test), never a constant — the local venue has proven it cannot
+rank widths 1–8 by IOPS.
 
 ## 6. Verification
 

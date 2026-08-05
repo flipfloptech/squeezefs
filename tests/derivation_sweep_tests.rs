@@ -751,45 +751,55 @@ fn zcrx_lane_xfer_cap_is_the_transport_payload_face() {
     assert_eq!(LANE_MAX_XFER_CAP_BYTES, 1024 * 1024, "Z2-benched MDTS face");
 }
 
-/// Ingress-queue-spread lever 2 (2026-08-05): the drain-group width is
-/// the MEASURED batching constant `DRAIN_GROUP_WIDTH` (the counted local
-/// bracket's optimum — the `fold_fill`/`MINT_SPREAD` amortization-constant
-/// class), node-clamped so groups never span a NUMA node; the context
-/// COUNT keeps deriving from machine size (possible CPUs ÷ width per
-/// node). Drift here is a conscious re-grade against the ingress ladder,
-/// never a constant edit.
+/// Ingress-queue-spread lever 2 (2026-08-05, hard-constant ruling): the
+/// drain-group width is DERIVED — `drain_group_width(node_possible_cpus)`
+/// = the house `cpus/4` drain-parallelism SLOPE (the
+/// `il_sessions_default` / `dd_shards_from` lineage) evaluated on the
+/// NODE's possible-CPU span, floor 1 (physical minimum: a context owns at
+/// least one queue). NEVER a frozen bracket winner: the counted 2026-08-05
+/// bracket validated the slope at the 32-possible shape (32/4 = 8 — the
+/// winning width, byte-identical to the derived value, so the A/B rows
+/// carry over verbatim), and the field ladder re-grades the SLOPE, not a
+/// constant. Drift-is-red on the canonical shapes (the dd_shards pattern).
 #[test]
-fn fuse_drain_group_width_is_the_measured_batching_constant() {
-    use fuse3::raw::connection::fuse_over_uring::{drain_group_plan, DRAIN_GROUP_WIDTH};
+fn fuse_drain_group_width_is_the_cpus_over_4_slope_per_node() {
+    use fuse3::raw::connection::fuse_over_uring::{drain_group_plan, drain_group_width};
     use fuse3::raw::connection::kmbuf::TransportBufferMode;
+    // The slope on canonical shapes: 32-possible/1-node ⇒ 8 (the
+    // bracket-validated shape); a 96-possible/2-node box ⇒ 12 per node;
+    // a 4-CPU box ⇒ 1 (= today's per-queue posture — the floor).
+    assert_eq!(drain_group_width(32), 8, "32-possible node: cpus/4 = 8");
+    assert_eq!(drain_group_width(48), 12, "48-possible node: cpus/4 = 12");
+    assert_eq!(drain_group_width(4), 1, "4-possible node: cpus/4 = 1");
     assert_eq!(
-        DRAIN_GROUP_WIDTH, 8,
-        "the counted 2026-08-05 bracket's optimum — re-grade before editing"
+        drain_group_width(1),
+        1,
+        "floor 1 — a context owns ≥ 1 queue"
     );
-    // Node wider than the constant: width == DRAIN_GROUP_WIDTH exactly
-    // (whole-node widths measured INTO the single-thread drain ceiling).
+    // The plan applies the slope PER NODE RUN: 96 possible over 2 nodes
+    // of 48 ⇒ 4 contexts of width 12 per node, never spanning a node.
     let plan = drain_group_plan(
-        DRAIN_GROUP_WIDTH * 8,
+        96,
         TransportBufferMode::UserEnts,
         true,
-        |_c| Some(0),
+        |c| Some(c / 48),
         None,
     );
+    assert_eq!(plan.len(), 8, "2 nodes × 4 contexts");
     assert!(
-        plan.iter().all(|g| g.len() == DRAIN_GROUP_WIDTH),
-        "width must be the measured constant when the node allows it"
-    );
-    // Node narrower than the constant: width degrades to the node span
-    // (groups never span a node — member arenas stay drain-thread-local).
-    let plan = drain_group_plan(
-        DRAIN_GROUP_WIDTH,
-        TransportBufferMode::UserEnts,
-        true,
-        |c| Some(c / (DRAIN_GROUP_WIDTH / 2)),
-        None,
+        plan.iter().all(|g| g.len() == 12),
+        "width = node span / 4 on 48-CPU nodes"
     );
     assert!(
-        plan.iter().all(|g| g.len() == DRAIN_GROUP_WIDTH / 2),
-        "width must clamp to the node span"
+        plan.iter().all(|g| (g.start / 48) == ((g.end - 1) / 48)),
+        "groups never span a node"
+    );
+    // Whole-node width must never be the DEFAULT (the counted bracket's
+    // falsifier: one context per node collapsed −15 % on the
+    // single-thread drain ceiling).
+    let plan = drain_group_plan(32, TransportBufferMode::UserEnts, true, |_c| Some(0), None);
+    assert!(
+        plan.iter().all(|g| g.len() == 8),
+        "32-possible single node: 4 contexts of 8 — the bracket-validated shape"
     );
 }

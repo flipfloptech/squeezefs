@@ -11892,6 +11892,14 @@ impl DataRouter {
                                         METRICS
                                             .read_copy_dest_bytes
                                             .fetch_add(len as u64, Ordering::Relaxed);
+                                        // A1 split: warm tier-buffer serve
+                                        // (subset of dest — see the field
+                                        // doc; counted AT the copy, like
+                                        // dest, so the subset law is exact
+                                        // even under a rebind retry).
+                                        METRICS
+                                            .read_copy_warm_serve_bytes
+                                            .fetch_add(len as u64, Ordering::Relaxed);
                                         // SAFETY: the destination window this serve was bounded against at
                                         // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
                                         // `cap`, and §5.4 lease exclusivity (kernel path) / session arena
@@ -11985,6 +11993,12 @@ impl DataRouter {
                                             }
                                             METRICS
                                                 .read_copy_dest_bytes
+                                                .fetch_add(len as u64, Ordering::Relaxed);
+                                            // A1 split: warm tier-buffer
+                                            // serve (the hold arm — see
+                                            // the field doc).
+                                            METRICS
+                                                .read_copy_warm_serve_bytes
                                                 .fetch_add(len as u64, Ordering::Relaxed);
                                             // SAFETY: the destination window this serve was bounded against at
                                             // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
@@ -12099,6 +12113,12 @@ impl DataRouter {
                                             }
                                             METRICS
                                                 .read_copy_dest_bytes
+                                                .fetch_add(len as u64, Ordering::Relaxed);
+                                            // A1 split: warm tier-buffer
+                                            // serve (the NVMe read-cache
+                                            // arm — see the field doc).
+                                            METRICS
+                                                .read_copy_warm_serve_bytes
                                                 .fetch_add(len as u64, Ordering::Relaxed);
                                             dest_bytes(dest_ptr, len)
                                         }

@@ -25,3 +25,25 @@ earns a roadmap slot. Verdicts below cite the measuring instrument for each.
 
 Declines are recorded here for the auditor's next pass; re-open any of them
 with a counted row that contradicts the citations above.
+
+## Addendum (2026-08-05): the A1 ledger split landed (instrument only)
+
+Sequence item 3's first half is in the tree (`fix/wave-closeout`):
+`read_copy_warm_serve_bytes` attributes the warm TIER-BUFFER serve copies
+(the serve ladder's hot-block / read-lane-hold / NVMe read-cache dest arms)
+as a **SUBSET** of `read_copy_dest_bytes` — every closure equation in the
+2026-08-02 note holds verbatim, and the cold dest residual is
+`dest − warm_serve` (fill→dest slice-outs, ranged bounce legs, assembly
+slices, and the mixed-provenance fetch-loop arms stay in the residual by
+design: the handoff's target population is exactly the tier-buffer arms the
+counter names). Contracts:
+`tests/read_copy_ledger_tests.rs::warm_tier_serves_split_out_of_the_dest_bucket`
+(red-first — phase B read 0 against the aggregated bucket).
+
+**The decision rule, recorded:** the tier-buffer lease into the ring commit
+is BUILT only if a counted warm row (the read_bw-kernel warm shape whose
+1,218 GB `read_copy_dest_bytes` motivated A1) shows `warm_serve` carrying
+the dominant share of `dest` — priced from that row's split, never the
+auditor's +15–25 % blanket. No serve-path behavior changed in this landing;
+the adjudication row itself (cluster warm battery with the split live) is
+the remaining half of sequence item 3.

@@ -750,3 +750,46 @@ fn zcrx_lane_xfer_cap_is_the_transport_payload_face() {
     assert_eq!(LANE_MAX_XFER_CAP_BYTES as usize, PAYLOAD_BASE);
     assert_eq!(LANE_MAX_XFER_CAP_BYTES, 1024 * 1024, "Z2-benched MDTS face");
 }
+
+/// Ingress-queue-spread lever 2 (2026-08-05): the drain-group width is
+/// the MEASURED batching constant `DRAIN_GROUP_WIDTH` (the counted local
+/// bracket's optimum — the `fold_fill`/`MINT_SPREAD` amortization-constant
+/// class), node-clamped so groups never span a NUMA node; the context
+/// COUNT keeps deriving from machine size (possible CPUs ÷ width per
+/// node). Drift here is a conscious re-grade against the ingress ladder,
+/// never a constant edit.
+#[test]
+fn fuse_drain_group_width_is_the_measured_batching_constant() {
+    use fuse3::raw::connection::fuse_over_uring::{drain_group_plan, DRAIN_GROUP_WIDTH};
+    use fuse3::raw::connection::kmbuf::TransportBufferMode;
+    assert_eq!(
+        DRAIN_GROUP_WIDTH, 8,
+        "the counted 2026-08-05 bracket's optimum — re-grade before editing"
+    );
+    // Node wider than the constant: width == DRAIN_GROUP_WIDTH exactly
+    // (whole-node widths measured INTO the single-thread drain ceiling).
+    let plan = drain_group_plan(
+        DRAIN_GROUP_WIDTH * 8,
+        TransportBufferMode::UserEnts,
+        true,
+        |_c| Some(0),
+        None,
+    );
+    assert!(
+        plan.iter().all(|g| g.len() == DRAIN_GROUP_WIDTH),
+        "width must be the measured constant when the node allows it"
+    );
+    // Node narrower than the constant: width degrades to the node span
+    // (groups never span a node — member arenas stay drain-thread-local).
+    let plan = drain_group_plan(
+        DRAIN_GROUP_WIDTH,
+        TransportBufferMode::UserEnts,
+        true,
+        |c| Some(c / (DRAIN_GROUP_WIDTH / 2)),
+        None,
+    );
+    assert!(
+        plan.iter().all(|g| g.len() == DRAIN_GROUP_WIDTH / 2),
+        "width must clamp to the node span"
+    );
+}

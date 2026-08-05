@@ -6819,6 +6819,14 @@ impl SqueezefsFilesystem {
         let (t_wake_writes, t_wakes_elided) = fuse3::transport_wake_stats();
         #[cfg(not(target_os = "linux"))]
         let (t_wake_writes, t_wakes_elided) = (0u64, 0u64);
+        // Ingress-queue-spread lever 2 engagement: the armed drain-group
+        // plan (`groups == transport_queues` with width 1 means the lever
+        // is structurally inert on this session — kmbuf mode or a width-1
+        // override).
+        #[cfg(target_os = "linux")]
+        let (t_drain_groups, t_drain_group_width) = fuse3::drain_group_stats();
+        #[cfg(not(target_os = "linux"))]
+        let (t_drain_groups, t_drain_group_width) = (0u64, 0u64);
         // FUSE-2 reply integrity (pre-RC spec): the exactly-one-reply
         // invariant's instruments, ALWAYS ON (the two detectors that
         // existed before were `transport_debug`-gated, i.e. off in
@@ -7581,6 +7589,8 @@ impl SqueezefsFilesystem {
                 "transport_commit_batch_commits": t_cb_commits,
                 "transport_wake_writes": t_wake_writes,
                 "transport_wakes_elided": t_wakes_elided,
+                "transport_drain_groups": t_drain_groups,
+                "transport_drain_group_width": t_drain_group_width,
                 // FUSE-2 reply integrity (spec §4 FUSE-2): see the gather
                 // site above. `transport_requests_abandoned` must stay 0.
                 "transport_requests_failed_synthetic": t_failed_synthetic,

@@ -161,6 +161,10 @@ pub struct InboundUringReq {
 }
 
 pub(crate) struct CommitMsg {
+    /// The queue the reply's slot lives on. Lever 2 (ingress-queue-spread,
+    /// 2026-08-05): commit channels are per drain GROUP, so the message
+    /// itself must carry the member queue its `ent_idx` addresses.
+    qid: u16,
     ent_idx: u16,
     commit_id: u64,
     header: Vec<u8>,
@@ -311,6 +315,12 @@ pub(crate) struct SlotTable {
 }
 
 impl SlotTable {
+    /// Slot population (== the member queue's ring depth) — what maps a
+    /// group-local ent id back to this table's queue-local index.
+    pub(crate) fn len(&self) -> usize {
+        self.states.len()
+    }
+
     pub(crate) fn new(depth: usize) -> Self {
         Self {
             states: vec![SlotState::Registered; depth],
@@ -589,17 +599,6 @@ pub(crate) fn decode_user_data(user_data: u64) -> Option<(RingOp, usize)> {
 }
 
 struct QueueHandle {
-    /// Unbounded: a bounded sync_channel can block the session reply task if the
-    /// queue worker is briefly not draining, freezing *all* fuse replies.
-    commit_tx: std::sync::mpsc::Sender<CommitMsg>,
-    /// Wake the queue thread (commit or shutdown).
-    wake_fd: RawFd,
-    /// Keep OwnedFd alive.
-    _wake: OwnedFd,
-    /// L3 lever B: elides redundant `wake_fd` writes — N reply submissions
-    /// between two worker passes cost one eventfd write. Shared with the
-    /// queue's [`PayloadArena`] so lease drops elide through the same flag.
-    wake_coalescer: Arc<WakeCoalescer>,
     /// The queue's payload arena, set once by the worker at startup. Held
     /// here so payload pointers handed out via `get_payload_buffer` stay
     /// valid for the pool's whole life, even after the worker exited.
@@ -616,6 +615,171 @@ struct QueueHandle {
     /// The queue's dest-claim geometry (MEM-1 address-containment
     /// resolution), set once by the worker right after its arena exists.
     dest_window: std::sync::OnceLock<DestWindow>,
+}
+
+/// One drain context's producer-facing half (ingress-queue-spread lever 2,
+/// `.benchmarks/2026-08-05-ingress-queue-spread.md`): the commit channel,
+/// wake eventfd and wake coalescer SHARED by every member queue of one
+/// drain group. N replies to ANY member between two worker passes cost one
+/// eventfd write — the L3 lever-B elision keyed on the group's aggregate
+/// state instead of one queue's (candidate direction (c), folded into (a)).
+struct GroupHandle {
+    /// Unbounded: a bounded sync_channel can block the session reply task
+    /// if the group worker is briefly not draining, freezing *all* fuse
+    /// replies (the per-queue law, unchanged by grouping).
+    commit_tx: std::sync::mpsc::Sender<CommitMsg>,
+    /// Wake the group's drain thread (commit or shutdown).
+    wake_fd: RawFd,
+    /// Keep OwnedFd alive.
+    _wake: OwnedFd,
+    /// L3 lever B at group scope; shared with every member queue's
+    /// [`PayloadArena`] so lease drops elide through the same flag.
+    wake_coalescer: Arc<WakeCoalescer>,
+    /// Member qids (ascending, contiguous, never spanning a NUMA node —
+    /// see [`drain_group_plan`]).
+    qids: std::ops::Range<u16>,
+}
+
+// ---------------------------------------------------------------------------
+// Ingress-queue-spread lever 2 — the drain-group plan
+// ---------------------------------------------------------------------------
+
+/// Groups (count) and max width of the armed drain-group plan — the
+/// lever's engagement gauges (`transport_drain_groups` /
+/// `transport_drain_group_width` on the stats inode).
+static DRAIN_GROUPS: AtomicU64 = AtomicU64::new(0);
+static DRAIN_GROUP_WIDTH_MAX: AtomicU64 = AtomicU64::new(0);
+
+/// Publish the armed plan's shape for the stats inode (called once per
+/// `try_start`; sim pools publish their singleton identity too).
+pub(crate) fn publish_drain_group_plan(plan: &[std::ops::Range<u16>]) {
+    DRAIN_GROUPS.store(plan.len() as u64, Ordering::Relaxed);
+    DRAIN_GROUP_WIDTH_MAX.store(
+        plan.iter().map(|g| g.len()).max().unwrap_or(0) as u64,
+        Ordering::Relaxed,
+    );
+}
+
+/// `(groups, width_max)` of the armed drain-group plan — the field row's
+/// engagement instrument: `groups == queues` (width 1) means the lever is
+/// structurally inert on this session (kmbuf mode, or a width-1 override).
+pub fn drain_group_stats() -> (u64, u64) {
+    (
+        DRAIN_GROUPS.load(Ordering::Relaxed),
+        DRAIN_GROUP_WIDTH_MAX.load(Ordering::Relaxed),
+    )
+}
+
+/// Queues per drain context — the MEASURED batching constant (the
+/// `fold_fill`/`MINT_SPREAD` class: an amortization width, not a resource
+/// cap — context COUNT keeps scaling with possible CPUs). Counted local
+/// bracket (2026-08-05, tcp devsub, fio libaio randread-4k, one standing
+/// prefilled store + mount-only A-B-B-A alternation): widths 1–8 sit at
+/// IOPS par on this venue's ~340k 32×8 ceiling while width 8 halves the
+/// drain-context cost — commit batch mean 1.48 → 2.98 COMMIT_AND_FETCH
+/// SQEs per `io_uring_enter` (−54 % enters) and eventfd wakes/op
+/// 0.687 → 0.340 (elide ratio 31 % → 66 %) on the SAME 32×8 point — and
+/// whole-node width 32 collapses −15 % on the single-thread drain
+/// ceiling. 8 is the largest width this venue proves cost-halving with
+/// zero IOPS regression; the field ladder (2026-08-05 evidence note) is
+/// the re-grading venue for the IOPS half of the claim.
+pub const DRAIN_GROUP_WIDTH: usize = 8;
+
+/// `SQUEEZEFS_FUSE_DRAIN_GROUP` — explicit queues-per-drain-context width,
+/// wins verbatim over the derivation (the ipc-cap explicit-wins pattern;
+/// the A/B measurement lever). Range 1..=512 (= the raw queue-count
+/// ceiling); the daemon's startup registry refuses malformed values, so a
+/// bad value here keeps the derived default (the shim-side asymmetry law).
+fn drain_group_width_env() -> Option<usize> {
+    crate::env_knob_core::parse_int_in::<usize>(
+        "SQUEEZEFS_FUSE_DRAIN_GROUP",
+        std::env::var("SQUEEZEFS_FUSE_DRAIN_GROUP").ok().as_deref(),
+        1,
+        512,
+    )
+    .ok()
+    .flatten()
+}
+
+/// The drain-group plan (ingress-queue-spread lever 2): partition qids
+/// `0..nqueues` into ascending, contiguous groups — one drain context
+/// (thread + io_uring + eventfd + coalescer) per group. The 2026-08-05
+/// evidence: with one context per possible CPU, IOPS scale NEGATIVELY
+/// with submitter spread at constant in-flight (32×8 = 273k vs 8×32 =
+/// 357k; pinning the same submitters to 8 CPUs recovers +21 %) because a
+/// context woken for ~1 op pays a full thread wake + a ~1-commit
+/// `io_uring_enter`. Grouping aggregates shallow member queues into
+/// per-context batches; the kernel's queue *selection* (`task_cpu`) and
+/// per-queue capacity are untouched, so submitter freedom is never
+/// constrained (the 8×32-pinned-hurts counter-row).
+///
+/// Width derivation:
+/// - default = [`DRAIN_GROUP_WIDTH`] — the measured batching constant
+///   (counted local bracket, 2026-08-05: widths {1, 4, 8, 16, 32} on the
+///   tcp devsub — 8 halves the per-op drain cost at IOPS par, whole-node
+///   widths collapse on the single-thread drain ceiling; the constant's
+///   doc carries the numbers). The context COUNT still scales with
+///   machine size (possible CPUs ÷ width per node) — the width is an
+///   amortization constant, the `fold_fill`/`MINT_SPREAD` class, not a
+///   resource cap;
+/// - clamped to the NUMA node span: groups never span a node, so every
+///   member arena stays local to its drain thread (`qid_is_cpu == false`
+///   has no qid↔CPU correspondence — no node info exists and the plan
+///   falls back to flat width-chunks, the per-queue placement law).
+///   Unknown-node HOLES (offline/isolated possible CPUs — sysfs node
+///   cpulists carry online CPUs only) join the current run instead of
+///   breaking it: a hole's queue is dormant (`task_cpu` never names an
+///   offline CPU), so it carries no locality cost, and breaking on holes
+///   fragments a single-node box into per-hole slivers;
+/// - `BufRing` sessions keep width 1 (today's posture byte-identical):
+///   the kmbuf fixed-headers/bufring registration is per-ring per-queue
+///   in the sqz kernel surface — grouping under kmbuf is the named
+///   follow-on, never a silent behavior fork;
+/// - `SQUEEZEFS_FUSE_DRAIN_GROUP` explicit width wins verbatim (still
+///   node-split: node containment is structural, not tuning).
+pub fn drain_group_plan(
+    nqueues: usize,
+    buffer_mode: TransportBufferMode,
+    qid_is_cpu: bool,
+    node_of: impl Fn(usize) -> Option<usize>,
+    explicit_width: Option<usize>,
+) -> Vec<std::ops::Range<u16>> {
+    let width = match buffer_mode {
+        // kmbuf: per-ring per-queue registration — singleton groups.
+        TransportBufferMode::BufRing => 1,
+        TransportBufferMode::UserEnts => explicit_width.unwrap_or(DRAIN_GROUP_WIDTH).max(1),
+    };
+    let mut plan: Vec<std::ops::Range<u16>> = Vec::new();
+    let mut start = 0usize;
+    // The run's KNOWN node (`None` while the run has only hole members).
+    let mut run_node: Option<usize> = None;
+    for qid in 0..nqueues {
+        // Node consulted ONLY under the qid↔CPU correspondence (testing
+        // queue overrides carry no per-qid node meaning).
+        let node = if qid_is_cpu && width > 1 {
+            node_of(qid)
+        } else {
+            None
+        };
+        if qid == start {
+            run_node = node;
+            continue;
+        }
+        // Break on width, or when TWO KNOWN nodes disagree; holes join.
+        let node_break = matches!((node, run_node), (Some(n), Some(r)) if n != r);
+        if qid - start >= width || node_break {
+            plan.push(start as u16..qid as u16);
+            start = qid;
+            run_node = node;
+        } else if run_node.is_none() {
+            // A hole-only run adopts the first known node it meets.
+            run_node = node;
+        }
+    }
+    if nqueues > start {
+        plan.push(start as u16..nqueues as u16);
+    }
+    plan
 }
 
 /// One queue's dest-claim geometry (MEM-1): the arena span, its buffer
@@ -1053,6 +1217,11 @@ pub struct FuseOverUring {
     /// leader/attach topology.
     sqpoll: Option<SqpollGroup>,
     queues: Vec<QueueHandle>,
+    /// Drain groups (lever 2): one entry per drain context; member queues
+    /// share its commit channel, eventfd and coalescer.
+    groups: Vec<GroupHandle>,
+    /// qid → index into `groups` (reply routing).
+    group_of: Vec<u16>,
     workers: Mutex<Vec<JoinHandle<()>>>,
     fuse_fd: RawFd,
     payload_sz: usize,
@@ -2108,29 +2277,53 @@ impl FuseOverUring {
             inbound.push(Arc::new(InboundQueue::new()));
         }
         let mut queue_handles = Vec::with_capacity(nqueues);
-        let mut commit_rxs = Vec::with_capacity(nqueues);
-        let mut wake_fds = Vec::with_capacity(nqueues);
-
         for _ in 0..nqueues {
-            let (commit_tx, commit_rx) = std::sync::mpsc::channel();
-            let efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-            if efd < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let wake = unsafe { OwnedFd::from_raw_fd(efd) };
-            let wake_fd = wake.as_raw_fd();
-            wake_fds.push(wake_fd);
             queue_handles.push(QueueHandle {
-                commit_tx,
-                wake_fd,
-                _wake: wake,
-                wake_coalescer: Arc::new(WakeCoalescer::new()),
                 arena: std::sync::Mutex::new(None),
                 kmbuf: std::sync::Mutex::new(None),
                 // One §5.4 lease word per ring ent — pool-level so MEM-1
                 // dest claims and the worker's commit gate share them.
                 lease_states: (0..depth).map(|_| Arc::new(EntLeaseState::new())).collect(),
                 dest_window: std::sync::OnceLock::new(),
+            });
+        }
+
+        // Lever 2 (ingress-queue-spread): one drain context per GROUP of
+        // queues — plan resolved once per session (see `drain_group_plan`
+        // for the width derivation and its evidence).
+        let qid_is_cpu = nqueues == kernel_possible_cpus();
+        let topo = crate::numa_core::topology();
+        let plan = drain_group_plan(
+            nqueues,
+            buffer_mode,
+            qid_is_cpu,
+            |cpu| topo.node_of_cpu(cpu),
+            drain_group_width_env(),
+        );
+        publish_drain_group_plan(&plan);
+        let mut group_handles = Vec::with_capacity(plan.len());
+        let mut group_of = vec![0u16; nqueues];
+        let mut commit_rxs = Vec::with_capacity(plan.len());
+        let mut wake_fds = Vec::with_capacity(plan.len());
+        for (gi, qids) in plan.iter().enumerate() {
+            let (commit_tx, commit_rx) = std::sync::mpsc::channel();
+            let efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+            if efd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: efd is a freshly-created, owned eventfd (checked >= 0).
+            let wake = unsafe { OwnedFd::from_raw_fd(efd) };
+            let wake_fd = wake.as_raw_fd();
+            wake_fds.push(wake_fd);
+            for qid in qids.clone() {
+                group_of[qid as usize] = gi as u16;
+            }
+            group_handles.push(GroupHandle {
+                commit_tx,
+                wake_fd,
+                _wake: wake,
+                wake_coalescer: Arc::new(WakeCoalescer::new()),
+                qids: qids.clone(),
             });
             commit_rxs.push(commit_rx);
         }
@@ -2164,31 +2357,40 @@ impl FuseOverUring {
             depth,
             sqpoll,
             queues: queue_handles,
+            groups: group_handles,
+            group_of,
             workers: Mutex::new(Vec::new()),
             fuse_fd,
             payload_sz,
             buffer_mode,
-            qid_is_cpu: nqueues == kernel_possible_cpus(),
+            qid_is_cpu,
             stats_requests: AtomicU64::new(0),
             stats_replies: AtomicU64::new(0),
             stats_cqe_err: AtomicU64::new(0),
             stats_register: AtomicU64::new(0),
         });
 
-        let (err_tx, err_rx) = std::sync::mpsc::sync_channel::<String>(nqueues.max(1));
+        let (err_tx, err_rx) = std::sync::mpsc::sync_channel::<String>(pool.groups.len().max(1));
         let mut handles = Vec::new();
-        for qid in 0..nqueues as u16 {
+        for (gi, &wake_fd) in wake_fds.iter().enumerate() {
             let pool_c = pool.clone();
             let commit_rx = commit_rxs.remove(0);
-            let wake_fd = wake_fds[qid as usize];
             let err_tx = err_tx.clone();
+            let qids = pool.groups[gi].qids.clone();
+            // Thread-name compat: a singleton group keeps today's
+            // per-queue name (comm truncates at 15 chars anyway).
+            let name = if qids.len() == 1 {
+                format!("fuse-over-uring-{}", qids.start)
+            } else {
+                format!("fuse-over-uring-{}-{}", qids.start, qids.end - 1)
+            };
             let h = std::thread::Builder::new()
-                .name(format!("fuse-over-uring-{qid}"))
+                .name(name)
                 .spawn(move || {
                     if let Err(e) =
-                        queue_worker(pool_c.clone(), qid, depth, payload_sz, commit_rx, wake_fd)
+                        queue_worker(pool_c.clone(), gi, depth, payload_sz, commit_rx, wake_fd)
                     {
-                        let msg = format!("qid={qid}: {e}");
+                        let msg = format!("qids={:?}: {e}", pool_c.groups[gi].qids);
                         error!("fuse-over-uring worker {msg}");
                         let _ = err_tx.send(msg);
                         pool_c.shutdown();
@@ -2271,14 +2473,19 @@ impl FuseOverUring {
             TransportBufferMode::UserEnts => "user-ents",
             TransportBufferMode::BufRing => "kmbuf-bufring",
         };
+        // Lever-2 evidence line: the armed drain-group shape (groups ==
+        // queues ⇒ the lever is structurally inert on this session).
+        let (dg, dgw) = drain_group_stats();
         eprintln!(
             "FUSE-over-io_uring registered: queues={nqueues} depth={depth} payload_sz={payload_sz} \
-             max_write={max_write} max_pages={max_pages} buffers={mode_state} fd={fuse_fd} sqpoll={sqpoll_state}"
+             max_write={max_write} max_pages={max_pages} buffers={mode_state} fd={fuse_fd} \
+             sqpoll={sqpoll_state} drain_groups={dg}(width<={dgw})"
         );
         info!(
             "FUSE-over-io_uring registered: queues={nqueues} depth={depth} \
              payload_sz={payload_sz} max_write={max_write} max_pages={max_pages} \
-             buffers={mode_state} fd={fuse_fd} sqpoll={sqpoll_state}"
+             buffers={mode_state} fd={fuse_fd} sqpoll={sqpoll_state} \
+             drain_groups={dg}(width<={dgw})"
         );
         Ok(pool)
     }
@@ -2315,8 +2522,9 @@ impl FuseOverUring {
     fn sim_inert_inner(nqueues: u16) -> (Arc<Self>, Vec<std::sync::mpsc::Receiver<CommitMsg>>) {
         let mut inbound = Vec::with_capacity(nqueues as usize);
         let mut queues = Vec::with_capacity(nqueues as usize);
+        let mut groups = Vec::with_capacity(nqueues as usize);
         let mut commit_rxs = Vec::with_capacity(nqueues as usize);
-        for _ in 0..nqueues {
+        for qid in 0..nqueues {
             inbound.push(Arc::new(InboundQueue::new()));
             let (commit_tx, commit_rx) = std::sync::mpsc::channel();
             let efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
@@ -2329,10 +2537,6 @@ impl FuseOverUring {
             let wake = unsafe { OwnedFd::from_raw_fd(efd) };
             let wake_fd = wake.as_raw_fd();
             queues.push(QueueHandle {
-                commit_tx,
-                wake_fd,
-                _wake: wake,
-                wake_coalescer: Arc::new(WakeCoalescer::new()),
                 arena: std::sync::Mutex::new(None),
                 kmbuf: std::sync::Mutex::new(None),
                 // MEM-1: the sim venue arms no ring, but the §5.4 lease
@@ -2342,6 +2546,15 @@ impl FuseOverUring {
                 // honest shape.
                 lease_states: Vec::new(),
                 dest_window: std::sync::OnceLock::new(),
+            });
+            // Sim groups are the singleton identity (per-queue receivers —
+            // the teardown pins address queues individually).
+            groups.push(GroupHandle {
+                commit_tx,
+                wake_fd,
+                _wake: wake,
+                wake_coalescer: Arc::new(WakeCoalescer::new()),
+                qids: qid..qid + 1,
             });
             commit_rxs.push(commit_rx);
         }
@@ -2358,6 +2571,8 @@ impl FuseOverUring {
             depth: Self::SIM_DEPTH,
             sqpoll: None,
             queues,
+            group_of: (0..nqueues).collect(),
+            groups,
             workers: Mutex::new(Vec::new()),
             fuse_fd: -1,
             payload_sz: 1 << 20,
@@ -2454,25 +2669,28 @@ impl FuseOverUring {
             "[XPORT] reply qid={qid} ent={ent_idx} cid={commit_id} body={}",
             reply_body.len()
         );
-        let q = self
-            .queues
+        let g = self
+            .group_of
             .get(qid as usize)
+            .and_then(|&gi| self.groups.get(gi as usize))
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bad qid"))?;
-        q.commit_tx
+        g.commit_tx
             .send(CommitMsg {
+                qid,
                 ent_idx,
                 commit_id,
                 header,
                 reply_body,
             })
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "uring commit closed"))?;
-        // Wake the queue thread. L3 lever B: the channel send above is the
-        // publication; the coalescer elides the eventfd write when a wake
-        // is already armed — N replies between two worker passes cost one
-        // write (wake_core protocol, loom-verified send→arm→write order).
-        if q.wake_coalescer.arm() {
+        // Wake the drain thread. L3 lever B at group scope: the channel
+        // send above is the publication; the coalescer elides the eventfd
+        // write when a wake is already armed — N replies to ANY member
+        // queue between two worker passes cost one write (wake_core
+        // protocol, loom-verified send→arm→write order).
+        if g.wake_coalescer.arm() {
             let one: u64 = 1;
-            let _ = unsafe { libc::write(q.wake_fd, &one as *const u64 as *const _, 8) };
+            let _ = unsafe { libc::write(g.wake_fd, &one as *const u64 as *const _, 8) };
             TRANSPORT_WAKE_WRITES.fetch_add(1, Ordering::Relaxed);
         } else {
             TRANSPORT_WAKES_ELIDED.fetch_add(1, Ordering::Relaxed);
@@ -2641,8 +2859,8 @@ impl FuseOverUring {
         // wake to see active == false whatever the elision flag says, and a
         // one-shot extra write costs nothing.
         let one: u64 = 1;
-        for q in &self.queues {
-            let _ = unsafe { libc::write(q.wake_fd, &one as *const u64 as *const _, 8) };
+        for g in &self.groups {
+            let _ = unsafe { libc::write(g.wake_fd, &one as *const u64 as *const _, 8) };
         }
     }
 }
@@ -3052,36 +3270,55 @@ fn connection_watch(pool: Arc<FuseOverUring>) {
 
 fn queue_worker(
     pool: Arc<FuseOverUring>,
-    qid: u16,
+    group_idx: usize,
     depth: usize,
     payload_sz: usize,
     commit_rx: std::sync::mpsc::Receiver<CommitMsg>,
     wake_fd: RawFd,
 ) -> io::Result<()> {
-    // The queue's NUMA node (NUMA-affinity campaign 2026-07-31): the
+    // Lever 2 (ingress-queue-spread): this worker is ONE drain context for
+    // every member queue of its group — one ring, one park, one wake, one
+    // flush amortized over the group's aggregate traffic. `first_qid`
+    // stands in wherever the retired per-queue worker used its qid
+    // (affinity home, SQPOLL leader election); per-request logs and reply
+    // addressing always carry the member's REAL qid.
+    let qids = pool.groups[group_idx].qids.clone();
+    let first_qid = qids.start;
+    let g = qids.len();
+    // The group's NUMA node (NUMA-affinity campaign 2026-07-31): the
     // kernel routes requests to the queue of the requester's CPU, so on
     // queue-per-possible-CPU sessions qid IS a kernel cpu id and the
-    // queue's home node is a map lookup. Testing queue overrides break
-    // the correspondence — no per-queue node, no placement.
+    // group's home node is a map lookup on any member (the plan never
+    // lets a group span nodes). Testing queue overrides break the
+    // correspondence — no per-queue node, no placement.
     let queue_node = if pool.qid_is_cpu {
-        crate::numa_core::topology().node_of_cpu(qid as usize)
+        // First member with a KNOWN node (offline-CPU holes report none —
+        // the plan lets them join a run, so the group's home is its first
+        // online member's node).
+        qids.clone()
+            .find_map(|q| crate::numa_core::topology().node_of_cpu(q as usize))
     } else {
         None
     };
     // Affinity posture (transport-ingress campaign 2026-08-01): node
-    // scope by DEFAULT — the worker keeps its queue's home node (arena
+    // scope by DEFAULT — the worker keeps its group's home node (arena
     // binding + reply-serve locality unchanged) but may run on any
     // process-mask CPU of it, so the reap wake stops paying the pinned
     // core's runqueue wait (the same hostage mechanism the fuse3-tpc
     // lanes measured; that wait lands in the KERNEL-SIDE residue term).
-    // `SQUEEZEFS_FUSE_PIN_SCOPE=core` restores the pre-campaign posture.
+    // `SQUEEZEFS_FUSE_PIN_SCOPE=core` restores the pre-campaign posture
+    // (a multi-queue group core-pins to its FIRST member's core — the
+    // closest analog of the retired per-queue pin).
     match crate::raw::affinity::pin_scope() {
         crate::raw::affinity::PinScope::Core => {
-            // Best-effort pin to core qid; when the exact core is outside
-            // the process mask (taskset-restricted mounts) fall back to
-            // the queue's NODE cpu set (intersected with the process mask)
-            // so the worker's reply serves and the arena stay co-located.
-            if !core_affinity::set_for_current(core_affinity::CoreId { id: qid as usize }) {
+            // Best-effort pin to the home core; when the exact core is
+            // outside the process mask (taskset-restricted mounts) fall
+            // back to the group's NODE cpu set (intersected with the
+            // process mask) so the worker's reply serves and the arenas
+            // stay co-located.
+            if !core_affinity::set_for_current(core_affinity::CoreId {
+                id: first_qid as usize,
+            }) {
                 if let Some(n) = queue_node {
                     if crate::numa_core::placement_active() {
                         let _ = crate::numa_core::topology().pin_current_to_node(n);
@@ -3090,14 +3327,14 @@ fn queue_worker(
             }
         }
         crate::raw::affinity::PinScope::Node => {
-            // Home = cpu qid when qid IS a kernel cpu id; the derivation
-            // degrades to the whole process mask for testing queue
-            // overrides / unknown nodes / masks excluding the node.
+            // Home = cpu first_qid when qid IS a kernel cpu id; the
+            // derivation degrades to the whole process mask for testing
+            // queue overrides / unknown nodes / masks excluding the node.
             let topo = crate::numa_core::topology();
             let avail = crate::raw::affinity::process_cpus();
             let cpus = crate::raw::affinity::scoped_affinity_cpus(
                 crate::raw::affinity::PinScope::Node,
-                qid as usize,
+                first_qid as usize,
                 &avail,
                 |c| topo.node_of_cpu(c),
                 |n| {
@@ -3111,10 +3348,15 @@ fn queue_worker(
         }
     }
 
-    let sq_entries = (depth as u32 + 8).next_power_of_two().max(16);
+    // The group ring carries every member's ents: SQ sized to the group's
+    // aggregate depth (the same per-queue formula, aggregate-scaled).
+    let group_depth = g * depth;
+    let sq_entries = (group_depth as u32 + 8).next_power_of_two().max(16);
     // §5.3 D3.b: plain SQE128 ring by default; SQPOLL leader/attach
-    // topology when the session knobs opted in (see `build_queue_ring`).
-    let mut ring: Ring = build_queue_ring(sq_entries, qid, pool.sqpoll.as_ref(), &pool.active)?;
+    // topology when the session knobs opted in (see `build_queue_ring` —
+    // the group containing qid 0 is the leader).
+    let mut ring: Ring =
+        build_queue_ring(sq_entries, first_qid, pool.sqpoll.as_ref(), &pool.active)?;
     // FUSE-3f: probe the feature word ONCE per ring (portable-by-default:
     // probe, never a kernel-version check) and watch the overflow counter
     // after every `cq.sync()` below. A dropped completion is a REGISTER or
@@ -3122,9 +3364,9 @@ fn queue_worker(
     let mut cq_drops = CqDropWatch::new(ring.params().is_feature_nodrop());
     if !cq_drops.nodrop() {
         debug!(
-            "fuse-over-uring qid={qid}: kernel lacks IORING_FEAT_NODROP — a full              CQ drops completions (cqsize={}, worst pass {}); watching              transport_cq_overflows",
+            "fuse-over-uring qids={qids:?}: kernel lacks IORING_FEAT_NODROP — a full              CQ drops completions (cqsize={}, worst pass {}); watching              transport_cq_overflows",
             sq_entries * 2,
-            depth * 2 + 1
+            group_depth * 2 + 1
         );
     }
 
@@ -3141,121 +3383,167 @@ fn queue_worker(
     // + kernel-managed payload bufring BEFORE any ent REGISTER (the
     // kernel resolves both at ent-registration time). A refusal here
     // fails the worker → the mount (the capability gate is the PROBE;
-    // post-probe refusals never silently downgrade).
+    // post-probe refusals never silently downgrade). Grouping never
+    // composes with kmbuf in this lever (the plan derives width 1 under
+    // BufRing), so the per-ring registration keeps its exact shape.
     let kmbuf_q: Option<Arc<KmbufQueue>> = match pool.buffer_mode {
         TransportBufferMode::BufRing => {
+            debug_assert_eq!(g, 1, "BufRing sessions run singleton drain groups by plan");
             Some(Arc::new(KmbufQueue::setup(&ring, depth, payload_sz)?))
         }
         TransportBufferMode::UserEnts => None,
     };
 
-    // Payload memory lives in an Arc'd arena (not the worker-local Ent) so
-    // FUSE_WRITE leases and `get_payload_buffer` pointers stay valid past
-    // worker exit (§5.4). The arena shares the queue's wake coalescer so
-    // lease-drop wakes elide through the same flag as reply submissions.
-    // kmbuf mode: the arena is a bid-indexed view over the queue's mmap'd
-    // kernel buffer region (mapping owned by KmbufQueue, held alive by
-    // the arena for lease lifetimes).
-    let wake_coalescer = Arc::clone(&pool.queues[qid as usize].wake_coalescer);
-    let arena = match &kmbuf_q {
-        Some(kq) => PayloadArena::from_kmbuf(Arc::clone(kq), wake_fd, Arc::clone(&wake_coalescer))?,
-        None => PayloadArena::new(
-            depth,
-            payload_sz,
-            wake_fd,
-            Arc::clone(&wake_coalescer),
-            queue_node,
-        )?,
-    };
-    // One lease state per ring ent (pool-level since MEM-1 — dest claims
-    // acquire against the same words) + the worker-local parked commit
-    // slots.
-    let lease_states: Vec<Arc<EntLeaseState>> = pool.queues[qid as usize].lease_states.clone();
-    debug_assert_eq!(lease_states.len(), depth, "lease states sized to depth");
-    let mut parked_msgs: Vec<Option<CommitMsg>> = (0..depth).map(|_| None).collect();
-
-    let mut ents: Vec<Ent> = (0..depth)
-        .map(|idx| match &kmbuf_q {
-            None => {
-                let mut header = Box::new(FuseUringReqHeader::default());
-                header.ring_ent_in_out.payload_sz = payload_sz as u32;
-                let header_ptr = &mut *header as *mut FuseUringReqHeader;
-                Ent {
-                    header_ptr,
-                    _owned_header: Some(header),
-                    payload_ptr: arena.buf(idx).expect("arena sized to depth"),
-                    payload_len: payload_sz,
-                    node: arena.node_of_buf(idx),
-                    iov: [
-                        libc::iovec {
-                            iov_base: std::ptr::null_mut(),
-                            iov_len: 0,
-                        },
-                        libc::iovec {
-                            iov_base: std::ptr::null_mut(),
-                            iov_len: 0,
-                        },
-                    ],
-                    last_opcode: 0,
-                }
-            }
+    // Per-member state: exactly the retired per-queue worker's locals,
+    // one set per member queue. Payload memory lives in Arc'd per-QUEUE
+    // arenas (not the worker-local Ent) so FUSE_WRITE leases and
+    // `get_payload_buffer` pointers stay valid past worker exit (§5.4);
+    // each arena shares the GROUP's wake coalescer so lease-drop wakes
+    // elide through the same flag as reply submissions. kmbuf mode: the
+    // arena is a bid-indexed view over the queue's mmap'd kernel buffer
+    // region (mapping owned by KmbufQueue, held alive by the arena for
+    // lease lifetimes).
+    struct MemberState {
+        qid: u16,
+        ents: Vec<Ent>,
+        slots: SlotTable,
+        parked_msgs: Vec<Option<CommitMsg>>,
+        lease_states: Vec<Arc<EntLeaseState>>,
+        arena: Arc<PayloadArena>,
+        node: Option<usize>,
+    }
+    let wake_coalescer = Arc::clone(&pool.groups[group_idx].wake_coalescer);
+    let mut members: Vec<MemberState> = Vec::with_capacity(g);
+    for qid in qids.clone() {
+        let member_node = if pool.qid_is_cpu {
+            crate::numa_core::topology().node_of_cpu(qid as usize)
+        } else {
+            None
+        };
+        let arena = match &kmbuf_q {
             Some(kq) => {
-                let mut ent = Ent {
-                    // Header slot inside the fixed headers region (fresh
-                    // anon mapping — zeroed).
-                    header_ptr: kq.header_ptr(idx).cast(),
-                    _owned_header: None,
-                    // No payload buffer until the first flagged delivery.
-                    payload_ptr: std::ptr::null_mut(),
-                    payload_len: payload_sz,
-                    node: None,
-                    iov: [
-                        libc::iovec {
-                            iov_base: std::ptr::null_mut(),
-                            iov_len: 0,
-                        },
-                        libc::iovec {
-                            iov_base: std::ptr::null_mut(),
-                            iov_len: 0,
-                        },
-                    ],
-                    last_opcode: 0,
-                };
-                ent.hdr_mut().ring_ent_in_out.payload_sz = payload_sz as u32;
-                ent
+                PayloadArena::from_kmbuf(Arc::clone(kq), wake_fd, Arc::clone(&wake_coalescer))?
             }
-        })
-        .collect();
+            None => PayloadArena::new(
+                depth,
+                payload_sz,
+                wake_fd,
+                Arc::clone(&wake_coalescer),
+                member_node,
+            )?,
+        };
+        // One lease state per ring ent (pool-level since MEM-1 — dest
+        // claims acquire against the same words) + the worker-local
+        // parked commit slots.
+        let lease_states: Vec<Arc<EntLeaseState>> = pool.queues[qid as usize].lease_states.clone();
+        debug_assert_eq!(lease_states.len(), depth, "lease states sized to depth");
+        let parked_msgs: Vec<Option<CommitMsg>> = (0..depth).map(|_| None).collect();
 
-    if kmbuf_q.is_none() {
-        for ent in &mut ents {
-            ent.iov[0] = libc::iovec {
-                iov_base: ent.header_ptr.cast(),
-                iov_len: std::mem::size_of::<FuseUringReqHeader>(),
-            };
-            ent.iov[1] = libc::iovec {
-                iov_base: ent.payload_ptr.cast(),
-                iov_len: ent.payload_len,
-            };
+        let mut ents: Vec<Ent> = (0..depth)
+            .map(|idx| match &kmbuf_q {
+                None => {
+                    let mut header = Box::new(FuseUringReqHeader::default());
+                    header.ring_ent_in_out.payload_sz = payload_sz as u32;
+                    let header_ptr = &mut *header as *mut FuseUringReqHeader;
+                    Ent {
+                        header_ptr,
+                        _owned_header: Some(header),
+                        payload_ptr: arena.buf(idx).expect("arena sized to depth"),
+                        payload_len: payload_sz,
+                        node: arena.node_of_buf(idx),
+                        iov: [
+                            libc::iovec {
+                                iov_base: std::ptr::null_mut(),
+                                iov_len: 0,
+                            },
+                            libc::iovec {
+                                iov_base: std::ptr::null_mut(),
+                                iov_len: 0,
+                            },
+                        ],
+                        last_opcode: 0,
+                    }
+                }
+                Some(kq) => {
+                    let mut ent = Ent {
+                        // Header slot inside the fixed headers region (fresh
+                        // anon mapping — zeroed).
+                        header_ptr: kq.header_ptr(idx).cast(),
+                        _owned_header: None,
+                        // No payload buffer until the first flagged delivery.
+                        payload_ptr: std::ptr::null_mut(),
+                        payload_len: payload_sz,
+                        node: None,
+                        iov: [
+                            libc::iovec {
+                                iov_base: std::ptr::null_mut(),
+                                iov_len: 0,
+                            },
+                            libc::iovec {
+                                iov_base: std::ptr::null_mut(),
+                                iov_len: 0,
+                            },
+                        ],
+                        last_opcode: 0,
+                    };
+                    ent.hdr_mut().ring_ent_in_out.payload_sz = payload_sz as u32;
+                    ent
+                }
+            })
+            .collect();
+
+        if kmbuf_q.is_none() {
+            for ent in &mut ents {
+                ent.iov[0] = libc::iovec {
+                    iov_base: ent.header_ptr.cast(),
+                    iov_len: std::mem::size_of::<FuseUringReqHeader>(),
+                };
+                ent.iov[1] = libc::iovec {
+                    iov_base: ent.payload_ptr.cast(),
+                    iov_len: ent.payload_len,
+                };
+            }
         }
+
+        *pool.queues[qid as usize].arena.lock().unwrap() = Some(arena.clone());
+        *pool.queues[qid as usize].kmbuf.lock().unwrap() = kmbuf_q.clone();
+        // MEM-1: publish the queue's dest-claim geometry (set exactly once
+        // — each qid belongs to exactly one group worker;
+        // `lease_dest_window` resolves claims by address containment
+        // against this window).
+        let _ = pool.queues[qid as usize].dest_window.set(DestWindow {
+            base: arena.base,
+            span: arena.span,
+            stride: arena.stride,
+            arena: Arc::clone(&arena),
+            kmbuf: kmbuf_q.clone(),
+        });
+
+        members.push(MemberState {
+            qid,
+            ents,
+            // FUSE-2: the queue's slot state machine — one state per ring
+            // ent, owned exclusively by THIS thread (see [`SlotState`]
+            // for the exactly-one-reply invariant it enforces).
+            slots: SlotTable::new(depth),
+            parked_msgs,
+            lease_states,
+            arena,
+            node: member_node,
+        });
     }
 
-    *pool.queues[qid as usize].arena.lock().unwrap() = Some(arena.clone());
-    *pool.queues[qid as usize].kmbuf.lock().unwrap() = kmbuf_q.clone();
-    // MEM-1: publish the queue's dest-claim geometry (set exactly once —
-    // workers run once per qid; `lease_dest_window` resolves claims by
-    // address containment against this window).
-    let _ = pool.queues[qid as usize].dest_window.set(DestWindow {
-        base: arena.base,
-        span: arena.span,
-        stride: arena.stride,
-        arena: Arc::clone(&arena),
-        kmbuf: kmbuf_q.clone(),
-    });
+    // Group-local ent id: `gent = member_slot × depth + ent_idx` — the
+    // reply-address word this ring's SQEs carry (round-trip pinned by
+    // `drain_group_tests::gent_user_data_round_trips`).
+    let gent_of = |mi: usize, ent: usize| mi * depth + ent;
+    let member_of_qid =
+        |q: u16| -> Option<usize> { (qids.contains(&q)).then(|| (q - qids.start) as usize) };
 
     // REGISTER shape per mode: classical = 2 iovecs (header + payload);
     // kmbuf = no iovecs, `init.flags = FUSE_URING_BUF_RING`,
-    // `sqe->buf_index = ent_idx` (the ent's fixed_buf_id).
+    // `sqe->buf_index = ent_idx` (the ent's fixed_buf_id — kmbuf groups
+    // are singletons, so gent == ent_idx there).
     let reg_init_flags: u16 = match pool.buffer_mode {
         TransportBufferMode::BufRing => kmbuf::init_flags(true, false),
         TransportBufferMode::UserEnts => 0,
@@ -3273,26 +3561,24 @@ fn queue_worker(
         }
     };
 
-    // FUSE-2: the queue's slot state machine — one state per ring ent,
-    // owned exclusively by THIS thread (see [`SlotState`] for the
-    // exactly-one-reply invariant it enforces).
-    let mut slots = SlotTable::new(depth);
-
-    for (idx, ent) in ents.iter().enumerate() {
-        push_cmd(
-            &mut ring,
-            FUSE_IO_URING_CMD_REGISTER,
-            qid,
-            0,
-            reg_iov(ent),
-            encode_user_data(RingOp::Register, idx),
-            reg_init_flags,
-            reg_buf_index(idx),
-        )
-        .map_err(|e| io::Error::other(format!("push REGISTER ent={idx}: {e}")))?;
-        slots.on_register_submitted(idx);
-        pool.stats_register.fetch_add(1, Ordering::Relaxed);
-        STATS_REGISTER.fetch_add(1, Ordering::Relaxed);
+    for (mi, m) in members.iter_mut().enumerate() {
+        for idx in 0..depth {
+            let iov = reg_iov(&m.ents[idx]);
+            push_cmd(
+                &mut ring,
+                FUSE_IO_URING_CMD_REGISTER,
+                m.qid,
+                0,
+                iov,
+                encode_user_data(RingOp::Register, gent_of(mi, idx)),
+                reg_init_flags,
+                reg_buf_index(idx),
+            )
+            .map_err(|e| io::Error::other(format!("push REGISTER qid={} ent={idx}: {e}", m.qid)))?;
+            m.slots.on_register_submitted(idx);
+            pool.stats_register.fetch_add(1, Ordering::Relaxed);
+            STATS_REGISTER.fetch_add(1, Ordering::Relaxed);
+        }
     }
     {
         let poll_e = opcode::PollAdd::new(types::Fixed(1), libc::POLLIN as _)
@@ -3319,7 +3605,7 @@ fn queue_worker(
     // a refusal arrives as a negative-result CQE, backs off, retires the ent
     // after `REGISTER_RETRY_MAX` (`transport_ents_retired`), and fails the
     // session when every ent has retired.
-    pool.queues_registered.fetch_add(1, Ordering::AcqRel);
+    pool.queues_registered.fetch_add(g as u64, Ordering::AcqRel);
 
     // §5.3 D3.a (S2) submit economy: the passes below PUSH their SQEs
     // (commits, poll re-arms, re-REGISTERs) through the batched helpers and
@@ -3355,44 +3641,51 @@ fn queue_worker(
         // evidence in the model docs).
         wake_coalescer.disarm();
 
-        // Drain commits for this queue only (no demux). §5.4 re-arm gate: a
-        // COMMIT_AND_FETCH both writes the reply into the ent payload and
-        // re-arms the registered buffers for the kernel — never legal while
-        // a payload lease is live. Gate every commit; park the message when
-        // leased and rely on the lease drop's eventfd wake.
+        // Drain commits for EVERY member queue of this group (lever 2:
+        // one pass drains the group's aggregate — the per-op wake+enter
+        // pair amortizes over it). §5.4 re-arm gate: a COMMIT_AND_FETCH
+        // both writes the reply into the ent payload and re-arms the
+        // registered buffers for the kernel — never legal while a payload
+        // lease is live. Gate every commit; park the message when leased
+        // and rely on the lease drop's eventfd wake.
         while let Ok(msg) = commit_rx.try_recv() {
             let idx = msg.ent_idx as usize;
-            if idx >= ents.len() {
-                warn!("fuse-over-uring qid={qid}: commit for bad ent {idx}");
+            let Some(mi) = member_of_qid(msg.qid).filter(|_| idx < depth) else {
+                warn!(
+                    "fuse-over-uring qids={qids:?}: commit for bad slot qid={} ent={idx}",
+                    msg.qid
+                );
                 TRANSPORT_REPLIES_REFUSED_STALE.fetch_add(1, Ordering::Relaxed);
                 continue;
-            }
+            };
+            let m = &mut members[mi];
+            let qid = m.qid;
             // FUSE-2 / FUSE-3e: the slot decides. A commit that does not
             // address the request this slot currently owes (double reply,
             // late reply, a reply for a displaced request) is refused
             // loud-never-fatally — never allowed to overwrite a live one,
             // and never turned into a second COMMIT_AND_FETCH.
-            if slots.admit_commit(idx, msg.commit_id) == CommitAdmit::RefuseStale {
+            if m.slots.admit_commit(idx, msg.commit_id) == CommitAdmit::RefuseStale {
                 warn!(
                     "fuse-over-uring qid={qid} ent={idx}: refusing a stale reply \
                      (cid={} state={:?}) — the slot does not owe it",
                     msg.commit_id,
-                    slots.state(idx)
+                    m.slots.state(idx)
                 );
                 continue;
             }
-            match lease_states[idx].try_commit() {
+            match m.lease_states[idx].try_commit() {
                 CommitGate::Ready => {
                     xport_dbg!("[XPORT] commit qid={qid} ent={idx} cid={}", msg.commit_id);
-                    apply_reply(&mut ents[idx], &msg.header, &msg.reply_body);
-                    batch.note_commit_opcode(ents[idx].last_opcode);
+                    apply_reply(&mut m.ents[idx], &msg.header, &msg.reply_body);
+                    batch.note_commit_opcode(m.ents[idx].last_opcode);
                     submit_commit(
                         &mut ring,
                         &mut batch,
-                        &mut slots,
+                        &mut m.slots,
                         pool.slot_watch_cell(qid, idx),
                         qid,
-                        idx,
+                        gent_of(mi, idx),
                         msg.commit_id,
                     )?;
                 }
@@ -3402,8 +3695,8 @@ fn queue_worker(
                         msg.commit_id
                     );
                     TRANSPORT_PARKED_COMMITS.fetch_add(1, Ordering::Relaxed);
-                    slots.on_commit_parked(idx);
-                    parked_msgs[idx] = Some(msg);
+                    m.slots.on_commit_parked(idx);
+                    m.parked_msgs[idx] = Some(msg);
                 }
             }
         }
@@ -3413,25 +3706,28 @@ fn queue_worker(
         // submit_and_wait): un-park and commit every ent whose lease is
         // gone. try_unpark re-proves refs == 0, so the payload write below
         // cannot alias a live lease.
-        for idx in 0..ents.len() {
-            if parked_msgs[idx].is_some() && lease_states[idx].try_unpark() {
-                let msg = parked_msgs[idx].take().expect("checked is_some");
-                xport_dbg!(
-                    "[XPORT] commit-unparked qid={qid} ent={idx} cid={}",
-                    msg.commit_id
-                );
-                TRANSPORT_UNPARKED_COMMITS.fetch_add(1, Ordering::Relaxed);
-                apply_reply(&mut ents[idx], &msg.header, &msg.reply_body);
-                batch.note_commit_opcode(ents[idx].last_opcode);
-                submit_commit(
-                    &mut ring,
-                    &mut batch,
-                    &mut slots,
-                    pool.slot_watch_cell(qid, idx),
-                    qid,
-                    idx,
-                    msg.commit_id,
-                )?;
+        for (mi, m) in members.iter_mut().enumerate() {
+            let qid = m.qid;
+            for idx in 0..depth {
+                if m.parked_msgs[idx].is_some() && m.lease_states[idx].try_unpark() {
+                    let msg = m.parked_msgs[idx].take().expect("checked is_some");
+                    xport_dbg!(
+                        "[XPORT] commit-unparked qid={qid} ent={idx} cid={}",
+                        msg.commit_id
+                    );
+                    TRANSPORT_UNPARKED_COMMITS.fetch_add(1, Ordering::Relaxed);
+                    apply_reply(&mut m.ents[idx], &msg.header, &msg.reply_body);
+                    batch.note_commit_opcode(m.ents[idx].last_opcode);
+                    submit_commit(
+                        &mut ring,
+                        &mut batch,
+                        &mut m.slots,
+                        pool.slot_watch_cell(qid, idx),
+                        qid,
+                        gent_of(mi, idx),
+                        msg.commit_id,
+                    )?;
+                }
             }
         }
 
@@ -3458,7 +3754,11 @@ fn queue_worker(
         // its retry waits for an unrelated CQE that may never arrive.
         // Bound the wait by the nearest retry deadline (and only then;
         // the steady-state path keeps today's plain `submit_and_wait`).
-        let wait_result = match slots.next_retry_deadline() {
+        let next_retry = members
+            .iter()
+            .filter_map(|m| m.slots.next_retry_deadline())
+            .min();
+        let wait_result = match next_retry {
             Some(deadline) => {
                 let left = deadline.saturating_duration_since(Instant::now());
                 let ts = types::Timespec::new()
@@ -3477,7 +3777,9 @@ fn queue_worker(
             Ok(_) => {}
             Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
             Err(e) if FuseOverUring::is_disconnect_errno(e.raw_os_error().unwrap_or(0)) => {
-                info!("fuse-over-uring qid={qid}: submit_and_wait disconnect ({e}); shutting down");
+                info!(
+                    "fuse-over-uring qids={qids:?}: submit_and_wait disconnect ({e}); shutting down"
+                );
                 pool.shutdown();
                 break;
             }
@@ -3500,31 +3802,36 @@ fn queue_worker(
             let dropped = cq_drops.observe(cq.overflow());
             if dropped > 0 {
                 error!(
-                    "fuse-over-uring qid={qid}: kernel DROPPED {dropped} completion(s)                      (CQ overflow, nodrop={}) — the ents they belonged to are stalled;                      transport_cq_overflows",
+                    "fuse-over-uring qids={qids:?}: kernel DROPPED {dropped} completion(s)                      (CQ overflow, nodrop={}) — the ents they belonged to are stalled;                      transport_cq_overflows",
                     cq_drops.nodrop()
                 );
             }
             cq.map(|c| (c.user_data(), c.result(), c.flags())).collect()
         };
 
-        let mut resubmit = Vec::new();
+        // Reclaim list — group-local ent ids (member recovered by
+        // `gent / depth` at the re-REGISTER pass).
+        let mut resubmit: Vec<usize> = Vec::new();
         let mut disconnect = false;
         for (user_data, res, cqe_flags) in completed {
             // FUSE-2 row 6: the op class rides `user_data`, so an errored
             // COMMIT is never mistaken for an errored REGISTER (which is
             // how an EAGAIN'd commit used to discard the reply
             // `apply_reply` had already written into the ent).
-            let Some((op, ent_idx)) = decode_user_data(user_data) else {
+            let Some((op, gent)) = decode_user_data(user_data) else {
                 // wake_fd poll completed — re-arm (or exit if inactive)
                 need_repoll_sticky = true;
                 continue;
             };
-            if ent_idx >= ents.len() {
-                warn!("fuse-over-uring qid={qid}: CQE for out-of-range ent {ent_idx}");
+            if gent >= members.len() * depth {
+                warn!("fuse-over-uring qids={qids:?}: CQE for out-of-range ent {gent}");
                 continue;
             }
+            let (mi, ent_idx) = (gent / depth, gent % depth);
+            let qid = members[mi].qid;
             if res < 0 {
                 let err = -res;
+                let m = &mut members[mi];
                 pool.stats_cqe_err.fetch_add(1, Ordering::Relaxed);
                 STATS_CQE_ERR.fetch_add(1, Ordering::Relaxed);
                 xport_dbg!("[XPORT] cqe-err qid={qid} ent={ent_idx} op={op:?} err={err}");
@@ -3549,7 +3856,7 @@ fn queue_worker(
                     // re-REGISTERing here would discard that reply and
                     // leave the caller waiting forever.
                     RingOp::Commit if err == libc::EAGAIN || err == libc::EINTR => {
-                        let commit_id = match slots.state(ent_idx) {
+                        let commit_id = match m.slots.state(ent_idx) {
                             SlotState::Replied { commit_id } => Some(commit_id),
                             _ => None,
                         };
@@ -3559,14 +3866,14 @@ fn queue_worker(
                                     "fuse-over-uring qid={qid} ent={ent_idx}: COMMIT err={err}; \
                                      re-committing cid={cid} (reply already applied)"
                                 );
-                                slots.on_commit_retry(ent_idx);
+                                m.slots.on_commit_retry(ent_idx);
                                 submit_commit(
                                     &mut ring,
                                     &mut batch,
-                                    &mut slots,
+                                    &mut m.slots,
                                     pool.slot_watch_cell(qid, ent_idx),
                                     qid,
-                                    ent_idx,
+                                    gent,
                                     cid,
                                 )?;
                             }
@@ -3574,9 +3881,9 @@ fn queue_worker(
                                 warn!(
                                     "fuse-over-uring qid={qid} ent={ent_idx}: COMMIT err={err} \
                                      with no reply in flight ({:?}); re-REGISTER",
-                                    slots.state(ent_idx)
+                                    m.slots.state(ent_idx)
                                 );
-                                resubmit.push(ent_idx);
+                                resubmit.push(gent);
                             }
                         }
                     }
@@ -3589,7 +3896,7 @@ fn queue_worker(
                             "fuse-over-uring qid={qid} ent={ent_idx}: COMMIT cqe err={err}; \
                              reclaim entry"
                         );
-                        resubmit.push(ent_idx);
+                        resubmit.push(gent);
                     }
                     // Row 5: a REGISTER error on a slot that still owes a
                     // reply must SYNTHESIZE that reply before the ent is
@@ -3601,26 +3908,26 @@ fn queue_worker(
                         if fail_ent(
                             &mut ring,
                             &mut batch,
-                            &mut slots,
-                            &mut ents[ent_idx],
-                            &lease_states[ent_idx],
+                            &mut m.slots,
+                            &mut m.ents[ent_idx],
+                            &m.lease_states[ent_idx],
                             pool.slot_watch_cell(qid, ent_idx),
                             qid,
-                            ent_idx,
+                            gent,
                             libc::EIO,
                         )? {
                             // A synthesized commit is now in flight for
                             // this ent; the kernel re-arms it.
                             continue;
                         }
-                        match slots.note_register_failure(ent_idx, Instant::now()) {
+                        match m.slots.note_register_failure(ent_idx, Instant::now()) {
                             RegisterAction::Retry { after } => {
                                 warn!(
                                     "fuse-over-uring qid={qid} ent={ent_idx}: REGISTER err={err}; \
                                      retry in {after:?}"
                                 );
                                 if after.is_zero() {
-                                    resubmit.push(ent_idx);
+                                    resubmit.push(gent);
                                 }
                                 // A nonzero backoff is served by the
                                 // backoff pass below (it also bounds the
@@ -3632,7 +3939,13 @@ fn queue_worker(
                                     "fuse-over-uring qid={qid} ent={ent_idx}: REGISTER failed \
                                      {REGISTER_RETRY_MAX}× (last err={err}); retiring the ent"
                                 );
-                                if slots.all_retired() {
+                                // Per MEMBER, not per group: the kernel
+                                // routes by task_cpu, so one fully-retired
+                                // member queue strands its CPU's requests
+                                // even while siblings stay healthy — the
+                                // session must fail exactly as the
+                                // per-queue worker did.
+                                if m.slots.all_retired() {
                                     error!(
                                         "fuse-over-uring qid={qid}: every ring ent retired — \
                                          the queue can no longer serve; failing the session"
@@ -3646,21 +3959,23 @@ fn queue_worker(
                 }
                 continue;
             }
+            let m = &mut members[mi];
             if op == RingOp::Register {
-                slots.note_register_success(ent_idx);
+                m.slots.note_register_success(ent_idx);
             }
             // kmbuf attachment law (2026-08-04): a flagged CQE re-points
             // the ent's payload buffer to the freshly-selected kernel
             // buffer; an unflagged one keeps the current attachment (the
             // kernel's reuse case). NUMA locality is re-derived per
-            // attachment (bid-indexed buffers).
+            // attachment (bid-indexed buffers). kmbuf groups are
+            // singletons, so gent == ent_idx on this arm.
             if let Some(kq) = &kmbuf_q {
                 match kq.note_delivery(ent_idx, cqe_flags) {
                     Some((p, len)) => {
-                        if ents[ent_idx].payload_ptr != p {
-                            ents[ent_idx].payload_ptr = p;
-                            ents[ent_idx].payload_len = len;
-                            ents[ent_idx].node = arena.node_of_ptr(p);
+                        if m.ents[ent_idx].payload_ptr != p {
+                            m.ents[ent_idx].payload_ptr = p;
+                            m.ents[ent_idx].payload_len = len;
+                            m.ents[ent_idx].node = m.arena.node_of_ptr(p);
                         }
                     }
                     None if cqe_flags & kmbuf::IORING_CQE_F_BUFFER != 0 => {
@@ -3677,8 +3992,9 @@ fn queue_worker(
                 }
             }
             // Kernel sets commit_id = unique when delivering a request.
-            let unique = u64::from_le_bytes(ents[ent_idx].hdr().in_out[8..16].try_into().unwrap());
-            let mut commit_id = ents[ent_idx].hdr().ring_ent_in_out.commit_id;
+            let unique =
+                u64::from_le_bytes(m.ents[ent_idx].hdr().in_out[8..16].try_into().unwrap());
+            let mut commit_id = m.ents[ent_idx].hdr().ring_ent_in_out.commit_id;
             if commit_id == 0 {
                 // Fall back to unique — some paths only fill in_out.
                 commit_id = unique;
@@ -3686,7 +4002,7 @@ fn queue_worker(
             if unique == 0 {
                 // Prefer COMMIT with commit_id if the kernel filled it — re-REGISTER
                 // alone leaves USERSPACE entries and permanent waiting/EBUSY umount.
-                let cid = ents[ent_idx].hdr().ring_ent_in_out.commit_id;
+                let cid = m.ents[ent_idx].hdr().ring_ent_in_out.commit_id;
                 if cid != 0 {
                     warn!(
                         "fuse-over-uring qid={qid} ent={ent_idx}: unique=0 commit_id={cid}; force EIO COMMIT"
@@ -3694,20 +4010,20 @@ fn queue_worker(
                     xport_dbg!("[XPORT] unique0-force-commit qid={qid} ent={ent_idx} cid={cid}");
                     // Delivery on this ent implies its previous commit passed
                     // the refs == 0 gate; header-only reply, payload untouched.
-                    debug_assert!(!lease_states[ent_idx].leased());
-                    slots.on_deliver_degenerate(ent_idx, cid);
+                    debug_assert!(!m.lease_states[ent_idx].leased());
+                    m.slots.on_deliver_degenerate(ent_idx, cid);
                     apply_reply(
-                        &mut ents[ent_idx],
+                        &mut m.ents[ent_idx],
                         &error_out_header(0, libc::EIO),
                         &Bytes::new(),
                     );
                     submit_commit(
                         &mut ring,
                         &mut batch,
-                        &mut slots,
+                        &mut m.slots,
                         pool.slot_watch_cell(qid, ent_idx),
                         qid,
-                        ent_idx,
+                        gent,
                         cid,
                     )?;
                 } else {
@@ -3715,14 +4031,14 @@ fn queue_worker(
                         "fuse-over-uring qid={qid} ent={ent_idx}: unique=0 commit_id=0; re-REGISTER"
                     );
                     xport_dbg!("[XPORT] unique0-re-register qid={qid} ent={ent_idx}");
-                    resubmit.push(ent_idx);
+                    resubmit.push(gent);
                 }
                 continue;
             }
-            let opcode = u32::from_le_bytes(ents[ent_idx].hdr().in_out[4..8].try_into().unwrap());
-            let payload_sz = ents[ent_idx].hdr().ring_ent_in_out.payload_sz as usize;
-            ents[ent_idx].last_opcode = opcode;
-            if payload_sz > 0 && !ents[ent_idx].has_payload_buf() {
+            let opcode = u32::from_le_bytes(m.ents[ent_idx].hdr().in_out[4..8].try_into().unwrap());
+            let payload_sz = m.ents[ent_idx].hdr().ring_ent_in_out.payload_sz as usize;
+            m.ents[ent_idx].last_opcode = opcode;
+            if payload_sz > 0 && !m.ents[ent_idx].has_payload_buf() {
                 // kmbuf: request payload announced but no buffer was ever
                 // attached — the attachment law is broken; serving a
                 // fabricated payload would corrupt data. Fail loud.
@@ -3734,9 +4050,9 @@ fn queue_worker(
             }
             let mut header_and_op =
                 Vec::with_capacity(FUSE_IN_HEADER_SIZE + FUSE_URING_OP_IN_OUT_SZ);
-            header_and_op.extend_from_slice(&ents[ent_idx].hdr().in_out[..FUSE_IN_HEADER_SIZE]);
-            header_and_op.extend_from_slice(&ents[ent_idx].hdr().op_in);
-            let capped_sz = payload_sz.min(ents[ent_idx].payload_len);
+            header_and_op.extend_from_slice(&m.ents[ent_idx].hdr().in_out[..FUSE_IN_HEADER_SIZE]);
+            header_and_op.extend_from_slice(&m.ents[ent_idx].hdr().op_in);
+            let capped_sz = payload_sz.min(m.ents[ent_idx].payload_len);
             // §5.4: FUSE_WRITE payloads ride a zero-copy lease over the
             // registered buffer (kills the 1 MiB copy + alloc per write
             // request, audit #1); the commit gate above defers the ent's
@@ -3746,7 +4062,7 @@ fn queue_worker(
             // already refilling — and non-write opcodes carry small payloads
             // (names, xattrs): both keep the copy.
             let payload = if opcode == FUSE_WRITE_OPCODE && capped_sz > 0 {
-                let state = Arc::clone(&lease_states[ent_idx]);
+                let state = Arc::clone(&m.lease_states[ent_idx]);
                 let prev = state.acquire();
                 debug_assert_eq!(prev, 0, "delivery on a still-leased ent");
                 TRANSPORT_PAYLOAD_LEASES.fetch_add(1, Ordering::Relaxed);
@@ -3756,16 +4072,16 @@ fn queue_worker(
                 // requester CPU) into the buffer's actual node
                 // (ent-static classically; per-attachment on kmbuf —
                 // `ents[..].node` tracks both).
-                numa_classify_pass(queue_node, ents[ent_idx].node, capped_sz);
+                numa_classify_pass(m.node, m.ents[ent_idx].node, capped_sz);
                 Bytes::from_owner(EntPayloadLease {
-                    arena: Arc::clone(&arena),
+                    arena: Arc::clone(&m.arena),
                     state,
-                    ptr: ents[ent_idx].payload_ptr as *const u8,
+                    ptr: m.ents[ent_idx].payload_ptr as *const u8,
                     len: capped_sz,
                     born: Instant::now(),
                 })
             } else {
-                Bytes::copy_from_slice(&ents[ent_idx].payload()[..capped_sz])
+                Bytes::copy_from_slice(&m.ents[ent_idx].payload()[..capped_sz])
             };
 
             // FUSE-2: the slot now owes exactly one commit. A delivery
@@ -3776,7 +4092,7 @@ fn queue_worker(
             // cannot be answered, and pretending otherwise (what
             // `pending.insert` did) hides a wedged caller.
             if let DeliverOutcome::DisplacedRequest { unique: lost } =
-                slots.on_deliver(ent_idx, unique, commit_id)
+                m.slots.on_deliver(ent_idx, unique, commit_id)
             {
                 error!(
                     "fuse-over-uring qid={qid} ent={ent_idx}: kernel delivered unique={unique} \
@@ -3827,19 +4143,19 @@ fn queue_worker(
                 // previous commit passed the refs == 0 gate: the immediate
                 // auto-commit below cannot alias a live lease. Its SQE rides
                 // the shared loop-bottom flush like every other commit.
-                debug_assert!(!lease_states[ent_idx].leased());
+                debug_assert!(!m.lease_states[ent_idx].leased());
                 apply_reply(
-                    &mut ents[ent_idx],
+                    &mut m.ents[ent_idx],
                     &error_out_header(unique, 0),
                     &Bytes::new(),
                 );
                 submit_commit(
                     &mut ring,
                     &mut batch,
-                    &mut slots,
+                    &mut m.slots,
                     pool.slot_watch_cell(qid, ent_idx),
                     qid,
-                    ent_idx,
+                    gent,
                     commit_id,
                 )?;
                 pool.stats_replies.fetch_add(1, Ordering::Relaxed);
@@ -3879,12 +4195,12 @@ fn queue_worker(
                 fail_ent(
                     &mut ring,
                     &mut batch,
-                    &mut slots,
-                    &mut ents[ent_idx],
-                    &lease_states[ent_idx],
+                    &mut m.slots,
+                    &mut m.ents[ent_idx],
+                    &m.lease_states[ent_idx],
                     pool.slot_watch_cell(qid, ent_idx),
                     qid,
-                    ent_idx,
+                    gent,
                     libc::EIO,
                 )?;
             }
@@ -3896,36 +4212,39 @@ fn queue_worker(
         if !pool.active.load(Ordering::Relaxed) {
             break;
         }
-        // FUSE-2 row 7: losing the wake-fd poll re-arm stops the queue
-        // waking on `commit_tx` ENTIRELY — every reply on this queue is
-        // then stranded until an unrelated CQE happens by. The flag is
-        // STICKY: a failed push is retried on the next pass instead of
-        // being swallowed by `let _ =`.
+        // FUSE-2 row 7: losing the wake-fd poll re-arm stops the group
+        // waking on `commit_tx` ENTIRELY — every reply on its member
+        // queues is then stranded until an unrelated CQE happens by. The
+        // flag is STICKY: a failed push is retried on the next pass
+        // instead of being swallowed by `let _ =`.
         if need_repoll_sticky {
             match push_poll_batched(&mut ring, &mut batch) {
                 Ok(()) => need_repoll_sticky = false,
                 Err(e) => warn!(
-                    "fuse-over-uring qid={qid}: wake-poll re-arm push failed ({e}); \
+                    "fuse-over-uring qids={qids:?}: wake-poll re-arm push failed ({e}); \
                      retrying next pass"
                 ),
             }
         }
         // Never re-REGISTER after a disconnect; only while still active.
         if !resubmit.is_empty() && pool.active.load(Ordering::Relaxed) {
-            for ent_idx in resubmit {
-                let iov = reg_iov(&ents[ent_idx]);
+            for gent in resubmit {
+                let (mi, ent_idx) = (gent / depth, gent % depth);
+                let m = &mut members[mi];
+                let qid = m.qid;
+                let iov = reg_iov(&m.ents[ent_idx]);
                 // Re-REGISTER is a non-reply exit: an ent that still owes
                 // a reply must be failed first (row 5) — `fail_ent` is a
                 // no-op for slots that owe nothing.
                 fail_ent(
                     &mut ring,
                     &mut batch,
-                    &mut slots,
-                    &mut ents[ent_idx],
-                    &lease_states[ent_idx],
+                    &mut m.slots,
+                    &mut m.ents[ent_idx],
+                    &m.lease_states[ent_idx],
                     pool.slot_watch_cell(qid, ent_idx),
                     qid,
-                    ent_idx,
+                    gent,
                     libc::EIO,
                 )?;
                 if let Err(e) = push_cmd_batched(
@@ -3935,36 +4254,39 @@ fn queue_worker(
                     qid,
                     0,
                     iov,
-                    encode_user_data(RingOp::Register, ent_idx),
+                    encode_user_data(RingOp::Register, gent),
                     reg_init_flags,
                     reg_buf_index(ent_idx),
                 ) {
                     warn!("fuse-over-uring qid={qid} ent={ent_idx}: re-REGISTER push failed ({e})");
                     continue;
                 }
-                slots.on_register_submitted(ent_idx);
+                m.slots.on_register_submitted(ent_idx);
             }
         }
         // FUSE-3a: serve any ent whose REGISTER backoff has expired. An
-        // idle queue gets no CQEs, so the loop wait above is bounded
+        // idle group gets no CQEs, so the loop wait above is bounded
         // while a backoff is outstanding (see `wait_budget`).
         let now = Instant::now();
-        for ent_idx in slots.register_retries_due(now) {
-            let iov = reg_iov(&ents[ent_idx]);
-            if push_cmd_batched(
-                &mut ring,
-                &mut batch,
-                FUSE_IO_URING_CMD_REGISTER,
-                qid,
-                0,
-                iov,
-                encode_user_data(RingOp::Register, ent_idx),
-                reg_init_flags,
-                reg_buf_index(ent_idx),
-            )
-            .is_ok()
-            {
-                slots.on_register_submitted(ent_idx);
+        for (mi, m) in members.iter_mut().enumerate() {
+            let qid = m.qid;
+            for ent_idx in m.slots.register_retries_due(now) {
+                let iov = reg_iov(&m.ents[ent_idx]);
+                if push_cmd_batched(
+                    &mut ring,
+                    &mut batch,
+                    FUSE_IO_URING_CMD_REGISTER,
+                    qid,
+                    0,
+                    iov,
+                    encode_user_data(RingOp::Register, gent_of(mi, ent_idx)),
+                    reg_init_flags,
+                    reg_buf_index(ent_idx),
+                )
+                .is_ok()
+                {
+                    m.slots.on_register_submitted(ent_idx);
+                }
             }
         }
     }
@@ -3983,53 +4305,65 @@ fn queue_worker(
     // message that PARKED can close its park here (a message pulled off
     // `commit_rx` was never parked, and the header-only fallback below is
     // the unresolved case by construction).
-    let mut final_msgs: Vec<(CommitMsg, bool)> = parked_msgs
+    let mut final_msgs: Vec<(CommitMsg, bool)> = members
         .iter_mut()
+        .flat_map(|m| m.parked_msgs.iter_mut())
         .filter_map(|s| s.take().map(|m| (m, true)))
         .collect();
     while let Ok(msg) = commit_rx.try_recv() {
         final_msgs.push((msg, false));
     }
     xport_dbg!(
-        "[XPORT] worker-exit qid={qid} final_msgs={} active={}",
+        "[XPORT] worker-exit qids={qids:?} final_msgs={} active={}",
         final_msgs.len(),
         pool.active.load(Ordering::Relaxed)
     );
     let mut final_commits = 0;
-    // FUSE-3j: ONE bounded, event-driven wait for the whole queue. Publish
+    // FUSE-3j: ONE bounded, event-driven wait for the whole GROUP. Publish
     // `parked` for every message whose ent is still leased (that is what
-    // makes the lease drop fire this queue's eventfd — a message pulled
+    // makes the lease drop fire this group's eventfd — a message pulled
     // straight off `commit_rx` was never parked), then wait for all of them
-    // together instead of sleep-polling each in series.
+    // together instead of sleep-polling each in series. The wait indexes a
+    // flattened gent-ordered view of every member's lease words.
+    let flat_leases: Vec<Arc<EntLeaseState>> = members
+        .iter()
+        .flat_map(|m| m.lease_states.iter().cloned())
+        .collect();
     let mut final_msgs: Vec<(CommitMsg, bool)> = final_msgs;
     let mut waiting: Vec<usize> = Vec::new();
     for (msg, _) in final_msgs.iter() {
         let idx = msg.ent_idx as usize;
-        if idx < ents.len() && lease_states[idx].try_commit() == CommitGate::Parked {
-            waiting.push(idx);
+        let Some(mi) = member_of_qid(msg.qid).filter(|_| idx < depth) else {
+            continue;
+        };
+        if members[mi].lease_states[idx].try_commit() == CommitGate::Parked {
+            waiting.push(gent_of(mi, idx));
         }
     }
     if !waiting.is_empty() {
         drain_await_leases(
             wake_fd,
             &wake_coalescer,
-            &lease_states,
+            &flat_leases,
             &mut waiting,
             DRAIN_LEASE_BUDGET,
         );
     }
     for (msg, was_parked) in final_msgs.drain(..) {
         let idx = msg.ent_idx as usize;
-        if idx >= ents.len() {
+        let Some(mi) = member_of_qid(msg.qid).filter(|_| idx < depth) else {
             continue;
-        }
+        };
+        let m = &mut members[mi];
+        let qid = m.qid;
+        let gent = gent_of(mi, idx);
         // Still in `waiting` ⇒ the budget expired with the lease live.
-        let free = !waiting.contains(&idx);
+        let free = !waiting.contains(&gent);
         if free {
             if was_parked {
                 TRANSPORT_UNPARKED_COMMITS.fetch_add(1, Ordering::Relaxed);
             }
-            apply_reply(&mut ents[idx], &msg.header, &msg.reply_body);
+            apply_reply(&mut m.ents[idx], &msg.header, &msg.reply_body);
         } else {
             warn!(
                 "fuse-over-uring qid={qid} ent={idx}: payload lease still live at \
@@ -4043,7 +4377,7 @@ fn queue_worker(
             // Header-only: apply_reply never touches the payload region when
             // the reply has no body beyond the 16-byte fuse_out_header.
             apply_reply(
-                &mut ents[idx],
+                &mut m.ents[idx],
                 &error_out_header(unique, libc::EIO),
                 &Bytes::new(),
             );
@@ -4051,10 +4385,10 @@ fn queue_worker(
         if submit_commit(
             &mut ring,
             &mut batch,
-            &mut slots,
+            &mut m.slots,
             pool.slot_watch_cell(qid, idx),
             qid,
-            idx,
+            gent,
             msg.commit_id,
         )
         .is_ok()
@@ -4069,36 +4403,39 @@ fn queue_worker(
     // map vanished, parking its caller in uninterruptible sleep with an
     // `umount` that returns EBUSY. The drain is the teardown half of the
     // exactly-one-reply invariant.
-    let owed: Vec<(usize, u64, u64)> = slots.owing().collect();
-    for (idx, unique, commit_id) in owed {
-        warn!(
-            "fuse-over-uring qid={qid} ent={idx}: unanswered request unique={unique} at \
-             teardown; synthesizing EIO (row 8)"
-        );
-        let _ = commit_id;
-        match fail_ent(
-            &mut ring,
-            &mut batch,
-            &mut slots,
-            &mut ents[idx],
-            &lease_states[idx],
-            pool.slot_watch_cell(qid, idx),
-            qid,
-            idx,
-            libc::EIO,
-        ) {
-            Ok(true) => final_commits += 1,
-            Ok(false) => {}
-            Err(e) => {
-                // The ring itself is gone: the request cannot be
-                // answered at all — the must-stay-0 tripwire's honest
-                // case.
-                error!(
-                    "fuse-over-uring qid={qid} ent={idx}: teardown commit push failed ({e}); \
-                     unique={unique} abandoned"
-                );
-                slots.abandon(idx);
-                pool.publish_slot_owed(qid, idx, 0);
+    for (mi, m) in members.iter_mut().enumerate() {
+        let qid = m.qid;
+        let owed: Vec<(usize, u64, u64)> = m.slots.owing().collect();
+        for (idx, unique, commit_id) in owed {
+            warn!(
+                "fuse-over-uring qid={qid} ent={idx}: unanswered request unique={unique} at \
+                 teardown; synthesizing EIO (row 8)"
+            );
+            let _ = commit_id;
+            match fail_ent(
+                &mut ring,
+                &mut batch,
+                &mut m.slots,
+                &mut m.ents[idx],
+                &m.lease_states[idx],
+                pool.slot_watch_cell(qid, idx),
+                qid,
+                gent_of(mi, idx),
+                libc::EIO,
+            ) {
+                Ok(true) => final_commits += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    // The ring itself is gone: the request cannot be
+                    // answered at all — the must-stay-0 tripwire's honest
+                    // case.
+                    error!(
+                        "fuse-over-uring qid={qid} ent={idx}: teardown commit push failed ({e}); \
+                         unique={unique} abandoned"
+                    );
+                    m.slots.abandon(idx);
+                    pool.publish_slot_owed(qid, idx, 0);
+                }
             }
         }
     }
@@ -4115,7 +4452,7 @@ fn queue_worker(
         // an EINTR'd submit) left in the SQ — a no-op enter when none.
         let _ = ring.submit();
     }
-    debug!("fuse-over-uring qid={qid} worker exit");
+    debug!("fuse-over-uring qids={qids:?} worker exit");
     Ok(())
 }
 
@@ -4142,9 +4479,15 @@ fn submit_commit(
     slots: &mut SlotTable,
     watch: Option<&SlotWatch>,
     qid: u16,
-    ent_idx: usize,
+    gent: usize,
     commit_id: u64,
 ) -> io::Result<()> {
+    // `gent` is the GROUP-local ent id (member_slot × depth + ent_idx —
+    // the SQE reply-address word); the member's slot table indexes by the
+    // queue-local ent, recovered here (`gent % depth` — the table holds
+    // exactly one member's `depth` slots) so no caller can pass the pair
+    // inconsistently.
+    let ent_idx = gent % slots.len();
     push_cmd_batched(
         ring,
         batch,
@@ -4152,7 +4495,7 @@ fn submit_commit(
         qid,
         commit_id,
         None,
-        encode_user_data(RingOp::Commit, ent_idx),
+        encode_user_data(RingOp::Commit, gent),
         0,
         0,
     )?;
@@ -4181,9 +4524,12 @@ fn fail_ent(
     lease: &EntLeaseState,
     watch: Option<&SlotWatch>,
     qid: u16,
-    ent_idx: usize,
+    gent: usize,
     errno: i32,
 ) -> io::Result<bool> {
+    // Queue-local slot index of the group-local ent id (see
+    // `submit_commit` — same recovery, same invariant).
+    let ent_idx = gent % slots.len();
     let FailOutcome::Synthesize { unique, commit_id } = slots.fail_ent(ent_idx) else {
         return Ok(false);
     };
@@ -4197,7 +4543,7 @@ fn fail_ent(
     );
     xport_dbg!("[XPORT] fail-ent qid={qid} ent={ent_idx} unique={unique} errno={errno}");
     apply_reply(ent, &error_out_header(unique, errno), &Bytes::new());
-    match submit_commit(ring, batch, slots, watch, qid, ent_idx, commit_id) {
+    match submit_commit(ring, batch, slots, watch, qid, gent, commit_id) {
         Ok(()) => Ok(true),
         Err(e) => {
             // The commit could not even be pushed: this request will
@@ -6307,5 +6653,168 @@ mod drain_wait_tests {
             t0.elapsed() < Duration::from_millis(100),
             "an unleased queue must not wait at all"
         );
+    }
+}
+
+/// Ingress-queue-spread lever 2 (2026-08-05 evidence note): the drain-group
+/// plan — one drain context (thread + ring + eventfd + coalescer) per
+/// NUMA-node-contiguous GROUP of FUSE queues, so a spread of shallow
+/// submitters (32 queues at ~8-deep — the measured anti-scaling shape)
+/// aggregates into per-context batches instead of 32 wake-per-few-ops
+/// contexts. The plan is pure and topology-injectable (the numa_core test
+/// convention) so every law here is checkable without a mount.
+#[cfg(test)]
+mod drain_group_tests {
+    use super::*;
+
+    /// Two-node 32-CPU box (the field shape): width = the measured
+    /// batching constant (8 — the counted local bracket's optimum, see
+    /// [`DRAIN_GROUP_WIDTH`]), two contexts per 16-queue node, groups
+    /// never spanning a node (member arenas stay node-local to their
+    /// drain thread).
+    #[test]
+    fn default_width_is_the_measured_batching_constant_node_split() {
+        let node_of = |cpu: usize| Some(cpu / 16); // 2 nodes × 16
+        let plan = drain_group_plan(32, TransportBufferMode::UserEnts, true, node_of, None);
+        assert_eq!(
+            plan,
+            vec![0u16..8, 8..16, 16..24, 24..32],
+            "width = min(DRAIN_GROUP_WIDTH, node span): 4 contexts on 2×16"
+        );
+    }
+
+    /// The width is a MEASURED constant, never the whole node: the counted
+    /// bracket showed one context per node collapsing on the single-thread
+    /// drain ceiling (width-32 −15 % IOPS at every point vs widths 1–8 on
+    /// the clean venue), so wider nodes get MORE contexts, not wider
+    /// groups.
+    #[test]
+    fn width_never_exceeds_the_measured_constant() {
+        let node_of = |_cpu: usize| Some(0);
+        let plan = drain_group_plan(64, TransportBufferMode::UserEnts, true, node_of, None);
+        assert_eq!(plan.len(), 64 / DRAIN_GROUP_WIDTH);
+        assert!(plan.iter().all(|g| g.len() == DRAIN_GROUP_WIDTH));
+    }
+
+    /// kmbuf sessions keep today's one-context-per-queue posture
+    /// byte-identical: the bufring/fixed-headers registration is per-ring
+    /// per-queue in the sqz kernel surface, so grouping under BufRing is
+    /// the named follow-on, never a silent behavior fork.
+    #[test]
+    fn bufring_mode_keeps_singleton_groups() {
+        let node_of = |_cpu: usize| Some(0);
+        let plan = drain_group_plan(4, TransportBufferMode::BufRing, true, node_of, None);
+        assert_eq!(plan, vec![0u16..1, 1..2, 2..3, 3..4]);
+    }
+
+    /// `SQUEEZEFS_FUSE_DRAIN_GROUP` explicit width wins verbatim (the
+    /// ipc-cap explicit-wins pattern) — still node-split, because node
+    /// containment is a structural property (arena locality), not tuning.
+    #[test]
+    fn explicit_width_wins_verbatim_but_never_spans_a_node() {
+        let node_of = |cpu: usize| Some(cpu / 4); // nodes of 4
+        let plan = drain_group_plan(8, TransportBufferMode::UserEnts, true, node_of, Some(3));
+        assert_eq!(
+            plan,
+            vec![0u16..3, 3..4, 4..7, 7..8],
+            "width 3 chunks inside each 4-wide node"
+        );
+    }
+
+    /// Testing queue overrides (`qid_is_cpu == false`) have no qid↔CPU
+    /// correspondence, so no node info exists: contiguous slices of the
+    /// derived width, exactly like the per-queue NUMA placement law
+    /// (no correspondence ⇒ no per-queue node derivation).
+    #[test]
+    fn no_cpu_correspondence_falls_back_to_flat_chunks() {
+        let node_of = |_cpu: usize| -> Option<usize> {
+            panic!("node lookup must not be consulted without qid↔cpu correspondence")
+        };
+        let plan = drain_group_plan(5, TransportBufferMode::UserEnts, false, node_of, None);
+        assert_eq!(plan, vec![0u16..5]);
+    }
+
+    /// Offline-CPU holes are node-AGNOSTIC, never run breakers: queues =
+    /// kernel POSSIBLE CPUs, but sysfs node cpulists carry only ONLINE
+    /// ones, so a box with offline/isolated CPUs hands back `None` holes
+    /// all through the qid range (the dev box: 25 online of 32 possible ⇒
+    /// 15 fragments instead of 4 groups). A hole's queue is dormant
+    /// (task_cpu never names an offline CPU), so it joins the current run
+    /// free of locality cost. (Explicit width 32 isolates the node law
+    /// from the width constant.)
+    #[test]
+    fn offline_cpu_holes_join_the_run_instead_of_fragmenting_it() {
+        // The dev-box shape: one node, holes at 4, 6, 14, 16, 22, 24, 30.
+        let node_of = |cpu: usize| match cpu {
+            4 | 6 | 14 | 16 | 22 | 24 | 30 => None,
+            _ => Some(0),
+        };
+        let plan = drain_group_plan(32, TransportBufferMode::UserEnts, true, node_of, Some(32));
+        assert_eq!(
+            plan,
+            vec![0u16..32],
+            "unknown-node holes must not fragment a single-node box"
+        );
+        // Holes at a node BOUNDARY still never merge two known nodes: the
+        // holes attach to the run they follow, and the next KNOWN node
+        // starts its own group.
+        let node_of = |cpu: usize| match cpu {
+            15 | 16 => None,
+            c => Some(c / 16),
+        };
+        let plan = drain_group_plan(32, TransportBufferMode::UserEnts, true, node_of, Some(32));
+        assert_eq!(
+            plan,
+            vec![0u16..17, 17..32],
+            "a hole may extend a run, but two known nodes never share a group"
+        );
+    }
+
+    /// Coverage + ordering law: every qid appears exactly once, in
+    /// ascending order, whatever the topology hands back (including
+    /// unknown-node holes) — the group worker's per-queue FIFO servicing
+    /// order rides this.
+    #[test]
+    fn plan_covers_every_qid_exactly_once_in_order() {
+        // Pathological map: alternating nodes + an unknown-node hole.
+        let node_of = |cpu: usize| match cpu {
+            7 => None,
+            c => Some(c % 3),
+        };
+        let plan = drain_group_plan(17, TransportBufferMode::UserEnts, true, node_of, None);
+        let mut seen: Vec<u16> = Vec::new();
+        for g in &plan {
+            assert!(!g.is_empty(), "no empty groups");
+            seen.extend(g.clone());
+        }
+        assert_eq!(seen, (0u16..17).collect::<Vec<_>>());
+    }
+
+    /// The group-local ent id (`gent = member_slot × depth + ent_idx`)
+    /// round-trips through the SQE user_data words — the reply-address
+    /// law the merged ring rides.
+    #[test]
+    fn gent_user_data_round_trips() {
+        let depth = Q_DEPTH_DESIRED;
+        for member in [0usize, 1, 15, 31] {
+            for ent in [0usize, 1, depth - 1] {
+                let gent = member * depth + ent;
+                for op in [RingOp::Register, RingOp::Commit] {
+                    let ud = encode_user_data(op, gent);
+                    assert_eq!(decode_user_data(ud), Some((op, gent)));
+                }
+            }
+        }
+    }
+
+    /// Engagement gauge: the published group stats reflect the armed plan
+    /// (groups, max width) — the field row's instrument.
+    #[test]
+    fn drain_group_stats_reflect_the_plan() {
+        let node_of = |_cpu: usize| Some(0);
+        let plan = drain_group_plan(8, TransportBufferMode::UserEnts, true, node_of, Some(4));
+        publish_drain_group_plan(&plan);
+        let (groups, width_max) = drain_group_stats();
+        assert_eq!((groups, width_max), (2, 4));
     }
 }

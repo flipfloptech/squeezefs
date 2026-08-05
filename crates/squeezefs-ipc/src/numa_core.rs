@@ -417,10 +417,23 @@ pub fn placement_applies(t: &NumaTopology, env_enabled: bool) -> bool {
     env_enabled && !t.is_single()
 }
 
-/// Locality-first owner pick: among `owner_nodes` (index → node), choose
-/// the owner minimizing `(distance(session_node, owner_node), load,
+/// Balance-first owner pick: among `owner_nodes` (index → node), choose
+/// the owner minimizing `(load, distance(session_node, owner_node),
 /// index)`. On a single-node map every distance ties, so this IS the
-/// pre-campaign `(load, index)` pick — the structural-no-op contract.
+/// `(load, index)` pick — the structural-no-op contract.
+///
+/// Ordering law (530k-ceiling campaign, 2026-08-05): LOAD dominates,
+/// distance is the tiebreak. The prior `(distance, load, index)` order
+/// let locality confine a fork-clustered process fleet (32 fio pids
+/// whose HELLO-instant CPUs all inferred one node of the 2×16 field
+/// box) to that node's owner subset — 4 of 8 service-thread lanes,
+/// 4-5 live `ipc_direct_shards`, the ~530k rand-4k il service ceiling
+/// with clat doubling per qd step while half the derived drain width
+/// sat dark. Balance across the width is the structural property;
+/// locality costs nothing at equal load (an idle box still gets the
+/// nearest owner), and daemon-side node locality is preserved either
+/// way because the session arena binds to the CHOSEN owner's node
+/// (memory follows thread — `IpcHost::handle_hello_msg`).
 pub fn pick_owner(
     t: &NumaTopology,
     session_node: usize,
@@ -436,7 +449,7 @@ pub fn pick_owner(
             } else {
                 u32::MAX
             };
-            (d, loads[i], i)
+            (loads[i], d, i)
         })
         .unwrap_or(0)
 }

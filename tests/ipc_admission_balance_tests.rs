@@ -29,7 +29,9 @@
 //! env-lever + global-METRICS pattern `ipc_host_tests.rs` already uses).
 
 use squeezefs::fuse_client::METRICS;
-use squeezefs::ipc_host::{abstract_connect, recv_ctl, send_ctl, EchoSessionSink, IpcHost, IpcHostConfig};
+use squeezefs::ipc_host::{
+    abstract_connect, recv_ctl, send_ctl, EchoSessionSink, IpcHost, IpcHostConfig,
+};
 use squeezefs_ipc::layout::Geometry;
 use squeezefs_ipc::wire::{CtlMsg, NONCE_LEN};
 
@@ -70,6 +72,11 @@ fn test_config(name: &str) -> IpcHostConfig {
     }
 }
 
+fn fstat_dev(path: &std::path::Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).expect("metadata").dev()
+}
+
 fn open_cred_fd(dir: &std::path::Path) -> OwnedFd {
     let path = dir.join("cred_file");
     if !path.exists() {
@@ -79,7 +86,11 @@ fn open_cred_fd(dir: &std::path::Path) -> OwnedFd {
     let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
     // SAFETY: plain open(2); ownership taken immediately.
     let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) };
-    assert!(fd >= 0, "open cred file: {}", std::io::Error::last_os_error());
+    assert!(
+        fd >= 0,
+        "open cred file: {}",
+        std::io::Error::last_os_error()
+    );
     // SAFETY: fresh owned fd.
     unsafe { OwnedFd::from_raw_fd(fd) }
 }
@@ -146,6 +157,7 @@ fn sequential_fleet_admission_balances_exactly() {
         let host = IpcHost::spawn(cfg.clone(), Arc::new(EchoSessionSink)).expect("host");
         let dir = tempfile::tempdir().expect("tempdir");
         let fd = open_cred_fd(dir.path());
+        host.set_expected_st_dev(fstat_dev(&dir.path().join("cred_file")));
         let mut socks = Vec::new();
         for _ in 0..8 {
             socks.push(establish(&cfg, &host, fd.as_raw_fd()));
@@ -176,6 +188,8 @@ fn concurrent_fleet_admission_balances_exactly() {
         let cfg = test_config("conc");
         let host = IpcHost::spawn(cfg.clone(), Arc::new(EchoSessionSink)).expect("host");
         let dir = tempfile::tempdir().expect("tempdir");
+        drop(open_cred_fd(dir.path())); // seed the file once
+        host.set_expected_st_dev(fstat_dev(&dir.path().join("cred_file")));
         let barrier = Arc::new(std::sync::Barrier::new(16));
         let socks: Vec<UnixStream> = std::thread::scope(|s| {
             let handles: Vec<_> = (0..16)
@@ -217,7 +231,10 @@ fn teardown_releases_the_owner_ledger() {
         let host = IpcHost::spawn(cfg.clone(), Arc::new(EchoSessionSink)).expect("host");
         let dir = tempfile::tempdir().expect("tempdir");
         let fd = open_cred_fd(dir.path());
-        let socks: Vec<UnixStream> = (0..3).map(|_| establish(&cfg, &host, fd.as_raw_fd())).collect();
+        host.set_expected_st_dev(fstat_dev(&dir.path().join("cred_file")));
+        let socks: Vec<UnixStream> = (0..3)
+            .map(|_| establish(&cfg, &host, fd.as_raw_fd()))
+            .collect();
         assert_eq!(host.session_owner_spread().iter().sum::<usize>(), 3);
         drop(socks); // ctl EOF ⇒ teardown_session per session
         wait_sessions_active(0, "socket-drop teardown");

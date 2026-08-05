@@ -1118,19 +1118,26 @@ pub struct IpcHost {
     uid_sessions: Mutex<HashMap<u32, usize>>,
     next_session_id: AtomicU64,
     next_binding_id: AtomicU64,
-    /// Service-thread CEILING (§5.5.1) — sessions are assigned an owner
-    /// index in `0..service_threads` at admission, forever. Threads
-    /// spawn on demand as owners first receive a session
-    /// ([`Self::ensure_service_threads`], ingest-economy 2026-07-28) —
-    /// a session-less host (every default mount's control-plane-only
-    /// posture) owns ZERO service threads.
-    service_threads: usize,
     /// Owner index → dense NUMA node (NUMA-affinity campaign 2026-07-31):
     /// the `numa_core::owner_nodes` CPU-weighted interleaved partition,
     /// computed once at spawn. Single-node maps produce all-zeros and the
     /// partition is inert (pins refuse, picks reduce to load-then-index —
     /// the structural no-op law).
     owner_nodes: Vec<usize>,
+    /// Owner index → live-session count — THE admission balance ledger
+    /// (530k-ceiling campaign, 2026-08-05), sized to the service-thread
+    /// CEILING (§5.5.1): sessions are assigned an owner index in
+    /// `0..len` at admission, forever; threads spawn on demand as owners
+    /// first receive a session ([`Self::ensure_service_threads`],
+    /// ingest-economy 2026-07-28) — a session-less host owns ZERO
+    /// service threads. The pick and its accounting are one atomic act
+    /// under this mutex (reserve at pick, release at teardown/refusal):
+    /// the retired registry-scan count read owners that concurrent
+    /// fleet-launch admissions had not yet inserted, so balance was
+    /// schedule-dependent — 32 simultaneous HELLOs could convoy onto
+    /// low indices. Also feeds the `ipc_session_owners` gauge (owners
+    /// with ≥1 session — `ipc_direct_shards`' admission-time face).
+    owner_loads: Mutex<Vec<usize>>,
     /// Spawned service threads (dense: owners fill lowest-first, so
     /// spawned == the highest owner ever assigned + 1). Monotonic within
     /// a host's lifetime — a thread that has served stays (its empty
@@ -1317,8 +1324,8 @@ impl IpcHost {
             uid_sessions: Mutex::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
             next_binding_id: AtomicU64::new(1),
-            service_threads,
             owner_nodes: crate::numa_core::topology().owner_nodes(service_threads),
+            owner_loads: Mutex::new(vec![0; service_threads]),
             svc_spawned: std::sync::atomic::AtomicUsize::new(0),
             started: Instant::now(),
             spin_window: service_spin_window(),
@@ -2113,65 +2120,59 @@ impl IpcHost {
                 .count();
             crate::numa_core::topology().rotate_exec_from(base, siblings)
         });
-        // Establish: sealed memfd + mapping + registry entry.
-        let (memfd, map) = match create_session_shm(
-            &self.cfg.geometry,
-            layout,
-            Arc::clone(&self.severed_pool),
-            session_node,
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                log::error!("ipc host: session shm creation failed: {e}");
-                return refuse(RefuseClass::Internal);
-            }
-        };
-        // §5.5.1 pinning: admit to the lightest service thread (live
-        // sessions never rebalance — natural churn is the only mover).
-        // Ties resolve to the LOWEST index, so owners fill densely —
-        // the invariant `ensure_service_threads` relies on. With an
-        // active multi-node placement the pick is locality-FIRST
-        // (distance, then load, then index — `numa_core::pick_owner`);
-        // on single-node maps / `SQUEEZEFS_NUMA=0` that reduces to
-        // exactly the load-then-index pick below (structural no-op),
-        // and the ARENA's actual node (not the inference) is the key —
-        // the service thread must sit where the memory is.
-        let owner = {
-            let sessions = self
-                .sessions
-                .lock()
-                .expect("session registry mutex never poisons");
-            let mut counts = vec![0usize; self.service_threads];
-            for s in sessions.values() {
-                counts[s.owner] += 1;
-            }
-            let placement_node = if crate::numa_core::placement_active() {
-                map.arena_node.or(session_node)
-            } else {
-                None
-            };
-            match placement_node {
-                Some(n) => crate::numa_core::pick_owner(
-                    crate::numa_core::topology(),
-                    n,
-                    &self.owner_nodes,
-                    &counts,
-                ),
-                None => counts
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, n)| **n)
-                    .map(|(i, _)| i)
-                    .unwrap_or(0),
-            }
-        };
+        // §5.5.1 pinning: admit BALANCE-FIRST (530k-ceiling campaign,
+        // 2026-08-05 — live sessions never rebalance; natural churn is
+        // the only mover). The pick minimizes (load, distance, index):
+        // load dominates so a process fleet engages the FULL derived
+        // width — the retired locality-first order confined a fork-
+        // clustered fleet inference to ONE node's owner subset (4 of 8
+        // lanes on the 2×16 field box, the ~530k rand-4k il ceiling) —
+        // while the inference node breaks ties so an idle box still
+        // admits local (`numa_core::pick_owner`; single-node maps /
+        // `SQUEEZEFS_NUMA=0` reduce to load-then-index, ties to the
+        // LOWEST index so owners fill densely — the invariant
+        // `ensure_service_threads` relies on). The pick and its
+        // accounting are ONE atomic act on the owner-load ledger
+        // (reserve here, release at teardown/refusal): the retired
+        // registry-scan count raced concurrent fleet-launch HELLOs'
+        // not-yet-inserted sessions, making balance schedule-dependent.
+        let owner = self.reserve_owner(if crate::numa_core::placement_active() {
+            session_node
+        } else {
+            None
+        });
         // Spawn-on-bind (ingest-economy 2026-07-28): the owner's thread
         // must exist before the session publishes — a session pinned to
         // a never-spawned owner would strand its ops forever.
         if let Err(e) = self.ensure_service_threads(owner) {
             log::error!("ipc host: service thread spawn failed: {e}");
+            self.release_owner(owner);
             return refuse(RefuseClass::Internal);
         }
+        // Establish: sealed memfd + mapping + registry entry. The arena
+        // bind hint is the CHOSEN owner's partition node — memory
+        // follows thread, so the service thread sits where the memory
+        // is BY CONSTRUCTION whichever owner balance picked (gating
+        // inside `bind_session_arena` keeps single-node /
+        // `SQUEEZEFS_NUMA=0` mounts untouched).
+        let arena_node_hint = if crate::numa_core::placement_active() {
+            self.owner_nodes.get(owner).copied()
+        } else {
+            None
+        };
+        let (memfd, map) = match create_session_shm(
+            &self.cfg.geometry,
+            layout,
+            Arc::clone(&self.severed_pool),
+            arena_node_hint,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!("ipc host: session shm creation failed: {e}");
+                self.release_owner(owner);
+                return refuse(RefuseClass::Internal);
+            }
+        };
         let session = Arc::new(IpcSession {
             id: self.next_session_id.fetch_add(1, Ordering::Relaxed),
             uid: cred.uid,
@@ -2334,6 +2335,9 @@ impl IpcHost {
             .ipc_arena_bytes
             .fetch_sub(session.charged_bytes, Ordering::Relaxed);
         METRICS.ipc_sessions_active.fetch_sub(1, Ordering::Relaxed);
+        // Owner ledger closure: the torn_down swap above makes this
+        // exactly-once per session (530k-ceiling campaign).
+        self.release_owner(session.owner);
         // The mapping unmaps when the last accessor's Arc drops (§5.3.1
         // rule 4 — structural, not by convention).
     }
@@ -2536,6 +2540,67 @@ impl IpcHost {
     /// handle take: a spawn that wins the mutex before the take lands
     /// its handle in the joined vec; one that loses observes
     /// `shutting_down` and refuses — no leaked thread either way).
+    /// Pick + reserve the session's owner in ONE atomic act (530k-ceiling
+    /// campaign, 2026-08-05): balance-first `(load, distance, index)` via
+    /// `numa_core::pick_owner` when a placement node is supplied, plain
+    /// load-then-index otherwise. The increment happens under the same
+    /// lock as the read, so concurrent fleet-launch admissions can never
+    /// convoy onto stale counts (the retired registry-scan count raced
+    /// its own insert). Pairs with [`Self::release_owner`].
+    fn reserve_owner(&self, placement_node: Option<usize>) -> usize {
+        let mut loads = self
+            .owner_loads
+            .lock()
+            .expect("owner ledger mutex never poisons");
+        let owner = match placement_node {
+            Some(n) => crate::numa_core::pick_owner(
+                crate::numa_core::topology(),
+                n,
+                &self.owner_nodes,
+                &loads,
+            ),
+            None => loads
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, n)| **n)
+                .map(|(i, _)| i)
+                .unwrap_or(0),
+        };
+        loads[owner] += 1;
+        METRICS.ipc_session_owners.store(
+            loads.iter().filter(|&&n| n > 0).count() as u64,
+            Ordering::Relaxed,
+        );
+        owner
+    }
+
+    /// Release one owner reservation (teardown, or a refusal after the
+    /// pick). A leaked reservation would bias every later pick toward
+    /// the other owners — the ledger's closure is what the
+    /// `teardown_releases_the_owner_ledger` contract pins.
+    fn release_owner(&self, owner: usize) {
+        let mut loads = self
+            .owner_loads
+            .lock()
+            .expect("owner ledger mutex never poisons");
+        if let Some(n) = loads.get_mut(owner) {
+            *n = n.saturating_sub(1);
+        }
+        METRICS.ipc_session_owners.store(
+            loads.iter().filter(|&&n| n > 0).count() as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Live sessions per owner index — the admission-balance observable
+    /// (`tests/ipc_admission_balance_tests.rs`).
+    pub fn session_owner_spread(&self) -> Vec<usize> {
+        self.owner_loads
+            .lock()
+            .expect("owner ledger mutex never poisons")
+            .clone()
+    }
+
     fn ensure_service_threads(self: &Arc<Self>, owner: usize) -> io::Result<()> {
         if owner < self.svc_spawned.load(Ordering::Acquire) {
             return Ok(());

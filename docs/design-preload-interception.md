@@ -493,6 +493,7 @@ New families on `.stats` (`generate_stats_json`, `src/fuse_client.rs`), followin
 | `ipc_ring_full_stalls` / `ipc_slot_wait_parks` | backpressure; parks/op ≈ 0 at saturation or the spin window is mis-sized |
 | `ipc_wake_writes` / `ipc_wakes_elided` (both directions) | the L3 counter-true wake economy, same law: writes/(writes+elided) ≈ 1 under saturation = coalescer regression |
 | `ipc_service_{polls_hot,parks}` / `ipc_service_threads` | service duty cycle (`ipc_service_threads` = SPAWNED threads — spawn-on-bind, Rev 13; 0 on session-less hosts) |
+| `ipc_session_owners` | 530k-ceiling campaign (2026-08-05): owners with ≥1 LIVE session — the admission-time face of `ipc_direct_shards`. Admission is balance-first `(load, distance, index)` on an atomic owner-load ledger (reserve at pick, release at teardown), the arena binds to the CHOSEN owner's node; a saturated process fleet must read the full derived width here — stuck below it under load is the field's lane-concentration signature (4-5 of 8 = the ~530k rand-4k il service ceiling, clat doubling per qd step) |
 | `ipc_severed_pool_{hits,misses,bytes}` | Rev 13 severed-write buffer pool: reuse health (steady miss growth on a streaming write = the per-op slab-alloc fault engine is back) + retained-bytes gauge (worst case = the session-shm cap) |
 | `ipc_arena_bytes` (mem-budget component gauge) / `ipc_admission_refusals` | R5 integration |
 | `ipc_inval_notifies` | §5.6.2 coherence handoffs (rate-limited — unbounded growth = limiter broken) |

@@ -4887,6 +4887,13 @@ pub struct Metrics {
     /// 2026-07-28 — 0 on a session-less host; ceiling =
     /// `SQUEEZEFS_IPC_SERVICE_THREADS` / the shared sizing derivation).
     pub ipc_service_threads: Align64<AtomicU64>,
+    /// Gauge: service-thread owners with ≥1 LIVE session — the
+    /// admission-time face of `ipc_direct_shards` (530k-ceiling
+    /// campaign, 2026-08-05). A saturated process fleet must read the
+    /// full derived width here; a value stuck below it under load is
+    /// the lane-concentration field signature (4-5 of 8 = the ~530k
+    /// rand-4k il service ceiling).
+    pub ipc_session_owners: Align64<AtomicU64>,
     /// Severed-write buffer pool (ingest-economy 2026-07-28): ring-write
     /// severs served from a recycled buffer (`hits`) vs fresh slab-sized
     /// allocations (`misses` — bounded by warmup + in-flight peaks;
@@ -7692,6 +7699,7 @@ impl SqueezefsFilesystem {
                 "ipc_hold_probe_serves": METRICS.ipc_hold_probe_serves.load(Ordering::Relaxed),
                 "ipc_hold_probe_misses": METRICS.ipc_hold_probe_misses.load(Ordering::Relaxed),
                 "ipc_service_threads": METRICS.ipc_service_threads.load(Ordering::Relaxed),
+                "ipc_session_owners": METRICS.ipc_session_owners.load(Ordering::Relaxed),
                 "ipc_service_parks": METRICS.ipc_service_parks.load(Ordering::Relaxed),
                 "ipc_arena_prep_queued": METRICS.ipc_arena_prep_queued.load(Ordering::Relaxed),
                 "ipc_arena_prep_done": METRICS.ipc_arena_prep_done.load(Ordering::Relaxed),

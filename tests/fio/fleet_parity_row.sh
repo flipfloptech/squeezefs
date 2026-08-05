@@ -10,7 +10,10 @@
 # usage: fleet_parity_row.sh --mount <mnt> [--njobs 256] [--size 512m]
 #        [--shim /scratch/tmp/libsqueezefs_il.so] [--out DIR]
 set -u
-MNT="" NJOBS=256 SIZE="512m" SHIM="/scratch/tmp/libsqueezefs_il.so"
+# SIZE default 256m: 3 write fleets + the read prefill must fit the
+# store WITH reclaim headroom (512m hit ENOSPC at fleet 3, varying
+# user bytes across rows -- an invalid comparison).
+MNT="" NJOBS=256 SIZE="256m" SHIM="/scratch/tmp/libsqueezefs_il.so"
 OUT="/tmp/fleet_parity_$(date +%Y%m%d_%H%M%S)"
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -94,8 +97,11 @@ raw = open(f"{p}.fio.json", "rb").read()
 fio = json.loads(raw[raw.find(b"{"):])
 key = "read" if rw == "read" else "write"
 r = [j[key] for j in fio["jobs"]]
-bw = sum(x["bw_bytes"] for x in r) / 1e9
 user = sum(x["io_bytes"] for x in r)
+# Durable law: fio bw_bytes excludes the end_fsync stall. The honest
+# durable rate is user bytes / max job elapsed (submit -> fsync done).
+wall_ms = max((j.get("job_runtime") or j.get("elapsed", 0) * 1000) for j in fio["jobs"])
+bw = user / (wall_ms / 1000) / 1e9 if wall_ms else 0.0
 def m(f):
     d = json.load(open(f)); return d.get("metrics", d)
 b, a = m(f"{p}.before.json"), m(f"{p}.after.json")

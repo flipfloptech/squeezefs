@@ -205,7 +205,12 @@ pub struct LaneSession {
     /// backend only; design §5 record-and-restore law).
     steering: std::sync::Mutex<Option<SteeringHold>>,
     /// Keeps the admin connection (and thus the association) alive.
-    _admin_hold: tokio::task::JoinHandle<()>,
+    /// `Mutex<Option<…>>` so teardown can TAKE it and AWAIT its
+    /// completion (stop-ship flake, 2026-08: `abort()` only requests
+    /// cancellation — without the await, teardown returned while the
+    /// watchdog's cancellation was still in flight and `is_finished()`
+    /// raced the runtime).
+    admin_hold: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The rxq-arbiter grant backing this session's ifqs (real backend
     /// only). Declared LAST: it drops after the queues close their
     /// doorbells, so the indices return to the per-NIC pool only once
@@ -233,7 +238,9 @@ impl LaneSession {
 
 impl Drop for LaneSession {
     fn drop(&mut self) {
-        self._admin_hold.abort();
+        if let Some(h) = self.admin_hold.lock().expect("admin hold lock").take() {
+            h.abort();
+        }
         // FINDING 3 teardown order (2026-08 field): the ifqs must be
         // gone BEFORE the steering restore re-includes the lane queues
         // in RSS — a still-bound ifq makes host flows on its queue
@@ -761,7 +768,7 @@ impl LaneSession {
             if admin_latch.load(Ordering::SeqCst) {
                 return; // orderly teardown — not an association event
             }
-            match event {
+            match &event {
                 Ok(0) => log::error!(
                     "zcrx-lane: admin connection closed by target — session poisoned \
                      (kernel path serves; remount re-arms)"
@@ -771,7 +778,14 @@ impl LaneSession {
                 }
                 Err(e) => log::error!("zcrx-lane: admin connection error: {e} — session poisoned"),
             }
-            mark_session_poisoned(&admin_poison);
+            // The mark-site latch edge (belt): a teardown that began
+            // AFTER the early check above must still not gain a poison
+            // mark from this task. With teardown awaiting this handle,
+            // a mark that wins here reflects a genuinely concurrent
+            // pre-teardown association event — which IS poison.
+            if !admin_latch.load(Ordering::SeqCst) {
+                mark_session_poisoned(&admin_poison);
+            }
         });
 
         log::info!(
@@ -798,7 +812,7 @@ impl LaneSession {
             next_q: AtomicUsize::new(0),
             poisoned,
             steering: std::sync::Mutex::new(steering_hold),
-            _admin_hold: admin_hold,
+            admin_hold: std::sync::Mutex::new(Some(admin_hold)),
             rxq_lease: std::sync::Mutex::new(rxq_lease),
             teardown_latch,
         });
@@ -814,7 +828,13 @@ impl LaneSession {
     /// honesty instrument: teardown must RETIRE the watchdog before the
     /// target's orderly association close can be misread as poison).
     pub fn admin_watchdog_finished(&self) -> bool {
-        self._admin_hold.is_finished()
+        // Retired = taken-and-awaited by teardown (None), or the task
+        // itself completed (a real association event ran its course).
+        self.admin_hold
+            .lock()
+            .expect("admin hold lock")
+            .as_ref()
+            .is_none_or(|h| h.is_finished())
     }
 
     /// Round-5 blast-radius law: any queue in a refill-starvation
@@ -847,8 +867,15 @@ impl LaneSession {
         // association and close the admin connection, and that ORDERLY
         // close must never be markable as poison (the field's
         // poisoned=8-with-zero-poison-logs). The latch (checked by the
-        // watchdog) is the belt for an EOF racing this abort.
-        self._admin_hold.abort();
+        // watchdog) is the belt for an EOF racing this abort. Take,
+        // abort, AWAIT: retirement is an owned, completed edge before
+        // teardown proceeds — `abort()` alone only REQUESTS cancellation
+        // (the stop-ship flake: is_finished raced the runtime).
+        let handle = self.admin_hold.lock().expect("admin hold lock").take();
+        if let Some(h) = handle {
+            h.abort();
+            let _ = h.await; // JoinError::Cancelled is the expected arm
+        }
         self.quiesce().await;
         // The lease releases only AFTER the ifqs are joined (quiesce),
         // so a successor arm re-registers a freed queue, not a live one.

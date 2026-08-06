@@ -277,6 +277,21 @@ fn test_default_mount_gauges_negotiated_write_geometry() {
         0,
         "fuse3_zc_replies must stay 0 until the zc serve integration lands"
     );
+    // zc WRITE-extraction engagement pair (write-bracket campaign,
+    // 2026-08-06): the slot→memfd extraction is the armed-mount WRITE
+    // vehicle; the pair must be PLUMBED (a write row without its
+    // engagement face is invalid by repo law) and identically 0 on a
+    // session that never armed zc.
+    assert_eq!(
+        mount.metric(&stats, "fuse3_zc_write_extractions"),
+        0,
+        "fuse3_zc_write_extractions must exist and stay 0 on an unarmed session"
+    );
+    assert_eq!(
+        mount.metric(&stats, "fuse3_zc_write_extract_bytes"),
+        0,
+        "fuse3_zc_write_extract_bytes must exist and stay 0 on an unarmed session"
+    );
 
     let p = mount.mnt.join("geom.txt");
     std::fs::write(&p, b"negotiated geometry").unwrap();

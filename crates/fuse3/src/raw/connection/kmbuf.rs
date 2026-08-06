@@ -1212,6 +1212,17 @@ mod tests {
         let s0 = zc_slot_payload_skips();
         note_zc_slot_payload_skip();
         assert_eq!(zc_slot_payload_skips(), s0 + 1);
+        // WRITE-extraction engagement pair (write-bracket campaign,
+        // 2026-08-06): the slot→memfd extraction is the armed-mount WRITE
+        // vehicle — a write row without its engagement face is INVALID.
+        let w0 = zc_write_extractions();
+        let wb0 = zc_write_extract_bytes();
+        note_zc_write_extraction(4096);
+        assert_eq!(zc_write_extractions(), w0 + 1);
+        assert_eq!(zc_write_extract_bytes(), wb0 + 4096);
+        note_zc_write_extraction(0);
+        assert_eq!(zc_write_extractions(), w0 + 2, "zero-length still counts the op");
+        assert_eq!(zc_write_extract_bytes(), wb0 + 4096);
     }
 
     /// `uses_kmbuf` composition — the zc arm is bufring-plus.

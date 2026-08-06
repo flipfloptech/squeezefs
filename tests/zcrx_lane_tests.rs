@@ -3123,3 +3123,90 @@ async fn test_majority_structural_releases_the_whole_nic() {
          (their RSS exclusion restores mid-row, not at umount)"
     );
 }
+
+// ---------------------- round 4 (2026-08-06): THE VERDICT — (a) is FALSE
+//
+// The sharp hypothesis (stride/chunk granularity incompatibility) is
+// FALSE at the source: MPWQE "strides" are VIRTUALLY contiguous via the
+// UMR — mlx5e_alloc_rx_mpwqe maps pages_per_wqe INDIVIDUAL order-0
+// netmems per WQE by DMA address into inline MTTs (en_rx.c:797–808 —
+// one page_pool_dev_alloc_netmems per page, en_rx.c:277–293); a
+// non-XSK queue's page_shift IS PAGE_SHIFT (params.c:24–34), the
+// provider pool is created order-0 (en_main.c:994), and the zcrx
+// provider accepts exactly that (zcrx.c:1018: order + PAGE_SHIFT must
+// equal niov_shift — our 4 KiB chunks). The 16 KiB "linear stride" is
+// the ethtool frames↔WQE conversion unit, never a physical-contiguity
+// demand; MTU has no bearing on compatibility. The lane's own 0.6 GB
+// of pattern-correct zero-copy fills is the empirical co-proof.
+//
+// What remains is EDGE arithmetic: the ring stays FULL at its standing
+// term while consumed payload is held downstream, so peak simultaneous
+// = ring(128 MiB) + in-flight window(≤64 MiB) + the pp-cache FLOAT —
+// and the float has a source-derivable cap: the page_pool ptr_ring
+// lawfully parks up to min(pool_size, 16384) driver-recycled chunks
+// (page_pool.c:213–214) which the aggregate rx_pp_recycle_cache_full
+// growth (1.7 M/run) proves is a live path. Funding that cap is the
+// round-4 arithmetical fix; everything else is field-owed to the
+// per-queue rx[i]_pp_* ethtool row.
+
+#[test]
+fn test_pool_term_pp_cache_float_is_the_ptr_ring_cap() {
+    use squeezefs::zcrx_lane::area;
+    // page_pool.c:213–214: ring_qsize = min(pool_size, 16384) — the
+    // kernel cap on driver-recycled free chunks the pool may park in
+    // its own ptr_ring. pool_size for a striding RQ = the standing
+    // chunk count, so the float = min(standing_chunks, 16384) × chunk.
+    let ring = area::ring_standing_bytes(8192, Some(9000), 4096); // 128 MiB
+    assert_eq!(
+        area::pp_cache_float_bytes(ring, 4096),
+        16384 * 4096,
+        "field rail: the 32768-chunk standing term caps at the kernel's \
+         16384-entry ptr_ring — a 64 MiB float"
+    );
+    // Small rings float at their own size (pool_size < the cap).
+    assert_eq!(area::pp_cache_float_bytes(1024 * 4096, 4096), 1024 * 4096);
+    assert_eq!(area::pp_cache_float_bytes(0, 4096), 0, "no ring, no float");
+}
+
+#[test]
+fn test_nic_census_live_denominator_matches_the_field_tape() {
+    use squeezefs::zcrx_lane::nic_census;
+    // Round-4 adjudication: the majority denominator is LIVE-armed, not
+    // ever-armed. The vote asks "do the sessions that PROVED the shared
+    // pool term outnumber half the sessions still paying rent?" — a
+    // session that already tore down (structural OR poison/shutdown)
+    // holds no RSS exclusion, so it carries no rent into the
+    // denominator. The round-4 field tape: 10 ever-armed, votes arrive
+    // as voters tear down — the 4th vote must fire (2×4 = 8 ≥ live 7),
+    // where the ever-armed rule sat one vote short for the whole row
+    // (structural=4, one session's second window never fired).
+    let ifx = 0xC4A0;
+    for _ in 0..10 {
+        nic_census::note_armed(ifx);
+    }
+    for k in 1..=3u32 {
+        assert!(
+            !nic_census::note_structural(ifx),
+            "vote {k}: voters do not yet dominate the live set"
+        );
+        nic_census::note_released(ifx); // the voter's own teardown
+    }
+    assert!(
+        nic_census::note_structural(ifx),
+        "the 4th vote fires: 2×4 ≥ (10 − 3 released) — the field tape's \
+         exact shape releases the NIC instead of idling one vote short"
+    );
+    // Non-structural releases (poison, shutdown) shrink the live set
+    // the same way: a sole survivor's own vote is always a majority.
+    let ifx2 = 0xC4A1;
+    for _ in 0..4 {
+        nic_census::note_armed(ifx2);
+    }
+    for _ in 0..3 {
+        nic_census::note_released(ifx2); // poisoned peers, no votes
+    }
+    assert!(
+        nic_census::note_structural(ifx2),
+        "1 vote vs 1 live session: fires"
+    );
+}

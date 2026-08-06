@@ -161,3 +161,17 @@ refill-posting and CQ arms are clean. The named residual for any future
 resumption: read the lane-leased queues' pp inflight (`hold_cnt −
 release_cnt`, free ethtool taps — no binary change) during one armed row
 and the missing MiB becomes a number. Parked here.
+
+## Addendum (2026-08-06, ruling D13): the park's portability leg superseded
+
+User ruling later the same day (rc-manifest §3f, D13): "since we have the
+custom kernel anything is OK in the realm of a custom KERNEL or custom
+KERNEL requirements for it to work." The kernel ≥ 6.15 / mlx5-provider /
+ntuple requirement is therefore no longer a park reason. The park STANDS
+on the measured leg the original ruling also named ("it also doesn't seem
+like it's giving us the performance we expected on these servers anyway"):
+12 field rounds, ~0.05 % engagement, the pool_dry-dominated closing tape,
+measured RSS rent on the A-sides, and a composed-net estimate of only
+−0.2..−0.3 core-s/GB even if the pool funded. Resumption remains gated on
+the pp-inflight number above AND sequenced behind the K1 zc-serve lever
+(the larger pass, now unhedged under D13).

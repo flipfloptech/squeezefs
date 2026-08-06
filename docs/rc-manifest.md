@@ -559,6 +559,26 @@ starvation (~21 in-flight fills vs the raw row's 160; `prefetch_issued =
 823` over 1.567 M ops — R2 disengaged on the 16-stream shape), NOT the
 copy ledger (dest 1.00×, all NT, hottest daemon thread 34 %).
 
+**Kernel-frontier ruling (D13, user 2026-08-06, verbatim: "since we have
+the custom kernel anything is OK in the realm of a custom KERNEL or custom
+KERNEL requirements for it to work. Our goal is to work on the latest and
+greats modern kernel and features as needed."):** the sqz kernel series
+(`docker/kernel-sqz/`, linux-6.19.14-sqz today) is a first-class product
+surface — a perf lever MAY require the custom kernel or a modern mainline
+feature, and tracking the latest mainline is the program's posture. Scope
+notes: (a) the "Portable by default" non-negotiable governs CPU-model
+code paths and topology assumptions, never kernel version — this ruling
+makes that explicit; (b) the K1 zc serve (`FUSE_URING_ZERO_COPY` — patch
+`0024-fuse-add-zero-copy-over-io-uring.patch` + the fork's negotiation
+face) loses its "sqz-kernel-only" hedge and stands as the read program's
+lever #1; negotiation stays (a stock kernel degrades to the memcpy commit,
+gauged by `fuse3_zc_replies`), but the requirement itself is sanctioned;
+(c) the zcrx park (same day) now rests on its MEASURED leg only — 12
+rounds, ~0.6 GB of ~1,600 GB row bytes engaged, pool_dry closing tape,
+RSS rent, composed-net estimate −0.2..−0.3 core-s/GB — not on the
+kernel ≥ 6.15 requirement; resumption stays priced by the recorded
+pp-inflight diagnostic and sequenced behind K1.
+
 Performance board (exit criteria):
 1. **zcrx Z3 field rows** — Connect fix in, lane associates on real nvmet,
    engagement laws hold; acceptance = the D5 chain's CPU/byte drop on

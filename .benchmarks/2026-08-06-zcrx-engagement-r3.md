@@ -13,7 +13,7 @@ residual rent. Cluster READ-ONLY. Design: `docs/design-zcrx-read-lane.md`
 Rev 4b.
 
 Commits: red `9ceaf0b2` (contracts, compile-red at base) · green
-`<GREEN_SHA>` (the derivation + the whole-NIC release + Rev 4b + this
+`9a93fa53` (the derivation + the whole-NIC release + Rev 4b + this
 note).
 
 Source venue: the sqz **linux-6.19.14** tree (the exact field kernel —

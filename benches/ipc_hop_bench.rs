@@ -330,11 +330,13 @@ fn bench_job_wire_frames(c: &mut Criterion) {
 /// * a drain pass of **32 published ops** — the ingest-economy field
 ///   shape (a 32-CPU client's fleet keeps tens of ops in flight per
 ///   session, `.benchmarks/2026-07-28-ingest-economy.md`);
-/// * **4 sessions per service thread** — sessions outnumber threads on
-///   the derived defaults (`sizing::il_sessions_default` = clamp(cpus/4,
-///   2, 16) sessions against the same ceiling of threads, with fd-sharded
-///   multi-process fleets pushing the ratio up); 4 is the shape the
-///   §5.5.1 pinning invariant makes ordinary.
+/// * **4 sessions per service thread** — multi-process fleets keep
+///   sessions ahead of threads (`sizing::il_sessions_default` =
+///   clamp(cpus/4, 2, 16) sessions per PROCESS against the drain-lane
+///   ceiling `il_drain_lanes_default` = clamp(3×cpus/8, 2, 64) — a
+///   32-process fleet runs ~2.7 sessions/owner on the 32-CPU shape, and
+///   fd-sharded single-process workloads push the ratio up); 4 is the
+///   shape the §5.5.1 pinning invariant makes ordinary.
 fn bench_drain_pass(c: &mut Criterion) {
     use squeezefs_ipc::layout::DEFAULT_RING_ENTRIES;
     use std::sync::atomic::{AtomicU32, Ordering};

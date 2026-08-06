@@ -535,6 +535,87 @@ async fn lane_walk_skips_covered_blocks_without_spending_depth() {
 }
 
 // ---------------------------------------------------------------------------
+// Contract 14 (2026-08-06, the fill-clamp campaign — the flat D-ladder
+// conviction): lane issue was TOUCH-DRIVEN ONLY — the pipeline was
+// topped up exclusively inside `pipeline_touch`, so when a stream's
+// whole qd sat blocked on fills (the cold-row steady state), completed
+// fetches emptied the pipe and NOTHING refilled it until the reader's
+// next request arrived. Effective fill concurrency became a function
+// of request-arrival cadence — invariant to the depth pin (field:
+// D4/D8/D16 all ~22 GB/s at ~50 in-flight vs the raw row's 160; local
+// samples: `read_lane_inflight_bytes` sawtoothing depth→0 while
+// devices sat at qd 1-20). The contract: a lane fetch COMPLETION
+// refills the pipeline to the reader-tied horizon with NO new touch —
+// converge-by-completion, the write-pipeline admission law's read
+// twin. The bound that remains is all derived: depth (probe-governed,
+// R5-capped) × streams, horizon-tied to the reader's edge.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lane_completions_refill_the_pipeline_without_a_touch() {
+    set_zero_share_env();
+    set_ahead_env(); // depth 4 pin
+    let h = make_with(*b"read-lane-test12", "rdlane_ns_l", false).await;
+    clear_ahead_env();
+    clear_zero_share_env();
+
+    let blocks = 12u64;
+    let (ino, _map) = striped_file(&h, "refill", blocks).await;
+
+    let f0 = lane_fetches();
+    let fill_n0 = fill_total_count();
+
+    // Classify with block 0's four contiguous sub-reads, then STOP —
+    // no further touches. The zero-share env derives examine_cap = 4
+    // (= depth), so the reader-tied horizon is end(0) + 1 + 4 = block 5
+    // inclusive: blocks 1..=5 are lane-fetchable.
+    for half in 0..4u64 {
+        let d = read_at(&h, ino, half * 128 * 1024, 128 * 1024).await;
+        assert!(d.iter().all(|&x| x == 1), "byte parity block 0");
+    }
+
+    // Drain: in-flight converges by completion. Touch-driven-only issue
+    // stalls at ONE top-up's worth (depth 4 = blocks 1..=4) — the
+    // completion refill must walk the cursor to the horizon (block 5).
+    for _ in 0..300 {
+        if h.fs.router.read_lane_inflight_bytes() == 0 && lane_fetches() - f0 >= 5 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        lane_fetches() - f0,
+        5,
+        "completions must refill the pipeline to the reader-tied horizon \
+         (blocks 1..=5) without a new touch — touch-driven-only issue is \
+         the field's flat-D-ladder clamp; past the horizon issue STOPS \
+         (the stalled reader is the tie)"
+    );
+
+    // Contract 15 (the instrument gap, same fixture): lane fetches ride
+    // the read_fill_phase_ns accounting — fill_total must count the
+    // demand fill (block 0) AND every lane fetch, or the field's
+    // per-fill decomposition undercounts the row (field: n=24,748
+    // against 372k fills).
+    assert_eq!(
+        fill_total_count() - fill_n0,
+        6,
+        "fill_total must count the demand fill + the 5 lane fetches \
+         (the phase family's per-fill denominator)"
+    );
+    drop(h);
+}
+
+fn fill_total_count() -> u64 {
+    // The histogram JSON is `{bucket_label: count}`; the phase's op count
+    // is the bucket sum.
+    squeezefs::fuse_client::read_fill_phase_json()["fill_total"]
+        .as_object()
+        .map(|m| m.values().filter_map(|v| v.as_u64()).sum())
+        .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
 // Hold-store unit semantics (coverage retirement, FIFO trim, purge,
 // exact gauge accounting).
 // ---------------------------------------------------------------------------

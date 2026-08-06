@@ -186,6 +186,14 @@ pub struct ReplyData {
     pub data: Bytes,
     /// Backing resource to keep alive (e.g. guard or pooled buffer)
     pub backing: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    /// zc direct-leg marker (K1 kill, `FUSE_URING_ZERO_COPY` sessions):
+    /// `Some(n)` = the reply's `n` payload bytes ALREADY SIT in the
+    /// request's pages (the handler's device fetch landed them through
+    /// the sparse slot) — `data` must be empty and the session commits
+    /// header + length with no body move. Only meaningful on a zc-armed
+    /// session; `None` everywhere else (the `From<Bytes>` and every
+    /// existing constructor keep it `None`).
+    pub zc_prefilled: Option<u32>,
 }
 
 impl PartialEq for ReplyData {
@@ -219,6 +227,7 @@ impl From<Bytes> for ReplyData {
         Self {
             data,
             backing: None,
+            zc_prefilled: None,
         }
     }
 }

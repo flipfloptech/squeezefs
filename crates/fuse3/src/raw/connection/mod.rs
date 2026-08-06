@@ -15,4 +15,10 @@ pub mod fuse_over_uring;
 #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
 pub mod kmbuf;
 
+/// FUSE_URING_ZERO_COPY serve integration (K1 kill, 2026-08-06): the
+/// sparse-slot bridge machinery (bounce arena, opcode mirror, pending
+/// table) — rides the kmbuf module's carried-series ABI boundary.
+#[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
+pub mod zc;
+
 pub(crate) type CompleteIoResult<T, U> = (T, io::Result<U>);

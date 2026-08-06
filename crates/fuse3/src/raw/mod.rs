@@ -17,7 +17,9 @@ pub use connection::fuse_over_uring::{
     transport_wake_stats, COMMIT_BATCH_LABELS,
 };
 #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
-pub use connection::kmbuf::{kmbuf_negotiated, zc_replies};
+pub use connection::kmbuf::{
+    kmbuf_negotiated, zc_fallbacks, zc_negotiated, zc_replies, zc_slot_payload_skips,
+};
 pub use filesystem::Filesystem;
 use futures_util::future::Either;
 pub use read_phase::{

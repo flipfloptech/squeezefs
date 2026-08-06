@@ -73,11 +73,13 @@
 //! - `SQUEEZEFS_FUSE_KMBUF=0` — disable the bufring arm even where the
 //!   surface probes Present (the A/B lever; the probe/gauges stay alive
 //!   on both sides). Default: arm when Present.
-//! - `SQUEEZEFS_FUSE_ZC=1` — recognized and LOUDLY declined: the
-//!   `FUSE_URING_ZERO_COPY` negotiation face (flags, `init.queue_depth`,
-//!   the sparse-table registration shape) ships here, but the zc serve
-//!   integration (READ_FIXED/WRITE_FIXED serves into the registered
-//!   request folios) is the staged follow-on. Never a silent no-op.
+//! - `SQUEEZEFS_FUSE_ZC=1` — arm the `FUSE_URING_ZERO_COPY` serve
+//!   integration (K1 kill, 2026-08-06 — `zc.rs` carries the serve
+//!   design): READ_FIXED/WRITE_FIXED against the sparse request-page
+//!   slots, direct device leg for eligible cold reads, memfd bounce for
+//!   everything else. Requires the kmbuf surface, the kmbuf lever, and
+//!   CAP_SYS_ADMIN; every decline is loud (never a silent no-op), and a
+//!   kernel that refuses the zc REGISTER degrades to BufRing loudly.
 
 #![cfg(all(target_os = "linux", feature = "tokio-runtime"))]
 
@@ -247,6 +249,20 @@ pub enum TransportBufferMode {
     /// The kmbuf arm: fixed headers buffer + kernel-managed payload
     /// bufring, REGISTER with `init.flags = FUSE_URING_BUF_RING`.
     BufRing,
+    /// The zc arm (K1 kill, 2026-08-06): BufRing PLUS the sparse
+    /// request-page slot table (`0..depth`, headers at index `depth`),
+    /// `init.flags = FUSE_URING_BUF_RING | FUSE_URING_ZERO_COPY` with
+    /// `init.queue_depth = depth`, and the per-queue memfd bounce arena
+    /// — see `zc.rs` for the serve integration.
+    ZeroCopy,
+}
+
+impl TransportBufferMode {
+    /// True for every mode that registers a kmbuf ring (the zc arm is
+    /// bufring-plus — the kernel refuses zc without a kmbuf ring).
+    pub fn uses_kmbuf(self) -> bool {
+        matches!(self, Self::BufRing | Self::ZeroCopy)
+    }
 }
 
 /// One boolean knob read under the shared ENG-10 convention: any of
@@ -262,29 +278,58 @@ fn env_bool(key: &str, default: bool) -> bool {
 
 /// Resolve the mode once per session: the capability probe gated by the
 /// `SQUEEZEFS_FUSE_KMBUF` lever (`0` ⇒ UserEnts — the A/B lever; the
-/// probe and gauges stay alive on both sides). `SQUEEZEFS_FUSE_ZC=1` is
-/// recognized and loudly declined (negotiation face present; the zc
-/// serve integration is the staged follow-on).
+/// probe and gauges stay alive on both sides). `SQUEEZEFS_FUSE_ZC=1`
+/// arms the FUSE_URING_ZERO_COPY serve integration (K1 kill, 2026-08-06)
+/// where the surface admits it: kmbuf Present (zc is bufring-plus — the
+/// kernel refuses zc without a kmbuf ring), the kmbuf lever on, and
+/// euid 0 (the kernel gate is `capable(CAP_SYS_ADMIN)`; probing it here
+/// keeps the refusal loud AT RESOLUTION instead of a per-queue REGISTER
+/// EINVAL). Every decline is loud — never a silent no-op — and the
+/// worker's own REGISTER failure path degrades zc → BufRing loudly too
+/// (a stock kernel that probes kmbuf-Present but lacks the zc flag).
 pub fn resolve_buffer_mode() -> TransportBufferMode {
     // ENG-10: one boolean convention — `0/false/no/off` all disable, and a
     // malformed value keeps the documented default (announced by the
     // daemon's startup gate, which refuses it outright).
     let lever_off = !env_bool("SQUEEZEFS_FUSE_KMBUF", true);
-    if env_bool("SQUEEZEFS_FUSE_ZC", false) {
-        warn!(
-            "SQUEEZEFS_FUSE_ZC=1: the FUSE_URING_ZERO_COPY negotiation face is \
-             present but the zc serve integration is the staged follow-on \
-             (design-zero-copy-write-path §5.4c) — declining zc, continuing \
-             with the bufring/user-ent resolution"
-        );
-    }
+    let zc_wanted = env_bool("SQUEEZEFS_FUSE_ZC", false);
     match (kmbuf_surface(), lever_off) {
-        (KmbufSurface::Present, false) => TransportBufferMode::BufRing,
+        (KmbufSurface::Present, false) => {
+            if zc_wanted {
+                // SAFETY: geteuid has no failure mode.
+                let euid = unsafe { libc::geteuid() };
+                if euid == 0 {
+                    return TransportBufferMode::ZeroCopy;
+                }
+                warn!(
+                    "SQUEEZEFS_FUSE_ZC=1 but euid={euid}: the kernel's zc REGISTER \
+                     requires CAP_SYS_ADMIN — declining zc, continuing on the \
+                     bufring path (fuse3_zc_replies stays 0)"
+                );
+            }
+            TransportBufferMode::BufRing
+        }
         (KmbufSurface::Present, true) => {
             warn!("kmbuf surface Present but SQUEEZEFS_FUSE_KMBUF=0 — userspace ents (A/B lever)");
+            if zc_wanted {
+                warn!(
+                    "SQUEEZEFS_FUSE_ZC=1 declined: zc is bufring-plus and the kmbuf \
+                     lever is off (fuse3_zc_replies stays 0)"
+                );
+            }
             TransportBufferMode::UserEnts
         }
-        (KmbufSurface::Absent, _) => TransportBufferMode::UserEnts,
+        (KmbufSurface::Absent, _) => {
+            if zc_wanted {
+                warn!(
+                    "SQUEEZEFS_FUSE_ZC=1 declined: the kmbuf/zc io_uring surface is \
+                     Absent on this kernel — continuing on the userspace-ent path \
+                     (fuse3_zc_replies stays 0; the sqz kernel series carries the \
+                     surface)"
+                );
+            }
+            TransportBufferMode::UserEnts
+        }
     }
 }
 
@@ -293,7 +338,10 @@ pub fn resolve_buffer_mode() -> TransportBufferMode {
 // ---------------------------------------------------------------------
 
 static KMBUF_NEGOTIATED: AtomicU64 = AtomicU64::new(0);
+static ZC_NEGOTIATED: AtomicU64 = AtomicU64::new(0);
 static ZC_REPLIES: AtomicU64 = AtomicU64::new(0);
+static ZC_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static ZC_SLOT_PAYLOAD_SKIPS: AtomicU64 = AtomicU64::new(0);
 
 /// Set the session's kmbuf negotiation state (0/1) — stored at arm time
 /// by `try_start` (the worker-arm wiring), a level like the geometry
@@ -309,21 +357,61 @@ pub fn kmbuf_negotiated() -> u64 {
     KMBUF_NEGOTIATED.load(Ordering::Relaxed)
 }
 
-/// Count one zc-flagged reply commit. Structurally unreachable in this
-/// build (the zc arm is negotiation-face-only — `resolve_buffer_mode`
-/// declines `SQUEEZEFS_FUSE_ZC`); the counter ships WITH the face so the
-/// follow-on's engagement is measured by the same instrument that
-/// guards it (the read-inplace silent-disengagement lesson).
+/// Set the session's zc negotiation state (0/1) — stored at arm time
+/// like [`set_kmbuf_negotiated`]; the worker downgrades it (with a loud
+/// line) if the kernel refuses the zc REGISTER on a kmbuf-Present
+/// surface.
+pub fn set_zc_negotiated(on: bool) {
+    ZC_NEGOTIATED.store(u64::from(on), Ordering::Relaxed);
+}
+
+/// `fuse3_zc_negotiated` (stats inode, 0/1): 1 ⇒ every queue of the
+/// live session REGISTERed with `FUSE_URING_ZERO_COPY` accepted — the
+/// zc arm-proof gauge for the field window.
+pub fn zc_negotiated() -> u64 {
+    ZC_NEGOTIATED.load(Ordering::Relaxed)
+}
+
+/// Count one zc reply commit: a paged reply whose payload rode the
+/// sparse-slot path (device-direct prefill or bounce bridge) — K1's
+/// folio copy skipped by the kernel at COMMIT.
 pub fn note_zc_reply() {
     ZC_REPLIES.fetch_add(1, Ordering::Relaxed);
 }
 
 /// `fuse3_zc_replies` (stats inode): replies whose payload rode the
 /// `FUSE_URING_ZERO_COPY` fixed-buffer path (K1 deleted both
-/// directions). 0 by construction until the staged zc serve integration
-/// arms.
+/// directions). 0 by construction until a session arms zc.
 pub fn zc_replies() -> u64 {
     ZC_REPLIES.load(Ordering::Relaxed)
+}
+
+/// Count one zc bridge FAILURE that degraded to the kmbuf attachment or
+/// a header-only EIO (the opcode-mirror safety net — see zc.rs module
+/// doc). Steady growth means the mirror disagrees with the running
+/// kernel for some opcode: stop and read the log lines naming it.
+pub fn note_zc_fallback() {
+    ZC_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `fuse3_zc_fallbacks` (stats inode): must stay ≈ 0 on a healthy zc
+/// session.
+pub fn zc_fallbacks() -> u64 {
+    ZC_FALLBACKS.load(Ordering::Relaxed)
+}
+
+/// Count one payload-announcing delivery on a zc queue whose payload was
+/// neither kmbuf-covered nor an extractable WRITE (the FUSE_IOCTL-class
+/// shape): delivered with an EMPTY payload, loudly. Nonzero names an
+/// opcode the in-direction mirror must learn.
+pub fn note_zc_slot_payload_skip() {
+    ZC_SLOT_PAYLOAD_SKIPS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `fuse3_zc_slot_payload_skips` (stats inode): must stay 0 outside
+/// data-carrying ioctls (which this daemon does not serve).
+pub fn zc_slot_payload_skips() -> u64 {
+    ZC_SLOT_PAYLOAD_SKIPS.load(Ordering::Relaxed)
 }
 
 // ---------------------------------------------------------------------
@@ -368,7 +456,11 @@ impl KmbufQueue {
     /// kernel buffer region:
     ///
     /// 1. anon headers region (`depth × REQ_HEADER_SZ`) registered as
-    ///    THE fixed buffer (index [`FUSE_URING_FIXED_HEADERS_OFFSET`]);
+    ///    THE fixed buffer — table index [`FUSE_URING_FIXED_HEADERS_OFFSET`]
+    ///    in bufring mode, or [`zc_headers_index`]`(depth)` on the zc arm,
+    ///    where the table is `depth + 1` entries with `0..depth` left
+    ///    SPARSE (zeroed iovecs — the kernel installs the client's
+    ///    request pages there per request via `io_buffer_register_bvec`);
     /// 2. `IORING_REGISTER_KMBUF_RING` with `buf_size = payload_sz`
     ///    (page-aligned by the geometry law) and pow2 entries ≥ depth;
     /// 3. mmap of the buffer region at
@@ -381,6 +473,7 @@ impl KmbufQueue {
         ring: &io_uring::IoUring<io_uring::squeue::Entry128>,
         depth: usize,
         payload_sz: usize,
+        zero_copy: bool,
     ) -> io::Result<Self> {
         use std::os::fd::AsRawFd;
         let page = {
@@ -420,14 +513,33 @@ impl KmbufQueue {
             iov_base: headers_base as *mut libc::c_void,
             iov_len: headers_span,
         };
-        // SAFETY: the iovec references the mapping above, which this
-        // struct keeps alive until drop; registered buffers are pinned by
-        // the ring and released at ring teardown.
-        if let Err(e) = unsafe { ring.submitter().register_buffers(&[headers_iov]) } {
+        // Table shape: bufring = [headers] at index 0; zc = depth SPARSE
+        // entries (zeroed iovecs — legal since 5.19's rsrc rework, they
+        // stay empty until the kernel's per-request bvec install) with
+        // headers at index `depth` (= `zc_headers_index(depth)` — the
+        // kernel reads headers at `FUSE_URING_FIXED_HEADERS_OFFSET +
+        // zero_copy_depth`).
+        let table: Vec<libc::iovec> = if zero_copy {
+            let mut t: Vec<libc::iovec> = (0..depth)
+                .map(|_| libc::iovec {
+                    iov_base: std::ptr::null_mut(),
+                    iov_len: 0,
+                })
+                .collect();
+            t.push(headers_iov);
+            t
+        } else {
+            vec![headers_iov]
+        };
+        // SAFETY: the headers iovec references the mapping above, which
+        // this struct keeps alive until drop; sparse entries are null by
+        // construction; registered buffers are pinned by the ring and
+        // released at ring teardown.
+        if let Err(e) = unsafe { ring.submitter().register_buffers(&table) } {
             // SAFETY: unmapping the region mapped above (error path).
             unsafe { libc::munmap(headers_base as *mut libc::c_void, headers_span) };
             return Err(io::Error::other(format!(
-                "kmbuf headers fixed-buffer register failed: {e}"
+                "kmbuf headers fixed-buffer register failed (zc={zero_copy}): {e}"
             )));
         }
 
@@ -764,7 +876,8 @@ mod tests {
         let page = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) } as usize;
         match kmbuf_surface() {
             KmbufSurface::Present => {
-                let q = KmbufQueue::setup(&ring, 4, page).expect("Present surface must set up");
+                let q =
+                    KmbufQueue::setup(&ring, 4, page, false).expect("Present surface must set up");
                 assert_eq!(q.ring_entries(), 4);
                 assert!(q.attached_ptr(0).is_none());
                 // Buffers are real memory: write/read through bid 0.
@@ -776,7 +889,7 @@ mod tests {
                 }
             }
             KmbufSurface::Absent => {
-                let err = KmbufQueue::setup(&ring, 4, page)
+                let err = KmbufQueue::setup(&ring, 4, page, false)
                     .err()
                     .expect("Absent surface must refuse setup, never fake it");
                 let msg = err.to_string();
@@ -788,6 +901,68 @@ mod tests {
         }
     }
 
+    /// The zc table shape (K1 kill): `depth` SPARSE entries + the headers
+    /// buffer at index `depth`. The buffer-table registration itself is a
+    /// stock io_uring surface (5.19+ sparse entries), so it must succeed
+    /// on ANY modern kernel — what gates zc is the kmbuf ring + the
+    /// REGISTER flag, probed separately. Runs the registration ladder
+    /// wherever the kmbuf surface probes Present; on Absent kernels the
+    /// sparse-table half is still exercised via a bare ring.
+    #[test]
+    fn test_zc_setup_table_shape() {
+        let ring: io_uring::IoUring<io_uring::squeue::Entry128> =
+            io_uring::IoUring::builder().build(16).expect("SQE128 ring");
+        let page = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) } as usize;
+        match kmbuf_surface() {
+            KmbufSurface::Present => {
+                let q =
+                    KmbufQueue::setup(&ring, 4, page, true).expect("Present surface must set up");
+                assert_eq!(q.ring_entries(), 4);
+                // Header slots still stride the anon region — index math
+                // is table-shape independent.
+                assert_eq!(
+                    q.header_ptr(1) as usize - q.header_ptr(0) as usize,
+                    REQ_HEADER_SZ
+                );
+            }
+            KmbufSurface::Absent => {
+                // The sparse table registers on stock kernels; the kmbuf
+                // ring refusal is what fails setup. Prove the sparse half
+                // directly so the shape is pinned everywhere.
+                let mut table: Vec<libc::iovec> = (0..4)
+                    .map(|_| libc::iovec {
+                        iov_base: std::ptr::null_mut(),
+                        iov_len: 0,
+                    })
+                    .collect();
+                let span = 4096usize;
+                // SAFETY: fresh anon RW mapping for the headers entry.
+                let base = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        span,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                };
+                assert_ne!(base, libc::MAP_FAILED);
+                table.push(libc::iovec {
+                    iov_base: base,
+                    iov_len: span,
+                });
+                // SAFETY: iovecs valid for the registration's life (ring
+                // dropped in this scope); sparse entries are null.
+                unsafe { ring.submitter().register_buffers(&table) }
+                    .expect("sparse buffer table (depth zeroed + headers tail) is stock 5.19+");
+                drop(ring);
+                // SAFETY: unmapping the region mapped above.
+                unsafe { libc::munmap(base, span) };
+            }
+        }
+    }
+
     /// Unaligned payload sizes are refused before any registration (the
     /// kernel would EINVAL; the geometry law guarantees page multiples,
     /// so a violation here is a planner bug — fail loud, name it).
@@ -795,21 +970,40 @@ mod tests {
     fn test_kmbuf_setup_refuses_unaligned_payload() {
         let ring: io_uring::IoUring<io_uring::squeue::Entry128> =
             io_uring::IoUring::builder().build(16).expect("SQE128 ring");
-        let err = KmbufQueue::setup(&ring, 4, 12345)
+        let err = KmbufQueue::setup(&ring, 4, 12345, false)
             .err()
             .expect("must refuse");
         assert!(err.to_string().contains("page-aligned"));
     }
 
-    /// Gauges: negotiated is a settable level; zc replies count.
+    /// Gauges: negotiated is a settable level (both arms); zc replies /
+    /// fallbacks / slot-payload skips count.
     #[test]
     fn test_gauges() {
         set_kmbuf_negotiated(true);
         assert_eq!(kmbuf_negotiated(), 1);
         set_kmbuf_negotiated(false);
         assert_eq!(kmbuf_negotiated(), 0);
+        set_zc_negotiated(true);
+        assert_eq!(zc_negotiated(), 1);
+        set_zc_negotiated(false);
+        assert_eq!(zc_negotiated(), 0);
         let z0 = zc_replies();
         note_zc_reply();
         assert_eq!(zc_replies(), z0 + 1);
+        let f0 = zc_fallbacks();
+        note_zc_fallback();
+        assert_eq!(zc_fallbacks(), f0 + 1);
+        let s0 = zc_slot_payload_skips();
+        note_zc_slot_payload_skip();
+        assert_eq!(zc_slot_payload_skips(), s0 + 1);
+    }
+
+    /// `uses_kmbuf` composition — the zc arm is bufring-plus.
+    #[test]
+    fn test_mode_uses_kmbuf() {
+        assert!(!TransportBufferMode::UserEnts.uses_kmbuf());
+        assert!(TransportBufferMode::BufRing.uses_kmbuf());
+        assert!(TransportBufferMode::ZeroCopy.uses_kmbuf());
     }
 }

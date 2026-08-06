@@ -374,6 +374,67 @@ impl FuseConnection {
         self.over_uring.get().is_some_and(|p| p.is_ready())
     }
 
+    /// True when the session's request hot path runs the
+    /// `FUSE_URING_ZERO_COPY` arm (K1 kill) — the gate the daemon's READ
+    /// handler consults before minting a device-fetch descriptor.
+    #[cfg(target_os = "linux")]
+    pub fn zc_armed(&self) -> bool {
+        self.over_uring.get().is_some_and(|p| p.zc_armed())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn zc_armed(&self) -> bool {
+        false
+    }
+
+    /// zc direct leg (K1 kill): DMA `len` bytes from `fd@off` straight
+    /// into the requesting slot's registered pages — see
+    /// [`super::fuse_over_uring::FuseOverUring::zc_device_fetch`].
+    #[cfg(target_os = "linux")]
+    pub async fn zc_device_fetch(
+        &self,
+        slot: crate::raw::ReplySlot,
+        fd: std::os::fd::RawFd,
+        off: u64,
+        len: u32,
+    ) -> io::Result<u32> {
+        let pool = self
+            .over_uring
+            .get()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no over-uring pool"))?;
+        pool.zc_device_fetch(slot, fd, off, len).await
+    }
+
+    /// Commit a reply whose payload already sits in the request's pages
+    /// (the zc direct leg) — see
+    /// [`super::fuse_over_uring::FuseOverUring::submit_reply_prefilled`].
+    #[cfg(target_os = "linux")]
+    pub fn submit_reply_prefilled(
+        &self,
+        slot: crate::raw::ReplySlot,
+        header: Vec<u8>,
+        payload_len: u32,
+    ) -> io::Result<()> {
+        let pool = self
+            .over_uring
+            .get()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no over-uring pool"))?;
+        pool.submit_reply_prefilled(slot, header, payload_len)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn submit_reply_prefilled(
+        &self,
+        _slot: crate::raw::ReplySlot,
+        _header: Vec<u8>,
+        _payload_len: u32,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no FUSE-over-io_uring transport on this platform",
+        ))
+    }
+
     #[cfg(not(target_os = "linux"))]
     pub fn over_uring_ready(&self) -> bool {
         false

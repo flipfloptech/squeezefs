@@ -2649,7 +2649,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 request.unique, in_header.nodeid, read_in
             );
 
-            let (mut reply_data, backing) = match fs
+            let (mut reply_data, backing, zc_prefilled) = match fs
                 .read(
                     request,
                     in_header.nodeid,
@@ -2666,8 +2666,59 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     return;
                 }
 
-                Ok(reply_data) => (reply_data.data, reply_data.backing),
+                Ok(reply_data) => (reply_data.data, reply_data.backing, reply_data.zc_prefilled),
             };
+
+            // zc direct leg (K1 kill): the payload already sits in the
+            // request's pages — commit header + length, no body move.
+            // Prefilled replies exist only on zc-armed sessions (the
+            // handler mints them against the live connection), so a
+            // missing/un-armed connection here is a bug: fail the request
+            // loud rather than fabricate a body-less classical reply.
+            if let Some(n) = zc_prefilled {
+                let n = n.min(read_in.size);
+                let out_header = fuse_out_header {
+                    len: (FUSE_OUT_HEADER_SIZE + n as usize) as u32,
+                    error: 0,
+                    unique: request.unique,
+                };
+                let mut data_buf = Vec::with_capacity(FUSE_OUT_HEADER_SIZE);
+                get_bincode_config()
+                    .serialize_into(&mut data_buf, &out_header)
+                    .expect("won't happened");
+                match reply_conn.filter(|c| c.over_uring_ready()) {
+                    Some(conn) => {
+                        resp_sender.mark_replied();
+                        if let Err(err) = conn.submit_reply_prefilled(request.slot, data_buf, n) {
+                            if err.kind() == ErrorKind::NotFound {
+                                warn!(
+                                    "may reply interrupted fuse request, ignore this error {}",
+                                    err
+                                );
+                            } else {
+                                error!("zc prefilled read reply failed {}", err);
+                            }
+                        }
+                        crate::raw::read_phase::note_read_inplace_reply();
+                        drop(backing);
+                    }
+                    None => {
+                        error!(
+                            "zc prefilled reply with no armed connection (unique {}) — EIO",
+                            request.unique
+                        );
+                        reply_error_in_place(libc::EIO.into(), request, resp_sender).await;
+                    }
+                }
+                if arrival_ns > 0 {
+                    let now_ns = crate::raw::read_phase::transport_now_ns();
+                    crate::raw::read_phase::read_transport_phase_record(
+                        crate::raw::read_phase::TransportPhase::TransportTotal,
+                        std::time::Duration::from_nanos(now_ns.saturating_sub(arrival_ns)),
+                    );
+                }
+                return;
+            }
 
             let reply_t0 = std::time::Instant::now();
             if reply_data.len() > read_in.size as _ {

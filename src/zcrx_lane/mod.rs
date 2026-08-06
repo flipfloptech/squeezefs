@@ -300,23 +300,28 @@ pub async fn arm_for_device(device_path: &str) -> Option<Arc<LaneSession>> {
     };
     // flows ≡ queues 1:1, so the FREE rule-slot count (total reserved
     // minus live sessions' holdings) clamps the queue want the same way
-    // the §8 pool does — a queue we cannot steer is a queue we must not
-    // claim. The kernel-assigned class (field finding 1: 0-advertised
-    // tables that accept inserts) has NO static bound — the kernel's
-    // insert verdict rules at steering, so the clamp never zeroes the
-    // want there.
-    // FINDING C (round 3): NIC-sharing-aware queue want — the §8
+    // the census pool does — a queue we cannot steer is a queue we must
+    // not claim. The kernel-assigned class (field finding 1:
+    // 0-advertised tables that accept inserts) has NO static bound —
+    // the kernel's insert verdict rules at steering, so the clamp never
+    // zeroes the want there.
+    // FINDING C (round 3) + the 2026-08-06 engagement campaign: the
     // eligible pool is shared by every fabric device routing through
     // this NIC, and cold sequential fills spread across ALL namespaces
-    // (breadth beats depth): want = clamp(eligible / devices_via_nic,
-    // 1, derived geometry want). The device count comes from the
-    // mount's OWN sysfs + route probe (never a constant); an empty or
-    // failed enumeration degrades to 1 — the sole-device posture.
+    // (breadth beats depth) — so the CENSUS both widens the pool
+    // (`lane_eligible_queues`: clamp(devices, channels/4, channels/2) —
+    // the round-8 verdict's 2-of-10 laneless devices were the flat /4
+    // pool refusing sessions 9 and 10) and divides it (`fair_queue_want`:
+    // clamp(eligible / devices, 1, geometry want)). The device count
+    // comes from the mount's OWN sysfs + route probe (never a
+    // constant); an empty or failed enumeration degrades to 1 — the
+    // sole-device posture, whose pool is byte-identical to the
+    // pre-campaign /4 slice.
+    let devices = probe::tcp_devices_via_nic(&ifname).max(1);
     let eligible = {
-        let pool = steering::lane_eligible_queues(channels);
+        let pool = steering::lane_eligible_queues(channels, devices);
         pool.end.saturating_sub(pool.start)
     };
-    let devices = probe::tcp_devices_via_nic(&ifname).max(1);
     let fair_want = steering::fair_queue_want(eligible, devices, target.io_queues);
     let slot_want = match steering::free_reserved_slots(&ifname, &reserved) {
         Some(0) => {
@@ -334,7 +339,7 @@ pub async fn arm_for_device(device_path: &str) -> Option<Arc<LaneSession>> {
     // REGISTER_ZCRX_IFQ EEXIST fix (field row 3): the arbiter grants
     // queues no live session holds and frees them when the session (and
     // thus its ifqs) tears down.
-    let lease = match rxq_alloc::acquire(ifindex, &ifname, channels, slot_want) {
+    let lease = match rxq_alloc::acquire(ifindex, &ifname, channels, devices, slot_want) {
         Ok(l) => l,
         Err(e) => {
             log::warn!(
@@ -350,11 +355,12 @@ pub async fn arm_for_device(device_path: &str) -> Option<Arc<LaneSession>> {
     // kernel adjudication: the provider pool is the queue's ONLY buffer
     // source once restarted onto it, and the driver fills its ring from
     // that pool for the queue's lifetime — the area must cover it).
-    let ring_fill_bytes = area_queue::ring_standing_bytes(
-        rx_ring_descs,
-        ethtool::nic_mtu(&ifname),
-        area::chunk_bytes_default(),
-    );
+    // The MTU also rides the plan since the engagement campaign: the
+    // fills' delivery-slack allotment and the CQ's chunk-touch demand
+    // both derive from the burst occupancy (`area::burst_geometry`).
+    let mtu = ethtool::nic_mtu(&ifname);
+    let ring_fill_bytes =
+        area_queue::ring_standing_bytes(rx_ring_descs, mtu, area::chunk_bytes_default());
     let plan = initiator::ZcrxPlan {
         numa_node: ethtool::nic_numa_node(&ifname),
         ifname,
@@ -362,6 +368,7 @@ pub async fn arm_for_device(device_path: &str) -> Option<Arc<LaneSession>> {
         rx_queues: lease.queues().to_vec(),
         rxq_lease: Some(Arc::new(lease)),
         ring_fill_bytes,
+        mtu,
     };
     area::register_r5_component();
     match LaneSession::connect_with(target, LaneBackend::Zcrx(plan)).await {

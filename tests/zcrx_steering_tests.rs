@@ -230,15 +230,36 @@ fn flow(sport: u16, queue: u32) -> FlowRule {
 
 #[test]
 fn test_lane_queue_picks_are_highest_indexed_and_bounded() {
-    // Design §8: lane queues ≤ nic_queues / 4 so RSS keeps ≥ ¾ of the NIC.
-    let picks = lane_queue_picks(32, 4);
+    // The census-driven pool law (2026-08-06 engagement campaign):
+    // width = clamp(devices, channels/4, channels/2). At the
+    // sole-device posture (devices = 1) the floor binds and the picks
+    // are byte-identical to the pre-campaign §8 /4 slice.
+    let picks = lane_queue_picks(32, 1, 4);
     assert_eq!(picks, vec![28, 29, 30, 31], "highest-indexed queues");
-    let picks = lane_queue_picks(32, 100);
-    assert_eq!(picks.len(), 8, "bounded to channels/4");
+    let picks = lane_queue_picks(32, 1, 100);
+    assert_eq!(picks.len(), 8, "bounded to the floor pool (channels/4)");
     assert_eq!(*picks.last().unwrap(), 31);
+    // The field census widens the pool — 10 devices ⇒ 10 eligible.
+    let picks = lane_queue_picks(32, 10, 100);
+    assert_eq!(
+        picks.len(),
+        10,
+        "census widens the pool to one queue/device"
+    );
+    assert_eq!(*picks.first().unwrap(), 22);
+    // …bounded by the RSS-keeps-half ceiling.
+    let picks = lane_queue_picks(32, 100, 100);
+    assert_eq!(picks.len(), 16, "the kernel path keeps >= half the NIC");
     // Too-narrow NIC: no picks (the caller refuses the arm loud).
-    assert!(lane_queue_picks(3, 1).is_empty(), "channels/4 < 1 ⇒ none");
-    assert_eq!(lane_queue_picks(4, 2), vec![3], "exactly one at 4 channels");
+    assert!(
+        lane_queue_picks(3, 1, 1).is_empty(),
+        "channels/4 < 1 ⇒ none"
+    );
+    assert_eq!(
+        lane_queue_picks(4, 1, 2),
+        vec![3],
+        "exactly one at 4 channels"
+    );
 }
 
 #[test]

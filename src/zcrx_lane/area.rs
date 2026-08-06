@@ -27,6 +27,76 @@ pub fn area_bytes_per_queue(depth: u16, max_xfer_bytes: u32) -> u64 {
     window.div_ceil(PMD_BYTES).max(1) * PMD_BYTES
 }
 
+/// Admission accounting grain (bytes per semaphore permit) — one page
+/// class: a sub-page read rounds to one unit, and the unit matching the
+/// chunk grain keeps permit arithmetic and chunk arithmetic composable.
+pub const ADMISSION_UNIT: usize = 4096;
+
+/// Admission permits over the ADMITTED payload window — since the
+/// 2026-08-06 engagement campaign the caller's window admits in FULL
+/// (floor one chunk). The retired `/2` halved the window as an implicit
+/// delivery-slack budget; that budget now lives in the AREA size where
+/// it belongs ([`delivery_slack_bytes`]), so the admitted window and
+/// the CID namespace are the SAME arithmetic (`depth × max_xfer` ≡
+/// depth commands of max_xfer): the round-8 field verdict measured the
+/// halved window declining most of the ~51 MiB/device the cold row
+/// offers (0.05 % engagement — `.benchmarks/2026-08-05-zcrx-z3-field-
+/// rows.md`), and a declined read is a kernel-RX-copy read on a
+/// CPU-walled box.
+pub fn admission_permits(admit_window_len: usize, chunk: usize) -> usize {
+    (admit_window_len.max(chunk) / ADMISSION_UNIT).max(1)
+}
+
+/// One wire delivery burst's worst-case chunk geometry: an MTU-grain
+/// payload lands in `⌈mtu/chunk⌉` page-grain niovs (HDS splits the
+/// header off; payload starts at a fresh niov), so `burst_bytes` chunk
+/// bytes hold `payload_bytes` of payload. `None` = the delivery grain
+/// is unknown (MTU probe failed) — callers degrade to the occupancy-½
+/// posture. `payload_bytes` uses the interface MTU verbatim: the
+/// L4 header bytes it overstates shave < 1–4 % of occupancy, absorbed
+/// by the PMD round-up and, at the pathological end (sub-MTU
+/// segmentation storms), by the round-5/6 park governor — parks are
+/// flow control, never poison.
+pub struct BurstGeometry {
+    pub payload_bytes: u64,
+    pub burst_bytes: u64,
+}
+
+pub fn burst_geometry(mtu: Option<u32>, chunk: usize) -> Option<BurstGeometry> {
+    let m = u64::from(mtu?);
+    if m == 0 || chunk == 0 {
+        return None;
+    }
+    let chunks = m.div_ceil(chunk as u64).max(1);
+    Some(BurstGeometry {
+        payload_bytes: m,
+        burst_bytes: chunks * chunk as u64,
+    })
+}
+
+/// The delivery-slack AREA allotment for a fully-admitted fill window
+/// (2026-08-06 engagement campaign — the retired admission `/2`'s
+/// implicit budget, made explicit and DERIVED): admitted payload
+/// occupies chunks at the burst occupancy ([`burst_geometry`] —
+/// `payload/burst` ≈ 73 % at the 9000-MTU/4 KiB field shape), so the
+/// fills' chunk budget needs `window × (burst − payload)/payload` extra
+/// bytes, PMD-rounded (hugepage hygiene; the area total stays
+/// chunk-granular). Unknown MTU degrades to `window` — occupancy ½,
+/// byte-identical to the retired posture's budget.
+pub fn delivery_slack_bytes(fill_window: u64, mtu: Option<u32>, chunk: usize) -> u64 {
+    let slack = match burst_geometry(mtu, chunk) {
+        Some(g) => fill_window
+            .saturating_mul(g.burst_bytes - g.payload_bytes)
+            .div_ceil(g.payload_bytes),
+        None => fill_window,
+    };
+    if slack == 0 {
+        0
+    } else {
+        slack.div_ceil(PMD_BYTES) * PMD_BYTES
+    }
+}
+
 /// Refill-ring entries for an area of `chunks` chunks: 1:1, next pow2
 /// (design §8; the kernel requires a power of two).
 pub fn rq_entries_for(chunks: u64) -> u32 {

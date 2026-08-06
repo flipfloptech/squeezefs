@@ -80,20 +80,26 @@ fn registry() -> MutexGuard<'static, HashMap<u32, NicPool>> {
 /// — naming the NIC, the probed queue count, the derived pool and the
 /// demand — when NO free queue exists (or the NIC is too narrow to
 /// dedicate ZC queues at all).
-pub fn acquire(ifindex: u32, ifname: &str, channels: u32, want: u16) -> Result<RxqLease, String> {
+pub fn acquire(
+    ifindex: u32,
+    ifname: &str,
+    channels: u32,
+    devices: usize,
+    want: u16,
+) -> Result<RxqLease, String> {
     if want == 0 {
         return Err(format!(
             "zcrx rxq arbiter: zero lane queues requested for {ifname} (ifindex \
              {ifindex}) — a lane with no queues cannot exist (refusing)"
         ));
     }
-    let pool = super::steering::lane_eligible_queues(channels);
+    let pool = super::steering::lane_eligible_queues(channels, devices);
     let pool_len = pool.end.saturating_sub(pool.start);
     if pool_len == 0 {
         return Err(format!(
             "zcrx rxq arbiter: {ifname} (ifindex {ifindex}) has {channels} RX queues \
-             — too narrow to dedicate ZC queues (needs ≥ 4: the lane pool is \
-             nic_queues/4, design §8)"
+             — too narrow to dedicate ZC queues (needs ≥ 4: the lane pool floor is \
+             nic_queues/4)"
         ));
     }
     let mut reg = registry();
@@ -104,7 +110,7 @@ pub fn acquire(ifindex: u32, ifname: &str, channels: u32, want: u16) -> Result<R
     // teardown may still be in flight).
     let fresh = |e: &NicPool, q: &u32| -> bool { !e.in_use.contains(q) && !e.retired.contains(q) };
     // Preferred grant: the pure §8 single-session picks…
-    let mut grant: Vec<u32> = super::steering::lane_queue_picks(channels, want)
+    let mut grant: Vec<u32> = super::steering::lane_queue_picks(channels, devices, want)
         .into_iter()
         .filter(|q| fresh(entry, q))
         .collect();
@@ -135,7 +141,8 @@ pub fn acquire(ifindex: u32, ifname: &str, channels: u32, want: u16) -> Result<R
         let leased = entry.in_use.len();
         return Err(format!(
             "zcrx rxq arbiter: {ifname} (ifindex {ifindex}) has {channels} RX queues \
-             → {pool_len} lane-eligible (nic_queues/4, design §8: RSS keeps ≥ ¾ of \
+             → {pool_len} lane-eligible (clamp({devices} fabric devices, \
+             nic_queues/4, nic_queues/2) — the census-driven pool; RSS keeps ≥ half \
              the NIC), all {leased} already leased by armed lane sessions — demand \
              for {want} more refused; kernel path serves (free a lane session, or \
              widen the NIC: ethtool -L {ifname} combined <N>)"
@@ -191,13 +198,13 @@ mod tests {
         // Field row 3: two sessions on one NIC must never compute the
         // same rxq (REGISTER_ZCRX_IFQ EEXIST). 32 channels → pool 24..32.
         let ifx = 0xBEE0;
-        let a = acquire(ifx, "unit-nic-a", 32, 4).expect("first lease");
+        let a = acquire(ifx, "unit-nic-a", 32, 1, 4).expect("first lease");
         assert_eq!(
             a.queues(),
             &[28, 29, 30, 31],
             "single-session grant keeps parity with the §8 highest-indexed picks"
         );
-        let b = acquire(ifx, "unit-nic-a", 32, 4).expect("second lease");
+        let b = acquire(ifx, "unit-nic-a", 32, 1, 4).expect("second lease");
         for q in b.queues() {
             assert!(
                 !a.queues().contains(q),
@@ -219,9 +226,9 @@ mod tests {
     fn arbiter_exhaustion_refuses_loudly_with_the_derived_numbers() {
         // 8 channels → pool {6, 7}; a third queue cannot exist.
         let ifx = 0xBEE1;
-        let hold = acquire(ifx, "unit-nic-b", 8, 2).expect("pool-filling lease");
+        let hold = acquire(ifx, "unit-nic-b", 8, 1, 2).expect("pool-filling lease");
         assert_eq!(hold.queues(), &[6, 7]);
-        let err = acquire(ifx, "unit-nic-b", 8, 1).expect_err("exhausted pool must refuse");
+        let err = acquire(ifx, "unit-nic-b", 8, 1, 1).expect_err("exhausted pool must refuse");
         for needle in [
             "unit-nic-b",
             "8 RX queues",
@@ -239,10 +246,10 @@ mod tests {
     #[test]
     fn arbiter_release_then_reacquire_reuses_freed_indices() {
         let ifx = 0xBEE2;
-        let a = acquire(ifx, "unit-nic-c", 8, 2).expect("lease");
+        let a = acquire(ifx, "unit-nic-c", 8, 1, 2).expect("lease");
         assert_eq!(a.queues(), &[6, 7]);
         drop(a); // ifq closed → indices return to the pool
-        let b = acquire(ifx, "unit-nic-c", 8, 2).expect("reacquire after release");
+        let b = acquire(ifx, "unit-nic-c", 8, 1, 2).expect("reacquire after release");
         assert_eq!(b.queues(), &[6, 7], "freed indices are reused");
     }
 
@@ -253,7 +260,7 @@ mod tests {
         // constant. Sweep several NIC widths.
         for channels in [8u32, 12, 32, 64, 96] {
             let ifx = 0xBEE8 + channels;
-            let lease = acquire(ifx, "unit-nic-d", channels, u16::MAX)
+            let lease = acquire(ifx, "unit-nic-d", channels, 1, u16::MAX)
                 .unwrap_or_else(|e| panic!("{channels}-queue NIC must grant: {e}"));
             assert_eq!(
                 lease.queues().len() as u32,
@@ -268,7 +275,8 @@ mod tests {
             }
         }
         // Too-narrow NIC (pool empty) refuses naming the numbers.
-        let err = acquire(0xBFFF, "unit-nic-narrow", 3, 1).expect_err("3-queue NIC must refuse");
+        let err =
+            acquire(0xBFFF, "unit-nic-narrow", 3, 10, 1).expect_err("3-queue NIC must refuse");
         assert!(
             err.contains("unit-nic-narrow") && err.contains('3'),
             "narrow refusal names the NIC and its queue count: {err}"
@@ -283,12 +291,12 @@ mod tests {
         // only {9} left → partial grant of 1 (arm degrades io_queues, the
         // §8 clamp posture — refusal is reserved for EMPTY).
         let ifx = 0xBEC0;
-        let a = acquire(ifx, "unit-nic-e", 12, 2).expect("A");
+        let a = acquire(ifx, "unit-nic-e", 12, 1, 2).expect("A");
         assert_eq!(a.queues(), &[10, 11]);
-        let b = acquire(ifx, "unit-nic-e", 12, 2).expect("B partial");
+        let b = acquire(ifx, "unit-nic-e", 12, 1, 2).expect("B partial");
         assert_eq!(b.queues(), &[9], "B gets the remaining free queue");
         // A DIFFERENT ifindex is a different pool entirely.
-        let other = acquire(0xBEC1, "unit-nic-f", 12, 2).expect("other NIC");
+        let other = acquire(0xBEC1, "unit-nic-f", 12, 1, 2).expect("other NIC");
         assert_eq!(other.queues(), &[10, 11]);
     }
 
@@ -302,7 +310,7 @@ mod tests {
         let ifx = 0xBEE3;
         let mut seen: Vec<u32> = Vec::new();
         for i in 0..8 {
-            let l = acquire(ifx, "unit-nic-rot", 32, 1).expect("grant");
+            let l = acquire(ifx, "unit-nic-rot", 32, 1, 1).expect("grant");
             assert_eq!(l.queues().len(), 1);
             let q = l.queues()[0];
             assert!(
@@ -314,7 +322,7 @@ mod tests {
         }
         assert_eq!(seen[0], 31, "first grant keeps the §8 pick parity");
         // History exhausted: the 9th arm reuses the LEAST-recently-freed.
-        let l = acquire(ifx, "unit-nic-rot", 32, 1).expect("grant");
+        let l = acquire(ifx, "unit-nic-rot", 32, 1, 1).expect("grant");
         assert_eq!(
             l.queues()[0],
             seen[0],
@@ -324,7 +332,7 @@ mod tests {
 
     #[test]
     fn arbiter_zero_want_refuses() {
-        let err = acquire(0xBEC2, "unit-nic-g", 32, 0).expect_err("a lane with zero queues");
+        let err = acquire(0xBEC2, "unit-nic-g", 32, 1, 0).expect_err("a lane with zero queues");
         assert!(err.contains("unit-nic-g"), "refusal names the NIC: {err}");
     }
 }

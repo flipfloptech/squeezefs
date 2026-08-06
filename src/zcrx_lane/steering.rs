@@ -170,20 +170,35 @@ pub trait NicControl {
 }
 
 /// The lane-eligible RX-queue pool for a NIC: the HIGHEST-indexed
-/// `channels / 4` queues — ONE definition of the §8 ceiling (RSS keeps
-/// ≥ ¾ of the NIC's queues; the divisor is design §8's stated bound,
-/// not tuning). The rxq arbiter (`rxq_alloc`) arbitrates session grants
-/// WITHIN this range; empty = NIC too narrow to dedicate ZC queues.
-pub fn lane_eligible_queues(channels: u32) -> std::ops::Range<u32> {
-    channels - channels / 4..channels
+/// `clamp(devices, channels/4, channels/2)` queues — ONE definition of
+/// the pool law (2026-08-06 engagement campaign, superseding the flat
+/// §8 `/4`). The DEVICE CENSUS (`probe::tcp_devices_via_nic`) is what
+/// widens the pool: the round-8 field verdict left 2 of 10 devices
+/// with no lane at the flat 8-queue pool — 20 % of row bytes
+/// structurally kernel-path. Floor `channels/4` = the standing §8
+/// posture (a small census never narrows the pool — sole-device arms
+/// stay byte-identical); ceiling `channels/2` = the kernel path
+/// (writes, metadata, admin, declined reads) keeps at least HALF the
+/// NIC's RSS width no matter how many fabric devices share the rail.
+/// A `channels/4 == 0` NIC keeps the too-narrow refusal (empty pool —
+/// never dedicate ZC queues on a sub-4-queue NIC). The rxq arbiter
+/// (`rxq_alloc`) arbitrates session grants WITHIN this range.
+pub fn lane_eligible_queues(channels: u32, devices: usize) -> std::ops::Range<u32> {
+    let floor = channels / 4;
+    if floor == 0 {
+        return channels..channels;
+    }
+    let devices = u32::try_from(devices).unwrap_or(u32::MAX);
+    let width = devices.clamp(floor, channels / 2);
+    channels - width..channels
 }
 
 /// Lane ZC queue picks: the HIGHEST-indexed `want` queues of the
 /// eligible pool (design §8) — the pure, UNCONTENDED single-session
 /// derivation (the arbiter's preferred grant). Empty = NIC too narrow
 /// (the caller refuses the arm loud).
-pub fn lane_queue_picks(channels: u32, want: u16) -> Vec<u32> {
-    let pool = lane_eligible_queues(channels);
+pub fn lane_queue_picks(channels: u32, devices: usize, want: u16) -> Vec<u32> {
+    let pool = lane_eligible_queues(channels, devices);
     let take = u32::from(want).min(pool.end - pool.start);
     (pool.end - take..pool.end).collect()
 }
@@ -733,10 +748,11 @@ impl Drop for SteeringGuard {
 /// eligible pool is a shared resource across every fabric device whose
 /// target routes through this NIC, and cold sequential fills spread
 /// across ALL namespaces — breadth beats depth.
-/// `clamp(eligible / devices, 1, geometry_want)` — the §8-eligible pool
-/// divided across the fabric devices routing through the NIC (field
-/// shape: `clamp(8/10, 1, 4) = 1` → 8 of 10 devices get a lane instead
-/// of 2×4). Floor 1 is the physical minimum (a lane with zero queues
+/// `clamp(eligible / devices, 1, geometry_want)` — the census-driven
+/// eligible pool divided across the fabric devices routing through the
+/// NIC (field shape since the census pool: `clamp(10/10, 1, 4) = 1` →
+/// every one of the 10 devices gets a lane; the pre-campaign flat pool
+/// left 2 of 10 laneless). Floor 1 is the physical minimum (a lane with zero queues
 /// cannot exist — the ARBITER, not this derivation, refuses when the
 /// pool is truly exhausted); the ceiling is the derived geometry want
 /// (never grant more than the session would drive).

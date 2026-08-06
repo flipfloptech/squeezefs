@@ -1213,9 +1213,10 @@ async fn test_z2_area_exhaustion_backpressures_admission_never_deadlocks() {
         }
     }
     // Floor derivation (whole-read ATOMIC admission, finding I): area =
-    // depth 16 × 256 KiB max_xfer = 4 MiB (PMD-exact); the sim fill
-    // window is the whole area, so `admission_permits` = 4 MiB / 2 =
-    // 2 MiB = 512 × 4 KiB units. One 512 KiB read = two 256 KiB
+    // depth 16 × 256 KiB max_xfer = 4 MiB (PMD-exact); the sim's
+    // admitted window is HALF the area (its unprobed-delivery slack
+    // posture — engagement campaign: the window itself now grants in
+    // full), so admission = 2 MiB = 512 × 4 KiB units. One 512 KiB read = two 256 KiB
     // segments = 128 units, taken in ONE try-acquire (single queue).
     // Every holder therefore holds exactly 128 units, so a decline
     // (available < 128 ⇒ held > 384) can only be witnessed while
@@ -1976,13 +1977,13 @@ use squeezefs::zcrx_lane::steering::{self, NicControl};
 fn test_rxq_arbiter_two_sessions_on_one_nic_get_distinct_queues() {
     // (1) Two sessions on one NIC (ifindex-keyed) must never share an rxq.
     let ifx = 0xACE0;
-    let a = rxq_alloc::acquire(ifx, "itest-nic-a", 32, 4).expect("first lease");
+    let a = rxq_alloc::acquire(ifx, "itest-nic-a", 32, 1, 4).expect("first lease");
     assert_eq!(
         a.queues(),
         &[28, 29, 30, 31],
         "first session keeps parity with the §8 highest-indexed picks"
     );
-    let b = rxq_alloc::acquire(ifx, "itest-nic-a", 32, 4).expect("second lease");
+    let b = rxq_alloc::acquire(ifx, "itest-nic-a", 32, 1, 4).expect("second lease");
     for q in b.queues() {
         assert!(
             !a.queues().contains(q),
@@ -2002,8 +2003,8 @@ fn test_rxq_arbiter_exhaustion_refuses_with_derived_numbers() {
     // probed queue count, the DERIVED pool, and the demand — never a bare
     // errno-class line.
     let ifx = 0xACE1;
-    let _hold = rxq_alloc::acquire(ifx, "itest-nic-b", 8, 2).expect("pool-filling lease");
-    let err = rxq_alloc::acquire(ifx, "itest-nic-b", 8, 1).expect_err("exhausted pool");
+    let _hold = rxq_alloc::acquire(ifx, "itest-nic-b", 8, 1, 2).expect("pool-filling lease");
+    let err = rxq_alloc::acquire(ifx, "itest-nic-b", 8, 1, 1).expect_err("exhausted pool");
     for needle in [
         "itest-nic-b",
         "8 RX queues",
@@ -2017,10 +2018,10 @@ fn test_rxq_arbiter_exhaustion_refuses_with_derived_numbers() {
 #[test]
 fn test_rxq_arbiter_release_then_reacquire_reuses_index() {
     let ifx = 0xACE2;
-    let a = rxq_alloc::acquire(ifx, "itest-nic-c", 8, 2).expect("lease");
+    let a = rxq_alloc::acquire(ifx, "itest-nic-c", 8, 1, 2).expect("lease");
     assert_eq!(a.queues(), &[6, 7]);
     drop(a);
-    let b = rxq_alloc::acquire(ifx, "itest-nic-c", 8, 2).expect("reacquire");
+    let b = rxq_alloc::acquire(ifx, "itest-nic-c", 8, 1, 2).expect("reacquire");
     assert_eq!(b.queues(), &[6, 7], "freed indices must be reused");
 }
 
@@ -2030,7 +2031,7 @@ fn test_rxq_arbiter_range_derives_from_nic_queue_count() {
     // FUNCTION of the probed queue count — channels/4 top slice (§8).
     for channels in [8u32, 12, 32, 64] {
         let ifx = 0xACE8 + channels;
-        let lease = rxq_alloc::acquire(ifx, "itest-nic-d", channels, u16::MAX)
+        let lease = rxq_alloc::acquire(ifx, "itest-nic-d", channels, 1, u16::MAX)
             .unwrap_or_else(|e| panic!("{channels}-queue NIC must grant: {e}"));
         assert_eq!(lease.queues().len() as u32, channels / 4);
         for q in lease.queues() {
@@ -2156,7 +2157,7 @@ fn test_rxq_arbiter_serial_rearm_rotates_pool_before_reuse() {
     let ifx = 0xACF1;
     let mut seen: Vec<u32> = Vec::new();
     for i in 0..8 {
-        let l = rxq_alloc::acquire(ifx, "itest-nic-rot", 32, 1).expect("grant");
+        let l = rxq_alloc::acquire(ifx, "itest-nic-rot", 32, 1, 1).expect("grant");
         let q = l.queues()[0];
         assert!(
             !seen.contains(&q),
@@ -2166,7 +2167,7 @@ fn test_rxq_arbiter_serial_rearm_rotates_pool_before_reuse() {
         seen.push(q);
     }
     // History exhausted: the 9th arm reuses the LEAST-recently-freed.
-    let l = rxq_alloc::acquire(ifx, "itest-nic-rot", 32, 1).expect("grant");
+    let l = rxq_alloc::acquire(ifx, "itest-nic-rot", 32, 1, 1).expect("grant");
     assert_eq!(
         l.queues()[0],
         seen[0],
@@ -2181,8 +2182,8 @@ fn test_registration_rxqs_come_from_the_arbiter_grant_disjoint_across_sessions()
     // arbiter's granted list — two sessions' plans on one NIC can never
     // present the same rxq at REGISTER_ZCRX_IFQ time.
     let ifx = 0xACF2;
-    let a = rxq_alloc::acquire(ifx, "itest-nic-w", 32, 2).expect("lease A");
-    let b = rxq_alloc::acquire(ifx, "itest-nic-w", 32, 2).expect("lease B");
+    let a = rxq_alloc::acquire(ifx, "itest-nic-w", 32, 1, 2).expect("lease A");
+    let b = rxq_alloc::acquire(ifx, "itest-nic-w", 32, 1, 2).expect("lease B");
     let plan = |lease: std::sync::Arc<rxq_alloc::RxqLease>| ZcrxPlan {
         ifname: "itest-nic-w".into(),
         ifindex: ifx,
@@ -2190,6 +2191,7 @@ fn test_registration_rxqs_come_from_the_arbiter_grant_disjoint_across_sessions()
         rx_queues: lease.queues().to_vec(),
         rxq_lease: Some(lease),
         ring_fill_bytes: 0,
+        mtu: None,
     };
     let pa = plan(std::sync::Arc::new(a));
     let pb = plan(std::sync::Arc::new(b));
@@ -2336,14 +2338,20 @@ fn test_ten_devices_one_nic_first_session_wants_one_queue() {
         |ip: &std::net::IpAddr| (ip.to_string() == "10.0.0.1").then(|| "mock-e2e".to_string());
     let devices = probe::tcp_devices_via_nic_with(root, "mock-e2e", &resolve);
     assert_eq!(devices, 10, "the census sees all ten devices");
-    let eligible = 32 / 4; // lane_eligible_queues(32) width — the §8 pool
+    let eligible = {
+        // The census-driven pool (engagement campaign): every device
+        // can hold a lane — clamp(10, 8, 16) = 10.
+        let p = squeezefs::zcrx_lane::steering::lane_eligible_queues(32, devices);
+        p.end - p.start
+    };
+    assert_eq!(eligible, 10, "the pool covers the census");
     let want = squeezefs::zcrx_lane::steering::fair_queue_want(eligible, devices, 4);
-    assert_eq!(want, 1, "clamp(8/10, 1, 4) = 1");
-    let lease = rxq_alloc::acquire(0xDD01, "mock-e2e", 32, want).expect("lease");
+    assert_eq!(want, 1, "clamp(10/10, 1, 4) = 1");
+    let lease = rxq_alloc::acquire(0xDD01, "mock-e2e", 32, devices, want).expect("lease");
     assert_eq!(
         lease.queues().len(),
         1,
-        "the first session registers ONE queue — 8 of 10 devices get a lane"
+        "the first session registers ONE queue — every device gets a lane"
     );
 }
 

@@ -397,6 +397,12 @@ pub struct ZcrxPlan {
     /// probe) — added to every queue's area so the pool survives the
     /// driver's ring fill. 0 on the sim backend (no NIC ring exists).
     pub ring_fill_bytes: u64,
+    /// The NIC's MTU (arm-time probe; `None` = probe failed). The
+    /// engagement campaign's burst-occupancy input: the fills'
+    /// delivery-slack allotment (`area::delivery_slack_bytes`) and the
+    /// CQ's chunk-touch demand (`uring_zcrx::cq_entries_for`) both
+    /// derive from it; unknown degrades to the occupancy-½ posture.
+    pub mtu: Option<u32>,
     /// The arbiter lease backing `rx_queues` (RAII: the queues return to
     /// the NIC's pool when the session — and thus its ifqs — goes away).
     /// `None` only in direct unit constructions.
@@ -666,33 +672,38 @@ impl LaneSession {
                         // ring + ifq registration ON the driver thread
                         // (SINGLE_ISSUER law) → steering after ALL connects →
                         // RECV_ZC arms on the go signal.
-                        // Round-6 sizing law: the registered area must
-                        // cover the NIC RX ring's STANDING pool demand
-                        // (the plan carries it — probed at arm) ON TOP
-                        // of the fill window; admission clamps to the
-                        // fill window only — further shrunk (round 7,
-                        // the either/or law) to what a kernel-max CQ
-                        // can actually complete.
+                        // Sizing laws (rounds 6–7 + the 2026-08-06
+                        // engagement campaign): the registered area =
+                        // fill window (depth × max_xfer — admitted in
+                        // FULL, the /2 retired) + the DERIVED
+                        // delivery-slack allotment (burst occupancy
+                        // from the arm-time MTU probe — the budget the
+                        // /2 held implicitly) + the NIC RX ring's
+                        // STANDING pool demand (the plan carries it).
+                        // Admission clamps to the fill window — further
+                        // shrunk (round 7, the either/or law) to what a
+                        // kernel-max CQ can actually complete at the
+                        // burst-occupancy chunk grain.
+                        let chunk = super::area::chunk_bytes_default();
                         let fill_window =
                             super::area::area_bytes_per_queue(depth, target.max_xfer_bytes);
+                        let slack = super::area::delivery_slack_bytes(fill_window, plan.mtu, chunk);
                         let area = super::area::ZcrxArea::new(
-                            fill_window + plan.ring_fill_bytes,
-                            super::area::chunk_bytes_default(),
+                            fill_window + slack + plan.ring_fill_bytes,
+                            chunk,
                             plan.numa_node,
                         )?;
                         let sq = (depth as u32 + 8).next_power_of_two();
                         let cq = super::uring_zcrx::cq_entries_for(
                             depth,
                             target.max_xfer_bytes,
-                            super::area::chunk_bytes_default(),
+                            chunk,
                             sq,
+                            plan.mtu,
                         );
-                        let admit_window =
-                            fill_window.min(super::uring_zcrx::cq_admitted_window_bytes(
-                                cq,
-                                sq,
-                                super::area::chunk_bytes_default(),
-                            ));
+                        let admit_window = fill_window.min(
+                            super::uring_zcrx::cq_admitted_window_bytes(cq, sq, chunk, plan.mtu),
+                        );
                         let shared =
                             super::area_queue::AreaShared::new(depth, &area, admit_window as usize);
                         let cmds = super::uring_zcrx::RingCmd::new().map_err(io_err)?;

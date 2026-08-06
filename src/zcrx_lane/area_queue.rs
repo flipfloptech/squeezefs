@@ -20,24 +20,20 @@ use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
-/// Admission accounting grain (bytes per semaphore permit).
-pub(crate) const ADMISSION_UNIT: usize = 4096;
+/// Admission accounting grain — ONE definition ([`super::area`]).
+pub(crate) use super::area::ADMISSION_UNIT;
 
-/// Admission permits over the FILL WINDOW (the slice of the area the
-/// provider pool can actually hand to fills — the area minus the NIC
-/// ring's standing demand): HALF for admitted payload, half for
-/// delivery slack (short-recv fragmentation, headers riding payload
-/// chunks) — derived from the geometry, floor one chunk.
-///
-/// Round 6 kernel adjudication (io_uring/zcrx.c @ v6.19.14): the
-/// round-5 wire-grain `amp` model is DELETED — falsified by the field
-/// (MTU 9000 ⇒ amp 1, still instant exhaustion) and by the source
-/// (`io_zcrx_copy_chunk` packs fallback niovs FULLY via io_copy_page —
-/// no per-segment page burn). The real structural consumer is the NIC
-/// RX ring itself (see [`ring_standing_bytes`]).
-pub(crate) fn admission_permits(fill_window_len: usize, chunk: usize) -> usize {
-    ((fill_window_len / 2).max(chunk) / ADMISSION_UNIT).max(1)
-}
+// Admission permits: since the 2026-08-06 engagement campaign the
+// admitted window is granted in FULL (`super::area::admission_permits`
+// — the sizing-law home); the retired /2's delivery-slack budget lives
+// in the AREA size (`super::area::delivery_slack_bytes`).
+//
+// Round 6 kernel adjudication (io_uring/zcrx.c @ v6.19.14) still
+// stands underneath: the round-5 wire-grain `amp` model is DELETED —
+// falsified by the field (MTU 9000 ⇒ amp 1, still instant exhaustion)
+// and by the source (`io_zcrx_copy_chunk` packs fallback niovs FULLY
+// via io_copy_page — no per-segment page burn). The real structural
+// consumer is the NIC RX ring itself (see [`ring_standing_bytes`]).
 
 /// The NIC RX descriptor ring's STANDING demand on the provider pool
 /// (round 6): when the queue restarts onto the zcrx memory provider,
@@ -92,14 +88,17 @@ pub(crate) struct AreaShared {
 }
 
 impl AreaShared {
-    pub(crate) fn new(depth: u16, area: &ZcrxArea, fill_window_len: usize) -> Arc<AreaShared> {
+    /// `admit_window_len` is the ADMITTED payload window — granted in
+    /// full (2026-08-06 engagement law; the caller derives its venue's
+    /// delivery slack into the AREA size, never into this semaphore).
+    pub(crate) fn new(depth: u16, area: &ZcrxArea, admit_window_len: usize) -> Arc<AreaShared> {
         Arc::new(AreaShared {
             table: FillTable::new(),
             free_cids: Arc::new(std::sync::Mutex::new((0..depth).collect())),
             cid_gate: Arc::new(tokio::sync::Semaphore::new(depth as usize)),
             cid_capacity: depth as usize,
-            admission: Arc::new(tokio::sync::Semaphore::new(admission_permits(
-                fill_window_len,
+            admission: Arc::new(tokio::sync::Semaphore::new(super::area::admission_permits(
+                admit_window_len,
                 area.chunk_bytes(),
             ))),
             poisoned: AtomicBool::new(false),
@@ -182,8 +181,13 @@ pub(crate) fn spawn_area_queue(
     area: Arc<ZcrxArea>,
     session_poison: Arc<AtomicBool>,
 ) -> AreaQueue {
-    // Sim: no NIC ring exists — the whole area IS the fill window.
-    let shared = AreaShared::new(depth, &area, area.len());
+    // Sim: no NIC ring exists and the delivery grain is the loopback
+    // try_read (unprobed — no MTU to derive from), so HALF the area is
+    // the admitted window and the other half stays the slack budget:
+    // byte-identical to every Z2 contract's arithmetic (the real
+    // backend's slack is derived into the AREA size instead —
+    // `super::area::delivery_slack_bytes`).
+    let shared = AreaShared::new(depth, &area, area.len() / 2);
     let (read_half, write_half) = stream.into_split();
     let (tx, rx) = mpsc::unbounded_channel();
 
@@ -289,14 +293,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn admission_derives_from_the_fill_window() {
+    fn admission_grants_the_full_admitted_window() {
+        // 2026-08-06 engagement law: the caller's admitted window grants
+        // in FULL (the /2 retired — its slack budget lives in the AREA
+        // size, `super::super::area::delivery_slack_bytes`).
         let window = 64 << 20;
         assert_eq!(
-            admission_permits(window, 4096),
-            (window / 2) / ADMISSION_UNIT,
-            "half the FILL WINDOW (never the whole area) admits payload"
+            super::super::area::admission_permits(window, 4096),
+            window / ADMISSION_UNIT,
+            "the WHOLE admitted window admits payload"
         );
-        assert!(admission_permits(4096, 4096) >= 1, "floor one unit");
+        assert!(
+            super::super::area::admission_permits(4096, 4096) >= 1,
+            "floor one unit"
+        );
     }
 
     #[test]

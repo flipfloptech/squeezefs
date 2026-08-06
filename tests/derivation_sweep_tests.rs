@@ -785,7 +785,10 @@ fn zcrx_engagement_geometry_derives_on_canonical_shapes() {
         area::admission_permits(window as usize, 4096) as u64,
         window / 4096
     );
-    assert_eq!(area::delivery_slack_bytes(window, Some(9000), 4096), 24 << 20);
+    assert_eq!(
+        area::delivery_slack_bytes(window, Some(9000), 4096),
+        24 << 20
+    );
     assert_eq!(area::delivery_slack_bytes(window, None, 4096), window);
 }
 

@@ -113,15 +113,16 @@ pub fn nvme_tcp_target_for_with_root(device_path: &str, sysfs_root: &Path) -> Op
 
 /// Pre-steering ceiling on the DERIVED per-device lane-queue want
 /// (derivation-debt audit 2026-08-04 — named so the number has a
-/// definition site): at probe time the NIC is unknown, so the §8
-/// NIC-derived ceiling (`nic_queues / 4` — keep ≥ ¾ of the RSS set)
-/// cannot apply yet; it does at steering (`steering::lane_queue_picks`),
-/// where the device is known. Until then each wanted queue pins
-/// `queue_depth × LANE_MAX_XFER_CAP_BYTES`-class area RAM at arm, so
-/// this rail bounds the pre-steering pinned footprint at
-/// `8 × 64 × 1 MiB = 512 MiB`/device worst case — the largest geometry
-/// the Z2/Z3 acceptance venues exercised. Interim measured posture,
-/// filed with the §8 BDP follow-on; tie-tested in
+/// definition site): at probe time the NIC is unknown, so the
+/// NIC-derived pool ceiling (the census-driven
+/// `steering::lane_eligible_queues` slice) cannot apply yet; it does at
+/// steering, where the device is known. Until then each wanted queue
+/// pins `queue_depth × LANE_MAX_XFER_CAP_BYTES`-class area RAM at arm,
+/// so this rail bounds the pre-steering pinned footprint at
+/// `8 × (64 MiB window + derived slack + ring standing)`/device worst
+/// case (engagement campaign: the window admits in full and the area
+/// carries its slack explicitly — ≈ 8 × 184 MiB at the 9000-MTU/8192-
+/// desc field rail). Interim measured posture; tie-tested in
 /// `tests/derivation_sweep_tests.rs`.
 pub const LANE_IO_QUEUES_MAX: u16 = 8;
 
@@ -132,17 +133,26 @@ pub const LANE_IO_QUEUES_MAX: u16 = 8;
 /// * `io_queues = clamp(cpus / 8, 1, LANE_IO_QUEUES_MAX)` — the §8
 ///   possible-CPUs slope; floor 1 is the physical minimum (a lane with
 ///   zero queues cannot exist); the ceiling is the pre-steering want
-///   rail (see [`LANE_IO_QUEUES_MAX`] — the real §8 ceiling is
-///   NIC-derived and applies at steering).
-/// * `queue_depth = clamp(cpus × 2, 4, 64)` — an INTERIM in-flight
-///   slope standing in for §8's BDP derivation (`bdp_bytes /
-///   block_size` from link speed × measured connect RTT — that probe is
-///   not built; filed follow-on, derivation-debt audit 2026-08-04).
-///   Floor 4 and cap 64 are §8's own `derived_inflight` clamp — the
-///   floor is the transport's never-regress `Q_DEPTH_FLOOR` class — and
-///   CAP.MQES still clamps the granted depth at connect
-///   (`initiator.rs`), so the cap never exceeds what the controller
-///   grants.
+///   rail (see [`LANE_IO_QUEUES_MAX`] — the real ceiling is the
+///   NIC/census-derived pool and applies at steering).
+/// * `queue_depth = clamp(cpus × 2, 4, 64)` — the OFFERED-CONCURRENCY
+///   slope. The 2026-08-06 engagement campaign adjudicated the §8 BDP
+///   line (`bdp_bytes / block_size` from link speed × RTT) AGAINST
+///   building it: the wire-BDP depth class is a self-fulfilling
+///   equilibrium under demand-concurrent venues — falsified twice for
+///   read-side depth (the 2026-08-01 read-lane falsification; the
+///   2026-08-06 queue-wall audit explicitly credits the ABSENCE of
+///   measured-BW-derived terms) — and at fabric RTT it derives a
+///   window (~6 MiB) that would decline nearly all of the ~51 MiB/
+///   device the field row offers. Depth × max_xfer IS the per-queue
+///   admitted window (granted in full since the campaign), so the
+///   client-concurrency slope is the term that scales admission to
+///   offered demand: 64 at the 32-CPU field client = 64 MiB/queue ≥
+///   the offered ~51 MiB/device. Floor 4 and cap 64 are §8's own
+///   `derived_inflight` clamp — the floor is the transport's
+///   never-regress `Q_DEPTH_FLOOR` class — and CAP.MQES still clamps
+///   the granted depth at connect (`initiator.rs`), so the cap never
+///   exceeds what the controller grants.
 pub fn lane_geometry(cpus: usize) -> (u16, u16) {
     let io_queues = (cpus / 8).clamp(1, LANE_IO_QUEUES_MAX as usize) as u16;
     let queue_depth = (cpus * 2).clamp(4, 64) as u16;

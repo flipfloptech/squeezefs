@@ -600,7 +600,13 @@ pub(crate) const KERNEL_MAX_CQ_ENTRIES: u32 = 2 * 32768;
 /// completion demand (round 7 field: 8 queues died `RECV_ZC terminal:
 /// ENOSPC` ~134 MB into the first healthy row): every admitted command
 /// can deliver its whole payload as chunk-grain CQEs between two reap
-/// passes, so `cq = depth × ⌈max_xfer / chunk⌉ + sq_entries` (send /
+/// passes. Since the 2026-08-06 engagement campaign the per-command
+/// chunk-touch demand is BURST-OCCUPANCY-aware (the same
+/// `area::burst_geometry` the delivery-slack allotment derives from):
+/// a fragmented delivery touches `⌈max_xfer/mtu⌉ × ⌈mtu/chunk⌉` chunks
+/// worst case (each touched chunk = one CQE), never fewer than the
+/// flat `⌈max_xfer/chunk⌉`; unknown MTU degrades to 2× flat — the
+/// occupancy-½ posture. `cq = depth × per_cmd + sq_entries` (send /
 /// doorbell / recv-end headroom), next pow2, clamped to the kernel max.
 /// Kernel law being sized for: a full CQ makes `io_cqe_cache_refill`
 /// (overflow=false) return false — zcrx NEVER takes the overflow path
@@ -608,18 +614,44 @@ pub(crate) const KERNEL_MAX_CQ_ENTRIES: u32 = 2 * 32768;
 /// io_uring.h:286–293 → :257–264 with overflow=false) — and the recv
 /// terminates -ENOSPC (zcrx.c:1280/:1317). The userspace contract is
 /// size-adequately + reap-promptly; there is no kernel-side recovery.
-pub(crate) fn cq_entries_for(depth: u16, max_xfer: u32, chunk: usize, sq_entries: u32) -> u32 {
-    let per_cmd = (max_xfer as u64).div_ceil(chunk.max(1) as u64).max(1);
+pub(crate) fn cq_entries_for(
+    depth: u16,
+    max_xfer: u32,
+    chunk: usize,
+    sq_entries: u32,
+    mtu: Option<u32>,
+) -> u32 {
+    let chunk = chunk.max(1);
+    let flat = (max_xfer as u64).div_ceil(chunk as u64).max(1);
+    let per_cmd = match super::area::burst_geometry(mtu, chunk) {
+        Some(g) => {
+            let bursts = (max_xfer as u64).div_ceil(g.payload_bytes).max(1);
+            flat.max(bursts * (g.burst_bytes / chunk as u64))
+        }
+        None => flat * 2,
+    };
     let demand = depth as u64 * per_cmd + sq_entries as u64;
     demand.next_power_of_two().min(KERNEL_MAX_CQ_ENTRIES as u64) as u32
 }
 
 /// The either/or honesty clamp (the round-5 admission law's shape): if
 /// the derived CQ hits the kernel max, the ADMISSION window must shrink
-/// to what the CQ can actually hold — `(cq − sq_headroom) × chunk × 2`
-/// (admission spends half its window on in-flight payload).
-pub(crate) fn cq_admitted_window_bytes(cq_entries: u32, sq_entries: u32, chunk: usize) -> u64 {
-    (cq_entries.saturating_sub(sq_entries) as u64) * chunk as u64 * 2
+/// to the PAYLOAD the CQ's span budget can actually complete —
+/// `(cq − sq_headroom)` chunk-grain spans at the delivery burst
+/// occupancy (engagement campaign: admission is the FULL window now, so
+/// the retired `× 2` half-window compensation is gone; unknown MTU
+/// degrades to occupancy ½).
+pub(crate) fn cq_admitted_window_bytes(
+    cq_entries: u32,
+    sq_entries: u32,
+    chunk: usize,
+    mtu: Option<u32>,
+) -> u64 {
+    let span_bytes = (cq_entries.saturating_sub(sq_entries) as u64) * chunk as u64;
+    match super::area::burst_geometry(mtu, chunk) {
+        Some(g) => span_bytes.saturating_mul(g.payload_bytes) / g.burst_bytes,
+        None => span_bytes / 2,
+    }
 }
 
 /// How many CONSECUTIVE failover windows (no payload progress between
@@ -1494,27 +1526,42 @@ mod tests {
 
     #[test]
     fn cq_sizing_derives_from_chunk_grain_completion_demand() {
-        // Round 7 field arithmetic: depth 64 × ⌈1 MiB / 4 KiB⌉ = 16,384
-        // chunk CQEs of standing demand + 128 sq headroom → 32,768
-        // (pow2), within the kernel max — vs the shipped implicit
-        // cq = sq × 4 = 512 that died ENOSPC ~134 MB into the row.
-        assert_eq!(cq_entries_for(64, 1 << 20, 4096, 128), 32768);
-        assert!(cq_entries_for(64, 1 << 20, 4096, 128) <= KERNEL_MAX_CQ_ENTRIES);
+        // Round 7 field arithmetic, burst-occupancy-aware since the
+        // engagement campaign: at the 9000-MTU field rail a 1 MiB
+        // command fragments into ⌈1 MiB/9000⌉ = 117 bursts × 3 chunks
+        // = 351 chunk CQEs; depth 64 × 351 + 128 sq headroom = 22,592
+        // → 32,768 (pow2) — the SAME CQ the flat round-7 arithmetic
+        // landed on, now honest about fragmentation.
+        assert_eq!(cq_entries_for(64, 1 << 20, 4096, 128, Some(9000)), 32768);
+        // Unknown MTU degrades to 2× flat (occupancy ½): 64 × 512 + 128
+        // → 65,536.
+        assert_eq!(cq_entries_for(64, 1 << 20, 4096, 128, None), 65536);
+        assert!(cq_entries_for(64, 1 << 20, 4096, 128, Some(9000)) <= KERNEL_MAX_CQ_ENTRIES);
+        // A chunk-exact MTU is the flat demand exactly.
+        assert_eq!(cq_entries_for(64, 1 << 20, 4096, 128, Some(8192)), 32768);
         // A monster geometry clamps at the kernel max…
         assert_eq!(
-            cq_entries_for(512, 4 << 20, 4096, 128),
+            cq_entries_for(512, 4 << 20, 4096, 128, Some(9000)),
             KERNEL_MAX_CQ_ENTRIES,
             "demand beyond the kernel max clamps (io_uring.h:161)"
         );
-        // …and the admission window then shrinks to what the CQ holds.
-        let cap = cq_admitted_window_bytes(KERNEL_MAX_CQ_ENTRIES, 128, 4096);
+        // …and the admission window then shrinks to the PAYLOAD the
+        // CQ's span budget completes at the burst occupancy (the
+        // retired ×2 half-window compensation is gone — admission is
+        // the full window now).
+        let cap = cq_admitted_window_bytes(KERNEL_MAX_CQ_ENTRIES, 128, 4096, Some(9000));
         assert_eq!(
             cap,
-            (KERNEL_MAX_CQ_ENTRIES as u64 - 128) * 4096 * 2,
-            "admission window ≤ 2 × (cq − sq headroom) × chunk"
+            (KERNEL_MAX_CQ_ENTRIES as u64 - 128) * 4096 * 9000 / 12288,
+            "admitted payload ≤ (cq − sq headroom) spans × occupancy"
+        );
+        assert_eq!(
+            cq_admitted_window_bytes(KERNEL_MAX_CQ_ENTRIES, 128, 4096, None),
+            (KERNEL_MAX_CQ_ENTRIES as u64 - 128) * 4096 / 2,
+            "unknown MTU: occupancy ½"
         );
         // Small ring floors sanely.
-        assert!(cq_entries_for(2, 4096, 4096, 16) >= 16);
+        assert!(cq_entries_for(2, 4096, 4096, 16, None) >= 16);
     }
 
     // -- the two per-completion gates ----------------------------------

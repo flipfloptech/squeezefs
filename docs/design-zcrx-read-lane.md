@@ -1,18 +1,82 @@
 # Design: the zcrx read lane — a userspace NVMe/TCP initiator for cold read fills
 
-Rev 3 — 2026-08-04. Branch `perf/zcrx-z3` (Rev 2: `perf/zcrx-lane-z2`;
-Rev 1: `perf/zcrx-lane`, 2026-08-03). Status: **Phase-1 bracket GO**
+Rev 4 — 2026-08-06. Branch `perf/zcrx-engagement` (Rev 3:
+`perf/zcrx-z3`; Rev 2: `perf/zcrx-lane-z2`; Rev 1: `perf/zcrx-lane`,
+2026-08-03). Status: **Phase-1 bracket GO**
 (`.benchmarks/2026-08-03-zcrx-lane.md`); PR Z1 shipped the initiator
 core + probes + gauges + opt-in wire-in; PR Z2 shipped the
 zcrx recv backend — the area/refill/gather machinery, the steering
 state machine + live ethtool/netlink surface, and the raw
 `REGISTER_ZCRX_IFQ`/`RECV_ZC` driver (local contracts + loom;
 live-NIC execution field-owed — `.benchmarks/2026-08-04-zcrx-z2.md`);
-**PR Z3 (this branch) ships MEM-3 cancellation custody + gather-serve
-fusion** (`.benchmarks/2026-08-04-zcrx-z3.md`); default-on adjudication
-stays field-owed behind the D5 gate chain (MEM-3 ✓ → TEST-6 ✓ — the
-in-module contract suite `src/zcrx_lane/uring_zcrx.rs::tests` — → Z3
-field rows, now the chain's remaining link).
+PR Z3 shipped MEM-3 cancellation custody + gather-serve
+fusion (`.benchmarks/2026-08-04-zcrx-z3.md`); the eight-round Z3 field
+campaign (`.benchmarks/2026-08-05-zcrx-z3-field-rows.md`) landed
+correct-and-safe and PARKED the lane on engagement economics (0.05 %
+engagement could not pay the RSS rent); **PR Z4 (this branch) is the
+ENGAGEMENT campaign** — phase 2 of the read copy-elimination program
+(`.benchmarks/2026-08-06-read-cpu-wall.md`: reads are whole-box
+CPU-bound, so every zero-copy RX byte is direct capacity;
+`.benchmarks/2026-08-06-read-dest-lease.md` FIELD ACCEPTANCE: 27.9 of
+41.8 raw after phase 1, the 85 % bar = 35.5). Default-on adjudication
+stays field-owed behind the D5 gate chain (MEM-3 ✓ → TEST-6 ✓ → the
+Rev-4 engagement field rows, §13).
+
+**Rev 4 amendments (the engagement geometry — all derived, no
+constants):**
+
+* **The census-driven eligible pool** (`steering::lane_eligible_queues`)
+  — width `clamp(devices_via_nic, channels/4, channels/2)`, highest-
+  indexed slice. The round-8 verdict's flat `/4` pool (8 of 32) left
+  2 of 10 field devices with NO lane — 20 % of row bytes structurally
+  kernel-path. The DEVICE CENSUS (`probe::tcp_devices_via_nic`, the
+  finding-C/D machinery) now widens the pool exactly as far as fabric
+  breadth demands: floor = the standing ¼ posture (a sole-device arm is
+  byte-identical to Rev 3), ceiling = the kernel path (writes,
+  metadata, admin, declined reads) keeps ≥ HALF the NIC's RSS width.
+  Field: `clamp(10, 8, 16) = 10` → every device leases one queue (the
+  two-rail 5/5 split stays at the floor 8, all covered);
+  `fair_queue_want` is unchanged (`clamp(10/10, 1, 4) = 1`).
+* **Full-window admission** (`area::admission_permits`) — the admitted
+  payload window is the WHOLE `depth × max_xfer` fill window; the
+  retired `/2` was an implicit delivery-slack budget that halved
+  engagement capacity (32 MiB/queue admitted vs the ~51 MiB/device the
+  cold field row offers = whole-read atomic admission declining most of
+  the row). The admitted window and the CID namespace are now the SAME
+  arithmetic (`depth` commands of `max_xfer`). Field: 64 MiB/queue ≥
+  51.2 MiB offered — ≥ 16 concurrent whole 4 MiB reads admit (was 8).
+* **The delivery slack is explicit and derived**
+  (`area::delivery_slack_bytes` over `area::burst_geometry`): an
+  MTU-grain payload burst lands in `⌈mtu/chunk⌉` page-grain niovs (HDS
+  splits headers off; payload starts a fresh niov), so the fills' chunk
+  budget carries `window × (burst − payload)/payload` extra bytes,
+  PMD-rounded (field: 64 MiB × 3288/9000 → 24 MiB). Unknown MTU
+  degrades to `window` — occupancy ½, the retired posture's exact
+  budget. Area = **window + slack + ring-standing** (rounds 6–7
+  arithmetic unchanged underneath; ≈ 184 MiB/queue on the field rail,
+  R5-gauged as before — Red still blocks arms). The CQ demand and the
+  round-7 either/or clamp are burst-occupancy-aware through the same
+  function (`cq_entries_for` worst-case chunk-touch = `⌈max_xfer/mtu⌉ ×
+  ⌈mtu/chunk⌉`; `cq_admitted_window_bytes` = spans × occupancy — the
+  `× 2` half-window compensation retired with the `/2`). Sub-MTU
+  segmentation storms stay the round-5/6 park governor's job — parks
+  are flow control, never poison, and the round-8 structural-starvation
+  teardown (no-harm) is untouched.
+* **BDP depth ADJUDICATED AGAINST** (the §8 line is superseded): the
+  wire-BDP depth class is a self-fulfilling equilibrium under
+  demand-concurrent venues — falsified twice on the read side
+  (2026-08-01 read-lane; the 2026-08-06 queue-wall audit credits the
+  absence of measured-BW terms) — and at fabric RTT it derives a ~6 MiB
+  window that would decline nearly everything the row offers. Depth
+  stays the OFFERED-CONCURRENCY slope (`clamp(cpus × 2, 4, 64)`,
+  MQES-clamped at connect): depth × max_xfer IS the admitted window,
+  so the client-concurrency slope is what scales admission to offered
+  demand.
+* **Dest-lease composition (§12)** and the **engagement field rows
+  (§13)** are specified below. Lazy re-arm after structural teardown
+  stays a filed follow-on (with the sized window the structural trigger
+  should not fire; if it does, the row is INVALID by the engagement law
+  and gets diagnosed, not presented).
 
 **Rev 3 amendments (Z3 as built):**
 
@@ -338,18 +402,37 @@ posture.
 | R5 Red | lane area is a non-sheddable component registered at arm; Red blocks NEW lane arms and sheds nothing (area is fixed); in-flight converges by completion |
 | Fenced mount (`writer_guard_fenced`) | lane is read-only and keeps serving reads exactly like the kernel path; no interaction |
 
-## 8. Derived sizing (no fixed constants)
+## 8. Derived sizing (no fixed constants — Rev 4 supersedes the BDP line)
 
-* **Lane queues per device**: `clamp(possible_cpus / 8, 1, nic_queues / 4)`
-  — bounded so the RSS set keeps ≥ ¾ of the NIC queues.
-* **Queue depth (SQSIZE)**: `min(MQES + 1, derived_inflight)` where
-  `derived_inflight = clamp(bdp_bytes / block_size, 4, 64)`;
-  `bdp_bytes` from link speed (sysfs) × measured connect RTT class.
-* **Area per queue**: `depth × max_stored_image_len(block_size)`
-  rounded to PMD, floor one PMD; PMD-aligned mmap (the thp.rs
-  `map_shared_pmd_aligned` law), `MADV_HUGEPAGE`, NUMA-bound to the
-  NIC's node (`numa_core::is_local_choice` map), populated at arm.
+* **Eligible pool per NIC** (Rev 4): the highest-indexed
+  `clamp(devices_via_nic, nic_queues/4, nic_queues/2)` RX queues —
+  census-widened so every fabric device behind the rail can hold a
+  lane; the kernel path keeps ≥ half the NIC's RSS width.
+* **Lane queues per device**: geometry want `clamp(possible_cpus / 8,
+  1, 8)`, fair-spread `clamp(eligible / devices, 1, want)`, then the
+  free-rule-slot clamp and the rxq arbiter's grant.
+* **Queue depth (SQSIZE)**: `min(MQES + 1, clamp(cpus × 2, 4, 64))` —
+  the OFFERED-CONCURRENCY slope. (The Rev 1–3 BDP line — `bdp_bytes /
+  block_size` from link speed × RTT — is ADJUDICATED AGAINST, Rev 4:
+  the wire-BDP class is a self-fulfilling equilibrium, falsified twice
+  on the read side, and at fabric RTT it would decline nearly all
+  offered demand. Depth × max_xfer IS the admitted window.)
+* **Admitted window per queue** (Rev 4): `depth × max_xfer`, granted in
+  FULL by the admission semaphore (whole-read atomic, round 8), clamped
+  by the round-7 either/or law to the CQ's occupancy-aware payload
+  budget.
+* **Area per queue**: `depth × max_xfer` (PMD-rounded, floor one PMD)
+  **+ delivery slack** (`window × (burst − payload)/payload` from the
+  MTU/chunk burst geometry; unknown MTU ⇒ `window`, occupancy ½) **+
+  the NIC RX ring's standing pool demand** (round 6); PMD-aligned mmap
+  (the thp.rs `map_shared_pmd_aligned` law), `MADV_HUGEPAGE`,
+  NUMA-bound to the NIC's node (`numa_core::is_local_choice` map),
+  populated at arm.
 * **Refill ring entries**: area chunks (1:1), pow2.
+* **CQ entries**: `depth × per_cmd + sq` next-pow2, kernel-max-clamped,
+  where `per_cmd` is the burst-occupancy worst-case chunk-touch count
+  (`max(⌈max_xfer/chunk⌉, ⌈max_xfer/mtu⌉ × ⌈mtu/chunk⌉)`; unknown MTU ⇒
+  2× flat).
 
 ## 9. Observability (stats inode)
 
@@ -411,3 +494,103 @@ dest-read bytes). Ledger closure extension per §4.4.
    surfaces at Connect — arm fails loud, kernel path intact.
 4. **Keep-alive**: KATO 0 in v1; if a field target enforces nonzero
    KATO, arm fails loud at Connect and Z2 adds the keep-alive tick.
+
+## 12. Composition with the READ dest-window lease (Rev 4 adjudication)
+
+The dest-lease (copy-elimination phase 1,
+`.benchmarks/2026-08-06-read-dest-lease.md`) serves cold 4 KiB-aligned
+sub-block kernel windows by aiming the ranged primitive's device DMA at
+the reply's registered ent window — the serve dest-copy deleted. The
+question the engagement campaign owed an answer: do the zcrx gather
+path and the dest-lease DMA **compose or conflict**?
+
+**Verdict: they COMPOSE at the funnel, by construction — and the
+compose's floor on this kernel is ONE fused gather, not zero.**
+
+* A leased window arrives at `read_block_with_dest_inner` as a
+  dest-carrying, LBA-aligned ranged read — exactly the Z3 fused-gather
+  shape (`dest_addr = Some`, area backend). The lane serves it with the
+  ONE requester-side gather (`read_into_dest`) landing directly in the
+  leased ent window; the lease's incarnation/still-check/binding-
+  recheck ceremony is vehicle-blind (it wraps the device read whatever
+  serves it), and `read_dest_lease_bytes ⊆ read_dest_dma_bytes` keep
+  counting at the routing serve regardless of vehicle — the 2026-08-02
+  ledger closure is untouched. Pinned:
+  `test_compose_dest_lease_shape_rides_the_fused_lane`.
+* **Zero daemon passes end-to-end is NOT expressible**: the zcrx area
+  is a NIC-owned, arrival-ordered page pool — the refill ring hands
+  free chunks to the NIC in delivery order, so no mechanism can aim a
+  SPECIFIC read's C2HData payload at a SPECIFIC ent window; and the
+  FUSE commit copy imports the REGISTER-time ent VA (the dest-lease
+  kernel adjudication §1A — the reply body must sit at the ent window
+  base), so the area can never BE reply-reachable memory. The serve
+  from lane-area memory to the reply window is therefore exactly one
+  gather — which the Z3 fusion already made the ONLY daemon pass.
+* **What phase 2 alone buys (the pricing)**: on lease-served bytes the
+  kernel path pays the nvme-tcp RX skb copy — 0.69–0.72 passes/byte at
+  the ~2.7 GB/s/core skb-walk class (the queue-wall's measured
+  per-core RX wall), the exact residual term the CPU-wall ruling names.
+  Through the lane those bytes arrive by NIC DMA (zcrx-side residual
+  0.035 B/B DRAM, Phase-1) and pay one userspace NT gather at memcpy
+  class (~3–4× cheaper per byte than the skb walk, non-cache-
+  polluting). Daemon passes on dest bytes go 0 → 1 while kernel passes
+  go 0.69 → 0: net ≈ −0.2 to −0.3 core-s/GB per lane byte on a box
+  measured 92 % busy at 27.9 GB/s — the freed ~6–8 cores are the
+  capacity the 35.5 bar needs if the row stays CPU-elastic (the
+  CPU-wall arithmetic). Pooled fills (tier-admitted / hold-retained)
+  keep the Z2 two-pass shape with the kernel RX pass killed — same
+  direction, one more daemon pass by design (§4.4: memory that outlives
+  the serve pays the pooled gather).
+* **Interaction, stated**: the lease's LANE YIELD (dest-leaseable
+  streams stand the R2/ahead speculative arms down) means leased
+  streams offer DEMAND windows only — per-window lane reads at client
+  concurrency. That is admission-friendly (windows ≤ 1 MiB = 1
+  command) and orthogonal to the whole-block fill shapes the admission
+  window was sized for; no code interaction exists beyond the funnel.
+* **The true zero-pass serve** stays the staged zc-serve follow-on
+  (dest-lease §8.1: READ_FIXED into the kernel-registered request
+  folios — kills the serve AND commit passes; sqz-kernel-only). The
+  lane's gather is the floor until that kernel surface ships.
+
+## 13. The engagement field rows (the D5 chain's remaining link — field-only)
+
+The engagement GEOMETRY is field-only by nature (real mlx5 queues, real
+RSS width, real ntuple verdicts — ntuple is ON on both rails from the
+earlier campaign); the sim pins every law up to the io_uring syscall
+seam (TEST-6). The acceptance instrument is
+`tests/fio/zcrx_field_rows.sh` (A-B-B-A lane-on/off remounts, one
+prefilled beyond-RAM fileset), run on the squeeze-test client (sqz
+kernel, 32 RX queues/rail, MTU 9000, 10 data namespaces):
+
+* **Geometry engagement (arm-time, logged + snapshot)**: 10 lane
+  sessions armed (`zcrx_lane_armed = 1`, one per device — the census
+  pool), RSS width 22/32 per rail, `zcrx_area_bytes` ≈ 10 × ~184 MiB.
+* **Row A (lane on) vs B (off), cold seq-read ≥ 60 s sustained + the
+  rand-4k face, BOTH orders**: the verdict is the A-B-B-A side medians,
+  never a single order (the aging-store rule).
+* **Engagement laws (a row violating any is INVALID, printed loudly,
+  never presented as a lane number)**:
+  - `zcrx_fill_bytes` delta ≥ **50 % of row user bytes** (the
+    serve-the-bulk bar — the rig's `eng > 0.5` verdict; round 8
+    measured 0.0005),
+  - `gather ≡ fill` byte-exact (round-7 whole-read boundary),
+  - `zcrx_dest_gather_bytes` accounts the dest-leg share (with the
+    dest-lease armed, expect dest_gather ≈ gather on the leased rows),
+  - `zcrx_lane_poisoned = 0`, `zcrx_frame_violations = 0`,
+    `zcrx_fill_fallbacks ≈ 0`,
+  - `zcrx_area_admission_waits` bounded (declines are the SIZING
+    instrument now: sustained growth at < 100 % engagement = the
+    window is still under-derived — name the term, do not hand-tune),
+  - `parks`/`failovers` bounded episodes, six-consecutive pristine
+    teardowns (0 rules, full RSS after every mount — the round-8 bar).
+* **The performance verdict**: CPU/byte (pidstat daemon cores/GB +
+  mpstat %sys/%soft) DOWN on the lane side at ≥ par throughput — and
+  the composed row (lane + dest-lease, both defaults-on-trial) read
+  against the **35.5 GB/s bar** (85 % of the 41.8 raw ceiling, the
+  2026-08-06 ruling). The RSS rent (item 3) is accepted or refused by
+  exactly this row: at > 50 % lane share the kernel path's lost width
+  taxes a minority of bytes on a CPU-freed box; the no-harm teardown
+  machinery (round 8) remains the automatic exit if the row disproves
+  it.
+* **After the row**: default-on adjudication per the user sequencing
+  (2026-08-03) — default-on last, and only on a counted win.

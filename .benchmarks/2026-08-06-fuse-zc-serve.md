@@ -298,3 +298,11 @@ cause hunt (field, counted):
 * Default stays **OFF**; flipping default-ON (on kmbuf-Present
   kernels) is a follow-up commit after field acceptance — the
   dest-lease precedent.
+* **Write bracket ADJUDICATED (2026-08-06,
+  `.benchmarks/2026-08-06-fuse-zc-write-bracket.md`): default stays
+  OFF.** Seq-1M writes par (0.998×), but rand-4k write −6.4 % (both
+  brackets) and the durable fsync_on_close row −9.1 % (armed never
+  reaches the control side's ~24 GB/s mode) — the extraction round
+  trip's per-op term. The read win re-confirmed on the same binary
+  (40.09 GB/s armed sentinel). Armed WRITE engagement is now
+  ledger-visible: `fuse3_zc_write_extractions/_bytes`.

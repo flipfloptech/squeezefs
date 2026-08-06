@@ -6971,7 +6971,27 @@ mod tests {
         let deadline = Instant::now() + window;
         loop {
             let now = count_sqpoll_pollers();
-            assert_eq!(now, expected, "{ctx}");
+            if now != expected {
+                // Self-naming failure: dump every task comm — libtest names
+                // threads after their running test, so a poller-count
+                // violation names the concurrent test set that produced it.
+                // (Armed permanently after a ~1/100 in-suite firing that
+                // was 120/120 solo-green — the next firing attributes
+                // itself instead of costing another hunt.)
+                let mut dump = String::new();
+                if let Ok(tasks) = std::fs::read_dir("/proc/self/task") {
+                    for t in tasks.flatten() {
+                        let comm =
+                            std::fs::read_to_string(t.path().join("comm")).unwrap_or_default();
+                        dump.push_str(&format!(
+                            "  tid={} comm={}\n",
+                            t.file_name().to_string_lossy(),
+                            comm.trim_end()
+                        ));
+                    }
+                }
+                panic!("{ctx}: now={now} expected={expected}\ntasks:\n{dump}");
+            }
             if Instant::now() >= deadline {
                 return;
             }

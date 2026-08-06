@@ -7627,6 +7627,22 @@ impl DataRouter {
     /// (`spawn_bg`), generation fencing, and shed-rollback contract as
     /// [`Self::spawn_prefetch_task`]. Returns `spawn_bg`'s verdict:
     /// `false` = shed un-run, the CALLER rolls back.
+    ///
+    /// **Completion-driven refill (2026-08-06 fill-clamp campaign —
+    /// contract 14):** a settled task RE-DRIVES the issue path for its
+    /// live lane. Issue used to be touch-driven only, so when a
+    /// stream's whole qd sat blocked on fills (the cold-row steady
+    /// state), completions emptied the pipe and nothing refilled it
+    /// until the reader's next request — effective fill concurrency
+    /// became request-arrival cadence, invariant to the depth pin (the
+    /// field's flat D4/D8/D16 ladder at ~50 in-flight vs the raw row's
+    /// 160; local: `read_lane_inflight_bytes` sawtoothing depth→0 with
+    /// devices at qd 1–20). Converge-by-completion is the
+    /// write-pipeline admission law's read twin: the refill re-enters
+    /// `read_lane_top_up` (same single-issuer, quiescence, generation,
+    /// Red, depth and horizon gates — the reader-tied horizon still
+    /// bounds the cursor, so a stalled reader stops the chain at
+    /// horizon, never EOF).
     #[allow(clippy::too_many_arguments)]
     fn spawn_read_lane_task(
         &self,
@@ -7642,16 +7658,37 @@ impl DataRouter {
         let router = self.clone();
         crate::bg_admit::spawn_bg(async move {
             let lane = &lanes.lanes[lane_idx];
-            let settle = |completed: bool| {
+            // Returns `true` when the settled task's lane is still live
+            // (the completion-refill gate — an error/stale settle never
+            // re-drives issue, so a failing device cannot self-loop).
+            let settle = |completed: bool| -> bool {
                 // Parked-task screen closure (the R2 settle rule).
                 let _ = lane
                     .pending_blocks
                     .remove_sync(&lane_pending_key(generation, block));
                 lane.rl_inflight.fetch_sub(1, Relaxed);
                 router.read_lane.sub_inflight(block_size);
-                if !completed || lane.generation.load(Relaxed) != generation {
+                let live = lane.generation.load(Relaxed) == generation;
+                if !completed || !live {
                     METRICS.read_lane_wasted.fetch_add(1, Relaxed);
                 }
+                completed && live
+            };
+            let refill = |router: &DataRouter| {
+                router.read_lane_top_up(
+                    &file_path,
+                    &meta,
+                    block_size,
+                    // The reader's live edge: `consumed_edge` is the
+                    // newest touch's end_block + 1.
+                    lane.consumed_edge.load(Relaxed).saturating_sub(1),
+                    &lanes,
+                    lane_idx,
+                    generation,
+                    METRICS.prefetch_active_streams.load(Relaxed),
+                    crate::mem_budget::level(),
+                    false,
+                );
             };
             if lane.generation.load(Relaxed) != generation {
                 settle(false);
@@ -7662,7 +7699,9 @@ impl DataRouter {
                 BlockKeyResolve::Key(k) => k.into_owned(),
                 BlockKeyResolve::Hole => {
                     // Hole in the current map: nothing to fetch.
-                    settle(true);
+                    if settle(true) {
+                        refill(&router);
+                    }
                     return;
                 }
                 BlockKeyResolve::NeedsAuthority => match router
@@ -7672,7 +7711,9 @@ impl DataRouter {
                     Ok(mut keys) => match keys.pop().and_then(|(_, k)| k) {
                         Some(k) => k,
                         None => {
-                            settle(true);
+                            if settle(true) {
+                                refill(&router);
+                            }
                             return;
                         }
                     },
@@ -7693,11 +7734,17 @@ impl DataRouter {
                     .read_sync(&key, |_, _| ())
                     .is_some()
             {
-                settle(true);
+                if settle(true) {
+                    refill(&router);
+                }
                 return;
             }
             match router.lane_fetch_block(&key).await {
-                Ok(()) => settle(true),
+                Ok(()) => {
+                    if settle(true) {
+                        refill(&router);
+                    }
+                }
                 Err(err) => {
                     debug!("read-lane: failed to fetch block {key}: {err:?}");
                     settle(false);
@@ -7728,6 +7775,11 @@ impl DataRouter {
                 libc::EIO,
             )));
         }
+        // read_fill_phase_ns `fill_total` (2026-08-06 instrument gap,
+        // contract 15): lane fetches are fills — without this span the
+        // family's per-fill denominator undercounted the row by the
+        // lane's whole share (field D4: n=24,748 against 372k fills).
+        let fill_t0 = std::time::Instant::now();
         let (tx, _rx) = tokio::sync::broadcast::channel(4);
         if self
             .inflight_block_reads
@@ -7784,6 +7836,7 @@ impl DataRouter {
             serve_valid,
         }));
         guard.completed.set(true);
+        read_fill_phase_record(ReadFillPhase::FillTotal, fill_t0);
         Ok(())
     }
 

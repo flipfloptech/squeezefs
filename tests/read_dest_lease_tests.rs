@@ -20,7 +20,7 @@
 //!
 //! Contracts pinned (red-first):
 //! 1. **Engagement**: a cold, 4 KiB-aligned, sub-block, dest-armed read
-//!    with `ReadClassHint::dest_lease` serves by device→dest DMA — 
+//!    with `ReadClassHint::dest_lease` serves by device→dest DMA —
 //!    `read_dest_lease_bytes` accounts every served byte,
 //!    `read_copy_dest_bytes` stays 0, and the reply is in place.
 //!    Streaming classification does NOT veto the leg (the old
@@ -64,12 +64,13 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tempfile::{tempdir, NamedTempFile, TempDir};
 
-const BS: u64 = 524_288;
-/// The lease-window read size: 4 KiB-aligned, sub-block (4 windows per
+const BS: u64 = 1_048_576;
+/// The lease-window read size: 4 KiB-aligned, sub-block (2 windows per
 /// block), and ABOVE the old `ranged_eligible` threshold (256 KiB) so
 /// phase A's engagement cannot be served by the pre-existing
-/// small-read ranged gate once the stream classifies.
-const WIN: u64 = 131_072;
+/// small-read ranged gate — every phase-A byte must ride the NEW lease
+/// gate (streaming or not).
+const WIN: u64 = 524_288;
 
 struct H {
     fs: SqueezefsFilesystem,
@@ -290,6 +291,7 @@ async fn read_windows(h: &H, path: &str, blocks: u64, hint: ReadClassHint) -> u6
     for b in 0..blocks {
         for w in 0..per_block {
             let off = b * BS + w * WIN;
+            let s_win = snap();
             let dest = AlignedDest::new(WIN as usize);
             let (data, _backing) =
                 h.fs.router
@@ -317,6 +319,13 @@ async fn read_windows(h: &H, path: &str, blocks: u64, hint: ReadClassHint) -> u6
                 "window content at {off}"
             );
             drop(data);
+            if hint.dest_lease {
+                let dw = delta(&s_win);
+                assert_eq!(
+                    dw.lease, WIN,
+                    "window at {off}: expected a lease serve, got {dw:?}"
+                );
+            }
             total += WIN;
         }
     }
@@ -328,7 +337,7 @@ async fn read_windows(h: &H, path: &str, blocks: u64, hint: ReadClassHint) -> u6
 /// subset ledger law.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dest_lease_serves_cold_windows_by_dma_and_stands_the_fill_machinery_down() {
-    let h = make_with("524288", *b"rdstlease-v1-26!", "rdl_ns_a").await;
+    let h = make_with("1048576", *b"rdstlease-v1-26!", "rdl_ns_a").await;
     // Shift ino allocation off the process-global DLM lock map hot keys
     // (the op-economy salt_inos discipline, ledger-suite pattern).
     for i in 0..8 {

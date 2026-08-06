@@ -4211,6 +4211,19 @@ pub struct StreamLanes {
     /// until the flood subsides — under such a flood its whole-block
     /// locality was churning anyway, and re-classification is 4 requests.
     foreign_since_match: std::sync::atomic::AtomicU32,
+    /// READ dest-window lease yield stamp (copy-elimination phase 1):
+    /// the last `now_ms()` a dest-LEASEABLE request touched this file's
+    /// lanes. While fresh (< the 2 s issue-owner staleness convention)
+    /// the speculative issue arms decline — `pipeline_touch` returns
+    /// before its R2 top-up, and `read_lane_top_up` (touch-driven AND
+    /// completion-refill entries alike) declines at its head — because
+    /// every window such traffic reads is device→dest DMA'd by the
+    /// demand request itself: a pooled ahead fill is a pure
+    /// double-fetch. Self-healing: a stream that stops being leaseable
+    /// (unaligned pattern, lever change, transform volume) ages the
+    /// stamp out within one window and the lane resumes. 0 = never
+    /// stamped.
+    dest_lease_ms: std::sync::atomic::AtomicU64,
 }
 
 /// §5.6 zero-copy ranged destination, one definition: a 4 KiB-aligned
@@ -4222,6 +4235,12 @@ pub struct StreamLanes {
 pub struct RangedDest {
     ptr: *mut u8,
     cap: usize,
+    /// READ dest-window lease admission (copy-elimination phase 1): the
+    /// window was offered by the LEASE gate — the validated dest serve
+    /// accounts its bytes on `read_dest_lease_bytes` (the engagement
+    /// split of the dest-DMA bucket). Pure attribution: the DMA/serve
+    /// mechanics are identical either way.
+    lease: bool,
 }
 
 impl RangedDest {
@@ -4236,7 +4255,18 @@ impl RangedDest {
     /// (kernel path) or the validated arena window (E-IL2 il path) is what
     /// establishes that exclusivity.
     pub unsafe fn new(ptr: *mut u8, cap: usize) -> Self {
-        RangedDest { ptr, cap }
+        RangedDest {
+            ptr,
+            cap,
+            lease: false,
+        }
+    }
+
+    /// Tag the window as lease-gate-admitted (attribution only — see the
+    /// field doc).
+    pub fn with_lease(mut self) -> Self {
+        self.lease = true;
+        self
     }
 
     /// The destination base (the callee DMAs the served length at offset 0).
@@ -4528,7 +4558,18 @@ impl StreamLanes {
             foreign_since_match: std::sync::atomic::AtomicU32::new(0),
             issue_owner_idx: std::sync::atomic::AtomicUsize::new(usize::MAX),
             issue_owner_ms: std::sync::atomic::AtomicU64::new(0),
+            dest_lease_ms: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Whether the dest-lease yield stamp is FRESH (see the field doc):
+    /// a leaseable request touched these lanes within the staleness
+    /// window, so the speculative issue arms decline.
+    fn dest_lease_fresh(&self, now_ms: u64) -> bool {
+        let stamp = self
+            .dest_lease_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        stamp != 0 && now_ms.saturating_sub(stamp) < 2_000
     }
 
     /// Foreign-run length that clears every lane's classification (see
@@ -6753,6 +6794,7 @@ impl DataRouter {
         will_wait_inflight: bool,
         first_key: Option<&str>,
         lane_claim: bool,
+        dest_leaseable: bool,
     ) {
         if self.prefetch_disabled() || meta.file_type != "striped" {
             return;
@@ -6860,7 +6902,26 @@ impl DataRouter {
             }
         }
 
+        // Dest-lease yield (copy-elimination phase 1): stamp BEFORE the
+        // streaming check — the stamp must be fresh from the first
+        // leaseable request so the classification edge (request 4) never
+        // issues a plan the demand reads will double-fetch, and so the
+        // completion-refill entries into `read_lane_top_up` observe it.
+        if dest_leaseable {
+            lanes.dest_lease_ms.store(StreamLanes::now_ms(), Relaxed);
+        }
+
         if !streaming {
+            return;
+        }
+
+        // Dest-lease yield: every window this stream reads is device→dest
+        // DMA'd by the demand request itself — R2 plans and read-lane
+        // ahead fetches are pure double-fetches here. Consume/classifier
+        // bookkeeping above stays (other consumers key on it); only the
+        // ISSUE arms decline. Non-leaseable interleavings age the stamp
+        // out (see `StreamLanes::dest_lease_ms`).
+        if dest_leaseable || lanes.dest_lease_fresh(StreamLanes::now_ms()) {
             return;
         }
 
@@ -7130,6 +7191,10 @@ impl DataRouter {
             // Warm serves continue lanes, never claim them (the
             // warm-row tax — see `StreamLanes::observe`).
             missed,
+            // Phase 1 scopes the dest lease to the KERNEL transport:
+            // il ring reads keep their composition (direct-drive
+            // already dest-DMAs the aligned il cold path).
+            false,
         );
     }
 
@@ -7483,6 +7548,16 @@ impl DataRouter {
         if !self.read_lane.enabled()
             || block_size <= crate::read_lane::READ_LANE_MIN_FILL_BYTES as u64
         {
+            return;
+        }
+        // Dest-lease yield (copy-elimination phase 1) — enforced HERE so
+        // BOTH entries decline: the touch-driven top-up (pipeline_touch
+        // already returned before reaching it) and the completion-driven
+        // refill (fill-clamp campaign), whose settle re-drives this fn
+        // directly and would otherwise keep a pre-yield pipe
+        // self-sustaining against demand reads that DMA their own
+        // windows.
+        if lanes.dest_lease_fresh(StreamLanes::now_ms()) {
             return;
         }
         // File-level single issuer (round 4 — see the StreamLanes field
@@ -8512,7 +8587,20 @@ impl DataRouter {
         // per request against the resolved key — the check itself records
         // the touch (the primitive's old success-site record moved here),
         // so first touches keep exactly one ghost interaction per read.
-        if !device_true && self.tier_admission == TierAdmission::SecondTouch {
+        //
+        // LEASE windows are exempt (copy-elimination phase 1): the ghost
+        // keys on the BLOCK, so the second sub-block window of one
+        // sequential pass reads as a "re-read" and escalates — a false
+        // positive that turns every block's tail windows into
+        // whole-block fills + admissions (2× device bytes AND the very
+        // serve copy the lease deletes). Lease traffic is device-true by
+        // design (the CPU-wall trade: a deleted CPU pass is worth a
+        // device fetch on re-reads); warm convergence for it comes from
+        // tiers other traffic populated, never from self-escalation.
+        if !device_true
+            && self.tier_admission == TierAdmission::SecondTouch
+            && !dest.as_ref().is_some_and(|d| d.lease)
+        {
             if let Some(k) = resolved_key {
                 if self.ranged_escalation_candidate(k)
                     // Scan-resistance governor (2026-07-26): an escalation
@@ -8656,6 +8744,18 @@ impl DataRouter {
                         // fully DMA-covered — nothing to zero (the
                         // reused-payload replay rule is satisfied by full
                         // coverage).
+                        // Lease engagement (copy-elimination phase 1):
+                        // counted at the VALIDATED serve, not the DMA —
+                        // a rebind retry re-DMAs (each attempt is a real
+                        // device pass, `read_dest_dma_bytes` counts them
+                        // all) but serves once, and the engagement
+                        // instrument accounts SERVED bytes so a field
+                        // row closes `dest → lease` byte-for-byte.
+                        if d.lease {
+                            METRICS
+                                .read_dest_lease_bytes
+                                .fetch_add(req_len as u64, Ordering::Relaxed);
+                        }
                         // SAFETY: the destination window this serve was bounded against at
                         // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
                         // `cap`, and §5.4 lease exclusivity (kernel path) / session arena
@@ -12291,6 +12391,28 @@ impl DataRouter {
                                 .read_device_true_reads
                                 .fetch_add(1, Ordering::Relaxed);
                         }
+                        // READ dest-window lease admission (copy-elimination
+                        // phase 1, 2026-08-06 CPU-wall ruling): the handler's
+                        // transport-class verdict (`hint.dest_lease` — kernel
+                        // ent payload, lever on) composed with this request's
+                        // geometry: 4 KiB-aligned window AND dest pointer
+                        // (the O_DIRECT DMA contract), strictly sub-block
+                        // (whole blocks keep the raw full-block dest leg
+                        // below as their canonical server), passthrough only
+                        // (a transform volume's device bytes are ciphertext/
+                        // frame bytes — decode needs the whole block). A
+                        // leaseable request serves cold by device→dest DMA
+                        // (the ranged primitive under the lease tag) and
+                        // stands the speculative fill machinery down — a
+                        // pooled fill for a window the demand read DMAs
+                        // itself is a pure double-fetch.
+                        let dest_leaseable = hint.dest_lease
+                            && !device_true
+                            && slice_start % 4096 == 0
+                            && u64::from(slice_len) % 4096 == 0
+                            && u64::from(slice_len) < block_size
+                            && dest_addr.is_some_and(|d| d % 4096 == 0)
+                            && self.get_crypto().is_passthrough();
                         // §5.5 pipeline driver — once per request, before
                         // the serve probes: consume bookkeeping, growth on
                         // foreground-wait (key already in the single-
@@ -12314,6 +12436,7 @@ impl DataRouter {
                                 will_wait,
                                 first_key,
                                 true,
+                                dest_leaseable,
                             );
                         }
                         if let Some((_, b_key_opt)) = block_keys.first() {
@@ -12651,10 +12774,21 @@ impl DataRouter {
                             // eligibility policy is for the default mode) —
                             // exactly the requested bytes, device-true,
                             // publish-free; the primitive skips the ghost.
+                            // Lease admission (phase 1): the leaseable
+                            // geometry above, provided no fill for this
+                            // block is already in flight — joining the
+                            // single-flight cohort is strictly cheaper
+                            // than a second device fetch of bytes a
+                            // completing fill already carries.
+                            let lease_admits = dest_leaseable
+                                && b_key_opt.as_ref().is_some_and(|k| {
+                                    self.inflight_block_reads.read_sync(k, |_, _| ()).is_none()
+                                });
                             if b_key_opt.is_some()
                                 && ((device_true && self.get_crypto().is_passthrough())
                                     || (!device_true
-                                        && self.ranged_eligible(file_path, slice_len as u64)))
+                                        && self.ranged_eligible(file_path, slice_len as u64))
+                                    || lease_admits)
                             {
                                 let rel = slice_start..slice_start + slice_len as u64;
                                 let aligned = slice_start % 4096 == 0
@@ -12684,7 +12818,12 @@ impl DataRouter {
                                         // region (ReadDest::new's contract) and
                                         // `slice_len` bytes of it are proven to
                                         // fit by `ranged`.
-                                        .and_then(|w| unsafe { w.ranged(slice_len as usize) }),
+                                        .and_then(|w| unsafe { w.ranged(slice_len as usize) })
+                                        // Lease engagement tag: the validated
+                                        // dest serve counts these bytes on
+                                        // `read_dest_lease_bytes` (subset of
+                                        // the dest-DMA bucket).
+                                        .map(|r| if lease_admits { r.with_lease() } else { r }),
                                     _ => None,
                                 };
                                 read_serve_phase_record(ReadServePhase::ClassifyProbe, probe_t0);
@@ -13228,6 +13367,11 @@ impl DataRouter {
                             false,
                             block_keys.first().and_then(|(_, k)| k.as_deref()),
                             true,
+                            // Multi-block requests keep today's pipeline
+                            // (phase 1 leases single-block windows only —
+                            // the field row's shape; block-spanning reads
+                            // ride the assembly arms unchanged).
+                            false,
                         );
                     }
 

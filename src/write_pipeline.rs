@@ -215,8 +215,15 @@ pub enum PipelineDisposition {
 pub fn pipeline_disposition(res: &Result<(), crate::error::SqueezefsError>) -> PipelineDisposition {
     match res {
         Ok(()) => PipelineDisposition::Done,
+        // The 2026-08-06 fsync-vs-writeback tail-loss fix: a process-local
+        // fencing rotation on live parked custody CONVERGES inside
+        // `write_through_complete_block` (`fencing_retry_token`), so an
+        // escaping `FencingTokenExpired` means the non-progress arm kept
+        // the custody PARKED — counting it as a custody drop would
+        // misreport the never-lossy posture. The genuine fence is the
+        // `WriterGuardFenced` class below.
         Err(crate::error::SqueezefsError::FencingTokenExpired { .. }) => {
-            PipelineDisposition::FenceDrop
+            PipelineDisposition::StayParked
         }
         // RES-6: the D0 latch's face. A fenced holder that retried
         // forever would park custody until the R5 budget went Red and

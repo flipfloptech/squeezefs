@@ -157,8 +157,17 @@ fn disposition_mapping_is_the_task_counting_contract() {
             token: 1,
             expected: 2
         })),
+        PipelineDisposition::StayParked,
+        "a process-local fencing rotation converges inside the unit \
+         (fencing_retry_token); an escaping expiry kept custody PARKED — \
+         the 2026-08-06 fsync-vs-writeback tail-loss law \
+         (tests/fsync_writeback_tail_loss_tests.rs)"
+    );
+    assert_eq!(
+        pipeline_disposition(&Err(SqueezefsError::WriterGuardFenced)),
         PipelineDisposition::FenceDrop,
-        "fencing expiry = custody dropped loudly (the remount law)"
+        "the genuine fence class (the D0 latch, WriterGuardFenced) = \
+         custody dropped loudly (the remount law)"
     );
     assert_eq!(
         pipeline_disposition(&Err(SqueezefsError::InvalidOperation("io".into()))),
@@ -893,11 +902,17 @@ async fn t1_completing_write_acks_before_upload_and_drains_durably() {
     assert_eq!(got, data, "read-back after the detached publish");
 }
 
-/// T2 — the fencing custody-drop law (FIND-M11-A applied to detached
-/// uploads): a stale-era write-through must retire the parked overlay,
-/// publish NOTHING, and propagate `FencingTokenExpired`.
+/// T2 — the fencing CONVERGENCE law (the 2026-08-06 fsync-vs-writeback
+/// tail-loss fix, superseding the pre-fix custody-drop pin that WAS the
+/// bug): a write-through presented a token this process has since
+/// rotated must re-present the ino's CURRENT generation and PUBLISH the
+/// parked custody — the entry is the newest bytes in existence, and
+/// retiring it unpublished zeroed the field's tail block
+/// (`tests/fsync_writeback_tail_loss_tests.rs` owns the full-shape
+/// pins; the genuine-fence drop lives on the `WriterGuardFenced` class,
+/// refused at `authorize_dma` before any merge).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn t2_fenced_write_through_drops_custody_and_never_publishes() {
+async fn t2_stale_token_write_through_converges_and_publishes() {
     let _s = serial().await;
     let _g = OverrideGuard;
     set_depth_override(Some(1));
@@ -922,9 +937,9 @@ async fn t2_fenced_write_through_drops_custody_and_never_publishes() {
     )
     .await;
 
-    // Drive the write-through unit DIRECTLY with a stale-era token (the
-    // write_through_tests stale-token pattern): custody must drop, and
-    // nothing may publish.
+    // Drive the write-through unit DIRECTLY with a stale token (one
+    // rotation behind — the release-background-flush shape): it must
+    // converge to the current generation and publish.
     let cache_key = squeezefs::keys::active_block(ino, 3).to_string();
     let current = h.fs.dlm().get_fencing_token_ino(ino);
     assert!(current > 0, "the write path must have acquired a lease");
@@ -933,16 +948,17 @@ async fn t2_fenced_write_through_drops_custody_and_never_publishes() {
         h.fs.write_through_complete_block(ino, 3, &cache_key, current - 1, guard)
             .await;
     assert!(
-        matches!(res, Err(SqueezefsError::FencingTokenExpired { .. })),
-        "a superseded era must be refused loud (got {res:?})"
+        res.is_ok(),
+        "a process-local rotation must converge (fencing_retry_token), \
+         never refuse the publish: {res:?}"
     );
     assert!(
-        !block_map_has(&h, ino, 3).await,
-        "a fenced write-through must publish NOTHING"
+        block_map_has(&h, ino, 3).await,
+        "the converged write-through must have PUBLISHED the parked custody"
     );
 
     // Release the parked write: it ACKs, and its detached upload must
-    // resolve as a clean no-op against the dropped custody.
+    // resolve as a clean no-op against the already-durable custody.
     drop(blocker);
     tokio::time::timeout(Duration::from_secs(10), w)
         .await
@@ -952,10 +968,8 @@ async fn t2_fenced_write_through_drops_custody_and_never_publishes() {
         h.fs.write_pipeline.quiesce(Duration::from_secs(10)).await,
         "the no-op task must drain"
     );
-    assert!(
-        !block_map_has(&h, ino, 3).await,
-        "dropped custody must stay unpublished (the remount law)"
-    );
+    let got = read_at(&h, ino, 3 * BS, BS as usize).await;
+    assert_eq!(got, data, "the acked bytes must read back (never lost)");
 }
 
 /// T3 — fsync owns the drain: durability on return regardless of where

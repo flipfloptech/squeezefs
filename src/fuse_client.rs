@@ -10047,21 +10047,44 @@ impl SqueezefsFilesystem {
                 // detour (the parked-straggler RMW pipeline RW3b killed).
                 // Either racer (detached task / this flush) uploads it
                 // exactly once: retire-under-the-block-lock is the
-                // arbiter. Fence = custody dropped + propagate (a fenced
-                // writer must not publish anywhere); transient failure
-                // falls THROUGH to the staging leg below — fsync's
-                // durability bar owns the escalation ladder, unlike the
-                // write path's keep-parked posture.
+                // arbiter.
+                //
+                // The publish presents the ino's CURRENT fencing
+                // generation, read fresh here — never the caller's
+                // captured token (the 2026-08-06 tail-loss fix: the
+                // RELEASE-background flush captured its token before
+                // spawning, the next open's fsync re-acquired the lease,
+                // and this leg's stale presentation + retire-on-expiry
+                // dropped the tail block's only copy — the `cp && sync
+                // <file>` all-zeros field P0). A racing rotation between
+                // this read and the merge converges via
+                // `fencing_retry_token`; custody is NEVER retired on
+                // this class. Transient failure falls THROUGH to the
+                // staging leg below — fsync's durability bar owns the
+                // escalation ladder, unlike the write path's keep-parked
+                // posture.
                 let snapshot = self
                     .active_block_buffers
                     .get(&key)
                     .expect("parked entry cannot vanish under the held block lock")
                     .value()
                     .snapshot();
-                match self
-                    .upload_full_block_sized(ino, b, snapshot, fencing_token, false)
-                    .await
-                {
+                let mut wt_token = self.dlm.get_fencing_token_ino(ino);
+                let wt_res = loop {
+                    match self
+                        .upload_full_block_sized(ino, b, snapshot.clone(), wt_token, false)
+                        .await
+                    {
+                        Err(e @ SqueezefsError::FencingTokenExpired { .. }) => {
+                            match self.fencing_retry_token(ino, wt_token) {
+                                Some(fresh) => wt_token = fresh,
+                                None => break Err(e),
+                            }
+                        }
+                        other => break other,
+                    }
+                };
+                match wt_res {
                     Ok(()) => {
                         self.retire_parked_overlay(&key);
                         METRICS.write_through_blocks.fetch_add(1, Ordering::Relaxed);
@@ -10073,7 +10096,11 @@ impl SqueezefsFilesystem {
                         continue;
                     }
                     Err(e @ SqueezefsError::FencingTokenExpired { .. }) => {
-                        self.retire_parked_overlay(&key);
+                        // Structurally unreachable (the retry read is
+                        // monotone past every failed presentation):
+                        // custody STAYS PARKED — never retired
+                        // unpublished, the tail-loss bug — and the
+                        // error propagates loud.
                         drop(block_guard);
                         return Err(e);
                     }
@@ -10141,7 +10168,29 @@ impl SqueezefsFilesystem {
             // never-lossy custody in staging behind the retry ladder.
             let mut escalation_err: Option<SqueezefsError> = None;
             if driver.durable_by_return() {
-                match upload_active_block_bytes(ino, b, staging_copy.clone(), &self.router).await {
+                // `upload_active_block_bytes` presents the CURRENT
+                // generation internally; a rotation racing its
+                // read→merge window converges here (2026-08-06 tail-loss
+                // fix — the error's `token` field is the presentation
+                // that failed, so the progress check is exact). Custody
+                // is NEVER retired on this class.
+                let esc_res = loop {
+                    match upload_active_block_bytes(ino, b, staging_copy.clone(), &self.router)
+                        .await
+                    {
+                        Err(e @ SqueezefsError::FencingTokenExpired { .. }) => {
+                            let presented = match &e {
+                                SqueezefsError::FencingTokenExpired { token, .. } => *token,
+                                _ => unreachable!("guarded by the match arm"),
+                            };
+                            if self.fencing_retry_token(ino, presented).is_none() {
+                                break Err(e);
+                            }
+                        }
+                        other => break other,
+                    }
+                };
+                match esc_res {
                     Ok(()) => {
                         METRICS
                             .durable_upload_bytes_escalation
@@ -10151,8 +10200,9 @@ impl SqueezefsFilesystem {
                         continue;
                     }
                     Err(e @ SqueezefsError::FencingTokenExpired { .. }) => {
-                        // A fenced writer must not publish anywhere.
-                        self.retire_parked_overlay(&key);
+                        // Structurally unreachable (monotone retry read):
+                        // custody STAYS PARKED and the error propagates
+                        // loud — never a retire without a publish.
                         drop(block_guard);
                         return Err(e);
                     }
@@ -11112,19 +11162,55 @@ impl SqueezefsFilesystem {
         Ok(())
     }
 
+    /// FIND-M11-A applied to LIVE RAM custody — the 2026-08-06
+    /// fsync-vs-writeback tail-loss fix (P0,
+    /// `.benchmarks/2026-08-06-fsync-writeback-tail-loss.md`): within one
+    /// process, `FencingTokenExpired` from a publish merge can only mean
+    /// this same daemon re-acquired the ino's lease between the caller's
+    /// token capture and the merge's revalidation (open/close churn — the
+    /// RELEASE-background flush racing the next open's fsync). It is
+    /// NEVER the cross-mount fence: that is the D0 guard latch, which
+    /// surfaces as `WriterGuardFenced` from `authorize_dma` BEFORE any
+    /// merge runs. Dropping parked custody on this class discarded the
+    /// only copy of acked bytes and published nothing — the field's tail
+    /// block read back as a hole, persistently.
+    ///
+    /// The disposition is RE-PRESENT THE CURRENT GENERATION AND RETRY —
+    /// the staged ladder's own transient contract
+    /// ([`flush_one_active_block`]'s doc), counted on the same
+    /// `writeback_stale_token_retries` family. Progress is monotone: a
+    /// failed merge proves the generation advanced past `presented`, so
+    /// the fresh read here is strictly larger and the retry converges as
+    /// soon as lease churn quiets. `None` (no advancement readable) is
+    /// structurally unreachable for the process-local class and tells
+    /// the caller to keep custody PARKED and propagate loud — never to
+    /// retire it.
+    fn fencing_retry_token(&self, ino: u64, presented: u64) -> Option<u64> {
+        let fresh = self.dlm.get_fencing_token_ino(ino);
+        (fresh > presented).then(|| {
+            METRICS
+                .writeback_stale_token_retries
+                .fetch_add(1, Ordering::Relaxed);
+            fresh
+        })
+    }
+
     /// Upload one coverage-complete PARKED block durably under its HELD
     /// [`BLOCK_FLUSH_LOCKS`] guard (consumed) — the write-through unit
     /// factored from the WRITE handler (2026-07-27 write-pipeline-depth
     /// campaign), now driven from two places: the handler's synchronous
     /// A/B lever and the detached pipeline task
     /// ([`Self::pipeline_upload_parked_block`]). Public for the campaign's
-    /// contract tests (`tests/write_pipeline_tests.rs` pins the fencing
-    /// custody-drop law with an explicitly stale token).
+    /// contract tests (`tests/write_pipeline_tests.rs` +
+    /// `tests/fsync_writeback_tail_loss_tests.rs` pin the fencing
+    /// convergence law with an explicitly stale token).
     ///
-    /// Outcomes (unchanged from the inline arm this was factored from):
-    /// durable publish retires the overlay; a fencing expiry DROPS custody
-    /// (retire + propagate — a fenced writer must not publish anywhere);
-    /// any other failure rides the never-lossy ladder (staging fallback +
+    /// Outcomes: durable publish retires the overlay; a fencing expiry
+    /// CONVERGES by re-presenting the ino's current generation
+    /// ([`Self::fencing_retry_token`] — the 2026-08-06 tail-loss fix;
+    /// the parked entry is the newest custody in existence, so dropping
+    /// it on a process-local lease rotation was silent data loss); any
+    /// other failure rides the never-lossy ladder (staging fallback +
     /// writeback, else keep parked + R5 admission).
     pub async fn write_through_complete_block(
         &self,
@@ -11155,10 +11241,22 @@ impl SqueezefsFilesystem {
                 }
                 entry.value().snapshot()
             };
-            match self
-                .upload_full_block(ino, b, block_snapshot.clone(), fencing_token)
-                .await
-            {
+            let mut token = fencing_token;
+            let upload_res = loop {
+                match self
+                    .upload_full_block(ino, b, block_snapshot.clone(), token)
+                    .await
+                {
+                    Err(e @ SqueezefsError::FencingTokenExpired { .. }) => {
+                        match self.fencing_retry_token(ino, token) {
+                            Some(fresh) => token = fresh,
+                            None => break Err(e),
+                        }
+                    }
+                    other => break other,
+                }
+            };
+            match upload_res {
                 Ok(()) => {
                     // Durable + published: the RAM entry retires
                     // (reads flow to the block map / read tiers).
@@ -11170,11 +11268,12 @@ impl SqueezefsFilesystem {
                     std::mem::drop(block_guard);
                 }
                 Err(e @ SqueezefsError::FencingTokenExpired { .. }) => {
-                    // A fenced-out writer must not publish anywhere —
-                    // not even to staging. Drop custody (the old
-                    // checked-out buffer was dropped here too) and
-                    // propagate; the caller invalidates the lease.
-                    self.retire_parked_overlay(cache_key);
+                    // Structurally unreachable (the retry read is
+                    // monotone past every failed presentation): custody
+                    // STAYS PARKED — the entry is the newest bytes in
+                    // existence and retiring it unpublished was the
+                    // tail-loss bug — and the error propagates loud.
+                    std::mem::drop(block_guard);
                     return Err(e);
                 }
                 Err(e) => {
@@ -11191,7 +11290,7 @@ impl SqueezefsFilesystem {
                     );
                     let nvme_clone = self.router.cache.nvme.clone();
                     let cache_key_clone = cache_key.to_string();
-                    let fencing_token_val = fencing_token;
+                    let fencing_token_val = token;
                     let put_len = block_snapshot.len() as u64;
                     let staging_snapshot = block_snapshot;
                     let wp_put = write_phase_start();
@@ -11220,7 +11319,7 @@ impl SqueezefsFilesystem {
                         let req = WritebackRequest {
                             ino,
                             block_idx: b as u32,
-                            fencing_token,
+                            fencing_token: token,
                             attempts: 0,
                         };
                         self.enqueue_writeback(req).await?;
@@ -13305,22 +13404,38 @@ impl SqueezefsFilesystem {
                 // Teardown write-through leg (2026-07-27 campaign, same
                 // law as the fsync pass): coverage-complete parked custody
                 // uploads durably ONCE — no staging + writeback detour on
-                // the way out. A fencing expiry drops custody loudly (the
-                // remount law: a superseded era publishes nowhere;
-                // unfsynced loss is D0-legal at teardown); a transient
-                // failure falls through to the staging leg, whose durable
-                // escalation already owns the never-strand-dirty-RAM bar.
-                let fencing_token = self.dlm.get_fencing_token_ino(ino);
+                // the way out. A fencing expiry is the process-local
+                // rotation class (2026-08-06 tail-loss fix — a genuine
+                // fence is `WriterGuardFenced`, refused at `authorize_dma`
+                // before any merge) and CONVERGES by re-presenting the
+                // current generation; on non-progress the buffer stays
+                // PARKED until process end (the same posture as the
+                // unreadable-seed arm — never a retire without a
+                // publish). A transient failure falls through to the
+                // staging leg, whose durable escalation already owns the
+                // never-strand-dirty-RAM bar.
                 let snapshot = self
                     .active_block_buffers
                     .get(&key)
                     .expect("parked entry cannot vanish under the held block lock")
                     .value()
                     .snapshot();
-                match self
-                    .upload_full_block_sized(ino, b, snapshot, fencing_token, false)
-                    .await
-                {
+                let mut wt_token = self.dlm.get_fencing_token_ino(ino);
+                let wt_res = loop {
+                    match self
+                        .upload_full_block_sized(ino, b, snapshot.clone(), wt_token, false)
+                        .await
+                    {
+                        Err(e @ SqueezefsError::FencingTokenExpired { .. }) => {
+                            match self.fencing_retry_token(ino, wt_token) {
+                                Some(fresh) => wt_token = fresh,
+                                None => break Err(e),
+                            }
+                        }
+                        other => break other,
+                    }
+                };
+                match wt_res {
                     Ok(()) => {
                         self.retire_parked_overlay(&key);
                         METRICS.write_through_blocks.fetch_add(1, Ordering::Relaxed);
@@ -13333,12 +13448,11 @@ impl SqueezefsFilesystem {
                     }
                     Err(SqueezefsError::FencingTokenExpired { token, expected }) => {
                         error!(
-                            "dismount: write-through for ino {ino} block {b} fenced \
-                             (token {token}, expected {expected}): custody dropped \
-                             (the remount law — a superseded writer era publishes \
-                             nowhere)"
+                            "dismount: write-through for ino {ino} block {b} could not \
+                             converge its fencing presentation (token {token}, expected \
+                             {expected}): buffer stays parked until process end \
+                             (never a retire without a publish)"
                         );
-                        self.retire_parked_overlay(&key);
                         drop(block_guard);
                         continue;
                     }

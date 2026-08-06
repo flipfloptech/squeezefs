@@ -377,7 +377,13 @@ async fn release_then_fsync_never_zeroes_the_tail_block() {
         // while close-then-sync races them — the tape's schedule.
         set_test_upload_stall_ms(150);
         for b in 0..BLOCKS {
-            write_at(&h, ino, b * BS, &data[(b * BS) as usize..((b + 1) * BS) as usize]).await;
+            write_at(
+                &h,
+                ino,
+                b * BS,
+                &data[(b * BS) as usize..((b + 1) * BS) as usize],
+            )
+            .await;
         }
         // close(2): RELEASE spawns the background flush with the
         // write-era token, then releases the lease.

@@ -11,7 +11,7 @@ zero-copy RX byte is direct capacity). Cluster READ-ONLY — the field rows
 run via report (§5). Design: `docs/design-zcrx-read-lane.md` Rev 4.
 
 Commits: red `39f02100` (engagement-geometry contracts, compile-red at
-base) · green `<GREEN_SHA>` (the derivations) · docs + this note.
+base) · green `be284bf5` (the derivations + design Rev 4 + this note).
 
 ## 1. The engagement failure, decomposed (round-8 arithmetic)
 

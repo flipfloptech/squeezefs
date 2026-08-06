@@ -73,31 +73,50 @@ fn depth_derivation_tables() {
     let gib = 1024 * 1024 * 1024u64;
     let bs = 4 * 1024 * 1024u64;
 
-    // Ahead-issue is OPT-IN (default 0): the campaign brackets
-    // falsified both adaptive derivations (pure-BDP = the write
-    // campaign's self-fulfilling equilibrium; the AIMD window = -19%
-    // vs the hold alone on demand-concurrent venues — ahead-fetches
-    // died FIFO-unconsumed racing the cohort). The pin remains for
-    // high-latency/low-qd fabrics.
-    assert_eq!(read_lane_depth_blocks(None, bs, 32, false, 64 * gib), 0);
-    assert_eq!(read_lane_depth_blocks(None, bs, 1, false, 64 * gib), 0);
+    // Ahead-issue defaults to the ENGAGE-GOVERNOR's depth (2026-08-05,
+    // the read-throughput campaign — the probe-adopt-retreat follow-on
+    // the read-lane note §8.2 named): an unprobed governor contributes
+    // 0 (exact hold-only prior behavior), an adopted probe multiplier
+    // flows through verbatim. The 2026-08-01 falsification stands as
+    // the RETREAT arm, not as a constant 0.
+    assert_eq!(read_lane_depth_blocks(None, 0, bs, 32, false, 64 * gib), 0);
+    assert_eq!(read_lane_depth_blocks(None, 0, bs, 1, false, 64 * gib), 0);
+    assert_eq!(read_lane_depth_blocks(None, 5, bs, 32, false, 64 * gib), 5);
 
-    // The pin wins verbatim (0 = no ahead issue).
-    assert_eq!(read_lane_depth_blocks(Some(7), bs, 32, false, 64 * gib), 7);
-    assert_eq!(read_lane_depth_blocks(Some(0), bs, 32, false, 64 * gib), 0);
+    // The pin wins verbatim over the governed depth (0 = ahead off —
+    // the A0/hold-only measurement control).
+    assert_eq!(
+        read_lane_depth_blocks(Some(7), 3, bs, 32, false, 64 * gib),
+        7
+    );
+    assert_eq!(
+        read_lane_depth_blocks(Some(0), 3, bs, 32, false, 64 * gib),
+        0
+    );
 
-    // The R5 budget cap is senior to the pin: a cap that holds 3
-    // blocks/stream clamps a deeper pin to 3; a cap that cannot hold
-    // even ONE block per stream never speculates.
-    assert_eq!(read_lane_depth_blocks(Some(16), bs, 2, false, 6 * bs), 3);
-    assert_eq!(read_lane_depth_blocks(Some(16), bs, 32, false, 16 * bs), 0);
+    // The R5 budget cap is senior to the pin AND the governed depth: a
+    // cap that holds 3 blocks/stream clamps deeper values to 3; a cap
+    // that cannot hold even ONE block per stream never speculates.
+    assert_eq!(read_lane_depth_blocks(Some(16), 0, bs, 2, false, 6 * bs), 3);
+    assert_eq!(read_lane_depth_blocks(None, 16, bs, 2, false, 6 * bs), 3);
+    assert_eq!(
+        read_lane_depth_blocks(Some(16), 0, bs, 32, false, 16 * bs),
+        0
+    );
 
-    // Red stops speculation outright and is SENIOR to the pin (the
-    // write-pipeline Red-clamp precedent).
-    assert_eq!(read_lane_depth_blocks(Some(8), bs, 32, true, 64 * gib), 0);
+    // Red stops speculation outright and is SENIOR to the pin and the
+    // governor (the write-pipeline Red-clamp precedent).
+    assert_eq!(
+        read_lane_depth_blocks(Some(8), 0, bs, 32, true, 64 * gib),
+        0
+    );
+    assert_eq!(read_lane_depth_blocks(None, 8, bs, 32, true, 64 * gib), 0);
 
     // Zero streams behaves as one (defensive).
-    assert_eq!(read_lane_depth_blocks(Some(2), bs, 0, false, 64 * gib), 2);
+    assert_eq!(
+        read_lane_depth_blocks(Some(2), 0, bs, 0, false, 64 * gib),
+        2
+    );
 
     // Issue admission: per-lane depth bound AND the aggregate cap.
     assert!(lane_issue_admits(1, 2, 0, bs, 64 * gib));
@@ -128,6 +147,117 @@ fn depth_derivation_tables() {
         hold_budget_bytes(0, bs, 1, 2),
         4 * bs,
         "floor survives a zero budget"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Contract 9 (2026-08-05, the read-throughput campaign): the ahead
+// lane's ENGAGE-GOVERNOR — the probe-adopt-retreat follow-on the
+// read-lane note §8.2 named. The depth derives from a measured probe
+// cycle (launch on saturated epochs with headroom, adopt only when
+// fill delivery responds, retreat + cool down on dead gain, bleed to
+// zero on unsaturated epochs) — never from a constant, never from the
+// falsified pure-BDP/AIMD arithmetic.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn probe_governed_depth_mapping_table() {
+    use squeezefs::read_lane::probe_governed_depth;
+    use squeezefs::write_pipeline::{PROBE_MUL_MAX, PROBE_MUL_ONE};
+
+    // ×1.0 (unprobed / fully decayed) = depth 0 — the exact hold-only
+    // prior behavior; the first probe gain (+1/4) = the minimal
+    // one-block-per-stream pipeline; adopted gains compound.
+    assert_eq!(probe_governed_depth(PROBE_MUL_ONE), 0);
+    assert_eq!(probe_governed_depth(PROBE_MUL_ONE + PROBE_MUL_ONE / 4), 1);
+    assert_eq!(probe_governed_depth(100), 2);
+    assert_eq!(probe_governed_depth(125), 3);
+    assert_eq!(probe_governed_depth(156), 5);
+    assert_eq!(probe_governed_depth(195), 8);
+    // Monotone, and bounded by the ProbeCore runaway guard (the R5 cap
+    // in read_lane_depth_blocks stays the operative absolute bound).
+    let mut prev = 0;
+    for mul in PROBE_MUL_ONE..=PROBE_MUL_MAX {
+        let d = probe_governed_depth(mul);
+        assert!(d >= prev, "depth must be monotone in the multiplier");
+        prev = d;
+    }
+    assert_eq!(probe_governed_depth(PROBE_MUL_MAX), 124);
+    // Sub-one multipliers (impossible by ProbeCore's floor; defensive)
+    // never underflow.
+    assert_eq!(probe_governed_depth(0), 0);
+}
+
+#[test]
+fn engage_governor_probe_cycle_drives_the_default_depth() {
+    use squeezefs::read_lane::ReadLaneGovernor;
+
+    // No env pin: the governor owns the depth.
+    std::env::remove_var("SQUEEZEFS_READ_LANE_DEPTH");
+    std::env::remove_var("SQUEEZEFS_READ_LANE");
+    let g = ReadLaneGovernor::from_env();
+    let gib = 1024 * 1024 * 1024u64;
+    let bs = 4 * 1024 * 1024u64;
+
+    // Unprobed: depth 0 — a default mount speculates nothing until a
+    // probe epoch has MEASURED that ahead depth buys delivery.
+    assert_eq!(g.governed_depth(), 0);
+    assert_eq!(g.depth_blocks(bs, 16, false, 64 * gib), 0);
+
+    // Epoch anchor.
+    assert!(!g.probe_roll_at(1_000, true, true));
+
+    // Saturated + headroom + delivery flowing => LAUNCH (+1/4 = depth 1).
+    g.probe_on_fill_bytes(10_000_000);
+    assert!(g.probe_roll_at(1_600, true, true));
+    assert_eq!(g.governed_depth(), 1, "first probe = the minimal pipeline");
+    assert_eq!(g.probe_ups(), 1);
+
+    // Delivery responds (2x) => ADOPT (multiplier kept, re-armed).
+    g.probe_on_fill_bytes(20_000_000);
+    assert!(g.probe_roll_at(2_200, true, true));
+    assert_eq!(g.governed_depth(), 1, "adopt keeps the raised multiplier");
+
+    // Next saturated epoch relaunches and compounds (depth 2)...
+    g.probe_on_fill_bytes(40_000_000);
+    assert!(g.probe_roll_at(2_800, true, true));
+    assert_eq!(g.governed_depth(), 2, "discovery compounds");
+    assert_eq!(g.probe_ups(), 2);
+
+    // ...and DEAD GAIN retreats to the pre-probe multiplier + cools
+    // down — the 2026-08-01 falsified venue (demand already covers the
+    // fabric BDP: extra depth buys nothing) is a RETREAT arm, bounded
+    // to the probe duty cycle, not a sustained -19 % engagement.
+    g.probe_on_fill_bytes(40_000_000);
+    assert!(g.probe_roll_at(3_400, true, true));
+    assert_eq!(g.governed_depth(), 1, "dead gain retreats");
+    assert!(g.probe_backoffs() >= 1);
+
+    // The pinned depth flows through depth_blocks (Red/cap senior —
+    // pinned by depth_derivation_tables).
+    assert_eq!(g.depth_blocks(bs, 16, false, 64 * gib), 1);
+    assert_eq!(g.depth_blocks(bs, 16, true, 64 * gib), 0, "Red senior");
+
+    // Unsaturated epochs bleed the multiplier back to x1.0 — the
+    // latency guard: low-offered-load mounts never inherit streaming
+    // depth (the write-pipeline probe-up law, verbatim).
+    for i in 0..8u64 {
+        g.probe_roll_at(4_000 + i * 600, false, true);
+    }
+    assert_eq!(g.governed_depth(), 0, "idle decay converges to zero");
+
+    // The explicit pin stays senior to the governor (the A/B lever).
+    std::env::set_var("SQUEEZEFS_READ_LANE_DEPTH", "0");
+    let pinned_off = ReadLaneGovernor::from_env();
+    std::env::remove_var("SQUEEZEFS_READ_LANE_DEPTH");
+    pinned_off.probe_on_fill_bytes(10_000_000);
+    pinned_off.probe_roll_at(1_000, true, true);
+    pinned_off.probe_on_fill_bytes(10_000_000);
+    pinned_off.probe_roll_at(1_600, true, true);
+    assert_eq!(
+        pinned_off.depth_blocks(bs, 16, false, 64 * gib),
+        0,
+        "SQUEEZEFS_READ_LANE_DEPTH=0 pins ahead-issue OFF verbatim"
     );
 }
 
@@ -628,6 +758,74 @@ async fn lane_engages_on_zero_share_streams_and_stays_ledger_invisible() {
          only the pre-classification demand blocks may hit)"
     );
     let _ = ghost0;
+    drop(h);
+}
+
+// ---------------------------------------------------------------------------
+// Contract 10 (2026-08-05, the read-throughput campaign — the field's
+// 16-stream shape): a resident share of ONE block is BELOW R2's AIMD
+// start window (2), so R2's hot-probation landing is structurally
+// evicted-before-consume — the field row issued 823 prefetches in 60 s
+// and 575 died unconsumed, quiescing every lane while foreground reads
+// waited 5.4 ms on demand fills (27.4 GB/s vs the 41.8 raw ceiling).
+// The lane — whose hold landing is coverage-retired, never
+// clock-churned by demand fills — is the vehicle for the WHOLE
+// below-start-window regime, not only share == 0.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lane_engages_below_the_r2_start_window() {
+    // Hot budget 1 MiB + share 50 % at 512 KiB blocks and one stream:
+    // resident_share = 50 % x 1 MiB / 512 KiB / 1 = 1 — the sub-start
+    // regime the field's 16-job row rides (share oscillating 0..1).
+    std::env::set_var("SQUEEZEFS_READ_TIER_ADMISSION", "second-touch");
+    std::env::set_var("SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB", "1");
+    std::env::set_var("SQUEEZEFS_READ_PREFETCH_SHARE_PCT", "50");
+    std::env::set_var("SQUEEZEFS_READ_RANGED_THRESHOLD", "0");
+    set_ahead_env();
+    let h = make_with(*b"read-lane-test09", "rdlane_ns_i", false).await;
+    clear_ahead_env();
+    clear_zero_share_env();
+
+    let blocks = 16u64;
+    let (ino, _map) = striped_file(&h, "subwindow", blocks).await;
+
+    let (g0, f0, p0) = (
+        get_obj(),
+        lane_fetches(),
+        METRICS.prefetch_issued.load(Ordering::Relaxed),
+    );
+
+    stream_pass(&h, ino, blocks, |b| (b % 250) as u8 + 1).await;
+    for _ in 0..200 {
+        if h.fs.router.read_lane_inflight_bytes() == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let df = lane_fetches() - f0;
+    let dg = get_obj() - g0;
+    let dp = METRICS.prefetch_issued.load(Ordering::Relaxed) - p0;
+
+    // R2 must DECLINE the whole sub-start-window regime: a share of 1
+    // cannot express even the AIMD start plan, and its issues die in
+    // hot probation (the field's 70 % evicted-unconsumed).
+    assert_eq!(
+        dp, 0,
+        "R2 must not issue hot-landing speculation below its start window"
+    );
+    // The lane front-runs instead (hold landing — coverage-retired).
+    assert!(
+        df >= blocks / 2,
+        "the lane must front-run a share-1 stream \
+         (read_lane_fetches = {df} across {blocks} blocks)"
+    );
+    // Fetch economy unchanged: one device fetch per block.
+    assert!(
+        dg <= blocks + 3,
+        "no double-fetch: {dg} device fetches for {blocks} blocks"
+    );
     drop(h);
 }
 

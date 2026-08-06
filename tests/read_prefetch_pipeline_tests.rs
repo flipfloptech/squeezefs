@@ -361,8 +361,18 @@ async fn pipeline_phases() {
     // consumer must DETECT the genuinely-starved fills, AIMD collapses
     // the window + the progress-clocked arm quiesces issue, and total
     // device fetches stay < 2x unique — never the runaway spiral.
+    //
+    // Re-pinned under the `SQUEEZEFS_READ_LANE=0` lever (2026-08-05
+    // read-throughput campaign — the sibling-suite precedent): the
+    // armed default now routes this phase's share-1 regime to the
+    // hold-landing lane (R2 correctly declines below its start
+    // window), so R2's hot-landing detector — still the live spiral
+    // control for share >= 2 — is exercised in the pre-lane posture
+    // the lever restores verbatim.
     std::env::set_var("SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB", "1");
+    std::env::set_var("SQUEEZEFS_READ_LANE", "0");
     let h2 = make_with(*b"pipeline-c-pr5v3", "pipe_ns_c").await;
+    std::env::remove_var("SQUEEZEFS_READ_LANE");
     std::env::remove_var("SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB");
     let ino_c = make_cold_file(&h2, "pipe_c", 24, 100).await;
 

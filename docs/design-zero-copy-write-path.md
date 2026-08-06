@@ -527,26 +527,41 @@ the kernel's buffers and joined by the same lease machinery**:
   `fuse_copy_fill` in BOTH directions; one memcpy per folio remains
   (K1).
 
-#### zc negotiation face (staged) & instruments
+#### zc serve integration (§5.4c — SHIPPED 2026-08-06, the K1 kill) & instruments
 
-The `FUSE_URING_ZERO_COPY` **negotiation face ships**: the init-flags
-composition (zc never rides without the bufring), `init.queue_depth`,
-and the sparse-table shape (request-folio slots 0..depth, headers at
-index `depth` — `zc_headers_index`). The **zc serve integration does
-not**: with zc negotiated the kernel skips the folio copy entirely
+The `FUSE_URING_ZERO_COPY` **serve integration ships** (campaign
+`.benchmarks/2026-08-06-fuse-zc-serve.md`; `SQUEEZEFS_FUSE_ZC=1`,
+default OFF pending field acceptance — the dest-lease flip precedent).
+With zc negotiated the kernel skips the folio copy entirely
 (`skip_folio_copy`, both directions — `can_zero_copy_req` covers
-`in_pages || out_pages`), so the daemon must serve READs via
-`READ_FIXED` into (and consume WRITEs via `WRITE_FIXED` from) the
-request folios the kernel registers at `ent->fixed_buf_id` — a
-cross-crate program touching the read-serve and write-through paths,
-staged as the follow-on PR (it can only be *executed* on the sqz kernel
-anyway). `SQUEEZEFS_FUSE_ZC=1` is recognized and loudly declined until
-then — never a silent no-op.
+`in_pages || out_pages`, NO per-request daemon opt-out), so the
+integration answers all three consequences on an armed queue
+(`crates/fuse3/src/raw/connection/zc.rs` carries the design):
 
-Instruments: `fuse3_kmbuf_negotiated` (0/1 — the arm proof, set only
-after the all-queues-REGISTERed barrier), `fuse3_zc_replies`
-(structurally 0 until the zc arm; ships with the face so the follow-on
-is measured by the gauge that guards it), and the `commit_flush` phase
+- **out-paged replies** (READ/READDIR[PLUS]/READLINK) bridge through
+  the sparse slot: the **direct device leg** (`READ_FIXED(device →
+  slot)` — routing's cold aligned passthrough windows, whole-block AND
+  sub-block; `ZcReadServe` + `ReplyData::zc_prefilled`) is the K1 kill
+  — device DMA into the caller's pages, zero daemon passes; every
+  other shape (warm/tier serves, transform volumes, unaligned) lands
+  in the per-ent **memfd bounce** (`ZcBounce`) and bridges with
+  `READ_FIXED(memfd → slot)` — copy-count parity with the kmbuf path.
+- **WRITE payloads** extract slot → bounce (`WRITE_FIXED`) before
+  dispatch; the §5.4 lease then rides the bounce mapping verbatim
+  (deferred re-arm ≡ deferred recycle unchanged).
+- **non-paged traffic** keeps the kmbuf shape byte-identically.
+
+Opcode-mirror misses are LOUD, never corrupting: a wrongly-bridged
+reply errors its slot fetch and falls back to the kmbuf attachment
+(`fuse3_zc_fallbacks`); a wrongly-copied paged reply hits the
+no-attachment EIO guard.
+
+Instruments: `fuse3_kmbuf_negotiated` / `fuse3_zc_negotiated` (0/1 —
+the arm proofs), `fuse3_zc_replies` (paged replies that rode the slot),
+`fuse3_zc_fallbacks` + `fuse3_zc_slot_payload_skips` (the mirror
+tripwires, ≈ 0 / 0), `read_zc_serve_bytes` (the direct-leg engagement
+ledger — a NEW closure term: an armed row is INVALID unless its delta
+accounts for the row's READ bytes), and the `commit_flush` phase
 (5th member of `read/write_transport_phase_ns`): the COMMIT-carrying
 ring-flush syscall duration — the venue where the kernel's commit-side
 copy machinery runs — per-FLUSH sampled on provably wait-free flushes

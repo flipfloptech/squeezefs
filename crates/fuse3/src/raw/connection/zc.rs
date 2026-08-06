@@ -66,14 +66,18 @@ use crate::raw::abi::fuse_opcode;
 /// requests with `args->out_pages = true`, so their reply bodies are
 /// NEVER copied from the kmbuf at COMMIT — they must ride the slot.
 /// (fs/fuse: `fuse_do_readfolio`/`fuse_readahead`/`fuse_direct_io` for
-/// READ, `fuse_readdir_uncached` for READDIR/READDIRPLUS,
-/// `fuse_readlink_folio` for READLINK.) A mirror miss is loud — see the
-/// module doc.
+/// READ, `fuse_readlink_folio` for READLINK.)
+///
+/// READDIR/READDIRPLUS are deliberately NOT here — **measured on the
+/// deployed 6.19.14-sqz** (fuse-zc-serve field probe, 2026-08-06):
+/// every body-carrying readdir reply arrives with a kmbuf attachment
+/// and the kernel copies it (each bridged attempt failed its slot fetch
+/// and fell back, +1 `fuse3_zc_fallbacks` per `ls`), so their replies
+/// ride the ordinary kmbuf path. A kernel that DOES zc readdir surfaces
+/// as the loud no-attachment EIO guard — a mirror miss is loud in both
+/// directions (see the module doc).
 pub fn out_paged(opcode: u32) -> bool {
-    opcode == fuse_opcode::FUSE_READ as u32
-        || opcode == fuse_opcode::FUSE_READDIR as u32
-        || opcode == fuse_opcode::FUSE_READDIRPLUS as u32
-        || opcode == fuse_opcode::FUSE_READLINK as u32
+    opcode == fuse_opcode::FUSE_READ as u32 || opcode == fuse_opcode::FUSE_READLINK as u32
 }
 
 /// In-direction paged opcodes on a zc queue: the kernel registers the
@@ -250,12 +254,16 @@ mod tests {
 
     /// The opcode mirror, pinned against the ABI values (a silent ABI
     /// drift here is the corruption vector the module doc walks).
+    /// READDIR/READDIRPLUS are pinned FALSE — the deployed-kernel
+    /// measurement (see [`out_paged`]'s doc): their replies ride the
+    /// kmbuf, and bridging them costs a failed ring op + fallback per
+    /// readdir.
     #[test]
     fn test_paged_opcode_mirror() {
         assert!(out_paged(fuse_opcode::FUSE_READ as u32));
-        assert!(out_paged(fuse_opcode::FUSE_READDIR as u32));
-        assert!(out_paged(fuse_opcode::FUSE_READDIRPLUS as u32));
         assert!(out_paged(fuse_opcode::FUSE_READLINK as u32));
+        assert!(!out_paged(fuse_opcode::FUSE_READDIR as u32));
+        assert!(!out_paged(fuse_opcode::FUSE_READDIRPLUS as u32));
         assert!(!out_paged(fuse_opcode::FUSE_WRITE as u32));
         assert!(!out_paged(fuse_opcode::FUSE_GETXATTR as u32));
         assert!(!out_paged(fuse_opcode::FUSE_LISTXATTR as u32));

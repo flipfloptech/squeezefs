@@ -3579,6 +3579,18 @@ pub struct Metrics {
     /// full-block dest leg, ranged zero-copy leg, ipc direct-drive) —
     /// the zero-daemon-copy engagement gauge.
     pub read_dest_dma_bytes: Align64<AtomicU64>,
+    /// Bytes served through the READ dest-window LEASE (read
+    /// copy-elimination phase 1, 2026-08-06): cold sub-block windows
+    /// whose fill DMA'd device bytes straight into the request's own
+    /// registered dest window (the ent payload / validated arena window)
+    /// under the widened lease gate — the serve dest-copy those bytes
+    /// used to pay is DELETED. A SUBSET of `read_dest_dma_bytes` (the
+    /// closure law `dest + bounce + dest_dma ≡ served` is unchanged);
+    /// the engagement instrument for the CPU-wall campaign: on a cold
+    /// aligned kernel row expect `read_copy_dest_bytes → ~0` with this
+    /// counter carrying the row. 0 by construction under
+    /// `SQUEEZEFS_READ_DEST_LEASE=0` and for hints without `dest_lease`.
+    pub read_dest_lease_bytes: Align64<AtomicU64>,
     /// Device DMA into pooled fill intermediates (whole-block fills +
     /// ranged bounce windows) — the nvme-tcp RX-copy pricing denominator.
     pub read_fill_dma_bytes: Align64<AtomicU64>,
@@ -7168,6 +7180,9 @@ impl SqueezefsFilesystem {
                 "open_count_stranded": METRICS.open_count_stranded.load(Ordering::Relaxed),
                 "read_copy_bounce_bytes": METRICS.read_copy_bounce_bytes.load(Ordering::Relaxed),
                 "read_dest_dma_bytes": METRICS.read_dest_dma_bytes.load(Ordering::Relaxed),
+                // Dest-window lease engagement (copy-elimination phase 1)
+                // — subset of read_dest_dma_bytes; see the METRICS doc.
+                "read_dest_lease_bytes": METRICS.read_dest_lease_bytes.load(Ordering::Relaxed),
                 "read_fill_dma_bytes": METRICS.read_fill_dma_bytes.load(Ordering::Relaxed),
                 "ipc_arena_copy_bytes": METRICS.ipc_arena_copy_bytes.load(Ordering::Relaxed),
                 "ipc_read_dest_serves": METRICS.ipc_read_dest_serves.load(Ordering::Relaxed),
@@ -15467,10 +15482,11 @@ impl Filesystem for SqueezefsFilesystem {
         // travels with the class): a ring-origin handoff's task-local
         // window override, if any (see `ipc_service::ipc_read_dest_override`).
         let arena_dest = crate::ipc_service::ipc_read_dest_override(size);
-        let read_hint = crate::routing::ReadClassHint {
+        let mut read_hint = crate::routing::ReadClassHint {
             odirect,
             dest_arena: arena_dest.is_some(),
             lane_pre_fed: _req.unique == 0,
+            dest_lease: false,
         };
 
         if is_virtual_ino(ino) {
@@ -15794,6 +15810,14 @@ impl Filesystem for SqueezefsFilesystem {
             // window under the descriptor-validated session custody
             // (`ipc_read_dest_override`).
             .map(|(ptr, cap)| unsafe { crate::routing::ReadDest::new(ptr, cap) });
+        // READ dest-window lease admission (copy-elimination phase 1):
+        // kernel ent-payload dests only — arena windows keep their il
+        // composition (direct-drive already dest-DMAs the aligned il
+        // cold path; the consumer-distance law is different there), and
+        // the lever is the A/B control. The router composes this with
+        // the per-request geometry (alignment, sub-block, passthrough).
+        read_hint.dest_lease =
+            dest.is_some() && !read_hint.dest_arena && self.router.dest_lease_enabled();
 
         // OVERLAY NEVER INVISIBLE — the moving-custody read protocol
         // (fstests generic/795, VL10 release gate). A block's acked bytes

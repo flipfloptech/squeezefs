@@ -169,6 +169,7 @@ pub static KNOBS: &[Knob] = &[
     k("SQUEEZEFS_READ_PREFETCH_WINDOW", int(0, 1 << 20), "derived", "R2 prefetch window override, blocks."),
     k("SQUEEZEFS_READ_PREFETCH_SHARE_PCT", int(1, 100), "50", "R2 prefetch share of the read budget, percent."),
     k("SQUEEZEFS_READ_RANGED_THRESHOLD", int(0, BYTES_MAX), "262144", "R3 ranged-read threshold, bytes."),
+    k("SQUEEZEFS_READ_DEST_LEASE", Kind::Bool, "on", "READ dest-window lease (copy-elimination phase 1): cold aligned sub-block windows DMA device bytes straight into the reply's registered dest — the serve dest-copy deleted; 0 = the A/B control (pre-campaign fill+serve-copy shape)."),
     k("SQUEEZEFS_READ_LANE", Kind::Bool, "on", "R1b read-lane hold (the shipped default win); 0 = the A0 control."),
     k("SQUEEZEFS_READ_LANE_DEPTH", int(0, 1 << 16), "derived (engage-governor)", "Read-ahead lane depth pin, blocks — unset = probe-governed (probe-adopt-retreat); 0 = ahead-issue off (the hold-only A/B control)."),
     k("SQUEEZEFS_NVME_READ_LANES", int(1, 1024), "derived (cpus / data devices)", "Per-device READ submission fan-out lanes (read-queue-wall campaign); 1 = single-worker A/B posture."),

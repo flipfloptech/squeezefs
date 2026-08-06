@@ -3386,6 +3386,12 @@ pub struct DataRouterInner {
     /// only their 4 KiB-aligned window (`SQUEEZEFS_READ_RANGED_THRESHOLD`,
     /// default 262144; 0 = kill switch).
     pub(crate) ranged_threshold: u64,
+    /// READ dest-window lease lever (copy-elimination phase 1,
+    /// `SQUEEZEFS_READ_DEST_LEASE`, default ON; `0` = the A/B control):
+    /// gates the FUSE read handler's [`ReadClassHint::dest_lease`]
+    /// admission — with it off, every read keeps the pre-campaign
+    /// fill+serve-copy shape byte-identically.
+    pub(crate) dest_lease: bool,
     /// Hybrid I/O diagnostic escape (user directive 2026-07-15;
     /// `-o direct_device_true` / `SQUEEZEFS_DIRECT_DEVICE_TRUE=1`): when
     /// set, O_DIRECT READ requests are strictly device-true — no tier
@@ -4444,6 +4450,21 @@ pub struct ReadClassHint {
     /// classification that routed the op here — the §5.3 declassify
     /// rule). The handler's `pipeline_touch` sites skip when set.
     pub lane_pre_fed: bool,
+    /// READ dest-window lease admission (copy-elimination phase 1,
+    /// 2026-08-06 CPU-wall ruling): the request's destination is a
+    /// transport window whose fill may be DMA'd directly (the kernel
+    /// registered ent payload under §5.4 exclusivity — the FUSE read
+    /// handler sets this iff a payload dest exists, the dest is not a
+    /// client-visible arena window, and `SQUEEZEFS_READ_DEST_LEASE` is
+    /// on). The router's single-block arm composes it with the
+    /// per-request geometry (4 KiB alignment of window and dest,
+    /// sub-block, passthrough) into the lease gate; cold windows then
+    /// serve by device→dest DMA with the serve dest-copy deleted, and
+    /// the speculative fill machinery stands down for the request
+    /// (`read_dest_lease_bytes` is the engagement instrument). Internal
+    /// readers pass `default()` (false) — their consumers are daemon
+    /// memory, not a reply window.
+    pub dest_lease: bool,
 }
 
 /// The dest-arm serve copy (read-copy-count 2026-08-02): NT-policied for
@@ -5783,6 +5804,10 @@ impl DataRouter {
         // §5.6 ranged-read threshold (0 disables — the kill switch).
         let ranged_threshold =
             crate::env_knobs::int_knob::<u64>("SQUEEZEFS_READ_RANGED_THRESHOLD", 262_144);
+        // READ dest-window lease (copy-elimination phase 1, 2026-08-06):
+        // default ON — the CPU-wall ruling's mechanism; `0` is the A/B
+        // control (the pre-campaign fill+serve-copy shape, verbatim).
+        let dest_lease = crate::env_knobs::bool_knob("SQUEEZEFS_READ_DEST_LEASE", true);
         // Hybrid I/O diagnostic escape (env half; `-o direct_device_true`
         // sets it post-construction from `start_mount`). "1"/"true" arms.
         let direct_device_true = crate::env_knobs::bool_knob("SQUEEZEFS_DIRECT_DEVICE_TRUE", false);
@@ -5843,6 +5868,7 @@ impl DataRouter {
                 escalation_cooldown: std::sync::Arc::new(EscalationCooldown::new()),
                 tier_admission,
                 ranged_threshold,
+                dest_lease,
                 direct_device_true: std::sync::atomic::AtomicBool::new(direct_device_true),
                 prefetch_window_override,
                 prefetch_share_pct,
@@ -5932,6 +5958,13 @@ impl DataRouter {
     pub fn direct_device_true(&self) -> bool {
         self.direct_device_true
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether the READ dest-window lease is armed
+    /// (`SQUEEZEFS_READ_DEST_LEASE`, default on; the FUSE read handler
+    /// consults this when minting [`ReadClassHint::dest_lease`]).
+    pub fn dest_lease_enabled(&self) -> bool {
+        self.dest_lease
     }
 
     /// Whether the cold-stream read lane is armed (the

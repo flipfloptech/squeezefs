@@ -1044,6 +1044,15 @@ pub struct NvmeBlockDev {
     /// path stays byte-identical. Shared across clones (one association
     /// per device node).
     lane: Arc<tokio::sync::OnceCell<Option<Arc<crate::zcrx_lane::LaneSession>>>>,
+    /// FUSE-zc direct-leg read fd (K1 kill, 2026-08-06): a dedicated
+    /// `O_DIRECT` read-only fd on the device, opened lazily at the first
+    /// zc resolve and held for the mount's life — the fuse3 queue ring
+    /// issues `READ_FIXED` against it (device DMA into the request's
+    /// pages via the sparse slot). Its own fd by design: zc fetches ride
+    /// a FOREIGN ring, so sharing a worker's fd would only couple
+    /// lifetimes, not queues. `None` cached on open failure (the zc leg
+    /// falls through to the ordinary ladder). Shared across clones.
+    zc_fd: Arc<std::sync::OnceLock<Option<std::os::fd::OwnedFd>>>,
 }
 
 /// Capacity in bytes of a backing file OR block device (seek-to-end works
@@ -1119,7 +1128,38 @@ impl NvmeBlockDev {
             write_cache: crate::write_cache::probe_data_volume(std::path::Path::new(device_path)),
             lane: Arc::new(tokio::sync::OnceCell::new()),
             fence: Arc::new(DeviceFence::new()),
+            zc_fd: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// The FUSE-zc direct-leg read fd (see the field doc): opened lazily
+    /// (`O_DIRECT | O_RDONLY`, mirroring the worker's alignment
+    /// contract), `None` on refusal — the caller's zc leg falls through
+    /// to the ordinary read ladder, loudly once.
+    pub fn zc_read_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        use std::os::fd::AsRawFd;
+        self.zc_fd
+            .get_or_init(|| {
+                let mut opts = std::fs::OpenOptions::new();
+                opts.read(true);
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    opts.custom_flags(libc::O_DIRECT);
+                }
+                match opts.open(&self.device_path) {
+                    Ok(f) => Some(std::os::fd::OwnedFd::from(f)),
+                    Err(e) => {
+                        log::warn!(
+                            "zc read fd open failed for {:?} ({e}) — the FUSE-zc direct \
+                             leg stays cold on this device (ordinary ladder serves)",
+                            self.device_path
+                        );
+                        None
+                    }
+                }
+            })
+            .as_ref()
+            .map(|fd| fd.as_raw_fd())
     }
 
     /// Grow the READ submission pool to `n` lanes (see [`read_lanes_for`]

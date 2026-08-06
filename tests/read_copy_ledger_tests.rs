@@ -333,6 +333,7 @@ async fn ledger_closes_and_cold_none_dest_slice_is_zero_copy() {
                 Some(dest.dest()),
                 ReadClassHint::default(),
                 None,
+                None,
             )
             .await
             .expect("phase B read");
@@ -383,6 +384,7 @@ async fn ledger_closes_and_cold_none_dest_slice_is_zero_copy() {
                 Some(dest.dest()),
                 ReadClassHint::default(),
                 None,
+                None,
             )
             .await
             .expect("phase C read");
@@ -415,6 +417,7 @@ async fn ledger_closes_and_cold_none_dest_slice_is_zero_copy() {
                 part as u32,
                 Some(dest.dest()),
                 ReadClassHint::default(),
+                None,
                 None,
             )
             .await
@@ -452,6 +455,7 @@ async fn ledger_closes_and_cold_none_dest_slice_is_zero_copy() {
                 4096,
                 Some(dest.dest()),
                 ReadClassHint::default(),
+                None,
                 None,
             )
             .await
@@ -526,6 +530,7 @@ async fn warm_tier_serves_split_out_of_the_dest_bucket() {
                 Some(dest.dest()),
                 ReadClassHint::default(),
                 None,
+                None,
             )
             .await
             .expect("phase A cold read");
@@ -555,6 +560,7 @@ async fn warm_tier_serves_split_out_of_the_dest_bucket() {
                 part as u32,
                 Some(dest.dest()),
                 ReadClassHint::default(),
+                None,
                 None,
             )
             .await
@@ -597,6 +603,7 @@ async fn warm_tier_serves_split_out_of_the_dest_bucket() {
                 part as u32,
                 Some(dest.dest()),
                 ReadClassHint::default(),
+                None,
                 None,
             )
             .await

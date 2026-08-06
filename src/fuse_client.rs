@@ -3591,6 +3591,18 @@ pub struct Metrics {
     /// counter carrying the row. 0 by construction under
     /// `SQUEEZEFS_READ_DEST_LEASE=0` and for hints without `dest_lease`.
     pub read_dest_lease_bytes: Align64<AtomicU64>,
+    /// Bytes served through the FUSE-zc DIRECT leg (K1 kill, 2026-08-06,
+    /// `SQUEEZEFS_FUSE_ZC=1` on the sqz kernel): cold aligned passthrough
+    /// windows whose device bytes DMA'd STRAIGHT into the caller's pages
+    /// through the transport's sparse slot — zero daemon CPU passes AND
+    /// the kernel's COMMIT folio copy (K1) deleted. A NEW closure term
+    /// beside `read_copy_dest_bytes`/`read_dest_dma_bytes` (these bytes
+    /// never touch a daemon-visible destination): on an armed cold row
+    /// `zc_serve + dest + bounce + dest_dma ≈ served bytes`. The
+    /// engagement instrument for the zc campaign — an armed row whose
+    /// READ bytes this delta does not account for is INVALID. 0 by
+    /// construction on un-armed sessions (stock kernels, lever off).
+    pub read_zc_serve_bytes: Align64<AtomicU64>,
     /// Device DMA into pooled fill intermediates (whole-block fills +
     /// ranged bounce windows) — the nvme-tcp RX-copy pricing denominator.
     pub read_fill_dma_bytes: Align64<AtomicU64>,
@@ -7217,6 +7229,9 @@ impl SqueezefsFilesystem {
                 // Dest-window lease engagement (copy-elimination phase 1)
                 // — subset of read_dest_dma_bytes; see the METRICS doc.
                 "read_dest_lease_bytes": METRICS.read_dest_lease_bytes.load(Ordering::Relaxed),
+                // FUSE-zc direct-leg engagement (K1 kill) — a NEW closure
+                // term; see the METRICS doc.
+                "read_zc_serve_bytes": METRICS.read_zc_serve_bytes.load(Ordering::Relaxed),
                 "read_fill_dma_bytes": METRICS.read_fill_dma_bytes.load(Ordering::Relaxed),
                 "ipc_arena_copy_bytes": METRICS.ipc_arena_copy_bytes.load(Ordering::Relaxed),
                 "ipc_read_dest_serves": METRICS.ipc_read_dest_serves.load(Ordering::Relaxed),
@@ -7547,7 +7562,14 @@ impl SqueezefsFilesystem {
                 // custom kernel); zc_replies = the staged zc arm's
                 // engagement counter (structurally 0 until it lands).
                 "fuse3_kmbuf_negotiated": fuse3::kmbuf_negotiated(),
+                // FUSE-zc arm/engagement gauges (K1 kill, 2026-08-06):
+                // negotiated is the arm proof; replies is the paged-reply
+                // engagement; fallbacks + slot_payload_skips are the
+                // opcode-mirror tripwires (≈ 0 / 0 on a healthy session).
+                "fuse3_zc_negotiated": fuse3::zc_negotiated(),
                 "fuse3_zc_replies": fuse3::zc_replies(),
+                "fuse3_zc_fallbacks": fuse3::zc_fallbacks(),
+                "fuse3_zc_slot_payload_skips": fuse3::zc_slot_payload_skips(),
                 // The WRITE twin (transport-ingress campaign): the gauge
                 // is what keeps the in-place arm wired.
                 "fuse3_write_inplace_replies": fuse3::write_inplace_replies(),
@@ -15556,6 +15578,7 @@ impl Filesystem for SqueezefsFilesystem {
                 return Ok(ReplyData {
                     data: Vec::new().into(),
                     backing: None,
+                    zc_prefilled: None,
                 });
             }
             let start = offset as usize;
@@ -15565,6 +15588,7 @@ impl Filesystem for SqueezefsFilesystem {
             return Ok(ReplyData {
                 data: slice.to_vec().into(),
                 backing: None,
+                zc_prefilled: None,
             });
         }
 
@@ -15637,6 +15661,7 @@ impl Filesystem for SqueezefsFilesystem {
                 return Ok(ReplyData {
                     data: Vec::new().into(),
                     backing: None,
+                    zc_prefilled: None,
                 });
             }
 
@@ -15691,6 +15716,7 @@ impl Filesystem for SqueezefsFilesystem {
                         return Ok(ReplyData {
                             data: bytes::Bytes::from(out),
                             backing: None,
+                            zc_prefilled: None,
                         });
                     }
                     // Zero-copy CoW-stable snapshot: immutable for the
@@ -15724,6 +15750,7 @@ impl Filesystem for SqueezefsFilesystem {
                         return Ok(ReplyData {
                             data: bytes::Bytes::from(out),
                             backing: None,
+                            zc_prefilled: None,
                         });
                     }
                     if contained {
@@ -15734,6 +15761,7 @@ impl Filesystem for SqueezefsFilesystem {
                         return Ok(ReplyData {
                             data: snapshot.slice(rel_offset..rel_end),
                             backing: None,
+                            zc_prefilled: None,
                         });
                     }
                     drop(buf);
@@ -15777,6 +15805,7 @@ impl Filesystem for SqueezefsFilesystem {
                                     return Ok(ReplyData {
                                         data: snap.slice(rel_offset..rel_end),
                                         backing: None,
+                                        zc_prefilled: None,
                                     });
                                 }
                                 // Vanished between fetch and fill — the lock
@@ -15793,6 +15822,7 @@ impl Filesystem for SqueezefsFilesystem {
                                     return Ok(ReplyData {
                                         data: snap.slice(rel_offset..rel_end),
                                         backing: None,
+                                        zc_prefilled: None,
                                     });
                                 }
                             }
@@ -15859,6 +15889,27 @@ impl Filesystem for SqueezefsFilesystem {
         read_hint.dest_lease =
             dest.is_some() && !read_hint.dest_arena && self.router.dest_lease_enabled();
 
+        // FUSE-zc direct leg (K1 kill, 2026-08-06): on a zc-armed session
+        // the READ's own pages sit behind the transport's sparse slot —
+        // mint the device-fetch handle the router's cold leg drives
+        // (device DMA straight into the caller's pages; the daemon serve
+        // pass AND the kernel's COMMIT folio copy both deleted). Kernel
+        // ring slots only: il arena overrides never ride FUSE replies,
+        // and `dest` still points at the transport BOUNCE, so every warm/
+        // ineligible serve keeps its venue unchanged.
+        let zc_serve = conn_guard
+            .as_ref()
+            .as_ref()
+            .filter(|c| c.zc_armed() && _req.slot.is_ring() && arena_dest.is_none())
+            .map(|conn| {
+                let conn = conn.clone();
+                let slot = _req.slot;
+                crate::routing::ZcReadServe::new(Box::new(move |fd, off, len| {
+                    let conn = conn.clone();
+                    Box::pin(async move { conn.zc_device_fetch(slot, fd, off, len).await })
+                }))
+            });
+
         // OVERLAY NEVER INVISIBLE — the moving-custody read protocol
         // (fstests generic/795, VL10 release gate). A block's acked bytes
         // live in exactly one live authority at a time — RAM overlay →
@@ -15891,8 +15942,20 @@ impl Filesystem for SqueezefsFilesystem {
         // IS the movement signal.
         let mut meta_hint = guard_meta;
         let mut attempts = 0u32;
+        // FUSE-zc: one direct-leg attempt per request; any post-serve
+        // movement (parked overlay runs, custody fingerprint) disables
+        // the leg and re-reads through the ordinary ladder, whose reply
+        // bridges through the transport bounce and OVERWRITES the pages.
+        let mut zc_enabled = true;
         let (data, backing, router_done_at) = loop {
             let pre_runs = self.capture_parked_runs(ino, offset, read_len);
+
+            // The zc leg composes with the overlay-never-invisible law by
+            // DECLINING whenever parked runs exist for this window — a
+            // page-resident serve cannot be overlay-composed.
+            let zc_pass = zc_serve
+                .as_ref()
+                .filter(|_| zc_enabled && pre_runs.is_empty());
 
             // Backend / cache read without holding the inode lock (readers
             // scale).
@@ -15903,6 +15966,7 @@ impl Filesystem for SqueezefsFilesystem {
                 dest,
                 read_hint,
                 meta_hint.take(),
+                zc_pass,
             );
             if attempts == 0 {
                 // First dispatch only: retries are movement-signal
@@ -15921,6 +15985,29 @@ impl Filesystem for SqueezefsFilesystem {
                 }
             };
 
+            // FUSE-zc direct serve: the payload is IN THE CALLER'S PAGES
+            // (empty reply body + latched length). Validate the same
+            // movement signals the byte path validates; on ANY of them
+            // re-read with the leg disabled (never compose overlays or
+            // serve a moved binding from pages the daemon cannot see).
+            if data.is_empty() && zc_pass.is_some_and(|z| z.served().is_some()) && read_len > 0 {
+                let post_runs = self.capture_parked_runs(ino, offset, read_len);
+                let bindings_after = self
+                    .read_custody_fingerprint(None, &file_path, ino, offset, read_len)
+                    .await;
+                if post_runs.is_empty()
+                    && read_custody_fp_matches(&bindings_after, &bindings_before)
+                {
+                    break (data, backing, router_done_at);
+                }
+                zc_enabled = false;
+                bindings_before = bindings_after;
+                // Deliberately NOT counted against `attempts`: the
+                // ordinary re-read below must always run at least once
+                // (an empty body is never a servable last compose).
+                continue;
+            }
+
             let post_runs = self.capture_parked_runs(ino, offset, data.len());
             let data = Self::apply_parked_runs(offset, data, &pre_runs);
             let data = Self::apply_parked_runs(offset, data, &post_runs);
@@ -15938,7 +16025,23 @@ impl Filesystem for SqueezefsFilesystem {
         // the whole per-op residence.
         read_serve_phase_record(ReadServePhase::PostValidate, router_done_at);
         read_serve_phase_record(ReadServePhase::Total, serve_t0);
-        Ok(ReplyData { data, backing })
+        // FUSE-zc direct serve: reply header + length only (the session's
+        // prefilled commit) — the payload already sits in the caller's
+        // pages.
+        if data.is_empty() && read_len > 0 {
+            if let Some(n) = zc_serve.as_ref().and_then(|z| z.served()) {
+                return Ok(ReplyData {
+                    data,
+                    backing,
+                    zc_prefilled: Some(n),
+                });
+            }
+        }
+        Ok(ReplyData {
+            data,
+            backing,
+            zc_prefilled: None,
+        })
     }
 
     async fn write(
@@ -16770,6 +16873,7 @@ impl Filesystem for SqueezefsFilesystem {
         Ok(ReplyData {
             data: target_bytes.into(),
             backing: None,
+            zc_prefilled: None,
         })
     }
 

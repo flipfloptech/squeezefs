@@ -2419,6 +2419,36 @@ impl BackendRouter {
         }
     }
 
+    /// FUSE-zc direct-leg resolve (K1 kill, 2026-08-06): the raw device
+    /// fd + byte offset of `block_key`'s block, for a transport-ring
+    /// `READ_FIXED` straight into the requesting READ's pages. Gated
+    /// exactly like [`Self::read_block_with_dest`] (incarnation currency
+    /// + backend health); `None` = the leg falls through to the ordinary
+    /// ladder (unparsable key, stale incarnation, unhealthy/unknown
+    /// backend, or a device whose zc fd refused to open). The serve's
+    /// own validity still rests on the CALLER's post-fetch
+    /// incarnation-still + binding recheck — this resolve is the address
+    /// half only.
+    pub fn zc_device_resolve(&self, block_key: &str) -> Option<(std::os::unix::io::RawFd, u64)> {
+        let parts = self.parse_block_key_parts(block_key).ok()?;
+        if !self.incarnation_ok(&parts, block_key) {
+            return None;
+        }
+        let (be_id, offset) = (parts.be_id, parts.offset);
+        if !self.is_backend_healthy(&be_id) {
+            return None;
+        }
+        if be_id == "backend_0" {
+            self.default_device.zc_read_fd().map(|fd| (fd, offset))
+        } else {
+            self.backends
+                .get(&be_id)?
+                .device
+                .zc_read_fd()
+                .map(|fd| (fd, offset))
+        }
+    }
+
     /// Take one reference on the block behind `block_key`. `false` = the
     /// reference was NOT taken (freed/untracked offset, unknown backend, or
     /// unparsable key) — the caller must re-resolve, never proceed unpinned.
@@ -4386,6 +4416,66 @@ impl ReadDest {
 /// custody (il path) is what guarantees that.
 unsafe fn dest_bytes(ptr: *mut u8, len: usize) -> bytes::Bytes {
     bytes::Bytes::from_owner(crate::cache::pool::UringBufOwner::new(ptr, len))
+}
+
+/// The zc direct-leg fetch primitive (K1 kill, 2026-08-06): DMA `len`
+/// bytes from a device fd at a byte offset STRAIGHT into the requesting
+/// FUSE READ's pages, through the transport queue ring's sparse
+/// fixed-buffer slot. Implemented by the FUSE handler over the armed
+/// connection (`FuseConnection::zc_device_fetch`); injected in tests
+/// (the sqz-kernel surface is the only live venue for the real op).
+pub type ZcFetchFn = dyn Fn(
+        std::os::unix::io::RawFd,
+        u64,
+        u32,
+    ) -> futures::future::BoxFuture<'static, std::io::Result<u32>>
+    + Send
+    + Sync;
+
+/// The zc direct-leg serve handle (K1 kill): minted by the FUSE READ
+/// handler on a zc-armed session and threaded to the router's
+/// single-block arm beside the dest. Carries the transport fetch
+/// primitive and the serve outcome the handler reads back — a served
+/// request replies `zc_prefilled` (header + length; the payload already
+/// sits in the caller's pages), an un-served one replies through the
+/// ordinary ladder (whose bytes bridge through the transport's bounce,
+/// overwriting anything a failed/stale direct fetch may have landed).
+pub struct ZcReadServe {
+    fetch: Box<ZcFetchFn>,
+    /// Served payload length; `u32::MAX` = not served (0 is untaken by
+    /// construction — the leg requires a nonzero aligned window).
+    served: std::sync::atomic::AtomicU32,
+}
+
+impl ZcReadServe {
+    pub fn new(fetch: Box<ZcFetchFn>) -> Self {
+        ZcReadServe {
+            fetch,
+            served: std::sync::atomic::AtomicU32::new(u32::MAX),
+        }
+    }
+
+    /// Run the device→pages fetch (`Ok(n)` = bytes DMA'd).
+    pub(crate) async fn fetch(
+        &self,
+        fd: std::os::unix::io::RawFd,
+        off: u64,
+        len: u32,
+    ) -> std::io::Result<u32> {
+        (self.fetch)(fd, off, len).await
+    }
+
+    /// Record a validated direct serve of `len` bytes.
+    pub(crate) fn mark_served(&self, len: u32) {
+        self.served.store(len, Ordering::Release);
+    }
+
+    /// The serve outcome the handler replies with (`Some(n)` ⇒ reply
+    /// `zc_prefilled(n)`).
+    pub fn served(&self) -> Option<u32> {
+        let v = self.served.load(Ordering::Acquire);
+        (v != u32::MAX).then_some(v)
+    }
 }
 
 /// A block fill's provenance at the validated fill site
@@ -11901,7 +11991,7 @@ impl DataRouter {
         bytes::Bytes,
         Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     )> {
-        self.read_file_range_zero_copy_with_meta(file_path, offset, size, dest, hint, None)
+        self.read_file_range_zero_copy_with_meta(file_path, offset, size, dest, hint, None, None)
             .await
     }
 
@@ -11913,6 +12003,7 @@ impl DataRouter {
     /// exact `fetch_metadata` gate — a >1 s-stale clean entry still
     /// re-validates from the backend), and every re-resolve inside the
     /// loop goes through `fetch_metadata` as before.
+    #[allow(clippy::too_many_arguments)] // the read entry point: dest + hint + meta + zc all ride per-request
     pub async fn read_file_range_zero_copy_with_meta(
         &self,
         file_path: &str,
@@ -11921,6 +12012,7 @@ impl DataRouter {
         dest: Option<ReadDest>,
         hint: ReadClassHint,
         meta_hint: Option<CachedMetadata>,
+        zc: Option<&ZcReadServe>,
     ) -> Result<(
         bytes::Bytes,
         Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
@@ -12413,6 +12505,27 @@ impl DataRouter {
                             && u64::from(slice_len) < block_size
                             && dest_addr.is_some_and(|d| d % 4096 == 0)
                             && self.get_crypto().is_passthrough();
+                        // FUSE-zc direct-leg admission (K1 kill, 2026-08-06):
+                        // the transport DMAs device bytes straight into the
+                        // request's pages through the sparse slot — no dest
+                        // pointer exists or is needed (the kernel installed
+                        // the pages), so the geometry gate is the request
+                        // window itself: 4 KiB-aligned start AND length
+                        // (the O_DIRECT contract of the zc read fd),
+                        // sub-block OR whole-block (zc covers the whole-
+                        // block shape dest-lease deliberately left to the
+                        // raw dest leg), passthrough only (a transform
+                        // volume's device bytes are ciphertext/frame
+                        // bytes), never on the device-true diagnostic
+                        // escape (its amplification rows must keep their
+                        // own leg's semantics).
+                        let zc_geometry = zc.is_some()
+                            && !device_true
+                            && slice_len > 0
+                            && slice_start % 4096 == 0
+                            && u64::from(slice_len) % 4096 == 0
+                            && slice_start + u64::from(slice_len) <= block_size
+                            && self.get_crypto().is_passthrough();
                         // §5.5 pipeline driver — once per request, before
                         // the serve probes: consume bookkeeping, growth on
                         // foreground-wait (key already in the single-
@@ -12420,6 +12533,10 @@ impl DataRouter {
                         // the windowed top-up. Ring-originated requests
                         // fed the lanes at the sink (`lane_pre_fed`) —
                         // observing them again would declassify (§5.3).
+                        // zc-eligible traffic yields the speculative fill
+                        // machinery exactly like dest-leaseable traffic —
+                        // same law, same stamp (a pooled fill for a window
+                        // the demand read DMAs itself is a double-fetch).
                         if !device_true && !hint.lane_pre_fed {
                             let first_key = block_keys.first().and_then(|(_, k)| k.as_deref());
                             let will_wait = first_key.is_some_and(|k| {
@@ -12436,7 +12553,7 @@ impl DataRouter {
                                 will_wait,
                                 first_key,
                                 true,
-                                dest_leaseable,
+                                dest_leaseable || zc_geometry,
                             );
                         }
                         if let Some((_, b_key_opt)) = block_keys.first() {
@@ -12757,6 +12874,103 @@ impl DataRouter {
                                     "stale-binding rebind (single-block tier hit): file={} block={} key={}",
                                     file_path, start_block, b_key
                                 );
+                                }
+                            }
+
+                            // FUSE-zc direct leg (K1 kill, 2026-08-06) —
+                            // strictly after the overlay/hot/tier probes
+                            // missed (cold by construction): the transport
+                            // DMAs the device window straight into the
+                            // request's pages through the sparse slot —
+                            // ZERO daemon CPU passes AND the kernel's
+                            // COMMIT folio copy deleted. Fill discipline
+                            // mirrors the raw dest leg verbatim:
+                            // incarnation snapshot before, still-check +
+                            // binding recheck after; any movement or fetch
+                            // failure falls through to the ordinary ladder,
+                            // whose serve bridges through the transport
+                            // bounce and OVERWRITES whatever a stale/failed
+                            // direct fetch may have landed in the pages.
+                            // Single-flight: an in-flight fill for this
+                            // block declines the leg (joining the cohort
+                            // beats a second device fetch — the dest-lease
+                            // admission law).
+                            if zc_geometry {
+                                if let (Some(zcs), Some(b_key)) = (zc, b_key_opt.as_deref()) {
+                                    let cold = self
+                                        .inflight_block_reads
+                                        .read_sync(b_key, |_, _| ())
+                                        .is_none();
+                                    if cold {
+                                        if let Some((fd, dev_base)) =
+                                            self.backend_router.zc_device_resolve(b_key)
+                                        {
+                                            let tracked =
+                                                self.backend_router.key_incarnation_tracked(b_key);
+                                            let before =
+                                                self.backend_router.fill_incarnation(b_key);
+                                            let fetch_t0 = std::time::Instant::now();
+                                            match zcs
+                                                .fetch(fd, dev_base + slice_start, slice_len)
+                                                .await
+                                            {
+                                                Ok(n) if n == slice_len => {
+                                                    read_serve_phase_record(
+                                                        ReadServePhase::BlockFetch,
+                                                        fetch_t0,
+                                                    );
+                                                    let incarnation_ok = !tracked
+                                                        || before.is_some_and(|bf| {
+                                                            self.backend_router
+                                                                .fill_incarnation_still(b_key, bf)
+                                                        });
+                                                    if incarnation_ok
+                                                        && self
+                                                            .block_binding_is(
+                                                                file_path,
+                                                                start_block,
+                                                                b_key,
+                                                            )
+                                                            .await?
+                                                    {
+                                                        // Engagement ledger: the
+                                                        // K1-killed serve — device
+                                                        // DMA into the caller's
+                                                        // pages, zero daemon
+                                                        // passes.
+                                                        METRICS.read_zc_serve_bytes.fetch_add(
+                                                            u64::from(n),
+                                                            Ordering::Relaxed,
+                                                        );
+                                                        zcs.mark_served(n);
+                                                        return Ok((bytes::Bytes::new(), None));
+                                                    }
+                                                    METRICS
+                                                        .stale_binding_rebinds
+                                                        .fetch_add(1, Ordering::Relaxed);
+                                                    debug!(
+                                                        "stale-binding rebind (zc direct leg): \
+                                                         file={} block={} key={}",
+                                                        file_path, start_block, b_key
+                                                    );
+                                                }
+                                                Ok(n) => {
+                                                    debug!(
+                                                        "zc direct leg short fetch ({n}/{slice_len}) \
+                                                         for {file_path} block {start_block} — \
+                                                         ordinary ladder serves"
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    debug!(
+                                                        "zc direct leg fetch failed ({e}) for \
+                                                         {file_path} block {start_block} — \
+                                                         ordinary ladder serves"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
 

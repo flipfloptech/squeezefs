@@ -302,6 +302,7 @@ async fn read_windows(h: &H, path: &str, blocks: u64, hint: ReadClassHint) -> u6
                         Some(dest.dest()),
                         hint,
                         None,
+                        None,
                     )
                     .await
                     .unwrap_or_else(|e| panic!("window read at {off} failed: {e:?}"));
@@ -403,6 +404,7 @@ async fn dest_lease_serves_cold_windows_by_dma_and_stands_the_fill_machinery_dow
                 ulen as u32,
                 Some(dest.dest()),
                 lease_hint(),
+                None,
                 None,
             )
             .await

@@ -430,6 +430,7 @@ async fn dest_armed_loop_serves_credit_true_block_coverage() {
                 Some(dest.dest()),
                 Default::default(),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -458,6 +459,7 @@ async fn dest_armed_loop_serves_credit_true_block_coverage() {
                     128 * 1024,
                     Some(dest.dest()),
                     Default::default(),
+                    None,
                     None,
                 )
                 .await

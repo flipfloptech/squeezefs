@@ -579,7 +579,21 @@ RSS rent, composed-net estimate −0.2..−0.3 core-s/GB — not on the
 kernel ≥ 6.15 requirement; resumption stays priced by the recorded
 pp-inflight diagnostic and sequenced behind K1.
 
-Performance board (exit criteria):
+**Ruling D14 (user 2026-08-06, verbatim: "if a write side exists,
+everything should be stopped and it enabled / built... it may solve our
+gap entirely. making the shim strictly for iops."):** on learning that
+patch 0024 already registers WRITE payload pages `ITER_SOURCE` in the
+sparse slot (the kernel half of write-side zc exists; only the daemon
+half — slot→device direct DMA — was unbuilt, with the memfd bounce
+extraction shipped as the general vehicle), the user redirected the
+program: the zc write-tax economy campaign (extraction batching +
+dispatch-before-extraction, dispatched after the 0.909×/0.936×
+DO-NOT-FLIP bracket `ee1e0956`) was STOPPED pre-work and superseded by
+the **write-side zc build** — `WRITE_FIXED(device ← slot)` for eligible
+shapes, extraction only as the ineligible-shape fallback. Fleet-posture
+corollary recorded with the ruling: with kernel-lane reads AND writes at
+zc, the interception shim's charter narrows toward the IOPS/rand-small
+lane (direct-drive), big-sequential traffic riding the kernel lane.
 1. **zcrx Z3 field rows** — Connect fix in, lane associates on real nvmet,
    engagement laws hold; acceptance = the D5 chain's CPU/byte drop on
    sustained cold seq-read (the RX-copy term), throughput no worse.

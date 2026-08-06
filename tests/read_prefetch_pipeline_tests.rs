@@ -410,8 +410,31 @@ async fn pipeline_phases() {
          is the spiral detector the design's observability demands"
     );
 
+    drop(h2);
+
     // ---- Phase D: multi-stream contention against the same tiny budget —
     // collectively bounded (contention-scaled effective_window).
+    //
+    // Adjudicated 2026-08-06 (fix/phase-d-amp — the ~1/12 quiet-box
+    // flake at g = 96): Phase D previously SHARED Phase C's
+    // `SQUEEZEFS_READ_LANE=0` handle — a 2026-08-05 collateral: the
+    // lever exists for Phase C's R2 hot-landing detector, but it also
+    // stripped Phase D's hold absorption, so every block's second
+    // sub-read that lost the 2-slot hot race refetched (deterministic
+    // adverse tape: g = 96 EXACTLY with hold_serves = 0, hot_hits = 0,
+    // lane_fetches = 0 — pure demand refetches, no lane/walk
+    // amplification; the structural max equals the assert boundary).
+    // Verdict (b) TEST: Phase D gets its OWN default-posture handle
+    // (lane armed — the shipped mount posture, and the posture this
+    // phase was green under before the re-pin), and the adverse
+    // schedule ships INSIDE the phase (deterministic hot displacement
+    // between halves — no interleaving luck left), which turns the
+    // phase into a REAL detector again: g rides the hold's absorption
+    // (48 exactly on the tape), so any future registry/hold dedupe
+    // break shows as g toward 96.
+    std::env::set_var("SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB", "1");
+    let h2 = make_with(*b"pipeline-d-pr5v3", "pipe_ns_d").await;
+    std::env::remove_var("SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB");
     let mut inos = Vec::new();
     for i in 0..4u8 {
         inos.push((
@@ -420,6 +443,9 @@ async fn pipeline_phases() {
         ));
     }
     let g0 = METRICS.get_obj.load(Ordering::Relaxed);
+    let hs0 = METRICS.read_lane_serves.load(Ordering::Relaxed);
+    let hh0 = METRICS.hot_block_hits.load(Ordering::Relaxed);
+    let lf0 = METRICS.read_lane_fetches.load(Ordering::Relaxed);
     let mut tasks = Vec::new();
     for (ino, base) in inos {
         let fs = h2.fs.clone();
@@ -438,6 +464,20 @@ async fn pipeline_phases() {
                         d.iter().all(|&x| x == base.wrapping_add(b as u8)),
                         "stream base {base} block {b} half {half}"
                     );
+                    // The deterministic adverse schedule (shipped —
+                    // 2026-08-06 adjudication): displace every probation
+                    // fill from the 2-slot hot tier before its second
+                    // half arrives, so the phase never depends on
+                    // interleaving luck. The hold (default posture) is
+                    // what absorbs the second halves.
+                    if half == 0 {
+                        for j in 0..2 {
+                            fs.router.cache.hot_block.put(
+                                &format!("dpollute_{base}_{b}_{j}"),
+                                bytes::Bytes::from(vec![0u8; 262_144]),
+                            );
+                        }
+                    }
                 }
             }
         }));
@@ -447,10 +487,19 @@ async fn pipeline_phases() {
     }
     settle_pipeline().await;
     let g = METRICS.get_obj.load(Ordering::Relaxed) - g0;
+    let _ = (hh0, lf0);
     assert!(
         g < 96,
         "4-stream contention must stay collectively bounded: {g} fetches \
          for 48 unique blocks"
+    );
+    // The absorption engagement (the 2026-08-06 adjudication's
+    // mechanism pin): under the deterministic displacement the second
+    // halves are hold-served (48 on the tape) — a collapse here means
+    // the registry/hold dedupe broke and g is riding toward 96.
+    assert!(
+        METRICS.read_lane_serves.load(Ordering::Relaxed) - hs0 >= 24,
+        "the hold must absorb the displaced second halves"
     );
 
     drop(h2);

@@ -13,7 +13,7 @@ touch zcrx.c's provider ops or mlx5). Design:
 
 Commits: red `94cc75ed` + amendment `ccd5e7c2` (see §3 — the first red
 premise self-falsified in the same source walk; the amended contracts
-are the honest ones) · green `<GREEN_SHA>`.
+are the honest ones) · green `426acb7c`.
 
 ## 1. THE VERDICT: (a) is FALSE — the lane is NOT structurally incompatible
 

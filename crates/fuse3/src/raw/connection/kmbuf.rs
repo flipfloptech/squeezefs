@@ -1006,4 +1006,113 @@ mod tests {
         assert!(TransportBufferMode::BufRing.uses_kmbuf());
         assert!(TransportBufferMode::ZeroCopy.uses_kmbuf());
     }
+
+    /// The two kernel tracks' opcode pairs are PINNED (they are deployed
+    /// ABI): 6.19.14-sqz field fleet = 37/38; the patches-7.1 track =
+    /// 38/39 (upstream 7.1 took 37 for IORING_REGISTER_BPF_FILTER).
+    /// Field-first probe order: the deployed fleet resolves on rung 1.
+    #[test]
+    fn test_ladder_pins_the_two_tracks() {
+        assert_eq!(KMBUF_OPCODES_SQZ_619.register, 37);
+        assert_eq!(KMBUF_OPCODES_SQZ_619.unregister, 38);
+        assert_eq!(KMBUF_OPCODES_SQZ_71.register, 38);
+        assert_eq!(KMBUF_OPCODES_SQZ_71.unregister, 39);
+        assert_eq!(KMBUF_OPCODE_LADDER[0], KMBUF_OPCODES_SQZ_619);
+        assert_eq!(KMBUF_OPCODE_LADDER[1], KMBUF_OPCODES_SQZ_71);
+    }
+
+    /// The ladder decision table over injected rung outcomes — every
+    /// kernel class plus the ambiguous shapes, with no syscalls:
+    ///
+    /// | kernel                | rung 37 (reg-args)        | rung 38 (reg-args) | verdict        |
+    /// |-----------------------|---------------------------|--------------------|----------------|
+    /// | 6.19.14-sqz           | Confirmed (0+EEXIST+mmap) | never probed       | Present(37/38) |
+    /// | 7.1.6-sqz             | EINVAL (BPF import)       | Confirmed          | Present(38/39) |
+    /// | stock (any)           | EINVAL                    | EINVAL             | Absent         |
+    /// | foreign lookup shape  | ENOENT                    | EINVAL             | Absent         |
+    /// | foreign 0-return      | ForeignSuccess (loud)     | per rung           | never Present via the foreign rung |
+    #[test]
+    fn test_opcode_ladder_decision_table() {
+        use RungOutcome::*;
+        fn run(script: &[RungOutcome]) -> (KmbufSurface, usize) {
+            let mut i = 0;
+            let s = resolve_ladder(|_pair| {
+                let o = script[i];
+                i += 1;
+                o
+            });
+            (s, i)
+        }
+        // 6.19.14-sqz: rung 1 confirms; rung 2 is never probed — the
+        // short-circuit is part of the contract (probing 38 on 6.19-sqz
+        // would hit kmbuf-UNREGISTER, and while that is characterized
+        // side-effect-free, the ladder must not rely on it).
+        let (s, n) = run(&[Confirmed]);
+        assert_eq!(s, KmbufSurface::Present(KMBUF_OPCODES_SQZ_619));
+        assert_eq!(n, 1, "rung 1 Confirmed must short-circuit");
+        // 7.1.6-sqz: rung 1 hits IORING_REGISTER_BPF_FILTER, whose import
+        // reads the arg's first u16 as cmd_type (≠ 1 for any page-aligned
+        // buf_size) → EINVAL before any state change; rung 2 confirms.
+        let (s, n) = run(&[Refused(libc::EINVAL), Confirmed]);
+        assert_eq!(s, KmbufSurface::Present(KMBUF_OPCODES_SQZ_71));
+        assert_eq!(n, 2);
+        // Stock kernels: opcode unknown everywhere.
+        let (s, n) = run(&[Refused(libc::EINVAL), Refused(libc::EINVAL)]);
+        assert_eq!(s, KmbufSurface::Absent);
+        assert_eq!(n, 2, "Absent only after every rung refused");
+        // Register-shaped args hitting a foreign LOOKUP opcode (the
+        // kmbuf-UNREGISTER cross: resv/flags pass, bgid lookup on the
+        // scratch ring fails) → ENOENT reads NOT-kmbuf, quietly.
+        let (s, _) = run(&[Refused(libc::ENOENT), Refused(libc::EINVAL)]);
+        assert_eq!(s, KmbufSurface::Absent);
+        // A foreign opcode returning 0 WITHOUT the kmbuf signature
+        // (identical-repeat EEXIST + kmbuf-offset mmap) can never arm
+        // that rung — the conjunction is the false-Present proof.
+        let (s, n) = run(&[ForeignSuccess, Confirmed]);
+        assert_eq!(s, KmbufSurface::Present(KMBUF_OPCODES_SQZ_71));
+        assert_eq!(n, 2, "a foreign success falls through to the next rung");
+        let (s, _) = run(&[ForeignSuccess, ForeignSuccess]);
+        assert_eq!(s, KmbufSurface::Absent);
+        // Unexpected errnos are loud but never block later rungs, and
+        // never read as Present themselves.
+        let (s, _) = run(&[Refused(libc::EACCES), Confirmed]);
+        assert_eq!(s, KmbufSurface::Present(KMBUF_OPCODES_SQZ_71));
+        let (s, _) = run(&[Refused(libc::ENOMEM), Refused(libc::EPERM)]);
+        assert_eq!(s, KmbufSurface::Absent);
+    }
+
+    /// The BPF_FILTER discriminator, pinned as arithmetic: 7.1 kernels
+    /// (sqz AND stock CachyOS) dispatch opcode 37 to
+    /// IORING_REGISTER_BPF_FILTER, whose import reads the argument's
+    /// first u16 as `cmd_type` and requires IO_URING_BPF_CMD_FILTER (=1)
+    /// before touching any state. Our register probe's first field is a
+    /// page-aligned `buf_size` — low 12 bits zero — so the import refuses
+    /// EINVAL deterministically: a false Present via BPF_FILTER is
+    /// arithmetically unreachable for every plausible page size.
+    #[test]
+    fn test_probe_arg_first_u16_never_reads_as_bpf_cmd_filter() {
+        for page in [4096u32, 8192, 16384, 65536] {
+            let reg = IoUringBufReg::kernel_managed(page, PROBE_RING_ENTRIES, PROBE_BGID);
+            // SAFETY: reading the union member we just wrote.
+            let first_u16 = (unsafe { reg.addr.buf_size } & 0xffff) as u16;
+            assert_ne!(
+                first_u16, 1,
+                "page-aligned buf_size {page} must never read as \
+                 IO_URING_BPF_CMD_FILTER"
+            );
+        }
+    }
+
+    /// The live probe argument rides in a zero-padded buffer wider than
+    /// any foreign opcode's struct (7.1's io_uring_bpf reads 72 bytes):
+    /// bytes past our 40-byte reg read as deterministic zeros — never
+    /// stack garbage, never a page-boundary EFAULT.
+    #[test]
+    fn test_probe_arg_padding_covers_foreign_readers() {
+        assert!(std::mem::size_of::<IoUringBufReg>() == 40);
+        assert!(
+            PROBE_ARG_SPAN >= 128,
+            "padding must cover foreign-struct reads (io_uring_bpf = 72 B)"
+        );
+    }
 }

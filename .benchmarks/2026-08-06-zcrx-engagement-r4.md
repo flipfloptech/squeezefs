@@ -152,3 +152,12 @@ The read-throughput program continues on the PORTABLE road: whole-block
 cohort dest-DMA (the dest-lease's (C) extension), the warm-serve zc
 follow-on (§8.1), and transport-ingress economy — no NIC or kernel
 dependencies beyond what the product already ships on.
+
+## The program's closing data point (the park-class row, run post-ruling)
+
+`parks=5(dry=5,rq=0,cq=0)` on both A-sides — **pool_dry-dominated**: the
+provider pool's real holding exceeds even the 216 MiB derived area; the
+refill-posting and CQ arms are clean. The named residual for any future
+resumption: read the lane-leased queues' pp inflight (`hold_cnt −
+release_cnt`, free ethtool taps — no binary change) during one armed row
+and the missing MiB becomes a number. Parked here.

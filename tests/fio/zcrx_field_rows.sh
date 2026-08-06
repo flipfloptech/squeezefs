@@ -105,6 +105,10 @@ waits = delta("zcrx_area_admission_waits")
 parks, fails = delta("zcrx_recv_parks"), delta("zcrx_recv_failovers")
 fbk, viol = delta("zcrx_fill_fallbacks"), delta("zcrx_frame_violations")
 byp = delta("zcrx_degraded_bypasses")
+# Round 4: the park errno-class split — closure parks == dry+rq+cq per
+# row; WHICH class dominates names the starved term (pool arithmetic vs
+# refill posting vs reap/CQ) without another source campaign.
+pdry, prq, pcq = delta("zcrx_parks_pool_dry"), delta("zcrx_parks_rq_empty"), delta("zcrx_parks_cq_full")
 starved_ms, structural = delta("zcrx_starved_ms"), delta("zcrx_structural_teardowns")
 eng = fill / user if user else 0.0
 closure = "exact" if fill == gath else f"TORN(fill={fill},gather={gath})"
@@ -114,7 +118,7 @@ verdict = "n/a(off)" if lane == "off" else (
 print(f"  {p.split('/')[-1]}: {bw:.2f} GB/s {iops:,.0f} IOPS user={user/1e9:.1f}GB "
       f"fill={fill/1e9:.1f}GB gather={gath/1e9:.1f}GB dest={dest/1e9:.1f}GB "
       f"share={eng:.3f} closure={closure} waits={waits} bypasses={byp} "
-      f"parks={parks} failovers={fails} fallbacks={fbk} "
+      f"parks={parks}(dry={pdry},rq={prq},cq={pcq}) failovers={fails} fallbacks={fbk} "
       f"starved_ms={starved_ms} structural={structural} armed={armed} {verdict}")
 EOF
     done

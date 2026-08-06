@@ -27,6 +27,7 @@ pub mod steering;
 mod uring_zcrx;
 
 pub use initiator::{LaneBackend, LaneSession, LaneTarget};
+pub use uring_zcrx::park_class_name;
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;

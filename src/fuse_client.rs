@@ -3668,6 +3668,17 @@ pub struct Metrics {
     /// per-op errors (`zcrx_fill_fallbacks`) — the three gates are now
     /// mutually exclusive counters.
     pub zcrx_degraded_bypasses: Align64<AtomicU64>,
+    /// Round 4 — the park ERRNO-CLASS split (`zcrx_recv_parks` keeps
+    /// its round-5 episode meaning; closure: parks ≡ pool_dry +
+    /// rq_empty + cq_full per row): `pool_dry` = the provider pool had
+    /// no free niov (the area/pool-arithmetic term), `rq_empty` = the
+    /// RQ ring starved (the refill-posting term), `cq_full` = the
+    /// lane's CQ could not take a completion (the reap/CQ-sizing
+    /// term). Rounds 2–4 filed all three under one number — the field
+    /// tape could not name WHICH term starved.
+    pub zcrx_parks_pool_dry: Align64<AtomicU64>,
+    pub zcrx_parks_rq_empty: Align64<AtomicU64>,
+    pub zcrx_parks_cq_full: Align64<AtomicU64>,
     /// `zcrx_starved_ms` = cumulative starvation-episode milliseconds
     /// across all lane queues (window accounting + episode tails, exact)
     /// — the economics arm's ledger exported: starved_ms vs
@@ -7224,6 +7235,9 @@ impl SqueezefsFilesystem {
                 "zcrx_recv_parks": METRICS.zcrx_recv_parks.load(Ordering::Relaxed),
                 "zcrx_recv_failovers": METRICS.zcrx_recv_failovers.load(Ordering::Relaxed),
                 "zcrx_degraded_bypasses": METRICS.zcrx_degraded_bypasses.load(Ordering::Relaxed),
+                "zcrx_parks_pool_dry": METRICS.zcrx_parks_pool_dry.load(Ordering::Relaxed),
+                "zcrx_parks_rq_empty": METRICS.zcrx_parks_rq_empty.load(Ordering::Relaxed),
+                "zcrx_parks_cq_full": METRICS.zcrx_parks_cq_full.load(Ordering::Relaxed),
                 "zcrx_starved_ms": METRICS.zcrx_starved_ms.load(Ordering::Relaxed),
                 "zcrx_structural_teardowns": METRICS.zcrx_structural_teardowns.load(Ordering::Relaxed),
                 "zcrx_dest_gather_bytes": METRICS.zcrx_dest_gather_bytes.load(Ordering::Relaxed),

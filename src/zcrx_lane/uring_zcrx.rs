@@ -870,7 +870,7 @@ pub(crate) enum RecvEnd {
 pub(crate) fn classify_recv_end(res: i32) -> RecvEnd {
     if res == 0 {
         RecvEnd::Eof
-    } else if res == -libc::ENOMEM || res == -libc::ENOBUFS || res == -libc::ENOSPC {
+    } else if park_class_name(res).is_some() {
         // ENOSPC (round 7) = CQ-full (zcrx.c:1280/:1317): the data
         // stays in the socket; reap-then-re-arm recovers. After the
         // cq_entries_for sizing a park here means the reaper was
@@ -881,6 +881,28 @@ pub(crate) fn classify_recv_end(res: i32) -> RecvEnd {
         RecvEnd::Rearm
     } else {
         RecvEnd::Terminal
+    }
+}
+
+/// The park ERRNO CLASS (round 4 — the starvation discriminator):
+/// three flow-control conditions park the recv, and each names a
+/// DIFFERENT term — `pool_dry` (-ENOMEM: the provider pool has no free
+/// niov — the area/pool arithmetic's face; io_uring/zcrx.c netmem /
+/// copy-fallback allocation), `rq_empty` (-ENOBUFS: the RQ ring
+/// starved — the refill-posting face), `cq_full` (-ENOSPC: the lane's
+/// own CQ could not take a completion — the reap/CQ-sizing face,
+/// zcrx.c:1280/:1317). Rounds 2–4 filed all three under ONE counter,
+/// which is why the field tape could not tell the pool term from the
+/// reap term. `None` = not a park (EOF/rearm/terminal).
+pub fn park_class_name(res: i32) -> Option<&'static str> {
+    if res == -libc::ENOMEM {
+        Some("pool_dry")
+    } else if res == -libc::ENOBUFS {
+        Some("rq_empty")
+    } else if res == -libc::ENOSPC {
+        Some("cq_full")
+    } else {
+        None
     }
 }
 const TAG_DOORBELL: u64 = 2;
@@ -1317,9 +1339,29 @@ fn drive(
                                 // bounds the episode (failover) —
                                 // parks count EPISODES, not retries.
                                 if gov.on_park(std::time::Instant::now()) {
-                                    crate::fuse_client::METRICS
-                                        .zcrx_recv_parks
-                                        .fetch_add(1, Ordering::Relaxed);
+                                    let m = &crate::fuse_client::METRICS;
+                                    m.zcrx_recv_parks.fetch_add(1, Ordering::Relaxed);
+                                    // Round 4: the episode-STARTING
+                                    // errno names the starved term
+                                    // (closure law: parks ≡ pool_dry +
+                                    // rq_empty + cq_full).
+                                    match park_class_name(res) {
+                                        Some("pool_dry") => {
+                                            m.zcrx_parks_pool_dry.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        Some("rq_empty") => {
+                                            m.zcrx_parks_rq_empty.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        Some("cq_full") => {
+                                            m.zcrx_parks_cq_full.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        _ => {}
+                                    }
+                                    log::warn!(
+                                        "zcrx-lane: recv parked ({}) — refill \
+                                         starvation episode opens",
+                                        park_class_name(res).unwrap_or("?")
+                                    );
                                 }
                             }
                             RecvEnd::Rearm => {

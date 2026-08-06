@@ -208,6 +208,61 @@ touches io_uring/FUSE only — mlx5 is pristine stable):
   probeable. A kernel-side per-queue page budget remains a nice-to-
   have, not a blocker.
 
+**Rev 4c amendments (engagement round 4 — THE VERDICT, 2026-08-06):**
+
+The 216 MiB area still starved (starved_ms = 9 windows, structural = 4
+of 10). The deciding hypothesis — stride/chunk granularity
+incompatibility between MPWQE and the zcrx provider — was adjudicated
+at the source and is **FALSE**:
+
+* **Compatibility is proven.** MPWQE "strides" are VIRTUALLY contiguous
+  via the UMR: `mlx5e_alloc_rx_mpwqe` allocates `pages_per_wqe`
+  INDIVIDUAL order-0 netmems per WQE (`mlx5e_page_alloc_fragmented` →
+  `page_pool_dev_alloc_netmems`, en_rx.c:277–293) and maps each by DMA
+  address into the WQE's inline MTTs (en_rx.c:797–808) — the device
+  sees one contiguous IOVA range over discontiguous 4 KiB pages. A
+  non-XSK queue's `page_shift` IS `PAGE_SHIFT` (params.c:24–34, "the
+  NIC must be able to map order-0"), the UMR mode falls through to
+  ALIGNED/MTT (params.c — the XSK arms are the only others), the
+  provider pool is created `order = 0` (en_main.c:994), and the zcrx
+  provider REQUIRES exactly `pp order + PAGE_SHIFT == niov_shift`
+  (zcrx.c:1018) — the lane's 4 KiB chunks. The 16 KiB "linear stride"
+  (Rev 4b) is the ethtool frames↔WQE conversion unit, never a
+  physical-contiguity demand; **MTU has no bearing on provider
+  compatibility**, and the 0.6 GB of pattern-correct zero-copy fills is
+  the empirical co-proof. The campaign-ending stop is NOT filed.
+* **The free-pool stranding theories are also closed at the source**:
+  the pool's alloc path drains alloc-cache → ptr_ring → provider IN
+  ORDER (page_pool.c:654–668), a full ptr_ring overflows driver
+  recycles to the provider's freelist (page_pool.c:753–773 →
+  `release_netmem`, zcrx.c:994–1005), and user refill returns wait in
+  the rqe ring for the slow-path pull (`io_pp_zc_alloc_netmems` →
+  `io_zcrx_ring_refill`, zcrx.c:920–991). Free chunks cannot strand.
+  Every enumerable holder — posted WQEs (the Rev-4b standing term),
+  in-flight payload (⊆ the admitted window), socket transit (⊆ issued
+  ⊆ admitted), copy-fallback niovs (⊆ transit, zcrx.c:1254+),
+  partial-WQE tails (≤ 2 WQEs) — is funded at 216 MiB.
+* **Therefore the remaining unknown is a LIVE-INPUT question, not a
+  source question** — and the round-4 instrument closes the
+  discrimination gap that kept it unknowable: `classify_recv_end`
+  files three DIFFERENT starvation terms under one Park verdict —
+  **the park errno-class split** (`zcrx_parks_{pool_dry,rq_empty,
+  cq_full}`; closure `parks ≡ dry + rq + cq` per row; the
+  episode-starting errno is the counted class, and the park log names
+  it). `pool_dry` = the area/pool arithmetic's face; `rq_empty` = the
+  refill-posting face; `cq_full` = the lane's own reap/CQ face —
+  **round 2's "every window starved" is a different bug in each
+  class**, and the next field row names it in one line beside the
+  per-queue `rx[i]_pp_*` ethtool counters (alloc_empty/slow +
+  hold−release inflight = the pool's actual holding, readable per row
+  with no binary change).
+* **The census denominator is LIVE-armed** (the structural=4-of-10
+  miss): `note_released` (every teardown — voter, poison, shutdown)
+  removes the session from the rent denominator, because a torn
+  session holds no RSS exclusion; the voter votes while still counted
+  live. The round-4 tape's 4th vote now fires (2×4 ≥ 10 − 3) where
+  ever-armed idled one vote short for the whole row.
+
 **Rev 3 amendments (Z3 as built):**
 
 * **Gather fusion (the PERF-1 win)**: registered-destination funnel

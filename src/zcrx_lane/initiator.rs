@@ -996,6 +996,13 @@ impl LaneSession {
                 }
             }
         }
+        // Round 4: EVERY teardown (structural voter, poison, shutdown)
+        // leaves the census's rent denominator — the vote above ran
+        // while this session still counted live, so a voter can never
+        // shrink the set it is voting against.
+        if let Some(ifx) = self.nic_ifindex() {
+            super::nic_census::note_released(ifx);
+        }
     }
 
     /// Fire-and-forget teardown for the poison path (finding F: the

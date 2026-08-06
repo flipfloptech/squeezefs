@@ -542,6 +542,8 @@ static ZC_NEGOTIATED: AtomicU64 = AtomicU64::new(0);
 static ZC_REPLIES: AtomicU64 = AtomicU64::new(0);
 static ZC_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static ZC_SLOT_PAYLOAD_SKIPS: AtomicU64 = AtomicU64::new(0);
+static ZC_WRITE_EXTRACTIONS: AtomicU64 = AtomicU64::new(0);
+static ZC_WRITE_EXTRACT_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Set the session's kmbuf negotiation state (0/1) — stored at arm time
 /// by `try_start` (the worker-arm wiring), a level like the geometry
@@ -612,6 +614,31 @@ pub fn note_zc_slot_payload_skip() {
 /// data-carrying ioctls (which this daemon does not serve).
 pub fn zc_slot_payload_skips() -> u64 {
     ZC_SLOT_PAYLOAD_SKIPS.load(Ordering::Relaxed)
+}
+
+/// Count one COMPLETED zc WRITE extraction (`WRITE_FIXED` slot → memfd
+/// succeeded and the delivery was dispatched with its §5.4 lease over
+/// the bounce slot) plus its payload bytes. Failed extractions ride
+/// [`note_zc_fallback`], never this pair — the pair is the armed-mount
+/// WRITE engagement face (write-bracket campaign, 2026-08-06): a write
+/// row whose op count these deltas do not account is INVALID.
+pub fn note_zc_write_extraction(bytes: u64) {
+    ZC_WRITE_EXTRACTIONS.fetch_add(1, Ordering::Relaxed);
+    ZC_WRITE_EXTRACT_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// `fuse3_zc_write_extractions` (stats inode): FUSE_WRITE payloads that
+/// arrived via the slot→memfd extraction on a zc-armed queue. 0 by
+/// construction until a session arms zc.
+pub fn zc_write_extractions() -> u64 {
+    ZC_WRITE_EXTRACTIONS.load(Ordering::Relaxed)
+}
+
+/// `fuse3_zc_write_extract_bytes` (stats inode): the byte face of
+/// [`zc_write_extractions`] — closure vs a write row's user bytes is the
+/// row-validity instrument.
+pub fn zc_write_extract_bytes() -> u64 {
+    ZC_WRITE_EXTRACT_BYTES.load(Ordering::Relaxed)
 }
 
 // ---------------------------------------------------------------------
@@ -1221,7 +1248,11 @@ mod tests {
         assert_eq!(zc_write_extractions(), w0 + 1);
         assert_eq!(zc_write_extract_bytes(), wb0 + 4096);
         note_zc_write_extraction(0);
-        assert_eq!(zc_write_extractions(), w0 + 2, "zero-length still counts the op");
+        assert_eq!(
+            zc_write_extractions(),
+            w0 + 2,
+            "zero-length still counts the op"
+        );
         assert_eq!(zc_write_extract_bytes(), wb0 + 4096);
     }
 

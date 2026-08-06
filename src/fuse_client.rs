@@ -7570,6 +7570,12 @@ impl SqueezefsFilesystem {
                 "fuse3_zc_replies": fuse3::zc_replies(),
                 "fuse3_zc_fallbacks": fuse3::zc_fallbacks(),
                 "fuse3_zc_slot_payload_skips": fuse3::zc_slot_payload_skips(),
+                // The WRITE engagement face (write-bracket, 2026-08-06):
+                // completed slot→memfd extractions + their payload bytes —
+                // an armed write row is INVALID unless these deltas
+                // account for its ops/bytes. 0 until a session arms zc.
+                "fuse3_zc_write_extractions": fuse3::zc_write_extractions(),
+                "fuse3_zc_write_extract_bytes": fuse3::zc_write_extract_bytes(),
                 // The WRITE twin (transport-ingress campaign): the gauge
                 // is what keeps the in-place arm wired.
                 "fuse3_write_inplace_replies": fuse3::write_inplace_replies(),

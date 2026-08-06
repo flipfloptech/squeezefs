@@ -4061,7 +4061,10 @@ fn queue_worker(
                     // The payload now exists in the bounce slot: hand the
                     // deferred delivery back to the caller, which mints
                     // the §5.4 lease and pushes inbound (it owns the
-                    // member's arena/lease/pool references).
+                    // member's arena/lease/pool references). Engagement
+                    // face (write-bracket campaign): count the completed
+                    // extraction + its payload bytes.
+                    kmbuf::note_zc_write_extraction(u64::from(len));
                     return Ok(Some(PendingInbound {
                         header_and_op,
                         unique,

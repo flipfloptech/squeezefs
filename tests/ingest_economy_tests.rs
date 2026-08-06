@@ -12,11 +12,14 @@
 //!
 //! The contracts pinned here:
 //!
-//! 1. **One derivation** — the daemon's service-thread ceiling default
-//!    IS `squeezefs_ipc::sizing::il_sessions_default` (the same function
-//!    the shim's per-mount session default rides; its own tie test lives
-//!    in `squeezefs-preload`). The pair cannot drift without turning one
-//!    of the paired tests red.
+//! 1. **One derivation per pair** — the daemon's service-thread ceiling
+//!    default IS `squeezefs_ipc::sizing::il_drain_lanes_default`, the
+//!    SAME function that widths the direct-drive shards (the drain-LANE
+//!    pair — re-graded off the shim slope by the counted 2026-08-06
+//!    field width sweep), and it DOMINATES the shim's per-mount session
+//!    default (`il_sessions_default`, whose own tie test lives in
+//!    `squeezefs-preload` and whose cpus/4 slope does not move) at every
+//!    machine size. Neither pair can drift without turning a test red.
 //! 2. **Override levers stay levers** — `SQUEEZEFS_IPC_SERVICE_THREADS`
 //!    is honored verbatim within its clamp; the default is never a
 //!    constant.
@@ -46,20 +49,50 @@ use std::time::{Duration, Instant};
 // 1. + 2. — the derivation tie (pure forms, machine-independent)
 // ---------------------------------------------------------------------------
 
-/// The daemon's service-thread ceiling default derives from the SAME
-/// function as the shim's per-mount session default — for every machine
-/// size, not just the box running the test (the field mismatch was
-/// invisible at cpus ≤ 32 where the old clamps agreed up to the shim's
-/// flat 4).
+/// The daemon's service-thread ceiling was DELIBERATELY re-graded off the
+/// shim session slope by the counted 2026-08-06 field width sweep (the
+/// direct-drive width re-grade — `.benchmarks/2026-08-06-dd-width-slope.md`):
+/// it now rides the drain-LANE width `il_drain_lanes_default` =
+/// clamp(3×cpus/8, 2, 64), the SAME function as the direct-drive shard
+/// width. The equality half is STRUCTURAL, not preference: governed
+/// submits ride `lane = owner_idx % width` and owners are bounded by this
+/// ceiling, so a shard set wider than the ceiling is production-dark and a
+/// ceiling wider than the shard set shares reapers — splitting the pair
+/// recreates the DEFAULTS-MISMATCH class in either direction.
+///
+/// The ORIGINAL ingest contract survives as DOMINANCE, which is what
+/// makes the re-grade subsume (never retune) the ingest-measured
+/// surfaces: ceiling ≥ the shim's per-mount session default at EVERY
+/// machine size (⌊3c/8⌋ ≥ ⌊c/4⌋, floors equal at 2), so every
+/// default-session single-process ingest workload still gets one drain
+/// thread per session, and spawn-on-bind keeps idle spares
+/// unrepresentable — the field's idle-thread/starved-session topology
+/// cannot recur in either direction. The shim session default itself
+/// (cpus/4 — the surface the +44 % ingest experiment actually measured)
+/// does NOT move; its own tie test in `squeezefs-preload` is untouched.
 #[test]
-fn service_ceiling_default_ties_to_shim_session_default() {
-    for cpus in [1, 2, 4, 8, 16, 22, 32, 48, 64, 128, 256] {
+fn service_ceiling_is_the_drain_lane_width_and_dominates_shim_sessions() {
+    use squeezefs::ipc_direct::dd_shards_from;
+    use squeezefs_ipc::sizing::il_drain_lanes_default;
+    for cpus in [1, 2, 4, 8, 16, 22, 32, 48, 64, 96, 128, 256] {
         assert_eq!(
             service_thread_ceiling_from(None, cpus),
-            il_sessions_default(cpus),
-            "daemon service-thread ceiling default must ride the shared \
-             derivation (cpus={cpus}) — a drift here recreates the field's \
-             idle-thread/starved-session mismatch"
+            il_drain_lanes_default(cpus),
+            "daemon service-thread ceiling default must ride the drain-lane \
+             derivation (cpus={cpus})"
+        );
+        assert_eq!(
+            service_thread_ceiling_from(None, cpus),
+            dd_shards_from(None, cpus),
+            "lane-pair equality (cpus={cpus}): svc ceiling and dd shard \
+             width are ONE number by the lane routing — a split here is \
+             dark shards or shared reapers, the DEFAULTS-MISMATCH class"
+        );
+        assert!(
+            service_thread_ceiling_from(None, cpus) >= il_sessions_default(cpus),
+            "dominance (cpus={cpus}): the ceiling must cover the shim's \
+             session default so every default session still owns a drain \
+             thread — losing this recreates the field's starved-ring shape"
         );
     }
 }
@@ -79,7 +112,7 @@ fn service_ceiling_env_override_is_a_lever() {
     );
     assert_eq!(
         service_thread_ceiling_from(Some("garbage"), 32),
-        il_sessions_default(32),
+        squeezefs_ipc::sizing::il_drain_lanes_default(32),
         "unparseable falls back to the derivation"
     );
 }

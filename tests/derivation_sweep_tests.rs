@@ -829,3 +829,50 @@ fn fuse_drain_group_width_is_the_cpus_over_4_slope_per_node() {
         "32-possible single node: 4 contexts of 8 — the bracket-validated shape"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Direct-drive width re-grade (2026-08-06): the drain-LANE 3×cpus/8 slope
+// ---------------------------------------------------------------------------
+
+/// The counted field width sweep (squeeze-test, 32 CPUs / 2 nodes, il
+/// rand-4k 32×qd32, 3×30 s rows/width, W8 brackets both ends, engagement
+/// exact — `.benchmarks/2026-08-06-dd-width-slope.md`) found a genuine
+/// INTERIOR optimum at W12 on the 32-CPU shape: W8 622–636k → W12
+/// 695–700k (+10.4 %, clat down) → W16 675–690k → W24 616–626k
+/// (regression). The derivation is the LANE-PAIR budget, never the point:
+/// one lane = 2 OS threads (svc submitter + dd reaper), so
+/// `il_drain_lanes_default(cpus)` = clamp(3×cpus/8, 2, 64) puts the lane
+/// thread population 2W at ¾ of the core budget — the sweep's one point
+/// past 1.0× (W24 = 1.5×) is its one regression, verifying the
+/// oversubscription failure mode in the same data. Floor 2 = the pre-L4-8
+/// single-consumer plateau (never-regress: ⌊3c/8⌋ ≥ ⌊c/4⌋ pointwise, so
+/// no box shape derives below the previously shipped width); rail 64 =
+/// the explicit-lever clamp parity (a default must be expressible as an
+/// explicit setting; engages only at cpus ≥ 174 — harmless where absent).
+/// The shim session default and the fuse3 drain-group width keep their
+/// own measured cpus/4 slopes — this class is the DAEMON drain lane only.
+#[test]
+fn il_drain_lane_width_is_the_three_eighths_lane_pair_slope() {
+    use squeezefs_ipc::sizing::{il_drain_lanes_default, il_sessions_default};
+    // The field shape: the counted sweep's interior optimum.
+    assert_eq!(il_drain_lanes_default(32), 12, "32-CPU field box ⇒ 12");
+    // The floor shape (the sweep's canonical 2-CPU box).
+    assert_eq!(il_drain_lanes_default(2), 2, "floor: pre-L4-8 plateau");
+    assert_eq!(il_drain_lanes_default(4), 2, "3×4/8 = 1 ⇒ floor 2");
+    // Big-box slope points (the slope is the claim, not the 32-CPU point).
+    assert_eq!(il_drain_lanes_default(64), 24);
+    assert_eq!(il_drain_lanes_default(96), 36);
+    // The env-rail parity ceiling.
+    assert_eq!(il_drain_lanes_default(256), 64, "railed at the lever clamp");
+    assert_eq!(il_drain_lanes_default(usize::MAX), 64, "no overflow");
+    // Dominance / never-regress: at every machine size the lane width
+    // covers the shim's session default (every default session keeps its
+    // own drain thread — the ingest-economy topology preserved by
+    // subsumption) and never derives below the previously shipped cpus/4.
+    for cpus in 1..=512usize {
+        assert!(
+            il_drain_lanes_default(cpus) >= il_sessions_default(cpus),
+            "dominance broken at cpus={cpus}"
+        );
+    }
+}

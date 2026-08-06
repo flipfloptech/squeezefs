@@ -1324,30 +1324,53 @@ fn governor_peek_is_non_reserving_and_counts_denials() {
 //    pinned per the numa_core owner partition.
 // ---------------------------------------------------------------------------
 
-/// The derivation tie (drift-is-red, the ingest-economy paired-pin law):
-/// the shard width must ride `il_sessions_default` — never a constant —
-/// and the env form (`SQUEEZEFS_IPC_DD_SHARDS`) is an override/measurement
-/// lever with the service-ceiling clamp parity (1..=64), unparseable ⇒
-/// derived.
+/// The derivation tie (drift-is-red, the ingest-economy paired-pin law),
+/// RE-GRADED by the counted 2026-08-06 field width sweep (squeeze-test,
+/// 32 CPUs / 2 nodes, il rand-4k 32×qd32, 3×30 s rows per width, W8
+/// brackets at BOTH ends — no drift — engagement + shards/svc gauges
+/// exact per width): W8 (the old cpus/4) 622–636k, **W12 695–700k
+/// (+10.4 %, clat 1461–1472 µs — best)**, W16 675–690k (+7 %), W24
+/// 616–626k (−2 % — REGRESSION). The shard width must ride the drain-
+/// LANE derivation `il_drain_lanes_default` = clamp(3×cpus/8, 2, 64):
+/// one lane = TWO OS threads (svc submitter + `sqz-ipc-ddN` reaper), so
+/// the sweep's grid in lane-thread/core terms is 2W/cpus ∈ {0.5, 0.75,
+/// 1.0, 1.5} — the optimum sits at the ¾-core-budget point and the one
+/// sampled point past 1.0× is the one regression (oversubscription of
+/// the co-located client fleet). Never a constant; the env form
+/// (`SQUEEZEFS_IPC_DD_SHARDS`) stays an override/measurement lever with
+/// the service-ceiling clamp parity (1..=64), unparseable ⇒ derived.
 #[test]
-fn dd_shard_width_derivation_ties_to_il_sessions_default() {
+fn dd_shard_width_derivation_ties_to_drain_lane_width() {
     use squeezefs::ipc_direct::dd_shards_from;
-    use squeezefs_ipc::sizing::il_sessions_default;
-    for cpus in [1usize, 2, 4, 8, 16, 25, 32, 64, 128, 256] {
+    use squeezefs_ipc::sizing::il_drain_lanes_default;
+    for cpus in [1usize, 2, 4, 8, 16, 25, 32, 64, 96, 128, 256] {
         assert_eq!(
             dd_shards_from(None, cpus),
-            il_sessions_default(cpus),
-            "shard width must ride the ONE drain-parallelism derivation \
+            il_drain_lanes_default(cpus),
+            "shard width must ride the ONE drain-lane derivation \
              (cpus={cpus}) — a flat constant is the DEFAULTS-MISMATCH class"
         );
     }
+    // Canonical shapes (drift-is-red): the counted-optimum field box, a
+    // big-box slope point, the floor.
+    assert_eq!(
+        dd_shards_from(None, 32),
+        12,
+        "the 32-CPU field box: the counted sweep's interior optimum"
+    );
+    assert_eq!(dd_shards_from(None, 96), 36, "big-box slope: 3×96/8");
+    assert_eq!(
+        dd_shards_from(None, 4),
+        2,
+        "floor 2: the pre-L4-8 single-consumer plateau"
+    );
     assert_eq!(dd_shards_from(Some("1"), 32), 1, "explicit wins verbatim");
     assert_eq!(dd_shards_from(Some("12"), 32), 12);
     assert_eq!(dd_shards_from(Some("999"), 32), 64, "env clamp ceiling 64");
     assert_eq!(dd_shards_from(Some("0"), 32), 1, "env clamp floor 1");
     assert_eq!(
         dd_shards_from(Some("nope"), 32),
-        il_sessions_default(32),
+        il_drain_lanes_default(32),
         "unparseable falls back to the derivation"
     );
 }

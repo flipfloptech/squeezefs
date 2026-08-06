@@ -262,6 +262,279 @@ fn engage_governor_probe_cycle_drives_the_default_depth() {
 }
 
 // ---------------------------------------------------------------------------
+// Contract 11 (2026-08-05, the hold-churn campaign — the field's
+// retirement-death conviction, local S1 evidence: 570 retired of
+// 121,639 holds, 119k FIFO evictions, hold_bytes pinned at ~8-11 GB):
+// the governor must never PROBE into a thrashing hold — an ahead-class
+// eviction since the last epoch is zero headroom (else probes measure
+// their own thrash as dead gain forever), and the hold's oldest-first
+// trim structurally retains ahead entries (the newest deposits) while
+// classing its evictions so the pressure signal is clean.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn governor_refuses_to_probe_into_ahead_eviction_pressure() {
+    use squeezefs::read_lane::ReadLaneGovernor;
+    std::env::remove_var("SQUEEZEFS_READ_LANE_DEPTH");
+    std::env::remove_var("SQUEEZEFS_READ_LANE");
+    let g = ReadLaneGovernor::from_env();
+
+    // Epoch anchor.
+    g.note_probe_saturation();
+    assert!(!g.probe_epoch_tick_at(1_000, true, 0));
+
+    // Saturated + headroom, but ahead-class hold evictions moved since
+    // the last epoch: the landing zone is thrashing — a probe launched
+    // now would fetch into a hold that evicts its deposits before
+    // their readers arrive and adjudicate its own thrash as dead gain.
+    // NO launch.
+    g.note_probe_saturation();
+    g.probe_on_fill_bytes(10_000_000);
+    assert!(g.probe_epoch_tick_at(1_600, true, 5));
+    assert_eq!(
+        g.probe_ups(),
+        0,
+        "ahead-eviction pressure must read as zero headroom"
+    );
+    assert_eq!(g.governed_depth(), 0);
+
+    // Pressure cleared (counter unchanged since the snapshot): the
+    // probe launches on the next saturated epoch.
+    g.note_probe_saturation();
+    g.probe_on_fill_bytes(10_000_000);
+    assert!(g.probe_epoch_tick_at(2_200, true, 5));
+    assert_eq!(g.probe_ups(), 1, "clean epoch probes again");
+    assert_eq!(g.governed_depth(), 1);
+}
+
+#[test]
+fn hold_trim_retains_ahead_entries_and_classes_its_evictions() {
+    let hold = ReadLaneHold::new();
+    let blk = bytes::Bytes::from(vec![9u8; BS as usize]);
+    let budget = 2 * BS; // two entries
+
+    let evicted0 = METRICS
+        .read_lane_hold_evicted_unconsumed
+        .load(Ordering::Relaxed);
+    let ahead0 = METRICS
+        .read_lane_hold_ahead_evictions
+        .load(Ordering::Relaxed);
+
+    // Demand transit d1, then the ahead entry a1 (the newest), then
+    // demand transit d2: the oldest-first trim must evict d1 — the
+    // flow-through population — and RETAIN the ahead entry (the item-2
+    // adjudication: FIFO oldest-first + retirement-by-consumption IS
+    // the ahead-priority mechanism; ahead entries are structurally
+    // last in line).
+    hold.insert_demand("d1", blk.clone(), budget);
+    hold.insert("a1", blk.clone(), budget); // ahead class (lane fetch)
+    hold.insert_demand("d2", blk.clone(), budget);
+    assert!(!hold.contains("d1"), "oldest demand transit evicts first");
+    assert!(hold.contains("a1"), "the ahead entry is retained");
+    assert!(hold.contains("d2"));
+    assert_eq!(
+        METRICS
+            .read_lane_hold_ahead_evictions
+            .load(Ordering::Relaxed)
+            - ahead0,
+        0,
+        "a demand-class eviction must not read as ahead pressure"
+    );
+
+    // Trimming past the ahead entry classes it: the governor's
+    // pressure signal (contract 11's headroom input) counts exactly
+    // the ahead-class starvation evictions.
+    hold.trim_to(0);
+    assert_eq!(
+        METRICS
+            .read_lane_hold_ahead_evictions
+            .load(Ordering::Relaxed)
+            - ahead0,
+        1,
+        "an unconsumed ahead-class eviction is the pressure signal"
+    );
+    assert_eq!(
+        METRICS
+            .read_lane_hold_evicted_unconsumed
+            .load(Ordering::Relaxed)
+            - evicted0,
+        3,
+        "the total evicted-unconsumed ledger counts both classes"
+    );
+}
+
+/// 4 KiB-aligned scratch destination (the registered-payload stand-in —
+/// the read_copy_ledger_tests pattern).
+struct AlignedDest {
+    ptr: *mut u8,
+    layout: std::alloc::Layout,
+}
+impl AlignedDest {
+    fn new(size: usize) -> Self {
+        let layout = std::alloc::Layout::from_size_align(size, 4096).unwrap();
+        // SAFETY: valid non-zero layout; zeroed so reads of unwritten
+        // bytes are defined.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!ptr.is_null());
+        Self { ptr, layout }
+    }
+    fn dest(&self) -> squeezefs::routing::ReadDest {
+        // SAFETY: the allocation outlives every read it is handed to and
+        // is exclusively this test's.
+        unsafe { squeezefs::routing::ReadDest::new(self.ptr as u64, self.layout.size()) }
+    }
+}
+impl Drop for AlignedDest {
+    fn drop(&mut self) {
+        // SAFETY: allocated with this exact layout above.
+        unsafe { std::alloc::dealloc(self.ptr, self.layout) };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Contract 12 (2026-08-05, the hold-churn campaign — the coverage-credit
+// truth): a dest-armed fetch-loop serve must credit its TRUE block
+// coverage. The shipped tail credit computed
+// `min(slice_len, served_slice.len() − slice_start)` — on the dest arm
+// `served_slice` is the POST-SLICE dest bytes (len == slice_len), so
+// every sub-read past a block's first credited ZERO: coverage
+// retirement died on deep-qd cohort rows (local S1 evidence: 570
+// retired of 121,639 holds; the hold pinned at its ~10 GiB budget with
+// 119k FIFO evictions reading as churn; the field's 9,025
+// `read_lane_hold_evicted_unconsumed`).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dest_armed_loop_serves_credit_true_block_coverage() {
+    // Whole-block shape parity (the zero-share-env rule): the fixture's
+    // 512 KiB blocks force 128 KiB sub-reads, which would otherwise
+    // ride R3 ranged windows (no whole-block fill, no deposit).
+    std::env::set_var("SQUEEZEFS_READ_RANGED_THRESHOLD", "0");
+    let h = make_with(*b"read-lane-test10", "rdlane_ns_j", false).await;
+    std::env::remove_var("SQUEEZEFS_READ_RANGED_THRESHOLD");
+    let blocks = 2u64;
+    let (ino, map) = striped_file(&h, "credittruth", blocks).await;
+    let key0 = map.get(&0).unwrap().clone();
+    let path = squeezefs::keys::inode_path(ino);
+    let dest = AlignedDest::new(128 * 1024);
+
+    // Cold, dest-armed, slice_start = 128 KiB: the primary rides the
+    // validated fetch loop, deposits the 512 KiB fill in the hold, and
+    // must credit THIS op's block coverage — 128 KiB.
+    let (data, _b) =
+        h.fs.router
+            .read_file_range_zero_copy_with_meta(
+                &path,
+                128 * 1024,
+                128 * 1024,
+                Some(dest.dest()),
+                Default::default(),
+                None,
+            )
+            .await
+            .unwrap();
+    assert!(data.iter().all(|&x| x == 1), "byte parity");
+    assert!(
+        h.fs.router.cache.read_lane_hold.contains(&key0),
+        "the demand primary deposits"
+    );
+    assert_eq!(
+        h.fs.router.cache.read_lane_hold.served_bytes(&key0),
+        Some(128 * 1024),
+        "a dest-armed loop serve must credit its true block coverage \
+         (the tail credit read 0 for every sub-read past the block's first)"
+    );
+
+    // The remaining three sub-reads complete the coverage (whatever arm
+    // serves them — hot/hold serves already credit correctly): the
+    // entry RETIRES — memory converges by consumption, not eviction.
+    let r0 = METRICS.read_lane_hold_retired.load(Ordering::Relaxed);
+    for off in [0u64, 256 * 1024, 384 * 1024] {
+        let (d, _b) =
+            h.fs.router
+                .read_file_range_zero_copy_with_meta(
+                    &path,
+                    off,
+                    128 * 1024,
+                    Some(dest.dest()),
+                    Default::default(),
+                    None,
+                )
+                .await
+                .unwrap();
+        assert!(d.iter().all(|&x| x == 1), "byte parity at {off}");
+    }
+    assert!(
+        !h.fs.router.cache.read_lane_hold.contains(&key0),
+        "full coverage retires the entry"
+    );
+    assert_eq!(
+        METRICS.read_lane_hold_retired.load(Ordering::Relaxed) - r0,
+        1,
+        "retirement is the converge-by-consumption verdict"
+    );
+    drop(h);
+}
+
+// ---------------------------------------------------------------------------
+// Contract 13 (2026-08-05, the hold-churn campaign — the marginal-issue
+// walk): blocks the demand front or any store already covers must
+// advance the lane cursor as SYNC probes — never a spawned task, never
+// a depth slot. The field's depth-1 probes died here: ~92 % of issue
+// opportunities raced into demand-covered blocks and skip-settled
+// through full task latency (1,912 real fetches against ~25k
+// opportunities), so probe delivery never responded and every probe
+// honestly retreated (ups = backoffs = 14).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lane_walk_skips_covered_blocks_without_spending_depth() {
+    set_zero_share_env();
+    // 4 MiB hot tier (8 slots) instead of the zero-share default 1 MiB
+    // (2 slots): the demand fills' own hot landings must not evict the
+    // pre-covered blocks before the walk probes them. Share stays 0
+    // (1 % x 4 MiB / 512 KiB truncates to 0).
+    std::env::set_var("SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB", "4");
+    set_ahead_env();
+    let h = make_with(*b"read-lane-test11", "rdlane_ns_k", false).await;
+    clear_ahead_env();
+    clear_zero_share_env();
+
+    let blocks = 12u64;
+    let (ino, map) = striped_file(&h, "walkfile", blocks).await;
+    // Pre-cover blocks 2 and 3 (hot-resident — the demand-front
+    // stand-in: a block the reader will find without a lane fetch).
+    for b in [2u32, 3] {
+        let key = map.get(&b).unwrap();
+        h.fs.router.cache.hot_block.put(
+            key,
+            bytes::Bytes::from(vec![(b % 250) as u8 + 1; BS as usize]),
+        );
+    }
+
+    let skips0 = METRICS.read_lane_covered_skips.load(Ordering::Relaxed);
+    let f0 = lane_fetches();
+    stream_pass(&h, ino, blocks, |b| (b % 250) as u8 + 1).await;
+    for _ in 0..200 {
+        if h.fs.router.read_lane_inflight_bytes() == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    assert!(
+        METRICS.read_lane_covered_skips.load(Ordering::Relaxed) - skips0 >= 2,
+        "covered blocks must advance the cursor as sync probes \
+         (the walk's engagement instrument)"
+    );
+    assert!(
+        lane_fetches() - f0 >= blocks / 2,
+        "the lane still front-runs the uncovered span"
+    );
+    drop(h);
+}
+
+// ---------------------------------------------------------------------------
 // Hold-store unit semantics (coverage retirement, FIFO trim, purge,
 // exact gauge accounting).
 // ---------------------------------------------------------------------------

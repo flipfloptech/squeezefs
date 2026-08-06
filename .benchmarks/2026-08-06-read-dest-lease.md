@@ -220,3 +220,13 @@ the cold 128 GB 16-stream bs=1M row that adjudicated the CPU wall:
    AND the lease (qd1 O_DIRECT streams): a lease-aware ahead arm would
    need scatter fills (dest window + pooled complement) — priced only
    if a field shape demands it.
+
+## FIELD ACCEPTANCE (2026-08-06, pair ccc91701 — the phase-1 verdict)
+
+A-B-B-A on the cold 128 GB 16-stream row, order-independent:
+LEASE 27.98 / 27.74 GB/s vs CONTROL 21.47 / 21.98 — **+28.3 %**, engagement
+exact (dest 0.0, lease 1,958.7/1,946.1 GB ≡ the rows' served bytes),
+daemon %CPU down ~90-130 points at +28 % more delivered bytes (CPU/byte
+−28 %). The local +28.6 % transferred verbatim. Reads now 67 % of raw
+(27.9/41.8); the phase-2 zcrx engagement campaign owns the remaining gap
+to the 85 % bar (35.5).

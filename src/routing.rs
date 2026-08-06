@@ -7364,6 +7364,33 @@ impl DataRouter {
         }
     }
 
+    /// Sync coverage screen for the lane issue walk (2026-08-05
+    /// hold-churn campaign): is `block` already covered — a hole, or
+    /// resident/in-flight anywhere a reader will find it (the
+    /// single-flight registry = the demand front, the hold, the hot
+    /// tier, the RAM LRU, the NVMe read tier)? All arms are sync RAM
+    /// probes; `NeedsAuthority` reads as UNCOVERED (the spawned task's
+    /// own resident re-check stays the race-safe arbiter). Racy by
+    /// design: a stale verdict costs one skipped-or-deduped fetch,
+    /// never correctness (the single-flight and the validated-fill
+    /// discipline own those).
+    fn lane_block_covered(&self, meta: &CachedMetadata, block: u32) -> bool {
+        match block_key_in(meta, block) {
+            BlockKeyResolve::Hole => true,
+            BlockKeyResolve::NeedsAuthority => false,
+            BlockKeyResolve::Key(k) => {
+                let key: &str = &k;
+                self.inflight_block_reads
+                    .read_sync(key, |_, _| ())
+                    .is_some()
+                    || self.cache.read_lane_hold.contains(key)
+                    || self.cache.hot_block.get_no_promote(key).is_some()
+                    || self.cache.read_lru.get_no_promote(key).is_some()
+                    || self.cache.nvme.has_cached_read_block(key)
+            }
+        }
+    }
+
     /// The read-lane issue path (2026-08-01 campaign — the §5.5
     /// sub-start-window regime's pipeline): top the lane up to the
     /// engage-governor-derived per-stream depth with whole-block
@@ -7451,13 +7478,27 @@ impl DataRouter {
             return;
         }
         // Cache the consume-window hold budget for the deposit sites
-        // (streams × depth are known only here).
+        // (streams × depth are known only here). The window input is
+        // `depth + the derived cohort-spread window` (2026-08-05 — item
+        // 1's form): the hold must cover the ahead pipeline AND the
+        // flow-through demand population's retirement lag (in-flight
+        // fills + deep-qd cohort spread per stream ≈ the same derived
+        // §5.5 window cap the deposit-site fallback already uses) — a
+        // depth-only window under-covered the mixed population whenever
+        // the adopted depth was small. `read_lane_hold_budget()` takes
+        // the max of this cache and the fallback, so the effective
+        // budget can only tighten upward toward the true working set.
+        let cohort_window = derived_prefetch_window_cap(
+            self.prefetch_share_pct,
+            self.cache.hot_block.max_bytes(),
+            block_size,
+        );
         self.read_lane
             .set_hold_budget(crate::read_lane::hold_budget_bytes(
                 crate::read_lane::effective_mem_budget(),
                 block_size,
                 streams,
-                depth,
+                depth.saturating_add(cohort_window),
             ));
         // (Re)base the plan when it is uninitialized or fell behind the
         // reader (the R2 rule verbatim: the skipped span was never
@@ -7473,14 +7514,31 @@ impl DataRouter {
             return;
         }
         let total_blocks = meta.size.div_ceil(block_size) as u32;
-        // The reader-tied horizon: issue only inside
-        // (end_block, end_block + 1 + depth] — a skip-settled task (the
-        // demand front already owns the flight) must not let the cursor
-        // sprint to EOF fetching bytes the reader is minutes away from
-        // (round-2 field lesson: an unbounded cursor turned the hold
-        // into a 23.6 GiB FIFO with ~50 % of deposits evicted
-        // unconsumed).
-        let horizon = end_block.saturating_add(1).saturating_add(depth);
+        // The reader-tied horizon (2026-08-05 hold-churn campaign — the
+        // marginal-issue walk): the depth bound governs UNCOVERED
+        // fetches (`rl_inflight < depth`), while blocks the demand
+        // front or any store already covers advance the cursor as ONE
+        // SYNC probe each — never a spawned task, never a depth slot.
+        // The field's depth-1 probes died without this: the cursor
+        // rebased onto the qd-covered demand front, every issue raced
+        // into a registry-owned block and skip-settled through full
+        // task latency (~92 % of opportunities), so probe delivery
+        // never responded and every probe honestly retreated. The walk
+        // bound is the derived §5.5 window cap (budget-derived, railed
+        // [4, 4096] — never a constant): the cursor may sit at most
+        // that many blocks past the reader, which keeps the round-2
+        // EOF-sprint lesson (fetched-ahead bytes stay depth-bounded;
+        // examined-ahead distance stays cap-bounded). A demand front
+        // wider than the cap stalls the walk in covered space — the
+        // demand-covered venue, where ahead fetch has nothing to buy.
+        let examine_cap = derived_prefetch_window_cap(
+            self.prefetch_share_pct,
+            self.cache.hot_block.max_bytes(),
+            block_size,
+        )
+        .max(depth);
+        let walk_horizon = end_block.saturating_add(1).saturating_add(examine_cap);
+        let mut examined = 0u32;
         loop {
             let in_flight = lane.rl_inflight.load(Relaxed);
             if !crate::read_lane::lane_issue_admits(
@@ -7500,10 +7558,31 @@ impl DataRouter {
                 }
                 break;
             }
-            let next = lane.next_prefetch_block.load(Relaxed);
-            if next >= total_blocks || next > horizon {
+            if examined >= examine_cap {
                 break;
             }
+            let next = lane.next_prefetch_block.load(Relaxed);
+            if next >= total_blocks || next > walk_horizon {
+                break;
+            }
+            // Sync coverage screen: demand front (single-flight
+            // registry), hold, hot, RAM LRU, NVMe tier, and holes —
+            // all sync probes on RAM indexes. A covered block costs
+            // the walk one probe and moves the cursor; the task-level
+            // resident re-check stays the race-safe arbiter for the
+            // blocks we DO fetch.
+            if self.lane_block_covered(meta, next) {
+                if lane
+                    .next_prefetch_block
+                    .compare_exchange(next, next + 1, Relaxed, Relaxed)
+                    .is_ok()
+                {
+                    examined += 1;
+                    METRICS.read_lane_covered_skips.fetch_add(1, Relaxed);
+                }
+                continue;
+            }
+            examined += 1;
             if lane
                 .next_prefetch_block
                 .compare_exchange(next, next + 1, Relaxed, Relaxed)
@@ -12674,6 +12753,19 @@ impl DataRouter {
                                                 {
                                                     let len = block_size as usize;
                                                     let dest_ptr = dest as *mut u8;
+                                                    // Read-lane coverage credit (2026-08-05
+                                                    // hold-churn campaign — the coverage-credit
+                                                    // truth): dest arms credit INLINE, where the
+                                                    // true block coverage is known; the tail
+                                                    // credit computed it from the POST-SLICE dest
+                                                    // bytes and read 0 for every sub-read past a
+                                                    // block's first (the retirement-death class).
+                                                    // This raw leg serves the whole block.
+                                                    if !device_true && self.read_lane.enabled() {
+                                                        self.cache
+                                                            .read_lane_hold
+                                                            .credit(b_key, block_size);
+                                                    }
                                                     // SAFETY: the destination window this serve was bounded against at
                                                     // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
                                                     // `cap`, and §5.4 lease exclusivity (kernel path) / session arena
@@ -12735,6 +12827,23 @@ impl DataRouter {
                                                             val.len(),
                                                         );
                                                         let len = end - start;
+                                                        // Read-lane coverage credit (2026-08-05
+                                                        // — the coverage-credit truth): computed
+                                                        // HERE, on the full block, before the
+                                                        // slice. The tail credit read the
+                                                        // POST-SLICE dest bytes and credited 0
+                                                        // for every sub-read past a block's
+                                                        // first — coverage retirement died on
+                                                        // deep-qd cohort rows (570 retired of
+                                                        // 121,639 holds; the hold pinned at its
+                                                        // budget with 119k FIFO evictions
+                                                        // reading as churn).
+                                                        if !device_true && self.read_lane.enabled()
+                                                        {
+                                                            self.cache
+                                                                .read_lane_hold
+                                                                .credit(b_key, len as u64);
+                                                        }
                                                         let dest_ptr = dest as *mut u8;
                                                         // SAFETY: the destination window this serve was bounded against at
                                                         // entry (`ReadDest::checked_ptr`, FUSE-4e) — writes stay within
@@ -12880,7 +12989,19 @@ impl DataRouter {
                                     // it a streamed block would sit one
                                     // sub-read short of retirement
                                     // forever (no-op when not held).
-                                    if !device_true && self.read_lane.enabled() {
+                                    // None-dest arms ONLY (2026-08-05,
+                                    // the coverage-credit truth): here
+                                    // `downloaded` is the FULL block, so
+                                    // the coverage formula is honest;
+                                    // dest arms serve a POST-SLICE
+                                    // buffer (len == the served slice)
+                                    // and credit INLINE at their slice
+                                    // sites, where the full block length
+                                    // is still in hand.
+                                    if dest_addr.is_none()
+                                        && !device_true
+                                        && self.read_lane.enabled()
+                                    {
                                         if let Some(bk) = b_key_opt.as_deref() {
                                             let served = std::cmp::min(
                                                 slice_len as u64,

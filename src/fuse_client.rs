@@ -3509,6 +3509,16 @@ pub struct Metrics {
     pub read_lane_serve_bytes: Align64<AtomicU64>,
     pub read_lane_hold_retired: Align64<AtomicU64>,
     pub read_lane_hold_evicted_unconsumed: Align64<AtomicU64>,
+    /// Ahead-class (lane-fetch) subset of the evicted-unconsumed ledger
+    /// (2026-08-05 hold-churn campaign) — the engage-governor's
+    /// landing-zone pressure signal: movement within an epoch reads as
+    /// zero probe headroom.
+    pub read_lane_hold_ahead_evictions: Align64<AtomicU64>,
+    /// Lane issue-walk blocks skipped as already covered (demand front /
+    /// hold / hot / LRU / NVMe tier) — sync probes that advance the
+    /// cursor without a task or a depth slot (the marginal-issue walk's
+    /// engagement instrument).
+    pub read_lane_covered_skips: Align64<AtomicU64>,
     pub read_lane_wasted: Align64<AtomicU64>,
     pub read_lane_depth_target: Align64<AtomicU64>,
     /// The READ copy ledger (read-copy-count campaign, 2026-08-02): every
@@ -7131,6 +7141,8 @@ impl SqueezefsFilesystem {
                 "read_lane_serve_bytes": METRICS.read_lane_serve_bytes.load(Ordering::Relaxed),
                 "read_lane_hold_retired": METRICS.read_lane_hold_retired.load(Ordering::Relaxed),
                 "read_lane_hold_evicted_unconsumed": METRICS.read_lane_hold_evicted_unconsumed.load(Ordering::Relaxed),
+                "read_lane_hold_ahead_evictions": METRICS.read_lane_hold_ahead_evictions.load(Ordering::Relaxed),
+                "read_lane_covered_skips": METRICS.read_lane_covered_skips.load(Ordering::Relaxed),
                 "read_lane_wasted": METRICS.read_lane_wasted.load(Ordering::Relaxed),
                 "read_lane_depth_target": METRICS.read_lane_depth_target.load(Ordering::Relaxed),
                 "read_lane_depth_probe_ups": self.router.read_lane_probe_ups(),

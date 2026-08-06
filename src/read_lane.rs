@@ -443,8 +443,24 @@ impl ReadLaneHold {
         let _ = self.remove_entry(block_key);
     }
 
+    /// The entry's consumed-byte credit (tests + observability; `None`
+    /// when the key is not held). The coverage-credit truth contract
+    /// (`tests/read_lane_tests.rs` contract 12) reads it to pin that
+    /// every serve arm credits its TRUE block coverage.
+    pub fn served_bytes(&self, block_key: &str) -> Option<u64> {
+        self.entries
+            .read_sync(block_key, |_, e| e.served.load(Ordering::Relaxed))
+    }
+
     /// Trim oldest-first to `target` bytes (insert-time budget and the
-    /// R5 shed hook).
+    /// R5 shed hook). Evicted-unconsumed entries are CLASSED (2026-08-05
+    /// hold-churn campaign): an ahead-class (lane-fetch) eviction also
+    /// counts `read_lane_hold_ahead_evictions` — the engage-governor's
+    /// landing-zone-pressure signal (a probe launched into a hold that
+    /// evicts its ahead deposits before their readers arrive measures
+    /// its own thrash as dead gain forever). Oldest-first is itself the
+    /// ahead-priority mechanism: ahead entries are the NEWEST deposits,
+    /// so the flow-through demand population always evicts first.
     pub fn trim_to(&self, target: u64) {
         while self.bytes.load(Ordering::Relaxed) > target {
             let Some((seq, key)) = self.fifo.pop() else {
@@ -459,6 +475,11 @@ impl ReadLaneHold {
                     crate::fuse_client::METRICS
                         .read_lane_hold_evicted_unconsumed
                         .fetch_add(1, Ordering::Relaxed);
+                    if !e.ledger_visible {
+                        crate::fuse_client::METRICS
+                            .read_lane_hold_ahead_evictions
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         }
@@ -565,6 +586,10 @@ pub struct ReadLaneGovernor {
     /// snapshot — marks moved since the snapshot = a saturated epoch.
     probe_sat_marks: AtomicU64,
     probe_sat_snap: AtomicU64,
+    /// `read_lane_hold_ahead_evictions` at the last epoch roll — the
+    /// landing-zone pressure snapshot (2026-08-05): movement since the
+    /// snapshot reads as zero headroom (see [`Self::probe_epoch_tick`]).
+    probe_ahead_snap: AtomicU64,
     inflight_bytes: AtomicU64,
     /// The live consume-behind hold budget (bytes), cached by the issue
     /// path (which knows streams × depth) for the deposit sites (which
@@ -595,6 +620,7 @@ impl ReadLaneGovernor {
             probe: crate::write_pipeline_core::ProbeCore::new(),
             probe_sat_marks: AtomicU64::new(0),
             probe_sat_snap: AtomicU64::new(0),
+            probe_ahead_snap: AtomicU64::new(0),
             inflight_bytes: AtomicU64::new(0),
             hold_budget: AtomicU64::new(0),
             hold_budget_decay_ms: AtomicU64::new(0),
@@ -654,13 +680,33 @@ impl ReadLaneGovernor {
 
     /// Roll the probe epoch from the issue path (production clock):
     /// saturation from the sat-mark snapshot, headroom from the caller
-    /// (below the R5 cap and not Red).
+    /// (below the R5 cap and not Red) COMPOSED with the landing-zone
+    /// pressure arm (2026-08-05 hold-churn campaign): an ahead-class
+    /// hold eviction since the last epoch means the hold is evicting
+    /// lane deposits before their readers arrive — probing into that
+    /// is guaranteed dead gain (the probe measures its own thrash), so
+    /// pressure reads as ZERO headroom until an eviction-free epoch.
     pub fn probe_epoch_tick(&self, headroom: bool) {
+        let ahead_now = crate::fuse_client::METRICS
+            .read_lane_hold_ahead_evictions
+            .load(Ordering::Relaxed);
+        let _ = self.probe_epoch_tick_at(coarse_ms(), headroom, ahead_now);
+    }
+
+    /// [`Self::probe_epoch_tick`] with an explicit clock and
+    /// ahead-eviction reading (tests — the ProbeCore determinism
+    /// contract). Returns `true` iff this call rolled the epoch.
+    pub fn probe_epoch_tick_at(&self, now_ms: u64, headroom: bool, ahead_evictions: u64) -> bool {
         let marks = self.probe_sat_marks.load(Ordering::Relaxed);
         let saturated = marks != self.probe_sat_snap.load(Ordering::Relaxed);
-        if self.probe.roll(coarse_ms(), saturated, headroom) {
+        let pressure = ahead_evictions != self.probe_ahead_snap.load(Ordering::Relaxed);
+        let rolled = self.probe.roll(now_ms, saturated, headroom && !pressure);
+        if rolled {
             self.probe_sat_snap.store(marks, Ordering::Relaxed);
+            self.probe_ahead_snap
+                .store(ahead_evictions, Ordering::Relaxed);
         }
+        rolled
     }
 
     /// [`crate::write_pipeline::ProbeCore::roll`] with an explicit

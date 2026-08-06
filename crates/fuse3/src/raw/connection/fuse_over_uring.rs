@@ -7436,8 +7436,16 @@ mod inbound_queue_tests {
 mod cq_overflow_tests {
     use super::*;
 
+    /// `TRANSPORT_CQ_{OVERFLOWS,NODROP}` are process-global (the product
+    /// publishes ONE probe per process), and `CqDropWatch::new` stores to
+    /// the NODROP word — so every test in this module that reads either
+    /// global must hold this lock, or a sibling test's constructor races
+    /// its assertion (observed ~1/20 under the default parallel harness).
+    static GLOBALS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn a_quiet_ring_reports_no_drops() {
+        let _g = GLOBALS.lock().unwrap();
         let mut w = CqDropWatch::new(true);
         for _ in 0..8 {
             assert_eq!(w.observe(0), 0, "an un-overflowed CQ must report nothing");
@@ -7446,6 +7454,7 @@ mod cq_overflow_tests {
 
     #[test]
     fn newly_dropped_completions_are_reported_once_each() {
+        let _g = GLOBALS.lock().unwrap();
         let mut w = CqDropWatch::new(false);
         assert_eq!(w.observe(3), 3, "the first observation reports the backlog");
         assert_eq!(w.observe(3), 0, "an unchanged counter is not re-reported");
@@ -7456,6 +7465,7 @@ mod cq_overflow_tests {
     /// counter must not report ~4 G phantom drops (nor go silent).
     #[test]
     fn the_counter_is_read_as_a_wrapping_delta() {
+        let _g = GLOBALS.lock().unwrap();
         let mut w = CqDropWatch::new(false);
         assert_eq!(w.observe(u32::MAX - 1), u32::MAX - 1);
         assert_eq!(w.observe(1), 3, "wraparound is a delta of 3, not 4 billion");
@@ -7466,6 +7476,7 @@ mod cq_overflow_tests {
     /// integrity counters).
     #[test]
     fn observations_land_on_the_stats_tripwire() {
+        let _g = GLOBALS.lock().unwrap();
         let before = transport_cq_overflow_stats().0;
         let mut w = CqDropWatch::new(false);
         w.observe(7);
@@ -7480,6 +7491,7 @@ mod cq_overflow_tests {
     /// whether this kernel can drop at all.
     #[test]
     fn the_nodrop_probe_is_published() {
+        let _g = GLOBALS.lock().unwrap();
         note_cq_nodrop(true);
         assert_eq!(transport_cq_overflow_stats().1, 1);
         note_cq_nodrop(false);

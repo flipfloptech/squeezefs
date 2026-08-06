@@ -751,6 +751,44 @@ fn zcrx_lane_xfer_cap_is_the_transport_payload_face() {
     assert_eq!(LANE_MAX_XFER_CAP_BYTES, 1024 * 1024, "Z2-benched MDTS face");
 }
 
+/// The zcrx ENGAGEMENT geometry (2026-08-06 campaign — phase 2 of the
+/// read copy-elimination program) is DERIVED end-to-end; drift-is-red
+/// on the canonical shapes:
+/// * eligible pool = `clamp(devices_via_nic, channels/4, channels/2)` —
+///   the census input widens the flat §8 /4 pool exactly as far as the
+///   fabric-device breadth demands (floor = the standing ¼ posture,
+///   ceiling = the kernel path keeps ≥ half the NIC's RSS width);
+/// * admission = the FULL fill window `depth × max_xfer` (the retired
+///   /2's implicit slack budget moved to the AREA, derived from the
+///   MTU/chunk burst-occupancy arithmetic — `delivery_slack_bytes`);
+/// * area = window + slack + ring-standing (rounds 6–7 unchanged).
+#[test]
+fn zcrx_engagement_geometry_derives_on_canonical_shapes() {
+    use squeezefs::zcrx_lane::area;
+    use squeezefs::zcrx_lane::steering::lane_eligible_queues;
+    // Pool width: (channels, devices) → width.
+    for (ch, dev, width) in [
+        (32u32, 10usize, 10u32), // the field rail: 10 devices, all covered
+        (32, 5, 8),              // two-rail split: floor binds
+        (32, 0, 8),              // failed census: the sole-device posture
+        (32, 100, 16),           // ceiling: RSS keeps ≥ half the NIC
+        (64, 20, 20),
+        (3, 10, 0), // too narrow: never dedicates ZC queues
+    ] {
+        let p = lane_eligible_queues(ch, dev);
+        assert_eq!(p.end - p.start, width, "pool width at ({ch}, {dev})");
+        assert_eq!(p.end, ch, "the pool stays the HIGHEST-indexed slice");
+    }
+    // Admission is the whole window; slack derives from burst occupancy.
+    let window = area::area_bytes_per_queue(64, 1 << 20); // the field queue
+    assert_eq!(
+        area::admission_permits(window as usize, 4096) as u64,
+        window / 4096
+    );
+    assert_eq!(area::delivery_slack_bytes(window, Some(9000), 4096), 24 << 20);
+    assert_eq!(area::delivery_slack_bytes(window, None, 4096), window);
+}
+
 /// Ingress-queue-spread lever 2 (2026-08-05, hard-constant ruling): the
 /// drain-group width is DERIVED — `drain_group_width(node_possible_cpus)`
 /// = the house `cpus/4` drain-parallelism SLOPE (the

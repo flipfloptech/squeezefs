@@ -2664,3 +2664,216 @@ async fn test_admission_overflow_declines_fast_never_parks() {
     }
     sess.teardown().await;
 }
+
+// ---------------------------------------- engagement geometry (2026-08-06)
+//
+// Phase 2 of the read copy-elimination program (the zcrx ENGAGEMENT
+// campaign). The round-8 verdict (`.benchmarks/2026-08-05-zcrx-z3-field-
+// rows.md`) measured 0.05 % engagement at the flat-/4-pool +
+// half-window geometry: 2 of 10 devices held NO lane, and the halved
+// admission window (32 MiB/queue) declined most of the ~51 MiB/device
+// the cold row offers — the copy-elimination thesis could not pay the
+// RSS rent. The read CPU-wall ruling (2026-08-06) inverted the
+// economics: reads are whole-box CPU-bound, so every RX byte moved to
+// zero-copy is direct capacity. These contracts pin the re-derived
+// geometry — every input probed or censused, no constants:
+//
+//   pool width  = clamp(devices_via_nic, channels/4, channels/2)
+//   admission   = the FULL fill window (depth × max_xfer) — the /2
+//                 retired; its implicit slack budget moves to the AREA
+//                 size, derived from MTU/chunk burst occupancy
+//   area        = fill_window + delivery_slack + ring_standing (rounds
+//                 6–7 arithmetic unchanged underneath)
+
+#[test]
+fn test_engagement_pool_scales_with_the_device_census() {
+    use squeezefs::zcrx_lane::steering::lane_eligible_queues;
+    // The field shape: 32 RX queues, 10 fabric devices behind the rail.
+    // The flat /4 pool (8) left 2 of 10 devices with NO lane — 20 % of
+    // row bytes structurally kernel-path forever. The census widens the
+    // pool to one queue per device.
+    assert_eq!(
+        lane_eligible_queues(32, 10),
+        22..32,
+        "field shape: every device can hold a lane"
+    );
+    // Floor: the standing §8 ¼ posture — a small census never NARROWS
+    // the pool below channels/4 (today's exact behavior).
+    assert_eq!(lane_eligible_queues(32, 2), 24..32);
+    assert_eq!(
+        lane_eligible_queues(32, 5),
+        24..32,
+        "the two-rail split (5 devices/rail) stays at the floor"
+    );
+    // Ceiling: the RSS set never falls below HALF the NIC — the kernel
+    // path (writes, metadata, admin, declined reads) keeps ≥ channels/2
+    // of the queue width no matter how many devices share the rail.
+    assert_eq!(lane_eligible_queues(32, 100), 16..32);
+    // A failed census (0) degrades to the floor — the sole-device
+    // posture, byte-identical to the pre-campaign pool.
+    assert_eq!(lane_eligible_queues(32, 0), 24..32);
+    // The too-narrow refusal is unchanged: channels/4 == 0 ⇒ empty pool
+    // (the arm refuses loud; a 2-queue NIC never dedicates ZC queues).
+    let pool = lane_eligible_queues(3, 10);
+    assert_eq!(
+        pool.end - pool.start,
+        0,
+        "sub-4-queue NICs never dedicate ZC queues (unchanged)"
+    );
+}
+
+#[test]
+fn test_engagement_all_field_devices_lease_a_queue() {
+    // Round 8: fair_queue_want(8, 10, 4) = 1 but the arbiter pool held
+    // only 8 — the 9th and 10th sessions were REFUSED and their devices
+    // stayed kernel-path for the mount lifetime. With the census-driven
+    // pool all ten sessions hold a distinct queue.
+    let devices = 10usize;
+    let eligible = {
+        let p = squeezefs::zcrx_lane::steering::lane_eligible_queues(32, devices);
+        p.end - p.start
+    };
+    assert_eq!(eligible, 10, "the pool covers the census");
+    let want = squeezefs::zcrx_lane::steering::fair_queue_want(eligible, devices, 4);
+    assert_eq!(want, 1, "clamp(10/10, 1, 4) = 1 — breadth beats depth");
+    let mut leases = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for i in 0..devices {
+        let l = rxq_alloc::acquire(0xE2E2, "engage-e2e", 32, devices, want)
+            .unwrap_or_else(|e| panic!("device {i} must lease a queue: {e}"));
+        assert_eq!(l.queues().len(), 1);
+        for q in l.queues() {
+            assert!((22..32).contains(q), "grants stay inside the pool");
+            assert!(seen.insert(*q), "distinct queues across sessions");
+        }
+        leases.push(l);
+    }
+    drop(leases);
+}
+
+#[test]
+fn test_engagement_admission_is_the_full_window_with_derived_slack() {
+    use squeezefs::zcrx_lane::area;
+    // The field geometry: depth 64 (32-CPU client), max_xfer 1 MiB
+    // (LANE_MAX_XFER_CAP_BYTES), 4 KiB chunks, MTU 9000.
+    let window = area::area_bytes_per_queue(64, 1 << 20);
+    assert_eq!(window, 64 << 20);
+    // Admission covers the FULL window (the /2 retired): the window and
+    // the CID namespace are now the SAME arithmetic (64 CIDs × 1 MiB
+    // max_xfer ≡ 64 MiB admitted payload).
+    assert_eq!(
+        area::admission_permits(window as usize, 4096),
+        (64 << 20) / 4096,
+        "the whole fill window admits payload"
+    );
+    // The slack the /2 implicitly budgeted is now DERIVED: an MTU-9000
+    // payload burst lands in ⌈9000/4096⌉ = 3 page-grain niovs (12288 B
+    // holding ~9000) — occupancy ~73 %, so the fills' chunk budget needs
+    // window × 3288/9000 extra bytes, PMD-rounded.
+    let slack = area::delivery_slack_bytes(window, Some(9000), 4096);
+    assert_eq!(slack, 24 << 20, "64 MiB × 3288/9000 → 24 MiB PMD-rounded");
+    // A chunk-exact MTU wastes nothing.
+    assert_eq!(area::delivery_slack_bytes(window, Some(8192), 4096), 0);
+    // 1500-MTU: every ≤ 1500-B payload burns a whole 4 KiB chunk —
+    // the honest (large) slack a small-MTU rail pays.
+    assert_eq!(
+        area::delivery_slack_bytes(window, Some(1500), 4096),
+        112 << 20,
+        "64 MiB × 2596/1500 → 112 MiB PMD-rounded"
+    );
+    // Unknown MTU degrades to occupancy ½ — the retired half-window
+    // posture, now explicit in the AREA instead of implicit in the
+    // admission semaphore.
+    assert_eq!(area::delivery_slack_bytes(window, None, 4096), window);
+}
+
+#[test]
+fn test_engagement_field_shape_admits_the_offered_row() {
+    use squeezefs::zcrx_lane::{area, probe};
+    // The round-8 verdict's arithmetic, inverted: the field row offers
+    // ~128 concurrent 4 MiB fills across 10 devices ≈ 51.2 MiB in
+    // flight per device. The per-queue admitted window must cover it —
+    // whole-read atomic admission then ADMITS the offered row instead
+    // of declining most of it (the 0.05 %-engagement term).
+    let (_queues, depth) = probe::lane_geometry(32); // the 32-CPU field client
+    let window = area::area_bytes_per_queue(depth, probe::LANE_MAX_XFER_CAP_BYTES);
+    let offered_per_device = 128u64 * (4 << 20) / 10;
+    assert!(
+        window >= offered_per_device,
+        "the admitted window ({window}) must cover the offered per-device \
+         in-flight ({offered_per_device})"
+    );
+    let permits = area::admission_permits(window as usize, 4096);
+    let whole_read_units = (4usize << 20).div_ceil(4096);
+    assert!(
+        permits / whole_read_units >= 12,
+        "≥ 12 concurrent whole 4 MiB reads admit per queue (halved window \
+         admitted 8 vs ~12.8 offered; got {})",
+        permits / whole_read_units
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_compose_dest_lease_shape_rides_the_fused_lane() {
+    // The dest-lease compose adjudication (campaign item 4): a leased
+    // window arrives at the funnel as a dest-carrying, 4 KiB-aligned,
+    // SUB-BLOCK ranged read — exactly the Z3 fused-gather shape. The
+    // lane serves it with ONE requester-side gather into the reply
+    // window and ZERO kernel RX passes; the area is never
+    // reply-reachable (NIC fills land in arrival order — no DMA can aim
+    // a specific read's C2HData at a specific ent window), so the single
+    // fused gather IS the compose's floor on this kernel. The lease's
+    // ledger half (`read_dest_lease_bytes` ⊆ `read_dest_dma_bytes`) is
+    // counted at the routing serve regardless of vehicle — closure
+    // unchanged (design §4.4).
+    let mock = MockTarget::start(MockCfg::default(), 8 << 20).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("blockfile");
+    std::fs::write(&path, vec![0xEEu8; 8 << 20]).unwrap();
+
+    let env = LaneEnv::area_sim(&mock, 2, 8);
+    let before_fills = zcrx_metric("fills");
+    let before_bytes = zcrx_metric("fill_bytes");
+    let before_gather = zcrx_metric("gather_bytes");
+    let before_dest_gather = zcrx_metric("dest_gather_bytes");
+    let before_fallbacks = zcrx_metric("fallbacks");
+
+    let dev = squeezefs::nvme_dev::NvmeBlockDev::new(path.to_str().unwrap());
+    let (dest_ptr, dest_bytes) = squeezefs::cache::pool::ALIGNED_BUF_POOL.alloc();
+    // The lease shape: 4 KiB-aligned NON-block offset, odd 4 KiB-multiple
+    // sub-block length (63 × 4 KiB — strictly inside one 4 MiB block,
+    // not a max_xfer multiple).
+    let (off, size) = (12288u64, 63 * 4096usize);
+    let got = dev
+        .read_block_with_dest(off, size, Some(dest_ptr as u64))
+        .await
+        .expect("lease-shaped dest read");
+    drop(env);
+
+    assert_eq!(
+        &got[..size],
+        &mock.device[off as usize..off as usize + size],
+        "the lane must serve the lease-shaped window (namespace bytes)"
+    );
+    // SAFETY: test-owned pooled buffer, op complete.
+    let landed = unsafe { std::slice::from_raw_parts(dest_ptr, size) };
+    assert_eq!(
+        landed,
+        &mock.device[off as usize..off as usize + size],
+        "the gather lands IN the leased destination (no intermediate)"
+    );
+    assert_eq!(zcrx_metric("fills") - before_fills, 1);
+    assert_eq!(zcrx_metric("fill_bytes") - before_bytes, size as u64);
+    assert_eq!(
+        zcrx_metric("gather_bytes") - before_gather,
+        size as u64,
+        "gather ≡ fill closes on the lease shape"
+    );
+    assert_eq!(
+        zcrx_metric("dest_gather_bytes") - before_dest_gather,
+        size as u64,
+        "the fused-serve gauge accounts the leased window byte-exactly"
+    );
+    assert_eq!(zcrx_metric("fallbacks"), before_fallbacks, "clean run");
+    drop(dest_bytes);
+}

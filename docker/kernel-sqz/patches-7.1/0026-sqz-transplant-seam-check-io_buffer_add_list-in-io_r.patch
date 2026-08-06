@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sqz kernel recipe <sqz-kernel@squeezefs>
+Date: Sat, 1 Aug 2026 22:26:42 -0400
+Subject: [PATCH 26/27] sqz transplant seam: check io_buffer_add_list() in
+ io_register_kmbuf_ring()
+
+6.19.14 stable made io_buffer_add_list() return int (xa_store error) and
+the pbuf register path checks it; the v4 series was written against the
+void-returning base and the kmbuf register path (patch 3) inherits the
+unchecked call. Extend the same stable-fix error handling to the kmbuf
+path: on failure free the internal ring struct, the buffers region, and
+the list (exact inverse of io_setup_kmbuf_ring; bl not yet visible in
+the xarray so no double-free is possible).
+---
+ io_uring/kbuf.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/io_uring/kbuf.c b/io_uring/kbuf.c
+index 0de0d16f1..f5e9f9a1d 100644
+--- a/io_uring/kbuf.c
++++ b/io_uring/kbuf.c
+@@ -988,7 +988,13 @@ int io_register_kmbuf_ring(struct io_ring_ctx *ctx, void __user *arg)
+ 
+ 	bl->flags |= IOBL_KERNEL_MANAGED;
+ 
+-	io_buffer_add_list(ctx, bl, reg.bgid);
++	ret = io_buffer_add_list(ctx, bl, reg.bgid);
++	if (ret) {
++		kfree(bl->buf_ring);
++		io_free_region(ctx->user, &bl->region);
++		kfree(bl);
++		return ret;
++	}
+ 
+ 	return 0;
+ }

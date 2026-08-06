@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Joanne Koong <joannelkoong@gmail.com>
+Date: Fri, 16 Jan 2026 15:30:34 -0800
+Subject: [PATCH 15/27] fuse: refactor io-uring header copying from ring
+
+Move header copying from ring logic into a new copy_header_from_ring()
+function. This consolidates error handling.
+
+Signed-off-by: Joanne Koong <joannelkoong@gmail.com>
+Reviewed-by: Bernd Schubert <bschubert@ddn.com>
+Reviewed-by: Baokun Li <libaokun@linux.alibaba.com>
+Reviewed-by: Jeff Layton <jlayton@kernel.org>
+
+[sqz 7.1.6 rebase] fuse_uring_commit() keeps 7.1's control flow (req->out.h.error assignment was dropped upstream); the copy_header_from_ring() swap is unchanged.
+---
+ fs/fuse/dev_uring.c | 25 +++++++++++++++++++------
+ 1 file changed, 19 insertions(+), 6 deletions(-)
+
+diff --git a/fs/fuse/dev_uring.c b/fs/fuse/dev_uring.c
+index 891938135..648addcb2 100644
+--- a/fs/fuse/dev_uring.c
++++ b/fs/fuse/dev_uring.c
+@@ -587,6 +587,18 @@ static __always_inline int copy_header_to_ring(void __user *ring,
+ 	return 0;
+ }
+ 
++static __always_inline int copy_header_from_ring(void *header,
++						 const void __user *ring,
++						 size_t header_size)
++{
++	if (copy_from_user(header, ring, header_size)) {
++		pr_info_ratelimited("Copying header from ring failed.\n");
++		return -EFAULT;
++	}
++
++	return 0;
++}
++
+ static int fuse_uring_copy_from_ring(struct fuse_ring *ring,
+ 				     struct fuse_req *req,
+ 				     struct fuse_ring_ent *ent)
+@@ -597,10 +609,10 @@ static int fuse_uring_copy_from_ring(struct fuse_ring *ring,
+ 	int err;
+ 	struct fuse_uring_ent_in_out ring_in_out;
+ 
+-	err = copy_from_user(&ring_in_out, &ent->headers->ring_ent_in_out,
+-			     sizeof(ring_in_out));
++	err = copy_header_from_ring(&ring_in_out, &ent->headers->ring_ent_in_out,
++				    sizeof(ring_in_out));
+ 	if (err)
+-		return -EFAULT;
++		return err;
+ 
+ 	err = import_ubuf(ITER_SOURCE, ent->payload, ring->max_payload_sz,
+ 			  &iter);
+@@ -805,10 +817,11 @@ static void fuse_uring_commit(struct fuse_ring_ent *ent, struct fuse_req *req,
+ {
+ 	struct fuse_ring *ring = ent->queue->ring;
+ 	struct fuse_conn *fc = ring->fc;
+-	ssize_t err = -EFAULT;
++	ssize_t err;
+ 
+-	if (copy_from_user(&req->out.h, &ent->headers->in_out,
+-			   sizeof(req->out.h)))
++	err = copy_header_from_ring(&req->out.h, &ent->headers->in_out,
++				    sizeof(req->out.h));
++	if (err)
+ 		goto out;
+ 
+ 	err = fuse_uring_out_header_has_err(&req->out.h, req, fc);

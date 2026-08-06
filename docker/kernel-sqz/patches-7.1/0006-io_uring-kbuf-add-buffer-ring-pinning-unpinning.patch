@@ -1,0 +1,149 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Joanne Koong <joannelkoong@gmail.com>
+Date: Fri, 16 Jan 2026 15:30:25 -0800
+Subject: [PATCH 06/27] io_uring/kbuf: add buffer ring pinning/unpinning
+
+Add kernel APIs to pin and unpin buffer rings, preventing userspace from
+unregistering a buffer ring while it is pinned by the kernel.
+
+This provides a mechanism for kernel subsystems to safely access buffer
+ring contents while ensuring the buffer ring remains valid. A pinned
+buffer ring cannot be unregistered until explicitly unpinned. On the
+userspace side, trying to unregister a pinned buffer will return -EBUSY.
+
+This is a preparatory change for upcoming fuse usage of kernel-managed
+buffer rings. It is necessary for fuse to pin the buffer ring because
+fuse may need to select a buffer in atomic contexts, which it can only
+do so by using the underlying buffer list pointer.
+
+Signed-off-by: Joanne Koong <joannelkoong@gmail.com>
+---
+ include/linux/io_uring/cmd.h | 17 +++++++++++++
+ io_uring/kbuf.c              | 48 ++++++++++++++++++++++++++++++++++++
+ io_uring/kbuf.h              |  5 ++++
+ 3 files changed, 70 insertions(+)
+
+diff --git a/include/linux/io_uring/cmd.h b/include/linux/io_uring/cmd.h
+index 331dcbefe..e8578f13e 100644
+--- a/include/linux/io_uring/cmd.h
++++ b/include/linux/io_uring/cmd.h
+@@ -91,6 +91,10 @@ struct io_br_sel io_uring_cmd_buffer_select(struct io_uring_cmd *ioucmd,
+ bool io_uring_mshot_cmd_post_cqe(struct io_uring_cmd *ioucmd,
+ 				 struct io_br_sel *sel, unsigned int issue_flags);
+ 
++int io_uring_buf_ring_pin(struct io_uring_cmd *cmd, unsigned buf_group,
++			  unsigned issue_flags, struct io_buffer_list **bl);
++int io_uring_buf_ring_unpin(struct io_uring_cmd *cmd, unsigned buf_group,
++			    unsigned issue_flags);
+ #else
+ static inline int
+ io_uring_cmd_import_fixed(u64 ubuf, unsigned long len, int rw,
+@@ -133,6 +137,19 @@ static inline bool io_uring_mshot_cmd_post_cqe(struct io_uring_cmd *ioucmd,
+ {
+ 	return true;
+ }
++static inline int io_uring_buf_ring_pin(struct io_uring_cmd *cmd,
++					unsigned buf_group,
++					unsigned issue_flags,
++					struct io_buffer_list **bl)
++{
++	return -EOPNOTSUPP;
++}
++static inline int io_uring_buf_ring_unpin(struct io_uring_cmd *cmd,
++					  unsigned buf_group,
++					  unsigned issue_flags)
++{
++	return -EOPNOTSUPP;
++}
+ #endif
+ 
+ static inline struct io_uring_cmd *io_uring_cmd_from_tw(struct io_tw_req tw_req)
+diff --git a/io_uring/kbuf.c b/io_uring/kbuf.c
+index a6cbd87d2..07a0bc043 100644
+--- a/io_uring/kbuf.c
++++ b/io_uring/kbuf.c
+@@ -9,6 +9,7 @@
+ #include <linux/poll.h>
+ #include <linux/vmalloc.h>
+ #include <linux/io_uring.h>
++#include <linux/io_uring/cmd.h>
+ 
+ #include <uapi/linux/io_uring.h>
+ 
+@@ -251,6 +252,51 @@ struct io_br_sel io_buffer_select(struct io_kiocb *req, size_t *len,
+ 	return sel;
+ }
+ 
++int io_uring_buf_ring_pin(struct io_uring_cmd *cmd, unsigned buf_group,
++			  unsigned issue_flags, struct io_buffer_list **bl)
++{
++	struct io_ring_ctx *ctx = cmd_to_io_kiocb(cmd)->ctx;
++	struct io_buffer_list *buffer_list;
++	int ret = -EINVAL;
++
++	io_ring_submit_lock(ctx, issue_flags);
++
++	buffer_list = io_buffer_get_list(ctx, buf_group);
++	if (buffer_list && (buffer_list->flags & IOBL_BUF_RING)) {
++		if (unlikely(buffer_list->flags & IOBL_PINNED)) {
++			ret = -EALREADY;
++		} else {
++			buffer_list->flags |= IOBL_PINNED;
++			ret = 0;
++			*bl = buffer_list;
++		}
++	}
++
++	io_ring_submit_unlock(ctx, issue_flags);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(io_uring_buf_ring_pin);
++
++int io_uring_buf_ring_unpin(struct io_uring_cmd *cmd, unsigned buf_group,
++		       unsigned issue_flags)
++{
++	struct io_ring_ctx *ctx = cmd_to_io_kiocb(cmd)->ctx;
++	struct io_buffer_list *bl;
++	int ret = -EINVAL;
++
++	io_ring_submit_lock(ctx, issue_flags);
++
++	bl = io_buffer_get_list(ctx, buf_group);
++	if (bl && (bl->flags & IOBL_BUF_RING) && (bl->flags & IOBL_PINNED)) {
++		bl->flags &= ~IOBL_PINNED;
++		ret = 0;
++	}
++
++	io_ring_submit_unlock(ctx, issue_flags);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(io_uring_buf_ring_unpin);
++
+ /* cap it at a reasonable 256, will be one page even for 4K */
+ #define PEEK_MAX_IMPORT		256
+ 
+@@ -769,6 +815,8 @@ int io_unregister_buf_ring(struct io_ring_ctx *ctx, void __user *arg)
+ 		return -ENOENT;
+ 	if (!(bl->flags & IOBL_BUF_RING))
+ 		return -EINVAL;
++	if (bl->flags & IOBL_PINNED)
++		return -EBUSY;
+ 
+ 	scoped_guard(mutex, &ctx->mmap_lock)
+ 		xa_erase(&ctx->io_bl_xa, bl->bgid);
+diff --git a/io_uring/kbuf.h b/io_uring/kbuf.h
+index 0d0143395..22d15f0c2 100644
+--- a/io_uring/kbuf.h
++++ b/io_uring/kbuf.h
+@@ -12,6 +12,11 @@ enum {
+ 	IOBL_INC		= 2,
+ 	/* buffers are kernel managed */
+ 	IOBL_KERNEL_MANAGED	= 4,
++	/*
++	 * buffer ring is pinned and cannot be unregistered by userspace until
++	 * it has been unpinned
++	 */
++	IOBL_PINNED		= 8,
+ };
+ 
+ struct io_buffer_list {

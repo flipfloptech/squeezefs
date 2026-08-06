@@ -208,8 +208,8 @@ pub static KNOBS: &[Knob] = &[
     k("SQUEEZEFS_IPC_MAX_OP_BYTES", int(1, BYTES_MAX), "layout default", "Per-op payload ceiling, bytes."),
     k("SQUEEZEFS_IPC_MEM_MAX", int(1, 1 << 30), "derived", "Session-arena admission cap, MiB (absolute > pct > derived)."),
     k("SQUEEZEFS_IPC_MEM_PCT", int(1, 100), "derived", "Session-arena admission cap as a percentage of the R5 budget."),
-    k("SQUEEZEFS_IPC_SERVICE_THREADS", int(1, 1 << 12), "derived clamp(cpus/4,2,16)", "Service-thread ceiling (threads spawn on session admission)."),
-    k("SQUEEZEFS_IPC_DD_SHARDS", int(1, 1 << 12), "derived clamp(cpus/4,2,16)", "Direct-drive uring shards (one ring + pinned reaper per shard, one lane per service thread; override/measurement lever)."),
+    k("SQUEEZEFS_IPC_SERVICE_THREADS", int(1, 1 << 12), "derived clamp(3*cpus/8,2,64)", "Service-thread ceiling (threads spawn on session admission; the drain-lane pair's submitter half — same derivation as DD_SHARDS)."),
+    k("SQUEEZEFS_IPC_DD_SHARDS", int(1, 1 << 12), "derived clamp(3*cpus/8,2,64)", "Direct-drive uring shards (one ring + pinned reaper per shard, one lane per service thread; override/measurement lever)."),
     k("SQUEEZEFS_IPC_SOCKET_DIR", Kind::Str, "derived (XDG_RUNTIME_DIR / /run)", "Rendezvous socket directory; `none` disables the filesystem-path socket."),
     k("SQUEEZEFS_IPC_SPIN_US", int(0, 1 << 20), "0", "Service-thread empty-pass spin window, µs — an explicit fleet lever (nonzero taxes the sync lane)."),
     // -- L4 interception: client (shim) side -----------------------------

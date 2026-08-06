@@ -5035,11 +5035,13 @@ pub struct Metrics {
     pub ipc_direct_reap_stalls: Align64<AtomicU64>,
     /// Gauge: LIVE direct-drive shard reapers (D12 randread-shim
     /// residual, 2026-08-05 — rings + reapers shard by the derived
-    /// drain-parallelism width, `ipc_direct::dd_shards_from` ==
-    /// `il_sessions_default`; one lane per service thread, reapers
-    /// spawn on a lane's first governed submit). 0 on mounts that never
-    /// direct-drive; 1 forever under load = the single-reaper 208k-flat
-    /// field structure is back (lane routing rot).
+    /// drain-lane width, `ipc_direct::dd_shards_from` ==
+    /// `il_drain_lanes_default`, re-graded to 3×cpus/8 by the counted
+    /// 2026-08-06 field width sweep; one lane per service thread,
+    /// reapers spawn on a lane's first governed submit). 0 on mounts
+    /// that never direct-drive; 1 forever under load = the
+    /// single-reaper 208k-flat field structure is back (lane routing
+    /// rot).
     pub ipc_direct_shards: Align64<AtomicU64>,
     pub ipc_direct_ineligible_shape: Align64<AtomicU64>,
     /// `meta` = no RAM-resident metadata / non-striped layout / block map

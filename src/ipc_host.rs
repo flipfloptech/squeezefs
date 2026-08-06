@@ -201,31 +201,41 @@ mod spin_window_tests {
 
 /// IPC service-thread CEILING (§5.5.1; knob
 /// `SQUEEZEFS_IPC_SERVICE_THREADS`, clamp 1..=64). Default = the shared
-/// ingest-economy derivation [`squeezefs_ipc::sizing::il_sessions_default`]
-/// — the SAME function the shim's per-mount session default rides, so
-/// the pair cannot drift (the 2026-07-28 field conviction: 4 shim
-/// sessions vs 8 daemon threads left half the drain capacity idle at
-/// 7.5 GB/s of a 16.6 GB/s ceiling). Threads spawn ON SESSION ADMISSION
-/// up to this ceiling ([`IpcHost::ensure_service_threads`]) — a
-/// session-less host owns zero service threads.
+/// drain-LANE derivation [`squeezefs_ipc::sizing::il_drain_lanes_default`]
+/// (`clamp(3×cpus/8, 2, 64)` — the counted 2026-08-06 field width sweep,
+/// `.benchmarks/2026-08-06-dd-width-slope.md`) — the SAME function the
+/// direct-drive shard width rides, so the lane pair cannot drift (the
+/// lane routing makes a split dark shards or shared reapers — the
+/// ingest-economy DEFAULTS-MISMATCH class), and it DOMINATES the shim's
+/// per-mount session default at every machine size, so the 2026-07-28
+/// field conviction's topology (4 shim sessions vs 8 daemon threads left
+/// half the drain capacity idle at 7.5 GB/s of a 16.6 GB/s ceiling)
+/// stays unrepresentable: every default session owns a drain thread, and
+/// spawn-on-bind means a wider ceiling never parks a spare. Threads
+/// spawn ON SESSION ADMISSION up to this ceiling
+/// ([`IpcHost::ensure_service_threads`]) — a session-less host owns zero
+/// service threads.
 fn service_thread_count() -> usize {
     service_thread_ceiling_from(
         std::env::var("SQUEEZEFS_IPC_SERVICE_THREADS")
             .ok()
             .as_deref(),
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(8),
+        // PROCESS parallelism, never `available_parallelism()` — the
+        // Hang-1 pinned-first-toucher sizing law, and the runtime half
+        // of the lane-pair equality: `ipc_direct::dd_shards` sizes from
+        // the same mask, so ceiling == shard width on every box.
+        crate::cpu::process_parallelism(),
     )
 }
 
-/// Pure sizing form (unit-pinned by `tests/ingest_economy_tests.rs`;
-/// the paired shim-side pin is `session_sizing_tests` in
-/// `squeezefs-preload`).
+/// Pure sizing form (unit-pinned by `tests/ingest_economy_tests.rs` —
+/// lane-pair equality with `ipc_direct::dd_shards_from` + dominance over
+/// the shim's session default, whose own pin is `session_sizing_tests`
+/// in `squeezefs-preload`).
 pub fn service_thread_ceiling_from(env: Option<&str>, cpus: usize) -> usize {
     env.and_then(|v| v.trim().parse::<usize>().ok())
         .map(|n| n.clamp(1, 64))
-        .unwrap_or_else(|| squeezefs_ipc::sizing::il_sessions_default(cpus))
+        .unwrap_or_else(|| squeezefs_ipc::sizing::il_drain_lanes_default(cpus))
 }
 
 /// VAL-5d: the concurrent ctl-thread (= live connection) bound, DERIVED

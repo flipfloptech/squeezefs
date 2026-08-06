@@ -81,12 +81,13 @@
 //!
 //! ## Sharding (D12 randread-shim residual, 2026-08-05)
 //!
-//! Rings + reapers shard by the DERIVED drain-parallelism width
-//! ([`dd_shards_from`] == `il_sessions_default`, the SAME `cpus/4`
-//! slope that ceilings the service threads feeding this engine), one
-//! lane per service thread (`set_service_lane` from the host's
-//! `service_loop`; the owner→node partition pins each shard's reaper
-//! alongside its submitter). The pre-shard single-shared-ring +
+//! Rings + reapers shard by the DERIVED drain-lane width
+//! ([`dd_shards_from`] == `il_drain_lanes_default`, the SAME
+//! `clamp(3×cpus/8, 2, 64)` slope that ceilings the service threads
+//! feeding this engine — re-graded from cpus/4 by the counted 2026-08-06
+//! field width sweep), one lane per service thread (`set_service_lane`
+//! from the host's `service_loop`; the owner→node partition pins each
+//! shard's reaper alongside its submitter). The pre-shard single-shared-ring +
 //! single-unpinned-reaper shape serialized every CQE-side serve on ONE
 //! thread — the field's 208k-IOPS-flat rand-4k il ceiling at 235 µs
 //! fabric RTT × 256 in-flight (fio libaio 32×qd8) while the kernel
@@ -121,17 +122,21 @@ const RING_ENTRIES: u32 = 512;
 
 /// Shard width: env lever wins verbatim (clamp 1..=64 — the
 /// `service_thread_ceiling_from` env-clamp parity), derived default =
-/// [`squeezefs_ipc::sizing::il_sessions_default`] — the ONE
-/// drain-parallelism slope (`clamp(cpus/4, 2, 16)`), the SAME function
-/// that ceilings the service threads feeding this engine, so lanes and
-/// service threads are 1:1 by construction (the ingest-economy
-/// paired-derivation law: two independent constants here would be the
-/// DEFAULTS-MISMATCH class again). Unit-pinned by
-/// `dd_shard_width_derivation_ties_to_il_sessions_default`.
+/// [`squeezefs_ipc::sizing::il_drain_lanes_default`] — the ONE drain-LANE
+/// slope (`clamp(3×cpus/8, 2, 64)`, the counted 2026-08-06 field width
+/// sweep: W12 695–700k vs W8 622–636k vs W24 616–626k on the 32-CPU
+/// squeeze-test shape, `.benchmarks/2026-08-06-dd-width-slope.md`), the
+/// SAME function that ceilings the service threads feeding this engine,
+/// so lanes and service threads are 1:1 by construction (the
+/// ingest-economy paired-derivation law: two independent constants here
+/// would be the DEFAULTS-MISMATCH class again — and a shard set wider
+/// than the ceiling is production-DARK, since governed submits only ever
+/// ride owner-indexed lanes). Unit-pinned by
+/// `dd_shard_width_derivation_ties_to_drain_lane_width`.
 pub fn dd_shards_from(env: Option<&str>, cpus: usize) -> usize {
     env.and_then(|v| v.trim().parse::<usize>().ok())
         .map(|n| n.clamp(1, 64))
-        .unwrap_or_else(|| squeezefs_ipc::sizing::il_sessions_default(cpus))
+        .unwrap_or_else(|| squeezefs_ipc::sizing::il_drain_lanes_default(cpus))
 }
 
 fn dd_shards() -> usize {

@@ -754,7 +754,9 @@ fn zcrx_lane_xfer_cap_is_the_transport_payload_face() {
 /// Ingress-queue-spread lever 2 (2026-08-05, hard-constant ruling): the
 /// drain-group width is DERIVED — `drain_group_width(node_possible_cpus)`
 /// = the house `cpus/4` drain-parallelism SLOPE (the
-/// `il_sessions_default` / `dd_shards_from` lineage) evaluated on the
+/// `il_sessions_default` lineage; the ipc drain-lane pair moved to its
+/// own class-measured 3×cpus/8 slope in the 2026-08-06 width re-grade,
+/// this transport width keeps its own bracket-validated cpus/4) on the
 /// NODE's possible-CPU span, floor 1 (physical minimum: a context owns at
 /// least one queue). NEVER a frozen bracket winner: the counted 2026-08-05
 /// bracket validated the slope at the 32-possible shape (32/4 = 8 — the

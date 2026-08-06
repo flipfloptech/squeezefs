@@ -672,10 +672,11 @@ pub fn drain_group_stats() -> (u64, u64) {
 }
 
 /// Queues per drain context, DERIVED from the node's possible-CPU span:
-/// the house `cpus/4` drain-parallelism SLOPE — the SAME slope that
-/// ceilings the ipc service threads (`il_sessions_default`) and shards
-/// the direct-drive rings (`dd_shards_from`); two independent numbers
-/// here would be the ingest-economy DEFAULTS-MISMATCH class again. Floor
+/// the house `cpus/4` drain-parallelism SLOPE (the `il_sessions_default`
+/// lineage; the ipc drain-LANE pair — service-thread ceiling + direct-
+/// drive shard width — moved to its own class-measured `3×cpus/8` slope
+/// in the 2026-08-06 width re-grade, while THIS width keeps the cpus/4
+/// slope its own counted bracket validated). Floor
 /// 1 = the physical minimum (a drain context owns at least one queue);
 /// the node-span ceiling is implicit (`n/4 ≤ n`) and the counted bracket
 /// showed whole-node must never be the default (−15 % on the

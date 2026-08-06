@@ -1310,6 +1310,13 @@ impl NvmeBlockDev {
     ///   ranged zero-copy legs. Engagement gauge: `zcrx_dest_gather_bytes`.
     /// * `dest_addr = None`: pooled fill (the Z2 shape — memory that must
     ///   outlive the serve for tiers/holds pays the pooled gather).
+    /// Contract seam (engagement round 2 — `tests/zcrx_lane_tests.rs`
+    /// bypass-accounting suite): the lane session this device's funnel
+    /// armed, if any. Read-only access; the OnceCell stays the owner.
+    pub fn lane_session_for_test(&self) -> Option<Arc<crate::zcrx_lane::LaneSession>> {
+        self.lane.get().and_then(|o| o.clone())
+    }
+
     async fn try_lane_read(
         &self,
         offset: u64,
@@ -1339,7 +1346,15 @@ impl NvmeBlockDev {
         if sess.refill_degraded() {
             // Round 5: a refill-starved queue must never hold reads
             // hostage — the lane declines while recovering; the kernel
-            // path serves (ineligibility class, uncounted).
+            // path serves. COUNTED since engagement round 2: the
+            // formerly-uncounted "ineligibility class" was the silent
+            // volume gate that held two field campaigns' rows at ~0
+            // engagement with no instrument naming it (round-1 tape:
+            // ~1.5 M lease reads unaccounted at fill = 0.6 GB while the
+            // park → failover → trickle cycle kept this latch set).
+            crate::fuse_client::METRICS
+                .zcrx_degraded_bypasses
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return None;
         }
         if !sess.range_eligible(offset, size) {

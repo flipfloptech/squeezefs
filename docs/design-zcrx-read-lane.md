@@ -78,6 +78,71 @@ constants):**
   should not fire; if it does, the row is INVALID by the engagement law
   and gets diagnosed, not presented).
 
+**Rev 4a amendments (engagement round 2 — the volume gates, 2026-08-06):**
+
+The Rev-4 geometry deployed and the field rows stayed ~0 engaged
+(`fill ≡ dest ≡ 0.6 GB` of a ~1500 GB row; waits 1045/2740, parks 5,
+failovers 10, fallbacks 401, poisoned 0). The audit's findings and the
+round-2 machinery:
+
+* **The volume-path audit (recorded)**: EVERY device read class reaches
+  the funnel — pooled cohort fills (`fetch_block_from_remote` →
+  `read_nvme_block` → `BackendRouter::read_block`, dest-less; R2
+  prefetch and read-lane fetches ride `get_cached_or_fetch_block` into
+  the same funnel) and lease/ranged windows
+  (`get_block_range_for_index` → `read_block_range`, dest-carrying)
+  both land in `read_block_with_dest_inner` → `try_lane_read`; nothing
+  bypasses. On a lease-armed row the ~1500 GB rode the ranged dest leg
+  and REACHED the funnel; the gate was the round-5 **degraded bypass**
+  (`refill_degraded()`), deliberately uncounted since round 5 — held
+  latched by the park → failover → trickle-progress cycle for most of
+  the row. **The bypass is now COUNTED** (`zcrx_degraded_bypasses`):
+  the three volume gates are mutually exclusive counters — bypasses
+  (the pool/degraded term), `zcrx_area_admission_waits` (the whole-read
+  window arm — the ONLY counting decline site; the CID gate parks,
+  never declines), `zcrx_fill_fallbacks` (per-op errors).
+* **The waits decomposition (recorded)**: waits are whole-read-window
+  declines whose permits were HELD BY PARKED FILLS (admission permits
+  ride pending fills for up to `park_fail_bound()` during an episode) —
+  offered ~13 concurrent 1 MiB windows/device against a 64-read window
+  cannot fill it by demand alone. The admission derivation is not the
+  refusing term; the pool underneath is.
+* **The no-harm ECONOMICS arm** (the round-8 law made trickle-proof):
+  round 8's zero-progress streak resets on ANY payload byte, so a pool
+  that trickles one fill per window never proves structural while
+  paying full RSS rent at ~0 engagement. The governor now keeps a
+  cumulative **starved-time ledger** (monotone — trickle cannot reset
+  it): starved time ≥ HALF the armed lifetime, evaluated at failover
+  windows past the round-8 horizon (`REFILL_STRUCTURAL_FAILOVERS ×
+  park_fail_bound()`), latches the SAME `starved_structural` →
+  funnel-teardown path. Derivations: the horizon is the existing
+  structural law's own time constant (this arm can never fire faster
+  than the transient allowance); ½ is the majority boundary (rent is
+  paid for the whole armed life, savings accrue only while serving).
+  Instruments: `zcrx_starved_ms` (the ledger, exported),
+  `zcrx_structural_teardowns` (escalations latched, either arm — the
+  "did no-harm fire?" adjudication is a number now).
+* **Round-8 non-firing, adjudicated**: at the field tape's shape the
+  zero-progress arm COULD NOT fire — 5 episodes / 10 windows means
+  trickle progress ended episodes between windows, resetting the
+  streak each time; the economics arm exists precisely for this gray
+  zone and would have fired within ~2 windows of majority-starved
+  life, returning the RSS width for the rest of the row.
+* **The ahead-governor feed, adjudicated (deferred — do not force)**:
+  the demand/lease stream alone carries ~100 % of cold row bytes on the
+  field shape, so ahead-depth is NOT required for share ≥ 0.5; and the
+  ahead governor measures DELIVERY response, so once the lane actually
+  serves volume its CPU savings show up in the governor's own signal —
+  the honest coupling already exists through measurement. Revisit only
+  if a fixed-lane field row shows demand-stream share < 0.5 with
+  ahead-depth 0.
+* **The pool term itself is field-owed**: whether the provider pool's
+  standing demand exceeds the round-6 model on this NIC (striding-RQ
+  vs legacy-RQ geometry) is only measurable live; `zcrx_starved_ms` vs
+  armed wall time now names it directly (starved-share ≈ 0 ⇒ the area
+  is sized; immediate majority-starvation ⇒ the ring-standing model is
+  the term — fix the PROBE, never a constant).
+
 **Rev 3 amendments (Z3 as built):**
 
 * **Gather fusion (the PERF-1 win)**: registered-destination funnel
@@ -581,6 +646,11 @@ kernel, 32 RX queues/rail, MTU 9000, 10 data namespaces):
   - `zcrx_area_admission_waits` bounded (declines are the SIZING
     instrument now: sustained growth at < 100 % engagement = the
     window is still under-derived — name the term, do not hand-tune),
+  - **`zcrx_degraded_bypasses` ≈ 0 on an engaged row** (Rev 4a — the
+    round-1 tape's silent gate: bypasses dominating fills = the pool
+    term, read beside `zcrx_starved_ms` share and
+    `zcrx_structural_teardowns`; a majority-starved session now tears
+    down by the economics arm instead of limping at full rent),
   - `parks`/`failovers` bounded episodes, six-consecutive pristine
     teardowns (0 rules, full RSS after every mount — the round-8 bar).
 * **The performance verdict**: CPU/byte (pidstat daemon cores/GB +

@@ -98,9 +98,14 @@ armed, poi = a.get("zcrx_lane_armed", 0), delta("zcrx_lane_poisoned")
 # Engagement-geometry instruments (Rev 4 §13): declines are the SIZING
 # instrument (sustained growth at < 100 % engagement = an under-derived
 # window — name the term); parks/failovers must stay bounded episodes.
+# Round 2: the three volume gates are mutually-exclusive counters —
+# bypasses (the pool/degraded term), waits (admission), fallbacks
+# (per-op errors) — and starved_ms/structural name the no-harm arms.
 waits = delta("zcrx_area_admission_waits")
 parks, fails = delta("zcrx_recv_parks"), delta("zcrx_recv_failovers")
 fbk, viol = delta("zcrx_fill_fallbacks"), delta("zcrx_frame_violations")
+byp = delta("zcrx_degraded_bypasses")
+starved_ms, structural = delta("zcrx_starved_ms"), delta("zcrx_structural_teardowns")
 eng = fill / user if user else 0.0
 closure = "exact" if fill == gath else f"TORN(fill={fill},gather={gath})"
 verdict = "n/a(off)" if lane == "off" else (
@@ -108,8 +113,9 @@ verdict = "n/a(off)" if lane == "off" else (
     f"INVALID(eng={eng:.3f},poisoned={poi},viol={viol})")
 print(f"  {p.split('/')[-1]}: {bw:.2f} GB/s {iops:,.0f} IOPS user={user/1e9:.1f}GB "
       f"fill={fill/1e9:.1f}GB gather={gath/1e9:.1f}GB dest={dest/1e9:.1f}GB "
-      f"share={eng:.3f} closure={closure} waits={waits} parks={parks} "
-      f"failovers={fails} fallbacks={fbk} armed={armed} {verdict}")
+      f"share={eng:.3f} closure={closure} waits={waits} bypasses={byp} "
+      f"parks={parks} failovers={fails} fallbacks={fbk} "
+      f"starved_ms={starved_ms} structural={structural} armed={armed} {verdict}")
 EOF
     done
 }

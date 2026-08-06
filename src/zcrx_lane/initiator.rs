@@ -890,6 +890,18 @@ impl LaneSession {
         })
     }
 
+    /// Contract seam (engagement round 2 — the bypass-accounting suite):
+    /// latch/unlatch the round-5 degraded flag on every area queue,
+    /// standing in for a live starvation episode (only the real ring
+    /// driver's governor produces one; the sim backend has no governor).
+    pub fn set_refill_degraded_for_test(&self, on: bool) {
+        for q in &self.queues {
+            if let QueueHandle::Area(q) = q {
+                q.shared.starved.store(on, Ordering::SeqCst);
+            }
+        }
+    }
+
     /// Round-8 no-harm escalation: any queue whose refill starvation
     /// proved STRUCTURAL (two consecutive failover windows without
     /// payload) — the funnel tears the whole session down so the RSS

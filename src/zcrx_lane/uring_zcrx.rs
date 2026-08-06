@@ -697,15 +697,25 @@ pub(crate) struct RecvGovernor {
     /// Consecutive failover windows without payload progress (finding
     /// J: 2 ⇒ structural — see [`REFILL_STRUCTURAL_FAILOVERS`]).
     failover_streak: u32,
+    /// The queue's arm instant — the economics arm's lifetime anchor
+    /// (engagement round 2).
+    born: std::time::Instant,
+    /// Cumulative starved time across ALL episodes — the economics
+    /// ledger (round 2): accounted at every failover window and at
+    /// every episode-ending progress, so trickle progress (which
+    /// resets `failover_streak`) can never reset it. Time is monotone.
+    starved_total: std::time::Duration,
 }
 
 impl RecvGovernor {
-    pub(crate) fn new() -> RecvGovernor {
+    pub(crate) fn new(born: std::time::Instant) -> RecvGovernor {
         RecvGovernor {
             armed: true,
             episode: None,
             probe_unlatched: false,
             failover_streak: 0,
+            born,
+            starved_total: std::time::Duration::ZERO,
         }
     }
 
@@ -722,13 +732,20 @@ impl RecvGovernor {
         false
     }
 
-    /// Payload flowed. `true` ⇔ an episode ENDED (clear the degraded
-    /// latch) — the ONLY verb that ends one (round 6: parks count
-    /// episodes, so nothing on the retry path may reset this).
-    pub(crate) fn on_progress(&mut self) -> bool {
+    /// Payload flowed. `Some(tail)` ⇔ an episode ENDED (clear the
+    /// degraded latch; publish `tail` to the starved-time gauge) — the
+    /// ONLY verb that ends one (round 6: parks count episodes, so
+    /// nothing on the retry path may reset this). The tail is the
+    /// episode time since the last accounting point (window start), so
+    /// window accounting + tails sum EXACTLY to episode time.
+    pub(crate) fn on_progress(&mut self, now: std::time::Instant) -> Option<std::time::Duration> {
         self.probe_unlatched = false;
         self.failover_streak = 0;
-        self.episode.take().is_some()
+        self.episode.take().map(|w| {
+            let tail = now.saturating_duration_since(w);
+            self.starved_total += tail;
+            tail
+        })
     }
 
     /// Loop-top: should the driver push a fresh RECV_ZC now? An unarmed
@@ -780,21 +797,51 @@ impl RecvGovernor {
         self.failover_streak >= REFILL_STRUCTURAL_FAILOVERS
     }
 
-    /// Has THIS failover window expired? `true` fires at most once per
-    /// `bound` (the window restarts) — the caller fails the queue's
-    /// pending fills over to the kernel path and latches degraded.
+    /// The no-harm law's ECONOMICS arm (engagement round 2): is this
+    /// queue starved for the MAJORITY of its armed life, past the
+    /// round-8 horizon? The round-1 field tape (parks=5, failovers=10,
+    /// 0.6 GB of a ~1500 GB row) cycled park → failover →
+    /// trickle-progress all row: every trickle byte reset the
+    /// zero-progress streak, so `structural()` never fired and the
+    /// lane held its RSS rent at ~0 engagement. This arm's ledger is
+    /// TIME — monotone, trickle-proof.
+    ///
+    /// Derivations (no fresh constants): the horizon is
+    /// `REFILL_STRUCTURAL_FAILOVERS × bound` — the round-8 structural
+    /// law's own time constant, so this arm can never fire FASTER than
+    /// the existing transient allowance; the ½ share is the majority
+    /// boundary — the rent (this queue's RSS exclusion) is paid for
+    /// the WHOLE armed life while savings accrue only while serving,
+    /// so a majority-starved queue's best case is half-rate savings
+    /// against full rent with the episode trend established.
+    pub(crate) fn economic_structural(
+        &self,
+        now: std::time::Instant,
+        bound: std::time::Duration,
+    ) -> bool {
+        let lifetime = now.saturating_duration_since(self.born);
+        lifetime >= bound * REFILL_STRUCTURAL_FAILOVERS && self.starved_total * 2 >= lifetime
+    }
+
+    /// Has THIS failover window expired? `Some(window)` fires at most
+    /// once per `bound` (the window restarts; `window` = the starved
+    /// duration just accounted — publish it to the starved-time gauge)
+    /// — the caller fails the queue's pending fills over to the kernel
+    /// path and latches degraded.
     pub(crate) fn failover_due(
         &mut self,
         now: std::time::Instant,
         bound: std::time::Duration,
-    ) -> bool {
+    ) -> Option<std::time::Duration> {
         match self.episode {
             Some(start) if now.duration_since(start) >= bound => {
+                let window = now.saturating_duration_since(start);
+                self.starved_total += window;
                 self.episode = Some(now);
                 self.failover_streak += 1;
-                true
+                Some(window)
             }
-            _ => false,
+            _ => None,
         }
     }
 }
@@ -978,7 +1025,9 @@ fn drive(
     // wake could never fire in the field shape — partial fills hold
     // every span and nothing releases — so the governor polls bounded
     // in EVERY parked state instead; the hook machinery is deleted).
-    let mut gov = RecvGovernor::new();
+    // Born HERE (the queue's armed life starts when the driver runs) —
+    // the round-2 economics arm's lifetime anchor.
+    let mut gov = RecvGovernor::new(std::time::Instant::now());
 
     let sock_fd = cfg.sock.as_raw_fd();
     let mut doorbell_buf = 0u64;
@@ -1074,7 +1123,10 @@ fn drive(
                          re-enter (episode stays open)"
                     );
                 }
-            } else if gov.failover_due(std::time::Instant::now(), park_fail_bound()) {
+            } else if let Some((now, window)) = {
+                let now = std::time::Instant::now();
+                gov.failover_due(now, park_fail_bound()).map(|w| (now, w))
+            } {
                 // Blast-radius bound (round 5): a parked queue must
                 // never hold reads hostage for the 30 s timeout — fail
                 // the pending fills over to the kernel path (fallback,
@@ -1085,8 +1137,17 @@ fn drive(
                 crate::fuse_client::METRICS
                     .zcrx_recv_failovers
                     .fetch_add(1, Ordering::Relaxed);
+                crate::fuse_client::METRICS
+                    .zcrx_starved_ms
+                    .fetch_add(window.as_millis() as u64, Ordering::Relaxed);
                 cfg.shared.starved.store(true, Ordering::SeqCst);
-                if gov.structural() && !cfg.shared.starved_structural.swap(true, Ordering::SeqCst) {
+                // Round 2: the economics arm evaluates beside the
+                // round-8 zero-progress arm — same latch, same funnel
+                // teardown; the log names WHICH arm fired.
+                let econ = gov.economic_structural(now, park_fail_bound());
+                if (gov.structural() || econ)
+                    && !cfg.shared.starved_structural.swap(true, Ordering::SeqCst)
+                {
                     // FINDING J (the no-harm law): the FIRST failover's
                     // releases ARE the recovery mechanism; a second
                     // consecutive window proves they cannot refill the
@@ -1097,12 +1158,28 @@ fn drive(
                     // FULL teardown: RSS restores, kernel path serves
                     // this device at full width for the rest of the
                     // mount (the lane stays opt-in; lazy re-arm is a
-                    // filed follow-on).
+                    // filed follow-on). Round 2 adds the ECONOMICS arm:
+                    // majority-starved armed life past the same horizon
+                    // — the trickle-cycling shape the zero-progress
+                    // streak cannot see (round-1 field: parks=5,
+                    // failovers=10, 0.6 GB of ~1500 GB, never fired).
+                    crate::fuse_client::METRICS
+                        .zcrx_structural_teardowns
+                        .fetch_add(1, Ordering::Relaxed);
                     log::error!(
-                        "zcrx-lane: refill starvation is STRUCTURAL \
-                         ({REFILL_STRUCTURAL_FAILOVERS} consecutive failover windows \
-                         without payload) — releasing the NIC (RSS width restores); \
-                         kernel path serves this device"
+                        "zcrx-lane: refill starvation is STRUCTURAL ({}) — releasing \
+                         the NIC (RSS width restores); kernel path serves this device",
+                        if gov.structural() {
+                            format!(
+                                "{REFILL_STRUCTURAL_FAILOVERS} consecutive failover \
+                                 windows without payload"
+                            )
+                        } else {
+                            "economics arm: starved for the majority of the armed \
+                             life past the structural horizon — trickle progress \
+                             cannot pay the RSS rent"
+                                .to_string()
+                        }
                     );
                 }
                 log::warn!(
@@ -1150,9 +1227,17 @@ fn drive(
                     if res > 0 {
                         // Payload flowed: any active starvation episode
                         // ends (cheap: one Option check).
-                        if gov.on_progress() && cfg.shared.starved.load(Ordering::SeqCst) {
-                            cfg.shared.starved.store(false, Ordering::SeqCst);
-                            log::info!("zcrx-lane: refill recovered — lane serves again");
+                        if let Some(tail) = gov.on_progress(std::time::Instant::now()) {
+                            // The episode's unaccounted tail joins the
+                            // starved-time ledger (round 2 — window
+                            // accounting + tails sum exactly).
+                            crate::fuse_client::METRICS
+                                .zcrx_starved_ms
+                                .fetch_add(tail.as_millis() as u64, Ordering::Relaxed);
+                            if cfg.shared.starved.load(Ordering::SeqCst) {
+                                cfg.shared.starved.store(false, Ordering::SeqCst);
+                                log::info!("zcrx-lane: refill recovered — lane serves again");
+                            }
                         }
                         let raw_off = big0;
                         if !cqe_area_matches(raw_off, refill.area_token) {
@@ -1356,8 +1441,8 @@ mod tests {
         // release hook can never fire), rq ring not full. The governor
         // must retry the re-arm anyway — progress is a bonus, never the
         // unlock condition.
-        let mut gov = RecvGovernor::new();
         let t0 = std::time::Instant::now();
+        let mut gov = RecvGovernor::new(t0);
         assert!(gov.on_park(t0), "first park starts the episode");
         for _ in 0..3 {
             assert!(
@@ -1375,15 +1460,16 @@ mod tests {
         // (retries + the failover clock); an IDLE starved queue blocks
         // in enter — data CQEs wake it, and a 200 µs spin with nothing
         // to retry for burns a core for the row.
-        let mut gov = RecvGovernor::new();
+        let t0 = std::time::Instant::now();
+        let mut gov = RecvGovernor::new(t0);
         assert!(!gov.poll_bounded(true), "healthy ⇒ block in enter");
-        gov.on_park(std::time::Instant::now());
+        gov.on_park(t0);
         assert!(gov.poll_bounded(true), "starved + pending fills ⇒ poll");
         assert!(
             !gov.poll_bounded(false),
             "starved + idle ⇒ block (nothing to retry for)"
         );
-        assert!(gov.on_progress(), "payload ends the episode");
+        assert!(gov.on_progress(t0).is_some(), "payload ends the episode");
         assert!(!gov.poll_bounded(true), "recovered ⇒ block in enter");
     }
 
@@ -1394,8 +1480,8 @@ mod tests {
         // recounted. The law: on_idle_drain unlatches the probe gate
         // WITHOUT ending the accounting episode; ONLY payload progress
         // ends one — parks count STARVATION EPISODES.
-        let mut gov = RecvGovernor::new();
         let t0 = std::time::Instant::now();
+        let mut gov = RecvGovernor::new(t0);
         assert!(gov.on_park(t0));
         assert!(gov.on_idle_drain(), "first idle drain unlatches the probe");
         assert!(!gov.on_idle_drain(), "idempotent within an episode");
@@ -1407,47 +1493,49 @@ mod tests {
             !gov.on_park(t0),
             "a retry re-park after the idle drain is the SAME episode — never recounted"
         );
-        assert!(gov.on_progress(), "payload ends the episode");
+        assert!(gov.on_progress(t0).is_some(), "payload ends the episode");
         assert!(!gov.episode_active());
     }
 
     #[test]
     fn recv_governor_counts_episodes_not_retries() {
-        let mut gov = RecvGovernor::new();
         let t0 = std::time::Instant::now();
+        let mut gov = RecvGovernor::new(t0);
         assert!(gov.on_park(t0));
         let _ = gov.rearm_due();
         assert!(!gov.on_park(t0), "retry re-park: same episode");
-        assert!(gov.on_progress());
-        assert!(!gov.on_progress(), "progress is idempotent");
+        assert!(gov.on_progress(t0).is_some());
+        assert!(gov.on_progress(t0).is_none(), "progress is idempotent");
         assert!(gov.on_park(t0), "a NEW starvation after recovery recounts");
     }
 
     #[test]
     fn recv_governor_failover_fires_once_per_bound_window() {
-        let mut gov = RecvGovernor::new();
         let t0 = std::time::Instant::now();
+        let mut gov = RecvGovernor::new(t0);
         let bound = std::time::Duration::from_millis(100);
         gov.on_park(t0);
         assert!(
-            !gov.failover_due(t0 + bound / 2, bound),
+            gov.failover_due(t0 + bound / 2, bound).is_none(),
             "inside the window: keep waiting"
         );
-        assert!(
+        assert_eq!(
             gov.failover_due(t0 + bound, bound),
-            "window expired: fail the pending fills over"
+            Some(bound),
+            "window expired: fail the pending fills over (duration accounted)"
         );
         assert!(
-            !gov.failover_due(t0 + bound + bound / 2, bound),
+            gov.failover_due(t0 + bound + bound / 2, bound).is_none(),
             "the window RESTARTS at failover — once per bound"
         );
-        assert!(
+        assert_eq!(
             gov.failover_due(t0 + bound * 2, bound),
+            Some(bound),
             "a still-starved queue fails over again a bound later"
         );
-        assert!(gov.on_progress());
+        assert!(gov.on_progress(t0 + bound * 2).is_some());
         assert!(
-            !gov.failover_due(t0 + bound * 10, bound),
+            gov.failover_due(t0 + bound * 10, bound).is_none(),
             "no episode ⇒ no failover"
         );
     }
@@ -1473,24 +1561,27 @@ mod tests {
         // — structural by definition, so the session must RELEASE the
         // NIC (RSS width restores) instead of holding rail width for a
         // lane that cannot serve.
-        let mut gov = RecvGovernor::new();
         let t0 = std::time::Instant::now();
+        let mut gov = RecvGovernor::new(t0);
         let bound = std::time::Duration::from_millis(100);
         gov.on_park(t0);
-        assert!(gov.failover_due(t0 + bound, bound));
+        assert!(gov.failover_due(t0 + bound, bound).is_some());
         assert!(!gov.structural(), "first failover: transient allowance");
-        assert!(gov.failover_due(t0 + bound * 2, bound));
+        assert!(gov.failover_due(t0 + bound * 2, bound).is_some());
         assert!(
             gov.structural(),
             "second consecutive failover: STRUCTURAL — escalate to teardown"
         );
 
-        let mut gov2 = RecvGovernor::new();
+        let mut gov2 = RecvGovernor::new(t0);
         gov2.on_park(t0);
-        assert!(gov2.failover_due(t0 + bound, bound));
-        assert!(gov2.on_progress(), "payload between windows");
+        assert!(gov2.failover_due(t0 + bound, bound).is_some());
+        assert!(
+            gov2.on_progress(t0 + bound).is_some(),
+            "payload between windows"
+        );
         gov2.on_park(t0 + bound * 3);
-        assert!(gov2.failover_due(t0 + bound * 4, bound));
+        assert!(gov2.failover_due(t0 + bound * 4, bound).is_some());
         assert!(
             !gov2.structural(),
             "progress between windows resets the streak"
@@ -1536,7 +1627,10 @@ mod tests {
         // Episode 2: park again immediately — the majority of this
         // queue's life is starved.
         gov.on_park(t0 + bound + eps * 2);
-        assert_eq!(gov.failover_due(t0 + bound * 2 + eps * 2, bound), Some(bound));
+        assert_eq!(
+            gov.failover_due(t0 + bound * 2 + eps * 2, bound),
+            Some(bound)
+        );
         assert!(
             !gov.structural(),
             "streak = 1 within this episode — the round-8 arm STILL \
@@ -1567,9 +1661,7 @@ mod tests {
         // whole life, so later heavy starvation still fires.
         for k in 0..12u32 {
             gov.on_park(t0 + bound * (12 + 2 * k));
-            assert!(gov
-                .failover_due(t0 + bound * (13 + 2 * k), bound)
-                .is_some());
+            assert!(gov.failover_due(t0 + bound * (13 + 2 * k), bound).is_some());
             let _ = gov.on_progress(t0 + bound * (13 + 2 * k));
         }
         // ~13 starved bounds of ~37 total: still minority — no fire.

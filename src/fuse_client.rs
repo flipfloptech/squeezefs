@@ -3657,6 +3657,29 @@ pub struct Metrics {
     /// blast-radius instrument (a sustained rate ≈ 1/bound means the
     /// provider pool is structurally dysfunctional on this NIC).
     pub zcrx_recv_failovers: Align64<AtomicU64>,
+    /// Engagement round 2 (2026-08-06) — the volume-gate instruments.
+    /// `zcrx_degraded_bypasses` = funnel reads that bypassed the lane
+    /// because a queue was in the round-5 degraded (starvation) state:
+    /// the formerly-UNCOUNTED "ineligibility class" that hid the
+    /// dominant volume gate across two field campaigns (round-1 tape:
+    /// ~1.5 M lease reads unaccounted at fill = 0.6 GB). A lane row
+    /// whose bypasses dominate its fills is losing its volume to the
+    /// pool term, not to admission (`zcrx_area_admission_waits`) or
+    /// per-op errors (`zcrx_fill_fallbacks`) — the three gates are now
+    /// mutually exclusive counters.
+    pub zcrx_degraded_bypasses: Align64<AtomicU64>,
+    /// `zcrx_starved_ms` = cumulative starvation-episode milliseconds
+    /// across all lane queues (window accounting + episode tails, exact)
+    /// — the economics arm's ledger exported: starved_ms vs
+    /// (armed sessions × row wall) is the live starved-share estimate.
+    pub zcrx_starved_ms: Align64<AtomicU64>,
+    /// `zcrx_structural_teardowns` = structural escalations latched
+    /// (either arm: the round-8 zero-progress streak or the round-2
+    /// economics arm — majority-starved armed life past the same
+    /// horizon). Each is one queue's session released back to the
+    /// kernel path (RSS width restored); the adjudication "did the
+    /// no-harm teardown fire?" is a number now, not log archaeology.
+    pub zcrx_structural_teardowns: Align64<AtomicU64>,
     /// PR Z3 (gather fusion): the subset of `zcrx_gather_bytes` whose ONE
     /// completion gather landed DIRECTLY in the funnel caller's registered
     /// destination (`dest_addr` reads — the routing raw full-block leg and
@@ -7200,6 +7223,9 @@ impl SqueezefsFilesystem {
                 "zcrx_lane_poisoned": METRICS.zcrx_lane_poisoned.load(Ordering::Relaxed),
                 "zcrx_recv_parks": METRICS.zcrx_recv_parks.load(Ordering::Relaxed),
                 "zcrx_recv_failovers": METRICS.zcrx_recv_failovers.load(Ordering::Relaxed),
+                "zcrx_degraded_bypasses": METRICS.zcrx_degraded_bypasses.load(Ordering::Relaxed),
+                "zcrx_starved_ms": METRICS.zcrx_starved_ms.load(Ordering::Relaxed),
+                "zcrx_structural_teardowns": METRICS.zcrx_structural_teardowns.load(Ordering::Relaxed),
                 "zcrx_dest_gather_bytes": METRICS.zcrx_dest_gather_bytes.load(Ordering::Relaxed),
                 "layout_inline_writes": METRICS.layout_inline_writes.load(Ordering::Relaxed),
                 "layout_staged_writes": METRICS.layout_staged_writes.load(Ordering::Relaxed),

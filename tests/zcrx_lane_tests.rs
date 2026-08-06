@@ -343,6 +343,9 @@ fn zcrx_metric(name: &str) -> u64 {
         "admission_waits" => m.zcrx_area_admission_waits.load(Ordering::Relaxed),
         "poisoned" => m.zcrx_lane_poisoned.load(Ordering::Relaxed),
         "dest_gather_bytes" => m.zcrx_dest_gather_bytes.load(Ordering::Relaxed),
+        "degraded_bypasses" => m.zcrx_degraded_bypasses.load(Ordering::Relaxed),
+        "starved_ms" => m.zcrx_starved_ms.load(Ordering::Relaxed),
+        "structural_teardowns" => m.zcrx_structural_teardowns.load(Ordering::Relaxed),
         _ => panic!("unknown metric {name}"),
     }
 }

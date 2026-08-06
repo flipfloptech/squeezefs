@@ -135,3 +135,20 @@ ACTUAL holding per row.
   transient the classes now bound), the round-1 engagement laws take
   over: share ≥ 0.5, `gather ≡ fill`, and the composed row against the
   35.5 bar.
+
+## PROGRAM PARKED (user ruling 2026-08-06, verbatim): "if we can reach the
+## numbers we want without zcrx I would rather do that since it seems much
+## more portable if we can" + "it also doesn't seem like it's giving us the
+## performance we expected on these servers anyway"
+
+Adjudication: the ruling matches the portable-by-default law — the lane
+requires kernel ≥ 6.15 zcrx, driver/provider cooperation, ntuple state and
+RSS manipulation, and after 12 field rounds on this exact rail it has
+served ~0.6 GB of ~1,600 GB rows while paying measurable RSS rent. The
+machinery REMAINS (opt-in `SQUEEZEFS_ZCRX_LANE=1`, safe-by-construction:
+no-harm economics arm + live-armed whole-NIC release + the park-class
+discriminator make any future engagement attempt a one-row diagnosis).
+The read-throughput program continues on the PORTABLE road: whole-block
+cohort dest-DMA (the dest-lease's (C) extension), the warm-serve zc
+follow-on (§8.1), and transport-ingress economy — no NIC or kernel
+dependencies beyond what the product already ships on.

@@ -60,9 +60,12 @@ All gcc-8.5-clean, no libnl/liburing — they compile on the field box.
   read-only-safe (valid args, if_idx=0 → ENODEV/EPERM ⇒ opcode
   present); `bind <ifidx> <rxq>` does a real queue bind (restarts the
   rx queue — flagged, not default).
-* `kmbuf_smoke.c` — `IORING_REGISTER_KMBUF_RING` (=37) with valid args:
-  success ⇒ the FUSE-zc io_uring surface is present (the sqz kernel);
-  EINVAL ⇒ absent (stock kernels).
+* `kmbuf_smoke.c` — the `IORING_REGISTER_KMBUF_RING` opcode LADDER
+  (37/38 = 6.19-sqz field track, then 38/39 = 7.1-sqz track; see the
+  7.1-track audit section): a rung reads PRESENT only on register 0 +
+  repeat-EEXIST + kmbuf-offset mmap; every rung refused ⇒ ABSENT
+  (stock kernels). `--signatures` prints the raw per-opcode errno
+  signature (the per-class measurement mode).
 * `capability_matrix.sh` — the before/after matrix runner (kernel id,
   HDS attr, HW-GRO, zcrx surface, kmbuf surface, fuse_uring kallsyms,
   storage modules).
@@ -106,15 +109,24 @@ the running CachyOS 7.1.6 config, zero warnings).
   38 → 39.** Upstream 7.1 allocated **37 = `IORING_REGISTER_BPF_FILTER`**
   (`CONFIG_IO_URING_BPF`, enabled in the CachyOS config), so keeping 37
   was impossible (duplicate case in `io_uring/register.c`; a userspace
-  probe of 37 would hit BPF-filter semantics, not EINVAL). **This breaks
-  numeric lockstep with the deployed 6.19.14-sqz field kernel and the
-  fuse3 fork's constants** (`crates/fuse3/src/raw/connection/kmbuf.rs`
-  pins `IORING_REGISTER_KMBUF_RING: u32 = 37`, and
-  `probes/kmbuf_smoke.c` probes 37): daemon/probe work on a 7.1.6-sqz
-  host needs a per-kernel opcode (NOT retrofitted here — flagged as the
-  open decision point). On a 7.1.6-sqz kernel, opcode 37 is BPF_FILTER:
-  the existing probe/daemon would read the surface as Absent (or worse,
-  ambiguous), never mis-arm.
+  probe of 37 would hit BPF-filter semantics, not EINVAL). This breaks
+  numeric lockstep with the deployed 6.19.14-sqz field kernel — **the
+  daemon-side follow-up is DONE**: the fuse3 fork and `kmbuf_smoke.c`
+  resolve the pair by a **probe LADDER** (never a kernel-version check —
+  the portable-by-default law): field track 37/38 first, then 38/39,
+  where a rung reads Present only on the full kmbuf signature —
+  register 0 **+** identical-repeat `EEXIST` **+** a successful mmap at
+  `IORING_OFF_KMBUF_RING | (bgid<<16)`. False Present is unreachable
+  (7.1's BPF_FILTER imports the arg's first u16 as `cmd_type` ≠ 1 for
+  any page-aligned `buf_size` ⇒ EINVAL before any state change; a
+  crossed kmbuf-UNREGISTER answers ENOENT at the bgid lookup; stock
+  dispatch EINVALs at `IORING_REGISTER_LAST`), the probe arg rides
+  zero-padded past any foreign reader's struct width, and each rung's
+  scratch ring is dropped before the verdict. Resolution logged at arm
+  (`kmbuf_ops=37/38 (6.19-sqz)` / `38/39 (7.1-sqz)` / `absent`);
+  decision table pinned in `crates/fuse3/src/raw/connection/kmbuf.rs`
+  tests; `kmbuf_smoke.c --signatures` is the per-class measurement
+  mode.
 * `IORING_OFF_KMBUF_RING 0x88000000` — free in 7.1.6 (PBUF 0x80000000,
   PARAM 0x20000000, ZCRX 0x30000000, mask 0xf8000000): **unchanged**.
 * `FUSE_URING_BUF_RING (1<<0)` / `FUSE_URING_ZERO_COPY (1<<1)` in the

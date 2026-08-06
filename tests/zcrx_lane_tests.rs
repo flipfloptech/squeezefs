@@ -2885,3 +2885,92 @@ async fn test_compose_dest_lease_shape_rides_the_fused_lane() {
     assert_eq!(zcrx_metric("fallbacks"), before_fallbacks, "clean run");
     drop(dest_bytes);
 }
+
+// ------------------------------ engagement round 2 (2026-08-06): the volume gates
+//
+// The round-1 geometry deployed and the field rows showed the lane SAFE
+// but ~0 engaged: `dest ≡ fill ≡ 0.6 GB` with waits=1045/2740,
+// parks=5, failovers=10, fallbacks=401 — and ~1.5 M lease-shaped dest
+// reads UNACCOUNTED. The volume-path audit found every read class DOES
+// reach the funnel (pooled cohort fills via fetch_block_from_remote →
+// read_nvme_block → BackendRouter::read_block; lease/ranged windows via
+// read_block_range — both land in read_block_with_dest_inner →
+// try_lane_read); the silent gate is the round-5 DEGRADED BYPASS
+// (`refill_degraded()` — deliberately uncounted "ineligibility class"),
+// which the park/failover/trickle-recovery cycle holds latched for most
+// of the row. Round 2's contracts: (a) the bypass is COUNTED — the
+// instrument that names the dominant volume gate in-field; (b) the
+// no-harm law gains its ECONOMICS arm (in-module governor tests): a
+// lane starved for the MAJORITY of its armed life is structural even
+// when trickle progress resets the round-8 zero-progress streak.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_degraded_bypass_is_counted_and_recovers() {
+    // The round-5 bypass law is unchanged (a starved queue must never
+    // hold reads hostage — the kernel path serves); what changes is
+    // ACCOUNTING: each bypassed read counts in `zcrx_degraded_bypasses`,
+    // so a field row can no longer lose its volume to an invisible
+    // gate (rounds Z3-8 and engagement-1 both diagnosed this blind).
+    let mock = MockTarget::start(MockCfg::default(), 4 << 20).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("blockfile");
+    std::fs::write(&path, vec![0xEEu8; 4 << 20]).unwrap();
+
+    let env = LaneEnv::area_sim(&mock, 1, 8);
+    let dev = squeezefs::nvme_dev::NvmeBlockDev::new(path.to_str().unwrap());
+
+    // Healthy first read arms the session and serves from the lane.
+    let got = dev.read_block(4096, 65536).await.expect("lane read");
+    assert_eq!(&got[..], &mock.device[4096..4096 + 65536]);
+    let sess = dev
+        .lane_session_for_test()
+        .expect("session armed by the first read");
+
+    let before_bypasses = zcrx_metric("degraded_bypasses");
+    let before_fills = zcrx_metric("fills");
+    let before_waits = zcrx_metric("admission_waits");
+    let before_fallbacks = zcrx_metric("fallbacks");
+
+    // Latch the round-5 degraded state (the driver-owned starved flag —
+    // the seam stands in for a live starvation episode).
+    sess.set_refill_degraded_for_test(true);
+    let got = dev.read_block(8192, 65536).await.expect("kernel-path read");
+    assert_eq!(
+        &got[..],
+        &[0xEEu8; 65536][..],
+        "a degraded lane BYPASSES — the kernel path serves file bytes"
+    );
+    assert_eq!(
+        zcrx_metric("degraded_bypasses") - before_bypasses,
+        1,
+        "the bypass is COUNTED — the volume gate is named, never silent"
+    );
+    assert_eq!(
+        zcrx_metric("fills"),
+        before_fills,
+        "a bypassed read is not a fill"
+    );
+    assert_eq!(
+        zcrx_metric("admission_waits"),
+        before_waits,
+        "bypass ≠ admission decline (the waits decomposition stays exact)"
+    );
+    assert_eq!(
+        zcrx_metric("fallbacks"),
+        before_fallbacks,
+        "bypass ≠ per-op lane error"
+    );
+
+    // Recovery: unlatch — the lane serves again, bypasses stay flat.
+    sess.set_refill_degraded_for_test(false);
+    let got = dev.read_block(12288, 65536).await.expect("lane read");
+    assert_eq!(&got[..], &mock.device[12288..12288 + 65536]);
+    assert_eq!(zcrx_metric("fills") - before_fills, 1, "lane serves again");
+    assert_eq!(
+        zcrx_metric("degraded_bypasses") - before_bypasses,
+        1,
+        "recovery stops the bypass count"
+    );
+    drop(env);
+    sess.teardown().await;
+}

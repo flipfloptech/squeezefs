@@ -1497,6 +1497,85 @@ mod tests {
         );
     }
 
+    // -- the no-harm ECONOMICS arm (engagement round 2, 2026-08-06) -----
+
+    #[test]
+    fn recv_governor_economics_arm_trickle_cannot_reset() {
+        // The engagement-round-1 field tape: parks=5, failovers=10,
+        // fill=0.6 GB of a ~1500 GB row — the pool cycled
+        // park → failover → trickle-progress → park for the WHOLE row,
+        // and every trickle byte reset the round-8 zero-progress streak
+        // (`on_progress` zeroes `failover_streak`), so `structural()`
+        // never fired and the lane held its RSS rent at ~0 engagement.
+        // The economics arm closes the gray zone with a ledger trickle
+        // cannot reset: cumulative STARVED TIME ≥ half the armed
+        // lifetime, evaluated past the round-8 horizon
+        // (REFILL_STRUCTURAL_FAILOVERS × bound) ⇒ structural.
+        let t0 = std::time::Instant::now();
+        let bound = std::time::Duration::from_millis(100);
+        let eps = std::time::Duration::from_millis(1);
+        let mut gov = RecvGovernor::new(t0);
+        // Episode 1: park at birth, one failover window, trickle blip.
+        gov.on_park(t0);
+        assert_eq!(
+            gov.failover_due(t0 + bound, bound),
+            Some(bound),
+            "the failover window accounts its starved duration"
+        );
+        assert!(
+            !gov.economic_structural(t0 + bound, bound),
+            "horizon floor: one window's lifetime can never fire the \
+             economics arm (the round-8 transient allowance holds)"
+        );
+        assert_eq!(
+            gov.on_progress(t0 + bound + eps),
+            Some(eps),
+            "progress accounts the episode tail"
+        );
+        assert!(!gov.structural(), "the trickle reset the streak (round 8)");
+        // Episode 2: park again immediately — the majority of this
+        // queue's life is starved.
+        gov.on_park(t0 + bound + eps * 2);
+        assert_eq!(gov.failover_due(t0 + bound * 2 + eps * 2, bound), Some(bound));
+        assert!(
+            !gov.structural(),
+            "streak = 1 within this episode — the round-8 arm STILL \
+             cannot see the cycling"
+        );
+        assert!(
+            gov.economic_structural(t0 + bound * 2 + eps * 2, bound),
+            "past the horizon with starved-share ≥ ½ the episode cycling \
+             IS structural — the rent cannot be paid at trickle engagement"
+        );
+    }
+
+    #[test]
+    fn recv_governor_economics_arm_majority_serving_never_fires() {
+        let t0 = std::time::Instant::now();
+        let bound = std::time::Duration::from_millis(100);
+        let mut gov = RecvGovernor::new(t0);
+        // Ten bounds of clean serving, then ONE starvation window.
+        gov.on_park(t0 + bound * 10);
+        assert_eq!(gov.failover_due(t0 + bound * 11, bound), Some(bound));
+        assert!(
+            !gov.economic_structural(t0 + bound * 11, bound),
+            "starved 1 of 11 bounds — a majority-serving lane never fires \
+             the economics arm"
+        );
+        assert!(gov.on_progress(t0 + bound * 11).is_some());
+        // The ledger is cumulative: a lane must EARN its keep across its
+        // whole life, so later heavy starvation still fires.
+        for k in 0..12u32 {
+            gov.on_park(t0 + bound * (12 + 2 * k));
+            assert!(gov
+                .failover_due(t0 + bound * (13 + 2 * k), bound)
+                .is_some());
+            let _ = gov.on_progress(t0 + bound * (13 + 2 * k));
+        }
+        // ~13 starved bounds of ~37 total: still minority — no fire.
+        assert!(!gov.economic_structural(t0 + bound * 37, bound));
+    }
+
     // -- the recv-end law (field finding E) -----------------------------
 
     #[test]

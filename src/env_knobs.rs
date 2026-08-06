@@ -170,7 +170,7 @@ pub static KNOBS: &[Knob] = &[
     k("SQUEEZEFS_READ_PREFETCH_SHARE_PCT", int(1, 100), "50", "R2 prefetch share of the read budget, percent."),
     k("SQUEEZEFS_READ_RANGED_THRESHOLD", int(0, BYTES_MAX), "262144", "R3 ranged-read threshold, bytes."),
     k("SQUEEZEFS_READ_LANE", Kind::Bool, "on", "R1b read-lane hold (the shipped default win); 0 = the A0 control."),
-    k("SQUEEZEFS_READ_LANE_DEPTH", int(0, 1 << 16), "0 (hold only)", "Opt-in read-ahead lane depth, blocks — both adaptive derivations were falsified by counted brackets."),
+    k("SQUEEZEFS_READ_LANE_DEPTH", int(0, 1 << 16), "derived (engage-governor)", "Read-ahead lane depth pin, blocks — unset = probe-governed (probe-adopt-retreat); 0 = ahead-issue off (the hold-only A/B control)."),
     k("SQUEEZEFS_DIRECT_DEVICE_TRUE", Kind::Bool, "off", "Strict device-true O_DIRECT (the amplification-measurement escape); default serves O_DIRECT like buffered."),
     // -- Copy economy ----------------------------------------------------
     k("SQUEEZEFS_NT_COPY", Kind::Bool, "on", "Non-temporal stores at the two DMA-destined copy sites; 0 = the A/B control."),

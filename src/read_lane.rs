@@ -43,18 +43,26 @@
 //!    binary, A-B-B-A vs the A0 lever): qd8 **+11 %** (25.98 vs 23.50
 //!    GB/s), qd32 **+12 %** (20.91 vs 18.60) with read_amp 1.404 →
 //!    1.147 — every serve/credit path measured engagement-exact.
-//! 2. **The ahead lane** (opt-in, `SQUEEZEFS_READ_LANE_DEPTH=N`): when
-//!    a lane is classified streaming and R2 declines with a zero
-//!    resident share, issue pinned-depth whole-block fetches —
+//! 2. **The ahead lane** (probe-governed since 2026-08-05;
+//!    `SQUEEZEFS_READ_LANE_DEPTH=N` pins, `0` = off): when a lane is
+//!    classified streaming and R2 declines — a resident share below
+//!    its AIMD start window, the whole sub-retention regime — issue
+//!    whole-block fetches at the ENGAGE-GOVERNOR's depth —
 //!    **ledger-invisible**: no ghost recording, no governor
 //!    arbitration, no hot/NVMe-tier publication, no admission-waste
 //!    accounting — the 2026-07-26 scan-resistance verdict STANDS.
 //!    Bounded by the reader-tied horizon, a per-file single issue
 //!    owner, the R5 budget cap ([`READ_LANE_BUDGET_DIVISOR`]) and
 //!    clamped to zero under Red (in-flight bytes converge by
-//!    completion — the `write_pipeline_inflight` pattern). Default 0:
-//!    the campaign's counted brackets falsified ahead speculation on
-//!    demand-concurrent venues (see [`read_lane_depth_blocks`]).
+//!    completion — the `write_pipeline_inflight` pattern). The depth
+//!    derives CLOSED-LOOP (probe-adopt-retreat, the write-side
+//!    [`crate::write_pipeline::ProbeCore`] reused verbatim —
+//!    the follow-on the 2026-08-01 note §8 named): probes launch only
+//!    on saturated epochs with R5 headroom, adopt only when measured
+//!    fill delivery responds, retreat + cool down on dead gain, and
+//!    bleed to zero on unsaturated epochs — so the falsified
+//!    demand-covered venues are a duty-cycle-bounded RETREAT arm
+//!    (see [`read_lane_depth_blocks`] / [`probe_governed_depth`]).
 //!
 //! ## Correctness posture (nothing new is proven here)
 //!
@@ -84,10 +92,12 @@
 //! * `SQUEEZEFS_READ_LANE=0` — the A0 attribution control: disables the
 //!   lane AND the hold (deposits, probes, credits, issue) — exact prior
 //!   behavior; the counters stay wired and read 0.
-//! * `SQUEEZEFS_READ_LANE_DEPTH=N` — measurement-only per-stream depth
-//!   pin (bracket lever, the `SQUEEZEFS_WRITE_PIPELINE_DEPTH_BLOCKS`
-//!   pattern); `0` = no lane issue (the hold stays armed). Red is
-//!   senior to the pin (the write-pipeline Red-clamp precedent).
+//! * `SQUEEZEFS_READ_LANE_DEPTH=N` — per-stream depth pin (bracket
+//!   lever, the `SQUEEZEFS_WRITE_PIPELINE_DEPTH_BLOCKS` pattern);
+//!   unset = the engage-governor derives the depth at runtime; `0` =
+//!   no lane issue (the hold stays armed — the hold-only A/B control).
+//!   Red is senior to the pin AND the governor (the write-pipeline
+//!   Red-clamp precedent).
 
 use bytes::Bytes;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -105,28 +115,54 @@ pub const READ_LANE_BUDGET_DIVISOR: u64 = 8;
 /// today's behavior verbatim — it already has a RAM tier).
 pub const READ_LANE_MIN_FILL_BYTES: usize = crate::routing::READ_SIZE_CLASS_BOUNDARY_BYTES;
 
-/// Per-stream lane AHEAD-issue depth, in blocks (pure — pinned by
-/// `tests/read_lane_tests.rs` depth tables). **Default 0 — ahead-issue
-/// is opt-in** (`SQUEEZEFS_READ_LANE_DEPTH=N`, verbatim): the campaign
-/// field brackets falsified BOTH adaptive derivations on the reset-v3
-/// venue — pure-BDP (the write campaign's self-fulfilling-equilibrium
-/// lesson, reproduced: floor-locked at 32+ streams) and the §5.5 AIMD
-/// window (engaged at depth 2/4/16 alike, the ahead-fetches
-/// systematically died FIFO-unconsumed before their reader and cost
-/// −19 % vs the hold alone: 21.0 vs 26.0 GB/s at qd8, read_amp 1.16
-/// vs 0.71 — every armed row worse than every hold-only row). On a
-/// venue where the client's own qd × streams already covers the
-/// fabric BDP, ahead speculation only competes with the demand
-/// cohort's perfect single-flight amortization. The pin remains for
-/// high-latency / low-qd fabrics pending the engage-governor
-/// follow-on (probe-adopt-retreat, the ProbeCore shape — named in the
-/// campaign note).
+/// The engage-governor's depth mapping (2026-08-05 read-throughput
+/// campaign — the probe-adopt-retreat follow-on the 2026-08-01 note §8
+/// named): the [`crate::write_pipeline::ProbeCore`] multiplier
+/// (Q6 fixed point, ×1.0 = [`crate::write_pipeline::PROBE_MUL_ONE`])
+/// maps to a per-stream ahead depth in blocks. ×1.0 — unprobed, fully
+/// decayed, or retreated — is depth 0 (the exact hold-only prior
+/// behavior); each +1/4 probe gain is one more block of pipeline, so
+/// the FIRST adopted probe is the minimal one-block-per-stream ahead
+/// window and adopted gains compound: 64→0, 80→1, 100→2, 125→3,
+/// 156→5, 195→8 … (pinned table, `tests/read_lane_tests.rs`).
 ///
-/// Red returns 0 — senior to the pin (the write-pipeline precedent).
-/// A budget cap that cannot hold one block per stream never
-/// speculates.
+/// Dimensionless-multiplier law (the write-side probe-up precedent
+/// verbatim): the governor never models the fabric — it PROBES.
+/// Depth rises only while measured fill delivery responds; the
+/// 2026-08-01 falsified venues (demand qd × streams already covering
+/// the fabric BDP) become the RETREAT arm, duty-cycle-bounded, instead
+/// of a constant 0 that leaves every under-offered shape (the field's
+/// 16-job row: 21 in-flight fills vs the raw row's 160) at the demand
+/// plateau.
+pub fn probe_governed_depth(mul_q6: u64) -> u32 {
+    (mul_q6.saturating_sub(crate::write_pipeline_core::PROBE_MUL_ONE) * 4
+        / crate::write_pipeline_core::PROBE_MUL_ONE)
+        .min(u64::from(u32::MAX)) as u32
+}
+
+/// Per-stream lane AHEAD-issue depth, in blocks (pure — pinned by
+/// `tests/read_lane_tests.rs` depth tables). **Default = the
+/// engage-governor's `governed_depth`** ([`probe_governed_depth`] over
+/// the live probe multiplier — 0 until a probe epoch has MEASURED that
+/// ahead depth buys delivery); an explicit `SQUEEZEFS_READ_LANE_DEPTH`
+/// pin wins verbatim (`0` = ahead-issue off — the hold-only
+/// measurement control). The 2026-08-01 campaign falsified both OPEN-
+/// LOOP derivations on the reset-v3 venue — pure-BDP (the write
+/// campaign's self-fulfilling-equilibrium lesson, reproduced:
+/// floor-locked at 32+ streams) and the §5.5 AIMD window (engaged at
+/// depth 2/4/16 alike, −19 % vs the hold alone: ahead-fetches died
+/// FIFO-unconsumed racing a demand cohort that already covered the
+/// fabric BDP) — which is exactly why the shipped derivation is
+/// CLOSED-LOOP: probe, adopt on measured response, retreat + cool down
+/// on dead gain (`.benchmarks/2026-08-01-read-lane.md` §8 item 2, the
+/// named follow-on).
+///
+/// Red returns 0 — senior to the pin AND the governor (the
+/// write-pipeline precedent). A budget cap that cannot hold one block
+/// per stream never speculates.
 pub fn read_lane_depth_blocks(
     override_depth: Option<u32>,
+    governed_depth: u32,
     block_size: u64,
     active_streams: u32,
     red: bool,
@@ -135,9 +171,10 @@ pub fn read_lane_depth_blocks(
     if red {
         return 0;
     }
-    let Some(depth) = override_depth else {
+    let depth = override_depth.unwrap_or(governed_depth);
+    if depth == 0 {
         return 0;
-    };
+    }
     let bs = block_size.max(1);
     let streams = u64::from(active_streams.max(1));
     let cap = (budget_cap_bytes / bs / streams).min(u64::from(u32::MAX)) as u32;
@@ -507,11 +544,27 @@ fn coarse_ms() -> u64 {
 }
 
 /// Per-mount read-lane authority: the arm/disarm lever, the depth pin,
-/// and the aggregate in-flight gauge (the R5 `read_lane_inflight`
-/// component source).
+/// the engage-governor probe layer, and the aggregate in-flight gauge
+/// (the R5 `read_lane_inflight` component source).
 pub struct ReadLaneGovernor {
     enabled: bool,
     depth_override: Option<u32>,
+    /// The engage-governor (2026-08-05): the write-side BBR-flavored
+    /// probe core REUSED verbatim (loom-modeled, weakening-verified).
+    /// Delivery = completed whole-block fill bytes (demand primaries +
+    /// lane fetches — total device fill throughput, so an ahead lane
+    /// that merely displaces demand fetches reads as dead gain and
+    /// retreats); saturation = the sat-mark snapshot pattern
+    /// (`probe_waits_snap` precedent); headroom = below the R5 cap and
+    /// not Red. [`probe_governed_depth`] maps the multiplier to the
+    /// default ahead depth.
+    probe: crate::write_pipeline_core::ProbeCore,
+    /// Saturation marks (issue-path observations: a classified stream
+    /// the lane declines at depth 0, a depth-bound issue loop, or a
+    /// reader that caught an in-flight fill) and the last-roll
+    /// snapshot — marks moved since the snapshot = a saturated epoch.
+    probe_sat_marks: AtomicU64,
+    probe_sat_snap: AtomicU64,
     inflight_bytes: AtomicU64,
     /// The live consume-behind hold budget (bytes), cached by the issue
     /// path (which knows streams × depth) for the deposit sites (which
@@ -539,6 +592,9 @@ impl ReadLaneGovernor {
         Self {
             enabled,
             depth_override,
+            probe: crate::write_pipeline_core::ProbeCore::new(),
+            probe_sat_marks: AtomicU64::new(0),
+            probe_sat_snap: AtomicU64::new(0),
             inflight_bytes: AtomicU64::new(0),
             hold_budget: AtomicU64::new(0),
             hold_budget_decay_ms: AtomicU64::new(0),
@@ -552,7 +608,7 @@ impl ReadLaneGovernor {
     }
 
     /// Live per-stream ahead depth (blocks) — [`read_lane_depth_blocks`]
-    /// over the pin.
+    /// over the pin and the engage-governor's probed depth.
     pub fn depth_blocks(
         &self,
         block_size: u64,
@@ -562,11 +618,66 @@ impl ReadLaneGovernor {
     ) -> u32 {
         read_lane_depth_blocks(
             self.depth_override,
+            self.governed_depth(),
             block_size,
             active_streams,
             red,
             budget_cap_bytes,
         )
+    }
+
+    /// The engage-governor's current depth contribution
+    /// ([`probe_governed_depth`] over the live probe multiplier).
+    pub fn governed_depth(&self) -> u32 {
+        probe_governed_depth(self.probe.mul_q6())
+    }
+
+    /// `true` under an explicit `SQUEEZEFS_READ_LANE_DEPTH` pin — the
+    /// probe layer goes dormant so the A/B lever stays verbatim (the
+    /// write-pipeline depth-override precedent).
+    pub fn depth_pinned(&self) -> bool {
+        self.depth_override.is_some()
+    }
+
+    /// Count completed whole-block fill bytes into the running probe
+    /// epoch (demand primaries + lane fetches — TOTAL fill delivery,
+    /// the response signal probes are adjudicated against).
+    pub fn probe_on_fill_bytes(&self, bytes: u64) {
+        self.probe.on_bytes(bytes);
+    }
+
+    /// One issue-path saturation observation (see the field doc): the
+    /// epoch that contains at least one mark is a saturated epoch.
+    pub fn note_probe_saturation(&self) {
+        self.probe_sat_marks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Roll the probe epoch from the issue path (production clock):
+    /// saturation from the sat-mark snapshot, headroom from the caller
+    /// (below the R5 cap and not Red).
+    pub fn probe_epoch_tick(&self, headroom: bool) {
+        let marks = self.probe_sat_marks.load(Ordering::Relaxed);
+        let saturated = marks != self.probe_sat_snap.load(Ordering::Relaxed);
+        if self.probe.roll(coarse_ms(), saturated, headroom) {
+            self.probe_sat_snap.store(marks, Ordering::Relaxed);
+        }
+    }
+
+    /// [`crate::write_pipeline::ProbeCore::roll`] with an explicit
+    /// clock and saturation verdict (tests — the write-side ProbeCore
+    /// suite's determinism contract).
+    pub fn probe_roll_at(&self, now_ms: u64, saturated: bool, headroom: bool) -> bool {
+        self.probe.roll(now_ms, saturated, headroom)
+    }
+
+    /// Probes launched (`read_lane_depth_probe_ups`).
+    pub fn probe_ups(&self) -> u64 {
+        self.probe.probe_ups()
+    }
+
+    /// Retreats/step-downs (`read_lane_depth_probe_backoffs`).
+    pub fn probe_backoffs(&self) -> u64 {
+        self.probe.probe_backoffs()
     }
 
     /// Cache the issue path's consume-window hold-budget derivation for

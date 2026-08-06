@@ -7133,6 +7133,8 @@ impl SqueezefsFilesystem {
                 "read_lane_hold_evicted_unconsumed": METRICS.read_lane_hold_evicted_unconsumed.load(Ordering::Relaxed),
                 "read_lane_wasted": METRICS.read_lane_wasted.load(Ordering::Relaxed),
                 "read_lane_depth_target": METRICS.read_lane_depth_target.load(Ordering::Relaxed),
+                "read_lane_depth_probe_ups": self.router.read_lane_probe_ups(),
+                "read_lane_depth_probe_backoffs": self.router.read_lane_probe_backoffs(),
                 "read_lane_hold_bytes": self.router.cache.read_lane_hold.bytes(),
                 "read_lane_inflight_bytes": self.router.read_lane_inflight_bytes(),
                 "read_copy_dest_bytes": METRICS.read_copy_dest_bytes.load(Ordering::Relaxed),

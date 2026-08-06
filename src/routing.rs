@@ -4445,6 +4445,14 @@ pub(crate) unsafe fn serve_copy_to_dest(
     }
 }
 
+/// R2's AIMD start window (blocks) — a fresh lane's plan depth, and the
+/// pipeline-routing boundary (2026-08-05 read-throughput campaign): a
+/// resident share BELOW this cannot express even R2's starting plan, so
+/// `pipeline_touch` routes the whole sub-start regime to the read lane
+/// (hold-landing) instead of hot-landing speculation that is
+/// structurally evicted-before-consume.
+pub(crate) const R2_WINDOW_START: u32 = 2;
+
 impl StreamLanes {
     // `pub` for the microbench program (2026-08-04): the classifier bench
     // constructs a bare lane set (production sites build them inside the
@@ -4456,7 +4464,7 @@ impl StreamLanes {
             last_seen_ms: std::sync::atomic::AtomicU64::new(0),
             classified: std::sync::atomic::AtomicBool::new(false),
             next_prefetch_block: std::sync::atomic::AtomicU32::new(0),
-            window: std::sync::atomic::AtomicU32::new(2),
+            window: std::sync::atomic::AtomicU32::new(R2_WINDOW_START),
             inflight: std::sync::atomic::AtomicU32::new(0),
             rl_inflight: std::sync::atomic::AtomicU32::new(0),
             unconsumed: std::sync::atomic::AtomicU32::new(0),
@@ -5912,6 +5920,26 @@ impl DataRouter {
         self.read_lane.inflight_bytes()
     }
 
+    /// The engage-governor's probe engagement (`read_lane_depth_probe_ups`
+    /// stats field — 0 on latency-sensitive/low-offered-load mounts by
+    /// design, the write-pipeline probe-up posture).
+    pub fn read_lane_probe_ups(&self) -> u64 {
+        self.read_lane.probe_ups()
+    }
+
+    /// Probe retreats/step-downs (`read_lane_depth_probe_backoffs`) —
+    /// the dead-gain arm engaging: demand-covered venues retreat here
+    /// instead of paying sustained ahead speculation.
+    pub fn read_lane_probe_backoffs(&self) -> u64 {
+        self.read_lane.probe_backoffs()
+    }
+
+    /// The read-lane governor (tests: the engage-governor's
+    /// deterministic probe-drive seam — `probe_roll_at`).
+    pub fn read_lane_governor(&self) -> &crate::read_lane::ReadLaneGovernor {
+        &self.read_lane
+    }
+
     pub async fn read_nvme_block(&self, block_key: &str) -> Result<bytes::Bytes> {
         // FIND-RW2-A (fixed in RW4): decorated `bk:off:len` mappings —
         // the promoted-staged form a striped block map can legitimately
@@ -6537,6 +6565,17 @@ impl DataRouter {
                     }));
                     guard.completed.set(true);
                     read_fill_phase_record(ReadFillPhase::FillTotal, fill_t0);
+                    // Engage-governor delivery signal (2026-08-05):
+                    // completed whole-block fill bytes — demand
+                    // primaries and lane fetches BOTH count (total
+                    // device fill throughput), so an ahead lane that
+                    // merely displaces demand fetches reads as dead
+                    // gain and retreats (the 2026-08-01 falsified
+                    // venue, now a duty-cycle-bounded probe arm).
+                    if self.read_lane.enabled() {
+                        self.read_lane
+                            .probe_on_fill_bytes(downloaded_bytes.len() as u64);
+                    }
                     // PERF-11: dispatch the deferred disk-tier publish with
                     // the single-flight guard aboard. The registry entry —
                     // and therefore the anti-churn ordering — outlives the
@@ -6826,21 +6865,45 @@ impl DataRouter {
         if plan_bound > hwm {
             METRICS.prefetch_window_hwm.store(plan_bound, Relaxed);
         }
-        if resident_share == 0 {
-            // R2 declines: the per-lane share of the hot budget cannot
-            // retain even ONE landed block, so hot-landing speculation
-            // is guaranteed evicted-before-consume (the §5.5 no-floor
-            // rationale). THE READ LANE (2026-08-01 campaign) engages
-            // exactly here — the field's 0.49×-of-raw plateau regime
+        // The R2-declines boundary. Lane armed (default): the WHOLE
+        // sub-start-window regime (2026-08-05 read-throughput campaign
+        // — share < the AIMD start): a share of 0 cannot retain even
+        // ONE landed block, and a share of 1 cannot express R2's
+        // starting plan — its hot-probation landings are clock-churned
+        // by the demand fills sharing the tier (field 16-job row: hot
+        // residency ≈ hot_budget / aggregate fill rate ≈ 9 ms, 575 of
+        // 823 issues evicted-unconsumed, every lane quiesced while
+        // foreground reads waited 5.4 ms on demand fills). Under the
+        // `SQUEEZEFS_READ_LANE=0` A0 control the boundary stays the
+        // pre-campaign `== 0` so R2's share-1 behavior is EXACT prior
+        // behavior (the lever's contract).
+        let r2_declines = if self.read_lane.enabled() {
+            resident_share < u64::from(R2_WINDOW_START)
+        } else {
+            resident_share == 0
+        };
+        if r2_declines {
+            // THE READ LANE (2026-08-01 campaign) engages here — the
+            // field's plateau regime
             // (`.benchmarks/2026-07-31-fio-gap-accounting.md` §6.2):
-            // pipelined whole-block fetches landing in the
-            // ledger-invisible hold instead of the hot tier, so the
-            // stream's next blocks are in flight while the current one
-            // serves. Depth derives at runtime (BDP); the governor's
-            // scan-resistance verdict stands untouched.
+            // whole-block fetches landing in the ledger-invisible,
+            // COVERAGE-RETIRED hold instead of the churning hot tier,
+            // so the stream's next blocks are in flight while the
+            // current one serves. Depth derives CLOSED-LOOP (the
+            // engage-governor probe — `src/read_lane.rs`); the
+            // admission governor's scan-resistance verdict stands
+            // untouched.
             self.read_lane_top_up(
-                file_path, meta, block_size, end_block, &lanes, lane_idx, generation, active,
+                file_path,
+                meta,
+                block_size,
+                end_block,
+                &lanes,
+                lane_idx,
+                generation,
+                active,
                 mem_level,
+                will_wait_inflight,
             );
             return;
         }
@@ -7302,14 +7365,17 @@ impl DataRouter {
     }
 
     /// The read-lane issue path (2026-08-01 campaign — the §5.5
-    /// zero-resident-share regime's pipeline): top the lane up to the
-    /// BDP-derived per-stream depth with whole-block fetches through
-    /// [`Self::lane_fetch_block`] — single-flight-deduped with the
-    /// foreground, landing in the ledger-invisible hold, never a tier.
-    /// Shares the R2 plan cursor (`next_prefetch_block`/`issued_base` —
-    /// rebase-past-the-reader semantics verbatim) and the
-    /// progress-clocked quiescence arm; carries its OWN in-flight
-    /// bound (`rl_inflight`) and the aggregate R5 cap.
+    /// sub-start-window regime's pipeline): top the lane up to the
+    /// engage-governor-derived per-stream depth with whole-block
+    /// fetches through [`Self::lane_fetch_block`] —
+    /// single-flight-deduped with the foreground, landing in the
+    /// ledger-invisible hold, never a tier. Shares the R2 plan cursor
+    /// (`next_prefetch_block`/`issued_base` — rebase-past-the-reader
+    /// semantics verbatim) and the progress-clocked quiescence arm;
+    /// carries its OWN in-flight bound (`rl_inflight`) and the
+    /// aggregate R5 cap. Also the probe governor's epoch driver:
+    /// saturation marks (depth 0 declines, depth-bound issue, readers
+    /// catching in-flight fills) and epoch rolls happen here.
     #[allow(clippy::too_many_arguments)]
     fn read_lane_top_up(
         &self,
@@ -7322,6 +7388,7 @@ impl DataRouter {
         generation: u64,
         active_streams: u64,
         mem_level: crate::mem_budget::Level,
+        will_wait_inflight: bool,
     ) {
         use std::sync::atomic::Ordering::Relaxed;
         // The R1b size boundary, mirrored: ≤ 256 KiB blocks keep
@@ -7349,18 +7416,34 @@ impl DataRouter {
         let budget_cap =
             crate::read_lane::effective_mem_budget() / crate::read_lane::READ_LANE_BUDGET_DIVISOR;
         let lane = &lanes.lanes[lane_idx];
-        // Ahead depth: the explicit pin only (default 0 — the campaign
-        // brackets falsified ahead speculation on demand-concurrent
-        // venues; see read_lane_depth_blocks). The hold keeps working
-        // regardless: demand deposits + cohort serves are the measured
-        // win.
+        // Ahead depth: the explicit pin verbatim, else the
+        // engage-governor's probed depth (2026-08-05 — the closed-loop
+        // derivation that replaced the falsified open-loop BDP/AIMD
+        // arithmetic AND the opt-in-forever 0; see
+        // read_lane_depth_blocks). The hold keeps working regardless:
+        // demand deposits + cohort serves are the measured win.
         let streams = active_streams.min(u64::from(u32::MAX)) as u32;
-        let depth = self.read_lane.depth_blocks(
-            block_size,
-            streams,
-            mem_level == crate::mem_budget::Level::Red,
-            budget_cap,
-        );
+        let red = mem_level == crate::mem_budget::Level::Red;
+        let depth = self
+            .read_lane
+            .depth_blocks(block_size, streams, red, budget_cap);
+        // Probe-epoch drive (the write-side on_upload_complete pattern;
+        // dormant under a pinned A/B override — the lever stays
+        // verbatim): saturation marks — a reader that caught an
+        // in-flight fill (the pipeline is too shallow at ANY depth,
+        // incl. 0: the engage-from-zero arm), plus the depth-bound
+        // issue exit below — then roll with this epoch's headroom
+        // observation (below the per-stream R5 cap share and not Red;
+        // a cap share of 0 never has headroom — the never-speculate
+        // posture).
+        if !self.read_lane.depth_pinned() {
+            if will_wait_inflight || depth == 0 {
+                self.read_lane.note_probe_saturation();
+            }
+            let cap_blocks = budget_cap / block_size.max(1) / u64::from(streams.max(1));
+            let headroom = !red && u64::from(depth) < cap_blocks;
+            self.read_lane.probe_epoch_tick(headroom);
+        }
         METRICS
             .read_lane_depth_target
             .store(u64::from(depth), Relaxed);
@@ -7407,6 +7490,14 @@ impl DataRouter {
                 block_size,
                 budget_cap,
             ) {
+                // Depth-bound exit = the pipeline rode at its target
+                // this epoch — the probe governor's saturation signal
+                // (the aggregate-R5-cap exit is deliberately NOT one:
+                // that is headroom exhaustion, which the tick's
+                // headroom=false observation already encodes).
+                if in_flight >= depth && !self.read_lane.depth_pinned() {
+                    self.read_lane.note_probe_saturation();
+                }
                 break;
             }
             let next = lane.next_prefetch_block.load(Relaxed);
@@ -7605,6 +7696,10 @@ impl DataRouter {
         METRICS
             .read_lane_fetch_bytes
             .fetch_add(downloaded.len() as u64, Ordering::Relaxed);
+        // Engage-governor delivery signal (see the demand-fill twin in
+        // get_cached_or_fetch_block_traced): lane fetches count into
+        // the same total-fill-delivery epoch the probe adjudicates on.
+        self.read_lane.probe_on_fill_bytes(downloaded.len() as u64);
         let _ = guard.tx.send(Some(FillResult {
             bytes: downloaded,
             serve_valid,

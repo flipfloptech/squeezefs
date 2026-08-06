@@ -502,3 +502,90 @@ fn read_bounce_pool_routing_and_home_recycle() {
         "big backing must recycle into its HOME pool"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Read-lane fan-out (2026-08-06 read-queue-wall campaign): ONE submitting
+// thread per device = ONE blk-mq software queue = ONE nvme-tcp connection
+// = ONE RX softirq core per device — the ~2.7 GB/s/core read-copy wall
+// the flat field D-ladder rode (~22 GB/s over 8 namespaces at ANY pinned
+// depth; local written-region discriminator: 1 submitter/dev qd16 = 11.5
+// GB/s, qd32 = 12.1 — depth through one queue buys ~nothing — while 4
+// submitters/dev at the SAME in-flight = 16.7, and 8 = 17.7). Writes
+// escape it (nvme-tcp TX is zero-copy spliced — 34 GB/s through the same
+// single workers), which is exactly why the read plane needs the fan-out
+// and the write plane keeps worker 0 (ordering/barrier reasoning
+// unchanged). The lane count DERIVES: cpus / data devices, floor 1,
+// self-bounded by cpus (never a constant); explicit
+// SQUEEZEFS_NVME_READ_LANES wins verbatim.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn read_lanes_derivation_table() {
+    use squeezefs::nvme_dev::read_lanes_for;
+    // The field shape: 32 CPUs / 8 data namespaces => 4 submitting
+    // threads (nvme-tcp queues) per device.
+    assert_eq!(read_lanes_for(32, 8), 4);
+    // The local devsub: 32 / 4 => 8.
+    assert_eq!(read_lanes_for(32, 4), 8);
+    // Self-bounding: one device may use every CPU (the raw row's shape);
+    // more devices than CPUs floors at 1 (never zero).
+    assert_eq!(read_lanes_for(32, 1), 32);
+    assert_eq!(read_lanes_for(4, 8), 1);
+    assert_eq!(read_lanes_for(0, 0), 1, "degenerate inputs floor at 1");
+}
+
+#[tokio::test]
+async fn read_lane_pool_serves_exact_bytes_and_leaves_writes_on_lane_zero() {
+    let _serial = serial().await;
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path().to_path_buf();
+    File::create(&path)
+        .unwrap()
+        .set_len(64 * 1024 * 1024)
+        .unwrap();
+
+    let dev = std::sync::Arc::new(NvmeBlockDev::new(path.to_str().unwrap()));
+    assert_eq!(
+        dev.read_lanes(),
+        1,
+        "default = the prior single-worker posture"
+    );
+
+    // Arm 4 read lanes (monotone: shrinking is refused silently).
+    dev.set_read_lanes(4);
+    assert_eq!(dev.read_lanes(), 4);
+    dev.set_read_lanes(2);
+    assert_eq!(dev.read_lanes(), 4, "lane count only grows");
+
+    // Writes (worker 0) then concurrent reads round-robined across the
+    // pool: byte-exact at every offset, every lane a full citizen of the
+    // exact-length contract.
+    for b in 0..8u64 {
+        let data = vec![b as u8 + 1; 1024 * 1024];
+        dev.write_block(b * 1024 * 1024, bytes::Bytes::from(data))
+            .await
+            .unwrap();
+    }
+    dev.flush().await.unwrap();
+    let mut tasks = Vec::new();
+    for round in 0..4u64 {
+        for b in 0..8u64 {
+            let d = dev.clone();
+            tasks.push(tokio::spawn(async move {
+                let got = d
+                    .read_block_with_dest(b * 1024 * 1024, 1024 * 1024, None)
+                    .await
+                    .unwrap();
+                assert_eq!(got.len(), 1024 * 1024, "exact-length contract");
+                assert!(
+                    got.iter().all(|&x| x == b as u8 + 1),
+                    "byte parity lane round {round} block {b}"
+                );
+            }));
+        }
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    drop(dev);
+}

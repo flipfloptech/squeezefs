@@ -548,6 +548,17 @@ warm il 1.017 M is already on record, G-L4-2). Both get RAW-CEILING pricing
 rows first — a target above the substrate's own ceiling is re-negotiated
 with the numbers, never chased.
 
+**Read-throughput bar (user ruling 2026-08-06, verbatim: "read throughput
+is 100% trying to get to the 85% mark of the raw ceiling. I feel that
+alleviates all the bottlenecks and makes us competitive."):** sustained
+seq-read ≥ **85 % of the SAME-DAY raw ceiling** (today: 0.85 × 41.8 ≈
+35.5 GB/s; the fraction, not the absolute, is the bar — matching the write
+path's ~85 % fraction). Campaign evidence trail: the 2026-08-06
+decomposition row (27.4 GB/s = 65 %) attributed the gap to fill-concurrency
+starvation (~21 in-flight fills vs the raw row's 160; `prefetch_issued =
+823` over 1.567 M ops — R2 disengaged on the 16-stream shape), NOT the
+copy ledger (dest 1.00×, all NT, hottest daemon thread 34 %).
+
 Performance board (exit criteria):
 1. **zcrx Z3 field rows** — Connect fix in, lane associates on real nvmet,
    engagement laws hold; acceptance = the D5 chain's CPU/byte drop on

@@ -2977,3 +2977,133 @@ async fn test_degraded_bypass_is_counted_and_recovers() {
     drop(env);
     sess.teardown().await;
 }
+
+// ------------------------- round 3 (2026-08-06): the pool term, adjudicated
+//
+// The round-2 discriminator fired outcome (2) exactly: A-sides
+// starved_ms = 9370 ≡ 10 × park_fail_bound (EVERY failover window
+// starved), structural = 5, fill stuck at 0.6 GB. Driver-source
+// adjudication (the sqz linux-6.19.14 tree): a zcrx-provider-backed
+// mlx5 queue runs STRIDING RQ (MPWQE) + SHAMPO HDS (en_main.c:826/
+// :1005–1007 — unreadable-MP queues get a SEPARATE header pool;
+// payload strides ride the provider pool), and its standing provider
+// demand is pages_per_wqe × wq_size (en_main.c:940–941) which
+// algebraically reduces to ethtool_rx_frames × linear_stride_sz
+// (params.c:415 log_rq_size = log_rq_mtu_frames − log_pkts_per_wqe;
+// :292–301 log_pkts_per_wqe = log_wqe_sz − order2(linear_stride) —
+// log_wqe_sz CANCELS), with linear_stride_sz =
+// roundup_pow_of_two(SKB_FRAG_SZ(headroom + hw_mtu)) (params.c:284,
+// :252–262; en.h:75/:79) and ethtool -g rx reporting FRAMES
+// (en_ethtool.c:372). Field rail: 8192 × 16384 = 128 MiB/queue vs the
+// round-6 legacy model's 96 MiB — the 184 MiB area left the fills a
+// 56 MiB budget against a 64 MiB admitted window: permanently starved,
+// which is the tape. The RQ mode is not portably probeable, so the
+// derivation takes max(legacy, striding) — the round-6 safe direction.
+
+#[test]
+fn test_pool_term_striding_rq_standing_demand() {
+    use squeezefs::zcrx_lane::area;
+    // The MPWQE per-frame stride model (the ethtool-frames unit):
+    // roundup_pow2(mtu + the ≤512 B kernel skb arithmetic — NET_SKB_PAD
+    // 64 + hard_mtu ≤ 22 + SKB_DATA_ALIGN(skb_shared_info) 320 + two
+    // SKB_DATA_ALIGN roundings ≤ 128, ceiled to 512: over-estimating
+    // only rounds UP at pow2 boundaries, the safe direction).
+    assert_eq!(area::mpwqe_stride_bytes(9000), 16384, "jumbo rail: 16 KiB strides");
+    assert_eq!(area::mpwqe_stride_bytes(1500), 2048, "1500-MTU: 2 KiB strides");
+    assert_eq!(area::mpwqe_stride_bytes(3584), 4096, "boundary: 3584+512 = pow2 exact");
+    assert_eq!(area::mpwqe_stride_bytes(3585), 8192, "past the boundary rounds up");
+
+    // The field rail: striding (8192 × 16 KiB = 128 MiB) DOMINATES the
+    // round-6 legacy model (8192 × 3 × 4 KiB = 96 MiB) — the 32 MiB
+    // shortfall that starved every window.
+    assert_eq!(
+        area::ring_standing_bytes(8192, Some(9000), 4096),
+        8192 * 16384,
+        "the REAL field standing term is the striding model's 128 MiB"
+    );
+    // Small-MTU rails: legacy governs (2 KiB strides < 1-chunk frames)
+    // — max() keeps the round-6 model as the floor.
+    assert_eq!(
+        area::ring_standing_bytes(8192, Some(1500), 4096),
+        8192 * 4096,
+        "1500-MTU: the legacy chunk model still governs via max()"
+    );
+    // Unknown MTU and no-probe degrade exactly as round 6 shipped.
+    assert_eq!(area::ring_standing_bytes(1024, None, 4096), 1024 * 4096);
+    assert_eq!(area::ring_standing_bytes(0, Some(9000), 4096), 0);
+}
+
+#[test]
+fn test_nic_census_majority_law() {
+    use squeezefs::zcrx_lane::nic_census;
+    // The whole-NIC economics face (round-3 rent adjudication): the
+    // pool term is per-NIC physics — when HALF the sessions ever armed
+    // on a NIC prove it structural, the remainder share it and holding
+    // their RSS exclusion is pure rent (round-2 field: 5 of 10 tore
+    // down, the other 5 held ~16 % of the queue width at ~0 engagement
+    // for the rest of the row — the residual 5–8 %). Same ½ majority
+    // derivation as the per-session arm.
+    let ifx = 0xC3A0;
+    for _ in 0..10 {
+        nic_census::note_armed(ifx);
+    }
+    for k in 0..4 {
+        assert!(
+            !nic_census::note_structural(ifx),
+            "structural {k} of 10: minority — sessions stand"
+        );
+    }
+    assert!(
+        nic_census::note_structural(ifx),
+        "the 5th structural of 10 is the majority — release the NIC"
+    );
+    // Independent NICs never couple.
+    nic_census::note_armed(0xC3A1);
+    assert!(
+        nic_census::note_structural(0xC3A1),
+        "a sole-session NIC: its own structural IS the majority"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_majority_structural_releases_the_whole_nic() {
+    // The action half: when a structurally-torn session's census says
+    // majority, its teardown SWEEPS the NIC's remaining live sessions
+    // (their RSS width restores with them) instead of leaving them to
+    // limp at full rent.
+    let ifx = 0xC3B0;
+    let mock_a = MockTarget::start(MockCfg::default(), 1 << 20).await;
+    let env = LaneEnv::area_sim(&mock_a, 1, 4);
+    let sess_a = LaneSession::connect_with(
+        squeezefs::zcrx_lane::lane_target_override().expect("target env"),
+        LaneBackend::AreaSim,
+    )
+    .await
+    .expect("session A");
+    drop(env);
+    let mock_b = MockTarget::start(MockCfg::default(), 1 << 20).await;
+    let env = LaneEnv::area_sim(&mock_b, 1, 4);
+    let sess_b = LaneSession::connect_with(
+        squeezefs::zcrx_lane::lane_target_override().expect("target env"),
+        LaneBackend::AreaSim,
+    )
+    .await
+    .expect("session B");
+    drop(env);
+
+    sess_a.set_nic_for_test(ifx);
+    sess_b.set_nic_for_test(ifx);
+    squeezefs::zcrx_lane::nic_census::note_armed(ifx);
+    squeezefs::zcrx_lane::nic_census::note_armed(ifx);
+
+    // A proves the pool term structural; its teardown must sweep B
+    // (1 structural of 2 armed = the majority).
+    sess_a.set_refill_structural_for_test();
+    sess_a.teardown().await;
+    assert!(sess_a.torn_down());
+    assert!(
+        sess_b.torn_down(),
+        "the majority sweep releases the NIC's remaining sessions \
+         (their RSS exclusion restores mid-row, not at umount)"
+    );
+}

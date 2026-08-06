@@ -1631,6 +1631,32 @@ impl BackendRouter {
     /// barrier, so a caller that awaited its DMAs may then commit
     /// metadata naming those blocks. Per-device flushes coalesce with
     /// concurrent callers inside each `NvmeBlockDev`.
+    /// Read-queue-wall campaign (2026-08-06): arm the per-device READ
+    /// submission fan-out — [`crate::nvme_dev::read_lanes_for`]`(cpus,
+    /// devices)` lanes per distinct data device (explicit
+    /// `SQUEEZEFS_NVME_READ_LANES` wins verbatim; `1` = the prior
+    /// single-worker posture, the A/B lever). Called at mount after
+    /// every backend is registered and re-run by the online `volume
+    /// add-data` verb (the device count changed — lane counts only ever
+    /// grow, so a re-arm never shrinks a live pool). Offline
+    /// tools/tests that never call this keep exactly one worker per
+    /// device.
+    pub fn arm_read_lanes(&self) {
+        let devices = self.distinct_data_devices();
+        let lanes = match crate::env_knobs::opt_int_knob::<usize>("SQUEEZEFS_NVME_READ_LANES") {
+            Some(n) => n.max(1),
+            None => {
+                crate::nvme_dev::read_lanes_for(crate::cpu::process_parallelism(), devices.len())
+            }
+        };
+        for dev in &devices {
+            dev.set_read_lanes(lanes);
+        }
+        crate::fuse_client::METRICS
+            .data_read_lanes
+            .store(lanes as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub async fn flush_data_devices(&self) -> Result<()> {
         for dev in self.distinct_data_devices() {
             dev.flush().await?;

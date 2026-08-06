@@ -1014,7 +1014,14 @@ impl DeviceFence {
 #[derive(Clone)]
 pub struct NvmeBlockDev {
     pub device_path: String,
+    /// Lane 0: writes, barriers, probes (and reads when the pool is 1).
     worker: Arc<UringWorker>,
+    /// READ submission fan-out (read-queue-wall campaign): reads
+    /// round-robin these workers so submissions spread across blk-mq
+    /// software queues (per submitting CPU) — see [`read_lanes_for`].
+    /// Always contains lane 0; grows via [`Self::set_read_lanes`].
+    read_pool: Arc<arc_swap::ArcSwap<Vec<Arc<UringWorker>>>>,
+    lane_rr: Arc<std::sync::atomic::AtomicUsize>,
     node_probe: Arc<NodeProbe>,
     /// RES-6: the D0 writer-guard fence, shared across clones (they
     /// describe the same device). Wired by `DataRouter::set_meta_backend`
@@ -1075,11 +1082,33 @@ fn coarse_monotonic_ms() -> u64 {
     START.elapsed().as_millis() as u64
 }
 
+/// Read-lane fan-out derivation (2026-08-06 read-queue-wall campaign —
+/// the flat field D-ladder's device-plane term): ONE submitting thread
+/// per device is ONE blk-mq software queue is ONE nvme-tcp connection is
+/// ONE RX softirq core, and nvme-tcp RX pays the per-byte kernel copy on
+/// that core (~2.7 GB/s/core measured class) — 8 field namespaces × one
+/// core ≈ the 22 GB/s read wall, invariant to any client-side depth
+/// (local written-region discriminator: 1 submitter/dev qd16 → qd32 =
+/// 11.5 → 12.1 GB/s, while 4 submitters/dev at the SAME in-flight =
+/// 16.7). Writes escape it (TX is zero-copy spliced — the same single
+/// workers sustain 34 GB/s), so only READ submission fans out.
+///
+/// The count derives — never a constant: `cpus / data_devices`, floor 1
+/// (a device never loses its worker), self-bounded by `cpus` (total read
+/// threads ≈ the machine, the raw row's own shape when devices = 1).
+/// Explicit `SQUEEZEFS_NVME_READ_LANES` wins verbatim at the arming site.
+pub fn read_lanes_for(cpus: usize, data_devices: usize) -> usize {
+    (cpus / data_devices.max(1)).clamp(1, cpus.max(1))
+}
+
 impl NvmeBlockDev {
     pub fn new(device_path: &str) -> Self {
+        let worker = Arc::new(UringWorker::new(device_path.to_string()));
         Self {
             device_path: device_path.to_string(),
-            worker: Arc::new(UringWorker::new(device_path.to_string())),
+            read_pool: Arc::new(arc_swap::ArcSwap::from_pointee(vec![worker.clone()])),
+            lane_rr: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            worker,
             node_probe: Arc::new(NodeProbe {
                 at_ms: std::sync::atomic::AtomicU64::new(0),
                 seen: std::sync::atomic::AtomicBool::new(false),
@@ -1091,6 +1120,59 @@ impl NvmeBlockDev {
             lane: Arc::new(tokio::sync::OnceCell::new()),
             fence: Arc::new(DeviceFence::new()),
         }
+    }
+
+    /// Grow the READ submission pool to `n` lanes (see [`read_lanes_for`]
+    /// — the read-queue-wall campaign). Lane 0 is the construction
+    /// worker; extra lanes are full [`UringWorker`]s on the same device
+    /// (own thread, own ring, own O_DIRECT fd), so their submissions map
+    /// to DIFFERENT blk-mq software queues (per-CPU) and therefore
+    /// different fabric queues/RX cores. **Reads only** round-robin the
+    /// pool; writes, barriers and probes stay on lane 0 (the ordering and
+    /// DUR-2 barrier reasoning is untouched — a device flush is
+    /// device-wide regardless of the submitting queue, and callers
+    /// barrier only after their writes completed). Monotone: the pool
+    /// only grows (shrink = the A/B lever's remount); idempotent and
+    /// latch-free (ArcSwap — in-flight requests keep their lane alive by
+    /// Arc).
+    pub fn set_read_lanes(&self, n: usize) {
+        let n = n.max(1);
+        loop {
+            let cur = self.read_pool.load_full();
+            if cur.len() >= n {
+                return;
+            }
+            let mut next = (*cur).clone();
+            while next.len() < n {
+                next.push(Arc::new(UringWorker::new(self.device_path.clone())));
+            }
+            let prev = self.read_pool.compare_and_swap(&cur, Arc::new(next));
+            if Arc::ptr_eq(&prev, &cur) {
+                log::info!(
+                    "NvmeBlockDev {}: read submission fan-out armed ({} lanes)",
+                    self.device_path,
+                    n
+                );
+                return;
+            }
+        }
+    }
+
+    /// Live read-lane count (`data_read_lanes` stats face; 1 = the prior
+    /// single-worker posture).
+    pub fn read_lanes(&self) -> usize {
+        self.read_pool.load().len()
+    }
+
+    /// Round-robin pick for one READ submission (lock-free; the returned
+    /// Arc keeps the lane alive across the request's lifetime).
+    fn read_lane_pick(&self) -> Arc<UringWorker> {
+        let pool = self.read_pool.load();
+        let idx = self
+            .lane_rr
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % pool.len();
+        pool[idx].clone()
     }
 
     /// RES-6: wire the D0 writer-guard fence probe (the SAME per-volume
@@ -1693,7 +1775,12 @@ impl NvmeBlockDev {
         };
 
         let (tx, rx_oneshot) = oneshot::channel();
-        self.worker
+        // Read-queue-wall campaign: READ submissions round-robin the lane
+        // pool (writes/barriers stay on lane 0 — see `set_read_lanes`).
+        // The picked Arc lives past the await, keeping the lane's worker
+        // alive for this request's whole lifetime.
+        let read_lane = self.read_lane_pick();
+        read_lane
             .sender()
             .try_send(UringRequest::Read {
                 offset,

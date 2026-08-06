@@ -4847,6 +4847,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             router
                 .backend_router
                 .set_volume_records(volume_records.clone());
+            // Read-queue-wall campaign: fan READ submission across
+            // derived per-device lanes (one submitting thread = one
+            // blk-mq/fabric queue = one RX core — the 22 GB/s wall).
+            router.backend_router.arm_read_lanes();
 
             // Mount every volume through the sector-0 version gate
             // (design-cow-kv-metadata §6.1): v3 mounts read-write (the

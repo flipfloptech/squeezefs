@@ -11,7 +11,18 @@ requirement; the field host runs the sqz kernel (6.19.14-sqz, patches
 0019–0026 = the Koong v4 kmbuf+zc series) booted.
 
 Commits: fork `628c4402` (zc arm + sparse-slot bridges) · root
-`24b23ac5` (direct serve leg + ledger + contracts) · docs + this note.
+`24b23ac5` (direct serve leg + ledger + contracts) · `7eccd53a`
+(READDIR mirror pinned to the deployed kernel's measurement) · docs +
+this note.
+
+**Verdict up front: the bar is CLEARED.** A-B-B-A on the field host:
+**39.84 / 39.92 GB/s armed** vs 27.95 / 27.33 GB/s control (60 s
+sustained, engagement exact, zero fallbacks, all correctness gates
+green) — **95.5 % of the 41.8 GB/s raw ceiling**, daemon CPU/GB
+**−80 %**, box busy −14 pts at 1.43× the bytes. §5 has the table. The
+rig's FATAL smoke also flushed out a PRE-EXISTING (base `50ad803d`,
+zc-independent) fsync-during-writeback data-loss bug — §5b, P0
+hand-off.
 
 ## 1. The kernel contract (verified line-by-line against patch 0024)
 
@@ -68,7 +79,13 @@ never attempt zc** (surface Absent ⇒ decline; verified on the dev box,
   leases, dest windows — `PayloadArena::from_zc` wraps it so every
   existing protocol runs verbatim) and by FD (the ring bridges);
 * three bridge ops on the queue ring (`RingOp::Fetch`, resolved
-  against the per-ent `ZcPend`):
+  against the per-ent `ZcPend`). The out-paged mirror is
+  **{READ, READLINK}** — READDIR[PLUS] was bridged in the first cut
+  and the field probe measured every readdir reply kmbuf-attached and
+  kernel-copied on 6.19.14-sqz (one clean fallback per `ls`, output
+  correct — the safety net's designed outcome), so `7eccd53a` pinned
+  them back onto the kmbuf path (empiricism over source-reading; a
+  kernel that DOES zc readdir hits the loud no-attachment EIO guard):
   - `READ_FIXED(device fd → slot)` — the direct leg
     (handler-initiated via `zc_device_fetch`, oneshot back to the
     handler which validates and replies `prefilled`);
@@ -195,7 +212,72 @@ nrfiles=8 size=8g time_based 60 s ramp 10 s over `exa_perf`
 per leg (§2 Instruments). Baseline for comparison: dest-lease-ON
 control ≈ 27.9–28.1 GB/s; raw ceiling 41.8 GB/s; bar 35.5 GB/s (85 %).
 
-<!-- FIELD TABLE PENDING -->
+Binary `7eccd53a` (rocky8 pair, md5-verified both ends). Every leg:
+fresh mount → arm-proof gate → correctness smoke (O_DIRECT+fsync
+write → O_DIRECT AND buffered readback md5 + readdir + readlink — the
+zc WRITE-extraction, direct-read, bounce and kmbuf classes all live)
+→ 60 s + 10 s-ramp fio row → FATAL engagement verdict. All four legs
+PASSED every gate. Artifacts: `squeeze-test:/scratch/tmp/zc-abba-final2/`
+(per-leg fio JSON, stats before/after, /proc/stat + daemon-CPU
+snapshots, mount logs).
+
+| leg | zc | GB/s (60 s sustained) | box busy % | daemon CPU s | daemon ms/GB | zc GB | dest-lease GB | dest-copy GB | zc replies | fallbacks |
+|----:|---:|----:|----:|----:|----:|----:|----:|----:|----:|----:|
+| 1 (A) | 1 | **39.841** | 65.0 | 234.3 | **84.0** | 2790.7 | 0.1 | 0.0 | 2,661,427 | 0 |
+| 2 (B) | 0 | 27.951 | 80.3 | 847.5 | 433.1 | 0.0 | 1958.3 | 0.0 | 0 | 0 |
+| 3 (B) | 0 | 27.327 | 79.5 | 831.6 | 434.7 | 0.0 | 1914.6 | 0.0 | 0 | 0 |
+| 4 (A) | 1 | **39.919** | 66.6 | 249.1 | **89.1** | 2792.1 | 0.1 | 0.0 | 2,662,769 | 0 |
+
+* **Both brackets** (A→B and B→A) show the same delta — order-
+  independent: **+42.6 % / +46.1 % GB/s** (39.84/39.92 vs 27.95/27.33).
+* **Engagement EXACT**: armed legs' `read_zc_serve_bytes` (2.79 TB) =
+  the row's full ramp-inclusive volume (fio measured-window io_bytes
+  2.39 TB; ratio 1.167 ≈ 70 s/60 s); `fuse3_zc_replies` ≈ 2.66 M =
+  the row's READ count; fallbacks + slot-skips **0**; control legs' zc
+  ledger identically 0 with dest-lease carrying the row (1.9 TB) as
+  before — the baseline mechanism intact.
+* **Pass DELETION, not just GB/s**: daemon CPU/GB fell **433 → 84–89
+  ms/GB (−80 %)** and whole-box busy fell 80 → 65–67 % while moving
+  1.43× the bytes — the claim is CPU-work removal and the CPU columns
+  prove it (the kernel-side K1/GUP/lock share rides the box column).
+* Latency face: clat mean 3.35 ms vs 4.8 ms; p99 11.8 ms vs 17.5 ms.
+* Sustained: 60 s time_based rows, per-leg `bw_min/bw_max` window
+  34.5→43.4 GiB/s (armed) with no decay trend; a 15 s early probe on
+  the pre-fix binary read the same (38.8 GiB/s) — burst ≈ sustained.
+* **Verdict vs the bar**: 39.84/39.92 GB/s ≥ **35.5 GB/s bar (85 % of
+  the 41.8 GB/s raw ceiling)** — CLEARED at **95.5 % of raw**. K1 is
+  dead on the headline row.
+
+## 5b. PRE-EXISTING data-loss bug found by the rig's FATAL smoke (NOT this branch's — P0 hand-off)
+
+The rig's first armed leg FAILED its write→readback md5 smoke. Root
+cause hunt (field, counted):
+
+* Shape: `cp <32 MiB file> mnt/f && sync mnt/f` (buffered write +
+  `fsync(2)` on the file) then read back ⇒ the file's **LAST 4 MiB
+  block reads all-zeros**, PERSISTENTLY (O_DIRECT re-read, buffered
+  re-read, both corrupt — the stored state is zeros). Always block 7
+  of the 8-block file; `overwrite_seed_materialized` +1 per trial
+  (the partially-covered-block seed path engaging on a block that ends
+  fully covered — the smoking gun for an fsync-vs-writeback coverage
+  race).
+* Rates (10 trials each, same host/volume): zc=1 armed **6/10**
+  corrupt · zc=0 control same binary **7/10** · **BASE `50ad803d`
+  (the wave tip, pre-branch) 5/10** — the bug PREDATES this branch
+  and is zc-independent.
+* NOT corrupting (5/5 clean each): `dd oflag=direct conv=fsync`
+  (O_DIRECT writes + fsync), and `cp` + **global** `sync` (syncfs).
+  The trigger is specifically fsync-on-file racing in-flight kernel
+  writeback of that file's tail block.
+* Tripwires all silent during corruption: `write_path_seed_read_bytes 0`,
+  `writeback_superseded_noops 0`, `invariant_tripwires 0`,
+  `writeback_errors_latched 0` — nothing upstream noticed the loss.
+* Hand-off: needs its own red-first campaign (repro-port: live-mount
+  shape — kernel writeback + FUSE_FSYNC interleave; the
+  `overwrite_seed_materialized` engagement per corrupt trial is the
+  entry point). The rig's smoke now uses the O_DIRECT+fsync shape so
+  THIS campaign's acceptance measures its own machinery; the finding
+  is loud here, not dodged.
 
 ## 6. Honest notes / follow-ups
 

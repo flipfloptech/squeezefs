@@ -538,8 +538,9 @@ With zc negotiated the kernel skips the folio copy entirely
 integration answers all three consequences on an armed queue
 (`crates/fuse3/src/raw/connection/zc.rs` carries the design):
 
-- **out-paged replies** (READ/READDIR[PLUS]/READLINK) bridge through
-  the sparse slot: the **direct device leg** (`READ_FIXED(device →
+- **out-paged replies** (READ/READLINK — the measured 6.19.14-sqz
+  paged set; READDIR[PLUS] measured kmbuf-copied on that kernel and
+  keeps the ordinary path) bridge through the sparse slot: the **direct device leg** (`READ_FIXED(device →
   slot)` — routing's cold aligned passthrough windows, whole-block AND
   sub-block; `ZcReadServe` + `ReplyData::zc_prefilled`) is the K1 kill
   — device DMA into the caller's pages, zero daemon passes; every

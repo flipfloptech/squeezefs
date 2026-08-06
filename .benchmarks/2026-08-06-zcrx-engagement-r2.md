@@ -10,7 +10,7 @@ armed 1, NIC pristine after. Decompose the interlock, fix by derivation.
 Design: `docs/design-zcrx-read-lane.md` Rev 4a. Cluster READ-ONLY.
 
 Commits: red `164818ec` (contracts, compile-red at base) · green
-`<GREEN_SHA>` (the instruments + the economics arm + design Rev 4a +
+`50a92804` (the instruments + the economics arm + design Rev 4a +
 this note).
 
 ## 1. THE VOLUME-PATH AUDIT (deliverable 1 — where 1500 GB routed)

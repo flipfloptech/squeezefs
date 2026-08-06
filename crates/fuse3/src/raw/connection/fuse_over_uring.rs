@@ -2610,19 +2610,24 @@ impl FuseOverUring {
             TransportBufferMode::BufRing => "kmbuf-bufring",
             TransportBufferMode::ZeroCopy => "kmbuf-bufring+zero-copy",
         };
+        // The ladder-resolved kmbuf opcode pair (per kernel track:
+        // 37/38 = 6.19-sqz, 38/39 = 7.1-sqz, "absent" = stock) — logged
+        // once at arm beside the negotiation state.
+        let kmbuf_ops = kmbuf::resolved_opcodes_label();
         // Lever-2 evidence line: the armed drain-group shape (groups ==
         // queues ⇒ the lever is structurally inert on this session).
         let (dg, dgw) = drain_group_stats();
         eprintln!(
             "FUSE-over-io_uring registered: queues={nqueues} depth={depth} payload_sz={payload_sz} \
-             max_write={max_write} max_pages={max_pages} buffers={mode_state} fd={fuse_fd} \
-             sqpoll={sqpoll_state} drain_groups={dg}(width<={dgw})"
+             max_write={max_write} max_pages={max_pages} buffers={mode_state} \
+             kmbuf_ops={kmbuf_ops} fd={fuse_fd} sqpoll={sqpoll_state} \
+             drain_groups={dg}(width<={dgw})"
         );
         info!(
             "FUSE-over-io_uring registered: queues={nqueues} depth={depth} \
              payload_sz={payload_sz} max_write={max_write} max_pages={max_pages} \
-             buffers={mode_state} fd={fuse_fd} sqpoll={sqpoll_state} \
-             drain_groups={dg}(width<={dgw})"
+             buffers={mode_state} kmbuf_ops={kmbuf_ops} fd={fuse_fd} \
+             sqpoll={sqpoll_state} drain_groups={dg}(width<={dgw})"
         );
         Ok(pool)
     }

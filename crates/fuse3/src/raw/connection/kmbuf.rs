@@ -11,10 +11,17 @@
 //! transplant is therefore the only live form of this ABI anywhere, and
 //! everything here is a knowing throwaway against the eventual upstream
 //! shape — which is exactly why it lives behind ONE module boundary and
-//! a **runtime capability probe** ([`kmbuf_surface`]): on stock kernels
-//! the probe returns [`KmbufSurface::Absent`] (`EINVAL` — opcode
-//! unknown) and the transport runs today's userspace-ent path
-//! byte-identically, contract-pinned like every capability gate.
+//! a **runtime capability probe** ([`kmbuf_surface`]): an opcode LADDER
+//! (never a kernel-version check — portable-by-default law), because
+//! the register opcode is per kernel track: 37/38 on the 6.19.14-sqz
+//! field fleet, 38/39 on the 7.1-sqz track (upstream 7.1 took 37 for
+//! `IORING_REGISTER_BPF_FILTER`). A rung reads Present only on the full
+//! kmbuf signature (register 0 + identical-repeat `EEXIST` +
+//! kmbuf-offset mmap — the discrimination proof lives on
+//! `kmbuf_surface`); on stock kernels every rung refuses
+//! ([`KmbufSurface::Absent`]) and the transport runs today's
+//! userspace-ent path byte-identically, contract-pinned like every
+//! capability gate.
 //!
 //! # What the bufring arm buys (counted terms)
 //!
@@ -93,9 +100,45 @@ use tracing::warn;
 // uapi surface of the carried series (SERIES.md; io_uring + fuse halves)
 // ---------------------------------------------------------------------
 
-/// `IORING_REGISTER_KMBUF_RING` (series patch 03). The whole capability
-/// probe rides this opcode: stock kernels answer `EINVAL`.
-pub const IORING_REGISTER_KMBUF_RING: u32 = 37;
+/// One kernel track's `IORING_(UN)REGISTER_KMBUF_RING` opcode pair.
+///
+/// The register opcode number is **per kernel track** (series patch 03
+/// vs its 7.1 rebase — `docker/kernel-sqz/patches-7.1/`): upstream 7.1
+/// allocated 37 to `IORING_REGISTER_BPF_FILTER`, so the two sqz tracks
+/// occupy different numbers and the daemon resolves the pair by the
+/// probe ladder ([`kmbuf_surface`]) — never a kernel-version check
+/// (portable-by-default law).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KmbufOpcodes {
+    /// `IORING_REGISTER_KMBUF_RING` on this track.
+    pub register: u32,
+    /// `IORING_UNREGISTER_KMBUF_RING` on this track (documented pair
+    /// identity; teardown rides ring-fd close, so the daemon never
+    /// issues it — the smoke probe exercises it).
+    pub unregister: u32,
+    /// Track label for the arm-time log line.
+    pub track: &'static str,
+}
+
+/// The 6.19.14-sqz FIELD track (the deployed EL8 fleet): 37/38.
+pub const KMBUF_OPCODES_SQZ_619: KmbufOpcodes = KmbufOpcodes {
+    register: 37,
+    unregister: 38,
+    track: "6.19-sqz",
+};
+/// The 7.1-sqz track (`docker/kernel-sqz/patches-7.1/`): 38/39 —
+/// upstream 7.1 took 37 for `IORING_REGISTER_BPF_FILTER`.
+pub const KMBUF_OPCODES_SQZ_71: KmbufOpcodes = KmbufOpcodes {
+    register: 38,
+    unregister: 39,
+    track: "7.1-sqz",
+};
+/// Probe order: FIELD track first — the deployed fleet resolves on
+/// rung 1, and on 7.1 kernels rung 1's foreign occupant (BPF_FILTER)
+/// refuses deterministically before any state change (see
+/// [`kmbuf_surface`]'s discrimination proof).
+pub const KMBUF_OPCODE_LADDER: [KmbufOpcodes; 2] = [KMBUF_OPCODES_SQZ_619, KMBUF_OPCODES_SQZ_71];
+
 /// mmap offset base for kmbuf buffer regions (series patch 04).
 pub const IORING_OFF_KMBUF_RING: u64 = 0x8800_0000;
 /// bgid shift inside the kmbuf mmap offset (series patch 04).
@@ -178,66 +221,223 @@ pub fn init_flags(bufring: bool, zero_copy: bool) -> u16 {
 }
 
 // ---------------------------------------------------------------------
-// Runtime capability probe
+// Runtime capability probe — the opcode LADDER
 // ---------------------------------------------------------------------
 
 /// Probe verdict for the kmbuf io_uring surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KmbufSurface {
-    /// `IORING_REGISTER_KMBUF_RING` accepted — the sqz kernel.
-    Present,
-    /// Opcode unknown (`EINVAL`) or probe failed — stock kernels;
-    /// today's userspace-ent path, byte-identical.
+    /// A ladder rung confirmed — the sqz kernel, with THIS track's
+    /// opcode pair (6.19-sqz = 37/38, 7.1-sqz = 38/39).
+    Present(KmbufOpcodes),
+    /// Every rung refused (`EINVAL`/foreign) or the probe failed —
+    /// stock kernels; today's userspace-ent path, byte-identical.
     Absent,
 }
 
-/// Probe once per process: register a small, fully-valid kernel-managed
-/// buffer ring on a scratch io_uring (the `kmbuf_smoke.c` shape —
-/// `docker/kernel-sqz/probes/`), then drop the ring (releases the
-/// registration). SUCCESS ⇒ Present; `EINVAL` ⇒ Absent (opcode
-/// unknown); anything else ⇒ Absent, loudly (ambiguous surfaces never
-/// arm).
-pub fn kmbuf_surface() -> KmbufSurface {
-    static PROBE: OnceLock<KmbufSurface> = OnceLock::new();
-    *PROBE.get_or_init(|| {
-        let ring = match io_uring::IoUring::new(8) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("kmbuf probe: scratch io_uring_setup failed ({e}); surface Absent");
-                return KmbufSurface::Absent;
+/// One rung's verdict: probing ONE candidate register opcode with
+/// fully-valid kmbuf-register args on a fresh scratch ring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RungOutcome {
+    /// The full kmbuf signature: register returned 0, the identical
+    /// repeat answered `EEXIST` (a live bufring at the bgid), and the
+    /// kmbuf-offset mmap produced the buffer region. Only the kmbuf
+    /// machinery can satisfy the conjunction.
+    Confirmed,
+    /// register returned 0 but a confirmation failed — a FOREIGN opcode
+    /// accepted our argument shape. Loud; never arms; the scratch ring
+    /// is dropped so whatever it registered dies with the fd.
+    ForeignSuccess,
+    /// register refused with this errno. `EINVAL` = opcode unknown
+    /// (stock dispatch) or a foreign occupant's validation (7.1's
+    /// BPF_FILTER); `ENOENT` = a foreign lookup shape (kmbuf-UNREGISTER
+    /// crossed: resv/flags pass, bgid lookup fails). Both quiet;
+    /// anything else is loud. All read NOT-kmbuf at this number.
+    Refused(i32),
+}
+
+/// Probe-argument geometry (shared by the rung probe and its pinned
+/// tests): a tiny valid registration — 8 × page at bgid 7 — embedded in
+/// a zeroed [`PROBE_ARG_SPAN`]-byte buffer so a foreign opcode reading a
+/// WIDER struct (7.1's `io_uring_bpf` reads 72 bytes) sees deterministic
+/// zeros, never stack garbage, never a page-boundary EFAULT.
+const PROBE_RING_ENTRIES: u32 = 8;
+const PROBE_BGID: u16 = 7;
+const PROBE_ARG_SPAN: usize = 256;
+
+/// The pure ladder decision table (unit-tested with injected outcomes):
+/// first Confirmed rung wins and short-circuits; every other outcome
+/// falls through; all rungs exhausted ⇒ Absent.
+fn resolve_ladder(mut probe: impl FnMut(KmbufOpcodes) -> RungOutcome) -> KmbufSurface {
+    for pair in KMBUF_OPCODE_LADDER {
+        match probe(pair) {
+            RungOutcome::Confirmed => return KmbufSurface::Present(pair),
+            RungOutcome::ForeignSuccess => {
+                warn!(
+                    "kmbuf probe: opcode {} returned 0 WITHOUT the kmbuf \
+                     signature (EEXIST-on-repeat + kmbuf-offset mmap) — a \
+                     foreign opcode accepted the argument shape; rung {} \
+                     reads NOT-kmbuf",
+                    pair.register, pair.track
+                );
             }
-        };
-        let page = {
-            let sz = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) };
-            if sz > 0 {
-                sz as u32
-            } else {
-                4096
+            RungOutcome::Refused(e) if e == libc::EINVAL || e == libc::ENOENT => {}
+            RungOutcome::Refused(e) => {
+                warn!(
+                    "kmbuf probe: opcode {} refused ambiguously (errno {e}); \
+                     rung {} reads NOT-kmbuf",
+                    pair.register, pair.track
+                );
             }
-        };
-        let reg = IoUringBufReg::kernel_managed(page, 8, 7);
-        use std::os::fd::AsRawFd;
-        // SAFETY: `reg` is a fully-initialized 40-byte repr(C) struct;
-        // the fd is a live io_uring; the kernel copies the argument.
+        }
+    }
+    KmbufSurface::Absent
+}
+
+/// Probe one rung live: a fresh scratch ring (a foreign opcode's
+/// hypothetical side effects die with the fd), the padded valid
+/// registration, then — only on a 0 return — the two confirmations.
+fn probe_rung_live(pair: KmbufOpcodes) -> RungOutcome {
+    use std::os::fd::AsRawFd;
+    let ring = match io_uring::IoUring::new(8) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("kmbuf probe: scratch io_uring_setup failed ({e})");
+            return RungOutcome::Refused(e.raw_os_error().unwrap_or(libc::EINVAL));
+        }
+    };
+    let page = {
+        let sz = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) };
+        if sz > 0 {
+            sz as u32
+        } else {
+            4096
+        }
+    };
+    let reg = IoUringBufReg::kernel_managed(page, PROBE_RING_ENTRIES, PROBE_BGID);
+    let mut arg = [0u8; PROBE_ARG_SPAN];
+    // SAFETY: IoUringBufReg is 40 bytes of plain-old-data (repr(C),
+    // fully initialized); the destination is in-bounds.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            &reg as *const IoUringBufReg as *const u8,
+            arg.as_mut_ptr(),
+            std::mem::size_of::<IoUringBufReg>(),
+        );
+    }
+    let register = |fd: i32| -> Result<(), i32> {
+        // SAFETY: live ring fd; the argument buffer outlives the call
+        // (the kernel copies it).
         let ret = unsafe {
             libc::syscall(
                 libc::SYS_io_uring_register,
-                ring.as_raw_fd(),
-                IORING_REGISTER_KMBUF_RING,
-                &reg as *const IoUringBufReg as *const libc::c_void,
+                fd,
+                pair.register,
+                arg.as_ptr() as *const libc::c_void,
                 1u32,
             )
         };
         if ret == 0 {
-            // Ring drop (fd close) releases the probe registration.
-            return KmbufSurface::Present;
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EINVAL))
         }
-        let errno = io::Error::last_os_error();
-        if errno.raw_os_error() != Some(libc::EINVAL) {
-            warn!("kmbuf probe: REGISTER_KMBUF_RING refused ambiguously ({errno}); surface Absent");
+    };
+    let fd = ring.as_raw_fd();
+    if let Err(errno) = register(fd) {
+        return RungOutcome::Refused(errno);
+    }
+    // Confirmation 1: the identical repeat must answer EEXIST — kmbuf's
+    // io_alloc_new_buffer_list refuses a bgid with a live bufring.
+    match register(fd) {
+        Err(errno) if errno == libc::EEXIST => {}
+        other => {
+            warn!(
+                "kmbuf probe: opcode {} repeat answered {other:?}, not EEXIST — \
+                 foreign success on rung {}",
+                pair.register, pair.track
+            );
+            return RungOutcome::ForeignSuccess;
         }
-        KmbufSurface::Absent
-    })
+    }
+    // Confirmation 2: only the kmbuf registration mints an mmap region
+    // at IORING_OFF_KMBUF_RING | (bgid << shift); stock kernels have no
+    // case for that offset.
+    let span = PROBE_RING_ENTRIES as usize * page as usize;
+    let off = IORING_OFF_KMBUF_RING | ((PROBE_BGID as u64) << IORING_OFF_KMBUF_SHIFT);
+    // SAFETY: mapping the kernel-owned probe buffer region; unmapped
+    // below; the ring fd is live.
+    let p = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            span,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            off as libc::off_t,
+        )
+    };
+    if p == libc::MAP_FAILED {
+        let e = io::Error::last_os_error();
+        warn!(
+            "kmbuf probe: opcode {} registered but the kmbuf-offset mmap \
+             ({off:#x}) failed ({e}) — foreign success on rung {}",
+            pair.register, pair.track
+        );
+        return RungOutcome::ForeignSuccess;
+    }
+    // SAFETY: unmapping the region mapped above.
+    unsafe { libc::munmap(p, span) };
+    // Ring drop (fd close) releases the probe registration.
+    RungOutcome::Confirmed
+}
+
+/// Resolve the kmbuf surface once per process by the opcode LADDER —
+/// field track (37/38) first, then the 7.1 track (38/39). Never a
+/// kernel-version check (portable-by-default law).
+///
+/// # Why the ladder cannot mis-identify
+///
+/// **False Present is unreachable.** A rung arms only on the conjunction
+/// register==0 ∧ identical-repeat==EEXIST ∧ kmbuf-offset-mmap-succeeds,
+/// which only the kmbuf machinery satisfies. The characterized foreign
+/// occupants can't even reach the confirmations:
+/// - 7.1's `IORING_REGISTER_BPF_FILTER` (=37) imports the argument's
+///   first u16 as `cmd_type` and requires `IO_URING_BPF_CMD_FILTER` (=1)
+///   before touching state — a page-aligned `buf_size` has low 12 bits
+///   zero, so it refuses EINVAL deterministically (pinned as arithmetic
+///   in the tests); with `CONFIG_IO_URING_BPF=n` the stub returns EINVAL.
+/// - kmbuf-UNREGISTER crossed with register args (probing 38 on
+///   6.19-sqz — unreachable via ladder order, characterized anyway):
+///   resv/flags validate, the bgid lookup on the fresh scratch ring
+///   fails → ENOENT, before any state change.
+/// - Stock dispatch refuses unknown opcodes EINVAL at the
+///   `IORING_REGISTER_LAST` gate.
+///
+/// **False Absent is unreachable on the two sqz tracks**: the rung runs
+/// the exact registration [`KmbufQueue::setup`] performs (valid args,
+/// page-aligned `buf_size`, pow2 entries), so the track's own kernel
+/// accepts it by construction; on 7.1-sqz rung 1's EINVAL falls through
+/// to the confirming rung 2.
+///
+/// **Side-effect-free everywhere**: each rung uses a fresh scratch ring
+/// dropped before the verdict returns (releasing every registration,
+/// even a hypothetical foreign one), and every characterized foreign
+/// refusal happens before any kernel state change.
+pub fn kmbuf_surface() -> KmbufSurface {
+    static PROBE: OnceLock<KmbufSurface> = OnceLock::new();
+    *PROBE.get_or_init(|| resolve_ladder(probe_rung_live))
+}
+
+/// The resolved opcode pair, for the arm-time log line: e.g.
+/// "37/38 (6.19-sqz)"; "absent" on stock kernels.
+pub fn resolved_opcodes_label() -> String {
+    match kmbuf_surface() {
+        KmbufSurface::Present(p) => format!("{}/{} ({})", p.register, p.unregister, p.track),
+        KmbufSurface::Absent => "absent".to_string(),
+    }
 }
 
 /// The session-level transport buffer mode.
@@ -294,7 +494,7 @@ pub fn resolve_buffer_mode() -> TransportBufferMode {
     let lever_off = !env_bool("SQUEEZEFS_FUSE_KMBUF", true);
     let zc_wanted = env_bool("SQUEEZEFS_FUSE_ZC", false);
     match (kmbuf_surface(), lever_off) {
-        (KmbufSurface::Present, false) => {
+        (KmbufSurface::Present(_), false) => {
             if zc_wanted {
                 // SAFETY: geteuid has no failure mode.
                 let euid = unsafe { libc::geteuid() };
@@ -309,7 +509,7 @@ pub fn resolve_buffer_mode() -> TransportBufferMode {
             }
             TransportBufferMode::BufRing
         }
-        (KmbufSurface::Present, true) => {
+        (KmbufSurface::Present(_), true) => {
             warn!("kmbuf surface Present but SQUEEZEFS_FUSE_KMBUF=0 — userspace ents (A/B lever)");
             if zc_wanted {
                 warn!(
@@ -484,12 +684,26 @@ impl KmbufQueue {
                 4096
             }
         };
+        // The geometry law is kernel-independent (a violation is a
+        // planner bug) — refuse it before anything else.
         if payload_sz % page != 0 {
             return Err(io::Error::other(format!(
                 "kmbuf buf_size {payload_sz} not page-aligned (page {page}) — \
                  the geometry law guarantees page-multiple ents; refusing"
             )));
         }
+        // The register opcode is per kernel track — the ladder's cached
+        // verdict carries the resolved pair (never a blind number).
+        let ops = match kmbuf_surface() {
+            KmbufSurface::Present(ops) => ops,
+            KmbufSurface::Absent => {
+                return Err(io::Error::other(
+                    "IORING_REGISTER_KMBUF_RING unavailable: the kmbuf opcode \
+                     ladder probed Absent on this kernel — refusing setup \
+                     (stock kernels run the userspace-ent path)",
+                ));
+            }
+        };
         let headers_span = (depth * REQ_HEADER_SZ).next_multiple_of(page);
         // SAFETY: fresh anonymous RW mapping, kernel-validated length.
         let headers_base = unsafe {
@@ -554,7 +768,7 @@ impl KmbufQueue {
             libc::syscall(
                 libc::SYS_io_uring_register,
                 ring.as_raw_fd(),
-                IORING_REGISTER_KMBUF_RING,
+                ops.register,
                 &reg as *const IoUringBufReg as *const libc::c_void,
                 1u32,
             )
@@ -564,9 +778,10 @@ impl KmbufQueue {
             // SAFETY: error-path unmap of our own mapping.
             unsafe { libc::munmap(headers_base as *mut libc::c_void, headers_span) };
             return Err(io::Error::other(format!(
-                "IORING_REGISTER_KMBUF_RING(bgid={FUSE_URING_RINGBUF_GROUP}, \
+                "IORING_REGISTER_KMBUF_RING(op={}, bgid={FUSE_URING_RINGBUF_GROUP}, \
                  buf_size={payload_sz}, entries={ring_entries}) failed: {e} \
-                 — surface probed Present; refusing (no silent downgrade)"
+                 — surface probed Present ({}); refusing (no silent downgrade)",
+                ops.register, ops.track
             )));
         }
 
@@ -875,7 +1090,7 @@ mod tests {
             io_uring::IoUring::builder().build(16).expect("SQE128 ring");
         let page = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) } as usize;
         match kmbuf_surface() {
-            KmbufSurface::Present => {
+            KmbufSurface::Present(_) => {
                 let q =
                     KmbufQueue::setup(&ring, 4, page, false).expect("Present surface must set up");
                 assert_eq!(q.ring_entries(), 4);
@@ -914,7 +1129,7 @@ mod tests {
             io_uring::IoUring::builder().build(16).expect("SQE128 ring");
         let page = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) } as usize;
         match kmbuf_surface() {
-            KmbufSurface::Present => {
+            KmbufSurface::Present(_) => {
                 let q =
                     KmbufQueue::setup(&ring, 4, page, true).expect("Present surface must set up");
                 assert_eq!(q.ring_entries(), 4);
@@ -1109,10 +1324,11 @@ mod tests {
     /// stack garbage, never a page-boundary EFAULT.
     #[test]
     fn test_probe_arg_padding_covers_foreign_readers() {
-        assert!(std::mem::size_of::<IoUringBufReg>() == 40);
-        assert!(
-            PROBE_ARG_SPAN >= 128,
-            "padding must cover foreign-struct reads (io_uring_bpf = 72 B)"
-        );
+        assert_eq!(std::mem::size_of::<IoUringBufReg>(), 40);
+        // Compile-time tripwire: shrinking the span below any foreign
+        // reader's struct width (io_uring_bpf = 72 B) fails the build.
+        const {
+            assert!(PROBE_ARG_SPAN >= 128);
+        }
     }
 }

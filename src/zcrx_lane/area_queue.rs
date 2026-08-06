@@ -33,26 +33,15 @@ pub(crate) use super::area::ADMISSION_UNIT;
 // falsified by the field (MTU 9000 ⇒ amp 1, still instant exhaustion)
 // and by the source (`io_zcrx_copy_chunk` packs fallback niovs FULLY
 // via io_copy_page — no per-segment page burn). The real structural
-// consumer is the NIC RX ring itself (see [`ring_standing_bytes`]).
+// consumer is the NIC RX ring itself (see
+// [`super::area::ring_standing_bytes`]).
 
-/// The NIC RX descriptor ring's STANDING demand on the provider pool
-/// (round 6): when the queue restarts onto the zcrx memory provider,
-/// the driver fills its RX ring FROM THE POOL — `rx_descs` descriptors
-/// × ⌈mtu / chunk⌉ chunk-sized buffers each (worst-case legacy-RQ
-/// geometry; striding-RQ fleets over-provision, the safe direction) —
-/// and holds that many buffers for the queue's lifetime. The area must
-/// cover this ON TOP of the fill window, or the pool is dry before the
-/// first packet (the field shape: 8192 descs × ⌈9000/4096⌉=3 pages =
-/// 96 MiB standing vs a 64 MiB round-5 area — instant ENOMEM, and
-/// failover releases could never satisfy it). Unknown MTU degrades to
-/// one chunk per descriptor (the floor the ring cannot be below).
-pub(crate) fn ring_standing_bytes(rx_descs: u32, mtu: Option<u32>, chunk: usize) -> u64 {
-    let per_desc = match mtu {
-        Some(mtu) => (mtu as usize).div_ceil(chunk.max(1)).max(1),
-        None => 1,
-    };
-    rx_descs as u64 * per_desc as u64 * chunk as u64
-}
+// The NIC RX ring's standing provider-pool demand lives in
+// `super::area::ring_standing_bytes` (round 3: it gained the
+// striding-RQ/MPWQE model beside the round-6 legacy one — the sizing
+// laws live in area.rs; the round-6 caveat "striding-RQ fleets
+// over-provision" was FALSIFIED by the field: striding demand is
+// LARGER at jumbo MTU — 128 MiB vs 96 MiB on the field rail).
 
 pub(crate) fn admission_units(len: usize) -> u32 {
     len.div_ceil(ADMISSION_UNIT) as u32
@@ -307,32 +296,5 @@ mod tests {
             super::super::area::admission_permits(4096, 4096) >= 1,
             "floor one unit"
         );
-    }
-
-    #[test]
-    fn ring_standing_bytes_covers_the_field_geometry() {
-        // Round 6 kernel adjudication: the RX ring holds pool buffers
-        // for the queue's LIFETIME (io_uring/zcrx.c: the provider pool
-        // is the ONLY buffer source once the queue restarts onto it).
-        // Field rail: 8192 descriptors, MTU 9000, 4 KiB chunks ⇒
-        // 8192 × 3 × 4096 = 96 MiB standing — the instant-exhaustion
-        // arithmetic against the 64 MiB round-5 area, and why failover
-        // releases could never refill the pool.
-        assert_eq!(
-            ring_standing_bytes(8192, Some(9000), 4096),
-            8192 * 3 * 4096,
-            "the field rail's standing demand"
-        );
-        assert_eq!(
-            ring_standing_bytes(8192, Some(1500), 4096),
-            8192 * 4096,
-            "1500-MTU: one chunk per descriptor"
-        );
-        assert_eq!(
-            ring_standing_bytes(1024, None, 4096),
-            1024 * 4096,
-            "unknown MTU degrades to one chunk per descriptor (the floor)"
-        );
-        assert_eq!(ring_standing_bytes(0, Some(9000), 4096), 0, "no probe => 0");
     }
 }

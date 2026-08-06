@@ -74,6 +74,56 @@ pub fn burst_geometry(mtu: Option<u32>, chunk: usize) -> Option<BurstGeometry> {
     })
 }
 
+/// The MPWQE (striding-RQ) per-frame stride model (round 3, 2026-08-06
+/// — the pool-term adjudication against the sqz linux-6.19.14 tree):
+/// mlx5 reports its RX ring in FRAMES (`ethtool -g` rx =
+/// `1 << log_rq_mtu_frames`, en_ethtool.c:372), and a striding-RQ
+/// queue's standing provider-pool demand is `pages_per_wqe <<
+/// log_rq_size` (en_main.c:940–941), which algebraically reduces to
+/// `frames × linear_stride_sz` — `log_wqe_sz` cancels
+/// (params.c:415 `log_rq_size = log_rq_mtu_frames − log_pkts_per_wqe`;
+/// :292–301 `log_pkts_per_wqe = log_wqe_sz − order2(linear_stride)`)
+/// — so the term is probeable WITHOUT any driver-internal input. The
+/// stride is `roundup_pow_of_two(SKB_FRAG_SZ(headroom + hw_mtu))`
+/// (params.c:284, :252–262): mtu + NET_SKB_PAD (64, en.h:79) +
+/// `hard_mtu` (≤ 22, en.h:75 SW2HW) + `SKB_DATA_ALIGN(skb_shared_info)`
+/// (320 on x86_64) + two SKB_DATA_ALIGN roundings (≤ 128) — ceiled to
+/// 512 B on the line: over-estimating the overhead only rounds UP at a
+/// pow2 boundary, the safe (over-provisioning) direction.
+pub fn mpwqe_stride_bytes(mtu: u32) -> u64 {
+    /// The kernel skb linear-size arithmetic above, ceiled (≤ 498 real).
+    const MPWQE_SKB_LINEAR_OVERHEAD_BYTES: u64 = 512;
+    (u64::from(mtu) + MPWQE_SKB_LINEAR_OVERHEAD_BYTES).next_power_of_two()
+}
+
+/// The NIC RX ring's STANDING demand on the provider pool — round 6
+/// modeled the LEGACY/cyclic RQ (`descs × ⌈mtu/chunk⌉ chunks`); round 3
+/// adds the STRIDING-RQ (MPWQE) model ([`mpwqe_stride_bytes`] —
+/// `frames × stride`), because a zcrx-provider-backed mlx5 queue runs
+/// striding RQ + SHAMPO HDS (en_main.c:826/:1005–1007 — the header
+/// pool is SEPARATE for unreadable-MP queues; payload strides ride the
+/// provider pool) and the queue-restart path reuses the channel params
+/// verbatim (en_main.c:5561–5601). The RQ mode is not portably
+/// probeable from userspace, so the derivation takes **max(legacy,
+/// striding)** — the round-6 safe direction (small-MTU rails keep the
+/// legacy floor: 2 KiB strides < 1-chunk frames). Field rail: 8192 ×
+/// 16 KiB = 128 MiB vs the legacy 96 MiB — the 32 MiB shortfall that
+/// held every round-2 failover window starved. Unknown MTU degrades to
+/// one chunk per descriptor (the round-6 floor; the failed-probe warn
+/// is loud at the arm site).
+pub fn ring_standing_bytes(rx_descs: u32, mtu: Option<u32>, chunk: usize) -> u64 {
+    let legacy_per_desc = match mtu {
+        Some(m) if m > 0 => (m as usize).div_ceil(chunk.max(1)).max(1),
+        _ => 1,
+    };
+    let legacy = rx_descs as u64 * legacy_per_desc as u64 * chunk as u64;
+    let striding = match mtu {
+        Some(m) if m > 0 => rx_descs as u64 * mpwqe_stride_bytes(m),
+        _ => 0,
+    };
+    legacy.max(striding)
+}
+
 /// The delivery-slack AREA allotment for a fully-admitted fill window
 /// (2026-08-06 engagement campaign — the retired admission `/2`'s
 /// implicit budget, made explicit and DERIVED): admitted payload

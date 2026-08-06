@@ -228,6 +228,10 @@ pub struct LaneSession {
     /// (round 6 — an orderly post-teardown association close must be
     /// unreadable as poison).
     teardown_latch: Arc<AtomicBool>,
+    /// The NIC this session's queues ride (real backend: the plan's
+    /// ifindex; 0 = none — contract backends). Round 3: the per-NIC
+    /// structural census key (the whole-NIC no-harm face).
+    nic_ifindex: std::sync::atomic::AtomicU32,
 }
 
 impl LaneSession {
@@ -847,6 +851,10 @@ impl LaneSession {
             LaneBackend::Zcrx(plan) => plan.rxq_lease.clone(),
             _ => None,
         };
+        let nic_ifindex = match &backend {
+            LaneBackend::Zcrx(plan) => plan.ifindex,
+            _ => 0,
+        };
         let session = Arc::new(LaneSession {
             target,
             queues,
@@ -856,6 +864,7 @@ impl LaneSession {
             admin_hold: std::sync::Mutex::new(Some(admin_hold)),
             rxq_lease: std::sync::Mutex::new(rxq_lease),
             teardown_latch,
+            nic_ifindex: std::sync::atomic::AtomicU32::new(nic_ifindex),
         });
         super::register_session(&session);
         Ok(session)
@@ -902,6 +911,32 @@ impl LaneSession {
         }
     }
 
+    /// Contract seam (round 3 — the whole-NIC release suite): latch the
+    /// structural flag on every area queue, standing in for a
+    /// governor-proven structural starvation.
+    pub fn set_refill_structural_for_test(&self) {
+        for q in &self.queues {
+            if let QueueHandle::Area(q) = q {
+                q.shared.starved_structural.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// The NIC this session's queues ride (`None` on contract backends).
+    pub fn nic_ifindex(&self) -> Option<u32> {
+        match self.nic_ifindex.load(Ordering::Relaxed) {
+            0 => None,
+            ifx => Some(ifx),
+        }
+    }
+
+    /// Contract seam (round 3): bind a contract-backend session to a
+    /// test NIC so the census/sweep laws are exercisable without a
+    /// real ifq.
+    pub fn set_nic_for_test(&self, ifindex: u32) {
+        self.nic_ifindex.store(ifindex, Ordering::Relaxed);
+    }
+
     /// Round-8 no-harm escalation: any queue whose refill starvation
     /// proved STRUCTURAL (two consecutive failover windows without
     /// payload) — the funnel tears the whole session down so the RSS
@@ -944,6 +979,23 @@ impl LaneSession {
         // The lease releases only AFTER the ifqs are joined (quiesce),
         // so a successor arm re-registers a freed queue, not a live one.
         self.rxq_lease.lock().expect("rxq lease lock").take();
+        // Round 3 — the whole-NIC no-harm face: a STRUCTURALLY-starved
+        // session votes in the per-NIC census once (this body is
+        // latch-idempotent), and a majority verdict sweeps the NIC's
+        // remaining live sessions — the pool term is per-NIC physics,
+        // so the survivors' RSS exclusion is pure rent (round-2 field:
+        // 5 of 10 tore down, the other 5 held ~16 % of queue width at
+        // ~0 engagement for the rest of the row). Runs AFTER this
+        // session's own release (the finding-3 ordering stays
+        // per-session); a swept peer is never structural itself, so
+        // the sweep recursion ends at depth one.
+        if self.refill_structural() {
+            if let Some(ifx) = self.nic_ifindex() {
+                if super::nic_census::note_structural(ifx) {
+                    super::sweep_nic_sessions(ifx, self as *const _ as usize).await;
+                }
+            }
+        }
     }
 
     /// Fire-and-forget teardown for the poison path (finding F: the

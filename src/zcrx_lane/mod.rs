@@ -18,6 +18,7 @@ mod ethtool;
 mod ethtool_nl;
 pub mod fill_table;
 pub mod initiator;
+pub mod nic_census;
 pub mod pdu;
 pub mod pdu_stream;
 pub mod probe;
@@ -72,6 +73,40 @@ pub async fn teardown_all_lanes() {
     );
     for sess in live {
         sess.teardown().await;
+    }
+}
+
+/// The whole-NIC release (round 3 — the majority-structural sweep): a
+/// structurally-torn session whose census vote made the MAJORITY tears
+/// the NIC's remaining live sessions down too, so their RSS width
+/// restores MID-ROW instead of at umount (round-2 field: the surviving
+/// minority held ~16 % of queue width at ~0 engagement for the rest of
+/// the row). `except` is the sweeping session's identity (it is already
+/// inside its own teardown). Awaited — the caller's teardown completes
+/// only when the NIC is released; peers' teardowns are idempotent, and
+/// a swept peer is never structural itself, so recursion ends at depth
+/// one (Box::pin breaks the async cycle for the compiler).
+pub(crate) async fn sweep_nic_sessions(ifindex: u32, except: usize) {
+    let peers: Vec<Arc<LaneSession>> = {
+        let reg = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+        reg.iter()
+            .filter_map(|w| w.upgrade())
+            .filter(|s| s.nic_ifindex() == Some(ifindex))
+            .filter(|s| Arc::as_ptr(s) as usize != except)
+            .filter(|s| !s.torn_down())
+            .collect()
+    };
+    if peers.is_empty() {
+        return;
+    }
+    log::error!(
+        "zcrx-lane: the MAJORITY of lane sessions on ifindex {ifindex} proved the \
+         provider-pool term structural — releasing the whole NIC ({} remaining \
+         session(s) torn down; RSS width restores now, kernel path serves)",
+        peers.len()
+    );
+    for p in peers {
+        Box::pin(p.teardown()).await;
     }
 }
 
@@ -360,7 +395,7 @@ pub async fn arm_for_device(device_path: &str) -> Option<Arc<LaneSession>> {
     // both derive from the burst occupancy (`area::burst_geometry`).
     let mtu = ethtool::nic_mtu(&ifname);
     let ring_fill_bytes =
-        area_queue::ring_standing_bytes(rx_ring_descs, mtu, area::chunk_bytes_default());
+        area::ring_standing_bytes(rx_ring_descs, mtu, area::chunk_bytes_default());
     let plan = initiator::ZcrxPlan {
         numa_node: ethtool::nic_numa_node(&ifname),
         ifname,
@@ -376,6 +411,10 @@ pub async fn arm_for_device(device_path: &str) -> Option<Arc<LaneSession>> {
             crate::fuse_client::METRICS
                 .zcrx_lane_armed
                 .store(1, Ordering::Relaxed);
+            // Round 3: the per-NIC structural census (the whole-NIC
+            // no-harm face) counts EVER-ARMED sessions here — the same
+            // ifindex the session carries for its structural vote.
+            nic_census::note_armed(ifindex);
             Some(sess)
         }
         Err(e) => {

@@ -3008,10 +3008,26 @@ fn test_pool_term_striding_rq_standing_demand() {
     // 64 + hard_mtu ≤ 22 + SKB_DATA_ALIGN(skb_shared_info) 320 + two
     // SKB_DATA_ALIGN roundings ≤ 128, ceiled to 512: over-estimating
     // only rounds UP at pow2 boundaries, the safe direction).
-    assert_eq!(area::mpwqe_stride_bytes(9000), 16384, "jumbo rail: 16 KiB strides");
-    assert_eq!(area::mpwqe_stride_bytes(1500), 2048, "1500-MTU: 2 KiB strides");
-    assert_eq!(area::mpwqe_stride_bytes(3584), 4096, "boundary: 3584+512 = pow2 exact");
-    assert_eq!(area::mpwqe_stride_bytes(3585), 8192, "past the boundary rounds up");
+    assert_eq!(
+        area::mpwqe_stride_bytes(9000),
+        16384,
+        "jumbo rail: 16 KiB strides"
+    );
+    assert_eq!(
+        area::mpwqe_stride_bytes(1500),
+        2048,
+        "1500-MTU: 2 KiB strides"
+    );
+    assert_eq!(
+        area::mpwqe_stride_bytes(3584),
+        4096,
+        "boundary: 3584+512 = pow2 exact"
+    );
+    assert_eq!(
+        area::mpwqe_stride_bytes(3585),
+        8192,
+        "past the boundary rounds up"
+    );
 
     // The field rail: striding (8192 × 16 KiB = 128 MiB) DOMINATES the
     // round-6 legacy model (8192 × 3 × 4 KiB = 96 MiB) — the 32 MiB

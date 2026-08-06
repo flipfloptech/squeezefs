@@ -143,6 +143,71 @@ round-2 machinery:
   is sized; immediate majority-starvation ⇒ the ring-standing model is
   the term — fix the PROBE, never a constant).
 
+**Rev 4b amendments (engagement round 3 — the pool term adjudicated at
+the driver source, 2026-08-06):**
+
+The round-2 discriminator fired outcome (2): A-sides `starved_ms =
+9370` ≡ 10 × `park_fail_bound` (EVERY failover window starved),
+`structural = 5`, fill stuck at 0.6 GB. The term was then read out of
+the sqz linux-6.19.14 tree (the exact field kernel; the 27-patch series
+touches io_uring/FUSE only — mlx5 is pristine stable):
+
+* **A zcrx-provider-backed mlx5 queue runs STRIDING RQ (MPWQE) +
+  SHAMPO HDS.** `mlx5_rq_shampo_alloc` is the striding arm's
+  (en_main.c:961) and its unreadable-MP branch (en_main.c:826,
+  `netif_rxq_has_unreadable_mp`) gives the queue a SEPARATE header
+  page pool — headers on normal kernel pages, payload strides on the
+  provider pool ("Shampo header data split allow for unreadable
+  netmem", en_main.c:1005–1007). The queue-restart path
+  (`mlx5e_queue_mem_alloc`, en_main.c:5561–5601) reopens the channel
+  with `chs->params` VERBATIM — a REGISTER_ZCRX_IFQ restart changes no
+  geometry, and `netdev_queue_mgmt_ops` (en_main.c:5668) has no
+  per-queue ring-size hook, so `ethtool -G` stays device-global
+  (option (b) of the round-3 charter is NOT expressible).
+* **The real standing demand**: the RQ's provider draw when fully
+  posted is `pages_per_wqe << log_rq_size` (en_main.c:940–941 — also
+  the page_pool sizing), and it REDUCES to
+  **`ethtool_rx_frames × linear_stride_sz`**: `log_rq_size =
+  log_rq_mtu_frames − log_pkts_per_wqe` (params.c:415),
+  `log_pkts_per_wqe = log_wqe_sz − order2(linear_stride_sz)`
+  (params.c:292–301) — **`log_wqe_sz` cancels**, so no driver-internal
+  input is needed. `ethtool -g` rx reports FRAMES (en_ethtool.c:372 —
+  `1 << log_rq_mtu_frames`; the probe the lane already runs), and
+  `linear_stride_sz = roundup_pow_of_two(SKB_FRAG_SZ(headroom +
+  hw_mtu))` (params.c:284, :252–262; en.h:75 `SW2HW_MTU`, :79
+  `MLX5_RX_HEADROOM = NET_SKB_PAD`). Field rail: 8192 × 16384 =
+  **128 MiB/queue** vs the round-6 legacy model's 96 MiB — the 184 MiB
+  area left the fills a 56 MiB budget against a 64 MiB fully-admitted
+  window: **permanently starved**, which is exactly the tape.
+* **The derivation landed** (`area::ring_standing_bytes`, probeable
+  end-to-end): `max(legacy, striding)` where legacy is the round-6
+  `descs × ⌈mtu/chunk⌉ × chunk` and striding is `frames ×
+  mpwqe_stride_bytes(mtu)` (`roundup_pow2(mtu + ≤512 B of kernel skb
+  arithmetic, ceiled — over-estimating only rounds UP at a pow2
+  boundary, the safe direction)`). The RQ mode is not portably
+  probeable, so max() is the round-6 safe direction — small-MTU rails
+  keep the legacy floor (2 KiB strides < 1-chunk frames). Field area
+  becomes ≈ 64 window + 24 slack + 128 ring = 216 MiB/queue
+  (PMD-rounded), ~2.2 GiB across 10 sessions, R5-gauged — Red still
+  blocks arms. The round-6 caveat "striding-RQ fleets over-provision"
+  is hereby FALSIFIED and retired.
+* **The whole-NIC release** (`nic_census` — the residual-rent
+  adjudication): per-session teardowns DID restore their own RSS
+  mid-row (the ArmedSteering restore rides `teardown()`), but the
+  surviving minority held ~16 % of the queue width at ~0 engagement
+  for the rest of the row — the residual 5–7 % A-vs-B gap. The pool
+  term is per-NIC physics, so a structural vote that reaches the
+  MAJORITY of the NIC's ever-armed sessions (the same ½ boundary as
+  the per-session arm) sweeps the remaining live sessions
+  (`sweep_nic_sessions` — awaited inside the voter's teardown, depth-
+  one recursion by construction). Round-2's tape under this law:
+  the 5th structural teardown releases all 10 sessions' width.
+* **Options adjudicated**: (a) probe the real term — LANDED (above);
+  (b) per-queue ring shrink — NOT EXPRESSIBLE on this kernel (cited
+  above); (c) the honest stop — NOT NEEDED: the term is finite and
+  probeable. A kernel-side per-queue page budget remains a nice-to-
+  have, not a blocker.
+
 **Rev 3 amendments (Z3 as built):**
 
 * **Gather fusion (the PERF-1 win)**: registered-destination funnel

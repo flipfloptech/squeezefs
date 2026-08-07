@@ -607,7 +607,14 @@ fast-tracked** as its fix. Armed wins carried by the record: reads
 ladder, zero tripwires since), stock kernels decline loud and run the
 bufring path byte-identically. `SQUEEZEFS_FUSE_ZC=0` is the escape/A-B
 lever; the D16 caveat sunsets when fusion's bracket clears 0.97× on the
-rand-4k row.
+rand-4k row. **Fusion LANDED 2026-08-07** (`perf/zc-write-fusion`,
+`.benchmarks/2026-08-07-zc-write-fusion.md`): local tcp-devsub A-B-B-A
+measured fusion +12.2 %/+21.9 % on the rand rows (both bracket orders
+> 1) at −27..29 % daemon CPU/byte, and the caveat's own axis recovered
+to armed = 0.973× (hole) / 1.000× (overwrite) of unarmed at median —
+the sunset row itself (the FIELD bracket above) is still owed:
+squeeze-test was busy at check time and the spec is filed in the fusion
+note §5.
 
 **Ruling D15 (user 2026-08-07 — rig discipline, standing): every battery/rig
 row must pass END-TO-END on the local substrate before it runs on the remote

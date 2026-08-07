@@ -57,6 +57,20 @@ pub fn set_test_read_stall(count: usize, ms: u64) {
     STALL_NEXT_READS.store(count, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Test seam: the worker stalls the next N WRITE submissions (the
+/// deterministic stand-in for a slow fabric DMA — the read seam's twin,
+/// used by the DUR-2 cross-lane flush-drain contract). One relaxed load
+/// unset; never set in production.
+static STALL_NEXT_WRITES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static STALL_WRITE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Arm the write-stall test seam: the next `count` worker write
+/// submissions each stall `ms` milliseconds (`0` disables).
+pub fn set_test_write_stall(count: usize, ms: u64) {
+    STALL_WRITE_MS.store(ms, std::sync::atomic::Ordering::SeqCst);
+    STALL_NEXT_WRITES.store(count, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// Caller-side wait bound (ms) on the uring-worker read oneshot. Default
 /// 30 000 — a wedged device/worker must not freeze the whole FUSE session
 /// (pre-MEM-1 posture, unchanged); the MEM-1 stall legs shorten it via
@@ -307,10 +321,116 @@ fn finish_read(
     Ok(bytes.slice(0..size))
 }
 
+/// Per-lane WRITE completion watermark (write-lane-fanout campaign,
+/// 2026-08-07): the DUR-2 barrier's cross-lane ordering instrument. Every
+/// write/fsync submission bumps `submitted` (caller side, before the
+/// channel send); every TERMINAL resolution of one — CQE completion,
+/// SQ-full refusal, worker-teardown drain — bumps `completed` (worker
+/// side, authoritative: a dropped caller future cannot strand the
+/// ledger). [`NvmeBlockDev::flush`] captures each lane's `submitted`
+/// watermark at barrier start and waits until `completed` reaches it
+/// BEFORE issuing the device Fsync, so "everything written before the
+/// barrier started" holds at submission grain across every lane — a
+/// device flush command only covers commands the device completed before
+/// processing it, and an io_uring `Fsync` never drains its own ring's
+/// in-flight SQEs (no `IO_DRAIN`), so the watermark is what makes the
+/// contract true (it was caller-await-dependent even on the single
+/// lane).
+///
+/// Reads deliberately do NOT ride the ledger: a barrier must never wait
+/// out a wedged read's 30 s timeout class.
+///
+/// Wake economy: the completer pays a `notify_waiters` only when a
+/// barrier is actually parked (`waiters > 0` — the `transport_wake_*` /
+/// `ipc_cqe_wake_*` discipline). The waiter-registration/completion pair
+/// is the cqe_core Dekker shape: both sides are SeqCst RMW/loads, so a
+/// completer that misses the waiter forces the waiter to see the count.
+struct WriteWatermark {
+    submitted: std::sync::atomic::AtomicU64,
+    completed: std::sync::atomic::AtomicU64,
+    waiters: std::sync::atomic::AtomicUsize,
+    drained: tokio::sync::Notify,
+    /// Worker thread exited (normal drain OR refused open/ring): any
+    /// unreachable watermark target fails loud instead of parking a
+    /// barrier forever.
+    dead: std::sync::atomic::AtomicBool,
+}
+
+impl WriteWatermark {
+    fn new() -> Self {
+        Self {
+            submitted: std::sync::atomic::AtomicU64::new(0),
+            completed: std::sync::atomic::AtomicU64::new(0),
+            waiters: std::sync::atomic::AtomicUsize::new(0),
+            drained: tokio::sync::Notify::new(),
+            dead: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// One write/fsync entered this lane's channel.
+    fn note_submitted(&self) {
+        self.submitted
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// One write/fsync terminally resolved (CQE, refusal, or teardown).
+    fn note_completed(&self) {
+        self.completed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.waiters.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            self.drained.notify_waiters();
+        }
+    }
+
+    /// The worker thread is gone (all exit paths, including refused
+    /// open/ring setup where channel residue was dropped unaccounted).
+    fn mark_dead(&self) {
+        self.dead.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.drained.notify_waiters();
+    }
+
+    /// Park until `completed ≥ target` (the DUR-2 drain). Errors loud if
+    /// the worker died — a barrier must fail, never falsely complete.
+    async fn wait_completed(&self, target: u64) -> Result<()> {
+        use std::sync::atomic::Ordering::SeqCst;
+        /// Cancellation-safe waiter count (a dropped barrier future must
+        /// not leave the completer notifying forever).
+        struct WaiterGuard<'a>(&'a WriteWatermark);
+        impl Drop for WaiterGuard<'_> {
+            fn drop(&mut self) {
+                self.0.waiters.fetch_sub(1, SeqCst);
+            }
+        }
+        loop {
+            if self.completed.load(SeqCst) >= target {
+                return Ok(());
+            }
+            if self.dead.load(SeqCst) {
+                return Err(crate::error::SqueezefsError::InvalidOperation(
+                    "NvmeBlockDev worker shut down during data-device barrier drain".to_string(),
+                ));
+            }
+            // Dekker registration: publish waiter presence, arm the
+            // Notify (enable = registered for notify_waiters), THEN
+            // re-check — the completer's SeqCst pair cannot miss us.
+            self.waiters.fetch_add(1, SeqCst);
+            let _g = WaiterGuard(self);
+            let mut notified = std::pin::pin!(self.drained.notified());
+            notified.as_mut().enable();
+            if self.completed.load(SeqCst) >= target || self.dead.load(SeqCst) {
+                continue;
+            }
+            notified.await;
+        }
+    }
+}
+
 struct UringWorker {
     /// Dropped first in `Drop` so the worker observes disconnect and drains.
     tx: Option<crossbeam::channel::Sender<UringRequest>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// The lane's DUR-2 write watermark (see [`WriteWatermark`]).
+    wm: Arc<WriteWatermark>,
 }
 
 /// P1-6: bound io_uring request queue to apply backpressure under overload.
@@ -319,12 +439,19 @@ const URING_REQ_QUEUE_CAP: usize = 4096;
 impl UringWorker {
     fn new(device_path: String) -> Self {
         let (tx, rx) = crossbeam::channel::bounded(URING_REQ_QUEUE_CAP);
+        let wm = Arc::new(WriteWatermark::new());
+        let worker_wm = wm.clone();
         let thread = std::thread::spawn(move || {
-            worker_thread_loop(device_path, rx);
+            worker_thread_loop(device_path, rx, &worker_wm);
+            // Every exit path (normal drain, refused O_DIRECT open,
+            // refused ring build) lands here: unreachable watermark
+            // targets fail parked barriers loud instead of forever.
+            worker_wm.mark_dead();
         });
         Self {
             tx: Some(tx),
             thread: Some(thread),
+            wm,
         }
     }
 
@@ -407,7 +534,11 @@ fn build_worker_ring(entries: u32) -> std::io::Result<(IoUring, &'static str)> {
     Ok((IoUring::new(entries)?, "plain"))
 }
 
-fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<UringRequest>) {
+fn worker_thread_loop(
+    device_path: String,
+    rx: crossbeam::channel::Receiver<UringRequest>,
+    wm: &WriteWatermark,
+) {
     // TEST-1 env seam (`SQUEEZEFS_TEST_POWER_CUT_DEVS`): read ONCE per
     // worker, zero cost unset, never set in production.
     crate::dev_power_cut::arm_from_env(&device_path);
@@ -538,8 +669,10 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
     /// dest owner token drops FIRST — the DMA is over, so the
     /// destination's owner (the transport ent re-arm gate) is released
     /// before the caller oneshot can possibly produce a reply; the happy
-    /// path therefore never pays a spurious commit park.
-    fn complete_one(act: ActiveReq, io_res: std::io::Result<usize>) {
+    /// path therefore never pays a spurious commit park. The write
+    /// watermark bumps BEFORE the caller oneshot for the same reason a
+    /// barrier drain keyed on it must not depend on caller scheduling.
+    fn complete_one(act: ActiveReq, io_res: std::io::Result<usize>, wm: &WriteWatermark) {
         let ActiveReq {
             response,
             free_ptr,
@@ -562,6 +695,12 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                 let _ = tx.send(finish_read(io_res, bytes, size, offset));
             }
             UringResponse::Write { tx } => {
+                // DUR-2 watermark: writes AND fsyncs ride
+                // `UringResponse::Write`, and both count symmetrically at
+                // submit, so the ledger stays exact (an asymmetric count
+                // would let an unrelated fsync completion "cover" a
+                // pending write in a barrier drain).
+                wm.note_completed();
                 let mapped = io_res.map(|_| ()).map_err(crate::error::SqueezefsError::Io);
                 let _ = tx.send(mapped);
             }
@@ -699,6 +838,32 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                     }
                 }
                 UringRequest::Write { offset, data, tx } => {
+                    // Test seam: deterministic slow-DMA stall (the read
+                    // seam's twin) — the write is already accounted
+                    // submitted on its lane's watermark, so the DUR-2
+                    // cross-lane drain property under test spans this
+                    // window exactly like an in-flight fabric DMA.
+                    loop {
+                        let cur = STALL_NEXT_WRITES.load(std::sync::atomic::Ordering::SeqCst);
+                        if cur == 0 {
+                            break;
+                        }
+                        if STALL_NEXT_WRITES
+                            .compare_exchange(
+                                cur,
+                                cur - 1,
+                                std::sync::atomic::Ordering::SeqCst,
+                                std::sync::atomic::Ordering::SeqCst,
+                            )
+                            .is_ok()
+                        {
+                            let ms = STALL_WRITE_MS.load(std::sync::atomic::Ordering::SeqCst);
+                            if ms > 0 {
+                                std::thread::sleep(std::time::Duration::from_millis(ms));
+                            }
+                            break;
+                        }
+                    }
                     let (ptr, len, free_ptr, keep_alive) = match data {
                         WriteData::Aligned { data } => {
                             (data.as_ptr(), data.len(), None, Some(data))
@@ -809,7 +974,7 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                         } else {
                             Ok(res as usize)
                         };
-                        complete_one(act, io_res);
+                        complete_one(act, io_res, wm);
                     }
                     completed_slots.push(slot_idx);
                 }
@@ -833,6 +998,9 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                             )));
                         }
                         UringResponse::Write { tx } => {
+                            // DUR-2 watermark: a refusal is a terminal
+                            // resolution.
+                            wm.note_completed();
                             let _ = tx.send(Err(crate::error::SqueezefsError::Io(
                                 std::io::Error::new(
                                     std::io::ErrorKind::Other,
@@ -876,7 +1044,7 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                     } else {
                         Ok(res as usize)
                     };
-                    complete_one(act, io_res);
+                    complete_one(act, io_res, wm);
                 }
 
                 completed_slots.push(slot_idx);
@@ -900,6 +1068,8 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
         match req {
             UringRequest::Write { data, tx, .. } => {
                 release_write_buf(&data);
+                // DUR-2 watermark: teardown is a terminal resolution.
+                wm.note_completed();
                 let _ = tx.send(Err(crate::error::SqueezefsError::InvalidOperation(
                     "NvmeBlockDev worker shutting down".to_string(),
                 )));
@@ -910,6 +1080,7 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                 )));
             }
             UringRequest::Fsync { tx, .. } => {
+                wm.note_completed();
                 let _ = tx.send(Err(crate::error::SqueezefsError::InvalidOperation(
                     "NvmeBlockDev worker shutting down".to_string(),
                 )));
@@ -932,6 +1103,8 @@ fn worker_thread_loop(device_path: String, rx: crossbeam::channel::Receiver<Urin
                     )));
                 }
                 UringResponse::Write { tx } => {
+                    // DUR-2 watermark: teardown is a terminal resolution.
+                    wm.note_completed();
                     let _ = tx.send(Err(crate::error::SqueezefsError::InvalidOperation(
                         "NvmeBlockDev worker shutting down".to_string(),
                     )));
@@ -1014,14 +1187,39 @@ impl DeviceFence {
 #[derive(Clone)]
 pub struct NvmeBlockDev {
     pub device_path: String,
-    /// Lane 0: writes, barriers, probes (and reads when the pool is 1).
+    /// Lane 0: barriers and probes always; writes when un-armed
+    /// (`write_lanes == 1`, every offline tool/test); reads when the
+    /// pool is 1.
     worker: Arc<UringWorker>,
-    /// READ submission fan-out (read-queue-wall campaign): reads
-    /// round-robin these workers so submissions spread across blk-mq
-    /// software queues (per submitting CPU) — see [`read_lanes_for`].
-    /// Always contains lane 0; grows via [`Self::set_read_lanes`].
-    read_pool: Arc<arc_swap::ArcSwap<Vec<Arc<UringWorker>>>>,
+    /// I/O submission fan-out pool (read-queue-wall 2026-08-06 +
+    /// write-lane-fanout 2026-08-07): full [`UringWorker`]s on the same
+    /// device (own thread, own ring, own O_DIRECT fd), so their
+    /// submissions map to DIFFERENT blk-mq software queues (per-CPU) and
+    /// therefore different fabric queues/connections — see
+    /// [`io_lanes_for`]. Reads round-robin the first `read_lanes` lanes;
+    /// writes offset-affinity over the first `write_lanes` lanes. Always
+    /// contains lane 0; grows via [`Self::set_read_lanes`] /
+    /// [`Self::set_write_lanes`].
+    lane_pool: Arc<arc_swap::ArcSwap<Vec<Arc<UringWorker>>>>,
     lane_rr: Arc<std::sync::atomic::AtomicUsize>,
+    /// Reads round-robin the first `read_lanes` pool lanes (monotone;
+    /// 1 = the prior single-worker posture).
+    read_lanes: Arc<std::sync::atomic::AtomicUsize>,
+    /// Writes spread by BLOCK-OFFSET AFFINITY over the first
+    /// `write_lanes` pool lanes (monotone; 1 = the pre-fanout posture —
+    /// every write on lane 0). Affinity, never round-robin: same block →
+    /// same lane → same channel FIFO → same connection, so two DMAs
+    /// naming one device offset keep exactly the per-offset submission
+    /// order the single worker gave (see [`write_lane_index`]).
+    write_lanes: Arc<std::sync::atomic::AtomicUsize>,
+    /// The write-affinity grain = the volume block size, handed by the
+    /// arming site ([`Self::set_write_lanes`], re-stamped by
+    /// `DataRouter::set_block_size` at FUSE init) — a derivation from
+    /// the volume format, never a constant. Never read while
+    /// `write_lanes == 1`, and affinity is a structural-preservation
+    /// property, not a correctness dependency (per-offset serialization
+    /// lives above the device layer), so the init-time re-stamp is safe.
+    write_grain: Arc<std::sync::atomic::AtomicU64>,
     node_probe: Arc<NodeProbe>,
     /// RES-6: the D0 writer-guard fence, shared across clones (they
     /// describe the same device). Wired by `DataRouter::set_meta_backend`
@@ -1095,23 +1293,52 @@ fn coarse_monotonic_ms() -> u64 {
     START.elapsed().as_millis() as u64
 }
 
-/// Read-lane fan-out derivation (2026-08-06 read-queue-wall campaign —
-/// the flat field D-ladder's device-plane term): ONE submitting thread
-/// per device is ONE blk-mq software queue is ONE nvme-tcp connection is
-/// ONE RX softirq core, and nvme-tcp RX pays the per-byte kernel copy on
-/// that core (~2.7 GB/s/core measured class) — 8 field namespaces × one
-/// core ≈ the 22 GB/s read wall, invariant to any client-side depth
-/// (local written-region discriminator: 1 submitter/dev qd16 → qd32 =
-/// 11.5 → 12.1 GB/s, while 4 submitters/dev at the SAME in-flight =
-/// 16.7). Writes escape it (TX is zero-copy spliced — the same single
-/// workers sustain 34 GB/s), so only READ submission fans out.
+/// I/O-lane fan-out derivation — ONE term for both planes: "submitting
+/// CPUs per device".
+///
+/// Reads (2026-08-06 read-queue-wall campaign — the flat field D-ladder's
+/// device-plane term): ONE submitting thread per device is ONE blk-mq
+/// software queue is ONE nvme-tcp connection is ONE RX softirq core, and
+/// nvme-tcp RX pays the per-byte kernel copy on that core (~2.7
+/// GB/s/core measured class) — 8 field namespaces × one core ≈ the 22
+/// GB/s read wall, invariant to any client-side depth (local
+/// written-region discriminator: 1 submitter/dev qd16 → qd32 = 11.5 →
+/// 12.1 GB/s, while 4 submitters/dev at the SAME in-flight = 16.7).
+///
+/// Writes (2026-08-07 write-lane-fanout campaign): the read campaign's
+/// "writes escape it" held only up to the TX splice's HIGHER
+/// per-connection ceiling — the field decomposition walls kernel seq
+/// writes at 35.31 GB/s = 7.06 GB/s × 5 data namespaces
+/// (`write_pipeline_phase_ns` dma mode 2–8 ms, interior µs-clean; the
+/// depth governor pinned at base with probe_ups 20 = backoffs 20 — depth
+/// into a per-connection wall converts nothing) while raw fio reaches
+/// 49.7 GB/s on the SAME namespaces by spreading queues. So DATA WRITES
+/// fan out with the SAME derivation, by block-offset affinity (see
+/// [`write_lane_index`]).
 ///
 /// The count derives — never a constant: `cpus / data_devices`, floor 1
-/// (a device never loses its worker), self-bounded by `cpus` (total read
-/// threads ≈ the machine, the raw row's own shape when devices = 1).
-/// Explicit `SQUEEZEFS_NVME_READ_LANES` wins verbatim at the arming site.
-pub fn read_lanes_for(cpus: usize, data_devices: usize) -> usize {
+/// (a device never loses its worker), self-bounded by `cpus` (total
+/// submitting threads per plane ≈ the machine, the raw row's own shape
+/// when devices = 1). Explicit `SQUEEZEFS_NVME_READ_LANES` /
+/// `SQUEEZEFS_NVME_WRITE_LANES` win verbatim at the arming site.
+pub fn io_lanes_for(cpus: usize, data_devices: usize) -> usize {
     (cpus / data_devices.max(1)).clamp(1, cpus.max(1))
+}
+
+/// The write-lane pick — a PURE function of the block offset:
+/// `(offset / grain) % lanes`, grain = the volume block size. Same block
+/// → same lane → same channel FIFO → same submission queue/connection,
+/// so every pair of DMAs naming one device offset (supersession /
+/// in-place-overwrite / W1 sub-block patch shapes) keeps the per-offset
+/// SUBMISSION order the single worker provided — structurally, not by
+/// caller discipline. (Completion order was never guaranteed even on
+/// one lane — no `IO_LINK`/`IO_DRAIN`, NVMe completes out of order —
+/// which is why per-offset serialization lives above the device layer:
+/// `BLOCK_FLUSH_LOCKS`, awaited DMAs before dependent publishes, the W1
+/// §5.1 fence. The affinity preserves the status quo and adds no new
+/// reordering surface.) Degenerate inputs floor at lane 0.
+pub fn write_lane_index(offset: u64, grain: u64, lanes: usize) -> usize {
+    ((offset / grain.max(1)) % lanes.max(1) as u64) as usize
 }
 
 impl NvmeBlockDev {
@@ -1119,8 +1346,11 @@ impl NvmeBlockDev {
         let worker = Arc::new(UringWorker::new(device_path.to_string()));
         Self {
             device_path: device_path.to_string(),
-            read_pool: Arc::new(arc_swap::ArcSwap::from_pointee(vec![worker.clone()])),
+            lane_pool: Arc::new(arc_swap::ArcSwap::from_pointee(vec![worker.clone()])),
             lane_rr: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            read_lanes: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            write_lanes: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            write_grain: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             worker,
             node_probe: Arc::new(NodeProbe {
                 at_ms: std::sync::atomic::AtomicU64::new(0),
@@ -1209,23 +1439,17 @@ impl NvmeBlockDev {
         self.fence_gate(None)
     }
 
-    /// Grow the READ submission pool to `n` lanes (see [`read_lanes_for`]
-    /// — the read-queue-wall campaign). Lane 0 is the construction
-    /// worker; extra lanes are full [`UringWorker`]s on the same device
-    /// (own thread, own ring, own O_DIRECT fd), so their submissions map
-    /// to DIFFERENT blk-mq software queues (per-CPU) and therefore
-    /// different fabric queues/RX cores. **Reads only** round-robin the
-    /// pool; writes, barriers and probes stay on lane 0 (the ordering and
-    /// DUR-2 barrier reasoning is untouched — a device flush is
-    /// device-wide regardless of the submitting queue, and callers
-    /// barrier only after their writes completed). Monotone: the pool
+    /// Grow the shared submission pool to at least `n` lanes. Lane 0 is
+    /// the construction worker; extra lanes are full [`UringWorker`]s on
+    /// the same device (own thread, own ring, own O_DIRECT fd), so their
+    /// submissions map to DIFFERENT blk-mq software queues (per-CPU) and
+    /// therefore different fabric queues/RX cores. Monotone: the pool
     /// only grows (shrink = the A/B lever's remount); idempotent and
     /// latch-free (ArcSwap — in-flight requests keep their lane alive by
-    /// Arc).
-    pub fn set_read_lanes(&self, n: usize) {
-        let n = n.max(1);
+    /// Arc; a lost CAS race drops only freshly-spawned idle workers).
+    fn grow_pool(&self, n: usize) {
         loop {
-            let cur = self.read_pool.load_full();
+            let cur = self.lane_pool.load_full();
             if cur.len() >= n {
                 return;
             }
@@ -1233,33 +1457,123 @@ impl NvmeBlockDev {
             while next.len() < n {
                 next.push(Arc::new(UringWorker::new(self.device_path.clone())));
             }
-            let prev = self.read_pool.compare_and_swap(&cur, Arc::new(next));
+            let prev = self.lane_pool.compare_and_swap(&cur, Arc::new(next));
             if Arc::ptr_eq(&prev, &cur) {
-                log::info!(
-                    "NvmeBlockDev {}: read submission fan-out armed ({} lanes)",
-                    self.device_path,
-                    n
-                );
                 return;
             }
         }
     }
 
+    /// Arm `n` READ submission lanes (see [`io_lanes_for`] — the
+    /// read-queue-wall campaign). Reads round-robin the first `n` pool
+    /// lanes; monotone.
+    pub fn set_read_lanes(&self, n: usize) {
+        let n = n.max(1);
+        self.grow_pool(n);
+        let prev = self
+            .read_lanes
+            .fetch_max(n, std::sync::atomic::Ordering::Relaxed);
+        if n > prev {
+            log::info!(
+                "NvmeBlockDev {}: read submission fan-out armed ({} lanes)",
+                self.device_path,
+                n
+            );
+        }
+    }
+
+    /// Arm `n` DATA-WRITE submission lanes with affinity `grain` = the
+    /// volume block size (see [`io_lanes_for`] + [`write_lane_index`] —
+    /// the write-lane-fanout campaign, 2026-08-07). Writes spread by
+    /// block-offset affinity over the first `n` pool lanes; barriers and
+    /// probes keep lane 0, and [`Self::flush`] drains EVERY lane's write
+    /// watermark before the device Fsync issues. Monotone lane count;
+    /// the grain re-stamps freely (it is a structural-affinity term, not
+    /// a correctness dependency — see the field doc).
+    pub fn set_write_lanes(&self, n: usize, grain: u64) {
+        let n = n.max(1);
+        self.grow_pool(n);
+        self.write_grain
+            .store(grain.max(1), std::sync::atomic::Ordering::Relaxed);
+        let prev = self
+            .write_lanes
+            .fetch_max(n, std::sync::atomic::Ordering::Relaxed);
+        if n > prev {
+            log::info!(
+                "NvmeBlockDev {}: write submission fan-out armed ({} lanes, {} B affinity grain)",
+                self.device_path,
+                n,
+                grain.max(1)
+            );
+        }
+    }
+
+    /// Re-stamp the write-affinity grain (the `DataRouter::set_block_size`
+    /// hook: the mount arms lanes before FUSE init reads the configured
+    /// block size).
+    pub fn set_write_lane_grain(&self, grain: u64) {
+        self.write_grain
+            .store(grain.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Live read-lane count (`data_read_lanes` stats face; 1 = the prior
     /// single-worker posture).
     pub fn read_lanes(&self) -> usize {
-        self.read_pool.load().len()
+        self.read_lanes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Live write-lane count (`data_write_lanes` stats face; 1 = the
+    /// pre-fanout posture — every write on lane 0).
+    pub fn write_lanes(&self) -> usize {
+        self.write_lanes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Per-pool-lane `(writes_submitted, writes_completed)` watermarks —
+    /// the lane-spread ENGAGEMENT instrument (`data_write_lane_submits`
+    /// on the stats inode: a fan-out row is invalid unless > 1 lane's
+    /// submit counter moved) and the flush-drain contract's test face.
+    pub fn write_lane_watermarks(&self) -> Vec<(u64, u64)> {
+        self.lane_pool
+            .load()
+            .iter()
+            .map(|w| {
+                (
+                    w.wm.submitted.load(std::sync::atomic::Ordering::SeqCst),
+                    w.wm.completed.load(std::sync::atomic::Ordering::SeqCst),
+                )
+            })
+            .collect()
     }
 
     /// Round-robin pick for one READ submission (lock-free; the returned
     /// Arc keeps the lane alive across the request's lifetime).
     fn read_lane_pick(&self) -> Arc<UringWorker> {
-        let pool = self.read_pool.load();
+        let pool = self.lane_pool.load();
+        let lanes = self
+            .read_lanes
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(pool.len())
+            .max(1);
         let idx = self
             .lane_rr
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            % pool.len();
+            % lanes;
         pool[idx].clone()
+    }
+
+    /// Block-offset-affinity pick for one WRITE submission (lock-free;
+    /// see [`write_lane_index`]). `write_lanes == 1` (every un-armed
+    /// device) short-circuits to the construction worker — byte-for-byte
+    /// the pre-fanout posture.
+    fn write_lane_pick(&self, offset: u64) -> Arc<UringWorker> {
+        let lanes = self.write_lanes.load(std::sync::atomic::Ordering::Relaxed);
+        if lanes <= 1 {
+            return self.worker.clone();
+        }
+        let pool = self.lane_pool.load();
+        let lanes = lanes.min(pool.len()).max(1);
+        let grain = self.write_grain.load(std::sync::atomic::Ordering::Relaxed);
+        pool[write_lane_index(offset, grain, lanes)].clone()
     }
 
     /// RES-6: wire the D0 writer-guard fence probe (the SAME per-volume
@@ -1334,6 +1648,18 @@ impl NvmeBlockDev {
     /// everything written before the barrier started, so a caller that
     /// awaited its DMAs can name those blocks in durable metadata.
     ///
+    /// Write-lane-fanout (2026-08-07): the barrier orders against ALL
+    /// prior writes on EVERY lane, not just lane 0 — each barrier op
+    /// first drains every lane's write watermark (writes submitted
+    /// before the op started have completed at the device) and only then
+    /// issues the ONE device Fsync on lane 0. A device flush command
+    /// covers only commands the device completed before processing it,
+    /// so without the drain a stalled DMA on another lane would silently
+    /// escape the barrier. (Chosen over an `IO_DRAIN` Fsync fan-out:
+    /// that would order behind in-flight READS sharing each ring — a
+    /// wedged read's 30 s timeout class holding every fsync hostage —
+    /// and pay N device flushes per barrier instead of one.)
+    ///
     /// Concurrent callers coalesce through the metadata plane's
     /// [`crate::meta_backend::sync_coalescer::SyncCoalescer`] — reused,
     /// not re-derived: a caller is released only by an op that STARTED
@@ -1355,14 +1681,23 @@ impl NvmeBlockDev {
                         std::io::Error::from_raw_os_error(code),
                     ));
                 }
+                // The cross-lane drain — BEFORE the coverage frontier and
+                // the Fsync, so every prior write is at the device when
+                // the flush command executes.
+                self.drain_write_lanes().await?;
                 // TEST-1 coverage frontier: everything journaled before
                 // this op started is durable when it completes.
                 let covered = crate::dev_power_cut::mark_barrier_start(&self.device_path);
                 let (tx, rx) = oneshot::channel();
+                // The Fsync rides lane 0's watermark symmetrically (see
+                // `complete_one` — fsyncs and writes share the response
+                // variant, so both must count or neither).
+                self.worker.wm.note_submitted();
                 self.worker
                     .sender()
                     .try_send(UringRequest::Fsync { datasync: true, tx })
                     .map_err(|e| {
+                        self.worker.wm.note_completed();
                         crate::fuse_client::METRICS
                             .uring_queue_full
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1381,6 +1716,29 @@ impl NvmeBlockDev {
                 Ok(())
             })
             .await
+    }
+
+    /// The DUR-2 cross-lane write drain: snapshot every lane's submitted
+    /// watermark FIRST (the barrier covers writes submitted before it
+    /// started; writes racing in behind the snapshot must not extend the
+    /// wait), then park until each lane's completions reach its snapshot.
+    /// Errors loud if a lane's worker died — a barrier fails, it never
+    /// falsely completes.
+    async fn drain_write_lanes(&self) -> Result<()> {
+        let pool = self.lane_pool.load_full();
+        let targets: Vec<(Arc<UringWorker>, u64)> = pool
+            .iter()
+            .map(|w| {
+                (
+                    w.clone(),
+                    w.wm.submitted.load(std::sync::atomic::Ordering::SeqCst),
+                )
+            })
+            .collect();
+        for (w, target) in targets {
+            w.wm.wait_completed(target).await?;
+        }
+        Ok(())
     }
 
     /// zcrx-lane read attempt (design §6). `Some(bytes)` = the lane served
@@ -1616,17 +1974,28 @@ impl NvmeBlockDev {
         let data_len = data.len();
         let alignment = crate::cache::pool::POOLED_BUF_ALIGN;
 
+        // Write-lane-fanout (2026-08-07): block-offset-affinity lane pick
+        // — same block, same lane, same connection (per-offset submission
+        // order preserved structurally). The picked Arc lives past the
+        // await, keeping the lane's worker alive for this request's whole
+        // lifetime; the lane's DUR-2 watermark is bumped BEFORE the send
+        // (balanced by note_completed on every terminal outcome), so a
+        // barrier that starts after this line waits this write out.
+        let lane = self.write_lane_pick(offset);
+
         let rx_oneshot = if (data.as_ptr() as usize) % alignment == 0 && data_len % alignment == 0 {
             let data_type = WriteData::Aligned { data: data.clone() };
             let (tx, rx) = oneshot::channel();
-            self.worker
-                .sender()
+            lane.wm.note_submitted();
+            lane.sender()
                 .try_send(UringRequest::Write {
                     offset,
                     data: data_type,
                     tx,
                 })
                 .map_err(|e| {
+                    // The send never happened: terminally resolved here.
+                    lane.wm.note_completed();
                     crate::fuse_client::METRICS
                         .uring_queue_full
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1718,8 +2087,8 @@ impl NvmeBlockDev {
                  alignment contract"
             );
             let (tx, rx) = oneshot::channel();
-            if self
-                .worker
+            lane.wm.note_submitted();
+            if lane
                 .sender()
                 .try_send(UringRequest::Write {
                     offset,
@@ -1728,7 +2097,9 @@ impl NvmeBlockDev {
                 })
                 .is_err()
             {
-                // Send failed; worker never took ownership. Release immediately.
+                // Send failed; worker never took ownership. Release
+                // immediately (and terminally resolve the watermark).
+                lane.wm.note_completed();
                 if use_pool {
                     // SAFETY: `rp` was `pool.alloc_raw()`'d above and the
                     // worker never took ownership — this is its only release.
@@ -1878,7 +2249,8 @@ impl NvmeBlockDev {
 
         let (tx, rx_oneshot) = oneshot::channel();
         // Read-queue-wall campaign: READ submissions round-robin the lane
-        // pool (writes/barriers stay on lane 0 — see `set_read_lanes`).
+        // pool (writes ride block-offset affinity — `write_lane_pick`;
+        // barriers/probes stay on lane 0).
         // The picked Arc lives past the await, keeping the lane's worker
         // alive for this request's whole lifetime.
         let read_lane = self.read_lane_pick();

@@ -173,6 +173,7 @@ pub static KNOBS: &[Knob] = &[
     k("SQUEEZEFS_READ_LANE", Kind::Bool, "on", "R1b read-lane hold (the shipped default win); 0 = the A0 control."),
     k("SQUEEZEFS_READ_LANE_DEPTH", int(0, 1 << 16), "derived (engage-governor)", "Read-ahead lane depth pin, blocks — unset = probe-governed (probe-adopt-retreat); 0 = ahead-issue off (the hold-only A/B control)."),
     k("SQUEEZEFS_NVME_READ_LANES", int(1, 1024), "derived (cpus / data devices)", "Per-device READ submission fan-out lanes (read-queue-wall campaign); 1 = single-worker A/B posture."),
+    k("SQUEEZEFS_NVME_WRITE_LANES", int(1, 1024), "derived (cpus / data devices)", "Per-device DATA-WRITE submission fan-out lanes, block-offset affinity (write-lane-fanout campaign); 1 = single-worker pre-fanout A/B posture."),
     k("SQUEEZEFS_DIRECT_DEVICE_TRUE", Kind::Bool, "off", "Strict device-true O_DIRECT (the amplification-measurement escape); default serves O_DIRECT like buffered."),
     // -- Copy economy ----------------------------------------------------
     k("SQUEEZEFS_NT_COPY", Kind::Bool, "on", "Non-temporal stores at the two DMA-destined copy sites; 0 = the A/B control."),

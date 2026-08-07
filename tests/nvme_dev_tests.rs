@@ -453,6 +453,16 @@ fn read_bounce_pool_routing_and_home_recycle() {
         read_bounce_pool, ALIGNED_BUF_POOL, RANGED_BUF_POOL, RANGED_BUF_SIZE,
     };
 
+    // The gauges below are process-global: serialize against every test
+    // that checks out pool buffers (pre-existing parallel-observation
+    // flake — a concurrent test's in-flight read bounce holds a pool
+    // slot while this test samples `allocated_bytes`; exact under
+    // `--test-threads=1`, ~40 % failed under the parallel runner even
+    // with the 2026-08-07 write-lane tests skipped).
+    let _serial = WRITE_SERIAL
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .blocking_lock();
+
     // Routing: sub-block windows ride the small pool; whole-block stays big.
     assert!(std::sync::Arc::ptr_eq(
         read_bounce_pool(4096),
@@ -633,9 +643,9 @@ async fn write_lane_pool_spreads_by_offset_and_stays_byte_exact() {
         .iter()
         .map(|(s, _)| *s)
         .collect();
-    for lane in 0..4 {
+    for (lane, (a, b)) in after.iter().zip(before.iter()).enumerate() {
         assert_eq!(
-            after[lane] - before.get(lane).copied().unwrap_or(0),
+            a - b,
             2,
             "lane {lane} must carry exactly its residue class (blocks {lane} and {})",
             lane + 4
@@ -659,8 +669,8 @@ async fn write_lane_pool_spreads_by_offset_and_stays_byte_exact() {
         .iter()
         .map(|(s, _)| *s)
         .collect();
-    for lane in 0..4 {
-        let delta = after[lane] - before[lane];
+    for (lane, (a, b)) in after.iter().zip(before.iter()).enumerate() {
+        let delta = a - b;
         if lane == 1 {
             assert_eq!(delta, 2, "same block → same lane, every time");
         } else {
@@ -674,10 +684,7 @@ async fn write_lane_pool_spreads_by_offset_and_stays_byte_exact() {
     for b in 0..8u64 {
         let expect = if b == 5 { 0xEEu8 } else { b as u8 + 1 };
         let got = dev.read_block(b * grain, grain as usize).await.unwrap();
-        assert!(
-            got.iter().all(|&x| x == expect),
-            "byte parity block {b}"
-        );
+        assert!(got.iter().all(|&x| x == expect), "byte parity block {b}");
     }
     drop(dev);
 }

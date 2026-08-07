@@ -1631,30 +1631,75 @@ impl BackendRouter {
     /// barrier, so a caller that awaited its DMAs may then commit
     /// metadata naming those blocks. Per-device flushes coalesce with
     /// concurrent callers inside each `NvmeBlockDev`.
-    /// Read-queue-wall campaign (2026-08-06): arm the per-device READ
-    /// submission fan-out — [`crate::nvme_dev::read_lanes_for`]`(cpus,
-    /// devices)` lanes per distinct data device (explicit
-    /// `SQUEEZEFS_NVME_READ_LANES` wins verbatim; `1` = the prior
-    /// single-worker posture, the A/B lever). Called at mount after
-    /// every backend is registered and re-run by the online `volume
-    /// add-data` verb (the device count changed — lane counts only ever
-    /// grow, so a re-arm never shrinks a live pool). Offline
-    /// tools/tests that never call this keep exactly one worker per
-    /// device.
-    pub fn arm_read_lanes(&self) {
+    /// Arm the per-device I/O submission fan-out — read-queue-wall
+    /// campaign (2026-08-06) for READS, write-lane-fanout campaign
+    /// (2026-08-07) for DATA WRITES: [`crate::nvme_dev::io_lanes_for`]
+    /// `(cpus, devices)` lanes per plane per distinct data device
+    /// (explicit `SQUEEZEFS_NVME_READ_LANES` /
+    /// `SQUEEZEFS_NVME_WRITE_LANES` win verbatim; `1` = the prior
+    /// single-worker posture, the A/B lever). The write plane's affinity
+    /// grain is the volume block size (re-stamped by
+    /// [`DataRouter::set_block_size`] at FUSE init — the mount arms
+    /// before the config read). Called at mount after every backend is
+    /// registered and re-run by the online `volume add-data` verb (the
+    /// device count changed — lane counts only ever grow, so a re-arm
+    /// never shrinks a live pool). Offline tools/tests that never call
+    /// this keep exactly one worker per device.
+    pub fn arm_io_lanes(&self) {
         let devices = self.distinct_data_devices();
-        let lanes = match crate::env_knobs::opt_int_knob::<usize>("SQUEEZEFS_NVME_READ_LANES") {
+        let cpus = crate::cpu::process_parallelism();
+        let derived = crate::nvme_dev::io_lanes_for(cpus, devices.len());
+        let read_lanes = match crate::env_knobs::opt_int_knob::<usize>("SQUEEZEFS_NVME_READ_LANES")
+        {
             Some(n) => n.max(1),
-            None => {
-                crate::nvme_dev::read_lanes_for(crate::cpu::process_parallelism(), devices.len())
-            }
+            None => derived,
         };
+        let write_lanes =
+            match crate::env_knobs::opt_int_knob::<usize>("SQUEEZEFS_NVME_WRITE_LANES") {
+                Some(n) => n.max(1),
+                None => derived,
+            };
+        let grain = self
+            .block_size
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .max(1);
         for dev in &devices {
-            dev.set_read_lanes(lanes);
+            dev.set_read_lanes(read_lanes);
+            dev.set_write_lanes(write_lanes, grain);
         }
         crate::fuse_client::METRICS
             .data_read_lanes
-            .store(lanes as u64, std::sync::atomic::Ordering::Relaxed);
+            .store(read_lanes as u64, std::sync::atomic::Ordering::Relaxed);
+        crate::fuse_client::METRICS
+            .data_write_lanes
+            .store(write_lanes as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Re-stamp the write-lane affinity grain on every data device (the
+    /// [`DataRouter::set_block_size`] hook — FUSE init learns the
+    /// configured block size after the mount armed the lanes).
+    pub fn set_write_lane_grain(&self, grain: u64) {
+        for dev in self.distinct_data_devices() {
+            dev.set_write_lane_grain(grain);
+        }
+    }
+
+    /// `data_write_lane_submits` (stats inode): per-device per-lane write
+    /// submit counters, `<backing_dev>=<lane0>,<lane1>,…` — the
+    /// write-lane-fanout ENGAGEMENT instrument (a fan-out row is invalid
+    /// unless more than one lane's counter moved).
+    pub fn data_write_lane_submits(&self) -> Vec<String> {
+        self.distinct_data_devices()
+            .into_iter()
+            .map(|d| {
+                let subs: Vec<String> = d
+                    .write_lane_watermarks()
+                    .iter()
+                    .map(|(s, _)| s.to_string())
+                    .collect();
+                format!("{}={}", d.device_path, subs.join(","))
+            })
+            .collect()
     }
 
     pub async fn flush_data_devices(&self) -> Result<()> {
@@ -6299,6 +6344,9 @@ impl DataRouter {
     pub fn set_block_size(&self, block_size: u64) {
         self.block_size
             .store(block_size, std::sync::atomic::Ordering::Relaxed);
+        // Write-lane-fanout: the affinity grain follows the configured
+        // block size (the mount arms lanes before this config read).
+        self.backend_router.set_write_lane_grain(block_size);
     }
 
     async fn fetch_block_from_remote(&self, block_key: &str) -> Result<bytes::Bytes> {

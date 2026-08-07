@@ -3572,9 +3572,15 @@ pub struct Metrics {
     pub read_lane_covered_skips: Align64<AtomicU64>,
     pub read_lane_wasted: Align64<AtomicU64>,
     /// Read-queue-wall campaign (2026-08-06): per-device READ submission
-    /// lanes armed at mount (`read_lanes_for(cpus, devices)`; 1 = the
+    /// lanes armed at mount (`io_lanes_for(cpus, devices)`; 1 = the
     /// prior single-worker posture — the A/B lever).
     pub data_read_lanes: Align64<AtomicU64>,
+    /// Write-lane-fanout campaign (2026-08-07): per-device DATA-WRITE
+    /// submission lanes armed at mount (same `io_lanes_for` derivation,
+    /// block-offset affinity; 1 = the pre-fanout posture — the
+    /// `SQUEEZEFS_NVME_WRITE_LANES=1` A/B lever). Per-lane engagement is
+    /// `data_write_lane_submits`.
+    pub data_write_lanes: Align64<AtomicU64>,
     pub read_lane_depth_target: Align64<AtomicU64>,
     /// The READ copy ledger (read-copy-count campaign, 2026-08-02): every
     /// daemon CPU pass over read payload bytes is attributed to exactly
@@ -6378,9 +6384,10 @@ impl SqueezefsFilesystem {
             .publish_backend(&record.id, backend)
             .map_err(|e| format!("backend publish failed after the durable commit: {e}"))?;
         self.router.backend_router.set_volume_records(records);
-        // Read-queue-wall campaign: the device count changed — re-derive
-        // the per-device read-lane fan-out (monotone; never shrinks).
-        self.router.backend_router.arm_read_lanes();
+        // Read-queue-wall + write-lane-fanout campaigns: the device
+        // count changed — re-derive the per-device I/O lane fan-out
+        // (monotone; never shrinks).
+        self.router.backend_router.arm_io_lanes();
         info!(
             "volume add-data: '{}' added as {} ({} bytes) — durable record committed, \
              placement enabled",
@@ -7274,6 +7281,11 @@ impl SqueezefsFilesystem {
                 "read_lane_covered_skips": METRICS.read_lane_covered_skips.load(Ordering::Relaxed),
                 "read_lane_wasted": METRICS.read_lane_wasted.load(Ordering::Relaxed),
                 "data_read_lanes": METRICS.data_read_lanes.load(Ordering::Relaxed),
+                "data_write_lanes": METRICS.data_write_lanes.load(Ordering::Relaxed),
+                // Write-lane-fanout engagement: per-device per-lane write
+                // submit counters (a fan-out row is invalid unless more
+                // than one lane's counter moved).
+                "data_write_lane_submits": self.router.backend_router.data_write_lane_submits(),
                 "read_lane_depth_target": METRICS.read_lane_depth_target.load(Ordering::Relaxed),
                 "read_lane_depth_probe_ups": self.router.read_lane_probe_ups(),
                 "read_lane_depth_probe_backoffs": self.router.read_lane_probe_backoffs(),

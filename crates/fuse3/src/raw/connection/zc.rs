@@ -61,36 +61,67 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use crate::raw::abi::fuse_opcode;
+use crate::raw::connection::kmbuf::KmbufTrack;
 
-/// Out-direction paged opcodes on a zc queue: the kernel builds these
-/// requests with `args->out_pages = true`, so their reply bodies are
-/// NEVER copied from the kmbuf at COMMIT — they must ride the slot.
-/// (fs/fuse: `fuse_do_readfolio`/`fuse_readahead`/`fuse_direct_io` for
-/// READ, `fuse_readlink_folio` for READLINK.)
+/// Out-direction paged opcodes on a zc queue, **keyed by kernel track**
+/// (out-paged-mirror divergence fix, 2026-08-06): the kernel builds
+/// these requests with `args->out_pages = true`, so their reply bodies
+/// are NEVER copied from the kmbuf at COMMIT — they must ride the slot.
+/// The per-opcode `out_pages` choice is a property of the running
+/// kernel's FUSE TREE, not of the zc series, so each track carries its
+/// own measured-and-source-verified set:
 ///
-/// READDIR/READDIRPLUS are deliberately NOT here — **measured on the
-/// deployed 6.19.14-sqz** (fuse-zc-serve field probe, 2026-08-06):
-/// every body-carrying readdir reply arrives with a kmbuf attachment
-/// and the kernel copies it (each bridged attempt failed its slot fetch
-/// and fell back, +1 `fuse3_zc_fallbacks` per `ls`), so their replies
-/// ride the ordinary kmbuf path. A kernel that DOES zc readdir surfaces
-/// as the loud no-attachment EIO guard — a mirror miss is loud in both
-/// directions (see the module doc).
-pub fn out_paged(opcode: u32) -> bool {
-    opcode == fuse_opcode::FUSE_READ as u32 || opcode == fuse_opcode::FUSE_READLINK as u32
+/// * **6.19-sqz** (elrepo EL8 base — VANILLA fuse readdir, kvmalloc
+///   buffer): {READ, READLINK}. Field-measured 2026-08-06 (`7eccd53a`):
+///   every body-carrying readdir reply arrives kmbuf-attached and the
+///   kernel copies it (each bridged attempt failed its slot fetch and
+///   fell back, +1 `fuse3_zc_fallbacks` per `ls`).
+/// * **7.1-sqz** (CachyOS 7.1.6 base, whose fuse tree carries the
+///   page-buffer readdir — `fuse_readdir_alloc_buf` sets
+///   `ap->args.out_pages = true`): {READ, READLINK, READDIR,
+///   READDIRPLUS}. Source-verified in the shipping package's own tree
+///   AND live-proven: the un-keyed mirror EIO'd every `getdents64` on
+///   an armed 7.1 mount (the loud no-attachment guard — the reverse
+///   miss direction).
+///
+/// Uncertainty degrades SAFELY toward inclusion: an op listed here that
+/// the running kernel actually serves copyable fails its slot fetch and
+/// falls back to the kmbuf attachment (+1 fallback, output correct — a
+/// vanilla-fuse 7.1 build would pay one clean fallback per readdir);
+/// an op NOT listed that the kernel zc's hits the no-attachment EIO
+/// guard — loud, never garbage, naming the op + track (see the module
+/// doc).
+pub fn out_paged(opcode: u32, track: KmbufTrack) -> bool {
+    if opcode == fuse_opcode::FUSE_READ as u32 || opcode == fuse_opcode::FUSE_READLINK as u32 {
+        return true;
+    }
+    match track {
+        KmbufTrack::Sqz619 => false,
+        KmbufTrack::Sqz71 => {
+            opcode == fuse_opcode::FUSE_READDIR as u32
+                || opcode == fuse_opcode::FUSE_READDIRPLUS as u32
+        }
+    }
 }
 
-/// In-direction paged opcodes on a zc queue: the kernel registers the
-/// caller's SOURCE pages instead of copying them into the kmbuf, so the
-/// payload announced by `payload_sz` lives in the slot and must be
-/// extracted through the ring before dispatch. (`fuse_send_write` /
-/// the writeback path — `args->in_pages = true`.) FUSE_IOCTL's
+/// In-direction paged opcodes on a zc queue, keyed by kernel track for
+/// symmetry with [`out_paged`] (both tracks' fuse trees agree today):
+/// the kernel registers the caller's SOURCE pages instead of copying
+/// them into the kmbuf, so the payload announced by `payload_sz` lives
+/// in the slot and must be extracted through the ring before dispatch.
+/// (`fuse_fill_write_pages` / `fuse_direct_io` write / the writeback
+/// path — `args->in_pages = true` — on BOTH trees.) FUSE_IOCTL's
 /// in-paged shape is deliberately NOT extracted: this daemon serves no
 /// data ioctls, and its ddir can be DEST (out wins), which would refuse
 /// a source-direction ring op anyway — the delivery keeps an empty
-/// payload and the tripwire counts it.
-pub fn in_paged(opcode: u32) -> bool {
-    opcode == fuse_opcode::FUSE_WRITE as u32
+/// payload and the tripwire counts it. FUSE_NOTIFY_REPLY (in-paged on
+/// both trees) is unreachable: this daemon never issues retrieves.
+pub fn in_paged(opcode: u32, track: KmbufTrack) -> bool {
+    match track {
+        // Both tracks agree today; the exhaustive match is what forces a
+        // decision the day a track's fuse tree diverges in-direction.
+        KmbufTrack::Sqz619 | KmbufTrack::Sqz71 => opcode == fuse_opcode::FUSE_WRITE as u32,
+    }
 }
 
 /// One queue's zc bounce arena: a **memfd-backed** twin of the classical

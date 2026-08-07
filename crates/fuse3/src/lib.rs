@@ -39,7 +39,8 @@ pub use raw::{
     over_uring_geometry, over_uring_negotiated_write, over_uring_sessions_active, over_uring_stats,
     transport_cq_overflow_stats, transport_lease_stats, transport_reply_integrity_stats,
     transport_wake_stats, zc_fallbacks, zc_negotiated, zc_replies, zc_slot_payload_skips,
-    zc_write_extract_bytes, zc_write_extractions, COMMIT_BATCH_LABELS,
+    zc_write_direct_bytes, zc_write_directs, zc_write_extract_bytes, zc_write_extractions,
+    COMMIT_BATCH_LABELS,
 };
 pub use raw::{
     pin_scope_from_env, read_inplace_replies, read_transport_phase_record,

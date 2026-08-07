@@ -127,6 +127,15 @@ optional = true
 
 [dependencies.tracing]
 version = "0.1.40"
+# The daemon logs through `log`/env_logger and installs no tracing
+# subscriber, so without this feature every transport warn!/error! —
+# including the zc opcode-mirror guards, whose whole design is
+# "loud-never-corrupt" — was structurally INVISIBLE in the daemon log
+# (the 2026-08-06 out-paged-mirror divergence EIO'd every readdir with
+# zero log lines anywhere). With `log`, tracing events emit `log`
+# records when no subscriber is set; env_logger's level filter keeps
+# debug!/trace! hot-path macros short-circuited as before.
+features = ["log"]
 
 [dependencies.trait-make]
 version = "0.1"

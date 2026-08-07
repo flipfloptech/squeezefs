@@ -7576,6 +7576,12 @@ impl SqueezefsFilesystem {
                 // account for its ops/bytes. 0 until a session arms zc.
                 "fuse3_zc_write_extractions": fuse3::zc_write_extractions(),
                 "fuse3_zc_write_extract_bytes": fuse3::zc_write_extract_bytes(),
+                // The D14 write-side DIRECT leg (2026-08-06): FUSE_WRITE
+                // payloads DMA'd slot→device with zero daemon copies —
+                // direct + extract bytes vs a row's user bytes is the
+                // armed-row closure instrument.
+                "fuse3_zc_write_directs": fuse3::zc_write_directs(),
+                "fuse3_zc_write_direct_bytes": fuse3::zc_write_direct_bytes(),
                 // The WRITE twin (transport-ingress campaign): the gauge
                 // is what keeps the in-place arm wired.
                 "fuse3_write_inplace_replies": fuse3::write_inplace_replies(),

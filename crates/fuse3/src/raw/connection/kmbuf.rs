@@ -100,6 +100,23 @@ use tracing::warn;
 // uapi surface of the carried series (SERIES.md; io_uring + fuse halves)
 // ---------------------------------------------------------------------
 
+/// The KERNEL-TRACK identity a resolved opcode pair names (out-paged-
+/// mirror divergence fix, 2026-08-06). The track keys the zc opcode
+/// mirror (`zc::out_paged`/`zc::in_paged`): the kernel's per-opcode
+/// `in_pages`/`out_pages` choice is a property of the running kernel's
+/// FUSE TREE, not of the zc series — the CachyOS 7.1.6 base pages
+/// readdir (`fuse_readdir_alloc_buf`) while the elrepo 6.19 base does
+/// not — so each track carries its own measured mirror set. Resolution
+/// still rides the opcode LADDER probe, never a kernel-version check
+/// (portable-by-default law: the track is a runtime-probed trait).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KmbufTrack {
+    /// 6.19.14-sqz (elrepo EL8 base — vanilla fuse readdir).
+    Sqz619,
+    /// 7.1.x-sqz (CachyOS base — page-buffer readdir).
+    Sqz71,
+}
+
 /// One kernel track's `IORING_(UN)REGISTER_KMBUF_RING` opcode pair.
 ///
 /// The register opcode number is **per kernel track** (series patch 03
@@ -118,6 +135,8 @@ pub struct KmbufOpcodes {
     pub unregister: u32,
     /// Track label for the arm-time log line.
     pub track: &'static str,
+    /// The track identity the zc opcode mirror keys on.
+    pub id: KmbufTrack,
 }
 
 /// The 6.19.14-sqz FIELD track (the deployed EL8 fleet): 37/38.
@@ -125,6 +144,7 @@ pub const KMBUF_OPCODES_SQZ_619: KmbufOpcodes = KmbufOpcodes {
     register: 37,
     unregister: 38,
     track: "6.19-sqz",
+    id: KmbufTrack::Sqz619,
 };
 /// The 7.1-sqz track (`docker/kernel-sqz/patches-7.1/`): 38/39 —
 /// upstream 7.1 took 37 for `IORING_REGISTER_BPF_FILTER`.
@@ -132,6 +152,7 @@ pub const KMBUF_OPCODES_SQZ_71: KmbufOpcodes = KmbufOpcodes {
     register: 38,
     unregister: 39,
     track: "7.1-sqz",
+    id: KmbufTrack::Sqz71,
 };
 /// Probe order: FIELD track first — the deployed fleet resolves on
 /// rung 1, and on 7.1 kernels rung 1's foreign occupant (BPF_FILTER)
@@ -440,6 +461,16 @@ pub fn resolved_opcodes_label() -> String {
     }
 }
 
+/// The resolved KERNEL TRACK the zc opcode mirror keys on (`None` on
+/// stock kernels — no kmbuf surface, so no zc queue ever exists to
+/// consult a mirror).
+pub fn resolved_track() -> Option<KmbufTrack> {
+    match kmbuf_surface() {
+        KmbufSurface::Present(p) => Some(p.id),
+        KmbufSurface::Absent => None,
+    }
+}
+
 /// The session-level transport buffer mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportBufferMode {
@@ -544,6 +575,8 @@ static ZC_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static ZC_SLOT_PAYLOAD_SKIPS: AtomicU64 = AtomicU64::new(0);
 static ZC_WRITE_EXTRACTIONS: AtomicU64 = AtomicU64::new(0);
 static ZC_WRITE_EXTRACT_BYTES: AtomicU64 = AtomicU64::new(0);
+static ZC_WRITE_DIRECTS: AtomicU64 = AtomicU64::new(0);
+static ZC_WRITE_DIRECT_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Set the session's kmbuf negotiation state (0/1) — stored at arm time
 /// by `try_start` (the worker-arm wiring), a level like the geometry
@@ -639,6 +672,33 @@ pub fn zc_write_extractions() -> u64 {
 /// row-validity instrument.
 pub fn zc_write_extract_bytes() -> u64 {
     ZC_WRITE_EXTRACT_BYTES.load(Ordering::Relaxed)
+}
+
+/// Count one COMPLETED zc WRITE **direct** DMA (`WRITE_FIXED(device fd ←
+/// slot)` succeeded — the D14 write-side leg: the payload moved from the
+/// caller's pages STRAIGHT to the device, zero daemon copies, the memfd
+/// extraction never ran) plus its payload bytes. Failed direct attempts
+/// fall back to the extraction vehicle and are counted THERE — never
+/// here — so an armed write row attributes direct vs extracted vs
+/// (never) bounce bytes exactly.
+pub fn note_zc_write_direct(bytes: u64) {
+    ZC_WRITE_DIRECTS.fetch_add(1, Ordering::Relaxed);
+    ZC_WRITE_DIRECT_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// `fuse3_zc_write_directs` (stats inode): FUSE_WRITE payloads that
+/// rode the slot→device direct DMA on a zc-armed queue (D14 write-side
+/// leg). 0 by construction until a session arms zc AND the shape is
+/// eligible.
+pub fn zc_write_directs() -> u64 {
+    ZC_WRITE_DIRECTS.load(Ordering::Relaxed)
+}
+
+/// `fuse3_zc_write_direct_bytes` (stats inode): the byte face of
+/// [`zc_write_directs`] — `direct + extract` bytes vs a write row's user
+/// bytes is the armed-row closure instrument.
+pub fn zc_write_direct_bytes() -> u64 {
+    ZC_WRITE_DIRECT_BYTES.load(Ordering::Relaxed)
 }
 
 // ---------------------------------------------------------------------

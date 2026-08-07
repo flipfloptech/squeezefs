@@ -3666,6 +3666,17 @@ fn queue_worker(
     // composes with kmbuf in this lever (the plan derives width 1 under
     // BufRing), so the per-ring registration keeps its exact shape.
     let zc_mode = pool.buffer_mode == TransportBufferMode::ZeroCopy;
+    // The zc opcode mirror is TRACK-KEYED (2026-08-06 divergence fix):
+    // the running kernel's fuse tree decides which opcodes are paged
+    // (cachyos 7.1 pages readdir; elrepo 6.19 does not), so the worker
+    // captures the ladder-resolved track once. zc_mode ⇒ the surface
+    // probed Present ⇒ a track exists; a None here (impossible by that
+    // chain) simply keeps every request on the kmbuf path.
+    let zc_track: Option<kmbuf::KmbufTrack> = if zc_mode {
+        kmbuf::resolved_track()
+    } else {
+        None
+    };
     let kmbuf_q: Option<Arc<KmbufQueue>> = match pool.buffer_mode {
         TransportBufferMode::BufRing | TransportBufferMode::ZeroCopy => {
             debug_assert_eq!(
@@ -3869,6 +3880,7 @@ fn queue_worker(
         ent: &mut Ent,
         zc_pend_slot: &mut Option<ZcPend>,
         zc_bounce: Option<&Arc<ZcBounce>>,
+        zc_track: Option<kmbuf::KmbufTrack>,
         watch: Option<&SlotWatch>,
         qid: u16,
         gent: usize,
@@ -3881,7 +3893,10 @@ fn queue_worker(
             batch.note_commit_opcode(ent.last_opcode);
             return submit_commit(ring, batch, slots, watch, qid, gent, msg.commit_id);
         }
-        if let Some(zb) = zc_bounce.filter(|_| zc::out_paged(ent.last_opcode)) {
+        if let Some((zb, _)) = zc_bounce
+            .zip(zc_track)
+            .filter(|(_, track)| zc::out_paged(ent.last_opcode, *track))
+        {
             let extra = msg.header.len().saturating_sub(16);
             let body_len = msg.reply_body.len();
             if extra > 0 {
@@ -4029,8 +4044,11 @@ fn queue_worker(
                 kmbuf::note_zc_fallback();
                 warn!(
                     "fuse-over-uring qid={qid} ent={idx}: zc bounce bridge failed \
-                     (res={res}, want={len}, opcode={}) — falling back to {}",
+                     (res={res}, want={len}, opcode={}, kmbuf_ops={}) — the kernel \
+                     served this opcode copyable while zc::out_paged bridges it on \
+                     this track; falling back to {}",
                     ent.last_opcode,
+                    kmbuf::resolved_opcodes_label(),
                     if ent.has_payload_buf() {
                         "the kmbuf attachment"
                     } else {
@@ -4305,6 +4323,7 @@ fn queue_worker(
                         &mut m.ents[idx],
                         &mut m.zc_pend[idx],
                         zc_bounce.as_ref(),
+                        zc_track,
                         pool.slot_watch_cell(qid, idx),
                         qid,
                         gent_of(mi, idx),
@@ -4347,6 +4366,7 @@ fn queue_worker(
                         &mut m.ents[idx],
                         &mut m.zc_pend[idx],
                         zc_bounce.as_ref(),
+                        zc_track,
                         pool.slot_watch_cell(qid, idx),
                         qid,
                         gent_of(mi, idx),
@@ -4789,7 +4809,8 @@ fn queue_worker(
             // lives in the SPARSE SLOT (the kernel registered the
             // caller's source pages instead of copying them) — it must be
             // extracted through the ring before dispatch.
-            let zc_slot_payload = zc_mode && zc::in_paged(opcode) && payload_sz > 0;
+            let zc_slot_payload =
+                zc_track.is_some_and(|track| zc::in_paged(opcode, track)) && payload_sz > 0;
             // The FUSE_IOCTL-class shape: payload announced on a zc queue
             // for an opcode the in-direction mirror does not extract —
             // deliver EMPTY, loudly counted (this daemon serves no data
@@ -4801,8 +4822,10 @@ fn queue_worker(
                 warn!(
                     "fuse-over-uring qid={qid} ent={ent_idx}: zc delivery announced \
                      {payload_sz} payload bytes for opcode {opcode} with no kmbuf \
-                     attachment and no extraction arm — delivering empty \
-                     (fuse3_zc_slot_payload_skips)"
+                     attachment and no extraction arm (kmbuf_ops={}) — the \
+                     in-direction mirror must learn this opcode for this track; \
+                     delivering empty (fuse3_zc_slot_payload_skips)",
+                    kmbuf::resolved_opcodes_label()
                 );
                 kmbuf::note_zc_slot_payload_skip();
             }
@@ -5470,13 +5493,34 @@ fn apply_reply(ent: &mut Ent, header: &[u8], body: &Bytes) {
     ent.hdr_mut().in_out[..OUT_HDR].copy_from_slice(&header[..OUT_HDR]);
 
     if (header.len() > OUT_HDR || !body.is_empty()) && !ent.has_payload_buf() {
-        // kmbuf mode: a body-carrying reply on an ent with no attached
-        // buffer is structurally unreachable (the kernel attaches a
-        // buffer to every request with out args); if it ever fires, the
-        // reply degrades to a loud header-only EIO — never an OOB write.
-        error!(
-            "fuse-over-uring: body-carrying reply on an ent with no              payload buffer (kmbuf attachment law violated) — EIO"
-        );
+        // A body-carrying reply on an ent with no attached buffer. On a
+        // zc session this is THE reverse opcode-mirror miss: the kernel
+        // treated this opcode as PAGED (no kmbuf attach, folio copy
+        // skipped at COMMIT) while `zc::out_paged` calls it copyable —
+        // the 7.1 readdir divergence's exact shape. The reply degrades
+        // to a loud header-only EIO — never an OOB write, never silent
+        // garbage — counted on the mirror tripwire and NAMING the op +
+        // resolved track so the mirror table can be fixed for it.
+        if kmbuf::zc_negotiated() != 0 {
+            kmbuf::note_zc_fallback();
+            error!(
+                "fuse-over-uring: body-carrying reply for opcode {} with no kmbuf \
+                 attachment on a zc session (kmbuf_ops={}) — the kernel treats this \
+                 opcode as out-paged and zc::out_paged does not: fix the mirror for \
+                 this track — committing EIO (fuse3_zc_fallbacks)",
+                ent.last_opcode,
+                kmbuf::resolved_opcodes_label()
+            );
+        } else {
+            // Non-zc kmbuf mode: structurally unreachable (the kernel
+            // attaches a buffer to every request with out args).
+            error!(
+                "fuse-over-uring: body-carrying reply for opcode {} on an ent with \
+                 no payload buffer (kmbuf attachment law violated, kmbuf_ops={}) — EIO",
+                ent.last_opcode,
+                kmbuf::resolved_opcodes_label()
+            );
+        }
         ent.hdr_mut().in_out[..4].copy_from_slice(&((OUT_HDR as u32).to_le_bytes()));
         ent.hdr_mut().in_out[4..8].copy_from_slice(&(-libc::EIO).to_le_bytes());
         ent.hdr_mut().ring_ent_in_out.payload_sz = 0;

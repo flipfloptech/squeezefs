@@ -34,6 +34,29 @@ the kernel lane by design. A bs=1M il libaio row therefore needs the
 daemon mounted with `SQUEEZEFS_IPC_ARENA_MB >= 1024` (slab = 1 MiB); the
 engagement verdict makes any silent passthrough exit nonzero.
 
+## Output convention (`SQZ_DEBUG` — user ruling 2026-08-07)
+
+The rigs here print the **clean summary only** by default:
+
+* `exa_client_perf.sh` — a one-line run header, one `[i/N] row bs pass
+  ...` progress line per pass, the final side-by-side table, and the
+  report path. Nothing else on stdout.
+* `run_fio_row.sh` — the ROW line (with the engagement verdict inline
+  on shim rows) plus the amplification line when `--data-devs` is set.
+* `perf_session.sh` / `d12_session.sh` — their section/progress headers
+  plus one result line per row.
+
+`SQZ_DEBUG=1` restores the full verbose stream — banner headers,
+per-pass runner output, stats-delta listings, cold-discipline verdicts,
+geometry/budget hints, fio chatter — on **stderr**, so stdout stays the
+machine-parseable clean summary in both modes. **Failures are ALWAYS
+verbose** regardless of mode: a FATAL gate trip (require-mount,
+engagement, fio error, tripwire growth) dumps its full diagnostic
+context (captured runner/fio output, the gate arithmetic, the stats
+delta, log tails) to stderr. Gate semantics — checks, thresholds, exit
+codes — are identical in both modes; `exa_client_perf.sh` persists the
+full banner + table to its `$REPORT` artifact either way.
+
 ## The runner
 
 `tests/fio/run_fio_row.sh` turns a `[global]`-shape job file into a
@@ -166,10 +189,12 @@ tests/fio/run_fio_row.sh --job tests/fio/raw_ceiling_write.job \
 
 Our version of the EXA client perf script: one command runs the four
 EXA-parity rows kernel-path first, then through the shim, and prints
-the results side-by-side (aligned table + venue header; persisted to a
-timestamped report under the artifacts dir). Execution rides
-`run_fio_row.sh` verbatim — NUMA fan-out, engagement verification, amp
-columns, and labels all come from the runner.
+the results side-by-side (one-line run header + `[i/N]` progress lines
++ the aligned table by default; the full venue banner persists to the
+timestamped report and streams on `SQZ_DEBUG=1` — see the output
+convention above). Execution rides `run_fio_row.sh` verbatim — NUMA
+fan-out, engagement verification, amp columns, and labels all come
+from the runner.
 
 * **KD-7 screen**: refuses loud before any row when the shim does not
   embed the mounted daemon's `build_commit`.

@@ -212,6 +212,14 @@
 
 #[path = "../../src/meta_backend/kv/alloc_ext_core.rs"]
 pub mod alloc_ext_core;
+/// Stand-in for the production `meta_backend::kv::META_CONVEYOR_QUEUED`
+/// wedge-census gauge (2026-08-07) that `conveyor_core` maintains via
+/// `super::` — here `super` is this crate root, so the static must exist
+/// for the include to compile. Deliberately a STD atomic (the shipped
+/// code names `std::sync::atomic::Ordering` verbatim): it is a display
+/// gauge, not modeled state, and no model asserts on it.
+pub static META_CONVEYOR_QUEUED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 #[path = "../../src/meta_backend/kv/conveyor_core.rs"]
 pub mod conveyor_core;
 #[path = "../../src/cow_core.rs"]

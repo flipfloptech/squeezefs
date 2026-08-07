@@ -100,8 +100,13 @@ raw class degraded vs the reference epoch (tracked in fanout §7 — worth a
 storage-node look before the next absolute-GB/s campaign), and the
 slab-clamp composition residual (gate note §5).
 
-**Host left state**: default-posture mount (no env overrides) on
-`cc5e4ab1` at `/scratch/tmp/test` (`--daemon --interception --allow-other`,
-log `/scratch/tmp/logs/sqz.log`), fresh reset + task-spec 5+5 format,
-mount gate + P0 smoke clean, `data_write_lanes=6` (the shipped derived
-default), tripwires 0.
+**Host left state**: the campaign closed with a fresh cluster reset +
+task-spec 5+5 format and a DEFAULT-posture mount (no env overrides) on
+`cc5e4ab1` at `/scratch/tmp/test` — mount gate + P0 smoke clean,
+`data_write_lanes=6` (the shipped derived default), tripwires 0
+(17:37 local, `fieldconf-0807/restore.sh`). Minutes later the user's own
+session re-took the box (pts/0 login 17:39): unmounted it and started
+their own `SQUEEZEFS_FUSE_ZC=1` mount + `exa_client_perf.sh` battery on
+the SAME deployed `cc5e4ab1` pair — verified healthy from here
+(`data_write_lanes=6`, poisoned/rejects/fence-refusals all 0) and left
+strictly alone.

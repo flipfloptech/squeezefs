@@ -48,7 +48,11 @@ use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 /// ([`ClientStatsPage`] — the hybrid lane gate's shim-side counters,
 /// 2026-08-07). Region arithmetic unchanged (the page always existed,
 /// all-zeroes); coarse bump per the discipline.
-pub const IPC_ABI: u32 = 4;
+/// v5: the slot's reserved word became the **ingress stamp**
+/// ([`IpcSlot::stamp_ingress`] — the reap-fanin campaign's measured
+/// client→daemon ring-ingress term, 2026-08-08). Coarse bump per the
+/// discipline.
+pub const IPC_ABI: u32 = 5;
 
 /// Session mapping magic: `SQZIPC01` little-endian.
 pub const IPC_MAGIC: u64 = u64::from_le_bytes(*b"SQZIPC01");
@@ -447,7 +451,14 @@ pub struct IpcSlot {
     binding: AtomicU64,
     offset: AtomicU64,
     len: AtomicU32,
-    _reserved: AtomicU32,
+    /// Ring-ingress stamp (reap-fanin campaign, 2026-08-08): the CLIENT's
+    /// CLOCK_MONOTONIC low-32 nanoseconds at publish, written between the
+    /// descriptor and `publish_submitted`. The daemon reads it ONCE at
+    /// dequeue and buckets `now − stamp` through [`ingress_delta_ns`] —
+    /// a DISPLAY-ONLY measurement input (§5.3.1 trust boundary: a
+    /// hostile stamp can only pollute a histogram, never steer a serve).
+    /// 0 = never stamped (raw-protocol test clients, pre-v5 shapes).
+    ingress_stamp_ns: AtomicU32,
     arena_off: AtomicU64,
     result: AtomicI64,
 }
@@ -468,10 +479,25 @@ impl IpcSlot {
             binding: AtomicU64::new(0),
             offset: AtomicU64::new(0),
             len: AtomicU32::new(0),
-            _reserved: AtomicU32::new(0),
+            ingress_stamp_ns: AtomicU32::new(0),
             arena_off: AtomicU64::new(0),
             result: AtomicI64::new(0),
         }
+    }
+
+    /// Client: stamp the publish instant (CLOCK_MONOTONIC low-32 ns —
+    /// the `mono_core::monotonic_stamp_ns_u32` clock) between
+    /// [`Self::publish_descriptor`] and `core.publish_submitted()`.
+    /// Relaxed like the descriptor fields: ordered by the submit
+    /// Release / dequeue Acquire edges.
+    pub fn stamp_ingress(&self, ns: u32) {
+        self.ingress_stamp_ns.store(ns, Ordering::Relaxed);
+    }
+
+    /// Daemon: the ONE dequeue read of the ingress stamp (display-only —
+    /// feed it to [`ingress_delta_ns`], never to control flow).
+    pub fn ingress_stamp(&self) -> u32 {
+        self.ingress_stamp_ns.load(Ordering::Relaxed)
     }
 
     /// Client: write the descriptor (between `try_claim` and
@@ -510,6 +536,30 @@ impl IpcSlot {
     pub fn result(&self) -> i64 {
         self.result.load(Ordering::Relaxed)
     }
+}
+
+/// Plausibility ceiling for one ring-ingress residence sample: a u32
+/// CLOCK_MONOTONIC-ns stamp wraps every ~4.295 s, so a same-host delta
+/// at or past 1 s is indistinguishable from wrap ambiguity (or a §5.3.1
+/// hostile scribble) and is DISCARDED, never bucketed. Physical bound,
+/// not tuning: honest same-host ring residence is µs-class.
+pub const INGRESS_PLAUSIBLE_MAX_NS: u64 = 1_000_000_000;
+
+/// The ingress-delta law (reap-fanin campaign, 2026-08-08): turn the
+/// daemon's dequeue-time clock reading and the slot's client-written
+/// stamp into one plausible residence sample. `None` = record nothing
+/// (never-stamped slot, wrap-ambiguous delta, or a hostile stamp — the
+/// stamp is client-writable shm and strictly display-only).
+#[inline]
+pub fn ingress_delta_ns(now_ns: u32, stamp_ns: u32) -> Option<u64> {
+    if stamp_ns == 0 {
+        return None;
+    }
+    let delta = u64::from(now_ns.wrapping_sub(stamp_ns));
+    if delta >= INGRESS_PLAUSIBLE_MAX_NS {
+        return None;
+    }
+    Some(delta)
 }
 
 // ---- layout pins (production shm shapes; loom never builds this file) ----
@@ -699,6 +749,44 @@ mod tests {
         assert_eq!(
             bad_geometry.validate().unwrap_err(),
             HeaderError::Geometry(GeometryError::RingEntriesNotPowerOfTwo)
+        );
+    }
+
+    /// Reap-fanin campaign (2026-08-08): the ingress stamp round-trips
+    /// through the slot, a fresh slot carries none, and the delta law
+    /// discards exactly the never-stamped / wrap-ambiguous / hostile
+    /// classes (the stamp is client-writable shm — display-only).
+    #[test]
+    fn ingress_stamp_roundtrip_and_delta_law() {
+        let slot = IpcSlot::new();
+        assert_eq!(slot.ingress_stamp(), 0, "fresh slot carries no stamp");
+        slot.stamp_ingress(0xdead_beef);
+        assert_eq!(slot.ingress_stamp(), 0xdead_beef);
+
+        // Never-stamped ⇒ no sample.
+        assert_eq!(ingress_delta_ns(1_000, 0), None);
+        // Plausible same-host delta ⇒ the exact ns.
+        assert_eq!(ingress_delta_ns(5_000, 1_000), Some(4_000));
+        // Wrap-safe across the u32 boundary.
+        assert_eq!(ingress_delta_ns(100, u32::MAX - 99), Some(200));
+        // Future-stamped (hostile / skewed) reads as a huge wrapped
+        // delta ⇒ discarded.
+        assert_eq!(ingress_delta_ns(1_000, 2_000), None);
+        // At/past the 1 s wrap-ambiguity ceiling ⇒ discarded.
+        assert_eq!(
+            ingress_delta_ns(2_000_000_500, 400),
+            None,
+            "≥ 1 s is wrap-ambiguous on a u32 ns stamp"
+        );
+        assert_eq!(
+            ingress_delta_ns(1_000_000_001, 1),
+            None,
+            "the 1 s ceiling itself is excluded"
+        );
+        assert_eq!(
+            ingress_delta_ns(999_999_999 + 1, 1),
+            Some(999_999_999),
+            "one below the ceiling records"
         );
     }
 

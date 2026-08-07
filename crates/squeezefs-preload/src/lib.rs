@@ -48,6 +48,12 @@ pub mod thp;
 // and keeps the documented default (§ENG-10's documented asymmetry).
 #[path = "../../squeezefs-ipc/src/env_knob_core.rs"]
 pub mod env_knob_core;
+// The ring-ingress residence clock (reap-fanin campaign, 2026-08-08) —
+// canonical file in the squeezefs-ipc tree, `#[path]`-included here (the
+// publish-side stamper) and by the root crate (the dequeue-side reader),
+// so both ends of the `stamp_ingress` protocol read the ONE clock.
+#[path = "../../squeezefs-ipc/src/mono_core.rs"]
+pub mod mono_core;
 
 /// This shim's build identity (`<full-hash>[-dirty]`, `src/version.rs`
 /// form) — the KD-7 skew-gate key, compared against the daemon's

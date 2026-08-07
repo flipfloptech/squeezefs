@@ -30,6 +30,12 @@ pub mod latency_core;
 // `src/env_knobs.rs` is the registry + startup refusal gate over it.
 #[path = "../crates/squeezefs-ipc/src/env_knob_core.rs"]
 pub mod env_knob_core;
+// The ring-ingress residence clock (reap-fanin campaign, 2026-08-08) —
+// canonical file in the squeezefs-ipc tree, `#[path]`-included here (the
+// dequeue-side reader) and by the preload shim (the publish-side stamper),
+// so both ends of the `stamp_ingress` protocol read the ONE clock.
+#[path = "../crates/squeezefs-ipc/src/mono_core.rs"]
+pub mod mono_core;
 pub mod nvme_dev;
 #[path = "../crates/squeezefs-ipc/src/thp.rs"]
 pub mod thp;

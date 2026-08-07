@@ -821,6 +821,36 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     "FUSE-over-io_uring: classical sideband servicer armed \
                      (primary session; FORGET/INTERRUPT/resend + switchover stragglers)"
                 );
+
+                // zc-write-fusion: register the fused-write dispatcher
+                // with the transport pool — queue workers may now run
+                // small armed WRITE handler futures on their own fused
+                // lanes (zero cross-thread wakes on the store/extract
+                // bridge round trip). The Weak connection breaks the
+                // pool→dispatcher→conn→pool Arc cycle; deliveries that
+                // raced this registration ride the classic dispatch
+                // (counted as fusion demotions).
+                {
+                    use crate::raw::connection::fuse_over_uring::fused::{
+                        FusedFuture, FusedWriteDispatch,
+                    };
+                    use crate::raw::connection::fuse_over_uring::InboundUringReq;
+                    let fs_for_fused = fs.clone();
+                    let conn_weak = Arc::downgrade(&fuse_connection);
+                    let reply_sender = self.response_sender.clone();
+                    let mint = move |req: InboundUringReq| -> FusedFuture {
+                        Box::pin(fused_write_future(
+                            fs_for_fused.clone(),
+                            conn_weak.clone(),
+                            reply_sender.clone(),
+                            req,
+                        ))
+                    };
+                    fuse_connection.set_fused_write_dispatcher(FusedWriteDispatch {
+                        mint: Arc::new(mint),
+                        handle: tokio::runtime::Handle::current(),
+                    });
+                }
             }
         }
 
@@ -2904,7 +2934,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             }
         };
 
-        let mut resp_sender = self.reply_tx(&request);
+        let resp_sender = self.reply_tx(&request);
         let fs = fs.clone();
         // P2 per-op economy, WRITE twin (transport-ingress campaign): on
         // an armed over-uring session the WRITE reply is completed in
@@ -2915,99 +2945,20 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         // saved on the write wall's ACK chain.
         let reply_conn = self.fuse_connection.clone();
 
-        spawn(debug_span!("fuse_write"), async move {
-            crate::raw::read_phase::write_transport_phase_record(
-                crate::raw::read_phase::TransportPhase::DispatchLag,
-                dispatch_t0.elapsed(),
-            );
-            debug!(
-                "write unique {} inode {} {:?}",
-                request.unique, in_header.nodeid, write_in
-            );
-
-            let reply_write = match fs
-                .write(
-                    request,
-                    in_header.nodeid,
-                    write_in.fh,
-                    write_in.offset,
-                    payload,
-                    write_in.write_flags,
-                    write_in.flags,
-                )
-                .await
-            {
-                Err(err) => {
-                    reply_error_in_place(err, request, resp_sender).await;
-
-                    return;
-                }
-
-                Ok(reply_write) => reply_write,
-            };
-
-            let reply_t0 = std::time::Instant::now();
-            let write_out: fuse_write_out = reply_write.into();
-
-            let out_header = fuse_out_header {
-                len: (FUSE_OUT_HEADER_SIZE + FUSE_WRITE_OUT_SIZE) as u32,
-                error: 0,
-                unique: request.unique,
-            };
-
-            let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_WRITE_OUT_SIZE);
-
-            get_bincode_config()
-                .serialize_into(&mut data, &out_header)
-                .expect("won't happened");
-            get_bincode_config()
-                .serialize_into(&mut data, &write_out)
-                .expect("won't happened");
-
-            // In-place reply on an armed session; the channel path stays
-            // for INIT-phase/classical sessions (pool not ready) and any
-            // clone without a connection handle. Error semantics mirror
-            // `reply_fuse`: NotFound = interrupted/double reply (benign);
-            // anything else is logged loud — the session's dispatch task
-            // observes a dead connection through its own read path.
-            match reply_conn.filter(|c| c.over_uring_ready()) {
-                Some(conn) => {
-                    resp_sender.mark_replied();
-                    if let Err(err) = conn
-                        .write_vectored(data, None::<Bytes>, request.slot)
-                        .await
-                        .1
-                    {
-                        if err.kind() == ErrorKind::NotFound {
-                            warn!(
-                                "may reply interrupted fuse request, ignore this error {}",
-                                err
-                            );
-                        } else {
-                            error!("in-place write reply failed {}", err);
-                        }
-                    }
-                    crate::raw::read_phase::note_write_inplace_reply();
-                }
-                None => {
-                    let _ = resp_sender.send(Either::Left(data)).await;
-                }
-            }
-            // `reply_commit`: handler returned → reply committed to the
-            // transport (in-place arm: the synchronous COMMIT enqueue;
-            // the channel arm measures the hand-off — INIT-phase only).
-            crate::raw::read_phase::write_transport_phase_record(
-                crate::raw::read_phase::TransportPhase::ReplyCommit,
-                reply_t0.elapsed(),
-            );
-            if arrival_ns > 0 {
-                let now_ns = crate::raw::read_phase::transport_now_ns();
-                crate::raw::read_phase::write_transport_phase_record(
-                    crate::raw::read_phase::TransportPhase::TransportTotal,
-                    std::time::Duration::from_nanos(now_ns.saturating_sub(arrival_ns)),
-                );
-            }
-        });
+        spawn(
+            debug_span!("fuse_write"),
+            write_handler_body(
+                fs,
+                reply_conn,
+                resp_sender,
+                request,
+                in_header.nodeid,
+                write_in,
+                payload,
+                dispatch_t0,
+                arrival_ns,
+            ),
+        );
     }
 
     #[instrument(level = "debug", skip(self, fs))]
@@ -5028,6 +4979,254 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             let _ = resp_sender.send(Either::Left(data)).await;
         });
     }
+}
+
+/// The FUSE_WRITE handler body — everything after `handle_write`'s
+/// parse/validation: run the filesystem write, then commit the reply
+/// in place (armed sessions) or through the reply channel (INIT-phase/
+/// classical). Extracted (zc-write-fusion campaign, 2026-08-07) so the
+/// SAME body runs from both venues: the classic handler-lane spawn and
+/// the queue worker's fused lane — fusion changes WHERE the future is
+/// polled, never what it does.
+#[allow(clippy::too_many_arguments)] // the parse results + the reply plumbing, verbatim
+async fn write_handler_body<FS: Filesystem + Send + Sync + 'static>(
+    fs: Arc<FS>,
+    reply_conn: Option<Arc<FuseConnection>>,
+    mut resp_sender: ReplyTx,
+    request: Request,
+    nodeid: u64,
+    write_in: fuse_write_in,
+    payload: Bytes,
+    dispatch_t0: std::time::Instant,
+    arrival_ns: u64,
+) {
+    crate::raw::read_phase::write_transport_phase_record(
+        crate::raw::read_phase::TransportPhase::DispatchLag,
+        dispatch_t0.elapsed(),
+    );
+    debug!(
+        "write unique {} inode {} {:?}",
+        request.unique, nodeid, write_in
+    );
+
+    let reply_write = match fs
+        .write(
+            request,
+            nodeid,
+            write_in.fh,
+            write_in.offset,
+            payload,
+            write_in.write_flags,
+            write_in.flags,
+        )
+        .await
+    {
+        Err(err) => {
+            reply_error_in_place(err, request, resp_sender).await;
+
+            return;
+        }
+
+        Ok(reply_write) => reply_write,
+    };
+
+    let reply_t0 = std::time::Instant::now();
+    let write_out: fuse_write_out = reply_write.into();
+
+    let out_header = fuse_out_header {
+        len: (FUSE_OUT_HEADER_SIZE + FUSE_WRITE_OUT_SIZE) as u32,
+        error: 0,
+        unique: request.unique,
+    };
+
+    let mut data = Vec::with_capacity(FUSE_OUT_HEADER_SIZE + FUSE_WRITE_OUT_SIZE);
+
+    get_bincode_config()
+        .serialize_into(&mut data, &out_header)
+        .expect("won't happened");
+    get_bincode_config()
+        .serialize_into(&mut data, &write_out)
+        .expect("won't happened");
+
+    // In-place reply on an armed session; the channel path stays
+    // for INIT-phase/classical sessions (pool not ready) and any
+    // clone without a connection handle. Error semantics mirror
+    // `reply_fuse`: NotFound = interrupted/double reply (benign);
+    // anything else is logged loud — the session's dispatch task
+    // observes a dead connection through its own read path.
+    match reply_conn.filter(|c| c.over_uring_ready()) {
+        Some(conn) => {
+            resp_sender.mark_replied();
+            if let Err(err) = conn
+                .write_vectored(data, None::<Bytes>, request.slot)
+                .await
+                .1
+            {
+                if err.kind() == ErrorKind::NotFound {
+                    warn!(
+                        "may reply interrupted fuse request, ignore this error {}",
+                        err
+                    );
+                } else {
+                    error!("in-place write reply failed {}", err);
+                }
+            }
+            crate::raw::read_phase::note_write_inplace_reply();
+        }
+        None => {
+            let _ = resp_sender.send(Either::Left(data)).await;
+        }
+    }
+    // `reply_commit`: handler returned → reply committed to the
+    // transport (in-place arm: the synchronous COMMIT enqueue;
+    // the channel arm measures the hand-off — INIT-phase only).
+    crate::raw::read_phase::write_transport_phase_record(
+        crate::raw::read_phase::TransportPhase::ReplyCommit,
+        reply_t0.elapsed(),
+    );
+    if arrival_ns > 0 {
+        let now_ns = crate::raw::read_phase::transport_now_ns();
+        crate::raw::read_phase::write_transport_phase_record(
+            crate::raw::read_phase::TransportPhase::TransportTotal,
+            std::time::Duration::from_nanos(now_ns.saturating_sub(arrival_ns)),
+        );
+    }
+}
+
+/// One FUSED WRITE handler invocation (zc-write-fusion campaign): the
+/// dispatch-loop prelude — header/`fuse_write_in` parse, body-bounds
+/// validation, the held-length agreement check — followed by
+/// [`write_handler_body`], as ONE future the queue worker polls on its
+/// fused lane. Every parse refusal replies EINVAL through the same
+/// `ReplyTx` discipline (and a dropped/panicked future's drop-guard
+/// synthesizes — FUSE-2 holds on the fused venue by the same machinery
+/// as the handler lanes).
+#[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
+async fn fused_write_future<FS: Filesystem + Send + Sync + 'static>(
+    fs: Arc<FS>,
+    conn: std::sync::Weak<FuseConnection>,
+    reply_sender: UnboundedSender<FuseReply>,
+    req: crate::raw::connection::fuse_over_uring::InboundUringReq,
+) {
+    // `queue_wait`: CQE reap → first fused poll (the fused twin of the
+    // dispatch pop's stamp; the venues stay comparable in the phase
+    // tables).
+    let mint_t0 = std::time::Instant::now();
+    let arrived_ns = req.arrived_ns;
+    if arrived_ns > 0 {
+        let now_ns = crate::raw::read_phase::transport_now_ns();
+        crate::raw::read_phase::write_transport_phase_record(
+            crate::raw::read_phase::TransportPhase::QueueWait,
+            std::time::Duration::from_nanos(now_ns.saturating_sub(arrived_ns)),
+        );
+    }
+    let Some(conn) = conn.upgrade() else {
+        // Teardown raced the mint: the worker's row-8 drain owns the
+        // slot (this future never took a ReplyTx, so nothing double
+        // synthesizes).
+        return;
+    };
+    if req.header_and_op.len() < FUSE_IN_HEADER_SIZE {
+        // The worker delivers ≥ 40 bytes by construction; a short frame
+        // has no parseable identity — reply EINVAL against the carried
+        // unique so the slot is not stranded.
+        error!(
+            "fused write: short header frame ({} B) for unique {}",
+            req.header_and_op.len(),
+            req.unique
+        );
+        let request = Request {
+            unique: req.unique,
+            uid: 0,
+            gid: 0,
+            pid: 0,
+            slot: req.slot,
+        };
+        let sender = ReplyTx::owing(reply_sender, &request, req.slot, Some(conn));
+        reply_error_in_place(libc::EINVAL.into(), request, sender).await;
+        return;
+    }
+    let in_header = match get_bincode_config()
+        .deserialize::<fuse_in_header>(&req.header_and_op[..FUSE_IN_HEADER_SIZE])
+    {
+        Ok(h) => h,
+        Err(err) => {
+            error!("fused write: fuse_in_header deserialize failed {err}");
+            let request = Request {
+                unique: req.unique,
+                uid: 0,
+                gid: 0,
+                pid: 0,
+                slot: req.slot,
+            };
+            let sender = ReplyTx::owing(reply_sender, &request, req.slot, Some(conn));
+            reply_error_in_place(libc::EINVAL.into(), request, sender).await;
+            return;
+        }
+    };
+    let mut request = Request::from(&in_header);
+    request.slot = req.slot;
+    let request = request;
+    let resp_sender = ReplyTx::owing(reply_sender, &request, req.slot, Some(conn.clone()));
+    // Belt: the worker fuses WRITE deliveries only.
+    if in_header.opcode != fuse_opcode::FUSE_WRITE as u32 {
+        error!(
+            "fused write: non-WRITE opcode {} reached the fused lane (unique {})",
+            in_header.opcode, request.unique
+        );
+        reply_error_in_place(libc::EINVAL.into(), request, resp_sender).await;
+        return;
+    }
+    let op = &req.header_and_op[FUSE_IN_HEADER_SIZE..];
+    if op.len() < FUSE_WRITE_IN_SIZE {
+        error!(
+            "fused write: op frame too short for fuse_write_in ({} B, unique {})",
+            op.len(),
+            request.unique
+        );
+        reply_error_in_place(libc::EINVAL.into(), request, resp_sender).await;
+        return;
+    }
+    let write_in =
+        match get_bincode_config().deserialize::<fuse_write_in>(&op[..FUSE_WRITE_IN_SIZE]) {
+            Ok(w) => w,
+            Err(err) => {
+                error!("fused write: fuse_write_in deserialize failed {err}");
+                reply_error_in_place(libc::EINVAL.into(), request, resp_sender).await;
+                return;
+            }
+        };
+    // The dispatch loop's FUSE-3g/§5.4 payload agreement, fused twin:
+    // the body rides `req.payload` (a lease over the bounce for
+    // extracted deliveries, the EMPTY placeholder for held ones — the
+    // connection's held table then carries the authoritative length,
+    // which must agree with the header). Any other mismatch is EINVAL.
+    let payload = req.payload;
+    if write_in.size as usize != payload.len() {
+        let held = payload.is_empty() && conn.zc_write_held_len(req.slot) == Some(write_in.size);
+        if !held {
+            error!(
+                "fused write: fuse_write_in size {} != payload len {} (unique {})",
+                write_in.size,
+                payload.len(),
+                request.unique
+            );
+            reply_error_in_place(libc::EINVAL.into(), request, resp_sender).await;
+            return;
+        }
+    }
+    write_handler_body(
+        fs,
+        Some(conn),
+        resp_sender,
+        request,
+        in_header.nodeid,
+        write_in,
+        payload,
+        mint_t0,
+        arrived_ns,
+    )
+    .await
 }
 
 /// Reply `err` for `request`. Consumes the request's one [`ReplyTx`], so

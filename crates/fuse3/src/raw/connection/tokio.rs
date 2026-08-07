@@ -449,6 +449,18 @@ impl FuseConnection {
         pool.zc_write_extract(slot).await
     }
 
+    /// Register the session's fused-write dispatcher (zc-write-fusion
+    /// campaign): the mint that builds one delivery's WRITE handler
+    /// future plus the runtime handle fused polls enter — see
+    /// [`super::fuse_over_uring::FuseOverUring::set_fused_write_dispatcher`].
+    /// No-op when no over-uring pool exists (classical sessions).
+    #[cfg(target_os = "linux")]
+    pub fn set_fused_write_dispatcher(&self, d: super::fuse_over_uring::fused::FusedWriteDispatch) {
+        if let Some(pool) = self.over_uring.get() {
+            pool.set_fused_write_dispatcher(d);
+        }
+    }
+
     /// Commit a reply whose payload already sits in the request's pages
     /// (the zc direct leg) — see
     /// [`super::fuse_over_uring::FuseOverUring::submit_reply_prefilled`].

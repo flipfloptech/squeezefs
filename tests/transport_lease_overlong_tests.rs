@@ -139,6 +139,21 @@ fn spawn_stalled_mount(meta: &Path, mnt: &Path, log: &Path, stall_ms: u64) -> Mo
         .arg("--gid")
         .arg(unsafe { libc::getgid() }.to_string())
         .env("SQUEEZEFS_TEST_WRITE_STALL_MS", stall_ms.to_string())
+        // Venue pin (zc-write-fusion campaign, 2026-08-07): this suite
+        // instruments the DELIVERY-time §5.4 lease — the stall seam
+        // fires at the top of the write handler, and the tripwire only
+        // has a voice while a lease is held across that window. On a
+        // ZC-ARMED session (default ON since ruling D16) a hold-candidate
+        // WRITE's payload stays in the sparse slot through the stall (the
+        // lease is minted at materialize, AFTER the seam), so the seam
+        // selects a lease-free window and the assert fails vacuously —
+        // proven by lever bracket on 7.1-sqz: FUSE_ZC=0 green,
+        // FUSE_ZC=1 red with fusion on OR off. Armed-mount overlong
+        // leases (post-materialize stalls) keep the same tripwire; wedge
+        // coverage on armed mounts is the FUSE-2 slot watchdog +
+        // zc_bridge_cqe_wedge_tests. Pin the venue whose machinery this
+        // suite tests.
+        .env("SQUEEZEFS_FUSE_ZC", "0")
         .stdout(Stdio::from(logf.try_clone().expect("clone log fd")))
         .stderr(Stdio::from(logf))
         .spawn()

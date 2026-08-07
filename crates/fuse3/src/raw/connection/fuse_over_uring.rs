@@ -80,6 +80,14 @@ use lease_core::{CommitGate, EntLeaseState};
 mod wake_core;
 use wake_core::WakeCoalescer;
 
+/// The fused write lane (zc-write-fusion campaign, 2026-08-07): a
+/// bounded per-worker executor that runs SMALL armed-WRITE handler
+/// futures on the queue worker's own thread — the store/extract bridge
+/// round trip pays zero cross-thread wakes. Child of this module (like
+/// `wake_core`) so it shares the wake statics + `InboundUringReq`.
+#[path = "fused.rs"]
+pub mod fused;
+
 use super::kmbuf::{self, KmbufQueue, TransportBufferMode};
 use super::zc::{self, ZcBounce, ZcPend};
 use crate::raw::request::ReplySlot;
@@ -148,8 +156,8 @@ pub struct InboundUringReq {
     /// `fuse_in_header` || per-op header (`op_in`).
     pub header_and_op: Vec<u8>,
     pub payload: Bytes,
-    /// FUSE request unique (also embedded in `header_and_op`).
-    #[allow(dead_code)]
+    /// FUSE request unique (also embedded in `header_and_op`) — the
+    /// fused-write mint's parse-refusal identity (zc-write-fusion).
     pub unique: u64,
     /// The ring slot this request was delivered on — the address its
     /// reply commits against (FUSE-2 ⊕ PERF-16: the request carries its
@@ -1371,6 +1379,11 @@ pub struct FuseOverUring {
     /// nonzero so their [`zc::BridgeDeadlines`] scans run even on idle
     /// queues.
     zc_bridge_pends: AtomicU64,
+    /// The fused-write dispatcher (zc-write-fusion campaign): the
+    /// session's WRITE-handler mint + runtime handle, registered once
+    /// after INIT. Deliveries before registration ride the classic
+    /// dispatch (counted as fusion demotions when otherwise eligible).
+    fused_dispatch: std::sync::OnceLock<fused::FusedWriteDispatch>,
     /// Ring depth (per queue) — the `slot_watch` stride.
     depth: usize,
     /// §5.3 D3.b: session SQPOLL posture for the queue rings (`None` =
@@ -2575,6 +2588,7 @@ impl FuseOverUring {
             slot_watch: (0..nqueues * depth).map(|_| SlotWatch::default()).collect(),
             zc_write_held: zc::ZcHeldTable::new(nqueues, depth),
             zc_bridge_pends: AtomicU64::new(0),
+            fused_dispatch: std::sync::OnceLock::new(),
             depth,
             sqpoll,
             queues: queue_handles,
@@ -2800,6 +2814,7 @@ impl FuseOverUring {
                 .collect(),
             zc_write_held: zc::ZcHeldTable::new(nqueues as usize, Self::SIM_DEPTH),
             zc_bridge_pends: AtomicU64::new(0),
+            fused_dispatch: std::sync::OnceLock::new(),
             depth: Self::SIM_DEPTH,
             sqpoll: None,
             queues,
@@ -3044,6 +3059,16 @@ impl FuseOverUring {
             return None;
         }
         self.zc_write_held.get(qid, ent_idx as usize)
+    }
+
+    /// Register the session's fused-write dispatcher (zc-write-fusion
+    /// campaign, 2026-08-07): the WRITE-handler mint + the runtime
+    /// handle whose timers/spawns the fused polls may use. First set
+    /// wins (worker sessions all clone one primary — re-registration is
+    /// a benign no-op); deliveries before registration ride the classic
+    /// dispatch and count as fusion demotions when otherwise eligible.
+    pub fn set_fused_write_dispatcher(&self, d: fused::FusedWriteDispatch) {
+        let _ = self.fused_dispatch.set(d);
     }
 
     /// D14 write-side direct leg: DMA the request's HELD WRITE payload
@@ -3956,6 +3981,15 @@ fn queue_worker(
         bridge_deadlines: zc::BridgeDeadlines,
     }
     let wake_coalescer = Arc::clone(&pool.groups[group_idx].wake_coalescer);
+    // zc-write-fusion (2026-08-07): the per-worker fused lane — a bounded
+    // executor that runs SMALL armed-WRITE handler futures on THIS thread
+    // (the store/extract bridge round trip then pays zero cross-thread
+    // wakes). Capacity = the group's aggregate ent depth (a fused task
+    // exists only while its ent owes a reply — the bound is structural);
+    // wakes ride the group's own coalescer+eventfd producer protocol.
+    let fusion_on = zc_mode && fused::fusion_enabled();
+    let fusion_max = fused::fusion_ceiling(payload_sz_cfg);
+    let mut fused_lane = fused::FusedLane::new(group_depth, Arc::clone(&wake_coalescer), wake_fd);
     let mut members: Vec<MemberState> = Vec::with_capacity(g);
     for &qid in qids.iter() {
         let member_node = if pool.qid_is_cpu {
@@ -4500,6 +4534,19 @@ fn queue_worker(
         // order is loom-verified (`wake_coalescer_*` models; weakening
         // evidence in the model docs).
         wake_coalescer.disarm();
+
+        // Fused-lane drain (zc-write-fusion): poll every READY fused
+        // WRITE handler future on THIS thread — a producer-observable
+        // state scanned after the disarm (the wake_core law), and BEFORE
+        // the commit drain so a poll's WorkerMsg sends (ZcStore /
+        // ZcExtract / the reply Commit) are picked up by the SAME pass.
+        // Each poll's inline work is bounded by the fusion ceiling; a
+        // future that parks on FS state parks in the slab, never here.
+        if fused_lane.len() > 0 {
+            if let Some(d) = pool.fused_dispatch.get() {
+                fused_lane.drain(&d.handle);
+            }
+        }
 
         // Drain commits for EVERY member queue of this group (lever 2:
         // one pass drains the group's aggregate — the per-op wake+enter
@@ -5253,6 +5300,38 @@ fn queue_worker(
                             commit_id,
                             len,
                         } => {
+                            // zc-write-fusion: a SMALL at-delivery
+                            // extraction (unaligned sub-ceiling shapes —
+                            // hold_candidate said no on alignment, never
+                            // size here) completes with its payload
+                            // lease already minted on THIS thread; run
+                            // its handler on the fused lane instead of
+                            // paying the inbound push + dispatch spawn.
+                            if fused::fuse_candidate(len, fusion_max, fusion_on) {
+                                if let Some(d) = pool
+                                    .fused_dispatch
+                                    .get()
+                                    .filter(|_| fused_lane.len() < group_depth)
+                                {
+                                    let payload = mint_lease(m, len);
+                                    let fut = (d.mint)(InboundUringReq {
+                                        header_and_op,
+                                        payload,
+                                        unique,
+                                        slot: ReplySlot::Ring {
+                                            qid,
+                                            ent_idx: ent_idx as u16,
+                                            commit_id,
+                                        },
+                                        arrived_ns: crate::raw::read_phase::transport_now_ns(),
+                                    });
+                                    let admitted = fused_lane.spawn(fut, unique);
+                                    debug_assert!(admitted, "capacity checked above");
+                                    fused::note_zc_write_fusion(u64::from(len));
+                                    continue;
+                                }
+                                fused::note_zc_write_fusion_demotion();
+                            }
                             // The at-delivery extraction's deferred
                             // dispatch (the streaming arm).
                             let payload = mint_lease(m, len);
@@ -5586,6 +5665,40 @@ fn queue_worker(
                 let w_size = u32::from_le_bytes(op_in[16..20].try_into().unwrap());
                 if zc::hold_candidate(w_off, w_size, payload_sz_cfg) {
                     pool.zc_write_held.set(qid, ent_idx, payload_sz as u32);
+                    // zc-write-fusion: a held write at or under the
+                    // fusion ceiling runs its handler on THIS worker's
+                    // fused lane — the dispatch spawn and both bridge
+                    // round-trip wakes collapse to same-thread channel
+                    // ops. Above the ceiling (or lever off) the classic
+                    // handler-lane dispatch below is unchanged; an
+                    // ELIGIBLE delivery that cannot fuse (no dispatcher
+                    // yet / lane at capacity) demotes loudly-counted.
+                    if fused::fuse_candidate(payload_sz as u32, fusion_max, fusion_on) {
+                        let can = pool
+                            .fused_dispatch
+                            .get()
+                            .filter(|_| fused_lane.len() < group_depth);
+                        match can {
+                            Some(d) => {
+                                let fut = (d.mint)(InboundUringReq {
+                                    header_and_op,
+                                    payload,
+                                    unique,
+                                    slot: ReplySlot::Ring {
+                                        qid,
+                                        ent_idx: ent_idx as u16,
+                                        commit_id,
+                                    },
+                                    arrived_ns: crate::raw::read_phase::transport_now_ns(),
+                                });
+                                let admitted = fused_lane.spawn(fut, unique);
+                                debug_assert!(admitted, "capacity checked above");
+                                fused::note_zc_write_fusion(u64::from(payload_sz as u32));
+                                continue;
+                            }
+                            None => fused::note_zc_write_fusion_demotion(),
+                        }
+                    }
                 } else {
                     // The streaming arm: at-delivery extraction, exactly
                     // the zcws-6-era vehicle (kernel shmem copy replaces
@@ -5808,6 +5921,20 @@ fn queue_worker(
     // message that PARKED can close its park here (a message pulled off
     // `commit_rx` was never parked, and the header-only fallback below is
     // the unresolved case by construction).
+    //
+    // zc-write-fusion teardown: drop parked fused futures FIRST — their
+    // payload leases release (unparking any lease-gated commit into the
+    // drain below) and their ReplyTx drop-guards' replies are refused by
+    // the now-inactive pool (NotFound — benign, counted apart), so the
+    // row-8 owing() pass below synthesizes each fused slot's EIO exactly
+    // once. Never let a fused future outlive its worker's arenas.
+    if fused_lane.len() > 0 {
+        debug!(
+            "fuse-over-uring qids={qids:?}: dropping {} parked fused write task(s) at teardown",
+            fused_lane.len()
+        );
+    }
+    drop(fused_lane);
     let mut final_msgs: Vec<(CommitMsg, bool)> = members
         .iter_mut()
         .flat_map(|m| m.parked_msgs.iter_mut())

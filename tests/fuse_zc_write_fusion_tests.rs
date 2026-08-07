@@ -402,8 +402,11 @@ fn fusion_ceiling_bounds_inline_work_and_explicit_wins() {
     }
     // Explicit ceiling raised to 256 KiB: the same shape fuses.
     {
-        let Some(v) = armed_venue("ceilraise", &[("SQUEEZEFS_FUSE_ZC_FUSION_MAX", "262144")], site!())
-        else {
+        let Some(v) = armed_venue(
+            "ceilraise",
+            &[("SQUEEZEFS_FUSE_ZC_FUSION_MAX", "262144")],
+            site!(),
+        ) else {
             return;
         };
         let mnt = &v.mount.mnt;

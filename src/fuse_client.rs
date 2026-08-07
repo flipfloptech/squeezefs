@@ -7723,6 +7723,17 @@ impl SqueezefsFilesystem {
                 // armed-row closure instrument.
                 "fuse3_zc_write_directs": fuse3::zc_write_directs(),
                 "fuse3_zc_write_direct_bytes": fuse3::zc_write_direct_bytes(),
+                // Handler/worker FUSION engagement (zc-write-fusion,
+                // 2026-08-07 — D16's fast-track): armed small WRITEs
+                // whose handler ran on the queue worker's fused lane
+                // (zero cross-thread wakes on the store/extract round
+                // trip) + the byte face. Demotions = fusion-eligible
+                // deliveries that rode the classic dispatch anyway
+                // (no dispatcher yet / lane at capacity) — ≈ 0 in
+                // steady state.
+                "fuse3_zc_write_fusions": fuse3::zc_write_fusions(),
+                "fuse3_zc_write_fusion_bytes": fuse3::zc_write_fusion_bytes(),
+                "fuse3_zc_write_fusion_demotions": fuse3::zc_write_fusion_demotions(),
                 // The bounded-outcome tripwire (zc-bridge-cqe-wedge,
                 // 2026-08-07): MUST STAY 0 — nonzero names a bridge op
                 // the ring never completed inside the deadline

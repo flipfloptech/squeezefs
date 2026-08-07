@@ -240,7 +240,7 @@ write_leg() { # $1 = leg tag, $2 = zc
   # row 2: durable seq write (fsync_on_close)
   d="$MNT/zcw_dur"; mkdir -p "$d"
   run_row "$leg" dur "${FIO_COMMON[@]}" --name=dur --directory="$d" \
-    --rw=write --bs=1M --iodepth=8 --numjobs=16 --nrfiles=8 --size=2g --fsync_on_close=1
+    --rw=write --bs=1M --iodepth=8 --numjobs=16 --nrfiles=8 --size=1536m --fsync_on_close=1
   verdict_write "$leg" dur "$zc"
   rm -rf "$d"; settle
 

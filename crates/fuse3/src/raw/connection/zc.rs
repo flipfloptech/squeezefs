@@ -29,10 +29,20 @@
 //!     kmbuf before) and the queue worker bridges bounce → slot with a
 //!     kernel-side shmem copy replacing the K1 folio copy: copy-count
 //!     parity, correctness everywhere.
-//! * **Paged WRITE payloads are not in the kmbuf** — the daemon
-//!   extracts them slot → bounce (`WRITE_FIXED` slot → memfd) before
-//!   dispatch, then the §5.4 payload lease rides the bounce mapping
-//!   (kernel shmem copy replaces the delivery-time folio copy: parity).
+//! * **Paged WRITE payloads are not in the kmbuf** — they stay HELD in
+//!   the sparse slot (D14 write-side leg, 2026-08-06:
+//!   dispatch-before-extraction). The request dispatches immediately
+//!   with an empty placeholder + the held length published on the
+//!   pool's [`ZcHeldTable`]; the handler consumes the payload through
+//!   the slot source: the **direct leg** (`WRITE_FIXED(device fd ←
+//!   slot)` — the W1 sole-owner patch class DMAs the caller's
+//!   registered pages straight to the device, zero daemon copies) or
+//!   the **lazy extraction** (`WRITE_FIXED(slot → memfd)` on demand —
+//!   every other shape; the §5.4 payload lease rides the bounce
+//!   mapping, kernel shmem copy replacing the delivery-time folio
+//!   copy: parity). Slot lifetime: pages unregister at COMMIT, and
+//!   every slot-sourcing DMA is handler-awaited strictly before the
+//!   reply exists, so the ordering holds by construction.
 //! * Non-paged traffic (names, xattrs, small headers) keeps today's
 //!   kmbuf shape byte-identically — `fuse_uring_req_has_copyable_payload`
 //!   still selects a kmbuf buffer for it on zc queues.

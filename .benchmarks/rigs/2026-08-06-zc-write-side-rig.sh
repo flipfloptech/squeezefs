@@ -137,7 +137,11 @@ if d["fuse3_zc_write_directs"] < 1:
     sys.exit(f"FATAL: {leg}: aligned overwrite did not ride the D14 direct DMA (deltas {d})")
 want = hashlib.md5(bytes(src)).hexdigest()
 got = hashlib.md5(open(p, "rb").read()).hexdigest()
-r = subprocess.run(["dd", f"if={p}", "iflag=direct", "bs=1M", "status=none"], capture_output=True)
+# EL8 python3.6: no capture_output kwarg
+r = subprocess.run(
+    ["dd", f"if={p}", "iflag=direct", "bs=1M", "status=none"],
+    stdout=subprocess.PIPE,
+)
 gotd = hashlib.md5(r.stdout).hexdigest()
 os.unlink(p)
 if want != got or want != gotd:

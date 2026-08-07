@@ -594,6 +594,21 @@ shapes, extraction only as the ineligible-shape fallback. Fleet-posture
 corollary recorded with the ruling: with kernel-lane reads AND writes at
 zc, the interception shim's charter narrows toward the IOPS/rand-small
 lane (direct-drive), big-sequential traffic riding the kernel lane.
+
+**Ruling D15 (user 2026-08-07 — rig discipline, standing): every battery/rig
+row must pass END-TO-END on the local substrate before it runs on the remote
+host.** Issued after the wave-closing battery wedged the field host mid-run
+(a NEW default-posture wedge class: 129 requests stranded on one FUSE
+connection, clients D-state in `request_wait_answer`, `squeezefs umount`
+itself stuck >1 h; tape preserved at `squeeze-test:/scratch/tmp/wedge-tape-0807/`,
+recovered via fusectl connection abort). The remote host is the acceptance
+venue, never the debugging venue. Scope refocus recorded with the ruling:
+the battery's headline question narrows to "zc write throughput on a clean
+host vs established fresh write baselines — is arming worth it", plus a
+mandated differential audit of the zc WRITE side against the read side
+(reads +43 %, writes par-at-best — is a write-side defect hiding in the
+comparison?).
+
 1. **zcrx Z3 field rows** — Connect fix in, lane associates on real nvmet,
    engagement laws hold; acceptance = the D5 chain's CPU/byte drop on
    sustained cold seq-read (the RX-copy term), throughput no worse.

@@ -869,3 +869,81 @@ async fn fabric_family_stats_surface_exports_zero_valued_without_fabric() {
         );
     }
 }
+
+/// The FUSE-zc engagement LEDGER (K1 kill + write-side campaign,
+/// 2026-08-06): the full family must ALWAYS export as u64s on the
+/// `.stats` **`metrics`** object — armed or not, on every mount. The
+/// nesting is the contract: every zc key lives UNDER `metrics` (like
+/// every other counter family), never at the JSON top level — the
+/// 2026-08-06 write-side campaign found a top-level scan reading {} on
+/// a live armed mount and this pin is what makes that a tooling error
+/// rather than an export regression. A bracket row whose deltas cannot
+/// be read from these keys is INVALID by repo law.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fuse_zc_ledger_always_exports_under_metrics() {
+    use squeezefs::block_allocator::BlockAllocator;
+    use squeezefs::cache::TieredCache;
+    use squeezefs::dlm::DlmClient;
+    use squeezefs::fuse_client::SqueezefsFilesystem;
+    use squeezefs::nvme_dev::NvmeBlockDev;
+    use squeezefs::routing::DataRouter;
+    use std::sync::Arc;
+    use tempfile::NamedTempFile;
+
+    let dlm = DlmClient::new().unwrap();
+    let b = NamedTempFile::new().unwrap();
+    std::fs::File::create(b.path())
+        .unwrap()
+        .set_len(64 * 1024 * 1024)
+        .unwrap();
+    let nvme = Arc::new(NvmeBlockDev::new(b.path().to_str().unwrap()));
+    let ba = Arc::new(BlockAllocator::new("zc_ledger_stats_test").await.unwrap());
+    let s = tempfile::tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![s.path().to_path_buf()],
+        Some("64MB"),
+        Some("64MB"),
+        Some("16MB"),
+        Some("32MB"),
+        ba.clone(),
+        nvme.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let router = DataRouter::new(dlm.clone(), cache, ba, nvme);
+    let fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);
+
+    let json: serde_json::Value =
+        serde_json::from_str(&fs.generate_stats_json().await).expect("stats JSON parses");
+
+    let zc_family = [
+        "fuse3_kmbuf_negotiated",
+        "fuse3_zc_negotiated",
+        "fuse3_zc_replies",
+        "fuse3_zc_fallbacks",
+        "fuse3_zc_slot_payload_skips",
+        "fuse3_zc_write_extractions",
+        "fuse3_zc_write_extract_bytes",
+        "fuse3_zc_write_directs",
+        "fuse3_zc_write_direct_bytes",
+        "read_zc_serve_bytes",
+    ];
+
+    let metrics = json
+        .get("metrics")
+        .and_then(|m| m.as_object())
+        .expect("stats carries a metrics object");
+    for key in zc_family {
+        assert!(
+            metrics.get(key).is_some_and(|v| v.is_u64()),
+            "metrics.{key} must always export as u64 (the zc engagement \
+             ledger — an armed bracket row is INVALID without it)"
+        );
+        assert!(
+            json.get(key).is_none(),
+            "{key} must NOT appear at the JSON top level — the metrics \
+             nesting is the contract tooling keys on"
+        );
+    }
+}

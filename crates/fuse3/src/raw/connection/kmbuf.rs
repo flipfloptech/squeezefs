@@ -1035,6 +1035,26 @@ mod tests {
         assert_eq!(zc_headers_index(4), 4);
     }
 
+    /// Each ladder rung carries its KERNEL-TRACK identity (out-paged-
+    /// mirror divergence fix, 2026-08-06): the zc opcode mirror is
+    /// track-keyed (`zc::out_paged(op, track)` — the cachyos 7.1 base
+    /// pages readdir, the elrepo 6.19 base does not), so the resolved
+    /// pair must NAME its track, and `resolved_track()` must agree with
+    /// the surface verdict (Present ⇒ the pair's id; Absent ⇒ None).
+    #[test]
+    fn test_ladder_rungs_carry_their_track_id() {
+        assert_eq!(KMBUF_OPCODES_SQZ_619.id, KmbufTrack::Sqz619);
+        assert_eq!(KMBUF_OPCODES_SQZ_71.id, KmbufTrack::Sqz71);
+        match kmbuf_surface() {
+            KmbufSurface::Present(pair) => {
+                assert_eq!(resolved_track(), Some(pair.id));
+            }
+            KmbufSurface::Absent => {
+                assert_eq!(resolved_track(), None);
+            }
+        }
+    }
+
     /// The capability probe on THIS kernel: deterministic verdict,
     /// cached, and — on stock kernels — Absent via EINVAL with zero side
     /// effects (the contract that keeps today's path byte-identical

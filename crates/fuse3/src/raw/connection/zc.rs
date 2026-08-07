@@ -251,27 +251,64 @@ pub(crate) enum ZcPend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raw::connection::kmbuf::KmbufTrack;
 
-    /// The opcode mirror, pinned against the ABI values (a silent ABI
-    /// drift here is the corruption vector the module doc walks).
-    /// READDIR/READDIRPLUS are pinned FALSE — the deployed-kernel
-    /// measurement (see [`out_paged`]'s doc): their replies ride the
-    /// kmbuf, and bridging them costs a failed ring op + fallback per
-    /// readdir.
+    /// The opcode mirror is TRACK-KEYED (out-paged-mirror divergence
+    /// fix, 2026-08-06): the kernel's per-opcode `out_pages` choice is a
+    /// property of the RUNNING KERNEL'S fuse tree, not of the zc series
+    /// — and the two sqz tracks genuinely differ. Pinned per track
+    /// against the ABI values (a silent ABI drift here is the corruption
+    /// vector the module doc walks):
+    ///
+    /// * **6.19-sqz** (elrepo EL8 base, VANILLA fuse readdir — kvmalloc
+    ///   buffer, `fs/fuse/readdir.c fuse_readdir_uncached`): out-paged =
+    ///   {READ, READLINK}. Field-measured 2026-08-06 (`7eccd53a`): every
+    ///   body-carrying readdir reply arrives kmbuf-attached and the
+    ///   kernel COPIES it.
+    /// * **7.1-sqz** (CachyOS 7.1.6 base, whose fuse tree carries the
+    ///   page-buffer readdir — `fuse_readdir_alloc_buf` sets
+    ///   `ap->args.out_pages = true`): out-paged = {READ, READLINK,
+    ///   READDIR, READDIRPLUS}. Source-verified in the running kernel's
+    ///   build tree AND live-measured (the un-keyed mirror EIO'd every
+    ///   `getdents64` on an armed 7.1 mount — the loud no-attachment
+    ///   guard, never garbage).
+    ///
+    /// The in-direction mirror is {WRITE} on BOTH tracks (both trees:
+    /// `fuse_fill_write_pages` / direct-io write / writeback set
+    /// `in_pages`; NOTIFY_REPLY and data IOCTLs are excluded — this
+    /// daemon issues no retrieves and serves no data ioctls).
     #[test]
-    fn test_paged_opcode_mirror() {
-        assert!(out_paged(fuse_opcode::FUSE_READ as u32));
-        assert!(out_paged(fuse_opcode::FUSE_READLINK as u32));
-        assert!(!out_paged(fuse_opcode::FUSE_READDIR as u32));
-        assert!(!out_paged(fuse_opcode::FUSE_READDIRPLUS as u32));
-        assert!(!out_paged(fuse_opcode::FUSE_WRITE as u32));
-        assert!(!out_paged(fuse_opcode::FUSE_GETXATTR as u32));
-        assert!(!out_paged(fuse_opcode::FUSE_LISTXATTR as u32));
-        assert!(!out_paged(fuse_opcode::FUSE_GETATTR as u32));
+    fn test_paged_opcode_mirror_by_track() {
+        for track in [KmbufTrack::Sqz619, KmbufTrack::Sqz71] {
+            assert!(out_paged(fuse_opcode::FUSE_READ as u32, track));
+            assert!(out_paged(fuse_opcode::FUSE_READLINK as u32, track));
+            assert!(!out_paged(fuse_opcode::FUSE_WRITE as u32, track));
+            assert!(!out_paged(fuse_opcode::FUSE_GETXATTR as u32, track));
+            assert!(!out_paged(fuse_opcode::FUSE_LISTXATTR as u32, track));
+            assert!(!out_paged(fuse_opcode::FUSE_GETATTR as u32, track));
 
-        assert!(in_paged(fuse_opcode::FUSE_WRITE as u32));
-        assert!(!in_paged(fuse_opcode::FUSE_READ as u32));
-        assert!(!in_paged(fuse_opcode::FUSE_SETXATTR as u32));
+            assert!(in_paged(fuse_opcode::FUSE_WRITE as u32, track));
+            assert!(!in_paged(fuse_opcode::FUSE_READ as u32, track));
+            assert!(!in_paged(fuse_opcode::FUSE_SETXATTR as u32, track));
+        }
+
+        // The divergence itself — the whole point of the track key.
+        assert!(
+            !out_paged(fuse_opcode::FUSE_READDIR as u32, KmbufTrack::Sqz619),
+            "6.19-sqz readdir is kmbuf-copied (field-measured, 7eccd53a)"
+        );
+        assert!(
+            !out_paged(fuse_opcode::FUSE_READDIRPLUS as u32, KmbufTrack::Sqz619),
+            "6.19-sqz readdirplus is kmbuf-copied (field-measured, 7eccd53a)"
+        );
+        assert!(
+            out_paged(fuse_opcode::FUSE_READDIR as u32, KmbufTrack::Sqz71),
+            "7.1-sqz (cachyos base) pages readdir — fuse_readdir_alloc_buf"
+        );
+        assert!(
+            out_paged(fuse_opcode::FUSE_READDIRPLUS as u32, KmbufTrack::Sqz71),
+            "7.1-sqz (cachyos base) pages readdirplus — fuse_readdir_alloc_buf"
+        );
     }
 
     /// The bounce arena is real dual-face memory: bytes written by VA

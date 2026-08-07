@@ -460,6 +460,9 @@ impl ClientSession {
         let slot = self.slot(slot_idx);
         let gen = slot.core.try_claim().expect("slot must be FREE");
         slot.publish_descriptor(d);
+        // The shim's publish shape (reap-fanin 2026-08-08): stamp the
+        // ingress instant between the descriptor and the submit publish.
+        slot.stamp_ingress(squeezefs::mono_core::monotonic_stamp_ns_u32());
         slot.core.publish_submitted();
         assert!(self.ring().push(slot_idx), "ring must accept");
         self.header().doorbell.fetch_add(1, Ordering::Release);
@@ -1013,6 +1016,20 @@ async fn direct_drive_stats_fields_export() {
 //     ride the handler, whose own family times them).
 // ---------------------------------------------------------------------------
 
+/// Sample count of the `ipc_ingress_ns` histogram (reap-fanin campaign,
+/// 2026-08-08: the measured client→daemon ring-ingress residence).
+fn ingress_count(v: &serde_json::Value) -> u64 {
+    v.get("metrics")
+        .expect("stats JSON carries a metrics object")
+        .get("ipc_ingress_ns")
+        .expect("stats inode must export ipc_ingress_ns")
+        .as_object()
+        .expect("ingress histogram is a bucket map")
+        .values()
+        .map(|n| n.as_u64().unwrap_or(0))
+        .sum()
+}
+
 fn phase_counts(v: &serde_json::Value, phase: &str) -> u64 {
     v.get("metrics")
         .expect("stats JSON carries a metrics object")
@@ -1066,6 +1083,51 @@ async fn direct_drive_serves_record_residence_phases() {
              (grew {grew}, want ≥ {n})"
         );
     }
+    fx.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// 6b'. ingress residence (reap-fanin campaign, 2026-08-08): every stamped
+//      ring op records ONE measured client→daemon ingress sample at the
+//      dequeue — the term the shim-iops ledger could only derive by
+//      subtraction (fio clat − daemon total). Contract:
+//      - the stats inode exports `ipc_ingress_ns` (26-bucket histogram);
+//      - a stamped submit grows its count by exactly the ops popped
+//        (never-stamped slots and implausible deltas record NOTHING —
+//        the delta law's discard classes, unit-pinned in squeezefs-ipc).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ring_ops_record_ingress_residence() {
+    let fx = Fixture::new("ingress").await;
+    fx.salt_inos(9).await;
+    let ino = fx.create_striped("ingress.bin", &[0, 1]).await;
+    let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("repo-dir tempdir");
+    let fd = odirect_standin(&fx, &dir, "ingress.bin", ino);
+    let (session, binding) = ClientSession::establish(&fx, &fd);
+    fx.fs.router.set_direct_device_true(true);
+
+    let stats0: serde_json::Value =
+        serde_json::from_str(&fx.fs.generate_stats_json().await).expect("stats json parses");
+    let before = ingress_count(&stats0);
+
+    let n = 4u64;
+    for i in 0..n {
+        let got = tokio::task::block_in_place(|| {
+            session.ring_pread(binding, (16 + i) * 4096, 4096, 0, "ingress read")
+        });
+        assert_eq!(got.len(), 4096, "served read {i}");
+    }
+    fx.fs.router.set_direct_device_true(false);
+
+    let stats1: serde_json::Value =
+        serde_json::from_str(&fx.fs.generate_stats_json().await).expect("stats json parses");
+    let grew = ingress_count(&stats1) - before;
+    assert!(
+        grew >= n,
+        "every stamped ring op must record one ingress sample \
+         (grew {grew}, want ≥ {n})"
+    );
     fx.shutdown();
 }
 

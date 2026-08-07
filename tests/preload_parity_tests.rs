@@ -1320,6 +1320,12 @@ async fn data_plane_stats_fields_export() {
         "ipc_fast_path_lock_demotions",
         "ipc_fast_path_miss_demotions",
         "ipc_service_threads",
+        // Hybrid lane gate (D14 corollary): the split-attribution pair +
+        // the derived-threshold gauge export UNCONDITIONALLY (zeros on a
+        // host-less mount) so any row can attribute its lane split.
+        "ipc_lane_gate_kernel_routes",
+        "ipc_lane_gate_kernel_bytes",
+        "ipc_lane_gate_threshold_bytes",
     ] {
         assert!(m.get(key).is_some(), "stats inode must export {key}");
     }
@@ -1400,4 +1406,172 @@ async fn ring_write_applies_the_killpriv_clearing_law() {
          ring writes in EVERY peer class"
     );
     fx.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// hybrid lane gate (D14 corollary): mixed-lane coherence + the stats-page
+// export plumbing
+// ---------------------------------------------------------------------------
+
+/// The correctness invariant the gate leans on, pinned: mixed-lane
+/// traffic on ONE file is coherent BY CONSTRUCTION because both lanes
+/// funnel into the same daemon custody — small ring writes and large
+/// kernel-lane writes (under KD-11 a buffered kernel `write(2)` reaches
+/// the daemon's own FUSE handler synchronously before acking, which is
+/// exactly what `fuse_write` drives here) interleave on one ino and read
+/// back exact through EITHER lane, with both lanes' engagement counters
+/// moving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mixed_lane_writes_on_one_file_stay_coherent_and_both_lanes_account() {
+    let fx = Fixture::new("lane-mix").await;
+    let (ino, fd) = fx.create_file("lane-mix.bin").await;
+    let (session, binding) = ClientSession::establish(&fx, &fd);
+
+    // 512 KiB region built by interleaving the two lanes: even 64 KiB
+    // stripes are SMALL ring writes (4 KiB sub-chunks — the IOPS-lane
+    // shape), odd stripes are LARGE kernel-lane writes (one 64 KiB
+    // handler write each — the shape the gate routes to Real).
+    const STRIPE: usize = 64 * 1024;
+    const STRIPES: usize = 8;
+    let mut expected = vec![0u8; STRIPE * STRIPES];
+    let ops_w_before = METRICS.ipc_ops_write.load(Ordering::Relaxed);
+    let bytes_in_before = METRICS.ipc_bytes_in.load(Ordering::Relaxed);
+    let fuse_before = METRICS.fuse_ops.load(Ordering::Relaxed);
+    let mut ring_ops = 0u64;
+    let mut ring_bytes = 0u64;
+    for s in 0..STRIPES {
+        let base = s * STRIPE;
+        let data = deterministic_bytes(STRIPE, s as u64 + 1);
+        expected[base..base + STRIPE].copy_from_slice(&data);
+        if s % 2 == 0 {
+            // Ring lane, small ops: 4 KiB chunks.
+            for (i, chunk) in data.chunks(4096).enumerate() {
+                tokio::task::block_in_place(|| {
+                    session.ring_write(
+                        binding,
+                        (base + i * 4096) as u64,
+                        chunk,
+                        "lane-mix ring write",
+                    )
+                });
+                ring_ops += 1;
+                ring_bytes += chunk.len() as u64;
+            }
+        } else {
+            // Kernel lane, large op: the daemon handler (the state a
+            // gate-routed real write(2) reaches).
+            let written = fx.fuse_write(ino, base as u64, &data).await;
+            assert_eq!(written as usize, STRIPE, "kernel-lane write short");
+        }
+    }
+
+    // Readback exact through BOTH lanes.
+    let via_fuse = fx.fuse_read(ino, 0, (STRIPE * STRIPES) as u32).await;
+    assert_eq!(via_fuse, expected, "kernel-lane readback of mixed writes");
+    let via_ring = tokio::task::block_in_place(|| {
+        session.ring_read(binding, 0, STRIPE * STRIPES, "lane-mix readback")
+    });
+    assert_eq!(via_ring, expected, "ring-lane readback of mixed writes");
+
+    // Both lanes' engagement counters moved: the ring ops/bytes account
+    // for every small write, and the kernel lane's handler op counter
+    // moved for the large stripes.
+    assert!(
+        METRICS.ipc_ops_write.load(Ordering::Relaxed) >= ops_w_before + ring_ops,
+        "ipc_ops_write must count every ring-lane write of the mix"
+    );
+    assert!(
+        METRICS.ipc_bytes_in.load(Ordering::Relaxed) >= bytes_in_before + ring_bytes,
+        "ipc_bytes_in must count every ring-lane byte of the mix"
+    );
+    assert!(
+        METRICS.fuse_ops.load(Ordering::Relaxed) >= fuse_before + (STRIPES as u64 / 2),
+        "the kernel lane's handler ops must move for the large stripes"
+    );
+    fx.shutdown();
+}
+
+/// The lane-gate observability plumbing, end to end minus the shim: the
+/// gate's counters are SHIM-side decisions (a kernel-routed op never
+/// touches the ring, so the daemon cannot see it), carried on the
+/// session's client stats page — client-writable, display-only, never a
+/// daemon input — and exported on the stats inode as the sum over live
+/// sessions plus the totals folded at teardown, with the threshold gauge
+/// being the max over LIVE sessions (a gauge, so it drops with them).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lane_gate_counters_ride_the_stats_page_to_the_stats_inode() {
+    use squeezefs_ipc::layout::ClientStatsPage;
+    let fx = Fixture::new("lane-stats").await;
+    // Arm the stats surface with this fixture's host (start_mount's act).
+    fx.fs
+        .ipc_host
+        .store(std::sync::Arc::new(Some(fx.host.clone())));
+
+    let (_ino1, fd1) = fx.create_file("lane-a.bin").await;
+    let (_ino2, fd2) = fx.create_file("lane-b.bin").await;
+    let (s1, _b1) = ClientSession::establish(&fx, &fd1);
+    let (s2, _b2) = ClientSession::establish(&fx, &fd2);
+
+    // Play the shim: publish gate decisions into each session's stats
+    // page exactly as the interposer funnels do.
+    let page = |s: &ClientSession| -> &ClientStatsPage {
+        // SAFETY: stats page at stats_off of a mapping sized by the
+        // layout; repr(C, align(4096)) protocol type, zero-initialized
+        // by the fresh memfd.
+        unsafe { &*(s.base.add(s.layout.stats_off as usize) as *const ClientStatsPage) }
+    };
+    let p1 = page(&s1);
+    p1.lane_gate_threshold_bytes.store(64 * 1024, Ordering::Relaxed);
+    for _ in 0..3 {
+        p1.note_kernel_route(1024 * 1024);
+    }
+    let p2 = page(&s2);
+    p2.lane_gate_threshold_bytes
+        .store(128 * 1024, Ordering::Relaxed);
+    for _ in 0..2 {
+        p2.note_kernel_route(2 * 1024 * 1024);
+    }
+
+    let metrics = |json: &str| -> serde_json::Value {
+        let v: serde_json::Value = serde_json::from_str(json).expect("stats json parses");
+        v.get("metrics").expect("metrics object").clone()
+    };
+    let m = metrics(&fx.fs.generate_stats_json().await);
+    assert_eq!(
+        m.get("ipc_lane_gate_kernel_routes").and_then(|v| v.as_u64()),
+        Some(5),
+        "routes must sum over live sessions"
+    );
+    assert_eq!(
+        m.get("ipc_lane_gate_kernel_bytes").and_then(|v| v.as_u64()),
+        Some(7 * 1024 * 1024),
+        "bytes must sum over live sessions"
+    );
+    assert_eq!(
+        m.get("ipc_lane_gate_threshold_bytes")
+            .and_then(|v| v.as_u64()),
+        Some(128 * 1024),
+        "the threshold gauge is the max over live sessions"
+    );
+
+    // Teardown folds the counters (monotone across session churn) and
+    // drops the gauge with the last live session.
+    fx.host.shutdown();
+    let m = metrics(&fx.fs.generate_stats_json().await);
+    assert_eq!(
+        m.get("ipc_lane_gate_kernel_routes").and_then(|v| v.as_u64()),
+        Some(5),
+        "reaped sessions' routes must persist (folded at teardown)"
+    );
+    assert_eq!(
+        m.get("ipc_lane_gate_kernel_bytes").and_then(|v| v.as_u64()),
+        Some(7 * 1024 * 1024),
+        "reaped sessions' bytes must persist (folded at teardown)"
+    );
+    assert_eq!(
+        m.get("ipc_lane_gate_threshold_bytes")
+            .and_then(|v| v.as_u64()),
+        Some(0),
+        "the threshold gauge drops with the live sessions"
+    );
 }

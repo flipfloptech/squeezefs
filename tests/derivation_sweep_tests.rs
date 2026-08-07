@@ -919,3 +919,53 @@ fn il_drain_lane_width_is_the_three_eighths_lane_pair_slope() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Hybrid lane gate (2026-08-07): the shim's kernel-lane crossover threshold
+// ---------------------------------------------------------------------------
+
+/// Ruling D14's fleet-posture corollary ("the shim narrows toward the
+/// IOPS lane") formalized as a DERIVED crossover, never a constant: the
+/// threshold is the op size where the ring's per-byte cost (client copy
+/// passes over the payload at the probed memcpy bandwidth — 2 for reads:
+/// daemon serve-into-arena + client consume; the write side's single
+/// copy crosses at 2× and collapses to the same clamp on measured
+/// hardware) exceeds the kernel FUSE lane's per-op overhead delta
+/// ([`KERNEL_LANE_RTT_DELTA_NS`] — the D14 field bracket's measured
+/// rand-4k per-op cost gap class). Rails are PHYSICAL: floor = the slot
+/// slab (at or below it a ring op is the single-flight allocation-free
+/// serial path — the IOPS lane's own regime, which the gate exists to
+/// protect, never to tax); ceiling = `max_op_bytes` (past it an op must
+/// chunk into multiple ring flights, so the gate must have engaged at
+/// latest there). `SQUEEZEFS_IL_KERNEL_LANE_MIN` overrides verbatim
+/// (0 = gate off — the A/B lever); the derived value is exported live as
+/// `ipc_lane_gate_threshold_bytes`.
+#[test]
+fn il_kernel_lane_min_derives_from_membw_and_lane_rtt_delta() {
+    use squeezefs_ipc::sizing::{kernel_lane_min_default, KERNEL_LANE_RTT_DELTA_NS};
+    // Default session geometry: 64 MiB arena / 1024 slots ⇒ 64 KiB slab;
+    // 1 MiB per-op ceiling.
+    const SLAB: u64 = 64 * 1024;
+    const MAX_OP: u64 = 1024 * 1024;
+    // The delta class constant is measured evidence, pinned so a retune
+    // is a deliberate act with a new citation.
+    assert_eq!(KERNEL_LANE_RTT_DELTA_NS, 2_300);
+    // The field-class client (~15 GB/s single-thread memcpy): raw
+    // crossover ≈ 17 KiB sits BELOW the slab ⇒ clamps to the slab floor —
+    // single-flight ops stay ring, everything that would chunk multi-slab
+    // rides the kernel zc lane.
+    assert_eq!(kernel_lane_min_default(15_000_000_000, SLAB, MAX_OP), SLAB);
+    // A failed/degenerate probe (0) degrades to the same floor.
+    assert_eq!(kernel_lane_min_default(0, SLAB, MAX_OP), SLAB);
+    // A 100 GB/s-class copy engine: interior value on the 4 KiB LBA/page
+    // grain (100e9 × 2300 ns ÷ 1e9 ÷ 2 copies = 115_000 → 28 × 4096).
+    assert_eq!(
+        kernel_lane_min_default(100_000_000_000, SLAB, MAX_OP),
+        112 * 1024
+    );
+    // Absurd bandwidth rails at the payload ceiling, overflow-safe.
+    assert_eq!(kernel_lane_min_default(u64::MAX, SLAB, MAX_OP), MAX_OP);
+    // Toy geometries: the rails never invert (lo ≤ hi holds even when a
+    // caller hands slab == max_op).
+    assert_eq!(kernel_lane_min_default(0, 4096, 4096), 4096);
+}

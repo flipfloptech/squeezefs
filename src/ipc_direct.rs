@@ -970,6 +970,24 @@ mod tests {
         assert_eq!(sorted.len(), 3, "three foreign threads get three lanes");
     }
 
+    /// The eager-flush lever (shim-iops campaign, 2026-08-07): 0 =
+    /// shipped end-of-sweep flush only (the M3 submit-batch economy);
+    /// K > 0 = a lane whose unflushed SQE count reaches K enters
+    /// inline, so a mid-sweep burst starts its device service without
+    /// waiting for the sweep tail. Clamp ceiling = the per-shard ring
+    /// depth (an eager threshold past SQ capacity is meaningless).
+    #[test]
+    fn dd_eager_flush_default_and_clamp() {
+        assert_eq!(dd_eager_flush_from(None), 0, "shipped = end-of-sweep");
+        assert_eq!(dd_eager_flush_from(Some("4")), 4);
+        assert_eq!(
+            dd_eager_flush_from(Some("999999")),
+            RING_ENTRIES,
+            "clamp ceiling = ring entries"
+        );
+        assert_eq!(dd_eager_flush_from(Some("garbage")), 0);
+    }
+
     /// The service-lane pin wins over the fallback (the owner-partition
     /// mapping `lane = owner % width` depends on it).
     #[test]

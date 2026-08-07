@@ -2839,4 +2839,28 @@ mod reap_park_max_tests {
         );
         assert_eq!(reap_event_park_max_from(Some("garbage")), 2);
     }
+
+    /// The deep-regime batch-reap quantum lever (shim-iops campaign,
+    /// 2026-08-07): the shipped 50 µs blind sleep is the default (the
+    /// 2026-07-26 sizing), `SQUEEZEFS_IL_REAP_QUANTUM_US` is the
+    /// counted-measurement lever — clamp 1..=1000 (0 would busy-spin;
+    /// spin policy is `SQUEEZEFS_IL_SPINS`' business, never this
+    /// knob's), unparseable ⇒ default (the shim's ENG-10 asymmetry).
+    #[test]
+    fn reap_quantum_default_and_clamp() {
+        use std::time::Duration;
+        assert_eq!(reap_quantum_from(None), Duration::from_micros(50));
+        assert_eq!(reap_quantum_from(Some("10")), Duration::from_micros(10));
+        assert_eq!(
+            reap_quantum_from(Some("0")),
+            Duration::from_micros(1),
+            "clamp floor: 0 must not busy-spin"
+        );
+        assert_eq!(
+            reap_quantum_from(Some("999999")),
+            Duration::from_micros(1000),
+            "clamp ceiling"
+        );
+        assert_eq!(reap_quantum_from(Some("garbage")), Duration::from_micros(50));
+    }
 }

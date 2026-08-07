@@ -959,6 +959,84 @@ async fn direct_drive_stats_fields_export() {
 }
 
 // ---------------------------------------------------------------------------
+// 6b. residence decomposition — `ipc_direct_phase_ns` (shim-iops campaign,
+//     2026-08-07): the direct-drive path is the rand-4k il hot path and had
+//     NO residence instrument — `read_serve_phase_ns` never sees these ops
+//     (no handler), so the fio-clat-vs-daemon-residence split the 1M-IOPS
+//     decomposition needs was unmeasurable on production mounts. The
+//     family is ALWAYS-ON (the `write_pipeline_phase_ns` cost contract:
+//     one `Instant` read + one relaxed `fetch_add` per boundary crossed)
+//     and buckets through the SAME shared `latency_core`, so it composes
+//     with the fuse3/read tables. Phases:
+//       admit    = prelude probe entry → in-flight slab insert (eligibility
+//                  + custody snapshot + lane route + slab/SQE-prep)
+//       inflight = slab insert → CQE popped by the shard reaper (SQE push +
+//                  flush-batch wait + device/fabric service + reap batch)
+//       finish   = CQE popped → slot completion posted (revalidate + serve
+//                  accounting + bounce-leg copy)
+//       total    = probe entry → completion posted (the DAEMON residence;
+//                  fio clat − total = client + ring-ingress residence, the
+//                  subtraction the campaign ledger keys on)
+//     Containment: total ≈ admit + inflight + finish (same-op spans, no
+//     unexplained residue). Only SERVED ops record finish/total (fallbacks
+//     ride the handler, whose own family times them).
+// ---------------------------------------------------------------------------
+
+fn phase_counts(v: &serde_json::Value, phase: &str) -> u64 {
+    v.get("ipc_direct_phase_ns")
+        .unwrap_or_else(|| panic!("stats inode must export ipc_direct_phase_ns (phase {phase})"))
+        .get(phase)
+        .unwrap_or_else(|| panic!("ipc_direct_phase_ns must carry phase '{phase}'"))
+        .as_object()
+        .expect("phase histogram is a bucket map")
+        .values()
+        .map(|n| n.as_u64().unwrap_or(0))
+        .sum()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn direct_drive_serves_record_residence_phases() {
+    let fx = Fixture::new("phases").await;
+    fx.salt_inos(3).await;
+    let ino = fx.create_striped("phase.bin", &[0, 1]).await;
+    let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("repo-dir tempdir");
+    let fd = odirect_standin(&fx, &dir, "phase.bin", ino);
+    let (session, binding) = ClientSession::establish(&fx, &fd);
+    fx.fs.router.set_direct_device_true(true);
+
+    let stats0: serde_json::Value =
+        serde_json::from_str(&fx.fs.generate_stats_json().await).expect("stats json parses");
+    let before: Vec<u64> = ["admit", "inflight", "finish", "total"]
+        .iter()
+        .map(|p| phase_counts(&stats0, p))
+        .collect();
+
+    let n = 4u64;
+    let d0 = snap();
+    for i in 0..n {
+        let got = tokio::task::block_in_place(|| {
+            session.ring_pread(binding, (16 + i) * 4096, 4096, 0, "phase read")
+        });
+        assert_eq!(got.len(), 4096, "served read {i}");
+    }
+    let d = delta(&d0);
+    fx.fs.router.set_direct_device_true(false);
+    assert_eq!(d.dd_serves, n, "phase rows require direct-drive engagement");
+
+    let stats1: serde_json::Value =
+        serde_json::from_str(&fx.fs.generate_stats_json().await).expect("stats json parses");
+    for (i, phase) in ["admit", "inflight", "finish", "total"].iter().enumerate() {
+        let grew = phase_counts(&stats1, phase) - before[i];
+        assert!(
+            grew >= n,
+            "every direct-drive serve must record phase '{phase}' \
+             (grew {grew}, want ≥ {n})"
+        );
+    }
+    fx.shutdown();
+}
+
+// ---------------------------------------------------------------------------
 // 7. DIALED P1.5 (2026-07-27): direct-drive for governor-denied misses on
 //    DEFAULT mounts. Post-governor, a denied miss on the default hybrid
 //    posture is semantically identical to a device-true serve — ranged

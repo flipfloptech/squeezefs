@@ -2906,6 +2906,55 @@ static READ_SERVE_PROF: Lazy<[LatencyHistogram; READ_SERVE_PHASES]> =
 static READ_FILL_PROF: Lazy<[LatencyHistogram; READ_FILL_PHASES]> =
     Lazy::new(|| std::array::from_fn(|_| LatencyHistogram::default()));
 
+/// Direct-drive residence sub-phases (`ipc_direct_phase_ns` — the
+/// shim-iops campaign's rand-4k il decomposition instrument,
+/// 2026-08-07). The direct-drive engine serves the ring's governed
+/// O_DIRECT misses with no task, no tokio, no handler — so the
+/// `read_serve_phase_ns` family structurally never sees the shim's
+/// hot path, and the fio-clat-vs-daemon-residence subtraction the
+/// 1M-IOPS ledger keys on had no measured daemon term. ALWAYS-ON
+/// (the `write_pipeline_phase_ns` cost contract) and bucketed through
+/// the shared `latency_core`, so it composes with the read/fuse3
+/// tables. Containment: `total ≈ admit + inflight + finish`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum IpcDirectPhase {
+    /// Prelude probe entry → in-flight slab insert: eligibility ladder
+    /// + 795 custody snapshot + lane route + slab/SQE prep.
+    Admit = 0,
+    /// Slab insert → CQE popped by the shard reaper: SQE push +
+    /// flush-batch wait + device/fabric service + reap batching.
+    Inflight = 1,
+    /// CQE popped → slot completion posted: revalidate + serve
+    /// accounting (+ the bounce leg's request-slice copy).
+    Finish = 2,
+    /// Probe entry → completion posted — the DAEMON-side residence.
+    /// `fio clat − total` = client + ring-ingress residence (the
+    /// campaign ledger's subtraction).
+    Total = 3,
+}
+
+const IPC_DIRECT_PHASES: usize = 4;
+const IPC_DIRECT_PHASE_NAMES: [&str; IPC_DIRECT_PHASES] = ["admit", "inflight", "finish", "total"];
+
+static IPC_DIRECT_PROF: Lazy<[LatencyHistogram; IPC_DIRECT_PHASES]> =
+    Lazy::new(|| std::array::from_fn(|_| LatencyHistogram::default()));
+
+/// Record one direct-drive residence span started at `t0` (always-on).
+#[inline]
+pub fn ipc_direct_phase_record(phase: IpcDirectPhase, t0: std::time::Instant) {
+    IPC_DIRECT_PROF[phase as usize].record(t0.elapsed());
+}
+
+/// `ipc_direct_phase_ns` stats payload: `{phase: histogram}` — UNGATED.
+pub fn ipc_direct_phase_json() -> serde_json::Value {
+    let mut phases = serde_json::Map::new();
+    for (pi, pname) in IPC_DIRECT_PHASE_NAMES.iter().enumerate() {
+        phases.insert((*pname).to_string(), IPC_DIRECT_PROF[pi].to_json());
+    }
+    serde_json::Value::Object(phases)
+}
+
 /// Record one serve-residence span started at `t0` (always-on; see the
 /// module block above for the cost contract).
 #[inline]
@@ -5572,6 +5621,9 @@ pub struct IpcDirectSnapshot {
     /// part of its 100 %-CPU saturation at t32qd32).
     pub cache_key: String,
     pub ext_key: String,
+    /// Probe-entry instant — the `ipc_direct_phase_ns` `admit`/`total`
+    /// anchor (shim-iops campaign, 2026-08-07).
+    pub t0: std::time::Instant,
 }
 
 pub enum IpcReadProbe {
@@ -7624,6 +7676,11 @@ impl SqueezefsFilesystem {
                 // containment map). Deliberately ungated.
                 "read_serve_phase_ns": read_serve_phase_json(),
                 "read_fill_phase_ns": read_fill_phase_json(),
+                // Direct-drive residence decomposition (shim-iops
+                // campaign 2026-08-07): the ring's governed O_DIRECT
+                // hot path never touches a handler, so it needs its
+                // own family. Deliberately ungated.
+                "ipc_direct_phase_ns": ipc_direct_phase_json(),
                 "read_transport_phase_ns": read_transport_phase_json(),
                 // The WRITE twin (transport-ingress campaign): the write
                 // wall's pre-handler leg, measured — no longer inferred.
@@ -9098,6 +9155,11 @@ impl SqueezefsFilesystem {
         len: u32,
     ) -> Result<IpcDirectSnapshot, IpcDirectIneligible> {
         use IpcDirectIneligible as I;
+        // ipc_direct_phase_ns `admit`/`total` anchor (always-on): the
+        // probe entry is the daemon-side residence's t0 — everything
+        // before it (ring publish → drain pop) is the ingress term the
+        // ledger derives by subtraction from fio clat.
+        let t0 = std::time::Instant::now();
         // Device-class shape: 4–64 KiB (the R3 ranged window class the
         // 64 KiB bounce pool sizes; sub-4 KiB and jumbo shapes are not
         // the governed miss shape).
@@ -9203,6 +9265,7 @@ impl SqueezefsFilesystem {
             len,
             cache_key,
             ext_key,
+            t0,
         })
     }
 

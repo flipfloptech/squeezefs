@@ -983,7 +983,9 @@ async fn direct_drive_stats_fields_export() {
 // ---------------------------------------------------------------------------
 
 fn phase_counts(v: &serde_json::Value, phase: &str) -> u64 {
-    v.get("ipc_direct_phase_ns")
+    v.get("metrics")
+        .expect("stats JSON carries a metrics object")
+        .get("ipc_direct_phase_ns")
         .unwrap_or_else(|| panic!("stats inode must export ipc_direct_phase_ns (phase {phase})"))
         .get(phase)
         .unwrap_or_else(|| panic!("ipc_direct_phase_ns must carry phase '{phase}'"))

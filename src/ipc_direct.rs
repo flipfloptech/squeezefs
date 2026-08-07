@@ -207,6 +207,10 @@ struct Pending {
     /// Bounce backing (`None` = direct arena DMA). The `Bytes` owner
     /// recycles the buffer into its home pool on drop.
     bounce: Option<(SendPtr, bytes::Bytes)>,
+    /// `ipc_direct_phase_ns` `inflight` anchor: slab-insert instant
+    /// (shim-iops campaign, 2026-08-07 — always-on residence
+    /// decomposition; `snap.t0` anchors `admit`/`total`).
+    t_insert: std::time::Instant,
 }
 
 struct EngineState {
@@ -549,6 +553,13 @@ impl DirectDriveEngine {
             .note_foreground(window as u64);
 
         let dev_read_off = dev_off + aligned_start;
+        // ipc_direct_phase_ns: `admit` closes here (probe entry →
+        // slab insert); the same instant anchors `inflight`.
+        let t_insert = std::time::Instant::now();
+        crate::fuse_client::ipc_direct_phase_record(
+            crate::fuse_client::IpcDirectPhase::Admit,
+            snap.t0,
+        );
         let pending = Pending {
             op,
             completion,
@@ -556,6 +567,7 @@ impl DirectDriveEngine {
             window,
             win_skew,
             bounce,
+            t_insert,
         };
 
         // Lane routing: this thread's shard (service threads pin their
@@ -798,7 +810,16 @@ impl DirectDriveEngine {
                     );
                     continue;
                 };
-                self.finish(pending, res);
+                // ipc_direct_phase_ns: `inflight` closes at the CQE pop
+                // (slab insert → here — SQE push + flush-batch wait +
+                // device service + reap batching); the same instant
+                // anchors `finish`.
+                let t_cqe = std::time::Instant::now();
+                crate::fuse_client::ipc_direct_phase_record(
+                    crate::fuse_client::IpcDirectPhase::Inflight,
+                    pending.t_insert,
+                );
+                self.finish(pending, res, t_cqe);
             }
         }
     }
@@ -806,7 +827,8 @@ impl DirectDriveEngine {
     /// CQE disposition: exact-length + 795 revalidation ⇒ serve;
     /// anything else falls back to the handler path (which re-runs the
     /// full moving-custody read protocol and surfaces genuine errors).
-    fn finish(&self, pending: Pending, res: i32) {
+    /// `t_cqe` anchors the `ipc_direct_phase_ns` `finish` span.
+    fn finish(&self, pending: Pending, res: i32, t_cqe: std::time::Instant) {
         let Pending {
             op,
             completion,
@@ -814,6 +836,7 @@ impl DirectDriveEngine {
             window,
             win_skew,
             bounce,
+            t_insert: _,
         } = pending;
         let exact = res >= 0 && res as usize == window;
         if exact && self.fs.ipc_direct_revalidate(&snap) {
@@ -846,6 +869,18 @@ impl DirectDriveEngine {
                 .ipc_direct_drive_serves
                 .fetch_add(1, Ordering::Relaxed);
             completion.complete(req_len as i64);
+            // ipc_direct_phase_ns: served ops close `finish` (CQE pop →
+            // completion posted) and `total` (probe entry → here — the
+            // daemon-side residence). Fallbacks ride the handler, whose
+            // own family times them.
+            crate::fuse_client::ipc_direct_phase_record(
+                crate::fuse_client::IpcDirectPhase::Finish,
+                t_cqe,
+            );
+            crate::fuse_client::ipc_direct_phase_record(
+                crate::fuse_client::IpcDirectPhase::Total,
+                snap.t0,
+            );
         } else {
             // Custody moved mid-DMA, or the device said no: the handler
             // owns the truth (never-lossy, never-fabricating).

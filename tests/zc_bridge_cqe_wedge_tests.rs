@@ -156,7 +156,14 @@ fn spawn_zc_mount(meta: &Path, mnt: &Path, log: &Path, drop_n: u64) -> Mount {
         .arg("--gid")
         .arg(unsafe { libc::getgid() }.to_string())
         .env("SQUEEZEFS_FUSE_ZC", "1")
-        .env("SQUEEZEFS_ZC_BRIDGE_TIMEOUT_MS", "1000")
+        // An OUTER override wins — running the suite with
+        // `SQUEEZEFS_ZC_BRIDGE_TIMEOUT_MS=600000` is the standing RED
+        // control: the ladder cannot fire inside the test bound and the
+        // dropped CQE wedges exactly as the field did.
+        .env(
+            "SQUEEZEFS_ZC_BRIDGE_TIMEOUT_MS",
+            std::env::var("SQUEEZEFS_ZC_BRIDGE_TIMEOUT_MS").unwrap_or_else(|_| "1000".into()),
+        )
         .env("SQUEEZEFS_TEST_ZC_DROP_WRITE_CQES", drop_n.to_string())
         .stdout(Stdio::from(logf.try_clone().expect("clone log fd")))
         .stderr(Stdio::from(logf))
@@ -249,7 +256,8 @@ fn bounded_write_leg(mnt: &Path, name: &str, payload: &[u8], log: &Path) {
 fn assert_serviceable(mnt: &Path) {
     let file = mnt.join("post_recovery_probe.bin");
     let mut f = std::fs::File::create(&file).expect("create post-recovery file");
-    f.write_all(b"bounded outcome").expect("post-recovery write");
+    f.write_all(b"bounded outcome")
+        .expect("post-recovery write");
     f.sync_all().expect("post-recovery fsync");
     drop(f);
     assert_eq!(

@@ -1422,6 +1422,29 @@ fn zc_bridge_timeout_ns() -> u64 {
     })
 }
 
+/// TEST SEAM budget (`SQUEEZEFS_TEST_ZC_DROP_WRITE_CQES`): how many
+/// WRITE-class bridge CQEs the workers should consume-and-drop — the
+/// deterministic lost-completion interleave of the zcws-9 W4 wedge
+/// (`tests/zc_bridge_cqe_wedge_tests.rs`). Returns `true` when THIS CQE
+/// must be dropped. Production cost: one relaxed load of a
+/// process-lifetime zero.
+fn test_drop_write_cqe() -> bool {
+    static BUDGET: std::sync::OnceLock<AtomicU64> = std::sync::OnceLock::new();
+    let b = BUDGET.get_or_init(|| {
+        AtomicU64::new(
+            std::env::var("SQUEEZEFS_TEST_ZC_DROP_WRITE_CQES")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(0),
+        )
+    });
+    if b.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    b.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1))
+        .is_ok()
+}
+
 /// `SQUEEZEFS_TRANSPORT_DEBUG=1` — per-request transport tracing to stderr
 /// (delivery / reply / commit / CQE errors) for stuck-request forensics.
 pub fn transport_debug() -> bool {
@@ -4899,6 +4922,27 @@ fn queue_worker(
             }
             let (mi, ent_idx) = (gent / depth, gent % depth);
             let qid = members[mi].qid;
+            // TEST SEAM (zc-bridge-cqe-wedge): consume-and-drop the first
+            // N WRITE-class bridge CQEs — pend + deadline stay live, the
+            // exact zcws-9 lost-completion posture, selected
+            // deterministically instead of by load. Env-gated
+            // (`SQUEEZEFS_TEST_ZC_DROP_WRITE_CQES`); one relaxed load in
+            // production.
+            if op == RingOp::Fetch
+                && matches!(
+                    members[mi].zc_pend[ent_idx],
+                    Some(ZcPend::HandlerStore { .. })
+                        | Some(ZcPend::LazyExtract { .. })
+                        | Some(ZcPend::WriteExtract { .. })
+                )
+                && test_drop_write_cqe()
+            {
+                error!(
+                    "fuse-over-uring qid={qid} ent={ent_idx}: TEST SEAM dropping \
+                     WRITE-class bridge CQE (res={res}) — pend stays live"
+                );
+                continue;
+            }
             if res < 0 {
                 let err = -res;
                 let m = &mut members[mi];
@@ -4911,14 +4955,73 @@ fn queue_worker(
                 // unregistered slot (the opcode-mirror miss), both of
                 // which fall back per-request.
                 if op == RingOp::Cancel {
-                    // A bridge-deadline cancel's own CQE is informational
-                    // — resolution rides the ORIGINAL op's CQE (completed
-                    // or -ECANCELED).
-                    warn!(
-                        "fuse-over-uring qid={qid} ent={ent_idx}: bridge AsyncCancel \
-                         answered {err} (0=canceled, ENOENT=already done, \
-                         EALREADY=running)"
-                    );
+                    // The lost-CQE resolution ladder (zc-bridge-cqe-wedge,
+                    // 2026-08-07): the cancel's own CQE classifies the
+                    // overdue op — see `zc::cancel_cqe_action` for the
+                    // FIFO argument that makes -ENOENT-with-a-live-pend
+                    // the PROVEN lost-completion shape.
+                    match zc::cancel_cqe_action(res, m.zc_pend[ent_idx].is_some()) {
+                        zc::CancelCqeAction::Nothing => {}
+                        zc::CancelCqeAction::AwaitOriginal => {
+                            debug!(qid, ent_idx, res, "bridge AsyncCancel: op canceled");
+                        }
+                        zc::CancelCqeAction::SynthesizeLost => {
+                            kmbuf::note_zc_bridge_lost();
+                            error!(
+                                "fuse-over-uring qid={qid} ent={ent_idx}: bridge \
+                                 AsyncCancel answered ENOENT with the pend still \
+                                 live — the op's completion was POSTED and never \
+                                 reaped (a LOST ring completion, the zcws-9 class); \
+                                 synthesizing its resolution \
+                                 (fuse3_zc_bridge_lost)"
+                            );
+                            let pend = zc_fetch_complete(
+                                &mut ring,
+                                &mut batch,
+                                &mut m.slots,
+                                &mut m.ents[ent_idx],
+                                &mut m.zc_pend[ent_idx],
+                                pool.slot_watch_cell(qid, ent_idx),
+                                qid,
+                                gent,
+                                -libc::ETIMEDOUT,
+                            )?;
+                            if m.bridge_deadlines.clear(ent_idx) {
+                                pool.zc_bridge_pends.fetch_sub(1, Ordering::Relaxed);
+                            }
+                            if matches!(pend, Some(PendDone::DeliverFailed)) {
+                                fail_ent(
+                                    &mut ring,
+                                    &mut batch,
+                                    &mut m.slots,
+                                    &mut m.ents[ent_idx],
+                                    &m.lease_states[ent_idx],
+                                    pool.slot_watch_cell(qid, ent_idx),
+                                    qid,
+                                    gent,
+                                    libc::EIO,
+                                )?;
+                            }
+                        }
+                        zc::CancelCqeAction::Restamp => {
+                            warn!(
+                                "fuse-over-uring qid={qid} ent={ent_idx}: bridge \
+                                 AsyncCancel answered {err} — the op is still \
+                                 RUNNING kernel-side and cannot be synthesized \
+                                 (a late DMA would alias a recycled slot); \
+                                 re-arming the deadline (the slot stays \
+                                 watchdog-named until the op completes)"
+                            );
+                            if m.bridge_deadlines
+                                .stamp(ent_idx, crate::raw::read_phase::transport_now_ns())
+                            {
+                                // Structurally a re-stamp (the pend is
+                                // live), but keep the gauge exact if the
+                                // ledger ever disagrees.
+                                pool.zc_bridge_pends.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
                     continue;
                 }
                 if op == RingOp::Fetch {

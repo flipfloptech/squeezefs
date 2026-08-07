@@ -7639,6 +7639,12 @@ impl SqueezefsFilesystem {
                 // (investigate with transport_slots_overdue + the wedge
                 // census).
                 "fuse3_zc_bridge_cancels": fuse3::zc_bridge_cancels(),
+                // The PROVEN-loss split (must stay 0): completions the
+                // kernel posted that the transport never reaped — the
+                // -ENOENT synthesis arm's ledger. cancels without losses
+                // = stuck-op class; losses = ring-completion loss, the
+                // kernel-side evidence face.
+                "fuse3_zc_bridge_lost": fuse3::zc_bridge_lost(),
                 // The WRITE twin (transport-ingress campaign): the gauge
                 // is what keeps the in-place arm wired.
                 "fuse3_write_inplace_replies": fuse3::write_inplace_replies(),

@@ -406,7 +406,8 @@ impl BridgeDeadlines {
 
     /// The ents whose bridge ops have been in flight longer than
     /// `timeout_ns` and have NOT been yielded before — each exactly
-    /// once per pend lifetime.
+    /// once per pend lifetime (a re-[`Self::stamp`] resets the latch:
+    /// the `-EALREADY` re-arm).
     pub(crate) fn overdue(&mut self, now_ns: u64, timeout_ns: u64) -> Vec<usize> {
         let mut out = Vec::new();
         for (ent, b) in self.born.iter().enumerate() {
@@ -422,6 +423,51 @@ impl BridgeDeadlines {
         }
         out
     }
+}
+
+/// What a bridge-deadline `AsyncCancel`'s OWN CQE requires of the
+/// worker (the lost-CQE resolution ladder — zc-bridge-cqe-wedge
+/// campaign, 2026-08-07).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CancelCqeAction {
+    /// The pend already resolved (its CQE arrived in this or an earlier
+    /// batch) — the cancel CQE owes nothing.
+    Nothing,
+    /// The kernel found and canceled the op: its `-ECANCELED` CQE is
+    /// coming and resolves the pend through the normal ladders.
+    AwaitOriginal,
+    /// **The PROVEN lost-completion shape** (`-ENOENT` with the pend
+    /// still live): the kernel has no such op in flight, so its
+    /// completion was already POSTED — and the CQ is FIFO, so that CQE
+    /// precedes this cancel CQE in reap order. A live pend here means
+    /// the completion never reached us (the zcws-9 W4 class).
+    /// Synthesize the resolution — safe exactly because no kernel op
+    /// still references the slot.
+    SynthesizeLost,
+    /// The op is still RUNNING kernel-side (`-EALREADY`, or any errno
+    /// this ladder does not know) and cannot be stopped from userspace.
+    /// Synthesizing would let a late kernel DMA alias a recycled
+    /// slot/bounce — re-stamp the deadline instead (loud every period;
+    /// the slot stays watchdog-named; only completion — or a kernel fix
+    /// — frees this class).
+    Restamp,
+}
+
+/// Classify a bridge-deadline `AsyncCancel` CQE. `res` is the cancel's
+/// own result (0 = found+canceled, negative errno otherwise);
+/// `pend_live` is whether the ORIGINAL op's pend is still unresolved at
+/// processing time.
+pub(crate) fn cancel_cqe_action(res: i32, pend_live: bool) -> CancelCqeAction {
+    if !pend_live {
+        return CancelCqeAction::Nothing;
+    }
+    if res == 0 {
+        return CancelCqeAction::AwaitOriginal;
+    }
+    if res == -libc::ENOENT {
+        return CancelCqeAction::SynthesizeLost;
+    }
+    CancelCqeAction::Restamp
 }
 
 /// The held-payload table (D14 write-side leg): one cell per

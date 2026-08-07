@@ -578,6 +578,7 @@ static ZC_WRITE_EXTRACT_BYTES: AtomicU64 = AtomicU64::new(0);
 static ZC_WRITE_DIRECTS: AtomicU64 = AtomicU64::new(0);
 static ZC_WRITE_DIRECT_BYTES: AtomicU64 = AtomicU64::new(0);
 static ZC_BRIDGE_CANCELS: AtomicU64 = AtomicU64::new(0);
+static ZC_BRIDGE_LOST: AtomicU64 = AtomicU64::new(0);
 
 /// Set the session's kmbuf negotiation state (0/1) — stored at arm time
 /// by `try_start` (the worker-arm wiring), a level like the geometry
@@ -717,6 +718,23 @@ pub fn note_zc_bridge_cancel() {
 /// census).
 pub fn zc_bridge_cancels() -> u64 {
     ZC_BRIDGE_CANCELS.load(Ordering::Relaxed)
+}
+
+/// Count one PROVEN lost ring completion (the `-ENOENT` arm of the
+/// lost-CQE resolution ladder): a deadline cancel found NO op in
+/// flight while the pend was still live — the completion posted and
+/// never reached the worker; the resolution was synthesized.
+pub fn note_zc_bridge_lost() {
+    ZC_BRIDGE_LOST.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `fuse3_zc_bridge_lost` (stats inode): **must stay 0** — each count
+/// is a ring completion the kernel posted that the transport never
+/// reaped (the zcws-9 W4 class), recovered by synthesis. Split from
+/// [`zc_bridge_cancels`] so the field discriminates lost-CQE (this;
+/// kernel-side evidence) from stuck-op (cancels without losses).
+pub fn zc_bridge_lost() -> u64 {
+    ZC_BRIDGE_LOST.load(Ordering::Relaxed)
 }
 
 // ---------------------------------------------------------------------

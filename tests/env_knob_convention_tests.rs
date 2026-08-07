@@ -438,6 +438,14 @@ fn documented_defaults_match_the_shipped_ones() {
         ("SQUEEZEFS_REWRITE_SHADOW", true),
         ("SQUEEZEFS_DISCARD_ELISION", true),
         ("SQUEEZEFS_FUSE_KMBUF", true),
+        // NOT flipped (zc-bridge-cqe-wedge campaign, 2026-08-07): the
+        // zcws-10 bracket on the FIXED transport ran wedge-free with
+        // zero tripwires but failed the flip rule's perf gates (rand4k
+        // 0.796×, rand4kow 0.924×, read sentinel 33.99 < 39.5 GB/s) —
+        // `.benchmarks/2026-08-07-zc-bridge-cqe-wedge.md` §6 is the
+        // adjudication. The default stays OFF until a counted bracket
+        // passes the standing rule.
+        ("SQUEEZEFS_FUSE_ZC", false),
         ("SQUEEZEFS_FREE_FORENSICS", false),
         ("SQUEEZEFS_OP_PROFILE", false),
         ("SQUEEZEFS_INPLACE_OVERWRITE", false),

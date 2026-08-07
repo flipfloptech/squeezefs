@@ -395,6 +395,24 @@ fn pending_tokens_snapshot_reports_inflight_ring_ops_oldest_first() {
 }
 
 #[test]
+fn pending_tokens_into_matches_the_allocating_form() {
+    // Reap-fanin ceremony economy (2026-08-08): the reusable-buffer form
+    // must report exactly the allocating snapshot (same set, same
+    // oldest-first order), EXTENDING the caller's buffer.
+    let mut st = AioCtxState::new();
+    let (mut ring, mut kern) = (FakeRing::default(), FakeKernel::default());
+    use IocbClass::*;
+    submit(&mut st, &mut ring, &mut kern, &[Ring, Ring, Kernel, Ring]);
+    let mut buf: Vec<RingToken> = Vec::new();
+    st.pending_tokens_into(&mut buf);
+    assert_eq!(buf, st.pending_tokens(), "same set, same order");
+    // Reuse across passes: clear-then-fill is the loop's contract.
+    buf.clear();
+    st.pending_tokens_into(&mut buf);
+    assert_eq!(buf.len(), 3);
+}
+
+#[test]
 fn destroy_abandons_ring_pendings_without_delivering() {
     let mut st = AioCtxState::new();
     let (mut ring, mut kern) = (FakeRing::default(), FakeKernel::default());

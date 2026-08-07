@@ -158,6 +158,29 @@ pub fn kernel_lane_min_default(
     grained.clamp(lo, max_op_bytes)
 }
 
+/// The libaio deep-regime **batch-wake threshold** (reap-fanin campaign,
+/// 2026-08-08): how many completions a batch-parked reaper lets the
+/// daemon elide before the wake — `clamp(pending/4, 2, pending)`,
+/// derived from the caller's OWN in-flight population on the session
+/// (never a constant; the parked-gate history is `REAP_EVENT_PARK_MAX`
+/// 24 → 2, the 2026-07-28 wake-herd conviction).
+///
+/// The shape: `pending/4` amortizes the wake syscall + reaper wakeup
+/// over a quarter of the visible depth — deep enough that the daemon's
+/// wake rate falls ~4× below the flat park's measured herd (0.8
+/// wakes/op at 32×8), shallow enough that a completion BURST (the
+/// daemon drains CQs in batches) trips the mark inside the age bound
+/// instead of sleeping it out. Rails, each structural: floor 2 = the
+/// first value distinguishable from the flat event park (k=1 IS the
+/// sparse regime, `REAP_EVENT_PARK_MAX` already owns that boundary);
+/// ceiling `pending` = the LIVENESS cap (`CqeDoorbell::park_begin_batch`'s
+/// contract: an admitted sleeper needs k more completions to exist, and
+/// only its own pending ops are guaranteed to produce them) — the
+/// ceiling DOMINATES the floor, so degenerate pending never violates it.
+pub fn reap_batch_wake_threshold(pending: usize) -> u32 {
+    (pending / 4).max(2).min(pending.max(1)) as u32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +262,37 @@ mod tests {
             assert!(
                 il_drain_lanes_default(cpus) >= il_sessions_default(cpus),
                 "dominance broken at cpus={cpus}"
+            );
+        }
+    }
+
+    /// The batch-wake threshold (reap-fanin 2026-08-08): depth-derived,
+    /// liveness-capped, floor-2 (k=1 belongs to the sparse regime).
+    #[test]
+    fn reap_batch_wake_threshold_values() {
+        assert_eq!(
+            reap_batch_wake_threshold(0),
+            1,
+            "degenerate: liveness cap dominates the floor"
+        );
+        assert_eq!(reap_batch_wake_threshold(1), 1, "liveness: k ≤ pending");
+        assert_eq!(reap_batch_wake_threshold(2), 2);
+        assert_eq!(
+            reap_batch_wake_threshold(3),
+            2,
+            "the deep arm's smallest engagement (REAP_EVENT_PARK_MAX + 1)"
+        );
+        assert_eq!(reap_batch_wake_threshold(8), 2, "qd8: floor");
+        assert_eq!(reap_batch_wake_threshold(16), 4);
+        assert_eq!(reap_batch_wake_threshold(32), 8, "the field qd32 shape");
+        assert_eq!(reap_batch_wake_threshold(128), 32);
+        // Liveness law pointwise: k never exceeds the pending population
+        // that must produce the wake (pending ≥ 1).
+        for pending in 1..=4096usize {
+            let k = reap_batch_wake_threshold(pending) as usize;
+            assert!(
+                k <= pending && k >= 1,
+                "liveness broken at pending={pending}: k={k}"
             );
         }
     }

@@ -1221,6 +1221,25 @@ impl Session {
         }
     }
 
+    /// Batch-threshold park entry (reap-fanin 2026-08-08): like
+    /// [`Self::cqe_park_begin`] but the daemon elides completion wakes
+    /// until the k-th post-snapshot completion — the deep-regime reap's
+    /// event-driven replacement for the blind batch sleep. LIVENESS is
+    /// the caller's half: `k` must not exceed its own pending-op
+    /// population on THIS session, and the wait on the returned entry
+    /// must stay bounded (both are what
+    /// [`squeezefs_ipc::cqe_core::CqeDoorbell::park_begin_batch`]'s
+    /// contract demands; `sizing::reap_batch_wake_threshold` derives a
+    /// conforming k). Same disarm→scan law, same `cqe_park_end` balance.
+    pub fn cqe_park_begin_batch(&self, k: u32) -> WaitEntry<'_> {
+        let cqe = &self.header().cqe;
+        let expected = cqe.park_begin_batch(k);
+        WaitEntry {
+            word: cqe.seq_word(),
+            expected,
+        }
+    }
+
     /// Deregister a [`Self::cqe_park_begin`] after the wait returns
     /// (wake, EAGAIN, or timeout — every §5.3.1-rule-5-bounded exit).
     pub fn cqe_park_end(&self) {

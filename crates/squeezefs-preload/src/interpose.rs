@@ -2389,6 +2389,15 @@ unsafe fn aio_reap_served(
         };
         let (min_nr, nr) = (min_nr.max(0) as usize, nr as usize);
         let mut got = 0usize;
+        // Pass-reused ceremony buffers (reap-fanin ceremony economy,
+        // 2026-08-08): the reap loop used to allocate its park snapshot,
+        // token buffer and wait-entry vectors PER EMPTY PASS on the host
+        // app's malloc — pure churn at fan-in, where empty passes are
+        // the steady state. One set per call, cleared per pass.
+        let mut parks: Vec<(usize, OpTicket)> = Vec::new();
+        let mut tok_buf: Vec<crate::aio_core::RingToken> = Vec::new();
+        let mut entries: Vec<crate::session::WaitEntry<'static>> = Vec::new();
+        let mut parked_tokens: Vec<usize> = Vec::new();
         loop {
             // One merge pass per lock hold. Ring-involved passes carry a
             // ZERO budget (non-blocking: harvest + kernel probes only) —
@@ -2398,7 +2407,7 @@ unsafe fn aio_reap_served(
             // kernel-lane-only shape waits inside the pass (the real
             // io_getevents wake is already event-driven there), bounded
             // ≤ ~50 ms per hold as before.
-            let mut parks: Vec<(usize, OpTicket)> = Vec::new();
+            parks.clear();
             let (evs, ring_pending, kernel_pending) = {
                 let mut c = m.lock().unwrap_or_else(|p| p.into_inner());
                 let AioCtx { state, tickets } = &mut *c;
@@ -2426,7 +2435,9 @@ unsafe fn aio_reap_served(
                 if evs.is_empty() && ring_pending > 0 {
                     // Park snapshot: (session token, ticket) per pending
                     // ring op — resolved to wait entries outside the lock.
-                    for tok in state.pending_tokens() {
+                    tok_buf.clear();
+                    state.pending_tokens_into(&mut tok_buf);
+                    for tok in tok_buf.iter() {
                         if let Some(Some(t)) = tickets.get(tok.0 as usize).map(Option::as_ref) {
                             parks.push((t.session, t.ticket));
                         }
@@ -2465,26 +2476,74 @@ unsafe fn aio_reap_served(
                 std::thread::sleep(std::time::Duration::from_micros(200));
                 continue;
             }
-            // Ring ops pending, nothing ready. Deep-pending sets batch
-            // on a SHORT bounded sleep instead of event-parking (sized
-            // 2026-07-26 under the per-ticket WAITER economics; the
-            // completion doorbell collapsed those costs — see the
-            // REAP_EVENT_PARK_MAX doc — so the threshold is a Phase B
-            // re-measure candidate). The quantum is 50 µs, only ever
-            // taken with ≥ REAP_EVENT_PARK_MAX ops in flight, so its
-            // latency contribution is bounded by depth; the SPARSE
-            // regime — where the 200 µs/5 ms quantum actually shaped
-            // completion latency and max-latency tails — stays fully
-            // event-driven below.
+            // Ring ops pending, nothing ready. Deep-pending sets take
+            // the BATCH-THRESHOLD doorbell park (reap-fanin 2026-08-08 —
+            // replaces the blind `reap_quantum()` sleep, whose
+            // quantum/2 mean observation lag PLUS nanosleep timer slack
+            // and runqueue delay under fan-in was the field's ~1.2 ms
+            // mean / ×5-tail client-observation segment at 32×32): the
+            // park registers a wake MARK of k completions (depth-derived,
+            // liveness-capped per session — `reap_batch_wake_threshold`),
+            // so a completion BURST cuts the wait short (event-exact)
+            // while the daemon still pays ≤ 1 wake per k completions —
+            // never the flat park's wake-per-completion herd (the
+            // REAP_EVENT_PARK_MAX 24→2 history). The age bound is the
+            // SAME `SQUEEZEFS_IL_REAP_QUANTUM_US` quantum the sleep
+            // used: the worst case is exactly the shipped posture.
+            // No pre-park spin here (the sparse arm keeps its 4-sweep
+            // spin): at fan-in the spin's O(sweeps × qd) remote-line
+            // probes are CPU theft, and the park's own admission +
+            // mandatory re-scan already cover the just-completing case.
             if parks.len() > reap_event_park_max() {
-                let quantum = reap_quantum();
-                let bound = match deadline {
-                    None => quantum,
-                    Some(d) => d
-                        .saturating_duration_since(std::time::Instant::now())
-                        .min(quantum),
-                };
-                std::thread::sleep(bound);
+                entries.clear();
+                parked_tokens.clear();
+                for (token, _) in parks.iter() {
+                    if parked_tokens.contains(token) {
+                        continue;
+                    }
+                    let Some(session) = registry().by_token(*token) else {
+                        continue; // session gone: its poll resolves next pass
+                    };
+                    let pending_here = parks.iter().filter(|(t, _)| t == token).count();
+                    let k = squeezefs_ipc::sizing::reap_batch_wake_threshold(pending_here);
+                    entries.push(session.cqe_park_begin_batch(k));
+                    parked_tokens.push(*token);
+                }
+                // The mandatory post-registration re-scan (disarm→scan
+                // law — a completion that beat the registration is found
+                // here; one that lands after it either fails the wait's
+                // admission on the moved seq or counts toward the mark).
+                let mut ready = false;
+                for (token, t) in parks.iter() {
+                    if registry()
+                        .by_token(*token)
+                        .is_some_and(|s| s.ticket_done(*t))
+                    {
+                        ready = true;
+                        break;
+                    }
+                }
+                if !ready && !entries.is_empty() {
+                    let quantum = reap_quantum();
+                    let bound = match deadline {
+                        None => quantum,
+                        Some(d) => d
+                            .saturating_duration_since(std::time::Instant::now())
+                            .min(quantum),
+                    };
+                    crate::session::wait_any(&entries, bound);
+                }
+                for token in &parked_tokens {
+                    if let Some(s) = registry().by_token(*token) {
+                        s.cqe_park_end();
+                    }
+                }
+                if entries.is_empty() && !ready {
+                    // No waitable session (all poisoned/gone): the next
+                    // pass resolves the tickets as -EIO; don't spin the
+                    // lock at full speed while it does.
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
                 continue;
             }
             // Sparse pending set: EVENT-DRIVEN park outside
@@ -2529,8 +2588,8 @@ unsafe fn aio_reap_served(
             // ctxs sharing a session wake us spuriously — bounded,
             // re-scan); both-lanes shapes cap at the kernel-probe slice
             // (kernel completions cannot wake a futex).
-            let mut entries: Vec<crate::session::WaitEntry<'static>> = Vec::with_capacity(4);
-            let mut parked_tokens: Vec<usize> = Vec::with_capacity(4);
+            entries.clear();
+            parked_tokens.clear();
             for (token, _) in parks.iter() {
                 if parked_tokens.contains(token) {
                     continue;
@@ -2599,8 +2658,10 @@ const KERNEL_LANE_SLICE: std::time::Duration = std::time::Duration::from_millis(
 /// on sessions this park never registered on.
 const RING_PARK_RECHECK: std::time::Duration = std::time::Duration::from_millis(5);
 
-/// Above this many in-flight ring ops the reap batches on a 50 µs
-/// bounded sleep instead of event-parking. RE-SIZED **24 → 2** by the
+/// Above this many in-flight ring ops the reap takes the deep regime —
+/// since 2026-08-08 (reap-fanin) a BATCH-THRESHOLD doorbell park (wake
+/// at the k-th completion, age-bounded at the reap quantum) where it
+/// used to blind-sleep the quantum. RE-SIZED **24 → 2** by the
 /// 2026-07-28 Phase B counted A/B (fabric-latency venue, medians of 3,
 /// engagement exact — `.benchmarks/2026-07-28-ipc-op-economy.md` §B.3):
 /// under the completion DOORBELL, an event-parked reaper on a SHARED
@@ -2631,15 +2692,18 @@ fn reap_event_park_max_from(v: Option<&str>) -> usize {
         .unwrap_or(REAP_EVENT_PARK_MAX)
 }
 
-/// Deep-regime batch-reap sleep quantum, µs (shim-iops campaign,
-/// 2026-08-07). The 50 µs default is the shipped 2026-07-26 sizing; the
-/// campaign's decomposition measured the blind sleep as the dominant
-/// residence term at low fan-in (1×qd8: 75.5 k → 344.8 k IOPS with the
-/// sleep replaced by the event park) and a bunching term at fleet
-/// shapes, so `SQUEEZEFS_IL_REAP_QUANTUM_US` is the counted-measurement
-/// lever. Clamp 1..=1000: 0 would busy-spin (spin policy belongs to
-/// `SQUEEZEFS_IL_SPINS`, never this knob), and past 1 ms the sparse
-/// regime's event park is strictly better.
+/// Deep-regime reap quantum, µs (shim-iops campaign 2026-08-07; role
+/// re-graded by reap-fanin 2026-08-08). The 50 µs default is the
+/// shipped 2026-07-26 sizing. It used to be a BLIND sleep — the
+/// decomposition measured it as the dominant residence term at low
+/// fan-in (1×qd8: 75.5 k → 344.8 k IOPS with the sleep replaced by the
+/// event park) and a bunching term at fleet shapes. Since the
+/// batch-threshold park it is the park's AGE BOUND: the k-th completion
+/// cuts the wait short, the quantum caps it — worst case identical to
+/// the blind sleep it replaced. `SQUEEZEFS_IL_REAP_QUANTUM_US` remains
+/// the counted-measurement lever. Clamp 1..=1000: 0 would busy-spin
+/// (spin policy belongs to `SQUEEZEFS_IL_SPINS`, never this knob), and
+/// past 1 ms the sparse regime's event park is strictly better.
 const REAP_BATCH_QUANTUM_US: u64 = 50;
 
 fn reap_quantum() -> std::time::Duration {

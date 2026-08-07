@@ -152,6 +152,14 @@ impl AioCtxState {
         self.pending.iter().map(|p| p.tok).collect()
     }
 
+    /// Zero-alloc form of [`Self::pending_tokens`] (reap-fanin ceremony
+    /// economy, 2026-08-08): extend `out` with the pending tokens,
+    /// oldest first — the reap loop reuses ONE buffer across passes
+    /// instead of allocating per empty pass on the host app's malloc.
+    pub fn pending_tokens_into(&self, out: &mut Vec<RingToken>) {
+        out.extend(self.pending.iter().map(|p| p.tok));
+    }
+
     /// The lane-split `io_submit` walk. `classes[i]` classifies
     /// `iocb_ids[i]`; `data_of` supplies each iocb's completion cookie
     /// (captured AT SUBMIT — the client may recycle the iocb after the

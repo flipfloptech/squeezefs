@@ -1334,6 +1334,13 @@ mod tests {
             "zero-length still counts the op"
         );
         assert_eq!(zc_write_extract_bytes(), wb0 + 4096);
+        // Bridge-deadline tripwire (zc-bridge-cqe-wedge, 2026-08-07):
+        // every AsyncCancel pushed at a bridge deadline counts — the
+        // must-stay-0 face of the bounded-outcome law (nonzero names a
+        // bridge op the ring never completed inside the deadline).
+        let c0 = zc_bridge_cancels();
+        note_zc_bridge_cancel();
+        assert_eq!(zc_bridge_cancels(), c0 + 1);
     }
 
     /// `uses_kmbuf` composition — the zc arm is bufring-plus.

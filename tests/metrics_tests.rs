@@ -927,6 +927,7 @@ async fn fuse_zc_ledger_always_exports_under_metrics() {
         "fuse3_zc_write_extract_bytes",
         "fuse3_zc_write_directs",
         "fuse3_zc_write_direct_bytes",
+        "fuse3_zc_bridge_cancels",
         "read_zc_serve_bytes",
     ];
 

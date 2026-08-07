@@ -8289,7 +8289,7 @@ mod drain_group_tests {
         for member in [0usize, 1, 15, 31] {
             for ent in [0usize, 1, depth - 1] {
                 let gent = member * depth + ent;
-                for op in [RingOp::Register, RingOp::Commit] {
+                for op in [RingOp::Register, RingOp::Commit, RingOp::Fetch, RingOp::Cancel] {
                     let ud = encode_user_data(op, gent);
                     assert_eq!(decode_user_data(ud), Some((op, gent)));
                 }

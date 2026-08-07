@@ -505,6 +505,50 @@ mod tests {
         assert_eq!(t.get(0, 1), None);
     }
 
+    /// The bridge-deadline ledger (zc-bridge-cqe-wedge campaign,
+    /// 2026-08-07): every in-flight zc bridge op must have a BOUNDED
+    /// outcome — a worker parked forever on a CQE that never comes
+    /// violates the transport's own FUSE-2 discipline. The ledger
+    /// stamps a pend at issue, clears it at resolution, yields overdue
+    /// ents exactly once (the cancel-once law — an `AsyncCancel` is
+    /// pushed per overdue pend, and the ORIGINAL op's CQE — completed
+    /// or `-ECANCELED` — resolves through the existing loud fallback
+    /// ladders), and re-arms the stamp if the pend somehow survives a
+    /// cancel round (never silent, never a second cancel storm per
+    /// scan).
+    #[test]
+    fn test_bridge_deadline_ledger() {
+        let mut l = BridgeDeadlines::new(4);
+        assert!(l.overdue(1_000_000, 500_000).is_empty(), "empty ledger");
+        l.stamp(1, 100);
+        l.stamp(3, 200);
+        assert_eq!(l.outstanding(), 2);
+        // Not yet overdue.
+        assert!(l.overdue(250, 500).is_empty());
+        // Both overdue at now=1000, timeout=500 — yielded ONCE.
+        assert_eq!(l.overdue(1_000, 500), vec![1, 3]);
+        assert!(
+            l.overdue(2_000, 500).is_empty(),
+            "cancel-once: a second scan must not re-yield a canceled pend"
+        );
+        // Resolution clears the stamp AND the cancel latch.
+        l.clear(1);
+        assert_eq!(l.outstanding(), 1);
+        l.stamp(1, 3_000);
+        assert!(
+            l.overdue(3_100, 500).is_empty(),
+            "a fresh pend on a recycled ent starts a fresh deadline"
+        );
+        assert_eq!(l.overdue(4_000, 500), vec![1]);
+        l.clear(1);
+        l.clear(3);
+        assert_eq!(l.outstanding(), 0);
+        // Out-of-range never panics.
+        l.stamp(9, 1);
+        l.clear(9);
+        assert!(l.overdue(u64::MAX, 0).is_empty());
+    }
+
     /// The bounce arena is real dual-face memory: bytes written by VA
     /// are readable through the FD (the ring's view) and vice versa —
     /// runs on ANY kernel (memfd + mmap only, no uring surface).

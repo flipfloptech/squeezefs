@@ -27,6 +27,20 @@
 # cross-checked against these proxies and against throughput ratios —
 # never presented as measured DRAM bytes.
 #
+# FIO ENGINE POLICY (user ruling 2026-08-07 — the matched-instrument law;
+# `.benchmarks/2026-08-07-fio-engine-policy.md`): throughput/IOPS rows
+# are libaio+direct+stated-qd both lanes; A/Bs use the SAME engine both
+# sides; psync survives only as labeled sync-lane coverage.
+#
+# SYNC-LANE COVERAGE RIG — psync by design, matched engine on every arm:
+# the census's MEASURAND is the sync-lane copy machinery itself (the
+# §5.5.2 ring-write sever + §5.5.1 arena completion serves — the two
+# DMA-destined copy sites the NT-store lever rides), so every row runs
+# fio psync 1m through the same client lane on both A/B arms. These are
+# copy-ledger instrument rows, NEVER headline throughput numbers (the
+# ledger's per-byte numbers are code-derived counts cross-checked
+# against the proxies below).
+#
 # Substrate: the TCP devsub (`SQZ_DEVSUB_TRANSPORT=tcp
 # tests/dev_substrate.sh create`) — the fabric-sensitive venue (two-
 # substrate rule; write rows are INVALID on loop). Namespace discovery
@@ -165,6 +179,8 @@ row() { # row <name> <shim01> <rw> <fresh|keep|cold> [extra fio args...]
         perf stat -p "$dpid" -e "$PERF_EVENTS" -o "$base.dmn.perf" &
         local perfpid=$!
         sleep 0.2
+        # SYNC-LANE COVERAGE ROW — psync by design (header): the §5.5.1/
+        # §5.5.2 sync-lane copy sites are the measurand; NOT a headline.
         "${pfx[@]}" perf stat -e "$PERF_EVENTS" -o "$base.fio.perf" -- \
             fio --name="$name" --directory="$dir" --filename_format='f$jobnum' \
             --numjobs="$THREADS" --thread --group_reporting --ioengine=psync \

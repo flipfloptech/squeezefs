@@ -14,6 +14,10 @@
 # qd8 libaio overwrite storm 20 s, sweeper horizon is 30 s so we also
 # quiesce 40 s and re-read (the field's randread-face). PASS = zero fio
 # EIO on every read leg AND zero fsck findings. Exit nonzero on any.
+#
+# FIO ENGINE POLICY (user ruling 2026-08-07;
+# `.benchmarks/2026-08-07-fio-engine-policy.md`): libaio + direct=1 +
+# stated iodepth on every row — this repro rig is libaio-compliant.
 set -u
 SQZ=${SQZ:-target/release/squeezefs}
 MNT=${MNT:-/mnt/sqz_refdrift}

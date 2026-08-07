@@ -10,37 +10,58 @@
 # per-pass engine law, FAIRNESS (matched offered concurrency + cold-read
 # discipline), the KD-7 identity screen, and the report.
 #
+# FIO ENGINE POLICY (user ruling 2026-08-07 — the matched-instrument law;
+# `.benchmarks/2026-08-07-fio-engine-policy.md`):
+#   1. Throughput/IOPS rows: ioengine=libaio + direct=1 + stated iodepth,
+#      BOTH lanes (kernel and il). il libaio rides the v1.1 aio interposers
+#      (`.benchmarks/2026-07-19-v1.1-libaio-interposers.md`); each row's
+#      engagement gate checks the counters ITS lane actually moves.
+#   2. Any A/B comparison (kernel-vs-shim, armed-vs-control) uses the SAME
+#      engine both sides — never kernel-libaio vs shim-psync.
+#   3. psync survives ONLY as explicitly-labeled sync-lane coverage rows
+#      (the §5.5.1 sync fast path as measurand) — never a headline, never
+#      cross-lane compared.
+#   4. Buffered rows never silently use libaio (it degrades to sync) —
+#      engine choice stated per row. All rows here are direct=1.
+#   5. ioengine=io_uring is admissible only as a labeled kernel-lane extra
+#      (the shim cannot interpose io_uring — never on il rows).
+#
 # Battery (default; --rows subsets): the four EXA-parity canon rows —
 #   write_bw   exa_write_bw.job        bs=1M  (also the read rows' prefill)
 #   read_bw    exa_read_bw.job         bs=1M
 #   randwrite  exa_randwrite_iops.job  bs=4k
 #   randread   exa_randread_iops.job   bs=4k
-# EXA shape fidelity on the KERNEL pass: libaio, direct=1, qd=8,
+# EXA shape fidelity on BOTH passes: libaio, direct=1, qd=8,
 # 30 s + 10 s ramp, size=1g/job, njobs=nproc NUMA-split. --sustain lifts
 # runtime to 60 s (the house sustain law; the report states which ran).
 #
 # FAIRNESS, visible by construction (2026-08-02 il-anomalies window —
 # `.benchmarks/2026-08-02-il-anomalies.md`):
-#   * Matched offered concurrency: psync is structurally qd=1, so a psync
-#     shim pass at the kernel pass's njobs offers 1/qd the in-flight ops —
-#     the two prior table flaws' root. By default the psync pass scales
-#     njobs to njobs×qd so IN-FLIGHT MATCHES the kernel pass
-#     (--no-match-inflight restores raw njobs); the per-pass in-flight
-#     figure prints in the table either way, so unmatched rows can never
-#     read as path deltas.
+#   * Matched instrument + offered concurrency: both passes run the SAME
+#     engine at the same njobs×qd, so in-flight matches by construction
+#     (the per-pass in-flight figure still prints in the table; the psync
+#     njobs×qd scaling survives only for the opt-in sync_lane row).
 #   * Cold-read discipline: a read row is COLD only if (a) --allow-remount
 #     let the script remount between passes (captured daemon cmdline+env,
 #     same binary, restore-verified), or (b) the fileset overflows RAM
 #     warmth by construction (set bytes ≥ 2× the R5 `mem_budget_bytes`).
 #     Otherwise the pass prints `WARM (label-only)` — never a bare number.
 #
-# SHIM pass engine law (measured, not assumed: a bs=1M libaio pass through
-# the shim measured engagement 0.000 on 2026-08-02 — ops at the slab
-# boundary ride the kernel lane): bs=1M rows run psync through the shim,
-# bs=4k rows keep libaio (the il libaio interposers). Engine + in-flight
-# are labeled per pass; the runner's engagement verdict governs — a
-# silent-passthrough shim pass is printed INVALID (passthrough), never
-# presented as a shim number.
+# SHIM-pass geometry law (the v1.1 single-slot aio screen,
+# crates/squeezefs-preload/src/aio_glue.rs `screen_iocb`): an aio op with
+# nbytes > the session slot slab (= min(arena/slots, max_op_bytes);
+# 64 KiB at the derived floor, slots = 1024) rides the KERNEL lane by
+# design — a bs=1M shim libaio row engages the ring only when the mount's
+# geometry covers it (daemon env SQUEEZEFS_IPC_ARENA_MB >= 1024 gives a
+# 1 MiB slab; the 2026-08-02 "engagement 0.000" probe ran the derived
+# floor). The runner's engagement verdict governs — a silent-passthrough
+# shim pass is printed INVALID (passthrough) with a loud geometry hint,
+# never presented as a shim number.
+#
+# Optional sync-lane row (--rows ...,sync_lane; shim pass only, no kernel
+# twin, excluded from the side-by-side delta table):
+# SYNC-LANE COVERAGE ROW — psync by design, measures the §5.5.1 sync fast
+# path (the multi-slab claim_run write chunking); NOT a headline number.
 #
 # Integrity screens:
 #   * KD-7: the shim must embed the MOUNTED daemon's build commit
@@ -55,11 +76,13 @@
 # usage:
 #   tests/fio/exa_client_perf.sh --mount <mountpoint> --shim <libsqueezefs_il.so>
 #       [--dir <dir>]                (default <mountpoint>/exa_perf)
-#       [--rows write_bw,read_bw,randwrite,randread]   (default: all four)
+#       [--rows write_bw,read_bw,randwrite,randread]   (default: all four;
+#                                     add sync_lane for the labeled psync
+#                                     sync-fast-path coverage row)
 #       [--sustain]                  (60 s rows instead of 30 s)
 #       [--allow-remount]            (cold reads via remount between passes;
 #                                     captures + restores the daemon cmdline/env)
-#       [--no-match-inflight]        (psync shim passes keep raw njobs)
+#       [--no-match-inflight]        (psync sync_lane pass keeps raw njobs)
 #       [--njobs N] [--size 1g]      (runner defaults: nproc / 1g)
 #       [--data-devs nvme4n1:..]     (diskstats amp columns per row)
 #       [--substrate S] [--fill S]   (venue labels, printed + persisted)
@@ -70,7 +93,7 @@ set -u
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)
 RUNNER="$SCRIPT_DIR/run_fio_row.sh"
 
-usage() { sed -n '56,71p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+usage() { sed -n '/^# usage:/,/run nothing)$/p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 MOUNT="" SHIM="" DIR="" ROWS="write_bw,read_bw,randwrite,randread"
@@ -200,12 +223,17 @@ cold_guarantee() {
 
 # ---- the battery ------------------------------------------------------------
 # row spec: name | job | class(read/write) | bs | qd | kernel engine | shim engine
+# Engine policy rule 1+2: every headline row is libaio on BOTH passes
+# (matched instrument). sync_lane is the rig's ONE labeled psync row
+# (rule 3): shim pass only (kernel engine "-" skips the kernel pass),
+# opt-in via --rows, excluded from the side-by-side delta table.
 battery() {
     cat <<EOF
-write_bw|exa_write_bw.job|write|1M|8|libaio|psync
-read_bw|exa_read_bw.job|read|1M|8|libaio|psync
+write_bw|exa_write_bw.job|write|1M|8|libaio|libaio
+read_bw|exa_read_bw.job|read|1M|8|libaio|libaio
 randwrite|exa_randwrite_iops.job|write|4k|8|libaio|libaio
 randread|exa_randread_iops.job|read|4k|8|libaio|libaio
+sync_lane|exa_write_bw.job|write|1M|8|-|psync
 EOF
 }
 
@@ -270,6 +298,20 @@ HINT: ipc_bind_refused_budget grew by $((b1 - b0)) during the $label pass —
       suspect until resolved.
 HINT
         fi
+        # Engine-policy geometry hint: a big-bs shim LIBAIO pass that read
+        # INVALID(passthrough) most likely hit the v1.1 single-slot aio
+        # screen (nbytes > slot slab rides the kernel lane by design).
+        if [ "$rc" -eq 4 ] && [ "$engine" = "libaio" ] && [ "$bs" != "4k" ]; then
+            cat >&2 <<HINT
+HINT: the $label pass (libaio bs=$bs) read INVALID(passthrough). The v1.1
+      aio interposers are single-slot: an iocb with nbytes > the session
+      slot slab (= min(arena/1024 slots, max_op_bytes); 64 KiB at the
+      derived arena floor) rides the KERNEL lane by design. Mount the
+      daemon with SQUEEZEFS_IPC_ARENA_MB=1024 (slab = 1 MiB) — plus
+      SQUEEZEFS_IPC_MEM_MAX sized for sessions x arena — so bs=1M aio
+      ops are ring-eligible, then re-run this row.
+HINT
+        fi
     fi
     return "$rc"
 }
@@ -284,11 +326,13 @@ header() {
               $NNODES node(s), engagement off the stats inode, per-row artifacts)
  mode       : $MODE
  shape      : size=$SIZE/job, base njobs=$NJOBS (NUMA-split), direct=1
-              kernel pass: libaio qd=8 (EXA canon dims)
-              shim pass  : psync for bs=1M rows / libaio for bs=4k rows
-              (measured: bs=1M libaio through the shim rides the kernel
-              lane — engagement 0.000; engines + IN-FLIGHT labeled per
-              pass, matched by default: psync njobs scale to njobs x qd)
+              BOTH passes: libaio qd=8 (EXA canon dims — the matched-
+              instrument law: same engine, same in-flight, both lanes;
+              shim bs=1M libaio needs slot slab >= 1 MiB — mount with
+              SQUEEZEFS_IPC_ARENA_MB=1024 — or the row prints INVALID
+              (passthrough) per the v1.1 single-slot aio screen)
+              sync_lane (opt-in): psync — SYNC-LANE COVERAGE ROW, the
+              §5.5.1 sync fast path; NOT a headline number
  cold reads : $([ "$ALLOW_REMOUNT" -eq 1 ] && echo "remount between passes (--allow-remount)" || echo "overflow check only (un-guaranteed rows print WARM)")
  mount      : $MOUNT (daemon build $MOUNT_COMMIT)
  shim       : $SHIM (KD-7 same-commit verified)
@@ -306,12 +350,15 @@ render_table() {
 import json, os, sys
 
 results, rows = sys.argv[1], [r for r in sys.argv[2].split(",") if r]
+# Engine policy: every headline pair is libaio/libaio (matched instrument).
+# sync_lane renders OUTSIDE this table (shim-only labeled psync coverage).
 SPEC = {
-    "write_bw":  ("write", "bw",   "1M", ("libaio", "psync")),
-    "read_bw":   ("read",  "bw",   "1M", ("libaio", "psync")),
+    "write_bw":  ("write", "bw",   "1M", ("libaio", "libaio")),
+    "read_bw":   ("read",  "bw",   "1M", ("libaio", "libaio")),
     "randwrite": ("write", "iops", "4k", ("libaio", "libaio")),
     "randread":  ("read",  "iops", "4k", ("libaio", "libaio")),
 }
+rows = [r for r in rows if r != "sync_lane"]
 
 def sidecar(label, suffix):
     try:
@@ -418,10 +465,14 @@ journal "START battery rows=$ROWS mode=\"$MODE\" njobs=$NJOBS match_inflight=$MA
 FAILED_HARD=0
 while IFS='|' read -r row job class bs qd keng seng; do
     want_row "$row" || continue
-    run_pass "$row" "$job" "$class" "$bs" "$qd" "$keng" kernel || {
-        rc=$?
-        [ "$rc" -ne 4 ] && FAILED_HARD=1
-    }
+    # Engine "-" = no kernel pass for this row (the sync_lane coverage
+    # row is shim-only by design — rule 3: never cross-lane compared).
+    if [ "$keng" != "-" ]; then
+        run_pass "$row" "$job" "$class" "$bs" "$qd" "$keng" kernel || {
+            rc=$?
+            [ "$rc" -ne 4 ] && FAILED_HARD=1
+        }
+    fi
     run_pass "$row" "$job" "$class" "$bs" "$qd" "$seng" shim || {
         rc=$?
         [ "$rc" -ne 4 ] && FAILED_HARD=1
@@ -435,6 +486,19 @@ fi
 
 echo
 render_table | tee -a "$REPORT"
+# sync_lane (when requested): printed OUTSIDE the delta table, labeled.
+if want_row sync_lane && [ -d "$RESULTS/sync_lane-shim" ]; then
+    {
+        echo "SYNC-LANE COVERAGE ROW — psync by design, measures the §5.5.1"
+        echo "sync fast path; NOT a headline number, never cross-lane compared:"
+        python3 - "$RESULTS/sync_lane-shim/sync_lane-shim.json" <<'EOF' || echo "  (no data)"
+import json, sys
+fio = json.load(open(sys.argv[1]))
+bw = sum(j.get("write", {}).get("bw_bytes", 0) for j in fio["jobs"])
+print(f"  sync_lane-shim (psync 1M write): {bw / 1e9:.2f} GB/s")
+EOF
+    } | tee -a "$REPORT"
+fi
 echo "report: $REPORT"
 journal "DONE report=$REPORT failed_hard=$FAILED_HARD"
 exit "$FAILED_HARD"

@@ -19,6 +19,13 @@
 # Venue law: run on the TCP dev substrate (fabric-sensitive row —
 # the two-substrate rule); state instrument + substrate on every use.
 #
+# FIO ENGINE POLICY (user ruling 2026-08-07;
+# `.benchmarks/2026-08-07-fio-engine-policy.md`): throughput/IOPS rows =
+# ioengine=libaio + direct=1 + stated iodepth, BOTH lanes; A/Bs use the
+# SAME engine both sides; psync only as labeled sync-lane coverage rows;
+# io_uring = labeled kernel-lane extra. This rig is libaio-compliant
+# (all rows: prefill + every njobs x qd sweep point).
+#
 # usage: transport_ingress_sweep.sh --mount <mnt> [--dir <dir>]
 #        [--points "4x8 8x8 16x8 32x8"]  (njobs x qd list)
 #        [--size 512m] [--runtime 20] [--label <tag>]

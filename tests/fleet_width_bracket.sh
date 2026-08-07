@@ -4,6 +4,22 @@
 # function of PROCESS-fleet width (one shim session per client process — the
 # field's 256-session shape), bs=1M psync qd1, per the shim-parity law.
 #
+# FIO ENGINE POLICY (user ruling 2026-08-07 — the matched-instrument law;
+# `.benchmarks/2026-08-07-fio-engine-policy.md`): throughput/IOPS rows are
+# libaio+direct=1+stated iodepth both lanes; A/Bs use the SAME engine both
+# sides; psync survives only as labeled sync-lane coverage.
+#
+# SYNC-LANE COVERAGE RIG — psync by design, matched engine on BOTH arms;
+# NOT headline throughput numbers. Adjudication (same as
+# tests/fio/fleet_parity_row.sh): the measurand is the §5.5.1
+# sync-fast-path SESSION FLEET as a function of width — the v1.1
+# single-slot aio screen cannot express a bs=1M fleet (slab >= 1 MiB
+# needs SQUEEZEFS_IPC_ARENA_MB>=1024, and width x sessions x 1 GiB
+# arenas is an admission-budget impossibility at fleet widths), so a
+# libaio il fleet would silently measure the kernel lane. The default
+# rows are buffered (the field ingest shape) — psync is the explicit
+# engine choice per rule 4 (libaio degrades to sync on buffered I/O).
+#
 # Instrument (stated per the standing rule): fio psync, numjobs=N PROCESSES
 # (no --thread — each job is a fork, so each job establishes its OWN
 # session; the write_matrix's --thread shape shares ONE session registry
@@ -268,7 +284,7 @@ EOF
 }
 
 echo "results: $RESULTS  widths: $WIDTHS  bs=$BS direct=$DIRECT total=${TOTAL_MB}MB"
-echo "instrument: fio-$(fio --version 2>/dev/null | head -1) psync process-fleet qd1; substrate: nvmet-tcp devsub (localhost)"
+echo "instrument: fio-$(fio --version 2>/dev/null | head -1) psync process-fleet qd1 (SYNC-LANE COVERAGE — psync by design, §5.5.1 session fleet; NOT headline); substrate: nvmet-tcp devsub (localhost)"
 echo "label,rep,width,bw_mib_s,elapsed_s,fio_ops,ipc_ops_write,engagement" > "$CSV"
 
 kill_daemon

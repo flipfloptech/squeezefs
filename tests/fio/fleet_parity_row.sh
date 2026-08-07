@@ -7,6 +7,24 @@
 # (ipc_arena_prep_{queued,done}) off the stats inode. A shim row whose
 # engagement deltas do not account for its ops is INVALID and printed so.
 #
+# FIO ENGINE POLICY (user ruling 2026-08-07 — the matched-instrument law;
+# `.benchmarks/2026-08-07-fio-engine-policy.md`): throughput/IOPS rows are
+# libaio+direct=1+stated iodepth both lanes; A/Bs use the SAME engine both
+# sides; psync survives only as labeled sync-lane coverage.
+#
+# SYNC-LANE COVERAGE RIG — psync by design, matched engine on BOTH arms;
+# NOT headline throughput numbers. Adjudication: the measurand is the
+# §5.5.1 sync-fast-path SESSION FLEET itself (one shim session per client
+# process — the field's 256-session shape, incl. session establishment +
+# the arena-prep ledger). The il arm structurally cannot ride the aio
+# interposers at this shape: v1.1 aio is single-slot (nbytes > slot slab
+# rides the kernel lane), a bs=1M slab needs SQUEEZEFS_IPC_ARENA_MB>=1024,
+# and 256 processes x >=2 sessions x 1 GiB arenas is an admission-budget
+# impossibility — so a libaio fleet would silently measure the kernel
+# lane on the il arm (banned). Both arms run the SAME engine (rule 2
+# holds); the write rows are buffered+end_fsync (the field ingest shape),
+# where psync is the explicit engine choice per rule 4.
+#
 # usage: fleet_parity_row.sh --mount <mnt> [--njobs 256] [--size 512m]
 #        [--shim /scratch/tmp/libsqueezefs_il.so] [--out DIR]
 set -u
@@ -127,7 +145,7 @@ EOF
     rm -rf "$dir"
 }
 
-echo "== fleet parity row: njobs=$NJOBS size=$SIZE (K-I, I-K, K-I pairs) =="
+echo "== fleet parity row: njobs=$NJOBS size=$SIZE (K-I, I-K, K-I pairs) [SYNC-LANE COVERAGE — psync by design, §5.5.1 session fleet; NOT headline] =="
 for pair in "kern il" "il kern" "kern il"; do
     set -- $pair
     for arm in $1 $2; do

@@ -15,20 +15,31 @@
 #   dial4t4m_f64 — same cell, SQUEEZEFS_WRITE_PIPELINE_DEPTH_BLOCKS=64
 #                (the field's forced-optimal lever) on BOTH binaries:
 #                the fraction default/forced is the headline number.
-#   q1_4k / q1_4k_od — fio psync 4k qd1 (buffered / O_DIRECT) on the
-#                zram data namespaces: the latency-guard row — IOPS/clat
-#                must be flat A vs B and branch probe_ups must stay 0.
+#   q1_4k / q1_4k_od — fio 4k qd1 (buffered psync / O_DIRECT libaio
+#                iodepth=1) on the zram data namespaces: the
+#                latency-guard row — IOPS/clat must be flat A vs B and
+#                branch probe_ups must stay 0.
 #
 # Per run: throughput, /proc/diskstats deltas on the run's DATA devices
 # (aqu-sz, wareq-KiB, amp = device bytes ÷ user bytes), and the
 # write_pipeline_* stats-inode deltas incl. the probe gauges
 # (depth_target vs depth_target_base, depth_probe_{ups,backoffs}).
 #
+# FIO ENGINE POLICY (user ruling 2026-08-07 — the matched-instrument law;
+# `.benchmarks/2026-08-07-fio-engine-policy.md`): throughput/IOPS rows
+# are libaio+direct=1+stated iodepth; A/Bs use the SAME engine both
+# sides (this bracket's A/B is binary-vs-binary — engines match per cell
+# by construction); psync survives only labeled. Per cell here:
+#   * q1_4k_od: libaio iodepth=1 direct=1 (the O_DIRECT qd1 guard row).
+#   * q1_4k (buffered): psync EXPLICITLY (rule 4 — libaio silently
+#     degrades to sync on buffered I/O; psync is the honest buffered
+#     qd1 latency instrument). Guard rows, never headline throughput.
+#
 # Substrate: pug tcp devsub (meta nvme17-20n1, zram data nvme21-24n1)
 # + the dialed namespace nvme25n1 (configfs null_blk sqzpuglat0,
 # completion_nsec=20ms, irqmode=2, max_sectors=8192, nvmet-tcp :54141).
-# Instruments: elbencho 3.1-10 (dynamic, sync driver, --direct), fio
-# psync. Usage:
+# Instruments: elbencho 3.1-10 (dynamic, sync driver, --direct), fio.
+# Usage:
 #   sudo tests/pug_bracket.sh <results-dir> [cell-filter-regex]
 set -u
 
@@ -138,9 +149,15 @@ run_q1() { # cell blabel bin rep direct
     echo "=== $tag"
     mount_fs "$bin" "$ZRAM_DATA" "" "$tag"
     local s0 s1 t0 t1 out
+    # Engine per the header policy: O_DIRECT guard row = libaio qd1;
+    # buffered guard row = psync explicitly (libaio degrades to sync on
+    # buffered I/O — rule 4).
+    local engine=psync engflags=()
+    [ "$direct" = 1 ] && { engine=libaio; engflags=(--iodepth=1); }
     s0=$(ds_snap nvme21n1 nvme22n1 nvme23n1 nvme24n1)
     t0=$(date +%s.%N)
-    out=$(fio --name=q1 --filename="$MNT/bench/q1" --size=256m --ioengine=psync \
+    out=$(fio --name=q1 --filename="$MNT/bench/q1" --size=256m --ioengine="$engine" \
+        "${engflags[@]}" \
         --rw=randwrite --bs=4k --direct="$direct" --runtime=10 --time_based \
         --group_reporting 2>&1)
     t1=$(date +%s.%N)

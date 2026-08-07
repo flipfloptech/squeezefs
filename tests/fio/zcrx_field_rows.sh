@@ -11,6 +11,13 @@
 # account for the row's cold bytes is INVALID (silent kernel-path serve),
 # printed loudly, never presented as a lane number.
 #
+# FIO ENGINE POLICY (user ruling 2026-08-07;
+# `.benchmarks/2026-08-07-fio-engine-policy.md`): throughput/IOPS rows =
+# ioengine=libaio + direct=1 + stated iodepth, BOTH lanes; A/Bs use the
+# SAME engine both sides (this rig's A/B is armed-vs-control — matched by
+# construction); psync only as labeled sync-lane coverage rows; io_uring
+# = labeled kernel-lane extra. This rig is libaio-compliant (all rows).
+#
 # usage: zcrx_field_rows.sh --mount <mnt> --meta <sqmeta-uri> [--dir <dir>]
 #        [--runtime 60] [--njobs 16] [--out /tmp/zcrx_rows]
 set -u

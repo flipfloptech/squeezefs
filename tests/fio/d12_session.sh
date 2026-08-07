@@ -16,6 +16,13 @@
 #  2.  Battery under SQUEEZEFS_IPC_SERVICE_THREADS=32 — the thread-slope
 #      bracket for the -33% full-fleet finding.
 #  3.  zcrx Z3 field rows retry (the Connect fix's first live shot).
+#
+# FIO ENGINE POLICY (user ruling 2026-08-07;
+# `.benchmarks/2026-08-07-fio-engine-policy.md`): throughput/IOPS rows =
+# ioengine=libaio + direct=1 + stated iodepth, BOTH lanes; A/Bs use the
+# SAME engine both sides; psync only as labeled sync-lane coverage rows;
+# io_uring = labeled kernel-lane extra. This rig is libaio-compliant
+# (all rows); the delegated exa_client_perf battery is all-libaio too.
 set -u
 SQZ=/scratch/tmp/squeezefs
 MNT=/scratch/tmp/test

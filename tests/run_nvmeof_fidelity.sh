@@ -1783,7 +1783,11 @@ leg_ab_smoke() {
     # Rides the raw guard-data namespaces BEFORE the guard legs (which
     # re-wipe + reformat them at their leg 0/1). Recorded rows only —
     # ordered A/B belongs to PR 7's bench rerun. Instrument: fio io_uring,
-    # O_DIRECT, railed to cores 0-15.
+    # O_DIRECT, railed to cores 0-15. Engine policy note (2026-08-07,
+    # `.benchmarks/2026-08-07-fio-engine-policy.md` rule 5): io_uring is
+    # the sanctioned KERNEL-LANE raw-device instrument — these rows never
+    # ride the shim (which cannot interpose io_uring) and are labeled
+    # raw-ceiling rows, not FUSE-lane numbers.
     local arm dev row iops
     for arm in spdk nvmet; do
         case "$arm" in

@@ -2,6 +2,19 @@
 # tests/fio/run_fio_row.sh — the house fio row runner (fio is the house
 # instrument for all field rows; user directive 2026-07-31).
 #
+# FIO ENGINE POLICY (user ruling 2026-08-07;
+# `.benchmarks/2026-08-07-fio-engine-policy.md`): throughput/IOPS rows =
+# ioengine=libaio + direct=1 + stated iodepth (the runner's defaults),
+# BOTH lanes; A/Bs use the SAME engine both sides; psync only as labeled
+# sync-lane coverage rows (--engine psync stays available for exactly
+# those); buffered rows never silently use libaio; io_uring = labeled
+# kernel-lane extra (the shim cannot interpose io_uring — never with
+# --shim). Shim-lane geometry note: v1.1 aio is single-slot — an iocb
+# with nbytes > the session slot slab rides the kernel lane by design,
+# so bs=1M il libaio rows need the daemon mounted with
+# SQUEEZEFS_IPC_ARENA_MB >= 1024 (slab = 1 MiB); the engagement verdict
+# below makes any silent passthrough exit nonzero.
+#
 # Takes a [global]-shape job file from tests/fio/ and makes it a labeled,
 # reproducible ROW:
 #   * TOPOLOGY-GENERAL NUMA fan-out: discovers the box's NUMA nodes at

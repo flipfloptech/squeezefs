@@ -1549,6 +1549,8 @@ Target-side health and initiator-side fabric signals (`target status`, `fabric_*
 
 ## Performance records
 
+> **fio engine policy (user ruling 2026-08-07, `.benchmarks/2026-08-07-fio-engine-policy.md`):** every throughput/IOPS row runs `ioengine=libaio --direct=1` with a stated iodepth on BOTH lanes (kernel and il — the il lane rides the v1.1 aio interposers), every A/B comparison uses the SAME engine both sides, and psync survives only as explicitly-labeled §5.5.1 sync-lane coverage rows (never a headline, never cross-lane compared); `io_uring` is a labeled kernel-lane-only extra.
+
 Every number traces to a committed `.benchmarks/` note (box/substrate/method inside each). Headline classes on the reference box:
 
 | Axis | Measured class | Evidence |

@@ -10,15 +10,31 @@
 # adjudicates: kernel out-streamed the ring path ~15 % at t16×4MiB
 # (ingest-economy §3 — 11.7 vs 9.9–10.1 GiB/s).
 #
+# FIO ENGINE POLICY (user ruling 2026-08-07 — the matched-instrument law;
+# `.benchmarks/2026-08-07-fio-engine-policy.md`):
+#   1. Throughput/IOPS rows: ioengine=libaio + direct=1 + stated iodepth,
+#      BOTH lanes; engagement gates check the counters each lane moves.
+#   2. Any A/B uses the SAME engine both sides.
+#   3. psync survives ONLY as explicitly-labeled sync-lane coverage rows.
+#   4. Buffered rows never silently use libaio; 5. io_uring = kernel-only.
+#
 # Sides run CAMP-BASE-BASE-CAMP (the standing alternating-order rule for
 # aging stores); each side gets fresh blkdiscard + format + interception
 # mount; KD-7 same-commit daemon+shim pairs. Instrument (stated): fio
-# psync --zero_buffers --direct=1 (zeros ≈ free on zram — device
-# exonerated, client path measured), medians of 3. Engagement EXACT per
-# il row (ipc_bytes_in Δ == row bytes); placed-sever engagement
-# (ipc_placed_severs / placed_adoptions / placed_merge_elides) printed
-# per row; per-row /proc/diskstats write-amplification columns on the
-# data namespaces; write_path_seed_read_bytes tripwire asserted 0.
+# --zero_buffers --direct=1 (zeros ≈ free on zram — device exonerated,
+# client path measured), medians of 3; engines per row:
+#   * rand4k rows: libaio qd8 (headline IOPS rows, matched both lanes —
+#     4k <= slot slab, il aio rides the v1.1 interposers).
+#   * t16-b4m rows + the 1m prep passes: psync — SYNC-LANE COVERAGE ROWS
+#     by design: they measure the §5.5.1/§5.5.2 ring streaming path
+#     (multi-slab claim_run + placed sever, THE campaign's measurand);
+#     the v1.1 single-slot aio screen cannot express a >max_op (1 MiB)
+#     op, so aio 4m through the shim would silently ride the kernel
+#     lane. Matched engine both lanes; NOT headline throughput numbers.
+# Engagement EXACT per il row (ipc_bytes_in Δ == row bytes); placed-sever
+# engagement (ipc_placed_severs / placed_adoptions / placed_merge_elides)
+# printed per row; per-row /proc/diskstats write-amplification columns on
+# the data namespaces; write_path_seed_read_bytes tripwire asserted 0.
 #
 # Usage:
 #   sudo SQZ_CAMP_BIN=... SQZ_CAMP_SO=... SQZ_BASE_BIN=... SQZ_BASE_SO=... \
@@ -107,10 +123,16 @@ fio_write_row() { # fio_write_row <side> <pass> <row> <shim01> <rw> <bs> <size> 
         local out="$RESULTS/$side.$pass.$row.r$rep.fio.json"
         local pfx=(env)
         [ "$shim" = 1 ] && pfx=(env LD_PRELOAD="$ACTIVE_SO")
+        # Engine per row class (header policy): 4k rows = libaio qd8
+        # (headline, matched); 4m/1m rows = psync SYNC-LANE COVERAGE
+        # (ring streaming is the measurand; aio cannot express > max_op).
+        local engine=psync engflags=()
+        if [ "$bs" = 4k ]; then engine=libaio; engflags=(--iodepth=8); fi
         local dw0; dw0=$(dev_write_bytes)
         snap_stats "$pre"
         "${pfx[@]}" fio --name="$row" --directory="$dir" --filename_format='f$jobnum' \
-            --numjobs=16 --thread --group_reporting --ioengine=psync --rw="$rw" \
+            --numjobs=16 --thread --group_reporting --ioengine="$engine" \
+            "${engflags[@]}" --rw="$rw" \
             --bs="$bs" --direct=1 --zero_buffers --size="$size" "$@" \
             --output-format=json --output="$out" >/dev/null 2>&1 || fail "fio $side/$row r$rep"
         snap_stats "$post"

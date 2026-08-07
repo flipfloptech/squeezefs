@@ -378,6 +378,9 @@ echo "OK: offsetful read() parity"
 # 2g. fio / elbencho when present (parity-checked workloads).
 if command -v fio &>/dev/null; then
     # Run from the scratch dir: fio drops *-verify.state files in CWD.
+    # SYNC-LANE COVERAGE ROW — psync by design (fio engine policy
+    # 2026-08-07 rule 3): this is a CORRECTNESS row whose measurand is
+    # the §5.5.1 sync interposers themselves; never a perf number.
     (cd "$T" && ILP fio --name=il --directory="$MOUNT_DIR" --size=32M --bs=4k --rw=randwrite \
         --ioengine=psync --verify=crc32c --do_verify=1 --output-format=terse >/dev/null) \
         || fail "fio randwrite+verify under LD_PRELOAD"

@@ -15,6 +15,15 @@
 #     shim >= kernel; ipc_direct_shards engagement)
 #  4. durable fleet parity (convoy-fix verdict: il ~>= kernel durable)
 #
+# FIO ENGINE POLICY (user ruling 2026-08-07;
+# `.benchmarks/2026-08-07-fio-engine-policy.md`): throughput/IOPS rows =
+# ioengine=libaio + direct=1 + stated iodepth, BOTH lanes (il libaio rides
+# the v1.1 aio interposers; engagement gates check the counters each lane
+# actually moves); A/Bs use the SAME engine both sides; psync only as
+# labeled sync-lane coverage rows; io_uring = labeled kernel-lane extra.
+# This rig's own rows are libaio-compliant; row 4 delegates to
+# fleet_parity_row.sh, whose rows are labeled SYNC-LANE COVERAGE there.
+#
 # usage: perf_session.sh --mount <mnt> --meta <uri> [--out DIR]
 set -u
 MNT="" META="" OUT="/scratch/tmp/logs/perf_session_$(date +%Y%m%d_%H%M%S)"

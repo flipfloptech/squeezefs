@@ -7,6 +7,33 @@ informal-only. Every field/benchmark row cites the job file it ran, the
 dims it ran it with, and the venue labels below — that is what makes a
 `.benchmarks/` note reproducible.
 
+## The engine policy (user ruling 2026-08-07)
+
+`.benchmarks/2026-08-07-fio-engine-policy.md` is the record; the rules:
+
+1. **Every throughput/IOPS row is `ioengine=libaio` + `direct=1` + a
+   stated iodepth — BOTH lanes** (kernel and il/shim). il libaio rows
+   ride the v1.1 aio interposers
+   (`.benchmarks/2026-07-19-v1.1-libaio-interposers.md`); each row's
+   engagement gate checks the counters ITS lane actually moves.
+2. **Any A/B comparison uses the SAME engine both sides** (the
+   matched-instrument law) — never kernel-libaio vs shim-psync.
+3. **psync survives only as explicitly-labeled sync-lane coverage rows**
+   (the §5.5.1 sync fast path as measurand; e.g. the session-FLEET rigs,
+   whose 256-process shape the single-slot aio lane cannot express) —
+   never a headline, never cross-lane compared.
+4. **Buffered rows never silently use libaio** (without O_DIRECT it
+   degrades to sync) — a buffered row states its engine choice.
+5. **`ioengine=io_uring` is a labeled kernel-lane-only extra** — the
+   shim cannot interpose io_uring, so it never appears on il rows.
+
+Shim-lane geometry law: the v1.1 aio interposers are single-slot — an
+iocb with `nbytes >` the session slot slab (`min(arena/slots,
+max_op_bytes)`; 64 KiB at the derived arena floor, slots = 1024) rides
+the kernel lane by design. A bs=1M il libaio row therefore needs the
+daemon mounted with `SQUEEZEFS_IPC_ARENA_MB >= 1024` (slab = 1 MiB); the
+engagement verdict makes any silent passthrough exit nonzero.
+
 ## The runner
 
 `tests/fio/run_fio_row.sh` turns a `[global]`-shape job file into a

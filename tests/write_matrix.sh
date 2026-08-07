@@ -19,10 +19,34 @@
 #   are the shim-parity campaign's known-violation venue (t16×4MiB
 #   streaming — ingest-economy board item 1).
 #
-# Instrument (stated, per the L1-A lesson): fio psync, --thread, numjobs=16,
-# qd1 sync syscalls — fio page-aligns its buffers. Rand rows are time_based
-# overwrites of preallocated striped whole-block-mapped files (the W1 patch
-# shape); seq rows are fresh-file creates, size-scaled per bs.
+# FIO ENGINE POLICY (user ruling 2026-08-07 — the matched-instrument law;
+# `.benchmarks/2026-08-07-fio-engine-policy.md`):
+#   1. Throughput/IOPS rows: ioengine=libaio + direct=1 + stated iodepth,
+#      BOTH lanes. il libaio rides the v1.1 aio interposers; engagement
+#      gates check the counters each row's lane actually moves.
+#   2. Any A/B (kernel-vs-shim) uses the SAME engine both sides.
+#   3. psync survives ONLY as explicitly-labeled sync-lane coverage rows.
+#   4. Buffered rows never silently use libaio (it degrades to sync) —
+#      the buffered half of this matrix is psync EXPLICITLY (stated below).
+#   5. io_uring: kernel-lane-only labeled extra, never on il rows.
+#
+# Instrument (stated, per the L1-A lesson; fio page-aligns its buffers):
+#   * O_DIRECT rows: fio libaio, --thread, numjobs=16, iodepth=SQZ_WM_IODEPTH
+#     (default 8) — BOTH lanes (matched instrument). il libaio bs<=1m rows
+#     need slot slab >= bs: the armed mount sets SQUEEZEFS_IPC_ARENA_MB
+#     (default 1024 -> slab = 1 MiB) so 256k/1m aio ops are ring-eligible
+#     (the v1.1 single-slot aio screen: nbytes > slab rides the kernel lane).
+#   * Buffered rows: fio psync qd1 EXPLICITLY (policy rule 4 — libaio on
+#     buffered I/O silently degrades to sync; psync is the honest buffered
+#     instrument), matched both lanes.
+#   * 4m seq rows: SYNC-LANE COVERAGE ROWS — psync by design, measure the
+#     §5.5.1/§5.5.2 ring streaming path (multi-slab claim_run chunking,
+#     placed sever); aio structurally cannot express a 4 MiB op (single
+#     slot <= max_op_bytes = 1 MiB); NOT headline numbers, matched engine
+#     both lanes.
+# Rand rows are time_based overwrites of preallocated striped
+# whole-block-mapped files (the W1 patch shape); seq rows are fresh-file
+# creates, size-scaled per bs.
 #
 # Engagement (charter rule 4): every shim row must account its ops in
 # ipc_ops_write Δ (expected = fio ops × ceil(bs / slab)); a zero Δ shim row
@@ -44,6 +68,14 @@ ROW_FILTER="${1:-.}"
 REPS="${SQZ_WM_REPS:-3}"
 THREADS="${SQZ_WM_THREADS:-16}"
 RUNTIME="${SQZ_WM_RUNTIME:-10}"
+# Stated iodepth for the libaio (O_DIRECT) rows — engine policy rule 1.
+IODEPTH="${SQZ_WM_IODEPTH:-8}"
+# Armed-mount session-arena geometry: slab = min(arena/1024, max_op) must
+# cover the largest libaio bs (1m) or il aio rows ride the kernel lane
+# (v1.1 single-slot screen). 1024 MiB -> 1 MiB slab; MEM_MAX covers the
+# session population (fio --thread = 1 process, <= 16 default sessions).
+ARENA_MB="${SQZ_WM_ARENA_MB:-1024}"
+IPC_MEM_MAX="${SQZ_WM_IPC_MEM_MAX:-24576}"
 # The il-vs-kernel parity noise band (percent): a shim row within
 # ±band of its kernel twin is PAR; below is a LOSS (sweep failure).
 NOISE_PCT="${SQZ_WM_NOISE_PCT:-10}"
@@ -126,7 +158,9 @@ mount_fs() { # mount_fs armed|unarmed
     # genuinely-held writer lock keeps refusing and still fails loud.
     local m_ok=0
     for _ in 1 2 3 4 5; do
-        if RUST_LOG=info SQUEEZEFS_IPC_SERVICE_THREADS=8 "$SQUEEZEFS_BIN" mount \
+        if RUST_LOG=info SQUEEZEFS_IPC_SERVICE_THREADS=8 \
+            SQUEEZEFS_IPC_ARENA_MB="$ARENA_MB" SQUEEZEFS_IPC_MEM_MAX="$IPC_MEM_MAX" \
+            "$SQUEEZEFS_BIN" mount \
             "sqmeta://$META_DEV" "$MOUNT_DIR" --daemon --allow-other \
             --mem-cache-size 1GB --log-file "$LOG" "${extra[@]}"; then
             m_ok=1; break
@@ -176,10 +210,20 @@ run_row() { # run_row <rowname> <shim 0|1> <rw seq|rand> <bs> <direct 0|1> <dir>
         local pfx=(env)
         [ "$shim" = 1 ] && pfx=(env LD_PRELOAD="$SO")
         local fname='f$jobnum'; [ "$rw" = seq ] && fname='s_f$jobnum'
+        # Engine policy (header): O_DIRECT rows = libaio + stated iodepth
+        # (matched both lanes); buffered rows = psync EXPLICITLY (rule 4 —
+        # libaio degrades to sync on buffered I/O); 4m rows = psync
+        # SYNC-LANE COVERAGE (aio single-slot <= max_op 1 MiB cannot
+        # express a 4 MiB op — the ring streaming path is the measurand).
+        local engine=psync engflags=()
+        if [ "$direct" = 1 ] && [ "$bs" != 4m ]; then
+            engine=libaio; engflags=(--iodepth="$IODEPTH")
+        fi
         snap_stats "$pre"
         "${pfx[@]}" fio --name="$row" --directory="$dir" \
             --filename_format="$fname" --numjobs="$THREADS" --thread \
-            --group_reporting --ioengine=psync --rw="$fio_rw" --bs="$bs" \
+            --group_reporting --ioengine="$engine" "${engflags[@]}" \
+            --rw="$fio_rw" --bs="$bs" \
             --direct="$direct" "${fio_extra[@]}" \
             --output-format=json --output="$fioout" >/dev/null 2>&1 \
             || fail "fio $row rep$rep"
@@ -211,7 +255,10 @@ run_row() { # run_row <rowname> <shim 0|1> <rw seq|rand> <bs> <direct 0|1> <dir>
         local chunks="-"
         [ "$shim" = 1 ] && [ "$ops" -gt 0 ] && chunks=$(python3 -c "print(f'{$ipcw/$ops:.2f}')")
         echo "$row,$rep,$iops,$bw,$el,$dur_s,$ops,$ipcw,$chunks,$engage" >> "$CSV"
-        echo "  [$row r$rep] iops=$iops bw=${bw}MiB/s el=${el}s durable_tail=${dur_s}s ops=$ops ring/op=$chunks $engage"
+        local englabel="$engine"
+        [ "$engine" = libaio ] && englabel="libaio qd$IODEPTH"
+        [ "$bs" = 4m ] && englabel="psync SYNC-LANE"
+        echo "  [$row r$rep] ($englabel) iops=$iops bw=${bw}MiB/s el=${el}s durable_tail=${dur_s}s ops=$ops ring/op=$chunks $engage"
         [ -n "$sel" ] && echo "      Δ $sel"
         iops_list+=("$iops")
     done
@@ -223,10 +270,12 @@ run_row() { # run_row <rowname> <shim 0|1> <rw seq|rand> <bs> <direct 0|1> <dir>
 }
 
 prealloc_rand() { # prealloc_rand <dir> — 16 × 1 GiB striped whole-block files
+    # Prep pass, not a measured row (kernel lane, no shim): libaio direct
+    # per the engine policy default.
     mkdir -p "$1"
     fio --name=prealloc --directory="$1" --filename_format='f$jobnum' \
-        --numjobs="$THREADS" --thread --group_reporting --ioengine=psync \
-        --rw=write --bs=1m --direct=1 --size=1g --output-format=json \
+        --numjobs="$THREADS" --thread --group_reporting --ioengine=libaio \
+        --iodepth=8 --rw=write --bs=1m --direct=1 --size=1g --output-format=json \
         --output="$RESULTS/prealloc.json" >/dev/null 2>&1 || fail "prealloc"
     sync "$1"/f* 2>/dev/null || true
     sync -f "$MOUNT_DIR" 2>/dev/null || true

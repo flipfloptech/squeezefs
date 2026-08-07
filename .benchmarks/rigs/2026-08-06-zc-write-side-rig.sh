@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# FIO ENGINE POLICY (2026-08-07, .benchmarks/2026-08-07-fio-engine-policy.md):
+# libaio + direct=1 + stated iodepth on every row, same engine both A/B
+# sides — this rig was already compliant; recorded here per the ruling.
 # D14 write-side zc bracket (2026-08-06 — extends the DO-NOT-FLIP
 # pricing rig 2026-08-06-zc-write-bracket-rig.sh forward; that file
 # stays as the ee1e0956 evidence's instrument). Runs ON the field host

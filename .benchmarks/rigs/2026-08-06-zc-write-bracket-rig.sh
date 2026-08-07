@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# FIO ENGINE POLICY (2026-08-07, .benchmarks/2026-08-07-fio-engine-policy.md):
+# libaio + direct=1 + stated iodepth on every row, same engine both A/B
+# sides — this rig was already compliant; recorded here per the ruling.
 # FUSE-zc WRITE-side pricing bracket (fuse-zc-serve §6 follow-up,
 # 2026-08-06). Runs ON the field host (squeeze-test: EL8, 6.19.14-sqz,
 # 32 CPUs). Six legs, each on a FRESH mount:

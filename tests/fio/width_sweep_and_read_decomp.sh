@@ -9,6 +9,13 @@
 #     16×8 60 s with read_{serve,fill,transport}_phase_ns + copy-ledger
 #     deltas + mpstat — the fresh evidence for the read-throughput
 #     campaign (reads vs the 41.8 raw ceiling).
+#
+# FIO ENGINE POLICY (user ruling 2026-08-07;
+# `.benchmarks/2026-08-07-fio-engine-policy.md`): throughput/IOPS rows =
+# ioengine=libaio + direct=1 + stated iodepth, BOTH lanes; A/Bs use the
+# SAME engine both sides; psync only as labeled sync-lane coverage rows;
+# io_uring = labeled kernel-lane extra. This rig is libaio-compliant
+# (all rows: il rand-4k 32x32, kernel seq-read 16x8).
 set -u
 MNT="/scratch/tmp/test"
 META="sqmeta:///dev/nvme0n1,/dev/nvme2n1,/dev/nvme4n1,/dev/nvme6n1,/dev/nvme8n1"

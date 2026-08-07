@@ -44,7 +44,11 @@ use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 /// v3: `AdminHello` gained the ABI / build-commit / nonce fields so the
 /// control lane runs the same screening ladder as the data plane (VAL-7c,
 /// pre-RC spec §3) — a ctl-wire layout change, hence the coarse bump.
-pub const IPC_ABI: u32 = 3;
+/// v4: the client stats page gained its typed layout
+/// ([`ClientStatsPage`] — the hybrid lane gate's shim-side counters,
+/// 2026-08-07). Region arithmetic unchanged (the page always existed,
+/// all-zeroes); coarse bump per the discipline.
+pub const IPC_ABI: u32 = 4;
 
 /// Session mapping magic: `SQZIPC01` little-endian.
 pub const IPC_MAGIC: u64 = u64::from_le_bytes(*b"SQZIPC01");
@@ -372,6 +376,51 @@ impl core::fmt::Display for HeaderError {
 
 impl std::error::Error for HeaderError {}
 
+/// The **client stats page** (region between the slots and the arena) —
+/// shim-side counters, CLIENT-writable for the session's life and
+/// **display-only on the daemon side** (§5.3.1 rule 1's trust boundary:
+/// the daemon sums these verbatim into the stats-inode export and never
+/// makes a control decision from them). Zero-initialized by the fresh
+/// memfd, so a client that never publishes reads as all-zeroes.
+///
+/// v4 contents — the **hybrid lane gate** ledger (ruling D14's corollary:
+/// the shim narrows toward the IOPS lane; large ops ride the kernel FUSE
+/// lane): the gate's kernel-route decisions happen in the SHIM, where the
+/// daemon cannot see them (a kernel-routed op never touches the ring), so
+/// this page is what carries the split attribution to the stats inode.
+#[repr(C, align(4096))]
+pub struct ClientStatsPage {
+    /// Ops the lane gate routed to the kernel FUSE lane (the real call).
+    pub lane_gate_kernel_routes: AtomicU64,
+    /// Requested bytes of those ops (counted at route time — the real
+    /// call's short-serve residue is kernel business, not the gate's).
+    pub lane_gate_kernel_bytes: AtomicU64,
+    /// The session's resolved gate threshold (bytes; 0 = gate off) —
+    /// published once at establish, exported as the
+    /// `ipc_lane_gate_threshold_bytes` gauge (max over live sessions).
+    pub lane_gate_threshold_bytes: AtomicU64,
+    _reserved: [u8; PAGE_BYTES as usize - 24],
+}
+
+impl ClientStatsPage {
+    /// Client: record one gate decision that routed kernel.
+    pub fn note_kernel_route(&self, bytes: u64) {
+        self.lane_gate_kernel_routes.fetch_add(1, Ordering::Relaxed);
+        self.lane_gate_kernel_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Daemon: one display snapshot `(routes, bytes, threshold)` —
+    /// untrusted client words, summed verbatim into the export.
+    pub fn snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.lane_gate_kernel_routes.load(Ordering::Relaxed),
+            self.lane_gate_kernel_bytes.load(Ordering::Relaxed),
+            self.lane_gate_threshold_bytes.load(Ordering::Relaxed),
+        )
+    }
+}
+
 /// A descriptor snapshot — the daemon's private copy of the client-written
 /// op fields, read **once** after `try_begin_serve` succeeds (§5.3.1 rule
 /// 1: validate the copy, serve from the copy, never re-read the slot).
@@ -469,6 +518,10 @@ const _: () = {
     assert!(std::mem::align_of::<IpcSlot>() == SLOT_BYTES as usize);
     assert!(std::mem::size_of::<SessionHeader>() == PAGE_BYTES as usize);
     assert!(std::mem::align_of::<SessionHeader>() == PAGE_BYTES as usize);
+    // The client stats page fills its region exactly (stats_bytes is one
+    // page), and zero-initialized = all counters 0 / gate gauge 0.
+    assert!(std::mem::size_of::<ClientStatsPage>() == PAGE_BYTES as usize);
+    assert!(std::mem::align_of::<ClientStatsPage>() == PAGE_BYTES as usize);
     // The shared WakeCoalescer is one AtomicBool — the header arithmetic
     // (_pad2) assumes exactly one byte.
     assert!(std::mem::size_of::<WakeCoalescer>() == 1);

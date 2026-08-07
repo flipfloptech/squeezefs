@@ -64,7 +64,7 @@
 //! "old tables leaked-by-design at ~KB scale".)
 
 use crate::fd_table_core::{EpochCore, MirrorCore, RefCore};
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 /// One bound fd's rights, as granted by the daemon's `BindOk` (§5.2).
@@ -124,6 +124,17 @@ struct BindingCell {
     refs: RefCore,
     /// PERF-7 offset mirror (module docs).
     mirror: MirrorState,
+    /// The hybrid lane gate's **sticky kernel-lane latch** for the
+    /// OFFSETFUL forms (`crate::lane_gate` module docs): monotone
+    /// false→true, per DESCRIPTION (dup siblings share it exactly as
+    /// they share `f_pos` — one description = one offset = one lane),
+    /// cleared only by a fresh bind (a new cell). Set by the gate
+    /// exactly once, under the cell's offset lock, together with the
+    /// mirror flush — after which every offsetful op on this
+    /// description takes the real call against kernel `f_pos` at native
+    /// cost. A plain relaxed flag: the offset-consistency edges belong
+    /// to the mirror's own Dekker protocol, never to this word.
+    kernel_lane: AtomicBool,
 }
 
 /// Borrowed view of one cell's offset mirror. The `'a` is the table
@@ -132,6 +143,7 @@ struct BindingCell {
 pub struct MirrorHandle<'a> {
     mirror: &'a MirrorState,
     table_epoch: &'a EpochCore,
+    kernel_lane: &'a AtomicBool,
 }
 
 impl<'a> MirrorHandle<'a> {
@@ -183,6 +195,20 @@ impl<'a> MirrorHandle<'a> {
 
     fn try_lock_offsets(&self) -> Option<MutexGuard<'a, ()>> {
         self.mirror.lock.try_lock().ok()
+    }
+
+    /// The hybrid lane gate's sticky offsetful latch (cell field docs):
+    /// `true` = every offsetful op on this description takes the real
+    /// call (the kernel FUSE lane).
+    pub fn kernel_lane_latched(&self) -> bool {
+        self.kernel_lane.load(Ordering::Relaxed)
+    }
+
+    /// Latch this description to the kernel lane — monotone, idempotent.
+    /// The caller owns the one-time mirror flush (`disarm_if_current` +
+    /// kernel `SEEK_SET`) under the held offset lock.
+    pub fn latch_kernel_lane(&self) {
+        self.kernel_lane.store(true, Ordering::Relaxed);
     }
 }
 
@@ -361,6 +387,7 @@ impl FdTable {
             MirrorHandle {
                 mirror: &cell.mirror,
                 table_epoch: &self.fork_epoch,
+                kernel_lane: &cell.kernel_lane,
             },
         ))
     }
@@ -412,6 +439,7 @@ impl FdTable {
                 let h = MirrorHandle {
                     mirror: &cell.mirror,
                     table_epoch: &self.fork_epoch,
+                    kernel_lane: &cell.kernel_lane,
                 };
                 // Bounded try-lock spin: an in-flight offsetful op
                 // holds this only for its serve window.
@@ -467,6 +495,9 @@ impl FdTable {
             binding,
             refs: RefCore::new_one(),
             mirror,
+            // A fresh description starts on the ring lane (lane state is
+            // per-description, never per-fd-number residue).
+            kernel_lane: AtomicBool::new(false),
         }));
         let old = slot.swap(cell, Ordering::AcqRel);
         Self::release_cell(old)
@@ -579,6 +610,7 @@ impl FdTable {
                 let h = MirrorHandle {
                     mirror: unsafe { &(*cell).mirror },
                     table_epoch: &self.fork_epoch,
+                    kernel_lane: unsafe { &(*cell).kernel_lane },
                 };
                 if let Some(off) = h.disarm_if_current() {
                     flushes.push(((d << SEG_BITS | s) as i32, off));

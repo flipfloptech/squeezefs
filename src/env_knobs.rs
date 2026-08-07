@@ -223,6 +223,7 @@ pub static KNOBS: &[Knob] = &[
     k("SQUEEZEFS_IL_OP_TIMEOUT_MS", int(1, MS_MAX), "bounded default", "Per-op bounded wait against a stalled daemon, ms."),
     k("SQUEEZEFS_IL_REAP_PARK_MAX", int(0, 1 << 16), "2", "libaio reap: queue depth at or below which the event-driven park is used."),
     k("SQUEEZEFS_IL_READ_DEST", Kind::Bool, "on", "Arena-destination read serves (E-IL2); 0 = the A/B lever."),
+    k("SQUEEZEFS_IL_KERNEL_LANE_MIN", int(0, BYTES_MAX), "derived (memBW probe x lane-RTT delta, clamp [slab, max_op])", "Hybrid lane gate (D14 corollary): ops STRICTLY larger than this ride the kernel FUSE lane, smaller ops the IPC ring; explicit wins verbatim, 0 = gate off (all eligible ops ring - the A/B lever). Offsetful forms latch a whole description kernel-lane on first trigger (sticky - the offset mirror never flaps)."),
     // -- zcrx read lane ---------------------------------------------------
     k("SQUEEZEFS_ZCRX_LANE", Kind::Bool, "off", "Arm the zcrx read lane."),
     k("SQUEEZEFS_ZCRX_LANE_FORCE_COPY", Kind::Bool, "off", "Test seam: allow the classic-recv backend to arm (copy parity)."),

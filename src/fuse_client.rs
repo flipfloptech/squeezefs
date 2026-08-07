@@ -7126,6 +7126,19 @@ impl SqueezefsFilesystem {
             "backends": placement_backends,
         });
 
+        // Hybrid lane gate (D14 corollary): the shim-side lane-split
+        // ledger — reaped fold + live client stats pages, summed by the
+        // session host; (0, 0, 0) on non-interception mounts so the keys
+        // always export (rows can attribute their lane split, and a
+        // host-less mount reads as "no gate traffic").
+        let (lane_gate_kernel_routes, lane_gate_kernel_bytes, lane_gate_threshold_bytes) = self
+            .ipc_host
+            .load()
+            .as_ref()
+            .as_ref()
+            .map(|h| h.lane_gate_snapshot())
+            .unwrap_or((0, 0, 0));
+
         let mut stats_obj = serde_json::json!({
             // Build identity (docs/operations.md §Versioning & releases):
             // the fleet mixed-version detector. `build_commit` is the full
@@ -7874,6 +7887,16 @@ impl SqueezefsFilesystem {
                 "ipc_fast_path_miss_demotions": METRICS.ipc_fast_path_miss_demotions.load(Ordering::Relaxed),
                 "ipc_hold_probe_serves": METRICS.ipc_hold_probe_serves.load(Ordering::Relaxed),
                 "ipc_hold_probe_misses": METRICS.ipc_hold_probe_misses.load(Ordering::Relaxed),
+                // Hybrid lane gate (D14 corollary): the SHIM's lane-split
+                // ledger — kernel-routed ops/bytes (client stats pages,
+                // reap-folded) + the derived-threshold gauge (max over
+                // live sessions; 0 = no live session or gate off). A
+                // hybrid il row is attributable iff these deltas account
+                // for its large-op traffic while `ipc_ops_*` account for
+                // its small-op traffic.
+                "ipc_lane_gate_kernel_routes": lane_gate_kernel_routes,
+                "ipc_lane_gate_kernel_bytes": lane_gate_kernel_bytes,
+                "ipc_lane_gate_threshold_bytes": lane_gate_threshold_bytes,
                 "ipc_service_threads": METRICS.ipc_service_threads.load(Ordering::Relaxed),
                 "ipc_session_owners": METRICS.ipc_session_owners.load(Ordering::Relaxed),
                 "ipc_service_parks": METRICS.ipc_service_parks.load(Ordering::Relaxed),

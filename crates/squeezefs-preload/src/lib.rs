@@ -31,6 +31,7 @@ pub mod fd_table;
 pub mod fd_table_core;
 #[cfg(feature = "interposers")]
 pub mod interpose;
+pub mod lane_gate;
 pub mod mapped_inos;
 pub mod session;
 // Session-arena THP helper — canonical file in the squeezefs-ipc tree,

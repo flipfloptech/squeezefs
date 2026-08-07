@@ -63,7 +63,8 @@
 
 use crate::fuse_client::METRICS;
 use squeezefs_ipc::layout::{
-    Geometry, IpcSlot, SessionHeader, SessionLayout, SlotDescriptor, OP_ECHO, OP_READ, OP_WRITE,
+    ClientStatsPage, Geometry, IpcSlot, SessionHeader, SessionLayout, SlotDescriptor, OP_ECHO,
+    OP_READ, OP_WRITE,
 };
 use squeezefs_ipc::ring_core::{MpscRingView, RingCell, RingConsumer};
 use squeezefs_ipc::wire::{
@@ -802,6 +803,17 @@ impl SessionMapping {
         unsafe { &*(self.base as *const SessionHeader) }
     }
 
+    /// The client stats page (hybrid lane gate ledger) — CLIENT-writable
+    /// for the session's life, DISPLAY-ONLY here (§5.3.1 rule 1: these
+    /// words are summed verbatim into the stats-inode export and never
+    /// feed a control decision).
+    fn stats_page(&self) -> &ClientStatsPage {
+        // SAFETY: the stats region at `stats_off`, page-aligned/-sized by
+        // the layout; repr(C, align(4096)) protocol type, zero-initialized
+        // by the fresh memfd.
+        unsafe { &*(self.base.add(self.layout.stats_off as usize) as *const ClientStatsPage) }
+    }
+
     fn ring(&self) -> MpscRingView<'_> {
         // SAFETY: offsets computed by the same `SessionLayout` that sized
         // the mapping; the types are the repr(C) shm protocol types.
@@ -1199,6 +1211,14 @@ pub struct IpcHost {
     arena_prep_done: AtomicU64,
     arena_prep_skipped_dead: AtomicU64,
     arena_prep_skipped_pressure: AtomicU64,
+    /// Hybrid lane gate (D14 corollary): the reaped-session fold of the
+    /// client stats pages' `lane_gate_kernel_{routes,bytes}` — captured
+    /// exactly once per session at teardown (the `torn_down` swap), so
+    /// the exported counters stay monotone across session churn. The
+    /// live half is summed on demand ([`Self::lane_gate_snapshot`]).
+    /// Untrusted client words, display-only (§5.3.1 rule 1).
+    lane_gate_reaped_routes: AtomicU64,
+    lane_gate_reaped_bytes: AtomicU64,
 }
 
 /// One deferred arena-prep job — a `Weak` on purpose (prep-liveness fix,
@@ -1351,6 +1371,8 @@ impl IpcHost {
             arena_prep_done: AtomicU64::new(0),
             arena_prep_skipped_dead: AtomicU64::new(0),
             arena_prep_skipped_pressure: AtomicU64::new(0),
+            lane_gate_reaped_routes: AtomicU64::new(0),
+            lane_gate_reaped_bytes: AtomicU64::new(0),
         });
         // Spawn-on-bind (ingest-economy 2026-07-28): the gauge reports
         // SPAWNED service threads — 0 until a session admits. No thread
@@ -1581,6 +1603,37 @@ impl IpcHost {
         sessions
             .iter()
             .any(|s| s.bindings.any_sync(|_, rights| rights.ino == ino).is_some())
+    }
+
+    /// Hybrid lane gate display snapshot `(kernel_routes, kernel_bytes,
+    /// threshold_gauge)` for the stats-inode export: the counters are the
+    /// reaped fold plus the sum over LIVE sessions' client stats pages;
+    /// the threshold gauge is the MAX over live sessions (0 with none —
+    /// a gauge, it drops with them). Untrusted client words, summed
+    /// verbatim, display-only (§5.3.1 rule 1: never a daemon input).
+    pub fn lane_gate_snapshot(&self) -> (u64, u64, u64) {
+        // Accumulators read + live set cloned under ONE lock hold — the
+        // teardown fold runs remove+fold under the same lock, so every
+        // session lands on exactly one half of the sum.
+        let (mut routes, mut bytes, sessions) = {
+            let sessions = self
+                .sessions
+                .lock()
+                .expect("session registry mutex never poisons");
+            (
+                self.lane_gate_reaped_routes.load(Ordering::Relaxed),
+                self.lane_gate_reaped_bytes.load(Ordering::Relaxed),
+                sessions.values().cloned().collect::<Vec<Arc<IpcSession>>>(),
+            )
+        };
+        let mut threshold = 0u64;
+        for s in sessions {
+            let (r, b, t) = s.map.stats_page().snapshot();
+            routes = routes.wrapping_add(r);
+            bytes = bytes.wrapping_add(b);
+            threshold = threshold.max(t);
+        }
+        (routes, bytes, threshold)
     }
 
     /// Synthesize the bootstrap virtual-xattr blob (§5.2) for this host.
@@ -2319,10 +2372,27 @@ impl IpcHost {
         log::info!("ipc session {} torn down ({why})", session.id);
         session.bindings.clear_sync();
         let _ = session.sock.shutdown(std::net::Shutdown::Both);
-        self.sessions
-            .lock()
-            .expect("session registry mutex never poisons")
-            .remove(&session.id);
+        {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .expect("session registry mutex never poisons");
+            sessions.remove(&session.id);
+            // Hybrid lane gate: fold this session's stats-page ledger
+            // into the host accumulators — exactly once (the swap
+            // above), under the SAME lock hold as the registry removal
+            // so a concurrent [`Self::lane_gate_snapshot`] counts the
+            // session on exactly one half. The threshold gauge
+            // deliberately dies with the session. (The client may still
+            // write the page until it observes the poison — a straggler
+            // route landing after this fold is display noise, never
+            // accounting truth: §5.3.1 rule 1.)
+            let (routes, bytes, _thr) = session.map.stats_page().snapshot();
+            self.lane_gate_reaped_routes
+                .fetch_add(routes, Ordering::Relaxed);
+            self.lane_gate_reaped_bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
         // A stale snapshot may drain this session for at most one more
         // pass (safe: the mapping is Arc-held, bindings are cleared, the
         // torn_down flag skips it at the next refresh).

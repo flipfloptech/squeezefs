@@ -99,6 +99,65 @@ pub fn il_drain_lanes_default(cpus: usize) -> usize {
     (cpus.saturating_mul(3) / 8).clamp(2, 64)
 }
 
+/// The hybrid lane gate's **lane-RTT delta class** (ruling D14's
+/// corollary, 2026-08-07): the per-op overhead the kernel FUSE lane pays
+/// over the IPC ring — a MEASURED class constant, like the W2 fold
+/// amortization constant, never tuning. Basis: the D14 field bracket's
+/// rand-4k rows (squeeze-test, the shape where per-byte cost vanishes and
+/// the per-op delta is the whole difference): ring lane 594 k IOPS vs
+/// kernel lane ≈ 253 k at the same shape ⇒ per-op service-cost gap
+/// 1/253 k − 1/594 k ≈ 2.27 µs. Retuning this is a deliberate act with a
+/// new counted citation (the derivation-sweep tie test pins it).
+pub const KERNEL_LANE_RTT_DELTA_NS: u64 = 2_300;
+
+/// The ring pays this many CPU passes over a READ payload's bytes (the
+/// daemon's serve-into-arena copy + the client's arena→app consume copy —
+/// the read-copy-count ledger's E-IL closure). Writes pay one client
+/// copy; their crossover is 2× and collapses to the same clamp floor at
+/// every measured memBW on target hardware, so ONE threshold (derived on
+/// the read side, the conservative half and the direction with the larger
+/// field gap) governs both directions.
+const KERNEL_LANE_RING_COPIES: u64 = 2;
+
+/// The hybrid lane gate's derived crossover threshold (bytes): ops
+/// STRICTLY larger ride the kernel FUSE lane, at-or-below rides the IPC
+/// ring. `SQUEEZEFS_IL_KERNEL_LANE_MIN` overrides verbatim (0 = gate off);
+/// this is the ABSENT default.
+///
+/// The model: `ring_time(size) ≈ ring_rtt + copies × size / memBW`,
+/// `kernel_time(size) ≈ fuse_rtt` (+ ≈ 0 per-byte userspace cost — the
+/// kernel lane's zc serve moves payload by DMA/kernel copy at line rate).
+/// Setting them equal: `size* = memBW × (fuse_rtt − ring_rtt) / copies`
+/// with the delta being [`KERNEL_LANE_RTT_DELTA_NS`] and `memBW` the
+/// shim's startup micro-probe (runtime-derived — portable-by-default,
+/// never a CPU-ID table; a failed probe passes 0 and lands on the floor).
+///
+/// Rails (each physical, per the derivation law):
+/// * rounded DOWN to the 4 KiB LBA/page grain — the same grain
+///   [`crate::layout::Geometry::slot_slab`] floors to, so the boundary
+///   composes with O_DIRECT alignment;
+/// * floor = `slab_bytes` — at or below the slab a ring op is the
+///   single-flight allocation-free serial path (one claim, one wait: the
+///   IOPS lane's own regime, which the gate exists to protect, never to
+///   tax);
+/// * ceiling = `max_op_bytes` — past the per-op payload ceiling an op
+///   must chunk into multiple ring flights (RTT multiplication), so the
+///   gate must have engaged at latest there.
+pub fn kernel_lane_min_default(
+    mem_bw_bytes_per_sec: u64,
+    slab_bytes: u64,
+    max_op_bytes: u64,
+) -> u64 {
+    const GRAIN: u64 = 4096;
+    let raw = (u128::from(mem_bw_bytes_per_sec) * u128::from(KERNEL_LANE_RTT_DELTA_NS)
+        / (1_000_000_000u128 * u128::from(KERNEL_LANE_RING_COPIES))) as u64;
+    let grained = raw / GRAIN * GRAIN;
+    // lo ≤ hi even for degenerate/toy geometries (slot_slab already
+    // guarantees slab ≤ max_op for real sessions).
+    let lo = slab_bytes.min(max_op_bytes);
+    grained.clamp(lo, max_op_bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +241,28 @@ mod tests {
                 "dominance broken at cpus={cpus}"
             );
         }
+    }
+
+    /// The hybrid lane gate's crossover (2026-08-07): pure-form values
+    /// on the canonical shapes; the root suite carries the tie test.
+    #[test]
+    fn kernel_lane_min_derivation_values() {
+        const SLAB: u64 = 64 * 1024;
+        const MAX_OP: u64 = 1024 * 1024;
+        // Field-class memcpy (~15 GB/s): raw ≈ 17 KiB ⇒ slab floor.
+        assert_eq!(kernel_lane_min_default(15_000_000_000, SLAB, MAX_OP), SLAB);
+        // Failed probe (0) ⇒ the floor, conservatively.
+        assert_eq!(kernel_lane_min_default(0, SLAB, MAX_OP), SLAB);
+        // 100 GB/s-class engine: interior, 4 KiB-grained (115_000 → 28 ×
+        // 4096 = 112 KiB).
+        assert_eq!(
+            kernel_lane_min_default(100_000_000_000, SLAB, MAX_OP),
+            112 * 1024
+        );
+        // Overflow-safe rail at the payload ceiling.
+        assert_eq!(kernel_lane_min_default(u64::MAX, SLAB, MAX_OP), MAX_OP);
+        // Toy geometries never invert the rails.
+        assert_eq!(kernel_lane_min_default(0, 4096, 4096), 4096);
+        assert_eq!(kernel_lane_min_default(0, 8192, 4096), 4096);
     }
 }

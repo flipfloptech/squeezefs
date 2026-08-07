@@ -25,7 +25,8 @@
 
 use crate::fd_table::Binding;
 use squeezefs_ipc::layout::{
-    Geometry, IpcSlot, SessionHeader, SessionLayout, SlotDescriptor, OP_READ, OP_WRITE,
+    ClientStatsPage, Geometry, IpcSlot, SessionHeader, SessionLayout, SlotDescriptor, OP_READ,
+    OP_WRITE,
 };
 use squeezefs_ipc::ring_core::{MpscRingView, RingCell};
 use squeezefs_ipc::slot_core::ParkOutcome;
@@ -406,6 +407,11 @@ pub struct Session {
     /// window `[slot × slab, slot × slab + slab)`; no cross-thread arena
     /// coordination exists or is needed).
     slab: u64,
+    /// The hybrid lane gate's resolved threshold for this session
+    /// (`crate::lane_gate` — derived from the memBW probe and this
+    /// geometry, `SQUEEZEFS_IL_KERNEL_LANE_MIN` override verbatim;
+    /// 0 = gate off). Published to the client stats page at establish.
+    lane_gate_min: u64,
     ctl: Mutex<CtlSocket>,
     /// Raw ctl fd for the AS-safe poison `shutdown(2)` (the mutex-held
     /// owner is not lockable from an atfork handler).
@@ -650,12 +656,21 @@ impl Session {
             return Err(SessionError::Protocol);
         }
 
+        // Hybrid lane gate (D14 corollary): resolve this session's
+        // kernel-lane threshold — memBW probe (process-memoized, first
+        // establish pays ~1 ms) through the shared derivation, railed by
+        // THIS geometry, env override verbatim — and publish it as the
+        // stats-page gauge before any op can consult it.
+        let lane_gate_min =
+            crate::lane_gate::kernel_lane_min_for_geometry(slab, u64::from(geometry.max_op_bytes));
+
         let sock = sock_guard.release();
-        Ok(Session {
+        let session = Session {
             base: base as *mut u8,
             layout,
             geometry,
             slab,
+            lane_gate_min,
             ctl: Mutex::new(CtlSocket { fd: sock }),
             ctl_fd: sock,
             op_timeout,
@@ -663,7 +678,12 @@ impl Session {
             last_parked: AtomicBool::new(false),
             poisoned: AtomicBool::new(false),
             my_generation,
-        })
+        };
+        session
+            .stats_page()
+            .lane_gate_threshold_bytes
+            .store(lane_gate_min, Ordering::Relaxed);
+        Ok(session)
     }
 
     /// Bind `fd` for the data plane. Ctl round trip (control-plane
@@ -1117,6 +1137,21 @@ impl Session {
         self.slab
     }
 
+    /// The hybrid lane gate's resolved threshold for this session
+    /// (bytes; 0 = gate off): ops STRICTLY larger take the kernel FUSE
+    /// lane (`crate::lane_gate::kernel_lane_route`).
+    pub fn lane_gate_min(&self) -> u64 {
+        self.lane_gate_min
+    }
+
+    /// Record one gate decision that routed an op to the kernel lane —
+    /// the shim-side half of `ipc_lane_gate_kernel_{routes,bytes}` (the
+    /// daemon sums the stats page into the stats-inode export; §5.3.1
+    /// trust boundary: display-only over there).
+    pub fn note_kernel_route(&self, bytes: u64) {
+        self.stats_page().note_kernel_route(bytes);
+    }
+
     /// Fire a positional read without waiting. `None` = no slot or
     /// poisoned (client-visible backpressure — the batch prefix ends
     /// there, §5.5.1). The claimed slot stays claimed until
@@ -1401,6 +1436,14 @@ impl Session {
         // SAFETY: header page at offset 0, written by the daemon before
         // the memfd was shared; validated at establish.
         unsafe { &*(self.base as *const SessionHeader) }
+    }
+
+    fn stats_page(&self) -> &ClientStatsPage {
+        // SAFETY: the stats page region at `stats_off`, page-aligned and
+        // page-sized by the layout; repr(C, align(4096)) protocol type,
+        // zero-initialized by the fresh memfd (client-writable by design
+        // — this side IS the client).
+        unsafe { &*(self.base.add(self.layout.stats_off as usize) as *const ClientStatsPage) }
     }
 
     fn ring(&self) -> MpscRingView<'_> {

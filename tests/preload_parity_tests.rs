@@ -1521,7 +1521,8 @@ async fn lane_gate_counters_ride_the_stats_page_to_the_stats_inode() {
         unsafe { &*(s.base.add(s.layout.stats_off as usize) as *const ClientStatsPage) }
     };
     let p1 = page(&s1);
-    p1.lane_gate_threshold_bytes.store(64 * 1024, Ordering::Relaxed);
+    p1.lane_gate_threshold_bytes
+        .store(64 * 1024, Ordering::Relaxed);
     for _ in 0..3 {
         p1.note_kernel_route(1024 * 1024);
     }
@@ -1538,7 +1539,8 @@ async fn lane_gate_counters_ride_the_stats_page_to_the_stats_inode() {
     };
     let m = metrics(&fx.fs.generate_stats_json().await);
     assert_eq!(
-        m.get("ipc_lane_gate_kernel_routes").and_then(|v| v.as_u64()),
+        m.get("ipc_lane_gate_kernel_routes")
+            .and_then(|v| v.as_u64()),
         Some(5),
         "routes must sum over live sessions"
     );
@@ -1559,7 +1561,8 @@ async fn lane_gate_counters_ride_the_stats_page_to_the_stats_inode() {
     fx.host.shutdown();
     let m = metrics(&fx.fs.generate_stats_json().await);
     assert_eq!(
-        m.get("ipc_lane_gate_kernel_routes").and_then(|v| v.as_u64()),
+        m.get("ipc_lane_gate_kernel_routes")
+            .and_then(|v| v.as_u64()),
         Some(5),
         "reaped sessions' routes must persist (folded at teardown)"
     );

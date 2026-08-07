@@ -625,6 +625,7 @@ fn ring_positional_core(
     count: usize,
     offset: off_t,
     write: bool,
+    gate: bool,
 ) -> RingServe {
     const REAL: RingServe = RingServe::Real { poisoned: false };
     if offset < 0 || count == 0 || buf.is_null() {
@@ -639,6 +640,15 @@ fn ring_positional_core(
     let Some(session) = registry().by_token(b.session) else {
         return REAL;
     };
+    // HYBRID LANE GATE (D14 corollary, positional per-op arm — the
+    // offsetful/vector callers pass `gate = false` and run their own
+    // sticky/whole-op checks): a strictly-larger-than-threshold op takes
+    // the kernel FUSE lane via the proven Real fallthrough (binding
+    // stays, no demote, errno semantics are the real call's own).
+    if gate && crate::lane_gate::kernel_lane_route(count as u64, session.lane_gate_min()) {
+        session.note_kernel_route(count as u64);
+        return REAL;
+    }
     let out = if write {
         // SAFETY: the app's own (buf, count) contract, same as libc.
         let data = unsafe { std::slice::from_raw_parts(buf as *const u8, count) };
@@ -666,7 +676,7 @@ fn ring_positional(
     offset: off_t,
     write: bool,
 ) -> Option<ssize_t> {
-    match ring_positional_core(fd, buf, count, offset, write) {
+    match ring_positional_core(fd, buf, count, offset, write, true) {
         RingServe::Served(n) => Some(n),
         RingServe::Errno(e) => {
             set_errno(e);
@@ -707,8 +717,41 @@ fn finish_offsetful(fd: c_int, m: &crate::fd_table::MirrorHandle<'_>, armed: boo
 /// re-arms — transient backpressure simply prices that fd back at the
 /// pre-PERF-7 two-syscall discipline).
 fn ring_offsetful(fd: c_int, buf: *mut u8, count: usize, write: bool) -> Option<ssize_t> {
-    let (_b, m) = table().lookup_with_mirror(fd)?; // cheap pre-check
+    // Cheap pre-check: unbound fds take the real call.
+    let (b, m) = table().lookup_with_mirror(fd)?;
+    // HYBRID LANE GATE (offsetful sticky arm — `lane_gate.rs` module
+    // docs): a LATCHED description takes the real call outright — the
+    // mirror was flushed and permanently demoted at latch time, so
+    // kernel f_pos is authoritative and the real read/write costs zero
+    // shim syscalls (the kernel lane at native cost). Every op the
+    // latch routes is a gate route (the sticky posture's documented
+    // cost: small ops on a latched fd ride kernel too — no flapping).
+    if m.kernel_lane_latched() {
+        if let Some(session) = registry().by_token(b.session) {
+            session.note_kernel_route(count as u64);
+        }
+        return None;
+    }
     let _l = m.lock_offsets()?;
+    // Gate trigger, under the held offset lock (single-issuer flush
+    // discipline): the first strictly-larger-than-threshold op latches
+    // the description and flushes an armed mirror to kernel f_pos
+    // exactly once. Rights screen first — a wrong-direction op's Real
+    // is the kernel's EBADF business, never a gate route.
+    if ((write && b.write_ok) || (!write && b.read_ok))
+        && registry()
+            .by_token(b.session)
+            .is_some_and(|s| crate::lane_gate::kernel_lane_route(count as u64, s.lane_gate_min()))
+    {
+        m.latch_kernel_lane();
+        if let Some(cur) = m.disarm_if_current() {
+            raw_lseek(fd, cur as i64, libc::SEEK_SET);
+        }
+        if let Some(session) = registry().by_token(b.session) {
+            session.note_kernel_route(count as u64);
+        }
+        return None;
+    }
     let armed = m.armed();
     let off = if armed {
         m.load() as i64
@@ -721,7 +764,7 @@ fn ring_offsetful(fd: c_int, buf: *mut u8, count: usize, write: bool) -> Option<
         }
         off
     };
-    match ring_positional_core(fd, buf, count, off as off_t, write) {
+    match ring_positional_core(fd, buf, count, off as off_t, write, false) {
         RingServe::Served(n) => {
             if n > 0 {
                 finish_offsetful(fd, &m, armed, off + n as i64);
@@ -764,6 +807,41 @@ fn ring_iovec(
     if (write && !b.write_ok) || (!write && !b.read_ok) {
         return None;
     }
+    // HYBRID LANE GATE: a vector op gates on its TOTAL requested bytes
+    // (the kernel serves the whole vector as one FUSE request — the
+    // per-op-overhead-vs-per-byte model prices the op, not a segment).
+    let total_req: u64 = (0..iovcnt)
+        .map(|i| {
+            // SAFETY: the app's iovec array contract, same as libc.
+            unsafe { (*iov.add(i as usize)).iov_len as u64 }
+        })
+        .fold(0u64, u64::saturating_add);
+    if offset < 0 && m.kernel_lane_latched() {
+        // Sticky offsetful arm (see `ring_offsetful`): latched
+        // descriptions ride the kernel lane outright, counted.
+        if let Some(session) = registry().by_token(b.session) {
+            session.note_kernel_route(total_req);
+        }
+        return None;
+    }
+    if registry()
+        .by_token(b.session)
+        .is_some_and(|s| crate::lane_gate::kernel_lane_route(total_req, s.lane_gate_min()))
+    {
+        if offset < 0 {
+            // Offsetful trigger: latch + one-time mirror flush under the
+            // held offset lock (the single-issuer discipline).
+            let _l = m.lock_offsets()?;
+            m.latch_kernel_lane();
+            if let Some(cur) = m.disarm_if_current() {
+                raw_lseek(fd, cur as i64, libc::SEEK_SET);
+            }
+        }
+        if let Some(session) = registry().by_token(b.session) {
+            session.note_kernel_route(total_req);
+        }
+        return None;
+    }
     // Hold the description's offset lock across the whole chain for the
     // offsetful shape (one atomic f_pos advance for the vector op).
     let (guard, armed, mut off) = if offset < 0 {
@@ -792,7 +870,14 @@ fn ring_iovec(
         if e.iov_len == 0 {
             continue;
         }
-        match ring_positional_core(fd, e.iov_base as *mut u8, e.iov_len, off as off_t, write) {
+        match ring_positional_core(
+            fd,
+            e.iov_base as *mut u8,
+            e.iov_len,
+            off as off_t,
+            write,
+            false,
+        ) {
             RingServe::Served(n) => {
                 total += n;
                 off += n as i64;
@@ -2187,17 +2272,41 @@ pub unsafe extern "C" fn io_submit(ctx: u64, nr: c_long, ios: *mut *mut RawIocb)
                 }
                 // SAFETY: non-null app iocb pointer, live for the call.
                 let io = unsafe { &*(id as *const RawIocb) };
-                let (rights, slab) = match table().lookup(io.aio_fildes) {
+                let (rights, slab, session) = match table().lookup(io.aio_fildes) {
                     Some(b) => {
-                        let slab = registry()
-                            .by_token(b.session)
-                            .map(|s| s.slab_bytes())
-                            .unwrap_or(0);
-                        (Some((b.read_ok, b.write_ok)), slab)
+                        let session = registry().by_token(b.session);
+                        let slab = session.map(|s| s.slab_bytes()).unwrap_or(0);
+                        (Some((b.read_ok, b.write_ok)), slab, session)
                     }
-                    None => (None, 0),
+                    None => (None, 0, None),
                 };
-                screen_iocb(io, rights, slab)
+                let Some(s) = session else {
+                    return screen_iocb(io, rights, slab);
+                };
+                // HYBRID LANE GATE (per-iocb arm): size-route eligible
+                // iocbs at their batch position (the mixed-batch core's
+                // own reroute venue — prefix law preserved). The screen
+                // runs SIZE-BLIND here so the two size laws — the
+                // structural one-slot slab law (a multi-slot async op
+                // would hold slots hostage) and the gate threshold —
+                // resolve in ONE place and the gate's ledger attributes
+                // every size-based kernel route (the libaio 1 MiB row's
+                // engagement instrument). Gate OFF (min = 0, the A/B
+                // lever) keeps the structural slab reroute — it is a
+                // slot-shape constraint, not a gate decision — but
+                // counts nothing.
+                let class = screen_iocb(io, rights, u64::MAX);
+                if class == IocbClass::Ring {
+                    let min = s.lane_gate_min();
+                    let structural = io.nbytes > slab;
+                    if structural || crate::lane_gate::kernel_lane_route(io.nbytes, min) {
+                        if min != 0 {
+                            s.note_kernel_route(io.nbytes);
+                        }
+                        return IocbClass::Kernel;
+                    }
+                }
+                class
             })
             .collect();
         if !classes.contains(&IocbClass::Ring) {

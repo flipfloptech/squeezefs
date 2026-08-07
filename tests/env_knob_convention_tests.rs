@@ -438,14 +438,18 @@ fn documented_defaults_match_the_shipped_ones() {
         ("SQUEEZEFS_REWRITE_SHADOW", true),
         ("SQUEEZEFS_DISCARD_ELISION", true),
         ("SQUEEZEFS_FUSE_KMBUF", true),
-        // NOT flipped (zc-bridge-cqe-wedge campaign, 2026-08-07): the
-        // zcws-10 bracket on the FIXED transport ran wedge-free with
-        // zero tripwires but failed the flip rule's perf gates (rand4k
-        // 0.796×, rand4kow 0.924×, read sentinel 33.99 < 39.5 GB/s) —
-        // `.benchmarks/2026-08-07-zc-bridge-cqe-wedge.md` §6 is the
-        // adjudication. The default stays OFF until a counted bracket
-        // passes the standing rule.
-        ("SQUEEZEFS_FUSE_ZC", false),
+        // FLIPPED ON by ruling D16 (user, 2026-08-07), superseding the
+        // 0.97× all-write-rows rule the zcws-10 bracket failed on: the
+        // hybrid lane gate changed the failing row's fleet meaning
+        // (shim small ops ride the ring, never FUSE), so the −20 %
+        // rand-4k write tax applies only to UN-shimmed kernel-lane
+        // small writes — accepted, documented in operations.md, with
+        // handler/worker fusion fast-tracked as its fix. Reads gain
+        // +40–75 % on every armed-capable mount; wedge class closed
+        // (bounded-outcome ladder); stock kernels decline loud and run
+        // the bufring path byte-identically. `SQUEEZEFS_FUSE_ZC=0` is
+        // the escape/A-B lever. rc-manifest §3f D16 is the ruling.
+        ("SQUEEZEFS_FUSE_ZC", true),
         ("SQUEEZEFS_FREE_FORENSICS", false),
         ("SQUEEZEFS_OP_PROFILE", false),
         ("SQUEEZEFS_INPLACE_OVERWRITE", false),

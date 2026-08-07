@@ -595,6 +595,20 @@ corollary recorded with the ruling: with kernel-lane reads AND writes at
 zc, the interception shim's charter narrows toward the IOPS/rand-small
 lane (direct-drive), big-sequential traffic riding the kernel lane.
 
+**Ruling D16 (user 2026-08-07): `SQUEEZEFS_FUSE_ZC` default ON — "flip, and
+fast-track fusion."** Supersedes the 0.97× all-write-rows flip rule (which
+zcws-10 failed on rand-4k write 0.796×). Basis: the hybrid lane gate changed
+the failing row's fleet meaning — shim small ops ride the ring and never
+touch FUSE, so the ~20 % extraction-hop tax applies only to UN-shimmed
+kernel-lane rand-4k writes, accepted as a documented caveat
+(`docs/operations.md` §Environment knobs) with **handler/worker fusion
+fast-tracked** as its fix. Armed wins carried by the record: reads
++40–75 %, durable/seq writes ≥ par, wedge class closed (bounded-outcome
+ladder, zero tripwires since), stock kernels decline loud and run the
+bufring path byte-identically. `SQUEEZEFS_FUSE_ZC=0` is the escape/A-B
+lever; the D16 caveat sunsets when fusion's bracket clears 0.97× on the
+rand-4k row.
+
 **Ruling D15 (user 2026-08-07 — rig discipline, standing): every battery/rig
 row must pass END-TO-END on the local substrate before it runs on the remote
 host.** Issued after the wave-closing battery wedged the field host mid-run

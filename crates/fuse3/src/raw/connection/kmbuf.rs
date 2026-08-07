@@ -523,7 +523,11 @@ pub fn resolve_buffer_mode() -> TransportBufferMode {
     // malformed value keeps the documented default (announced by the
     // daemon's startup gate, which refuses it outright).
     let lever_off = !env_bool("SQUEEZEFS_FUSE_KMBUF", true);
-    let zc_wanted = env_bool("SQUEEZEFS_FUSE_ZC", false);
+    // Default TRUE per ruling D16 (2026-08-07, rc-manifest §3f): reads
+    // +40–75 % armed; every unsupported surface declines LOUD and runs
+    // the bufring path byte-identically, so the ON default is inert on
+    // stock kernels. `SQUEEZEFS_FUSE_ZC=0` is the escape / A-B lever.
+    let zc_wanted = env_bool("SQUEEZEFS_FUSE_ZC", true);
     match (kmbuf_surface(), lever_off) {
         (KmbufSurface::Present(_), false) => {
             if zc_wanted {

@@ -121,8 +121,72 @@ Venue: squeeze-test (or any fabric client), armed mount (`SQUEEZEFS_FUSE_ZC=1`),
 6. **Sustained row**: one ≥ 60 s `--time_based` 1 MiB read row ON, throughput flat across the window (the burst rows above are label-only for speed claims).
 7. Tripwires along every row: `ipc_sessions_poisoned = 0`, `ipc_descriptor_rejects = 0`, `transport_lease_overlong` flat, and the write rows carry their amplification columns per the standing instrument.
 
+## 4b. Field confirmation (2026-08-07, perf/field-confirmations-0807 — RUN)
+
+**Venue/instrument**: squeeze-test (32 CPUs, EL8, 6.19.14-sqz), real
+NVMe-oF TCP fabric (reset-v5 converged cluster, 5 meta + 5 nullb data
+namespaces — same format as the write-lane-fanout §7 rows), fresh
+`cluster_reset_v4.sh` + fresh format; **armed** interception mount
+(`SQUEEZEFS_FUSE_ZC=1` — `fuse3_kmbuf_negotiated=1` gauged); daemon+shim
+both `cc5e4ab1` (KD-7). Instrument: fio 3.36 (dynamic — loads the shim),
+`LD_PRELOAD=libsqueezefs_il.so`, libaio/psync as stated per row,
+`direct=1`. Rig `.benchmarks/rigs/2026-08-07-fieldconf-set2-lanegate.sh`
+(+ `…-set2-gate.py`, engagement gates FATAL); artifacts
+`/scratch/tmp/fieldconf-0807/set2*`.
+
+**Geometry adjudication (first run = the slab-clamp capture).** §4's rows
+compose with the fio-engine-policy arena-slab law — they do not stack: on a
+`SQUEEZEFS_IPC_ARENA_MB=1024` mount the slot slab is 1 MiB and the
+derivation clamps the threshold into [slab, max_op] = [1 MiB, 1 MiB], so
+the DERIVED gate keeps bs=1M ops on the RING by the strictly-greater
+boundary law (measured: threshold gauge 1,048,576; a 16 GiB libaio 1M il
+write row ran **byte-exact through the ring at 13.28 GB/s**, kernel-lane
+bytes 0 — kept as `set2-run1-slabclamp/`). That IS the derivation working
+as specified (§1.2's rails), stated here so nobody arms both notes at once
+and reads the ring row as a gate failure. The confirmation therefore runs
+the §4 spec on the DEFAULT arena (threshold derives interior), and uses
+the 1 GiB arena only where the §5 residual demands it — as the OFF arm's
+geometry, since a bs=1M libaio "all-ring" row is expressible ONLY there.
+
+**Phase 1 — the §4 rows (default arena, derived gate; engagement EXACT on
+every row, checks shown are the FATAL gates):**
+
+| §4 row | Result | Engagement |
+|---|---|---|
+| 1. threshold publish | `ipc_lane_gate_threshold_bytes` = **86,016** (84 KiB, interior — this box's memBW probe class) | > 0 with one live bound fd ✓ |
+| 2a. libaio 1M write il | **12.58 GB/s** | lane bytes ≡ row (1.0000×), ring in = 0; amp 1.000, wareq ≈ 4 MiB |
+| 2b. libaio 1M read il | **24.06 GB/s** | lane bytes ≡ row, ring out = 0 |
+| 2c. psync 1M write il | **13.21 GB/s** | lane bytes ≡ row, ring in = 0; amp 1.001 |
+| 2d. psync 1M read il | 9.15 GB/s (qd1 sync twin — label-only) | lane bytes ≡ row, ring out = 0 |
+| 3. psync rand-4k read il ×8 jobs | **167,989 IOPS** | ring ops 3,359,949 ≡ row ios, lane routes = 0 |
+| 4. dd bs=1M sticky (write(2) stream) | routes **1024 ≡ count** | ring writes = 0; amp 1.001 |
+| — kernel reference (no shim), libaio 1M read | 26.23 GB/s | labeled class row |
+| 6. sustained ON read (60 s, 1.44 TiB served) | **26.39 GB/s, thirds 26.38 / 26.46 / 25.72** (flat ≤ 2.9 %) | lane bytes ≡ row (1.0000×) |
+| 7. tripwires (every row) | `ipc_sessions_poisoned` 0, `ipc_descriptor_rejects` 0, `transport_lease_overlong` 0 | ✓ |
+
+**Phase 2 — §4 item 5, the A/B at the 1 MiB read shape** (matched libaio
+qd8×4 both arms; ON = default arena + derived gate ⇒ kernel lane, OFF =
+1 GiB arena + `SQUEEZEFS_IL_KERNEL_LANE_MIN=0` ⇒ the true ring arm;
+remount + fresh dir + fresh prewrite per leg, ON OFF OFF ON ON OFF —
+medians of 3, both orders; every leg engagement-gated on ITS lane):
+
+| arm | legs (GB/s) | median |
+|---|---|---|
+| gate ON (kernel/zc lane) | 26.54 / 26.38 / 26.42 | **26.42** |
+| gate OFF (ring, best ring geometry) | 15.55 / 15.54 / 15.56 | **15.55** |
+
+**ON/OFF = 1.70×** — order-insensitive (leg spread < 0.2 % within each
+arm), and the ON arm lands ON the no-shim kernel reference (26.42 vs
+26.23 = 1.007): **the il 1 MiB read gap does not just close toward the
+kernel lane's class, it closes exactly** (the reference-epoch 49.2-vs-28
+absolute classes did not reproduce on today's venue — see the fanout §7
+same-day raw grading — but the ≥ 1.5× ON-ratio expectation holds at
+1.70×). rand-4k holds: the ring row's IOPS lane is untouched by the gate
+(routes = 0) with ring engagement exact.
+
 ## 5. Standing residuals
 
 * The probe reads LLC-class bandwidth on big-L3 parts (§1.2) — conservative toward the ring; if a field row shows the threshold materially misplaced, the probe's buffer should grow past LLC (a one-line change, re-derivation automatic).
 * The sticky latch never un-latches short of a fresh bind — a workload that writes one 1 MiB burst then does rand-4k on the SAME fd via read()/write() pays kernel-lane for the small tail (counted, visible in the ledger). Positional ops on the same fd are unaffected (per-op). If a counted field row prices un-latching in, hysteresis (latch-down after N sub-threshold ops + re-arm cost) is the shaped follow-on.
 * aio gate-OFF keeps the structural > slab kernel reroute uncounted (it is not a gate decision); a libaio "all-ring" A/B arm is therefore only meaningful at ≤ slab shapes — stated here so nobody reads a libaio 1 MiB OFF row as a ring row.
+* **Big-arena mounts pin the derived gate to the slab** (field capture, §4b): at `SQUEEZEFS_IPC_ARENA_MB=1024` the slab is 1 MiB = `max_op`, the clamp yields threshold ≡ 1 MiB, and the strictly-greater law keeps every ≤ 1 MiB op on the ring — the derivation's rails working, but operationally it means the fio-engine-policy arena geometry and the derived gate cannot be armed together for 1 MiB traffic. If a counted row ever prices big-arena + gate composition in, the threshold's floor rail (protect the single-flight regime) needs to decouple from the slab it currently rides.

@@ -228,3 +228,83 @@ Expected on the armed leg:
 
 Sustained-state rule applies: the headline field row is the 60 s
 `time_based` window (flat across thirds), not a burst.
+
+## 7. Field confirmation (2026-08-07, perf/field-confirmations-0807 — RUN)
+
+**Venue/instrument** (stated per the standing rules): squeeze-test
+(32 CPUs, EL8, 6.19.14-sqz), real NVMe-oF TCP fabric — reset-v5 converged
+cluster (5 storage nodes × [1 nullb meta + 2 nullb 48 GiB data namespaces],
+2 fabric paths/subsystem, iopolicy round-robin), task format = 5 meta +
+**5 data namespaces** (aqr37-d0/d1, aqr38-d0/d1, aqr39-d0); binary+shim
+`cc5e4ab1` (md5-verified deploy); fio 3.36 libaio `direct=1 rw=write bs=1M
+iodepth=8 numjobs=16 nrfiles=8 size=8g time_based 60 s + 10 s ramp,
+end_fsync=1`, fresh dir per leg. Rig
+`.benchmarks/rigs/2026-08-07-fieldconf-set1-wlanes.sh` (+ its analyzer /
+raw-calibration sibling); artifacts `/scratch/tmp/fieldconf-0807/set1*`.
+
+**Venue-stationarity lesson (first run = the aging capture).** The
+memory-backed null_blk data plane is a CONSUMABLE venue: a first pass
+without target resets decayed 27.3 → 18.7 GB/s monotonically across legs
+regardless of arm, and the two A-B-B-A brackets DISAGREED (1.30× forward,
+0.96× reversed) — the ordering-artifact signature, row set INVALID for the
+bracket (kept as `set1-run1-agingcapture/`). The creditable run resets the
+cluster (`cluster_reset_v4.sh`) before EVERY leg, so each leg starts from
+the reference state; device names are re-resolved from NQNs per reset.
+**Same-day venue grade**: the reference epoch's raw class did NOT
+reproduce — raw fio on the same 5 namespaces reads **24.22 GB/s**
+(1 submitter/dev qd16) and **38.05 GB/s** (6 submitters/dev qd3, same
+in-flight) vs the reference epoch's 49.7; the venue sits at ~77 % of the
+epoch the 35.31 GB/s wall was measured in. Absolute-GB/s comparisons to
+§6's targets are therefore ratio-graded against the same-day raw rows.
+
+**The A/B (reset per leg, 8 legs = A-B-B-A + B-A-A-B, medians of 4/arm):**
+
+| leg | arm | GB/s (60 s sustained) | engagement | governor (target vs base; ups/backoffs Δ) |
+|---|---|---|---|---|
+| 1A | derived (6 lanes/dev) | 24.38 | all 6 lanes ×5 devs | **462 M > 296 M; +17/+14 (converting)** |
+| 2B | lanes=1 | 21.71 | lane 0 only, pinned | 381 M = base; +19/+19 |
+| 3B | lanes=1 | 23.85 | lane 0 only | 266 M = base; +19/+19 |
+| 4A | derived | **31.07** | all 6 ×5 | **185 M > 169 M; +22/+21** |
+| 6B | lanes=1 | 22.40 | lane 0 only | 270 M = base; +20/+20 |
+| 7A | derived | **30.83** | all 6 ×5 | **178 M > 168 M; +24/+22** |
+| 8A | derived | 24.67 | all 6 ×5 | 224 M = base; +16/+16 |
+| 9B | lanes=1 | 22.58 | lane 0 only | 284 M = base; +19/+19 |
+
+* **Medians: A 27.75 vs B 22.49 GB/s = +23.4 %**, and every adjacent
+  A/B pair agrees in direction across both orders (1.12× / 1.30× /
+  1.38× / 1.09×). Same-day-raw-normalized: the fan-out arm delivers
+  **0.73× raw-spread** vs the control's **0.59×** — the control's
+  FS/raw matches the reference epoch's 35.31/49.7 = 0.71 shape only
+  through the fan-out arm; the single-lane posture has fallen further
+  behind the venue than it was at the reference epoch.
+* **Governor conversion — the §6 signature CONFIRMED**: probes convert
+  only on the armed arm (target > base with ups > backoffs on 3 of 4 A
+  legs; every B leg pinned target ≡ base, ups ≡ backoffs). `dma` phase
+  mode moves down one octave (B mode `<=8ms`, A mode `<=4ms`) — down,
+  though not out of the 2–8 ms class on this venue.
+* **Amplification columns**: dev/user 1.007–1.011, wareq-sz ≈ 2.5–3.0 MiB
+  on every leg (no request-size collapse); `data_dma_fence_refusals`
+  flat 0; P0 smoke (`cp` 32 MiB `&& sync f`, md5 ×3) clean on all 9 legs.
+* **Connection census (ss -ti, >100 MB TX in a 15 s mid-row window)**: A
+  legs saturate the data-queue population UNIFORMLY — 320 hot = exactly
+  (2+2+1 data subsystems) × 2 paths × 32 queues; B legs read 224–300 with
+  per-target asymmetry. The §6 "was 1 hot" expectation is NOT what ss
+  shows on this kernel: io-wq punting + round-robin multipath spread even
+  the single lane across many queues — the delivered difference is
+  submitting-thread width (the product's own `data_write_lane_submits`
+  ledger is the engagement instrument; ss corroborates uniform-vs-partial).
+* **Armed compose variant (labeled, 1 leg)**: `SQUEEZEFS_FUSE_ZC=1` +
+  derived lanes = **25.22 GB/s** — inside the A population's spread
+  (24.4–31.1); no separable zc term at this venue's variance.
+* **Within-leg thirds** varied leg-to-leg (flat 1.02 on the best A legs —
+  which were also the fastest — up to 1.6 on decaying ones): the null_blk
+  first-pass/rewrite transition is visible INSIDE a 60 s row; the quoted
+  figures are the full measured-window means per the sustained-state law.
+
+**Verdict:** the fan-out leaves the single-lane wall on the real fabric —
+**+23 % at medians, direction unanimous across four order-alternating
+brackets, engagement exact, governor converting only when the wall is
+lifted** — but the venue's absolute class has degraded ~24 % below the
+reference epoch (raw-graded), so "35.31 → raw-49.7-class" could not be
+re-tested as an absolute; on today's venue the control arm's wall sits at
+≈ 22.5 GB/s and the fan-out clears it to ≈ 27.8–31.1.

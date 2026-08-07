@@ -30,7 +30,7 @@ use squeezefs::meta_backend::kv::builder::{format_v3, FormatV3Options};
 use squeezefs::meta_backend::kv::{
     META_COMMIT_PARKED, META_CONVEYOR_LEADER_PASSES, META_CONVEYOR_QUEUED,
 };
-use squeezefs::meta_backend::RoutedMetaBackend;
+use squeezefs::meta_backend::{Metadata, RoutedMetaBackend};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -135,8 +135,10 @@ async fn census_names_a_stalled_conveyor() {
     let passes0 = META_CONVEYOR_LEADER_PASSES.load(Ordering::SeqCst);
 
     let be = Arc::clone(&routed);
-    let committer =
-        tokio::spawn(async move { be.create(1, "wedge_census_probe", 0o100644, 0, 0).await });
+    let committer = tokio::spawn(async move {
+        be.create(1, "wedge_census_probe", libc::S_IFREG | 0o644, 0, 0)
+            .await
+    });
 
     assert!(
         poll_until(POLL_DEADLINE, || {

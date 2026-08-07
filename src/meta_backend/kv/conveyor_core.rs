@@ -100,6 +100,9 @@ impl<T> ConveyorCore<T> {
     /// journal entry size — the drain's byte cap counts these).
     pub fn enqueue(&self, item: T, len: u64) {
         self.queue.lock().unwrap().push_back((item, len));
+        // Wedge census (2026-08-07): the process-global queued gauge —
+        // maintained HERE (enqueue/drain) so no fan-out path can leak it.
+        super::META_CONVEYOR_QUEUED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Attempt to become the leader. `true` ⇒ the caller MUST arrange a
@@ -131,6 +134,10 @@ impl<T> ConveyorCore<T> {
             let (item, len) = q.pop_front().expect("front observed");
             bytes += len;
             out.push(item);
+        }
+        if !out.is_empty() {
+            super::META_CONVEYOR_QUEUED
+                .fetch_sub(out.len() as u64, std::sync::atomic::Ordering::Relaxed);
         }
         out
     }

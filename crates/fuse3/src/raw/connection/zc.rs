@@ -331,6 +331,99 @@ pub fn hold_candidate(offset: u64, size: u32, payload_sz: usize) -> bool {
     size > 0 && (size as usize) < payload_sz / 2 && offset % 4096 == 0 && size % 4096 == 0
 }
 
+/// The per-worker **bridge-deadline ledger** (zc-bridge-cqe-wedge
+/// campaign, 2026-08-07): every in-flight zc bridge op must have a
+/// BOUNDED outcome — completion, error, or a deadline-driven
+/// `AsyncCancel` whose `-ECANCELED` CQE resolves through the existing
+/// loud fallback ladders. The zcws-9 W4 field wedge's posture (every
+/// worker parked healthy in `io_cqring_wait` while slots aged 57+ min)
+/// is exactly what an unbounded bridge wait produces; a parked worker
+/// waiting forever on a CQE that never comes violates the transport's
+/// own FUSE-2 discipline.
+///
+/// One ledger per drain-group worker (ent-indexed like its `zc_pend`
+/// vec): [`Self::stamp`] at every pend SET, [`Self::clear`] at every
+/// pend resolution, [`Self::overdue`] yields each overdue ent EXACTLY
+/// ONCE (the cancel-once law — the scan runs every worker pass, and a
+/// canceled op that somehow never completes must not spawn a cancel
+/// storm; it stays named by the slot watchdog). Out-of-range indexes
+/// never panic.
+pub(crate) struct BridgeDeadlines {
+    /// Issue stamp (transport-epoch ns); 0 = no pend.
+    born: Vec<u64>,
+    /// Cancel-once latch, reset by [`Self::clear`]/[`Self::stamp`].
+    cancelled: Vec<bool>,
+    outstanding: usize,
+}
+
+impl BridgeDeadlines {
+    pub(crate) fn new(depth: usize) -> Self {
+        Self {
+            born: vec![0; depth],
+            cancelled: vec![false; depth],
+            outstanding: 0,
+        }
+    }
+
+    /// Record a bridge op issued on `ent` at `now_ns`. `true` = a NEW
+    /// pend (the caller bumps the pool gauge on it).
+    pub(crate) fn stamp(&mut self, ent: usize, now_ns: u64) -> bool {
+        if let Some(b) = self.born.get_mut(ent) {
+            let fresh = *b == 0;
+            if fresh {
+                self.outstanding += 1;
+            }
+            *b = now_ns.max(1);
+            self.cancelled[ent] = false;
+            fresh
+        } else {
+            false
+        }
+    }
+
+    /// Record `ent`'s bridge op resolved (any CQE — success, error, or
+    /// `-ECANCELED`). `true` = a pend was live (the caller drops the
+    /// pool gauge on it).
+    pub(crate) fn clear(&mut self, ent: usize) -> bool {
+        if let Some(b) = self.born.get_mut(ent) {
+            let was = *b != 0;
+            if was {
+                self.outstanding -= 1;
+            }
+            *b = 0;
+            self.cancelled[ent] = false;
+            was
+        } else {
+            false
+        }
+    }
+
+    /// Live pend count (drives the watch thread's wake decision via the
+    /// pool gauge).
+    pub(crate) fn outstanding(&self) -> usize {
+        self.outstanding
+    }
+
+    /// The ents whose bridge ops have been in flight longer than
+    /// `timeout_ns` and have NOT been yielded before — each exactly
+    /// once per pend lifetime.
+    pub(crate) fn overdue(&mut self, now_ns: u64, timeout_ns: u64) -> Vec<usize> {
+        let mut out = Vec::new();
+        for (ent, b) in self.born.iter().enumerate() {
+            if *b == 0 || self.cancelled[ent] {
+                continue;
+            }
+            if now_ns.saturating_sub(*b) >= timeout_ns {
+                out.push(ent);
+            }
+        }
+        for &ent in &out {
+            self.cancelled[ent] = true;
+        }
+        out
+    }
+}
+
 /// The held-payload table (D14 write-side leg): one cell per
 /// `(qid, ent)`, `nqueues × depth`, 0 = nothing held (a held length is
 /// always > 0 — the delivery only holds payload-carrying WRITEs).

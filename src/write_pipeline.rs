@@ -125,6 +125,16 @@ const ADMIT_TICK: Duration = Duration::from_millis(5);
 /// inside the window the registration order closes.
 static TEST_PREPARK_STALL_US: AtomicU64 = AtomicU64::new(0);
 
+/// Wedge-census mirrors (zc-bridge-cqe-wedge, 2026-08-07): the
+/// process-global twins of the per-instance pipeline gauges, readable
+/// from the op watchdog with no instance in hand. Permit-count
+/// semantics: minted at admission, returned at `PipelinePermit::drop` —
+/// the loom-modeled `AdmissionCore` stays untouched.
+pub static PIPELINE_INFLIGHT_PERMITS: AtomicU64 = AtomicU64::new(0);
+/// Process-global mirror of `admission_waits` (writers that parked at
+/// least once behind the depth target).
+pub static PIPELINE_ADMISSION_WAITS: AtomicU64 = AtomicU64::new(0);
+
 /// Set the [`TEST_PREPARK_STALL_US`] seam (tests only).
 pub fn set_test_prepark_stall_us(us: u64) {
     TEST_PREPARK_STALL_US.store(us, Ordering::Relaxed);
@@ -475,6 +485,11 @@ impl WritePipeline {
             let target = self.depth_target_bytes(block_bytes.max(1));
             match self.core.try_admit_once(block_bytes, target) {
                 crate::write_pipeline_core::AdmitAttempt::Admitted => {
+                    // Wedge-census mirror (2026-08-07): the process-global
+                    // twin of `core.inflight_blocks()` — permit-count
+                    // semantics, maintained at the permit's mint/drop so
+                    // the loom-modeled core stays untouched.
+                    PIPELINE_INFLIGHT_PERMITS.fetch_add(1, Ordering::Relaxed);
                     return Some(PipelinePermit {
                         pipe: self.clone(),
                         bytes: block_bytes,
@@ -531,6 +546,8 @@ impl WritePipeline {
             if !waited {
                 waited = true;
                 self.admission_waits.fetch_add(1, Ordering::Relaxed);
+                // Wedge-census mirror (2026-08-07).
+                PIPELINE_ADMISSION_WAITS.fetch_add(1, Ordering::Relaxed);
             }
             // PERF-13 test seam: one relaxed load per park, zero cost when
             // unset. Lets a test place a completion exactly inside the
@@ -636,6 +653,7 @@ impl PipelinePermit {
 
 impl Drop for PipelinePermit {
     fn drop(&mut self) {
+        PIPELINE_INFLIGHT_PERMITS.fetch_sub(1, Ordering::Relaxed);
         self.pipe.core.release(self.bytes);
         self.pipe.completions.notify_waiters();
     }

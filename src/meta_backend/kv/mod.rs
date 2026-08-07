@@ -401,6 +401,39 @@ pub static META_CONVEYOR_LEADER_PASSES: AtomicU64 = AtomicU64::new(0);
 /// journal-failure lattice bumped — never a silent `completed_upto` wedge.
 pub static META_CONVEYOR_PASS_PANICS: AtomicU64 = AtomicU64::new(0);
 
+/// Entries queued on ANY conveyor (tx + layout, every volume) and not
+/// yet drained by a pass — the wedge census's stalled-conveyor gauge
+/// (zc-bridge-cqe-wedge, 2026-08-07): growing while
+/// [`META_CONVEYOR_LEADER_PASSES`] stays flat IS the stalled signature.
+/// Maintained by `conveyor_core` (enqueue +1, drain −n) so no fan-out
+/// path can leak it.
+pub static META_CONVEYOR_QUEUED: AtomicU64 = AtomicU64::new(0);
+
+/// Committers parked on their conveyor oneshot RIGHT NOW (the wedge
+/// census's writers-behind-the-conveyor gauge): incremented before the
+/// fan-out park, decremented on the answer — panic-safe by Drop guard.
+pub static META_COMMIT_PARKED: AtomicU64 = AtomicU64::new(0);
+
+/// The layout-merge (Lever B publish) twin of [`META_COMMIT_PARKED`].
+pub static META_PUBLISH_PARKED: AtomicU64 = AtomicU64::new(0);
+
+/// RAII decrement for the parked gauges (panic-safe: a committer future
+/// dropped mid-park must not strand the census).
+pub struct ParkedGaugeGuard(&'static AtomicU64);
+
+impl ParkedGaugeGuard {
+    pub fn enter(gauge: &'static AtomicU64) -> Self {
+        gauge.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(gauge)
+    }
+}
+
+impl Drop for ParkedGaugeGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// The conveyor group-size histogram (design-metadata-throughput §9):
 /// exact buckets 1–8 (the G3 median band), then ≤16 / ≤32 / ≤64 / >64.
 pub struct CommitGroupSizeHistogram {

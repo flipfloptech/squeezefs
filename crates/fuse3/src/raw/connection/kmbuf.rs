@@ -577,6 +577,7 @@ static ZC_WRITE_EXTRACTIONS: AtomicU64 = AtomicU64::new(0);
 static ZC_WRITE_EXTRACT_BYTES: AtomicU64 = AtomicU64::new(0);
 static ZC_WRITE_DIRECTS: AtomicU64 = AtomicU64::new(0);
 static ZC_WRITE_DIRECT_BYTES: AtomicU64 = AtomicU64::new(0);
+static ZC_BRIDGE_CANCELS: AtomicU64 = AtomicU64::new(0);
 
 /// Set the session's kmbuf negotiation state (0/1) — stored at arm time
 /// by `try_start` (the worker-arm wiring), a level like the geometry
@@ -699,6 +700,23 @@ pub fn zc_write_directs() -> u64 {
 /// bytes is the armed-row closure instrument.
 pub fn zc_write_direct_bytes() -> u64 {
     ZC_WRITE_DIRECT_BYTES.load(Ordering::Relaxed)
+}
+
+/// Count one bridge-deadline `AsyncCancel` (zc-bridge-cqe-wedge,
+/// 2026-08-07): a zc bridge op aged past the deadline and the worker
+/// pushed its cancel — the original op's CQE (completed or
+/// `-ECANCELED`) then resolves through the loud fallback ladders. The
+/// bounded-outcome law's engagement face.
+pub fn note_zc_bridge_cancel() {
+    ZC_BRIDGE_CANCELS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `fuse3_zc_bridge_cancels` (stats inode): **must stay 0** — nonzero
+/// names a bridge op the ring never completed inside the deadline
+/// (investigate alongside `transport_slots_overdue` and the wedge
+/// census).
+pub fn zc_bridge_cancels() -> u64 {
+    ZC_BRIDGE_CANCELS.load(Ordering::Relaxed)
 }
 
 // ---------------------------------------------------------------------

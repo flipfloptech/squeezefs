@@ -614,6 +614,12 @@ pub(crate) enum RingOp {
     /// bridge, `WRITE_FIXED(slot → memfd)` for WRITE extraction. The
     /// per-ent pending kind ([`zc::ZcPend`]) disambiguates at the CQE.
     Fetch,
+    /// A bridge-deadline `AsyncCancel` targeting an overdue Fetch op
+    /// (zc-bridge-cqe-wedge, 2026-08-07 — the bounded-outcome law). Its
+    /// own CQE is informational (`0` = found+canceled, `-ENOENT` = the
+    /// op already completed, `-EALREADY` = running, may still complete);
+    /// resolution always rides the ORIGINAL op's CQE.
+    Cancel,
 }
 
 /// `user_data` reserved for the wake-fd PollAdd (unchanged).
@@ -626,6 +632,7 @@ const UD_TAG_SHIFT: u32 = 32;
 const UD_TAG_REGISTER: u64 = 1;
 const UD_TAG_COMMIT: u64 = 2;
 const UD_TAG_FETCH: u64 = 3;
+const UD_TAG_CANCEL: u64 = 4;
 
 /// Encode `(op, ent_idx)` into an SQE `user_data` word.
 #[inline]
@@ -634,6 +641,7 @@ pub(crate) fn encode_user_data(op: RingOp, ent_idx: usize) -> u64 {
         RingOp::Register => UD_TAG_REGISTER,
         RingOp::Commit => UD_TAG_COMMIT,
         RingOp::Fetch => UD_TAG_FETCH,
+        RingOp::Cancel => UD_TAG_CANCEL,
     };
     (tag << UD_TAG_SHIFT) | (ent_idx as u64 & 0xFFFF_FFFF)
 }
@@ -648,6 +656,7 @@ pub(crate) fn decode_user_data(user_data: u64) -> Option<(RingOp, usize)> {
         UD_TAG_REGISTER => RingOp::Register,
         UD_TAG_COMMIT => RingOp::Commit,
         UD_TAG_FETCH => RingOp::Fetch,
+        UD_TAG_CANCEL => RingOp::Cancel,
         // A word this worker never pushed (kernel echo of an unknown op
         // class): treat as a REGISTER completion — the historical
         // reading — rather than dropping the CQE.
@@ -1357,6 +1366,11 @@ pub struct FuseOverUring {
     /// extracts it). Written by the queue workers, read by the session
     /// validation and the handler's slot-source mint.
     zc_write_held: zc::ZcHeldTable,
+    /// Live zc bridge ops across every worker (the bounded-outcome law,
+    /// 2026-08-07): the watch thread wakes parked workers while this is
+    /// nonzero so their [`zc::BridgeDeadlines`] scans run even on idle
+    /// queues.
+    zc_bridge_pends: AtomicU64,
     /// Ring depth (per queue) — the `slot_watch` stride.
     depth: usize,
     /// §5.3 D3.b: session SQPOLL posture for the queue rings (`None` =
@@ -1388,6 +1402,24 @@ pub struct FuseOverUring {
     pub stats_replies: AtomicU64,
     pub stats_cqe_err: AtomicU64,
     pub stats_register: AtomicU64,
+}
+
+/// The zc bridge deadline (`SQUEEZEFS_ZC_BRIDGE_TIMEOUT_MS`, default
+/// 30 000 — the D1.b op-watchdog threshold's transport twin): a bridge
+/// op in flight past this pushes its `AsyncCancel` (the bounded-outcome
+/// law; `fuse3_zc_bridge_cancels` is the must-stay-0 tripwire). Read
+/// once per process; the daemon's startup gate refuses malformed
+/// values, so a bad value here keeps the default.
+fn zc_bridge_timeout_ns() -> u64 {
+    static NS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *NS.get_or_init(|| {
+        let ms = std::env::var("SQUEEZEFS_ZC_BRIDGE_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&v| (100..=600_000).contains(&v))
+            .unwrap_or(30_000);
+        ms * 1_000_000
+    })
 }
 
 /// `SQUEEZEFS_TRANSPORT_DEBUG=1` — per-request transport tracing to stderr
@@ -2519,6 +2551,7 @@ impl FuseOverUring {
             inbound,
             slot_watch: (0..nqueues * depth).map(|_| SlotWatch::default()).collect(),
             zc_write_held: zc::ZcHeldTable::new(nqueues, depth),
+            zc_bridge_pends: AtomicU64::new(0),
             depth,
             sqpoll,
             queues: queue_handles,
@@ -2743,6 +2776,7 @@ impl FuseOverUring {
                 .map(|_| SlotWatch::default())
                 .collect(),
             zc_write_held: zc::ZcHeldTable::new(nqueues as usize, Self::SIM_DEPTH),
+            zc_bridge_pends: AtomicU64::new(0),
             depth: Self::SIM_DEPTH,
             sqpoll: None,
             queues,
@@ -3670,6 +3704,24 @@ fn connection_watch(pool: Arc<FuseOverUring>) {
         if last_scan.elapsed() >= SLOT_WATCHDOG_INTERVAL {
             last_scan = Instant::now();
             pool.scan_overdue_slots();
+            // The bounded-outcome law's WAKE half (2026-08-07): a worker
+            // parked in cq-wait never scans its bridge deadlines — while
+            // any bridge pend is outstanding, tick every group's eventfd
+            // so the parked workers run the scan (coalesced; one write
+            // per group per watchdog interval at most).
+            if pool.zc_bridge_pends.load(Ordering::Relaxed) > 0 {
+                for g in &pool.groups {
+                    if g.wake_coalescer.arm() {
+                        let one: u64 = 1;
+                        // SAFETY: writing 8 bytes to a live eventfd.
+                        let _ =
+                            unsafe { libc::write(g.wake_fd, &one as *const u64 as *const _, 8) };
+                        TRANSPORT_WAKE_WRITES.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        TRANSPORT_WAKES_ELIDED.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
         }
         let mut pfd = libc::pollfd {
             fd: pool.fuse_fd,
@@ -3876,6 +3928,9 @@ fn queue_worker(
         /// an ent serves one request between two commits). `None`s on
         /// non-zc sessions.
         zc_pend: Vec<Option<ZcPend>>,
+        /// The bounded-outcome ledger for `zc_pend` (2026-08-07): stamp
+        /// at issue, clear at resolution, cancel-once past the deadline.
+        bridge_deadlines: zc::BridgeDeadlines,
     }
     let wake_coalescer = Arc::clone(&pool.groups[group_idx].wake_coalescer);
     let mut members: Vec<MemberState> = Vec::with_capacity(g);
@@ -4007,6 +4062,7 @@ fn queue_worker(
             arena,
             node: member_node,
             zc_pend: (0..depth).map(|_| None).collect(),
+            bridge_deadlines: zc::BridgeDeadlines::new(depth),
         });
     }
 
@@ -4036,6 +4092,8 @@ fn queue_worker(
         slots: &mut SlotTable,
         ent: &mut Ent,
         zc_pend_slot: &mut Option<ZcPend>,
+        deadlines: &mut zc::BridgeDeadlines,
+        bridge_gauge: &AtomicU64,
         zc_bounce: Option<&Arc<ZcBounce>>,
         zc_track: Option<kmbuf::KmbufTrack>,
         watch: Option<&SlotWatch>,
@@ -4126,6 +4184,9 @@ fn queue_worker(
                             commit_id: msg.commit_id,
                             len: body_len as u32,
                         });
+                        if deadlines.stamp(idx, crate::raw::read_phase::transport_now_ns()) {
+                            bridge_gauge.fetch_add(1, Ordering::Relaxed);
+                        }
                         return Ok(());
                     }
                     Err(e) => {
@@ -4466,6 +4527,11 @@ fn queue_worker(
                     match push_fetch_batched(&mut ring, &mut batch, entry) {
                         Ok(()) => {
                             m.zc_pend[idx] = Some(ZcPend::HandlerFetch { done: f.done });
+                            if m.bridge_deadlines
+                                .stamp(idx, crate::raw::read_phase::transport_now_ns())
+                            {
+                                pool.zc_bridge_pends.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                         Err(e) => {
                             warn!(
@@ -4520,6 +4586,11 @@ fn queue_worker(
                     match push_fetch_batched(&mut ring, &mut batch, entry) {
                         Ok(()) => {
                             m.zc_pend[idx] = Some(ZcPend::HandlerStore { done: s.done });
+                            if m.bridge_deadlines
+                                .stamp(idx, crate::raw::read_phase::transport_now_ns())
+                            {
+                                pool.zc_bridge_pends.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                         Err(e) => {
                             warn!(
@@ -4583,6 +4654,11 @@ fn queue_worker(
                     match push_fetch_batched(&mut ring, &mut batch, entry) {
                         Ok(()) => {
                             m.zc_pend[idx] = Some(ZcPend::LazyExtract { done: x.done, len });
+                            if m.bridge_deadlines
+                                .stamp(idx, crate::raw::read_phase::transport_now_ns())
+                            {
+                                pool.zc_bridge_pends.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                         Err(e) => {
                             warn!(
@@ -4629,6 +4705,8 @@ fn queue_worker(
                         &mut m.slots,
                         &mut m.ents[idx],
                         &mut m.zc_pend[idx],
+                        &mut m.bridge_deadlines,
+                        &pool.zc_bridge_pends,
                         zc_bounce.as_ref(),
                         zc_track,
                         pool.slot_watch_cell(qid, idx),
@@ -4672,6 +4750,8 @@ fn queue_worker(
                         &mut m.slots,
                         &mut m.ents[idx],
                         &mut m.zc_pend[idx],
+                        &mut m.bridge_deadlines,
+                        &pool.zc_bridge_pends,
                         zc_bounce.as_ref(),
                         zc_track,
                         pool.slot_watch_cell(qid, idx),
@@ -4686,6 +4766,44 @@ fn queue_worker(
         // Exit promptly when another worker/watch already shut us down (wake_fd).
         if !pool.active.load(Ordering::Relaxed) {
             break;
+        }
+
+        // The bounded-outcome law (zc-bridge-cqe-wedge, 2026-08-07):
+        // every zc bridge op in flight past the deadline gets ONE
+        // AsyncCancel — the original op's CQE (completed or -ECANCELED)
+        // then resolves through the loud fallback ladders, so a lost
+        // ring completion can wedge NOTHING beyond the deadline. The
+        // cancel SQEs ride the same loop-bottom flush; the watch thread
+        // wakes parked workers while any pend is outstanding, so this
+        // scan runs on idle queues too.
+        if zc_mode && pool.zc_bridge_pends.load(Ordering::Relaxed) > 0 {
+            let now = crate::raw::read_phase::transport_now_ns();
+            let timeout = zc_bridge_timeout_ns();
+            for (mi, m) in members.iter_mut().enumerate() {
+                for ent in m.bridge_deadlines.overdue(now, timeout) {
+                    let gent = gent_of(mi, ent);
+                    error!(
+                        "fuse-over-uring qid={} ent={ent}: zc bridge op in flight past \
+                         the {} ms deadline — pushing AsyncCancel; the op's own CQE \
+                         resolves it (fuse3_zc_bridge_cancels)",
+                        m.qid,
+                        timeout / 1_000_000
+                    );
+                    kmbuf::note_zc_bridge_cancel();
+                    let entry = Entry128::from(
+                        opcode::AsyncCancel::new(encode_user_data(RingOp::Fetch, gent))
+                            .build()
+                            .user_data(encode_user_data(RingOp::Cancel, gent)),
+                    );
+                    if let Err(e) = push_fetch_batched(&mut ring, &mut batch, entry) {
+                        warn!(
+                            "fuse-over-uring qid={} ent={ent}: bridge AsyncCancel push \
+                             failed ({e}) — the slot stays named by the watchdog",
+                            m.qid
+                        );
+                    }
+                }
+            }
         }
 
         // ONE syscall for everything pushed above: submit_and_wait both
@@ -4792,6 +4910,17 @@ fn queue_worker(
                 // EINVAL here is a misaligned O_DIRECT fetch or an
                 // unregistered slot (the opcode-mirror miss), both of
                 // which fall back per-request.
+                if op == RingOp::Cancel {
+                    // A bridge-deadline cancel's own CQE is informational
+                    // — resolution rides the ORIGINAL op's CQE (completed
+                    // or -ECANCELED).
+                    warn!(
+                        "fuse-over-uring qid={qid} ent={ent_idx}: bridge AsyncCancel \
+                         answered {err} (0=canceled, ENOENT=already done, \
+                         EALREADY=running)"
+                    );
+                    continue;
+                }
                 if op == RingOp::Fetch {
                     // An errored bridge CQE: LazyExtract answers its
                     // handler's oneshot with the error (the DISPATCHED
@@ -4810,6 +4939,9 @@ fn queue_worker(
                         gent,
                         res,
                     )?;
+                    if m.bridge_deadlines.clear(ent_idx) {
+                        pool.zc_bridge_pends.fetch_sub(1, Ordering::Relaxed);
+                    }
                     if matches!(pend, Some(PendDone::DeliverFailed)) {
                         fail_ent(
                             &mut ring,
@@ -4840,9 +4972,10 @@ fn queue_worker(
                     return Err(io::Error::from_raw_os_error(err));
                 }
                 match op {
-                    // Structurally unreachable: Fetch errors resolved (and
-                    // `continue`d) before the protocol-fatal ladder above.
-                    RingOp::Fetch => {}
+                    // Structurally unreachable: Fetch/Cancel errors
+                    // resolved (and `continue`d) before the
+                    // protocol-fatal ladder above.
+                    RingOp::Fetch | RingOp::Cancel => {}
                     // Row 6: a transient COMMIT failure re-commits. The
                     // ent still holds the applied reply, so re-pushing
                     // the same COMMIT_AND_FETCH is the whole recovery —
@@ -4953,6 +5086,12 @@ fn queue_worker(
                 continue;
             }
             let m = &mut members[mi];
+            if op == RingOp::Cancel {
+                // Informational (see the error-path twin): resolution
+                // always rides the original op's CQE.
+                debug!(qid, ent_idx, res, "bridge AsyncCancel CQE");
+                continue;
+            }
             if op == RingOp::Fetch {
                 // A zc bridge completed (device fetch/store, bounce
                 // bridge, or lazy WRITE extraction). NOT a delivery —
@@ -4968,6 +5107,9 @@ fn queue_worker(
                     gent,
                     res,
                 )?;
+                if m.bridge_deadlines.clear(ent_idx) {
+                    pool.zc_bridge_pends.fetch_sub(1, Ordering::Relaxed);
+                }
                 if let Some(p) = pend {
                     // An extracted WRITE payload sits in the bounce
                     // slot: mint the §5.4 lease over it. The lease arena
@@ -5385,6 +5527,11 @@ fn queue_worker(
                                 commit_id,
                                 len: payload_sz as u32,
                             });
+                            if m.bridge_deadlines
+                                .stamp(ent_idx, crate::raw::read_phase::transport_now_ns())
+                            {
+                                pool.zc_bridge_pends.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                         Err(e) => {
                             error!(
@@ -5603,6 +5750,15 @@ fn queue_worker(
             WorkerMsg::Commit(msg) => final_msgs.push((msg, false)),
             // Dropping the sender unblocks the parked handler (BrokenPipe).
             WorkerMsg::ZcFetch(_) | WorkerMsg::ZcStore(_) | WorkerMsg::ZcExtract(_) => {}
+        }
+    }
+    // Bridge-deadline gauge hygiene: every pend died with this worker —
+    // return its share so the watch thread stops waking survivors for
+    // ledgers that no longer exist.
+    for m in members.iter_mut() {
+        let n = m.bridge_deadlines.outstanding() as u64;
+        if n > 0 {
+            pool.zc_bridge_pends.fetch_sub(n, Ordering::Relaxed);
         }
     }
     xport_dbg!(
@@ -8289,7 +8445,12 @@ mod drain_group_tests {
         for member in [0usize, 1, 15, 31] {
             for ent in [0usize, 1, depth - 1] {
                 let gent = member * depth + ent;
-                for op in [RingOp::Register, RingOp::Commit, RingOp::Fetch, RingOp::Cancel] {
+                for op in [
+                    RingOp::Register,
+                    RingOp::Commit,
+                    RingOp::Fetch,
+                    RingOp::Cancel,
+                ] {
                     let ud = encode_user_data(op, gent);
                     assert_eq!(decode_user_data(ud), Some((op, gent)));
                 }

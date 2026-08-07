@@ -4960,6 +4960,9 @@ impl KvMetaBackend {
         // (3) Park on the fan-out. A closed channel means the pass died
         // between drain and fan-out — the panic sentinel already failed
         // the batch loud (EIO here is the belt, not the mechanism).
+        // The wedge census gauges the park (2026-08-07): writers parked
+        // here while passes stay flat IS the stalled-conveyor signature.
+        let _parked = super::ParkedGaugeGuard::enter(&super::META_COMMIT_PARKED);
         match rx.await {
             Ok(out) => out,
             Err(_) => Err(KvError::Io(self.eio(
@@ -6907,6 +6910,9 @@ impl KvMetaBackend {
             // cancellation can drop a batch mid-commit.
             tokio::spawn(Self::layout_merge_pass_task(conveyor, weak));
         }
+        // The wedge census gauges this park too (2026-08-07) — the
+        // publish plane's twin of META_COMMIT_PARKED.
+        let _parked = super::ParkedGaugeGuard::enter(&super::META_PUBLISH_PARKED);
         match rx.await {
             Ok(out) => out,
             Err(_) => Err(self.eio(

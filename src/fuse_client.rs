@@ -1618,6 +1618,53 @@ const PATH_MAX_WITH_NUL: usize = 4096;
 /// are accurate to ± one tick.
 const OP_WATCHDOG_TICK: Duration = Duration::from_secs(5);
 
+/// The **wedge census** (zc-bridge-cqe-wedge campaign, 2026-08-07):
+/// one line naming what overdue ops park on, built from PROCESS-GLOBAL
+/// atomics only — readable from the watchdog task no matter what is
+/// wedged (the zcws-9 W4 capture had 16k overdue-op lines, a 3-entry
+/// lock census, and a `.stats` read that hung, so the gauges were
+/// unreachable exactly when they mattered). Reading rules:
+///
+/// * `meta_conveyor_queued`/`meta_commit_parked`/`meta_publish_parked`
+///   growing while `meta_conveyor_passes` stays flat across ticks = the
+///   commit conveyor stalled (X is inside a pass: journal write,
+///   admission, checkpoint — read `meta_journal_entries` +
+///   `meta_checkpoints` deltas next).
+/// * `pipeline_inflight_blocks` pinned + `pipeline_admission_waits`
+///   growing = write-pipeline permit exhaustion.
+/// * `transport_parked_commits − transport_unparked_commits` growing =
+///   §5.4 leases never dropping (handler-side custody wedge).
+pub fn wedge_census_line() -> String {
+    // transport_lease_stats = (leases, parked, unparked, outstanding,
+    // max_age_ms, overlong, dest_dma).
+    let (leases_outstanding, parked, unparked) = {
+        let s = fuse3::transport_lease_stats();
+        (s.3, s.1, s.2)
+    };
+    format!(
+        "wedge census: meta_conveyor_passes={} meta_conveyor_queued={} \
+         meta_commit_parked={} meta_publish_parked={} meta_journal_entries={} \
+         meta_checkpoints={} pipeline_inflight_blocks={} pipeline_admission_waits={} \
+         reclaim_queue_bytes={} rewrite_open_epochs={} transport_leases_outstanding={} \
+         transport_parked_commits={} transport_unparked_commits={}",
+        crate::meta_backend::kv::META_CONVEYOR_LEADER_PASSES.load(Ordering::Relaxed),
+        crate::meta_backend::kv::META_CONVEYOR_QUEUED.load(Ordering::Relaxed),
+        crate::meta_backend::kv::META_COMMIT_PARKED.load(Ordering::Relaxed),
+        crate::meta_backend::kv::META_PUBLISH_PARKED.load(Ordering::Relaxed),
+        crate::meta_backend::kv::META_KV_JOURNAL_ENTRIES.load(Ordering::Relaxed),
+        crate::meta_backend::kv::META_KV_CHECKPOINTS.load(Ordering::Relaxed),
+        crate::write_pipeline::PIPELINE_INFLIGHT_PERMITS.load(Ordering::Relaxed),
+        crate::write_pipeline::PIPELINE_ADMISSION_WAITS.load(Ordering::Relaxed),
+        METRICS
+            .block_free_reclaim_queue_bytes
+            .load(Ordering::Relaxed),
+        METRICS.rewrite_shadow_open_epochs.load(Ordering::Relaxed),
+        leases_outstanding,
+        parked,
+        unparked,
+    )
+}
+
 /// Spawn the per-daemon D1.b watchdog task (idempotent: one per process
 /// — the op registry is process-global, so one scanner serves every
 /// mounted volume). Called from FUSE `init`.
@@ -1645,6 +1692,10 @@ pub fn spawn_op_watchdog() {
                     // and each blocked stripe's last acquirer, so a wedge
                     // capture reads as a cycle without a gdb session.
                     log_lock_wait_census(threshold);
+                    // The wedge census (2026-08-07): one line naming what
+                    // the non-lock-parked ops await — atomics only, so it
+                    // reads even when `.stats` itself is wedged.
+                    error!("{}", wedge_census_line());
                 }
             }
         });
@@ -7582,6 +7633,12 @@ impl SqueezefsFilesystem {
                 // armed-row closure instrument.
                 "fuse3_zc_write_directs": fuse3::zc_write_directs(),
                 "fuse3_zc_write_direct_bytes": fuse3::zc_write_direct_bytes(),
+                // The bounded-outcome tripwire (zc-bridge-cqe-wedge,
+                // 2026-08-07): MUST STAY 0 — nonzero names a bridge op
+                // the ring never completed inside the deadline
+                // (investigate with transport_slots_overdue + the wedge
+                // census).
+                "fuse3_zc_bridge_cancels": fuse3::zc_bridge_cancels(),
                 // The WRITE twin (transport-ingress campaign): the gauge
                 // is what keeps the in-place arm wired.
                 "fuse3_write_inplace_replies": fuse3::write_inplace_replies(),

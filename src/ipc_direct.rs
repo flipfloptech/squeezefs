@@ -150,6 +150,32 @@ fn dd_shards() -> usize {
     )
 }
 
+/// Mid-sweep eager-flush threshold (shim-iops campaign, 2026-08-07):
+/// `0` (the shipped default) keeps the M3 submit-batch economy — one
+/// `io_uring_enter` per shard per drain sweep; `K > 0` additionally
+/// enters INLINE when a lane's unflushed SQE count reaches K, so a
+/// burst's device service starts before the sweep tail (the
+/// decomposition's push→enter share of the ~105 µs inflight-over-device
+/// term). `SQUEEZEFS_IPC_DD_EAGER_FLUSH` is the counted-measurement
+/// lever; clamp ceiling = the per-shard ring depth.
+fn dd_eager_flush() -> u32 {
+    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        dd_eager_flush_from(
+            std::env::var("SQUEEZEFS_IPC_DD_EAGER_FLUSH")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// Pure sizing form (unit-pinned like `dd_shards_from`).
+fn dd_eager_flush_from(v: Option<&str>) -> u32 {
+    v.and_then(|v| v.trim().parse::<u32>().ok())
+        .map(|n| n.clamp(0, RING_ENTRIES))
+        .unwrap_or(0)
+}
+
 thread_local! {
     /// The submitting thread's direct-drive LANE. Service threads set
     /// their owner index at loop start ([`set_service_lane`] from
@@ -643,11 +669,19 @@ impl DirectDriveEngine {
             st.inflight[idx] = Some(pending);
             st.inflight_count += 1;
         }
-        // No enter here: the SQE is published; the owning service
-        // thread's drain pass flushes ONCE per sweep (`flush`), so a
-        // deep-qd burst pays one syscall per batch instead of one per
-        // op. (The SQ-full path above already entered to make room.)
-        shard.pending_submits.fetch_add(1, Ordering::Release);
+        // No enter here by default: the SQE is published; the owning
+        // service thread's drain pass flushes ONCE per sweep (`flush`),
+        // so a deep-qd burst pays one syscall per batch instead of one
+        // per op. (The SQ-full path above already entered to make room.)
+        // The eager arm (lever B, shim-iops 2026-08-07): with
+        // `SQUEEZEFS_IPC_DD_EAGER_FLUSH=K` a lane whose unflushed count
+        // reaches K enters INLINE — a mid-sweep burst starts its device
+        // service without waiting for the sweep tail.
+        let pending = shard.pending_submits.fetch_add(1, Ordering::Release) + 1;
+        let eager = dd_eager_flush();
+        if eager > 0 && pending >= eager {
+            Self::flush_shard(lane, shard);
+        }
         Ok(())
     }
 
@@ -659,26 +693,35 @@ impl DirectDriveEngine {
     /// lane) keeps the liveness rule thread-pairing-independent.
     pub(crate) fn flush(&self) {
         for (lane, shard) in self.shards.iter().enumerate() {
-            if shard.pending_submits.swap(0, Ordering::AcqRel) == 0 {
-                continue;
-            }
-            for attempt in 0..3 {
-                match shard.ring.submit() {
-                    Ok(_) => break,
-                    Err(e)
-                        if matches!(
-                            e.raw_os_error(),
-                            Some(libc::EINTR) | Some(libc::EAGAIN) | Some(libc::EBUSY)
-                        ) && attempt < 2 =>
-                    {
-                        std::hint::spin_loop();
-                    }
-                    Err(e) => {
-                        // The SQEs are published; the reaper's own enter
-                        // carries them. Loud because it should not happen.
-                        log::error!("ipc direct-drive: shard {lane} io_uring submit failed: {e}");
-                        break;
-                    }
+            Self::flush_shard(lane, shard);
+        }
+    }
+
+    /// One shard's enter (shared by the per-sweep [`Self::flush`] and
+    /// the eager mid-sweep arm in [`Self::submit`]): swap-claims the
+    /// pending count, so concurrent callers never double-enter for the
+    /// same published tail (and a lost race is harmless — the other
+    /// caller's enter carried the SQEs).
+    fn flush_shard(lane: usize, shard: &DdShard) {
+        if shard.pending_submits.swap(0, Ordering::AcqRel) == 0 {
+            return;
+        }
+        for attempt in 0..3 {
+            match shard.ring.submit() {
+                Ok(_) => break,
+                Err(e)
+                    if matches!(
+                        e.raw_os_error(),
+                        Some(libc::EINTR) | Some(libc::EAGAIN) | Some(libc::EBUSY)
+                    ) && attempt < 2 =>
+                {
+                    std::hint::spin_loop();
+                }
+                Err(e) => {
+                    // The SQEs are published; the reaper's own enter
+                    // carries them. Loud because it should not happen.
+                    log::error!("ipc direct-drive: shard {lane} io_uring submit failed: {e}");
+                    break;
                 }
             }
         }

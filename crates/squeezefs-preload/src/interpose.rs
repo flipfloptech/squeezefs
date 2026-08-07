@@ -2477,7 +2477,7 @@ unsafe fn aio_reap_served(
             // completion latency and max-latency tails — stays fully
             // event-driven below.
             if parks.len() > reap_event_park_max() {
-                let quantum = std::time::Duration::from_micros(50);
+                let quantum = reap_quantum();
                 let bound = match deadline {
                     None => quantum,
                     Some(d) => d
@@ -2629,6 +2629,33 @@ fn reap_event_park_max_from(v: Option<&str>) -> usize {
     v.and_then(|v| v.trim().parse::<usize>().ok())
         .map(|n| n.clamp(0, 4096))
         .unwrap_or(REAP_EVENT_PARK_MAX)
+}
+
+/// Deep-regime batch-reap sleep quantum, µs (shim-iops campaign,
+/// 2026-08-07). The 50 µs default is the shipped 2026-07-26 sizing; the
+/// campaign's decomposition measured the blind sleep as the dominant
+/// residence term at low fan-in (1×qd8: 75.5 k → 344.8 k IOPS with the
+/// sleep replaced by the event park) and a bunching term at fleet
+/// shapes, so `SQUEEZEFS_IL_REAP_QUANTUM_US` is the counted-measurement
+/// lever. Clamp 1..=1000: 0 would busy-spin (spin policy belongs to
+/// `SQUEEZEFS_IL_SPINS`, never this knob), and past 1 ms the sparse
+/// regime's event park is strictly better.
+const REAP_BATCH_QUANTUM_US: u64 = 50;
+
+fn reap_quantum() -> std::time::Duration {
+    static V: OnceLock<std::time::Duration> = OnceLock::new();
+    *V.get_or_init(|| {
+        reap_quantum_from(std::env::var("SQUEEZEFS_IL_REAP_QUANTUM_US").ok().as_deref())
+    })
+}
+
+/// Pure sizing form (unit-pinned like `reap_event_park_max_from`).
+fn reap_quantum_from(v: Option<&str>) -> std::time::Duration {
+    std::time::Duration::from_micros(
+        v.and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|n| n.clamp(1, 1000))
+            .unwrap_or(REAP_BATCH_QUANTUM_US),
+    )
 }
 
 /// # Safety

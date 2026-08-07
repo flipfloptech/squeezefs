@@ -215,6 +215,7 @@ pub static KNOBS: &[Knob] = &[
     k("SQUEEZEFS_IPC_MEM_PCT", int(1, 100), "derived", "Session-arena admission cap as a percentage of the R5 budget."),
     k("SQUEEZEFS_IPC_SERVICE_THREADS", int(1, 1 << 12), "derived clamp(3*cpus/8,2,64)", "Service-thread ceiling (threads spawn on session admission; the drain-lane pair's submitter half — same derivation as DD_SHARDS)."),
     k("SQUEEZEFS_IPC_DD_SHARDS", int(1, 1 << 12), "derived clamp(3*cpus/8,2,64)", "Direct-drive uring shards (one ring + pinned reaper per shard, one lane per service thread; override/measurement lever)."),
+    k("SQUEEZEFS_IPC_DD_EAGER_FLUSH", int(0, 1 << 12), "0", "Direct-drive mid-sweep eager flush: K > 0 enters inline once a lane's unflushed SQE count reaches K (shim-iops measurement lever; 0 = end-of-sweep flush only, the shipped M3 submit-batch posture)."),
     k("SQUEEZEFS_IPC_SOCKET_DIR", Kind::Str, "derived (XDG_RUNTIME_DIR / /run)", "Rendezvous socket directory; `none` disables the filesystem-path socket."),
     k("SQUEEZEFS_IPC_SPIN_US", int(0, 1 << 20), "0", "Service-thread empty-pass spin window, µs — an explicit fleet lever (nonzero taxes the sync lane)."),
     // -- L4 interception: client (shim) side -----------------------------
@@ -223,6 +224,7 @@ pub static KNOBS: &[Knob] = &[
     k("SQUEEZEFS_IL_MAX_RUN_SLOTS", int(0, 1 << 16), "0 (unbounded)", "Cap on concurrently claimed slots per session."),
     k("SQUEEZEFS_IL_OP_TIMEOUT_MS", int(1, MS_MAX), "bounded default", "Per-op bounded wait against a stalled daemon, ms."),
     k("SQUEEZEFS_IL_REAP_PARK_MAX", int(0, 1 << 16), "2", "libaio reap: queue depth at or below which the event-driven park is used."),
+    k("SQUEEZEFS_IL_REAP_QUANTUM_US", int(1, 1000), "50", "libaio reap: deep-regime batch sleep quantum, µs (shim-iops measurement lever; the shipped 50 µs is the 2026-07-26 sizing)."),
     k("SQUEEZEFS_IL_READ_DEST", Kind::Bool, "on", "Arena-destination read serves (E-IL2); 0 = the A/B lever."),
     k("SQUEEZEFS_IL_KERNEL_LANE_MIN", int(0, BYTES_MAX), "derived (memBW probe x lane-RTT delta, clamp [slab, max_op])", "Hybrid lane gate (D14 corollary): ops STRICTLY larger than this ride the kernel FUSE lane, smaller ops the IPC ring; explicit wins verbatim, 0 = gate off (all eligible ops ring - the A/B lever). Offsetful forms latch a whole description kernel-lane on first trigger (sticky - the offset mirror never flaps)."),
     // -- zcrx read lane ---------------------------------------------------

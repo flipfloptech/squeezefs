@@ -183,6 +183,40 @@ green throughout.
   clippy `--all-features` AND shipped-config `-D warnings` clean; fmt
   clean.
 
+## Found-latent hand-off: post-close GETATTR can adopt a mid-writeback size floor
+
+The first bracket attempts flushed out a class the (intended)
+loudness fix had armed: 43 of the fork session's 45 `#[instrument]`
+handler spans carried no level → the tracing `log` feature made every
+FUSE op write an INFO line through env_logger's mutex to the log file.
+Under that per-op tax the P0 smoke (`cp 32MiB f && sync f` → md5)
+failed **20/20 on the field** (fabric venue; local loop venue 0/10) on
+BOTH zc postures — and the counted A/B pinned it: base `aca64de1`
+0/20, Part-0-only binary 20/20, same venue, same shape.
+
+The signature is NOT data loss: `stat` right after `sync f` reads the
+file SHORT by exactly its tail block (29360128 = 28 of 32 MiB), the
+stored bytes are intact (md5 exact after the kernel attr TTL), and the
+op tape (now readable thanks to the same loudness fix) shows the
+mechanism: cp's 32 WRITEs dispatch → RELEASE → **GETATTR** (u=16004) →
+LOOKUP×2 → OPEN → FSYNC → RELEASE. The GETATTR runs between cp's
+close and `sync`'s fsync while the LAST WRITEs are still unreplied —
+the daemon legally serves the attr floor as of that instant (28 MiB),
+the post-close kernel adopts the smaller size, and the 1 s kernel attr
+TTL then serves the stale i_size to every stat/read until it expires.
+The per-op log tax stretched the write-handler window enough to select
+this schedule deterministically; base's timing never selects it on
+this venue. Classification: a LATENT attr-floor-vs-in-flight-acks
+race, pre-existing on the timing axis — the daemon could defend by
+flooring served attr sizes at the ino's in-flight write high-water
+mark. HAND-OFF: needs its own red-first campaign (the op tape above is
+the repro recipe; a `SQUEEZEFS_TEST_WRITE_STALL_MS`-class seam selects
+the schedule deterministically in-process).
+
+The fix here (`a1ff7782`): handler spans are per-op DEBUG surface and
+now say so — `level = "debug"` on all 45; `warn!`/`error!` (what the
+loudness fix was FOR) stay audible. Post-fix field probe: 0/20 (below).
+
 ## Field acceptance (squeeze-test: EL8, 6.19.14-sqz — the 6.19 track)
 
 Rig `.benchmarks/rigs/2026-08-06-zc-write-side-rig.sh` (extends the

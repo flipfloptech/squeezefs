@@ -50,8 +50,9 @@ use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 /// all-zeroes); coarse bump per the discipline.
 /// v5: the slot's reserved word became the **ingress stamp**
 /// ([`IpcSlot::stamp_ingress`] — the reap-fanin campaign's measured
-/// client→daemon ring-ingress term, 2026-08-08). Coarse bump per the
-/// discipline.
+/// client→daemon ring-ingress term, 2026-08-08), and the
+/// [`CqeDoorbell`] grew its batch-wake mark (8 → 16 bytes, same header
+/// line — the fan-in reap park). Coarse bump per the discipline.
 pub const IPC_ABI: u32 = 5;
 
 /// Session mapping magic: `SQZIPC01` little-endian.
@@ -317,7 +318,7 @@ pub struct SessionHeader {
     /// submit wake words above, and the producer-contended ring tail
     /// still lives in the ring region ([`SessionLayout::ring_off`]).
     pub cqe: CqeDoorbell,
-    pub _pad3: [u8; 56],
+    pub _pad3: [u8; 48],
     // -- geometry copy (write-once, for the CLIENT's map-time read) ------
     pub geometry: Geometry,
 }
@@ -337,7 +338,7 @@ impl SessionHeader {
             doorbell_coalescer: WakeCoalescer::new(),
             _pad2: [0; 55],
             cqe: CqeDoorbell::new(),
-            _pad3: [0; 56],
+            _pad3: [0; 48],
             geometry,
         }
     }
@@ -599,7 +600,11 @@ const _: () = {
     // sparse, which it does.
     assert!(std::mem::offset_of!(SessionHeader, doorbell) == 64);
     assert!(std::mem::offset_of!(SessionHeader, cqe) == 128);
-    assert!(std::mem::size_of::<CqeDoorbell>() == 8);
+    // v5 (reap-fanin 2026-08-08): the doorbell grew its batch-wake mark
+    // (seq + parked + wake_at + pad) — still ONE line with the seq (the
+    // PERF-18 falsification stands: the daemon reads wake_at only while
+    // parked ≠ 0, and the parker writes it once per park — sparse).
+    assert!(std::mem::size_of::<CqeDoorbell>() == 16);
     assert!(std::mem::offset_of!(SessionHeader, geometry) == 192);
 };
 

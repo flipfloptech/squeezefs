@@ -2930,6 +2930,91 @@ mod models {
         });
     }
 
+    /// IPC completion doorbell, BATCH form (`ipc_cqe_core`
+    /// `park_begin_batch`, reap-fanin 2026-08-08): the SHIPPED batch
+    /// threshold composed with the SHIPPED slot DONE publication — TWO
+    /// ops in flight, the reaper batch-parks with `k = 2` (its own
+    /// pending population, the caller's liveness cap), two daemon
+    /// threads each serve one op and run `cqe.complete()` (below-mark
+    /// completions ELIDE the wake — the fan-in wake-herd economy this
+    /// protocol extension ships). Strand-freedom: an ADMITTED park (seq
+    /// still equals the snapshot at admission — i.e. zero completions
+    /// since the snapshot, so both marks lie in the future) must be
+    /// covered by a wake once both completions have applied; a failed
+    /// admission or a scan hit consumes without sleeping.
+    ///
+    /// Weakening evidence (verified 2026-08-08, then restored): (a)
+    /// removing the daemon-side Dekker `fence(SeqCst)` in `complete`,
+    /// (b) weakening the daemon's `parked` load to `Relaxed`, and (c)
+    /// permuting `park_begin_batch` to snapshot-before-register each
+    /// produce the strand assert here and/or in the k=1 model above —
+    /// the same three weakenings the 2026-07-28 model recorded.
+    #[test]
+    fn ipc_cqe_batch_parked_reaper_never_stranded() {
+        loom::model(|| {
+            let a = Arc::new(ipc_slot_core::SlotCore::new());
+            let b = Arc::new(ipc_slot_core::SlotCore::new());
+            let cqe = Arc::new(ipc_cqe_core::CqeDoorbell::new());
+            let wake = Arc::new(AtomicBool::new(false));
+
+            // Sequential prologue: two ops claimed + submitted.
+            let gen_a = a.try_claim().expect("fresh slot a must claim");
+            a.publish_submitted();
+            let gen_b = b.try_claim().expect("fresh slot b must claim");
+            b.publish_submitted();
+
+            // Two daemon completers (separate threads — the shipped
+            // shape: any completing thread may run the doorbell).
+            let mk_server = |slot: &Arc<ipc_slot_core::SlotCore>| {
+                let slot = Arc::clone(slot);
+                let cqe = Arc::clone(&cqe);
+                let wake = Arc::clone(&wake);
+                thread::spawn(move || {
+                    assert!(slot.try_begin_serve(), "submitted slot must serve");
+                    let _slot_waiter = slot.complete();
+                    if cqe.complete() {
+                        wake.store(true, Ordering::SeqCst);
+                    }
+                })
+            };
+            let s1 = mk_server(&a);
+            let s2 = mk_server(&b);
+
+            // Reaper: batch register-then-snapshot (k = pending = 2),
+            // mandatory re-scan, futex admission.
+            let expected = cqe.park_begin_batch(2);
+            let scan_found = a.is_done_for(gen_a) || b.is_done_for(gen_b);
+            if !scan_found {
+                // The futex admission is atomic against the word: model
+                // it as one SeqCst load at park entry.
+                let admitted = cqe.seq() == expected;
+                s1.join().unwrap();
+                s2.join().unwrap();
+                if admitted {
+                    // Sleeping through both completions: the SECOND one
+                    // reached the mark and must have paid the wake —
+                    // the strand otherwise (the first one's elision is
+                    // the protocol's whole point).
+                    assert!(
+                        wake.load(Ordering::SeqCst),
+                        "cqe batch strand: reaper admitted a k=2 park, both \
+                         ops completed, and no wake is coming \
+                         (expected {expected}, seq now {}, parked {})",
+                        cqe.seq(),
+                        cqe.parked(),
+                    );
+                }
+                // EAGAIN path needs no wake: the reaper re-scans.
+            } else {
+                s1.join().unwrap();
+                s2.join().unwrap();
+            }
+            cqe.park_end();
+            assert!(a.is_done_for(gen_a), "op a completed exactly once");
+            assert!(b.is_done_for(gen_b), "op b completed exactly once");
+        });
+    }
+
     /// IPC wake composition (`ipc_wake_core`, §5.3 protocol rule 3):
     /// the SHIPPED `wake_core::WakeCoalescer` composed with the SHIPPED
     /// `ipc_ring_core` publication, exactly as the session doorbell wires

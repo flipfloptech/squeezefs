@@ -505,6 +505,37 @@ impl ClientSession {
         assert!(r >= 0, "{what}: ring read failed with {r}");
         self.arena_read(arena_off, r as usize)
     }
+
+    /// `n` CONCURRENT ring preads on distinct slots/arena windows (the
+    /// fusion suite's burst shape): submit all, then reap all. Returns
+    /// `(offset, len, bytes)` per op, submit order.
+    fn ring_pread_burst(&self, binding: u64, n: u32) -> Vec<(u64, usize, Vec<u8>)> {
+        let len = 4096usize;
+        let mut gens = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            let offset = (16 + u64::from(i)) * 4096;
+            let arena_off = u64::from(i) * 8192;
+            let gen = self.submit_on(
+                i,
+                &SlotDescriptor {
+                    op: OP_READ,
+                    flags: 0,
+                    binding,
+                    offset,
+                    len: len as u32,
+                    arena_off,
+                },
+            );
+            gens.push((i, offset, arena_off, gen));
+        }
+        gens.into_iter()
+            .map(|(i, offset, arena_off, gen)| {
+                let r = self.wait_done(i, gen, "burst read");
+                assert!(r >= 0, "burst op {i} failed with {r}");
+                (offset, len, self.arena_read(arena_off, r as usize))
+            })
+            .collect()
+    }
 }
 
 impl Drop for ClientSession {
@@ -1036,6 +1067,73 @@ async fn direct_drive_serves_record_residence_phases() {
         );
     }
     fx.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// 6c. reaper/drain fusion (shim-iops campaign, 2026-08-07): a shard's CQ
+//     may be consumed OPPORTUNISTICALLY by the service thread's flush pass
+//     (userspace CQ peek — zero syscall) so a continuously-loaded lane's
+//     completions stop paying the dedicated reaper's per-batch
+//     `io_uring_enter` wake + ctx switch (the decomposition's measured
+//     0.72 enters/op + 2.36 ctx/op economy at the 32×8 ceiling shape).
+//     The shard reaper stays the blocking backstop (park-time serves,
+//     shutdown drain). Contracts:
+//     - correctness under fusion: a concurrent burst of governed ring
+//       reads serves exactly, engagement intact, regardless of which
+//       consumer took each CQE;
+//     - `ipc_direct_inline_reaps` exports (the fusion engagement gauge —
+//       brackets key on its delta; a fixture burst cannot assert it
+//       deterministically, the reaper legitimately races);
+//     - shutdown stays prompt with fusion armed (the NOP wake must stay
+//       reaper-only — an inline consumer eating it would strand the join).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inline_reap_fusion_serves_bursts_exactly_and_exports() {
+    let fx = Fixture::new("fusion").await;
+    fx.salt_inos(7).await;
+    let ino = fx.create_striped("fusion.bin", &[0, 1]).await;
+    let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("repo-dir tempdir");
+    let fd = odirect_standin(&fx, &dir, "fusion.bin", ino);
+    let (session, binding) = ClientSession::establish(&fx, &fd);
+    fx.fs.router.set_direct_device_true(true);
+
+    let before = snap();
+    // Concurrent burst: distinct slots on one session, all in flight
+    // together — the shape where the sweep's inline reap can race the
+    // reaper for CQEs. Byte parity per op proves whoever consumed the
+    // CQE ran the identical revalidate+serve.
+    let n = 8u64;
+    let got = tokio::task::block_in_place(|| session.ring_pread_burst(binding, n as u32));
+    for (i, (offset, len, bytes)) in got.iter().enumerate() {
+        let block = (*offset / BS) as u32;
+        let rel = (*offset % BS) as usize;
+        assert_eq!(
+            bytes,
+            &expect_bytes(block, rel, *len),
+            "byte parity on fused burst op {i}"
+        );
+    }
+    let d = delta(&before);
+    fx.fs.router.set_direct_device_true(false);
+    assert_eq!(d.dd_serves, n, "every burst op direct-drives");
+    assert_eq!(d.handoffs, 0, "no handoff under fusion");
+
+    let stats: serde_json::Value =
+        serde_json::from_str(&fx.fs.generate_stats_json().await).expect("stats json parses");
+    let m = stats.get("metrics").expect("metrics object");
+    assert!(
+        m.get("ipc_direct_inline_reaps").is_some(),
+        "stats inode must export ipc_direct_inline_reaps (the fusion \
+         engagement gauge)"
+    );
+    // Shutdown promptness with fusion armed (the NOP stays reaper-only).
+    let t0 = Instant::now();
+    fx.shutdown();
+    assert!(
+        t0.elapsed() < Duration::from_secs(10),
+        "shutdown must stay prompt with fusion armed"
+    );
 }
 
 // ---------------------------------------------------------------------------

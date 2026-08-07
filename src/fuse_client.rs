@@ -2940,6 +2940,28 @@ const IPC_DIRECT_PHASE_NAMES: [&str; IPC_DIRECT_PHASES] = ["admit", "inflight", 
 static IPC_DIRECT_PROF: Lazy<[LatencyHistogram; IPC_DIRECT_PHASES]> =
     Lazy::new(|| std::array::from_fn(|_| LatencyHistogram::default()));
 
+/// Ring-ingress residence (`ipc_ingress_ns`, reap-fanin campaign
+/// 2026-08-08): client publish stamp → daemon dequeue, MEASURED per op
+/// via the slot's `stamp_ingress` word (one shared CLOCK_MONOTONIC
+/// domain — `mono_core`). Always-on, every stamped ring op (warm serves,
+/// handoffs and direct-drive alike — the segment sits UPSTREAM of the
+/// `ipc_direct_phase_ns` `admit` anchor), so the ledger's former
+/// `fio clat − total` subtraction splits into measured ingress + the
+/// residual OBSERVATION term (daemon completion → client harvest).
+static IPC_INGRESS_PROF: Lazy<LatencyHistogram> = Lazy::new(LatencyHistogram::default);
+
+/// Record one measured ring-ingress residence sample (ns — already
+/// plausibility-screened by `squeezefs_ipc::layout::ingress_delta_ns`).
+#[inline]
+pub fn ipc_ingress_record_ns(ns: u64) {
+    IPC_INGRESS_PROF.record(std::time::Duration::from_nanos(ns));
+}
+
+/// `ipc_ingress_ns` stats payload (bucket map) — UNGATED.
+pub fn ipc_ingress_json() -> serde_json::Value {
+    IPC_INGRESS_PROF.to_json()
+}
+
 /// Record one direct-drive residence span started at `t0` (always-on).
 #[inline]
 pub fn ipc_direct_phase_record(phase: IpcDirectPhase, t0: std::time::Instant) {
@@ -7689,6 +7711,12 @@ impl SqueezefsFilesystem {
                 // hot path never touches a handler, so it needs its
                 // own family. Deliberately ungated.
                 "ipc_direct_phase_ns": ipc_direct_phase_json(),
+                // Measured client→daemon ring-ingress residence
+                // (reap-fanin 2026-08-08): the slot ingress stamp read
+                // at dequeue — upstream of ipc_direct_phase_ns' admit
+                // anchor, so `fio clat − ingress − total` isolates the
+                // client OBSERVATION segment. Deliberately ungated.
+                "ipc_ingress_ns": ipc_ingress_json(),
                 "read_transport_phase_ns": read_transport_phase_json(),
                 // The WRITE twin (transport-ingress campaign): the write
                 // wall's pre-handler leg, measured — no longer inferred.

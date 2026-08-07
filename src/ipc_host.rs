@@ -967,6 +967,17 @@ impl IpcSession {
             // THE one linearization read of the descriptor (§5.3.1 rule 1):
             // validate the copy, serve from the copy, never re-read.
             let desc = slot.snapshot_descriptor();
+            // Ring-ingress residence (reap-fanin 2026-08-08): one
+            // dequeue read of the client's publish stamp, bucketed
+            // through the delta law (display-only — a hostile stamp can
+            // pollute a histogram, never steer a serve; implausible
+            // deltas are discarded there, not clamped).
+            if let Some(ns) = squeezefs_ipc::layout::ingress_delta_ns(
+                crate::mono_core::monotonic_stamp_ns_u32(),
+                slot.ingress_stamp(),
+            ) {
+                crate::fuse_client::ipc_ingress_record_ns(ns);
+            }
             let completion = SlotCompletion {
                 map: Arc::clone(&self.map),
                 slot_index: index,

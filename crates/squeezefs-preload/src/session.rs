@@ -837,6 +837,7 @@ impl Session {
                     len: chunk as u32,
                     arena_off: u64::from(base) * self.slab,
                 });
+                slot.stamp_ingress(crate::mono_core::monotonic_stamp_ns_u32());
                 slot.core.publish_submitted();
                 staged.push(WriteFlight {
                     base,
@@ -991,6 +992,7 @@ impl Session {
                     len: chunk as u32,
                     arena_off: u64::from(base) * self.slab,
                 });
+                slot.stamp_ingress(crate::mono_core::monotonic_stamp_ns_u32());
                 slot.core.publish_submitted();
                 staged.push(WriteFlight {
                     base,
@@ -1107,6 +1109,10 @@ impl Session {
             len: len as u32,
             arena_off,
         });
+        // Ring-ingress stamp (reap-fanin 2026-08-08): the publish
+        // instant, read once daemon-side at dequeue — what turns the
+        // ledger's clat−total subtraction into a measured term.
+        slot.stamp_ingress(crate::mono_core::monotonic_stamp_ns_u32());
         slot.core.publish_submitted();
         if !self.ring().push(slot_idx) {
             // Unreachable for an honest client (slots ≤ ring_entries);

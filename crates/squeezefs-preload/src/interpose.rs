@@ -2645,7 +2645,11 @@ const REAP_BATCH_QUANTUM_US: u64 = 50;
 fn reap_quantum() -> std::time::Duration {
     static V: OnceLock<std::time::Duration> = OnceLock::new();
     *V.get_or_init(|| {
-        reap_quantum_from(std::env::var("SQUEEZEFS_IL_REAP_QUANTUM_US").ok().as_deref())
+        reap_quantum_from(
+            std::env::var("SQUEEZEFS_IL_REAP_QUANTUM_US")
+                .ok()
+                .as_deref(),
+        )
     })
 }
 
@@ -2888,6 +2892,9 @@ mod reap_park_max_tests {
             Duration::from_micros(1000),
             "clamp ceiling"
         );
-        assert_eq!(reap_quantum_from(Some("garbage")), Duration::from_micros(50));
+        assert_eq!(
+            reap_quantum_from(Some("garbage")),
+            Duration::from_micros(50)
+        );
     }
 }

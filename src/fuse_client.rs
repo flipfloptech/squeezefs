@@ -5197,6 +5197,14 @@ pub struct Metrics {
     /// (LBA-unaligned request window, or an arena destination that cannot
     /// take O_DIRECT-class DMA) instead of straight into the arena.
     pub ipc_direct_drive_bounces: Align64<AtomicU64>,
+    /// Reaper/drain fusion engagement (shim-iops campaign, 2026-08-07):
+    /// direct-drive CQEs consumed INLINE by the owning service thread's
+    /// flush pass (userspace CQ peek — zero syscall, zero ctx switch)
+    /// instead of the shard reaper's blocking `io_uring_enter` wake.
+    /// A loaded lane should run this ≈ its serve rate; 0 under load =
+    /// fusion disarmed (`SQUEEZEFS_IPC_DD_INLINE_REAP=0`, a pre-5.11
+    /// kernel without ENTER_EXT_ARG, or the reaper winning every race).
+    pub ipc_direct_inline_reaps: Align64<AtomicU64>,
     /// Direct-drive CQEs that failed post-DMA revalidation (custody
     /// moved / binding changed / device error) and fell back to the
     /// handler path — races, ≈ 0 on quiet read workloads.
@@ -8010,6 +8018,8 @@ impl SqueezefsFilesystem {
                 "ipc_direct_drive_submits": METRICS.ipc_direct_drive_submits.load(Ordering::Relaxed),
                 "ipc_direct_drive_serves": METRICS.ipc_direct_drive_serves.load(Ordering::Relaxed),
                 "ipc_direct_drive_bounces": METRICS.ipc_direct_drive_bounces.load(Ordering::Relaxed),
+                // Reaper/drain fusion engagement (shim-iops 2026-08-07).
+                "ipc_direct_inline_reaps": METRICS.ipc_direct_inline_reaps.load(Ordering::Relaxed),
                 "ipc_direct_drive_fallbacks_post": METRICS.ipc_direct_drive_fallbacks_post.load(Ordering::Relaxed),
                 // MEM-7c tripwire: must stay 0 (see the field doc).
                 "ipc_direct_reap_stalls": METRICS.ipc_direct_reap_stalls.load(Ordering::Relaxed),

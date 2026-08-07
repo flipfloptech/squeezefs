@@ -176,6 +176,20 @@ fn dd_eager_flush_from(v: Option<&str>) -> u32 {
         .unwrap_or(0)
 }
 
+/// Reaper/drain FUSION arm (shim-iops campaign, 2026-08-07 — the A/B
+/// lever, default ON): the owning service thread's flush pass consumes
+/// its lane's completed CQEs INLINE (userspace CQ peek — zero syscall,
+/// zero ctx switch) where the shipped shape paid the dedicated reaper's
+/// per-batch `io_uring_enter` wake + context switch per ~1.4 CQEs (the
+/// decomposition's measured 0.72 enters/op + 2.36 ctx/op at the 32×8
+/// ceiling shape). The reaper stays the blocking BACKSTOP — its wait is
+/// timeout-bounded (see `REAP_WAIT_TIMEOUT_NS`), which is what makes a
+/// fusion-consumed wake unstrandable.
+fn dd_inline_reap() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| crate::env_knobs::bool_knob("SQUEEZEFS_IPC_DD_INLINE_REAP", true))
+}
+
 thread_local! {
     /// The submitting thread's direct-drive LANE. Service threads set
     /// their owner index at loop start ([`set_service_lane`] from
@@ -271,6 +285,14 @@ struct DdShard {
     /// never across I/O or a wait; contended only by this shard's lane
     /// owner and its reaper).
     state: Mutex<EngineState>,
+    /// CQ consumer gate (reaper/drain fusion, 2026-08-07): the CQ has
+    /// exactly one consumer AT A TIME — the reaper takes it around its
+    /// post-enter drain, the owning service thread's flush pass
+    /// `try_lock`s it for the inline drain (never blocks; contention
+    /// means the reaper is already draining). Lock order: `cq_gate`
+    /// then `state` (both drain bodies take `state` per CQE) — never
+    /// the reverse.
+    cq_gate: Mutex<()>,
     /// Fixed-file registration outcome for THIS shard's ring.
     use_fixed: bool,
     /// SQEs pushed since the last `io_uring_enter` — the submit-batch
@@ -313,6 +335,13 @@ pub(crate) struct DirectDriveEngine {
     /// LIVE shard reapers — mirrored into the `ipc_direct_shards`
     /// gauge (the sharding engagement instrument).
     reapers_spawned: AtomicUsize,
+    /// Reaper waits are timeout-bounded via `IORING_ENTER_EXT_ARG`
+    /// (kernel ≥ 5.11). `false` = the kernel refused EXT_ARG once —
+    /// the reaper degrades to the unbounded `submit_and_wait` and the
+    /// fusion inline arm DISARMS (without the bounded wait, an
+    /// inline-consumed NOP wake could strand the shutdown join —
+    /// negotiate-and-degrade-loudly, the kernel-feature law).
+    ext_arg_ok: AtomicBool,
 }
 
 impl DirectDriveEngine {
@@ -408,6 +437,7 @@ impl DirectDriveEngine {
                     free: Vec::new(),
                     inflight_count: 0,
                 }),
+                cq_gate: Mutex::new(()),
                 use_fixed,
                 pending_submits: std::sync::atomic::AtomicU32::new(0),
                 reaper: Mutex::new(None),
@@ -427,6 +457,7 @@ impl DirectDriveEngine {
             req_pid,
             shutting_down: AtomicBool::new(false),
             reapers_spawned: AtomicUsize::new(0),
+            ext_arg_ok: AtomicBool::new(true),
         });
         // Fresh engine: no shard reaper is live yet (spawn-on-first-
         // submit) — the gauge reflects THIS engine from here on.
@@ -691,9 +722,35 @@ impl DirectDriveEngine {
     /// concurrent flushes are harmless (the kernel consumes the
     /// published tail). Flushing ALL shards (not just the caller's
     /// lane) keeps the liveness rule thread-pairing-independent.
+    ///
+    /// Fusion (2026-08-07): after the submit sweep, the calling
+    /// service thread opportunistically drains ITS OWN lane's CQ
+    /// (userspace peek — zero syscall; `try_lock` so the reaper's
+    /// drain is never waited on, other lanes' CQs never touched:
+    /// cross-lane inline reaping would put every svc thread on every
+    /// CQ gate). Disabled while shutting down — teardown CQEs belong
+    /// to the reaper's drain contract.
     pub(crate) fn flush(&self) {
         for (lane, shard) in self.shards.iter().enumerate() {
             Self::flush_shard(lane, shard);
+        }
+        if dd_inline_reap()
+            && self.ext_arg_ok.load(Ordering::Relaxed)
+            && !self.shutting_down.load(Ordering::SeqCst)
+        {
+            let lane = current_lane() % self.shards.len();
+            let shard = &self.shards[lane];
+            // No reaper yet ⇒ nothing ever submitted on this lane.
+            if shard.reaper_live.load(Ordering::Acquire) {
+                if let Ok(_gate) = shard.cq_gate.try_lock() {
+                    let served = self.drain_cq_locked(lane);
+                    if served > 0 {
+                        METRICS
+                            .ipc_direct_inline_reaps
+                            .fetch_add(served as u64, Ordering::Relaxed);
+                    }
+                }
+            }
         }
     }
 
@@ -758,7 +815,7 @@ impl DirectDriveEngine {
                     return;
                 }
             }
-            match shard.ring.submitter().submit_and_wait(1) {
+            match self.reaper_wait(shard) {
                 Ok(_) => {}
                 Err(e) if e.raw_os_error() == Some(libc::EINTR) => {}
                 Err(e) => {
@@ -823,48 +880,109 @@ impl DirectDriveEngine {
                 }
             }
             consecutive_stalls = 0;
-            // SAFETY: this thread is the ONLY CQ accessor of THIS
-            // shard's ring (construction invariant; §module docs).
-            let mut cq = unsafe { shard.ring.completion_shared() };
-            cq.sync();
-            let cqes: Vec<(u64, i32)> = cq.by_ref().map(|c| (c.user_data(), c.result())).collect();
-            drop(cq);
-            for (user_data, res) in cqes {
-                if user_data == NOP_WAKE {
-                    continue;
-                }
-                let pending = {
-                    let mut st = shard
-                        .state
-                        .lock()
-                        .expect("direct-drive state mutex never poisons");
-                    let slot_idx = user_data as usize;
-                    let p = st.inflight.get_mut(slot_idx).and_then(Option::take);
-                    if p.is_some() {
-                        st.free.push(slot_idx);
-                        st.inflight_count -= 1;
-                    }
-                    p
-                };
-                let Some(pending) = pending else {
-                    log::error!(
-                        "ipc direct-drive: shard {idx} CQE for unknown slot \
-                         {user_data} — dropped"
+            // The reaper is one of exactly two CQ consumers (fusion,
+            // 2026-08-07); the gate serializes them. A blocking lock is
+            // fine here — the inline side only ever `try_lock`s, so the
+            // reaper waits at most one inline drain.
+            let gate = shard
+                .cq_gate
+                .lock()
+                .expect("direct-drive cq gate never poisons");
+            self.drain_cq_locked(idx);
+            drop(gate);
+        }
+    }
+
+    /// The reaper's blocking enter: `submit_and_wait(1)` bounded by
+    /// `IORING_ENTER_EXT_ARG` timeout where the kernel supports it
+    /// (≥ 5.11). The bound is a LIVENESS re-check cadence, not tuning
+    /// (the SERVICE_PARK_MAX posture): with the fusion inline arm
+    /// consuming CQEs — including, in one shutdown race, the NOP wake —
+    /// the reaper must re-check `shutting_down` on its own clock or the
+    /// join can strand. 100 ms bounds that race's shutdown latency;
+    /// idle cost is 10 wakes/s/shard. A timeout expiry returns `Ok(0)`.
+    fn reaper_wait(&self, shard: &DdShard) -> std::io::Result<usize> {
+        if self.ext_arg_ok.load(Ordering::Relaxed) {
+            const REAP_WAIT_TIMEOUT: types::Timespec = types::Timespec::new().nsec(100_000_000);
+            let args = types::SubmitArgs::new().timespec(&REAP_WAIT_TIMEOUT);
+            match shard.ring.submitter().submit_with_args(1, &args) {
+                Ok(n) => return Ok(n),
+                // Timeout expiry: nothing completed — a normal bounded
+                // wake (the liveness re-check), never an error.
+                Err(e) if e.raw_os_error() == Some(libc::ETIME) => return Ok(0),
+                Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                    // Pre-5.11 kernel: no EXT_ARG. Degrade loudly ONCE —
+                    // unbounded waits + the fusion arm disarmed (see
+                    // `ext_arg_ok`).
+                    self.ext_arg_ok.store(false, Ordering::Relaxed);
+                    log::warn!(
+                        "ipc direct-drive: kernel refused IORING_ENTER_EXT_ARG — \
+                         reaper waits are unbounded and the inline-reap fusion \
+                         arm is DISARMED on this kernel"
                     );
-                    continue;
-                };
-                // ipc_direct_phase_ns: `inflight` closes at the CQE pop
-                // (slab insert → here — SQE push + flush-batch wait +
-                // device service + reap batching); the same instant
-                // anchors `finish`.
-                let t_cqe = std::time::Instant::now();
-                crate::fuse_client::ipc_direct_phase_record(
-                    crate::fuse_client::IpcDirectPhase::Inflight,
-                    pending.t_insert,
-                );
-                self.finish(pending, res, t_cqe);
+                }
+                Err(e) => return Err(e),
             }
         }
+        shard.ring.submitter().submit_and_wait(1)
+    }
+
+    /// Drain THIS shard's CQ and complete every popped op — the ONE
+    /// CQE-consumption body, shared by the reaper (post-enter) and the
+    /// fusion inline arm ([`Self::flush`]). Caller MUST hold the
+    /// shard's `cq_gate` (the single-consumer-at-a-time invariant the
+    /// pre-fusion design got from the dedicated reaper thread).
+    /// Returns ops completed (NOP wakes excluded).
+    fn drain_cq_locked(&self, idx: usize) -> usize {
+        let shard = &self.shards[idx];
+        // SAFETY: exactly one CQ accessor at a time — the caller holds
+        // `cq_gate` (module docs; the fusion campaign's gate).
+        let mut cq = unsafe { shard.ring.completion_shared() };
+        cq.sync();
+        let cqes: Vec<(u64, i32)> = cq.by_ref().map(|c| (c.user_data(), c.result())).collect();
+        drop(cq);
+        let mut served = 0usize;
+        for (user_data, res) in cqes {
+            if user_data == NOP_WAKE {
+                // Shutdown wake sentinel. Whichever consumer pops it,
+                // the reaper cannot strand: its kernel wait is
+                // timeout-bounded (`REAP_WAIT_TIMEOUT_NS`), so it
+                // re-checks the shutdown flag on its own cadence.
+                continue;
+            }
+            let pending = {
+                let mut st = shard
+                    .state
+                    .lock()
+                    .expect("direct-drive state mutex never poisons");
+                let slot_idx = user_data as usize;
+                let p = st.inflight.get_mut(slot_idx).and_then(Option::take);
+                if p.is_some() {
+                    st.free.push(slot_idx);
+                    st.inflight_count -= 1;
+                }
+                p
+            };
+            let Some(pending) = pending else {
+                log::error!(
+                    "ipc direct-drive: shard {idx} CQE for unknown slot \
+                     {user_data} — dropped"
+                );
+                continue;
+            };
+            // ipc_direct_phase_ns: `inflight` closes at the CQE pop
+            // (slab insert → here — SQE push + flush-batch wait +
+            // device service + reap batching); the same instant
+            // anchors `finish`.
+            let t_cqe = std::time::Instant::now();
+            crate::fuse_client::ipc_direct_phase_record(
+                crate::fuse_client::IpcDirectPhase::Inflight,
+                pending.t_insert,
+            );
+            self.finish(pending, res, t_cqe);
+            served += 1;
+        }
+        served
     }
 
     /// CQE disposition: exact-length + 795 revalidation ⇒ serve;

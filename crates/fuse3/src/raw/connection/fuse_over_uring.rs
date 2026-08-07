@@ -3708,6 +3708,10 @@ fn queue_worker(
     commit_rx: std::sync::mpsc::Receiver<WorkerMsg>,
     wake_fd: RawFd,
 ) -> io::Result<()> {
+    // The queue's CONFIGURED ent payload size (the delivery loop shadows
+    // `payload_sz` with each request's announced size) — the D14
+    // hold-candidate bound derives from it.
+    let payload_sz_cfg = payload_sz;
     // Lever 2 (ingress-queue-spread): this worker is ONE drain context for
     // every member queue of its group — one ring, one park, one wake, one
     // flush amortized over the group's aggregate traffic. `first_qid`
@@ -4161,7 +4165,7 @@ fn queue_worker(
         qid: u16,
         gent: usize,
         res: i32,
-    ) -> io::Result<Option<PendingExtract>> {
+    ) -> io::Result<Option<PendDone>> {
         let idx = gent % slots.len();
         match zc_pend_slot.take() {
             None => {
@@ -4236,7 +4240,7 @@ fn queue_worker(
                     // (write-bracket campaign): count the completed
                     // extraction + its payload bytes.
                     kmbuf::note_zc_write_extraction(u64::from(len));
-                    return Ok(Some(PendingExtract { done, len }));
+                    return Ok(Some(PendDone::Lazy { done, len }));
                 }
                 kmbuf::note_zc_fallback();
                 error!(
@@ -4248,16 +4252,59 @@ fn queue_worker(
                 let _ = done.send(Err(io::Error::from_raw_os_error(libc::EIO)));
                 Ok(None)
             }
+            Some(ZcPend::WriteExtract {
+                header_and_op,
+                unique,
+                commit_id,
+                len,
+            }) => {
+                if res == len as i32 {
+                    // The payload now exists in the bounce slot: hand the
+                    // deferred delivery back to the caller, which mints
+                    // the §5.4 lease and pushes inbound (it owns the
+                    // member's arena/lease/pool references). Engagement
+                    // face: count the completed extraction + bytes.
+                    kmbuf::note_zc_write_extraction(u64::from(len));
+                    return Ok(Some(PendDone::Deliver {
+                        header_and_op,
+                        unique,
+                        commit_id,
+                        len,
+                    }));
+                }
+                kmbuf::note_zc_fallback();
+                error!(
+                    "fuse-over-uring qid={qid} ent={idx}: zc WRITE at-delivery extraction \
+                     failed (res={res}, want={len}, kmbuf_ops={}) — synthesizing EIO \
+                     for unique={unique}",
+                    kmbuf::resolved_opcodes_label()
+                );
+                Ok(Some(PendDone::DeliverFailed))
+            }
         }
     }
 
-    /// A completed LAZY WRITE-payload extraction, handed from
-    /// [`zc_fetch_complete`] back to the loop body that owns the
-    /// member's arena and lease references (which mints the §5.4 lease
-    /// and answers the parked handler).
-    struct PendingExtract {
-        done: tokio::sync::oneshot::Sender<io::Result<Bytes>>,
-        len: u32,
+    /// A completed zc bridge outcome handed from [`zc_fetch_complete`]
+    /// back to the loop body (which owns the member's arena, lease and
+    /// pool references).
+    enum PendDone {
+        /// A LAZY extraction completed: mint the §5.4 lease over the
+        /// bounce bytes and answer the parked handler's oneshot.
+        Lazy {
+            done: tokio::sync::oneshot::Sender<io::Result<Bytes>>,
+            len: u32,
+        },
+        /// An AT-DELIVERY extraction completed: mint the lease and push
+        /// the deferred delivery inbound.
+        Deliver {
+            header_and_op: Vec<u8>,
+            unique: u64,
+            commit_id: u64,
+            len: u32,
+        },
+        /// An at-delivery extraction FAILED: the request cannot be
+        /// served — the caller synthesizes its EIO (row-5 discipline).
+        DeliverFailed,
     }
     // Membership lookup, not offset arithmetic: groups are node-membership
     // SETS (interleaved numberings are the field norm). A linear scan over
@@ -4746,11 +4793,12 @@ fn queue_worker(
                 // unregistered slot (the opcode-mirror miss), both of
                 // which fall back per-request.
                 if op == RingOp::Fetch {
-                    // An errored bridge CQE never carries a completed
-                    // extraction (LazyExtract answers its handler's
-                    // oneshot with the error — the DISPATCHED request's
-                    // handler owns the EIO reply; synthesizing one here
-                    // would double-reply the slot).
+                    // An errored bridge CQE: LazyExtract answers its
+                    // handler's oneshot with the error (the DISPATCHED
+                    // request's handler owns the EIO reply — a synthesis
+                    // here would double-reply the slot); a failed
+                    // AT-DELIVERY extraction is a request nothing
+                    // dispatched, so its EIO synthesizes here.
                     let pend = zc_fetch_complete(
                         &mut ring,
                         &mut batch,
@@ -4762,10 +4810,19 @@ fn queue_worker(
                         gent,
                         res,
                     )?;
-                    debug_assert!(
-                        pend.is_none(),
-                        "an errored bridge CQE cannot complete an extraction"
-                    );
+                    if matches!(pend, Some(PendDone::DeliverFailed)) {
+                        fail_ent(
+                            &mut ring,
+                            &mut batch,
+                            &mut m.slots,
+                            &mut m.ents[ent_idx],
+                            &m.lease_states[ent_idx],
+                            pool.slot_watch_cell(qid, ent_idx),
+                            qid,
+                            gent,
+                            libc::EIO,
+                        )?;
+                    }
                     continue;
                 }
                 // Kernel abort/unmount (dev_uring.c): -ENOTCONN on entry teardown /
@@ -4912,32 +4969,97 @@ fn queue_worker(
                     res,
                 )?;
                 if let Some(p) = pend {
-                    // The extracted WRITE payload sits in the bounce
-                    // slot: mint the §5.4 lease over it and answer the
-                    // parked handler. The lease arena IS the bounce
-                    // arena in zc mode, so the drop protocol (refs →
-                    // unpark → wake) is byte-identical to the kmbuf
-                    // path. The held state clears — one materialization
-                    // per request (the handler memoizes).
-                    pool.zc_write_held.clear(qid, ent_idx);
-                    let zb = zc_bounce.as_ref().expect("zc pend implies zc mode");
-                    let ptr = zb.buf_ptr(ent_idx).expect("pend slot in range") as *const u8;
-                    let state = Arc::clone(&m.lease_states[ent_idx]);
-                    let prev = state.acquire();
-                    debug_assert_eq!(prev, 0, "extraction on a still-leased ent");
-                    TRANSPORT_PAYLOAD_LEASES.fetch_add(1, Ordering::Relaxed);
-                    TRANSPORT_LEASES_OUTSTANDING.fetch_add(1, Ordering::Relaxed);
-                    let payload = Bytes::from_owner(EntPayloadLease {
-                        arena: Arc::clone(&m.arena),
-                        state,
-                        ptr,
-                        len: p.len as usize,
-                        born: Instant::now(),
-                    });
-                    // A dropped receiver = the handler gave up
-                    // (teardown); the lease drops with the unsent Bytes
-                    // and the commit gate unparks — nothing leaks.
-                    let _ = p.done.send(Ok(payload));
+                    // An extracted WRITE payload sits in the bounce
+                    // slot: mint the §5.4 lease over it. The lease arena
+                    // IS the bounce arena in zc mode, so the drop
+                    // protocol (refs → unpark → wake) is byte-identical
+                    // to the kmbuf path.
+                    let mint_lease = |m: &mut MemberState, len: u32| {
+                        let zb = zc_bounce.as_ref().expect("zc pend implies zc mode");
+                        let ptr = zb.buf_ptr(ent_idx).expect("pend slot in range") as *const u8;
+                        let state = Arc::clone(&m.lease_states[ent_idx]);
+                        let prev = state.acquire();
+                        debug_assert_eq!(prev, 0, "extraction on a still-leased ent");
+                        TRANSPORT_PAYLOAD_LEASES.fetch_add(1, Ordering::Relaxed);
+                        TRANSPORT_LEASES_OUTSTANDING.fetch_add(1, Ordering::Relaxed);
+                        Bytes::from_owner(EntPayloadLease {
+                            arena: Arc::clone(&m.arena),
+                            state,
+                            ptr,
+                            len: len as usize,
+                            born: Instant::now(),
+                        })
+                    };
+                    match p {
+                        PendDone::Lazy { done, len } => {
+                            // The held state clears — one materialization
+                            // per request (the handler memoizes). A
+                            // dropped receiver = the handler gave up
+                            // (teardown); the lease drops with the unsent
+                            // Bytes and the commit gate unparks — nothing
+                            // leaks.
+                            pool.zc_write_held.clear(qid, ent_idx);
+                            let payload = mint_lease(m, len);
+                            let _ = done.send(Ok(payload));
+                        }
+                        PendDone::Deliver {
+                            header_and_op,
+                            unique,
+                            commit_id,
+                            len,
+                        } => {
+                            // The at-delivery extraction's deferred
+                            // dispatch (the streaming arm).
+                            let payload = mint_lease(m, len);
+                            if pool.inbound[qid as usize]
+                                .push(InboundUringReq {
+                                    header_and_op,
+                                    payload,
+                                    unique,
+                                    slot: ReplySlot::Ring {
+                                        qid,
+                                        ent_idx: ent_idx as u16,
+                                        commit_id,
+                                    },
+                                    arrived_ns: crate::raw::read_phase::transport_now_ns(),
+                                })
+                                .is_err()
+                            {
+                                error!(
+                                    "fuse-over-uring qid={qid} ent={ent_idx}: session inbound \
+                                     queue closed after zc extraction; synthesizing EIO for \
+                                     unique={unique} (row 4)",
+                                    unique = unique
+                                );
+                                fail_ent(
+                                    &mut ring,
+                                    &mut batch,
+                                    &mut m.slots,
+                                    &mut m.ents[ent_idx],
+                                    &m.lease_states[ent_idx],
+                                    pool.slot_watch_cell(qid, ent_idx),
+                                    qid,
+                                    gent,
+                                    libc::EIO,
+                                )?;
+                            }
+                        }
+                        PendDone::DeliverFailed => {
+                            // Short success CQE (res != len): the request
+                            // cannot be served — synthesize.
+                            fail_ent(
+                                &mut ring,
+                                &mut batch,
+                                &mut m.slots,
+                                &mut m.ents[ent_idx],
+                                &m.lease_states[ent_idx],
+                                pool.slot_watch_cell(qid, ent_idx),
+                                qid,
+                                gent,
+                                libc::EIO,
+                            )?;
+                        }
+                    }
                 }
                 continue;
             }
@@ -5178,15 +5300,18 @@ fn queue_worker(
                 continue;
             }
 
-            // D14 write-side: a zc WRITE's payload stays HELD in the
-            // sparse slot (dispatch-before-extraction) — the request
-            // dispatches IMMEDIATELY with an empty placeholder payload
-            // and the held length published on the pool table. An
-            // eligible shape DMAs it slot→device (`zc_write_store`, zero
-            // daemon copies — the D14 leg); everything else materializes
-            // lazily (`zc_write_extract` → the §5.4 bounce lease). The
-            // oversize shape is refused loud exactly as the at-delivery
-            // extraction refused it.
+            // D14 write-side HYBRID delivery (the zcws-8 lesson): a zc
+            // WRITE's payload stays HELD in the sparse slot ONLY when
+            // the shape is a direct-DMA candidate (`zc::hold_candidate`
+            // — aligned, sub-streaming) — the request then dispatches
+            // IMMEDIATELY with an empty placeholder and the held length
+            // published on the pool table (the handler DMAs it
+            // slot→device or materializes lazily). Every OTHER shape —
+            // the streaming population — extracts AT DELIVERY on this
+            // worker's own drain pass (`WRITE_FIXED(slot → memfd)`,
+            // batched SQEs, no per-request task wake: the all-lazy
+            // design collapsed the durable streaming row to 0.61×).
+            // The oversize shape is refused loud as always.
             if zc_slot_payload {
                 let zb = zc_bounce.as_ref().expect("zc_slot_payload implies zc mode");
                 if payload_sz > zb.stride() {
@@ -5208,7 +5333,79 @@ fn queue_worker(
                     )?;
                     continue;
                 }
-                pool.zc_write_held.set(qid, ent_idx, payload_sz as u32);
+                // fuse_write_in rides op_in: fh u64 ‖ offset u64 ‖
+                // size u32 ‖ … (little-endian, the ABI shape
+                // handle_write deserializes).
+                let op_in = &m.ents[ent_idx].hdr().op_in;
+                let w_off = u64::from_le_bytes(op_in[8..16].try_into().unwrap());
+                let w_size = u32::from_le_bytes(op_in[16..20].try_into().unwrap());
+                if zc::hold_candidate(w_off, w_size, payload_sz_cfg) {
+                    pool.zc_write_held.set(qid, ent_idx, payload_sz as u32);
+                } else {
+                    // The streaming arm: at-delivery extraction, exactly
+                    // the zcws-6-era vehicle (kernel shmem copy replaces
+                    // the delivery-time folio copy; the inbound push
+                    // happens at the CQE with a §5.4 lease over the
+                    // bounce).
+                    pool.zc_write_held.clear(qid, ent_idx);
+                    if m.zc_pend[ent_idx].is_some() {
+                        error!(
+                            "fuse-over-uring qid={qid} ent={ent_idx}: zc WRITE extraction \
+                             refused (pending bridge) — EIO"
+                        );
+                        fail_ent(
+                            &mut ring,
+                            &mut batch,
+                            &mut m.slots,
+                            &mut m.ents[ent_idx],
+                            &m.lease_states[ent_idx],
+                            pool.slot_watch_cell(qid, ent_idx),
+                            qid,
+                            gent,
+                            libc::EIO,
+                        )?;
+                        continue;
+                    }
+                    let entry = Entry128::from(
+                        opcode::WriteFixed::new(
+                            types::Fd(zb.fd()),
+                            std::ptr::null(),
+                            payload_sz as u32,
+                            ent_idx as u16,
+                        )
+                        .offset(zb.offset_of(ent_idx).expect("ent in range"))
+                        .build()
+                        .user_data(encode_user_data(RingOp::Fetch, gent)),
+                    );
+                    match push_fetch_batched(&mut ring, &mut batch, entry) {
+                        Ok(()) => {
+                            m.zc_pend[ent_idx] = Some(ZcPend::WriteExtract {
+                                header_and_op,
+                                unique,
+                                commit_id,
+                                len: payload_sz as u32,
+                            });
+                        }
+                        Err(e) => {
+                            error!(
+                                "fuse-over-uring qid={qid} ent={ent_idx}: zc WRITE extraction \
+                                 push failed ({e}); synthesizing EIO for unique={unique}"
+                            );
+                            fail_ent(
+                                &mut ring,
+                                &mut batch,
+                                &mut m.slots,
+                                &mut m.ents[ent_idx],
+                                &m.lease_states[ent_idx],
+                                pool.slot_watch_cell(qid, ent_idx),
+                                qid,
+                                gent,
+                                libc::EIO,
+                            )?;
+                        }
+                    }
+                    continue;
+                }
             } else if zc_mode {
                 // Any non-held delivery re-points the ent: stale held
                 // state from a prior request must never be readable by a
@@ -5373,7 +5570,9 @@ fn queue_worker(
     // report success over unwritten pages. Handler fetches/stores and
     // lazy extractions unblock by SENDER DROP (the oneshot receiver
     // reads BrokenPipe and the handler's serve/write fails loud — the
-    // dispatched request's own reply path owns the slot).
+    // dispatched request's own reply path owns the slot); deferred
+    // at-delivery WRITE extractions are still OWED slots, which the
+    // row-8 owing() pass below synthesizes.
     for m in members.iter_mut() {
         for (idx, pend) in m.zc_pend.iter_mut().enumerate() {
             if let Some(ZcPend::BounceFetch {

@@ -297,6 +297,38 @@ pub(crate) enum ZcPend {
         done: tokio::sync::oneshot::Sender<io::Result<bytes::Bytes>>,
         len: u32,
     },
+    /// An AT-DELIVERY payload extraction (`WRITE_FIXED(slot → memfd)`,
+    /// the hybrid delivery's streaming arm — [`hold_candidate`] said
+    /// no): the delivered request is held back until its payload bytes
+    /// exist in the bounce; on completion the inbound push happens with
+    /// a §5.4 lease over the bounce slot. This is the zcws-6-era
+    /// batched vehicle restored for the shapes the direct DMA can never
+    /// serve — its SQE rides the worker's own drain pass, no
+    /// per-request task wake.
+    WriteExtract {
+        header_and_op: Vec<u8>,
+        unique: u64,
+        commit_id: u64,
+        len: u32,
+    },
+}
+
+/// D14 hold-candidate predicate (the hybrid delivery, zcws-8 lesson):
+/// hold a WRITE's payload in the slot ONLY when the shape can plausibly
+/// take the direct slot→device DMA — LBA-aligned offset AND length,
+/// nonzero, and strictly under HALF the transport payload size (the
+/// geometry-derived streaming bound: kernel-split streaming writes
+/// arrive payload_sz-sized, and the W1 patch cap is block_size/8 ≤
+/// payload_sz/2 on every shipped geometry). Everything else extracts
+/// AT DELIVERY on the worker's own drain pass — the zcws-8 bracket
+/// measured the lazy path's per-request task wakes collapsing the
+/// durable streaming row to 0.61× (armed legs starved at 38–42 % busy
+/// vs 74–75 % control), while the at-delivery batch had priced at
+/// 0.998×/0.909×. Over-holding taxes streaming; under-holding only
+/// forfeits a direct-DMA candidate — the bound is deliberately
+/// conservative.
+pub fn hold_candidate(offset: u64, size: u32, payload_sz: usize) -> bool {
+    size > 0 && (size as usize) < payload_sz / 2 && offset % 4096 == 0 && size % 4096 == 0
 }
 
 /// The held-payload table (D14 write-side leg): one cell per
@@ -421,6 +453,32 @@ mod tests {
         assert!(
             out_paged(fuse_opcode::FUSE_READDIRPLUS as u32, KmbufTrack::Sqz71),
             "7.1-sqz (cachyos base) pages readdirplus — fuse_readdir_alloc_buf"
+        );
+    }
+
+    /// The hybrid-delivery hold predicate (the zcws-8 counted lesson —
+    /// 0.61× durable streaming under all-lazy): hold ONLY plausible
+    /// direct-DMA candidates; streaming/unaligned/zero shapes extract
+    /// at delivery on the worker's batched drain pass.
+    #[test]
+    fn test_hold_candidate_bounds() {
+        const P: usize = 1 << 20; // the shipped 1 MiB ent payload
+        assert!(hold_candidate(0, 4096, P), "aligned 4k overwrite holds");
+        assert!(hold_candidate(4096 * 3, 8192, P), "aligned sub-bound holds");
+        assert!(
+            !hold_candidate(0, P as u32, P),
+            "payload-sized streaming segments never hold"
+        );
+        assert!(
+            !hold_candidate(0, (P / 2) as u32, P),
+            "the bound is STRICT — half-payload is streaming class"
+        );
+        assert!(!hold_candidate(1234, 4096, P), "unaligned offset extracts");
+        assert!(!hold_candidate(0, 5000, P), "unaligned length extracts");
+        assert!(!hold_candidate(0, 0, P), "zero length never holds");
+        assert!(
+            hold_candidate(0, ((P / 2) - 4096) as u32, P),
+            "the largest aligned sub-bound shape holds"
         );
     }
 

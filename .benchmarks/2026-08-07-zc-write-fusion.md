@@ -119,6 +119,9 @@ stated). Rigs: `.benchmarks/rigs/2026-08-07-zc-write-fusion-rig.sh`
 `…-zcaxis-rig.sh` (the caveat's own axis: armed vs unarmed) + the
 table script. P0 smoke (O_DIRECT+fsync md5 + cp+sync-file ×3) per leg;
 bridge tripwires asserted flat per leg; engagement gates FATAL per row.
+Artifacts (fio JSONs, stats snapshots, disk/CPU deltas, mount logs):
+`~/tmp/sqz-fusion-artifacts-2026-08-07/{abba-1,zcaxis-1,logs}` on the
+local box.
 
 ### 3.1 The fusion-lever bracket (F1 on / F2 off / F3 off / F4 on)
 

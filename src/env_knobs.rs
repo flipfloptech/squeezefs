@@ -216,6 +216,7 @@ pub static KNOBS: &[Knob] = &[
     k("SQUEEZEFS_IPC_SERVICE_THREADS", int(1, 1 << 12), "derived clamp(3*cpus/8,2,64)", "Service-thread ceiling (threads spawn on session admission; the drain-lane pair's submitter half — same derivation as DD_SHARDS)."),
     k("SQUEEZEFS_IPC_DD_SHARDS", int(1, 1 << 12), "derived clamp(3*cpus/8,2,64)", "Direct-drive uring shards (one ring + pinned reaper per shard, one lane per service thread; override/measurement lever)."),
     k("SQUEEZEFS_IPC_DD_EAGER_FLUSH", int(0, 1 << 12), "0", "Direct-drive mid-sweep eager flush: K > 0 enters inline once a lane's unflushed SQE count reaches K (shim-iops measurement lever; 0 = end-of-sweep flush only, the shipped M3 submit-batch posture)."),
+    k("SQUEEZEFS_IPC_DD_INLINE_REAP", Kind::Bool, "on", "Reaper/drain fusion: the owning service thread drains its lane's direct-drive CQ inline (zero syscall); 0 = the A/B lever (reaper-only completion, the pre-fusion posture). Auto-disarmed on kernels without IORING_ENTER_EXT_ARG."),
     k("SQUEEZEFS_IPC_SOCKET_DIR", Kind::Str, "derived (XDG_RUNTIME_DIR / /run)", "Rendezvous socket directory; `none` disables the filesystem-path socket."),
     k("SQUEEZEFS_IPC_SPIN_US", int(0, 1 << 20), "0", "Service-thread empty-pass spin window, µs — an explicit fleet lever (nonzero taxes the sync lane)."),
     // -- L4 interception: client (shim) side -----------------------------

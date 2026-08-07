@@ -263,6 +263,16 @@ stats() { # stats <key>
 # fine: --allow-other admits any uid, and root's opens pass the screen.
 ILP() { LD_PRELOAD="$SO" "$@"; }
 
+# HYBRID LANE GATE (D14 corollary, 2026-08-07): the legacy ring rows
+# below pin the RING lane explicitly — under the derived gate a
+# large-buffer cp/dd row legitimately rides the kernel FUSE lane (cp's
+# 256 KiB write() buffers and every bs=1M dd sit above the derived
+# threshold), which is the hybrid posture WORKING, not an engagement
+# failure. `SQUEEZEFS_IL_KERNEL_LANE_MIN=0` is the gate's documented
+# A/B lever (all eligible ops ring); the derived-gate posture gets its
+# own engagement row (2g-lane), which un-sets this per invocation.
+export SQUEEZEFS_IL_KERNEL_LANE_MIN=0
+
 # §5.6.2 W1 + the L4-6 mitigation: ring writes grow files invisibly to
 # the KERNEL's attr cache (size TTL 1 s) — the daemon now pushes
 # FUSE_NOTIFY_INVAL_INODE on bind + rate-limited first write, so an
@@ -422,6 +432,62 @@ if command -v fio &>/dev/null && ldd "$(command -v fio)" 2>/dev/null | grep -q l
 else
     echo "SKIP: fio or libaio.so.1 not present (libaio row)"
 fi
+
+# 2g-lane. Hybrid lane gate (D14 corollary): with the DERIVED threshold
+# (the env pin above un-set per invocation) a bs=1M dd — offsetful
+# write(2), the sticky-latch arm — must route to the kernel FUSE lane
+# and be ACCOUNTED: `ipc_lane_gate_kernel_{routes,bytes}` deltas cover
+# the row (silent ring-serving of large ops and silent-passthrough both
+# refuse), the threshold gauge publishes a real derived value, a 4k row
+# still rides the ring under the same derived gate, and byte parity
+# holds ACROSS the lanes (both funnel into one daemon custody).
+LG_R0=$(stats ipc_lane_gate_kernel_routes)
+LG_B0=$(stats ipc_lane_gate_kernel_bytes)
+LG_W0=$(stats ipc_ops_write)
+env -u SQUEEZEFS_IL_KERNEL_LANE_MIN LD_PRELOAD="$SO" SQUEEZEFS_IPC_ALLOW_DEV=1 \
+    dd if="$T/src.bin" of="$MOUNT_DIR/lane.bin" bs=1M status=none
+# The threshold gauge is LIVE-session-scoped (it drops with the last
+# session — dd's tore down at exit, its counters reap-folded), so read
+# it while a derived-gate process HOLDS a bound fd.
+env -u SQUEEZEFS_IL_KERNEL_LANE_MIN LD_PRELOAD="$SO" SQUEEZEFS_IPC_ALLOW_DEV=1 \
+    python3 - "$MOUNT_DIR/lane.bin" <<'EOF' &
+import os, sys, time
+fd = os.open(sys.argv[1], os.O_RDONLY)
+os.pread(fd, 4096, 0)  # bind + session established (sub-threshold: ring)
+time.sleep(8)
+os.close(fd)
+EOF
+LG_HOLD=$!
+THR=0
+for _ in $(seq 1 40); do
+    THR=$(stats ipc_lane_gate_threshold_bytes)
+    [ "$THR" -gt 0 ] && break
+    sleep 0.2
+done
+kill "$LG_HOLD" 2>/dev/null || true
+wait "$LG_HOLD" 2>/dev/null || true
+[ "$THR" -gt 0 ] || fail "lane-gate threshold gauge never published (derived live session)"
+LG_R1=$(stats ipc_lane_gate_kernel_routes)
+LG_B1=$(stats ipc_lane_gate_kernel_bytes)
+[ "$((LG_R1 - LG_R0))" -ge 4 ] \
+    || fail "1M dd writes did not route kernel-lane (routes Δ$((LG_R1 - LG_R0)))"
+SRC_BYTES=$(stat -c %s "$T/src.bin")
+[ "$((LG_B1 - LG_B0))" -ge "$SRC_BYTES" ] \
+    || fail "lane-gate bytes do not account for the 1M row (Δ$((LG_B1 - LG_B0)) < $SRC_BYTES)"
+# Cross-lane parity: read the kernel-lane-written file back over the
+# RING (small bs, ring pinned) — one custody, byte-exact.
+ILP dd if="$MOUNT_DIR/lane.bin" of="$T/lane_back.bin" bs=4k status=none
+cmp "$T/src.bin" "$T/lane_back.bin" || fail "cross-lane parity (kernel-lane write, ring read)"
+# The IOPS lane is untouched under the derived gate: 4k writes ride the
+# ring, and the gate counters do not move for them.
+LG_R2=$(stats ipc_lane_gate_kernel_routes)
+env -u SQUEEZEFS_IL_KERNEL_LANE_MIN LD_PRELOAD="$SO" SQUEEZEFS_IPC_ALLOW_DEV=1 \
+    dd if="$T/src.bin" of="$MOUNT_DIR/lane_small.bin" bs=4k status=none
+LG_W1=$(stats ipc_ops_write)
+LG_R3=$(stats ipc_lane_gate_kernel_routes)
+[ "$LG_W1" -gt "$LG_W0" ] || fail "4k writes under the derived gate left the ring"
+[ "$LG_R3" -eq "$LG_R2" ] || fail "4k writes moved the lane-gate counters (Δ$((LG_R3 - LG_R2)))"
+echo "OK: hybrid lane gate (threshold=$THR, kernel routes +$((LG_R1 - LG_R0)), bytes +$((LG_B1 - LG_B0)), 4k stays ring)"
 
 # 2g-netns. OQ-6 path-socket rendezvous: a client in a FOREIGN network
 # namespace (abstract AF_UNIX names are per-netns — the pre-v1.1 shape

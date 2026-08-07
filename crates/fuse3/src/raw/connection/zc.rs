@@ -342,6 +342,29 @@ mod tests {
         );
     }
 
+    /// The held-payload table (D14 write-side leg): one cell per
+    /// (qid, ent), set at an armed WRITE's delivery (the payload stays
+    /// in the sparse slot — never extracted at delivery), queried by the
+    /// session/handler (`zc_write_held_len`), cleared by extraction and
+    /// overwritten by the next delivery. Out-of-range coordinates never
+    /// panic — a bad slot reads None and a bad set is a loud no-op.
+    #[test]
+    fn test_zc_held_table() {
+        let t = ZcHeldTable::new(2, 4);
+        assert_eq!(t.get(0, 0), None, "fresh table holds nothing");
+        t.set(1, 3, 4096);
+        assert_eq!(t.get(1, 3), Some(4096));
+        assert_eq!(t.get(0, 3), None, "cells are per (qid, ent)");
+        t.clear(1, 3);
+        assert_eq!(t.get(1, 3), None, "cleared");
+        assert_eq!(t.get(2, 0), None, "qid out of range reads None");
+        assert_eq!(t.get(0, 4), None, "ent out of range reads None");
+        t.set(9, 9, 1); // out of range: loud no-op, never a panic
+        assert_eq!(t.get(9, 9), None);
+        t.set(0, 1, 0); // len 0 = clear (0 is the none sentinel)
+        assert_eq!(t.get(0, 1), None);
+    }
+
     /// The bounce arena is real dual-face memory: bytes written by VA
     /// are readable through the FD (the ring's view) and vice versa —
     /// runs on ANY kernel (memfd + mmap only, no uring surface).

@@ -177,7 +177,8 @@ run_row() { # $1 = leg tag, $2 = row name, $3... = fio args
   local mp=$!
   pidstat -u -p "$(pidof squeezefs)" 5 > "$OUT/$leg-$row-pidstat.log" 2>&1 &
   local ps=$!
-  fio "$@" --output-format=json --output="$OUT/$leg-$row-fio.json" >/dev/null
+  fio "$@" --output-format=json --output="$OUT/$leg-$row-fio.json" >/dev/null \
+    || fatal "$leg/$row: fio exited nonzero (row errors — e.g. failed end_fsync under ENOSPC) — row INVALID"
   kill "$mp" "$ps" 2>/dev/null || true; wait "$mp" "$ps" 2>/dev/null || true
   daemon_cpu > "$OUT/$leg-$row-dcpu1"; cpu_snap > "$OUT/$leg-$row-cpu1"
   disk_snap > "$OUT/$leg-$row-disk1"
@@ -224,20 +225,22 @@ write_leg() { # $1 = leg tag, $2 = zc
   echo "=== $leg (SQUEEZEFS_FUSE_ZC=$zc) ==="
   do_umount
   do_mount "$zc" "$leg"
+  rm -rf "$MNT"/zcw_seq "$MNT"/zcw_dur "$MNT"/zcw_rand "$MNT"/zcw_rd_ow "$MNT"/zcw_smoke_* 2>/dev/null || true
+  settle
   smoke "$leg"
   if [ "$zc" = 1 ]; then smoke_direct "$leg"; fi
 
   # row 1: seq write 1M
   local d="$MNT/zcw_seq"; mkdir -p "$d"
   run_row "$leg" seqwr "${FIO_COMMON[@]}" --name=seqwr --directory="$d" \
-    --rw=write --bs=1M --iodepth=8 --numjobs=16 --nrfiles=8 --size=4g
+    --rw=write --bs=1M --iodepth=8 --numjobs=16 --nrfiles=8 --size=3g
   verdict_write "$leg" seqwr "$zc"
   rm -rf "$d"; settle
 
   # row 2: durable seq write (fsync_on_close)
   d="$MNT/zcw_dur"; mkdir -p "$d"
   run_row "$leg" dur "${FIO_COMMON[@]}" --name=dur --directory="$d" \
-    --rw=write --bs=1M --iodepth=8 --numjobs=16 --nrfiles=8 --size=4g --fsync_on_close=1
+    --rw=write --bs=1M --iodepth=8 --numjobs=16 --nrfiles=8 --size=3g --fsync_on_close=1
   verdict_write "$leg" dur "$zc"
   rm -rf "$d"; settle
 

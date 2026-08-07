@@ -73,6 +73,22 @@
 #
 # Only ever targets a MOUNTED filesystem path — never raw devices.
 #
+# OUTPUT CONVENTION (shared across tests/fio/ — user ruling 2026-08-07):
+#   * default          — the clean summary only: a one-line run header,
+#                        one "[i/N] row bs pass ..." progress line per
+#                        pass, the final side-by-side table, and the
+#                        report path. Nothing else on stdout.
+#   * SQZ_DEBUG=1      — the full verbose stream (banner header, per-pass
+#                        runner output incl. stats deltas, cold-discipline
+#                        verdicts, hints, the verdict-law footer) on
+#                        STDERR; stdout stays the clean summary.
+#   * failures         — ALWAYS verbose regardless of mode: a failing
+#                        pass (fio error, tripwire, engagement gate trip)
+#                        dumps its captured runner output + diagnostics
+#                        to stderr before the run continues/exits.
+#   The full banner + table always persist to the $REPORT artifact; gate
+#   semantics (checks, thresholds, exit codes) are unchanged by the mode.
+#
 # usage:
 #   tests/fio/exa_client_perf.sh --mount <mountpoint> --shim <libsqueezefs_il.so>
 #       [--dir <dir>]                (default <mountpoint>/exa_perf)
@@ -89,6 +105,9 @@
 #       [--results DIR] [--journal FILE]
 #       [--emit-only]                (print the plan + commands, run nothing)
 set -u
+
+SQZ_DEBUG="${SQZ_DEBUG:-0}"
+dbg() { [ "$SQZ_DEBUG" = "1" ] && echo "$@" >&2 || true; }
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)
 RUNNER="$SCRIPT_DIR/run_fio_row.sh"
@@ -195,9 +214,19 @@ cold_guarantee() {
             kill "$pid" 2>/dev/null || true; sleep 0.5; i=$((i+1))
         done
         kill -0 "$pid" 2>/dev/null && { kill -9 "$pid"; sleep 1; }
-        env "${envs[@]}" "${ARGV[@]}" || fail "cold remount: daemon relaunch failed"
+        # Per-leg mount log: captured always, streamed on SQZ_DEBUG=1,
+        # dumped verbatim on any remount failure (failures stay verbose).
+        local rlog="$RESULTS/${label}.remount.log" rrc
+        if [ "$SQZ_DEBUG" = "1" ]; then
+            env "${envs[@]}" "${ARGV[@]}" 2>&1 | tee "$rlog" >&2
+            rrc=${PIPESTATUS[0]}
+        else
+            env "${envs[@]}" "${ARGV[@]}" > "$rlog" 2>&1
+            rrc=$?
+        fi
+        [ "$rrc" -eq 0 ] || { cat "$rlog" >&2; fail "cold remount: daemon relaunch failed"; }
         for _ in $(seq 1 60); do mountpoint -q "$MOUNT" && break; sleep 0.5; done
-        mountpoint -q "$MOUNT" || fail "cold remount: mount did not return"
+        mountpoint -q "$MOUNT" || { cat "$rlog" >&2; fail "cold remount: mount did not return"; }
         # restore verification: same binary identity, transport armed
         local c2="" q=0
         for _ in $(seq 1 20); do
@@ -205,8 +234,8 @@ cold_guarantee() {
             [ -n "$c2" ] && [ "${q:-0}" -gt 0 ] && break
             sleep 0.5
         done
-        [ "$c2" = "$MOUNT_COMMIT" ] || fail "cold remount: build_commit changed ($c2 != $MOUNT_COMMIT)"
-        [ "${q:-0}" -gt 0 ] || fail "cold remount: transport never armed"
+        [ "$c2" = "$MOUNT_COMMIT" ] || { cat "$rlog" >&2; fail "cold remount: build_commit changed ($c2 != $MOUNT_COMMIT)"; }
+        [ "${q:-0}" -gt 0 ] || { cat "$rlog" >&2; fail "cold remount: transport never armed"; }
         verdict="cold (remount, restore-verified: commit unchanged, queues=$q)"
     else
         # cold-by-overflow: fileset bytes >= 2x the R5 budget
@@ -218,7 +247,7 @@ cold_guarantee() {
         fi
     fi
     echo "$verdict" > "$RESULTS/${label}.cold"
-    echo "  cold-discipline [$label]: $verdict"
+    dbg "  cold-discipline [$label]: $verdict"
 }
 
 # ---- the battery ------------------------------------------------------------
@@ -281,15 +310,36 @@ run_pass() {
 
     local b0 b1
     b0=$(stat_get ipc_bind_refused_budget)
-    echo "== $label ($engine bs=$bs qd=$qd njobs=$pass_njobs in-flight=$inflight ${RUNTIME}s) =="
-    bash "$RUNNER" "${args[@]}"
-    local rc=$?
-    echo "$rc" > "$RESULTS/$label/pass.rc" 2>/dev/null || mkdir -p "$RESULTS/$label" && echo "$rc" > "$RESULTS/$label/pass.rc"
+    PASS_IDX=$((PASS_IDX + 1))
+    echo "[$PASS_IDX/$TOTAL_PASSES] $row $bs $pass ($engine qd=$qd njobs=$pass_njobs in-flight=$inflight, ${RUNTIME}s) ..."
+    dbg "== $label ($engine bs=$bs qd=$qd njobs=$pass_njobs in-flight=$inflight ${RUNTIME}s) =="
+    # Runner output: captured always; streamed to stderr on SQZ_DEBUG=1;
+    # dumped verbatim on ANY nonzero pass rc (failures stay verbose —
+    # incl. rc=4 engagement gate trips, whose diagnostic block the
+    # runner writes on stderr).
+    mkdir -p "$RESULTS/$label"
+    local rc rlog="$RESULTS/$label/runner.log"
+    if [ "$SQZ_DEBUG" = "1" ]; then
+        bash "$RUNNER" "${args[@]}" 2>&1 | tee "$rlog" >&2
+        rc=${PIPESTATUS[0]}
+    else
+        bash "$RUNNER" "${args[@]}" > "$rlog" 2>&1
+        rc=$?
+        if [ "$rc" -ne 0 ]; then
+            {
+                echo "---- $label FAILED (rc=$rc) — full runner output ----"
+                cat "$rlog"
+                echo "---- end $label ----"
+            } >&2
+        fi
+    fi
+    echo "$rc" > "$RESULTS/$label/pass.rc"
     if [ "$pass" = "shim" ]; then
         b1=$(stat_get ipc_bind_refused_budget)
         if [ "$b1" -gt "$b0" ] 2>/dev/null; then
             echo "$((b1 - b0))" > "$RESULTS/$label/bind_refused_budget.delta"
-            cat >&2 <<HINT
+            # Diagnostic hint: debug mode, or ANY pass failure (verbose).
+            if [ "$SQZ_DEBUG" = "1" ] || [ "$rc" -ne 0 ]; then cat >&2 <<HINT
 HINT: ipc_bind_refused_budget grew by $((b1 - b0)) during the $label pass —
       the daemon refused shim sessions on the arena budget. Pre-eb94f0c
       binaries cap session arenas at a fixed 2 GiB: raise the daemon's
@@ -297,6 +347,7 @@ HINT: ipc_bind_refused_budget grew by $((b1 - b0)) during the $label pass —
       binary with the derived cap (>= eb94f0c). Engagement on this row is
       suspect until resolved.
 HINT
+            fi
         fi
         # Engine-policy geometry hint: a big-bs shim LIBAIO pass that read
         # INVALID(passthrough) most likely hit the v1.1 single-slot aio
@@ -449,18 +500,37 @@ for row in rows:
             bits.append(p["amp"])
         if bits:
             print(f"{'':>14} {tag}: " + " | ".join(bits))
-print()
-print("verdict law: a shim row is quotable ONLY when its verdict is OK and its")
-print("engagement passed (>= SQZ_FIO_ENGAGE_MIN, default 0.90); INVALID")
-print("(passthrough) = the ops rode the kernel lane. A read pass without a")
-print("cold guarantee prints WARM (label-only) — never a bare number. In-flight")
-print("figures make offered-concurrency mismatches visible by construction.")
+EOF
+}
+
+# The verdict-law footer: persisted in the report always; stdout is kept
+# clean (SQZ_DEBUG=1 re-echoes it on stderr).
+render_footer() {
+    cat <<'EOF'
+
+verdict law: a shim row is quotable ONLY when its verdict is OK and its
+engagement passed (>= SQZ_FIO_ENGAGE_MIN, default 0.90); INVALID
+(passthrough) = the ops rode the kernel lane. A read pass without a
+cold guarantee prints WARM (label-only) — never a bare number. In-flight
+figures make offered-concurrency mismatches visible by construction.
 EOF
 }
 
 # ---- run ---------------------------------------------------------------------
-header | tee "$REPORT"
+header > "$REPORT"                      # the full banner always persists
+[ "$SQZ_DEBUG" = "1" ] && header >&2    # ... and streams in debug mode
+# The clean one-line run header (default stdout).
+echo "exa_client_perf: host=$(hostname) mount=$MOUNT daemon=$MOUNT_COMMIT (KD-7 shim verified) mode=\"$MODE\" rows=$ROWS instrument=\"$FIO_VERSION\""
 journal "START battery rows=$ROWS mode=\"$MODE\" njobs=$NJOBS match_inflight=$MATCH_INFLIGHT allow_remount=$ALLOW_REMOUNT mount=$MOUNT commit=$MOUNT_COMMIT"
+
+# Pass count for the [i/N] progress lines.
+TOTAL_PASSES=0
+while IFS='|' read -r row job class bs qd keng seng; do
+    want_row "$row" || continue
+    [ "$keng" != "-" ] && TOTAL_PASSES=$((TOTAL_PASSES + 1))
+    TOTAL_PASSES=$((TOTAL_PASSES + 1))
+done < <(battery)
+PASS_IDX=0
 
 FAILED_HARD=0
 while IFS='|' read -r row job class bs qd keng seng; do
@@ -486,6 +556,8 @@ fi
 
 echo
 render_table | tee -a "$REPORT"
+render_footer >> "$REPORT"
+[ "$SQZ_DEBUG" = "1" ] && render_footer >&2
 # sync_lane (when requested): printed OUTSIDE the delta table, labeled.
 if want_row sync_lane && [ -d "$RESULTS/sync_lane-shim" ]; then
     {

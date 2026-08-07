@@ -24,8 +24,18 @@
 # This rig's own rows are libaio-compliant; row 4 delegates to
 # fleet_parity_row.sh, whose rows are labeled SYNC-LANE COVERAGE there.
 #
+# OUTPUT CONVENTION (shared across tests/fio/ — user ruling 2026-08-07):
+# default = the clean summary only (section headers + one result line per
+# row); SQZ_DEBUG=1 adds the diagnostic stream (raw gauge/counter dumps)
+# on stderr; failures are ALWAYS verbose regardless of mode (require-mount
+# trips print mount diagnostics, fio/parse failures dump the captured fio
+# stderr). Gate semantics/exit codes are unchanged by the mode.
+#
 # usage: perf_session.sh --mount <mnt> --meta <uri> [--out DIR]
 set -u
+
+SQZ_DEBUG="${SQZ_DEBUG:-0}"
+dbg() { [ "$SQZ_DEBUG" = "1" ] && echo "$@" >&2 || true; }
 MNT="" META="" OUT="/scratch/tmp/logs/perf_session_$(date +%Y%m%d_%H%M%S)"
 SQZ="${SQZ:-/scratch/tmp/squeezefs}"
 SHIM="${SHIM:-/scratch/tmp/libsqueezefs_il.so}"
@@ -41,9 +51,19 @@ done
 [ -n "$MNT" ] && [ -n "$META" ] || { echo "--mount and --meta required" >&2; exit 2; }
 mkdir -p "$OUT"
 
+# Failure diagnostics are ALWAYS verbose (regardless of SQZ_DEBUG).
+mount_diag() {
+    {
+        echo "---- mount diagnostic ($MNT) ----"
+        findmnt "$MNT" 2>/dev/null || echo "  (findmnt: $MNT not mounted)"
+        mount | grep -iE "squeezefs|fuse" || echo "  (no fuse/squeezefs mounts)"
+        ls -la "$MNT" 2>&1 | head -5
+        echo "---- end diagnostic ----"
+    } >&2
+}
 require_mount() {
-    mountpoint -q "$MNT" || { echo "FATAL: $MNT not a mountpoint" >&2; exit 1; }
-    [ -e "$MNT/.stats" ] || { echo "FATAL: no .stats" >&2; exit 1; }
+    mountpoint -q "$MNT" || { echo "FATAL: $MNT not a mountpoint" >&2; mount_diag; exit 1; }
+    [ -e "$MNT/.stats" ] || { echo "FATAL: no .stats" >&2; mount_diag; exit 1; }
 }
 
 echo "== 0. raw ceilings (same-day grading rows) =="
@@ -56,17 +76,19 @@ DEVS=$(for i in 10 12 14 16 18 20 22 24 26 28; do printf "/dev/nvme%dn1:" $i; do
 if sudo -n true 2>/dev/null; then
     sudo fio --name=rawread --filename="$DEVS" --rw=read --bs=4m --iodepth=16 \
         --numjobs=10 --ioengine=libaio --direct=1 --time_based --runtime=30 \
-        --group_reporting --output-format=json 2>/dev/null | python3 -c "
+        --group_reporting --output-format=json 2>"$OUT/rawread.fio.err" | python3 -c "
 import json,sys
 raw=sys.stdin.buffer.read();d=json.loads(raw[raw.find(b'{'):])
-print('  raw seq-read: %.2f GB/s' % (sum(x['read']['bw_bytes'] for x in d['jobs'])/1e9))"
+print('  raw seq-read: %.2f GB/s' % (sum(x['read']['bw_bytes'] for x in d['jobs'])/1e9))" \
+        || { echo "  raw seq-read: fio/parse FAILED — fio stderr follows" >&2; cat "$OUT/rawread.fio.err" >&2; }
     sudo fio --name=rawrand --filename="$DEVS" --rw=randread --bs=4k --iodepth=32 \
         --numjobs=32 --ioengine=libaio --direct=1 --time_based --runtime=30 \
-        --group_reporting --output-format=json 2>/dev/null | python3 -c "
+        --group_reporting --output-format=json 2>"$OUT/rawrand.fio.err" | python3 -c "
 import json,sys
 raw=sys.stdin.buffer.read();d=json.loads(raw[raw.find(b'{'):])
 r=[j['read'] for j in d['jobs']]
-print('  raw rand-4k: %s IOPS' % format(int(sum(x['iops'] for x in r)),','))"
+print('  raw rand-4k: %s IOPS' % format(int(sum(x['iops'] for x in r)),','))" \
+        || { echo "  raw rand-4k: fio/parse FAILED — fio stderr follows" >&2; cat "$OUT/rawrand.fio.err" >&2; }
 else
     echo "  (no passwordless sudo — raw rows SKIPPED; grade against standing 41.8 GB/s / 3.36M)"
 fi
@@ -81,12 +103,13 @@ for row in "read 1m 16 8 seqread" "randread 4k 32 8 randread"; do
     fio --name=$tag --directory="$DIR" --filename_format='sqzfio.$jobnum.0' \
         --rw=$rw --bs=$bs --size=1g --numjobs=$nj --iodepth=$qd \
         --ioengine=libaio --direct=1 --time_based --runtime=60 \
-        --group_reporting --output-format=json 2>/dev/null | python3 -c "
+        --group_reporting --output-format=json 2>"$OUT/$tag.fio.err" | python3 -c "
 import json,sys
 raw=sys.stdin.buffer.read();d=json.loads(raw[raw.find(b'{'):])
 r=[j['read'] for j in d['jobs']]
 bw=sum(x['bw_bytes'] for x in r)/1e9; iops=sum(x['iops'] for x in r)
-print('  $tag: %.2f GB/s %s IOPS' % (bw, format(int(iops),',')))"
+print('  $tag: %.2f GB/s %s IOPS' % (bw, format(int(iops),',')))" \
+        || { echo "  $tag: fio/parse FAILED — fio stderr follows" >&2; cat "$OUT/$tag.fio.err" >&2; }
 done
 WDIR="$MNT/perf_w"; rm -rf "$WDIR"; mkdir -p "$WDIR"
 for row in "write 1m 16 8 seqwrite" "randwrite 4k 32 8 randwrite"; do
@@ -95,23 +118,25 @@ for row in "write 1m 16 8 seqwrite" "randwrite 4k 32 8 randwrite"; do
     fio --name=$tag --directory="$WDIR" --filename_format='w.$jobnum' \
         --rw=$rw --bs=$bs --size=2g --numjobs=$nj --iodepth=$qd \
         --ioengine=libaio --direct=1 --time_based --runtime=60 \
-        --group_reporting --output-format=json 2>/dev/null | python3 -c "
+        --group_reporting --output-format=json 2>"$OUT/$tag.fio.err" | python3 -c "
 import json,sys
 raw=sys.stdin.buffer.read();d=json.loads(raw[raw.find(b'{'):])
 r=[j['write'] for j in d['jobs']]
 bw=sum(x['bw_bytes'] for x in r)/1e9; iops=sum(x['iops'] for x in r)
-print('  $tag: %.2f GB/s %s IOPS' % (bw, format(int(iops),',')))"
+print('  $tag: %.2f GB/s %s IOPS' % (bw, format(int(iops),',')))" \
+        || { echo "  $tag: fio/parse FAILED — fio stderr follows" >&2; cat "$OUT/$tag.fio.err" >&2; }
     rm -rf "$WDIR"/*
 done
 rm -rf "$WDIR"
 
 echo "== 2. ingress ladder (lever-2 grading; drain groups live) =="
-python3 -c "
+# Raw gauge dump: debug stream only (the sweep's own summary lines govern).
+dbg "$(python3 -c "
 import json
 m=json.load(open('$MNT/.stats'));m=m.get('metrics',m)
-print('  transport_drain_groups=%s width=%s' % (m.get('transport_drain_groups'), m.get('transport_drain_group_width')))"
+print('  transport_drain_groups=%s width=%s' % (m.get('transport_drain_groups'), m.get('transport_drain_group_width')))")"
 "$RIG/transport_ingress_sweep.sh" --mount "$MNT" --points "16x8 32x8 8x32" \
-    --runtime 30 --label lever2 2>&1 | tail -6
+    --runtime 30 --label lever2 2>&1 | tee "$OUT/ingress_sweep.log" | tail -6
 
 echo "== 3. libaio randread il vs kernel (sharding verdict) =="
 for arm in kern il; do
@@ -123,17 +148,20 @@ print(m.get('ipc_ops_read',0), m.get('ipc_direct_shards',0))")
     env $envp fio --name=rr --directory="$DIR" --filename_format='sqzfio.$jobnum.0' \
         --rw=randread --bs=4k --size=1g --numjobs=32 --iodepth=8 \
         --ioengine=libaio --direct=1 --time_based --runtime=30 \
-        --group_reporting --output-format=json 2>/dev/null | python3 -c "
+        --group_reporting --output-format=json 2>"$OUT/rr_$arm.fio.err" | python3 -c "
 import json,sys
 raw=sys.stdin.buffer.read();d=json.loads(raw[raw.find(b'{'):])
 r=[j['read'] for j in d['jobs']]
-print('  $arm: %s IOPS' % format(int(sum(x['iops'] for x in r)),','))"
+print('  $arm: %s IOPS' % format(int(sum(x['iops'] for x in r)),','))" \
+        || { echo "  $arm: fio/parse FAILED — fio stderr follows" >&2; cat "$OUT/rr_$arm.fio.err" >&2; }
     A=$(python3 -c "
 import json;m=json.load(open('$MNT/.stats'));m=m.get('metrics',m)
 print(m.get('ipc_ops_read',0), m.get('ipc_direct_shards',0))")
-    echo "    ops/shards before=($B) after=($A)"
+    # Engagement counter dump (raw before/after tuples): debug stream only.
+    dbg "    ops/shards before=($B) after=($A)"
 done
 
 echo "== 4. durable fleet parity (convoy verdict) =="
-"$RIG/fleet_parity_row.sh" --mount "$MNT" --size 512m --out "$OUT/parity" 2>&1 | grep -E "^  w\.|^  r\."
+"$RIG/fleet_parity_row.sh" --mount "$MNT" --size 512m --out "$OUT/parity" 2>&1 \
+    | tee "$OUT/parity_row.log" | grep -E "^  w\.|^  r\."
 echo "artifacts: $OUT"

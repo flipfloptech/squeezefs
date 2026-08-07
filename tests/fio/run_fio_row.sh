@@ -50,7 +50,24 @@
 #   # Raw device read ceiling (per-device sections):
 #   tests/fio/run_fio_row.sh --job tests/fio/raw_ceiling_read.job \
 #     --devices /dev/nvme1n1:/dev/nvme2n1 --label raw-read
+#
+# OUTPUT CONVENTION (shared across tests/fio/ — user ruling 2026-08-07):
+#   * default          — the clean summary only: the ROW line (with the
+#                        engagement verdict inline on shim rows) plus the
+#                        amplification line when --data-devs is set.
+#   * SQZ_DEBUG=1      — the full verbose stream (shape/venue lines, the
+#                        stats-delta listing, artifacts path) on STDERR,
+#                        so stdout stays machine-parseable either way.
+#   * failures         — ALWAYS verbose regardless of mode: a fio error
+#                        cats the fio log, a tripwire trip dumps the
+#                        stats delta, an engagement gate trip dumps the
+#                        gate arithmetic + stats delta + artifact paths.
+#   Gate semantics (checks, thresholds, exit codes) are unchanged by the
+#   mode — this is presentation only.
 set -u
+
+SQZ_DEBUG="${SQZ_DEBUG:-0}"
+dbg() { [ "$SQZ_DEBUG" = "1" ] && echo "$@" >&2 || true; }
 
 usage() {
     cat <<'EOF'
@@ -266,9 +283,10 @@ if i > 0:
 EOF
 
 # ---- stats snapshot (after) + delta --------------------------------------
+STATS_LINE=""
 if [ -n "$MOUNT" ]; then
     snap_stats "$RESULTS/${LABEL}.stats_after.json"
-    python3 - "$RESULTS/${LABEL}.stats_before.json" \
+    STATS_LINE="$(python3 - "$RESULTS/${LABEL}.stats_before.json" \
         "$RESULTS/${LABEL}.stats_after.json" \
         "$RESULTS/${LABEL}.stats_delta.json" <<'EOF'
 import json, sys
@@ -286,6 +304,8 @@ keys = ["ipc_ops_read", "ipc_ops_write", "ipc_bytes_in", "ipc_bytes_out",
         "block_free_reclaim_cap_parks", "prefetch_issued", "ranged_reads"]
 print("  stats: " + " ".join(f"{k}={delta[k]}" for k in keys if delta.get(k)))
 EOF
+)"
+    dbg "$STATS_LINE"
     # Must-stay-flat tripwires (the 2026-08-04 EXA corruption lesson —
     # invariant_tripwires and its escalation siblings growing ACROSS a
     # benchmark row means the daemon hit a designed-impossible concurrency
@@ -303,6 +323,13 @@ EOF
 )"
     if [ -n "$TRIP" ]; then
         journal "FAIL label=$LABEL tripwires: $TRIP"
+        # Failures are ALWAYS verbose: dump the full stats delta the
+        # verdict was computed from, regardless of SQZ_DEBUG.
+        {
+            echo "---- $LABEL tripwire diagnostic (full stats delta) ----"
+            cat "$RESULTS/${LABEL}.stats_delta.json" 2>/dev/null || true
+            echo "---- end diagnostic ----"
+        } >&2
         fail "must-stay-flat tripwires grew across the row: $TRIP (stats delta: $RESULTS/${LABEL}.stats_delta.json)"
     fi
 fi
@@ -388,6 +415,16 @@ EOF
     else
         ENGAGE="$ENGAGE (<$MIN INVALID)"
         RC=4
+        # Failures are ALWAYS verbose: dump the gate arithmetic + the
+        # stats-delta summary + artifact paths, regardless of SQZ_DEBUG.
+        {
+            echo "ENGAGEMENT GATE TRIP: $LABEL — the shim pass did not account for the row's ios"
+            echo "  gate: (ipc_ops_read + ipc_ops_write) / total_ios = $ENGAGE ; total_ios=$TOTAL_IOS ; threshold SQZ_FIO_ENGAGE_MIN=$MIN"
+            [ -n "$STATS_LINE" ] && echo "$STATS_LINE"
+            echo "  stats delta: $RESULTS/${LABEL}.stats_delta.json"
+            echo "  fio log:     $RESULTS/${LABEL}.fio_stderr.log"
+            echo "  artifacts:   $RESULTS"
+        } >&2
     fi
 fi
 
@@ -408,11 +445,19 @@ json.dump({
 }, open(sys.argv[1], "w"), indent=1)
 EOF
 
-echo "ROW label=$LABEL | $ROWLINE"
-echo "  shape: $(basename "$JOB") engine=$ENGINE bs=$BS qd=$IODEPTH njobs=$NJOBS_TOTAL (numa_fanout=$USE_NUMA/$NNODES nodes) runtime=${RUNTIME}s ramp=${RAMP}s size=$SIZE"
-echo "  venue: instrument=\"$FIO_VERSION\" substrate=\"$SUBSTRATE\" fill=\"$FILL\" order=\"$ORDER\" path=$PATHKIND"
-echo "  engagement: $ENGAGE"
+# Clean summary (default stdout): the ROW line — with the engagement
+# verdict inline on shim rows — plus the standing amplification column.
+# The verbose extras ride SQZ_DEBUG=1 on stderr (persisted in meta.json
+# either way).
+if [ -n "$SHIM" ] && [ -n "$MOUNT" ]; then
+    echo "ROW label=$LABEL | $ROWLINE | engagement $ENGAGE"
+else
+    echo "ROW label=$LABEL | $ROWLINE"
+fi
 [ -n "$AMP_LINE" ] && echo "  amplification: $AMP_LINE"
-echo "  artifacts: $RESULTS"
+dbg "  shape: $(basename "$JOB") engine=$ENGINE bs=$BS qd=$IODEPTH njobs=$NJOBS_TOTAL (numa_fanout=$USE_NUMA/$NNODES nodes) runtime=${RUNTIME}s ramp=${RAMP}s size=$SIZE"
+dbg "  venue: instrument=\"$FIO_VERSION\" substrate=\"$SUBSTRATE\" fill=\"$FILL\" order=\"$ORDER\" path=$PATHKIND"
+dbg "  engagement: $ENGAGE"
+dbg "  artifacts: $RESULTS"
 journal "DONE label=$LABEL rc=$RC | $ROWLINE | engagement=$ENGAGE"
 exit "$RC"

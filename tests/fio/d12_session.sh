@@ -23,7 +23,19 @@
 # SAME engine both sides; psync only as labeled sync-lane coverage rows;
 # io_uring = labeled kernel-lane extra. This rig is libaio-compliant
 # (all rows); the delegated exa_client_perf battery is all-libaio too.
+#
+# OUTPUT CONVENTION (shared across tests/fio/ — user ruling 2026-08-07):
+# default = the clean summary only (the [d12 ..] progress lines + one
+# result line per row + the delegated batteries' clean tables, excerpted);
+# SQZ_DEBUG=1 adds the diagnostic stream on stderr (fio stderr live; it
+# also propagates into the delegated exa_client_perf/zcrx runs, whose
+# captured logs then carry their full verbose streams). Failures are
+# ALWAYS verbose regardless of mode: a failed remount dumps the daemon
+# log tail, a failed fio row dumps its stderr, a failed delegated battery
+# dumps its log tail. Gate semantics/exit codes are unchanged by the mode.
 set -u
+
+SQZ_DEBUG="${SQZ_DEBUG:-0}"
 SQZ=/scratch/tmp/squeezefs
 MNT=/scratch/tmp/test
 META="sqmeta:///dev/nvme0n1,/dev/nvme2n1,/dev/nvme4n1,/dev/nvme6n1,/dev/nvme8n1"
@@ -40,18 +52,45 @@ remount() { # $1 = extra mount args (may be empty), $2.. = env pairs
     "$SQZ" umount "$MNT" >/dev/null 2>&1 || true
     sleep 2
     env "${envs[@]}" "$SQZ" mount "$META" "$MNT" --daemon --interception \
-        --allow-other $args --log-file /scratch/tmp/logs/sqz.log >/dev/null 2>&1
+        --allow-other $args --log-file /scratch/tmp/logs/sqz.log \
+        > "$OUT/remount.log" 2>&1
     sleep 4
-    mountpoint -q "$MNT" || { log "REMOUNT FAILED (args=$args)"; exit 1; }
+    # Failure is ALWAYS verbose: dump the mount invocation output + the
+    # daemon log tail before exiting.
+    mountpoint -q "$MNT" || {
+        log "REMOUNT FAILED (args=$args)"
+        { echo "---- remount diagnostic (args=$args) ----"
+          cat "$OUT/remount.log" 2>/dev/null || true
+          echo "-- daemon log tail (/scratch/tmp/logs/sqz.log):"
+          tail -40 /scratch/tmp/logs/sqz.log 2>/dev/null || true
+          echo "---- end diagnostic ----"; } >&2
+        exit 1
+    }
 }
 
 fio_row() { # $1 label, $2 rw, $3 bs, $4 runtime
-    local label=$1 rw=$2 bs=$3 rt=$4
-    fio --name=r --directory="$DIR" --filename_format='sqzfio.$jobnum.0' \
-        --rw="$rw" --bs="$bs" --size=1g --numjobs=16 --iodepth=8 \
-        --ioengine=libaio --direct=1 --time_based --runtime="$rt" \
-        --group_reporting --output-format=json --output="$OUT/$label.fio.json" \
-        >/dev/null 2>&1
+    local label=$1 rw=$2 bs=$3 rt=$4 rc
+    # fio chatter: captured always, streamed on SQZ_DEBUG=1, dumped on
+    # failure (failures stay verbose in default mode).
+    if [ "$SQZ_DEBUG" = "1" ]; then
+        fio --name=r --directory="$DIR" --filename_format='sqzfio.$jobnum.0' \
+            --rw="$rw" --bs="$bs" --size=1g --numjobs=16 --iodepth=8 \
+            --ioengine=libaio --direct=1 --time_based --runtime="$rt" \
+            --group_reporting --output-format=json --output="$OUT/$label.fio.json" \
+            2>&1 | tee "$OUT/$label.fio.err" >&2
+        rc=${PIPESTATUS[0]}
+    else
+        fio --name=r --directory="$DIR" --filename_format='sqzfio.$jobnum.0' \
+            --rw="$rw" --bs="$bs" --size=1g --numjobs=16 --iodepth=8 \
+            --ioengine=libaio --direct=1 --time_based --runtime="$rt" \
+            --group_reporting --output-format=json --output="$OUT/$label.fio.json" \
+            > "$OUT/$label.fio.err" 2>&1
+        rc=$?
+    fi
+    if [ "$rc" -ne 0 ] || [ ! -s "$OUT/$label.fio.json" ]; then
+        { echo "  $label: fio FAILED (rc=$rc) — output follows"
+          cat "$OUT/$label.fio.err" 2>/dev/null || true; } >&2
+    fi
     python3 - "$OUT/$label.fio.json" "$label" <<'EOF'
 import json, sys
 raw = open(sys.argv[1], "rb").read()
@@ -86,6 +125,9 @@ rm -f "$OUT/bat_default.rc"
 "$RIG/exa_client_perf.sh" --mount "$MNT" --shim /scratch/tmp/libsqueezefs_il.so \
     > "$OUT/bat_default.log" 2>&1
 echo $? > "$OUT/bat_default.rc"
+[ "$(cat "$OUT/bat_default.rc")" = "0" ] || {
+    echo "  battery FAILED (rc=$(cat "$OUT/bat_default.rc")) — log tail:"
+    tail -40 "$OUT/bat_default.log"; } >&2
 grep -A 18 "^row " "$OUT/bat_default.log" | head -6 | sed 's/^/  /'
 
 log "row 2: battery @ SERVICE_THREADS=32 (thread-slope bracket)"
@@ -93,6 +135,9 @@ remount "" SQUEEZEFS_IPC_SERVICE_THREADS=32
 "$RIG/exa_client_perf.sh" --mount "$MNT" --shim /scratch/tmp/libsqueezefs_il.so \
     > "$OUT/bat_threads32.log" 2>&1
 echo $? > "$OUT/bat_threads32.rc"
+[ "$(cat "$OUT/bat_threads32.rc")" = "0" ] || {
+    echo "  battery FAILED (rc=$(cat "$OUT/bat_threads32.rc")) — log tail:"
+    tail -40 "$OUT/bat_threads32.log"; } >&2
 grep -A 18 "^row " "$OUT/bat_threads32.log" | head -6 | sed 's/^/  /'
 
 log "row 3: zcrx Z3 field rows (Connect fix live)"

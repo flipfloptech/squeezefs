@@ -1164,8 +1164,31 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             // buffer. Either way: reply EINVAL, never present the slice.
             // (The §5.4 zero-copy WRITE body legitimately rides
             // `uring_payload` and is counted as available — see
-            // `validated_body`.)
-            let payload_len = uring_payload.as_ref().map_or(0, Bytes::len);
+            // `validated_body`. D14 held-slot WRITEs deliver an EMPTY
+            // placeholder while the body sits in the transport's sparse
+            // slot: the connection's held table carries the
+            // authoritative length, which is AVAILABLE by construction
+            // — `handle_write` re-validates it against the header.)
+            let payload_len = {
+                let placeholder_len = uring_payload.as_ref().map_or(0, Bytes::len);
+                #[cfg(target_os = "linux")]
+                {
+                    if placeholder_len == 0
+                        && uring_payload.is_some()
+                        && in_header.opcode == fuse_opcode::FUSE_WRITE as u32
+                    {
+                        fuse_connection
+                            .zc_write_held_len(request.slot)
+                            .map_or(placeholder_len, |l| l as usize)
+                    } else {
+                        placeholder_len
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    placeholder_len
+                }
+            };
             let data_ref =
                 match validated_body(in_header.len, filled, payload_len, data_buffer.len()) {
                     BodyBounds::Valid(n) => &data_buffer[..n],

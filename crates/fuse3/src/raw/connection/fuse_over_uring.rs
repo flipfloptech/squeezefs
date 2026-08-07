@@ -177,9 +177,9 @@ pub(crate) struct CommitMsg {
     prefilled: Option<u32>,
 }
 
-/// A handler-initiated zc device fetch (the direct leg): DMA `len` bytes
-/// from `fd` at `off` straight into the request's pages via the ent's
-/// sparse slot. The worker forwards the raw CQE result (`res`) on
+/// A handler-initiated zc device fetch (the direct read leg): DMA `len`
+/// bytes from `fd` at `off` straight into the request's pages via the
+/// ent's sparse slot. The worker forwards the raw CQE result (`res`) on
 /// `done`; the handler validates and only then commits its reply.
 pub(crate) struct ZcFetchMsg {
     qid: u16,
@@ -190,10 +190,35 @@ pub(crate) struct ZcFetchMsg {
     done: tokio::sync::oneshot::Sender<i32>,
 }
 
+/// A handler-initiated zc device STORE (the D14 write-side direct leg):
+/// DMA the ent's HELD WRITE payload (`len` = the held length, resolved
+/// worker-side) from the slot's registered source pages straight to
+/// `fd` at `dev_off`. The worker forwards the raw CQE result on `done`;
+/// the handler validates full length and owns the fallback.
+pub(crate) struct ZcStoreMsg {
+    qid: u16,
+    ent_idx: u16,
+    fd: RawFd,
+    dev_off: u64,
+    done: tokio::sync::oneshot::Sender<i32>,
+}
+
+/// A handler-requested LAZY WRITE-payload extraction
+/// (dispatch-before-extraction, D14): bridge the ent's HELD payload
+/// slot → memfd bounce and answer with a §5.4 lease over the bounce
+/// bytes.
+pub(crate) struct ZcExtractMsg {
+    qid: u16,
+    ent_idx: u16,
+    done: tokio::sync::oneshot::Sender<io::Result<Bytes>>,
+}
+
 /// One message to a drain-group worker (commit channel payload).
 pub(crate) enum WorkerMsg {
     Commit(CommitMsg),
     ZcFetch(ZcFetchMsg),
+    ZcStore(ZcStoreMsg),
+    ZcExtract(ZcExtractMsg),
 }
 
 /// One slot's liveness cell, published by its queue worker and read by
@@ -1326,6 +1351,12 @@ pub struct FuseOverUring {
     /// side-channel: two relaxed stores at delivery, one at commit, read
     /// only by the watch thread.
     slot_watch: Vec<SlotWatch>,
+    /// D14 write-side: per-(qid, ent) HELD WRITE-payload lengths
+    /// (dispatch-before-extraction — the payload stays in the sparse
+    /// slot until the handler stores it to the device or lazily
+    /// extracts it). Written by the queue workers, read by the session
+    /// validation and the handler's slot-source mint.
+    zc_write_held: zc::ZcHeldTable,
     /// Ring depth (per queue) — the `slot_watch` stride.
     depth: usize,
     /// §5.3 D3.b: session SQPOLL posture for the queue rings (`None` =
@@ -2487,6 +2518,7 @@ impl FuseOverUring {
             nqueues: nqueues as u16,
             inbound,
             slot_watch: (0..nqueues * depth).map(|_| SlotWatch::default()).collect(),
+            zc_write_held: zc::ZcHeldTable::new(nqueues, depth),
             depth,
             sqpoll,
             queues: queue_handles,
@@ -2710,6 +2742,7 @@ impl FuseOverUring {
             slot_watch: (0..nqueues as usize * Self::SIM_DEPTH)
                 .map(|_| SlotWatch::default())
                 .collect(),
+            zc_write_held: zc::ZcHeldTable::new(nqueues as usize, Self::SIM_DEPTH),
             depth: Self::SIM_DEPTH,
             sqpoll: None,
             queues,
@@ -2940,6 +2973,126 @@ impl FuseOverUring {
             return Err(io::Error::from_raw_os_error(-res));
         }
         Ok(res as u32)
+    }
+
+    /// D14 write-side: the HELD payload length of `slot`'s request
+    /// (dispatch-before-extraction — `Some(len)` means the WRITE's
+    /// payload sits in the sparse slot, consumable via
+    /// [`Self::zc_write_store`] / [`Self::zc_write_extract`]).
+    pub fn zc_write_held_len(&self, slot: ReplySlot) -> Option<u32> {
+        let ReplySlot::Ring { qid, ent_idx, .. } = slot else {
+            return None;
+        };
+        if !self.zc_armed() {
+            return None;
+        }
+        self.zc_write_held.get(qid, ent_idx as usize)
+    }
+
+    /// D14 write-side direct leg: DMA the request's HELD WRITE payload
+    /// from its registered source pages straight to `fd` at `dev_off`
+    /// (`WRITE_FIXED(device fd ← slot)`). Resolves to the raw ring
+    /// result: `Ok(n)` = bytes transferred (the caller treats
+    /// `n != held_len` as a failed leg and falls back to
+    /// [`Self::zc_write_extract`]), `Err` = the op errored/refused.
+    ///
+    /// Ordering contract (patch 0024): the slot's pages unregister at
+    /// COMMIT — this call happens strictly BEFORE the request's reply
+    /// exists (the handler awaits it), so the DMA always completes
+    /// before the commit that releases the pages.
+    pub async fn zc_write_store(
+        &self,
+        slot: ReplySlot,
+        fd: RawFd,
+        dev_off: u64,
+    ) -> io::Result<u32> {
+        let ReplySlot::Ring { qid, ent_idx, .. } = slot else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "zc store: reply has no ring slot",
+            ));
+        };
+        if !self.zc_armed() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "zc store: session not zc-armed",
+            ));
+        }
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let g = self
+            .group_of
+            .get(qid as usize)
+            .and_then(|&gi| self.groups.get(gi as usize))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bad qid"))?;
+        g.commit_tx
+            .send(WorkerMsg::ZcStore(ZcStoreMsg {
+                qid,
+                ent_idx,
+                fd,
+                dev_off,
+                done: done_tx,
+            }))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "uring worker closed"))?;
+        if g.wake_coalescer.arm() {
+            let one: u64 = 1;
+            // SAFETY: writing 8 bytes to a live eventfd.
+            let _ = unsafe { libc::write(g.wake_fd, &one as *const u64 as *const _, 8) };
+            TRANSPORT_WAKE_WRITES.fetch_add(1, Ordering::Relaxed);
+        } else {
+            TRANSPORT_WAKES_ELIDED.fetch_add(1, Ordering::Relaxed);
+        }
+        let res = done_rx.await.map_err(|_| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "zc store dropped (teardown)")
+        })?;
+        if res < 0 {
+            return Err(io::Error::from_raw_os_error(-res));
+        }
+        Ok(res as u32)
+    }
+
+    /// D14 write-side lazy extraction (the ineligible-shape vehicle):
+    /// bridge the request's HELD WRITE payload slot → memfd bounce and
+    /// answer with a §5.4 lease over the bounce bytes — exactly the
+    /// payload the at-delivery extraction used to mint, minted on
+    /// demand instead. Clears the held state on success (one
+    /// materialization per request; the handler memoizes).
+    pub async fn zc_write_extract(&self, slot: ReplySlot) -> io::Result<Bytes> {
+        let ReplySlot::Ring { qid, ent_idx, .. } = slot else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "zc extract: reply has no ring slot",
+            ));
+        };
+        if !self.zc_armed() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "zc extract: session not zc-armed",
+            ));
+        }
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let g = self
+            .group_of
+            .get(qid as usize)
+            .and_then(|&gi| self.groups.get(gi as usize))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bad qid"))?;
+        g.commit_tx
+            .send(WorkerMsg::ZcExtract(ZcExtractMsg {
+                qid,
+                ent_idx,
+                done: done_tx,
+            }))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "uring worker closed"))?;
+        if g.wake_coalescer.arm() {
+            let one: u64 = 1;
+            // SAFETY: writing 8 bytes to a live eventfd.
+            let _ = unsafe { libc::write(g.wake_fd, &one as *const u64 as *const _, 8) };
+            TRANSPORT_WAKE_WRITES.fetch_add(1, Ordering::Relaxed);
+        } else {
+            TRANSPORT_WAKES_ELIDED.fetch_add(1, Ordering::Relaxed);
+        }
+        done_rx.await.map_err(|_| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "zc extract dropped (teardown)")
+        })?
     }
 
     /// Commit a reply whose payload ALREADY SITS in the request's pages
@@ -4008,7 +4161,7 @@ fn queue_worker(
         qid: u16,
         gent: usize,
         res: i32,
-    ) -> io::Result<Option<PendingInbound>> {
+    ) -> io::Result<Option<PendingExtract>> {
         let idx = gent % slots.len();
         match zc_pend_slot.take() {
             None => {
@@ -4018,9 +4171,13 @@ fn queue_worker(
                 );
                 Ok(None)
             }
-            Some(ZcPend::HandlerFetch { done }) => {
+            Some(ZcPend::HandlerFetch { done }) | Some(ZcPend::HandlerStore { done }) => {
                 // A dropped receiver = the handler gave up (teardown);
-                // nothing owed here — its reply path owns the slot.
+                // nothing owed here — its reply path owns the slot. The
+                // store's engagement ledger is counted at the CONSUMING
+                // site (the root patch path) after ITS validation, so a
+                // caller-side length refusal never leaves a phantom
+                // count.
                 let _ = done.send(res);
                 Ok(None)
             }
@@ -4069,51 +4226,37 @@ fn queue_worker(
                 submit_commit(ring, batch, slots, watch, qid, gent, commit_id)?;
                 Ok(None)
             }
-            Some(ZcPend::WriteExtract {
-                header_and_op,
-                unique,
-                commit_id,
-                len,
-            }) => {
+            Some(ZcPend::LazyExtract { done, len }) => {
                 if res == len as i32 {
                     // The payload now exists in the bounce slot: hand the
-                    // deferred delivery back to the caller, which mints
-                    // the §5.4 lease and pushes inbound (it owns the
-                    // member's arena/lease/pool references). Engagement
-                    // face (write-bracket campaign): count the completed
+                    // completed extraction back to the caller, which
+                    // mints the §5.4 lease over the bounce bytes and
+                    // answers the parked handler (it owns the member's
+                    // arena/lease references). Engagement face
+                    // (write-bracket campaign): count the completed
                     // extraction + its payload bytes.
                     kmbuf::note_zc_write_extraction(u64::from(len));
-                    return Ok(Some(PendingInbound {
-                        header_and_op,
-                        unique,
-                        commit_id,
-                        len,
-                    }));
+                    return Ok(Some(PendingExtract { done, len }));
                 }
                 kmbuf::note_zc_fallback();
                 error!(
                     "fuse-over-uring qid={qid} ent={idx}: zc WRITE extraction failed \
-                     (res={res}, want={len}) — synthesizing EIO for unique={unique}"
+                     (res={res}, want={len}, kmbuf_ops={}) — answering the handler \
+                     with EIO",
+                    kmbuf::resolved_opcodes_label()
                 );
-                // fail_ent needs the lease state; the caller runs it — signal
-                // via the empty-header marker below.
-                Ok(Some(PendingInbound {
-                    header_and_op: Vec::new(),
-                    unique,
-                    commit_id,
-                    len: 0,
-                }))
+                let _ = done.send(Err(io::Error::from_raw_os_error(libc::EIO)));
+                Ok(None)
             }
         }
     }
 
-    /// A WRITE delivery whose payload extraction completed (or failed:
-    /// `header_and_op.is_empty()`), handed from [`zc_fetch_complete`]
-    /// back to the loop body that owns the member's arena and pool refs.
-    struct PendingInbound {
-        header_and_op: Vec<u8>,
-        unique: u64,
-        commit_id: u64,
+    /// A completed LAZY WRITE-payload extraction, handed from
+    /// [`zc_fetch_complete`] back to the loop body that owns the
+    /// member's arena and lease references (which mints the §5.4 lease
+    /// and answers the parked handler).
+    struct PendingExtract {
+        done: tokio::sync::oneshot::Sender<io::Result<Bytes>>,
         len: u32,
     }
     // Membership lookup, not offset arithmetic: groups are node-membership
@@ -4283,6 +4426,123 @@ fn queue_worker(
                                 f.qid
                             );
                             let _ = f.done.send(-libc::EIO);
+                        }
+                    }
+                    continue;
+                }
+                WorkerMsg::ZcStore(s) => {
+                    // D14 direct write leg: WRITE_FIXED(device fd ← the
+                    // ent's held source pages). Refusals answer the
+                    // oneshot with a negative errno (the handler falls
+                    // back to the extraction vehicle).
+                    let idx = s.ent_idx as usize;
+                    let Some(mi) = member_of_qid(s.qid).filter(|_| idx < depth) else {
+                        warn!(
+                            "fuse-over-uring qids={qids:?}: zc store for bad slot qid={} ent={idx}",
+                            s.qid
+                        );
+                        let _ = s.done.send(-libc::EINVAL);
+                        continue;
+                    };
+                    let m = &mut members[mi];
+                    let Some(len) = pool.zc_write_held.get(s.qid, idx) else {
+                        warn!(
+                            "fuse-over-uring qid={} ent={idx}: zc store with no held \
+                             payload — refusing",
+                            s.qid
+                        );
+                        let _ = s.done.send(-libc::ENOENT);
+                        continue;
+                    };
+                    if m.zc_pend[idx].is_some() {
+                        warn!(
+                            "fuse-over-uring qid={} ent={idx}: zc store on a slot with a \
+                             pending bridge — refusing",
+                            s.qid
+                        );
+                        let _ = s.done.send(-libc::EBUSY);
+                        continue;
+                    }
+                    let gent = gent_of(mi, idx);
+                    let entry = Entry128::from(
+                        opcode::WriteFixed::new(types::Fd(s.fd), std::ptr::null(), len, idx as u16)
+                            .offset(s.dev_off)
+                            .build()
+                            .user_data(encode_user_data(RingOp::Fetch, gent)),
+                    );
+                    match push_fetch_batched(&mut ring, &mut batch, entry) {
+                        Ok(()) => {
+                            m.zc_pend[idx] = Some(ZcPend::HandlerStore { done: s.done });
+                        }
+                        Err(e) => {
+                            warn!(
+                                "fuse-over-uring qid={} ent={idx}: zc store push failed ({e})",
+                                s.qid
+                            );
+                            let _ = s.done.send(-libc::EIO);
+                        }
+                    }
+                    continue;
+                }
+                WorkerMsg::ZcExtract(x) => {
+                    // D14 lazy extraction: WRITE_FIXED(slot → memfd) on
+                    // demand — the ineligible-shape vehicle. Refusals
+                    // answer the oneshot with an error (the write fails
+                    // loud for exactly this request).
+                    let idx = x.ent_idx as usize;
+                    let Some(mi) = member_of_qid(x.qid).filter(|_| idx < depth) else {
+                        warn!(
+                            "fuse-over-uring qids={qids:?}: zc extract for bad slot qid={} ent={idx}",
+                            x.qid
+                        );
+                        let _ = x.done.send(Err(io::Error::from_raw_os_error(libc::EINVAL)));
+                        continue;
+                    };
+                    let m = &mut members[mi];
+                    let Some(len) = pool.zc_write_held.get(x.qid, idx) else {
+                        warn!(
+                            "fuse-over-uring qid={} ent={idx}: zc extract with no held \
+                             payload — refusing",
+                            x.qid
+                        );
+                        let _ = x.done.send(Err(io::Error::from_raw_os_error(libc::ENOENT)));
+                        continue;
+                    };
+                    if m.zc_pend[idx].is_some() {
+                        warn!(
+                            "fuse-over-uring qid={} ent={idx}: zc extract on a slot with a \
+                             pending bridge — refusing",
+                            x.qid
+                        );
+                        let _ = x.done.send(Err(io::Error::from_raw_os_error(libc::EBUSY)));
+                        continue;
+                    }
+                    let Some(zb) = zc_bounce.as_ref() else {
+                        let _ = x.done.send(Err(io::Error::from_raw_os_error(libc::EINVAL)));
+                        continue;
+                    };
+                    let gent = gent_of(mi, idx);
+                    let entry = Entry128::from(
+                        opcode::WriteFixed::new(
+                            types::Fd(zb.fd()),
+                            std::ptr::null(),
+                            len,
+                            idx as u16,
+                        )
+                        .offset(zb.offset_of(idx).expect("ent in range"))
+                        .build()
+                        .user_data(encode_user_data(RingOp::Fetch, gent)),
+                    );
+                    match push_fetch_batched(&mut ring, &mut batch, entry) {
+                        Ok(()) => {
+                            m.zc_pend[idx] = Some(ZcPend::LazyExtract { done: x.done, len });
+                        }
+                        Err(e) => {
+                            warn!(
+                                "fuse-over-uring qid={} ent={idx}: zc extract push failed ({e})",
+                                x.qid
+                            );
+                            let _ = x.done.send(Err(io::Error::other(e.to_string())));
                         }
                     }
                     continue;
@@ -4486,6 +4746,11 @@ fn queue_worker(
                 // unregistered slot (the opcode-mirror miss), both of
                 // which fall back per-request.
                 if op == RingOp::Fetch {
+                    // An errored bridge CQE never carries a completed
+                    // extraction (LazyExtract answers its handler's
+                    // oneshot with the error — the DISPATCHED request's
+                    // handler owns the EIO reply; synthesizing one here
+                    // would double-reply the slot).
                     let pend = zc_fetch_complete(
                         &mut ring,
                         &mut batch,
@@ -4497,21 +4762,10 @@ fn queue_worker(
                         gent,
                         res,
                     )?;
-                    if pend.is_some() {
-                        // A failed WRITE extraction: the request cannot be
-                        // served — synthesize its error (row-5 discipline).
-                        fail_ent(
-                            &mut ring,
-                            &mut batch,
-                            &mut m.slots,
-                            &mut m.ents[ent_idx],
-                            &m.lease_states[ent_idx],
-                            pool.slot_watch_cell(qid, ent_idx),
-                            qid,
-                            gent,
-                            libc::EIO,
-                        )?;
-                    }
+                    debug_assert!(
+                        pend.is_none(),
+                        "an errored bridge CQE cannot complete an extraction"
+                    );
                     continue;
                 }
                 // Kernel abort/unmount (dev_uring.c): -ENOTCONN on entry teardown /
@@ -4643,9 +4897,9 @@ fn queue_worker(
             }
             let m = &mut members[mi];
             if op == RingOp::Fetch {
-                // A zc bridge completed (device fetch, bounce bridge, or
-                // WRITE extraction). NOT a delivery — resolve the pending
-                // kind and move on.
+                // A zc bridge completed (device fetch/store, bounce
+                // bridge, or lazy WRITE extraction). NOT a delivery —
+                // resolve the pending kind and move on.
                 let pend = zc_fetch_complete(
                     &mut ring,
                     &mut batch,
@@ -4658,27 +4912,14 @@ fn queue_worker(
                     res,
                 )?;
                 if let Some(p) = pend {
-                    if p.header_and_op.is_empty() {
-                        // Short extraction (success CQE with res != len):
-                        // the request cannot be served — synthesize.
-                        fail_ent(
-                            &mut ring,
-                            &mut batch,
-                            &mut m.slots,
-                            &mut m.ents[ent_idx],
-                            &m.lease_states[ent_idx],
-                            pool.slot_watch_cell(qid, ent_idx),
-                            qid,
-                            gent,
-                            libc::EIO,
-                        )?;
-                        continue;
-                    }
-                    // The extracted WRITE payload sits in the bounce slot:
-                    // mint the §5.4 lease over it and dispatch the deferred
-                    // delivery. The lease arena IS the bounce arena in zc
-                    // mode, so the drop protocol (refs → unpark → wake) is
-                    // byte-identical to the kmbuf path.
+                    // The extracted WRITE payload sits in the bounce
+                    // slot: mint the §5.4 lease over it and answer the
+                    // parked handler. The lease arena IS the bounce
+                    // arena in zc mode, so the drop protocol (refs →
+                    // unpark → wake) is byte-identical to the kmbuf
+                    // path. The held state clears — one materialization
+                    // per request (the handler memoizes).
+                    pool.zc_write_held.clear(qid, ent_idx);
                     let zb = zc_bounce.as_ref().expect("zc pend implies zc mode");
                     let ptr = zb.buf_ptr(ent_idx).expect("pend slot in range") as *const u8;
                     let state = Arc::clone(&m.lease_states[ent_idx]);
@@ -4693,37 +4934,10 @@ fn queue_worker(
                         len: p.len as usize,
                         born: Instant::now(),
                     });
-                    if pool.inbound[qid as usize]
-                        .push(InboundUringReq {
-                            header_and_op: p.header_and_op,
-                            payload,
-                            unique: p.unique,
-                            slot: ReplySlot::Ring {
-                                qid,
-                                ent_idx: ent_idx as u16,
-                                commit_id: p.commit_id,
-                            },
-                            arrived_ns: crate::raw::read_phase::transport_now_ns(),
-                        })
-                        .is_err()
-                    {
-                        error!(
-                            "fuse-over-uring qid={qid} ent={ent_idx}: session inbound queue \
-                             closed after zc extraction; synthesizing EIO for unique={} (row 4)",
-                            p.unique
-                        );
-                        fail_ent(
-                            &mut ring,
-                            &mut batch,
-                            &mut m.slots,
-                            &mut m.ents[ent_idx],
-                            &m.lease_states[ent_idx],
-                            pool.slot_watch_cell(qid, ent_idx),
-                            qid,
-                            gent,
-                            libc::EIO,
-                        )?;
-                    }
+                    // A dropped receiver = the handler gave up
+                    // (teardown); the lease drops with the unsent Bytes
+                    // and the commit gate unparks — nothing leaks.
+                    let _ = p.done.send(Ok(payload));
                 }
                 continue;
             }
@@ -4964,20 +5178,22 @@ fn queue_worker(
                 continue;
             }
 
-            // zc WRITE extraction (K1 kill): bridge the slot-resident
-            // payload into the bounce (`WRITE_FIXED(slot → memfd)`) and
-            // defer the inbound dispatch to its CQE — the handler then
-            // sees a normal §5.4 lease over the bounce bytes. One ring
-            // round trip per WRITE; the kernel's shmem copy replaces the
-            // delivery-time folio copy (pass-count parity).
+            // D14 write-side: a zc WRITE's payload stays HELD in the
+            // sparse slot (dispatch-before-extraction) — the request
+            // dispatches IMMEDIATELY with an empty placeholder payload
+            // and the held length published on the pool table. An
+            // eligible shape DMAs it slot→device (`zc_write_store`, zero
+            // daemon copies — the D14 leg); everything else materializes
+            // lazily (`zc_write_extract` → the §5.4 bounce lease). The
+            // oversize shape is refused loud exactly as the at-delivery
+            // extraction refused it.
             if zc_slot_payload {
                 let zb = zc_bounce.as_ref().expect("zc_slot_payload implies zc mode");
-                if payload_sz > zb.stride() || m.zc_pend[ent_idx].is_some() {
+                if payload_sz > zb.stride() {
                     error!(
-                        "fuse-over-uring qid={qid} ent={ent_idx}: zc WRITE extraction \
-                         refused (len={payload_sz}, stride={}, pending={}) — EIO",
-                        zb.stride(),
-                        m.zc_pend[ent_idx].is_some()
+                        "fuse-over-uring qid={qid} ent={ent_idx}: zc WRITE payload \
+                         {payload_sz} B exceeds the slot stride ({} B) — EIO",
+                        zb.stride()
                     );
                     fail_ent(
                         &mut ring,
@@ -4992,45 +5208,13 @@ fn queue_worker(
                     )?;
                     continue;
                 }
-                let entry = Entry128::from(
-                    opcode::WriteFixed::new(
-                        types::Fd(zb.fd()),
-                        std::ptr::null(),
-                        payload_sz as u32,
-                        ent_idx as u16,
-                    )
-                    .offset(zb.offset_of(ent_idx).expect("ent in range"))
-                    .build()
-                    .user_data(encode_user_data(RingOp::Fetch, gent)),
-                );
-                match push_fetch_batched(&mut ring, &mut batch, entry) {
-                    Ok(()) => {
-                        m.zc_pend[ent_idx] = Some(ZcPend::WriteExtract {
-                            header_and_op,
-                            unique,
-                            commit_id,
-                            len: payload_sz as u32,
-                        });
-                    }
-                    Err(e) => {
-                        error!(
-                            "fuse-over-uring qid={qid} ent={ent_idx}: zc WRITE extraction \
-                             push failed ({e}); synthesizing EIO for unique={unique}"
-                        );
-                        fail_ent(
-                            &mut ring,
-                            &mut batch,
-                            &mut m.slots,
-                            &mut m.ents[ent_idx],
-                            &m.lease_states[ent_idx],
-                            pool.slot_watch_cell(qid, ent_idx),
-                            qid,
-                            gent,
-                            libc::EIO,
-                        )?;
-                    }
-                }
-                continue;
+                pool.zc_write_held.set(qid, ent_idx, payload_sz as u32);
+            } else if zc_mode {
+                // Any non-held delivery re-points the ent: stale held
+                // state from a prior request must never be readable by a
+                // later one (queries only race their own request's
+                // window by protocol; this is the belt).
+                pool.zc_write_held.clear(qid, ent_idx);
             }
 
             // The request carries its own reply address (FUSE-2 ⊕
@@ -5186,10 +5370,10 @@ fn queue_worker(
     // EIO commits — their bodies never reached the request's pages (the
     // bridge CQE is not coming), and committing the body through the
     // attachment would let a still-live kernel skip the folio copy and
-    // report success over unwritten pages. Handler fetches unblock by
-    // SENDER DROP (the oneshot receiver reads BrokenPipe and the
-    // handler's serve fails loud); deferred WRITE deliveries are still
-    // OWED slots, which the row-8 owing() pass below synthesizes.
+    // report success over unwritten pages. Handler fetches/stores and
+    // lazy extractions unblock by SENDER DROP (the oneshot receiver
+    // reads BrokenPipe and the handler's serve/write fails loud — the
+    // dispatched request's own reply path owns the slot).
     for m in members.iter_mut() {
         for (idx, pend) in m.zc_pend.iter_mut().enumerate() {
             if let Some(ZcPend::BounceFetch {
@@ -5219,7 +5403,7 @@ fn queue_worker(
         match wmsg {
             WorkerMsg::Commit(msg) => final_msgs.push((msg, false)),
             // Dropping the sender unblocks the parked handler (BrokenPipe).
-            WorkerMsg::ZcFetch(_) => {}
+            WorkerMsg::ZcFetch(_) | WorkerMsg::ZcStore(_) | WorkerMsg::ZcExtract(_) => {}
         }
     }
     xport_dbg!(

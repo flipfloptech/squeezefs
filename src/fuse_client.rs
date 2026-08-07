@@ -10358,7 +10358,7 @@ impl SqueezefsFilesystem {
         ino: u64,
         b: u32,
         rel_start: u64,
-        payload: &[u8],
+        payload: &crate::routing::WritePayload,
         cache_key: &str,
         file_path: &str,
         fencing_token: u64,
@@ -10472,18 +10472,77 @@ impl SqueezefsFilesystem {
             return Ok(false);
         }
 
-        // The severed pooled payload: ONE userspace copy into a 4 KiB-
-        // aligned pooled backing (§5.4 lease severance — the transport
-        // lease slice never crosses the DMA), then ONE aligned DMA.
-        let mut buf = crate::cache::pool::BUFFER_POOL.alloc();
-        if payload.len() > buf.capacity() {
-            buf.resize(payload.len(), 0);
+        // The DMA — two vehicles, one contract (the §5.1 window wraps
+        // both; the post path below is identical):
+        //
+        // * **D14 direct leg** (slot payload): `WRITE_FIXED(device fd ←
+        //   slot)` — the payload DMAs from the CALLER'S registered pages,
+        //   zero daemon copies, no extraction (rc-manifest §3f ruling
+        //   D14). Gated on the device's zc write fd and OFF under
+        //   `--write-verification` (the pooled path's window-exact
+        //   read-back covers only `write_block`); the RES-6/S7 custody
+        //   gate runs the SAME authorization the worker path runs. Any
+        //   failure falls back to the pooled vehicle below — a partial
+        //   direct store is fully overwritten by the same window's
+        //   pooled DMA, so the fallback is self-healing.
+        // * **Pooled vehicle** (bytes, or a slot whose direct leg
+        //   declined/failed): ONE userspace copy into a 4 KiB-aligned
+        //   pooled backing (§5.4 lease severance — the transport lease
+        //   slice never crosses the DMA), then ONE aligned DMA.
+        let payload_len = payload.len();
+        let mut dma: Option<Result<(), SqueezefsError>> = None;
+        if let Some(z) = payload.slot() {
+            if !crate::write_verification_enabled() {
+                if let Some(fd) = device.zc_write_fd() {
+                    // RES-6/S7: authorize BEFORE the submission (the
+                    // same law `write_block`'s worker enforces); a fence
+                    // refusal fails this write loud through the common
+                    // re-stabilize/purge exit below — never a fallback
+                    // (a fenced holder must not fall back to a SECOND
+                    // submission path).
+                    match device.authorize_zc_store() {
+                        Err(e) => dma = Some(Err(e)),
+                        Ok(()) => match z.store(fd, dev_offset + rel_start).await {
+                            Ok(n) if n as usize == payload_len => {
+                                fuse3::note_zc_write_direct(payload_len as u64);
+                                dma = Some(Ok(()));
+                            }
+                            other => {
+                                warn!(
+                                    "D14 direct store declined for ino {ino} block {b} \
+                                     (dev_off {}, len {payload_len}): {other:?} — falling \
+                                     back to the pooled patch vehicle",
+                                    dev_offset + rel_start
+                                );
+                            }
+                        },
+                    }
+                }
+            }
         }
-        buf.backing_mut()[..payload.len()].copy_from_slice(payload);
-        buf.set_written_len(payload.len());
-        let dma = device
-            .write_block(dev_offset + rel_start, buf.into_bytes())
-            .await;
+        let dma = match dma {
+            Some(res) => res,
+            None => {
+                match payload
+                    .materialize()
+                    .await
+                    .map_err(crate::error::SqueezefsError::Io)
+                {
+                    Ok(bytes) => {
+                        let mut buf = crate::cache::pool::BUFFER_POOL.alloc();
+                        if bytes.len() > buf.capacity() {
+                            buf.resize(bytes.len(), 0);
+                        }
+                        buf.backing_mut()[..bytes.len()].copy_from_slice(&bytes);
+                        buf.set_written_len(bytes.len());
+                        device
+                            .write_block(dev_offset + rel_start, buf.into_bytes())
+                            .await
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        };
 
         // Re-stabilize + purge on BOTH exits (the upload_full_block
         // invalidation set and ordering — after the DMA, before the ACK):
@@ -10499,7 +10558,7 @@ impl SqueezefsFilesystem {
                 METRICS.patch_writes.fetch_add(1, Ordering::Relaxed);
                 METRICS
                     .patch_write_bytes
-                    .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                    .fetch_add(payload_len as u64, Ordering::Relaxed);
                 Ok(true)
             }
             Err(e) => {
@@ -10662,14 +10721,22 @@ impl SqueezefsFilesystem {
     ///
     /// P1-10: the fencing check uses a short-lived meta connection that is dropped
     /// before any active-block / backend I/O (block tasks open their own connections).
+    /// (D14 write-side zc leg: the payload is an `Into<WritePayload>` —
+    /// plain `Bytes` for every classical/internal caller, or a
+    /// [`WritePayload::Slot`] carrying the FUSE WRITE's payload HELD in
+    /// the transport's sparse slot. The W1 patch shape consumes a slot
+    /// by direct slot→device DMA — zero daemon copies — and every other
+    /// shape materializes it lazily through the memoized extraction, so
+    /// eligible writes never pay the extraction round trip.)
     pub async fn write_file_staged(
         &self,
         ino: u64,
         offset: u64,
-        data: bytes::Bytes,
+        payload: impl Into<crate::routing::WritePayload>,
         existing_size: u64,
         fencing_token: u64,
     ) -> Result<(), SqueezefsError> {
+        let payload: crate::routing::WritePayload = payload.into();
         {
             let current_fencing = self.dlm.get_fencing_token_ino(ino);
             if fencing_token < current_fencing {
@@ -10681,8 +10748,9 @@ impl SqueezefsFilesystem {
         }
 
         let block_size = self.router.block_size.load(Ordering::Relaxed);
+        let payload_len = payload.len() as u64;
         let start_block = offset / block_size;
-        let end_block = (offset + data.len() as u64 - 1) / block_size;
+        let end_block = (offset + payload_len - 1) / block_size;
 
         // W1 sole-owner extent patch — the request-shape half of the §5.1
         // predicate (design-random-small-writes), evaluated once per
@@ -10692,12 +10760,12 @@ impl SqueezefsFilesystem {
         // against invocations. The stream word is swapped UNCONDITIONALLY
         // (predicate 6 needs the true previous end even while the knob is
         // 0 or the shape is ineligible).
-        let prev_write_end = self.note_last_write_end(ino, offset, data.len() as u64);
+        let prev_write_end = self.note_last_write_end(ino, offset, payload_len);
         // W2 (§5.2): stream-adjacency also gates the extent-overlay park —
         // sequential streams keep the whole-block write-through economy.
         let stream_adjacent = prev_write_end == Some(offset);
         let patch_cap = patch_max_bytes();
-        let try_patch = if patch_cap == 0 || data.is_empty() {
+        let try_patch = if patch_cap == 0 || payload.is_empty() {
             // Knob 0 = the §6 A/B lever: the patch path is OFF and the
             // decision ledger stays silent.
             false
@@ -10709,8 +10777,8 @@ impl SqueezefsFilesystem {
                 .fetch_add(1, Ordering::Relaxed);
             false
         } else if start_block != end_block
-            || data.len() as u64 > patch_cap
-            || offset + data.len() as u64 > existing_size
+            || payload_len > patch_cap
+            || offset + payload_len > existing_size
         {
             // Predicate 5 size/window class (one bucket by design, §5.4):
             // spans blocks, exceeds SQUEEZEFS_PATCH_MAX_BYTES, or EXTENDS
@@ -10719,7 +10787,7 @@ impl SqueezefsFilesystem {
                 .patch_ineligible_oversize
                 .fetch_add(1, Ordering::Relaxed);
             false
-        } else if offset % 4096 != 0 || data.len() % 4096 != 0 {
+        } else if offset % 4096 != 0 || payload_len % 4096 != 0 {
             // Predicate 5 alignment (v1 is LBA-aligned-only — the unaligned
             // edge path is phase-2 behind its own torn-edge contract).
             METRICS
@@ -10730,6 +10798,20 @@ impl SqueezefsFilesystem {
             true
         };
 
+        // D14: a slot payload stays UNMATERIALIZED only for the
+        // single-block patch shape (the direct slot→device DMA
+        // candidate — try_patch ⇒ start_block == end_block, so the one
+        // future below owns the whole payload); every other shape
+        // materializes HERE — one memoized extraction, requested after
+        // the handler prelude it overlaps with. Bytes payloads are a
+        // zero-cost clone.
+        let deferred_slot = try_patch && payload.slot().is_some();
+        let data: bytes::Bytes = if deferred_slot {
+            bytes::Bytes::new()
+        } else {
+            payload.materialize().await.map_err(SqueezefsError::Io)?
+        };
+
         let mut futures = Vec::new();
         let mut data_cursor = 0usize;
         for b in start_block..=end_block {
@@ -10737,10 +10819,24 @@ impl SqueezefsFilesystem {
             let b_end_offset = b_start_offset + block_size;
 
             let write_start = std::cmp::max(offset, b_start_offset);
-            let write_end = std::cmp::min(offset + data.len() as u64, b_end_offset);
+            let write_end = std::cmp::min(offset + payload_len, b_end_offset);
             let slice_len = (write_end - write_start) as usize;
 
-            let file_data_slice = &data[data_cursor..data_cursor + slice_len];
+            // The patch consumes the PAYLOAD form (slot or sliced
+            // bytes); the accumulation path below consumes the slice
+            // (materialized inside the future for the deferred shape).
+            let patch_payload: crate::routing::WritePayload = if deferred_slot {
+                payload.clone()
+            } else {
+                crate::routing::WritePayload::Bytes(
+                    data.slice(data_cursor..data_cursor + slice_len),
+                )
+            };
+            let file_data_slice = if deferred_slot {
+                &data[0..0]
+            } else {
+                &data[data_cursor..data_cursor + slice_len]
+            };
             data_cursor += slice_len;
 
             let cache_key = crate::keys::active_block(ino, b as u64).to_string();
@@ -10779,7 +10875,7 @@ impl SqueezefsFilesystem {
                             ino,
                             b as u32,
                             rel,
-                            file_data_slice,
+                            &patch_payload,
                             &cache_key,
                             &file_path,
                             fencing_token,
@@ -10797,6 +10893,32 @@ impl SqueezefsFilesystem {
                         }
                     }
                 }
+
+                // D14: a slot payload that declined the patch (its
+                // `patch_ineligible_*` bucket counted) materializes HERE
+                // — the memoized extraction (a store-failure fallback
+                // inside the patch already extracted; this clone is
+                // free), consumed by the accumulation path exactly like
+                // a bytes payload. Holding the block guard across the
+                // extraction await is the flush paths' own discipline
+                // (the guard exists to be held across block I/O), and
+                // the transport worker never takes block locks.
+                let owned_slot_bytes: bytes::Bytes = if deferred_slot {
+                    match patch_payload.materialize().await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            std::mem::drop(block_guard);
+                            return Err(SqueezefsError::Io(e));
+                        }
+                    }
+                } else {
+                    bytes::Bytes::new()
+                };
+                let file_data_slice: &[u8] = if deferred_slot {
+                    &owned_slot_bytes[..]
+                } else {
+                    file_data_slice
+                };
 
                 // W2 §5.2 extent-overlay park — the patch-INELIGIBLE
                 // small-write route (compressed/shared/decorated/hole/
@@ -16215,12 +16337,52 @@ impl Filesystem for SqueezefsFilesystem {
             return Err(Errno::from(libc::EACCES));
         }
 
+        // D14 write-side zc leg (rc-manifest §3f): on a zc-armed session
+        // the WRITE's payload was delivered HELD in the transport's
+        // sparse slot (dispatch-before-extraction — `data` here is the
+        // empty placeholder); mint the slot source the write path
+        // consumes: the W1 patch class DMAs it slot→device (zero daemon
+        // copies), everything else materializes it lazily through the
+        // memoized extraction. Kernel ring slots only — il parity
+        // writes never ride FUSE deliveries.
+        let zc_slot = {
+            let conn_guard = self.session_connection.load();
+            conn_guard
+                .as_ref()
+                .as_ref()
+                .and_then(|conn| conn.zc_write_held_len(_req.slot))
+                .zip(conn_guard.as_ref().as_ref())
+                .map(|(len, conn)| {
+                    let slot = _req.slot;
+                    let store_conn = conn.clone();
+                    let extract_conn = conn.clone();
+                    crate::routing::ZcWriteSlot::new(
+                        len,
+                        Box::new(move |fd, dev_off| {
+                            let c = store_conn.clone();
+                            Box::pin(async move { c.zc_write_store(slot, fd, dev_off).await })
+                        }),
+                        Box::new(move || {
+                            let c = extract_conn.clone();
+                            Box::pin(async move { c.zc_write_extract(slot).await })
+                        }),
+                    )
+                })
+        };
+        let payload = match zc_slot {
+            Some(z) => crate::routing::WritePayload::Slot(z),
+            None => crate::routing::WritePayload::Bytes(data),
+        };
+        // The authoritative write length (`data.len()` is 0 for held
+        // deliveries by design).
+        let wlen = payload.len();
+
         // The representable maximum: block indices are u32 across the
         // striped layout, so files cap at block_size × (2^32 − 1). Beyond
         // it the pre-fix path silently wrapped the block index mod 2^32
         // and read back zeros (fstests generic/525) — refuse EFBIG loud
         // (pinned in tests/sparse_write_bounded_tests.rs).
-        if offset.saturating_add(data.len() as u64) > self.max_file_size() {
+        if offset.saturating_add(wlen as u64) > self.max_file_size() {
             return Err(Errno::from(libc::EFBIG));
         }
 
@@ -16292,12 +16454,11 @@ impl Filesystem for SqueezefsFilesystem {
                             .fetch_add(1, Ordering::Relaxed);
                         debug!(
                             "FUSE Write: ino {ino} is verified-reclaimed — \
-                             counted writeback-orphan discard ({} bytes)",
-                            data.len()
+                             counted writeback-orphan discard ({wlen} bytes)"
                         );
                         drop(guard);
                         return Ok(ReplyWrite {
-                            written: data.len() as u32,
+                            written: wlen as u32,
                         });
                     }
                 }
@@ -16356,7 +16517,7 @@ impl Filesystem for SqueezefsFilesystem {
             };
             let is_striped = file_type == "striped";
 
-            let bytes_written = data.len() as u32;
+            let bytes_written = wlen as u32;
             let expected_new_size = std::cmp::max(old_size, offset + bytes_written as u64);
 
             let fits_inline = expected_new_size <= MAX_INLINE_SIZE
@@ -16400,8 +16561,15 @@ impl Filesystem for SqueezefsFilesystem {
                 // would park the ring ent's COMMIT_AND_FETCH for as long as
                 // the cache holds it (deterministic mount hang at
                 // Q_DEPTH=4). Materialize a private copy before anything
-                // reaches `DataRouter::write_file`.
-                let data_bytes = sever_payload(&data);
+                // reaches `DataRouter::write_file`. (D14: a held-slot
+                // payload materializes here first — the memoized bounce
+                // lease — and the sever below is what keeps that lease
+                // inside this handler invocation, §5.4.)
+                let slot_bytes = payload.materialize().await.map_err(|e| {
+                    error!("FUSE Write: slot payload materialize failed: {e}");
+                    Errno::from(libc::EIO)
+                })?;
+                let data_bytes = sever_payload(&slot_bytes);
                 // FIND-RW5-A face 3: one fresh-lease retry on a transient
                 // adjacent-bump fence (see the striped arm below).
                 let held_guard = if lock_scope == InodeWriteLockScope::MetaPrepOnly {
@@ -16461,7 +16629,7 @@ impl Filesystem for SqueezefsFilesystem {
                 let mut attempt = 0u32;
                 loop {
                     match self
-                        .write_file_staged(ino, offset, data.clone(), old_size, token)
+                        .write_file_staged(ino, offset, payload.clone(), old_size, token)
                         .await
                     {
                         Ok(()) => break,

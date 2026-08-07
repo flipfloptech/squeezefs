@@ -4478,6 +4478,126 @@ impl ZcReadServe {
     }
 }
 
+/// The D14 write-side slot STORE primitive (2026-08-06, rc-manifest §3f
+/// ruling D14): DMA the FUSE WRITE's payload from its registered source
+/// pages STRAIGHT to a device fd at a byte offset, through the
+/// transport queue ring's sparse fixed-buffer slot
+/// (`WRITE_FIXED(device fd ← slot)`). Implemented by the FUSE handler
+/// over the armed connection (`FuseConnection::zc_write_store`);
+/// injected in tests (the sqz-kernel surface is the only live venue).
+pub type ZcStoreFn = dyn Fn(std::os::unix::io::RawFd, u64) -> futures::future::BoxFuture<'static, std::io::Result<u32>>
+    + Send
+    + Sync;
+
+/// The D14 lazy-extraction primitive (dispatch-before-extraction): the
+/// ineligible-shape vehicle — bridge the held payload slot → transport
+/// bounce and return the §5.4 lease over its bytes.
+pub type ZcExtractFn =
+    dyn Fn() -> futures::future::BoxFuture<'static, std::io::Result<bytes::Bytes>> + Send + Sync;
+
+/// The D14 write-side slot source: minted by the FUSE WRITE handler on
+/// a zc-armed session whose delivery HELD the payload in the sparse
+/// slot, and threaded down the write path as [`WritePayload::Slot`].
+/// An eligible shape (the W1 sole-owner patch class) consumes it via
+/// [`Self::store`] — one slot→device DMA, zero daemon copies; every
+/// other shape [`Self::materialize`]s (memoized — the fencing-retry
+/// loop must never pay a second extraction).
+pub struct ZcWriteSlot {
+    len: u32,
+    store: Box<ZcStoreFn>,
+    extract: Box<ZcExtractFn>,
+    materialized: tokio::sync::Mutex<Option<bytes::Bytes>>,
+}
+
+impl ZcWriteSlot {
+    pub fn new(len: u32, store: Box<ZcStoreFn>, extract: Box<ZcExtractFn>) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(ZcWriteSlot {
+            len,
+            store,
+            extract,
+            materialized: tokio::sync::Mutex::new(None),
+        })
+    }
+
+    /// The held payload length (the authoritative write size).
+    pub fn len(&self) -> u32 {
+        self.len
+    }
+
+    /// Never empty by construction: the transport only holds
+    /// payload-carrying WRITEs (`payload_sz > 0`).
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The direct leg: DMA the held payload to `fd` at `dev_off`.
+    /// `Ok(n)` — the caller treats `n != len()` as a failed leg and
+    /// falls back to [`Self::materialize`].
+    pub async fn store(&self, fd: std::os::unix::io::RawFd, dev_off: u64) -> std::io::Result<u32> {
+        (self.store)(fd, dev_off).await
+    }
+
+    /// Materialize the payload bytes (the extraction vehicle), memoized:
+    /// one extraction per request ever — clones serve every retry.
+    pub async fn materialize(&self) -> std::io::Result<bytes::Bytes> {
+        let mut slot = self.materialized.lock().await;
+        if let Some(b) = slot.as_ref() {
+            return Ok(b.clone());
+        }
+        let b = (self.extract)().await?;
+        *slot = Some(b.clone());
+        Ok(b)
+    }
+}
+
+/// A WRITE's payload as the write path consumes it: plain bytes (every
+/// classical/kmbuf delivery, and every internal writer), or the D14
+/// held-slot source. `len()` is authoritative for both; slot payloads
+/// materialize lazily at their consumption point, so the eligible
+/// shapes never pay the extraction.
+#[derive(Clone)]
+pub enum WritePayload {
+    Bytes(bytes::Bytes),
+    Slot(std::sync::Arc<ZcWriteSlot>),
+}
+
+impl From<bytes::Bytes> for WritePayload {
+    fn from(b: bytes::Bytes) -> Self {
+        WritePayload::Bytes(b)
+    }
+}
+
+impl WritePayload {
+    pub fn len(&self) -> usize {
+        match self {
+            WritePayload::Bytes(b) => b.len(),
+            WritePayload::Slot(z) => z.len() as usize,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The slot source, when this payload is one (the patch path's
+    /// direct-leg input).
+    pub fn slot(&self) -> Option<&std::sync::Arc<ZcWriteSlot>> {
+        match self {
+            WritePayload::Bytes(_) => None,
+            WritePayload::Slot(z) => Some(z),
+        }
+    }
+
+    /// The payload bytes — zero-cost for the Bytes form, the memoized
+    /// extraction for the slot form.
+    pub async fn materialize(&self) -> std::io::Result<bytes::Bytes> {
+        match self {
+            WritePayload::Bytes(b) => Ok(b.clone()),
+            WritePayload::Slot(z) => z.materialize().await,
+        }
+    }
+}
+
 /// A block fill's provenance at the validated fill site
 /// (`get_cached_or_fetch_block_traced`) — the transient stream window's
 /// dispatch input (2026-07-29):

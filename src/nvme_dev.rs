@@ -1053,6 +1053,10 @@ pub struct NvmeBlockDev {
     /// lifetimes, not queues. `None` cached on open failure (the zc leg
     /// falls through to the ordinary ladder). Shared across clones.
     zc_fd: Arc<std::sync::OnceLock<Option<std::os::fd::OwnedFd>>>,
+    /// The D14 write-side direct-leg fd (`O_DIRECT | O_WRONLY`), opened
+    /// lazily like [`Self::zc_fd`]; `None` on refusal — the direct
+    /// store leg falls back to the extraction vehicle, loudly once.
+    zc_wfd: Arc<std::sync::OnceLock<Option<std::os::fd::OwnedFd>>>,
 }
 
 /// Capacity in bytes of a backing file OR block device (seek-to-end works
@@ -1129,6 +1133,7 @@ impl NvmeBlockDev {
             lane: Arc::new(tokio::sync::OnceCell::new()),
             fence: Arc::new(DeviceFence::new()),
             zc_fd: Arc::new(std::sync::OnceLock::new()),
+            zc_wfd: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -1160,6 +1165,48 @@ impl NvmeBlockDev {
             })
             .as_ref()
             .map(|fd| fd.as_raw_fd())
+    }
+
+    /// The D14 write-side direct-leg fd (`O_DIRECT | O_WRONLY`, opened
+    /// lazily like [`Self::zc_read_fd`]): the transport ring's
+    /// `WRITE_FIXED(device fd ← slot)` names it. `None` on refusal —
+    /// the direct store leg falls back to the extraction vehicle,
+    /// loudly once per device.
+    pub fn zc_write_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        use std::os::fd::AsRawFd;
+        self.zc_wfd
+            .get_or_init(|| {
+                let mut opts = std::fs::OpenOptions::new();
+                opts.write(true);
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    opts.custom_flags(libc::O_DIRECT);
+                }
+                match opts.open(&self.device_path) {
+                    Ok(f) => Some(std::os::fd::OwnedFd::from(f)),
+                    Err(e) => {
+                        log::warn!(
+                            "zc write fd open failed for {:?} ({e}) — the D14 direct \
+                             store leg stays cold on this device (extraction serves)",
+                            self.device_path
+                        );
+                        None
+                    }
+                }
+            })
+            .as_ref()
+            .map(|fd| fd.as_raw_fd())
+    }
+
+    /// RES-6/S7 authorization for a D14 direct slot→device store: the
+    /// transport ring's `WRITE_FIXED` bypasses [`Self::write_block`]'s
+    /// worker, so the SAME submit gate must run here — the D0 latch
+    /// probe (poisons process custody on first observation) followed by
+    /// THE authorization point (`data_custody::authorize_dma`, which
+    /// owns the refusal/classification/counting). Called strictly
+    /// before every direct store submission.
+    pub fn authorize_zc_store(&self) -> Result<()> {
+        self.fence_gate(None)
     }
 
     /// Grow the READ submission pool to `n` lanes (see [`read_lanes_for`]

@@ -18,8 +18,9 @@ pub use connection::fuse_over_uring::{
 };
 #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
 pub use connection::kmbuf::{
-    kmbuf_negotiated, zc_fallbacks, zc_negotiated, zc_replies, zc_slot_payload_skips,
-    zc_write_direct_bytes, zc_write_directs, zc_write_extract_bytes, zc_write_extractions,
+    kmbuf_negotiated, note_zc_write_direct, zc_fallbacks, zc_negotiated, zc_replies,
+    zc_slot_payload_skips, zc_write_direct_bytes, zc_write_directs, zc_write_extract_bytes,
+    zc_write_extractions,
 };
 pub use filesystem::Filesystem;
 use futures_util::future::Either;

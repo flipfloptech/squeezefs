@@ -261,22 +261,94 @@ pub(crate) enum ZcPend {
         len: u32,
     },
     /// A handler-initiated device fetch (`READ_FIXED(device → slot)`,
-    /// the direct leg): the handler task parks on the oneshot; the CQE
-    /// result is forwarded verbatim (`res` — negative errno, or bytes
-    /// read). The slot's reply commit comes LATER via the normal path.
+    /// the direct read leg): the handler task parks on the oneshot; the
+    /// CQE result is forwarded verbatim (`res` — negative errno, or
+    /// bytes read). The slot's reply commit comes LATER via the normal
+    /// path.
     HandlerFetch {
         done: tokio::sync::oneshot::Sender<i32>,
     },
-    /// A WRITE payload extraction (`WRITE_FIXED(slot → memfd)`): the
-    /// delivered request is held back until its payload bytes exist in
-    /// the bounce; on completion the inbound push happens with a §5.4
-    /// lease over the bounce slot.
-    WriteExtract {
-        header_and_op: Vec<u8>,
-        unique: u64,
-        commit_id: u64,
+    /// A handler-initiated device STORE (`WRITE_FIXED(device fd ←
+    /// slot)`, the D14 write-side direct leg): the WRITE payload's
+    /// registered pages DMA straight to the device — zero daemon
+    /// copies, no extraction. The CQE result is forwarded verbatim;
+    /// full-length success counts the `fuse3_zc_write_directs` ledger
+    /// AT THE CONSUMING SITE (the root patch path), never here, so a
+    /// caller-side validation failure can never leave a phantom count.
+    HandlerStore {
+        done: tokio::sync::oneshot::Sender<i32>,
+    },
+    /// A handler-requested LAZY payload extraction (`WRITE_FIXED(slot →
+    /// memfd)`, dispatch-before-extraction): the delivered request was
+    /// dispatched with its payload HELD in the slot; an ineligible
+    /// shape materializes it here — the CQE mints the §5.4 lease over
+    /// the bounce slot and answers the oneshot.
+    LazyExtract {
+        done: tokio::sync::oneshot::Sender<io::Result<bytes::Bytes>>,
         len: u32,
     },
+}
+
+/// The held-payload table (D14 write-side leg): one cell per
+/// `(qid, ent)`, `nqueues × depth`, 0 = nothing held (a held length is
+/// always > 0 — the delivery only holds payload-carrying WRITEs).
+///
+/// Lifecycle: SET at an armed WRITE's delivery (the payload stays in
+/// the sparse slot — never extracted at delivery), READ by the
+/// session's size validation and the handler's slot-source mint,
+/// CLEARED by a completed extraction and OVERWRITTEN by the ent's next
+/// delivery. Queries only ever race their own request's window: the
+/// handler runs strictly before its reply, the reply strictly before
+/// the ent's COMMIT, and the next delivery (the only re-pointing write)
+/// strictly after that commit.
+pub struct ZcHeldTable {
+    cells: Vec<std::sync::atomic::AtomicU32>,
+    depth: usize,
+}
+
+impl ZcHeldTable {
+    pub fn new(nqueues: usize, depth: usize) -> Self {
+        Self {
+            cells: (0..nqueues * depth)
+                .map(|_| std::sync::atomic::AtomicU32::new(0))
+                .collect(),
+            depth,
+        }
+    }
+
+    fn cell(&self, qid: u16, ent_idx: usize) -> Option<&std::sync::atomic::AtomicU32> {
+        if ent_idx >= self.depth {
+            return None;
+        }
+        self.cells.get(qid as usize * self.depth + ent_idx)
+    }
+
+    /// Publish `len` bytes held in `(qid, ent)`'s slot (0 clears).
+    /// Out-of-range coordinates are a loud no-op, never a panic.
+    pub fn set(&self, qid: u16, ent_idx: usize, len: u32) {
+        match self.cell(qid, ent_idx) {
+            Some(c) => c.store(len, std::sync::atomic::Ordering::Release),
+            None => {
+                tracing::warn!("zc held table: set({qid}, {ent_idx}) out of range — ignored");
+            }
+        }
+    }
+
+    /// Clear `(qid, ent)`'s held payload (extraction completed).
+    pub fn clear(&self, qid: u16, ent_idx: usize) {
+        if let Some(c) = self.cell(qid, ent_idx) {
+            c.store(0, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// The held payload length, `None` when nothing is held (or the
+    /// coordinates are out of range).
+    pub fn get(&self, qid: u16, ent_idx: usize) -> Option<u32> {
+        let len = self
+            .cell(qid, ent_idx)?
+            .load(std::sync::atomic::Ordering::Acquire);
+        (len > 0).then_some(len)
+    }
 }
 
 #[cfg(test)]

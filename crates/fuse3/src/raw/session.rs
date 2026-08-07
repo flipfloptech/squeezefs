@@ -2833,16 +2833,34 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             // kernel fills payload_sz from the same request).
             Some(p) => {
                 if write_in.size as usize != p.len() {
-                    error!(
-                        "fuse_write_in size {} != uring payload len {}",
-                        write_in.size,
-                        p.len()
-                    );
+                    // D14 held-slot delivery (dispatch-before-extraction):
+                    // on a zc-armed session the WRITE payload stays in
+                    // the transport's SPARSE SLOT — the placeholder here
+                    // is empty and the connection's held table carries
+                    // the authoritative length, which must agree with
+                    // the header. The filesystem consumes the payload
+                    // via the connection's slot source (store/extract).
+                    // Every other mismatch stays the EINVAL it always
+                    // was.
+                    #[cfg(target_os = "linux")]
+                    let held = p.is_empty()
+                        && self.fuse_connection.as_ref().is_some_and(|c| {
+                            c.zc_write_held_len(request.slot) == Some(write_in.size)
+                        });
+                    #[cfg(not(target_os = "linux"))]
+                    let held = false;
+                    if !held {
+                        error!(
+                            "fuse_write_in size {} != uring payload len {}",
+                            write_in.size,
+                            p.len()
+                        );
 
-                    reply_error_in_place(libc::EINVAL.into(), request, self.reply_tx(&request))
-                        .await;
+                        reply_error_in_place(libc::EINVAL.into(), request, self.reply_tx(&request))
+                            .await;
 
-                    return;
+                        return;
+                    }
                 }
 
                 p

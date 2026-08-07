@@ -259,9 +259,8 @@ impl FakeSlot {
                     }
                     // O_DIRECT-aligned scratch (the live slot pages are
                     // page-aligned user pages).
-                    let layout =
-                        std::alloc::Layout::from_size_align(payload.len().max(1), 4096)
-                            .expect("layout");
+                    let layout = std::alloc::Layout::from_size_align(payload.len().max(1), 4096)
+                        .expect("layout");
                     // SAFETY: nonzero aligned allocation, freed below.
                     let buf = unsafe { std::alloc::alloc(layout) };
                     assert!(!buf.is_null());
@@ -272,12 +271,7 @@ impl FakeSlot {
                     // SAFETY: fd is the patch-resolved device write fd;
                     // buf holds payload.len() initialized bytes.
                     let n = unsafe {
-                        libc::pwrite(
-                            fd,
-                            buf.cast(),
-                            payload.len(),
-                            dev_off as libc::off_t,
-                        )
+                        libc::pwrite(fd, buf.cast(), payload.len(), dev_off as libc::off_t)
                     };
                     // SAFETY: allocated with this layout above.
                     unsafe { std::alloc::dealloc(buf, layout) };

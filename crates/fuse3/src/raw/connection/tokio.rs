@@ -405,6 +405,50 @@ impl FuseConnection {
         pool.zc_device_fetch(slot, fd, off, len).await
     }
 
+    /// D14 write-side: the HELD WRITE-payload length of `slot`'s
+    /// request (`Some(len)` ⇒ the payload sits in the transport's
+    /// sparse slot, consumable via [`Self::zc_write_store`] /
+    /// [`Self::zc_write_extract`]) — see
+    /// [`super::fuse_over_uring::FuseOverUring::zc_write_held_len`].
+    #[cfg(target_os = "linux")]
+    pub fn zc_write_held_len(&self, slot: crate::raw::ReplySlot) -> Option<u32> {
+        self.over_uring.get()?.zc_write_held_len(slot)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn zc_write_held_len(&self, _slot: crate::raw::ReplySlot) -> Option<u32> {
+        None
+    }
+
+    /// D14 write-side direct leg: DMA the request's held WRITE payload
+    /// slot→device — see
+    /// [`super::fuse_over_uring::FuseOverUring::zc_write_store`].
+    #[cfg(target_os = "linux")]
+    pub async fn zc_write_store(
+        &self,
+        slot: crate::raw::ReplySlot,
+        fd: std::os::fd::RawFd,
+        dev_off: u64,
+    ) -> io::Result<u32> {
+        let pool = self
+            .over_uring
+            .get()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no over-uring pool"))?;
+        pool.zc_write_store(slot, fd, dev_off).await
+    }
+
+    /// D14 write-side lazy extraction: materialize the request's held
+    /// WRITE payload as a §5.4 lease over the bounce — see
+    /// [`super::fuse_over_uring::FuseOverUring::zc_write_extract`].
+    #[cfg(target_os = "linux")]
+    pub async fn zc_write_extract(&self, slot: crate::raw::ReplySlot) -> io::Result<Bytes> {
+        let pool = self
+            .over_uring
+            .get()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no over-uring pool"))?;
+        pool.zc_write_extract(slot).await
+    }
+
     /// Commit a reply whose payload already sits in the request's pages
     /// (the zc direct leg) — see
     /// [`super::fuse_over_uring::FuseOverUring::submit_reply_prefilled`].
@@ -739,9 +783,13 @@ impl FuseConnection {
                     self.last_write_arrival_ns
                         .store(inbound.arrived_ns, std::sync::atomic::Ordering::Relaxed);
                 }
+                // D14: held-slot WRITE deliveries carry an EMPTY
+                // placeholder payload (the body stays in the sparse
+                // slot), so the fast arm keys on the header shape alone
+                // — a 0-size WRITE takes it too (empty payload, size 0:
+                // the session validation is a tautology there).
                 if opcode == crate::raw::abi::fuse_opcode::FUSE_WRITE as u32
                     && body_need >= FUSE_WRITE_IN_SIZE
-                    && !payload.is_empty()
                 {
                     let n = FUSE_WRITE_IN_SIZE.min(op_in.len()).min(data_buf.len());
                     data_buf[..n].copy_from_slice(&op_in[..n]);

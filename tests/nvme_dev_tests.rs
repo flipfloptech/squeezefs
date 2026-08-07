@@ -504,34 +504,243 @@ fn read_bounce_pool_routing_and_home_recycle() {
 }
 
 // ---------------------------------------------------------------------------
-// Read-lane fan-out (2026-08-06 read-queue-wall campaign): ONE submitting
-// thread per device = ONE blk-mq software queue = ONE nvme-tcp connection
-// = ONE RX softirq core per device — the ~2.7 GB/s/core read-copy wall
-// the flat field D-ladder rode (~22 GB/s over 8 namespaces at ANY pinned
-// depth; local written-region discriminator: 1 submitter/dev qd16 = 11.5
-// GB/s, qd32 = 12.1 — depth through one queue buys ~nothing — while 4
-// submitters/dev at the SAME in-flight = 16.7, and 8 = 17.7). Writes
-// escape it (nvme-tcp TX is zero-copy spliced — 34 GB/s through the same
-// single workers), which is exactly why the read plane needs the fan-out
-// and the write plane keeps worker 0 (ordering/barrier reasoning
-// unchanged). The lane count DERIVES: cpus / data devices, floor 1,
-// self-bounded by cpus (never a constant); explicit
-// SQUEEZEFS_NVME_READ_LANES wins verbatim.
+// I/O-lane fan-out. Reads (2026-08-06 read-queue-wall campaign): ONE
+// submitting thread per device = ONE blk-mq software queue = ONE nvme-tcp
+// connection = ONE RX softirq core per device — the ~2.7 GB/s/core
+// read-copy wall the flat field D-ladder rode (~22 GB/s over 8 namespaces
+// at ANY pinned depth; local written-region discriminator: 1 submitter/dev
+// qd16 = 11.5 GB/s, qd32 = 12.1 — depth through one queue buys ~nothing —
+// while 4 submitters/dev at the SAME in-flight = 16.7, and 8 = 17.7).
+// Writes (2026-08-07 write-lane-fanout campaign): the read campaign's
+// "writes escape it" held only up to the TX splice's higher per-connection
+// ceiling — the field decomposition walls kernel seq writes at 35.31 GB/s
+// = 7.06 GB/s × 5 data namespaces (`write_pipeline_phase_ns` dma mode
+// 2–8 ms, interior µs-clean; depth probes 20 up = 20 backoffs — depth into
+// a per-connection wall converts nothing) while raw fio reaches 49.7 GB/s
+// on the SAME namespaces by spreading queues. So DATA WRITES fan out too,
+// with LANE AFFINITY BY BLOCK OFFSET (same block → same lane → same
+// submission FIFO → same connection: exactly the per-offset submission
+// order the single worker provided), and the DUR-2 barrier drains EVERY
+// lane's write watermark before the device flush issues. The lane count
+// DERIVES: cpus / data devices, floor 1, self-bounded by cpus (never a
+// constant); explicit SQUEEZEFS_NVME_READ_LANES /
+// SQUEEZEFS_NVME_WRITE_LANES win verbatim (1 = the pre-change posture,
+// the A/B lever).
 // ---------------------------------------------------------------------------
 
 #[test]
-fn read_lanes_derivation_table() {
-    use squeezefs::nvme_dev::read_lanes_for;
-    // The field shape: 32 CPUs / 8 data namespaces => 4 submitting
+fn io_lanes_derivation_table() {
+    use squeezefs::nvme_dev::io_lanes_for;
+    // The read field shape: 32 CPUs / 8 data namespaces => 4 submitting
     // threads (nvme-tcp queues) per device.
-    assert_eq!(read_lanes_for(32, 8), 4);
+    assert_eq!(io_lanes_for(32, 8), 4);
+    // The WRITE field shape (2026-08-07 decomposition): 32 CPUs / 5 data
+    // namespaces => 6 submitting threads per device.
+    assert_eq!(io_lanes_for(32, 5), 6);
     // The local devsub: 32 / 4 => 8.
-    assert_eq!(read_lanes_for(32, 4), 8);
+    assert_eq!(io_lanes_for(32, 4), 8);
     // Self-bounding: one device may use every CPU (the raw row's shape);
     // more devices than CPUs floors at 1 (never zero).
-    assert_eq!(read_lanes_for(32, 1), 32);
-    assert_eq!(read_lanes_for(4, 8), 1);
-    assert_eq!(read_lanes_for(0, 0), 1, "degenerate inputs floor at 1");
+    assert_eq!(io_lanes_for(32, 1), 32);
+    assert_eq!(io_lanes_for(4, 8), 1);
+    assert_eq!(io_lanes_for(0, 0), 1, "degenerate inputs floor at 1");
+}
+
+// ---------------------------------------------------------------------------
+// Write-lane affinity: the lane pick is a PURE function of the block
+// offset — `(offset / grain) % lanes` — so two DMAs naming the same
+// device offset (supersession / in-place / W1 patch shapes) ride the
+// same lane, the same channel FIFO and the same connection, preserving
+// the per-offset submission order the single worker gave structurally.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn write_lane_affinity_is_pure_and_block_stable() {
+    use squeezefs::nvme_dev::write_lane_index;
+    let grain = 4 * 1024 * 1024u64; // the shipped block size
+    let lanes = 6; // the 32-cpu / 5-namespace field derivation
+
+    // Same offset → same lane, always (per-offset ordering).
+    for off in [0u64, 4096, grain - 4096, grain, 7 * grain + 8192] {
+        assert_eq!(
+            write_lane_index(off, grain, lanes),
+            write_lane_index(off, grain, lanes),
+            "the pick must be pure"
+        );
+    }
+    // Same BLOCK → same lane: a whole-block write at the block start and
+    // a W1 sub-block patch inside it must not reorder across lanes.
+    for block in 0..64u64 {
+        let base = write_lane_index(block * grain, grain, lanes);
+        for rel in [0u64, 4096, 512 * 1024, grain - 4096] {
+            assert_eq!(
+                write_lane_index(block * grain + rel, grain, lanes),
+                base,
+                "block {block} rel {rel} must stay on its block's lane"
+            );
+        }
+    }
+    // Consecutive blocks SPREAD: the whole point of the fan-out.
+    let mut seen = std::collections::HashSet::new();
+    for block in 0..lanes as u64 {
+        seen.insert(write_lane_index(block * grain, grain, lanes));
+    }
+    assert_eq!(seen.len(), lanes, "streaming blocks must cover every lane");
+    // Degenerate inputs never panic and land on lane 0.
+    assert_eq!(write_lane_index(123, 0, 4), write_lane_index(123, 1, 4));
+    assert_eq!(write_lane_index(u64::MAX, grain, 1), 0);
+    assert_eq!(write_lane_index(42, grain, 0), 0);
+}
+
+#[tokio::test]
+async fn write_lane_pool_spreads_by_offset_and_stays_byte_exact() {
+    let _serial = serial().await;
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path().to_path_buf();
+    File::create(&path)
+        .unwrap()
+        .set_len(64 * 1024 * 1024)
+        .unwrap();
+
+    let dev = std::sync::Arc::new(NvmeBlockDev::new(path.to_str().unwrap()));
+    assert_eq!(
+        dev.write_lanes(),
+        1,
+        "default = the pre-change single-worker posture"
+    );
+
+    let grain = 1024 * 1024u64;
+    dev.set_write_lanes(4, grain);
+    assert_eq!(dev.write_lanes(), 4);
+    dev.set_write_lanes(2, grain);
+    assert_eq!(dev.write_lanes(), 4, "lane count only grows (monotone)");
+
+    // 8 block writes at 1 MiB stride: affinity says block b rides lane
+    // b % 4, so each lane's submit counter moves by exactly 2.
+    let before: Vec<u64> = dev
+        .write_lane_watermarks()
+        .iter()
+        .map(|(s, _)| *s)
+        .collect();
+    for b in 0..8u64 {
+        let data = vec![b as u8 + 1; grain as usize];
+        dev.write_block(b * grain, bytes::Bytes::from(data))
+            .await
+            .unwrap();
+    }
+    let after: Vec<u64> = dev
+        .write_lane_watermarks()
+        .iter()
+        .map(|(s, _)| *s)
+        .collect();
+    for lane in 0..4 {
+        assert_eq!(
+            after[lane] - before.get(lane).copied().unwrap_or(0),
+            2,
+            "lane {lane} must carry exactly its residue class (blocks {lane} and {})",
+            lane + 4
+        );
+    }
+
+    // Two more writes to the SAME block land on ONE lane (affinity, not
+    // round-robin): only block 5's lane (5 % 4 = 1) moves.
+    let before: Vec<u64> = dev
+        .write_lane_watermarks()
+        .iter()
+        .map(|(s, _)| *s)
+        .collect();
+    for _ in 0..2 {
+        dev.write_block(5 * grain, bytes::Bytes::from(vec![0xEEu8; grain as usize]))
+            .await
+            .unwrap();
+    }
+    let after: Vec<u64> = dev
+        .write_lane_watermarks()
+        .iter()
+        .map(|(s, _)| *s)
+        .collect();
+    for lane in 0..4 {
+        let delta = after[lane] - before[lane];
+        if lane == 1 {
+            assert_eq!(delta, 2, "same block → same lane, every time");
+        } else {
+            assert_eq!(delta, 0, "no other lane may carry block 5");
+        }
+    }
+
+    // Byte parity across the whole span: every lane is a full citizen of
+    // the write contract.
+    dev.flush().await.unwrap();
+    for b in 0..8u64 {
+        let expect = if b == 5 { 0xEEu8 } else { b as u8 + 1 };
+        let got = dev.read_block(b * grain, grain as usize).await.unwrap();
+        assert!(
+            got.iter().all(|&x| x == expect),
+            "byte parity block {b}"
+        );
+    }
+    drop(dev);
+}
+
+// ---------------------------------------------------------------------------
+// DUR-2 flush ordering across lanes — THE red contract of the write
+// fan-out: a flush must not complete before a write submitted to a
+// DIFFERENT lane has completed at the device. The drain is a per-lane
+// completion watermark captured at barrier start; without it the Fsync
+// on lane 0 races a stalled write on lane 3 and "everything written
+// before the barrier started" silently stops being true.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flush_completes_no_earlier_than_writes_on_every_lane() {
+    let _serial = serial().await;
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path().to_path_buf();
+    File::create(&path)
+        .unwrap()
+        .set_len(16 * 1024 * 1024)
+        .unwrap();
+
+    let dev = std::sync::Arc::new(NvmeBlockDev::new(path.to_str().unwrap()));
+    let grain = 1024 * 1024u64;
+    dev.set_write_lanes(4, grain);
+
+    // The worker-side stall stands in for a slow fabric DMA on lane 3
+    // (the deterministic device-order seam — the set_test_read_stall
+    // precedent): the write is SUBMITTED (watermark moves) but does not
+    // complete for 800 ms.
+    squeezefs::nvme_dev::set_test_write_stall(1, 800);
+
+    let payload = bytes::Bytes::from(vec![0xABu8; grain as usize]);
+    let write_dev = dev.clone();
+    let flush_dev = dev.clone();
+    // join! polls in order: the write future's FIRST poll runs its
+    // submission synchronously (watermark bumped, request in lane 3's
+    // channel) before the flush future is ever polled — "submitted
+    // before the barrier started" holds by construction, no sleeps.
+    let (write_res, marks_at_flush_return) = tokio::join!(
+        async move { write_dev.write_block(3 * grain, payload).await },
+        async move {
+            flush_dev.flush().await.expect("flush must succeed");
+            flush_dev.write_lane_watermarks()
+        }
+    );
+    write_res.expect("the stalled write must land");
+
+    let (submitted, completed) = marks_at_flush_return[3];
+    assert_eq!(submitted, 1, "the write rode lane 3 (offset affinity)");
+    assert_eq!(
+        completed, submitted,
+        "DUR-2: the barrier returned while a write submitted before it \
+         started was still in flight on another lane — the flush covered \
+         nothing for that block"
+    );
+
+    // And the barrier really did cover it: the bytes are on the device.
+    let got = dev.read_block(3 * grain, grain as usize).await.unwrap();
+    assert!(got.iter().all(|&x| x == 0xAB), "post-barrier byte parity");
+    squeezefs::nvme_dev::set_test_write_stall(0, 0);
+    drop(dev);
 }
 
 #[tokio::test]

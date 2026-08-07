@@ -158,6 +158,44 @@ fn fenced_dma_refusal_is_a_fence_drop_not_a_retry() {
     );
 }
 
+/// Write-lane fan-out (2026-08-07): the fence gate runs PER SUBMISSION
+/// in `write_block`/`write_block_authorized` BEFORE the lane pick, so it
+/// is lane-independent by construction — a fenced device refuses a write
+/// on every offset class (every lane) and no refused write ever reaches
+/// a lane's submission channel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fenced_device_refuses_writes_on_every_lane() {
+    let _serial = serial();
+    let _poison = PoisonGuard;
+    let (_f, dev) = backing();
+    let grain = 1024 * 1024u64;
+    dev.set_write_lanes(4, grain);
+    dev.set_fence_signal(Arc::new(|| true));
+
+    let marks_before = dev.write_lane_watermarks();
+    let before = refusals();
+    for lane in 0..4u64 {
+        let err = dev
+            .write_block(lane * grain, bytes::Bytes::from(vec![0x5Au8; 4096]))
+            .await
+            .expect_err("every lane's offset class must refuse while fenced");
+        assert!(
+            matches!(err, SqueezefsError::WriterGuardFenced),
+            "lane {lane}: the refusal must be loud and classifiable"
+        );
+    }
+    assert_eq!(
+        refusals(),
+        before + 4,
+        "every refusal counts in data_dma_fence_refusals, lane-independent"
+    );
+    let marks_after = dev.write_lane_watermarks();
+    assert_eq!(
+        marks_before, marks_after,
+        "a refused write must never reach a lane's submission channel"
+    );
+}
+
 /// The fence signal is shared across clones — one device, one latch,
 /// however many handles the router holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

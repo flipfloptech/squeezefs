@@ -642,6 +642,89 @@ mod tests {
         assert!(l.overdue(u64::MAX, 0).is_empty());
     }
 
+    /// The EALREADY re-arm (lost-CQE resolution ladder): a re-stamp on a
+    /// LIVE pend must reset the cancel-once latch and restart the
+    /// deadline WITHOUT double-counting the pend — the worker re-stamps
+    /// when the kernel answers a cancel with "still running", so the
+    /// scan re-fires (and re-logs, loud) every timeout period until the
+    /// op resolves, instead of going silent after the first cancel.
+    #[test]
+    fn test_bridge_deadline_restamp_rearms_cancelled_pend() {
+        let mut l = BridgeDeadlines::new(2);
+        assert!(l.stamp(0, 100), "first stamp is fresh");
+        assert_eq!(l.overdue(1_000, 500), vec![0]);
+        assert!(l.overdue(2_000, 500).is_empty(), "cancel-once latched");
+        // The kernel said -EALREADY: re-stamp restarts the clock.
+        assert!(
+            !l.stamp(0, 2_000),
+            "a re-stamp on a live pend is NOT fresh (no gauge double-count)"
+        );
+        assert_eq!(l.outstanding(), 1, "re-stamp must not double-count");
+        assert!(
+            l.overdue(2_400, 500).is_empty(),
+            "the re-stamped pend runs a FRESH deadline"
+        );
+        assert_eq!(
+            l.overdue(2_500, 500),
+            vec![0],
+            "the re-stamped pend re-fires after another full timeout"
+        );
+        assert!(l.clear(0), "still one live pend to clear");
+        assert_eq!(l.outstanding(), 0);
+    }
+
+    /// The lost-CQE resolution ladder's decision core (zc-bridge-cqe-
+    /// wedge campaign): what a bridge-deadline `AsyncCancel`'s OWN CQE
+    /// means, given whether the original op's pend is still live.
+    ///
+    /// * `0` (found + canceled): the original op's `-ECANCELED` CQE is
+    ///   coming — keep waiting, it resolves the pend.
+    /// * `-ENOENT` with the pend LIVE: the kernel has NO such op in
+    ///   flight, so its completion was already POSTED — and the CQ is
+    ///   FIFO, so that CQE precedes this cancel CQE. A live pend here
+    ///   PROVES the completion was lost (the zcws-9 class): synthesize
+    ///   the resolution — safe exactly because no kernel op still
+    ///   references the slot.
+    /// * `-EALREADY` (or anything else) with the pend live: the op is
+    ///   still RUNNING kernel-side and cannot be stopped from userspace.
+    ///   Synthesizing here would let a late kernel DMA alias a recycled
+    ///   slot/bounce — re-stamp instead (loud every period, the slot
+    ///   stays watchdog-named; only a kernel fix closes this class).
+    /// * Any cancel CQE with the pend GONE: the original resolved in
+    ///   this or an earlier batch — nothing to do.
+    #[test]
+    fn test_cancel_cqe_action_ladder() {
+        // Pend live.
+        assert_eq!(
+            cancel_cqe_action(0, true),
+            CancelCqeAction::AwaitOriginal,
+            "found+canceled: the original -ECANCELED CQE resolves it"
+        );
+        assert_eq!(
+            cancel_cqe_action(-libc::ENOENT, true),
+            CancelCqeAction::SynthesizeLost,
+            "ENOENT with a live pend is the PROVEN lost-CQE shape"
+        );
+        assert_eq!(
+            cancel_cqe_action(-libc::EALREADY, true),
+            CancelCqeAction::Restamp,
+            "EALREADY: the op is still running — re-arm the deadline"
+        );
+        assert_eq!(
+            cancel_cqe_action(-libc::EINVAL, true),
+            CancelCqeAction::Restamp,
+            "unknown cancel errno degrades to the conservative arm"
+        );
+        // Pend already resolved — every result class is a no-op.
+        for res in [0, -libc::ENOENT, -libc::EALREADY, -libc::EINVAL] {
+            assert_eq!(
+                cancel_cqe_action(res, false),
+                CancelCqeAction::Nothing,
+                "res={res}: a resolved pend owes nothing"
+            );
+        }
+    }
+
     /// The bounce arena is real dual-face memory: bytes written by VA
     /// are readable through the FD (the ring's view) and vice versa —
     /// runs on ANY kernel (memfd + mmap only, no uring surface).

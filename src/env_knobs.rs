@@ -193,6 +193,7 @@ pub static KNOBS: &[Knob] = &[
     k("SQUEEZEFS_FUSE_KMBUF", Kind::Bool, "on", "kmbuf reply-buffer negotiation; 0 = the A/B control."),
     k("SQUEEZEFS_FUSE_ZC", Kind::Bool, "off", "FUSE_URING_ZERO_COPY serve integration (K1 kill; sqz kernel + CAP_SYS_ADMIN required — declines loud elsewhere)."),
     k("SQUEEZEFS_ZC_BRIDGE_TIMEOUT_MS", int(100, 600_000), "30000", "zc bridge-op deadline, ms (the bounded-outcome law): past it the worker pushes AsyncCancel and the op's CQE resolves through the loud fallback ladders (fuse3_zc_bridge_cancels)."),
+    k("SQUEEZEFS_TEST_ZC_DROP_WRITE_CQES", int(0, 1_000_000), "0", "Test seam: the zc worker consumes-and-drops the first N WRITE-class bridge CQEs (pend + deadline stay live) — the deterministic lost-CQE interleave of the zcws-9 W4 wedge. Never set in production."),
     k("SQUEEZEFS_FUSE_NO_KILLPRIV", Kind::Bool, "off", "TESTING escape: refuse FUSE_HANDLE_KILLPRIV_V2 and restore the kernel's per-write GETXATTR probe."),
     k("SQUEEZEFS_FUSE_ATTR_TTL_MS", int(0, MS_MAX), "1000", "Kernel attribute-cache TTL, ms (-o attr_timeout overrides)."),
     k("SQUEEZEFS_FUSE_ENTRY_TTL_MS", int(0, MS_MAX), "1000", "Kernel dentry TTL, ms (-o entry_timeout overrides)."),

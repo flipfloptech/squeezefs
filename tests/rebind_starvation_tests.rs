@@ -355,7 +355,16 @@ async fn read_survives_stripe_free_displacement_storm_no_rebind_eio() {
 
     let _seam = SeamGuard::arm(SEAM_STRIPE_FREE_MS);
     let escalations_before = METRICS.stale_binding_escalations.load(Ordering::Relaxed);
-    for round in 0..3u32 {
+    // Engagement rounds: a fixed 3-round window flaked under load (a
+    // throttled box — Tctl ≥ 100 °C soak, ~2/8 — can stall the STORM's
+    // alloc/free cycle past the seam window inside a round, letting a
+    // ladder attempt see a stable binding and serve early; observed on
+    // BOTH read-mostly arms, 2026-08-08, so it is a venue sensitivity of
+    // the storm, not a product change). Rounds retry — bounded — until
+    // the settle arm engages; every round still pins the never-EIO and
+    // legal-generation halves verbatim.
+    let mut engaged = false;
+    for round in 0..12u32 {
         purge_read_tiers(&h, ino).await;
         // The read-path posture: escalate_contended = true (no caller-held
         // stripe) — exactly what the FUSE/ipc read handlers pass.
@@ -372,12 +381,18 @@ async fn read_survives_stripe_free_displacement_storm_no_rebind_eio() {
                 .expect("block {BLK} is mapped, never a hole");
         let published = gens.load(Ordering::Acquire);
         assert_legal_generation(&val, base_block, published, &format!("round {round}"));
+        if round >= 2
+            && METRICS.stale_binding_escalations.load(Ordering::Relaxed) > escalations_before
+        {
+            engaged = true;
+            break;
+        }
     }
-    let escalations_after = METRICS.stale_binding_escalations.load(Ordering::Relaxed);
     assert!(
-        escalations_after > escalations_before,
+        engaged,
         "the settle arm is the engagement the storm must have forced \
-         ({escalations_before} -> {escalations_after})"
+         within 12 seam-widened rounds (escalations stayed at \
+         {escalations_before})"
     );
 
     stop.store(true, Ordering::Release);

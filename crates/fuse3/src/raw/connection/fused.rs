@@ -278,10 +278,16 @@ pub(crate) fn fusion_ceiling(payload_sz: usize) -> u32 {
     (payload_sz / 8).max(4096) as u32
 }
 
-/// The fusion lever (`SQUEEZEFS_FUSE_ZC_WRITE_FUSION`, default ON): `0`
-/// is the A/B control that keeps the pre-campaign handler-lane dispatch
-/// byte-identically. Absent/malformed keeps the default (the transport
-/// lever law — the daemon's startup gate already refused a bad value).
+/// The fusion lever (`SQUEEZEFS_FUSE_ZC_WRITE_FUSION`, **default OFF** —
+/// field falsification 2026-08-08: at ~300 µs fabric RTT the fused lane's
+/// bounded future polling collapsed armed rand-4k writes to 0.45× vs the
+/// 0.78× fusion-off posture (386k unarmed / 300k fusion-off / 175k fused
+/// on squeeze-test), inverting the local +12 % bracket — the bounded-
+/// concurrency-times-fabric-RTT class. Default returns ON only when the
+/// fused lane is re-derived RTT-tolerant and proves itself on the
+/// fabric-emulated venue). `1` opts in; absent/malformed keeps the
+/// default (the transport lever law — the daemon's startup gate already
+/// refused a bad value).
 pub(crate) fn fusion_enabled() -> bool {
     crate::env_knob_core::parse_bool(
         "SQUEEZEFS_FUSE_ZC_WRITE_FUSION",
@@ -291,7 +297,7 @@ pub(crate) fn fusion_enabled() -> bool {
     )
     .ok()
     .flatten()
-    .unwrap_or(true)
+    .unwrap_or(false)
 }
 
 /// A registered fused-write dispatcher: the session's mint (builds the

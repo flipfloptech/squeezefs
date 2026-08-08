@@ -316,7 +316,11 @@ create_nullb() { # name gb cache_mb [delay_ns] -> echoes /dev path
         # holds 2 k per device, ≫ any offered depth in the rigs.
         echo "$delay_ns" >"$d/completion_nsec"
         echo 2 >"$d/irqmode"
-        echo 8 >"$d/submit_queues" 2>/dev/null || true
+        # 32 submit queues: timer-mode completions fire per-queue hrtimer
+        # contexts — 8 queues capped the BACKING at ~823 k completions/s
+        # at depth (measured direct, r5 calibration), masquerading as
+        # fabric queueing.
+        echo 32 >"$d/submit_queues" 2>/dev/null || true
         echo 256 >"$d/hw_queue_depth" 2>/dev/null || true
     else
         echo 0 >"$d/completion_nsec"

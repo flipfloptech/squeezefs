@@ -180,31 +180,21 @@ fn dd_eager_flush_from(v: Option<&str>) -> Option<u32> {
         .map(|n| n.clamp(0, RING_ENTRIES))
 }
 
-/// The un-issued tail's pipeline share: the derived eager threshold is
-/// `kernel_inflight / 8` (floor 1), so SQEs waiting on an enter are
-/// bounded to an EIGHTH of the lane's live device pipeline — the device
-/// would have to complete 7/8 of its in-flight inside one batch window
-/// before issue cadence could starve it (the liveness argument; no RTT
-/// estimate, no rate estimator, no circular Little's-law target).
-/// Counted basis: the r4 emu-venue eager sweep (RED sweep-only 847 k /
-/// E1 964 k / E16 1.009 M at 32×32 over ~310 µs emulated RTT) — the
-/// interior optimum trades per-op enter cost against issue delay, and
-/// this slope lands each regime on the measured-good side: cold or
-/// shallow lanes (inflight < 16) issue per-push (the latency regime,
-/// K = 1..2), deep lanes batch ~16..32 (the CPU-economy regime).
-/// Explicit `SQUEEZEFS_IPC_DD_EAGER_FLUSH` remains the measurement
-/// lever over this derivation.
-const DD_EAGER_PIPELINE_DIVISOR: u32 = 8;
-
-/// The issue-cadence law (r4): how many unflushed SQEs a lane may
-/// accumulate before it MUST enter. `explicit` wins verbatim
-/// (`Some(0)` = never mid-sweep — the pre-r4 A/B posture); derived =
-/// `max(kernel_inflight / 8, 1)`.
-fn dd_eager_threshold(explicit: Option<u32>, kernel_inflight: u32) -> u32 {
+/// The issue-cadence law after the r5 CALIBRATED re-adjudication:
+/// ABSENT/0 = sweep-only (the M3 submit-batch posture — one enter per
+/// drain sweep), explicit K wins verbatim. The r4 derived-adaptive arm
+/// (un-issued tail ≤ kernel_inflight/8) was FALSIFIED on the licensed
+/// venue (`.benchmarks/2026-08-08-iops-internal-time-r5.md` §calibration:
+/// sweep-only 955 k vs adaptive 822 k vs K=16 878 k at 32×32 over the
+/// calibrated ~316 µs operating point — every mid-sweep enter taxes the
+/// svc thread more than issue promptness pays once the sweep cadence
+/// itself is prompt; r4's +19 % was an artifact of its miscalibrated
+/// 2.5×-slow venue) and deleted per the no-dead-code law. The knob
+/// stays the counted measurement lever.
+fn dd_eager_threshold(explicit: Option<u32>) -> u32 {
     match explicit {
-        Some(0) => u32::MAX,
-        Some(k) => k,
-        None => (kernel_inflight / DD_EAGER_PIPELINE_DIVISOR).max(1),
+        Some(k) if k > 0 => k,
+        _ => u32::MAX,
     }
 }
 
@@ -722,7 +712,6 @@ impl DirectDriveEngine {
         let shard = &self.shards[lane];
 
         // Slab insert + SQE push under the ONE shard mutex.
-        let slab_inflight;
         {
             let mut st = shard
                 .state
@@ -777,24 +766,16 @@ impl DirectDriveEngine {
             }
             st.inflight[idx] = Some(pending);
             st.inflight_count += 1;
-            slab_inflight = st.inflight_count as u32;
         }
-        // The issue-cadence law (r4 lane-depth campaign): the SQE is
-        // published; it becomes KERNEL-visible either here (the eager
-        // enter) or at the sweep tail (`flush`). Pre-r4 the default was
-        // sweep-only — at fabric RTT that cadence, not demand, bounded
-        // the lane's device concurrency (the ~18-per-lane field
-        // arithmetic). Now the un-issued tail is bounded to 1/8 of the
-        // lane's LIVE pipeline (`dd_eager_threshold` — derived from
-        // in-flight demand, no constants): cold/shallow lanes issue
-        // per-push (latency regime), deep lanes batch ~16-32 SQEs per
-        // enter (CPU-economy regime — one enter per ~2 completions'
-        // worth of demand at the emu-venue optimum). Explicit
-        // `SQUEEZEFS_IPC_DD_EAGER_FLUSH` wins verbatim; `=0` is the
-        // pre-r4 sweep-only A/B lever.
+        // Issue cadence (r5 calibrated re-adjudication): sweep-only by
+        // default — the SQE becomes kernel-visible at the sweep tail
+        // (`flush`); every mid-sweep enter taxes the svc thread more
+        // than issue promptness pays once the sweep cadence is prompt
+        // (the r4 adaptive arm was falsified on the licensed venue).
+        // Explicit `SQUEEZEFS_IPC_DD_EAGER_FLUSH=K` remains the counted
+        // measurement lever.
         let pending = shard.pending_submits.fetch_add(1, Ordering::Release) + 1;
-        let kernel_inflight = slab_inflight.saturating_sub(pending);
-        if pending >= dd_eager_threshold(dd_eager_flush(), kernel_inflight) {
+        if pending >= dd_eager_threshold(dd_eager_flush()) {
             Self::flush_shard(lane, shard);
         }
         Ok(())
@@ -1232,9 +1213,13 @@ mod tests {
     /// sweep-only A/B posture, ABSENT = the derived adaptive threshold.
     #[test]
     fn dd_eager_flush_lever_parses_and_clamps() {
-        assert_eq!(dd_eager_flush_from(None), None, "absent = derived");
+        assert_eq!(dd_eager_flush_from(None), None, "absent = sweep-only");
         assert_eq!(dd_eager_flush_from(Some("4")), Some(4));
-        assert_eq!(dd_eager_flush_from(Some("0")), Some(0), "0 = sweep-only A/B");
+        assert_eq!(
+            dd_eager_flush_from(Some("0")),
+            Some(0),
+            "0 = sweep-only A/B"
+        );
         assert_eq!(
             dd_eager_flush_from(Some("999999")),
             Some(RING_ENTRIES),
@@ -1243,39 +1228,15 @@ mod tests {
         assert_eq!(dd_eager_flush_from(Some("garbage")), None);
     }
 
-    /// The issue-cadence derivation (r4): the un-issued tail is bounded
-    /// to 1/8 of the lane's live kernel pipeline, floor 1 — a cold lane
-    /// issues per-push (the latency regime), a deep lane batches, and
-    /// the bound scales with DEMAND (never a constant, never an RTT
-    /// estimator). Explicit levers win verbatim; `Some(0)` never
-    /// mid-sweep-enters.
+    /// The issue-cadence law after the r5 calibrated re-adjudication:
+    /// absent/0 = sweep-only (never mid-sweep — the shipped posture,
+    /// re-proven on the licensed venue), explicit K wins verbatim.
     #[test]
-    fn dd_eager_threshold_derivation() {
-        // Derived arm: floor 1 at zero/shallow inflight.
-        assert_eq!(dd_eager_threshold(None, 0), 1, "cold lane: per-push");
-        assert_eq!(dd_eager_threshold(None, 7), 1);
-        assert_eq!(dd_eager_threshold(None, 8), 1);
-        assert_eq!(dd_eager_threshold(None, 16), 2);
-        assert_eq!(dd_eager_threshold(None, 128), 16, "deep lane: batch");
-        assert_eq!(dd_eager_threshold(None, 256), 32);
-        // The liveness law pointwise: the un-issued tail can never be
-        // required to exceed the live pipeline (threshold ≤ inflight
-        // for any nonzero pipeline, so issue cadence cannot starve the
-        // device by more than the 1/8 share).
-        for infl in 1..=4096u32 {
-            let k = dd_eager_threshold(None, infl);
-            assert!(
-                k >= 1 && k <= infl.max(1),
-                "cadence law broken at inflight={infl}: k={k}"
-            );
-        }
-        // Explicit arms.
-        assert_eq!(dd_eager_threshold(Some(4), 4096), 4, "explicit wins");
-        assert_eq!(
-            dd_eager_threshold(Some(0), 4096),
-            u32::MAX,
-            "0 = sweep-only (never mid-sweep)"
-        );
+    fn dd_eager_threshold_law() {
+        assert_eq!(dd_eager_threshold(None), u32::MAX, "absent = sweep-only");
+        assert_eq!(dd_eager_threshold(Some(0)), u32::MAX, "0 = sweep-only");
+        assert_eq!(dd_eager_threshold(Some(4)), 4, "explicit wins verbatim");
+        assert_eq!(dd_eager_threshold(Some(16)), 16, "the K=16 measurement arm");
     }
 
     /// The service-lane pin wins over the fallback (the owner-partition

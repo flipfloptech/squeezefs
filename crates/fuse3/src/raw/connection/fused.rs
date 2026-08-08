@@ -308,6 +308,36 @@ pub struct FusedWriteDispatch {
     pub handle: tokio::runtime::Handle,
 }
 
+/// The zc-write HOLD gate (fused-lane-predicate campaign, 2026-08-08):
+/// `(ino, offset, len) → may this payload stay HELD in the sparse slot
+/// as a direct-consume candidate?` — the transport face of
+/// `Filesystem::zc_write_hold_eligible`. Called on the queue-worker
+/// thread once per armed WRITE delivery: must be cheap, sync,
+/// non-blocking, lock-free.
+pub type ZcHoldGate = Arc<dyn Fn(u64, u64, u32) -> bool + Send + Sync + 'static>;
+
+/// Count one LATE (handler-initiated lazy) extraction of a HELD write —
+/// the hold gate's staleness gauge (`fuse3_zc_write_lazy_extractions`):
+/// the delivery-time eligibility hint said hold, the handler's
+/// authoritative predicate then declined (racing overlay park, clone
+/// pin, custody move), so the payload extracted AFTER dispatch instead
+/// of at delivery. Bounded by construction (once per request, the
+/// memoized materialize); **≈ 0 in steady state** — sustained growth
+/// means the delivery-time probe drifted from the handler's ladder (the
+/// field-falsification class re-forming).
+pub fn note_zc_write_lazy_extraction() {
+    ZC_WRITE_LAZY_EXTRACTIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `fuse3_zc_write_lazy_extractions` (stats inode): see
+/// [`note_zc_write_lazy_extraction`].
+pub fn zc_write_lazy_extractions() -> u64 {
+    ZC_WRITE_LAZY_EXTRACTIONS.load(Ordering::Relaxed)
+}
+
+static ZC_WRITE_LAZY_EXTRACTIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Count one fused dispatch + its payload bytes (the engagement pair —
 /// `fuse3_zc_write_fusions`/`_bytes` on the stats inode). Counted AT
 /// MINT on the worker; the vehicle ledgers (direct/extraction) keep

@@ -20,6 +20,35 @@ pub trait Filesystem {
     /// initialize filesystem. Called before any other filesystem method.
     async fn init(&self, req: Request) -> Result<ReplyInit>;
 
+    /// zc-write hold-eligibility seam (fused-lane-predicate campaign,
+    /// 2026-08-08): may THIS armed WRITE's payload be HELD in the
+    /// transport's sparse slot — i.e. will a slot→device direct-consume
+    /// vehicle (the daemon's W1 sole-owner patch class, or any future
+    /// direct vehicle) actually consume it? The transport layer knows
+    /// only the request SHAPE; layouts live in the filesystem, so the
+    /// hold decision routes through here.
+    ///
+    /// **Default `false` — a filesystem that cannot prove eligibility
+    /// gets every armed WRITE payload extracted AT DELIVERY on the
+    /// queue worker's batched pass** (the streaming arm), never held.
+    /// The 2026-08-08 field falsification is exactly what holding
+    /// unprovable shapes costs: a W1-ineligible write paid hold + fused
+    /// handler poll + LATE extraction, serialized at fabric RTT — 0.45×.
+    ///
+    /// Contract: SYNC, cheap, non-blocking, lock-free — called on the
+    /// transport queue-worker thread once per armed WRITE delivery. A
+    /// STALE `true` (state changed between delivery and handler) is
+    /// legal: the handler's authoritative predicate re-decides and
+    /// extracts late exactly once (counted on
+    /// `fuse3_zc_write_lazy_extractions` — bounded staleness, never the
+    /// steady-state majority). A stale `false` only forfeits one
+    /// direct-DMA candidate (the payload arrives extracted; the pooled
+    /// vehicle still serves it).
+    fn zc_write_hold_eligible(&self, ino: Inode, offset: u64, len: u32) -> bool {
+        let _ = (ino, offset, len);
+        false
+    }
+
     /// clean up filesystem. Called on filesystem exit which is fuseblk, in normal fuse filesystem,
     /// kernel may call forget for root. There is some discuss for this
     /// <https://github.com/bazil/fuse/issues/82#issuecomment-88126886>,

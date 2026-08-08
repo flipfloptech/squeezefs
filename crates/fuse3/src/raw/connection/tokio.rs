@@ -461,6 +461,17 @@ impl FuseConnection {
         }
     }
 
+    /// Register the zc-write HOLD gate (fused-lane-predicate campaign,
+    /// 2026-08-08) — see
+    /// [`super::fuse_over_uring::FuseOverUring::set_zc_write_hold_gate`].
+    /// No-op when no over-uring pool exists (classical sessions).
+    #[cfg(target_os = "linux")]
+    pub fn set_zc_write_hold_gate(&self, g: super::fuse_over_uring::fused::ZcHoldGate) {
+        if let Some(pool) = self.over_uring.get() {
+            pool.set_zc_write_hold_gate(g);
+        }
+    }
+
     /// Commit a reply whose payload already sits in the request's pages
     /// (the zc direct leg) — see
     /// [`super::fuse_over_uring::FuseOverUring::submit_reply_prefilled`].

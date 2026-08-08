@@ -7819,6 +7819,14 @@ impl SqueezefsFilesystem {
                 "fuse3_zc_write_fusions": fuse3::zc_write_fusions(),
                 "fuse3_zc_write_fusion_bytes": fuse3::zc_write_fusion_bytes(),
                 "fuse3_zc_write_fusion_demotions": fuse3::zc_write_fusion_demotions(),
+                // The hold gate's staleness gauge (fused-lane-predicate,
+                // 2026-08-08): LATE (post-dispatch lazy) extractions of
+                // HELD writes — the delivery-time eligibility hint went
+                // stale before the handler's authoritative predicate.
+                // ≈ 0 in steady state; sustained growth = the delivery
+                // probe drifted from the W1 ladder (the 0.45×
+                // field-falsification class re-forming).
+                "fuse3_zc_write_lazy_extractions": fuse3::zc_write_lazy_extractions(),
                 // The bounded-outcome tripwire (zc-bridge-cqe-wedge,
                 // 2026-08-07): MUST STAY 0 — nonzero names a bridge op
                 // the ring never completed inside the deadline
@@ -14986,6 +14994,109 @@ impl SqueezefsFilesystem {
 impl Filesystem for SqueezefsFilesystem {
     type DirEntryStream<'a> = futures::stream::BoxStream<'a, FuseResult<DirectoryEntry>>;
     type DirEntryPlusStream<'a> = futures::stream::BoxStream<'a, FuseResult<DirectoryEntryPlus>>;
+
+    /// The zc-write HOLD gate (fused-lane-predicate campaign, 2026-08-08
+    /// — the field-falsification fix): may this armed WRITE's payload
+    /// stay HELD in the transport's sparse slot? TRUE only when the W1
+    /// sole-owner patch — the ONLY slot→device direct-consume vehicle —
+    /// will plausibly consume it: the `try_patch` request-shape ladder
+    /// (predicates 5/6, `handle_write`'s striped path) plus the cheap
+    /// read-only half of `try_sole_owner_patch`'s state clauses
+    /// (passthrough, undecorated whole-block mapping, no overlay),
+    /// mirrored here as LOCK-FREE SYNC PROBES — this runs on the
+    /// transport queue-worker thread once per armed WRITE delivery.
+    ///
+    /// Deliberately SKIPPED clauses (handler-time discovery is the
+    /// bounded, counted `fuse3_zc_write_lazy_extractions` path):
+    /// refcount == 1 (§5.1 predicate 4 — needs the allocator's
+    /// unstable-mark protocol, a mutation) and byte-range custody
+    /// (clause 7 — inert on shipped mounts). A stale TRUE (overlay
+    /// parked / clone pinned / size grown between delivery and handler)
+    /// extracts late exactly once; a stale FALSE only forfeits one
+    /// direct-DMA candidate (the pooled patch vehicle still serves the
+    /// extracted payload). The steady-state majority routes exactly:
+    /// eligible ⇒ held (fused ≤ ceiling), ineligible ⇒ extracted at
+    /// delivery on the worker's batched pass — never both vehicles.
+    ///
+    /// The decision ledger (`patch_ineligible_*`) stays owned by the
+    /// handler's authoritative predicate; this probe is silent by
+    /// design (it answers routing, not accounting).
+    fn zc_write_hold_eligible(&self, ino: u64, offset: u64, len: u32) -> bool {
+        // Shape half — the `try_patch` ladder, read-only.
+        if len == 0 || is_virtual_ino(ino) {
+            return false;
+        }
+        let cap = patch_max_bytes();
+        if cap == 0 || u64::from(len) > cap {
+            return false;
+        }
+        if offset % 4096 != 0 || u64::from(len) % 4096 != 0 {
+            return false;
+        }
+        // The direct leg declines under write verification (the pooled
+        // path's window-exact read-back is the verifier) — holding
+        // would buy a guaranteed late extraction.
+        if crate::write_verification_enabled() {
+            return false;
+        }
+        // State clause 3 — passthrough only.
+        if !self.router.get_crypto().is_passthrough() {
+            return false;
+        }
+        let block_size = self.router.block_size.load(Ordering::Relaxed);
+        if block_size == 0 {
+            return false;
+        }
+        let end = offset + u64::from(len);
+        let b = offset / block_size;
+        if (end - 1) / block_size != b {
+            // Spans blocks (predicate 5's window class).
+            return false;
+        }
+        // State clause 1 — striped, non-extending, undecorated
+        // whole-block mapping, from the lock-free metadata cache. A
+        // cache MISS is honest ineligibility for HOLDING purposes: the
+        // authoritative fetch is an await this probe must not pay.
+        let Some(meta) = self.router.metadata_cache.get(&ino) else {
+            return false;
+        };
+        if meta.file_type != "striped" || end > meta.size {
+            return false;
+        }
+        let whole = meta
+            .block_map
+            .as_ref()
+            .and_then(|bm| bm.get(&(b as u32)))
+            .is_some_and(|m| crate::routing::is_whole_block_mapping(m));
+        if !whole {
+            return false;
+        }
+        // State clause 2 — no accumulation overlay owns the block
+        // (RAM park, staged active block, staged extent record): the
+        // same lock-free probes `try_sole_owner_patch` runs.
+        let key = crate::keys::active_block_stack(ino, b);
+        if self.active_block_buffers.contains_key(key.as_str())
+            || self.router.cache.nvme.has_staged_active_block(key.as_str())
+            || self
+                .router
+                .cache
+                .nvme
+                .has_staged_extent_record(&crate::keys::active_block_ext(ino, b))
+        {
+            return false;
+        }
+        // Predicate 6 peek — stream-adjacent writes keep the
+        // whole-block write-through economy (read-only: the handler's
+        // `note_last_write_end` swap stays the authority).
+        if self
+            .last_write_end
+            .read_sync(&ino, |_, v| v.load(Ordering::Relaxed))
+            == Some(offset)
+        {
+            return false;
+        }
+        true
+    }
 
     async fn init(&self, _req: Request) -> FuseResult<ReplyInit> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);

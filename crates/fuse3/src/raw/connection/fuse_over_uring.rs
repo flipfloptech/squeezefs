@@ -1384,6 +1384,15 @@ pub struct FuseOverUring {
     /// after INIT. Deliveries before registration ride the classic
     /// dispatch (counted as fusion demotions when otherwise eligible).
     fused_dispatch: std::sync::OnceLock<fused::FusedWriteDispatch>,
+    /// The zc-write HOLD gate (fused-lane-predicate campaign,
+    /// 2026-08-08): the filesystem's `zc_write_hold_eligible` seam —
+    /// may this WRITE's payload stay HELD in the sparse slot as a
+    /// direct-consume candidate? **Unregistered ⇒ never hold**: every
+    /// armed WRITE extracts at delivery on the worker's batched pass
+    /// (the safe posture the field falsification mandates — holding a
+    /// shape no direct vehicle consumes buys hold + late extraction,
+    /// serialized at fabric RTT).
+    zc_hold_gate: std::sync::OnceLock<fused::ZcHoldGate>,
     /// Ring depth (per queue) — the `slot_watch` stride.
     depth: usize,
     /// §5.3 D3.b: session SQPOLL posture for the queue rings (`None` =
@@ -2588,6 +2597,7 @@ impl FuseOverUring {
             slot_watch: (0..nqueues * depth).map(|_| SlotWatch::default()).collect(),
             zc_write_held: zc::ZcHeldTable::new(nqueues, depth),
             zc_bridge_pends: AtomicU64::new(0),
+            zc_hold_gate: std::sync::OnceLock::new(),
             fused_dispatch: std::sync::OnceLock::new(),
             depth,
             sqpoll,
@@ -2814,6 +2824,7 @@ impl FuseOverUring {
                 .collect(),
             zc_write_held: zc::ZcHeldTable::new(nqueues as usize, Self::SIM_DEPTH),
             zc_bridge_pends: AtomicU64::new(0),
+            zc_hold_gate: std::sync::OnceLock::new(),
             fused_dispatch: std::sync::OnceLock::new(),
             depth: Self::SIM_DEPTH,
             sqpoll: None,
@@ -3069,6 +3080,13 @@ impl FuseOverUring {
     /// dispatch and count as fusion demotions when otherwise eligible.
     pub fn set_fused_write_dispatcher(&self, d: fused::FusedWriteDispatch) {
         let _ = self.fused_dispatch.set(d);
+    }
+
+    /// Register the zc-write HOLD gate (fused-lane-predicate campaign):
+    /// the filesystem's cheap W1-eligibility probe. First set wins;
+    /// deliveries before registration extract at delivery (never hold).
+    pub fn set_zc_write_hold_gate(&self, g: fused::ZcHoldGate) {
+        let _ = self.zc_hold_gate.set(g);
     }
 
     /// D14 write-side direct leg: DMA the request's HELD WRITE payload
@@ -4356,8 +4374,16 @@ fn queue_worker(
                     // answers the parked handler (it owns the member's
                     // arena/lease references). Engagement face
                     // (write-bracket campaign): count the completed
-                    // extraction + its payload bytes.
+                    // extraction + its payload bytes — PLUS the LATE
+                    // split (fused-lane-predicate, 2026-08-08): a lazy
+                    // extraction on a held write means the hold gate's
+                    // eligibility hint went STALE between delivery and
+                    // handler (or the handler's authoritative predicate
+                    // declined a racing overlay/refcount) — bounded and
+                    // counted, ≈ 0 in steady state; growth here names a
+                    // predicate-drift bug.
                     kmbuf::note_zc_write_extraction(u64::from(len));
+                    fused::note_zc_write_lazy_extraction();
                     return Ok(Some(PendDone::Lazy { done, len }));
                 }
                 kmbuf::note_zc_fallback();
@@ -5300,38 +5326,18 @@ fn queue_worker(
                             commit_id,
                             len,
                         } => {
-                            // zc-write-fusion: a SMALL at-delivery
-                            // extraction (unaligned sub-ceiling shapes —
-                            // hold_candidate said no on alignment, never
-                            // size here) completes with its payload
-                            // lease already minted on THIS thread; run
-                            // its handler on the fused lane instead of
-                            // paying the inbound push + dispatch spawn.
-                            if fused::fuse_candidate(len, fusion_max, fusion_on) {
-                                if let Some(d) = pool
-                                    .fused_dispatch
-                                    .get()
-                                    .filter(|_| fused_lane.len() < group_depth)
-                                {
-                                    let payload = mint_lease(m, len);
-                                    let fut = (d.mint)(InboundUringReq {
-                                        header_and_op,
-                                        payload,
-                                        unique,
-                                        slot: ReplySlot::Ring {
-                                            qid,
-                                            ent_idx: ent_idx as u16,
-                                            commit_id,
-                                        },
-                                        arrived_ns: crate::raw::read_phase::transport_now_ns(),
-                                    });
-                                    let admitted = fused_lane.spawn(fut, unique);
-                                    debug_assert!(admitted, "capacity checked above");
-                                    fused::note_zc_write_fusion(u64::from(len));
-                                    continue;
-                                }
-                                fused::note_zc_write_fusion_demotion();
-                            }
+                            // fused-lane-predicate (2026-08-08): an
+                            // at-delivery extraction is by definition a
+                            // shape NO direct vehicle consumes (the hold
+                            // gate said no) — it dispatches on the
+                            // classic handler lanes, NEVER the fused
+                            // lane: its handler path parks on fabric-RTT
+                            // FS state (allocation, growth publishes)
+                            // and the multi-lane venue owns that
+                            // concurrency. The 2026-08-07 fusion arm
+                            // that lived here is what double-paid the
+                            // field's ineligible ops.
+                            //
                             // The at-delivery extraction's deferred
                             // dispatch (the streaming arm).
                             let payload = mint_lease(m, len);
@@ -5663,7 +5669,25 @@ fn queue_worker(
                 let op_in = &m.ents[ent_idx].hdr().op_in;
                 let w_off = u64::from_le_bytes(op_in[8..16].try_into().unwrap());
                 let w_size = u32::from_le_bytes(op_in[16..20].try_into().unwrap());
-                if zc::hold_candidate(w_off, w_size, payload_sz_cfg) {
+                // fused-lane-predicate (2026-08-08, the field-falsification
+                // fix): HOLD only when a slot→device vehicle will actually
+                // CONSUME the slot — the shape predicate (`hold_candidate`:
+                // aligned, sub-streaming) composed with the FILESYSTEM's
+                // W1-eligibility probe (`zc_write_hold_eligible` through
+                // the registered gate; layouts live in the root crate, so
+                // the transport cannot decide alone). No gate ⇒ never
+                // hold. A W1-INELIGIBLE shape held anyway paid hold +
+                // fused poll + LATE extraction serialized at fabric RTT —
+                // the 0.45× field collapse whose signature is fusions ≈
+                // ops ∧ extractions ≈ ops (both vehicles per op).
+                let hold_nodeid =
+                    u64::from_le_bytes(m.ents[ent_idx].hdr().in_out[16..24].try_into().unwrap());
+                if zc::hold_candidate(w_off, w_size, payload_sz_cfg)
+                    && pool
+                        .zc_hold_gate
+                        .get()
+                        .is_some_and(|g| g(hold_nodeid, w_off, w_size))
+                {
                     pool.zc_write_held.set(qid, ent_idx, payload_sz as u32);
                     // zc-write-fusion: a held write at or under the
                     // fusion ceiling runs its handler on THIS worker's

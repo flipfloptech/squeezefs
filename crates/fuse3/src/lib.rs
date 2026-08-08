@@ -42,7 +42,7 @@ pub use raw::{
     zc_bridge_cancels, zc_bridge_lost, zc_fallbacks, zc_negotiated, zc_replies,
     zc_slot_payload_skips, zc_write_direct_bytes, zc_write_directs, zc_write_extract_bytes,
     zc_write_extractions, zc_write_fusion_bytes, zc_write_fusion_demotions, zc_write_fusions,
-    COMMIT_BATCH_LABELS,
+    zc_write_lazy_extractions, COMMIT_BATCH_LABELS,
 };
 pub use raw::{
     pin_scope_from_env, read_inplace_replies, read_transport_phase_record,

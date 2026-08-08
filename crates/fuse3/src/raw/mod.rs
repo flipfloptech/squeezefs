@@ -10,7 +10,7 @@ pub use affinity::{pin_scope_from_env, scoped_affinity_cpus, PinScope};
 use bytes::Bytes;
 #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
 pub use connection::fuse_over_uring::fused::{
-    zc_write_fusion_bytes, zc_write_fusion_demotions, zc_write_fusions,
+    zc_write_fusion_bytes, zc_write_fusion_demotions, zc_write_fusions, zc_write_lazy_extractions,
 };
 #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
 pub use connection::fuse_over_uring::{

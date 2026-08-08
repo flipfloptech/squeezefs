@@ -155,6 +155,10 @@ pub(crate) mod patch_clone_core;
 pub(crate) mod placed_core;
 pub(crate) mod placed_sever;
 pub mod read_lane;
+/// L3 coherence campaign (2026-08-08): the read-mostly cache — reads write
+/// nothing shared (deletes moka's per-read bookkeeping from the serve
+/// prelude; `.benchmarks/2026-08-08-moka-coherence.md`).
+pub mod read_mostly_cache;
 pub(crate) mod refcount_core;
 /// DLM stage S5 — read-only coherent mounts (reader revalidation cadence,
 /// purge-on-revalidation, the node-cache revalidation seam).

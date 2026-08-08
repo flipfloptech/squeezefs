@@ -36,7 +36,7 @@ fn test_clock() -> (Arc<AtomicU64>, Arc<dyn Fn() -> u64 + Send + Sync>) {
     (t, Arc::new(move || tc.load(Ordering::Relaxed)))
 }
 
-fn rm_config(read_mostly: bool) -> RmConfig {
+fn rm_config<V>(read_mostly: bool) -> RmConfig<V> {
     RmConfig {
         name: "test",
         read_mostly,
@@ -334,7 +334,7 @@ fn concurrent_stress_values_never_torn() {
             while stop.load(Ordering::Relaxed) == 0 {
                 let v = w * 1_000_000 + i;
                 c.insert(w % 8, Pair { a: v, b: !v });
-                if i % 7 == 0 {
+                if i.is_multiple_of(7) {
                     c.remove(&(w % 8));
                 }
                 i += 1;

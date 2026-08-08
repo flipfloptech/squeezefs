@@ -3421,7 +3421,11 @@ pub struct DataRouterInner {
     /// `u64` they already hold — the per-op key alloc + string hash bought
     /// nothing; string forms remain only where backend keys genuinely need
     /// `fs_key!`-class shapes).
-    pub metadata_cache: moka::sync::Cache<u64, CachedMetadata, ahash::RandomState>,
+    /// L3 coherence campaign (2026-08-08): read-mostly backing — the
+    /// §5.5.1 probe / 795 revalidate / probe-locked reads are pure loads
+    /// (zero shared-line writes; moka survives as the policy shell).
+    pub metadata_cache:
+        crate::read_mostly_cache::ReadMostlyCache<u64, CachedMetadata, ahash::RandomState>,
     /// Single-flight registry. `scc::HashMap`, NOT `HashIndex` (a measured
     /// deviation from the design doc's "container stays" note): HashIndex
     /// defers value drops through epoch reclamation, and since R1a the
@@ -3435,7 +3439,11 @@ pub struct DataRouterInner {
     /// state (PR 5 merged the legacy prefetch cursor into these lanes).
     /// `pub` so the pipeline suite can simulate silent moka eviction (the
     /// lane-leak self-repair phase).
-    pub stream_lanes: moka::sync::Cache<String, std::sync::Arc<StreamLanes>>,
+    pub stream_lanes: crate::read_mostly_cache::ReadMostlyCache<
+        String,
+        std::sync::Arc<StreamLanes>,
+        std::hash::RandomState,
+    >,
     /// §5.5 window-cap OVERRIDE (`SQUEEZEFS_READ_PREFETCH_WINDOW`;
     /// explicit value wins verbatim, railed ≤ 4096; 0 disables the
     /// pipeline outright). `None` = the budget-derived default
@@ -6154,10 +6162,23 @@ impl DataRouter {
                 // expiry keeps any observed entry resident; staleness is
                 // governed by `cached_at` (the 1 s freshness horizon), not by
                 // residency.
-                metadata_cache: moka::sync::Cache::builder()
-                    .max_capacity(metadata_capacity)
-                    .time_to_idle(std::time::Duration::from_secs(METADATA_CACHE_TTI_SECS))
-                    .build_with_hasher(ahash::RandomState::new()),
+                metadata_cache: crate::read_mostly_cache::ReadMostlyCache::new(
+                    crate::read_mostly_cache::RmConfig {
+                        name: "metadata_cache",
+                        read_mostly: crate::read_mostly_cache::read_mostly_enabled(),
+                        capacity: metadata_capacity,
+                        tti: Some(std::time::Duration::from_secs(METADATA_CACHE_TTI_SECS)),
+                        ttl: None,
+                        touch_secs: None, // derived TTI/4; SQUEEZEFS_CACHE_TOUCH_SECS wins
+                        // The dirty pin: a `layout_dirty` entry is the ONLY
+                        // authority for acked layout state — policy eviction
+                        // may never drop it (the persist cadence's clean
+                        // re-insert releases the pin).
+                        pin: Some(std::sync::Arc::new(|m: &CachedMetadata| m.layout_dirty)),
+                        clock: None,
+                    },
+                    ahash::RandomState::new(),
+                ),
                 inflight_block_reads: std::sync::Arc::new(scc::HashMap::new()),
                 // R2 stream-lane tracking: entries are tiny lane structs,
                 // so the 100 k cap is a leak rail (≫ any honest live
@@ -6165,10 +6186,19 @@ impl DataRouter {
                 // 30 s TTL is the stream-idle horizon — a lane silent that
                 // long is a finished stream (time horizon, not a resource
                 // cap; the prefetch window itself is budget-derived).
-                stream_lanes: moka::sync::Cache::builder()
-                    .max_capacity(100000)
-                    .time_to_live(std::time::Duration::from_secs(30))
-                    .build(),
+                stream_lanes: crate::read_mostly_cache::ReadMostlyCache::new(
+                    crate::read_mostly_cache::RmConfig {
+                        name: "stream_lanes",
+                        read_mostly: crate::read_mostly_cache::read_mostly_enabled(),
+                        capacity: 100000,
+                        tti: None,
+                        ttl: Some(std::time::Duration::from_secs(30)),
+                        touch_secs: None,
+                        pin: None,
+                        clock: None,
+                    },
+                    std::hash::RandomState::new(),
+                ),
                 ghost: std::sync::Arc::new(GhostTable::new()),
                 escalation_cooldown: std::sync::Arc::new(EscalationCooldown::new()),
                 tier_admission,
@@ -7073,9 +7103,11 @@ impl DataRouter {
         // no lanes to continue and must not mint any.
         let lanes = match self.stream_lanes.get(file_path) {
             Some(l) => l,
-            None if lane_claim => self.stream_lanes.get_with(file_path.to_string(), || {
-                std::sync::Arc::new(StreamLanes::new())
-            }),
+            None if lane_claim => self
+                .stream_lanes
+                .get_or_insert_with(file_path.to_string(), || {
+                    std::sync::Arc::new(StreamLanes::new())
+                }),
             None => return,
         };
         let (lane_idx, streaming) = {

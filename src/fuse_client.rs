@@ -5125,6 +5125,19 @@ pub struct Metrics {
     /// on its existing path unchanged (leg 3 → demote/direct-drive).
     /// `serves + misses` ≈ executed probes: the engagement instrument.
     pub ipc_hold_probe_misses: Align64<AtomicU64>,
+    /// L3 coherence campaign (2026-08-08): mech-2's sampled policy
+    /// touches — the ONE moka read a hot TTI-cache entry pays per
+    /// derived horizon (TTI/4) instead of per read. Rate ≈ hot inos ÷
+    /// horizon; growth proportional to op rate means the sampling
+    /// regressed to per-read recording (`SQUEEZEFS_CACHE_TOUCH_SECS=0`
+    /// is that posture as a lever).
+    pub read_mostly_policy_touches: Align64<AtomicU64>,
+    /// The dirty pin engaging: a policy eviction declined because the
+    /// store entry is `layout_dirty` (the ONLY layout authority — kept
+    /// until the persist cadence's clean re-insert). ≈ 0 in steady
+    /// state; sustained growth means the persist cadence is not
+    /// outrunning the idle horizon (investigate writeback health).
+    pub read_mostly_dirty_pins: Align64<AtomicU64>,
     /// Gauge: SPAWNED IPC service threads (spawn-on-bind, ingest-economy
     /// 2026-07-28 — 0 on a session-less host; ceiling =
     /// `SQUEEZEFS_IPC_SERVICE_THREADS` / the shared sizing derivation).
@@ -5742,7 +5755,14 @@ pub struct SqueezefsFilesystem {
     lease_locks: std::sync::Arc<StripeLocks<tokio::sync::Mutex<()>, 4096>>,
     pub active_inode_locks: std::sync::Arc<StripeLocks<tokio::sync::RwLock<()>, 4096>>,
     /// P1-4: capacity-bounded attribute cache (moka TTL + max_capacity).
-    pub attr_cache: moka::sync::Cache<u64, (FileAttr, std::time::Instant), ahash::RandomState>,
+    /// L3 coherence campaign (2026-08-08): read-mostly backing — the
+    /// §5.5.1 probe's size read stops paying moka's per-read bookkeeping
+    /// (TTL still filters at read, on the coarse clock).
+    pub attr_cache: crate::read_mostly_cache::ReadMostlyCache<
+        u64,
+        (FileAttr, std::time::Instant),
+        ahash::RandomState,
+    >,
     /// §4.5 (PR K7): snapshots of directories ≤
     /// [`DIR_ENTRY_CACHE_MAX_ENTRIES`], cookie-ascending
     /// `(name, ino, §5.1 cookie, file_type)` so cache-served pages keep
@@ -6156,10 +6176,19 @@ impl SqueezefsFilesystem {
             .build_with_hasher(ahash::RandomState::new());
         // P1-4: bound attr cache growth (was unbounded DashMap).
         let attr_capacity = std::cmp::max(10_000, total_memory / 100_000);
-        let attr_cache = moka::sync::Cache::builder()
-            .max_capacity(attr_capacity)
-            .time_to_live(daemon_cache_ttl)
-            .build_with_hasher(ahash::RandomState::new());
+        let attr_cache = crate::read_mostly_cache::ReadMostlyCache::new(
+            crate::read_mostly_cache::RmConfig {
+                name: "attr_cache",
+                read_mostly: crate::read_mostly_cache::read_mostly_enabled(),
+                capacity: attr_capacity,
+                tti: None,
+                ttl: Some(daemon_cache_ttl),
+                touch_secs: None,
+                pin: None,
+                clock: None,
+            },
+            ahash::RandomState::new(),
+        );
         let fs = Self {
             router,
             dlm,
@@ -8068,6 +8097,12 @@ impl SqueezefsFilesystem {
                 "ipc_fast_path_miss_demotions": METRICS.ipc_fast_path_miss_demotions.load(Ordering::Relaxed),
                 "ipc_hold_probe_serves": METRICS.ipc_hold_probe_serves.load(Ordering::Relaxed),
                 "ipc_hold_probe_misses": METRICS.ipc_hold_probe_misses.load(Ordering::Relaxed),
+                // L3 coherence campaign (2026-08-08): posture + the two
+                // mechanism gauges (sampled policy touches; dirty pins
+                // ≈ 0 in steady state — see the METRICS field docs).
+                "read_mostly_cache": crate::read_mostly_cache::read_mostly_enabled(),
+                "read_mostly_policy_touches": METRICS.read_mostly_policy_touches.load(Ordering::Relaxed),
+                "read_mostly_dirty_pins": METRICS.read_mostly_dirty_pins.load(Ordering::Relaxed),
                 // Hybrid lane gate (D14 corollary): the SHIM's lane-split
                 // ledger — kernel-routed ops/bytes (client stats pages,
                 // reap-folded) + the derived-threshold gauge (max over
@@ -9293,25 +9328,14 @@ impl SqueezefsFilesystem {
         if !self.router.get_crypto().is_passthrough() {
             return Err(I::Meta);
         }
-        // RAM-authoritative metadata only. The RAM entry is the binding
-        // authority on a live mount (the write path updates it
-        // synchronously; D0 excludes remote writers) — exactly the
-        // handler's `current_block_binding` source. Not resident ⇒
-        // fall back (the honest map-resident-majority split).
-        let Some(meta) = self.router.metadata_cache.get(&ino) else {
-            return Err(I::Meta);
-        };
-        if meta.file_type != "striped" {
-            return Err(I::Meta);
-        }
         // Strict in-bounds: EOF-clipping shapes keep the handler's
-        // short-read/zero-fill semantics.
+        // short-read/zero-fill semantics. (Shape arithmetic hoisted above
+        // the metadata peek — L3 coherence campaign: the peek closure
+        // borrows the entry under the store's read protection, so it
+        // carries only the metadata-dependent screens.)
         let Some(end) = offset.checked_add(u64::from(len)) else {
             return Err(I::Shape);
         };
-        if end > meta.size {
-            return Err(I::Shape);
-        }
         let block_size = self.router.block_size.load(Ordering::Relaxed);
         if block_size == 0 || block_size % 4096 != 0 {
             return Err(I::Shape);
@@ -9321,18 +9345,41 @@ impl SqueezefsFilesystem {
             return Err(I::Shape); // multi-block
         }
         let b32 = b as u32;
-        let Some(map) = meta.block_map.as_ref() else {
-            // Indirect / not-RAM-resident maps: sibling shapes stay on
-            // the handler (recorded split — never force a partial
-            // design to claim the whole shape).
-            return Err(I::Meta);
+        // RAM-authoritative metadata only. The RAM entry is the binding
+        // authority on a live mount (the write path updates it
+        // synchronously; D0 excludes remote writers) — exactly the
+        // handler's `current_block_binding` source. Not resident ⇒
+        // fall back (the honest map-resident-majority split).
+        // Zero-clone peek (L3 coherence campaign): a pure-load read of
+        // the read-mostly store — no moka bookkeeping, no per-op value
+        // clone (the former get cloned five Arcs per call); the block
+        // key is copied out ONCE, exactly the CompactString the 795
+        // snapshot carries anyway.
+        let key = match self.router.metadata_cache.peek_with(&ino, |meta| {
+            if meta.file_type != "striped" {
+                return Err(I::Meta);
+            }
+            if end > meta.size {
+                return Err(I::Shape);
+            }
+            let Some(map) = meta.block_map.as_ref() else {
+                // Indirect / not-RAM-resident maps: sibling shapes stay on
+                // the handler (recorded split — never force a partial
+                // design to claim the whole shape).
+                return Err(I::Meta);
+            };
+            let Some(key) = map.get(&b32) else {
+                return Err(I::Layout); // hole block — handler serves zeros
+            };
+            if !crate::routing::is_whole_block_mapping(key) {
+                return Err(I::Layout); // decorated `bk:off:len` mapping
+            }
+            Ok(compact_str::CompactString::from(key.as_str()))
+        }) {
+            Some(Ok(key)) => key,
+            Some(Err(class)) => return Err(class),
+            None => return Err(I::Meta),
         };
-        let Some(key) = map.get(&b32) else {
-            return Err(I::Layout); // hole block — handler serves zeros
-        };
-        if !crate::routing::is_whole_block_mapping(key) {
-            return Err(I::Layout); // decorated `bk:off:len` mapping
-        }
         // Overlay screen — ANY overlay presence ⇒ handler (correctness
         // owns ambiguity). The O(1) gate first (the capture_parked_runs
         // discipline: never a map scan when no overlay exists).
@@ -9370,9 +9417,9 @@ impl SqueezefsFilesystem {
         }
         // The 795 custody snapshot: epoch + binding + fill incarnation.
         let epoch = block_custody_epoch(ino, b32);
-        let tracked = self.router.backend_router.key_incarnation_tracked(key);
+        let tracked = self.router.backend_router.key_incarnation_tracked(&key);
         let incarnation = if tracked {
-            match self.router.backend_router.fill_incarnation(key) {
+            match self.router.backend_router.fill_incarnation(&key) {
                 Some(v) => Some(v),
                 // Unstable incarnation word = a patch/free is mid-flight
                 // on the block — movement, not a stable serve source.
@@ -9383,13 +9430,14 @@ impl SqueezefsFilesystem {
         };
         // Parse-carry (r5): resolve the backend identity + device
         // offset ONCE here — the submit path's per-op re-parse is gone.
-        let Ok((be_id, dev_off)) = self.router.backend_router.split_block_key(key) else {
+        let Ok((be_id, dev_off)) = self.router.backend_router.split_block_key(&key) else {
             return Err(I::Layout);
         };
+        let be_id = compact_str::CompactString::from(be_id);
         Ok(IpcDirectSnapshot {
             ino,
             block: b32,
-            key: compact_str::CompactString::from(key.as_str()),
+            key,
             epoch,
             tracked,
             incarnation,
@@ -9397,7 +9445,7 @@ impl SqueezefsFilesystem {
             len,
             cache_key,
             ext_key,
-            be_id: compact_str::CompactString::from(be_id),
+            be_id,
             dev_off,
             t0_ns,
         })
@@ -9414,19 +9462,20 @@ impl SqueezefsFilesystem {
     /// binding + incarnation checks prove the device bytes belong to
     /// the block's live incarnation (the validated-ranged serve rule).
     pub fn ipc_direct_revalidate(&self, snap: &IpcDirectSnapshot) -> bool {
-        let Some(meta) = self.router.metadata_cache.get(&snap.ino) else {
-            return false;
-        };
-        if meta.file_type != "striped" {
-            return false;
-        }
-        if snap.offset + u64::from(snap.len) > meta.size {
-            return false;
-        }
-        let Some(map) = meta.block_map.as_ref() else {
-            return false;
-        };
-        if map.get(&snap.block).map(String::as_str) != Some(snap.key.as_str()) {
+        // Zero-clone peek (L3 coherence campaign): the CQE-side binding
+        // re-check is pure loads — the former get paid the full moka
+        // read ceremony + a five-Arc value clone per completion, on the
+        // dd reaper (25.4 % of its cycles on the 2-socket field box).
+        let binding_holds = self.router.metadata_cache.peek_with(&snap.ino, |meta| {
+            meta.file_type == "striped"
+                && snap.offset + u64::from(snap.len) <= meta.size
+                && meta
+                    .block_map
+                    .as_ref()
+                    .and_then(|map| map.get(&snap.block))
+                    .is_some_and(|k| k.as_str() == snap.key.as_str())
+        });
+        if binding_holds != Some(true) {
             return false;
         }
         if block_custody_epoch(snap.ino, snap.block) != snap.epoch {
@@ -9525,9 +9574,14 @@ impl SqueezefsFilesystem {
         {
             return None;
         }
-        match self.router.metadata_cache.get(&ino) {
-            Some(meta) if meta.file_type.as_str() == "striped" => {}
-            _ => return None,
+        // Zero-clone peek (L3 coherence campaign): layout-class screen only.
+        if self
+            .router
+            .metadata_cache
+            .peek_with(&ino, |meta| meta.file_type.as_str() == "striped")
+            != Some(true)
+        {
+            return None;
         }
         let block = offset / bs;
         if self

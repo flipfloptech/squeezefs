@@ -181,6 +181,8 @@ pub static KNOBS: &[Knob] = &[
     k("SQUEEZEFS_NT_READ_SERVE", Kind::Bool, "on", "Non-temporal stores on dest-arm read serves; 0 = the A/B control."),
     k("SQUEEZEFS_NT_READ_SERVE_MIN", int(0, BYTES_MAX), "262144", "Read-serve NT-store floor, bytes (keeps rand-4k/warm-small serves cached)."),
     k("SQUEEZEFS_NUMA", Kind::Bool, "on", "NUMA placement actions (structurally inert on single-node hosts); 0 = the A/B lever, instrument stays live."),
+    k("SQUEEZEFS_READ_MOSTLY_CACHE", Kind::Bool, "on", "L3 coherence campaign (2026-08-08): read-mostly backing for the hot process-global caches (metadata/stream-lanes/attrs) — reads are pure loads (scc peek), eviction rides a moka policy shell; deletes moka's per-read bookkeeping (54.6%/33.4% of svc/dd cycles on the 2-socket field box). 0 = the classic moka value caches verbatim (the A/B control)."),
+    k("SQUEEZEFS_CACHE_TOUCH_SECS", int(0, 86_400), "derived (TTI/4)", "L3 mech-2: the TTI-cache policy-touch sampling horizon, seconds — an entry read at least once per horizon keeps access-refreshed residency (4x margin inside the 300 s TTI). 0 = touch the policy shell on EVERY read (the un-sampled isolation lever); explicit value wins verbatim."),
     // -- Transport (fuse3 fork) ------------------------------------------
     k("SQUEEZEFS_FUSE_MAX_WRITE", int(4096, BYTES_MAX), "derived", "Negotiated FUSE max_write, bytes."),
     k("SQUEEZEFS_FUSE_OVER_IO_URING_QUEUES", int(1, 512), "kernel possible CPUs", "FUSE-over-io_uring queue count (TESTING only — fewer than possible CPUs never becomes ready)."),

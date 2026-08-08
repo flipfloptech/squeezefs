@@ -1016,6 +1016,20 @@ async fn direct_drive_stats_fields_export() {
 //     ride the handler, whose own family times them).
 // ---------------------------------------------------------------------------
 
+/// Sample count of the `ipc_drain_pass_ns` histogram (drain-funnel
+/// campaign, 2026-08-08 r3: non-empty svc-thread drain sweeps).
+fn drain_pass_count(v: &serde_json::Value) -> u64 {
+    v.get("metrics")
+        .expect("stats JSON carries a metrics object")
+        .get("ipc_drain_pass_ns")
+        .expect("stats inode must export ipc_drain_pass_ns")
+        .as_object()
+        .expect("drain-pass histogram is a bucket map")
+        .values()
+        .map(|n| n.as_u64().unwrap_or(0))
+        .sum()
+}
+
 /// Sample count of the `ipc_ingress_ns` histogram (reap-fanin campaign,
 /// 2026-08-08: the measured client→daemon ring-ingress residence).
 fn ingress_count(v: &serde_json::Value) -> u64 {
@@ -1127,6 +1141,62 @@ async fn ring_ops_record_ingress_residence() {
         grew >= n,
         "every stamped ring op must record one ingress sample \
          (grew {grew}, want ≥ {n})"
+    );
+    fx.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// 6b''. drain-pass decomposition (drain-funnel campaign, 2026-08-08 r3):
+//       the svc-thread dequeue rate is the funnel the field ingress
+//       histogram convicted (~85 % of clat pooled pre-dequeue), so the
+//       pass itself gets an always-on instrument. Contract:
+//       - `ipc_drain_pass_ns` exports (26-bucket histogram): duration of
+//         every NON-EMPTY drain sweep (drain + flush + inline reap —
+//         the whole per-pass ceremony); its count is the pass count, so
+//         ops ÷ count is the live ops/pass and mean ns ÷ (ops/pass) the
+//         per-op svc-thread cost;
+//       - `ipc_drain_empty_passes` exports (the spin-phase cadence
+//         gauge, pairs with ipc_service_parks);
+//       - a served ring burst grows the pass count by ≥ 1.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drain_passes_record_duration_and_counts() {
+    let fx = Fixture::new("drainpass").await;
+    fx.salt_inos(11).await;
+    let ino = fx.create_striped("drainpass.bin", &[0, 1]).await;
+    let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("repo-dir tempdir");
+    let fd = odirect_standin(&fx, &dir, "drainpass.bin", ino);
+    let (session, binding) = ClientSession::establish(&fx, &fd);
+    fx.fs.router.set_direct_device_true(true);
+
+    let stats0: serde_json::Value =
+        serde_json::from_str(&fx.fs.generate_stats_json().await).expect("stats json parses");
+    let passes0 = drain_pass_count(&stats0);
+    assert!(
+        stats0
+            .get("metrics")
+            .expect("metrics object")
+            .get("ipc_drain_empty_passes")
+            .is_some(),
+        "stats inode must export ipc_drain_empty_passes"
+    );
+
+    let n = 4u64;
+    for i in 0..n {
+        let got = tokio::task::block_in_place(|| {
+            session.ring_pread(binding, (16 + i) * 4096, 4096, 0, "drainpass read")
+        });
+        assert_eq!(got.len(), 4096, "served read {i}");
+    }
+    fx.fs.router.set_direct_device_true(false);
+
+    let stats1: serde_json::Value =
+        serde_json::from_str(&fx.fs.generate_stats_json().await).expect("stats json parses");
+    let grew = drain_pass_count(&stats1) - passes0;
+    assert!(
+        (1..=n).contains(&grew) || grew > n,
+        "served ring ops must record non-empty drain passes (grew {grew})"
     );
     fx.shutdown();
 }

@@ -616,6 +616,23 @@ the sunset row itself (the FIELD bracket above) is still owed:
 squeeze-test was busy at check time and the spec is filed in the fusion
 note §5.
 
+**Ruling D17 (user 2026-08-08, verbatim: "filesystem will not be used until
+we have stable numbers we are happy with and support multiple clients
+without issues. so we don't need a 'safe' default."):** the pre-production
+posture, standing until release readiness. Two consequences: (1) DEFAULTS
+during the performance program are chosen for measurement value and
+iteration velocity — the best-measured posture wins the default slot;
+fleet-safety framing ("ship the conservative default") is retired until
+the release phase. The 2026-08-08 fusion default-OFF flip STANDS under
+this ruling because fusion-off is the FASTER measured posture at fabric
+RTT (0.78× vs 0.45×), not because it is safer; it returns ON the moment
+the RTT-tolerant fix measures ahead. (2) The user's definition of usable
+is now pinned: STABLE numbers at the targets + MULTIPLE CLIENTS without
+issues — multi-client stability joins the board as an explicit gate
+beside the performance targets (the S5 reader mounts and the built-but-
+unstamped S9 multi-writer plane are the machinery; a multi-client
+stability program follows the single-node numbers stabilizing).
+
 **Ruling D15 (user 2026-08-07 — rig discipline, standing): every battery/rig
 row must pass END-TO-END on the local substrate before it runs on the remote
 host.** Issued after the wave-closing battery wedged the field host mid-run

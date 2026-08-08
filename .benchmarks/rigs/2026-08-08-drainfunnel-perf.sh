@@ -7,6 +7,7 @@ PAIR_T="${PAIR_T:-/home/justin/Source/.sqz-drainfunnel-target}"
 META="${META:-sqmeta:///dev/nvme1n1,/dev/nvme2n1,/dev/nvme3n1,/dev/nvme4n1}"
 DATA="${DATA:-sqdata:///dev/nvme5n1,/dev/nvme6n1,/dev/nvme7n1,/dev/nvme8n1}"
 MNT="${MNT:-/mnt/sqz-drainfunnel}"
+PROFILE_CLIENT="${PROFILE_CLIENT:-1}"   # r5: also record fio + dd reapers
 OUT="${OUT:-/tmp/drainfunnel-0808/perf}"
 BIN="$PAIR_T/release/squeezefs"
 SHIM="$PAIR_T/preload-release/libsqueezefs_il.so"
@@ -40,6 +41,14 @@ fio --name=pf --directory="$MNT/d" --nrfiles=1 --filesize=128m --numjobs=32 \
     ps -eo pid=,comm= | awk '$2=="squeezefs"'; } > "$OUT/prof-resolve.txt"
   [ -n "$TIDS" ] || { echo "PROF: no svc tids" > "$OUT/svc-wchan.txt"; exit 0; }
   perf record -g --call-graph dwarf -o "$OUT/svc.perf" -t "$TIDS" -- sleep 10
+  # r5 internal-time program: the dd reapers and the CLIENT are on the
+  # per-op path too — rank all three populations.
+  DDTIDS=$(ps -T -p "$PID" -o spid=,comm= 2>/dev/null | awk '$2 ~ /sqz-ipc-dd/ {printf "%s,", $1}' | sed 's/,$//')
+  [ -n "$DDTIDS" ] && perf record -g --call-graph dwarf -o "$OUT/dd.perf" -t "$DDTIDS" -- sleep 8
+  if [ "$PROFILE_CLIENT" = 1 ]; then
+    FPID=$(pgrep -x fio | head -1)
+    [ -n "$FPID" ] && perf record -g --call-graph dwarf -o "$OUT/fio.perf" -p "$FPID" -- sleep 8
+  fi
   # off-CPU attribution: sample state+wchan of svc threads for 10 s
   for i in $(seq 1 100); do
     for t in ${TIDS//,/ }; do

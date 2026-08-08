@@ -375,7 +375,8 @@ fn ineligible_growth_writes_extract_at_delivery_and_never_fuse() {
         v.log.display()
     );
     assert_eq!(
-        fu1, fu0,
+        fu1,
+        fu0,
         "a W1-ineligible shape must NEVER hold/fuse — hold + fused poll + \
          late extraction is the field's 0.45× collapse (fusions {fu0} → \
          {fu1}, extractions {wx0} → {wx1}: both moving for one op IS the \
@@ -468,8 +469,7 @@ fn fusion_ceiling_bounds_inline_work_and_explicit_wins() {
 /// direct-consumes, but the fused ledger never moves.
 #[test]
 fn fusion_lever_off_keeps_the_classic_dispatch() {
-    let Some(v) = armed_venue("lever", &[("SQUEEZEFS_FUSE_ZC_WRITE_FUSION", "0")], site!())
-    else {
+    let Some(v) = armed_venue("lever", &[("SQUEEZEFS_FUSE_ZC_WRITE_FUSION", "0")], site!()) else {
         return;
     };
     let mnt = &v.mount.mnt;
@@ -501,20 +501,63 @@ fn fusion_lever_off_keeps_the_classic_dispatch() {
 /// worker that polls the fused future. Never a self-deadlock.
 #[test]
 fn fused_write_lost_bridge_cqe_resolves_through_the_ladder() {
-    let Some(v) = armed_venue(
-        "ladder",
+    // Two mounts over one volume: the PUBLISH mount runs seam-free (a
+    // buffered prewrite's writeback rides WRITE-class extraction
+    // bridges, and the drop seam would eat ITS CQE instead of the fused
+    // store's); the SEAM mount then warms the metadata cache with a
+    // READ (READ bridges are not WRITE-class — the seam ignores them,
+    // and the hold gate needs the cached striped layout) before the
+    // fused overwrite whose store CQE the seam eats.
+    if !mount_supported(site!()) {
+        return;
+    }
+    let base = scratch("ladder");
+    let meta = format_volume(&base);
+    let mnt_path = base.join("mnt");
+    let log0 = base.join("mount-publish.log");
+    {
+        let mount = spawn_zc_mount(&meta, &mnt_path, &log0, &[]);
+        if !zc_armed(&log0) {
+            drop(mount);
+            let _ = std::fs::remove_dir_all(&base);
+            let _ = squeezefs_testkit::declare(
+                site!(),
+                squeezefs_testkit::SkipClass::Capability,
+                "FUSE_URING_ZERO_COPY did not arm (sqz kernel + CAP_SYS_ADMIN required)",
+            );
+            return;
+        }
+        publish_file(&mnt_path, "ladder.bin", 16 * 1024 * 1024, 0x55);
+    }
+    let log = base.join("mount-seam.log");
+    let mount = spawn_zc_mount(
+        &meta,
+        &mnt_path,
+        &log,
         &[
             ("SQUEEZEFS_TEST_ZC_DROP_WRITE_CQES", "1"),
             ("SQUEEZEFS_ZC_BRIDGE_TIMEOUT_MS", "1000"),
         ],
-        site!(),
-    ) else {
+    );
+    if !zc_armed(&log) {
+        drop(mount);
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = squeezefs_testkit::declare(
+            site!(),
+            squeezefs_testkit::SkipClass::Capability,
+            "FUSE_URING_ZERO_COPY did not arm on the seam mount",
+        );
         return;
-    };
-    let mnt = &v.mount.mnt;
-    let log = &v.log;
-
-    let owfile = publish_file(mnt, "ladder.bin", 16 * 1024 * 1024, 0x55);
+    }
+    let mnt = &mnt_path;
+    let owfile = mnt.join("ladder.bin");
+    // Warm the layout cache (the hold gate's clause-1 source) — READ
+    // bridges are not WRITE-class, so the seam's drop budget survives.
+    assert_eq!(
+        read_back(&owfile, 0, 4096),
+        vec![0x55u8; 4096],
+        "published file must read back on the seam mount"
+    );
     let cancels0 = metric(mnt, "fuse3_zc_bridge_cancels");
 
     let payload = fill_buf(4096, 0x9B);

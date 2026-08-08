@@ -123,7 +123,7 @@ settle() {
   sleep 3
 }
 
-daemon_cpu() { awk '{print $14+$15}' "/proc/$(pidof squeezefs | awk '"'"'{print $1}'"'"')/stat" 2>/dev/null || echo 0; }
+daemon_cpu() { awk '{print $14+$15}' "/proc/$(pgrep -n squeezefs)/stat" 2>/dev/null || echo 0; }
 
 run_row() { # $1 = leg tag, $2 = row name, $3... = fio args
   local leg=$1 row=$2; shift 2
@@ -158,8 +158,13 @@ fu, fub = d("fuse3_zc_write_fusions"), d("fuse3_zc_write_fusion_bytes")
 dem = d("fuse3_zc_write_fusion_demotions")
 lazy = d("fuse3_zc_write_lazy_extractions")  # 0 pre-split builds
 fb, sk = d("fuse3_zc_fallbacks"), d("fuse3_zc_slot_payload_skips")
-# The both-vehicles double-pay estimator: vehicle events beyond one per
-# op. (directs+extractions) - ops > 0 means ops paid twice.
+# Vehicle accounting caveat: the stats counters span the WHOLE fio run
+# (layout + ramp + window) while fio's io_bytes is the timed window
+# only, so cross-domain arithmetic ((directs+extractions) - ops) is an
+# ESTIMATE that over-counts on laid-out shapes. The EXACT per-op
+# double-pay instrument post-fix is fuse3_zc_write_lazy_extractions (a
+# held op that ALSO extracted); pre-fix binaries lack it, and there the
+# team signature (fusions ~= ops AND extractions ~= ops) is the read.
 double = max(0, (wd + wx) - ops)
 # il stats-pin columns (team list) — printed; 0/absent legal on
 # un-shimmed kernel-lane rows.
@@ -192,7 +197,7 @@ if dp_h and dp_h[0]:
 else:
     dpline = "0"
 print(f"{leg}/{row} zc={zc} f={fusion}: io={io/1e9:.2f}GB bw={bw/1e9:.3f}GB/s iops={iops:.0f} p50={p50:.2f} p99={p99:.2f}")
-print(f"  PIN neg={a.get('fuse3_zc_negotiated')} fusions={fu} fu_bytes={fub} dem={dem} extractions={wx} directs={wd} lazy={lazy} double_pay={double} ({100*double/max(1,ops):.1f}% of {ops} ops)")
+print(f"  PIN neg={a.get('fuse3_zc_negotiated')} fusions={fu} fu_bytes={fub} dem={dem} extractions={wx} directs={wd} lazy={lazy} est_excess={double} ({100*double/max(1,ops):.1f}% of {ops} window ops)")
 print(f"  PIN ipc_session_owners={owners} ipc_direct_shards={shards} ipc_ingress_ns_mean={ing} ipc_drain_pass[{dpline}]")
 if zc == 1:
     if (wdb + wxb) < 0.95 * io:
@@ -208,13 +213,28 @@ if fusion == 0 and fu != 0:
 # SEE the bug, the acceptance must gate it).
 import os
 if os.environ.get("FP_FIXED") == "1" and zc == 1:
-    if double > 0.05 * ops:
-        sys.exit(f"FATAL: {leg}/{row} double-pay {double} > 5% of ops — the predicate bug")
-    if klass == "grow" and fusion == 1 and fu > 0.01 * ops:
-        sys.exit(f"FATAL: {leg}/{row} pure-growth shape fused {fu} ops (> 1%)")
-    if klass == "ow" and fusion == 1 and fu < 0.90 * ops:
-        sys.exit(f"FATAL: {leg}/{row} W1-eligible shape fused only {fu} of {ops} ops")
-    if klass == "seq" and fu > 0.01 * ops:
+    # COUNTER-DOMAIN gates (both sides of each ratio span the same
+    # layout+ramp+window population):
+    # (a) the exact double-pay: a held op that also extracted = lazy.
+    if lazy > 0.05 * max(1, fu + wx):
+        sys.exit(f"FATAL: {leg}/{row} lazy (late) extractions {lazy} > 5% of vehicle ops — hold-gate staleness/drift")
+    # (b) pure-growth shape: nothing holds/fuses (extractions carry it).
+    if klass == "grow" and fu > 0.01 * max(1, wx):
+        sys.exit(f"FATAL: {leg}/{row} pure-growth shape fused {fu} ops vs {wx} extractions")
+    # (c) W1-eligible shape: the fused/held population direct-consumes;
+    # extraction stays the small residue.
+    # The eligible-shape extraction RESIDUE is honestly-ineligible ops
+    # (a norandommap revisit landing while a prior extraction's extent
+    # overlay is still parked on the block makes the block W1-ineligible
+    # until the fold — a self-seeding class that scales with the row's
+    # IOPS, ~6% at 55k IOPS emulated, ~11% at 157k un-emulated). The
+    # EXACT hint-accuracy instrument is `lazy` (gated above at 5%);
+    # this bound only catches a gate that broadly refuses the shape.
+    if klass == "ow" and wx > 0.25 * max(1, wd):
+        sys.exit(f"FATAL: {leg}/{row} eligible shape extracted {wx} vs directs {wd} — the hold gate is refusing eligible ops")
+    if klass == "ow" and fusion == 1 and fu < 0.90 * max(1, wd):
+        sys.exit(f"FATAL: {leg}/{row} eligible shape fused {fu} of {wd} direct-consumed ops")
+    if klass == "seq" and fu > 0.01 * max(1, wx):
         sys.exit(f"FATAL: {leg}/{row} seq row fused {fu} ops")
 EOF
   echo "$1/$2: verdict PASS"

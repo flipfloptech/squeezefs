@@ -278,16 +278,22 @@ pub(crate) fn fusion_ceiling(payload_sz: usize) -> u32 {
     (payload_sz / 8).max(4096) as u32
 }
 
-/// The fusion lever (`SQUEEZEFS_FUSE_ZC_WRITE_FUSION`, **default OFF** —
-/// field falsification 2026-08-08: at ~300 µs fabric RTT the fused lane's
-/// bounded future polling collapsed armed rand-4k writes to 0.45× vs the
-/// 0.78× fusion-off posture (386k unarmed / 300k fusion-off / 175k fused
-/// on squeeze-test), inverting the local +12 % bracket — the bounded-
-/// concurrency-times-fabric-RTT class. Default returns ON only when the
-/// fused lane is re-derived RTT-tolerant and proves itself on the
-/// fabric-emulated venue). `1` opts in; absent/malformed keeps the
-/// default (the transport lever law — the daemon's startup gate already
-/// refused a bad value).
+/// The fusion lever (`SQUEEZEFS_FUSE_ZC_WRITE_FUSION`, **default ON** —
+/// RESOLVED 2026-08-08, fused-lane-predicate campaign: the 2026-08-08
+/// field falsification (armed rand-4k 0.45× at ~300 µs fabric RTT) was
+/// the PREDICATE, not the lane — shape-only `hold_candidate` held/fused
+/// W1-ineligible shapes, which then paid hold + fused poll + LATE
+/// extraction serialized at fabric RTT (the both-vehicles signature:
+/// fusions ≈ ops ∧ extractions ≈ ops, 46–97 % reproduced on the netem
+/// venue). With the hold gated on the filesystem's W1-eligibility seam
+/// (`zc_write_hold_eligible`) and ineligible shapes extracting at
+/// delivery on the classic dispatch, the fabric-emulated A-B-B-A reads
+/// fused ≥ fusion-off on the field shape AND the eligible shape, armed
+/// ≥ unarmed on both, and the un-emulated W1-shape win survives
+/// (+11.6 %, both bracket orders) — evidence
+/// `.benchmarks/2026-08-08-fused-lane-predicate.md`. `0` is the A/B
+/// control; absent/malformed keeps the default (the transport lever
+/// law — the daemon's startup gate already refused a bad value).
 pub(crate) fn fusion_enabled() -> bool {
     crate::env_knob_core::parse_bool(
         "SQUEEZEFS_FUSE_ZC_WRITE_FUSION",
@@ -297,7 +303,7 @@ pub(crate) fn fusion_enabled() -> bool {
     )
     .ok()
     .flatten()
-    .unwrap_or(false)
+    .unwrap_or(true)
 }
 
 /// A registered fused-write dispatcher: the session's mint (builds the

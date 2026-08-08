@@ -616,6 +616,26 @@ the sunset row itself (the FIELD bracket above) is still owed:
 squeeze-test was busy at check time and the spec is filed in the fusion
 note §5.
 
+**D16 re-opened (team adjudication 2026-08-08, accepted):** the armed
+kernel-lane rand-4k WRITE loss at fabric RTT is 0.78× fusion-off / 0.45×
+fused (386k/300k/175k, squeeze-test) — the fused-predicate bug (holds
+W1-ineligible shapes, discovers ineligibility after the fused poll,
+extracts late; signature: fusions ≈ ops ∧ extractions ≈ ops on one row).
+Disposition under D17: **zc default stays ON** (the cold-read wins govern
+the program's default slot), **kernel small-write IOPS rows pin
+`SQUEEZEFS_FUSE_ZC=0` in the rigs** until the predicate fix lands (fuse
+only what W1 will consume; ineligible extracts at delivery on the
+streaming arm), at which point the caveat re-brackets. Companion
+directive recorded: do NOT chase the 1M shim-IOPS target by retuning
+zc/lane-flush — the ~680k field number is the W12 + ~1.2 ms-ingress
+equilibrium; the round-4 lane-depth campaign's red gate is reproducing
+that equilibrium at netem fabric RTT, and if it cannot, a FIELD perf
+profile of the ingress path is owed before any further lever. Standing
+row law added (team list): every later row FATAL-gates on
+`fuse3_zc_negotiated`, `fuse3_zc_write_fusions/_bytes/_demotions`,
+extractions-vs-directs, `ipc_session_owners`, `ipc_direct_shards`,
+`ipc_ingress_ns` mean, `ipc_drain_pass_ns` (ops/pass + µs/op).
+
 **Ruling D17 (user 2026-08-08, verbatim: "filesystem will not be used until
 we have stable numbers we are happy with and support multiple clients
 without issues. so we don't need a 'safe' default."):** the pre-production

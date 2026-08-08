@@ -2983,6 +2983,22 @@ pub fn ipc_drain_pass_json() -> serde_json::Value {
     IPC_DRAIN_PASS_PROF.to_json()
 }
 
+/// The FLUSH half of a recorded pass (`ipc_drain_flush_ns` — sink flush:
+/// dd shard enters + the fusion inline reap). `pass − flush` = the drain
+/// half by subtraction, so the ceremony's fixed term is attributable.
+static IPC_DRAIN_FLUSH_PROF: Lazy<LatencyHistogram> = Lazy::new(LatencyHistogram::default);
+
+/// Record one non-empty pass's flush span started at `t0`.
+#[inline]
+pub fn ipc_drain_flush_record(t0: std::time::Instant) {
+    IPC_DRAIN_FLUSH_PROF.record(t0.elapsed());
+}
+
+/// `ipc_drain_flush_ns` stats payload (bucket map) — UNGATED.
+pub fn ipc_drain_flush_json() -> serde_json::Value {
+    IPC_DRAIN_FLUSH_PROF.to_json()
+}
+
 /// Record one direct-drive residence span started at `t0` (always-on).
 #[inline]
 pub fn ipc_direct_phase_record(phase: IpcDirectPhase, t0: std::time::Instant) {
@@ -8048,6 +8064,7 @@ impl SqueezefsFilesystem {
                 // sweep ceremony durations (count = pass count; ops ÷
                 // count = live ops/pass) + the empty-sweep cadence gauge.
                 "ipc_drain_pass_ns": ipc_drain_pass_json(),
+                "ipc_drain_flush_ns": ipc_drain_flush_json(),
                 "ipc_drain_empty_passes": METRICS.ipc_drain_empty_passes.load(Ordering::Relaxed),
                 "ipc_arena_prep_queued": METRICS.ipc_arena_prep_queued.load(Ordering::Relaxed),
                 "ipc_arena_prep_done": METRICS.ipc_arena_prep_done.load(Ordering::Relaxed),

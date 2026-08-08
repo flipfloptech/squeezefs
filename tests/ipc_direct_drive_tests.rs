@@ -1198,6 +1198,23 @@ async fn drain_passes_record_duration_and_counts() {
         (1..=n).contains(&grew) || grew > n,
         "served ring ops must record non-empty drain passes (grew {grew})"
     );
+    // The flush half (funnel attribution r3): every recorded pass also
+    // records its sink-flush span, so pass − flush = the drain half by
+    // subtraction and the fixed-ceremony term is attributable.
+    let flush_count: u64 = stats1
+        .get("metrics")
+        .expect("metrics object")
+        .get("ipc_drain_flush_ns")
+        .expect("stats inode must export ipc_drain_flush_ns")
+        .as_object()
+        .expect("flush histogram is a bucket map")
+        .values()
+        .map(|v| v.as_u64().unwrap_or(0))
+        .sum();
+    assert!(
+        flush_count >= grew,
+        "every non-empty pass records its flush half (flush {flush_count} < passes {grew})"
+    );
     fx.shutdown();
 }
 

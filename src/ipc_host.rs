@@ -2802,8 +2802,10 @@ impl IpcHost {
             // One flush per sweep (SessionSink::flush liveness rule):
             // direct-drive SQEs published during the drain become
             // kernel-visible before this thread can park.
+            let t_flush = Instant::now();
             self.sink.flush();
             if served > 0 {
+                crate::fuse_client::ipc_drain_flush_record(t_flush);
                 crate::fuse_client::ipc_drain_pass_record(t_pass);
                 last_progress = Instant::now();
                 continue;
@@ -2856,10 +2858,12 @@ impl IpcHost {
             let rescan_served = self.drain_pass(&sessions, rr_start);
             rr_start = rr_start.wrapping_add(1);
             // Same liveness rule on the pre-park rescan sweep.
+            let t_flush2 = Instant::now();
             self.sink.flush();
             if rescan_served > 0 {
                 // The rescan is a drain pass too (the funnel instrument
                 // must see every serving sweep or ops/pass lies).
+                crate::fuse_client::ipc_drain_flush_record(t_flush2);
                 crate::fuse_client::ipc_drain_pass_record(t_rescan);
             }
             if rescan_served == 0 {

@@ -107,6 +107,68 @@ ipc_op_economy 3 / preload_parity 16 — green ×10), clippy
 fmt both workspaces, env-knob convention (the re-graded eager-flush
 entry), and the r5 bench group.
 
+## 5.5 QUIET-BOX ACCEPTANCE (r5 close-out, branch `perf/r5-acceptance` off dev `3d865df6`)
+
+Box verified quiet (the interfering fleet turned out to be THIS rig's
+own orphaned fio from the killed attempt — killed by exact comm after
+ownership verification; 0 fio, no foreign daemons, Tctl gated ≤ 70 °C
+per row). Pairs: C = tip `3d865df6` (contains L1+L2 + the fused-
+predicate fix), B = `b92f2133` (pre-r5), both clean KD-7 pairs, base in
+a scratch target dir. Every row: engagement exact (`ops ≡ dd_serves`,
+ingress n ≡ ops), tripwires 0, poisons 0, zc write-fusion families 0
+(read rows — the D16 pin governs write rows).
+
+### A-B-B-A, calibrated venue, 32×32
+
+| leg | IOPS | clat mean | p50 | p99 | ingress mean | drain pass mean | svc µs/op |
+|---|---|---|---|---|---|---|---|
+| C1 | 899,543 | 1,137 | 823 | 5,079 | 215.3 | 272 µs | 13.58 |
+| B1 | 896,115 | 1,142 | 848 | 4,882 | 222.5 | 282 µs | 13.65 |
+| B2 | 906,550 | 1,129 | 848 | 4,751 | 222.8 | 284 µs | 13.51 |
+| C2 | 902,107 | 1,134 | 832 | 4,882 | 217.6 | 277 µs | 13.55 |
+
+**Composed row delta: WASH** (C median 900.8 k vs B 901.3 k, −0.05 %;
+clat wash; ingress −3 %, pass mean −2 % — the svc-side instruments move
+in the predicted direction but small). **Why the ~17 %-svc-cycles cut
+does not read at row level HERE, honestly:** this venue is
+INFLIGHT-bound at 32×32 — inflight mean 940–1,019 µs vs ingress ~220 µs
+(the ops pool at the emulated DEVICE's open-loop queue; svc threads run
+~50 % utilization), so IOPS ≈ 1,024 ÷ (inflight + ingress) is
+insensitive to svc service time. The FIELD is the OPPOSITE regime
+(ingress 1.25 ms = 80 % of clat, svc-queueing-bound at ρ≈0.9) — the
+regime where a service-time cut composes superlinearly. The §6 field
+profile + A/B remains the adjudicator; the microbench deltas
+(clock 39.15→35.48 ns/pair ×2 fewer pairs, probe keys 118.4→63.9 ns,
+3 allocs→0) and the ingress/pass movement are the landed evidence.
+
+### Sustained 90 s (tip, calibrated venue)
+
+**904,469 IOPS**, clat mean 1,131 µs, p99 4.82 ms; thirds 840.8 k →
+929.2 k (+10.5 % — warm-up direction, no decay); engagement exact
+(86.18 M ops ≡ dd serves), poisons 0.
+
+### Un-emulated no-regression (plain tcp devsub, 32×32)
+
+| leg | IOPS | clat mean | ingress mean | svc µs/op |
+|---|---|---|---|---|
+| PC (tip) | 1,218,833 | 839.3 | 191.3 | 10.04 |
+| PB (base) | 1,221,196 | 837.7 | 191.2 | 10.03 |
+
+**No regression** (−0.19 %, inside noise) — the low-RTT regime is
+unharmed by L1/L2 (as designed: fewer clock reads and zero-heap keys
+cannot cost anything anywhere).
+
+### Bench baseline
+
+`tests/run_bench_baseline.sh save` STARTED on the quiet box (its
+thermal/foreign-work gates PASSED — Tctl 71.6 °C, no foreign cargo)
+but was cut by this session's own 3,000 s guard mid-measurement (the
+full two-workspace set runs longer); `reference.json` is UNCHANGED
+(verified against git — no partial save is possible, the script writes
+at the end). The save remains owed as ONE command on the next quiet
+window; the r5 bench deltas themselves are recorded in §4 and in the
+committed Criterion outputs.
+
 ## 6. Field spec (squeeze-test untouched — user active)
 
 1. **The owed field perf profile of the ingress path** (the a5d47bc6

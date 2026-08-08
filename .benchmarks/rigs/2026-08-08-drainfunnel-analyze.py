@@ -73,6 +73,7 @@ def analyze(out, leg, qd):
     dd = cd(pre, post, "ipc_direct_drive_serves")
     ing = hstats(hist_delta(pre, post, "ipc_ingress_ns"))
     dp = hstats(hist_delta(pre, post, "ipc_drain_pass_ns"))
+    fl = hstats(hist_delta(pre, post, "ipc_drain_flush_ns"))
     infl = hstats(hist_delta(pre, post, "ipc_direct_phase_ns", "inflight"))
     tot = hstats(hist_delta(pre, post, "ipc_direct_phase_ns", "total"))
     empty = cd(pre, post, "ipc_drain_empty_passes")
@@ -103,7 +104,7 @@ def analyze(out, leg, qd):
         "clat_us": {"mean": round(clat_mean, 1), "p50": round(p50, 1), "p99": round(p99, 1)},
         "ops": ops, "dd_serves": dd,
         "ingress_us": ing, "inflight_us": infl, "total_us": tot,
-        "drain_pass_us": dp, "ops_per_pass": ops_per_pass,
+        "drain_pass_us": dp, "drain_flush_us": fl, "ops_per_pass": ops_per_pass,
         "svc_us_per_op": svc_per_op,
         "empty_passes": empty, "parks": parks,
         "wakes_per_op": round(wakes / max(ops, 1), 4),

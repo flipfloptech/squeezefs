@@ -84,13 +84,28 @@ measurement lever (`d282090a`).
 * Bench group `r5_internal_time` added to `benches/ipc_hop_bench.rs`
   (field shapes in-file per the microbench-program convention).
 
-## 5. Acceptance rows
+## 5. Acceptance rows — INTERRUPTED, discarded with attribution
 
-(A-B-B-A on the calibrated venue vs dev tip + sustained 90 s +
-un-emulated no-regression — INTERRUPTED by a foreign campaign taking
-the box (`sqz-fusedrtt`, 32-job fio fleet, Tctl 91 °C, and the
-interloper unmounted this rig's mountpoint mid-leg); the quiescence
-monitor re-runs them — table lands here.)
+The A-B-B-A was launched twice and BOTH attempts were taken by a
+foreign campaign on the box (`sqz-fusedrtt`: its own daemon + 32-job
+fio fleets, Tctl 91–95 °C; the first attempt's mountpoint was
+unmounted from under the leg, the second attempt's C1 leg ran with the
+foreign fleet live — its row read inflight mean 1,138 µs vs the
+calibrated 316 µs operating point, i.e. the VENUE was gone). Per the
+counted-run discipline those rows are DISCARDED WITH ATTRIBUTION and
+never cited; the pre-interference §2 rows (955 k sweep-only baseline
+class on the calibrated venue, engagement exact) stand as the
+composition reference. **Owed on a quiet box** (one command each, rig
+unchanged): the C-vs-B A-B-B-A at 32×32, the 90 s sustained row, the
+un-emulated no-regression leg, the from-zero full-suite acceptance
+pass, and `tests/run_bench_baseline.sh save` for the intentional bench
+improvements (the script's own quiet-box gates refuse the current
+state). Gates that DID run to completion between interference windows:
+the touched suites ×10 (ipc_direct_drive 18 / ipc_host 37 /
+ipc_op_economy 3 / preload_parity 16 — green ×10), clippy
+`-D warnings` all-features AND shipped config + the fuse3 workspace,
+fmt both workspaces, env-knob convention (the re-graded eager-flush
+entry), and the r5 bench group.
 
 ## 6. Field spec (squeeze-test untouched — user active)
 

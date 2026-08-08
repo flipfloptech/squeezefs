@@ -2791,6 +2791,12 @@ impl IpcHost {
                     .collect();
                 seen_epoch = epoch;
             }
+            // Drain-funnel instrument (2026-08-08 r3): time the WHOLE
+            // per-pass ceremony — drains + flush + inline reap — for
+            // non-empty sweeps; count empty sweeps (the spin cadence).
+            // One Instant per pass, always-on (the write_pipeline cost
+            // contract; the pass body dwarfs the clock read).
+            let t_pass = Instant::now();
             let served = self.drain_pass(&sessions, rr_start);
             rr_start = rr_start.wrapping_add(1);
             // One flush per sweep (SessionSink::flush liveness rule):
@@ -2798,9 +2804,13 @@ impl IpcHost {
             // kernel-visible before this thread can park.
             self.sink.flush();
             if served > 0 {
+                crate::fuse_client::ipc_drain_pass_record(t_pass);
                 last_progress = Instant::now();
                 continue;
             }
+            METRICS
+                .ipc_drain_empty_passes
+                .fetch_add(1, Ordering::Relaxed);
             if last_progress.elapsed() < spin_window {
                 std::hint::spin_loop();
                 continue;
@@ -2842,10 +2852,16 @@ impl IpcHost {
                     .iter()
                     .map(|s| s.map.header().doorbell.load(Ordering::SeqCst)),
             );
+            let t_rescan = Instant::now();
             let rescan_served = self.drain_pass(&sessions, rr_start);
             rr_start = rr_start.wrapping_add(1);
             // Same liveness rule on the pre-park rescan sweep.
             self.sink.flush();
+            if rescan_served > 0 {
+                // The rescan is a drain pass too (the funnel instrument
+                // must see every serving sweep or ops/pass lies).
+                crate::fuse_client::ipc_drain_pass_record(t_rescan);
+            }
             if rescan_served == 0 {
                 if sessions.is_empty() {
                     std::thread::park_timeout(SERVICE_PARK_MAX);

@@ -2962,6 +2962,27 @@ pub fn ipc_ingress_json() -> serde_json::Value {
     IPC_INGRESS_PROF.to_json()
 }
 
+/// Drain-pass ceremony residence (`ipc_drain_pass_ns`, drain-funnel
+/// campaign 2026-08-08 r3): duration of every NON-EMPTY svc-thread drain
+/// sweep — session drains + sink flush + inline reap, the whole per-pass
+/// ceremony. Always-on. Its COUNT is the pass count: `ipc_ops_* ÷ count`
+/// is the live ops/pass, and `mean ÷ (ops/pass)` the per-op svc-thread
+/// cost — the funnel ledger's dequeue-capacity instrument (the field
+/// `ipc_ingress_ns` row pooled ~1,000 of 1,024 in-flight ops pre-dequeue
+/// with the device at a fifth of its concurrency).
+static IPC_DRAIN_PASS_PROF: Lazy<LatencyHistogram> = Lazy::new(LatencyHistogram::default);
+
+/// Record one non-empty drain-pass ceremony span started at `t0`.
+#[inline]
+pub fn ipc_drain_pass_record(t0: std::time::Instant) {
+    IPC_DRAIN_PASS_PROF.record(t0.elapsed());
+}
+
+/// `ipc_drain_pass_ns` stats payload (bucket map) — UNGATED.
+pub fn ipc_drain_pass_json() -> serde_json::Value {
+    IPC_DRAIN_PASS_PROF.to_json()
+}
+
 /// Record one direct-drive residence span started at `t0` (always-on).
 #[inline]
 pub fn ipc_direct_phase_record(phase: IpcDirectPhase, t0: std::time::Instant) {
@@ -5159,6 +5180,13 @@ pub struct Metrics {
     /// longer covers the per-session inter-arrival gap (the 2026-07-26
     /// sessions-inversion engine: a park/wake cycle per burst).
     pub ipc_service_parks: Align64<AtomicU64>,
+    /// Drain-funnel campaign (2026-08-08 r3): svc-thread drain sweeps
+    /// that found NOTHING to serve — the spin-phase cadence gauge
+    /// (pairs with `ipc_service_parks` and the `ipc_drain_pass_ns`
+    /// non-empty-pass histogram: empty ≫ non-empty = the thread spins
+    /// between bursts; non-empty ≈ ops = the thread is the serial
+    /// funnel, one op per sweep).
+    pub ipc_drain_empty_passes: Align64<AtomicU64>,
     /// Deferred session-arena THP prep (shim fleet parity, 2026-08-05):
     /// jobs queued at admission / completed by the `sqz-ipc-thp` worker.
     /// Ledger law (prep-liveness fix, fleet-parity round 2):
@@ -8016,6 +8044,11 @@ impl SqueezefsFilesystem {
                 "ipc_service_threads": METRICS.ipc_service_threads.load(Ordering::Relaxed),
                 "ipc_session_owners": METRICS.ipc_session_owners.load(Ordering::Relaxed),
                 "ipc_service_parks": METRICS.ipc_service_parks.load(Ordering::Relaxed),
+                // Drain-funnel decomposition (2026-08-08 r3): non-empty
+                // sweep ceremony durations (count = pass count; ops ÷
+                // count = live ops/pass) + the empty-sweep cadence gauge.
+                "ipc_drain_pass_ns": ipc_drain_pass_json(),
+                "ipc_drain_empty_passes": METRICS.ipc_drain_empty_passes.load(Ordering::Relaxed),
                 "ipc_arena_prep_queued": METRICS.ipc_arena_prep_queued.load(Ordering::Relaxed),
                 "ipc_arena_prep_done": METRICS.ipc_arena_prep_done.load(Ordering::Relaxed),
                 "ipc_arena_prep_skipped_dead": METRICS.ipc_arena_prep_skipped_dead.load(Ordering::Relaxed),

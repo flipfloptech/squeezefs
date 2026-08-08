@@ -5,11 +5,13 @@
 # remount per leg (aging rule). Default row shape: rand-4k il 32×qd32 —
 # the funnel shape the field ingress histogram convicted. Engagement
 # gates FATAL per row (the r2 analyzer's set + ingress n ≡ ops).
-# Leg spec: "NAME/DAEMON_ENV/CLIENT_ENV" ('-' = none), e.g.
-#   R0/-/-  R1/SQUEEZEFS_IPC_SERVICE_THREADS=4/-  R2/-/SQUEEZEFS_IL_SESSIONS=12
+# Leg spec: "NAME/PAIR/DAEMON_ENV/CLIENT_ENV" ('-' = none; PAIR = cand|base
+# or '-' = cand), e.g.
+#   C1/cand/-/-  B1/base/-/-  CL0/cand/SQUEEZEFS_IPC_DD_LANE_FLUSH=0/-
 set -u
 
 PAIR_T="${PAIR_T:-/home/justin/Source/.sqz-drainfunnel-target}"
+BASE_T="${BASE_T:-/home/justin/Source/.sqz-drainfunnel-base}"
 META="${META:-sqmeta:///dev/nvme1n1,/dev/nvme2n1,/dev/nvme3n1,/dev/nvme4n1}"
 DATA="${DATA:-sqdata:///dev/nvme5n1,/dev/nvme6n1,/dev/nvme7n1,/dev/nvme8n1}"
 MNT="${MNT:-/mnt/sqz-drainfunnel}"
@@ -18,17 +20,13 @@ RUNTIME="${RUNTIME:-60}"
 RAMP="${RAMP:-5}"
 QDS_STR="${QDS_STR:-32}"
 COOL_MAX="${COOL_MAX:-70}"
-LEGS_STR="${LEGS_STR:-R0/-/- R1/SQUEEZEFS_IPC_SERVICE_THREADS=4/- R2/-/SQUEEZEFS_IL_SESSIONS=12 R3/-/SQUEEZEFS_IL_SESSIONS=16}"
+LEGS_STR="${LEGS_STR:-R0/-/-/- R1/-/SQUEEZEFS_IPC_SERVICE_THREADS=4/- R2/-/-/SQUEEZEFS_IL_SESSIONS=12 R3/-/-/SQUEEZEFS_IL_SESSIONS=16}"
 
 read -r -a LEGS <<<"$LEGS_STR"
 read -r -a QDS <<<"$QDS_STR"
 mkdir -p "$OUT"
 fatal() { echo "FATAL: $*" >&2; exit 1; }
 
-BIN="$PAIR_T/release/squeezefs"
-SHIM="$PAIR_T/preload-release/libsqueezefs_il.so"
-[ -x "$BIN" ] || fatal "missing $BIN"
-[ -f "$SHIM" ] || fatal "missing $SHIM"
 
 cooldown() {
   local t
@@ -44,8 +42,9 @@ cooldown() {
 my_daemon() { pgrep -f "squeezefs mount.*$MNT" 2>/dev/null; }
 
 do_umount() {
+  local bin=${1:-$PAIR_T/release/squeezefs}
   if mountpoint -q "$MNT"; then
-    "$BIN" umount "$MNT" >/dev/null 2>&1 || umount "$MNT" 2>/dev/null || true
+    "$bin" umount "$MNT" >/dev/null 2>&1 || umount "$MNT" 2>/dev/null || true
   fi
   for _ in $(seq 1 120); do mountpoint -q "$MNT" || break; sleep 1; done
   mountpoint -q "$MNT" && fatal "mountpoint still mounted — wedge class"
@@ -62,14 +61,21 @@ pidstat_sampler() { # per-thread CPU of the daemon, two 5 s windows mid-row
   pidstat -t -p "$pid" 5 2 > "$OUT/leg$tag-pidstat.txt" 2>/dev/null
 }
 
-run_leg() { # $1 = "NAME/DAEMON_ENV/CLIENT_ENV"
-  local spec=$1 leg denv cenv
+run_leg() { # $1 = "NAME/PAIR/DAEMON_ENV/CLIENT_ENV"
+  local spec=$1 leg pair denv cenv BIN SHIM
   leg="${spec%%/*}"
-  denv="$(echo "$spec" | cut -d/ -f2)"
-  cenv="$(echo "$spec" | cut -d/ -f3)"
+  pair="$(echo "$spec" | cut -d/ -f2)"
+  denv="$(echo "$spec" | cut -d/ -f3)"
+  cenv="$(echo "$spec" | cut -d/ -f4)"
   [ "$denv" = "-" ] && denv=""
   [ "$cenv" = "-" ] && cenv=""
-  echo "=== leg $leg (daemon: '${denv}' client: '${cenv}') ==="
+  case "$pair" in base) t="$BASE_T" ;; *) t="$PAIR_T" ;; esac
+  BIN="$t/release/squeezefs"
+  SHIM="$t/preload-release/libsqueezefs_il.so"
+  [ -x "$BIN" ] || fatal "missing $BIN"
+  [ -f "$SHIM" ] || fatal "missing $SHIM"
+  echo "=== leg $leg (pair $t daemon: '${denv}' client: '${cenv}') ==="
+  "$BIN" --version | tee "$OUT/leg$leg-version.txt"
 
   cooldown
   "$BIN" format "$META" "$DATA" --force >"$OUT/leg$leg-format.log" 2>&1 \
@@ -111,7 +117,7 @@ run_leg() { # $1 = "NAME/DAEMON_ENV/CLIENT_ENV"
       "$OUT" "$leg" "$qd" || fatal "leg $leg qd$qd: engagement verdict failed"
   done
 
-  do_umount
+  do_umount "$BIN"
 }
 
 command -v fio >/dev/null || fatal "fio not installed"

@@ -248,3 +248,36 @@ row 1's first stats read decides, which is what lever 3 was for.
   pending — a need-spread-across-sessions shape could oversleep to the age
   bound; bounded, and not the fio/field shape (one file → one session per
   ctx). Filed.
+
+## 6. FIELD ADDENDUM (2026-08-08, squeeze-test, binary `82a9999f` — the merged branch; reconstructed from the field brief, exact histograms to be pasted verbatim below)
+
+The §4 spec's row 1 ran post-storage-reset (32×32 rand-4k il, engagement
+exact: **45.84 M ops**, ≈ **656 k IOPS** sustained). The first field read
+of `ipc_ingress_ns` ADJUDICATED the §4 projection's either/or — **the gap
+is the DRAIN FUNNEL's**:
+
+| term | field value | share of clat |
+|---|---|---|
+| fio clat MEAN | 1,561 µs | — |
+| **`ipc_ingress_ns` mean** | **~1,330 µs** | **~85 %** |
+| device inflight mean (`ipc_direct_phase_ns`) | ~316 µs | ~20 % (overlaps nothing — sequenced after dequeue) |
+| observation (residual) | ≈ 0 | the round-2 batch park holds in the field |
+
+Ingress histogram shape (reconstructed): **71 % of ops in the 256–512 µs
+bucket** (the funnel's steady-state queue), **10 % ≥ 2 ms**, including
+**~810 k ops at 16–64 ms** — which accounts for the client p99 20 ms tail
+**fully**. Little's law both ways: 656 k × 316 µs ≈ **210 concurrent
+device ops** vs 656 k × 1,330 µs ≈ 870 — i.e. **~1,000 of the 1,024
+in-flight ops pool PRE-DEQUEUE** while the device runs at a fifth of its
+concurrency. Same-day raw re-grade: **2.486 M @ p99 4.5 ms** — the funnel
+sits on ~2.5 M of device headroom.
+
+Round-2 verdicts updated by this row: the batch park is **exonerated and
+correct** (the field number was unmoved because the term was never
+client-side at this shape — exactly what §3.5's attribution shift
+predicted); the §4 projection's second arm fired verbatim ("if
+`ipc_ingress_ns` reads ~1 ms there, the gap is the DRAIN FUNNEL's and the
+next campaign is daemon-side"). Round 3 (`perf/shim-drain-funnel`) owns
+the dequeue-side serialization.
+
+(Orchestrator: paste the verbatim field histograms here.)

@@ -68,6 +68,20 @@
 #   SQZ_DEVSUB_MDS_CACHE_MB=256   null_blk write-back cache MiB (>0 ⇒ real
 #                                 FLUSH/FUA semantics: fua=1, write_cache=write back)
 #   SQZ_DEVSUB_OSS_COUNT=4        data namespaces (zram)
+#   SQZ_DEVSUB_OSS_NULLB_DELAY_US=  when set (>0): oss devices become
+#                                 memory-backed null_blk with per-IO TIMER
+#                                 completion delay of this many µs
+#                                 (completion_nsec + irqmode=2) instead of
+#                                 zram — the r4 FABRIC-RTT EMULATION venue
+#                                 (.benchmarks/2026-08-08-dd-lane-depth-r4.md:
+#                                 netem-on-lo was falsified by a delay-0
+#                                 control — the lo root-qdisc lock caps at
+#                                 ~390k IOPS regardless of delay; device-side
+#                                 timer completion delays every IO with full
+#                                 hw-queue parallelism and no qdisc in the
+#                                 path). Data is RAM-backed and readable
+#                                 exactly like zram; combine with a second
+#                                 SQZ_DEVSUB_INSTANCE to keep the plain venue.
 #   SQZ_DEVSUB_OSS_GB=8           zram disksize GiB per data device (VIRTUAL —
 #                                 RAM used ~= compressed working set only)
 #   SQZ_DEVSUB_OSS_ALGO=zstd      zram compression algorithm
@@ -177,6 +191,7 @@ MDS_COUNT="${SQZ_DEVSUB_MDS_COUNT:-4}"
 MDS_GB="${SQZ_DEVSUB_MDS_GB:-1}"
 MDS_CACHE_MB="${SQZ_DEVSUB_MDS_CACHE_MB:-256}"
 OSS_COUNT="${SQZ_DEVSUB_OSS_COUNT:-4}"
+OSS_NULLB_DELAY_US="${SQZ_DEVSUB_OSS_NULLB_DELAY_US:-}"
 OSS_GB="${SQZ_DEVSUB_OSS_GB:-8}"
 OSS_ALGO="${SQZ_DEVSUB_OSS_ALGO:-zstd}"
 OSS_MEM_LIMIT_GB="${SQZ_DEVSUB_OSS_MEM_LIMIT_GB:-0}"
@@ -282,16 +297,31 @@ wait_for() { # description max_tries cmd...
 # ---------------------------------------------------------------------------
 # backing devices
 # ---------------------------------------------------------------------------
-create_nullb() { # name gb cache_mb -> echoes /dev path
-    local name="$1" gb="$2" cache_mb="$3" d="$NULLB_CFS/$1" dev
+create_nullb() { # name gb cache_mb [delay_ns] -> echoes /dev path
+    local name="$1" gb="$2" cache_mb="$3" delay_ns="${4:-0}" d="$NULLB_CFS/$1" dev
     [ -d "$d" ] && die "null_blk item $name already exists (stale? run teardown)"
     mkdir "$d"
     echo 4096 >"$d/blocksize"
     echo $((gb * 1024)) >"$d/size" # MiB
     echo 1 >"$d/memory_backed"
     echo "$cache_mb" >"$d/cache_size" # >0 => write-back cache + FLUSH/FUA
-    echo 0 >"$d/completion_nsec"
-    echo 0 >"$d/irqmode"
+    if [ "$delay_ns" -gt 0 ]; then
+        # Fabric-RTT emulation (r4): TIMER-mode completion — every IO
+        # completes delay_ns after submit, fully parallel per hw queue
+        # (no qdisc, no serialization; the netem-on-lo falsification).
+        # Queue geometry must carry the emulated BDP: the configfs
+        # defaults (1 submit queue × depth 64) capped the raw 32×32
+        # ceiling at exactly 4 dev × 64 = 256 concurrent (827 k
+        # measured) — a GEOMETRY cap masquerading as fabric. 8 × 256
+        # holds 2 k per device, ≫ any offered depth in the rigs.
+        echo "$delay_ns" >"$d/completion_nsec"
+        echo 2 >"$d/irqmode"
+        echo 8 >"$d/submit_queues" 2>/dev/null || true
+        echo 256 >"$d/hw_queue_depth" 2>/dev/null || true
+    else
+        echo 0 >"$d/completion_nsec"
+        echo 0 >"$d/irqmode"
+    fi
     echo 1 >"$d/power"
     # Modern kernels name the disk after the configfs item; older ones use
     # nullb<index>.
@@ -720,12 +750,23 @@ cmd_create() {
 
     for ((i = 0; i < OSS_COUNT; i++)); do
         nqn="$(oss_nqn "$i")"
-        idx="$(create_zram)"
-        printf 'oss\t%s\t%s\tzram\t%s\t%s\n' "$i" "$nqn" "$idx" "/dev/zram$idx" >>"$MANIFEST"
-        configure_zram "$idx" "$OSS_GB" "$OSS_ALGO" "$OSS_MEM_LIMIT_GB"
-        create_subsys "$nqn" "/dev/zram$idx" "$port"
-        nsdev="$(connect_subsys "$nqn")"
-        log "oss$i: /dev/zram$idx ($OSS_ALGO, ${OSS_GB}G virtual) -> $nqn -> $nsdev"
+        if [ -n "$OSS_NULLB_DELAY_US" ] && [ "$OSS_NULLB_DELAY_US" -gt 0 ]; then
+            # Fabric-RTT emulation venue (r4): oss on memory-backed
+            # null_blk with per-IO timer completion delay.
+            name="${NULLB_PREFIX}oss$i"
+            bdev="$(create_nullb "$name" "$OSS_GB" 0 "$((OSS_NULLB_DELAY_US * 1000))")"
+            printf 'oss\t%s\t%s\tnullb\t%s\t%s\n' "$i" "$nqn" "$name" "$bdev" >>"$MANIFEST"
+            create_subsys "$nqn" "$bdev" "$port"
+            nsdev="$(connect_subsys "$nqn")"
+            log "oss$i: $bdev (null_blk memory_backed=1, ${OSS_GB}G, delay ${OSS_NULLB_DELAY_US}us) -> $nqn -> $nsdev"
+        else
+            idx="$(create_zram)"
+            printf 'oss\t%s\t%s\tzram\t%s\t%s\n' "$i" "$nqn" "$idx" "/dev/zram$idx" >>"$MANIFEST"
+            configure_zram "$idx" "$OSS_GB" "$OSS_ALGO" "$OSS_MEM_LIMIT_GB"
+            create_subsys "$nqn" "/dev/zram$idx" "$port"
+            nsdev="$(connect_subsys "$nqn")"
+            log "oss$i: /dev/zram$idx ($OSS_ALGO, ${OSS_GB}G virtual) -> $nqn -> $nsdev"
+        fi
     done
 
     trap - ERR
@@ -735,6 +776,7 @@ cmd_create() {
         [ "$TRANSPORT" = "tcp" ] && echo "tcp_addr=$TCP_ADDR tcp_svc=$TCP_SVC"
         echo "mds_count=$MDS_COUNT mds_gb=$MDS_GB mds_cache_mb=$MDS_CACHE_MB"
         echo "oss_count=$OSS_COUNT oss_gb=$OSS_GB oss_algo=$OSS_ALGO oss_mem_limit_gb=$OSS_MEM_LIMIT_GB"
+        [ -n "$OSS_NULLB_DELAY_US" ] && echo "oss_nullb_delay_us=$OSS_NULLB_DELAY_US"
         echo "io_queues=$IO_QUEUES"
     } >"$STATE_DIR/meta.env"
 

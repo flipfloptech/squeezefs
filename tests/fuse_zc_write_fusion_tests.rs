@@ -1,42 +1,40 @@
-//! **Handler/worker fusion for small armed FUSE WRITEs** (zc-write-fusion
-//! campaign, 2026-08-07 — ruling D16's second half: the fast-tracked fix
-//! for the documented `SQUEEZEFS_FUSE_ZC` rand-4k caveat).
+//! **Handler/worker fusion for small armed FUSE WRITEs** — the
+//! CORRECTED predicate contracts (fused-lane-predicate campaign,
+//! 2026-08-08, superseding the 2026-08-07 zc-write-fusion contracts).
 //!
-//! The term (D14 write-side note + zcws-10 re-bracket): an armed small
-//! WRITE dispatches to a foreign handler lane and then pays a
-//! handler→worker→CQE→oneshot→handler round trip per slot-source
-//! consumption (store OR materialize) — two cross-thread wakes and two
-//! schedules per 4 KiB op, on top of the dispatch spawn itself. At
-//! 99.5 % direct engagement the rand4kow row still lost ~7.6 % and the
-//! hole-regime rand4k row 20.4 % (0.796×). The prior "structural"
-//! verdict covered dispatching the DMA from a foreign thread
-//! (SINGLE_ISSUER + per-ring bvec — still true); it never covered
-//! moving the HANDLER to the ring's own thread.
+//! The field falsification (`bd6413f9`, squeeze-test 2026-08-08): at
+//! ~300 µs fabric RTT the fused lane collapsed armed rand-4k writes to
+//! 0.45× of the fusion-off posture (386k unarmed / 300k fusion-off /
+//! 175k fused). Team adjudication: the fusion PREDICATE was wrong —
+//! `zc::hold_candidate` (shape-only: aligned ∧ < payload/2) held/fused
+//! shapes the W1 sole-owner patch will never consume. A W1-INELIGIBLE
+//! shape (growth / unmapped / overlay / shared — the
+//! `patch_ineligible_*` classes) paid hold + fused poll + LATE
+//! extraction, serialized on the worker at fabric RTT — **ops paying
+//! BOTH vehicles** (`fuse3_zc_write_fusions` ≈ ops ∧
+//! `fuse3_zc_write_extractions` ≈ ops is the smoking-gun signature).
 //!
-//! The fusion contract this suite pins (red-first):
+//! The corrected routing this suite pins (red-first):
 //!
-//! 1. **Engagement** — on a zc-armed mount, a small (≤ fusion ceiling)
-//!    hold-candidate WRITE runs its handler ON the queue worker's fused
-//!    lane: `fuse3_zc_write_fusions`/`_bytes` account it, and the
-//!    write's vehicle ledger (direct or extraction) still accounts the
-//!    payload exactly as before — fusion changes the VENUE, never the
-//!    vehicle.
-//! 2. **Correctness** — fused writes are byte-exact, buffered and
-//!    O_DIRECT, hole-regime (extraction vehicle) and overwrite-regime
-//!    (direct DMA vehicle), with durability via fsync (P0 smoke).
-//! 3. **The ceiling** — a held write ABOVE the fusion ceiling keeps the
-//!    classic handler-lane dispatch (the drain loop's inline work stays
-//!    bounded: the write-bracket note's warning about moving 1 MiB
-//!    memcpys onto the queue worker). Explicit
-//!    `SQUEEZEFS_FUSE_ZC_FUSION_MAX` wins verbatim.
-//! 4. **The lever** — `SQUEEZEFS_FUSE_ZC_WRITE_FUSION=0` keeps the
-//!    pre-campaign dispatch byte-identically (`fusions` stays 0); it is
-//!    the acceptance bracket's A/B control.
-//! 5. **Bounded outcomes compose** — a fused write whose bridge CQE is
-//!    lost (the zcws-9 seam) still resolves through the deadline ladder:
-//!    the waiter is now a fused future on the SAME worker that runs the
-//!    ladder, and nothing may deadlock or strand
-//!    (`zc_bridge_cqe_wedge_tests`' law extended to the fused lane).
+//! 1. **Hold/fuse ONLY what a slot→device vehicle will consume**: the
+//!    delivery-time hold gate composes the shape predicate with the
+//!    ROOT's W1-eligibility probe (the `try_sole_owner_patch` ladder's
+//!    cheap read-only mirror — `src/fuse_client.rs`), reached through
+//!    the `Filesystem::zc_write_hold_eligible` seam. No gate (or a
+//!    `false`) ⇒ never held.
+//! 2. **Ineligible shapes extract AT DELIVERY** on the worker's batched
+//!    pass (the streaming arm) and dispatch on the classic handler
+//!    lanes — never after a fused handler poll, and never fused (their
+//!    handler path parks on fabric-RTT FS state; the multi-lane venue
+//!    owns that concurrency).
+//! 3. **Staleness is bounded and counted**: a hint that turns
+//!    ineligible between delivery and handler extracts LATE exactly
+//!    once (`fuse3_zc_write_lazy_extractions` — the staleness gauge,
+//!    ≈ 0 in steady state).
+//!
+//! Every mount here sets `SQUEEZEFS_FUSE_ZC_WRITE_FUSION=1` explicitly:
+//! the contracts are default-agnostic (the default flip rides its own
+//! acceptance-gated commit).
 
 use squeezefs_testkit::{mount_supported, site};
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
@@ -125,7 +123,8 @@ impl Drop for Mount {
     }
 }
 
-/// Spawn the real daemon zc-armed with per-test fusion envs.
+/// Spawn the real daemon zc-armed, fusion lever ON (default-agnostic),
+/// with per-test extra envs.
 fn spawn_zc_mount(meta: &Path, mnt: &Path, log: &Path, envs: &[(&str, &str)]) -> Mount {
     std::fs::create_dir_all(mnt).expect("create mountpoint");
     let logf = std::fs::File::create(log).expect("create log");
@@ -139,6 +138,7 @@ fn spawn_zc_mount(meta: &Path, mnt: &Path, log: &Path, envs: &[(&str, &str)]) ->
         .arg("--gid")
         .arg(unsafe { libc::getgid() }.to_string())
         .env("SQUEEZEFS_FUSE_ZC", "1")
+        .env("SQUEEZEFS_FUSE_ZC_WRITE_FUSION", "1")
         // Pin the transport payload geometry: the hold bound (payload/2)
         // and the derived fusion ceiling (payload/8) key on it, and the
         // host's fs.fuse.max_pages_limit would otherwise vary the
@@ -205,18 +205,25 @@ fn metric(mnt: &Path, key: &str) -> u64 {
     })
 }
 
+/// The vehicle/venue ledger snapshot the corrected-routing asserts diff.
+fn ledger(mnt: &Path) -> (u64, u64, u64, u64) {
+    (
+        metric(mnt, "fuse3_zc_write_fusions"),
+        metric(mnt, "fuse3_zc_write_extractions"),
+        metric(mnt, "fuse3_zc_write_directs"),
+        metric(mnt, "fuse3_zc_write_lazy_extractions"),
+    )
+}
+
 /// A test payload. The HOLD-candidate predicate keys on the FILE
 /// offset/length (LBA-aligned), never the user buffer's address — FUSE
-/// O_DIRECT carries byte-addressed iovecs to the daemon — so a plain
-/// Vec is the right instrument here (the standing instrument-alignment
-/// lesson applies to SIZES near max_pages, which this suite stays
-/// far under).
+/// O_DIRECT carries byte-addressed iovecs to the daemon.
 fn fill_buf(len: usize, byte: u8) -> Vec<u8> {
     vec![byte; len]
 }
 
 /// pwrite `buf` at `off` through O_DIRECT (a single kernel-lane FUSE
-/// WRITE with LBA-aligned offset+len — the hold-candidate shape).
+/// WRITE with LBA-aligned offset+len).
 fn odirect_pwrite(path: &Path, off: u64, buf: &[u8]) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt as _;
     let f = std::fs::OpenOptions::new()
@@ -237,6 +244,17 @@ fn read_back(path: &Path, off: u64, len: usize) -> Vec<u8> {
     out
 }
 
+/// A durably-published striped file: buffered write + fsync so the
+/// whole-block mappings exist (the W1-ELIGIBLE substrate).
+fn publish_file(mnt: &Path, name: &str, len: usize, byte: u8) -> PathBuf {
+    let p = mnt.join(name);
+    let mut f = std::fs::File::create(&p).expect("create publish file");
+    f.write_all(&vec![byte; len]).expect("prewrite");
+    f.sync_all().expect("fsync prewrite");
+    drop(f);
+    p
+}
+
 struct Venue {
     _base: PathBuf,
     mount: Mount,
@@ -244,9 +262,6 @@ struct Venue {
 }
 
 /// Format + zc-armed mount with `envs`, or skip when zc cannot arm.
-/// Returns None ⇔ the test must skip (the skip is already ledgered
-/// through the testkit against the CALLER's site, honouring the
-/// require-mount promotion exactly like the `skip!` macro).
 fn armed_venue(tag: &str, envs: &[(&str, &str)], caller: squeezefs_testkit::Site) -> Option<Venue> {
     if !mount_supported(caller) {
         return None;
@@ -273,134 +288,154 @@ fn armed_venue(tag: &str, envs: &[(&str, &str)], caller: squeezefs_testkit::Site
     })
 }
 
-/// Contract 1+2: small hold-candidate WRITEs engage the fused lane on
-/// both vehicles — the hole-regime extraction leg and the overwrite
-/// direct-DMA leg — byte-exact, with the vehicle ledger unchanged.
+/// Rule 1 (the eligible half): a W1-ELIGIBLE aligned small overwrite of
+/// a durably-published whole-block-mapped file HOLDS, FUSES, and rides
+/// the direct slot→device DMA — with the extraction vehicle NEVER
+/// paying (the double-pay signature must be structurally absent on this
+/// shape).
 #[test]
-fn fused_small_writes_engage_on_both_vehicles_byte_exact() {
-    let Some(v) = armed_venue("engage", &[], site!()) else {
+fn w1_eligible_overwrites_fuse_without_double_pay() {
+    let Some(v) = armed_venue("eligible", &[], site!()) else {
         return;
     };
     let mnt = &v.mount.mnt;
 
-    let fusions0 = metric(mnt, "fuse3_zc_write_fusions");
-    let fusion_bytes0 = metric(mnt, "fuse3_zc_write_fusion_bytes");
-    let extractions0 = metric(mnt, "fuse3_zc_write_extractions");
+    let owfile = publish_file(mnt, "eligible.bin", 16 * 1024 * 1024, 0x11);
+    let (fu0, wx0, wd0, lz0) = ledger(mnt);
 
-    // Leg 1 — hole regime (the 0.796× row's shape): an aligned 4 KiB
-    // O_DIRECT write into a fresh file. Hold candidate → fused dispatch;
-    // patch-ineligible (unmapped) → the extraction vehicle, now consumed
-    // by a fused future on the worker's own lane.
-    let hole = mnt.join("hole.bin");
-    let payload = fill_buf(4096, 0xA5);
-    odirect_pwrite(&hole, 0, &payload).expect("hole-regime O_DIRECT write");
-    assert_eq!(
-        read_back(&hole, 0, 4096),
-        payload,
-        "hole-regime fused write must read back byte-exact"
-    );
-
-    let fusions1 = metric(mnt, "fuse3_zc_write_fusions");
-    assert!(
-        fusions1 > fusions0,
-        "a small hold-candidate WRITE must dispatch on the fused lane \
-         (fuse3_zc_write_fusions {fusions0} → {fusions1}; log: {})",
-        v.log.display()
-    );
-    assert!(
-        metric(mnt, "fuse3_zc_write_extractions") > extractions0,
-        "fusion changes the VENUE, never the vehicle: the hole-regime \
-         payload still arrives via the extraction ledger"
-    );
-
-    // Leg 2 — overwrite regime (the rand4kow row's shape): publish a
-    // striped mapping durably, then patch one aligned 4 KiB window.
-    // The W1 sole-owner direct DMA must still engage — from the fused
-    // venue (the D14 write-side live proof's shape, fused edition).
-    let owfile = mnt.join("overwrite.bin");
-    {
-        let mut f = std::fs::File::create(&owfile).expect("create overwrite file");
-        let body = vec![0x11u8; 16 * 1024 * 1024];
-        f.write_all(&body).expect("prewrite");
-        f.sync_all().expect("fsync prewrite");
-    }
-    let directs0 = metric(mnt, "fuse3_zc_write_directs");
-    let fusions2 = metric(mnt, "fuse3_zc_write_fusions");
     let patch = fill_buf(4096, 0x5C);
-    odirect_pwrite(&owfile, 4096, &patch).expect("overwrite-regime O_DIRECT patch");
+    odirect_pwrite(&owfile, 4096, &patch).expect("eligible O_DIRECT overwrite");
     assert_eq!(
         read_back(&owfile, 4096, 4096),
         patch,
-        "direct-leg fused write must read back byte-exact"
+        "eligible fused write must read back byte-exact"
     );
     assert_eq!(
         read_back(&owfile, 0, 4096),
         vec![0x11u8; 4096],
         "the patched block's neighbor bytes must be untouched"
     );
+
+    let (fu1, wx1, wd1, lz1) = ledger(mnt);
     assert!(
-        metric(mnt, "fuse3_zc_write_fusions") > fusions2,
-        "the overwrite-regime small WRITE must also ride the fused lane"
+        fu1 > fu0,
+        "the W1-eligible overwrite must ride the fused lane \
+         (fusions {fu0} → {fu1}; log: {})",
+        v.log.display()
     );
     assert!(
-        metric(mnt, "fuse3_zc_write_directs") > directs0,
-        "the W1 direct DMA must still engage from the fused venue \
-         (fuse3_zc_write_directs {directs0} → {}; log: {})",
-        metric(mnt, "fuse3_zc_write_directs"),
+        wd1 > wd0,
+        "the W1 direct DMA must consume the held slot (directs {wd0} → {wd1})"
+    );
+    assert_eq!(
+        wx1, wx0,
+        "the eligible shape must never ALSO pay the extraction vehicle \
+         (the double-pay signature: extractions {wx0} → {wx1})"
+    );
+    assert_eq!(
+        lz1, lz0,
+        "a fresh eligible hint must not extract late (lazy {lz0} → {lz1})"
+    );
+}
+
+/// Rule 2 (the ineligible half — THE field-falsification repro): a
+/// W1-INELIGIBLE small write (growth into a fresh file — the
+/// `patch_ineligible_unmapped`/oversize-extend class) must extract AT
+/// DELIVERY on the worker's batched pass and dispatch on the classic
+/// handler lanes: extraction vehicle exactly once, fused lane NEVER.
+///
+/// Pre-fix this is the smoking gun in-process: the shape-only
+/// `hold_candidate` holds it, the fused handler discovers ineligibility
+/// and extracts LATE — fusions +1 AND extractions +1 for ONE op.
+#[test]
+fn ineligible_growth_writes_extract_at_delivery_and_never_fuse() {
+    let Some(v) = armed_venue("ineligible", &[], site!()) else {
+        return;
+    };
+    let mnt = &v.mount.mnt;
+
+    let (fu0, wx0, _wd0, _lz0) = ledger(mnt);
+
+    // Growth shape: first-touch aligned 4 KiB O_DIRECT write into a
+    // fresh file — unmapped AND extending, refused by two W1 clauses.
+    let hole = mnt.join("growth.bin");
+    let payload = fill_buf(4096, 0xA5);
+    odirect_pwrite(&hole, 0, &payload).expect("growth O_DIRECT write");
+    assert_eq!(
+        read_back(&hole, 0, 4096),
+        payload,
+        "growth write must read back byte-exact"
+    );
+
+    let (fu1, wx1, _wd1, _lz1) = ledger(mnt);
+    assert!(
+        wx1 > wx0,
+        "the ineligible payload arrives via the at-delivery extraction \
+         vehicle (extractions {wx0} → {wx1}; log: {})",
+        v.log.display()
+    );
+    assert_eq!(
+        fu1, fu0,
+        "a W1-ineligible shape must NEVER hold/fuse — hold + fused poll + \
+         late extraction is the field's 0.45× collapse (fusions {fu0} → \
+         {fu1}, extractions {wx0} → {wx1}: both moving for one op IS the \
+         double-pay signature; log: {})",
         v.log.display()
     );
 
-    // The byte face accounts the fused payloads.
-    let fusion_bytes = metric(mnt, "fuse3_zc_write_fusion_bytes");
+    // The same law under load shape: a short burst of growth writes
+    // keeps the ledger single-vehicle.
+    let (fu2, wx2, _, _) = ledger(mnt);
+    for i in 0..16u64 {
+        odirect_pwrite(&hole, (i + 1) * 4096, &payload).expect("growth burst");
+    }
+    let (fu3, wx3, _, _) = ledger(mnt);
     assert!(
-        fusion_bytes >= fusion_bytes0 + 8192,
-        "fuse3_zc_write_fusion_bytes must account both fused 4 KiB \
-         payloads ({fusion_bytes0} → {fusion_bytes})"
+        wx3 >= wx2 + 16,
+        "burst: every growth op pays the extraction vehicle once"
     );
-
-    // P0 smoke: durable round trip through the fused path.
-    let p0 = mnt.join("p0.bin");
-    let p0_payload = fill_buf(8192, 0x3D);
-    odirect_pwrite(&p0, 0, &p0_payload).expect("p0 write");
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&p0)
-        .expect("open p0");
-    f.sync_all().expect("p0 fsync");
-    drop(f);
-    assert_eq!(read_back(&p0, 0, 8192), p0_payload, "p0 durable read-back");
+    assert_eq!(
+        fu3, fu2,
+        "burst: the fused ledger stays flat on the ineligible shape"
+    );
 }
 
-/// Contract 3: the fusion ceiling bounds the worker's inline work — a
-/// held write ABOVE the ceiling keeps the classic handler-lane dispatch
-/// (fusions unchanged), and an explicit `SQUEEZEFS_FUSE_ZC_FUSION_MAX`
-/// wins verbatim (the same shape fuses when the operator raises it).
+/// Contract 3: the fusion ceiling bounds the worker's inline work ON
+/// THE ELIGIBLE POPULATION — an eligible held write above the ceiling
+/// keeps the classic dispatch (still held, still direct-consumed), and
+/// an explicit `SQUEEZEFS_FUSE_ZC_FUSION_MAX` wins verbatim.
 #[test]
 fn fusion_ceiling_bounds_inline_work_and_explicit_wins() {
-    // Default ceiling (derived payload/8 = 128 KiB at the shipped 1 MiB
-    // geometry): a 256 KiB held write must NOT fuse.
+    // Default ceiling (derived payload/8 = 128 KiB at the pinned 1 MiB
+    // geometry): an ELIGIBLE 256 KiB overwrite holds but must NOT fuse.
     {
         let Some(v) = armed_venue("ceiling", &[], site!()) else {
             return;
         };
         let mnt = &v.mount.mnt;
-        let fusions0 = metric(mnt, "fuse3_zc_write_fusions");
-        let big = mnt.join("above_ceiling.bin");
+        let owfile = publish_file(mnt, "ceiling.bin", 16 * 1024 * 1024, 0x22);
+        let (fu0, _wx0, wd0, _lz0) = ledger(mnt);
         let payload = fill_buf(256 * 1024, 0x77);
-        odirect_pwrite(&big, 0, &payload).expect("above-ceiling write");
+        odirect_pwrite(&owfile, 0, &payload).expect("above-ceiling eligible write");
         assert_eq!(
-            read_back(&big, 0, 256 * 1024),
+            read_back(&owfile, 0, 256 * 1024),
             payload,
             "above-ceiling write byte-exact"
         );
+        let (fu1, _wx1, wd1, _lz1) = ledger(mnt);
         assert_eq!(
-            metric(mnt, "fuse3_zc_write_fusions"),
-            fusions0,
-            "a held write above the fusion ceiling must keep the classic \
+            fu1, fu0,
+            "an eligible write above the fusion ceiling keeps the classic \
              handler-lane dispatch (bounded inline work on the drain loop)"
         );
+        assert!(
+            wd1 > wd0,
+            "…while still consuming the held slot via the direct DMA \
+             (directs {wd0} → {wd1}; log: {})",
+            v.log.display()
+        );
     }
-    // Explicit ceiling raised to 256 KiB: the same shape fuses.
+    // Explicit ceiling raised to 256 KiB: the same eligible shape fuses.
     {
         let Some(v) = armed_venue(
             "ceilraise",
@@ -410,40 +445,41 @@ fn fusion_ceiling_bounds_inline_work_and_explicit_wins() {
             return;
         };
         let mnt = &v.mount.mnt;
-        let fusions0 = metric(mnt, "fuse3_zc_write_fusions");
-        let big = mnt.join("at_explicit_ceiling.bin");
+        let owfile = publish_file(mnt, "ceilraise.bin", 16 * 1024 * 1024, 0x33);
+        let (fu0, _, _, _) = ledger(mnt);
         let payload = fill_buf(256 * 1024, 0x88);
-        odirect_pwrite(&big, 0, &payload).expect("at-explicit-ceiling write");
+        odirect_pwrite(&owfile, 0, &payload).expect("at-explicit-ceiling write");
         assert_eq!(
-            read_back(&big, 0, 256 * 1024),
+            read_back(&owfile, 0, 256 * 1024),
             payload,
             "explicit-ceiling write byte-exact"
         );
         assert!(
-            metric(mnt, "fuse3_zc_write_fusions") > fusions0,
+            metric(mnt, "fuse3_zc_write_fusions") > fu0,
             "an explicit SQUEEZEFS_FUSE_ZC_FUSION_MAX wins verbatim \
-             (256 KiB ≤ 262144 must fuse; log: {})",
+             (256 KiB ≤ 262144 on the eligible shape must fuse; log: {})",
             v.log.display()
         );
     }
 }
 
 /// Contract 4: `SQUEEZEFS_FUSE_ZC_WRITE_FUSION=0` is the A/B control —
-/// the classic dispatch runs byte-identically and the fused ledger
-/// never moves.
+/// the eligible shape still holds (the D14 held path) and
+/// direct-consumes, but the fused ledger never moves.
 #[test]
 fn fusion_lever_off_keeps_the_classic_dispatch() {
-    let Some(v) = armed_venue("lever", &[("SQUEEZEFS_FUSE_ZC_WRITE_FUSION", "0")], site!()) else {
+    let Some(v) = armed_venue("lever", &[("SQUEEZEFS_FUSE_ZC_WRITE_FUSION", "0")], site!())
+    else {
         return;
     };
     let mnt = &v.mount.mnt;
-    let extractions0 = metric(mnt, "fuse3_zc_write_extractions");
+    let owfile = publish_file(mnt, "lever.bin", 16 * 1024 * 1024, 0x44);
+    let (_, _, wd0, _) = ledger(mnt);
 
-    let f = mnt.join("classic.bin");
     let payload = fill_buf(4096, 0xE1);
-    odirect_pwrite(&f, 0, &payload).expect("lever-off write");
+    odirect_pwrite(&owfile, 4096, &payload).expect("lever-off eligible write");
     assert_eq!(
-        read_back(&f, 0, 4096),
+        read_back(&owfile, 4096, 4096),
         payload,
         "lever-off write byte-exact"
     );
@@ -454,16 +490,15 @@ fn fusion_lever_off_keeps_the_classic_dispatch() {
          (the A/B control's engagement proof)"
     );
     assert!(
-        metric(mnt, "fuse3_zc_write_extractions") > extractions0,
-        "the classic dispatch still consumes the payload via extraction"
+        metric(mnt, "fuse3_zc_write_directs") > wd0,
+        "the held slot still direct-consumes on the classic dispatch"
     );
 }
 
-/// Contract 5: bounded outcomes compose with fusion — a fused write
-/// whose bridge CQE is lost (the zcws-9 drop seam) resolves through the
-/// deadline ladder on the SAME worker that polls the fused future:
-/// loud error or completed fallback within the bound, tripwires account
-/// it, the mount stays serviceable. Never a self-deadlock.
+/// Contract 5: bounded outcomes compose with fusion on the ELIGIBLE
+/// shape — a fused write whose direct-store bridge CQE is lost (the
+/// zcws-9 drop seam) resolves through the deadline ladder on the SAME
+/// worker that polls the fused future. Never a self-deadlock.
 #[test]
 fn fused_write_lost_bridge_cqe_resolves_through_the_ladder() {
     let Some(v) = armed_venue(
@@ -479,18 +514,15 @@ fn fused_write_lost_bridge_cqe_resolves_through_the_ladder() {
     let mnt = &v.mount.mnt;
     let log = &v.log;
 
+    let owfile = publish_file(mnt, "ladder.bin", 16 * 1024 * 1024, 0x55);
     let cancels0 = metric(mnt, "fuse3_zc_bridge_cancels");
 
-    // A fused-eligible write whose first bridge CQE the seam eats: the
-    // fused future parks on the worker's own lane while the SAME worker
-    // must run the deadline ladder that unparks it.
-    let file = mnt.join("fused_lost_cqe.bin");
     let payload = fill_buf(4096, 0x9B);
     let writer = {
-        let file = file.clone();
+        let owfile = owfile.clone();
         std::thread::spawn(move || -> std::io::Result<()> {
-            odirect_pwrite(&file, 0, &payload)?;
-            let f = std::fs::OpenOptions::new().write(true).open(&file)?;
+            odirect_pwrite(&owfile, 4096, &payload)?;
+            let f = std::fs::OpenOptions::new().write(true).open(&owfile)?;
             f.sync_all()?;
             Ok(())
         })
@@ -525,13 +557,13 @@ fn fused_write_lost_bridge_cqe_resolves_through_the_ladder() {
         log.display()
     );
 
-    // Post-recovery serviceability through the fused lane.
+    // Post-recovery serviceability through both routes.
     let probe = mnt.join("post_recovery.bin");
     let p = fill_buf(4096, 0x44);
-    odirect_pwrite(&probe, 0, &p).expect("post-recovery fused write");
+    odirect_pwrite(&probe, 0, &p).expect("post-recovery write");
     assert_eq!(
         read_back(&probe, 0, 4096),
         p,
-        "post-recovery mount must serve fused writes byte-exact"
+        "post-recovery mount must serve byte-exact"
     );
 }

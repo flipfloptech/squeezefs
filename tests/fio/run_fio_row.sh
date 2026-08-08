@@ -301,8 +301,53 @@ keys = ["ipc_ops_read", "ipc_ops_write", "ipc_bytes_in", "ipc_bytes_out",
         "ipc_fast_path_serves", "ipc_async_handoffs",
         "write_through_blocks", "write_pipeline_admission_waits",
         "placed_severs", "placed_merge_elides", "nt_copy_bytes",
-        "block_free_reclaim_cap_parks", "prefetch_issued", "ranged_reads"]
-print("  stats: " + " ".join(f"{k}={delta[k]}" for k in keys if delta.get(k)))
+        "block_free_reclaim_cap_parks", "prefetch_issued", "ranged_reads",
+        # zc-write PIN columns (fused-lane-predicate campaign, 2026-08-08
+        # — team directive): the arm/vehicle/venue ledger every armed
+        # write row must show. `fusions` beside `extractions` is the
+        # both-vehicles double-pay discriminator (the 0.45× field class);
+        # `lazy_extractions` is the hold gate's staleness gauge.
+        "fuse3_zc_negotiated", "fuse3_zc_write_fusions",
+        "fuse3_zc_write_fusion_bytes", "fuse3_zc_write_fusion_demotions",
+        "fuse3_zc_write_extractions", "fuse3_zc_write_directs",
+        "fuse3_zc_write_lazy_extractions",
+        "ipc_session_owners", "ipc_direct_shards"]
+after_full = json.load(open(sys.argv[2]))
+if after_full.get("fuse3_zc_negotiated"):
+    delta["fuse3_zc_negotiated"] = after_full["fuse3_zc_negotiated"]
+line = " ".join(f"{k}={delta[k]}" for k in keys if delta.get(k))
+# Histogram-mean PIN columns (bucket-midpoint estimate over the row's
+# delta): ipc_ingress_ns mean; ipc_drain_pass_ns mean + ops/pass + us/op.
+def mid_us(lbl):
+    if lbl == ">16s":
+        return 16e6
+    v = lbl[2:]
+    if v.endswith("us"):
+        c = float(v[:-2])
+    elif v.endswith("ms"):
+        c = float(v[:-2]) * 1e3
+    else:
+        c = float(v[:-1]) * 1e6
+    return 0.5 if c <= 1 else 0.75 * c
+def hist_delta(key):
+    hb, ha = before.get(key), after_full.get(key)
+    if not isinstance(ha, dict):
+        return None
+    n, w = 0, 0.0
+    for lbl, av in ha.items():
+        dd = av - (hb.get(lbl, 0) if isinstance(hb, dict) else 0)
+        if dd > 0:
+            n += dd
+            w += dd * mid_us(lbl)
+    return (n, (w / n) if n else 0.0)
+ing = hist_delta("ipc_ingress_ns")
+if ing and ing[0]:
+    line += f" ipc_ingress_ns_mean={ing[1]:.1f}us(n={ing[0]})"
+dp = hist_delta("ipc_drain_pass_ns")
+if dp and dp[0]:
+    opp = (delta.get("ipc_ops_read", 0) + delta.get("ipc_ops_write", 0)) / dp[0]
+    line += f" ipc_drain_pass[mean={dp[1]:.1f}us ops/pass={opp:.1f} us/op={dp[1]/max(opp,1e-9):.2f}]"
+print("  stats: " + line)
 EOF
 )"
     dbg "$STATS_LINE"
@@ -318,6 +363,17 @@ watch = ["invariant_tripwires", "rewrite_shadow_fence_drops",
          "write_pipeline_fence_drops", "data_dma_fence_refusals",
          "detached_task_panics"]
 hits = {k: delta[k] for k in watch if delta.get(k)}
+# zc both-vehicles double-pay gate (fused-lane-predicate, 2026-08-08):
+# on an armed row, vehicle events (directs + extractions) beyond ~one
+# per fused-or-held op mean ops are paying hold + LATE extraction —
+# the 0.45× field-falsification class. Gate at the lazy-extraction
+# counter (exact, per-op) rather than an ops estimate this harness
+# cannot always derive: > 5 % of the row's write vehicle events is a
+# predicate-drift failure, never noise.
+veh = delta.get("fuse3_zc_write_extractions", 0) + delta.get("fuse3_zc_write_directs", 0)
+lazy = delta.get("fuse3_zc_write_lazy_extractions", 0)
+if veh and lazy > 0.05 * veh:
+    hits["fuse3_zc_write_lazy_extractions"] = lazy
 print(" ".join(f"{k}=+{v}" for k, v in sorted(hits.items())))
 EOF
 )"

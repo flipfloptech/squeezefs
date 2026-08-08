@@ -226,6 +226,7 @@ pub static KNOBS: &[Knob] = &[
     k("SQUEEZEFS_IL_SPINS", int(0, 1 << 24), "adaptive", "Fixed completion spin count (pins the adaptive spin for measurement)."),
     k("SQUEEZEFS_IL_MAX_RUN_SLOTS", int(0, 1 << 16), "0 (unbounded)", "Cap on concurrently claimed slots per session."),
     k("SQUEEZEFS_IL_OP_TIMEOUT_MS", int(1, MS_MAX), "bounded default", "Per-op bounded wait against a stalled daemon, ms."),
+    k("SQUEEZEFS_IPC_DD_LANE_FLUSH", Kind::Bool, "on", "Direct-drive flush scope: on = a service thread enters only its OWN lane's ring (the r3 drain-funnel fix — flush-all serialized every svc thread on every shard's kernel uring_lock); 0 = the pre-r3 flush-all sweep (A/B lever)."),
     k("SQUEEZEFS_IL_REAP_PARK_MAX", int(0, 1 << 16), "2", "libaio reap: queue depth at or below which the event-driven park is used."),
     k("SQUEEZEFS_IL_REAP_QUANTUM_US", int(1, 1000), "50", "libaio reap: deep-regime quantum, µs — since reap-fanin 2026-08-08 the batch-threshold park's AGE BOUND (the k-th completion cuts it short); the shipped 50 µs is the 2026-07-26 sizing (shim-iops measurement lever)."),
     k("SQUEEZEFS_IL_READ_DEST", Kind::Bool, "on", "Arena-destination read serves (E-IL2); 0 = the A/B lever."),

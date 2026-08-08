@@ -190,6 +190,24 @@ fn dd_inline_reap() -> bool {
     *V.get_or_init(|| crate::env_knobs::bool_knob("SQUEEZEFS_IPC_DD_INLINE_REAP", true))
 }
 
+/// LANE-SCOPED flush (drain-funnel campaign, 2026-08-08 r3 — the A/B
+/// lever, default ON): a service thread's flush pass enters ONLY its
+/// own lane's ring. The shipped flush-ALL sweep put every svc thread on
+/// every shard's kernel `uring_lock` whenever that shard had unflushed
+/// SQEs — the funnel profile's #1 term (31 % of svc cycles in
+/// `mutex_spin_on_owner`/`osq_lock` under `io_uring_enter` at 32×32,
+/// 12 threads racing 12 rings). Liveness is unchanged where it matters:
+/// every production submitter IS a lane owner (svc threads pin their
+/// lane; the shard partition mirrors the session→owner partition), so
+/// its own sweep-end flush carries its SQEs — and any straggler on a
+/// foreign lane (tests, fallback-lane submitters) is carried by that
+/// lane's REAPER, whose `submit_and_wait` re-enters on its bounded
+/// 100 ms EXT_ARG cadence at the latest. `0` restores flush-all.
+fn dd_lane_flush() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| crate::env_knobs::bool_knob("SQUEEZEFS_IPC_DD_LANE_FLUSH", true))
+}
+
 thread_local! {
     /// The submitting thread's direct-drive LANE. Service threads set
     /// their owner index at loop start ([`set_service_lane`] from
@@ -414,8 +432,34 @@ impl DirectDriveEngine {
         let width = dd_shards();
         let nodes = crate::numa_core::topology().owner_nodes(width);
         let mut shards = Vec::with_capacity(width);
+        // COOP_TASKRUN (drain-funnel 2026-08-08 r3): without it the
+        // kernel delivers each completion's task-work by TWA_SIGNAL —
+        // interrupting whichever thread last touched the ring and
+        // running `io_handle_tw_list` under the ring's `uring_lock` ON
+        // THE SVC THREAD (the funnel profile's 9.5 % `get_signal →
+        // task_work_run → __mutex_lock` term). With it, task-work runs
+        // only when a task enters the ring — the reaper's own bounded
+        // wait, where it belongs. Negotiate-and-degrade: pre-5.19
+        // kernels refuse the flag (EINVAL) and fall back to the plain
+        // setup, loudly, once.
+        let mut coop_ok = true;
         for idx in 0..width {
-            let ring = IoUring::new(RING_ENTRIES)?;
+            let ring = if coop_ok {
+                match IoUring::builder().setup_coop_taskrun().build(RING_ENTRIES) {
+                    Ok(r) => r,
+                    Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                        coop_ok = false;
+                        log::warn!(
+                            "ipc direct-drive: kernel refused IORING_SETUP_COOP_TASKRUN \
+                             — dd rings degrade to signal-delivered task-work"
+                        );
+                        IoUring::new(RING_ENTRIES)?
+                    }
+                    Err(e) => return Err(e),
+                }
+            } else {
+                IoUring::new(RING_ENTRIES)?
+            };
             let use_fixed = if fds.is_empty() {
                 false
             } else {
@@ -611,11 +655,12 @@ impl DirectDriveEngine {
 
         let dev_read_off = dev_off + aligned_start;
         // ipc_direct_phase_ns: `admit` closes here (probe entry →
-        // slab insert); the same instant anchors `inflight`.
+        // slab insert); the SAME instant anchors `inflight` — one
+        // clock read for both (drain-funnel clock economy, r3).
         let t_insert = std::time::Instant::now();
-        crate::fuse_client::ipc_direct_phase_record(
+        crate::fuse_client::ipc_direct_phase_record_span(
             crate::fuse_client::IpcDirectPhase::Admit,
-            snap.t0,
+            t_insert.saturating_duration_since(snap.t0),
         );
         let pending = Pending {
             op,
@@ -730,9 +775,21 @@ impl DirectDriveEngine {
     /// cross-lane inline reaping would put every svc thread on every
     /// CQ gate). Disabled while shutting down — teardown CQEs belong
     /// to the reaper's drain contract.
+    ///
+    /// LANE SCOPE (drain-funnel 2026-08-08 r3, default ON): the enter
+    /// sweep covers ONLY the calling thread's lane — the flush-ALL
+    /// posture serialized every svc thread on every shard's kernel
+    /// `uring_lock` (the funnel profile's 31 % spin term). See
+    /// [`dd_lane_flush`] for the liveness argument; `0` restores the
+    /// thread-pairing-independent sweep.
     pub(crate) fn flush(&self) {
-        for (lane, shard) in self.shards.iter().enumerate() {
-            Self::flush_shard(lane, shard);
+        if dd_lane_flush() {
+            let lane = current_lane() % self.shards.len();
+            Self::flush_shard(lane, &self.shards[lane]);
+        } else {
+            for (lane, shard) in self.shards.iter().enumerate() {
+                Self::flush_shard(lane, shard);
+            }
         }
         if dd_inline_reap()
             && self.ext_arg_ok.load(Ordering::Relaxed)
@@ -972,12 +1029,12 @@ impl DirectDriveEngine {
             };
             // ipc_direct_phase_ns: `inflight` closes at the CQE pop
             // (slab insert → here — SQE push + flush-batch wait +
-            // device service + reap batching); the same instant
-            // anchors `finish`.
+            // device service + reap batching); the SAME instant
+            // anchors `finish` — one clock read for both (r3).
             let t_cqe = std::time::Instant::now();
-            crate::fuse_client::ipc_direct_phase_record(
+            crate::fuse_client::ipc_direct_phase_record_span(
                 crate::fuse_client::IpcDirectPhase::Inflight,
-                pending.t_insert,
+                t_cqe.saturating_duration_since(pending.t_insert),
             );
             self.finish(pending, res, t_cqe);
             served += 1;

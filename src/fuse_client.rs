@@ -3005,6 +3005,16 @@ pub fn ipc_direct_phase_record(phase: IpcDirectPhase, t0: std::time::Instant) {
     IPC_DIRECT_PROF[phase as usize].record(t0.elapsed());
 }
 
+/// Span form (drain-funnel clock economy, 2026-08-08 r3): record a
+/// pre-computed span — the submit site closes `admit` against the SAME
+/// `Instant` that anchors `inflight`, one clock read instead of two
+/// (the funnel profile priced `__vdso_clock_gettime` at 8.7 % of
+/// svc-thread cycles; every read on the per-op path is counted).
+#[inline]
+pub fn ipc_direct_phase_record_span(phase: IpcDirectPhase, span: std::time::Duration) {
+    IPC_DIRECT_PROF[phase as usize].record(span);
+}
+
 /// `ipc_direct_phase_ns` stats payload: `{phase: histogram}` — UNGATED.
 pub fn ipc_direct_phase_json() -> serde_json::Value {
     let mut phases = serde_json::Map::new();

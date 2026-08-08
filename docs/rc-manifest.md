@@ -636,6 +636,24 @@ row law added (team list): every later row FATAL-gates on
 extractions-vs-directs, `ipc_session_owners`, `ipc_direct_shards`,
 `ipc_ingress_ns` mean, `ipc_drain_pass_ns` (ops/pass + µs/op).
 
+**Internal-time program (user directive 2026-08-08, verbatim: "we should be
+using our micro benchmarks on all functions to see if we can reduce their
+overall time of execution focusing on hotspots... the only way is to lower
+our internal times since I can't lower the network"):** the IOPS frame is
+`IOPS = depth / clat` with clat = incompressible network+device (~330 µs
+field) + INTERNAL residence (~1.2 ms, ours) — the program is profile-ranked
+per-function time reduction, each hotspot carrying a field-shaped Criterion
+bench (the microbench program's convention) as its instrument, composed
+against the calibrated-venue row. Companion calibration law (third-party
+adjudication, accepted): **a latency emulator is calibrated against the
+SITE'S measured decomposition** (`ipc_direct_phase_ns.inflight` mean + raw
+same-shape latency), never a nominal delay constant — round 4's additive
+~300 µs backing timer produced 821.9 µs emulated inflight vs the field's
+~330 µs, and its 1.01 M "result" was just 1,024 ÷ its own 1.014 ms clat.
+An emulated venue's license is two proof rows: raw ≈ field raw class, and
+the unpatched binary reproducing the field equilibrium (~660–680k,
+ingress ~1.2 ms).
+
 **Ruling D17 (user 2026-08-08, verbatim: "filesystem will not be used until
 we have stable numbers we are happy with and support multiple clients
 without issues. so we don't need a 'safe' default."):** the pre-production

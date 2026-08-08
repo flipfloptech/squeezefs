@@ -998,6 +998,110 @@ fn bench_sharded_counters(c: &mut Criterion) {
     group.finish();
 }
 
+/// L3 coherence campaign (2026-08-08, `.benchmarks/2026-08-08-moka-coherence.md`):
+/// the read-mostly cache vs the classic moka value cache it replaced, at
+/// the FIELD shape (the microbench law: toy inputs are violations) —
+/// **32 hot inos** (the standing 32×1g fileset) hammered by concurrent
+/// readers (the field box runs 12 svc + 12 dd threads; the bench uses 8
+/// so the row is stable across dev boxes), values = striped
+/// `CachedMetadata` with a 256-entry block map (1 GiB at 4 MiB blocks).
+///
+/// What the rows can and cannot see: a 1-node box prices moka's per-read
+/// bookkeeping at its LOCAL cost (LLC-resident RMWs — the field ledger's
+/// ~7 % face); the 5–8× cross-socket amplification (54.6 % svc) only a
+/// 2-node venue manufactures. The contended rows are the mechanism
+/// instrument (bookkeeping RMWs vs pure loads), NOT the field win.
+fn bench_read_mostly_cache(c: &mut Criterion) {
+    use squeezefs::read_mostly_cache::{ReadMostlyCache, RmConfig};
+    let mut group = c.benchmark_group("read_mostly");
+
+    fn field_meta() -> squeezefs::routing::CachedMetadata {
+        let mut map = std::collections::HashMap::new();
+        for b in 0..256u32 {
+            map.insert(
+                b,
+                format!("blocks/vol-0123456789abcdef/{}", b as u64 * 4096),
+            );
+        }
+        squeezefs::routing::CachedMetadata {
+            file_type: "striped".into(),
+            size: 1 << 30,
+            block_map: Some(std::sync::Arc::new(map)),
+            ..Default::default()
+        }
+    }
+    fn build(
+        read_mostly: bool,
+    ) -> ReadMostlyCache<u64, squeezefs::routing::CachedMetadata, ahash::RandomState> {
+        let cache = ReadMostlyCache::new(
+            RmConfig {
+                name: "bench",
+                read_mostly,
+                capacity: 10_000,
+                tti: Some(std::time::Duration::from_secs(
+                    squeezefs::routing::METADATA_CACHE_TTI_SECS,
+                )),
+                ttl: None,
+                touch_secs: None,
+                pin: None,
+                clock: None,
+            },
+            ahash::RandomState::new(),
+        );
+        for ino in 0..32u64 {
+            cache.insert(ino, field_meta());
+        }
+        cache
+    }
+
+    const KEYS: u64 = 32;
+    for (label, read_mostly) in [("rm", true), ("moka", false)] {
+        let cache = build(read_mostly);
+        let mut k = 0u64;
+        group.bench_function(format!("{label}_get_hot_1t"), |b| {
+            b.iter(|| {
+                k = (k + 1) % KEYS;
+                black_box(cache.get(black_box(&k)))
+            });
+        });
+        let mut k2 = 0u64;
+        group.bench_function(format!("{label}_peek_size_1t"), |b| {
+            b.iter(|| {
+                k2 = (k2 + 1) % KEYS;
+                black_box(cache.peek_with(black_box(&k2), |m| m.size))
+            });
+        });
+    }
+
+    // Contended rows: 8 threads × 4096 gets each over the 32 shared keys
+    // (per-iteration thread spawn matches the sharded_counters pattern —
+    // constant across arms, so the DELTA is the bookkeeping term).
+    const THREADS: usize = 8;
+    const PER_THREAD: u64 = 4096;
+    for (label, read_mostly) in [("rm", true), ("moka", false)] {
+        let cache = std::sync::Arc::new(build(read_mostly));
+        group.bench_function(format!("{label}_get_hot_8t_x4096"), |b| {
+            b.iter(|| {
+                let mut hs = Vec::with_capacity(THREADS);
+                for t in 0..THREADS {
+                    let cache = std::sync::Arc::clone(&cache);
+                    hs.push(std::thread::spawn(move || {
+                        for i in 0..PER_THREAD {
+                            let k = (t as u64 * 7 + i) % KEYS;
+                            black_box(cache.peek_with(&k, |m| m.size));
+                        }
+                    }));
+                }
+                for h in hs {
+                    h.join().unwrap();
+                }
+            });
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_reclaim_enqueue,
@@ -1008,6 +1112,7 @@ criterion_group!(
     bench_metadata_clone,
     bench_dynamic_meta_routing,
     bench_error_paths,
-    bench_writeback_latch
+    bench_writeback_latch,
+    bench_read_mostly_cache
 );
 criterion_main!(benches);

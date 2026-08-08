@@ -2999,17 +2999,12 @@ pub fn ipc_drain_flush_json() -> serde_json::Value {
     IPC_DRAIN_FLUSH_PROF.to_json()
 }
 
-/// Record one direct-drive residence span started at `t0` (always-on).
-#[inline]
-pub fn ipc_direct_phase_record(phase: IpcDirectPhase, t0: std::time::Instant) {
-    IPC_DIRECT_PROF[phase as usize].record(t0.elapsed());
-}
-
-/// Span form (drain-funnel clock economy, 2026-08-08 r3): record a
-/// pre-computed span — the submit site closes `admit` against the SAME
-/// `Instant` that anchors `inflight`, one clock read instead of two
-/// (the funnel profile priced `__vdso_clock_gettime` at 8.7 % of
-/// svc-thread cycles; every read on the per-op path is counted).
+/// Record one pre-computed direct-drive residence span (always-on —
+/// the r5 single-read law: every anchor is a CLOCK_MONOTONIC ns value
+/// from ONE read per boundary crossing; the profile priced
+/// `__vdso_clock_gettime` at 8.1 %/7.1 % of svc/dd cycles at the old
+/// 5–6 reads per op, so the Instant-form record was deleted with its
+/// last caller).
 #[inline]
 pub fn ipc_direct_phase_record_span(phase: IpcDirectPhase, span: std::time::Duration) {
     IPC_DIRECT_PROF[phase as usize].record(span);
@@ -5689,7 +5684,10 @@ pub struct IpcDirectSnapshot {
     pub ino: u64,
     pub block: u32,
     /// The RAM-authoritative durable binding (whole-block, undecorated).
-    pub key: String,
+    /// CompactString: the shipped key shapes inline (≤ 24 B — no heap
+    /// clone per op; the r5 internal-time ledger priced the probe's
+    /// string builds at ~8 % of svc-thread cycles).
+    pub key: compact_str::CompactString,
     /// `BLOCK_CUSTODY_EPOCHS` word at probe time (bumped by every
     /// overlay/sibling/record retire — the 795 seqlock).
     pub epoch: u64,
@@ -5699,15 +5697,20 @@ pub struct IpcDirectSnapshot {
     pub incarnation: Option<u64>,
     pub offset: u64,
     pub len: u32,
-    /// Probe-time overlay/staging keys, carried so the CQE-side
-    /// revalidation is allocation-free (the reaper thread is the
-    /// deep-qd throughput governor — 3 string builds/op measured as
-    /// part of its 100 %-CPU saturation at t32qd32).
-    pub cache_key: String,
-    pub ext_key: String,
-    /// Probe-entry instant — the `ipc_direct_phase_ns` `admit`/`total`
-    /// anchor (shim-iops campaign, 2026-08-07).
-    pub t0: std::time::Instant,
+    /// Probe-time overlay/staging keys — ZERO-HEAP stack keys (r5; the
+    /// op-economy StackKey family), carried so the CQE-side
+    /// revalidation is allocation-free.
+    pub cache_key: crate::keys::StackKey,
+    pub ext_key: crate::keys::StackKey,
+    /// The key's backend identity + device offset, PARSED ONCE at the
+    /// probe (r5 parse-carry: the submit's per-op `parse_block_key`
+    /// re-search deleted — the StrSearcher/TwoWay ~4.4 % svc term).
+    pub be_id: compact_str::CompactString,
+    pub dev_off: u64,
+    /// Probe-entry instant (CLOCK_MONOTONIC ns — the drain's ONE clock
+    /// read, r5 single-read law): the `ipc_direct_phase_ns`
+    /// `admit`/`total` anchor.
+    pub t0_ns: u64,
 }
 
 pub enum IpcReadProbe {
@@ -9262,13 +9265,14 @@ impl SqueezefsFilesystem {
         ino: u64,
         offset: u64,
         len: u32,
+        t0_ns: u64,
     ) -> Result<IpcDirectSnapshot, IpcDirectIneligible> {
         use IpcDirectIneligible as I;
         // ipc_direct_phase_ns `admit`/`total` anchor (always-on): the
-        // probe entry is the daemon-side residence's t0 — everything
-        // before it (ring publish → drain pop) is the ingress term the
-        // ledger derives by subtraction from fio clat.
-        let t0 = std::time::Instant::now();
+        // DEQUEUE instant, handed in from the drain's ONE clock read
+        // (r5 single-read law — the probe pays no read of its own);
+        // everything before it (ring publish → drain pop) is the
+        // measured `ipc_ingress_ns` term.
         // Device-class shape: 4–64 KiB (the R3 ranged window class the
         // 64 KiB bounce pool sizes; sub-4 KiB and jumbo shapes are not
         // the governed miss shape).
@@ -9324,13 +9328,14 @@ impl SqueezefsFilesystem {
         // Overlay screen — ANY overlay presence ⇒ handler (correctness
         // owns ambiguity). The O(1) gate first (the capture_parked_runs
         // discipline: never a map scan when no overlay exists).
-        let file_path = crate::keys::inode_path(ino);
-        let cache_key = crate::keys::active_block_for_path(&file_path, b32).to_string();
+        // Zero-heap key builds (r5): the ino-direct StackKey forms — no
+        // file_path intermediate, no fmt-into-heap, no allocation.
+        let cache_key = crate::keys::active_block_stack(ino, u64::from(b32));
         if self
             .parked_overlay_count
             .load(std::sync::atomic::Ordering::Acquire)
             != 0
-            && self.active_block_buffers.contains_key(&cache_key)
+            && self.active_block_buffers.contains_key(cache_key.as_str())
         {
             return Err(I::Overlay);
         }
@@ -9340,14 +9345,19 @@ impl SqueezefsFilesystem {
             .router
             .cache
             .nvme
-            .read_staged_zero_copy(&cache_key)
+            .read_staged_zero_copy(cache_key.as_str())
             .is_some()
         {
             return Err(I::Overlay);
         }
         // W2 staged extent record (newer than every base tier).
-        let ext_key = crate::keys::active_block_ext_for_path(&file_path, b32).to_string();
-        if self.router.cache.nvme.has_staged_extent_record(&ext_key) {
+        let ext_key = crate::keys::active_block_ext_stack(ino, u64::from(b32));
+        if self
+            .router
+            .cache
+            .nvme
+            .has_staged_extent_record(ext_key.as_str())
+        {
             return Err(I::Overlay);
         }
         // The 795 custody snapshot: epoch + binding + fill incarnation.
@@ -9363,10 +9373,15 @@ impl SqueezefsFilesystem {
         } else {
             None
         };
+        // Parse-carry (r5): resolve the backend identity + device
+        // offset ONCE here — the submit path's per-op re-parse is gone.
+        let Ok((be_id, dev_off)) = self.router.backend_router.split_block_key(key) else {
+            return Err(I::Layout);
+        };
         Ok(IpcDirectSnapshot {
             ino,
             block: b32,
-            key: key.clone(),
+            key: compact_str::CompactString::from(key.as_str()),
             epoch,
             tracked,
             incarnation,
@@ -9374,7 +9389,9 @@ impl SqueezefsFilesystem {
             len,
             cache_key,
             ext_key,
-            t0,
+            be_id: compact_str::CompactString::from(be_id),
+            dev_off,
+            t0_ns,
         })
     }
 
@@ -9411,7 +9428,9 @@ impl SqueezefsFilesystem {
             .parked_overlay_count
             .load(std::sync::atomic::Ordering::Acquire)
             != 0
-            && self.active_block_buffers.contains_key(&snap.cache_key)
+            && self
+                .active_block_buffers
+                .contains_key(snap.cache_key.as_str())
         {
             return false;
         }
@@ -9419,7 +9438,7 @@ impl SqueezefsFilesystem {
             .router
             .cache
             .nvme
-            .read_staged_zero_copy(&snap.cache_key)
+            .read_staged_zero_copy(snap.cache_key.as_str())
             .is_some()
         {
             return false;
@@ -9428,7 +9447,7 @@ impl SqueezefsFilesystem {
             .router
             .cache
             .nvme
-            .has_staged_extent_record(&snap.ext_key)
+            .has_staged_extent_record(snap.ext_key.as_str())
         {
             return false;
         }

@@ -651,7 +651,7 @@ impl DataPlaneSink {
             let (op, completion) =
                 match self
                     .fs
-                    .ipc_direct_read_probe(ino, op.desc.offset, op.desc.len)
+                    .ipc_direct_read_probe(ino, op.desc.offset, op.desc.len, op.t0_ns)
                 {
                     Ok(snap) => match self.direct_engine() {
                         Some(engine) => match engine.submit(op, completion, snap) {
@@ -853,7 +853,7 @@ impl DataPlaneSink {
         }
         let snap = match self
             .fs
-            .ipc_direct_read_probe(ino, op.desc.offset, op.desc.len)
+            .ipc_direct_read_probe(ino, op.desc.offset, op.desc.len, op.t0_ns)
         {
             Ok(snap) => snap,
             Err(class) => {

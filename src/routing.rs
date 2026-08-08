@@ -2123,6 +2123,15 @@ impl BackendRouter {
         Ok((be_id.to_string(), offset))
     }
 
+    /// Borrow-form of [`Self::parse_block_key`] (r5 internal-time
+    /// program: the direct-drive probe's parse-carry — same
+    /// [`Self::split_key`] core, zero allocation; the returned `&str`
+    /// borrows the caller's key).
+    pub fn split_block_key<'a>(&self, block_key: &'a str) -> Result<(&'a str, u64)> {
+        let (be_id, offset, _) = Self::split_key(block_key)?;
+        Ok((be_id, offset))
+    }
+
     /// [`Self::parse_block_key`] plus the key's **incarnation** (spec §6.2
     /// item 6) — not a fork: both parses run the SAME extraction core
     /// ([`Self::split_key`]) and this one keeps the lifetime the other

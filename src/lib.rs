@@ -526,9 +526,16 @@ pub mod keys {
     /// form with headroom; [`StackKey::format`] returns `None` on
     /// overflow so pathological inputs fall back to the heap helpers
     /// instead of truncating (a truncated key would serve wrong data).
+    #[derive(Clone, Copy)]
     pub struct StackKey {
         buf: [u8; 192],
         len: usize,
+    }
+
+    impl std::fmt::Debug for StackKey {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_tuple("StackKey").field(&self.as_str()).finish()
+        }
     }
 
     impl StackKey {
@@ -604,6 +611,15 @@ pub mod keys {
     pub fn active_block_stack(ino: u64, block: u64) -> StackKey {
         StackKey::format_scoped(format_args!("active_block:inode_{ino}:block_{block}"))
             .expect("active_block key fits StackKey capacity")
+    }
+
+    /// Zero-heap scoped `active_block_ext:inode_{ino}:block_{block}` —
+    /// the W2 record-key twin of [`active_block_stack`] (r5 probe
+    /// economy: ino-direct, no path intermediate; fits always).
+    #[inline]
+    pub fn active_block_ext_stack(ino: u64, block: u64) -> StackKey {
+        StackKey::format_scoped(format_args!("active_block_ext:inode_{ino}:block_{block}"))
+            .expect("active_block_ext key fits StackKey capacity")
     }
 
     /// Zero-heap scoped `active_block:{file_path}:block_{block}` — the

@@ -16,11 +16,14 @@
 //! protocol library is dependency-free (loom-included cores), and this
 //! file needs `libc::clock_gettime`, which both consumers already carry.
 
-/// CLOCK_MONOTONIC now, low 32 bits of nanoseconds. Rust's `Instant` is
-/// the same kernel clock on Linux, so spans built from this compose with
-/// the `Instant`-anchored phase histograms.
+/// CLOCK_MONOTONIC now, full nanoseconds (r5 internal-time program: the
+/// ONE clock read per boundary crossing — its low 32 bits are the
+/// ingress-stamp domain, its u64 spans anchor the `ipc_direct_phase_ns`
+/// records, so one read serves both). Rust's `Instant` is the same
+/// kernel clock on Linux, so spans built from this compose with any
+/// remaining `Instant`-anchored histograms.
 #[inline]
-pub fn monotonic_stamp_ns_u32() -> u32 {
+pub fn monotonic_ns_u64() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -29,7 +32,14 @@ pub fn monotonic_stamp_ns_u32() -> u32 {
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     (ts.tv_sec as u64)
         .wrapping_mul(1_000_000_000)
-        .wrapping_add(ts.tv_nsec as u64) as u32
+        .wrapping_add(ts.tv_nsec as u64)
+}
+
+/// CLOCK_MONOTONIC now, low 32 bits of nanoseconds (the ingress-stamp
+/// domain — see [`monotonic_ns_u64`]).
+#[inline]
+pub fn monotonic_stamp_ns_u32() -> u32 {
+    monotonic_ns_u64() as u32
 }
 
 #[cfg(test)]

@@ -850,7 +850,12 @@ async fn custody_snapshot_revalidation_governs_the_serve() {
     // The prelude snapshot on a clean striped block is eligible…
     let snap0 = fx
         .fs
-        .ipc_direct_read_probe(ino, 16 * 4096, 4096)
+        .ipc_direct_read_probe(
+            ino,
+            16 * 4096,
+            4096,
+            squeezefs::mono_core::monotonic_ns_u64(),
+        )
         .expect("clean striped block must probe eligible");
     assert!(
         fx.fs.ipc_direct_revalidate(&snap0),
@@ -869,7 +874,12 @@ async fn custody_snapshot_revalidation_governs_the_serve() {
     // …a fresh snapshot sees the new epoch and revalidates again…
     let snap1 = fx
         .fs
-        .ipc_direct_read_probe(ino, 16 * 4096, 4096)
+        .ipc_direct_read_probe(
+            ino,
+            16 * 4096,
+            4096,
+            squeezefs::mono_core::monotonic_ns_u64(),
+        )
         .expect("probe after epoch bump");
     assert_eq!(snap1.epoch, block_custody_epoch(ino, 0));
     assert!(fx.fs.ipc_direct_revalidate(&snap1));
@@ -887,7 +897,12 @@ async fn custody_snapshot_revalidation_governs_the_serve() {
     );
     assert!(
         matches!(
-            fx.fs.ipc_direct_read_probe(ino, 16 * 4096, 4096),
+            fx.fs.ipc_direct_read_probe(
+                ino,
+                16 * 4096,
+                4096,
+                squeezefs::mono_core::monotonic_ns_u64()
+            ),
             Err(IpcDirectIneligible::Overlay)
         ),
         "the prelude must refuse a block with a live overlay"

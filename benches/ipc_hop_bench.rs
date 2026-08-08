@@ -814,6 +814,59 @@ fn bench_meta_ship_verbs(c: &mut Criterion) {
     g.finish();
 }
 
+/// r5 internal-time program (`.benchmarks/2026-08-08-iops-internal-time-r5.md`):
+/// the per-op hotspot instruments behind the direct-drive probe/phase
+/// path. FIELD-derived shapes in-file (program convention): ino
+/// 1_048_612 (a 7-digit steady-state ino), block 173, block key
+/// `"8388608"` — the shipped bare whole-block form (`routing::split_key`
+/// docs). Pairs measured:
+/// * `clock/*` — the phase-anchor read: `Instant::now`+`elapsed` (the
+///   pre-r5 form, 2 reads) vs ONE `mono_core::monotonic_ns_u64` span
+///   pair — the single-read law's per-read price (the profile's 8.1 %
+///   / 7.1 % svc/dd `__vdso_clock_gettime` term at 5–6 reads/op).
+/// * `probe_keys/*` — the probe's 3 key builds: heap (inode_path +
+///   two `FsKey::to_string`s + `String` key clone — the pre-r5 form,
+///   ~8 % of svc cycles as fmt/push_str/alloc) vs the r5 zero-heap
+///   stack forms + `CompactString` inline clone.
+fn bench_r5_internal_time(c: &mut Criterion) {
+    let mut g = c.benchmark_group("r5_internal_time");
+    let ino: u64 = 1_048_612;
+    let block: u32 = 173;
+    let key = String::from("8388608");
+
+    g.bench_function("clock/instant_pair", |b| {
+        b.iter(|| {
+            let t0 = std::time::Instant::now();
+            std::hint::black_box(t0.elapsed())
+        })
+    });
+    g.bench_function("clock/mono_ns_pair", |b| {
+        b.iter(|| {
+            let t0 = squeezefs::mono_core::monotonic_ns_u64();
+            std::hint::black_box(squeezefs::mono_core::monotonic_ns_u64().saturating_sub(t0))
+        })
+    });
+
+    g.bench_function("probe_keys/heap_build", |b| {
+        b.iter(|| {
+            let path = squeezefs::keys::inode_path(std::hint::black_box(ino));
+            let ck = squeezefs::keys::active_block_for_path(&path, block).to_string();
+            let ek = squeezefs::keys::active_block_ext_for_path(&path, block).to_string();
+            let k = std::hint::black_box(&key).clone();
+            std::hint::black_box((ck.len(), ek.len(), k.len()))
+        })
+    });
+    g.bench_function("probe_keys/stack_build", |b| {
+        b.iter(|| {
+            let ck =
+                squeezefs::keys::active_block_stack(std::hint::black_box(ino), u64::from(block));
+            let ek = squeezefs::keys::active_block_ext_stack(ino, u64::from(block));
+            let k = compact_str::CompactString::from(std::hint::black_box(key.as_str()));
+            std::hint::black_box((ck.as_str().len(), ek.as_str().len(), k.len()))
+        })
+    });
+    g.finish();
+}
 criterion_group!(
     benches,
     bench_ring_push_pop,
@@ -824,6 +877,7 @@ criterion_group!(
     bench_job_wire_frames,
     bench_cluster_wire_rtt,
     bench_meta_ship_verbs,
-    bench_drain_pass
+    bench_drain_pass,
+    bench_r5_internal_time
 );
 criterion_main!(benches);

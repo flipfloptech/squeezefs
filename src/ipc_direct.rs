@@ -288,9 +288,9 @@ struct Pending {
     /// recycles the buffer into its home pool on drop.
     bounce: Option<(SendPtr, bytes::Bytes)>,
     /// `ipc_direct_phase_ns` `inflight` anchor: slab-insert instant
-    /// (shim-iops campaign, 2026-08-07 — always-on residence
-    /// decomposition; `snap.t0` anchors `admit`/`total`).
-    t_insert: std::time::Instant,
+    /// (CLOCK_MONOTONIC ns — r5 single-read law; `snap.t0_ns` anchors
+    /// `admit`/`total`).
+    t_insert_ns: u64,
 }
 
 struct EngineState {
@@ -597,22 +597,16 @@ impl DirectDriveEngine {
         snap: IpcDirectSnapshot,
     ) -> Result<(), (DataOp, SlotCompletion)> {
         let router = &self.fs.router;
-        let (be_id, dev_off) = match router.backend_router.parse_block_key(&snap.key) {
-            Ok(v) => v,
-            Err(_) => {
-                METRICS
-                    .ipc_direct_ineligible_backend
-                    .fetch_add(1, Ordering::Relaxed);
-                return Err((op, completion));
-            }
-        };
-        let Some(vol) = self.vols.get(&be_id) else {
+        // Parse-carry (r5): the probe resolved `(be_id, dev_off)` once;
+        // the per-op re-parse (the StrSearcher/TwoWay svc term) is gone.
+        let (be_id, dev_off) = (snap.be_id.as_str(), snap.dev_off);
+        let Some(vol) = self.vols.get(be_id) else {
             METRICS
                 .ipc_direct_ineligible_backend
                 .fetch_add(1, Ordering::Relaxed);
             return Err((op, completion));
         };
-        if !router.backend_router.is_backend_healthy(&be_id) {
+        if !router.backend_router.is_backend_healthy(be_id) {
             METRICS
                 .ipc_direct_ineligible_backend
                 .fetch_add(1, Ordering::Relaxed);
@@ -677,12 +671,12 @@ impl DirectDriveEngine {
 
         let dev_read_off = dev_off + aligned_start;
         // ipc_direct_phase_ns: `admit` closes here (probe entry →
-        // slab insert); the SAME instant anchors `inflight` — one
-        // clock read for both (drain-funnel clock economy, r3).
-        let t_insert = std::time::Instant::now();
+        // slab insert); the SAME ns read anchors `inflight` — one
+        // clock read for both (r5 single-read law).
+        let t_insert_ns = crate::mono_core::monotonic_ns_u64();
         crate::fuse_client::ipc_direct_phase_record_span(
             crate::fuse_client::IpcDirectPhase::Admit,
-            t_insert.saturating_duration_since(snap.t0),
+            std::time::Duration::from_nanos(t_insert_ns.saturating_sub(snap.t0_ns)),
         );
         let pending = Pending {
             op,
@@ -691,7 +685,7 @@ impl DirectDriveEngine {
             window,
             win_skew,
             bounce,
-            t_insert,
+            t_insert_ns,
         };
 
         // Lane routing: this thread's shard (service threads pin their
@@ -1049,14 +1043,14 @@ impl DirectDriveEngine {
             };
             // ipc_direct_phase_ns: `inflight` closes at the CQE pop
             // (slab insert → here — SQE push + flush-batch wait +
-            // device service + reap batching); the SAME instant
-            // anchors `finish` — one clock read for both (r3).
-            let t_cqe = std::time::Instant::now();
+            // device service + reap batching); the SAME ns read
+            // anchors `finish` — one clock read (r5 single-read law).
+            let t_cqe_ns = crate::mono_core::monotonic_ns_u64();
             crate::fuse_client::ipc_direct_phase_record_span(
                 crate::fuse_client::IpcDirectPhase::Inflight,
-                t_cqe.saturating_duration_since(pending.t_insert),
+                std::time::Duration::from_nanos(t_cqe_ns.saturating_sub(pending.t_insert_ns)),
             );
-            self.finish(pending, res, t_cqe);
+            self.finish(pending, res, t_cqe_ns);
             served += 1;
         }
         served
@@ -1066,7 +1060,7 @@ impl DirectDriveEngine {
     /// anything else falls back to the handler path (which re-runs the
     /// full moving-custody read protocol and surfaces genuine errors).
     /// `t_cqe` anchors the `ipc_direct_phase_ns` `finish` span.
-    fn finish(&self, pending: Pending, res: i32, t_cqe: std::time::Instant) {
+    fn finish(&self, pending: Pending, res: i32, t_cqe_ns: u64) {
         let Pending {
             op,
             completion,
@@ -1074,7 +1068,7 @@ impl DirectDriveEngine {
             window,
             win_skew,
             bounce,
-            t_insert: _,
+            t_insert_ns: _,
         } = pending;
         let exact = res >= 0 && res as usize == window;
         if exact && self.fs.ipc_direct_revalidate(&snap) {
@@ -1111,13 +1105,17 @@ impl DirectDriveEngine {
             // completion posted) and `total` (probe entry → here — the
             // daemon-side residence). Fallbacks ride the handler, whose
             // own family times them.
-            crate::fuse_client::ipc_direct_phase_record(
+            // ONE end-of-op ns read closes BOTH finish and total (r5
+            // single-read law — the dd population's clock share was
+            // 7.1 % of cycles at 3 reads/op).
+            let end_ns = crate::mono_core::monotonic_ns_u64();
+            crate::fuse_client::ipc_direct_phase_record_span(
                 crate::fuse_client::IpcDirectPhase::Finish,
-                t_cqe,
+                std::time::Duration::from_nanos(end_ns.saturating_sub(t_cqe_ns)),
             );
-            crate::fuse_client::ipc_direct_phase_record(
+            crate::fuse_client::ipc_direct_phase_record_span(
                 crate::fuse_client::IpcDirectPhase::Total,
-                snap.t0,
+                std::time::Duration::from_nanos(end_ns.saturating_sub(snap.t0_ns)),
             );
         } else {
             // Custody moved mid-DMA, or the device said no: the handler

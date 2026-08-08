@@ -365,6 +365,10 @@ pub struct BindingRights {
 pub struct DataOp {
     pub desc: SlotDescriptor,
     pub binding: BindingRights,
+    /// Dequeue-instant (CLOCK_MONOTONIC ns, the drain's ONE clock read —
+    /// r5 single-read law): the daemon-residence t0 every
+    /// `ipc_direct_phase_ns` span anchors against.
+    pub t0_ns: u64,
     /// The validated arena window `[arena_off, arena_off + len)` —
     /// **client-writable memory** (§5.3.1: single-read discipline; derived
     /// values from a severed copy only).
@@ -967,15 +971,17 @@ impl IpcSession {
             // THE one linearization read of the descriptor (§5.3.1 rule 1):
             // validate the copy, serve from the copy, never re-read.
             let desc = slot.snapshot_descriptor();
-            // Ring-ingress residence (reap-fanin 2026-08-08): one
-            // dequeue read of the client's publish stamp, bucketed
-            // through the delta law (display-only — a hostile stamp can
-            // pollute a histogram, never steer a serve; implausible
-            // deltas are discarded there, not clamped).
-            if let Some(ns) = squeezefs_ipc::layout::ingress_delta_ns(
-                crate::mono_core::monotonic_stamp_ns_u32(),
-                slot.ingress_stamp(),
-            ) {
+            // Ring-ingress residence (reap-fanin 2026-08-08) + the
+            // r5 single-read law: ONE clock read per dequeue — its low
+            // 32 bits close the ingress delta (display-only; hostile /
+            // implausible stamps discarded by the law, never clamped),
+            // its u64 anchors the op's daemon-residence t0 (the
+            // `ipc_direct_phase_ns` admit/total base), so the probe
+            // pays no clock read of its own.
+            let t0_ns = crate::mono_core::monotonic_ns_u64();
+            if let Some(ns) =
+                squeezefs_ipc::layout::ingress_delta_ns(t0_ns as u32, slot.ingress_stamp())
+            {
                 crate::fuse_client::ipc_ingress_record_ns(ns);
             }
             let completion = SlotCompletion {
@@ -983,7 +989,7 @@ impl IpcSession {
                 slot_index: index,
                 inflight: Some(Arc::clone(&self.inflight)),
             };
-            self.serve_validated(&desc, sink, completion);
+            self.serve_validated(&desc, t0_ns, sink, completion);
             served += 1;
             if served >= budget {
                 break;
@@ -1000,6 +1006,7 @@ impl IpcSession {
     fn serve_validated(
         &self,
         desc: &SlotDescriptor,
+        t0_ns: u64,
         sink: &Arc<dyn SessionSink>,
         completion: SlotCompletion,
     ) {
@@ -1064,6 +1071,7 @@ impl IpcSession {
             DataOp {
                 desc: *desc,
                 binding,
+                t0_ns,
                 payload,
             },
             completion,

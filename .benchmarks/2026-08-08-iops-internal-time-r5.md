@@ -188,3 +188,23 @@ committed Criterion outputs.
    field profile: **clat 1,545 → ~900–1,100 µs ⇒ 0.93–1.14 M IOPS**
    (the 1 M class), with the field profile adjudicating the residual
    ladder (L3 hashing ~7–9 %, dd `uring_lock` residue ~8 %).
+
+### §6 EXECUTED (2026-08-08, `.benchmarks/2026-08-08-field-ingress-profile.md`)
+
+The owed field profile ran on squeeze-test at dev tip `4d033c2f`
+(default posture, engagement exact, 49.35 M ops). Row: **706 k /
+clat 1,450 µs / ingress 1,165 µs** — +6.5 % vs the 663 k equilibrium;
+**the §6.3 projection band (0.93–1.14 M) was NOT met, and the profile
+names why**: the local cycle SHARES do not transplant — on the
+2-socket field box (Xeon 6426Y, 2 NUMA nodes vs the 1-node local
+venue) the ladder's **L3 term (moka metadata-cache bookkeeping +
+hashing) is 54.6 % of svc / 33.4 % of dd cycles** (local: 7.0/9.4)
+≈ 12 µs of the 17.96 µs/op svc service time — cross-socket coherence
+on moka's shared read-path RMW lines (read ring, TinyLFU sketch,
+entry timestamps, `do_run_pending_tasks`), hammered by 24 threads on
+~32 hot inos. L1+L2 engaged exactly (clock 8.9 → 0.38 %, probe
+strings gone, `mutex_spin_on_owner` gone) but were only ~8–9 % of the
+FIELD's svc cycles. The residual-ladder ruling stands with L3
+re-priced field-first; the charter (arc-swap read-mostly snapshot /
+sampled read-recording / per-node instances — NOT a hasher swap) is
+in the field-profile note §3.

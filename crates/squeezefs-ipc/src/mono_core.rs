@@ -1,9 +1,10 @@
 //! The ring-ingress residence CLOCK (reap-fanin campaign, 2026-08-08):
 //! CLOCK_MONOTONIC truncated to its low 32 bits of nanoseconds — the
-//! one clock BOTH sides of the [`crate::layout::IpcSlot::stamp_ingress`]
-//! protocol read, so the daemon's dequeue-time subtraction
-//! ([`crate::layout::ingress_delta_ns`]) is a measurement, not a
-//! cross-clock guess. Same host, same boot (the session protocol's own
+//! one clock BOTH sides of the `IpcSlot::stamp_ingress` protocol read
+//! (plain-text on purpose: this file is `#[path]`-included by crates
+//! where `squeezefs_ipc::layout` is a foreign crate), so the daemon's
+//! dequeue-time subtraction (`layout::ingress_delta_ns`) is a
+//! measurement, not a cross-clock guess. Same host, same boot (the
 //! precondition — design KD-7), so the domain is shared by construction;
 //! the u32 truncation wraps every ~4.295 s, which is why the delta law
 //! carries its 1 s plausibility ceiling.

@@ -172,12 +172,84 @@ face of it).
 
 ### 4.3 U1 — un-emulated venue, fusion lever on the W1 shape
 
-U1-TABLE
+| leg | GB/s | IOPS | fusions | directs | extractions | lazy |
+|---|---|---|---|---|---|---|
+| U1 f=1 | 0.626 | 152.9k | 9.72M | 9.72M | 1.24M | 80 |
+| U2 f=0 | 0.566 | 138.3k | 0 | 8.78M | 1.04M | 109 |
+| U3 f=0 | 0.559 | 136.5k | 0 | 8.66M | 1.07M | 111 |
+| U4 f=1 | 0.630 | 153.7k | 9.77M | 9.77M | 1.24M | 109 |
+
+**Fused = 1.116× fusion-off (brackets 1.106× / 1.127× — both orders) —
+the original W1-shape fusion win survives the fix un-emulated.** The
+eligible-shape extraction residue (~11–13 % of directs here vs ~6 % on
+the emulated venue) is honestly-ineligible ops — a norandommap revisit
+landing while a prior extraction's extent overlay is still parked makes
+the block W1-ineligible until the fold, a self-seeding class that
+scales with the row's IOPS; the EXACT hint-accuracy instrument is
+`lazy` (80–111 ops of ~10M vehicle events ≈ 0.001 %).
+
+The first U-pass aborted on a rig gate bug (the 10 % residue bound was
+calibrated on the emulated venue; the exact staleness instrument is
+`lazy`, which was 99) — bound re-derived to 25 % with the residue class
+documented, and the count restarted from zero per the multi-run
+discipline (U1b is the counted pass).
 
 ## 5. Default verdict
 
-DEFAULT
+**Default flipped back ON in this branch (`SQUEEZEFS_FUSE_ZC_WRITE_FUSION`
+default `on`, commit `4b1396d7`) — the charter's bar met with proof:**
+
+* fusion-on ≥ fusion-off at rand-4k on BOTH charter shapes on the
+  fabric-emulated venue (field job shape 1.019×, W1-eligible 1.049×);
+* armed ≥ 0.97× unarmed on both shapes on the emulated venue (1.090× /
+  1.153×);
+* the ineligible-majority ledger law holds (growth rows: extractions ≈
+  ops, fusions ≈ 0 — 0.17 %, the counted out-of-order adjacency-peek
+  residue — and the vehicles never double-pay: `lazy` ≤ 0.1 %
+  everywhere);
+* the un-emulated W1-shape win survives (1.116×, both orders).
+
+The falsification records (`bd6413f9`'s knob text in
+`docs/operations.md`, the registry entry, the `fusion_enabled` doc)
+carry the resolution addendum: the collapse was the PREDICATE
+double-paying W1-ineligible ops, not the lane's bounded polling; the
+lane's RTT-concurrency question for the now-legitimately-fused
+population is answered by the brackets above (fused ≥ off at 0.36 ms
+RTT on both shapes — no residual concurrency term surfaced at this
+venue's depth; the field bracket on real hardware remains the standing
+confirmation row and can reuse
+`.benchmarks/rigs/2026-08-08-fused-predicate-rig.sh` verbatim, whose
+stats-pin columns make any residual term attributable per row).
 
 ## 6. Gates
 
-GATES
+* Red-first: `89a037bc` verified red against `bd6413f9` (the ineligible
+  contract failed on the missing lazy ledger; the netem red passes
+  carry the both-vehicles signature at 46–97 %).
+* **×10 (consecutive, final binary `4b1396d7`, root, live armed
+  7.1-sqz): ALL GREEN** across {fuse_zc_write_fusion (5 corrected
+  contracts), fsync_writeback_tail_loss (P0), zc_bridge_cqe_wedge} —
+  30 suite executions, zero failures.
+* Constraint suites green at the fix commit: fuse_zc_write,
+  write_through_coverage, transport_lease_overlong, wedge_census,
+  metrics pin (incl. the new lazy gauge), env-knob convention,
+  skip ledger, derivation sweep; fork suite 160.
+* Both workspaces `clippy --all-targets -D warnings` (root also
+  `--all-features`) + `fmt --check` clean; markdown check PASS.
+* Load-bearing laws re-proven live: §5.4 lease-severance (the lazy
+  materialize still mints one lease per invocation), slot-state machine
+  untouched, bounded-outcome bridge ladder reaching a fused waiter
+  (drop-seam leg), COMMIT-after-extraction ordering unchanged, P0
+  tail-loss ×10.
+* Venue hygiene: netem installed only over a verified-default lo qdisc
+  and removed after every run (EXIT trap + explicit final check —
+  `noqueue` restored); all mounts torn down; both devsubs left healthy
+  (the loop devsub created this campaign remains for future use, as the
+  tcp one did from the prior campaign).
+* Deviations recorded: the E1 first launch aborted on a rig
+  cross-domain estimator (counters span layout+ramp+window vs fio's
+  window — gates re-derived counter-domain, restarted from zero); the
+  U first pass aborted on the emulated-venue-calibrated residue bound
+  (re-derived with the class documented, restarted from zero); red-2's
+  rig died POST-verdict from editing a running script (both rows
+  captured; frozen-copy discipline adopted for every later launch).

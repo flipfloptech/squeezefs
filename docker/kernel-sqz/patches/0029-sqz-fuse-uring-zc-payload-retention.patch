@@ -1,0 +1,530 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sqz kernel recipe <sqz-kernel@squeezefs>
+Date: Sun, 9 Aug 2026 07:40:00 -0400
+Subject: [PATCH 29/29] sqz: fuse-uring zc payload retention
+
+sqz: fuse-uring zc payload retention
+
+Approach B's ACK-early accelerator (design-device-overlay §8 / design
+kernel-zc-write-v2 §3): the daemon may COMMIT (ACK the write to the
+application) while the sparse-slot pages remain registered, DMA from
+those bvecs later, and RELEASE the slot explicitly when done.
+
+Depends on 0025: after fuse_request_end() the folios' owners drop their
+references; only the imu-held references from 0025 keep a retained
+slot's pages live.
+
+uapi (include/uapi/linux/fuse.h; struct size stays 24 bytes, union
+absorbs the new member; BUILD_BUG_ON in dev_uring.c):
+
+  FUSE_IO_URING_CMD_RELEASE_PAYLOAD = 3
+  FUSE_URING_PAYLOAD_RETENTION      (1 << 2)   /* init.flags */
+  FUSE_URING_COMMIT_RETAIN          (1 << 0)   /* commit.flags */
+
+Arming: PAYLOAD_RETENTION is accepted only with ZERO_COPY; refuse
+-EINVAL otherwise. Re-REGISTER consistency includes the retention bit.
+
+COMMIT with RETAIN is valid only when the queue is retention-armed AND
+the ent is zero_copied AND the registration was ITER_SOURCE (a write).
+Any violation fails the commit with -EINVAL without consuming the
+request. Read-direction retention is refused by design.
+
+On a valid RETAIN the request ends normally (write(2) returns) but
+io_buffer_unregister() is skipped and the ent goes FRRS_RETAINED. The
+COMMIT_AND_FETCH cmd stays pending (no CQE) — re-arm is deferred
+exactly like a §5.4 payload lease. Pin accounting is structural: one
+retained slot = one ent out of the fetch pool, bounded by
+zero_copy_depth.
+
+RELEASE_PAYLOAD looks up by commit_id:
+  - FRRS_RETAINED: unregister, re-enter fetch, RELEASE completes 0
+  - live un-retained commit: -EBUSY
+  - unknown / already released: -ENOENT
+  - unknown opcode (old kernel): -EINVAL / -EOPNOTSUPP
+The errno split is the negotiation probe.
+
+Teardown drains FRRS_RETAINED like userspace-held ents whose request
+already ended — no stop_fuse_req_end, parked cmd completed through the
+existing IO_URING_F_CANCEL-safe path (-ENOTCONN). Pages survive until
+the ring releases them (0025's law). A ratelimited pr_warn fires when
+teardown sees a nonzero retained population (daemon lost RELEASEs).
+No kernel timer: a leaked retention is bounded, visible as fetch
+starvation, and reclaimed at teardown.
+
+Stability law (kernel documents; daemon enforces): after
+COMMIT-with-RETAIN the application legally owns its buffer again.
+Bytes that land are sampled at DMA time — unstable-write semantics
+(NFS UNSTABLE/COMMIT class). Page-cache writeback is sound by
+composition (redirty is a new WRITE; overlay newest-wins). O_DIRECT
+GUP pages are NOT sound in general; ACK-early those only under an
+explicit opt-in. A read intersecting an ACKed-but-incomplete store
+must wait for that store or serve from its retained source; it may
+never treat the range as an uncovered old-map gap.
+
+A retention-armed queue with zero RETAIN commits behaves bit-identically
+to a zc queue.
+
+[sqz 6.19.14] io_uring_sqe_cmd; cancel moves FRRS_RETAINED onto ent_in_userspace like AVAILABLE (no kfree — teardown owns the ent); prepare_send is the simpler 6.19 error arm.
+
+---
+diff --git a/Documentation/filesystems/fuse/fuse-io-uring.rst b/Documentation/filesystems/fuse/fuse-io-uring.rst
+index 11c244b63..f9483f28c 100644
+--- a/Documentation/filesystems/fuse/fuse-io-uring.rst
++++ b/Documentation/filesystems/fuse/fuse-io-uring.rst
+@@ -154,3 +154,39 @@ Please note that the server is not able to directly access these pages, it
+ must go through the io-uring interface to read/write to them. The pages are
+ unregistered once the server replies to the request. Non-zero-copyable
+ payload (if needed) is placed in a buffer from the kernel-managed buffer ring.
++
++Payload retention
++=================
++
++Zero-copy write payloads can outlive the FUSE request. A privileged server
++that set ``FUSE_URING_PAYLOAD_RETENTION`` (requires ``FUSE_URING_ZERO_COPY``)
++may commit a write with ``FUSE_URING_COMMIT_RETAIN``. The application's
++write(2) then returns while the sparse-slot pages stay registered. The
++COMMIT_AND_FETCH command stays pending (no CQE, no fetch) until the server
++issues ``FUSE_IO_URING_CMD_RELEASE_PAYLOAD`` with the same ``commit_id``.
++
++Read-direction retention is refused (``-EINVAL``): a retained READ dest has
++no consumer once the reply is committed. Illegal RETAIN (queue not armed,
++not zero-copied, or not ``ITER_SOURCE``) fails the commit with ``-EINVAL``
++without consuming the request. ``RELEASE_PAYLOAD`` on an unknown
++``commit_id`` returns ``-ENOENT``; on a live un-retained commit, ``-EBUSY``.
++Unknown opcode on an old kernel is ``-EINVAL``/``-EOPNOTSUPP`` — that split
++is the negotiation probe.
++
++After COMMIT-with-RETAIN, write(2) has returned: the application legally owns
++its buffer again and may modify it, while the retained DMA has not yet
++sampled the pages. The bytes that land are sampled at DMA time within the
++retention window — **unstable-write semantics** (the NFS UNSTABLE/COMMIT
++class). Kernel-side this is a documentation duty; the daemon decides which
++writes may ACK early.
++
++A read intersecting an ACKed-but-incomplete store must wait for that store
++or serve from its retained source; it may never treat the range as an
++uncovered old-map gap.
++
++Pin accounting is structural: one retained slot is one ent out of the fetch
++pool, bounded by ``zero_copy_depth``. The kernel does not carry a timer. A
++leaked retention is reclaimed at teardown (ratelimited ``pr_warn``). Page
++lifetime follows the io_uring registration (see the folio-get / imu-release
++contract); request lifetime follows FUSE. Neither trusts the other's
++ordering.
+diff --git a/fs/fuse/dev_uring.c b/fs/fuse/dev_uring.c
+index fc374bc61..6fc2a4909 100644
+--- a/fs/fuse/dev_uring.c
++++ b/fs/fuse/dev_uring.c
+@@ -96,7 +96,7 @@ static bool can_zero_copy_req(struct fuse_ring_ent *ent, struct fuse_req *req)
+ }
+ 
+ static void fuse_uring_req_end(struct fuse_ring_ent *ent, struct fuse_req *req,
+-			       int error, unsigned issue_flags)
++			       int error, unsigned issue_flags, bool retain)
+ {
+ 	struct fuse_ring_queue *queue = ent->queue;
+ 	struct fuse_ring *ring = queue->ring;
+@@ -115,9 +115,10 @@ static void fuse_uring_req_end(struct fuse_ring_ent *ent, struct fuse_req *req,
+ 
+ 	spin_unlock(&queue->lock);
+ 
+-	if (ent->zero_copied) {
++	if (ent->zero_copied && !retain) {
+ 		io_buffer_unregister(ent->cmd, ent->fixed_buf_id, issue_flags);
+ 		ent->zero_copied = false;
++		ent->zc_dir_source = false;
+ 	}
+ 
+ 	if (error)
+@@ -293,7 +294,7 @@ static struct fuse_ring *fuse_uring_create(struct fuse_conn *fc)
+ 
+ static int fuse_uring_buf_ring_setup(struct io_uring_cmd *cmd,
+ 				     struct fuse_ring_queue *queue,
+-				     bool zero_copy,
++				     bool zero_copy, bool retention,
+ 				     unsigned int issue_flags)
+ {
+ 	int err;
+@@ -308,6 +309,9 @@ static int fuse_uring_buf_ring_setup(struct io_uring_cmd *cmd,
+ 	if (!io_uring_is_kmbuf_ring(cmd, FUSE_URING_RINGBUF_GROUP, issue_flags))
+ 		goto error;
+ 
++	if (retention && !zero_copy)
++		goto error;
++
+ 	if (zero_copy) {
+ 		const struct fuse_uring_cmd_req *cmd_req =
+ 			io_uring_sqe_cmd(cmd->sqe);
+@@ -319,6 +323,7 @@ static int fuse_uring_buf_ring_setup(struct io_uring_cmd *cmd,
+ 		queue->zero_copy_depth = READ_ONCE(cmd_req->init.queue_depth);
+ 		if (!queue->zero_copy_depth)
+ 			goto error;
++		queue->use_retention = retention;
+ 	}
+ 
+ 	queue->use_bufring = true;
+@@ -333,7 +338,7 @@ static int fuse_uring_buf_ring_setup(struct io_uring_cmd *cmd,
+ static struct fuse_ring_queue *
+ fuse_uring_create_queue(struct io_uring_cmd *cmd, struct fuse_ring *ring,
+ 			int qid, bool use_bufring, bool zero_copy,
+-			unsigned int issue_flags)
++			bool retention, unsigned int issue_flags)
+ {
+ 	struct fuse_conn *fc = ring->fc;
+ 	struct fuse_ring_queue *queue;
+@@ -357,6 +362,7 @@ fuse_uring_create_queue(struct io_uring_cmd *cmd, struct fuse_ring *ring,
+ 	INIT_LIST_HEAD(&queue->ent_commit_queue);
+ 	INIT_LIST_HEAD(&queue->ent_w_req_queue);
+ 	INIT_LIST_HEAD(&queue->ent_in_userspace);
++	INIT_LIST_HEAD(&queue->ent_retained);
+ 	INIT_LIST_HEAD(&queue->fuse_req_queue);
+ 	INIT_LIST_HEAD(&queue->fuse_req_bg_queue);
+ 	INIT_LIST_HEAD(&queue->ent_released);
+@@ -366,10 +372,10 @@ fuse_uring_create_queue(struct io_uring_cmd *cmd, struct fuse_ring *ring,
+ 
+ 	if (use_bufring) {
+ 		err = fuse_uring_buf_ring_setup(cmd, queue, zero_copy,
+-						issue_flags);
++						retention, issue_flags);
+ 		if (err)
+ 			goto cleanup;
+-	} else if (zero_copy) {
++	} else if (zero_copy || retention) {
+ 		err = -EINVAL;
+ 		goto cleanup;
+ 	}
+@@ -476,6 +482,11 @@ static void fuse_uring_teardown_entries(struct fuse_ring_queue *queue)
+ 				     FRRS_USERSPACE);
+ 	fuse_uring_stop_list_entries(&queue->ent_avail_queue, queue,
+ 				     FRRS_AVAILABLE);
++	if (!list_empty(&queue->ent_retained))
++		pr_warn_ratelimited("fuse-uring: qid=%u teardown with retained zc payloads (daemon lost RELEASE_PAYLOAD)\n",
++				    queue->qid);
++	fuse_uring_stop_list_entries(&queue->ent_retained, queue,
++				     FRRS_RETAINED);
+ }
+ 
+ /*
+@@ -505,6 +516,10 @@ static void fuse_uring_log_ent_state(struct fuse_ring *ring)
+ 			pr_info(" ent-commit-queue ring=%p qid=%d ent=%p state=%d\n",
+ 				ring, qid, ent, ent->state);
+ 		}
++		list_for_each_entry(ent, &queue->ent_retained, list) {
++			pr_info(" ent-retained ring=%p qid=%d ent=%p state=%d\n",
++				ring, qid, ent, ent->state);
++		}
+ 		spin_unlock(&queue->lock);
+ 	}
+ 	ring->stop_debug_log = 1;
+@@ -591,7 +606,7 @@ static void fuse_uring_cancel(struct io_uring_cmd *cmd,
+ 	 */
+ 	queue = ent->queue;
+ 	spin_lock(&queue->lock);
+-	if (ent->state == FRRS_AVAILABLE) {
++	if (ent->state == FRRS_AVAILABLE || ent->state == FRRS_RETAINED) {
+ 		ent->state = FRRS_USERSPACE;
+ 		list_move_tail(&ent->list, &queue->ent_in_userspace);
+ 		need_cmd_done = true;
+@@ -914,6 +929,7 @@ static int fuse_uring_set_up_zero_copy(struct fuse_ring_ent *ent,
+ 	}
+ 
+ 	ent->zero_copied = true;
++	ent->zc_dir_source = (ddir == ITER_SOURCE);
+ 
+ 	return 0;
+ }
+@@ -1117,7 +1133,7 @@ static int fuse_uring_prepare_send(struct fuse_ring_ent *ent,
+ 	if (!err)
+ 		set_bit(FR_SENT, &req->flags);
+ 	else
+-		fuse_uring_req_end(ent, req, err, issue_flags);
++		fuse_uring_req_end(ent, req, err, issue_flags, false);
+ 
+ 	return err;
+ }
+@@ -1201,7 +1217,7 @@ static struct fuse_req *fuse_uring_ent_assign_req(struct fuse_ring_ent *ent,
+  * Also make the ring request available again for new fuse requests.
+  */
+ static void fuse_uring_commit(struct fuse_ring_ent *ent, struct fuse_req *req,
+-			      unsigned int issue_flags)
++			      unsigned int issue_flags, bool retain)
+ {
+ 	struct fuse_ring *ring = ent->queue->ring;
+ 	struct fuse_conn *fc = ring->fc;
+@@ -1222,7 +1238,9 @@ static void fuse_uring_commit(struct fuse_ring_ent *ent, struct fuse_req *req,
+ 
+ 	err = fuse_uring_copy_from_ring(ring, req, ent);
+ out:
+-	fuse_uring_req_end(ent, req, err, issue_flags);
++	if (err)
++		retain = false;
++	fuse_uring_req_end(ent, req, err, issue_flags, retain);
+ }
+ 
+ /*
+@@ -1332,6 +1350,7 @@ static int fuse_uring_commit_fetch(struct io_uring_cmd *cmd, int issue_flags,
+ 	struct fuse_pqueue *fpq;
+ 	struct fuse_req *req;
+ 	bool send;
++	bool retain;
+ 
+ 	err = -ENOTCONN;
+ 	if (!ring)
+@@ -1362,8 +1381,14 @@ static int fuse_uring_commit_fetch(struct io_uring_cmd *cmd, int issue_flags,
+ 		spin_unlock(&queue->lock);
+ 		return err;
+ 	}
+-	list_del_init(&req->list);
+ 	ent = req->ring_entry;
++	retain = READ_ONCE(cmd_req->commit.flags) & FUSE_URING_COMMIT_RETAIN;
++	if (retain && (!queue->use_retention || !ent->zero_copied ||
++		       !ent->zc_dir_source)) {
++		spin_unlock(&queue->lock);
++		return -EINVAL;
++	}
++	list_del_init(&req->list);
+ 	req->ring_entry = NULL;
+ 
+ 	err = fuse_ring_ent_set_commit(ent);
+@@ -1384,10 +1409,27 @@ static int fuse_uring_commit_fetch(struct io_uring_cmd *cmd, int issue_flags,
+ 	fuse_uring_prepare_cancel(cmd, issue_flags, ent);
+ 
+ 	err = fuse_uring_headers_prep(ent, ITER_SOURCE, issue_flags);
+-	if (err)
+-		fuse_uring_req_end(ent, req, err, issue_flags);
+-	else
+-		fuse_uring_commit(ent, req, issue_flags);
++	if (err) {
++		fuse_uring_req_end(ent, req, err, issue_flags, false);
++	} else if (retain) {
++		fuse_uring_commit(ent, req, issue_flags, true);
++		if (ent->zero_copied) {
++			/*
++			 * Req is ended; slot stays registered. Park this
++			 * COMMIT_AND_FETCH until RELEASE_PAYLOAD — no
++			 * fetch, no CQE.
++			 */
++			spin_lock(&queue->lock);
++			ent->state = FRRS_RETAINED;
++			ent->retained_commit_id = commit_id;
++			list_move_tail(&ent->list, &queue->ent_retained);
++			spin_unlock(&queue->lock);
++			return 0;
++		}
++		/* copy/header error cleared retain; fall through to fetch */
++	} else {
++		fuse_uring_commit(ent, req, issue_flags, false);
++	}
+ 
+ 	/*
+ 	 * Fetching the next request is absolutely required as queued
+@@ -1402,6 +1444,72 @@ static int fuse_uring_commit_fetch(struct io_uring_cmd *cmd, int issue_flags,
+ 	return 0;
+ }
+ 
++/* FUSE_IO_URING_CMD_RELEASE_PAYLOAD handler */
++static int fuse_uring_release_payload(struct io_uring_cmd *cmd,
++				      unsigned int issue_flags,
++				      struct fuse_conn *fc)
++{
++	const struct fuse_uring_cmd_req *cmd_req =
++		io_uring_sqe_cmd(cmd->sqe);
++	uint64_t commit_id = READ_ONCE(cmd_req->commit_id);
++	unsigned int qid = READ_ONCE(cmd_req->qid);
++	struct fuse_ring *ring = fc->ring;
++	struct fuse_ring_queue *queue;
++	struct fuse_ring_ent *ent, *found = NULL;
++	struct fuse_req *req;
++	struct io_uring_cmd *parked;
++	bool send;
++
++	if (!ring)
++		return -ENOTCONN;
++	if (qid >= ring->nr_queues)
++		return -EINVAL;
++	queue = ring->queues[qid];
++	if (!queue || !READ_ONCE(fc->connected))
++		return -ENOTCONN;
++
++	spin_lock(&queue->lock);
++	if (unlikely(queue->stopped)) {
++		spin_unlock(&queue->lock);
++		return -ENOTCONN;
++	}
++
++	req = fuse_request_find(&queue->fpq, commit_id);
++	if (req) {
++		spin_unlock(&queue->lock);
++		return -EBUSY;
++	}
++
++	list_for_each_entry(ent, &queue->ent_retained, list) {
++		if (ent->retained_commit_id == commit_id) {
++			found = ent;
++			break;
++		}
++	}
++	if (!found) {
++		spin_unlock(&queue->lock);
++		return -ENOENT;
++	}
++	if (found->state != FRRS_RETAINED) {
++		spin_unlock(&queue->lock);
++		return -EBUSY;
++	}
++	parked = found->cmd;
++	spin_unlock(&queue->lock);
++
++	if (found->zero_copied) {
++		io_buffer_unregister(parked, found->fixed_buf_id, issue_flags);
++		found->zero_copied = false;
++		found->zc_dir_source = false;
++	}
++
++	send = fuse_uring_get_next_fuse_req(found, queue, issue_flags);
++	fuse_uring_headers_cleanup(found, issue_flags);
++	if (send)
++		fuse_uring_send(found, parked, 0, issue_flags);
++	return 0;
++}
++
+ static bool is_ring_ready(struct fuse_ring *ring, int current_qid)
+ {
+ 	int qid;
+@@ -1548,6 +1656,7 @@ static int fuse_uring_register(struct io_uring_cmd *cmd,
+ 	unsigned int init_flags = READ_ONCE(cmd_req->init.flags);
+ 	bool use_bufring = init_flags & FUSE_URING_BUF_RING;
+ 	bool zero_copy = init_flags & FUSE_URING_ZERO_COPY;
++	bool retention = init_flags & FUSE_URING_PAYLOAD_RETENTION;
+ 	struct fuse_ring *ring = smp_load_acquire(&fc->ring);
+ 	struct fuse_ring_queue *queue;
+ 	struct fuse_ring_ent *ent;
+@@ -1569,12 +1678,14 @@ static int fuse_uring_register(struct io_uring_cmd *cmd,
+ 	queue = ring->queues[qid];
+ 	if (!queue) {
+ 		queue = fuse_uring_create_queue(cmd, ring, qid, use_bufring,
+-						zero_copy, issue_flags);
++						zero_copy, retention,
++						issue_flags);
+ 		if (IS_ERR(queue))
+ 			return PTR_ERR(queue);
+ 	} else {
+ 		if ((queue->use_bufring != use_bufring) ||
+-		    (queue->use_zero_copy != zero_copy))
++		    (queue->use_zero_copy != zero_copy) ||
++		    (queue->use_retention != retention))
+ 			return -EINVAL;
+ 	}
+ 
+@@ -1619,6 +1730,8 @@ int fuse_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
+ 	}
+ 	fc = fud->fc;
+ 
++	BUILD_BUG_ON(sizeof(struct fuse_uring_cmd_req) != 24);
++
+ 	/* Once a connection has io-uring enabled on it, it can't be disabled */
+ 	if (!enable_uring && !fc->io_uring) {
+ 		pr_info_ratelimited("fuse-io-uring is disabled\n");
+@@ -1656,6 +1769,8 @@ int fuse_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
+ 			return err;
+ 		}
+ 		break;
++	case FUSE_IO_URING_CMD_RELEASE_PAYLOAD:
++		return fuse_uring_release_payload(cmd, issue_flags, fc);
+ 	default:
+ 		return -EINVAL;
+ 	}
+diff --git a/fs/fuse/dev_uring_i.h b/fs/fuse/dev_uring_i.h
+index e32405d7b..e196332a6 100644
+--- a/fs/fuse/dev_uring_i.h
++++ b/fs/fuse/dev_uring_i.h
+@@ -31,6 +31,12 @@ enum fuse_ring_req_state {
+ 	/* The ring entry is in or on the way to user space */
+ 	FRRS_USERSPACE,
+ 
++	/*
++	 * COMMIT_RETAIN: FUSE request ended, zc write pages still
++	 * registered. Parked COMMIT_AND_FETCH waits for RELEASE_PAYLOAD.
++	 */
++	FRRS_RETAINED,
++
+ 	/* The ring entry is in teardown */
+ 	FRRS_TEARDOWN,
+ 
+@@ -61,6 +67,10 @@ struct fuse_ring_ent {
+ 
+ 			/* True if the request's pages are being zero-copied */
+ 			bool zero_copied;
++			/* Registration was ITER_SOURCE (a write payload) */
++			bool zc_dir_source : 1;
++			/* commit_id of a FRRS_RETAINED payload */
++			u64 retained_commit_id;
+ 		};
+ 	};
+ 
+@@ -107,6 +117,9 @@ struct fuse_ring_queue {
+ 	/* entries in userspace */
+ 	struct list_head ent_in_userspace;
+ 
++	/* COMMIT_RETAIN'd ents waiting for RELEASE_PAYLOAD */
++	struct list_head ent_retained;
++
+ 	/* entries that are released */
+ 	struct list_head ent_released;
+ 
+@@ -134,6 +147,8 @@ struct fuse_ring_queue {
+ 	 * in order to use zero copy.
+ 	 */
+ 	bool use_zero_copy : 1;
++	/* FUSE_URING_PAYLOAD_RETENTION: COMMIT may keep the zc slot */
++	bool use_retention : 1;
+ 	unsigned int zero_copy_depth;
+ };
+ 
+diff --git a/include/uapi/linux/fuse.h b/include/uapi/linux/fuse.h
+index 08d2af942..b9d27c536 100644
+--- a/include/uapi/linux/fuse.h
++++ b/include/uapi/linux/fuse.h
+@@ -243,6 +243,11 @@
+  *
+  *  7.46
+  *  - add fuse_uring_cmd_req init flags and queue_depth
++ *
++ *  7.47
++ *  - add FUSE_IO_URING_CMD_RELEASE_PAYLOAD
++ *  - add FUSE_URING_PAYLOAD_RETENTION init flag
++ *  - add fuse_uring_cmd_req commit.flags / FUSE_URING_COMMIT_RETAIN
+  */
+ 
+ #ifndef _LINUX_FUSE_H
+@@ -1306,11 +1311,18 @@ enum fuse_uring_cmd {
+ 
+ 	/* commit fuse request result and fetch next request */
+ 	FUSE_IO_URING_CMD_COMMIT_AND_FETCH = 2,
++
++	/* release a COMMIT_RETAIN'd zero-copy write payload and re-arm */
++	FUSE_IO_URING_CMD_RELEASE_PAYLOAD = 3,
+ };
+ 
+ /* fuse_uring_cmd_req init flags */
+-#define FUSE_URING_BUF_RING	(1 << 0)
+-#define FUSE_URING_ZERO_COPY	(1 << 1)
++#define FUSE_URING_BUF_RING		(1 << 0)
++#define FUSE_URING_ZERO_COPY		(1 << 1)
++#define FUSE_URING_PAYLOAD_RETENTION	(1 << 2)
++
++/* fuse_uring_cmd_req commit flags */
++#define FUSE_URING_COMMIT_RETAIN	(1 << 0)
+ 
+ /**
+  * In the 80B command area of the SQE.
+@@ -1329,6 +1341,9 @@ struct fuse_uring_cmd_req {
+ 			uint16_t flags;
+ 			uint16_t queue_depth;
+ 		} init;
++		struct {
++			uint16_t flags;
++		} commit;
+ 	};
+ 
+ 	uint8_t padding[2];

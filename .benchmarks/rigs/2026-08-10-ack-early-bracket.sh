@@ -83,15 +83,18 @@ EOF
 
 smoke() { # $1 tag — P0 (per-leg, before the row)
   local d="$MNT/ovl_smoke"
+  local src="$OUT/ovl_smoke.src"
   mkdir -p "$d"
-  dd if=/dev/urandom of=/tmp/ovl_smoke.src bs=1M count=32 status=none
+  # $OUT, not /tmp: fs.protected_regular refuses O_CREAT on another
+  # uid's leftover in a sticky world-writable dir (root included).
+  dd if=/dev/urandom of="$src" bs=1M count=32 status=none
   local a b c
-  a=$(md5sum < /tmp/ovl_smoke.src | cut -d' ' -f1)
-  dd if=/tmp/ovl_smoke.src of="$d/blob" bs=1M oflag=direct conv=fsync status=none
+  a=$(md5sum < "$src" | cut -d' ' -f1)
+  dd if="$src" of="$d/blob" bs=1M oflag=direct conv=fsync status=none
   b=$(dd if="$d/blob" bs=1M iflag=direct status=none | md5sum | cut -d' ' -f1)
   c=$(md5sum < "$d/blob" | cut -d' ' -f1)
   [ "$a" = "$b" ] && [ "$a" = "$c" ] || fatal "leg $1: md5 mismatch — CORRUPTION"
-  rm -rf "$d" /tmp/ovl_smoke.src
+  rm -rf "$d" "$src"
   echo "leg $1: correctness smoke OK"
 }
 

@@ -15205,8 +15205,14 @@ impl Filesystem for SqueezefsFilesystem {
         offset: u64,
         len: u32,
     ) -> Option<fuse3::raw::connection::fuse_over_uring::fused::ZcWritePlacement> {
+        // Default OFF — the Approach A falsification verdict
+        // (.benchmarks/2026-08-09-fuse-placed-merge.md): whole-cohort
+        // capture ceilings at ~25 % on every reachable streaming shape
+        // (per-inode write serialization upstream of delivery), so the
+        // conversion never materializes; the lever stays the counted
+        // A/B instrument and the machinery seeds Approach B.
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| crate::env_knobs::bool_knob("SQUEEZEFS_FUSE_PLACED_MERGE", true)) {
+        if !*ON.get_or_init(|| crate::env_knobs::bool_knob("SQUEEZEFS_FUSE_PLACED_MERGE", false)) {
             return None;
         }
         if len == 0 || is_virtual_ino(ino) {

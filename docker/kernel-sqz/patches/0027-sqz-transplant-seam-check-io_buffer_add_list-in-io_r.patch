@@ -1,7 +1,7 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From f40a2fb67339e43358d8194fee907aa1bcf5790c Mon Sep 17 00:00:00 2001
 From: sqz kernel recipe <sqz-kernel@squeezefs>
 Date: Sat, 1 Aug 2026 22:26:42 -0400
-Subject: [PATCH 26/27] sqz transplant seam: check io_buffer_add_list() in
+Subject: [PATCH 27/29] sqz transplant seam: check io_buffer_add_list() in
  io_register_kmbuf_ring()
 
 6.19.14 stable made io_buffer_add_list() return int (xa_store error) and
@@ -16,10 +16,10 @@ the xarray so no double-free is possible).
  1 file changed, 7 insertions(+), 1 deletion(-)
 
 diff --git a/io_uring/kbuf.c b/io_uring/kbuf.c
-index 0de0d16f1..f5e9f9a1d 100644
+index 7c416af6e..224c53af9 100644
 --- a/io_uring/kbuf.c
 +++ b/io_uring/kbuf.c
-@@ -988,7 +988,13 @@ int io_register_kmbuf_ring(struct io_ring_ctx *ctx, void __user *arg)
+@@ -983,7 +983,13 @@ int io_register_kmbuf_ring(struct io_ring_ctx *ctx, void __user *arg)
  
  	bl->flags |= IOBL_KERNEL_MANAGED;
  
@@ -34,3 +34,6 @@ index 0de0d16f1..f5e9f9a1d 100644
  
  	return 0;
  }
+-- 
+2.55.0
+

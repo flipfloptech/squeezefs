@@ -1,7 +1,7 @@
 From 7ca12e14ccc30528a998f4e89e7e94882748d596 Mon Sep 17 00:00:00 2001
 From: sqz kernel recipe <sqz-kernel@squeezefs>
 Date: Sun, 2 Aug 2026 07:09:58 -0400
-Subject: [PATCH] sqz: FUSE_TIME_LIMITS INIT advertisement of inode-timestamp
+Subject: [PATCH 28/29] sqz: FUSE_TIME_LIMITS INIT advertisement of inode-timestamp
  range
 
 The only timestamp field FUSE_INIT carries is time_gran, so a FUSE

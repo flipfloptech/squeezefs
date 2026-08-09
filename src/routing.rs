@@ -9640,6 +9640,17 @@ impl DataRouter {
     /// striped flip) minus the save. Fencing is deferred to the swap —
     /// the staged-family precedent (deferred persists fence at persist
     /// time; the write handler validated the lease upstream).
+    /// Device-overlay PR B2 (KD-OV-12's one-authority screen): whether a
+    /// rewrite-shadow epoch is live on `ino` — the overlay install
+    /// predicate declines while any pending-binding authority exists
+    /// (the B4 coexistence arm is what would relax this).
+    pub(crate) fn has_open_rewrite_epoch(&self, ino: u64) -> bool {
+        self.inner
+            .rewrite_epochs
+            .read_sync(&ino, |_, _| ())
+            .is_some()
+    }
+
     pub(crate) async fn rewrite_shadow_record(
         &self,
         ino: u64,

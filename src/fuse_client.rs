@@ -5204,6 +5204,64 @@ pub struct Metrics {
     /// correct, but the parity win is rotting).
     pub placed_adoptions: Align64<AtomicU64>,
     pub placed_merge_elides: Align64<AtomicU64>,
+    // ---- Device-backed visible overlay (Approach B, PR B2 —
+    // docs/design-device-overlay.md §9.1). Engagement: on an eligible row
+    // `overlay_store_bytes` ≈ user bytes while extraction and nt_copy stay
+    // ≈ 0 (the extraction-delete instrument). ----
+    /// Overlay records installed (one per (ino, block)).
+    pub overlay_installs: Align64<AtomicU64>,
+    /// Segment stores completed into overlay destinations (slot direct
+    /// or the pooled §4.3 vehicle).
+    pub overlay_stores: Align64<AtomicU64>,
+    /// Byte face of [`Self::overlay_stores`] — row validity closure.
+    pub overlay_store_bytes: Align64<AtomicU64>,
+    /// §4.3 failure ladder: segments that fell from the slot direct leg
+    /// to the pooled vehicle (loud engagement-loss; ≈ 0 on eligible
+    /// shapes).
+    pub overlay_store_fallbacks: Align64<AtomicU64>,
+    /// Law-3 refusals: short/errored store CQEs (the range never joined
+    /// the completed set on that attempt).
+    pub overlay_short_stores: Align64<AtomicU64>,
+    /// Law-6 newest-wins engagements (structurally 0 in B2: the block
+    /// guard serializes same-block stores; growth means a future rung
+    /// armed concurrent submission).
+    pub overlay_supersessions: Align64<AtomicU64>,
+    /// B2 read posture: reads of open overlays DRAIN
+    /// (freeze/complete/seed/publish) instead of composing (§5.2 is PR
+    /// B3). One count per drained record on the read path.
+    pub overlay_read_drains: Align64<AtomicU64>,
+    /// Overlay publications (the ONE-tx map+ref flip — law 7).
+    pub overlay_publishes: Align64<AtomicU64>,
+    /// Byte face of [`Self::overlay_publishes`] (whole blocks).
+    pub overlay_published_bytes: Align64<AtomicU64>,
+    /// §6.2 step-3 gap seeds (partial overlays only — the B4
+    /// falsifier's instrument; ≈ 0 on full-coverage streams).
+    pub overlay_gap_seeds: Align64<AtomicU64>,
+    /// Byte face of [`Self::overlay_gap_seeds`].
+    pub overlay_gap_seed_bytes: Align64<AtomicU64>,
+    /// GAUGE: live overlay records — must return to 0 at quiesce (the
+    /// `rewrite_shadow_open_epochs` law); the read/write probe hooks'
+    /// `overlay_open == 0` fast path rides it.
+    pub overlay_open: Align64<AtomicU64>,
+    /// GAUGE: bytes with stores submitted, CQE not yet seen.
+    pub overlay_inflight_bytes: Align64<AtomicU64>,
+    /// MUST STAY 0: overlays dropped by the D0 writer-guard fence (W5 —
+    /// publish refused, nothing freed; investigate alongside
+    /// `writer_guard_fenced`).
+    pub overlay_fence_drops: Align64<AtomicU64>,
+    /// MUST STAY 0: law-9 teardowns observed waiting on a non-empty
+    /// in-flight set past the tripwire threshold.
+    pub overlay_teardown_waits: Align64<AtomicU64>,
+    /// MUST STAY 0: a record surviving its ino's durability boundary
+    /// (the §6.2 invariant, counted rather than assumed).
+    pub overlay_unpublished_at_fsync: Align64<AtomicU64>,
+    /// Mount-census free-completions (Rev 2 correction C / KD-OV-14:
+    /// the census structurally cannot tell an overlay's destination
+    /// from any other allocated-but-unpublished offset, so this is the
+    /// honest GENERIC count — offsets free-listed by the recovery
+    /// walk's gap-completing arm. Overlay-specific attribution lives
+    /// only in the fault-injection suite's harness knowledge).
+    pub unpublished_offsets_recovered: Align64<AtomicU64>,
     /// FUSE placed-merge (Approach A, 2026-08-09): placement CLAIMS
     /// granted (a bridge target minted — the delivery-side half of the
     /// `fuse3_zc_write_placements` pair, which counts CQE-confirmed
@@ -6048,6 +6106,10 @@ pub struct SqueezefsFilesystem {
     /// handler clones (the sink severs on service threads; the write
     /// merge adopts under the block lock).
     pub(crate) placed_assemblies: std::sync::Arc<crate::placed_sever::PlacedSeverRegistry>,
+    /// Device-backed visible overlay registry (Approach B, PR B2 —
+    /// `docs/design-device-overlay.md` §2.1): volatile per-(ino, block)
+    /// records over allocated-but-unpublished destinations.
+    pub(crate) device_overlays: std::sync::Arc<crate::device_overlay::DeviceOverlayRegistry>,
 }
 
 impl Clone for SqueezefsFilesystem {
@@ -6125,6 +6187,7 @@ impl Clone for SqueezefsFilesystem {
             job_wire_endpoint: self.job_wire_endpoint.clone(),
             write_pipeline: self.write_pipeline.clone(),
             placed_assemblies: self.placed_assemblies.clone(),
+            device_overlays: self.device_overlays.clone(),
         }
     }
 }
@@ -6296,6 +6359,9 @@ impl SqueezefsFilesystem {
             job_wire_endpoint: std::sync::Arc::new(std::sync::OnceLock::new()),
             write_pipeline: crate::write_pipeline::WritePipeline::for_mount(),
             placed_assemblies: std::sync::Arc::new(crate::placed_sever::PlacedSeverRegistry::new()),
+            device_overlays: std::sync::Arc::new(
+                crate::device_overlay::DeviceOverlayRegistry::new(),
+            ),
         };
         // The inode-reclaim latch probe (live-statfs ENOSPC-drift fix,
         // 2026-08-05): the layout-save funnel refuses publishes for inos
@@ -8146,7 +8212,25 @@ impl SqueezefsFilesystem {
                 // live-assembly gauge (R5 `placed_assemblies`).
                 "ipc_placed_severs": METRICS.ipc_placed_severs.load(Ordering::Relaxed),
                 "ipc_placed_sever_fallbacks": METRICS.ipc_placed_sever_fallbacks.load(Ordering::Relaxed),
-                "placed_adoptions": METRICS.placed_adoptions.load(Ordering::Relaxed),
+                                "placed_adoptions": METRICS.placed_adoptions.load(Ordering::Relaxed),
+                "overlay_installs": METRICS.overlay_installs.load(Ordering::Relaxed),
+                "overlay_stores": METRICS.overlay_stores.load(Ordering::Relaxed),
+                "overlay_store_bytes": METRICS.overlay_store_bytes.load(Ordering::Relaxed),
+                "overlay_store_fallbacks": METRICS.overlay_store_fallbacks.load(Ordering::Relaxed),
+                "overlay_short_stores": METRICS.overlay_short_stores.load(Ordering::Relaxed),
+                "overlay_supersessions": METRICS.overlay_supersessions.load(Ordering::Relaxed),
+                "overlay_read_drains": METRICS.overlay_read_drains.load(Ordering::Relaxed),
+                "overlay_publishes": METRICS.overlay_publishes.load(Ordering::Relaxed),
+                "overlay_published_bytes": METRICS.overlay_published_bytes.load(Ordering::Relaxed),
+                "overlay_gap_seeds": METRICS.overlay_gap_seeds.load(Ordering::Relaxed),
+                "overlay_gap_seed_bytes": METRICS.overlay_gap_seed_bytes.load(Ordering::Relaxed),
+                "overlay_open": METRICS.overlay_open.load(Ordering::Relaxed),
+                "overlay_inflight_bytes": METRICS.overlay_inflight_bytes.load(Ordering::Relaxed),
+                "overlay_fence_drops": METRICS.overlay_fence_drops.load(Ordering::Relaxed),
+                "overlay_teardown_waits": METRICS.overlay_teardown_waits.load(Ordering::Relaxed),
+                "overlay_unpublished_at_fsync": METRICS.overlay_unpublished_at_fsync.load(Ordering::Relaxed),
+                "unpublished_offsets_recovered": METRICS.unpublished_offsets_recovered.load(Ordering::Relaxed),
+                "overlay_store_submits_qids": fuse3::zc_write_store_qid_census(),
                 "placed_merge_elides": METRICS.placed_merge_elides.load(Ordering::Relaxed),
                 "placed_fuse_claims": METRICS.placed_fuse_claims.load(Ordering::Relaxed),
                 "placed_adoption_refusals": METRICS.placed_adoption_refusals.load(Ordering::Relaxed),
@@ -9435,6 +9519,13 @@ impl SqueezefsFilesystem {
             .nvme
             .has_staged_extent_record(ext_key.as_str())
         {
+            return Err(I::Overlay);
+        }
+        // Device-overlay screen (PR B2): a live device-overlay record on
+        // the block ⇒ handler (its read path drains the overlay before
+        // serving — §5.4's DEMOTE-never-purge law for fast paths that
+        // cannot run the precedence check). Gauge fast path first.
+        if crate::device_overlay::any_open_fast() && self.device_overlays.get(ino, b32).is_some() {
             return Err(I::Overlay);
         }
         // The 795 custody snapshot: epoch + binding + fill incarnation.
@@ -11101,6 +11192,539 @@ impl SqueezefsFilesystem {
     /// by direct slot→device DMA — zero daemon copies — and every other
     /// shape materializes it lazily through the memoized extraction, so
     /// eligible writes never pay the extraction round trip.)
+    /// Device-overlay PR B2 — the HOLD-gate face of the eligibility
+    /// ladder (sync, lock-free — the gate runs on the transport
+    /// worker): the same screen `try_device_overlay_store` re-runs
+    /// under the block guard. A cache MISS is honest ineligibility for
+    /// HOLDING purposes.
+    pub(crate) fn overlay_hold_eligible(&self, ino: u64, offset: u64, len: u32) -> bool {
+        if !crate::device_overlay::device_overlay_enabled() {
+            return false;
+        }
+        if len == 0 || is_virtual_ino(ino) || offset % 4096 != 0 || u64::from(len) % 4096 != 0 {
+            return false;
+        }
+        if crate::write_verification_enabled() || !self.router.get_crypto().is_passthrough() {
+            return false;
+        }
+        let block_size = self.router.block_size.load(Ordering::Relaxed);
+        if block_size == 0 {
+            return false;
+        }
+        let b = offset / block_size;
+        if (offset + u64::from(len) - 1) / block_size != b {
+            return false;
+        }
+        let Some(meta) = self.router.metadata_cache.get(&ino) else {
+            return false;
+        };
+        if meta.file_type != "striped" {
+            return false;
+        }
+        let Some(bm) = meta.block_map.as_ref() else {
+            return false;
+        };
+        if bm.contains_key(&(b as u32)) || self.router.has_open_rewrite_epoch(ino) {
+            return false;
+        }
+        let key = crate::keys::active_block_stack(ino, b);
+        if self.active_block_buffers.contains_key(key.as_str())
+            || self.router.cache.nvme.has_staged_active_block(key.as_str())
+            || self
+                .router
+                .cache
+                .nvme
+                .has_staged_extent_record(&crate::keys::active_block_ext(ino, b))
+        {
+            return false;
+        }
+        match self.device_overlays.get(ino, b as u32) {
+            None => true,
+            Some(r) => r.core.state() == crate::overlay_core::OverlayState::Open,
+        }
+    }
+
+    /// Device-overlay (Approach B, PR B2) — the per-segment
+    /// install/reserve/store wiring for the FRESH/HOLE shape
+    /// (`docs/design-device-overlay.md` §1.2/§8 B2). Called from the
+    /// write handler's per-block future UNDER the held
+    /// `BLOCK_FLUSH_LOCKS` guard, after the W1 patch probe declined.
+    ///
+    /// Returns `Ok(true)` = the segment was ACKed off the overlay
+    /// (store CQE seen — KD-OV-7's ACK-after-CQE), `Ok(false)` = the
+    /// shape declined structurally (the caller rides the accumulation
+    /// path), `Err` = the store failed loud for exactly this write
+    /// (nothing acked, coverage unchanged — law 3).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn try_device_overlay_store(
+        &self,
+        ino: u64,
+        b: u32,
+        rel: usize,
+        len: usize,
+        payload: &crate::routing::WritePayload,
+        cache_key: &str,
+        fencing_token: u64,
+    ) -> Result<bool, SqueezefsError> {
+        use crate::overlay_core::OverlayState;
+        let block_size = self.router.block_size.load(Ordering::Relaxed) as usize;
+        debug_assert!(rel % 4096 == 0 && len % 4096 == 0 && len > 0 && rel + len <= block_size);
+
+        // ---- The §7 state screen (sync probes, under the held guard).
+        // Striped authority only (§7.1: AFTER promotion drained AND
+        // published — file_type IS the durable flip witness), and the
+        // block must be FRESH (no durable mapping, no staged-family
+        // custody, no RAM accumulation, no pending shadow binding).
+        let Some(meta) = self.router.metadata_cache.get(&ino) else {
+            return Ok(false);
+        };
+        if meta.file_type != "striped" {
+            return Ok(false);
+        }
+        let Some(bm) = meta.block_map.as_ref() else {
+            // Indirect-mapped layouts: conservatively decline in B2 (a
+            // fresh block cannot be PROVEN unmapped without the map).
+            return Ok(false);
+        };
+        if bm.contains_key(&b) {
+            // An old binding exists — the overwrite shape is PR B4.
+            return Ok(false);
+        }
+        if self.router.has_open_rewrite_epoch(ino) {
+            // A pending-binding authority is live on this ino: the
+            // KD-OV-12 one-authority law says fresh overlays wait for
+            // B4's coexistence arm — decline (accumulation).
+            return Ok(false);
+        }
+        if self.active_block_buffers.contains_key(cache_key)
+            || self.router.cache.nvme.has_staged_active_block(cache_key)
+            || self
+                .router
+                .cache
+                .nvme
+                .has_staged_extent_record(&crate::keys::active_block_ext(ino, b as u64))
+        {
+            return Ok(false);
+        }
+
+        // ---- Registry: join an Open record, settle anything else.
+        let rec = match self.device_overlays.get(ino, b) {
+            Some(r) if r.core.state() == OverlayState::Open => r,
+            Some(_) => {
+                // Frozen/terminal UNDER OUR HELD GUARD means the detached
+                // publisher has not acquired the guard yet — steal its
+                // work (publish/teardown inline), then decline: the block
+                // is mapped now and rides the ordinary path.
+                self.settle_overlay_block_locked(ino, b, false).await?;
+                return Ok(false);
+            }
+            None => {
+                // ---- Install: reserve-before-DMA (law 2) + the two
+                // owners (fsck visibility + the law-9 mint rollback,
+                // KD-OV-11), then the reader-visible record (law 1: the
+                // record is installed before this write can ACK).
+                let (be_id, allocator, device) = self.router.backend_router.get_active_backend()?;
+                if payload.slot().is_some() && device.zc_write_fd().is_none() {
+                    return Ok(false);
+                }
+                let dest_offset = allocator.allocate_block().await?;
+                let fsck_guard = allocator.inflight_register(dest_offset);
+                let mint_owner = crate::assembly_tasks::MintedBlockGuard::new(
+                    std::sync::Arc::clone(&allocator),
+                    dest_offset,
+                );
+                match self.device_overlays.install(
+                    ino,
+                    b,
+                    block_size as u32,
+                    be_id,
+                    dest_offset,
+                    device,
+                    allocator,
+                    fencing_token,
+                    fsck_guard,
+                    mint_owner,
+                ) {
+                    Some(r) => r,
+                    None => {
+                        // Lost an install race (structurally impossible
+                        // under the held guard) — the dropped mint owner
+                        // frees the reservation; decline.
+                        crate::note_invariant_tripwire(
+                            "overlay_install_race_under_guard",
+                            "a second overlay record raced an install under the block guard",
+                        );
+                        return Ok(false);
+                    }
+                }
+            }
+        };
+
+        // ---- Claim + accept (§2.3: the claim spans submit→CQE).
+        let first_page = rel / crate::overlay_core::OVERLAY_PAGE;
+        let pages = len.div_ceil(crate::overlay_core::OVERLAY_PAGE);
+        let ticket = match rec.core.begin_store(first_page, pages) {
+            Ok(t) => t,
+            Err(_) => {
+                // Structurally unreachable in B2 (the held guard
+                // serializes same-block stores): settle + decline.
+                crate::note_invariant_tripwire(
+                    "overlay_claim_refused_under_guard",
+                    "an overlay range claim refused under the held block guard",
+                );
+                self.settle_overlay_block_locked(ino, b, false).await?;
+                return Ok(false);
+            }
+        };
+        METRICS
+            .overlay_inflight_bytes
+            .fetch_add(len as u64, Ordering::Relaxed);
+        let dest = rec.dest_offset + rel as u64;
+
+        // ---- The store: slot direct leg first (zero daemon copies),
+        // the pooled §4.3 vehicle as the loud fallback (and the
+        // in-process suites' bytes-seam vehicle).
+        let mut stored = false;
+        let mut was_fallback = false;
+        if let Some(z) = payload.slot() {
+            let fd = rec.device.zc_write_fd().expect("screened above");
+            if let Err(e) = rec.device.authorize_zc_store() {
+                // Fence/custody refusal: fail THIS write loud through
+                // the common exit (never a second submission path — the
+                // W1 leg's rule).
+                let _ = rec.core.complete_store(ticket, false);
+                crate::gauge_core::sub_saturating(&METRICS.overlay_inflight_bytes, len as u64);
+                return Err(e);
+            }
+            match z.store(fd, dest).await {
+                Ok(n) if n as usize == len => {
+                    fuse3::note_zc_write_direct(len as u64);
+                    stored = true;
+                }
+                other => {
+                    warn!(
+                        "device-overlay direct store declined for ino {ino} block {b} \
+                         (dest {dest}, len {len}): {other:?} — pooled fallback"
+                    );
+                    METRICS.overlay_short_stores.fetch_add(1, Ordering::Relaxed);
+                    was_fallback = true;
+                }
+            }
+        }
+        if !stored {
+            // Pooled vehicle: ONE copy into an aligned pooled backing,
+            // one aligned DMA at the claimed range (the claim is HELD
+            // across this DMA — §2.3's law is vehicle-blind).
+            let bytes = match payload.materialize().await {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = rec.core.complete_store(ticket, false);
+                    crate::gauge_core::sub_saturating(&METRICS.overlay_inflight_bytes, len as u64);
+                    return Err(SqueezefsError::Io(e));
+                }
+            };
+            debug_assert_eq!(bytes.len(), len);
+            let mut buf = crate::cache::pool::BUFFER_POOL.alloc();
+            if bytes.len() > buf.capacity() {
+                buf.resize(bytes.len(), 0);
+            }
+            buf.backing_mut()[..bytes.len()].copy_from_slice(&bytes);
+            buf.set_written_len(bytes.len());
+            if let Err(e) = rec.device.write_block(dest, buf.into_bytes()).await {
+                // Law 3: the range never joins `completed`; the claim
+                // releases; nothing is acked for this write.
+                let _ = rec.core.complete_store(ticket, false);
+                crate::gauge_core::sub_saturating(&METRICS.overlay_inflight_bytes, len as u64);
+                return Err(e);
+            }
+            if was_fallback {
+                METRICS
+                    .overlay_store_fallbacks
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        // ---- CQE: coverage publication (law 3) + the completion
+        // transition → freeze + detached publication.
+        let verdict = rec.core.complete_store(ticket, true);
+        crate::gauge_core::sub_saturating(&METRICS.overlay_inflight_bytes, len as u64);
+        METRICS.overlay_stores.fetch_add(1, Ordering::Relaxed);
+        METRICS
+            .overlay_store_bytes
+            .fetch_add(len as u64, Ordering::Relaxed);
+        match verdict {
+            crate::overlay_core::CompleteVerdict::Covered { coverage_complete } => {
+                if coverage_complete {
+                    // Freeze under THIS guard hold (no further segment is
+                    // needed) and publish on a detached task — the ACK
+                    // detaches from the meta commit exactly like the
+                    // write-pipeline upload.
+                    rec.core.freeze();
+                    let fs = self.clone();
+                    crate::detached::tpc_spawn_guarded("overlay_publish", async move {
+                        if let Err(e) = fs.drain_device_overlay_block(ino, b, false).await {
+                            warn!(
+                                "device-overlay publish for ino {ino} block {b} failed \
+                                 (record stays parked for the next durability boundary): {e:?}"
+                            );
+                        }
+                    });
+                }
+            }
+            crate::overlay_core::CompleteVerdict::Superseded => {
+                // The record went terminal mid-store — impossible under
+                // the held guard in B2.
+                crate::note_invariant_tripwire(
+                    "overlay_store_superseded_under_guard",
+                    "an overlay store completed into a terminal record under the held guard",
+                );
+            }
+            crate::overlay_core::CompleteVerdict::NotCovered => unreachable!("success path"),
+        }
+        Ok(true)
+    }
+
+    /// Settle one block's overlay UNDER the caller's held
+    /// `BLOCK_FLUSH_LOCKS` guard: freeze (if Open), await the in-flight
+    /// set, seed uncovered gaps with ZEROS (law 5's dual — the
+    /// fresh/hole shape's complement is zeros by definition), optionally
+    /// barrier the device (§6.2 step 4, fsync only), publish the map+ref
+    /// flip in ONE tx (law 7), and retire the record. Terminal records
+    /// run their law-9 teardown disposition instead.
+    pub(crate) async fn settle_overlay_block_locked(
+        &self,
+        ino: u64,
+        b: u32,
+        barrier: bool,
+    ) -> Result<(), SqueezefsError> {
+        use crate::overlay_core::OverlayState;
+        let Some(rec) = self.device_overlays.get(ino, b) else {
+            return Ok(());
+        };
+        match rec.core.state() {
+            OverlayState::Open => {
+                rec.core.freeze();
+            }
+            OverlayState::Frozen => {}
+            _terminal => {
+                self.teardown_overlay_block_locked(ino, b, &rec).await;
+                return Ok(());
+            }
+        }
+        self.await_overlay_inflight(&rec).await;
+
+        // §6.2 step 3 — seed gaps to a WHOLE block (zeros: the B2 shape
+        // has no old binding). A fully-covered overlay pays nothing.
+        let gaps = rec.core.gaps();
+        let app_complete = gaps.is_empty();
+        for &(gs, ge) in &gaps {
+            let glen = (ge - gs) as usize;
+            let mut buf = crate::cache::pool::BUFFER_POOL.alloc();
+            if glen > buf.capacity() {
+                buf.resize(glen, 0);
+            }
+            buf.backing_mut()[..glen].fill(0);
+            buf.set_written_len(glen);
+            rec.device
+                .write_block(rec.dest_offset + gs as u64, buf.into_bytes())
+                .await?;
+            METRICS.overlay_gap_seeds.fetch_add(1, Ordering::Relaxed);
+            METRICS
+                .overlay_gap_seed_bytes
+                .fetch_add(glen as u64, Ordering::Relaxed);
+        }
+        // §6.2 step 4 — the data barrier strictly precedes the publish
+        // on durability boundaries (DUR-1 order by construction).
+        if barrier {
+            rec.device.flush().await?;
+        }
+
+        // Publish: stabilize the incarnation, purge the reused key's
+        // read tiers (the upload_block_dma_phase order), then the ONE-tx
+        // map+ref flip through the existing primitive (law 7) with the
+        // FIND-M11-A fencing-retry convergence.
+        rec.allocator.publish_block(rec.dest_offset);
+        let new_key = self
+            .router
+            .backend_router
+            .persist_block_key(&rec.be_id, rec.dest_offset);
+        self.router.cache.purge_block_key(&new_key);
+        let block_size = self.router.block_size.load(Ordering::Relaxed);
+        let min_size = if app_complete {
+            (b as u64 + 1) * block_size
+        } else {
+            // Seeded zeros were never app-written: the merge floors at
+            // the RAM acked size (the generic/795 SIZE-NEVER-LEADS-DATA
+            // law — the upload_full_block_sized(false) posture).
+            0
+        };
+        let mut token = self.dlm.get_fencing_token_ino(ino).max(rec.fence_token);
+        loop {
+            match self
+                .router
+                .merge_block_mappings_coalesced(
+                    ino,
+                    vec![(b, new_key.clone())],
+                    min_size,
+                    crate::routing::LayoutFlip::ToStripedKeepStagedIdentity,
+                    token,
+                )
+                .await
+            {
+                Ok(_) => break,
+                Err(e @ SqueezefsError::FencingTokenExpired { .. }) => {
+                    match self.fencing_retry_token(ino, token) {
+                        Some(fresh) => token = fresh,
+                        None => return Err(e),
+                    }
+                }
+                Err(SqueezefsError::WriterGuardFenced) => {
+                    // W5: publish refused, NOTHING freed — successor
+                    // recovery owns all accounting.
+                    METRICS.overlay_fence_drops.fetch_add(1, Ordering::Relaxed);
+                    rec.core.fence_drop();
+                    self.teardown_overlay_block_locked(ino, b, &rec).await;
+                    return Err(SqueezefsError::WriterGuardFenced);
+                }
+                // Any other failure: the record stays FROZEN — the acked
+                // bytes live ONLY at the unpublished destination, so it
+                // is never freed; the next durability boundary retries.
+                Err(e) => return Err(e),
+            }
+        }
+        rec.core.mark_published();
+        self.teardown_overlay_block_locked(ino, b, &rec).await;
+        METRICS.overlay_publishes.fetch_add(1, Ordering::Relaxed);
+        METRICS
+            .overlay_published_bytes
+            .fetch_add(block_size, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Law-9 teardown under the held guard: waits out the in-flight set
+    /// (already empty in B2 — the guard serializes stores), runs the
+    /// per-terminal-state mint disposition, and retires the record.
+    async fn teardown_overlay_block_locked(
+        &self,
+        ino: u64,
+        b: u32,
+        rec: &std::sync::Arc<crate::device_overlay::DeviceOverlayRecord>,
+    ) {
+        self.await_overlay_inflight(rec).await;
+        rec.run_teardown_disposition();
+        self.device_overlays.retire(ino, b, rec);
+    }
+
+    /// Bounded in-flight wait (law 9's "wait out the stragglers"):
+    /// structurally instant in B2 — the block guard serializes stores —
+    /// so a long wait is the tripwire, never a hang.
+    async fn await_overlay_inflight(&self, rec: &crate::device_overlay::DeviceOverlayRecord) {
+        let mut spins = 0u32;
+        while !rec.core.inflight_empty() {
+            spins += 1;
+            if spins == 1_000 {
+                METRICS
+                    .overlay_teardown_waits
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Take the block guard and settle one overlay (the detached
+    /// publish body, the read-path drain unit, the accumulation-write
+    /// screen's slow arm).
+    pub(crate) async fn drain_device_overlay_block(
+        &self,
+        ino: u64,
+        b: u32,
+        barrier: bool,
+    ) -> Result<(), SqueezefsError> {
+        if self.device_overlays.get(ino, b).is_none() {
+            return Ok(());
+        }
+        let (block_guard, _w) = block_lock_acquire_timed(ino, b, BlockLockSite::OverlayPrune).await;
+        let res = self.settle_overlay_block_locked(ino, b, barrier).await;
+        drop(block_guard);
+        res
+    }
+
+    /// Drain (publish) every overlay of `ino` whose block starts below
+    /// `keep_below` and SUPERSEDE the rest (their data is being
+    /// discarded by the caller's shape-change op — truncate/punch past
+    /// the cut; §7 row 6's drain-or-supersede). `barrier` = the fsync
+    /// posture (§6.2 step 4 before step 5).
+    pub(crate) async fn drain_device_overlays_for_ino(
+        &self,
+        ino: u64,
+        keep_below: u64,
+        barrier: bool,
+    ) -> Result<(), SqueezefsError> {
+        if !crate::device_overlay::any_open_fast() {
+            return Ok(());
+        }
+        let block_size = self.router.block_size.load(Ordering::Relaxed);
+        for b in self.device_overlays.blocks_of(ino) {
+            let (block_guard, _w) =
+                block_lock_acquire_timed(ino, b, BlockLockSite::OverlayPrune).await;
+            let res = if (b as u64) * block_size >= keep_below {
+                if let Some(rec) = self.device_overlays.get(ino, b) {
+                    if rec.core.supersede() || rec.core.state().is_terminal() {
+                        self.teardown_overlay_block_locked(ino, b, &rec).await;
+                    } else {
+                        // Frozen (a publish is owed): drain instead —
+                        // never strand a frozen record.
+                        self.settle_overlay_block_locked(ino, b, barrier).await?;
+                    }
+                }
+                Ok(())
+            } else {
+                self.settle_overlay_block_locked(ino, b, barrier).await
+            };
+            drop(block_guard);
+            res?;
+        }
+        Ok(())
+    }
+
+    /// Resolve `(parent, name)` → ino for the unlink-path overlay drain
+    /// (best-effort: a miss means no drain — the unlink itself will
+    /// still resolve or fail on its own authority).
+    async fn lookup_ino_for_overlay_drain(&self, parent: u64, name: &str) -> Option<u64> {
+        let backend = self.meta_backend.as_ref()?;
+        backend
+            .lookup_dentry(parent, name)
+            .await
+            .ok()
+            .flatten()
+            .map(|(ino, _)| ino)
+    }
+
+    /// The B2 read posture: reads of blocks with live overlays DRAIN
+    /// them first (freeze/complete/seed/publish — the §5.2 lock-free
+    /// composition is PR B3), so every ACKed byte resolves through the
+    /// durable map (law 1). One relaxed gauge load when no overlay is
+    /// open anywhere.
+    pub(crate) async fn drain_device_overlays_range(
+        &self,
+        ino: u64,
+        start: u64,
+        end: u64,
+    ) -> Result<(), SqueezefsError> {
+        if !crate::device_overlay::any_open_fast() {
+            return Ok(());
+        }
+        let block_size = self.router.block_size.load(Ordering::Relaxed);
+        for b in self.device_overlays.blocks_of(ino) {
+            let bs = (b as u64) * block_size;
+            if bs < end && bs + block_size > start {
+                self.drain_device_overlay_block(ino, b, false).await?;
+                METRICS.overlay_read_drains.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Ok(())
+    }
+
     pub async fn write_file_staged(
         &self,
         ino: u64,
@@ -11171,14 +11795,30 @@ impl SqueezefsFilesystem {
             true
         };
 
+        // Device-overlay (Approach B, PR B2): the SHAPE half of the
+        // eligibility ladder, decided BEFORE the extraction so an
+        // eligible slot never pays the bounce (the extraction-delete
+        // charter). Single-block, LBA-aligned, passthrough, no write
+        // verification; the STATE half (striped authority, fresh block,
+        // no staged/RAM/shadow custody) runs in the per-block future
+        // under the held block guard.
+        let try_overlay = crate::device_overlay::device_overlay_enabled()
+            && !payload.is_empty()
+            && start_block == end_block
+            && offset % 4096 == 0
+            && payload_len % 4096 == 0
+            && (payload.slot().is_some() || crate::device_overlay::bytes_vehicle_armed())
+            && !crate::write_verification_enabled()
+            && self.router.get_crypto().is_passthrough();
+
         // D14: a slot payload stays UNMATERIALIZED only for the
-        // single-block patch shape (the direct slot→device DMA
-        // candidate — try_patch ⇒ start_block == end_block, so the one
+        // single-block patch/overlay shapes (the direct slot→device DMA
+        // candidates — both imply start_block == end_block, so the one
         // future below owns the whole payload); every other shape
         // materializes HERE — one memoized extraction, requested after
         // the handler prelude it overlaps with. Bytes payloads are a
         // zero-cost clone.
-        let deferred_slot = try_patch && payload.slot().is_some();
+        let deferred_slot = (try_patch || try_overlay) && payload.slot().is_some();
         let data: bytes::Bytes = if deferred_slot {
             bytes::Bytes::new()
         } else {
@@ -11264,6 +11904,50 @@ impl SqueezefsFilesystem {
                             std::mem::drop(block_guard);
                             return Err(e);
                         }
+                    }
+                }
+
+                // Device-overlay (Approach B, PR B2): the state half of
+                // the eligibility ladder + install/claim/store/CQE, under
+                // this held guard. `Ok(true)` = ACKed off the overlay
+                // (ACK-after-CQE — KD-OV-7); `Ok(false)` = declined
+                // structurally (fall through to the accumulation path);
+                // `Err` = the store failed loud for exactly this write.
+                if try_overlay {
+                    let rel = (write_start - b_start_offset) as usize;
+                    match self
+                        .try_device_overlay_store(
+                            ino,
+                            b as u32,
+                            rel,
+                            slice_len,
+                            &patch_payload,
+                            &cache_key,
+                            fencing_token,
+                        )
+                        .await
+                    {
+                        Ok(true) => {
+                            std::mem::drop(block_guard);
+                            return Ok::<(), SqueezefsError>(());
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            std::mem::drop(block_guard);
+                            return Err(e);
+                        }
+                    }
+                }
+                // One-authority screen: an accumulation-path write to a
+                // block with a LIVE overlay first settles the overlay
+                // under this held guard (publish; the block map then
+                // carries the binding and the ordinary checkout seeds
+                // from it) — a parked ActiveBlockBuf and an open overlay
+                // may never coexist on one block.
+                if crate::device_overlay::any_open_fast() {
+                    if let Err(e) = self.settle_overlay_block_locked(ino, b as u32, false).await {
+                        std::mem::drop(block_guard);
+                        return Err(e);
                     }
                 }
 
@@ -13078,6 +13762,19 @@ impl SqueezefsFilesystem {
         ino: u64,
         fencing_token: u64,
     ) -> Result<(), SqueezefsError> {
+        // Device-overlay §6.2: freeze → complete → seed zeros → data
+        // barrier → publish, per open overlay on this ino, BEFORE the
+        // ordinary flush machinery (a successful fsync may never leave
+        // an overlay unpublished — counted, not assumed).
+        if crate::device_overlay::any_open_fast() {
+            self.drain_device_overlays_for_ino(ino, u64::MAX, true)
+                .await?;
+            if !self.device_overlays.blocks_of(ino).is_empty() {
+                METRICS
+                    .overlay_unpublished_at_fsync
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
         // DUR-1: the DURABLE driver — a partially-covered block's staging
         // leg escalates to one durable upload instead of
         // `put_active_block` + a queued writeback the caller cannot wait
@@ -14968,6 +15665,19 @@ impl SqueezefsFilesystem {
             );
         }
 
+        // Device-overlay unmount drain (§6.2's boundary set includes the
+        // unmount drain): publish every open overlay — with the data
+        // barrier — before the staged sweep; a failure stays loud but
+        // never blocks the teardown (the record's bytes are the
+        // writeback-class custody every unflushed park shares).
+        if crate::device_overlay::any_open_fast() {
+            for (ino, b) in self.device_overlays.all() {
+                if let Err(e) = self.drain_device_overlay_block(ino, b, true).await {
+                    warn!("dismount: overlay publish for ino {ino} block {b} failed: {e:?}");
+                }
+            }
+        }
+
         // Phase 1 & 2: Force flush memory buffers to staging, then staged blocks to NVMe-oF backend
         let _ = self.force_flush_all_staged_data().await;
 
@@ -15098,6 +15808,13 @@ impl Filesystem for SqueezefsFilesystem {
     /// handler's authoritative predicate; this probe is silent by
     /// design (it answers routing, not accounting).
     fn zc_write_hold_eligible(&self, ino: u64, offset: u64, len: u32) -> bool {
+        // Device-overlay hold arm (Approach B, PR B2): an eligible
+        // fresh/hole aligned single-block segment consumes the slot by
+        // DIRECT slot→device DMA — hold it (the whole point of the
+        // widened streaming hold, KD-OV-4).
+        if self.overlay_hold_eligible(ino, offset, len) {
+            return true;
+        }
         // Shape half — the `try_patch` ladder, read-only.
         if len == 0 || is_virtual_ino(ino) {
             return false;
@@ -16397,6 +17114,16 @@ impl Filesystem for SqueezefsFilesystem {
         }
 
         let prof = OpProf::begin(FuseOpKind::Read, ino);
+        // Device-overlay B2 read posture: blocks with live overlays are
+        // DRAINED (freeze/complete/seed-zeros/publish) before this read
+        // resolves — every ACKed byte then reaches it through the
+        // durable map (law 1; the §5.2 lock-free composition is PR B3).
+        // One relaxed gauge load on overlay-free mounts.
+        if crate::device_overlay::any_open_fast() {
+            self.drain_device_overlays_range(ino, offset, offset.saturating_add(size as u64))
+                .await
+                .map_err(map_squeezefs_err)?;
+        }
         // Serve-residence decomposition (read_serve_phase_ns, always-on):
         // t0 anchors `prelude` and `total`; the router records the inner
         // phases; `post_validate` covers the last iteration's overlay +
@@ -17409,6 +18136,17 @@ impl Filesystem for SqueezefsFilesystem {
                 if size > self.max_file_size() {
                     return Err(Errno::from(libc::EFBIG));
                 }
+                // Device-overlay §7 row 6 (drain-or-supersede): overlays
+                // wholly at/beyond the new size are SUPERSEDED (their
+                // data is being discarded — the mint owner frees the
+                // unpublished destination, law 9); overlays straddling
+                // or below the cut DRAIN so the truncate operates on
+                // published state.
+                if crate::device_overlay::any_open_fast() {
+                    self.drain_device_overlays_for_ino(ino, size, false)
+                        .await
+                        .map_err(map_squeezefs_err)?;
+                }
                 size_to_set = Some(size);
             }
             let mut uid_to_set = None;
@@ -17793,6 +18531,18 @@ impl Filesystem for SqueezefsFilesystem {
 
         let prof = OpProf::begin(FuseOpKind::Unlink, parent);
         let unlink_future = async {
+            // Device-overlay §7 row 6: drain the target ino's overlays
+            // BEFORE the unlink — an unlinked-but-open file must keep
+            // reading its ACKed bytes, so overlays PUBLISH (never
+            // supersede) and the delete's own machinery then frees the
+            // published blocks through the ordinary ladder.
+            if crate::device_overlay::any_open_fast() {
+                if let Some(child) = self.lookup_ino_for_overlay_drain(parent, &name_str).await {
+                    self.drain_device_overlays_for_ino(child, u64::MAX, false)
+                        .await
+                        .map_err(map_squeezefs_err)?;
+                }
+            }
             let backend = self
                 .meta_backend
                 .as_ref()
@@ -18237,6 +18987,18 @@ impl Filesystem for SqueezefsFilesystem {
         // D1.d: the DESTINATION gains flushable state (the source is
         // read-only here).
         self.mark_handle_dirty(inode_out);
+
+        // Device-overlay §7 row 6: a clone/copy of a half-overlaid block
+        // must see either the published whole or the old binding, never
+        // the registry — drain BOTH inos' overlays first.
+        if crate::device_overlay::any_open_fast() {
+            self.drain_device_overlays_for_ino(inode, u64::MAX, false)
+                .await
+                .map_err(map_squeezefs_err)?;
+            self.drain_device_overlays_for_ino(inode_out, u64::MAX, false)
+                .await
+                .map_err(map_squeezefs_err)?;
+        }
 
         // u32 block-index representability (see `max_file_size`) — EFBIG
         // past the cap, like write/truncate (generic/525).
@@ -19040,6 +19802,16 @@ impl Filesystem for SqueezefsFilesystem {
         // fall back instead of silently corrupting via the extend path below.
         if mode & (COLLAPSE_RANGE | INSERT_RANGE) != 0 {
             return Err(Errno::from(libc::EOPNOTSUPP));
+        }
+
+        // Device-overlay §7 row 6: shape-change ops operate on PUBLISHED
+        // state — drain this ino's overlays first (punch/zero of a range
+        // an overlay covers must compose with the durable map, not the
+        // registry).
+        if crate::device_overlay::any_open_fast() {
+            self.drain_device_overlays_for_ino(ino, u64::MAX, false)
+                .await
+                .map_err(map_squeezefs_err)?;
         }
 
         // u32 block-index representability (see `max_file_size`) — EFBIG
@@ -20652,6 +21424,15 @@ pub async fn start_mount<P: AsRef<Path>>(
             }
         }
     });
+
+    // Device-overlay (Approach B, PR B2): arm the transport's STREAMING
+    // hold — eligible large aligned WRITE payloads stay in the sparse
+    // slot for the slot→device direct store instead of extracting at
+    // delivery (the hold GATE's overlay arm does the exact screening).
+    if crate::device_overlay::device_overlay_enabled() {
+        fuse3::set_zc_hold_streaming(true);
+        info!("device-overlay armed: transport streaming holds enabled (SQUEEZEFS_DEVICE_OVERLAY)");
+    }
 
     // Spawns the mount loop using fuse3 Session
     let session = fuse3::raw::Session::new(options);

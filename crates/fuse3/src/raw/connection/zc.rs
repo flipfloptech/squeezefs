@@ -343,7 +343,33 @@ pub(crate) enum ZcPend {
 /// forfeits a direct-DMA candidate — the bound is deliberately
 /// conservative.
 pub fn hold_candidate(offset: u64, size: u32, payload_sz: usize) -> bool {
-    size > 0 && (size as usize) < payload_sz / 2 && offset % 4096 == 0 && size % 4096 == 0
+    let bound = if hold_streaming() {
+        // Device-overlay mode (Approach B, PR B2): eligible streaming
+        // segments consume the slot by DIRECT slot->device DMA, so the
+        // zcws-8 "held shape nothing consumes" tax does not apply —
+        // hold every aligned shape that fits the slot and let the
+        // registered HOLD GATE (the filesystem's exact probe, which
+        // sees ino/offset/len and the overlay eligibility state)
+        // decide. Ineligible-at-the-daemon shapes pay the memoized
+        // lazy extraction, which is the armed posture's priced cost.
+        payload_sz + 1
+    } else {
+        payload_sz / 2
+    };
+    size > 0 && (size as usize) < bound && offset % 4096 == 0 && size % 4096 == 0
+}
+
+/// Streaming-hold mode (device-overlay PR B2): armed once at mount by
+/// the daemon when `SQUEEZEFS_DEVICE_OVERLAY` is on.
+static HOLD_STREAMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Arm/disarm streaming holds (see [`hold_candidate`]).
+pub fn set_zc_hold_streaming(on: bool) {
+    HOLD_STREAMING.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn hold_streaming() -> bool {
+    HOLD_STREAMING.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The per-worker **bridge-deadline ledger** (zc-bridge-cqe-wedge

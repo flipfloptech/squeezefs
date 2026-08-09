@@ -2621,7 +2621,10 @@ impl FuseOverUring {
             nqueues: nqueues as u16,
             inbound,
             slot_watch: (0..nqueues * depth).map(|_| SlotWatch::default()).collect(),
-            zc_write_held: zc::ZcHeldTable::new(nqueues, depth),
+            zc_write_held: {
+                kmbuf::init_zc_store_qid_census(nqueues);
+                zc::ZcHeldTable::new(nqueues, depth)
+            },
             zc_bridge_pends: AtomicU64::new(0),
             zc_hold_gate: std::sync::OnceLock::new(),
             zc_place_gate: std::sync::OnceLock::new(),
@@ -4843,6 +4846,9 @@ fn queue_worker(
                     );
                     match push_fetch_batched(&mut ring, &mut batch, entry) {
                         Ok(()) => {
+                            // Device-overlay §4.3: the per-qid direct-store
+                            // census (the fabric-queue spread instrument).
+                            kmbuf::note_zc_store_qid(s.qid);
                             m.zc_pend[idx] = Some(ZcPend::HandlerStore { done: s.done });
                             if m.bridge_deadlines
                                 .stamp(idx, crate::raw::read_phase::transport_now_ns())

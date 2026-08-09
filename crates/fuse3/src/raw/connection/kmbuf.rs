@@ -687,6 +687,41 @@ pub fn zc_write_extract_bytes() -> u64 {
 /// fall back to the extraction vehicle and are counted THERE — never
 /// here — so an armed write row attributes direct vs extracted vs
 /// (never) bounce bytes exactly.
+/// Device-overlay PR B2 — the per-qid direct-store census (§4.3: the
+/// fabric-queue spread instrument; the `data_write_lane_submits` shape).
+/// Sized once at pool construction; counted at every zc STORE submit
+/// (the W1 patch leg and the overlay stores share the vehicle, so the
+/// census covers both — a streaming row's W1 traffic is ≈ 0).
+static ZC_STORE_QIDS: std::sync::OnceLock<Box<[AtomicU64]>> = std::sync::OnceLock::new();
+
+/// Size the store census (first caller wins — pool construction).
+pub fn init_zc_store_qid_census(nqueues: usize) {
+    let _ = ZC_STORE_QIDS.get_or_init(|| {
+        (0..nqueues)
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    });
+}
+
+/// Count one zc store submission on `qid`.
+pub fn note_zc_store_qid(qid: u16) {
+    if let Some(v) = ZC_STORE_QIDS.get() {
+        if let Some(c) = v.get(qid as usize) {
+            c.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The census snapshot (`overlay_store_submits_qids` on the stats
+/// inode): one count per qid; empty until a pool constructs.
+pub fn zc_write_store_qid_census() -> Vec<u64> {
+    ZC_STORE_QIDS
+        .get()
+        .map(|v| v.iter().map(|c| c.load(Ordering::Relaxed)).collect())
+        .unwrap_or_default()
+}
+
 pub fn note_zc_write_direct(bytes: u64) {
     ZC_WRITE_DIRECTS.fetch_add(1, Ordering::Relaxed);
     ZC_WRITE_DIRECT_BYTES.fetch_add(bytes, Ordering::Relaxed);

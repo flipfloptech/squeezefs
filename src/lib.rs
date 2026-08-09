@@ -98,11 +98,16 @@ pub mod alloc_lane_grant;
 // note below).
 pub mod coverage_core;
 pub mod defrag;
+// PR B2 (docs/design-device-overlay.md §2.1/§6.1): the device-overlay
+// registry — volatile per-daemon records over allocated-but-unpublished
+// destinations; the pure laws live in `overlay_core`. A plain comment (the
+// `env_knobs` note below).
 pub mod detached;
 /// TEST-1 (pre-RC spec §11): the data-device power-cut harness — the
 /// `uring_fs` volatile-cache simulator's coverage extended to the
 /// `NvmeBlockDev` worker. Test-only; inert until armed.
 pub mod dev_power_cut;
+pub mod device_overlay;
 pub mod dlm;
 // DLM stage S4 (pre-rc spec §6.7 decisions 2/3, §6.9 S4): the slot-homed lock
 // authority — lock homing over the durable meta slot map plus the lock-free

@@ -2211,6 +2211,21 @@ impl BlockAllocator {
         Self::plane_gate("specific block allocation")?;
         let cur_highest = self.highest_block.load(Ordering::Relaxed);
         if block_idx >= cur_highest {
+            // Rev 2 correction C (device-overlay KD-OV-14): the honest
+            // GENERIC recovery census — offsets free-listed by this
+            // gap-completing arm. The census structurally cannot tell an
+            // overlay's abandoned destination from any other
+            // allocated-but-unpublished offset (or from ordinary free
+            // space below the cursor); overlay-specific attribution
+            // lives only in the fault-injection suites.
+            if block_idx > cur_highest {
+                crate::fuse_client::METRICS
+                    .unpublished_offsets_recovered
+                    .fetch_add(
+                        block_idx - cur_highest,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+            }
             for idx in cur_highest..block_idx {
                 self.free_blocks.insert(idx);
             }

@@ -240,6 +240,8 @@ async fn fresh_block_segments_ride_the_overlay_and_publish_at_completion() {
     let bytes0 = m(&METRICS.overlay_store_bytes);
     let pubs0 = m(&METRICS.overlay_publishes);
     let wt0 = m(&METRICS.write_through_blocks);
+    let open0 = m(&METRICS.overlay_open);
+    let seedb0 = m(&METRICS.overlay_gap_seed_bytes);
 
     // Block 2 (fresh — beyond the striped image): four aligned 16 KiB
     // segments, in order.
@@ -274,12 +276,20 @@ async fn fresh_block_segments_ride_the_overlay_and_publish_at_completion() {
         "the overlaid block never rides the accumulation write-through"
     );
     assert_eq!(
-        m(&METRICS.overlay_gap_seed_bytes),
+        m(&METRICS.overlay_gap_seed_bytes) - seedb0,
         0,
         "a full-coverage stream seeds nothing (the B4 falsifier's instrument)"
     );
-    assert_eq!(m(&METRICS.overlay_open), 0, "no record survives the fsync");
-    assert_eq!(m(&METRICS.overlay_unpublished_at_fsync), 0, "§6.2 invariant");
+    assert_eq!(
+        m(&METRICS.overlay_open),
+        open0,
+        "no record survives the fsync"
+    );
+    assert_eq!(
+        m(&METRICS.overlay_unpublished_at_fsync),
+        0,
+        "§6.2 invariant"
+    );
 
     let got = read_at(&h, ino, 2 * BS, BS as u32).await;
     assert_eq!(got.len(), BS as usize);
@@ -302,6 +312,7 @@ async fn partial_overlay_fsync_seeds_zeros_and_publishes_whole_block() {
 
     let seeds0 = m(&METRICS.overlay_gap_seeds);
     let seedb0 = m(&METRICS.overlay_gap_seed_bytes);
+    let open0 = m(&METRICS.overlay_open);
 
     // One 16 KiB segment at block 2 + 16 KiB (an interior segment: gaps
     // on BOTH sides).
@@ -318,20 +329,20 @@ async fn partial_overlay_fsync_seeds_zeros_and_publishes_whole_block() {
         BS - BS / 4,
         "the seed pays exactly the gap bytes"
     );
-    assert_eq!(m(&METRICS.overlay_open), 0);
+    assert_eq!(m(&METRICS.overlay_open), open0);
     assert_eq!(m(&METRICS.overlay_unpublished_at_fsync), 0);
 
-    let got = read_at(&h, ino, 2 * BS, BS as u32).await;
-    assert_eq!(got.len(), BS as usize);
+    // POSIX size: the acked end (2·BS + BS/2) — the seeded zeros beyond
+    // it are never size-visible (generic/795: size never leads data).
+    let sz = h.fs.getattr(h.req, ino, None, 0).await.unwrap().attr.size;
+    assert_eq!(sz, 2 * BS + BS / 2, "size floors at the acked end");
+    let got = read_at(&h, ino, 2 * BS, (BS / 2) as u32).await;
+    assert_eq!(got.len(), (BS / 2) as usize);
     for (i, &b) in got.iter().enumerate() {
-        let expect = if (i as u64) >= BS / 4 && (i as u64) < BS / 2 {
-            0x5A
-        } else {
-            0
-        };
+        let expect = if (i as u64) >= BS / 4 { 0x5A } else { 0 };
         assert_eq!(
             b, expect,
-            "byte {i}: gaps must read zeros, the segment its bytes"
+            "byte {i}: the pre-segment hole must read zeros, the segment its bytes"
         );
     }
 }
@@ -385,6 +396,8 @@ async fn open_overlay_reads_serve_acked_bytes_and_zero_gaps() {
         "an uncovered overlay range must read zeros, never the \
          destination's recycled device content (law 5)"
     );
+    // Leave the process-global gauges clean for the sibling tests.
+    fsync(&h, ino).await;
 }
 
 /// generic/209, fresh-file shape: a sequential fresh-file writer races
@@ -646,6 +659,7 @@ async fn truncate_drains_open_overlays() {
     let h = make("ovl_trunc").await;
     let ino = create(&h, "trunc").await;
     promote_striped(&h, ino).await;
+    let open0 = m(&METRICS.overlay_open);
 
     let seg: Vec<u8> = vec![0x99; (BS / 4) as usize];
     write_at(&h, ino, 2 * BS, &seg).await;
@@ -664,7 +678,7 @@ async fn truncate_drains_open_overlays() {
     .unwrap();
     assert_eq!(
         m(&METRICS.overlay_open),
-        0,
+        open0,
         "no overlay record may survive a truncate of its ino"
     );
 

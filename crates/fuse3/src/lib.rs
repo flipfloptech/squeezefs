@@ -32,6 +32,7 @@ use raw::abi::{
     fuse_setattr_in, FATTR_ATIME, FATTR_ATIME_NOW, FATTR_CTIME, FATTR_GID, FATTR_KILL_SUIDGID,
     FATTR_LOCKOWNER, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW, FATTR_SIZE, FATTR_UID,
 };
+pub use raw::set_zc_hold_streaming;
 #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
 pub use raw::{
     drain_group_stats, kmbuf_negotiated, negotiated_max_readahead, note_zc_write_direct,
@@ -43,7 +44,7 @@ pub use raw::{
     zc_slot_payload_skips, zc_write_direct_bytes, zc_write_directs, zc_write_extract_bytes,
     zc_write_extractions, zc_write_fusion_bytes, zc_write_fusion_demotions, zc_write_fusions,
     zc_write_lazy_extractions, zc_write_place_fallbacks, zc_write_placement_bytes,
-    zc_write_placements, COMMIT_BATCH_LABELS,
+    zc_write_placements, zc_write_store_qid_census, COMMIT_BATCH_LABELS,
 };
 pub use raw::{
     pin_scope_from_env, read_inplace_replies, read_transport_phase_record,

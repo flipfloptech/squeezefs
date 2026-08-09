@@ -25,8 +25,9 @@ pub use connection::fuse_over_uring::{
 pub use connection::kmbuf::{
     kmbuf_negotiated, note_zc_write_direct, zc_bridge_cancels, zc_bridge_lost, zc_fallbacks,
     zc_negotiated, zc_replies, zc_slot_payload_skips, zc_write_direct_bytes, zc_write_directs,
-    zc_write_extract_bytes, zc_write_extractions,
+    zc_write_extract_bytes, zc_write_extractions, zc_write_store_qid_census,
 };
+pub use connection::zc::set_zc_hold_streaming;
 pub use filesystem::Filesystem;
 use futures_util::future::Either;
 pub use read_phase::{

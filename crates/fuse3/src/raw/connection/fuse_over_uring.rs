@@ -107,6 +107,7 @@ const FUSE_IO_URING_CMD_RELEASE_PAYLOAD: u32 = 3;
 const FUSE_IN_HEADER_SIZE: usize = 40;
 /// `linux/fuse.h` opcode 16 — the only opcode whose payload rides a lease.
 const FUSE_WRITE_OPCODE: u32 = crate::raw::abi::fuse_opcode::FUSE_WRITE as u32;
+const FUSE_WRITE_CACHE: u32 = crate::raw::abi::FUSE_WRITE_CACHE;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -6263,11 +6264,23 @@ fn queue_worker(
                 // ops ∧ extractions ≈ ops (both vehicles per op).
                 let hold_nodeid =
                     u64::from_le_bytes(m.ents[ent_idx].hdr().in_out[16..24].try_into().unwrap());
+                // fuse_write_in: write_flags @ 20, flags (open) @ 32.
+                // O_DIRECT GUP pages + not WRITE_CACHE ⇒ extract at
+                // delivery when the FS overlay arm would otherwise HOLD
+                // (handler materialize is the 23 GiB/s late-extract tax).
+                let w_flags = u32::from_le_bytes(op_in[20..24].try_into().unwrap());
+                let open_flags = if op_in.len() >= 36 {
+                    u32::from_le_bytes(op_in[32..36].try_into().unwrap())
+                } else {
+                    0
+                };
+                let odirect =
+                    (open_flags as i32) & libc::O_DIRECT != 0 && w_flags & FUSE_WRITE_CACHE == 0;
                 if zc::hold_candidate(w_off, w_size, payload_sz_cfg)
                     && pool
                         .zc_hold_gate
                         .get()
-                        .is_some_and(|g| g(hold_nodeid, w_off, w_size))
+                        .is_some_and(|g| g(hold_nodeid, w_off, w_size, odirect))
                 {
                     pool.zc_write_held.set(qid, ent_idx, payload_sz as u32);
                     // zc-write-fusion: a held write at or under the

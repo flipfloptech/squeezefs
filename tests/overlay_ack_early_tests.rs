@@ -656,3 +656,81 @@ async fn odirect_ack_early_must_not_observe_post_ack_reuse() {
     );
     clear_test_zc_slot_wrap();
 }
+
+/// O_DIRECT overlay must NOT HOLD the zc slot (delivery extracts on the
+/// worker's batched pass). Holding + handler `materialize` is the late
+/// extract that pinned the field 1 MiB row at 23 GiB/s (zcws-8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn odirect_overlay_is_not_hold_eligible() {
+    let _g = serial().await;
+    let h = make("ackearly-nohold").await;
+    let ino = create(&h, "f").await;
+    promote_striped(&h, ino).await;
+    // Next block is fresh/unmapped — overlay-eligible.
+    assert!(
+        h.fs.zc_write_hold_eligible(ino, 2 * BS, BS as u32, false),
+        "page-cache overlay still HOLDs for 0-copy retain"
+    );
+    assert!(
+        !h.fs.zc_write_hold_eligible(ino, 2 * BS, BS as u32, true),
+        "O_DIRECT overlay must extract at delivery, not HOLD"
+    );
+    // Mapped block 0 is W1-eligible — O_DIRECT must still HOLD so the
+    // sole-owner patch keeps the 0-copy slot→device vehicle.
+    assert!(
+        h.fs.zc_write_hold_eligible(ino, 0, 4096, true),
+        "W1 O_DIRECT must still HOLD (only overlay O_DIRECT extracts at delivery)"
+    );
+}
+
+/// Bytes payloads (at-delivery extract, IL severs) ACK-early when the
+/// overlay is armed — they are daemon-owned snapshots, so the GUP
+/// opt-in does not apply. The write returns while device DMA is stalled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bytes_overlay_ack_early_returns_before_device_cqe() {
+    let _g = serial().await;
+    let h = make("ackearly-bytes").await;
+    set_device_overlay_for_tests(true, true); // Bytes vehicle
+    set_ack_early_for_tests(true, true);
+    clear_test_zc_slot_wrap();
+    let ino = create(&h, "f").await;
+    promote_striped(&h, ino).await;
+
+    struct StallReset;
+    impl Drop for StallReset {
+        fn drop(&mut self) {
+            squeezefs::nvme_dev::set_test_write_stall(0, 0);
+        }
+    }
+    squeezefs::nvme_dev::set_test_write_stall(4, 2_000);
+    let _stall = StallReset;
+    let data = vec![0xE1u8; BS as usize];
+    let t0 = std::time::Instant::now();
+    let w =
+        h.fs.write(
+            h.req,
+            ino,
+            0,
+            2 * BS,
+            bytes::Bytes::copy_from_slice(&data),
+            0,
+            0,
+        )
+        .await
+        .expect("bytes ack-early write");
+    let dt = t0.elapsed();
+    assert_eq!(w.written, BS as u32);
+    assert!(
+        dt < Duration::from_millis(500),
+        "Bytes overlay ACK-early waited {dt:?} — still on the device CQE \
+         (the late-extract/ACK-after-CQE tax)"
+    );
+    eventually(
+        || METRICS.overlay_stores.load(Ordering::Relaxed) > 0,
+        "bytes ack-early store published",
+    )
+    .await;
+    let back = read_at(&h, ino, 2 * BS, BS as u32).await;
+    assert_eq!(back, data);
+    squeezefs::nvme_dev::set_test_write_stall(0, 0);
+}

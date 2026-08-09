@@ -46,7 +46,7 @@ use fuse3::raw::prelude::Filesystem;
 use fuse3::raw::Request;
 use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::cache::TieredCache;
-use squeezefs::device_overlay::set_device_overlay_for_tests;
+use squeezefs::device_overlay::{set_ack_early_for_tests, set_device_overlay_for_tests};
 use squeezefs::dlm::DlmClient;
 use squeezefs::fuse_client::{SqueezefsFilesystem, METRICS};
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
@@ -139,6 +139,10 @@ async fn format_meta(path: &std::path::Path, uuid: [u8; 16]) {
 async fn make(tag: &str) -> H {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "65536");
     set_device_overlay_for_tests(true, true);
+    // This suite pins ACK-after-CQE (KD-OV-7): production Bytes overlay
+    // now ACKs early by default, which would race the crash-drop and
+    // the post-write metric checks.
+    set_ack_early_for_tests(false, false);
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())
         .unwrap()
@@ -536,6 +540,7 @@ async fn crash_without_drain_reclaims_unpublished_offsets() {
     let _g = serial().await;
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "65536");
     set_device_overlay_for_tests(true, true);
+    set_ack_early_for_tests(false, false);
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())
         .unwrap()

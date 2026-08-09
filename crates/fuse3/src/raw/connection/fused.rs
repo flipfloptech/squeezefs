@@ -393,12 +393,15 @@ static ZC_WRITE_PLACE_FALLBACKS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// The zc-write HOLD gate (fused-lane-predicate campaign, 2026-08-08):
-/// `(ino, offset, len) → may this payload stay HELD in the sparse slot
-/// as a direct-consume candidate?` — the transport face of
-/// `Filesystem::zc_write_hold_eligible`. Called on the queue-worker
-/// thread once per armed WRITE delivery: must be cheap, sync,
-/// non-blocking, lock-free.
-pub type ZcHoldGate = Arc<dyn Fn(u64, u64, u32) -> bool + Send + Sync + 'static>;
+/// `(ino, offset, len, odirect) → may this payload stay HELD in the
+/// sparse slot as a direct-consume candidate?` — the transport face of
+/// `Filesystem::zc_write_hold_eligible`. `odirect` is the GUP/O_DIRECT
+/// class (open flags carry `O_DIRECT` and the op is not
+/// `FUSE_WRITE_CACHE`): overlay-eligible O_DIRECT must return false so
+/// the worker extracts at delivery (batched) instead of a late handler
+/// extract on the ACK path. Called on the queue-worker thread once per
+/// armed WRITE delivery: must be cheap, sync, non-blocking, lock-free.
+pub type ZcHoldGate = Arc<dyn Fn(u64, u64, u32, bool) -> bool + Send + Sync + 'static>;
 
 /// Count one LATE (handler-initiated lazy) extraction of a HELD write —
 /// the hold gate's staleness gauge (`fuse3_zc_write_lazy_extractions`):

@@ -73,9 +73,25 @@ pub fn device_overlay_enabled() -> bool {
     tri(&ENABLED, "SQUEEZEFS_DEVICE_OVERLAY")
 }
 
-/// The in-process suites' vehicle seam (see [`BYTES_VEHICLE`]).
+/// Whether `WritePayload::Bytes` may ride the overlay store.
+///
+/// Production: follows [`device_overlay_enabled`] — O_DIRECT overlay
+/// extracts at delivery (batched worker copy) and the handler's Bytes
+/// ARE the snapshot; refusing them forced a HOLD + late extract.
+/// Test seam: [`set_device_overlay_for_tests`] still pins on/off
+/// independently. Unset + `SQUEEZEFS_TEST_OVERLAY_BYTES=1` forces ON
+/// even when overlay is off (in-process suites that do not call the
+/// setter). Never cache a 1 on the unset arm — that would freeze the
+/// vehicle off across a later overlay enable.
 pub fn bytes_vehicle_armed() -> bool {
-    tri(&BYTES_VEHICLE, "SQUEEZEFS_TEST_OVERLAY_BYTES")
+    match BYTES_VEHICLE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            crate::env_knobs::bool_knob("SQUEEZEFS_TEST_OVERLAY_BYTES", false)
+                || device_overlay_enabled()
+        }
+    }
 }
 
 /// ACK-early enablement (`SQUEEZEFS_ZC_ACK_EARLY`, default ON —

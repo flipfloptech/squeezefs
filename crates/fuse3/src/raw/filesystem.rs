@@ -44,8 +44,13 @@ pub trait Filesystem {
     /// steady-state majority). A stale `false` only forfeits one
     /// direct-DMA candidate (the payload arrives extracted; the pooled
     /// vehicle still serves it).
-    fn zc_write_hold_eligible(&self, ino: Inode, offset: u64, len: u32) -> bool {
-        let _ = (ino, offset, len);
+    ///
+    /// `odirect` is the GUP/O_DIRECT class (open flags carry `O_DIRECT`
+    /// and the op is not `FUSE_WRITE_CACHE`). Overlay-eligible O_DIRECT
+    /// must return false so the worker extracts at delivery (batched)
+    /// instead of a late handler extract on the ACK path.
+    fn zc_write_hold_eligible(&self, ino: Inode, offset: u64, len: u32, odirect: bool) -> bool {
+        let _ = (ino, offset, len, odirect);
         false
     }
 

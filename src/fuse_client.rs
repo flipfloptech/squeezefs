@@ -11290,10 +11290,11 @@ impl SqueezefsFilesystem {
     /// `BLOCK_FLUSH_LOCKS` guard, after the W1 patch probe declined.
     ///
     /// Returns `Ok(true)` = the segment was ACKed off the overlay
-    /// (store CQE seen — KD-OV-7's ACK-after-CQE), `Ok(false)` = the
-    /// shape declined structurally (the caller rides the accumulation
-    /// path), `Err` = the store failed loud for exactly this write
-    /// (nothing acked, coverage unchanged — law 3).
+    /// (ACK-early: reply detaches from the store CQE when armed;
+    /// ACK-after-CQE otherwise — KD-OV-7), `Ok(false)` = the shape
+    /// declined structurally (the caller rides the accumulation path),
+    /// `Err` = the store failed loud for exactly this write (nothing
+    /// acked, coverage unchanged — law 3).
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn try_device_overlay_store(
         &self,
@@ -11555,7 +11556,27 @@ impl SqueezefsFilesystem {
             }
             buf.backing_mut()[..bytes.len()].copy_from_slice(&bytes);
             buf.set_written_len(bytes.len());
-            if let Err(e) = rec.device.write_block(dest, buf.into_bytes()).await {
+            let owned = buf.into_bytes();
+            // Bytes are daemon-owned (at-delivery extract / IL sever) —
+            // ACK-early is always sound. This is the 1 MiB O_DIRECT
+            // A-leg: extract already happened on the worker; do not
+            // wait for the device CQE.
+            if crate::device_overlay::ack_early_enabled() {
+                let fs = self.clone();
+                let rec2 = std::sync::Arc::clone(&rec);
+                METRICS
+                    .overlay_ack_early_stores
+                    .fetch_add(1, Ordering::Relaxed);
+                METRICS
+                    .overlay_ack_early_bytes
+                    .fetch_add(len as u64, Ordering::Relaxed);
+                crate::detached::tpc_spawn_guarded("overlay_ack_early_bytes", async move {
+                    fs.finish_ack_early_bytes(ino, b, rec2, ticket, dest, len, owned)
+                        .await;
+                });
+                return Ok(true);
+            }
+            if let Err(e) = rec.device.write_block(dest, owned).await {
                 // Law 3: the range never joins `completed`; the claim
                 // releases; nothing is acked for this write.
                 let _ = rec.core.complete_store(ticket, false);
@@ -16106,13 +16127,18 @@ impl Filesystem for SqueezefsFilesystem {
     /// The decision ledger (`patch_ineligible_*`) stays owned by the
     /// handler's authoritative predicate; this probe is silent by
     /// design (it answers routing, not accounting).
-    fn zc_write_hold_eligible(&self, ino: u64, offset: u64, len: u32) -> bool {
+    fn zc_write_hold_eligible(&self, ino: u64, offset: u64, len: u32, odirect: bool) -> bool {
         // Device-overlay hold arm (Approach B, PR B2): an eligible
         // fresh/hole aligned single-block segment consumes the slot by
         // DIRECT slot→device DMA — hold it (the whole point of the
-        // widened streaming hold, KD-OV-4).
+        // widened streaming hold, KD-OV-4) ONLY for page-cache
+        // deliveries (0-copy COMMIT_RETAIN). O_DIRECT/GUP HOLDs force
+        // a handler-side materialize (late WRITE_FIXED + oneshot) on
+        // the ACK path — the zcws-8 tax that pinned the field 1 MiB
+        // A-leg at 23 GiB/s. Those extract AT DELIVERY (batched) and
+        // ride the Bytes ACK-early arm.
         if self.overlay_hold_eligible(ino, offset, len) {
-            return true;
+            return !odirect;
         }
         // Shape half — the `try_patch` ladder, read-only.
         if len == 0 || is_virtual_ino(ino) {
@@ -16232,6 +16258,13 @@ impl Filesystem for SqueezefsFilesystem {
             return None;
         }
         if len == 0 || is_virtual_ino(ino) {
+            return None;
+        }
+        // O_DIRECT overlay extracts at delivery (no HOLD) and would
+        // otherwise land here. A placement is accumulation, not an
+        // overlay store — refuse so the Bytes ACK-early arm owns the
+        // fresh/hole A-leg even when Approach A is the A/B instrument.
+        if self.overlay_hold_eligible(ino, offset, len) {
             return None;
         }
         let block_size = self.router.block_size.load(Ordering::Relaxed);

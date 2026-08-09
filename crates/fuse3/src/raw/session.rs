@@ -860,8 +860,8 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     // delivery.
                     let fs_for_gate = fs.clone();
                     fuse_connection.set_zc_write_hold_gate(Arc::new(
-                        move |ino: u64, offset: u64, len: u32| {
-                            fs_for_gate.zc_write_hold_eligible(ino, offset, len)
+                        move |ino: u64, offset: u64, len: u32, odirect: bool| {
+                            fs_for_gate.zc_write_hold_eligible(ino, offset, len, odirect)
                         },
                     ));
                     // Approach A (placed merge, 2026-08-09): the PLACE

@@ -132,6 +132,116 @@ cat docker/kernel-sqz/patches-7.1/00*.patch > ~/sqz-kmbuf-zc-7.1.6-v2.patch
 
 v1 concat `~/sqz-kmbuf-zc-7.1.6.patch` left in place.
 
-## 0030 refusal arithmetic (placeholder)
+## Local boot-test results (2026-08-09, v2 kernel BOOTED — usermode smoke)
 
-Not measured this session. The slot stays empty on purpose.
+Executed per the plan above on the local box, steps 2–6. Binary
+`625c50d5` (`cargo build --release`, default features — this branch
+touches only kernel patches/probes/docs, so the daemon is functionally
+dev tip `c417ec27`). Venue: **tcp devsub** (nvmet-tcp on lo, 4× nullb
+meta `nvme1-4n1` + 4× 8 GiB zram data `nvme5-8n1`), cache-less format,
+armed default mounts. Instrument: fio 3.42 libaio `direct=1`;
+substrate+instrument stated per the standing rule.
+
+### Kernel identity (step 2)
+
+* `uname -r` = `7.1.6-1-cachyos-sqz`, build stamp 2026-08-09 11:46 UTC
+  (minutes after the v2 concat regen).
+* **The honest discriminator — /proc/kallsyms carries both v2 symbols:**
+  `fuse_zc_pages_release` (0025's imu release callback) and
+  `fuse_uring_release_payload` (0029's RELEASE handler). A v1 build has
+  neither. This is the v2 kernel.
+* `kmbuf_smoke` ladder: **38/39 PRESENT (7.1-sqz track)**, unchanged.
+  `--fuse-rungs` negotiation SKIPs unprivileged as documented (the
+  probe's INIT rung needs to be its own toy daemon; step-7 deliverable).
+
+### Negotiation + arm (steps 3–4)
+
+Mount log: `FUSE-over-io_uring registered: queues=32 depth=32
+payload_sz=1048576 … buffers=kmbuf-bufring+zero-copy kmbuf_ops=38/39
+(7.1-sqz)`. Stats inode pins: **`fuse3_kmbuf_negotiated=1`,
+`fuse3_zc_negotiated=1`**, `transport_queues=32`, `transport_q_depth=32`,
+`transport_max_write=1048576`, `fuse_killpriv_negotiated=1`.
+`SQUEEZEFS_FUSE_ZC=0` remount negotiates `buffers=kmbuf-bufring`,
+`fuse3_zc_negotiated=0` — the A/B lever works on the v2 kernel.
+
+### Armed write row (step 5) — the §3.6 bit-identical law holds
+
+Placed-merge step0 shape verbatim (1 MiB seq write, 8 jobs × qd8 ×
+nrfiles=4 × 512 MiB, 45 s), same venue/binary-class as the v1-kernel
+red gate two days prior:
+
+| | v1 kernel (step0, 2026-08-09) | **v2 kernel (this row)** |
+|---|---|---|
+| GB/s | 1.332 | **1.354** (+1.7 % — single runs, within venue noise: PAR) |
+| `fuse3_zc_write_extract_bytes` / user | 100.0 % | **100.0 %** (61.17 GB, 58,336 extractions) |
+| `fuse3_zc_write_direct_bytes` | 0 | 0 |
+| `nt_copy_bytes` / user | 99.9 % | 99.9 % |
+| amp / device bytes | 1.044 | **1.044** (63.87 GB) |
+
+Tripwires all clean: `fuse3_zc_fallbacks=0`, `zc_slot_payload_skips=0`,
+`invariant_tripwires=0`, `detached_task_panics=0`,
+`data_dma_fence_refusals=0`, `write_pipeline_fence_drops=0`. Park
+ledger CLOSED at quiesce (`transport_payload_leases=58,336` all
+released, `transport_leases_outstanding=0`, parked/unparked 0/0).
+`transport_lease_overlong=112` (max age 2.2 s) — the documented
+loud-never-fatal saturation tripwire, consistent with the row's 700 ms
+p99. **dmesg silent across the row** — 0025's per-folio get/put ran
+under all 58 k zc writes with zero kernel complaints.
+
+Correctness gate (bracket-rig shape): O_DIRECT+fsync 32 MiB
+write→readback md5 both postures + the P0 `cp && sync` shape ×3 both
+postures — **7/7 clean**.
+
+### Abort-path live exercise (unplanned, evidentiary)
+
+Every `squeezefs umount` this session took the SIGTERM-timeout →
+direct-unmount → **kernel connection abort** path on a zc-armed mount —
+exactly 0025's window 1 (teardown ends zc requests, no unregister).
+Three such aborts, **dmesg clean after each** (no UAF splat, no
+warnings). This is live-fire evidence, not the red-first proof — the
+KASAN abort-race rung (unfixed-must-splat) stays deferred per the plan.
+The SIGTERM-timeout itself reproduces on BOTH zc and non-zc mounts, so
+it is a daemon/venue shutdown shape, not v2-kernel-attributable —
+flagged for a separate look.
+
+## 0030 refusal arithmetic — MEASURED, refusal FINAL
+
+The §4.3 gate row: 4 KiB randread over a 4 GiB striped fileset (8 jobs
+× qd8, 30 s measured after a 15 s warm pass), armed vs
+`SQUEEZEFS_FUSE_ZC=0`, fresh mount per leg, **A-B-B-A** (aging store —
+standing rule):
+
+| leg | IOPS | clat p50 | p99 | zc engagement |
+|---|---|---|---|---|
+| armed (A1) | **411,210** | 87 µs | 946 µs | `fuse3_zc_replies` Δ=12.34 M ≡ inplace replies |
+| disarmed (B1) | 292,243 | 108 µs | 1,253 µs | 0 |
+| disarmed (B2) | 267,237 | 112 µs | 1,417 µs | 0 |
+| armed (A2) | **341,418** | 101 µs | 1,139 µs | engaged |
+
+Armed wins BOTH brackets (+40.7 % / +27.8 %); worst armed (341 k) beats
+best disarmed (292 k). Per-site cost, flat system-wide perf on the live
+armed row (kptr_restrict relaxed for the record, restored after):
+`io_buffer_register_bvec` 0.02 %, `io_buffer_unregister` 0.02 %,
+`io_kernel_buffer_init` 0.02 %, `mutex_lock`/`unlock` 0.03/0.02 %,
+`fuse_zc_pages_release` 0.14 % (the 0025 reference tax made visible —
+the largest new v2 symbol, priced and cheap), `io_import_fixed` 0.09 %.
+
+**Verdict: there is no crossover to clear.** At the smallest payload
+this transport delivers, zc-armed is FASTER than the kmbuf copy path
+on this venue — the register/unregister machinery costs ~0.25 % of
+system cycles while zc deletes the copy AND rides the in-place reply
+arm (`fuse3_read_inplace_replies` ≡ `fuse3_zc_replies` on the armed
+leg). A per-queue size floor (`zc_min_kb`) has nothing to elide.
+**0030 is refused on measurement — the patch stays unbuilt.** Un-park
+condition: a venue where small-op zc measurably loses (e.g. a
+warm-tier-serve-dominated shape where the daemon's memcpy fast path
+beats slot RW) — re-run this bracket there before reopening the slot.
+
+### Still deferred (needs a COMMIT+RETAIN userspace)
+
+Retention round-trip and the KASAN abort-race red-first rung — both
+need either the probe's toy-daemon INIT/REGISTER extension or the
+Approach B daemon PR (`docs/design-zc-write-kernel-v2.md` §6). The
+kernel side is live and negotiable today (§3.5's errno split reachable:
+`fuse_uring_release_payload` in kallsyms); the usermode retention half
+remains NOT BUILT by charter.

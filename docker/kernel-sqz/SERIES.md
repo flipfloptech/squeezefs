@@ -11,9 +11,11 @@ zc-write charter (`docs/design-zc-write-kernel-v2.md`) inserted
 **0025** (abort-race folio refs) immediately after Koong 0024 and
 appended **0029** (payload retention). Old 0025–0027 renumbered
 0026–0028 (no hunk overlap; both tracks apply `--fuzz=0`). Selective
-zc delivery (**0030**) was **not** built — §4.3 gate deferred to the
-boot-test 4 KiB armed-vs-disarmed perf-annotate row (evidence
-`.benchmarks/2026-08-09-kernel-zc-write-v2.md`).
+zc delivery (**0030**) was **not** built — the §4.3 gate row ran on the
+booted 7.1.6-sqz-v2 kernel (2026-08-09): armed WINS the 4 KiB randread
+A-B-B-A outright (+40.7 %/+27.8 %, both orders; register/unregister
+~0.25 % of cycles) — **refusal FINAL on measurement** (evidence
+`.benchmarks/2026-08-09-kernel-zc-write-v2.md` §0030).
 
 ## What was taken, exactly
 

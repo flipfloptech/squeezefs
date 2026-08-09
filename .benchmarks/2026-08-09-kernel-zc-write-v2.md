@@ -237,11 +237,49 @@ condition: a venue where small-op zc measurably loses (e.g. a
 warm-tier-serve-dominated shape where the daemon's memcpy fast path
 beats slot RW) — re-run this bracket there before reopening the slot.
 
-### Still deferred (needs a COMMIT+RETAIN userspace)
+### Retention round-trip — LIVE PASS ×5 (2026-08-09, second session)
 
-Retention round-trip and the KASAN abort-race red-first rung — both
-need either the probe's toy-daemon INIT/REGISTER extension or the
-Approach B daemon PR (`docs/design-zc-write-kernel-v2.md` §6). The
-kernel side is live and negotiable today (§3.5's errno split reachable:
-`fuse_uring_release_payload` in kallsyms); the usermode retention half
-remains NOT BUILT by charter.
+The probe's toy-daemon extension landed (`kmbuf_smoke.c --fuse-rungs`
+is now a real root-only FUSE daemon: private mount, classical INIT
+echoing `FUSE_OVER_IO_URING`, one SQE128 io_uring per possible-CPU
+queue — fuse pins bgid 0 of the ring each REGISTER rides and a second
+pin refuses `-EALREADY`, so the shared-ring shortcut is structurally
+illegal — sparse zc slot + headers fixed buffer at index 1 + kmbuf
+ring per queue, REGISTER `BUF_RING|ZERO_COPY|PAYLOAD_RETENTION`
+`queue_depth=1`, and a CPU-0-pinned child driving `FOPEN_DIRECT_IO`
+writes). Green **×5 consecutive** on the booted `7.1.6-1-cachyos-sqz`
+v2 kernel, dmesg oops-clean:
+
+| rung | verdict |
+|---|---|
+| negotiation, pre-arm | `RELEASE` ⇒ **`-ENOTCONN`** (opcode present, no ring — the §3.5 middle arm, now measured) |
+| negotiation, armed | impossible `commit_id` ⇒ **`-ENOENT`** |
+| zc delivery | paged 8 KiB WRITE arrives on the sparse slot; `WRITE_FIXED` sample byte-exact |
+| imu direction law | `READ_FIXED` against the `ITER_SOURCE` slot ⇒ `-EFAULT` |
+| **ACK-early** | COMMIT+RETAIN parks the ent (no CQE) and `write(2)` returns — witnessed by pipe ordering |
+| **post-ACK page liveness** | retained slot re-sampled byte-exact AFTER `fuse_request_end` — **0025's imu-held folio refs doing exactly their job** |
+| RELEASE ladder | `0` → double ⇒ `-ENOENT` → live commit ⇒ `-EBUSY` |
+| teardown drain | WRITE #2 deliberately leaked retained into connection death: no oops, request never strands, and the §3.3 `pr_warn` forensic line ("teardown with retained zc payloads") observed on every run |
+
+Two latent probe bugs died in the rewrite: the SQE128 command area was
+written at offset 64 (the kernel reads `sqe->cmd` at **48**; the zeroed
+misread happened to also answer ENOENT, masking it), and the INIT
+"handshake" wrote a request instead of reading the kernel's. The
+`--fuse-rungs` SKIP paths (unprivileged, missing kernel) and the
+ladder/`--signatures` modes are regression-checked unchanged.
+
+**Still deferred:** the KASAN abort-race red-first rung (needs a KASAN
+dir-build of unfixed-0024 vs 0025 — the toy daemon can now drive it:
+arm zc, park a fixed-buffer op, SIGKILL) and the fuse3/daemon retention
+lease (design §6 — Approach B's PR, not this track's).
+
+### Field build (step for `squeeze-test`)
+
+`docker/kernel-sqz/build.sh` completed 2026-08-09: series applied
+`--fuzz=0` 29/29 in-container, RPMs at `dist/kernel-sqz/`
+(`kernel-6.19.14_sqz-1` `19b08f15…`, `-devel` `12cf4b3e…`, `-headers`
+`be506647…`, SHA256SUMS). Deploy + one-shot grub boot on `squeeze-test`
+is the user checkpoint (7.1.2-elrepo stays default until the smoke
+passes), then the same usermode smoke: probe ladder 37/38 → armed mount
+negotiation pins → the step0 write row vs the 2026-08-06 6.19-v1
+baselines.

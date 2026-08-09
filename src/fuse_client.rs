@@ -7899,6 +7899,10 @@ impl SqueezefsFilesystem {
                 // engagement; fallbacks + slot_payload_skips are the
                 // opcode-mirror tripwires (≈ 0 / 0 on a healthy session).
                 "fuse3_zc_negotiated": fuse3::zc_negotiated(),
+                // 1 ⇒ the session is retention-armed (0029 kernel probed
+                // Present + lever on + zc mode): the PRECONDITION gauge
+                // for ACK-early — arming alone is bit-identical (§3.6).
+                "fuse3_zc_retention_negotiated": fuse3::retention_negotiated(),
                 "fuse3_zc_replies": fuse3::zc_replies(),
                 "fuse3_zc_fallbacks": fuse3::zc_fallbacks(),
                 "fuse3_zc_slot_payload_skips": fuse3::zc_slot_payload_skips(),

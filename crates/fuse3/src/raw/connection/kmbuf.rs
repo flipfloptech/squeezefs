@@ -94,7 +94,7 @@ use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
-use tracing::warn;
+use tracing::{info, warn};
 
 // ---------------------------------------------------------------------
 // uapi surface of the carried series (SERIES.md; io_uring + fuse halves)
@@ -171,6 +171,14 @@ pub const FUSE_URING_BUF_RING: u16 = 1 << 0;
 /// `fuse_uring_cmd_req.init.flags` bit 1 (series patch 24;
 /// `CAP_SYS_ADMIN`-gated kernel-side, requires the bufring too).
 pub const FUSE_URING_ZERO_COPY: u16 = 1 << 1;
+/// `fuse_uring_cmd_req.init.flags` bit 2 (series patch 0029 — zc
+/// payload retention; uapi "7.47", collision-audited free on both
+/// tracks 2026-08-09). Valid ONLY with [`FUSE_URING_ZERO_COPY`]:
+/// `fuse_uring_buf_ring_setup` refuses `retention && !zero_copy` with
+/// EINVAL. A retention-armed queue with zero RETAIN commits is
+/// bit-identical to a zc queue (design-zc-write-kernel-v2 §3.6, pinned
+/// live by the kmbuf_smoke retention round-trip on both sqz tracks).
+pub const FUSE_URING_PAYLOAD_RETENTION: u16 = 1 << 2;
 /// The buffer-group id FUSE hardcodes for the payload bufring.
 pub const FUSE_URING_RINGBUF_GROUP: u16 = 0;
 /// Fixed-table index of the headers buffer in bufring mode. In zc mode
@@ -239,6 +247,92 @@ pub fn init_flags(bufring: bool, zero_copy: bool) -> u16 {
         f |= FUSE_URING_ZERO_COPY;
     }
     f
+}
+
+/// [`init_flags`] plus the retention bit. Bit 2 composes ONLY onto the
+/// zc arm (kernel law: retention without ZERO_COPY refuses EINVAL), so
+/// every non-zc mode and every retention-Absent/lever-off session gets
+/// exactly today's flags — the §3.6 bit-identity is structural.
+pub fn init_flags_with_retention(bufring: bool, zero_copy: bool, retention: bool) -> u16 {
+    let mut f = init_flags(bufring, zero_copy);
+    if zero_copy && retention {
+        f |= FUSE_URING_PAYLOAD_RETENTION;
+    }
+    f
+}
+
+// ---------------------------------------------------------------------
+// Retention capability (design-zc-write-kernel-v2 §3.5/§6.1)
+// ---------------------------------------------------------------------
+
+/// Probe verdict for the 0029 payload-retention surface.
+///
+/// `fuse_uring_register()` ignores unknown init-flag bits, so bit 2
+/// cannot be its own negotiation — an old kernel would accept and
+/// silently ignore it (the worst failure class). The capability is
+/// probed by OPCODE instead: one `FUSE_IO_URING_CMD_RELEASE_PAYLOAD`
+/// with an impossible `commit_id`, issued after FUSE_INIT and before
+/// the REGISTER pass (so the verdict can compose the REGISTER flags).
+/// The errno IS the verdict — measured live ×5 on both sqz tracks
+/// (`.benchmarks/2026-08-09-kernel-zc-write-v2.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetentionSurface {
+    /// The RELEASE_PAYLOAD opcode exists — a 0029 kernel.
+    Present,
+    /// Pre-0029 / stock kernel, or an ambiguous answer (fail-safe:
+    /// bit 2 is never armed on ambiguity).
+    Absent,
+}
+
+impl RetentionSurface {
+    /// The pure §3.5 decision table over the probe cmd's CQE `res`
+    /// (`Err(())` = the probe could not be submitted/reaped at all):
+    ///
+    /// * `-ENOTCONN` — opcode present, dispatched, no ring yet (the
+    ///   pre-arm shape this probe runs in) ⇒ Present.
+    /// * `-ENOENT` — opcode present, ring armed, commit_id unknown
+    ///   (the §3.5 post-arm shape) ⇒ Present.
+    /// * `-EINVAL` / `-EOPNOTSUPP` — the pre-0029 opcode-switch
+    ///   default / disabled surface ⇒ Absent.
+    /// * anything else (0, positive, foreign errno, submit failure) ⇒
+    ///   Absent, fail-safe.
+    pub fn from_probe_errno(res: Result<i32, ()>) -> Self {
+        match res {
+            Ok(r) if r == -libc::ENOTCONN || r == -libc::ENOENT => Self::Present,
+            _ => Self::Absent,
+        }
+    }
+}
+
+/// Resolve the session's retention posture: probe verdict × lever ×
+/// mode. `SQUEEZEFS_FUSE_ZC_RETENTION=0` is the A/B escape; the default
+/// is ON because ARMING is bit-identical when unused (§3.6) — actual
+/// ACK-early engagement is a separate, daemon-owned posture.
+pub fn resolve_retention(surface: RetentionSurface, zero_copy_mode: bool) -> bool {
+    if !zero_copy_mode {
+        return false;
+    }
+    let wanted = env_bool("SQUEEZEFS_FUSE_ZC_RETENTION", true);
+    match (surface, wanted) {
+        (RetentionSurface::Present, true) => true,
+        (RetentionSurface::Present, false) => {
+            warn!(
+                "zc payload retention probed Present but \
+                 SQUEEZEFS_FUSE_ZC_RETENTION=0 — not arming bit 2 (A/B lever; \
+                 fuse3_zc_retention_negotiated stays 0)"
+            );
+            false
+        }
+        (RetentionSurface::Absent, true) => {
+            info!(
+                "zc payload retention: RELEASE_PAYLOAD opcode absent on this \
+                 kernel (pre-0029) — ACK-after-CQE posture, byte-identical \
+                 (the sqz kernel v2 series carries the surface)"
+            );
+            false
+        }
+        (RetentionSurface::Absent, false) => false,
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -611,6 +705,24 @@ pub fn set_zc_negotiated(on: bool) {
 /// zc arm-proof gauge for the field window.
 pub fn zc_negotiated() -> u64 {
     ZC_NEGOTIATED.load(Ordering::Relaxed)
+}
+
+static RETENTION_NEGOTIATED: AtomicU64 = AtomicU64::new(0);
+
+/// Set the session's retention negotiation state (0/1) — stored at arm
+/// time beside [`set_zc_negotiated`] once every queue REGISTERed with
+/// `FUSE_URING_PAYLOAD_RETENTION` accepted.
+pub fn set_retention_negotiated(on: bool) {
+    RETENTION_NEGOTIATED.store(u64::from(on), Ordering::Relaxed);
+}
+
+/// `fuse3_zc_retention_negotiated` (stats inode, 0/1): 1 ⇒ the session
+/// is retention-armed (0029 kernel probed Present, lever on, zc mode,
+/// every REGISTER accepted bit 2). Arming alone changes nothing on the
+/// wire (§3.6 bit-identity) — this gauge going 1 is the PRECONDITION
+/// gauge for ACK-early engagement, not an engagement counter.
+pub fn retention_negotiated() -> u64 {
+    RETENTION_NEGOTIATED.load(Ordering::Relaxed)
 }
 
 /// Count one zc reply commit: a paged reply whose payload rode the

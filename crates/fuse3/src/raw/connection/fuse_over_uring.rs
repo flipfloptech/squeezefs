@@ -100,6 +100,10 @@ pub const FUSE_URING_OP_IN_OUT_SZ: usize = 128;
 
 const FUSE_IO_URING_CMD_REGISTER: u32 = 1;
 const FUSE_IO_URING_CMD_COMMIT_AND_FETCH: u32 = 2;
+/// Series patch 0029 (uapi "7.47"): release a COMMIT_RETAIN'd zc write
+/// payload and re-arm the parked ent. Doubles as the §3.5 capability
+/// probe opcode (see [`probe_retention_surface`]).
+const FUSE_IO_URING_CMD_RELEASE_PAYLOAD: u32 = 3;
 const FUSE_IN_HEADER_SIZE: usize = 40;
 /// `linux/fuse.h` opcode 16 — the only opcode whose payload rides a lease.
 const FUSE_WRITE_OPCODE: u32 = crate::raw::abi::fuse_opcode::FUSE_WRITE as u32;
@@ -1439,6 +1443,12 @@ pub struct FuseOverUring {
     /// `SQUEEZEFS_FUSE_KMBUF` lever. `UserEnts` = today's path,
     /// byte-identical.
     buffer_mode: TransportBufferMode,
+    /// Session retention posture (design-zc-write-kernel-v2 §6.1):
+    /// resolved ONCE at `try_start` — the §3.5 opcode probe × the
+    /// `SQUEEZEFS_FUSE_ZC_RETENTION` lever × zc mode. True ⇒ every
+    /// REGISTER carries `FUSE_URING_PAYLOAD_RETENTION`; arming alone is
+    /// bit-identical (§3.6) until a commit carries RETAIN.
+    retention: bool,
     /// True when qid == kernel cpu id (queue count == kernel possible
     /// CPUs — the production default). The NUMA placement/instrument
     /// derives each queue's node from its qid ONLY under this
@@ -2532,6 +2542,13 @@ impl FuseOverUring {
         // silently downgrade — SQUEEZEFS_FUSE_KMBUF=0 is the operator
         // escape).
         let buffer_mode = kmbuf::resolve_buffer_mode();
+        // Retention capability (design-zc-write-kernel-v2 §3.5/§6.1):
+        // probe by OPCODE post-INIT pre-REGISTER — an old kernel ignores
+        // unknown init bits, so bit 2 cannot self-negotiate. Probed only
+        // where it could arm (zc mode); the verdict composes the
+        // REGISTER flags below and gauges after the arm barrier.
+        let retention = buffer_mode == TransportBufferMode::ZeroCopy
+            && kmbuf::resolve_retention(probe_retention_surface(fuse_fd), true);
         GEOM_QUEUES.store(nqueues as u64, Ordering::Relaxed);
         GEOM_DEPTH.store(depth as u64, Ordering::Relaxed);
         GEOM_PAYLOAD_SZ.store(payload_sz as u64, Ordering::Relaxed);
@@ -2639,6 +2656,7 @@ impl FuseOverUring {
             fuse_fd,
             payload_sz,
             buffer_mode,
+            retention,
             qid_is_cpu,
             stats_requests: AtomicU64::new(0),
             stats_replies: AtomicU64::new(0),
@@ -2721,6 +2739,7 @@ impl FuseOverUring {
         // would have failed the barrier above).
         kmbuf::set_kmbuf_negotiated(buffer_mode.uses_kmbuf());
         kmbuf::set_zc_negotiated(buffer_mode == TransportBufferMode::ZeroCopy);
+        kmbuf::set_retention_negotiated(retention);
         ACTIVE_SESSIONS.fetch_add(1, Ordering::Relaxed);
 
         // Watch /dev/fuse for POLLERR/POLLHUP/etc so we shut down even if a
@@ -2748,10 +2767,11 @@ impl FuseOverUring {
                 _ => "declined".to_string(),
             },
         };
-        let mode_state = match buffer_mode {
-            TransportBufferMode::UserEnts => "user-ents",
-            TransportBufferMode::BufRing => "kmbuf-bufring",
-            TransportBufferMode::ZeroCopy => "kmbuf-bufring+zero-copy",
+        let mode_state = match (buffer_mode, retention) {
+            (TransportBufferMode::UserEnts, _) => "user-ents",
+            (TransportBufferMode::BufRing, _) => "kmbuf-bufring",
+            (TransportBufferMode::ZeroCopy, false) => "kmbuf-bufring+zero-copy",
+            (TransportBufferMode::ZeroCopy, true) => "kmbuf-bufring+zero-copy+retention",
         };
         // The ladder-resolved kmbuf opcode pair (per kernel track:
         // 37/38 = 6.19-sqz, 38/39 = 7.1-sqz, "absent" = stock) — logged
@@ -2868,6 +2888,7 @@ impl FuseOverUring {
             fuse_fd: -1,
             payload_sz: 1 << 20,
             buffer_mode: TransportBufferMode::UserEnts,
+            retention: false,
             qid_is_cpu: false,
             stats_requests: AtomicU64::new(0),
             stats_replies: AtomicU64::new(0),
@@ -4626,7 +4647,14 @@ fn queue_worker(
     // are singletons, so gent == ent_idx there).
     let reg_init_flags: u16 = match pool.buffer_mode {
         TransportBufferMode::BufRing => kmbuf::init_flags(true, false),
-        TransportBufferMode::ZeroCopy => kmbuf::init_flags(true, true),
+        // Retention bit 2 composes onto the zc arm only (kernel law:
+        // retention without ZERO_COPY refuses EINVAL). The SAME flags
+        // serve initial REGISTER and every re-REGISTER — the kernel's
+        // re-REGISTER consistency check refuses a queue whose retention
+        // bit differs from its creation-time posture.
+        TransportBufferMode::ZeroCopy => {
+            kmbuf::init_flags_with_retention(true, true, pool.retention)
+        }
         TransportBufferMode::UserEnts => 0,
     };
     // zc REGISTERs carry `init.queue_depth` (the kernel refuses zc with a
@@ -6735,6 +6763,53 @@ fn push_fetch_batched(ring: &mut Ring, batch: &mut SubmitBatch, entry: Entry128)
     }
     batch.pending += 1;
     Ok(())
+}
+
+/// The §3.5 retention capability probe (design-zc-write-kernel-v2):
+/// ONE `RELEASE_PAYLOAD` uring_cmd with an impossible `commit_id` on a
+/// scratch SQE128 ring against the raw fuse fd, post-INIT pre-REGISTER.
+/// The errno is the verdict (`RetentionSurface::from_probe_errno`):
+/// `-ENOTCONN` = opcode present, no ring yet (this shape — measured
+/// live ×5 on both sqz tracks); `-EINVAL`/`-EOPNOTSUPP` = pre-0029.
+/// Bounded wait (1 s): a kernel that parks the probe cmd is ambiguous
+/// and reads Absent, fail-safe — bit 2 is never armed on ambiguity.
+fn probe_retention_surface(fuse_fd: RawFd) -> kmbuf::RetentionSurface {
+    let res: Result<i32, ()> = (|| {
+        let mut ring: Ring = IoUring::<squeue::Entry128, cqueue::Entry>::builder()
+            .build(8)
+            .map_err(|_| ())?;
+        let mut cmd = [0u8; 80];
+        let req = FuseUringCmdReq {
+            flags: 0,
+            commit_id: u64::MAX,
+            qid: 0,
+            init_flags: 0,
+            init_queue_depth: 0,
+            padding: [0; 2],
+        };
+        // SAFETY: FuseUringCmdReq is repr(C), 24 bytes; rest stays zero.
+        unsafe {
+            std::ptr::write(cmd.as_mut_ptr().cast::<FuseUringCmdReq>(), req);
+        }
+        let entry: Entry128 =
+            opcode::UringCmd80::new(types::Fd(fuse_fd), FUSE_IO_URING_CMD_RELEASE_PAYLOAD)
+                .cmd(cmd)
+                .build()
+                .user_data(1);
+        // SAFETY: the cmd bytes are owned by the entry; no user memory
+        // is referenced by RELEASE_PAYLOAD.
+        unsafe { ring.submission().push(&entry) }.map_err(|_| ())?;
+        let ts = types::Timespec::new().sec(1);
+        let args = types::SubmitArgs::new().timespec(&ts);
+        match ring.submitter().submit_with_args(1, &args) {
+            Ok(_) => {}
+            Err(e) if e.raw_os_error() == Some(libc::ETIME) => return Err(()),
+            Err(_) => return Err(()),
+        }
+        let cqe = ring.completion().next().ok_or(())?;
+        Ok(cqe.result())
+    })();
+    kmbuf::RetentionSurface::from_probe_errno(res)
 }
 
 /// Build one FUSE uring-cmd SQE (SQE128) — extracted from [`push_cmd`] so

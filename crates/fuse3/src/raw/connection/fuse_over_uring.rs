@@ -1342,6 +1342,19 @@ impl InboundQueue {
     }
 }
 
+/// One assembly's dispatch-quiescence state (Approach A cohort
+/// capture): completed placements park in `ready` until no sibling
+/// bridge write on the assembly is in flight, so the first merge's
+/// adoption finds the whole cohort claim-complete (whole-cohort capture
+/// is the design bar — first-chunk-only ≈ 25 % of a 4 MiB block's bytes
+/// is a designed FAILURE).
+struct PlacedCohort {
+    /// Placement bridges submitted, CQE not yet processed.
+    inflight: usize,
+    /// Completed placements holding for quiescence.
+    ready: Vec<InboundUringReq>,
+}
+
 /// Process-wide FUSE-over-io_uring controller (one per fuse session / mount).
 pub struct FuseOverUring {
     /// Session may drain the inbound queue only when true (all queues REGISTERed).
@@ -1393,6 +1406,19 @@ pub struct FuseOverUring {
     /// shape no direct vehicle consumes buys hold + late extraction,
     /// serialized at fabric RTT).
     zc_hold_gate: std::sync::OnceLock<fused::ZcHoldGate>,
+    /// The zc-write PLACE gate (Approach A, 2026-08-09): the
+    /// filesystem's placed-merge seam — an eligible streaming WRITE's
+    /// payload bridges straight into its (ino, block) memfd assembly
+    /// instead of the extraction bounce. Unregistered ⇒ extraction.
+    zc_place_gate: std::sync::OnceLock<fused::ZcPlaceGate>,
+    /// Per-assembly dispatch quiescence (the cohort-capture gate): a
+    /// completed placement's dispatch is HELD while any sibling bridge
+    /// write on the same assembly is in flight, so the first merge's
+    /// adoption seal (which refuses on open writer windows — the §5.2
+    /// law) finds the cohort quiescent and the siblings elide instead
+    /// of demoting to copies. Mutex'd map: ops at 1 MiB granularity
+    /// (thousands/s), touched by the group workers only.
+    placed_cohorts: Mutex<std::collections::HashMap<u64, PlacedCohort>>,
     /// Ring depth (per queue) — the `slot_watch` stride.
     depth: usize,
     /// §5.3 D3.b: session SQPOLL posture for the queue rings (`None` =
@@ -2598,6 +2624,8 @@ impl FuseOverUring {
             zc_write_held: zc::ZcHeldTable::new(nqueues, depth),
             zc_bridge_pends: AtomicU64::new(0),
             zc_hold_gate: std::sync::OnceLock::new(),
+            zc_place_gate: std::sync::OnceLock::new(),
+            placed_cohorts: Mutex::new(std::collections::HashMap::new()),
             fused_dispatch: std::sync::OnceLock::new(),
             depth,
             sqpoll,
@@ -2825,6 +2853,8 @@ impl FuseOverUring {
             zc_write_held: zc::ZcHeldTable::new(nqueues as usize, Self::SIM_DEPTH),
             zc_bridge_pends: AtomicU64::new(0),
             zc_hold_gate: std::sync::OnceLock::new(),
+            zc_place_gate: std::sync::OnceLock::new(),
+            placed_cohorts: Mutex::new(std::collections::HashMap::new()),
             fused_dispatch: std::sync::OnceLock::new(),
             depth: Self::SIM_DEPTH,
             sqpoll: None,
@@ -3087,6 +3117,76 @@ impl FuseOverUring {
     /// deliveries before registration extract at delivery (never hold).
     pub fn set_zc_write_hold_gate(&self, g: fused::ZcHoldGate) {
         let _ = self.zc_hold_gate.set(g);
+    }
+
+    /// Register the zc-write PLACE gate (Approach A — the FUSE
+    /// placed-merge assembly). First set wins; deliveries before
+    /// registration ride the extraction vehicle.
+    pub fn set_zc_write_place_gate(&self, g: fused::ZcPlaceGate) {
+        let _ = self.zc_place_gate.set(g);
+    }
+
+    /// A placement bridge was submitted on `assembly_id` (the cohort's
+    /// in-flight census — quiescence holds sibling dispatches).
+    fn placed_cohort_begin(&self, assembly_id: u64) {
+        let mut m = self.placed_cohorts.lock().expect("placed cohorts");
+        m.entry(assembly_id)
+            .or_insert(PlacedCohort {
+                inflight: 0,
+                ready: Vec::new(),
+            })
+            .inflight += 1;
+    }
+
+    /// One placement bridge on `assembly_id` resolved (`req` = the
+    /// completed delivery to hold for quiescence; `None` = a failed
+    /// bridge that rides the extraction fallback). Returns the cohort's
+    /// held deliveries when the assembly went QUIESCENT — the caller
+    /// dispatches them.
+    fn placed_cohort_settle(
+        &self,
+        assembly_id: u64,
+        req: Option<InboundUringReq>,
+    ) -> Vec<InboundUringReq> {
+        let mut m = self.placed_cohorts.lock().expect("placed cohorts");
+        let Some(c) = m.get_mut(&assembly_id) else {
+            // Structurally unreachable (begin precedes settle); degrade
+            // to immediate dispatch rather than strand a delivery.
+            return req.into_iter().collect();
+        };
+        c.inflight = c.inflight.saturating_sub(1);
+        if let Some(r) = req {
+            c.ready.push(r);
+        }
+        if c.inflight == 0 {
+            let out = std::mem::take(&mut c.ready);
+            m.remove(&assembly_id);
+            out
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Dispatch quiescent cohort deliveries to their queues' inbound
+    /// (cross-group legal: the queues are `Arc`'d MPMC). A failed push
+    /// means the session is closing — the slot stays owed and the
+    /// owning worker's row-8 teardown drain synthesizes its reply.
+    fn placed_dispatch(&self, ready: Vec<InboundUringReq>) {
+        for req in ready {
+            let ReplySlot::Ring { qid, .. } = req.slot else {
+                continue;
+            };
+            let unique = req.unique;
+            if let Some(q) = self.inbound.get(qid as usize) {
+                if q.push(req).is_err() {
+                    warn!(
+                        "fuse-over-uring qid={qid}: placed cohort dispatch found the \
+                         session inbound closed (unique={unique}); the slot is owed and \
+                         the teardown drain synthesizes (row 8)"
+                    );
+                }
+            }
+        }
     }
 
     /// D14 write-side direct leg: DMA the request's HELD WRITE payload
@@ -4425,6 +4525,46 @@ fn queue_worker(
                 );
                 Ok(Some(PendDone::DeliverFailed))
             }
+            Some(ZcPend::PlacedWrite {
+                header_and_op,
+                unique,
+                commit_id,
+                len,
+                placement,
+            }) => {
+                // §5.2 law: the writer window closes at the CQE — success
+                // AND failure — before anything else can observe the
+                // assembly (a still-open window blocks adoption; a closed
+                // one makes the cohort adoptable once quiescent).
+                placement.complete();
+                if res == len as i32 {
+                    fused::note_zc_write_placement(u64::from(len));
+                    return Ok(Some(PendDone::Placed {
+                        header_and_op,
+                        unique,
+                        commit_id,
+                        payload: placement.payload,
+                        assembly_id: placement.assembly_id,
+                    }));
+                }
+                // Short/errored bridge: the slot still holds the payload
+                // (pages unregister only at COMMIT) — fall back to the
+                // at-delivery extraction vehicle for this ent, counted.
+                // The placement payload drops here (claim released).
+                fused::note_zc_write_place_fallback();
+                warn!(
+                    "fuse-over-uring qid={qid} ent={idx}: placed-merge bridge failed \
+                     (res={res}, want={len}) — falling back to the extraction vehicle \
+                     for unique={unique}"
+                );
+                Ok(Some(PendDone::PlacedFailed {
+                    header_and_op,
+                    unique,
+                    commit_id,
+                    len,
+                    assembly_id: placement.assembly_id,
+                }))
+            }
         }
     }
 
@@ -4449,6 +4589,28 @@ fn queue_worker(
         /// An at-delivery extraction FAILED: the request cannot be
         /// served — the caller synthesizes its EIO (row-5 discipline).
         DeliverFailed,
+        /// An Approach A placement bridge COMPLETED: the payload sits in
+        /// the (ino, block) assembly; the caller routes the delivery
+        /// through the cohort quiescence gate (dispatch when no sibling
+        /// bridge on the assembly is in flight).
+        Placed {
+            header_and_op: Vec<u8>,
+            unique: u64,
+            commit_id: u64,
+            payload: Bytes,
+            assembly_id: u64,
+        },
+        /// An Approach A placement bridge FAILED: the caller re-routes
+        /// the SAME ent through the at-delivery extraction vehicle
+        /// (payload intact in the slot until COMMIT) and settles the
+        /// assembly's cohort accounting.
+        PlacedFailed {
+            header_and_op: Vec<u8>,
+            unique: u64,
+            commit_id: u64,
+            len: u32,
+            assembly_id: u64,
+        },
     }
     // Membership lookup, not offset arithmetic: groups are node-membership
     // SETS (interleaved numberings are the field norm). A linear scan over
@@ -5007,6 +5169,7 @@ fn queue_worker(
                     Some(ZcPend::HandlerStore { .. })
                         | Some(ZcPend::LazyExtract { .. })
                         | Some(ZcPend::WriteExtract { .. })
+                        | Some(ZcPend::PlacedWrite { .. })
                 )
                 && test_drop_write_cqe()
             {
@@ -5389,6 +5552,92 @@ fn queue_worker(
                                 libc::EIO,
                             )?;
                         }
+                        PendDone::Placed {
+                            header_and_op,
+                            unique,
+                            commit_id,
+                            payload,
+                            assembly_id,
+                        } => {
+                            // Approach A: the payload sits in the
+                            // assembly; hold the delivery for cohort
+                            // quiescence (dispatch when no sibling
+                            // bridge on the assembly is in flight — the
+                            // whole-cohort-capture bar).
+                            let req = InboundUringReq {
+                                header_and_op,
+                                payload,
+                                unique,
+                                slot: ReplySlot::Ring {
+                                    qid,
+                                    ent_idx: ent_idx as u16,
+                                    commit_id,
+                                },
+                                arrived_ns: crate::raw::read_phase::transport_now_ns(),
+                            };
+                            let ready = pool.placed_cohort_settle(assembly_id, Some(req));
+                            pool.placed_dispatch(ready);
+                        }
+                        PendDone::PlacedFailed {
+                            header_and_op,
+                            unique,
+                            commit_id,
+                            len,
+                            assembly_id,
+                        } => {
+                            // Settle the cohort first (siblings must not
+                            // wait on a bridge that already failed),
+                            // then re-route THIS ent through the
+                            // at-delivery extraction vehicle — the slot
+                            // still holds the payload until COMMIT.
+                            let ready = pool.placed_cohort_settle(assembly_id, None);
+                            pool.placed_dispatch(ready);
+                            let zb = zc_bounce.as_ref().expect("placed pend implies zc mode");
+                            let entry = Entry128::from(
+                                opcode::WriteFixed::new(
+                                    types::Fd(zb.fd()),
+                                    std::ptr::null(),
+                                    len,
+                                    ent_idx as u16,
+                                )
+                                .offset(zb.offset_of(ent_idx).expect("ent in range"))
+                                .build()
+                                .user_data(encode_user_data(RingOp::Fetch, gent)),
+                            );
+                            match push_fetch_batched(&mut ring, &mut batch, entry) {
+                                Ok(()) => {
+                                    m.zc_pend[ent_idx] = Some(ZcPend::WriteExtract {
+                                        header_and_op,
+                                        unique,
+                                        commit_id,
+                                        len,
+                                    });
+                                    if m.bridge_deadlines
+                                        .stamp(ent_idx, crate::raw::read_phase::transport_now_ns())
+                                    {
+                                        pool.zc_bridge_pends.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "fuse-over-uring qid={qid} ent={ent_idx}: placed \
+                                         fallback extraction push failed ({e}); synthesizing \
+                                         EIO for unique={unique}"
+                                    );
+                                    fail_ent(
+                                        &mut ring,
+                                        &mut batch,
+                                        &mut m.slots,
+                                        &mut m.ents[ent_idx],
+                                        &m.lease_states[ent_idx],
+                                        pool.slot_watch_cell(qid, ent_idx),
+                                        qid,
+                                        gent,
+                                        libc::EIO,
+                                    )?;
+                                }
+                            }
+                        }
                     }
                 }
                 continue;
@@ -5748,6 +5997,76 @@ fn queue_worker(
                         )?;
                         continue;
                     }
+                    // Approach A (placed merge, 2026-08-09): an eligible
+                    // streaming chunk bridges STRAIGHT into its
+                    // (ino, block) memfd assembly — the extraction
+                    // destination and the handler's NT merge copy are
+                    // both deleted for placed bytes (the first merge
+                    // ADOPTS the assembly; siblings elide via the
+                    // pointer proof). The filesystem's gate owns
+                    // eligibility (page-aligned, full-repr class, no
+                    // live overlay); refusals ride the extraction
+                    // vehicle below unchanged.
+                    if let Some(placement) = pool
+                        .zc_place_gate
+                        .get()
+                        .and_then(|g| g(hold_nodeid, w_off, w_size))
+                    {
+                        let entry = Entry128::from(
+                            opcode::WriteFixed::new(
+                                types::Fd(placement.fd),
+                                std::ptr::null(),
+                                payload_sz as u32,
+                                ent_idx as u16,
+                            )
+                            .offset(placement.file_off)
+                            .build()
+                            .user_data(encode_user_data(RingOp::Fetch, gent)),
+                        );
+                        match push_fetch_batched(&mut ring, &mut batch, entry) {
+                            Ok(()) => {
+                                pool.placed_cohort_begin(placement.assembly_id);
+                                m.zc_pend[ent_idx] = Some(ZcPend::PlacedWrite {
+                                    header_and_op,
+                                    unique,
+                                    commit_id,
+                                    len: payload_sz as u32,
+                                    placement,
+                                });
+                                if m.bridge_deadlines
+                                    .stamp(ent_idx, crate::raw::read_phase::transport_now_ns())
+                                {
+                                    pool.zc_bridge_pends.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            Err(e) => {
+                                // The placement drops here (writer window
+                                // balanced by ZcWritePlacement::complete
+                                // via the failure path below; claim by
+                                // payload drop). Loud EIO — the same
+                                // class as an extraction push failure.
+                                placement.complete();
+                                fused::note_zc_write_place_fallback();
+                                error!(
+                                    "fuse-over-uring qid={qid} ent={ent_idx}: placed-merge \
+                                     bridge push failed ({e}); synthesizing EIO for \
+                                     unique={unique}"
+                                );
+                                fail_ent(
+                                    &mut ring,
+                                    &mut batch,
+                                    &mut m.slots,
+                                    &mut m.ents[ent_idx],
+                                    &m.lease_states[ent_idx],
+                                    pool.slot_watch_cell(qid, ent_idx),
+                                    qid,
+                                    gent,
+                                    libc::EIO,
+                                )?;
+                            }
+                        }
+                        continue;
+                    }
                     let entry = Entry128::from(
                         opcode::WriteFixed::new(
                             types::Fd(zb.fd()),
@@ -5976,6 +6295,17 @@ fn queue_worker(
     // row-8 owing() pass below synthesizes.
     for m in members.iter_mut() {
         for (idx, pend) in m.zc_pend.iter_mut().enumerate() {
+            // Approach A: an in-flight placement's writer window is
+            // balanced (once-only) and its payload dropped (claim
+            // released) — the slot is still OWED and the row-8 pass
+            // below synthesizes its reply. The assembly drains via
+            // payload drops (never adopted).
+            if matches!(pend, Some(ZcPend::PlacedWrite { .. })) {
+                if let Some(ZcPend::PlacedWrite { placement, .. }) = pend.take() {
+                    placement.complete();
+                }
+                continue;
+            }
             if let Some(ZcPend::BounceFetch {
                 header, commit_id, ..
             }) = pend.take()

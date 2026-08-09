@@ -11,6 +11,7 @@ use bytes::Bytes;
 #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
 pub use connection::fuse_over_uring::fused::{
     zc_write_fusion_bytes, zc_write_fusion_demotions, zc_write_fusions, zc_write_lazy_extractions,
+    zc_write_place_fallbacks, zc_write_placement_bytes, zc_write_placements,
 };
 #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
 pub use connection::fuse_over_uring::{

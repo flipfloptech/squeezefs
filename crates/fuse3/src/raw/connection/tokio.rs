@@ -472,6 +472,17 @@ impl FuseConnection {
         }
     }
 
+    /// Register the zc-write PLACE gate (Approach A — the FUSE
+    /// placed-merge assembly, 2026-08-09) — see
+    /// [`super::fuse_over_uring::FuseOverUring::set_zc_write_place_gate`].
+    /// No-op when no over-uring pool exists (classical sessions).
+    #[cfg(target_os = "linux")]
+    pub fn set_zc_write_place_gate(&self, g: super::fuse_over_uring::fused::ZcPlaceGate) {
+        if let Some(pool) = self.over_uring.get() {
+            pool.set_zc_write_place_gate(g);
+        }
+    }
+
     /// Commit a reply whose payload already sits in the request's pages
     /// (the zc direct leg) — see
     /// [`super::fuse_over_uring::FuseOverUring::submit_reply_prefilled`].

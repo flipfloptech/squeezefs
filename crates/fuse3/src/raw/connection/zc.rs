@@ -311,6 +311,21 @@ pub(crate) enum ZcPend {
         commit_id: u64,
         len: u32,
     },
+    /// An Approach A PLACEMENT bridge (`WRITE_FIXED(slot → assembly
+    /// memfd)`, write-bandwidth program 2026-08-09): the delivered
+    /// WRITE's payload is landing straight in its (ino, block) merge
+    /// assembly. On the full-length CQE the worker closes the writer
+    /// window (`placement.complete()` — the §5.2 seal law) and hands
+    /// the delivery to the cohort quiescence gate; a short/errored CQE
+    /// (or the deadline ladder's synthesized loss) falls back to the
+    /// at-delivery extraction vehicle for the SAME ent, counted.
+    PlacedWrite {
+        header_and_op: Vec<u8>,
+        unique: u64,
+        commit_id: u64,
+        len: u32,
+        placement: crate::raw::connection::fuse_over_uring::fused::ZcWritePlacement,
+    },
 }
 
 /// D14 hold-candidate predicate (the hybrid delivery, zcws-8 lesson):

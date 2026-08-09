@@ -5204,6 +5204,17 @@ pub struct Metrics {
     /// correct, but the parity win is rotting).
     pub placed_adoptions: Align64<AtomicU64>,
     pub placed_merge_elides: Align64<AtomicU64>,
+    /// FUSE placed-merge (Approach A, 2026-08-09): placement CLAIMS
+    /// granted (a bridge target minted — the delivery-side half of the
+    /// `fuse3_zc_write_placements` pair, which counts CQE-confirmed
+    /// bridges).
+    pub placed_fuse_claims: Align64<AtomicU64>,
+    /// Adoption attempts REFUSED by the seal Dekker (a matching
+    /// assembly existed but a bridge write was still in flight, or a
+    /// sibling raced the seal): the cohort-break gauge — each refusal
+    /// demotes that block's whole cohort to the copy path (correct,
+    /// counted; growth prices the quiescence window).
+    pub placed_adoption_refusals: Align64<AtomicU64>,
     /// Gauge: live pre-adoption assembly bytes (block-size backings held
     /// by in-flight placed ring writes; R5 component `placed_assemblies`,
     /// non-sheddable — converges by adoption/drop, never by shedding).
@@ -8137,6 +8148,17 @@ impl SqueezefsFilesystem {
                 "ipc_placed_sever_fallbacks": METRICS.ipc_placed_sever_fallbacks.load(Ordering::Relaxed),
                 "placed_adoptions": METRICS.placed_adoptions.load(Ordering::Relaxed),
                 "placed_merge_elides": METRICS.placed_merge_elides.load(Ordering::Relaxed),
+                "placed_fuse_claims": METRICS.placed_fuse_claims.load(Ordering::Relaxed),
+                "placed_adoption_refusals": METRICS.placed_adoption_refusals.load(Ordering::Relaxed),
+                // Approach A engagement (FUSE placed-merge, 2026-08-09):
+                // CQE-confirmed slot->assembly bridges + the byte face
+                // (the acceptance signature: placement bytes ~= row
+                // bytes; nt_copy AND extract bytes fall by the same);
+                // fallbacks = bridge failures/sealed retries riding the
+                // extraction vehicle.
+                "fuse3_zc_write_placements": fuse3::zc_write_placements(),
+                "fuse3_zc_write_placement_bytes": fuse3::zc_write_placement_bytes(),
+                "fuse3_zc_write_place_fallbacks": fuse3::zc_write_place_fallbacks(),
                 "placed_assembly_bytes": METRICS.placed_assembly_bytes.load(Ordering::Relaxed),
                 // Near-zero-copy campaign (2026-07-31): NT-store copy
                 // engagement at the DMA-destined copy sites (merge +
@@ -15150,6 +15172,80 @@ impl Filesystem for SqueezefsFilesystem {
             return false;
         }
         true
+    }
+
+    /// The zc-write PLACE gate (Approach A — the FUSE placed-merge
+    /// assembly, write-bandwidth program 2026-08-09): may this armed
+    /// streaming WRITE bridge straight into its `(ino, block)` memfd
+    /// assembly? TRUE only for the FULL-repr streaming class the
+    /// checkout path will ADOPT:
+    ///
+    /// * page-aligned offset AND length ([`crate::placed_core::CLAIM_PAGE`]
+    ///   — the claim bitmap's granularity), single block;
+    /// * NOT the W2 small class (`len × 4 ≥ block_size` — the extent
+    ///   overlay's own `small` predicate inverted, so placements can
+    ///   never inflate a small-write row into full-buffer backings);
+    /// * a CACHE-LESS mount (empty `staging_dirs` — format-time,
+    ///   mount-immutable): beyond-inline writes route STRIPED, so the
+    ///   full-repr checkout owns every placed chunk and the staged
+    ///   sibling/extent probes are structurally empty. Staged-layout
+    ///   mounts ride the extraction vehicle unchanged (the honest v1
+    ///   bound — the adjudication's streaming venue is cache-less);
+    /// * no LIVE overlay entry for the block (the adopted-assembly
+    ///   isolation law's ROUTING face: post-adoption writes must never
+    ///   place — they extract and merge into the parked entry).
+    ///
+    /// The registry half (claims, cap, sealed/pooled refusals) lives in
+    /// [`crate::placed_sever::PlacedSeverRegistry::begin_placement`];
+    /// every refusal is a counted extraction fallback. Lock-free sync
+    /// probes only — this runs on the transport queue-worker thread.
+    fn zc_write_place(
+        &self,
+        ino: u64,
+        offset: u64,
+        len: u32,
+    ) -> Option<fuse3::raw::connection::fuse_over_uring::fused::ZcWritePlacement> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| crate::env_knobs::bool_knob("SQUEEZEFS_FUSE_PLACED_MERGE", true)) {
+            return None;
+        }
+        if len == 0 || is_virtual_ino(ino) {
+            return None;
+        }
+        let block_size = self.router.block_size.load(Ordering::Relaxed);
+        if block_size == 0 {
+            return None;
+        }
+        let page = crate::placed_core::CLAIM_PAGE as u64;
+        if offset % page != 0 || u64::from(len) % page != 0 {
+            return None;
+        }
+        if u64::from(len) * 4 < block_size {
+            return None;
+        }
+        let b = offset / block_size;
+        if (offset + u64::from(len) - 1) / block_size != b {
+            return None;
+        }
+        if !self.router.cache.nvme.staging_dirs().is_empty() {
+            return None;
+        }
+        let key = crate::keys::active_block_stack(ino, b);
+        if self.active_block_buffers.contains_key(key.as_str()) {
+            return None;
+        }
+        let rel = (offset - b * block_size) as usize;
+        self.placed_assemblies
+            .begin_placement(ino, b, rel, len as usize, block_size as usize)
+            .map(
+                |p| fuse3::raw::connection::fuse_over_uring::fused::ZcWritePlacement {
+                    fd: p.fd,
+                    file_off: p.file_off,
+                    payload: p.payload,
+                    assembly_id: p.assembly_id,
+                    end_write: p.end_write,
+                },
+            )
     }
 
     async fn init(&self, _req: Request) -> FuseResult<ReplyInit> {

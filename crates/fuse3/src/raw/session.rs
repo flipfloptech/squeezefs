@@ -864,6 +864,16 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                             fs_for_gate.zc_write_hold_eligible(ino, offset, len)
                         },
                     ));
+                    // Approach A (placed merge, 2026-08-09): the PLACE
+                    // gate — eligible streaming chunks bridge straight
+                    // into their (ino, block) memfd assembly instead of
+                    // the extraction bounce.
+                    let fs_for_place = fs.clone();
+                    fuse_connection.set_zc_write_place_gate(Arc::new(
+                        move |ino: u64, offset: u64, len: u32| {
+                            fs_for_place.zc_write_place(ino, offset, len)
+                        },
+                    ));
                 }
             }
         }

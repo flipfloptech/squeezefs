@@ -27,7 +27,7 @@
 //!    `metrics` (the engagement instrument the brackets gate on).
 
 use squeezefs_testkit::{mount_supported, site};
-use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -218,6 +218,45 @@ fn armed_venue(tag: &str, envs: &[(&str, &str)], caller: squeezefs_testkit::Site
     })
 }
 
+/// A page-aligned 1 MiB write buffer (the standing instrument-alignment
+/// lesson: an UNALIGNED O_DIRECT buffer spans max_pages+1 and the
+/// kernel SPLITS it into two non-page-multiple WRITEs — which the
+/// placement gate rightly refuses; fio/elbencho align their buffers, so
+/// this instrument must too).
+struct AlignedMiB(*mut u8);
+// SAFETY: exclusively-owned anonymous mapping; sent whole across the
+// cohort thread spawn.
+unsafe impl Send for AlignedMiB {}
+impl AlignedMiB {
+    fn filled(byte: u8) -> Self {
+        // SAFETY: fresh anonymous RW mapping, page-aligned by mmap.
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                1024 * 1024,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert!(p != libc::MAP_FAILED, "aligned buffer mmap");
+        // SAFETY: the fresh 1 MiB mapping is writable.
+        unsafe { std::ptr::write_bytes(p as *mut u8, byte, 1024 * 1024) };
+        Self(p as *mut u8)
+    }
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: the mapping is 1 MiB, initialized, exclusively owned.
+        unsafe { std::slice::from_raw_parts(self.0, 1024 * 1024) }
+    }
+}
+impl Drop for AlignedMiB {
+    fn drop(&mut self) {
+        // SAFETY: unmapping the mapping created in `filled`, once.
+        unsafe { libc::munmap(self.0 as *mut libc::c_void, 1024 * 1024) };
+    }
+}
+
 /// A start-synchronized cohort of 1 MiB O_DIRECT pwrites covering one
 /// 4 MiB block from `nthreads` threads — the concurrent-chunk shape a
 /// qd>1 streaming row delivers (cohort capture needs sibling claims to
@@ -241,9 +280,9 @@ fn write_block_cohort(path: &Path, block_off: u64, patterns: &[u8]) {
                     .custom_flags(libc::O_DIRECT)
                     .open(&path)
                     .expect("open O_DIRECT");
-                let buf = vec![byte; 1024 * 1024];
+                let buf = AlignedMiB::filled(byte);
                 barrier.wait();
-                f.write_all_at(&buf, block_off + (i as u64) * 1024 * 1024)
+                f.write_all_at(buf.as_slice(), block_off + (i as u64) * 1024 * 1024)
                     .expect("cohort chunk write");
             })
         })
@@ -347,8 +386,42 @@ fn post_adoption_writes_never_target_the_assembly() {
     let mnt = &v.mount.mnt;
 
     let file = mnt.join("sealed.bin");
-    // Round 1: a cohort covering block 0 — places + adopts.
-    write_block_cohort(&file, 0, &[0xA1, 0xA2, 0xA3, 0xA4]);
+    // Round 1: a PARTIAL cohort (3 of the block's 4 MiB) over ONE
+    // kept-open O_DIRECT fd — places and adopts, but coverage stays
+    // incomplete AND the handle stays open (a close would FLUSH and
+    // retire the entry), so the adopted assembly REMAINS the live
+    // parked overlay across round 2.
+    use std::os::unix::fs::FileExt as _;
+    let f = std::sync::Arc::new(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .custom_flags(libc::O_DIRECT)
+            .open(&file)
+            .expect("open O_DIRECT"),
+    );
+    {
+        use std::sync::Barrier;
+        let barrier = std::sync::Arc::new(Barrier::new(3));
+        let handles: Vec<_> = [0xA1u8, 0xA2, 0xA3]
+            .iter()
+            .enumerate()
+            .map(|(i, &byte)| {
+                let f = std::sync::Arc::clone(&f);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let buf = AlignedMiB::filled(byte);
+                    barrier.wait();
+                    f.write_all_at(buf.as_slice(), (i as u64) * 1024 * 1024)
+                        .expect("cohort chunk write");
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("cohort thread");
+        }
+    }
     let adoptions = metric(mnt, "placed_adoptions");
     assert!(
         adoptions >= 1,
@@ -360,15 +433,9 @@ fn post_adoption_writes_never_target_the_assembly() {
     // snapshot-visible). A rewrite of chunk 1 MUST NOT place — the
     // root gate refuses (live overlay) and the write rides extraction.
     let placements1 = metric(mnt, "fuse3_zc_write_placements");
-    use std::os::unix::fs::FileExt as _;
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .custom_flags(libc::O_DIRECT)
-        .open(&file)
-        .expect("open O_DIRECT");
-    f.write_all_at(&vec![0xB1u8; 1024 * 1024], 0)
+    let rebuf = AlignedMiB::filled(0xB1);
+    f.write_all_at(rebuf.as_slice(), 0)
         .expect("post-adoption rewrite");
-    drop(f);
     assert_eq!(
         metric(mnt, "fuse3_zc_write_placements"),
         placements1,
@@ -384,6 +451,14 @@ fn post_adoption_writes_never_target_the_assembly() {
         read_back(&file, 1024 * 1024, 1024 * 1024),
         vec![0xA2u8; 1024 * 1024],
         "sibling chunk bytes must be untouched by the rewrite"
+    );
+    // Durability round trip across the mixed-vehicle block.
+    f.sync_all().expect("fsync mixed-vehicle block");
+    drop(f);
+    assert_eq!(
+        read_back(&file, 2 * 1024 * 1024, 1024 * 1024),
+        vec![0xA3u8; 1024 * 1024],
+        "chunk 3 byte-exact after fsync"
     );
 }
 

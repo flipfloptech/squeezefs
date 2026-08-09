@@ -238,6 +238,15 @@ impl PlacedSeverRegistry {
                 // Pointer mismatch (foreign payload) or a sever mid-copy:
                 // never adopt. A sealed non-adopted assembly drains via
                 // payload drops; a mismatch keeps serving its own ops.
+                if matches {
+                    // The cohort-break gauge (Approach A): OUR assembly,
+                    // but a writer window (bridge/sever mid-copy) blocked
+                    // the seal — the whole cohort demotes to the copy
+                    // path. Growth prices the quiescence window.
+                    METRICS
+                        .placed_adoption_refusals
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 false
             }
         });
@@ -255,11 +264,149 @@ impl PlacedSeverRegistry {
         });
     }
 
+    /// The FUSE placed-merge PLACEMENT (Approach A, write-bandwidth
+    /// program 2026-08-09): claim `[rel, rel + len)` of `(ino, block)`'s
+    /// **memfd-backed** assembly and open the writer window — the writer
+    /// is the transport queue worker's `WRITE_FIXED(slot → assembly fd)`
+    /// bridge, whose full-length CQE closes the window (the returned
+    /// guard). Unlike [`Self::sever`] there is NO copy here: the claim's
+    /// begin/end straddle an ASYNC kernel write, which is exactly what
+    /// makes the §5.2 isolation law hold — [`Self::take_for_adoption`]'s
+    /// `seal_for_adoption` refuses while any writer window is open, so
+    /// **no kernel write can target the assembly after it becomes
+    /// snapshot-visible** (pinned by
+    /// `placement_writer_window_blocks_adoption` below).
+    ///
+    /// `None` ⇒ the caller falls back to the extraction vehicle:
+    /// misaligned/out-of-range shape, an existing NON-memfd assembly
+    /// (the IPC pooled kind — the bridge cannot target it), the
+    /// assembly cap, a claim overlap, or a sealed (adopted) assembly.
+    pub(crate) fn begin_placement(
+        self: &Arc<Self>,
+        ino: u64,
+        block: u64,
+        rel: usize,
+        len: usize,
+        block_size: usize,
+    ) -> Option<FusePlacement> {
+        if rel % CLAIM_PAGE != 0
+            || len % CLAIM_PAGE != 0
+            || len == 0
+            || rel.saturating_add(len) > block_size
+        {
+            METRICS
+                .ipc_placed_sever_fallbacks
+                .fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let key = (ino, block);
+        let assembly = {
+            let entry = self.map.entry_sync(key);
+            let assembly = match entry {
+                scc::hash_map::Entry::Occupied(o) => Arc::clone(o.get()),
+                scc::hash_map::Entry::Vacant(v) => {
+                    let charged = METRICS
+                        .placed_assembly_bytes
+                        .fetch_add(block_size as u64, Ordering::Relaxed)
+                        + block_size as u64;
+                    if charged > assembly_cap_bytes() {
+                        crate::gauge_core::sub_saturating(
+                            &METRICS.placed_assembly_bytes,
+                            block_size as u64,
+                        );
+                        METRICS
+                            .ipc_placed_sever_fallbacks
+                            .fetch_add(1, Ordering::Relaxed);
+                        return None;
+                    }
+                    let Some((block_mem, _fd)) = SharedBlock::alloc_memfd(block_size) else {
+                        crate::gauge_core::sub_saturating(
+                            &METRICS.placed_assembly_bytes,
+                            block_size as u64,
+                        );
+                        METRICS
+                            .ipc_placed_sever_fallbacks
+                            .fetch_add(1, Ordering::Relaxed);
+                        return None;
+                    };
+                    let a = Arc::new(BlockAssembly {
+                        block: block_mem,
+                        claims: PlacedClaims::new(block_size),
+                        outstanding: AtomicUsize::new(0),
+                    });
+                    v.insert_entry(Arc::clone(&a));
+                    a
+                }
+            };
+            // The bridge needs an fd: an existing POOLED assembly (the
+            // IPC sever kind) cannot be targeted — fall back.
+            if assembly.block.memfd_raw().is_none() {
+                METRICS
+                    .ipc_placed_sever_fallbacks
+                    .fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            if !assembly
+                .claims
+                .begin_claim(rel / CLAIM_PAGE, len / CLAIM_PAGE)
+            {
+                METRICS
+                    .ipc_placed_sever_fallbacks
+                    .fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            // Relaxed: published under the entry guard (PERF-21).
+            assembly.outstanding.fetch_add(1, Ordering::Relaxed);
+            assembly
+        };
+        METRICS.placed_fuse_claims.fetch_add(1, Ordering::Relaxed);
+        let fd = assembly
+            .block
+            .memfd_raw()
+            .expect("memfd presence checked under the entry guard");
+        let assembly_id = Arc::as_ptr(&assembly) as u64;
+        // The writer-window closer, once-only (CQE success, CQE failure,
+        // and every drop path all balance the SAME window).
+        let end_assembly = Arc::clone(&assembly);
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let end_write: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            if !ended.swap(true, Ordering::AcqRel) {
+                end_assembly.claims.end_write();
+            }
+        });
+        let payload = bytes::Bytes::from_owner(PlacedSevered {
+            registry: Arc::clone(self),
+            key,
+            assembly,
+            rel,
+            len,
+        });
+        Some(FusePlacement {
+            fd,
+            file_off: rel as u64,
+            payload,
+            assembly_id,
+            end_write,
+        })
+    }
+
     /// Test/teardown visibility: live assemblies.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.map.len()
     }
+}
+
+/// One granted FUSE placement (Approach A): the bridge target
+/// (`fd`/`file_off`), the assembly-region payload the dispatch will
+/// carry (claim released on drop), the cohort key, and the once-only
+/// writer-window closer the CQE calls.
+pub(crate) struct FusePlacement {
+    pub(crate) fd: std::os::fd::RawFd,
+    pub(crate) file_off: u64,
+    pub(crate) payload: bytes::Bytes,
+    pub(crate) assembly_id: u64,
+    pub(crate) end_write: Arc<dyn Fn() + Send + Sync>,
 }
 
 /// The placed payload owner: `AsRef` = the assembly region; drop releases
@@ -309,6 +456,92 @@ mod tests {
     ) -> Option<bytes::Bytes> {
         // SAFETY: payload is a live slice for the call.
         unsafe { reg.sever(ino, block, rel, payload.len(), block_size, payload.as_ptr()) }
+    }
+
+    /// THE §5.2 isolation-law pin (Approach A): a placement whose bridge
+    /// write is still in flight (writer window OPEN — `end_write` not
+    /// yet called) must BLOCK adoption, because adoption makes the
+    /// assembly snapshot-visible and a late kernel write would mutate
+    /// frozen bytes. After `end_write`, adoption proceeds; after
+    /// adoption (sealed), no new placement may claim the assembly.
+    #[test]
+    fn placement_writer_window_blocks_adoption() {
+        let reg = Arc::new(PlacedSeverRegistry::new());
+        const BS: usize = 64 * 1024;
+        let p = reg
+            .begin_placement(9, 4, 0, 8192, BS)
+            .expect("placement claim");
+        // Bridge in flight: adoption MUST refuse (writer window open).
+        assert!(
+            reg.take_for_adoption(9, 4, p.payload.as_ptr(), 0).is_none(),
+            "adoption while a kernel bridge write is in flight would let \
+             the write land in snapshot-visible memory — the §5.2 law"
+        );
+        // CQE lands: the window closes (once-only — a second call is a
+        // no-op, the guard/drop paths all balance the same window).
+        (p.end_write)();
+        (p.end_write)();
+        let shared = reg
+            .take_for_adoption(9, 4, p.payload.as_ptr(), 0)
+            .expect("adoption after the writer window closed");
+        assert!(
+            shared.memfd_raw().is_some(),
+            "the adopted backing is the memfd assembly"
+        );
+        // Post-adoption: the adopted assembly LEFT the registry (removal
+        // IS the seal's registry face), so a later placement mints a
+        // FRESH private assembly — the adopted, snapshot-visible backing
+        // can never be a bridge target again (the §5.2 law's second
+        // half; the MOUNT-level routing gate additionally refuses
+        // placement while the adopted overlay entry lives — pinned by
+        // `post_adoption_writes_never_target_the_assembly`).
+        let p2 = reg
+            .begin_placement(9, 4, 16384, 8192, BS)
+            .expect("post-adoption placement mints a fresh assembly");
+        assert!(
+            !std::ptr::eq(p2.payload.as_ptr(), unsafe { shared.as_ptr().add(16384) }),
+            "a post-adoption placement must never target the adopted \
+             (snapshot-visible) backing"
+        );
+        drop(p2);
+        drop(p);
+    }
+
+    /// Placement payload bytes ARE the assembly region (fd + VA views of
+    /// one memory): bytes written through the memfd are the payload's.
+    #[test]
+    fn placement_payload_is_the_memfd_region() {
+        let reg = Arc::new(PlacedSeverRegistry::new());
+        const BS: usize = 64 * 1024;
+        let p = reg
+            .begin_placement(11, 2, 4096, 8192, BS)
+            .expect("placement claim");
+        let pattern = vec![0x7Eu8; 8192];
+        // The kernel-bridge stand-in: pwrite through the fd at file_off.
+        let n = unsafe {
+            libc::pwrite(
+                p.fd,
+                pattern.as_ptr().cast(),
+                8192,
+                p.file_off as libc::off_t,
+            )
+        };
+        assert_eq!(n, 8192);
+        (p.end_write)();
+        assert_eq!(
+            &p.payload[..],
+            &pattern[..],
+            "fd writes are visible through the payload's mmap view"
+        );
+        // Pool-backed assembly (IPC sever) refuses placements: bridge
+        // has no fd to target.
+        let ipc = sever_ok(&reg, 12, 1, 0, &pattern, BS).expect("ipc sever");
+        assert!(
+            reg.begin_placement(12, 1, 16384, 8192, BS).is_none(),
+            "a pooled (fd-less) assembly must refuse placements"
+        );
+        drop(ipc);
+        drop(p);
     }
 
     #[test]

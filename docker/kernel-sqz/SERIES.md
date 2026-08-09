@@ -2,14 +2,18 @@
 
 The sqz kernel = **linux-6.19.14** (kernel.org stable, sha256
 `cde8bf6739be4a0777fedbbba5330b8188c55680c45a922a4dfa289cbec6f185`)
-+ the 27 patches in `patches/` + the client base config + `config-fragment`,
++ the 29 patches in `patches/` + the client base config + `config-fragment`,
 built `LOCALVERSION=-sqz` → `uname -r` = `6.19.14-sqz`.
 
-**v2 delta (2026-08-04):** patch **0027** (sqz-authored, see below) is
-the entire v2 kernel change — `.benchmarks/2026-08-04-sqz-kernel-v2-scoping.md`
-adjudicated every other candidate as sysctl-only, already-in-series,
-maintainer-blocked, or daemon-side work (`V2-CANDIDATES.md` is the
-ranked manifest).
+**v2 delta (2026-08-04 + 2026-08-09):** the 2026-08-04 scoping campaign
+authored **0028** (was 0027: `FUSE_TIME_LIMITS`). The 2026-08-09
+zc-write charter (`docs/design-zc-write-kernel-v2.md`) inserted
+**0025** (abort-race folio refs) immediately after Koong 0024 and
+appended **0029** (payload retention). Old 0025–0027 renumbered
+0026–0028 (no hunk overlap; both tracks apply `--fuzz=0`). Selective
+zc delivery (**0030**) was **not** built — §4.3 gate deferred to the
+boot-test 4 KiB armed-vs-disarmed perf-annotate row (evidence
+`.benchmarks/2026-08-09-kernel-zc-write-v2.md`).
 
 ## What was taken, exactly
 
@@ -87,14 +91,18 @@ applied clean.
    `ublk_need_complete_req()`); the rename patch edits the old location.
    Resolution: rename applied at the moved location, no re-insertion at
    the old one.
-4. **patch 26 (sqz-authored seam commit)** — the kmbuf register path
-   (patch 03) inherits the pre-stable unchecked `io_buffer_add_list()`
+4. **patch 26 (docs; was 25)** — Koong "docs: fuse: add io-uring bufring
+   and zero-copy documentation". Renumbered 0025 → 0026; no hunk overlap
+   with new 0025 (docs-only vs `dev_uring.c`/`rsrc.c`/`cmd.h`).
+5. **patch 27 (was 26; sqz-authored seam commit)** — the kmbuf register
+   path (patch 03) inherits the pre-stable unchecked `io_buffer_add_list()`
    call. Extends the same stable error handling to
    `io_register_kmbuf_ring()` (free internal ring struct + buffers
    region + bl; bl not yet xarray-visible so no double-free). Commit
-   message carries the full rationale.
-5. **patch 27 (sqz-authored, v2 — `FUSE_TIME_LIMITS`)** — no upstream
-   original (the V2-CANDIDATES.md candidate-5 sketch, authored
+   message carries the full rationale. Renumbered 0026 → 0027 when
+   0025 (abort-race) was inserted; no hunk overlap with 0025.
+6. **patch 28 (was 27; sqz-authored, v2 — `FUSE_TIME_LIMITS`)** — no
+   upstream original (the V2-CANDIDATES.md candidate-5 sketch, authored
    2026-08-04): `fuse_init_out` carves `time_min`/`time_max` i64s out
    of `unused[11]` (→ `unused[3]` placed FIRST so the i64s stay
    naturally aligned and the struct stays 64 bytes), init flag
@@ -105,6 +113,31 @@ applied clean.
    nonzero `time_max`. Applies fuzz=0 on the fully-patched tree; zero
    overlap with the series' FUSE hunks (different functions). Design
    precedent: djwong's fuse-iomap `FUSE_IOMAP_CONFIG_TIME`.
+   Renumbered 0027 → 0028 with the 0025 insert.
+7. **patch 25 (NEW 2026-08-09; sqz-authored — abort-race folio refs)** —
+   inserted IMMEDIATELY after Koong 0024. `io_buffer_register_bvec()`
+   grows `release`/`priv` (patch 0022's optional-callback machinery;
+   same shape as `io_buffer_register_request()`).
+   `fuse_uring_set_up_zero_copy()` `folio_get()`s into a GFP_KERNEL_ACCOUNT
+   carrier; the imu release callback puts them when the last rsrc node
+   drops. Closes three windows: abort-without-unregister UAF, in-flight
+   FIXED I/O across COMMIT, and the retention (0029) steady state.
+   Teardown does **not** gain an unregister (no uring-cmd issue context).
+   Files: `fs/fuse/dev_uring.c`, `io_uring/rsrc.c`,
+   `include/linux/io_uring/cmd.h`. Zero overlap with 0026–0028.
+8. **patch 29 (NEW 2026-08-09; sqz-authored — zc payload retention)** —
+   Approach B ACK-early accelerator. uapi: `FUSE_IO_URING_CMD_RELEASE_PAYLOAD=3`,
+   `FUSE_URING_PAYLOAD_RETENTION (1<<2)`, `FUSE_URING_COMMIT_RETAIN (1<<0)`;
+   `fuse_uring_cmd_req` stays 24 bytes (union absorbs `commit.flags`;
+   `BUILD_BUG_ON` in `dev_uring.c`). Arming requires ZERO_COPY.
+   COMMIT+RETAIN parks the ent in `FRRS_RETAINED` (no unregister, no
+   fetch, cmd pending). RELEASE: `-ENOENT` unknown / `-EBUSY` live
+   un-retained / `0` then re-arm. Teardown drains retained (pr_warn on
+   nonzero). Depends on 0025. FUSE values identical on both tracks
+   (uapi collision audit 2026-08-09: opcode 3 and bits 2/0 free in
+   6.19.14 and 7.1.6). 7.1 adaptations: `io_uring_sqe128_cmd`; cancel
+   composes with 7.1's list_del+kfree AVAILABLE path. 6.19: `io_uring_sqe_cmd`;
+   cancel moves RETAINED onto `ent_in_userspace` like AVAILABLE.
 
 `patches/` is the `git format-patch` export of the resolved transplant;
 `build-kernel.sh` applies it with `patch -p1 --fuzz=0` (any regression

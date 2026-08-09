@@ -15,16 +15,14 @@ found closed on the field kernel:
 Result: **`6.19.14-sqz`** EL8 kernel RPMs (Rocky 8.10 installable),
 built in a pinned Rocky 8 + gcc-toolset-14 + pahole v1.30 container.
 
-**v2 (2026-08-04 prep):** the series grew sqz patch **0027**
-(`FUSE_TIME_LIMITS` INIT advertisement — V2-CANDIDATES.md rank 1, the
-only kernel delta of the v2 manifest): `fuse_init_out` gains
-`time_min`/`time_max` i64s carved from `unused[11]` (struct stays 64
-bytes, fields naturally aligned), flags2-space bit 62, and a guarded
-`sb->s_time_min/max` branch beside the `time_gran` consumption in
-`process_init_reply`. Converts the fstests generic/634 release-gate
-adjudication into expected-PASS **on sqz-kernel hosts only** (the
-adjudication stays pinned for the fleet kernel). Feature-absent ⇒
-bit-identical behavior on both sides.
+**v2 (2026-08-04 + 2026-08-09):** the series is 29 patches. 2026-08-04
+authored `FUSE_TIME_LIMITS` (now **0028**). 2026-08-09 inserted **0025**
+(abort-race: imu-held folio refs on zc registrations) after Koong 0024
+and appended **0029** (zc payload retention — Approach B ACK-early
+accelerator). Old 0025–0027 became 0026–0028. Selective zc delivery
+(0030) is not in the series — §4.3 gate rides the boot-test 4 KiB
+armed-vs-disarmed row. Spec `docs/design-zc-write-kernel-v2.md`,
+evidence `.benchmarks/2026-08-09-kernel-zc-write-v2.md`.
 
 **Strata ruling (USER DECISION 2026-08-02): the kmod-sqzfuse stratum
 is KILLED.** There are exactly **two strata**: (1) **stock-graceful**
@@ -40,11 +38,11 @@ maintained; do not resurrect it.
 |---|---|
 | `Dockerfile` | pinned EL8 build image (gcc-toolset-14, from-source pahole v1.30 for BTF) |
 | `build.sh` | host wrapper: image build + capped (`--cpus 16`, `nice`) kernel build; artifacts → `dist/kernel-sqz/` |
-| `build-kernel.sh` | in-container: sha256-pinned tarball → 27 patches → config assembly → checklist assertion (fail loud) → `make binrpm-pkg` |
-| `SERIES.md` | the series manifest: message-ids, base ruling, conflict resolutions |
-| `V2-CANDIDATES.md` | the v2 scoping manifest (ranked candidates; rank 1 = the authored 0027) |
-| `patches/` | `git format-patch` export of the resolved transplant (25 series patches + 2 sqz-authored commits: 0026 seam, 0027 FUSE_TIME_LIMITS) |
-| `patches-7.1/` | the **linux-7.1.6 rebase** of the same 27 patches (the D13 latest-mainline track — see *The 7.1 track* below) |
+| `build-kernel.sh` | in-container: sha256-pinned tarball → 29 patches → config assembly → checklist assertion (fail loud) → `make binrpm-pkg` |
+| `SERIES.md` | the series manifest: message-ids, base ruling, conflict resolutions, 0025/0029 |
+| `V2-CANDIDATES.md` | the v2 scoping manifest (ranked candidates; rank 1 = TIME_LIMITS, now patch 0028) |
+| `patches/` | `git format-patch` export (0001–0024 Koong + 0025 abort-race + 0026 docs + 0027 seam + 0028 TIME_LIMITS + 0029 retention) |
+| `patches-7.1/` | the **linux-7.1.6 rebase** of the same 29 patches (the D13 latest-mainline track — see *The 7.1 track* below) |
 | `config-base-7.1.2-1.el8.elrepo.x86_64` | the field client's running config (the base; copied read-only 2026-08-01) |
 | `config-fragment` | the ENABLE CHECKLIST — every entry asserted in the final `.config` |
 | `probes/` | capability probes (see below) |
@@ -65,7 +63,11 @@ All gcc-8.5-clean, no libnl/liburing — they compile on the field box.
   7.1-track audit section): a rung reads PRESENT only on register 0 +
   repeat-EEXIST + kmbuf-offset mmap; every rung refused ⇒ ABSENT
   (stock kernels). `--signatures` prints the raw per-opcode errno
-  signature (the per-class measurement mode).
+  signature (the per-class measurement mode). `--fuse-rungs` is the
+  v2 retention/abort probe: RELEASE_PAYLOAD negotiation after
+  FUSE_INIT (`-ENOENT`/`-ENOTCONN` = opcode present, `-EINVAL` =
+  pre-0029); retention round-trip + abort-race SKIP until the
+  boot-test plan's armed mount / KASAN dir-build.
 * `capability_matrix.sh` — the before/after matrix runner (kernel id,
   HDS attr, HW-GRO, zcrx surface, kmbuf surface, fuse_uring kallsyms,
   storage modules).
@@ -92,16 +94,16 @@ reboot
 
 ## The 7.1 track (`patches-7.1/`) — D13 latest-mainline rebase
 
-**Base: linux-7.1.6** (kernel.org; the CachyOS 7.1.6-1 line). The same 27
-patches, semantically rebased 2026-08-06 onto 7.1.6 for local
-zc-capable boots via the CachyOS kernel manager. **6.19.14 stays the
-FIELD series** (the EL8 fleet RPMs, `patches/`); 7.1 is the D13
-latest-mainline track. Concatenated manager-ready form:
-`sqz-kmbuf-zc-7.1.6.patch` = `cat patches-7.1/00*.patch` — applies
+**Base: linux-7.1.6** (kernel.org; the CachyOS 7.1.6-1 line). The same 29
+patches, semantically rebased 2026-08-06 onto 7.1.6 (0025/0029 landed
+2026-08-09) for local zc-capable boots via the CachyOS kernel manager.
+**6.19.14 stays the FIELD series** (the EL8 fleet RPMs, `patches/`); 7.1
+is the D13 latest-mainline track. Concatenated manager-ready form:
+`~/sqz-kmbuf-zc-7.1.6-v2.patch` = `cat patches-7.1/00*.patch` — applies
 sequentially `patch -p1 --fuzz=0` clean (verified on a fresh pristine
-7.1.6 extraction, per-patch dry-run in sequence + full-tree byte compare;
-compile-proof: `make io_uring/ fs/fuse/ drivers/block/ublk_drv.o` with
-the running CachyOS 7.1.6 config, zero warnings).
+7.1.6 extraction). Compile-proof: `make io_uring/ fs/fuse/` with the
+running CachyOS 7.1.6 config, zero new warnings (0025 and 0029). The
+v1 concat `~/sqz-kmbuf-zc-7.1.6.patch` is the 27-patch predecessor.
 
 ### ABI/opcode audit (the one collision — RENUMBERED, loudly)
 
@@ -129,10 +131,12 @@ the running CachyOS 7.1.6 config, zero warnings).
   mode.
 * `IORING_OFF_KMBUF_RING 0x88000000` — free in 7.1.6 (PBUF 0x80000000,
   PARAM 0x20000000, ZCRX 0x30000000, mask 0xf8000000): **unchanged**.
-* `FUSE_URING_BUF_RING (1<<0)` / `FUSE_URING_ZERO_COPY (1<<1)` in the
-  `fuse_uring_cmd_req.init` union, and `FUSE_TIME_LIMITS (1ULL<<62)` —
-  all still free in 7.1.6 (`fuse_uring_cmd_req` still `padding[6]`;
-  INIT-flag watermark still bit 42): **unchanged**.
+* `FUSE_URING_BUF_RING (1<<0)` / `FUSE_URING_ZERO_COPY (1<<1)` /
+  `FUSE_URING_PAYLOAD_RETENTION (1<<2)` in the `fuse_uring_cmd_req`
+  init union, `FUSE_IO_URING_CMD_RELEASE_PAYLOAD=3`,
+  `FUSE_URING_COMMIT_RETAIN (1<<0)` on `commit.flags`, and
+  `FUSE_TIME_LIMITS (1ULL<<62)` — FUSE values identical on 6.19.14 and
+  7.1.6 (uapi collision audit 2026-08-09). Struct stays 24 bytes.
 
 ### Port ledger (patch → what changed vs the 6.19 series)
 
@@ -152,7 +156,9 @@ patch carries its `[sqz 7.1.6 rebase]` note in the commit body.
 | 0020 bvec rename | rename extended to the 7.1-only ublk call sites (batch dispatch / auto-buf-reg paths) |
 | 0021 register split | `io_kernel_buffer_init()` in 7.1 idioms: `io_cache_free(&ctx->node_cache, node)`, `imu->flags = IO_REGBUF_F_KBUF` (replaces `is_kbuf`) |
 | 0024 FUSE zc | `issue_flags` threading composed with 7.1's `prepare_send` error arm + the 7.1-only cancel-arm `fuse_uring_req_end()` site; `io_uring_sqe_cmd` → `io_uring_sqe128_cmd` |
-| 0026 seam | ported as-is — **still required**: 7.1's `io_buffer_add_list()` is the int-returning stable form, and patch 03's register path inherits the unchecked call |
+| 0025 abort-race | identical besides context offsets; `io_buffer_register_bvec` + `fuse_uring_set_up_zero_copy` shape is shared |
+| 0027 seam (was 26) | ported as-is — **still required**: 7.1's `io_buffer_add_list()` is the int-returning stable form, and patch 03's register path inherits the unchecked call |
+| 0029 retention | `io_uring_sqe128_cmd`; cancel composes FRRS_RETAINED with 7.1's list_del+kfree AVAILABLE path; 6.19 cancel moves RETAINED to `ent_in_userspace` |
 
 ### CachyOS kernel manager notes
 

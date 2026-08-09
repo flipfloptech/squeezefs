@@ -6,7 +6,7 @@
 # Produces EL8-installable kernel RPMs via `make binrpm-pkg` with
 # LOCALVERSION=-sqz (the non-negotiable sqz tag), from:
 #   linux-6.19.14 (base the FUSE-zc series applies to; sha256-pinned)
-#   + the 27-patch series in /src/patches (SERIES.md is the manifest)
+#   + the 29-patch series in /src/patches (SERIES.md is the manifest)
 #   + client base config + /src/config-fragment (checklist asserted).
 set -euo pipefail
 

@@ -636,6 +636,39 @@ row law added (team list): every later row FATAL-gates on
 extractions-vs-directs, `ipc_session_owners`, `ipc_direct_shards`,
 `ipc_ingress_ns` mean, `ipc_drain_pass_ns` (ops/pass + µs/op).
 
+**Write-bandwidth program (third-party read-only investigation 2026-08-08,
+adjudication ACCEPTED; supersedes the same-day kernel-patch charter, which
+was stopped pre-work):** the armed 1 MiB streaming path pays an extraction
+destination before its real accumulation destination (slot → memfd bounce
+[copy] → NT merge into ActiveBlockBuf [copy] → block DMA); raw 1 MiB writes
+reach the 49.5 GB/s class, so granularity is not the device limit. The
+sequence: **(1) counter confirmation on the existing binary** (extract
+bytes ≈ user bytes, direct ≈ 0, nt_copy ≈ user bytes, AND the write-lane
+spread check — an unspread `data_write_lane_submits` is a regression to fix
+before anything is built); **(2) Approach A as bounded falsification** —
+the fd-backed placed-merge assembly (port the IPC placed-sever design to
+FUSE delivery; WRITE_FIXED cannot copy fixed→fixed, so the assembly is a
+memfd whose mmap view is adopted as the ActiveBlockBuf backing), gates:
+placement ≥ 90–95 % of stream bytes (first-chunk-only ≈ 25 % = FAILURE),
+armed-A ≥ 0.99× unarmed, nt_copy/extract bytes fall commensurately, no W2
+full-buffer inflation; **(3) Approach B — the device-backed visible
+overlay** (= shape (b) made concrete) as the strategic end state toward
+≥ 0.85× same-day raw: a DeviceOverlay registry with the nine laws
+(install-before-ack … never-return-unpublished-to-allocator), reusing
+allocator/incarnation/rewrite-shadow/coverage-core machinery, v1 hard
+gates (passthrough, single-writer, aligned, no verification), generic/209
+as the named highest-risk surface, volatile-overlay durability (no new
+on-disk format; fsync freezes-completes-seeds-flushes-publishes). Kernel
+notes: B's direct store rides `zc_write_fd` on the FUSE queue rings — NOT
+the NvmeBlockDev write lanes (per-qid direct-store accounting is B's
+engagement instrument; ring-affinity is its spread remedy); the custom
+fixed-buffer-copy opcode is PARKED (A's ceiling, more maintenance) unless
+A shows the memfd arena itself is the limit; the payload-retention patch
+(0029 draft charter) queues as a B ACCELERATOR (ACK-early), not a
+prerequisite. Measurement gates: ratios not absolutes; reset-per-leg
+A-B-B-A (the venue ages); amplification ≤ 1.05, no wareq collapse,
+tripwires 0 on every write row.
+
 **Internal-time program (user directive 2026-08-08, verbatim: "we should be
 using our micro benchmarks on all functions to see if we can reduce their
 overall time of execution focusing on hotspots... the only way is to lower

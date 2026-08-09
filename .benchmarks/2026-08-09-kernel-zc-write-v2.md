@@ -283,3 +283,16 @@ is the user checkpoint (7.1.2-elrepo stays default until the smoke
 passes), then the same usermode smoke: probe ladder 37/38 → armed mount
 negotiation pins → the step0 write row vs the 2026-08-06 6.19-v1
 baselines.
+
+**Field boot CONFIRMED (2026-08-10, user-run on `memp-s3ds-aqs-37`):**
+the RPM booted and the probe passed end-to-end — kmbuf ladder
+**CONFIRMED on the 37/38 rung (6.19-sqz track)** (the per-track opcode
+split working as designed: the local 7.1 box resolves 38/39, the field
+6.19 box 37/38, same binary), `--fuse-rungs` with `enable_uring=Y`:
+negotiation pre-arm `-ENOTCONN` / armed `-ENOENT` (0029 kernel), 32
+queues armed zc+retention, **retention-rt PASS** (zc delivery, dir law,
+ACK-early, post-ACK page liveness, RELEASE ladder 0/ENOENT/EBUSY), and
+**teardown-drain PASS** with the pr_warn forensic line observed. Both
+tracks of the v2 series are now live-verified. Next: the field write
+rows (the 2026-08-06 zc-write-bracket shapes) on the v2 kernel vs the
+v1 baselines.

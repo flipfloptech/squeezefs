@@ -26,8 +26,10 @@
 //!   success and failure arms alike (the transport ledger's closure
 //!   law lives fuse3-side; here the closure-call count pins it).
 //! * **The §3.4 stability-law class split** — sound-class (page-cache /
-//!   buffered) writes may ACK early by default; O_DIRECT (GUP) writes
-//!   only under the explicit unstable-write opt-in.
+//!   buffered) writes ACK early 0-copy via COMMIT_RETAIN; O_DIRECT
+//!   (GUP) writes only under the opt-in, which SNAPSHOTS (extract)
+//!   before the reply so a post-ACK buffer reuse cannot change what
+//!   lands (the 2026-08-09 live-smoke aliasing).
 //!
 //! Vehicle: the test slot-wrap seam (`set_test_zc_slot_wrap`) turns the
 //! in-process `WritePayload::Bytes` into a mock `ZcWriteSlot` whose
@@ -523,5 +525,134 @@ async fn odirect_class_needs_the_unstable_write_opt_in() {
     w.await.expect("write task").expect("awaited write");
     let back = read_at(&h, ino, 2 * BS, BS as u32).await;
     assert_eq!(back, data);
+    clear_test_zc_slot_wrap();
+}
+
+/// Live-smoke conviction (2026-08-09 tcp-devsub): O_DIRECT ACK-early
+/// that DMAs from the GUP pages *after* write(2) returns observes a
+/// reused buffer's later contents (dd/fio class — 6553/8192 pages
+/// aliased, first striped block exact because it still rode
+/// ACK-after-CQE promotion). §3.4 named this "unstable-write"; the
+/// NFS UNSTABLE analogy is wrong (NFS samples at ACK). The opt-in
+/// must SNAPSHOT at ACK (extract) and DMA the snapshot, so a
+/// post-ACK reuse cannot change what lands.
+///
+/// The mock's default store clones at mint and cannot express this;
+/// this test's store reads a shared buffer at DMA time (the GUP),
+/// and extract clones at the materialize instant (the snapshot).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn odirect_ack_early_must_not_observe_post_ack_reuse() {
+    let _g = serial().await;
+    set_device_overlay_for_tests(true, false);
+    set_ack_early_for_tests(true, true);
+    let h = make("ackearly-gup-reuse").await;
+    let ino = create(&h, "f").await;
+    promote_striped(&h, ino).await;
+
+    let original = vec![0xA5u8; BS as usize];
+    let reused = vec![0x5Cu8; BS as usize];
+    let live = std::sync::Arc::new(std::sync::Mutex::new(original.clone()));
+    let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let stores = std::sync::Arc::new(AtomicUsize::new(0));
+    let extracts = std::sync::Arc::new(AtomicUsize::new(0));
+
+    {
+        let live_s = live.clone();
+        let live_e = live.clone();
+        let gate_s = gate.clone();
+        let stores_c = stores.clone();
+        let extracts_c = extracts.clone();
+        set_test_zc_slot_wrap(std::sync::Arc::new(move |bytes: bytes::Bytes| {
+            let len = bytes.len() as u32;
+            let live_s = live_s.clone();
+            let live_e = live_e.clone();
+            let gate_s = gate_s.clone();
+            let stores_c = stores_c.clone();
+            let extracts_c = extracts_c.clone();
+            ZcWriteSlot::new_with_ack_early(
+                len,
+                false, // unsound = O_DIRECT/GUP
+                Box::new(move |fd, dev_off| {
+                    let live = live_s.clone();
+                    let gate = gate_s.clone();
+                    let stores_c = stores_c.clone();
+                    Box::pin(async move {
+                        let permit = gate.acquire().await.expect("gate");
+                        permit.forget();
+                        stores_c.fetch_add(1, Ordering::SeqCst);
+                        let b = live.lock().expect("live").clone();
+                        let n = unsafe {
+                            libc::pwrite(fd, b.as_ptr().cast(), b.len(), dev_off as libc::off_t)
+                        };
+                        if n < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(n as u32)
+                    })
+                }),
+                Box::new(move || {
+                    let live = live_e.clone();
+                    let extracts_c = extracts_c.clone();
+                    Box::pin(async move {
+                        extracts_c.fetch_add(1, Ordering::SeqCst);
+                        let b = live.lock().expect("live").clone();
+                        Ok(bytes::Bytes::from(b))
+                    })
+                }),
+                Box::new(|| true),
+                Box::new(|| {}),
+            )
+        }));
+    }
+
+    let w =
+        h.fs.write(
+            h.req,
+            ino,
+            0,
+            2 * BS,
+            bytes::Bytes::copy_from_slice(&original),
+            0,
+            0,
+        )
+        .await
+        .expect("ack-early O_DIRECT write");
+    assert_eq!(w.written, BS as u32);
+
+    // Application reuses the GUP buffer after write(2) returned.
+    *live.lock().expect("live") = reused;
+
+    // Unblock a DMA-time store if the path still takes that arm.
+    gate.add_permits(1024);
+    let stores_w = stores.clone();
+    let extracts_w = extracts.clone();
+    eventually(
+        move || {
+            stores_w.load(Ordering::SeqCst) + extracts_w.load(Ordering::SeqCst) >= 1
+                && METRICS.overlay_stores.load(Ordering::Relaxed) > 0
+        },
+        "acked O_DIRECT store published",
+    )
+    .await;
+
+    let back = read_at(&h, ino, 2 * BS, BS as u32).await;
+    assert!(
+        back == original,
+        "O_DIRECT ACK-early must persist the ACK-time bytes, not a \
+         post-ACK reuse (got {:#x} want {:#x} — DMA sampled the GUP \
+         pages after write(2) returned)",
+        back.first().copied().unwrap_or(0),
+        original.first().copied().unwrap_or(0)
+    );
+    assert_eq!(
+        extracts.load(Ordering::SeqCst),
+        1,
+        "O_DIRECT ACK-early must snapshot via extract (not DMA the GUP)"
+    );
+    assert_eq!(
+        stores.load(Ordering::SeqCst),
+        0,
+        "O_DIRECT ACK-early must not take the retained-slot store arm"
+    );
     clear_test_zc_slot_wrap();
 }

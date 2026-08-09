@@ -585,6 +585,18 @@ W1 `ZcWriteSlot::store()`-await discipline, `src/fuse_client.rs`
 probe, per ruling D13's custom-kernel sanction — stock kernels keep
 ACK-after-CQE.
 
+**O_DIRECT class (daemon, 2026-08-09 live-smoke):** 0-copy retain is
+sound only for page-cache folios. O_DIRECT/GUP pages are legally
+reusable the instant write(2) returns; DMA-from-retained-GUP after ACK
+aliased later-chunk bytes onto earlier dests (dd `oflag=direct`,
+6553/8192 pages, first striped block exact because it still rode
+promotion ACK-after-CQE). The NFS UNSTABLE analogy in kernel §3.4 is
+the *sampling* contract (bytes frozen at ACK), not "DMA whenever".
+The daemon's O_DIRECT opt-in (`SQUEEZEFS_ZC_ACK_EARLY_ODIRECT`)
+therefore SNAPSHOTS (extract) before the reply and DMAs the snapshot —
+still ACK-before-device-CQE (the depth-cap release), one local copy,
+safe under buffer reuse. Page-cache retains stay 0-copy.
+
 **The accelerator's future law (Rev 2 addition — recorded now because
 ACK-early changes read synchronization and fsync ownership, not just
 payload lifetime):**

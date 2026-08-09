@@ -4583,9 +4583,9 @@ pub struct ZcWriteSlot {
     /// The §3.4 stability class: `true` = page-cache-sound (a post-ACK
     /// buffer modification is a redirty ⇒ a new WRITE — buffered
     /// deliveries), `false` = GUP/O_DIRECT (a post-ACK buffer reuse
-    /// scribbles the retained pages — ACK-early only under the explicit
-    /// unstable-write opt-in). Stamped at mint from the write's open
-    /// flags.
+    /// would scribble live pages — ACK-early only under the opt-in,
+    /// which snapshots at ACK rather than DMA'ing the live GUP).
+    /// Stamped at mint from the write's open flags.
     ack_early_sound: bool,
     /// The ACK-early transport face (`None` on sessions without the
     /// retention machinery — every such write keeps ACK-after-CQE).

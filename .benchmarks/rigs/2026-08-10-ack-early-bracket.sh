@@ -4,9 +4,9 @@
 # postures — A = overlay + ACK-early (retention pipeline; the depth cap
 # released), B = overlay ACK-after-CQE (the falsified B2 posture — the
 # isolation control), C = shipped extraction control. fio is O_DIRECT, so
-# A legs arm the §3.4 unstable-write opt-in — LABELED posture: fio never
-# reuses a buffer it has not finished with inside one batch, and the
-# per-leg dd correctness smoke is fsync-bounded.
+# A legs arm SQUEEZEFS_ZC_ACK_EARLY_ODIRECT — O_DIRECT stores SNAPSHOT
+# (extract) then ACK then DMA the snapshot. fio/dd reuse is safe (bytes
+# sampled at ACK). The per-leg dd smoke is the aliasing regression pin.
 # Adapted from 2026-08-09-device-overlay-bracket.sh (B2).
 #
 # Comparator = the SHIPPED EXTRACTION CONTROL (§1.4 case 2: Approach A was
@@ -180,12 +180,15 @@ print(f"  PIN ack_early stores={ae_st} bytes={ae_b/1e9:.2f}GB retain_commits={re
 if ae:
     if ae_st < 0.95 * max(1, st):
         sys.exit(f"FATAL: {leg} ack-early engagement {ae_st}/{st} stores < 95%")
-    if ret_c < 0.95 * ae_st:
-        sys.exit(f"FATAL: {leg} retain_commits {ret_c} < 95% of ack-early stores {ae_st}")
+    # O_DIRECT A-leg snapshots (extract) then ACK — retain_commits is the
+    # page-cache arm and stays ~0 on a pure-direct row. Closure still
+    # applies to whatever DID retain.
     if rel_c != ret_c:
         sys.exit(f"FATAL: {leg} release closure broken: retains={ret_c} releases={rel_c}")
     if ret_out != 0:
         sys.exit(f"FATAL: {leg} retained_outstanding={ret_out} at quiesce")
+    if ext_b < 0.90 * max(1, ae_b):
+        sys.exit(f"FATAL: {leg} O_DIRECT snapshot extract {ext_b} < 90% of ack-early bytes {ae_b}")
 else:
     if ae_st or ret_c:
         sys.exit(f"FATAL: {leg} shows ack-early engagement (stores={ae_st} retains={ret_c}) with the lever off")
@@ -218,7 +221,9 @@ if wareq_kb < 256:
 if ovl:
     if sb < 0.95 * io:
         sys.exit(f"FATAL: {leg} overlay engagement {sb/max(1,io)*100:.1f}% < 95% of user bytes")
-    if ext_b > 0.05 * io:
+    # B (ACK-after-CQE) stays 0-copy. A (ACK-early O_DIRECT) snapshots
+    # via extract — that pin is the ack-early block above, not here.
+    if not ae and ext_b > 0.05 * io:
         sys.exit(f"FATAL: {leg} extraction bytes {ext_b/max(1,io)*100:.1f}% > 5% on the eligible shape")
     if nt_b > 0.05 * io:
         sys.exit(f"FATAL: {leg} nt_copy bytes {nt_b/max(1,io)*100:.1f}% > 5% on the eligible shape")

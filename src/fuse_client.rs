@@ -11442,37 +11442,84 @@ impl SqueezefsFilesystem {
                 return Err(e);
             }
             // ---- ACK-early (kernel 0029; design-zc-write-kernel-v2
-            // §6.2–6.4): the reply detaches from the store CQE. Gates,
-            // in order: the lever; the §3.4 stability class (sound =
-            // page-cache deliveries; O_DIRECT/GUP only under the
-            // explicit unstable-write opt-in); and the transport's
-            // retention arm (commit_retain sticks ONLY on a
-            // retention-negotiated session — false keeps today's
-            // ACK-after-CQE byte-identically). Coverage publication,
-            // freeze/publish and the release all stay CQE-anchored in
-            // the detached continuation; the fsync/read laws hold
-            // because the §2.3 claim spans submit→CQE unchanged.
-            if crate::device_overlay::ack_early_enabled()
-                && (z.ack_early_sound() || crate::device_overlay::ack_early_odirect())
-                && z.commit_retain()
-            {
-                let fs = self.clone();
-                let z2 = std::sync::Arc::clone(z);
-                let rec2 = std::sync::Arc::clone(&rec);
-                METRICS
-                    .overlay_ack_early_stores
-                    .fetch_add(1, Ordering::Relaxed);
-                METRICS
-                    .overlay_ack_early_bytes
-                    .fetch_add(len as u64, Ordering::Relaxed);
-                crate::detached::tpc_spawn_guarded("overlay_ack_early_store", async move {
-                    fs.finish_ack_early_store(ino, b, rec2, ticket, fd, dest, len, z2)
-                        .await;
-                });
-                // The handler replies NOW — the application's write(2)
-                // returns while the DMA is in flight against the
-                // retained slot (the kernel keeps the pages).
-                return Ok(true);
+            // §6.2–6.4): the reply detaches from the store CQE.
+            // Two vehicles, one law (bytes sampled at ACK, not at DMA):
+            //   * page-cache-sound: COMMIT_RETAIN + slot→device DMA
+            //     (folios are stable; 0-copy, needs 0029).
+            //   * O_DIRECT/GUP under the opt-in: SNAPSHOT (extract)
+            //     then ACK then DMA the snapshot. DMA-from-GUP after
+            //     write(2) returns is the 2026-08-09 live-smoke
+            //     aliasing (dd/fio reuse). NFS UNSTABLE samples at
+            //     ACK; we do too. Retention is unused on this arm
+            //     (the slot is consumed by the extract).
+            // Coverage/publication/fsync/read-wait stay CQE-anchored
+            // in the detached continuation; the §2.3 claim spans
+            // submit→CQE unchanged.
+            if crate::device_overlay::ack_early_enabled() {
+                if z.ack_early_sound() && z.commit_retain() {
+                    let fs = self.clone();
+                    let z2 = std::sync::Arc::clone(z);
+                    let rec2 = std::sync::Arc::clone(&rec);
+                    METRICS
+                        .overlay_ack_early_stores
+                        .fetch_add(1, Ordering::Relaxed);
+                    METRICS
+                        .overlay_ack_early_bytes
+                        .fetch_add(len as u64, Ordering::Relaxed);
+                    crate::detached::tpc_spawn_guarded("overlay_ack_early_store", async move {
+                        fs.finish_ack_early_store(ino, b, rec2, ticket, fd, dest, len, z2)
+                            .await;
+                    });
+                    return Ok(true);
+                }
+                if !z.ack_early_sound() && crate::device_overlay::ack_early_odirect() {
+                    let snap = match z.materialize().await {
+                        Ok(b) if b.len() == len => {
+                            let mut buf = crate::cache::pool::BUFFER_POOL.alloc();
+                            if b.len() > buf.capacity() {
+                                buf.resize(b.len(), 0);
+                            }
+                            buf.backing_mut()[..b.len()].copy_from_slice(&b);
+                            buf.set_written_len(b.len());
+                            // Drop the extract lease BEFORE we reply so
+                            // the §5.4 commit gate does not park the
+                            // ACK behind the snapshot DMA.
+                            drop(b);
+                            buf.into_bytes()
+                        }
+                        other => {
+                            warn!(
+                                "device-overlay O_DIRECT snapshot declined for ino {ino} \
+                                 block {b} (dest {dest}, len {len}): {other:?}"
+                            );
+                            let _ = rec.core.complete_store(ticket, false);
+                            crate::gauge_core::sub_saturating(
+                                &METRICS.overlay_inflight_bytes,
+                                len as u64,
+                            );
+                            return match other {
+                                Err(e) => Err(SqueezefsError::Io(e)),
+                                Ok(b) => Err(SqueezefsError::Io(std::io::Error::other(format!(
+                                    "O_DIRECT ack-early snapshot short ({} != {len})",
+                                    b.len()
+                                )))),
+                            };
+                        }
+                    };
+                    let fs = self.clone();
+                    let rec2 = std::sync::Arc::clone(&rec);
+                    METRICS
+                        .overlay_ack_early_stores
+                        .fetch_add(1, Ordering::Relaxed);
+                    METRICS
+                        .overlay_ack_early_bytes
+                        .fetch_add(len as u64, Ordering::Relaxed);
+                    crate::detached::tpc_spawn_guarded("overlay_ack_early_snapshot", async move {
+                        fs.finish_ack_early_bytes(ino, b, rec2, ticket, dest, len, snap)
+                            .await;
+                    });
+                    return Ok(true);
+                }
             }
             match z.store(fd, dest).await {
                 Ok(n) if n as usize == len => {
@@ -11656,6 +11703,84 @@ impl SqueezefsFilesystem {
         // slot access is done (the retained pages die with this call's
         // kernel-side re-arm).
         z.release_payload();
+    }
+
+    /// ACK-early continuation for the O_DIRECT snapshot arm: DMA the
+    /// ACK-time copy (never the live GUP pages). Same CQE-anchored
+    /// coverage / never-lossy retry / fence-only drop as the retained
+    /// slot arm; no RELEASE (the slot was consumed by the extract).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn finish_ack_early_bytes(
+        &self,
+        ino: u64,
+        b: u32,
+        rec: std::sync::Arc<crate::device_overlay::DeviceOverlayRecord>,
+        ticket: crate::overlay_core::StoreTicket,
+        dest: u64,
+        len: usize,
+        data: bytes::Bytes,
+    ) {
+        let mut attempt: u32 = 0;
+        let stored = loop {
+            match rec.device.write_block(dest, data.clone()).await {
+                Ok(()) => break true,
+                other => {
+                    if rec.device.authorize_zc_store().is_err() {
+                        warn!(
+                            "ack-early snapshot store for ino {ino} block {b} dropped by \
+                             the writer-guard fence after {attempt} attempts \
+                             (overlay_fence_drops)"
+                        );
+                        METRICS.overlay_fence_drops.fetch_add(1, Ordering::Relaxed);
+                        break false;
+                    }
+                    attempt = attempt.saturating_add(1);
+                    METRICS
+                        .overlay_ack_early_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    if attempt.is_power_of_two() {
+                        warn!(
+                            "ack-early snapshot store for ino {ino} block {b} (dest {dest}, \
+                             len {len}) failed attempt {attempt}: {other:?} — acked \
+                             custody retries until it lands"
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        (10u64 << attempt.min(7)).min(1000),
+                    ))
+                    .await;
+                }
+            }
+        };
+
+        let verdict = rec.core.complete_store(ticket, stored);
+        crate::gauge_core::sub_saturating(&METRICS.overlay_inflight_bytes, len as u64);
+        if stored {
+            METRICS.overlay_stores.fetch_add(1, Ordering::Relaxed);
+            METRICS
+                .overlay_store_bytes
+                .fetch_add(len as u64, Ordering::Relaxed);
+        }
+        match verdict {
+            crate::overlay_core::CompleteVerdict::Covered { coverage_complete } => {
+                if coverage_complete {
+                    rec.core.freeze();
+                    if let Err(e) = self.drain_device_overlay_block(ino, b, false).await {
+                        warn!(
+                            "ack-early snapshot publish for ino {ino} block {b} failed \
+                             (record stays parked for the next durability boundary): {e:?}"
+                        );
+                    }
+                }
+            }
+            crate::overlay_core::CompleteVerdict::Superseded => {
+                debug!(
+                    "ack-early snapshot store for ino {ino} block {b}: record \
+                     superseded mid-flight"
+                );
+            }
+            crate::overlay_core::CompleteVerdict::NotCovered => {}
+        }
     }
 
     /// Settle one block's overlay UNDER the caller's held
@@ -17815,12 +17940,15 @@ impl Filesystem for SqueezefsFilesystem {
                     let extract_conn = conn.clone();
                     let retain_conn = conn.clone();
                     let release_conn = conn.clone();
-                    // The §3.4 stability class from the file's open
-                    // flags: O_DIRECT deliveries carry GUP user pages
-                    // (post-ACK buffer reuse scribbles the retained
-                    // source — unsound without the opt-in); everything
-                    // else is page-cache-sound.
-                    let sound = (flags as i32) & libc::O_DIRECT == 0;
+                    // The §3.4 stability class: O_DIRECT deliveries
+                    // carry GUP user pages (post-ACK reuse scribbles
+                    // them). FUSE_WRITE_CACHE is the kernel writing
+                    // ITS page-cache folios out — sound even when it
+                    // borrowed an O_DIRECT ff to carry them
+                    // (generic/451). Everything else without O_DIRECT
+                    // is page-cache-sound.
+                    let sound = (flags as i32) & libc::O_DIRECT == 0
+                        || write_flags & fuse3::raw::flags::FUSE_WRITE_CACHE != 0;
                     crate::routing::ZcWriteSlot::new_with_ack_early(
                         len,
                         sound,

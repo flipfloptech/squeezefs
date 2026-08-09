@@ -83,7 +83,7 @@ pub fn bytes_vehicle_armed() -> bool {
 /// retention-negotiated transport, and the §3.4 class gate below, so
 /// the ON default is inert on every shipped posture).
 static ACK_EARLY: AtomicU8 = AtomicU8::new(0);
-/// The §3.4 unstable-write opt-in (`SQUEEZEFS_ZC_ACK_EARLY_ODIRECT`,
+/// The O_DIRECT ACK-early opt-in (`SQUEEZEFS_ZC_ACK_EARLY_ODIRECT`,
 /// default OFF): O_DIRECT/GUP writes may ACK early only under it — a
 /// post-ACK buffer reuse persists scribbled bytes, the NFS
 /// UNSTABLE-class contract the operator must explicitly accept.
@@ -107,7 +107,7 @@ pub fn ack_early_enabled() -> bool {
     tri_default_on(&ACK_EARLY, "SQUEEZEFS_ZC_ACK_EARLY")
 }
 
-/// The `SQUEEZEFS_ZC_ACK_EARLY_ODIRECT` unstable-write opt-in.
+/// The `SQUEEZEFS_ZC_ACK_EARLY_ODIRECT` snapshot-then-ACK opt-in.
 pub fn ack_early_odirect() -> bool {
     tri(&ACK_EARLY_ODIRECT, "SQUEEZEFS_ZC_ACK_EARLY_ODIRECT")
 }

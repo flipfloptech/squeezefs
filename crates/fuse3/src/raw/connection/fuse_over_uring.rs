@@ -7059,6 +7059,130 @@ mod slot_state_tests {
         );
     }
 
+    /// The retained arc (design-zc-write-kernel-v2 §3.3): a commit
+    /// submitted WITH RETAIN parks the ent kernel-side (no CQE), so the
+    /// slot enters `Retained` instead of `Replied`; the RELEASE
+    /// submission is the ONLY normal exit, returning the slot to
+    /// `Replied` (the kernel owns the ent again — its parked commit's
+    /// CQE brings the next delivery).
+    #[test]
+    fn retain_commit_parks_then_release_rearms() {
+        let mut t = table(2);
+        t.on_deliver(0, 100, 7);
+        assert_eq!(t.admit_commit(0, 7), CommitAdmit::Accept);
+        t.on_commit_submitted_retained(0, 7);
+        assert_eq!(t.state(0), SlotState::Retained { commit_id: 7 });
+        // A retained slot owes NO reply: a second commit is stale, and a
+        // teardown fail_ent must synthesize nothing (the request already
+        // ended kernel-side at the RETAIN commit).
+        assert_eq!(t.admit_commit(0, 7), CommitAdmit::RefuseStale);
+        assert_eq!(
+            t.fail_ent(0),
+            FailOutcome::Nothing,
+            "a retained slot's request already ended — teardown owes no synthesis"
+        );
+        assert_eq!(
+            t.state(0),
+            SlotState::Retained { commit_id: 7 },
+            "fail_ent on a retained slot is a no-op (the kernel drains it at teardown)"
+        );
+        t.on_release_submitted(0);
+        assert_eq!(
+            t.state(0),
+            SlotState::Replied { commit_id: 7 },
+            "RELEASE re-arms: the kernel owns the ent, next CQE is a delivery"
+        );
+    }
+
+    /// Kernel-refused RETAIN (commit CQE `-EINVAL` while `Retained`):
+    /// the recovery is a plain re-commit of the SAME applied reply —
+    /// `on_retain_refused` mirrors `on_commit_retry`'s shape.
+    #[test]
+    fn retain_refused_recovers_to_plain_recommit() {
+        let mut t = table(1);
+        t.on_deliver(0, 200, 9);
+        t.on_commit_submitted_retained(0, 9);
+        assert_eq!(t.state(0), SlotState::Retained { commit_id: 9 });
+        t.on_retain_refused(0);
+        assert_eq!(
+            t.state(0),
+            SlotState::Delivered {
+                unique: 0,
+                commit_id: 9
+            },
+            "the ent still holds its applied reply — re-commit plain, never re-REGISTER"
+        );
+        assert_eq!(t.admit_commit(0, 9), CommitAdmit::Accept);
+        t.on_commit_submitted(0, 9);
+        assert_eq!(t.state(0), SlotState::Replied { commit_id: 9 });
+    }
+
+    /// Release on a slot that is not retained is a stale no-op (the
+    /// teardown race) — never a transition, never a panic.
+    #[test]
+    fn release_on_unretained_slot_is_inert() {
+        let mut t = table(1);
+        t.on_deliver(0, 300, 4);
+        t.on_release_submitted(0);
+        assert_eq!(
+            t.state(0),
+            SlotState::Delivered {
+                unique: 300,
+                commit_id: 4
+            }
+        );
+    }
+
+    /// The COMMIT wire face of RETAIN: the union bytes at offset 18 of
+    /// the 24-byte `fuse_uring_cmd_req` carry `commit.flags` on
+    /// COMMIT_AND_FETCH (the same bytes REGISTER reads as `init.flags` —
+    /// the kernel selects the union member by opcode). A plain commit
+    /// keeps them zero; a RETAIN commit carries bit 0.
+    #[test]
+    fn commit_entry_carries_retain_in_the_union_bytes() {
+        let plain = build_cmd_entry(
+            FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
+            3,
+            0xABCD,
+            None,
+            42,
+            0,
+            0,
+            0,
+        );
+        let retained = build_cmd_entry(
+            FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
+            3,
+            0xABCD,
+            None,
+            42,
+            kmbuf::FUSE_URING_COMMIT_RETAIN,
+            0,
+            0,
+        );
+        // Entry128 = (Entry, [u8; 64]); the 80-byte cmd area starts at
+        // SQE offset 48, so the cmd_req's union u16 sits at 48+18 = 66.
+        let bytes_of = |e: &Entry128| -> [u8; 128] {
+            // SAFETY: Entry128 is a POD wrapper over the 128-byte SQE.
+            unsafe { std::mem::transmute_copy(e) }
+        };
+        let p = bytes_of(&plain);
+        let r = bytes_of(&retained);
+        assert_eq!(u16::from_le_bytes([p[66], p[67]]), 0);
+        assert_eq!(
+            u16::from_le_bytes([r[66], r[67]]),
+            kmbuf::FUSE_URING_COMMIT_RETAIN,
+            "RETAIN must land in the union u16 the kernel reads as commit.flags"
+        );
+        // Everything else identical (the flag is the ONLY delta).
+        for i in 0..128 {
+            if i == 66 || i == 67 {
+                continue;
+            }
+            assert_eq!(p[i], r[i], "byte {i} differs beyond the union flags");
+        }
+    }
+
     /// FUSE-3e: a second commit for one ent must never overwrite the
     /// first. Loud-never-fatal — refuse and count.
     #[test]

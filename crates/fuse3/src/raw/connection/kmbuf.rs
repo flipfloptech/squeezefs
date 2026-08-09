@@ -1373,6 +1373,85 @@ mod tests {
         assert!(err.to_string().contains("page-aligned"));
     }
 
+    /// Retention negotiation (design-zc-write-kernel-v2 §3.5, measured
+    /// live ×5 on both sqz tracks 2026-08-09/10): the pre-arm
+    /// RELEASE_PAYLOAD probe's errno IS the capability verdict —
+    /// `ENOTCONN` (opcode present, no ring yet) or `ENOENT` (armed
+    /// probe form) ⇒ Present; `EINVAL`/`EOPNOTSUPP` (pre-0029 opcode
+    /// switch default) ⇒ Absent; ANYTHING else ⇒ Absent (fail-safe:
+    /// never arm bit 2 on an ambiguous answer — an old kernel ignores
+    /// unknown init bits silently, the worst failure class).
+    #[test]
+    fn test_retention_verdict_table() {
+        assert_eq!(
+            RetentionSurface::from_probe_errno(Ok(-libc::ENOTCONN)),
+            RetentionSurface::Present
+        );
+        assert_eq!(
+            RetentionSurface::from_probe_errno(Ok(-libc::ENOENT)),
+            RetentionSurface::Present
+        );
+        assert_eq!(
+            RetentionSurface::from_probe_errno(Ok(-libc::EINVAL)),
+            RetentionSurface::Absent
+        );
+        assert_eq!(
+            RetentionSurface::from_probe_errno(Ok(-libc::EOPNOTSUPP)),
+            RetentionSurface::Absent
+        );
+        // Ambiguity is Absent: a positive res, zero, a foreign errno,
+        // or a failed probe submission all read fail-safe.
+        assert_eq!(
+            RetentionSurface::from_probe_errno(Ok(0)),
+            RetentionSurface::Absent
+        );
+        assert_eq!(
+            RetentionSurface::from_probe_errno(Ok(-libc::EBUSY)),
+            RetentionSurface::Absent
+        );
+        assert_eq!(
+            RetentionSurface::from_probe_errno(Err(())),
+            RetentionSurface::Absent
+        );
+    }
+
+    /// Retention flag composition: bit 2 rides ONLY on the zc arm (the
+    /// kernel refuses retention without ZERO_COPY — `fuse_uring_buf_
+    /// ring_setup`'s `retention && !zero_copy ⇒ EINVAL`), and only when
+    /// the surface probed Present AND the lever is on.
+    #[test]
+    fn test_retention_init_flags_composition() {
+        // Non-zc modes never carry bit 2, Present or not.
+        assert_eq!(init_flags_with_retention(false, false, true), 0);
+        assert_eq!(
+            init_flags_with_retention(true, false, true),
+            FUSE_URING_BUF_RING
+        );
+        // zc + retention composes all three bits.
+        assert_eq!(
+            init_flags_with_retention(true, true, true),
+            FUSE_URING_BUF_RING | FUSE_URING_ZERO_COPY | FUSE_URING_PAYLOAD_RETENTION
+        );
+        // zc without retention = today's pair, byte-identical.
+        assert_eq!(
+            init_flags_with_retention(true, true, false),
+            init_flags(true, true)
+        );
+        // The constant itself is the uapi bit (collision audit
+        // 2026-08-09: bit 2 free on both tracks).
+        assert_eq!(FUSE_URING_PAYLOAD_RETENTION, 1 << 2);
+    }
+
+    /// The retention gauge is a settable level like the kmbuf/zc pair:
+    /// `fuse3_zc_retention_negotiated` 0/1 on the stats inode.
+    #[test]
+    fn test_retention_gauge() {
+        set_retention_negotiated(true);
+        assert_eq!(retention_negotiated(), 1);
+        set_retention_negotiated(false);
+        assert_eq!(retention_negotiated(), 0);
+    }
+
     /// Gauges: negotiated is a settable level (both arms); zc replies /
     /// fallbacks / slot-payload skips count.
     #[test]

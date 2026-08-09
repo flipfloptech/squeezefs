@@ -4557,6 +4557,17 @@ pub type ZcStoreFn = dyn Fn(std::os::unix::io::RawFd, u64) -> futures::future::B
 pub type ZcExtractFn =
     dyn Fn() -> futures::future::BoxFuture<'static, std::io::Result<bytes::Bytes>> + Send + Sync;
 
+/// ACK-early (kernel 0029): arm RETAIN for this request's commit —
+/// `true` iff the transport is retention-armed and the flag stuck
+/// (`FuseConnection::zc_commit_retain`). `false` ⇒ the caller keeps
+/// ACK-after-CQE.
+pub type ZcRetainFn = dyn Fn() -> bool + Send + Sync;
+
+/// ACK-early (kernel 0029): release the COMMIT_RETAIN'd slot — the
+/// store continuation's ONE obligation once its retained DMA completed
+/// or terminally failed (`FuseConnection::zc_release_payload`).
+pub type ZcReleaseFn = dyn Fn() + Send + Sync;
+
 /// The D14 write-side slot source: minted by the FUSE WRITE handler on
 /// a zc-armed session whose delivery HELD the payload in the sparse
 /// slot, and threaded down the write path as [`WritePayload::Slot`].
@@ -4569,6 +4580,17 @@ pub struct ZcWriteSlot {
     store: Box<ZcStoreFn>,
     extract: Box<ZcExtractFn>,
     materialized: tokio::sync::Mutex<Option<bytes::Bytes>>,
+    /// The §3.4 stability class: `true` = page-cache-sound (a post-ACK
+    /// buffer modification is a redirty ⇒ a new WRITE — buffered
+    /// deliveries), `false` = GUP/O_DIRECT (a post-ACK buffer reuse
+    /// scribbles the retained pages — ACK-early only under the explicit
+    /// unstable-write opt-in). Stamped at mint from the write's open
+    /// flags.
+    ack_early_sound: bool,
+    /// The ACK-early transport face (`None` on sessions without the
+    /// retention machinery — every such write keeps ACK-after-CQE).
+    retain: Option<Box<ZcRetainFn>>,
+    release: Option<Box<ZcReleaseFn>>,
 }
 
 impl ZcWriteSlot {
@@ -4578,7 +4600,50 @@ impl ZcWriteSlot {
             store,
             extract,
             materialized: tokio::sync::Mutex::new(None),
+            ack_early_sound: false,
+            retain: None,
+            release: None,
         })
+    }
+
+    /// [`Self::new`] with the ACK-early face: the §3.4 class stamp and
+    /// the transport retain/release closures.
+    pub fn new_with_ack_early(
+        len: u32,
+        ack_early_sound: bool,
+        store: Box<ZcStoreFn>,
+        extract: Box<ZcExtractFn>,
+        retain: Box<ZcRetainFn>,
+        release: Box<ZcReleaseFn>,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(ZcWriteSlot {
+            len,
+            store,
+            extract,
+            materialized: tokio::sync::Mutex::new(None),
+            ack_early_sound,
+            retain: Some(retain),
+            release: Some(release),
+        })
+    }
+
+    /// The §3.4 class stamp (see [`Self::new_with_ack_early`]).
+    pub fn ack_early_sound(&self) -> bool {
+        self.ack_early_sound
+    }
+
+    /// Arm RETAIN for this request's commit — `false` = no retention
+    /// (stock kernel / lever off / no ack-early face): ACK-after-CQE.
+    pub fn commit_retain(&self) -> bool {
+        self.retain.as_ref().map(|f| f()).unwrap_or(false)
+    }
+
+    /// Release the retained slot (exactly once, by the store
+    /// continuation).
+    pub fn release_payload(&self) {
+        if let Some(f) = self.release.as_ref() {
+            f();
+        }
     }
 
     /// The held payload length (the authoritative write size).
@@ -4610,6 +4675,30 @@ impl ZcWriteSlot {
         *slot = Some(b.clone());
         Ok(b)
     }
+}
+
+/// Test seam (the `set_device_overlay_for_tests` register): wrap an
+/// in-process `WritePayload::Bytes` into a mock [`ZcWriteSlot`] so the
+/// suites can drive the overlay's SLOT leg (store gates, scripted
+/// failures, retain/release ledgers) without a zc-armed transport.
+/// Never consulted when a real held slot exists.
+pub type TestZcSlotWrap =
+    std::sync::Arc<dyn Fn(bytes::Bytes) -> std::sync::Arc<ZcWriteSlot> + Send + Sync>;
+
+static TEST_ZC_SLOT_WRAP: std::sync::RwLock<Option<TestZcSlotWrap>> = std::sync::RwLock::new(None);
+
+#[doc(hidden)]
+pub fn set_test_zc_slot_wrap(f: TestZcSlotWrap) {
+    *TEST_ZC_SLOT_WRAP.write().unwrap() = Some(f);
+}
+
+#[doc(hidden)]
+pub fn clear_test_zc_slot_wrap() {
+    *TEST_ZC_SLOT_WRAP.write().unwrap() = None;
+}
+
+pub(crate) fn test_zc_slot_wrap() -> Option<TestZcSlotWrap> {
+    TEST_ZC_SLOT_WRAP.read().unwrap().clone()
 }
 
 /// A WRITE's payload as the write path consumes it: plain bytes (every

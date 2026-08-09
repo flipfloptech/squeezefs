@@ -5226,6 +5226,21 @@ pub struct Metrics {
     /// guard serializes same-block stores; growth means a future rung
     /// armed concurrent submission).
     pub overlay_supersessions: Align64<AtomicU64>,
+    /// ACK-early engagement (kernel 0029): stores whose reply detached
+    /// from the store CQE (the retained-slot pipeline). An ACK-early
+    /// row is INVALID unless this delta accounts for its eligible
+    /// stores; ≡ 0 on non-retention sessions and with the lever off.
+    pub overlay_ack_early_stores: Align64<AtomicU64>,
+    /// Byte face of [`Self::overlay_ack_early_stores`].
+    pub overlay_ack_early_bytes: Align64<AtomicU64>,
+    /// Transient-failure retries of ACKed stores (acked custody is
+    /// retry-forever; only the fence drops it — `overlay_fence_drops`).
+    pub overlay_ack_early_retries: Align64<AtomicU64>,
+    /// A begin_store claim refused by an in-flight overlap — the
+    /// legitimate rewrite-while-in-flight shape under ACK-early (the
+    /// writer settles and rides accumulation). Was a tripwire when
+    /// ACK-after-CQE made it unreachable.
+    pub overlay_claim_conflicts: Align64<AtomicU64>,
     /// B2 read posture: reads of open overlays DRAIN
     /// (freeze/complete/seed/publish) instead of composing (§5.2 is PR
     /// B3). One count per drained record on the read path.
@@ -8233,6 +8248,16 @@ impl SqueezefsFilesystem {
                 "overlay_store_fallbacks": METRICS.overlay_store_fallbacks.load(Ordering::Relaxed),
                 "overlay_short_stores": METRICS.overlay_short_stores.load(Ordering::Relaxed),
                 "overlay_supersessions": METRICS.overlay_supersessions.load(Ordering::Relaxed),
+                // ACK-early (kernel 0029): the engagement pair (an
+                // ack-early row is INVALID unless the stores delta
+                // accounts for its eligible stores), the acked-custody
+                // retry counter, and the rewrite-while-in-flight claim
+                // conflicts (legal under ACK-early, settle-then-
+                // accumulate).
+                "overlay_ack_early_stores": METRICS.overlay_ack_early_stores.load(Ordering::Relaxed),
+                "overlay_ack_early_bytes": METRICS.overlay_ack_early_bytes.load(Ordering::Relaxed),
+                "overlay_ack_early_retries": METRICS.overlay_ack_early_retries.load(Ordering::Relaxed),
+                "overlay_claim_conflicts": METRICS.overlay_claim_conflicts.load(Ordering::Relaxed),
                 "overlay_read_drains": METRICS.overlay_read_drains.load(Ordering::Relaxed),
                 "overlay_publishes": METRICS.overlay_publishes.load(Ordering::Relaxed),
                 "overlay_published_bytes": METRICS.overlay_published_bytes.load(Ordering::Relaxed),
@@ -11380,12 +11405,18 @@ impl SqueezefsFilesystem {
         let ticket = match rec.core.begin_store(first_page, pages) {
             Ok(t) => t,
             Err(_) => {
-                // Structurally unreachable in B2 (the held guard
-                // serializes same-block stores): settle + decline.
-                crate::note_invariant_tripwire(
-                    "overlay_claim_refused_under_guard",
-                    "an overlay range claim refused under the held block guard",
-                );
+                // An overlapping claim is STILL IN FLIGHT. Under
+                // ACK-after-CQE this was structurally unreachable (the
+                // held guard serialized same-block stores); with
+                // ACK-early it is the legitimate rewrite-while-in-flight
+                // shape — the earlier store's claim outlives its ACK.
+                // Settle (freeze → await the in-flight set → publish)
+                // and decline: this write rides accumulation, and the
+                // law-6 in-flight overlap exclusion is what made the
+                // stale-DMA counterexample unrepresentable.
+                METRICS
+                    .overlay_claim_conflicts
+                    .fetch_add(1, Ordering::Relaxed);
                 self.settle_overlay_block_locked(ino, b, false).await?;
                 return Ok(false);
             }
@@ -11409,6 +11440,39 @@ impl SqueezefsFilesystem {
                 let _ = rec.core.complete_store(ticket, false);
                 crate::gauge_core::sub_saturating(&METRICS.overlay_inflight_bytes, len as u64);
                 return Err(e);
+            }
+            // ---- ACK-early (kernel 0029; design-zc-write-kernel-v2
+            // §6.2–6.4): the reply detaches from the store CQE. Gates,
+            // in order: the lever; the §3.4 stability class (sound =
+            // page-cache deliveries; O_DIRECT/GUP only under the
+            // explicit unstable-write opt-in); and the transport's
+            // retention arm (commit_retain sticks ONLY on a
+            // retention-negotiated session — false keeps today's
+            // ACK-after-CQE byte-identically). Coverage publication,
+            // freeze/publish and the release all stay CQE-anchored in
+            // the detached continuation; the fsync/read laws hold
+            // because the §2.3 claim spans submit→CQE unchanged.
+            if crate::device_overlay::ack_early_enabled()
+                && (z.ack_early_sound() || crate::device_overlay::ack_early_odirect())
+                && z.commit_retain()
+            {
+                let fs = self.clone();
+                let z2 = std::sync::Arc::clone(z);
+                let rec2 = std::sync::Arc::clone(&rec);
+                METRICS
+                    .overlay_ack_early_stores
+                    .fetch_add(1, Ordering::Relaxed);
+                METRICS
+                    .overlay_ack_early_bytes
+                    .fetch_add(len as u64, Ordering::Relaxed);
+                crate::detached::tpc_spawn_guarded("overlay_ack_early_store", async move {
+                    fs.finish_ack_early_store(ino, b, rec2, ticket, fd, dest, len, z2)
+                        .await;
+                });
+                // The handler replies NOW — the application's write(2)
+                // returns while the DMA is in flight against the
+                // retained slot (the kernel keeps the pages).
+                return Ok(true);
             }
             match z.store(fd, dest).await {
                 Ok(n) if n as usize == len => {
@@ -11496,6 +11560,102 @@ impl SqueezefsFilesystem {
             crate::overlay_core::CompleteVerdict::NotCovered => unreachable!("success path"),
         }
         Ok(true)
+    }
+
+    /// The ACK-early store CONTINUATION (detached, panic-guarded — the
+    /// reply is already out, so this task owns the acked custody):
+    /// await the retained-slot DMA, retry-forever on transient failure
+    /// (acked bytes may only be dropped by a fence —
+    /// `overlay_fence_drops`), publish coverage at the REAL CQE (law 3
+    /// unchanged), trigger freeze/publish on coverage completion
+    /// exactly like the inline path, and RELEASE the retained slot
+    /// exactly once, last.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn finish_ack_early_store(
+        &self,
+        ino: u64,
+        b: u32,
+        rec: std::sync::Arc<crate::device_overlay::DeviceOverlayRecord>,
+        ticket: crate::overlay_core::StoreTicket,
+        fd: std::os::unix::io::RawFd,
+        dest: u64,
+        len: usize,
+        z: std::sync::Arc<crate::routing::ZcWriteSlot>,
+    ) {
+        let mut attempt: u32 = 0;
+        let stored = loop {
+            match z.store(fd, dest).await {
+                Ok(n) if n as usize == len => break true,
+                other => {
+                    // The fence latch is the ONE legal drop for acked
+                    // custody (the mount is fail-stopped; successor
+                    // recovery owns the offsets) — checked per retry so
+                    // a fenced zombie never spins.
+                    if rec.device.authorize_zc_store().is_err() {
+                        warn!(
+                            "ack-early store for ino {ino} block {b} dropped by the \
+                             writer-guard fence after {attempt} attempts \
+                             (overlay_fence_drops)"
+                        );
+                        METRICS.overlay_fence_drops.fetch_add(1, Ordering::Relaxed);
+                        break false;
+                    }
+                    attempt = attempt.saturating_add(1);
+                    METRICS
+                        .overlay_ack_early_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    if attempt.is_power_of_two() {
+                        warn!(
+                            "ack-early store for ino {ino} block {b} (dest {dest}, \
+                             len {len}) failed attempt {attempt}: {other:?} — acked \
+                             custody retries until it lands"
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        (10u64 << attempt.min(7)).min(1000),
+                    ))
+                    .await;
+                }
+            }
+        };
+
+        // CQE-anchored coverage (law 3): identical to the inline path.
+        let verdict = rec.core.complete_store(ticket, stored);
+        crate::gauge_core::sub_saturating(&METRICS.overlay_inflight_bytes, len as u64);
+        if stored {
+            fuse3::note_zc_write_direct(len as u64);
+            METRICS.overlay_stores.fetch_add(1, Ordering::Relaxed);
+            METRICS
+                .overlay_store_bytes
+                .fetch_add(len as u64, Ordering::Relaxed);
+        }
+        match verdict {
+            crate::overlay_core::CompleteVerdict::Covered { coverage_complete } => {
+                if coverage_complete {
+                    rec.core.freeze();
+                    if let Err(e) = self.drain_device_overlay_block(ino, b, false).await {
+                        warn!(
+                            "ack-early overlay publish for ino {ino} block {b} failed \
+                             (record stays parked for the next durability boundary): {e:?}"
+                        );
+                    }
+                }
+            }
+            crate::overlay_core::CompleteVerdict::Superseded => {
+                // The record went terminal while the store was in
+                // flight (a settle/truncate drained it) — the claim is
+                // released; the settle owns publication.
+                debug!("ack-early store for ino {ino} block {b}: record superseded mid-flight");
+            }
+            crate::overlay_core::CompleteVerdict::NotCovered => {
+                // stored == false: the fence-drop arm — coverage never
+                // published (law 3), nothing more to do.
+            }
+        }
+        // The ONE release, success and failure arms alike — after every
+        // slot access is done (the retained pages die with this call's
+        // kernel-side re-arm).
+        z.release_payload();
     }
 
     /// Settle one block's overlay UNDER the caller's held
@@ -17653,8 +17813,17 @@ impl Filesystem for SqueezefsFilesystem {
                     let slot = _req.slot;
                     let store_conn = conn.clone();
                     let extract_conn = conn.clone();
-                    crate::routing::ZcWriteSlot::new(
+                    let retain_conn = conn.clone();
+                    let release_conn = conn.clone();
+                    // The §3.4 stability class from the file's open
+                    // flags: O_DIRECT deliveries carry GUP user pages
+                    // (post-ACK buffer reuse scribbles the retained
+                    // source — unsound without the opt-in); everything
+                    // else is page-cache-sound.
+                    let sound = (flags as i32) & libc::O_DIRECT == 0;
+                    crate::routing::ZcWriteSlot::new_with_ack_early(
                         len,
+                        sound,
                         Box::new(move |fd, dev_off| {
                             let c = store_conn.clone();
                             Box::pin(async move { c.zc_write_store(slot, fd, dev_off).await })
@@ -17663,12 +17832,24 @@ impl Filesystem for SqueezefsFilesystem {
                             let c = extract_conn.clone();
                             Box::pin(async move { c.zc_write_extract(slot).await })
                         }),
+                        Box::new(move || retain_conn.zc_commit_retain(slot)),
+                        Box::new(move || {
+                            if let Err(e) = release_conn.zc_release_payload(slot) {
+                                warn!("zc release_payload failed (teardown race): {e}");
+                            }
+                        }),
                     )
                 })
         };
         let payload = match zc_slot {
             Some(z) => crate::routing::WritePayload::Slot(z),
-            None => crate::routing::WritePayload::Bytes(data),
+            None => match crate::routing::test_zc_slot_wrap() {
+                // Test seam: the in-process suites' mock slot vehicle
+                // (never armed in production; a real held slot above
+                // always wins).
+                Some(wrap) => crate::routing::WritePayload::Slot(wrap(data)),
+                None => crate::routing::WritePayload::Bytes(data),
+            },
         };
         // The authoritative write length (`data.len()` is 0 for held
         // deliveries by design).

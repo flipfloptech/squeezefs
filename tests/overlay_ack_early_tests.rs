@@ -48,7 +48,7 @@ use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::builder::{BuilderConfig, ImageBuilder};
 use squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE;
 use squeezefs::meta_backend::RoutedMetaBackend;
-use squeezefs::routing::{clear_test_zc_slot_wrap, set_test_zc_slot_wrap, ZcWriteSlot};
+use squeezefs::routing::{clear_test_zc_slot_wrap, set_test_zc_slot_wrap, DataRouter, ZcWriteSlot};
 use std::ffi::OsStr;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -155,7 +155,7 @@ async fn format_meta(path: &std::path::Path, uuid: [u8; 16]) {
     ImageBuilder::new(BuilderConfig {
         node_size: DEFAULT_NODE_SIZE,
         journal_len_override: None,
-        hash_seed: 0xACE_0F_ACE,
+        hash_seed: 0xACE0_FACE,
         uuid,
     })
     .unwrap()
@@ -168,8 +168,8 @@ async fn make(tag: &str) -> H {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "65536");
     set_device_overlay_for_tests(true, false); // SLOT vehicle, not bytes
     set_ack_early_for_tests(true, true); // enabled + O_DIRECT opt-in
-    // Backing files under target/ — tmpfs refuses the O_DIRECT open the
-    // zc_write_fd screen requires.
+                                         // Backing files under target/ — tmpfs refuses the O_DIRECT open the
+                                         // zc_write_fd screen requires.
     let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));
     std::fs::create_dir_all(dir).unwrap();
     let b = tempfile::Builder::new()
@@ -241,11 +241,25 @@ async fn create(h: &H, name: &str) -> u64 {
 }
 
 async fn read_at(h: &H, ino: u64, off: u64, len: u32) -> Vec<u8> {
-    h.fs.read(h.req, ino, 0, off, len)
+    h.fs.read(h.req, ino, 0, off, len, 0)
         .await
         .unwrap()
         .data
         .to_vec()
+}
+
+/// Promote `ino` to striped authority (overlays install only AFTER the
+/// promotion drained and published — §7.1) with the seam DISARMED, so
+/// the promotion itself rides the ordinary bytes path.
+async fn promote_striped(h: &H, ino: u64) {
+    clear_test_zc_slot_wrap();
+    let base: Vec<u8> = (0..2 * BS).map(|i| (i % 251) as u8).collect();
+    let w =
+        h.fs.write(h.req, ino, 0, 0, bytes::Bytes::copy_from_slice(&base), 0, 0)
+            .await
+            .unwrap();
+    assert_eq!(w.written as usize, base.len());
+    h.fs.fsync(h.req, ino, 0, false).await.unwrap();
 }
 
 /// Await a condition with a bounded poll (never a bare sleep-for-sync:
@@ -268,17 +282,25 @@ async fn eventually(mut f: impl FnMut() -> bool, what: &str) {
 async fn ack_early_write_returns_before_store_cqe() {
     let _g = serial().await;
     let ctl = SlotCtl::new(true);
-    arm_slot_seam(ctl.clone());
     let h = make("ackearly-rt").await;
     let ino = create(&h, "f").await;
+    promote_striped(&h, ino).await;
+    arm_slot_seam(ctl.clone());
 
     let acked0 = METRICS.overlay_ack_early_stores.load(Ordering::Relaxed);
     let data = vec![0xA5u8; BS as usize];
     // The write must return with the gate CLOSED — the ACK detached
     // from the store CQE.
-    let w = h
-        .fs
-        .write(h.req, ino, 0, 0, &data, 0, 0)
+    let w =
+        h.fs.write(
+            h.req,
+            ino,
+            0,
+            2 * BS,
+            bytes::Bytes::copy_from_slice(&data),
+            0,
+            0,
+        )
         .await
         .expect("ack-early write");
     assert_eq!(w.written, BS as u32);
@@ -310,7 +332,7 @@ async fn ack_early_write_returns_before_store_cqe() {
     .await;
 
     // Publication converged: the bytes are readable and exact.
-    let back = read_at(&h, ino, 0, BS as u32).await;
+    let back = read_at(&h, ino, 2 * BS, BS as u32).await;
     assert_eq!(back, data, "readback after ack-early publish");
     clear_test_zc_slot_wrap();
 }
@@ -322,14 +344,23 @@ async fn ack_early_write_returns_before_store_cqe() {
 async fn fsync_awaits_acked_inflight_store() {
     let _g = serial().await;
     let ctl = SlotCtl::new(true);
-    arm_slot_seam(ctl.clone());
     let h = make("ackearly-fsync").await;
     let ino = create(&h, "f").await;
+    promote_striped(&h, ino).await;
+    arm_slot_seam(ctl.clone());
 
     let data = vec![0x5Cu8; BS as usize];
-    h.fs.write(h.req, ino, 0, 0, &data, 0, 0)
-        .await
-        .expect("ack-early write");
+    h.fs.write(
+        h.req,
+        ino,
+        0,
+        2 * BS,
+        bytes::Bytes::copy_from_slice(&data),
+        0,
+        0,
+    )
+    .await
+    .expect("ack-early write");
     assert_eq!(ctl.releases.load(Ordering::SeqCst), 0);
 
     // fsync with the store parked: must NOT complete.
@@ -353,7 +384,7 @@ async fn fsync_awaits_acked_inflight_store() {
         0,
         "a successful fsync leaves no overlay unpublished"
     );
-    let back = read_at(&h, ino, 0, BS as u32).await;
+    let back = read_at(&h, ino, 2 * BS, BS as u32).await;
     assert_eq!(back, data);
     clear_test_zc_slot_wrap();
 }
@@ -365,18 +396,27 @@ async fn fsync_awaits_acked_inflight_store() {
 async fn read_waits_for_acked_inflight_store() {
     let _g = serial().await;
     let ctl = SlotCtl::new(true);
-    arm_slot_seam(ctl.clone());
     let h = make("ackearly-ryw").await;
     let ino = create(&h, "f").await;
+    promote_striped(&h, ino).await;
+    arm_slot_seam(ctl.clone());
 
     let data = vec![0x3Du8; BS as usize];
-    h.fs.write(h.req, ino, 0, 0, &data, 0, 0)
-        .await
-        .expect("ack-early write");
+    h.fs.write(
+        h.req,
+        ino,
+        0,
+        2 * BS,
+        bytes::Bytes::copy_from_slice(&data),
+        0,
+        0,
+    )
+    .await
+    .expect("ack-early write");
 
     let fs2 = h.fs.clone();
     let req = h.req;
-    let read = tokio::spawn(async move { fs2.read(req, ino, 0, 0, BS as u32).await });
+    let read = tokio::spawn(async move { fs2.read(req, ino, 0, 2 * BS, BS as u32, 0).await });
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert!(
         !read.is_finished(),
@@ -401,15 +441,24 @@ async fn failed_acked_store_retries_until_landed() {
     let _g = serial().await;
     let ctl = SlotCtl::new(true);
     ctl.fail_first.store(2, Ordering::SeqCst);
-    arm_slot_seam(ctl.clone());
     let h = make("ackearly-retry").await;
     let ino = create(&h, "f").await;
+    promote_striped(&h, ino).await;
+    arm_slot_seam(ctl.clone());
 
     let r0 = METRICS.overlay_ack_early_retries.load(Ordering::Relaxed);
     let data = vec![0x77u8; BS as usize];
-    h.fs.write(h.req, ino, 0, 0, &data, 0, 0)
-        .await
-        .expect("ack-early write");
+    h.fs.write(
+        h.req,
+        ino,
+        0,
+        2 * BS,
+        bytes::Bytes::copy_from_slice(&data),
+        0,
+        0,
+    )
+    .await
+    .expect("ack-early write");
     ctl.open_gate();
 
     let c = ctl.clone();
@@ -422,8 +471,11 @@ async fn failed_acked_store_retries_until_landed() {
         METRICS.overlay_ack_early_retries.load(Ordering::Relaxed) >= r0 + 2,
         "two scripted failures ⇒ at least two retries"
     );
-    let back = read_at(&h, ino, 0, BS as u32).await;
-    assert_eq!(back, data, "acked custody landed despite transient failures");
+    let back = read_at(&h, ino, 2 * BS, BS as u32).await;
+    assert_eq!(
+        back, data,
+        "acked custody landed despite transient failures"
+    );
     clear_test_zc_slot_wrap();
 }
 
@@ -434,16 +486,28 @@ async fn failed_acked_store_retries_until_landed() {
 async fn odirect_class_needs_the_unstable_write_opt_in() {
     let _g = serial().await;
     let ctl = SlotCtl::new(false); // unsound class (O_DIRECT/GUP)
-    arm_slot_seam(ctl.clone());
-    let h = make("ackearly-класс").await;
+    let h = make("ackearly-class").await;
     set_ack_early_for_tests(true, false); // opt-in OFF
     let ino = create(&h, "f").await;
+    promote_striped(&h, ino).await;
+    arm_slot_seam(ctl.clone());
 
     let data = vec![0x11u8; BS as usize];
     let fs2 = h.fs.clone();
     let req = h.req;
     let d2 = data.clone();
-    let w = tokio::spawn(async move { fs2.write(req, ino, 0, 0, &d2, 0, 0).await });
+    let w = tokio::spawn(async move {
+        fs2.write(
+            req,
+            ino,
+            0,
+            2 * BS,
+            bytes::Bytes::copy_from_slice(&d2),
+            0,
+            0,
+        )
+        .await
+    });
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert!(
         !w.is_finished(),
@@ -457,7 +521,7 @@ async fn odirect_class_needs_the_unstable_write_opt_in() {
     );
     ctl.open_gate();
     w.await.expect("write task").expect("awaited write");
-    let back = read_at(&h, ino, 0, BS as u32).await;
+    let back = read_at(&h, ino, 2 * BS, BS as u32).await;
     assert_eq!(back, data);
     clear_test_zc_slot_wrap();
 }

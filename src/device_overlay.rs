@@ -78,11 +78,51 @@ pub fn bytes_vehicle_armed() -> bool {
     tri(&BYTES_VEHICLE, "SQUEEZEFS_TEST_OVERLAY_BYTES")
 }
 
+/// ACK-early enablement (`SQUEEZEFS_ZC_ACK_EARLY`, default ON —
+/// engagement additionally requires an armed overlay, a
+/// retention-negotiated transport, and the §3.4 class gate below, so
+/// the ON default is inert on every shipped posture).
+static ACK_EARLY: AtomicU8 = AtomicU8::new(0);
+/// The §3.4 unstable-write opt-in (`SQUEEZEFS_ZC_ACK_EARLY_ODIRECT`,
+/// default OFF): O_DIRECT/GUP writes may ACK early only under it — a
+/// post-ACK buffer reuse persists scribbled bytes, the NFS
+/// UNSTABLE-class contract the operator must explicitly accept.
+static ACK_EARLY_ODIRECT: AtomicU8 = AtomicU8::new(0);
+
+fn tri_default_on(state: &AtomicU8, knob: &str) -> bool {
+    match state.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = crate::env_knobs::bool_knob(knob, true);
+            state.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// The `SQUEEZEFS_ZC_ACK_EARLY` lever (registry entry in
+/// `src/env_knobs.rs`).
+pub fn ack_early_enabled() -> bool {
+    tri_default_on(&ACK_EARLY, "SQUEEZEFS_ZC_ACK_EARLY")
+}
+
+/// The `SQUEEZEFS_ZC_ACK_EARLY_ODIRECT` unstable-write opt-in.
+pub fn ack_early_odirect() -> bool {
+    tri(&ACK_EARLY_ODIRECT, "SQUEEZEFS_ZC_ACK_EARLY_ODIRECT")
+}
+
 /// Test override (the `set_patch_max_bytes` precedent): pins both the
 /// enablement and the bytes-vehicle seam without env-order coupling.
 pub fn set_device_overlay_for_tests(enabled: bool, bytes_vehicle: bool) {
     ENABLED.store(if enabled { 2 } else { 1 }, Ordering::Relaxed);
     BYTES_VEHICLE.store(if bytes_vehicle { 2 } else { 1 }, Ordering::Relaxed);
+}
+
+/// Test override for the ACK-early pair.
+pub fn set_ack_early_for_tests(enabled: bool, odirect_opt_in: bool) {
+    ACK_EARLY.store(if enabled { 2 } else { 1 }, Ordering::Relaxed);
+    ACK_EARLY_ODIRECT.store(if odirect_opt_in { 2 } else { 1 }, Ordering::Relaxed);
 }
 
 /// The registry-wide fast path (§5.2 Resolved Questions #5): one

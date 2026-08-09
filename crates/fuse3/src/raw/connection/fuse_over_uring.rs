@@ -187,6 +187,12 @@ pub(crate) struct CommitMsg {
     /// fetch landed them through the sparse slot) — the worker commits
     /// header + `payload_sz = n` with no body move of any kind.
     prefilled: Option<u32>,
+    /// ACK-early (0029): this reply's COMMIT carries
+    /// `FUSE_URING_COMMIT_RETAIN` — the zc slot stays registered and the
+    /// daemon's store continuation owes the RELEASE. Set from the
+    /// per-ent retain flag at mint (the handler armed it via
+    /// `zc_commit_retain` strictly before replying).
+    retain: bool,
 }
 
 /// A handler-initiated zc device fetch (the direct read leg): DMA `len`
@@ -231,6 +237,17 @@ pub(crate) enum WorkerMsg {
     ZcFetch(ZcFetchMsg),
     ZcStore(ZcStoreMsg),
     ZcExtract(ZcExtractMsg),
+    /// Release a COMMIT_RETAIN'd zc slot (design-zc-write-kernel-v2
+    /// §3.3): the daemon's ACK-early store continuation sends this once
+    /// its retained DMA completed (or terminally failed). Ordered
+    /// against the commit by the worker's deferral protocol — a release
+    /// arriving before the RETAIN commit was submitted parks per-ent
+    /// and fires the moment the commit goes out, so the kernel can
+    /// never see RELEASE-before-COMMIT (`-EBUSY`).
+    ZcRelease {
+        qid: u16,
+        ent_idx: u16,
+    },
 }
 
 /// One slot's liveness cell, published by its queue worker and read by
@@ -306,6 +323,15 @@ pub(crate) enum SlotState {
     /// COMMIT_AND_FETCH submitted; the kernel owns the ent again (its CQE
     /// brings the next delivery).
     Replied { commit_id: u64 },
+    /// COMMIT_AND_FETCH submitted WITH `FUSE_URING_COMMIT_RETAIN`
+    /// (design-zc-write-kernel-v2 §3.3): the request ended kernel-side
+    /// (the application's write returned — ACK-early), but the zc slot's
+    /// pages stay registered and the commit cmd is PARKED (no CQE). The
+    /// slot owes no reply; the daemon's store continuation owes exactly
+    /// one RELEASE_PAYLOAD, whose submission returns the slot to
+    /// [`SlotState::Replied`]. Teardown drains retained ents kernel-side
+    /// (`-ECONNABORTED` on the parked cmd), so this state never wedges.
+    Retained { commit_id: u64 },
     /// Retired after `REGISTER_RETRY_MAX` consecutive REGISTER failures
     /// (FUSE-3a) — the ent is out of the queue's rotation.
     Retired,
@@ -371,6 +397,10 @@ pub(crate) struct SlotTable {
     register_failures: Vec<u32>,
     /// Earliest instant a retried REGISTER may be re-pushed (FUSE-3a).
     retry_at: Vec<Option<Instant>>,
+    /// A ZcRelease that arrived ahead of its ent's RETAIN commit —
+    /// consumed by the commit submission (the release-after-commit
+    /// ordering protocol; see [`Self::set_release_pending`]).
+    release_pending: Vec<bool>,
     /// Debug-only ownership proof (single-owner by construction).
     #[cfg(debug_assertions)]
     owner: std::thread::ThreadId,
@@ -388,9 +418,25 @@ impl SlotTable {
             states: vec![SlotState::Registered; depth],
             register_failures: vec![0; depth],
             retry_at: vec![None; depth],
+            release_pending: vec![false; depth],
             #[cfg(debug_assertions)]
             owner: std::thread::current().id(),
         }
+    }
+
+    /// A ZcRelease arrived before this ent's RETAIN commit was
+    /// submitted (the store CQE beat the reply through the channels) —
+    /// park it; the commit submission fires it (the kernel must never
+    /// see RELEASE-before-COMMIT, which would answer `-EBUSY`).
+    pub(crate) fn set_release_pending(&mut self, ent: usize) {
+        self.assert_owner();
+        self.release_pending[ent] = true;
+    }
+
+    /// Consume a parked release (at RETAIN-commit submission).
+    pub(crate) fn take_release_pending(&mut self, ent: usize) -> bool {
+        self.assert_owner();
+        std::mem::take(&mut self.release_pending[ent])
     }
 
     /// Single-owner proof: every transition runs on the worker thread that
@@ -479,6 +525,39 @@ impl SlotTable {
     pub(crate) fn on_commit_submitted(&mut self, ent: usize, commit_id: u64) {
         self.assert_owner();
         self.states[ent] = SlotState::Replied { commit_id };
+    }
+
+    /// A COMMIT_AND_FETCH SQE carrying `FUSE_URING_COMMIT_RETAIN` was
+    /// pushed — the reply is out (the slot owes nothing) but the ent is
+    /// kernel-parked until RELEASE.
+    pub(crate) fn on_commit_submitted_retained(&mut self, ent: usize, commit_id: u64) {
+        self.assert_owner();
+        self.states[ent] = SlotState::Retained { commit_id };
+    }
+
+    /// A RELEASE_PAYLOAD SQE for a retained `ent` was pushed — the
+    /// kernel re-arms the parked commit into the fetch path, so the slot
+    /// is `Replied` again (next CQE = next delivery). Inert on any other
+    /// state (the teardown race).
+    pub(crate) fn on_release_submitted(&mut self, ent: usize) {
+        self.assert_owner();
+        if let SlotState::Retained { commit_id } = self.states[ent] {
+            self.states[ent] = SlotState::Replied { commit_id };
+        }
+    }
+
+    /// The kernel refused a RETAIN commit (`-EINVAL` on the commit CQE
+    /// while `Retained` — the queue was not retention-armed or the ent
+    /// was not a zc write source). The ent still holds its applied
+    /// reply: recover by plain re-commit, mirroring [`Self::on_commit_retry`].
+    pub(crate) fn on_retain_refused(&mut self, ent: usize) {
+        self.assert_owner();
+        if let SlotState::Retained { commit_id } = self.states[ent] {
+            self.states[ent] = SlotState::Delivered {
+                unique: 0,
+                commit_id,
+            };
+        }
     }
 
     /// Row 6: a transient COMMIT failure is about to be re-committed
@@ -632,6 +711,12 @@ pub(crate) enum RingOp {
     /// op already completed, `-EALREADY` = running, may still complete);
     /// resolution always rides the ORIGINAL op's CQE.
     Cancel,
+    /// A RELEASE_PAYLOAD uring_cmd for a retained ent (0029). Its CQE is
+    /// accounting only: `0` counts a release; nonzero is the must-stay-0
+    /// `fuse3_zc_release_failures` tripwire. The ent's next delivery
+    /// rides the re-armed parked commit's CQE, a normal Fetch-class
+    /// delivery.
+    Release,
 }
 
 /// `user_data` reserved for the wake-fd PollAdd (unchanged).
@@ -645,6 +730,7 @@ const UD_TAG_REGISTER: u64 = 1;
 const UD_TAG_COMMIT: u64 = 2;
 const UD_TAG_FETCH: u64 = 3;
 const UD_TAG_CANCEL: u64 = 4;
+const UD_TAG_RELEASE: u64 = 5;
 
 /// Encode `(op, ent_idx)` into an SQE `user_data` word.
 #[inline]
@@ -654,6 +740,7 @@ pub(crate) fn encode_user_data(op: RingOp, ent_idx: usize) -> u64 {
         RingOp::Commit => UD_TAG_COMMIT,
         RingOp::Fetch => UD_TAG_FETCH,
         RingOp::Cancel => UD_TAG_CANCEL,
+        RingOp::Release => UD_TAG_RELEASE,
     };
     (tag << UD_TAG_SHIFT) | (ent_idx as u64 & 0xFFFF_FFFF)
 }
@@ -669,6 +756,7 @@ pub(crate) fn decode_user_data(user_data: u64) -> Option<(RingOp, usize)> {
         UD_TAG_COMMIT => RingOp::Commit,
         UD_TAG_FETCH => RingOp::Fetch,
         UD_TAG_CANCEL => RingOp::Cancel,
+        UD_TAG_RELEASE => RingOp::Release,
         // A word this worker never pushed (kernel echo of an unknown op
         // class): treat as a REGISTER completion — the historical
         // reading — rather than dropping the CQE.
@@ -1385,6 +1473,13 @@ pub struct FuseOverUring {
     /// side-channel: two relaxed stores at delivery, one at commit, read
     /// only by the watch thread.
     slot_watch: Vec<SlotWatch>,
+    /// ACK-early (0029): per-(qid, ent) "next commit carries RETAIN"
+    /// flags, addressed like `slot_watch`. Set by the daemon handler
+    /// (via [`Self::zc_commit_retain`]) strictly before it replies,
+    /// consumed at CommitMsg mint, and belt-cleared at delivery so an
+    /// errored handler can never leak a stale retain onto the NEXT
+    /// request's reply.
+    retain_next: Vec<AtomicBool>,
     /// D14 write-side: per-(qid, ent) HELD WRITE-payload lengths
     /// (dispatch-before-extraction — the payload stays in the sparse
     /// slot until the handler stores it to the device or lazily
@@ -2638,6 +2733,9 @@ impl FuseOverUring {
             nqueues: nqueues as u16,
             inbound,
             slot_watch: (0..nqueues * depth).map(|_| SlotWatch::default()).collect(),
+            retain_next: (0..nqueues * depth)
+                .map(|_| AtomicBool::new(false))
+                .collect(),
             zc_write_held: {
                 kmbuf::init_zc_store_qid_census(nqueues);
                 zc::ZcHeldTable::new(nqueues, depth)
@@ -2873,6 +2971,9 @@ impl FuseOverUring {
             slot_watch: (0..nqueues as usize * Self::SIM_DEPTH)
                 .map(|_| SlotWatch::default())
                 .collect(),
+            retain_next: (0..nqueues as usize * Self::SIM_DEPTH)
+                .map(|_| AtomicBool::new(false))
+                .collect(),
             zc_write_held: zc::ZcHeldTable::new(nqueues as usize, Self::SIM_DEPTH),
             zc_bridge_pends: AtomicU64::new(0),
             zc_hold_gate: std::sync::OnceLock::new(),
@@ -2986,6 +3087,10 @@ impl FuseOverUring {
             .get(qid as usize)
             .and_then(|&gi| self.groups.get(gi as usize))
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bad qid"))?;
+        // ACK-early: consume the handler-armed retain flag into the
+        // message (set ≺ reply on the handler task, so the read is
+        // race-free; delivery belt-clears leaks).
+        let retain = self.take_retain_next(qid, ent_idx as usize);
         g.commit_tx
             .send(WorkerMsg::Commit(CommitMsg {
                 qid,
@@ -2994,6 +3099,7 @@ impl FuseOverUring {
                 header,
                 reply_body,
                 prefilled: None,
+                retain,
             }))
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "uring commit closed"))?;
         // Wake the drain thread. L3 lever B at group scope: the channel
@@ -3352,6 +3458,10 @@ impl FuseOverUring {
             .get(qid as usize)
             .and_then(|&gi| self.groups.get(gi as usize))
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bad qid"))?;
+        // Prefilled replies are read-direction — retention is a write
+        // law; clear any stale flag rather than carry it (hygiene: the
+        // delivery belt-clear also covers this).
+        let _ = self.take_retain_next(qid, ent_idx as usize);
         g.commit_tx
             .send(WorkerMsg::Commit(CommitMsg {
                 qid,
@@ -3360,6 +3470,7 @@ impl FuseOverUring {
                 header,
                 reply_body: Bytes::new(),
                 prefilled: Some(payload_len),
+                retain: false,
             }))
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "uring commit closed"))?;
         if g.wake_coalescer.arm() {
@@ -3420,6 +3531,74 @@ impl FuseOverUring {
     #[inline]
     fn slot_watch_cell(&self, qid: u16, ent_idx: usize) -> Option<&SlotWatch> {
         self.slot_watch.get(qid as usize * self.depth + ent_idx)
+    }
+
+    /// ACK-early (0029): arm RETAIN for this slot's NEXT commit. Returns
+    /// `true` iff armed — the daemon gates its early reply on it (false
+    /// ⇒ no retention on this session, keep ACK-after-CQE). Legal only
+    /// from the request's own handler, strictly before its reply (the
+    /// severance chain handler ≺ reply ≺ COMMIT makes the flag's
+    /// lifetime exactly one request; delivery belt-clears it).
+    pub fn zc_commit_retain(&self, slot: ReplySlot) -> bool {
+        let ReplySlot::Ring { qid, ent_idx, .. } = slot else {
+            return false;
+        };
+        if !self.retention || !self.zc_armed() {
+            return false;
+        }
+        let Some(cell) = self
+            .retain_next
+            .get(qid as usize * self.depth + ent_idx as usize)
+        else {
+            return false;
+        };
+        cell.store(true, Ordering::Release);
+        true
+    }
+
+    /// Consume the retain flag at CommitMsg mint (one request's reply).
+    #[inline]
+    fn take_retain_next(&self, qid: u16, ent_idx: usize) -> bool {
+        self.retain_next
+            .get(qid as usize * self.depth + ent_idx)
+            .map(|c| c.swap(false, Ordering::AcqRel))
+            .unwrap_or(false)
+    }
+
+    /// ACK-early (0029): release a COMMIT_RETAIN'd slot — the store
+    /// continuation's ONE obligation once its retained DMA completed
+    /// (or terminally failed). Ordering against the commit is the
+    /// worker's deferral protocol; a stale release (teardown race) is
+    /// inert.
+    pub fn zc_release_payload(&self, slot: ReplySlot) -> io::Result<()> {
+        let ReplySlot::Ring { qid, ent_idx, .. } = slot else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "zc release: reply has no ring slot",
+            ));
+        };
+        if !self.active.load(Ordering::Acquire) {
+            // Teardown owns retained ents from here (kernel drains the
+            // parked cmds -ECONNABORTED); the release is moot.
+            return Ok(());
+        }
+        let g = self
+            .group_of
+            .get(qid as usize)
+            .and_then(|&gi| self.groups.get(gi as usize))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bad qid"))?;
+        g.commit_tx
+            .send(WorkerMsg::ZcRelease { qid, ent_idx })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "uring worker closed"))?;
+        if g.wake_coalescer.arm() {
+            let one: u64 = 1;
+            // SAFETY: writing 8 bytes to a live eventfd.
+            let _ = unsafe { libc::write(g.wake_fd, &one as *const u64 as *const _, 8) };
+            TRANSPORT_WAKE_WRITES.fetch_add(1, Ordering::Relaxed);
+        } else {
+            TRANSPORT_WAKES_ELIDED.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// Publish a slot's owed-reply state for the watchdog (`unique == 0`
@@ -4406,7 +4585,21 @@ fn queue_worker(
         }
         apply_reply(ent, &msg.header, &msg.reply_body);
         batch.note_commit_opcode(ent.last_opcode);
-        submit_commit(ring, batch, slots, watch, qid, gent, msg.commit_id)
+        // ACK-early (0029): a WRITE reply whose handler armed RETAIN
+        // commits with the flag — the kernel ends the request (the
+        // application's write returns NOW) and parks the ent until the
+        // store continuation's RELEASE. Every other arm of this routing
+        // fn is read-shaped and stays plain.
+        submit_commit_retain(
+            ring,
+            batch,
+            slots,
+            watch,
+            qid,
+            gent,
+            msg.commit_id,
+            msg.retain,
+        )
     }
 
     /// Resolve one zc bridge CQE (`RingOp::Fetch`) against the ent's
@@ -4962,6 +5155,45 @@ fn queue_worker(
                     }
                     continue;
                 }
+                WorkerMsg::ZcRelease { qid: rqid, ent_idx } => {
+                    // ACK-early (0029): release a retained slot. The
+                    // ordering protocol: Retained ⇒ push RELEASE now;
+                    // commit not yet submitted (Delivered/Parked — the
+                    // store CQE beat the reply through the channels) ⇒
+                    // park it, the RETAIN commit submission fires it.
+                    // Anything else is the teardown race — inert.
+                    let idx = ent_idx as usize;
+                    let Some(mi) = member_of_qid(rqid).filter(|_| idx < depth) else {
+                        warn!(
+                            "fuse-over-uring qids={qids:?}: zc release for bad slot \
+                             qid={rqid} ent={idx}"
+                        );
+                        continue;
+                    };
+                    let m = &mut members[mi];
+                    match m.slots.state(idx) {
+                        SlotState::Retained { commit_id } => {
+                            push_release(
+                                &mut ring,
+                                &mut batch,
+                                &mut m.slots,
+                                rqid,
+                                gent_of(mi, idx),
+                                commit_id,
+                            )?;
+                        }
+                        SlotState::Delivered { .. } | SlotState::Parked { .. } => {
+                            m.slots.set_release_pending(idx);
+                        }
+                        other => {
+                            debug!(
+                                "fuse-over-uring qid={rqid} ent={idx}: stale zc release \
+                                 (state {other:?}) — inert"
+                            );
+                        }
+                    }
+                    continue;
+                }
             };
             let idx = msg.ent_idx as usize;
             let Some(mi) = member_of_qid(msg.qid).filter(|_| idx < depth) else {
@@ -5339,6 +5571,44 @@ fn queue_worker(
                     disconnect = true;
                     break;
                 }
+                // A failed RELEASE_PAYLOAD is accounting + tripwire, never
+                // protocol-fatal (ENOENT = double release, EBUSY = raced a
+                // live commit — both unrepresentable under the deferral
+                // protocol, hence must-stay-0).
+                if op == RingOp::Release {
+                    warn!(
+                        "fuse-over-uring qid={qid} ent={ent_idx}: RELEASE_PAYLOAD \
+                         cqe err={err} (fuse3_zc_release_failures)"
+                    );
+                    kmbuf::note_zc_release_failure();
+                    continue;
+                }
+                // Kernel-refused RETAIN (design-zc-write-kernel-v2 §3.3's
+                // -EINVAL arm): the ent still holds its applied reply —
+                // recover by plain re-commit, count the must-stay-0
+                // tripwire, and DON'T let the refusal reach the
+                // protocol-fatal ladder below.
+                if op == RingOp::Commit && err == libc::EINVAL {
+                    if let SlotState::Retained { commit_id } = m.slots.state(ent_idx) {
+                        warn!(
+                            "fuse-over-uring qid={qid} ent={ent_idx}: RETAIN commit \
+                             refused EINVAL — re-committing plain \
+                             (fuse3_zc_retain_refused)"
+                        );
+                        kmbuf::note_zc_retain_refused();
+                        m.slots.on_retain_refused(ent_idx);
+                        submit_commit(
+                            &mut ring,
+                            &mut batch,
+                            &mut m.slots,
+                            pool.slot_watch_cell(qid, ent_idx),
+                            qid,
+                            gent,
+                            commit_id,
+                        )?;
+                        continue;
+                    }
+                }
                 if err == libc::ENOTSUP || err == libc::EINVAL || err == libc::ENOSYS {
                     error!("fuse-over-uring: kernel rejected protocol err={err}");
                     pool.shutdown();
@@ -5348,25 +5618,38 @@ fn queue_worker(
                     // Structurally unreachable: Fetch/Cancel errors
                     // resolved (and `continue`d) before the
                     // protocol-fatal ladder above.
-                    RingOp::Fetch | RingOp::Cancel => {}
+                    // Release errors resolved (and `continue`d) before
+                    // the protocol-fatal ladder above, like Fetch/Cancel.
+                    RingOp::Fetch | RingOp::Cancel | RingOp::Release => {}
                     // Row 6: a transient COMMIT failure re-commits. The
                     // ent still holds the applied reply, so re-pushing
                     // the same COMMIT_AND_FETCH is the whole recovery —
                     // re-REGISTERing here would discard that reply and
                     // leave the caller waiting forever.
                     RingOp::Commit if err == libc::EAGAIN || err == libc::EINTR => {
-                        let commit_id = match m.slots.state(ent_idx) {
-                            SlotState::Replied { commit_id } => Some(commit_id),
-                            _ => None,
+                        // A transient failure of a RETAIN commit re-commits
+                        // WITH retain (the kernel never parked the ent, so
+                        // the retained arc restarts whole — the outstanding
+                        // count is retracted and re-made at re-submission).
+                        let (commit_id, retain) = match m.slots.state(ent_idx) {
+                            SlotState::Replied { commit_id } => (Some(commit_id), false),
+                            SlotState::Retained { commit_id } => (Some(commit_id), true),
+                            _ => (None, false),
                         };
                         match commit_id {
                             Some(cid) => {
                                 warn!(
                                     "fuse-over-uring qid={qid} ent={ent_idx}: COMMIT err={err}; \
-                                     re-committing cid={cid} (reply already applied)"
+                                     re-committing cid={cid} retain={retain} \
+                                     (reply already applied)"
                                 );
-                                m.slots.on_commit_retry(ent_idx);
-                                submit_commit(
+                                if retain {
+                                    kmbuf::retract_zc_retain_commit();
+                                    m.slots.on_retain_refused(ent_idx);
+                                } else {
+                                    m.slots.on_commit_retry(ent_idx);
+                                }
+                                submit_commit_retain(
                                     &mut ring,
                                     &mut batch,
                                     &mut m.slots,
@@ -5374,6 +5657,7 @@ fn queue_worker(
                                     qid,
                                     gent,
                                     cid,
+                                    retain,
                                 )?;
                             }
                             None => {
@@ -5463,6 +5747,12 @@ fn queue_worker(
                 // Informational (see the error-path twin): resolution
                 // always rides the original op's CQE.
                 debug!(qid, ent_idx, res, "bridge AsyncCancel CQE");
+                continue;
+            }
+            if op == RingOp::Release {
+                // Accounting-only (counted at submission); the re-armed
+                // parked commit's CQE is the next delivery.
+                debug!(qid, ent_idx, res, "RELEASE_PAYLOAD CQE");
                 continue;
             }
             if op == RingOp::Fetch {
@@ -5834,6 +6124,14 @@ fn queue_worker(
                 Bytes::copy_from_slice(&m.ents[ent_idx].payload()[..capped_sz])
             };
 
+            // ACK-early belt: every request starts with a clean retain
+            // flag — a handler that armed RETAIN and then errored (its
+            // reply synthesized by fail_ent, which never mints a
+            // CommitMsg) must not leak the flag onto THIS request's
+            // reply.
+            if let Some(cell) = pool.retain_next.get(qid as usize * depth + ent_idx) {
+                cell.store(false, Ordering::Relaxed);
+            }
             // FUSE-2: the slot now owes exactly one commit. A delivery
             // onto a slot that STILL owes one (row 10's overwrite class,
             // and row 11's `fuse_resend` double-delivery shape) is
@@ -6357,6 +6655,7 @@ fn queue_worker(
                         header: error_out_header(unique, libc::EIO).to_vec(),
                         reply_body: Bytes::new(),
                         prefilled: None,
+                        retain: false,
                     },
                     true,
                 ));
@@ -6367,7 +6666,12 @@ fn queue_worker(
         match wmsg {
             WorkerMsg::Commit(msg) => final_msgs.push((msg, false)),
             // Dropping the sender unblocks the parked handler (BrokenPipe).
-            WorkerMsg::ZcFetch(_) | WorkerMsg::ZcStore(_) | WorkerMsg::ZcExtract(_) => {}
+            // A teardown-raced ZcRelease is moot: the kernel drains every
+            // retained ent (-ECONNABORTED on the parked cmd) at abort.
+            WorkerMsg::ZcFetch(_)
+            | WorkerMsg::ZcStore(_)
+            | WorkerMsg::ZcExtract(_)
+            | WorkerMsg::ZcRelease { .. } => {}
         }
     }
     // Bridge-deadline gauge hygiene: every pend died with this worker —
@@ -6548,12 +6852,41 @@ fn submit_commit(
     gent: usize,
     commit_id: u64,
 ) -> io::Result<()> {
+    submit_commit_retain(ring, batch, slots, watch, qid, gent, commit_id, false)
+}
+
+/// [`submit_commit`] with the RETAIN arm (design-zc-write-kernel-v2
+/// §3.3): `retain = true` carries `FUSE_URING_COMMIT_RETAIN` in the
+/// cmd-req union (the kernel ends the request, keeps the zc slot
+/// registered, and parks the commit — no CQE until RELEASE), transitions
+/// the slot to `Retained`, and fires any release that raced ahead of
+/// this commit (the release-after-commit ordering protocol — the two
+/// SQEs ride ONE batch, so the kernel processes them in order and can
+/// never answer `-EBUSY`).
+#[allow(clippy::too_many_arguments)] // one wire word per SQE field (see push_cmd_batched)
+fn submit_commit_retain(
+    ring: &mut Ring,
+    batch: &mut SubmitBatch,
+    slots: &mut SlotTable,
+    watch: Option<&SlotWatch>,
+    qid: u16,
+    gent: usize,
+    commit_id: u64,
+    retain: bool,
+) -> io::Result<()> {
     // `gent` is the GROUP-local ent id (member_slot × depth + ent_idx —
     // the SQE reply-address word); the member's slot table indexes by the
     // queue-local ent, recovered here (`gent % depth` — the table holds
     // exactly one member's `depth` slots) so no caller can pass the pair
     // inconsistently.
     let ent_idx = gent % slots.len();
+    // The union bytes at cmd offset 18: `init.flags` on REGISTER,
+    // `commit.flags` on COMMIT_AND_FETCH (opcode selects the member).
+    let union_flags = if retain {
+        kmbuf::FUSE_URING_COMMIT_RETAIN
+    } else {
+        0
+    };
     push_cmd_batched(
         ring,
         batch,
@@ -6562,14 +6895,53 @@ fn submit_commit(
         commit_id,
         None,
         encode_user_data(RingOp::Commit, gent),
+        union_flags,
+        0,
+        0,
+    )?;
+    if retain {
+        slots.on_commit_submitted_retained(ent_idx, commit_id);
+        kmbuf::note_zc_retain_commit();
+        if slots.take_release_pending(ent_idx) {
+            push_release(ring, batch, slots, qid, gent, commit_id)?;
+        }
+    } else {
+        slots.on_commit_submitted(ent_idx, commit_id);
+    }
+    if let Some(w) = watch {
+        w.clear();
+    }
+    Ok(())
+}
+
+/// Push one RELEASE_PAYLOAD uring_cmd for a retained ent and transition
+/// the slot back to `Replied` (the kernel re-arms the parked commit into
+/// the fetch path; its CQE is the next delivery). Counted at submission
+/// — the RELEASE cmd's own CQE is accounting-only (`0` expected; nonzero
+/// rides the `fuse3_zc_release_failures` must-stay-0 tripwire).
+fn push_release(
+    ring: &mut Ring,
+    batch: &mut SubmitBatch,
+    slots: &mut SlotTable,
+    qid: u16,
+    gent: usize,
+    commit_id: u64,
+) -> io::Result<()> {
+    push_cmd_batched(
+        ring,
+        batch,
+        FUSE_IO_URING_CMD_RELEASE_PAYLOAD,
+        qid,
+        commit_id,
+        None,
+        encode_user_data(RingOp::Release, gent),
         0,
         0,
         0,
     )?;
-    slots.on_commit_submitted(ent_idx, commit_id);
-    if let Some(w) = watch {
-        w.clear();
-    }
+    let ent_idx = gent % slots.len();
+    slots.on_release_submitted(ent_idx);
+    kmbuf::note_zc_release();
     Ok(())
 }
 

@@ -7903,6 +7903,16 @@ impl SqueezefsFilesystem {
                 // Present + lever on + zc mode): the PRECONDITION gauge
                 // for ACK-early — arming alone is bit-identical (§3.6).
                 "fuse3_zc_retention_negotiated": fuse3::retention_negotiated(),
+                // The retained-slot ledger (ACK-early engagement): an
+                // ACK-early row is INVALID unless retain_commits accounts
+                // for its early-acked stores; retain_commits − releases =
+                // outstanding (0 at quiesce); release_failures and
+                // retain_refused are must-stay-0 tripwires.
+                "fuse3_zc_retain_commits": fuse3::zc_retain_commits(),
+                "fuse3_zc_releases": fuse3::zc_releases(),
+                "fuse3_zc_release_failures": fuse3::zc_release_failures(),
+                "fuse3_zc_retain_refused": fuse3::zc_retain_refused(),
+                "fuse3_zc_retained_outstanding": fuse3::zc_retained_outstanding(),
                 "fuse3_zc_replies": fuse3::zc_replies(),
                 "fuse3_zc_fallbacks": fuse3::zc_fallbacks(),
                 "fuse3_zc_slot_payload_skips": fuse3::zc_slot_payload_skips(),

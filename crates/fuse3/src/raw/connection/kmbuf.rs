@@ -179,6 +179,13 @@ pub const FUSE_URING_ZERO_COPY: u16 = 1 << 1;
 /// bit-identical to a zc queue (design-zc-write-kernel-v2 §3.6, pinned
 /// live by the kmbuf_smoke retention round-trip on both sqz tracks).
 pub const FUSE_URING_PAYLOAD_RETENTION: u16 = 1 << 2;
+/// `fuse_uring_cmd_req.commit.flags` bit 0 (series patch 0029): this
+/// COMMIT_AND_FETCH ends the request but keeps the zc slot registered
+/// and parks the cmd (no CQE) until RELEASE_PAYLOAD. Valid only on a
+/// retention-armed queue for a zc WRITE (`ITER_SOURCE`) ent — the
+/// submit site mirrors the kernel checks so the `-EINVAL` refusal arm
+/// is unreachable in practice (tripwired if not).
+pub const FUSE_URING_COMMIT_RETAIN: u16 = 1 << 0;
 /// The buffer-group id FUSE hardcodes for the payload bufring.
 pub const FUSE_URING_RINGBUF_GROUP: u16 = 0;
 /// Fixed-table index of the headers buffer in bufring mode. In zc mode
@@ -723,6 +730,85 @@ pub fn set_retention_negotiated(on: bool) {
 /// gauge for ACK-early engagement, not an engagement counter.
 pub fn retention_negotiated() -> u64 {
     RETENTION_NEGOTIATED.load(Ordering::Relaxed)
+}
+
+// ---------------------------------------------------------------------
+// Retained-slot ledger (ACK-early engagement — the §6.3 counter family)
+// ---------------------------------------------------------------------
+
+static ZC_RETAIN_COMMITS: AtomicU64 = AtomicU64::new(0);
+static ZC_RELEASES: AtomicU64 = AtomicU64::new(0);
+static ZC_RELEASE_FAILURES: AtomicU64 = AtomicU64::new(0);
+static ZC_RETAIN_REFUSED: AtomicU64 = AtomicU64::new(0);
+static ZC_RETAINED_OUTSTANDING: AtomicU64 = AtomicU64::new(0);
+
+/// One COMMIT_AND_FETCH submitted with RETAIN (the ACK-early
+/// engagement counter — an ACK-early row is INVALID unless this delta
+/// accounts for its early-acked stores).
+pub fn note_zc_retain_commit() {
+    ZC_RETAIN_COMMITS.fetch_add(1, Ordering::Relaxed);
+    ZC_RETAINED_OUTSTANDING.fetch_add(1, Ordering::Relaxed);
+}
+
+/// One RELEASE_PAYLOAD submitted for a retained ent. The closure law:
+/// `retain_commits − releases` = the retained population, 0 at quiesce
+/// (teardown drains report a nonzero residue loudly).
+pub fn note_zc_release() {
+    ZC_RELEASES.fetch_add(1, Ordering::Relaxed);
+    let prev = ZC_RETAINED_OUTSTANDING.fetch_sub(1, Ordering::Relaxed);
+    debug_assert!(prev > 0, "release without a matching retain");
+}
+
+/// `fuse3_zc_retain_commits` (stats inode).
+pub fn zc_retain_commits() -> u64 {
+    ZC_RETAIN_COMMITS.load(Ordering::Relaxed)
+}
+
+/// `fuse3_zc_releases` (stats inode).
+pub fn zc_releases() -> u64 {
+    ZC_RELEASES.load(Ordering::Relaxed)
+}
+
+/// A RELEASE_PAYLOAD CQE answered nonzero — `fuse3_zc_release_failures`
+/// is a must-stay-0 tripwire (ENOENT = double release, EBUSY = release
+/// raced a live commit; both are ordering bugs the deferral protocol
+/// makes unrepresentable).
+pub fn note_zc_release_failure() {
+    ZC_RELEASE_FAILURES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `fuse3_zc_release_failures` (stats inode, must stay 0).
+pub fn zc_release_failures() -> u64 {
+    ZC_RELEASE_FAILURES.load(Ordering::Relaxed)
+}
+
+/// The kernel refused a RETAIN commit (`-EINVAL`) and the worker
+/// re-committed plain — `fuse3_zc_retain_refused` is a must-stay-0
+/// tripwire (the submit-site gating mirrors the kernel checks).
+pub fn note_zc_retain_refused() {
+    ZC_RETAIN_REFUSED.fetch_add(1, Ordering::Relaxed);
+    let prev = ZC_RETAINED_OUTSTANDING.fetch_sub(1, Ordering::Relaxed);
+    debug_assert!(prev > 0, "refusal without a matching retain");
+}
+
+/// `fuse3_zc_retain_refused` (stats inode, must stay 0).
+pub fn zc_retain_refused() -> u64 {
+    ZC_RETAIN_REFUSED.load(Ordering::Relaxed)
+}
+
+/// A RETAIN commit failed transiently (EAGAIN — never parked
+/// kernel-side): retract its submission accounting; the re-submission
+/// re-counts. Keeps `retain_commits − releases ≡ outstanding` exact.
+pub fn retract_zc_retain_commit() {
+    ZC_RETAIN_COMMITS.fetch_sub(1, Ordering::Relaxed);
+    let prev = ZC_RETAINED_OUTSTANDING.fetch_sub(1, Ordering::Relaxed);
+    debug_assert!(prev > 0, "retract without a matching retain");
+}
+
+/// `fuse3_zc_retained_outstanding` (stats inode, gauge): the live
+/// retained population — 0 at quiesce.
+pub fn zc_retained_outstanding() -> u64 {
+    ZC_RETAINED_OUTSTANDING.load(Ordering::Relaxed)
 }
 
 /// Count one zc reply commit: a paged reply whose payload rode the

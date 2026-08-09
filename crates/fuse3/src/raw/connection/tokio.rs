@@ -449,6 +449,34 @@ impl FuseConnection {
         pool.zc_write_extract(slot).await
     }
 
+    /// ACK-early (0029): arm RETAIN for this slot's next commit —
+    /// `true` iff the session is retention-armed and the flag stuck.
+    /// See [`super::fuse_over_uring::FuseOverUring::zc_commit_retain`].
+    #[cfg(target_os = "linux")]
+    pub fn zc_commit_retain(&self, slot: crate::raw::ReplySlot) -> bool {
+        self.over_uring
+            .get()
+            .map(|p| p.zc_commit_retain(slot))
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn zc_commit_retain(&self, _slot: crate::raw::ReplySlot) -> bool {
+        false
+    }
+
+    /// ACK-early (0029): release a COMMIT_RETAIN'd slot — the store
+    /// continuation's one obligation. See
+    /// [`super::fuse_over_uring::FuseOverUring::zc_release_payload`].
+    #[cfg(target_os = "linux")]
+    pub fn zc_release_payload(&self, slot: crate::raw::ReplySlot) -> io::Result<()> {
+        let pool = self
+            .over_uring
+            .get()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no over-uring pool"))?;
+        pool.zc_release_payload(slot)
+    }
+
     /// Register the session's fused-write dispatcher (zc-write-fusion
     /// campaign): the mint that builds one delivery's WRITE handler
     /// future plus the runtime handle fused polls enter — see

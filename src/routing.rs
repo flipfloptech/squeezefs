@@ -9641,14 +9641,20 @@ impl DataRouter {
     /// the staged-family precedent (deferred persists fence at persist
     /// time; the write handler validated the lease upstream).
     /// Device-overlay PR B2 (KD-OV-12's one-authority screen): whether a
-    /// rewrite-shadow epoch is live on `ino` — the overlay install
-    /// predicate declines while any pending-binding authority exists
-    /// (the B4 coexistence arm is what would relax this).
-    pub(crate) fn has_open_rewrite_epoch(&self, ino: u64) -> bool {
+    /// rewrite-shadow epoch holds a pending binding for exactly `(ino,
+    /// b)` — the overlay install predicate declines for THAT block (the
+    /// five B4 dual-authority hazards are all same-block; an epoch's
+    /// bindings for OTHER blocks compose with a fresh block's direct
+    /// merge on disjoint map keys, serialized by the publish conveyor).
+    /// An ino-wide screen was measured to cascade-disable the overlay:
+    /// one accumulation block's detached publish opens an epoch and
+    /// every concurrent fresh segment then declines into accumulation,
+    /// which reopens epochs forever.
+    pub(crate) fn rewrite_epoch_binds_block(&self, ino: u64, b: u32) -> bool {
         self.inner
             .rewrite_epochs
-            .read_sync(&ino, |_, _| ())
-            .is_some()
+            .read_sync(&ino, |_, e| e.shadow.read_sync(&b, |_, _| ()).is_some())
+            .unwrap_or(false)
     }
 
     pub(crate) async fn rewrite_shadow_record(

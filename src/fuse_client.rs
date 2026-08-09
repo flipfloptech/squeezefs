@@ -11224,7 +11224,7 @@ impl SqueezefsFilesystem {
         let Some(bm) = meta.block_map.as_ref() else {
             return false;
         };
-        if bm.contains_key(&(b as u32)) || self.router.has_open_rewrite_epoch(ino) {
+        if bm.contains_key(&(b as u32)) || self.router.rewrite_epoch_binds_block(ino, b as u32) {
             return false;
         }
         let key = crate::keys::active_block_stack(ino, b);
@@ -11290,10 +11290,10 @@ impl SqueezefsFilesystem {
             // An old binding exists — the overwrite shape is PR B4.
             return Ok(false);
         }
-        if self.router.has_open_rewrite_epoch(ino) {
-            // A pending-binding authority is live on this ino: the
-            // KD-OV-12 one-authority law says fresh overlays wait for
-            // B4's coexistence arm — decline (accumulation).
+        if self.router.rewrite_epoch_binds_block(ino, b) {
+            // A pending shadow binding exists for THIS block: the
+            // KD-OV-12 one-authority law — decline (accumulation; the
+            // B4 coexistence arm is what would relax this).
             return Ok(false);
         }
         if self.active_block_buffers.contains_key(cache_key)

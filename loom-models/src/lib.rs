@@ -222,6 +222,8 @@ pub static META_CONVEYOR_QUEUED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 #[path = "../../src/meta_backend/kv/conveyor_core.rs"]
 pub mod conveyor_core;
+#[path = "../../src/coverage_core.rs"]
+pub mod coverage_core;
 #[path = "../../src/cow_core.rs"]
 pub mod cow_core;
 #[path = "../../src/meta_backend/kv/epoch_core.rs"]
@@ -246,6 +248,8 @@ pub mod lane_core;
 pub mod lease_core;
 #[path = "../../src/meta_backend/kv/node_state_core.rs"]
 pub mod node_state_core;
+#[path = "../../src/overlay_core.rs"]
+pub mod overlay_core;
 #[path = "../../src/patch_clone_core.rs"]
 pub mod patch_clone_core;
 #[path = "../../src/placed_core.rs"]
@@ -383,10 +387,10 @@ mod models {
     use crate::{
         alloc_ext_core, conveyor_core, epoch_core, gauge_core, incarnation_core, ipc_cqe_core,
         ipc_ring_core, ipc_slot_core, journal_core, lane_core, lease_core, node_state_core,
-        patch_clone_core, placed_core, refcount_core, slot_cursor_core, slot_gate_core, wake_core,
-        write_pipeline_core,
+        overlay_core, patch_clone_core, placed_core, refcount_core, slot_cursor_core,
+        slot_gate_core, wake_core, write_pipeline_core,
     };
-    use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use loom::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use loom::sync::Arc;
     use loom::thread;
 
@@ -3945,6 +3949,138 @@ mod models {
                 assert!(!c.begin_claim(0, 1), "sealed assembly granted a new claim");
             }
             claimer.join().unwrap();
+        });
+    }
+
+    // -----------------------------------------------------------------
+    // overlay_core — the device-overlay §5.2 snapshot/revalidate word
+    // protocol (design-device-overlay Rev 2, PR B1). The words: the
+    // law-6 generation (bumped at ACCEPT, before any device byte can
+    // move), the published coverage face (set only at a full-success
+    // CQE — law 3), and the reused claim bitmap (held submit→CQE — the
+    // §2.3 overlap-exclusion clause). Everything is SeqCst; weakening
+    // the generation accesses or the claim/coverage words to
+    // Release/Acquire re-admits interleavings these models reject
+    // (weakening-verified at landing).
+    // -----------------------------------------------------------------
+
+    /// §5.2's torn-serve exclusion: a reader that passes covered_probe
+    /// AND generation-equality revalidation never observes a mix of two
+    /// stores' bytes. The "device" is two Relaxed words (a DMA has no
+    /// memory-model ordering of its own — the protocol words must carry
+    /// ALL the exclusion): version consistency across both words is the
+    /// invariant.
+    #[test]
+    fn overlay_validated_serve_is_never_torn() {
+        loom::model(|| {
+            let r = Arc::new(overlay_core::OverlayRecordCore::new(
+                2 * overlay_core::OVERLAY_PAGE as u32,
+                1,
+            ));
+            let d0 = Arc::new(AtomicUsize::new(0));
+            let d1 = Arc::new(AtomicUsize::new(0));
+
+            // Pass 1 lands whole before the race: covered, version 1.
+            let t = r.begin_store(0, 2).expect("fresh range claims");
+            d0.store(1, Ordering::Relaxed);
+            d1.store(1, Ordering::Relaxed);
+            r.complete_store(t, true);
+
+            // Pass 2 races the reader over the SAME covered range (the
+            // re-write-in-flight shape: coverage alone cannot screen it —
+            // the claim bitmap and the generation word must).
+            let writer = {
+                let r = r.clone();
+                let d0 = d0.clone();
+                let d1 = d1.clone();
+                thread::spawn(move || {
+                    if let Ok(t2) = r.begin_store(0, 2) {
+                        d0.store(2, Ordering::Relaxed);
+                        d1.store(2, Ordering::Relaxed);
+                        r.complete_store(t2, true);
+                    }
+                })
+            };
+
+            // The §5.2 reader: snapshot → probe → fetch → revalidate.
+            let g = r.read_begin();
+            if r.covered_probe(0, 2) {
+                let v0 = d0.load(Ordering::Relaxed);
+                let v1 = d1.load(Ordering::Relaxed);
+                if r.read_valid(g) {
+                    assert_eq!(v0, v1, "a validated serve straddled two passes (torn read)");
+                }
+            }
+            writer.join().unwrap();
+        });
+    }
+
+    /// The freeze/drain edge (fsync steps 1–2, law 9's wait): a store
+    /// racing the freeze either backs out before any coverage can
+    /// publish, or is visible in the in-flight set until its CQE — so a
+    /// freezer that observes `inflight_empty()` has seen the FINAL
+    /// coverage (no store can publish after that observation).
+    #[test]
+    fn overlay_freeze_drain_observes_final_coverage() {
+        loom::model(|| {
+            let r = Arc::new(overlay_core::OverlayRecordCore::new(
+                overlay_core::OVERLAY_PAGE as u32,
+                1,
+            ));
+            let stored = Arc::new(AtomicBool::new(false));
+
+            let path = Arc::new(AtomicUsize::new(0));
+            let writer = {
+                let r = r.clone();
+                let stored = stored.clone();
+                let path = path.clone();
+                thread::spawn(move || match r.begin_store(0, 1) {
+                    Ok(t) => {
+                        if matches!(
+                            r.complete_store(t, true),
+                            overlay_core::CompleteVerdict::Covered { .. }
+                        ) {
+                            path.store(4, Ordering::SeqCst);
+                            stored.store(true, Ordering::SeqCst);
+                        } else {
+                            path.store(5, Ordering::SeqCst);
+                        }
+                    }
+                    Err(overlay_core::StoreRefusal::NotOpen) => path.store(3, Ordering::SeqCst),
+                    Err(overlay_core::StoreRefusal::Overlap) => path.store(2, Ordering::SeqCst),
+                    Err(_) => path.store(1, Ordering::SeqCst),
+                })
+            };
+
+            let froze = r.freeze();
+            assert!(froze, "freeze CAS failed on an Open record");
+            if r.inflight_empty() {
+                // Drained: the coverage face is FINAL — either the racing
+                // store backed out on the frozen state (never covered) or
+                // its publication is already visible here.
+                let covered_at_drain = r.covered_probe(0, 1);
+                let complete_at_drain = r.coverage_complete();
+                writer.join().unwrap();
+                assert_eq!(
+                    stored.load(Ordering::SeqCst),
+                    covered_at_drain,
+                    "a drained freeze missed a store's coverage publication \
+                     (or saw one that backed out); coverage_complete at drain = {complete_at_drain}, \
+                     inflight_empty now = {}, probe now = {}, writer path = {}",
+                    r.inflight_empty(),
+                    r.covered_probe(0, 1),
+                    path.load(Ordering::SeqCst)
+                );
+            } else {
+                writer.join().unwrap();
+            }
+            assert!(
+                matches!(
+                    r.begin_store(0, 1),
+                    Err(overlay_core::StoreRefusal::NotOpen)
+                ),
+                "a frozen record admitted a new segment"
+            );
         });
     }
 

@@ -159,6 +159,22 @@ impl PlacedClaims {
         }
     }
 
+    /// Read-only probe: does any LIVE claim overlap pages
+    /// `[first_page, first_page + page_count)`? The device-overlay
+    /// law-3 read screen (an in-flight range is never served — even a
+    /// re-write of an already-covered range): SeqCst loads pair with
+    /// the SeqCst claim RMWs, so a claim granted before a reader's
+    /// generation snapshot is always visible here. Out-of-range probes
+    /// answer `true` (conservative — never servable).
+    pub fn overlaps(&self, first_page: usize, page_count: usize) -> bool {
+        if page_count == 0 || first_page + page_count > self.pages {
+            return true;
+        }
+        self.masks(first_page, page_count)
+            .iter()
+            .any(|&(w, m)| self.words[w].load(Ordering::SeqCst) & m != 0)
+    }
+
     /// The adopter half of the Dekker pair: permanently seal the
     /// assembly, then report whether adoption is safe (`true` ⇔ no sever
     /// is inside its memcpy window; every future claim refuses on the

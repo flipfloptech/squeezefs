@@ -89,9 +89,15 @@ pub mod data_alloc_lane;
 // not doc comments: an outer doc comment here merges into the crate root's
 // link scope — see the `data_custody` note above.)
 pub mod alloc_lane_grant;
-pub mod defrag;
 /// RES-8 (pre-RC spec §7): unwind containment + counting for detached
 /// (fire-and-forget) data-path tasks.
+// PR B1 (device-overlay design KD-OV-2): the ONE written-coverage union —
+// `active_block.rs` (RAM accumulation) and `overlay_core` (device
+// accumulation) both route through it, so drift between the two coverage
+// laws is a red build, not a review item. A plain comment (the `env_knobs`
+// note below).
+pub mod coverage_core;
+pub mod defrag;
 pub mod detached;
 /// TEST-1 (pre-RC spec §11): the data-device power-cut harness — the
 /// `uring_fs` volatile-cache simulator's coverage extended to the
@@ -151,6 +157,10 @@ pub mod meta_ship;
 // loudly naming the missing piece.
 pub mod multi_writer;
 pub mod nvmeof;
+// PR B1 (docs/design-device-overlay.md §2): the device-overlay pure state
+// core — laws 1-3/6/9 as pure transitions, the §2.3 range-claim overlap
+// exclusion (the `placed_core` protocol reused), the §5.2 read words.
+pub mod overlay_core;
 pub(crate) mod patch_clone_core;
 pub(crate) mod placed_core;
 pub(crate) mod placed_sever;

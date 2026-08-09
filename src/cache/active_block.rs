@@ -361,19 +361,15 @@ pub struct ActiveBlockBuf {
     /// Logical block size — representation-independent (the extent form
     /// has no backing to measure).
     block_size: u32,
-    /// Primary written run `[written.0, written.1)` — the union of ranges
-    /// merged via [`ActiveBlockBuf::record_write`], as long as they arrive
-    /// overlapping/abutting (the in-order common case: this pair is the
-    /// ONLY coverage state ever touched, no allocation). RW3b: written
-    /// coverage IS the write-through trigger input — `record_write`
-    /// returns `true` when the union reaches the whole block.
-    written: (u32, u32),
-    /// Out-of-order overflow: additional written runs, sorted by start,
-    /// pairwise disjoint and non-abutting, each disjoint and non-abutting
-    /// from `written`. Empty — never allocated — on in-order streams;
-    /// populated only when a write lands disjoint from every existing run
-    /// (kernel-split segment reorder; counted `active_block_ooo_runs`).
-    written_extra: Vec<(u32, u32)>,
+    /// The written-coverage union (primary run + sorted disjoint
+    /// out-of-order extras) — since PR B1 the SHARED
+    /// [`crate::coverage_core::CoverageUnion`] (device-overlay KD-OV-2:
+    /// one coverage law for RAM and device accumulation; the arithmetic
+    /// moved verbatim, `record_write`'s contract unchanged). RW3b:
+    /// written coverage IS the write-through trigger input —
+    /// `record_write` returns `true` when the union reaches the whole
+    /// block.
+    coverage: crate::coverage_core::CoverageUnion,
     /// Every byte of the buffer is the block's correct current content:
     /// born-`seeded`, written union spans the block, complement zeroed
     /// ([`ActiveBlockBuf::zero_complete`]) or seed-filled
@@ -449,8 +445,7 @@ impl ActiveBlockBuf {
         Self {
             repr: Repr::Full(CowCell::new(AlignedBlock::alloc_raw(block_size))),
             block_size: block_size as u32,
-            written: (0, 0),
-            written_extra: Vec::new(),
+            coverage: crate::coverage_core::CoverageUnion::new(),
             content_valid: false,
             deferred_seed,
             write_epoch: next_write_epoch(),
@@ -496,8 +491,7 @@ impl ActiveBlockBuf {
         Self {
             repr: Repr::Full(CowCell::adopt(Arc::clone(&shared.0))),
             block_size: shared.len() as u32,
-            written: (0, 0),
-            written_extra: Vec::new(),
+            coverage: crate::coverage_core::CoverageUnion::new(),
             content_valid: false,
             deferred_seed: deferred,
             write_epoch: next_write_epoch(),
@@ -535,8 +529,7 @@ impl ActiveBlockBuf {
         Self {
             repr: Repr::Extent(ExtentOverlay { slabs: Vec::new() }),
             block_size: block_size as u32,
-            written: (0, 0),
-            written_extra: Vec::new(),
+            coverage: crate::coverage_core::CoverageUnion::new(),
             content_valid: false,
             deferred_seed: deferred,
             write_epoch: next_write_epoch(),
@@ -555,7 +548,7 @@ impl ActiveBlockBuf {
 
     /// Extent-repr accessors (0/empty on the full repr).
     pub fn extent_count(&self) -> usize {
-        self.written_extra.len() + usize::from(self.written.0 != self.written.1)
+        self.coverage.run_count()
     }
 
     /// Parked extent payload bytes (0 for the full repr).
@@ -781,8 +774,7 @@ impl ActiveBlockBuf {
         Self {
             repr: Repr::Full(CowCell::new(block)),
             block_size: block_size as u32,
-            written: (0, 0),
-            written_extra: Vec::new(),
+            coverage: crate::coverage_core::CoverageUnion::new(),
             content_valid: true,
             deferred_seed: false,
             write_epoch: next_write_epoch(),
@@ -797,7 +789,7 @@ impl ActiveBlockBuf {
         if self.content_valid {
             (0, self.block_size)
         } else {
-            self.written
+            self.coverage.primary()
         }
     }
 
@@ -815,9 +807,7 @@ impl ActiveBlockBuf {
         if self.content_valid {
             return true;
         }
-        let (s, e) = (start as u32, end as u32);
-        let inside = |run: (u32, u32)| run.0 <= s && e <= run.1;
-        inside(self.written) || self.written_extra.iter().any(|&run| inside(run))
+        self.coverage.contains(start as u32, end as u32)
     }
 
     /// The written runs intersected with `[start, end)`, ascending — the
@@ -839,30 +829,12 @@ impl ActiveBlockBuf {
     /// All written runs in ascending offset order (primary merged into the
     /// sorted extras view). Runs are pairwise disjoint and non-abutting.
     fn runs_sorted(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
-        let p = self.written;
-        let idx = self.written_extra.partition_point(|&(s, _)| s < p.0);
-        let (before, after) = self.written_extra.split_at(idx);
-        before
-            .iter()
-            .copied()
-            .chain((p.0 != p.1).then_some(p))
-            .chain(after.iter().copied())
+        self.coverage.runs_sorted()
     }
 
     /// The unwritten gaps of `[0, len)` in ascending order.
     fn gaps(&self, len: u32) -> Vec<(u32, u32)> {
-        let mut out = Vec::new();
-        let mut cursor = 0u32;
-        for (s, e) in self.runs_sorted() {
-            if s > cursor {
-                out.push((cursor, s));
-            }
-            cursor = e;
-        }
-        if cursor < len {
-            out.push((cursor, len));
-        }
-        out
+        self.coverage.gaps(len)
     }
 
     /// Record a write of `[start, end)` **before** merging it via
@@ -888,43 +860,27 @@ impl ActiveBlockBuf {
         // union — exactly the latest-wins shape an in-flight upload must
         // observe and yield to). Under the caller's held block lock.
         self.write_epoch = next_write_epoch();
-        if self.union_is_full() {
-            // Already-complete: no transition to report (a re-write of a
-            // completed union must not double-fire the write-through).
-            return false;
-        }
-        let (s, e) = (start as u32, end as u32);
-        let (p0, p1) = self.written;
-        if p0 == p1 {
-            // First touch.
-            self.written = (s, e);
-        } else if s <= p1 && e >= p0 {
-            // Overlaps or abuts the primary run: extend it, then absorb any
-            // extras the grown primary now reaches (a bridging write can
-            // connect runs on both sides).
-            self.written = (p0.min(s), p1.max(e));
-            self.coalesce_extras_into_primary();
-        } else {
-            // Disjoint from the primary: an out-of-order run. Insert into
-            // the sorted extras, coalescing with overlapping/abutting
-            // neighbours (extras stay disjoint from the primary by
-            // construction: a run reaching the primary is caught above).
-            self.insert_extra_run(s, e);
+        // The union arithmetic is the SHARED coverage core (PR B1,
+        // KD-OV-2) — semantics unchanged: overlap-safe, order-blind,
+        // completion fires once, re-writes of a complete union report
+        // nothing.
+        let v = self
+            .coverage
+            .record(start as u32, end as u32, self.block_size);
+        if v.out_of_order {
             crate::fuse_client::METRICS
                 .active_block_ooo_runs
                 .fetch_add(1, Ordering::Relaxed);
         }
-        if self.union_is_full() {
-            self.complete_written_union();
+        if v.completed {
+            self.complete_written_union(v.completed_with_extras);
             return true;
         }
         false
     }
 
     fn union_is_full(&self) -> bool {
-        // Extras are disjoint from the primary, so a full primary implies
-        // no extras.
-        self.written == (0, self.block_size)
+        self.coverage.is_full(self.block_size)
     }
 
     /// The supersession generation (Idea 2 — see the field doc): capture
@@ -942,36 +898,6 @@ impl ActiveBlockBuf {
     /// leg's admission predicate).
     pub fn is_union_complete(&self) -> bool {
         !self.is_extent_repr() && self.union_is_full()
-    }
-
-    fn coalesce_extras_into_primary(&mut self) {
-        let (mut p0, mut p1) = self.written;
-        self.written_extra.retain(|&(s, e)| {
-            if s <= p1 && e >= p0 {
-                p0 = p0.min(s);
-                p1 = p1.max(e);
-                false
-            } else {
-                true
-            }
-        });
-        // One retain pass suffices: extras are pairwise non-abutting, so a
-        // grown primary can absorb each at most once, and absorbing one
-        // cannot make a previously-disjoint one reachable (any run between
-        // them would have been coalesced with it already).
-        self.written = (p0, p1);
-    }
-
-    fn insert_extra_run(&mut self, s: u32, e: u32) {
-        let idx = self.written_extra.partition_point(|&(_, re)| re < s);
-        let mut end_idx = idx;
-        let (mut ns, mut ne) = (s, e);
-        while end_idx < self.written_extra.len() && self.written_extra[end_idx].0 <= ne {
-            ns = ns.min(self.written_extra[end_idx].0);
-            ne = ne.max(self.written_extra[end_idx].1);
-            end_idx += 1;
-        }
-        self.written_extra.splice(idx..end_idx, [(ns, ne)]);
     }
 
     /// Establish content-validity at a stage/upload exit: zero **every**
@@ -1008,8 +934,7 @@ impl ActiveBlockBuf {
         // The gaps are zeros now — the exit owns the buffer's remaining
         // life, so claiming the full union keeps `covered()` reporting
         // `(0, len)` exactly as the pre-RW3b degrade did.
-        self.written = (0, len as u32);
-        self.written_extra.clear();
+        self.coverage.set_full(len as u32);
         self.content_valid = true;
         crate::fuse_client::METRICS
             .active_block_memset_elided_bytes
@@ -1019,11 +944,11 @@ impl ActiveBlockBuf {
     /// The written union reached the whole block (the trigger transition):
     /// every byte is app-written, so the buffer is content-valid with zero
     /// memset; a deferred seed is skipped forever (the row-4 win).
-    fn complete_written_union(&mut self) {
+    fn complete_written_union(&mut self, completed_with_extras: bool) {
         let len = self.block_size as usize;
         // RES-22: a COALESCING outcome of the out-of-order run merge —
         // kernel-split writes decide it, not this call's arguments.
-        if !self.written_extra.is_empty() {
+        if completed_with_extras {
             crate::note_invariant_tripwire(
                 "complete_union_with_extra_runs",
                 "the written union completed with out-of-order runs still \

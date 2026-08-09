@@ -44,11 +44,17 @@ fn coverage_union_is_overlap_safe_and_order_blind() {
     // union exactly once, never because a segment's end touches len.
     let mut c = CoverageUnion::new();
     assert!(!c.record(1024, 2048, 4096).completed);
-    assert!(!c.record(3072, 4096, 4096).completed, "end-at-len alone must not fire");
+    assert!(
+        !c.record(3072, 4096, 4096).completed,
+        "end-at-len alone must not fire"
+    );
     assert!(!c.record(0, 512, 4096).completed);
     let v = c.record(512, 3072, 4096);
     assert!(v.completed, "the bridging segment completes the union");
-    assert!(!c.record(0, 4096, 4096).completed, "no double-fire after complete");
+    assert!(
+        !c.record(0, 4096, 4096).completed,
+        "no double-fire after complete"
+    );
 }
 
 #[test]
@@ -63,7 +69,10 @@ fn coverage_union_tracks_out_of_order_runs_and_gaps() {
     assert!(c.contains(0, 1024));
     assert!(c.contains(4096, 5120));
     assert!(!c.contains(1024, 4096), "a gap is never covered");
-    assert!(!c.contains(0, 5120), "a range spanning a gap is never covered");
+    assert!(
+        !c.contains(0, 5120),
+        "a range spanning a gap is never covered"
+    );
 }
 
 #[test]
@@ -73,7 +82,10 @@ fn coverage_union_set_full_claims_everything() {
     c.set_full(4096);
     assert!(c.is_full(4096));
     assert!(c.gaps(4096).is_empty());
-    assert!(!c.record(0, 4096, 4096).completed, "set_full consumed the transition");
+    assert!(
+        !c.record(0, 4096, 4096).completed,
+        "set_full consumed the transition"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -84,15 +96,34 @@ fn coverage_union_set_full_claims_everything() {
 fn coverage_publishes_only_on_successful_complete() {
     let r = rec();
     let t = r.begin_store(0, 4).expect("fresh range claims");
-    assert!(!r.covered_probe(0, 4), "law 3: an in-flight range is never served");
+    assert!(
+        !r.covered_probe(0, 4),
+        "law 3: an in-flight range is never served"
+    );
     let v = r.complete_store(t, false);
-    assert!(matches!(v, CompleteVerdict::NotCovered), "a failed CQE publishes nothing");
-    assert!(!r.covered_probe(0, 4), "failed store leaves the range uncovered");
+    assert!(
+        matches!(v, CompleteVerdict::NotCovered),
+        "a failed CQE publishes nothing"
+    );
+    assert!(
+        !r.covered_probe(0, 4),
+        "failed store leaves the range uncovered"
+    );
 
-    let t2 = r.begin_store(0, 4).expect("failed store's claim released at CQE");
+    let t2 = r
+        .begin_store(0, 4)
+        .expect("failed store's claim released at CQE");
     let v2 = r.complete_store(t2, true);
-    assert!(matches!(v2, CompleteVerdict::Covered { coverage_complete: false }));
-    assert!(r.covered_probe(0, 4), "law 4's serve authority: covered after full CQE");
+    assert!(matches!(
+        v2,
+        CompleteVerdict::Covered {
+            coverage_complete: false
+        }
+    ));
+    assert!(
+        r.covered_probe(0, 4),
+        "law 4's serve authority: covered after full CQE"
+    );
 }
 
 #[test]
@@ -101,7 +132,12 @@ fn completion_transition_fires_exactly_once_at_full_union() {
     let mut fired = 0;
     for p in 0..16u32 {
         let t = r.begin_store(p as usize, 1).unwrap();
-        if matches!(r.complete_store(t, true), CompleteVerdict::Covered { coverage_complete: true }) {
+        if matches!(
+            r.complete_store(t, true),
+            CompleteVerdict::Covered {
+                coverage_complete: true
+            }
+        ) {
             fired += 1;
             assert_eq!(p, 15, "the transition is the union reaching len");
         }
@@ -124,7 +160,9 @@ fn overlapping_inflight_stores_are_unrepresentable() {
         matches!(r.begin_store(2, 4), Err(StoreRefusal::Overlap)),
         "an overlapping in-flight store must refuse"
     );
-    let t2 = r.begin_store(4, 4).expect("disjoint ranges run concurrently");
+    let t2 = r
+        .begin_store(4, 4)
+        .expect("disjoint ranges run concurrently");
     r.complete_store(t, true);
     r.complete_store(t2, true);
     // The claim releases only at the store CQE — re-admitting the range.
@@ -158,7 +196,10 @@ fn read_snapshot_revalidation_catches_mid_fetch_accepts() {
     let snap = r.read_begin();
     assert!(r.read_valid(snap), "quiet record revalidates");
     let t2 = r.begin_store(8, 4).unwrap(); // accept bumps the word
-    assert!(!r.read_valid(snap), "an accept between snapshot and revalidate fails equality");
+    assert!(
+        !r.read_valid(snap),
+        "an accept between snapshot and revalidate fails equality"
+    );
     r.complete_store(t2, true);
 }
 
@@ -177,7 +218,10 @@ fn freeze_refuses_new_stores_and_inflight_drains_to_publishable() {
         matches!(r.begin_store(8, 4), Err(StoreRefusal::NotOpen)),
         "a frozen record admits no new segment"
     );
-    assert!(!r.inflight_empty(), "the pre-freeze store is still in flight");
+    assert!(
+        !r.inflight_empty(),
+        "the pre-freeze store is still in flight"
+    );
     // The frozen record still completes its in-flight set (fsync step 2).
     assert!(matches!(
         r.complete_store(t, true),
@@ -194,7 +238,10 @@ fn law9_rollback_requires_terminal_state_and_empty_inflight() {
     // MEM-1 class applied to device offsets.
     let r = rec();
     let t = r.begin_store(0, 4).unwrap();
-    assert!(!r.rollback_admissible(), "an Open record never rolls back its dest");
+    assert!(
+        !r.rollback_admissible(),
+        "an Open record never rolls back its dest"
+    );
     assert!(r.supersede(), "Open → Superseded");
     assert!(
         !r.rollback_admissible(),
@@ -205,7 +252,10 @@ fn law9_rollback_requires_terminal_state_and_empty_inflight() {
         matches!(v, CompleteVerdict::Superseded),
         "a store completing into a superseded record publishes nothing"
     );
-    assert!(r.rollback_admissible(), "terminal + inflight empty ⇒ the mint owner may free");
+    assert!(
+        r.rollback_admissible(),
+        "terminal + inflight empty ⇒ the mint owner may free"
+    );
 }
 
 #[test]
@@ -260,22 +310,20 @@ proptest! {
                 Op::Begin { first, pages } => {
                     let pages = pages.min(16 - first.min(16));
                     if pages == 0 { continue; }
-                    match r.begin_store(first, pages) {
-                        Ok(t) => {
-                            // No two overlapping in-flight claims, ever.
-                            for &(s, p, _) in &live {
-                                prop_assert!(
-                                    first + pages <= s || s + p <= first,
-                                    "overlapping in-flight claims granted: [{first},{}) vs [{s},{})",
-                                    first + pages, s + p
-                                );
-                            }
-                            // Law 6's ordering word: strictly monotone.
-                            prop_assert!(t.generation() > last_gen, "generation must advance");
-                            last_gen = t.generation();
-                            live.push((first, pages, t));
+                    // A refusal is always legal; a grant carries the laws.
+                    if let Ok(t) = r.begin_store(first, pages) {
+                        // No two overlapping in-flight claims, ever.
+                        for &(s, p, _) in &live {
+                            prop_assert!(
+                                first + pages <= s || s + p <= first,
+                                "overlapping in-flight claims granted: [{first},{}) vs [{s},{})",
+                                first + pages, s + p
+                            );
                         }
-                        Err(_) => {} // refusal is always legal
+                        // Law 6's ordering word: strictly monotone.
+                        prop_assert!(t.generation() > last_gen, "generation must advance");
+                        last_gen = t.generation();
+                        live.push((first, pages, t));
                     }
                 }
                 Op::Complete { idx, success } => {
@@ -303,9 +351,19 @@ proptest! {
                 Op::Supersede => { let _ = r.supersede(); }
             }
 
-            // Coverage only grows: everything proven covered stays covered.
+            // Coverage only grows: everything proven covered stays
+            // servable — UNLESS a newer overlapping store is in flight,
+            // in which case law 3's read screen (an in-flight range is
+            // never served) correctly withholds the serve until its CQE.
             for &(s, p) in &covered {
-                prop_assert!(r.covered_probe(s, p), "published coverage can never regress");
+                let inflight_overlap = live
+                    .iter()
+                    .any(|&(ls, lp, _)| s < ls + lp && ls < s + p);
+                prop_assert_eq!(
+                    r.covered_probe(s, p),
+                    !inflight_overlap,
+                    "published coverage serves exactly when no in-flight store overlaps"
+                );
             }
             // Law 3's read screen: in-flight ranges are never served.
             for &(s, p, _) in &live {

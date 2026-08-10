@@ -3223,6 +3223,60 @@ pub enum InodeWriteLockScope {
     Shared,
 }
 
+/// KD-5 (design-write-inode-convoy §4.4 rows 3/13/22): what an attr
+/// publication CLAIMS. Every `attr_cache` publisher routes its claim
+/// through [`SqueezefsFilesystem::publish_attr`] — the one atomic merge
+/// domain — instead of a bare insert; the variant is the merge law.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum AttrPublish {
+    /// A freshly minted inode (create/mkdir/mknod/symlink): no prior
+    /// state can legitimately exist — the value publishes wholesale.
+    Fresh(FileAttr),
+    /// A backend REFETCH republished (lookup / link / refresh / TTL
+    /// expiry): the durable inode legally LAGS acked writes (deferred
+    /// layout persist), so size+blocks keep the fresher cached pair and
+    /// times merge signed-max per field. Identity fields (mode, uid,
+    /// nlink, …) are the fresh record's — that read is authoritative.
+    Refetch(FileAttr),
+    /// The setattr commit: explicitly requested fields SET verbatim
+    /// (truncate may shrink; utimes may move times backward), everything
+    /// else follows the [`AttrPublish::Refetch`] merge law.
+    Setattr {
+        attr: FileAttr,
+        explicit_size: bool,
+        explicit_atime: bool,
+        explicit_mtime: bool,
+        explicit_ctime: bool,
+    },
+    /// The WRITE postlude (KD-6): times merge signed-max (the durable
+    /// fold's law — `park_times_refinement`), and the size claim
+    /// publishes ONLY when the entry-time claim was genuine growth. A
+    /// size-neutral completion must never resurrect a stale-high size
+    /// over a newer truncate (`None` ⇒ times only). Publishes only onto
+    /// an existing entry — a write never fabricates an attr.
+    WriteTimes {
+        mtime: Timestamp,
+        ctime: Timestamp,
+        size_claim: Option<u64>,
+    },
+    /// A monotone size floor raise onto an existing entry
+    /// (`extend_file_size`): size/blocks rise to the claimed value,
+    /// never fall; absent entry ⇒ no publish.
+    FloorSize(u64),
+    /// `get_attr_internal`'s size reconcile against the LIVE
+    /// `metadata_cache` (the write path's synchronous truth — both
+    /// directions: it also carries truncates). Sets size/blocks
+    /// verbatim onto an existing entry.
+    MetaReconcile { size: u64, blocks: u64 },
+}
+
+/// Per-field signed-max time merge (the `park_times_refinement` law:
+/// `Timestamp`'s derived `Ord` compares `sec: i64` first, so pre-epoch
+/// values order correctly).
+fn merge_time_max(cached: Timestamp, incoming: Timestamp) -> Timestamp {
+    std::cmp::max(cached, incoming)
+}
+
 /// Decide inode write-lock scope for a FUSE write.
 ///
 /// Already-striped files use block-level locks on the data path, so the full-inode
@@ -6013,6 +6067,14 @@ pub struct SqueezefsFilesystem {
         (FileAttr, std::time::Instant),
         ahash::RandomState,
     >,
+    /// KD-5 (design-write-inode-convoy §4.4 rows 3/13): the attr
+    /// publication merge domain — a striped SYNC mutex serializing every
+    /// publisher's read→merge→insert against `attr_cache`, so no
+    /// publication can lose a concurrent one. A LEAF domain in the P1-9
+    /// order: acquired last, holds no other lock, never held across an
+    /// await. Publications route through [`Self::publish_attr`] — the
+    /// ONE door (`tests/attr_publish_tests.rs` pins the scan).
+    attr_publish_locks: std::sync::Arc<StripeLocks<std::sync::Mutex<()>, 4096>>,
     /// §4.5 (PR K7): snapshots of directories ≤
     /// [`DIR_ENTRY_CACHE_MAX_ENTRIES`], cookie-ascending
     /// `(name, ino, §5.1 cookie, file_type)` so cache-served pages keep
@@ -6305,6 +6367,7 @@ impl Clone for SqueezefsFilesystem {
             lease_locks: self.lease_locks.clone(),
             active_inode_locks: self.active_inode_locks.clone(),
             attr_cache: self.attr_cache.clone(),
+            attr_publish_locks: self.attr_publish_locks.clone(),
             writeback_errors: self.writeback_errors.clone(),
             writeback_error_count: self.writeback_error_count.clone(),
             dir_entry_cache_v3: self.dir_entry_cache_v3.clone(),
@@ -6456,6 +6519,7 @@ impl SqueezefsFilesystem {
             lease_locks: std::sync::Arc::new(StripeLocks::new()),
             active_inode_locks: std::sync::Arc::new(StripeLocks::new()),
             attr_cache,
+            attr_publish_locks: std::sync::Arc::new(StripeLocks::new()),
             dir_entry_cache_v3,
             parent_memo,
             dir_gen: std::sync::Arc::new(scc::HashMap::new()),
@@ -6665,6 +6729,102 @@ impl SqueezefsFilesystem {
     /// forget-eviction observation point).
     pub fn attr_cache_holds(&self, ino: u64) -> bool {
         self.attr_cache.get(&ino).is_some()
+    }
+
+    /// KD-5: the ONE attr publication door. Every publisher's claim
+    /// merges atomically against the cached state under the ino's
+    /// `attr_publish_locks` stripe (a leaf mutex — never held across an
+    /// await, holds no other lock), so a publication can never LOSE a
+    /// concurrent one: the write postlude's former get→overwrite→insert
+    /// RMW dropped racing updates, and refetch-class publishers
+    /// clobbered acked floors with the lagging durable inode
+    /// (`tests/attr_publish_tests.rs`). Returns the merged attr the
+    /// caller replies with; `None` = entry-scoped claims
+    /// (`WriteTimes`/`FloorSize`/`MetaReconcile`) found no entry and
+    /// published nothing.
+    ///
+    /// Merge laws (per [`AttrPublish`] variant): times = signed max for
+    /// ambient claims / explicit-set for setattr; size = explicit-set
+    /// (truncate) else the fresher floor; the postlude's size claim
+    /// publishes only genuine entry-time growth (KD-6 — a size-neutral
+    /// completion never resurrects a stale-high size over a newer
+    /// truncate).
+    pub(crate) fn publish_attr(&self, ino: u64, publish: AttrPublish) -> Option<FileAttr> {
+        let lock = self.attr_publish_locks.get_inode_lock(ino);
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let cached = self.attr_cache.peek_with(&ino, |(a, _)| *a);
+        let merged = match publish {
+            AttrPublish::Fresh(attr) => attr,
+            AttrPublish::Refetch(mut attr) => {
+                if let Some(c) = cached {
+                    if c.size > attr.size {
+                        attr.size = c.size;
+                        attr.blocks = c.blocks;
+                    }
+                    attr.atime = merge_time_max(c.atime, attr.atime);
+                    attr.mtime = merge_time_max(c.mtime, attr.mtime);
+                    attr.ctime = merge_time_max(c.ctime, attr.ctime);
+                }
+                attr
+            }
+            AttrPublish::Setattr {
+                mut attr,
+                explicit_size,
+                explicit_atime,
+                explicit_mtime,
+                explicit_ctime,
+            } => {
+                if let Some(c) = cached {
+                    if !explicit_size && c.size > attr.size {
+                        attr.size = c.size;
+                        attr.blocks = c.blocks;
+                    }
+                    if !explicit_atime {
+                        attr.atime = merge_time_max(c.atime, attr.atime);
+                    }
+                    if !explicit_mtime {
+                        attr.mtime = merge_time_max(c.mtime, attr.mtime);
+                    }
+                    if !explicit_ctime {
+                        attr.ctime = merge_time_max(c.ctime, attr.ctime);
+                    }
+                }
+                attr
+            }
+            AttrPublish::WriteTimes {
+                mtime,
+                ctime,
+                size_claim,
+            } => {
+                let mut attr = cached?;
+                attr.mtime = merge_time_max(attr.mtime, mtime);
+                attr.ctime = merge_time_max(attr.ctime, ctime);
+                if let Some(claim) = size_claim {
+                    if claim > attr.size {
+                        attr.size = claim;
+                        attr.blocks = claim.div_ceil(512);
+                    }
+                }
+                attr
+            }
+            AttrPublish::FloorSize(target) => {
+                let mut attr = cached?;
+                if target > attr.size {
+                    attr.size = target;
+                    attr.blocks = target.div_ceil(512);
+                }
+                attr
+            }
+            AttrPublish::MetaReconcile { size, blocks } => {
+                let mut attr = cached?;
+                attr.size = size;
+                attr.blocks = blocks;
+                attr
+            }
+        };
+        self.attr_cache
+            .insert(ino, (merged, std::time::Instant::now()));
+        Some(merged)
     }
 
     /// D1.d: mark this inode's open generation dirty (a data-mutating op
@@ -13798,15 +13958,9 @@ impl SqueezefsFilesystem {
             }
         }
 
-        // Update cache (never regress a fresher attr size).
-        if let Some((mut attr, _)) = self.attr_cache.get(&ino) {
-            if attr.size < target_size {
-                attr.size = target_size;
-                attr.blocks = target_size.div_ceil(512);
-                self.attr_cache
-                    .insert(ino, (attr, std::time::Instant::now()));
-            }
-        }
+        // Update cache (never regress a fresher attr size) — through the
+        // KD-5 door so the raise cannot lose a racing publication.
+        self.publish_attr(ino, AttrPublish::FloorSize(target_size));
         Ok(())
     }
 
@@ -15733,8 +15887,9 @@ impl SqueezefsFilesystem {
         match backend.getattr(ino).await {
             Ok(inode) => {
                 let attr = self.inode_to_file_attr(&inode);
-                self.attr_cache
-                    .insert(ino, (attr, std::time::Instant::now()));
+                // KD-5 refetch-floor: the durable inode legally lags
+                // acked writes — never clobber the fresher cached floor.
+                self.publish_attr(ino, AttrPublish::Refetch(attr));
                 METRICS
                     .fuse_attr_cache_refreshes
                     .fetch_add(1, Ordering::Relaxed);
@@ -16004,9 +16159,9 @@ impl SqueezefsFilesystem {
                 })?;
                 let inode = backend.getattr(ino).await?;
                 let attr = self.inode_to_file_attr(&inode);
-                self.attr_cache
-                    .insert(ino, (attr, std::time::Instant::now()));
-                attr
+                // KD-5 refetch-floor (the TTL-expiry publisher).
+                self.publish_attr(ino, AttrPublish::Refetch(attr))
+                    .unwrap_or(attr)
             }
         };
 
@@ -16038,8 +16193,16 @@ impl SqueezefsFilesystem {
                     }
                 }
                 if changed {
-                    self.attr_cache
-                        .insert(ino, (attr, std::time::Instant::now()));
+                    // The live metadata_cache is the write path's
+                    // synchronous truth (both directions — it also
+                    // carries truncates); atomic via the KD-5 door.
+                    self.publish_attr(
+                        ino,
+                        AttrPublish::MetaReconcile {
+                            size: attr.size,
+                            blocks: attr.blocks,
+                        },
+                    );
                 }
             }
         }
@@ -17282,8 +17445,12 @@ impl Filesystem for SqueezefsFilesystem {
             prof.mark_backend_done();
             let inode = backend_res.map_err(map_squeezefs_err)?;
             let attr = self.inode_to_file_attr(&inode);
-            self.attr_cache
-                .insert(inode.ino, (attr, std::time::Instant::now()));
+            // KD-5 refetch-floor: reply the MERGED attr — the durable
+            // inode legally lags acked writes (deferred layout persist),
+            // and the pre-door verbatim republish clobbered the floor.
+            let attr = self
+                .publish_attr(inode.ino, AttrPublish::Refetch(attr))
+                .unwrap_or(attr);
             // POSIX-4: this LOOKUP is how the kernel reached the child —
             // if it is a directory, its `..` is now known without a scan.
             if attr.kind == FileType::Directory {
@@ -17415,8 +17582,7 @@ impl Filesystem for SqueezefsFilesystem {
             prof.mark_backend_done();
             let inode = backend_res.map_err(map_squeezefs_err)?;
             let attr = self.inode_to_file_attr(&inode);
-            self.attr_cache
-                .insert(inode.ino, (attr, std::time::Instant::now()));
+            self.publish_attr(inode.ino, AttrPublish::Fresh(attr));
             self.bump_dir_generation(parent);
             self.attr_cache.invalidate(&parent);
             // FUSE-3k: the kernel instantiates the new inode from this reply.
@@ -17463,8 +17629,7 @@ impl Filesystem for SqueezefsFilesystem {
             prof.mark_backend_done();
             let inode = backend_res.map_err(map_squeezefs_err)?;
             let attr = self.inode_to_file_attr(&inode);
-            self.attr_cache
-                .insert(inode.ino, (attr, std::time::Instant::now()));
+            self.publish_attr(inode.ino, AttrPublish::Fresh(attr));
             // Seed layout cache so the first write skips a cold meta
             // backend fetch. Ino-keyed (D1.c): the pre-M4 shape allocated
             // an `inode_{ino}` String per create just to key this insert.
@@ -18708,14 +18873,21 @@ impl Filesystem for SqueezefsFilesystem {
                     .update_metadata_cache_size(file_path, expected_new_size)
                     .await;
             }
-            if let Some((mut attr, _)) = self.attr_cache.get(&ino) {
-                attr.size = attr.size.max(expected_new_size);
-                attr.blocks = attr.size.div_ceil(512);
-                attr.mtime = Timestamp::new(sec, nsec);
-                attr.ctime = Timestamp::new(sec, nsec);
-                self.attr_cache
-                    .insert(ino, (attr, std::time::Instant::now()));
-            }
+            // KD-5/KD-6: the postlude's claim rides the atomic merge
+            // domain — times signed-max (the durable fold's law, so the
+            // served view and a cold refetch agree), and the size claim
+            // publishes ONLY when the entry-time claim was genuine
+            // growth: a size-neutral completion must never resurrect a
+            // stale-high size over a truncate that landed after the
+            // guard dropped (`tests/attr_publish_tests.rs`).
+            self.publish_attr(
+                ino,
+                AttrPublish::WriteTimes {
+                    mtime: Timestamp::new(sec, nsec),
+                    ctime: Timestamp::new(sec, nsec),
+                    size_claim: (expected_new_size > old_size).then_some(expected_new_size),
+                },
+            );
             // Single-authority durable times (generic/003 remount
             // divergence): THE SAME stamp published above is parked as
             // the ino's pending-times refinement — fold-visible reads,
@@ -18784,8 +18956,7 @@ impl Filesystem for SqueezefsFilesystem {
             prof.mark_backend_done();
             let inode = backend_res.map_err(map_squeezefs_err)?;
             let attr = self.inode_to_file_attr(&inode);
-            self.attr_cache
-                .insert(inode.ino, (attr, std::time::Instant::now()));
+            self.publish_attr(inode.ino, AttrPublish::Fresh(attr));
             // POSIX-4: the new directory's parent is known by construction.
             self.memoize_parent(inode.ino, parent);
             self.bump_dir_generation(parent);
@@ -19085,24 +19256,27 @@ impl Filesystem for SqueezefsFilesystem {
             if set_attr.mode.is_some() {
                 self.killpriv_clean.remove_sync(&ino);
             }
-            let mut attr = self.inode_to_file_attr(&inode);
-            // A metadata-only setattr (chmod/chown/utimes — no `size` in the
-            // request) must never change the file size. The durable inode can
-            // lag a deferred (cached-but-not-yet-committed) write, so reconcile
-            // against the freshest cached size and never regress it — otherwise
-            // a chmod right after a write truncates the file to the stale
-            // durable size (0), zeroing reads and causing SIGBUS on mmap
-            // (LTP mmap02).
-            if size_to_set.is_none() {
-                if let Some((cached, _)) = self.attr_cache.get(&ino) {
-                    if cached.size > attr.size {
-                        attr.size = cached.size;
-                        attr.blocks = cached.blocks;
-                    }
-                }
-            }
-            self.attr_cache
-                .insert(ino, (attr, std::time::Instant::now()));
+            let attr = self.inode_to_file_attr(&inode);
+            // KD-5: explicitly requested fields SET verbatim (truncate
+            // may shrink, utimes may move times backward); everything
+            // else merges — a metadata-only setattr (chmod/chown/utimes,
+            // no `size` in the request) must never change the file size:
+            // the durable inode can lag a deferred write, and the
+            // pre-door verbatim republish truncated the cached size to
+            // the stale durable one (0), zeroing reads and SIGBUSing
+            // mmap (LTP mmap02).
+            let attr = self
+                .publish_attr(
+                    ino,
+                    AttrPublish::Setattr {
+                        attr,
+                        explicit_size: size_to_set.is_some(),
+                        explicit_atime: atime_to_set.is_some(),
+                        explicit_mtime: mtime_to_set.is_some(),
+                        explicit_ctime: ctime_to_set.is_some(),
+                    },
+                )
+                .unwrap_or(attr);
             Ok(ReplyAttr {
                 ttl: self.kernel_ttls.attr,
                 attr,
@@ -19184,8 +19358,7 @@ impl Filesystem for SqueezefsFilesystem {
             let mut attr = self.inode_to_file_attr(&inode);
             debug_assert_eq!(attr.size, link_str.len() as u64);
             attr.blocks = 1;
-            self.attr_cache
-                .insert(inode.ino, (attr, std::time::Instant::now()));
+            self.publish_attr(inode.ino, AttrPublish::Fresh(attr));
             self.bump_dir_generation(parent);
             self.attr_cache.invalidate(&parent);
             // FUSE-3k: one kernel lookup reference for the new symlink.
@@ -19260,8 +19433,12 @@ impl Filesystem for SqueezefsFilesystem {
                 .map_err(map_squeezefs_err)?;
             prof.mark_backend_done();
             let attr = self.inode_to_file_attr(&inode);
-            self.attr_cache
-                .insert(ino, (attr, std::time::Instant::now()));
+            // KD-5 refetch-floor: LINK republishes an EXISTING ino — the
+            // reply carries the merged attr, never the lagging durable
+            // size over an acked write's floor.
+            let attr = self
+                .publish_attr(ino, AttrPublish::Refetch(attr))
+                .unwrap_or(attr);
             self.attr_cache.invalidate(&new_parent);
             self.bump_dir_generation(new_parent);
             // FUSE-3k: LINK returns an entry for the EXISTING ino — another

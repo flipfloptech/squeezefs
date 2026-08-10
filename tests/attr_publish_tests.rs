@@ -44,8 +44,9 @@ const BS: u64 = 65536;
 
 /// One suite-wide serializer: the seam cells, the env-selected cache arm
 /// and the global metric counters are process-wide — tests in this file
-/// must not interleave (the PR 1 bench SERIAL precedent).
-static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// must not interleave (the PR 1 bench SERIAL precedent). Async (tokio)
+/// so holding it across the tests' awaits is legal.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// RAII disarm: a panicking test must not leave the seam armed for the
 /// next one.
@@ -210,7 +211,7 @@ async fn wait_stall_entries(base: u64, want: u64) {
 /// refetch-floor merge must keep both at the acked size.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lookup_republish_never_regresses_acked_size() {
-    let _s = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _s = SERIAL.lock().await;
     for (arm, rm) in [("rm", true), ("moka", false)] {
         let h = make(&format!("ap_lookup_{arm}"), rm).await;
         let ino = create(&h, "f").await;
@@ -255,7 +256,7 @@ async fn lookup_republish_never_regresses_acked_size() {
 /// cached value equal what a cold refetch serves.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postlude_stamp_matches_the_durable_fold() {
-    let _s = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _s = SERIAL.lock().await;
     let h = make("ap_fold", true).await;
     let ino = create(&h, "t").await;
     write_at(&h, ino, 0, &vec![1u8; 8192]).await;
@@ -310,7 +311,7 @@ async fn postlude_stamp_matches_the_durable_fold() {
 /// guard-free today, and PR 3's Shared class widens it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_write_postludes_cannot_regress_mtime() {
-    let _s = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _s = SERIAL.lock().await;
     for (arm, rm) in [("rm", true), ("moka", false)] {
         let h = make(&format!("ap_race_{arm}"), rm).await;
         let ino = create(&h, "r").await;
@@ -364,7 +365,7 @@ async fn concurrent_write_postludes_cannot_regress_mtime() {
 /// A size-neutral completion must publish times only.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn truncate_is_never_resurrected_by_a_size_neutral_postlude() {
-    let _s = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _s = SERIAL.lock().await;
     let h = make("ap_trunc", true).await;
     let ino = create(&h, "k").await;
     grow_striped(&h, ino, 4).await;
@@ -427,7 +428,7 @@ async fn truncate_is_never_resurrected_by_a_size_neutral_postlude() {
 /// KD-6's PR 3 protocol re-run extends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fenced_write_retries_rerun_and_publish_coherently() {
-    let _s = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _s = SERIAL.lock().await;
     let h = make("ap_fence", true).await;
     let ino = create(&h, "z").await;
     grow_striped(&h, ino, 4).await;
@@ -467,7 +468,7 @@ async fn fenced_write_retries_rerun_and_publish_coherently() {
 /// `lease_locks` is the (a)-row machinery PR 3's Shared class leans on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn first_touch_writer_storm_mints_one_lease() {
-    let _s = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _s = SERIAL.lock().await;
     let h = make("ap_storm", true).await;
     let ino = create(&h, "s").await;
     grow_striped(&h, ino, 33).await;

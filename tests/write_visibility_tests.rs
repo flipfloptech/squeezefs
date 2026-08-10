@@ -1299,3 +1299,80 @@ async fn whole_file_clone_carries_parked_source_custody() {
     assert_fill(&h, dst, 0, len, 0x5C, &tag).await;
     assert_fill(&h, src, 0, len, 0x5C, &tag).await;
 }
+
+/// generic/795, the DETERMINISTIC face of the recopy storm above (found
+/// by the 2026-08-09 gate under load: 7/20 storm failures overlay-ON,
+/// 0/20 overlay-OFF): the overlay compose serve
+/// (`try_serve_overlay_read`) clamped its reply to BLOCK bounds only —
+/// never to file size — and the read handler consults it BEFORE its
+/// size prelude, so a read reaching past EOF inside an overlay-open
+/// block returned zero padding AS FILE CONTENT (a full-length reply
+/// where the contract demands a short one). Both storm damage labels
+/// collapse to this hole ("SIZE LED DATA" verbatim; "ACKED bytes lost"
+/// is the same over-serve read against a watermark that advanced before
+/// the panic formatted it). Size may never lead data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overlay_compose_read_clamps_to_eof() {
+    let h = make().await;
+    // Pin the overlay ON explicitly (its integration-binary default):
+    // this contract exists to hold ON THE OVERLAY PATH; the storm's
+    // overlay-OFF A/B is what proved the accumulation path clean.
+    squeezefs::device_overlay::set_device_overlay_for_tests(true, true);
+
+    use std::sync::atomic::Ordering as AtomOrd;
+    let installs0 = squeezefs::fuse_client::METRICS
+        .overlay_installs
+        .load(AtomOrd::Relaxed);
+    let ino = create(&h, "ovl_eof").await;
+    // The storm's own growth shape: sequential 8 KiB chunks walking the
+    // file through its layouts — stop mid-block so the file ends with a
+    // partial tail block. 6 blocks + one 8 KiB chunk.
+    const CHUNK: usize = 8192;
+    let tail_block_start = 6 * BS;
+    let eof = tail_block_start + CHUNK as u64;
+    let pattern: Vec<u8> = (0..eof as usize).map(|i| (i % 251) as u8 ^ 0x5A).collect();
+    for off in (0..eof).step_by(CHUNK) {
+        let end = ((off as usize) + CHUNK).min(eof as usize);
+        write_at(&h, ino, off, &pattern[off as usize..end]).await;
+    }
+
+    // A read spanning past EOF must be SHORT — never zero-padded to the
+    // requested length. Assert at the tail (the overlay-open block) and,
+    // for completeness, at every block's start (path-blind contract).
+    for b in 0..=6u64 {
+        let off = b * BS;
+        let want = ((eof - off) as usize).min(16384);
+        let got = read_at(&h, ino, off, 16384).await;
+        assert_eq!(
+            got.len(),
+            want,
+            "block {b}: read [{off}, {off}+16384) against eof {eof} must serve \
+             exactly {want} bytes — a longer reply is zero padding past EOF \
+             served as file content (size led data, generic/795)"
+        );
+        assert_eq!(
+            &got[..],
+            &pattern[off as usize..off as usize + want],
+            "block {b}: served bytes must be the acked pattern"
+        );
+    }
+
+    // Wholly-past-EOF reads inside the tail block are EMPTY.
+    let got = read_at(&h, ino, eof + 4096, 4096).await;
+    assert!(
+        got.is_empty(),
+        "a read wholly past EOF must be empty, got {} bytes",
+        got.len()
+    );
+
+    // Engagement: the tail block must actually have exercised the
+    // overlay (otherwise this pins nothing — the storm's A/B law).
+    assert!(
+        squeezefs::fuse_client::METRICS
+            .overlay_installs
+            .load(AtomOrd::Relaxed)
+            > installs0,
+        "the fixture never engaged the device overlay — the contract \
+         above ran against the accumulation path only"
+    );
+}

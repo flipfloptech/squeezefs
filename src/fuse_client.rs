@@ -10705,6 +10705,7 @@ impl SqueezefsFilesystem {
                 // fix — the error's `token` field is the presentation
                 // that failed, so the progress check is exact). Custody
                 // is NEVER retired on this class.
+                let mut space_settled = false;
                 let esc_res = loop {
                     match self
                         .upload_active_block_bytes(ino, b, staging_copy.clone())
@@ -10718,6 +10719,31 @@ impl SqueezefsFilesystem {
                             if self.fencing_retry_token(ino, presented).is_none() {
                                 break Err(e);
                             }
+                        }
+                        Err(e)
+                            if !space_settled
+                                && matches!(&e, SqueezefsError::Io(io)
+                                    if io.kind() == std::io::ErrorKind::StorageFull) =>
+                        {
+                            // generic/590 residual (fill 1.0): a block's
+                            // OWN earlier upload can still be in flight
+                            // holding its allocation when the fsync
+                            // flush re-uploads the newer generation — a
+                            // transient double-hold the brim rightly
+                            // declines (a fresh block has no mapping to
+                            // rewrite in place) and the reclaim valve
+                            // cannot see (in-flight custody is not
+                            // queued). The fsync bar owes convergence:
+                            // settle the pipeline (the superseded task
+                            // frees its orphan at revalidation), drain
+                            // the reclaim queue, retry ONCE. A second
+                            // StorageFull is genuine pressure — honest.
+                            space_settled = true;
+                            let _ = self
+                                .write_pipeline
+                                .quiesce(std::time::Duration::from_secs(30))
+                                .await;
+                            self.router.backend_router.reclaim_drain().await;
                         }
                         other => break other,
                     }

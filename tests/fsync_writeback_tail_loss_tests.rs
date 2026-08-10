@@ -96,6 +96,14 @@ async fn make(uuid: [u8; 16], alloc_ns: &str) -> H {
     // Pin the W1 patch path OFF (the downscaled BS would make sub-block
     // segments patch-eligible and bypass the machinery under test).
     squeezefs::fuse_client::set_patch_max_bytes(0);
+    // Pin the overlay fresh-write store OFF (default ON since ab74d1ad;
+    // the sibling custody-pinning suites carry the same pin): this suite
+    // tests the PARKED-ActiveBlockBuf flush ladder — an overlay-stored
+    // fresh tail write parks no custody, so the stall-seam interleave
+    // T1/T2 pin never forms. The ladder stays live product code for
+    // every non-fresh shape; the overlay path's own laws live in
+    // tests/device_overlay_tests.rs.
+    squeezefs::device_overlay::set_device_overlay_for_tests(false, false);
     let dlm = DlmClient::new().unwrap();
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())

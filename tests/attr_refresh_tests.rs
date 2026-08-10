@@ -114,6 +114,13 @@ fn refreshes() -> u64 {
     METRICS.fuse_attr_cache_refreshes.load(Ordering::Relaxed)
 }
 
+/// `fuse_attr_cache_refreshes` is process-GLOBAL: the exact-delta
+/// assertions below are only meaningful while no sibling test in this
+/// binary runs its own rename/unlink concurrently. The authoritative
+/// gate runs `--test-threads=1`; this serializer keeps ad-hoc parallel
+/// runs honest too (pre-existing flake, surfaced 2026-08-10).
+static REFRESH_DELTA_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn ts(ns: u64) -> Timestamp {
     Timestamp::new((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as u32)
 }
@@ -157,6 +164,7 @@ async fn mkdir(h: &H, name: &str) -> u64 {
 /// attrs are cached FRESH — present, and byte-agreeing with the backend.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unlink_refreshes_parent_and_child_attr_cache() {
+    let _serial = REFRESH_DELTA_SERIAL.lock().await;
     let h = make().await;
     let dir = mkdir(&h, "d").await;
     let child = create(&h, dir, "victim").await;
@@ -198,6 +206,7 @@ async fn unlink_refreshes_parent_and_child_attr_cache() {
 /// fuse_ops/rename revalidation lands on the cache, not the backend).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rename_refreshes_both_parents() {
+    let _serial = REFRESH_DELTA_SERIAL.lock().await;
     let h = make().await;
     let src_dir = mkdir(&h, "src").await;
     let dst_dir = mkdir(&h, "dst").await;
@@ -234,6 +243,7 @@ async fn rename_refreshes_both_parents() {
 /// Same-dir rename refreshes the one parent once (no double fetch).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn same_dir_rename_refreshes_parent_once() {
+    let _serial = REFRESH_DELTA_SERIAL.lock().await;
     let h = make().await;
     let dir = mkdir(&h, "one").await;
     create(&h, dir, "a").await;
@@ -265,6 +275,7 @@ async fn same_dir_rename_refreshes_parent_once() {
 /// invalidated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_refreshes_parent_attr_cache() {
+    let _serial = REFRESH_DELTA_SERIAL.lock().await;
     let h = make().await;
     let dir = mkdir(&h, "pdir").await;
 

@@ -3212,9 +3212,17 @@ pub fn inode_write_lock_scope(
     range_fully_mapped: Option<bool>,
 ) -> InodeWriteLockScope {
     if file_type == "striped" {
-        // Shared (KD-3, v1 mapped-only) lands with the predicate commit;
-        // until then every striped write keeps today's MetaPrepOnly.
-        let _ = (size_floor, range_end, range_fully_mapped);
+        // §4.1 Shared (KD-3, v1 mapped-only): within the CONSERVATIVE
+        // floor (closed bound — end == floor is within EOF) AND every
+        // touched block mapped in the one cached snapshot. Any probe
+        // miss (`None`) or any hole routes MetaPrepOnly — never a
+        // fetch, never an error (KD-2). Extending shapes publish size
+        // ⇒ MetaPrepOnly.
+        if let (Some(floor), Some(true)) = (size_floor, range_fully_mapped) {
+            if range_end <= floor {
+                return InodeWriteLockScope::Shared;
+            }
+        }
         return InodeWriteLockScope::MetaPrepOnly;
     }
     // The folded staged bypass: a staged write that stays within one

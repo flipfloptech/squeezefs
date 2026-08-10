@@ -510,7 +510,6 @@ async fn fencing_monotone_and_unique_under_concurrent_range_minting() {
     const ROUNDS: u64 = 32;
 
     let tokens = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
-    let read_floor = Arc::new(AtomicU64::new(0));
     let regressions = Arc::new(AtomicU64::new(0));
     let uncovered = Arc::new(AtomicU64::new(0));
 
@@ -519,10 +518,19 @@ async fn fencing_monotone_and_unique_under_concurrent_range_minting() {
         let d = dlm();
         let path = path.clone();
         let tokens = tokens.clone();
-        let read_floor = read_floor.clone();
         let regressions = regressions.clone();
         let uncovered = uncovered.clone();
         set.spawn(async move {
+            // Monotonicity is only OBSERVABLE in one observer's program
+            // order: the retired global fetch-max floor raced the read it
+            // recorded (worker X reads 100, deschedules; Y reads-and-
+            // records 101; X records 100 → a false "regression" of two
+            // correctly-ordered reads — the 2026-08-10 gate flake, 7/10
+            // red pre-fix). Each worker's successive reads of the
+            // monotone generation must be non-decreasing; cross-worker
+            // coverage is the `uncovered` check below (read ≥ the
+            // worker's own LIVE token) plus global mint uniqueness.
+            let mut my_floor = 0u64;
             for r in 0..ROUNDS {
                 let start = (w * ROUNDS + r) * 4096;
                 let lease = d
@@ -538,11 +546,11 @@ async fn fencing_monotone_and_unique_under_concurrent_range_minting() {
                 if read < tok {
                     uncovered.fetch_add(1, Ordering::Relaxed);
                 }
-                // ... and it must never regress.
-                let prev = read_floor.fetch_max(read, Ordering::AcqRel);
-                if read < prev {
+                // ... and it must never regress in this observer's order.
+                if read < my_floor {
                     regressions.fetch_add(1, Ordering::Relaxed);
                 }
+                my_floor = my_floor.max(read);
                 lease.release().await.expect("release");
             }
         });

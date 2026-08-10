@@ -3277,6 +3277,26 @@ fn merge_time_max(cached: Timestamp, incoming: Timestamp) -> Timestamp {
     std::cmp::max(cached, incoming)
 }
 
+/// The §4.2 held-guard mode (design-write-inode-convoy KD-2): the WRITE
+/// handler acquires `active_inode_locks` AS CLASSIFIED — read for the
+/// revalidated Shared class, write for everything else — and both modes
+/// drop at the SAME pre-dispatch point (KD-1). A holder never re-enters
+/// `active_inode_locks` on the same ino (§4.2 must-not).
+enum HeldWriteGuard<'a> {
+    Shared {
+        _g: tokio::sync::RwLockReadGuard<'a, ()>,
+    },
+    Exclusive {
+        _g: tokio::sync::RwLockWriteGuard<'a, ()>,
+    },
+}
+
+impl HeldWriteGuard<'_> {
+    fn is_exclusive(&self) -> bool {
+        matches!(self, HeldWriteGuard::Exclusive { .. })
+    }
+}
+
 /// Decide inode write-lock scope for a FUSE write.
 ///
 /// Already-striped files use block-level locks on the data path, so the full-inode
@@ -9574,6 +9594,53 @@ impl SqueezefsFilesystem {
 
     pub fn get_inode_lock_ref(&self, ino: u64) -> &tokio::sync::RwLock<()> {
         self.active_inode_locks.get_inode_lock(ino)
+    }
+
+    /// KD-2's RAM-only classification probe (design-write-inode-convoy
+    /// §4.2): may this write hold the inode guard in READ mode? Pure
+    /// peeks — `peek_with` on both caches, zero awaits, zero fetches,
+    /// zero policy ops — so it is legal both PRE-lock (the admission
+    /// probe) and UNDER the held read guard (the revalidation; no
+    /// refill may run there). Any miss answers `None`: a miss routes to
+    /// the exclusive acquisition, where today's fetch-capable
+    /// classification runs unchanged (KD-7's lifecycle order rides
+    /// exactly that).
+    ///
+    /// `Some(size)` is the admission SNAPSHOT (KD-6): the metadata-cache
+    /// size the Shared dispatch carries — captured under the guard at
+    /// revalidation, so the excluded mutators (truncate, fallocate,
+    /// EntireOp) cannot move it while held, and the non-excluded ones
+    /// (concurrent extends) only ever leave it stale-LOW, which the
+    /// size-neutral postlude claim absorbs.
+    ///
+    /// The verdict delegates to the ONE classifier
+    /// ([`inode_write_lock_scope`]) over one immutable metadata-cache
+    /// snapshot (KD-3) plus the conservative size floor — never a
+    /// re-implementation of the predicate.
+    fn shared_write_probe(&self, ino: u64, offset: u64, write_end: u64) -> Option<u64> {
+        let block_size = self.router.block_size.load(Ordering::Relaxed);
+        if block_size == 0 {
+            return None;
+        }
+        let floor = self.shared_size_floor(ino)?;
+        let (size, file_type, mapped) = self.router.metadata_cache.peek_with(&ino, |m| {
+            let ft = layout_class(&m.file_type);
+            let mapped = if ft == "striped" {
+                cached_range_fully_mapped(m, offset, write_end, block_size)
+            } else {
+                None
+            };
+            (m.size, ft, mapped)
+        })?;
+        (inode_write_lock_scope(
+            file_type,
+            size.max(write_end),
+            block_size,
+            Some(floor),
+            write_end,
+            mapped,
+        ) == InodeWriteLockScope::Shared)
+            .then_some(size)
     }
 
     /// Daemon-initiated **ATTRS-ONLY** kernel invalidation for `ino`
@@ -18633,9 +18700,58 @@ impl Filesystem for SqueezefsFilesystem {
             // (recorded only on the striped branch below).
             let wp_route = write_phase_start();
             let lock = self.get_inode_lock_ref(ino);
-            let start_wait = std::time::Instant::now();
-            let guard = lock.write().await;
-            METRICS.write_lock_wait.record(start_wait.elapsed());
+            // §4.2 (KD-2): classify-from-cache → acquire-as-classified →
+            // revalidate-under-guard → at most ONE upgrade. The pre-lock
+            // probe is RAM-only (peeks, no awaits); any miss routes to
+            // the exclusive acquisition, where the fetch-capable
+            // classification below runs exactly as before. The
+            // revalidation under the held READ guard re-runs the same
+            // probe: the guard now excludes every exclusive mutator
+            // (truncate/fallocate/EntireOp), so a verdict that survives
+            // it cannot be invalidated while held — and a verdict that
+            // does not survives exactly one upgrade to the exclusive
+            // path (never a loop, never a downgrade).
+            let admit_shared =
+                write_shared_enabled() && self.shared_write_probe(ino, offset, write_end).is_some();
+            // KD-6: the Shared admission record — the revalidated
+            // metadata-cache size snapshot the Shared dispatch carries.
+            let mut shared_snapshot: Option<u64> = None;
+            let guard: HeldWriteGuard = if admit_shared {
+                let start_wait = std::time::Instant::now();
+                let g = lock.read().await;
+                let waited = start_wait.elapsed();
+                METRICS.write_lock_wait.record(waited);
+                METRICS.write_lock_wait_shared.record(waited);
+                match self.shared_write_probe(ino, offset, write_end) {
+                    Some(size) => {
+                        shared_snapshot = Some(size);
+                        HeldWriteGuard::Shared { _g: g }
+                    }
+                    None => {
+                        // The ONE upgrade (KD-2): the world moved between
+                        // the probe and the guard (truncate, eviction,
+                        // layout change) — drop, take exclusive, run
+                        // today's full path.
+                        drop(g);
+                        METRICS
+                            .write_lock_scope_shared_upgrades
+                            .fetch_add(1, Ordering::Relaxed);
+                        let start_wait = std::time::Instant::now();
+                        let g = lock.write().await;
+                        let waited = start_wait.elapsed();
+                        METRICS.write_lock_wait.record(waited);
+                        METRICS.write_lock_wait_exclusive.record(waited);
+                        HeldWriteGuard::Exclusive { _g: g }
+                    }
+                }
+            } else {
+                let start_wait = std::time::Instant::now();
+                let g = lock.write().await;
+                let waited = start_wait.elapsed();
+                METRICS.write_lock_wait.record(waited);
+                METRICS.write_lock_wait_exclusive.record(waited);
+                HeldWriteGuard::Exclusive { _g: g }
+            };
 
             // VL8 item 9 — the syncfs transient-ENOENT vector: with the
             // writeback cache + clean-handle FLUSH elision the kernel can
@@ -18652,7 +18768,13 @@ impl Filesystem for SqueezefsFilesystem {
             // against the backend; a verified-NotFound ino gets a COUNTED
             // discard ack (`writeback_orphan_discards`, the FIND-M11-A
             // remount-law analogue), never a resurrect, never an errno.
-            if !self.is_open(ino)
+            // KD-7: the probe runs on the EXCLUSIVE arm only — the Shared
+            // class is unreachable without live meta+attr cache entries
+            // (the revalidated probe requires both), so this condition is
+            // structurally false under a held Shared guard; skipping it
+            // there keeps the lifecycle order byte-identical to today's.
+            if guard.is_exclusive()
+                && !self.is_open(ino)
                 && self.router.metadata_cache.get(&ino).is_none()
                 && self.attr_cache.get(&ino).is_none()
             {
@@ -18699,7 +18821,13 @@ impl Filesystem for SqueezefsFilesystem {
             // comparison against one of the three known classes, so an
             // unrecognized type maps to a sentinel that compares unequal to
             // all of them — byte-identical behavior, zero allocation.
-            let (old_size, file_type) = if let Some(m) = self.router.metadata_cache.get(&ino) {
+            let (old_size, file_type) = if let Some(size) = shared_snapshot {
+                // KD-2: no fetch/refill/await under a held Shared guard —
+                // the revalidated snapshot IS the resolution (striped by
+                // construction: the classifier's Shared arm admits only
+                // striped shapes).
+                (size, "striped")
+            } else if let Some(m) = self.router.metadata_cache.get(&ino) {
                 (m.size, layout_class(&m.file_type))
             } else if let Some((attr, cached_at)) = self.attr_cache.get(&ino) {
                 if cached_at.elapsed() < Duration::from_secs(1) {
@@ -18743,42 +18871,58 @@ impl Filesystem for SqueezefsFilesystem {
                 fits_inline || fits_staged || file_type == "inline" || file_type == "staged";
             // The ONE scope classifier (design-write-inode-convoy §4.1;
             // the former staged bypass is folded inside). Probes are
-            // RAM-cache-only; misses route to write-guard classes.
-            // NOTE (KD-2/KD-8): in PR 1 this is counted at today's
-            // post-guard classification site; PR 3 moves the probe
-            // pre-lock as part of the acquire protocol and meters the
-            // FINAL scope separately after held-guard revalidation.
-            let size_floor = self.shared_size_floor(ino);
-            let range_mapped = if is_striped {
-                self.router
-                    .metadata_cache
-                    .get(&ino)
-                    .and_then(|m| cached_range_fully_mapped(&m, offset, write_end, block_size))
+            // RAM-cache-only; misses route to write-guard classes. On the
+            // revalidated Shared arm the verdict is already Shared by
+            // construction (`shared_write_probe` delegates to this same
+            // classifier); on the exclusive arm it classifies exactly as
+            // before.
+            let candidate = if shared_snapshot.is_some() {
+                InodeWriteLockScope::Shared
             } else {
-                None
+                let size_floor = self.shared_size_floor(ino);
+                let range_mapped = if is_striped {
+                    self.router
+                        .metadata_cache
+                        .get(&ino)
+                        .and_then(|m| cached_range_fully_mapped(&m, offset, write_end, block_size))
+                } else {
+                    None
+                };
+                inode_write_lock_scope(
+                    file_type,
+                    expected_new_size,
+                    block_size,
+                    size_floor,
+                    write_end,
+                    range_mapped,
+                )
             };
-            let candidate = inode_write_lock_scope(
-                file_type,
-                expected_new_size,
-                block_size,
-                size_floor,
-                write_end,
-                range_mapped,
-            );
             match candidate {
                 InodeWriteLockScope::Shared => &METRICS.write_lock_candidate_shared,
                 InodeWriteLockScope::MetaPrepOnly => &METRICS.write_lock_candidate_metaprep,
                 InodeWriteLockScope::EntireOp => &METRICS.write_lock_candidate_entire,
             }
             .fetch_add(1, Ordering::Relaxed);
-            // PR 1 (R-m5): candidates are PREVIEW ONLY — behavior maps
-            // Shared onto MetaPrepOnly (the identical drop-before-I/O
-            // hold today's striped writes get) until PR 3's acquire
-            // protocol lands.
+            // KD-8: the FINAL scope is the guard mode actually HELD —
+            // the Shared class dispatches on the read guard only when the
+            // held-guard revalidation admitted it (`shared_snapshot`); a
+            // Shared-shaped candidate reached on the EXCLUSIVE arm (probe
+            // miss, posture off, upgrade, or a shape that turned Shared
+            // under the exclusive guard's own fetch) executes the
+            // drop-before-I/O exclusive class exactly as before.
             let lock_scope = match candidate {
+                InodeWriteLockScope::Shared if shared_snapshot.is_some() => {
+                    InodeWriteLockScope::Shared
+                }
                 InodeWriteLockScope::Shared => InodeWriteLockScope::MetaPrepOnly,
                 other => other,
             };
+            match lock_scope {
+                InodeWriteLockScope::Shared => &METRICS.write_lock_scope_shared,
+                InodeWriteLockScope::MetaPrepOnly => &METRICS.write_lock_scope_metaprep,
+                InodeWriteLockScope::EntireOp => &METRICS.write_lock_scope_entire,
+            }
+            .fetch_add(1, Ordering::Relaxed);
 
             // Kernel clock domain (fstests generic/423) — an attr-cache
             // time publish is a daemon-authored inode stamp like any
@@ -18795,6 +18939,11 @@ impl Filesystem for SqueezefsFilesystem {
             // and legitimately composes ZEROS for the not-yet-landed
             // range — acked-looking zeros at stable offsets, the 795
             // cmp-mismatch signature.)
+
+            // KD-6: the size the DATA path and the postlude claim
+            // against. Entry-time by default; a fencing retry re-resolves
+            // it (the fence is the evidence the world moved).
+            let mut effective_old_size = old_size;
 
             if use_router_write {
                 // §5.4 lease-severance boundary — the single sever route:
@@ -18816,7 +18965,11 @@ impl Filesystem for SqueezefsFilesystem {
                 })?;
                 let data_bytes = sever_payload(&slot_bytes);
                 // FIND-RW5-A face 3: one fresh-lease retry on a transient
-                // adjacent-bump fence (see the striped arm below).
+                // adjacent-bump fence (see the striped arm below). Shared
+                // never reaches this arm (`use_router_write` is
+                // structurally false for striped shapes), so the held
+                // guard here is always exclusive: EntireOp holds across
+                // the commit, MetaPrepOnly drops (KD-1's point).
                 let held_guard = if lock_scope == InodeWriteLockScope::MetaPrepOnly {
                     drop(guard);
                     None
@@ -18842,6 +18995,13 @@ impl Filesystem for SqueezefsFilesystem {
                                 .acquire_write_lease(ino)
                                 .await
                                 .map_err(map_squeezefs_err)?;
+                            // KD-6: never reuse the entry-time snapshot
+                            // across a fence — the fence IS the evidence
+                            // the world moved. Re-resolve the size the
+                            // postlude will claim against.
+                            if let Ok(m) = self.router.fetch_metadata(file_path).await {
+                                effective_old_size = m.size;
+                            }
                         }
                         Err(e) => return Err(map_squeezefs_err(e)),
                     }
@@ -18861,9 +19021,10 @@ impl Filesystem for SqueezefsFilesystem {
                 // its `file_type` guard could never hold here) and the
                 // subsumed `is_aligned` direct leg.
                 //
-                // Striped: drop inode write lock before long active-block
-                // I/O (P1-8); per-block BLOCK_FLUSH_LOCKS serialize the
-                // data path.
+                // Striped: drop the inode guard — read (Shared) or write
+                // (MetaPrepOnly), the SAME pre-dispatch point (KD-1) —
+                // before long active-block I/O (P1-8); per-block
+                // BLOCK_FLUSH_LOCKS serialize the data path.
                 drop(guard);
                 write_phase_record(WritePhase::RouteClassify, wp_route);
                 // FIND-RW5-A face 3: a transient adjacent-bump fence
@@ -18874,7 +19035,7 @@ impl Filesystem for SqueezefsFilesystem {
                 let mut attempt = 0u32;
                 loop {
                     match self
-                        .write_file_staged(ino, offset, payload.clone(), old_size, token)
+                        .write_file_staged(ino, offset, payload.clone(), effective_old_size, token)
                         .await
                     {
                         Ok(()) => break,
@@ -18888,6 +19049,13 @@ impl Filesystem for SqueezefsFilesystem {
                                 .acquire_write_lease(ino)
                                 .await
                                 .map_err(map_squeezefs_err)?;
+                            // KD-6: the retry re-runs the protocol against
+                            // the CURRENT world, never the entry-time
+                            // snapshot (no guard is held here — the
+                            // fetch-capable resolution is legal).
+                            if let Ok(m) = self.router.fetch_metadata(file_path).await {
+                                effective_old_size = m.size;
+                            }
                         }
                         Err(e) => return Err(map_squeezefs_err(e)),
                     }
@@ -18914,24 +19082,28 @@ impl Filesystem for SqueezefsFilesystem {
             // reason the attr publish below does — the read path clamps
             // `read_len` to this entry's size, and a size the overlays
             // cannot back yet composes zeros for the gap.
-            if !use_router_write && expected_new_size > old_size {
+            // The publish pair rides the FINAL attempt's resolution
+            // (KD-6): a fenced retry re-derived `effective_old_size`, so
+            // a claim the current world does not justify never publishes.
+            let publish_expected = std::cmp::max(effective_old_size, write_end);
+            if !use_router_write && publish_expected > effective_old_size {
                 self.router
-                    .update_metadata_cache_size(file_path, expected_new_size)
+                    .update_metadata_cache_size(file_path, publish_expected)
                     .await;
             }
             // KD-5/KD-6: the postlude's claim rides the atomic merge
             // domain — times signed-max (the durable fold's law, so the
             // served view and a cold refetch agree), and the size claim
-            // publishes ONLY when the entry-time claim was genuine
-            // growth: a size-neutral completion must never resurrect a
-            // stale-high size over a truncate that landed after the
-            // guard dropped (`tests/attr_publish_tests.rs`).
+            // publishes ONLY when the claim was genuine growth: a
+            // size-neutral completion must never resurrect a stale-high
+            // size over a truncate that landed after the guard dropped
+            // (`tests/attr_publish_tests.rs`).
             self.publish_attr(
                 ino,
                 AttrPublish::WriteTimes {
                     mtime: Timestamp::new(sec, nsec),
                     ctime: Timestamp::new(sec, nsec),
-                    size_claim: (expected_new_size > old_size).then_some(expected_new_size),
+                    size_claim: (publish_expected > effective_old_size).then_some(publish_expected),
                 },
             );
             // Single-authority durable times (generic/003 remount

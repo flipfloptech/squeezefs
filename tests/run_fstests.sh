@@ -34,9 +34,22 @@ SCRATCH_DEV="${SCRATCH_DEV:-/dev/shm/squeezefs_fstests_scratch_meta}"
 
 # Sizes: meta >= 72 MiB + 20000 * 32 KiB (~697 MiB) reaches the inode
 # allocator cap; below that "Inode table full" aborts long runs. Backing
-# files are sparse on tmpfs.
-META_SIZE="${SQUEEZEFS_FSTESTS_META_SIZE:-1G}"
-DATA_SIZE="${SQUEEZEFS_FSTESTS_DATA_SIZE:-8G}"
+# files are sparse on tmpfs, so the sizes below cost RAM only for bytes a
+# test actually writes (the mkfs wrapper recreates them per re-format, so
+# usage never accumulates across tests).
+#
+# Size-gate law (user directive 2026-08-10 — no size-based skips on a dev
+# box): xfstests' _require_scratch_size reads the SCRATCH_DEV file — for
+# us the META file — so META_SIZE is what clears the gate, while
+# DATA_SIZE is what actually holds a test's bytes. The largest -g auto
+# gate today is 16 GiB (generic/781, generic/793): META 17G clears it
+# with margin, DATA 24G holds a 16 GiB write plus block rounding. With
+# these defaults the residual [not run] population is capability gates
+# only (block-device/zoned/reflink/dax) — never device size. Bigger
+# needs ride the existing TEST_DEV/SCRATCH_DEV env overrides (flat files
+# on disk).
+META_SIZE="${SQUEEZEFS_FSTESTS_META_SIZE:-17G}"
+DATA_SIZE="${SQUEEZEFS_FSTESTS_DATA_SIZE:-24G}"
 
 echo "=== Squeezefs fstests Integration ==="
 echo "Repo: $REPO_DIR"

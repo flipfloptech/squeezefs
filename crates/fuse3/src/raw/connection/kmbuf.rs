@@ -387,6 +387,45 @@ const PROBE_RING_ENTRIES: u32 = 8;
 const PROBE_BGID: u16 = 7;
 const PROBE_ARG_SPAN: usize = 256;
 
+/// `IORING_REGISTER_KMBUF_RING` ENOMEM retry budget: the registration
+/// asks the kernel for `entries × buf_size` of kernel-managed buffers in
+/// one call, and under battery-grade page-cache churn that allocation
+/// can fail TRANSIENTLY while `available` memory is plentiful (the
+/// 2026-08-10 gate capture — `tests/` battery, 32 × 1 MiB, ENOMEM once,
+/// clean on every standalone rerun). Bounded so a genuinely exhausted
+/// box still refuses loudly within ~1 s.
+const KMBUF_REGISTER_ENOMEM_RETRIES: usize = 5;
+
+/// Bounded ENOMEM retry around the kmbuf ring registration — the SAME
+/// registration each attempt (same geometry, same opcode: never a
+/// downgrade, per the no-silent-downgrade law), loud per attempt, loud
+/// refusal on exhaustion. Every non-ENOMEM errno refuses immediately: a
+/// capability or argument verdict does not improve with time. Pure over
+/// the injected attempt (`test_register_retry_policy_bounds_and_classes`).
+fn register_with_retry(mut attempt: impl FnMut() -> io::Result<()>) -> io::Result<()> {
+    let mut backoff_ms = 50u64;
+    for tried in 0..=KMBUF_REGISTER_ENOMEM_RETRIES {
+        match attempt() {
+            Ok(()) => return Ok(()),
+            Err(e)
+                if e.raw_os_error() == Some(libc::ENOMEM)
+                    && tried < KMBUF_REGISTER_ENOMEM_RETRIES =>
+            {
+                warn!(
+                    "IORING_REGISTER_KMBUF_RING transient ENOMEM (attempt {}/{}) — \
+                     retrying the same registration in {backoff_ms} ms",
+                    tried + 1,
+                    KMBUF_REGISTER_ENOMEM_RETRIES + 1,
+                );
+                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                backoff_ms = (backoff_ms * 2).min(400);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("the loop returns on Ok, terminal Err, or the last ENOMEM")
+}
+
 /// The pure ladder decision table (unit-tested with injected outcomes):
 /// first Confirmed rung wins and short-circuits; every other outcome
 /// falls through; all rungs exhausted ⇒ Absent.
@@ -1123,18 +1162,29 @@ impl KmbufQueue {
             ring_entries,
             FUSE_URING_RINGBUF_GROUP,
         );
-        // SAFETY: fully-initialized 40-byte argument; live ring fd.
-        let ret = unsafe {
-            libc::syscall(
-                libc::SYS_io_uring_register,
-                ring.as_raw_fd(),
-                ops.register,
-                &reg as *const IoUringBufReg as *const libc::c_void,
-                1u32,
-            )
-        };
-        if ret != 0 {
-            let e = io::Error::last_os_error();
+        // The registration allocates `entries × buf_size` of
+        // kernel-managed memory in one call — transiently refusable
+        // under page-cache churn even with ample `available` RAM, so
+        // ENOMEM gets the bounded same-registration retry (never a
+        // downgrade); every other errno is a verdict and refuses
+        // immediately.
+        if let Err(e) = register_with_retry(|| {
+            // SAFETY: fully-initialized 40-byte argument; live ring fd.
+            let ret = unsafe {
+                libc::syscall(
+                    libc::SYS_io_uring_register,
+                    ring.as_raw_fd(),
+                    ops.register,
+                    &reg as *const IoUringBufReg as *const libc::c_void,
+                    1u32,
+                )
+            };
+            if ret == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }) {
             // SAFETY: error-path unmap of our own mapping.
             unsafe { libc::munmap(headers_base as *mut libc::c_void, headers_span) };
             return Err(io::Error::other(format!(
@@ -1810,6 +1860,58 @@ mod tests {
         // reader's struct width (io_uring_bpf = 72 B) fails the build.
         const {
             assert!(PROBE_ARG_SPAN >= 128);
+        }
+    }
+
+    /// The register-retry policy over injected outcomes (the 2026-08-10
+    /// gate capture: a 30-min battery's page-cache churn left the kernel
+    /// unable to serve 32 × 1 MiB kmbuf buffers ONCE — `available` RAM is
+    /// not contiguous kernel memory — and the mount died permanently on a
+    /// transient). ENOMEM retries the SAME registration a bounded number
+    /// of times (same geometry, same opcode — never a downgrade, loud per
+    /// attempt, loud refusal on exhaustion); every other errno refuses
+    /// immediately (a capability/argument verdict does not improve with
+    /// time).
+    #[test]
+    fn test_register_retry_policy_bounds_and_classes() {
+        // Transient: fails n times then succeeds within the budget.
+        for succeed_at in [1usize, 2, KMBUF_REGISTER_ENOMEM_RETRIES] {
+            let mut calls = 0usize;
+            let r = register_with_retry(|| {
+                calls += 1;
+                if calls > succeed_at {
+                    Ok(())
+                } else {
+                    Err(io::Error::from_raw_os_error(libc::ENOMEM))
+                }
+            });
+            assert!(r.is_ok(), "transient ENOMEM ×{succeed_at} must recover");
+            assert_eq!(calls, succeed_at + 1);
+        }
+        // Exhaustion: budget + 1 attempts total, then the loud refusal.
+        let mut calls = 0usize;
+        let r = register_with_retry(|| {
+            calls += 1;
+            Err(io::Error::from_raw_os_error(libc::ENOMEM))
+        });
+        assert_eq!(
+            r.expect_err("exhausted ENOMEM must refuse").raw_os_error(),
+            Some(libc::ENOMEM)
+        );
+        assert_eq!(
+            calls,
+            KMBUF_REGISTER_ENOMEM_RETRIES + 1,
+            "the retry budget is bounded"
+        );
+        // Non-transient errnos refuse on the FIRST attempt.
+        for errno in [libc::EINVAL, libc::EPERM, libc::ENOENT] {
+            let mut calls = 0usize;
+            let r = register_with_retry(|| {
+                calls += 1;
+                Err(io::Error::from_raw_os_error(errno))
+            });
+            assert_eq!(r.expect_err("must refuse").raw_os_error(), Some(errno));
+            assert_eq!(calls, 1, "errno {errno} is a verdict, not a transient");
         }
     }
 }

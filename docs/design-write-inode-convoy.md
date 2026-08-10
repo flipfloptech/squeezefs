@@ -1,249 +1,287 @@
 # Design: Shared-Mode Write Admission — the Write-Inode-Convoy Campaign
 
-Status: **DESIGN — awaiting review** (2026-08-10)
-Branch (on approval): `perf/write-inode-convoy`
-Evidence basis: the 2026-08-10 squeeze-test rand-4k diagnosis rows (§2) — captured
-against dev tip `e4f756a9` on the production-shaped fabric rig (memp-s3ds-aqs-37,
-32 CPUs, 5×2 NVMe volume set, `--interception` mount).
+| | |
+|---|---|
+| **Title** | Shared-mode write admission (the lock-scope half of one-path) |
+| **Date** | 2026-08-10 (rev 2 — both review rounds folded) |
+| **Status** | DESIGN — review rounds 1+2 addressed; awaiting sign-off |
+| **Related** | `docs/design-one-path.md` (parent program — this is the lock-scope half of "one admission, cheapest legal"; NOT a new vehicle), `docs/design-random-small-writes.md` (W1/W2 machinery this admits concurrently), `.benchmarks/2026-08-10-write-inode-convoy-diagnosis.md` (the evidence note — R-M7) |
+| **Inviolable** | One admission path (no benchmark fork); any classification doubt routes EXCLUSIVE; lease/DLM layer untouched; block-plane locks untouched; a Shared holder never re-enters `active_inode_locks` on the same ino |
+| **Branch (on approval)** | `perf/write-inode-convoy` |
 
 ---
 
 ## 1. Charter
 
-Random small **writes** on this filesystem are ceilinged by the per-inode
-`active_inode_locks` **write** guard, not by the device, the shim, the meta
-plane, or the W1 patch machinery. Remove the ceiling by admitting the
-**non-mutating-layout write class** under the inode **read** (shared) guard —
-a third class in the existing one-path lock-scope classifier — so that
-same-inode writes serialize only where bytes actually conflict (the block
-plane), the way reads already do.
+Random small **writes** are ceilinged by the per-inode `active_inode_locks`
+**write** guard — a tokio-wake convoy pricing ≈ 1.12 ms/op at 32×32 depth
+while the data devices idle at qd ≈ 1.5 (evidence: the diagnosis note,
+measured on dev `e4f756a9`, production fabric rig, engagement exact). Remove
+the ceiling by admitting the **fully-mapped within-EOF striped overwrite
+class** under the inode **read** (shared) guard, serialized only where bytes
+conflict (the block plane) — the `xfs_file_dio_write` /
+`IOMAP_DIO_OVERWRITE_ONLY` shape (shared `i_rwsem` for overwrite-only DIO;
+`-EAGAIN` → one exclusive retry on anything that would allocate).
 
 **Non-goals (charter rails):**
 
-* **No benchmark fork.** The change extends `inode_write_lock_scope()` — the
-  classifier every write already passes through (`EntireOp` vs `MetaPrepOnly`
-  today). One admission, always the cheapest *legal* guard
-  (`docs/design-one-path.md`). Any shape in doubt routes to the exclusive
-  class; the decision ledger (§7) makes classifier rot visible, exactly the
-  `patch_ineligible_*` pattern.
-* **No DLM/lease changes.** The cross-writer custody layer already implements
-  the Lustre-style hold-until-conflict model this campaign was compared
-  against (§3.1) — measured at **32 lease acquisitions for 23.5M writes** on
-  the diagnosis row. It is not the bottleneck and is not touched.
-* **No block-lock changes.** `BLOCK_FLUSH_LOCKS` + the W1 §5.1 fence protocol
-  are precisely what make shared-mode admission safe; they stay verbatim.
+* **No benchmark fork.** One classifier every write passes through; the
+  decision ledger (§7) makes rot visible. The admitted shape is the design
+  target's dominant write (D1 mixed AI-training workloads; the scoreboard's
+  rand-4k row; checkpoint/DB in-place update traffic; mmap writeback — audit
+  row 16).
+* **No DLM/lease changes.** The custody layer already runs
+  hold-until-conflict (32 lease acquisitions / 23.5M writes on the diagnosis
+  row). Not the bottleneck; not touched.
+* **No block-lock changes.** `BLOCK_FLUSH_LOCKS` + the W1 §5.1 fence are the
+  safety basis and stay verbatim.
+* **v1 is overwrite-only.** Hole-fills / overlay-B2 stores / any map insert
+  are a *different, larger* campaign (KD-3). Nothing here relaxes them.
 
----
+## 2. Key decisions
 
-## 2. Evidence: the four diagnosis rows (2026-08-10, squeeze-test)
-
-Workload: rand-4k overwrite of 32 preconditioned 2 GiB files, 32 jobs ×
-iodepth 32 (elbencho 3.1-11 dynamic, libaio), 60 s sustained, `--direct`.
-Engagement verified per charter rule 4 on every row (`ipc_ops_write` /
-`patch_writes` deltas account for the row's ops; write amplification 1.027).
-
-| Row | IOPS | avg lat | Device qd (10 data vols) | Note |
-|---|---|---|---|---|
-| il (shim) 32×32 | 205k | 5.0 ms | ~1.0 each | 99.96 % W1 patch engagement |
-| kernel 32×32 | 391k | 2.6 ms | ~1.5 each | same engagement; **il < kernel = write_matrix parity violation** |
-| il, `SQUEEZEFS_IL_SESSIONS=16` | 206k | 5.0 ms | ~1.0 | sessions lever = no-op |
-| kernel, 8 files | 266k | 3.8 ms | — | sub-linear in file count |
-
-Phase decomposition of the kernel row (23.5M ops, always-on histograms):
-
-| Term | mean | verdict |
+| # | Decision | Rationale |
 |---|---|---|
-| **`write_lock_wait`** (per-inode write guard) | **≈ 1,120 µs** | **the ceiling** |
-| `write_transport_phase_ns.queue_wait` | 60 µs | healthy |
-| `block_lock_wait` | 24 µs | healthy |
-| `lease_lock_wait` | n = **32** total | lease layer already hold-until-conflict |
-| dispatch / reply commit | ~1 µs | healthy |
+| **KD-1** | **Hold duration: drop-before-data-I/O** (MetaPrepOnly's law, shared mode). The Shared guard covers classification-revalidation, lease, and the size/type/map snapshot — never the DMA window. | Hold-across-I/O would block truncate/fallocate for full device windows (a new convoy) and make any future nested inode-lock acquisition a self-deadlock. Truncate-vs-in-flight-I/O is today's MetaPrepOnly world, already handled by `drop_active_block_overlays_beyond` + `truncate_layout` + block locks (review R-B2 + R2 correction). |
+| **KD-2** | **Acquire protocol: classify-from-cache → acquire-as-classified → revalidate-under-guard → at most ONE upgrade** (§4.2). Pre-lock probe is RAM-cache-only; cache miss ⇒ exclusive; no fetch/refill/await while classifying or holding Shared. | Today's order (exclusive first at `fuse_client.rs:18243`, classify at `:18350`) cannot express Shared. The XFS precedent retries exclusive on `-EAGAIN`; ours upgrades once, never loops. Tokio `RwLock` is write-preferring/FIFO, so a waiting truncate excludes newly-arriving Shared writers — no starvation, no upgrade livelock (R-B1). |
+| **KD-3** | **v1 predicate is mapped-only**: the written range must be fully mapped in ONE immutable cached `block_map` snapshot. Resident rehydrated indirect maps are eligible (the refill decodes into `CachedMetadata.block_map`; the 2 GiB diagnosis file ≈ 512 mappings stays in class). Miss, `block_map_id`-without-map anomaly, or any hole ⇒ exclusive. | A within-EOF hole-fill allocates and `merge_block_mappings` under `INODE_META_LOCKS` — an inode-plane mutation; overlay B2 is *defined* as the fresh/hole store. XFS overwrite-only refuses holes for the same reason (R-B3, R2-M1). |
+| **KD-4** | **Predicate 6 (stream adjacency) is adjudicated by a gate row, not redesigned.** PR 3 adds a seq-4k streaming-overwrite gate row; if write-through economy regresses beyond band, the contingency is a small per-ino recent-ends window for the adjacency detector — a follow-up, not a blocker. | Shared admission makes qd>1 sequential writers miss `offset == prev_end` and take W1 — correctness-safe, economy-visible (R-M3). Measure, don't speculate. |
+| **KD-5** | **Attr publication becomes one atomic merge domain**: `attr_publish_locks` (4096-way striped sync mutex, the `INODE_META_LOCKS` sizing pattern) wraps get→merge→insert for **every** attr publisher (WRITE postlude, `refresh_attr_cache`, setattr, expiry-reinsert). Merge law: times = signed max per field (the `park_times_refinement` pattern, `kv/backend.rs:3053`); size = explicit-set (setattr/truncate) else max. Policy/listener work runs OUTSIDE the entry guard (the 2026-08-10 `read_mostly_cache` deadlock law). Works identically over both cache backings. | Today's `:18485` get→overwrite-mtime→insert loses updates under concurrent Shared writers; `ReadMostlyCache` exposes only replacement `insert`, and a WRITE-only fix still races refresh/setattr (R-M4, R2-B3). Lands in PR 2 — behavior-preserving under exclusive, load-bearing before PR 3. |
+| **KD-6** | **The admission record survives the drop** (R2-B2): dispatch carries `{scope_final, size_floor, map_snapshot: Arc, fencing_token}`. A `FencingTokenExpired` retry re-runs the FULL protocol (classify → acquire → revalidate), never reuses the entry-time snapshot. The Shared postlude publishes **times only** — a size-neutral completion must not resurrect a stale-high size over a newer truncate. Exclusive-class postludes unchanged. | Truncate/punch can land between the Shared drop and a retry/postlude; the entry-time `old_size` republish is the dangerous direction. |
+| **KD-7** | **The lifecycle boundary stays exclusive-only** (R2-B1): the verified-NotFound orphan probe, and every cold/no-open write, route exclusive *by construction* — Shared requires cached meta+attr (KD-2's miss⇒exclusive), and the orphan probe fires exactly when no handle/meta/attr is live. Reclaim purging caches under its own protocol (`open_inodes` + `reclaim_inflight` + `INODE_META_LOCKS`) forces the revalidation miss → upgrade → the exclusive path runs the probe before any fetch, exactly as today. Reclaim-wins reply stays the counted orphan-discard ack. | Shared must never fetch or fabricate metadata ahead of the lifecycle probe; making the class unreachable without cached state is the proof, and revalidation is the fence. |
+| **KD-8** | **Preview and final scope are separate ledgers** (R2-B4): PR 1 ships `write_lock_candidate_{shared,metaprep,entire}` while still taking today's exclusive guard; PR 3 ships final `write_lock_scope_{shared,metaprep,entire}` + `write_lock_scope_shared_upgrades`, with closure against WRITE ops. `write_lock_wait` extends to per-mode histograms (aggregate kept) so Shared's wait cannot vanish from the convicting instrument by moving to an unmetered `read().await`. | The engagement gate must meter the mode actually HELD after revalidation, and the ceiling instrument must survive the fix. |
 
-The mechanism: with ~32 writers queued per inode, every guard **handoff pays a
-tokio wake** (~15–30 µs); the guard's *held* time is only ~µs (the
-`MetaPrepOnly` scope drops it before device I/O per P1-8), but the serialized
-wake chain prices ~1.1 ms of queueing per op. The devices — capable of
-38 GB/s on the same rig — idle at qd ≈ 1.5 while ~1,000 ops wait upstream.
-Offered depth is irrelevant to a convoy: this is why the row's IOPS is
-`files ÷ (wake chain)` and not `depth ÷ (device service)`.
+## 3. Evidence
 
-Little's-law closure: kernel 391k × 2.6 ms ≈ 1,024 = the offered depth
-(nothing lost in the client); 391k ÷ 32 inodes ≈ 12.2k/inode ≈ 1 ÷ 82 µs —
-one op per inode per wake+service interval. The model predicts the measured
-number to within noise on all four rows.
-
-## 3. The three lock layers (and where the Lustre analogy lands)
-
-| Layer | Today | Lustre analog | This campaign |
-|---|---|---|---|
-| **3.1 Lease/DLM** (cross-writer custody) | Cached per-ino lease, held across ops, fencing tokens minted from it; S9 custody leases extend this cross-mount (renewal + pull revocation) | LDLM lock caching: hold until conflict callback / LRU age-out | **Untouched** — already the model; n=32 proves it |
-| **3.2 Per-inode RwLock** (process-local op ordering) | Every WRITE takes **write** mode; reads take read mode | local `i_rwsem` — and XFS's shared-mode DIO writes are the exact precedent | **The change**: eligible writes take **read** mode |
-| **3.3 Block/extent locks** (`BLOCK_FLUSH_LOCKS`, 3.5 `INODE_META_LOCKS`) | Serialize same-block mutation; W1 §5.1 fence closes clone/patch races | LDLM extent locks | **Untouched** — the safety basis for §3.2's change |
-
-The user-raised "acquire and hold until someone else wants it or it ages out"
-is layer 3.1's law and it is already in force. Layer 3.2's contention is
-*self*-contention among sibling ops of one client — there is no other client
-to yield to; the correct classical resolution is compatible-mode concurrency
-(shared admission), not longer holds.
+`.benchmarks/2026-08-10-write-inode-convoy-diagnosis.md` — the four
+engagement-verified rows, phase decomposition, and the Little's-law model.
+Summary: kern 391k / il 205k IOPS at 32×32; `write_lock_wait` ≈ 1,120 µs
+dominant; devices qd ≈ 1–1.5; lease layer n=32; sessions lever no-op; W1
+engagement 99.96 %; write amp ≈ 1.03. Note: 38/39 GB/s are the seq-1m
+bandwidth class and are quoted only as the non-regression gate, never as a
+4k ceiling claim. Held time "~µs" is cache-hit meta-prep; the 82 µs
+per-inode interval is wake + prep — which is why device qd stays ≈ 1.5.
 
 ## 4. Design
 
-### 4.1 The classifier (one path, three classes)
+### 4.1 The classifier
 
-`inode_write_lock_scope()` gains a third variant:
+`inode_write_lock_scope` is rebuilt so it can actually decide (R-M2): it
+takes `(file_type, size_floor, offset, len, map_probe)` and absorbs the
+staged bypass at `:18350` (`staged && expected_new_size <= block_size ⇒
+MetaPrepOnly`) — one classifier, no side channel. It returns a **candidate**;
+the **final** scope exists only after §4.2's revalidation (KD-8 naming).
 
 ```rust
 pub enum InodeWriteLockScope {
-    /// Inline / layout-transition / RMW shapes: write guard for the whole op.
+    /// Inline / staged / layout-transition / RMW: write guard, whole op.
     EntireOp,
-    /// Striped shapes that publish size/attrs: write guard, dropped before I/O.
+    /// Striped shapes that publish size or map: write guard, dropped
+    /// before data I/O.
     MetaPrepOnly,
-    /// NEW — the non-mutating-layout write class: read (shared) guard.
+    /// Fully-mapped within-EOF striped overwrite: READ guard, dropped
+    /// before data I/O (KD-1) — the same drop point as MetaPrepOnly.
     Shared,
 }
 ```
 
-**`Shared` predicate (every clause must hold; any failure falls to the next
-class down — never an error, never a second admission):**
+**Range validation precedes classification** (R2-M2): zero length returns
+success with no lease/dirty/time side effects; `offset.checked_add(len)`
+overflow or `end > max_file_size()` is EFBIG before any classification;
+touched blocks derive from `[offset, end)` (no `len - 1` underflow).
+Contract tests pin zero, `u64::MAX`, the last representable byte, and an
+end exactly on a block boundary.
 
-1. `file_type == "striped"` at the cached-layout probe (the same authority the
-   W1 request-shape half reads).
-2. The write is **within EOF**: `offset + len <= live size floor` — the
-   *conservative* size read (`min` of attr/meta caches; a stale-low size can
-   only route to the exclusive class, never admit wrongly). Extending writes
-   mutate size ⇒ `MetaPrepOnly`.
-3. No layout transition possible: the write cannot cross the staged→striped
-   or inline threshold by construction of (1) + (2).
-4. The ino has no in-flight `EntireOp`-class holder — guaranteed by the
-   RwLock itself (shared acquisition waits out exclusive holders; no new
-   protocol).
+**`Shared` candidate predicate** (each clause cache-only; any failure falls
+through; never an error, never a second admission):
 
-Deliberately **not** in the predicate: alignment, W1-patch eligibility, block
-count, payload size. The Shared class is about what the op does to the
-*inode plane* (nothing), not which data-plane vehicle serves it. A Shared
-write may ride W1 patch, extent park, accumulation merge, or the overlay —
-each already owns its block-plane serialization.
+1. `file_type == "striped"` from the cached metadata snapshot.
+2. **Within EOF by the conservative floor**: `end <= shared_size_floor(ino)`
+   — a **named new helper**, distinct from `freshest_size` (which takes max
+   for the never-lose-acked-bytes direction): it returns the *minimum* of
+   the live attr-cache and metadata-cache sizes and **misses ⇒ exclusive**
+   (no fetch under or before Shared). Stale-low only routes exclusive;
+   truncate publishes the new size into **both** caches before dropping its
+   exclusive guard (pinned: `truncate_layout` → `merge_block_mappings`
+   updates `metadata_cache`; `setattr` updates `attr_cache` at `:18878` —
+   both under the same exclusive hold), so stale-high is unrepresentable
+   after the revalidation fence.
+3. **Fully mapped** (KD-3): one immutable `Arc` map snapshot taken from the
+   same `CachedMetadata` read as (1)–(2); probe exactly the touched block
+   indexes, O(touched). Resident rehydrated indirect maps qualify; miss /
+   anomaly / any hole ⇒ exclusive.
 
-### 4.2 What the read guard still excludes
+(The former clause 4 — "no in-flight EntireOp holder" — is deleted per
+R-m1: that is the RwLock's own semantics, not a classifier input.)
 
-Truncate, punch/zero-range, setattr-size, rename-over, and the fsync flush
-sweeps take the inode **write** guard today and keep it. Every one of them
-continues to exclude the whole Shared population — the read guard is not a
-weakening against the ops that actually conflict with within-EOF writes.
+Deliberately not in the predicate: alignment, W1 eligibility, payload size.
+Those choose the data-plane *vehicle*; Shared is about the inode plane, and
+with KD-3 the class provably performs no inode-plane mutation.
 
-### 4.3 The invariant audit (the campaign's real work)
+### 4.2 The acquire protocol (KD-2)
 
-Every site that today relies on **writer–writer** exclusion via the inode
-guard must be classified into one of: **(a)** already block-plane-covered,
-**(b)** migrate to an atomic/synchronized form, **(c)** grounds to route that
-shape out of `Shared`. Inventory from the current handler prelude and data
-path — each row becomes a red-first test in PR 2:
+```
+validate range (R2-M2)                      [no locks]
+probe caches: meta snapshot + attr floor    [no locks, no fetch, no await]
+candidate = classify(...)                   [count: write_lock_candidate_*]
+acquire: Shared ⇒ read().await; else write().await
+revalidate UNDER the guard: re-read floor + re-probe the SAME touched
+    indexes on a fresh snapshot
+  ├─ still Shared-eligible ⇒ final = Shared  [count: write_lock_scope_shared]
+  └─ moved (truncate/punch/reclaim purge/…) ⇒ drop; write().await;
+       re-classify ONCE among {MetaPrepOnly, EntireOp}
+       [count: write_lock_scope_shared_upgrades]
+proceed:
+  Shared / MetaPrepOnly ⇒ lease + snapshot + admission record (KD-6);
+       DROP GUARD; data I/O; postlude per KD-6
+  EntireOp ⇒ today's path verbatim
+```
 
-| # | Site | Today's cover | Disposition (proposed) |
-|---|---|---|---|
-| 1 | `acquire_write_lease` per-ino mint/refresh | inode wr guard serializes | (b) — the lease cache is already an scc map with a per-ino entry; concurrent Shared writers converge on one lease (verify no double-mint; `lease_locks` (P1-9 layer 2) already exists for exactly this) |
-| 2 | `note_last_write_end` stream stamp (W1 predicate 6) | wr guard orders the swap | (a/b) — already an atomic swap; under Shared it becomes advisory-ordered. Audit: a mis-ordered stamp can only mis-classify stream-adjacency → routes a write to a *heavier* path (fine) or declines a patch (fine). Never a correctness edge |
-| 3 | Attr-cache mtime/size refresh post-write | wr guard orders updates | (b) — monotonic merge (size = max, times = latest); within-EOF writes don't move size at all |
-| 4 | Coverage-union `record_write` + ActiveBlockBuf merge | block guard (already) | (a) — pinned by `write_through_coverage_tests` under kernel-split OOO segments |
-| 5 | W1 patch decision + §5.1 fence | block guard + fence | (a) — the fence protocol was loom-verified for exactly concurrent clone/patch |
-| 6 | Extent park / escalation maps | block guard scope (audit) | (a) after audit — `try_extent_park` runs inside the per-block future under the held block guard |
-| 7 | Seed/park classification live re-derivation (the generic/551 fix) | under block guard, post-settle | (a) — deliberately built under the block guard, not the inode guard |
-| 8 | Overlay install/settle one-authority screen | block guard | (a) — same |
-| 9 | Orphan-discard probe (VL8 item 9 prelude) | wr guard | (c)/(b) — probe only fires when no handle/meta/attr is live; a Shared-class write on an open handle never probes. Keep the probe on the exclusive classes only |
-| 10 | `mark_handle_dirty` / open-generation | atomic already | (a) |
-| 11 | Rewrite-epoch/supersession registration | block guard + global epoch | (a) — CQE-supersession law is lock-serialized at the block, epoch-unique globally |
+No loop: one upgrade maximum. Tokio `RwLock` write-preference means a
+waiting truncate gates new Shared arrivals — a rand-4k storm cannot starve
+setattr-size. The exclusive classes keep today's exact order (guard first),
+so the lifecycle probe (KD-7) sees an unchanged world.
 
-Any row that resists a clean (a)/(b) verdict during implementation becomes a
-predicate clause — shrinking `Shared` is always legal; silently widening it
-never is.
+**Must-not (P1-9 addendum):** a Shared or MetaPrepOnly holder never
+re-enters `active_inode_locks` (read or write) on the same ino. For the
+record (R2 correction): the queue-full and synchronous-fsync paths reach
+`flush_due_active_blocks_for_inode` → `flush_one_active_block`, which takes
+**no** inode guard; `flush_single_active_block` (`:22829`) is the
+background/teardown **read**-guard wrapper, and the GDS ioctl takes read.
+No current chain violates the must-not; the rule keeps it unrepresentable.
 
-### 4.4 The il parity follow-up
+### 4.3 What the read guard still excludes — corrected taker list (R-M1)
 
-The il row (205k) trails kernel (391k) beyond the convoy's share; the handoff
-venue (`handoff_spawn` → handler lanes) joins the same per-inode queue today.
-After the convoy falls, re-measure il-vs-kernel on the same rows; if the
-parity verdict (il ≥ kernel at minimum) still fails, that residual is PR 4's
-charter (likely the §5.5.2 sever + handoff pipeline depth per inode), *not*
-part of this design's core.
+Exclusive `active_inode_locks.write()` takers at `e4f756a9`: FUSE `write`
+(pre-classification today), `setattr` **iff size**, `fallocate` punch/zero,
+`fallocate` extend, `copy_file_range` dest. All keep exclusive and are
+excluded while a Shared guard is held. **`fsync` does not take the inode
+write guard today and its mode does not change** — its flush serializes
+against in-flight data via block locks (making it exclusive would put fsync
+behind the very convoy this campaign removes).
+
+### 4.4 The writer-writer invariant audit
+
+Every row lands as a red-first test in PR 2 before PR 3 flips admission.
+Dispositions: (a) already covered elsewhere, (b) migrate, (c) predicate
+grounds.
+
+| # | Site | Disposition |
+|---|---|---|
+| 1 | Lease mint/refresh | (a) — `get_or_acquire_lease_bounded` double-checks `active_leases` then serializes misses on `lease_locks` (`:9902–9933`). Red test: no double-mint under 32 Shared first-touch writers |
+| 2 | `note_last_write_end` (W1 predicate 6) | (a) correctness / **KD-4** economy — seq-4k gate row; detector contingency |
+| 3 | Attr-cache publication | **(b) — KD-5**: the striped merge domain + monotone law; red test: two concurrent within-EOF writes cannot regress mtime, across both cache arms and refresh/setattr/expiry publishers |
+| 4 | Coverage-union `record_write` / ActiveBlockBuf merge | (a) — block guard; pinned OOO by `write_through_coverage_tests` |
+| 5 | W1 patch + §5.1 fence | (a) — loom-verified for concurrent clone/patch |
+| 6 | Extent park / escalation | (a) — runs inside the per-block future under the held block guard |
+| 7 | Seed/park live re-derivation (generic/551 fix) | (a) — deliberately block-guard-scoped |
+| 8 | Overlay one-authority screen | (a) **for mapped overwrites only** — hole stores are out of class (KD-3) |
+| 9 | Orphan-discard probe (VL8 item 9) | **(c) — KD-7**: unreachable from Shared (cache miss ⇒ exclusive); probe order unchanged on exclusive |
+| 10 | `mark_handle_dirty` / open generation | (a) — atomic |
+| 11 | Rewrite-epoch / CQE supersession | (a) — block-lock-serialized, globally unique epochs |
+| 12 | `park_write_times` / `park_times_refinement` | (a) — already signed-max monotone |
+| 13 | Attr-cache RMW `:18485` | (b) — folded into row 3 / KD-5 |
+| 14 | `placed_sever_for` per-(ino, block) assembly | (a) after audit — IL Shared writers to one block (claims Dekker + adoption seal) |
+| 15 | Hole-fill / overlay install / `merge_block_mappings` | (c) — out of class in v1 (KD-3); the widening campaign owes the (a) proof |
+| 16 | mmap writeback WRITEs after truncate+regrow | **in the Shared class** — gate: `mmap_writeback_staleness_tests` + generic/074 (closes former OQ 3) |
+| 17 | `copy_file_range` dest | stays exclusive (write-mode today) |
+| 18 | Nested inode-lock from the data path | must-not (§4.2) |
+| 19 | `apply_killpriv` | (a) — runs before the inode lock (`:18212`); latch protocol exists |
+| 20 | Write-pipeline in-flight depth | not correctness — Shared raises offered depth; the governor absorbs (gate note: watch `write_pipeline_admission_waits`) |
+| 21 | Final FORGET / unlink / rename-over / open-count / `reclaim_inflight` / `delete_file` | (a) via KD-7 — these ride the open/reclaim handshake + `INODE_META_LOCKS`, not the inode write guard; pins: `fuse_watchdog_teardown_tests` counted discard + `write_visibility_tests` open/reclaim handshake |
+| 22 | Fencing retry + postlude publication | **(b) — KD-6**: admission record; re-run protocol on retry; times-only Shared postlude; deterministic truncate/punch-race tests pinning both legal outcomes |
+
+### 4.5 IL path
+
+Handler-only classification: the sink already calls `Filesystem::write`
+after the §5.5.2 sever (`ipc_service.rs:944`) — no second classifier at the
+sink. The IL read fast path's `try_read()` (`ipc_service.rs:675`)
+legitimately succeeds during a held Shared write (compatible readers) —
+expected, not a bug to "fix" (R-m4). If il still trails kernel after PR 3,
+that residual is PR 4 (instruments: `ipc_ingress_ns`, `ipc_async_handoffs`,
+`placed_*`, per-mode `write_lock_wait` — which should by then be quiet).
 
 ## 5. Lock-order statement (P1-9 delta)
 
-Order is unchanged: (1) `active_inode_locks` → (2) `lease_locks` →
-(3) `BLOCK_FLUSH_LOCKS` → (3.5) `INODE_META_LOCKS` → (4) meta-tx locks.
-The only delta is the **mode** taken at layer (1) for the Shared class.
-Shared-mode holders acquire nothing new; exclusive-class ops are unchanged;
-no new wait-for edges, so the acyclicity argument carries verbatim. The
-`AGENTS.md` lock-order table gains one sentence, no reordering.
+Order unchanged: (1) → (2) → (3) → (3.5) → (4). Deltas: the **mode** at
+layer (1) for the Shared class, plus two addenda — the §4.2 must-not
+(no same-ino re-entry by any layer-(1) holder) and KD-5's
+`attr_publish_locks` (a leaf domain: acquired last, holds no other lock,
+never held across an await — no new wait-for edges).
 
-## 6. What could go wrong (adversarial review seeds)
+## 6. What could go wrong (review seeds, rev 2)
 
-* **Torn multi-block writes become visible interleaved.** Already true today
-  between *different* writers on POSIX and on this FS (per-block futures under
-  per-block guards); Shared admission makes same-fd concurrent writes equally
-  interleavable. POSIX does not promise write/write atomicity across
-  concurrent writers; pjdfstests/LTP/fstests will adjudicate (battery gate).
-* **Size-read race admits a write past a concurrent truncate.** Truncate takes
-  the write guard: it cannot run concurrently with a Shared holder at all.
-  A truncate *between* classification and acquisition re-checks: classify
-  under the held guard (the acquisition IS the fence — classify-then-acquire
-  re-validates size after the shared guard lands, route out if it moved).
-* **A hidden writer-writer invariant not in §4.3's table.** The mitigation is
-  the audit method itself: PR 2 lands each row as a red-first concurrency test
-  *before* PR 3 flips any admission, and `invariant_tripwires` stays the
-  runtime backstop.
-* **Wake-convoy merely moves to the block locks.** Only same-block collisions
-  queue there; rand-4k across 512 blocks/file makes collisions rare. The A/B
-  gate (§8) measures it rather than argues it.
+* **Interleaved same-inode writes become observable.** True today across
+  writers under MetaPrepOnly; POSIX does not promise write/write atomicity.
+  The battery adjudicates (gate 5; generic/074 + 075 named).
+* **Truncate vs post-drop in-flight I/O.** Today's MetaPrepOnly world
+  (KD-1); handled by `drop_active_block_overlays_beyond` + `truncate_layout`
+  + block locks; the *new* protections are KD-6's times-only postlude and
+  retry-revalidation.
+* **Stale-high size floor.** Unrepresentable after the revalidation fence
+  given truncate's both-caches-before-drop publication (pinned in §4.1.2).
+* **Hidden writer-writer invariant.** The audit method: every §4.4 row is a
+  red test before any admission flips; `invariant_tripwires` is the runtime
+  backstop.
+* **Convoy relocates to block locks.** Only same-block collisions queue
+  there (rand-4k across ~512 blocks/file ⇒ rare); gate 3 measures the
+  per-mode wait histograms rather than arguing.
 
-## 7. Observability
+## 7. Observability (KD-8)
 
-* `write_lock_scope_{shared,metaprep,entire}` — the decision ledger
-  (counters, stats inode). A rand-overwrite row classifying below ~99 %
-  `shared` = predicate rot; the engagement instrument for every future row.
-* `write_lock_wait` stays the ceiling instrument (the histogram that convicted
-  the convoy); expected post-change: the ms-class population collapses on
-  Shared-dominant rows.
-* `invariant_tripwires` — any §4.3 migration adds its tripwire rather than a
-  `debug_assert!` (the `transport_lease_overlong` law).
+* PR 1: `write_lock_candidate_{shared,metaprep,entire}` (preview; exclusive
+  still taken).
+* PR 3: final `write_lock_scope_{shared,metaprep,entire}`,
+  `write_lock_scope_shared_upgrades` (zero on fully-mapped overwrite rows =
+  floor healthy; nonzero around truncate storms = the upgrade working), and
+  per-mode `write_lock_wait_{shared,exclusive}` histograms (aggregate kept).
+  Closure: final-scope counts ≡ WRITE ops per row.
+* `SQUEEZEFS_WRITE_SHARED` registered in `env_knobs.rs` (ENG-10) in PR 1;
+  default OFF; PR 3 flips default ON and the knob becomes the measurement
+  A/B (`=0` disables, the `SQUEEZEFS_NT_COPY` pattern) — never an
+  operational escape, never `SQUEEZEFS_TEST_*`.
 
-## 8. Gates (all must pass; house rules apply verbatim)
+## 8. Gates
 
-1. **Red-first**: every §4.3 row lands as a failing concurrency test before
-   its migration; the classifier's own contract tests pin all three classes
-   plus the any-doubt-exclusive default.
-2. **Loom** on any migrated protocol that gains a fence/atomic (expected: none
-   new; the campaign reuses existing verified protocols — if one appears, it
-   gets the weakening-verified treatment).
-3. **Counted A-B-B-A on squeeze-test** (the aging-store rule): the four §2
-   rows re-run both orders, plus the seq-1m throughput rows (38/39 GB/s must
-   not regress), sustained-60 s discipline, engagement exact.
-   Success bar: kernel rand-4k write ≥ 3× baseline (>1.2M at depth if the
-   device-service model holds), il ≥ kernel (parity restored), `write_lock_wait`
-   ms-population gone.
-4. **write_matrix parity verdict** green (il ≥ kernel at minimum, ahead in the
-   majority).
-5. **The full battery regime** (this session's): `task check` from zero, then
-   pjdfstests + LTP + fstests `-g auto` fail-fast from zero — a lock-order
-   change re-earns the whole certificate.
-6. Bench baseline (`tests/run_bench_baseline.sh`) pre-merge — this is a
-   hot-path perf PR by definition.
+1. **Red-first**: every §4.4 row + the classifier contract tests (three
+   classes, any-doubt-exclusive default, R2-M2 range table) before their
+   migrations.
+2. **Loom** only if a new fence/atomic protocol appears (KD-5 is a plain
+   striped mutex; none expected).
+3. **PR 3 gate (counted A-B-B-A on squeeze-test, sustained-60 s,
+   engagement exact, vs the R-M7 diagnosis note)**:
+   a. kernel rand-4k: `write_lock_wait` ms-population gone;
+   b. data-device qd rises materially from ≈ 1.5 (the convoy was hiding the
+      device);
+   c. IOPS ≥ **2×** baseline floor (3× / >1.2M is the stretch iff
+      device-service holds);
+   d. seq-1m 38/39 GB/s non-regression;
+   e. **seq-4k streaming-overwrite row** (KD-4's adjudicator);
+   f. preview/final ledger closure on every row.
+4. **PR 4 gate**: write_matrix parity (il ≥ kernel at minimum) on the
+   rand-4k rows.
+5. **The full battery regime** from zero (`task check`, pjdfstests, LTP,
+   fstests `-g auto` fail-fast) — a lock-**mode** change (not order), but it
+   re-earns the certificate; generic/074 and generic/075 are the named
+   truncate/overlay-race sentinels.
+6. Bench baseline (`tests/run_bench_baseline.sh`) pre-merge.
 
 ## 9. PR plan
 
 | PR | Content | Gate |
 |---|---|---|
-| 1 | `Shared` variant + classifier + decision-ledger counters + classifier contract tests (classification only — nothing takes the read guard yet; `Shared` maps to `MetaPrepOnly` behavior behind `SQUEEZEFS_WRITE_SHARED=0/1` default OFF) | full cargo gate |
-| 2 | §4.3 audit rows as red-first tests + their (a)/(b)/(c) migrations | full cargo gate + loom where touched |
-| 3 | Flip `Shared` to the read guard; default ON; the knob becomes the A/B lever (never an operational escape) | gates §8.3–8.6 |
-| 4 | il parity residual (only if the §4.4 re-measure still fails parity) | write_matrix verdict |
+| 1 | Range validation (R2-M2) + rebuilt classifier signature (staged bypass folded in) + `shared_size_floor` helper + map-probe + **candidate** ledger + knob registry entry. Exclusive guard still taken for every class (R-m5) | full cargo gate |
+| 2 | §4.4 audit rows as red-first tests + migrations — including KD-5's attr merge domain (load-bearing pre-PR-3) and KD-6's admission record + retry protocol | full cargo gate (+ loom if any protocol appears) |
+| 3 | The §4.2 acquire protocol live: Shared takes the read guard; final-scope + per-mode-wait ledgers; default ON | gates 8.3, 8.5, 8.6 |
+| 4 | il parity residual (only if the re-measure still fails) | gate 8.4 |
 
-## 10. Open questions for review
+## 10. Resolved review decisions (former open questions)
 
-1. Should the fsync flush sweep *also* gain a shared-mode fast path for its
-   read-only census pass, or stay fully exclusive? (Proposed: stay exclusive —
-   flush is not the hot path and its exclusivity is a §4.3 safety anchor.)
-2. `Shared` for the **il ring-write handoff** path: same classifier at the
-   sink's handler dispatch, or classify once in the handler only? (Proposed:
-   handler-only — one classification point, the sink never guesses.)
-3. Does the mmap writeback path (`mmap_writeback_staleness_tests` surface)
-   carry any writer-writer assumption not in §4.3? Flagged for the audit.
+1. **fsync**: mode untouched — it is not exclusive today (R-M1) and must not
+   become so.
+2. **IL classification**: handler-only (already structurally true).
+3. **mmap writeback**: not an open question — audit row 16, in the Shared
+   class, gated by `mmap_writeback_staleness_tests` + generic/074.
+4. Hold duration → **KD-1**. v1 breadth → **KD-3**. Predicate 6 → **KD-4**.
+   Write-vs-reclaim → **KD-7**. Retry/postlude → **KD-6**. Attr merge →
+   **KD-5**. Ledgers/timing → **KD-8**. Range semantics → §4.1 (R2-M2).

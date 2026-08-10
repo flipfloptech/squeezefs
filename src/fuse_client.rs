@@ -10706,7 +10706,8 @@ impl SqueezefsFilesystem {
                 // that failed, so the progress check is exact). Custody
                 // is NEVER retired on this class.
                 let esc_res = loop {
-                    match upload_active_block_bytes(ino, b, staging_copy.clone(), &self.router)
+                    match self
+                        .upload_active_block_bytes(ino, b, staging_copy.clone())
                         .await
                     {
                         Err(e @ SqueezefsError::FencingTokenExpired { .. }) => {
@@ -10784,7 +10785,7 @@ impl SqueezefsFilesystem {
                 // extended order), so holding the block guard is legal.
                 // The RAM copy stays parked (readable) until the durable
                 // merge has published.
-                upload_active_block_bytes(ino, b, staging_copy, &self.router).await?;
+                self.upload_active_block_bytes(ino, b, staging_copy).await?;
                 METRICS
                     .durable_upload_bytes_escalation
                     .fetch_add(put_len, Ordering::Relaxed);
@@ -15039,7 +15040,8 @@ impl SqueezefsFilesystem {
                             None => return,
                         };
                         let self_flush_len = self_flush_snapshot.len() as u64;
-                        match upload_active_block_bytes(ino, b, self_flush_snapshot, &self.router)
+                        match self
+                            .upload_active_block_bytes(ino, b, self_flush_snapshot)
                             .await
                         {
                             Ok(()) => {
@@ -15278,8 +15280,7 @@ impl SqueezefsFilesystem {
                 // not strand dirty RAM — upload the block durably right now
                 // (the escalation merges via the shared primitive, legal
                 // under the block guard per the P1-9 extended order).
-                if let Err(e) = upload_active_block_bytes(ino, b, staging_copy, &self.router).await
-                {
+                if let Err(e) = self.upload_active_block_bytes(ino, b, staging_copy).await {
                     error!(
                         "Dismount durable upload failed for ino {} block {}: {:?}",
                         ino, b, e
@@ -22614,64 +22615,109 @@ async fn flush_due_active_blocks_for_inode(
 /// op-start token snapshot going stale mid-flush must degrade to a
 /// transient retryable error at worst, never a permanently-stale hard
 /// failure that strands dirty RAM at dismount.
-async fn upload_active_block_bytes(
-    ino: u64,
-    b: u32,
-    block_bytes: bytes::Bytes,
-    router: &DataRouter,
-) -> Result<(), SqueezefsError> {
-    let processed_block = router
-        .get_crypto()
-        .process_write_async(block_bytes.clone())
-        .await?;
-    let (be_id, block_allocator, nvme_writer) = router.backend_router.get_active_backend()?;
-    crate::block_allocator::ensure_stored_block_image_fits(
-        processed_block.len(),
-        block_allocator.chunk_size(),
-        "staging-refusal durable escalation",
-    )?;
-    let offset = block_allocator.allocate_block().await?;
-    // RES-9 mint guard: this unit runs inside the fsync/dismount flush
-    // fan-outs whose first-error unwind drops siblings mid-await (the
-    // live-statfs drift class — see flush_one_active_block).
-    let mut minted = crate::assembly_tasks::MintedBlockGuard::new(block_allocator.clone(), offset);
-    // PR VL6a: live-owner registration for the allocate→merge window.
-    let _inflight = block_allocator.inflight_register(offset);
-    if let Err(e) = nvme_writer.write_block(offset, processed_block).await {
-        minted.disarm();
-        let _ = block_allocator.free_block(offset).await;
-        return Err(e);
-    }
-    block_allocator.publish_block(offset);
-    let stored_block_key = router.backend_router.persist_block_key(&be_id, offset);
-
-    let merge_token = router.dlm.get_fencing_token_ino(ino);
-    let entries = [(b, stored_block_key)];
-    let merge_res = router
-        .merge_block_mappings(
-            ino,
-            crate::routing::BlockMapOp::Merge(&entries),
-            0,
-            crate::routing::LayoutFlip::ToStripedKeepStagedIdentity,
-            merge_token,
-        )
-        .await;
-    let displaced = match merge_res {
-        Ok(d) => d,
-        Err(e) => {
-            // The uploaded block never reached the map: free it before
-            // propagating (same leak rule as flush_one_active_block).
+impl SqueezefsFilesystem {
+    /// The durable-flush upload unit (fsync escalation, dismount sweep,
+    /// writeback self-flush): one CoW block write + map merge presenting
+    /// the ino's CURRENT generation. A method since the generic/590 fix
+    /// (2026-08-10): allocator exhaustion on a SPACE-NEUTRAL rewrite now
+    /// rides the same contract-9 brim ladder as `upload_full_block_sized`
+    /// — a free function could not reach `try_inplace_rewrite`, so this
+    /// leg surfaced ENOSPC at fill 1.0 where every other upload leg
+    /// converges in place ("a store at fill 1.0 can never serve CoW's
+    /// allocate-before-free"). Predicate misses (fresh/shared/decorated/
+    /// transformed) keep the honest StorageFull.
+    async fn upload_active_block_bytes(
+        &self,
+        ino: u64,
+        b: u32,
+        block_bytes: bytes::Bytes,
+    ) -> Result<(), SqueezefsError> {
+        let router = &self.router;
+        let processed_block = router
+            .get_crypto()
+            .process_write_async(block_bytes.clone())
+            .await?;
+        let (be_id, block_allocator, nvme_writer) = router.backend_router.get_active_backend()?;
+        crate::block_allocator::ensure_stored_block_image_fits(
+            processed_block.len(),
+            block_allocator.chunk_size(),
+            "staging-refusal durable escalation",
+        )?;
+        let pipe_t0 = std::time::Instant::now();
+        let offset = match block_allocator.allocate_block().await {
+            Ok(o) => o,
+            Err(e)
+                if matches!(&e, SqueezefsError::Io(io)
+                    if io.kind() == std::io::ErrorKind::StorageFull) =>
+            {
+                // Contract-9 brim (generic/590): genuine space failure —
+                // the valve already drained queued reclaims — on a block
+                // whose CURRENT mapping is sole-owned/undecorated/
+                // passthrough converges IN PLACE at its own offset. The
+                // flush legs' size posture: never grow the size floor
+                // (the 795 SIZE-NEVER-LEADS-DATA law).
+                let token = router.dlm.get_fencing_token_ino(ino);
+                if self
+                    .try_inplace_rewrite(
+                        ino,
+                        b,
+                        processed_block.clone(),
+                        token,
+                        false,
+                        pipe_t0,
+                        true,
+                    )
+                    .await?
+                {
+                    return self.upload_invalidation_tail(ino, b).await;
+                }
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
+        // RES-9 mint guard: this unit runs inside the fsync/dismount flush
+        // fan-outs whose first-error unwind drops siblings mid-await (the
+        // live-statfs drift class — see flush_one_active_block).
+        let mut minted =
+            crate::assembly_tasks::MintedBlockGuard::new(block_allocator.clone(), offset);
+        // PR VL6a: live-owner registration for the allocate→merge window.
+        let _inflight = block_allocator.inflight_register(offset);
+        if let Err(e) = nvme_writer.write_block(offset, processed_block).await {
             minted.disarm();
             let _ = block_allocator.free_block(offset).await;
             return Err(e);
         }
-    };
-    // Publish landed: the map owns the block.
-    minted.disarm();
-    for bk in displaced {
-        let _ = router.backend_router.free_block(&bk).await;
+        block_allocator.publish_block(offset);
+        let stored_block_key = router.backend_router.persist_block_key(&be_id, offset);
+
+        let merge_token = router.dlm.get_fencing_token_ino(ino);
+        let entries = [(b, stored_block_key)];
+        let merge_res = router
+            .merge_block_mappings(
+                ino,
+                crate::routing::BlockMapOp::Merge(&entries),
+                0,
+                crate::routing::LayoutFlip::ToStripedKeepStagedIdentity,
+                merge_token,
+            )
+            .await;
+        let displaced = match merge_res {
+            Ok(d) => d,
+            Err(e) => {
+                // The uploaded block never reached the map: free it before
+                // propagating (same leak rule as flush_one_active_block).
+                minted.disarm();
+                let _ = block_allocator.free_block(offset).await;
+                return Err(e);
+            }
+        };
+        // Publish landed: the map owns the block.
+        minted.disarm();
+        for bk in displaced {
+            let _ = router.backend_router.free_block(&bk).await;
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// W2 fold upload (design-random-small-writes §5.2): one durable CoW

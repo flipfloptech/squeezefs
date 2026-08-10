@@ -495,7 +495,7 @@ where
                 let now = clock();
                 let expired =
                     |e: &Rm<V>| ttl_ms.is_some_and(|t| now.saturating_sub(e.inserted_ms) >= t);
-                match store.entry_sync(key.clone()) {
+                let v = match store.entry_sync(key.clone()) {
                     scc::hash_index::Entry::Occupied(mut o) => {
                         if !expired(o.get()) {
                             return o.get().v.clone();
@@ -506,7 +506,6 @@ where
                             inserted_ms: now,
                             touched: AtomicU64::new(now),
                         });
-                        policy.insert(key, ());
                         v
                     }
                     scc::hash_index::Entry::Vacant(slot) => {
@@ -516,10 +515,20 @@ where
                             inserted_ms: now,
                             touched: AtomicU64::new(now),
                         });
-                        policy.insert(key, ());
                         v
                     }
-                }
+                };
+                // The policy op runs OUTSIDE the store guard — the module
+                // law, and load-bearing: moka::sync delivers its eviction
+                // listener INLINE on the paying thread, and the listener
+                // takes store bucket locks (`remove_if_sync`). Paying
+                // while the entry guard above was live self-deadlocked
+                // the thread on its own bucket (same key ⇒ same bucket —
+                // the 2026-08-10 LTP writev03 handler-lane wedge; repro
+                // `expired_reinsert_never_deadlocks_on_inline_listener`).
+                // Both match arms end their guard at the match boundary.
+                policy.insert(key, ());
+                v
             }
             Backing::Classic(c) => c.get_with(key, init),
         }

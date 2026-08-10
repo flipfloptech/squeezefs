@@ -422,5 +422,7 @@ fn expired_reinsert_never_deadlocks_on_inline_listener() {
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    worker.join().expect("worker must complete without panicking");
+    worker
+        .join()
+        .expect("worker must complete without panicking");
 }

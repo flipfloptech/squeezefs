@@ -372,8 +372,17 @@ mod overlay_dma_bytes_tests {
     use crate::fuse_client::METRICS;
     use std::sync::atomic::Ordering;
 
+    /// These three tests assert EXACT process-global counter deltas
+    /// (`overlay_dma_{passthrough,pool_copy}_bytes`), so they serialize
+    /// against each other (2026-08-09 bench-smoke find: the gate's test
+    /// phase runs `--test-threads=1`, but the bench smoke re-runs the
+    /// lib harness at default parallelism — a sibling's concurrent
+    /// bounce lands inside the delta window).
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn aligned_extract_bytes_skip_the_pool_copy() {
+        let _s = SERIAL.lock().unwrap();
         let mut buf = BUFFER_POOL.alloc();
         buf.resize(8192, 0xCD);
         let src = buf.into_bytes();
@@ -406,11 +415,20 @@ mod overlay_dma_bytes_tests {
 
     #[test]
     fn unaligned_bytes_still_bounce_into_the_pool() {
-        let mut v = vec![0xABu8; 8192 + POOLED_BUF_ALIGN];
+        let _s = SERIAL.lock().unwrap();
         // Force a non-4 KiB pointer so write_block would miss Aligned.
-        let off = 1 + (v.as_ptr() as usize % POOLED_BUF_ALIGN == 0) as usize;
-        v[off..off + 8192].fill(0xAB);
-        let src = bytes::Bytes::copy_from_slice(&v[off..off + 8192]);
+        // DETERMINISTIC misalignment (2026-08-09 bench-smoke find): the
+        // former `Bytes::copy_from_slice(&v[off..])` fixture allocated a
+        // FRESH buffer, so its pointer alignment was allocator luck — it
+        // held under the dhat allocator (`--all-features` test profile)
+        // and failed under jemalloc (default-features bench smoke, which
+        // page-aligns the 8 KiB size class). Slicing ONE backing
+        // allocation at a computed odd offset pins ptr ≡ 1 (mod ALIGN)
+        // on every allocator and profile.
+        let base = bytes::Bytes::from(vec![0xABu8; 8192 + POOLED_BUF_ALIGN]);
+        let mis = base.as_ptr() as usize % POOLED_BUF_ALIGN;
+        let off = (POOLED_BUF_ALIGN + 1 - mis) % POOLED_BUF_ALIGN;
+        let src = base.slice(off..off + 8192);
         assert_ne!(
             src.as_ptr() as usize % POOLED_BUF_ALIGN,
             0,
@@ -433,6 +451,7 @@ mod overlay_dma_bytes_tests {
 
     #[test]
     fn odd_length_bytes_bounce() {
+        let _s = SERIAL.lock().unwrap();
         let src = bytes::Bytes::from(vec![0x11u8; 100]);
         let out = overlay_owned_dma_bytes(src.clone());
         assert_eq!(&out[..], &src[..]);

@@ -689,7 +689,11 @@ struct FlushHarness {
 }
 
 async fn make_flush_fs(test_id: &str) -> FlushHarness {
-    std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "4096");
+    make_flush_fs_bs(test_id, 4096).await
+}
+
+async fn make_flush_fs_bs(test_id: &str, bs: u64) -> FlushHarness {
+    std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", bs.to_string());
     let dlm = DlmClient::new().unwrap();
 
     let backing = NamedTempFile::new().unwrap();
@@ -1337,5 +1341,90 @@ async fn test_stale_token_writeback_adopts_current_epoch_no_leak() {
     assert!(
         used <= mapped as u64 + 1,
         "leaked published-but-unmerged blocks: used={used} mapped={mapped}"
+    );
+}
+
+/// generic/590's tight-fit face (release-gate battery, 2026-08-10 —
+/// pre-existing on the perf-wave tip, 5/5 default and 3/5 overlay-off):
+/// writing a device-sized file and fsyncing a dirtied block on the FULL
+/// store failed ENOSPC. The DUR-1 fsync escalation
+/// (`upload_active_block_bytes`) hand-rolled allocate→DMA→merge with NO
+/// brim arm, so a SPACE-NEUTRAL rewrite of a block's own sole-owned
+/// mapping — contract 9's exact charter: "a store at fill 1.0 can never
+/// serve CoW's allocate-before-free" — surfaced allocator exhaustion to
+/// the application instead of converging in place like every other
+/// upload leg (`upload_full_block_sized`'s StorageFull ladder).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fsync_escalation_converges_in_place_at_fill_one() {
+    let _serial = serial().await;
+    // 64 KiB FS blocks: a 16 KiB dirtying write parks PARTIAL custody
+    // (extent park escalation), which is the fsync-escalation shape —
+    // a whole-block write would ride upload_full_block_sized, whose
+    // brim already converges.
+    let h = make_flush_fs_bs("fsync_brim_test", 65536).await;
+    // Patch OFF: the W1 arm would absorb the dirtying overwrite before
+    // it ever parks (the escalation path under test needs parked
+    // custody).
+    squeezefs::fuse_client::set_patch_max_bytes(0);
+    let bs: u64 = 65536;
+    let blocks: u64 = 8;
+    // Bound the allocator to EXACTLY the file's blocks (capacity is in
+    // 4 MiB allocator chunks, one per FS block) — fill 1.0 once the
+    // stream lands.
+    h.fs.router
+        .block_allocator
+        .set_capacity_bytes(blocks * squeezefs::block_allocator::CHUNK_SIZE);
+
+    let ino = {
+        let r =
+            h.fs.create(
+                h.req,
+                1,
+                std::ffi::OsStr::new("brim.bin"),
+                libc::S_IFREG | 0o644,
+                0,
+            )
+            .await
+            .unwrap();
+        r.attr.ino
+    };
+    // Fill the device: 8 blocks, then make them durable.
+    let pattern: Vec<u8> = (0..(blocks * bs) as usize)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    harness_write(&h, ino, 0, &pattern).await;
+    h.fs.fsync(h.req, ino, 0, false)
+        .await
+        .expect("initial fsync fills the device");
+    drain_pipeline(&h).await;
+
+    // Dirty block 2 with a PARTIAL (16 KiB of 64 KiB) write — extent
+    // park escalates to a full active-block buffer with a partial
+    // union — then fsync on the FULL device: the escalation seeds the
+    // complement and uploads; contract 9 demands it converge IN PLACE
+    // (the rewrite is space-neutral by definition).
+    let newz = vec![0xEEu8; 16384];
+    harness_write(&h, ino, 2 * bs, &newz).await;
+    h.fs.fsync(h.req, ino, 0, false).await.expect(
+        "a space-neutral rewrite fsync on a full device must converge \
+         in place (contract 9) — ENOSPC here is the generic/590 failure",
+    );
+    drain_pipeline(&h).await;
+
+    // Content law: the dirtied range serves the new bytes; the block
+    // complement and neighbours keep the seed.
+    let got = harness_read(&h, ino, 2 * bs, 16384).await;
+    assert_eq!(got, newz, "rewritten range serves the new bytes");
+    let got = harness_read(&h, ino, 2 * bs + 16384, (bs - 16384) as u32).await;
+    assert_eq!(
+        got,
+        &pattern[(2 * bs + 16384) as usize..(3 * bs) as usize],
+        "block complement keeps the seeded old bytes"
+    );
+    let got = harness_read(&h, ino, 3 * bs, bs as u32).await;
+    assert_eq!(
+        got,
+        &pattern[(3 * bs) as usize..(4 * bs) as usize],
+        "neighbour untouched"
     );
 }

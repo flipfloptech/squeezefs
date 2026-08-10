@@ -436,6 +436,80 @@ async fn open_overlay_reads_serve_acked_bytes_and_zero_gaps() {
     fsync(&h, ino).await;
 }
 
+/// A read of an OPEN overlay must NOT freeze/seed/publish the block.
+/// The 1 MiB-into-4 MiB A-leg would otherwise write 3 MiB of zeros on
+/// the first readback (B2 drain-on-read). Covered bytes come from the
+/// dest; gaps are zeros (law 5) without a device write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn partial_overlay_read_does_not_seed_or_publish() {
+    let _g = serial().await;
+    let h = make("ovl_noseed").await;
+
+    let dirty = create(&h, "dirty").await;
+    write_at(&h, dirty, 0, &vec![0xEE; 3 * BS as usize]).await;
+    fsync(&h, dirty).await;
+    unlink(&h, "dirty").await;
+
+    let ino = create(&h, "noseed").await;
+    promote_striped(&h, ino).await;
+
+    let seeds0 = m(&METRICS.overlay_gap_seed_bytes);
+    let drains0 = m(&METRICS.overlay_read_drains);
+    let serves0 = m(&METRICS.overlay_read_serves);
+    let pubs0 = m(&METRICS.overlay_publishes);
+    let open0 = m(&METRICS.overlay_open);
+
+    let seg: Vec<u8> = vec![0xA1; (BS / 4) as usize];
+    write_at(&h, ino, 2 * BS + BS / 4, &seg).await;
+    assert_eq!(m(&METRICS.overlay_open), open0 + 1, "overlay installed");
+
+    let got = read_at(&h, ino, 2 * BS + BS / 4, (BS / 4) as u32).await;
+    assert_eq!(got, seg, "covered overlay read is byte-exact");
+    assert_eq!(
+        m(&METRICS.overlay_gap_seed_bytes),
+        seeds0,
+        "a covered read must not zero-seed the rest of the block"
+    );
+    assert_eq!(
+        m(&METRICS.overlay_read_drains),
+        drains0,
+        "compose serve, not drain-on-read"
+    );
+    assert!(
+        m(&METRICS.overlay_read_serves) > serves0,
+        "compose serve engagement"
+    );
+    assert_eq!(
+        m(&METRICS.overlay_publishes),
+        pubs0,
+        "a read must not publish"
+    );
+    assert_eq!(
+        m(&METRICS.overlay_open),
+        open0 + 1,
+        "the record stays Open after a compose read"
+    );
+
+    let gap = read_at(&h, ino, 2 * BS, (BS / 4) as u32).await;
+    assert!(
+        gap.iter().all(|&b| b == 0),
+        "uncovered gap is zeros, never recycled dest (law 5)"
+    );
+    assert_eq!(
+        m(&METRICS.overlay_gap_seed_bytes),
+        seeds0,
+        "a gap read must not seed either"
+    );
+    assert_eq!(m(&METRICS.overlay_open), open0 + 1);
+
+    fsync(&h, ino).await;
+    assert!(
+        m(&METRICS.overlay_gap_seed_bytes) - seeds0 == BS - BS / 4,
+        "fsync still seeds the gaps (durability sequence unchanged)"
+    );
+    assert_eq!(m(&METRICS.overlay_open), open0);
+}
+
 /// generic/209, fresh-file shape: a sequential fresh-file writer races
 /// a reader; every byte whose write COMPLETED before the read began
 /// must never read stale (zeros where data was ACKed, or a previous

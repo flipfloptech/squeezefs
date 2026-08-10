@@ -5241,10 +5241,14 @@ pub struct Metrics {
     /// writer settles and rides accumulation). Was a tripwire when
     /// ACK-after-CQE made it unreachable.
     pub overlay_claim_conflicts: Align64<AtomicU64>,
-    /// B2 read posture: reads of open overlays DRAIN
-    /// (freeze/complete/seed/publish) instead of composing (§5.2 is PR
-    /// B3). One count per drained record on the read path.
+    /// B2 drain-on-read (fallback when compose cannot cover the request
+    /// — multi-block, terminal record). Compose serves increment
+    /// [`Self::overlay_read_serves`] instead.
     pub overlay_read_drains: Align64<AtomicU64>,
+    /// Compose serves of an open overlay (no freeze/seed/publish).
+    pub overlay_read_serves: Align64<AtomicU64>,
+    /// Byte face of [`Self::overlay_read_serves`].
+    pub overlay_read_serve_bytes: Align64<AtomicU64>,
     /// Overlay publications (the ONE-tx map+ref flip — law 7).
     pub overlay_publishes: Align64<AtomicU64>,
     /// Byte face of [`Self::overlay_publishes`] (whole blocks).
@@ -8259,6 +8263,8 @@ impl SqueezefsFilesystem {
                 "overlay_ack_early_retries": METRICS.overlay_ack_early_retries.load(Ordering::Relaxed),
                 "overlay_claim_conflicts": METRICS.overlay_claim_conflicts.load(Ordering::Relaxed),
                 "overlay_read_drains": METRICS.overlay_read_drains.load(Ordering::Relaxed),
+                "overlay_read_serves": METRICS.overlay_read_serves.load(Ordering::Relaxed),
+                "overlay_read_serve_bytes": METRICS.overlay_read_serve_bytes.load(Ordering::Relaxed),
                 "overlay_publishes": METRICS.overlay_publishes.load(Ordering::Relaxed),
                 "overlay_published_bytes": METRICS.overlay_published_bytes.load(Ordering::Relaxed),
                 "overlay_gap_seeds": METRICS.overlay_gap_seeds.load(Ordering::Relaxed),
@@ -12020,11 +12026,109 @@ impl SqueezefsFilesystem {
             .map(|(ino, _)| ino)
     }
 
-    /// The B2 read posture: reads of blocks with live overlays DRAIN
-    /// them first (freeze/complete/seed/publish — the §5.2 lock-free
-    /// composition is PR B3), so every ACKed byte resolves through the
-    /// durable map (law 1). One relaxed gauge load when no overlay is
-    /// open anywhere.
+    /// Await overlapping in-flight stores on `[first_page, pages)`.
+    /// ACK-early returns before CQE; coverage is published only at
+    /// complete_store (law 3). A long wait is the tripwire.
+    async fn await_overlay_pages(
+        &self,
+        rec: &crate::device_overlay::DeviceOverlayRecord,
+        first_page: usize,
+        pages: usize,
+    ) {
+        let mut spins = 0u32;
+        while rec.core.range_inflight(first_page, pages) {
+            spins += 1;
+            if spins == 1_000 {
+                METRICS
+                    .overlay_teardown_waits
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Compose-serve one read from a live overlay without freeze/seed/
+    /// publish. `None` = fall through to drain (multi-block, no record,
+    /// terminal). Covered pages DMA from the unpublished dest; gaps
+    /// stay zeros (law 5 — never dest recycled content).
+    pub(crate) async fn try_serve_overlay_read(
+        &self,
+        ino: u64,
+        offset: u64,
+        size: u32,
+    ) -> Option<Result<Vec<u8>, SqueezefsError>> {
+        if size == 0 || !crate::device_overlay::any_open_fast() {
+            return None;
+        }
+        let block_size = self.router.block_size.load(Ordering::Relaxed);
+        if block_size == 0 {
+            return None;
+        }
+        let end = offset.saturating_add(u64::from(size));
+        let b = offset / block_size;
+        if end.saturating_sub(1) / block_size != b {
+            return None;
+        }
+        let rec = self.device_overlays.get(ino, b as u32)?;
+        match rec.core.state() {
+            crate::overlay_core::OverlayState::Open | crate::overlay_core::OverlayState::Frozen => {
+            }
+            _ => return None,
+        }
+        let rel = (offset - b * block_size) as usize;
+        let len = size as usize;
+        let blk = rec.core.len() as usize;
+        if rel >= blk {
+            return Some(Ok(Vec::new()));
+        }
+        let take = len.min(blk - rel);
+        let first_page = rel / crate::overlay_core::OVERLAY_PAGE;
+        let pages = (rel + take).div_ceil(crate::overlay_core::OVERLAY_PAGE) - first_page;
+        loop {
+            let snap = rec.core.read_begin();
+            self.await_overlay_pages(&rec, first_page, pages).await;
+            if rec.core.state().is_terminal() {
+                return None;
+            }
+            let mut out = vec![0u8; take];
+            for (ps, pc) in rec.core.covered_runs(first_page, pages) {
+                let run_lo = ps * crate::overlay_core::OVERLAY_PAGE;
+                let run_hi = ((ps + pc) * crate::overlay_core::OVERLAY_PAGE).min(blk);
+                let from = run_lo.max(rel);
+                let to = run_hi.min(rel + take);
+                if from >= to {
+                    continue;
+                }
+                let n = to - from;
+                match rec
+                    .device
+                    .read_block(rec.dest_offset + from as u64, n)
+                    .await
+                {
+                    Ok(got) if got.len() >= n => {
+                        out[from - rel..from - rel + n].copy_from_slice(&got[..n]);
+                    }
+                    Ok(got) => {
+                        return Some(Err(SqueezefsError::Io(std::io::Error::other(format!(
+                            "overlay compose short read ({} < {n})",
+                            got.len()
+                        )))));
+                    }
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+            if rec.core.read_valid(snap) && !rec.core.range_inflight(first_page, pages) {
+                METRICS.overlay_read_serves.fetch_add(1, Ordering::Relaxed);
+                METRICS
+                    .overlay_read_serve_bytes
+                    .fetch_add(take as u64, Ordering::Relaxed);
+                return Some(Ok(out));
+            }
+        }
+    }
+
+    /// Drain fallback: freeze/complete/seed/publish. Used when compose
+    /// cannot cover the request (multi-block span, terminal record).
     pub(crate) async fn drain_device_overlays_range(
         &self,
         ino: u64,
@@ -17446,15 +17550,30 @@ impl Filesystem for SqueezefsFilesystem {
         }
 
         let prof = OpProf::begin(FuseOpKind::Read, ino);
-        // Device-overlay B2 read posture: blocks with live overlays are
-        // DRAINED (freeze/complete/seed-zeros/publish) before this read
-        // resolves — every ACKed byte then reaches it through the
-        // durable map (law 1; the §5.2 lock-free composition is PR B3).
-        // One relaxed gauge load on overlay-free mounts.
+        // Overlay reads compose first (covered → dest, gaps → zeros)
+        // so a 1 MiB read of a 1 MiB store does not zero-seed the rest
+        // of the 4 MiB block. Drain is the multi-block / terminal
+        // fallback. One relaxed gauge load on overlay-free mounts.
         if crate::device_overlay::any_open_fast() {
-            self.drain_device_overlays_range(ino, offset, offset.saturating_add(size as u64))
-                .await
-                .map_err(map_squeezefs_err)?;
+            match self.try_serve_overlay_read(ino, offset, size).await {
+                Some(Ok(buf)) => {
+                    return Ok(ReplyData {
+                        data: buf.into(),
+                        backing: None,
+                        zc_prefilled: None,
+                    });
+                }
+                Some(Err(e)) => return Err(map_squeezefs_err(e)),
+                None => {
+                    self.drain_device_overlays_range(
+                        ino,
+                        offset,
+                        offset.saturating_add(size as u64),
+                    )
+                    .await
+                    .map_err(map_squeezefs_err)?;
+                }
+            }
         }
         // Serve-residence decomposition (read_serve_phase_ns, always-on):
         // t0 anchors `prelude` and `total`; the router records the inner

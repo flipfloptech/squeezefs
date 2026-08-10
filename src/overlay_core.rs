@@ -371,6 +371,39 @@ impl OverlayRecordCore {
         true
     }
 
+    /// True iff a live claim overlaps `[first_page, first_page + pages)`.
+    pub fn range_inflight(&self, first_page: usize, pages: usize) -> bool {
+        pages > 0 && self.claims.overlaps(first_page, pages)
+    }
+
+    /// Coalesced covered page runs inside `[first_page, first_page + pages)`.
+    /// Caller waits out [`Self::range_inflight`] first; uncovered pages
+    /// are omitted (the serve fills them with zeros — law 5).
+    pub fn covered_runs(&self, first_page: usize, pages: usize) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let end = first_page.saturating_add(pages).min(self.pages);
+        let mut p = first_page.min(self.pages);
+        while p < end {
+            if !self.page_covered(p) {
+                p += 1;
+                continue;
+            }
+            let start = p;
+            p += 1;
+            while p < end && self.page_covered(p) {
+                p += 1;
+            }
+            out.push((start, p - start));
+        }
+        out
+    }
+
+    fn page_covered(&self, page: usize) -> bool {
+        let word = page / 64;
+        let bit = page % 64;
+        self.covered[word].load(Ordering::SeqCst) & (1u64 << bit) != 0
+    }
+
     /// §5.2 step 1: the generation snapshot (one word).
     pub fn read_begin(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)

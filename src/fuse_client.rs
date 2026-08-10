@@ -12066,8 +12066,25 @@ impl SqueezefsFilesystem {
             }
             _ => return None,
         }
+        // EOF clamp (generic/795, 2026-08-09 gate find): this serve runs
+        // BEFORE the handler's size prelude, and block bounds alone let a
+        // read past EOF return law-5 gap zeros AS FILE CONTENT at full
+        // requested length ("size led data" — the recopy storm's 7/20
+        // load failure, 0/20 overlay-off). Both size caches publish at
+        // ACK, so they lag truth and never lead it: a stale value can
+        // only SHORTEN the serve, and a short read of a concurrently
+        // growing file is legal. No size authority at all ⇒ decline to
+        // the drain path, whose ordinary read ladder resolves size loud.
+        let mut file_size = self.attr_cache.get(&ino).map(|(attr, _)| attr.size);
+        if let Some(m) = self.router.metadata_cache.get(&ino) {
+            file_size = Some(file_size.map_or(m.size, |s| s.max(m.size)));
+        }
+        let file_size = file_size?;
+        if offset >= file_size {
+            return Some(Ok(Vec::new()));
+        }
         let rel = (offset - b * block_size) as usize;
-        let len = size as usize;
+        let len = (size as usize).min((file_size - offset) as usize);
         let blk = rec.core.len() as usize;
         if rel >= blk {
             return Some(Ok(Vec::new()));

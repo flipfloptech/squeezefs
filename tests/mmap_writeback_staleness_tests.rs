@@ -64,6 +64,7 @@ struct H {
 
 async fn make(uuid: [u8; 16], alloc_ns: &str) -> H {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", BS.to_string());
+    squeezefs::device_overlay::set_device_overlay_for_tests(false, false);
     let dlm = DlmClient::new().unwrap();
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())

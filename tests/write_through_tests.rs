@@ -116,6 +116,8 @@ struct H {
 
 async fn make_with(test_id: &str, write_disk: &str, block_size: &str) -> H {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", block_size);
+    // This suite pins the accumulation write-through path.
+    squeezefs::device_overlay::set_device_overlay_for_tests(false, false);
     let dlm = DlmClient::new().unwrap();
 
     let b = NamedTempFile::new().unwrap();

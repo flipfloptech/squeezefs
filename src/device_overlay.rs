@@ -67,10 +67,29 @@ fn tri(state: &AtomicU8, knob: &str) -> bool {
 }
 
 /// The `SQUEEZEFS_DEVICE_OVERLAY` knob (registry entry in
-/// `src/env_knobs.rs`; default OFF until the B5 gate row — D17's
-/// measured-posture rule applies from the bracket on).
+/// `src/env_knobs.rs`; default ON — one-path: fresh/hole stores are
+/// overlay, not an opt-in. `=0` is the accumulation A/B).
+///
+/// In-process `cfg(test)` readers default OFF so accumulation / W1
+/// harnesses stay on the path they pin (they would otherwise steal
+/// every fresh hole). The **binary** (live mounts, field) is ON.
 pub fn device_overlay_enabled() -> bool {
-    tri(&ENABLED, "SQUEEZEFS_DEVICE_OVERLAY")
+    match ENABLED.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let default = !cfg!(test);
+            let on = crate::env_knobs::bool_knob("SQUEEZEFS_DEVICE_OVERLAY", default);
+            ENABLED.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Drop the test pin so the next probe re-reads env / the ON default.
+pub fn clear_device_overlay_for_tests() {
+    ENABLED.store(0, Ordering::Relaxed);
+    BYTES_VEHICLE.store(0, Ordering::Relaxed);
 }
 
 /// Whether `WritePayload::Bytes` may ride the overlay store.

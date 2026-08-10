@@ -698,6 +698,7 @@ async fn make(uuid: [u8; 16], alloc_ns: &str) -> H {
     // downscaled BS would make sub-block segments patch-eligible and
     // bypass the machinery under test).
     squeezefs::fuse_client::set_patch_max_bytes(0);
+    squeezefs::device_overlay::set_device_overlay_for_tests(false, false);
     let dlm = DlmClient::new().unwrap();
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())

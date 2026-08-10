@@ -94,6 +94,7 @@ async fn open_fs(
     backing_path: &std::path::Path,
     staging: &std::path::Path,
 ) -> SqueezefsFilesystem {
+    squeezefs::device_overlay::set_device_overlay_for_tests(false, false);
     let dlm = DlmClient::new().unwrap();
     let nvme = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(
         backing_path.to_str().unwrap(),

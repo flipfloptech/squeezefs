@@ -436,6 +436,7 @@ fn documented_defaults_match_the_shipped_ones() {
         ("SQUEEZEFS_IPC_ARENA_THP", true),
         ("SQUEEZEFS_IL_READ_DEST", true),
         ("SQUEEZEFS_REWRITE_SHADOW", true),
+        ("SQUEEZEFS_DEVICE_OVERLAY", true),
         ("SQUEEZEFS_DISCARD_ELISION", true),
         ("SQUEEZEFS_FUSE_KMBUF", true),
         // FLIPPED ON by ruling D16 (user, 2026-08-07), superseding the

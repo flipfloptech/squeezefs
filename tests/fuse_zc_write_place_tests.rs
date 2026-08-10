@@ -130,6 +130,8 @@ fn spawn_zc_mount(meta: &Path, mnt: &Path, log: &Path, envs: &[(&str, &str)]) ->
         // this suite tests the MACHINERY, so it arms explicitly — the
         // lever-off contract passes its own =0 (matching the default).
         .env("SQUEEZEFS_FUSE_PLACED_MERGE", "1")
+        // Place vs overlay: overlay-eligible deliveries refuse place.
+        .env("SQUEEZEFS_DEVICE_OVERLAY", "0")
         // Pin the transport payload geometry (the venue-independence
         // law the fusion suite established): 1 MiB payload.
         .env("SQUEEZEFS_FUSE_MAX_WRITE", "1048576");

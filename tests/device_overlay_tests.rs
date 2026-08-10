@@ -46,7 +46,10 @@ use fuse3::raw::prelude::Filesystem;
 use fuse3::raw::Request;
 use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::cache::TieredCache;
-use squeezefs::device_overlay::{set_ack_early_for_tests, set_device_overlay_for_tests};
+use squeezefs::device_overlay::{
+    clear_device_overlay_for_tests, device_overlay_enabled, set_ack_early_for_tests,
+    set_device_overlay_for_tests,
+};
 use squeezefs::dlm::DlmClient;
 use squeezefs::fuse_client::{SqueezefsFilesystem, METRICS};
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
@@ -221,6 +224,35 @@ async fn promote_striped(h: &H, ino: u64) -> Vec<u8> {
 
 fn m(v: &squeezefs::fuse_client::Align64<std::sync::atomic::AtomicU64>) -> u64 {
     v.load(Ordering::Relaxed)
+}
+
+/// One-path: overlay is the shipped fresh-write store, not an opt-in.
+/// The binary reads default ON; in-process `cfg(test)` readers default
+/// OFF so accumulation harnesses do not steal fresh holes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlay_defaults_on_when_unset() {
+    let _g = serial().await;
+    assert_eq!(
+        squeezefs::env_knobs::lookup("SQUEEZEFS_DEVICE_OVERLAY")
+            .expect("registered")
+            .default,
+        "on",
+        "registry default is the shipped binary"
+    );
+    std::env::remove_var("SQUEEZEFS_DEVICE_OVERLAY");
+    assert!(
+        squeezefs::env_knobs::bool_knob("SQUEEZEFS_DEVICE_OVERLAY", true),
+        "production reader (default true) is ON when unset"
+    );
+    std::env::set_var("SQUEEZEFS_DEVICE_OVERLAY", "0");
+    clear_device_overlay_for_tests();
+    assert!(!device_overlay_enabled(), "=0 is the accumulation A/B");
+    std::env::set_var("SQUEEZEFS_DEVICE_OVERLAY", "1");
+    clear_device_overlay_for_tests();
+    assert!(device_overlay_enabled(), "explicit 1 enables in-process");
+    std::env::remove_var("SQUEEZEFS_DEVICE_OVERLAY");
+    set_device_overlay_for_tests(true, true);
+    set_ack_early_for_tests(false, false);
 }
 
 // ---------------------------------------------------------------------

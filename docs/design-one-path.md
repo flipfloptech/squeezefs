@@ -93,7 +93,7 @@ The inventory below is from live code, not folklore. Every row is a *named* path
 | Accumulation + write-through + rewrite-shadow CoW | **the shipped streaming *and* whole-block-overwrite path** | `ActiveBlockBuf` + RW3b coverage union → DMA when complete; overwrite publishes via rewrite-shadow (`pipeline_upload_parked_block` takes CoW/supersession unless `inplace_overwrite_enabled()`) | `SQUEEZEFS_REWRITE_SHADOW` default ON (`=0` is an A/B). This is the **live whole-block overwrite winner** on zram-lz4 |
 | W1 sole-owner patch | ON (`SQUEEZEFS_PATCH_MAX_BYTES` derived block/8) | LBA-aligned exclusive overwrite of mapped whole-block passthrough | `try_sole_owner_patch` |
 | W2 extent overlay | ON | patch-ineligible small writes; park extents, fold later | `SQUEEZEFS_FOLD_MAX_*` |
-| Device overlay B2 | **OFF** | fresh/hole aligned single-block; slot/Bytes → unpublished dest. Mapped blocks still `Ok(false)` ("the overwrite shape is PR B4") | `SQUEEZEFS_DEVICE_OVERLAY`; `try_device_overlay_store` / `overlay_hold_eligible`. `device_overlay_enabled` comment: default OFF until the **B5 gate row** |
+| Device overlay B2 | **ON** (shipped) | fresh/hole aligned single-block; slot/Bytes → unpublished dest. Mapped blocks still `Ok(false)` ("the overwrite shape is PR B4") | `SQUEEZEFS_DEVICE_OVERLAY`; `try_device_overlay_store` / `overlay_hold_eligible`. `=0` is the accumulation A/B. In-process `cfg(test)` readers default OFF |
 | Inplace overwrite | **OFF** | full-block sole-owner rewrite, zero displacement | `SQUEEZEFS_INPLACE_OVERWRITE` — substrate-measured ≈ 2× loss on zram-lz4 |
 | FUSE placed merge (Approach A) | **OFF, falsified** | FUSE `WRITE_FIXED(slot → memfd assembly)` + adopt | `SQUEEZEFS_FUSE_PLACED_MERGE`; `zc_write_place`. ~25 % capture. Distinct from IL `placed_sever` |
 
@@ -388,7 +388,7 @@ Consequences:
 
 ### 5.4 Overlay is the fresh path — P2-prep then P2-flip
 
-Today `SQUEEZEFS_DEVICE_OVERLAY` is default OFF (D17): B2 ACK-after-CQE lost 0.77× with engagement exact. `device_overlay_enabled`'s comment still says "default OFF until the **B5 gate row**." This program does **not** redefine "B-initial." Overlay PR B5 still closes B-initial (fsync-storm + B4 coexistence + the §1.3/§1.4 number) and is **not** a P2-flip conjunct. OQ1 flips the *one-path* default without waiting on the A-leg number; last counted overlay row remains 0.77× — accepted risk R1.
+`SQUEEZEFS_DEVICE_OVERLAY` is default **ON** (feat/one-path-writes): the fresh/hole A-leg is the shipped store. `=0` is the accumulation A/B (B2's 0.77× ACK-after-CQE control). Overlay PR B5 still closes the overlay program's B-initial (fsync-storm + B4 coexistence) and is **not** a one-path conjunct. Last counted overlay row remains 0.77× until the field A-leg note — accepted risk R1; KISS+FAST ships the path.
 
 **P2-prep** (mergeable now, default stays OFF):
 
@@ -698,7 +698,7 @@ Mount log: one line that states the admission **facts** (overlay armed/unarmed, 
 
 | Stage | Default mount | What is allowed |
 |---|---|---|
-| **Now (tip `c987ce0b`)** | overlay OFF, dest-lease ON, read-lane ON, fusion ON, zc ON, FUSE placed-merge OFF, inplace OFF, rewrite-shadow ON, hybrid derived | P-minus-one live. Overlay is opt-in for the A-leg re-bracket only |
+| **Now (feat/one-path-writes)** | overlay **ON** (binary), dest-lease ON, read-lane ON, fusion ON, zc ON, FUSE placed-merge OFF, inplace OFF, rewrite-shadow ON, hybrid derived | Fresh/hole A-leg is the default mount. `=0` accumulation A/B |
 | **P0** | unchanged | Law + drift tests + ACK-time admission counters + class-(3) purpose strings + mount-log + comment repairs. **No program-acceptance claim.** Fusion cap is F0, not P0 |
 | **F0** | unchanged | `fusion_ceiling` cap at hold bound after INIT; 256 KiB A/B stays |
 | **P2-prep** | unchanged | Streaming-hold pins (streaming-hold forced on *in tests only*); do not arm it in production while overlay is OFF; `device_overlay_enabled` comment updated |

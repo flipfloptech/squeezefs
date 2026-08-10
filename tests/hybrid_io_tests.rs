@@ -69,6 +69,7 @@ async fn make_with(uuid: [u8; 16], alloc_ns: &str) -> H {
     // prior test of this binary must never leak forward).
     squeezefs::fuse_client::set_patch_max_bytes(512 * 1024);
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "524288");
+    squeezefs::device_overlay::set_device_overlay_for_tests(false, false);
     let dlm = DlmClient::new().unwrap();
 
     let b = NamedTempFile::new().unwrap();

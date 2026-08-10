@@ -1122,6 +1122,7 @@ impl Drop for InplaceOff {
 
 async fn make_field_harness(test_id: &str) -> FieldH {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", FBS.to_string());
+    squeezefs::device_overlay::set_device_overlay_for_tests(false, false);
     let dlm = DlmClient::new().unwrap();
     let backing = NamedTempFile::new().unwrap();
     std::fs::File::create(backing.path())

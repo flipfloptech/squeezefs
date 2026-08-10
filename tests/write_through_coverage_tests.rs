@@ -89,6 +89,7 @@ async fn make(uuid: [u8; 16], alloc_ns: &str) -> H {
     // would bypass the machinery under test — pin the patch path OFF, as
     // striped_overwrite_lazy_seed_tests does for the same reason.
     squeezefs::fuse_client::set_patch_max_bytes(0);
+    squeezefs::device_overlay::set_device_overlay_for_tests(false, false);
     let dlm = DlmClient::new().unwrap();
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())
@@ -622,6 +623,7 @@ async fn crash_with_ooo_parked_segments_leaves_old_blocks_intact() {
     let _g = serial().await;
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "65536");
     squeezefs::fuse_client::set_patch_max_bytes(0);
+    squeezefs::device_overlay::set_device_overlay_for_tests(false, false);
     let meta = NamedTempFile::new().unwrap();
     let backing = NamedTempFile::new().unwrap();
     std::fs::File::create(backing.path())

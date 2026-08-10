@@ -144,7 +144,9 @@ fn spawn_zc_mount(meta: &Path, mnt: &Path, log: &Path, envs: &[(&str, &str)]) ->
         // host's fs.fuse.max_pages_limit would otherwise vary the
         // negotiated size across venues (256 ⇒ 1 MiB, sqz-host 1024 ⇒
         // 4 MiB). 1 MiB ⇒ hold < 512 KiB, derived ceiling = 128 KiB.
-        .env("SQUEEZEFS_FUSE_MAX_WRITE", "1048576");
+        .env("SQUEEZEFS_FUSE_MAX_WRITE", "1048576")
+        // Fusion suite pins W1 HOLD/fuse, not overlay streaming-hold.
+        .env("SQUEEZEFS_DEVICE_OVERLAY", "0");
     for (k, v) in envs {
         cmd.env(k, v);
     }

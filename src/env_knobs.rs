@@ -177,7 +177,7 @@ pub static KNOBS: &[Knob] = &[
     k("SQUEEZEFS_NVME_WRITE_LANES", int(1, 1024), "derived (cpus / data devices)", "Per-device DATA-WRITE submission fan-out lanes, block-offset affinity (write-lane-fanout campaign); 1 = single-worker pre-fanout A/B posture."),
     k("SQUEEZEFS_DIRECT_DEVICE_TRUE", Kind::Bool, "off", "Strict device-true O_DIRECT (the amplification-measurement escape); default serves O_DIRECT like buffered."),
     // -- Copy economy ----------------------------------------------------
-    k("SQUEEZEFS_WRITE_SHARED", Kind::Bool, "off", "Shared-mode write admission (design-write-inode-convoy): fully-mapped within-EOF striped overwrites take the inode READ guard. PR 1 exports the posture + candidate ledger only (every class still runs exclusive); PR 3 flips the default ON and `0` becomes the measurement A/B, never an operational escape."),
+    k("SQUEEZEFS_WRITE_SHARED", Kind::Bool, "on", "Shared-mode write admission (design-write-inode-convoy): fully-mapped within-EOF striped overwrites take the inode READ guard (classify → acquire-as-classified → revalidate → at most one upgrade). Default ON since PR 3; `=0` is the measurement A/B lever, never an operational escape."),
     k("SQUEEZEFS_NT_COPY", Kind::Bool, "on", "Non-temporal stores at the two DMA-destined copy sites; 0 = the A/B control."),
     k("SQUEEZEFS_NT_COPY_MIN", int(0, BYTES_MAX), "262144", "NT-store engagement floor, bytes."),
     k("SQUEEZEFS_NT_READ_SERVE", Kind::Bool, "on", "Non-temporal stores on dest-arm read serves; 0 = the A/B control."),

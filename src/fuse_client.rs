@@ -3370,14 +3370,30 @@ pub fn cached_range_fully_mapped(
 }
 
 /// The `SQUEEZEFS_WRITE_SHARED` admission posture (registry entry in
-/// `src/env_knobs.rs`; ENG-10). PR 1: exported on the stats inode only —
-/// candidates are counted regardless, and every class still takes the
-/// exclusive guard. PR 3 consults this at admission (default flips ON;
-/// `=0` becomes the measurement A/B, the `SQUEEZEFS_NT_COPY` pattern —
-/// never an operational escape).
+/// `src/env_knobs.rs`; ENG-10). PR 3: consulted at admission — the
+/// pre-lock probe may route a fully-mapped within-EOF striped overwrite
+/// onto the inode READ guard. Default ON; `=0` is the measurement A/B
+/// (the `SQUEEZEFS_NT_COPY` pattern — never an operational escape).
+/// Candidates are counted regardless of the posture.
 pub fn write_shared_enabled() -> bool {
-    static MEMO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *MEMO.get_or_init(|| crate::env_knobs::bool_knob("SQUEEZEFS_WRITE_SHARED", false))
+    // Test override first (the `set_device_overlay_for_tests` tri-state
+    // pattern): suites pin the posture without env-order coupling.
+    match WRITE_SHARED_OVERRIDE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            static MEMO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *MEMO.get_or_init(|| crate::env_knobs::bool_knob("SQUEEZEFS_WRITE_SHARED", true))
+        }
+    }
+}
+
+static WRITE_SHARED_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Test override for the Shared-write admission posture (tests only;
+/// the `set_device_overlay_for_tests` precedent).
+pub fn set_write_shared_for_tests(on: bool) {
+    WRITE_SHARED_OVERRIDE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
 }
 
 /// §5.4 lease-severance boundary (zero-copy write-path design, PR 5).
@@ -4886,6 +4902,29 @@ pub struct Metrics {
     /// §4.1 candidates: inline / staged-transition / unknown layouts
     /// (write guard, whole op).
     pub write_lock_candidate_entire: Align64<AtomicU64>,
+    // ---- FINAL-scope ledger (KD-8, PR 3): the guard mode actually HELD
+    // after held-guard revalidation — the engagement instrument. Closure
+    // law: Σ scope ≡ Σ candidate ≡ classified writes (per row); an
+    // upgraded op counts its POST-upgrade class here plus one
+    // `shared_upgrades`. ----
+    /// Writes DISPATCHED on the shared (read) guard.
+    pub write_lock_scope_shared: Align64<AtomicU64>,
+    /// Writes dispatched on the exclusive guard, drop-before-data-I/O.
+    pub write_lock_scope_metaprep: Align64<AtomicU64>,
+    /// Writes dispatched holding the exclusive guard for the whole op.
+    pub write_lock_scope_entire: Align64<AtomicU64>,
+    /// Shared admissions that failed held-guard revalidation and took
+    /// the ONE upgrade to exclusive (KD-2). Zero on fully-mapped
+    /// overwrite rows = floor healthy; nonzero around truncate storms =
+    /// the upgrade working.
+    pub write_lock_scope_shared_upgrades: Align64<AtomicU64>,
+    /// Per-mode inode-guard wait histograms (KD-8): the convicting
+    /// instrument must survive the fix — a Shared wait cannot vanish
+    /// into an unmetered `read().await`. The aggregate
+    /// `write_lock_wait` keeps recording every acquisition (an upgraded
+    /// op records once per acquisition, so twice).
+    pub write_lock_wait_shared: Align64<LatencyHistogram>,
+    pub write_lock_wait_exclusive: Align64<LatencyHistogram>,
     pub block_lock_wait: Align64<LatencyHistogram>,
     pub lease_lock_wait: Align64<LatencyHistogram>,
     pub dlm_acquire_time: Align64<LatencyHistogram>,
@@ -8647,12 +8686,19 @@ impl SqueezefsFilesystem {
                 "ipc_direct_ineligible_backend": METRICS.ipc_direct_ineligible_backend.load(Ordering::Relaxed),
                 "ipc_direct_ineligible_policy": METRICS.ipc_direct_ineligible_policy.load(Ordering::Relaxed),
                 "write_lock_wait": METRICS.write_lock_wait.to_json(),
-                // design-write-inode-convoy §7: the candidate ledger +
-                // the admission posture (PR 3 flips the default ON and
-                // adds the FINAL-scope ledger).
+                // design-write-inode-convoy §7: the candidate ledger,
+                // the admission posture, the KD-8 FINAL-scope ledger
+                // (closure: Σ scope ≡ Σ candidate per row) and the
+                // per-mode guard-wait histograms.
                 "write_lock_candidate_shared": METRICS.write_lock_candidate_shared.load(Ordering::Relaxed),
                 "write_lock_candidate_metaprep": METRICS.write_lock_candidate_metaprep.load(Ordering::Relaxed),
                 "write_lock_candidate_entire": METRICS.write_lock_candidate_entire.load(Ordering::Relaxed),
+                "write_lock_scope_shared": METRICS.write_lock_scope_shared.load(Ordering::Relaxed),
+                "write_lock_scope_metaprep": METRICS.write_lock_scope_metaprep.load(Ordering::Relaxed),
+                "write_lock_scope_entire": METRICS.write_lock_scope_entire.load(Ordering::Relaxed),
+                "write_lock_scope_shared_upgrades": METRICS.write_lock_scope_shared_upgrades.load(Ordering::Relaxed),
+                "write_lock_wait_shared": METRICS.write_lock_wait_shared.to_json(),
+                "write_lock_wait_exclusive": METRICS.write_lock_wait_exclusive.to_json(),
                 "write_shared_enabled": if write_shared_enabled() { 1 } else { 0 },
                 "block_lock_wait": METRICS.block_lock_wait.to_json(),
                 "lease_lock_wait": METRICS.lease_lock_wait.to_json(),

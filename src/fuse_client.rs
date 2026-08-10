@@ -3165,7 +3165,8 @@ impl FlushDriver {
     }
 }
 
-/// P1-8: how long the FUSE write path holds the per-inode write lock.
+/// P1-8: which mode, and for how long, the FUSE write path holds the
+/// per-inode lock (design-write-inode-convoy §4.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InodeWriteLockScope {
     /// Hold exclusive lock for the entire write (inline RMW or layout transition).
@@ -3174,6 +3175,13 @@ pub enum InodeWriteLockScope {
     /// size update). Data I/O runs without the inode write lock; per-block
     /// [`BLOCK_FLUSH_LOCKS`] serialize active-block mutation.
     MetaPrepOnly,
+    /// Fully-mapped within-EOF striped overwrite (KD-3): hold the READ
+    /// (shared) guard, dropped before data I/O — the same drop point as
+    /// `MetaPrepOnly` (KD-1). The guard covers classification-
+    /// revalidation, lease, and the size/type/map snapshot; it is never
+    /// a DMA fence. A Shared holder never re-enters
+    /// `active_inode_locks` on the same ino (§4.2 must-not).
+    Shared,
 }
 
 /// Decide inode write-lock scope for a FUSE write.
@@ -3183,13 +3191,92 @@ pub enum InodeWriteLockScope {
 /// transition / whole-buffer RMW) paths keep the lock for the entire operation.
 pub const MAX_INLINE_SIZE: u64 = 4096;
 
+/// The one write lock-scope classifier (design-write-inode-convoy §4.1;
+/// the lock-scope half of design-one-path's "one admission, cheapest
+/// legal"). Inputs are RAM-cache probes only — a probe miss (`None`)
+/// routes to a write-guard class, never to a fetch (KD-2: no I/O before
+/// or under a Shared guard). The former `:18350` staged bypass is folded
+/// in (R-M2): this function is the ONLY scope authority.
+///
+/// PR-phase note (KD-8): this returns the **candidate**; the final scope
+/// exists only after PR 3's held-guard revalidation. In PR 1 candidates
+/// are counted (`write_lock_candidate_*`) while every class still takes
+/// today's exclusive guard.
 #[inline]
-pub fn inode_write_lock_scope(fits_inline: bool, is_striped: bool) -> InodeWriteLockScope {
-    if fits_inline || !is_striped {
-        InodeWriteLockScope::EntireOp
-    } else {
-        InodeWriteLockScope::MetaPrepOnly
+pub fn inode_write_lock_scope(
+    file_type: &str,
+    expected_new_size: u64,
+    block_size: u64,
+    size_floor: Option<u64>,
+    range_end: u64,
+    range_fully_mapped: Option<bool>,
+) -> InodeWriteLockScope {
+    if file_type == "striped" {
+        // Shared (KD-3, v1 mapped-only) lands with the predicate commit;
+        // until then every striped write keeps today's MetaPrepOnly.
+        let _ = (size_floor, range_end, range_fully_mapped);
+        return InodeWriteLockScope::MetaPrepOnly;
     }
+    // The folded staged bypass: a staged write that stays within one
+    // block publishes no layout transition — write guard, dropped
+    // before data I/O (byte-identical to the pre-fold `:18350` arm).
+    if file_type == "staged" && expected_new_size <= block_size {
+        return InodeWriteLockScope::MetaPrepOnly;
+    }
+    // Inline / staged-transition / unknown-layout shapes: write guard
+    // for the whole op (today's behavior — for every non-striped type
+    // the retired 2-arg form returned EntireOp unconditionally).
+    InodeWriteLockScope::EntireOp
+}
+
+/// Touched-block interval for `[offset, end)` (R2-M2): callers validate
+/// `end > offset` (zero-length writes return before classification) and
+/// `end`'s checked arithmetic before deriving blocks — no `len - 1`
+/// underflow anywhere. Returns `(first_block, last_block)` inclusive.
+#[inline]
+pub fn write_touched_blocks(offset: u64, end: u64, block_size: u64) -> (u64, u64) {
+    debug_assert!(end > offset && block_size > 0);
+    (offset / block_size, (end - 1) / block_size)
+}
+
+/// §4.1 clause 3 / R2-M1: is `[offset, end)` fully mapped in this ONE
+/// immutable cached snapshot? O(touched blocks), no I/O, no await.
+/// `None` = ineligible-for-Shared without a verdict: the map is not
+/// resident (a `block_map_id` whose blob was not rehydrated — the
+/// anomaly arm — or no map at all on a striped record). `Some(false)` =
+/// a genuine hole in the probed range. A resident rehydrated indirect
+/// map is a first-class `Some(..)` citizen — the refill decodes it into
+/// `CachedMetadata.block_map`, so the ~512-mapping 2 GiB diagnosis file
+/// stays in class.
+#[inline]
+pub fn cached_range_fully_mapped(
+    meta: &crate::routing::CachedMetadata,
+    offset: u64,
+    end: u64,
+    block_size: u64,
+) -> Option<bool> {
+    let bm = meta.block_map.as_ref()?;
+    let (first, last) = write_touched_blocks(offset, end, block_size);
+    if last > u32::MAX as u64 {
+        return Some(false); // beyond representable blocks ⇒ never mapped
+    }
+    for b in first..=last {
+        if !bm.contains_key(&(b as u32)) {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+/// The `SQUEEZEFS_WRITE_SHARED` admission posture (registry entry in
+/// `src/env_knobs.rs`; ENG-10). PR 1: exported on the stats inode only —
+/// candidates are counted regardless, and every class still takes the
+/// exclusive guard. PR 3 consults this at admission (default flips ON;
+/// `=0` becomes the measurement A/B, the `SQUEEZEFS_NT_COPY` pattern —
+/// never an operational escape).
+pub fn write_shared_enabled() -> bool {
+    static MEMO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MEMO.get_or_init(|| crate::env_knobs::bool_knob("SQUEEZEFS_WRITE_SHARED", false))
 }
 
 /// §5.4 lease-severance boundary (zero-copy write-path design, PR 5).
@@ -4683,6 +4770,21 @@ pub struct Metrics {
     pub data_device_sync_requests: Align64<AtomicU64>,
     /// Histograms for lock wait times and queue depths.
     pub write_lock_wait: Align64<LatencyHistogram>,
+    // ---- Write lock-scope CANDIDATE ledger (design-write-inode-convoy
+    // §7 / KD-8, PR 1): what the §4.1 classifier WOULD admit, counted
+    // while every class still takes today's exclusive guard. PR 3 adds
+    // the separate FINAL-scope ledger after held-guard revalidation —
+    // a preliminary Shared candidate never satisfies the engagement
+    // gate. A rand-overwrite row classifying below ~99 % shared here =
+    // predicate rot (the patch_ineligible_* pattern). ----
+    /// §4.1 candidates: fully-mapped within-EOF striped overwrites.
+    pub write_lock_candidate_shared: Align64<AtomicU64>,
+    /// §4.1 candidates: striped-but-not-Shared + the folded staged
+    /// bypass (write guard, dropped before data I/O).
+    pub write_lock_candidate_metaprep: Align64<AtomicU64>,
+    /// §4.1 candidates: inline / staged-transition / unknown layouts
+    /// (write guard, whole op).
+    pub write_lock_candidate_entire: Align64<AtomicU64>,
     pub block_lock_wait: Align64<LatencyHistogram>,
     pub lease_lock_wait: Align64<LatencyHistogram>,
     pub dlm_acquire_time: Align64<LatencyHistogram>,
@@ -8338,6 +8440,13 @@ impl SqueezefsFilesystem {
                 "ipc_direct_ineligible_backend": METRICS.ipc_direct_ineligible_backend.load(Ordering::Relaxed),
                 "ipc_direct_ineligible_policy": METRICS.ipc_direct_ineligible_policy.load(Ordering::Relaxed),
                 "write_lock_wait": METRICS.write_lock_wait.to_json(),
+                // design-write-inode-convoy §7: the candidate ledger +
+                // the admission posture (PR 3 flips the default ON and
+                // adds the FINAL-scope ledger).
+                "write_lock_candidate_shared": METRICS.write_lock_candidate_shared.load(Ordering::Relaxed),
+                "write_lock_candidate_metaprep": METRICS.write_lock_candidate_metaprep.load(Ordering::Relaxed),
+                "write_lock_candidate_entire": METRICS.write_lock_candidate_entire.load(Ordering::Relaxed),
+                "write_shared_enabled": if write_shared_enabled() { 1 } else { 0 },
                 "block_lock_wait": METRICS.block_lock_wait.to_json(),
                 "lease_lock_wait": METRICS.lease_lock_wait.to_json(),
                 "dlm_acquire_time": METRICS.dlm_acquire_time.to_json(),
@@ -13555,6 +13664,22 @@ impl SqueezefsFilesystem {
         Ok(size)
     }
 
+    /// §4.1 clause 2 (design-write-inode-convoy): the CONSERVATIVE size
+    /// floor for Shared classification — the **opposite** direction of
+    /// [`Self::freshest_size`] (whose `max` serves the never-lose-acked-
+    /// bytes law). This takes the *minimum* of the two live RAM caches
+    /// and returns `None` on any miss: a miss routes to a write-guard
+    /// class, never to a fetch (KD-2 — no I/O before or under Shared).
+    /// Stale-low can only route exclusive (safe); stale-high is
+    /// unrepresentable after PR 3's held-guard revalidation, because
+    /// truncate publishes its new size into BOTH caches before dropping
+    /// its exclusive guard. Pure loads, no await.
+    pub fn shared_size_floor(&self, ino: u64) -> Option<u64> {
+        let meta = self.router.metadata_cache.peek_with(&ino, |m| m.size)?;
+        let attr = self.attr_cache.peek_with(&ino, |(a, _)| a.size)?;
+        Some(meta.min(attr))
+    }
+
     /// Grow a file's logical size to `target_size` (a no-op if already at least
     /// that large). The newly exposed region [old_size, target_size) is a hole
     /// (reads zeros). Shared by the fallocate preallocate/extend and ZERO_RANGE
@@ -15517,7 +15642,7 @@ impl SqueezefsFilesystem {
     /// an on-disk layout-key change; at the default 4 MiB block size the
     /// cap is ~16 EiB−4 MiB, far past the i64 VFS ceiling — only small
     /// custom block sizes ever observe it.
-    fn max_file_size(&self) -> u64 {
+    pub fn max_file_size(&self) -> u64 {
         let bs = self.router.block_size.load(Ordering::Relaxed);
         (i64::MAX as u64).min(bs.saturating_mul(u32::MAX as u64))
     }
@@ -18195,14 +18320,25 @@ impl Filesystem for SqueezefsFilesystem {
         // deliveries by design).
         let wlen = payload.len();
 
+        // R2-M2 range contract (design-write-inode-convoy §4.1), ahead of
+        // EVERY side effect: a zero-length write succeeds with no lease,
+        // no dirty-generation mark, no killpriv, no time publish — the
+        // POSIX write(fd, buf, 0) shape.
+        if wlen == 0 {
+            return Ok(ReplyWrite { written: 0 });
+        }
         // The representable maximum: block indices are u32 across the
         // striped layout, so files cap at block_size × (2^32 − 1). Beyond
         // it the pre-fix path silently wrapped the block index mod 2^32
         // and read back zeros (fstests generic/525) — refuse EFBIG loud
-        // (pinned in tests/sparse_write_bounded_tests.rs).
-        if offset.saturating_add(wlen as u64) > self.max_file_size() {
-            return Err(Errno::from(libc::EFBIG));
-        }
+        // (pinned in tests/sparse_write_bounded_tests.rs). `checked_add`
+        // (R2-M2): u64 overflow is the same EFBIG verdict, computed once —
+        // `write_end` is the exclusive bound every touched-block
+        // derivation uses (never `len - 1`).
+        let write_end = match offset.checked_add(wlen as u64) {
+            Some(e) if e <= self.max_file_size() => e,
+            _ => return Err(Errno::from(libc::EFBIG)),
+        };
 
         // FUSE_HANDLE_KILLPRIV_V2: the kernel (or the il parity shim)
         // flagged this write's caller as non-CAP_FSETID — apply the
@@ -18347,10 +18483,43 @@ impl Filesystem for SqueezefsFilesystem {
 
             let use_router_write =
                 fits_inline || fits_staged || file_type == "inline" || file_type == "staged";
-            let lock_scope = if file_type == "staged" && expected_new_size <= block_size {
-                InodeWriteLockScope::MetaPrepOnly
+            // The ONE scope classifier (design-write-inode-convoy §4.1;
+            // the former staged bypass is folded inside). Probes are
+            // RAM-cache-only; misses route to write-guard classes.
+            // NOTE (KD-2/KD-8): in PR 1 this is counted at today's
+            // post-guard classification site; PR 3 moves the probe
+            // pre-lock as part of the acquire protocol and meters the
+            // FINAL scope separately after held-guard revalidation.
+            let size_floor = self.shared_size_floor(ino);
+            let range_mapped = if is_striped {
+                self.router
+                    .metadata_cache
+                    .get(&ino)
+                    .and_then(|m| cached_range_fully_mapped(&m, offset, write_end, block_size))
             } else {
-                inode_write_lock_scope(use_router_write, is_striped)
+                None
+            };
+            let candidate = inode_write_lock_scope(
+                file_type,
+                expected_new_size,
+                block_size,
+                size_floor,
+                write_end,
+                range_mapped,
+            );
+            match candidate {
+                InodeWriteLockScope::Shared => &METRICS.write_lock_candidate_shared,
+                InodeWriteLockScope::MetaPrepOnly => &METRICS.write_lock_candidate_metaprep,
+                InodeWriteLockScope::EntireOp => &METRICS.write_lock_candidate_entire,
+            }
+            .fetch_add(1, Ordering::Relaxed);
+            // PR 1 (R-m5): candidates are PREVIEW ONLY — behavior maps
+            // Shared onto MetaPrepOnly (the identical drop-before-I/O
+            // hold today's striped writes get) until PR 3's acquire
+            // protocol lands.
+            let lock_scope = match candidate {
+                InodeWriteLockScope::Shared => InodeWriteLockScope::MetaPrepOnly,
+                other => other,
             };
 
             // Kernel clock domain (fstests generic/423) — an attr-cache

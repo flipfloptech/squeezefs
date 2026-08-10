@@ -296,6 +296,7 @@ pub static KNOBS: &[Knob] = &[
     k("SQUEEZEFS_TEST_THP_PREP_STALL_MS", int(0, MS_MAX), "0", "Test seam: stall each deferred session-arena THP prep job, ms (the fleet-launch admission pin)."),
     k("SQUEEZEFS_TEST_INVAL_TAIL_STALL_MS", int(0, MS_MAX), "0", "Test seam: stall the detached pipeline upload before its invalidation tail, ms (the 2026-08-04 tail-vs-writer race pin)."),
     k("SQUEEZEFS_TEST_CHECKOUT_STALL_MS", int(0, MS_MAX), "0", "Test seam: stall the write handler post-checkout inside its held block-lock window, ms (pairs with the inval-tail stall)."),
+    k("SQUEEZEFS_TEST_ATTR_PUBLISH_STALL_MS", int(0, MS_MAX), "0", "Test seam: stall the write handler between its data phase and its size/attr postlude publish, ms (the KD-5/KD-6 attr-merge race pin — design-write-inode-convoy)."),
     k("SQUEEZEFS_TEST_NVME_READ_TIMEOUT_MS", int(1, MS_MAX), "30000", "Test seam: NVMe read timeout, ms."),
     k("SQUEEZEFS_TEST_POWER_CUT_DEVS", Kind::Str, "none", "Test seam: comma list of device paths armed for the power-cut simulator."),
     k("SQUEEZEFS_TEST_OVERLAY_BYTES", Kind::Bool, "0", "Test seam: force the overlay Bytes vehicle on even when SQUEEZEFS_DEVICE_OVERLAY is off (in-process suites). Production overlay already accepts Bytes (O_DIRECT at-delivery extract / IL severs). `set_device_overlay_for_tests` still pins off for slot-only suites."),

@@ -903,6 +903,45 @@ pub fn set_test_checkout_stall_ms(ms: u64) {
     test_checkout_stall_cell().store(ms, Ordering::Relaxed);
 }
 
+/// TEST SEAM (`SQUEEZEFS_TEST_ATTR_PUBLISH_STALL_MS`, the KD-5/KD-6
+/// attr-merge race pin — design-write-inode-convoy §4.4 rows 3/13/22):
+/// stall the write handler strictly AFTER its data phase completed
+/// (router commit / striped overlays readable, all inode/block guards
+/// dropped) and BEFORE its size/attr postlude publish — the window in
+/// which a truncate or a sibling writer's publication legally lands.
+/// Load selects such schedules; this lever selects them
+/// deterministically (`tests/attr_publish_tests.rs`). One relaxed load
+/// unset; never set in production.
+fn test_attr_publish_stall_cell() -> &'static std::sync::atomic::AtomicU64 {
+    static CELL: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        let v = std::env::var("SQUEEZEFS_TEST_ATTR_PUBLISH_STALL_MS")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        std::sync::atomic::AtomicU64::new(v)
+    })
+}
+
+/// Set the attr-publish stall seam (tests only; `0` disables).
+pub fn set_test_attr_publish_stall_ms(ms: u64) {
+    test_attr_publish_stall_cell().store(ms, Ordering::Relaxed);
+}
+
+/// Attr-publish stall-window entries (tests only — the seam's sequencing
+/// observable: a planted schedule polls it to know the writer is parked
+/// at the postlude edge before landing the racing op). Bumped only when
+/// the seam is armed; untouched in production.
+fn test_attr_publish_stall_entries_cell() -> &'static std::sync::atomic::AtomicU64 {
+    static CELL: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::atomic::AtomicU64::new(0))
+}
+
+/// Read the attr-publish stall-window entry count (tests only).
+pub fn test_attr_publish_stall_entries() -> u64 {
+    test_attr_publish_stall_entries_cell().load(Ordering::Relaxed)
+}
+
 /// Stall-window entries (tests only — the seam's sequencing observable:
 /// a planted-stale schedule polls it to know the in-flight snapshots are
 /// parked in the window before landing the superseding write). Bumped
@@ -18645,6 +18684,16 @@ impl Filesystem for SqueezefsFilesystem {
             }
 
             prof.mark_backend_done();
+            // TEST SEAM: park this write at the postlude edge — data
+            // landed, no guards held, publish not yet run (see
+            // `set_test_attr_publish_stall_ms`).
+            {
+                let stall = test_attr_publish_stall_cell().load(Ordering::Relaxed);
+                if stall > 0 {
+                    test_attr_publish_stall_entries_cell().fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(std::time::Duration::from_millis(stall)).await;
+                }
+            }
             // Size/mtime publish — strictly AFTER the data landed (either
             // router commit or the striped overlays; both are readable
             // now), so size never leads data (generic/795). The striped

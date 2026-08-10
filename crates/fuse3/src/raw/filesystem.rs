@@ -54,32 +54,6 @@ pub trait Filesystem {
         false
     }
 
-    /// zc-write PLACE seam (Approach A — the FUSE placed-merge assembly,
-    /// write-bandwidth program 2026-08-09): may this armed streaming
-    /// WRITE's payload bridge STRAIGHT into its `(ino, block)` merge
-    /// assembly (a memfd whose mmap view the first merging handler
-    /// adopts as the overlay backing), instead of the extraction bounce?
-    /// The filesystem owns the eligibility ladder AND the assembly
-    /// registry; the transport only executes the returned descriptor
-    /// (`WRITE_FIXED(slot → fd @ file_off)`) and calls
-    /// [`ZcWritePlacement::complete`] at the CQE.
-    ///
-    /// Default `None` — no placement, the extraction vehicle runs
-    /// unchanged. Contract: SYNC, cheap, non-blocking — called on the
-    /// transport queue-worker thread per eligible armed WRITE delivery.
-    ///
-    /// [`ZcWritePlacement::complete`]: crate::raw::connection::fuse_over_uring::fused::ZcWritePlacement::complete
-    #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
-    fn zc_write_place(
-        &self,
-        ino: Inode,
-        offset: u64,
-        len: u32,
-    ) -> Option<crate::raw::connection::fuse_over_uring::fused::ZcWritePlacement> {
-        let _ = (ino, offset, len);
-        None
-    }
-
     /// clean up filesystem. Called on filesystem exit which is fuseblk, in normal fuse filesystem,
     /// kernel may call forget for root. There is some discuss for this
     /// <https://github.com/bazil/fuse/issues/82#issuecomment-88126886>,

@@ -59,19 +59,10 @@ struct AlignedBlock {
 }
 
 /// Where an [`AlignedBlock`]'s memory came from (and therefore how it
-/// is returned). `Memfd` is the FUSE placed-merge assembly backing
-/// (write-bandwidth program, 2026-08-09): a `MAP_SHARED` mmap of an
-/// anonymous memfd, so the SAME bytes are reachable by fd (the queue
-/// worker's `WRITE_FIXED(slot → assembly)` bridge) and by VA (the
-/// adopted overlay backing + placed payload views) — the ZcBounce
-/// dual-face law, per-block.
+/// is returned).
 enum BlockBacking {
     Pooled,
     Oversized,
-    Memfd {
-        _fd: std::os::fd::OwnedFd,
-        map_len: usize,
-    },
 }
 
 // SAFETY: `ptr` designates a uniquely-owned allocation of `len` bytes.
@@ -107,60 +98,6 @@ impl AlignedBlock {
         }
     }
 
-    /// A memfd-backed block (the FUSE placed-merge assembly): fresh
-    /// anonymous memfd sized to page-rounded `len`, mapped
-    /// `MAP_SHARED | MAP_POPULATE` (zero-filled at birth — shmem pages).
-    /// Refusals are `None` — the caller falls back to the pooled vehicle.
-    fn alloc_memfd(len: usize) -> Option<(Self, std::os::fd::RawFd)> {
-        use std::os::fd::{AsRawFd, FromRawFd};
-        let page = 4096usize;
-        let map_len = len.checked_next_multiple_of(page)?;
-        // SAFETY: memfd_create with a static name; the fd is fresh.
-        let raw = unsafe { libc::memfd_create(c"sqz-placed-assembly".as_ptr(), libc::MFD_CLOEXEC) };
-        if raw < 0 {
-            return None;
-        }
-        // SAFETY: `raw` is a fresh owned descriptor.
-        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
-        // SAFETY: sizing our own fresh memfd.
-        if unsafe { libc::ftruncate(fd.as_raw_fd(), map_len as libc::off_t) } != 0 {
-            return None;
-        }
-        // SAFETY: fresh shared RW mapping over the memfd we just sized.
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                map_len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED | libc::MAP_POPULATE,
-                fd.as_raw_fd(),
-                0,
-            )
-        };
-        if ptr == libc::MAP_FAILED {
-            return None;
-        }
-        let raw_fd = fd.as_raw_fd();
-        Some((
-            Self {
-                ptr: ptr as *mut u8,
-                len,
-                backing: BlockBacking::Memfd { _fd: fd, map_len },
-            },
-            raw_fd,
-        ))
-    }
-
-    /// The memfd behind a placed-merge assembly backing (`None` for
-    /// pool/heap blocks — the bridge cannot target them).
-    fn memfd_raw(&self) -> Option<std::os::fd::RawFd> {
-        use std::os::fd::AsRawFd;
-        match &self.backing {
-            BlockBacking::Memfd { _fd, .. } => Some(_fd.as_raw_fd()),
-            _ => None,
-        }
-    }
-
     fn oversized_layout(len: usize) -> std::alloc::Layout {
         std::alloc::Layout::from_size_align(len, 4096)
             .expect("active-block layout (len rounded, 4096 align)")
@@ -193,11 +130,6 @@ impl Drop for AlignedBlock {
                 // SAFETY: allocated in `alloc_raw` with this exact layout.
                 unsafe { std::alloc::dealloc(self.ptr, Self::oversized_layout(self.len)) };
             }
-            BlockBacking::Memfd { map_len, .. } => {
-                // SAFETY: unmapping the region mapped in `alloc_memfd`;
-                // dropped once. The memfd closes with the OwnedFd.
-                unsafe { libc::munmap(self.ptr as *mut libc::c_void, *map_len) };
-            }
         }
     }
 }
@@ -218,21 +150,6 @@ impl SharedBlock {
     /// initialized memory — same class as every overlay backing).
     pub(crate) fn alloc(len: usize) -> Self {
         Self(Arc::new(AlignedBlock::alloc_raw(len)))
-    }
-
-    /// A memfd-backed shared block (the FUSE placed-merge assembly,
-    /// 2026-08-09): fd-reachable for the queue worker's
-    /// `WRITE_FIXED(slot → assembly)` bridge, VA-reachable for adoption
-    /// and payload views. `None` = allocation refusal (caller falls
-    /// back to the pooled vehicle).
-    pub(crate) fn alloc_memfd(len: usize) -> Option<(Self, std::os::fd::RawFd)> {
-        AlignedBlock::alloc_memfd(len).map(|(b, fd)| (Self(Arc::new(b)), fd))
-    }
-
-    /// The backing memfd when this block is a placed-merge assembly
-    /// (`None` for pool/heap blocks).
-    pub(crate) fn memfd_raw(&self) -> Option<std::os::fd::RawFd> {
-        self.0.memfd_raw()
     }
 
     pub(crate) fn len(&self) -> usize {

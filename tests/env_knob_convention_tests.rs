@@ -212,6 +212,10 @@ fn retired_spellings_refuse_naming_the_successor() {
             "SQUEEZEFS_RECLAIM_CONCURRENCY",
             "SQUEEZEFS_INODE_RECLAIM_CONCURRENCY",
         ),
+        (
+            "SQUEEZEFS_FUSE_PLACED_MERGE",
+            "(deleted — FUSE placed-merge was falsified; IL placed_sever is not this knob)",
+        ),
     ] {
         let v = env_knobs::validate_vars([(old, "64")]);
         assert_eq!(v.errors.len(), 1, "{old} must refuse: {v:?}");

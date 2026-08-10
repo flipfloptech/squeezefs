@@ -734,3 +734,53 @@ async fn bytes_overlay_ack_early_returns_before_device_cqe() {
     assert_eq!(back, data);
     squeezefs::nvme_dev::set_test_write_stall(0, 0);
 }
+
+/// 4 KiB-aligned extract/sever Bytes skip the BUFFER_POOL memcpy
+/// and DMA as `WriteData::Aligned` (the A-leg tax).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn aligned_overlay_bytes_skip_the_pool_copy() {
+    let _g = serial().await;
+    let h = make("ackearly-aligned-dma").await;
+    set_device_overlay_for_tests(true, true);
+    set_ack_early_for_tests(true, true);
+    clear_test_zc_slot_wrap();
+    let ino = create(&h, "f").await;
+    promote_striped(&h, ino).await;
+
+    let mut buf = squeezefs::cache::pool::BUFFER_POOL.alloc();
+    buf.resize(BS as usize, 0xE2);
+    let data = buf.into_bytes();
+    assert_eq!(
+        data.as_ptr() as usize % squeezefs::cache::pool::POOLED_BUF_ALIGN,
+        0
+    );
+    let pass0 = METRICS
+        .overlay_dma_passthrough_bytes
+        .load(Ordering::Relaxed);
+    let copy0 = METRICS.overlay_dma_pool_copy_bytes.load(Ordering::Relaxed);
+    let w =
+        h.fs.write(h.req, ino, 0, 2 * BS, data.clone(), 0, 0)
+            .await
+            .expect("aligned bytes overlay write");
+    assert_eq!(w.written, BS as u32);
+    eventually(
+        || METRICS.overlay_stores.load(Ordering::Relaxed) > 0,
+        "aligned overlay store published",
+    )
+    .await;
+    assert_eq!(
+        METRICS
+            .overlay_dma_passthrough_bytes
+            .load(Ordering::Relaxed)
+            - pass0,
+        BS,
+        "aligned overlay Bytes must DMA without a pool copy"
+    );
+    assert_eq!(
+        METRICS.overlay_dma_pool_copy_bytes.load(Ordering::Relaxed),
+        copy0,
+        "aligned overlay A-leg must not pay the pool bounce"
+    );
+    let back = read_at(&h, ino, 2 * BS, BS as u32).await;
+    assert_eq!(back, data.as_ref());
+}

@@ -336,3 +336,106 @@ impl DeviceOverlayRegistry {
         rec.retired.notify_waiters();
     }
 }
+
+/// Own overlay DMA bytes: pass through when already 4 KiB-aligned
+/// (at-delivery extract / IL sever), else one pool copy so
+/// `write_block` takes `WriteData::Aligned`.
+///
+/// The A-leg 1 MiB O_DIRECT extract is bounce-arena memory — page-aligned
+/// by the zc stride law — so the pool memcpy here was a pure tax on
+/// every fresh/hole store. Unaligned / odd-length Bytes (in-process
+/// `copy_from_slice` suites, residual GUP snapshots) still bounce.
+pub(crate) fn overlay_owned_dma_bytes(bytes: bytes::Bytes) -> bytes::Bytes {
+    let align = crate::cache::pool::POOLED_BUF_ALIGN;
+    if !bytes.is_empty() && (bytes.as_ptr() as usize) % align == 0 && bytes.len() % align == 0 {
+        crate::fuse_client::METRICS
+            .overlay_dma_passthrough_bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        return bytes;
+    }
+    let mut buf = crate::cache::pool::BUFFER_POOL.alloc();
+    if bytes.len() > buf.capacity() {
+        buf.resize(bytes.len(), 0);
+    }
+    buf.backing_mut()[..bytes.len()].copy_from_slice(&bytes);
+    buf.set_written_len(bytes.len());
+    crate::fuse_client::METRICS
+        .overlay_dma_pool_copy_bytes
+        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+    buf.into_bytes()
+}
+
+#[cfg(test)]
+mod overlay_dma_bytes_tests {
+    use super::overlay_owned_dma_bytes;
+    use crate::cache::pool::{BUFFER_POOL, POOLED_BUF_ALIGN};
+    use crate::fuse_client::METRICS;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn aligned_extract_bytes_skip_the_pool_copy() {
+        let mut buf = BUFFER_POOL.alloc();
+        buf.resize(8192, 0xCD);
+        let src = buf.into_bytes();
+        let ptr = src.as_ptr();
+        let pass0 = METRICS
+            .overlay_dma_passthrough_bytes
+            .load(Ordering::Relaxed);
+        let copy0 = METRICS.overlay_dma_pool_copy_bytes.load(Ordering::Relaxed);
+        let out = overlay_owned_dma_bytes(src);
+        assert_eq!(
+            out.as_ptr(),
+            ptr,
+            "4 KiB-aligned extract Bytes must DMA as-is — the pool copy \
+             is the A-leg tax this helper exists to delete"
+        );
+        assert_eq!(&out[..], &[0xCDu8; 8192]);
+        assert_eq!(
+            METRICS
+                .overlay_dma_passthrough_bytes
+                .load(Ordering::Relaxed)
+                - pass0,
+            8192
+        );
+        assert_eq!(
+            METRICS.overlay_dma_pool_copy_bytes.load(Ordering::Relaxed),
+            copy0,
+            "aligned passthrough must not count a pool copy"
+        );
+    }
+
+    #[test]
+    fn unaligned_bytes_still_bounce_into_the_pool() {
+        let mut v = vec![0xABu8; 8192 + POOLED_BUF_ALIGN];
+        // Force a non-4 KiB pointer so write_block would miss Aligned.
+        let off = 1 + (v.as_ptr() as usize % POOLED_BUF_ALIGN == 0) as usize;
+        v[off..off + 8192].fill(0xAB);
+        let src = bytes::Bytes::copy_from_slice(&v[off..off + 8192]);
+        assert_ne!(
+            src.as_ptr() as usize % POOLED_BUF_ALIGN,
+            0,
+            "fixture must be pointer-unaligned"
+        );
+        let copy0 = METRICS.overlay_dma_pool_copy_bytes.load(Ordering::Relaxed);
+        let out = overlay_owned_dma_bytes(src.clone());
+        assert_ne!(
+            out.as_ptr(),
+            src.as_ptr(),
+            "unaligned Bytes must take the pool bounce"
+        );
+        assert_eq!(out.as_ptr() as usize % POOLED_BUF_ALIGN, 0);
+        assert_eq!(&out[..], &src[..]);
+        assert_eq!(
+            METRICS.overlay_dma_pool_copy_bytes.load(Ordering::Relaxed) - copy0,
+            8192
+        );
+    }
+
+    #[test]
+    fn odd_length_bytes_bounce() {
+        let src = bytes::Bytes::from(vec![0x11u8; 100]);
+        let out = overlay_owned_dma_bytes(src.clone());
+        assert_eq!(&out[..], &src[..]);
+        assert_ne!(out.as_ptr(), src.as_ptr());
+    }
+}

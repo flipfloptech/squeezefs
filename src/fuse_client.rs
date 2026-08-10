@@ -5233,6 +5233,16 @@ pub struct Metrics {
     pub overlay_ack_early_stores: Align64<AtomicU64>,
     /// Byte face of [`Self::overlay_ack_early_stores`].
     pub overlay_ack_early_bytes: Align64<AtomicU64>,
+    /// Overlay Bytes vehicle that DMA'd the extract/sever buffer as-is
+    /// (`write_block` `WriteData::Aligned` — no `BUFFER_POOL` memcpy).
+    /// A-leg validity: ≈ `overlay_ack_early_bytes` on 4 KiB-aligned
+    /// extracts (1 MiB O_DIRECT FUSE).
+    pub overlay_dma_passthrough_bytes: Align64<AtomicU64>,
+    /// Overlay Bytes vehicle that still paid the pool bounce (pointer
+    /// or length not 4 KiB-aligned). ≈ 0 on the A-leg; in-process
+    /// `copy_from_slice` suites and odd-length tails are the legitimate
+    /// traffic.
+    pub overlay_dma_pool_copy_bytes: Align64<AtomicU64>,
     /// Transient-failure retries of ACKed stores (acked custody is
     /// retry-forever; only the fence drops it — `overlay_fence_drops`).
     pub overlay_ack_early_retries: Align64<AtomicU64>,
@@ -5281,16 +5291,11 @@ pub struct Metrics {
     /// walk's gap-completing arm. Overlay-specific attribution lives
     /// only in the fault-injection suite's harness knowledge).
     pub unpublished_offsets_recovered: Align64<AtomicU64>,
-    /// FUSE placed-merge (Approach A, 2026-08-09): placement CLAIMS
-    /// granted (a bridge target minted — the delivery-side half of the
-    /// `fuse3_zc_write_placements` pair, which counts CQE-confirmed
-    /// bridges).
-    pub placed_fuse_claims: Align64<AtomicU64>,
     /// Adoption attempts REFUSED by the seal Dekker (a matching
-    /// assembly existed but a bridge write was still in flight, or a
-    /// sibling raced the seal): the cohort-break gauge — each refusal
-    /// demotes that block's whole cohort to the copy path (correct,
-    /// counted; growth prices the quiescence window).
+    /// assembly existed but a sever was still in flight, or a sibling
+    /// raced the seal): the cohort-break gauge — each refusal demotes
+    /// that block's whole cohort to the copy path (correct, counted;
+    /// growth prices the quiescence window).
     pub placed_adoption_refusals: Align64<AtomicU64>,
     /// Gauge: live pre-adoption assembly bytes (block-size backings held
     /// by in-flight placed ring writes; R5 component `placed_assemblies`,
@@ -8260,6 +8265,12 @@ impl SqueezefsFilesystem {
                 // accumulate).
                 "overlay_ack_early_stores": METRICS.overlay_ack_early_stores.load(Ordering::Relaxed),
                 "overlay_ack_early_bytes": METRICS.overlay_ack_early_bytes.load(Ordering::Relaxed),
+                "overlay_dma_passthrough_bytes": METRICS
+                    .overlay_dma_passthrough_bytes
+                    .load(Ordering::Relaxed),
+                "overlay_dma_pool_copy_bytes": METRICS
+                    .overlay_dma_pool_copy_bytes
+                    .load(Ordering::Relaxed),
                 "overlay_ack_early_retries": METRICS.overlay_ack_early_retries.load(Ordering::Relaxed),
                 "overlay_claim_conflicts": METRICS.overlay_claim_conflicts.load(Ordering::Relaxed),
                 "overlay_read_drains": METRICS.overlay_read_drains.load(Ordering::Relaxed),
@@ -8277,17 +8288,7 @@ impl SqueezefsFilesystem {
                 "unpublished_offsets_recovered": METRICS.unpublished_offsets_recovered.load(Ordering::Relaxed),
                 "overlay_store_submits_qids": fuse3::zc_write_store_qid_census(),
                 "placed_merge_elides": METRICS.placed_merge_elides.load(Ordering::Relaxed),
-                "placed_fuse_claims": METRICS.placed_fuse_claims.load(Ordering::Relaxed),
                 "placed_adoption_refusals": METRICS.placed_adoption_refusals.load(Ordering::Relaxed),
-                // Approach A engagement (FUSE placed-merge, 2026-08-09):
-                // CQE-confirmed slot->assembly bridges + the byte face
-                // (the acceptance signature: placement bytes ~= row
-                // bytes; nt_copy AND extract bytes fall by the same);
-                // fallbacks = bridge failures/sealed retries riding the
-                // extraction vehicle.
-                "fuse3_zc_write_placements": fuse3::zc_write_placements(),
-                "fuse3_zc_write_placement_bytes": fuse3::zc_write_placement_bytes(),
-                "fuse3_zc_write_place_fallbacks": fuse3::zc_write_place_fallbacks(),
                 "placed_assembly_bytes": METRICS.placed_assembly_bytes.load(Ordering::Relaxed),
                 // Near-zero-copy campaign (2026-07-31): NT-store copy
                 // engagement at the DMA-destined copy sites (merge +
@@ -11482,17 +11483,9 @@ impl SqueezefsFilesystem {
                 if !z.ack_early_sound() && crate::device_overlay::ack_early_odirect() {
                     let snap = match z.materialize().await {
                         Ok(b) if b.len() == len => {
-                            let mut buf = crate::cache::pool::BUFFER_POOL.alloc();
-                            if b.len() > buf.capacity() {
-                                buf.resize(b.len(), 0);
-                            }
-                            buf.backing_mut()[..b.len()].copy_from_slice(&b);
-                            buf.set_written_len(b.len());
-                            // Drop the extract lease BEFORE we reply so
-                            // the §5.4 commit gate does not park the
-                            // ACK behind the snapshot DMA.
-                            drop(b);
-                            buf.into_bytes()
+                            // materialize() already extracted off the
+                            // GUP slot; aligned bounce Bytes DMA as-is.
+                            crate::device_overlay::overlay_owned_dma_bytes(b)
                         }
                         other => {
                             warn!(
@@ -11556,13 +11549,11 @@ impl SqueezefsFilesystem {
                 }
             };
             debug_assert_eq!(bytes.len(), len);
-            let mut buf = crate::cache::pool::BUFFER_POOL.alloc();
-            if bytes.len() > buf.capacity() {
-                buf.resize(bytes.len(), 0);
-            }
-            buf.backing_mut()[..bytes.len()].copy_from_slice(&bytes);
-            buf.set_written_len(bytes.len());
-            let owned = buf.into_bytes();
+            // At-delivery extract / IL sever Bytes are already 4 KiB-
+            // aligned (bounce stride / SharedBlock). Pass them to
+            // write_block as WriteData::Aligned — the pool memcpy was
+            // a second copy of every overlay A-leg byte.
+            let owned = crate::device_overlay::overlay_owned_dma_bytes(bytes);
             // Bytes are daemon-owned (at-delivery extract / IL sever) —
             // ACK-early is always sound. This is the 1 MiB O_DIRECT
             // A-leg: extract already happened on the worker; do not
@@ -16318,93 +16309,6 @@ impl Filesystem for SqueezefsFilesystem {
             return false;
         }
         true
-    }
-
-    /// The zc-write PLACE gate (Approach A — the FUSE placed-merge
-    /// assembly, write-bandwidth program 2026-08-09): may this armed
-    /// streaming WRITE bridge straight into its `(ino, block)` memfd
-    /// assembly? TRUE only for the FULL-repr streaming class the
-    /// checkout path will ADOPT:
-    ///
-    /// * page-aligned offset AND length ([`crate::placed_core::CLAIM_PAGE`]
-    ///   — the claim bitmap's granularity), single block;
-    /// * NOT the W2 small class (`len × 4 ≥ block_size` — the extent
-    ///   overlay's own `small` predicate inverted, so placements can
-    ///   never inflate a small-write row into full-buffer backings);
-    /// * a CACHE-LESS mount (empty `staging_dirs` — format-time,
-    ///   mount-immutable): beyond-inline writes route STRIPED, so the
-    ///   full-repr checkout owns every placed chunk and the staged
-    ///   sibling/extent probes are structurally empty. Staged-layout
-    ///   mounts ride the extraction vehicle unchanged (the honest v1
-    ///   bound — the adjudication's streaming venue is cache-less);
-    /// * no LIVE overlay entry for the block (the adopted-assembly
-    ///   isolation law's ROUTING face: post-adoption writes must never
-    ///   place — they extract and merge into the parked entry).
-    ///
-    /// The registry half (claims, cap, sealed/pooled refusals) lives in
-    /// [`crate::placed_sever::PlacedSeverRegistry::begin_placement`];
-    /// every refusal is a counted extraction fallback. Lock-free sync
-    /// probes only — this runs on the transport queue-worker thread.
-    fn zc_write_place(
-        &self,
-        ino: u64,
-        offset: u64,
-        len: u32,
-    ) -> Option<fuse3::raw::connection::fuse_over_uring::fused::ZcWritePlacement> {
-        // Default OFF — the Approach A falsification verdict
-        // (.benchmarks/2026-08-09-fuse-placed-merge.md): whole-cohort
-        // capture ceilings at ~25 % on every reachable streaming shape
-        // (per-inode write serialization upstream of delivery), so the
-        // conversion never materializes; the lever stays the counted
-        // A/B instrument and the machinery seeds Approach B.
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| crate::env_knobs::bool_knob("SQUEEZEFS_FUSE_PLACED_MERGE", false)) {
-            return None;
-        }
-        if len == 0 || is_virtual_ino(ino) {
-            return None;
-        }
-        // O_DIRECT overlay extracts at delivery (no HOLD) and would
-        // otherwise land here. A placement is accumulation, not an
-        // overlay store — refuse so the Bytes ACK-early arm owns the
-        // fresh/hole A-leg even when Approach A is the A/B instrument.
-        if self.overlay_hold_eligible(ino, offset, len) {
-            return None;
-        }
-        let block_size = self.router.block_size.load(Ordering::Relaxed);
-        if block_size == 0 {
-            return None;
-        }
-        let page = crate::placed_core::CLAIM_PAGE as u64;
-        if offset % page != 0 || u64::from(len) % page != 0 {
-            return None;
-        }
-        if u64::from(len) * 4 < block_size {
-            return None;
-        }
-        let b = offset / block_size;
-        if (offset + u64::from(len) - 1) / block_size != b {
-            return None;
-        }
-        if !self.router.cache.nvme.staging_dirs().is_empty() {
-            return None;
-        }
-        let key = crate::keys::active_block_stack(ino, b);
-        if self.active_block_buffers.contains_key(key.as_str()) {
-            return None;
-        }
-        let rel = (offset - b * block_size) as usize;
-        self.placed_assemblies
-            .begin_placement(ino, b, rel, len as usize, block_size as usize)
-            .map(
-                |p| fuse3::raw::connection::fuse_over_uring::fused::ZcWritePlacement {
-                    fd: p.fd,
-                    file_off: p.file_off,
-                    payload: p.payload,
-                    assembly_id: p.assembly_id,
-                    end_write: p.end_write,
-                },
-            )
     }
 
     async fn init(&self, _req: Request) -> FuseResult<ReplyInit> {

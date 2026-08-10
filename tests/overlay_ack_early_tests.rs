@@ -923,3 +923,83 @@ async fn dead_ring_and_dead_extract_terminate_loud_never_wedge() {
          (generic/464: it waited forever on the spinning claim)"
     );
 }
+
+/// generic/551 (release-gate battery, 2026-08-10; DURABLE corruption —
+/// 6/10 at the field shape, 10/10 at 128 MiB): one O_DIRECT AIO write's
+/// kernel-split segments race each other. A single-block sibling rode
+/// the overlay store; the straddling segment's slice (multi-block ⇒
+/// `try_overlay` false) hit the one-authority screen, which SETTLED the
+/// overlay — publishing the sibling's acked bytes as the block's
+/// binding — and then classified its seed off the REQUEST-ENTRY
+/// `existing_size` snapshot, stale by construction under concurrent
+/// siblings: `Fresh` (zeros complement). The write-through then
+/// DURABLY replaced the just-published binding with the zeros
+/// complement (the field dump's exact 1 MiB zero run at the overlay
+/// coverage's complement; remount-verified durable). The site's own
+/// comment states the law — "the seed class keys on whether the BLOCK
+/// holds any existing bytes" — the stale size proxy is what broke it.
+/// Deterministic here through the seam the race rides:
+/// `write_file_staged`'s `existing_size` argument IS the stale snapshot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_size_seed_class_never_zeros_a_published_overlay_sibling() {
+    let _g = serial().await;
+    let h = make("ackearly-g551").await;
+    // Bytes vehicle (no slot seam): the sibling's plain write rides the
+    // overlay store like the field's at-delivery-extracted O_DIRECT.
+    set_device_overlay_for_tests(true, true);
+    let ino = create(&h, "f").await;
+    promote_striped(&h, ino).await; // size = 2*BS, striped authority
+
+    // Sibling A: single-block aligned 8 KiB at block 4 rel 16 KiB —
+    // the overlay store owns the fresh block. DISJOINT from B's slice
+    // (overlapping concurrent writes may legally serve either content;
+    // the field corruption is at the overlay coverage's COMPLEMENT).
+    let a = vec![0x5Au8; 8192];
+    let stores0 = METRICS.overlay_stores.load(Ordering::Relaxed);
+    h.fs.write(
+        h.req,
+        ino,
+        0,
+        4 * BS + 16384,
+        bytes::Bytes::copy_from_slice(&a),
+        0,
+        0,
+    )
+    .await
+    .expect("sibling A");
+    eventually(
+        || METRICS.overlay_stores.load(Ordering::Relaxed) > stores0,
+        "A must ride the overlay store (engagement)",
+    )
+    .await;
+
+    // Straddler B (blocks 3→4), presented with the STALE entry snapshot
+    // the concurrent request captured BEFORE A existed (size = 2*BS).
+    // Its block-4 slice settles A's overlay (binding published: A's
+    // bytes + law-5 zero gaps), then classifies the seed.
+    let token = h.fs.dlm().get_fencing_token_ino(ino);
+    h.fs.write_file_staged(
+        ino,
+        4 * BS - 8192,
+        bytes::Bytes::from(vec![0x5Bu8; 16384]),
+        2 * BS, // the stale snapshot
+        token,
+    )
+    .await
+    .expect("straddler B");
+
+    // A's acked (and now PUBLISHED) bytes must survive B's classification.
+    let back = read_at(&h, ino, 4 * BS + 16384, 8192).await;
+    assert_eq!(
+        back, a,
+        "the sibling's published overlay bytes were replaced by the \
+         Fresh-class zeros complement (generic/551)"
+    );
+    // And durably, through the flush boundary.
+    h.fs.fsync(h.req, ino, 0, false).await.expect("fsync");
+    let back = read_at(&h, ino, 4 * BS + 16384, 8192).await;
+    assert_eq!(back, a, "the durable image keeps the sibling's bytes");
+    // B's own bytes are intact on both sides of the boundary.
+    let bband = read_at(&h, ino, 4 * BS - 8192, 16384).await;
+    assert_eq!(bband, vec![0x5Bu8; 16384], "B's bytes intact");
+}

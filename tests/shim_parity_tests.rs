@@ -68,6 +68,16 @@ async fn sandbox_fs() -> (
     use squeezefs::nvme_dev::NvmeBlockDev;
     use squeezefs::routing::DataRouter;
 
+    // Pin the overlay fresh-write store OFF (default ON since ab74d1ad;
+    // the custody-pinning suites' shared pin): this suite pins the
+    // placed-sever ADOPTION law of the accumulation path — with the
+    // overlay ON, a ring-severed fresh block rides the severed Bytes
+    // straight into the overlay DMA (18c5fbb6's IL-sever aligned
+    // passthrough, covered by tests/overlay_ack_early_tests.rs), no
+    // ActiveBlockBuf is born, and the adoption accounting legitimately
+    // never fires. The accumulation path stays live product code
+    // (overlay-off mounts, ineligible shapes).
+    squeezefs::device_overlay::set_device_overlay_for_tests(false, false);
     let dlm = DlmClient::new().unwrap();
     let backing_temp = tempfile::NamedTempFile::new().unwrap();
     {

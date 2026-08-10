@@ -775,21 +775,42 @@ impl Drop for Mount {
 
 impl Mount {
     fn unmount(&mut self) {
+        // FUSE RELEASE/writeback on the test's just-closed fds is async,
+        // so early attempts can be transiently EBUSY — retry, capturing
+        // the noise (evidence only if the LAST attempt still failed).
+        let mut unmounted = false;
+        let mut last_err = String::new();
         for _ in 0..10 {
-            if Command::new("fusermount3")
+            match Command::new("fusermount3")
                 .arg("-u")
                 .arg(&self.mnt)
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
+                .output()
             {
-                break;
+                Ok(out) if out.status.success() => {
+                    unmounted = true;
+                    break;
+                }
+                Ok(out) => last_err = String::from_utf8_lossy(&out.stderr).into_owned(),
+                Err(e) => last_err = e.to_string(),
             }
             std::thread::sleep(Duration::from_millis(500));
         }
+        assert!(
+            unmounted,
+            "fusermount3 -u {:?} failed after 10 attempts: {last_err}",
+            self.mnt
+        );
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
-            if self.child.try_wait().expect("try_wait").is_some() {
+            if let Some(status) = self.child.try_wait().expect("try_wait") {
+                // A clean unmount must be a CLEAN daemon exit — a
+                // panic/abort during teardown is a bug an `ok` verdict
+                // must not absorb.
+                assert!(
+                    status.success(),
+                    "mount daemon exited {status} on unmount (teardown crash); log:\n{}",
+                    std::fs::read_to_string(&self.log).unwrap_or_default()
+                );
                 return;
             }
             std::thread::sleep(Duration::from_millis(200));

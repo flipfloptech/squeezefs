@@ -566,20 +566,39 @@ struct CliMount {
 
 impl CliMount {
     fn unmount(&mut self) {
+        // FUSE RELEASE/writeback on the test's just-closed fds is async,
+        // so early attempts can be transiently EBUSY — retry, capturing
+        // the noise (evidence only if the LAST attempt still failed).
+        let mut unmounted = false;
+        let mut last_err = String::new();
         for _ in 0..10 {
-            let st = std::process::Command::new("fusermount3")
+            let out = std::process::Command::new("fusermount3")
                 .arg("-u")
                 .arg(&self.mnt)
-                .status()
+                .output()
                 .expect("run fusermount3 -u");
-            if st.success() {
+            if out.status.success() {
+                unmounted = true;
                 break;
             }
+            last_err = String::from_utf8_lossy(&out.stderr).into_owned();
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
+        assert!(
+            unmounted,
+            "fusermount3 -u {:?} failed after 10 attempts: {last_err}",
+            self.mnt
+        );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while std::time::Instant::now() < deadline {
-            if self.child.try_wait().expect("try_wait").is_some() {
+            if let Some(status) = self.child.try_wait().expect("try_wait") {
+                // A clean unmount must be a CLEAN daemon exit — a
+                // panic/abort during teardown is a bug an `ok` verdict
+                // must not absorb.
+                assert!(
+                    status.success(),
+                    "mount daemon exited {status} on unmount (teardown crash)"
+                );
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(200));

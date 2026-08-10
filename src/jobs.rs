@@ -945,10 +945,43 @@ impl JobCtl {
     pub(crate) fn state(&self) -> JobState {
         *self.state.lock()
     }
+    /// Terminal states never regress (2026-08-09 gate strand): the
+    /// first terminal state wins — a worker park arm's or vehicle's
+    /// stale flip landing after a `cancel()` must not overwrite it
+    /// (the check-then-act `!is_terminal()` guards at the call sites
+    /// raced the verbs; the refusal belongs under the state lock).
     fn set_state(&self, s: JobState) {
-        *self.state.lock() = s;
+        let mut st = self.state.lock();
+        if st.is_terminal() {
+            return;
+        }
+        *st = s;
         if s.is_terminal() {
             self.terminal.notify_waiters();
+        }
+    }
+    /// Settle the paused-park state flip against racing control verbs
+    /// (the 2026-08-09 lost-resume strand): under the state lock, the
+    /// `Paused` flip holds only while the pause intent is still
+    /// standing — a `resume()` that landed inside the worker's
+    /// checkpoint window wins (`Queued`, so the pool re-claims), and a
+    /// terminal state is never regressed. Returns the state that holds.
+    fn settle_park(&self) -> JobState {
+        let mut st = self.state.lock();
+        if st.is_terminal() {
+            return *st;
+        }
+        if self.paused.load(Ordering::SeqCst) {
+            let s = if *st == JobState::PausedCapacity {
+                JobState::PausedCapacity
+            } else {
+                JobState::Paused
+            };
+            *st = s;
+            s
+        } else {
+            *st = JobState::Queued;
+            JobState::Queued
         }
     }
 }
@@ -1334,6 +1367,65 @@ impl JobFabric {
         self.persist(&rec).await
     }
 
+    /// The ONE paused-park ceremony (2026-08-09 gate strand): durable
+    /// checkpoint, then the settle — the state flip re-checks the pause
+    /// intent under the state lock, so a `resume()` that landed inside
+    /// the checkpoint window wins instead of being overwritten by the
+    /// stale `Paused` flip (the lost-resume strand: `claim_next` claims
+    /// `Queued` only, so the overwrite left `paused = false` with a
+    /// `Paused` state — unclaimable forever). A settled `Queued`
+    /// re-asserts the durable record and wakes the pool.
+    async fn park_paused(&self, job_id: &str, ctl: &JobCtl) {
+        JOB_PARK_ENTRIES.fetch_add(1, Ordering::Relaxed);
+        let st = if ctl.state() == JobState::PausedCapacity {
+            JobState::PausedCapacity
+        } else {
+            JobState::Paused
+        };
+        let _ = self.checkpoint_as(job_id, ctl, st).await;
+        // Park-window seam: stretch the checkpoint→flip gap the way
+        // gate-load checkpoint contention does (red-first repro;
+        // tests/job_fabric_tests.rs park-window tests).
+        let park_delay = TEST_JOB_PARK_DELAY_MS.load(Ordering::Relaxed);
+        if park_delay > 0 {
+            tokio::time::sleep(Duration::from_millis(park_delay)).await;
+        }
+        if ctl.settle_park() == JobState::Queued {
+            // The resume won inside the window: re-assert Queued
+            // durably (the checkpoint above wrote Paused) and wake the
+            // pool — the job keeps running instead of stranding.
+            let _ = self.checkpoint(job_id, ctl).await;
+            self.work.notify_waiters();
+        }
+    }
+
+    /// KD-3 duty park, interruptible (2026-08-09 gate strand): the duty
+    /// debt is served in bounded slices, re-deriving the remaining debt
+    /// from the LIVE throttle and re-checking the control flags per
+    /// slice — a live rethrottle / pause / cancel reaches a parked
+    /// worker within one slice instead of at the end of a one-shot
+    /// sleep (at 1 % a 2 s task priced a 198 s un-interruptible park).
+    /// The TOTAL park for a fixed pct is unchanged, so the G-VL-7
+    /// duty-adherence gate holds.
+    async fn duty_park(ctl: &JobCtl, task_elapsed: Duration) {
+        const SLICE: Duration = Duration::from_millis(50);
+        let started = tokio::time::Instant::now();
+        loop {
+            if ctl.cancelled.load(Ordering::SeqCst) || ctl.paused.load(Ordering::SeqCst) {
+                return; // the vehicle's park/cancel arm owns the exit
+            }
+            let pct = ctl.throttle.load(Ordering::Relaxed);
+            let Some(total) = job_throttle_sleep(task_elapsed, pct) else {
+                return; // rethrottled to unthrottled — debt forgiven live
+            };
+            let served = started.elapsed();
+            if served >= total {
+                return;
+            }
+            tokio::time::sleep((total - served).min(SLICE)).await;
+        }
+    }
+
     /// Claim the next runnable job (Queued, unclaimed). `for_wire`
     /// restricts the pick to wire-executable job types — the §5.1.6
     /// dispatcher must never claim a mover (its meta publish is
@@ -1611,8 +1703,7 @@ impl JobFabric {
             return;
         }
         if ctl.paused.load(Ordering::SeqCst) {
-            let _ = self.checkpoint_as(job_id, ctl, JobState::Paused).await;
-            ctl.set_state(JobState::Paused);
+            self.park_paused(job_id, ctl).await;
             return;
         }
         match outcome {
@@ -1754,8 +1845,7 @@ impl JobFabric {
                 return;
             }
             if ctl.paused.load(Ordering::SeqCst) {
-                let _ = self.checkpoint_as(job_id, ctl, JobState::Paused).await;
-                ctl.set_state(JobState::Paused);
+                self.park_paused(job_id, ctl).await;
                 return;
             }
             if let Err(e) = crate::defrag::page_in_leaves(kv).await {
@@ -1800,10 +1890,7 @@ impl JobFabric {
                     let _ = self.checkpoint(job_id, ctl).await;
                     last_checkpoint = tokio::time::Instant::now();
                 }
-                let pct = ctl.throttle.load(Ordering::Relaxed);
-                if let Some(delay) = job_throttle_sleep(start.elapsed(), pct) {
-                    tokio::time::sleep(delay).await;
-                }
+                Self::duty_park(ctl, start.elapsed()).await;
             }
         }
         if ctl.cancelled.load(Ordering::SeqCst) {
@@ -1812,8 +1899,7 @@ impl JobFabric {
             return;
         }
         if ctl.paused.load(Ordering::SeqCst) {
-            let _ = self.checkpoint_as(job_id, ctl, JobState::Paused).await;
-            ctl.set_state(JobState::Paused);
+            self.park_paused(job_id, ctl).await;
             return;
         }
         let _ = self.checkpoint_as(job_id, ctl, JobState::Completed).await;
@@ -1849,8 +1935,7 @@ impl JobFabric {
                 return;
             }
             if ctl.paused.load(Ordering::SeqCst) {
-                let _ = self.checkpoint_as(job_id, ctl, JobState::Paused).await;
-                ctl.set_state(JobState::Paused);
+                self.park_paused(job_id, ctl).await;
                 return;
             }
             let start = tokio::time::Instant::now();
@@ -1871,10 +1956,7 @@ impl JobFabric {
                 let _ = self.checkpoint(job_id, ctl).await;
                 last_checkpoint = tokio::time::Instant::now();
             }
-            let pct = ctl.throttle.load(Ordering::Relaxed);
-            if let Some(delay) = job_throttle_sleep(start.elapsed(), pct) {
-                tokio::time::sleep(delay).await;
-            }
+            Self::duty_park(ctl, start.elapsed()).await;
         }
         if let Some(ctx) = self.mover.as_ref() {
             let router = ctx.router.clone();
@@ -1899,15 +1981,7 @@ impl JobFabric {
                 return;
             }
             if ctl.paused.load(Ordering::SeqCst) {
-                JOB_PARK_ENTRIES.fetch_add(1, Ordering::Relaxed);
-                let _ = self.checkpoint_as(job_id, ctl, JobState::Paused).await;
-                // Park-window seam: stretch the checkpoint→flip gap the
-                // way gate-load checkpoint contention does.
-                let park_delay = TEST_JOB_PARK_DELAY_MS.load(Ordering::Relaxed);
-                if park_delay > 0 {
-                    tokio::time::sleep(Duration::from_millis(park_delay)).await;
-                }
-                ctl.set_state(JobState::Paused);
+                self.park_paused(job_id, ctl).await;
                 return;
             }
             let done = ctl.done.load(Ordering::Relaxed);
@@ -1945,10 +2019,7 @@ impl JobFabric {
             }
 
             // KD-3: duty-cycle throttle, live re-read per task.
-            let pct = ctl.throttle.load(Ordering::Relaxed);
-            if let Some(delay) = job_throttle_sleep(start.elapsed(), pct) {
-                tokio::time::sleep(delay).await;
-            }
+            Self::duty_park(ctl, start.elapsed()).await;
         }
     }
 
@@ -2004,13 +2075,7 @@ impl JobFabric {
                 return Ok(());
             }
             if ctl.paused.load(Ordering::SeqCst) {
-                let st = if ctl.state() == JobState::PausedCapacity {
-                    JobState::PausedCapacity
-                } else {
-                    JobState::Paused
-                };
-                let _ = self.checkpoint_as(job_id, ctl, st).await;
-                ctl.set_state(st);
+                self.park_paused(job_id, ctl).await;
                 return Ok(());
             }
 
@@ -2253,9 +2318,7 @@ impl JobFabric {
                 }
                 // KD-3: duty-cycle throttle, live re-read per task
                 // (width is 1 whenever the throttle is active).
-                if let Some(delay) = job_throttle_sleep(start.elapsed(), pct) {
-                    tokio::time::sleep(delay).await;
-                }
+                Self::duty_park(ctl, start.elapsed()).await;
             }
 
             // Indirect blob relocations: one empty merge under the ino's

@@ -911,11 +911,11 @@ async fn resume_inside_the_park_window_never_strands_the_job() {
     // pause that lands before the claim is skipped by `claim_next` and
     // no worker ever enters the park arm. Wait for mid-run first.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while !fab
+    while fab
         .status(&job_id)
         .await
         .unwrap()
-        .is_some_and(|s| s.tasks_done >= 1)
+        .is_none_or(|s| s.tasks_done < 1)
     {
         assert!(
             std::time::Instant::now() < deadline,
@@ -946,8 +946,10 @@ async fn resume_inside_the_park_window_never_strands_the_job() {
     let end = fab
         .wait_terminal(&job_id, Duration::from_secs(60))
         .await
-        .expect("a resumed job must reach a terminal state — a Paused \
-                 live state with paused=false is the lost-resume strand");
+        .expect(
+            "a resumed job must reach a terminal state — a Paused \
+                 live state with paused=false is the lost-resume strand",
+        );
     assert_eq!(end, JobState::Completed);
 }
 
@@ -995,8 +997,10 @@ async fn live_rethrottle_reaches_a_parked_worker() {
     let end = fab
         .wait_terminal(&job_id, Duration::from_secs(15))
         .await
-        .expect("a rethrottled-to-100 job must not stay parked on the \
-                 old duty debt — the KD-3 re-read must reach a parked worker");
+        .expect(
+            "a rethrottled-to-100 job must not stay parked on the \
+                 old duty debt — the KD-3 re-read must reach a parked worker",
+        );
     assert_eq!(end, JobState::Completed);
     assert!(
         t0.elapsed() < Duration::from_secs(15),
@@ -1026,11 +1030,11 @@ async fn cancel_inside_the_park_window_stays_terminal() {
         .expect("submit");
 
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while !fab
+    while fab
         .status(&job_id)
         .await
         .unwrap()
-        .is_some_and(|s| s.tasks_done >= 1)
+        .is_none_or(|s| s.tasks_done < 1)
     {
         assert!(
             std::time::Instant::now() < deadline,

@@ -915,11 +915,8 @@ async fn dead_ring_and_dead_extract_terminate_loud_never_wedge() {
     // in-flight → publish ladder the dismount teardown runs) converges
     // instead of waiting forever on the spinning in-flight set.
     clear_test_zc_slot_wrap();
-    let drained = tokio::time::timeout(
-        Duration::from_secs(30),
-        h.fs.fsync(h.req, ino, 0, false),
-    )
-    .await;
+    let drained =
+        tokio::time::timeout(Duration::from_secs(30), h.fs.fsync(h.req, ino, 0, false)).await;
     assert!(
         drained.is_ok(),
         "the drain boundary must converge after the loud terminal \

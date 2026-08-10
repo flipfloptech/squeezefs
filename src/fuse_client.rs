@@ -11660,6 +11660,62 @@ impl SqueezefsFilesystem {
         let stored = loop {
             match z.store(fd, dest).await {
                 Ok(n) if n as usize == len => break true,
+                // VEHICLE-PERMANENT (generic/464, 2026-08-10): the ring
+                // store answers `Unsupported` ("session not zc-armed")
+                // when the uring connection died under an external
+                // umount — fuse3's shutdown() disarms zc before this
+                // continuation can land. Retrying "until it lands" can
+                // never land on a dead ring; the spinning in-flight
+                // claim wedged the dismount teardown's overlay drain
+                // and the daemon outlived the next test's mount. Fall
+                // back to the SESSION-INDEPENDENT device write with the
+                // ACK-time bytes (materialize — memoized extraction);
+                // when the extraction rides the same dead session, the
+                // custody is genuinely unreachable from this process:
+                // terminate LOUD (law 3 — coverage never published;
+                // `overlay_ack_early_lost`), the unflushed-at-unmount
+                // class ("dismounted with unflushed data"), never a
+                // teardown-wedging spin.
+                Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                    match z.materialize().await {
+                        Ok(bytes) => match rec.device.write_block(dest, bytes).await {
+                            Ok(()) => {
+                                warn!(
+                                    "ack-early store for ino {ino} block {b}: ring \
+                                     vehicle dead ({e:?}) — acked custody landed via \
+                                     the device-write fallback"
+                                );
+                                break true;
+                            }
+                            Err(fe) => {
+                                error!(
+                                    "ack-early store for ino {ino} block {b}: ring \
+                                     vehicle dead and the device-write fallback \
+                                     failed ({fe:?}) — acked custody LOST \
+                                     (overlay_ack_early_lost; the unflushed-at-\
+                                     unmount class)"
+                                );
+                                METRICS
+                                    .overlay_ack_early_lost
+                                    .fetch_add(1, Ordering::Relaxed);
+                                break false;
+                            }
+                        },
+                        Err(me) => {
+                            error!(
+                                "ack-early store for ino {ino} block {b}: ring \
+                                 vehicle dead ({e:?}) and the ACK-time bytes are \
+                                 unreachable ({me:?}) — acked custody LOST \
+                                 (overlay_ack_early_lost; the unflushed-at-unmount \
+                                 class: the retained pages died with the connection)"
+                            );
+                            METRICS
+                                .overlay_ack_early_lost
+                                .fetch_add(1, Ordering::Relaxed);
+                            break false;
+                        }
+                    }
+                }
                 other => {
                     // The fence latch is the ONE legal drop for acked
                     // custody (the mount is fail-stopped; successor

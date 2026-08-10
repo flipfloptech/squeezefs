@@ -79,6 +79,13 @@ struct SlotCtl {
     releases: AtomicUsize,
     /// The §3.4 class the mock slot reports (true = page-cache-sound).
     sound: bool,
+    /// Dead-vehicle script (the generic/464 unmount wedge): stores fail
+    /// `Unsupported` FOREVER — the fuse3 "session not zc-armed" class a
+    /// torn-down ring returns. Never counts against `fail_first`.
+    store_dead: std::sync::atomic::AtomicBool,
+    /// The extract half of the dead ring: `materialize()` fails
+    /// `Unsupported` too (bytes unreachable — the honest-loss arm).
+    extract_dead: std::sync::atomic::AtomicBool,
 }
 
 impl SlotCtl {
@@ -89,6 +96,8 @@ impl SlotCtl {
             retains: AtomicUsize::new(0),
             releases: AtomicUsize::new(0),
             sound,
+            store_dead: std::sync::atomic::AtomicBool::new(false),
+            extract_dead: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -104,6 +113,7 @@ fn arm_slot_seam(ctl: Arc<SlotCtl>) {
         let len = bytes.len() as u32;
         let c_store = ctl.clone();
         let store_bytes = bytes.clone();
+        let c_extract = ctl.clone();
         let c_retain = ctl.clone();
         let c_release = ctl.clone();
         ZcWriteSlot::new_with_ack_early(
@@ -115,6 +125,13 @@ fn arm_slot_seam(ctl: Arc<SlotCtl>) {
                 Box::pin(async move {
                     let permit = c.gate.acquire().await.expect("gate closed for good");
                     permit.forget();
+                    if c.store_dead.load(Ordering::SeqCst) {
+                        // The dead ring: fuse3's not-zc-armed class.
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Unsupported,
+                            "zc store: session not zc-armed",
+                        ));
+                    }
                     if c.fail_first
                         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1))
                         .is_ok()
@@ -132,7 +149,16 @@ fn arm_slot_seam(ctl: Arc<SlotCtl>) {
             }),
             Box::new(move || {
                 let b = bytes.clone();
-                Box::pin(async move { Ok(b) })
+                let c = c_extract.clone();
+                Box::pin(async move {
+                    if c.extract_dead.load(Ordering::SeqCst) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Unsupported,
+                            "zc extract: session not zc-armed",
+                        ));
+                    }
+                    Ok(b)
+                })
             }),
             Box::new(move || {
                 c_retain.retains.fetch_add(1, Ordering::SeqCst);
@@ -783,4 +809,120 @@ async fn aligned_overlay_bytes_skip_the_pool_copy() {
     );
     let back = read_at(&h, ino, 2 * BS, BS as u32).await;
     assert_eq!(back, data.as_ref());
+}
+
+/// The generic/464 unmount wedge (release-gate battery, 2026-08-10; the
+/// runner's fail-fast at test 458/787): an external umount kills the
+/// uring connection, fuse3's `shutdown()` disarms zc, and every pending
+/// ACK-early retained-slot DMA starts failing `Unsupported` ("session
+/// not zc-armed") — a VEHICLE-PERMANENT class the continuation retried
+/// forever ("acked custody retries until it lands" can never land on a
+/// dead ring). The spinning in-flight claims wedged the dismount
+/// teardown's overlay drain, the daemon lingered past its 70 s bound,
+/// and the next mount refused ("previous daemon still running after
+/// 60s"). The recoverable half, pinned here: while the ACK-time bytes
+/// are still reachable (`materialize()` — memoized extraction), the
+/// continuation must fall back to the SESSION-INDEPENDENT device write
+/// and land the acked custody: bounded, never-lossy, no spin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dead_ring_store_falls_back_to_device_write() {
+    let _g = serial().await;
+    let ctl = SlotCtl::new(true);
+    ctl.store_dead.store(true, Ordering::SeqCst); // ring dead from op 1
+    let h = make("ackearly-deadring").await;
+    let ino = create(&h, "f").await;
+    promote_striped(&h, ino).await;
+    arm_slot_seam(ctl.clone());
+
+    let data = vec![0x4Au8; BS as usize];
+    h.fs.write(
+        h.req,
+        ino,
+        0,
+        2 * BS,
+        bytes::Bytes::copy_from_slice(&data),
+        0,
+        0,
+    )
+    .await
+    .expect("ack-early write acks");
+    ctl.open_gate();
+
+    // The continuation must terminate via the fallback (release fires
+    // exactly once) — the pre-fix loop spins on the dead vehicle and
+    // this deadline is the red assertion.
+    let c = ctl.clone();
+    eventually(
+        move || c.releases.load(Ordering::SeqCst) == 1,
+        "dead-ring continuation must terminate through the device-write \
+         fallback (spinning 'until it lands' on a disarmed session is \
+         the generic/464 teardown wedge)",
+    )
+    .await;
+    // Never-lossy: the acked bytes landed via the fallback.
+    clear_test_zc_slot_wrap();
+    let back = read_at(&h, ino, 2 * BS, BS as u32).await;
+    assert_eq!(back, data, "acked custody must land via the fallback");
+}
+
+/// The honest-loss half: ring dead AND the ACK-time bytes unreachable
+/// (extraction rides the same dead session — the field shape, where the
+/// retained folios die with the connection). The continuation must
+/// terminate LOUD (coverage never published — law 3; the loss counted
+/// on `overlay_ack_early_lost`) instead of wedging the teardown: this
+/// is exactly the "dismounted with unflushed data" posture, and the
+/// teardown drain must converge afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dead_ring_and_dead_extract_terminate_loud_never_wedge() {
+    let _g = serial().await;
+    let ctl = SlotCtl::new(true);
+    ctl.store_dead.store(true, Ordering::SeqCst);
+    ctl.extract_dead.store(true, Ordering::SeqCst);
+    let h = make("ackearly-deadboth").await;
+    let ino = create(&h, "f").await;
+    promote_striped(&h, ino).await;
+    arm_slot_seam(ctl.clone());
+
+    let lost0 = METRICS.overlay_ack_early_lost.load(Ordering::Relaxed);
+    let data = vec![0x5Bu8; BS as usize];
+    h.fs.write(
+        h.req,
+        ino,
+        0,
+        2 * BS,
+        bytes::Bytes::copy_from_slice(&data),
+        0,
+        0,
+    )
+    .await
+    .expect("ack-early write acks");
+    ctl.open_gate();
+
+    let c = ctl.clone();
+    eventually(
+        move || c.releases.load(Ordering::SeqCst) == 1,
+        "dead-vehicle continuation must terminate (loud loss), never spin",
+    )
+    .await;
+    assert_eq!(
+        METRICS.overlay_ack_early_lost.load(Ordering::Relaxed),
+        lost0 + 1,
+        "the unrecoverable acked store is COUNTED (the unflushed-at-\
+         unmount class, must stay 0 outside teardown races)"
+    );
+    // Teardown liveness — the wedge's other half: with the claim
+    // released, the drain boundary (fsync runs the same freeze → await
+    // in-flight → publish ladder the dismount teardown runs) converges
+    // instead of waiting forever on the spinning in-flight set.
+    clear_test_zc_slot_wrap();
+    let drained = tokio::time::timeout(
+        Duration::from_secs(30),
+        h.fs.fsync(h.req, ino, 0, false),
+    )
+    .await;
+    assert!(
+        drained.is_ok(),
+        "the drain boundary must converge after the loud terminal \
+         (generic/464: it waited forever on the spinning claim)"
+    );
 }

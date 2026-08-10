@@ -5246,6 +5246,14 @@ pub struct Metrics {
     /// Transient-failure retries of ACKed stores (acked custody is
     /// retry-forever; only the fence drops it — `overlay_fence_drops`).
     pub overlay_ack_early_retries: Align64<AtomicU64>,
+    /// ACK-early stores whose acked custody was UNRECOVERABLE: the ring
+    /// vehicle died (`Unsupported` — the session disarmed under an
+    /// external umount, generic/464) AND the ACK-time bytes were
+    /// unreachable (extraction rides the same dead session). Terminated
+    /// LOUD — the unflushed-at-unmount class ("dismounted with
+    /// unflushed data"), never a teardown-wedging spin. Must stay 0
+    /// outside unmount races.
+    pub overlay_ack_early_lost: Align64<AtomicU64>,
     /// A begin_store claim refused by an in-flight overlap — the
     /// legitimate rewrite-while-in-flight shape under ACK-early (the
     /// writer settles and rides accumulation). Was a tripwire when
@@ -8272,6 +8280,7 @@ impl SqueezefsFilesystem {
                     .overlay_dma_pool_copy_bytes
                     .load(Ordering::Relaxed),
                 "overlay_ack_early_retries": METRICS.overlay_ack_early_retries.load(Ordering::Relaxed),
+                "overlay_ack_early_lost": METRICS.overlay_ack_early_lost.load(Ordering::Relaxed),
                 "overlay_claim_conflicts": METRICS.overlay_claim_conflicts.load(Ordering::Relaxed),
                 "overlay_read_drains": METRICS.overlay_read_drains.load(Ordering::Relaxed),
                 "overlay_read_serves": METRICS.overlay_read_serves.load(Ordering::Relaxed),

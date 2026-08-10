@@ -70,6 +70,36 @@ pub fn set_test_job_panic_after(n: u64) {
     TEST_JOB_PANIC_AFTER.store(n, Ordering::Relaxed);
 }
 
+/// Test seam (red-first repro for the lost-resume race, 2026-08-09 gate
+/// strand): stretch the worker's paused-park window — the gap between
+/// the durable `checkpoint_as(Paused)` and the live state flip — by N
+/// ms, so a racing `resume()` deterministically lands inside it. Under
+/// gate load that window is wide (the checkpoint contends with the
+/// control verbs' own checkpoints on the same conveyor); in isolation
+/// it is microscopic, which is exactly why the strand was
+/// load-dependent. Zero cost unset — the `TEST_JOB_PANIC_AFTER` /
+/// `SQUEEZEFS_TEST_WRITE_STALL_MS` pattern.
+static TEST_JOB_PARK_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Paused-park arm entries (monotonic). Tests synchronize on "the
+/// worker is INSIDE its park window" by polling this across a control
+/// verb — there is no other honest observable for that position, since
+/// both the pause verb and the worker's park write the same durable
+/// state.
+static JOB_PARK_ENTRIES: AtomicU64 = AtomicU64::new(0);
+
+/// Arm (`ms > 0`) or disarm (`0`) the park-window seam. Production
+/// never calls it.
+pub fn set_test_job_park_delay_ms(ms: u64) {
+    TEST_JOB_PARK_DELAY_MS.store(ms, Ordering::Relaxed);
+}
+
+/// Total paused-park arm entries (test synchronization instrument for
+/// the park-window seam).
+pub fn job_park_entries() -> u64 {
+    JOB_PARK_ENTRIES.load(Ordering::Relaxed)
+}
+
 /// VL10 (G-VL-3 b): how many independent block moves an UNTHROTTLED
 /// drain/rebalance pass keeps in flight (join_all window). Each move is
 /// device-I/O-bound (read + write + verify-read per block); 4 overlaps
@@ -1869,7 +1899,14 @@ impl JobFabric {
                 return;
             }
             if ctl.paused.load(Ordering::SeqCst) {
+                JOB_PARK_ENTRIES.fetch_add(1, Ordering::Relaxed);
                 let _ = self.checkpoint_as(job_id, ctl, JobState::Paused).await;
+                // Park-window seam: stretch the checkpoint→flip gap the
+                // way gate-load checkpoint contention does.
+                let park_delay = TEST_JOB_PARK_DELAY_MS.load(Ordering::Relaxed);
+                if park_delay > 0 {
+                    tokio::time::sleep(Duration::from_millis(park_delay)).await;
+                }
                 ctl.set_state(JobState::Paused);
                 return;
             }

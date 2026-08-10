@@ -857,3 +857,219 @@ async fn removexattr_of_absent_attr_is_enodata() {
         .await
         .expect_err("absent inode must fail");
 }
+
+// ---------------------------------------------------------------------------
+// 2026-08-09 gate strand (defrag_tests::test_defrag_throttle_live_retune_
+// and_pause, load-dependent): two check-then-act windows in the fabric's
+// park machinery. Load-dependent hangs are first-class product bugs; these
+// pin both schedules deterministically via the park-window seam.
+// ---------------------------------------------------------------------------
+
+/// Disarm the park-window seam on every exit path (the seam is
+/// process-global; a panicking assertion must not leak it into the
+/// binary's other tests).
+fn park_seam(ms: u64) -> impl Drop {
+    struct Disarm;
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            squeezefs::jobs::set_test_job_park_delay_ms(0);
+        }
+    }
+    squeezefs::jobs::set_test_job_park_delay_ms(ms);
+    Disarm
+}
+
+/// Bug 1 — the LOST-RESUME race. The worker's paused-park arm was
+/// `paused.load()` → durable checkpoint → UNCONDITIONAL
+/// `set_state(Paused)`. A `resume()` landing inside the checkpoint
+/// window (wide under gate load — the checkpoint contends with the
+/// control verbs' own checkpoints) set the state to `Queued`, which the
+/// worker's stale flip then overwrote back to `Paused` — with
+/// `paused = false`. `claim_next` only claims `Queued`: the job was
+/// unclaimable forever. The park-window seam stretches the gap so the
+/// resume deterministically lands inside it; the job must still reach
+/// terminal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resume_inside_the_park_window_never_strands_the_job() {
+    let fx = fixture("fab-park-race").await;
+    let fab = fabric(&fx, 1).await;
+
+    let _disarm = park_seam(150);
+
+    let job_id = fab
+        .submit(JobSpec {
+            job_type: JobType::Noop {
+                tasks: 2_000,
+                task_ms: 1,
+            },
+            throttle_pct: 100,
+        })
+        .await
+        .expect("submit");
+
+    // The gate's schedule paused a job that was already RUNNING — a
+    // pause that lands before the claim is skipped by `claim_next` and
+    // no worker ever enters the park arm. Wait for mid-run first.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !fab
+        .status(&job_id)
+        .await
+        .unwrap()
+        .is_some_and(|s| s.tasks_done >= 1)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "job never started running"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+
+    // Pause, then wait for the worker to ENTER its park arm (the seam's
+    // entry counter is the only honest observable for that position).
+    let parks_before = squeezefs::jobs::job_park_entries();
+    fab.pause(&job_id).await.expect("pause");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while squeezefs::jobs::job_park_entries() == parks_before {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "worker never reached its park arm"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+
+    // The worker is now INSIDE the checkpoint→flip window. Resume lands
+    // here — the exact schedule the gate's load produced.
+    fab.resume(&job_id).await.expect("resume");
+
+    // The job must still complete: a resumed job whose live state reads
+    // Paused-with-paused=false is the strand this test exists to kill.
+    let end = fab
+        .wait_terminal(&job_id, Duration::from_secs(60))
+        .await
+        .expect("a resumed job must reach a terminal state — a Paused \
+                 live state with paused=false is the lost-resume strand");
+    assert_eq!(end, JobState::Completed);
+}
+
+/// Bug 2 — the UN-INTERRUPTIBLE duty-cycle park. At 1 % throttle the
+/// worker slept `elapsed × 99` in ONE shot; KD-3's "live re-read per
+/// task" only happened at the NEXT task, so a live rethrottle-to-100
+/// (and pause/cancel) could not reach a parked worker for minutes. A
+/// 200 ms task at 1 % prices a 19.8 s one-shot park; the rethrottle
+/// must land in bounded time instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_rethrottle_reaches_a_parked_worker() {
+    let fx = fixture("fab-park-reach").await;
+    let fab = fabric(&fx, 1).await;
+
+    let job_id = fab
+        .submit(JobSpec {
+            job_type: JobType::Noop {
+                tasks: 3,
+                task_ms: 200,
+            },
+            throttle_pct: 1, // 200 ms task ⇒ 19.8 s duty park per task
+        })
+        .await
+        .expect("submit");
+
+    // Let the first task complete and the worker enter its duty park.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let st = fab.status(&job_id).await.unwrap();
+        if st.as_ref().is_some_and(|s| s.tasks_done >= 1) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "first task never completed"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // Rethrottle to 100 while the worker is parked. With interruptible
+    // slicing the remaining 2 tasks cost ~400 ms + slice latency; the
+    // one-shot park costs ≥ 19.8 s and fails this deadline.
+    fab.throttle(&job_id, 100).await.expect("rethrottle");
+    let t0 = std::time::Instant::now();
+    let end = fab
+        .wait_terminal(&job_id, Duration::from_secs(15))
+        .await
+        .expect("a rethrottled-to-100 job must not stay parked on the \
+                 old duty debt — the KD-3 re-read must reach a parked worker");
+    assert_eq!(end, JobState::Completed);
+    assert!(
+        t0.elapsed() < Duration::from_secs(15),
+        "rethrottle reached the parked worker"
+    );
+}
+
+/// Bug 1's sibling: CANCEL landing inside the park window must also
+/// stick (the park arm's stale flip must not overwrite Cancelled with
+/// Paused — cancel is terminal and terminal states never regress).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_inside_the_park_window_stays_terminal() {
+    let fx = fixture("fab-park-cancel").await;
+    let fab = fabric(&fx, 1).await;
+
+    let _disarm = park_seam(150);
+
+    let job_id = fab
+        .submit(JobSpec {
+            job_type: JobType::Noop {
+                tasks: 2_000,
+                task_ms: 1,
+            },
+            throttle_pct: 100,
+        })
+        .await
+        .expect("submit");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !fab
+        .status(&job_id)
+        .await
+        .unwrap()
+        .is_some_and(|s| s.tasks_done >= 1)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "job never started running"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+
+    let parks_before = squeezefs::jobs::job_park_entries();
+    fab.pause(&job_id).await.expect("pause");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while squeezefs::jobs::job_park_entries() == parks_before {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "worker never reached its park arm"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+
+    fab.cancel(&job_id).await.expect("cancel");
+    let end = fab
+        .wait_terminal(&job_id, Duration::from_secs(60))
+        .await
+        .expect("terminal");
+    assert_eq!(
+        end,
+        JobState::Cancelled,
+        "a terminal Cancelled must never be overwritten by the park arm's stale Paused flip"
+    );
+    // KEPT sleep (TEST-3 negative-assertion window): "the terminal state
+    // does not regress" has no positive edge to poll for. Outwait the
+    // park seam (150 ms) so the worker's stale flip — if the bug is
+    // present — has landed before the re-check.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let st = fab.status(&job_id).await.unwrap().expect("known");
+    assert_eq!(
+        st.state,
+        JobState::Cancelled,
+        "the park arm's stale flip regressed a terminal Cancelled to {:?}",
+        st.state
+    );
+}

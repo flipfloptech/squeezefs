@@ -446,6 +446,15 @@ async fn test_small_block_map_stays_inline() {
 static WRITE_SERIAL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+    // Pin the overlay fresh-write store OFF (default ON since ab74d1ad;
+    // the custody-pinning suites' shared pin): this binary pins the
+    // ACCUMULATION path's writeback/flush/recovery contracts — buffer →
+    // staging → block-publish, and the allocator-recovery walk over the
+    // layouts those flushes publish. Overlay-stored fresh writes publish
+    // on their own (ACK-early) schedule, which legitimately breaks the
+    // exact used-block/flush accounting pinned here; the overlay path's
+    // publish/recovery laws live in the overlay suites.
+    squeezefs::device_overlay::set_device_overlay_for_tests(false, false);
     WRITE_SERIAL
         .get_or_init(|| tokio::sync::Mutex::new(()))
         .lock()

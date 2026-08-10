@@ -361,3 +361,66 @@ fn concurrent_stress_values_never_torn() {
         h.join().expect("no panics under stress");
     }
 }
+
+/// The 2026-08-10 LTP writev03 wedge (found by the release-gate battery;
+/// deterministic on the runner's ext3-on-loop leg; live daemon stack: a
+/// fuse3 handler lane parked in scc `lock_sync_wait` ← the eviction
+/// listener ← `moka::sync::Cache::insert` ← `pipeline_touch`):
+/// `get_or_insert_with`'s Occupied-EXPIRED arm paid its policy op while
+/// STILL HOLDING the store's bucket writer guard. moka::sync delivers
+/// its eviction listener INLINE on the paying thread, and the listener
+/// takes store bucket locks (`remove_if_sync`) — the same key hashes to
+/// the held bucket, so the thread parks on the lock it itself holds: a
+/// permanent same-thread deadlock that wedges the handler lane (every
+/// reader through it goes unkillable-D; LTP's kill escalation calls it
+/// a kernel bug). The module's own law: policy ops run OUTSIDE store
+/// guards — this arm was the one violator.
+///
+/// The shape is the stream-lanes production shape verbatim: a 30 s-TTL
+/// lane expires, the next read re-mints it through the expired arm, and
+/// the policy insert processes the just-expired previous incarnation.
+/// Compressed here to a small real TTL (moka expires on ITS wall clock;
+/// the injected clock only drives the store's read filter), re-expired
+/// across rounds until the inline listener lands inside the paying
+/// insert. RED: the worker deadlocks and the deadline fires.
+#[test]
+fn expired_reinsert_never_deadlocks_on_inline_listener() {
+    let (t, clock) = test_clock();
+    let ttl = std::time::Duration::from_millis(25);
+    let mut cfg = rm_config::<u64>(true);
+    cfg.ttl = Some(ttl);
+    cfg.clock = Some(clock);
+    let c: ReadMostlyCache<String, u64, std::hash::RandomState> =
+        ReadMostlyCache::new(cfg, std::hash::RandomState::new());
+
+    let worker = {
+        let c = c.clone();
+        let t = t.clone();
+        std::thread::spawn(move || {
+            c.insert("k".to_string(), 0);
+            for round in 1..=400u64 {
+                // Let BOTH clocks pass the TTL: moka's wall clock (its
+                // expiry verdicts) and the injected store clock (the
+                // read filter that routes the next call through the
+                // Occupied-EXPIRED arm).
+                std::thread::sleep(ttl + std::time::Duration::from_millis(10));
+                t.fetch_add(50, Ordering::Relaxed);
+                let got = c.get_or_insert_with("k".to_string(), || round);
+                assert_eq!(got, round, "an expired entry reconstructs fresh");
+            }
+        })
+    };
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while !worker.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "get_or_insert_with deadlocked: the Occupied-expired arm paid \
+             its policy op under the held store bucket guard and moka's \
+             inline eviction listener parked on that same bucket (the LTP \
+             writev03 handler-lane wedge)"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    worker.join().expect("worker must complete without panicking");
+}

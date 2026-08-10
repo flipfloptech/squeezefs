@@ -12448,6 +12448,45 @@ impl SqueezefsFilesystem {
                     }
                 }
 
+                // LIVE existing-bytes re-derivation, under the held
+                // guard and AFTER the settle (generic/551, 2026-08-10 —
+                // DURABLE corruption): the request-entry `existing_size`
+                // snapshot is stale by construction under concurrent AIO
+                // siblings — a sibling's overlay store already bound
+                // this block (the settle above just PUBLISHED it), and a
+                // partial-coverage publish floors its size merge at 0
+                // (the 795 size-never-leads-data law), so the SIZE alone
+                // cannot witness the binding: the MAP is the truth. A
+                // stale no-existing-bytes verdict routed the park/seed
+                // consumers below onto the zeros-complement class, whose
+                // flush durably replaced the sibling's acked bytes with
+                // zeros at exactly the overlay coverage's complement.
+                // The snapshot stays as a floor (never classify LESS
+                // conservatively than the request already knew); the
+                // metadata cache is the write path's synchronous RAM
+                // authority. Indirect maps (block_map None past the
+                // spill bound) conservatively claim existing bytes —
+                // correctness over a seed read.
+                let (live_mapped, live_size) = self
+                    .router
+                    .metadata_cache
+                    .peek_with(&ino, |m| match m.block_map.as_ref() {
+                        Some(bm) => (bm.contains_key(&(b as u32)), m.size),
+                        None if m.file_type == "striped" => (true, m.size),
+                        None => (false, m.size),
+                    })
+                    .unwrap_or((false, 0));
+                let live_existing_size = existing_size.max(live_size);
+                let needs_existing_data = needs_existing_data
+                    || live_mapped
+                    || Self::block_write_needs_existing_data(
+                        live_existing_size,
+                        b_start_offset,
+                        b_end_offset,
+                        write_start,
+                        write_end,
+                    );
+
                 // D14: a slot payload that declined the patch (its
                 // `patch_ineligible_*` bucket counted) materializes HERE
                 // — the memoized extraction (a store-failure fallback
@@ -12537,8 +12576,16 @@ impl SqueezefsFilesystem {
                     // covering write completes the union at record_write,
                     // which clears the deferral (`seed_deferred ⇒ union
                     // partial` — structural), so no seed read is ever paid.
-                    let block_has_existing_bytes =
-                        std::cmp::min(existing_size, b_end_offset) > b_start_offset;
+                    // The block's CURRENT truth (generic/551): the
+                    // hoisted under-guard derivation above — a mapped
+                    // block (the settle just published the sibling's
+                    // binding; a partial-coverage publish floors its
+                    // size merge at 0, so the SIZE alone cannot witness
+                    // it) or a live size covering this block ⇒ existing
+                    // bytes ⇒ the deferred (RMW-seed) class, never the
+                    // Fresh zeros complement.
+                    let block_has_existing_bytes = live_mapped
+                        || std::cmp::min(live_existing_size, b_end_offset) > b_start_offset;
                     let seed = if let Some(d) = self.router.cache.nvme.read_staged(&cache_key) {
                         METRICS.write_block_revisits.fetch_add(1, Ordering::Relaxed);
                         crate::cache::active_block::ActiveBlockBuf::seeded(&d, block_size as usize)

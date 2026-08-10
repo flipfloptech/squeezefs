@@ -175,12 +175,13 @@ fn spawn_mount(meta: &Path, mnt: &Path, log: &Path) -> Mount {
     };
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
-        if std::fs::read_to_string(mount.mnt.join(".stats")).is_ok() {
-            break;
-        }
+        let err = match std::fs::read_to_string(mount.mnt.join(".stats")) {
+            Ok(_) => break,
+            Err(e) => e,
+        };
         assert!(
             Instant::now() < deadline,
-            "mount did not become ready in 90s; log:\n{}",
+            "mount did not become ready in 90s (last .stats error: {err}); log:\n{}",
             std::fs::read_to_string(&mount.log).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(250));

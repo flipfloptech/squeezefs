@@ -104,7 +104,11 @@ fn registry_registers_the_full_delivered_ring_capacity() {
          registry slot — unregistered ops are invisible to the D1.b watchdog"
     );
     drop(herd);
-    assert_eq!(op_profile_inflight(), inflight0, "all slots recycle on drop");
+    assert_eq!(
+        op_profile_inflight(),
+        inflight0,
+        "all slots recycle on drop"
+    );
 }
 
 /// Exhaustion contract carried forward verbatim: past TOTAL capacity the
@@ -123,7 +127,11 @@ fn exhaustion_degrades_to_unregistered_and_recycles() {
         "claims past total capacity must degrade to None"
     );
     drop(herd);
-    assert_eq!(op_profile_inflight(), inflight0, "exhaustion herd fully recycles");
+    assert_eq!(
+        op_profile_inflight(),
+        inflight0,
+        "exhaustion herd fully recycles"
+    );
 }
 
 /// Foreign-thread release stays legal (the sharded claim is thread-AFFINE,
@@ -134,7 +142,9 @@ fn release_from_a_foreign_thread_recycles_the_slot() {
     let inflight0 = op_profile_inflight();
     let op = OpProf::begin(FuseOpKind::Write, 7);
     assert_eq!(op_profile_inflight(), inflight0 + 1);
-    std::thread::spawn(move || drop(op)).join().expect("release thread");
+    std::thread::spawn(move || drop(op))
+        .join()
+        .expect("release thread");
     assert_eq!(
         op_profile_inflight(),
         inflight0,

@@ -1231,11 +1231,6 @@ const OP_PHASE_NAMES: [&str; OP_PHASES] = [
     "total",              // handler entry → reply enqueued
 ];
 
-/// Watchdog-ready op registry slot count. Sized for the daemon's realistic
-/// in-flight op ceiling (over-uring queues × depth is far below this);
-/// claim degrades to unregistered-but-profiled when full — never blocks.
-const OP_REGISTRY_SLOTS: usize = 256;
-
 /// The shipped registry capacity (the flat 256-slot slab) — the
 /// never-regress-below-shipped floor for the derived geometry: no box
 /// gets LESS watchdog scan surface than every box already ran.
@@ -1272,7 +1267,8 @@ pub fn op_registry_derived_geometry(possible_cpus: usize) -> (usize, usize) {
 /// drift-is-red tie test (`tests/op_registry_shard_tests.rs`) holds
 /// against [`op_registry_derived_geometry`].
 pub fn op_registry_geometry() -> (usize, usize) {
-    (1, OP_REGISTRY_SLOTS)
+    let r = &OP_PROFILE.registry;
+    (r.shards.len(), r.slots_per_shard)
 }
 
 /// The registry slot's `(size, align)` — the false-sharing law's face:
@@ -1285,6 +1281,12 @@ pub fn op_registry_slot_layout() -> (usize, usize) {
     )
 }
 
+/// One watchdog registry slot. `#[repr(align(64))]` is load-bearing:
+/// slots are CAS-claimed from every CPU at op rate, and the former packed
+/// 24-byte layout put ~2.7 slots per cache line — the false-sharing half
+/// of the 6.65 %-of-worker claim storm (a FAILING `lock cmpxchg` still
+/// takes the line exclusive). A slot owns its line outright.
+#[repr(align(64))]
 struct OpSlot {
     /// 0 = free, 1 = claimed. CAS-claimed, store-released.
     state: std::sync::atomic::AtomicU32,
@@ -1296,40 +1298,109 @@ struct OpSlot {
     start_ns: AtomicU64,
 }
 
+/// One registry shard: a slot block plus its OWN claim cursor. The former
+/// single global cursor was one `fetch_add` per op from every CPU on one
+/// shared line — the other half of the claim storm.
+struct OpShard {
+    slots: Box<[OpSlot]>,
+    /// Per-shard round-robin claim cursor (keeps claim O(1) amortized).
+    cursor: Align64<std::sync::atomic::AtomicUsize>,
+}
+
+thread_local! {
+    /// This thread's HOME shard (`usize::MAX` = unassigned; assigned
+    /// round-robin at first claim). Claims probe the home shard first, so
+    /// a fused worker's claim traffic stays on lines its own CPU keeps
+    /// warm; spill to neighbor shards happens only on home exhaustion.
+    static OP_HOME_SHARD: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(usize::MAX) };
+}
+
+/// The D1.b watchdog op registry — sharded per [`op_registry_derived_geometry`]
+/// (shards = kernel possible CPUs shadowing the transport's queue
+/// population, slots/shard = 2 × the depth ceiling). Claims are
+/// thread-AFFINE (home shard first), never thread-OWNED: any thread may
+/// release any slot (FUSE futures migrate across handler lanes).
 struct OpRegistry {
-    slots: [OpSlot; OP_REGISTRY_SLOTS],
-    /// Round-robin claim cursor: keeps claim O(1) amortized instead of
-    /// rescanning slot 0 under storm.
-    cursor: std::sync::atomic::AtomicUsize,
+    shards: Box<[OpShard]>,
+    slots_per_shard: usize,
+    /// Round-robin home-shard assignment for first-claim threads.
+    next_home: std::sync::atomic::AtomicUsize,
 }
 
 impl OpRegistry {
-    fn claim(&self, kind: FuseOpKind, ino: u64, start_ns: u64) -> Option<usize> {
-        let base = self.cursor.fetch_add(1, Ordering::Relaxed);
-        for probe in 0..OP_REGISTRY_SLOTS {
-            let idx = (base + probe) % OP_REGISTRY_SLOTS;
-            let slot = &self.slots[idx];
-            if slot
-                .state
-                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-            {
-                slot.kind.store(kind as u32, Ordering::Relaxed);
-                slot.ino.store(ino, Ordering::Relaxed);
-                slot.start_ns.store(start_ns, Ordering::Relaxed);
-                return Some(idx);
-            }
+    fn new((shards, slots_per_shard): (usize, usize)) -> Self {
+        OpRegistry {
+            shards: (0..shards)
+                .map(|_| OpShard {
+                    slots: (0..slots_per_shard)
+                        .map(|_| OpSlot {
+                            state: std::sync::atomic::AtomicU32::new(0),
+                            kind: std::sync::atomic::AtomicU32::new(0),
+                            ino: AtomicU64::new(0),
+                            start_ns: AtomicU64::new(0),
+                        })
+                        .collect(),
+                    cursor: Align64(std::sync::atomic::AtomicUsize::new(0)),
+                })
+                .collect(),
+            slots_per_shard,
+            next_home: std::sync::atomic::AtomicUsize::new(0),
         }
-        None // slab full: op still profiles, just unregistered
     }
 
-    fn release(&self, idx: usize) {
-        self.slots[idx].state.store(0, Ordering::Release);
+    /// This thread's home shard, assigned round-robin on first use.
+    fn home_shard(&self) -> usize {
+        OP_HOME_SHARD.with(|c| {
+            let h = c.get();
+            if h != usize::MAX {
+                return h;
+            }
+            let h = self.next_home.fetch_add(1, Ordering::Relaxed) % self.shards.len();
+            c.set(h);
+            h
+        })
+    }
+
+    fn claim(&self, kind: FuseOpKind, ino: u64, start_ns: u64) -> Option<usize> {
+        let nshards = self.shards.len();
+        let home = self.home_shard();
+        for s in 0..nshards {
+            let si = (home + s) % nshards;
+            let shard = &self.shards[si];
+            let base = shard.cursor.0.fetch_add(1, Ordering::Relaxed);
+            for probe in 0..self.slots_per_shard {
+                let idx = (base + probe) % self.slots_per_shard;
+                let slot = &shard.slots[idx];
+                if slot
+                    .state
+                    .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    slot.kind.store(kind as u32, Ordering::Relaxed);
+                    slot.ino.store(ino, Ordering::Relaxed);
+                    slot.start_ns.store(start_ns, Ordering::Relaxed);
+                    return Some(si * self.slots_per_shard + idx);
+                }
+            }
+        }
+        None // every shard full: op still profiles, just unregistered
+    }
+
+    fn release(&self, global_idx: usize) {
+        let si = global_idx / self.slots_per_shard;
+        let idx = global_idx % self.slots_per_shard;
+        self.shards[si].slots[idx].state.store(0, Ordering::Release);
+    }
+
+    /// All slots across all shards — the watchdog scan / gauge surface
+    /// (slow path by design).
+    fn iter_slots(&self) -> impl Iterator<Item = &OpSlot> {
+        self.shards.iter().flat_map(|s| s.slots.iter())
     }
 
     fn active(&self) -> u64 {
-        self.slots
-            .iter()
+        self.iter_slots()
             .filter(|s| s.state.load(Ordering::Relaxed) == 1)
             .count() as u64
     }
@@ -1394,15 +1465,7 @@ struct OpProfileState {
 static OP_PROFILE: Lazy<OpProfileState> = Lazy::new(|| OpProfileState {
     phases: std::array::from_fn(|_| std::array::from_fn(|_| LatencyHistogram::default())),
     create_under_lock: LatencyHistogram::default(),
-    registry: OpRegistry {
-        slots: std::array::from_fn(|_| OpSlot {
-            state: std::sync::atomic::AtomicU32::new(0),
-            kind: std::sync::atomic::AtomicU32::new(0),
-            ino: AtomicU64::new(0),
-            start_ns: AtomicU64::new(0),
-        }),
-        cursor: std::sync::atomic::AtomicUsize::new(0),
-    },
+    registry: OpRegistry::new(op_registry_derived_geometry(crate::cpu::possible_cpus())),
     recent_lookups: LookupPairTable {
         keys: std::array::from_fn(|_| AtomicU64::new(0)),
         stamps: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -1618,7 +1681,7 @@ pub fn op_watchdog_tick(threshold: Duration) -> Vec<OverdueOp> {
     let now = prof_now_ns();
     let threshold_ns = threshold.as_nanos() as u64;
     let mut overdue = Vec::new();
-    for slot in &OP_PROFILE.registry.slots {
+    for slot in OP_PROFILE.registry.iter_slots() {
         if slot.state.load(Ordering::Acquire) != 1 {
             continue;
         }

@@ -65,3 +65,44 @@ economy).
 - Parallel-run test flakes (zc suites, read_lane_tests) reproduce on
   pre-campaign trees under default `cargo test` parallelism; the gate's
   `--test-threads=1` never sees them. Backlog item, not campaign debt.
+
+## Addendum — the worker op-cost leg landed the jump (same day)
+
+The clean worker profile (PAIR posture, F=599 dwarf, resolved locally
+against the build-id'd rocky8 binary + rig kallsyms) named the ~51 µs
+worker-CPU budget's top line: **scc bucket-writer lock spin, 16.6 % SELF**
+(`_mm_pause`; ICF-merged symbol — stacks under
+`publish_attr → attr_cache HashIndex insert`, 32 workers × 32 hot inos),
+plus the same path's `SystemTime` mint behind `__vdso_gettimeofday`
+(~16 % combined clock reads).
+
+**Fix (`09c679f4`): identical-WriteTimes publish elision** — the postlude
+stamps on the coarse clock, so per hot ino every publish inside a ~4 ms
+tick merges byte-identically; a lock-free peek pre-computes the merge and
+equality skips the stripe mutex + insert (value-idempotent; the skipped
+TTL-stamp refresh degrades to one refetch per daemon TTL, self-healing).
+
+| Row (E1 binary) | Shared ON | Shared OFF |
+|---|---|---|
+| kern rand-4k | **525,259** (1.95 ms) / **525,509 sustained 120 s, flat** | 489,874 |
+| il rand-4k | **531,344** | 491,769 |
+| il seq-1m | 38,832 MiB/s ✓ | — |
+| kern rand-4k qd64 | 368k (deeper offered depth still buys latency only) | — |
+
+Three verdicts:
+1. **391k → 525k/531k sustained (+34/36 %)** — the campaign's first jump,
+   from the convoy+funnel+elision STACK (each was individually a wash;
+   the pair law made the stack visible).
+2. **The il→kern parity violation is RESOLVED** (il ≥ kern for the first
+   time): the shared attr-bucket spin was the parity gap, not the ipc
+   handoff — PR 4's question closes without a PR 4.
+3. **Shared admission is now a counted +7–8 % win on BOTH paths** — the
+   default-OFF ruling should be revisited with a fresh A-B-B-A after the
+   next lever (single-order pair today).
+
+Next named terms (from the same profile, in order): the remaining
+bucket-writer venues (patch-purge present-key removes; `note_last_write_end`
+swap word), the ~32 µs worker wait residue (enter/park economy), and the
+qd-scaling knee (525k at qd32 vs 369k at qd64 — offered depth past the knee
+still degrades; the probe-governor treatment applies once per-op cost
+stops moving).

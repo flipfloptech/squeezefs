@@ -4955,10 +4955,31 @@ fn queue_worker(
                             }
                         }
                     }
+                    // Burst-drain (T2 correction): poll EVERY currently-
+                    // ready task between enters — one flush+GETEVENTS per
+                    // burst instead of per poll (T2 priced the per-poll
+                    // enter at ~2.7 syscalls/op: bridge RTT fell 10× and
+                    // the row still lost 6 % to the lengthened pass). The
+                    // burst's own wakes (reap resolutions) land in the
+                    // ready queue and form the NEXT burst after the next
+                    // flush, so DMA launch stays eager per burst.
                     fused_more = match pool.fused_dispatch.get() {
-                        Some(d) => fused_lane.drain_one(&d.handle),
+                        Some(d) => {
+                            let mut any = false;
+                            while fused_lane.drain_one(&d.handle) {
+                                any = true;
+                                if let Ok(m) = commit_rx.try_recv() {
+                                    got = Some(m);
+                                    break;
+                                }
+                            }
+                            any
+                        }
                         None => false,
                     };
+                    if got.is_some() {
+                        break;
+                    }
                 }
                 got
             }};

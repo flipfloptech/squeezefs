@@ -152,6 +152,48 @@ verdict still owed before keep), clock-ceremony (~23 % of lane cycles) and
 kernel-abort unmount cycles — all 32 files stat 2 GiB every time; NOT
 reproduced.
 
+## Addendum (same day): the yield board re-measured — two stale numbers retired
+
+**1. The "~23 % clock ceremony" deferred lever is DEAD on the current tip.**
+Fresh cycles profile (`perf record -F 3997 -g --call-graph dwarf,512`, svc+dd
+lanes, 8 s @ plateau, 149 k lane samples): clock-containing stacks are
+**0.8–1.0 %** of lane cycles — the r5 single-read law + span-form records
+already killed it, and the residue is kernel-internal (`tcp_write_xmit`'s own
+mstamp). `clear_page_erms` likewise ≈ 0 on the lanes now. The fresh lane
+ledger: **inline nvme-tcp TCP transmit ~34 %** (38 % svc / 30 % dd — the
+whole `io_submit_sqes → blk_mq → nvme_tcp_queue_rq → tcp_sendmsg` transmit
+runs on the submitting thread), io_uring enter/CQ ceremony ~24 %,
+futex/wake ~10 %, memcpy ≈ 0.
+
+**2. The inline-TX offload (`nvme_tcp.wq_unbound=Y`) is a WASH at steady
+state — and the A-B-B-A law caught the false positive.** Substrate flip via
+ordered full-fabric reconnect (mapping verified byte-identical modulo the
+`host_traddr` field `nvme connect -w` adds; flip script
+`/scratch/tmp/wq_flip.sh`, restore verified). Bracket (B-B-B-A-A, all
+engaged, posture verified): B1 **690 k** @ 1.42 ms / 20.6 µs/op CPU,
+B2 638 k, B3 635 k | A-close 637 k, 636 k @ 1.56 ms / 23.9 µs/op. B1 was a
+**fresh-TCP-connection transient** (every first-row-after-reconnect runs
+hot); steady-state B ≡ steady-state A at ~636 k. The REAL signal: daemon
+CPU/op fell ~1.5–3 µs with TX on unbound kworkers, and IOPS did not follow —
+**direct confirmation the loop is residence-bound, not lane-CPU-bound**.
+Also note the day-drift: morning A band 598–616 k vs evening 636–637 k on
+both postures (profiler-attached rows and connection age both depress rows —
+same-bracket comparison is the only valid read; the note's morning/evening
+bands must never be cross-compared).
+
+**3. Where the residence actually sits (the refined ledger).** With kernel
+`submit→CQE` at 239 µs and `admit` span 33 µs vs ~7 µs svc CPU/op, the
+inflight surplus (~760 µs) is the **sweep-serialized admit structure**: a
+pass admits ~17 ops sequentially (~33 µs each, span not CPU — the balance is
+preemption/stall on an ~89 %-busy box) and flushes ONCE at sweep end, so an
+op staged early in a sweep waits most of the sweep before its SQE enters the
+kernel, then its CQE waits for a reap point. Mid-sweep eager enters are
+already falsified (r5, eager-K sweep); cutting the admit span's stall term
+and the per-op post-ACK fan-out (the 208 k/s `spawn_dd_write_times_park`
+dispatch churn + 292 k/s wake edges toward tpc — pure preemption pressure on
+the very threads whose pass length sets the wall) is the surviving yield
+board, in that order.
+
 ## Row ledger (engagement exact on every row)
 
 | Leg | IOPS (first/last) | daemon CPU | notes |
@@ -164,5 +206,9 @@ reproduced.
 | noinline discriminator | 616,508 / 614,003 | 15.52 cores, 25.2 µs/op | `SQUEEZEFS_IPC_DD_INLINE_REAP=0` |
 | uring tracepoint row | 598,444 / 595,929 | — | io_uring+block tracepoints 0.3 s |
 | raw control | 3,106,730 (read) | — | 10 namespaces direct, same shape |
+| cycles capture row | 620,352 / 616,100 (capture-free) · 567,464 / 564,508 (profiler attached) | — | lane-cycle ledger source |
+| wqY B1 (fresh connect) | 689,800 / 681,839 | 14.24 cores, 20.6 µs/op | TRANSIENT — see addendum |
+| wqY B2 / B3 | 638,144 / 634,625 | ~14.3 cores, 22.5 µs/op | steady-state B |
+| wqN A-close ×2 | 637,014 / 635,741 | 15.23 cores, 23.9 µs/op | bracket closed: WASH |
 
 Numbers stay internal until a release battery (standing rule).

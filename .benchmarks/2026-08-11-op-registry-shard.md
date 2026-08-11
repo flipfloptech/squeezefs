@@ -77,3 +77,24 @@ path burns ~2× CPU per op — the fattest single target on the road to
 remaining worker self lines (clock reads ~4 %, saa bucket spin 1.7 %,
 timeline instrument fetch_adds ~1.5 %, kernel `fuse_request_end`
 spinlocks 5.2 % — custom-kernel surface).
+
+## Addendum — the direct-drive WRITE lane's first counted leg (same day)
+
+Lane landed (`499ef67b`/`c1bd0ebe`/`65eb36f5`, docs/design-il-direct-write.md
+§6): eligible il writes DMA on the svc lane's dd shards, postlude at CQE,
+handoff fallback intact. Leg ddw2 (leg.sh protocol, Shared ON, engagement
+exact — 32.1 M dd serves + 6.8 M handoffs ≡ 38.9 M ops, fence refusals 0):
+
+| row | pre-lane | ddw2 |
+|---|---|---|
+| il rand-4k | 272–295 k @ 60–62 µs/op | **648,410 @ 23.46 µs/op** (clat 1.58 ms) |
+| kern rand-4k | 518–534 k | 536,921 @ 31.39 µs/op |
+| il seq-1m / kern seq-4k | par | par |
+
+**+2.2× il IOPS, −61 % daemon CPU/op; il now leads kern +21 %** — the fan-in
+wall named by the C1 investigation (lanes 42 % util, 3.68 ms clat) is gone
+from the eligible shape. Residuals: `ineligible_custody` 6.78 M/38.9 M
+(17 % — RAM lease-cache misses under churn; the next shaving), the one-time
+size-0 stat anomaly after a kernel-abort unmount (watch item; clean-remount
+discriminator showed durable sizes intact), single-leg so far — the A-B-B-A
+closure leg + sustained row still owed before any headline.

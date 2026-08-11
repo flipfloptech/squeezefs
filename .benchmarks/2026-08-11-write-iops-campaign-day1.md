@@ -106,3 +106,30 @@ swap word), the ~32 µs worker wait residue (enter/park economy), and the
 qd-scaling knee (525k at qd32 vs 369k at qd64 — offered depth past the knee
 still degrades; the probe-governor treatment applies once per-op cost
 stops moving).
+
+## Addendum 2 — CORRECTION: every day-1 "il" row was a KD-7 passthrough
+
+The op-registry bracket's engagement audit (same day, later) found that
+every "il" row above moved **zero `ipc_ops_write`** — the on-disk shim
+was still the `4362ea74` build while the daemon had been redeployed
+through `86e47549`/`3c7cf95a`/`09c679f4`, so KD-7 refused every session
+("build mismatch … mount passthrough", printed on every row's stderr)
+and LD_PRELOAD rows rode the kernel ring. KD-7 worked exactly as
+designed; the harness never checked engagement. `row_diag.sh` now
+refuses any row whose output announces passthrough (exit 9), and the
+deploy step is PAIRED by law (daemon + shim from one `dist/<target>/`).
+
+What survives, what falls:
+- **Falls**: verdict 2 ("il→kern parity RESOLVED", "il 531,344") — that
+  cell was the kernel path measured twice. Parity is REOPENED: the first
+  ENGAGED il row of the day (B1 of the op-registry bracket, ring ledger
+  exact: `ipc_ops_write` +16.39 M ≡ row ops) reads **273.2 k = 0.53×
+  kern** on the same mount.
+- **Survives**: verdict 1 (kern 391 k → 525 k) — kernel-venue rows,
+  engagement N/A. Verdict 3 (Shared ON +7–8 %) — BOTH brackets were
+  genuinely kernel-path (the "il" bracket was an accidental second
+  kernel bracket, order-independent at 530/491 vs 523/489), so the
+  default-ON ruling stands on kernel evidence; the engaged-il posture
+  bracket is owed.
+- Engaged il DID move with the campaign: 205 k (diagnosis note, PAIR
+  posture) → 273 k engaged (+33 %) — the same ratio as kern's +34 %.

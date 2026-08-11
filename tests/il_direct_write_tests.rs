@@ -16,6 +16,12 @@
 //! * **(a) decision-ledger closure** — an ineligible shape falls back to
 //!   the sever→handoff path UNCHANGED, counts exactly its
 //!   `ipc_dd_write_ineligible_*` clause bucket, and serves 0 direct.
+//!   Custody refusals attribute PER CAUSE (`lease` / `range` /
+//!   `block_lock` / `killpriv` / `fence_backoff` — the rig ran the
+//!   retired bundled `..._custody` counter at 17 % of ops, and the fix
+//!   design needs to know WHICH cause dominates): closure/silence
+//!   assertions read the SUM of the five, the per-arm rails below each
+//!   assert their own arm.
 //! * **(b) the RES-6 fence rail** — a fenced writer guard refuses the
 //!   direct write LOUD (errno to the client, `ipc_dd_write_fence_refusals`
 //!   moves) and never falls back to a second submission path.
@@ -521,7 +527,11 @@ struct Snap {
     dd_bytes: u64,
     dd_fence_refusals: u64,
     dd_shape: u64,
-    dd_custody: u64,
+    dd_lease: u64,
+    dd_range: u64,
+    dd_block_lock: u64,
+    dd_killpriv: u64,
+    dd_fence_backoff: u64,
     dd_overlay: u64,
     dd_backend: u64,
     dd_align: u64,
@@ -533,6 +543,19 @@ struct Snap {
     data_fence_refusals: u64,
 }
 
+impl Snap {
+    /// The retired bundled `ipc_dd_write_ineligible_custody` population —
+    /// the SUM of its five split arms. Ledger-closure/silence assertions
+    /// read this; the per-arm rails assert their specific cause.
+    fn dd_custody_sum(&self) -> u64 {
+        self.dd_lease
+            + self.dd_range
+            + self.dd_block_lock
+            + self.dd_killpriv
+            + self.dd_fence_backoff
+    }
+}
+
 fn snap() -> Snap {
     let l = |c: &std::sync::atomic::AtomicU64| c.load(Ordering::Relaxed);
     Snap {
@@ -540,7 +563,11 @@ fn snap() -> Snap {
         dd_bytes: l(&METRICS.ipc_dd_write_bytes),
         dd_fence_refusals: l(&METRICS.ipc_dd_write_fence_refusals),
         dd_shape: l(&METRICS.ipc_dd_write_ineligible_shape),
-        dd_custody: l(&METRICS.ipc_dd_write_ineligible_custody),
+        dd_lease: l(&METRICS.ipc_dd_write_ineligible_lease),
+        dd_range: l(&METRICS.ipc_dd_write_ineligible_range),
+        dd_block_lock: l(&METRICS.ipc_dd_write_ineligible_block_lock),
+        dd_killpriv: l(&METRICS.ipc_dd_write_ineligible_killpriv),
+        dd_fence_backoff: l(&METRICS.ipc_dd_write_ineligible_fence_backoff),
         dd_overlay: l(&METRICS.ipc_dd_write_ineligible_overlay),
         dd_backend: l(&METRICS.ipc_dd_write_ineligible_backend),
         dd_align: l(&METRICS.ipc_dd_write_ineligible_align),
@@ -560,10 +587,11 @@ macro_rules! delta {
 }
 
 /// Warm the lane: the FIRST ring write may legitimately fall back once
-/// (cold killpriv-clean latch on an unprivileged peer — the clearing
-/// obligation is async metadata work the sync probe must not pay; the
-/// handler latches it). After one warm-up, eligible writes MUST serve
-/// direct. Returns when a probe write direct-serves.
+/// (cold killpriv-clean latch on an unprivileged peer, counted on the
+/// `killpriv` arm — the clearing obligation is async metadata work the
+/// sync probe must not pay; the handler latches it). After one warm-up,
+/// eligible writes MUST serve direct. Returns when a probe write
+/// direct-serves.
 fn warm_direct_lane(session: &ClientSession, binding: u64, base: &mut [u8], offsets: &[u64]) {
     let deadline = Instant::now() + Duration::from_secs(20);
     for (i, &off) in offsets.iter().enumerate() {
@@ -660,9 +688,15 @@ async fn direct_writes_serve_on_the_svc_lane_and_stay_byte_exact() {
             "ipc_ops_write must account for direct serves (engagement law)"
         );
         assert_eq!(delta!(after, before, bytes_in), user_bytes);
-        // Ledger silence: an all-eligible window counts no fallback clause.
+        // Ledger silence: an all-eligible window counts no fallback clause
+        // (the custody face reads the SUM of its five split arms).
         assert_eq!(delta!(after, before, dd_shape), 0);
-        assert_eq!(delta!(after, before, dd_custody), 0);
+        assert_eq!(
+            after.dd_custody_sum() - before.dd_custody_sum(),
+            0,
+            "no custody arm (lease/range/block_lock/killpriv/fence_backoff) \
+             may move on an all-eligible window"
+        );
         assert_eq!(delta!(after, before, dd_overlay), 0);
         assert_eq!(delta!(after, before, dd_backend), 0);
         assert_eq!(delta!(after, before, dd_align), 0);
@@ -736,9 +770,10 @@ async fn ineligible_shapes_fall_back_and_count_their_clause() {
         assert_eq!(delta!(after, before, dd_serves), 0);
         assert_eq!(delta!(after, before, handoffs), 1);
 
-        // custody: drop the cached lease — the sync probe must not pay the
+        // lease: drop the cached lease — the sync probe must not pay the
         // async lease acquisition; the op demotes and the handler
-        // re-acquires.
+        // re-acquires. The refusal attributes to the LEASE arm exactly —
+        // no sibling custody arm may absorb it.
         fx.fs.invalidate_local_lease(ino);
         let before = snap();
         let p = pattern(4096, 0xB3);
@@ -748,9 +783,19 @@ async fn ineligible_shapes_fall_back_and_count_their_clause() {
         want[off as usize..off as usize + 4096].copy_from_slice(&p);
         let after = snap();
         assert!(
-            delta!(after, before, dd_custody) >= 1,
-            "a lease-less ino counts the custody clause (an await-needing \
+            delta!(after, before, dd_lease) >= 1,
+            "a lease-less ino counts the LEASE arm (an await-needing \
              custody shape is INELIGIBLE — v1 stays synchronous)"
+        );
+        assert_eq!(
+            delta!(after, before, dd_range)
+                + delta!(after, before, dd_block_lock)
+                + delta!(after, before, dd_killpriv)
+                + delta!(after, before, dd_fence_backoff),
+            0,
+            "exactly one custody arm per refusal: the lease miss must not \
+             leak into a sibling arm (per-cause attribution is the whole \
+             point of the split)"
         );
         assert_eq!(delta!(after, before, dd_serves), 0);
         assert_eq!(delta!(after, before, handoffs), 1);
@@ -787,6 +832,314 @@ async fn ineligible_shapes_fall_back_and_count_their_clause() {
     fx.purge_read_tiers(ino).await;
     let got = fx.fuse_read(ino, 0, want.len() as u32).await;
     assert_eq!(got, want, "fallback writes must stay byte-exact");
+    fx.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// (a) continued: the split custody arms, one rail per cause
+//
+// The retired bundled `..._custody` counter ran 17 % of ops on the rig
+// (6.78 M/38.9 M — .benchmarks/2026-08-11-op-registry-shard.md) across
+// FIVE distinct refusal causes; the rails below pin each cause to its own
+// counter so the field number attributes.
+//
+// The RANGE arm (`ipc_dd_write_ineligible_range` — the W1 clause-7
+// `span_range_shared` refusal) has NO reachable seam in this harness by
+// construction, not by omission: the probe consults the clause with the
+// ino's CACHED whole-file lease's token, and whole-file EXCLUSIVE custody
+// conflicts with every byte-range acquire in the shipped lock table
+// (`FileCustody::conflicts` checks `wholes` first; S9's
+// `adopt_remote_grant` refuses conflicting adoptions too), so "cached
+// whole-file lease AND a live overlapping range grant" is unconstructible
+// without new active_leases seams. The arm exists for the S9 co-writer
+// posture (an adopted byte-range lease serving as the cached custody).
+// The predicate itself is pinned by
+// `tests/dlm_range_custody_tests.rs::span_range_shared_classifies_custody`;
+// HERE the arm is covered by the ledger-closure/silence sums
+// (`Snap::dd_custody_sum`) and by every sibling rail's
+// exactly-one-arm-per-refusal assertion.
+// ---------------------------------------------------------------------------
+
+/// `block_lock` arm: an otherwise-eligible write whose block's
+/// `BLOCK_FLUSH_LOCKS` stripe is HELD demotes (the probe's ONE
+/// non-blocking `try_lock` — the serve_read lock-demotion posture),
+/// counts exactly the block_lock arm, and serves 0 direct. The test IS
+/// the mid-flight writer: it holds the block's guard across the ring
+/// write's probe and releases it once the arm has counted (the demoted
+/// handler write then takes the same lock and lands byte-exact).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn contended_block_lock_counts_its_own_arm_and_demotes() {
+    let fx = Fixture::new("ddwblock").await;
+    fx.salt_inos(11).await;
+    let (ino, mut want) = fx.durable_striped("blklock.bin", 4, 0x50).await;
+    let dir = tempfile::tempdir().unwrap();
+    let fd = rw_standin(&fx, &dir, "standin.bin", ino);
+    let (session, binding) = ClientSession::establish(&fx, &fd);
+
+    tokio::task::block_in_place(|| {
+        warm_direct_lane(&session, binding, &mut want, &[BS + 16384, 3 * BS + 8192]);
+
+        // Hold block 2's flush lock — the probe's try_lock must observe
+        // the contention (a writer mid-flight on the block).
+        let lock = squeezefs::fuse_client::BLOCK_FLUSH_LOCKS.get_lock(ino, 2);
+        let guard = lock.try_lock().expect("the test takes block 2's guard");
+
+        let before = snap();
+        let base_block_lock = before.dd_block_lock;
+        // The guard travels into a watcher thread: the demoted handler
+        // write blocks on this same stripe, so the guard must drop only
+        // AFTER the probe counted the arm (deadline-bounded — never a
+        // sleep-synchronized release).
+        let watcher = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let moved = loop {
+                if METRICS
+                    .ipc_dd_write_ineligible_block_lock
+                    .load(Ordering::Relaxed)
+                    > base_block_lock
+                {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::yield_now();
+            };
+            drop(guard);
+            moved
+        });
+
+        let p = pattern(4096, 0xF1);
+        let off = 2 * BS + 8192;
+        let r = session.ring_pwrite(binding, off, &p);
+        assert_eq!(r, 4096, "the demoted write must still ack via the handler");
+        want[off as usize..off as usize + 4096].copy_from_slice(&p);
+        assert!(
+            watcher.join().expect("watcher thread must not panic"),
+            "the probe never counted the block_lock arm while the test \
+             held the block's BLOCK_FLUSH_LOCKS guard"
+        );
+
+        let after = snap();
+        assert_eq!(
+            delta!(after, before, dd_block_lock),
+            1,
+            "a contended block lock counts exactly the block_lock arm"
+        );
+        assert_eq!(
+            delta!(after, before, dd_lease)
+                + delta!(after, before, dd_range)
+                + delta!(after, before, dd_killpriv)
+                + delta!(after, before, dd_fence_backoff),
+            0,
+            "exactly one custody arm per refusal (attribution law)"
+        );
+        assert_eq!(delta!(after, before, dd_serves), 0, "no direct serve");
+        assert_eq!(
+            delta!(after, before, handoffs),
+            1,
+            "the contended op rides the sever→handoff path"
+        );
+    });
+
+    fx.fsync(ino).await;
+    fx.purge_read_tiers(ino).await;
+    let got = fx.fuse_read(ino, 2 * BS, BS as u32).await;
+    assert_eq!(
+        got,
+        want[(2 * BS) as usize..(3 * BS) as usize].to_vec(),
+        "the demoted write stays byte-exact"
+    );
+    fx.shutdown();
+}
+
+/// `killpriv` arm: a `kill_priv`-flagged binding whose ino's
+/// killpriv-clean latch is NOT held is custody-INELIGIBLE (the clearing
+/// obligation is async metadata work the sync probe must not pay — the
+/// VFS privs-before-write order). A chmod re-arms the obligation
+/// (`setattr` removes the latch after its commit); the next eligible
+/// ring write counts exactly the killpriv arm and falls back, the
+/// handler re-latches, and the write after that direct-serves again.
+///
+/// The binding's `kill_priv` class is the HELLO-time
+/// `peer_kill_priv(uid, pid)` of THIS test process: an exempt peer
+/// (root / CAP_FSETID) makes the arm structurally unreachable — that
+/// branch asserts the exemption face instead (the flagless write
+/// direct-serves with the arm silent), so the test is deterministic on
+/// both identities without an environment skip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unlatched_killpriv_counts_its_own_arm_then_relatches() {
+    let fx = Fixture::new("ddwkpriv").await;
+    fx.salt_inos(13).await;
+    let (ino, mut want) = fx.durable_striped("kpriv.bin", 4, 0x60).await;
+    let dir = tempfile::tempdir().unwrap();
+    let fd = rw_standin(&fx, &dir, "standin.bin", ino);
+    let (session, binding) = ClientSession::establish(&fx, &fd);
+
+    // The same classification the host computed at HELLO for this peer.
+    let kill = squeezefs::ipc_host::peer_kill_priv(unsafe { libc::getuid() }, std::process::id());
+
+    tokio::task::block_in_place(|| {
+        warm_direct_lane(&session, binding, &mut want, &[BS + 16384, 2 * BS + 8192]);
+    });
+
+    // Re-arm the obligation: a mode-touching setattr removes the latch
+    // AFTER its commit (the latch's write-then-remove race law).
+    fx.fs
+        .setattr(
+            req(),
+            ino,
+            None,
+            fuse3::SetAttr {
+                mode: Some(0o644),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("chmod must succeed");
+    assert!(
+        !fx.fs.killpriv_clean_holds(ino),
+        "a mode-touching setattr must drop the killpriv-clean latch"
+    );
+
+    tokio::task::block_in_place(|| {
+        let before = snap();
+        let p = pattern(4096, 0xF2);
+        let off = 3 * BS + 16384;
+        let r = session.ring_pwrite(binding, off, &p);
+        assert_eq!(r, 4096, "the write must ack on either identity");
+        want[off as usize..off as usize + 4096].copy_from_slice(&p);
+        let after = snap();
+
+        if kill {
+            assert_eq!(
+                delta!(after, before, dd_killpriv),
+                1,
+                "an unlatched killpriv obligation counts exactly the \
+                 killpriv arm (one fallback lets the handler clear privs \
+                 BEFORE the data lands)"
+            );
+            assert_eq!(
+                delta!(after, before, dd_lease)
+                    + delta!(after, before, dd_range)
+                    + delta!(after, before, dd_block_lock)
+                    + delta!(after, before, dd_fence_backoff),
+                0,
+                "exactly one custody arm per refusal (attribution law)"
+            );
+            assert_eq!(delta!(after, before, dd_serves), 0, "no direct serve");
+            assert_eq!(delta!(after, before, handoffs), 1);
+
+            // The fallback latched the ino clean: steady state pays the
+            // contains-check and direct-serves again.
+            let before = snap();
+            let p = pattern(4096, 0xF3);
+            let off = BS + 32768;
+            let r = session.ring_pwrite(binding, off, &p);
+            assert_eq!(r, 4096);
+            want[off as usize..off as usize + 4096].copy_from_slice(&p);
+            let after = snap();
+            assert_eq!(
+                delta!(after, before, dd_serves),
+                1,
+                "the latch is re-held after ONE fallback: the next \
+                 eligible write direct-serves"
+            );
+            assert_eq!(delta!(after, before, dd_killpriv), 0);
+        } else {
+            // Exempt peer (root / CAP_FSETID): the binding never carries
+            // the obligation, so the un-latched ino direct-serves and the
+            // arm stays structurally silent.
+            assert_eq!(
+                delta!(after, before, dd_serves),
+                1,
+                "an exempt peer's write carries no killpriv obligation"
+            );
+            assert_eq!(delta!(after, before, dd_killpriv), 0);
+        }
+    });
+
+    fx.fsync(ino).await;
+    fx.purge_read_tiers(ino).await;
+    let got = fx.fuse_read(ino, 0, want.len() as u32).await;
+    assert_eq!(got, want, "both identities stay byte-exact");
+    fx.shutdown();
+}
+
+/// `fence_backoff` arm: the probe passes (the prelude has NO refcount
+/// screen — sole ownership is the ENGINE's §5.1 fence to prove), but
+/// `begin_patch_sole_owner`'s refcount re-check observes a clone pin ⇒
+/// the engine re-stabilizes the word (content never changed), counts
+/// exactly the fence_backoff arm, and falls back to the handler's CoW
+/// arm — never an in-place scribble on a shared block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn clone_pinned_block_counts_the_fence_backoff_arm_and_cows() {
+    let fx = Fixture::new("ddwpin").await;
+    fx.salt_inos(15).await;
+    let (ino, mut want) = fx.durable_striped("pin.bin", 4, 0x70).await;
+    let dir = tempfile::tempdir().unwrap();
+    let fd = rw_standin(&fx, &dir, "standin.bin", ino);
+    let (session, binding) = ClientSession::establish(&fx, &fd);
+
+    tokio::task::block_in_place(|| {
+        warm_direct_lane(&session, binding, &mut want, &[BS + 16384, 2 * BS + 8192]);
+    });
+
+    // Pin block 3 clone-shared (refcount 1 → 2): the inplace/refcount
+    // test seam — the §5.1 sole-owner predicate must now fail.
+    let bk = fx.block_key(ino, 3).await;
+    assert!(
+        fx.fs.router.backend_router.increment_refcount(&bk),
+        "clone pin on a live block must succeed"
+    );
+
+    tokio::task::block_in_place(|| {
+        let before = snap();
+        let p = pattern(4096, 0xF4);
+        let off = 3 * BS + 24576;
+        let r = session.ring_pwrite(binding, off, &p);
+        assert_eq!(r, 4096, "the CoW fallback must still ack the write");
+        want[off as usize..off as usize + 4096].copy_from_slice(&p);
+        let after = snap();
+
+        assert_eq!(
+            delta!(after, before, dd_fence_backoff),
+            1,
+            "a clone-pinned block counts exactly the fence_backoff arm \
+             (the engine-side §5.1 back-off, not a prelude class)"
+        );
+        assert_eq!(
+            delta!(after, before, dd_lease)
+                + delta!(after, before, dd_range)
+                + delta!(after, before, dd_block_lock)
+                + delta!(after, before, dd_killpriv),
+            0,
+            "exactly one custody arm per refusal (attribution law)"
+        );
+        assert_eq!(delta!(after, before, dd_serves), 0, "no direct serve");
+        assert_eq!(
+            delta!(after, before, handoffs),
+            1,
+            "the backed-off op rides the sever→handoff path (re-stabilized \
+             word, unchanged content — the handler re-runs the whole patch \
+             protocol and takes its CoW arm)"
+        );
+        assert_eq!(
+            delta!(after, before, patch_writes),
+            0,
+            "no in-place patch may land on a clone-shared block"
+        );
+    });
+
+    // The CoW displaced the mapping; the write is byte-exact and durable.
+    fx.fsync(ino).await;
+    fx.purge_read_tiers(ino).await;
+    let got = fx.fuse_read(ino, 3 * BS, BS as u32).await;
+    assert_eq!(
+        got,
+        want[(3 * BS) as usize..(4 * BS) as usize].to_vec(),
+        "the CoW fallback stays byte-exact"
+    );
     fx.shutdown();
 }
 
@@ -980,9 +1333,10 @@ async fn lever_off_routes_every_write_to_the_handoff_path() {
             "the handoff path carries the whole row under the lever"
         );
         // The lever is silent: no ledger class moves (the knob is the A/B
-        // control, never an 'ineligible' verdict).
+        // control, never an 'ineligible' verdict) — the custody face reads
+        // the SUM of its five split arms.
         assert_eq!(delta!(after, before, dd_shape), 0);
-        assert_eq!(delta!(after, before, dd_custody), 0);
+        assert_eq!(after.dd_custody_sum() - before.dd_custody_sum(), 0);
         assert_eq!(delta!(after, before, dd_overlay), 0);
         assert_eq!(delta!(after, before, dd_backend), 0);
         assert_eq!(delta!(after, before, dd_align), 0);

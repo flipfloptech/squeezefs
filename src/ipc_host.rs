@@ -2301,6 +2301,17 @@ impl IpcHost {
         // the queue costs nothing and skips at its turn.
         self.enqueue_arena_prep(&session);
 
+        // Record the establishment latency BEFORE the SessionOk send —
+        // the same ordering law as the prep enqueue above: anything a
+        // client may observe after SessionOk (the admission-contract
+        // tests read this histogram the instant `establish` returns)
+        // must be visible before the send. The cost of the stronger
+        // order is one sample recorded for the rare SessionOk-send
+        // failure below — a torn-down admission's latency datum in a
+        // diagnostic histogram, harmless; the refusal counters remain
+        // the refusal ledger.
+        METRICS.ipc_session_admission_ns.record(admit_t0.elapsed());
+
         if send_ctl(
             sock,
             &CtlMsg::SessionOk {
@@ -2317,9 +2328,6 @@ impl IpcHost {
         // established) keeps the memory alive, and the client holds its
         // own fd. Zero persistent residue by construction.
         drop(memfd);
-        // Admission complete and acknowledged: record the establishment
-        // latency (the convoy instrument's sample).
-        METRICS.ipc_session_admission_ns.record(admit_t0.elapsed());
         Some(session)
     }
 

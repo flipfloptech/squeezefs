@@ -941,12 +941,14 @@ impl DirectDriveEngine {
 
         // §5.1 steps 1a+1b — mark-unstable → fence(SeqCst) → refcount
         // re-check. A clone pinned the block ⇒ re-stabilize (content
-        // never changed) and fall back to the handler's CoW arm.
+        // never changed) and fall back to the handler's CoW arm — the
+        // ledger's one post-probe arm, attributed apart from the prelude
+        // custody classes (per-cause split, 2026-08-11).
         if !allocator.begin_patch_sole_owner(snap.dev_off) {
             allocator.publish_block(snap.dev_off);
             drop(block_guard);
             METRICS
-                .ipc_dd_write_ineligible_custody
+                .ipc_dd_write_ineligible_fence_backoff
                 .fetch_add(1, Ordering::Relaxed);
             return Err((op, completion));
         }

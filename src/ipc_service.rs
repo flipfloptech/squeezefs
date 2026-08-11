@@ -947,12 +947,18 @@ impl DataPlaneSink {
     }
 
     /// The direct-drive WRITE lane's decision ledger (the W1
-    /// `patch_ineligible_*` shape — design-il-direct-write §5).
+    /// `patch_ineligible_*` shape — design-il-direct-write §5). Custody
+    /// refusals carry their cause (lease / range / block_lock /
+    /// killpriv); the engine-side clone-pin back-off counts its own
+    /// `..._fence_backoff` arm at the refusal site in `ipc_direct`.
     fn count_dd_write_ineligible(class: crate::fuse_client::IpcDirectWriteIneligible) {
         use crate::fuse_client::IpcDirectWriteIneligible as I;
         let counter = match class {
             I::Shape => &METRICS.ipc_dd_write_ineligible_shape,
-            I::Custody => &METRICS.ipc_dd_write_ineligible_custody,
+            I::Lease => &METRICS.ipc_dd_write_ineligible_lease,
+            I::Range => &METRICS.ipc_dd_write_ineligible_range,
+            I::BlockLock => &METRICS.ipc_dd_write_ineligible_block_lock,
+            I::Killpriv => &METRICS.ipc_dd_write_ineligible_killpriv,
             I::Overlay => &METRICS.ipc_dd_write_ineligible_overlay,
             I::Backend => &METRICS.ipc_dd_write_ineligible_backend,
             I::Align => &METRICS.ipc_dd_write_ineligible_align,

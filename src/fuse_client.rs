@@ -2223,7 +2223,7 @@ pub enum BlockLockSite {
     ReadSettle = 11,
     /// The IL direct-drive WRITE lane's `try_lock`
     /// (`ipc_direct_write_probe` — design-il-direct-write §3): contended
-    /// = INELIGIBLE (the custody clause — the op was about to wait
+    /// = INELIGIBLE (the `block_lock` arm — the op was about to wait
     /// anyway, the serve_read lock-demotion posture), never a blocking
     /// acquire on the service thread.
     IlDirectWrite = 12,
@@ -5853,12 +5853,33 @@ pub struct Metrics {
     /// RAM-resident, hole/decorated mapping, transform volume, or
     /// write-verification armed (the D14 direct-leg rule).
     pub ipc_dd_write_ineligible_shape: Align64<AtomicU64>,
-    /// `custody` = no RAM-cached lease (the acquisition is an await the
-    /// sync probe must not pay), byte-range custody shared (clause 7),
-    /// killpriv obligation not yet latched clean, block lock contended
-    /// (a writer is mid-flight on the block — the op was about to wait
-    /// anyway), or the §5.1 sole-owner fence observed a clone pin.
-    pub ipc_dd_write_ineligible_custody: Align64<AtomicU64>,
+    /// The custody refusals attribute PER CAUSE (the bundled `custody`
+    /// counter retired 2026-08-11: it ran 17 % of rig ops across five
+    /// distinct causes — attribution had to precede the fix design).
+    /// `lease` = no RAM-cached lease: the acquisition is an await the
+    /// sync probe must not pay (the handler's async job; one fallback
+    /// caches it).
+    pub ipc_dd_write_ineligible_lease: Align64<AtomicU64>,
+    /// `range` = W1 clause 7 (`span_range_shared`): the block's bytes are
+    /// under byte-range custody the holder does not solely own — whole-
+    /// inode exclusive custody does not hold (the S9 co-writer face; a
+    /// cached whole-file lease keeps this arm structurally silent).
+    pub ipc_dd_write_ineligible_range: Align64<AtomicU64>,
+    /// `block_lock` = the block's `BLOCK_FLUSH_LOCKS` stripe was
+    /// try_lock-contended: a writer is mid-flight on the block — the op
+    /// was about to wait anyway (the serve_read lock-demotion posture).
+    pub ipc_dd_write_ineligible_block_lock: Align64<AtomicU64>,
+    /// `killpriv` = a kill_priv-flagged binding whose ino's
+    /// killpriv-clean latch is not held: the clearing obligation is
+    /// async metadata work (VFS privs-before-write order); one fallback
+    /// latches it, steady state pays a contains-check.
+    pub ipc_dd_write_ineligible_killpriv: Align64<AtomicU64>,
+    /// `fence_backoff` = the ENGINE-side §5.1 sole-owner fence
+    /// (`begin_patch_sole_owner`) observed a clone pin at the refcount
+    /// re-check: re-stabilized (content never changed) and fell back to
+    /// the handler's CoW arm. Counted at the engine, not the prelude —
+    /// the only post-probe arm of the ledger.
+    pub ipc_dd_write_ineligible_fence_backoff: Align64<AtomicU64>,
     /// `overlay` = live RAM overlay / staged sibling / staged extent
     /// record / device overlay on the block — its extents are NEWER than
     /// the base block; correctness owns ambiguity.
@@ -6263,11 +6284,18 @@ pub struct IpcDirectSnapshot {
 /// Why the direct-drive WRITE prelude refused an op (the
 /// `ipc_dd_write_ineligible_*` decision ledger — design-il-direct-write
 /// §5, the W1 `patch_ineligible_*` pattern). Per-clause docs live on the
-/// counters in [`Metrics`].
+/// counters in [`Metrics`]. Custody refusals carry their CAUSE (`Lease`
+/// / `Range` / `BlockLock` / `Killpriv` — the bundled `Custody` class
+/// retired 2026-08-11 for attribution); the engine-side §5.1 clone-pin
+/// back-off (`..._fence_backoff`) is not a prelude verdict and counts
+/// directly at its site in `ipc_direct`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IpcDirectWriteIneligible {
     Shape,
-    Custody,
+    Lease,
+    Range,
+    BlockLock,
+    Killpriv,
     Overlay,
     Backend,
     Align,
@@ -8957,7 +8985,11 @@ impl SqueezefsFilesystem {
                 "ipc_dd_write_bytes": METRICS.ipc_dd_write_bytes.load(Ordering::Relaxed),
                 "ipc_dd_write_fence_refusals": METRICS.ipc_dd_write_fence_refusals.load(Ordering::Relaxed),
                 "ipc_dd_write_ineligible_shape": METRICS.ipc_dd_write_ineligible_shape.load(Ordering::Relaxed),
-                "ipc_dd_write_ineligible_custody": METRICS.ipc_dd_write_ineligible_custody.load(Ordering::Relaxed),
+                "ipc_dd_write_ineligible_lease": METRICS.ipc_dd_write_ineligible_lease.load(Ordering::Relaxed),
+                "ipc_dd_write_ineligible_range": METRICS.ipc_dd_write_ineligible_range.load(Ordering::Relaxed),
+                "ipc_dd_write_ineligible_block_lock": METRICS.ipc_dd_write_ineligible_block_lock.load(Ordering::Relaxed),
+                "ipc_dd_write_ineligible_killpriv": METRICS.ipc_dd_write_ineligible_killpriv.load(Ordering::Relaxed),
+                "ipc_dd_write_ineligible_fence_backoff": METRICS.ipc_dd_write_ineligible_fence_backoff.load(Ordering::Relaxed),
                 "ipc_dd_write_ineligible_overlay": METRICS.ipc_dd_write_ineligible_overlay.load(Ordering::Relaxed),
                 "ipc_dd_write_ineligible_backend": METRICS.ipc_dd_write_ineligible_backend.load(Ordering::Relaxed),
                 "ipc_dd_write_ineligible_align": METRICS.ipc_dd_write_ineligible_align.load(Ordering::Relaxed),
@@ -10392,15 +10424,15 @@ impl SqueezefsFilesystem {
     /// / atomics) except ONE non-blocking `try_lock` of the block's
     /// `BLOCK_FLUSH_LOCKS` stripe — the serve_read `try_read()` posture:
     /// contention means a writer is mid-flight on the block and the op
-    /// was about to wait anyway, so it demotes (custody clause). On
+    /// was about to wait anyway, so it demotes (the `block_lock` arm). On
     /// success the HELD guard travels with the snapshot into the engine's
     /// in-flight slab and drops in the CQE postlude — the SAME protection
     /// `try_sole_owner_patch` runs under (block `b`'s mapping mutates
     /// only under this lock, so probe-time resolution stays authoritative
     /// across the DMA; no CQE revalidation ladder is needed). Custody
-    /// that would need an await — a missing cached lease, an un-latched
-    /// killpriv obligation — is INELIGIBLE by design: v1 stays
-    /// synchronous.
+    /// that would need an await — a missing cached lease (the `lease`
+    /// arm), an un-latched killpriv obligation (the `killpriv` arm) — is
+    /// INELIGIBLE by design: v1 stays synchronous.
     ///
     /// Commit point: once every screen passes, the ino's stream word is
     /// swapped (`note_last_write_end` — the coverage bookkeeping the
@@ -10469,7 +10501,7 @@ impl SqueezefsFilesystem {
         let Ok(guard) = lock.try_lock() else {
             // A writer holds the block: the op was about to wait anyway —
             // demote (the serve_read lock-demotion posture).
-            return Err(I::Custody);
+            return Err(I::BlockLock);
         };
         // Lock census: always-on last-holder stamp (the D1.b watchdog's
         // named-holder surface) + the profile-armed site row.
@@ -10534,11 +10566,12 @@ impl SqueezefsFilesystem {
             return Err(I::Shape);
         }
 
-        // -- custody (RAM-only; an await-needing shape is INELIGIBLE) ---
+        // -- custody (RAM-only; an await-needing shape is INELIGIBLE),
+        //    each refusal attributed to its own arm ------------------
         // The cached-lease hot path only: a first-write ino's lease
         // acquisition is the handler's async job.
         let Some(lease) = self.active_leases.get(&ino) else {
-            return Err(I::Custody);
+            return Err(I::Lease);
         };
         let token = lease.fencing_token();
         drop(lease);
@@ -10548,7 +10581,7 @@ impl SqueezefsFilesystem {
         // fallback op would double-count there otherwise.
         let block_start = u64::from(b32) * block_size;
         if crate::dlm::span_range_shared(ino, block_start, block_start + block_size, token) {
-            return Err(I::Custody);
+            return Err(I::Range);
         }
         // Killpriv-v2 (il parity): a flagged peer's write may only
         // direct-serve once the ino's known-clean latch holds — the
@@ -10557,7 +10590,7 @@ impl SqueezefsFilesystem {
         // privs-before-write order). One fallback latches it; steady
         // state pays a contains-check, exactly the handler's economy.
         if kill_priv && !self.killpriv_clean.contains_sync(&ino) {
-            return Err(I::Custody);
+            return Err(I::Killpriv);
         }
 
         // -- backend identity (parse-carry — the submit re-parses nothing)

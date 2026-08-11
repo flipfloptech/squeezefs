@@ -1102,10 +1102,54 @@ fn bench_read_mostly_cache(c: &mut Criterion) {
     group.finish();
 }
 
+/// Op-registry claim/release under storm (2026-08-11 write-IOPS campaign,
+/// `.benchmarks/2026-08-11-write-iops-campaign-day1.md` addendum 2): the
+/// FIELD shape is 32 fused workers each claiming at op rate with ~32
+/// in-flight per worker (qd32 rand-4k, 525 k ops/s) — the flat-slab claim
+/// was 6.65 % of worker self-cycles. The bench uses 8 threads × 32 held
+/// claims so the row is stable across dev boxes; the mechanism instrument
+/// is claim+release ns/op with slots HELD (the storm probes past busy
+/// slots exactly as the field does).
+fn bench_op_registry(c: &mut Criterion) {
+    use squeezefs::fuse_client::{FuseOpKind, OpProf};
+
+    const THREADS: usize = 8;
+    const HELD: usize = 32;
+    const OPS: usize = 2_048;
+
+    let mut group = c.benchmark_group("op_registry");
+    group.throughput(criterion::Throughput::Elements((THREADS * OPS) as u64));
+
+    group.bench_function("claim_release_storm_held32", |b| {
+        b.iter(|| {
+            let mut hs = Vec::with_capacity(THREADS);
+            for t in 0..THREADS {
+                hs.push(std::thread::spawn(move || {
+                    // The standing in-flight population (ring depth).
+                    let held: Vec<OpProf> = (0..HELD)
+                        .map(|i| OpProf::begin(FuseOpKind::Write, (t * HELD + i) as u64))
+                        .collect();
+                    // Op-rate claim/release churn against that population.
+                    for i in 0..OPS {
+                        black_box(OpProf::begin(FuseOpKind::Write, i as u64));
+                    }
+                    drop(held);
+                }));
+            }
+            for h in hs {
+                h.join().unwrap();
+            }
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_reclaim_enqueue,
     bench_sharded_counters,
+    bench_op_registry,
     bench_high_concurrency,
     bench_cluster_dlm,
     bench_s9_custody,

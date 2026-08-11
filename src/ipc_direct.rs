@@ -293,8 +293,63 @@ struct Pending {
     t_insert_ns: u64,
 }
 
+/// One in-flight direct-drive WRITE (design-il-direct-write §3, PR-3):
+/// the arena window is the DMA **source** (or its severed pooled copy on
+/// the unaligned leg), and the op travels with everything the CQE
+/// postlude needs — including the block's HELD `BLOCK_FLUSH_LOCKS` guard
+/// (the W1 patch's protection: block `b`'s mapping mutates only under
+/// it, so the probe-time resolution stays authoritative across the DMA)
+/// and the allocator whose `publish_block` re-stabilizes the §5.1 word
+/// on BOTH exits.
+struct PendingWrite {
+    /// Pins the session mapping (§5.3.1 rule 4) AND is the live DMA
+    /// source on the aligned leg — a client kill-9 mid-DMA never unmaps
+    /// under the kernel's read of the arena.
+    op: DataOp,
+    completion: SlotCompletion,
+    snap: crate::fuse_client::IpcDirectWriteSnapshot,
+    allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
+    /// Held from the probe through the postlude's purge — the extended
+    /// P1-9 order is exactly the patch path's (level 3 only; nothing
+    /// else is ever acquired under it here).
+    block_guard: tokio::sync::MutexGuard<'static, ()>,
+    /// Severed 4 KiB-aligned pooled source (`None` = direct arena DMA).
+    /// The `Bytes` owner recycles the backing on drop.
+    bounce: Option<(SendPtr, bytes::Bytes)>,
+    /// The W1 inval hook (§5.6.2 — fired in the postlude, step 6).
+    inval: Option<Arc<crate::ipc_service::Invalidator>>,
+    /// `ipc_direct_phase_ns` `inflight` anchor (r5 single-read law).
+    t_insert_ns: u64,
+}
+
+/// The in-flight slab's entry: reads and writes share the rings, the
+/// slab, the reapers and the flush cadence — one engine, both directions
+/// (the user directive: reuse the dd machinery in reverse, never build
+/// parallel plumbing).
+// Deliberately UNBOXED both ways (clippy wants the 696-byte read variant
+// boxed): the slab is a pre-sized per-shard Vec whose entries recycle via
+// the free list, so inline variants keep BOTH directions' submit paths
+// allocation-free — a per-op Box on the read arm would put a heap
+// round-trip on the 1M-IOPS lane the op-economy campaign just emptied
+// (allocs/op ≈ 0, `tests/ipc_op_economy_tests.rs`). ~360 KiB/shard at
+// the 512-entry ring depth is the whole cost.
+#[allow(clippy::large_enum_variant)]
+enum PendingOp {
+    Read(Pending),
+    Write(PendingWrite),
+}
+
+impl PendingOp {
+    fn t_insert_ns(&self) -> u64 {
+        match self {
+            PendingOp::Read(p) => p.t_insert_ns,
+            PendingOp::Write(p) => p.t_insert_ns,
+        }
+    }
+}
+
 struct EngineState {
-    inflight: Vec<Option<Pending>>,
+    inflight: Vec<Option<PendingOp>>,
     free: Vec<usize>,
     inflight_count: usize,
 }
@@ -304,6 +359,12 @@ struct EngineState {
 struct VolSlot {
     fixed: u32,
     raw: RawFd,
+    /// The fd opened read+write (the direct-drive WRITE lane's
+    /// requirement — design-il-direct-write §3). `false` = the R/W open
+    /// ladder degraded to read-only: governed reads keep working, direct
+    /// writes stay on the handler path for this volume (counted in the
+    /// `backend` ledger class), loudly once at spawn.
+    writable: bool,
 }
 
 /// One direct-drive SHARD: its own ring, in-flight slab, and (lazily
@@ -412,28 +473,41 @@ impl DirectDriveEngine {
         let mut files = Vec::with_capacity(paths.len());
         let mut vols = HashMap::new();
         for (be_id, path) in paths {
-            let mut opts = std::fs::OpenOptions::new();
-            opts.read(true);
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.custom_flags(libc::O_DIRECT);
-            }
-            let file = match opts.open(&path) {
-                Ok(f) => f,
-                Err(_) => {
-                    // File-backed substrates that refuse O_DIRECT
-                    // (tmpfs sandboxes) — buffered, like the worker.
-                    match std::fs::OpenOptions::new().read(true).open(&path) {
-                        Ok(f) => f,
-                        Err(e) => {
-                            log::warn!(
-                                "ipc direct-drive: cannot open data volume '{be_id}' at \
-                                 {path}: {e} — its blocks stay on the handler path"
-                            );
-                            continue;
-                        }
-                    }
+            // Open ladder (WRITE lane, design-il-direct-write §3): R/W +
+            // O_DIRECT → R/W buffered (tmpfs sandboxes, like the worker)
+            // → the historical read-only pair (governed reads keep
+            // working; direct writes degrade to the handler, loudly).
+            let open = |write: bool, direct: bool| {
+                let mut opts = std::fs::OpenOptions::new();
+                opts.read(true);
+                if write {
+                    opts.write(true);
                 }
+                if direct {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    opts.custom_flags(libc::O_DIRECT);
+                }
+                opts.open(&path)
+            };
+            let (file, writable) = match open(true, true).or_else(|_| open(true, false)) {
+                Ok(f) => (f, true),
+                Err(rw_err) => match open(false, true).or_else(|_| open(false, false)) {
+                    Ok(f) => {
+                        log::warn!(
+                            "ipc direct-drive: data volume '{be_id}' at {path} refused a \
+                             read+write open ({rw_err}) — direct WRITES stay on the \
+                             handler path for this volume"
+                        );
+                        (f, false)
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "ipc direct-drive: cannot open data volume '{be_id}' at \
+                             {path}: {e} — its blocks stay on the handler path"
+                        );
+                        continue;
+                    }
+                },
             };
             let fixed = files.len() as u32;
             vols.insert(
@@ -441,6 +515,7 @@ impl DirectDriveEngine {
                 VolSlot {
                     fixed,
                     raw: file.as_raw_fd(),
+                    writable,
                 },
             );
             files.push(file);
@@ -758,7 +833,7 @@ impl DirectDriveEngine {
                 let Pending { op, completion, .. } = pending;
                 return Err((op, completion));
             }
-            st.inflight[idx] = Some(pending);
+            st.inflight[idx] = Some(PendingOp::Read(pending));
             st.inflight_count += 1;
         }
         // Issue cadence (r5 calibrated re-adjudication): sweep-only by
@@ -770,6 +845,222 @@ impl DirectDriveEngine {
         // measurement lever.
         let pending = shard.pending_submits.fetch_add(1, Ordering::Release) + 1;
         if pending >= dd_eager_threshold(dd_eager_flush()) {
+            Self::flush_shard(lane, shard);
+        }
+        Ok(())
+    }
+
+    /// Submit one probe-eligible WRITE on the calling thread's LANE
+    /// shard (design-il-direct-write §3, PR-3): the arena is the DMA
+    /// SOURCE (or its severed pooled copy when the window cannot take
+    /// O_DIRECT-class DMA), the §5.1 sole-owner fence and the RES-6
+    /// authorization door run strictly BEFORE the SQE, and the CQE
+    /// completes the ring slot after the patch postlude
+    /// ([`Self::finish_write`]).
+    ///
+    /// Outcomes:
+    /// * `Ok(())` — consumed: submitted, **or fence-refused LOUD**
+    ///   (errno completed to the client; a fenced holder must never
+    ///   fall back to a SECOND submission path — the patch path's law).
+    /// * `Err((op, completion))` — handler fallback (unknown/unhealthy/
+    ///   read-only volume, reaper spawn failure, SQ full, clone-pinned
+    ///   block), its ledger class counted here; the §5.1 word is
+    ///   re-stabilized where the fence had already been taken, so the
+    ///   handler path re-runs the whole patch protocol on unchanged
+    ///   content.
+    pub(crate) fn submit_write(
+        self: &Arc<Self>,
+        op: DataOp,
+        completion: SlotCompletion,
+        snap: crate::fuse_client::IpcDirectWriteSnapshot,
+        block_guard: tokio::sync::MutexGuard<'static, ()>,
+        inval: Option<Arc<crate::ipc_service::Invalidator>>,
+    ) -> Result<(), (DataOp, SlotCompletion)> {
+        let router = &self.fs.router;
+        let backend_refuse = |op, completion| {
+            METRICS
+                .ipc_dd_write_ineligible_backend
+                .fetch_add(1, Ordering::Relaxed);
+            Err((op, completion))
+        };
+        let Some(vol) = self.vols.get(snap.be_id.as_str()) else {
+            drop(block_guard);
+            return backend_refuse(op, completion);
+        };
+        if !vol.writable
+            || !router
+                .backend_router
+                .is_backend_healthy(snap.be_id.as_str())
+        {
+            drop(block_guard);
+            return backend_refuse(op, completion);
+        }
+        let Ok((allocator, device)) = router.backend_router.get_backend(snap.be_id.as_str()) else {
+            drop(block_guard);
+            return backend_refuse(op, completion);
+        };
+        // The reaper must be live BEFORE the SQE publishes.
+        let lane = current_lane() % self.shards.len();
+        if !self.ensure_reaper(lane) {
+            drop(block_guard);
+            return backend_refuse(op, completion);
+        }
+
+        // DMA source: the arena window verbatim when it can take
+        // O_DIRECT-class DMA (4 KiB-aligned — the read leg's own
+        // screen), else the §5.5.2 sever lands in a 4 KiB-aligned
+        // pooled buffer (the patch path's pooled vehicle: same ONE
+        // copy the handoff path pays, none of its handler descent). A
+        // racing client scribble on the live-arena leg is torn CONTENT
+        // on the device — the client's own POSIX concurrent-buffer
+        // hazard (§5.3.1 rule 2's severed-copy discipline exists for
+        // DERIVED values; the payload is uninterpreted bytes DMA'd
+        // exactly once).
+        let len = snap.len as usize;
+        let arena_ptr = op.payload.as_base_ptr();
+        let (src_ptr, bounce) = if (arena_ptr as usize) % (LBA as usize) == 0 {
+            (arena_ptr, None)
+        } else {
+            let mut buf = crate::cache::pool::BUFFER_POOL.alloc();
+            if len > buf.capacity() {
+                buf.resize(len, 0);
+            }
+            // SAFETY: the dequeued op's validated arena window is alive
+            // for this call (op is held); destination capacity ensured
+            // above; a racing client write yields torn content, never UB.
+            unsafe {
+                std::ptr::copy_nonoverlapping(arena_ptr, buf.backing_mut().as_mut_ptr(), len);
+            }
+            buf.set_written_len(len);
+            // Locality instrument: ONE CPU pass over arena bytes.
+            crate::numa::count_current_pass(op.payload.arena_node(), len);
+            let bytes = buf.into_bytes();
+            let p = bytes.as_ptr() as *mut u8;
+            (p, Some((SendPtr(p), bytes)))
+        };
+
+        // §5.1 steps 1a+1b — mark-unstable → fence(SeqCst) → refcount
+        // re-check. A clone pinned the block ⇒ re-stabilize (content
+        // never changed) and fall back to the handler's CoW arm.
+        if !allocator.begin_patch_sole_owner(snap.dev_off) {
+            allocator.publish_block(snap.dev_off);
+            drop(block_guard);
+            METRICS
+                .ipc_dd_write_ineligible_custody
+                .fetch_add(1, Ordering::Relaxed);
+            return Err((op, completion));
+        }
+        // RES-6/S7: THE authorization door, strictly before the SQE (the
+        // same gate `write_block`'s worker and the patch's D14 leg run).
+        // A fence refusal fails the op LOUD through the patch path's
+        // common re-stabilize/purge exit — never a fallback: a fenced
+        // holder must not fall back to a second submission path.
+        if let Err(e) = device.authorize_zc_store() {
+            allocator.publish_block(snap.dev_off);
+            router.cache.purge_block_key(snap.key.as_str());
+            let file_path = crate::keys::inode_path_stack(snap.ino);
+            router.cache.write_lru.remove(file_path.as_str());
+            router.cache.read_lru.remove(file_path.as_str());
+            drop(block_guard);
+            METRICS
+                .ipc_dd_write_fence_refusals
+                .fetch_add(1, Ordering::Relaxed);
+            log::error!(
+                "ipc direct-drive: WRITE refused by the data-plane fence for ino {} \
+                 block {} ({e}) — failed loud to the client (RES-6)",
+                snap.ino,
+                snap.block
+            );
+            completion.complete(-i64::from(e.to_errno()));
+            return Ok(());
+        }
+
+        // ipc_direct_phase_ns `admit` closes at slab insert; the SAME
+        // ns read anchors `inflight` (r5 single-read law).
+        let t_insert_ns = crate::mono_core::monotonic_ns_u64();
+        crate::fuse_client::ipc_direct_phase_record_span(
+            crate::fuse_client::IpcDirectPhase::Admit,
+            std::time::Duration::from_nanos(t_insert_ns.saturating_sub(snap.t0_ns)),
+        );
+        let dev_write_off = snap.dev_write_off;
+        let dev_off = snap.dev_off;
+        let pending = PendingWrite {
+            op,
+            completion,
+            snap,
+            allocator,
+            block_guard,
+            bounce,
+            inval,
+            t_insert_ns,
+        };
+        let shard = &self.shards[lane];
+
+        // Slab insert + WRITE SQE push under the ONE shard mutex (the
+        // read submit's discipline verbatim, direction reversed).
+        {
+            let mut st = shard
+                .state
+                .lock()
+                .expect("direct-drive state mutex never poisons");
+            let idx = match st.free.pop() {
+                Some(i) => i,
+                None => {
+                    st.inflight.push(None);
+                    st.inflight.len() - 1
+                }
+            };
+            let sqe = if shard.use_fixed {
+                opcode::Write::new(types::Fixed(vol.fixed), src_ptr, len as u32)
+                    .offset(dev_write_off)
+                    .build()
+                    .user_data(idx as u64)
+            } else {
+                opcode::Write::new(types::Fd(vol.raw), src_ptr, len as u32)
+                    .offset(dev_write_off)
+                    .build()
+                    .user_data(idx as u64)
+            };
+            // SAFETY: SQ access is exclusive under `state`'s mutex (the
+            // reaper never touches the SQ; §module docs).
+            let mut sq = unsafe { shard.ring.submission_shared() };
+            let mut pushed = unsafe { sq.push(&sqe).is_ok() };
+            if !pushed {
+                // SQ full: flush what's queued, retry once, else refuse
+                // (client backpressure via the handler path).
+                sq.sync();
+                drop(sq);
+                let _ = shard.ring.submit();
+                // SAFETY: as above — still under the mutex.
+                let mut sq = unsafe { shard.ring.submission_shared() };
+                pushed = unsafe { sq.push(&sqe).is_ok() };
+                sq.sync();
+            } else {
+                sq.sync();
+            }
+            if !pushed {
+                st.free.push(idx);
+                drop(st);
+                // Nothing DMA'd: re-stabilize the §5.1 word (content
+                // unchanged) and let the handler re-run the protocol.
+                let PendingWrite {
+                    op,
+                    completion,
+                    allocator,
+                    block_guard,
+                    ..
+                } = pending;
+                allocator.publish_block(dev_off);
+                drop(block_guard);
+                return backend_refuse(op, completion);
+            }
+            st.inflight[idx] = Some(PendingOp::Write(pending));
+            st.inflight_count += 1;
+        }
+        // Issue cadence: sweep-only by default (the r5 calibrated law);
+        // the explicit eager lever keeps its meaning for writes too.
+        let pending_count = shard.pending_submits.fetch_add(1, Ordering::Release) + 1;
+        if pending_count >= dd_eager_threshold(dd_eager_flush()) {
             Self::flush_shard(lane, shard);
         }
         Ok(())
@@ -931,6 +1222,13 @@ impl DirectDriveEngine {
                             let mut n = 0usize;
                             for slot in st.inflight.iter_mut() {
                                 if let Some(p) = slot.take() {
+                                    // A forgotten WRITE also leaks its held
+                                    // BLOCK_FLUSH_LOCKS guard — that block's
+                                    // stripe wedges, which is strictly better
+                                    // than a mapping (DMA source) or word
+                                    // (§5.1) whose owner the kernel may still
+                                    // touch; this arm is the unrecoverable-
+                                    // ring terminal state either way.
                                     std::mem::forget(p);
                                     n += 1;
                                 }
@@ -1048,9 +1346,12 @@ impl DirectDriveEngine {
             let t_cqe_ns = crate::mono_core::monotonic_ns_u64();
             crate::fuse_client::ipc_direct_phase_record_span(
                 crate::fuse_client::IpcDirectPhase::Inflight,
-                std::time::Duration::from_nanos(t_cqe_ns.saturating_sub(pending.t_insert_ns)),
+                std::time::Duration::from_nanos(t_cqe_ns.saturating_sub(pending.t_insert_ns())),
             );
-            self.finish(pending, res, t_cqe_ns);
+            match pending {
+                PendingOp::Read(p) => self.finish(p, res, t_cqe_ns),
+                PendingOp::Write(p) => self.finish_write(p, res, t_cqe_ns),
+            }
             served += 1;
         }
         served
@@ -1142,6 +1443,134 @@ impl DirectDriveEngine {
         }
         // A bounce backing drops here → recycled into its home pool.
         drop(bounce);
+    }
+
+    /// WRITE CQE disposition (design-il-direct-write §3, PR-3): the W1
+    /// patch postlude, order copied from `try_sole_owner_patch` + the
+    /// write handler's own tail — re-stabilize + purge on BOTH exits
+    /// (after the DMA, strictly before the ACK), then the ledger, the
+    /// WriteTimes publish, the W1 inval, the completion, and the
+    /// non-ACK-blocking durable-times tail on the handler lanes. Runs on
+    /// the shard reaper or the fusion inline arm — every step is
+    /// synchronous and runtime-free except the dispatched tail.
+    fn finish_write(&self, pending: PendingWrite, res: i32, t_cqe_ns: u64) {
+        let PendingWrite {
+            op,
+            completion,
+            snap,
+            allocator,
+            block_guard,
+            bounce,
+            inval,
+            t_insert_ns: _,
+        } = pending;
+        let len = snap.len as usize;
+        let exact = res >= 0 && res as usize == len;
+        // Steps 1 + 2 — the `upload_full_block` invalidation set and
+        // ordering, on BOTH exits: `publish_block` (the §5.1 word
+        // re-stabilizes under a NEW generation), the 4-arm block-key
+        // purge, the stale whole-file LRU drops. No allocate, no free,
+        // no block-map merge, no journal entry, no staging — the map
+        // names the same key.
+        allocator.publish_block(snap.dev_off);
+        self.fs.router.cache.purge_block_key(snap.key.as_str());
+        let file_path = crate::keys::inode_path_stack(snap.ino);
+        self.fs.router.cache.write_lru.remove(file_path.as_str());
+        self.fs.router.cache.read_lru.remove(file_path.as_str());
+        // The block guard held since the probe drops HERE — purges done
+        // under it (the patch path's window), everything after it is
+        // guard-free exactly like the handler's postlude.
+        drop(block_guard);
+        if exact {
+            // A direct write IS a patch write (the W1 ledger) + the
+            // lane's own engagement instruments + the charter-rule-4
+            // data-plane accounting.
+            METRICS.patch_writes.fetch_add(1, Ordering::Relaxed);
+            METRICS
+                .patch_write_bytes
+                .fetch_add(len as u64, Ordering::Relaxed);
+            METRICS.ipc_dd_write_serves.fetch_add(1, Ordering::Relaxed);
+            METRICS
+                .ipc_dd_write_bytes
+                .fetch_add(len as u64, Ordering::Relaxed);
+            METRICS.ipc_ops_write.fetch_add(1, Ordering::Relaxed);
+            METRICS
+                .ipc_bytes_in
+                .fetch_add(len as u64, Ordering::Relaxed);
+            // Step 3 — coverage: the ino's stream word was swapped at the
+            // probe's commit point (`note_last_write_end` — the coverage
+            // bookkeeping the handler performs for THIS shape; the
+            // `record_write` union lives on accumulation buffers, which
+            // the overlay screen excluded structurally).
+            // Step 4 — the WriteTimes publish through the
+            // identical-publish elision door. `size_claim: None`: the
+            // shape is NON-EXTENDING by eligibility, and a size-neutral
+            // completion must never resurrect a stale-high size (KD-6).
+            let now_ns = crate::coarse_realtime_ns() as i64;
+            let sec = now_ns.div_euclid(1_000_000_000);
+            let nsec = now_ns.rem_euclid(1_000_000_000) as u32;
+            let _ = self.fs.publish_attr(
+                snap.ino,
+                crate::fuse_client::AttrPublish::WriteTimes {
+                    mtime: fuse3::Timestamp::new(sec, nsec),
+                    ctime: fuse3::Timestamp::new(sec, nsec),
+                    size_claim: None,
+                },
+            );
+            // Step 5 — killpriv: structurally nothing to clear here —
+            // eligibility admits a `kill_priv`-flagged binding only
+            // under a HELD known-clean latch (the handler's own D4
+            // short-circuit); a non-clean ino fell back so the handler
+            // cleared privs BEFORE its data landed (the VFS order).
+            // Step 6 — the §5.6.2 W1 inval, after the write landed.
+            if let Some(iv) = inval {
+                iv.on_write(snap.ino, snap.offset + u64::from(snap.len));
+            }
+            // Step 7 — ACK.
+            completion.complete(len as i64);
+            // ONE end-of-op ns read closes BOTH finish and total (r5).
+            let end_ns = crate::mono_core::monotonic_ns_u64();
+            crate::fuse_client::ipc_direct_phase_record_span(
+                crate::fuse_client::IpcDirectPhase::Finish,
+                std::time::Duration::from_nanos(end_ns.saturating_sub(t_cqe_ns)),
+            );
+            crate::fuse_client::ipc_direct_phase_record_span(
+                crate::fuse_client::IpcDirectPhase::Total,
+                std::time::Duration::from_nanos(end_ns.saturating_sub(snap.t0_ns)),
+            );
+            // The non-ACK-blocking tail: the durable times refinement
+            // park, dispatched exactly once to the fuse3 handler lanes
+            // (the client ACK above never waits on tokio).
+            crate::ipc_service::spawn_dd_write_times_park(
+                Arc::clone(&self.fs),
+                op.payload.arena_node(),
+                snap.ino,
+                now_ns as u64,
+            );
+        } else {
+            // A failed/short DMA fails exactly THIS write: nothing
+            // acked, nothing parked, nothing lost — tiers purged and
+            // the word re-stabilized above, so no stale serve (the
+            // patch path's EIO law; only app-written sectors were ever
+            // addressed, so the crash blast radius holds).
+            METRICS.patch_dma_errors.fetch_add(1, Ordering::Relaxed);
+            log::warn!(
+                "ipc direct-drive: WRITE CQE {res} (wanted {len}) on ino {} block {} — \
+                 failing exactly this write (tiers purged, word re-stabilized)",
+                snap.ino,
+                snap.block
+            );
+            completion.complete(if res < 0 {
+                i64::from(res)
+            } else {
+                -i64::from(libc::EIO)
+            });
+        }
+        // The bounce backing (if any) recycles; the op's arena window
+        // pin (§5.3.1 rule 4) releases only now — after the last DMA
+        // byte was consumed by the kernel.
+        drop(bounce);
+        drop(op);
     }
 
     /// Flag shutdown, NOP-wake EVERY spawned shard reaper, join them

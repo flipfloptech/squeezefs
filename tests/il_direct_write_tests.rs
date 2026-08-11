@@ -819,12 +819,14 @@ async fn fenced_guard_refuses_direct_writes_loud_never_a_fallback() {
     tokio::task::block_in_place(|| {
         warm_direct_lane(&session, binding, &mut want, &[BS + 16384, 2 * BS + 8192]);
 
-        // Fence the mount (the D0 fail-stop latch RES-6 keys on).
-        fx.fs
-            .router
-            .backend_router
-            .default_device
-            .set_fence_signal(Arc::new(|| true));
+        // Fence the mount: poison process data-plane custody — the D0
+        // fail-stop face `authorize_dma` (THE authorization door the
+        // engine's `authorize_zc_store` passes) refuses on. The device
+        // probe seam (`set_fence_signal`) is unusable on a full fixture:
+        // `set_meta_backend` already installed the real D0 probe in that
+        // OnceLock, and poisoning is exactly what its first latch
+        // observation performs anyway.
+        squeezefs::data_custody::poison("test: il-direct-write fence rail");
 
         let before = snap();
         let p = pattern(4096, 0xC1);
@@ -892,7 +894,10 @@ async fn direct_write_purges_read_tiers_before_the_ack() {
         let p = pattern(4096, 0xD1);
         let off = 2 * BS + 8192;
         let r = session.ring_pwrite(binding, off, &p);
-        assert_eq!(r, 4096, "the seeded tiers must not make the write fall back");
+        assert_eq!(
+            r, 4096,
+            "the seeded tiers must not make the write fall back"
+        );
         want[off as usize..off as usize + 4096].copy_from_slice(&p);
         assert_eq!(
             delta!(snap(), before, dd_serves),

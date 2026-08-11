@@ -2221,9 +2221,15 @@ pub enum BlockLockSite {
     /// under this block's stripe (3) AND its ino's `INODE_META_LOCKS`
     /// (3.5) — the arm legal writer churn cannot beat.
     ReadSettle = 11,
+    /// The IL direct-drive WRITE lane's `try_lock`
+    /// (`ipc_direct_write_probe` — design-il-direct-write §3): contended
+    /// = INELIGIBLE (the custody clause — the op was about to wait
+    /// anyway, the serve_read lock-demotion posture), never a blocking
+    /// acquire on the service thread.
+    IlDirectWrite = 12,
 }
 
-const BLOCK_LOCK_SITES: usize = 12;
+const BLOCK_LOCK_SITES: usize = 13;
 const BLOCK_LOCK_SITE_NAMES: [&str; BLOCK_LOCK_SITES] = [
     "write_checkout",
     "spill_victim",
@@ -2237,6 +2243,7 @@ const BLOCK_LOCK_SITE_NAMES: [&str; BLOCK_LOCK_SITES] = [
     "read_escalate",
     "pipeline_upload",
     "read_settle",
+    "il_direct_write",
 ];
 
 struct WriteProfState {
@@ -6250,6 +6257,46 @@ pub struct IpcDirectSnapshot {
     /// Probe-entry instant (CLOCK_MONOTONIC ns — the drain's ONE clock
     /// read, r5 single-read law): the `ipc_direct_phase_ns`
     /// `admit`/`total` anchor.
+    pub t0_ns: u64,
+}
+
+/// Why the direct-drive WRITE prelude refused an op (the
+/// `ipc_dd_write_ineligible_*` decision ledger — design-il-direct-write
+/// §5, the W1 `patch_ineligible_*` pattern). Per-clause docs live on the
+/// counters in [`Metrics`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpcDirectWriteIneligible {
+    Shape,
+    Custody,
+    Overlay,
+    Backend,
+    Align,
+}
+
+/// Everything the direct-drive WRITE lane's submit + CQE postlude need,
+/// captured by [`SqueezefsFilesystem::ipc_direct_write_probe`] on the
+/// service thread. Unlike the read snapshot there is no CQE-side
+/// revalidation ladder: the probe hands back the block's HELD
+/// `BLOCK_FLUSH_LOCKS` guard, which is the same protection the W1 patch
+/// runs under — the mapping cannot move while the DMA is in flight.
+#[derive(Debug)]
+pub struct IpcDirectWriteSnapshot {
+    pub ino: u64,
+    pub block: u32,
+    /// The undecorated whole-block mapping (purge target).
+    pub key: compact_str::CompactString,
+    pub be_id: compact_str::CompactString,
+    /// Block-base device offset — `begin_patch_sole_owner` /
+    /// `publish_block` operate on the BLOCK's word.
+    pub dev_off: u64,
+    /// Absolute device offset of THIS write's window
+    /// (`dev_off + (offset − block_base)`).
+    pub dev_write_off: u64,
+    /// Absolute file offset (the W1 inval's `on_write` end derives here).
+    pub offset: u64,
+    pub len: u32,
+    /// Dequeue instant (the drain's ONE clock read — r5 single-read
+    /// law): the `ipc_direct_phase_ns` `admit`/`total` anchor.
     pub t0_ns: u64,
 }
 
@@ -10329,6 +10376,214 @@ impl SqueezefsFilesystem {
             }
         }
         true
+    }
+
+    /// The IL direct-drive WRITE prelude (docs/design-il-direct-write.md
+    /// §3, PR-2): decide — synchronously, on the service thread — whether
+    /// this ring write is the **W1 sole-owner patch shape**
+    /// (design-random-small-writes §5.1: LBA-aligned, sub-block,
+    /// non-extending overwrite of an exclusively-owned, passthrough,
+    /// whole-block-mapped striped block with no overlay) and may DMA in
+    /// place on the dd rings. Any miss ⇒ the caller falls back to the
+    /// sever→handoff path (fallback-is-correctness), recorded in the
+    /// `ipc_dd_write_ineligible_*` decision ledger by class.
+    ///
+    /// Locking: every screen is a lock-free probe (peeks / scc / dashmap
+    /// / atomics) except ONE non-blocking `try_lock` of the block's
+    /// `BLOCK_FLUSH_LOCKS` stripe — the serve_read `try_read()` posture:
+    /// contention means a writer is mid-flight on the block and the op
+    /// was about to wait anyway, so it demotes (custody clause). On
+    /// success the HELD guard travels with the snapshot into the engine's
+    /// in-flight slab and drops in the CQE postlude — the SAME protection
+    /// `try_sole_owner_patch` runs under (block `b`'s mapping mutates
+    /// only under this lock, so probe-time resolution stays authoritative
+    /// across the DMA; no CQE revalidation ladder is needed). Custody
+    /// that would need an await — a missing cached lease, an un-latched
+    /// killpriv obligation — is INELIGIBLE by design: v1 stays
+    /// synchronous.
+    ///
+    /// Commit point: once every screen passes, the ino's stream word is
+    /// swapped (`note_last_write_end` — the coverage bookkeeping the
+    /// handler performs for this shape; the accumulation-buffer
+    /// `record_write` union machinery structurally does not exist here
+    /// because the overlay screen excluded every accumulating block) and
+    /// the open generation is dirtied (`mark_handle_dirty`, D1.d — the
+    /// clean-FLUSH elision must not skip the device flush this DMA now
+    /// owes). Both are idempotent under an engine-side fallback: the
+    /// handler re-swaps with this op's own end (same non-adjacent
+    /// verdict, `len > 0`) and re-dirties the same bit.
+    pub fn ipc_direct_write_probe(
+        &self,
+        ino: u64,
+        offset: u64,
+        len: u32,
+        kill_priv: bool,
+        t0_ns: u64,
+    ) -> Result<
+        (IpcDirectWriteSnapshot, tokio::sync::MutexGuard<'static, ()>),
+        IpcDirectWriteIneligible,
+    > {
+        use IpcDirectWriteIneligible as I;
+        // -- request-shape screens (lock-free, cheapest first) ----------
+        if len == 0 || is_virtual_ino(ino) {
+            return Err(I::Shape);
+        }
+        let cap = patch_max_bytes();
+        if cap == 0 || u64::from(len) > cap {
+            // Over the W1 cap (or the cap-0 A/B lever, which the caller
+            // screens for silence): the shape belongs to the placement/
+            // accumulation machinery, never an in-place patch.
+            return Err(I::Shape);
+        }
+        if offset % 4096 != 0 || u64::from(len) % 4096 != 0 {
+            // v1 is LBA-aligned-only BY CONTRACT (crash blast radius:
+            // only app-written sectors are ever rewritten).
+            return Err(I::Align);
+        }
+        let Some(end) = offset.checked_add(u64::from(len)) else {
+            return Err(I::Shape);
+        };
+        let block_size = self.router.block_size.load(Ordering::Relaxed);
+        if block_size == 0 || block_size % 4096 != 0 {
+            return Err(I::Shape);
+        }
+        let b = offset / block_size;
+        if (end - 1) / block_size != b {
+            return Err(I::Shape); // multi-block: no single in-place window
+        }
+        let b32 = b as u32;
+        // The D14 direct-leg rule: the pooled patch vehicle's
+        // window-exact read-back is the verifier — a direct DMA under
+        // write verification would silently skip it.
+        if crate::write_verification_enabled() {
+            return Err(I::Shape);
+        }
+        // Passthrough only (a compressed/encrypted image cannot be
+        // patched in place).
+        if !self.router.get_crypto().is_passthrough() {
+            return Err(I::Shape);
+        }
+
+        // -- the block lock (ONE try_lock — never a blocking acquire) ---
+        let lock = BLOCK_FLUSH_LOCKS.get_lock(ino, b32);
+        let Ok(guard) = lock.try_lock() else {
+            // A writer holds the block: the op was about to wait anyway —
+            // demote (the serve_read lock-demotion posture).
+            return Err(I::Custody);
+        };
+        // Lock census: always-on last-holder stamp (the D1.b watchdog's
+        // named-holder surface) + the profile-armed site row.
+        let stripe = BLOCK_FLUSH_LOCKS.block_shard_index(ino, b32);
+        STRIPE_LAST_HOLDER[stripe].store(
+            pack_holder(BlockLockSite::IlDirectWrite, ino, b32),
+            Ordering::Relaxed,
+        );
+        block_lock_try_note(BlockLockSite::IlDirectWrite, ino, b32, true);
+
+        // -- state screens, resolved UNDER the held lock (the patch
+        //    path's authoritative-map discipline) ----------------------
+        let key = match self.router.metadata_cache.peek_with(&ino, |meta| {
+            if meta.file_type != "striped" {
+                return Err(I::Shape);
+            }
+            if end > meta.size {
+                // EXTENDING: a grown i_size owes a meta commit — never
+                // an in-place patch.
+                return Err(I::Shape);
+            }
+            let Some(map) = meta.block_map.as_ref() else {
+                return Err(I::Shape); // indirect / not RAM-resident
+            };
+            let Some(key) = map.get(&b32) else {
+                return Err(I::Shape); // hole block
+            };
+            if !crate::routing::is_whole_block_mapping(key) {
+                return Err(I::Shape); // decorated `bk:off:len` mapping
+            }
+            Ok(compact_str::CompactString::from(key.as_str()))
+        }) {
+            Some(Ok(key)) => key,
+            Some(Err(class)) => return Err(class),
+            None => return Err(I::Shape),
+        };
+        // Overlay screens — ANY overlay owns the block's newest bytes;
+        // an in-place patch under one would be folded over (W2's law).
+        let cache_key = crate::keys::active_block_stack(ino, u64::from(b32));
+        if self.active_block_buffers.contains_key(cache_key.as_str())
+            || self
+                .router
+                .cache
+                .nvme
+                .has_staged_active_block(cache_key.as_str())
+            || self.router.cache.nvme.has_staged_extent_record(
+                crate::keys::active_block_ext_stack(ino, u64::from(b32)).as_str(),
+            )
+        {
+            return Err(I::Overlay);
+        }
+        if crate::device_overlay::any_open_fast() && self.device_overlays.get(ino, b32).is_some() {
+            return Err(I::Overlay);
+        }
+        // Stream adjacency (W1 predicate 6, read-only peek): sequential
+        // streams keep the whole-block write-through economy.
+        if self
+            .last_write_end
+            .read_sync(&ino, |_, v| v.load(Ordering::Relaxed))
+            == Some(offset)
+        {
+            return Err(I::Shape);
+        }
+
+        // -- custody (RAM-only; an await-needing shape is INELIGIBLE) ---
+        // The cached-lease hot path only: a first-write ino's lease
+        // acquisition is the handler's async job.
+        let Some(lease) = self.active_leases.get(&ino) else {
+            return Err(I::Custody);
+        };
+        let token = lease.fencing_token();
+        drop(lease);
+        // W1 clause 7 — whole-inode exclusive custody. The uncounted
+        // core (`span_range_shared`), NOT `patch_range_shared`: the W1
+        // ledger belongs to the handler's authoritative predicate, and a
+        // fallback op would double-count there otherwise.
+        let block_start = u64::from(b32) * block_size;
+        if crate::dlm::span_range_shared(ino, block_start, block_start + block_size, token) {
+            return Err(I::Custody);
+        }
+        // Killpriv-v2 (il parity): a flagged peer's write may only
+        // direct-serve once the ino's known-clean latch holds — the
+        // clearing obligation is async metadata work (the handler's
+        // `apply_killpriv`, which runs BEFORE the data lands per the VFS
+        // privs-before-write order). One fallback latches it; steady
+        // state pays a contains-check, exactly the handler's economy.
+        if kill_priv && !self.killpriv_clean.contains_sync(&ino) {
+            return Err(I::Custody);
+        }
+
+        // -- backend identity (parse-carry — the submit re-parses nothing)
+        let Ok((be_id, dev_off)) = self.router.backend_router.split_block_key(&key) else {
+            return Err(I::Shape);
+        };
+        let be_id = compact_str::CompactString::from(be_id);
+
+        // -- commit ------------------------------------------------------
+        let _prev = self.note_last_write_end(ino, offset, u64::from(len));
+        self.mark_handle_dirty(ino);
+        let rel = offset - block_start;
+        Ok((
+            IpcDirectWriteSnapshot {
+                ino,
+                block: b32,
+                key,
+                be_id,
+                dev_off,
+                dev_write_off: dev_off + rel,
+                offset,
+                len,
+                t0_ns,
+            },
+            guard,
+        ))
     }
 
     /// Placed sever (shim-parity 2026-07-28): decide — synchronously, on

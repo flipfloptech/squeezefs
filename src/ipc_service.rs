@@ -290,6 +290,32 @@ pub(crate) fn spawn_read_handoff(
     });
 }
 
+/// The direct-drive WRITE lane's non-ACK-blocking postlude tail
+/// (design-il-direct-write §3): the durable times refinement park is an
+/// async backend op the CQE thread must not block the client ACK on —
+/// dispatch it, exactly once per served op, to the fuse3 handler lanes
+/// (the hold-probe campaign's venue law: never a `Handle::spawn` onto
+/// the multi-thread runtime's global inject queue). Best-effort like the
+/// handler's own park (µs-grade time polish — never worth failing an
+/// acked write over); the RAM face (`publish_attr` WriteTimes) already
+/// ran synchronously in the postlude.
+pub(crate) fn spawn_dd_write_times_park(
+    fs: Arc<SqueezefsFilesystem>,
+    node: Option<usize>,
+    ino: u64,
+    now_ns: u64,
+) {
+    handoff_spawn_on(node, async move {
+        if let Some(backend) = fs.meta_backend.as_ref() {
+            if let Err(e) =
+                crate::meta_ship::publish::park_write_times(backend, ino, now_ns, now_ns).await
+            {
+                log::debug!("dd write: ino {ino} times refinement park skipped: {e}");
+            }
+        }
+    });
+}
+
 /// What a W1 invalidation shoots down (POSIX-8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvalScope {
@@ -320,7 +346,7 @@ pub enum InvalScope {
 /// shootdown so nothing the window suppressed outlives the bindings.
 ///
 /// [`Notify`]: fuse3::raw::Notify
-struct Invalidator {
+pub(crate) struct Invalidator {
     hook: Arc<dyn Fn(u64, InvalScope) + Send + Sync>,
     window: std::time::Duration,
     /// ino → last write-fired instant (latch-free; bounded by the set of
@@ -375,7 +401,12 @@ impl Invalidator {
     /// subsumes attrs, so it is never doubled); otherwise the POSIX-8
     /// attrs-only refresh when the write grew the file; otherwise
     /// suppressed.
-    fn on_write(&self, ino: u64, end: u64) {
+    ///
+    /// `pub(crate)`: the direct-drive WRITE lane's CQE postlude
+    /// (`crate::ipc_direct::finish_write`) fires the SAME policy — every
+    /// arm is a synchronous latch-free probe + a detached notify enqueue,
+    /// callable from the dd reaper thread.
+    pub(crate) fn on_write(&self, ino: u64, end: u64) {
         let grew = self.note_write_end(ino, end);
         let now = std::time::Instant::now();
         let mut fire = false;
@@ -915,10 +946,80 @@ impl DataPlaneSink {
         spawn_read_handoff(Arc::clone(&self.fs), self.ring_request(), op, completion);
     }
 
-    /// WRITE (all writes are handoffs in v1 — OQ-3 decides a sync write
-    /// fast path by measurement): sever at dequeue, then run the real
-    /// write handler with the severed copy as its payload source.
+    /// The direct-drive WRITE lane's decision ledger (the W1
+    /// `patch_ineligible_*` shape — design-il-direct-write §5).
+    fn count_dd_write_ineligible(class: crate::fuse_client::IpcDirectWriteIneligible) {
+        use crate::fuse_client::IpcDirectWriteIneligible as I;
+        let counter = match class {
+            I::Shape => &METRICS.ipc_dd_write_ineligible_shape,
+            I::Custody => &METRICS.ipc_dd_write_ineligible_custody,
+            I::Overlay => &METRICS.ipc_dd_write_ineligible_overlay,
+            I::Backend => &METRICS.ipc_dd_write_ineligible_backend,
+            I::Align => &METRICS.ipc_dd_write_ineligible_align,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The direct-drive WRITE fast path (design-il-direct-write §3,
+    /// PR-2+PR-3): probe the W1 sole-owner patch shape synchronously on
+    /// the service thread; an eligible op submits its in-place WRITE SQE
+    /// on the caller's dd lane shard from the arena and completes at the
+    /// CQE after the patch postlude — no sever bounce on the aligned
+    /// leg, no handler handoff. `Err` returns the op untouched for
+    /// today's sever→handoff path (fallback-is-correctness), its ledger
+    /// class counted; `Ok(())` = consumed (submitted, or fence-refused
+    /// LOUD by the engine — never a silent second submission).
+    fn try_direct_write(
+        &self,
+        op: DataOp,
+        completion: SlotCompletion,
+    ) -> Result<(), (DataOp, SlotCompletion)> {
+        let snap = match self.fs.ipc_direct_write_probe(
+            op.binding.ino,
+            op.desc.offset,
+            op.desc.len,
+            op.binding.kill_priv,
+            op.t0_ns,
+        ) {
+            Ok(pair) => pair,
+            Err(class) => {
+                Self::count_dd_write_ineligible(class);
+                return Err((op, completion));
+            }
+        };
+        let (snap, guard) = snap;
+        match self.direct_engine() {
+            Some(engine) => engine.submit_write(op, completion, snap, guard, self.inval.clone()),
+            None => {
+                drop(guard);
+                Self::count_dd_write_ineligible(
+                    crate::fuse_client::IpcDirectWriteIneligible::Backend,
+                );
+                Err((op, completion))
+            }
+        }
+    }
+
+    /// WRITE: sever at dequeue, then run the real write handler with the
+    /// severed copy as its payload source — EXCEPT the W1-patch-shaped
+    /// ops the direct-drive lane serves on the svc thread itself (the
+    /// 2026-08-11 write-IOPS ruling: the road to 1 M writes is the read
+    /// lane's road — execute the eligible shape ON the ipc lane,
+    /// device-true, with no handler handoff).
     fn serve_write(&self, op: DataOp, completion: SlotCompletion) {
+        // Direct-drive lane gate: the A/B lever (default ON) and the W1
+        // patch cap's own A/B lever (0 = the patch machinery is off, so
+        // the lane — which IS the patch shape — goes silent with it;
+        // both levers keep the decision ledger quiet by design).
+        let (op, completion) =
+            if il_direct_write_enabled() && crate::fuse_client::patch_max_bytes() != 0 {
+                match self.try_direct_write(op, completion) {
+                    Ok(()) => return,
+                    Err(pair) => pair,
+                }
+            } else {
+                (op, completion)
+            };
         // §5.5.2 severance — the ONE arena read, on the service thread,
         // BEFORE the handoff counter increments (tests park the handoff
         // behind a held writer and scribble the arena: the scribble must

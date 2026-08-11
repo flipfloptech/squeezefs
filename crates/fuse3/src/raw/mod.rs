@@ -32,9 +32,9 @@ pub use connection::zc::set_zc_hold_streaming;
 pub use filesystem::Filesystem;
 use futures_util::future::Either;
 pub use read_phase::{
-    read_inplace_replies, read_transport_phase_record, read_transport_phase_snapshot,
-    write_inplace_replies, write_transport_phase_record, write_transport_phase_snapshot,
-    TransportPhase,
+    fused_midpass_reaps, fused_passbottom_reaps, fused_timeline_snapshot, read_inplace_replies,
+    read_transport_phase_record, read_transport_phase_snapshot, write_inplace_replies,
+    write_transport_phase_record, write_transport_phase_snapshot, TransportPhase,
 };
 pub use request::{ReplySlot, Request};
 #[cfg(feature = "tokio-runtime")]

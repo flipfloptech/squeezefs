@@ -101,7 +101,9 @@ impl FusedWakeSink {
 /// once per pass. Duplicate ids are legal (spurious polls are legal);
 /// stale ids (task already completed) are skipped by the slab lookup.
 pub(crate) struct FusedRunQueue {
-    ready: Mutex<VecDeque<usize>>,
+    /// `(task id, push stamp ns)` — the stamp feeds the always-on
+    /// `wake_to_poll` timeline histogram (write-IOPS campaign).
+    ready: Mutex<VecDeque<(usize, u64)>>,
     sink: FusedWakeSink,
 }
 
@@ -112,11 +114,11 @@ impl FusedRunQueue {
         self.ready
             .lock()
             .expect("fused run queue poisoned-free")
-            .push_back(id);
+            .push_back((id, crate::raw::read_phase::transport_now_ns()));
         self.sink.wake();
     }
 
-    fn pop(&self) -> Option<usize> {
+    fn pop(&self) -> Option<(usize, u64)> {
         self.ready
             .lock()
             .expect("fused run queue poisoned-free")
@@ -204,15 +206,19 @@ impl FusedLane {
     /// Returns `false` when the run queue named nothing pollable.
     pub(crate) fn drain_one(&mut self, handle: &tokio::runtime::Handle) -> bool {
         loop {
-            let Some(id) = self.rq.pop() else {
+            let Some((id, pushed_ns)) = self.rq.pop() else {
                 return false;
             };
             let Some(task) = self.tasks.get_mut(id) else {
                 // Stale wake for a completed/recycled slot — legal;
                 // keep looking for a live one so a stale burst cannot
-                // starve the interleave of its poll.
+                // starve the interleave of its poll (and it records no
+                // wake_to_poll span — only real polls feed the timeline).
                 continue;
             };
+            crate::raw::read_phase::note_fused_wake_to_poll(
+                crate::raw::read_phase::transport_now_ns().saturating_sub(pushed_ns),
+            );
             let waker = std::task::Waker::from(Arc::new(FusedWaker {
                 id,
                 rq: Arc::clone(&self.rq),

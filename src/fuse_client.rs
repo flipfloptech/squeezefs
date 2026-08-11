@@ -3106,8 +3106,18 @@ pub fn write_transport_phase_json() -> serde_json::Value {
     transport_phase_json(fuse3::write_transport_phase_snapshot())
 }
 
-fn transport_phase_json(
-    snapshot: [(&'static str, [u64; crate::latency_core::LATENCY_BUCKETS]); 5],
+/// `fuse3_fused_timeline_ns` stats payload — the fused-op timeline
+/// (write-IOPS campaign, 2026-08-11): `wake_to_poll` (run-queue push →
+/// poll, the scheduling quantum every hop pays) and `bridge_rtt` (zc
+/// bridge issue → the handler oneshot's resolution, venue-split by the
+/// `fuse3_fused_{midpass,passbottom}_reaps` counters — the funnel fix's
+/// engagement instrument).
+pub fn fused_timeline_json() -> serde_json::Value {
+    transport_phase_json(fuse3::fused_timeline_snapshot())
+}
+
+fn transport_phase_json<const N: usize>(
+    snapshot: [(&'static str, [u64; crate::latency_core::LATENCY_BUCKETS]); N],
 ) -> serde_json::Value {
     let mut phases = serde_json::Map::new();
     for (pname, buckets) in snapshot {
@@ -8285,6 +8295,9 @@ impl SqueezefsFilesystem {
                 // The WRITE twin (transport-ingress campaign): the write
                 // wall's pre-handler leg, measured — no longer inferred.
                 "write_transport_phase_ns": write_transport_phase_json(),
+                "fuse3_fused_timeline_ns": fused_timeline_json(),
+                "fuse3_fused_midpass_reaps": fuse3::fused_midpass_reaps(),
+                "fuse3_fused_passbottom_reaps": fuse3::fused_passbottom_reaps(),
                 // The P2 in-place READ reply engagement gauge (found
                 // mis-wired by this campaign: dispatch takes the session
                 // connection, so handle_read's in-place arm never fired;

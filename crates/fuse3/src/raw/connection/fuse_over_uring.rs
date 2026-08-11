@@ -4894,6 +4894,17 @@ fn queue_worker(
                             match m.zc_pend[ent_idx].take() {
                                 Some(ZcPend::HandlerFetch { done })
                                 | Some(ZcPend::HandlerStore { done }) => {
+                                    // Fused timeline: issue → resolution,
+                                    // mid-pass venue (the funnel fix's
+                                    // engagement instrument).
+                                    let born = m.bridge_deadlines.born_ns(ent_idx);
+                                    if born != 0 {
+                                        crate::raw::read_phase::note_fused_bridge_resolved(
+                                            crate::raw::read_phase::transport_now_ns()
+                                                .saturating_sub(born),
+                                            true,
+                                        );
+                                    }
                                     let _ = done.send(res);
                                 }
                                 other => {
@@ -5456,6 +5467,11 @@ fn queue_worker(
                                  synthesizing its resolution \
                                  (fuse3_zc_bridge_lost)"
                             );
+                            note_handler_bridge_passbottom(
+                                &m.zc_pend[ent_idx],
+                                &m.bridge_deadlines,
+                                ent_idx,
+                            );
                             let pend = zc_fetch_complete(
                                 &mut ring,
                                 &mut batch,
@@ -5512,6 +5528,11 @@ fn queue_worker(
                     // here would double-reply the slot); a failed
                     // AT-DELIVERY extraction is a request nothing
                     // dispatched, so its EIO synthesizes here.
+                    note_handler_bridge_passbottom(
+                        &m.zc_pend[ent_idx],
+                        &m.bridge_deadlines,
+                        ent_idx,
+                    );
                     let pend = zc_fetch_complete(
                         &mut ring,
                         &mut batch,
@@ -5738,6 +5759,7 @@ fn queue_worker(
                 // A zc bridge completed (device fetch/store, bounce
                 // bridge, or lazy WRITE extraction). NOT a delivery —
                 // resolve the pending kind and move on.
+                note_handler_bridge_passbottom(&m.zc_pend[ent_idx], &m.bridge_deadlines, ent_idx);
                 let pend = zc_fetch_complete(
                     &mut ring,
                     &mut batch,
@@ -6942,6 +6964,29 @@ fn apply_reply_zc(ent: &mut Ent, header: &[u8], payload_len: u32) {
     }
     ent.hdr_mut().in_out[..OUT_HDR].copy_from_slice(&header[..OUT_HDR]);
     ent.hdr_mut().ring_ent_in_out.payload_sz = payload_len;
+}
+
+/// Fused timeline, pass-bottom venue: record a HANDLER bridge's issue →
+/// resolution span for a CQE the mid-pass reap did NOT consume (it parked
+/// through the pass-bottom wait first). Reads the deadline stamp BEFORE
+/// the caller's `clear`; non-handler pend classes record nothing.
+fn note_handler_bridge_passbottom(
+    pend: &Option<ZcPend>,
+    deadlines: &zc::BridgeDeadlines,
+    ent_idx: usize,
+) {
+    if matches!(
+        pend,
+        Some(ZcPend::HandlerFetch { .. }) | Some(ZcPend::HandlerStore { .. })
+    ) {
+        let born = deadlines.born_ns(ent_idx);
+        if born != 0 {
+            crate::raw::read_phase::note_fused_bridge_resolved(
+                crate::raw::read_phase::transport_now_ns().saturating_sub(born),
+                false,
+            );
+        }
+    }
 }
 
 /// Push one zc sparse-slot bridge SQE (READ_FIXED / WRITE_FIXED) with the

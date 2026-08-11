@@ -424,6 +424,12 @@ impl BridgeDeadlines {
         }
     }
 
+    /// `ent`'s live issue stamp (transport-epoch ns; 0 = no pend) — the
+    /// fused-timeline `bridge_rtt` recorder reads it BEFORE `clear`.
+    pub(crate) fn born_ns(&self, ent: usize) -> u64 {
+        self.born.get(ent).copied().unwrap_or(0)
+    }
+
     /// Live pend count (drives the watch thread's wake decision via the
     /// pool gauge).
     pub(crate) fn outstanding(&self) -> usize {

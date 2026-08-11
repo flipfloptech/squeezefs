@@ -242,6 +242,72 @@ pub fn write_inplace_replies() -> u64 {
     WRITE_INPLACE_REPLIES.load(Ordering::Relaxed)
 }
 
+// ---------------------------------------------------------------------------
+// The FUSED-op timeline (write-IOPS campaign, 2026-08-11): three engaged
+// levers (guard convoy, pass funnel, purge economy) left rand-4k pinned at
+// ~390k while CPUs sat 45 % idle and devices at 1 % — the residual ~2.2 ms
+// of per-op daemon queueing needs NAMED stages before another lever. Two
+// always-on instruments decompose a fused write's life:
+//
+// * `wake_to_poll` — run-queue push (spawn OR waker) → the drain's poll of
+//   that task: the scheduling quantum every hop pays. Recorded per poll.
+// * `bridge_rtt` — zc bridge SQE issue (`BridgeDeadlines::stamp`) → its
+//   resolution reaching the handler's oneshot (`done.send`): the device
+//   round trip AS THE HANDLER EXPERIENCES IT, venue-split by the reap
+//   counters below (a mid-pass reap resolves in-window; a pass-bottom reap
+//   ate a park + re-drain first).
+//
+// The reap venue counters are the funnel fix's ENGAGEMENT instrument —
+// shipped late (the fix landed without one, against the house rule; this
+// is the correction): `midpass / (midpass + passbottom)` ≈ the share of
+// bridge DMAs the interleave resolved without waiting out the pass.
+// ---------------------------------------------------------------------------
+
+static FUSED_WAKE_TO_POLL: [AtomicU64; LATENCY_BUCKETS] =
+    [const { AtomicU64::new(0) }; LATENCY_BUCKETS];
+static FUSED_BRIDGE_RTT: [AtomicU64; LATENCY_BUCKETS] =
+    [const { AtomicU64::new(0) }; LATENCY_BUCKETS];
+static FUSED_MIDPASS_REAPS: AtomicU64 = AtomicU64::new(0);
+static FUSED_PASSBOTTOM_REAPS: AtomicU64 = AtomicU64::new(0);
+
+/// Record one run-queue push → poll span (ns, transport epoch).
+#[inline]
+pub(crate) fn note_fused_wake_to_poll(ns: u64) {
+    FUSED_WAKE_TO_POLL[latency_bucket_index(ns / 1_000)].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record one bridge issue → oneshot-resolution span (ns) plus its venue.
+#[inline]
+pub(crate) fn note_fused_bridge_resolved(ns: u64, midpass: bool) {
+    FUSED_BRIDGE_RTT[latency_bucket_index(ns / 1_000)].fetch_add(1, Ordering::Relaxed);
+    if midpass {
+        FUSED_MIDPASS_REAPS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        FUSED_PASSBOTTOM_REAPS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Stats-inode snapshot: the fused timeline histograms, name + buckets
+/// (index-aligned with `latency_core::LATENCY_BUCKET_LABELS`).
+pub fn fused_timeline_snapshot() -> [(&'static str, [u64; LATENCY_BUCKETS]); 2] {
+    let load =
+        |a: &[AtomicU64; LATENCY_BUCKETS]| std::array::from_fn(|i| a[i].load(Ordering::Relaxed));
+    [
+        ("wake_to_poll", load(&FUSED_WAKE_TO_POLL)),
+        ("bridge_rtt", load(&FUSED_BRIDGE_RTT)),
+    ]
+}
+
+/// Mid-pass bridge resolutions (the funnel-fix engagement gauge).
+pub fn fused_midpass_reaps() -> u64 {
+    FUSED_MIDPASS_REAPS.load(Ordering::Relaxed)
+}
+
+/// Pass-bottom bridge resolutions (the park-then-resolve venue).
+pub fn fused_passbottom_reaps() -> u64 {
+    FUSED_PASSBOTTOM_REAPS.load(Ordering::Relaxed)
+}
+
 #[cfg(test)]
 mod transport_phase_tests {
     use super::*;

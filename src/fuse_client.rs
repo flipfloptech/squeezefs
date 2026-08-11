@@ -6820,6 +6820,36 @@ impl SqueezefsFilesystem {
     /// completion never resurrects a stale-high size over a newer
     /// truncate).
     pub(crate) fn publish_attr(&self, ino: u64, publish: AttrPublish) -> Option<FileAttr> {
+        // Identical-publish elision (write-IOPS campaign, 2026-08-11):
+        // the postlude publishes times on the COARSE clock, so at 100k+
+        // ops/s per hot ino every publish inside a ~4 ms tick merges to
+        // a byte-identical attr — and the perf stacks put the resulting
+        // per-op stripe-mutex + scc bucket-writer traffic (32 workers ×
+        // 32 hot inos) at double-digit worker CPU. A LOCK-FREE peek
+        // (HashIndex read) pre-computes the WriteTimes merge; equality
+        // skips the mutex and the insert entirely. Sound by idempotence
+        // on the VALUE (an equal-value publish changes nothing; any
+        // concurrent unequal publisher takes the mutex path exactly as
+        // before); the one skipped side effect is the entry's TTL stamp
+        // refresh, so a continuously-written ino now refetches once per
+        // daemon TTL instead of never — a correct-valued, self-healing
+        // miss. Scoped to WriteTimes — the only per-op-rate publisher;
+        // every other variant is op-rare.
+        if let AttrPublish::WriteTimes {
+            mtime,
+            ctime,
+            size_claim,
+        } = &publish
+        {
+            if let Some(cached) = self.attr_cache.peek_with(&ino, |(a, _)| *a) {
+                let unchanged = cached.mtime >= *mtime
+                    && cached.ctime >= *ctime
+                    && size_claim.map(|c| c <= cached.size).unwrap_or(true);
+                if unchanged {
+                    return Some(cached);
+                }
+            }
+        }
         let lock = self.attr_publish_locks.get_inode_lock(ino);
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let cached = self.attr_cache.peek_with(&ino, |(a, _)| *a);

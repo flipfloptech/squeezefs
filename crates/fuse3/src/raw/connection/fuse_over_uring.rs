@@ -4837,11 +4837,25 @@ fn queue_worker(
         // Gate every commit; park the message when leased and rely on
         // the lease drop's eventfd wake.
         let mut fused_more = fused_lane.len() > 0;
+        // Work-conserving pass (write-IOPS campaign, T3 correction): the
+        // signals below decide the pass-bottom PARK. A pass that pumped a
+        // message, polled a fused task, or holds deferred completions
+        // skips the blocking wait entirely — the loop spins back through
+        // the eventfd drain and the interleave, so a delivery dispatched
+        // at THIS pass's bottom is polled at the NEXT iteration's top
+        // instead of waiting out a park (T3 named delivery quantization
+        // as the ~2 ms residual: commits re-arm ents whose fresh
+        // deliveries landed mid-pass and then waited for the park).
+        // Idle passes park exactly as before — a quiet mount burns
+        // nothing.
+        let mut pass_polls: usize = 0;
+        let mut pass_msgs: usize = 0;
         macro_rules! next_wmsg {
             () => {{
                 let mut got: Option<WorkerMsg> = None;
                 loop {
                     if let Ok(m) = commit_rx.try_recv() {
+                        pass_msgs += 1;
                         got = Some(m);
                         break;
                     }
@@ -4968,7 +4982,9 @@ fn queue_worker(
                             let mut any = false;
                             while fused_lane.drain_one(&d.handle) {
                                 any = true;
+                                pass_polls += 1;
                                 if let Ok(m) = commit_rx.try_recv() {
+                                    pass_msgs += 1;
                                     got = Some(m);
                                     break;
                                 }
@@ -5385,13 +5401,21 @@ fn queue_worker(
             .iter()
             .filter_map(|m| m.slots.next_retry_deadline())
             .min();
-        let wait_result = if !deferred_cqes.is_empty() {
-            // The mid-pass reap consumed completions it deferred to THIS
-            // pass bottom — parking here would sleep over work already
-            // in hand (a REGISTER/COMMIT completion nothing else will
-            // ever re-signal: the drained-then-park wedge). Flush any
-            // pending SQEs non-blocking and fall through to process.
-            ring.submit()
+        let wait_result = if !deferred_cqes.is_empty() || pass_polls > 0 || pass_msgs > 0 {
+            // Work-conserving pass: completions in hand (parking would
+            // sleep over work nothing re-signals — the drained-then-park
+            // wedge), or this pass did real work whose follow-ons (fresh
+            // deliveries from the commits it flushed, wakes from the
+            // tasks it polled) are best served by spinning straight back
+            // through the interleave. Flush non-blocking with GETEVENTS
+            // (DEFER_TASKRUN: deliveries only materialize under the
+            // flag) and fall through.
+            let ts = types::Timespec::new();
+            let args = types::SubmitArgs::new().timespec(&ts);
+            match ring.submitter().submit_with_args(1, &args) {
+                Err(e) if e.raw_os_error() == Some(libc::ETIME) => Ok(0),
+                other => other,
+            }
         } else {
             match next_retry {
                 Some(deadline) => {

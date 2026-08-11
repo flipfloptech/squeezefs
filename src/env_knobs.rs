@@ -238,6 +238,7 @@ pub static KNOBS: &[Knob] = &[
     k("SQUEEZEFS_IL_REAP_PARK_MAX", int(0, 1 << 16), "2", "libaio reap: queue depth at or below which the event-driven park is used."),
     k("SQUEEZEFS_IL_REAP_QUANTUM_US", int(1, 1000), "50", "libaio reap: deep-regime quantum, µs — since reap-fanin 2026-08-08 the batch-threshold park's AGE BOUND (the k-th completion cuts it short); the shipped 50 µs is the 2026-07-26 sizing (shim-iops measurement lever)."),
     k("SQUEEZEFS_IL_READ_DEST", Kind::Bool, "on", "Arena-destination read serves (E-IL2); 0 = the A/B lever."),
+    k("SQUEEZEFS_IL_DIRECT_WRITE", Kind::Bool, "on", "IL direct-drive WRITE lane (design-il-direct-write §3): W1-patch-shaped ring writes DMA in place on the svc thread's dd lane — no sever bounce on the aligned leg, no handler handoff; 0 = the A0 control (every ring write rides the sever→handoff path, the ipc_dd_write_* ledger stays silent)."),
     k("SQUEEZEFS_IL_KERNEL_LANE_MIN", int(0, BYTES_MAX), "derived (memBW probe x lane-RTT delta, clamp [slab, max_op])", "Hybrid lane gate (D14 corollary): ops STRICTLY larger than this ride the kernel FUSE lane, smaller ops the IPC ring; explicit wins verbatim, 0 = gate off (all eligible ops ring - the A/B lever). Offsetful forms latch a whole description kernel-lane on first trigger (sticky - the offset mirror never flaps)."),
     // -- zcrx read lane ---------------------------------------------------
     k("SQUEEZEFS_ZCRX_LANE", Kind::Bool, "off", "Arm the zcrx read lane."),

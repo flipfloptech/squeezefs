@@ -5824,6 +5824,45 @@ pub struct Metrics {
     /// deliberate-routing sibling of the `ineligible_*` refusal classes
     /// (docs/design-read-path.md §Observability).
     pub ipc_direct_ineligible_policy: Align64<AtomicU64>,
+    /// IL direct-drive WRITE lane (docs/design-il-direct-write.md §3/§5,
+    /// PR-2+PR-3): W1-patch-shaped ring writes DMA'd IN PLACE on the svc
+    /// thread's dd lane shard — no handler handoff, the arena (or its
+    /// severed pooled copy) as the DMA source, the patch postlude at the
+    /// CQE. Engagement law: an il write row is INVALID unless
+    /// `ipc_dd_write_serves + ipc_async_handoffs` accounts for its ops.
+    pub ipc_dd_write_serves: Align64<AtomicU64>,
+    pub ipc_dd_write_bytes: Align64<AtomicU64>,
+    /// RES-6 loud-fail rail: direct writes REFUSED by THE authorization
+    /// door (`authorize_zc_store` → `data_custody::authorize_dma`) after
+    /// the §5.1 sole-owner fence — errno'd to the client, tiers purged,
+    /// word re-stabilized, NEVER fallen back to a second submission path
+    /// (the patch path's own law). **Must stay 0** — investigate
+    /// alongside `writer_guard_fenced` / `data_dma_fence_refusals`.
+    pub ipc_dd_write_fence_refusals: Align64<AtomicU64>,
+    /// The write-lane decision ledger (the W1 `patch_ineligible_*`
+    /// pattern — growth on a shape that should direct-serve = probe rot).
+    /// `shape` = zero-len/virtual ino, multi-block, over the patch cap,
+    /// EXTENDS the file, stream-adjacent, non-striped / meta or map not
+    /// RAM-resident, hole/decorated mapping, transform volume, or
+    /// write-verification armed (the D14 direct-leg rule).
+    pub ipc_dd_write_ineligible_shape: Align64<AtomicU64>,
+    /// `custody` = no RAM-cached lease (the acquisition is an await the
+    /// sync probe must not pay), byte-range custody shared (clause 7),
+    /// killpriv obligation not yet latched clean, block lock contended
+    /// (a writer is mid-flight on the block — the op was about to wait
+    /// anyway), or the §5.1 sole-owner fence observed a clone pin.
+    pub ipc_dd_write_ineligible_custody: Align64<AtomicU64>,
+    /// `overlay` = live RAM overlay / staged sibling / staged extent
+    /// record / device overlay on the block — its extents are NEWER than
+    /// the base block; correctness owns ambiguity.
+    pub ipc_dd_write_ineligible_overlay: Align64<AtomicU64>,
+    /// `backend` = engine unavailable, unknown/unhealthy/read-only-open
+    /// volume, reaper spawn failure, or SQ full (client backpressure via
+    /// the handler path).
+    pub ipc_dd_write_ineligible_backend: Align64<AtomicU64>,
+    /// `align` = LBA-misaligned offset or length (v1 is aligned-only by
+    /// the patch contract — only app-written sectors are ever rewritten).
+    pub ipc_dd_write_ineligible_align: Align64<AtomicU64>,
 }
 
 pub static METRICS: Lazy<Metrics> = Lazy::new(Metrics::default);
@@ -8863,6 +8902,18 @@ impl SqueezefsFilesystem {
                 "ipc_direct_ineligible_overlay": METRICS.ipc_direct_ineligible_overlay.load(Ordering::Relaxed),
                 "ipc_direct_ineligible_backend": METRICS.ipc_direct_ineligible_backend.load(Ordering::Relaxed),
                 "ipc_direct_ineligible_policy": METRICS.ipc_direct_ineligible_policy.load(Ordering::Relaxed),
+                // IL direct-drive WRITE lane (design-il-direct-write §5):
+                // serves/bytes + the RES-6 must-stay-0 fence tripwire +
+                // the decision ledger. Engagement law: dd_write_serves +
+                // ipc_async_handoffs accounts for an il write row's ops.
+                "ipc_dd_write_serves": METRICS.ipc_dd_write_serves.load(Ordering::Relaxed),
+                "ipc_dd_write_bytes": METRICS.ipc_dd_write_bytes.load(Ordering::Relaxed),
+                "ipc_dd_write_fence_refusals": METRICS.ipc_dd_write_fence_refusals.load(Ordering::Relaxed),
+                "ipc_dd_write_ineligible_shape": METRICS.ipc_dd_write_ineligible_shape.load(Ordering::Relaxed),
+                "ipc_dd_write_ineligible_custody": METRICS.ipc_dd_write_ineligible_custody.load(Ordering::Relaxed),
+                "ipc_dd_write_ineligible_overlay": METRICS.ipc_dd_write_ineligible_overlay.load(Ordering::Relaxed),
+                "ipc_dd_write_ineligible_backend": METRICS.ipc_dd_write_ineligible_backend.load(Ordering::Relaxed),
+                "ipc_dd_write_ineligible_align": METRICS.ipc_dd_write_ineligible_align.load(Ordering::Relaxed),
                 "write_lock_wait": METRICS.write_lock_wait.to_json(),
                 // design-write-inode-convoy §7: the candidate ledger,
                 // the admission posture, the KD-8 FINAL-scope ledger

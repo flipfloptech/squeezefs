@@ -123,6 +123,34 @@ fn il_read_dest_enabled() -> bool {
     *ON.get_or_init(|| crate::env_knobs::bool_knob("SQUEEZEFS_IL_READ_DEST", true))
 }
 
+/// `SQUEEZEFS_IL_DIRECT_WRITE` — the direct-drive WRITE lane's A/B lever
+/// (docs/design-il-direct-write.md §5; default ON). `0` = the A0
+/// control: every ring write rides the sever→handoff path and the
+/// `ipc_dd_write_*` ledger stays silent. A runtime CELL, not a per-op
+/// `getenv` (the std env lock contends across svc threads at the lane's
+/// op rate) — initialized from the registered knob once, flipped by
+/// [`set_il_direct_write_enabled`] (the measurement/test seam, the
+/// `set_patch_max_bytes` precedent).
+fn il_direct_write_cell() -> &'static std::sync::atomic::AtomicBool {
+    static ON: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
+    ON.get_or_init(|| {
+        std::sync::atomic::AtomicBool::new(crate::env_knobs::bool_knob(
+            "SQUEEZEFS_IL_DIRECT_WRITE",
+            true,
+        ))
+    })
+}
+
+pub(crate) fn il_direct_write_enabled() -> bool {
+    il_direct_write_cell().load(Ordering::Relaxed)
+}
+
+/// Flip the direct-drive WRITE lane at runtime (A/B bracket + test seam —
+/// env init still wins at process start via the registered knob).
+pub fn set_il_direct_write_enabled(v: bool) {
+    il_direct_write_cell().store(v, Ordering::Relaxed);
+}
+
 thread_local! {
     /// PLACED-write handoffs deferred to the end of the drain pass
     /// (shim-parity 2026-07-28): a placed sever's whole win is that every

@@ -1836,6 +1836,31 @@ fn flush_submit(ring: &mut Ring, batch: &mut SubmitBatch) -> io::Result<usize> {
     }
     Ok(n)
 }
+
+/// [`flush_submit`] that ALSO materializes completions on
+/// `DEFER_TASKRUN` rings — the interleave's flush (write-IOPS campaign,
+/// 2026-08-11): a plain `submit()` never sets `IORING_ENTER_GETEVENTS`,
+/// and deferred-task-work rings run their completion work ONLY under
+/// that flag, so the mid-pass reap synced an eternally-empty CQ (the T1
+/// engagement row: `fused_midpass_reaps` +0 against 22.85M pass-bottom
+/// resolutions). `want = 1` + a ZERO `EXT_ARG` timespec is the
+/// non-blocking GETEVENTS idiom (the dd-ring bounded-wait precedent):
+/// task work runs, completed CQEs land, and an empty completion state
+/// answers `ETIME` immediately — never a park.
+fn flush_submit_getevents(ring: &mut Ring, batch: &mut SubmitBatch) -> io::Result<usize> {
+    let (had_reads, had_writes) = batch.note_flush();
+    let t0 = (had_reads || had_writes).then(Instant::now);
+    let ts = types::Timespec::new();
+    let args = types::SubmitArgs::new().timespec(&ts);
+    let n = match ring.submitter().submit_with_args(1, &args) {
+        Err(e) if e.raw_os_error() == Some(libc::ETIME) => Ok(0),
+        other => other,
+    }?;
+    if let Some(t0) = t0 {
+        record_commit_flush(had_reads, had_writes, t0.elapsed());
+    }
+    Ok(n)
+}
 // §5.4 transport payload-lease observability (SqueezeFS stats inode).
 static TRANSPORT_PAYLOAD_LEASES: AtomicU64 = AtomicU64::new(0);
 // MEM-1 dest-DMA lease claims (read-destination owner tokens) — the
@@ -4824,11 +4849,21 @@ fn queue_worker(
                         break;
                     }
                     // Launch the PREVIOUS poll's SQEs before burning the
-                    // next poll's CPU (an error here is deferred to the
-                    // pass-bottom enter, which owns the disconnect
-                    // handling for this ring).
-                    if batch.pending > 0 {
-                        if let Err(e) = flush_submit(&mut ring, &mut batch) {
+                    // next poll's CPU, and MATERIALIZE completions while
+                    // at it: these rings run DEFER_TASKRUN, where CQEs
+                    // land only under a GETEVENTS enter — a plain submit
+                    // left the mid-pass reap syncing an eternally-empty
+                    // CQ (T1: midpass_reaps +0 / 22.85M pass-bottom).
+                    // Gated on work being possible: pending SQEs to
+                    // launch, or live bridge pends whose CQEs could land.
+                    // (An error here is deferred to the pass-bottom
+                    // enter, which owns the disconnect handling.)
+                    let live_pends: usize = members
+                        .iter()
+                        .map(|m| m.bridge_deadlines.outstanding())
+                        .sum();
+                    if batch.pending > 0 || live_pends > 0 {
+                        if let Err(e) = flush_submit_getevents(&mut ring, &mut batch) {
                             warn!(
                                 "fuse-over-uring qids={qids:?}: eager bridge flush \
                                  failed ({e}); deferring to the pass-bottom submit"

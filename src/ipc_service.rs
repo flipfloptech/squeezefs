@@ -316,6 +316,185 @@ pub(crate) fn spawn_dd_write_times_park(
     });
 }
 
+/// The direct-drive WRITE lane's decision ledger (the W1
+/// `patch_ineligible_*` shape — design-il-direct-write §5). Custody
+/// refusals carry their cause (lease / range / block_lock / killpriv);
+/// the engine-side clone-pin back-off counts its own `..._fence_backoff`
+/// arm at the refusal site in `ipc_direct`. Free function: the engine's
+/// residual re-drive attributes through the SAME ledger the sink does.
+pub(crate) fn count_dd_write_ineligible(class: crate::fuse_client::IpcDirectWriteIneligible) {
+    use crate::fuse_client::IpcDirectWriteIneligible as I;
+    let counter = match class {
+        I::Shape => &METRICS.ipc_dd_write_ineligible_shape,
+        I::Lease => &METRICS.ipc_dd_write_ineligible_lease,
+        I::Range => &METRICS.ipc_dd_write_ineligible_range,
+        I::BlockLock => &METRICS.ipc_dd_write_ineligible_block_lock,
+        I::Killpriv => &METRICS.ipc_dd_write_ineligible_killpriv,
+        I::Overlay => &METRICS.ipc_dd_write_ineligible_overlay,
+        I::Backend => &METRICS.ipc_dd_write_ineligible_backend,
+        I::Align => &METRICS.ipc_dd_write_ineligible_align,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// ONE full direct-drive WRITE attempt — probe → park-or-submit →
+/// counted fallback — shared verbatim by the sink's serve_write gate and
+/// the conveyor's post-release residual re-drive (`ipc_direct::run_train`
+/// — "residual followers re-drive through the normal probe").
+///
+/// The park arm (the per-block follower conveyor): a `BlockLock` refusal
+/// parks on the block's train ONLY when the guard holder is the dd-write
+/// lane itself — the train registry IS the holder authority (armed at
+/// the leader's probe success, closed on every guard release), so a
+/// foreign holder (handler/fold/flush/truncate) can never absorb a park.
+/// Foreign contention keeps the honest `block_lock` count + today's
+/// fallback.
+pub(crate) fn drive_direct_write(
+    fs: &Arc<SqueezefsFilesystem>,
+    engine: Option<&Arc<crate::ipc_direct::DirectDriveEngine>>,
+    inval: &Option<Arc<Invalidator>>,
+    op: DataOp,
+    completion: SlotCompletion,
+) -> Result<(), (DataOp, SlotCompletion)> {
+    use crate::fuse_client::IpcDirectWriteIneligible as I;
+    match fs.ipc_direct_write_probe(
+        op.binding.ino,
+        op.desc.offset,
+        op.desc.len,
+        op.binding.kill_priv,
+        op.t0_ns,
+    ) {
+        Ok((snap, guard)) => match engine {
+            Some(engine) => engine.submit_write(op, completion, snap, guard, inval.clone()),
+            None => {
+                drop(guard);
+                count_dd_write_ineligible(I::Backend);
+                Err((op, completion))
+            }
+        },
+        Err(I::BlockLock) => {
+            if let Some(engine) = engine {
+                match engine.try_park_write(op, completion, inval.clone()) {
+                    Ok(()) => return Ok(()),
+                    Err(pair) => {
+                        count_dd_write_ineligible(I::BlockLock);
+                        return Err(pair);
+                    }
+                }
+            }
+            count_dd_write_ineligible(I::BlockLock);
+            Err((op, completion))
+        }
+        Err(class) => {
+            count_dd_write_ineligible(class);
+            Err((op, completion))
+        }
+    }
+}
+
+/// The ring WRITE's sever→handoff body (§5.5.2 severance + the full
+/// kernel-venue write handler on the fuse3 handler lanes), factored free
+/// of the sink so the conveyor's close/teardown fallbacks ride the
+/// IDENTICAL path (the `spawn_read_handoff` precedent — same venue, same
+/// handler, same counters).
+///
+/// `defer_placed_to_sweep`: placed severs defer their handler spawn to
+/// end-of-sweep via the SERVICE-THREAD-LOCAL queue (`SessionSink::flush`
+/// drains it) — legal ONLY mid-drain on a service thread. Foreign
+/// callers (the dd engine's CQE-side fallbacks, on reaper/inline-reap
+/// threads with no flush contract) pass `false` and spawn immediately:
+/// a deferral there would strand the handoff in a thread_local nothing
+/// drains.
+pub(crate) fn spawn_write_handoff(
+    fs: Arc<SqueezefsFilesystem>,
+    request: Request,
+    inval: Option<Arc<Invalidator>>,
+    op: DataOp,
+    completion: SlotCompletion,
+    defer_placed_to_sweep: bool,
+) {
+    // §5.5.2 severance — the ONE arena read, BEFORE the handoff counter
+    // increments (tests park the handoff behind a held writer and
+    // scribble the arena: the scribble must be inert). Placed first
+    // (shim-parity 2026-07-28): whole-block-stream shapes sever DIRECTLY
+    // into the block's future `ActiveBlockBuf` backing so the handler
+    // merge elides its copy — the 1-copy ring write path; everything
+    // else severs through the pooled buffers exactly as before.
+    // SAFETY: the op's validated arena window is alive for this
+    // synchronous call (racing client writes are torn CONTENT, never UB
+    // — the pooled sever's own contract).
+    let mut placed = true;
+    let severed = unsafe {
+        fs.placed_sever_for(
+            op.binding.ino,
+            op.desc.offset,
+            op.payload.len(),
+            op.payload.as_base_ptr(),
+        )
+    }
+    .unwrap_or_else(|| {
+        placed = false;
+        op.payload.read_severed_bytes()
+    });
+    // Locality instrument (NUMA-affinity 2026-07-31): the sever is ONE
+    // CPU pass over the arena bytes — classified once here for BOTH
+    // sever paths (placed + pooled).
+    let arena_node = op.payload.arena_node();
+    crate::numa::count_current_pass(arena_node, op.payload.len());
+    METRICS.ipc_async_handoffs.fetch_add(1, Ordering::Relaxed);
+    let ino = op.binding.ino;
+    let offset = op.desc.offset;
+    // Killpriv-v2 il parity (2026-07-28 campaign): intercepted write(2)
+    // never runs the kernel's file_remove_privs, so the session peer's
+    // HELLO-time class (BindingRights::kill_priv — uid + CAP_FSETID,
+    // SO_PEERCRED-verified) stands in for the kernel's per-write
+    // !capable(CAP_FSETID) and rides the SAME daemon clearing law the
+    // kernel path uses. Known-clean inos short-circuit on the handler's
+    // latch — the common case pays a contains-check, nothing more.
+    let write_flags = if op.binding.kill_priv {
+        fuse3::raw::flags::FUSE_WRITE_KILL_SUIDGID
+    } else {
+        0
+    };
+    let fut = async move {
+        match fs
+            .write(request, ino, 0, offset, severed, write_flags, 0)
+            .await
+        {
+            Ok(reply) => {
+                METRICS.ipc_ops_write.fetch_add(1, Ordering::Relaxed);
+                METRICS
+                    .ipc_bytes_in
+                    .fetch_add(u64::from(reply.written), Ordering::Relaxed);
+                completion.complete(i64::from(reply.written));
+                // §5.6.2 W1: invalidate AFTER the write landed (the
+                // kernel's refetch must observe the new state);
+                // rate-limited per (ino, window); reads never fire.
+                // POSIX-8: the write's END OFFSET rides along — a write
+                // past the announced high-water grew the file and owes
+                // the kernel an attrs refresh whatever the window says.
+                if let Some(iv) = inval {
+                    iv.on_write(ino, offset.saturating_add(u64::from(reply.written)));
+                }
+            }
+            Err(errno) => {
+                completion.complete(i64::from(libc::c_int::from(errno)));
+            }
+        }
+    };
+    if placed && defer_placed_to_sweep {
+        // Placed writes defer their handler spawn to end-of-sweep (see
+        // PENDING_PLACED_HANDOFFS): the sibling chunks still in this
+        // drain pass must sever into the shared assembly before any
+        // merge parks the overlay entry. Custody is already severed
+        // (above, synchronously) — the deferral moves only WHERE the
+        // handler starts, never what it writes.
+        PENDING_PLACED_HANDOFFS.with(|q| q.borrow_mut().push((arena_node, Box::pin(fut))));
+    } else {
+        handoff_spawn_on(arena_node, fut);
+    }
+}
+
 /// What a W1 invalidation shoots down (POSIX-8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvalScope {
@@ -946,64 +1125,19 @@ impl DataPlaneSink {
         spawn_read_handoff(Arc::clone(&self.fs), self.ring_request(), op, completion);
     }
 
-    /// The direct-drive WRITE lane's decision ledger (the W1
-    /// `patch_ineligible_*` shape — design-il-direct-write §5). Custody
-    /// refusals carry their cause (lease / range / block_lock /
-    /// killpriv); the engine-side clone-pin back-off counts its own
-    /// `..._fence_backoff` arm at the refusal site in `ipc_direct`.
-    fn count_dd_write_ineligible(class: crate::fuse_client::IpcDirectWriteIneligible) {
-        use crate::fuse_client::IpcDirectWriteIneligible as I;
-        let counter = match class {
-            I::Shape => &METRICS.ipc_dd_write_ineligible_shape,
-            I::Lease => &METRICS.ipc_dd_write_ineligible_lease,
-            I::Range => &METRICS.ipc_dd_write_ineligible_range,
-            I::BlockLock => &METRICS.ipc_dd_write_ineligible_block_lock,
-            I::Killpriv => &METRICS.ipc_dd_write_ineligible_killpriv,
-            I::Overlay => &METRICS.ipc_dd_write_ineligible_overlay,
-            I::Backend => &METRICS.ipc_dd_write_ineligible_backend,
-            I::Align => &METRICS.ipc_dd_write_ineligible_align,
-        };
-        counter.fetch_add(1, Ordering::Relaxed);
-    }
-
     /// The direct-drive WRITE fast path (design-il-direct-write §3,
-    /// PR-2+PR-3): probe the W1 sole-owner patch shape synchronously on
-    /// the service thread; an eligible op submits its in-place WRITE SQE
-    /// on the caller's dd lane shard from the arena and completes at the
-    /// CQE after the patch postlude — no sever bounce on the aligned
-    /// leg, no handler handoff. `Err` returns the op untouched for
-    /// today's sever→handoff path (fallback-is-correctness), its ledger
-    /// class counted; `Ok(())` = consumed (submitted, or fence-refused
-    /// LOUD by the engine — never a silent second submission).
+    /// PR-2+PR-3): one [`drive_direct_write`] attempt with this sink's
+    /// engine + invalidator. `Err` returns the op untouched for today's
+    /// sever→handoff path (fallback-is-correctness), its ledger class
+    /// counted; `Ok(())` = consumed (submitted, PARKED on a same-block
+    /// follower train, or fence-refused LOUD by the engine — never a
+    /// silent second submission).
     fn try_direct_write(
         &self,
         op: DataOp,
         completion: SlotCompletion,
     ) -> Result<(), (DataOp, SlotCompletion)> {
-        let snap = match self.fs.ipc_direct_write_probe(
-            op.binding.ino,
-            op.desc.offset,
-            op.desc.len,
-            op.binding.kill_priv,
-            op.t0_ns,
-        ) {
-            Ok(pair) => pair,
-            Err(class) => {
-                Self::count_dd_write_ineligible(class);
-                return Err((op, completion));
-            }
-        };
-        let (snap, guard) = snap;
-        match self.direct_engine() {
-            Some(engine) => engine.submit_write(op, completion, snap, guard, self.inval.clone()),
-            None => {
-                drop(guard);
-                Self::count_dd_write_ineligible(
-                    crate::fuse_client::IpcDirectWriteIneligible::Backend,
-                );
-                Err((op, completion))
-            }
-        }
+        drive_direct_write(&self.fs, self.direct_engine(), &self.inval, op, completion)
     }
 
     /// WRITE: sever at dequeue, then run the real write handler with the
@@ -1026,92 +1160,18 @@ impl DataPlaneSink {
             } else {
                 (op, completion)
             };
-        // §5.5.2 severance — the ONE arena read, on the service thread,
-        // BEFORE the handoff counter increments (tests park the handoff
-        // behind a held writer and scribble the arena: the scribble must
-        // be inert). Placed first (shim-parity 2026-07-28): whole-block-
-        // stream shapes sever DIRECTLY into the block's future
-        // `ActiveBlockBuf` backing so the handler merge elides its copy —
-        // the 1-copy ring write path; everything else severs through the
-        // pooled buffers exactly as before.
-        // SAFETY: the dequeued op's validated arena window is alive for
-        // this synchronous call (racing client writes are torn CONTENT,
-        // never UB — the pooled sever's own contract).
-        let mut placed = true;
-        let severed = unsafe {
-            self.fs.placed_sever_for(
-                op.binding.ino,
-                op.desc.offset,
-                op.payload.len(),
-                op.payload.as_base_ptr(),
-            )
-        }
-        .unwrap_or_else(|| {
-            placed = false;
-            op.payload.read_severed_bytes()
-        });
-        // Locality instrument (NUMA-affinity 2026-07-31): the sever is
-        // ONE CPU pass over the arena bytes on this service thread —
-        // classified once here for BOTH sever paths (placed + pooled).
-        let arena_node = op.payload.arena_node();
-        crate::numa::count_current_pass(arena_node, op.payload.len());
-        METRICS.ipc_async_handoffs.fetch_add(1, Ordering::Relaxed);
-        let fs = Arc::clone(&self.fs);
-        let request = self.ring_request();
-        let inval = self.inval.clone();
-        let ino = op.binding.ino;
-        let offset = op.desc.offset;
-        // Killpriv-v2 il parity (2026-07-28 campaign): intercepted
-        // write(2) never runs the kernel's file_remove_privs, so the
-        // session peer's HELLO-time class (BindingRights::kill_priv —
-        // uid + CAP_FSETID, SO_PEERCRED-verified) stands in for the
-        // kernel's per-write !capable(CAP_FSETID) and rides the SAME
-        // daemon clearing law the kernel path uses. Known-clean inos
-        // short-circuit on the handler's latch — the common case pays a
-        // contains-check, nothing more.
-        let write_flags = if op.binding.kill_priv {
-            fuse3::raw::flags::FUSE_WRITE_KILL_SUIDGID
-        } else {
-            0
-        };
-        let fut = async move {
-            match fs
-                .write(request, ino, 0, offset, severed, write_flags, 0)
-                .await
-            {
-                Ok(reply) => {
-                    METRICS.ipc_ops_write.fetch_add(1, Ordering::Relaxed);
-                    METRICS
-                        .ipc_bytes_in
-                        .fetch_add(u64::from(reply.written), Ordering::Relaxed);
-                    completion.complete(i64::from(reply.written));
-                    // §5.6.2 W1: invalidate AFTER the write landed (the
-                    // kernel's refetch must observe the new state);
-                    // rate-limited per (ino, window); reads never fire.
-                    // POSIX-8: the write's END OFFSET rides along — a
-                    // write past the announced high-water grew the file
-                    // and owes the kernel an attrs refresh whatever the
-                    // window says.
-                    if let Some(iv) = inval {
-                        iv.on_write(ino, offset.saturating_add(u64::from(reply.written)));
-                    }
-                }
-                Err(errno) => {
-                    completion.complete(i64::from(libc::c_int::from(errno)));
-                }
-            }
-        };
-        if placed {
-            // Placed writes defer their handler spawn to end-of-sweep
-            // (see PENDING_PLACED_HANDOFFS): the sibling chunks still in
-            // this drain pass must sever into the shared assembly before
-            // any merge parks the overlay entry. Custody is already
-            // severed (above, synchronously) — the deferral moves only
-            // WHERE the handler starts, never what it writes.
-            PENDING_PLACED_HANDOFFS.with(|q| q.borrow_mut().push((arena_node, Box::pin(fut))));
-        } else {
-            handoff_spawn_on(arena_node, fut);
-        }
+        // The sever→handoff body (factored — the conveyor's CQE-side
+        // fallbacks ride the identical path): placed severs defer to the
+        // end-of-sweep queue, which is legal exactly here — this IS a
+        // service thread mid-drain, and `SessionSink::flush` drains it.
+        spawn_write_handoff(
+            Arc::clone(&self.fs),
+            self.ring_request(),
+            self.inval.clone(),
+            op,
+            completion,
+            true,
+        );
     }
 }
 

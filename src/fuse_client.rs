@@ -10477,7 +10477,61 @@ impl SqueezefsFilesystem {
         IpcDirectWriteIneligible,
     > {
         use IpcDirectWriteIneligible as I;
-        // -- request-shape screens (lock-free, cheapest first) ----------
+        let (b32, block_size, end) = self.dd_write_shape_probe(ino, offset, len)?;
+
+        // -- the block lock (ONE try_lock — never a blocking acquire) ---
+        let lock = BLOCK_FLUSH_LOCKS.get_lock(ino, b32);
+        let Ok(guard) = lock.try_lock() else {
+            // A writer holds the block: the op was about to wait anyway —
+            // demote (the serve_read lock-demotion posture). The caller's
+            // park arm (the per-block follower conveyor) decides whether
+            // the holder is the dd-write lane itself.
+            return Err(I::BlockLock);
+        };
+        // Lock census: always-on last-holder stamp (the D1.b watchdog's
+        // named-holder surface) + the profile-armed site row.
+        let stripe = BLOCK_FLUSH_LOCKS.block_shard_index(ino, b32);
+        STRIPE_LAST_HOLDER[stripe].store(
+            pack_holder(BlockLockSite::IlDirectWrite, ino, b32),
+            Ordering::Relaxed,
+        );
+        block_lock_try_note(BlockLockSite::IlDirectWrite, ino, b32, true);
+
+        match self.dd_write_state_probe(ino, b32, block_size, end, offset, len, kill_priv, t0_ns) {
+            Ok(snap) => Ok((snap, guard)),
+            Err(class) => Err(class),
+        }
+    }
+
+    /// The follower re-drive form of [`Self::ipc_direct_write_probe`]
+    /// (the per-block conveyor — design-il-direct-write §6 conveyor
+    /// notes): same shape + state ladder, NO try_lock. **Contract: the
+    /// caller HOLDS `BLOCK_FLUSH_LOCKS(ino, offset / block_size)`** —
+    /// the guard a parked follower's train leader acquired and kept
+    /// through the CQE postlude — which is exactly what makes the state
+    /// resolution authoritative here, as in the primary probe.
+    pub fn ipc_direct_write_probe_locked(
+        &self,
+        ino: u64,
+        offset: u64,
+        len: u32,
+        kill_priv: bool,
+        t0_ns: u64,
+    ) -> Result<IpcDirectWriteSnapshot, IpcDirectWriteIneligible> {
+        let (b32, block_size, end) = self.dd_write_shape_probe(ino, offset, len)?;
+        self.dd_write_state_probe(ino, b32, block_size, end, offset, len, kill_priv, t0_ns)
+    }
+
+    /// The lock-free request-shape half of the dd-write probe (cheapest
+    /// first; no side effects): returns `(block, block_size, end)` for
+    /// the state half.
+    fn dd_write_shape_probe(
+        &self,
+        ino: u64,
+        offset: u64,
+        len: u32,
+    ) -> Result<(u32, u64, u64), IpcDirectWriteIneligible> {
+        use IpcDirectWriteIneligible as I;
         if len == 0 || is_virtual_ino(ino) {
             return Err(I::Shape);
         }
@@ -10504,7 +10558,6 @@ impl SqueezefsFilesystem {
         if (end - 1) / block_size != b {
             return Err(I::Shape); // multi-block: no single in-place window
         }
-        let b32 = b as u32;
         // The D14 direct-leg rule: the pooled patch vehicle's
         // window-exact read-back is the verifier — a direct DMA under
         // write verification would silently skip it.
@@ -10516,25 +10569,26 @@ impl SqueezefsFilesystem {
         if !self.router.get_crypto().is_passthrough() {
             return Err(I::Shape);
         }
+        Ok((b as u32, block_size, end))
+    }
 
-        // -- the block lock (ONE try_lock — never a blocking acquire) ---
-        let lock = BLOCK_FLUSH_LOCKS.get_lock(ino, b32);
-        let Ok(guard) = lock.try_lock() else {
-            // A writer holds the block: the op was about to wait anyway —
-            // demote (the serve_read lock-demotion posture).
-            return Err(I::BlockLock);
-        };
-        // Lock census: always-on last-holder stamp (the D1.b watchdog's
-        // named-holder surface) + the profile-armed site row.
-        let stripe = BLOCK_FLUSH_LOCKS.block_shard_index(ino, b32);
-        STRIPE_LAST_HOLDER[stripe].store(
-            pack_holder(BlockLockSite::IlDirectWrite, ino, b32),
-            Ordering::Relaxed,
-        );
-        block_lock_try_note(BlockLockSite::IlDirectWrite, ino, b32, true);
-
-        // -- state screens, resolved UNDER the held lock (the patch
-        //    path's authoritative-map discipline) ----------------------
+    /// The state + custody + commit half of the dd-write probe.
+    /// **Contract: the caller holds `BLOCK_FLUSH_LOCKS(ino, b32)`** (the
+    /// patch path's authoritative-map discipline — block `b`'s mapping
+    /// mutates only under that lock).
+    #[allow(clippy::too_many_arguments)] // the probe's factored interior
+    fn dd_write_state_probe(
+        &self,
+        ino: u64,
+        b32: u32,
+        block_size: u64,
+        end: u64,
+        offset: u64,
+        len: u32,
+        kill_priv: bool,
+        t0_ns: u64,
+    ) -> Result<IpcDirectWriteSnapshot, IpcDirectWriteIneligible> {
+        use IpcDirectWriteIneligible as I;
         let key = match self.router.metadata_cache.peek_with(&ino, |meta| {
             if meta.file_type != "striped" {
                 return Err(I::Shape);
@@ -10624,20 +10678,17 @@ impl SqueezefsFilesystem {
         let _prev = self.note_last_write_end(ino, offset, u64::from(len));
         self.mark_handle_dirty(ino);
         let rel = offset - block_start;
-        Ok((
-            IpcDirectWriteSnapshot {
-                ino,
-                block: b32,
-                key,
-                be_id,
-                dev_off,
-                dev_write_off: dev_off + rel,
-                offset,
-                len,
-                t0_ns,
-            },
-            guard,
-        ))
+        Ok(IpcDirectWriteSnapshot {
+            ino,
+            block: b32,
+            key,
+            be_id,
+            dev_off,
+            dev_write_off: dev_off + rel,
+            offset,
+            len,
+            t0_ns,
+        })
     }
 
     /// Placed sever (shim-parity 2026-07-28): decide — synchronously, on

@@ -1561,7 +1561,12 @@ async fn train_bound_closes_the_tenure_and_residuals_redrive() {
     let (session, binding) = ClientSession::establish(&fx, &fd);
 
     tokio::task::block_in_place(|| {
-        warm_direct_lane(&session, binding, &mut want, &[2 * BS + 16384, 3 * BS + 8192]);
+        warm_direct_lane(
+            &session,
+            binding,
+            &mut want,
+            &[2 * BS + 16384, 3 * BS + 8192],
+        );
 
         // 34 ops on block 1 = 1 leader + 32 parked (the queue cap) + 1
         // overflow fallback. Alternating disjoint windows A/B keep every

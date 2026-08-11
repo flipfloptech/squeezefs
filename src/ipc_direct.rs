@@ -339,6 +339,161 @@ struct PendingWrite {
     t_insert_ns: u64,
 }
 
+/// Ops per guard tenure AND the park queue's capacity: ONE ring depth's
+/// worth ([`fuse3::raw::Q_DEPTH_DESIRED`] — the per-queue depth ceiling),
+/// so a fold/flush/handler waiter on the block's stripe parks behind at
+/// most one train. Derived, never invented (the derivation-sweep law);
+/// overflow past the queue capacity falls back on the honest
+/// `block_lock` arm.
+const TRAIN_BOUND: u32 = fuse3::raw::Q_DEPTH_DESIRED as u32;
+
+/// One follower parked on a block's train: the op/completion travel
+/// AS-IS (allocation-free steady state — the queue slot is the only
+/// storage) plus the sink's invalidator for its eventual postlude or
+/// handler fallback. The op's arena window stays pinned (§5.3.1 rule 4)
+/// and UNREAD until the re-drive — parking severs nothing.
+struct ParkedWrite {
+    op: DataOp,
+    completion: SlotCompletion,
+    inval: Option<Arc<crate::ipc_service::Invalidator>>,
+}
+
+/// One block's conveyor state. `open` is the LANE-HOLDER authority: true
+/// exactly while a dd-write leader holds the block's `BLOCK_FLUSH_LOCKS`
+/// guard (armed at probe success, closed on EVERY release path), so a
+/// park can never wait behind a foreign holder — the wedge-free rule is
+/// "any entry in the queue while `open` is observed by the closing
+/// drain or a CQE pop", serialized by the map's per-entry exclusive
+/// access.
+struct TrainState {
+    open: bool,
+    /// Ops served under the current guard tenure (leader = 1); the
+    /// [`TRAIN_BOUND`] cap is what keeps fold/flush/handler waiters on
+    /// the stripe bounded to one train's wait.
+    tenure: u32,
+    /// FIFO per block (pop order == park order). Capacity is retained
+    /// across tenures (steady-state parks/pops allocate nothing).
+    queue: std::collections::VecDeque<ParkedWrite>,
+}
+
+/// The per-block follower conveyor registry (design-il-direct-write §6
+/// conveyor notes; the rig's 99.8% block_lock attribution). One entry
+/// per (ino, block) ever dd-write-contended — entries are never removed
+/// (the `last_write_end`/Invalidator RES-13 recorded-ceiling class:
+/// ~100 B + retained queue capacity per contended block, bounded by the
+/// working set; the only correct sweep signal is the ino's death and a
+/// lost entry would cost correctness here, not one extra notify).
+struct WriteTrains {
+    map: scc::HashMap<(u64, u32), TrainState>,
+}
+
+impl WriteTrains {
+    fn new() -> Self {
+        Self {
+            map: scc::HashMap::new(),
+        }
+    }
+
+    /// Leader arm: the calling thread HOLDS the block's guard (probe
+    /// success). Opens the train and resets the tenure; a queue left
+    /// over from a mid-drain re-arm keeps its entries (they simply ride
+    /// the new tenure, FIFO preserved).
+    fn arm(&self, key: (u64, u32)) {
+        match self.map.entry_sync(key) {
+            scc::hash_map::Entry::Occupied(mut o) => {
+                let t = o.get_mut();
+                t.open = true;
+                t.tenure = 1;
+            }
+            scc::hash_map::Entry::Vacant(v) => {
+                let _ = v.insert_entry(TrainState {
+                    open: true,
+                    tenure: 1,
+                    queue: std::collections::VecDeque::new(),
+                });
+            }
+        }
+    }
+
+    /// Park a follower on `key`'s OPEN train (counted). `Err` hands the
+    /// entry back: no train / closed / at the [`TRAIN_BOUND`] cap — the
+    /// caller falls back on the honest `block_lock` arm.
+    fn try_park(&self, key: (u64, u32), parked: ParkedWrite) -> Result<(), ParkedWrite> {
+        match self.map.entry_sync(key) {
+            scc::hash_map::Entry::Occupied(mut o) => {
+                let t = o.get_mut();
+                if t.open && t.queue.len() < TRAIN_BOUND as usize {
+                    t.queue.push_back(parked);
+                    METRICS
+                        .ipc_dd_write_block_parks
+                        .fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                } else {
+                    Err(parked)
+                }
+            }
+            scc::hash_map::Entry::Vacant(_) => Err(parked),
+        }
+    }
+
+    /// The CQE postlude's pop: the next follower while the tenure has
+    /// room, else CLOSE the train (`None` — the caller releases the
+    /// guard and drains residuals via [`Self::pop_parked`]). The close
+    /// and the pop are one atomic decision under the entry's exclusive
+    /// access, which is what makes a park-vs-close race impossible: a
+    /// parker either lands before this (and is popped here or by the
+    /// residual drain) or observes `open == false` and falls back.
+    fn pop_under_tenure(&self, key: (u64, u32)) -> Option<ParkedWrite> {
+        match self.map.entry_sync(key) {
+            scc::hash_map::Entry::Occupied(mut o) => {
+                let t = o.get_mut();
+                if t.tenure < TRAIN_BOUND {
+                    if let Some(p) = t.queue.pop_front() {
+                        t.tenure += 1;
+                        METRICS
+                            .ipc_dd_write_park_redrives
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Some(p);
+                    }
+                }
+                t.open = false;
+                None
+            }
+            // A guard holder always armed; tolerated for symmetry.
+            scc::hash_map::Entry::Vacant(_) => None,
+        }
+    }
+
+    /// Close the train WITHOUT popping (the error-path releases: engine
+    /// refusals, fence refusals, the reaper's leak arm). Residuals drain
+    /// via [`Self::pop_parked`] after the guard drops.
+    fn close(&self, key: (u64, u32)) {
+        if let scc::hash_map::Entry::Occupied(mut o) = self.map.entry_sync(key) {
+            o.get_mut().open = false;
+        }
+    }
+
+    /// Drain one residual after a close (counted as a re-drive — it left
+    /// the queue toward a disposition). With `open == false` no new park
+    /// can land, so the drain terminates; a concurrent RE-ARM (a
+    /// residual that won a fresh try_lock) legally interleaves — either
+    /// consumer pops each entry exactly once, FIFO preserved.
+    fn pop_parked(&self, key: (u64, u32)) -> Option<ParkedWrite> {
+        match self.map.entry_sync(key) {
+            scc::hash_map::Entry::Occupied(mut o) => {
+                let p = o.get_mut().queue.pop_front();
+                if p.is_some() {
+                    METRICS
+                        .ipc_dd_write_park_redrives
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                p
+            }
+            scc::hash_map::Entry::Vacant(_) => None,
+        }
+    }
+}
+
 /// The in-flight slab's entry: reads and writes share the rings, the
 /// slab, the reapers and the flush cadence — one engine, both directions
 /// (the user directive: reuse the dd machinery in reverse, never build
@@ -363,6 +518,25 @@ impl PendingOp {
             PendingOp::Write(p) => p.t_insert_ns,
         }
     }
+}
+
+/// [`DirectDriveEngine::submit_write_core`]'s outcome: every
+/// non-submitted arm hands the block guard BACK so the caller owns the
+/// train disposition — the leader closes the train, the CQE postlude
+/// keeps popping followers (a dropped-inside-core guard would strand
+/// whatever parked behind it).
+enum DdWriteSubmit {
+    /// SQE in flight; the guard travels with the pending op to the CQE.
+    Submitted,
+    /// Completed LOUD (the RES-6 fence refusal — errno already posted).
+    Refused(tokio::sync::MutexGuard<'static, ()>),
+    /// Handler fallback (ledger class counted at the refusal site).
+    Fallback {
+        op: DataOp,
+        completion: SlotCompletion,
+        inval: Option<Arc<crate::ipc_service::Invalidator>>,
+        guard: tokio::sync::MutexGuard<'static, ()>,
+    },
 }
 
 struct EngineState {
@@ -443,6 +617,10 @@ pub(crate) struct DirectDriveEngine {
     fs: Arc<SqueezefsFilesystem>,
     shards: Vec<DdShard>,
     vols: HashMap<String, VolSlot>,
+    /// The per-block follower conveyor (same-block dd writes train on
+    /// the guard holder instead of falling back to the handler and then
+    /// blocking on the same stripe anyway).
+    trains: WriteTrains,
     /// Keeps the device fds open for the engine's lifetime.
     _files: Vec<std::fs::File>,
     /// Fallback request identity (the sink's ring-op identity).
@@ -609,6 +787,7 @@ impl DirectDriveEngine {
             fs,
             shards,
             vols,
+            trains: WriteTrains::new(),
             _files: files,
             req_uid,
             req_gid,
@@ -867,6 +1046,51 @@ impl DirectDriveEngine {
         Ok(())
     }
 
+    /// The engine's synthetic request identity for CQE-side handler
+    /// fallbacks (the sink's `ring_request` shape — authorization
+    /// already happened at the §5.2 fd screen).
+    fn ring_request(&self) -> fuse3::raw::Request {
+        fuse3::raw::Request {
+            unique: 0,
+            uid: self.req_uid,
+            gid: self.req_gid,
+            pid: self.req_pid,
+            // Ring-origin op: no kernel delivery, no reply slot.
+            slot: fuse3::raw::ReplySlot::Classical,
+        }
+    }
+
+    /// Park one probe-`BlockLock`-refused WRITE on its block's OPEN
+    /// train (the per-block follower conveyor). `Err` hands the op back
+    /// for the honest `block_lock` fallback: the guard holder is NOT the
+    /// dd-write lane (no train armed — a handler/fold/flush/truncate has
+    /// the stripe), the train just closed, or the queue is at its
+    /// [`TRAIN_BOUND`] cap. The op's shape screens already passed (the
+    /// probe runs them before its try_lock); the state screens run at
+    /// re-drive time under the then-held guard.
+    pub(crate) fn try_park_write(
+        &self,
+        op: DataOp,
+        completion: SlotCompletion,
+        inval: Option<Arc<crate::ipc_service::Invalidator>>,
+    ) -> Result<(), (DataOp, SlotCompletion)> {
+        let block_size = self.fs.router.block_size.load(Ordering::Relaxed);
+        if block_size == 0 {
+            return Err((op, completion));
+        }
+        let key = (op.binding.ino, (op.desc.offset / block_size) as u32);
+        self.trains
+            .try_park(
+                key,
+                ParkedWrite {
+                    op,
+                    completion,
+                    inval,
+                },
+            )
+            .map_err(|ParkedWrite { op, completion, .. }| (op, completion))
+    }
+
     /// Submit one probe-eligible WRITE on the calling thread's LANE
     /// shard (design-il-direct-write §3, PR-3): the arena is the DMA
     /// SOURCE (or its severed pooled copy when the window cannot take
@@ -875,16 +1099,21 @@ impl DirectDriveEngine {
     /// completes the ring slot after the patch postlude
     /// ([`Self::finish_write`]).
     ///
+    /// This is the LEADER entry: it ARMS the block's train (the
+    /// lane-holder authority parks same-block followers behind this
+    /// guard tenure) and CLOSES it on every non-submitted outcome, so a
+    /// parked op can never outlive the guard it waits on.
+    ///
     /// Outcomes:
     /// * `Ok(())` — consumed: submitted, **or fence-refused LOUD**
     ///   (errno completed to the client; a fenced holder must never
     ///   fall back to a SECOND submission path — the patch path's law).
     /// * `Err((op, completion))` — handler fallback (unknown/unhealthy/
     ///   read-only volume, reaper spawn failure, SQ full, clone-pinned
-    ///   block), its ledger class counted here; the §5.1 word is
-    ///   re-stabilized where the fence had already been taken, so the
-    ///   handler path re-runs the whole patch protocol on unchanged
-    ///   content.
+    ///   block), its ledger class counted at the refusal site; the §5.1
+    ///   word is re-stabilized where the fence had already been taken,
+    ///   so the handler path re-runs the whole patch protocol on
+    ///   unchanged content.
     pub(crate) fn submit_write(
         self: &Arc<Self>,
         op: DataOp,
@@ -893,34 +1122,92 @@ impl DirectDriveEngine {
         block_guard: tokio::sync::MutexGuard<'static, ()>,
         inval: Option<Arc<crate::ipc_service::Invalidator>>,
     ) -> Result<(), (DataOp, SlotCompletion)> {
+        let key = (snap.ino, snap.block);
+        self.trains.arm(key);
+        match self.submit_write_core(op, completion, snap, block_guard, inval) {
+            DdWriteSubmit::Submitted => Ok(()),
+            DdWriteSubmit::Refused(guard) => {
+                self.close_train_error(key, guard);
+                Ok(())
+            }
+            DdWriteSubmit::Fallback {
+                op,
+                completion,
+                inval: _,
+                guard,
+            } => {
+                self.close_train_error(key, guard);
+                Err((op, completion))
+            }
+        }
+    }
+
+    /// Close `key`'s train on a non-CQE guard release (engine refusals,
+    /// fence refusals): residuals parked in the arm→refusal window go
+    /// STRAIGHT to the handler — the engine just proved this block's
+    /// submit path refusing, so a re-probe would re-hit it (their pops
+    /// count `park_redrives`; the closure law holds).
+    fn close_train_error(
+        self: &Arc<Self>,
+        key: (u64, u32),
+        guard: tokio::sync::MutexGuard<'static, ()>,
+    ) {
+        self.trains.close(key);
+        drop(guard);
+        while let Some(parked) = self.trains.pop_parked(key) {
+            crate::ipc_service::spawn_write_handoff(
+                Arc::clone(&self.fs),
+                self.ring_request(),
+                parked.inval,
+                parked.op,
+                parked.completion,
+                false,
+            );
+        }
+    }
+
+    /// The submission interior, shared by the leader path
+    /// ([`Self::submit_write`]) and the conveyor's under-guard follower
+    /// re-drive ([`Self::run_train`]): every non-submitted outcome hands
+    /// the GUARD BACK so the caller owns the train disposition (the
+    /// leader closes; the postlude keeps popping).
+    fn submit_write_core(
+        self: &Arc<Self>,
+        op: DataOp,
+        completion: SlotCompletion,
+        snap: crate::fuse_client::IpcDirectWriteSnapshot,
+        block_guard: tokio::sync::MutexGuard<'static, ()>,
+        inval: Option<Arc<crate::ipc_service::Invalidator>>,
+    ) -> DdWriteSubmit {
         let router = &self.fs.router;
-        let backend_refuse = |op, completion| {
+        let backend_refuse = |op, completion, inval, guard| {
             METRICS
                 .ipc_dd_write_ineligible_backend
                 .fetch_add(1, Ordering::Relaxed);
-            Err((op, completion))
+            DdWriteSubmit::Fallback {
+                op,
+                completion,
+                inval,
+                guard,
+            }
         };
         let Some(vol) = self.vols.get(snap.be_id.as_str()) else {
-            drop(block_guard);
-            return backend_refuse(op, completion);
+            return backend_refuse(op, completion, inval, block_guard);
         };
         if !vol.writable
             || !router
                 .backend_router
                 .is_backend_healthy(snap.be_id.as_str())
         {
-            drop(block_guard);
-            return backend_refuse(op, completion);
+            return backend_refuse(op, completion, inval, block_guard);
         }
         let Ok((allocator, device)) = router.backend_router.get_backend(snap.be_id.as_str()) else {
-            drop(block_guard);
-            return backend_refuse(op, completion);
+            return backend_refuse(op, completion, inval, block_guard);
         };
         // The reaper must be live BEFORE the SQE publishes.
         let lane = current_lane() % self.shards.len();
         if !self.ensure_reaper(lane) {
-            drop(block_guard);
-            return backend_refuse(op, completion);
+            return backend_refuse(op, completion, inval, block_guard);
         }
 
         // DMA source: the arena window verbatim when it can take
@@ -963,11 +1250,15 @@ impl DirectDriveEngine {
         // custody classes (per-cause split, 2026-08-11).
         if !allocator.begin_patch_sole_owner(snap.dev_off) {
             allocator.publish_block(snap.dev_off);
-            drop(block_guard);
             METRICS
                 .ipc_dd_write_ineligible_fence_backoff
                 .fetch_add(1, Ordering::Relaxed);
-            return Err((op, completion));
+            return DdWriteSubmit::Fallback {
+                op,
+                completion,
+                inval,
+                guard: block_guard,
+            };
         }
         // RES-6/S7: THE authorization door, strictly before the SQE (the
         // same gate `write_block`'s worker and the patch's D14 leg run).
@@ -980,7 +1271,6 @@ impl DirectDriveEngine {
             let file_path = crate::keys::inode_path_stack(snap.ino);
             router.cache.write_lru.remove(file_path.as_str());
             router.cache.read_lru.remove(file_path.as_str());
-            drop(block_guard);
             METRICS
                 .ipc_dd_write_fence_refusals
                 .fetch_add(1, Ordering::Relaxed);
@@ -991,7 +1281,7 @@ impl DirectDriveEngine {
                 snap.block
             );
             completion.complete(-i64::from(e.to_errno()));
-            return Ok(());
+            return DdWriteSubmit::Refused(block_guard);
         }
 
         // ipc_direct_phase_ns `admit` closes at slab insert; the SAME
@@ -1067,11 +1357,11 @@ impl DirectDriveEngine {
                     completion,
                     allocator,
                     block_guard,
+                    inval,
                     ..
                 } = pending;
                 allocator.publish_block(dev_off);
-                drop(block_guard);
-                return backend_refuse(op, completion);
+                return backend_refuse(op, completion, inval, block_guard);
             }
             st.inflight[idx] = Some(PendingOp::Write(pending));
             st.inflight_count += 1;
@@ -1082,7 +1372,7 @@ impl DirectDriveEngine {
         if pending_count >= dd_eager_threshold(dd_eager_flush()) {
             Self::flush_shard(lane, shard);
         }
-        Ok(())
+        DdWriteSubmit::Submitted
     }
 
     /// Flush pushed-but-unsubmitted SQEs — one `io_uring_enter` per
@@ -1106,7 +1396,7 @@ impl DirectDriveEngine {
     /// `uring_lock` (the funnel profile's 31 % spin term). See
     /// [`dd_lane_flush`] for the liveness argument; `0` restores the
     /// thread-pairing-independent sweep.
-    pub(crate) fn flush(&self) {
+    pub(crate) fn flush(self: &Arc<Self>) {
         if dd_lane_flush() {
             let lane = current_lane() % self.shards.len();
             Self::flush_shard(lane, &self.shards[lane]);
@@ -1178,6 +1468,10 @@ impl DirectDriveEngine {
         if let Some(node) = shard.node {
             crate::numa::pin_service_thread(node);
         }
+        // Conveyor lane pin: follower submissions from this reaper's
+        // CQE postludes ride ITS OWN shard, so a train's next hop is
+        // reaped right here (no cross-shard reaper spawn per train).
+        set_service_lane(idx);
         // MEM-7c escalation bound: consecutive failed enters while ops are
         // in flight. A permanently broken ring must neither unmap under DMA
         // nor hang `shutdown`'s join forever, so past this many 1 ms
@@ -1239,6 +1533,7 @@ impl DirectDriveEngine {
                                 .lock()
                                 .expect("direct-drive state mutex never poisons");
                             let mut n = 0usize;
+                            let mut wedged_trains: Vec<(u64, u32)> = Vec::new();
                             for slot in st.inflight.iter_mut() {
                                 if let Some(p) = slot.take() {
                                     // A forgotten WRITE also leaks its held
@@ -1247,12 +1542,33 @@ impl DirectDriveEngine {
                                     // than a mapping (DMA source) or word
                                     // (§5.1) whose owner the kernel may still
                                     // touch; this arm is the unrecoverable-
-                                    // ring terminal state either way.
+                                    // ring terminal state either way. Its
+                                    // TRAIN, however, must not strand parked
+                                    // followers silently: they have NO DMA in
+                                    // flight, so they fail LOUD below.
+                                    if let PendingOp::Write(w) = &p {
+                                        wedged_trains.push((w.snap.ino, w.snap.block));
+                                    }
                                     std::mem::forget(p);
                                     n += 1;
                                 }
                             }
                             st.inflight_count = 0;
+                            drop(st);
+                            for key in wedged_trains {
+                                self.trains.close(key);
+                                while let Some(parked) = self.trains.pop_parked(key) {
+                                    log::error!(
+                                        "ipc direct-drive: failing parked follower on \
+                                         ino {} block {} LOUD (EIO) — its train's guard \
+                                         holder was leaked with the unrecoverable ring \
+                                         (never silence)",
+                                        key.0,
+                                        key.1
+                                    );
+                                    parked.completion.complete(-i64::from(libc::EIO));
+                                }
+                            }
                             n
                         };
                         log::error!(
@@ -1321,7 +1637,7 @@ impl DirectDriveEngine {
     /// shard's `cq_gate` (the single-consumer-at-a-time invariant the
     /// pre-fusion design got from the dedicated reaper thread).
     /// Returns ops completed (NOP wakes excluded).
-    fn drain_cq_locked(&self, idx: usize) -> usize {
+    fn drain_cq_locked(self: &Arc<Self>, idx: usize) -> usize {
         // Conveyor-rail determinism seam: leave the CQ untouched while a
         // test pins guard tenures open (the reaper's bounded wait resumes
         // consumption when the gate reopens; nothing is lost).
@@ -1478,7 +1794,7 @@ impl DirectDriveEngine {
     /// non-ACK-blocking durable-times tail on the handler lanes. Runs on
     /// the shard reaper or the fusion inline arm — every step is
     /// synchronous and runtime-free except the dispatched tail.
-    fn finish_write(&self, pending: PendingWrite, res: i32, t_cqe_ns: u64) {
+    fn finish_write(self: &Arc<Self>, pending: PendingWrite, res: i32, t_cqe_ns: u64) {
         let PendingWrite {
             op,
             completion,
@@ -1502,10 +1818,12 @@ impl DirectDriveEngine {
         let file_path = crate::keys::inode_path_stack(snap.ino);
         self.fs.router.cache.write_lru.remove(file_path.as_str());
         self.fs.router.cache.read_lru.remove(file_path.as_str());
-        // The block guard held since the probe drops HERE — purges done
-        // under it (the patch path's window), everything after it is
-        // guard-free exactly like the handler's postlude.
-        drop(block_guard);
+        // The block guard held since the probe survives this op's
+        // postlude: after the completion posts, the CONVEYOR pops the
+        // block's next parked follower and re-drives it under this same
+        // tenure ([`Self::run_train`] — where the guard finally drops
+        // when the queue empties or the tenure hits its bound).
+        let train_key = (snap.ino, snap.block);
         if exact {
             // A direct write IS a patch write (the W1 ledger) + the
             // lane's own engagement instruments + the charter-rule-4
@@ -1596,6 +1914,128 @@ impl DirectDriveEngine {
         // byte was consumed by the kernel.
         drop(bounce);
         drop(op);
+        // The conveyor: pop this block's parked followers under the
+        // still-held guard, or close the train and release it.
+        self.run_train(train_key, block_guard);
+    }
+
+    /// The per-block follower conveyor's CQE-side pump: while the guard
+    /// tenure has room, pop the block's next parked follower FIFO and
+    /// re-drive it UNDER THE ALREADY-HELD GUARD — the probe-commit steps
+    /// re-run via `ipc_direct_write_probe_locked` (no try_lock; the
+    /// world may have moved while parked, so a follower failing a state
+    /// screen rides the handler, counted on its honest arm), then its
+    /// own §5.1 fence + RES-6 authorization + SQE
+    /// ([`Self::submit_write_core`] — every follower authorizes its OWN
+    /// submission). When the queue empties or the tenure hits
+    /// [`TRAIN_BOUND`] (one ring depth's worth — fold/flush wait at most
+    /// one train), the guard drops and any residual followers re-drive
+    /// through the NORMAL probe (fresh try_lock) from this reap/inline
+    /// thread: a residual that wins the lock becomes the next leader
+    /// (FIFO preserved — later residuals park on its train); one that
+    /// loses to a queued foreign waiter falls back on the honest
+    /// `block_lock` arm. Never dropped, never blocked on the svc thread.
+    fn run_train(
+        self: &Arc<Self>,
+        key: (u64, u32),
+        mut guard: tokio::sync::MutexGuard<'static, ()>,
+    ) {
+        loop {
+            let Some(parked) = self.trains.pop_under_tenure(key) else {
+                // Tenure closed (bound hit or queue empty): release the
+                // guard, then drain residuals via the normal drive.
+                drop(guard);
+                while let Some(parked) = self.trains.pop_parked(key) {
+                    let ParkedWrite {
+                        op,
+                        completion,
+                        inval,
+                    } = parked;
+                    if let Err((op, completion)) = crate::ipc_service::drive_direct_write(
+                        &self.fs,
+                        Some(self),
+                        &inval,
+                        op,
+                        completion,
+                    ) {
+                        crate::ipc_service::spawn_write_handoff(
+                            Arc::clone(&self.fs),
+                            self.ring_request(),
+                            inval,
+                            op,
+                            completion,
+                            false,
+                        );
+                    }
+                }
+                return;
+            };
+            let ParkedWrite {
+                op,
+                completion,
+                inval,
+            } = parked;
+            // The follower's probe-commit under the held guard (its
+            // `t0_ns` is the DEQUEUE instant, so the admit span honestly
+            // carries the park residence).
+            match self.fs.ipc_direct_write_probe_locked(
+                op.binding.ino,
+                op.desc.offset,
+                op.desc.len,
+                op.binding.kill_priv,
+                op.t0_ns,
+            ) {
+                Ok(snap) => {
+                    match self.submit_write_core(op, completion, snap, guard, inval) {
+                        DdWriteSubmit::Submitted => {
+                            // The follower's SQE must be kernel-visible
+                            // NOW: no sweep-end flush runs on this
+                            // thread's cadence, and the reaper's bounded
+                            // wake would tax the train hop with up to
+                            // its 100 ms liveness cadence.
+                            let lane = current_lane() % self.shards.len();
+                            Self::flush_shard(lane, &self.shards[lane]);
+                            return;
+                        }
+                        DdWriteSubmit::Refused(g) => {
+                            // Completed LOUD (fence) — keep the train
+                            // moving; each follower fences individually
+                            // (loud, never silent).
+                            guard = g;
+                        }
+                        DdWriteSubmit::Fallback {
+                            op,
+                            completion,
+                            inval,
+                            guard: g,
+                        } => {
+                            guard = g;
+                            crate::ipc_service::spawn_write_handoff(
+                                Arc::clone(&self.fs),
+                                self.ring_request(),
+                                inval,
+                                op,
+                                completion,
+                                false,
+                            );
+                        }
+                    }
+                }
+                Err(class) => {
+                    // The world moved while parked (overlay parked, size
+                    // grew, adjacency…): honest arm + the handler path.
+                    crate::ipc_service::count_dd_write_ineligible(class);
+                    crate::ipc_service::spawn_write_handoff(
+                        Arc::clone(&self.fs),
+                        self.ring_request(),
+                        inval,
+                        op,
+                        completion,
+                        false,
+                    );
+                }
+            }
+        }
     }
 
     /// Flag shutdown, NOP-wake EVERY spawned shard reaper, join them

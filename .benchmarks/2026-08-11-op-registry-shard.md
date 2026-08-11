@@ -98,3 +98,19 @@ from the eligible shape. Residuals: `ineligible_custody` 6.78 M/38.9 M
 size-0 stat anomaly after a kernel-abort unmount (watch item; clean-remount
 discriminator showed durable sizes intact), single-leg so far — the A-B-B-A
 closure leg + sustained row still owed before any headline.
+
+## Addendum 2 — custody split + conveyor leg 1
+
+Split (`836083bc`) attributed the 17% fallback class: **99.8% = block_lock**
+(6.90M same-block try-lock losses; lease 50, killpriv/range/fence 0).
+Conveyor (`d28a0435`, leg conv1): ledger closes exactly (parks ≡ redrives =
+1.32M, fence 0, seq/kern par) but captures only ~18% of the contention —
+il 628.8k @ 24.75µs vs the split leg's 652.8k @ 23.46µs (single legs, no
+A-B-B-A yet). Mechanism: a fallback becomes a HANDLER write holding the
+same stripe, so subsequent probes see a foreign holder and fall back too —
+handler-mode is self-sustaining per contended block. The park predicate
+(holder = open lane train) aims too narrow. Next design: classify same-
+block ops at the SINK by (ino, block) BEFORE any guard exists (svc-side
+coalescing into the block's train regardless of current holder class), or
+arm train adoption on handler release. Conveyor verdict deferred to its
+A-B-B-A; correctness rails all green (11/11 ×3).

@@ -1236,6 +1236,55 @@ const OP_PHASE_NAMES: [&str; OP_PHASES] = [
 /// claim degrades to unregistered-but-profiled when full — never blocks.
 const OP_REGISTRY_SLOTS: usize = 256;
 
+/// The shipped registry capacity (the flat 256-slot slab) — the
+/// never-regress-below-shipped floor for the derived geometry: no box
+/// gets LESS watchdog scan surface than every box already ran.
+const OP_REGISTRY_SHIPPED_SLOTS: usize = 256;
+
+/// Op-registry geometry derivation (2026-08-11 write-IOPS campaign,
+/// `.benchmarks/2026-08-11-write-iops-campaign-day1.md`): the fixed
+/// 256-slot slab was 4× UNDER the delivered ring capacity on the field
+/// rig (32 possible CPUs × depth 32 = 1024 in flight), so under load
+/// every claim walked all 256 slots with one failing `lock cmpxchg`
+/// each — from ONE globally-shared round-robin cursor, over 24-byte
+/// slots packed ~2.7 per cache line. Measured: 6.65 % of fused-worker
+/// self-cycles at 525 k IOPS (`OpRegistry::claim`, perf_worker2).
+///
+/// The registry must shadow the geometry the transport DELIVERS:
+/// - **shards = kernel possible CPUs** (the over-uring queue population
+///   — one queue per possible CPU, `TransportGeometry`), floored so
+///   total capacity never drops below the shipped 256 slots;
+/// - **slots/shard = 2 × `Q_DEPTH_DESIRED`** — the per-queue depth
+///   ceiling plus equal headroom for the registrations that arrive
+///   OUTSIDE ring accounting (classical-sideband ops, ipc handoffs on
+///   foreign threads).
+///
+/// Returns `(shards, slots_per_shard)`; total = product, ≥ 2× the max
+/// delivered ring capacity (`possible_cpus × Q_DEPTH_DESIRED`) on every
+/// box, never below shipped. Never a knob — geometry, not tuning.
+pub fn op_registry_derived_geometry(possible_cpus: usize) -> (usize, usize) {
+    let slots_per_shard = 2 * fuse3::raw::Q_DEPTH_DESIRED;
+    let floor_shards = OP_REGISTRY_SHIPPED_SLOTS.div_ceil(slots_per_shard);
+    (possible_cpus.max(floor_shards).max(1), slots_per_shard)
+}
+
+/// The LIVE registry's `(shards, slots_per_shard)` — the face the
+/// drift-is-red tie test (`tests/op_registry_shard_tests.rs`) holds
+/// against [`op_registry_derived_geometry`].
+pub fn op_registry_geometry() -> (usize, usize) {
+    (1, OP_REGISTRY_SLOTS)
+}
+
+/// The registry slot's `(size, align)` — the false-sharing law's face:
+/// slots are CAS-claimed from every CPU at op rate, so a slot must own
+/// its cache line outright.
+pub fn op_registry_slot_layout() -> (usize, usize) {
+    (
+        std::mem::size_of::<OpSlot>(),
+        std::mem::align_of::<OpSlot>(),
+    )
+}
+
 struct OpSlot {
     /// 0 = free, 1 = claimed. CAS-claimed, store-released.
     state: std::sync::atomic::AtomicU32,

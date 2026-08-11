@@ -1030,13 +1030,16 @@ async fn op_prof_records_phases_and_recycles_registry_slots() {
 
     // Exhaustion: more live ops than slots must not block or panic; the
     // overflow ops still profile (histograms move), just unregistered.
+    let (shards, slots) = squeezefs::fuse_client::op_registry_geometry();
+    let capacity = (shards * slots) as u64;
+    let herd_n = shards * slots + 44;
     let before_total = phase_total(&op_profile_phase_json(), "getattr", "total");
-    let herd: Vec<OpProf> = (0..300)
+    let herd: Vec<OpProf> = (0..herd_n as u64)
         .map(|i| OpProf::begin_forced(FuseOpKind::Getattr, i))
         .collect();
     assert!(
-        op_profile_inflight() <= inflight0 + 256,
-        "registry is a FIXED slab (256 slots)"
+        op_profile_inflight() <= inflight0 + capacity,
+        "registry is a bounded slab (geometry-derived capacity {capacity})"
     );
     drop(herd);
     assert_eq!(
@@ -1046,7 +1049,7 @@ async fn op_prof_records_phases_and_recycles_registry_slots() {
     );
     assert_eq!(
         phase_total(&op_profile_phase_json(), "getattr", "total"),
-        before_total + 300,
+        before_total + herd_n as u64,
         "slot exhaustion never drops histogram samples"
     );
 }

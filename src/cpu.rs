@@ -24,6 +24,26 @@ pub fn process_parallelism() -> usize {
     *CACHED.get_or_init(compute_process_parallelism)
 }
 
+/// Kernel **possible** CPU count (`_SC_NPROCESSORS_CONF`) — the same
+/// population the FUSE-over-io_uring transport sizes its queue set from
+/// (kernel `fuse_uring_create()` uses `num_possible_cpus()`; fewer queues
+/// than possible CPUs never becomes ready). Distinct from
+/// [`process_parallelism`] on purpose: taskset/offline masks shrink the
+/// affinity mask but never the delivered ring geometry, and anything
+/// shadowing that geometry (the D1.b op registry) must size from THIS
+/// number. Never returns 0.
+pub fn possible_cpus() -> usize {
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) };
+        if n > 0 {
+            n as usize
+        } else {
+            process_parallelism()
+        }
+    })
+}
+
 fn compute_process_parallelism() -> usize {
     // SAFETY: zeroed cpu_set_t is a valid empty set; sched_getaffinity
     // writes at most size_of::<cpu_set_t>() bytes into it.

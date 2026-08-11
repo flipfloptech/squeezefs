@@ -105,6 +105,47 @@ async_handoffs` accounts for its ops. A/B lever `SQUEEZEFS_IL_DIRECT_WRITE=0`
 - **PR 4**: governor/width composition (drain-lane derivation unchanged;
   the lane rides existing `il_drain_lanes_default`).
 
+### PR 2+3 landed (2026-08-11, `perf/il-direct-write`) — notes + residuals
+
+Probe `SqueezefsFilesystem::ipc_direct_write_probe` + the WRITE leg of
+the existing `DirectDriveEngine` (`submit_write`/`finish_write` — same
+shards, lane routing, flush cadence, reapers, fusion; volumes now open
+read+write with a loud reads-only degrade). Rails red-first in
+`tests/il_direct_write_tests.rs`. Deviations from the sketch above, all
+conservative (ineligible ⇒ fallback, never a weakened rail):
+
+1. **Phase spans ride `ipc_direct_phase_ns`** (admit/inflight/finish/
+   total — the read lane's family), not a separate `ipc_dd_write_phase_ns`:
+   one table, both directions compose (implementation directive).
+2. **Coverage (§3 rail 3)**: the eligible shape's coverage bookkeeping is
+   the ino's stream word (`note_last_write_end`, swapped at the probe's
+   commit point). The `record_write` coverage-union lives on
+   ACCUMULATION buffers, which the overlay screen excludes structurally —
+   a block with any overlay is ineligible, so there is never a union to
+   feed (the handler's own patch arm records exactly nothing else).
+3. **Killpriv (§3 rail 4)**: a `kill_priv`-flagged binding direct-serves
+   only under a HELD `killpriv_clean` latch; a non-clean ino is
+   custody-INELIGIBLE — one fallback lets the handler clear privs BEFORE
+   its data lands (the VFS order; clearing in a CQE postlude would
+   invert it), then steady state pays the same contains-check the
+   kernel venue does.
+4. **Custody window**: the probe holds the block's `BLOCK_FLUSH_LOCKS`
+   stripe from ONE non-blocking `try_lock` (contended = custody
+   fallback — the serve_read demotion posture) through the CQE
+   postlude's purge — the same protection `try_sole_owner_patch` runs
+   under, which is what makes probe-time mapping resolution
+   authoritative across the DMA with no CQE revalidation ladder.
+5. **The durable times park** (`park_write_times`) is the one async
+   postlude member: dispatched exactly once per served op to the fuse3
+   handler lanes AFTER `completion.complete` — the client ACK never
+   waits on tokio. The RAM face (`publish_attr` WriteTimes, elision
+   door, `size_claim: None` — non-extending by eligibility) runs
+   synchronously on the reap thread.
+6. **PR 1 (§4 cost kills) and PR 4 (governor/width) are NOT in this
+   branch**; the counted A-B-B-A bracket on squeeze-test (leg.sh
+   protocol, engagement enforced) remains owed before any public number
+   (the §6 gate).
+
 Gates: counted A-B-B-A on squeeze-test per leg (leg.sh protocol, CPU face,
 engagement enforced); release battery before any public number (user ruling
 2026-08-11).

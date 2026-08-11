@@ -101,36 +101,47 @@ impl MemoryCacheShard {
     }
 
     fn get(&self, key: &[u8], promote: bool, served_bytes: u64) -> Option<Bytes> {
-        let entry = self.map.get_sync(key)?;
-        let (value, state) = entry.get();
-        state.referenced.store(true, Ordering::Relaxed);
-        if served_bytes > 0 && !state.stream_admitted.load(Ordering::Relaxed) {
-            // Serve-site payback credit (admission governor): only real
-            // reader serves pass a length; probes and residency checks
-            // pass 0 and never inflate an entry's payback. STREAM-admitted
-            // entries credit NOTHING (the transient stream window,
-            // 2026-07-29): probation would have served their within-pass
-            // consumption identically, so the admission's marginal value
-            // is cross-pass retention only — counting consumption diluted
-            // the governor's waste ratio and held the clamp open under
-            // beyond-budget stream loops (the 4 GB/s ledger-pollution
-            // face; scan resistance broken for co-tenants).
-            state
-                .served_bytes
-                .fetch_add(served_bytes, Ordering::Relaxed);
-        }
-        if promote {
-            // Sticky promotion (§5.4): a block-level re-access marks the
-            // entry worth keeping — never cleared by the clock scan.
-            state.protected.store(true, Ordering::Relaxed);
-        }
-        // Non-promoting gets (stream sub-read CONSUMPTION, the R1b row-2
-        // measured correction): the entry still earns its clock second
-        // chance for the pass, but consuming a fill's own sub-ranges is
-        // not evidence it will ever be needed again — promotion here
-        // re-taxed streams through protected-victim dehydration and
-        // parked gigabytes in the eviction channel (the PR 4 bench OOM).
-        Some(value.clone())
+        // READER-class lookup (write-IOPS campaign, 2026-08-11): this was
+        // `get_sync`, whose `OccupiedEntry` holds the bucket's EXCLUSIVE
+        // writer lock — so every tier get excluded every other get on the
+        // bucket. Measured: 20.1 % of il handler-lane cycles parked in
+        // `bucket::Writer::lock_sync_wait` with 32 lanes colliding on the
+        // hot-file key population (`.benchmarks/2026-08-11-op-registry-
+        // shard.md` §The next named target). Everything this get does is
+        // legal under the SHARED `Reader` lock `read_sync` takes: the
+        // `EntryState` bookkeeping is relaxed atomics through `&self`,
+        // and the serve is a `Bytes` clone. Only put/remove/evict remain
+        // writer-class.
+        self.map.read_sync(key, |_, (value, state)| {
+            state.referenced.store(true, Ordering::Relaxed);
+            if served_bytes > 0 && !state.stream_admitted.load(Ordering::Relaxed) {
+                // Serve-site payback credit (admission governor): only real
+                // reader serves pass a length; probes and residency checks
+                // pass 0 and never inflate an entry's payback. STREAM-admitted
+                // entries credit NOTHING (the transient stream window,
+                // 2026-07-29): probation would have served their within-pass
+                // consumption identically, so the admission's marginal value
+                // is cross-pass retention only — counting consumption diluted
+                // the governor's waste ratio and held the clamp open under
+                // beyond-budget stream loops (the 4 GB/s ledger-pollution
+                // face; scan resistance broken for co-tenants).
+                state
+                    .served_bytes
+                    .fetch_add(served_bytes, Ordering::Relaxed);
+            }
+            if promote {
+                // Sticky promotion (§5.4): a block-level re-access marks the
+                // entry worth keeping — never cleared by the clock scan.
+                state.protected.store(true, Ordering::Relaxed);
+            }
+            // Non-promoting gets (stream sub-read CONSUMPTION, the R1b row-2
+            // measured correction): the entry still earns its clock second
+            // chance for the pass, but consuming a fill's own sub-ranges is
+            // not evidence it will ever be needed again — promotion here
+            // re-taxed streams through protected-victim dehydration and
+            // parked gigabytes in the eviction channel (the PR 4 bench OOM).
+            value.clone()
+        })
     }
 
     fn put(

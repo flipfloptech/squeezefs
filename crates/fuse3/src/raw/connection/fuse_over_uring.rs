@@ -4761,6 +4761,11 @@ fn queue_worker(
     let mut batch = SubmitBatch::default();
     // Row 7: sticky across passes — see the re-arm site below.
     let mut need_repoll_sticky = false;
+    // Mid-pass-reaped CQEs the narrow bridge arm does NOT resolve —
+    // handed to the pass-bottom machinery verbatim, ahead of the
+    // post-wait CQ drain (arrival order preserved). Hoisted so passes
+    // reuse the allocation.
+    let mut deferred_cqes: Vec<(u64, i32, u32)> = Vec::new();
 
     while pool.active.load(Ordering::Relaxed) {
         // Drain the eventfd FIRST. The wake-fd PollAdd re-arm is deferred to
@@ -4786,27 +4791,133 @@ fn queue_worker(
         // evidence in the model docs).
         wake_coalescer.disarm();
 
-        // Fused-lane drain (zc-write-fusion): poll every READY fused
-        // WRITE handler future on THIS thread — a producer-observable
-        // state scanned after the disarm (the wake_core law), and BEFORE
-        // the commit drain so a poll's WorkerMsg sends (ZcStore /
-        // ZcExtract / the reply Commit) are picked up by the SAME pass.
-        // Each poll's inline work is bounded by the fusion ceiling; a
-        // future that parks on FS state parks in the slab, never here.
-        if fused_lane.len() > 0 {
-            if let Some(d) = pool.fused_dispatch.get() {
-                fused_lane.drain(&d.handle);
-            }
+        // Fused-lane drain + WorkerMsg pump, INTERLEAVED (zc-write-fusion;
+        // DMA-overlap fix 2026-08-11): the retired shape polled EVERY
+        // ready fused handler first and converted their WorkerMsgs to
+        // SQEs after, so a pass's bridge DMAs all launched at the
+        // pass-bottom enter — serially AFTER the pass's handler CPU. On
+        // the 32-CPU fabric rig that self-clocked loop capped rand-4k at
+        // ~7.5 ops/pass × 32 queues / ~600 µs ≈ 420k IOPS with devices
+        // busy ~50 µs of each pass (avg in-flight ≈ 21 — an emergent
+        // equilibrium, not a budget). The driver below alternates: pump
+        // every pending WorkerMsg into SQEs, EAGER-flush the ring, THEN
+        // poll ONE fused handler — so each write's device DMA runs under
+        // the NEXT handler's CPU. No width constant anywhere: the
+        // overlap scales with the run queue and the queue count (=
+        // possible CPUs).
+        //
+        // §5.4 re-arm gate unchanged: a COMMIT_AND_FETCH both writes the
+        // reply into the ent payload and re-arms the registered buffers
+        // for the kernel — never legal while a payload lease is live.
+        // Gate every commit; park the message when leased and rely on
+        // the lease drop's eventfd wake.
+        let mut fused_more = fused_lane.len() > 0;
+        macro_rules! next_wmsg {
+            () => {{
+                let mut got: Option<WorkerMsg> = None;
+                loop {
+                    if let Ok(m) = commit_rx.try_recv() {
+                        got = Some(m);
+                        break;
+                    }
+                    if !fused_more {
+                        break;
+                    }
+                    // Launch the PREVIOUS poll's SQEs before burning the
+                    // next poll's CPU (an error here is deferred to the
+                    // pass-bottom enter, which owns the disconnect
+                    // handling for this ring).
+                    if batch.pending > 0 {
+                        if let Err(e) = flush_submit(&mut ring, &mut batch) {
+                            warn!(
+                                "fuse-over-uring qids={qids:?}: eager bridge flush \
+                                 failed ({e}); deferring to the pass-bottom submit"
+                            );
+                            fused_more = false;
+                            continue;
+                        }
+                    }
+                    // Mid-pass reap: resolve finished HANDLER bridges NOW
+                    // (raw `done.send` + deadline clear — byte-identical
+                    // to `zc_fetch_complete`'s arm for these two pends),
+                    // so their tasks re-poll AND COMMIT in this same
+                    // pass; every other completion class defers verbatim
+                    // to the pass-bottom machinery, same-pass, later
+                    // point.
+                    {
+                        let mut cq = ring.completion();
+                        cq.sync();
+                        let dropped = cq_drops.observe(cq.overflow());
+                        if dropped > 0 {
+                            error!(
+                                "fuse-over-uring qids={qids:?}: kernel DROPPED {dropped} \
+                                 completion(s) (CQ overflow, nodrop={}) — the ents they \
+                                 belonged to are stalled; transport_cq_overflows",
+                                cq_drops.nodrop()
+                            );
+                        }
+                        for c in cq {
+                            let (user_data, res, flags) = (c.user_data(), c.result(), c.flags());
+                            let Some((op, gent)) = decode_user_data(user_data) else {
+                                // wake-fd poll completed — re-arm later.
+                                need_repoll_sticky = true;
+                                continue;
+                            };
+                            let deferrable = op != RingOp::Fetch
+                                || gent >= members.len() * depth
+                                || !matches!(
+                                    members[gent / depth].zc_pend[gent % depth],
+                                    Some(ZcPend::HandlerFetch { .. })
+                                        | Some(ZcPend::HandlerStore { .. })
+                                );
+                            if deferrable {
+                                deferred_cqes.push((user_data, res, flags));
+                                continue;
+                            }
+                            let (mi, ent_idx) = (gent / depth, gent % depth);
+                            let m = &mut members[mi];
+                            // TEST SEAM (zc-bridge-cqe-wedge): same
+                            // consume-and-drop as the pass-bottom check —
+                            // consulted here ONLY for the class this arm
+                            // resolves, so the seam budget is popped once
+                            // per CQE.
+                            if matches!(m.zc_pend[ent_idx], Some(ZcPend::HandlerStore { .. }))
+                                && test_drop_write_cqe()
+                            {
+                                error!(
+                                    "fuse-over-uring qid={} ent={ent_idx}: TEST SEAM dropping \
+                                     WRITE-class bridge CQE (res={res}) — pend stays live",
+                                    m.qid
+                                );
+                                continue;
+                            }
+                            match m.zc_pend[ent_idx].take() {
+                                Some(ZcPend::HandlerFetch { done })
+                                | Some(ZcPend::HandlerStore { done }) => {
+                                    let _ = done.send(res);
+                                }
+                                other => {
+                                    // Checked two branches up; keep the
+                                    // pend intact rather than lose it.
+                                    m.zc_pend[ent_idx] = other;
+                                    deferred_cqes.push((user_data, res, flags));
+                                    continue;
+                                }
+                            }
+                            if m.bridge_deadlines.clear(ent_idx) {
+                                pool.zc_bridge_pends.fetch_sub(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    fused_more = match pool.fused_dispatch.get() {
+                        Some(d) => fused_lane.drain_one(&d.handle),
+                        None => false,
+                    };
+                }
+                got
+            }};
         }
-
-        // Drain commits for EVERY member queue of this group (lever 2:
-        // one pass drains the group's aggregate — the per-op wake+enter
-        // pair amortizes over it). §5.4 re-arm gate: a COMMIT_AND_FETCH
-        // both writes the reply into the ent payload and re-arms the
-        // registered buffers for the kernel — never legal while a payload
-        // lease is live. Gate every commit; park the message when leased
-        // and rely on the lease drop's eventfd wake.
-        while let Ok(wmsg) = commit_rx.try_recv() {
+        while let Some(wmsg) = next_wmsg!() {
             let msg = match wmsg {
                 WorkerMsg::Commit(msg) => msg,
                 WorkerMsg::ZcFetch(f) => {
@@ -5187,24 +5298,49 @@ fn queue_worker(
         // its retry waits for an unrelated CQE that may never arrive.
         // Bound the wait by the nearest retry deadline (and only then;
         // the steady-state path keeps today's plain `submit_and_wait`).
+        // Row 7, mid-pass face: the interleave's reap may have consumed
+        // the wake-fd poll CQE — re-arm BEFORE this pass's park, or an
+        // eventfd wake (lease drop, commit send, a foreign-thread waker)
+        // lands on an unarmed poll and strands until an unrelated CQE.
+        // The PollAdd is level-triggered, so a wake that already raised
+        // the counter completes the re-armed poll immediately; the
+        // pass-bottom re-arm site stays for CQEs its own drain consumes.
+        if need_repoll_sticky {
+            match push_poll_batched(&mut ring, &mut batch) {
+                Ok(()) => need_repoll_sticky = false,
+                Err(e) => warn!(
+                    "fuse-over-uring qids={qids:?}: pre-wait wake-poll re-arm push \
+                     failed ({e}); retrying next pass"
+                ),
+            }
+        }
         let next_retry = members
             .iter()
             .filter_map(|m| m.slots.next_retry_deadline())
             .min();
-        let wait_result = match next_retry {
-            Some(deadline) => {
-                let left = deadline.saturating_duration_since(Instant::now());
-                let ts = types::Timespec::new()
-                    .sec(left.as_secs())
-                    .nsec(left.subsec_nanos());
-                let args = types::SubmitArgs::new().timespec(&ts);
-                match ring.submitter().submit_with_args(1, &args) {
-                    // A timed-out wait is the retry tick, not an error.
-                    Err(e) if e.raw_os_error() == Some(libc::ETIME) => Ok(0),
-                    other => other,
+        let wait_result = if !deferred_cqes.is_empty() {
+            // The mid-pass reap consumed completions it deferred to THIS
+            // pass bottom — parking here would sleep over work already
+            // in hand (a REGISTER/COMMIT completion nothing else will
+            // ever re-signal: the drained-then-park wedge). Flush any
+            // pending SQEs non-blocking and fall through to process.
+            ring.submit()
+        } else {
+            match next_retry {
+                Some(deadline) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    let ts = types::Timespec::new()
+                        .sec(left.as_secs())
+                        .nsec(left.subsec_nanos());
+                    let args = types::SubmitArgs::new().timespec(&ts);
+                    match ring.submitter().submit_with_args(1, &args) {
+                        // A timed-out wait is the retry tick, not an error.
+                        Err(e) if e.raw_os_error() == Some(libc::ETIME) => Ok(0),
+                        other => other,
+                    }
                 }
+                None => ring.submit_and_wait(1),
             }
-            None => ring.submit_and_wait(1),
         };
         match wait_result {
             Ok(_) => {}
@@ -5239,7 +5375,12 @@ fn queue_worker(
                     cq_drops.nodrop()
                 );
             }
-            cq.map(|c| (c.user_data(), c.result(), c.flags())).collect()
+            // Mid-pass-deferred CQEs first (they ARRIVED first), then the
+            // post-wait drain.
+            deferred_cqes
+                .drain(..)
+                .chain(cq.map(|c| (c.user_data(), c.result(), c.flags())))
+                .collect()
         };
 
         // Reclaim list — group-local ent ids (member recovered by

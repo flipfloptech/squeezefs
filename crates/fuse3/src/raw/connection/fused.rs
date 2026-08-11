@@ -190,30 +190,27 @@ impl FusedLane {
         true
     }
 
-    /// One drain pass: poll every task the run queue names, bounded by
-    /// the queue's CURRENT population (wakes produced by these polls are
-    /// consumed by the NEXT pass — the coalescer's eventfd keeps the
-    /// worker from parking over them). Runs inside `handle.enter()` so
-    /// handler futures may use tokio timers/spawns.
+    /// Poll exactly ONE ready task (the pass-interleave primitive —
+    /// 2026-08-11 write-DMA-overlap fix): the worker alternates one
+    /// handler poll with one WorkerMsg drain + eager ring submit, so a
+    /// write's device DMA launches while the NEXT handler's CPU runs
+    /// instead of after ALL of them (the serial pass shape left devices
+    /// busy ~50 µs of every ~600 µs pass — the measured ~21-in-flight
+    /// equilibrium on the 32-CPU rig; nothing here is a width constant,
+    /// the overlap scales with whatever the run queue holds). Runs
+    /// inside `handle.enter()` so handler futures may use tokio
+    /// timers/spawns.
     ///
-    /// Returns the number of polls performed.
-    pub(crate) fn drain(&mut self, handle: &tokio::runtime::Handle) -> usize {
-        let budget = {
-            self.rq
-                .ready
-                .lock()
-                .expect("fused run queue poisoned-free")
-                .len()
-        };
-        if budget == 0 {
-            return 0;
-        }
-        let _rt = handle.enter();
-        let mut polls = 0;
-        for _ in 0..budget {
-            let Some(id) = self.rq.pop() else { break };
+    /// Returns `false` when the run queue named nothing pollable.
+    pub(crate) fn drain_one(&mut self, handle: &tokio::runtime::Handle) -> bool {
+        loop {
+            let Some(id) = self.rq.pop() else {
+                return false;
+            };
             let Some(task) = self.tasks.get_mut(id) else {
-                // Stale wake for a completed/recycled slot — legal.
+                // Stale wake for a completed/recycled slot — legal;
+                // keep looking for a live one so a stale burst cannot
+                // starve the interleave of its poll.
                 continue;
             };
             let waker = std::task::Waker::from(Arc::new(FusedWaker {
@@ -221,7 +218,7 @@ impl FusedLane {
                 rq: Arc::clone(&self.rq),
             }));
             let mut cx = Context::from_waker(&waker);
-            polls += 1;
+            let _rt = handle.enter();
             match std::panic::catch_unwind(AssertUnwindSafe(|| task.fut.as_mut().poll(&mut cx))) {
                 Ok(Poll::Ready(())) => {
                     self.tasks.remove(id);
@@ -242,6 +239,35 @@ impl FusedLane {
                     );
                 }
             }
+            return true;
+        }
+    }
+
+    /// Drain every task the run queue names, bounded by the population
+    /// at entry (wakes produced by these polls are consumed by the NEXT
+    /// pass — the coalescer's eventfd keeps the worker from parking over
+    /// them). One [`Self::drain_one`] per ready task; the production
+    /// worker interleaves `drain_one` with its message pump + eager ring
+    /// flush instead (the DMA-overlap shape), so this whole-queue form
+    /// survives only as the contract tests' harness (`#[cfg(test)]` —
+    /// the no-dead-code law's cfg-completeness exception).
+    ///
+    /// Returns the number of polls performed.
+    #[cfg(test)]
+    pub(crate) fn drain(&mut self, handle: &tokio::runtime::Handle) -> usize {
+        let budget = {
+            self.rq
+                .ready
+                .lock()
+                .expect("fused run queue poisoned-free")
+                .len()
+        };
+        let mut polls = 0;
+        for _ in 0..budget {
+            if !self.drain_one(handle) {
+                break;
+            }
+            polls += 1;
         }
         polls
     }

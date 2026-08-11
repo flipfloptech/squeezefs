@@ -1145,11 +1145,53 @@ fn bench_op_registry(c: &mut Criterion) {
     group.finish();
 }
 
+/// Memory-tier contended GET (write-IOPS campaign 2026-08-11): the FIELD
+/// shape is 32 handler lanes probing/serving the same ~32-file hot key
+/// population per op — with `get_sync` (exclusive bucket lock) the gets
+/// excluded each other (20.1 % of il lane cycles in
+/// `bucket::Writer::lock_sync_wait`). The row pins the reader-class get:
+/// 8 threads × 4k gets over 32 hot keys on ONE LruCache.
+fn bench_tier_get_contended(c: &mut Criterion) {
+    use squeezefs::cache::lru::LruCache;
+
+    const THREADS: usize = 8;
+    const OPS: usize = 4_096;
+
+    let cache = Arc::new(LruCache::with_capacity(64 * 1024 * 1024));
+    let keys: Vec<String> = (0..32).map(|i| format!("blocks/vol-bench/{i}")).collect();
+    for k in &keys {
+        cache.put(k, bytes::Bytes::from(vec![7u8; 4096]));
+    }
+
+    let mut group = c.benchmark_group("tier_get");
+    group.throughput(criterion::Throughput::Elements((THREADS * OPS) as u64));
+    group.bench_function("contended_hot32_8t", |b| {
+        b.iter(|| {
+            let mut hs = Vec::with_capacity(THREADS);
+            for t in 0..THREADS {
+                let cache = Arc::clone(&cache);
+                let keys = keys.clone();
+                hs.push(std::thread::spawn(move || {
+                    for i in 0..OPS {
+                        let k = &keys[(t + i) % keys.len()];
+                        black_box(cache.get(k));
+                    }
+                }));
+            }
+            for h in hs {
+                h.join().unwrap();
+            }
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_reclaim_enqueue,
     bench_sharded_counters,
     bench_op_registry,
+    bench_tier_get_contended,
     bench_high_concurrency,
     bench_cluster_dlm,
     bench_s9_custody,

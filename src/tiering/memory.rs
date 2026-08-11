@@ -78,6 +78,13 @@ struct MemoryCacheShard {
     eviction_queue: crossbeam::queue::SegQueue<Bytes>,
     eviction_lock: parking_lot::Mutex<()>,
     current_bytes: AtomicUsize,
+    /// Live ENTRY count (write-IOPS economy, 2026-08-11): maintained at
+    /// insert/remove/evict so (a) `MemoryCache::is_empty` is O(shards) —
+    /// the `parked_overlay_count` law: per-op invalidations of a tier
+    /// nothing populated must cost loads, not hashes+bucket locks — and
+    /// (b) the RES-10 reclaim gate stops paying `scc::HashMap::len()`
+    /// (an O(buckets) SCAN) on every removal.
+    entries: AtomicUsize,
     max_bytes: usize,
 }
 
@@ -88,6 +95,7 @@ impl MemoryCacheShard {
             eviction_queue: crossbeam::queue::SegQueue::new(),
             eviction_lock: parking_lot::Mutex::new(()),
             current_bytes: AtomicUsize::new(0),
+            entries: AtomicUsize::new(0),
             max_bytes,
         }
     }
@@ -164,6 +172,7 @@ impl MemoryCacheShard {
             .or_insert_with(|| {
                 self.eviction_queue.push(key.clone());
                 self.current_bytes.fetch_add(val_len, Ordering::Relaxed);
+                self.entries.fetch_add(1, Ordering::Relaxed);
                 (
                     value,
                     EntryState {
@@ -210,6 +219,7 @@ impl MemoryCacheShard {
                 {
                     let (value, state) = entry.remove();
                     self.current_bytes.fetch_sub(value.len(), Ordering::Relaxed);
+                    self.entries.fetch_sub(1, Ordering::Relaxed);
                     let class = if state.protected.load(Ordering::Relaxed) {
                         EvictClass::Protected {
                             served_bytes: state.served_bytes.load(Ordering::Relaxed),
@@ -255,6 +265,7 @@ impl MemoryCacheShard {
                                 // caller) immediately — no epoch-deferred
                                 // multi-MiB garbage under churn.
                                 let (value, state) = entry.remove();
+                                self.entries.fetch_sub(1, Ordering::Relaxed);
                                 should_evict = true;
                                 len = value.len();
                                 // The STICKY bit classifies the victim —
@@ -291,12 +302,27 @@ impl MemoryCacheShard {
     }
 
     fn remove(&self, key: &[u8]) -> Option<Bytes> {
-        let entry = self.map.entry_sync(Bytes::copy_from_slice(key));
-        let out = match entry {
+        // Write-IOPS economy (2026-08-11): the common invalidation is of
+        // an ABSENT key (every W1 patch purges tiers the write path never
+        // populated). The retired shape paid a heap `Bytes` mint + a
+        // bucket WRITER lock + the RES-10 gate's O(buckets) `map.len()`
+        // scan per absent remove — pure ceremony at 400k+ patches/s.
+        // Absent key: one borrowed reader-lock probe
+        // (`Bytes: Borrow<[u8]>`), no alloc. The probe consults the MAP
+        // itself — deliberately never the `entries` gauge, whose relaxed
+        // staleness could skip a purge of a just-inserted key (the R-6
+        // stale-serve class). The probe→remove race is the same window
+        // today's remove→concurrent-insert has (the fill-incarnation/
+        // rebind ladder owns it either way).
+        if !self.map.contains_sync(key) {
+            return None;
+        }
+        let out = match self.map.entry_sync(Bytes::copy_from_slice(key)) {
             scc::hash_map::Entry::Occupied(entry) => {
                 let (val, _) = entry.remove();
                 let len = val.len();
                 self.current_bytes.fetch_sub(len, Ordering::Relaxed);
+                self.entries.fetch_sub(1, Ordering::Relaxed);
                 Some(val)
             }
             scc::hash_map::Entry::Vacant(_) => None,
@@ -325,7 +351,9 @@ impl MemoryCacheShard {
     /// during one pass, whose cost is one refill, never correctness.
     fn reclaim_eviction_queue(&self) {
         let nodes = self.eviction_queue.len();
-        if nodes <= self.map.len() * 2 + EVICTION_QUEUE_RECLAIM_SLACK {
+        // The live count rides the shard's own entry gauge — the retired
+        // `scc::HashMap::len()` here was an O(buckets) scan per removal.
+        if nodes <= self.entries.load(Ordering::Relaxed) * 2 + EVICTION_QUEUE_RECLAIM_SLACK {
             return;
         }
         let Some(_guard) = self.eviction_lock.try_lock() else {
@@ -494,6 +522,22 @@ impl MemoryCache {
             shard.shed_to(per_shard, &mut evicted);
         }
         evicted
+    }
+
+    /// Live entry count across shards (O(shards) loads — the per-shard
+    /// gauge the probe-first `remove` fast path rides).
+    pub fn len(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|s| s.entries.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// O(shards) emptiness (the `parked_overlay_count` law).
+    pub fn is_empty(&self) -> bool {
+        self.shards
+            .iter()
+            .all(|s| s.entries.load(Ordering::Relaxed) == 0)
     }
 
     /// Get current total memory usage in bytes.

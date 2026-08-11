@@ -124,6 +124,14 @@ pub struct GdsCache {
     #[cfg(all(feature = "gds", unix))]
     cufile_lib: Option<Arc<LibCuFile>>,
     pub force_available: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// True once ANY `.gds_cache` file was materialized this mount
+    /// (write-IOPS economy, 2026-08-11): the per-op purge fires an
+    /// `unlink(2)` + two path allocations per block invalidation, and on
+    /// the (default) GDS-idle mount every one is ENOENT ceremony. Within
+    /// a mount every producer sets this before its file exists, so a
+    /// false-`false` skip is unrepresentable; cross-mount staleness is
+    /// owned by `wipe_gds_cache_files` exactly as before.
+    materialized: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl GdsCache {
@@ -165,6 +173,7 @@ impl GdsCache {
                 staging_dirs,
                 cufile_lib,
                 force_available: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                materialized: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
         }
 
@@ -179,11 +188,20 @@ impl GdsCache {
                 gpu_detected,
                 staging_dirs,
                 force_available: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                materialized: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
         }
     }
 
     /// Check if GPU Direct Storage is available.
+    /// Arm the purge gate: a producer OUTSIDE this module (the routing
+    /// prefetch arm) is about to materialize a `.gds_cache` file. Must be
+    /// called BEFORE the file exists (the gate's ordering law).
+    pub fn note_materialized(&self) {
+        self.materialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn is_available(&self) -> bool {
         if self
             .force_available
@@ -243,6 +261,11 @@ impl GdsCache {
             if !local_path.exists() {
                 // Fetch the block using the router (handles decompression, decryption, and caching layers)
                 let data = router.get_cached_or_fetch_block(object_key).await?;
+                // The purge gate arms BEFORE the file exists (see
+                // `materialized`), so a concurrent invalidation can
+                // never skip a file this write is about to create.
+                self.materialized
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 // P2-8: GDS local cache materialization via process io_uring file worker.
                 crate::uring_fs::write_all(&local_path, data.to_vec()).await?;
             }
@@ -323,6 +346,11 @@ impl GdsCache {
     /// keys never had a GDS copy). Complete by construction: every
     /// producer builds its name through `get_gds_path` (PR 3 unification).
     pub fn remove_cached(&self, object_key: &str) {
+        // GDS-idle mounts (the default fleet) skip the per-invalidation
+        // path mint + unlink ceremony entirely — see `materialized`.
+        if !self.materialized.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         if let Some(path) = self.get_gds_path(object_key) {
             match std::fs::remove_file(&path) {
                 Ok(()) => {}

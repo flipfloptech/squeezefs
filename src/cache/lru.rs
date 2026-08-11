@@ -378,6 +378,17 @@ impl LruCache {
         self.inner.current_bytes() as u64
     }
 
+    /// Live entry count (the per-shard gauge; drift-pinned by
+    /// `tests/memory_shard_tombstone_tests.rs`).
+    pub fn inner_len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// O(shards) emptiness over the entry gauge.
+    pub fn inner_is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
     pub fn max_bytes(&self) -> u64 {
         self.max_bytes
     }

@@ -498,6 +498,17 @@ impl ReadLaneHold {
 
     /// Exactly-once gauge accounting: the scc removal winner subtracts.
     fn remove_entry(&self, block_key: &str) -> bool {
+        // Write-IOPS economy (2026-08-11): the R-6 unified purge calls
+        // this per invalidated block, and on write-heavy shapes the key
+        // is absent — a reader-lock `contains` probe instead of a
+        // bucket-WRITER lock per absent key. (Deliberately NOT gated on
+        // the `live` gauge: it is saturating/best-effort, and a stale 0
+        // skipping a mandatory purge is the R-6 stale-serve class.) The
+        // probe→remove race window equals today's remove→insert one (the
+        // hold's seq/retire protocol owns it either way).
+        if !self.entries.contains_sync(block_key) {
+            return false;
+        }
         if let Some((_, e)) = self.entries.remove_sync(block_key) {
             self.bytes
                 .fetch_sub(e.bytes.len() as u64, Ordering::Relaxed);

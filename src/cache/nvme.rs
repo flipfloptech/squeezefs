@@ -1614,7 +1614,7 @@ impl NvmeStaging {
             if cur_gen != gen {
                 return false;
             }
-            if self.staging_nvme_cache.remove(&key_bytes).is_some() {
+            if self.staging_nvme_cache.remove(&key_bytes[..]).is_some() {
                 let prev = self
                     .staged_writes_in_flight
                     .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -1871,8 +1871,7 @@ impl NvmeStaging {
     /// Remove a packed active block write from staging_nvme_cache.
     pub fn remove_active_block(&self, key: &str) -> Option<Vec<u8>> {
         let val = self.read_staged(key);
-        let key_bytes = Bytes::copy_from_slice(key.as_bytes());
-        if self.staging_nvme_cache.remove(&key_bytes).is_some() {
+        if self.staging_nvme_cache.remove(key.as_bytes()).is_some() {
             let prev = self
                 .staged_writes_in_flight
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -2287,8 +2286,7 @@ impl NvmeStaging {
     /// allocation of that offset reuses the same key string and must never be
     /// served this incarnation's bytes.
     pub fn remove_cached_read_block(&self, block_key: &str) {
-        let key_bytes = Bytes::copy_from_slice(block_key.as_bytes());
-        let _ = self.read_nvme_cache.remove(&key_bytes);
+        let _ = self.read_nvme_cache.remove(block_key.as_bytes());
     }
 
     pub fn get_cached_read_block(&self, block_key: &str) -> Option<Vec<u8>> {

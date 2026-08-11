@@ -986,7 +986,15 @@ impl NvmeShard {
         true
     }
 
-    pub fn remove(&self, key: &Bytes) -> Option<Bytes> {
+    pub fn remove(&self, key: &[u8]) -> Option<Bytes> {
+        // Write-IOPS economy (2026-08-11): per-op purges of ABSENT keys
+        // (every W1 patch purges the read tier) probe under the SHARED
+        // lock and touch the write lock only on a hit — the probe→remove
+        // race window is the same one today's remove→concurrent-insert
+        // has (owned by the fill-incarnation/rebind ladder either way).
+        if !self.inner.read().map.contains_key(key) {
+            return None;
+        }
         let mut inner = self.inner.write();
         if let Some(meta) = inner.map.remove(key) {
             // Read value before invalidating
@@ -1460,8 +1468,9 @@ impl NvmeCache {
     /// Remove `key` from EVERY device (pre-affinity rings can hold
     /// duplicates; a purge must not leave a stale survivor). Returns the
     /// most recent value found, favoring later devices only after earlier
-    /// ones are cleared.
-    pub fn remove(&self, key: &Bytes) -> Option<Bytes> {
+    /// ones are cleared. Borrowed key (`&[u8]`): the per-op purge path
+    /// must not mint a heap `Bytes` to ask about an absent entry.
+    pub fn remove(&self, key: &[u8]) -> Option<Bytes> {
         let devices = self.devices.read();
         let mut removed = None;
         for dev in devices.iter() {

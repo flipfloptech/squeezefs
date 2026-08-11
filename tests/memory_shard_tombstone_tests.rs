@@ -162,3 +162,59 @@ fn tombstone_reclamation_preserves_live_entries_and_eviction_order() {
         max_bytes
     );
 }
+
+// ---------------------------------------------------------------------------
+// Write-IOPS economy (2026-08-11): the per-shard entry gauge + the
+// probe-first absent-remove fast path.
+// ---------------------------------------------------------------------------
+
+/// The entry gauge is maintained at EVERY population-changing site
+/// (insert / remove / clock evict / shed) — the RES-10 reclaim gate and
+/// `is_empty` ride it, so drift is red. Absent removes (the W1 patch's
+/// per-op tier purges) stay correct: None on absent, value on present,
+/// and a present key inserted after a long absent-remove storm is still
+/// removable (the probe path never poisons the map).
+#[test]
+fn entry_gauge_tracks_every_population_change_and_absent_removes_are_correct() {
+    let cache = LruCache::with_capacity(1 << 30);
+    let payload = Bytes::from(vec![7u8; VAL]);
+    assert!(cache.inner_is_empty(), "fresh cache is empty");
+
+    // Absent-remove storm on an EMPTY cache (the write-only shape).
+    for i in 0..10_000 {
+        cache.remove(&format!("absent{i}"));
+    }
+    assert!(cache.inner_is_empty(), "absent removes change nothing");
+    assert_eq!(cache.inner_len(), 0);
+
+    // Populate, then interleave absent + present removes.
+    for i in 0..64 {
+        cache.put(&format!("k{i}"), payload.clone());
+    }
+    assert_eq!(cache.inner_len(), 64, "64 live entries");
+    assert!(!cache.inner_is_empty());
+    for i in 0..64 {
+        cache.remove(&format!("absent{i}"));
+    }
+    assert_eq!(
+        cache.inner_len(),
+        64,
+        "absent removes do not drift the gauge"
+    );
+    for i in 0..32 {
+        cache.remove(&format!("k{i}"));
+    }
+    assert_eq!(cache.inner_len(), 32, "present removes decrement exactly");
+    // Re-insert after removal: still insertable + removable (the probe
+    // path never leaves tombstone state behind).
+    cache.put("k0", payload.clone());
+    assert_eq!(cache.inner_len(), 33);
+    assert!(cache.get("k0").is_some(), "re-inserted key serves");
+    cache.remove("k0");
+    assert_eq!(cache.inner_len(), 32);
+
+    // Shed to zero: the gauge follows forced eviction too.
+    cache.shed_to(0);
+    assert_eq!(cache.inner_len(), 0, "shed drains the gauge with the map");
+    assert!(cache.inner_is_empty());
+}

@@ -7681,6 +7681,9 @@ impl DataRouter {
                     if !local_path.exists() {
                         debug!("Prefetch (GDS): scheduling download for block {key}");
                         if let Ok(downloaded) = router.fetch_block_from_remote(&key).await {
+                            // Arm the purge gate BEFORE the file exists
+                            // (GdsCache::materialized ordering law).
+                            router.cache.gds.note_materialized();
                             // P2-8: path-based cache write via the process
                             // io_uring file worker.
                             if let Err(e) =

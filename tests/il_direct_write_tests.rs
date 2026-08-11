@@ -194,8 +194,11 @@ impl SessionSink for InoMapSink {
 
 fn test_geometry() -> Geometry {
     Geometry {
-        ring_entries: 16,
-        slots: 16,
+        // 64 slots/entries: the block-conveyor train-bound rail packs one
+        // leader + 33 followers in flight at once (bound = one ring
+        // depth's worth = 32); the pre-conveyor suites use slot 0 only.
+        ring_entries: 64,
+        slots: 64,
         arena_bytes: 2 * 1024 * 1024,
         max_op_bytes: 128 * 1024,
         _pad: 0,
@@ -470,6 +473,48 @@ impl ClientSession {
         };
     }
 
+    /// Stage + submit one pwrite on `slot_idx` WITHOUT waiting (the
+    /// conveyor rails submit trains of in-flight same-block ops): each
+    /// slot owns its private 4 KiB arena window (`slot_idx × 4096` —
+    /// page-aligned, so the direct-arena DMA leg stays engaged) and the
+    /// staged bytes must stay untouched until the op completes (the
+    /// arena is the DMA SOURCE). Returns the claim generation for
+    /// [`Self::wait_slot`].
+    fn stage_pwrite(&self, slot_idx: u32, binding: u64, offset: u64, data: &[u8]) -> u64 {
+        assert!(data.len() <= 4096, "conveyor-rail ops are 4 KiB class");
+        let arena_off = u64::from(slot_idx) * 4096;
+        self.arena_write(arena_off, data);
+        let slot = self.slot(slot_idx);
+        let gen = slot.core.try_claim().expect("slot must be FREE");
+        slot.publish_descriptor(&SlotDescriptor {
+            op: OP_WRITE,
+            flags: 0,
+            binding,
+            offset,
+            len: data.len() as u32,
+            arena_off,
+        });
+        slot.core.publish_submitted();
+        assert!(self.ring().push(slot_idx), "ring must accept");
+        self.header().doorbell.fetch_add(1, Ordering::Release);
+        futex_wake(&self.header().doorbell, 1);
+        gen
+    }
+
+    /// Bounded wait for `slot_idx`'s completion; returns the slot result
+    /// verbatim (bytes or -errno) and releases the slot.
+    fn wait_slot(&self, slot_idx: u32, gen: u64, what: &str) -> i64 {
+        let slot = self.slot(slot_idx);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !slot.core.is_done_for(gen) {
+            assert!(Instant::now() < deadline, "{what}: op never completed");
+            std::hint::spin_loop();
+        }
+        let r = slot.result();
+        slot.core.release();
+        r
+    }
+
     /// One ring pwrite on slot 0: arena stage → claim → publish → push →
     /// doorbell → bounded spin. Returns the slot result verbatim (bytes
     /// or -errno — the fence rail asserts the negative face).
@@ -541,6 +586,12 @@ struct Snap {
     ops_write: u64,
     bytes_in: u64,
     data_fence_refusals: u64,
+    /// Block-conveyor ledger (perf/ddw-block-conveyor): ops parked on an
+    /// open same-block train / parked ops popped back out (any
+    /// disposition). Closure law: `parks ≡ redrives` at quiesce — a
+    /// parked op whose train ends without a pop is a WEDGE.
+    dd_parks: u64,
+    dd_redrives: u64,
 }
 
 impl Snap {
@@ -577,6 +628,46 @@ fn snap() -> Snap {
         ops_write: l(&METRICS.ipc_ops_write),
         bytes_in: l(&METRICS.ipc_bytes_in),
         data_fence_refusals: l(&METRICS.data_dma_fence_refusals),
+        dd_parks: l(&METRICS.ipc_dd_write_block_parks),
+        dd_redrives: l(&METRICS.ipc_dd_write_park_redrives),
+    }
+}
+
+/// RAII over the conveyor rails' determinism seam
+/// (`ipc_direct::set_test_ddw_cqe_hold`): while held, the dd engine's CQE
+/// consumption pauses — the leader's guard tenure is pinned open so
+/// followers deterministically observe a lane-held block. Drop REOPENS
+/// the gate even on a panicking assertion, so a red run can never wedge
+/// the engine's shutdown drain behind a closed gate.
+struct CqeHold;
+
+impl CqeHold {
+    fn hold() -> CqeHold {
+        squeezefs::ipc_direct::set_test_ddw_cqe_hold(true);
+        CqeHold
+    }
+    fn release(self) {
+        drop(self);
+    }
+}
+
+impl Drop for CqeHold {
+    fn drop(&mut self) {
+        squeezefs::ipc_direct::set_test_ddw_cqe_hold(false);
+    }
+}
+
+/// Bounded counter wait (never a sleep-synchronized assertion): spin
+/// until `probe()` reaches `target` or the deadline names the failure.
+fn wait_counter_at_least(probe: &dyn Fn() -> u64, target: u64, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while probe() < target {
+        assert!(
+            Instant::now() < deadline,
+            "{what}: counter never reached {target} (now {})",
+            probe()
+        );
+        std::thread::yield_now();
     }
 }
 
@@ -925,6 +1016,12 @@ async fn contended_block_lock_counts_its_own_arm_and_demotes() {
             delta!(after, before, dd_block_lock),
             1,
             "a contended block lock counts exactly the block_lock arm"
+        );
+        assert_eq!(
+            delta!(after, before, dd_parks),
+            0,
+            "a NON-lane holder must never park a follower (the conveyor \
+             trains only behind the dd-write lane's own guard tenure)"
         );
         assert_eq!(
             delta!(after, before, dd_lease)
@@ -1345,5 +1442,280 @@ async fn lever_off_routes_every_write_to_the_handoff_path() {
     fx.purge_read_tiers(ino).await;
     let got = fx.fuse_read(ino, 0, (4 * BS) as u32).await;
     assert_eq!(got, want, "the A0 control stays byte-exact");
+    fx.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// The per-block follower conveyor (perf/ddw-block-conveyor): same-block
+// dd writes TRAIN on the guard holder instead of falling back to the
+// handler and then blocking on the same stripe anyway (the rig's 99.8%
+// block_lock attribution: 6.90M of 39.2M ops at qd32 same-block).
+// Determinism seam: `CqeHold` pins the leader's guard tenure open (the
+// engine's CQE consumption pauses), so followers observe a lane-held
+// block on every run — never a sleep-synchronized race.
+// ---------------------------------------------------------------------------
+
+/// Rail (1): two-plus eligible writes to the SAME block while the lane
+/// holds the guard — the followers PARK (never the block_lock fallback),
+/// the CQE postlude re-drives them under the already-held guard in FIFO
+/// order, every op direct-serves byte-exact, and the ledger closes:
+/// serves == ops, handoffs == 0, parks == redrives == followers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn same_block_followers_park_and_train_on_the_guard_holder() {
+    let fx = Fixture::new("ddwtrain").await;
+    fx.salt_inos(19).await;
+    let (ino, mut want) = fx.durable_striped("train.bin", 4, 0x60).await;
+    let dir = tempfile::tempdir().unwrap();
+    let fd = rw_standin(&fx, &dir, "standin.bin", ino);
+    let (session, binding) = ClientSession::establish(&fx, &fd);
+
+    tokio::task::block_in_place(|| {
+        warm_direct_lane(&session, binding, &mut want, &[BS + 16384, 3 * BS + 8192]);
+
+        // Pin the leader's tenure open, then submit leader + 3 followers
+        // to block 2 (scattered, pairwise non-adjacent in dequeue order).
+        let hold = CqeHold::hold();
+        let before = snap();
+        let writes: &[(u64, u8)] = &[
+            (2 * BS, 0xA1),
+            (2 * BS + 8192, 0xA2),
+            (2 * BS + 16384, 0xA3),
+            (2 * BS + 24576, 0xA4),
+        ];
+        let mut gens = Vec::new();
+        for (i, &(off, tag)) in writes.iter().enumerate() {
+            let p = pattern(4096, tag);
+            gens.push(session.stage_pwrite(i as u32, binding, off, &p));
+            want[off as usize..off as usize + 4096].copy_from_slice(&p);
+        }
+        // The followers must PARK while the leader's guard is pinned —
+        // the conveyor's whole contract (red pre-conveyor: this deadline
+        // fires, the ops fell back on the block_lock arm instead).
+        wait_counter_at_least(
+            &|| METRICS.ipc_dd_write_block_parks.load(Ordering::Relaxed),
+            before.dd_parks + 3,
+            "same-block followers never parked on the lane-held guard",
+        );
+        hold.release();
+        for (i, gen) in gens.iter().enumerate() {
+            let r = session.wait_slot(i as u32, *gen, "train op");
+            assert_eq!(r, 4096, "train op {i} must ack its full length");
+        }
+        let after = snap();
+
+        assert_eq!(
+            delta!(after, before, dd_serves),
+            writes.len() as u64,
+            "the whole train direct-serves (leader + re-driven followers)"
+        );
+        assert_eq!(
+            delta!(after, before, handoffs),
+            0,
+            "a trained same-block burst pays zero handler handoffs"
+        );
+        assert_eq!(
+            delta!(after, before, dd_block_lock),
+            0,
+            "lane-held contention parks — the block_lock arm stays for \
+             foreign holders only"
+        );
+        assert_eq!(delta!(after, before, dd_parks), 3, "three followers parked");
+        assert_eq!(
+            delta!(after, before, dd_redrives),
+            3,
+            "every parked follower was popped back out (closure: parks == \
+             redrives — a parked op left behind is a WEDGE)"
+        );
+        assert_eq!(
+            delta!(after, before, ops_write),
+            writes.len() as u64,
+            "engagement law: serves + handoffs accounts for the row"
+        );
+    });
+
+    // Byte parity through the kernel venue, device-honest.
+    fx.purge_read_tiers(ino).await;
+    let got = fx.fuse_read(ino, 2 * BS, BS as u32).await;
+    assert_eq!(
+        got,
+        want[(2 * BS) as usize..(3 * BS) as usize].to_vec(),
+        "trained writes stay byte-exact in FIFO order"
+    );
+    fx.shutdown();
+}
+
+/// Rail (2): the train BOUND (one ring depth's worth — Q_DEPTH_DESIRED
+/// = 32 ops per guard tenure, so a fold/flush waiter parks behind at
+/// most one train). Pack MORE followers than the bound: the queue caps
+/// at the bound (the overflow op falls back on the block_lock arm), the
+/// tenure closes at 32 served ops, residual followers re-drive through
+/// the normal probe from the reap thread — never dropped — and the
+/// ledger closes: parks == redrives, serves + handoffs == ops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn train_bound_closes_the_tenure_and_residuals_redrive() {
+    let fx = Fixture::new("ddwbound").await;
+    fx.salt_inos(21).await;
+    let (ino, mut want) = fx.durable_striped("bound.bin", 4, 0x70).await;
+    let dir = tempfile::tempdir().unwrap();
+    let fd = rw_standin(&fx, &dir, "standin.bin", ino);
+    let (session, binding) = ClientSession::establish(&fx, &fd);
+
+    tokio::task::block_in_place(|| {
+        warm_direct_lane(&session, binding, &mut want, &[2 * BS + 16384, 3 * BS + 8192]);
+
+        // 34 ops on block 1 = 1 leader + 32 parked (the queue cap) + 1
+        // overflow fallback. Alternating disjoint windows A/B keep every
+        // consecutive pair non-adjacent AND make the final content
+        // last-writer-per-window regardless of where the boundary ops
+        // (overflow / residual) execute relative to the train.
+        const OPS: u32 = 34;
+        let win_a = BS;
+        let win_b = BS + 8192;
+        let hold = CqeHold::hold();
+        let before = snap();
+        let mut gens = Vec::new();
+        for i in 0..OPS {
+            let off = if i % 2 == 0 { win_a } else { win_b };
+            let p = pattern(4096, 0x80 + i as u8);
+            gens.push(session.stage_pwrite(i, binding, off, &p));
+            want[off as usize..off as usize + 4096].copy_from_slice(&p);
+        }
+        wait_counter_at_least(
+            &|| METRICS.ipc_dd_write_block_parks.load(Ordering::Relaxed),
+            before.dd_parks + 32,
+            "the queue must park exactly one ring depth's worth",
+        );
+        hold.release();
+        for (i, gen) in gens.iter().enumerate() {
+            let r = session.wait_slot(i as u32, *gen, "bound op");
+            assert_eq!(r, 4096, "bound op {i} must ack its full length");
+        }
+        let after = snap();
+
+        assert_eq!(
+            delta!(after, before, dd_parks),
+            32,
+            "the park queue is bounded at one ring depth's worth"
+        );
+        assert_eq!(
+            delta!(after, before, dd_redrives),
+            32,
+            "every parked follower left the queue (closure: parks == \
+             redrives — residuals past the tenure bound re-drive, never \
+             strand)"
+        );
+        // The tenure bound guarantees at least the bound's worth of ops
+        // served under the train; the boundary ops (overflow + any
+        // residual that lost the post-release lock race to the queued
+        // handler waiter) legitimately land either way.
+        assert!(
+            delta!(after, before, dd_serves) >= 32,
+            "at least one full tenure's worth of ops direct-serves \
+             (got {})",
+            delta!(after, before, dd_serves)
+        );
+        assert_eq!(
+            delta!(after, before, dd_serves) + delta!(after, before, handoffs),
+            u64::from(OPS),
+            "ledger closure: every op is exactly one of served / handed off"
+        );
+        assert_eq!(
+            delta!(after, before, dd_block_lock),
+            delta!(after, before, handoffs),
+            "every handoff in this row is a block_lock-attributed fallback \
+             (overflow past the bounded queue, or a residual that lost the \
+             post-release lock race)"
+        );
+        assert_eq!(
+            delta!(after, before, ops_write),
+            u64::from(OPS),
+            "engagement law over the whole row"
+        );
+    });
+
+    fx.fsync(ino).await;
+    fx.purge_read_tiers(ino).await;
+    let got = fx.fuse_read(ino, BS, BS as u32).await;
+    assert_eq!(
+        got,
+        want[BS as usize..(2 * BS) as usize].to_vec(),
+        "last-writer-per-window content holds across the tenure boundary"
+    );
+    fx.shutdown();
+}
+
+/// Rail (4): park never strands — a teardown initiated while a follower
+/// is PARKED completes (or fails loudly with an errno) every parked op:
+/// the engine's shutdown drain processes the guard holder's CQE, the
+/// conveyor pops the follower, and the ledger closes (parks ==
+/// redrives). Silence — a completion that never lands — is the wedge
+/// this rail exists to make impossible (the queue-entry-co-owns-guards
+/// law's conveyor face).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn teardown_completes_parked_followers_never_silence() {
+    let fx = Fixture::new("ddwteardown").await;
+    fx.salt_inos(23).await;
+    let (ino, mut want) = fx.durable_striped("teardown.bin", 4, 0x90).await;
+    let dir = tempfile::tempdir().unwrap();
+    let fd = rw_standin(&fx, &dir, "standin.bin", ino);
+    let (session, binding) = ClientSession::establish(&fx, &fd);
+
+    tokio::task::block_in_place(|| {
+        warm_direct_lane(&session, binding, &mut want, &[BS + 16384, 2 * BS + 8192]);
+
+        let hold = CqeHold::hold();
+        let before = snap();
+        let p1 = pattern(4096, 0xB1);
+        let p2 = pattern(4096, 0xB2);
+        let g1 = session.stage_pwrite(0, binding, 3 * BS + 8192, &p1);
+        let g2 = session.stage_pwrite(1, binding, 3 * BS + 24576, &p2);
+        want[(3 * BS + 8192) as usize..(3 * BS + 8192) as usize + 4096].copy_from_slice(&p1);
+        want[(3 * BS + 24576) as usize..(3 * BS + 24576) as usize + 4096].copy_from_slice(&p2);
+        wait_counter_at_least(
+            &|| METRICS.ipc_dd_write_block_parks.load(Ordering::Relaxed),
+            before.dd_parks + 1,
+            "the follower never parked on the lane-held guard",
+        );
+
+        // Teardown WHILE the follower is parked: shutdown blocks on the
+        // engine's drain (the gate holds the leader's CQE), so the
+        // parked state provably overlaps the teardown.
+        let host = Arc::clone(&fx.host);
+        let shutdown = std::thread::spawn(move || host.shutdown());
+        // Race-widener only (assertions below are completion-based,
+        // never sleep-synchronized): let the shutdown reach its drain.
+        std::thread::sleep(Duration::from_millis(100));
+        hold.release();
+        shutdown
+            .join()
+            .expect("shutdown must complete once the drain runs");
+
+        // NEVER SILENCE: both ops complete — served through the drain
+        // (4096) or failed LOUD with an errno; a hang here is the wedge.
+        let r1 = session.wait_slot(0, g1, "teardown leader");
+        let r2 = session.wait_slot(1, g2, "teardown parked follower");
+        assert!(
+            r1 == 4096 || r1 < 0,
+            "leader must ack or fail loud, got {r1}"
+        );
+        assert!(
+            r2 == 4096 || r2 < 0,
+            "parked follower must ack or fail loud, got {r2}"
+        );
+
+        let after = snap();
+        assert_eq!(
+            delta!(after, before, dd_parks),
+            1,
+            "exactly the follower parked"
+        );
+        assert_eq!(
+            delta!(after, before, dd_redrives),
+            1,
+            "the parked follower was popped through the teardown (closure: \
+             parks == redrives — never stranded in the queue)"
+        );
+    });
+    // fx.shutdown() is idempotent with the raced teardown above.
     fx.shutdown();
 }

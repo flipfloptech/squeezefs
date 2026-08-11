@@ -5891,6 +5891,23 @@ pub struct Metrics {
     /// `align` = LBA-misaligned offset or length (v1 is aligned-only by
     /// the patch contract — only app-written sectors are ever rewritten).
     pub ipc_dd_write_ineligible_align: Align64<AtomicU64>,
+    /// Per-block follower conveyor (perf/ddw-block-conveyor — the rig's
+    /// 99.8% block_lock attribution: 6.90M of 39.2M ops were try_lock
+    /// losers that fell back to the handler and then blocked on the same
+    /// stripe anyway): a dd write whose block guard is held by THE LANE
+    /// ITSELF parks in the block's bounded FIFO instead of falling back;
+    /// the guard holder's CQE postlude re-drives it under the
+    /// already-held guard. `block_parks` = ops parked (the engagement
+    /// instrument — same-block qd collisions should run this ≈ the old
+    /// block_lock rate); foreign-holder contention keeps counting
+    /// `ipc_dd_write_ineligible_block_lock`.
+    pub ipc_dd_write_block_parks: Align64<AtomicU64>,
+    /// Parked ops popped BACK OUT of a block's FIFO, toward any
+    /// disposition (under-guard re-drive, post-release re-probe,
+    /// close-time handler fallback, teardown loud-fail). Closure law:
+    /// `block_parks ≡ park_redrives` at quiesce — a park the counter
+    /// pair cannot account for is a WEDGED op.
+    pub ipc_dd_write_park_redrives: Align64<AtomicU64>,
 }
 
 pub static METRICS: Lazy<Metrics> = Lazy::new(Metrics::default);
@@ -8993,6 +9010,10 @@ impl SqueezefsFilesystem {
                 "ipc_dd_write_ineligible_overlay": METRICS.ipc_dd_write_ineligible_overlay.load(Ordering::Relaxed),
                 "ipc_dd_write_ineligible_backend": METRICS.ipc_dd_write_ineligible_backend.load(Ordering::Relaxed),
                 "ipc_dd_write_ineligible_align": METRICS.ipc_dd_write_ineligible_align.load(Ordering::Relaxed),
+                // The per-block follower conveyor's ledger (closure law:
+                // parks ≡ redrives at quiesce — a residue is a wedge).
+                "ipc_dd_write_block_parks": METRICS.ipc_dd_write_block_parks.load(Ordering::Relaxed),
+                "ipc_dd_write_park_redrives": METRICS.ipc_dd_write_park_redrives.load(Ordering::Relaxed),
                 "write_lock_wait": METRICS.write_lock_wait.to_json(),
                 // design-write-inode-convoy §7: the candidate ledger,
                 // the admission posture, the KD-8 FINAL-scope ledger

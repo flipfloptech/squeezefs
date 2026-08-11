@@ -114,6 +114,23 @@ use std::sync::{Arc, Mutex};
 /// Reaper-wake sentinel (shutdown NOP) — never a slab index.
 const NOP_WAKE: u64 = u64::MAX;
 
+/// TEST SEAM (the block-conveyor rails' determinism gate — the
+/// `data_custody::test_clear_poison` precedent): while held, the engine's
+/// CQE consumption pauses (`drain_cq_locked` returns without touching the
+/// CQ — nothing is lost, the reaper's bounded 100 ms cadence resumes it),
+/// which pins a write leader's guard tenure open so same-block followers
+/// deterministically observe a lane-held block. One relaxed load per
+/// drain pass when idle; production never sets it.
+static TEST_DDW_CQE_HOLD: AtomicBool = AtomicBool::new(false);
+
+/// Arm/release the CQE-consumption hold (tests only — see
+/// [`TEST_DDW_CQE_HOLD`]). Callers own reopening it: the test suites wrap
+/// it in an RAII guard so a panicking assertion can never wedge the
+/// engine's shutdown drain behind a closed gate.
+pub fn set_test_ddw_cqe_hold(hold: bool) {
+    TEST_DDW_CQE_HOLD.store(hold, Ordering::SeqCst);
+}
+
 /// SQ/CQ entries PER SHARD. 512 in-flight direct reads ≫ any observed
 /// per-lane governed depth (t32qd32 offers ≤ 1024 across 8 service
 /// threads, and each service thread owns its own shard; SQ-full
@@ -1305,6 +1322,12 @@ impl DirectDriveEngine {
     /// pre-fusion design got from the dedicated reaper thread).
     /// Returns ops completed (NOP wakes excluded).
     fn drain_cq_locked(&self, idx: usize) -> usize {
+        // Conveyor-rail determinism seam: leave the CQ untouched while a
+        // test pins guard tenures open (the reaper's bounded wait resumes
+        // consumption when the gate reopens; nothing is lost).
+        if TEST_DDW_CQE_HOLD.load(Ordering::Relaxed) {
+            return 0;
+        }
         let shard = &self.shards[idx];
         // SAFETY: exactly one CQ accessor at a time — the caller holds
         // `cq_gate` (module docs; the fusion campaign's gate).

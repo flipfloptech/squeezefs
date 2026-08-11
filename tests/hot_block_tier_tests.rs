@@ -627,6 +627,11 @@ async fn purge_block_key_unlinks_gds_cache_including_prefixed_keys() {
             .gds
             .get_gds_path(key)
             .expect("staging dir present => gds path resolvable");
+        // This test IS a producer (it plants the file by hand), so it
+        // follows the producer law: arm the purge gate BEFORE the file
+        // exists (write-IOPS economy, 2026-08-11 — never-materialized
+        // mounts skip the per-op unlink ceremony entirely).
+        cache.gds.note_materialized();
         std::fs::write(&gds_path, b"stale gds payload").unwrap();
         assert!(gds_path.exists());
 

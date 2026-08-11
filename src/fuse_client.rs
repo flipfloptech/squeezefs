@@ -3402,10 +3402,12 @@ pub fn cached_range_fully_mapped(
 /// The `SQUEEZEFS_WRITE_SHARED` admission posture (registry entry in
 /// `src/env_knobs.rs`; ENG-10). PR 3: consulted at admission — the
 /// pre-lock probe may route a fully-mapped within-EOF striped overwrite
-/// onto the inode READ guard. Default OFF pending the campaign's gate
-/// 8.3c (the 2026-08-11 A-B-B-A: kern rand-4k wash, il −7..15 % — the
-/// convoy fell but the wall was co-limited; `=1` is the measurement
-/// A/B). Candidates are counted regardless of the posture.
+/// onto the inode READ guard. Default ON — the 2026-08-11 elision-era
+/// A-B-B-A (both orders, kern AND il): ON 523.3–523.4k / 529.6–530.3k
+/// vs OFF 489.4–490.1k / 491.3–492.0k, a +7–8 % order-independent win
+/// once the attr-bucket spin stopped masking it. `=0` is the
+/// measurement A/B (the `SQUEEZEFS_NT_COPY` pattern — never an
+/// operational escape). Candidates are counted regardless.
 pub fn write_shared_enabled() -> bool {
     // Test override first (the `set_device_overlay_for_tests` tri-state
     // pattern): suites pin the posture without env-order coupling.
@@ -3414,7 +3416,7 @@ pub fn write_shared_enabled() -> bool {
         2 => true,
         _ => {
             static MEMO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *MEMO.get_or_init(|| crate::env_knobs::bool_knob("SQUEEZEFS_WRITE_SHARED", false))
+            *MEMO.get_or_init(|| crate::env_knobs::bool_knob("SQUEEZEFS_WRITE_SHARED", true))
         }
     }
 }

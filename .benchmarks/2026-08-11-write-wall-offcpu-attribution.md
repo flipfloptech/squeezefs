@@ -212,3 +212,36 @@ board, in that order.
 | wqN A-close ×2 | 637,014 / 635,741 | 15.23 cores, 23.9 µs/op | bracket closed: WASH |
 
 Numbers stay internal until a release battery (standing rule).
+
+## Addendum 2 (2026-08-12): the split instrument landed — the wall is the reap cycle
+
+The `ipc_direct_phase_ns` family gained `sq_wait` (slab insert → the
+`io_uring_enter` that carried the SQE; stamped at the `pending_submits`
+claim under the shard state lock, ONE clock read per enter) and `device_cq`
+(that enter → CQE pop; `n(device_cq) ≡ n(inflight)` exactly, the unstamped
+racer class records full-span device_cq and no sq_wait — measured racer
+rate 133 of 14.16 M = 0.001 %). Contract test:
+`direct_drive_inflight_splits_into_sq_wait_and_device_cq` (red-first).
+
+First decomposed rows (engaged, posture verified, 636–641 k @ 1.57 ms —
+the evening band): `admit` 31–35 µs, **`sq_wait` 78–86 µs**, **`device_cq`
+877–964 µs**, `finish` 5 µs. Same-row kernel `submit→complete`
+(tracepoints, dd rings): 209 µs mean. Therefore **CQE-posted → popped
+≈ 670 µs — two thirds of the daemon residence** — and the population
+arithmetic corroborates: 542 k/s × 877 µs ≈ 475 ops resident in device_cq
+vs ~113 inside the kernel window (Little's law on the tracepoint lag) vs
+~24 at the devices (diskstats). The sweep-flush quantum every prior lever
+targeted (eager-K, lane-flush, inline-reap) is the SMALL half (78 µs);
+the CQ-side reap cycle is the wall: one consumer per shard pops a batch
+and runs each op's FULL `finish_write` postlude (publish_block, 4-tier
+`purge_block_key`, two whole-file LRU removes, `publish_attr`, W1 inval,
+doorbell, train pump, times-park dispatch) inline between pops, so a CQE
+posted mid-cycle waits out the entire cycle before its ACK.
+
+Next lever (named, measured, in the residence path): shorten the reap
+cycle — either price-and-cut the postlude's dominant term (the cycles
+profile points at the tiering::memory purge machinery: the moka/scc
+removes) or restructure the drain into pop-ACK-fast/defer-heavy-tail
+shapes that preserve the per-op purge-before-ACK law. Every candidate now
+has a per-quantum readout (`device_cq` must fall; `sq_wait` must not
+grow) instead of an IOPS-only wash.

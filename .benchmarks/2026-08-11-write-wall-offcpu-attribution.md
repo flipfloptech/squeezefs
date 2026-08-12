@@ -376,3 +376,42 @@ the kernel window by shrinking the daemon's post-CQE segment (the
 from 670 µs), and (b) cut the fabric write RTT itself (client-side
 nvme-tcp PDU wake chain; queue/io-cpu geometry). Both are counted-next
 board items; neither is a daemon lock, a lane, or the substrate.
+
+## Addendum 7 (2026-08-12): holding more ops in the kernel window — the eager-cadence re-count
+
+Lever (a) from Addendum 6, counted. `SQUEEZEFS_IPC_DD_EAGER_FLUSH=K`
+(mid-sweep enter at K un-entered SQEs) was re-swept at the RTT-limited
+operating point — the r5 sweep-only ruling was counted when the reap
+cycle was the wall and no longer binds:
+
+| K (qd32, engaged, per-leg remounts) | IOPS first/last | clat | sq_wait | device_cq | ingress |
+|---|---|---|---|---|---|
+| off (sweep-only) | 775.8/769.6 k | 1.28 ms | 104 µs | 583 µs | 317 µs |
+| 1 | 634.6/619.8 k | 1.60 ms | 1 µs | 210 µs | 1,413 µs |
+| 4 | 768.9/751.6 k | 1.31 ms | 9 µs | 300 µs | 1,048 µs |
+| 8 | 827.6/806.5 k | 1.21 ms | 20 µs | 276 µs | 881 µs |
+| **16** | **849.4/834.0 k** | **1.17 ms** | 41 µs | 352 µs | 725 µs |
+| 24 | 831.2/820.1 k | 1.19 ms | 59 µs | 465 µs | 555 µs |
+
+A-B-B-A closed (off 776 → K16 849 → K16 847 → off 782) and re-confirmed
+in a second window (K16 839 k vs off 808 k — venue drifted up between
+brackets; only in-bracket compares are valid). The phase shape is the
+RTT model's fingerprint: sq_wait collapses (SQEs enter promptly),
+device_cq halves (more ops inside the kernel window), the residue pools
+upstream in ingress. K=1 pays the per-op enter tax (−18 %).
+
+**The closed-form default was falsified**: `clamp(inflight/2, 2, ring)`
+read 785/799 k against its own 808 k sweep-only control — at steady
+per-shard inflight ≈ 40 the derived threshold exceeds the sweep size, so
+it degenerates to sweep-only plus edge-of-window over-eagerness. Per the
+no-fixed-constants law the default stays sweep-only; **K=16 is the
+counted explicit lever** (+4–8 %), and the board's sanctioned follow-on
+is a `ProbeCore` cadence governor (probe K on saturated epochs, adopt on
+delivery response — the write-pipeline/read-lane pattern, one law for
+all regimes, no per-pattern pathway).
+
+Also recorded: the IL shim bypasses the CLIENT→daemon kernel crossing
+(FUSE + metadata ceremony); the daemon→device leg (io_uring → blk-mq →
+nvme-tcp) is the kernel window this addendum's lever feeds. Standing
+best rows: qd32 **849 k** (K=16 lever) / 797 k (default), qd12–16
+805–830 k.

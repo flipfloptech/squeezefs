@@ -3835,6 +3835,37 @@ mod models {
         });
     }
 
+    /// Issue-cadence governor (write-wall Addendum 8): the epoch roll is
+    /// single-winner — the `ProbeCore` CAS shape verbatim, mirrored for
+    /// the cadence core because its transition includes the k store
+    /// (a double roll would double-launch: two halvings in one epoch).
+    /// Weakening-verified the same way (check-then-store roll ⇒ ups == 2).
+    #[test]
+    fn dd_cadence_epoch_roll_is_single_winner() {
+        loom::model(|| {
+            let c = Arc::new(write_pipeline_core::CadenceCore::new());
+            assert!(!c.roll(1, 512));
+            c.on_claim(32);
+            c.on_ops(1000);
+
+            let now = 1 + write_pipeline_core::PROBE_EPOCH_MS + 10;
+            let ts: Vec<_> = (0..2)
+                .map(|_| {
+                    let c = c.clone();
+                    thread::spawn(move || {
+                        c.on_claim(32);
+                        c.on_ops(1000);
+                        c.roll(now, 512)
+                    })
+                })
+                .collect();
+            let rolled: u64 = ts.into_iter().map(|t| u64::from(t.join().unwrap())).sum();
+            assert_eq!(rolled, 1, "exactly one racing thread may roll the epoch");
+            assert_eq!(c.probe_ups(), 1, "a double roll would double-launch");
+            assert_eq!(c.k(), 16, "exactly one halving from the measured claim");
+        });
+    }
+
     // -----------------------------------------------------------------
     // placed_core — the placed-sever claims protocol (shim-parity
     // 2026-07-28): page-claim overlap exclusion and the

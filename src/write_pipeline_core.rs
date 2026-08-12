@@ -312,3 +312,263 @@ impl ProbeCore {
         self.backoffs.load(Ordering::Relaxed)
     }
 }
+
+// =========================================================================
+// Issue-cadence governor core (write-wall Addendum 7, 2026-08-12)
+// =========================================================================
+
+/// The smallest meaningful eager threshold — a structural minimum, not
+/// tuning: below 2 the cadence IS per-op issue (the counted K=1 tax:
+/// −18 % at qd32, every enter amortizing over nothing).
+pub const CADENCE_K_FLOOR: u64 = 2;
+
+/// The dd issue-cadence governor (the `ProbeCore` law with the search
+/// DIRECTION inverted and the entry point MEASURED): the eager-flush
+/// threshold K is probed DOWNWARD by halving from the observed sweep
+/// claim size — K = 0 is sweep-only (the OFF posture), each probe cuts
+/// K in half, and every step is delivery-gated exactly like the depth
+/// governor (adopt on ≥ +1/16 ops response under saturation, retreat +
+/// cool down on dead gain, step back toward OFF when adopted delivery
+/// collapses, decay to OFF on unsaturated epochs). Addendum 7's basis:
+/// K = 16 was a counted +4–8 % at qd32 but every closed-form derivation
+/// failed (`inflight/2` falsified in-bracket), so the threshold must be
+/// DISCOVERED against live delivery — one law for every regime, no
+/// shape-specific pathway, no constant (the floor is the per-op-issue
+/// physical minimum; the OFF boundary is the ring size, above which a
+/// threshold structurally cannot fire before the sweep does).
+///
+/// Saturation is computed from the governor's own claim census —
+/// `epoch_claim_max > CADENCE_K_FLOOR` (sweeps batch beyond the floor,
+/// so cadence has something to act on) — never a knob. The epoch roll
+/// is the `ProbeCore` single-winner CAS verbatim (loom:
+/// `dd_cadence_epoch_roll_is_single_winner`).
+#[derive(Default)]
+pub struct CadenceCore {
+    /// Current threshold; 0 = sweep-only (OFF).
+    k: AtomicU64,
+    prev_k: AtomicU64,
+    state: AtomicU64,
+    baseline_ops_s: AtomicU64,
+    adopted_ops_s: AtomicU64,
+    cooldown: AtomicU64,
+    epoch_start_ms: AtomicU64,
+    epoch_ops: AtomicU64,
+    epoch_claim_max: AtomicU64,
+    ups: AtomicU64,
+    backoffs: AtomicU64,
+}
+
+impl CadenceCore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Count one flush claim of `n` staged SQEs (the sweep-size census).
+    pub fn on_claim(&self, n: u64) {
+        self.epoch_claim_max.fetch_max(n, Ordering::Relaxed);
+    }
+
+    /// Count `n` completed ops into the running epoch.
+    pub fn on_ops(&self, n: u64) {
+        self.epoch_ops.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Current governed threshold: 0 = sweep-only.
+    pub fn k(&self) -> u64 {
+        self.k.load(Ordering::Relaxed)
+    }
+
+    pub fn probe_ups(&self) -> u64 {
+        self.ups.load(Ordering::Relaxed)
+    }
+
+    pub fn probe_backoffs(&self) -> u64 {
+        self.backoffs.load(Ordering::Relaxed)
+    }
+
+    /// One step toward OFF: doubling past the ring's capacity is
+    /// structurally sweep-only (a threshold ≥ ring cannot fire first).
+    fn step_off(k: u64, ring: u64) -> u64 {
+        let next = k.saturating_mul(2);
+        if next >= ring {
+            0
+        } else {
+            next
+        }
+    }
+
+    /// Roll the cadence epoch if due (single-winner CAS — the
+    /// `ProbeCore` shape). `ring` = the consumer's ring depth (the OFF
+    /// boundary). Returns `true` iff THIS call rolled.
+    pub fn roll(&self, now_ms: u64, ring: u64) -> bool {
+        let ws = self.epoch_start_ms.load(Ordering::Relaxed);
+        if ws == 0 {
+            let _ = self.epoch_start_ms.compare_exchange(
+                0,
+                now_ms.max(1),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+            return false;
+        }
+        let elapsed = now_ms.saturating_sub(ws);
+        if elapsed < PROBE_EPOCH_MS
+            || self
+                .epoch_start_ms
+                .compare_exchange(ws, now_ms, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+        {
+            return false;
+        }
+        let ops_s = self
+            .epoch_ops
+            .swap(0, Ordering::Relaxed)
+            .saturating_mul(1000)
+            / elapsed.max(1);
+        let claim_max = self.epoch_claim_max.swap(0, Ordering::Relaxed);
+        let saturated = claim_max > CADENCE_K_FLOOR;
+        let k = self.k.load(Ordering::Relaxed);
+        match self.state.load(Ordering::Relaxed) {
+            PROBE_STATE_PROBING => {
+                let baseline = self.baseline_ops_s.load(Ordering::Relaxed);
+                if saturated && ops_s >= baseline.saturating_add((baseline / 16).max(1)) {
+                    // ADOPT: delivery responded to the tighter cadence.
+                    self.adopted_ops_s.store(ops_s, Ordering::Relaxed);
+                    self.state.store(PROBE_STATE_HOLD, Ordering::Relaxed);
+                } else {
+                    // RETREAT; dead gain under saturation cools down.
+                    self.k
+                        .store(self.prev_k.load(Ordering::Relaxed), Ordering::Relaxed);
+                    self.state.store(PROBE_STATE_HOLD, Ordering::Relaxed);
+                    if saturated {
+                        self.cooldown
+                            .store(PROBE_COOLDOWN_EPOCHS, Ordering::Relaxed);
+                    }
+                    self.backoffs.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            _ => {
+                let adopted = self.adopted_ops_s.load(Ordering::Relaxed);
+                let collapsed = k > 0 && adopted > 0 && ops_s < adopted.saturating_sub(adopted / 8);
+                if !saturated {
+                    // Latency/idle guard: bleed one notch toward OFF.
+                    if k > 0 {
+                        self.k.store(Self::step_off(k, ring), Ordering::Relaxed);
+                    }
+                } else if collapsed {
+                    // Adopted cadence must keep paying rent.
+                    self.k.store(Self::step_off(k, ring), Ordering::Relaxed);
+                    self.adopted_ops_s.store(ops_s, Ordering::Relaxed);
+                    self.backoffs.fetch_add(1, Ordering::Relaxed);
+                } else if self.cooldown.load(Ordering::Relaxed) > 0 {
+                    self.cooldown.fetch_sub(1, Ordering::Relaxed);
+                } else if ops_s > 0 {
+                    // LAUNCH: halve toward the floor; the entry point is
+                    // the MEASURED claim size (sweep→claim/2 is where
+                    // the counted optimum lived).
+                    let cand = if k == 0 { claim_max / 2 } else { k / 2 }.max(CADENCE_K_FLOOR);
+                    if cand != k && cand < claim_max {
+                        self.prev_k.store(k, Ordering::Relaxed);
+                        self.baseline_ops_s.store(ops_s, Ordering::Relaxed);
+                        self.k.store(cand, Ordering::Relaxed);
+                        self.state.store(PROBE_STATE_PROBING, Ordering::Relaxed);
+                        self.ups.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        true
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod cadence_tests {
+    use super::*;
+
+    const RING: u64 = 512;
+    const E: u64 = PROBE_EPOCH_MS + 1;
+
+    /// Drive one epoch: claims of max size `claim`, `ops` completions.
+    fn epoch(c: &CadenceCore, t: &mut u64, claim: u64, ops: u64) {
+        c.on_claim(claim);
+        c.on_ops(ops);
+        *t += E;
+        assert!(c.roll(*t, RING), "the due epoch must roll");
+    }
+
+    #[test]
+    fn off_by_default_and_probes_down_from_the_measured_claim() {
+        let c = CadenceCore::new();
+        let mut t = 1;
+        assert_eq!(c.k(), 0, "fresh governor is sweep-only");
+        assert!(!c.roll(t, RING), "first call opens the epoch window");
+        epoch(&c, &mut t, 32, 400_000);
+        assert_eq!(c.k(), 16, "first probe = measured claim size / 2");
+        assert_eq!(c.probe_ups(), 1);
+    }
+
+    #[test]
+    fn adopts_on_delivery_response_and_compounds() {
+        let c = CadenceCore::new();
+        let mut t = 1;
+        assert!(!c.roll(t, RING));
+        epoch(&c, &mut t, 32, 400_000); // launch k=16
+        epoch(&c, &mut t, 32, 440_000); // +10% ⇒ adopt
+        assert_eq!(c.k(), 16, "adopted");
+        epoch(&c, &mut t, 32, 440_000); // launch again ⇒ k=8
+        assert_eq!(c.k(), 8, "discovery compounds by halving");
+        assert_eq!(c.probe_ups(), 2);
+    }
+
+    #[test]
+    fn dead_gain_retreats_and_cools_down() {
+        let c = CadenceCore::new();
+        let mut t = 1;
+        assert!(!c.roll(t, RING));
+        epoch(&c, &mut t, 32, 400_000); // launch k=16
+        epoch(&c, &mut t, 32, 400_000); // flat ⇒ retreat
+        assert_eq!(c.k(), 0, "retreat restores the pre-probe posture");
+        assert_eq!(c.probe_backoffs(), 1);
+        for _ in 0..PROBE_COOLDOWN_EPOCHS {
+            epoch(&c, &mut t, 32, 400_000);
+            assert_eq!(c.k(), 0, "cooldown holds the posture");
+        }
+        epoch(&c, &mut t, 32, 400_000);
+        assert_eq!(c.k(), 16, "cooled down ⇒ probing resumes");
+    }
+
+    #[test]
+    fn collapse_steps_toward_off_and_idle_decays_to_off() {
+        let c = CadenceCore::new();
+        let mut t = 1;
+        assert!(!c.roll(t, RING));
+        epoch(&c, &mut t, 32, 400_000); // launch k=16
+        epoch(&c, &mut t, 32, 440_000); // adopt k=16 @440k
+        epoch(&c, &mut t, 32, 300_000); // collapse (< 7/8 of adopted)…
+                                        // (that epoch LAUNCHED or collapsed depending on order: the
+                                        // collapse guard is senior — k stepped toward off.)
+        assert_eq!(c.k(), 32, "collapse steps one notch toward OFF");
+        // Idle epochs decay the rest of the way to OFF.
+        let mut idle = 0;
+        while c.k() != 0 {
+            epoch(&c, &mut t, 0, 0);
+            idle += 1;
+            assert!(idle < 12, "idle decay must reach OFF");
+        }
+    }
+
+    #[test]
+    fn floor_is_the_per_op_issue_minimum() {
+        let c = CadenceCore::new();
+        let mut t = 1;
+        assert!(!c.roll(t, RING));
+        epoch(&c, &mut t, 8, 400_000); // launch k=4
+        assert_eq!(c.k(), 4);
+        epoch(&c, &mut t, 8, 440_000); // adopt
+        epoch(&c, &mut t, 8, 480_000); // launch k=2 (the floor)
+        assert_eq!(c.k(), 2);
+        epoch(&c, &mut t, 8, 520_000); // adopt
+        epoch(&c, &mut t, 8, 560_000); // floor reached: no further probe
+        assert_eq!(c.k(), 2, "the floor is terminal for downward probes");
+    }
+}

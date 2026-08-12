@@ -5869,6 +5869,14 @@ pub struct Metrics {
     /// edge). `ipc_dd_write_serves ÷ dispatches` is the live coalesce
     /// factor; ≈ 1 on a saturated drain means the batching regressed.
     pub ipc_dd_write_times_dispatches: Align64<AtomicU64>,
+    /// Issue-cadence governor gauges (fourth adjudication — the
+    /// `CadenceCore` in `write_pipeline_core`): `k` is the live governed
+    /// eager-flush threshold (0 = sweep-only), `probe_ups`/`backoffs`
+    /// the probe engagement (the `write_pipeline_depth_probe_*`
+    /// discipline: ups stay 0 on unbatched/low-load mounts by design).
+    pub ipc_dd_cadence_k: Align64<AtomicU64>,
+    pub ipc_dd_cadence_probe_ups: Align64<AtomicU64>,
+    pub ipc_dd_cadence_probe_backoffs: Align64<AtomicU64>,
     /// RES-6 loud-fail rail: direct writes REFUSED by THE authorization
     /// door (`authorize_zc_store` → `data_custody::authorize_dma`) after
     /// the §5.1 sole-owner fence — errno'd to the client, tiers purged,
@@ -9031,6 +9039,9 @@ impl SqueezefsFilesystem {
                 "ipc_dd_write_serves": METRICS.ipc_dd_write_serves.load(Ordering::Relaxed),
                 "ipc_dd_write_bytes": METRICS.ipc_dd_write_bytes.load(Ordering::Relaxed),
                 "ipc_dd_write_times_dispatches": METRICS.ipc_dd_write_times_dispatches.load(Ordering::Relaxed),
+                "ipc_dd_cadence_k": METRICS.ipc_dd_cadence_k.load(Ordering::Relaxed),
+                "ipc_dd_cadence_probe_ups": METRICS.ipc_dd_cadence_probe_ups.load(Ordering::Relaxed),
+                "ipc_dd_cadence_probe_backoffs": METRICS.ipc_dd_cadence_probe_backoffs.load(Ordering::Relaxed),
                 "ipc_dd_write_fence_refusals": METRICS.ipc_dd_write_fence_refusals.load(Ordering::Relaxed),
                 "ipc_dd_write_ineligible_shape": METRICS.ipc_dd_write_ineligible_shape.load(Ordering::Relaxed),
                 "ipc_dd_write_ineligible_lease": METRICS.ipc_dd_write_ineligible_lease.load(Ordering::Relaxed),

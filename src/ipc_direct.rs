@@ -244,10 +244,12 @@ fn dd_eager_flush_from(v: Option<&str>) -> Option<u32> {
 /// read-lane pattern): probe the threshold on delivery, adopt on
 /// response — board item, not this commit. `inflight` stays a
 /// parameter so the law test pins that ABSENT ignores it.
-fn dd_eager_threshold(explicit: Option<u32>, _inflight: u32) -> u32 {
+fn dd_eager_threshold(explicit: Option<u32>, governed: u32) -> u32 {
     match explicit {
-        Some(k) if k > 0 => k,
-        _ => u32::MAX,
+        Some(0) => u32::MAX,
+        Some(k) => k,
+        None if governed > 0 => governed,
+        None => u32::MAX,
     }
 }
 
@@ -770,6 +772,11 @@ pub(crate) struct DirectDriveEngine {
     /// LIVE shard reapers — mirrored into the `ipc_direct_shards`
     /// gauge (the sharding engagement instrument).
     reapers_spawned: AtomicUsize,
+    /// The issue-cadence governor (fourth adjudication): discovers the
+    /// eager-flush threshold against live delivery — claims censused at
+    /// every `claim_and_stamp`, completions at every drain, epochs
+    /// rolled from the SAME clock reads those sites already pay.
+    cadence: crate::write_pipeline_core::CadenceCore,
     /// Reaper waits are timeout-bounded via `IORING_ENTER_EXT_ARG`
     /// (kernel ≥ 5.11). `false` = the kernel refused EXT_ARG once —
     /// the reaper degrades to the unbounded `submit_and_wait` and the
@@ -934,6 +941,7 @@ impl DirectDriveEngine {
             req_pid,
             shutting_down: AtomicBool::new(false),
             reapers_spawned: AtomicUsize::new(0),
+            cadence: crate::write_pipeline_core::CadenceCore::new(),
             ext_arg_ok: AtomicBool::new(true),
         });
         // Fresh engine: no shard reaper is live yet (spawn-on-first-
@@ -1121,7 +1129,6 @@ impl DirectDriveEngine {
         let shard = &self.shards[lane];
 
         // Slab insert + SQE push under the ONE shard mutex.
-        let inflight_now;
         {
             let mut st = shard
                 .state
@@ -1181,12 +1188,11 @@ impl DirectDriveEngine {
             st.inflight[idx] = Some(PendingOp::Read(pending));
             st.inflight_count += 1;
             st.staged.push(idx);
-            inflight_now = st.inflight_count as u32;
         }
         // Issue cadence (BDP-derived — see `dd_eager_threshold`).
         let pending = shard.pending_submits.fetch_add(1, Ordering::Release) + 1;
-        if pending >= dd_eager_threshold(dd_eager_flush(), inflight_now) {
-            Self::flush_shard(lane, shard);
+        if pending >= dd_eager_threshold(dd_eager_flush(), self.cadence.k() as u32) {
+            self.flush_shard(lane, shard);
         }
         Ok(())
     }
@@ -1453,7 +1459,6 @@ impl DirectDriveEngine {
 
         // Slab insert + WRITE SQE push under the ONE shard mutex (the
         // read submit's discipline verbatim, direction reversed).
-        let inflight_now;
         {
             let mut st = shard
                 .state
@@ -1517,12 +1522,11 @@ impl DirectDriveEngine {
             st.inflight[idx] = Some(PendingOp::Write(pending));
             st.inflight_count += 1;
             st.staged.push(idx);
-            inflight_now = st.inflight_count as u32;
         }
         // Issue cadence (BDP-derived — see `dd_eager_threshold`).
         let pending_count = shard.pending_submits.fetch_add(1, Ordering::Release) + 1;
-        if pending_count >= dd_eager_threshold(dd_eager_flush(), inflight_now) {
-            Self::flush_shard(lane, shard);
+        if pending_count >= dd_eager_threshold(dd_eager_flush(), self.cadence.k() as u32) {
+            self.flush_shard(lane, shard);
         }
         DdWriteSubmit::Submitted
     }
@@ -1551,10 +1555,10 @@ impl DirectDriveEngine {
     pub(crate) fn flush(self: &Arc<Self>) {
         if dd_lane_flush() {
             let lane = current_lane() % self.shards.len();
-            Self::flush_shard(lane, &self.shards[lane]);
+            self.flush_shard(lane, &self.shards[lane]);
         } else {
             for (lane, shard) in self.shards.iter().enumerate() {
-                Self::flush_shard(lane, shard);
+                self.flush_shard(lane, shard);
             }
         }
         if dd_inline_reap()
@@ -1586,9 +1590,9 @@ impl DirectDriveEngine {
     /// enter (records `sq_wait`; the `t_flush_ns != 0` screen makes a
     /// ghost/reused slab idx harmless — a slot is stamped at most once
     /// per op). Caller holds the shard state lock and owes an enter.
-    fn stamp_staged_locked(st: &mut EngineState) {
+    fn stamp_staged_locked(st: &mut EngineState) -> Option<u64> {
         if st.staged.is_empty() {
-            return;
+            return None;
         }
         let now_ns = crate::mono_core::monotonic_ns_u64();
         while let Some(idx) = st.staged.pop() {
@@ -1598,26 +1602,46 @@ impl DirectDriveEngine {
                 }
             }
         }
+        Some(now_ns)
     }
 
     /// Swap-claim the shard's published tail AND stamp the carried ops
     /// (`sq_wait`/`device_cq` split, write-wall campaign 2026-08-11).
     /// Returns whether the caller owes an enter. Cost: one short state
     /// hold + ONE clock read per claimed enter — never per op (r5).
-    fn claim_and_stamp(shard: &DdShard) -> bool {
-        if shard.pending_submits.swap(0, Ordering::AcqRel) == 0 {
+    fn claim_and_stamp(&self, shard: &DdShard) -> bool {
+        let claimed = shard.pending_submits.swap(0, Ordering::AcqRel);
+        if claimed == 0 {
             return false;
         }
+        // Cadence census: this claim's size is the sweep-size signal
+        // (the governor's probe entry point); the roll rides the clock
+        // read the stamp pass pays anyway (r5 economy).
+        self.cadence.on_claim(u64::from(claimed));
         let mut st = shard
             .state
             .lock()
             .expect("direct-drive state mutex never poisons");
-        Self::stamp_staged_locked(&mut st);
+        let now_ns = Self::stamp_staged_locked(&mut st);
+        drop(st);
+        if let Some(ns) = now_ns {
+            if self.cadence.roll(ns / 1_000_000, u64::from(RING_ENTRIES)) {
+                METRICS
+                    .ipc_dd_cadence_k
+                    .store(self.cadence.k(), Ordering::Relaxed);
+                METRICS
+                    .ipc_dd_cadence_probe_ups
+                    .store(self.cadence.probe_ups(), Ordering::Relaxed);
+                METRICS
+                    .ipc_dd_cadence_probe_backoffs
+                    .store(self.cadence.probe_backoffs(), Ordering::Relaxed);
+            }
+        }
         true
     }
 
-    fn flush_shard(lane: usize, shard: &DdShard) {
-        if !Self::claim_and_stamp(shard) {
+    fn flush_shard(&self, lane: usize, shard: &DdShard) {
+        if !self.claim_and_stamp(shard) {
             return;
         }
         for attempt in 0..3 {
@@ -1680,7 +1704,7 @@ impl DirectDriveEngine {
             // SQEs (its `submit_and_wait` submits unconditionally) —
             // claim-and-stamp them so their `sq_wait` closes at the
             // enter that actually carried them.
-            Self::claim_and_stamp(shard);
+            self.claim_and_stamp(shard);
             match self.reaper_wait(shard) {
                 Ok(_) => {}
                 Err(e) if e.raw_os_error() == Some(libc::EINTR) => {}
@@ -1853,6 +1877,7 @@ impl DirectDriveEngine {
         let cqes: Vec<(u64, i32)> = cq.by_ref().map(|c| (c.user_data(), c.result())).collect();
         drop(cq);
         let mut served = 0usize;
+        let mut last_cqe_ns = 0u64;
         for (user_data, res) in cqes {
             if user_data == NOP_WAKE {
                 // Shutdown wake sentinel. Whichever consumer pops it,
@@ -1887,6 +1912,7 @@ impl DirectDriveEngine {
             // anchors `device_cq` and `finish` — one clock read (r5
             // single-read law).
             let t_cqe_ns = crate::mono_core::monotonic_ns_u64();
+            last_cqe_ns = t_cqe_ns;
             crate::fuse_client::ipc_direct_phase_record_span(
                 crate::fuse_client::IpcDirectPhase::Inflight,
                 std::time::Duration::from_nanos(t_cqe_ns.saturating_sub(pending.t_insert_ns())),
@@ -1933,6 +1959,25 @@ impl DirectDriveEngine {
         }
         for (key, guard) in batch.trains.drain(..) {
             self.run_train(key, guard);
+        }
+        if served > 0 {
+            // Cadence delivery census + epoch roll — rides the loop's
+            // last CQE clock read (no new read; r5 economy).
+            self.cadence.on_ops(served as u64);
+            if self
+                .cadence
+                .roll(last_cqe_ns / 1_000_000, u64::from(RING_ENTRIES))
+            {
+                METRICS
+                    .ipc_dd_cadence_k
+                    .store(self.cadence.k(), Ordering::Relaxed);
+                METRICS
+                    .ipc_dd_cadence_probe_ups
+                    .store(self.cadence.probe_ups(), Ordering::Relaxed);
+                METRICS
+                    .ipc_dd_cadence_probe_backoffs
+                    .store(self.cadence.probe_backoffs(), Ordering::Relaxed);
+            }
         }
         served
     }
@@ -2245,7 +2290,7 @@ impl DirectDriveEngine {
                             // wake would tax the train hop with up to
                             // its 100 ms liveness cadence.
                             let lane = current_lane() % self.shards.len();
-                            Self::flush_shard(lane, &self.shards[lane]);
+                            self.flush_shard(lane, &self.shards[lane]);
                             return;
                         }
                         DdWriteSubmit::Refused(g) => {
@@ -2427,30 +2472,32 @@ mod tests {
         assert_eq!(dd_eager_flush_from(Some("garbage")), None);
     }
 
-    /// The issue-cadence law, third adjudication (write-wall
-    /// Addendum 7): K=16 is a COUNTED +4–8 % at qd32 on the RTT-limited
-    /// system, but the `inflight/2` closed-form derivation was
-    /// FALSIFIED in-bracket, so per the no-fixed-constants law ABSENT
-    /// stays sweep-only (and ignores the in-flight signal); the
-    /// probe-governor cadence is the board's sanctioned follow-on.
+    /// The issue-cadence law, fourth adjudication (write-wall
+    /// Addendum 7/8): ABSENT = the `CadenceCore`-GOVERNED threshold —
+    /// discovered against live delivery (probe down by halving from the
+    /// measured claim size, adopt on response, retreat/decay to
+    /// sweep-only), because K=16 was a counted +4–8 % but every
+    /// closed-form derivation was falsified. Explicit K wins verbatim;
+    /// explicit 0 = sweep-only, governor ignored (the ungoverned A/B
+    /// control).
     #[test]
     fn dd_eager_threshold_law() {
         assert_eq!(
-            dd_eager_threshold(None, 32),
-            u32::MAX,
-            "absent = sweep-only"
+            dd_eager_threshold(None, 16),
+            16,
+            "absent = the governed threshold"
         );
         assert_eq!(
             dd_eager_threshold(None, 0),
             u32::MAX,
-            "absent ignores inflight"
+            "governor OFF (k=0) = sweep-only"
         );
         assert_eq!(
-            dd_eager_threshold(Some(0), 32),
+            dd_eager_threshold(Some(0), 16),
             u32::MAX,
-            "0 = sweep-only (A/B)"
+            "0 = sweep-only, governor ignored (A/B)"
         );
-        assert_eq!(dd_eager_threshold(Some(4), 32), 4, "explicit wins verbatim");
+        assert_eq!(dd_eager_threshold(Some(4), 16), 4, "explicit wins verbatim");
         assert_eq!(
             dd_eager_threshold(Some(16), 0),
             16,

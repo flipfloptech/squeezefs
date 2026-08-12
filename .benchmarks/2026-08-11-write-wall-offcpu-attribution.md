@@ -415,3 +415,36 @@ Also recorded: the IL shim bypasses the CLIENT→daemon kernel crossing
 nvme-tcp) is the kernel window this addendum's lever feeds. Standing
 best rows: qd32 **849 k** (K=16 lever) / 797 k (default), qd12–16
 805–830 k.
+
+## Addendum 8 (2026-08-12): the CadenceCore governor — the +4–8 % becomes the default, discovered
+
+`perf/dd-cadence-governor`: the eager-flush threshold is now GOVERNED —
+`CadenceCore` (`write_pipeline_core.rs`, the `ProbeCore` law with the
+search direction inverted and the entry point measured) probes K
+downward by halving from the observed sweep claim size, adopts only on
+live delivery response (≥ +1/16 ops under saturation), retreats + cools
+down on dead gain, steps toward sweep-only on adopted-delivery collapse,
+and decays to sweep-only on unsaturated epochs. Saturation is the
+governor's own claim census (sweeps batching beyond the per-op floor of
+2 — the counted K=1 tax); the OFF boundary is the ring size (a threshold
+≥ ring structurally cannot fire before the sweep). No knob, no constant,
+one law for every regime. Census + epoch rolls ride clock reads the
+stamp pass and drain already pay (r5 economy). Loom:
+`dd_cadence_epoch_roll_is_single_winner` (the ProbeCore single-winner
+CAS mirror). ABSENT = governed; explicit K verbatim; `=0` = ungoverned
+sweep-only (the A/B control). Gauges `ipc_dd_cadence_{k,probe_ups,
+probe_backoffs}`.
+
+**Counted (90 s rows, zero env, engaged, posture verified), A-B-B-A:**
+governed **821.5/809.9 k @ 1.21 ms** (k converged 14) → control
+(`=0`) 777.0/771.9 k → control 774.8/769.7 k → governed **841.2/826.5 k
+@ 1.18 ms** (k 28, ups 7). The governor discovers the counted K8–K16
+optimum live and holds +6–8 % in both orders. Low-depth guard: qd12
+governed 833.4 k @ 449 µs — full speed, latency intact.
+
+**Standing rows (all defaults, no levers):** qd32 **~821–841 k @
+1.18–1.21 ms**, qd12 **833 k @ 449 µs** — from 630–650 k at the
+session's start (+~30 % net, all defaults). The kernel/nvme-tcp RTT hunt
+(Addendum 6 lever b) is the next frontier: at the current ~150–220 µs
+write RTT the remaining daemon segments are ingress (~300 µs) and the
+CQE-pop residue (~360 µs).

@@ -81,6 +81,37 @@ assign-to-popped-waiter release protocol fails the model), shared-grant
 never observes a live writer, and the FIFO wake shape (all leading
 shared, or one exclusive; tokens only, ownership on re-poll).
 
+## Stage-1 field attribution (2026-08-12, counted runs aborted at run 1)
+
+The lock migration landed gate-green, and the 464-at-3.0GHz instrument
+then produced the NEXT attribution (3/3 reproductions, live-daemon gdb
+captures `~/sqz-battery-logs/sqzsync-wedge-{run2,attrib1}.gdb.txt`):
+
+* The lock plane is now HONEST during a wedge: waiters are census-named
+  (`lock-wait census: block/write_checkout … waited 356s` with the
+  stripe's last holder), and the conveyor/journal/checkpoints stay LIVE
+  through the whole stall — the old all-dark signature is gone.
+* The stuck party is a SINGLE lost write task (one capture: two holders
+  + two same-stripe waiters; the cleaner capture: ONE write, ZERO lock
+  waiters, `pipeline_inflight_blocks=0`, leases closed, all 8 NVMe
+  uring workers idle-parked, all 216 threads parked).
+* `lock_ticked_reregisters` (now on the wedge-census line, which logs
+  fine while `.stats` reads hang) reads **0 during the wedge**: the
+  lost task's timer wakes no-op just like its I/O wakes — consistent
+  with the July ticked-wrapper evidence (5/6 wedge, zero engagements).
+  A task lost at the scheduler layer cannot be healed by ANY
+  future-layer backstop, ours included.
+
+**Conclusion:** barging protects the plane from a dead WAITER (proved:
+the queue keeps moving, everything is named), but the wedge class lives
+in the tokio scheduler's task delivery, so a lost HOLDER — or a lone
+lost op awaiting its device-completion oneshot — still stalls its
+dependents. "Metadata plane scheduler-free" therefore requires the
+write-path critical sections and their completion WAITS to run off
+tokio tasks entirely (the svc-thread / dd-reaper pattern the hot path
+already uses): the Stage 1b/2 wait classes are on the critical path
+before the held battery can run, not optional follow-ons.
+
 ## Acceptance
 
 * The primitive's unit rails + a loom model of the acquire/release/wake

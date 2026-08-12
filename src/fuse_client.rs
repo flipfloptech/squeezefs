@@ -1797,7 +1797,7 @@ pub fn wedge_census_line() -> String {
          meta_commit_parked={} meta_publish_parked={} meta_journal_entries={} \
          meta_checkpoints={} pipeline_inflight_blocks={} pipeline_admission_waits={} \
          reclaim_queue_bytes={} rewrite_open_epochs={} transport_leases_outstanding={} \
-         transport_parked_commits={} transport_unparked_commits={}",
+         transport_parked_commits={} transport_unparked_commits={} lock_ticked_reregisters={}",
         crate::meta_backend::kv::META_CONVEYOR_LEADER_PASSES.load(Ordering::Relaxed),
         crate::meta_backend::kv::META_CONVEYOR_QUEUED.load(Ordering::Relaxed),
         crate::meta_backend::kv::META_COMMIT_PARKED.load(Ordering::Relaxed),
@@ -1813,6 +1813,12 @@ pub fn wedge_census_line() -> String {
         leases_outstanding,
         parked,
         unparked,
+        // The sqz_sync tick backstop's engagement DURING a wedge is the
+        // attribution split: growing = waiter tasks are pollable and the
+        // stall is a real wait (a lost HOLDER, a lost completion); flat
+        // with live census waiters = the waiters' own tasks are lost at
+        // the scheduler layer (the OQ-5 class the tick cannot heal).
+        crate::sqz_sync::TICK_RECOVERIES.load(Ordering::Relaxed),
     )
 }
 

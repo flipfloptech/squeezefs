@@ -5861,6 +5861,14 @@ pub struct Metrics {
     /// `ipc_dd_write_serves + ipc_async_handoffs` accounts for its ops.
     pub ipc_dd_write_serves: Align64<AtomicU64>,
     pub ipc_dd_write_bytes: Align64<AtomicU64>,
+    /// Times-park handoff DISPATCHES (ACK-fast drain, write-wall
+    /// campaign 2026-08-12): the post-ACK durable-times tail is
+    /// coalesced per DRAIN BATCH (distinct inos deduped), never
+    /// dispatched per op — the pre-split posture paid one fuse3-lane
+    /// handoff + wake per write (the sched capture's 208 k/s dd→tpc
+    /// edge). `ipc_dd_write_serves ÷ dispatches` is the live coalesce
+    /// factor; ≈ 1 on a saturated drain means the batching regressed.
+    pub ipc_dd_write_times_dispatches: Align64<AtomicU64>,
     /// RES-6 loud-fail rail: direct writes REFUSED by THE authorization
     /// door (`authorize_zc_store` → `data_custody::authorize_dma`) after
     /// the §5.1 sole-owner fence — errno'd to the client, tiers purged,
@@ -9022,6 +9030,7 @@ impl SqueezefsFilesystem {
                 // ipc_async_handoffs accounts for an il write row's ops.
                 "ipc_dd_write_serves": METRICS.ipc_dd_write_serves.load(Ordering::Relaxed),
                 "ipc_dd_write_bytes": METRICS.ipc_dd_write_bytes.load(Ordering::Relaxed),
+                "ipc_dd_write_times_dispatches": METRICS.ipc_dd_write_times_dispatches.load(Ordering::Relaxed),
                 "ipc_dd_write_fence_refusals": METRICS.ipc_dd_write_fence_refusals.load(Ordering::Relaxed),
                 "ipc_dd_write_ineligible_shape": METRICS.ipc_dd_write_ineligible_shape.load(Ordering::Relaxed),
                 "ipc_dd_write_ineligible_lease": METRICS.ipc_dd_write_ineligible_lease.load(Ordering::Relaxed),

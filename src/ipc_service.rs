@@ -299,18 +299,26 @@ pub(crate) fn spawn_read_handoff(
 /// handler's own park (µs-grade time polish — never worth failing an
 /// acked write over); the RAM face (`publish_attr` WriteTimes) already
 /// ran synchronously in the postlude.
-pub(crate) fn spawn_dd_write_times_park(
+/// One coalesced durable-times refinement dispatch per DRAIN BATCH
+/// (ACK-fast drain, write-wall campaign 2026-08-12): `entries` is the
+/// batch's ino-deduped `(ino, now_ns)` set, parked in one handoff task
+/// instead of one per op — the pre-split posture paid a fuse3-lane
+/// handoff + wake per write (the sched capture's 208 k/s dd→tpc edge,
+/// pure preemption pressure on the threads whose pass length sets the
+/// wall). `node` is a venue hint (the batch's first op's arena node).
+pub(crate) fn spawn_dd_write_times_park_batch(
     fs: Arc<SqueezefsFilesystem>,
     node: Option<usize>,
-    ino: u64,
-    now_ns: u64,
+    entries: Vec<(u64, u64)>,
 ) {
     handoff_spawn_on(node, async move {
         if let Some(backend) = fs.meta_backend.as_ref() {
-            if let Err(e) =
-                crate::meta_ship::publish::park_write_times(backend, ino, now_ns, now_ns).await
-            {
-                log::debug!("dd write: ino {ino} times refinement park skipped: {e}");
+            for (ino, now_ns) in entries {
+                if let Err(e) =
+                    crate::meta_ship::publish::park_write_times(backend, ino, now_ns, now_ns).await
+                {
+                    log::debug!("dd write: ino {ino} times refinement park skipped: {e}");
+                }
             }
         }
     });

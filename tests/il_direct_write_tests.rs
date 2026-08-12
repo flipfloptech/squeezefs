@@ -592,6 +592,7 @@ struct Snap {
     /// parked op whose train ends without a pop is a WEDGE.
     dd_parks: u64,
     dd_redrives: u64,
+    dd_times_dispatches: u64,
 }
 
 impl Snap {
@@ -630,6 +631,7 @@ fn snap() -> Snap {
         data_fence_refusals: l(&METRICS.data_dma_fence_refusals),
         dd_parks: l(&METRICS.ipc_dd_write_block_parks),
         dd_redrives: l(&METRICS.ipc_dd_write_park_redrives),
+        dd_times_dispatches: l(&METRICS.ipc_dd_write_times_dispatches),
     }
 }
 
@@ -1541,6 +1543,80 @@ async fn same_block_followers_park_and_train_on_the_guard_holder() {
         want[(2 * BS) as usize..(3 * BS) as usize].to_vec(),
         "trained writes stay byte-exact in FIFO order"
     );
+    fx.shutdown();
+}
+
+/// ACK-fast drain (write-wall campaign 2026-08-12,
+/// `.benchmarks/2026-08-11-write-wall-offcpu-attribution.md` addendum 2:
+/// CQE-posted→popped ≈ 670 µs of the 877 µs `device_cq` — the drain runs
+/// every op's FULL postlude inline between pops, so mid-cycle CQEs wait
+/// out the whole cycle). Contract: the post-ACK durable-times tail is
+/// dispatched ONCE PER DRAIN BATCH (distinct inos deduped), never per
+/// op. Determinism: the CQE hold queues K completions (the CQ-ready
+/// probe is the release gate), so the release pops all K in ONE drain —
+/// exactly one dispatch, K ACKs, and the times still land (the batch
+/// carries every ino).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drain_batch_coalesces_the_times_park_dispatch() {
+    let fx = Fixture::new("ddwtimes").await;
+    fx.salt_inos(23).await;
+    let (ino, mut want) = fx.durable_striped("times.bin", 4, 0x90).await;
+    let dir = tempfile::tempdir().unwrap();
+    let fd = rw_standin(&fx, &dir, "standin.bin", ino);
+    let (session, binding) = ClientSession::establish(&fx, &fd);
+
+    tokio::task::block_in_place(|| {
+        warm_direct_lane(&session, binding, &mut want, &[16384, BS + 8192]);
+
+        // K eligible writes to K DISTINCT blocks (no trains — each op
+        // owns its own guard), queued behind the CQE hold.
+        let hold = CqeHold::hold();
+        let before = snap();
+        let writes: &[(u64, u8)] = &[
+            (4096, 0xB1),
+            (BS + 20480, 0xB2),
+            (2 * BS + 12288, 0xB3),
+            (3 * BS + 28672, 0xB4),
+        ];
+        let mut gens = Vec::new();
+        for (i, &(off, tag)) in writes.iter().enumerate() {
+            let p = pattern(4096, tag);
+            gens.push(session.stage_pwrite(i as u32, binding, off, &p));
+            want[off as usize..off as usize + 4096].copy_from_slice(&p);
+        }
+        // The deterministic release gate: all K completions QUEUED.
+        wait_counter_at_least(
+            &|| squeezefs::ipc_direct::test_ddw_cq_ready() as u64,
+            writes.len() as u64,
+            "all completions must queue behind the hold",
+        );
+        hold.release();
+        for (i, gen) in gens.iter().enumerate() {
+            let r = session.wait_slot(i as u32, *gen, "batched op");
+            assert_eq!(r, 4096, "batched op {i} must ack its full length");
+        }
+        let after = snap();
+
+        assert_eq!(
+            delta!(after, before, dd_serves),
+            writes.len() as u64,
+            "every op direct-serves (the batch is the contract's subject)"
+        );
+        assert_eq!(
+            delta!(after, before, dd_times_dispatches),
+            1,
+            "ONE drain batch dispatches ONE times-park handoff — the \
+             pre-split per-op dispatch (the 208k/s dd→tpc wake edge) is \
+             the regression this rail pins out"
+        );
+    });
+
+    // The tail still lands: bytes are byte-exact through the FUSE read
+    // path after a tier purge (the ACK-fast reorder must not have
+    // weakened the purge-before-ACK law).
+    fx.purge_read_tiers(ino).await;
+    let got = fx.fuse_read(ino, 0, (4 * BS) as u32).await;
+    assert_eq!(got, want, "ACK-fast drain stays byte-exact");
     fx.shutdown();
 }
 

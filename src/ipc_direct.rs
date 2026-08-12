@@ -131,6 +131,37 @@ pub fn set_test_ddw_cqe_hold(hold: bool) {
     TEST_DDW_CQE_HOLD.store(hold, Ordering::SeqCst);
 }
 
+/// Tests-only engine registry (the hold seam's companion): the last
+/// spawned engine, weakly held so the seam never extends a shutdown.
+static TEST_ENGINE: Mutex<Option<std::sync::Weak<DirectDriveEngine>>> = Mutex::new(None);
+
+/// Tests-only: CQEs currently POSTED-and-unconsumed across the engine's
+/// shards (a peek under each shard's `cq_gate` — never consumes). With
+/// the hold armed this is the deterministic "all K completions are
+/// queued" gate the ACK-fast drain rails wait on (a bare counter wait on
+/// submits would release before the DMAs completed — a race, not a
+/// contract).
+pub fn test_ddw_cq_ready() -> usize {
+    let engine = TEST_ENGINE
+        .lock()
+        .expect("test engine registry never poisons")
+        .as_ref()
+        .and_then(std::sync::Weak::upgrade);
+    let Some(engine) = engine else { return 0 };
+    let mut ready = 0usize;
+    for shard in &engine.shards {
+        let _gate = shard
+            .cq_gate
+            .lock()
+            .expect("direct-drive cq gate never poisons");
+        // SAFETY: single CQ accessor under the gate (module docs).
+        let mut cq = unsafe { shard.ring.completion_shared() };
+        cq.sync();
+        ready += cq.len();
+    }
+    ready
+}
+
 /// SQ/CQ entries PER SHARD. 512 in-flight direct reads ≫ any observed
 /// per-lane governed depth (t32qd32 offers ≤ 1024 across 8 service
 /// threads, and each service thread owns its own shard; SQ-full
@@ -569,6 +600,19 @@ enum DdWriteSubmit {
     },
 }
 
+/// One drain pass's deferred tails (ACK-fast drain, write-wall campaign
+/// 2026-08-12): everything a write postlude may do AFTER its ACK is
+/// collected here and runs once the batch's last ACK has posted —
+/// `times` feeds ONE coalesced durable-times handoff (ino-deduped),
+/// `trains` holds each op's still-held block guard for the conveyor
+/// pump (follower re-drives pay SQE prep + inline TX — the inter-pop
+/// stall term the `device_cq` decomposition convicted).
+#[derive(Default)]
+struct DrainBatch {
+    times: Vec<(u64, u64, Option<usize>)>,
+    trains: Vec<((u64, u32), tokio::sync::MutexGuard<'static, ()>)>,
+}
+
 struct EngineState {
     inflight: Vec<Option<PendingOp>>,
     free: Vec<usize>,
@@ -834,6 +878,9 @@ impl DirectDriveEngine {
         // Fresh engine: no shard reaper is live yet (spawn-on-first-
         // submit) — the gauge reflects THIS engine from here on.
         METRICS.ipc_direct_shards.store(0, Ordering::Relaxed);
+        *TEST_ENGINE
+            .lock()
+            .expect("test engine registry never poisons") = Some(Arc::downgrade(&engine));
         log::info!(
             "ipc direct-drive engine up: {} volume(s), {} shard(s), entries={}/shard",
             engine.vols.len(),
@@ -1730,6 +1777,16 @@ impl DirectDriveEngine {
         if TEST_DDW_CQE_HOLD.load(Ordering::Relaxed) {
             return 0;
         }
+        // ACK-fast drain (write-wall campaign 2026-08-12): the batch
+        // context. Per-op postludes keep every pre-ACK law inline
+        // (publish_block, purges, LRU drops, attr publish, inval, ACK);
+        // the HEAVY tails — the durable-times handoff (one dispatch per
+        // batch, inos deduped) and the train pump (follower re-drives:
+        // SQE prep + inline nvme-tcp TX) — defer past the LAST ACK, so
+        // a CQE popped mid-batch never waits behind a sibling's tail.
+        // Two small per-BATCH allocations (~40 ops amortize them; the
+        // op-economy law governs per-OP allocs).
+        let mut batch = DrainBatch::default();
         let shard = &self.shards[idx];
         // SAFETY: exactly one CQ accessor at a time — the caller holds
         // `cq_gate` (module docs; the fusion campaign's gate).
@@ -1790,9 +1847,34 @@ impl DirectDriveEngine {
             );
             match pending {
                 PendingOp::Read(p) => self.finish(p, res, t_cqe_ns),
-                PendingOp::Write(p) => self.finish_write(p, res, t_cqe_ns),
+                PendingOp::Write(p) => self.finish_write(p, res, t_cqe_ns, &mut batch),
             }
             served += 1;
+        }
+        // The deferred tails — every ACK in the batch has posted.
+        if !batch.times.is_empty() {
+            let node = batch.times[0].2;
+            let entries: Vec<(u64, u64)> = {
+                // Dedup by ino keeping the max stamp (same-batch writes
+                // to one ino are one refinement park).
+                let mut m = std::collections::HashMap::with_capacity(batch.times.len());
+                for (ino, ns, _) in batch.times.drain(..) {
+                    let e = m.entry(ino).or_insert(0u64);
+                    *e = (*e).max(ns);
+                }
+                m.into_iter().collect()
+            };
+            METRICS
+                .ipc_dd_write_times_dispatches
+                .fetch_add(1, Ordering::Relaxed);
+            crate::ipc_service::spawn_dd_write_times_park_batch(
+                Arc::clone(&self.fs),
+                node,
+                entries,
+            );
+        }
+        for (key, guard) in batch.trains.drain(..) {
+            self.run_train(key, guard);
         }
         served
     }
@@ -1894,7 +1976,13 @@ impl DirectDriveEngine {
     /// non-ACK-blocking durable-times tail on the handler lanes. Runs on
     /// the shard reaper or the fusion inline arm — every step is
     /// synchronous and runtime-free except the dispatched tail.
-    fn finish_write(self: &Arc<Self>, pending: PendingWrite, res: i32, t_cqe_ns: u64) {
+    fn finish_write(
+        self: &Arc<Self>,
+        pending: PendingWrite,
+        res: i32,
+        t_cqe_ns: u64,
+        batch: &mut DrainBatch,
+    ) {
         let PendingWrite {
             op,
             completion,
@@ -1982,15 +2070,13 @@ impl DirectDriveEngine {
                 crate::fuse_client::IpcDirectPhase::Total,
                 std::time::Duration::from_nanos(end_ns.saturating_sub(snap.t0_ns)),
             );
-            // The non-ACK-blocking tail: the durable times refinement
-            // park, dispatched exactly once to the fuse3 handler lanes
-            // (the client ACK above never waits on tokio).
-            crate::ipc_service::spawn_dd_write_times_park(
-                Arc::clone(&self.fs),
-                op.payload.arena_node(),
-                snap.ino,
-                now_ns as u64,
-            );
+            // The non-ACK-blocking tail: collected into the drain
+            // batch — ONE coalesced handoff per batch (ino-deduped)
+            // after the last ACK, never a per-op dispatch (the 208 k/s
+            // dd→tpc wake edge the write-wall capture convicted).
+            batch
+                .times
+                .push((snap.ino, now_ns as u64, op.payload.arena_node()));
         } else {
             // A failed/short DMA fails exactly THIS write: nothing
             // acked, nothing parked, nothing lost — tiers purged and
@@ -2015,9 +2101,11 @@ impl DirectDriveEngine {
         // byte was consumed by the kernel.
         drop(bounce);
         drop(op);
-        // The conveyor: pop this block's parked followers under the
-        // still-held guard, or close the train and release it.
-        self.run_train(train_key, block_guard);
+        // The conveyor pump DEFERS to the batch tail (ACK-fast drain):
+        // the guard stays held — parked followers still re-drive under
+        // the leader's tenure in FIFO order — but their SQE prep +
+        // inline TX no longer run between a sibling CQE's pop and ACK.
+        batch.trains.push((train_key, block_guard));
     }
 
     /// The per-block follower conveyor's CQE-side pump: while the guard

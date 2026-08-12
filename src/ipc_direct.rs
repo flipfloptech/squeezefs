@@ -308,6 +308,12 @@ struct Pending {
     /// (CLOCK_MONOTONIC ns — r5 single-read law; `snap.t0_ns` anchors
     /// `admit`/`total`).
     t_insert_ns: u64,
+    /// `sq_wait`/`device_cq` split anchor: the instant of the
+    /// `io_uring_enter` that carried this SQE, stamped at the
+    /// `pending_submits` claim under the shard state lock. `0` = the
+    /// racer class (published after a concurrent claim, swept into that
+    /// claimer's enter) — records no `sq_wait`, full-span `device_cq`.
+    t_flush_ns: u64,
 }
 
 /// One in-flight direct-drive WRITE (design-il-direct-write §3, PR-3):
@@ -337,6 +343,8 @@ struct PendingWrite {
     inval: Option<Arc<crate::ipc_service::Invalidator>>,
     /// `ipc_direct_phase_ns` `inflight` anchor (r5 single-read law).
     t_insert_ns: u64,
+    /// The carrying-enter stamp (see [`Pending::t_flush_ns`]).
+    t_flush_ns: u64,
 }
 
 /// Ops per guard tenure AND the park queue's capacity: ONE ring depth's
@@ -518,6 +526,28 @@ impl PendingOp {
             PendingOp::Write(p) => p.t_insert_ns,
         }
     }
+
+    fn t_flush_ns(&self) -> u64 {
+        match self {
+            PendingOp::Read(p) => p.t_flush_ns,
+            PendingOp::Write(p) => p.t_flush_ns,
+        }
+    }
+
+    /// Stamp the carrying enter (claim-and-stamp — see
+    /// [`DirectDriveEngine::claim_and_stamp`]). Records the op's
+    /// `sq_wait` span with the caller's single clock read.
+    fn stamp_flush(&mut self, now_ns: u64) {
+        let (t_insert, slot) = match self {
+            PendingOp::Read(p) => (p.t_insert_ns, &mut p.t_flush_ns),
+            PendingOp::Write(p) => (p.t_insert_ns, &mut p.t_flush_ns),
+        };
+        *slot = now_ns;
+        crate::fuse_client::ipc_direct_phase_record_span(
+            crate::fuse_client::IpcDirectPhase::SqWait,
+            std::time::Duration::from_nanos(now_ns.saturating_sub(t_insert)),
+        );
+    }
 }
 
 /// [`DirectDriveEngine::submit_write_core`]'s outcome: every
@@ -543,6 +573,10 @@ struct EngineState {
     inflight: Vec<Option<PendingOp>>,
     free: Vec<usize>,
     inflight_count: usize,
+    /// Slab idxs inserted since the last claimed enter — drained by
+    /// [`DirectDriveEngine::claim_and_stamp`] (the `sq_wait`/`device_cq`
+    /// split's stamp list; reused Vec, no steady-state allocation).
+    staged: Vec<usize>,
 }
 
 /// A registered data volume: fixed-file index when registration
@@ -772,6 +806,7 @@ impl DirectDriveEngine {
                     inflight: Vec::with_capacity(RING_ENTRIES as usize),
                     free: Vec::new(),
                     inflight_count: 0,
+                    staged: Vec::with_capacity(RING_ENTRIES as usize),
                 }),
                 cq_gate: Mutex::new(()),
                 use_fixed,
@@ -957,6 +992,7 @@ impl DirectDriveEngine {
             win_skew,
             bounce,
             t_insert_ns,
+            t_flush_ns: 0,
         };
 
         // Lane routing: this thread's shard (service threads pin their
@@ -1009,6 +1045,10 @@ impl DirectDriveEngine {
                 // (client backpressure via the handler path).
                 sq.sync();
                 drop(sq);
+                // This enter carries the previously staged SQEs — stamp
+                // them (we hold the state lock; the current op is not
+                // yet staged, its push failed).
+                Self::stamp_staged_locked(&mut st);
                 let _ = shard.ring.submit();
                 // SAFETY: as above — still under the mutex.
                 let mut sq = unsafe { shard.ring.submission_shared() };
@@ -1031,6 +1071,7 @@ impl DirectDriveEngine {
             }
             st.inflight[idx] = Some(PendingOp::Read(pending));
             st.inflight_count += 1;
+            st.staged.push(idx);
         }
         // Issue cadence (r5 calibrated re-adjudication): sweep-only by
         // default — the SQE becomes kernel-visible at the sweep tail
@@ -1302,6 +1343,7 @@ impl DirectDriveEngine {
             bounce,
             inval,
             t_insert_ns,
+            t_flush_ns: 0,
         };
         let shard = &self.shards[lane];
 
@@ -1339,6 +1381,10 @@ impl DirectDriveEngine {
                 // (client backpressure via the handler path).
                 sq.sync();
                 drop(sq);
+                // This enter carries the previously staged SQEs — stamp
+                // them (we hold the state lock; the current op is not
+                // yet staged, its push failed).
+                Self::stamp_staged_locked(&mut st);
                 let _ = shard.ring.submit();
                 // SAFETY: as above — still under the mutex.
                 let mut sq = unsafe { shard.ring.submission_shared() };
@@ -1365,6 +1411,7 @@ impl DirectDriveEngine {
             }
             st.inflight[idx] = Some(PendingOp::Write(pending));
             st.inflight_count += 1;
+            st.staged.push(idx);
         }
         // Issue cadence: sweep-only by default (the r5 calibrated law);
         // the explicit eager lever keeps its meaning for writes too.
@@ -1430,8 +1477,42 @@ impl DirectDriveEngine {
     /// pending count, so concurrent callers never double-enter for the
     /// same published tail (and a lost race is harmless — the other
     /// caller's enter carried the SQEs).
-    fn flush_shard(lane: usize, shard: &DdShard) {
+    /// Stamp every staged-and-unstamped op with `now_ns` as its carrying
+    /// enter (records `sq_wait`; the `t_flush_ns != 0` screen makes a
+    /// ghost/reused slab idx harmless — a slot is stamped at most once
+    /// per op). Caller holds the shard state lock and owes an enter.
+    fn stamp_staged_locked(st: &mut EngineState) {
+        if st.staged.is_empty() {
+            return;
+        }
+        let now_ns = crate::mono_core::monotonic_ns_u64();
+        while let Some(idx) = st.staged.pop() {
+            if let Some(p) = st.inflight.get_mut(idx).and_then(Option::as_mut) {
+                if p.t_flush_ns() == 0 {
+                    p.stamp_flush(now_ns);
+                }
+            }
+        }
+    }
+
+    /// Swap-claim the shard's published tail AND stamp the carried ops
+    /// (`sq_wait`/`device_cq` split, write-wall campaign 2026-08-11).
+    /// Returns whether the caller owes an enter. Cost: one short state
+    /// hold + ONE clock read per claimed enter — never per op (r5).
+    fn claim_and_stamp(shard: &DdShard) -> bool {
         if shard.pending_submits.swap(0, Ordering::AcqRel) == 0 {
+            return false;
+        }
+        let mut st = shard
+            .state
+            .lock()
+            .expect("direct-drive state mutex never poisons");
+        Self::stamp_staged_locked(&mut st);
+        true
+    }
+
+    fn flush_shard(lane: usize, shard: &DdShard) {
+        if !Self::claim_and_stamp(shard) {
             return;
         }
         for attempt in 0..3 {
@@ -1490,6 +1571,11 @@ impl DirectDriveEngine {
                     return;
                 }
             }
+            // The reaper's enter carries any published-but-unclaimed
+            // SQEs (its `submit_and_wait` submits unconditionally) —
+            // claim-and-stamp them so their `sq_wait` closes at the
+            // enter that actually carried them.
+            Self::claim_and_stamp(shard);
             match self.reaper_wait(shard) {
                 Ok(_) => {}
                 Err(e) if e.raw_os_error() == Some(libc::EINTR) => {}
@@ -1683,11 +1769,24 @@ impl DirectDriveEngine {
             // ipc_direct_phase_ns: `inflight` closes at the CQE pop
             // (slab insert → here — SQE push + flush-batch wait +
             // device service + reap batching); the SAME ns read
-            // anchors `finish` — one clock read (r5 single-read law).
+            // anchors `device_cq` and `finish` — one clock read (r5
+            // single-read law).
             let t_cqe_ns = crate::mono_core::monotonic_ns_u64();
             crate::fuse_client::ipc_direct_phase_record_span(
                 crate::fuse_client::IpcDirectPhase::Inflight,
                 std::time::Duration::from_nanos(t_cqe_ns.saturating_sub(pending.t_insert_ns())),
+            );
+            // The split's second half: carrying enter → CQE pop. An
+            // unstamped op (`t_flush_ns == 0` — the racer class, or a
+            // shutdown straggler) records the FULL span here and no
+            // sq_wait, so the two halves never double-count.
+            let cq_anchor = match pending.t_flush_ns() {
+                0 => pending.t_insert_ns(),
+                t => t,
+            };
+            crate::fuse_client::ipc_direct_phase_record_span(
+                crate::fuse_client::IpcDirectPhase::DeviceCq,
+                std::time::Duration::from_nanos(t_cqe_ns.saturating_sub(cq_anchor)),
             );
             match pending {
                 PendingOp::Read(p) => self.finish(p, res, t_cqe_ns),
@@ -1711,6 +1810,7 @@ impl DirectDriveEngine {
             win_skew,
             bounce,
             t_insert_ns: _,
+            t_flush_ns: _,
         } = pending;
         let exact = res >= 0 && res as usize == window;
         if exact && self.fs.ipc_direct_revalidate(&snap) {
@@ -1804,6 +1904,7 @@ impl DirectDriveEngine {
             bounce,
             inval,
             t_insert_ns: _,
+            t_flush_ns: _,
         } = pending;
         let len = snap.len as usize;
         let exact = res >= 0 && res as usize == len;

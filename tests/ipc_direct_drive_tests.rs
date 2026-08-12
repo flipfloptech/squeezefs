@@ -1116,6 +1116,84 @@ async fn direct_drive_serves_record_residence_phases() {
 }
 
 // ---------------------------------------------------------------------------
+// 6b''. inflight split — `sq_wait` / `device_cq` (write-wall campaign,
+//     2026-08-11, `.benchmarks/2026-08-11-write-wall-offcpu-attribution.md`):
+//     the plateau verdict named the residence surplus as SQE/CQE
+//     lane-cadence quantization, but `inflight` (slab insert → CQE pop)
+//     conflated its two quanta — staged-waiting-for-the-sweep-flush and
+//     kernel+CQ-waiting-for-a-reap-point — so every cadence lever read as
+//     an IOPS-only wash with no per-quantum attribution. Contract:
+//       sq_wait   = slab insert → the enter that carried the SQE (stamped
+//                   at the pending_submits claim, under the shard state
+//                   lock, ONE clock read per enter — r5 economy)
+//       device_cq = that enter → CQE pop (device/fabric service + CQ
+//                   residence + reap batching; `− kernel submit→complete`
+//                   from tracepoints = the reap-wait term by subtraction)
+//     Laws: containment `inflight ≈ sq_wait + device_cq` (same-op spans);
+//     count `n(device_cq) == n(inflight)` exactly (an unstamped racer —
+//     an SQE published after a concurrent claim but carried by its enter
+//     — records device_cq over the full span and NO sq_wait, so
+//     n(sq_wait) ≤ n(inflight), equal on serial fixtures).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn direct_drive_inflight_splits_into_sq_wait_and_device_cq() {
+    let fx = Fixture::new("infsplit").await;
+    fx.salt_inos(5).await;
+    let ino = fx.create_striped("infsplit.bin", &[0, 1]).await;
+    let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("repo-dir tempdir");
+    let fd = odirect_standin(&fx, &dir, "infsplit.bin", ino);
+    let (session, binding) = ClientSession::establish(&fx, &fd);
+    fx.fs.router.set_direct_device_true(true);
+
+    let stats0: serde_json::Value =
+        serde_json::from_str(&fx.fs.generate_stats_json().await).expect("stats json parses");
+    let before: Vec<u64> = ["inflight", "sq_wait", "device_cq"]
+        .iter()
+        .map(|p| phase_counts(&stats0, p))
+        .collect();
+
+    let n = 4u64;
+    let d0 = snap();
+    for i in 0..n {
+        let got = tokio::task::block_in_place(|| {
+            session.ring_pread(binding, (8 + i) * 4096, 4096, 0, "infsplit read")
+        });
+        assert_eq!(got.len(), 4096, "served read {i}");
+    }
+    let d = delta(&d0);
+    fx.fs.router.set_direct_device_true(false);
+    assert_eq!(d.dd_serves, n, "split rows require direct-drive engagement");
+
+    let stats1: serde_json::Value =
+        serde_json::from_str(&fx.fs.generate_stats_json().await).expect("stats json parses");
+    let grew: Vec<u64> = ["inflight", "sq_wait", "device_cq"]
+        .iter()
+        .enumerate()
+        .map(|(i, p)| phase_counts(&stats1, p) - before[i])
+        .collect();
+    // Count law: every popped CQE records device_cq alongside inflight.
+    assert!(
+        grew[0] >= n,
+        "every serve records inflight (grew {}, want ≥ {n})",
+        grew[0]
+    );
+    assert_eq!(
+        grew[2], grew[0],
+        "device_cq count must equal inflight count exactly (an op cannot \
+         pop without a device_cq span)"
+    );
+    // Serial fixture: each op is inserted then flushed by the same
+    // thread, so every op is stamped — sq_wait matches too.
+    assert_eq!(
+        grew[1], grew[0],
+        "serial ops must all stamp sq_wait (racer skew is impossible \
+         on a serial fixture)"
+    );
+    fx.shutdown();
+}
+
+// ---------------------------------------------------------------------------
 // 6b'. ingress residence (reap-fanin campaign, 2026-08-08): every stamped
 //      ring op records ONE measured client→daemon ingress sample at the
 //      dequeue — the term the shim-iops ledger could only derive by

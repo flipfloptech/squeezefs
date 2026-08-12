@@ -3082,6 +3082,9 @@ pub enum IpcDirectPhase {
     Admit = 0,
     /// Slab insert → CQE popped by the shard reaper: SQE push +
     /// flush-batch wait + device/fabric service + reap batching.
+    /// Splits as `inflight ≈ sq_wait + device_cq` (write-wall campaign
+    /// 2026-08-11 — the plateau's two conflated quanta, split so cadence
+    /// levers stop reading as IOPS-only washes).
     Inflight = 1,
     /// CQE popped → slot completion posted: revalidate + serve
     /// accounting (+ the bounce leg's request-slice copy).
@@ -3090,10 +3093,29 @@ pub enum IpcDirectPhase {
     /// `fio clat − total` = client + ring-ingress residence (the
     /// campaign ledger's subtraction).
     Total = 3,
+    /// Slab insert → the `io_uring_enter` that carried the SQE (the
+    /// sweep-flush quantum). Stamped at the `pending_submits` claim
+    /// under the shard state lock — ONE clock read per enter, never
+    /// per op (r5 economy). An SQE published after a concurrent claim
+    /// but swept into that claimer's enter records NO sq_wait (its
+    /// device_cq covers the full span), so `n(sq_wait) ≤ n(inflight)`.
+    SqWait = 4,
+    /// The carrying enter → CQE pop: device/fabric service + CQ
+    /// residence + reap batching. `n(device_cq) == n(inflight)` exactly;
+    /// `device_cq − kernel submit→complete` (tracepoints) = the
+    /// reap-wait term by subtraction.
+    DeviceCq = 5,
 }
 
-const IPC_DIRECT_PHASES: usize = 4;
-const IPC_DIRECT_PHASE_NAMES: [&str; IPC_DIRECT_PHASES] = ["admit", "inflight", "finish", "total"];
+const IPC_DIRECT_PHASES: usize = 6;
+const IPC_DIRECT_PHASE_NAMES: [&str; IPC_DIRECT_PHASES] = [
+    "admit",
+    "inflight",
+    "finish",
+    "total",
+    "sq_wait",
+    "device_cq",
+];
 
 static IPC_DIRECT_PROF: Lazy<[LatencyHistogram; IPC_DIRECT_PHASES]> =
     Lazy::new(|| std::array::from_fn(|_| LatencyHistogram::default()));

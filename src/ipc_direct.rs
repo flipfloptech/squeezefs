@@ -404,7 +404,7 @@ struct ParkedWrite {
 /// "any entry in the queue while `open` is observed by the closing
 /// drain or a CQE pop", serialized by the map's per-entry exclusive
 /// access.
-struct TrainState {
+struct TrainState<P> {
     open: bool,
     /// Ops served under the current guard tenure (leader = 1); the
     /// [`TRAIN_BOUND`] cap is what keeps fold/flush/handler waiters on
@@ -412,7 +412,7 @@ struct TrainState {
     tenure: u32,
     /// FIFO per block (pop order == park order). Capacity is retained
     /// across tenures (steady-state parks/pops allocate nothing).
-    queue: std::collections::VecDeque<ParkedWrite>,
+    queue: std::collections::VecDeque<P>,
 }
 
 /// The per-block follower conveyor registry (design-il-direct-write §6
@@ -422,11 +422,24 @@ struct TrainState {
 /// ~100 B + retained queue capacity per contended block, bounded by the
 /// working set; the only correct sweep signal is the ino's death and a
 /// lost entry would cost correctness here, not one extra notify).
-struct WriteTrains {
-    map: scc::HashMap<(u64, u32), TrainState>,
+struct WriteTrains<P = ParkedWrite> {
+    map: scc::HashMap<(u64, u32), TrainState<P>>,
 }
 
-impl WriteTrains {
+/// One residual-drain pop outcome (the re-park livelock fix, 2026-08-12):
+/// `Rearmed` = the train re-opened under a NEW leader while the drain
+/// ran — the drain must STOP (the leader's CQE pump owns the queue), and
+/// on the reap thread it must stop URGENTLY: the drain runs under
+/// `cq_gate`, so spinning here blocks the very CQE that would end the
+/// new leader's tenure — the qd12+ field wedge (160 s stripe waits, the
+/// 2.2 B park/redrive ping-pong).
+enum ResidualPop<P> {
+    Popped(P),
+    Rearmed,
+    Empty,
+}
+
+impl<P> WriteTrains<P> {
     fn new() -> Self {
         Self {
             map: scc::HashMap::new(),
@@ -457,7 +470,7 @@ impl WriteTrains {
     /// Park a follower on `key`'s OPEN train (counted). `Err` hands the
     /// entry back: no train / closed / at the [`TRAIN_BOUND`] cap — the
     /// caller falls back on the honest `block_lock` arm.
-    fn try_park(&self, key: (u64, u32), parked: ParkedWrite) -> Result<(), ParkedWrite> {
+    fn try_park(&self, key: (u64, u32), parked: P) -> Result<(), P> {
         match self.map.entry_sync(key) {
             scc::hash_map::Entry::Occupied(mut o) => {
                 let t = o.get_mut();
@@ -482,7 +495,7 @@ impl WriteTrains {
     /// access, which is what makes a park-vs-close race impossible: a
     /// parker either lands before this (and is popped here or by the
     /// residual drain) or observes `open == false` and falls back.
-    fn pop_under_tenure(&self, key: (u64, u32)) -> Option<ParkedWrite> {
+    fn pop_under_tenure(&self, key: (u64, u32)) -> Option<P> {
         match self.map.entry_sync(key) {
             scc::hash_map::Entry::Occupied(mut o) => {
                 let t = o.get_mut();
@@ -513,11 +526,41 @@ impl WriteTrains {
     }
 
     /// Drain one residual after a close (counted as a re-drive — it left
-    /// the queue toward a disposition). With `open == false` no new park
-    /// can land, so the drain terminates; a concurrent RE-ARM (a
-    /// residual that won a fresh try_lock) legally interleaves — either
-    /// consumer pops each entry exactly once, FIFO preserved.
-    fn pop_parked(&self, key: (u64, u32)) -> Option<ParkedWrite> {
+    /// the queue toward a disposition). Pops ONLY while the train stays
+    /// CLOSED: with `open == false` no new park can land, so the drain
+    /// terminates — and a concurrent RE-ARM (a residual that won a fresh
+    /// try_lock) transfers queue ownership to the NEW leader's CQE pump
+    /// ([`ResidualPop::Rearmed`] — the drain STOPS). The pre-fix
+    /// unconditional pop is the qd12+ field wedge: a popped residual
+    /// re-parked onto the re-armed train the drain was popping — a
+    /// ping-pong at memory speed, on the reap thread, under `cq_gate`,
+    /// blocking the very CQE that would close the new tenure (2.2 B
+    /// park/redrive pairs, 160 s stripe waits).
+    fn pop_residual(&self, key: (u64, u32)) -> ResidualPop<P> {
+        match self.map.entry_sync(key) {
+            scc::hash_map::Entry::Occupied(mut o) => {
+                let t = o.get_mut();
+                if t.open {
+                    return ResidualPop::Rearmed;
+                }
+                match t.queue.pop_front() {
+                    Some(p) => {
+                        METRICS
+                            .ipc_dd_write_park_redrives
+                            .fetch_add(1, Ordering::Relaxed);
+                        ResidualPop::Popped(p)
+                    }
+                    None => ResidualPop::Empty,
+                }
+            }
+            scc::hash_map::Entry::Vacant(_) => ResidualPop::Empty,
+        }
+    }
+
+    /// Unconditional drain — the ring-death leak arm ONLY (no CQE pump
+    /// will ever run again on that shard, so ownership transfer is
+    /// meaningless there; every parked op must fail LOUD).
+    fn pop_any(&self, key: (u64, u32)) -> Option<P> {
         match self.map.entry_sync(key) {
             scc::hash_map::Entry::Occupied(mut o) => {
                 let p = o.get_mut().queue.pop_front();
@@ -1242,7 +1285,7 @@ impl DirectDriveEngine {
     ) {
         self.trains.close(key);
         drop(guard);
-        while let Some(parked) = self.trains.pop_parked(key) {
+        while let ResidualPop::Popped(parked) = self.trains.pop_residual(key) {
             crate::ipc_service::spawn_write_handoff(
                 Arc::clone(&self.fs),
                 self.ring_request(),
@@ -1690,7 +1733,7 @@ impl DirectDriveEngine {
                             drop(st);
                             for key in wedged_trains {
                                 self.trains.close(key);
-                                while let Some(parked) = self.trains.pop_parked(key) {
+                                while let Some(parked) = self.trains.pop_any(key) {
                                     log::error!(
                                         "ipc direct-drive: failing parked follower on \
                                          ino {} block {} LOUD (EIO) — its train's guard \
@@ -2132,9 +2175,13 @@ impl DirectDriveEngine {
         loop {
             let Some(parked) = self.trains.pop_under_tenure(key) else {
                 // Tenure closed (bound hit or queue empty): release the
-                // guard, then drain residuals via the normal drive.
+                // guard, then drain residuals via the normal drive. A
+                // Rearmed pop STOPS the drain — the residual that won
+                // the fresh try_lock is the new leader and its CQE pump
+                // owns the queue (this thread may hold `cq_gate`; only
+                // by returning can that CQE ever be drained).
                 drop(guard);
-                while let Some(parked) = self.trains.pop_parked(key) {
+                while let ResidualPop::Popped(parked) = self.trains.pop_residual(key) {
                     let ParkedWrite {
                         op,
                         completion,
@@ -2287,6 +2334,62 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), 3, "three foreign threads get three lanes");
+    }
+
+    /// The re-park livelock rail (field wedge 2026-08-12, qd12+: 2.2 B
+    /// park/redrive ping-pong pairs on the reap thread under `cq_gate`,
+    /// 160 s stripe waits): a residual drain that observes a RE-ARMED
+    /// train must STOP — the new leader's CQE pump owns the queue. The
+    /// pre-fix unconditional pop popped the re-armed train's entries,
+    /// which the normal drive then re-parked onto the SAME queue: the
+    /// exact ping-pong, reconstructed here move by move.
+    #[test]
+    fn residual_drain_stops_when_the_train_rearms() {
+        let trains: WriteTrains<u32> = WriteTrains::new();
+        let key = (7u64, 3u32);
+        // Leader arms, follower parks, tenure exhausts (close).
+        trains.arm(key);
+        trains.try_park(key, 11).expect("park on the open train");
+        trains.try_park(key, 12).expect("park on the open train");
+        assert!(matches!(trains.pop_under_tenure(key), Some(11)));
+        // Simulate the tenure bound: close without popping 12.
+        trains.close(key);
+        // Residual drain begins; a residual (11) won a fresh try_lock
+        // mid-drain and RE-ARMED the train.
+        trains.arm(key);
+        // The old semantics popped 12 here — and the normal drive,
+        // seeing an OPEN dd-lane train, parked it right back: the
+        // ping-pong. The fixed drain observes the re-arm and stops.
+        assert!(
+            matches!(trains.pop_residual(key), ResidualPop::Rearmed),
+            "a residual drain must never pop from a re-armed train \
+             (queue ownership transferred to the live leader's CQE pump)"
+        );
+        // The queue is intact for the new leader's pump.
+        assert!(matches!(trains.pop_under_tenure(key), Some(12)));
+        trains.close(key);
+        assert!(matches!(trains.pop_residual(key), ResidualPop::Empty));
+    }
+
+    /// The closed-train residual drain still drains (the fix must not
+    /// strand residuals when NO re-arm happens), and the ring-death
+    /// leak arm's unconditional pop keeps working on an open train
+    /// (no CQE pump will ever run there).
+    #[test]
+    fn residual_drain_drains_closed_trains_and_leak_arm_pops_any() {
+        let trains: WriteTrains<u32> = WriteTrains::new();
+        let key = (9u64, 1u32);
+        trains.arm(key);
+        trains.try_park(key, 21).expect("park");
+        trains.try_park(key, 22).expect("park");
+        trains.close(key);
+        assert!(matches!(trains.pop_residual(key), ResidualPop::Popped(21)));
+        assert!(matches!(trains.pop_residual(key), ResidualPop::Popped(22)));
+        assert!(matches!(trains.pop_residual(key), ResidualPop::Empty));
+        // Leak arm: pops regardless of open state.
+        trains.arm(key);
+        trains.try_park(key, 23).expect("park");
+        assert_eq!(trains.pop_any(key), Some(23), "ring-death arm pops any");
     }
 
     /// The eager-flush lever after the r4 re-grade: explicit K wins

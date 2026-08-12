@@ -228,18 +228,23 @@ fn dd_eager_flush_from(v: Option<&str>) -> Option<u32> {
         .map(|n| n.clamp(0, RING_ENTRIES))
 }
 
-/// The issue-cadence law after the r5 CALIBRATED re-adjudication:
-/// ABSENT/0 = sweep-only (the M3 submit-batch posture — one enter per
-/// drain sweep), explicit K wins verbatim. The r4 derived-adaptive arm
-/// (un-issued tail ≤ kernel_inflight/8) was FALSIFIED on the licensed
-/// venue (`.benchmarks/2026-08-08-iops-internal-time-r5.md` §calibration:
-/// sweep-only 955 k vs adaptive 822 k vs K=16 878 k at 32×32 over the
-/// calibrated ~316 µs operating point — every mid-sweep enter taxes the
-/// svc thread more than issue promptness pays once the sweep cadence
-/// itself is prompt; r4's +19 % was an artifact of its miscalibrated
-/// 2.5×-slow venue) and deleted per the no-dead-code law. The knob
-/// stays the counted measurement lever.
-fn dd_eager_threshold(explicit: Option<u32>) -> u32 {
+/// The issue-cadence law, third adjudication (write-wall Addendum 7,
+/// 2026-08-12): the r5 sweep-only ruling was counted when the REAP
+/// cycle was the wall; with the ACK-fast drain the system is
+/// fabric-RTT × in-kernel-concurrency limited and issue promptness
+/// PAYS again — the counted qd32 sweep peaked at K=16 (+4–8 % in two
+/// independent A-B-B-A windows: 849/847 k vs off 776/782 k; 839 k vs
+/// off 808 k). BUT no closed-form derivation captured it: the
+/// `inflight/2` candidate was FALSIFIED in-bracket (785/799 k vs its
+/// own 808 k control — at steady per-shard inflight ≈ 40 the threshold
+/// exceeds the sweep size and collapses to sweep-only behavior), so per
+/// the no-fixed-constants law the DEFAULT stays sweep-only and the
+/// measured optimum ships only as the explicit lever. The sanctioned
+/// follow-on is a `ProbeCore` cadence governor (the write-pipeline /
+/// read-lane pattern): probe the threshold on delivery, adopt on
+/// response — board item, not this commit. `inflight` stays a
+/// parameter so the law test pins that ABSENT ignores it.
+fn dd_eager_threshold(explicit: Option<u32>, _inflight: u32) -> u32 {
     match explicit {
         Some(k) if k > 0 => k,
         _ => u32::MAX,
@@ -1116,6 +1121,7 @@ impl DirectDriveEngine {
         let shard = &self.shards[lane];
 
         // Slab insert + SQE push under the ONE shard mutex.
+        let inflight_now;
         {
             let mut st = shard
                 .state
@@ -1175,16 +1181,11 @@ impl DirectDriveEngine {
             st.inflight[idx] = Some(PendingOp::Read(pending));
             st.inflight_count += 1;
             st.staged.push(idx);
+            inflight_now = st.inflight_count as u32;
         }
-        // Issue cadence (r5 calibrated re-adjudication): sweep-only by
-        // default — the SQE becomes kernel-visible at the sweep tail
-        // (`flush`); every mid-sweep enter taxes the svc thread more
-        // than issue promptness pays once the sweep cadence is prompt
-        // (the r4 adaptive arm was falsified on the licensed venue).
-        // Explicit `SQUEEZEFS_IPC_DD_EAGER_FLUSH=K` remains the counted
-        // measurement lever.
+        // Issue cadence (BDP-derived — see `dd_eager_threshold`).
         let pending = shard.pending_submits.fetch_add(1, Ordering::Release) + 1;
-        if pending >= dd_eager_threshold(dd_eager_flush()) {
+        if pending >= dd_eager_threshold(dd_eager_flush(), inflight_now) {
             Self::flush_shard(lane, shard);
         }
         Ok(())
@@ -1452,6 +1453,7 @@ impl DirectDriveEngine {
 
         // Slab insert + WRITE SQE push under the ONE shard mutex (the
         // read submit's discipline verbatim, direction reversed).
+        let inflight_now;
         {
             let mut st = shard
                 .state
@@ -1515,11 +1517,11 @@ impl DirectDriveEngine {
             st.inflight[idx] = Some(PendingOp::Write(pending));
             st.inflight_count += 1;
             st.staged.push(idx);
+            inflight_now = st.inflight_count as u32;
         }
-        // Issue cadence: sweep-only by default (the r5 calibrated law);
-        // the explicit eager lever keeps its meaning for writes too.
+        // Issue cadence (BDP-derived — see `dd_eager_threshold`).
         let pending_count = shard.pending_submits.fetch_add(1, Ordering::Release) + 1;
-        if pending_count >= dd_eager_threshold(dd_eager_flush()) {
+        if pending_count >= dd_eager_threshold(dd_eager_flush(), inflight_now) {
             Self::flush_shard(lane, shard);
         }
         DdWriteSubmit::Submitted
@@ -2425,15 +2427,35 @@ mod tests {
         assert_eq!(dd_eager_flush_from(Some("garbage")), None);
     }
 
-    /// The issue-cadence law after the r5 calibrated re-adjudication:
-    /// absent/0 = sweep-only (never mid-sweep — the shipped posture,
-    /// re-proven on the licensed venue), explicit K wins verbatim.
+    /// The issue-cadence law, third adjudication (write-wall
+    /// Addendum 7): K=16 is a COUNTED +4–8 % at qd32 on the RTT-limited
+    /// system, but the `inflight/2` closed-form derivation was
+    /// FALSIFIED in-bracket, so per the no-fixed-constants law ABSENT
+    /// stays sweep-only (and ignores the in-flight signal); the
+    /// probe-governor cadence is the board's sanctioned follow-on.
     #[test]
     fn dd_eager_threshold_law() {
-        assert_eq!(dd_eager_threshold(None), u32::MAX, "absent = sweep-only");
-        assert_eq!(dd_eager_threshold(Some(0)), u32::MAX, "0 = sweep-only");
-        assert_eq!(dd_eager_threshold(Some(4)), 4, "explicit wins verbatim");
-        assert_eq!(dd_eager_threshold(Some(16)), 16, "the K=16 measurement arm");
+        assert_eq!(
+            dd_eager_threshold(None, 32),
+            u32::MAX,
+            "absent = sweep-only"
+        );
+        assert_eq!(
+            dd_eager_threshold(None, 0),
+            u32::MAX,
+            "absent ignores inflight"
+        );
+        assert_eq!(
+            dd_eager_threshold(Some(0), 32),
+            u32::MAX,
+            "0 = sweep-only (A/B)"
+        );
+        assert_eq!(dd_eager_threshold(Some(4), 32), 4, "explicit wins verbatim");
+        assert_eq!(
+            dd_eager_threshold(Some(16), 0),
+            16,
+            "the counted K=16 measurement arm"
+        );
     }
 
     /// The service-lane pin wins over the fallback (the owner-partition

@@ -312,3 +312,34 @@ qd16 → 16.3 % @ qd32 → 25.5 % @ qd64, each fallback poisoning its block
 for same-block dd probes) — the qd-knee governor row stays on the board,
 now with the sweep's numbers. Standing best: **~830 k il rand-4k**
 (qd12–16 shapes), 740–753 k at the qd32 reference shape.
+
+## Addendum 5 (2026-08-12): pending-leader trains — FALSIFIED at the reference shape (not merged)
+
+The collision-cascade lever was built and counted (branch
+`perf/ddw-pending-leader` @ `aaa4969b`, left UNMERGED for review): an
+eligible dd write that loses the block try_lock with no open train arms
+the train atomically-once and becomes an async PENDING LEADER (awaits
+the same stripe guard FIFO-fair on the handler lanes, re-probes under
+the acquired guard, drives itself direct; Drop-enforced close
+containment; rails red-first, all suites green). The mechanism engaged
+PERFECTLY — serves 100 %, `block_lock` 0, handoffs ≈ 0, 1.96 M
+elections/row at qd32 — and the rows still lost: qd32 **710 k** (vs
+740–797 k dev-tip), qd16 **723 k** (vs 805 k), qd64 **637 k** (vs 561 k
+— the one win), with worse tails (max 385 ms).
+
+**The finding that matters: the handler demote is ACCIDENTALLY
+ADAPTIVE.** A same-block storm absorbed by the handler coalesces into
+RAM-speed `ActiveBlockBuf` merges (many ops, one eventual DMA); a train
+serializes the same storm as back-to-back ~250 µs fabric DMAs under one
+guard. Converting every collision to direct trades cheap RAM merges for
+serial fabric round-trips — net negative wherever collisions cluster,
+net positive only at qd64 where the cascade's queueing dominated. Any
+future lever here must be hybrid (lead only when the block's storm is
+shallow), which is a governor, not a policy — deferred with the qd-knee
+row.
+
+**Standing dev-tip confirmation row** (`fdf11fa4` pair, engaged, posture
+verified, 60 s, zero lock-wait lines): qd32 **797.2 k first / 783.4 k
+last @ 1.24 ms avg**. The net-700k+ stack in dev is: the
+`sq_wait`/`device_cq` split instrument (`32864139`), the ACK-fast batch
+drain (`3f65ccfe`), and the re-park wedge fix (`1ab085b3`).

@@ -1879,7 +1879,7 @@ pub(crate) fn check_component_name_len(name: &std::ffi::OsStr) -> Result<(), Err
 /// audit table, which must be sized to the ACTUAL lock population.
 pub const BLOCK_LOCK_STRIPES: usize = 4096;
 
-pub static BLOCK_FLUSH_LOCKS: Lazy<StripeLocks<tokio::sync::Mutex<()>, BLOCK_LOCK_STRIPES>> =
+pub static BLOCK_FLUSH_LOCKS: Lazy<StripeLocks<crate::sqz_sync::SqzMutex<()>, BLOCK_LOCK_STRIPES>> =
     Lazy::new(|| StripeLocks::new());
 
 /// Per-(ino, block) CUSTODY-TRANSFER epoch — the moving-custody read
@@ -2329,11 +2329,11 @@ pub fn write_phase_record(phase: WritePhase, started: Option<std::time::Instant>
 /// last-acquirer word BEFORE parking, then falls into the ordinary FIFO
 /// `lock().await`.
 async fn block_lock_acquire_prof(
-    lock: &tokio::sync::Mutex<()>,
+    lock: &crate::sqz_sync::SqzMutex<()>,
     site: BlockLockSite,
     ino: u64,
     b: u32,
-) -> (tokio::sync::MutexGuard<'_, ()>, Duration) {
+) -> (crate::sqz_sync::SqzMutexGuard<'_, ()>, Duration) {
     let key = stripe_key64(ino, b);
     let stripe = BLOCK_FLUSH_LOCKS.block_shard_index(ino, b);
     let t0 = std::time::Instant::now();
@@ -2373,7 +2373,7 @@ pub async fn block_lock_acquire_timed(
     ino: u64,
     b: u32,
     site: BlockLockSite,
-) -> (tokio::sync::MutexGuard<'static, ()>, Duration) {
+) -> (crate::sqz_sync::SqzMutexGuard<'static, ()>, Duration) {
     let lock = BLOCK_FLUSH_LOCKS.get_lock(ino, b);
     if !op_profile_enabled() {
         let t0 = std::time::Instant::now();
@@ -2388,11 +2388,11 @@ pub async fn block_lock_acquire_timed(
 /// registers a [`LockWaitToken`] so the watchdog can name this wait, and
 /// every acquisition stamps the stripe's last-holder word.
 async fn block_lock_census_acquire(
-    lock: &tokio::sync::Mutex<()>,
+    lock: &crate::sqz_sync::SqzMutex<()>,
     site: BlockLockSite,
     ino: u64,
     b: u32,
-) -> tokio::sync::MutexGuard<'_, ()> {
+) -> crate::sqz_sync::SqzMutexGuard<'_, ()> {
     let g = match lock.try_lock() {
         Ok(g) => g,
         Err(_) => {
@@ -2412,7 +2412,7 @@ pub async fn block_lock_acquire(
     ino: u64,
     b: u32,
     site: BlockLockSite,
-) -> tokio::sync::MutexGuard<'static, ()> {
+) -> crate::sqz_sync::SqzMutexGuard<'static, ()> {
     let lock = BLOCK_FLUSH_LOCKS.get_lock(ino, b);
     if !op_profile_enabled() {
         return block_lock_census_acquire(lock, site, ino, b).await;
@@ -2634,9 +2634,9 @@ pub fn log_lock_wait_census(threshold: Duration) {
 /// by `routing::meta_lock_acquire` — the lock lives in `routing`, the
 /// census here). Fast path: one `try_lock`.
 pub async fn census_meta_lock_acquire(
-    lock: &tokio::sync::Mutex<()>,
+    lock: &crate::sqz_sync::SqzMutex<()>,
     ino: u64,
-) -> tokio::sync::MutexGuard<'_, ()> {
+) -> crate::sqz_sync::SqzMutexGuard<'_, ()> {
     if let Ok(g) = lock.try_lock() {
         return g;
     }
@@ -3435,10 +3435,10 @@ fn merge_time_max(cached: Timestamp, incoming: Timestamp) -> Timestamp {
 /// `active_inode_locks` on the same ino (§4.2 must-not).
 enum HeldWriteGuard<'a> {
     Shared {
-        _g: tokio::sync::RwLockReadGuard<'a, ()>,
+        _g: crate::sqz_sync::SqzRwLockReadGuard<'a, ()>,
     },
     Exclusive {
-        _g: tokio::sync::RwLockWriteGuard<'a, ()>,
+        _g: crate::sqz_sync::SqzRwLockWriteGuard<'a, ()>,
     },
 }
 
@@ -6409,8 +6409,8 @@ pub struct SqueezefsFilesystem {
     uid: u32,
     gid: u32,
     active_leases: std::sync::Arc<dashmap::DashMap<u64, crate::dlm::LockLease, ahash::RandomState>>,
-    lease_locks: std::sync::Arc<StripeLocks<tokio::sync::Mutex<()>, 4096>>,
-    pub active_inode_locks: std::sync::Arc<StripeLocks<tokio::sync::RwLock<()>, 4096>>,
+    lease_locks: std::sync::Arc<StripeLocks<crate::sqz_sync::SqzMutex<()>, 4096>>,
+    pub active_inode_locks: std::sync::Arc<StripeLocks<crate::sqz_sync::SqzRwLock<()>, 4096>>,
     /// P1-4: capacity-bounded attribute cache (moka TTL + max_capacity).
     /// L3 coherence campaign (2026-08-08): read-mostly backing — the
     /// §5.5.1 probe's size read stops paying moka's per-read bookkeeping
@@ -8362,6 +8362,12 @@ impl SqueezefsFilesystem {
                 // reported instead of panicking a handler task
                 // (must stay 0 on a healthy daemon).
                 "invariant_tripwires": METRICS.invariant_tripwires.load(Ordering::Relaxed),
+                // OQ-5: sqz_sync tick-backstop engagements — an async
+                // lock acquire whose wake was lost re-polled at the
+                // 2 s tick instead of parking forever. 0 on healthy
+                // schedules; growth = a lost wake was absorbed, loudly
+                // (the backstop WORKING, never a wedge).
+                "lock_ticked_reregisters": crate::sqz_sync::TICK_RECOVERIES.load(Ordering::Relaxed),
                 "job_paused_capacity": METRICS.job_paused_capacity.load(Ordering::Relaxed),
                 "evacuate_blocks_moved": METRICS.evacuate_blocks_moved.load(Ordering::Relaxed),
                 "evacuate_bytes_moved": METRICS.evacuate_bytes_moved.load(Ordering::Relaxed),
@@ -9914,7 +9920,7 @@ impl SqueezefsFilesystem {
         }
     }
 
-    pub fn get_inode_lock(&self, ino: u64) -> &tokio::sync::RwLock<()> {
+    pub fn get_inode_lock(&self, ino: u64) -> &crate::sqz_sync::SqzRwLock<()> {
         self.active_inode_locks.get_inode_lock(ino)
     }
 
@@ -9943,7 +9949,7 @@ impl SqueezefsFilesystem {
         }
     }
 
-    pub fn get_inode_lock_ref(&self, ino: u64) -> &tokio::sync::RwLock<()> {
+    pub fn get_inode_lock_ref(&self, ino: u64) -> &crate::sqz_sync::SqzRwLock<()> {
         self.active_inode_locks.get_inode_lock(ino)
     }
 
@@ -10515,7 +10521,10 @@ impl SqueezefsFilesystem {
         kill_priv: bool,
         t0_ns: u64,
     ) -> Result<
-        (IpcDirectWriteSnapshot, tokio::sync::MutexGuard<'static, ()>),
+        (
+            IpcDirectWriteSnapshot,
+            crate::sqz_sync::SqzMutexGuard<'static, ()>,
+        ),
         IpcDirectWriteIneligible,
     > {
         use IpcDirectWriteIneligible as I;
@@ -14020,7 +14029,7 @@ impl SqueezefsFilesystem {
         b: u32,
         cache_key: &str,
         fencing_token: u64,
-        block_guard: tokio::sync::MutexGuard<'static, ()>,
+        block_guard: crate::sqz_sync::SqzMutexGuard<'static, ()>,
     ) -> Result<(), SqueezefsError> {
         let block_size = self.router.block_size.load(Ordering::Relaxed);
         {
@@ -23657,7 +23666,7 @@ async fn run_constant_writeback_worker(
     requeue_tx: tokio::sync::mpsc::Sender<WritebackRequest>,
     router: DataRouter,
     dlm: DlmClient,
-    active_inode_locks: std::sync::Arc<StripeLocks<tokio::sync::RwLock<()>, 4096>>,
+    active_inode_locks: std::sync::Arc<StripeLocks<crate::sqz_sync::SqzRwLock<()>, 4096>>,
     max_uploads: usize,
 ) {
     let upload_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_uploads));
@@ -23833,7 +23842,7 @@ async fn flush_due_active_blocks_for_inode(
     block_indices: Vec<u32>,
     router: &DataRouter,
     _dlm: &DlmClient,
-    _active_inode_locks: &StripeLocks<tokio::sync::RwLock<()>, 4096>,
+    _active_inode_locks: &StripeLocks<crate::sqz_sync::SqzRwLock<()>, 4096>,
 ) -> Result<(), SqueezefsError> {
     use futures::stream::{self, StreamExt};
 
@@ -24055,7 +24064,7 @@ async fn flush_single_active_block(
     owner_token: Option<u64>,
     router: &DataRouter,
     _dlm: &DlmClient,
-    active_inode_locks: &StripeLocks<tokio::sync::RwLock<()>, 4096>,
+    active_inode_locks: &StripeLocks<crate::sqz_sync::SqzRwLock<()>, 4096>,
     is_striped: bool,
 ) -> Result<(), SqueezefsError> {
     let _inode_guard = active_inode_locks.get_inode_lock(ino).read().await;

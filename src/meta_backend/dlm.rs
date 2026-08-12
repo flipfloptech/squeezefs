@@ -26,9 +26,9 @@
 //! volume order; each volume's set is internally canonical, so the
 //! composition remains cycle-free.
 
+use crate::sqz_sync::SqzRwLock as RwLock;
 use crate::stripe_locks::StripeLocks;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use xxhash_rust::xxh3::xxh3_64;
 
 const STRIPES: usize = 4096;
@@ -163,6 +163,6 @@ impl DlmLockManager {
 }
 
 pub enum DlmGuard {
-    Shared(tokio::sync::OwnedRwLockReadGuard<()>),
-    Exclusive(tokio::sync::OwnedRwLockWriteGuard<()>),
+    Shared(crate::sqz_sync::OwnedSqzRwLockReadGuard<()>),
+    Exclusive(crate::sqz_sync::OwnedSqzRwLockWriteGuard<()>),
 }

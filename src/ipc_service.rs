@@ -7,7 +7,7 @@
 //! themselves, so coherence is structural, never mirrored:
 //!
 //! - **Sync read fast path (§5.5.1)**: per-inode `try_read()` (sync-
-//!   callable on the shipped `tokio::sync::RwLock<()>`), then the read
+//!   callable on the shipped `crate::sqz_sync::SqzRwLock<()>`), then the read
 //!   handler's guarded hit-path probe
 //!   ([`SqueezefsFilesystem::ipc_read_probe_locked`]). On a hit the bytes
 //!   memcpy into the arena and the slot completes on the service thread —

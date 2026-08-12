@@ -553,7 +553,7 @@ pub struct RoutedMetaBackend {
     gates: SlotGates,
     /// PR VL5b: one slot migration at a time per routed set (the
     /// coordinator's one-flip-per-slot law, made structural).
-    pub(crate) migration_lock: tokio::sync::Mutex<()>,
+    pub(crate) migration_lock: crate::sqz_sync::SqzMutex<()>,
     /// Per-volume mint rotors (design-dynamic-meta-routing §5.4): a
     /// relaxed counter whose modulo over the mint set picks each fresh
     /// ino's slot. Relaxed is sufficient — the rotor feeds a pure
@@ -643,7 +643,7 @@ impl RoutedMetaBackend {
             }),
             legacy_slot: (0..n).map(|v| Some(v as u16)).collect(),
             gates: SlotGates::new(),
-            migration_lock: tokio::sync::Mutex::new(()),
+            migration_lock: crate::sqz_sync::SqzMutex::new(()),
             mint_rr: (0..n)
                 .map(|_| std::sync::atomic::AtomicUsize::new(0))
                 .collect(),
@@ -701,7 +701,7 @@ impl RoutedMetaBackend {
             }),
             legacy_slot,
             gates: SlotGates::new(),
-            migration_lock: tokio::sync::Mutex::new(()),
+            migration_lock: crate::sqz_sync::SqzMutex::new(()),
             mint_rr: (0..n)
                 .map(|_| std::sync::atomic::AtomicUsize::new(0))
                 .collect(),

@@ -9,7 +9,7 @@
 //! - [`CachedNode`] holds an **arc-swap'd immutable [`NodeSnapshot`]**
 //!   (the merged-sorted record view over the on-disk bset list plus every
 //!   frozen/open delta) and the mutable dirty delta guarded by the
-//!   per-node `tokio::sync::RwLock` (§4.4 pt 1 — the lock covers RAM
+//!   per-node `SqzRwLock` (§4.4 pt 1 — the lock covers RAM
 //!   mutation only, never device I/O).
 //! - **Reads are latch-free**: load the snapshot `Arc`, binary-search the
 //!   merged index, hand out `Bytes` views into the snapshot's backing
@@ -1118,7 +1118,7 @@ pub struct CachedNode {
     max_key: Vec<u8>,
     state: NodeState,
     snapshot: ArcSwap<NodeSnapshot>,
-    dirty: tokio::sync::RwLock<NodeDirty>,
+    dirty: crate::sqz_sync::SqzRwLock<NodeDirty>,
     /// Clock second-chance bit (set on access).
     ref_bit: AtomicBool,
     /// Interior nodes and tree roots never evict (§4.5).
@@ -1181,7 +1181,7 @@ impl CachedNode {
                 tail: Arc::new(Vec::new()),
                 memo: FoldMemo::new(charge.clone()),
             }),
-            dirty: tokio::sync::RwLock::new(NodeDirty {
+            dirty: crate::sqz_sync::SqzRwLock::new(NodeDirty {
                 overlay: Vec::new(),
                 overlay_bytes: 0,
                 head_bytes: 0,
@@ -1258,7 +1258,7 @@ impl CachedNode {
     /// The per-node write lock (§4.4 pt 1 / §4.9 4b). Commit-path writers
     /// take it on **leaves only**; interior locks belong to the serialized
     /// SMO task — that split is what keeps the lock populations acyclic.
-    pub fn lock(&self) -> &tokio::sync::RwLock<NodeDirty> {
+    pub fn lock(&self) -> &crate::sqz_sync::SqzRwLock<NodeDirty> {
         &self.dirty
     }
 

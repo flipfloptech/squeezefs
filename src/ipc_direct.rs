@@ -386,7 +386,7 @@ struct PendingWrite {
     /// Held from the probe through the postlude's purge — the extended
     /// P1-9 order is exactly the patch path's (level 3 only; nothing
     /// else is ever acquired under it here).
-    block_guard: tokio::sync::MutexGuard<'static, ()>,
+    block_guard: crate::sqz_sync::SqzMutexGuard<'static, ()>,
     /// Severed 4 KiB-aligned pooled source (`None` = direct arena DMA).
     /// The `Bytes` owner recycles the backing on drop.
     bounce: Option<(SendPtr, bytes::Bytes)>,
@@ -653,13 +653,13 @@ enum DdWriteSubmit {
     /// SQE in flight; the guard travels with the pending op to the CQE.
     Submitted,
     /// Completed LOUD (the RES-6 fence refusal — errno already posted).
-    Refused(tokio::sync::MutexGuard<'static, ()>),
+    Refused(crate::sqz_sync::SqzMutexGuard<'static, ()>),
     /// Handler fallback (ledger class counted at the refusal site).
     Fallback {
         op: DataOp,
         completion: SlotCompletion,
         inval: Option<Arc<crate::ipc_service::Invalidator>>,
-        guard: tokio::sync::MutexGuard<'static, ()>,
+        guard: crate::sqz_sync::SqzMutexGuard<'static, ()>,
     },
 }
 
@@ -673,7 +673,7 @@ enum DdWriteSubmit {
 #[derive(Default)]
 struct DrainBatch {
     times: Vec<(u64, u64, Option<usize>)>,
-    trains: Vec<((u64, u32), tokio::sync::MutexGuard<'static, ()>)>,
+    trains: Vec<((u64, u32), crate::sqz_sync::SqzMutexGuard<'static, ()>)>,
 }
 
 struct EngineState {
@@ -1270,7 +1270,7 @@ impl DirectDriveEngine {
         op: DataOp,
         completion: SlotCompletion,
         snap: crate::fuse_client::IpcDirectWriteSnapshot,
-        block_guard: tokio::sync::MutexGuard<'static, ()>,
+        block_guard: crate::sqz_sync::SqzMutexGuard<'static, ()>,
         inval: Option<Arc<crate::ipc_service::Invalidator>>,
     ) -> Result<(), (DataOp, SlotCompletion)> {
         let key = (snap.ino, snap.block);
@@ -1301,7 +1301,7 @@ impl DirectDriveEngine {
     fn close_train_error(
         self: &Arc<Self>,
         key: (u64, u32),
-        guard: tokio::sync::MutexGuard<'static, ()>,
+        guard: crate::sqz_sync::SqzMutexGuard<'static, ()>,
     ) {
         self.trains.close(key);
         drop(guard);
@@ -1327,7 +1327,7 @@ impl DirectDriveEngine {
         op: DataOp,
         completion: SlotCompletion,
         snap: crate::fuse_client::IpcDirectWriteSnapshot,
-        block_guard: tokio::sync::MutexGuard<'static, ()>,
+        block_guard: crate::sqz_sync::SqzMutexGuard<'static, ()>,
         inval: Option<Arc<crate::ipc_service::Invalidator>>,
     ) -> DdWriteSubmit {
         let router = &self.fs.router;
@@ -2230,7 +2230,7 @@ impl DirectDriveEngine {
     fn run_train(
         self: &Arc<Self>,
         key: (u64, u32),
-        mut guard: tokio::sync::MutexGuard<'static, ()>,
+        mut guard: crate::sqz_sync::SqzMutexGuard<'static, ()>,
     ) {
         loop {
             let Some(parked) = self.trains.pop_under_tenure(key) else {

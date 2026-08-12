@@ -32,14 +32,14 @@ use uuid::Uuid;
 ///
 /// Held only for the short read→merge→save; block *data* I/O stays concurrent
 /// (COW) outside the lock.
-static INODE_META_LOCKS: once_cell::sync::Lazy<StripeLocks<tokio::sync::Mutex<()>, 4096>> =
+static INODE_META_LOCKS: once_cell::sync::Lazy<StripeLocks<crate::sqz_sync::SqzMutex<()>, 4096>> =
     once_cell::sync::Lazy::new(StripeLocks::new);
 
 /// Census-wrapped `INODE_META_LOCKS` acquisition (the D1.b named-holder
 /// surface, VL10): every acquisition site routes here so a contended wait
 /// on the block-map merge domain shows up in the watchdog's lock-wait
 /// census with its inode named. Fast path = one `try_lock`.
-async fn meta_lock_acquire(ino: u64) -> tokio::sync::MutexGuard<'static, ()> {
+async fn meta_lock_acquire(ino: u64) -> crate::sqz_sync::SqzMutexGuard<'static, ()> {
     crate::fuse_client::census_meta_lock_acquire(INODE_META_LOCKS.get_inode_lock(ino), ino).await
 }
 
@@ -4579,7 +4579,11 @@ pub struct ZcWriteSlot {
     len: u32,
     store: Box<ZcStoreFn>,
     extract: Box<ZcExtractFn>,
-    materialized: tokio::sync::Mutex<Option<bytes::Bytes>>,
+    // sqz-sync-exempt: per-write DATA-path memo (one writer thread ever
+    // touches a slot's materialize), not a metadata-plane lock — outside
+    // the Stage-1 population (docs/design-sqz-sync.md §Migration
+    // population); migrates with its stage.
+    materialized: tokio::sync::Mutex<Option<bytes::Bytes>>, // sqz-sync-exempt
     /// The §3.4 stability class: `true` = page-cache-sound (a post-ACK
     /// buffer modification is a redirty ⇒ a new WRITE — buffered
     /// deliveries), `false` = GUP/O_DIRECT (a post-ACK buffer reuse
@@ -4599,7 +4603,7 @@ impl ZcWriteSlot {
             len,
             store,
             extract,
-            materialized: tokio::sync::Mutex::new(None),
+            materialized: tokio::sync::Mutex::new(None), // sqz-sync-exempt (data-path memo)
             ack_early_sound: false,
             retain: None,
             release: None,
@@ -4620,7 +4624,7 @@ impl ZcWriteSlot {
             len,
             store,
             extract,
-            materialized: tokio::sync::Mutex::new(None),
+            materialized: tokio::sync::Mutex::new(None), // sqz-sync-exempt (data-path memo)
             ack_early_sound,
             retain: Some(retain),
             release: Some(release),

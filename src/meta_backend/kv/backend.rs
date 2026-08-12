@@ -742,7 +742,7 @@ pub struct KvMetaBackend {
     layout_deltas_ok: AtomicBool,
     /// Serializes the one-time incompat ratchet (sector-0 RMW must not
     /// race itself); contended at most once per volume lifetime.
-    layout_delta_ratchet: tokio::sync::Mutex<()>,
+    layout_delta_ratchet: crate::sqz_sync::SqzMutex<()>,
     // ---- PR M7: the §5.5 D5 commit conveyor ----
     /// The per-volume conveyor: all user commits enqueue here; a
     /// leader-elect committer spawns the detached pass task that drains
@@ -792,7 +792,7 @@ pub struct KvMetaBackend {
     /// per-volume checkpoint task, one at a time" — K5's `&mut SmoContext`
     /// discipline carried by this mutex; the background task is the
     /// primary holder, `checkpoint_now`/`shutdown` share the exclusion).
-    pub(super) smo: tokio::sync::Mutex<SmoContext>,
+    pub(super) smo: crate::sqz_sync::SqzMutex<SmoContext>,
     /// Last ledger seq written by a checkpoint (starts at the mounted
     /// record's seq).
     pub(super) checkpoint_seq: AtomicU64,
@@ -1729,7 +1729,7 @@ impl KvMetaBackend {
                 .ok()
                 .as_deref(),
         );
-        let smo = tokio::sync::Mutex::new(SmoContext::with_journal(
+        let smo = crate::sqz_sync::SqzMutex::new(SmoContext::with_journal(
             alloc.clone(),
             SmoJournal {
                 ring: ring.clone(),
@@ -1774,7 +1774,7 @@ impl KvMetaBackend {
             journal_failures: AtomicU64::new(0),
             stalls: AtomicU64::new(0),
             layout_deltas_ok: AtomicBool::new(layout_deltas_stamped),
-            layout_delta_ratchet: tokio::sync::Mutex::new(()),
+            layout_delta_ratchet: crate::sqz_sync::SqzMutex::new(()),
             conveyor: Arc::new(ConveyorCore::new()),
             conveyor_self: std::sync::OnceLock::new(),
             layout_conveyor: Arc::new(ConveyorCore::new()),

@@ -1304,11 +1304,14 @@ pub async fn repair_primary_superblock(path: &Path) -> Result<bool, KvError> {
 /// this closes the in-process race.
 static SB_WRITE_LOCKS: once_cell::sync::Lazy<
     std::sync::Mutex<
-        std::collections::HashMap<std::path::PathBuf, std::sync::Arc<tokio::sync::Mutex<()>>>,
+        std::collections::HashMap<
+            std::path::PathBuf,
+            std::sync::Arc<crate::sqz_sync::SqzMutex<()>>,
+        >,
     >,
 > = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-fn sb_write_lock(path: &Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+fn sb_write_lock(path: &Path) -> std::sync::Arc<crate::sqz_sync::SqzMutex<()>> {
     SB_WRITE_LOCKS
         .lock()
         .unwrap()

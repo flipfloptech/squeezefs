@@ -256,6 +256,8 @@ pub mod patch_clone_core;
 pub mod placed_core;
 #[path = "../../src/refcount_core.rs"]
 pub mod refcount_core;
+#[path = "../../src/sqz_sync_core.rs"]
+pub mod sqz_sync_core;
 #[path = "../../src/meta_backend/kv/slot_cursor_core.rs"]
 pub mod slot_cursor_core;
 #[path = "../../src/meta_backend/slot_gate_core.rs"]
@@ -4541,6 +4543,139 @@ mod fd_table_models {
                      the mirror still owned the final one"
                 );
             }
+        });
+    }
+}
+
+#[cfg(all(test, loom))]
+mod sqz_sync_models {
+    //! [`sqz_sync_core`]: the metadata-plane lock state machine
+    //! (docs/design-sqz-sync.md, Stage 1 — the OQ-5 lost-wakeup wedge
+    //! made unrepresentable). Invariants:
+    //! * **exclusion + no-lost-lock under a DEAD waiter (the wedge
+    //!   rail)**: a queued waiter that is never polled again (its wake
+    //!   dropped on the floor) owns nothing and blocks nobody — after
+    //!   the holder releases, a fresh contender always acquires. The
+    //!   tokio batch-semaphore protocol fails exactly this model: it
+    //!   assigns the released permit to the popped (dead) waiter.
+    //! * **reader/writer exclusion**: a shared grant never observes a
+    //!   live exclusive holder, across every interleaving of the
+    //!   acquire with the release.
+    //! * **release wakes the FIFO front**: one exclusive waiter, or
+    //!   every leading shared waiter — wake tokens only, never
+    //!   ownership.
+    use crate::sqz_sync_core::{LockCore, Want};
+    use loom::sync::atomic::{AtomicUsize, Ordering};
+    use loom::sync::Arc;
+    use loom::thread;
+
+    /// The wedge rail: holder (main) takes exclusive; T2 races one
+    /// acquisition attempt and, if refused, registers and DIES (its
+    /// wake token is dropped — the lost-wakeup schedule). Main then
+    /// releases and a fresh exclusive attempt must succeed in every
+    /// interleaving where T2 did not win — and must FAIL (exclusion)
+    /// in every interleaving where T2 won and still holds.
+    #[test]
+    fn a_dead_waiter_never_wedges_and_exclusion_holds() {
+        loom::model(|| {
+            let core: Arc<LockCore<u32>> = Arc::new(LockCore::new());
+            let (granted, _) = core.try_acquire(Want::Exclusive, None);
+            assert!(granted, "fresh lock must grant");
+
+            let c2 = core.clone();
+            let t2 = thread::spawn(move || {
+                let (g, wake) = c2.try_acquire(Want::Exclusive, None);
+                assert!(wake.is_empty());
+                if !g {
+                    // Refused: register and never poll again — the dead
+                    // waiter whose wake main will drop on the floor.
+                    c2.register(Want::Exclusive, None, &7u32);
+                }
+                g
+            });
+
+            // Release: the returned wakers are DROPPED (lost wake).
+            let _dropped_wakers = core.release_exclusive();
+            let t2_won = t2.join().unwrap();
+
+            let (fresh, _) = core.try_acquire(Want::Exclusive, None);
+            if t2_won {
+                // T2 holds: exclusion, not a wedge.
+                assert!(!fresh, "exclusion violated: two exclusive holders");
+                let _ = core.release_exclusive();
+                let (after, _) = core.try_acquire(Want::Exclusive, None);
+                assert!(after, "lock lost after t2's release");
+            } else {
+                // T2 is a dead queued waiter: barging keeps the lock
+                // takeable — the tokio protocol wedges exactly here.
+                assert!(fresh, "dead waiter wedged the lock (OQ-5 class)");
+            }
+        });
+    }
+
+    /// Reader/writer exclusion across the release race: a shared grant
+    /// must never observe the exclusive holder still inside.
+    #[test]
+    fn shared_grant_never_observes_live_writer() {
+        loom::model(|| {
+            let core: Arc<LockCore<u32>> = Arc::new(LockCore::new());
+            let in_write = Arc::new(AtomicUsize::new(0));
+
+            let (granted, _) = core.try_acquire(Want::Exclusive, None);
+            assert!(granted);
+            in_write.store(1, Ordering::Relaxed);
+
+            let c2 = core.clone();
+            let iw2 = in_write.clone();
+            let t2 = thread::spawn(move || {
+                let (g, _) = c2.try_acquire(Want::Shared, None);
+                if g {
+                    assert_eq!(
+                        iw2.load(Ordering::Relaxed),
+                        0,
+                        "shared grant while the writer was still inside"
+                    );
+                    let _ = c2.release_shared();
+                }
+                g
+            });
+
+            in_write.store(0, Ordering::Relaxed);
+            let _ = core.release_exclusive();
+            let _ = t2.join().unwrap();
+
+            // Whatever T2 saw, the lock ends free.
+            let (after, _) = core.try_acquire(Want::Exclusive, None);
+            assert!(after, "lock not free after all releases");
+        });
+    }
+
+    /// FIFO wake shape (deterministic under loom's single thread): a
+    /// release returns every leading shared waiter, or exactly one
+    /// exclusive front waiter — tokens only, ownership on re-poll.
+    #[test]
+    fn release_wakes_leading_shared_or_one_exclusive() {
+        loom::model(|| {
+            let core: LockCore<u32> = LockCore::new();
+            let (granted, _) = core.try_acquire(Want::Exclusive, None);
+            assert!(granted);
+            core.register(Want::Shared, None, &1);
+            core.register(Want::Shared, None, &2);
+            core.register(Want::Exclusive, None, &3);
+            core.register(Want::Shared, None, &4);
+            let woken = core.release_exclusive();
+            assert_eq!(woken, vec![1, 2], "wake = every LEADING shared waiter");
+
+            // Re-polled winners take shared; the trailing exclusive
+            // waiter is woken alone once the last reader leaves.
+            let (g1, _) = core.try_acquire(Want::Shared, Some(1));
+            let (g2, _) = core.try_acquire(Want::Shared, Some(2));
+            assert!(g1 && g2, "woken shared waiters re-contend and win");
+            assert!(core.release_shared().is_empty(), "readers still inside");
+            let woken = core.release_shared();
+            assert_eq!(woken, vec![3], "last reader wakes ONE exclusive waiter");
+            let (g3, _) = core.try_acquire(Want::Exclusive, Some(3));
+            assert!(g3, "woken exclusive waiter wins on re-poll");
         });
     }
 }

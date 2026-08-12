@@ -1,0 +1,438 @@
+//! Scheduler-free metadata-plane lock primitives (`docs/design-sqz-sync.md`,
+//! Stage 1 — user ruling 2026-08-12: the metadata plane must not depend on
+//! `tokio::sync`'s wake-delivery protocol after the OQ-5 lost-wakeup wedge).
+//!
+//! Two properties make the wedge class unrepresentable here:
+//!
+//! 1. **Barging (no ownership assignment to sleeping waiters):** release
+//!    flips the lock FREE and wakes the queue front; woken waiters
+//!    re-contend on poll. A waiter whose wake is lost owns nothing and
+//!    blocks nobody — the tokio batch-semaphore protocol assigns permits
+//!    to a popped waiter first, so a never-polled assignee wedges the
+//!    world; ours cannot.
+//! 2. **The tick backstop lives IN the primitive:** every async acquire
+//!    re-polls at [`TICK`]. Timer wakes ride the driver — a different
+//!    delivery path from waker handoff — so a waiter whose own wake was
+//!    lost self-heals one tick later. [`TICK_RECOVERIES`] counts
+//!    engagements (exported as `lock_ticked_reregisters`): 0 on healthy
+//!    schedules; growth = a lost wake absorbed, loudly.
+//!
+//! Fairness: FIFO wake order (all leading readers, or one writer) bounds
+//! barging in practice; the tick bounds the pathological case. Cancel
+//! safety: the acquire future's `Drop` unlinks its waiter — nothing is
+//! ever reserved for it, so cancellation leaks nothing. The interior
+//! short-hold `std::sync::Mutex` is never held across `.await` (it guards
+//! a queue push/pop measured in nanoseconds).
+
+use crate::sqz_sync_core::{LockCore, Want};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
+use std::time::Duration;
+
+/// The liveness tick — the backstop's re-poll period. Unreachable by
+/// healthy waits (P1-9 holds are never device-I/O-length), cheap enough
+/// that a lost wake costs one beat instead of a wedge. The same posture
+/// `write_pipeline_core` documents for its admit park.
+pub const TICK: Duration = Duration::from_secs(2);
+
+/// Backstop engagements: async acquires that re-polled past a tick.
+/// Each one is a wait that, on the tokio primitives, could have parked
+/// forever under a lost wake. 0 on healthy schedules.
+pub static TICK_RECOVERIES: AtomicU64 = AtomicU64::new(0);
+
+/// The shipped face of the state machine: wakers are `std::task::Waker`.
+/// The core returns wakers instead of calling them, so every `wake()`
+/// here runs OUTSIDE the interior mutex's critical section.
+type Core = LockCore<Waker>;
+
+fn wake_all(wakers: Vec<Waker>) {
+    for w in wakers {
+        w.wake();
+    }
+}
+
+// =========================================================================
+// Acquire future (cancel-safe; Drop unlinks)
+// =========================================================================
+
+struct Acquire<'a> {
+    core: &'a Core,
+    want: Want,
+    id: Option<u64>,
+}
+
+impl Future for Acquire<'_> {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let (granted, wake) = self.core.try_acquire(self.want, self.id);
+        wake_all(wake);
+        if granted {
+            // Any queue entry was removed inside try_acquire.
+            self.id = None;
+            return Poll::Ready(());
+        }
+        let id = self.core.register(self.want, self.id, cx.waker());
+        self.id = Some(id);
+        Poll::Pending
+    }
+}
+
+impl Drop for Acquire<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.id {
+            self.core.unregister(id);
+        }
+    }
+}
+
+/// The ticked async acquire: race the acquire against [`TICK`]; on
+/// expiry the waiter unlinks (its `Drop`) and re-registers — the
+/// backstop that absorbs a lost wake.
+async fn acquire_ticked(core: &Core, want: Want) {
+    loop {
+        let attempt = Acquire {
+            core,
+            want,
+            id: None,
+        };
+        match tokio::time::timeout(TICK, attempt).await {
+            Ok(()) => return,
+            Err(_elapsed) => {
+                TICK_RECOVERIES.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+// =========================================================================
+// SqzRwLock
+// =========================================================================
+
+/// The metadata plane's reader-writer lock (see module docs).
+pub struct SqzRwLock<T: ?Sized> {
+    core: Core,
+    data: std::cell::UnsafeCell<T>,
+}
+
+// SAFETY: access to `data` is serialized by the Core state machine
+// exactly as std/tokio RwLock serialize theirs.
+unsafe impl<T: ?Sized + Send> Send for SqzRwLock<T> {}
+unsafe impl<T: ?Sized + Send + Sync> Sync for SqzRwLock<T> {}
+
+impl<T> SqzRwLock<T> {
+    pub fn new(value: T) -> Self {
+        SqzRwLock {
+            core: Core::new(),
+            data: std::cell::UnsafeCell::new(value),
+        }
+    }
+
+    pub async fn read(&self) -> SqzRwLockReadGuard<'_, T> {
+        acquire_ticked(&self.core, Want::Shared).await;
+        SqzRwLockReadGuard { lock: self }
+    }
+
+    pub async fn write(&self) -> SqzRwLockWriteGuard<'_, T> {
+        acquire_ticked(&self.core, Want::Exclusive).await;
+        SqzRwLockWriteGuard { lock: self }
+    }
+
+    pub fn try_read(&self) -> Result<SqzRwLockReadGuard<'_, T>, ()> {
+        let (granted, wake) = self.core.try_acquire(Want::Shared, None);
+        wake_all(wake);
+        if granted {
+            Ok(SqzRwLockReadGuard { lock: self })
+        } else {
+            Err(())
+        }
+    }
+
+    pub fn try_write(&self) -> Result<SqzRwLockWriteGuard<'_, T>, ()> {
+        let (granted, wake) = self.core.try_acquire(Want::Exclusive, None);
+        wake_all(wake);
+        if granted {
+            Ok(SqzRwLockWriteGuard { lock: self })
+        } else {
+            Err(())
+        }
+    }
+
+    /// `Arc`-owned shared guard (the `DlmGuard` shape).
+    pub async fn read_owned(self: Arc<Self>) -> OwnedSqzRwLockReadGuard<T> {
+        acquire_ticked(&self.core, Want::Shared).await;
+        OwnedSqzRwLockReadGuard { lock: self }
+    }
+
+    /// `Arc`-owned exclusive guard (the `DlmGuard` shape).
+    pub async fn write_owned(self: Arc<Self>) -> OwnedSqzRwLockWriteGuard<T> {
+        acquire_ticked(&self.core, Want::Exclusive).await;
+        OwnedSqzRwLockWriteGuard { lock: self }
+    }
+}
+
+impl<T: Default> Default for SqzRwLock<T> {
+    fn default() -> Self {
+        SqzRwLock::new(T::default())
+    }
+}
+
+pub struct SqzRwLockReadGuard<'a, T: ?Sized> {
+    lock: &'a SqzRwLock<T>,
+}
+pub struct SqzRwLockWriteGuard<'a, T: ?Sized> {
+    lock: &'a SqzRwLock<T>,
+}
+pub struct OwnedSqzRwLockReadGuard<T: ?Sized> {
+    lock: Arc<SqzRwLock<T>>,
+}
+pub struct OwnedSqzRwLockWriteGuard<T: ?Sized> {
+    lock: Arc<SqzRwLock<T>>,
+}
+
+impl<T: ?Sized> Drop for SqzRwLockReadGuard<'_, T> {
+    fn drop(&mut self) {
+        wake_all(self.lock.core.release_shared());
+    }
+}
+impl<T: ?Sized> Drop for SqzRwLockWriteGuard<'_, T> {
+    fn drop(&mut self) {
+        wake_all(self.lock.core.release_exclusive());
+    }
+}
+impl<T: ?Sized> Drop for OwnedSqzRwLockReadGuard<T> {
+    fn drop(&mut self) {
+        wake_all(self.lock.core.release_shared());
+    }
+}
+impl<T: ?Sized> Drop for OwnedSqzRwLockWriteGuard<T> {
+    fn drop(&mut self) {
+        wake_all(self.lock.core.release_exclusive());
+    }
+}
+
+impl<T: ?Sized> std::ops::Deref for SqzRwLockReadGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: shared hold — no exclusive holder exists.
+        unsafe { &*self.lock.data.get() }
+    }
+}
+impl<T: ?Sized> std::ops::Deref for SqzRwLockWriteGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: exclusive hold.
+        unsafe { &*self.lock.data.get() }
+    }
+}
+impl<T: ?Sized> std::ops::DerefMut for SqzRwLockWriteGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: exclusive hold.
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+impl<T: ?Sized> std::ops::Deref for OwnedSqzRwLockReadGuard<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: shared hold.
+        unsafe { &*self.lock.data.get() }
+    }
+}
+impl<T: ?Sized> std::ops::Deref for OwnedSqzRwLockWriteGuard<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: exclusive hold.
+        unsafe { &*self.lock.data.get() }
+    }
+}
+impl<T: ?Sized> std::ops::DerefMut for OwnedSqzRwLockWriteGuard<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: exclusive hold.
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+
+// =========================================================================
+// SqzMutex (an exclusive-only face over the same core)
+// =========================================================================
+
+/// The metadata plane's mutex (see module docs).
+pub struct SqzMutex<T: ?Sized> {
+    inner: SqzRwLock<T>,
+}
+
+impl<T> SqzMutex<T> {
+    pub fn new(value: T) -> Self {
+        SqzMutex {
+            inner: SqzRwLock::new(value),
+        }
+    }
+
+    pub async fn lock(&self) -> SqzMutexGuard<'_, T> {
+        SqzMutexGuard {
+            inner: self.inner.write().await,
+        }
+    }
+
+    pub fn try_lock(&self) -> Result<SqzMutexGuard<'_, T>, ()> {
+        self.inner.try_write().map(|inner| SqzMutexGuard { inner })
+    }
+}
+
+impl<T: Default> Default for SqzMutex<T> {
+    fn default() -> Self {
+        SqzMutex::new(T::default())
+    }
+}
+
+pub struct SqzMutexGuard<'a, T: ?Sized> {
+    inner: SqzRwLockWriteGuard<'a, T>,
+}
+
+impl<T: ?Sized> std::ops::Deref for SqzMutexGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.inner
+    }
+}
+impl<T: ?Sized> std::ops::DerefMut for SqzMutexGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.inner
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Exclusion: N tasks × M increments through the mutex — the counter
+    /// is exact and never torn (multi-thread flavor exposes races).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mutex_excludes_under_contention() {
+        let m = Arc::new(SqzMutex::new(0u64));
+        let mut js = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let m = m.clone();
+            js.spawn(async move {
+                for _ in 0..1000 {
+                    let mut g = m.lock().await;
+                    *g += 1;
+                }
+            });
+        }
+        while js.join_next().await.is_some() {}
+        assert_eq!(*m.lock().await, 8000);
+    }
+
+    /// RwLock: readers coexist, writers exclude, and a queued writer is
+    /// not starved by a shared stream (write preference).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rwlock_readers_share_writers_exclude() {
+        let l = Arc::new(SqzRwLock::new(0u64));
+        let r1 = l.read().await;
+        let r2 = l.read().await;
+        assert!(l.try_write().is_err(), "readers exclude a writer");
+        drop(r1);
+        drop(r2);
+        let w = l.write().await;
+        assert!(l.try_read().is_err(), "a writer excludes readers");
+        drop(w);
+        let _ = l.read().await;
+    }
+
+    /// The wedge-immunity rail (THE design property): a waiter whose
+    /// wake is delivered but never acted on (its task is never polled
+    /// again — simulated by a raw registered waiter that we simply
+    /// forget) must NOT prevent other contenders from taking the lock,
+    /// and must not leak the lock when the holder releases.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_dead_waiter_never_wedges_the_lock() {
+        let l = Arc::new(SqzRwLock::new(()));
+        // Holder takes the lock exclusively.
+        let g = l.write().await;
+        // A "dead" waiter registers and is never polled again (we poll
+        // its acquire once to enqueue it, then LEAK the future —
+        // mem::forget keeps the queue entry alive like a never-polled
+        // task would).
+        let dead = Box::pin(Acquire {
+            core: &l.core,
+            want: Want::Exclusive,
+            id: None,
+        });
+        let mut dead = dead;
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(dead.as_mut().poll(&mut cx).is_pending());
+        std::mem::forget(dead); // the never-polled task
+                                // Holder releases: under the tokio protocol the lock would be
+                                // ASSIGNED to the dead waiter — wedged. Under barging it is
+                                // free: a fresh contender must win promptly.
+        drop(g);
+        let fresh = tokio::time::timeout(Duration::from_secs(1), l.write()).await;
+        assert!(
+            fresh.is_ok(),
+            "a dead queued waiter must never wedge the lock (barging)"
+        );
+    }
+
+    /// Tick backstop: a waiter that outlives a tick re-registers and
+    /// counts the recovery; it still acquires when the lock frees.
+    #[tokio::test(start_paused = true)]
+    async fn tick_backstop_reregisters_and_recovers() {
+        let l = Arc::new(SqzRwLock::new(()));
+        let g = l.write().await;
+        let before = TICK_RECOVERIES.load(Ordering::Relaxed);
+        let l2 = l.clone();
+        let waiter = tokio::spawn(async move {
+            let _g = l2.write().await;
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(TICK).await;
+        tokio::task::yield_now().await;
+        assert!(
+            TICK_RECOVERIES.load(Ordering::Relaxed) > before,
+            "a wait past the tick must count a recovery"
+        );
+        drop(g);
+        tokio::task::yield_now().await;
+        tokio::time::advance(TICK).await;
+        waiter.await.expect("waiter completes after release");
+    }
+
+    /// Cancel safety: dropping a pending acquire unlinks its waiter —
+    /// the queue does not grow and later acquires see no ghost.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_acquire_unlinks() {
+        let l = Arc::new(SqzRwLock::new(()));
+        let g = l.write().await;
+        {
+            let fut = l.read();
+            futures::pin_mut!(fut);
+            let waker = futures::task::noop_waker();
+            let mut cx = std::task::Context::from_waker(&waker);
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            // fut drops here — waiter unlinked.
+        }
+        assert_eq!(
+            l.core.queue_len(),
+            0,
+            "a cancelled acquire must leave no queue entry"
+        );
+        drop(g);
+        let _ = l.read().await;
+    }
+
+    /// Owned guards: the Arc-owned shapes acquire, exclude, release.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owned_guards_work() {
+        let l = Arc::new(SqzRwLock::new(7u64));
+        let w = l.clone().write_owned().await;
+        assert!(l.try_read().is_err());
+        drop(w);
+        let r = l.clone().read_owned().await;
+        assert_eq!(*r, 7);
+    }
+}

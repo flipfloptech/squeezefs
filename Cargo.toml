@@ -121,6 +121,7 @@ dhat-on = ["dep:dhat"]
 coz-on = ["dep:coz"]
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }  # paused-clock rails (sqz_sync tick backstop)
 # The ONE environment-gate + skip-ledger helper (spec §11 TEST-2). A
 # library crate rather than a `tests/common/mod.rs` so the gates each test
 # binary does NOT use are exempt from dead_code by construction.

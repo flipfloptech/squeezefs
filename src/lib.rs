@@ -194,6 +194,8 @@ macro_rules! coz_progress {
 pub mod block_allocator;
 pub mod block_reclaim;
 pub mod jobs;
+pub mod sqz_sync;
+pub mod sqz_sync_core;
 pub mod storage;
 pub mod stripe_locks;
 pub mod supervisor;

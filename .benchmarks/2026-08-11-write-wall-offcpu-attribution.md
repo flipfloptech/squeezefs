@@ -245,3 +245,38 @@ removes) or restructure the drain into pop-ACK-fast/defer-heavy-tail
 shapes that preserve the per-op purge-before-ACK law. Every candidate now
 has a per-quantum readout (`device_cq` must fall; `sq_wait` must not
 grow) instead of an IOPS-only wash.
+
+## Addendum 3 (2026-08-12): ACK-fast batch drain — the plateau moves (+22 %, A-B-B-A kept)
+
+The reap-cycle lever landed (`perf/dd-ack-fast-drain`): the drain now
+collects each write postlude's POST-ACK tails into a per-batch
+`DrainBatch` — the durable-times handoff coalesces to ONE ino-deduped
+fuse3-lane dispatch per batch (`ipc_dd_write_times_dispatches`; live
+coalesce factor 20.3 on the counted row — the 208 k/s dd→tpc wake edge
+is gone) and the conveyor pump's follower re-drives (SQE prep + inline
+TX) run after the batch's last ACK. Every pre-ACK law is unchanged and
+per-op: publish_block, the 4-tier purge, LRU drops, attr publish, W1
+inval, then the ACK. Rails: `drain_batch_coalesces_the_times_park_dispatch`
+(red-first, with the new tests-only CQ-ready probe seam
+`test_ddw_cq_ready` for a deterministic batch), byte-exactness through a
+tier purge, all direct-write/direct-drive/op-economy suites green.
+
+**A-B-B-A on the aged store (engaged, posture verified, same fabric):**
+A 636–641 k (pre-change binary `dd67a1f1`, evening band) → **B 783.1 k**
+→ **B 775.7 k** → A-close **624.6 / 642.0 k** (re-deployed `dd67a1f1`).
+The +21–23 % survives the reversed order; the closing A legs reproduce
+the old plateau exactly. No fresh-connection transient this time (the B
+legs repeat within 1 %).
+
+**The per-quantum readout the split instrument was built for:**
+`device_cq` 877 → **591 µs** (the targeted quantum fell), `sq_wait` held
+(86 → 108 µs), clat 1.57 → **1.27 ms**, daemon CPU/op 24.1 → **19.2 µs**,
+drain passes 923 k → 360 k/row (39 ops/pass — deeper batches, cheaper
+per op). Little's law closes: 1,024 ÷ 1.27 ms = 806 k ≈ the measured
+783 k.
+
+**Standing rows after this landing:** engaged il rand-4k **783 k/776 k**
+(was 630–650 k); the remaining residence board is ingress 326 µs (grew
+as the queue moved upstream — the next board's top), device_cq 591 µs
+(kernel 209 + reap ~380), sq_wait ~108 µs. The 1 M target needs
+residence ≤ 1.02 ms at qd 1024; current 1.27 ms.

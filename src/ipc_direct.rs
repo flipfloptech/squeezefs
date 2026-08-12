@@ -278,6 +278,19 @@ fn dd_lane_flush() -> bool {
     *V.get_or_init(|| crate::env_knobs::bool_knob("SQUEEZEFS_IPC_DD_LANE_FLUSH", true))
 }
 
+/// COOP_TASKRUN on the dd rings (r3) as a MEASUREMENT LEVER
+/// (write-wall campaign 2026-08-12): with it, a CQE submitted by a svc
+/// thread posts only at that thread's NEXT ring entry — one sweep away
+/// (231–375 µs pass cadence), which the post-ACK-fast `device_cq`
+/// ledger reads as CQE-post deferral proportional to offered load. `0`
+/// restores signal-delivered task-work (prompt posting, the pre-r3
+/// posture whose mid-drain `uring_lock` cost r3 measured — the trade
+/// this lever re-counts at the new operating point).
+fn dd_coop_taskrun() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| crate::env_knobs::bool_knob("SQUEEZEFS_IPC_DD_COOP_TASKRUN", true))
+}
+
 thread_local! {
     /// The submitting thread's direct-drive LANE. Service threads set
     /// their owner index at loop start ([`set_service_lane`] from
@@ -855,7 +868,7 @@ impl DirectDriveEngine {
         // wait, where it belongs. Negotiate-and-degrade: pre-5.19
         // kernels refuse the flag (EINVAL) and fall back to the plain
         // setup, loudly, once.
-        let mut coop_ok = true;
+        let mut coop_ok = dd_coop_taskrun();
         for idx in 0..width {
             let ring = if coop_ok {
                 match IoUring::builder().setup_coop_taskrun().build(RING_ENTRIES) {

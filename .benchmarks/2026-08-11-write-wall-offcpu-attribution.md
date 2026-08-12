@@ -343,3 +343,36 @@ verified, 60 s, zero lock-wait lines): qd32 **797.2 k first / 783.4 k
 last @ 1.24 ms avg**. The net-700k+ stack in dev is: the
 `sq_wait`/`device_cq` split instrument (`32864139`), the ACK-fast batch
 drain (`3f65ccfe`), and the re-park wedge fix (`1ab085b3`).
+
+## Addendum 6 (2026-08-12): the elimination ladder closes — the ceiling is fabric write RTT × daemon-held concurrency
+
+Every remaining suspect was counted and falsified at the post-ACK-fast
+operating point (all A/B or A-B-B-A, engaged, posture verified):
+
+| Suspect | Test | Verdict |
+|---|---|---|
+| Session→lane width | sessions 12/16 rows | wash (730–744 k) |
+| Per-lane skew | per-tid CPU census | falsified — 8 active lanes all ~62 %, dd ~50 % |
+| Box CPU | mpstat @ 794 k | 3.5–9 % idle, 19–35 % iowait — not pinned |
+| CQE-post deferral (COOP_TASKRUN) | `SQUEEZEFS_IPC_DD_COOP_TASKRUN=0` A-B-B-A | wash (777/776/783/777 k) — the lever stays registered |
+| NIC interrupt moderation (DIM) | coalescing off, client + 5 targets | wash (762 k qd32 / 831 k qd12), restored |
+| NUMA placement | `numa_remote_bytes` | **0** — placement already perfect; NICs split 1/socket, `iopolicy=numa` |
+| Target substrate | live-row mpstat on 3 targets | **96 % idle**, RAM-backed null_blk — exonerated |
+
+**The measured cause.** The dd-ring kernel `submit→CQE` for a 4 KiB
+nvme-tcp WRITE is **144 µs mean (p50 120) at the qd12 knee, rising to
+222 µs (p99 1,215) at qd32** — with idle targets, so the RTT lives in
+the client-side TCP TX/RX stack and its per-PDU wakes. The daemon keeps
+only `IOPS × RTT ≈ 110–165 ops` inside the kernel window while the
+client offers 384–1,024; the balance queues in daemon segments (ingress
+276 µs + sq_wait ~100 µs + CQE-pop ~360 µs at qd32), all of which scale
+together by Little's law. The raw control's 3.1 M is the same identity
+with the concurrency INSIDE the kernel: 1,024 in-kernel ÷ 328 µs. The
+ceiling is therefore `in-kernel concurrency ÷ write RTT`, and the two
+levers that remain are exactly its two factors: (a) hold MORE ops inside
+the kernel window by shrinking the daemon's post-CQE segment (the
+~360 µs post→pop residue: per-op pre-ACK postlude work — purge/LRU/attr
+— serialized on the reap path; the ACK-fast drain already took this
+from 670 µs), and (b) cut the fabric write RTT itself (client-side
+nvme-tcp PDU wake chain; queue/io-cpu geometry). Both are counted-next
+board items; neither is a daemon lock, a lane, or the substrate.

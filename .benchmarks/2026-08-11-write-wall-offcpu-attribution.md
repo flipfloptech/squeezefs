@@ -280,3 +280,35 @@ per op). Little's law closes: 1,024 ÷ 1.27 ms = 806 k ≈ the measured
 as the queue moved upstream — the next board's top), device_cq 591 µs
 (kernel 209 + reap ~380), sq_wait ~108 µs. The 1 M target needs
 residence ≤ 1.02 ms at qd 1024; current 1.27 ms.
+
+## Addendum 4 (2026-08-12): the qd12+ re-park wedge — found by the depth sweep, fixed red-first
+
+The post-landing depth sweep (qd8→qd64) WEDGED the daemon at qd12+: 160 s
+`BLOCK_FLUSH_LOCKS` waits (`il_direct_write` last holder), 2.2 B
+park/redrive pairs, rows collapsing to 36 k → 400 IOPS. Root cause: the
+ACK-fast batch tail widened a PRE-EXISTING race window in `run_train`'s
+residual drain — a residual that won a fresh try_lock re-ARMED the train
+mid-drain; the unconditional `pop_parked` kept popping the NEW leader's
+queue and the normal drive re-parked each popped op right back — a
+ping-pong at memory speed on the reap thread UNDER `cq_gate`, blocking
+the very CQE that would close the new tenure. Saturation exploring
+schedules quiet testing never reaches, again.
+
+Fix (`fix/ddw-train-repark-livelock`): `pop_parked` split into
+`pop_residual` (pops ONLY while the train stays closed; reports
+`Rearmed` → the drain STOPS, queue ownership transferred to the live
+leader's CQE pump) and `pop_any` (the ring-death leak arm alone).
+`WriteTrains` is now generic over the parked payload, so the interleave
+is a unit-tested state machine: `residual_drain_stops_when_the_train_
+rearms` reconstructs the ping-pong move by move (weakening-verified —
+red without the open-check) and `residual_drain_drains_closed_trains_
+and_leak_arm_pops_any` pins the no-strand and leak-arm halves.
+
+Post-fix rows (engaged, posture verified, zero lock-wait census lines):
+qd12 **830 k** @ 452 µs (the wedge shape), qd16 **805 k** @ 599 µs,
+qd32 **740–753 k** @ 1.25 ms. The depth curve is still non-monotone
+(knee ~qd16; the collision-cascade ledger: dd fallback share 9.8 % @
+qd16 → 16.3 % @ qd32 → 25.5 % @ qd64, each fallback poisoning its block
+for same-block dd probes) — the qd-knee governor row stays on the board,
+now with the sweep's numbers. Standing best: **~830 k il rand-4k**
+(qd12–16 shapes), 740–753 k at the qd32 reference shape.

@@ -5452,14 +5452,6 @@ impl TpcScheduler {
         }
 
         let mut lanes: Vec<Lane> = Vec::new();
-        // The runtime handle lane threads ENTER: the ambient (main
-        // daemon) runtime when the scheduler is first touched from one —
-        // so handler-internal `tokio::spawn`s and timers keep landing
-        // exactly where they always did — else the dedicated parked
-        // driver ([`tpc_timer_handle`], test contexts). Task DELIVERY
-        // for the handler futures themselves is sqz-exec either way;
-        // only their timers/aux-spawns ride tokio here.
-        let ambient = tokio::runtime::Handle::try_current().ok();
         let core_count = if core_ids.is_empty() {
             std::thread::available_parallelism()
                 .map(|n| n.get())
@@ -5482,7 +5474,6 @@ impl TpcScheduler {
         for i in 0..core_count {
             let exec = crate::sqz_exec::LaneExec::new();
             let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-            let ambient = ambient.clone();
             lanes.push(Lane {
                 exec: exec.clone(),
                 alive: alive.clone(),
@@ -5553,14 +5544,17 @@ impl TpcScheduler {
 
                     // Handler futures still use tokio's driver-backed
                     // primitives (`tokio::time` sleeps/timeouts) and may
-                    // `tokio::spawn` aux work: enter the captured main
-                    // runtime handle (fallback: the parked driver) so
-                    // both land where they always did. The driver only
-                    // FIRES wakers; the woken handler task's delivery
-                    // (queue -> poll) is sqz-exec, first-party by
-                    // construction.
-                    let handle = ambient.unwrap_or_else(tpc_timer_handle);
-                    let _rt = handle.enter();
+                    // `tokio::spawn` aux work: enter the PROCESS-LIFETIME
+                    // parked driver's handle — never a captured ambient
+                    // handle, whose runtime can be dropped under the
+                    // lanes (the first `#[tokio::test]` to touch the lazy
+                    // scheduler would donate its short-lived runtime and
+                    // every later lane timer/spawn dies silently — the
+                    // async_block_reclaim order-dependent hang this
+                    // replaced). The driver only FIRES wakers; the woken
+                    // handler task's delivery (queue -> poll) is
+                    // sqz-exec, first-party by construction.
+                    let _rt = tpc_timer_handle().enter();
                     exec.run();
                 })
                 .expect("fuse3 tpc lane thread spawns");
@@ -5802,6 +5796,15 @@ where
 
 pub fn tpc_thread_count() -> usize {
     TPC_SCHEDULER.lanes.len()
+}
+
+/// `true` exactly on `fuse3-tpcN` lane threads — the sqz-exec handler
+/// venue witness (the ipc handoff venue contract pins on this instead of
+/// the retired runtime-flavor proxy: lanes no longer run per-lane tokio
+/// runtimes, so the flavor of the ENTERED handle says nothing about the
+/// executing venue).
+pub fn on_tpc_lane_thread() -> bool {
+    IS_TPC_LANE.with(|c| c.get())
 }
 
 /// INIT reply-flags negotiation: the subset of the kernel's offered

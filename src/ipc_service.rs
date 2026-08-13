@@ -1691,25 +1691,26 @@ mod handoff_venue_tests {
     use std::time::Duration;
 
     /// The venue contract (§5.5.1 handoff economy): a handoff future
-    /// executes on a **per-core current-thread handler lane** — kernel
-    /// parity — never on the caller's multi-thread runtime. Weakening
-    /// evidence: routing `handoff_spawn` through a captured
-    /// multi-thread `Handle::spawn` (the pre-fix shape) fails this pin
-    /// with `MultiThread`.
+    /// executes on a **fuse3 per-core handler lane** — kernel parity —
+    /// never on the caller's multi-thread runtime. The witness is the
+    /// lane thread mark itself (`fuse3::on_tpc_lane_thread`): since
+    /// Stage 1b the lanes run the sqz-exec first-party executor under an
+    /// ENTERED main-runtime handle, so the retired runtime-flavor proxy
+    /// would read the handle, not the venue. Weakening evidence: routing
+    /// `handoff_spawn` through a captured multi-thread `Handle::spawn`
+    /// (the pre-fix shape) fails this pin with `on_lane == false`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn handoff_runs_on_a_current_thread_handler_lane() {
         let (tx, rx) = tokio::sync::oneshot::channel();
         handoff_spawn(async move {
-            let flavor = tokio::runtime::Handle::current().runtime_flavor();
-            let _ = tx.send(flavor);
+            let _ = tx.send(fuse3::raw::on_tpc_lane_thread());
         });
-        let flavor = tokio::time::timeout(Duration::from_secs(10), rx)
+        let on_lane = tokio::time::timeout(Duration::from_secs(10), rx)
             .await
             .expect("handoff future must run promptly")
             .expect("handoff future must complete");
-        assert_eq!(
-            flavor,
-            tokio::runtime::RuntimeFlavor::CurrentThread,
+        assert!(
+            on_lane,
             "ring handoffs must ride the fuse3 per-core handler lanes \
              (kernel parity), not the caller's multi-thread runtime"
         );

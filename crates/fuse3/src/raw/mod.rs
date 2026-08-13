@@ -42,8 +42,8 @@ pub use request::{ReplySlot, Request};
 #[doc(hidden)]
 pub use session::delivery_body_bounds;
 pub use session::{
-    kernel_init_info, negotiated_reply_flags, tpc_lane_redispatches, tpc_spawn, tpc_spawn_on_node,
-    tpc_thread_count, KernelInit, MountHandle, Session,
+    kernel_init_info, negotiated_reply_flags, on_tpc_lane_thread, tpc_lane_redispatches, tpc_spawn,
+    tpc_spawn_on_node, tpc_thread_count, KernelInit, MountHandle, Session,
 };
 
 pub(crate) type FuseData = Either<

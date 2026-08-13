@@ -245,6 +245,35 @@ nearly every pre-fix count; zero settle barks across the runs. The
 Stage-1 acceptance instrument is MET; the held release battery may run
 from zero.
 
+## Stage 1c (2026-08-13): plane-critical tasks off the tokio scheduler
+
+The plane's LOCKS (Stage 1) and the FUSE handler venue (Stage 1b) were
+first-party; the PLANE-CRITICAL detached tasks still rode
+`tokio::spawn` on the main multi-thread runtime — the venue whose task
+delivery a wedge investigation can never fully exonerate. A lost one
+wedges every committer parked on its fan-out, with no census presence.
+
+Landed: `src/meta_exec.rs` — a small process-global sqz-exec pool
+(`sqz-meta{N}` threads over the same loom-verified `exec_core`
+delivery; own parked timer driver, deliberately independent of fuse3's
+so offline verbs — fsck/format — carry no transport dependency). Moved
+onto it, panic-contained (RES-8):
+
+* the M7 **conveyor pass task** + the **layout-merge pass task**
+  (`kv/backend.rs` — every committer parks on their fan-outs),
+* the **checkpoint/SMO task** + the **times drain** (`kv/checkpoint.rs`
+  — journal reclamation: a lost one wedges ring admission; their
+  shutdown joins ride a drop-guarded completion channel, `DoneGuard`,
+  preserving the panicked-task⇒Corrupt surface),
+* the routing **publish pass**,
+* the write-custody population: the never-lossy **writeback loop** and
+  its per-unit uploads, the **extent-fold worker**, the **inode-reclaim
+  pool** (stripe-takers/committers whose loss violates never-lossy).
+
+Still tokio-hosted (Stage 2/3 scope, none plane-critical): mount-time
+init/teardown tasks, health/stats pollers, job fabric + wire, R5 shed
+workers, dehydration workers, supervisor.
+
 ## Acceptance
 
 * The primitive's unit rails + a loom model of the acquire/release/wake

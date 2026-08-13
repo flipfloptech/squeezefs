@@ -10439,9 +10439,11 @@ impl DataRouter {
             // RES-8: the PassGuard inside already releases leadership on
             // unwind; the wrapper adds the missing RECORD (the pass's
             // waiters see only a dropped oneshot otherwise).
-            tokio::spawn(crate::detached::contain("publish_pass", async move {
+            // Stage 1c: plane-critical (committers park on its fan-out) —
+            // sqz-meta lanes, never the main tokio runtime.
+            crate::meta_exec::spawn_meta("publish_pass", async move {
                 router.publish_pass_task(ino, conveyor).await;
-            }));
+            });
         }
         match rx.await {
             Ok(out) => out,

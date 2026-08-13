@@ -968,8 +968,18 @@ pub(super) fn spawn_checkpoint_task(be: &Arc<KvMetaBackend>) {
         0 => 100,
         ms => ms,
     };
-    let handle = tokio::spawn(checkpoint_task(weak, alive, wake, interval));
-    be.install_checkpoint_task(handle, probe);
+    // Stage 1c (design-sqz-sync): the checkpoint/SMO task is PLANE-
+    // CRITICAL — a lost one stops journal reclamation and wedges every
+    // committer at ring admission. It now runs on the sqz-meta lanes
+    // (first-party delivery); the shutdown join rides a drop-guarded
+    // completion channel instead of a tokio JoinHandle.
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    crate::meta_exec::spawn_meta("kv_checkpoint", async move {
+        let mut done = crate::meta_exec::DoneGuard::new(done_tx);
+        checkpoint_task(weak, alive, wake, interval).await;
+        done.complete();
+    });
+    be.install_checkpoint_task(done_rx, probe);
 }
 
 /// Spawn the per-volume **pending-times drain** task (PR M6, design-
@@ -994,8 +1004,13 @@ pub(super) fn spawn_times_drain_task(be: &Arc<KvMetaBackend>) {
         0 => 100,
         ms => ms,
     };
-    let handle = tokio::spawn(times_drain_task(weak, wake, interval));
-    be.install_times_drain_task(handle);
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    crate::meta_exec::spawn_meta("kv_times_drain", async move {
+        let mut done = crate::meta_exec::DoneGuard::new(done_tx);
+        times_drain_task(weak, wake, interval).await;
+        done.complete();
+    });
+    be.install_times_drain_task(done_rx);
 }
 
 async fn times_drain_task(

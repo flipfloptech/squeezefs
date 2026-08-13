@@ -829,7 +829,7 @@ pub struct KvMetaBackend {
     /// liveness probe (`Weak<()>` of the token the task owns).
     shutting_down: AtomicBool,
     ckpt_wake: Arc<tokio::sync::Notify>,
-    ckpt_join: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    ckpt_join: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<bool>>>,
     ckpt_alive: std::sync::Mutex<Weak<()>>,
 
     // ---- PR M6: the SETATTR-echo absorber (design §5.4 D4) ----
@@ -848,7 +848,7 @@ pub struct KvMetaBackend {
     pending_times_count: AtomicU64,
     /// Drain-task lifecycle: cap-crossing wake + join handle.
     times_drain_wake: Arc<tokio::sync::Notify>,
-    times_drain_join: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    times_drain_join: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<bool>>>,
     /// Mount-probe hardware classification (resolved OQ 2's second
     /// field), set once by the mount path.
     atomicity_physical: std::sync::OnceLock<crate::meta_backend::atomicity::AtomicityClass>,
@@ -3206,19 +3206,31 @@ impl KvMetaBackend {
         // PR M6: the drain task observes the flag on its wake and exits;
         // joining it keeps the no-leaked-tasks teardown contract.
         self.times_drain_wake.notify_waiters();
-        let drain_handle = self.times_drain_join.lock().unwrap().take();
-        if let Some(handle) = drain_handle {
-            handle
-                .await
-                .map_err(|e| KvError::Corrupt(format!("pending-times drain task panicked: {e}")))?;
+        let drain_done = self.times_drain_join.lock().unwrap().take();
+        if let Some(done) = drain_done {
+            match done.await {
+                Ok(true) => {}
+                Ok(false) | Err(_) => {
+                    return Err(KvError::Corrupt(
+                        "pending-times drain task panicked".to_string(),
+                    ));
+                }
+            }
         }
-        let handle = self.ckpt_join.lock().unwrap().take();
-        if let Some(handle) = handle {
+        let done = self.ckpt_join.lock().unwrap().take();
+        if let Some(done) = done {
             // The task observes the flag, runs the final checkpoint, and
-            // exits; joining it IS the drain.
-            handle.await.map_err(|e| {
-                KvError::Corrupt(format!("checkpoint task panicked during shutdown: {e}"))
-            })?;
+            // exits; awaiting its completion signal IS the drain. `false`
+            // (or a dropped guard) = the task unwound before its final
+            // cycle — same Corrupt surface the JoinHandle join gave.
+            match done.await {
+                Ok(true) => {}
+                Ok(false) | Err(_) => {
+                    return Err(KvError::Corrupt(
+                        "checkpoint task panicked during shutdown".to_string(),
+                    ));
+                }
+            }
         } else {
             // Task already gone (second shutdown, or a drop raced): make
             // the final state durable ourselves. Failures latch the
@@ -3252,10 +3264,10 @@ impl KvMetaBackend {
     /// Checkpoint-task plumbing (spawned by [`Self::open`]).
     pub(super) fn install_checkpoint_task(
         &self,
-        handle: tokio::task::JoinHandle<()>,
+        done: tokio::sync::oneshot::Receiver<bool>,
         alive: Weak<()>,
     ) {
-        *self.ckpt_join.lock().unwrap() = Some(handle);
+        *self.ckpt_join.lock().unwrap() = Some(done);
         *self.ckpt_alive.lock().unwrap() = alive;
     }
 
@@ -3265,8 +3277,8 @@ impl KvMetaBackend {
         self.times_drain_wake.clone()
     }
 
-    pub(super) fn install_times_drain_task(&self, handle: tokio::task::JoinHandle<()>) {
-        *self.times_drain_join.lock().unwrap() = Some(handle);
+    pub(super) fn install_times_drain_task(&self, done: tokio::sync::oneshot::Receiver<bool>) {
+        *self.times_drain_join.lock().unwrap() = Some(done);
     }
 
     /// R5 defense-in-depth gauge (follow-up C): the node cache's RAM
@@ -4954,7 +4966,13 @@ impl KvMetaBackend {
             // unforgiving (a dropped Admission leaks budget forever, an
             // uncompleted reservation wedges completed_upto).
             let conveyor = Arc::clone(&self.conveyor);
-            tokio::spawn(Self::conveyor_pass_task(conveyor, weak));
+            // Stage 1c: the pass task is PLANE-CRITICAL (it holds the 4b
+            // union leaf locks and every committer parks on its fan-out)
+            // — sqz-meta lanes, never the main tokio runtime.
+            crate::meta_exec::spawn_meta(
+                "kv_conveyor_pass",
+                Self::conveyor_pass_task(conveyor, weak),
+            );
         }
 
         // (3) Park on the fan-out. A closed channel means the pass died
@@ -6915,8 +6933,12 @@ impl KvMetaBackend {
                 )
             })?;
             // Detached (the M7 cancellation-safety law): no client-visible
-            // cancellation can drop a batch mid-commit.
-            tokio::spawn(Self::layout_merge_pass_task(conveyor, weak));
+            // cancellation can drop a batch mid-commit. Stage 1c venue:
+            // sqz-meta lanes (plane-critical — the publish plane's twin).
+            crate::meta_exec::spawn_meta(
+                "kv_layout_merge_pass",
+                Self::layout_merge_pass_task(conveyor, weak),
+            );
         }
         // The wedge census gauges this park too (2026-08-07) — the
         // publish plane's twin of META_COMMIT_PARKED.

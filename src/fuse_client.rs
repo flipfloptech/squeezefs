@@ -11646,7 +11646,7 @@ impl SqueezefsFilesystem {
         let fs = self.clone();
         // RES-8: a panic in this LOOP ends extent folding for the life
         // of the mount — contained + counted.
-        tokio::spawn(crate::detached::contain("extent_fold_worker", async move {
+        crate::meta_exec::spawn_meta("extent_fold_worker", async move {
             while let Some((ino, b)) = rx.recv().await {
                 if let Err(e) = fs.fold_extent_block(ino, b).await {
                     warn!(
@@ -11655,7 +11655,7 @@ impl SqueezefsFilesystem {
                     );
                 }
             }
-        }));
+        });
     }
 
     /// W2 mount-time extent-record sweep (design §5.2 crash/recovery/
@@ -18242,7 +18242,9 @@ impl Filesystem for SqueezefsFilesystem {
                 let active_inode_locks = self.active_inode_locks.clone();
                 let max_uploads = self.max_background_uploads;
                 let requeue_tx = self.writeback_tx.clone();
-                tokio::spawn(async move {
+                // Stage 1c: the never-lossy writeback LOOP is
+                // write-custody-critical — sqz-meta lanes.
+                crate::meta_exec::spawn_meta("writeback_worker_loop", async move {
                     run_constant_writeback_worker(
                         writeback_rx,
                         requeue_tx,
@@ -18296,7 +18298,7 @@ impl Filesystem for SqueezefsFilesystem {
             if let Some(reclaim_rx) = reclaim_rx_guard.take() {
                 let self_clone = self.clone();
                 let reclaim_concurrency = self.reclaim_semaphore.available_permits();
-                tokio::spawn(async move {
+                crate::meta_exec::spawn_meta("inode_reclaim_pool", async move {
                     run_reclaim_worker_pool(reclaim_rx, self_clone, reclaim_concurrency).await;
                 });
             }
@@ -23953,7 +23955,7 @@ async fn run_constant_writeback_worker(
 
         // RES-8: the never-lossy writeback unit rides this detached
         // task; a panic loses the block's retry with no record.
-        tokio::spawn(crate::detached::contain("writeback_upload", async move {
+        crate::meta_exec::spawn_meta("writeback_upload", async move {
             let _permit = match sem_clone.acquire().await {
                 Ok(p) => p,
                 Err(e) => {
@@ -24011,7 +24013,7 @@ async fn run_constant_writeback_worker(
                     requeue_or_hard_fail(&requeue_tx, req, format!("{e:?}")).await;
                 }
             }
-        }));
+        });
     }
 }
 

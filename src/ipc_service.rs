@@ -78,7 +78,7 @@ where
     crate::detached::tpc_spawn_guarded("ipc_handoff", fut);
 }
 
-tokio::task_local! {
+squeezefs_ipc::sqz_task_local! {
     /// E-IL2 (read-copy-count 2026-08-02): the arena-dest override for a
     /// ring-origin read handoff — `(window base ptr, window len)` of the
     /// op's VALIDATED arena window. Scoped around exactly one handler

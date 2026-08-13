@@ -86,7 +86,7 @@ pub fn dedup_cap() -> usize {
 }
 
 /// One dedup slot: the winner initializes it, duplicates await it.
-type DedupSlot<T> = Arc<tokio::sync::OnceCell<T>>;
+type DedupSlot<T> = Arc<squeezefs_ipc::sqz_once::OnceCell<T>>;
 
 /// The idempotency window: `(epoch, id)` → the winner's own outcome.
 ///
@@ -120,7 +120,7 @@ impl<T> DedupWindow<T> {
         if let Some(slot) = self.slots.read_sync(&key, |_, v| Arc::clone(v)) {
             return (slot, false);
         }
-        let fresh: DedupSlot<T> = Arc::new(tokio::sync::OnceCell::new());
+        let fresh: DedupSlot<T> = Arc::new(squeezefs_ipc::sqz_once::OnceCell::new());
         match self.slots.insert_sync(key, Arc::clone(&fresh)) {
             Ok(()) => {
                 let retire = {

@@ -1156,7 +1156,7 @@ fn spawn_custody_renewal(
 // lane-blind, which is the partition's own law.
 // ===========================================================================
 
-tokio::task_local! {
+squeezefs_ipc::sqz_task_local! {
     /// The **authority-accounting venue marker**: set for exactly one task
     /// tree — the shipped-free executor's ([`execute_shipped_frees`]) —
     /// and read only on the never-taken co-writer branch of the ownership-

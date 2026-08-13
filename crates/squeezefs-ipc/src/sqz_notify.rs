@@ -48,8 +48,16 @@ pub struct Notify {
 }
 
 impl Notify {
-    pub fn new() -> Self {
-        Notify::default()
+    /// Const: static cells (`sqz_once::OnceCell::new`) build on it.
+    pub const fn new() -> Self {
+        Notify {
+            state: Mutex::new(NotifyState {
+                permit: false,
+                epoch: 0,
+                waiters: Vec::new(),
+                next_id: 0,
+            }),
+        }
     }
 
     pub fn notify_one(&self) {

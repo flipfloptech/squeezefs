@@ -1241,7 +1241,7 @@ pub struct NvmeBlockDev {
     /// capability probes), `None` cached on any arm refusal — the kernel
     /// path stays byte-identical. Shared across clones (one association
     /// per device node).
-    lane: Arc<tokio::sync::OnceCell<Option<Arc<crate::zcrx_lane::LaneSession>>>>,
+    lane: Arc<squeezefs_ipc::sqz_once::OnceCell<Option<Arc<crate::zcrx_lane::LaneSession>>>>,
     /// FUSE-zc direct-leg read fd (K1 kill, 2026-08-06): a dedicated
     /// `O_DIRECT` read-only fd on the device, opened lazily at the first
     /// zc resolve and held for the mount's life — the fuse3 queue ring
@@ -1360,7 +1360,7 @@ impl NvmeBlockDev {
             // One-shot sysfs read at construction (never on a cadence or
             // a per-op path — the derived-defaults law).
             write_cache: crate::write_cache::probe_data_volume(std::path::Path::new(device_path)),
-            lane: Arc::new(tokio::sync::OnceCell::new()),
+            lane: Arc::new(squeezefs_ipc::sqz_once::OnceCell::new()),
             fence: Arc::new(DeviceFence::new()),
             zc_fd: Arc::new(std::sync::OnceLock::new()),
             zc_wfd: Arc::new(std::sync::OnceLock::new()),

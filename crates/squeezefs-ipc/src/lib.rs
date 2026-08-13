@@ -43,7 +43,9 @@ pub mod sqz_exec;
 pub mod sqz_flight;
 pub mod sqz_future;
 pub mod sqz_notify;
+pub mod sqz_once;
 pub mod sqz_semaphore;
+pub mod sqz_task;
 pub mod sqz_time;
 pub mod wire;
 

@@ -321,7 +321,7 @@ pub(crate) struct QueuedPublish {
     min_size: u64,
     flip: LayoutFlip,
     fencing_token: u64,
-    done: tokio::sync::oneshot::Sender<Result<Vec<String>>>,
+    done: squeezefs_ipc::sqz_channel::oneshot::Sender<Result<Vec<String>>>,
     /// Publish decomposition (2026-08-01): the op's enqueue instant —
     /// `publish_phase_ns` queue_wait records at pass drain, total at
     /// terminal fan-out.
@@ -1378,14 +1378,10 @@ impl BackendRouter {
     /// reclaimed-or-consciously-skipped and `finish_free`d.
     pub async fn reclaim_drain(&self) {
         let q = self.reclaim.clone();
-        if tokio::task::spawn_blocking(move || {
+        squeezefs_ipc::sqz_blocking::run_blocking(move || {
             let _ = q.drain_sync();
         })
-        .await
-        .is_err()
-        {
-            log::error!("reclaim_drain blocking task panicked");
-        }
+        .await;
     }
 
     /// Wire the terminal-free read-tier purge (see the field doc). Called
@@ -3230,7 +3226,7 @@ impl BackendRouter {
         let mut blocks = 0u64;
         let mut bytes = 0u64;
         for (device_path, allocator) in targets {
-            let res = tokio::task::spawn_blocking(move || {
+            let (b, by) = squeezefs_ipc::sqz_blocking::run_blocking(move || {
                 let mut b = 0u64;
                 let mut by = 0u64;
                 loop {
@@ -3251,13 +3247,8 @@ impl BackendRouter {
                 (b, by)
             })
             .await;
-            match res {
-                Ok((b, by)) => {
-                    blocks += b;
-                    bytes += by;
-                }
-                Err(e) => log::error!("trim_elided blocking task panicked: {e:?}"),
-            }
+            blocks += b;
+            bytes += by;
         }
         (blocks, bytes)
     }
@@ -3425,12 +3416,12 @@ pub struct DataRouterInner {
     /// Single-flight registry. `scc::HashMap`, NOT `HashIndex` (a measured
     /// deviation from the design doc's "container stays" note): HashIndex
     /// defers value drops through epoch reclamation, and since R1a the
-    /// value's broadcast ring owns the cohort's multi-MiB `FillResult` —
-    /// under a cold stream, thousands of dead flights' deferred rings
+    /// value's flight state owns the cohort's multi-MiB `FillResult` —
+    /// under a cold stream, thousands of dead flights' deferred states
     /// retained gigabytes of dead payloads (the PR 4 row-2 cage kill).
-    /// HashMap removal drops the Sender (and its ring) synchronously.
+    /// HashMap removal drops the Sender (and its stored value) synchronously.
     pub(crate) inflight_block_reads:
-        std::sync::Arc<scc::HashMap<String, tokio::sync::broadcast::Sender<Option<FillResult>>>>,
+        std::sync::Arc<scc::HashMap<String, squeezefs_ipc::sqz_flight::Sender<Option<FillResult>>>>,
     /// R1b/R2 (§5.3/§5.5): per-file K=4 offset-lane classifier + pipeline
     /// state (PR 5 merged the legacy prefetch cursor into these lanes).
     /// `pub` so the pipeline suite can simulate silent moka eviction (the
@@ -5111,19 +5102,20 @@ impl StreamLanes {
 }
 
 /// Single-flight registry guard. Three-case drop semantics (§5.2, exact):
-/// on the SUCCESS path the primary has already broadcast `Some(FillResult)`
+/// on the SUCCESS path the primary has already published `Some(FillResult)`
 /// and marked the guard `completed` — the drop is CLOSE-ONLY (no second
-/// value; a late subscriber that raced between the send and the drop sees
-/// `Err(Closed)`/`Err(Lagged)` and falls into the cache re-check loop). On
-/// the FAILURE path (fetch error return) and on FUTURE-DROP mid-fetch
-/// (caller cancelled), the un-`completed` guard sends `None` before
-/// closing, so live waiters fail fast into the re-check loop (one becomes
-/// the new primary) instead of waiting out a 50 ms slice.
+/// value; a late subscriber that raced between the send and the drop is
+/// served the stored value by the flight — `sqz_flight` keeps it — or
+/// falls into the cache re-check loop). On the FAILURE path (fetch error
+/// return) and on FUTURE-DROP mid-fetch (caller cancelled), the
+/// un-`completed` guard sends `None` before closing, so live waiters fail
+/// fast into the re-check loop (one becomes the new primary) instead of
+/// waiting out a 50 ms slice.
 struct InflightBlockReadGuard {
     key: String,
     inflight_block_reads:
-        std::sync::Arc<scc::HashMap<String, tokio::sync::broadcast::Sender<Option<FillResult>>>>,
-    tx: tokio::sync::broadcast::Sender<Option<FillResult>>,
+        std::sync::Arc<scc::HashMap<String, squeezefs_ipc::sqz_flight::Sender<Option<FillResult>>>>,
+    tx: squeezefs_ipc::sqz_flight::Sender<Option<FillResult>>,
     /// Set by the primary after a successful `send(Some(..))` — flips the
     /// drop from `None`-then-close to close-only.
     completed: std::cell::Cell<bool>,
@@ -5134,7 +5126,7 @@ impl Drop for InflightBlockReadGuard {
         self.inflight_block_reads
             .remove_if_sync(&self.key, |current| current.same_channel(&self.tx));
         if !self.completed.get() {
-            let _ = self.tx.send(None);
+            self.tx.send(None);
         }
     }
 }
@@ -6688,7 +6680,7 @@ impl DataRouter {
             if let Some(entry) = self.inflight_block_reads.get_sync(block_key) {
                 let tx = entry.get().clone();
                 drop(entry);
-                let mut rx = tx.subscribe();
+                let rx = tx.subscribe();
                 sf_waited = true;
                 // Completion may have raced between get_sync and subscribe — recheck.
                 if let Some(cached_block) = self
@@ -6708,7 +6700,7 @@ impl DataRouter {
                     // Primary finished; loop to re-read caches.
                     continue;
                 }
-                match squeezefs_ipc::sqz_time::timeout(WAIT_SLICE, rx.recv()).await {
+                match squeezefs_ipc::sqz_time::timeout(WAIT_SLICE, rx.wait()).await {
                     Ok(Ok(Some(res))) => {
                         // R1a (§5.2): served from the cohort's carried fill —
                         // no tier probe stands between a waiter and its
@@ -6734,12 +6726,11 @@ impl DataRouter {
                 }
             }
 
-            // Try to become the primary fetcher. Capacity 4 (design R-2):
-            // exactly one terminal value is ever sent, so any capacity ≥ 1
-            // suffices — the small bound caps per-receiver retained `Bytes`
-            // clones (the old 64 was sized for repeated `()` wakeups that
-            // no longer exist).
-            let (tx, _rx) = tokio::sync::broadcast::channel(4);
+            // Try to become the primary fetcher. `sqz_flight` is a shared
+            // oneshot (design R-2): exactly one terminal value is ever
+            // sent and the flight stores exactly it — no ring, no
+            // capacity, no per-receiver retained `Bytes` clones.
+            let (tx, _rx) = squeezefs_ipc::sqz_flight::channel();
             match self
                 .inflight_block_reads
                 .insert_sync(block_key.to_string(), tx.clone())
@@ -7053,9 +7044,9 @@ impl DataRouter {
                     // exactly the primary's serve-validity verdict.
                     // `Bytes` clone = refcount bump. Then flip the guard to
                     // close-only: the success drop must never send a second
-                    // value (a late subscriber that raced the send sees
-                    // Closed/Lagged and is served by the cache re-check).
-                    let _ = guard.tx.send(Some(FillResult {
+                    // value (a late subscriber that raced the send is served
+                    // the stored flight value or by the cache re-check).
+                    guard.tx.send(Some(FillResult {
                         bytes: downloaded_bytes.clone(),
                         serve_valid,
                     }));
@@ -7090,7 +7081,7 @@ impl DataRouter {
                     // closure (and the guard-ordering law) is identical on
                     // both arms.
                     if let Some((nvme_clone, backend_router, bk, dl, before)) = deferred_publish {
-                        let publish = tokio::task::spawn_blocking(move || {
+                        let publish = squeezefs_ipc::sqz_blocking::run_blocking(move || {
                             // Guard rides along: its Drop removes the
                             // registry entry AFTER the publish is visible.
                             let _guard = guard;
@@ -7113,7 +7104,7 @@ impl DataRouter {
                             }
                         });
                         if class == FillClass::Escalation {
-                            let _ = publish.await;
+                            publish.await;
                         }
                     }
                     return Ok((
@@ -7847,7 +7838,7 @@ impl DataRouter {
             let backend_router = self.backend_router.clone();
             let bk_clone = block_key.to_string();
             let held_clone = held.clone();
-            let _ = tokio::task::spawn_blocking(move || {
+            squeezefs_ipc::sqz_blocking::run_blocking(move || {
                 if !backend_router.fill_incarnation_still(&bk_clone, before) {
                     return;
                 }
@@ -8315,7 +8306,7 @@ impl DataRouter {
         // family's per-fill denominator undercounted the row by the
         // lane's whole share (field D4: n=24,748 against 372k fills).
         let fill_t0 = std::time::Instant::now();
-        let (tx, _rx) = tokio::sync::broadcast::channel(4);
+        let (tx, _rx) = squeezefs_ipc::sqz_flight::channel();
         if self
             .inflight_block_reads
             .insert_sync(block_key.to_string(), tx.clone())
@@ -8366,7 +8357,7 @@ impl DataRouter {
         // get_cached_or_fetch_block_traced): lane fetches count into
         // the same total-fill-delivery epoch the probe adjudicates on.
         self.read_lane.probe_on_fill_bytes(downloaded.len() as u64);
-        let _ = guard.tx.send(Some(FillResult {
+        guard.tx.send(Some(FillResult {
             bytes: downloaded,
             serve_valid,
         }));
@@ -10412,7 +10403,7 @@ impl DataRouter {
                 }
             },
         };
-        let (done, rx) = tokio::sync::oneshot::channel();
+        let (done, rx) = squeezefs_ipc::sqz_channel::oneshot::channel();
         let blocks = entries.len() as u64;
         // Enqueue-then-elect with no await between (the conveyor_core
         // no-lost-wakeup protocol): a cancelled submitter can never
@@ -10610,7 +10601,7 @@ impl DataRouter {
         /// One op's terminal-fan-out bookkeeping (sender + per-op payload
         /// + the enqueue instant for the `total` publish phase).
         struct Outcome<T> {
-            done: tokio::sync::oneshot::Sender<Result<Vec<String>>>,
+            done: squeezefs_ipc::sqz_channel::oneshot::Sender<Result<Vec<String>>>,
             payload: T,
             enqueued_at: std::time::Instant,
         }
@@ -11238,13 +11229,10 @@ impl DataRouter {
                             self.cache.nvme.bump_staged_generation(fid).await;
                             let nvme = self.cache.nvme.clone();
                             let ek = ext_key.clone();
-                            let admitted = tokio::task::spawn_blocking(move || {
+                            let admitted = squeezefs_ipc::sqz_blocking::run_blocking(move || {
                                 nvme.put_extent_record(&ek, &record)
                             })
-                            .await
-                            .map_err(|e| {
-                                SqueezefsError::Io(std::io::Error::other(e.to_string()))
-                            })?;
+                            .await;
                             if admitted {
                                 self.cache.write_lru.remove(file_path);
                                 self.cache.read_lru.remove(file_path);
@@ -12084,7 +12072,7 @@ impl DataRouter {
                 },
             ),
         );
-        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(
+        let sem = std::sync::Arc::new(squeezefs_ipc::sqz_semaphore::Semaphore::new(
             crate::bg_admit::striped_block_concurrency(),
         ));
 
@@ -12631,7 +12619,7 @@ impl DataRouter {
                             .staged_identity_retries
                             .fetch_add(1, Ordering::Relaxed);
                         if attempts <= 4 {
-                            tokio::task::yield_now().await;
+                            squeezefs_ipc::sqz_blocking::yield_now().await;
                         } else {
                             squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(2))
                                 .await;
@@ -14404,7 +14392,7 @@ impl DataRouter {
             base_deferred: rec.base_deferred,
             extents: clipped,
         };
-        let _ = tokio::task::spawn_blocking(move || {
+        squeezefs_ipc::sqz_blocking::run_blocking(move || {
             if record.extents.is_empty() {
                 nvme.remove_active_block(&key);
             } else if !nvme.rewrite_extent_record_in_place(&key, &record) {
@@ -14427,7 +14415,8 @@ impl DataRouter {
     async fn retire_rider_record(&self, ino: u64) {
         let key = crate::keys::active_block_ext(ino, 0).to_string();
         let nvme = self.cache.nvme.clone();
-        let _ = tokio::task::spawn_blocking(move || nvme.remove_active_block(&key)).await;
+        let _ =
+            squeezefs_ipc::sqz_blocking::run_blocking(move || nvme.remove_active_block(&key)).await;
         crate::fuse_client::METRICS
             .staged_rider_folds
             .fetch_add(1, Ordering::Relaxed);
@@ -15346,7 +15335,7 @@ impl DataRouter {
 
 pub struct IoUringPrefetcher {
     #[cfg(target_os = "linux")]
-    tx: tokio::sync::mpsc::Sender<(u64, usize)>,
+    tx: squeezefs_ipc::sqz_channel::mpsc::Sender<(u64, usize)>,
     pub prefetch_count: std::sync::atomic::AtomicUsize,
 }
 
@@ -15354,7 +15343,7 @@ impl IoUringPrefetcher {
     pub fn new() -> Self {
         #[cfg(target_os = "linux")]
         {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<(u64, usize)>(8192);
+            let (tx, mut rx) = squeezefs_ipc::sqz_channel::mpsc::channel::<(u64, usize)>(8192);
             std::thread::spawn(move || {
                 use io_uring::{opcode, IoUring};
                 let mut ring = match IoUring::new(512) {

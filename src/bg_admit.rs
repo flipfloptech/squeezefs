@@ -11,10 +11,10 @@
 //! [`striped_block_concurrency`], overridable at runtime.
 
 use once_cell::sync::Lazy;
+use squeezefs_ipc::sqz_semaphore::Semaphore;
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::Semaphore;
 
 /// Shared permit pool sized from host parallelism.
 ///

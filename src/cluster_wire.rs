@@ -70,22 +70,22 @@
 //! so storage-trust authn strengthens plaintext without weakening the
 //! Issue-30 verify-read law.
 //!
-//! ### 3. Owner-side RPC runs on pinned service threads
+//! ### 3. Owner-side RPC runs on dedicated OS threads
 //!
-//! §6.7 is explicit: owner-side RPC handling runs on pinned service
-//! threads (the `ipc_service.rs` pattern), **never on the conveyor's
-//! task** — the commit conveyor is a serialized ~0.78 ms server at
-//! ρ ≈ 0.92, and an RPC on it would multiply through the queueing
-//! formula. [`ServicePool`] is that venue: named OS threads (so
-//! `pidstat`/`perf` attribution works — the `fuse3-tpcN` lesson), NUMA
-//! pinned through the same `numa_core` partition the IPC host uses, each
-//! running a current-thread runtime with a `LocalSet`. [`RpcService::call`]
-//! is **synchronous by contract**, because §6.7's lock arbitration is
-//! RAM-only (an `scc` probe plus one atomic); anything that must await
-//! belongs on an explicit handoff, exactly as `ipc_service` does — and
-//! since **S8** that handoff is a type, [`RpcAsyncService`], whose future
-//! is polled on the same pinned lane (S8's own service hops to the
-//! runtime that owns the metadata backend's tasks itself, visibly).
+//! §6.7 is explicit: owner-side RPC handling runs on its own threads,
+//! **never on the conveyor's task** — the commit conveyor is a serialized
+//! ~0.78 ms server at ρ ≈ 0.92, and an RPC on it would multiply through
+//! the queueing formula. Since the rip-tokio conversion the venue is
+//! **one named OS thread per admitted connection** (`sqz-clw-conn`,
+//! accepted by the `sqz-clw-accept` poll loop — the names are
+//! load-bearing for `pidstat`/`perf` attribution, the `fuse3-tpcN`
+//! lesson), bounded by the same [`ConnGate`] connection cap that already
+//! bounded the accept loop. [`RpcService::call`] is **synchronous by
+//! contract**, because §6.7's lock arbitration is RAM-only (an `scc`
+//! probe plus one atomic); anything that must await is a type,
+//! [`RpcAsyncService`], whose future is polled to completion on the
+//! connection's own thread (S8's own service hops to the runtime that
+//! owns the metadata backend's tasks itself, visibly).
 //!
 //! Deliberately **not** io_uring: TLS peers and network TCP/TLS stacks are
 //! the sanctioned non-uring exception (AGENTS "Not uring" row).
@@ -128,17 +128,18 @@ use crate::tiering::cluster_tls::{
 
 use bincode::Options as _;
 use hmac::{Hmac, Mac};
+use rustls::{ClientConnection, ServerConnection, StreamOwned};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use std::net::SocketAddr;
+use std::io::{Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 // ---------------------------------------------------------------------------
 // Schema + framing constants
@@ -274,36 +275,61 @@ fn decode_body<T: DeserializeOwned>(body: &[u8]) -> std::io::Result<T> {
         .map_err(|e| std::io::Error::other(format!("undecodable frame: {e}")))
 }
 
+/// `true` ⇔ this I/O error is a socket-timeout expiry (`SO_RCVTIMEO` /
+/// `SO_SNDTIMEO` surface as `WouldBlock` on Linux, `TimedOut` elsewhere).
+/// One predicate, because every deadline on this wire now rides socket
+/// timeouts instead of a `tokio::time::timeout` wrapper.
+pub(crate) fn io_timed_out(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
 /// Commit body memory only as it arrives: at most one
 /// [`FRAME_CHUNK_BYTES`] round is outstanding ahead of the peer, so four
 /// attacker-chosen length bytes buy one chunk instead of the cap.
-async fn read_body_chunked<R: AsyncRead + Unpin>(
+///
+/// `deadline` is the whole-body bound: each `read_exact` blocks at most
+/// the caller-set socket read timeout, and the elapsed check between
+/// chunks is what turns a dribbling peer into an error instead of a
+/// parked thread.
+fn read_body_chunked<R: Read>(
     r: &mut R,
     len: usize,
+    deadline: Option<(std::time::Instant, Duration)>,
 ) -> std::io::Result<Vec<u8>> {
     let mut body: Vec<u8> = Vec::with_capacity(len.min(FRAME_CHUNK_BYTES));
     while body.len() < len {
+        if let Some((started, d)) = deadline {
+            if started.elapsed() > d {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("frame body of {len} B did not arrive within {d:?}"),
+                ));
+            }
+        }
         let want = (len - body.len()).min(FRAME_CHUNK_BYTES);
         let start = body.len();
         body.resize(start + want, 0);
-        r.read_exact(&mut body[start..]).await?;
+        r.read_exact(&mut body[start..])?;
     }
     Ok(body)
 }
 
 /// Read `len` body bytes plus `trailer` trailing bytes under one optional
 /// deadline covering the WHOLE body (a dribbling peer is an error, not a
-/// parked task). The length-prefix read itself is deliberately outside the
-/// deadline: an idle authenticated session legitimately waits between
-/// frames, and its bound is the session idle timeout.
-async fn read_framed_bytes<R: AsyncRead + Unpin>(
+/// parked thread). The length-prefix read itself is deliberately outside
+/// the deadline: an idle authenticated session legitimately waits between
+/// frames, and its bound is the session-level socket read timeout.
+fn read_framed_bytes<R: Read>(
     r: &mut R,
     max_len: u32,
     trailer: usize,
     body_timeout: Option<Duration>,
 ) -> std::io::Result<Option<(Vec<u8>, Vec<u8>)>> {
     let mut len_buf = [0u8; 4];
-    match r.read_exact(&mut len_buf).await {
+    match r.read_exact(&mut len_buf) {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e),
@@ -314,31 +340,28 @@ async fn read_framed_bytes<R: AsyncRead + Unpin>(
             "frame length {len} exceeds the {max_len} B cap"
         )));
     }
-    let read = async {
-        let body = read_body_chunked(r, len as usize).await?;
-        let mut tail = vec![0u8; trailer];
-        if trailer > 0 {
-            r.read_exact(&mut tail).await?;
+    let deadline = body_timeout.map(|d| (std::time::Instant::now(), d));
+    let body = read_body_chunked(r, len as usize, deadline)?;
+    let mut tail = vec![0u8; trailer];
+    if trailer > 0 {
+        if let Some((started, d)) = deadline {
+            if started.elapsed() > d {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("frame trailer did not arrive within {d:?}"),
+                ));
+            }
         }
-        Ok::<_, std::io::Error>((body, tail))
-    };
-    let out = match body_timeout {
-        Some(d) => tokio::time::timeout(d, read).await.map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("frame body of {len} B did not arrive within {d:?}"),
-            )
-        })??,
-        None => read.await?,
-    };
-    Ok(Some(out))
+        r.read_exact(&mut tail)?;
+    }
+    Ok(Some((body, tail)))
 }
 
 /// Write one **unauthenticated** length-prefixed frame — the handshake
 /// classes, and the pre-session direction of any protocol. One `write_all`
 /// (prefix and body in a single buffer): a syscall per frame is the RTT
 /// term this wire is measured on.
-pub async fn write_plain_frame<W: AsyncWrite + Unpin, T: Serialize>(
+pub fn write_plain_frame<W: Write, T: Serialize>(
     w: &mut W,
     class: FrameClass,
     frame: &T,
@@ -347,18 +370,18 @@ pub async fn write_plain_frame<W: AsyncWrite + Unpin, T: Serialize>(
     let mut out = Vec::with_capacity(4 + body.len());
     out.extend_from_slice(&(body.len() as u32).to_be_bytes());
     out.extend_from_slice(&body);
-    w.write_all(&out).await?;
-    w.flush().await
+    w.write_all(&out)?;
+    w.flush()
 }
 
 /// Read one **unauthenticated** frame under an explicit class cap and
 /// optional body deadline. `Ok(None)` on clean EOF at a frame boundary.
-pub async fn read_plain_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(
+pub fn read_plain_frame<R: Read, T: DeserializeOwned>(
     r: &mut R,
     max_len: u32,
     body_timeout: Option<Duration>,
 ) -> std::io::Result<Option<T>> {
-    match read_framed_bytes(r, max_len, 0, body_timeout).await? {
+    match read_framed_bytes(r, max_len, 0, body_timeout)? {
         None => Ok(None),
         Some((body, _)) => decode_body(&body).map(Some),
     }
@@ -488,7 +511,7 @@ fn tag_eq(a: &[u8], b: &[u8]) -> bool {
 
 impl FrameTx {
     /// Send one authenticated frame: `len ‖ body ‖ mac`, one `write_all`.
-    pub async fn send<W: AsyncWrite + Unpin, T: Serialize>(
+    pub fn send<W: Write, T: Serialize>(
         &mut self,
         w: &mut W,
         class: FrameClass,
@@ -500,8 +523,8 @@ impl FrameTx {
         out.extend_from_slice(&(body.len() as u32).to_be_bytes());
         out.extend_from_slice(&body);
         out.extend_from_slice(&tag);
-        w.write_all(&out).await?;
-        w.flush().await?;
+        w.write_all(&out)?;
+        w.flush()?;
         self.seq = self.seq.wrapping_add(1);
         Ok(())
     }
@@ -517,14 +540,13 @@ impl FrameRx {
     /// Receive one authenticated frame. Verification failure is a session
     /// error, never a skipped frame: tamper, reorder, replay and
     /// reflection are indistinguishable to the receiver and all fatal.
-    pub async fn recv<R: AsyncRead + Unpin, T: DeserializeOwned>(
+    pub fn recv<R: Read, T: DeserializeOwned>(
         &mut self,
         r: &mut R,
         max_len: u32,
         body_timeout: Option<Duration>,
     ) -> std::io::Result<Option<T>> {
-        let Some((body, tag)) = read_framed_bytes(r, max_len, MAC_BYTES, body_timeout).await?
-        else {
+        let Some((body, tag)) = read_framed_bytes(r, max_len, MAC_BYTES, body_timeout)? else {
             return Ok(None);
         };
         let expect = frame_mac(&self.key, self.dir, self.seq, &body);
@@ -967,7 +989,7 @@ impl SessionAuthn {
     }
 }
 
-/// The TLS **acceptor** for this wire — CA-pinned mTLS only.
+/// The TLS **acceptor** config for this wire — CA-pinned mTLS only.
 ///
 /// A `ClusterSecurityConfig` without both halves of the CA pair is
 /// **refused**: the node certificate the cluster machinery presents is
@@ -976,17 +998,80 @@ impl SessionAuthn {
 /// accept-everything verifier. That path is deleted from the tree; on this
 /// wire the honest alternative to mTLS is plaintext plus storage-trust
 /// authn, which is authenticated.
-pub fn tls_acceptor(security: &ClusterSecurityConfig) -> Result<tokio_rustls::TlsAcceptor> {
+///
+/// Returns the rustls `ServerConfig` (the rip-tokio conversion: sessions
+/// run sync `rustls::StreamOwned` on OS threads — see
+/// [`tls_server_handshake`]).
+pub fn tls_acceptor(security: &ClusterSecurityConfig) -> Result<Arc<rustls::ServerConfig>> {
     let ca = require_ca(security)?;
     let cfg = rustls_server_config(&ca)?;
-    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(cfg)))
+    Ok(Arc::new(cfg))
 }
 
-/// The TLS **connector** for this wire — same refusal, dial side.
-pub fn tls_connector(security: &ClusterSecurityConfig) -> Result<tokio_rustls::TlsConnector> {
+/// The TLS **connector** config for this wire — same refusal, dial side.
+pub fn tls_connector(security: &ClusterSecurityConfig) -> Result<Arc<rustls::ClientConfig>> {
     let ca = require_ca(security)?;
     let cfg = rustls_client_config(&ca)?;
-    Ok(tokio_rustls::TlsConnector::from(Arc::new(cfg)))
+    Ok(Arc::new(cfg))
+}
+
+/// Run the server half of the TLS handshake to completion (sync rustls
+/// completes its handshake lazily on first I/O; the exporter binding needs
+/// it done NOW, so `complete_io` is driven explicitly). The caller bounds
+/// it by setting the socket read/write timeouts to the handshake deadline
+/// **before** calling — the handshake is attacker-paced.
+pub(crate) fn tls_server_handshake(
+    cfg: Arc<rustls::ServerConfig>,
+    tcp: TcpStream,
+) -> std::io::Result<StreamOwned<ServerConnection, TcpStream>> {
+    let conn = ServerConnection::new(cfg).map_err(std::io::Error::other)?;
+    let mut s = StreamOwned::new(conn, tcp);
+    while s.conn.is_handshaking() {
+        s.conn.complete_io(&mut s.sock)?;
+    }
+    Ok(s)
+}
+
+/// The dial half of [`tls_server_handshake`] — same explicit-completion
+/// law, same caller-set socket-timeout bound. The literal `"localhost"`
+/// server name matches the SANs the `cluster_tls` node certs carry (the
+/// CA pin plus the storage-trust proof are what actually authenticate the
+/// peer — module docs, "still open by design").
+pub(crate) fn tls_client_handshake(
+    cfg: Arc<rustls::ClientConfig>,
+    tcp: TcpStream,
+) -> std::io::Result<StreamOwned<ClientConnection, TcpStream>> {
+    let name = rustls::pki_types::ServerName::try_from("localhost")
+        .expect("literal server name")
+        .to_owned();
+    let conn = ClientConnection::new(cfg, name).map_err(std::io::Error::other)?;
+    let mut s = StreamOwned::new(conn, tcp);
+    while s.conn.is_handshaking() {
+        s.conn.complete_io(&mut s.sock)?;
+    }
+    Ok(s)
+}
+
+/// Blocking dial with a real deadline: resolve, then
+/// `TcpStream::connect_timeout` each candidate address in order (the
+/// tokio dial this replaces had no explicit connect bound at all — the
+/// deadline that used to cover only the handshake now also bounds the
+/// connect).
+pub(crate) fn dial_tcp(endpoint: &str, deadline: Duration) -> std::io::Result<TcpStream> {
+    let addrs: Vec<SocketAddr> = endpoint.to_socket_addrs()?.collect();
+    let mut last: Option<std::io::Error> = None;
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, deadline) {
+            Ok(s) => return Ok(s),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            format!("'{endpoint}' resolved to no addresses"),
+        )
+    }))
 }
 
 fn require_ca(security: &ClusterSecurityConfig) -> Result<ClusterCa> {
@@ -1002,22 +1087,19 @@ fn require_ca(security: &ClusterSecurityConfig) -> Result<ClusterCa> {
 }
 
 // ---------------------------------------------------------------------------
-// The pinned service pool (§6.7: never the conveyor's task)
+// Accept/serve thread posture (§6.7: never the conveyor's task)
 // ---------------------------------------------------------------------------
 
-thread_local! {
-    /// The pool index of the current thread, or `usize::MAX` off-pool.
-    /// Const-initialized so the probe never allocates.
-    static SERVICE_THREAD: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
-}
+/// Accept-poll cadence: the listener socket is non-blocking and the named
+/// accept thread wakes this often to observe the shutdown latch (the
+/// simple-and-loud stop protocol — no self-connect nudge needed).
+pub(crate) const ACCEPT_POLL_TICK: Duration = Duration::from_millis(100);
 
-/// The pool index of the calling thread, or `None` when the caller is not
-/// a service thread. The venue probe: an owner-side RPC that observes
-/// `None` is running somewhere it must not.
-pub fn current_service_thread() -> Option<usize> {
-    let idx = SERVICE_THREAD.with(|c| c.get());
-    (idx != usize::MAX).then_some(idx)
-}
+/// Lock-held read-attempt slice for a **split** TLS stream: sync rustls
+/// cannot read and write one connection from two threads, so the halves
+/// share a mutex and the reader parks in the socket at most this long per
+/// slice before releasing it to the writer.
+const TLS_HALF_POLL_TICK: Duration = Duration::from_millis(100);
 
 /// Derived owner-side RPC lane count.
 ///
@@ -1026,6 +1108,12 @@ pub fn current_service_thread() -> Option<usize> {
 /// ceilinged at 8 so a 256-core host does not spawn a lane farm for a
 /// control plane. `SQUEEZEFS_CLUSTER_WIRE_SVC_THREADS` overrides absolute
 /// (the A/B lever), and never oversubscribes the box.
+///
+/// Retained across the rip-tokio conversion for the callers that size
+/// [`RpcListenerConfig::service_threads`] with it: since the listener
+/// serves thread-per-connection, the value no longer allocates lanes —
+/// the connection cap ([`RpcListenerConfig::max_connections`]) is what
+/// bounds serve threads.
 pub fn default_service_threads() -> usize {
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -1034,147 +1122,6 @@ pub fn default_service_threads() -> usize {
     let want = crate::env_knobs::opt_int_knob::<usize>("SQUEEZEFS_CLUSTER_WIRE_SVC_THREADS")
         .unwrap_or(derived);
     want.clamp(1, cpus.max(1))
-}
-
-type PoolJob = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
-
-/// Per-lane submission depth. Bounded by law (no unbounded channels on a
-/// reachable path): a full lane refuses the connection loudly instead of
-/// growing without limit.
-const POOL_LANE_DEPTH: usize = 1024;
-
-/// The owner-side RPC venue: pinned, named OS threads, each running a
-/// current-thread runtime with a `LocalSet`.
-///
-/// This is the `ipc_service.rs` pattern, and it exists for the reason
-/// §6.5 item 1 states: the commit conveyor is a serialized ~0.78 ms
-/// server at ρ ≈ 0.92, so an RPC dispatched onto its task multiplies
-/// through the queueing formula. Connections shard across lanes by key,
-/// and the thread names are load-bearing for `pidstat`/`perf` attribution
-/// (the `fuse3-tpcN` lesson).
-pub struct ServicePool {
-    lanes: parking_lot::Mutex<Vec<tokio::sync::mpsc::Sender<PoolJob>>>,
-    threads: parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>,
-    width: usize,
-    shutdown: AtomicBool,
-}
-
-impl std::fmt::Debug for ServicePool {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ServicePool")
-            .field("threads", &self.width)
-            .field("shutdown", &self.shutdown.load(Ordering::Relaxed))
-            .finish()
-    }
-}
-
-impl ServicePool {
-    /// Start `threads` pinned lanes named `{prefix}{index}`.
-    pub fn start(prefix: &'static str, threads: usize) -> std::io::Result<Arc<Self>> {
-        let width = threads.max(1);
-        let nodes = crate::numa_core::topology().owner_nodes(width);
-        let mut lanes = Vec::with_capacity(width);
-        let mut handles = Vec::with_capacity(width);
-        for idx in 0..width {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<PoolJob>(POOL_LANE_DEPTH);
-            let node = nodes.get(idx).copied();
-            let handle = std::thread::Builder::new()
-                .name(format!("{prefix}{idx}"))
-                .spawn(move || {
-                    SERVICE_THREAD.with(|c| c.set(idx));
-                    // NUMA: the same CPU-weighted partition the IPC host
-                    // pins to (∩ process mask, never widened). Gated
-                    // internally — a single-node host is a no-op.
-                    if let Some(node) = node {
-                        crate::numa::pin_service_thread(node);
-                    }
-                    let rt = match tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                    {
-                        Ok(rt) => rt,
-                        Err(e) => {
-                            log::error!("cluster wire: service lane {idx} has no runtime: {e}");
-                            return;
-                        }
-                    };
-                    let local = tokio::task::LocalSet::new();
-                    local.block_on(&rt, async move {
-                        while let Some(job) = rx.recv().await {
-                            tokio::task::spawn_local(job);
-                        }
-                    });
-                })?;
-            lanes.push(tx);
-            handles.push(handle);
-        }
-        Ok(Arc::new(Self {
-            lanes: parking_lot::Mutex::new(lanes),
-            threads: parking_lot::Mutex::new(handles),
-            width,
-            shutdown: AtomicBool::new(false),
-        }))
-    }
-
-    /// Lane count.
-    pub fn threads(&self) -> usize {
-        self.width
-    }
-
-    /// Run `fut` on the lane `key` shards to. Refuses (rather than
-    /// growing) when the lane's bounded queue is full, and after
-    /// shutdown.
-    pub fn spawn_on<F>(&self, key: u64, fut: F) -> std::io::Result<()>
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        if self.shutdown.load(Ordering::SeqCst) {
-            return Err(std::io::Error::other(
-                "cluster wire: service pool is shut down",
-            ));
-        }
-        let idx = (key % self.width as u64) as usize;
-        let lane = {
-            let lanes = self.lanes.lock();
-            lanes.get(idx).cloned()
-        };
-        let Some(lane) = lane else {
-            return Err(std::io::Error::other(
-                "cluster wire: service pool has no lanes",
-            ));
-        };
-        lane.try_send(Box::pin(fut)).map_err(|e| match e {
-            tokio::sync::mpsc::error::TrySendError::Full(_) => std::io::Error::other(format!(
-                "cluster wire: service lane {idx} is at its {POOL_LANE_DEPTH}-job depth"
-            )),
-            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                std::io::Error::other(format!("cluster wire: service lane {idx} is gone"))
-            }
-        })
-    }
-
-    /// Stop the lanes and join them.
-    ///
-    /// Dropping the senders is what ends each lane's receive loop; the
-    /// `LocalSet` then aborts whatever it still holds. Joining OS threads
-    /// blocks the caller (RES-12's teardown class), so an async caller
-    /// that cares should hop through `spawn_blocking`.
-    pub fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::SeqCst);
-        self.lanes.lock().clear();
-        let handles: Vec<_> = std::mem::take(&mut *self.threads.lock());
-        for h in handles {
-            let _ = h.join();
-        }
-    }
-}
-
-impl Drop for ServicePool {
-    fn drop(&mut self) {
-        if !self.shutdown.load(Ordering::SeqCst) {
-            self.shutdown();
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1417,10 +1364,15 @@ enum ServiceArm {
 }
 
 impl ServiceArm {
-    async fn call(&self, req: RpcRequest) -> RpcResponse {
+    fn call(&self, req: RpcRequest) -> RpcResponse {
         match self {
             ServiceArm::Sync(svc) => svc.call(req),
-            ServiceArm::Async(svc) => svc.call(req).await,
+            // The awaiting arm (S8's metadata verbs) is polled to
+            // completion ON this connection's own thread — never on the
+            // conveyor's task (§6.7's venue rule, unchanged): an
+            // implementation that needs a different runtime for its work
+            // performs that hop itself, visibly.
+            ServiceArm::Async(svc) => squeezefs_ipc::sqz_blocking::block_on(svc.call(req)),
         }
     }
 }
@@ -1593,14 +1545,256 @@ impl Drop for ConnPermit {
     }
 }
 
-/// A type-erased duplex byte stream: plaintext TCP or CA-pinned mTLS. One
-/// definition, so every protocol on this wire (RPC verbs, job shards) is
-/// carried by the same stream type instead of each declaring its own.
-pub trait Duplex: AsyncRead + AsyncWrite + Send + Unpin {}
-impl<T: AsyncRead + AsyncWrite + Send + Unpin> Duplex for T {}
+/// The TLS session forms this wire carries (sync rustls over blocking
+/// TCP). One enum instead of a generic so [`ClusterStream`] stays a
+/// nameable type across both directions.
+enum TlsConn {
+    Server(StreamOwned<ServerConnection, TcpStream>),
+    Client(StreamOwned<ClientConnection, TcpStream>),
+}
 
-/// The boxed form of [`Duplex`].
-pub type ClusterStream = Box<dyn Duplex>;
+impl TlsConn {
+    fn sock(&self) -> &TcpStream {
+        match self {
+            TlsConn::Server(s) => &s.sock,
+            TlsConn::Client(s) => &s.sock,
+        }
+    }
+}
+
+impl Read for TlsConn {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            TlsConn::Server(s) => s.read(buf),
+            TlsConn::Client(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for TlsConn {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            TlsConn::Server(s) => s.write(buf),
+            TlsConn::Client(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            TlsConn::Server(s) => s.flush(),
+            TlsConn::Client(s) => s.flush(),
+        }
+    }
+}
+
+/// A duplex byte stream on this wire: plaintext TCP or CA-pinned mTLS.
+/// One definition, so every protocol on the wire (RPC verbs, job shards)
+/// is carried by the same stream type instead of each declaring its own.
+/// Sync (`std::io::Read`/`Write` on blocking sockets, OS threads);
+/// deadlines ride the socket timeouts ([`Self::set_read_timeout`] /
+/// [`Self::set_write_timeout`]).
+pub struct ClusterStream(StreamInner);
+
+enum StreamInner {
+    /// Plaintext TCP (storage-trust authn makes the session
+    /// authenticated; it is not confidential).
+    Tcp(TcpStream),
+    /// CA-pinned mutual TLS. Boxed: a rustls session carries its record
+    /// buffers, so the variants differ by ~KiBs (clippy
+    /// `large_enum_variant`).
+    Tls(Box<TlsConn>),
+}
+
+impl ClusterStream {
+    /// Wrap a plaintext connection.
+    pub(crate) fn tcp(s: TcpStream) -> Self {
+        ClusterStream(StreamInner::Tcp(s))
+    }
+
+    /// Wrap a completed server-side TLS handshake.
+    pub(crate) fn tls_server(s: StreamOwned<ServerConnection, TcpStream>) -> Self {
+        ClusterStream(StreamInner::Tls(Box::new(TlsConn::Server(s))))
+    }
+
+    /// Wrap a completed dial-side TLS handshake.
+    pub(crate) fn tls_client(s: StreamOwned<ClientConnection, TcpStream>) -> Self {
+        ClusterStream(StreamInner::Tls(Box::new(TlsConn::Client(s))))
+    }
+
+    fn sock(&self) -> &TcpStream {
+        match &self.0 {
+            StreamInner::Tcp(s) => s,
+            StreamInner::Tls(t) => t.sock(),
+        }
+    }
+
+    /// Bound every subsequent blocking read at the socket.
+    pub fn set_read_timeout(&self, d: Option<Duration>) -> std::io::Result<()> {
+        self.sock().set_read_timeout(d)
+    }
+
+    /// Bound every subsequent blocking write at the socket.
+    pub fn set_write_timeout(&self, d: Option<Duration>) -> std::io::Result<()> {
+        self.sock().set_write_timeout(d)
+    }
+
+    /// A dup'd handle to the underlying socket, for teardown nudges:
+    /// `shutdown(Both)` on it from another thread wakes any read this
+    /// stream is parked in — the stop protocol for session threads.
+    pub fn nudge_handle(&self) -> std::io::Result<TcpStream> {
+        self.sock().try_clone()
+    }
+
+    /// Split into independently usable read/write halves (the job wire's
+    /// full-duplex sessions: one thread reads while others write).
+    /// Plaintext halves are dup'd sockets; TLS halves share the rustls
+    /// session under a mutex, with the reader parking in bounded
+    /// [`TLS_HALF_POLL_TICK`] slices so a parked read never starves the
+    /// writer.
+    pub fn split(self) -> std::io::Result<(ClusterReadHalf, ClusterWriteHalf)> {
+        match self.0 {
+            StreamInner::Tcp(s) => {
+                let w = s.try_clone()?;
+                Ok((
+                    ClusterReadHalf {
+                        inner: HalfInner::Tcp(s),
+                        bound: None,
+                    },
+                    ClusterWriteHalf {
+                        inner: HalfInner::Tcp(w),
+                    },
+                ))
+            }
+            StreamInner::Tls(t) => {
+                let sock = t.sock().try_clone()?;
+                let shared = Arc::new(TlsHalves {
+                    tls: parking_lot::Mutex::new(*t),
+                    sock,
+                });
+                Ok((
+                    ClusterReadHalf {
+                        inner: HalfInner::Tls(Arc::clone(&shared)),
+                        bound: None,
+                    },
+                    ClusterWriteHalf {
+                        inner: HalfInner::Tls(shared),
+                    },
+                ))
+            }
+        }
+    }
+}
+
+impl Read for ClusterStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match &mut self.0 {
+            StreamInner::Tcp(s) => s.read(buf),
+            StreamInner::Tls(t) => t.read(buf),
+        }
+    }
+}
+
+impl Write for ClusterStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match &mut self.0 {
+            StreamInner::Tcp(s) => s.write(buf),
+            StreamInner::Tls(t) => t.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match &mut self.0 {
+            StreamInner::Tcp(s) => s.flush(),
+            StreamInner::Tls(t) => t.flush(),
+        }
+    }
+}
+
+/// The shared state of a split TLS stream. `sock` is a dup of the
+/// session's socket, held OUTSIDE the mutex so timeouts (`SO_RCVTIMEO` /
+/// `SO_SNDTIMEO` are socket-level, shared across dups) can be adjusted
+/// while the other half holds the session.
+struct TlsHalves {
+    tls: parking_lot::Mutex<TlsConn>,
+    sock: TcpStream,
+}
+
+enum HalfInner {
+    Tcp(TcpStream),
+    Tls(Arc<TlsHalves>),
+}
+
+/// The read half of a split [`ClusterStream`].
+pub struct ClusterReadHalf {
+    inner: HalfInner,
+    /// The TLS read bound (plaintext rides the socket timeout directly).
+    bound: Option<Duration>,
+}
+
+impl ClusterReadHalf {
+    /// Bound every subsequent read. Plaintext: the socket timeout. TLS:
+    /// enforced across the mutex-sliced poll loop, so the bound holds
+    /// even though each socket park is a [`TLS_HALF_POLL_TICK`] slice.
+    pub fn set_read_timeout(&mut self, d: Option<Duration>) -> std::io::Result<()> {
+        match &self.inner {
+            HalfInner::Tcp(s) => s.set_read_timeout(d),
+            HalfInner::Tls(_) => {
+                self.bound = d;
+                Ok(())
+            }
+        }
+    }
+}
+
+impl Read for ClusterReadHalf {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match &mut self.inner {
+            HalfInner::Tcp(s) => s.read(buf),
+            HalfInner::Tls(sh) => {
+                let deadline = self.bound.map(|d| std::time::Instant::now() + d);
+                loop {
+                    {
+                        let mut g = sh.tls.lock();
+                        sh.sock.set_read_timeout(Some(TLS_HALF_POLL_TICK))?;
+                        match g.read(buf) {
+                            Ok(n) => return Ok(n),
+                            // A slice expiry: release the session to the
+                            // writer, then re-park. rustls buffers any
+                            // partial record internally, so the retry is
+                            // safe.
+                            Err(e) if io_timed_out(&e) => {}
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "tls read timed out",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The write half of a split [`ClusterStream`].
+pub struct ClusterWriteHalf {
+    inner: HalfInner,
+}
+
+impl Write for ClusterWriteHalf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match &mut self.inner {
+            HalfInner::Tcp(s) => s.write(buf),
+            HalfInner::Tls(sh) => sh.tls.lock().write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match &mut self.inner {
+            HalfInner::Tcp(s) => s.flush(),
+            HalfInner::Tls(sh) => sh.tls.lock().flush(),
+        }
+    }
+}
 
 struct ListenerCounters {
     conns: ConnGate,
@@ -1613,20 +1807,28 @@ struct ListenerCounters {
     service_refusals: AtomicU64,
 }
 
-/// The cluster-wire RPC listener: bounded accept loop + zero-config
-/// mutual authn + authenticated session loops, every one of them on a
-/// pinned [`ServicePool`] lane.
+/// The cluster-wire RPC listener: bounded accept poll loop on a named OS
+/// thread (`sqz-clw-accept`) + zero-config mutual authn + authenticated
+/// session loops, one named OS thread per admitted connection
+/// (`sqz-clw-conn`), bounded by the [`ConnGate`] cap.
 pub struct RpcListener {
     cfg: RpcListenerConfig,
     endpoint: SocketAddr,
     gate: Arc<AuthnGate>,
     service: ServiceArm,
-    pool: Arc<ServicePool>,
     counters: Arc<ListenerCounters>,
     channel: ChannelClass,
-    tls: Option<tokio_rustls::TlsAcceptor>,
+    tls: Option<Arc<rustls::ServerConfig>>,
     next_conn: AtomicU64,
     shutdown: Arc<AtomicBool>,
+    accept_thread: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Dup'd per-connection sockets, for the shutdown nudge
+    /// (`shutdown(Both)` wakes a session thread parked in a read).
+    /// Self-draining: a serve thread removes its own entry on exit.
+    conn_socks: parking_lot::Mutex<HashMap<u64, TcpStream>>,
+    /// Serve-thread handles, joined at shutdown. Self-draining like
+    /// `conn_socks`.
+    conn_threads: parking_lot::Mutex<HashMap<u64, std::thread::JoinHandle<()>>>,
 }
 
 impl std::fmt::Debug for RpcListener {
@@ -1634,7 +1836,6 @@ impl std::fmt::Debug for RpcListener {
         f.debug_struct("RpcListener")
             .field("endpoint", &self.endpoint)
             .field("channel", &self.channel.name())
-            .field("lanes", &self.pool.threads())
             .field("stats", &self.stats())
             .finish_non_exhaustive()
     }
@@ -1684,9 +1885,6 @@ impl RpcListener {
         let endpoint = std_listener.local_addr().map_err(|e| {
             SqueezefsError::InvalidOperation(format!("cluster wire: local_addr failed: {e}"))
         })?;
-        let pool = ServicePool::start("sqz-cluster-svc", cfg.service_threads).map_err(|e| {
-            SqueezefsError::InvalidOperation(format!("cluster wire: service pool failed: {e}"))
-        })?;
         let cfg_max_conns = cfg.max_connections;
         let gate = Arc::new(AuthnGate::new(
             secret,
@@ -1701,7 +1899,6 @@ impl RpcListener {
             endpoint,
             gate,
             service,
-            pool,
             counters: Arc::new(ListenerCounters {
                 conns: ConnGate::new(cfg_max_conns),
                 refused: AtomicU64::new(0),
@@ -1716,26 +1913,30 @@ impl RpcListener {
             tls,
             next_conn: AtomicU64::new(1),
             shutdown: Arc::new(AtomicBool::new(false)),
+            accept_thread: parking_lot::Mutex::new(None),
+            conn_socks: parking_lot::Mutex::new(HashMap::new()),
+            conn_threads: parking_lot::Mutex::new(HashMap::new()),
         });
         log::info!(
-            "cluster wire: listener {endpoint} ({}) — {} lanes, max {} connections, \
-             {HANDSHAKE_MAX_FRAME_BYTES} B pre-authn frame cap, handshake deadline {:?}, \
-             challenge freshness {:?}; every admitted frame carries a session MAC derived \
-             from the shared volume's job:enroll secret",
+            "cluster wire: listener {endpoint} ({}) — thread-per-connection, max {} \
+             connections, {HANDSHAKE_MAX_FRAME_BYTES} B pre-authn frame cap, handshake \
+             deadline {:?}, challenge freshness {:?}; every admitted frame carries a \
+             session MAC derived from the shared volume's job:enroll secret",
             host.channel.name(),
-            host.pool.threads(),
             host.cfg.max_connections,
             host.cfg.handshake_timeout,
             host.cfg.enroll_freshness,
         );
         let accept_host = Arc::clone(&host);
-        host.pool
-            .spawn_on(0, async move {
-                accept_host.accept_loop(std_listener).await;
-            })
+        let handle = std::thread::Builder::new()
+            .name("sqz-clw-accept".to_string())
+            .spawn(move || accept_host.accept_loop(std_listener))
             .map_err(|e| {
-                SqueezefsError::InvalidOperation(format!("cluster wire: accept lane refused: {e}"))
+                SqueezefsError::InvalidOperation(format!(
+                    "cluster wire: accept thread refused: {e}"
+                ))
             })?;
+        *host.accept_thread.lock() = Some(handle);
         Ok(host)
     }
 
@@ -1765,29 +1966,47 @@ impl RpcListener {
         }
     }
 
-    /// Stop accepting, end the sessions, and join the lanes.
+    /// Stop accepting, nudge every live session's socket so its serve
+    /// thread wakes out of any parked read, and join the threads.
     pub fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::SeqCst);
-        self.pool.shutdown();
+        if self.shutdown.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        {
+            let mut socks = self.conn_socks.lock();
+            for (_, sock) in socks.drain() {
+                let _ = sock.shutdown(Shutdown::Both);
+            }
+        }
+        if let Some(h) = self.accept_thread.lock().take() {
+            let _ = h.join();
+        }
+        let handles: Vec<_> = {
+            let mut threads = self.conn_threads.lock();
+            threads.drain().map(|(_, h)| h).collect()
+        };
+        for h in handles {
+            let _ = h.join();
+        }
     }
 
-    async fn accept_loop(self: Arc<Self>, std_listener: std::net::TcpListener) {
-        let listener = match tokio::net::TcpListener::from_std(std_listener) {
-            Ok(l) => l,
-            Err(e) => {
-                log::error!("cluster wire: listener adoption failed: {e}");
-                return;
-            }
-        };
+    fn accept_loop(self: Arc<Self>, listener: std::net::TcpListener) {
+        // The listener is non-blocking; the poll tick is how this thread
+        // observes the shutdown latch (simple and loud — no self-connect
+        // nudge protocol).
         let mut backoff: Option<Duration> = None;
         loop {
             if self.shutdown.load(Ordering::SeqCst) {
                 return;
             }
-            let (tcp, peer) = match listener.accept().await {
+            let (tcp, peer) = match listener.accept() {
                 Ok(x) => {
                     backoff = None;
                     x
+                }
+                Err(e) if io_timed_out(&e) => {
+                    std::thread::sleep(ACCEPT_POLL_TICK);
+                    continue;
                 }
                 Err(e) => {
                     // A bare `continue` here turns a persistent
@@ -1796,13 +2015,13 @@ impl RpcListener {
                     backoff = Some(d);
                     self.counters.backoffs.fetch_add(1, Ordering::SeqCst);
                     log::warn!("cluster wire: accept failed: {e} — backing off {d:?}");
-                    tokio::time::sleep(d).await;
+                    std::thread::sleep(d);
                     continue;
                 }
             };
             // Claim the connection slot BEFORE anything is spawned:
-            // over-cap peers cost one accept and one close, never a task
-            // or a buffer.
+            // over-cap peers cost one accept and one close, never a
+            // thread or a buffer.
             let Some(permit) = self.counters.conns.try_admit() else {
                 self.counters.refused.fetch_add(1, Ordering::SeqCst);
                 log::warn!(
@@ -1812,39 +2031,84 @@ impl RpcListener {
                 drop(tcp);
                 continue;
             };
-            let conn_id = self.next_conn.fetch_add(1, Ordering::SeqCst);
-            let host = Arc::clone(&self);
-            if let Err(e) = self.pool.spawn_on(conn_id, async move {
-                let _permit = permit;
-                host.serve_conn(tcp, peer).await;
-            }) {
-                self.counters
-                    .service_refusals
-                    .fetch_add(1, Ordering::SeqCst);
-                log::warn!("cluster wire: dropping {peer} — {e}");
+            if let Err(e) = tcp.set_nonblocking(false) {
+                log::warn!("cluster wire: dropping {peer} — set_nonblocking(false) failed: {e}");
+                continue;
             }
+            let conn_id = self.next_conn.fetch_add(1, Ordering::SeqCst);
+            if let Ok(nudge) = tcp.try_clone() {
+                self.conn_socks.lock().insert(conn_id, nudge);
+            }
+            let host = Arc::clone(&self);
+            // The registry lock is held across spawn+insert, so the serve
+            // thread's own exit-time removal can never run before the
+            // insert it undoes.
+            let mut threads = self.conn_threads.lock();
+            let spawned = std::thread::Builder::new()
+                .name("sqz-clw-conn".to_string())
+                .spawn(move || {
+                    /// Registry removal on EVERY exit (normal return or
+                    /// panic unwind), so the maps self-drain.
+                    struct Reaper {
+                        host: Arc<RpcListener>,
+                        conn_id: u64,
+                    }
+                    impl Drop for Reaper {
+                        fn drop(&mut self) {
+                            self.host.conn_socks.lock().remove(&self.conn_id);
+                            self.host.conn_threads.lock().remove(&self.conn_id);
+                        }
+                    }
+                    let _reaper = Reaper {
+                        host: Arc::clone(&host),
+                        conn_id,
+                    };
+                    let _permit = permit;
+                    host.serve_conn(tcp, peer);
+                });
+            match spawned {
+                Ok(h) => {
+                    threads.insert(conn_id, h);
+                }
+                Err(e) => {
+                    self.counters
+                        .service_refusals
+                        .fetch_add(1, Ordering::SeqCst);
+                    self.conn_socks.lock().remove(&conn_id);
+                    log::warn!("cluster wire: dropping {peer} — serve thread refused: {e}");
+                }
+            }
+            drop(threads);
         }
     }
 
-    async fn serve_conn(self: &Arc<Self>, tcp: tokio::net::TcpStream, peer: SocketAddr) {
+    fn serve_conn(self: &Arc<Self>, tcp: TcpStream, peer: SocketAddr) {
         let deadline = self.cfg.handshake_timeout;
-        // The TLS handshake is attacker-paced: bound it.
+        // Everything an unauthenticated peer does is bounded by the
+        // handshake deadline, applied at the socket (SO_RCVTIMEO /
+        // SO_SNDTIMEO — the tokio::time::timeout wrappers this replaces
+        // bounded the same exchanges).
+        if tcp.set_read_timeout(Some(deadline)).is_err()
+            || tcp.set_write_timeout(Some(deadline)).is_err()
+        {
+            log::warn!("cluster wire: {peer}: socket timeout setup failed — dropped");
+            return;
+        }
+        // The TLS handshake is attacker-paced: it runs under the socket
+        // deadlines just installed, driven to completion explicitly so
+        // the exporter binding exists before the challenge.
         let (mut stream, binding): (ClusterStream, Option<[u8; 32]>) = match self.tls.clone() {
-            Some(acceptor) => match tokio::time::timeout(deadline, acceptor.accept(tcp)).await {
-                Ok(Ok(s)) => {
-                    let binding = server_exporter(s.get_ref().1);
-                    (Box::new(s), binding)
+            Some(cfg) => match tls_server_handshake(cfg, tcp) {
+                Ok(s) => {
+                    let binding = server_exporter(&s.conn);
+                    (ClusterStream::tls_server(s), binding)
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
                     log::warn!("cluster wire: TLS handshake with {peer} failed: {e}");
                     return;
                 }
-                Err(_) => {
-                    log::warn!("cluster wire: TLS handshake with {peer} exceeded {deadline:?}");
-                    return;
-                }
             },
-            None => (Box::new(tcp), None),
+            None => (ClusterStream::tcp(tcp), None),
         };
 
         // The coordinator speaks first (the peer cannot choose its own
@@ -1855,38 +2119,27 @@ impl RpcListener {
             server_nonce: challenge.server_nonce.clone(),
             freshness_ms: challenge.freshness_ms,
         };
-        if tokio::time::timeout(
-            deadline,
-            write_plain_frame(&mut stream, FrameClass::Handshake, &frame),
-        )
-        .await
-        .is_err()
-        {
-            log::warn!("cluster wire: {peer}: challenge write stalled past {deadline:?}");
+        if let Err(e) = write_plain_frame(&mut stream, FrameClass::Handshake, &frame) {
+            log::warn!("cluster wire: {peer}: challenge write stalled: {e}");
             return;
         }
 
-        let proof = match tokio::time::timeout(
-            deadline,
-            read_plain_frame::<_, RpcFrame>(
-                &mut stream,
-                FrameClass::Handshake.cap(),
-                Some(deadline),
-            ),
-        )
-        .await
-        {
-            Ok(Ok(Some(f))) => f,
-            Ok(Ok(None)) => return,
-            Ok(Err(e)) => {
+        let proof = match read_plain_frame::<_, RpcFrame>(
+            &mut stream,
+            FrameClass::Handshake.cap(),
+            Some(deadline),
+        ) {
+            Ok(Some(f)) => f,
+            Ok(None) => return,
+            Err(e) if io_timed_out(&e) => {
+                log::warn!("cluster wire: {peer}: no proof within {deadline:?} — dropped");
+                return;
+            }
+            Err(e) => {
                 self.counters
                     .admissions_refused
                     .fetch_add(1, Ordering::SeqCst);
                 log::warn!("cluster wire: {peer}: undecodable proof frame: {e}");
-                return;
-            }
-            Err(_) => {
-                log::warn!("cluster wire: {peer}: no proof within {deadline:?} — dropped");
                 return;
             }
         };
@@ -1907,8 +2160,7 @@ impl RpcListener {
                 &RpcFrame::Refused {
                     reason: "expected Prove".into(),
                 },
-            )
-            .await;
+            );
             return;
         };
         let verdict = self.gate.verify(
@@ -1932,8 +2184,7 @@ impl RpcListener {
                     &mut stream,
                     FrameClass::Handshake,
                     &RpcFrame::Refused { reason },
-                )
-                .await;
+                );
                 return;
             }
         };
@@ -1944,7 +2195,6 @@ impl RpcListener {
                 schema: CLUSTER_WIRE_SCHEMA,
             },
         )
-        .await
         .is_err()
         {
             return;
@@ -1966,6 +2216,13 @@ impl RpcListener {
             }
         );
 
+        // Session posture: the idle bound rides the socket read timeout
+        // (the prefix wait), the write bound rides the socket write
+        // timeout, and the whole-body deadline is enforced inside the
+        // framer between chunks.
+        let _ = stream.set_read_timeout(Some(self.cfg.session_idle_timeout));
+        let _ = stream.set_write_timeout(Some(self.cfg.frame_body_timeout));
+
         // Authenticated session loop. Every frame is MAC'd, so the
         // session cannot be hijacked, reordered or replayed mid-flight.
         let (mut tx, mut rx) = session_framers(&key, Role::Coordinator);
@@ -1973,19 +2230,22 @@ impl RpcListener {
             if self.shutdown.load(Ordering::SeqCst) {
                 return;
             }
-            let frame = match tokio::time::timeout(
-                self.cfg.session_idle_timeout,
-                rx.recv::<_, RpcFrame>(
-                    &mut stream,
-                    FrameClass::Bulk.cap(),
-                    Some(self.cfg.frame_body_timeout),
-                ),
-            )
-            .await
-            {
-                Ok(Ok(Some(f))) => f,
-                Ok(Ok(None)) => break,
-                Ok(Err(e)) => {
+            let frame = match rx.recv::<_, RpcFrame>(
+                &mut stream,
+                FrameClass::Bulk.cap(),
+                Some(self.cfg.frame_body_timeout),
+            ) {
+                Ok(Some(f)) => f,
+                Ok(None) => break,
+                Err(e) if io_timed_out(&e) => {
+                    log::warn!(
+                        "cluster wire: peer '{peer_id}' sent no frame within {:?} — closing \
+                         the idle session",
+                        self.cfg.session_idle_timeout
+                    );
+                    break;
+                }
+                Err(e) => {
                     if e.to_string().contains("mac") {
                         self.counters.mac_failures.fetch_add(1, Ordering::SeqCst);
                         log::warn!(
@@ -1997,26 +2257,17 @@ impl RpcListener {
                     }
                     break;
                 }
-                Err(_) => {
-                    log::warn!(
-                        "cluster wire: peer '{peer_id}' sent no frame within {:?} — closing \
-                         the idle session",
-                        self.cfg.session_idle_timeout
-                    );
-                    break;
-                }
             };
             let RpcFrame::Call { id, verb, body } = frame else {
                 log::warn!("cluster wire: peer '{peer_id}' sent a non-Call frame — ignored");
                 continue;
             };
-            // The service runs HERE — on this pinned lane, which is the
-            // whole point of §6.7's venue rule. An awaiting arm (S8's
-            // metadata verbs) yields on this lane's `LocalSet`, so the
-            // lane keeps serving its other sessions while one verb's
-            // commit is in flight; it never migrates the work onto the
-            // conveyor's task.
-            let reply = self.service.call(RpcRequest { id, verb, body }).await;
+            // The service runs HERE — on this connection's own thread,
+            // which is §6.7's venue rule: it never migrates the work
+            // onto the conveyor's task. An awaiting arm (S8's metadata
+            // verbs) is polled to completion on this thread; other
+            // sessions keep serving on their own threads meanwhile.
+            let reply = self.service.call(RpcRequest { id, verb, body });
             self.counters.served.fetch_add(1, Ordering::SeqCst);
             if tx
                 .send(
@@ -2028,12 +2279,17 @@ impl RpcListener {
                         body: reply.body,
                     },
                 )
-                .await
                 .is_err()
             {
                 break;
             }
         }
+    }
+}
+
+impl Drop for RpcListener {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -2059,14 +2315,75 @@ pub fn client_exporter(conn: &rustls::ClientConnection) -> Option<[u8; 32]> {
 // The dial side
 // ---------------------------------------------------------------------------
 
-/// A dialed, authenticated cluster-wire session.
-pub struct RpcClient {
+/// A dialed session's I/O state — owned as one unit so [`RpcClient::call`]
+/// can move it onto the blocking pool and back (the async API is
+/// preserved; the roundtrip itself is sync socket I/O).
+struct ClientIo {
     stream: ClusterStream,
     tx: FrameTx,
     rx: FrameRx,
+    call_timeout: Duration,
+}
+
+impl ClientIo {
+    fn roundtrip(&mut self, id: u64, verb: u16, body: Vec<u8>) -> Result<RpcResponse> {
+        self.tx.send(
+            &mut self.stream,
+            FrameClass::Bulk,
+            &RpcFrame::Call { id, verb, body },
+        )?;
+        let frame = self
+            .rx
+            .recv::<_, RpcFrame>(
+                &mut self.stream,
+                FrameClass::Bulk.cap(),
+                Some(self.call_timeout),
+            )
+            .map_err(|e| {
+                if io_timed_out(&e) {
+                    SqueezefsError::InvalidOperation(format!(
+                        "cluster wire: no reply to call {id} within {:?}",
+                        self.call_timeout
+                    ))
+                } else {
+                    SqueezefsError::from(e)
+                }
+            })?;
+        match frame {
+            Some(RpcFrame::Reply {
+                id: reply_id,
+                status,
+                body,
+            }) => {
+                if reply_id != id {
+                    return Err(SqueezefsError::InvalidOperation(format!(
+                        "cluster wire: reply id {reply_id} does not match call {id}"
+                    )));
+                }
+                Ok(RpcResponse {
+                    id: reply_id,
+                    status,
+                    body,
+                })
+            }
+            Some(other) => Err(SqueezefsError::InvalidOperation(format!(
+                "cluster wire: unexpected frame in reply position: {other:?}"
+            ))),
+            None => Err(SqueezefsError::InvalidOperation(
+                "cluster wire: the coordinator closed the session".into(),
+            )),
+        }
+    }
+}
+
+/// A dialed, authenticated cluster-wire session.
+pub struct RpcClient {
+    /// `None` only while a call is in flight on the blocking pool (or
+    /// after that hop was lost to a panic — every later call then refuses
+    /// loud instead of reusing a desynchronized session).
+    io: Option<ClientIo>,
     authn: SessionAuthn,
     next_id: u64,
-    call_timeout: Duration,
 }
 
 impl std::fmt::Debug for RpcClient {
@@ -2078,33 +2395,51 @@ impl std::fmt::Debug for RpcClient {
     }
 }
 
-/// Bound on the dial-side handshake and on one call's reply.
+/// Bound on the dial-side connect + handshake and on one call's reply.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl RpcClient {
     /// Dial, prove storage membership against the coordinator's
     /// **server-issued** challenge, derive the session key, and return the
-    /// authenticated session.
+    /// authenticated session. Async API preserved; the socket work runs on
+    /// the blocking pool.
     pub async fn connect(
         endpoint: &str,
         secret: &[u8],
         peer_id: &str,
         security: Option<&ClusterSecurityConfig>,
     ) -> Result<Self> {
-        let tcp = tokio::net::TcpStream::connect(endpoint).await?;
+        let endpoint = endpoint.to_string();
+        let secret = secret.to_vec();
+        let peer_id = peer_id.to_string();
+        let security = security.cloned();
+        squeezefs_ipc::sqz_blocking::run_blocking(move || {
+            Self::connect_sync(&endpoint, &secret, &peer_id, security.as_ref())
+        })
+        .await
+    }
+
+    fn connect_sync(
+        endpoint: &str,
+        secret: &[u8],
+        peer_id: &str,
+        security: Option<&ClusterSecurityConfig>,
+    ) -> Result<Self> {
+        let tcp = dial_tcp(endpoint, DIAL_TIMEOUT)?;
+        // Every dial-side exchange is bounded by DIAL_TIMEOUT at the
+        // socket (the tokio::time::timeout wrappers this replaces bounded
+        // the same exchanges).
+        tcp.set_read_timeout(Some(DIAL_TIMEOUT))?;
+        tcp.set_write_timeout(Some(DIAL_TIMEOUT))?;
         let (mut stream, binding): (ClusterStream, Option<[u8; 32]>) = match security {
             Some(sec) => {
-                let connector = tls_connector(sec)?;
                 // The ClusterSecurityConfig node certs carry
                 // localhost/127.0.0.1 SANs (cluster_tls construction).
-                let name = rustls::pki_types::ServerName::try_from("localhost")
-                    .expect("literal server name")
-                    .to_owned();
-                let tls = connector.connect(name, tcp).await?;
-                let binding = client_exporter(tls.get_ref().1);
-                (Box::new(tls), binding)
+                let tls = tls_client_handshake(tls_connector(sec)?, tcp)?;
+                let binding = client_exporter(&tls.conn);
+                (ClusterStream::tls_client(tls), binding)
             }
-            None => (Box::new(tcp), None),
+            None => (ClusterStream::tcp(tcp), None),
         };
         let channel = if security.is_some() {
             ChannelClass::MutualTls
@@ -2112,20 +2447,20 @@ impl RpcClient {
             ChannelClass::Plaintext
         };
 
-        let server_nonce = match tokio::time::timeout(
-            DIAL_TIMEOUT,
-            read_plain_frame::<_, RpcFrame>(
-                &mut stream,
-                FrameClass::Handshake.cap(),
-                Some(DIAL_TIMEOUT),
-            ),
+        let server_nonce = match read_plain_frame::<_, RpcFrame>(
+            &mut stream,
+            FrameClass::Handshake.cap(),
+            Some(DIAL_TIMEOUT),
         )
-        .await
-        .map_err(|_| {
-            SqueezefsError::InvalidOperation(format!(
-                "cluster wire: no challenge from the coordinator within {DIAL_TIMEOUT:?}"
-            ))
-        })?? {
+        .map_err(|e| {
+            if io_timed_out(&e) {
+                SqueezefsError::InvalidOperation(format!(
+                    "cluster wire: no challenge from the coordinator within {DIAL_TIMEOUT:?}"
+                ))
+            } else {
+                SqueezefsError::from(e)
+            }
+        })? {
             Some(RpcFrame::Challenge {
                 schema,
                 server_nonce,
@@ -2156,15 +2491,12 @@ impl RpcClient {
                 peer_nonce: peer_nonce.clone(),
                 mac: proof_mac(secret, peer_id, &server_nonce, &peer_nonce),
             },
-        )
-        .await?;
+        )?;
         match read_plain_frame::<_, RpcFrame>(
             &mut stream,
             FrameClass::Handshake.cap(),
             Some(DIAL_TIMEOUT),
-        )
-        .await?
-        {
+        )? {
             Some(RpcFrame::Admitted { .. }) => {}
             Some(RpcFrame::Refused { reason }) => {
                 return Err(SqueezefsError::InvalidOperation(format!(
@@ -2186,16 +2518,18 @@ impl RpcClient {
         );
         let (tx, rx) = session_framers(&key, Role::Peer);
         Ok(Self {
-            stream,
-            tx,
-            rx,
+            io: Some(ClientIo {
+                stream,
+                tx,
+                rx,
+                call_timeout: DIAL_TIMEOUT,
+            }),
             authn: SessionAuthn {
                 channel,
                 proof_verified: true,
                 mac_engaged: true,
             },
             next_id: 0,
-            call_timeout: DIAL_TIMEOUT,
         })
     }
 
@@ -2204,56 +2538,24 @@ impl RpcClient {
         &self.authn
     }
 
-    /// Issue one authenticated request and await its reply.
+    /// Issue one authenticated request and await its reply. Async API
+    /// preserved; the roundtrip runs on the blocking pool with the reply
+    /// wait bounded by the socket read timeout.
     pub async fn call(&mut self, verb: u16, body: Vec<u8>) -> Result<RpcResponse> {
         self.next_id += 1;
         let id = self.next_id;
-        self.tx
-            .send(
-                &mut self.stream,
-                FrameClass::Bulk,
-                &RpcFrame::Call { id, verb, body },
+        let mut io = self.io.take().ok_or_else(|| {
+            SqueezefsError::InvalidOperation(
+                "cluster wire: session I/O lost to an earlier panicked call — reconnect".into(),
             )
-            .await?;
-        let frame = tokio::time::timeout(
-            self.call_timeout,
-            self.rx.recv::<_, RpcFrame>(
-                &mut self.stream,
-                FrameClass::Bulk.cap(),
-                Some(self.call_timeout),
-            ),
-        )
-        .await
-        .map_err(|_| {
-            SqueezefsError::InvalidOperation(format!(
-                "cluster wire: no reply to call {id} within {:?}",
-                self.call_timeout
-            ))
-        })??;
-        match frame {
-            Some(RpcFrame::Reply {
-                id: reply_id,
-                status,
-                body,
-            }) => {
-                if reply_id != id {
-                    return Err(SqueezefsError::InvalidOperation(format!(
-                        "cluster wire: reply id {reply_id} does not match call {id}"
-                    )));
-                }
-                Ok(RpcResponse {
-                    id: reply_id,
-                    status,
-                    body,
-                })
-            }
-            Some(other) => Err(SqueezefsError::InvalidOperation(format!(
-                "cluster wire: unexpected frame in reply position: {other:?}"
-            ))),
-            None => Err(SqueezefsError::InvalidOperation(
-                "cluster wire: the coordinator closed the session".into(),
-            )),
-        }
+        })?;
+        let (io, out) = squeezefs_ipc::sqz_blocking::run_blocking(move || {
+            let out = io.roundtrip(id, verb, body);
+            (io, out)
+        })
+        .await;
+        self.io = Some(io);
+        out
     }
 }
 

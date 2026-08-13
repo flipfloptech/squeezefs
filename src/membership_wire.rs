@@ -644,7 +644,7 @@ pub async fn census_as_registrations(
     let rec = membership::read_owner_record(be).await?;
     let secret = membership::cluster_secret(be).await?;
     let probe_id = format!("probe-{}", uuid::Uuid::new_v4());
-    let rows = tokio::time::timeout(deadline, async {
+    let rows = squeezefs_ipc::sqz_time::timeout(deadline, async {
         let mut client = CensusProbe::connect(&rec.endpoint, &secret, &probe_id).await?;
         let mut cursor = Some(0u64);
         let mut out: Vec<MemberSnapshot> = Vec::new();

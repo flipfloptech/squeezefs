@@ -103,7 +103,7 @@ pub enum VerbRoute {
 struct Submission {
     ops: Vec<MetaOp>,
     owner_term: u64,
-    reply: tokio::sync::oneshot::Sender<Result<Vec<MetaOpResult>>>,
+    reply: squeezefs_ipc::sqz_channel::oneshot::Sender<Result<Vec<MetaOpResult>>>,
     queued_at: Instant,
 }
 
@@ -111,7 +111,7 @@ struct Submission {
 /// has learned for that owner.
 struct ShipLane {
     peer: Arc<PeerOwner>,
-    tx: tokio::sync::mpsc::Sender<Submission>,
+    tx: squeezefs_ipc::sqz_channel::mpsc::Sender<Submission>,
     /// The owner's era, as learned from its replies. `0` = not yet known
     /// (the first frame asks).
     term: AtomicU64,
@@ -300,7 +300,7 @@ impl MetaShipRouter {
     ) -> Result<Vec<MetaOpResult>> {
         let count = ops.len() as u64;
         let lane = self.lane(peer)?;
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = squeezefs_ipc::sqz_channel::oneshot::channel();
         lane.tx
             .send(Submission {
                 ops,
@@ -383,7 +383,7 @@ impl MetaShipRouter {
         // Bounded by law: batch_max × 8 submissions in flight, so a
         // saturated owner backpressures its clients instead of growing a
         // queue without limit.
-        let (tx, rx) = tokio::sync::mpsc::channel::<Submission>(batch_max() * 8);
+        let (tx, rx) = squeezefs_ipc::sqz_channel::mpsc::channel::<Submission>(batch_max() * 8);
         let lane = Arc::new(ShipLane {
             peer: Arc::clone(peer),
             tx,
@@ -400,11 +400,10 @@ impl MetaShipRouter {
                     secret: Arc::clone(&self.secret),
                     client_epoch: self.client_epoch,
                 };
-                // The drain is spawned on the caller's runtime — the
-                // daemon's — because that is where the rest of this
-                // client's work lives; it ends when the router (and hence
-                // the lane's sender) is dropped.
-                tokio::spawn(drain.run(rx));
+                // The drain rides the sqz-meta pool — the venue that owns
+                // the daemon's plane tasks; it ends when the router (and
+                // hence the lane's sender) is dropped.
+                crate::meta_exec::spawn_meta("meta_ship_lane_drain", drain.run(rx));
                 Ok(lane)
             }
             Err(_) => self
@@ -434,7 +433,7 @@ struct LaneDrain {
 }
 
 impl LaneDrain {
-    async fn run(self, mut rx: tokio::sync::mpsc::Receiver<Submission>) {
+    async fn run(self, mut rx: squeezefs_ipc::sqz_channel::mpsc::Receiver<Submission>) {
         let mut session: Option<crate::cluster_wire::RpcClient> = None;
         while let Some(first) = rx.recv().await {
             // The head-of-iteration hold is a TEST seam only (0 in
@@ -442,7 +441,7 @@ impl LaneDrain {
             // a serial stream.
             let hold = TEST_SHIP_DRAIN_HOLD_MS.load(Ordering::Relaxed);
             if hold > 0 {
-                tokio::time::sleep(Duration::from_millis(hold)).await;
+                squeezefs_ipc::sqz_time::sleep(Duration::from_millis(hold)).await;
             }
             let mut batch = vec![first];
             let cap = batch_max();

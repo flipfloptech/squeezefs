@@ -401,9 +401,7 @@ pub async fn measure(meta: &Arc<RoutedMetaBackend>, router: &DataRouter) -> Resu
     let d2 = measure_d2(meta, router).await?;
     let d3 = {
         let r = router.clone();
-        tokio::task::spawn_blocking(move || measure_d3(&r))
-            .await
-            .map_err(|e| SqueezefsError::InvalidOperation(format!("D3 measure join: {e}")))?
+        squeezefs_ipc::sqz_blocking::run_blocking(move || measure_d3(&r)).await
     };
     let d4 = measure_d4(meta).await?;
 
@@ -451,17 +449,12 @@ pub fn refresh_d1_d3_gauges(router: &DataRouter) {
 /// health-worker cadence precedent (detached loop, dies with the
 /// daemon). D2/D4 stay measure-priced and refresh via [`measure`].
 pub fn spawn_gauge_worker(router: DataRouter) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    crate::meta_exec::spawn_meta("defrag_gauge_worker", async move {
+        let mut interval = squeezefs_ipc::sqz_time::interval(std::time::Duration::from_secs(5));
         loop {
             interval.tick().await;
             let r = router.clone();
-            if tokio::task::spawn_blocking(move || refresh_d1_d3_gauges(&r))
-                .await
-                .is_err()
-            {
-                return; // runtime shutting down
-            }
+            squeezefs_ipc::sqz_blocking::run_blocking(move || refresh_d1_d3_gauges(&r)).await;
         }
     });
 }

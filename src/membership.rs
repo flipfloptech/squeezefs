@@ -1738,7 +1738,6 @@ pub struct MembershipArm {
     /// The OWNER's identity — the claim-set entry to withdraw at disarm.
     owner_id: Option<String>,
     stop: Arc<AtomicBool>,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
     mode: &'static str,
 }
 
@@ -1746,7 +1745,6 @@ impl std::fmt::Debug for MembershipArm {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MembershipArm")
             .field("mode", &self.mode)
-            .field("tasks", &self.tasks.len())
             .finish_non_exhaustive()
     }
 }
@@ -1791,9 +1789,9 @@ impl MembershipArm {
                 );
             }
         }
-        for task in self.tasks.drain(..) {
-            task.abort();
-        }
+        // Stop latch (the D0 heartbeat precedent — sqz-meta tasks are
+        // never aborted mid-poll): the sweep/renewal loops check `stop`
+        // after every sleep and exit on their next wake.
         uninstall();
     }
 }
@@ -1963,15 +1961,15 @@ async fn arm_owner(
     // of one clock).
     owner.refresh_free_grace_bound();
     let stop = Arc::new(AtomicBool::new(false));
-    let sweep = {
+    {
         let owner = Arc::clone(&owner);
         let stop = Arc::clone(&stop);
         let meta = Arc::clone(meta);
         let plane_stats = Arc::clone(&plane);
         let cadence = clocks.renew_interval;
-        tokio::spawn(crate::detached::contain("membership_sweep", async move {
+        crate::meta_exec::spawn_meta_contained("membership_sweep", async move {
             loop {
-                tokio::time::sleep(cadence).await;
+                squeezefs_ipc::sqz_time::sleep(cadence).await;
                 if stop.load(Ordering::Acquire) {
                     return;
                 }
@@ -2005,8 +2003,8 @@ async fn arm_owner(
                     );
                 }
             }
-        }))
-    };
+        });
+    }
     log::info!(
         "membership OWNER armed on {endpoint} (id '{id}', term {term}, superseding {prior_term}): \
          members hold RAM leases renewed over cluster_wire, so liveness costs ZERO journal \
@@ -2018,7 +2016,6 @@ async fn arm_owner(
         volumes,
         owner_id: Some(id),
         stop,
-        tasks: vec![sweep],
         mode: "owner",
     }))
 }
@@ -2125,7 +2122,7 @@ async fn join_member_on(
     let session = Arc::clone(client.session());
     install_member(Arc::clone(&session));
     let stop = Arc::new(AtomicBool::new(false));
-    let task = spawn_member_renewal(
+    spawn_member_renewal(
         client,
         rec.endpoint.clone(),
         secret,
@@ -2149,7 +2146,6 @@ async fn join_member_on(
         volumes: Vec::new(),
         owner_id: None,
         stop,
-        tasks: vec![task],
         mode: "member",
     }))
 }
@@ -2166,13 +2162,13 @@ fn spawn_member_renewal(
     clock: LeaseClock,
     stop: Arc<AtomicBool>,
     on_purge: Option<Arc<dyn Fn() + Send + Sync>>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(crate::detached::contain("membership_renewal", async move {
+) {
+    crate::meta_exec::spawn_meta_contained("membership_renewal", async move {
         loop {
             let session = Arc::clone(client.session());
             let now = clock.now_ms();
             let due = session.renew_at_ms().saturating_sub(now);
-            tokio::time::sleep(Duration::from_millis(due.max(1))).await;
+            squeezefs_ipc::sqz_time::sleep(Duration::from_millis(due.max(1))).await;
             if stop.load(Ordering::Acquire) {
                 let _ = client.leave().await;
                 return;
@@ -2209,7 +2205,7 @@ fn spawn_member_renewal(
                 }
             }
         }
-    }))
+    })
 }
 
 /// The `membership_mode` stats field: `off` (no plane armed — the shipped

@@ -871,12 +871,10 @@ pub async fn gather_admission(
     // about us can exist). Registration is the mutation, so it happens
     // after rungs 1–3 and its failure is rung 5's refusal.
     let paths = data_paths.to_vec();
-    let wero =
-        tokio::task::spawn_blocking(move || crate::data_custody::join_wero_as_registrant(&paths))
-            .await
-            .map_err(|e| {
-                SqueezefsError::InvalidOperation(format!("co-writer WERO join task failed: {e}"))
-            })??;
+    let wero = squeezefs_ipc::sqz_blocking::run_blocking(move || {
+        crate::data_custody::join_wero_as_registrant(&paths)
+    })
+    .await?;
     req.registrant = Some(wero.evidence());
 
     if let Some(rec) = rendezvous {
@@ -930,14 +928,12 @@ pub struct CoWriterArm {
     membership: Option<crate::membership::MembershipArm>,
     wero: Option<crate::data_custody::WeroRegistrantJoin>,
     stop: Arc<AtomicBool>,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for CoWriterArm {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CoWriterArm")
             .field("admission", &self.admission)
-            .field("tasks", &self.tasks.len())
             .finish_non_exhaustive()
     }
 }
@@ -958,10 +954,10 @@ impl CoWriterArm {
     /// and unregister this node's key from the standing WERO hold (zero
     /// device residue — the authority's reservation is untouched).
     pub async fn disarm(mut self) {
+        // Stop latch (the D0 heartbeat precedent — sqz-meta tasks are
+        // never aborted mid-poll): the renewal loop checks `stop` after
+        // every sleep and exits before touching the client again.
         self.stop.store(true, Ordering::Release);
-        for task in self.tasks.drain(..) {
-            task.abort();
-        }
         crate::data_grant::uninstall_custody_client();
         crate::meta_ship::publish::uninstall_client();
         crate::meta_ship::disarm_ownership();
@@ -969,7 +965,7 @@ impl CoWriterArm {
             arm.disarm().await;
         }
         if let Some(wero) = self.wero.take() {
-            let _ = tokio::task::spawn_blocking(move || drop(wero)).await;
+            squeezefs_ipc::sqz_blocking::run_blocking(move || drop(wero)).await;
         }
         log::warn!(
             "CO-WRITER DISARMED: no custody is held, nothing ships, and this node is no longer \
@@ -1087,7 +1083,7 @@ pub async fn arm(
     }
 
     let stop = Arc::new(AtomicBool::new(false));
-    let renew = spawn_custody_renewal(Arc::clone(&client), Arc::clone(&stop));
+    spawn_custody_renewal(Arc::clone(&client), Arc::clone(&stop));
     log::warn!(
         "CO-WRITER ARMED (DLM S9): metadata verbs ship to '{}' at {}, write custody is acquired \
          there, fresh blocks are placed in allocation lane {} of {} (durable reservations \
@@ -1105,7 +1101,6 @@ pub async fn arm(
         membership,
         wero: Some(wero),
         stop,
-        tasks: vec![renew],
     })
 }
 
@@ -1117,31 +1112,28 @@ pub async fn arm(
 fn spawn_custody_renewal(
     client: Arc<crate::data_grant::WriteCustodyClient>,
     stop: Arc<AtomicBool>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(crate::detached::contain(
-        "cowriter_custody_renewal",
-        async move {
-            loop {
-                let now = crate::membership::LeaseClock::monotonic().now_ms();
-                let due = client.renew_at_ms().saturating_sub(now).max(1);
-                tokio::time::sleep(Duration::from_millis(due)).await;
-                if stop.load(Ordering::Acquire) {
+) {
+    crate::meta_exec::spawn_meta_contained("cowriter_custody_renewal", async move {
+        loop {
+            let now = crate::membership::LeaseClock::monotonic().now_ms();
+            let due = client.renew_at_ms().saturating_sub(now).max(1);
+            squeezefs_ipc::sqz_time::sleep(Duration::from_millis(due)).await;
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+            if let Err(e) = client.renew_all().await {
+                if client.self_fence_due() {
+                    client.self_fence(&format!("custody renewal failed: {e}"));
                     return;
                 }
-                if let Err(e) = client.renew_all().await {
-                    if client.self_fence_due() {
-                        client.self_fence(&format!("custody renewal failed: {e}"));
-                        return;
-                    }
-                    log::warn!(
-                        "co-writer custody renewal failed ({e}) — retrying before my own deadline \
+                log::warn!(
+                    "co-writer custody renewal failed ({e}) — retrying before my own deadline \
                      (T_self, strictly earlier than the authority's TTL)"
-                    );
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
+                );
+                squeezefs_ipc::sqz_time::sleep(Duration::from_millis(25)).await;
             }
-        },
-    ))
+        }
+    })
 }
 
 // ===========================================================================
@@ -1339,7 +1331,7 @@ pub async fn ship_displaced_frees(
                     if client.lease_epoch() != epoch || attempt >= FREE_SHIP_ATTEMPTS {
                         break Err(e);
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(10)).await;
                 }
             }
         };

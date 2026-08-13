@@ -391,14 +391,20 @@ async fn stamp_precleared_staging_dir(dir: &Path, plan: Option<&StagingWipePlan>
     if let Some(plan) = plan {
         print_wipe_plan(dir, plan);
     }
-    match tokio::fs::remove_dir_all(dir).await {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(ctx("wipe", &e)),
+    {
+        let dir = dir.to_path_buf();
+        match squeezefs_ipc::sqz_blocking::run_blocking(move || std::fs::remove_dir_all(&dir)).await
+        {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(ctx("wipe", &e)),
+        }
     }
-    tokio::fs::create_dir_all(dir)
-        .await
-        .map_err(|e| ctx("create", &e))?;
+    {
+        let dir = dir.to_path_buf();
+        squeezefs_ipc::sqz_blocking::run_blocking(move || std::fs::create_dir_all(&dir)).await
+    }
+    .map_err(|e| ctx("create", &e))?;
     // VAL-7b: mode + ownership are both applied through ONE
     // `O_DIRECTORY | O_NOFOLLOW` fd. The historical
     // `std::os::unix::fs::chown(dir, …)` was a PATH call: a symlink

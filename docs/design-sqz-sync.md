@@ -213,6 +213,38 @@ census with per-block keys and overlay sub-phases, stripe held-probe,
 fused residency watch, bridge scan gauges, message economy, bounded
 park, orphan sweep) is now permanent wedge-attribution machinery.
 
+## THE FIX (2026-08-13, branch fix/ack-early-settle-wedge) — accepted
+
+**Root cause** (live-gdb capture, thread 105 of the orphan-era wedge):
+`await_overlay_inflight` was a `yield_now()` SPIN. The write handler
+runs as a FUSED task polled by the transport queue worker's own pass
+interleave, so a settle spinning on a live store ticket SELF-WOKE
+forever — starving the very pass that pumps the ZcStore `WorkerMsg`
+and reaps the store CQE whose ticket the settle waits on. Same-block
+writers convoyed behind the held stripe (the checkout census), the
+transport read healthy (the pend either never pumped or never reaped
+by the starved pass), and capped clocks widened the same-block
+settle-vs-store window — which is why 3.0 GHz selected it.
+
+**Fix** (each half red/green):
+* `await_overlay_inflight` is an EVENT WAIT on the record's new
+  `inflight_change` Notify (register→re-check order; 100 ms belt so a
+  missed notify site degrades to a tick; 30 s bark names a genuinely
+  leaked ticket). Every store CQE routes through
+  `DeviceOverlayRecord::complete_store_and_wake` (all 7 sites).
+* zc-armed queue workers ALWAYS park bounded (their commit_rx receives
+  foreign-thread zc messages whose only wake is the elidable
+  coalescer→eventfd→PollAdd chain — the audit's stranded-message hole).
+* Repro-port: `tests/overlay_settle_wait_tests.rs` — parks-and-wakes,
+  never-spins (poll-count bound: the yield_now regression detector),
+  and the lost-wake belt.
+
+**Accepted**: generic/464 **×10 green** at 3.0 GHz boost-off with
+ACK-early ON (the shipped default) — the posture that wedged run 1 of
+nearly every pre-fix count; zero settle barks across the runs. The
+Stage-1 acceptance instrument is MET; the held release battery may run
+from zero.
+
 ## Acceptance
 
 * The primitive's unit rails + a loom model of the acquire/release/wake

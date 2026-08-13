@@ -477,6 +477,35 @@ impl OverlayRecordCore {
         self.inflight.load(Ordering::SeqCst) == 0
     }
 
+    /// The live in-flight store count (the leaked-ticket bark's
+    /// fingerprint — diagnostic only).
+    pub fn inflight_count(&self) -> usize {
+        self.inflight.load(Ordering::SeqCst)
+    }
+
+    /// The claim words' page ranges currently held (diagnostic only:
+    /// which pages the leaked ticket claimed identifies the STORE that
+    /// never completed).
+    pub fn claim_words(&self) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let mut run_start: Option<usize> = None;
+        for page in 0..self.pages {
+            let claimed = self.claims.overlaps(page, 1);
+            match (claimed, run_start) {
+                (true, None) => run_start = Some(page),
+                (false, Some(s)) => {
+                    out.push((s, page));
+                    run_start = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(s) = run_start {
+            out.push((s, self.pages));
+        }
+        out
+    }
+
     /// Law 9 as a pure transition: the destination may leave through
     /// its mint rollback owner only when the record is TERMINAL and no
     /// `WRITE_FIXED` naming it can still land. The per-terminal-state

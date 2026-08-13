@@ -2696,14 +2696,20 @@ pub const WP_UNIT: u32 = u32::MAX;
 
 /// RAII entry for one write unit's live phase word.
 pub struct WritePhaseGuard {
-    key: (u64, u64, u32),
+    /// `None` = the insert lost (key already owned by a live unit) —
+    /// this guard neither stamps nor removes (the 2026-08-13 collision
+    /// lesson: an unconditional remove let a continuation's guard erase
+    /// a live write unit's entry, and vice versa, hiding the holder).
+    key: Option<(u64, u64, u32)>,
 }
 
 pub fn write_phase_begin(ino: u64, offset: u64) -> WritePhaseGuard {
     let now = COARSE_NOW_NS.load(Ordering::Relaxed);
-    let _ = WRITE_PHASE_MAP.insert_sync((ino, offset, WP_UNIT), (WP_ENTRY, now));
+    let won = WRITE_PHASE_MAP
+        .insert_sync((ino, offset, WP_UNIT), (WP_ENTRY, now))
+        .is_ok();
     WritePhaseGuard {
-        key: (ino, offset, WP_UNIT),
+        key: won.then_some((ino, offset, WP_UNIT)),
     }
 }
 
@@ -2713,9 +2719,11 @@ pub fn write_phase_begin(ino: u64, offset: u64) -> WritePhaseGuard {
 /// whole life). RAII like the unit guard.
 pub fn write_phase_block_begin(ino: u64, offset: u64, b: u32) -> WritePhaseGuard {
     let now = COARSE_NOW_NS.load(Ordering::Relaxed);
-    let _ = WRITE_PHASE_MAP.insert_sync((ino, offset, b), (WP_CHECKOUT, now));
+    let won = WRITE_PHASE_MAP
+        .insert_sync((ino, offset, b), (WP_CHECKOUT, now))
+        .is_ok();
     WritePhaseGuard {
-        key: (ino, offset, b),
+        key: won.then_some((ino, offset, b)),
     }
 }
 
@@ -2731,7 +2739,9 @@ pub fn write_phase(ino: u64, offset: u64, b: u32, phase: u32) {
 
 impl Drop for WritePhaseGuard {
     fn drop(&mut self) {
-        let _ = WRITE_PHASE_MAP.remove_sync(&self.key);
+        if let Some(key) = self.key {
+            let _ = WRITE_PHASE_MAP.remove_sync(&key);
+        }
     }
 }
 
@@ -2759,6 +2769,53 @@ pub fn log_write_phase_census(threshold: Duration) {
         }
         printed < 64
     });
+}
+
+/// The settle's in-flight event wait over `(core, change)` — see
+/// `SqueezefsFilesystem::await_overlay_inflight`'s doc for the wedge
+/// record. Extracted to module scope so the event-park contract is
+/// pinnable without a full overlay record.
+pub async fn await_overlay_inflight_on(
+    core: &crate::overlay_core::OverlayRecordCore,
+    change: &tokio::sync::Notify,
+) {
+    let t0 = std::time::Instant::now();
+    let mut next_bark = std::time::Duration::from_secs(30);
+    let mut waited = false;
+    loop {
+        if core.inflight_empty() {
+            return;
+        }
+        if !waited {
+            waited = true;
+            METRICS
+                .overlay_teardown_waits
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if t0.elapsed() >= next_bark {
+            next_bark += std::time::Duration::from_secs(30);
+            error!(
+                "overlay settle STUCK {}s: inflight={} state={:?} claims={:?} \
+                 covered={} gaps={:?} (leaked store ticket — the ACK-early \
+                 continuation or an inline store never reached complete_store)",
+                t0.elapsed().as_secs(),
+                core.inflight_count(),
+                core.state(),
+                core.claim_words(),
+                core.coverage_complete(),
+                core.gaps(),
+            );
+        }
+        let notified = change.notified();
+        tokio::pin!(notified);
+        // Re-check AFTER registering: notify_waiters stores no permit,
+        // so the register→re-check order is what makes the wake
+        // un-losable.
+        if core.inflight_empty() {
+            return;
+        }
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), notified).await;
+    }
 }
 
 /// Log the named-holder census (the watchdog's cycle-drawing companion to
@@ -12716,7 +12773,7 @@ impl SqueezefsFilesystem {
                 // Fence/custody refusal: fail THIS write loud through
                 // the common exit (never a second submission path — the
                 // W1 leg's rule).
-                let _ = rec.core.complete_store(ticket, false);
+                let _ = rec.complete_store_and_wake(ticket, false);
                 crate::gauge_core::sub_saturating(&METRICS.overlay_inflight_bytes, len as u64);
                 return Err(e);
             }
@@ -12774,7 +12831,7 @@ impl SqueezefsFilesystem {
                                 "device-overlay O_DIRECT snapshot declined for ino {ino} \
                                  block {b} (dest {dest}, len {len}): {other:?}"
                             );
-                            let _ = rec.core.complete_store(ticket, false);
+                            let _ = rec.complete_store_and_wake(ticket, false);
                             crate::gauge_core::sub_saturating(
                                 &METRICS.overlay_inflight_bytes,
                                 len as u64,
@@ -12827,7 +12884,7 @@ impl SqueezefsFilesystem {
             let bytes = match payload.materialize().await {
                 Ok(b) => b,
                 Err(e) => {
-                    let _ = rec.core.complete_store(ticket, false);
+                    let _ = rec.complete_store_and_wake(ticket, false);
                     crate::gauge_core::sub_saturating(&METRICS.overlay_inflight_bytes, len as u64);
                     return Err(SqueezefsError::Io(e));
                 }
@@ -12860,7 +12917,7 @@ impl SqueezefsFilesystem {
             if let Err(e) = rec.device.write_block(dest, owned).await {
                 // Law 3: the range never joins `completed`; the claim
                 // releases; nothing is acked for this write.
-                let _ = rec.core.complete_store(ticket, false);
+                let _ = rec.complete_store_and_wake(ticket, false);
                 crate::gauge_core::sub_saturating(&METRICS.overlay_inflight_bytes, len as u64);
                 return Err(e);
             }
@@ -12873,7 +12930,7 @@ impl SqueezefsFilesystem {
 
         // ---- CQE: coverage publication (law 3) + the completion
         // transition → freeze + detached publication.
-        let verdict = rec.core.complete_store(ticket, true);
+        let verdict = rec.complete_store_and_wake(ticket, true);
         crate::gauge_core::sub_saturating(&METRICS.overlay_inflight_bytes, len as u64);
         METRICS.overlay_stores.fetch_add(1, Ordering::Relaxed);
         METRICS
@@ -13031,7 +13088,7 @@ impl SqueezefsFilesystem {
         };
 
         // CQE-anchored coverage (law 3): identical to the inline path.
-        let verdict = rec.core.complete_store(ticket, stored);
+        let verdict = rec.complete_store_and_wake(ticket, stored);
         crate::gauge_core::sub_saturating(&METRICS.overlay_inflight_bytes, len as u64);
         if stored {
             fuse3::note_zc_write_direct(len as u64);
@@ -13117,7 +13174,7 @@ impl SqueezefsFilesystem {
             }
         };
 
-        let verdict = rec.core.complete_store(ticket, stored);
+        let verdict = rec.complete_store_and_wake(ticket, stored);
         crate::gauge_core::sub_saturating(&METRICS.overlay_inflight_bytes, len as u64);
         if stored {
             METRICS.overlay_stores.fetch_add(1, Ordering::Relaxed);
@@ -13282,16 +13339,7 @@ impl SqueezefsFilesystem {
     /// structurally instant in B2 — the block guard serializes stores —
     /// so a long wait is the tripwire, never a hang.
     async fn await_overlay_inflight(&self, rec: &crate::device_overlay::DeviceOverlayRecord) {
-        let mut spins = 0u32;
-        while !rec.core.inflight_empty() {
-            spins += 1;
-            if spins == 1_000 {
-                METRICS
-                    .overlay_teardown_waits
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            tokio::task::yield_now().await;
-        }
+        await_overlay_inflight_on(&rec.core, &rec.inflight_change).await;
     }
 
     /// Take the block guard and settle one overlay (the detached

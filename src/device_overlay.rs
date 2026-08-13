@@ -192,9 +192,30 @@ pub struct DeviceOverlayRecord {
     /// Waiters on the record leaving the registry (frozen-record
     /// writers, drain rendezvous).
     pub retired: tokio::sync::Notify,
+    /// Waiters on the in-flight store set changing (the settle's
+    /// event wait — ACK-early wedge fix 2026-08-13: the retired
+    /// `yield_now` spin, polled as a FUSED task on the queue worker's
+    /// own lane, self-woke forever and starved the pass that pumps and
+    /// reaps the very store whose ticket it waited on).
+    pub inflight_change: tokio::sync::Notify,
 }
 
 impl DeviceOverlayRecord {
+    /// [`crate::overlay_core::OverlayRecordCore::complete_store`] + the
+    /// settle wake (ACK-early wedge fix 2026-08-13): EVERY store CQE —
+    /// success, failure, supersession — wakes `inflight_change` so a
+    /// parked settle re-checks. Call THIS, never `core.complete_store`
+    /// directly (the convention test greps for violations).
+    pub fn complete_store_and_wake(
+        &self,
+        ticket: crate::overlay_core::StoreTicket,
+        success: bool,
+    ) -> crate::overlay_core::CompleteVerdict {
+        let verdict = self.core.complete_store(ticket, success);
+        self.inflight_change.notify_waiters();
+        verdict
+    }
+
     /// Terminal teardown disposition (law 9 / KD-OV-11 — see module
     /// docs). Callers prove `core.rollback_admissible()` first.
     pub(crate) fn run_teardown_disposition(&self) {
@@ -310,6 +331,7 @@ impl DeviceOverlayRegistry {
             fsck_guard: std::sync::Mutex::new(Some(fsck_guard)),
             mint_owner: std::sync::Mutex::new(Some(mint_owner)),
             retired: tokio::sync::Notify::new(),
+            inflight_change: tokio::sync::Notify::new(),
         });
         match self.records.entry_sync((ino, block)) {
             scc::hash_map::Entry::Occupied(_) => None,

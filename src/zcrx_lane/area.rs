@@ -172,8 +172,19 @@ pub struct ZcrxArea {
     chunk: usize,
     ledger: SpanLedger,
     /// Wakes grant waiters when a chunk recycles (sim backpressure edge;
-    /// the real backend's kernel rq ring needs no waiter).
-    freed: tokio::sync::Notify,
+    /// the real backend's kernel rq ring needs no waiter). A std
+    /// mutex+condvar gate (rip-tokio-total): the sole grant waiter is
+    /// the sim reader OS thread, and the recycle bump rides the same
+    /// lock the wait parks on, so a release racing the pre-wait probe
+    /// can never strand the waiter (the bounded wait is pure backstop).
+    freed: FreedGate,
+}
+
+/// The grant-recycle wake gate (see [`ZcrxArea::freed`]).
+#[derive(Default)]
+struct FreedGate {
+    lock: std::sync::Mutex<()>,
+    cv: std::sync::Condvar,
 }
 
 // SAFETY: the area is a process-private anonymous mapping; `base` is
@@ -218,7 +229,7 @@ impl ZcrxArea {
             len,
             chunk: chunk_bytes,
             ledger: SpanLedger::new(len / chunk_bytes),
-            freed: tokio::sync::Notify::new(),
+            freed: FreedGate::default(),
         }))
     }
 
@@ -242,23 +253,37 @@ impl ZcrxArea {
         self.ledger.free_count()
     }
 
-    /// Grant a chunk for the next receive (single consumer — the queue
-    /// driver), awaiting a recycle when exhausted. The await is the
-    /// GRANT edge only; command admission is bounded by the queue's
-    /// admission semaphore so this can only starve transiently.
-    pub async fn grant_chunk(self: &Arc<Self>) -> GrantRef {
+    /// Grant a chunk for the next receive (single consumer — the sim
+    /// reader OS thread), blocking for a recycle when exhausted. The
+    /// wait is the GRANT edge only; command admission is bounded by the
+    /// queue's admission semaphore so this can only starve transiently.
+    ///
+    /// Race law (the notify-then-check shape, condvar form): the probe
+    /// re-runs UNDER the gate lock before parking — a release bumps the
+    /// gate under that same lock ([`Self::release_slot`]), so a recycle
+    /// racing the unlocked fast probe is visible either to the locked
+    /// re-probe or as a wakeup; the bounded wait is pure backstop
+    /// (a lost wake costs one tick, never a wedge — the sqz-sync law).
+    pub fn grant_chunk_blocking(self: &Arc<Self>) -> GrantRef {
         loop {
-            // Register interest BEFORE the probe (the notify-then-check
-            // race: a release between try_grant and notified() must not
-            // strand this waiter).
-            let notified = self.freed.notified();
             if let Some(slot) = self.ledger.try_grant() {
                 return GrantRef {
                     area: Arc::clone(self),
                     slot,
                 };
             }
-            notified.await;
+            let guard = self.freed.lock.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(slot) = self.ledger.try_grant() {
+                return GrantRef {
+                    area: Arc::clone(self),
+                    slot,
+                };
+            }
+            let _unused = self
+                .freed
+                .cv
+                .wait_timeout(guard, std::time::Duration::from_millis(50))
+                .unwrap_or_else(|e| e.into_inner());
         }
     }
 
@@ -295,7 +320,11 @@ impl ZcrxArea {
 
     fn release_slot(&self, slot: u32) {
         if self.ledger.release(slot) {
-            self.freed.notify_waiters();
+            // Bump-under-the-gate-lock (see [`Self::grant_chunk_blocking`]):
+            // acquiring the lock orders this recycle before any parked
+            // waiter's next probe; the notify wakes it.
+            drop(self.freed.lock.lock().unwrap_or_else(|e| e.into_inner()));
+            self.freed.cv.notify_all();
         }
     }
 }

@@ -12,13 +12,11 @@
 
 use super::area::{AreaSlice, ZcrxArea};
 use super::fill_table::FillTable;
-use super::initiator::mark_session_poisoned;
+use super::initiator::{mark_session_poisoned, WriterMsg};
 use super::pdu_stream::{ParseEvent, StreamParser};
+use crate::error::{Result, SqueezefsError};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::net::tcp::OwnedReadHalf;
-use tokio::net::TcpStream;
-use tokio::sync::mpsc;
 
 /// Admission accounting grain — ONE definition ([`super::area`]).
 pub(crate) use super::area::ADMISSION_UNIT;
@@ -47,6 +45,57 @@ pub(crate) fn admission_units(len: usize) -> u32 {
     len.div_ceil(ADMISSION_UNIT) as u32
 }
 
+/// Owned, splittable admission-unit custody over a queue's admission
+/// semaphore — the tokio `OwnedSemaphorePermit` shape the MEM-3
+/// admission face rides (rip-tokio-total: `sqz_semaphore` has no
+/// many-owned try-acquire or `split`, so custody is carried here —
+/// the units return via `add_permits` exactly when the holder drops,
+/// never early). The admission semaphore is TRY-only by design (round
+/// 8: over-demand declines, never parks), so no waiter fairness is in
+/// play.
+pub(crate) struct AdmissionUnits {
+    sem: Arc<squeezefs_ipc::sqz_semaphore::Semaphore>,
+    units: usize,
+}
+
+impl AdmissionUnits {
+    /// All-or-nothing take of `units` (never waits — the round-8
+    /// decline law's primitive).
+    pub(crate) fn try_take(
+        sem: &Arc<squeezefs_ipc::sqz_semaphore::Semaphore>,
+        units: u32,
+    ) -> std::result::Result<AdmissionUnits, squeezefs_ipc::sqz_semaphore::TryAcquireError> {
+        // `forget` transfers the borrowed permit's units into this
+        // owned holder; Drop below is the one return path.
+        sem.try_acquire_many(units)?.forget();
+        Ok(AdmissionUnits {
+            sem: Arc::clone(sem),
+            units: units as usize,
+        })
+    }
+
+    /// Carve `n` units off into a new holder (the per-segment split of
+    /// a whole-read admission); `None` if fewer than `n` remain.
+    pub(crate) fn split(&mut self, n: usize) -> Option<AdmissionUnits> {
+        if n > self.units {
+            return None;
+        }
+        self.units -= n;
+        Some(AdmissionUnits {
+            sem: Arc::clone(&self.sem),
+            units: n,
+        })
+    }
+}
+
+impl Drop for AdmissionUnits {
+    fn drop(&mut self) {
+        if self.units > 0 {
+            self.sem.add_permits(self.units);
+        }
+    }
+}
+
 /// Shared state of one area queue.
 pub(crate) struct AreaShared {
     pub table: FillTable,
@@ -54,15 +103,15 @@ pub(crate) struct AreaShared {
     /// with [`super::initiator::CidSlot`] custody. Lock order where both
     /// are held: fill-table `pending` → `free_cids`).
     pub free_cids: Arc<std::sync::Mutex<Vec<u16>>>,
-    pub cid_gate: Arc<tokio::sync::Semaphore>,
+    pub cid_gate: Arc<squeezefs_ipc::sqz_semaphore::Semaphore>,
     /// CID namespace size (== queue depth) — the `cid_slots` diagnostic's
     /// denominator (the MEM-3 no-leak instrument).
     pub cid_capacity: usize,
     /// In-flight payload admission (see [`admission_permits`]); Arc'd so
-    /// OWNED permits can ride the pending fill → the completed
-    /// [`super::fill_table::ZcrxFill`] (exact accounting under
+    /// OWNED units ([`AdmissionUnits`]) can ride the pending fill → the
+    /// completed [`super::fill_table::ZcrxFill`] (exact accounting under
     /// cancellation — the MEM-3 custody law's admission face).
-    pub admission: Arc<tokio::sync::Semaphore>,
+    pub admission: Arc<squeezefs_ipc::sqz_semaphore::Semaphore>,
     pub poisoned: AtomicBool,
     /// Round-5 blast-radius latch: a refill-starvation failover fired
     /// and the queue is recovering — NEW reads bypass the lane (kernel
@@ -84,12 +133,11 @@ impl AreaShared {
         Arc::new(AreaShared {
             table: FillTable::new(),
             free_cids: Arc::new(std::sync::Mutex::new((0..depth).collect())),
-            cid_gate: Arc::new(tokio::sync::Semaphore::new(depth as usize)),
+            cid_gate: Arc::new(squeezefs_ipc::sqz_semaphore::Semaphore::new(depth as usize)),
             cid_capacity: depth as usize,
-            admission: Arc::new(tokio::sync::Semaphore::new(super::area::admission_permits(
-                admit_window_len,
-                area.chunk_bytes(),
-            ))),
+            admission: Arc::new(squeezefs_ipc::sqz_semaphore::Semaphore::new(
+                super::area::admission_permits(admit_window_len, area.chunk_bytes()),
+            )),
             poisoned: AtomicBool::new(false),
             starved: AtomicBool::new(false),
             starved_structural: AtomicBool::new(false),
@@ -113,17 +161,17 @@ impl AreaShared {
     }
 }
 
-/// How a queue's capsules reach its wire: the sim's tokio writer task or
+/// How a queue's capsules reach its wire: the sim's writer OS thread or
 /// the real ring driver's doorbell lane.
 pub(crate) enum CommandSink {
-    Chan(mpsc::UnboundedSender<Vec<u8>>),
+    Chan(std::sync::mpsc::Sender<WriterMsg>),
     Ring(Arc<super::uring_zcrx::RingCmd>),
 }
 
 impl CommandSink {
-    pub(crate) fn send(&self, capsule: Vec<u8>) -> Result<(), ()> {
+    pub(crate) fn send(&self, capsule: Vec<u8>) -> std::result::Result<(), ()> {
         match self {
-            CommandSink::Chan(tx) => tx.send(capsule).map_err(|_| ()),
+            CommandSink::Chan(tx) => tx.send(WriterMsg::Capsule(capsule)).map_err(|_| ()),
             CommandSink::Ring(cmds) => cmds.send(capsule),
         }
     }
@@ -132,79 +180,127 @@ impl CommandSink {
 pub(crate) struct AreaQueue {
     pub shared: Arc<AreaShared>,
     pub sink: CommandSink,
-    /// Sim reader + writer tasks — abort-and-join is the quiescence law
-    /// (poison drain; timeout path). Empty on the ring backend.
-    pub tasks: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Sim reader + writer OS threads — shutdown-and-join is the
+    /// quiescence law (poison drain; timeout path): shutting `socket`
+    /// down makes both blocking loops return, and the JOIN proves no
+    /// lane context survives holding chunk refs. Empty on the ring
+    /// backend.
+    pub threads: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// The sim backend's kept socket handle — the shutdown half of
+    /// shutdown-and-join (None on the ring backend: its wire is owned
+    /// by the driver thread and stopped via the doorbell close).
+    pub socket: Option<std::net::TcpStream>,
     /// The real backend's driver thread (None on the sim backend).
     pub driver: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     pub area: Arc<ZcrxArea>,
 }
 
 impl AreaQueue {
+    /// The signal half of the quiescence law: close the ring doorbell /
+    /// send the writer Stop AND shut the socket down (belt and braces —
+    /// a blocking read/write on a shutdown socket returns an error, so
+    /// both sim loops exit). Never blocks.
+    pub(crate) fn signal_stop(&self) {
+        match &self.sink {
+            CommandSink::Ring(cmds) => cmds.close(),
+            CommandSink::Chan(tx) => {
+                let _ = tx.send(WriterMsg::Stop);
+            }
+        }
+        if let Some(s) = &self.socket {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    /// Take every joinable handle (sim threads + ring driver) — the
+    /// join half of shutdown-and-join. Idempotent (second call yields
+    /// nothing).
+    pub(crate) fn take_handles(&self) -> Vec<std::thread::JoinHandle<()>> {
+        let mut hs: Vec<std::thread::JoinHandle<()>> = self
+            .threads
+            .lock()
+            .expect("queue threads lock")
+            .drain(..)
+            .collect();
+        if let Some(h) = self.driver.lock().expect("driver handle lock").take() {
+            hs.push(h);
+        }
+        hs
+    }
+
     /// The drain half of the quiescence law: stop the wire (close the
-    /// ring doorbell / abort the sim tasks), then JOIN every driver so
-    /// no lane context survives holding chunk refs.
+    /// ring doorbell / Stop + socket shutdown for the sim threads), then
+    /// JOIN every driver so no lane context survives holding chunk refs
+    /// — the join is the PROOF of quiescence (stronger than the retired
+    /// abort+join: the loops ran to completion on a dead socket).
     pub(crate) async fn drain(&self) {
-        if let CommandSink::Ring(cmds) = &self.sink {
-            cmds.close();
-        }
-        let mut ts = self.tasks.lock().await;
-        for t in ts.iter() {
-            t.abort();
-        }
-        for t in ts.drain(..) {
-            let _ = t.await;
-        }
-        drop(ts);
-        let handle = self.driver.lock().expect("driver handle lock").take();
-        if let Some(h) = handle {
-            let _ = tokio::task::spawn_blocking(move || h.join()).await;
+        self.signal_stop();
+        let handles = self.take_handles();
+        if !handles.is_empty() {
+            squeezefs_ipc::sqz_blocking::run_blocking(move || {
+                for h in handles {
+                    let _ = h.join();
+                }
+            })
+            .await;
         }
     }
 }
 
 /// Spawn the SIM area queue over an established (post-Connect) stream.
 pub(crate) fn spawn_area_queue(
-    stream: TcpStream,
+    stream: std::net::TcpStream,
+    qid: u16,
     depth: u16,
     area: Arc<ZcrxArea>,
     session_poison: Arc<AtomicBool>,
-) -> AreaQueue {
+) -> Result<AreaQueue> {
     // Sim: no NIC ring exists and the delivery grain is the loopback
-    // try_read (unprobed — no MTU to derive from), so HALF the area is
-    // the admitted window and the other half stays the slack budget:
+    // recv extent (unprobed — no MTU to derive from), so HALF the area
+    // is the admitted window and the other half stays the slack budget:
     // byte-identical to every Z2 contract's arithmetic (the real
     // backend's slack is derived into the AREA size instead —
     // `super::area::delivery_slack_bytes`).
     let shared = AreaShared::new(depth, &area, area.len() / 2);
-    let (read_half, write_half) = stream.into_split();
-    let (tx, rx) = mpsc::unbounded_channel();
+    let sock_err = |what: &str, e: std::io::Error| {
+        SqueezefsError::Io(std::io::Error::other(format!("lane sim queue {what}: {e}")))
+    };
+    let writer_sock = stream.try_clone().map_err(|e| sock_err("clone", e))?;
+    let mut reader_sock = stream.try_clone().map_err(|e| sock_err("clone", e))?;
+    let (tx, rx) = std::sync::mpsc::channel();
 
     let s2 = Arc::clone(&shared);
     let p2 = Arc::clone(&session_poison);
-    let writer = tokio::spawn(async move {
-        if let Err(why) = super::initiator::writer_loop(write_half, rx).await {
-            // drain=false: the reader/driver may still be applying events
-            // — its own exit performs the drain (MEM-3 drain discipline).
-            s2.poison(&why, &p2, false);
-        }
-    });
+    let writer = std::thread::Builder::new()
+        .name(format!("sqz-zcrx-wr{qid}"))
+        .spawn(move || {
+            if let Err(why) = super::initiator::writer_loop(writer_sock, rx) {
+                // drain=false: the reader/driver may still be applying events
+                // — its own exit performs the drain (MEM-3 drain discipline).
+                s2.poison(&why, &p2, false);
+            }
+        })
+        .map_err(|e| sock_err("writer thread spawn", e))?;
     let s3 = Arc::clone(&shared);
     let a3 = Arc::clone(&area);
-    let reader = tokio::spawn(async move {
-        if let Err(why) = sim_reader_loop(read_half, &a3, &s3).await {
-            // drain=true: the driver is exiting — no further events.
-            s3.poison(&why, &session_poison, true);
-        }
-    });
+    let reader = std::thread::Builder::new()
+        .name(format!("sqz-zcrx-rd{qid}"))
+        .spawn(move || {
+            if let Err(why) = sim_reader_loop(&mut reader_sock, &a3, &s3) {
+                // drain=true: the driver is exiting — no further events.
+                s3.poison(&why, &session_poison, true);
+            }
+        })
+        .map_err(|e| sock_err("reader thread spawn", e))?;
 
-    AreaQueue {
+    Ok(AreaQueue {
         shared,
         sink: CommandSink::Chan(tx),
-        tasks: tokio::sync::Mutex::new(vec![reader, writer]),
+        threads: std::sync::Mutex::new(vec![reader, writer]),
+        socket: Some(stream),
         driver: std::sync::Mutex::new(None),
         area,
-    }
+    })
 }
 
 /// The SIM receive-extent cap (test lever `SQUEEZEFS_ZCRX_LANE_SIM_CHUNK`
@@ -214,29 +310,53 @@ fn recv_cap(area: &ZcrxArea) -> usize {
     area.chunk_bytes()
 }
 
-/// The SIM driver: recv into freshly-granted chunks (standing in for NIC
-/// DMA), push extents through the parser, apply events to the fill
-/// table. Grants are taken only once the socket is readable so an idle
-/// queue holds ZERO chunks (the recycle-law diagnostics stay exact).
-async fn sim_reader_loop(
-    read_half: OwnedReadHalf,
+/// Park until `sock` is readable (POLLIN — an EOF/HUP also reads as
+/// readable, so a socket shutdown always releases the parked reader).
+/// The grant-after-readable ordering below depends on this: the sim
+/// thread must never hold a granted chunk while parked on the wire.
+fn wait_readable(sock: &std::net::TcpStream) -> std::result::Result<(), String> {
+    use std::os::fd::AsRawFd;
+    let mut pfd = libc::pollfd {
+        fd: sock.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: one valid pollfd, infinite timeout; EINTR retried.
+        let rc = unsafe { libc::poll(&mut pfd, 1, -1) };
+        if rc > 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if rc < 0 && err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(format!("socket readiness: {err}"));
+        }
+    }
+}
+
+/// The SIM driver (a dedicated OS thread — `sqz-zcrx-rd{N}`): recv into
+/// freshly-granted chunks (standing in for NIC DMA), push extents
+/// through the parser, apply events to the fill table. Grants are taken
+/// only once the socket is readable so an idle queue holds ZERO chunks
+/// (the recycle-law diagnostics stay exact); a socket shutdown makes
+/// both the poll and the read return, so the quiescence join is prompt.
+fn sim_reader_loop(
+    sock: &mut std::net::TcpStream,
     area: &Arc<ZcrxArea>,
     shared: &AreaShared,
-) -> Result<(), String> {
+) -> std::result::Result<(), String> {
+    use std::io::Read;
     let metrics = &crate::fuse_client::METRICS;
     let mut parser = StreamParser::new();
     let mut events: Vec<ParseEvent> = Vec::new();
     loop {
-        read_half
-            .readable()
-            .await
-            .map_err(|e| format!("socket readiness: {e}"))?;
-        let grant = area.grant_chunk().await;
+        wait_readable(sock)?;
+        let grant = area.grant_chunk_blocking();
         let ptr = grant.chunk_ptr();
         // SAFETY: a fresh grant is exclusively this driver's until a
         // slice of it is published; the extent stays within the chunk.
         let buf = unsafe { std::slice::from_raw_parts_mut(ptr, recv_cap(area)) };
-        match read_half.try_read(buf) {
+        match sock.read(buf) {
             Ok(0) => {
                 // EOF with nothing pending = orderly teardown.
                 if shared.table.is_empty() {
@@ -266,11 +386,6 @@ async fn sim_reader_loop(
                         return Err(why);
                     }
                 }
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // Spurious readiness: return the untouched chunk.
-                drop(grant);
-                continue;
             }
             Err(e) => return Err(format!("socket read: {e}")),
         }

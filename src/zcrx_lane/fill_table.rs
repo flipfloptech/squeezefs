@@ -17,13 +17,14 @@
 //! driver is a plain thread. Requesters await their oneshot outside it.
 
 use super::area::AreaSlice;
+use super::area_queue::AdmissionUnits;
 use super::pdu;
 use super::pdu_stream::ParseEvent;
 use crate::error::{Result, SqueezefsError};
+use squeezefs_ipc::sqz_channel::oneshot;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
-use tokio::sync::oneshot;
 
 fn io_err(msg: String) -> SqueezefsError {
     SqueezefsError::Io(std::io::Error::other(msg))
@@ -39,7 +40,7 @@ fn io_err(msg: String) -> SqueezefsError {
 pub struct ZcrxFill {
     segs: Vec<(u32, AreaSlice)>,
     len: usize,
-    _admission: Option<tokio::sync::OwnedSemaphorePermit>,
+    _admission: Option<AdmissionUnits>,
 }
 
 impl ZcrxFill {
@@ -88,7 +89,7 @@ struct PendingFill {
     tx: Option<oneshot::Sender<Result<ZcrxFill>>>,
     /// Admission custody: moves into the completed [`ZcrxFill`]; released
     /// with the entry on error/poison paths (MEM-3 exact accounting).
-    admission: Option<tokio::sync::OwnedSemaphorePermit>,
+    admission: Option<AdmissionUnits>,
     /// CID + depth-permit custody — returns when the entry is destroyed
     /// (completion, send-failure cancel, or poison drain), never on the
     /// requester's exits (the MEM-3 no-leak law; lock order: this table's
@@ -119,7 +120,7 @@ impl FillTable {
         cid: u16,
         len: usize,
         slot: super::initiator::CidSlot,
-        admission: Option<tokio::sync::OwnedSemaphorePermit>,
+        admission: Option<AdmissionUnits>,
     ) -> oneshot::Receiver<Result<ZcrxFill>> {
         debug_assert_eq!(slot.cid(), cid, "slot/cid custody mismatch");
         let (tx, rx) = oneshot::channel();

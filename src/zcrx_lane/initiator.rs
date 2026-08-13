@@ -10,14 +10,15 @@
 //! Read-only by construction: see `pdu` — no write/reservation encoder
 //! exists, so the D0/fencing surface is unreachable from this module.
 
+use super::area_queue::AdmissionUnits;
 use super::pdu;
 use crate::error::{Result, SqueezefsError};
+use squeezefs_ipc::sqz_blocking::run_blocking;
+use squeezefs_ipc::sqz_channel::oneshot;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot, Mutex};
 
 /// Resolved lane target: identity + geometry, derived at discovery
 /// (`probe::nvme_tcp_target_for`) — tests construct it directly.
@@ -64,14 +65,15 @@ pub(crate) fn mark_session_poisoned(flag: &AtomicBool, why: &str) {
     }
 }
 
-/// Raw destination pointer crossing into the reader task. SAFETY contract
-/// (MEM-3 custody law): the pointee outlives every lane write because
-/// EITHER the caller awaits the op's oneshot before releasing the buffer
-/// (the timeout arm aborts AND joins the queue tasks first), OR the
-/// pending entry owns a keep-alive on the destination allocation
+/// Raw destination pointer crossing into the reader thread. SAFETY
+/// contract (MEM-3 custody law): the pointee outlives every lane write
+/// because EITHER the caller awaits the op's oneshot before releasing
+/// the buffer (the timeout arm shuts the queue socket down AND joins
+/// both queue threads first — the joins PROVE the reader exited), OR
+/// the pending entry owns a keep-alive on the destination allocation
 /// ([`Pending::_keepalive`] — the [`LaneSession::read_into_pooled`] arm),
 /// so a cancelled requester future can never let the allocation recycle
-/// while the reader can still write it. Exactly one reader task writes
+/// while the reader can still write it. Exactly one reader thread writes
 /// any given destination span (per-CID ownership).
 struct SendMutPtr(*mut u8);
 unsafe impl Send for SendMutPtr {}
@@ -87,7 +89,7 @@ unsafe impl Sync for SendMutPtr {}
 pub(crate) struct CidSlot {
     cid: u16,
     pool: Arc<std::sync::Mutex<Vec<u16>>>,
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    _permit: squeezefs_ipc::sqz_semaphore::OwnedSemaphorePermit,
 }
 
 impl CidSlot {
@@ -103,14 +105,28 @@ impl Drop for CidSlot {
 }
 
 /// Acquire a depth permit + pop a CID as one RAII unit (see [`CidSlot`]).
+///
+/// Closed semantics (rip-tokio-total): the sqz semaphore has no
+/// `close()` and its acquire never errors, so the queue's `poisoned`
+/// latch carries the "lane queue closed" meaning — checked BEFORE the
+/// acquire (fast refusal) and AFTER it (a poison that landed while we
+/// waited must not hand out custody on a dead queue; the fresh permit
+/// drops right here, returning it to the gate).
 pub(crate) async fn take_cid(
-    gate: &Arc<tokio::sync::Semaphore>,
+    gate: &Arc<squeezefs_ipc::sqz_semaphore::Semaphore>,
     pool: &Arc<std::sync::Mutex<Vec<u16>>>,
+    poisoned: &AtomicBool,
 ) -> Result<CidSlot> {
+    if poisoned.load(Ordering::SeqCst) {
+        return Err(io_err("lane queue closed".into()));
+    }
     let permit = Arc::clone(gate)
         .acquire_owned()
         .await
         .map_err(|_| io_err("lane queue closed".into()))?;
+    if poisoned.load(Ordering::SeqCst) {
+        return Err(io_err("lane queue closed".into()));
+    }
     let cid = pool
         .lock()
         .expect("cid pool lock")
@@ -148,7 +164,7 @@ struct QueueShared {
     pending: std::sync::Mutex<std::collections::HashMap<u16, Pending>>,
     /// Free CID pool (push/pop only; shared with [`CidSlot`] custody).
     free_cids: Arc<std::sync::Mutex<Vec<u16>>>,
-    cid_gate: Arc<tokio::sync::Semaphore>,
+    cid_gate: Arc<squeezefs_ipc::sqz_semaphore::Semaphore>,
     /// CID namespace size (== queue depth) — the `cid_slots` diagnostic's
     /// denominator (the MEM-3 no-leak instrument).
     cid_capacity: usize,
@@ -157,13 +173,14 @@ struct QueueShared {
 
 impl QueueShared {
     /// Queue poison. `drain_pending` MUST be true only when the reader
-    /// task provably writes no destination afterwards (it is exiting, it
-    /// was abort+JOINED, or it never started): draining drops the
-    /// entries' keep-alives, which is what lets destination buffers
-    /// recycle. A writer-side failure passes `false` — the reader is
-    /// still live on the (soon-dead) socket and its own exit performs
-    /// the drain; waiters it would have failed fall back via their own
-    /// 30 s timeouts instead (bounded, loud, never a recycled write).
+    /// thread provably writes no destination afterwards (it is exiting,
+    /// it was shutdown+JOINED — the join is the proof — or it never
+    /// started): draining drops the entries' keep-alives, which is what
+    /// lets destination buffers recycle. A writer-side failure passes
+    /// `false` — the reader is still live on the (soon-dead) socket and
+    /// its own exit performs the drain; waiters it would have failed
+    /// fall back via their own 30 s timeouts instead (bounded, loud,
+    /// never a recycled write).
     fn poison(&self, why: &str, session_poison: &AtomicBool, drain_pending: bool) {
         if !self.poisoned.swap(true, Ordering::SeqCst) {
             log::error!("zcrx-lane: IO queue poisoned: {why}");
@@ -184,14 +201,64 @@ impl QueueShared {
     }
 }
 
+/// A message to a queue's writer OS thread: a capsule for the wire, or
+/// the orderly Stop (teardown belt — the socket shutdown is the braces).
+pub(crate) enum WriterMsg {
+    Capsule(Vec<u8>),
+    Stop,
+}
+
 struct IoQueue {
     shared: Arc<QueueShared>,
-    to_writer: mpsc::UnboundedSender<Vec<u8>>,
-    /// Reader + writer task handles — the timeout quiescence law
-    /// ([`LaneSession::read_segment`]) aborts AND joins them before any
-    /// timed-out destination buffer is released, so a zombie reader can
-    /// never write into recycled pool memory.
-    tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    to_writer: std::sync::mpsc::Sender<WriterMsg>,
+    /// The kept socket handle — the shutdown half of the quiescence law:
+    /// shutting it down makes the blocking reader/writer loops return.
+    socket: TcpStream,
+    /// Reader + writer OS-thread handles — the timeout quiescence law
+    /// ([`LaneSession::read_segment`]) shuts the socket down AND joins
+    /// them before any timed-out destination buffer is released: the
+    /// join PROVES the reader exited (stronger than the retired tokio
+    /// abort+join, which only proved the task future was dropped), so a
+    /// zombie reader can never write into recycled pool memory.
+    threads: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>,
+}
+
+impl IoQueue {
+    /// The signal half of shutdown-and-join: send the writer Stop AND
+    /// shut the socket down (belt and braces — a blocking read/write on
+    /// a shutdown socket returns an error, so both loops exit). Never
+    /// blocks.
+    fn signal_stop(&self) {
+        let _ = self.to_writer.send(WriterMsg::Stop);
+        let _ = self.socket.shutdown(std::net::Shutdown::Both);
+    }
+
+    /// Take both thread handles (idempotent — a second call yields
+    /// nothing).
+    fn take_handles(&self) -> Vec<std::thread::JoinHandle<()>> {
+        self.threads
+            .lock()
+            .expect("queue threads lock")
+            .drain(..)
+            .collect()
+    }
+
+    /// Shutdown-and-join quiescence (MEM-3): after this returns, both
+    /// queue threads have run to completion — no lane context holds a
+    /// destination pointer for this queue, so timed-out destination
+    /// buffers may be released/recycled by the caller.
+    async fn drain(&self) {
+        self.signal_stop();
+        let handles = self.take_handles();
+        if !handles.is_empty() {
+            run_blocking(move || {
+                for h in handles {
+                    let _ = h.join();
+                }
+            })
+            .await;
+        }
+    }
 }
 
 /// A lane IO queue under one of the receive backends.
@@ -210,12 +277,12 @@ pub struct LaneSession {
     /// backend only; design §5 record-and-restore law).
     steering: std::sync::Mutex<Option<SteeringHold>>,
     /// Keeps the admin connection (and thus the association) alive.
-    /// `Mutex<Option<…>>` so teardown can TAKE it and AWAIT its
-    /// completion (stop-ship flake, 2026-08: `abort()` only requests
-    /// cancellation — without the await, teardown returned while the
-    /// watchdog's cancellation was still in flight and `is_finished()`
-    /// raced the runtime).
-    admin_hold: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// `Mutex<Option<…>>` so teardown can TAKE it, shut the socket down
+    /// and JOIN the watchdog thread (stop-ship flake, 2026-08, made
+    /// structural by the OS-thread conversion: the old `abort()` only
+    /// requested cancellation and `is_finished()` raced the runtime —
+    /// the join is an owned, completed edge by construction).
+    admin_hold: std::sync::Mutex<Option<AdminHold>>,
     /// The rxq-arbiter grant backing this session's ifqs (real backend
     /// only). Declared LAST: it drops after the queues close their
     /// doorbells, so the indices return to the per-NIC pool only once
@@ -234,6 +301,15 @@ pub struct LaneSession {
     nic_ifindex: std::sync::atomic::AtomicU32,
 }
 
+/// The parked admin watchdog: an OS thread (`sqz-zcrx-admin`) blocked in
+/// `read()` on the admin socket, plus a kept socket handle so teardown
+/// can shut it down and JOIN the thread (retirement is an owned,
+/// completed edge — round 6).
+struct AdminHold {
+    socket: TcpStream,
+    thread: std::thread::JoinHandle<()>,
+}
+
 impl LaneSession {
     /// Restore recorded NIC state (idempotent; disarm/unmount/quiesce).
     fn restore_steering(&self) {
@@ -247,29 +323,35 @@ impl LaneSession {
 
 impl Drop for LaneSession {
     fn drop(&mut self) {
+        // A drop IS a teardown: latch first so the admin watchdog's
+        // socket-shutdown wakeup below reads as orderly retirement,
+        // never as an association-death poison (round 6).
+        self.teardown_latch.store(true, Ordering::SeqCst);
         if let Some(h) = self.admin_hold.lock().expect("admin hold lock").take() {
-            h.abort();
+            let _ = h.socket.shutdown(std::net::Shutdown::Both);
+            let _ = h.thread.join();
         }
         // FINDING 3 teardown order (2026-08 field): the ifqs must be
         // gone BEFORE the steering restore re-includes the lane queues
         // in RSS — a still-bound ifq makes host flows on its queue
-        // unreadable (recv = EFAULT). Close the ring doorbells, JOIN
-        // the driver threads (prompt: the doorbell CQE wakes them and
-        // the closed latch exits the loop), THEN restore. `quiesce()`
-        // is the async path with the same order.
+        // unreadable (recv = EFAULT). Signal every queue first (close
+        // the ring doorbells / Stop + socket shutdown — prompt: the
+        // doorbell CQE / the failing blocking read wakes them), then
+        // JOIN every thread, THEN restore. `quiesce()` is the async
+        // path with the same order.
         for q in &self.queues {
-            if let QueueHandle::Area(q) = q {
-                if let super::area_queue::CommandSink::Ring(cmds) = &q.sink {
-                    cmds.close();
-                }
+            match q {
+                QueueHandle::Classic(q) => q.signal_stop(),
+                QueueHandle::Area(q) => q.signal_stop(),
             }
         }
         for q in &self.queues {
-            if let QueueHandle::Area(q) = q {
-                let handle = q.driver.lock().expect("driver handle lock").take();
-                if let Some(h) = handle {
-                    let _ = h.join();
-                }
+            let handles = match q {
+                QueueHandle::Classic(q) => q.take_handles(),
+                QueueHandle::Area(q) => q.take_handles(),
+            };
+            for h in handles {
+                let _ = h.join();
             }
         }
         self.restore_steering();
@@ -287,17 +369,17 @@ impl std::fmt::Debug for LaneSession {
     }
 }
 
-/// Sequential request/response over the admin stream during bring-up (the
-/// only admin traffic the lane ever issues; KATO 0 — design §4.2).
-async fn admin_roundtrip(stream: &mut TcpStream, capsule: &[u8]) -> Result<pdu::Cqe> {
+/// Sequential request/response over the admin stream during bring-up
+/// (the only admin traffic the lane ever issues; KATO 0 — design §4.2).
+/// Synchronous (rip-tokio-total): bring-up is cold and runs on the
+/// blocking pool via [`run_blocking`].
+fn admin_roundtrip(stream: &mut TcpStream, capsule: &[u8]) -> Result<pdu::Cqe> {
     stream
         .write_all(capsule)
-        .await
         .map_err(|e| io_err(format!("admin capsule write: {e}")))?;
     let mut ch_buf = [0u8; 8];
     stream
         .read_exact(&mut ch_buf)
-        .await
         .map_err(|e| io_err(format!("admin CH read: {e}")))?;
     let ch = parse_ch(&ch_buf)?;
     match ch.pdu_type {
@@ -305,7 +387,6 @@ async fn admin_roundtrip(stream: &mut TcpStream, capsule: &[u8]) -> Result<pdu::
             let mut rest = vec![0u8; (ch.plen as usize).saturating_sub(8)];
             stream
                 .read_exact(&mut rest)
-                .await
                 .map_err(|e| io_err(format!("admin CQE read: {e}")))?;
             pdu::parse_cqe(&rest).map_err(frame_err)
         }
@@ -326,15 +407,13 @@ fn frame_err(e: pdu::FrameError) -> SqueezefsError {
     io_err(format!("NVMe/TCP framing violation: {e}"))
 }
 
-async fn ic_exchange(stream: &mut TcpStream) -> Result<pdu::IcResp> {
+fn ic_exchange(stream: &mut TcpStream) -> Result<pdu::IcResp> {
     stream
         .write_all(&pdu::encode_icreq())
-        .await
         .map_err(|e| io_err(format!("ICReq write: {e}")))?;
     let mut resp = [0u8; 128];
     stream
         .read_exact(&mut resp)
-        .await
         .map_err(|e| io_err(format!("ICResp read: {e}")))?;
     pdu::parse_icresp(&resp).map_err(frame_err)
 }
@@ -488,22 +567,16 @@ impl LaneSession {
         (free, total)
     }
 
-    /// Abort AND join every queue driver — the poison-drain quiescence
-    /// law (design §7): after this returns no lane task or thread holds
-    /// destination pointers or area-chunk refs, and any recorded NIC
-    /// steering has been restored.
+    /// Shut down AND join every queue driver — the poison-drain
+    /// quiescence law (design §7): the socket shutdown makes every
+    /// blocking loop return and the joins PROVE they exited, so after
+    /// this returns no lane task or thread holds destination pointers
+    /// or area-chunk refs, and any recorded NIC steering has been
+    /// restored.
     pub async fn quiesce(&self) {
         for q in &self.queues {
             match q {
-                QueueHandle::Classic(q) => {
-                    let mut ts = q.tasks.lock().await;
-                    for t in ts.iter() {
-                        t.abort();
-                    }
-                    for t in ts.drain(..) {
-                        let _ = t.await;
-                    }
-                }
+                QueueHandle::Classic(q) => q.drain().await,
                 QueueHandle::Area(q) => q.drain().await,
             }
         }
@@ -543,67 +616,70 @@ impl LaneSession {
         if let LaneBackend::Zcrx(plan) = &backend {
             let ifname = plan.ifname.clone();
             let lane_queues = plan.rx_queues.clone();
-            let hold = tokio::task::spawn_blocking(move || -> Result<SteeringHold> {
+            let hold = run_blocking(move || -> Result<SteeringHold> {
                 let nic = super::ethtool::EthtoolNic::open(&ifname).map_err(io_err)?;
                 super::steering::ArmedSteering::arm(nic, &lane_queues)
                     .map_err(|e| io_err(format!("zcrx steering arm (RSS exclusion): {e}")))
             })
-            .await
-            .map_err(|e| io_err(format!("steering join: {e}")))??;
+            .await?;
             steering_hold = Some(hold);
         }
 
-        let mut admin = TcpStream::connect(&addr)
-            .await
-            .map_err(|e| io_err(format!("lane admin connect {addr}: {e}")))?;
-        admin.set_nodelay(true).ok();
-        ic_exchange(&mut admin).await?;
+        // The whole admin bring-up is synchronous blocking I/O on the
+        // blocking pool (setup is cold — rip-tokio-total): connect →
+        // ICReq/ICResp → admin Connect → CAP → CC.EN → CSTS.RDY.
+        let (admin, cntlid, mqes) = {
+            let addr = addr.clone();
+            let subnqn = target.subnqn.clone();
+            let hostnqn = hostnqn.clone();
+            run_blocking(move || -> Result<(TcpStream, u16, u16)> {
+                let mut admin = TcpStream::connect(&addr)
+                    .map_err(|e| io_err(format!("lane admin connect {addr}: {e}")))?;
+                admin.set_nodelay(true).ok();
+                ic_exchange(&mut admin)?;
 
-        let connect = pdu::encode_connect_capsule(
-            0,
-            31, // admin SQSIZE (0-based) — bring-up only, never data depth
-            0,  // KATO 0: keep-alive disabled (design §4.2 / residual 4)
-            0,
-            &hostid,
-            0xFFFF,
-            &target.subnqn,
-            &hostnqn,
-        );
-        let cqe = admin_roundtrip(&mut admin, &connect).await?;
-        check_status("admin Connect", &cqe)?;
-        let cntlid = (cqe.dw0 & 0xFFFF) as u16;
+                let connect = pdu::encode_connect_capsule(
+                    0, 31, // admin SQSIZE (0-based) — bring-up only, never data depth
+                    0,  // KATO 0: keep-alive disabled (design §4.2 / residual 4)
+                    0, &hostid, 0xFFFF, &subnqn, &hostnqn,
+                );
+                let cqe = admin_roundtrip(&mut admin, &connect)?;
+                check_status("admin Connect", &cqe)?;
+                let cntlid = (cqe.dw0 & 0xFFFF) as u16;
 
-        let cap = admin_roundtrip(
-            &mut admin,
-            &pdu::encode_property_get(1, pdu::PROP_CAP, true),
-        )
-        .await?;
-        check_status("Property Get CAP", &cap)?;
-        let mqes = (cap.dw0 & 0xFFFF) as u16; // 0-based max queue entries
+                let cap = admin_roundtrip(
+                    &mut admin,
+                    &pdu::encode_property_get(1, pdu::PROP_CAP, true),
+                )?;
+                check_status("Property Get CAP", &cap)?;
+                let mqes = (cap.dw0 & 0xFFFF) as u16; // 0-based max queue entries
 
-        let set_cc = pdu::encode_property_set(2, pdu::PROP_CC, pdu::CC_ENABLE_NVM, false);
-        let cqe = admin_roundtrip(&mut admin, &set_cc).await?;
-        check_status("Property Set CC.EN", &cqe)?;
+                let set_cc = pdu::encode_property_set(2, pdu::PROP_CC, pdu::CC_ENABLE_NVM, false);
+                let cqe = admin_roundtrip(&mut admin, &set_cc)?;
+                check_status("Property Set CC.EN", &cqe)?;
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let csts = admin_roundtrip(
-                &mut admin,
-                &pdu::encode_property_get(3, pdu::PROP_CSTS, false),
-            )
-            .await?;
-            check_status("Property Get CSTS", &csts)?;
-            if csts.dw0 & 1 == 1 {
-                break;
-            }
-            if csts.dw0 & 0b10 != 0 {
-                return Err(io_err("controller reports CFS during lane enable".into()));
-            }
-            if std::time::Instant::now() > deadline {
-                return Err(io_err("controller never reached CSTS.RDY (10 s)".into()));
-            }
-            squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                loop {
+                    let csts = admin_roundtrip(
+                        &mut admin,
+                        &pdu::encode_property_get(3, pdu::PROP_CSTS, false),
+                    )?;
+                    check_status("Property Get CSTS", &csts)?;
+                    if csts.dw0 & 1 == 1 {
+                        break;
+                    }
+                    if csts.dw0 & 0b10 != 0 {
+                        return Err(io_err("controller reports CFS during lane enable".into()));
+                    }
+                    if std::time::Instant::now() > deadline {
+                        return Err(io_err("controller never reached CSTS.RDY (10 s)".into()));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Ok((admin, cntlid, mqes))
+            })
+            .await?
+        };
 
         let poisoned = Arc::new(AtomicBool::new(false));
         let depth = target.queue_depth.min(mqes.saturating_add(1)).max(2);
@@ -617,30 +693,39 @@ impl LaneSession {
         // steering — never RSS-restore over a still-bound ifq.
         let bring_up: Result<()> = async {
             for qid in 1..=target.io_queues {
-                let mut s = TcpStream::connect(&addr)
-                    .await
-                    .map_err(|e| io_err(format!("lane IO queue {qid} connect: {e}")))?;
-                s.set_nodelay(true).ok();
-                ic_exchange(&mut s).await?;
-                let connect = pdu::encode_connect_capsule(
-                    qid,
-                    depth - 1,
-                    0,
-                    0,
-                    &hostid,
-                    cntlid,
-                    &target.subnqn,
-                    &hostnqn,
-                );
-                let cqe = admin_roundtrip(&mut s, &connect).await?;
-                check_status("IO Connect", &cqe)?;
+                let s = {
+                    let addr = addr.clone();
+                    let subnqn = target.subnqn.clone();
+                    let hostnqn = hostnqn.clone();
+                    run_blocking(move || -> Result<TcpStream> {
+                        let mut s = TcpStream::connect(&addr)
+                            .map_err(|e| io_err(format!("lane IO queue {qid} connect: {e}")))?;
+                        s.set_nodelay(true).ok();
+                        ic_exchange(&mut s)?;
+                        let connect = pdu::encode_connect_capsule(
+                            qid,
+                            depth - 1,
+                            0,
+                            0,
+                            &hostid,
+                            cntlid,
+                            &subnqn,
+                            &hostnqn,
+                        );
+                        let cqe = admin_roundtrip(&mut s, &connect)?;
+                        check_status("IO Connect", &cqe)?;
+                        Ok(s)
+                    })
+                    .await?
+                };
                 match &backend {
                     LaneBackend::Classic => {
                         queues.push(QueueHandle::Classic(spawn_queue(
                             s,
+                            qid,
                             depth,
                             Arc::clone(&poisoned),
-                        )));
+                        )?));
                     }
                     LaneBackend::AreaSim => {
                         // Registration-order law (design §5): area exists and
@@ -654,10 +739,11 @@ impl LaneSession {
                         )?;
                         queues.push(QueueHandle::Area(super::area_queue::spawn_area_queue(
                             s,
+                            qid,
                             depth,
                             area,
                             Arc::clone(&poisoned),
-                        )));
+                        )?));
                     }
                     LaneBackend::Zcrx(plan) => {
                         let rxq = plan.rxq_for_qid(qid).ok_or_else(|| {
@@ -725,9 +811,7 @@ impl LaneSession {
                                 shared: Arc::clone(&shared),
                                 cmds: Arc::clone(&cmds),
                                 session_poison: Arc::clone(&poisoned),
-                                sock: s
-                                    .into_std()
-                                    .map_err(|e| io_err(format!("lane queue into_std: {e}")))?,
+                                sock: s,
                             },
                             ready_tx,
                             go_rx,
@@ -736,9 +820,8 @@ impl LaneSession {
                         // dropping go_tx makes every parked driver exit
                         // silently — nothing armed, NIC untouched (steering
                         // is the LAST step).
-                        tokio::task::spawn_blocking(move || ready_rx.recv())
+                        run_blocking(move || ready_rx.recv())
                             .await
-                            .map_err(|e| io_err(format!("lane driver ready join: {e}")))?
                             .map_err(|_| io_err("lane driver died during setup".into()))?
                             .map_err(io_err)?;
                         go_txs.push(go_tx);
@@ -750,7 +833,8 @@ impl LaneSession {
                         queues.push(QueueHandle::Area(super::area_queue::AreaQueue {
                             shared,
                             sink: super::area_queue::CommandSink::Ring(cmds),
-                            tasks: tokio::sync::Mutex::new(Vec::new()),
+                            threads: std::sync::Mutex::new(Vec::new()),
+                            socket: None,
                             driver: std::sync::Mutex::new(Some(driver)),
                             area,
                         }));
@@ -769,14 +853,13 @@ impl LaneSession {
                 // The hold comes BACK on both arms — a rules failure must
                 // not drop the guard here (RSS has to stay excluded until
                 // the unwind below has torn the ifqs down).
-                let (hold_back, rules_res) = tokio::task::spawn_blocking(move || {
+                let (hold_back, rules_res) = run_blocking(move || {
                     let res = hold
                         .flow_rules(&flows_owned)
                         .map_err(|e| io_err(format!("zcrx steering arm (flow rules): {e}")));
                     (hold, res)
                 })
-                .await
-                .map_err(|e| io_err(format!("steering join: {e}")))?;
+                .await;
                 steering_hold = Some(hold_back);
                 rules_res?;
                 for tx in &go_txs {
@@ -791,47 +874,85 @@ impl LaneSession {
             // FINDING 3 unwind order: the ifqs must be GONE before the
             // phase-A RSS exclusion lifts. Parked drivers exit when
             // their go senders drop; armed ones exit on the doorbell
-            // close inside drain(); JOIN them all, THEN restore.
+            // close / socket shutdown inside drain(); JOIN them all,
+            // THEN restore. Classic/sim queue threads drain too — an
+            // OS thread parked on a live socket would otherwise outlive
+            // the failed bring-up.
             drop(go_txs);
             for q in &queues {
-                if let QueueHandle::Area(q) = q {
-                    q.drain().await;
+                match q {
+                    QueueHandle::Classic(q) => q.drain().await,
+                    QueueHandle::Area(q) => q.drain().await,
                 }
             }
             if let Some(mut hold) = steering_hold.take() {
-                let _ = tokio::task::spawn_blocking(move || hold.restore_now()).await;
+                run_blocking(move || hold.restore_now()).await;
             }
             return Err(e);
         }
 
-        // Park the admin socket: any read (data or EOF) after bring-up is an
-        // association event — poison loud, the kernel path keeps serving.
-        // EXCEPT during teardown (round 6): the latch makes the target's
-        // orderly association unwind silent, never a poison.
+        // Park the admin socket on a named OS thread: any read (data or
+        // EOF) after bring-up is an association event — poison loud, the
+        // kernel path keeps serving. EXCEPT during teardown (round 6):
+        // the latch makes the target's orderly association unwind (and
+        // teardown's own socket shutdown) silent, never a poison.
         let teardown_latch = Arc::new(AtomicBool::new(false));
         let admin_poison = Arc::clone(&poisoned);
         let admin_latch = Arc::clone(&teardown_latch);
-        let admin_hold = tokio::spawn(async move {
-            let mut b = [0u8; 8];
-            let event = admin.read(&mut b).await;
-            if admin_latch.load(Ordering::SeqCst) {
-                return; // orderly teardown — not an association event
+        let watchdog: Result<AdminHold> = (|| {
+            let admin_shutdown = admin
+                .try_clone()
+                .map_err(|e| io_err(format!("admin socket clone: {e}")))?;
+            let admin_thread = std::thread::Builder::new()
+                .name("sqz-zcrx-admin".into())
+                .spawn(move || {
+                    let mut admin = admin;
+                    let mut b = [0u8; 8];
+                    let event = admin.read(&mut b);
+                    if admin_latch.load(Ordering::SeqCst) {
+                        return; // orderly teardown — not an association event
+                    }
+                    let why = match &event {
+                        Ok(0) => {
+                            "admin connection closed by target (association death; remount re-arms)"
+                                .to_string()
+                        }
+                        Ok(_) => "unexpected admin PDU after bring-up".to_string(),
+                        Err(e) => format!("admin connection error: {e}"),
+                    };
+                    // The mark-site latch edge (belt): a teardown that began
+                    // AFTER the early check above must still not gain a poison
+                    // mark from this thread. With teardown JOINING this thread,
+                    // a mark that wins here reflects a genuinely concurrent
+                    // pre-teardown association event — which IS poison.
+                    if !admin_latch.load(Ordering::SeqCst) {
+                        mark_session_poisoned(&admin_poison, &why);
+                    }
+                })
+                .map_err(|e| io_err(format!("admin watchdog thread spawn: {e}")))?;
+            Ok(AdminHold {
+                socket: admin_shutdown,
+                thread: admin_thread,
+            })
+        })();
+        let admin_hold = match watchdog {
+            Ok(h) => h,
+            Err(e) => {
+                // Same FINDING-3 unwind as a bring-up failure: ifqs and
+                // queue threads down and JOINED before the RSS restore.
+                drop(go_txs);
+                for q in &queues {
+                    match q {
+                        QueueHandle::Classic(q) => q.drain().await,
+                        QueueHandle::Area(q) => q.drain().await,
+                    }
+                }
+                if let Some(mut hold) = steering_hold.take() {
+                    run_blocking(move || hold.restore_now()).await;
+                }
+                return Err(e);
             }
-            let why = match &event {
-                Ok(0) => "admin connection closed by target (association death; remount re-arms)"
-                    .to_string(),
-                Ok(_) => "unexpected admin PDU after bring-up".to_string(),
-                Err(e) => format!("admin connection error: {e}"),
-            };
-            // The mark-site latch edge (belt): a teardown that began
-            // AFTER the early check above must still not gain a poison
-            // mark from this task. With teardown awaiting this handle,
-            // a mark that wins here reflects a genuinely concurrent
-            // pre-teardown association event — which IS poison.
-            if !admin_latch.load(Ordering::SeqCst) {
-                mark_session_poisoned(&admin_poison, &why);
-            }
-        });
+        };
 
         log::info!(
             "zcrx-lane armed: {} nsid={} lba_shift={} queues={} depth={} max_xfer={} (backend: {})",
@@ -874,17 +995,18 @@ impl LaneSession {
         self.poisoned.load(Ordering::SeqCst)
     }
 
-    /// Whether the admin watchdog task has finished (round-6 gauge-
+    /// Whether the admin watchdog thread has finished (round-6 gauge-
     /// honesty instrument: teardown must RETIRE the watchdog before the
     /// target's orderly association close can be misread as poison).
     pub fn admin_watchdog_finished(&self) -> bool {
-        // Retired = taken-and-awaited by teardown (None), or the task
-        // itself completed (a real association event ran its course).
+        // Retired = taken-shutdown-and-JOINED by teardown (None), or the
+        // thread itself completed (a real association event ran its
+        // course).
         self.admin_hold
             .lock()
             .expect("admin hold lock")
             .as_ref()
-            .is_none_or(|h| h.is_finished())
+            .is_none_or(|h| h.thread.is_finished())
     }
 
     /// Round-5 blast-radius law: any queue in a refill-starvation
@@ -966,14 +1088,20 @@ impl LaneSession {
         // association and close the admin connection, and that ORDERLY
         // close must never be markable as poison (the field's
         // poisoned=8-with-zero-poison-logs). The latch (checked by the
-        // watchdog) is the belt for an EOF racing this abort. Take,
-        // abort, AWAIT: retirement is an owned, completed edge before
-        // teardown proceeds — `abort()` alone only REQUESTS cancellation
-        // (the stop-ship flake: is_finished raced the runtime).
-        let handle = self.admin_hold.lock().expect("admin hold lock").take();
-        if let Some(h) = handle {
-            h.abort();
-            let _ = h.await; // JoinError::Cancelled is the expected arm
+        // watchdog, set above) is the belt for an EOF racing this
+        // shutdown. Take, SHUTDOWN the socket, JOIN the thread:
+        // retirement is an owned, completed edge before teardown
+        // proceeds — structurally now (the blocking read returns on the
+        // shutdown socket and the join proves the thread exited; the
+        // retired tokio `abort()` only REQUESTED cancellation — the
+        // stop-ship flake where is_finished raced the runtime).
+        let hold = self.admin_hold.lock().expect("admin hold lock").take();
+        if let Some(h) = hold {
+            let _ = h.socket.shutdown(std::net::Shutdown::Both);
+            run_blocking(move || {
+                let _ = h.thread.join();
+            })
+            .await;
         }
         self.quiesce().await;
         // The lease releases only AFTER the ifqs are joined (quiesce),
@@ -1014,7 +1142,7 @@ impl LaneSession {
             return;
         }
         let sess = Arc::clone(self);
-        tokio::spawn(async move {
+        crate::meta_exec::spawn_meta("zcrx_lane_teardown", async move {
             sess.teardown().await;
         });
     }
@@ -1235,7 +1363,7 @@ impl LaneSession {
     fn admit_whole_read(
         &self,
         segs: &[(u64, SendMutPtr, usize, usize)],
-    ) -> Result<std::collections::HashMap<usize, tokio::sync::OwnedSemaphorePermit>> {
+    ) -> Result<std::collections::HashMap<usize, AdmissionUnits>> {
         use super::area_queue::admission_units;
         let mut totals: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
         for &(_, _, seg, qi) in segs {
@@ -1248,11 +1376,17 @@ impl LaneSession {
             let QueueHandle::Area(q) = &self.queues[qi] else {
                 continue;
             };
-            match Arc::clone(&q.shared.admission).try_acquire_many_owned(units) {
+            match AdmissionUnits::try_take(&q.shared.admission, units) {
                 Ok(p) => {
                     held.insert(qi, p);
                 }
-                Err(tokio::sync::TryAcquireError::NoPermits) => {
+                Err(_) => {
+                    // The single sqz try-acquire error covers both retired
+                    // tokio arms; the poison latch carries the Closed
+                    // meaning (take_cid's closed-semantics law).
+                    if q.shared.poisoned.load(Ordering::SeqCst) {
+                        return Err(io_err("lane queue closed".into()));
+                    }
                     // `held` drops here — every already-admitted queue's
                     // units release immediately (nothing rode a fill yet).
                     crate::fuse_client::METRICS
@@ -1262,9 +1396,6 @@ impl LaneSession {
                         std::io::ErrorKind::WouldBlock,
                         "lane admission window full — declined to the kernel path",
                     )));
-                }
-                Err(tokio::sync::TryAcquireError::Closed) => {
-                    return Err(io_err("lane queue closed".into()));
                 }
             }
         }
@@ -1277,7 +1408,7 @@ impl LaneSession {
         dest: SendMutPtr,
         len: usize,
         qi: usize,
-        admission: Option<tokio::sync::OwnedSemaphorePermit>,
+        admission: Option<AdmissionUnits>,
         keepalive: Option<bytes::Bytes>,
     ) -> Result<()> {
         match &self.queues[qi] {
@@ -1309,7 +1440,7 @@ impl LaneSession {
         byte_offset: u64,
         dest: SendMutPtr,
         len: usize,
-        admission: tokio::sync::OwnedSemaphorePermit,
+        admission: AdmissionUnits,
     ) -> Result<()> {
         let shared = &q.shared;
         if shared.poisoned.load(Ordering::SeqCst) {
@@ -1327,7 +1458,7 @@ impl LaneSession {
         // it returns when the driver destroys the entry — completion,
         // send-failure cancel, or poison drain — never on this
         // requester's exits, so a dropped future leaks nothing.
-        let slot = take_cid(&shared.cid_gate, &shared.free_cids).await?;
+        let slot = take_cid(&shared.cid_gate, &shared.free_cids, &shared.poisoned).await?;
         let cid = slot.cid();
         let rx = shared.table.insert(cid, len, slot, Some(admission));
 
@@ -1355,13 +1486,14 @@ impl LaneSession {
             Ok(Ok(Err(e))) => Err(e),
             Ok(Err(_)) => Err(io_err("lane completion channel dropped".into())),
             Err(_) => {
-                // Quiescence law: drain (abort-and-join tasks / close +
-                // join the ring driver) so no lane context survives
-                // holding chunk refs, then poison loud (drain=true: the
-                // drivers are provably joined). No pre-store: the poison
-                // funnel owns the flag flip AND the log (round 8 — the
-                // pre-store suppressed the first-swap log: silent
-                // poison). drain() needs no flag — it closes the sink.
+                // Quiescence law: drain (shutdown-and-join the sim
+                // threads / close + join the ring driver) so no lane
+                // context survives holding chunk refs, then poison loud
+                // (drain=true: the drivers are provably JOINED). No
+                // pre-store: the poison funnel owns the flag flip AND
+                // the log (round 8 — the pre-store suppressed the
+                // first-swap log: silent poison). drain() needs no flag
+                // — it closes the sink and shuts the socket down.
                 q.drain().await;
                 shared.poison("read timed out after 30 s", &self.poisoned, true);
                 Err(io_err(format!(
@@ -1383,10 +1515,10 @@ impl LaneSession {
             return Err(io_err("lane queue poisoned".into()));
         }
         // CID + depth-permit custody lives in the pending entry (MEM-3),
-        // alongside the destination keep-alive: the reader task writes
+        // alongside the destination keep-alive: the reader thread writes
         // only destinations whose entries exist, and the entry outlives
         // any cancelled requester — no recycled-buffer write, no leak.
-        let slot = take_cid(&q.shared.cid_gate, &q.shared.free_cids).await?;
+        let slot = take_cid(&q.shared.cid_gate, &q.shared.free_cids, &q.shared.poisoned).await?;
         let cid = slot.cid();
 
         let (tx, rx) = oneshot::channel();
@@ -1405,32 +1537,28 @@ impl LaneSession {
         let slba = byte_offset >> self.target.lba_shift;
         let nlb = (len >> self.target.lba_shift) as u32;
         let capsule = pdu::encode_read_capsule(cid, self.target.nsid, slba, nlb, len as u32);
-        if q.to_writer.send(capsule).is_err() {
+        if q.to_writer.send(WriterMsg::Capsule(capsule)).is_err() {
             // Capsule never reached the wire: destroy the entry (custody
             // returns with it).
             q.shared.pending.lock().expect("pending lock").remove(&cid);
-            return Err(io_err("lane writer task gone".into()));
+            return Err(io_err("lane writer thread gone".into()));
         }
 
         match squeezefs_ipc::sqz_time::timeout(LANE_READ_TIMEOUT, rx).await {
             Ok(Ok(r)) => r,
             Ok(Err(_)) => Err(io_err("lane completion channel dropped".into())),
             Err(_) => {
-                // Quiescence law: the reader task holds raw pointers into
-                // this (and other) destination buffers. Before this frame
-                // returns — and the caller's buffer can be dropped/recycled
-                // — abort AND join the queue's tasks so no writer survives;
-                // only then drain (dropping entry keep-alives).
-                // No pre-store (round 8): the poison funnel owns the
-                // flag flip and the log; abort+join needs no flag.
-                let mut ts = q.tasks.lock().await;
-                for t in ts.iter() {
-                    t.abort();
-                }
-                for t in ts.drain(..) {
-                    let _ = t.await;
-                }
-                drop(ts);
+                // Quiescence law: the reader thread holds raw pointers
+                // into this (and other) destination buffers. Before this
+                // frame returns — and the caller's buffer can be
+                // dropped/recycled — shut the socket down AND join both
+                // queue threads so no writer survives (the join is the
+                // PROOF: the blocking loops ran to completion on the
+                // dead socket); only then drain (dropping entry
+                // keep-alives). No pre-store (round 8): the poison
+                // funnel owns the flag flip and the log; shutdown+join
+                // needs no flag.
+                q.drain().await;
                 q.shared
                     .poison("read timed out after 30 s", &self.poisoned, true);
                 Err(io_err(format!(
@@ -1441,67 +1569,90 @@ impl LaneSession {
     }
 }
 
-fn spawn_queue(stream: TcpStream, depth: u16, session_poison: Arc<AtomicBool>) -> IoQueue {
+fn spawn_queue(
+    stream: TcpStream,
+    qid: u16,
+    depth: u16,
+    session_poison: Arc<AtomicBool>,
+) -> Result<IoQueue> {
     let shared = Arc::new(QueueShared {
         pending: std::sync::Mutex::new(std::collections::HashMap::new()),
         free_cids: Arc::new(std::sync::Mutex::new((0..depth).collect())),
-        cid_gate: Arc::new(tokio::sync::Semaphore::new(depth as usize)),
+        cid_gate: Arc::new(squeezefs_ipc::sqz_semaphore::Semaphore::new(depth as usize)),
         cid_capacity: depth as usize,
         poisoned: AtomicBool::new(false),
     });
-    let (read_half, write_half) = stream.into_split();
-    let (tx, rx) = mpsc::unbounded_channel();
+    let writer_sock = stream
+        .try_clone()
+        .map_err(|e| io_err(format!("lane queue {qid} socket clone: {e}")))?;
+    let mut reader_sock = stream
+        .try_clone()
+        .map_err(|e| io_err(format!("lane queue {qid} socket clone: {e}")))?;
+    let (tx, rx) = std::sync::mpsc::channel();
 
     let s2 = Arc::clone(&shared);
     let p2 = Arc::clone(&session_poison);
-    let writer = tokio::spawn(async move {
-        if let Err(why) = writer_loop(write_half, rx).await {
-            // drain=false: the reader may still be mid-write on a live
-            // entry — its own exit (or the timeout arm's abort+join)
-            // performs the drain (MEM-3 drain discipline).
-            s2.poison(&why, &p2, false);
-        }
-    });
+    let writer = std::thread::Builder::new()
+        .name(format!("sqz-zcrx-wr{qid}"))
+        .spawn(move || {
+            if let Err(why) = writer_loop(writer_sock, rx) {
+                // drain=false: the reader may still be mid-write on a live
+                // entry — its own exit (or the timeout arm's shutdown+join)
+                // performs the drain (MEM-3 drain discipline).
+                s2.poison(&why, &p2, false);
+            }
+        })
+        .map_err(|e| io_err(format!("lane queue {qid} writer thread spawn: {e}")))?;
     let s3 = Arc::clone(&shared);
-    let reader = tokio::spawn(async move {
-        if let Err(why) = reader_loop(read_half, &s3).await {
-            // drain=true: the reader is exiting — no further destination
-            // writes are possible from this queue.
-            s3.poison(&why, &session_poison, true);
-        }
-    });
+    let reader = std::thread::Builder::new()
+        .name(format!("sqz-zcrx-rd{qid}"))
+        .spawn(move || {
+            if let Err(why) = reader_loop(&mut reader_sock, &s3) {
+                // drain=true: the reader is exiting — no further destination
+                // writes are possible from this queue.
+                s3.poison(&why, &session_poison, true);
+            }
+        })
+        .map_err(|e| io_err(format!("lane queue {qid} reader thread spawn: {e}")))?;
 
-    IoQueue {
+    Ok(IoQueue {
         shared,
         to_writer: tx,
-        tasks: Mutex::new(vec![reader, writer]),
+        socket: stream,
+        threads: std::sync::Mutex::new(vec![reader, writer]),
+    })
+}
+
+/// The writer OS-thread loop (`sqz-zcrx-wr{N}`): capsules to the wire,
+/// 1:1 with the retired async loop. Exits on [`WriterMsg::Stop`], on
+/// channel disconnect, or on a write error (a shutdown socket fails the
+/// write — the quiescence path's braces).
+pub(crate) fn writer_loop(
+    mut w: TcpStream,
+    rx: std::sync::mpsc::Receiver<WriterMsg>,
+) -> std::result::Result<(), String> {
+    loop {
+        match rx.recv() {
+            Ok(WriterMsg::Capsule(capsule)) => {
+                w.write_all(&capsule)
+                    .map_err(|e| format!("capsule write: {e}"))?;
+            }
+            Ok(WriterMsg::Stop) | Err(_) => return Ok(()),
+        }
     }
 }
 
-pub(crate) async fn writer_loop(
-    mut w: OwnedWriteHalf,
-    mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
-) -> std::result::Result<(), String> {
-    while let Some(capsule) = rx.recv().await {
-        w.write_all(&capsule)
-            .await
-            .map_err(|e| format!("capsule write: {e}"))?;
-    }
-    Ok(())
-}
-
-/// The per-queue PDU state machine. C2HData payload is read **directly into
-/// the destination span** (one kernel copy — parity with the kernel
-/// initiator; the Z2 zcrx backend replaces this with area-chunk refs behind
-/// the same completion law).
-async fn reader_loop(
-    mut r: OwnedReadHalf,
-    shared: &QueueShared,
-) -> std::result::Result<(), String> {
+/// The per-queue PDU state machine (the `sqz-zcrx-rd{N}` OS thread).
+/// C2HData payload is read **directly into the destination span** (one
+/// kernel copy — parity with the kernel initiator; the Z2 zcrx backend
+/// replaces this with area-chunk refs behind the same completion law).
+/// A socket shutdown fails every blocking read here, so the
+/// shutdown+join quiescence path always terminates this loop promptly.
+fn reader_loop(r: &mut TcpStream, shared: &QueueShared) -> std::result::Result<(), String> {
     let metrics = &crate::fuse_client::METRICS;
     let mut hdr = [0u8; 128];
     loop {
-        if let Err(e) = r.read_exact(&mut hdr[..8]).await {
+        if let Err(e) = r.read_exact(&mut hdr[..8]) {
             // EOF with nothing pending = orderly teardown.
             if shared.pending.lock().expect("pending lock").is_empty()
                 && e.kind() == std::io::ErrorKind::UnexpectedEof
@@ -1519,7 +1670,6 @@ async fn reader_loop(
             return Err(format!("CH hlen {hlen} out of range"));
         }
         r.read_exact(&mut hdr[8..hlen])
-            .await
             .map_err(|e| format!("PSH read: {e}"))?;
 
         match ch.pdu_type {
@@ -1535,7 +1685,6 @@ async fn reader_loop(
                 while pad > 0 {
                     let n = pad.min(hdr.len());
                     r.read_exact(&mut hdr[..n])
-                        .await
                         .map_err(|e| format!("PDO pad read: {e}"))?;
                     pad -= n;
                 }
@@ -1543,8 +1692,9 @@ async fn reader_loop(
                     .zcrx_hdr_copy_bytes
                     .fetch_add(ch.pdo as u64, Ordering::Relaxed);
 
-                // Guard scope-bounded: a std MutexGuard must provably end
-                // before the socket await (the future stays Send).
+                // Guard scope-bounded: the map lock must provably end
+                // before the blocking socket read (never hold the
+                // pending lock across wire I/O).
                 let span = {
                     let mut map = shared.pending.lock().expect("pending lock");
                     let p = match map.get_mut(&c2h.cccid) {
@@ -1578,7 +1728,6 @@ async fn reader_loop(
                     // map lock ends here — never held across socket I/O
                 };
                 r.read_exact(span)
-                    .await
                     .map_err(|e| format!("C2HData payload read: {e}"))?;
 
                 {

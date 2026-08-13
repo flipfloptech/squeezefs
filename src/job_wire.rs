@@ -123,24 +123,26 @@
 //! the storage-trust proof are what actually authenticate the peer).
 
 use crate::cluster_wire::{
-    self, session_framers, AuthnConfig, AuthnGate, ChannelClass, ClusterStream, ConnGate,
-    FrameClass, FrameTx, ProofClaim, SessionAuthn, SessionKey, Verdict,
+    self, session_framers, AuthnConfig, AuthnGate, ChannelClass, ClusterStream, ClusterWriteHalf,
+    ConnGate, FrameClass, FrameTx, ProofClaim, SessionAuthn, SessionKey, Verdict,
 };
 use crate::data_custody::WeroHold;
 use crate::error::{Result, SqueezefsError};
 use crate::fuse_client::METRICS;
 use crate::jobs::{job_throttle_sleep, JobCtl, JobFabric, JobType};
 use crate::meta_backend::{Metadata, RoutedMetaBackend};
+use crate::sqz_sync::SqzMutex;
 use crate::tiering::cluster_tls::ClusterSecurityConfig;
 
 use serde::{Deserialize, Serialize};
+use squeezefs_ipc::{sqz_blocking, sqz_channel, sqz_time};
 use std::collections::{BTreeSet, HashMap};
-use std::net::SocketAddr;
+use std::io::{Read, Write};
+use std::net::{Shutdown, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite};
+use std::time::{Duration, Instant};
 use xxhash_rust::xxh3::xxh3_64;
 
 /// The wire frame schema this build speaks. A hello carrying any other
@@ -306,18 +308,15 @@ pub enum WireFrame {
 /// class — the handshake direction, and what the raw-connection tests
 /// speak. Post-enrollment frames ride [`FrameTx`] instead, which adds the
 /// session MAC.
-pub async fn write_frame<W: AsyncWrite + Unpin>(
-    w: &mut W,
-    frame: &WireFrame,
-) -> std::io::Result<()> {
-    cluster_wire::write_plain_frame(w, SESSION_CLASS, frame).await
+pub fn write_frame<W: Write>(w: &mut W, frame: &WireFrame) -> std::io::Result<()> {
+    cluster_wire::write_plain_frame(w, SESSION_CLASS, frame)
 }
 
 /// Read one **unauthenticated** frame at the bulk class
 /// ([`MAX_FRAME_BYTES`], no body deadline); `Ok(None)` on clean EOF at a
 /// frame boundary.
-pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Option<WireFrame>> {
-    read_frame_limited(r, MAX_FRAME_BYTES, None).await
+pub fn read_frame<R: Read>(r: &mut R) -> std::io::Result<Option<WireFrame>> {
+    read_frame_limited(r, MAX_FRAME_BYTES, None)
 }
 
 /// Read one frame under an explicit **class cap** and optional **body
@@ -328,16 +327,16 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Opti
 ///    body Vec grows [`FRAME_CHUNK_BYTES`] at a time *as bytes arrive*,
 ///    so a peer that declares 16 MiB and sends nothing costs one chunk.
 /// 2. Once a body has started, `body_timeout` bounds the WHOLE body (a
-///    dribbling peer is an error, not a parked task). The length-prefix
+///    dribbling peer is an error, not a parked thread). The length-prefix
 ///    read itself is deliberately unbounded here: an idle enrolled
 ///    session legitimately waits between frames, and its idle bound is
-///    the session-level deadline.
-pub async fn read_frame_limited<R: AsyncRead + Unpin>(
+///    the session-level socket read timeout.
+pub fn read_frame_limited<R: Read>(
     r: &mut R,
     max_len: u32,
     body_timeout: Option<Duration>,
 ) -> std::io::Result<Option<WireFrame>> {
-    cluster_wire::read_plain_frame(r, max_len, body_timeout).await
+    cluster_wire::read_plain_frame(r, max_len, body_timeout)
 }
 
 /// The enrollment proof: hex `HMAC-SHA256(secret, worker_id ‖
@@ -456,14 +455,14 @@ impl ShardDeviceSeam for NoopDeviceSeam {
 /// are strings).
 ///
 /// Bridging: the seam trait is sync (workers and the host's verify path
-/// call it inline); this implementation hops onto the captured runtime
-/// via `block_in_place` — it therefore requires the multi-thread
-/// runtime, which every mount and offline coordinator runs.
+/// call it inline, on the wire's own OS threads); this implementation
+/// drives the router's async device paths to completion with the
+/// first-party `sqz_blocking::block_on` — no runtime capture, no
+/// `block_in_place`.
 pub struct RouterShardDevice {
     router: Arc<crate::routing::BackendRouter>,
     backend_ids: Vec<String>,
     block_len: usize,
-    rt: tokio::runtime::Handle,
     /// PR VL6a: coordinator-pre-allocated shard destinations are
     /// unpublished BY DESIGN for the whole shard (and quarantined
     /// destinations until job end) — their live-owner registrations in
@@ -473,8 +472,7 @@ pub struct RouterShardDevice {
 }
 
 impl RouterShardDevice {
-    /// Capture the router and its CURRENT volume-id table (call from
-    /// async context — mount wiring is).
+    /// Capture the router and its CURRENT volume-id table.
     pub fn new(router: Arc<crate::routing::BackendRouter>, block_len: usize) -> Arc<Self> {
         let mut backend_ids: Vec<String> =
             router.backends.iter().map(|e| e.key().clone()).collect();
@@ -483,7 +481,6 @@ impl RouterShardDevice {
             router,
             backend_ids,
             block_len,
-            rt: tokio::runtime::Handle::current(),
             inflight: parking_lot::Mutex::new(Vec::new()),
         })
     }
@@ -502,7 +499,7 @@ impl RouterShardDevice {
     }
 
     fn block_on<F: std::future::Future>(&self, fut: F) -> F::Output {
-        tokio::task::block_in_place(|| self.rt.block_on(fut))
+        sqz_blocking::block_on(fut)
     }
 }
 
@@ -721,7 +718,7 @@ pub struct JobWireConfig {
     /// Listener bind address (`0.0.0.0:0` on mounts — ephemeral port,
     /// published via the mount registration).
     pub bind_addr: SocketAddr,
-    /// TLS via tokio-rustls when set (the `ClusterSecurityConfig`
+    /// TLS via sync rustls when set (the `ClusterSecurityConfig`
     /// cert/CA/verifier reuse); plaintext otherwise (OQ-A
     /// default-permissive — ONE loud log line at listener start).
     pub security: Option<ClusterSecurityConfig>,
@@ -1051,7 +1048,7 @@ struct Session {
     id: u64,
     worker_id: String,
     pr_key: Option<u64>,
-    writer: Arc<tokio::sync::Mutex<AuthedWriter>>,
+    writer: Arc<parking_lot::Mutex<AuthedWriter>>,
     /// Holds an assigned shard right now.
     busy: AtomicBool,
     /// Lease expired while holding a shard — never assignable again
@@ -1064,7 +1061,7 @@ struct Session {
 struct ShardHolder {
     session_id: u64,
     worker_id: String,
-    lease_expiry: tokio::time::Instant,
+    lease_expiry: Instant,
 }
 
 /// Coordinator-side shard state (persisted as `job:{id}:shard:{k}` on
@@ -1083,13 +1080,13 @@ struct ShardState {
 /// [`FrameTx`] sequence. One object, so no call site can accidentally
 /// write a session frame WITHOUT its MAC.
 struct AuthedWriter {
-    half: tokio::io::WriteHalf<ClusterStream>,
+    half: ClusterWriteHalf,
     tx: FrameTx,
 }
 
 impl AuthedWriter {
-    async fn send(&mut self, frame: &WireFrame) -> std::io::Result<()> {
-        self.tx.send(&mut self.half, SESSION_CLASS, frame).await
+    fn send(&mut self, frame: &WireFrame) -> std::io::Result<()> {
+        self.tx.send(&mut self.half, SESSION_CLASS, frame)
     }
 }
 
@@ -1110,7 +1107,7 @@ pub struct JobWireHost {
     /// keys on (VAL-6), never `transport == "tls"`.
     authenticated: bool,
     verify_permille: u32,
-    tls: Option<tokio_rustls::TlsAcceptor>,
+    tls: Option<Arc<rustls::ServerConfig>>,
     /// `false` when the posture disabled the listener entirely.
     listening: bool,
     /// Resolved idle bound for an enrolled session.
@@ -1125,30 +1122,34 @@ pub struct JobWireHost {
     sessions: parking_lot::Mutex<HashMap<u64, Arc<Session>>>,
     shards: parking_lot::Mutex<HashMap<String, Arc<ShardState>>>,
     quarantine: parking_lot::Mutex<BTreeSet<DestTuple>>,
-    /// WERO fence, held first-enrollment → last-departure. The tokio
+    /// WERO fence, held first-enrollment → last-departure. The async
     /// mutex serializes acquire/release transitions.
-    fence: tokio::sync::Mutex<Option<WeroHold>>,
+    fence: SqzMutex<Option<WeroHold>>,
     /// Guarantee class: true = `pr` (WERO held on EVERY configured data
     /// namespace).
     pr_mode: AtomicBool,
     shutdown: AtomicBool,
-    /// Task registry: the accept/dispatcher/sweeper cores plus one entry
-    /// per live connection. **Self-draining** (the 2026-08-04 quiet-host
-    /// law): a serve task's own completion removes its entry
+    /// Thread registry: the accept/dispatcher/sweeper cores plus one
+    /// entry per live connection. **Self-draining** (the 2026-08-04
+    /// quiet-host law): a serve thread's own completion removes its entry
     /// ([`HandleReaper`]), so finished handles are released the moment
-    /// their task ends — never parked until a later accept happens to
+    /// their thread ends — never parked until a later accept happens to
     /// run a prune (the RES-5 retain-on-accept left a quiet host's last
     /// arrivals retained until shutdown, which is exactly the schedule
     /// the `task check` flake kept losing to).
-    handles: parking_lot::Mutex<HashMap<u64, tokio::task::JoinHandle<()>>>,
+    handles: parking_lot::Mutex<HashMap<u64, std::thread::JoinHandle<()>>>,
+    /// Dup'd per-connection sockets: shutdown's nudge — `shutdown(Both)`
+    /// wakes a serve thread parked in a socket read (threads cannot be
+    /// aborted). Same id space and reaper as `handles`.
+    conn_socks: parking_lot::Mutex<HashMap<u64, std::net::TcpStream>>,
     next_handle_id: AtomicU64,
 }
 
-/// Removes one serve task's registry entry when the task ENDS — on
-/// every exit: normal return, panic unwind, or the shutdown abort
-/// (where [`JobWireHost::shutdown`] already took the map, making the
-/// remove a no-op). Held as the serve task's first local, so the drop
-/// runs unconditionally. This is what makes
+/// Removes one serve thread's registry entries when the thread ENDS — on
+/// every exit: normal return, panic unwind, or the shutdown nudge (where
+/// [`JobWireHost::shutdown`] already took the maps, making the removes
+/// no-ops). Held as the serve thread's first local, so the drop runs
+/// unconditionally. This is what makes
 /// [`JobWireHost::retained_task_handles`] converge on a quiet host: the
 /// completion itself is the prune trigger.
 struct HandleReaper {
@@ -1159,6 +1160,7 @@ struct HandleReaper {
 impl Drop for HandleReaper {
     fn drop(&mut self) {
         self.host.handles.lock().remove(&self.id);
+        self.host.conn_socks.lock().remove(&self.id);
     }
 }
 
@@ -1228,7 +1230,11 @@ impl JobWireHost {
         };
 
         let (listener, endpoint) = if cfg.enabled {
-            let l = tokio::net::TcpListener::bind(cfg.bind_addr).await?;
+            let l = std::net::TcpListener::bind(cfg.bind_addr)?;
+            // Non-blocking + the accept poll tick is how the accept
+            // thread observes the shutdown latch (threads cannot be
+            // aborted; keep it simple and loud).
+            l.set_nonblocking(true)?;
             let ep = l.local_addr()?;
             (Some(l), ep)
         } else {
@@ -1311,20 +1317,48 @@ impl JobWireHost {
             sessions: parking_lot::Mutex::new(HashMap::new()),
             shards: parking_lot::Mutex::new(HashMap::new()),
             quarantine: parking_lot::Mutex::new(BTreeSet::new()),
-            fence: tokio::sync::Mutex::new(None),
+            fence: SqzMutex::new(None),
             pr_mode: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             handles: parking_lot::Mutex::new(HashMap::new()),
+            conn_socks: parking_lot::Mutex::new(HashMap::new()),
             next_handle_id: AtomicU64::new(0),
             cfg,
         });
 
+        // The core loops run on named OS threads (pidstat/perf
+        // attribution — the fuse3-tpcN lesson). The dispatcher and
+        // sweeper bodies stay async (fabric/meta awaits) and are driven
+        // by the first-party block_on on their own threads.
+        let spawn_core =
+            |name: &str, f: Box<dyn FnOnce() + Send>| -> Result<std::thread::JoinHandle<()>> {
+                std::thread::Builder::new()
+                    .name(name.to_string())
+                    .spawn(f)
+                    .map_err(|e| {
+                        SqueezefsError::InvalidOperation(format!(
+                            "job wire: {name} thread refused: {e}"
+                        ))
+                    })
+            };
         let mut core = Vec::with_capacity(3);
         if let Some(listener) = listener {
-            core.push(tokio::spawn(Self::accept_loop(Arc::clone(&host), listener)));
+            let h = Arc::clone(&host);
+            core.push(spawn_core(
+                "sqz-jw-accept",
+                Box::new(move || h.accept_loop(listener)),
+            )?);
         }
-        core.push(tokio::spawn(Self::dispatcher_loop(Arc::clone(&host))));
-        core.push(tokio::spawn(Self::sweeper_loop(Arc::clone(&host))));
+        let h = Arc::clone(&host);
+        core.push(spawn_core(
+            "sqz-jw-dispatch",
+            Box::new(move || sqz_blocking::block_on(h.dispatcher_loop())),
+        )?);
+        let h = Arc::clone(&host);
+        core.push(spawn_core(
+            "sqz-jw-sweep",
+            Box::new(move || sqz_blocking::block_on(h.sweeper_loop())),
+        )?);
         {
             let mut handles = host.handles.lock();
             for h in core {
@@ -1420,39 +1454,54 @@ impl JobWireHost {
         self.quarantine.lock().iter().cloned().collect()
     }
 
-    /// Stop the wire: abort every task, drop every session (closing the
-    /// worker connections — their `run()` futures resolve on the EOF),
-    /// and release the WERO fence.
+    /// Stop the wire: latch the shutdown flag, nudge every live
+    /// connection's socket (threads cannot be aborted — `shutdown(Both)`
+    /// wakes any parked read; the accept/dispatcher/sweeper cores exit on
+    /// their poll ticks), join the threads, drop every session, and
+    /// release the WERO fence.
     pub async fn shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
-        // Take the whole map FIRST: every aborted serve task's reaper
-        // then removes against the fresh (empty) map — a no-op — while
-        // this loop owns joining the taken handles.
-        let handles = std::mem::take(&mut *self.handles.lock());
-        for h in handles.into_values() {
-            h.abort();
-            let _ = h.await;
+        // Take both maps FIRST: every woken serve thread's reaper then
+        // removes against the fresh (empty) maps — a no-op — while this
+        // call owns nudging the sockets and joining the taken handles.
+        let socks = std::mem::take(&mut *self.conn_socks.lock());
+        for sock in socks.into_values() {
+            let _ = sock.shutdown(Shutdown::Both);
         }
-        // Aborting a serve_conn task drops only its READ half; the
-        // session map still owns the write half, which keeps the TCP
-        // connection open and a remote worker's read loop parked. Drop
-        // the sessions so workers observe EOF.
+        let handles = std::mem::take(&mut *self.handles.lock());
+        // Joining OS threads blocks; hop through the blocking pool so an
+        // async caller's executor thread is never parked on it.
+        sqz_blocking::run_blocking(move || {
+            for h in handles.into_values() {
+                let _ = h.join();
+            }
+        })
+        .await;
+        // The socket nudge killed both halves at the transport; drop the
+        // session map's write halves too so nothing retains the fds and
+        // remote workers observe EOF.
         self.sessions.lock().clear();
         self.release_fence().await;
     }
 
     // -- transport plumbing --------------------------------------------------
 
-    async fn accept_loop(self: Arc<Self>, listener: tokio::net::TcpListener) {
+    fn accept_loop(self: Arc<Self>, listener: std::net::TcpListener) {
         let mut backoff: Option<Duration> = None;
         loop {
             if self.shutdown.load(Ordering::SeqCst) {
                 return;
             }
-            let (tcp, peer) = match listener.accept().await {
+            let (tcp, peer) = match listener.accept() {
                 Ok(x) => {
                     backoff = None;
                     x
+                }
+                Err(e) if cluster_wire::io_timed_out(&e) => {
+                    // Non-blocking listener: the poll tick is the
+                    // shutdown-latch observation cadence.
+                    std::thread::sleep(cluster_wire::ACCEPT_POLL_TICK);
+                    continue;
                 }
                 Err(e) => {
                     // VAL-6: the old arm `continue`d, so a persistent
@@ -1462,14 +1511,14 @@ impl JobWireHost {
                     backoff = Some(d);
                     self.accept_backoffs.fetch_add(1, Ordering::SeqCst);
                     log::warn!("job wire: accept failed: {e} — backing off {d:?}");
-                    tokio::time::sleep(d).await;
+                    std::thread::sleep(d);
                     continue;
                 }
             };
 
             // The concurrent-connection cap (VAL-6). Claim the slot
             // BEFORE spawning anything: over-cap peers cost one accept
-            // and one close, never a task or a buffer.
+            // and one close, never a thread or a buffer.
             let permit = match self.conns.try_admit() {
                 Some(p) => p,
                 None => {
@@ -1483,53 +1532,70 @@ impl JobWireHost {
                     continue;
                 }
             };
+            if let Err(e) = tcp.set_nonblocking(false) {
+                log::warn!("job wire: dropping {peer} — set_nonblocking(false) failed: {e}");
+                continue;
+            }
 
             let host = Arc::clone(&self);
             let handshake = self.cfg.handshake_timeout;
             // Self-draining registry (RES-5 + the 2026-08-04 quiet-host
-            // law): the serve task's own completion removes its entry,
+            // law): the serve thread's own completion removes its entry,
             // so `retained_task_handles` converges without a further
-            // accept. The lock is held across spawn+insert — no `.await`
-            // inside — so the reaper's remove can never run before the
-            // insert it undoes.
+            // accept. The lock is held across spawn+insert, so the
+            // reaper's remove can never run before the insert it undoes.
             let id = self.next_handle_id.fetch_add(1, Ordering::Relaxed);
+            if let Ok(nudge) = tcp.try_clone() {
+                self.conn_socks.lock().insert(id, nudge);
+            }
             let mut handles = self.handles.lock();
-            let h = tokio::spawn(async move {
-                let _reaper = HandleReaper {
-                    host: Arc::clone(&host),
-                    id,
-                };
-                let _permit = permit;
-                // The handshake itself is attacker-paced: bound it. The
-                // TLS **exporter** output is captured here and mixed into
-                // the session key, so an mTLS session's per-frame MAC is
-                // channel-bound (a key cannot be lifted onto another
-                // connection).
-                let (stream, binding): (ClusterStream, Option<[u8; 32]>) = match host.tls.clone() {
-                    Some(acceptor) => {
-                        match tokio::time::timeout(handshake, acceptor.accept(tcp)).await {
-                            Ok(Ok(s)) => {
-                                let binding = cluster_wire::server_exporter(s.get_ref().1);
-                                (Box::new(s), binding)
-                            }
-                            Ok(Err(e)) => {
-                                log::warn!("job wire: TLS handshake with {peer} failed: {e}");
-                                return;
-                            }
-                            Err(_) => {
-                                log::warn!(
-                                    "job wire: TLS handshake with {peer} exceeded {handshake:?} — \
-                                 dropped"
-                                );
-                                return;
-                            }
-                        }
+            let spawned = std::thread::Builder::new()
+                .name("sqz-jw-conn".to_string())
+                .spawn(move || {
+                    let _reaper = HandleReaper {
+                        host: Arc::clone(&host),
+                        id,
+                    };
+                    let _permit = permit;
+                    // The handshake itself is attacker-paced: bound every
+                    // pre-enrollment syscall at the socket. The TLS
+                    // **exporter** output is captured here and mixed into
+                    // the session key, so an mTLS session's per-frame MAC
+                    // is channel-bound (a key cannot be lifted onto
+                    // another connection).
+                    if tcp.set_read_timeout(Some(handshake)).is_err()
+                        || tcp.set_write_timeout(Some(handshake)).is_err()
+                    {
+                        log::warn!("job wire: {peer}: socket timeout setup failed — dropped");
+                        return;
                     }
-                    None => (Box::new(tcp), None),
-                };
-                host.serve_conn(stream, peer, binding).await;
-            });
-            handles.insert(id, h);
+                    let (stream, binding): (ClusterStream, Option<[u8; 32]>) =
+                        match host.tls.clone() {
+                            Some(cfg) => match cluster_wire::tls_server_handshake(cfg, tcp) {
+                                Ok(s) => {
+                                    let binding = cluster_wire::server_exporter(&s.conn);
+                                    (ClusterStream::tls_server(s), binding)
+                                }
+                                Err(e) => {
+                                    log::warn!("job wire: TLS handshake with {peer} failed: {e}");
+                                    return;
+                                }
+                            },
+                            None => (ClusterStream::tcp(tcp), None),
+                        };
+                    // The session body stays async (fabric/meta awaits);
+                    // this connection's own thread drives it.
+                    sqz_blocking::block_on(host.serve_conn(stream, peer, binding));
+                });
+            match spawned {
+                Ok(h) => {
+                    handles.insert(id, h);
+                }
+                Err(e) => {
+                    self.conn_socks.lock().remove(&id);
+                    log::warn!("job wire: dropping {peer} — serve thread refused: {e}");
+                }
+            }
             drop(handles);
         }
     }
@@ -1557,35 +1623,26 @@ impl JobWireHost {
             server_nonce: issued.server_nonce.clone(),
             freshness_ms: issued.freshness_ms,
         };
-        match tokio::time::timeout(deadline, write_frame(&mut stream, &challenge)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                log::warn!("job wire: {peer}: challenge write failed: {e}");
-                return;
-            }
-            Err(_) => {
-                log::warn!("job wire: {peer}: challenge write stalled past {deadline:?}");
-                return;
-            }
+        // The socket read/write timeouts were set to the handshake
+        // deadline before the TLS handshake; the challenge write and the
+        // hello read below ride the same bound.
+        if let Err(e) = write_frame(&mut stream, &challenge) {
+            log::warn!("job wire: {peer}: challenge write failed: {e}");
+            return;
         }
 
-        let hello = match tokio::time::timeout(
-            deadline,
-            read_frame_limited(&mut stream, MAX_HELLO_FRAME_BYTES, Some(deadline)),
-        )
-        .await
-        {
-            Ok(Ok(Some(f))) => f,
-            Ok(Ok(None)) => return,
-            Ok(Err(e)) => {
+        let hello = match read_frame_limited(&mut stream, MAX_HELLO_FRAME_BYTES, Some(deadline)) {
+            Ok(Some(f)) => f,
+            Ok(None) => return,
+            Err(e) if cluster_wire::io_timed_out(&e) => {
+                log::warn!("job wire: {peer}: no hello within {deadline:?} — dropped");
+                return;
+            }
+            Err(e) => {
                 log::warn!("job wire: {peer}: undecodable hello: {e}");
                 METRICS
                     .job_remote_enroll_refused
                     .fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-            Err(_) => {
-                log::warn!("job wire: {peer}: no hello within {deadline:?} — dropped");
                 return;
             }
         };
@@ -1606,8 +1663,7 @@ impl JobWireHost {
                 &WireFrame::EnrollRefused {
                     reason: "expected Enroll".into(),
                 },
-            )
-            .await;
+            );
             return;
         };
         // ONE ladder, cluster_wire's: schema, then the identity bound,
@@ -1636,7 +1692,7 @@ impl JobWireHost {
                     "job wire: {peer}: worker {worker_id} refused: {reason} \
                      (job_remote_enroll_refused)"
                 );
-                let _ = write_frame(&mut stream, &WireFrame::EnrollRefused { reason }).await;
+                let _ = write_frame(&mut stream, &WireFrame::EnrollRefused { reason });
                 return;
             }
         };
@@ -1655,23 +1711,37 @@ impl JobWireHost {
                 heartbeat_ms: self.cfg.heartbeat_interval.as_millis() as u64,
                 lease_ttl_ms: self.cfg.lease_ttl.as_millis() as u64,
             },
-        )
-        .await
-        {
+        ) {
             log::warn!("job wire: {peer}: EnrollOk write failed: {e}");
             self.on_worker_departed(None).await;
             return;
         }
 
+        // Session posture: the idle bound rides the socket read timeout
+        // (the prefix wait), writes are bounded by the body deadline.
+        let _ = stream.set_read_timeout(Some(self.session_idle));
+        let _ = stream.set_write_timeout(Some(self.cfg.frame_body_timeout));
+
         // EnrollOk was the last UNAUTHENTICATED frame on this
         // connection: from here both directions carry the session MAC.
-        let (mut rd, wr) = tokio::io::split(stream);
+        let (mut rd, wr) = match stream.split() {
+            Ok(halves) => halves,
+            Err(e) => {
+                log::warn!("job wire: {peer}: session split failed: {e}");
+                self.on_worker_departed(None).await;
+                return;
+            }
+        };
+        // Re-assert the idle bound on the READ half: a split TLS reader
+        // enforces its bound across mutex-sliced polls, not at the
+        // socket.
+        let _ = rd.set_read_timeout(Some(self.session_idle));
         let (tx, mut rx) = session_framers(&key, cluster_wire::Role::Coordinator);
         let session = Arc::new(Session {
             id: self.next_session.fetch_add(1, Ordering::SeqCst),
             worker_id: worker_id.clone(),
             pr_key,
-            writer: Arc::new(tokio::sync::Mutex::new(AuthedWriter { half: wr, tx })),
+            writer: Arc::new(parking_lot::Mutex::new(AuthedWriter { half: wr, tx })),
             busy: AtomicBool::new(false),
             expired: AtomicBool::new(false),
         });
@@ -1699,23 +1769,17 @@ impl JobWireHost {
         // shard result is custody-bearing, so an unauthenticated frame in
         // this position ends the session rather than being interpreted.
         loop {
-            let frame = match tokio::time::timeout(
-                self.session_idle,
-                rx.recv::<_, WireFrame>(
-                    &mut rd,
-                    MAX_FRAME_BYTES,
-                    Some(self.cfg.frame_body_timeout),
-                ),
-            )
-            .await
-            {
-                Ok(Ok(Some(f))) => f,
-                Ok(Ok(None)) => break,
-                Ok(Err(e)) => {
-                    log::warn!("job wire: session {} read error: {e}", session.id);
-                    break;
-                }
-                Err(_) => {
+            if self.shutdown.load(Ordering::SeqCst) {
+                break;
+            }
+            let frame = match rx.recv::<_, WireFrame>(
+                &mut rd,
+                MAX_FRAME_BYTES,
+                Some(self.cfg.frame_body_timeout),
+            ) {
+                Ok(Some(f)) => f,
+                Ok(None) => break,
+                Err(e) if cluster_wire::io_timed_out(&e) => {
                     log::warn!(
                         "job wire: session {} sent no frame within {:?} (heartbeat cadence \
                          {:?}) — closing the idle session",
@@ -1725,15 +1789,18 @@ impl JobWireHost {
                     );
                     break;
                 }
+                Err(e) => {
+                    log::warn!("job wire: session {} read error: {e}", session.id);
+                    break;
+                }
             };
             match frame {
                 WireFrame::Heartbeat { .. } => {
                     self.renew_lease(&session);
-                    let mut w = session.writer.lock().await;
+                    let mut w = session.writer.lock();
                     if w.send(&WireFrame::HeartbeatAck {
                         lease_ttl_ms: self.cfg.lease_ttl.as_millis() as u64,
                     })
-                    .await
                     .is_err()
                     {
                         break;
@@ -1755,6 +1822,15 @@ impl JobWireHost {
                     );
                 }
             }
+        }
+
+        // Shutdown short-circuit (the abort analog): a session woken by
+        // the teardown nudge must not run the departure ceremony —
+        // shutdown owns the fence release, and an expire/requeue against
+        // a stopping fabric would park the join on metadata commits.
+        if self.shutdown.load(Ordering::SeqCst) {
+            self.sessions.lock().remove(&session.id);
+            return;
         }
 
         // Departure: a session holding an unexpired shard is treated as
@@ -1799,10 +1875,12 @@ impl JobWireHost {
             return;
         }
         let paths = self.cfg.data_device_paths.clone();
-        let acquired =
-            tokio::task::spawn_blocking(move || crate::data_custody::acquire_wero(&paths)).await;
+        // Direct call: this runs on a wire-owned OS thread (conn/serve),
+        // so the blocking ioctl fan-out no longer needs a spawn_blocking
+        // hop (its JoinError arm is dead and deleted with it).
+        let acquired = crate::data_custody::acquire_wero(&paths);
         match acquired {
-            Ok(Some(f)) => {
+            Some(f) => {
                 log::info!(
                     "job wire: WERO (rtype 2) held on the data namespaces (key {:#x}) — \
                      guarantee class pr (expired worker hosts will be PR-preempted). The \
@@ -1815,16 +1893,13 @@ impl JobWireHost {
                 self.pr_mode.store(true, Ordering::SeqCst);
                 METRICS.job_remote_fence_mode.store(1, Ordering::Relaxed);
             }
-            Ok(None) => {
+            None => {
                 log::warn!(
                     "job wire: data namespaces are not (all) PR-capable — guarantee class \
                      deferred-reclaim: quarantine reclaim defers to job end; the \
                      unbounded-pause zombie window is the documented residual class \
                      (design-volume-lifecycle §5.1.6 rung 3)"
                 );
-            }
-            Err(e) => {
-                log::warn!("job wire: WERO acquire task failed: {e} — deferred-reclaim");
             }
         }
     }
@@ -1866,16 +1941,15 @@ impl JobWireHost {
                 return;
             }
             let Some(session) = self.pick_idle_session() else {
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                sqz_time::sleep(Duration::from_millis(25)).await;
                 continue;
             };
             // `true`: the wire claims only wire-executable job types —
             // the VL4 movers stay on the local pool (their per-ino meta
             // publish is coordinator-local; see `JobType::wire_executable`).
             let Some((job_id, ctl)) = self.fabric.claim_next(true) else {
-                let _ =
-                    tokio::time::timeout(Duration::from_millis(250), self.fabric.work_notified())
-                        .await;
+                let _ = sqz_time::timeout(Duration::from_millis(250), self.fabric.work_notified())
+                    .await;
                 continue;
             };
             if let Err(e) = self.assign(&job_id, &ctl, &session).await {
@@ -1941,7 +2015,7 @@ impl JobWireHost {
         *shard.holder.lock() = Some(ShardHolder {
             session_id: session.id,
             worker_id: session.worker_id.clone(),
-            lease_expiry: tokio::time::Instant::now() + self.cfg.lease_ttl,
+            lease_expiry: Instant::now() + self.cfg.lease_ttl,
         });
         let fencing = shard.fencing.load(Ordering::SeqCst);
 
@@ -1961,9 +2035,8 @@ impl JobWireHost {
             throttle_pct: ctl.throttle.load(Ordering::Relaxed),
             lease_ttl_ms: self.cfg.lease_ttl.as_millis() as u64,
         };
-        let mut w = session.writer.lock().await;
+        let mut w = session.writer.lock();
         w.send(&WireFrame::ShardAssign { shard: descriptor })
-            .await
             .map_err(SqueezefsError::from)
     }
 
@@ -1980,7 +2053,7 @@ impl JobWireHost {
             let mut holder = shard.holder.lock();
             if let Some(h) = holder.as_mut() {
                 if h.session_id == session.id {
-                    h.lease_expiry = tokio::time::Instant::now() + self.cfg.lease_ttl;
+                    h.lease_expiry = Instant::now() + self.cfg.lease_ttl;
                 }
             }
         }
@@ -1994,8 +2067,18 @@ impl JobWireHost {
             if self.shutdown.load(Ordering::SeqCst) {
                 return;
             }
-            tokio::time::sleep(tick).await;
-            let now = tokio::time::Instant::now();
+            // Tick in bounded slices so a long lease TTL never parks the
+            // sweeper past the shutdown latch.
+            let mut remaining = tick;
+            while remaining > Duration::ZERO {
+                if self.shutdown.load(Ordering::SeqCst) {
+                    return;
+                }
+                let slice = remaining.min(Duration::from_millis(250));
+                sqz_time::sleep(slice).await;
+                remaining = remaining.saturating_sub(slice);
+            }
+            let now = Instant::now();
             let expired: Vec<Arc<ShardState>> = {
                 let shards = self.shards.lock();
                 shards
@@ -2098,9 +2181,11 @@ impl JobWireHost {
                 fence.clone()
             };
             if let Some(hold) = hold {
-                let preempted = tokio::task::spawn_blocking(move || hold.preempt(victim))
-                    .await
-                    .unwrap_or(0);
+                // Direct call: expire_shard runs on a wire-owned OS
+                // thread (sweeper/conn), so the blocking ioctl fan-out
+                // needs no spawn_blocking hop (its JoinError fallback arm
+                // is dead and deleted with it).
+                let preempted = hold.preempt(victim);
                 if preempted > 0 {
                     METRICS
                         .job_remote_pr_preempts
@@ -2149,8 +2234,7 @@ impl JobWireHost {
                 &job_id,
                 shard_no,
                 "unknown shard (reclaimed or never assigned)".into(),
-            )
-            .await;
+            );
             return;
         };
         let current = shard.fencing.load(Ordering::SeqCst);
@@ -2169,8 +2253,7 @@ impl JobWireHost {
                 &job_id,
                 shard_no,
                 format!("stale shard_fencing {shard_fencing} (current {current})"),
-            )
-            .await;
+            );
             return;
         }
 
@@ -2191,14 +2274,13 @@ impl JobWireHost {
                     &job_id,
                     shard_no,
                     format!("verification failed: {e}"),
-                )
-                .await;
+                );
                 // A failed proposal is treated like an expired lease:
                 // never publish, never reuse those destinations.
                 *shard.holder.lock() = Some(ShardHolder {
                     session_id: session.id,
                     worker_id: session.worker_id.clone(),
-                    lease_expiry: tokio::time::Instant::now(),
+                    lease_expiry: Instant::now(),
                 });
                 self.expire_shard(&shard, "verification failed").await;
                 return;
@@ -2221,13 +2303,11 @@ impl JobWireHost {
         self.persist_shard_record(&shard, "completed").await;
         self.fabric.remote_complete(&job_id, &shard.ctl).await;
 
-        let mut w = session.writer.lock().await;
-        let _ = w
-            .send(&WireFrame::ResultAck {
-                job_id: job_id.clone(),
-                shard: shard_no,
-            })
-            .await;
+        let mut w = session.writer.lock();
+        let _ = w.send(&WireFrame::ResultAck {
+            job_id: job_id.clone(),
+            shard: shard_no,
+        });
     }
 
     /// Verify-read `dests` against the submitted checksums. Plaintext ⇒
@@ -2297,15 +2377,13 @@ impl JobWireHost {
 
 /// Send one ResultRefused reply (best-effort — a vanished session's
 /// refusal has nowhere to land, which is fine: fencing already holds).
-async fn refuse_submit(session: &Arc<Session>, job_id: &str, shard: u32, reason: String) {
-    let mut w = session.writer.lock().await;
-    let _ = w
-        .send(&WireFrame::ResultRefused {
-            job_id: job_id.to_string(),
-            shard,
-            reason,
-        })
-        .await;
+fn refuse_submit(session: &Arc<Session>, job_id: &str, shard: u32, reason: String) {
+    let mut w = session.writer.lock();
+    let _ = w.send(&WireFrame::ResultRefused {
+        job_id: job_id.to_string(),
+        shard,
+        reason,
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -2378,44 +2456,53 @@ impl std::fmt::Debug for JobWireWorker {
 impl JobWireWorker {
     /// Dial, enroll (HMAC over the storage-membership secret), and
     /// return the enrolled worker. Refusals surface loud with the
-    /// coordinator's reason.
+    /// coordinator's reason. Async API preserved; the socket work runs on
+    /// the blocking pool.
     pub async fn connect(endpoint: &str, secret: &[u8], opts: WorkerOptions) -> Result<Self> {
-        let tcp = tokio::net::TcpStream::connect(endpoint).await?;
+        let endpoint = endpoint.to_string();
+        let secret = secret.to_vec();
+        sqz_blocking::run_blocking(move || Self::connect_sync(&endpoint, &secret, opts)).await
+    }
+
+    fn connect_sync(endpoint: &str, secret: &[u8], opts: WorkerOptions) -> Result<Self> {
+        let tcp = cluster_wire::dial_tcp(endpoint, ENROLL_DIAL_TIMEOUT)?;
+        // The whole enrollment exchange is bounded per syscall at the
+        // socket (the tokio::time::timeout wrappers this replaces bounded
+        // the same exchanges).
+        tcp.set_read_timeout(Some(ENROLL_DIAL_TIMEOUT))?;
+        tcp.set_write_timeout(Some(ENROLL_DIAL_TIMEOUT))?;
         // S3: a CA-less TLS config REFUSES here (`tls_connector`) instead
         // of warning and presenting the storage secret's proof into a pipe
         // whose far end was never validated.
         let (mut stream, binding): (ClusterStream, Option<[u8; 32]>) = match opts.security.as_ref()
         {
             Some(sec) => {
-                let connector = cluster_wire::tls_connector(sec)?;
                 // The ClusterSecurityConfig node certs carry
                 // localhost/127.0.0.1 SANs (cluster_tls.rs construction).
-                let name = rustls::pki_types::ServerName::try_from("localhost")
-                    .expect("literal server name")
-                    .to_owned();
-                let tls = connector.connect(name, tcp).await?;
-                let binding = cluster_wire::client_exporter(tls.get_ref().1);
-                (Box::new(tls), binding)
+                let tls =
+                    cluster_wire::tls_client_handshake(cluster_wire::tls_connector(sec)?, tcp)?;
+                let binding = cluster_wire::client_exporter(&tls.conn);
+                (ClusterStream::tls_client(tls), binding)
             }
-            None => (Box::new(tcp), None),
+            None => (ClusterStream::tcp(tcp), None),
         };
         // The coordinator speaks first: its challenge nonce is what the
         // proof is bound to. Bounded read at the hello class — a hostile
         // "coordinator" gets no allocation authority either.
-        let server_nonce = match tokio::time::timeout(
-            ENROLL_DIAL_TIMEOUT,
-            read_frame_limited(
-                &mut stream,
-                MAX_HELLO_FRAME_BYTES,
-                Some(ENROLL_DIAL_TIMEOUT),
-            ),
+        let server_nonce = match read_frame_limited(
+            &mut stream,
+            MAX_HELLO_FRAME_BYTES,
+            Some(ENROLL_DIAL_TIMEOUT),
         )
-        .await
-        .map_err(|_| {
-            SqueezefsError::InvalidOperation(format!(
-                "no enrollment challenge from the coordinator within {ENROLL_DIAL_TIMEOUT:?}"
-            ))
-        })?? {
+        .map_err(|e| {
+            if cluster_wire::io_timed_out(&e) {
+                SqueezefsError::InvalidOperation(format!(
+                    "no enrollment challenge from the coordinator within {ENROLL_DIAL_TIMEOUT:?}"
+                ))
+            } else {
+                SqueezefsError::from(e)
+            }
+        })? {
             Some(WireFrame::Challenge {
                 wire_schema,
                 server_nonce,
@@ -2446,15 +2533,12 @@ impl JobWireWorker {
                 hmac: enroll_hmac(secret, &opts.worker_id, &server_nonce, &nonce),
                 pr_key: opts.pr_key,
             },
-        )
-        .await?;
+        )?;
         match read_frame_limited(
             &mut stream,
             MAX_HELLO_FRAME_BYTES,
             Some(ENROLL_DIAL_TIMEOUT),
-        )
-        .await?
-        {
+        )? {
             Some(WireFrame::EnrollOk {
                 wire_schema: _,
                 heartbeat_ms,
@@ -2497,46 +2581,56 @@ impl JobWireWorker {
             heartbeat,
             key,
         } = self;
-        let (mut rd, wr) = tokio::io::split(stream);
+        // The enrollment dial installed a 10 s socket read timeout; an
+        // enrolled worker legitimately waits UNBOUNDED between frames
+        // (assignments arrive on job cadence), so clear it — teardown is
+        // the nudge below, and the coordinator's EOF still ends the read.
+        stream
+            .set_read_timeout(None)
+            .map_err(SqueezefsError::from)?;
+        // Teardown nudge: `shutdown(Both)` on the dup wakes the read
+        // thread out of its (unbounded) frame wait.
+        let nudge = stream.nudge_handle().ok();
+        let (mut rd, wr) = stream.split().map_err(SqueezefsError::from)?;
         // Both directions authenticated from here (the peer half of the
         // coordinator's framers).
         let (tx, mut rx) = session_framers(&key, cluster_wire::Role::Peer);
-        let writer = Arc::new(tokio::sync::Mutex::new(AuthedWriter { half: wr, tx }));
+        let writer = Arc::new(parking_lot::Mutex::new(AuthedWriter { half: wr, tx }));
 
-        let (assign_tx, mut assign_rx) = tokio::sync::mpsc::channel::<ShardDescriptor>(4);
+        let (assign_tx, mut assign_rx) = sqz_channel::mpsc::channel::<ShardDescriptor>(4);
         let (resp_tx, mut resp_rx) =
-            tokio::sync::mpsc::channel::<std::result::Result<(), String>>(4);
+            sqz_channel::mpsc::channel::<std::result::Result<(), String>>(4);
         // The worker-side lease clock: latest deadline estimate,
         // extended by every HeartbeatAck.
-        let (lease_tx, lease_rx) = tokio::sync::watch::channel(tokio::time::Instant::now());
+        let (lease_tx, lease_rx) = sqz_channel::watch::channel(Instant::now());
 
-        // Read loop: route inbound frames. Abort-on-drop guards tie the
-        // spawned halves to THIS future's lifetime (no leaked tasks —
-        // and an aborted `run()` drops both stream halves, so the
-        // coordinator observes the departure EOF).
-        let read_task = AbortOnDrop(tokio::spawn(async move {
-            loop {
-                match rx
-                    .recv::<_, WireFrame>(&mut rd, MAX_FRAME_BYTES, None)
-                    .await
-                {
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // Read loop: route inbound frames, on its own named OS thread
+        // (the frame reads are blocking socket I/O). The teardown guard
+        // ties it to THIS future's completion: the stop latch plus the
+        // socket nudge replace the old JoinHandle::abort, and both stream
+        // halves drop with the threads, so the coordinator observes the
+        // departure EOF.
+        let read_thread = std::thread::Builder::new()
+            .name("sqz-jw-rd".to_string())
+            .spawn(move || loop {
+                match rx.recv::<_, WireFrame>(&mut rd, MAX_FRAME_BYTES, None) {
                     Ok(Some(WireFrame::ShardAssign { shard })) => {
-                        if assign_tx.send(shard).await.is_err() {
+                        if sqz_blocking::block_on(assign_tx.send(shard)).is_err() {
                             return;
                         }
                     }
                     Ok(Some(WireFrame::HeartbeatAck { lease_ttl_ms })) => {
-                        let _ = lease_tx.send(
-                            tokio::time::Instant::now() + Duration::from_millis(lease_ttl_ms),
-                        );
+                        lease_tx.send(Instant::now() + Duration::from_millis(lease_ttl_ms));
                     }
                     Ok(Some(WireFrame::ResultAck { .. })) => {
-                        if resp_tx.send(Ok(())).await.is_err() {
+                        if sqz_blocking::block_on(resp_tx.send(Ok(()))).is_err() {
                             return;
                         }
                     }
                     Ok(Some(WireFrame::ResultRefused { reason, .. })) => {
-                        if resp_tx.send(Err(reason)).await.is_err() {
+                        if sqz_blocking::block_on(resp_tx.send(Err(reason))).is_err() {
                             return;
                         }
                     }
@@ -2545,38 +2639,57 @@ impl JobWireWorker {
                     }
                     Ok(None) | Err(_) => return,
                 }
-            }
-        }));
+            })
+            .map_err(SqueezefsError::from)?;
 
         // Heartbeat loop (10 s cadence by default; the coordinator's
-        // EnrollOk sets it). The test hook models a partition: no
+        // EnrollOk sets it). Sleeps in bounded slices so the stop latch
+        // is observed promptly. The test hook models a partition: no
         // heartbeats at all.
         let hb_writer = Arc::clone(&writer);
         let hb_opts = opts.clone();
-        let hb_task = AbortOnDrop(tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(heartbeat).await;
+        let hb_stop = Arc::clone(&stop);
+        let hb_thread = std::thread::Builder::new()
+            .name("sqz-jw-hb".to_string())
+            .spawn(move || loop {
+                let mut waited = Duration::ZERO;
+                while waited < heartbeat {
+                    if hb_stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let slice = (heartbeat - waited).min(Duration::from_millis(100));
+                    std::thread::sleep(slice);
+                    waited += slice;
+                }
+                if hb_stop.load(Ordering::SeqCst) {
+                    return;
+                }
                 if !hb_opts.heartbeats.load(Ordering::SeqCst) {
                     continue;
                 }
-                let mut w = hb_writer.lock().await;
+                let mut w = hb_writer.lock();
                 if w.send(&WireFrame::Heartbeat {
                     worker_id: hb_opts.worker_id.clone(),
                 })
-                .await
                 .is_err()
                 {
                     return;
                 }
-            }
-        }));
+            })
+            .map_err(SqueezefsError::from)?;
+
+        let teardown = WorkerTeardown {
+            stop,
+            nudge,
+            threads: vec![read_thread, hb_thread],
+        };
 
         let mut report = WorkerReport::default();
         'shards: while let Some(shard) = assign_rx.recv().await {
             let ttl = Duration::from_millis(shard.lease_ttl_ms.max(1));
             // Local lease clock (rung 1): the assignment starts a full
             // TTL; HeartbeatAcks extend the watch.
-            let assigned_deadline = tokio::time::Instant::now() + ttl;
+            let assigned_deadline = Instant::now() + ttl;
 
             let mut lease_rx = lease_rx.clone();
             let mut aborted = false;
@@ -2643,12 +2756,12 @@ impl JobWireWorker {
                             }
                             let batch = remaining.min(REVALIDATE_BATCH as u64);
                             for _ in 0..batch {
-                                let start = tokio::time::Instant::now();
-                                tokio::time::sleep(Duration::from_millis(*task_ms)).await;
+                                let start = Instant::now();
+                                sqz_time::sleep(Duration::from_millis(*task_ms)).await;
                                 if let Some(delay) =
                                     job_throttle_sleep(start.elapsed(), shard.throttle_pct)
                                 {
-                                    tokio::time::sleep(delay).await;
+                                    sqz_time::sleep(delay).await;
                                 }
                             }
                             remaining -= batch;
@@ -2691,18 +2804,17 @@ impl JobWireWorker {
             // The pause-before-submit test hook (the zombie window the
             // fencing check exists for).
             while opts.hold_submission.load(Ordering::SeqCst) {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                sqz_time::sleep(Duration::from_millis(20)).await;
             }
 
             {
-                let mut w = writer.lock().await;
+                let mut w = writer.lock();
                 if w.send(&WireFrame::ResultSubmit {
                     job_id: shard.job_id.clone(),
                     shard: shard.shard,
                     shard_fencing: shard.shard_fencing,
                     checksums,
                 })
-                .await
                 .is_err()
                 {
                     break 'shards;
@@ -2722,24 +2834,39 @@ impl JobWireWorker {
             }
         }
 
-        // The guards abort + detach the halves (dropping both stream
-        // halves closes the connection — the coordinator sees the
-        // departure).
-        drop(hb_task);
-        drop(read_task);
+        // Drop the routing channels FIRST (a read thread parked in a
+        // full channel's send must observe the closed receiver, never
+        // the teardown join), then the teardown guard stops, nudges and
+        // joins the threads — dropping both stream halves with them
+        // closes the connection, so the coordinator sees the departure.
+        drop(assign_rx);
+        drop(resp_rx);
+        drop(teardown);
         Ok(report)
     }
 }
 
-/// Ties a spawned task to its owner's lifetime: dropping the guard
-/// aborts the task (no fire-and-forget leaks — AGENTS structured-
-/// concurrency posture; the abort also releases the stream half the
-/// task owns).
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
+/// Ties the worker's spawned threads to `run()`'s lifetime (no
+/// fire-and-forget leaks — AGENTS structured-concurrency posture).
+/// Dropping the guard latches the stop flag, nudges the socket
+/// (`shutdown(Both)` wakes the read thread's parked frame wait — the
+/// `JoinHandle::abort` replacement), and joins both threads, which
+/// releases the stream halves they own.
+struct WorkerTeardown {
+    stop: Arc<AtomicBool>,
+    nudge: Option<std::net::TcpStream>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
 
-impl Drop for AbortOnDrop {
+impl Drop for WorkerTeardown {
     fn drop(&mut self) {
-        self.0.abort();
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(n) = &self.nudge {
+            let _ = n.shutdown(Shutdown::Both);
+        }
+        for h in self.threads.drain(..) {
+            let _ = h.join();
+        }
     }
 }
 
@@ -2748,16 +2875,15 @@ impl Drop for AbortOnDrop {
 /// past half-TTL with heartbeating alive ⇒ one wire round-trip before
 /// proceeding (bounded wait for the ack).
 async fn revalidate_lease(
-    lease_rx: &mut tokio::sync::watch::Receiver<tokio::time::Instant>,
-    assigned_deadline: tokio::time::Instant,
-    writer: &Arc<tokio::sync::Mutex<AuthedWriter>>,
+    lease_rx: &mut sqz_channel::watch::Receiver<Instant>,
+    assigned_deadline: Instant,
+    writer: &Arc<parking_lot::Mutex<AuthedWriter>>,
     opts: &WorkerOptions,
     ttl: Duration,
 ) -> bool {
-    let deadline = |rx: &tokio::sync::watch::Receiver<tokio::time::Instant>| {
-        (*rx.borrow()).max(assigned_deadline)
-    };
-    let now = tokio::time::Instant::now();
+    let deadline =
+        |rx: &sqz_channel::watch::Receiver<Instant>| (*rx.borrow()).max(assigned_deadline);
+    let now = Instant::now();
     let d = deadline(lease_rx);
     if now >= d {
         return false;
@@ -2766,18 +2892,17 @@ async fn revalidate_lease(
         // Wire round-trip: heartbeat now and wait (bounded) for the ack
         // to move the deadline before committing the next batch.
         {
-            let mut w = writer.lock().await;
+            let mut w = writer.lock();
             if w.send(&WireFrame::Heartbeat {
                 worker_id: opts.worker_id.clone(),
             })
-            .await
             .is_err()
             {
                 return false;
             }
         }
-        let _ = tokio::time::timeout(ttl / 4, lease_rx.changed()).await;
-        return tokio::time::Instant::now() < deadline(lease_rx);
+        let _ = sqz_time::timeout(ttl / 4, lease_rx.changed()).await;
+        return Instant::now() < deadline(lease_rx);
     }
     true
 }

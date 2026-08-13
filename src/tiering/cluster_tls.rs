@@ -156,8 +156,10 @@ mod tests {
     //! mTLS contract pins ported from the deleted `tests/mtls_tests.rs`
     //! (which exercised them through the deleted DhtNode/quinn wrap):
     //! the CA-pinned server admits a CA-carrying client and refuses a
-    //! client that presents no certificate. Exercised over tokio-rustls —
-    //! the transport the live consumer (`cluster_wire`) actually uses.
+    //! client that presents no certificate. Exercised over sync
+    //! `rustls::StreamOwned` on `std::net` — the transport the live
+    //! consumer (`cluster_wire`) actually uses since the rip-tokio
+    //! conversion.
     //!
     //! DLM S3 note: the refusal leg used to build its client through this
     //! module with a CA-less config, which is exactly the
@@ -168,7 +170,7 @@ mod tests {
 
     use super::*;
     use rcgen::KeyUsagePurpose;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use std::io::{Read as _, Write as _};
 
     fn generate_test_ca() -> (Vec<u8>, Vec<u8>) {
         let mut ca_params = CertificateParams::default();
@@ -185,41 +187,46 @@ mod tests {
         (ca_cert.der().to_vec(), ca_key_pair.serialize_der())
     }
 
-    async fn spawn_tls_echo_server(
+    fn spawn_tls_echo_server(
         ca: &ClusterCa,
-    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
-        let server_cfg = rustls_server_config(ca).expect("server config");
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        let server_cfg = Arc::new(rustls_server_config(ca).expect("server config"));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("local addr");
-        let handle = tokio::spawn(async move {
-            if let Ok((stream, _)) = listener.accept().await {
-                // A failed handshake (unauthorized client) just drops.
-                if let Ok(mut tls) = acceptor.accept(stream).await {
+        let handle = std::thread::Builder::new()
+            .name("sqz-tls-echo".to_string())
+            .spawn(move || {
+                if let Ok((stream, _)) = listener.accept() {
+                    let conn = match rustls::ServerConnection::new(Arc::clone(&server_cfg)) {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    };
+                    let mut tls = rustls::StreamOwned::new(conn, stream);
+                    // A failed handshake (unauthorized client) just
+                    // errors out of the first read and drops.
                     let mut buf = [0u8; 5];
-                    if tls.read_exact(&mut buf).await.is_ok() {
-                        let _ = tls.write_all(&buf).await;
+                    if tls.read_exact(&mut buf).is_ok() {
+                        let _ = tls.write_all(&buf);
                     }
                 }
-            }
-        });
+            })
+            .expect("echo server thread");
         (addr, handle)
     }
 
-    async fn tls_echo_roundtrip(
+    fn tls_echo_roundtrip(
         addr: std::net::SocketAddr,
         client_cfg: rustls::ClientConfig,
     ) -> std::io::Result<[u8; 5]> {
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
-        let stream = tokio::net::TcpStream::connect(addr).await?;
+        let stream = std::net::TcpStream::connect(addr)?;
         let server_name = rustls::pki_types::ServerName::try_from("localhost")
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-        let mut tls = connector.connect(server_name, stream).await?;
-        tls.write_all(b"hello").await?;
+        let conn = rustls::ClientConnection::new(Arc::new(client_cfg), server_name)
+            .map_err(std::io::Error::other)?;
+        let mut tls = rustls::StreamOwned::new(conn, stream);
+        tls.write_all(b"hello")?;
         let mut buf = [0u8; 5];
-        tls.read_exact(&mut buf).await?;
+        tls.read_exact(&mut buf)?;
         Ok(buf)
     }
 
@@ -237,8 +244,8 @@ mod tests {
             .with_no_client_auth()
     }
 
-    #[tokio::test]
-    async fn mtls_authorized_client_completes_handshake() {
+    #[test]
+    fn mtls_authorized_client_completes_handshake() {
         let (ca_cert, ca_key) = generate_test_ca();
         let ca = ClusterSecurityConfig {
             ca_cert: Some(ca_cert),
@@ -246,16 +253,15 @@ mod tests {
         }
         .ca_pair()
         .expect("a complete pair");
-        let (addr, server) = spawn_tls_echo_server(&ca).await;
+        let (addr, server) = spawn_tls_echo_server(&ca);
         let echoed = tls_echo_roundtrip(addr, rustls_client_config(&ca).expect("client config"))
-            .await
             .expect("CA-carrying client must complete the mTLS handshake");
         assert_eq!(&echoed, b"hello", "echo through the mTLS session");
-        server.await.expect("server task");
+        server.join().expect("server thread");
     }
 
-    #[tokio::test]
-    async fn mtls_unauthorized_client_refused() {
+    #[test]
+    fn mtls_unauthorized_client_refused() {
         let (ca_cert, ca_key) = generate_test_ca();
         let ca = ClusterSecurityConfig {
             ca_cert: Some(ca_cert),
@@ -263,15 +269,16 @@ mod tests {
         }
         .ca_pair()
         .expect("a complete pair");
-        let (addr, server) = spawn_tls_echo_server(&ca).await;
+        let (addr, server) = spawn_tls_echo_server(&ca);
         // No client certificate: the CA-pinned server's WebPki client
         // verifier must refuse it.
-        let result = tls_echo_roundtrip(addr, certless_client(&ca)).await;
+        let result = tls_echo_roundtrip(addr, certless_client(&ca));
         assert!(
             result.is_err(),
             "cert-less client must be refused by the CA-pinned server"
         );
-        server.abort();
+        // The server thread errors out of its handshake read and exits.
+        server.join().expect("server thread");
     }
 
     #[test]

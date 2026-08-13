@@ -7,7 +7,7 @@
 //! shuffled full-coverage access, optional `O_DIRECT`.
 //!
 //! The engine is deliberately decoupled from FUSE: it benchmarks *any*
-//! directory through ordinary POSIX/tokio file I/O — bench is the load
+//! directory through ordinary POSIX (std) file I/O — bench is the load
 //! generator measuring the mounted filesystem through the kernel, exactly
 //! like elbencho. Do **not** route bench I/O through `crate::uring_fs`;
 //! the io_uring mandate governs the filesystem's own data paths, not this
@@ -25,7 +25,7 @@ use rand::seq::SliceRandom;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 /// Directory (directly under the mountpoint) holding the persistent
 /// bench dataset.
@@ -69,7 +69,7 @@ pub enum BenchError {
     Io(#[from] std::io::Error),
     /// A worker task panicked or was cancelled.
     #[error("bench worker failed: {0}")]
-    Join(#[from] tokio::task::JoinError),
+    Join(String),
 }
 
 /// Benchmark phases, in their fixed execution order.
@@ -465,8 +465,9 @@ impl WorkerOut {
     }
 }
 
-fn open_options(phase: Phase, direct: bool) -> tokio::fs::OpenOptions {
-    let mut options = tokio::fs::OpenOptions::new();
+fn open_options(phase: Phase, direct: bool) -> std::fs::OpenOptions {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = std::fs::OpenOptions::new();
     match phase {
         // Overwrite in place (no O_TRUNC): iteration N+1 measures steady
         // -state overwrites of the same inodes; the post-write set_len
@@ -489,7 +490,7 @@ fn block_len(shape: &Shape, b: u64) -> usize {
     std::cmp::min(shape.block, shape.size - b * shape.block) as usize
 }
 
-async fn write_worker(
+fn write_worker(
     mount: PathBuf,
     tid: usize,
     shape: Shape,
@@ -499,12 +500,12 @@ async fn write_worker(
     let nblocks = block_count(&shape);
     let mut out = WorkerOut::with_capacity((nblocks as usize).saturating_mul(shape.files));
     let dir = dataset_root(&mount).join(format!("t{tid}"));
-    tokio::fs::create_dir_all(&dir).await?;
+    std::fs::create_dir_all(&dir)?;
     let mut buf = AlignedBuf::new(shape.block as usize, shape.direct);
     let mut expired = false;
     for fid in 0..shape.files {
         let path = bench_file_path(&mount, tid, fid);
-        let mut file = open_options(Phase::Write, shape.direct).open(&path).await?;
+        let mut file = open_options(Phase::Write, shape.direct).open(&path)?;
         let mut pos = 0u64;
         for b in block_order(shape.rand, nblocks) {
             let off = b * shape.block;
@@ -512,9 +513,9 @@ async fn write_worker(
             fill_block(&mut buf.as_mut_slice()[..len], tid, fid, b);
             let t0 = Instant::now();
             if pos != off {
-                file.seek(SeekFrom::Start(off)).await?;
+                file.seek(SeekFrom::Start(off))?;
             }
-            file.write_all(&buf.as_slice()[..len]).await?;
+            file.write_all(&buf.as_slice()[..len])?;
             out.lat_ns.push(t0.elapsed().as_nanos() as u64);
             pos = off + len as u64;
             out.ops += 1;
@@ -535,8 +536,8 @@ async fn write_worker(
         // fsync is INSIDE the timed phase (honest durable write numbers).
         // On time-box expiry this still runs for the file in flight, so a
         // boxed overwrite pass leaves the dataset shape-valid.
-        file.set_len(shape.size).await?;
-        file.sync_all().await?;
+        file.set_len(shape.size)?;
+        file.sync_all()?;
         if expired {
             break;
         }
@@ -544,7 +545,7 @@ async fn write_worker(
     Ok(out)
 }
 
-async fn read_worker(
+fn read_worker(
     mount: PathBuf,
     tid: usize,
     shape: Shape,
@@ -556,7 +557,7 @@ async fn read_worker(
     let mut buf = AlignedBuf::new(shape.block as usize, shape.direct);
     'files: for fid in 0..shape.files {
         let path = bench_file_path(&mount, tid, fid);
-        let mut file = open_options(Phase::Read, shape.direct).open(&path).await?;
+        let mut file = open_options(Phase::Read, shape.direct).open(&path)?;
         let mut pos = 0u64;
         for b in block_order(shape.rand, nblocks) {
             let off = b * shape.block;
@@ -565,9 +566,9 @@ async fn read_worker(
             let len = block_len(&shape, b);
             let t0 = Instant::now();
             if pos != off {
-                file.seek(SeekFrom::Start(off)).await?;
+                file.seek(SeekFrom::Start(off))?;
             }
-            file.read_exact(&mut buf.as_mut_slice()[..len]).await?;
+            file.read_exact(&mut buf.as_mut_slice()[..len])?;
             out.lat_ns.push(t0.elapsed().as_nanos() as u64);
             pos = off + len as u64;
             out.ops += 1;
@@ -585,7 +586,7 @@ async fn read_worker(
     Ok(out)
 }
 
-async fn stat_worker(
+fn stat_worker(
     mount: PathBuf,
     tid: usize,
     shape: Shape,
@@ -595,7 +596,7 @@ async fn stat_worker(
     for fid in 0..shape.files {
         let path = bench_file_path(&mount, tid, fid);
         let t0 = Instant::now();
-        tokio::fs::metadata(&path).await?;
+        std::fs::metadata(&path)?;
         out.lat_ns.push(t0.elapsed().as_nanos() as u64);
         out.ops += 1;
         pb.inc(1);
@@ -603,7 +604,7 @@ async fn stat_worker(
     Ok(out)
 }
 
-async fn del_worker(
+fn del_worker(
     mount: PathBuf,
     tid: usize,
     shape: Shape,
@@ -613,7 +614,7 @@ async fn del_worker(
     for fid in 0..shape.files {
         let path = bench_file_path(&mount, tid, fid);
         let t0 = Instant::now();
-        tokio::fs::remove_file(&path).await?;
+        std::fs::remove_file(&path)?;
         out.lat_ns.push(t0.elapsed().as_nanos() as u64);
         out.ops += 1;
         pb.inc(1);
@@ -676,26 +677,41 @@ async fn run_one_pass(
     // The wall-clock box starts with the pass clock; workers stop issuing
     // ops once it expires (each worker still completes >= 1 op).
     let deadline = pass.time_box.map(|d| start + d);
-    let mut tasks = Vec::with_capacity(shape.threads);
-    for tid in 0..shape.threads {
-        let mount = mount.to_path_buf();
-        let shape = shape.clone();
-        let pb = pb.clone();
-        tasks.push(tokio::spawn(async move {
-            match phase {
-                Phase::Write => write_worker(mount, tid, shape, pb, deadline).await,
-                Phase::Read => read_worker(mount, tid, shape, pb, deadline).await,
-                Phase::Stat => stat_worker(mount, tid, shape, pb).await,
-                Phase::Del => del_worker(mount, tid, shape, pb).await,
-            }
-        }));
-    }
+    // Parallelism = named OS threads (the rip-tokio-total sweep): the
+    // syscall stream per worker is identical to the former task form;
+    // the loader's concurrency vehicle is threads, stated per the
+    // instrument-alignment law.
+    let mut results: Vec<Result<WorkerOut, BenchError>> = Vec::with_capacity(shape.threads);
+    std::thread::scope(|scope| {
+        let mut joins = Vec::with_capacity(shape.threads);
+        for tid in 0..shape.threads {
+            let mount = mount.to_path_buf();
+            let shape = shape.clone();
+            let pb = pb.clone();
+            joins.push(
+                std::thread::Builder::new()
+                    .name(format!("sqz-bench{tid}"))
+                    .spawn_scoped(scope, move || match phase {
+                        Phase::Write => write_worker(mount, tid, shape, pb, deadline),
+                        Phase::Read => read_worker(mount, tid, shape, pb, deadline),
+                        Phase::Stat => stat_worker(mount, tid, shape, pb),
+                        Phase::Del => del_worker(mount, tid, shape, pb),
+                    })
+                    .expect("bench worker thread spawns"),
+            );
+        }
+        for j in joins {
+            results.push(j.join().unwrap_or_else(|_| {
+                Err(BenchError::Join("bench worker panicked".to_string()))
+            }));
+        }
+    });
 
     let mut ops = 0u64;
     let mut bytes = 0u64;
     let mut lat_ns: Vec<u64> = Vec::with_capacity(total_ops as usize);
-    for task in tasks {
-        let out = task.await??;
+    for out in results {
+        let out = out?;
         ops += out.ops;
         bytes += out.bytes;
         lat_ns.extend(out.lat_ns);
@@ -710,7 +726,7 @@ async fn run_one_pass(
         // Cleanup bookkeeping OUTSIDE the timed region: the timed ops are
         // the file unlinks; removing the (now-empty) t{tid} dirs and the
         // dataset root is not part of the measurement.
-        tokio::fs::remove_dir_all(dataset_root(mount)).await?;
+        std::fs::remove_dir_all(dataset_root(mount))?;
     }
 
     lat_ns.sort_unstable();

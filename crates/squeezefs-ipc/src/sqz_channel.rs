@@ -36,8 +36,9 @@ pub static TICKED_WAIT_RECOVERIES: AtomicU64 = AtomicU64::new(0);
 
 /// Re-poll `f` at TICK until ready — the backstop that absorbs a lost
 /// wake. The future keeps its identity (and so any registered waiter
-/// slot) across ticks.
-pub(crate) async fn ticked<F: Future + Unpin>(mut f: F) -> F::Output {
+/// slot) across ticks. Public: the `#[path]`-shared consumers
+/// (`sqz_fdwatch`) and including crates ride the same law.
+pub async fn ticked<F: Future + Unpin>(mut f: F) -> F::Output {
     loop {
         match crate::sqz_time::timeout(TICK, &mut f).await {
             Ok(v) => return v,

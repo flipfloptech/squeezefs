@@ -1487,6 +1487,15 @@ pub struct FuseOverUring {
     scan_pends_seen: AtomicU64,
     scan_orphans_seen: AtomicU64,
     scan_passes: AtomicU64,
+    scan_max_age_ms: AtomicU64,
+    scan_cancel_latched: AtomicU64,
+    /// zc bridge WorkerMsg economy (pump-starvation discriminator): a
+    /// persistent `sent − taken` gap during a wedge = a ZcStore/ZcExtract
+    /// message sitting unconsumed in a worker's commit_rx while that
+    /// worker passes — the handler's oneshot then waits on a message no
+    /// pump will ever pop.
+    zc_msgs_sent: AtomicU64,
+    zc_msgs_taken: AtomicU64,
     /// Per-group fused-lane residency watches (Stage-1b wedge
     /// attribution): registered by each worker at lane creation; read by
     /// [`Self::scan_overdue_slots`] to name a stuck fused write's state.
@@ -2773,6 +2782,10 @@ impl FuseOverUring {
             scan_pends_seen: AtomicU64::new(0),
             scan_orphans_seen: AtomicU64::new(0),
             scan_passes: AtomicU64::new(0),
+            scan_max_age_ms: AtomicU64::new(0),
+            scan_cancel_latched: AtomicU64::new(0),
+            zc_msgs_sent: AtomicU64::new(0),
+            zc_msgs_taken: AtomicU64::new(0),
             fused_watches: std::sync::Mutex::new(Vec::new()),
             zc_hold_gate: std::sync::OnceLock::new(),
             fused_dispatch: std::sync::OnceLock::new(),
@@ -3010,6 +3023,10 @@ impl FuseOverUring {
             scan_pends_seen: AtomicU64::new(0),
             scan_orphans_seen: AtomicU64::new(0),
             scan_passes: AtomicU64::new(0),
+            scan_max_age_ms: AtomicU64::new(0),
+            scan_cancel_latched: AtomicU64::new(0),
+            zc_msgs_sent: AtomicU64::new(0),
+            zc_msgs_taken: AtomicU64::new(0),
             fused_watches: std::sync::Mutex::new(Vec::new()),
             zc_hold_gate: std::sync::OnceLock::new(),
             fused_dispatch: std::sync::OnceLock::new(),
@@ -3317,6 +3334,7 @@ impl FuseOverUring {
             .get(qid as usize)
             .and_then(|&gi| self.groups.get(gi as usize))
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bad qid"))?;
+        self.zc_msgs_sent.fetch_add(1, Ordering::Relaxed);
         g.commit_tx
             .send(WorkerMsg::ZcStore(ZcStoreMsg {
                 qid,
@@ -3368,6 +3386,7 @@ impl FuseOverUring {
             .get(qid as usize)
             .and_then(|&gi| self.groups.get(gi as usize))
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bad qid"))?;
+        self.zc_msgs_sent.fetch_add(1, Ordering::Relaxed);
         g.commit_tx
             .send(WorkerMsg::ZcExtract(ZcExtractMsg {
                 qid,
@@ -3618,13 +3637,18 @@ impl FuseOverUring {
                  still unreplied — the caller is in uninterruptible sleep \
                  (transport_slots_overdue; {fused_state}, fused_ready_total={ready_total}, \
                  zc_bridge_pends={}, scan_passes={}, scan_pends_seen={}, \
-                 scan_orphans_seen={}, park_backstop_ticks={})",
+                 scan_orphans_seen={}, pend_max_age_ms={}, cancel_latched={}, \
+                 park_backstop_ticks={}, zc_msgs_sent={}, zc_msgs_taken={})",
                 now.saturating_sub(since) / 1_000_000,
                 self.zc_bridge_pends.load(Ordering::Relaxed),
                 self.scan_passes.load(Ordering::Relaxed),
                 self.scan_pends_seen.load(Ordering::Relaxed),
                 self.scan_orphans_seen.load(Ordering::Relaxed),
-                TRANSPORT_PARK_BACKSTOP_TICKS.load(Ordering::Relaxed)
+                self.scan_max_age_ms.load(Ordering::Relaxed),
+                self.scan_cancel_latched.load(Ordering::Relaxed),
+                TRANSPORT_PARK_BACKSTOP_TICKS.load(Ordering::Relaxed),
+                self.zc_msgs_sent.load(Ordering::Relaxed),
+                self.zc_msgs_taken.load(Ordering::Relaxed)
             );
         }
     }
@@ -5131,6 +5155,7 @@ fn queue_worker(
                     continue;
                 }
                 WorkerMsg::ZcStore(s) => {
+                    pool.zc_msgs_taken.fetch_add(1, Ordering::Relaxed);
                     // D14 direct write leg: WRITE_FIXED(device fd ← the
                     // ent's held source pages). Refusals answer the
                     // oneshot with a negative errno (the handler falls
@@ -5193,6 +5218,7 @@ fn queue_worker(
                     continue;
                 }
                 WorkerMsg::ZcExtract(x) => {
+                    pool.zc_msgs_taken.fetch_add(1, Ordering::Relaxed);
                     // D14 lazy extraction: WRITE_FIXED(slot → memfd) on
                     // demand — the ineligible-shape vehicle. Refusals
                     // answer the oneshot with an error (the write fails
@@ -5411,12 +5437,20 @@ fn queue_worker(
             pool.scan_passes.fetch_add(1, Ordering::Relaxed);
             let mut pends_seen = 0u64;
             let mut orphans_seen = 0u64;
+            let mut max_age_ms = 0u64;
+            let mut cancelled_live = 0u64;
             for m in members.iter() {
                 for ent_idx in 0..depth {
                     if m.zc_pend[ent_idx].is_some() {
                         pends_seen += 1;
-                        if m.bridge_deadlines.born_ns(ent_idx) == 0 {
+                        let born = m.bridge_deadlines.born_ns(ent_idx);
+                        if born == 0 {
                             orphans_seen += 1;
+                        } else {
+                            max_age_ms = max_age_ms.max(now.saturating_sub(born) / 1_000_000);
+                            if m.bridge_deadlines.cancel_latched(ent_idx) {
+                                cancelled_live += 1;
+                            }
                         }
                     }
                 }
@@ -5425,6 +5459,12 @@ fn queue_worker(
                 .fetch_add(pends_seen, Ordering::Relaxed);
             pool.scan_orphans_seen
                 .fetch_add(orphans_seen, Ordering::Relaxed);
+            // GAUGES: live max pend age + live pends behind the
+            // cancel-once latch (a latched pend whose cancel CQE never
+            // resolved it would be a silent hole in the ladder).
+            pool.scan_max_age_ms.store(max_age_ms, Ordering::Relaxed);
+            pool.scan_cancel_latched
+                .store(cancelled_live, Ordering::Relaxed);
             for (mi, m) in members.iter_mut().enumerate() {
                 // The ORPHANED-PEND sweep (Stage-1b field wedge,
                 // 2026-08-13): the live capture showed a pool with

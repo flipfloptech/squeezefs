@@ -436,6 +436,13 @@ impl BridgeDeadlines {
         self.outstanding
     }
 
+    /// Is `ent` behind the cancel-once latch? (Diagnostic: a LIVE pend
+    /// with the latch set means its one AsyncCancel fired and whatever
+    /// came back failed to resolve the pend.)
+    pub(crate) fn cancel_latched(&self, ent: usize) -> bool {
+        self.cancelled.get(ent).copied().unwrap_or(false)
+    }
+
     /// The ents whose bridge ops have been in flight longer than
     /// `timeout_ns` and have NOT been yielded before — each exactly
     /// once per pend lifetime (a re-[`Self::stamp`] resets the latch:

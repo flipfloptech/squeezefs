@@ -191,6 +191,28 @@ stripe HELD flag (set on acquire, cleared on guard drop, aged) to split
 leaked-guard vs parked-holder, plus naming the ack-early finisher's
 awaits in the phase census.
 
+## The A/B conviction (2026-08-13): ACK-early overlay stores
+
+With every lower layer instrumented and exonerated by gauges — locks
+(sqz_sync, held-probe: "genuinely held"), lane delivery (sqz-exec),
+bridge pends (sent==taken, orphans 0), deadline ladder (scans running)
+— the write-phase census kept naming ACK-early overlay machinery
+(`overlay_store` / `ov_settle_retry` / the detached continuation), all
+code dated 2026-08-10. The counted A/B at the 3.0 GHz wedge posture:
+
+* `SQUEEZEFS_ZC_ACK_EARLY=1` (shipped default): wedges run 1 of nearly
+  every count (6+ reproductions this campaign).
+* **`SQUEEZEFS_ZC_ACK_EARLY=0`: 5/5 PASS.**
+
+The wedge class lives in the ACK-early device-overlay arm (the §3.4
+ACK-before-CQE machinery: retained-slot store continuation + ticket /
+settle interlock), not in any scheduler, lock, or transport-delivery
+layer. Root-causing THAT arm is the next campaign step; every
+instrument built on the way down (named-wait census, write-phase
+census with per-block keys and overlay sub-phases, stripe held-probe,
+fused residency watch, bridge scan gauges, message economy, bounded
+park, orphan sweep) is now permanent wedge-attribution machinery.
+
 ## Acceptance
 
 * The primitive's unit rails + a loom model of the acquire/release/wake

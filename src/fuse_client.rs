@@ -2649,7 +2649,7 @@ pub fn lock_wait_census(threshold: Duration) -> Vec<LockWaitEntry> {
 /// Live-phase names, indexed by the stamp constants below (coarser than
 /// the profile-gated [`WritePhase`] duration histograms on purpose: each
 /// entry names ONE await class a unit can park in).
-pub const LIVE_WRITE_PHASE_NAMES: [&str; 10] = [
+pub const LIVE_WRITE_PHASE_NAMES: [&str; 18] = [
     "entry",
     "materialize",
     "checkout",
@@ -2660,6 +2660,14 @@ pub const LIVE_WRITE_PHASE_NAMES: [&str; 10] = [
     "flush_tail",
     "patch_dma",
     "overlay_store",
+    "extent_probe",
+    "park_admit",
+    "ov_settle_pre",
+    "ov_alloc",
+    "ov_settle_retry",
+    "ov_ack_early",
+    "ov_slot_store",
+    "ov_pooled",
 ];
 pub const WP_ENTRY: u32 = 0;
 pub const WP_MATERIALIZE: u32 = 1;
@@ -2671,25 +2679,52 @@ pub const WP_WRITE_THROUGH: u32 = 6;
 pub const WP_FLUSH_TAIL: u32 = 7;
 pub const WP_PATCH_DMA: u32 = 8;
 pub const WP_OVERLAY_STORE: u32 = 9;
+pub const WP_EXTENT_PROBE: u32 = 10;
+pub const WP_PARK_ADMIT: u32 = 11;
+pub const WP_OV_SETTLE_PRE: u32 = 12;
+pub const WP_OV_ALLOC: u32 = 13;
+pub const WP_OV_SETTLE_RETRY: u32 = 14;
+pub const WP_OV_ACK_EARLY: u32 = 15;
+pub const WP_OV_SLOT_STORE: u32 = 16;
+pub const WP_OV_POOLED: u32 = 17;
 
-static WRITE_PHASE_MAP: Lazy<scc::HashMap<(u64, u64), (u32, u64)>> = Lazy::new(scc::HashMap::new);
+static WRITE_PHASE_MAP: Lazy<scc::HashMap<(u64, u64, u32), (u32, u64)>> =
+    Lazy::new(scc::HashMap::new);
+
+/// The unit-level (pre-block-loop) phase key's block sentinel.
+pub const WP_UNIT: u32 = u32::MAX;
 
 /// RAII entry for one write unit's live phase word.
 pub struct WritePhaseGuard {
-    key: (u64, u64),
+    key: (u64, u64, u32),
 }
 
 pub fn write_phase_begin(ino: u64, offset: u64) -> WritePhaseGuard {
     let now = COARSE_NOW_NS.load(Ordering::Relaxed);
-    let _ = WRITE_PHASE_MAP.insert_sync((ino, offset), (WP_ENTRY, now));
-    WritePhaseGuard { key: (ino, offset) }
+    let _ = WRITE_PHASE_MAP.insert_sync((ino, offset, WP_UNIT), (WP_ENTRY, now));
+    WritePhaseGuard {
+        key: (ino, offset, WP_UNIT),
+    }
 }
 
-/// Stamp the unit's CURRENT phase (call BEFORE the phase's await — a
-/// stuck unit then names the await it is parked in).
-pub fn write_phase(ino: u64, offset: u64, phase: u32) {
+/// Per-block phase entry (one write's N block futures stamp DISJOINT
+/// keys — the 2026-08-13 masking lesson: with a shared key, a sibling's
+/// `checkout` stamp hides the holder's true phase for the census's
+/// whole life). RAII like the unit guard.
+pub fn write_phase_block_begin(ino: u64, offset: u64, b: u32) -> WritePhaseGuard {
     let now = COARSE_NOW_NS.load(Ordering::Relaxed);
-    let _ = WRITE_PHASE_MAP.update_sync(&(ino, offset), |_, v| {
+    let _ = WRITE_PHASE_MAP.insert_sync((ino, offset, b), (WP_CHECKOUT, now));
+    WritePhaseGuard {
+        key: (ino, offset, b),
+    }
+}
+
+/// Stamp the CURRENT phase (call BEFORE the phase's await — a stuck
+/// unit then names the await it is parked in). `b` = the block future's
+/// block, or [`WP_UNIT`] for pre-loop unit phases.
+pub fn write_phase(ino: u64, offset: u64, b: u32, phase: u32) {
+    let now = COARSE_NOW_NS.load(Ordering::Relaxed);
+    let _ = WRITE_PHASE_MAP.update_sync(&(ino, offset, b), |_, v| {
         *v = (phase, now);
     });
 }
@@ -2711,9 +2746,10 @@ pub fn log_write_phase_census(threshold: Duration) {
         if age >= threshold_ns {
             printed += 1;
             error!(
-                "write-phase census: ino {} offset {} parked in phase {} for {} ms",
+                "write-phase census: ino {} offset {} block {} parked in phase {} for {} ms",
                 k.0,
                 k.1,
+                k.2 as i64,
                 LIVE_WRITE_PHASE_NAMES
                     .get(v.0 as usize)
                     .copied()
@@ -2729,14 +2765,31 @@ pub fn log_write_phase_census(threshold: Duration) {
 /// the overdue-op lines). Bounded output; one line per stuck wait.
 pub fn log_lock_wait_census(threshold: Duration) {
     for e in lock_wait_census(threshold).into_iter().take(64) {
+        // The holder-vs-leak discriminator (Stage-1b wedge hunt): for an
+        // AGED block-class wait, probe the stripe's live state. A
+        // successful try_lock while census waiters claim minutes-old
+        // waits = the lock is FREE and the waiters are starving (a
+        // primitive bug); a refusal = genuinely held (a lost/stalled
+        // HOLDER — hunt the holder's venue). Diagnostic-grade: the probe
+        // guard drops immediately (its release wakes the queue front, so
+        // the probe can only ever help a starving waiter).
+        let held_probe = if e.class == "block" && e.waited_ms > 60_000 {
+            let lock = BLOCK_FLUSH_LOCKS.get_lock(e.ino, e.key as u32);
+            match lock.try_lock() {
+                Ok(_g) => " [PROBE: stripe is FREE — waiter starvation, primitive bug]",
+                Err(()) => " [PROBE: stripe genuinely held — hunt the holder]",
+            }
+        } else {
+            ""
+        };
         match e.holder {
             Some((hsite, hino, hb)) => error!(
                 "lock-wait census: {}/{} ino {} key {} waited {} ms — stripe last-holder \
-                 site={} ino {} block {}",
+                 site={} ino {} block {}{held_probe}",
                 e.class, e.site, e.ino, e.key, e.waited_ms, hsite, hino, hb
             ),
             None => error!(
-                "lock-wait census: {}/{} ino {} key {} waited {} ms",
+                "lock-wait census: {}/{} ino {} key {} waited {} ms{held_probe}",
                 e.class, e.site, e.ino, e.key, e.waited_ms
             ),
         }
@@ -12520,6 +12573,7 @@ impl SqueezefsFilesystem {
     pub(crate) async fn try_device_overlay_store(
         &self,
         ino: u64,
+        offset_hint: u64,
         b: u32,
         rel: usize,
         len: usize,
@@ -12576,6 +12630,7 @@ impl SqueezefsFilesystem {
                 // publisher has not acquired the guard yet — steal its
                 // work (publish/teardown inline), then decline: the block
                 // is mapped now and rides the ordinary path.
+                write_phase(ino, offset_hint, b, WP_OV_SETTLE_PRE);
                 self.settle_overlay_block_locked(ino, b, false).await?;
                 return Ok(false);
             }
@@ -12588,6 +12643,7 @@ impl SqueezefsFilesystem {
                 if payload.slot().is_some() && device.zc_write_fd().is_none() {
                     return Ok(false);
                 }
+                write_phase(ino, offset_hint, b, WP_OV_ALLOC);
                 let dest_offset = allocator.allocate_block().await?;
                 let fsck_guard = allocator.inflight_register(dest_offset);
                 let mint_owner = crate::assembly_tasks::MintedBlockGuard::new(
@@ -12639,6 +12695,7 @@ impl SqueezefsFilesystem {
                 METRICS
                     .overlay_claim_conflicts
                     .fetch_add(1, Ordering::Relaxed);
+                write_phase(ino, offset_hint, b, WP_OV_SETTLE_RETRY);
                 self.settle_overlay_block_locked(ino, b, false).await?;
                 return Ok(false);
             }
@@ -12689,12 +12746,23 @@ impl SqueezefsFilesystem {
                         .overlay_ack_early_bytes
                         .fetch_add(len as u64, Ordering::Relaxed);
                     crate::detached::tpc_spawn_guarded("overlay_ack_early_store", async move {
-                        fs.finish_ack_early_store(ino, b, rec2, ticket, fd, dest, len, z2)
-                            .await;
+                        fs.finish_ack_early_store(
+                            ino,
+                            offset_hint,
+                            b,
+                            rec2,
+                            ticket,
+                            fd,
+                            dest,
+                            len,
+                            z2,
+                        )
+                        .await;
                     });
                     return Ok(true);
                 }
                 if !z.ack_early_sound() && crate::device_overlay::ack_early_odirect() {
+                    write_phase(ino, offset_hint, b, WP_OV_ACK_EARLY);
                     let snap = match z.materialize().await {
                         Ok(b) if b.len() == len => {
                             // materialize() already extracted off the
@@ -12735,6 +12803,7 @@ impl SqueezefsFilesystem {
                     return Ok(true);
                 }
             }
+            write_phase(ino, offset_hint, b, WP_OV_SLOT_STORE);
             match z.store(fd, dest).await {
                 Ok(n) if n as usize == len => {
                     fuse3::note_zc_write_direct(len as u64);
@@ -12754,6 +12823,7 @@ impl SqueezefsFilesystem {
             // Pooled vehicle: ONE copy into an aligned pooled backing,
             // one aligned DMA at the claimed range (the claim is HELD
             // across this DMA — §2.3's law is vehicle-blind).
+            write_phase(ino, offset_hint, b, WP_OV_POOLED);
             let bytes = match payload.materialize().await {
                 Ok(b) => b,
                 Err(e) => {
@@ -12853,6 +12923,7 @@ impl SqueezefsFilesystem {
     pub(crate) async fn finish_ack_early_store(
         &self,
         ino: u64,
+        offset_hint: u64,
         b: u32,
         rec: std::sync::Arc<crate::device_overlay::DeviceOverlayRecord>,
         ticket: crate::overlay_core::StoreTicket,
@@ -12861,8 +12932,13 @@ impl SqueezefsFilesystem {
         len: usize,
         z: std::sync::Arc<crate::routing::ZcWriteSlot>,
     ) {
+        // Own census entry: the spawner's per-block guard died with its
+        // write unit (the reply is out); this detached continuation is
+        // its own wait venue.
+        let _phase = write_phase_block_begin(ino, offset_hint, b);
         let mut attempt: u32 = 0;
         let stored = loop {
+            write_phase(ino, offset_hint, b, WP_OV_SLOT_STORE);
             match z.store(fd, dest).await {
                 Ok(n) if n as usize == len => break true,
                 // VEHICLE-PERMANENT (generic/464, 2026-08-10): the ring
@@ -13525,7 +13601,7 @@ impl SqueezefsFilesystem {
         let data: bytes::Bytes = if deferred_slot {
             bytes::Bytes::new()
         } else {
-            write_phase(ino, offset, WP_MATERIALIZE);
+            write_phase(ino, offset, WP_UNIT, WP_MATERIALIZE);
             payload.materialize().await.map_err(SqueezefsError::Io)?
         };
 
@@ -13573,7 +13649,7 @@ impl SqueezefsFilesystem {
                 // the returned wait keeps feeding the always-on global
                 // histogram so the FIND-L1-A baseline series stays
                 // comparable.)
-                write_phase(ino, offset, WP_CHECKOUT);
+                let _block_phase = write_phase_block_begin(ino, offset, b as u32);
                 let (block_guard, lock_waited) =
                     block_lock_acquire_timed(ino, b as u32, BlockLockSite::WriteCheckout).await;
                 METRICS.block_lock_wait.record(lock_waited);
@@ -13588,7 +13664,7 @@ impl SqueezefsFilesystem {
                 // failure surfaced to exactly this write.
                 if try_patch {
                     let rel = write_start - b_start_offset;
-                    write_phase(ino, offset, WP_PATCH_DMA);
+                    write_phase(ino, offset, b as u32, WP_PATCH_DMA);
                     match self
                         .try_sole_owner_patch(
                             ino,
@@ -13621,10 +13697,11 @@ impl SqueezefsFilesystem {
                 // `Err` = the store failed loud for exactly this write.
                 if try_overlay {
                     let rel = (write_start - b_start_offset) as usize;
-                    write_phase(ino, offset, WP_OVERLAY_STORE);
+                    write_phase(ino, offset, b as u32, WP_OVERLAY_STORE);
                     match self
                         .try_device_overlay_store(
                             ino,
+                            offset,
                             b as u32,
                             rel,
                             slice_len,
@@ -13652,7 +13729,7 @@ impl SqueezefsFilesystem {
                 // from it) — a parked ActiveBlockBuf and an open overlay
                 // may never coexist on one block.
                 if crate::device_overlay::any_open_fast() {
-                    write_phase(ino, offset, WP_OVERLAY_SETTLE);
+                    write_phase(ino, offset, b as u32, WP_OVERLAY_SETTLE);
                     if let Err(e) = self.settle_overlay_block_locked(ino, b as u32, false).await {
                         std::mem::drop(block_guard);
                         return Err(e);
@@ -13708,7 +13785,7 @@ impl SqueezefsFilesystem {
                 // (the guard exists to be held across block I/O), and
                 // the transport worker never takes block locks.
                 let owned_slot_bytes: bytes::Bytes = if deferred_slot {
-                    write_phase(ino, offset, WP_PATCH_SEED);
+                    write_phase(ino, offset, b as u32, WP_PATCH_SEED);
                     match patch_payload.materialize().await {
                         Ok(b) => b,
                         Err(e) => {
@@ -13731,6 +13808,7 @@ impl SqueezefsFilesystem {
                 // block-size deferred buffer. `true` = absorbed (ACK).
                 {
                     let rel = (write_start - b_start_offset) as usize;
+                    write_phase(ino, offset, b as u32, WP_EXTENT_PROBE);
                     let wp_probe = write_phase_start();
                     let parked = self
                         .try_extent_park(
@@ -13885,7 +13963,7 @@ impl SqueezefsFilesystem {
                                 .extent_record_absorbs
                                 .fetch_add(1, Ordering::Relaxed);
                             let nvme = self.router.cache.nvme.clone();
-                            write_phase(ino, offset, WP_ACCUMULATE);
+                            write_phase(ino, offset, b as u32, WP_ACCUMULATE);
                             tokio::task::spawn_blocking(move || nvme.remove_active_block(&ext_key))
                                 .await
                                 .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -13941,7 +14019,7 @@ impl SqueezefsFilesystem {
                     if self.router.cache.nvme.has_staged_active_block(&cache_key) {
                         let nvme = self.router.cache.nvme.clone();
                         let key = cache_key.clone();
-                        write_phase(ino, offset, WP_ACCUMULATE);
+                        write_phase(ino, offset, b as u32, WP_ACCUMULATE);
                         let removed =
                             tokio::task::spawn_blocking(move || nvme.remove_active_block(&key))
                                 .await
@@ -14035,7 +14113,7 @@ impl SqueezefsFilesystem {
                         // inline write-through — upload awaited before the
                         // WRITE ACKs, errors surfaced to exactly this
                         // write.
-                        write_phase(ino, offset, WP_WRITE_THROUGH);
+                        write_phase(ino, offset, b as u32, WP_WRITE_THROUGH);
                         self.write_through_complete_block(
                             ino,
                             b as u32,
@@ -14061,7 +14139,7 @@ impl SqueezefsFilesystem {
                         // t_admit anchors the block's WHOLE pipeline
                         // residence (Little's-law numerator).
                         let t_admit = std::time::Instant::now();
-                        write_phase(ino, offset, WP_FLUSH_TAIL);
+                        write_phase(ino, offset, b as u32, WP_FLUSH_TAIL);
                         let permit = self.write_pipeline.admit(block_size).await;
                         pipeline_phase_record(PipelinePhase::AdmitWait, t_admit);
                         // Per-op twin of the always-on AdmitWait above:
@@ -14098,6 +14176,7 @@ impl SqueezefsFilesystem {
                     // Partial coverage: already parked (never left the
                     // map); run the R5 byte-budget admission pass.
                     let wp_park = write_phase_start();
+                    write_phase(ino, offset, b as u32, WP_PARK_ADMIT);
                     self.admit_parked_active_block(&cache_key, fencing_token)
                         .await;
                     write_phase_record(WritePhase::ParkSpill, wp_park);

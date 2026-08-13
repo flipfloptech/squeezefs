@@ -265,7 +265,7 @@ enum IssueVenue {
 pub struct DebtDrainer {
     /// Targets that ever elided: device_path → allocator.
     targets: scc::HashMap<String, Arc<BlockAllocator>>,
-    notify: Arc<tokio::sync::Notify>,
+    notify: Arc<squeezefs_ipc::sqz_notify::Notify>,
     worker_armed: AtomicBool,
     /// Fence + foreground probes ride the sibling reclaim queue (same
     /// wiring sites; the drainer keeps its OWN foreground last-value so
@@ -291,7 +291,7 @@ impl DebtDrainer {
         let batch_blocks = reclaim.batch_blocks;
         Arc::new(Self {
             targets: scc::HashMap::new(),
-            notify: Arc::new(tokio::sync::Notify::new()),
+            notify: Arc::new(squeezefs_ipc::sqz_notify::Notify::new()),
             worker_armed: AtomicBool::new(false),
             reclaim,
             fg_last: AtomicU64::new(0),
@@ -341,13 +341,9 @@ impl DebtDrainer {
         if self.worker_armed.swap(true, Ordering::AcqRel) {
             return;
         }
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            self.worker_armed.store(false, Ordering::Release);
-            return;
-        };
         let weak = Arc::downgrade(self);
         let notify = self.notify.clone();
-        handle.spawn(async move {
+        crate::meta_exec::spawn_meta("debt_drain_worker", async move {
             loop {
                 notify.notified().await;
                 loop {
@@ -381,7 +377,7 @@ impl DebtDrainer {
                         let a = allocator.clone();
                         let dev = device_path.clone();
                         let max = d.batch_blocks as usize;
-                        let _ = tokio::task::spawn_blocking(move || {
+                        let _ = squeezefs_ipc::sqz_blocking::run_blocking(move || {
                             drain_debt_sync(&a, &dev, max, false)
                         })
                         .await;
@@ -538,7 +534,7 @@ pub struct ReclaimQueue {
     /// for these too, or the ENOSPC valve could observe an empty queue
     /// while the last free blocks are in a worker's hands.
     processing: AtomicU64,
-    notify: Arc<tokio::sync::Notify>,
+    notify: Arc<squeezefs_ipc::sqz_notify::Notify>,
     worker_armed: AtomicBool,
     /// The writer-guard fence probe (`tests/async_block_reclaim_tests.rs`
     /// contract 6): returns `true` when any volume of this mount's meta
@@ -582,7 +578,7 @@ impl ReclaimQueue {
             q: crossbeam::queue::SegQueue::new(),
             len: AtomicU64::new(0),
             processing: AtomicU64::new(0),
-            notify: Arc::new(tokio::sync::Notify::new()),
+            notify: Arc::new(squeezefs_ipc::sqz_notify::Notify::new()),
             worker_armed: AtomicBool::new(false),
             fence_signal: std::sync::OnceLock::new(),
             halted: AtomicBool::new(false),
@@ -779,24 +775,20 @@ impl ReclaimQueue {
         sig != prev
     }
 
-    /// Spawn the background worker once (lazily — the first enqueue runs
-    /// inside a tokio context; if it somehow does not, the arm is retried
-    /// and drains/valve still guarantee progress).
+    /// Spawn the background worker once (lazily, on the first enqueue —
+    /// the sqz-meta pool needs no ambient runtime, so the arm always
+    /// succeeds).
     fn ensure_worker(self: &Arc<Self>) {
         if self.worker_armed.swap(true, Ordering::AcqRel) {
             return;
         }
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            self.worker_armed.store(false, Ordering::Release);
-            return;
-        };
         // Weak, deliberately (the health-worker sentinel discipline): a
         // strong Arc would keep the queue — and this loop — alive forever
         // after the router dropped. `Drop` notifies so a parked worker
         // wakes, fails its upgrade, and exits.
         let weak = Arc::downgrade(self);
         let notify = self.notify.clone();
-        handle.spawn(async move {
+        crate::meta_exec::spawn_meta("block_reclaim_worker", async move {
             loop {
                 notify.notified().await;
                 let batch_ms = match weak.upgrade() {
@@ -905,19 +897,18 @@ impl ReclaimQueue {
                     .block_free_reclaim_batches
                     .fetch_add(1, Ordering::Relaxed);
                 let q = self.clone();
-                lanes.push(tokio::task::spawn_blocking(move || {
+                lanes.push(squeezefs_ipc::sqz_blocking::run_blocking(move || {
                     q.process_entries(c);
                 }));
             }
         }
         for lane in lanes {
-            if lane.await.is_err() {
-                // Panic in a lane: the batch guard already reconciled
-                // the counters; entries were dropped (guards
-                // deregistered) — fsck C6 heals any begin_free limbo.
-                // Loud, never silent.
-                log::error!("block-reclaim lane panicked; see fsck C6");
-            }
+            // A panicking lane re-panics HERE (run_blocking's
+            // join-and-unwrap semantics) — the containing worker task is
+            // panic-contained and counted (`detached_task_panics`), the
+            // batch guard already reconciled the counters, and fsck C6
+            // heals any begin_free limbo. Loud, never silent.
+            lane.await;
         }
     }
 
@@ -977,13 +968,7 @@ impl ReclaimQueue {
     /// once). Returns entries processed by THIS engagement.
     pub async fn drain_off_thread(self: &Arc<Self>) -> u64 {
         let q = self.clone();
-        match tokio::task::spawn_blocking(move || q.drain_sync()).await {
-            Ok(n) => n,
-            Err(e) => {
-                log::error!("valve drain blocking task panicked: {e:?}");
-                0
-            }
-        }
+        squeezefs_ipc::sqz_blocking::run_blocking(move || q.drain_sync()).await
     }
 
     /// Reclaimable supply exists (queued or in a processor's hands) —

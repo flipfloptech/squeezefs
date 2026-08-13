@@ -855,7 +855,7 @@ async fn reclaim_gather_close_reasons_and_fill_are_counted() {
 
     // (1) Cap close: 100 buffered inos, cap 64 — the first drain fills to
     // the cap without waiting out the window.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<u64>(1024);
+    let (tx, mut rx) = squeezefs_ipc::sqz_channel::mpsc::channel::<u64>(1024);
     for ino in 100..200u64 {
         tx.try_send(ino).expect("buffered send");
     }

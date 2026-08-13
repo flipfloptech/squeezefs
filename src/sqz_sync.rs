@@ -470,7 +470,7 @@ mod tests {
             "a wait past the tick must count a recovery"
         );
         drop(g);
-        tokio::time::timeout(Duration::from_secs(5), waiter)
+        squeezefs_ipc::sqz_time::timeout(Duration::from_secs(5), waiter)
             .await
             .expect("waiter completes after release")
             .expect("waiter task");

@@ -1070,9 +1070,8 @@ pub fn spawn_sampler() {
     if STARTED.swap(true, Relaxed) {
         return;
     }
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    crate::meta_exec::spawn_meta("mem_budget_sampler", async move {
+        let mut tick = squeezefs_ipc::sqz_time::interval(std::time::Duration::from_secs(1));
         loop {
             tick.tick().await;
             tick_off_thread().await;
@@ -1094,5 +1093,5 @@ pub fn spawn_sampler() {
 /// Awaited, so ticks never overlap: the hysteresis ladder, the backstop
 /// sustain count and the shed pass are all single-tick state machines.
 pub async fn tick_off_thread() {
-    let _ = tokio::task::spawn_blocking(|| MEM_BUDGET.tick()).await;
+    squeezefs_ipc::sqz_blocking::run_blocking(|| MEM_BUDGET.tick()).await;
 }

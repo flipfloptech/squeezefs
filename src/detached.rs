@@ -100,17 +100,17 @@ where
 /// So the fix is at the SITES, not in the `Drop` impls: hand the value to
 /// the blocking pool and let it block there.
 ///
-/// * Inside a runtime: returns the `JoinHandle` of the blocking task that
-///   performs the drop. Await it where the teardown must be ordered
-///   (dismount), ignore it where it must not (a live-mount volume retire).
-/// * Outside a runtime (offline CLI verbs, `Drop` backstops): drops
-///   inline and returns `None` — identical to today's behavior.
-pub fn drop_off_runtime<T: Send + 'static>(value: T) -> Option<tokio::task::JoinHandle<()>> {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => Some(handle.spawn_blocking(move || drop(value))),
-        Err(_) => {
-            drop(value);
-            None
-        }
-    }
+/// Returns the completion future of the blocking job that performs the
+/// drop (submission is eager — the job runs whether or not the future is
+/// awaited). Await it where the teardown must be ordered (dismount),
+/// drop it where it must not (a live-mount volume retire). The `Option`
+/// wrapper is kept for call-site compatibility with the retired
+/// runtime-probe shape (the sqz blocking pool needs no ambient runtime,
+/// so the inline-drop arm is gone): it is always `Some`.
+pub fn drop_off_runtime<T: Send + 'static>(
+    value: T,
+) -> Option<squeezefs_ipc::sqz_blocking::RunBlocking<()>> {
+    Some(squeezefs_ipc::sqz_blocking::run_blocking(move || {
+        drop(value)
+    }))
 }

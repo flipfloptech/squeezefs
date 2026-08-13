@@ -16,10 +16,10 @@
 
 use crate::error::Result;
 use io_uring::{opcode, types, types::Fd, IoUring};
+use squeezefs_ipc::sqz_channel::oneshot;
 use std::fs::OpenOptions;
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
-use tokio::sync::oneshot;
 
 pub static SIMULATE_CORRUPTION: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);

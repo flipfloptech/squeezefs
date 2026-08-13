@@ -10060,45 +10060,38 @@ impl DataRouter {
         {
             return;
         }
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            self.inner
-                .epoch_sweeper_armed
-                .store(false, std::sync::atomic::Ordering::Release);
-            return;
-        };
         let weak = std::sync::Arc::downgrade(&self.inner);
         // RES-8: a panic in this LOOP ends idle epoch closes for the
         // life of the mount (RAM-only bindings then wait for an explicit
-        // fsync forever). Contained + counted.
-        handle.spawn(crate::detached::contain(
-            "rewrite_epoch_sweeper",
-            async move {
-                let mut tick = squeezefs_ipc::sqz_time::interval(std::time::Duration::from_secs(5));
-                loop {
-                    tick.tick().await;
-                    let Some(inner) = weak.upgrade() else { return };
-                    let router = DataRouter { inner };
-                    let now = epoch_coarse_ms();
-                    let mut idle: Vec<u64> = Vec::new();
-                    router.inner.rewrite_epochs.iter_sync(|ino, e| {
-                        if now.saturating_sub(e.last_record_ms.load(Ordering::Relaxed))
-                            >= EPOCH_IDLE_HORIZON_MS
-                        {
-                            idle.push(*ino);
-                        }
-                        true
-                    });
-                    for ino in idle {
-                        let token = router.inner.dlm.get_fencing_token_ino(ino);
-                        if let Err(e) = router.close_rewrite_epoch(ino, token).await {
-                            log::warn!("idle epoch close for ino {ino} failed: {e:?}");
-                        }
+        // fsync forever). Contained + counted. Weak-held on the
+        // process-lifetime sqz-meta pool: the 5 s tick's upgrade
+        // failure is the exit edge (never pins a dropped router).
+        crate::meta_exec::spawn_meta_contained("rewrite_epoch_sweeper", async move {
+            let mut tick = squeezefs_ipc::sqz_time::interval(std::time::Duration::from_secs(5));
+            loop {
+                tick.tick().await;
+                let Some(inner) = weak.upgrade() else { return };
+                let router = DataRouter { inner };
+                let now = epoch_coarse_ms();
+                let mut idle: Vec<u64> = Vec::new();
+                router.inner.rewrite_epochs.iter_sync(|ino, e| {
+                    if now.saturating_sub(e.last_record_ms.load(Ordering::Relaxed))
+                        >= EPOCH_IDLE_HORIZON_MS
+                    {
+                        idle.push(*ino);
                     }
-                    // No Arc across the tick sleep.
-                    drop(router);
+                    true
+                });
+                for ino in idle {
+                    let token = router.inner.dlm.get_fencing_token_ino(ino);
+                    if let Err(e) = router.close_rewrite_epoch(ino, token).await {
+                        log::warn!("idle epoch close for ino {ino} failed: {e:?}");
+                    }
                 }
-            },
-        ));
+                // No Arc across the tick sleep.
+                drop(router);
+            }
+        });
     }
 
     pub async fn merge_block_mappings(

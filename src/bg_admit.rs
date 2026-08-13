@@ -99,12 +99,10 @@ where
             // background task that panics silently drops its permit's
             // worth of work (prefetch fills, tier publishes) with no
             // record.
-            match tokio::runtime::Handle::try_current() {
-                Ok(handle) => {
-                    handle.spawn(crate::detached::contain("bg_admit", task));
-                }
-                Err(_) => crate::detached::tpc_spawn_guarded("bg_admit", task),
-            }
+            // rip-tokio-total: ONE venue — the fuse3 TPC handler lanes
+            // (throughput-class prefetch/tier-publish fan-out; the
+            // 2-lane sqz-meta pool would funnel it).
+            crate::detached::tpc_spawn_guarded("bg_admit", task);
             true
         }
         Err(_) => {

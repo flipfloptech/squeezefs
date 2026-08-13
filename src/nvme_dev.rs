@@ -349,7 +349,7 @@ struct WriteWatermark {
     submitted: std::sync::atomic::AtomicU64,
     completed: std::sync::atomic::AtomicU64,
     waiters: std::sync::atomic::AtomicUsize,
-    drained: tokio::sync::Notify,
+    drained: squeezefs_ipc::sqz_notify::Notify,
     /// Worker thread exited (normal drain OR refused open/ring): any
     /// unreachable watermark target fails loud instead of parking a
     /// barrier forever.
@@ -362,7 +362,7 @@ impl WriteWatermark {
             submitted: std::sync::atomic::AtomicU64::new(0),
             completed: std::sync::atomic::AtomicU64::new(0),
             waiters: std::sync::atomic::AtomicUsize::new(0),
-            drained: tokio::sync::Notify::new(),
+            drained: squeezefs_ipc::sqz_notify::Notify::new(),
             dead: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -415,8 +415,8 @@ impl WriteWatermark {
             // re-check — the completer's SeqCst pair cannot miss us.
             self.waiters.fetch_add(1, SeqCst);
             let _g = WaiterGuard(self);
-            let mut notified = std::pin::pin!(self.drained.notified());
-            notified.as_mut().enable();
+            let mut notified = self.drained.notified_raw();
+            notified.enable();
             if self.completed.load(SeqCst) >= target || self.dead.load(SeqCst) {
                 continue;
             }

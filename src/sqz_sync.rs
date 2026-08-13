@@ -274,24 +274,39 @@ impl<T: ?Sized> std::ops::DerefMut for OwnedSqzRwLockWriteGuard<T> {
 
 /// The metadata plane's mutex (see module docs).
 pub struct SqzMutex<T: ?Sized> {
-    inner: SqzRwLock<T>,
+    core: Core,
+    data: std::cell::UnsafeCell<T>,
 }
+
+// SAFETY: the Core state machine only ever hands out EXCLUSIVE access
+// (Want::Exclusive), so `T: Send` suffices for both — the tokio
+// `Mutex` bound (`Sync where T: Send`), which the rwlock cannot offer
+// because its read guards alias `&T` across threads. Load-bearing for
+// the rip-tokio-total sweep: cluster-wire payloads are `Send + !Sync`.
+unsafe impl<T: ?Sized + Send> Send for SqzMutex<T> {}
+unsafe impl<T: ?Sized + Send> Sync for SqzMutex<T> {}
 
 impl<T> SqzMutex<T> {
     pub fn new(value: T) -> Self {
         SqzMutex {
-            inner: SqzRwLock::new(value),
+            core: Core::new(),
+            data: std::cell::UnsafeCell::new(value),
         }
     }
 
     pub async fn lock(&self) -> SqzMutexGuard<'_, T> {
-        SqzMutexGuard {
-            inner: self.inner.write().await,
-        }
+        acquire_ticked(&self.core, Want::Exclusive).await;
+        SqzMutexGuard { lock: self }
     }
 
     pub fn try_lock(&self) -> Result<SqzMutexGuard<'_, T>, ()> {
-        self.inner.try_write().map(|inner| SqzMutexGuard { inner })
+        let (granted, wake) = self.core.try_acquire(Want::Exclusive, None);
+        wake_all(wake);
+        if granted {
+            Ok(SqzMutexGuard { lock: self })
+        } else {
+            Err(())
+        }
     }
 }
 
@@ -302,18 +317,31 @@ impl<T: Default> Default for SqzMutex<T> {
 }
 
 pub struct SqzMutexGuard<'a, T: ?Sized> {
-    inner: SqzRwLockWriteGuard<'a, T>,
+    lock: &'a SqzMutex<T>,
+}
+
+// SAFETY: the guard proves exclusive ownership; sending it moves that
+// exclusivity (tokio guard parity — T: Send is the only requirement).
+unsafe impl<T: ?Sized + Send> Send for SqzMutexGuard<'_, T> {}
+unsafe impl<T: ?Sized + Send> Sync for SqzMutexGuard<'_, T> {}
+
+impl<T: ?Sized> Drop for SqzMutexGuard<'_, T> {
+    fn drop(&mut self) {
+        wake_all(self.lock.core.release_exclusive());
+    }
 }
 
 impl<T: ?Sized> std::ops::Deref for SqzMutexGuard<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
-        &self.inner
+        // SAFETY: exclusive hold.
+        unsafe { &*self.lock.data.get() }
     }
 }
 impl<T: ?Sized> std::ops::DerefMut for SqzMutexGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        &mut self.inner
+        // SAFETY: exclusive hold.
+        unsafe { &mut *self.lock.data.get() }
     }
 }
 

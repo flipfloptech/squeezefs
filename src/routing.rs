@@ -15353,11 +15353,9 @@ impl IoUringPrefetcher {
                         return;
                     }
                 };
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap();
-                runtime.block_on(async {
+                // First-party block_on (rip-tokio-total): the sqz mpsc
+                // recv needs only waker delivery — no runtime driver.
+                squeezefs_ipc::sqz_blocking::block_on(async {
                     while let Some((addr, len)) = rx.recv().await {
                         let prefetch_e = opcode::Madvise::new(
                             addr as *mut std::ffi::c_void,

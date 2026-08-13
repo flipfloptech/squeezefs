@@ -335,7 +335,7 @@ pub struct WritePipeline {
     /// `admission_waits` snapshot at the last probe-epoch roll: waits
     /// growth within an epoch is the saturation signal.
     probe_waits_snap: AtomicU64,
-    completions: tokio::sync::Notify,
+    completions: squeezefs_ipc::sqz_notify::Notify,
     /// `None` = live `MEM_BUDGET ÷ BUDGET_CAP_DIVISOR`; `Some` = explicit
     /// (tests).
     budget_cap_bytes: Option<u64>,
@@ -365,7 +365,7 @@ impl WritePipeline {
             lanes: scc::HashMap::new(),
             probe: ProbeCore::new(),
             probe_waits_snap: AtomicU64::new(0),
-            completions: tokio::sync::Notify::new(),
+            completions: squeezefs_ipc::sqz_notify::Notify::new(),
             budget_cap_bytes,
             red,
         })
@@ -536,9 +536,8 @@ impl WritePipeline {
             // that are NOT paired with a completion (R5 Red clearing,
             // governor/probe growth), which is all it was ever needed
             // for.
-            let park = self.completions.notified();
-            let mut park = std::pin::pin!(park);
-            park.as_mut().enable();
+            let mut park = self.completions.notified_raw();
+            park.enable();
 
             if let Some(permit) = self.try_admit_step(block_bytes) {
                 return permit;
@@ -557,9 +556,11 @@ impl WritePipeline {
             if stall_us > 0 {
                 squeezefs_ipc::sqz_time::sleep(Duration::from_micros(stall_us)).await;
             }
-            tokio::select! {
-                _ = park => {}
-                _ = squeezefs_ipc::sqz_time::sleep(ADMIT_TICK) => {
+            match squeezefs_ipc::sqz_future::race2(park, squeezefs_ipc::sqz_time::sleep(ADMIT_TICK))
+                .await
+            {
+                squeezefs_ipc::sqz_future::Either::Left(()) => {}
+                squeezefs_ipc::sqz_future::Either::Right(()) => {
                     self.admission_tick_wakes.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -574,19 +575,17 @@ impl WritePipeline {
         loop {
             // Same PERF-13 registration order as `admit`: enroll first,
             // then read the gauge, so a completion cannot slip between.
-            let park = self.completions.notified();
-            let mut park = std::pin::pin!(park);
-            park.as_mut().enable();
+            let mut park = self.completions.notified_raw();
+            park.enable();
             if self.core.inflight_blocks() == 0 {
                 return true;
             }
             if std::time::Instant::now() >= deadline {
                 return false;
             }
-            tokio::select! {
-                _ = park => {}
-                _ = squeezefs_ipc::sqz_time::sleep(ADMIT_TICK) => {}
-            }
+            let _ =
+                squeezefs_ipc::sqz_future::race2(park, squeezefs_ipc::sqz_time::sleep(ADMIT_TICK))
+                    .await;
         }
     }
 

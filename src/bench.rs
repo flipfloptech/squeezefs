@@ -23,9 +23,9 @@ use colored::Colorize;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rand::seq::SliceRandom;
 use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use std::io::{Read, Seek, SeekFrom, Write};
 
 /// Directory (directly under the mountpoint) holding the persistent
 /// bench dataset.
@@ -701,9 +701,10 @@ async fn run_one_pass(
             );
         }
         for j in joins {
-            results.push(j.join().unwrap_or_else(|_| {
-                Err(BenchError::Join("bench worker panicked".to_string()))
-            }));
+            results
+                .push(j.join().unwrap_or_else(|_| {
+                    Err(BenchError::Join("bench worker panicked".to_string()))
+                }));
         }
     });
 

@@ -265,7 +265,7 @@ pub fn arm_reader_coherence(
 pub fn spawn_reader_revalidation(
     volumes: Vec<Arc<KvMetaBackend>>,
     stop_flag: Arc<std::sync::atomic::AtomicBool>,
-    wake: Arc<tokio::sync::Notify>,
+    wake: Arc<squeezefs_ipc::sqz_notify::Notify>,
 ) -> squeezefs_ipc::sqz_channel::oneshot::Receiver<()> {
     let poller = RevalidationPoller::derived();
     let interval = poller.interval();

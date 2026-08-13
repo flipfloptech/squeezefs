@@ -766,7 +766,8 @@ fn read_identity(identity: &ObjectKey) -> u64 {
 /// Per-stripe release notifications. A release wakes only its own stripe —
 /// never every waiter in the process (the old single global `Notify` was a
 /// thundering herd and let unrelated churn burn waiters' retry budgets).
-static LOCK_WAITERS: Lazy<StripeLocks<tokio::sync::Notify, 1024>> = Lazy::new(StripeLocks::new);
+static LOCK_WAITERS: Lazy<StripeLocks<squeezefs_ipc::sqz_notify::Notify, 1024>> =
+    Lazy::new(StripeLocks::new);
 
 static CLIENT_NONCE: AtomicU64 = AtomicU64::new(1);
 
@@ -931,10 +932,9 @@ impl LocalLockManager {
         let deadline = std::time::Instant::now() + ttl;
 
         loop {
-            let notified = notify.notified();
-            tokio::pin!(notified);
+            let mut notified = notify.notified_raw();
             // Register interest BEFORE the availability check (lost-wakeup fix).
-            notified.as_mut().enable();
+            notified.enable();
 
             // One entry-lock critical section decides and records the
             // grant: conflict probe → mint → admit. Nothing awaits inside

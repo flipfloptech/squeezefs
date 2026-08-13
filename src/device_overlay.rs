@@ -197,7 +197,7 @@ pub struct DeviceOverlayRecord {
     /// `yield_now` spin, polled as a FUSED task on the queue worker's
     /// own lane, self-woke forever and starved the pass that pumps and
     /// reaps the very store whose ticket it waited on).
-    pub inflight_change: tokio::sync::Notify,
+    pub inflight_change: squeezefs_ipc::sqz_notify::Notify,
 }
 
 impl DeviceOverlayRecord {
@@ -331,7 +331,7 @@ impl DeviceOverlayRegistry {
             fsck_guard: std::sync::Mutex::new(Some(fsck_guard)),
             mint_owner: std::sync::Mutex::new(Some(mint_owner)),
             retired: squeezefs_ipc::sqz_notify::Notify::new(),
-            inflight_change: tokio::sync::Notify::new(),
+            inflight_change: squeezefs_ipc::sqz_notify::Notify::new(),
         });
         match self.records.entry_sync((ino, block)) {
             scc::hash_map::Entry::Occupied(_) => None,

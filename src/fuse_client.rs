@@ -2778,7 +2778,7 @@ pub fn log_write_phase_census(threshold: Duration) {
 /// pinnable without a full overlay record.
 pub async fn await_overlay_inflight_on(
     core: &crate::overlay_core::OverlayRecordCore,
-    change: &tokio::sync::Notify,
+    change: &squeezefs_ipc::sqz_notify::Notify,
 ) {
     let t0 = std::time::Instant::now();
     let mut next_bark = std::time::Duration::from_secs(30);
@@ -2807,11 +2807,13 @@ pub async fn await_overlay_inflight_on(
                 core.gaps(),
             );
         }
-        let notified = change.notified();
-        tokio::pin!(notified);
-        // Re-check AFTER registering: notify_waiters stores no permit,
-        // so the register→re-check order is what makes the wake
-        // un-losable.
+        let mut notified = change.notified_raw();
+        // Register (enable) then re-check: notify_waiters stores no
+        // permit, so the register→re-check order is what makes the wake
+        // un-losable — sqz `enable()` registers synchronously, closing
+        // the window the old first-poll-registers shape left to the
+        // 100 ms belt.
+        notified.enable();
         if core.inflight_empty() {
             return;
         }
@@ -6849,11 +6851,8 @@ pub struct SqueezefsFilesystem {
     /// completion (`wait_dismount_teardown`) so the daemon does not exit
     /// (and tests do not proceed) before heartbeat records deregister.
     dismount_complete: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    // REPORT (rip-tokio-total partition C): stays tokio::sync::Notify —
-    // shared with `ro_coherence::spawn_reader_revalidation(wake: Arc<
-    // tokio::sync::Notify>)`, a file outside this partition; convert both
-    // together.
-    dismount_done: std::sync::Arc<tokio::sync::Notify>,
+    // shared with `ro_coherence::spawn_reader_revalidation` (its wake).
+    dismount_done: std::sync::Arc<squeezefs_ipc::sqz_notify::Notify>,
     /// RES-20: the task-free FORGET enqueue (see [`ReclaimEnqueue`]).
     reclaim_enqueue: std::sync::Arc<ReclaimEnqueue>,
     reclaim_rx:
@@ -7179,7 +7178,7 @@ impl SqueezefsFilesystem {
             )),
             dismount_once: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             dismount_complete: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            dismount_done: std::sync::Arc::new(tokio::sync::Notify::new()),
+            dismount_done: std::sync::Arc::new(squeezefs_ipc::sqz_notify::Notify::new()),
             reclaim_enqueue: ReclaimEnqueue::new(reclaim_tx),
             reclaim_rx: std::sync::Arc::new(std::sync::Mutex::new(Some(reclaim_rx))),
             next_dir_fh: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(

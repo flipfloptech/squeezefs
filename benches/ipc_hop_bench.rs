@@ -164,9 +164,12 @@ fn bench_job_wire_frames(c: &mut Criterion) {
         read_frame, read_frame_limited, write_frame, BlockChecksum, DestTuple, WireFrame,
         MAX_FRAME_BYTES, MAX_HELLO_FRAME_BYTES, WIRE_SCHEMA,
     };
-    use tokio::runtime::Runtime;
 
-    let rt = Runtime::new().expect("bench runtime");
+    // VEHICLE NOTE (rip-tokio sweep, partition F): the framing helpers
+    // became SYNC (`std::io::Read`/`Write` on OS threads), so these rows
+    // now measure the sync calls directly — no async runtime in the
+    // loop. Group and row names are unchanged so history lines up; the
+    // committed baseline reference is refreshed as part of this landing.
 
     let enroll = WireFrame::Enroll {
         wire_schema: WIRE_SCHEMA,
@@ -194,7 +197,7 @@ fn bench_job_wire_frames(c: &mut Criterion) {
 
     let encode = |f: &WireFrame| -> Vec<u8> {
         let mut buf = Vec::new();
-        rt.block_on(write_frame(&mut buf, f)).expect("encode");
+        write_frame(&mut buf, f).expect("encode");
         buf
     };
     let enroll_wire = encode(&enroll);
@@ -211,9 +214,9 @@ fn bench_job_wire_frames(c: &mut Criterion) {
 
     // --- the S3 codec, encode side --------------------------------------
     g.bench_function("encode_result_submit_64", |b| {
-        b.to_async(&rt).iter(|| async {
+        b.iter(|| {
             let mut buf: Vec<u8> = Vec::new();
-            write_frame(&mut buf, &submit).await.expect("encode");
+            write_frame(&mut buf, &submit).expect("encode");
             std::hint::black_box(buf)
         })
     });
@@ -249,7 +252,7 @@ fn bench_job_wire_frames(c: &mut Criterion) {
         None,
     );
     g.bench_function("mac_roundtrip_result_submit_64", |b| {
-        b.to_async(&rt).iter(|| async {
+        b.iter(|| {
             let (mut tx, _) =
                 squeezefs::cluster_wire::session_framers(&key, squeezefs::cluster_wire::Role::Peer);
             let (_, mut rx) = squeezefs::cluster_wire::session_framers(
@@ -262,7 +265,6 @@ fn bench_job_wire_frames(c: &mut Criterion) {
                 squeezefs::cluster_wire::FrameClass::Bulk,
                 &submit,
             )
-            .await
             .expect("authenticated send");
             let mut cur = std::io::Cursor::new(wire);
             let f: WireFrame = rx
@@ -271,7 +273,6 @@ fn bench_job_wire_frames(c: &mut Criterion) {
                     squeezefs::cluster_wire::FrameClass::Bulk.cap(),
                     None,
                 )
-                .await
                 .expect("authenticated recv")
                 .expect("one frame");
             std::hint::black_box(f)
@@ -279,10 +280,9 @@ fn bench_job_wire_frames(c: &mut Criterion) {
     });
 
     g.bench_function("decode_enroll", |b| {
-        b.to_async(&rt).iter(|| async {
+        b.iter(|| {
             let mut cur = std::io::Cursor::new(enroll_wire.as_slice());
             let f = read_frame_limited(&mut cur, MAX_HELLO_FRAME_BYTES, None)
-                .await
                 .expect("valid hello")
                 .expect("one frame");
             std::hint::black_box(f)
@@ -290,10 +290,9 @@ fn bench_job_wire_frames(c: &mut Criterion) {
     });
 
     g.bench_function("decode_result_submit_64", |b| {
-        b.to_async(&rt).iter(|| async {
+        b.iter(|| {
             let mut cur = std::io::Cursor::new(submit_wire.as_slice());
             let f = read_frame(&mut cur)
-                .await
                 .expect("valid submit")
                 .expect("one frame");
             std::hint::black_box(f)
@@ -301,17 +300,17 @@ fn bench_job_wire_frames(c: &mut Criterion) {
     });
 
     g.bench_function("refuse_oversize_prefix", |b| {
-        b.to_async(&rt).iter(|| async {
+        b.iter(|| {
             let mut cur = std::io::Cursor::new(oversize_prefix.as_slice());
-            let e = read_frame(&mut cur).await.expect_err("past the cap");
+            let e = read_frame(&mut cur).expect_err("past the cap");
             std::hint::black_box(e)
         })
     });
 
     g.bench_function("refuse_lying_prefix_16mib", |b| {
-        b.to_async(&rt).iter(|| async {
+        b.iter(|| {
             let mut cur = std::io::Cursor::new(lying_prefix.as_slice());
-            let e = read_frame(&mut cur).await.expect_err("truncated body");
+            let e = read_frame(&mut cur).expect_err("truncated body");
             std::hint::black_box(e)
         })
     });

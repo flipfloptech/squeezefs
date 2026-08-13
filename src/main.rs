@@ -2856,10 +2856,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let first_meta_path = &meta_lvs[0];
-        let temp_rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        // rip-tokio-total: the probe rides sqz timers/blocking — the
+        // thread-park executor drives it with no runtime.
         // Version-gated bootstrap (PR K6a): the format config is read off
         // the SLOT-0 HOST's KV xattr tree via a read-only probe mount
         // (§5.5.1a discovery resolves the host — PR VL5b: after a slot-0
@@ -2868,7 +2866,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Blank, legacy-v2, foreign, torn, future-version, and
         // unknown-feature superblocks all fail loud here, before any
         // daemonization.
-        let val_opt = temp_rt.block_on(async {
+        let val_opt = squeezefs_ipc::sqz_blocking::block_on(async {
             let disc = squeezefs::meta_backend::discover_meta_set(&meta_lvs).await?;
             let home = &disc.ordered_paths[disc.slot_to_volume[0]];
             let vol = squeezefs::meta_backend::open_volume_probe(home).await?;
@@ -3017,30 +3015,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // so the one-line notice is audible.
     squeezefs::harden_root_subprocess_path();
 
-    // NOW start the Tokio runtime in the surviving process
-    let mut core_ids = core_affinity::get_core_ids().unwrap_or_default();
-    if !core_ids.is_empty() {
-        core_ids.remove(0); // Reserve Core 0 for OS kernel tasks
-    }
-    let core_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-
-    let mut rt_builder = tokio::runtime::Builder::new_multi_thread();
-    if !core_ids.is_empty() {
-        rt_builder.worker_threads(core_ids.len());
-    }
-    let rt = rt_builder
-        .enable_all()
-        .max_blocking_threads(8192)
-        .on_thread_start(move || {
-            let idx = core_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if idx < core_ids.len() {
-                core_affinity::set_for_current(core_ids[idx]);
-            }
-        })
-        .build()
-        .unwrap();
-
-    let res = rt.block_on(async { run_app(cli).await });
+    // rip-tokio-total: no runtime in the surviving process. The CLI
+    // future runs on THIS thread's park loop; every venue is first-party
+    // (fuse3 lanes own the handlers and their pinning, sqz-meta owns the
+    // plane tasks, sqz-blk owns blocking offload, sqz-timer owns time).
+    let res = squeezefs_ipc::sqz_blocking::block_on(async { run_app(cli).await });
     if let Err(ref e) = res {
         #[cfg(unix)]
         {

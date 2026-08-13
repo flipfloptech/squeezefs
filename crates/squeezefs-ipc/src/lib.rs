@@ -46,6 +46,7 @@ pub mod sqz_notify;
 pub mod sqz_once;
 pub mod sqz_semaphore;
 pub mod sqz_task;
+pub mod sqz_taskset;
 pub mod sqz_time;
 pub mod wire;
 

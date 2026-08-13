@@ -998,7 +998,12 @@ pub struct JobFabric {
     mover: Option<MoverCtx>,
     work: Notify,
     shutdown: AtomicBool,
-    handles: parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// The OWNED worker pool (first-party cancel-gated set on the
+    /// sqz-meta lanes): `shutdown_abrupt` cancels it — a cancelled
+    /// worker's future is dropped at its next poll boundary, so its
+    /// current await point never resumes and nothing later persists
+    /// (the documented kill-9 analog the crash-resume soak proves).
+    workers_set: squeezefs_ipc::sqz_taskset::OwnedSet,
 }
 
 impl JobFabric {
@@ -1022,7 +1027,10 @@ impl JobFabric {
             mover,
             work: Notify::new(),
             shutdown: AtomicBool::new(false),
-            handles: parking_lot::Mutex::new(Vec::new()),
+            workers_set: squeezefs_ipc::sqz_taskset::OwnedSet::new(
+                "job_worker",
+                crate::meta_exec::spawn_meta,
+            ),
         });
 
         // Crash-resume (KD-6): every durable non-terminal record is
@@ -1068,8 +1076,9 @@ impl JobFabric {
         // always pass the clamped L4-style pool size.
         for idx in 0..workers {
             let f = Arc::clone(&fabric);
-            let h = tokio::spawn(async move { f.worker_loop(idx).await });
-            fabric.handles.lock().push(h);
+            fabric
+                .workers_set
+                .spawn(async move { f.worker_loop(idx).await });
         }
         fabric.work.notify_waiters();
         Ok(fabric)
@@ -1229,14 +1238,18 @@ impl JobFabric {
 
     /// "Crash" shutdown for soak/tests: abort workers mid-task, persist
     /// NOTHING — durable records stay non-terminal exactly as a kill-9
-    /// leaves them.
+    /// leaves them. Abort = cancel + quiesce on the owned worker set:
+    /// a cancelled worker's future is dropped at its next poll boundary
+    /// — its current await point never resumes, so nothing later
+    /// persists (the kill-9 analog preserved; the mid-poll window is
+    /// the same non-instant one `JoinHandle::abort` had).
     pub async fn shutdown_abrupt(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
-        let handles: Vec<_> = std::mem::take(&mut *self.handles.lock());
-        for h in handles {
-            h.abort();
-            let _ = h.await;
-        }
+        self.workers_set.cancel_all();
+        // Wake parked workers so their next poll (where the cancel
+        // gate fires) happens now, not at the park's timeout slice.
+        self.work.notify_waiters();
+        self.workers_set.quiesce().await;
     }
 
     /// Offline-probe-shaped list: decode every top-level `job:{id}`
@@ -1557,9 +1570,10 @@ impl JobFabric {
             // whose volume scope intersects it.
             let claim = ClaimGuard { ctl: ctl.clone() };
             // ...and the unwind is CAUGHT, so the pool does not shrink by
-            // one worker per panic. `worker_loop`'s JoinHandle is stored
-            // but never observed, so a lost worker was silent — the
-            // last one dying meant no job could ever run again.
+            // one worker per panic. `worker_loop`'s task is spawned
+            // fire-and-forget (the owned set observes resolution, not
+            // output), so a lost worker was silent — the last one dying
+            // meant no job could ever run again.
             let panicked = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
                 self.run_job(&job_id, &ctl),
             ))

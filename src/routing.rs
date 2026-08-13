@@ -12332,18 +12332,30 @@ impl DataRouter {
         // OQ-5 (lost-wakeup wedge, 2026-07-30): the warm all-RAM serve legs
         // below (fresh/dirty moka meta + staging-ring mmap / hot-block RAM
         // tier) can complete with ZERO tokio coop-budget leaves — a caller
-        // task looping warm reads then never ends its poll, and any task it
-        // wakes mid-loop (e.g. the M6 times-drain via a DLM stripe guard
-        // drop) is scheduled into this worker's UNSTEALABLE LIFO slot and
-        // starves forever (tokio's documented LIFO footgun, #4323/#4941;
-        // the stealable-LIFO change #7431 was reverted upstream in 1.52.2
-        // for perf). One budget unit per read op bounds every such loop to
-        // one budget window (≤128) before the task yields; on foreign
-        // threads without a runtime context this is a no-op (unconstrained
-        // budget), so the IPC sync-lane serve is untouched. Pinned by
+        // task looping warm reads then never ends its poll starves every
+        // peer task queued on the same single-consumer lane (the OQ-5
+        // shape; originally tokio's LIFO footgun #4323/#4941 — the venue
+        // is now the sqz-exec lanes, which have no coop budget at all,
+        // so an unyielding poll starves the WHOLE lane, not just the
+        // LIFO slot). First-party budget: one unit per read op, yield at
+        // the 128-op window — the tokio coop constant, kept because the
+        // OQ-5 acceptance was measured at it. Task-local counter: zero
+        // cross-thread traffic, one branch per warm read. Pinned by
         // `warm_read_loop_yields_to_peer_tasks_on_one_worker` and the
         // OQ-5 storm-squeeze acceptance (.benchmarks/2026-07-30-oq5-*).
-        tokio::task::coop::consume_budget().await;
+        {
+            std::thread_local! {
+                static READ_BUDGET: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+            }
+            let spent = READ_BUDGET.with(|b| {
+                let v = b.get() + 1;
+                b.set(v % 128);
+                v >= 128
+            });
+            if spent {
+                squeezefs_ipc::sqz_blocking::yield_now().await;
+            }
+        }
 
         // FUSE-4e: the destination's WINDOW bounds this serve. `size` is the
         // upper bound of every dest write below — each leg writes its own

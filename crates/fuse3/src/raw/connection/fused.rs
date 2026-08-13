@@ -621,11 +621,7 @@ mod tests {
         assert_eq!(lane.drain(), 1);
         // Push a stale id by hand (the waker of the completed task).
         lane.rq.push(0);
-        assert_eq!(
-            lane.drain(),
-            0,
-            "stale id skipped"
-        );
+        assert_eq!(lane.drain(), 0, "stale id skipped");
     }
 
     /// The eligibility core: lever + ceiling, zero-length never.

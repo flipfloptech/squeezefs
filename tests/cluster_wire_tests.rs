@@ -23,10 +23,12 @@
 //!    (the accept-everything certificate verifier is deleted from the
 //!    tree), and verify-read sampling stays admissible only on a
 //!    confidential+peer-authenticated channel.
-//! 4. **Owner-side RPC runs on pinned service threads** (the
-//!    `ipc_service.rs` pattern) — never on the conveyor's task: the
-//!    conveyor is a serialized ~0.78 ms server at ρ ≈ 0.92 and an RPC on
-//!    it would multiply through the queueing formula (§6.5 item 1).
+//! 4. **Owner-side RPC runs on the connection's own named OS thread**
+//!    (`sqz-clw-conn`, thread-per-connection since the rip-tokio wire
+//!    conversion; bounded by the `ConnGate` cap) — never on the
+//!    conveyor's task: the conveyor is a serialized ~0.78 ms server at
+//!    ρ ≈ 0.92 and an RPC on it would multiply through the queueing
+//!    formula (§6.5 item 1).
 //! 5. **DISC-1 peer auto-discovery**: the shared volume IS the
 //!    rendezvous — `client:{uuid}` records already carry the endpoint, so
 //!    discovery is an enumeration, never a multicast protocol.
@@ -41,7 +43,8 @@ use squeezefs::cluster_wire as cw;
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::io::{Read as _, Write as _};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -96,13 +99,6 @@ fn peak_alloc<T>(f: impl FnOnce() -> T) -> (T, usize) {
     (out, PEAK.with(|p| p.get()))
 }
 
-fn rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("current-thread runtime")
-}
-
 const SECRET: &[u8] = b"storage-trust-enrollment-secret-32b";
 
 /// The mover-shard shape the 32.6 µs `serde_json` row was measured on
@@ -135,15 +131,9 @@ fn framing_is_binary_and_smaller_than_the_json_it_replaces() {
     // prices `serde_json` frame decode at 32.6 µs for this shape against
     // §6.5's 10 µs custody budget. A binary codec is not a preference,
     // it is the budget.
-    let rt = rt();
     let encode = |frame: &cw::RpcFrame| -> Vec<u8> {
         let mut wire: Vec<u8> = Vec::new();
-        rt.block_on(cw::write_plain_frame(
-            &mut wire,
-            cw::FrameClass::Bulk,
-            frame,
-        ))
-        .expect("encode");
+        cw::write_plain_frame(&mut wire, cw::FrameClass::Bulk, frame).expect("encode");
         assert!(wire.len() > 4, "a frame is a length prefix plus a body");
         wire[4..].to_vec()
     };
@@ -193,42 +183,34 @@ fn framing_is_binary_and_smaller_than_the_json_it_replaces() {
 
 #[test]
 fn frames_round_trip_through_every_class() {
-    let rt = rt();
-    rt.block_on(async {
-        for class in [
-            cw::FrameClass::Handshake,
-            cw::FrameClass::Control,
-            cw::FrameClass::Bulk,
-        ] {
-            let frame = cw::RpcFrame::Challenge {
-                schema: cw::CLUSTER_WIRE_SCHEMA,
-                server_nonce: "nonce-1".into(),
-                freshness_ms: 30_000,
-            };
-            let mut buf: Vec<u8> = Vec::new();
-            cw::write_plain_frame(&mut buf, class, &frame)
-                .await
-                .expect("encode");
-            let mut cur = std::io::Cursor::new(buf);
-            let back: cw::RpcFrame = cw::read_plain_frame(&mut cur, class.cap(), None)
-                .await
-                .expect("decode")
-                .expect("one frame");
-            match back {
-                cw::RpcFrame::Challenge { schema, .. } => {
-                    assert_eq!(schema, cw::CLUSTER_WIRE_SCHEMA)
-                }
-                other => panic!("round-trip changed the frame: {other:?}"),
+    for class in [
+        cw::FrameClass::Handshake,
+        cw::FrameClass::Control,
+        cw::FrameClass::Bulk,
+    ] {
+        let frame = cw::RpcFrame::Challenge {
+            schema: cw::CLUSTER_WIRE_SCHEMA,
+            server_nonce: "nonce-1".into(),
+            freshness_ms: 30_000,
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        cw::write_plain_frame(&mut buf, class, &frame).expect("encode");
+        let mut cur = std::io::Cursor::new(buf);
+        let back: cw::RpcFrame = cw::read_plain_frame(&mut cur, class.cap(), None)
+            .expect("decode")
+            .expect("one frame");
+        match back {
+            cw::RpcFrame::Challenge { schema, .. } => {
+                assert_eq!(schema, cw::CLUSTER_WIRE_SCHEMA)
             }
+            other => panic!("round-trip changed the frame: {other:?}"),
         }
-        // Clean EOF at a frame boundary is `Ok(None)`, never an error.
-        let mut empty = std::io::Cursor::new(Vec::new());
-        let none: Option<cw::RpcFrame> =
-            cw::read_plain_frame(&mut empty, cw::FrameClass::Bulk.cap(), None)
-                .await
-                .expect("clean eof");
-        assert!(none.is_none());
-    });
+    }
+    // Clean EOF at a frame boundary is `Ok(None)`, never an error.
+    let mut empty = std::io::Cursor::new(Vec::new());
+    let none: Option<cw::RpcFrame> =
+        cw::read_plain_frame(&mut empty, cw::FrameClass::Bulk.cap(), None).expect("clean eof");
+    assert!(none.is_none());
 }
 
 #[test]
@@ -257,38 +239,32 @@ fn class_caps_are_ordered_and_named() {
 
 #[test]
 fn oversize_frame_refuses_on_both_sides_naming_the_cap() {
-    let rt = rt();
-    rt.block_on(async {
-        // Encode side: never emit past the class cap.
-        let huge = cw::RpcFrame::Call {
-            id: 1,
-            verb: cw::VERB_PING,
-            body: vec![0u8; cw::FrameClass::Handshake.cap() as usize + 64],
-        };
-        let mut buf: Vec<u8> = Vec::new();
-        let err = cw::write_plain_frame(&mut buf, cw::FrameClass::Handshake, &huge)
-            .await
-            .expect_err("an oversize frame is never emitted");
-        assert!(
-            err.to_string()
-                .contains(cw::FrameClass::Handshake.cap_name()),
-            "the encode refusal names its class cap: {err}"
-        );
-        assert!(buf.is_empty(), "nothing is written when the cap refuses");
+    // Encode side: never emit past the class cap.
+    let huge = cw::RpcFrame::Call {
+        id: 1,
+        verb: cw::VERB_PING,
+        body: vec![0u8; cw::FrameClass::Handshake.cap() as usize + 64],
+    };
+    let mut buf: Vec<u8> = Vec::new();
+    let err = cw::write_plain_frame(&mut buf, cw::FrameClass::Handshake, &huge)
+        .expect_err("an oversize frame is never emitted");
+    assert!(
+        err.to_string()
+            .contains(cw::FrameClass::Handshake.cap_name()),
+        "the encode refusal names its class cap: {err}"
+    );
+    assert!(buf.is_empty(), "nothing is written when the cap refuses");
 
-        // Decode side: a length prefix past the cap is a comparison, not
-        // an allocation.
-        let mut cur = std::io::Cursor::new((cw::FrameClass::Bulk.cap() + 1).to_be_bytes().to_vec());
-        let err =
-            cw::read_plain_frame::<_, cw::RpcFrame>(&mut cur, cw::FrameClass::Bulk.cap(), None)
-                .await
-                .expect_err("a length prefix past the cap refuses");
-        assert!(
-            err.to_string()
-                .contains(&cw::FrameClass::Bulk.cap().to_string()),
-            "the decode refusal names the cap it enforced: {err}"
-        );
-    });
+    // Decode side: a length prefix past the cap is a comparison, not
+    // an allocation.
+    let mut cur = std::io::Cursor::new((cw::FrameClass::Bulk.cap() + 1).to_be_bytes().to_vec());
+    let err = cw::read_plain_frame::<_, cw::RpcFrame>(&mut cur, cw::FrameClass::Bulk.cap(), None)
+        .expect_err("a length prefix past the cap refuses");
+    assert!(
+        err.to_string()
+            .contains(&cw::FrameClass::Bulk.cap().to_string()),
+        "the decode refusal names the cap it enforced: {err}"
+    );
 }
 
 #[test]
@@ -296,14 +272,9 @@ fn lying_length_prefix_allocates_one_chunk_not_the_cap() {
     // Carried forward from VAL-6: `vec![0u8; len]` before `read_exact`
     // meant four attacker bytes bought a 16 MiB allocation per
     // connection. The property belongs to the transport now.
-    let rt = rt();
     let (res, peak) = peak_alloc(|| {
         let mut cur = std::io::Cursor::new(cw::FrameClass::Bulk.cap().to_be_bytes().to_vec());
-        rt.block_on(cw::read_plain_frame::<_, cw::RpcFrame>(
-            &mut cur,
-            cw::FrameClass::Bulk.cap(),
-            None,
-        ))
+        cw::read_plain_frame::<_, cw::RpcFrame>(&mut cur, cw::FrameClass::Bulk.cap(), None)
     });
     assert!(
         res.is_err(),
@@ -318,28 +289,38 @@ fn lying_length_prefix_allocates_one_chunk_not_the_cap() {
 
 #[test]
 fn stalled_frame_body_hits_the_class_deadline() {
-    let rt = rt();
-    rt.block_on(async {
-        let (mut client, mut server) = tokio::io::duplex(64);
-        let mut head = 4096u32.to_be_bytes().to_vec();
-        head.extend_from_slice(b"12345678");
-        tokio::io::AsyncWriteExt::write_all(&mut client, &head)
-            .await
-            .expect("prefix + dribble");
-        let err = cw::read_plain_frame::<_, cw::RpcFrame>(
-            &mut server,
-            cw::FrameClass::Handshake.cap(),
-            Some(Duration::from_millis(150)),
-        )
-        .await
-        .expect_err("a stalled body must time out");
-        assert_eq!(
+    // Deadlines ride the SOCKET since the rip-tokio conversion: each
+    // blocking read is bounded by the caller-set `set_read_timeout`, and
+    // the framer's `body_timeout` bounds the WHOLE body between chunks.
+    // Socket-timeout expiry surfaces as `WouldBlock` on Linux
+    // (`TimedOut` elsewhere) — the product's own `io_timed_out`
+    // predicate reads both as a timeout, so this asserts the same class.
+    let (mut client, mut server) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+    server
+        .set_read_timeout(Some(Duration::from_millis(150)))
+        .expect("socket read timeout");
+    let mut head = 4096u32.to_be_bytes().to_vec();
+    head.extend_from_slice(b"12345678");
+    client.write_all(&head).expect("prefix + dribble");
+    let started = std::time::Instant::now();
+    let err = cw::read_plain_frame::<_, cw::RpcFrame>(
+        &mut server,
+        cw::FrameClass::Handshake.cap(),
+        Some(Duration::from_millis(150)),
+    )
+    .expect_err("a stalled body must time out");
+    assert!(
+        matches!(
             err.kind(),
-            std::io::ErrorKind::TimedOut,
-            "the deadline surfaces as TimedOut: {err}"
-        );
-        drop(client);
-    });
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+        "the deadline surfaces as a timeout-class error: {err}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the deadline fired, not an unbounded park"
+    );
+    drop(client);
 }
 
 #[test]
@@ -383,135 +364,129 @@ fn gate(freshness: Duration) -> cw::AuthnGate {
 fn the_nonce_is_server_issued_single_use_and_freshness_windowed() {
     // The freshness window rides a deterministic clock SEAM (never a
     // sleep): the test advances the gate's own millisecond clock.
-    let rt = rt();
-    rt.block_on(async {
-        let g = gate(Duration::from_secs(30));
-        let challenge = g.issue_challenge();
-        assert_eq!(challenge.schema, cw::CLUSTER_WIRE_SCHEMA);
-        assert!(!challenge.server_nonce.is_empty());
-        assert_eq!(challenge.freshness_ms, 30_000);
-        assert_eq!(g.outstanding_challenges(), 1);
+    let g = gate(Duration::from_secs(30));
+    let challenge = g.issue_challenge();
+    assert_eq!(challenge.schema, cw::CLUSTER_WIRE_SCHEMA);
+    assert!(!challenge.server_nonce.is_empty());
+    assert_eq!(challenge.freshness_ms, 30_000);
+    assert_eq!(g.outstanding_challenges(), 1);
 
-        let peer_nonce = "peer-entropy";
-        let mac = cw::proof_mac(SECRET, "peer-a", &challenge.server_nonce, peer_nonce);
-        let claim = cw::ProofClaim {
+    let peer_nonce = "peer-entropy";
+    let mac = cw::proof_mac(SECRET, "peer-a", &challenge.server_nonce, peer_nonce);
+    let claim = cw::ProofClaim {
+        schema: cw::CLUSTER_WIRE_SCHEMA,
+        peer_id: "peer-a",
+        server_nonce: &challenge.server_nonce,
+        peer_nonce,
+        mac: &mac,
+    };
+    match g.verify(claim.clone(), None) {
+        cw::Verdict::Admit(_) => {}
+        cw::Verdict::Refuse(r) => panic!("a fresh, well-formed proof must admit: {r}"),
+    }
+    assert_eq!(
+        g.outstanding_challenges(),
+        0,
+        "an accepted nonce is CONSUMED"
+    );
+    // Replay of the identical hello: the MAC still verifies, and that
+    // is exactly why the nonce registry has to be the gate.
+    match g.verify(claim, None) {
+        cw::Verdict::Refuse(r) => assert!(
+            r.contains("replay") || r.contains("single-use") || r.contains("spent"),
+            "the refusal says why: {r}"
+        ),
+        cw::Verdict::Admit(_) => panic!("a replayed hello must never admit"),
+    }
+
+    // Freshness: a nonce answered past the window is refused even
+    // though the proof is arithmetically correct.
+    let clock = Arc::new(std::sync::atomic::AtomicU64::new(1_000));
+    let g = cw::AuthnGate::with_clock(
+        SECRET.to_vec(),
+        cw::AuthnConfig {
+            freshness: Duration::from_millis(500),
+            ..cw::AuthnConfig::default()
+        },
+        cw::WireClock::manual(clock.clone()),
+    );
+    let challenge = g.issue_challenge();
+    let mac = cw::proof_mac(SECRET, "peer-b", &challenge.server_nonce, "n2");
+    clock.fetch_add(1_500, Ordering::SeqCst);
+    match g.verify(
+        cw::ProofClaim {
             schema: cw::CLUSTER_WIRE_SCHEMA,
-            peer_id: "peer-a",
+            peer_id: "peer-b",
             server_nonce: &challenge.server_nonce,
-            peer_nonce,
+            peer_nonce: "n2",
             mac: &mac,
-        };
-        match g.verify(claim.clone(), None) {
-            cw::Verdict::Admit(_) => {}
-            cw::Verdict::Refuse(r) => panic!("a fresh, well-formed proof must admit: {r}"),
-        }
-        assert_eq!(
-            g.outstanding_challenges(),
-            0,
-            "an accepted nonce is CONSUMED"
-        );
-        // Replay of the identical hello: the MAC still verifies, and that
-        // is exactly why the nonce registry has to be the gate.
-        match g.verify(claim, None) {
-            cw::Verdict::Refuse(r) => assert!(
-                r.contains("replay") || r.contains("single-use") || r.contains("spent"),
-                "the refusal says why: {r}"
-            ),
-            cw::Verdict::Admit(_) => panic!("a replayed hello must never admit"),
-        }
-
-        // Freshness: a nonce answered past the window is refused even
-        // though the proof is arithmetically correct.
-        let clock = Arc::new(std::sync::atomic::AtomicU64::new(1_000));
-        let g = cw::AuthnGate::with_clock(
-            SECRET.to_vec(),
-            cw::AuthnConfig {
-                freshness: Duration::from_millis(500),
-                ..cw::AuthnConfig::default()
-            },
-            cw::WireClock::manual(clock.clone()),
-        );
-        let challenge = g.issue_challenge();
-        let mac = cw::proof_mac(SECRET, "peer-b", &challenge.server_nonce, "n2");
-        clock.fetch_add(1_500, Ordering::SeqCst);
-        match g.verify(
-            cw::ProofClaim {
-                schema: cw::CLUSTER_WIRE_SCHEMA,
-                peer_id: "peer-b",
-                server_nonce: &challenge.server_nonce,
-                peer_nonce: "n2",
-                mac: &mac,
-            },
-            None,
-        ) {
-            cw::Verdict::Refuse(r) => assert!(
-                r.contains("fresh") || r.contains("expired"),
-                "the refusal names the window: {r}"
-            ),
-            cw::Verdict::Admit(_) => panic!("a stale challenge must not admit"),
-        }
-    });
+        },
+        None,
+    ) {
+        cw::Verdict::Refuse(r) => assert!(
+            r.contains("fresh") || r.contains("expired"),
+            "the refusal names the window: {r}"
+        ),
+        cw::Verdict::Admit(_) => panic!("a stale challenge must not admit"),
+    }
 }
 
 #[test]
 fn proof_requires_the_storage_secret_and_bounds_the_peer_id() {
-    let rt = rt();
-    rt.block_on(async {
-        let g = gate(Duration::from_secs(30));
-        let c = g.issue_challenge();
-        // Wrong secret ⇒ refused. This is the whole trust root: the proof
-        // is computable only by a principal that can read the volume.
-        let bad = cw::proof_mac(b"not-the-secret", "peer-a", &c.server_nonce, "n");
-        match g.verify(
-            cw::ProofClaim {
-                schema: cw::CLUSTER_WIRE_SCHEMA,
-                peer_id: "peer-a",
-                server_nonce: &c.server_nonce,
-                peer_nonce: "n",
-                mac: &bad,
-            },
-            None,
-        ) {
-            cw::Verdict::Refuse(r) => {
-                assert!(r.contains("mac") || r.contains("membership"), "reason: {r}")
-            }
-            cw::Verdict::Admit(_) => panic!("a proof under the wrong secret must never admit"),
+    let g = gate(Duration::from_secs(30));
+    let c = g.issue_challenge();
+    // Wrong secret ⇒ refused. This is the whole trust root: the proof
+    // is computable only by a principal that can read the volume.
+    let bad = cw::proof_mac(b"not-the-secret", "peer-a", &c.server_nonce, "n");
+    match g.verify(
+        cw::ProofClaim {
+            schema: cw::CLUSTER_WIRE_SCHEMA,
+            peer_id: "peer-a",
+            server_nonce: &c.server_nonce,
+            peer_nonce: "n",
+            mac: &bad,
+        },
+        None,
+    ) {
+        cw::Verdict::Refuse(r) => {
+            assert!(r.contains("mac") || r.contains("membership"), "reason: {r}")
         }
-        // A schema mismatch refuses loud rather than being interpreted.
-        let c = g.issue_challenge();
-        let mac = cw::proof_mac(SECRET, "peer-a", &c.server_nonce, "n");
-        match g.verify(
-            cw::ProofClaim {
-                schema: cw::CLUSTER_WIRE_SCHEMA + 7,
-                peer_id: "peer-a",
-                server_nonce: &c.server_nonce,
-                peer_nonce: "n",
-                mac: &mac,
-            },
-            None,
-        ) {
-            cw::Verdict::Refuse(r) => assert!(r.contains("schema"), "reason: {r}"),
-            cw::Verdict::Admit(_) => panic!("a foreign schema must refuse"),
-        }
-        // An attacker-chosen identity is bounded — it lands in log lines
-        // and durable records.
-        let c = g.issue_challenge();
-        let long = "x".repeat(cw::AuthnConfig::default().max_peer_id_bytes + 1);
-        let mac = cw::proof_mac(SECRET, &long, &c.server_nonce, "n");
-        match g.verify(
-            cw::ProofClaim {
-                schema: cw::CLUSTER_WIRE_SCHEMA,
-                peer_id: &long,
-                server_nonce: &c.server_nonce,
-                peer_nonce: "n",
-                mac: &mac,
-            },
-            None,
-        ) {
-            cw::Verdict::Refuse(r) => assert!(r.contains("peer_id") || r.contains("id"), "{r}"),
-            cw::Verdict::Admit(_) => panic!("an unbounded identity must refuse"),
-        }
-    });
+        cw::Verdict::Admit(_) => panic!("a proof under the wrong secret must never admit"),
+    }
+    // A schema mismatch refuses loud rather than being interpreted.
+    let c = g.issue_challenge();
+    let mac = cw::proof_mac(SECRET, "peer-a", &c.server_nonce, "n");
+    match g.verify(
+        cw::ProofClaim {
+            schema: cw::CLUSTER_WIRE_SCHEMA + 7,
+            peer_id: "peer-a",
+            server_nonce: &c.server_nonce,
+            peer_nonce: "n",
+            mac: &mac,
+        },
+        None,
+    ) {
+        cw::Verdict::Refuse(r) => assert!(r.contains("schema"), "reason: {r}"),
+        cw::Verdict::Admit(_) => panic!("a foreign schema must refuse"),
+    }
+    // An attacker-chosen identity is bounded — it lands in log lines
+    // and durable records.
+    let c = g.issue_challenge();
+    let long = "x".repeat(cw::AuthnConfig::default().max_peer_id_bytes + 1);
+    let mac = cw::proof_mac(SECRET, &long, &c.server_nonce, "n");
+    match g.verify(
+        cw::ProofClaim {
+            schema: cw::CLUSTER_WIRE_SCHEMA,
+            peer_id: &long,
+            server_nonce: &c.server_nonce,
+            peer_nonce: "n",
+            mac: &mac,
+        },
+        None,
+    ) {
+        cw::Verdict::Refuse(r) => assert!(r.contains("peer_id") || r.contains("id"), "{r}"),
+        cw::Verdict::Admit(_) => panic!("an unbounded identity must refuse"),
+    }
 }
 
 #[test]
@@ -561,99 +536,86 @@ fn session_key_binds_the_secret_both_nonces_the_peer_and_the_channel() {
 
 #[test]
 fn per_frame_mac_rejects_tamper_reorder_replay_and_reflection() {
-    let rt = rt();
-    rt.block_on(async {
-        let key = cw::session_key(SECRET, "peer-a", "s", "p", None);
-        let frame = cw::RpcFrame::Call {
-            id: 1,
-            verb: cw::VERB_PING,
-            body: b"payload".to_vec(),
-        };
+    let key = cw::session_key(SECRET, "peer-a", "s", "p", None);
+    let frame = cw::RpcFrame::Call {
+        id: 1,
+        verb: cw::VERB_PING,
+        body: b"payload".to_vec(),
+    };
 
-        // Honest path: coordinator → peer, in order.
-        let (mut tx, _) = cw::session_framers(&key, cw::Role::Coordinator);
-        let (_, mut rx) = cw::session_framers(&key, cw::Role::Peer);
-        let mut wire: Vec<u8> = Vec::new();
-        tx.send(&mut wire, cw::FrameClass::Control, &frame)
-            .await
-            .expect("send");
-        let first = wire.clone();
-        tx.send(&mut wire, cw::FrameClass::Control, &frame)
-            .await
-            .expect("send 2");
-        let mut cur = std::io::Cursor::new(wire.clone());
-        for _ in 0..2 {
-            let got: Option<cw::RpcFrame> = rx
-                .recv(&mut cur, cw::FrameClass::Control.cap(), None)
-                .await
-                .expect("authenticated frames decode");
-            assert!(got.is_some());
-        }
-        assert_eq!(tx.frames(), 2);
-        assert_eq!(rx.frames(), 2);
+    // Honest path: coordinator → peer, in order.
+    let (mut tx, _) = cw::session_framers(&key, cw::Role::Coordinator);
+    let (_, mut rx) = cw::session_framers(&key, cw::Role::Peer);
+    let mut wire: Vec<u8> = Vec::new();
+    tx.send(&mut wire, cw::FrameClass::Control, &frame)
+        .expect("send");
+    let first = wire.clone();
+    tx.send(&mut wire, cw::FrameClass::Control, &frame)
+        .expect("send 2");
+    let mut cur = std::io::Cursor::new(wire.clone());
+    for _ in 0..2 {
+        let got: Option<cw::RpcFrame> = rx
+            .recv(&mut cur, cw::FrameClass::Control.cap(), None)
+            .expect("authenticated frames decode");
+        assert!(got.is_some());
+    }
+    assert_eq!(tx.frames(), 2);
+    assert_eq!(rx.frames(), 2);
 
-        // Tamper: flip one payload byte.
-        let mut tampered = first.clone();
-        let last = tampered.len() - cw::MAC_BYTES - 1;
-        tampered[last] ^= 0x40;
-        let (_, mut rx) = cw::session_framers(&key, cw::Role::Peer);
-        let err = rx
-            .recv::<_, cw::RpcFrame>(
-                &mut std::io::Cursor::new(tampered),
-                cw::FrameClass::Control.cap(),
-                None,
-            )
-            .await
-            .expect_err("a tampered frame must not decode");
-        assert!(
-            err.to_string().contains("mac") || err.to_string().contains("authentic"),
-            "the refusal says what failed: {err}"
-        );
-
-        // Replay of frame 1 in position 2: the sequence is inside the MAC.
-        let mut replayed = first.clone();
-        replayed.extend_from_slice(&first);
-        let (_, mut rx) = cw::session_framers(&key, cw::Role::Peer);
-        rx.recv::<_, cw::RpcFrame>(
-            &mut std::io::Cursor::new(replayed.clone()),
+    // Tamper: flip one payload byte.
+    let mut tampered = first.clone();
+    let last = tampered.len() - cw::MAC_BYTES - 1;
+    tampered[last] ^= 0x40;
+    let (_, mut rx) = cw::session_framers(&key, cw::Role::Peer);
+    let err = rx
+        .recv::<_, cw::RpcFrame>(
+            &mut std::io::Cursor::new(tampered),
             cw::FrameClass::Control.cap(),
             None,
         )
-        .await
-        .expect("first frame is honest");
-        let mut cur = std::io::Cursor::new(replayed);
-        let _ = rx
-            .recv::<_, cw::RpcFrame>(&mut cur, cw::FrameClass::Control.cap(), None)
-            .await;
-        let (_, mut rx2) = cw::session_framers(&key, cw::Role::Peer);
-        let mut cur = std::io::Cursor::new(first.clone());
-        rx2.recv::<_, cw::RpcFrame>(&mut cur, cw::FrameClass::Control.cap(), None)
-            .await
-            .expect("frame 1 at position 1");
-        let mut cur = std::io::Cursor::new(first.clone());
-        let err = rx2
-            .recv::<_, cw::RpcFrame>(&mut cur, cw::FrameClass::Control.cap(), None)
-            .await
-            .expect_err("frame 1 replayed at position 2 must refuse");
-        assert!(
-            err.to_string().contains("mac") || err.to_string().contains("sequence"),
-            "reason: {err}"
-        );
+        .expect_err("a tampered frame must not decode");
+    assert!(
+        err.to_string().contains("mac") || err.to_string().contains("authentic"),
+        "the refusal says what failed: {err}"
+    );
 
-        // Reflection: a coordinator→peer frame read by a COORDINATOR
-        // (i.e. bounced back at its author) must refuse — the direction
-        // tag is inside the MAC.
-        let (_, mut rx_same_dir) = cw::session_framers(&key, cw::Role::Coordinator);
-        let err = rx_same_dir
-            .recv::<_, cw::RpcFrame>(
-                &mut std::io::Cursor::new(first),
-                cw::FrameClass::Control.cap(),
-                None,
-            )
-            .await
-            .expect_err("a reflected frame must refuse");
-        assert!(err.to_string().contains("mac"), "reason: {err}");
-    });
+    // Replay of frame 1 in position 2: the sequence is inside the MAC.
+    let mut replayed = first.clone();
+    replayed.extend_from_slice(&first);
+    let (_, mut rx) = cw::session_framers(&key, cw::Role::Peer);
+    rx.recv::<_, cw::RpcFrame>(
+        &mut std::io::Cursor::new(replayed.clone()),
+        cw::FrameClass::Control.cap(),
+        None,
+    )
+    .expect("first frame is honest");
+    let mut cur = std::io::Cursor::new(replayed);
+    let _ = rx.recv::<_, cw::RpcFrame>(&mut cur, cw::FrameClass::Control.cap(), None);
+    let (_, mut rx2) = cw::session_framers(&key, cw::Role::Peer);
+    let mut cur = std::io::Cursor::new(first.clone());
+    rx2.recv::<_, cw::RpcFrame>(&mut cur, cw::FrameClass::Control.cap(), None)
+        .expect("frame 1 at position 1");
+    let mut cur = std::io::Cursor::new(first.clone());
+    let err = rx2
+        .recv::<_, cw::RpcFrame>(&mut cur, cw::FrameClass::Control.cap(), None)
+        .expect_err("frame 1 replayed at position 2 must refuse");
+    assert!(
+        err.to_string().contains("mac") || err.to_string().contains("sequence"),
+        "reason: {err}"
+    );
+
+    // Reflection: a coordinator→peer frame read by a COORDINATOR
+    // (i.e. bounced back at its author) must refuse — the direction
+    // tag is inside the MAC.
+    let (_, mut rx_same_dir) = cw::session_framers(&key, cw::Role::Coordinator);
+    let err = rx_same_dir
+        .recv::<_, cw::RpcFrame>(
+            &mut std::io::Cursor::new(first),
+            cw::FrameClass::Control.cap(),
+            None,
+        )
+        .expect_err("a reflected frame must refuse");
+    assert!(err.to_string().contains("mac"), "reason: {err}");
 }
 
 #[test]
@@ -723,59 +685,23 @@ fn a_ca_less_security_config_is_refused_not_downgraded() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Owner-side RPC runs on pinned service threads
+// 4. Owner-side RPC runs on the connection's own named OS thread
 // ---------------------------------------------------------------------------
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn rpc_work_runs_on_a_pinned_service_thread_never_the_callers_runtime() {
-    // §6.7: owner-side RPC handling runs on pinned service threads (the
-    // `ipc_service.rs` pattern), NEVER on the conveyor's task — the
-    // conveyor is a serialized ~0.78 ms server at ρ ≈ 0.92.
-    assert!(
-        cw::current_service_thread().is_none(),
-        "a tokio worker is never a service thread"
-    );
-    let pool = cw::ServicePool::start("sqz-clw-test", 2).expect("pool starts");
-    assert_eq!(pool.threads(), 2);
-
-    let (tx, rx) = std::sync::mpsc::channel::<(Option<usize>, String)>();
-    for key in 0..4u64 {
-        let tx = tx.clone();
-        pool.spawn_on(key, async move {
-            let name = std::thread::current()
-                .name()
-                .unwrap_or("<unnamed>")
-                .to_string();
-            let _ = tx.send((cw::current_service_thread(), name));
-        })
-        .expect("spawn on the pool");
-    }
-    drop(tx);
-    let mut seen = Vec::new();
-    for _ in 0..4 {
-        let (idx, name) = rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the pool executes the work");
-        let idx = idx.expect("work ran ON a service thread");
-        assert!(idx < 2, "the thread index is inside the pool: {idx}");
-        assert!(
-            name.starts_with("sqz-clw-test"),
-            "service threads are NAMED so pidstat/perf attribution works: {name}"
-        );
-        seen.push(idx);
-    }
-    seen.sort_unstable();
-    seen.dedup();
-    assert_eq!(
-        seen.len(),
-        2,
-        "connections shard across the pool, they do not pile on one thread"
-    );
-    pool.shutdown();
-}
+//
+// The pinned `ServicePool` (and its `current_service_thread` marker) was
+// DELETED by the rip-tokio wire conversion: the listener now serves
+// thread-per-connection, bounded by the `ConnGate` cap. The venue rule the
+// pool test pinned — owner-side RPC never runs on the caller's/conveyor's
+// runtime — survives on the new mechanism and is pinned below
+// (`rpc_service_calls_execute_on_the_connections_own_named_thread`).
 
 #[test]
-fn service_pool_thread_count_is_derived_and_bounded() {
+fn default_service_threads_derivation_is_bounded() {
+    // Retained across the conversion for the callers that size
+    // `RpcListenerConfig::service_threads` with it (the value no longer
+    // allocates lanes — serve threads are bounded by `max_connections`).
+    // The derivation law is unchanged: derived from the core count,
+    // never oversubscribing the box.
     let n = cw::default_service_threads();
     assert!(n >= 1, "at least one owner-side lane");
     let cpus = std::thread::available_parallelism()
@@ -1039,47 +965,41 @@ async fn rtt_instrument_reports_a_counted_loopback_floor() {
     host.shutdown();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_hostile_peer_costs_the_listener_one_bounded_handshake() {
+#[test]
+fn a_hostile_peer_costs_the_listener_one_bounded_handshake() {
     // The pre-authn budget: a peer that connects and says nothing is
     // dropped at the handshake deadline, and one that lies about a body
-    // length spends a chunk, not the cap.
+    // length spends a chunk, not the cap. Raw sync sockets since the
+    // rip-tokio conversion; the 5 s socket read timeout is the TEST
+    // budget (a hung read fails loud as WouldBlock), never the contract.
     let mut cfg = listener_cfg();
     cfg.handshake_timeout = Duration::from_millis(200);
     let host = cw::RpcListener::start(cfg, SECRET.to_vec(), Arc::new(cw::PingService))
         .expect("listener starts");
     let endpoint = host.endpoint();
 
-    let mut silent = tokio::net::TcpStream::connect(endpoint)
-        .await
-        .expect("connect");
+    let mut silent = std::net::TcpStream::connect(endpoint).expect("connect");
+    silent
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("test-budget read bound");
     // The coordinator speaks first, then waits — and gives up.
     let _challenge: Option<cw::RpcFrame> =
         cw::read_plain_frame(&mut silent, cw::FrameClass::Handshake.cap(), None)
-            .await
             .expect("the coordinator issues the challenge first");
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut buf = [0u8; 1];
-    let closed = tokio::time::timeout(Duration::from_secs(5), silent.read(&mut buf))
-        .await
-        .expect("the deadline fires well inside the test budget")
-        .expect("read");
+    let closed = silent
+        .read(&mut buf)
+        .expect("the deadline fires well inside the test budget");
     assert_eq!(closed, 0, "a silent peer is dropped, not parked forever");
 
-    let mut liar = tokio::net::TcpStream::connect(endpoint)
-        .await
-        .expect("connect");
+    let mut liar = std::net::TcpStream::connect(endpoint).expect("connect");
+    liar.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("test-budget read bound");
     let _: Option<cw::RpcFrame> =
-        cw::read_plain_frame(&mut liar, cw::FrameClass::Handshake.cap(), None)
-            .await
-            .expect("challenge");
+        cw::read_plain_frame(&mut liar, cw::FrameClass::Handshake.cap(), None).expect("challenge");
     liar.write_all(&u32::MAX.to_be_bytes())
-        .await
         .expect("lie about the length");
-    let n = tokio::time::timeout(Duration::from_secs(5), liar.read(&mut buf))
-        .await
-        .expect("the class cap refuses promptly")
-        .expect("read");
+    let n = liar.read(&mut buf).expect("the class cap refuses promptly");
     assert_eq!(
         n, 0,
         "a pre-authn frame past the hello class cap is dropped"
@@ -1088,23 +1008,31 @@ async fn a_hostile_peer_costs_the_listener_one_bounded_handshake() {
 }
 
 // ---------------------------------------------------------------------------
-// Wiring sanity: the pool is what serves, and it is bounded
+// Wiring sanity: the connection's own named serve thread is what serves
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn rpc_service_calls_execute_on_the_pinned_pool() {
+async fn rpc_service_calls_execute_on_the_connections_own_named_thread() {
+    // §6.7's venue rule on the rip-tokio mechanism: the pinned
+    // `ServicePool` is deleted, and the service call now runs ON the
+    // admitted connection's own named OS thread (`sqz-clw-conn` —
+    // thread-per-connection, bounded by the ConnGate cap the
+    // `concurrent_connections_are_capped_and_handles_pruned` leg pins) —
+    // never on the caller's tokio runtime (a runtime worker would show
+    // up here as `tokio-runtime-worker`) and never on the conveyor's
+    // task.
     #[derive(Default)]
     struct VenueService {
-        on_pool: AtomicUsize,
-        elsewhere: AtomicUsize,
+        venues: std::sync::Mutex<Vec<(String, std::thread::ThreadId)>>,
     }
     impl cw::RpcService for VenueService {
         fn call(&self, req: cw::RpcRequest) -> cw::RpcResponse {
-            if cw::current_service_thread().is_some() {
-                self.on_pool.fetch_add(1, Ordering::SeqCst);
-            } else {
-                self.elsewhere.fetch_add(1, Ordering::SeqCst);
-            }
+            let cur = std::thread::current();
+            let name = cur.name().unwrap_or("<unnamed>").to_string();
+            self.venues
+                .lock()
+                .expect("venue lock")
+                .push((name, cur.id()));
             cw::RpcResponse {
                 id: req.id,
                 status: 0,
@@ -1124,11 +1052,18 @@ async fn rpc_service_calls_execute_on_the_pinned_pool() {
             .await
             .expect("call");
     }
-    assert_eq!(svc.on_pool.load(Ordering::SeqCst), 4);
-    assert_eq!(
-        svc.elsewhere.load(Ordering::SeqCst),
-        0,
-        "an owner-side RPC must never run on the conveyor's runtime"
+    let venues = svc.venues.lock().expect("venue lock").clone();
+    assert_eq!(venues.len(), 4, "every call was served");
+    for (name, _) in &venues {
+        assert_eq!(
+            name, "sqz-clw-conn",
+            "an owner-side RPC runs on the connection's own NAMED serve \
+             thread (pidstat/perf attribution), never the caller's runtime"
+        );
+    }
+    assert!(
+        venues.windows(2).all(|w| w[0].1 == w[1].1),
+        "one connection is served by ONE thread (thread-per-connection): {venues:?}"
     );
     host.shutdown();
 }

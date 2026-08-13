@@ -64,7 +64,11 @@ fn watch() -> &'static Watch {
         // SAFETY: plain epoll fd creation; CLOEXEC so children never
         // inherit the reactor fd.
         let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-        assert!(epfd >= 0, "epoll_create1 failed: {}", std::io::Error::last_os_error());
+        assert!(
+            epfd >= 0,
+            "epoll_create1 failed: {}",
+            std::io::Error::last_os_error()
+        );
         let w: &'static Watch = Box::leak(Box::new(Watch {
             epfd,
             slots: Mutex::new(HashMap::new()),
@@ -83,9 +87,7 @@ fn service_loop(w: &'static Watch) {
     loop {
         // SAFETY: valid epfd + a stack event buffer; -1 = park until an
         // event (registrations use EPOLL_CTL so no wakeup fd is needed).
-        let n = unsafe {
-            libc::epoll_wait(w.epfd, events.as_mut_ptr(), events.len() as i32, -1)
-        };
+        let n = unsafe { libc::epoll_wait(w.epfd, events.as_mut_ptr(), events.len() as i32, -1) };
         if n < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::Interrupted {
@@ -100,8 +102,7 @@ fn service_loop(w: &'static Watch) {
             for ev in events.iter().take(n as usize) {
                 let fd = ev.u64 as RawFd;
                 if let Some(slot) = slots.get_mut(&fd) {
-                    let prev =
-                        std::mem::replace(&mut slot.state, SlotState::Fired(FdEvent::Ready));
+                    let prev = std::mem::replace(&mut slot.state, SlotState::Fired(FdEvent::Ready));
                     if let SlotState::Waiting(Some(wk)) = prev {
                         wakers.push(wk);
                     }
@@ -186,9 +187,7 @@ impl Future for ReadableFut {
         // future's drop deregisters before the caller can close it in
         // the ring teardown order).
         let rc = unsafe { libc::epoll_ctl(w.epfd, libc::EPOLL_CTL_MOD, self.fd, &mut ev) };
-        let rc = if rc < 0
-            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT)
-        {
+        let rc = if rc < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
             unsafe { libc::epoll_ctl(w.epfd, libc::EPOLL_CTL_ADD, self.fd, &mut ev) }
         } else {
             rc

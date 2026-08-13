@@ -15,22 +15,27 @@
 //!    behind the same reviewed contract.
 //!
 //! 2. **Tasks are owned, never detached.** [`OwnedTaskSet`] holds the
-//!    per-block tasks in a `tokio::task::JoinSet`:
-//!    [`OwnedTaskSet::join_all`] joins EVERY task before the
+//!    per-block tasks in a first-party cancel-gated set
+//!    (`squeezefs_ipc::sqz_taskset::OwnedSet` over the sqz-meta lanes):
+//!    [`OwnedTaskSet::join_all`] quiesces EVERY task before the
 //!    destination can be handed out or released and reports the first
-//!    error (inner or panic) only after the last sibling joined —
+//!    error (inner or panic) only after the last sibling resolved —
 //!    `try_join_all` over `JoinHandle`s short-circuited on the first
-//!    `JoinError` and dropped (= detached, tokio does not abort on
-//!    handle drop) the rest. Dropping the set (outer-future
-//!    cancellation) aborts every remaining task; with a salvage hook
-//!    installed, a detached reaper first drains the aborted set and
-//!    hands every SURFACED output to the hook — `write_striped`'s
+//!    error and dropped (= detached) the rest. Dropping the set
+//!    (outer-future cancellation) CANCELS every remaining task: a
+//!    cancelled writer's future is dropped at its next poll boundary
+//!    (never polled again — it cannot resume past its current await
+//!    point, and its captures die with it), and the set's own drop
+//!    bounds the mid-poll window with a TICK-bounded quiesce — the
+//!    same non-instant window tokio's `abort` had. With a salvage hook
+//!    installed, a detached reaper first quiesces the cancelled set
+//!    and hands every SURFACED output to the hook — `write_striped`'s
 //!    RES-9 face, where each output is a minted-and-published block
 //!    key that must be freed rather than leaked to fsck.
 //!
 //! [`MintedBlockGuard`] covers the task-interior window RES-9 names:
 //! between `allocate_block` and the `Ok` return that surfaces the block
-//! to the caller, ANY exit (a `?` error, a panic, or a `JoinSet` abort
+//! to the caller, ANY exit (a `?` error, a panic, or a cancel-gate drop
 //! landing at an await) frees the minted offset instead of leaking an
 //! allocated-but-unpublished block.
 
@@ -95,9 +100,12 @@ impl AssemblyDest {
     /// of this value and every clone of the owning `Arc` — on the read
     /// path that is the §5.4 payload-lease exclusivity window (this
     /// request is the region's only accessor until the reply commits).
-    /// Cancellation aborts the [`OwnedTaskSet`] so no detached writer
-    /// outlives the request; the ent re-arm window itself is MEM-1's
-    /// owner-token territory, not this type's.
+    /// Cancellation cancels the [`OwnedTaskSet`] so no detached writer
+    /// outlives the request: a cancelled writer's future is dropped at
+    /// its next poll boundary (never polled again), and quiesce-on-drop
+    /// bounds the mid-poll window — the same window tokio's abort had.
+    /// The ent re-arm window itself is MEM-1's owner-token territory,
+    /// not this type's.
     pub unsafe fn payload(ptr: *mut u8, len: usize) -> Self {
         Self {
             ptr,
@@ -189,42 +197,54 @@ impl AsRef<[u8]> for ArcDestOwner {
 /// abort) when the owner is dropped without a full [`OwnedTaskSet::join_all`].
 pub type Salvage<T> = Box<dyn FnOnce(Vec<T>) -> futures::future::BoxFuture<'static, ()> + Send>;
 
-/// An OWNED set of parallel per-block tasks (MEM-2): join-all-before-
-/// release semantics on the happy/error paths, abort (plus optional
-/// salvage) on cancellation. Never detaches a task.
-pub struct OwnedTaskSet<T: Send + 'static> {
-    set: tokio::task::JoinSet<Result<T>>,
-    /// Outputs surfaced so far — kept in `self` (not a caller local) so
-    /// cancellation mid-[`Self::join_all`] still hands them to the
-    /// salvage hook.
+/// The shared result sink of an [`OwnedTaskSet`]: outputs surfaced so
+/// far plus the first error — kept behind an `Arc` (not a caller
+/// local) so cancellation mid-[`OwnedTaskSet::join_all`] still hands
+/// the surfaced outputs to the salvage hook.
+struct TaskOutputs<T> {
     outputs: Vec<T>,
+    first_err: Option<SqueezefsError>,
+}
+
+/// An OWNED set of parallel per-block tasks (MEM-2): join-all-before-
+/// release semantics on the happy/error paths, cancel (plus optional
+/// salvage) on drop. Never detaches a task. Backed by the first-party
+/// cancel-gated `sqz_taskset::OwnedSet` on the sqz-meta lanes: a
+/// cancelled task's future is DROPPED at its next poll boundary
+/// (never polled again — its captures die), and the set's own drop
+/// bounds the mid-poll window with a TICK-bounded quiesce.
+pub struct OwnedTaskSet<T: Send + 'static> {
+    set: squeezefs_ipc::sqz_taskset::OwnedSet,
+    results: Arc<parking_lot::Mutex<TaskOutputs<T>>>,
     salvage: Option<Salvage<T>>,
     context: &'static str,
 }
 
 impl<T: Send + 'static> OwnedTaskSet<T> {
-    /// A set with no salvage hook (the read-assembly shape: outputs
-    /// carry no resources; dropping the set aborts every task and each
-    /// task's own `Arc<AssemblyDest>` keeps the destination alive).
-    pub fn new(context: &'static str) -> Self {
+    fn build(context: &'static str, salvage: Option<Salvage<T>>) -> Self {
         Self {
-            set: tokio::task::JoinSet::new(),
-            outputs: Vec::new(),
-            salvage: None,
+            set: squeezefs_ipc::sqz_taskset::OwnedSet::new(context, crate::meta_exec::spawn_meta),
+            results: Arc::new(parking_lot::Mutex::new(TaskOutputs {
+                outputs: Vec::new(),
+                first_err: None,
+            })),
+            salvage,
             context,
         }
+    }
+
+    /// A set with no salvage hook (the read-assembly shape: outputs
+    /// carry no resources; dropping the set cancels every task and each
+    /// task's own `Arc<AssemblyDest>` keeps the destination alive).
+    pub fn new(context: &'static str) -> Self {
+        Self::build(context, None)
     }
 
     /// A set whose cancel path hands every surfaced output to
     /// `salvage` (the `write_striped` shape: outputs are minted block
     /// keys that must be freed, RES-9).
     pub fn with_salvage(context: &'static str, salvage: Salvage<T>) -> Self {
-        Self {
-            set: tokio::task::JoinSet::new(),
-            outputs: Vec::new(),
-            salvage: Some(salvage),
-            context,
-        }
+        Self::build(context, Some(salvage))
     }
 
     /// Spawn a task into the owned set (starts immediately).
@@ -232,77 +252,83 @@ impl<T: Send + 'static> OwnedTaskSet<T> {
     where
         F: std::future::Future<Output = Result<T>> + Send + 'static,
     {
-        self.set.spawn(fut);
-    }
-
-    /// Join EVERY task — never short-circuits (MEM-2). Outputs of
-    /// successful tasks and the FIRST error (inner error or panic) are
-    /// returned only after the last sibling joined, so no exit path
-    /// releases the destination while a writer is still running.
-    pub async fn join_all(&mut self) -> (Vec<T>, Option<SqueezefsError>) {
-        let mut first_err: Option<SqueezefsError> = None;
-        while let Some(joined) = self.set.join_next().await {
-            match joined {
-                Ok(Ok(t)) => self.outputs.push(t),
+        let results = Arc::clone(&self.results);
+        let context = self.context;
+        self.set.spawn(async move {
+            // The retired `JoinSet` reported a panicking sibling as the
+            // first error after every task joined; catch here so the
+            // contract survives the venue change (the panic is
+            // REPORTED through `join_all`, never detached).
+            let out = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(fut)).await;
+            let mut r = results.lock();
+            match out {
+                Ok(Ok(t)) => r.outputs.push(t),
                 Ok(Err(e)) => {
-                    if first_err.is_none() {
-                        first_err = Some(e);
+                    if r.first_err.is_none() {
+                        r.first_err = Some(e);
                     }
                 }
-                Err(join_err) => {
-                    if first_err.is_none() {
-                        let kind = if join_err.is_panic() {
-                            "panicked"
-                        } else {
-                            "was aborted"
-                        };
-                        first_err = Some(SqueezefsError::Io(std::io::Error::other(format!(
-                            "{} task {kind}: {join_err:?}",
-                            self.context
+                Err(panic) => {
+                    if r.first_err.is_none() {
+                        let msg = panic
+                            .downcast_ref::<&str>()
+                            .map(|s| s.to_string())
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "non-string panic payload".to_string());
+                        r.first_err = Some(SqueezefsError::Io(std::io::Error::other(format!(
+                            "{context} task panicked: {msg}"
                         ))));
                     }
                 }
             }
-        }
-        (std::mem::take(&mut self.outputs), first_err)
+        });
+    }
+
+    /// Join EVERY task — never short-circuits (MEM-2). Outputs of
+    /// successful tasks and the FIRST error (inner error or panic) are
+    /// returned only after the last sibling resolved, so no exit path
+    /// releases the destination while a writer is still running.
+    pub async fn join_all(&mut self) -> (Vec<T>, Option<SqueezefsError>) {
+        self.set.quiesce().await;
+        let mut r = self.results.lock();
+        (std::mem::take(&mut r.outputs), r.first_err.take())
     }
 }
 
 impl<T: Send + 'static> Drop for OwnedTaskSet<T> {
     fn drop(&mut self) {
-        if self.set.is_empty() && self.outputs.is_empty() {
-            // Normal completion: `join_all` drained the set and handed
+        // Cancel FIRST: every remaining writer's future is dropped at
+        // its next poll boundary (the cancel gate checks the flag
+        // before polling), so no cancelled task ever writes the
+        // destination again; one mid-poll finishes that poll — the
+        // same non-instant window tokio's `abort_all` had. `self.set`'s
+        // own drop (fields drop after this body) then bounds that
+        // window with a TICK-bounded blocking quiesce.
+        self.set.cancel_all();
+        if self.set.live() == 0 && self.results.lock().outputs.is_empty() {
+            // Normal completion: `join_all` quiesced the set and handed
             // the outputs to the caller (whose happy/error paths own
-            // their custody). Nothing to abort, nothing to salvage.
+            // their custody). Nothing to cancel, nothing to salvage.
             return;
         }
         let Some(salvage) = self.salvage.take() else {
-            // No salvage hook: letting the `JoinSet` drop aborts every
-            // remaining task. Destination liveness under abort is the
-            // spawners' business — each task owns its own
-            // `Arc<AssemblyDest>` clone.
+            // No salvage hook: the cancel above (plus the set's own
+            // bounded drop-quiesce) is the whole story. Destination
+            // liveness under cancel is the spawners' business — each
+            // task owns its own `Arc<AssemblyDest>` clone.
             return;
         };
-        let mut set = std::mem::take(&mut self.set);
-        let outputs = std::mem::take(&mut self.outputs);
+        let handle = self.set.handle();
+        let results = Arc::clone(&self.results);
         let context = self.context;
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            // No runtime (teardown): the `JoinSet` drop still aborts
-            // the tasks; salvage state is rebuilt at next mount (the
-            // allocator state is process-lifetime).
-            return;
-        };
         // Detached by design (documented rationale): `Drop` cannot
-        // await. The reaper is bounded — it aborts the set, drains
-        // every surfaced output, runs the salvage hook once, and exits.
-        handle.spawn(async move {
-            set.abort_all();
-            let mut outs = outputs;
-            while let Some(joined) = set.join_next().await {
-                if let Ok(Ok(t)) = joined {
-                    outs.push(t);
-                }
-            }
+        // await. The reaper is bounded — it waits for every cancelled
+        // task to resolve, drains the surfaced outputs, runs the
+        // salvage hook once, and exits (no ambient runtime needed —
+        // the sqz-meta pool is process-lifetime).
+        crate::meta_exec::spawn_meta("assembly_salvage", async move {
+            handle.quiesce().await;
+            let outs = std::mem::take(&mut results.lock().outputs);
             log::debug!(
                 "{context}: owner cancelled — salvaging {} surfaced output(s)",
                 outs.len()
@@ -315,7 +341,7 @@ impl<T: Send + 'static> Drop for OwnedTaskSet<T> {
 /// RES-9 mint guard: covers a block-write task's window between
 /// `allocate_block` and the `Ok` return that surfaces the block to the
 /// caller. ANY exit inside the window — a `?` error, a panic, or a
-/// `JoinSet` abort landing at an await — frees the minted offset
+/// cancel-gate drop landing at an await — frees the minted offset
 /// instead of leaking an allocated(-and-possibly-published) block that
 /// only fsck could find. Disarm exactly when custody transfers (the
 /// surfaced output, whose failure/cancel paths free explicitly).

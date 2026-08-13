@@ -9,8 +9,9 @@
 //!   wrong `wire_schema` refused.
 //! - **Transport-coupled verification (Issue-30 law)**: plaintext ⇒
 //!   mandatory-100 % verify-reads before any mutating publish (the
-//!   configured sample is overridden); TLS (tokio-rustls over the
-//!   `ClusterSecurityConfig` cert/CA/verifier machinery) keeps sampling.
+//!   configured sample is overridden); TLS (sync rustls over the
+//!   `ClusterSecurityConfig` cert/CA/verifier machinery, on OS threads
+//!   since the rip-tokio conversion) keeps sampling.
 //! - **End-to-end Noop shard**: enroll → ShardAssign → heartbeats →
 //!   ResultSubmit → ResultAck; the job completes through the fabric;
 //!   `job_remote_shards`/`job_remote_submissions` account for it.
@@ -66,6 +67,7 @@ use squeezefs::meta_backend::reservation::{
 };
 use squeezefs::meta_backend::{Metadata, RoutedMetaBackend};
 
+use std::io::{Read as _, Write as _};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -129,14 +131,21 @@ fn noop_spec(tasks: u64, task_ms: u64) -> JobSpec {
     }
 }
 
+/// A raw sync client connection (the wire is `std::io` over blocking
+/// sockets since the rip-tokio conversion) with a loud failsafe read
+/// bound: a hung read fails the test as a timeout error instead of
+/// parking the binary forever.
+fn raw_connect(endpoint: std::net::SocketAddr) -> std::net::TcpStream {
+    let c = std::net::TcpStream::connect(endpoint).expect("raw connect");
+    c.set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("failsafe read bound");
+    c
+}
+
 /// Read the coordinator-issued enrollment challenge off a freshly
 /// accepted connection (VAL-6: the coordinator speaks first now).
-async fn challenge_nonce<S>(stream: &mut S) -> String
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
+fn challenge_nonce(stream: &mut std::net::TcpStream) -> String {
     match read_frame(stream)
-        .await
         .expect("challenge readable")
         .expect("the coordinator issues the challenge first")
     {
@@ -311,10 +320,8 @@ async fn enrollment_hmac_gate_and_schema_refusal() {
 
     // Wrong wire_schema: refused loudly even with a valid HMAC — the
     // frame layer is schema-versioned (the challenge handshake bumped it).
-    let mut raw_conn = tokio::net::TcpStream::connect(host.endpoint())
-        .await
-        .expect("raw connect");
-    let server_nonce = challenge_nonce(&mut raw_conn).await;
+    let mut raw_conn = raw_connect(host.endpoint());
+    let server_nonce = challenge_nonce(&mut raw_conn);
     let hmac = squeezefs::job_wire::enroll_hmac(&secret, "w-schema", &server_nonce, "nonce-1");
     write_frame(
         &mut raw_conn,
@@ -327,10 +334,8 @@ async fn enrollment_hmac_gate_and_schema_refusal() {
             pr_key: None,
         },
     )
-    .await
     .expect("send future-schema enroll");
     let reply = read_frame(&mut raw_conn)
-        .await
         .expect("read reply")
         .expect("reply frame");
     match reply {
@@ -371,7 +376,7 @@ async fn plaintext_transport_forces_mandatory_verify_reads() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tls_transport_round_trip_keeps_sampling() {
-    // TLS via tokio-rustls over the ClusterSecurityConfig cert/CA/
+    // TLS via sync rustls over the ClusterSecurityConfig cert/CA/
     // verifier machinery (`tiering::cluster_tls`): an mTLS-pinned worker
     // enrolls and executes a Noop shard end-to-end; the configured
     // verify sample is honored (sampling is sanctioned under TLS).
@@ -415,16 +420,38 @@ async fn tls_transport_round_trip_keeps_sampling() {
         .expect("TLS enroll");
     let run = tokio::spawn(worker.run(FakeShardDevice::new(0, 0)));
 
-    let job_id = fab.submit(noop_spec(8, 1)).await.expect("submit");
+    let job_a = fab.submit(noop_spec(8, 1)).await.expect("submit");
     let state = fab
-        .wait_terminal(&job_id, Duration::from_secs(30))
+        .wait_terminal(&job_a, Duration::from_secs(30))
         .await
         .expect("terminal over TLS");
     assert_eq!(state, JobState::Completed);
 
+    // The ResultAck is sent AFTER the job flips terminal, and on a split
+    // TLS stream the ack write waits for the reader's mutex slice (the
+    // rip-tokio `ClusterStream::split` posture) — so shutting down here
+    // races the teardown nudge against the FINAL ack by design (abrupt
+    // shutdown aborts in-flight session writes). A second job is the
+    // event-driven proof the first ack ARRIVED: the worker's shard loop
+    // only picks up shard B after it consumed shard A's ack, and this
+    // fabric has zero local workers, so job B completing IS that proof.
+    let job_b = fab.submit(noop_spec(8, 1)).await.expect("submit second");
+    let state = fab
+        .wait_terminal(&job_b, Duration::from_secs(30))
+        .await
+        .expect("second terminal over TLS");
+    assert_eq!(state, JobState::Completed);
+
     host.shutdown().await;
     let report = run.await.expect("worker task").expect("worker run");
-    assert_eq!(report.shards_completed, 1);
+    assert!(
+        report.shards_completed >= 1,
+        "job B completing proves shard A's ResultAck round-tripped over \
+         TLS and was counted; only shard B's ack may lose the shutdown \
+         race: {report:?}"
+    );
+    assert_eq!(report.submissions_refused, 0, "{report:?}");
+    assert_eq!(report.shards_aborted, 0, "{report:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -954,10 +981,8 @@ async fn enrollment_challenge_nonce_is_single_use() {
     let secret = read_enroll_secret(&meta).await.expect("secret");
 
     // Capture a legitimate hello…
-    let mut conn = tokio::net::TcpStream::connect(host.endpoint())
-        .await
-        .expect("connect");
-    let nonce = challenge_nonce(&mut conn).await;
+    let mut conn = raw_connect(host.endpoint());
+    let nonce = challenge_nonce(&mut conn);
     let hello = WireFrame::Enroll {
         wire_schema: WIRE_SCHEMA,
         worker_id: "w-replay".into(),
@@ -966,8 +991,8 @@ async fn enrollment_challenge_nonce_is_single_use() {
         hmac: squeezefs::job_wire::enroll_hmac(&secret, "w-replay", &nonce, "worker-entropy"),
         pr_key: None,
     };
-    write_frame(&mut conn, &hello).await.expect("send hello");
-    match read_frame(&mut conn).await.expect("reply").expect("frame") {
+    write_frame(&mut conn, &hello).expect("send hello");
+    match read_frame(&mut conn).expect("reply").expect("frame") {
         WireFrame::EnrollOk { .. } => {}
         other => panic!("a fresh challenge must admit: {other:?}"),
     }
@@ -979,18 +1004,10 @@ async fn enrollment_challenge_nonce_is_single_use() {
 
     // …and replay it verbatim on a second connection.
     let refused0 = METRICS.job_remote_enroll_refused.load(Ordering::Relaxed);
-    let mut replay = tokio::net::TcpStream::connect(host.endpoint())
-        .await
-        .expect("connect");
-    let _fresh = challenge_nonce(&mut replay).await; // discarded on purpose
-    write_frame(&mut replay, &hello)
-        .await
-        .expect("send the replayed hello");
-    match read_frame(&mut replay)
-        .await
-        .expect("reply")
-        .expect("frame")
-    {
+    let mut replay = raw_connect(host.endpoint());
+    let _fresh = challenge_nonce(&mut replay); // discarded on purpose
+    write_frame(&mut replay, &hello).expect("send the replayed hello");
+    match read_frame(&mut replay).expect("reply").expect("frame") {
         WireFrame::EnrollRefused { reason } => {
             assert!(
                 reason.contains("nonce"),
@@ -1023,10 +1040,8 @@ async fn expired_enrollment_challenge_is_refused() {
         .expect("host start");
     let secret = read_enroll_secret(&meta).await.expect("secret");
 
-    let mut conn = tokio::net::TcpStream::connect(host.endpoint())
-        .await
-        .expect("connect");
-    let nonce = challenge_nonce(&mut conn).await;
+    let mut conn = raw_connect(host.endpoint());
+    let nonce = challenge_nonce(&mut conn);
     tokio::time::sleep(Duration::from_millis(400)).await; // past the window
     write_frame(
         &mut conn,
@@ -1039,9 +1054,8 @@ async fn expired_enrollment_challenge_is_refused() {
             pr_key: None,
         },
     )
-    .await
     .expect("send the stale hello");
-    match read_frame(&mut conn).await.expect("reply").expect("frame") {
+    match read_frame(&mut conn).expect("reply").expect("frame") {
         WireFrame::EnrollRefused { reason } => {
             assert!(
                 reason.contains("expired") || reason.contains("stale"),
@@ -1071,10 +1085,8 @@ async fn concurrent_connections_are_capped() {
     // Two live connections fill the cap (each parks after its challenge).
     let mut held = Vec::new();
     for _ in 0..2 {
-        let mut c = tokio::net::TcpStream::connect(host.endpoint())
-            .await
-            .expect("connect");
-        let _ = challenge_nonce(&mut c).await;
+        let mut c = raw_connect(host.endpoint());
+        let _ = challenge_nonce(&mut c);
         held.push(c);
     }
     poll_until("both connections live", Duration::from_secs(5), || {
@@ -1082,12 +1094,10 @@ async fn concurrent_connections_are_capped() {
     })
     .await;
 
-    // The third is closed immediately — no task, no challenge, no frame.
-    let mut over = tokio::net::TcpStream::connect(host.endpoint())
-        .await
-        .expect("connect past the cap");
+    // The third is closed immediately — no thread, no challenge, no frame.
+    let mut over = raw_connect(host.endpoint());
     assert!(
-        read_frame(&mut over).await.expect("eof is clean").is_none(),
+        read_frame(&mut over).expect("eof is clean").is_none(),
         "a connection past the cap is closed, not served"
     );
     poll_until("refusal counted", Duration::from_secs(5), || {
@@ -1106,10 +1116,8 @@ async fn concurrent_connections_are_capped() {
         host.live_connections() == 1
     })
     .await;
-    let mut again = tokio::net::TcpStream::connect(host.endpoint())
-        .await
-        .expect("reconnect");
-    let _ = challenge_nonce(&mut again).await;
+    let mut again = raw_connect(host.endpoint());
+    let _ = challenge_nonce(&mut again);
 
     drop(again);
     drop(held);
@@ -1130,18 +1138,14 @@ async fn pre_enrollment_stall_is_dropped_at_the_handshake_deadline() {
         .expect("host start");
 
     // (a) silence after the challenge.
-    let mut silent = tokio::net::TcpStream::connect(host.endpoint())
-        .await
-        .expect("connect");
-    let _ = challenge_nonce(&mut silent).await;
+    let mut silent = raw_connect(host.endpoint());
+    let _ = challenge_nonce(&mut silent);
 
     // (b) a length prefix with a body that never comes (slowloris).
-    let mut dribble = tokio::net::TcpStream::connect(host.endpoint())
-        .await
-        .expect("connect");
-    let _ = challenge_nonce(&mut dribble).await;
-    tokio::io::AsyncWriteExt::write_all(&mut dribble, &[0u8, 0, 4, 0, b'{'])
-        .await
+    let mut dribble = raw_connect(host.endpoint());
+    let _ = challenge_nonce(&mut dribble);
+    dribble
+        .write_all(&[0u8, 0, 4, 0, b'{'])
         .expect("prefix + one body byte");
 
     poll_until(
@@ -1154,16 +1158,12 @@ async fn pre_enrollment_stall_is_dropped_at_the_handshake_deadline() {
     // Both see EOF.
     let mut buf = [0u8; 1];
     assert_eq!(
-        tokio::io::AsyncReadExt::read(&mut silent, &mut buf)
-            .await
-            .expect("read after reap"),
+        silent.read(&mut buf).expect("read after reap"),
         0,
         "the silent peer was closed"
     );
     assert_eq!(
-        tokio::io::AsyncReadExt::read(&mut dribble, &mut buf)
-            .await
-            .expect("read after reap"),
+        dribble.read(&mut buf).expect("read after reap"),
         0,
         "the dribbling peer was closed"
     );
@@ -1182,13 +1182,10 @@ async fn pre_enrollment_frames_ride_the_hello_class_cap() {
         .await
         .expect("host start");
 
-    let mut conn = tokio::net::TcpStream::connect(host.endpoint())
-        .await
-        .expect("connect");
-    let _ = challenge_nonce(&mut conn).await;
+    let mut conn = raw_connect(host.endpoint());
+    let _ = challenge_nonce(&mut conn);
     let oversize = squeezefs::job_wire::MAX_HELLO_FRAME_BYTES + 1;
-    tokio::io::AsyncWriteExt::write_all(&mut conn, &oversize.to_be_bytes())
-        .await
+    conn.write_all(&oversize.to_be_bytes())
         .expect("send an over-class length prefix");
     poll_until(
         "over-class pre-enrollment frame closes the connection",
@@ -1234,11 +1231,7 @@ async fn quiet_host_releases_finished_handles_without_further_accepts() {
     let base = host.retained_task_handles();
     let mut held = Vec::with_capacity(12);
     for _ in 0..12 {
-        held.push(
-            tokio::net::TcpStream::connect(host.endpoint())
-                .await
-                .expect("connect"),
-        );
+        held.push(raw_connect(host.endpoint()));
     }
     // All 12 handles registered, none finished (the connections are
     // still open): the accept loop has run its last prune of this test.
@@ -1289,10 +1282,8 @@ async fn finished_connection_handles_are_pruned() {
 
     let base = host.retained_task_handles();
     for _ in 0..24 {
-        let c = tokio::net::TcpStream::connect(host.endpoint())
-            .await
-            .expect("connect");
-        drop(c); // immediate departure — the serve task finishes at once
+        let c = raw_connect(host.endpoint());
+        drop(c); // immediate departure — the serve thread finishes at once
     }
     poll_until(
         "finished handles pruned (failsafe deadline)",

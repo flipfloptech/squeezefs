@@ -1,10 +1,13 @@
 use std::io;
 
 #[cfg(feature = "tokio-runtime")]
-pub use tokio::FuseConnection;
+pub use uring_conn::FuseConnection;
 
 #[cfg(feature = "tokio-runtime")]
-mod tokio;
+// The uring connection module (renamed from `tokio.rs` in the
+// rip-tokio-total sweep — it was always the io_uring implementation;
+// the name was upstream-fork lineage only).
+mod uring_conn;
 
 #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
 pub mod fuse_over_uring;

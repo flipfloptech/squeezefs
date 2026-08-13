@@ -1230,24 +1230,19 @@ impl SessionSink for DataPlaneSink {
 /// (design-volume-lifecycle §5.1.4) — and, since PR VL3, the volume
 /// lifecycle verbs against the live filesystem (`volume-add-data`,
 /// `volume-list`, the re-homed health overrides). Runs on host ctl
-/// threads (plain OS threads) and blocks on the captured runtime handle.
+/// threads (plain OS threads) and drives the verb futures with the
+/// first-party `sqz_blocking::block_on` (rip-tokio-total: the verbs
+/// ride sqz timers/channels + run_blocking — no runtime driver needed).
 pub struct FabricAdminSink {
     fabric: std::sync::Arc<crate::jobs::JobFabric>,
     /// The live filesystem the volume verbs act on. `None` = fabric-only
     /// wiring (fabric unit tests); volume verbs refuse loudly then.
     fs: Option<std::sync::Arc<SqueezefsFilesystem>>,
-    rt: tokio::runtime::Handle,
 }
 
 impl FabricAdminSink {
-    /// Capture the current runtime (call from async context — mount
-    /// wiring and tests both are).
     pub fn new(fabric: std::sync::Arc<crate::jobs::JobFabric>) -> Self {
-        Self {
-            fabric,
-            fs: None,
-            rt: tokio::runtime::Handle::current(),
-        }
+        Self { fabric, fs: None }
     }
 
     /// [`Self::new`] with the live filesystem wired — the mount posture
@@ -1259,7 +1254,6 @@ impl FabricAdminSink {
         Self {
             fabric,
             fs: Some(fs),
-            rt: tokio::runtime::Handle::current(),
         }
     }
 
@@ -1315,7 +1309,7 @@ impl crate::ipc_host::AdminSink for FabricAdminSink {
         let fabric = self.fabric.clone();
         let fs = self.fs.clone();
         let arg = arg.trim().to_string();
-        let res: Result<String, String> = self.rt.block_on(async move {
+        let res: Result<String, String> = squeezefs_ipc::sqz_blocking::block_on(async move {
             // The VL3 volume verbs need the live filesystem.
             let need_fs = || {
                 fs.clone()

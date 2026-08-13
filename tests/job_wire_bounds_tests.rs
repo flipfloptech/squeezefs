@@ -37,6 +37,7 @@ use squeezefs::job_wire::{
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::io::Write as _;
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -91,13 +92,6 @@ fn peak_alloc<T>(f: impl FnOnce() -> T) -> (T, usize) {
     (out, PEAK.with(|p| p.get()))
 }
 
-fn rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("current-thread runtime")
-}
-
 /// A length prefix with no body behind it (the lying-prefix shape).
 fn bare_prefix(len: u32) -> Vec<u8> {
     len.to_be_bytes().to_vec()
@@ -109,11 +103,9 @@ fn bare_prefix(len: u32) -> Vec<u8> {
 
 #[test]
 fn oversize_length_prefix_refuses_naming_the_cap() {
-    let rt = rt();
     let mut cursor = std::io::Cursor::new(bare_prefix(MAX_FRAME_BYTES + 1));
-    let err = rt
-        .block_on(read_frame(&mut cursor))
-        .expect_err("a length prefix past the cap is a protocol violation");
+    let err =
+        read_frame(&mut cursor).expect_err("a length prefix past the cap is a protocol violation");
     let msg = err.to_string();
     assert!(
         msg.contains(&MAX_FRAME_BYTES.to_string()),
@@ -126,10 +118,9 @@ fn lying_length_prefix_allocates_one_chunk_not_the_cap() {
     // The VAL-6 anchor: `vec![0u8; len]` ran BEFORE `read_exact`, so four
     // attacker bytes bought a 16 MiB allocation per connection. Body
     // memory must be committed only as bytes arrive.
-    let rt = rt();
     let (res, peak) = peak_alloc(|| {
         let mut cursor = std::io::Cursor::new(bare_prefix(MAX_FRAME_BYTES));
-        rt.block_on(read_frame(&mut cursor))
+        read_frame(&mut cursor)
     });
     assert!(
         res.is_err(),
@@ -146,12 +137,11 @@ fn lying_length_prefix_allocates_one_chunk_not_the_cap() {
 fn partially_delivered_body_allocates_only_what_arrived() {
     // 8 MiB claimed, 1 KiB delivered: the peak stays chunk-bounded and
     // the read fails (truncated), never succeeds on a short body.
-    let rt = rt();
     let mut wire = bare_prefix(8 * 1024 * 1024);
     wire.extend(std::iter::repeat_n(b'x', 1024));
     let (res, peak) = peak_alloc(|| {
         let mut cursor = std::io::Cursor::new(wire);
-        rt.block_on(read_frame(&mut cursor))
+        read_frame(&mut cursor)
     });
     assert!(res.is_err(), "a truncated body must not decode");
     assert!(
@@ -162,26 +152,20 @@ fn partially_delivered_body_allocates_only_what_arrived() {
 
 #[test]
 fn valid_frames_still_round_trip_through_the_bounded_reader() {
-    let rt = rt();
-    rt.block_on(async {
-        let frame = WireFrame::Heartbeat {
-            worker_id: "w-round-trip".into(),
-        };
-        let mut buf: Vec<u8> = Vec::new();
-        write_frame(&mut buf, &frame).await.expect("encode");
-        let mut cursor = std::io::Cursor::new(buf);
-        let back = read_frame(&mut cursor)
-            .await
-            .expect("decode")
-            .expect("one frame");
-        match back {
-            WireFrame::Heartbeat { worker_id } => assert_eq!(worker_id, "w-round-trip"),
-            other => panic!("round-trip changed the frame: {other:?}"),
-        }
-        // Clean EOF at a frame boundary is still `Ok(None)`.
-        let mut empty = std::io::Cursor::new(Vec::new());
-        assert!(read_frame(&mut empty).await.expect("clean eof").is_none());
-    });
+    let frame = WireFrame::Heartbeat {
+        worker_id: "w-round-trip".into(),
+    };
+    let mut buf: Vec<u8> = Vec::new();
+    write_frame(&mut buf, &frame).expect("encode");
+    let mut cursor = std::io::Cursor::new(buf);
+    let back = read_frame(&mut cursor).expect("decode").expect("one frame");
+    match back {
+        WireFrame::Heartbeat { worker_id } => assert_eq!(worker_id, "w-round-trip"),
+        other => panic!("round-trip changed the frame: {other:?}"),
+    }
+    // Clean EOF at a frame boundary is still `Ok(None)`.
+    let mut empty = std::io::Cursor::new(Vec::new());
+    assert!(read_frame(&mut empty).expect("clean eof").is_none());
 }
 
 #[test]
@@ -195,15 +179,13 @@ fn pre_enrollment_class_cap_is_far_below_the_frame_cap() {
             "the pre-enrollment class must be far below the post-enrollment cap"
         )
     };
-    let rt = rt();
     let mut cursor = std::io::Cursor::new(bare_prefix(MAX_HELLO_FRAME_BYTES + 1));
-    let err = rt
-        .block_on(read_frame_limited(
-            &mut cursor,
-            MAX_HELLO_FRAME_BYTES,
-            Some(Duration::from_millis(50)),
-        ))
-        .expect_err("a hello-class frame past its class cap refuses");
+    let err = read_frame_limited(
+        &mut cursor,
+        MAX_HELLO_FRAME_BYTES,
+        Some(Duration::from_millis(50)),
+    )
+    .expect_err("a hello-class frame past its class cap refuses");
     let msg = err.to_string();
     assert!(
         msg.contains(&MAX_HELLO_FRAME_BYTES.to_string()),
@@ -215,55 +197,57 @@ fn pre_enrollment_class_cap_is_far_below_the_frame_cap() {
 fn stalled_frame_body_hits_the_per_class_deadline() {
     // Slowloris: a valid prefix then silence. Before VAL-6 only the HELLO
     // frame had any deadline, and the body read had none at all.
-    let rt = rt();
-    rt.block_on(async {
-        let (mut client, mut server) = tokio::io::duplex(64);
-        // 4 KiB claimed; 8 bytes delivered; then the peer just holds.
-        let mut head = bare_prefix(4096);
-        head.extend_from_slice(b"12345678");
-        tokio::io::AsyncWriteExt::write_all(&mut client, &head)
-            .await
-            .expect("prefix + dribble");
+    //
+    // Deadlines ride the SOCKET since the rip-tokio conversion: each
+    // blocking read is bounded by the caller-set `set_read_timeout`, and
+    // the framer's `body_timeout` bounds the WHOLE body between chunks
+    // (a dribbling peer is an error, not a parked thread). Socket-timeout
+    // expiry surfaces as `WouldBlock` on Linux (`TimedOut` elsewhere) —
+    // the product's own `io_timed_out` predicate reads both as a timeout,
+    // so this asserts the same class.
+    let (mut client, mut server) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+    server
+        .set_read_timeout(Some(Duration::from_millis(150)))
+        .expect("socket read timeout");
+    // 4 KiB claimed; 8 bytes delivered; then the peer just holds.
+    let mut head = bare_prefix(4096);
+    head.extend_from_slice(b"12345678");
+    client.write_all(&head).expect("prefix + dribble");
 
-        let started = std::time::Instant::now();
-        let err = read_frame_limited(
-            &mut server,
-            MAX_HELLO_FRAME_BYTES,
-            Some(Duration::from_millis(150)),
-        )
-        .await
-        .expect_err("a stalled body must time out");
-        assert_eq!(
+    let started = std::time::Instant::now();
+    let err = read_frame_limited(
+        &mut server,
+        MAX_HELLO_FRAME_BYTES,
+        Some(Duration::from_millis(150)),
+    )
+    .expect_err("a stalled body must time out");
+    assert!(
+        matches!(
             err.kind(),
-            std::io::ErrorKind::TimedOut,
-            "the deadline surfaces as TimedOut: {err}"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "the deadline fired, not the old unbounded park"
-        );
-        drop(client);
-    });
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+        "the deadline surfaces as a timeout-class error: {err}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the deadline fired, not the old unbounded park"
+    );
+    drop(client);
 }
 
 #[test]
 fn write_frame_still_refuses_to_emit_past_the_cap() {
     // The encode side's cap is unchanged (kept in the same pass so the
     // two directions cannot drift).
-    let rt = rt();
-    rt.block_on(async {
-        let huge = WireFrame::Heartbeat {
-            worker_id: "x".repeat(MAX_FRAME_BYTES as usize + 64),
-        };
-        let mut buf: Vec<u8> = Vec::new();
-        let err = write_frame(&mut buf, &huge)
-            .await
-            .expect_err("an oversize frame is never emitted");
-        assert!(
-            err.to_string().contains("MAX_FRAME_BYTES"),
-            "the encode refusal names the cap: {err}"
-        );
-    });
+    let huge = WireFrame::Heartbeat {
+        worker_id: "x".repeat(MAX_FRAME_BYTES as usize + 64),
+    };
+    let mut buf: Vec<u8> = Vec::new();
+    let err = write_frame(&mut buf, &huge).expect_err("an oversize frame is never emitted");
+    assert!(
+        err.to_string().contains("MAX_FRAME_BYTES"),
+        "the encode refusal names the cap: {err}"
+    );
 }
 
 // ---------------------------------------------------------------------------

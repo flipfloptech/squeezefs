@@ -54,7 +54,7 @@ impl<F: std::future::Future> std::future::Future for PollCounted<F> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn settle_wait_parks_and_wakes_on_complete_store() {
     let core = Arc::new(OverlayRecordCore::new(BLOCK, 1));
-    let change = Arc::new(tokio::sync::Notify::new());
+    let change = Arc::new(squeezefs_ipc::sqz_notify::Notify::new());
     let ticket = core.begin_store(0, 8).expect("fresh overlay accepts");
 
     let polls = Arc::new(AtomicU64::new(0));
@@ -102,7 +102,7 @@ async fn settle_wait_parks_and_wakes_on_complete_store() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn settle_wait_belt_survives_a_lost_wake() {
     let core = Arc::new(OverlayRecordCore::new(BLOCK, 1));
-    let change = Arc::new(tokio::sync::Notify::new());
+    let change = Arc::new(squeezefs_ipc::sqz_notify::Notify::new());
     let ticket = core.begin_store(0, 8).expect("fresh overlay accepts");
 
     let waiter = {

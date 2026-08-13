@@ -15,7 +15,6 @@ use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
-use tokio::runtime::Builder;
 
 pub const CONFIG_INODE: u64 = 0xffff_ffff_ffff_fffe;
 pub const STATS_INODE: u64 = 0xffff_ffff_ffff_fffd;
@@ -22491,51 +22490,6 @@ fn kill_suidgid_mode(perm: u32) -> u32 {
         killed &= !libc::S_ISGID;
     }
     killed
-}
-
-/// Initialize the multi-threaded work-stealing tokio runtime
-/// with threads pinned strictly to physical cores, keeping one core free.
-pub fn init_runtime() -> tokio::runtime::Runtime {
-    let physical_cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    // Leave at least one core for kernel processing (FUSE filesystem driver, Garnet, networking)
-    let worker_threads = std::cmp::max(1, physical_cores - 1);
-    info!(
-        "FUSE Daemon: Initializing runtime with {} worker threads bound to physical CPU cores.",
-        worker_threads
-    );
-
-    Builder::new_multi_thread()
-        .worker_threads(worker_threads)
-        .enable_all()
-        .on_thread_start(|| {
-            debug!("Thread started and pinned to physical CPU core.");
-        })
-        .build()
-        .unwrap()
-}
-
-/// Historical debug helper — **not** used by production mounts.
-///
-/// Production FUSE transport is **fuse3** `BlockFuseConnection`: separate read/write
-/// `IoUring` rings, optional SQPOLL (`SQUEEZEFS_FUSE_IO_URING_SQPOLL_*`), eventfd
-/// completion wakeups, multi-queue `FUSE_DEV_IOC_CLONE` workers, and (P2-8) fixed-file
-/// registration of `/dev/fuse` as `types::Fixed(0)` when the kernel allows.
-///
-/// Prefer that path over this loop, which only demonstrates a bare `Read` on an fd
-/// and does not decode FUSE messages.
-#[cfg(target_os = "linux")]
-#[deprecated(
-    note = "Production mounts use fuse3 BlockFuseConnection io_uring; this loop is a no-op debug stub"
-)]
-pub fn start_io_uring_polling_loop(
-    _fuse_fd: std::os::fd::RawFd,
-    _runtime: &tokio::runtime::Runtime,
-) {
-    info!(
-        "FUSE Daemon: start_io_uring_polling_loop is deprecated; production I/O uses fuse3 uring rings"
-    );
 }
 
 pub fn parse_custom_options(opts: &str) -> std::ffi::OsString {

@@ -188,7 +188,7 @@ async fn block_map_of(h: &H, ino: u64) -> std::sync::Arc<std::collections::HashM
 /// Drain every currently-available striped-I/O admission permit so multi-block
 /// read tasks park between their binding resolution and their block fetch —
 /// the exact suspension the kernel-writeback race produces.
-fn drain_striped_io_permits() -> Vec<tokio::sync::OwnedSemaphorePermit> {
+fn drain_striped_io_permits() -> Vec<squeezefs_ipc::sqz_semaphore::OwnedSemaphorePermit> {
     let sem = squeezefs::bg_admit::STRIPED_IO_SEM.clone();
     let mut held = Vec::new();
     while let Ok(p) = sem.clone().try_acquire_owned() {

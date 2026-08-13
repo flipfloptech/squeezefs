@@ -824,7 +824,7 @@ async fn reader_revalidation_task_exits_at_dismount() {
         .await
         .expect("read-only mount");
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let wake = Arc::new(tokio::sync::Notify::new());
+    let wake = Arc::new(squeezefs_ipc::sqz_notify::Notify::new());
     let handle = squeezefs::ro_coherence::spawn_reader_revalidation(
         vec![reader],
         stop.clone(),

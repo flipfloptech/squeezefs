@@ -32,27 +32,6 @@ struct MetaExec {
     next: AtomicUsize,
 }
 
-fn timer_handle() -> tokio::runtime::Handle {
-    static DRIVER: once_cell::sync::Lazy<tokio::runtime::Handle> =
-        once_cell::sync::Lazy::new(|| {
-            let (tx, rx) = std::sync::mpsc::sync_channel(1);
-            std::thread::Builder::new()
-                .name("sqz-meta-timerdrv".to_string())
-                .spawn(move || {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .expect("sqz-meta timer-driver runtime builds");
-                    tx.send(rt.handle().clone())
-                        .expect("sqz-meta timer-driver handle handoff");
-                    rt.block_on(std::future::pending::<()>());
-                })
-                .expect("sqz-meta timer-driver thread spawns");
-            rx.recv().expect("sqz-meta timer-driver handle received")
-        });
-    DRIVER.clone()
-}
-
 static META_EXEC: once_cell::sync::Lazy<MetaExec> = once_cell::sync::Lazy::new(|| {
     let n = if std::thread::available_parallelism()
         .map(|p| p.get())
@@ -70,7 +49,8 @@ static META_EXEC: once_cell::sync::Lazy<MetaExec> = once_cell::sync::Lazy::new(|
         std::thread::Builder::new()
             .name(format!("sqz-meta{i}"))
             .spawn(move || {
-                let _rt = timer_handle().enter();
+                // rip-tokio-total: no ambient runtime — timers ride the
+                // sqz-timer thread, delivery rides this lane.
                 ex.run();
             })
             .expect("sqz-meta lane thread spawns");

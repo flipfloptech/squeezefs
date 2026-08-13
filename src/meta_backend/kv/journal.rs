@@ -456,9 +456,9 @@ pub struct JournalRing {
     inflight: Mutex<Inflight>,
     /// Wakes admission parkers (§4.4 pt 5) when `reusable_upto` advances
     /// — and on shutdown, so parked committers can observe the flag.
-    space_notify: tokio::sync::Notify,
+    space_notify: squeezefs_ipc::sqz_notify::Notify,
     /// Wakes `wait_completed_upto` waiters when the watermark advances.
-    completion_notify: tokio::sync::Notify,
+    completion_notify: squeezefs_ipc::sqz_notify::Notify,
     /// **Per-volume** mirror of the global `META_KV_JOURNAL_ENTRIES`
     /// accounting (perf/meta-plane-writes, 2026-07-30): entries written
     /// into THIS ring. The process-global counter cannot attribute
@@ -553,8 +553,8 @@ impl JournalRing {
                 0,
             ),
             inflight: Mutex::new(Inflight::default()),
-            space_notify: tokio::sync::Notify::new(),
-            completion_notify: tokio::sync::Notify::new(),
+            space_notify: squeezefs_ipc::sqz_notify::Notify::new(),
+            completion_notify: squeezefs_ipc::sqz_notify::Notify::new(),
             written_entries: std::sync::atomic::AtomicU64::new(0),
             written_bytes: std::sync::atomic::AtomicU64::new(0),
         }
@@ -634,8 +634,8 @@ impl JournalRing {
                 open: BTreeMap::new(),
                 completed_upto: recovery.head_pos,
             }),
-            space_notify: tokio::sync::Notify::new(),
-            completion_notify: tokio::sync::Notify::new(),
+            space_notify: squeezefs_ipc::sqz_notify::Notify::new(),
+            completion_notify: squeezefs_ipc::sqz_notify::Notify::new(),
             written_entries: std::sync::atomic::AtomicU64::new(0),
             written_bytes: std::sync::atomic::AtomicU64::new(0),
         };
@@ -756,7 +756,7 @@ impl JournalRing {
 
     /// A registered waiter on the space notify (the caller's
     /// register-recheck-await admission loop; §4.4 pt 5).
-    pub fn space_notified(&self) -> tokio::sync::futures::Notified<'_> {
+    pub fn space_notified(&self) -> impl std::future::Future<Output = ()> + '_ {
         self.space_notify.notified()
     }
 

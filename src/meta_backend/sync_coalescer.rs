@@ -26,9 +26,9 @@
 //! `sync_fn` await — so it is a plain `std::sync::Mutex`.
 
 use crate::error::{Result, SqueezefsError};
+use squeezefs_ipc::sqz_channel::oneshot;
 use std::future::Future;
 use std::sync::Mutex;
-use tokio::sync::oneshot;
 
 /// Outcome fanned out to every waiter in a batch. `SqueezefsError` is not
 /// `Clone`, so failures are carried as a rendered string and re-wrapped per
@@ -190,7 +190,7 @@ impl SyncCoalescer {
 
                 let raced = match bound {
                     None => Ok(sync_fn().await),
-                    Some(b) => tokio::time::timeout(b, sync_fn()).await,
+                    Some(b) => squeezefs_ipc::sqz_time::timeout(b, sync_fn()).await,
                 };
                 let outcome: BatchOutcome = match raced {
                     Ok(res) => res.map_err(|e| e.to_string()),
@@ -234,7 +234,7 @@ impl SyncCoalescer {
         let waited = match bound {
             None => rx.await.map_err(|_| ()),
             // Follower budget: in-flight barrier remainder + own batch.
-            Some(b) => match tokio::time::timeout(b.saturating_mul(2), rx).await {
+            Some(b) => match squeezefs_ipc::sqz_time::timeout(b.saturating_mul(2), rx).await {
                 Ok(res) => res.map_err(|_| ()),
                 Err(_elapsed) => {
                     return Err(SqueezefsError::Io(std::io::Error::from_raw_os_error(

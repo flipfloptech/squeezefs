@@ -19,8 +19,9 @@
 //!   `uring_fs::read_at` inside K2's [`load_node`] (header + bset
 //!   verification + the §4.5 torn-tail classifier), then builds the
 //!   snapshot. Loads are **single-flight** per node address (the
-//!   `routing.rs` inflight-guard discipline: losers wait on a broadcast
-//!   and re-check the map; a cancelled loader's drop guard wakes them).
+//!   `routing.rs` inflight-guard discipline: losers wait on a
+//!   single-flight completion and re-check the map; a cancelled loader's
+//!   drop guard wakes them).
 //! - **Eviction**: a clock (FIFO + second-chance ref bit) over cache
 //!   entries; clean nodes evict by dropping the `Arc` (in-flight readers
 //!   keep their snapshot alive by refcount), **dirty/serializing nodes are
@@ -1904,7 +1905,7 @@ where
                     "reader load of node {addr:#x} hit {e} on attempt {attempt} — \
                      re-reading (a writer's in-flight append looks exactly like this)"
                 );
-                tokio::task::yield_now().await;
+                squeezefs_ipc::sqz_blocking::yield_now().await;
             }
         }
     }
@@ -1920,15 +1921,15 @@ where
 struct InflightLoadGuard<'a> {
     cache: &'a NodeCache,
     addr: u64,
-    tx: tokio::sync::broadcast::Sender<()>,
+    tx: Arc<squeezefs_ipc::sqz_flight::Sender<()>>,
 }
 
 impl Drop for InflightLoadGuard<'_> {
     fn drop(&mut self) {
         self.cache
             .inflight
-            .remove_if_sync(&self.addr, |tx| tx.same_channel(&self.tx));
-        let _ = self.tx.send(());
+            .remove_if_sync(&self.addr, |tx| Arc::ptr_eq(tx, &self.tx));
+        self.tx.send(());
     }
 }
 
@@ -1937,7 +1938,7 @@ impl Drop for InflightLoadGuard<'_> {
 pub struct NodeCache {
     cfg: NodeCacheConfig,
     map: scc::HashMap<u64, Arc<CachedNode>>,
-    inflight: scc::HashMap<u64, tokio::sync::broadcast::Sender<()>>,
+    inflight: scc::HashMap<u64, Arc<squeezefs_ipc::sqz_flight::Sender<()>>>,
     /// Clock ring: FIFO of candidate addresses + per-node second-chance
     /// ref bits (the sharded-clock family of `src/cache/lru.rs`, sized for
     /// node counts). Stale entries (evicted/superseded nodes) fall out on
@@ -2374,15 +2375,16 @@ impl NodeCache {
             let guard = {
                 match self.inflight.entry_async(addr).await {
                     scc::hash_map::Entry::Occupied(e) => {
-                        let mut rx = e.get().subscribe();
+                        let rx = e.get().subscribe();
                         drop(e);
                         // Sender dropped (loader done or cancelled) also
                         // wakes us; either way, re-check the map.
-                        let _ = rx.recv().await;
+                        let _ = rx.wait().await;
                         continue;
                     }
                     scc::hash_map::Entry::Vacant(e) => {
-                        let (tx, _rx) = tokio::sync::broadcast::channel(1);
+                        let (tx, _rx) = squeezefs_ipc::sqz_flight::channel::<()>();
+                        let tx = Arc::new(tx);
                         e.insert_entry(tx.clone());
                         InflightLoadGuard {
                             cache: self,

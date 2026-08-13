@@ -65,8 +65,8 @@ pub struct PhaseHold {
     phase: MigrationPhase,
     once: bool,
     fired: AtomicBool,
-    entered: tokio::sync::Semaphore,
-    release: tokio::sync::Semaphore,
+    entered: squeezefs_ipc::sqz_semaphore::Semaphore,
+    release: squeezefs_ipc::sqz_semaphore::Semaphore,
 }
 
 impl PhaseHold {
@@ -76,8 +76,8 @@ impl PhaseHold {
             phase,
             once: false,
             fired: AtomicBool::new(false),
-            entered: tokio::sync::Semaphore::new(0),
-            release: tokio::sync::Semaphore::new(0),
+            entered: squeezefs_ipc::sqz_semaphore::Semaphore::new(0),
+            release: squeezefs_ipc::sqz_semaphore::Semaphore::new(0),
         }
     }
 
@@ -711,7 +711,7 @@ async fn cutover_window(
             reopen_retry("in-flight ops did not drain");
             return Ok(CutoverOutcome::Retry);
         }
-        tokio::task::yield_now().await;
+        squeezefs_ipc::sqz_blocking::yield_now().await;
     }
     // Absorbed times refinements ride ordinary commits — drain them so
     // the tee-empty recheck below can settle.

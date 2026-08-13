@@ -972,8 +972,8 @@ pub(super) fn spawn_checkpoint_task(be: &Arc<KvMetaBackend>) {
     // CRITICAL — a lost one stops journal reclamation and wedges every
     // committer at ring admission. It now runs on the sqz-meta lanes
     // (first-party delivery); the shutdown join rides a drop-guarded
-    // completion channel instead of a tokio JoinHandle.
-    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    // completion channel instead of a runtime JoinHandle.
+    let (done_tx, done_rx) = squeezefs_ipc::sqz_channel::oneshot::channel();
     crate::meta_exec::spawn_meta("kv_checkpoint", async move {
         let mut done = crate::meta_exec::DoneGuard::new(done_tx);
         checkpoint_task(weak, alive, wake, interval).await;
@@ -1004,7 +1004,7 @@ pub(super) fn spawn_times_drain_task(be: &Arc<KvMetaBackend>) {
         0 => 100,
         ms => ms,
     };
-    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let (done_tx, done_rx) = squeezefs_ipc::sqz_channel::oneshot::channel();
     crate::meta_exec::spawn_meta("kv_times_drain", async move {
         let mut done = crate::meta_exec::DoneGuard::new(done_tx);
         times_drain_task(weak, wake, interval).await;
@@ -1015,16 +1015,20 @@ pub(super) fn spawn_times_drain_task(be: &Arc<KvMetaBackend>) {
 
 async fn times_drain_task(
     weak: std::sync::Weak<KvMetaBackend>,
-    wake: Arc<tokio::sync::Notify>,
+    wake: Arc<squeezefs_ipc::sqz_notify::Notify>,
     interval_ms: u64,
 ) {
     let period = std::time::Duration::from_millis(interval_ms);
-    let mut ticker = squeezefs_ipc::sqz_time::interval(period);
+    // Fixed cadence deadline (the tokio-interval-in-select shape): a wake
+    // never re-arms the tick — the deadline only advances when it fires.
+    let mut next_tick = std::time::Instant::now() + period;
     loop {
-        tokio::select! {
-            _ = ticker.tick() => {}
-            _ = wake.notified() => {}
-        };
+        if squeezefs_ipc::sqz_time::timeout_at(next_tick, wake.notified())
+            .await
+            .is_err()
+        {
+            next_tick = std::time::Instant::now() + period;
+        }
         let Some(be) = weak.upgrade() else {
             return; // backend dropped without shutdown: exit, leak nothing
         };
@@ -1047,22 +1051,26 @@ async fn times_drain_task(
 async fn checkpoint_task(
     weak: std::sync::Weak<KvMetaBackend>,
     alive: Arc<()>,
-    wake: Arc<tokio::sync::Notify>,
+    wake: Arc<squeezefs_ipc::sqz_notify::Notify>,
     interval_ms: u64,
 ) {
     // Owned for the task's lifetime: `checkpoint_alive_probe` upgrades
     // iff this task is still running.
     let _alive = alive;
     let mut last_checkpoint = std::time::Instant::now();
-    // A FIXED cadence (not sleep-in-select, which would re-arm on every
-    // wake): §4.6 pt 1 threshold wakes must never starve the cadence's
-    // barriers/checkpoints under a sustained storm.
+    // A FIXED cadence deadline (not a per-wake re-armed sleep): §4.6 pt 1
+    // threshold wakes must never starve the cadence's
+    // barriers/checkpoints under a sustained storm — the deadline only
+    // advances when it fires.
     let period = std::time::Duration::from_millis(interval_ms);
-    let mut ticker = squeezefs_ipc::sqz_time::interval(period);
+    let mut next_tick = std::time::Instant::now() + period;
     loop {
-        let cadence = tokio::select! {
-            _ = ticker.tick() => true,
-            _ = wake.notified() => false,
+        let cadence = match squeezefs_ipc::sqz_time::timeout_at(next_tick, wake.notified()).await {
+            Ok(()) => false,
+            Err(_) => {
+                next_tick = std::time::Instant::now() + period;
+                true
+            }
         };
         let Some(be) = weak.upgrade() else {
             return; // backend dropped without shutdown: exit, leak nothing

@@ -109,16 +109,19 @@ fn submit(job: Job) {
     let spawn_name = {
         let mut st = p.state.lock().unwrap_or_else(|e| e.into_inner());
         st.queue.push_back(job);
-        if st.idle > 0 {
-            drop(st);
-            p.ready.notify_one();
-            None
-        } else if st.total < p.cap {
+        // Spawn whenever queued demand exceeds idle coverage (tokio's
+        // per-un-covered-job posture — the displacement-storm lesson:
+        // notifying one idle worker for a BURST double-books it, the
+        // worker drains serially, and demand-derived parallel lanes
+        // collapse to one). At cap or covered: wake an idle worker;
+        // in-flight workers absorb the rest.
+        if st.queue.len() > st.idle && st.total < p.cap {
             st.total += 1;
             st.seq += 1;
             Some(format!("sqz-blk{}", st.seq))
         } else {
-            // At cap: an in-flight worker will pick it up.
+            drop(st);
+            p.ready.notify_one();
             None
         }
     };
@@ -220,6 +223,33 @@ mod tests {
         }
         assert_eq!(sum, (0..32u64).map(|i| i * 2).sum::<u64>());
         assert_eq!(hits.load(Ordering::Relaxed), 32);
+    }
+
+    /// Burst width (the displacement-storm cap graze, 2026-08-13): a
+    /// burst of K blocking jobs must run in PARALLEL even when an idle
+    /// worker exists — the submit that merely notifies the one idle
+    /// worker double-books it (the worker drains the queue SERIALLY),
+    /// and the reclaim drain's demand-derived lanes collapse to one.
+    /// tokio's pool spawns per un-covered job; so must ours.
+    #[test]
+    fn burst_submits_run_in_parallel_past_one_idle_worker() {
+        // Warm exactly one idle worker.
+        block_on(run_blocking(|| {}));
+        std::thread::sleep(Duration::from_millis(20));
+        // Burst 4 × 100 ms blocking jobs; serial = 400 ms.
+        let t0 = std::time::Instant::now();
+        let futs: Vec<_> = (0..4)
+            .map(|_| run_blocking(|| std::thread::sleep(Duration::from_millis(100))))
+            .collect();
+        for f in futs {
+            block_on(f);
+        }
+        let wall = t0.elapsed();
+        assert!(
+            wall < Duration::from_millis(250),
+            "a 4-job burst must parallelize (wall {wall:?}; ~400 ms = the \
+             serialized single-worker shape)"
+        );
     }
 
     #[test]

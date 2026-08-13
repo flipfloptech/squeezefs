@@ -106,7 +106,9 @@ version = "0.4.9"
 [dependencies.tokio]
 version = "1.36"
 features = [
-    "fs",
+    # "fs" and "process" retired by the rip-tokio-total sweep: mount-time
+    # directory probes, fusermount subprocesses and /dev/fuse notify writes
+    # ride std wrapped in `crate::sqz_blocking::run_blocking`.
     "rt",
     # The multi-thread runtime the crate's own async tests run on (house
     # rule: async tests use the multi_thread flavor to expose data races).
@@ -117,10 +119,10 @@ features = [
     "sync",
     "net",
     "macros",
-    "process",
-    # The crate itself uses tokio::time (session retry sleeps); without this
-    # the standalone `cargo test` of the vendored crate only compiled via
-    # downstream feature unification.
+    # The tpc_timer_handle driver runtime fires tokio::time wakers for
+    # handler futures (downstream daemon timers); without this the
+    # standalone `cargo test` of the fork only compiled via downstream
+    # feature unification.
     "time",
 ]
 optional = true

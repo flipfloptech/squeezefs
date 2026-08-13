@@ -525,12 +525,7 @@ pub mod mpsc {
         type Output = Option<T>;
         fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
             let (out, waker) = {
-                let mut st = self
-                    .rx
-                    .chan
-                    .state
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let mut st = self.rx.chan.state.lock().unwrap_or_else(|e| e.into_inner());
                 match st.queue.pop_front() {
                     Some(v) => (Poll::Ready(Some(v)), st.tx_wakers.pop_front()),
                     None if st.senders == 0 || st.closed => (Poll::Ready(None), None),

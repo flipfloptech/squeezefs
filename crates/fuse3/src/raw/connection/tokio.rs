@@ -113,12 +113,10 @@ use nix::fcntl::{FcntlArg, OFlag};
 use nix::sys::socket::{self, AddressFamily, ControlMessageOwned, MsgFlags, SockFlag, SockType};
 #[cfg(target_os = "freebsd")]
 use nix::sys::uio;
+#[cfg(all(target_os = "linux", feature = "unprivileged"))]
+use std::process::Command;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use tokio::io::{unix::AsyncFd, Interest};
-#[cfg(all(target_os = "linux", feature = "unprivileged"))]
-use tokio::process::Command;
-#[cfg(all(target_os = "linux", feature = "unprivileged"))]
-use tokio::task;
 #[cfg(target_os = "linux")]
 use tracing::debug;
 #[cfg(target_os = "freebsd")]
@@ -989,7 +987,7 @@ impl FuseConnection {
         }
         // SAFETY: `dup` is a fresh fd this task exclusively owns.
         let owned = unsafe { OwnedFd::from_raw_fd(dup) };
-        let res = tokio::task::spawn_blocking(move || {
+        let res = crate::sqz_blocking::run_blocking(move || {
             loop {
                 // SAFETY: one whole-frame write of an initialized buffer
                 // on an owned /dev/fuse fd; the device consumes exactly
@@ -1005,8 +1003,7 @@ impl FuseConnection {
                 }
             }
         })
-        .await
-        .map_err(|e| io::Error::other(format!("notify_inval_inode_sync join: {e}")))?;
+        .await;
         match res {
             Ok(()) => Ok(true),
             Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(false),
@@ -1518,17 +1515,22 @@ impl NonBlockFuseConnection {
         let mount_path = mount_path.as_ref().as_os_str().to_os_string();
 
         let fd0 = sock0.as_raw_fd();
-        let mut child = Command::new(binary_path)
-            .env(ENV, fd0.to_string())
-            .args(vec![OsString::from("-o"), options, mount_path])
-            .spawn()?;
+        // std::process::Command spawn + wait on the blocking pool (the
+        // fusermount3 subprocess is syscall-class work, not async I/O).
+        let status = crate::sqz_blocking::run_blocking(move || {
+            Command::new(binary_path)
+                .env(ENV, fd0.to_string())
+                .args(vec![OsString::from("-o"), options, mount_path])
+                .status()
+        })
+        .await?;
 
-        if !child.wait().await?.success() {
+        if !status.success() {
             return Err(io::Error::other("fusermount run failed"));
         }
 
         let fd1 = sock1.as_raw_fd();
-        let fd = task::spawn_blocking(move || {
+        let fd = crate::sqz_blocking::run_blocking(move || {
             // let mut buf = vec![0; 10000]; // buf should large enough
             let mut buf = vec![]; // it seems 0 len still works well
 
@@ -1559,8 +1561,7 @@ impl NonBlockFuseConnection {
 
             Ok(fd)
         })
-        .await
-        .unwrap()?;
+        .await?;
 
         Self::set_fd_non_blocking(fd)?;
 

@@ -133,7 +133,9 @@ impl<T: Clone> Sender<T> {
 impl<T: Clone> Receiver<T> {
     /// Await the flight's completion value.
     pub async fn wait(&self) -> Result<T, Gone> {
-        let fut = WaitFut { shared: &self.shared };
+        let fut = WaitFut {
+            shared: &self.shared,
+        };
         ticked(fut).await
     }
 

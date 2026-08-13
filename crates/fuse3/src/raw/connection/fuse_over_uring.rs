@@ -1382,16 +1382,16 @@ impl Drop for DestDmaLease {
 
 /// Shared work queue for all session workers (primary + multi-queue clones).
 struct InboundQueue {
-    tx: tokio::sync::mpsc::UnboundedSender<InboundUringReq>,
-    rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<InboundUringReq>>,
+    tx: crate::sqz_channel::mpsc::UnboundedSender<InboundUringReq>,
+    rx: crate::sqz_sync::SqzMutex<crate::sqz_channel::mpsc::UnboundedReceiver<InboundUringReq>>,
 }
 
 impl InboundQueue {
     fn new() -> Self {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = crate::sqz_channel::mpsc::unbounded_channel();
         Self {
             tx,
-            rx: tokio::sync::Mutex::new(rx),
+            rx: crate::sqz_sync::SqzMutex::new(rx),
         }
     }
 
@@ -1412,24 +1412,24 @@ impl InboundQueue {
     async fn pop(
         &self,
         active: &AtomicBool,
-        shutdown: &tokio::sync::Notify,
+        shutdown: &crate::sqz_notify::Notify,
     ) -> Option<InboundUringReq> {
         let mut rx_guard = self.rx.lock().await;
         loop {
             // Register interest BEFORE the active check: `notify_waiters`
             // wakes only already-registered waiters, so enable-then-check
-            // closes the store(false)/notify vs check/park race (the
-            // documented tokio pattern). Either the check sees the store,
-            // or the registration precedes the notify and the select wakes.
-            let notified = shutdown.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
+            // closes the store(false)/notify vs check/park race.
+            // `Notified::enable()` registers SYNCHRONOUSLY (before any
+            // await): either the check sees the store, or the
+            // registration precedes the notify and the race wakes.
+            let mut notified = shutdown.notified_raw();
+            notified.enable();
             if !active.load(Ordering::Acquire) {
                 return None;
             }
-            tokio::select! {
-                r = rx_guard.recv() => return r,
-                _ = notified.as_mut() => continue, // re-check active
+            match crate::sqz_future::race2(rx_guard.recv(), notified).await {
+                crate::sqz_future::Either::Left(r) => return r,
+                crate::sqz_future::Either::Right(()) => continue, // re-check active
             }
         }
     }
@@ -1443,7 +1443,7 @@ pub struct FuseOverUring {
     active: AtomicBool,
     /// Wakes every parked session pull on shutdown (L3 lever C — the pull
     /// path is pure event-driven; this is its only non-channel wake).
-    shutdown_notify: tokio::sync::Notify,
+    shutdown_notify: crate::sqz_notify::Notify,
     /// Number of queue workers that have submitted their initial REGISTERs.
     queues_registered: AtomicU64,
     pub(crate) nqueues: u16, // used for diagnostics
@@ -2766,7 +2766,7 @@ impl FuseOverUring {
             // still delivers on the classical path → permanent hang.
             ready: AtomicBool::new(false),
             active: AtomicBool::new(true),
-            shutdown_notify: tokio::sync::Notify::new(),
+            shutdown_notify: crate::sqz_notify::Notify::new(),
             queues_registered: AtomicU64::new(0),
             nqueues: nqueues as u16,
             inbound,
@@ -3008,7 +3008,7 @@ impl FuseOverUring {
         let pool = Arc::new(Self {
             ready: AtomicBool::new(false),
             active: AtomicBool::new(true),
-            shutdown_notify: tokio::sync::Notify::new(),
+            shutdown_notify: crate::sqz_notify::Notify::new(),
             queues_registered: AtomicU64::new(0),
             nqueues,
             inbound,
@@ -5074,9 +5074,12 @@ fn queue_worker(
                     // ready queue and form the NEXT burst after the next
                     // flush, so DMA launch stays eager per burst.
                     fused_more = match pool.fused_dispatch.get() {
-                        Some(d) => {
+                        // Presence gate only: a registered dispatcher
+                        // means this lane may drain (no handle travels
+                        // since rip-tokio-total).
+                        Some(_) => {
                             let mut any = false;
-                            while fused_lane.drain_one(&d.handle) {
+                            while fused_lane.drain_one() {
                                 any = true;
                                 pass_polls += 1;
                                 if let Ok(m) = commit_rx.try_recv() {
@@ -9247,7 +9250,7 @@ mod inbound_queue_tests {
     async fn pop_delivers_pushed_requests_in_order() {
         let q = InboundQueue::new();
         let active = AtomicBool::new(true);
-        let shutdown = tokio::sync::Notify::new();
+        let shutdown = crate::sqz_notify::Notify::new();
         q.push(req(7)).expect("live receiver accepts");
         q.push(req(8)).expect("live receiver accepts");
         let a = q
@@ -9267,7 +9270,7 @@ mod inbound_queue_tests {
     async fn pop_wakes_promptly_for_late_push() {
         let q = Arc::new(InboundQueue::new());
         let active = Arc::new(AtomicBool::new(true));
-        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let shutdown = Arc::new(crate::sqz_notify::Notify::new());
         let popper = tokio::spawn({
             let q = Arc::clone(&q);
             let active = Arc::clone(&active);
@@ -9302,7 +9305,7 @@ mod inbound_queue_tests {
     async fn pop_returns_none_promptly_on_shutdown() {
         let q = Arc::new(InboundQueue::new());
         let active = Arc::new(AtomicBool::new(true));
-        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let shutdown = Arc::new(crate::sqz_notify::Notify::new());
         let popper = tokio::spawn({
             let q = Arc::clone(&q);
             let active = Arc::clone(&active);

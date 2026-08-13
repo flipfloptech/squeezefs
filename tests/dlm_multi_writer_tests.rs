@@ -266,10 +266,7 @@ fn start_authority(
 ) -> Authority {
     let mut router = data_grant::AsyncVerbRouter::new().with_custody(Arc::clone(&owner));
     if let Some(inner) = inner {
-        router = router.with_publish(publish::PublishService::new(
-            inner,
-            tokio::runtime::Handle::current(),
-        ));
+        router = router.with_publish(publish::PublishService::new(inner));
     }
     let cfg = cw::RpcListenerConfig {
         bind_addr: "127.0.0.1:0".parse().expect("literal addr"),
@@ -810,7 +807,6 @@ async fn the_mount_arm_refuses_a_non_pr_substrate() {
         &routed,
         std::slice::from_ref(&data),
         false,
-        tokio::runtime::Handle::current(),
         None,
         // DLM S9 blocker #3's admission: no data-plane router, which is
         // admissible only because this arm refuses before it would need one
@@ -865,7 +861,6 @@ async fn the_mount_arm_refuses_an_unstamped_format_naming_the_bit() {
         &routed,
         std::slice::from_ref(&data),
         false,
-        tokio::runtime::Handle::current(),
         None,
         None,
     )

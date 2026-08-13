@@ -112,7 +112,7 @@ async fn acquire_ticked(core: &Core, want: Want) {
         id: None,
     };
     loop {
-        match squeezefs_ipc::sqz_time::timeout(TICK, &mut attempt).await {
+        match crate::sqz_time::timeout(TICK, &mut attempt).await {
             Ok(()) => return,
             Err(_elapsed) => {
                 TICK_RECOVERIES.fetch_add(1, Ordering::Relaxed);
@@ -414,8 +414,7 @@ mod tests {
                                 // (FIFO courtesy) and its TICK re-contend barges past it —
                                 // one tick of latency, never a wedge.
         drop(g);
-        let fresh =
-            squeezefs_ipc::sqz_time::timeout(TICK * 2 + Duration::from_secs(1), l.write()).await;
+        let fresh = crate::sqz_time::timeout(TICK * 2 + Duration::from_secs(1), l.write()).await;
         assert!(
             fresh.is_ok(),
             "a dead queued waiter must never wedge the lock (tick-bounded barging)"
@@ -467,7 +466,7 @@ mod tests {
             }));
         }
         for (i, w) in waiters.into_iter().enumerate() {
-            let won = squeezefs_ipc::sqz_time::timeout(TICK * 5, w).await;
+            let won = crate::sqz_time::timeout(TICK * 5, w).await;
             assert!(
                 won.is_ok(),
                 "waiter {i} starved by the writer storm (unbounded barging)"
@@ -492,13 +491,13 @@ mod tests {
         let waiter = tokio::spawn(async move {
             let _g = l2.write().await;
         });
-        squeezefs_ipc::sqz_time::sleep(TICK + Duration::from_millis(200)).await;
+        crate::sqz_time::sleep(TICK + Duration::from_millis(200)).await;
         assert!(
             TICK_RECOVERIES.load(Ordering::Relaxed) > before,
             "a wait past the tick must count a recovery"
         );
         drop(g);
-        squeezefs_ipc::sqz_time::timeout(Duration::from_secs(5), waiter)
+        crate::sqz_time::timeout(Duration::from_secs(5), waiter)
             .await
             .expect("waiter completes after release")
             .expect("waiter task");

@@ -649,7 +649,6 @@ dependencies = [
  "once_cell",
  "serde",
  "slab",
- "tokio",
  "tracing",
  "trait-make",
  "which",

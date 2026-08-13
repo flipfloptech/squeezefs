@@ -313,7 +313,6 @@ pub async fn arm_mount_multi_writer(
     meta: &Arc<RoutedMetaBackend>,
     data_paths: &[PathBuf],
     read_only: bool,
-    runtime: tokio::runtime::Handle,
     quarantine: Option<Arc<dyn CustodyQuarantine>>,
     backend: Option<&Arc<crate::routing::BackendRouter>>,
 ) -> Result<Option<MultiWriterArm>> {
@@ -339,7 +338,7 @@ pub async fn arm_mount_multi_writer(
         );
         return Ok(None);
     }
-    arm_multi_writer(meta, data_paths, read_only, runtime, quarantine, backend).await
+    arm_multi_writer(meta, data_paths, read_only, quarantine, backend).await
 }
 
 /// **Arm the multi-writer planes, or refuse naming what is missing.**
@@ -351,7 +350,6 @@ pub async fn arm_multi_writer(
     meta: &Arc<RoutedMetaBackend>,
     data_paths: &[PathBuf],
     read_only: bool,
-    runtime: tokio::runtime::Handle,
     quarantine: Option<Arc<dyn CustodyQuarantine>>,
     backend: Option<&Arc<crate::routing::BackendRouter>>,
 ) -> Result<Option<MultiWriterArm>> {
@@ -567,7 +565,7 @@ pub async fn arm_multi_writer(
 
     let router = AsyncVerbRouter::new()
         .with_custody(Arc::clone(&owner))
-        .with_publish(publish::PublishService::new(Arc::clone(meta), runtime));
+        .with_publish(publish::PublishService::new(Arc::clone(meta)));
     let listener = crate::cluster_wire::RpcListener::start_async(
         crate::cluster_wire::RpcListenerConfig {
             bind_addr: bind,

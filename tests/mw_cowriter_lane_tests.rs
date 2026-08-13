@@ -338,10 +338,7 @@ impl Authority {
         data_grant::install_custody_owner(Arc::clone(&owner));
         let router = data_grant::AsyncVerbRouter::new()
             .with_custody(Arc::clone(&owner))
-            .with_publish(publish::PublishService::new(
-                Arc::clone(&meta),
-                tokio::runtime::Handle::current(),
-            ));
+            .with_publish(publish::PublishService::new(Arc::clone(&meta)));
         let listener = cw::RpcListener::start_async(
             cw::RpcListenerConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),

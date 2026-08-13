@@ -24,19 +24,18 @@
 //! §6.7 is explicit: owner-side RPC handling runs on the pinned service
 //! threads, **never on the conveyor's task**. The frame arrives on a
 //! `sqz-cluster-svc{n}` lane; the batch's *execution* is then handed to
-//! the runtime that owns the backend's tasks
-//! ([`MetaShipService::new`]'s `runtime` argument), and the lane awaits
-//! the join.
+//! the **sqz-meta pool** ([`crate::meta_exec::spawn_meta_join`]), and the
+//! lane awaits the join.
 //!
 //! That hop is deliberate and its reason is mechanical: `commit_tx`
-//! spawns the per-volume conveyor **pass task** on the committer's own
-//! runtime the first time a volume needs one (`kv/backend.rs`). A verb
-//! executed inline on a lane would therefore give the volume's entire
-//! commit conveyor a single-threaded current-thread runtime whose lifetime
-//! is the lane's — and take it down with the lane. The IPC handoff-economy
-//! campaign's lesson (never hand off onto a foreign runtime's global
-//! inject queue) is respected in the other direction: this hop lands on
-//! the runtime that already owns every task the verb will interact with.
+//! spawns the per-volume conveyor **pass task** on the sqz-meta pool the
+//! first time a volume needs one (`kv/backend.rs`) — the pool IS the venue
+//! that owns the backend's tasks. A verb executed inline on a lane would
+//! give the volume's entire commit conveyor a lane-lifetime venue — and
+//! take it down with the lane. The IPC handoff-economy campaign's lesson
+//! (never hand off onto a foreign runtime's global inject queue) is
+//! respected in the other direction: this hop lands on the pool that
+//! already owns every task the verb will interact with.
 //!
 //! # Cross-owner shapes
 //!
@@ -175,9 +174,6 @@ pub struct ServiceStats {
 /// volumes this node has authority over.
 pub struct MetaShipService {
     inner: Arc<RoutedMetaBackend>,
-    /// The runtime that owns the backend's tasks — see the module docs for
-    /// why the hop is deliberate.
-    runtime: tokio::runtime::Handle,
     /// The volumes this node is the metadata authority for. Defaults to
     /// every volume of `inner`, which is what holding the D0 claim on the
     /// whole set means.
@@ -195,7 +191,7 @@ pub struct MetaShipService {
     cross_owner: AtomicU64,
     panics: AtomicU64,
     /// A `Weak` to itself, so the batch handoff can hand an OWNED handle
-    /// to the backend's runtime without the trait impl having to be on
+    /// to the sqz-meta pool without the trait impl having to be on
     /// `Arc<Self>` (the `KvMetaBackend::conveyor_self` precedent).
     self_ref: std::sync::OnceLock<std::sync::Weak<MetaShipService>>,
 }
@@ -214,23 +210,16 @@ impl std::fmt::Debug for MetaShipService {
 impl MetaShipService {
     /// A service with authority over every volume of `inner` (the shape a
     /// node that write-mounted the set has: it holds the D0 claim on each
-    /// member).
-    ///
-    /// `runtime` is where shipped verbs execute — pass the handle of the
-    /// runtime the backend was opened on.
-    pub fn new(inner: Arc<RoutedMetaBackend>, runtime: tokio::runtime::Handle) -> Arc<Self> {
+    /// member). Shipped verbs execute on the sqz-meta pool (module docs).
+    pub fn new(inner: Arc<RoutedMetaBackend>) -> Arc<Self> {
         let all: Vec<usize> = (0..inner.volumes.len()).collect();
-        Self::with_authority(inner, runtime, &all)
+        Self::with_authority(inner, &all)
     }
 
     /// [`Self::new`] with an explicit authority set — the shape a node
     /// that owns a SUBSET of the set has (the multi-owner deployment S9
     /// mounts).
-    pub fn with_authority(
-        inner: Arc<RoutedMetaBackend>,
-        runtime: tokio::runtime::Handle,
-        volumes: &[usize],
-    ) -> Arc<Self> {
+    pub fn with_authority(inner: Arc<RoutedMetaBackend>, volumes: &[usize]) -> Arc<Self> {
         let mut authority = vec![false; inner.volumes.len()];
         for &v in volumes {
             if let Some(slot) = authority.get_mut(v) {
@@ -240,7 +229,6 @@ impl MetaShipService {
         let term = crate::dlm::durable_term();
         let me = Arc::new(Self {
             inner,
-            runtime,
             authority,
             term: AtomicU64::new(term),
             grace_until: parking_lot::Mutex::new(None),
@@ -468,7 +456,8 @@ impl MetaShipService {
         super::owner_phase_record(OwnerPhase::Admit, t_admit);
 
         // The handoff (see the module docs): execution lands on the
-        // runtime that owns the backend's tasks; this lane awaits it.
+        // sqz-meta pool — the venue that owns the backend's tasks; this
+        // lane awaits it.
         let t_dispatch = Instant::now();
         let Some(me) = self.owned() else {
             return self.refuse(
@@ -477,10 +466,10 @@ impl MetaShipService {
                 "S8 owner service is shutting down — no handle to dispatch the batch on".into(),
             );
         };
-        let joined = self
-            .runtime
-            .spawn(async move { me.run_batch(frame).await })
-            .await;
+        let joined = crate::meta_exec::spawn_meta_join("meta_ship_verb", async move {
+            me.run_batch(frame).await
+        })
+        .await;
         super::owner_phase_record(OwnerPhase::Dispatch, t_dispatch);
         let results = match joined {
             Ok(results) => results,

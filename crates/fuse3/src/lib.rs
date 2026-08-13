@@ -115,6 +115,29 @@ pub mod sqz_blocking;
 pub mod sqz_channel;
 #[path = "../../squeezefs-ipc/src/sqz_exec.rs"]
 pub mod sqz_exec;
+// First-party fd-readability watcher (replaces the tokio `AsyncFd`
+// reactor dependence in `connection/tokio.rs`) — same share pattern;
+// resolves `crate::sqz_channel::ticked` through the include above.
+#[path = "../../squeezefs-ipc/src/sqz_fdwatch.rs"]
+pub mod sqz_fdwatch;
+// First-party biased select (`race2`) — the `tokio::select!` shape the
+// InboundQueue pop uses.
+#[path = "../../squeezefs-ipc/src/sqz_future.rs"]
+pub mod sqz_future;
+// First-party Notify with the `notified_raw()`/`enable()` registration
+// handle (the enable-then-check pop protocol).
+#[path = "../../squeezefs-ipc/src/sqz_notify.rs"]
+pub mod sqz_notify;
+// First-party async locks (guards held across `.await` are their whole
+// point) — canonical files in the ROOT crate's src/ tree, crate-neutral
+// (`sqz_sync` resolves `crate::sqz_sync_core` / `crate::sqz_time`
+// through these includes).
+#[path = "../../../src/sqz_sync.rs"]
+pub mod sqz_sync;
+// `pub` mirrors the root crate's posture (a private include makes the
+// core's test/diagnostic surface read as dead code here).
+#[path = "../../../src/sqz_sync_core.rs"]
+pub mod sqz_sync_core;
 // First-party timer service (the rip-tokio-out sweep, 2026-08-13) —
 // same share pattern; `sleep`/`timeout` here never touch a tokio driver.
 #[path = "../../squeezefs-ipc/src/sqz_time.rs"]

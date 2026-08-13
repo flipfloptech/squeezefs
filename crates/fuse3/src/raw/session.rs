@@ -33,10 +33,6 @@ use nix::mount::MntFlags;
     feature = "unprivileged"
 ))]
 use std::process::Command;
-#[cfg(feature = "tokio-runtime")]
-use tokio::task;
-#[cfg(feature = "tokio-runtime")]
-use tokio::task::JoinHandle;
 use tracing::{debug, debug_span, error, instrument, warn, Instrument, Span};
 
 #[cfg(all(target_os = "linux", feature = "unprivileged"))]
@@ -365,17 +361,71 @@ impl Drop for MountHandle {
                 return;
             }
 
-            #[cfg(feature = "tokio-runtime")]
-            {
-                task::spawn(inner.inner_unmount());
-            }
+            // Background unmount on a named OS thread: the drop path has
+            // no executor, and the old fire-and-forget spawn discarded
+            // the result the same way.
+            std::thread::Builder::new()
+                .name("fuse3-unmount".to_string())
+                .spawn(move || {
+                    let _ = crate::sqz_blocking::block_on(inner.inner_unmount());
+                })
+                .expect("fuse3-unmount thread spawns");
         }
+    }
+}
+
+/// The mount task off tokio (rip-tokio-total): a dedicated named OS
+/// thread runs `block_on(inner_mount())` and completes (a) the
+/// `finished` latch — stored strictly BEFORE the result send, so
+/// `is_finished() == true` implies the outcome exists (the two
+/// `JoinHandle::is_finished` call sites only gate whether to await or
+/// skip) — and (b) a oneshot carrying the mount result. A panicked
+/// mount task drops the sender with the latch still false: the awaiting
+/// side reads `RecvError` = "mount task panicked".
+struct MountTask {
+    finished: Arc<std::sync::atomic::AtomicBool>,
+    result: crate::sqz_channel::oneshot::Receiver<IoResult<()>>,
+}
+
+impl std::fmt::Debug for MountTask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MountTask")
+            .field("finished", &self.is_finished())
+            .finish_non_exhaustive()
+    }
+}
+
+impl MountTask {
+    /// Spawn `fut` (the session's `inner_mount`) on the `fuse3-mount`
+    /// OS thread.
+    fn spawn(fut: impl Future<Output = IoResult<()>> + Send + 'static) -> Self {
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = crate::sqz_channel::oneshot::channel();
+        let latch = finished.clone();
+        std::thread::Builder::new()
+            .name("fuse3-mount".to_string())
+            .spawn(move || {
+                let res = crate::sqz_blocking::block_on(fut);
+                // Latch BEFORE send: an `is_finished()` observer never
+                // beats the result it implies.
+                latch.store(true, std::sync::atomic::Ordering::Release);
+                let _ = tx.send(res);
+            })
+            .expect("fuse3-mount thread spawns");
+        Self {
+            finished,
+            result: rx,
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.finished.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
 #[derive(Debug)]
 struct MountHandleInner {
-    task: JoinHandle<IoResult<()>>,
+    task: MountTask,
     mount_path: PathBuf,
     destroy_notify: Arc<async_notify::Notify>,
     #[cfg(all(target_os = "linux", feature = "unprivileged"))]
@@ -390,16 +440,22 @@ impl MountHandleInner {
 
         #[cfg(feature = "tokio-runtime")]
         {
-            // wait destroy done
+            // wait destroy done (RecvError = the mount task panicked —
+            // the old `.await.unwrap()` re-panicked; an error keeps the
+            // unmount path alive to report instead)
             if !self.task.is_finished() {
-                self.task.await.unwrap()?;
+                self.task
+                    .result
+                    .await
+                    .map_err(|_| IoError::other("mount task panicked"))??;
             }
 
             // TODO: freebsd mount is unprivileged, then unmount is unprivileged too?
             #[cfg(target_os = "freebsd")]
             {
+                let mount_path = self.mount_path.clone();
                 crate::sqz_blocking::run_blocking(move || {
-                    mount::unmount(&self.mount_path, MntFlags::MNT_SYNCHRONOUS)
+                    mount::unmount(&mount_path, MntFlags::MNT_SYNCHRONOUS)
                 })
                 .await?;
             }
@@ -464,11 +520,18 @@ impl Future for MountHandle {
 
     #[cfg(feature = "tokio-runtime")]
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // The unwrap actually should not panic: when MountHandle is canceled by the unmount
+        // The expect actually should not fire: when MountHandle is canceled by the unmount
         // method, user has no chance to poll again
-        Pin::new(&mut self.inner.as_mut().expect("inner should be Some()").task)
-            .poll(cx)
-            .map(Result::unwrap)
+        Pin::new(
+            &mut self
+                .inner
+                .as_mut()
+                .expect("inner should be Some()")
+                .task
+                .result,
+        )
+        .poll(cx)
+        .map(|r| r.unwrap_or_else(|_| Err(IoError::other("mount task panicked"))))
     }
 }
 
@@ -659,7 +722,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let fuse_conn_opt = self.fuse_connection.clone();
         Ok(MountHandle {
             inner: Some(MountHandleInner {
-                task: task::spawn(self.inner_mount()),
+                task: MountTask::spawn(self.inner_mount()),
                 mount_path: mount_path.to_path_buf(),
                 destroy_notify: notify,
                 unprivileged: true,
@@ -713,7 +776,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let fuse_conn_opt = self.fuse_connection.clone();
         Ok(MountHandle {
             inner: Some(MountHandleInner {
-                task: task::spawn(self.inner_mount()),
+                task: MountTask::spawn(self.inner_mount()),
                 mount_path: mount_path.to_path_buf(),
                 destroy_notify: notify,
                 #[cfg(all(target_os = "linux", feature = "unprivileged"))]
@@ -759,7 +822,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         Ok(MountHandle {
             inner: Some(MountHandleInner {
-                task: task::spawn(self.inner_mount()),
+                task: MountTask::spawn(self.inner_mount()),
                 mount_path: mount_path.to_path_buf(),
                 destroy_notify: notify,
             }),
@@ -774,9 +837,24 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let dispatch_task = self.dispatch_with_max_write(max_write).fuse();
         let mut dispatch_task = pin!(dispatch_task);
 
-        let reply_task = task::spawn(Self::reply_fuse(fuse_write_connection, receiver))
-            .map(Result::unwrap)
-            .fuse();
+        // The reply task rides the session's own TPC lane machinery
+        // (the venue the dispatch loop itself runs on); a oneshot
+        // carries its result back. RecvError = the reply future
+        // vanished (lane panic) — re-panic, parity with the old
+        // `task::spawn(..).map(Result::unwrap)`.
+        let (reply_done_tx, reply_done_rx) = crate::sqz_channel::oneshot::channel();
+        {
+            let fut = Self::reply_fuse(fuse_write_connection, receiver);
+            crate::raw::session::tpc_spawn(async move {
+                let _ = reply_done_tx.send(fut.await);
+            });
+        }
+        let reply_task = async move {
+            reply_done_rx
+                .await
+                .expect("reply_fuse task vanished (lane panic)")
+        }
+        .fuse();
 
         let mut reply_task = pin!(reply_task);
 
@@ -860,7 +938,6 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     };
                     fuse_connection.set_fused_write_dispatcher(FusedWriteDispatch {
                         mint: Arc::new(mint),
-                        handle: tokio::runtime::Handle::current(),
                     });
                     // fused-lane-predicate (2026-08-08): the HOLD gate —
                     // the filesystem's W1-eligibility probe, registered
@@ -886,9 +963,24 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let dispatch_task = self.dispatch_with_max_write(max_write).fuse();
         let mut dispatch_task = pin!(dispatch_task);
 
-        let reply_task = task::spawn(Self::reply_fuse(fuse_write_connection, receiver))
-            .map(Result::unwrap)
-            .fuse();
+        // The reply task rides the session's own TPC lane machinery
+        // (the venue the dispatch loop itself runs on); a oneshot
+        // carries its result back. RecvError = the reply future
+        // vanished (lane panic) — re-panic, parity with the old
+        // `task::spawn(..).map(Result::unwrap)`.
+        let (reply_done_tx, reply_done_rx) = crate::sqz_channel::oneshot::channel();
+        {
+            let fut = Self::reply_fuse(fuse_write_connection, receiver);
+            crate::raw::session::tpc_spawn(async move {
+                let _ = reply_done_tx.send(fut.await);
+            });
+        }
+        let reply_task = async move {
+            reply_done_rx
+                .await
+                .expect("reply_fuse task vanished (lane panic)")
+        }
+        .fuse();
 
         let mut reply_task = pin!(reply_task);
 
@@ -5554,19 +5646,13 @@ impl TpcScheduler {
                     IS_TPC_LANE.with(|c| c.set(true));
                     CURRENT_LANE.with(|c| *c.borrow_mut() = Some(exec.clone()));
 
-                    // Handler futures still use tokio's driver-backed
-                    // primitives (`tokio::time` sleeps/timeouts) and may
-                    // `tokio::spawn` aux work: enter the PROCESS-LIFETIME
-                    // parked driver's handle — never a captured ambient
-                    // handle, whose runtime can be dropped under the
-                    // lanes (the first `#[tokio::test]` to touch the lazy
-                    // scheduler would donate its short-lived runtime and
-                    // every later lane timer/spawn dies silently — the
-                    // async_block_reclaim order-dependent hang this
-                    // replaced). The driver only FIRES wakers; the woken
-                    // handler task's delivery (queue -> poll) is
-                    // sqz-exec, first-party by construction.
-                    let _rt = tpc_timer_handle().enter();
+                    // No ambient runtime: handler futures' timers ride
+                    // the first-party `sqz_time` service and their aux
+                    // spawns the sqz venues, so the lane needs no
+                    // entered handle (the retired `fuse3-timerdrv`
+                    // parked-runtime donation — rip-tokio-total). Task
+                    // delivery (queue -> poll) is sqz-exec, first-party
+                    // by construction.
                     exec.run();
                 })
                 .expect("fuse3 tpc lane thread spawns");
@@ -5585,7 +5671,14 @@ impl TpcScheduler {
         F: std::future::Future<Output = ()> + Send + 'static,
     {
         if self.lanes.is_empty() {
-            tokio::task::spawn(fut);
+            // Degenerate ZERO-LANE config only (never a production
+            // shape): a transient named OS thread drives the future to
+            // completion — loud on spawn failure, never a silent drop,
+            // and no ambient runtime requirement.
+            std::thread::Builder::new()
+                .name("fuse3-tpc-fallback".to_string())
+                .spawn(move || crate::sqz_blocking::block_on(fut))
+                .expect("fuse3-tpc-fallback thread spawns");
             return;
         }
         let idx = self
@@ -5619,7 +5712,7 @@ impl TpcScheduler {
     /// Lane dispatch with **loud dead-lane re-dispatch** (shim-parity
     /// campaign 2026-07-28, ingest-economy board item 2): a lane whose
     /// receiver is gone (its OS thread died — an escaped panic outside a
-    /// tokio task, a runtime build failure) must never silently blackhole
+    /// polled task) must never silently blackhole
     /// 1/N of all handler dispatches (each swallowed future is a FUSE
     /// request whose reply never happens: the kernel waiter parks in
     /// D-state forever and umount joins the wedge — the exact shape the
@@ -5691,32 +5784,6 @@ std::thread_local! {
     /// sqz-exec first-party.
     static CURRENT_LANE: std::cell::RefCell<Option<crate::sqz_exec::LaneExec>> =
         const { std::cell::RefCell::new(None) };
-}
-
-/// The shared background tokio driver for lane-task TIMERS (sleeps /
-/// timeouts inside handler futures): one parked current-thread runtime
-/// on its own OS thread, whose handle every lane enters. The driver
-/// fires waker callbacks; task DELIVERY stays sqz-exec (the waker pushes
-/// onto the lane queue — our code).
-fn tpc_timer_handle() -> tokio::runtime::Handle {
-    static DRIVER: once_cell::sync::Lazy<tokio::runtime::Handle> =
-        once_cell::sync::Lazy::new(|| {
-            let (tx, rx) = std::sync::mpsc::sync_channel(1);
-            std::thread::Builder::new()
-                .name("fuse3-timerdrv".to_string())
-                .spawn(move || {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .expect("fuse3 timer-driver runtime builds");
-                    tx.send(rt.handle().clone())
-                        .expect("timer-driver handle handoff");
-                    rt.block_on(std::future::pending::<()>());
-                })
-                .expect("fuse3 timer-driver thread spawns");
-            rx.recv().expect("timer-driver handle received")
-        });
-    DRIVER.clone()
 }
 
 /// Transport-ingress lever 1 (2026-08-04 campaign; the §9.2 deferred

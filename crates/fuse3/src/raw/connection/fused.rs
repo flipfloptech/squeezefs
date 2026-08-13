@@ -254,12 +254,12 @@ impl FusedLane {
     /// instead of after ALL of them (the serial pass shape left devices
     /// busy ~50 µs of every ~600 µs pass — the measured ~21-in-flight
     /// equilibrium on the 32-CPU rig; nothing here is a width constant,
-    /// the overlap scales with whatever the run queue holds). Runs
-    /// inside `handle.enter()` so handler futures may use tokio
-    /// timers/spawns.
+    /// the overlap scales with whatever the run queue holds). Handler
+    /// futures' timers ride the first-party `sqz_time` service — no
+    /// entered runtime handle (rip-tokio-total).
     ///
     /// Returns `false` when the run queue named nothing pollable.
-    pub(crate) fn drain_one(&mut self, handle: &tokio::runtime::Handle) -> bool {
+    pub(crate) fn drain_one(&mut self) -> bool {
         loop {
             let Some((id, pushed_ns)) = self.rq.pop() else {
                 return false;
@@ -279,7 +279,6 @@ impl FusedLane {
                 rq: Arc::clone(&self.rq),
             }));
             let mut cx = Context::from_waker(&waker);
-            let _rt = handle.enter();
             match std::panic::catch_unwind(AssertUnwindSafe(|| task.fut.as_mut().poll(&mut cx))) {
                 Ok(Poll::Ready(())) => {
                     let unique = self.tasks[id].unique;
@@ -318,7 +317,7 @@ impl FusedLane {
     ///
     /// Returns the number of polls performed.
     #[cfg(test)]
-    pub(crate) fn drain(&mut self, handle: &tokio::runtime::Handle) -> usize {
+    pub(crate) fn drain(&mut self) -> usize {
         let budget = {
             self.rq
                 .ready
@@ -328,7 +327,7 @@ impl FusedLane {
         };
         let mut polls = 0;
         for _ in 0..budget {
-            if !self.drain_one(handle) {
+            if !self.drain_one() {
                 break;
             }
             polls += 1;
@@ -397,11 +396,10 @@ pub(crate) fn fusion_enabled() -> bool {
 }
 
 /// A registered fused-write dispatcher: the session's mint (builds the
-/// WRITE handler future for one delivery) plus the runtime handle whose
-/// timers/spawn the polled futures may use.
+/// WRITE handler future for one delivery). Polled futures' timers ride
+/// the first-party `sqz_time` service — no runtime handle travels.
 pub struct FusedWriteDispatch {
     pub mint: Arc<dyn Fn(InboundUringReq) -> FusedFuture + Send + Sync + 'static>,
-    pub handle: tokio::runtime::Handle,
 }
 
 /// The zc-write HOLD gate (fused-lane-predicate campaign, 2026-08-08):
@@ -523,11 +521,11 @@ mod tests {
             7
         ));
         assert_eq!(lane.len(), 1);
-        let polls = lane.drain(&tokio::runtime::Handle::current());
+        let polls = lane.drain();
         assert_eq!(polls, 1);
         assert_eq!(hit.load(Ordering::SeqCst), 1, "future ran");
         assert_eq!(lane.len(), 0, "completed task removed");
-        assert_eq!(lane.drain(&tokio::runtime::Handle::current()), 0, "idle");
+        assert_eq!(lane.drain(), 0, "idle");
     }
 
     /// A parked future stays in the slab without blocking the drain; the
@@ -546,7 +544,7 @@ mod tests {
             }),
             9
         ));
-        assert_eq!(lane.drain(&tokio::runtime::Handle::current()), 1);
+        assert_eq!(lane.drain(), 1);
         assert_eq!(lane.len(), 1, "parked, not completed, not blocking");
         // Mirror the worker's pass-top protocol: drain the eventfd, then
         // DISARM the coalescer (a producer wake after this must re-arm
@@ -557,7 +555,7 @@ mod tests {
         // Resolve from another thread: the waker must re-queue the task
         // AND write the wake eventfd (the parked-worker path).
         tx.send(42).expect("send");
-        let polls = lane.drain(&tokio::runtime::Handle::current());
+        let polls = lane.drain();
         assert_eq!(polls, 1, "wake re-queued the task");
         assert_eq!(got.load(Ordering::SeqCst), 42);
         assert_eq!(lane.len(), 0);
@@ -606,7 +604,7 @@ mod tests {
             }),
             4
         ));
-        let polls = lane.drain(&tokio::runtime::Handle::current());
+        let polls = lane.drain();
         assert_eq!(polls, 2);
         assert_eq!(lane.panics, 1, "panic counted loudly");
         assert_eq!(lane.len(), 0, "both tasks retired");
@@ -620,11 +618,11 @@ mod tests {
     async fn fused_lane_stale_wakes_are_harmless() {
         let (mut lane, _fd, _c) = test_lane(4);
         assert!(lane.spawn(Box::pin(async {}), 5));
-        assert_eq!(lane.drain(&tokio::runtime::Handle::current()), 1);
+        assert_eq!(lane.drain(), 1);
         // Push a stale id by hand (the waker of the completed task).
         lane.rq.push(0);
         assert_eq!(
-            lane.drain(&tokio::runtime::Handle::current()),
+            lane.drain(),
             0,
             "stale id skipped"
         );

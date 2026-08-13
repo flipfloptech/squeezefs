@@ -496,7 +496,7 @@ pub fn stats_json() -> serde_json::Value {
 pub struct PublishClient {
     peer_id: Arc<str>,
     secret: Arc<Vec<u8>>,
-    sessions: scc::HashMap<String, Arc<tokio::sync::Mutex<Option<RpcClient>>>>,
+    sessions: scc::HashMap<String, Arc<crate::sqz_sync::SqzMutex<Option<RpcClient>>>>,
 }
 
 impl std::fmt::Debug for PublishClient {
@@ -519,11 +519,11 @@ impl PublishClient {
         })
     }
 
-    fn lane(&self, endpoint: &str) -> Arc<tokio::sync::Mutex<Option<RpcClient>>> {
+    fn lane(&self, endpoint: &str) -> Arc<crate::sqz_sync::SqzMutex<Option<RpcClient>>> {
         if let Some(lane) = self.sessions.read_sync(endpoint, |_, l| Arc::clone(l)) {
             return lane;
         }
-        let lane = Arc::new(tokio::sync::Mutex::new(None));
+        let lane = Arc::new(crate::sqz_sync::SqzMutex::new(None));
         match self
             .sessions
             .insert_sync(endpoint.to_string(), Arc::clone(&lane))
@@ -1097,13 +1097,13 @@ pub async fn readdir_stream(
 ///
 /// The **venue rule** is S8's, verbatim and for the same mechanical reason:
 /// the frame arrives on a pinned `sqz-cluster-svc{n}` lane, and the
-/// execution is handed to the runtime that owns the backend's tasks —
-/// because `commit_tx` spawns the per-volume conveyor pass task on the
-/// committer's own runtime, and a verb executed inline on a lane would give
-/// a volume's whole commit conveyor a runtime whose lifetime is the lane's.
+/// execution is handed to the **sqz-meta pool**
+/// ([`crate::meta_exec::spawn_meta_join`]) — the venue that owns the
+/// backend's tasks, because `commit_tx` spawns the per-volume conveyor pass
+/// task there, and a verb executed inline on a lane would give a volume's
+/// whole commit conveyor a venue whose lifetime is the lane's.
 pub struct PublishService {
     inner: Arc<RoutedMetaBackend>,
-    runtime: tokio::runtime::Handle,
     authority: Vec<bool>,
     /// The FREE verb's exactly-once witness: `(lease_epoch, request_id)` →
     /// the winner's own outcome — S8's [`DedupWindow`], reused (never a
@@ -1126,18 +1126,14 @@ impl PublishService {
     /// A service with authority over every volume of `inner` (the shape a
     /// node that write-mounted the set has: it holds the D0 claim on each
     /// member).
-    pub fn new(inner: Arc<RoutedMetaBackend>, runtime: tokio::runtime::Handle) -> Arc<Self> {
+    pub fn new(inner: Arc<RoutedMetaBackend>) -> Arc<Self> {
         let all: Vec<usize> = (0..inner.volumes.len()).collect();
-        Self::with_authority(inner, runtime, &all)
+        Self::with_authority(inner, &all)
     }
 
     /// [`Self::new`] with an explicit authority set — the shape a node that
     /// owns a SUBSET of the set has.
-    pub fn with_authority(
-        inner: Arc<RoutedMetaBackend>,
-        runtime: tokio::runtime::Handle,
-        volumes: &[usize],
-    ) -> Arc<Self> {
+    pub fn with_authority(inner: Arc<RoutedMetaBackend>, volumes: &[usize]) -> Arc<Self> {
         let mut authority = vec![false; inner.volumes.len()];
         for &v in volumes {
             if let Some(slot) = authority.get_mut(v) {
@@ -1146,7 +1142,6 @@ impl PublishService {
         }
         let me = Arc::new(Self {
             inner,
-            runtime,
             authority,
             free_dedup: DedupWindow::new(crate::meta_ship::service::dedup_cap()),
             self_ref: std::sync::OnceLock::new(),
@@ -1263,10 +1258,10 @@ impl PublishService {
             );
         };
         let name = frame.call.name();
-        let joined = self
-            .runtime
-            .spawn(async move { me.execute(frame.call).await })
-            .await;
+        let joined = crate::meta_exec::spawn_meta_join("meta_ship_publish_verb", async move {
+            me.execute(frame.call).await
+        })
+        .await;
         let outcome = match joined {
             Ok(out) => out,
             Err(e) => {
@@ -1298,8 +1293,8 @@ impl PublishService {
     }
 
     /// Serve one [`PublishCall::FreeBlocks`] through the dedup window: the
-    /// winner of `(lease_epoch, request_id)` executes on the backend's
-    /// runtime under the installed [`FreeExecutor`]; every duplicate —
+    /// winner of `(lease_epoch, request_id)` executes on the sqz-meta
+    /// pool under the installed [`FreeExecutor`]; every duplicate —
     /// a lost-reply retry, or an overlapping resend — awaits the winner's
     /// own outcome and is counted (`free_replays`). The era gate already
     /// ran in [`Self::serve`].
@@ -1335,14 +1330,18 @@ impl PublishService {
         if !owns {
             FREE_REPLAYS.fetch_add(1, Ordering::Relaxed);
         }
-        let runtime = self.runtime.clone();
         let outcome = slot
             .get_or_init(|| async move {
-                // The venue rule, verbatim: the ladder runs on the runtime
-                // that owns the backend's tasks (the reclaim queue's worker
-                // and the conveyor live there), never inline on a
-                // `sqz-cluster-svc{n}` lane.
-                match runtime.spawn(exec(vol_tag, blocks)).await {
+                // The venue rule, verbatim: the ladder runs on the
+                // sqz-meta pool — the venue that owns the backend's tasks
+                // (the reclaim queue's worker and the conveyor live
+                // there), never inline on a `sqz-cluster-svc{n}` lane.
+                match crate::meta_exec::spawn_meta_join(
+                    "shipped_free_ladder",
+                    exec(vol_tag, blocks),
+                )
+                .await
+                {
                     Ok(Ok(verdicts)) => {
                         FREE_SERVED_BLOCKS.fetch_add(
                             verdicts

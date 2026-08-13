@@ -910,10 +910,8 @@ async fn a_co_writer_ships_metadata_mutations_instead_of_committing_them() {
         .await
         .expect("the authority mounts");
     let listener = {
-        let router = data_grant::AsyncVerbRouter::new().with_publish(publish::PublishService::new(
-            Arc::clone(&authority),
-            tokio::runtime::Handle::current(),
-        ));
+        let router = data_grant::AsyncVerbRouter::new()
+            .with_publish(publish::PublishService::new(Arc::clone(&authority)));
         cw::RpcListener::start_async(
             cw::RpcListenerConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),

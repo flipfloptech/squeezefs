@@ -7,8 +7,10 @@ use std::vec::IntoIter;
 use bytes::Bytes;
 use futures_util::stream::{self, Iter, Stream, StreamExt};
 use slab::Slab;
-#[cfg(feature = "tokio-runtime")]
-use tokio::sync::RwLock;
+// First-party async rwlock: guards are deliberately held across the
+// awaited PathFilesystem calls (the name-map mutation on each op's
+// success/error arms must be atomic with the call).
+use crate::sqz_sync::SqzRwLock;
 
 use super::inode_generator::InodeGenerator;
 use super::path_filesystem::PathFilesystem;
@@ -102,7 +104,7 @@ impl InodeNameManager {
 
 pub struct InodePathBridge<FS> {
     path_filesystem: FS,
-    inode_name_manager: RwLock<InodeNameManager>,
+    inode_name_manager: SqzRwLock<InodeNameManager>,
 }
 
 impl<FS> InodePathBridge<FS> {
@@ -129,7 +131,7 @@ impl<FS> InodePathBridge<FS> {
 
         Self {
             path_filesystem,
-            inode_name_manager: RwLock::new(inode_name_manager),
+            inode_name_manager: SqzRwLock::new(inode_name_manager),
         }
     }
 }

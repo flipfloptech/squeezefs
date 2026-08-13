@@ -195,7 +195,12 @@ pub mod block_allocator;
 pub mod block_reclaim;
 pub mod jobs;
 pub mod meta_exec;
+pub mod signals;
 pub mod sqz_sync;
+/// Crate-neutral alias: `#[path]`-shared modules (sqz_sync, sqz_fdwatch)
+/// reference `crate::sqz_time`, which this re-export satisfies in the
+/// root crate (fuse3 owns a real module of the same name).
+pub use squeezefs_ipc::sqz_time;
 pub mod sqz_sync_core;
 pub mod storage;
 pub mod stripe_locks;

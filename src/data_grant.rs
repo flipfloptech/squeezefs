@@ -1803,7 +1803,7 @@ pub struct WriteCustodyClient {
     id: String,
     endpoint: String,
     secret: Vec<u8>,
-    session: tokio::sync::Mutex<Option<RpcClient>>,
+    session: crate::sqz_sync::SqzMutex<Option<RpcClient>>,
     /// This client's lease view — S6's [`MemberSession`], reused verbatim
     /// so the stricter-clock law and the writer's self-fence (which poisons
     /// process data custody) have exactly one implementation.
@@ -1875,7 +1875,7 @@ impl WriteCustodyClient {
             id: id.to_string(),
             endpoint: endpoint.to_string(),
             secret: secret.to_vec(),
-            session: tokio::sync::Mutex::new(Some(session)),
+            session: crate::sqz_sync::SqzMutex::new(Some(session)),
             lease: arc_swap::ArcSwap::from_pointee(member),
             lease_epoch: AtomicU64::new(lease.epoch),
             lane: std::sync::atomic::AtomicU32::new(pack_lane(lease.writer_lane, lease.writers)),

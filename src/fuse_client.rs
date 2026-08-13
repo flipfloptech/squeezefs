@@ -23488,13 +23488,18 @@ pub async fn start_mount<P: AsRef<Path>>(
     // outage it exists to observe. Sysfs reads are tiny control-plane
     // file I/O (the sanctioned nvmeof-module precedent), pushed through
     // spawn_blocking to keep the runtime clean.
-    let fabric_stats_handle = tokio::spawn(async move {
+    let fabric_stats_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let fabric_stats_stop_task = fabric_stats_stop.clone();
+    crate::meta_exec::spawn_meta("fabric_stats_sampler", async move {
         let mut sampler = crate::nvmeof::fabric::FabricStatsSampler::default();
         let mut interval = squeezefs_ipc::sqz_time::interval(std::time::Duration::from_secs(
             CLIENT_HEARTBEAT_INTERVAL_SECS,
         ));
         loop {
             interval.tick().await;
+            if fabric_stats_stop_task.load(Ordering::Acquire) {
+                return;
+            }
             let controllers = squeezefs_ipc::sqz_blocking::run_blocking(|| {
                 crate::nvmeof::fabric::enumerate_fabric_controllers(std::path::Path::new(
                     crate::nvmeof::fabric::SYSFS_NVME,
@@ -23649,89 +23654,58 @@ pub async fn start_mount<P: AsRef<Path>>(
 
     println!("\x1b[92mOK\x1b[0m Squeezefs is ready at {:?}", mount_path);
 
+    // First-party signal delivery (rip-tokio-total): SIGINT/SIGTERM ride
+    // the self-pipe watcher (`crate::signals`) onto an sqz channel; the
+    // double-Ctrl+C confirm window is a bounded recv. A failed arm falls
+    // back to session-exit-only shutdown (loud) — signals then act by
+    // their default disposition.
+    let mut sig_rx = match crate::signals::arm() {
+        Ok(rx) => Some(rx),
+        Err(e) => {
+            error!("signal delivery arm failed: {e} — Ctrl+C will hard-kill (default disposition)");
+            None
+        }
+    };
+
     let mut should_exit = false;
     while !should_exit {
         let shutdown = async {
-            #[cfg(unix)]
-            {
-                println!("[SIG] Registering signal handlers inside shutdown block...");
-                let sigterm_opt =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
-                let sigint_opt =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt());
-                if let (Ok(mut sigterm), Ok(mut sigint)) = (sigterm_opt, sigint_opt) {
-                    println!("[SIG] Signal handlers registered successfully.");
-                    loop {
-                        tokio::select! {
-                            _ = tokio::signal::ctrl_c() => {
-                                println!("[SIG] Ctrl+C pressed (ctrl_c future matched)!");
-                                eprintln!("\nWARNING: Ctrl+C pressed! If you really want to unmount/exit, hit Ctrl+C again.");
-                                tokio::select! {
-                                    _ = tokio::signal::ctrl_c() => {
-                                        println!("[SIG] Second Ctrl+C, exiting...");
-                                        break;
-                                    }
-                                    _ = squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_secs(5)) => {
-                                        eprintln!("\nUnmount timeout elapsed. Resuming filesystem...");
-                                    }
-                                }
-                            }
-                            _ = sigterm.recv() => {
-                                println!("[SIG] Received SIGTERM signal in sigterm.recv()!");
-                                break;
-                            }
-                            _ = sigint.recv() => {
-                                println!("[SIG] Received SIGINT signal in sigint.recv()!");
-                                eprintln!("\nWARNING: SIGINT received! If you really want to unmount/exit, send SIGINT again.");
-                                tokio::select! {
-                                    _ = sigint.recv() => {
-                                        println!("[SIG] Second SIGINT, exiting...");
-                                        break;
-                                    }
-                                    _ = squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_secs(5)) => {
-                                        eprintln!("\nUnmount timeout elapsed. Resuming filesystem...");
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    println!("[SIG] Failed to register unix signal handlers. Falling back...");
-                    loop {
-                        let _ = tokio::signal::ctrl_c().await;
-                        eprintln!("\nWARNING: Ctrl+C pressed! If you really want to unmount/exit, hit Ctrl+C again.");
-                        tokio::select! {
-                            _ = tokio::signal::ctrl_c() => {
-                                info!("Received second Ctrl+C, exiting...");
-                                break;
-                            }
-                            _ = squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_secs(5)) => {
-                                eprintln!("\nUnmount timeout elapsed. Resuming filesystem...");
-                            }
-                        }
-                    }
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                loop {
-                    let _ = tokio::signal::ctrl_c().await;
-                    eprintln!("\nWARNING: Ctrl+C pressed! If you really want to unmount/exit, hit Ctrl+C again.");
-                    tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {
-                            info!("Received second Ctrl+C, exiting...");
+            match sig_rx.as_mut() {
+                Some(rx) => loop {
+                    match rx.recv().await {
+                        None | Some(crate::signals::Sig::Term) => {
+                            println!(
+                                "[SIG] Received SIGTERM (or signal watcher exited); shutting down."
+                            );
                             break;
                         }
-                        _ = squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_secs(5)) => {
-                            eprintln!("\nUnmount timeout elapsed. Resuming filesystem...");
+                        Some(crate::signals::Sig::Int) => {
+                            eprintln!("\nWARNING: Ctrl+C/SIGINT received! If you really want to unmount/exit, send it again.");
+                            match squeezefs_ipc::sqz_time::timeout(
+                                std::time::Duration::from_secs(5),
+                                rx.recv(),
+                            )
+                            .await
+                            {
+                                Ok(_) => {
+                                    println!("[SIG] Second signal, exiting...");
+                                    break;
+                                }
+                                Err(_elapsed) => {
+                                    eprintln!("\nUnmount timeout elapsed. Resuming filesystem...");
+                                }
+                            }
                         }
                     }
-                }
+                },
+                // No signal channel: park forever — the session future
+                // side of the race is the only exit.
+                None => std::future::pending::<()>().await,
             }
         };
 
-        tokio::select! {
-            res = &mut handle => {
+        match squeezefs_ipc::sqz_future::race2(&mut handle, shutdown).await {
+            squeezefs_ipc::sqz_future::Either::Left(res) => {
                 if let Err(e) = res {
                     error!("FUSE session loop ended with error: {:?}", e);
                     eprintln!("FUSE session loop ended with error: {:?}", e);
@@ -23741,12 +23715,12 @@ pub async fn start_mount<P: AsRef<Path>>(
                 }
                 should_exit = true;
             }
-            _ = shutdown => {
+            squeezefs_ipc::sqz_future::Either::Right(()) => {
                 use colored::Colorize;
-                use std::io::Write;
                 use std::io::IsTerminal;
+                use std::io::Write;
 
-                println!("[SIG] Shutdown future resolved. Running shutdown logic...");
+                println!("[SIG] Shutdown resolved. Running shutdown logic...");
                 info!("Received shutdown signal. Force flushing memory buffers to staging...");
                 // Phase 1: Force flush RAM buffers to staging (cancellation NOT allowed)
                 if let Err(e) = fs.flush_all_memory_buffers_to_staging().await {
@@ -23767,9 +23741,17 @@ pub async fn start_mount<P: AsRef<Path>>(
                 let has_unflushed = staged_count > 0 || active_writes_count > 0;
                 if has_unflushed {
                     if std::io::stdin().is_terminal() {
-                        println!("\n{}", "WARNING: There are unflushed staged writes on this node!".red().bold());
+                        println!(
+                            "\n{}",
+                            "WARNING: There are unflushed staged writes on this node!"
+                                .red()
+                                .bold()
+                        );
                         println!("Remaining local staged files: {}", staged_count);
-                        println!("Active write transaction directories: {}", active_writes_count);
+                        println!(
+                            "Active write transaction directories: {}",
+                            active_writes_count
+                        );
                         println!("If you unmount now, other nodes will not see this data.");
                         println!("\nChoose an option:");
                         println!("  [w] Wait for staged files to drain/flush to NVMe-oF backend");
@@ -23790,19 +23772,34 @@ pub async fn start_mount<P: AsRef<Path>>(
                             continue;
                         } else if choice == "w" || choice == "wait" {
                             println!("Waiting for staged writes to drain. Press Ctrl+C again to force exit.");
-                            tokio::select! {
-                                summary = fs.flush_all_staged_blocks_to_backend() => {
+                            let cancel = async {
+                                match sig_rx.as_mut() {
+                                    Some(rx) => {
+                                        let _ = rx.recv().await;
+                                    }
+                                    None => std::future::pending::<()>().await,
+                                }
+                            };
+                            match squeezefs_ipc::sqz_future::race2(
+                                fs.flush_all_staged_blocks_to_backend(),
+                                cancel,
+                            )
+                            .await
+                            {
+                                squeezefs_ipc::sqz_future::Either::Left(summary) => {
                                     if summary.failed > 0 {
                                         error!(
                                             "Staged-block drain: {} flushed, {} failed (first errors: {:?})",
                                             summary.flushed, summary.failed, summary.error_samples
                                         );
                                     } else {
-                                        println!("\nAll staged files and active writes drained cleanly!");
+                                        println!(
+                                            "\nAll staged files and active writes drained cleanly!"
+                                        );
                                     }
                                 }
-                                _ = tokio::signal::ctrl_c() => {
-                                    println!("\nCtrl+C received. Cancelling staging flush to NVMe-oF backend and exiting immediately...");
+                                squeezefs_ipc::sqz_future::Either::Right(()) => {
+                                    println!("\nSignal received. Cancelling staging flush to NVMe-oF backend and exiting immediately...");
                                 }
                             }
                         } else {
@@ -23819,9 +23816,10 @@ pub async fn start_mount<P: AsRef<Path>>(
         }
     }
 
-    // Stop heartbeat + fabric sampler tasks
+    // Stop heartbeat + fabric sampler tasks (stop latches — sqz tasks
+    // are never aborted mid-poll; the sampler exits at its next tick).
     heartbeat_stop.store(true, Ordering::Release);
-    fabric_stats_handle.abort();
+    fabric_stats_stop.store(true, Ordering::Release);
 
     // Tear down the interception session host (poisons nothing — live
     // clients observe socket EOF and degrade to passthrough, §5.7).

@@ -137,7 +137,7 @@ async fn shutdown(routed: &Arc<RoutedMetaBackend>) {
 fn start_owner(
     inner: Arc<RoutedMetaBackend>,
 ) -> (Arc<cw::RpcListener>, Arc<MetaShipService>, String) {
-    let svc = MetaShipService::new(inner, tokio::runtime::Handle::current());
+    let svc = MetaShipService::new(inner);
     let cfg = cw::RpcListenerConfig {
         bind_addr: "127.0.0.1:0".parse().expect("literal addr"),
         service_threads: 2,

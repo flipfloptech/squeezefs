@@ -115,8 +115,6 @@ use nix::sys::socket::{self, AddressFamily, ControlMessageOwned, MsgFlags, SockF
 use nix::sys::uio;
 #[cfg(all(target_os = "linux", feature = "unprivileged"))]
 use std::process::Command;
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
-use tokio::io::{unix::AsyncFd, Interest};
 #[cfg(target_os = "linux")]
 use tracing::debug;
 #[cfg(target_os = "freebsd")]
@@ -642,8 +640,8 @@ impl FuseConnection {
                     return Err(e);
                 }
 
-                let read_ring_fd = AsyncFd::new(unsafe { OwnedFd::from_raw_fd(read_event_fd) })?;
-                let write_ring_fd = AsyncFd::new(unsafe { OwnedFd::from_raw_fd(write_event_fd) })?;
+                let read_ring_fd = unsafe { OwnedFd::from_raw_fd(read_event_fd) };
+                let write_ring_fd = unsafe { OwnedFd::from_raw_fd(write_event_fd) };
 
                 let read_ring = DebugUring(read_ring);
                 let write_ring = DebugUring(write_ring);
@@ -1119,9 +1117,9 @@ enum ConnectionMode {
 struct BlockFuseConnection {
     file: File,
     read_ring: std::sync::Mutex<DebugUring>,
-    read_ring_fd: AsyncFd<OwnedFd>,
+    read_ring_fd: OwnedFd,
     write_ring: std::sync::Mutex<DebugUring>,
-    write_ring_fd: AsyncFd<OwnedFd>,
+    write_ring_fd: OwnedFd,
     /// When true, SQEs use `types::Fixed(0)` for the fuse device (P2-8).
     read_use_fixed: bool,
     write_use_fixed: bool,
@@ -1143,7 +1141,7 @@ impl BlockFuseConnection {
 
         let fd = file.as_raw_fd();
 
-        // Set non-blocking to allow AsyncFd polling on eventfd completions
+        // Set non-blocking so the sqz_fdwatch-driven eventfd drains never park
         let flags = nix::fcntl::fcntl(fd, FcntlArg::F_GETFL).map_err(io::Error::from)?;
         let flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
         nix::fcntl::fcntl(fd, FcntlArg::F_SETFL(flags)).map_err(io::Error::from)?;
@@ -1185,8 +1183,8 @@ impl BlockFuseConnection {
             return Err(e);
         }
 
-        let read_ring_fd = AsyncFd::new(unsafe { OwnedFd::from_raw_fd(read_event_fd) })?;
-        let write_ring_fd = AsyncFd::new(unsafe { OwnedFd::from_raw_fd(write_event_fd) })?;
+        let read_ring_fd = unsafe { OwnedFd::from_raw_fd(read_event_fd) };
+        let write_ring_fd = unsafe { OwnedFd::from_raw_fd(write_event_fd) };
 
         let read_ring = DebugUring(read_ring);
         let write_ring = DebugUring(write_ring);
@@ -1271,17 +1269,20 @@ impl BlockFuseConnection {
                 }
             }
 
-            let mut fd_guard = match self.read_ring_fd.ready(Interest::READABLE).await {
-                Err(err) => break Err(err),
-                Ok(guard) => guard,
-            };
+            // First-party fd watch (sqz_fdwatch): level-triggered per await,
+            // so the nonblocking eventfd drain below plus re-await replaces
+            // the old AsyncFd guard/clear_ready protocol 1:1 (a `Replaced`
+            // event is treated as Ready — drain and CQ probe re-check).
+            if let Err(err) = crate::sqz_fdwatch::readable(self.read_ring_fd.as_raw_fd()).await {
+                break Err(err);
+            }
 
             let mut read_err = None;
             loop {
                 let mut buf = [0u8; 8];
                 let res = unsafe {
                     libc::read(
-                        self.read_ring_fd.get_ref().as_raw_fd(),
+                        self.read_ring_fd.as_raw_fd(),
                         buf.as_mut_ptr() as *mut libc::c_void,
                         8,
                     )
@@ -1292,7 +1293,7 @@ impl BlockFuseConnection {
                         continue;
                     }
                     if err.kind() == io::ErrorKind::WouldBlock {
-                        fd_guard.clear_ready();
+                        // Drained; the next `readable().await` re-arms.
                         break;
                     } else {
                         read_err = Some(err);
@@ -1384,17 +1385,20 @@ impl BlockFuseConnection {
                 }
             }
 
-            let mut fd_guard = match self.write_ring_fd.ready(Interest::READABLE).await {
-                Err(err) => break Err(err),
-                Ok(guard) => guard,
-            };
+            // First-party fd watch (sqz_fdwatch): level-triggered per await,
+            // so the nonblocking eventfd drain below plus re-await replaces
+            // the old AsyncFd guard/clear_ready protocol 1:1 (a `Replaced`
+            // event is treated as Ready — drain and CQ probe re-check).
+            if let Err(err) = crate::sqz_fdwatch::readable(self.write_ring_fd.as_raw_fd()).await {
+                break Err(err);
+            }
 
             let mut read_err = None;
             loop {
                 let mut buf = [0u8; 8];
                 let res = unsafe {
                     libc::read(
-                        self.write_ring_fd.get_ref().as_raw_fd(),
+                        self.write_ring_fd.as_raw_fd(),
                         buf.as_mut_ptr() as *mut libc::c_void,
                         8,
                     )
@@ -1405,7 +1409,7 @@ impl BlockFuseConnection {
                         continue;
                     }
                     if err.kind() == io::ErrorKind::WouldBlock {
-                        fd_guard.clear_ready();
+                        // Drained; the next `readable().await` re-arms.
                         break;
                     } else {
                         read_err = Some(err);
@@ -1434,19 +1438,19 @@ impl BlockFuseConnection {
 #[derive(Debug)]
 struct NonBlockFuseConnection {
     #[cfg(target_os = "freebsd")]
-    fd: AsyncFd<OwnedFd>,
+    fd: OwnedFd,
     #[cfg(target_os = "linux")]
     fd: OwnedFd,
 
     #[cfg(target_os = "linux")]
     read_ring: std::sync::Mutex<DebugUring>,
     #[cfg(target_os = "linux")]
-    read_ring_fd: AsyncFd<OwnedFd>,
+    read_ring_fd: OwnedFd,
 
     #[cfg(target_os = "linux")]
     write_ring: std::sync::Mutex<DebugUring>,
     #[cfg(target_os = "linux")]
-    write_ring_fd: AsyncFd<OwnedFd>,
+    write_ring_fd: OwnedFd,
 
     #[cfg(target_os = "linux")]
     read_use_fixed: bool,
@@ -1479,7 +1483,7 @@ impl NonBlockFuseConnection {
                 Err(e)
             }
             Ok(file) => Ok(Self {
-                fd: AsyncFd::new(file.into())?,
+                fd: file.into(),
                 read: Mutex::new(()),
                 write: Mutex::new(()),
             }),
@@ -1609,8 +1613,8 @@ impl NonBlockFuseConnection {
                 return Err(e);
             }
 
-            let read_ring_fd = AsyncFd::new(unsafe { OwnedFd::from_raw_fd(read_event_fd) })?;
-            let write_ring_fd = AsyncFd::new(unsafe { OwnedFd::from_raw_fd(write_event_fd) })?;
+            let read_ring_fd = unsafe { OwnedFd::from_raw_fd(read_event_fd) };
+            let write_ring_fd = unsafe { OwnedFd::from_raw_fd(write_event_fd) };
 
             let read_ring = DebugUring(read_ring);
             let write_ring = DebugUring(write_ring);
@@ -1631,7 +1635,7 @@ impl NonBlockFuseConnection {
         #[cfg(target_os = "freebsd")]
         {
             Ok(Self {
-                fd: AsyncFd::new(fd)?,
+                fd,
                 read: Mutex::new(()),
                 write: Mutex::new(()),
             })
@@ -1715,10 +1719,13 @@ impl NonBlockFuseConnection {
                 }
             }
 
-            let mut fd_guard = match self.read_ring_fd.ready(Interest::READABLE).await {
-                Err(err) => break Err(err),
-                Ok(guard) => guard,
-            };
+            // First-party fd watch (sqz_fdwatch): level-triggered per await,
+            // so the nonblocking eventfd drain below plus re-await replaces
+            // the old AsyncFd guard/clear_ready protocol 1:1 (a `Replaced`
+            // event is treated as Ready — drain and CQ probe re-check).
+            if let Err(err) = crate::sqz_fdwatch::readable(self.read_ring_fd.as_raw_fd()).await {
+                break Err(err);
+            }
 
             // Loop reading eventfd until EAGAIN (WouldBlock) to ensure no lost wakeups
             let mut read_err = None;
@@ -1726,7 +1733,7 @@ impl NonBlockFuseConnection {
                 let mut buf = [0u8; 8];
                 let res = unsafe {
                     libc::read(
-                        self.read_ring_fd.get_ref().as_raw_fd(),
+                        self.read_ring_fd.as_raw_fd(),
                         buf.as_mut_ptr() as *mut libc::c_void,
                         8,
                     )
@@ -1737,7 +1744,7 @@ impl NonBlockFuseConnection {
                         continue;
                     }
                     if err.kind() == io::ErrorKind::WouldBlock {
-                        fd_guard.clear_ready();
+                        // Drained; the next `readable().await` re-arms.
                         break;
                     } else {
                         read_err = Some(err);
@@ -1770,24 +1777,28 @@ impl NonBlockFuseConnection {
         let _guard = self.read.lock().await;
 
         loop {
-            let mut read_guard = match self.fd.ready(Interest::READABLE | Interest::ERROR).await {
-                Err(err) => return ((header_buf, data_buf), Err(err)),
-                Ok(read_guard) => read_guard,
-            };
+            // First-party fd watch: await readability, then attempt the
+            // nonblocking readv; WouldBlock re-awaits (the level-triggered
+            // per-await registration replaces the AsyncFd guard/try_io
+            // protocol; HUP/ERR surface as Ready and the readv reports).
+            if let Err(err) = {
+                use std::os::fd::AsRawFd;
+                crate::sqz_fdwatch::readable(self.fd.as_raw_fd()).await
+            } {
+                return ((header_buf, data_buf), Err(err));
+            }
 
-            if let Ok(result) = read_guard.try_io(|fd| {
-                uio::readv(
-                    fd,
-                    &mut [
-                        IoSliceMut::new(&mut header_buf),
-                        IoSliceMut::new(&mut data_buf),
-                    ],
-                )
-                .map_err(io::Error::from)
-            }) {
-                return ((header_buf, data_buf), result);
-            } else {
-                continue;
+            let result = uio::readv(
+                &self.fd,
+                &mut [
+                    IoSliceMut::new(&mut header_buf),
+                    IoSliceMut::new(&mut data_buf),
+                ],
+            )
+            .map_err(io::Error::from);
+            match result {
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
+                other => return ((header_buf, data_buf), other),
             }
         }
     }
@@ -1875,10 +1886,13 @@ impl NonBlockFuseConnection {
                 }
             }
 
-            let mut fd_guard = match self.write_ring_fd.ready(Interest::READABLE).await {
-                Err(err) => break Err(err),
-                Ok(guard) => guard,
-            };
+            // First-party fd watch (sqz_fdwatch): level-triggered per await,
+            // so the nonblocking eventfd drain below plus re-await replaces
+            // the old AsyncFd guard/clear_ready protocol 1:1 (a `Replaced`
+            // event is treated as Ready — drain and CQ probe re-check).
+            if let Err(err) = crate::sqz_fdwatch::readable(self.write_ring_fd.as_raw_fd()).await {
+                break Err(err);
+            }
 
             // Loop reading eventfd until EAGAIN (WouldBlock) to ensure no lost wakeups
             let mut read_err = None;
@@ -1886,7 +1900,7 @@ impl NonBlockFuseConnection {
                 let mut buf = [0u8; 8];
                 let res = unsafe {
                     libc::read(
-                        self.write_ring_fd.get_ref().as_raw_fd(),
+                        self.write_ring_fd.as_raw_fd(),
                         buf.as_mut_ptr() as *mut libc::c_void,
                         8,
                     )
@@ -1897,7 +1911,7 @@ impl NonBlockFuseConnection {
                         continue;
                     }
                     if err.kind() == io::ErrorKind::WouldBlock {
-                        fd_guard.clear_ready();
+                        // Drained; the next `readable().await` re-arms.
                         break;
                     } else {
                         read_err = Some(err);

@@ -9,7 +9,6 @@ use squeezefs::fuse_client::{start_mount, SqueezefsFilesystem};
 use squeezefs::routing::DataRouter;
 use squeezefs::FormatConfig;
 use std::path::{Path, PathBuf};
-use tokio::fs;
 #[derive(Parser)]
 #[command(name = "squeezefs")]
 // Release-train + git-commit versioning (docs/operations.md §Versioning &
@@ -2008,7 +2007,7 @@ async fn run_fsck_verb(
                     )
                     .into())
                 }
-                _ => tokio::time::sleep(std::time::Duration::from_millis(500)).await,
+                _ => squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(500)).await,
             }
         }
         let body = admin_roundtrip(target, "fsck-report", &job_id)?;
@@ -3806,7 +3805,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .map(|n| n.get())
                 .unwrap_or(4);
             let pool_size = num_cores * 2;
-            let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(pool_size));
+            let semaphore =
+                std::sync::Arc::new(squeezefs_ipc::sqz_semaphore::Semaphore::new(pool_size));
             let mp = std::sync::Arc::new(indicatif::MultiProgress::new());
 
             let mut join_handles = Vec::new();
@@ -3829,34 +3829,37 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 // PR VL5a: each member's §5.5.1a stamp, by format order
                 // (= member_position; the canonical set order).
                 let stamp = meta_slot_plan.stamps[position].clone();
-                let handle = tokio::task::spawn(async move {
-                    let _permit = sem.acquire().await.unwrap();
-                    // Volume length: block devices use their physical
-                    // size; regular files grow to the v2-era 128 MiB
-                    // floor (format_v3 set_lens them).
-                    let physical = get_backing_device_size(&path).unwrap_or(0);
-                    let volume_len = std::cmp::max(physical, 128 * 1024 * 1024);
-                    if !quick {
-                        println!("Full-wiping metadata volume {path} ({volume_len} bytes)...");
-                    }
-                    let opts = squeezefs::meta_backend::kv::builder::FormatV3Options {
-                        node_size: meta_node_size,
-                        journal_len_override: meta_journal_override,
-                        force,
-                        full_wipe: !quick,
-                        format_config_xattr: config_xattr,
-                    };
-                    squeezefs::meta_backend::kv::builder::format_v3_stamped(
-                        Path::new(&path),
-                        volume_len,
-                        &opts,
-                        stamp,
-                    )
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| format!("Failed to format metadata volume '{}': {}", path, e))?;
-                    Ok::<(), String>(())
-                });
+                let handle =
+                    squeezefs::meta_exec::spawn_meta_join("format_meta_volume", async move {
+                        let _permit = sem.acquire().await.unwrap();
+                        // Volume length: block devices use their physical
+                        // size; regular files grow to the v2-era 128 MiB
+                        // floor (format_v3 set_lens them).
+                        let physical = get_backing_device_size(&path).unwrap_or(0);
+                        let volume_len = std::cmp::max(physical, 128 * 1024 * 1024);
+                        if !quick {
+                            println!("Full-wiping metadata volume {path} ({volume_len} bytes)...");
+                        }
+                        let opts = squeezefs::meta_backend::kv::builder::FormatV3Options {
+                            node_size: meta_node_size,
+                            journal_len_override: meta_journal_override,
+                            force,
+                            full_wipe: !quick,
+                            format_config_xattr: config_xattr,
+                        };
+                        squeezefs::meta_backend::kv::builder::format_v3_stamped(
+                            Path::new(&path),
+                            volume_len,
+                            &opts,
+                            stamp,
+                        )
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| {
+                            format!("Failed to format metadata volume '{}': {}", path, e)
+                        })?;
+                        Ok::<(), String>(())
+                    });
                 join_handles.push(handle);
             }
 
@@ -3870,9 +3873,11 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     .to_string_lossy()
                     .to_string();
 
-                let handle = tokio::task::spawn(async move {
-                    let _permit = sem.acquire().await.unwrap();
-                    tokio::task::spawn_blocking(move || {
+                let handle = squeezefs::meta_exec::spawn_meta_join(
+                    "format_data_volume",
+                    async move {
+                        let _permit = sem.acquire().await.unwrap();
+                        squeezefs_ipc::sqz_blocking::run_blocking(move || {
                         let physical_size = get_backing_device_size(&path).unwrap_or(0);
                         let wipe_len = if quick {
                             std::cmp::min(total_capacity, 32 * 1024 * 1024)
@@ -3919,14 +3924,17 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         }
                         Ok::<(), String>(())
                     })
-                    .await
-                    .map_err(|e| e.to_string())?
-                });
+                    .await?;
+                        Ok::<(), String>(())
+                    },
+                );
                 join_handles.push(handle);
             }
 
             for handle in join_handles {
-                handle.await.map_err(|e| e.to_string())??;
+                handle
+                    .await
+                    .map_err(|_| "format task panicked".to_string())??;
             }
 
             log::info!("Successfully formatted (v3) and recorded config on metadata volume.");
@@ -4694,12 +4702,12 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     .map_err(|e| staging_remedy(&shared_cache_dir, e))?;
 
                 let symlink_path = isolated_dir.join("cache_segment");
-                let metadata = fs::symlink_metadata(&symlink_path).await;
+                let metadata = std::fs::symlink_metadata(&symlink_path);
                 if let Ok(meta) = metadata {
                     if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
-                        fs::remove_dir_all(&symlink_path).await?;
+                        std::fs::remove_dir_all(&symlink_path)?;
                     } else {
-                        fs::remove_file(&symlink_path).await?;
+                        std::fs::remove_file(&symlink_path)?;
                     }
                 }
 
@@ -5290,7 +5298,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     .map(std::path::PathBuf::from)
                     .collect::<Vec<_>>(),
                 reader_mount,
-                tokio::runtime::Handle::current(),
                 Some(mw_quarantine),
                 // DLM S9 blocker #3's admission: the authority engages its OWN
                 // allocation lane (lane 0 of the era's width) on these
@@ -5942,15 +5949,20 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     println!("Waiting for staged writes to drain (limit: {}s). Press 's' and Enter to skip wait.", dismount_wait);
                     let start_wait = std::time::Instant::now();
                     let max_wait = std::time::Duration::from_secs(dismount_wait);
-                    let (tx, mut rx) = tokio::sync::mpsc::channel(10);
-                    tokio::spawn(async move {
-                        let mut input = String::new();
-                        while std::io::stdin().read_line(&mut input).is_ok() {
-                            let trimmed = input.trim().to_lowercase().to_string();
-                            let _ = tx.send(trimmed).await;
-                            input.clear();
-                        }
-                    });
+                    let (tx, mut rx) = squeezefs_ipc::sqz_channel::mpsc::channel(10);
+                    std::thread::Builder::new()
+                        .name("sqz-umount-stdin".to_string())
+                        .spawn(move || {
+                            let mut input = String::new();
+                            while std::io::stdin().read_line(&mut input).is_ok() {
+                                let trimmed = input.trim().to_lowercase().to_string();
+                                if tx.try_send(trimmed).is_err() {
+                                    return;
+                                }
+                                input.clear();
+                            }
+                        })
+                        .expect("stdin watcher thread spawns");
 
                     let mut skipped = false;
                     let mut current_staged = staged_count;
@@ -6015,7 +6027,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             println!("\nWait limit expired.");
                             break;
                         }
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(500)).await;
                     }
 
                     if skipped || current_staged > 0 || current_active > 0 {
@@ -6070,7 +6082,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     if force {
                         eprintln!("--force: sending SIGTERM then SIGKILL to PID {}...", pid);
                         let _ = nix_kill(pid, false);
-                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(300)).await;
                         if std::path::Path::new(&format!("/proc/{pid}")).exists() {
                             let _ = nix_kill(pid, true);
                         }
@@ -6110,7 +6122,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         if start_wait.elapsed() >= max_wait {
                             break;
                         }
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                     if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
                         unmount_success = true;
@@ -6142,7 +6154,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(200)).await;
                 unmount_success = try_clean_unmount(&abs_mp);
                 if !unmount_success {
                     eprintln!(
@@ -6175,7 +6187,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             if start_wait.elapsed() >= max_wait {
                                 break;
                             }
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(100))
+                                .await;
                         }
                         if !std::path::Path::new(&proc_path).exists() {
                             println!(" done.");
@@ -6186,7 +6199,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                                 pid
                             );
                             let _ = nix_kill(pid, false);
-                            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                            squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(400))
+                                .await;
                             if std::path::Path::new(&proc_path).exists() {
                                 let _ = nix_kill(pid, true);
                             }
@@ -7004,32 +7018,55 @@ pub fn tune_system() -> Result<(), std::io::Error> {
     Ok(())
 }
 
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
-impl Drop for AbortOnDrop {
+/// Stops the confirm-loop task when the guarded CLI action completes
+/// (the task checks the latch after every recv).
+struct CtrlCGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+impl Drop for CtrlCGuard {
     fn drop(&mut self) {
-        self.0.abort();
+        self.0.store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
-fn spawn_ctrl_c_handler(action_name: &'static str) -> AbortOnDrop {
-    let handle = tokio::spawn(async move {
-        loop {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                eprintln!(
-                    "\nWARNING: Ctrl+C pressed! If you really want to cancel {}, hit Ctrl+C again.",
-                    action_name
-                );
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {
-                        eprintln!("\n{} cancelled by user. Exiting...", action_name);
-                        std::process::exit(130);
+fn spawn_ctrl_c_handler(action_name: &'static str) -> CtrlCGuard {
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_task = stop.clone();
+    match squeezefs::signals::arm() {
+        Ok(mut rx) => {
+            squeezefs::meta_exec::spawn_meta("cli_ctrl_c_confirm", async move {
+                loop {
+                    let sig = rx.recv().await;
+                    if stop_task.load(std::sync::atomic::Ordering::Acquire) {
+                        return;
                     }
-                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {
-                        eprintln!("\nCancel timeout elapsed. Resuming...");
+                    if sig.is_none() {
+                        return;
+                    }
+                    eprintln!(
+                        "\nWARNING: Ctrl+C pressed! If you really want to cancel {}, hit Ctrl+C again.",
+                        action_name
+                    );
+                    match squeezefs_ipc::sqz_time::timeout(
+                        std::time::Duration::from_secs(5),
+                        rx.recv(),
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            eprintln!("\n{} cancelled by user. Exiting...", action_name);
+                            std::process::exit(130);
+                        }
+                        Err(_elapsed) => {
+                            eprintln!("\nCancel timeout elapsed. Resuming...");
+                        }
                     }
                 }
-            }
+            });
         }
-    });
-    AbortOnDrop(handle)
+        Err(e) => {
+            // Default disposition already cancels the action on Ctrl+C;
+            // only the double-confirm nicety is lost. Loud, not fatal.
+            log::warn!("ctrl-c confirm handler unavailable: {e}");
+        }
+    }
+    CtrlCGuard(stop)
 }

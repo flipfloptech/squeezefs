@@ -103,30 +103,6 @@ features = ["derive"]
 [dependencies.slab]
 version = "0.4.9"
 
-[dependencies.tokio]
-version = "1.36"
-features = [
-    # "fs" and "process" retired by the rip-tokio-total sweep: mount-time
-    # directory probes, fusermount subprocesses and /dev/fuse notify writes
-    # ride std wrapped in `crate::sqz_blocking::run_blocking`.
-    "rt",
-    # The multi-thread runtime the crate's own async tests run on (house
-    # rule: async tests use the multi_thread flavor to expose data races).
-    # The consuming daemon enables it anyway; this keeps the standalone
-    # `cargo test` of the fork honest instead of riding downstream feature
-    # unification.
-    "rt-multi-thread",
-    "sync",
-    "net",
-    "macros",
-    # The tpc_timer_handle driver runtime fires tokio::time wakers for
-    # handler futures (downstream daemon timers); without this the
-    # standalone `cargo test` of the fork only compiled via downstream
-    # feature unification.
-    "time",
-]
-optional = true
-
 [dependencies.tracing]
 version = "0.1.40"
 # The daemon logs through `log`/env_logger and installs no tracing
@@ -155,15 +131,36 @@ version = "1.19"
 [dependencies.core_affinity]
 version = "0.8"
 
+# TESTS ONLY (rip-tokio-total): the product carries zero tokio — timers,
+# channels, locks, fd readiness, blocking offload and task venues are all
+# first-party sqz_* primitives. The async test harness (#[tokio::test],
+# multi_thread flavor per house rule) is the sole remaining consumer.
+[dev-dependencies.tokio]
+version = "1.36"
+features = [
+    "rt-multi-thread",
+    "sync",
+    "macros",
+    "time",
+]
+
+# The #[path]-included sqz_sync test module (canonical file in the root
+# crate) drives poll-cancellation shapes through `futures::pin_mut` /
+# `noop_waker` — tests only.
+[dev-dependencies.futures]
+version = "0.3.30"
 
 [features]
-# tokio-runtime is the ONLY runtime (the rotted async-io-runtime feature was
-# removed 2026-07-28 — it no longer compiled; the FUSE-over-io_uring
-# transport is tokio-only) and the crate does not compile without it, so it
-# is on by default. The consuming daemon still enables it explicitly.
+# tokio-runtime is a DEPRECATED NO-OP since the rip-tokio-total program
+# (2026-08-13): the transport now runs on first-party sqz_* primitives
+# and no runtime dependency exists to gate. The feature name is kept —
+# empty — because the consuming daemon's dependency declaration names it
+# (root Cargo.toml: `features = ["tokio-runtime", "unprivileged"]`) and
+# the in-tree `cfg(feature = "tokio-runtime")` gates stay true by
+# default. Do not hang new behavior off it.
 default = ["tokio-runtime"]
 file-lock = []
-tokio-runtime = ["dep:tokio"]
+tokio-runtime = []
 unprivileged = [
     "nix/socket",
     "dep:which",

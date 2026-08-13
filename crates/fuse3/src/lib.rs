@@ -90,8 +90,20 @@ pub mod latency_core;
 // through this include.
 #[path = "../../squeezefs-ipc/src/env_knob_core.rs"]
 pub mod env_knob_core;
+// The sqz-exec first-party task executor + its loom-modeled delivery
+// state word (design-sqz-sync Stage 1b) — canonical files in the
+// squeezefs-ipc tree, `#[path]`-included here for the TPC handler-lane
+// venue (`sqz_exec` resolves `crate::exec_core` through this pair, the
+// `numa_core`/`env_knob_core` pattern). The lanes must not run on the
+// tokio scheduler: the Stage-1 field attribution proved the OQ-5 wedge
+// class is a task lost inside tokio's delivery, unhealable by any
+// future-layer backstop.
+#[path = "../../squeezefs-ipc/src/exec_core.rs"]
+pub mod exec_core;
 pub mod path;
 pub mod raw;
+#[path = "../../squeezefs-ipc/src/sqz_exec.rs"]
+pub mod sqz_exec;
 
 /// Filesystem Inode.
 pub type Inode = u64;

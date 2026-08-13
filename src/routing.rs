@@ -4579,11 +4579,10 @@ pub struct ZcWriteSlot {
     len: u32,
     store: Box<ZcStoreFn>,
     extract: Box<ZcExtractFn>,
-    // sqz-sync-exempt: per-write DATA-path memo (one writer thread ever
-    // touches a slot's materialize), not a metadata-plane lock — outside
-    // the Stage-1 population (docs/design-sqz-sync.md §Migration
-    // population); migrates with its stage.
-    materialized: tokio::sync::Mutex<Option<bytes::Bytes>>, // sqz-sync-exempt
+    // Stage-1b: migrated with the exemption CLOSED — this memo lock sits
+    // inside the write holder's critical section (under the ino's block
+    // stripe), exactly where the exec1b wedge autopsy looked.
+    materialized: crate::sqz_sync::SqzMutex<Option<bytes::Bytes>>,
     /// The §3.4 stability class: `true` = page-cache-sound (a post-ACK
     /// buffer modification is a redirty ⇒ a new WRITE — buffered
     /// deliveries), `false` = GUP/O_DIRECT (a post-ACK buffer reuse
@@ -4603,7 +4602,7 @@ impl ZcWriteSlot {
             len,
             store,
             extract,
-            materialized: tokio::sync::Mutex::new(None), // sqz-sync-exempt (data-path memo)
+            materialized: crate::sqz_sync::SqzMutex::new(None),
             ack_early_sound: false,
             retain: None,
             release: None,
@@ -4624,7 +4623,7 @@ impl ZcWriteSlot {
             len,
             store,
             extract,
-            materialized: tokio::sync::Mutex::new(None), // sqz-sync-exempt (data-path memo)
+            materialized: crate::sqz_sync::SqzMutex::new(None),
             ack_early_sound,
             retain: Some(retain),
             release: Some(release),
@@ -4675,7 +4674,18 @@ impl ZcWriteSlot {
         if let Some(b) = slot.as_ref() {
             return Ok(b.clone());
         }
+        // Stage-1b named-wait census: a holder parked here forever means
+        // the TRANSPORT never served the payload fetch (the
+        // `transport_leases_outstanding` wedge shape) — a lost message,
+        // named as zc_extract instead of an anonymous stuck write.
+        let _census = crate::fuse_client::LockWaitToken::begin(
+            crate::fuse_client::LockClass::ZcExtract,
+            0,
+            0,
+            self.len as u64,
+        );
         let b = (self.extract)().await?;
+        drop(_census);
         *slot = Some(b.clone());
         Ok(b)
     }

@@ -234,6 +234,8 @@ pub mod fd_table_core;
 pub mod gauge_core;
 #[path = "../../src/incarnation_core.rs"]
 pub mod incarnation_core;
+#[path = "../../crates/squeezefs-ipc/src/exec_core.rs"]
+pub mod exec_core;
 #[path = "../../crates/squeezefs-ipc/src/cqe_core.rs"]
 pub mod ipc_cqe_core;
 #[path = "../../crates/squeezefs-ipc/src/ring_core.rs"]
@@ -4676,6 +4678,87 @@ mod sqz_sync_models {
             assert_eq!(woken, vec![3], "last reader wakes ONE exclusive waiter");
             let (g3, _) = core.try_acquire(Want::Exclusive, Some(3));
             assert!(g3, "woken exclusive waiter wins on re-poll");
+        });
+    }
+}
+
+#[cfg(all(test, loom))]
+mod sqz_exec_models {
+    //! [`exec_core`]: the sqz-exec task delivery state word (design-
+    //! sqz-sync Stage 1b — first-party poll delivery after the Stage-1
+    //! attribution proved the wedge class is tokio task delivery).
+    //! Invariants:
+    //! * **a wake racing the poll is never lost**: across every
+    //!   interleaving of one runner pass with one concurrent wake,
+    //!   exactly one party ends up owning an enqueue and the final
+    //!   state is SCHEDULED — never IDLE-with-a-dropped-wake (the OQ-5
+    //!   shape) and never double-queued.
+    //! * **concurrent wakes enqueue exactly once** (single-winner CAS).
+    //! * **wakes racing completion no-op** (terminal state absorbs).
+    use crate::exec_core::{self, TaskState};
+    use loom::sync::Arc;
+    use loom::thread;
+
+    #[test]
+    fn wake_racing_poll_is_never_lost_and_never_double_queued() {
+        loom::model(|| {
+            let st = Arc::new(TaskState::new_scheduled());
+            // Runner dequeues the (spawn-)scheduled task.
+            assert!(st.begin_poll(), "queued task must begin poll");
+
+            let w = st.clone();
+            let waker = thread::spawn(move || w.wake());
+            // Poll returns Pending; the runner transitions out.
+            let runner_requeues = st.end_poll_pending();
+            let waker_enqueues = waker.join().unwrap();
+
+            // Law 1: the wake must survive — exactly one enqueue owner.
+            assert!(
+                runner_requeues ^ waker_enqueues,
+                "wake lost (0 owners) or double-queued (2 owners):                  runner={runner_requeues} waker={waker_enqueues}"
+            );
+            assert_eq!(st.load(), exec_core::SCHEDULED, "wake dropped on floor");
+            // The single owner's enqueue is consumable: the next pass
+            // begins a poll.
+            assert!(st.begin_poll(), "rescheduled task must be pollable");
+        });
+    }
+
+    #[test]
+    fn concurrent_wakes_enqueue_exactly_once() {
+        loom::model(|| {
+            let st = Arc::new(TaskState::new_scheduled());
+            assert!(st.begin_poll());
+            assert!(!st.end_poll_pending(), "no wake yet: park to IDLE");
+
+            let a = st.clone();
+            let b = st.clone();
+            let t1 = thread::spawn(move || a.wake());
+            let t2 = thread::spawn(move || b.wake());
+            let (w1, w2) = (t1.join().unwrap(), t2.join().unwrap());
+            assert!(
+                w1 ^ w2,
+                "IDLE task woken twice must enqueue exactly once: {w1}/{w2}"
+            );
+            assert_eq!(st.load(), exec_core::SCHEDULED);
+        });
+    }
+
+    #[test]
+    fn wake_racing_completion_noops() {
+        loom::model(|| {
+            let st = Arc::new(TaskState::new_scheduled());
+            assert!(st.begin_poll());
+
+            let w = st.clone();
+            let waker = thread::spawn(move || w.wake());
+            st.end_poll_complete();
+            let enq = waker.join().unwrap();
+            // A wake that lands mid-poll may win NOTIFIED (never an
+            // enqueue); one landing after completion no-ops. Either way
+            // the terminal state absorbs and no enqueue is owed.
+            assert!(!enq, "a wake racing completion must never enqueue");
+            assert_eq!(st.load(), exec_core::COMPLETE);
         });
     }
 }

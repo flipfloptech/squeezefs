@@ -4963,6 +4963,14 @@ impl KvMetaBackend {
         // The wedge census gauges the park (2026-08-07): writers parked
         // here while passes stay flat IS the stalled-conveyor signature.
         let _parked = super::ParkedGaugeGuard::enter(&super::META_COMMIT_PARKED);
+        // Stage-1b named-wait census: ages this park in the watchdog's
+        // lock-wait lines (the gauge above counts it; this NAMES it).
+        let _census = crate::fuse_client::LockWaitToken::begin(
+            crate::fuse_client::LockClass::Commit,
+            0,
+            0,
+            len as u64,
+        );
         match rx.await {
             Ok(out) => out,
             Err(_) => Err(KvError::Io(self.eio(

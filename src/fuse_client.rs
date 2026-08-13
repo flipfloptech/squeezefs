@@ -1797,7 +1797,8 @@ pub fn wedge_census_line() -> String {
          meta_commit_parked={} meta_publish_parked={} meta_journal_entries={} \
          meta_checkpoints={} pipeline_inflight_blocks={} pipeline_admission_waits={} \
          reclaim_queue_bytes={} rewrite_open_epochs={} transport_leases_outstanding={} \
-         transport_parked_commits={} transport_unparked_commits={} lock_ticked_reregisters={}",
+         transport_parked_commits={} transport_unparked_commits={} lock_ticked_reregisters={} \
+         lane_exec_tick_rescues={} lane_exec_task_panics={}",
         crate::meta_backend::kv::META_CONVEYOR_LEADER_PASSES.load(Ordering::Relaxed),
         crate::meta_backend::kv::META_CONVEYOR_QUEUED.load(Ordering::Relaxed),
         crate::meta_backend::kv::META_COMMIT_PARKED.load(Ordering::Relaxed),
@@ -1819,6 +1820,11 @@ pub fn wedge_census_line() -> String {
         // with live census waiters = the waiters' own tasks are lost at
         // the scheduler layer (the OQ-5 class the tick cannot heal).
         crate::sqz_sync::TICK_RECOVERIES.load(Ordering::Relaxed),
+        // The sqz-exec lane executor's own tripwires (Stage 1b): a tick
+        // rescue = the lane's condvar notify never landed (≈0 healthy);
+        // a task panic = a handler completed-by-panic (RES-8's lane face).
+        fuse3::sqz_exec::TICK_RESCUES.load(Ordering::Relaxed),
+        fuse3::sqz_exec::TASK_PANICS.load(Ordering::Relaxed),
     )
 }
 
@@ -1849,6 +1855,7 @@ pub fn spawn_op_watchdog() {
                     // and each blocked stripe's last acquirer, so a wedge
                     // capture reads as a cycle without a gdb session.
                     log_lock_wait_census(threshold);
+                    log_write_phase_census(threshold);
                     // The wedge census (2026-08-07): one line naming what
                     // the non-lock-parked ops await — atomics only, so it
                     // reads even when `.stats` itself is wedged.
@@ -2473,9 +2480,21 @@ pub enum LockClass {
     Block = 0,
     /// `INODE_META_LOCKS` (P1-9 level 3.5) — `key` unused.
     Meta = 1,
+    /// NVMe uring-worker completion oneshots (`nvme_dev` caller waits) —
+    /// `key` = device byte offset. Stage-1b census extension: a write
+    /// holder parked here forever = a lost DEVICE completion, not a lock.
+    Device = 2,
+    /// Conveyor commit oneshot parks (`kv/backend` committers) — `key`
+    /// unused. Parked-forever = a lost COMMIT outcome.
+    Commit = 3,
+    /// zc payload-slot extraction (`ZcWriteSlot::materialize` — the
+    /// transport-served fetch oneshot) — `key` = payload len. A holder
+    /// parked here forever = the transport never served the fetch (the
+    /// `transport_leases_outstanding` shape), a lost MESSAGE, not a lock.
+    ZcExtract = 4,
 }
 
-const LOCK_CLASS_NAMES: [&str; 2] = ["block", "meta"];
+const LOCK_CLASS_NAMES: [&str; 5] = ["block", "meta", "device", "commit", "zc_extract"];
 const LOCK_WAIT_SLOTS: usize = 512;
 
 struct LockWaitSlot {
@@ -2531,7 +2550,7 @@ fn unpack_holder(word: u64) -> Option<(&'static str, u64, u64)> {
 pub struct LockWaitToken(usize);
 
 impl LockWaitToken {
-    fn begin(class: LockClass, site: u64, ino: u64, key: u64) -> LockWaitToken {
+    pub(crate) fn begin(class: LockClass, site: u64, ino: u64, key: u64) -> LockWaitToken {
         for (i, slot) in LOCK_WAIT_CENSUS.iter().enumerate() {
             if slot
                 .state
@@ -2616,6 +2635,94 @@ pub fn lock_wait_census(threshold: Duration) -> Vec<LockWaitEntry> {
         });
     }
     out
+}
+
+// =========================================================================
+// Stage-1b write-phase census: the LIVE ladder position of every
+// in-flight `write_file_staged` unit, keyed (ino, offset). The exec1b
+// wedge autopsies produced ANONYMOUS stuck writes — every named wait
+// class clean — so this names the AWAIT the unit died in instead.
+// Stamps ride the coarse epoch word (zero extra clock reads); one scc
+// insert/remove per write unit, updates are lock-free.
+// =========================================================================
+
+/// Live-phase names, indexed by the stamp constants below (coarser than
+/// the profile-gated [`WritePhase`] duration histograms on purpose: each
+/// entry names ONE await class a unit can park in).
+pub const LIVE_WRITE_PHASE_NAMES: [&str; 10] = [
+    "entry",
+    "materialize",
+    "checkout",
+    "overlay_settle",
+    "patch_seed",
+    "accumulate",
+    "write_through",
+    "flush_tail",
+    "patch_dma",
+    "overlay_store",
+];
+pub const WP_ENTRY: u32 = 0;
+pub const WP_MATERIALIZE: u32 = 1;
+pub const WP_CHECKOUT: u32 = 2;
+pub const WP_OVERLAY_SETTLE: u32 = 3;
+pub const WP_PATCH_SEED: u32 = 4;
+pub const WP_ACCUMULATE: u32 = 5;
+pub const WP_WRITE_THROUGH: u32 = 6;
+pub const WP_FLUSH_TAIL: u32 = 7;
+pub const WP_PATCH_DMA: u32 = 8;
+pub const WP_OVERLAY_STORE: u32 = 9;
+
+static WRITE_PHASE_MAP: Lazy<scc::HashMap<(u64, u64), (u32, u64)>> = Lazy::new(scc::HashMap::new);
+
+/// RAII entry for one write unit's live phase word.
+pub struct WritePhaseGuard {
+    key: (u64, u64),
+}
+
+pub fn write_phase_begin(ino: u64, offset: u64) -> WritePhaseGuard {
+    let now = COARSE_NOW_NS.load(Ordering::Relaxed);
+    let _ = WRITE_PHASE_MAP.insert_sync((ino, offset), (WP_ENTRY, now));
+    WritePhaseGuard { key: (ino, offset) }
+}
+
+/// Stamp the unit's CURRENT phase (call BEFORE the phase's await — a
+/// stuck unit then names the await it is parked in).
+pub fn write_phase(ino: u64, offset: u64, phase: u32) {
+    let now = COARSE_NOW_NS.load(Ordering::Relaxed);
+    let _ = WRITE_PHASE_MAP.update_sync(&(ino, offset), |_, v| {
+        *v = (phase, now);
+    });
+}
+
+impl Drop for WritePhaseGuard {
+    fn drop(&mut self) {
+        let _ = WRITE_PHASE_MAP.remove_sync(&self.key);
+    }
+}
+
+/// Log every write unit parked in one phase past `threshold` (the
+/// watchdog's companion line to the anonymous overdue-write report).
+pub fn log_write_phase_census(threshold: Duration) {
+    let now = COARSE_NOW_NS.load(Ordering::Relaxed);
+    let threshold_ns = threshold.as_nanos() as u64;
+    let mut printed = 0usize;
+    WRITE_PHASE_MAP.iter_sync(|k, v| {
+        let age = now.saturating_sub(v.1);
+        if age >= threshold_ns {
+            printed += 1;
+            error!(
+                "write-phase census: ino {} offset {} parked in phase {} for {} ms",
+                k.0,
+                k.1,
+                LIVE_WRITE_PHASE_NAMES
+                    .get(v.0 as usize)
+                    .copied()
+                    .unwrap_or("?"),
+                age / 1_000_000
+            );
+        }
+        printed < 64
+    });
 }
 
 /// Log the named-holder census (the watchdog's cycle-drawing companion to
@@ -8374,6 +8481,12 @@ impl SqueezefsFilesystem {
                 // schedules; growth = a lost wake was absorbed, loudly
                 // (the backstop WORKING, never a wedge).
                 "lock_ticked_reregisters": crate::sqz_sync::TICK_RECOVERIES.load(Ordering::Relaxed),
+                // Stage 1b (sqz-exec handler lanes) — both must stay ≈0:
+                // a tick rescue is a lane notify that never delivered; a
+                // task panic is a handler completed-by-panic (loud, lane
+                // survives — the detached_task_panics discipline).
+                "lane_exec_tick_rescues": fuse3::sqz_exec::TICK_RESCUES.load(Ordering::Relaxed),
+                "lane_exec_task_panics": fuse3::sqz_exec::TASK_PANICS.load(Ordering::Relaxed),
                 "job_paused_capacity": METRICS.job_paused_capacity.load(Ordering::Relaxed),
                 "evacuate_blocks_moved": METRICS.evacuate_blocks_moved.load(Ordering::Relaxed),
                 "evacuate_bytes_moved": METRICS.evacuate_bytes_moved.load(Ordering::Relaxed),
@@ -13397,10 +13510,12 @@ impl SqueezefsFilesystem {
         // materializes HERE — one memoized extraction, requested after
         // the handler prelude it overlaps with. Bytes payloads are a
         // zero-cost clone.
+        let _phase = write_phase_begin(ino, offset);
         let deferred_slot = (try_patch || try_overlay) && payload.slot().is_some();
         let data: bytes::Bytes = if deferred_slot {
             bytes::Bytes::new()
         } else {
+            write_phase(ino, offset, WP_MATERIALIZE);
             payload.materialize().await.map_err(SqueezefsError::Io)?
         };
 
@@ -13448,6 +13563,7 @@ impl SqueezefsFilesystem {
                 // the returned wait keeps feeding the always-on global
                 // histogram so the FIND-L1-A baseline series stays
                 // comparable.)
+                write_phase(ino, offset, WP_CHECKOUT);
                 let (block_guard, lock_waited) =
                     block_lock_acquire_timed(ino, b as u32, BlockLockSite::WriteCheckout).await;
                 METRICS.block_lock_wait.record(lock_waited);
@@ -13462,6 +13578,7 @@ impl SqueezefsFilesystem {
                 // failure surfaced to exactly this write.
                 if try_patch {
                     let rel = write_start - b_start_offset;
+                    write_phase(ino, offset, WP_PATCH_DMA);
                     match self
                         .try_sole_owner_patch(
                             ino,
@@ -13494,6 +13611,7 @@ impl SqueezefsFilesystem {
                 // `Err` = the store failed loud for exactly this write.
                 if try_overlay {
                     let rel = (write_start - b_start_offset) as usize;
+                    write_phase(ino, offset, WP_OVERLAY_STORE);
                     match self
                         .try_device_overlay_store(
                             ino,
@@ -13524,6 +13642,7 @@ impl SqueezefsFilesystem {
                 // from it) — a parked ActiveBlockBuf and an open overlay
                 // may never coexist on one block.
                 if crate::device_overlay::any_open_fast() {
+                    write_phase(ino, offset, WP_OVERLAY_SETTLE);
                     if let Err(e) = self.settle_overlay_block_locked(ino, b as u32, false).await {
                         std::mem::drop(block_guard);
                         return Err(e);
@@ -13579,6 +13698,7 @@ impl SqueezefsFilesystem {
                 // (the guard exists to be held across block I/O), and
                 // the transport worker never takes block locks.
                 let owned_slot_bytes: bytes::Bytes = if deferred_slot {
+                    write_phase(ino, offset, WP_PATCH_SEED);
                     match patch_payload.materialize().await {
                         Ok(b) => b,
                         Err(e) => {
@@ -13755,6 +13875,7 @@ impl SqueezefsFilesystem {
                                 .extent_record_absorbs
                                 .fetch_add(1, Ordering::Relaxed);
                             let nvme = self.router.cache.nvme.clone();
+                            write_phase(ino, offset, WP_ACCUMULATE);
                             tokio::task::spawn_blocking(move || nvme.remove_active_block(&ext_key))
                                 .await
                                 .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -13810,6 +13931,7 @@ impl SqueezefsFilesystem {
                     if self.router.cache.nvme.has_staged_active_block(&cache_key) {
                         let nvme = self.router.cache.nvme.clone();
                         let key = cache_key.clone();
+                        write_phase(ino, offset, WP_ACCUMULATE);
                         let removed =
                             tokio::task::spawn_blocking(move || nvme.remove_active_block(&key))
                                 .await
@@ -13903,6 +14025,7 @@ impl SqueezefsFilesystem {
                         // inline write-through — upload awaited before the
                         // WRITE ACKs, errors surfaced to exactly this
                         // write.
+                        write_phase(ino, offset, WP_WRITE_THROUGH);
                         self.write_through_complete_block(
                             ino,
                             b as u32,
@@ -13928,6 +14051,7 @@ impl SqueezefsFilesystem {
                         // t_admit anchors the block's WHOLE pipeline
                         // residence (Little's-law numerator).
                         let t_admit = std::time::Instant::now();
+                        write_phase(ino, offset, WP_FLUSH_TAIL);
                         let permit = self.write_pipeline.admit(block_size).await;
                         pipeline_phase_record(PipelinePhase::AdmitWait, t_admit);
                         // Per-op twin of the always-on AdmitWait above:

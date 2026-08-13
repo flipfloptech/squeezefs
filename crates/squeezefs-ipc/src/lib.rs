@@ -32,10 +32,12 @@ pub mod cqe_core;
 // here would be concatenated ahead of the file's own `//!` docs and resolve
 // their intra-doc links in the CRATE scope, breaking them.
 pub mod env_knob_core;
+pub mod exec_core;
 pub mod layout;
 pub mod ring_core;
 pub mod sizing;
 pub mod slot_core;
+pub mod sqz_exec;
 pub mod wire;
 
 // Production source-sharing of the shipped L3 wake-coalescing protocol

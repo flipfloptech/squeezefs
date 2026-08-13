@@ -1706,12 +1706,19 @@ impl NvmeBlockDev {
                             e
                         ))
                     })?;
+                let _census = crate::fuse_client::LockWaitToken::begin(
+                    crate::fuse_client::LockClass::Device,
+                    1, // site 1 = durability barrier
+                    0,
+                    0,
+                );
                 rx.await.map_err(|e| {
                     crate::error::SqueezefsError::InvalidOperation(format!(
                         "Worker thread closed receiver during data-device barrier: {:?}",
                         e
                     ))
                 })??;
+                drop(_census);
                 crate::dev_power_cut::complete_barrier(&self.device_path, covered);
                 Ok(())
             })
@@ -2121,12 +2128,22 @@ impl NvmeBlockDev {
             rx
         };
 
+        // Stage-1b named-wait census: a caller parked here forever is a
+        // LOST DEVICE COMPLETION (worker idle, oneshot never fired) — the
+        // watchdog names it instead of reporting an anonymous stuck write.
+        let _census = crate::fuse_client::LockWaitToken::begin(
+            crate::fuse_client::LockClass::Device,
+            0, // site 0 = write completion
+            0,
+            offset,
+        );
         rx_oneshot.await.map_err(|e| {
             crate::error::SqueezefsError::InvalidOperation(format!(
                 "Worker thread closed receiver: {:?}",
                 e
             ))
         })??;
+        drop(_census);
 
         crate::fuse_client::METRICS
             .put_obj

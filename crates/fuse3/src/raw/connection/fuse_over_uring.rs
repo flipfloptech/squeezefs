@@ -1479,6 +1479,15 @@ pub struct FuseOverUring {
     /// nonzero so their [`zc::BridgeDeadlines`] scans run even on idle
     /// queues.
     zc_bridge_pends: AtomicU64,
+    /// Per-group fused-lane residency watches (Stage-1b wedge
+    /// attribution): registered by each worker at lane creation; read by
+    /// [`Self::scan_overdue_slots`] to name a stuck fused write's state.
+    fused_watches: std::sync::Mutex<
+        Vec<(
+            std::sync::Arc<fused::FusedWatch>,
+            std::sync::Arc<fused::FusedRunQueue>,
+        )>,
+    >,
     /// The fused-write dispatcher (zc-write-fusion campaign): the
     /// session's WRITE-handler mint + runtime handle, registered once
     /// after INIT. Deliveries before registration ride the classic
@@ -2741,6 +2750,7 @@ impl FuseOverUring {
                 zc::ZcHeldTable::new(nqueues, depth)
             },
             zc_bridge_pends: AtomicU64::new(0),
+            fused_watches: std::sync::Mutex::new(Vec::new()),
             zc_hold_gate: std::sync::OnceLock::new(),
             fused_dispatch: std::sync::OnceLock::new(),
             depth,
@@ -2974,6 +2984,7 @@ impl FuseOverUring {
                 .collect(),
             zc_write_held: zc::ZcHeldTable::new(nqueues as usize, Self::SIM_DEPTH),
             zc_bridge_pends: AtomicU64::new(0),
+            fused_watches: std::sync::Mutex::new(Vec::new()),
             zc_hold_gate: std::sync::OnceLock::new(),
             fused_dispatch: std::sync::OnceLock::new(),
             depth: Self::SIM_DEPTH,
@@ -3556,10 +3567,33 @@ impl FuseOverUring {
             let depth = self.depth.max(1);
             let (qid, ent) = (idx / depth, idx % depth);
             TRANSPORT_SLOTS_OVERDUE.fetch_add(1, Ordering::Relaxed);
+            // Stage-1b attribution: is this unique a live fused task?
+            // resident+quiet-rq = parked awaiting an unnamed wake;
+            // resident+rq>0 persistently = fused polls not running;
+            // NOT resident anywhere = the future is GONE without its
+            // reply (the reply-obligation class).
+            let (fused_state, ready_total) = {
+                let watches = self
+                    .fused_watches
+                    .lock()
+                    .expect("fused watch registry poisoned-free");
+                let mut state = "not-fused";
+                let mut ready = 0usize;
+                for (w, rq) in watches.iter() {
+                    ready += rq.ready_len();
+                    if w.is_resident(unique) {
+                        state = "fused-resident";
+                    }
+                }
+                (state, ready)
+            };
             warn!(
                 "fuse-over-uring qid={qid} ent={ent}: unique={unique} delivered {} ms ago and \
-                 still unreplied — the caller is in uninterruptible sleep (transport_slots_overdue)",
-                now.saturating_sub(since) / 1_000_000
+                 still unreplied — the caller is in uninterruptible sleep \
+                 (transport_slots_overdue; {fused_state}, fused_ready_total={ready_total}, \
+                 zc_bridge_pends={})",
+                now.saturating_sub(since) / 1_000_000,
+                self.zc_bridge_pends.load(Ordering::Relaxed)
             );
         }
     }
@@ -4237,6 +4271,13 @@ fn queue_worker(
     let fusion_on = zc_mode && fused::fusion_enabled();
     let fusion_max = fused::fusion_ceiling(payload_sz_cfg);
     let mut fused_lane = fused::FusedLane::new(group_depth, Arc::clone(&wake_coalescer), wake_fd);
+    {
+        let (watch, rq) = fused_lane.watch_handle();
+        pool.fused_watches
+            .lock()
+            .expect("fused watch registry poisoned-free")
+            .push((watch, rq));
+    }
     let mut members: Vec<MemberState> = Vec::with_capacity(g);
     for &qid in qids.iter() {
         let member_node = if pool.qid_is_cpu {

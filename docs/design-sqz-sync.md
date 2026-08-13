@@ -112,6 +112,52 @@ tokio tasks entirely (the svc-thread / dd-reaper pattern the hot path
 already uses): the Stage 1b/2 wait classes are on the critical path
 before the held battery can run, not optional follow-ons.
 
+## Stage 1b (landed) + the attribution chain's terminus
+
+Stage 1b replaced the fuse3 TPC handler-lane venue's executor: the
+lanes now run **sqz-exec** (`crates/squeezefs-ipc/src/sqz_exec.rs` over
+the loom-verified `exec_core` task state word, `#[path]`-shared into
+fuse3 like `numa_core`) — wake→queue→poll is first-party code; tokio
+remains only as the lanes' entered timer/aux-spawn handle and the main
+runtime. Dead-lane re-dispatch kept its loud contract on a thread
+liveness word. Tripwires: `lane_exec_tick_rescues` (a lane notify that
+never delivered; ≈0) and `lane_exec_task_panics` (RES-8's lane face) —
+both on the stats inode and the wedge-census line.
+
+The instrumented 464-at-3.0GHz reproductions then walked the wedge to a
+NAMED product bug, one census layer at a time:
+
+1. sqz locks + lane executor: waiters tick (`lock_ticked_reregisters`
+   grows through the wedge), `lane_exec_*` clean — waiter delivery is
+   healed; the HOLDER never releases.
+2. Named-wait census (device / commit / zc_extract classes + the
+   `materialized` memo migration): ALL clean during the wedge — the
+   holder parks in none of the classical wait classes.
+3. Live write-phase census (`write-phase census` watchdog lines): the
+   holder parks in **`overlay_store`** — `try_device_overlay_store`'s
+   ACK-after-CQE wait (`fuse3 zc_write_store` → `WorkerMsg::ZcStore` →
+   `ZcPend::HandlerStore` oneshot) — for 400+ s, with same-block
+   writers queued behind the held stripe in `overlay_settle`/`checkout`.
+4. Fused-residency watch (`FusedWatch` on the overdue-slot warns): the
+   stuck writes are **fused-resident** (parked, not dropped), a ready
+   fused task is intermittently left unpolled, and — decisive —
+   **`zc_bridge_pends=4` while ZERO deadline-cancel lines print in
+   435 s**: the bounded-outcome scan (zc-bridge-cqe-wedge campaign,
+   2026-08-07) NEVER RAN on the stuck group's worker. The pend is
+   stamped, the gate is armed, the watch thread ticks — and the worker
+   never wakes to push its AsyncCancel.
+
+**Terminus:** this is not a scheduler bug and not a lock bug — it is
+the zc store (device-overlay D14 leg) losing its CQE under the
+capped-clock 464 schedule AND the bounded-outcome deadline ladder
+failing to engage because the stuck queue worker never leaves its
+cq-wait (wake-fd poll/coalescer arming is the suspect seam; the
+existing `SQUEEZEFS_TEST_ZC_DROP_WRITE_CQES` suite covers the
+extraction arms but not the HandlerStore arm, and not the
+parked-worker-never-scans face). Next: red-first cargo repro of the
+HandlerStore + parked-worker shape, then fix the wake/scan path — fix
+uring, never bypass it.
+
 ## Acceptance
 
 * The primitive's unit rails + a loom model of the acquire/release/wake

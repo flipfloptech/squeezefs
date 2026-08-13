@@ -5370,16 +5370,19 @@ fn validated_body(
 type LaneFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
 /// The per-core handler-lane venue: one OS thread per usable CPU, each
-/// running a current-thread runtime + `LocalSet`, fed by one
-/// `unbounded_channel` per lane.
+/// running a first-party [`crate::sqz_exec::LaneExec`] executor (design-
+/// sqz-sync Stage 1b — the former current-thread-runtime + `LocalSet`
+/// lanes rode tokio task delivery, the OQ-5 lost-task wedge class the
+/// Stage-1 field attribution convicted; wake→queue→poll is now our code
+/// plus the loom-verified `exec_core` state word).
 ///
 /// **RES-18 (pre-RC engineering spec §7) — why the lane channels stay
 /// unbounded** (recorded per the item's "a geometry-derived bound, or one
 /// sentence of recorded reasoning" disposition):
 ///
-/// The observation is correct — dispatch is an `unbounded_channel` and each
-/// lane `spawn_local`s with no cap, so resident task population is bounded
-/// only incidentally. But for the hot path that incidental bound IS a
+/// The observation is correct — each lane's sqz-exec ready queue is
+/// unbounded (as the dispatch channel it replaced was), so resident task
+/// population is bounded only incidentally. But for the hot path that incidental bound IS a
 /// transport-geometry bound: a request delivered over the ring holds its
 /// ent slot from delivery until its reply commits, and the handler future's
 /// lifetime is contained in that window, so concurrently resident
@@ -5406,12 +5409,22 @@ type LaneFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>
 /// becoming stranded requests. If a measurement ever shows lane residency
 /// mattering, the bound to add is `queues × q_depth` on the SIDEBAND
 /// dispatch alone, never on the ring lanes.
+/// One handler lane: the sqz-exec executor + its thread's liveness word
+/// (design-sqz-sync Stage 1b — the lane venue runs FIRST-PARTY poll
+/// delivery; the Stage-1 field attribution proved tokio task delivery is
+/// the OQ-5 wedge class and no future-layer backstop can heal a task the
+/// scheduler dropped).
+struct Lane {
+    exec: crate::sqz_exec::LaneExec,
+    /// Flipped false when the lane THREAD exits (normal or panic) — the
+    /// dead-lane re-dispatch gate. With sqz-exec a queue push cannot
+    /// fail, so thread liveness is the honest signal the closed-channel
+    /// error used to be.
+    alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
 struct TpcScheduler {
-    senders: Vec<
-        tokio::sync::mpsc::UnboundedSender<
-            std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
-        >,
-    >,
+    lanes: Vec<Lane>,
     next_idx: std::sync::atomic::AtomicUsize,
     /// NUMA-affinity campaign (2026-07-31): lane indices grouped by the
     /// dense node of each lane's pinned core (`node_lanes[node]` — empty
@@ -5438,7 +5451,15 @@ impl TpcScheduler {
             core_ids.remove(0); // Reserve Core 0 for OS kernel tasks
         }
 
-        let mut senders = Vec::new();
+        let mut lanes: Vec<Lane> = Vec::new();
+        // The runtime handle lane threads ENTER: the ambient (main
+        // daemon) runtime when the scheduler is first touched from one —
+        // so handler-internal `tokio::spawn`s and timers keep landing
+        // exactly where they always did — else the dedicated parked
+        // driver ([`tpc_timer_handle`], test contexts). Task DELIVERY
+        // for the handler futures themselves is sqz-exec either way;
+        // only their timers/aux-spawns ride tokio here.
+        let ambient = tokio::runtime::Handle::try_current().ok();
         let core_count = if core_ids.is_empty() {
             std::thread::available_parallelism()
                 .map(|n| n.get())
@@ -5459,10 +5480,13 @@ impl TpcScheduler {
 
         let scope = crate::raw::affinity::pin_scope();
         for i in 0..core_count {
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<
-                std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
-            >();
-            senders.push(tx);
+            let exec = crate::sqz_exec::LaneExec::new();
+            let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let ambient = ambient.clone();
+            lanes.push(Lane {
+                exec: exec.clone(),
+                alive: alive.clone(),
+            });
 
             let home_cpu = if !core_ids.is_empty() {
                 Some(core_ids[i % core_ids.len()])
@@ -5508,31 +5532,42 @@ impl TpcScheduler {
             std::thread::Builder::new()
                 .name(format!("fuse3-tpc{i}"))
                 .spawn(move || {
+                    // Liveness word: flipped on ANY exit path (normal or
+                    // panic) so the dead-lane re-dispatch gate is honest.
+                    struct DeadMark(std::sync::Arc<std::sync::atomic::AtomicBool>);
+                    impl Drop for DeadMark {
+                        fn drop(&mut self) {
+                            self.0.store(false, std::sync::atomic::Ordering::Release);
+                        }
+                    }
+                    let _dead_on_exit = DeadMark(alive);
+
                     if let Some(cpus) = lane_cpus {
                         crate::raw::affinity::set_current_affinity(&cpus);
                     }
-                    // Same-lane dispatch context mark (lever 1): READ
-                    // dispatchers probe this to spawn_local instead of
-                    // paying the cross-lane channel hop.
+                    // Same-lane dispatch context marks (lever 1): READ
+                    // dispatchers probe these to push onto the CURRENT
+                    // lane instead of paying the cross-lane hop.
                     IS_TPC_LANE.with(|c| c.set(true));
+                    CURRENT_LANE.with(|c| *c.borrow_mut() = Some(exec.clone()));
 
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .unwrap();
-
-                    let local = tokio::task::LocalSet::new();
-                    local.block_on(&rt, async move {
-                        while let Some(fut) = rx.recv().await {
-                            tokio::task::spawn_local(fut);
-                        }
-                    });
+                    // Handler futures still use tokio's driver-backed
+                    // primitives (`tokio::time` sleeps/timeouts) and may
+                    // `tokio::spawn` aux work: enter the captured main
+                    // runtime handle (fallback: the parked driver) so
+                    // both land where they always did. The driver only
+                    // FIRES wakers; the woken handler task's delivery
+                    // (queue -> poll) is sqz-exec, first-party by
+                    // construction.
+                    let handle = ambient.unwrap_or_else(tpc_timer_handle);
+                    let _rt = handle.enter();
+                    exec.run();
                 })
                 .expect("fuse3 tpc lane thread spawns");
         }
 
         Self {
-            senders,
+            lanes,
             next_idx: std::sync::atomic::AtomicUsize::new(0),
             node_lanes,
             node_next,
@@ -5543,15 +5578,15 @@ impl TpcScheduler {
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
-        if self.senders.is_empty() {
+        if self.lanes.is_empty() {
             tokio::task::spawn(fut);
             return;
         }
         let idx = self
             .next_idx
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            % self.senders.len();
-        Self::dispatch(&self.senders, idx, Box::pin(fut));
+            % self.lanes.len();
+        Self::dispatch(&self.lanes, idx, Box::pin(fut));
     }
 
     /// Node-targeted spawn: round-robin WITHIN `node`'s lane group when
@@ -5564,11 +5599,11 @@ impl TpcScheduler {
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
-        if let Some(lanes) = self.node_lanes.get(node) {
-            if !lanes.is_empty() && !self.senders.is_empty() {
+        if let Some(group) = self.node_lanes.get(node) {
+            if !group.is_empty() && !self.lanes.is_empty() {
                 let k = self.node_next[node].fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    % lanes.len();
-                Self::dispatch(&self.senders, lanes[k], Box::pin(fut));
+                    % group.len();
+                Self::dispatch(&self.lanes, group[k], Box::pin(fut));
                 return;
             }
         }
@@ -5589,41 +5624,35 @@ impl TpcScheduler {
     /// ALL lanes dead = the entire handler venue is gone: abort rather
     /// than blackhole (a daemon that can never again answer a FUSE
     /// request must fail loud, not wedge every mount user).
-    fn dispatch(
-        senders: &[tokio::sync::mpsc::UnboundedSender<LaneFuture>],
-        first_idx: usize,
-        mut fut: LaneFuture,
-    ) {
-        for attempt in 0..senders.len() {
-            let idx = (first_idx + attempt) % senders.len();
-            match senders[idx].send(fut) {
-                Ok(()) => {
-                    if attempt > 0 {
-                        TPC_LANE_REDISPATCHES
-                            .fetch_add(attempt as u64, std::sync::atomic::Ordering::Relaxed);
-                        error!(
-                            "fuse3: TPC lane {} is DEAD (channel closed) — dispatch \
-                             re-routed to lane {idx}; a dead handler lane means a lane \
-                             thread was lost (escaped panic / spawn failure) and deserves \
-                             investigation",
-                            (first_idx + attempt - 1) % senders.len(),
-                        );
-                    }
-                    return;
-                }
-                Err(tokio::sync::mpsc::error::SendError(returned)) => {
-                    fut = returned;
-                }
+    fn dispatch(lanes: &[Lane], first_idx: usize, fut: LaneFuture) {
+        for attempt in 0..lanes.len() {
+            let idx = (first_idx + attempt) % lanes.len();
+            let lane = &lanes[idx];
+            if !lane.alive.load(std::sync::atomic::Ordering::Acquire) {
+                continue;
             }
+            if attempt > 0 {
+                TPC_LANE_REDISPATCHES
+                    .fetch_add(attempt as u64, std::sync::atomic::Ordering::Relaxed);
+                error!(
+                    "fuse3: TPC lane {} is DEAD (thread exited) — dispatch \
+                     re-routed to lane {idx}; a dead handler lane means a lane \
+                     thread was lost (escaped panic / spawn failure) and deserves \
+                     investigation",
+                    (first_idx + attempt - 1) % lanes.len(),
+                );
+            }
+            lane.exec.spawn(fut);
+            return;
         }
-        // Every lane's receiver is gone: no handler can ever run again on
+        // Every lane thread is dead: no handler can ever run again on
         // this process — every future dispatch would strand a FUSE waiter
         // in D-state. Fail loud (the supervise/abort machinery restarts a
         // dead daemon; a silently wedged one strands the mount forever).
         error!(
             "fuse3: ALL {} TPC handler lanes are dead — aborting rather than \
              blackholing FUSE dispatch",
-            senders.len()
+            lanes.len()
         );
         std::process::abort();
     }
@@ -5649,6 +5678,39 @@ std::thread_local! {
     /// runtimes are `current_thread` and the probe must cost nothing on
     /// the per-op path.
     static IS_TPC_LANE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// The CURRENT lane's executor handle (set once in the lane thread
+    /// body) — the same-lane dispatch venue: a push here is a local
+    /// queue append, no cross-lane hop, and the task's delivery stays
+    /// sqz-exec first-party.
+    static CURRENT_LANE: std::cell::RefCell<Option<crate::sqz_exec::LaneExec>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The shared background tokio driver for lane-task TIMERS (sleeps /
+/// timeouts inside handler futures): one parked current-thread runtime
+/// on its own OS thread, whose handle every lane enters. The driver
+/// fires waker callbacks; task DELIVERY stays sqz-exec (the waker pushes
+/// onto the lane queue — our code).
+fn tpc_timer_handle() -> tokio::runtime::Handle {
+    static DRIVER: once_cell::sync::Lazy<tokio::runtime::Handle> =
+        once_cell::sync::Lazy::new(|| {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            std::thread::Builder::new()
+                .name("fuse3-timerdrv".to_string())
+                .spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("fuse3 timer-driver runtime builds");
+                    tx.send(rt.handle().clone())
+                        .expect("timer-driver handle handoff");
+                    rt.block_on(std::future::pending::<()>());
+                })
+                .expect("fuse3 timer-driver thread spawns");
+            rx.recv().expect("timer-driver handle received")
+        });
+    DRIVER.clone()
 }
 
 /// Transport-ingress lever 1 (2026-08-04 campaign; the §9.2 deferred
@@ -5689,10 +5751,13 @@ where
     #[cfg(feature = "tokio-runtime")]
     {
         if same_lane_dispatch_enabled() && IS_TPC_LANE.with(|c| c.get()) {
-            tokio::task::spawn_local(async move {
-                let _ = fut.instrument(span).await;
-            });
-            return;
+            let lane = CURRENT_LANE.with(|c| c.borrow().clone());
+            if let Some(lane) = lane {
+                lane.spawn(async move {
+                    let _ = fut.instrument(span).await;
+                });
+                return;
+            }
         }
         TPC_SCHEDULER.spawn(async move {
             let _ = fut.instrument(span).await;
@@ -5736,7 +5801,7 @@ where
 }
 
 pub fn tpc_thread_count() -> usize {
-    TPC_SCHEDULER.senders.len()
+    TPC_SCHEDULER.lanes.len()
 }
 
 /// INIT reply-flags negotiation: the subset of the kernel's offered
@@ -6756,69 +6821,95 @@ mod kernel_init_tests {
 mod tpc_dispatch_tests {
     use super::*;
 
-    type LaneFut = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
-
-    fn lanes(
-        n: usize,
-    ) -> (
-        Vec<tokio::sync::mpsc::UnboundedSender<LaneFut>>,
-        Vec<tokio::sync::mpsc::UnboundedReceiver<LaneFut>>,
-    ) {
-        (0..n)
-            .map(|_| tokio::sync::mpsc::unbounded_channel::<LaneFut>())
-            .unzip()
+    /// Test lanes: each backed by a REAL sqz-exec executor thread; the
+    /// dispatched futures signal a channel so delivery is observable.
+    fn live_lane() -> (Lane, std::thread::JoinHandle<()>) {
+        let exec = crate::sqz_exec::LaneExec::new();
+        let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let ex2 = exec.clone();
+        let jh = std::thread::spawn(move || ex2.run());
+        (Lane { exec, alive }, jh)
     }
 
-    fn drain(receivers: &mut [tokio::sync::mpsc::UnboundedReceiver<LaneFut>]) -> usize {
-        receivers
-            .iter_mut()
-            .map(|rx| {
-                let mut n = 0;
-                while rx.try_recv().is_ok() {
-                    n += 1;
-                }
-                n
-            })
-            .sum()
+    /// A DEAD lane: its liveness word is down (the thread-exit mark —
+    /// the shape the DeadMark drop guard produces when a lane thread is
+    /// lost).
+    fn dead_lane() -> Lane {
+        let exec = crate::sqz_exec::LaneExec::new();
+        Lane {
+            exec,
+            alive: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
     }
 
     /// One test (the redispatch counter is process-global): healthy
-    /// lanes never pay the counter; a dead lane (dropped receiver = the
-    /// lane thread died, the ingest-economy board item 2 shape) must
+    /// lanes never pay the counter; a dead lane (liveness word down =
+    /// the lane thread died, the ingest-economy board item 2 shape) must
     /// never blackhole a dispatch — the future re-routes to a live lane,
     /// counted loudly.
     #[test]
     fn dead_lane_redispatches_loudly_healthy_lanes_never() {
-        // Phase 1 — healthy: no counter movement.
-        let (senders, mut receivers) = lanes(2);
+        // Phase 1 — healthy: no counter movement, everything delivered.
+        let (l0, j0) = live_lane();
+        let (l1, j1) = live_lane();
+        let lanes = vec![l0, l1];
         let before = tpc_lane_redispatches();
+        let (tx, rx) = std::sync::mpsc::channel::<usize>();
         for first_idx in 0..4 {
-            TpcScheduler::dispatch(&senders, first_idx % 2, Box::pin(async {}));
+            let tx = tx.clone();
+            TpcScheduler::dispatch(
+                &lanes,
+                first_idx % 2,
+                Box::pin(async move {
+                    let _ = tx.send(first_idx);
+                }),
+            );
         }
-        assert_eq!(drain(&mut receivers), 4, "healthy lanes deliver everything");
+        for _ in 0..4 {
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("healthy lanes deliver everything");
+        }
         assert_eq!(
             tpc_lane_redispatches(),
             before,
             "healthy dispatch must not touch the dead-lane counter"
         );
+        for l in &lanes {
+            l.exec.shutdown();
+        }
+        j0.join().unwrap();
+        j1.join().unwrap();
 
         // Phase 2 — kill lane 1: every dispatch still lands on SOME live
         // lane (a swallowed future is a FUSE reply that never happens —
         // the D-state wedge), and the re-route is counted.
-        let (senders, mut receivers) = lanes(3);
-        receivers.remove(1);
+        let (l0, j0) = live_lane();
+        let (l2, j2) = live_lane();
+        let lanes = vec![l0, dead_lane(), l2];
+        let (tx, rx) = std::sync::mpsc::channel::<usize>();
         for first_idx in 0..3 {
-            TpcScheduler::dispatch(&senders, first_idx, Box::pin(async {}));
+            let tx = tx.clone();
+            TpcScheduler::dispatch(
+                &lanes,
+                first_idx,
+                Box::pin(async move {
+                    let _ = tx.send(first_idx);
+                }),
+            );
         }
-        assert_eq!(
-            drain(&mut receivers),
-            3,
-            "every dispatch must land on a live lane"
-        );
+        for _ in 0..3 {
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("every dispatch must land on a live lane");
+        }
         assert!(
             tpc_lane_redispatches() > before,
             "a dead-lane re-route must be counted (the loud half of the fix)"
         );
+        for l in &lanes {
+            l.exec.shutdown();
+        }
+        j0.join().unwrap();
+        j2.join().unwrap();
     }
 }
 

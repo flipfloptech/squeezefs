@@ -108,6 +108,15 @@ pub(crate) struct FusedRunQueue {
 }
 
 impl FusedRunQueue {
+    /// Ready-queue depth (watchdog attribution: a stuck RESIDENT task
+    /// with a persistently non-empty ready queue = polls not happening).
+    pub(crate) fn ready_len(&self) -> usize {
+        self.ready
+            .lock()
+            .expect("fused run queue poisoned-free")
+            .len()
+    }
+
     fn push(&self, id: usize) {
         // Publish the observable state FIRST (the producer law), then
         // wake through the coalescer.
@@ -123,6 +132,36 @@ impl FusedRunQueue {
             .lock()
             .expect("fused run queue poisoned-free")
             .pop_front()
+    }
+}
+
+/// Shared fused-lane residency watch (see [`FusedLane::watch`]). All
+/// three reads are diagnostic-grade: the watchdog tolerates the same
+/// scan-vs-retire races the op registry does.
+#[derive(Default)]
+pub(crate) struct FusedWatch {
+    uniques: Mutex<std::collections::HashSet<u64>>,
+}
+
+impl FusedWatch {
+    fn note_admit(&self, unique: u64) {
+        self.uniques
+            .lock()
+            .expect("fused watch poisoned-free")
+            .insert(unique);
+    }
+    fn note_retire(&self, unique: u64) {
+        self.uniques
+            .lock()
+            .expect("fused watch poisoned-free")
+            .remove(&unique);
+    }
+    /// Is `unique` a live fused task on this lane?
+    pub(crate) fn is_resident(&self, unique: u64) -> bool {
+        self.uniques
+            .lock()
+            .expect("fused watch poisoned-free")
+            .contains(&unique)
     }
 }
 
@@ -156,6 +195,14 @@ pub(crate) struct FusedLane {
     tasks: slab::Slab<FusedTask>,
     rq: Arc<FusedRunQueue>,
     capacity: usize,
+    /// Shared residency watch (Stage-1b wedge attribution): the overdue-
+    /// slot watchdog reads these from ITS thread to split a stuck fused
+    /// write three ways — resident-parked (awaiting an unnamed wake) vs
+    /// ready-never-polled (fused delivery bug) vs GONE (future dropped
+    /// without its reply — the reply-obligation bug). Uniques of resident
+    /// tasks ride a small mutex map; fused admission is already a slab
+    /// insert + queue push, one more map op is noise at that cost.
+    watch: Arc<FusedWatch>,
     /// Fused futures that panicked mid-poll (dropped + reply
     /// synthesized by the guard). Mirrors the TPC-lane blast radius.
     pub(crate) panics: u64,
@@ -171,7 +218,14 @@ impl FusedLane {
             }),
             capacity: capacity.max(1),
             panics: 0,
+            watch: Arc::new(FusedWatch::default()),
         }
+    }
+
+    /// The shared residency watch handles (registered with the pool so
+    /// the overdue-slot watchdog can attribute stuck fused writes).
+    pub(crate) fn watch_handle(&self) -> (Arc<FusedWatch>, Arc<FusedRunQueue>) {
+        (Arc::clone(&self.watch), Arc::clone(&self.rq))
     }
 
     /// Number of live fused tasks (parked + ready).
@@ -186,6 +240,7 @@ impl FusedLane {
             return false;
         }
         let id = self.tasks.insert(FusedTask { fut, unique });
+        self.watch.note_admit(unique);
         // First poll happens on the worker's next lane drain: enqueue
         // through the run queue so mint sites need no poll context.
         self.rq.push(id);
@@ -227,7 +282,9 @@ impl FusedLane {
             let _rt = handle.enter();
             match std::panic::catch_unwind(AssertUnwindSafe(|| task.fut.as_mut().poll(&mut cx))) {
                 Ok(Poll::Ready(())) => {
+                    let unique = self.tasks[id].unique;
                     self.tasks.remove(id);
+                    self.watch.note_retire(unique);
                 }
                 Ok(Poll::Pending) => {}
                 Err(_) => {
@@ -236,6 +293,7 @@ impl FusedLane {
                     // synthesizes the error reply. Loud + counted.
                     let unique = task.unique;
                     self.tasks.remove(id);
+                    self.watch.note_retire(unique);
                     self.panics += 1;
                     error!(
                         unique,

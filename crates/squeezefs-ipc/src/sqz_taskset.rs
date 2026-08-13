@@ -39,11 +39,12 @@
 //! run-count guard and the gate's drop-resolve), so quiesce never
 //! wedges on a panicked task.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use crate::sqz_notify::Notify;
@@ -72,9 +73,30 @@ struct CancelState {
     /// finishing poll is observed promptly.
     running: AtomicU64,
     quiesce: Notify,
+    /// Parked gates' wakers, by gate id. THE abort-delivery vehicle:
+    /// "resolve at the next poll" is vacuous for a task parked on a
+    /// wake that will never fire (the cancelled-sibling shape), so
+    /// [`CancelState::cancel`] drains this map and WAKES every parked
+    /// gate — cancel itself delivers the poll, exactly as tokio's
+    /// abort does. A gate registers under this lock BEFORE its
+    /// cancelled re-check (enable-then-recheck), so a cancel racing
+    /// the park is never lost.
+    parked: Mutex<HashMap<u64, Waker>>,
+    next_gate_id: AtomicU64,
 }
 
 impl CancelState {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        let wakers: Vec<Waker> = {
+            let mut parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
+            parked.drain().map(|(_, w)| w).collect()
+        };
+        for w in wakers {
+            w.wake();
+        }
+    }
+
     fn live(&self) -> u64 {
         // `resolved` can lag a concurrent spawn's `spawned` increment;
         // the saturation only matters to racy observers (quiesce is
@@ -144,6 +166,8 @@ impl OwnedSet {
                 resolved: AtomicU64::new(0),
                 running: AtomicU64::new(0),
                 quiesce: Notify::new(),
+                parked: Mutex::new(HashMap::new()),
+                next_gate_id: AtomicU64::new(1),
             }),
         }
     }
@@ -157,6 +181,7 @@ impl OwnedSet {
     {
         self.state.spawned.fetch_add(1, Ordering::SeqCst);
         let gate = CancelGate {
+            id: self.state.next_gate_id.fetch_add(1, Ordering::Relaxed),
             state: Arc::clone(&self.state),
             inner: Some(Box::pin(fut)),
             resolved: false,
@@ -164,11 +189,13 @@ impl OwnedSet {
         (self.spawner)(self.site, Box::pin(gate));
     }
 
-    /// Cancel every task: set the flag, wake nothing. Tasks resolve at
-    /// their next poll (a wake they already own, or the TICK backstop
-    /// their park rides); one mid-poll finishes that poll first.
+    /// Cancel every task: set the flag AND wake every parked gate —
+    /// cancel itself delivers the poll where the gate resolves (a
+    /// never-fires park would otherwise wedge quiesce forever; the
+    /// tokio-abort parity the assembly salvage reaper depends on).
+    /// One mid-poll task finishes that poll first.
     pub fn cancel_all(&self) {
-        self.state.cancelled.store(true, Ordering::SeqCst);
+        self.state.cancel();
     }
 
     /// Tasks not yet resolved (`spawned − resolved`).
@@ -239,7 +266,7 @@ pub struct SetHandle {
 
 impl SetHandle {
     pub fn cancel_all(&self) {
-        self.state.cancelled.store(true, Ordering::SeqCst);
+        self.state.cancel();
     }
 
     pub fn live(&self) -> u64 {
@@ -260,9 +287,20 @@ impl SetHandle {
 /// the inner future is taken and dropped INLINE (captures freed —
 /// MEM-2), never polled again.
 struct CancelGate {
+    id: u64,
     state: Arc<CancelState>,
     inner: Option<BoxTask>,
     resolved: bool,
+}
+
+impl CancelGate {
+    fn deregister(&self) {
+        self.state
+            .parked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
 }
 
 impl Future for CancelGate {
@@ -274,11 +312,21 @@ impl Future for CancelGate {
         if this.resolved {
             return Poll::Ready(());
         }
+        // Register the park waker BEFORE the cancelled re-check
+        // (enable-then-recheck): a cancel landing between the check and
+        // an eventual Pending return finds this waker in the map and
+        // delivers the next poll itself.
+        this.state
+            .parked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(this.id, cx.waker().clone());
         if this.state.cancelled.load(Ordering::SeqCst) {
             // The abort-at-next-poll-boundary semantic: resolve WITHOUT
             // polling the inner future, dropping it first so its
             // captures die before a quiesce waiter can observe
             // `live == 0`.
+            this.deregister();
             this.inner = None;
             this.resolved = true;
             this.state.resolve();
@@ -306,11 +354,14 @@ impl Future for CancelGate {
         };
         match polled {
             Poll::Ready(()) => {
+                this.deregister();
                 this.inner = None;
                 this.resolved = true;
                 this.state.resolve();
                 Poll::Ready(())
             }
+            // Stays registered: the waker in the map is the one cancel
+            // (or the inner future's own wake) delivers through.
             Poll::Pending => Poll::Pending,
         }
     }
@@ -323,6 +374,7 @@ impl Drop for CancelGate {
         // free the captures FIRST, then close the accounting — a
         // quiesce waiter observing `live == 0` must never see the
         // inner future's captures still alive.
+        self.deregister();
         self.inner = None;
         if !self.resolved {
             self.resolved = true;
@@ -411,6 +463,37 @@ mod tests {
             1,
             "drop returned only after the cancelled future was dropped"
         );
+    }
+
+    /// THE abort semantic (the assembly salvage wedge, 2026-08-13): a
+    /// task parked on a wake that will NEVER fire (the cancelled
+    /// sibling shape — a oneshot whose sender the owner keeps) must
+    /// still resolve on cancel_all. "Resolve at the next poll" is
+    /// vacuous for a parked task unless CANCEL ITSELF DELIVERS the
+    /// poll — tokio's abort wakes the task; so must ours.
+    #[test]
+    fn cancel_wakes_a_parked_task_that_would_never_wake() {
+        let set = OwnedSet::new("test_parked_cancel", thread_spawner);
+        let witness = Arc::new(());
+        let (_park_tx, park_rx) = crate::sqz_channel::oneshot::channel::<()>();
+        {
+            let w = Arc::clone(&witness);
+            set.spawn(async move {
+                let _held = w;
+                // Parks forever: the sender lives in the test frame and
+                // never sends.
+                let _ = park_rx.await;
+            });
+        }
+        // Let the task reach its park.
+        std::thread::sleep(Duration::from_millis(50));
+        set.cancel_all();
+        assert!(
+            set.quiesce_blocking(Duration::from_secs(4)),
+            "cancel_all must WAKE the parked gate — a never-fires park \
+             otherwise wedges quiesce forever (the salvage-reaper wedge)"
+        );
+        assert_eq!(Arc::strong_count(&witness), 1, "captures freed");
     }
 
     #[test]

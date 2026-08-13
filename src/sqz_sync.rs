@@ -154,23 +154,23 @@ impl<T> SqzRwLock<T> {
         SqzRwLockWriteGuard { lock: self }
     }
 
-    pub fn try_read(&self) -> Result<SqzRwLockReadGuard<'_, T>, ()> {
+    pub fn try_read(&self) -> Result<SqzRwLockReadGuard<'_, T>, TryLockError> {
         let (granted, wake) = self.core.try_acquire(Want::Shared, None);
         wake_all(wake);
         if granted {
             Ok(SqzRwLockReadGuard { lock: self })
         } else {
-            Err(())
+            Err(TryLockError)
         }
     }
 
-    pub fn try_write(&self) -> Result<SqzRwLockWriteGuard<'_, T>, ()> {
+    pub fn try_write(&self) -> Result<SqzRwLockWriteGuard<'_, T>, TryLockError> {
         let (granted, wake) = self.core.try_acquire(Want::Exclusive, None);
         wake_all(wake);
         if granted {
             Ok(SqzRwLockWriteGuard { lock: self })
         } else {
-            Err(())
+            Err(TryLockError)
         }
     }
 
@@ -192,6 +192,19 @@ impl<T: Default> Default for SqzRwLock<T> {
         SqzRwLock::new(T::default())
     }
 }
+
+/// The try-acquire refusal (`try_lock`/`try_read`/`try_write`): the
+/// lock is held (or FIFO courtesy queued you behind a waiter). Carries
+/// no state — the operation is retryable by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TryLockError;
+
+impl std::fmt::Display for TryLockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "lock unavailable")
+    }
+}
+impl std::error::Error for TryLockError {}
 
 pub struct SqzRwLockReadGuard<'a, T: ?Sized> {
     lock: &'a SqzRwLock<T>,
@@ -299,13 +312,13 @@ impl<T> SqzMutex<T> {
         SqzMutexGuard { lock: self }
     }
 
-    pub fn try_lock(&self) -> Result<SqzMutexGuard<'_, T>, ()> {
+    pub fn try_lock(&self) -> Result<SqzMutexGuard<'_, T>, TryLockError> {
         let (granted, wake) = self.core.try_acquire(Want::Exclusive, None);
         wake_all(wake);
         if granted {
             Ok(SqzMutexGuard { lock: self })
         } else {
-            Err(())
+            Err(TryLockError)
         }
     }
 }

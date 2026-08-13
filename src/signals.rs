@@ -61,7 +61,7 @@ pub fn arm() -> std::io::Result<squeezefs_ipc::sqz_channel::mpsc::Receiver<Sig>>
     // unrelated syscalls unperturbed.
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = on_signal as usize;
+        sa.sa_sigaction = on_signal as *const () as usize;
         sa.sa_flags = libc::SA_RESTART;
         libc::sigemptyset(&mut sa.sa_mask);
         for signo in [libc::SIGINT, libc::SIGTERM] {

@@ -130,7 +130,7 @@ mod tests {
         let cell = Arc::new(OnceCell::<u64>::new());
         // Leader whose init never completes — poll it once, then DROP it.
         {
-            let fut = cell.get_or_init(|| std::future::pending::<u64>());
+            let fut = cell.get_or_init(std::future::pending::<u64>);
             let mut fut = Box::pin(fut);
             let waker = futures_noop_waker();
             let mut cx = std::task::Context::from_waker(&waker);
@@ -146,12 +146,6 @@ mod tests {
     }
 
     fn futures_noop_waker() -> std::task::Waker {
-        use std::sync::Arc;
-        use std::task::Wake;
-        struct Noop;
-        impl Wake for Noop {
-            fn wake(self: Arc<Self>) {}
-        }
-        std::task::Waker::from(Arc::new(Noop))
+        std::task::Waker::noop().clone()
     }
 }

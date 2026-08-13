@@ -2837,7 +2837,7 @@ pub fn log_lock_wait_census(threshold: Duration) {
             let lock = BLOCK_FLUSH_LOCKS.get_lock(e.ino, e.key as u32);
             match lock.try_lock() {
                 Ok(_g) => " [PROBE: stripe is FREE — waiter starvation, primitive bug]",
-                Err(()) => " [PROBE: stripe genuinely held — hunt the holder]",
+                Err(_) => " [PROBE: stripe genuinely held — hunt the holder]",
             }
         } else {
             ""

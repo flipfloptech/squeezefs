@@ -313,12 +313,66 @@ workers, dehydration workers, supervisor.
   beat, so a post-unmount beat can never touch a released guard), the
   R5 parked-shed worker, the backend health worker, the staging merge
   worker, the orphan-reclaim batches.
-* **Deliberately still tokio** (none plane-critical): the CLI
-  bootstrap runtime, job fabric + remote wire + cluster/membership
-  wire (tokio net/TLS — Stage 3), mount init/teardown join fan-outs,
-  the fabric sampler, and `tokio::sync` channel/notify primitives
-  everywhere (driver-free: their wakers deliver through whatever
-  first-party executor polls the task).
+* **Deliberately still tokio** (none plane-critical) — SUPERSEDED the
+  same day by the total-removal ruling below; the list that stood here
+  (CLI runtime, wires, join fan-outs, `tokio::sync` primitives) is the
+  inventory the total sweep then deleted.
+
+## Rip-tokio-TOTAL (2026-08-13, user ruling: "I thought the whole goal
+## was we found a tokio bug so instead of forking and fixing we
+## removed it")
+
+The end state: **the shipped binary links no tokio** — `cargo tree -e
+normal` on the root crate shows zero tokio, and
+`tests/no_tokio_convention_tests.rs` is the forever-rail (any `tokio::`
+in product code, or a tokio declaration outside `[dev-dependencies]`,
+fails the gate naming the line). Tokio survives ONLY as the test
+harness (`#[tokio::test]` + test-module internals — never shipped) and
+the opt-in `rig`-feature measurement binary.
+
+**The first-party primitive set** (`crates/squeezefs-ipc/src/`, all
+waker-based, no runtime driver, every unbounded park under the 2 s
+ticked backstop — `TICKED_WAIT_RECOVERIES` counts absorbed lost wakes):
+
+| Module | Replaces | Note |
+|---|---|---|
+| `sqz_channel` | `tokio::sync::{oneshot, mpsc, watch}` | one short-hold Mutex per channel; waiters register under the SAME lock senders mutate under; wakes after guard drop |
+| `sqz_notify` | `Notify` | permit + epoch; `notified_raw().enable()` = tokio's `Notified::enable` (synchronous registration — the enable-then-recheck sites port 1:1: dlm LOCK_WAITERS, write-pipeline admit park, nvme_dev DUR-2 watermark, fuse3 InboundQueue pop) |
+| `sqz_semaphore` | `Semaphore` | the sqz-sync bounded-barging law (fresh yields to queue, queued barges — dead-waiter tick rail; `try_acquire`'s contract IS the barge) |
+| `sqz_flight` | `broadcast` (every use was single-flight) | shared oneshot: late subscribers served, dead leader = loud `Gone` |
+| `sqz_blocking` | `spawn_blocking`, `Runtime::block_on`, `yield_now` | thread-park `block_on`; cached `sqz-blk` pool (cap cpus×16 derived, floor 8 physical; panics propagate to the awaiter) |
+| `sqz_future` | `select!` | `race2` biased-left; recv-vs-sleep shapes ride `sqz_time::timeout` |
+| `sqz_once` | `tokio::sync::OnceCell` | leader-elected, cancelled-leader re-election |
+| `sqz_task` | `task_local!` | poll-scoped push/pop over a thread-local stack, panic-safe guard |
+| `sqz_taskset` | `JoinSet` + abort-on-drop | GENUINE cancel-on-drop (cancel gate drops the inner future at its next poll boundary — the MEM-2 assembly law and the jobs kill-9 analog preserved; quiesce-on-drop bounds the mid-poll window, same window tokio abort had) |
+| `sqz_fdwatch` | `AsyncFd` (the last REACTOR dependence) | one `sqz-fdwatch` epoll thread; oneshot EPOLLONESHOT per await, level-triggered semantics, generation-token slot ownership |
+| `src/signals.rs` | `tokio::signal` | self-pipe sigaction + `sqz-signal` watcher onto an sqz channel |
+| `meta_exec::spawn_meta_join` | `spawn` + `JoinHandle` await | sqz oneshot receiver; `RecvError` = the task unwound (the JoinError arm) |
+
+**The venue map after removal**: fuse3 lanes own handler polls (their
+own pinning), sqz-meta owns plane tasks, `sqz-blk` owns blocking
+offload, `sqz-timer` owns time, `sqz-fdwatch` owns fd readiness,
+thread-per-connection OS threads own the wires (std::net + sync rustls;
+public async APIs preserved via `run_blocking`), per-queue OS threads
+own the zcrx pumps (socket **shutdown+join** quiescence — strictly
+stronger than tokio's abort+join for the MEM-3 recycled-write law), and
+`main` drives the CLI future with the thread-park `block_on` — both
+bootstrap runtimes and the meta_exec/fuse3 timer-driver threads are
+DELETED. fuse3's `connection/tokio.rs` was renamed `uring_conn.rs` (it
+was always the io_uring implementation; the name was fork lineage).
+
+**Laws minted by this program** (each learned from a live conviction):
+1. **Bounded barging** (the rw5a writer-storm starvation) — fresh
+   acquires yield to queued waiters; only QUEUED waiters barge.
+2. **The immortal-fs law** — an fs-pinning loop on a process-lifetime
+   lane must have an exit edge (idle-exit-and-respawn, weak upgrade
+   failure, last-clone-drop stop guard, or channel closure); the
+   per-test-runtime death that used to hide the pin is gone.
+3. **Stop latches, never abort** — sqz tasks are never cancelled
+   mid-poll from outside; loops check a latch at their cadence
+   (`sqz_taskset`'s cancel gate is the one sanctioned abort shape).
+4. **Enable-then-recheck** — every register-before-probe lost-wake
+   discipline rides `Notified::enable`'s synchronous registration.
 
 ## Acceptance
 
@@ -332,7 +386,13 @@ workers, dehydration workers, supervisor.
 
 ## Out of scope (staged next)
 
-Stage 1b: conveyor/commit fan-out parks. Stage 2: fuse3 lanes from
+~~Stage 1b: conveyor/commit fan-out parks. Stage 2: fuse3 lanes from
 current-thread runtimes to plain uring event loops. Stage 3:
-jobs/wire/background. Full tokio removal is the program's end state;
-each stage ships independently behind the same gates.
+jobs/wire/background.~~ **All stages landed 2026-08-13 — the program's
+end state (full tokio removal) is SHIPPED**; see the Rip-tokio-TOTAL
+section. Remaining follow-ons are economics, not removal: the
+`rig`-feature bench binary's tokio A/B arm, and loom models for the
+new channel/notify/semaphore cores (their races are Mutex-serialized
+with wake-after-unlock — the pattern the sqz_sync wrapper already
+pinned — but dedicated models are the standing discipline for any
+future lock-free rewrite of them).

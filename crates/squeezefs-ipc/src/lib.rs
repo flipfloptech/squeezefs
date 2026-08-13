@@ -37,7 +37,12 @@ pub mod layout;
 pub mod ring_core;
 pub mod sizing;
 pub mod slot_core;
+pub mod sqz_blocking;
+pub mod sqz_channel;
 pub mod sqz_exec;
+pub mod sqz_flight;
+pub mod sqz_notify;
+pub mod sqz_semaphore;
 pub mod sqz_time;
 pub mod wire;
 

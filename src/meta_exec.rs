@@ -103,6 +103,28 @@ where
     META_EXEC.lanes[idx].spawn(crate::detached::contain(site, fut));
 }
 
+/// A joinable spawn (the `tokio::spawn` + `JoinHandle::await` shape the
+/// rip-tokio-total sweep replaces): the task runs panic-contained on
+/// the sqz-meta pool, and the returned receiver yields `Ok(T)` on
+/// completion or `Err(RecvError)` if the task unwound (the JoinError
+/// face — the panic itself is already counted by `detached_task_panics`
+/// via `contain`).
+pub fn spawn_meta_join<F, T>(
+    site: &'static str,
+    fut: F,
+) -> squeezefs_ipc::sqz_channel::oneshot::Receiver<T>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = squeezefs_ipc::sqz_channel::oneshot::channel();
+    spawn_meta(site, async move {
+        let out = fut.await;
+        let _ = tx.send(out);
+    });
+    rx
+}
+
 /// Drop-guarded completion signal for JOINED plane tasks (checkpoint /
 /// times drain): sends `true` on a clean exit (the task's final cycle
 /// ran) and `false` on an unwind — the shutdown join keeps the old

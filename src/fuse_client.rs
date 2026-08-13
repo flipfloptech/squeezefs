@@ -8805,6 +8805,10 @@ impl SqueezefsFilesystem {
                 // (investigate with transport_slots_overdue + the wedge
                 // census).
                 "fuse3_zc_bridge_cancels": fuse3::zc_bridge_cancels(),
+                // Must-stay-0 (Stage-1b field wedge): a live bridge pend
+                // found WITHOUT its deadline ledger entry and re-stamped
+                // by the orphan sweep — coverage restored, bug remains.
+                "fuse3_zc_bridge_orphans": fuse3::zc_bridge_orphans(),
                 // The PROVEN-loss split (must stay 0): completions the
                 // kernel posted that the transport never reaped — the
                 // -ENOENT synthesis arm's ledger. cancels without losses
@@ -8983,6 +8987,12 @@ impl SqueezefsFilesystem {
                 "transport_replies_dropped_no_slot": t_dropped_no_slot,
                 "transport_ents_retired": t_ents_retired,
                 "transport_slots_overdue": t_slots_overdue,
+                // Stage-1b bounded-park backstop: pend/fused-holding
+                // workers self-clock their deadline scans (100 ms EXT_ARG
+                // park bound) — growth under bridge traffic is the
+                // backstop working, never a wedge.
+                "transport_park_backstop_ticks":
+                    fuse3::transport_park_backstop_ticks(),
                 "transport_replies_oversize": t_replies_oversize,
                 // FUSE-3f: see the gather site above.
                 // `transport_cq_overflows` must stay 0.

@@ -17,16 +17,16 @@ pub use connection::fuse_over_uring::{
     drain_group_stats, negotiated_max_readahead, numa_local_bytes, numa_remote_bytes,
     over_uring_classical_sideband, over_uring_commit_batch_stats, over_uring_geometry,
     over_uring_negotiated_write, over_uring_sessions_active, over_uring_stats,
-    transport_cq_overflow_stats, transport_lease_stats, transport_reply_integrity_stats,
-    transport_wake_stats, COMMIT_BATCH_LABELS, Q_DEPTH_DESIRED,
+    transport_cq_overflow_stats, transport_lease_stats, transport_park_backstop_ticks,
+    transport_reply_integrity_stats, transport_wake_stats, COMMIT_BATCH_LABELS, Q_DEPTH_DESIRED,
 };
 #[cfg(all(target_os = "linux", feature = "tokio-runtime"))]
 pub use connection::kmbuf::{
     kmbuf_negotiated, note_zc_write_direct, retention_negotiated, zc_bridge_cancels,
-    zc_bridge_lost, zc_fallbacks, zc_negotiated, zc_release_failures, zc_releases, zc_replies,
-    zc_retain_commits, zc_retain_refused, zc_retained_outstanding, zc_slot_payload_skips,
-    zc_write_direct_bytes, zc_write_directs, zc_write_extract_bytes, zc_write_extractions,
-    zc_write_store_qid_census,
+    zc_bridge_lost, zc_bridge_orphans, zc_fallbacks, zc_negotiated, zc_release_failures,
+    zc_releases, zc_replies, zc_retain_commits, zc_retain_refused, zc_retained_outstanding,
+    zc_slot_payload_skips, zc_write_direct_bytes, zc_write_directs, zc_write_extract_bytes,
+    zc_write_extractions, zc_write_store_qid_census,
 };
 pub use connection::zc::set_zc_hold_streaming;
 pub use filesystem::Filesystem;

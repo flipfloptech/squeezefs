@@ -1479,6 +1479,14 @@ pub struct FuseOverUring {
     /// nonzero so their [`zc::BridgeDeadlines`] scans run even on idle
     /// queues.
     zc_bridge_pends: AtomicU64,
+    /// Worker-published scan gauges (Stage-1b attribution): each worker
+    /// stores, once per deadline-scan pass, how many `Some` pends its
+    /// members hold and how many of those lack a ledger stamp. The watch
+    /// thread prints them with overdue warns — the live discriminator
+    /// between "scan runs and sees nothing" and "scan never runs".
+    scan_pends_seen: AtomicU64,
+    scan_orphans_seen: AtomicU64,
+    scan_passes: AtomicU64,
     /// Per-group fused-lane residency watches (Stage-1b wedge
     /// attribution): registered by each worker at lane creation; read by
     /// [`Self::scan_overdue_slots`] to name a stuck fused write's state.
@@ -1910,6 +1918,18 @@ static TRANSPORT_REPLIES_DROPPED_NO_SLOT: AtomicU64 = AtomicU64::new(0);
 static TRANSPORT_ENTS_RETIRED: AtomicU64 = AtomicU64::new(0);
 static TRANSPORT_SLOTS_OVERDUE: AtomicU64 = AtomicU64::new(0);
 static TRANSPORT_REPLIES_OVERSIZE: AtomicU64 = AtomicU64::new(0);
+/// Bounded-park backstop ticks (Stage-1b field wedge fix, 2026-08-13):
+/// a worker holding live bridge pends / resident fused tasks parked its
+/// 100 ms EXT_ARG bound out and re-ran its pass (deadline scan + rq
+/// drain) under its OWN clock. Nonzero under bridge traffic is the
+/// backstop WORKING; the deadline ladder no longer depends on a
+/// cross-thread wake reaching a parked worker.
+static TRANSPORT_PARK_BACKSTOP_TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// The bounded-park backstop's engagement gauge (stats surface).
+pub fn transport_park_backstop_ticks() -> u64 {
+    TRANSPORT_PARK_BACKSTOP_TICKS.load(Ordering::Relaxed)
+}
 
 // FUSE-3f: completion-queue loss. `transport_cq_overflows` is a
 // must-stay-0 tripwire — a dropped CQE is a REGISTER or COMMIT_AND_FETCH
@@ -2750,6 +2770,9 @@ impl FuseOverUring {
                 zc::ZcHeldTable::new(nqueues, depth)
             },
             zc_bridge_pends: AtomicU64::new(0),
+            scan_pends_seen: AtomicU64::new(0),
+            scan_orphans_seen: AtomicU64::new(0),
+            scan_passes: AtomicU64::new(0),
             fused_watches: std::sync::Mutex::new(Vec::new()),
             zc_hold_gate: std::sync::OnceLock::new(),
             fused_dispatch: std::sync::OnceLock::new(),
@@ -2984,6 +3007,9 @@ impl FuseOverUring {
                 .collect(),
             zc_write_held: zc::ZcHeldTable::new(nqueues as usize, Self::SIM_DEPTH),
             zc_bridge_pends: AtomicU64::new(0),
+            scan_pends_seen: AtomicU64::new(0),
+            scan_orphans_seen: AtomicU64::new(0),
+            scan_passes: AtomicU64::new(0),
             fused_watches: std::sync::Mutex::new(Vec::new()),
             zc_hold_gate: std::sync::OnceLock::new(),
             fused_dispatch: std::sync::OnceLock::new(),
@@ -3591,9 +3617,14 @@ impl FuseOverUring {
                 "fuse-over-uring qid={qid} ent={ent}: unique={unique} delivered {} ms ago and \
                  still unreplied — the caller is in uninterruptible sleep \
                  (transport_slots_overdue; {fused_state}, fused_ready_total={ready_total}, \
-                 zc_bridge_pends={})",
+                 zc_bridge_pends={}, scan_passes={}, scan_pends_seen={}, \
+                 scan_orphans_seen={}, park_backstop_ticks={})",
                 now.saturating_sub(since) / 1_000_000,
-                self.zc_bridge_pends.load(Ordering::Relaxed)
+                self.zc_bridge_pends.load(Ordering::Relaxed),
+                self.scan_passes.load(Ordering::Relaxed),
+                self.scan_pends_seen.load(Ordering::Relaxed),
+                self.scan_orphans_seen.load(Ordering::Relaxed),
+                TRANSPORT_PARK_BACKSTOP_TICKS.load(Ordering::Relaxed)
             );
         }
     }
@@ -5374,10 +5405,52 @@ fn queue_worker(
         // cancel SQEs ride the same loop-bottom flush; the watch thread
         // wakes parked workers while any pend is outstanding, so this
         // scan runs on idle queues too.
-        if zc_mode && pool.zc_bridge_pends.load(Ordering::Relaxed) > 0 {
+        if pool.zc_bridge_pends.load(Ordering::Relaxed) > 0 {
             let now = crate::raw::read_phase::transport_now_ns();
             let timeout = zc_bridge_timeout_ns();
+            pool.scan_passes.fetch_add(1, Ordering::Relaxed);
+            let mut pends_seen = 0u64;
+            let mut orphans_seen = 0u64;
+            for m in members.iter() {
+                for ent_idx in 0..depth {
+                    if m.zc_pend[ent_idx].is_some() {
+                        pends_seen += 1;
+                        if m.bridge_deadlines.born_ns(ent_idx) == 0 {
+                            orphans_seen += 1;
+                        }
+                    }
+                }
+            }
+            pool.scan_pends_seen
+                .fetch_add(pends_seen, Ordering::Relaxed);
+            pool.scan_orphans_seen
+                .fetch_add(orphans_seen, Ordering::Relaxed);
             for (mi, m) in members.iter_mut().enumerate() {
+                // The ORPHANED-PEND sweep (Stage-1b field wedge,
+                // 2026-08-13): the live capture showed a pool with
+                // zc_bridge_pends=4 while EVERY member deadline ledger
+                // read 0 — a live pend without a ledger entry is
+                // invisible to the deadline ladder forever (its oneshot
+                // strands, the holder parks, the stripe convoys). The
+                // invariant is self-healing: every `Some` pend must hold
+                // a ledger entry; re-stamp any that lost theirs (loud,
+                // counted) so the deadline machinery re-covers them.
+                for ent_idx in 0..depth {
+                    if m.zc_pend[ent_idx].is_some() && m.bridge_deadlines.born_ns(ent_idx) == 0 {
+                        error!(
+                            "fuse-over-uring qid={} ent={ent_idx}: LIVE zc bridge pend                              with NO deadline ledger entry — re-stamping (orphaned pend;                              fuse3_zc_bridge_orphans)",
+                            m.qid
+                        );
+                        kmbuf::note_zc_bridge_orphan();
+                        // No pends fetch_add: the orphan's ORIGINAL
+                        // stamp counted it and no clear() ever -1'd —
+                        // the pool gauge still carries it (that is
+                        // exactly how the capture read pends=4 with
+                        // empty ledgers). Re-stamping only restores
+                        // ledger coverage.
+                        let _ = m.bridge_deadlines.stamp(ent_idx, now);
+                    }
+                }
                 for ent in m.bridge_deadlines.overdue(now, timeout) {
                     let gent = gent_of(mi, ent);
                     error!(
@@ -5442,6 +5515,30 @@ fn queue_worker(
             .iter()
             .filter_map(|m| m.slots.next_retry_deadline())
             .min();
+        // The bounded-park law (Stage-1b field wedge, 2026-08-13 —
+        // docs/design-sqz-sync.md §attribution): a worker holding LIVE
+        // BRIDGE PENDS or RESIDENT FUSED TASKS must never park
+        // unbounded. Their resolutions arrive via the cross-thread
+        // wake chain (foreign oneshot -> FusedWaker -> rq push ->
+        // coalescer -> eventfd -> wake-fd PollAdd), and the field
+        // capture proved that chain CAN lose exactly one wake under
+        // load — zc_bridge_pends=4 with zero deadline cancels for
+        // 435 s, the worker asleep in cq-wait while the watch thread
+        // ticked. Owning the clock removes the dependence: the park is
+        // EXT_ARG-bounded (the ipc dd-reaper's shipped 100 ms backstop
+        // cadence), so the pass — deadline scan, rq drain — is
+        // self-clocked. Idle workers (no pends, no fused residents)
+        // keep the zero-cost unbounded park.
+        // Gate on the POOL pend counter, not the per-member ledgers:
+        // the 2026-08-13 live capture (all 62 workers parked UNBOUNDED
+        // at zc_bridge_pends=4) proved a pend can be pool-visible while
+        // every local ledger reads 0 — whatever that accounting drift
+        // is, the liveness backstop must not depend on it. Coarse on
+        // purpose: every worker of the pool ticks 100 ms while ANY
+        // bridge pend lives; pends are rare and deadline-bounded.
+        let park_backstop = (fused_lane.len() > 0
+            || pool.zc_bridge_pends.load(Ordering::Relaxed) > 0)
+            .then(|| Duration::from_millis(100));
         let wait_result = if !deferred_cqes.is_empty() || pass_polls > 0 || pass_msgs > 0 {
             // Work-conserving pass: completions in hand (parking would
             // sleep over work nothing re-signals — the drained-then-park
@@ -5458,20 +5555,34 @@ fn queue_worker(
                 other => other,
             }
         } else {
-            match next_retry {
-                Some(deadline) => {
-                    let left = deadline.saturating_duration_since(Instant::now());
+            let retry_left =
+                next_retry.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            match (retry_left, park_backstop) {
+                (None, None) => ring.submit_and_wait(1),
+                (left, backstop) => {
+                    // Bounded park: the earlier of the REGISTER-retry
+                    // deadline and the pend/fused backstop tick.
+                    let bound = match (left, backstop) {
+                        (Some(l), Some(b)) => l.min(b),
+                        (Some(l), None) => l,
+                        (None, Some(b)) => b,
+                        (None, None) => unreachable!(),
+                    };
                     let ts = types::Timespec::new()
-                        .sec(left.as_secs())
-                        .nsec(left.subsec_nanos());
+                        .sec(bound.as_secs())
+                        .nsec(bound.subsec_nanos());
                     let args = types::SubmitArgs::new().timespec(&ts);
                     match ring.submitter().submit_with_args(1, &args) {
-                        // A timed-out wait is the retry tick, not an error.
-                        Err(e) if e.raw_os_error() == Some(libc::ETIME) => Ok(0),
+                        // A timed-out wait is the tick, not an error.
+                        Err(e) if e.raw_os_error() == Some(libc::ETIME) => {
+                            if backstop.is_some() {
+                                TRANSPORT_PARK_BACKSTOP_TICKS.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Ok(0)
+                        }
                         other => other,
                     }
                 }
-                None => ring.submit_and_wait(1),
             }
         };
         match wait_result {

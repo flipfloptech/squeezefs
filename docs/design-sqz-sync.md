@@ -158,6 +158,39 @@ parked-worker-never-scans face). Next: red-first cargo repro of the
 HandlerStore + parked-worker shape, then fix the wake/scan path — fix
 uring, never bypass it.
 
+## The bounded-outcome hardening loop (2026-08-13, branch fix/zc-store-bounded-outcome)
+
+Landed (each red/green against the zc-bridge suite, which gained
+contract 3 — the HandlerStore/quiet-mount leg, green with engagement):
+
+* **Bounded park**: a queue worker holding live bridge pends or
+  resident fused tasks parks EXT_ARG-bounded (100 ms — the dd-reaper
+  cadence) instead of unbounded `submit_and_wait`; the deadline scan +
+  rq drain are self-clocked, never dependent on a cross-thread wake
+  reaching a parked worker. Gauge `transport_park_backstop_ticks`;
+  live-gdb verified (62/62 parks unbounded before, 31/31 bounded after).
+* **Orphaned-pend sweep**: every `Some` pend must hold a deadline
+  ledger entry; the scan re-stamps any that lost theirs
+  (`fuse3_zc_bridge_orphans`, must-stay-0) — and the scan is no longer
+  `zc_mode`-gated (liveness machinery must not sit behind a mode bit).
+* **Worker-published scan gauges** on the overdue-slot warns:
+  `scan_passes` / `scan_pends_seen` / `scan_orphans_seen` /
+  `park_backstop_ticks` — the live discriminator between "scan never
+  runs" and "scan sees nothing".
+
+Field verdict so far (464 at 3.0 GHz, counted probes): the wedge
+persists, and the gauges FALSIFIED the orphan/parked-scan theories in
+the field shape — during a live wedge the scan runs (369k passes),
+every pend is stamped, none is overdue, no cancel fires, yet a block-0
+stripe stays held 160+ s with all waiters healthy and ticking. The
+stall is UPSTREAM of the bridge machinery: the overlay ticket /
+ack-early finisher path (`overlay_settle` waits on the in-flight store
+set; some runs show the holder in `overlay_store`, some show no live
+holder unit at all — the leaked-guard face). Next instrument: a
+stripe HELD flag (set on acquire, cleared on guard drop, aged) to split
+leaked-guard vs parked-holder, plus naming the ack-early finisher's
+awaits in the phase census.
+
 ## Acceptance
 
 * The primitive's unit rails + a loom model of the acquire/release/wake

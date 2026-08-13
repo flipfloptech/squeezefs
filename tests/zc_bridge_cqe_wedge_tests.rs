@@ -383,3 +383,113 @@ fn healthy_armed_mount_fires_no_bridge_tripwires() {
     drop(mount);
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// Contract 3 — the **HandlerStore class** (the Stage-1b field wedge,
+/// 2026-08-13, `docs/design-sqz-sync.md` §attribution): a device-overlay
+/// DIRECT STORE (`try_device_overlay_store` → `zc_write_store` →
+/// `ZcPend::HandlerStore`) whose `WriteFixed` CQE is lost, on an
+/// otherwise QUIET mount — the field posture: the handler holds the
+/// block stripe parked on the store oneshot (`write-phase census:
+/// overlay_store`), same-block writers convoy behind it, and with the
+/// ladder broken NOTHING wakes the parked worker to push its deadline
+/// AsyncCancel (`zc_bridge_pends` armed, zero cancel lines, 435+ s).
+///
+/// The quiet-mount shape is load-bearing: contracts 1/2 drive extraction
+/// bridges the worker resolves mid-pass; the store's CQE arrives (and is
+/// eaten) while the worker heads to PARK, so resolving it requires the
+/// watch-tick → eventfd → parked-worker wake path — exactly the leg the
+/// field capture shows failing.
+#[test]
+fn lost_overlay_store_cqe_resolves_through_the_deadline_ladder() {
+    if !mount_supported(site!()) {
+        return;
+    }
+    let base = scratch("ovstore");
+    let meta = format_volume(&base);
+    let mnt = base.join("mnt");
+
+    // Phase 1 — seam UNLOADED: make the file striped with block 0
+    // published (the overlay's §7 striped-authority screen), then
+    // unmount cleanly.
+    {
+        let log = base.join("setup.log");
+        let mount = spawn_zc_mount(&meta, &mnt, &log, 0);
+        if !zc_armed(&log) {
+            drop(mount);
+            let _ = std::fs::remove_dir_all(&base);
+            skip!(
+                Capability,
+                "FUSE_URING_ZERO_COPY did not arm (sqz kernel + CAP_SYS_ADMIN required)"
+            );
+        }
+        let mut f = std::fs::File::create(mnt.join("ovstore.bin")).expect("create");
+        f.write_all(&vec![0x33u8; 4 * 1024 * 1024])
+            .expect("stripe block 0");
+        f.sync_all().expect("fsync setup");
+    }
+
+    // Phase 2 — seam LOADED (drop 1): the FIRST write-class bridge op is
+    // the overlay-eligible store — a 4 KiB-aligned single-block write at
+    // the FRESH block 1 (offset 4 MiB) of the striped file. Its
+    // WriteFixed CQE is consumed-and-dropped; the pend + deadline stay
+    // live; the mount stays otherwise quiet.
+    let log = base.join("store.log");
+    let mount = spawn_zc_mount(&meta, &mnt, &log, 1);
+    assert!(zc_armed(&log), "phase-2 mount must re-arm zc");
+
+    let cancels0 = stats_metric(&mnt, "fuse3_zc_bridge_cancels").unwrap_or(0);
+    let file = mnt.join("ovstore.bin");
+    let payload = vec![0xC7u8; 4096];
+    let writer = std::thread::spawn(move || -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt as _;
+        let f = std::fs::OpenOptions::new().write(true).open(&file)?;
+        f.write_all_at(&payload, 4 * 1024 * 1024)?;
+        f.sync_all()?;
+        Ok(())
+    });
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !writer.is_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "overlay store did not resolve within 60 s against a dropped \
+             HandlerStore CQE — the bounded-outcome ladder never fired on \
+             the parked worker (the Stage-1b field wedge; daemon log: {})",
+            log.display()
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    match writer.join().expect("writer thread") {
+        Ok(()) => {}
+        Err(e) => {
+            eprintln!("bounded outcome: overlay store failed loud ({e}) — legal (never acked)");
+        }
+    }
+
+    // The ladder's ledger: the dropped store must push its deadline
+    // AsyncCancel (the engagement instrument for THIS class).
+    let cancels = stats_metric(&mnt, "fuse3_zc_bridge_cancels").unwrap_or(0);
+    assert!(
+        cancels > cancels0,
+        "the dropped HandlerStore CQE must push a deadline AsyncCancel \
+         (fuse3_zc_bridge_cancels {cancels0} → {cancels}; log: {})",
+        log.display()
+    );
+
+    // The bounded-park law's engagement (the FIX for the field face —
+    // the ladder must be SELF-CLOCKED, never dependent on a cross-thread
+    // wake reaching a parked worker): the pend-holding worker must have
+    // re-passed on its own 100 ms park bound at least once during the
+    // ~1 s deadline window.
+    let backstop = stats_metric(&mnt, "transport_park_backstop_ticks").unwrap_or(0);
+    assert!(
+        backstop > 0,
+        "a worker holding a live bridge pend must park BOUNDED and \
+         self-clock its deadline scan (transport_park_backstop_ticks = \
+         {backstop}; log: {})",
+        log.display()
+    );
+
+    assert_serviceable(&mnt);
+    drop(mount);
+    let _ = std::fs::remove_dir_all(&base);
+}

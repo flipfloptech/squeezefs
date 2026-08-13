@@ -988,6 +988,23 @@ pub fn note_zc_bridge_cancel() {
     ZC_BRIDGE_CANCELS.fetch_add(1, Ordering::Relaxed);
 }
 
+static ZC_BRIDGE_ORPHANS: AtomicU64 = AtomicU64::new(0);
+
+/// A LIVE zc bridge pend found with NO deadline ledger entry and
+/// re-stamped by the orphan sweep (Stage-1b field wedge, 2026-08-13).
+pub(crate) fn note_zc_bridge_orphan() {
+    ZC_BRIDGE_ORPHANS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `fuse3_zc_bridge_orphans` (stats inode): **must stay 0** — nonzero
+/// means a pend LOST its deadline coverage (an ent recycle / accounting
+/// path wiped the ledger under a live pend) and only the orphan sweep
+/// saved it from stranding forever. Each one is a bug to root-cause;
+/// the sweep is the belt, never the mechanism.
+pub fn zc_bridge_orphans() -> u64 {
+    ZC_BRIDGE_ORPHANS.load(Ordering::Relaxed)
+}
+
 /// `fuse3_zc_bridge_cancels` (stats inode): **must stay 0** — nonzero
 /// names a bridge op the ring never completed inside the deadline
 /// (investigate alongside `transport_slots_overdue` and the wedge

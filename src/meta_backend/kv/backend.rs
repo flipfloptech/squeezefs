@@ -143,8 +143,8 @@ pub static TEST_CONVEYOR_EMPTY_TAIL_PARKED: AtomicU64 = AtomicU64::new(0);
 
 /// The parked-pass wake for [`TEST_CONVEYOR_HOLD_STAGE`] (register-recheck
 /// discipline — a stale release can never strand a pass).
-static TEST_CONVEYOR_HOLD_NOTIFY: once_cell::sync::Lazy<tokio::sync::Notify> =
-    once_cell::sync::Lazy::new(tokio::sync::Notify::new);
+static TEST_CONVEYOR_HOLD_NOTIFY: once_cell::sync::Lazy<squeezefs_ipc::sqz_notify::Notify> =
+    once_cell::sync::Lazy::new(squeezefs_ipc::sqz_notify::Notify::new);
 
 /// Release every pass parked on [`TEST_CONVEYOR_HOLD_STAGE`] (callers
 /// store `0` first; the notify wakes the register-recheck loop).
@@ -828,8 +828,8 @@ pub struct KvMetaBackend {
     /// Checkpoint-task lifecycle: shutdown flag + wake + join handle +
     /// liveness probe (`Weak<()>` of the token the task owns).
     shutting_down: AtomicBool,
-    ckpt_wake: Arc<tokio::sync::Notify>,
-    ckpt_join: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<bool>>>,
+    ckpt_wake: Arc<squeezefs_ipc::sqz_notify::Notify>,
+    ckpt_join: std::sync::Mutex<Option<squeezefs_ipc::sqz_channel::oneshot::Receiver<bool>>>,
     ckpt_alive: std::sync::Mutex<Weak<()>>,
 
     // ---- PR M6: the SETATTR-echo absorber (design §5.4 D4) ----
@@ -847,8 +847,8 @@ pub struct KvMetaBackend {
     /// (`scc` `len()` walks buckets).
     pending_times_count: AtomicU64,
     /// Drain-task lifecycle: cap-crossing wake + join handle.
-    times_drain_wake: Arc<tokio::sync::Notify>,
-    times_drain_join: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<bool>>>,
+    times_drain_wake: Arc<squeezefs_ipc::sqz_notify::Notify>,
+    times_drain_join: std::sync::Mutex<Option<squeezefs_ipc::sqz_channel::oneshot::Receiver<bool>>>,
     /// Mount-probe hardware classification (resolved OQ 2's second
     /// field), set once by the mount path.
     atomicity_physical: std::sync::OnceLock<crate::meta_backend::atomicity::AtomicityClass>,
@@ -1094,12 +1094,10 @@ impl KvMetaBackend {
         // Layer B1 resolution: test override first, then the real RESCAP
         // probe (control-plane ioctl — off the async runtime).
         let probe_path = path.to_path_buf();
-        inner.reservations = tokio::task::spawn_blocking(move || {
+        inner.reservations = squeezefs_ipc::sqz_blocking::run_blocking(move || {
             crate::meta_backend::reservation::resolve_for_mount(&probe_path)
         })
-        .await
-        .ok()
-        .flatten();
+        .await;
         inner.pr_key = xxhash_rust::xxh3::xxh3_64(
             format!("{}\u{0}{}", inner.writer_id, inner.boot_id).as_bytes(),
         );
@@ -1791,12 +1789,12 @@ impl KvMetaBackend {
             barrier_starts: AtomicU64::new(0),
             barrier_durable: AtomicU64::new(0),
             shutting_down: AtomicBool::new(false),
-            ckpt_wake: Arc::new(tokio::sync::Notify::new()),
+            ckpt_wake: Arc::new(squeezefs_ipc::sqz_notify::Notify::new()),
             ckpt_join: std::sync::Mutex::new(None),
             ckpt_alive: std::sync::Mutex::new(Weak::new()),
             pending_times: scc::HashMap::new(),
             pending_times_count: AtomicU64::new(0),
-            times_drain_wake: Arc::new(tokio::sync::Notify::new()),
+            times_drain_wake: Arc::new(squeezefs_ipc::sqz_notify::Notify::new()),
             times_drain_join: std::sync::Mutex::new(None),
             atomicity_physical: std::sync::OnceLock::new(),
             guard_fd: std::sync::Mutex::new(None),
@@ -3264,7 +3262,7 @@ impl KvMetaBackend {
     /// Checkpoint-task plumbing (spawned by [`Self::open`]).
     pub(super) fn install_checkpoint_task(
         &self,
-        done: tokio::sync::oneshot::Receiver<bool>,
+        done: squeezefs_ipc::sqz_channel::oneshot::Receiver<bool>,
         alive: Weak<()>,
     ) {
         *self.ckpt_join.lock().unwrap() = Some(done);
@@ -3273,11 +3271,14 @@ impl KvMetaBackend {
 
     /// PR M6: the pending-times drain task's wake (cap crossings + the
     /// shutdown broadcast).
-    pub(super) fn times_drain_wake_handle(&self) -> Arc<tokio::sync::Notify> {
+    pub(super) fn times_drain_wake_handle(&self) -> Arc<squeezefs_ipc::sqz_notify::Notify> {
         self.times_drain_wake.clone()
     }
 
-    pub(super) fn install_times_drain_task(&self, done: tokio::sync::oneshot::Receiver<bool>) {
+    pub(super) fn install_times_drain_task(
+        &self,
+        done: squeezefs_ipc::sqz_channel::oneshot::Receiver<bool>,
+    ) {
         *self.times_drain_join.lock().unwrap() = Some(done);
     }
 
@@ -3309,7 +3310,7 @@ impl KvMetaBackend {
         self.checkpoint_wake().notify_one();
     }
 
-    pub(super) fn checkpoint_wake(&self) -> Arc<tokio::sync::Notify> {
+    pub(super) fn checkpoint_wake(&self) -> Arc<squeezefs_ipc::sqz_notify::Notify> {
         self.ckpt_wake.clone()
     }
 
@@ -4503,9 +4504,7 @@ where
         + 'static,
 {
     let rsv = rsv.clone();
-    tokio::task::spawn_blocking(move || f(rsv.as_ref()))
-        .await
-        .map_err(|e| std::io::Error::other(format!("reservation task join: {e}")))?
+    squeezefs_ipc::sqz_blocking::run_blocking(move || f(rsv.as_ref())).await
 }
 
 // ---------------------------------------------------------------------------
@@ -4646,7 +4645,7 @@ struct QueuedLayoutMerge {
     /// into the batch's ONE aggregated transaction alongside its layout
     /// record — the accounting aggregates exactly as the saves do.
     block_refs: Vec<super::block_refs::BlockRefOp>,
-    done: tokio::sync::oneshot::Sender<crate::error::Result<bool>>,
+    done: squeezefs_ipc::sqz_channel::oneshot::Sender<crate::error::Result<bool>>,
 }
 
 struct QueuedTx {
@@ -4667,7 +4666,7 @@ struct QueuedTx {
     _guards: Arc<[DlmGuard]>,
     /// Fan-out channel. A dead receiver (dropped committer future) is
     /// harmless — semantically identical to timeout-fires-after-commit.
-    done: tokio::sync::oneshot::Sender<std::result::Result<(), KvError>>,
+    done: squeezefs_ipc::sqz_channel::oneshot::Sender<std::result::Result<(), KvError>>,
 }
 
 /// The §5.5 panic guard: pipeline state that must never be dropped on
@@ -4948,7 +4947,7 @@ impl KvMetaBackend {
                     .to_string(),
             )
         })?;
-        let (done, rx) = tokio::sync::oneshot::channel();
+        let (done, rx) = squeezefs_ipc::sqz_channel::oneshot::channel();
         self.conveyor.enqueue(
             QueuedTx {
                 recs,
@@ -6901,7 +6900,7 @@ impl KvMetaBackend {
                 .merge_layout_and_size_direct(ino, delta, &full_layout, size, &block_refs)
                 .await;
         }
-        let (done, rx) = tokio::sync::oneshot::channel();
+        let (done, rx) = squeezefs_ipc::sqz_channel::oneshot::channel();
         // Spec §6.2 item 9: the versioned wire rides ONLY volumes whose
         // superblock carries KV_LAYOUT_VERSIONS — an un-stamped volume
         // strips the pair at encode and stays byte-identical to the
@@ -7055,11 +7054,11 @@ impl KvMetaBackend {
         // Per-op outcomes: staged members await the shared commit;
         // failed members own their error immediately.
         let mut staged: Vec<(
-            tokio::sync::oneshot::Sender<crate::error::Result<bool>>,
+            squeezefs_ipc::sqz_channel::oneshot::Sender<crate::error::Result<bool>>,
             bool,
         )> = Vec::new();
         let mut failed: Vec<(
-            tokio::sync::oneshot::Sender<crate::error::Result<bool>>,
+            squeezefs_ipc::sqz_channel::oneshot::Sender<crate::error::Result<bool>>,
             crate::error::SqueezefsError,
         )> = Vec::new();
         // Spec §6.2 item 9 (versioned volumes): the tree probe reads the

@@ -96,8 +96,8 @@ pub static TEST_SMO_BUILD_PAUSED: once_cell::sync::Lazy<
 
 /// The parked-SMO wake for [`TEST_SMO_BUILD_PAUSE_TREE`] (register-recheck
 /// discipline — a stale release can never strand the SMO task).
-static TEST_SMO_BUILD_NOTIFY: once_cell::sync::Lazy<tokio::sync::Notify> =
-    once_cell::sync::Lazy::new(tokio::sync::Notify::new);
+static TEST_SMO_BUILD_NOTIFY: once_cell::sync::Lazy<squeezefs_ipc::sqz_notify::Notify> =
+    once_cell::sync::Lazy::new(squeezefs_ipc::sqz_notify::Notify::new);
 
 /// Release an SMO parked on [`TEST_SMO_BUILD_PAUSE_TREE`] (disarms first;
 /// the notify wakes the register-recheck loop).
@@ -433,7 +433,7 @@ impl KvTree {
                 // ~1/2 bench runs once §4.6 pt 1 threshold wakes made
                 // SMOs frequent. Yielding turns the budget into 256
                 // scheduling opportunities, not 256 spins.
-                tokio::task::yield_now().await;
+                squeezefs_ipc::sqz_blocking::yield_now().await;
             }
             let root = self.root();
             let Some(mut cur) = (match self.cache.try_get(root.addr) {

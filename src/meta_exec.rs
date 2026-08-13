@@ -131,12 +131,12 @@ where
 /// JoinHandle semantics (a panicked task surfaces as Corrupt, never a
 /// silent skipped final checkpoint).
 pub struct DoneGuard {
-    tx: Option<tokio::sync::oneshot::Sender<bool>>,
+    tx: Option<squeezefs_ipc::sqz_channel::oneshot::Sender<bool>>,
     completed: bool,
 }
 
 impl DoneGuard {
-    pub fn new(tx: tokio::sync::oneshot::Sender<bool>) -> Self {
+    pub fn new(tx: squeezefs_ipc::sqz_channel::oneshot::Sender<bool>) -> Self {
         DoneGuard {
             tx: Some(tx),
             completed: false,

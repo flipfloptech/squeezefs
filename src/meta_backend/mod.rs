@@ -592,7 +592,7 @@ fn derive_mint_slots(volume_count: usize, slot_to_volume: &[usize]) -> Vec<Vec<u
 struct SlotGates {
     armed: std::sync::atomic::AtomicU64,
     map: scc::HashMap<u64, std::sync::Arc<slot_gate_core::SlotGate>>,
-    notify: tokio::sync::Notify,
+    notify: squeezefs_ipc::sqz_notify::Notify,
 }
 
 impl SlotGates {
@@ -600,7 +600,7 @@ impl SlotGates {
         Self {
             armed: std::sync::atomic::AtomicU64::new(0),
             map: scc::HashMap::new(),
-            notify: tokio::sync::Notify::new(),
+            notify: squeezefs_ipc::sqz_notify::Notify::new(),
         }
     }
 }

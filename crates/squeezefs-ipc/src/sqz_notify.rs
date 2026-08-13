@@ -94,11 +94,7 @@ struct Notified<'a> {
 impl Drop for Notified<'_> {
     fn drop(&mut self) {
         if let Some(id) = self.id {
-            let mut st = self
-                .notify
-                .state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut st = self.notify.state.lock().unwrap_or_else(|e| e.into_inner());
             st.waiters.retain(|(wid, _, _)| *wid != id);
         }
     }
@@ -107,11 +103,7 @@ impl Drop for Notified<'_> {
 impl Future for Notified<'_> {
     type Output = ();
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let mut st = self
-            .notify
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut st = self.notify.state.lock().unwrap_or_else(|e| e.into_inner());
         // A notify_waiters since registration completes this waiter.
         if self.id.is_some() && st.epoch > self.registered_epoch {
             let id = self.id.take().expect("checked");

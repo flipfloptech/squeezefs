@@ -232,9 +232,7 @@ impl Future for AcquireFut<'_> {
             } else {
                 match self.id {
                     Some(id) => {
-                        if let Some(entry) =
-                            st.waiters.iter_mut().find(|(wid, _, _)| *wid == id)
-                        {
+                        if let Some(entry) = st.waiters.iter_mut().find(|(wid, _, _)| *wid == id) {
                             entry.2 = cx.waker().clone();
                         } else {
                             let want = self.want;

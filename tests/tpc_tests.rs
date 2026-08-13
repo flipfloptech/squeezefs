@@ -19,9 +19,14 @@ async fn test_tpc_scheduler_threads_and_no_migration() {
             let start_thread = std::thread::current().id();
             thread_ids.lock().unwrap().insert(start_thread);
 
-            // Yield multiple times to check for task migration
+            // Yield multiple times to check for task migration.
+            // sqz_time, not tokio::time (rip-tokio-total): the TPC
+            // lanes carry no tokio driver any more — a tokio sleep
+            // inside a lane task panics "no reactor running", which is
+            // the removal WORKING; the timer that serves lane tasks is
+            // the sqz-timer thread.
             tokio::task::yield_now().await;
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            fuse3::sqz_time::sleep(Duration::from_millis(5)).await;
             tokio::task::yield_now().await;
 
             let end_thread = std::thread::current().id();

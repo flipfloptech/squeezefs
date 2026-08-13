@@ -1705,7 +1705,7 @@ mod handoff_venue_tests {
         handoff_spawn(async move {
             let _ = tx.send(fuse3::raw::on_tpc_lane_thread());
         });
-        let on_lane = tokio::time::timeout(Duration::from_secs(10), rx)
+        let on_lane = squeezefs_ipc::sqz_time::timeout(Duration::from_secs(10), rx)
             .await
             .expect("handoff future must run promptly")
             .expect("handoff future must complete");

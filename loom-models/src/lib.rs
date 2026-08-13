@@ -4556,10 +4556,13 @@ mod sqz_sync_models {
     //! made unrepresentable). Invariants:
     //! * **exclusion + no-lost-lock under a DEAD waiter (the wedge
     //!   rail)**: a queued waiter that is never polled again (its wake
-    //!   dropped on the floor) owns nothing and blocks nobody — after
-    //!   the holder releases, a fresh contender always acquires. The
+    //!   dropped on the floor) owns nothing and wedges nothing — after
+    //!   the holder releases, a fresh contender queues behind it (FIFO
+    //!   courtesy, the 2026-08-13 fairness fix) and its QUEUED
+    //!   re-contend (the TICK) barges past the corpse and acquires. The
     //!   tokio batch-semaphore protocol fails exactly this model: it
-    //!   assigns the released permit to the popped (dead) waiter.
+    //!   assigns the released permit to the popped (dead) waiter,
+    //!   unrecoverably.
     //! * **reader/writer exclusion**: a shared grant never observes a
     //!   live exclusive holder, across every interleaving of the
     //!   acquire with the release.
@@ -4600,17 +4603,25 @@ mod sqz_sync_models {
             let _dropped_wakers = core.release_exclusive();
             let t2_won = t2.join().unwrap();
 
-            let (fresh, _) = core.try_acquire(Want::Exclusive, None);
             if t2_won {
                 // T2 holds: exclusion, not a wedge.
+                let (fresh, _) = core.try_acquire(Want::Exclusive, None);
                 assert!(!fresh, "exclusion violated: two exclusive holders");
                 let _ = core.release_exclusive();
                 let (after, _) = core.try_acquire(Want::Exclusive, None);
                 assert!(after, "lock lost after t2's release");
             } else {
-                // T2 is a dead queued waiter: barging keeps the lock
-                // takeable — the tokio protocol wedges exactly here.
-                assert!(fresh, "dead waiter wedged the lock (OQ-5 class)");
+                // T2 is a dead queued waiter. FIFO courtesy: the fresh
+                // attempt queues behind the corpse rather than barging
+                // (the fairness law) …
+                let (fresh, _) = core.try_acquire(Want::Exclusive, None);
+                assert!(!fresh, "fresh attempt must queue behind a waiter");
+                let id = core.register(Want::Exclusive, None, &9u32);
+                // … and its QUEUED re-contend (the TICK backstop)
+                // barges past the corpse — one tick of latency, never
+                // a wedge. The tokio protocol wedges exactly here.
+                let (ticked, _) = core.try_acquire(Want::Exclusive, Some(id));
+                assert!(ticked, "dead waiter wedged the lock (OQ-5 class)");
             }
         });
     }

@@ -9317,7 +9317,7 @@ mod inbound_queue_tests {
         // before the shutdown fires. Not synchronization — the assertion
         // clock starts after it, and it only makes the test stricter: a
         // poll-based pull now provably sleeps out its interval.
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        crate::sqz_time::sleep(Duration::from_millis(20)).await;
         let t0 = Instant::now();
         // Exactly what FuseOverUring::shutdown does for the session path.
         active.store(false, Ordering::Release);

@@ -90,16 +90,29 @@ impl Drop for Acquire<'_> {
 }
 
 /// The ticked async acquire: race the acquire against [`TICK`]; on
-/// expiry the waiter unlinks (its `Drop`) and re-registers — the
-/// backstop that absorbs a lost wake.
+/// expiry the SAME waiter re-contends (its queue position — and so its
+/// FIFO fairness slot — survives the tick) — the backstop that absorbs
+/// a lost wake, since a queued waiter's re-contend barges
+/// unconditionally past a dead front waiter.
+///
+/// The bare `try_acquire` fast path keeps the uncontended acquire
+/// timer-free and allocation-free (no `Sleep` registration, no
+/// `Box::pin` — the ipc op-economy posture; the pre-fix shape minted a
+/// timer entry per lock op and `Sleep::new` showed up in the rw5a
+/// storm profile).
 async fn acquire_ticked(core: &Core, want: Want) {
+    let (granted, wake) = core.try_acquire(want, None);
+    wake_all(wake);
+    if granted {
+        return;
+    }
+    let mut attempt = Acquire {
+        core,
+        want,
+        id: None,
+    };
     loop {
-        let attempt = Acquire {
-            core,
-            want,
-            id: None,
-        };
-        match tokio::time::timeout(TICK, attempt).await {
+        match squeezefs_ipc::sqz_time::timeout(TICK, &mut attempt).await {
             Ok(()) => return,
             Err(_elapsed) => {
                 TICK_RECOVERIES.fetch_add(1, Ordering::Relaxed);
@@ -368,19 +381,81 @@ mod tests {
         assert!(dead.as_mut().poll(&mut cx).is_pending());
         std::mem::forget(dead); // the never-polled task
                                 // Holder releases: under the tokio protocol the lock would be
-                                // ASSIGNED to the dead waiter — wedged. Under barging it is
-                                // free: a fresh contender must win promptly.
+                                // ASSIGNED to the dead waiter — wedged forever. Under bounded
+                                // barging a fresh contender queues behind the dead waiter
+                                // (FIFO courtesy) and its TICK re-contend barges past it —
+                                // one tick of latency, never a wedge.
         drop(g);
-        let fresh = tokio::time::timeout(Duration::from_secs(1), l.write()).await;
+        let fresh =
+            squeezefs_ipc::sqz_time::timeout(TICK * 2 + Duration::from_secs(1), l.write()).await;
         assert!(
             fresh.is_ok(),
-            "a dead queued waiter must never wedge the lock (barging)"
+            "a dead queued waiter must never wedge the lock (tick-bounded barging)"
         );
+    }
+
+    /// Fairness under a 100 %-duty writer (the rw5a patch-storm shape,
+    /// 2026-08-13): a release→relock loop with no suspension between
+    /// `drop(guard)` and the next `lock()` (whose first poll runs
+    /// inline) must NOT starve queued waiters. `tokio::sync::Mutex` is
+    /// fair — release hands the permit to the FIFO front and the
+    /// releaser's next `lock()` queues behind it — and every call site
+    /// was written against that contract; the unbounded-barging Stage-1
+    /// core starved the rw5a reader cohort for 40 minutes
+    /// (TICK_RECOVERIES = 1351, storm task at 80 % CPU). The law: a
+    /// FRESH exclusive attempt queues behind existing waiters; only
+    /// QUEUED waiters barge (the dead-waiter tick rail).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn writer_storm_never_starves_a_waiter() {
+        let m = Arc::new(SqzMutex::new(0u64));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let storm = {
+            let m = m.clone();
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                while !stop.load(Ordering::Acquire) {
+                    let mut g = m.lock().await;
+                    *g += 1;
+                    // Yield INSIDE the guard (the patch storm's DMA
+                    // window) — the lock is held for the dominant share
+                    // of every iteration and freed only nanoseconds
+                    // before the inline reacquire.
+                    tokio::task::yield_now().await;
+                    drop(g);
+                }
+            })
+        };
+        // Four SPAWNED waiters (the reader cohort). Spawned matters:
+        // the release-wake lands in the storm worker's LIFO slot, so
+        // the waiter re-polls exactly while the storm sits in its
+        // yield — guard HELD — and the 2 s tick re-contend races a
+        // nanosecond free window. Pre-fix this loses essentially
+        // forever (the live rw5a capture: 40 min, 1351 ticks).
+        let mut waiters = Vec::new();
+        for _ in 0..4 {
+            let m = m.clone();
+            waiters.push(tokio::spawn(async move {
+                let _g = m.lock().await;
+            }));
+        }
+        for (i, w) in waiters.into_iter().enumerate() {
+            let won = squeezefs_ipc::sqz_time::timeout(TICK * 5, w).await;
+            assert!(
+                won.is_ok(),
+                "waiter {i} starved by the writer storm (unbounded barging)"
+            );
+        }
+        stop.store(true, Ordering::Release);
+        storm.await.expect("storm task");
     }
 
     /// Tick backstop: a waiter that outlives a tick re-registers and
     /// counts the recovery; it still acquires when the lock frees.
-    #[tokio::test(start_paused = true)]
+    /// Real-time since the rip-tokio-out sweep: the tick rides
+    /// `sqz_time` (our own timer thread — virtual `tokio::time::advance`
+    /// cannot drive it), so this test WAITS one real tick. ~2.2 s is the
+    /// price of testing the shipped backstop verbatim.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tick_backstop_reregisters_and_recovers() {
         let l = Arc::new(SqzRwLock::new(()));
         let g = l.write().await;
@@ -389,17 +464,16 @@ mod tests {
         let waiter = tokio::spawn(async move {
             let _g = l2.write().await;
         });
-        tokio::task::yield_now().await;
-        tokio::time::advance(TICK).await;
-        tokio::task::yield_now().await;
+        squeezefs_ipc::sqz_time::sleep(TICK + Duration::from_millis(200)).await;
         assert!(
             TICK_RECOVERIES.load(Ordering::Relaxed) > before,
             "a wait past the tick must count a recovery"
         );
         drop(g);
-        tokio::task::yield_now().await;
-        tokio::time::advance(TICK).await;
-        waiter.await.expect("waiter completes after release");
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("waiter completes after release")
+            .expect("waiter task");
     }
 
     /// Cancel safety: dropping a pending acquire unlinks its waiter —

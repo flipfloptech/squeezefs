@@ -234,7 +234,7 @@ where
     F: FnMut(Duration) -> Fut,
     Fut: std::future::Future<Output = Result<u64, SqueezefsError>>,
 {
-    let started = tokio::time::Instant::now();
+    let started = std::time::Instant::now();
     let mut attempt: u32 = 0;
     loop {
         let spent = started.elapsed();
@@ -281,7 +281,7 @@ where
                      {spent:?} of {budget:?} spent): backing off",
                     attempt + 1
                 );
-                tokio::time::sleep(lease_retry_backoff(attempt)).await;
+                squeezefs_ipc::sqz_time::sleep(lease_retry_backoff(attempt)).await;
                 attempt = attempt.saturating_add(1);
             }
             Err(other) => return Err(other),
@@ -416,7 +416,7 @@ impl KernelCacheTtls {
 // ===========================================================================
 // D1.b AWAIT-DISPOSITION AUDIT (design-metadata-throughput §5.1, PR M4)
 //
-// PR M4 retires the per-op `tokio::time::timeout(get_fuse_timeout(), …)`
+// PR M4 retires the per-op `squeezefs_ipc::sqz_time::timeout(get_fuse_timeout(), …)`
 // wrappers. Their replacement — the deadline watchdog below — only LOGS;
 // it never cancels. So every handler-reachable await that can block
 // indefinitely on device/ring/network needs an explicit disposition, and
@@ -1839,10 +1839,11 @@ pub fn wedge_census_line() -> String {
 pub fn spawn_op_watchdog() {
     static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     STARTED.get_or_init(|| {
-        tokio::spawn(async move {
+        // Sweep 2026-08-13: the D1.b watchdog must survive a broken
+        // scheduler — it IS the wedge instrument. sqz-meta venue.
+        crate::meta_exec::spawn_meta("op_watchdog", async move {
             let threshold = get_fuse_timeout();
-            let mut ticker = tokio::time::interval(OP_WATCHDOG_TICK);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut ticker = squeezefs_ipc::sqz_time::interval(OP_WATCHDOG_TICK);
             loop {
                 ticker.tick().await;
                 // Refresh the coarse clock FIRST so ops registering after
@@ -2814,7 +2815,8 @@ pub async fn await_overlay_inflight_on(
         if core.inflight_empty() {
             return;
         }
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), notified).await;
+        let _ =
+            squeezefs_ipc::sqz_time::timeout(std::time::Duration::from_millis(100), notified).await;
     }
 }
 
@@ -7469,7 +7471,24 @@ impl SqueezefsFilesystem {
         if self.is_open(ino) {
             return;
         }
+        self.ensure_reclaim_pool();
         self.reclaim_enqueue.enqueue(ino);
+    }
+
+    /// Spawn (or respawn) the inode-reclaim pool. The `reclaim_rx` slot
+    /// IS the spawn guard (taken = running); an idle worker parks the rx
+    /// back and exits — the 1c immortal-fs lesson (see
+    /// `ensure_fold_worker`): an fs-pinning loop on the process-lifetime
+    /// sqz-meta lanes must not outlive its mount's activity.
+    fn ensure_reclaim_pool(&self) {
+        let Some(reclaim_rx) = self.reclaim_rx.lock().unwrap().take() else {
+            return;
+        };
+        let self_clone = self.clone();
+        let reclaim_concurrency = self.reclaim_semaphore.available_permits();
+        crate::meta_exec::spawn_meta("inode_reclaim_pool", async move {
+            run_reclaim_worker_pool(reclaim_rx, self_clone, reclaim_concurrency).await;
+        });
     }
 
     pub fn disable_background_writeback(&self) {
@@ -11646,13 +11665,36 @@ impl SqueezefsFilesystem {
         let fs = self.clone();
         // RES-8: a panic in this LOOP ends extent folding for the life
         // of the mount — contained + counted.
+        //
+        // IDLE-EXIT-AND-RESPAWN (the 1c immortal-fs lesson, 2026-08-13):
+        // this loop holds a full `fs` clone while `fs` holds `fold_tx` —
+        // on the process-lifetime sqz-meta lanes that cycle made an
+        // abandoned filesystem IMMORTAL (its `active_leases` never
+        // released; the process-global DLM map then EIO'd every later
+        // in-process instance reusing those ino keys — the mmap-staleness
+        // conviction). An idle worker parks its rx back and exits (rx
+        // FIRST, flag second — the ensure/respawn race's ordering); every
+        // hint site calls `ensure_fold_worker` before `try_send`, so a
+        // buffered hint respawns the worker at the next crossing.
         crate::meta_exec::spawn_meta("extent_fold_worker", async move {
-            while let Some((ino, b)) = rx.recv().await {
-                if let Err(e) = fs.fold_extent_block(ino, b).await {
-                    warn!(
-                        "background fold of ino {ino} block {b} failed ({e:?}); extents \
-                         stay parked (fsync/pressure drains own the retry)"
-                    );
+            loop {
+                match squeezefs_ipc::sqz_time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                    .await
+                {
+                    Ok(Some((ino, b))) => {
+                        if let Err(e) = fs.fold_extent_block(ino, b).await {
+                            warn!(
+                                "background fold of ino {ino} block {b} failed ({e:?}); \
+                                 extents stay parked (fsync/pressure drains own the retry)"
+                            );
+                        }
+                    }
+                    Ok(None) => return,
+                    Err(_) => {
+                        *fs.fold_rx.lock().unwrap() = Some(rx);
+                        fs.fold_worker_started.store(false, Ordering::Release);
+                        return;
+                    }
                 }
             }
         });
@@ -13079,7 +13121,7 @@ impl SqueezefsFilesystem {
                              custody retries until it lands"
                         );
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(
+                    squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(
                         (10u64 << attempt.min(7)).min(1000),
                     ))
                     .await;
@@ -13166,7 +13208,7 @@ impl SqueezefsFilesystem {
                              custody retries until it lands"
                         );
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(
+                    squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(
                         (10u64 << attempt.min(7)).min(1000),
                     ))
                     .await;
@@ -13984,7 +14026,8 @@ impl SqueezefsFilesystem {
                 {
                     let stall = test_checkout_stall_cell().load(Ordering::Relaxed);
                     if stall > 0 {
-                        tokio::time::sleep(std::time::Duration::from_millis(stall)).await;
+                        squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(stall))
+                            .await;
                     }
                 }
 
@@ -14483,7 +14526,7 @@ impl SqueezefsFilesystem {
             let stall = test_upload_stall_cell().load(Ordering::Relaxed);
             if stall > 0 {
                 test_upload_stall_entries_cell().fetch_add(1, Ordering::Relaxed);
-                tokio::time::sleep(std::time::Duration::from_millis(stall)).await;
+                squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(stall)).await;
             }
 
             // The UNLOCKED device phase: crypto → allocate → DMA →
@@ -14583,7 +14626,8 @@ impl SqueezefsFilesystem {
                     {
                         let stall = test_inval_tail_stall_cell().load(Ordering::Relaxed);
                         if stall > 0 {
-                            tokio::time::sleep(std::time::Duration::from_millis(stall)).await;
+                            squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(stall))
+                                .await;
                         }
                     }
                     // The tail runs UNDER the still-held guard (the
@@ -16041,19 +16085,35 @@ impl SqueezefsFilesystem {
         // RES-8: a panic in this LOOP kills the R5 parked shed for the
         // life of the mount — the Red response would stop responding
         // with no record at all. Contained + counted.
-        tokio::spawn(crate::detached::contain(
-            "parked_drain_worker",
-            async move {
-                loop {
-                    fs.parked_drain_kick.notified().await;
-                    let target = fs.parked_drain_target.swap(u64::MAX, Ordering::Relaxed);
-                    if target == u64::MAX {
-                        continue;
-                    }
+        // IDLE-EXIT-AND-RESPAWN (the 1c immortal-fs lesson — see
+        // `ensure_fold_worker`): target-first each pass (a kick landing
+        // in the exit window leaves its sticky target; the re-ensure
+        // below or the next kick's ensure respawns and drains it).
+        crate::meta_exec::spawn_meta_contained("parked_drain_worker", async move {
+            loop {
+                let target = fs.parked_drain_target.swap(u64::MAX, Ordering::Relaxed);
+                if target != u64::MAX {
                     fs.drain_parked_toward(target).await;
+                    continue;
                 }
-            },
-        ));
+                if squeezefs_ipc::sqz_time::timeout(
+                    std::time::Duration::from_secs(2),
+                    fs.parked_drain_kick.notified(),
+                )
+                .await
+                .is_err()
+                {
+                    fs.parked_drain_worker_started
+                        .store(false, Ordering::Release);
+                    // A kick that raced the exit: respawn ourselves so
+                    // its sticky target is never stranded.
+                    if fs.parked_drain_target.load(Ordering::Relaxed) != u64::MAX {
+                        fs.ensure_parked_drain_worker();
+                    }
+                    return;
+                }
+            }
+        });
     }
 
     /// The parked-write BYTE gauge (W2 §5.2): full-repr backings + extent
@@ -16340,7 +16400,7 @@ impl SqueezefsFilesystem {
                     let progress = self.parked_drain_progress.notified();
                     tokio::select! {
                         _ = progress => {}
-                        _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                        _ = squeezefs_ipc::sqz_time::sleep(Duration::from_millis(25)) => {}
                     }
                 }
                 let still_over = Self::parked_gauge_bytes() > gate_bytes
@@ -17605,7 +17665,7 @@ impl SqueezefsFilesystem {
                 break;
             }
             let notify = self.router.cache.nvme.staged_drained_notify.clone();
-            let _ = tokio::time::timeout(remaining, notify.notified()).await;
+            let _ = squeezefs_ipc::sqz_time::timeout(remaining, notify.notified()).await;
         }
 
         // Async block-reclaim conservation (contract 3,
@@ -18294,14 +18354,7 @@ impl Filesystem for SqueezefsFilesystem {
 
         // Start background GC/reclaim worker pool
         if !reader_mount && !co_writer {
-            let mut reclaim_rx_guard = self.reclaim_rx.lock().unwrap();
-            if let Some(reclaim_rx) = reclaim_rx_guard.take() {
-                let self_clone = self.clone();
-                let reclaim_concurrency = self.reclaim_semaphore.available_permits();
-                crate::meta_exec::spawn_meta("inode_reclaim_pool", async move {
-                    run_reclaim_worker_pool(reclaim_rx, self_clone, reclaim_concurrency).await;
-                });
-            }
+            self.ensure_reclaim_pool();
         }
 
         // Desired INIT max_write = the volume BLOCK SIZE, floored at the
@@ -19460,7 +19513,7 @@ impl Filesystem for SqueezefsFilesystem {
                     .unwrap_or(0)
             });
             if stall > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(stall)).await;
+                squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(stall)).await;
             }
         }
 
@@ -19959,7 +20012,7 @@ impl Filesystem for SqueezefsFilesystem {
                 let stall = test_attr_publish_stall_cell().load(Ordering::Relaxed);
                 if stall > 0 {
                     test_attr_publish_stall_entries_cell().fetch_add(1, Ordering::Relaxed);
-                    tokio::time::sleep(std::time::Duration::from_millis(stall)).await;
+                    squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(stall)).await;
                 }
             }
             // Size/mtime publish — strictly AFTER the data landed (either
@@ -23408,15 +23461,24 @@ pub async fn start_mount<P: AsRef<Path>>(
     // per-volume `writer_claim` heartbeat and, on PR-capable namespaces,
     // runs the Reservation Report re-check (PTPL-lapse re-acquire /
     // foreign-holder fail-stop / host-identity stability).
-    let heartbeat_handle = {
+    // The D0 writer-guard heartbeat: guard-critical (a silently stopped
+    // heartbeat invites takeover) — sqz-meta venue. The stop latch
+    // replaces the retired JoinHandle::abort (sqz-exec tasks are never
+    // aborted mid-poll): checked BEFORE every beat so a post-unmount
+    // beat can never touch a released guard.
+    let heartbeat_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
         let fs = fs.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+        let stop = heartbeat_stop.clone();
+        crate::meta_exec::spawn_meta("writer_guard_heartbeat", async move {
+            let mut interval = squeezefs_ipc::sqz_time::interval(std::time::Duration::from_secs(
                 CLIENT_HEARTBEAT_INTERVAL_SECS,
             ));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
+                if stop.load(Ordering::Acquire) {
+                    return;
+                }
                 fs.refresh_client_registration().await;
                 if let Some(mb) = fs.meta_backend.as_ref() {
                     for vol in &mb.volumes {
@@ -23424,8 +23486,8 @@ pub async fn start_mount<P: AsRef<Path>>(
                     }
                 }
             }
-        })
-    };
+        });
+    }
 
     // PR 6 / N6 (design-nvmeof-target-management §6.9): the fabric_*
     // controller-state sampler. Rides the SAME cadence constant as the
@@ -23438,10 +23500,9 @@ pub async fn start_mount<P: AsRef<Path>>(
     // spawn_blocking to keep the runtime clean.
     let fabric_stats_handle = tokio::spawn(async move {
         let mut sampler = crate::nvmeof::fabric::FabricStatsSampler::default();
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+        let mut interval = squeezefs_ipc::sqz_time::interval(std::time::Duration::from_secs(
             CLIENT_HEARTBEAT_INTERVAL_SECS,
         ));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
             let controllers = tokio::task::spawn_blocking(|| {
@@ -23589,7 +23650,7 @@ pub async fn start_mount<P: AsRef<Path>>(
                     info!("IPC session host: mount st_dev resolved ({dev})");
                     return;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(100)).await;
             }
             error!(
                 "IPC session host: mount st_dev NEVER resolved — every bind will \
@@ -23622,7 +23683,7 @@ pub async fn start_mount<P: AsRef<Path>>(
                                         println!("[SIG] Second Ctrl+C, exiting...");
                                         break;
                                     }
-                                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {
+                                    _ = squeezefs_ipc::sqz_time::sleep(tokio::time::Duration::from_secs(5)) => {
                                         eprintln!("\nUnmount timeout elapsed. Resuming filesystem...");
                                     }
                                 }
@@ -23639,7 +23700,7 @@ pub async fn start_mount<P: AsRef<Path>>(
                                         println!("[SIG] Second SIGINT, exiting...");
                                         break;
                                     }
-                                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {
+                                    _ = squeezefs_ipc::sqz_time::sleep(tokio::time::Duration::from_secs(5)) => {
                                         eprintln!("\nUnmount timeout elapsed. Resuming filesystem...");
                                     }
                                 }
@@ -23656,7 +23717,7 @@ pub async fn start_mount<P: AsRef<Path>>(
                                 info!("Received second Ctrl+C, exiting...");
                                 break;
                             }
-                            _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {
+                            _ = squeezefs_ipc::sqz_time::sleep(tokio::time::Duration::from_secs(5)) => {
                                 eprintln!("\nUnmount timeout elapsed. Resuming filesystem...");
                             }
                         }
@@ -23673,7 +23734,7 @@ pub async fn start_mount<P: AsRef<Path>>(
                             info!("Received second Ctrl+C, exiting...");
                             break;
                         }
-                        _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {
+                        _ = squeezefs_ipc::sqz_time::sleep(tokio::time::Duration::from_secs(5)) => {
                             eprintln!("\nUnmount timeout elapsed. Resuming filesystem...");
                         }
                     }
@@ -23771,7 +23832,7 @@ pub async fn start_mount<P: AsRef<Path>>(
     }
 
     // Stop heartbeat + fabric sampler tasks
-    heartbeat_handle.abort();
+    heartbeat_stop.store(true, Ordering::Release);
     fabric_stats_handle.abort();
 
     // Tear down the interception session host (poisons nothing — live
@@ -23804,7 +23865,7 @@ pub async fn start_mount<P: AsRef<Path>>(
     // lingering to the 45 s staleness TTL. Bound: the teardown's own graceful
     // drain window plus flush margin — never an unbounded hang on exit.
     let teardown_wait = std::time::Duration::from_secs(fs.dismount_wait.saturating_add(60));
-    if tokio::time::timeout(teardown_wait, fs.wait_dismount_teardown())
+    if squeezefs_ipc::sqz_time::timeout(teardown_wait, fs.wait_dismount_teardown())
         .await
         .is_err()
     {
@@ -24062,7 +24123,7 @@ async fn requeue_or_hard_fail(
     }
     req.attempts += 1;
     let backoff_ms = 50u64.saturating_mul(1u64 << req.attempts.min(6));
-    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+    squeezefs_ipc::sqz_time::sleep(Duration::from_millis(backoff_ms)).await;
     // Wait for queue room WITHOUT a bare `send().await`: this task's own
     // sender clone keeps the channel open, so a full queue whose RECEIVER
     // already exited (dismount) would park the send forever and wedge
@@ -24085,7 +24146,7 @@ async fn requeue_or_hard_fail(
                     return;
                 }
                 unit = r;
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                squeezefs_ipc::sqz_time::sleep(Duration::from_millis(25)).await;
             }
         }
     }
@@ -24662,12 +24723,24 @@ pub async fn drain_reclaim_batch(
     window: std::time::Duration,
 ) -> Option<Vec<u64>> {
     let first = rx.recv().await?;
+    Some(gather_reclaim_batch(first, rx, cap, window).await)
+}
+
+/// The gather half of [`drain_reclaim_batch`] (split so the pool's
+/// idle-exit can bound ONLY the first recv — cancelling a mid-gather
+/// batch would leak its inos until the next mount).
+async fn gather_reclaim_batch(
+    first: u64,
+    rx: &mut tokio::sync::mpsc::Receiver<u64>,
+    cap: usize,
+    window: std::time::Duration,
+) -> Vec<u64> {
     let mut batch = vec![first];
     let mut channel_closed = false;
     if !window.is_zero() {
-        let deadline = tokio::time::Instant::now() + window;
+        let deadline = std::time::Instant::now() + window;
         while batch.len() < cap {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
+            match squeezefs_ipc::sqz_time::timeout_at(deadline, rx.recv()).await {
                 Ok(Some(ino)) => batch.push(ino),
                 Ok(None) => {
                     channel_closed = true;
@@ -24708,7 +24781,7 @@ pub async fn drain_reclaim_batch(
     batch.sort_unstable();
     batch.dedup();
     METRICS.meta_reclaim_gather_fill.record(batch.len());
-    Some(batch)
+    batch
 }
 
 async fn run_reclaim_worker_pool(
@@ -24716,6 +24789,9 @@ async fn run_reclaim_worker_pool(
     fs: SqueezefsFilesystem,
     concurrency: usize,
 ) {
+    // IDLE-EXIT wrapper is inside drain_reclaim_batch's gather (its recv
+    // rides the same timeout); the None arm below returns the rx to the
+    // slot on idle so `ensure_reclaim_pool` can respawn.
     // Group-commit batching (design §4.5): drain up to
     // SQUEEZEFS_INODE_RECLAIM_BATCH inos per unit of work — sequential
     // allocation clusters doomed inos in the same inode-table sectors, so a
@@ -24735,19 +24811,34 @@ async fn run_reclaim_worker_pool(
     let window = std::time::Duration::from_millis(window_ms);
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
     let fs_arc = std::sync::Arc::new(fs);
-    while let Some(batch) = drain_reclaim_batch(&mut rx, batch_cap, window).await {
+    loop {
+        // IDLE-EXIT-AND-RESPAWN (the 1c immortal-fs lesson — see
+        // `ensure_fold_worker`): 2 s of no reclaim traffic parks the rx
+        // back into the slot and exits; `queue_reclaim_inode` ensures a
+        // respawn before every enqueue. Only the FIRST recv is bounded —
+        // cancelling a mid-gather batch would leak its inos until the
+        // next mount.
+        let first =
+            match squeezefs_ipc::sqz_time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+            {
+                Ok(Some(first)) => first,
+                Ok(None) => return,
+                Err(_) => {
+                    *fs_arc.reclaim_rx.lock().unwrap() = Some(rx);
+                    return;
+                }
+            };
+        let batch = gather_reclaim_batch(first, &mut rx, batch_cap, window).await;
         let fs_clone = fs_arc.clone();
         let sem_clone = semaphore.clone();
         let permit = sem_clone.acquire_owned().await.unwrap();
         // RES-8: an orphan-reclaim batch that panics leaves its inos
         // in the in-flight set until the next mount — contained.
-        tokio::spawn(crate::detached::contain(
-            "reclaim_orphaned_batch",
-            async move {
-                let _permit = permit;
-                fs_clone.reclaim_orphaned_batch(batch).await;
-            },
-        ));
+        crate::meta_exec::spawn_meta_contained("reclaim_orphaned_batch", async move {
+            let _permit = permit;
+            fs_clone.reclaim_orphaned_batch(batch).await;
+        });
     }
 }
 
@@ -24792,7 +24883,7 @@ mod tests {
             requeue_or_hard_fail(&tx2, req, "transient upload failure".into()).await;
         });
         // Give the requeue a moment to hit the Full arm, then drain.
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        squeezefs_ipc::sqz_time::sleep(Duration::from_millis(400)).await;
         let _ = rx.recv().await; // frees the slot
         requeue.await.unwrap();
         // The request must still be queued (never lost, never sticky).

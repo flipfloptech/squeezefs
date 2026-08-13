@@ -3287,74 +3287,68 @@ impl BackendRouter {
         let weak = std::sync::Arc::downgrade(self);
         // RES-8: a panic in this LOOP ends backend health probing for
         // the life of the mount — contained + counted.
-        tokio::spawn(crate::detached::contain(
-            "backend_health_worker",
-            async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(5));
-                // Per-backend probe hysteresis: only FAILURE_THRESHOLD consecutive
-                // hard failures mark a backend unhealthy (a starved probe under
-                // saturation is inconclusive, never a flip — see crate::health).
-                let mut states: std::collections::HashMap<String, crate::health::HealthState> =
-                    std::collections::HashMap::new();
-                loop {
-                    interval.tick().await;
-                    let Some(router) = weak.upgrade() else {
-                        return; // router dropped: exit, leak nothing
-                    };
+        crate::meta_exec::spawn_meta_contained("backend_health_worker", async move {
+            let mut interval = squeezefs_ipc::sqz_time::interval(Duration::from_secs(5));
+            // Per-backend probe hysteresis: only FAILURE_THRESHOLD consecutive
+            // hard failures mark a backend unhealthy (a starved probe under
+            // saturation is inconclusive, never a flip — see crate::health).
+            let mut states: std::collections::HashMap<String, crate::health::HealthState> =
+                std::collections::HashMap::new();
+            loop {
+                interval.tick().await;
+                let Some(router) = weak.upgrade() else {
+                    return; // router dropped: exit, leak nothing
+                };
 
-                    // Probe the default slot under the legacy `backend_0` name
-                    // only on bare routers: on real mounts the first volume's
-                    // device IS the default slot and is probed under its real
-                    // name — a phantom probe would double-count it and leak the
-                    // reserved alias into health state and logs.
-                    let mut outcomes: Vec<(String, crate::health::Probe)> = Vec::new();
-                    if router.backends.is_empty() {
-                        outcomes.push((
-                            "backend_0".to_string(),
-                            perform_device_health_check(&router.default_device).await,
-                        ));
-                    }
-                    for entry in router.backends.iter() {
-                        outcomes.push((
-                            entry.key().clone(),
-                            perform_device_health_check(&entry.value().device).await,
-                        ));
-                    }
+                // Probe the default slot under the legacy `backend_0` name
+                // only on bare routers: on real mounts the first volume's
+                // device IS the default slot and is probed under its real
+                // name — a phantom probe would double-count it and leak the
+                // reserved alias into health state and logs.
+                let mut outcomes: Vec<(String, crate::health::Probe)> = Vec::new();
+                if router.backends.is_empty() {
+                    outcomes.push((
+                        "backend_0".to_string(),
+                        perform_device_health_check(&router.default_device).await,
+                    ));
+                }
+                for entry in router.backends.iter() {
+                    outcomes.push((
+                        entry.key().clone(),
+                        perform_device_health_check(&entry.value().device).await,
+                    ));
+                }
 
-                    for (be_id, probe) in outcomes {
-                        let state = states.entry(be_id.clone()).or_default();
-                        match state.observe(probe) {
-                            crate::health::Transition::WentUnhealthy => {
-                                log::error!(
+                for (be_id, probe) in outcomes {
+                    let state = states.entry(be_id.clone()).or_default();
+                    match state.observe(probe) {
+                        crate::health::Transition::WentUnhealthy => {
+                            log::error!(
                                 "Backend health check: backend '{}' is UNHEALTHY ({} consecutive probe failures)!",
                                 be_id,
                                 crate::health::HealthState::FAILURE_THRESHOLD
                             );
-                                router.unhealthy_backends.insert(be_id, true);
-                            }
-                            crate::health::Transition::Recovered => {
-                                log::info!(
-                                    "Backend health check: backend '{}' has recovered.",
-                                    be_id
-                                );
-                                router.unhealthy_backends.remove(&be_id);
-                            }
-                            crate::health::Transition::None => {}
+                            router.unhealthy_backends.insert(be_id, true);
                         }
+                        crate::health::Transition::Recovered => {
+                            log::info!("Backend health check: backend '{}' has recovered.", be_id);
+                            router.unhealthy_backends.remove(&be_id);
+                        }
+                        crate::health::Transition::None => {}
                     }
-
-                    // §5.9: republish the placement snapshot every tick — the
-                    // refresh cadence for fill drift, and the pickup point
-                    // for probe-driven health transitions. Failover IS the
-                    // republish: every write picks from this table
-                    // (`get_active_backend`), so an unhealthy/Draining volume
-                    // drops out of placement here — there is no sticky
-                    // active-backend pointer to repoint (deleted with the
-                    // KD-16 PlacementTable landing; it had no readers left).
-                    router.refresh_placement_table();
                 }
-            },
-        ));
+
+                // §5.9: republish the placement snapshot every tick — the
+                // refresh cadence for fill drift, and the pickup point
+                // for probe-driven health transitions. Failover IS the
+                // republish: every write picks from this table
+                // (`get_active_backend`), so an unhealthy/Draining volume
+                // drops out of placement here — there is no sticky
+                // active-backend pointer to repoint (deleted with the
+                // KD-16 PlacementTable landing; it had no readers left).
+                router.refresh_placement_table();
+            }
+        });
     }
 }
 
@@ -3373,7 +3367,9 @@ pub async fn perform_device_health_check(
     // never flip a healthy backend offline (hysteresis in crate::health).
     // `probe_read_block`, deliberately: a liveness probe is control-plane
     // and must never count in `get_obj` (the data churn detector).
-    match tokio::time::timeout(Duration::from_secs(2), dev.probe_read_block(0, 4096)).await {
+    match squeezefs_ipc::sqz_time::timeout(Duration::from_secs(2), dev.probe_read_block(0, 4096))
+        .await
+    {
         Ok(Ok(_)) => Probe::Ok,
         Ok(Err(e)) => {
             log::warn!(
@@ -6712,7 +6708,7 @@ impl DataRouter {
                     // Primary finished; loop to re-read caches.
                     continue;
                 }
-                match tokio::time::timeout(WAIT_SLICE, rx.recv()).await {
+                match squeezefs_ipc::sqz_time::timeout(WAIT_SLICE, rx.recv()).await {
                     Ok(Ok(Some(res))) => {
                         // R1a (§5.2): served from the cohort's carried fill —
                         // no tier probe stands between a waiter and its
@@ -6922,7 +6918,7 @@ impl DataRouter {
                         let stall = TEST_FILL_PRE_DEPOSIT_STALL_MS
                             .load(std::sync::atomic::Ordering::Relaxed);
                         if stall > 0 {
-                            tokio::time::sleep(Duration::from_millis(stall)).await;
+                            squeezefs_ipc::sqz_time::sleep(Duration::from_millis(stall)).await;
                         }
                         read_fill_phase_record(ReadFillPhase::Admission, adm_t0);
                         // read_fill_phase_ns `deposit`: the cache landing
@@ -7630,7 +7626,7 @@ impl DataRouter {
             // line is exactly what a loaded scheduler defers.
             let seam_ms = TEST_PREFETCH_TASK_DELAY_MS.load(std::sync::atomic::Ordering::Relaxed);
             if seam_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(seam_ms)).await;
+                squeezefs_ipc::sqz_time::sleep(Duration::from_millis(seam_ms)).await;
             }
             let lane = &lanes.lanes[lane_idx];
             let settle = |completed: bool| {
@@ -8662,7 +8658,7 @@ impl DataRouter {
             };
             if attempt >= BACKOFF_AFTER {
                 let shift = (attempt - BACKOFF_AFTER).min(3) as u32;
-                tokio::time::sleep(Duration::from_millis(1u64 << shift)).await;
+                squeezefs_ipc::sqz_time::sleep(Duration::from_millis(1u64 << shift)).await;
             }
             // VL8 item 7 escalation (FIND-RW5-A extension: EITHER loss
             // face): hold the block's stripe across one DIRECT fetch so no
@@ -8722,7 +8718,7 @@ impl DataRouter {
             // changed), which only holds when the recheck follows the read.
             let recheck_delay = TEST_BINDING_RECHECK_DELAY_MS.load(Ordering::Relaxed);
             if recheck_delay > 0 {
-                tokio::time::sleep(Duration::from_millis(recheck_delay)).await;
+                squeezefs_ipc::sqz_time::sleep(Duration::from_millis(recheck_delay)).await;
             }
             let bind_t0 = std::time::Instant::now();
             let current = self.current_block_binding(file_path, b).await?;
@@ -8809,7 +8805,8 @@ impl DataRouter {
             .fetch_add(1, Ordering::Relaxed);
         for attempt in 0..SETTLE_ATTEMPTS {
             if attempt > 0 {
-                tokio::time::sleep(Duration::from_millis(1u64 << (attempt - 1).min(3))).await;
+                squeezefs_ipc::sqz_time::sleep(Duration::from_millis(1u64 << (attempt - 1).min(3)))
+                    .await;
             }
             let _block_guard = crate::fuse_client::block_lock_acquire(
                 ino,
@@ -8862,7 +8859,7 @@ impl DataRouter {
             // what the starvation repro proves.
             let recheck_delay = TEST_BINDING_RECHECK_DELAY_MS.load(Ordering::Relaxed);
             if recheck_delay > 0 {
-                tokio::time::sleep(Duration::from_millis(recheck_delay)).await;
+                squeezefs_ipc::sqz_time::sleep(Duration::from_millis(recheck_delay)).await;
             }
             match self.fetch_block_device_true(&cur_key).await {
                 Ok((val, true)) => return Ok(Some(val)),
@@ -9088,7 +9085,8 @@ impl DataRouter {
             // absorbs the free-list-reuse incarnation storms first.
             if attempt >= 4 {
                 let shift = (attempt - 4).min(3) as u32;
-                tokio::time::sleep(std::time::Duration::from_millis(1u64 << shift)).await;
+                squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(1u64 << shift))
+                    .await;
             }
             let tracked = self.backend_router.key_incarnation_tracked(&cur_key);
             let before = self.backend_router.fill_incarnation(&cur_key);
@@ -10084,8 +10082,7 @@ impl DataRouter {
         handle.spawn(crate::detached::contain(
             "rewrite_epoch_sweeper",
             async move {
-                let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut tick = squeezefs_ipc::sqz_time::interval(std::time::Duration::from_secs(5));
                 loop {
                     tick.tick().await;
                     let Some(inner) = weak.upgrade() else { return };
@@ -10538,7 +10535,7 @@ impl DataRouter {
         // contract (`tests/publish_coalesce_tests.rs`) is deterministic.
         let delay = TEST_PUBLISH_PASS_DELAY_MS.load(std::sync::atomic::Ordering::Relaxed);
         if delay > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(delay)).await;
         }
         let t_lock = std::time::Instant::now();
         let _map_guard = meta_lock_acquire(ino).await;
@@ -12636,7 +12633,8 @@ impl DataRouter {
                         if attempts <= 4 {
                             tokio::task::yield_now().await;
                         } else {
-                            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                            squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(2))
+                                .await;
                         }
                         continue;
                     }

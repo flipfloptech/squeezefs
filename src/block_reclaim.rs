@@ -398,7 +398,7 @@ impl DebtDrainer {
                     if defer_tick {
                         // Deferred under foreground: coarse re-evaluation
                         // tick (the reclaim worker's manners loop pattern).
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(50)).await;
                     }
                 }
             }
@@ -738,7 +738,7 @@ impl ReclaimQueue {
                     break;
                 }
                 // 5 ms tick — the admit-park liveness pattern.
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(5)).await;
             }
         }
         METRICS
@@ -808,7 +808,8 @@ impl ReclaimQueue {
                 // batch coalesce adjacent ranges into fewer device
                 // commands. (Arc NOT held across the sleep.)
                 if batch_ms > 0 {
-                    tokio::time::sleep(std::time::Duration::from_millis(batch_ms)).await;
+                    squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(batch_ms))
+                        .await;
                 }
                 loop {
                     let Some(q) = weak.upgrade() else { return };
@@ -829,7 +830,7 @@ impl ReclaimQueue {
                         // the Arc across the sleep — the health-worker
                         // sentinel discipline).
                         drop(q);
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(50)).await;
                         continue;
                     }
                     // Demand-derived take: up to one full fan-out's

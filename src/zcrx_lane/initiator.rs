@@ -602,7 +602,7 @@ impl LaneSession {
             if std::time::Instant::now() > deadline {
                 return Err(io_err("controller never reached CSTS.RDY (10 s)".into()));
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(20)).await;
         }
 
         let poisoned = Arc::new(AtomicBool::new(false));
@@ -1341,7 +1341,7 @@ impl LaneSession {
             return Err(io_err("lane command sink gone".into()));
         }
 
-        match tokio::time::timeout(LANE_READ_TIMEOUT, rx).await {
+        match squeezefs_ipc::sqz_time::timeout(LANE_READ_TIMEOUT, rx).await {
             Ok(Ok(Ok(fill))) => {
                 // The gather law (design §4.4): ONE pass from refcounted
                 // area chunks into the destination; dropping the fill
@@ -1412,7 +1412,7 @@ impl LaneSession {
             return Err(io_err("lane writer task gone".into()));
         }
 
-        match tokio::time::timeout(LANE_READ_TIMEOUT, rx).await {
+        match squeezefs_ipc::sqz_time::timeout(LANE_READ_TIMEOUT, rx).await {
             Ok(Ok(r)) => r,
             Ok(Err(_)) => Err(io_err("lane completion channel dropped".into())),
             Err(_) => {

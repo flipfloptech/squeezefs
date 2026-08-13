@@ -38,6 +38,7 @@ pub mod ring_core;
 pub mod sizing;
 pub mod slot_core;
 pub mod sqz_exec;
+pub mod sqz_time;
 pub mod wire;
 
 // Production source-sharing of the shipped L3 wake-coalescing protocol

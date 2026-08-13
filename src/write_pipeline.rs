@@ -555,11 +555,11 @@ impl WritePipeline {
             // registration order above closes. Never set in production.
             let stall_us = TEST_PREPARK_STALL_US.load(Ordering::Relaxed);
             if stall_us > 0 {
-                tokio::time::sleep(Duration::from_micros(stall_us)).await;
+                squeezefs_ipc::sqz_time::sleep(Duration::from_micros(stall_us)).await;
             }
             tokio::select! {
                 _ = park => {}
-                _ = tokio::time::sleep(ADMIT_TICK) => {
+                _ = squeezefs_ipc::sqz_time::sleep(ADMIT_TICK) => {
                     self.admission_tick_wakes.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -570,7 +570,7 @@ impl WritePipeline {
     /// tests). `false` = the deadline elapsed with custody still in
     /// flight.
     pub async fn quiesce(&self, timeout: Duration) -> bool {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = std::time::Instant::now() + timeout;
         loop {
             // Same PERF-13 registration order as `admit`: enroll first,
             // then read the gauge, so a completion cannot slip between.
@@ -580,12 +580,12 @@ impl WritePipeline {
             if self.core.inflight_blocks() == 0 {
                 return true;
             }
-            if tokio::time::Instant::now() >= deadline {
+            if std::time::Instant::now() >= deadline {
                 return false;
             }
             tokio::select! {
                 _ = park => {}
-                _ = tokio::time::sleep(ADMIT_TICK) => {}
+                _ = squeezefs_ipc::sqz_time::sleep(ADMIT_TICK) => {}
             }
         }
     }

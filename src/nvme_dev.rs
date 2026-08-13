@@ -2295,27 +2295,29 @@ impl NvmeBlockDev {
         // Never wait unbounded on the uring worker (wedged device/worker must not
         // freeze the entire FUSE session including virtual .config reads).
         let timeout_ms = read_timeout_ms_cell().load(std::sync::atomic::Ordering::Relaxed);
-        let res =
-            match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), rx_oneshot)
-                .await
-            {
-                Ok(Ok(r)) => r?,
-                Ok(Err(e)) => {
-                    return Err(crate::error::SqueezefsError::InvalidOperation(format!(
-                        "Worker thread closed receiver: {:?}",
-                        e
-                    )));
-                }
-                Err(_) => {
-                    return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!(
-                            "NvmeBlockDev read timed out after {} ms (offset={}, size={})",
-                            timeout_ms, offset, size
-                        ),
-                    )));
-                }
-            };
+        let res = match squeezefs_ipc::sqz_time::timeout(
+            std::time::Duration::from_millis(timeout_ms),
+            rx_oneshot,
+        )
+        .await
+        {
+            Ok(Ok(r)) => r?,
+            Ok(Err(e)) => {
+                return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                    "Worker thread closed receiver: {:?}",
+                    e
+                )));
+            }
+            Err(_) => {
+                return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "NvmeBlockDev read timed out after {} ms (offset={}, size={})",
+                        timeout_ms, offset, size
+                    ),
+                )));
+            }
+        };
 
         if count_in_get_obj {
             crate::fuse_client::METRICS

@@ -1019,8 +1019,7 @@ async fn times_drain_task(
     interval_ms: u64,
 ) {
     let period = std::time::Duration::from_millis(interval_ms);
-    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut ticker = squeezefs_ipc::sqz_time::interval(period);
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
@@ -1059,8 +1058,7 @@ async fn checkpoint_task(
     // wake): §4.6 pt 1 threshold wakes must never starve the cadence's
     // barriers/checkpoints under a sustained storm.
     let period = std::time::Duration::from_millis(interval_ms);
-    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut ticker = squeezefs_ipc::sqz_time::interval(period);
     loop {
         let cadence = tokio::select! {
             _ = ticker.tick() => true,

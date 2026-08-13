@@ -41,9 +41,31 @@ THE two properties that make the wedge class unrepresentable:
    `lock_ticked_reregisters` stat) counts engagements: 0 on healthy
    schedules; growth = a lost wake was absorbed, loudly.
 
-Fairness: FIFO wake order bounds barging in practice (the woken waiter
-is the first to re-poll in the common case); the tick bounds the
-pathological case. Cancel-safety: the acquire future's `Drop` unlinks
+Fairness (**AMENDED 2026-08-13 — the rw5a writer-storm starvation**):
+FIFO-wake-order-bounds-barging-in-practice was FALSIFIED by the batched
+gate: `reader_cohort_survives_perpetual_patch_storm` wedged 40 minutes
+with `TICK_RECOVERIES = 1351` and the storm task at 80 % CPU. A
+release→relock loop's next `lock()` first-poll runs INLINE, nanoseconds
+after `drop(guard)`, so the woken FIFO front — whose poll latency is
+µs-class — lost every race, and each 2 s tick re-contend raced the same
+nanosecond free window. `tokio::sync::Mutex` is fair (release hands the
+permit to the FIFO front; the releaser's next `lock()` queues behind),
+and every call site was written against that contract. The law is now
+**bounded barging**: a FRESH attempt takes a free lock only when no one
+is queued (exclusive yields to any waiter; shared additionally yields
+to a queued writer — write preference, unchanged), while a QUEUED
+waiter's re-contend still barges unconditionally. That preserves the
+OQ-5 rail in tick-bounded form: a dead front waiter costs contenders
+one TICK (its corpse is unlinked by no one, but the queued re-contend
+passes it), never a wedge. `acquire_ticked` keeps the SAME waiter
+across ticks (queue position = fairness slot survives the tick) and
+takes a bare `try_acquire` fast path first, so the uncontended acquire
+mints no timer entry and no allocation (the pre-fix shape registered a
+`sqz_time` Sleep per lock op — visible in the storm profile). Pinned:
+`writer_storm_never_starves_a_waiter` (red pre-fix: deterministic 10 s
+starvation), the reshaped loom wedge rail (fresh-queues → ticked-barge),
+and the dead-waiter test's tick-bounded deadline.
+Cancel-safety: the acquire future's `Drop` unlinks
 its waiter (nothing is ever reserved for it, so cancellation leaks
 nothing). Guards: lifetime (`lock/read/write/try_*`) + `Arc`-owned
 (`read_owned/write_owned`) — the exact surface the plane's census uses.
@@ -273,6 +295,30 @@ onto it, panic-contained (RES-8):
 Still tokio-hosted (Stage 2/3 scope, none plane-critical): mount-time
 init/teardown tasks, health/stats pollers, job fabric + wire, R5 shed
 workers, dehydration workers, supervisor.
+
+## The rip-tokio-out sweep (2026-08-13, user ruling: go big, batch gates)
+
+* **`sqz_time`** (`crates/squeezefs-ipc/src/sqz_time.rs`, `#[path]`-
+  shared into fuse3): first-party `sleep`/`sleep_until`/`timeout`/
+  `timeout_at`/`interval` over one `sqz-timer` OS thread (heap +
+  condvar; cancel-safe tombstones). No tokio driver anywhere in a
+  plane wait — the `sqz_sync` TICK, the write/reclaim backoffs, the
+  guard heartbeat cadence, the watchdog tick, fuse3's transport
+  sleeps all ride it. (`tokio::time::pause/advance` tests of swept
+  code became real-time tests.)
+* **Venue sweep**: every plane/custody/guard/diagnostic loop now on
+  sqz-meta — added this pass: the D1.b op watchdog (the wedge
+  instrument must survive a broken scheduler), the D0 writer-guard
+  heartbeat (JoinHandle::abort → a stop latch checked BEFORE each
+  beat, so a post-unmount beat can never touch a released guard), the
+  R5 parked-shed worker, the backend health worker, the staging merge
+  worker, the orphan-reclaim batches.
+* **Deliberately still tokio** (none plane-critical): the CLI
+  bootstrap runtime, job fabric + remote wire + cluster/membership
+  wire (tokio net/TLS — Stage 3), mount init/teardown join fan-outs,
+  the fabric sampler, and `tokio::sync` channel/notify primitives
+  everywhere (driver-free: their wakers deliver through whatever
+  first-party executor polls the task).
 
 ## Acceptance
 

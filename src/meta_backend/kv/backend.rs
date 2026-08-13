@@ -3645,7 +3645,7 @@ impl KvMetaBackend {
             match Self::acquire_writer_flock(path) {
                 Ok(fd) => return Some(fd),
                 Err(FlockOutcome::Held) if std::time::Instant::now() < deadline => {
-                    tokio::time::sleep(POLL).await;
+                    squeezefs_ipc::sqz_time::sleep(POLL).await;
                 }
                 Err(_) => return None,
             }
@@ -5216,7 +5216,7 @@ impl KvMetaBackend {
         {
             let stall = TEST_COMMIT_ADMITTED_STALL_MS.load(Ordering::Relaxed);
             if stall > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(stall)).await;
+                squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(stall)).await;
             }
         }
 
@@ -5632,7 +5632,7 @@ impl KvMetaBackend {
             // Dropping `notified` on tick expiry only unregisters this
             // waiter; the re-registration + try_admit recheck at the
             // loop top preserves the register-recheck-await shape.
-            let _ = tokio::time::timeout(until_crossing, notified).await;
+            let _ = squeezefs_ipc::sqz_time::timeout(until_crossing, notified).await;
             if since.elapsed() >= threshold {
                 log::error!(
                     "meta volume {}: conveyor pass parked {} ms (≥ {} ms) waiting for \
@@ -6965,7 +6965,7 @@ impl KvMetaBackend {
             // deterministically (`TEST_LAYOUT_MERGE_HOLD_MS`).
             let hold = TEST_LAYOUT_MERGE_HOLD_MS.load(Ordering::Relaxed);
             if hold > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(hold)).await;
+                squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(hold)).await;
             }
             let Some(be) = weak.upgrade() else {
                 // Backend dropped without shutdown: queued entries are

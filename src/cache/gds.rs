@@ -335,7 +335,7 @@ impl GdsCache {
                 "Orchestrating GPU Direct Storage RDMA transfer for {} (offset {}, size {}) directly to VRAM address 0x{:X} (Simulated)",
                 object_key, offset, size, vram_address
             );
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(5)).await;
             Ok(())
         }
     }

@@ -928,7 +928,7 @@ impl LocalLockManager {
 
         let key = ObjectKey::from_path(file_path);
         let notify = LOCK_WAITERS.get_inode_lock(key.stripe_seed());
-        let deadline = tokio::time::Instant::now() + ttl;
+        let deadline = std::time::Instant::now() + ttl;
 
         loop {
             let notified = notify.notified();
@@ -998,7 +998,10 @@ impl LocalLockManager {
                 });
             }
 
-            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            if squeezefs_ipc::sqz_time::timeout_at(deadline, notified)
+                .await
+                .is_err()
+            {
                 return Err(crate::error::SqueezefsError::LockFailed {
                     reason: format!(
                         "lock {key:?} span {range:?} mode {mode:?} still held after {ttl:?} \

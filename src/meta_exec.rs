@@ -85,6 +85,16 @@ static META_EXEC: once_cell::sync::Lazy<MetaExec> = once_cell::sync::Lazy::new(|
 /// Spawn a metadata-plane detached task onto the sqz-meta pool,
 /// panic-contained and counted (`detached_task_panics` — RES-8: a
 /// panic here is a bug and the record of lost work; the lane survives).
+/// [`spawn_meta`] under the `contain(site, fut)` call shape the swapped
+/// `tokio::spawn(contain(..))` sites used — same behavior (spawn_meta
+/// already contains).
+pub fn spawn_meta_contained<F>(site: &'static str, fut: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    spawn_meta(site, fut);
+}
+
 pub fn spawn_meta<F>(site: &'static str, fut: F)
 where
     F: Future<Output = ()> + Send + 'static,

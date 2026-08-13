@@ -413,7 +413,7 @@ impl MountHandleInner {
                     let mut success = false;
                     for attempt in 0..10 {
                         if attempt > 0 {
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            crate::sqz_time::sleep(std::time::Duration::from_millis(100)).await;
                         }
                         let mut child = Command::new(&binary_path)
                             .args([OsStr::new("-u"), self.mount_path.as_os_str()])
@@ -434,7 +434,7 @@ impl MountHandleInner {
                 let mut success = false;
                 for attempt in 0..10 {
                     if attempt > 0 {
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        crate::sqz_time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                     let mp = mount_path.clone();
                     let res = task::spawn_blocking(move || mount::umount(&mp))

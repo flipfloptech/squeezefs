@@ -1416,11 +1416,14 @@ impl NvmeStaging {
             // backend blocks so the pool drains, then wait (bounded) for the
             // merge worker to credit freed space. Never a fixed futile stall.
             self.kick_promotion(file_id, 64).await;
-            let deadline = tokio::time::Instant::now() + Duration::from_millis(2000);
+            let deadline = std::time::Instant::now() + Duration::from_millis(2000);
             loop {
                 let notified = self.space_freed_notify.notified();
                 tokio::pin!(notified);
-                if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                if squeezefs_ipc::sqz_time::timeout_at(deadline, notified)
+                    .await
+                    .is_err()
+                {
                     break;
                 }
                 total_staged_bytes = self
@@ -2090,7 +2093,9 @@ impl NvmeStaging {
         let gauge = self.current_staged_write_bytes.clone();
         let high_water = self.max_write_bytes - self.max_write_bytes / 4;
 
-        tokio::spawn(async move {
+        // Sweep 2026-08-13: the staging merge LOOP is write-custody-
+        // critical — sqz-meta venue.
+        crate::meta_exec::spawn_meta("staging_merge_worker", async move {
             let mut batch: Vec<PendingStagedWrite> = Vec::new();
             let mut current_bytes = 0u64;
             let max_batch_bytes = 4 * 1024 * 1024;

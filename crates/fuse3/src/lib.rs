@@ -105,6 +105,10 @@ pub mod path;
 pub mod raw;
 #[path = "../../squeezefs-ipc/src/sqz_exec.rs"]
 pub mod sqz_exec;
+// First-party timer service (the rip-tokio-out sweep, 2026-08-13) —
+// same share pattern; `sleep`/`timeout` here never touch a tokio driver.
+#[path = "../../squeezefs-ipc/src/sqz_time.rs"]
+pub mod sqz_time;
 
 /// Filesystem Inode.
 pub type Inode = u64;

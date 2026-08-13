@@ -5,12 +5,19 @@
 //! the main build never sets `cfg(loom)`).
 //!
 //! THE design property (what makes the OQ-5 wedge class unrepresentable):
-//! **barging** — release never assigns ownership to a queued waiter; it
-//! flips the lock free and returns the front wakers (all leading shared,
-//! or one exclusive) for the caller to wake. Woken waiters re-contend on
-//! poll, so a waiter whose wake is lost (or whose task is never polled
-//! again) owns nothing and blocks nobody. The queue orders WAKES, never
-//! eligibility.
+//! **bounded barging** — release never assigns ownership to a queued
+//! waiter; it flips the lock free and returns the front wakers (all
+//! leading shared, or one exclusive) for the caller to wake. Woken
+//! waiters re-contend on poll, so a waiter whose wake is lost (or whose
+//! task is never polled again) owns nothing and blocks nobody. The
+//! bound (fairness fix, 2026-08-13): only QUEUED waiters barge — a
+//! FRESH attempt takes a free lock only when no one is queued (FIFO
+//! courtesy, the tokio fairness contract every call site was written
+//! against; without it a 100 %-duty release→relock writer reacquires
+//! inline nanoseconds after release and starves the woken FIFO front
+//! forever — the rw5a patch-storm capture). A dead front waiter
+//! therefore costs contenders at most one TICK re-contend, never a
+//! wedge.
 //!
 //! Generic over the waker type `W` (the shipped face uses
 //! `std::task::Waker`; the loom models use a recording token) — the core
@@ -69,11 +76,12 @@ impl<W: Clone> LockCore<W> {
     /// caller wakes AFTER its own lock ceremony (a granted shared acquire
     /// lets contiguous leading shared waiters through with it).
     ///
-    /// FIFO courtesy: a FRESH shared attempt (`my_id == None`) does not
-    /// barge past a queued exclusive waiter (write preference, the tokio
-    /// posture the call sites were written against); a QUEUED waiter
-    /// re-contends unconditionally — barging keeps the lock takeable when
-    /// a woken waiter is dead.
+    /// FIFO courtesy: a FRESH attempt (`my_id == None`) does not barge —
+    /// shared yields to any queued exclusive waiter (write preference)
+    /// and exclusive yields to ANY queued waiter (fairness, the tokio
+    /// posture the call sites were written against). A QUEUED waiter
+    /// re-contends unconditionally — barging among waiters keeps the
+    /// lock takeable when a woken waiter is dead.
     pub fn try_acquire(&self, want: Want, my_id: Option<u64>) -> (bool, Vec<W>) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let at_front = match my_id {
@@ -95,9 +103,17 @@ impl<W: Clone> LockCore<W> {
                 }
             }
             Want::Exclusive => {
-                if !st.writer && st.readers == 0 {
-                    // Exclusive takes the lock whenever it is free; the
-                    // queue orders wakes, not eligibility (barging).
+                // FIFO courtesy (fairness fix, 2026-08-13 — the rw5a
+                // writer-storm starvation): a FRESH exclusive attempt
+                // queues behind existing waiters, mirroring
+                // tokio::sync::Mutex fairness (release→relock loops
+                // reacquired inline nanoseconds after the release and
+                // starved the woken FIFO front forever). A QUEUED
+                // waiter still re-contends unconditionally — barging
+                // among waiters is the dead-waiter tick rail: a dead
+                // front waiter costs contenders one TICK, never a
+                // wedge.
+                if !st.writer && st.readers == 0 && (my_id.is_some() || at_front) {
                     st.writer = true;
                     if let Some(id) = my_id {
                         st.queue.retain(|w| w.id != id);

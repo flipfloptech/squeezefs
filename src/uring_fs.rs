@@ -28,13 +28,13 @@
 
 use crate::error::{Result, SqueezefsError};
 use once_cell::sync::Lazy;
+use squeezefs_ipc::sqz_channel::oneshot;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use tokio::sync::oneshot;
 
 /// Per-worker request-queue bound — backpressure, not custody (the P1-6
 /// class: small request structs; payload bytes live with the caller
@@ -367,7 +367,7 @@ struct FaultState {
 
 /// Operations parked by a stall, plus the arrival tap a test awaits.
 struct HeldOps {
-    arrived: tokio::sync::mpsc::UnboundedSender<()>,
+    arrived: squeezefs_ipc::sqz_channel::mpsc::UnboundedSender<()>,
     held: Vec<HeldOp>,
 }
 
@@ -444,8 +444,10 @@ pub fn arm_barrier_error(path: impl AsRef<Path>, raw_os_error: i32) {
 ///
 /// Returns an arrival receiver — awaiting it proves a barrier really
 /// reached the stall, so a test never races the window open.
-pub fn arm_barrier_stall(path: impl AsRef<Path>) -> tokio::sync::mpsc::UnboundedReceiver<()> {
-    let (arrived_tx, arrived_rx) = tokio::sync::mpsc::unbounded_channel();
+pub fn arm_barrier_stall(
+    path: impl AsRef<Path>,
+) -> squeezefs_ipc::sqz_channel::mpsc::UnboundedReceiver<()> {
+    let (arrived_tx, arrived_rx) = squeezefs_ipc::sqz_channel::mpsc::unbounded_channel();
     let mut st = FAULT_STATE.lock().unwrap();
     st.barrier_stalls.insert(
         path.as_ref().to_path_buf(),
@@ -494,8 +496,8 @@ pub fn arm_write_stall(
     path: impl AsRef<Path>,
     offset: u64,
     len: u64,
-) -> tokio::sync::mpsc::UnboundedReceiver<()> {
-    let (arrived_tx, arrived_rx) = tokio::sync::mpsc::unbounded_channel();
+) -> squeezefs_ipc::sqz_channel::mpsc::UnboundedReceiver<()> {
+    let (arrived_tx, arrived_rx) = squeezefs_ipc::sqz_channel::mpsc::unbounded_channel();
     let mut st = FAULT_STATE.lock().unwrap();
     st.write_stalls.insert(
         path.as_ref().to_path_buf(),

@@ -105,7 +105,7 @@ fn free_forensics_tape_is_a_bounded_ring() {
 /// the common case: no runtime is even required.
 #[test]
 fn reclaim_enqueue_is_task_free_when_the_queue_has_room() {
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<u64>(1024);
+    let (tx, mut rx) = squeezefs_ipc::sqz_channel::mpsc::channel::<u64>(1024);
     let q = squeezefs::fuse_client::ReclaimEnqueue::new(tx);
     // No tokio runtime in scope: a spawning implementation panics here.
     for ino in 2..1000u64 {
@@ -130,7 +130,7 @@ fn reclaim_enqueue_is_task_free_when_the_queue_has_room() {
 /// it parks on ONE shared drainer, not one task per FORGET.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reclaim_enqueue_overflows_onto_one_shared_drainer() {
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<u64>(4);
+    let (tx, mut rx) = squeezefs_ipc::sqz_channel::mpsc::channel::<u64>(4);
     let q = squeezefs::fuse_client::ReclaimEnqueue::new(tx);
     for ino in 2..64u64 {
         q.enqueue(ino);
@@ -180,18 +180,19 @@ async fn blocking_drop_hops_to_the_blocking_pool_inside_a_runtime() {
 
     let done = Arc::new(AtomicBool::new(false));
     let handle = squeezefs::detached::drop_off_runtime(JoinsOnDrop { done: done.clone() });
-    let handle = handle.expect("inside a runtime the drop must be handed off");
-    handle.await.expect("the blocking drop completes");
+    let handle = handle.expect("the drop is always handed to the blocking pool");
+    handle.await;
     assert!(
         done.load(Ordering::SeqCst),
         "the value was actually dropped"
     );
 }
 
-/// RES-12: outside a runtime the same helper drops inline — offline verbs
-/// and `Drop` backstops must not require a reactor.
+/// RES-12: the helper needs no ambient runtime — offline verbs and
+/// `Drop` backstops hand the drop to the sqz blocking pool (no reactor
+/// required) and can block on the completion future directly.
 #[test]
-fn blocking_drop_is_inline_without_a_runtime() {
+fn blocking_drop_needs_no_runtime() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
@@ -202,13 +203,11 @@ fn blocking_drop_is_inline_without_a_runtime() {
         }
     }
     let flag = Arc::new(AtomicBool::new(false));
-    let none = squeezefs::detached::drop_off_runtime(Marks(flag.clone()));
-    assert!(
-        none.is_none(),
-        "no runtime ⇒ no handoff (the value dropped inline)"
-    );
+    let fut = squeezefs::detached::drop_off_runtime(Marks(flag.clone()))
+        .expect("the drop is always handed to the blocking pool");
+    squeezefs_ipc::sqz_blocking::block_on(fut);
     assert!(
         flag.load(Ordering::SeqCst),
-        "the value dropped synchronously"
+        "the value was dropped by the blocking pool"
     );
 }

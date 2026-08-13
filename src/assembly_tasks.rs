@@ -349,16 +349,14 @@ impl Drop for MintedBlockGuard {
         let alloc = Arc::clone(&self.alloc);
         let offset = self.offset;
         // Detached by design (documented rationale): `Drop` cannot
-        // await and `free_block` is async. Bounded single free; on a
-        // shutting-down runtime the spawn is a no-op and the remount
-        // allocator rebuild reclaims the offset.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                log::debug!(
-                    "mint guard: freeing unsurfaced block offset {offset} (task errored or aborted)"
-                );
-                let _ = alloc.free_block(offset).await;
-            });
-        }
+        // await and `free_block` is async. Bounded single free on the
+        // sqz-meta pool (no ambient runtime needed; at process teardown
+        // the remount allocator rebuild reclaims the offset regardless).
+        crate::meta_exec::spawn_meta("mint_guard_free", async move {
+            log::debug!(
+                "mint guard: freeing unsurfaced block offset {offset} (task errored or aborted)"
+            );
+            let _ = alloc.free_block(offset).await;
+        });
     }
 }

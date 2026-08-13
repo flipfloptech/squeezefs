@@ -6717,9 +6717,10 @@ pub struct SqueezefsFilesystem {
     writeback_error_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub dismount_wait: u64,
     /// Bounded writeback queue (P1-2). Full → synchronous flush of that block.
-    writeback_tx: tokio::sync::mpsc::Sender<WritebackRequest>,
-    writeback_rx:
-        std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<WritebackRequest>>>>,
+    writeback_tx: squeezefs_ipc::sqz_channel::mpsc::Sender<WritebackRequest>,
+    writeback_rx: std::sync::Arc<
+        std::sync::Mutex<Option<squeezefs_ipc::sqz_channel::mpsc::Receiver<WritebackRequest>>>,
+    >,
     pub writeback_queue_cap: usize,
     pub client_id: std::sync::Arc<std::sync::Mutex<String>>,
     pub mountpoint: std::sync::Arc<std::sync::Mutex<String>>,
@@ -6756,8 +6757,8 @@ pub struct SqueezefsFilesystem {
     /// [`Self::drain_parked_toward`]; waiters (gated writers) wake on
     /// `progress` after every inode flush.
     parked_drain_target: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    parked_drain_kick: std::sync::Arc<tokio::sync::Notify>,
-    parked_drain_progress: std::sync::Arc<tokio::sync::Notify>,
+    parked_drain_kick: std::sync::Arc<squeezefs_ipc::sqz_notify::Notify>,
+    parked_drain_progress: std::sync::Arc<squeezefs_ipc::sqz_notify::Notify>,
     parked_drain_worker_started: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// W2 background fold plumbing (design-random-small-writes §5.2 fold
     /// triggers): extent overlays crossing the count/byte thresholds post
@@ -6765,8 +6766,10 @@ pub struct SqueezefsFilesystem {
     /// [`Self::fold_extent_block`]. Bounded + best-effort: a full queue
     /// drops the HINT only — the extents stay parked custody and the
     /// fsync/pressure/teardown drains fold them regardless.
-    fold_tx: tokio::sync::mpsc::Sender<(u64, u32)>,
-    fold_rx: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<(u64, u32)>>>>,
+    fold_tx: squeezefs_ipc::sqz_channel::mpsc::Sender<(u64, u32)>,
+    fold_rx: std::sync::Arc<
+        std::sync::Mutex<Option<squeezefs_ipc::sqz_channel::mpsc::Receiver<(u64, u32)>>>,
+    >,
     fold_worker_started: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Virtual-inode snapshot state — ALL of it shared across handler
     /// clones (`Arc`, the `kernel_notify` one-cell law; the 2026-08-04
@@ -6835,7 +6838,7 @@ pub struct SqueezefsFilesystem {
     /// Per-mount (DAOS per-container model): env-seeded at construction,
     /// mount-option-overridden in `start_mount`, direct-set in tests.
     pub kernel_ttls: KernelCacheTtls,
-    pub reclaim_semaphore: std::sync::Arc<tokio::sync::Semaphore>,
+    pub reclaim_semaphore: std::sync::Arc<squeezefs_ipc::sqz_semaphore::Semaphore>,
     /// FUSE-over-io_uring surfaces Destroy once per queue; teardown must
     /// run exactly once.
     dismount_once: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -6846,10 +6849,15 @@ pub struct SqueezefsFilesystem {
     /// completion (`wait_dismount_teardown`) so the daemon does not exit
     /// (and tests do not proceed) before heartbeat records deregister.
     dismount_complete: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    // REPORT (rip-tokio-total partition C): stays tokio::sync::Notify —
+    // shared with `ro_coherence::spawn_reader_revalidation(wake: Arc<
+    // tokio::sync::Notify>)`, a file outside this partition; convert both
+    // together.
     dismount_done: std::sync::Arc<tokio::sync::Notify>,
     /// RES-20: the task-free FORGET enqueue (see [`ReclaimEnqueue`]).
     reclaim_enqueue: std::sync::Arc<ReclaimEnqueue>,
-    reclaim_rx: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<u64>>>>,
+    reclaim_rx:
+        std::sync::Arc<std::sync::Mutex<Option<squeezefs_ipc::sqz_channel::mpsc::Receiver<u64>>>>,
     /// FIND-RW5-A face 4: per-ino single-drive reclaim guard. RELEASE and
     /// FORGET both enqueue reclaims and concurrent batches both passed
     /// admission (the inode slot persists until the destroy commits), so
@@ -7039,9 +7047,9 @@ impl SqueezefsFilesystem {
             "Dynamic reclaim concurrency limit configured: {}",
             reclaim_concurrency
         );
-        let (writeback_tx, writeback_rx) = tokio::sync::mpsc::channel(queue_cap);
-        let (fold_tx, fold_rx) = tokio::sync::mpsc::channel(1024);
-        let (reclaim_tx, reclaim_rx) = tokio::sync::mpsc::channel(100000);
+        let (writeback_tx, writeback_rx) = squeezefs_ipc::sqz_channel::mpsc::channel(queue_cap);
+        let (fold_tx, fold_rx) = squeezefs_ipc::sqz_channel::mpsc::channel(1024);
+        let (reclaim_tx, reclaim_rx) = squeezefs_ipc::sqz_channel::mpsc::channel(100000);
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();
         let total_memory = sys.total_memory();
@@ -7116,8 +7124,8 @@ impl SqueezefsFilesystem {
             parked_overlay_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             last_write_end: std::sync::Arc::new(scc::HashMap::new()),
             parked_drain_target: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
-            parked_drain_kick: std::sync::Arc::new(tokio::sync::Notify::new()),
-            parked_drain_progress: std::sync::Arc::new(tokio::sync::Notify::new()),
+            parked_drain_kick: std::sync::Arc::new(squeezefs_ipc::sqz_notify::Notify::new()),
+            parked_drain_progress: std::sync::Arc::new(squeezefs_ipc::sqz_notify::Notify::new()),
             parked_drain_worker_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
             )),
@@ -7166,7 +7174,7 @@ impl SqueezefsFilesystem {
             page_cache_inos: std::sync::Arc::new(scc::HashSet::new()),
             dio_inval_sink: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(None)),
             attr_inval_sink: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(None)),
-            reclaim_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            reclaim_semaphore: std::sync::Arc::new(squeezefs_ipc::sqz_semaphore::Semaphore::new(
                 reclaim_concurrency,
             )),
             dismount_once: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -11463,9 +11471,11 @@ impl SqueezefsFilesystem {
                 let key_owned = key.to_string();
                 // Detached blocking-pool removal (see fn doc): never take
                 // the staging shard WRITE lock on an executor thread.
-                tokio::task::spawn_blocking(move || {
+                // (run_blocking submits eagerly; the completion future is
+                // deliberately dropped — fire-and-forget.)
+                drop(squeezefs_ipc::sqz_blocking::run_blocking(move || {
                     nvme.remove_active_block(&key_owned);
-                });
+                }));
                 None
             }
             crate::cache::nvme::ExtentRecordError::FutureVersion(v) => {
@@ -11631,7 +11641,7 @@ impl SqueezefsFilesystem {
             let nvme = self.router.cache.nvme.clone();
             let ek = ext_key.clone();
             let ck = cache_key.clone();
-            tokio::task::spawn_blocking(move || {
+            squeezefs_ipc::sqz_blocking::run_blocking(move || {
                 nvme.remove_active_block(&ek);
                 if had_staged_full {
                     // The staged-full sibling was the fold's seed base and
@@ -11639,8 +11649,7 @@ impl SqueezefsFilesystem {
                     nvme.remove_active_block(&ck);
                 }
             })
-            .await
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+            .await;
         }
         drop(block_guard);
 
@@ -12108,11 +12117,10 @@ impl SqueezefsFilesystem {
             let key_clone = key.clone();
             let staging_snapshot = staging_copy.clone();
             let wp_put = write_phase_start();
-            let admitted = tokio::task::spawn_blocking(move || {
+            let admitted = squeezefs_ipc::sqz_blocking::run_blocking(move || {
                 nvme_clone.put_active_block(&key_clone, &staging_snapshot, fencing_token)
             })
-            .await
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+            .await;
             write_phase_record(WritePhase::StagingPut, wp_put);
 
             if admitted {
@@ -12556,9 +12564,7 @@ impl SqueezefsFilesystem {
             self.park_overlay_entry(cache_key.to_string(), overlay);
             let nvme = self.router.cache.nvme.clone();
             let ek = ext_key.clone();
-            tokio::task::spawn_blocking(move || nvme.remove_active_block(&ek))
-                .await
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            squeezefs_ipc::sqz_blocking::run_blocking(move || nvme.remove_active_block(&ek)).await;
             return Ok(false);
         }
         let completed = overlay.merge_extent(rel_start, data);
@@ -12578,9 +12584,7 @@ impl SqueezefsFilesystem {
         if absorbed_record {
             let nvme = self.router.cache.nvme.clone();
             let ek = ext_key.clone();
-            tokio::task::spawn_blocking(move || nvme.remove_active_block(&ek))
-                .await
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            squeezefs_ipc::sqz_blocking::run_blocking(move || nvme.remove_active_block(&ek)).await;
         }
         let fm = fold_max_extents();
         let fb = fold_max_bytes();
@@ -13470,7 +13474,7 @@ impl SqueezefsFilesystem {
                     .overlay_teardown_waits
                     .fetch_add(1, Ordering::Relaxed);
             }
-            tokio::task::yield_now().await;
+            squeezefs_ipc::sqz_blocking::yield_now().await;
         }
     }
 
@@ -14055,9 +14059,10 @@ impl SqueezefsFilesystem {
                                 .fetch_add(1, Ordering::Relaxed);
                             let nvme = self.router.cache.nvme.clone();
                             write_phase(ino, offset, b as u32, WP_ACCUMULATE);
-                            tokio::task::spawn_blocking(move || nvme.remove_active_block(&ext_key))
-                                .await
-                                .map_err(|e| std::io::Error::other(e.to_string()))?;
+                            squeezefs_ipc::sqz_blocking::run_blocking(move || {
+                                nvme.remove_active_block(&ext_key)
+                            })
+                            .await;
                         }
                     }
                 }
@@ -14111,10 +14116,10 @@ impl SqueezefsFilesystem {
                         let nvme = self.router.cache.nvme.clone();
                         let key = cache_key.clone();
                         write_phase(ino, offset, b as u32, WP_ACCUMULATE);
-                        let removed =
-                            tokio::task::spawn_blocking(move || nvme.remove_active_block(&key))
-                                .await
-                                .map_err(|e| std::io::Error::other(e.to_string()))?;
+                        let removed = squeezefs_ipc::sqz_blocking::run_blocking(move || {
+                            nvme.remove_active_block(&key)
+                        })
+                        .await;
                         if let Some(prev) = removed {
                             METRICS
                                 .restage_churn_removes
@@ -14415,15 +14420,14 @@ impl SqueezefsFilesystem {
                     let put_len = block_snapshot.len() as u64;
                     let staging_snapshot = block_snapshot;
                     let wp_put = write_phase_start();
-                    let admitted = tokio::task::spawn_blocking(move || {
+                    let admitted = squeezefs_ipc::sqz_blocking::run_blocking(move || {
                         nvme_clone.put_active_block(
                             &cache_key_clone,
                             &staging_snapshot,
                             fencing_token_val,
                         )
                     })
-                    .await
-                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    .await;
                     write_phase_record(WritePhase::StagingPut, wp_put);
 
                     if admitted {
@@ -14880,15 +14884,11 @@ impl SqueezefsFilesystem {
             // an async worker (§5.5 read guards are held across DMA awaits;
             // see flush_one_active_block).
             let nvme = self.router.cache.nvme.clone();
-            if tokio::task::spawn_blocking(move || {
+            squeezefs_ipc::sqz_blocking::run_blocking(move || {
                 nvme.remove_active_block(&key);
                 nvme.remove_active_block(&ext_key);
             })
-            .await
-            .is_err()
-            {
-                continue;
-            }
+            .await;
         }
     }
 
@@ -15774,13 +15774,13 @@ impl SqueezefsFilesystem {
     async fn enqueue_writeback(&self, req: WritebackRequest) -> Result<(), SqueezefsError> {
         match self.writeback_tx.try_send(req) {
             Ok(()) => Ok(()),
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(r)) => {
+            Err(squeezefs_ipc::sqz_channel::mpsc::error::TrySendError::Closed(r)) => {
                 Err(SqueezefsError::InvalidOperation(format!(
                     "writeback channel closed for ino {} block {}",
                     r.ino, r.block_idx
                 )))
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Full(r)) => {
+            Err(squeezefs_ipc::sqz_channel::mpsc::error::TrySendError::Full(r)) => {
                 warn!(
                     "Writeback queue full; synchronous flush for ino {} block {}",
                     r.ino, r.block_idx
@@ -16224,11 +16224,10 @@ impl SqueezefsFilesystem {
                     let payload = record.payload_bytes();
                     let nvme = self.router.cache.nvme.clone();
                     let wp_put = write_phase_start();
-                    let admitted = tokio::task::spawn_blocking(move || {
+                    let admitted = squeezefs_ipc::sqz_blocking::run_blocking(move || {
                         nvme.put_extent_record(&ext_key, &record)
                     })
-                    .await
-                    .unwrap_or(false);
+                    .await;
                     write_phase_record(WritePhase::StagingPut, wp_put);
                     if !admitted {
                         // Staging refused (never-lossy backpressure): the
@@ -16397,11 +16396,13 @@ impl SqueezefsFilesystem {
                         .fetch_min(cap_bytes, Ordering::Relaxed);
                     self.ensure_parked_drain_worker();
                     self.parked_drain_kick.notify_one();
-                    let progress = self.parked_drain_progress.notified();
-                    tokio::select! {
-                        _ = progress => {}
-                        _ = squeezefs_ipc::sqz_time::sleep(Duration::from_millis(25)) => {}
-                    }
+                    // Progress wake OR a 25 ms re-evaluation tick — the
+                    // outer while re-checks the gauge either way.
+                    let _ = squeezefs_ipc::sqz_time::timeout(
+                        Duration::from_millis(25),
+                        self.parked_drain_progress.notified(),
+                    )
+                    .await;
                 }
                 let still_over = Self::parked_gauge_bytes() > gate_bytes
                     && crate::mem_budget::level() == crate::mem_budget::Level::Red;
@@ -16475,7 +16476,7 @@ impl SqueezefsFilesystem {
                                 let nvme = self.router.cache.nvme.clone();
                                 let key = cache_key.to_string();
                                 let token = fencing_token;
-                                let _ = tokio::task::spawn_blocking(move || {
+                                squeezefs_ipc::sqz_blocking::run_blocking(move || {
                                     match nvme.get_staged_fencing_token(&key) {
                                         Some(tok) if tok != token => {}
                                         _ => {
@@ -16672,20 +16673,10 @@ impl SqueezefsFilesystem {
             let key_clone = key.clone();
             let staging_snapshot = staging_copy.clone();
             let put_len = staging_copy.len() as u64;
-            let admitted = match tokio::task::spawn_blocking(move || {
+            let admitted = squeezefs_ipc::sqz_blocking::run_blocking(move || {
                 nvme_clone.put_active_block(&key_clone, &staging_snapshot, fencing_token)
             })
-            .await
-            {
-                Ok(admitted) => admitted,
-                Err(e) => {
-                    error!(
-                        "Failed to write active block to NVMe staging during dismount: {:?}",
-                        e
-                    );
-                    continue;
-                }
-            };
+            .await;
 
             if !admitted {
                 // Staging refused (never-lossy backpressure): dismount must
@@ -16783,7 +16774,7 @@ impl SqueezefsFilesystem {
             active_keys.len()
         );
 
-        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(
+        let sem = std::sync::Arc::new(squeezefs_ipc::sqz_semaphore::Semaphore::new(
             crate::bg_admit::striped_block_concurrency(),
         ));
         let mut tasks = futures::stream::FuturesUnordered::new();
@@ -16794,50 +16785,53 @@ impl SqueezefsFilesystem {
             let dlm_clone = self.dlm.clone();
             let locks_clone = self.active_inode_locks.clone();
 
-            tasks.push(tokio::spawn(async move {
-                let _permit = sem_clone.acquire().await.ok();
+            tasks.push(crate::meta_exec::spawn_meta_join(
+                "dismount_block_flush",
+                async move {
+                    let _permit = sem_clone.acquire().await.ok();
 
-                let parts: Vec<&str> = key.split(":block_").collect();
-                if parts.len() != 2 {
-                    return Ok(());
-                }
-                let ino_parts: Vec<&str> = parts[0].split("inode_").collect();
-                if ino_parts.len() != 2 {
-                    return Ok(());
-                }
-                let ino = match ino_parts[1].parse::<u64>() {
-                    Ok(i) => i,
-                    Err(_) => return Ok(()),
-                };
-                let b = match parts[1].parse::<u32>() {
-                    Ok(idx) => idx,
-                    Err(_) => return Ok(()),
-                };
+                    let parts: Vec<&str> = key.split(":block_").collect();
+                    if parts.len() != 2 {
+                        return Ok(());
+                    }
+                    let ino_parts: Vec<&str> = parts[0].split("inode_").collect();
+                    if ino_parts.len() != 2 {
+                        return Ok(());
+                    }
+                    let ino = match ino_parts[1].parse::<u64>() {
+                        Ok(i) => i,
+                        Err(_) => return Ok(()),
+                    };
+                    let b = match parts[1].parse::<u32>() {
+                        Ok(idx) => idx,
+                        Err(_) => return Ok(()),
+                    };
 
-                let meta = router_clone
-                    .fetch_metadata_from_backend(ino)
-                    .await?
-                    .unwrap_or_default();
-                let is_striped = meta.file_type == "striped";
+                    let meta = router_clone
+                        .fetch_metadata_from_backend(ino)
+                        .await?
+                        .unwrap_or_default();
+                    let is_striped = meta.file_type == "striped";
 
-                // Authoritative dismount sweep (owner_token = None): flush
-                // whatever is staged regardless of the generation it was
-                // stamped under — acked custody bytes must reach the
-                // backend, and the entry must DRAIN so destroy's
-                // staged-drain wait is bounded (FIND-M11-A).
-                flush_single_active_block(
-                    ino,
-                    b,
-                    None,
-                    &router_clone,
-                    &dlm_clone,
-                    &locks_clone,
-                    is_striped,
-                )
-                .await?;
+                    // Authoritative dismount sweep (owner_token = None): flush
+                    // whatever is staged regardless of the generation it was
+                    // stamped under — acked custody bytes must reach the
+                    // backend, and the entry must DRAIN so destroy's
+                    // staged-drain wait is bounded (FIND-M11-A).
+                    flush_single_active_block(
+                        ino,
+                        b,
+                        None,
+                        &router_clone,
+                        &dlm_clone,
+                        &locks_clone,
+                        is_striped,
+                    )
+                    .await?;
 
-                Ok::<(), SqueezefsError>(())
-            }));
+                    Ok::<(), SqueezefsError>(())
+                },
+            ));
         }
 
         use futures::StreamExt;
@@ -17732,13 +17726,17 @@ impl SqueezefsFilesystem {
             return;
         }
         loop {
-            // Arm the notification BEFORE re-checking the flag (the
-            // standard Notify race-closure order).
-            let notified = self.dismount_done.notified();
+            // Re-check the flag, then park bounded: the notify is only an
+            // accelerator, the 2 s re-poll is what makes a wake racing
+            // the park window un-losable (cold path — daemon exit).
             if self.dismount_complete.load(Ordering::Acquire) {
                 return;
             }
-            notified.await;
+            let _ = squeezefs_ipc::sqz_time::timeout(
+                std::time::Duration::from_secs(2),
+                self.dismount_done.notified(),
+            )
+            .await;
         }
     }
 }
@@ -18402,7 +18400,7 @@ impl Filesystem for SqueezefsFilesystem {
         // point between the `dismount_once` claim above and this spawn —
         // the claim can never be taken without the teardown being scheduled.
         let this = self.clone();
-        let teardown = tokio::spawn(async move {
+        let teardown = crate::meta_exec::spawn_meta_join("dismount_teardown", async move {
             this.run_dismount_teardown().await;
             this.dismount_complete.store(true, Ordering::Release);
             this.dismount_done.notify_waiters();
@@ -22087,13 +22085,13 @@ impl Filesystem for SqueezefsFilesystem {
                 //    dirfd-pinned — see `read_caller_struct`.
                 let pid = _req.pid;
                 let arg = _arg;
-                let args_res = tokio::task::spawn_blocking(move || {
+                let args_res = squeezefs_ipc::sqz_blocking::run_blocking(move || {
                     read_caller_struct(pid, arg, std::mem::size_of::<GdsReadArgs>())
                 })
                 .await;
 
                 let args = match args_res {
-                    Ok(Ok(bytes)) => {
+                    Ok(bytes) => {
                         // SAFETY: `bytes` is exactly size_of::<GdsReadArgs>()
                         // bytes (read_caller_struct refuses a short read) and
                         // `GdsReadArgs` is a plain `#[repr(C)]` triple of u64s
@@ -22101,8 +22099,7 @@ impl Filesystem for SqueezefsFilesystem {
                         // range-checked afterwards (VAL-1).
                         unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const GdsReadArgs) }
                     }
-                    Ok(Err(errno)) => return Err(Errno::from(errno)),
-                    Err(_) => return Err(Errno::from(libc::EIO)),
+                    Err(errno) => return Err(Errno::from(errno)),
                 };
                 debug!("GDS ioctl args: {:?}", args);
 
@@ -22620,7 +22617,7 @@ fn mount_st_dev(mount_path: &Path) -> Option<u64> {
 /// never cost more than a single outstanding drainer. Nothing is dropped:
 /// an orphan ino that never reaches the queue is a durable slot leak.
 pub struct ReclaimEnqueue {
-    tx: tokio::sync::mpsc::Sender<u64>,
+    tx: squeezefs_ipc::sqz_channel::mpsc::Sender<u64>,
     /// Inos that hit a full queue, awaiting the drainer.
     overflow: std::sync::Mutex<std::collections::VecDeque<u64>>,
     /// Set while a drainer task is live: the "at most one" latch.
@@ -22631,7 +22628,7 @@ pub struct ReclaimEnqueue {
 }
 
 impl ReclaimEnqueue {
-    pub fn new(tx: tokio::sync::mpsc::Sender<u64>) -> std::sync::Arc<Self> {
+    pub fn new(tx: squeezefs_ipc::sqz_channel::mpsc::Sender<u64>) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             tx,
             overflow: std::sync::Mutex::new(std::collections::VecDeque::new()),
@@ -22649,14 +22646,14 @@ impl ReclaimEnqueue {
     pub fn enqueue(self: &std::sync::Arc<Self>, ino: u64) {
         match self.tx.try_send(ino) {
             Ok(()) => {}
-            Err(tokio::sync::mpsc::error::TrySendError::Full(ino)) => {
+            Err(squeezefs_ipc::sqz_channel::mpsc::error::TrySendError::Full(ino)) => {
                 self.overflow
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .push_back(ino);
                 self.ensure_drainer();
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            Err(squeezefs_ipc::sqz_channel::mpsc::error::TrySendError::Closed(_)) => {
                 // Teardown: the reclaim worker pool is gone. Mount-time
                 // recovery owns any orphan left behind.
             }
@@ -22664,7 +22661,8 @@ impl ReclaimEnqueue {
     }
 
     /// Spawn the single drainer if one is not already running. Called only
-    /// on the backpressure path, so the runtime-handle probe is cold.
+    /// on the backpressure path (the sqz-meta pool needs no ambient
+    /// runtime, so the spawn always succeeds).
     fn ensure_drainer(self: &std::sync::Arc<Self>) {
         if self
             .draining
@@ -22672,16 +22670,9 @@ impl ReclaimEnqueue {
         {
             return; // a drainer is already live and will see our push
         }
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            // No runtime (offline tools / tests): drain is impossible, and
-            // the latch must not stay armed.
-            self.draining
-                .store(false, std::sync::atomic::Ordering::Release);
-            return;
-        };
         self.spawned.fetch_add(1, Ordering::Relaxed);
         let me = std::sync::Arc::clone(self);
-        handle.spawn(async move {
+        crate::meta_exec::spawn_meta("reclaim_overflow_drainer", async move {
             loop {
                 let next = me
                     .overflow
@@ -23505,13 +23496,12 @@ pub async fn start_mount<P: AsRef<Path>>(
         ));
         loop {
             interval.tick().await;
-            let controllers = tokio::task::spawn_blocking(|| {
+            let controllers = squeezefs_ipc::sqz_blocking::run_blocking(|| {
                 crate::nvmeof::fabric::enumerate_fabric_controllers(std::path::Path::new(
                     crate::nvmeof::fabric::SYSFS_NVME,
                 ))
             })
-            .await
-            .unwrap_or_default();
+            .await;
             let sample = sampler.observe(&controllers);
             METRICS
                 .fabric_controllers
@@ -23638,13 +23628,12 @@ pub async fn start_mount<P: AsRef<Path>>(
     // self-FUSE traffic).
     if let Some(host) = fs.ipc_host.load().as_ref().as_ref().cloned() {
         let mp = mount_path.clone();
-        tokio::spawn(async move {
+        crate::meta_exec::spawn_meta("ipc_st_dev_resolver", async move {
             for _ in 0..100 {
                 let mp_probe = mp.clone();
-                let dev = tokio::task::spawn_blocking(move || mount_st_dev(&mp_probe))
-                    .await
-                    .ok()
-                    .flatten();
+                let dev =
+                    squeezefs_ipc::sqz_blocking::run_blocking(move || mount_st_dev(&mp_probe))
+                        .await;
                 if let Some(dev) = dev {
                     host.set_expected_st_dev(dev);
                     info!("IPC session host: mount st_dev resolved ({dev})");
@@ -23683,7 +23672,7 @@ pub async fn start_mount<P: AsRef<Path>>(
                                         println!("[SIG] Second Ctrl+C, exiting...");
                                         break;
                                     }
-                                    _ = squeezefs_ipc::sqz_time::sleep(tokio::time::Duration::from_secs(5)) => {
+                                    _ = squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_secs(5)) => {
                                         eprintln!("\nUnmount timeout elapsed. Resuming filesystem...");
                                     }
                                 }
@@ -23700,7 +23689,7 @@ pub async fn start_mount<P: AsRef<Path>>(
                                         println!("[SIG] Second SIGINT, exiting...");
                                         break;
                                     }
-                                    _ = squeezefs_ipc::sqz_time::sleep(tokio::time::Duration::from_secs(5)) => {
+                                    _ = squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_secs(5)) => {
                                         eprintln!("\nUnmount timeout elapsed. Resuming filesystem...");
                                     }
                                 }
@@ -23717,7 +23706,7 @@ pub async fn start_mount<P: AsRef<Path>>(
                                 info!("Received second Ctrl+C, exiting...");
                                 break;
                             }
-                            _ = squeezefs_ipc::sqz_time::sleep(tokio::time::Duration::from_secs(5)) => {
+                            _ = squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_secs(5)) => {
                                 eprintln!("\nUnmount timeout elapsed. Resuming filesystem...");
                             }
                         }
@@ -23734,7 +23723,7 @@ pub async fn start_mount<P: AsRef<Path>>(
                             info!("Received second Ctrl+C, exiting...");
                             break;
                         }
-                        _ = squeezefs_ipc::sqz_time::sleep(tokio::time::Duration::from_secs(5)) => {
+                        _ = squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_secs(5)) => {
                             eprintln!("\nUnmount timeout elapsed. Resuming filesystem...");
                         }
                     }
@@ -23838,7 +23827,7 @@ pub async fn start_mount<P: AsRef<Path>>(
     // Tear down the interception session host (poisons nothing — live
     // clients observe socket EOF and degrade to passthrough, §5.7).
     if let Some(host) = fs.ipc_host.load().as_ref().as_ref().cloned() {
-        let _ = tokio::task::spawn_blocking(move || host.shutdown()).await;
+        squeezefs_ipc::sqz_blocking::run_blocking(move || host.shutdown()).await;
     }
 
     // FINDING F (zcrx, 2026-08 field): lane sessions live in per-device
@@ -23992,14 +23981,15 @@ pub async fn get_volume_status(meta_lv_path: &str) -> Result<serde_json::Value, 
 }
 
 async fn run_constant_writeback_worker(
-    mut rx: tokio::sync::mpsc::Receiver<WritebackRequest>,
-    requeue_tx: tokio::sync::mpsc::Sender<WritebackRequest>,
+    mut rx: squeezefs_ipc::sqz_channel::mpsc::Receiver<WritebackRequest>,
+    requeue_tx: squeezefs_ipc::sqz_channel::mpsc::Sender<WritebackRequest>,
     router: DataRouter,
     dlm: DlmClient,
     active_inode_locks: std::sync::Arc<StripeLocks<crate::sqz_sync::SqzRwLock<()>, 4096>>,
     max_uploads: usize,
 ) {
-    let upload_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_uploads));
+    let upload_semaphore =
+        std::sync::Arc::new(squeezefs_ipc::sqz_semaphore::Semaphore::new(max_uploads));
 
     while let Some(req) = rx.recv().await {
         log::info!(
@@ -24104,7 +24094,7 @@ async fn run_constant_writeback_worker(
 ///   permanently-stale token cycling at capped backoff (the incident_013
 ///   kill-9 livelock).
 async fn requeue_or_hard_fail(
-    requeue_tx: &tokio::sync::mpsc::Sender<WritebackRequest>,
+    requeue_tx: &squeezefs_ipc::sqz_channel::mpsc::Sender<WritebackRequest>,
     mut req: WritebackRequest,
     err_msg: String,
 ) {
@@ -24133,11 +24123,11 @@ async fn requeue_or_hard_fail(
     loop {
         match requeue_tx.try_send(unit) {
             Ok(()) => return,
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            Err(squeezefs_ipc::sqz_channel::mpsc::error::TrySendError::Closed(_)) => {
                 warn!("Constant Writeback: requeue after shutdown; unit handed to teardown");
                 return;
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Full(r)) => {
+            Err(squeezefs_ipc::sqz_channel::mpsc::error::TrySendError::Full(r)) => {
                 if requeue_tx.is_closed() {
                     warn!(
                         "Constant Writeback: queue receiver gone at shutdown; \
@@ -24681,7 +24671,7 @@ async fn flush_one_active_block(
         {
             let nvme = router.cache.nvme.clone();
             let key = cache_key.clone();
-            tokio::task::spawn_blocking(move || {
+            squeezefs_ipc::sqz_blocking::run_blocking(move || {
                 let current_token = nvme.get_staged_fencing_token(&key);
                 if let Some(tok) = current_token {
                     if tok == staged_token {
@@ -24691,8 +24681,7 @@ async fn flush_one_active_block(
                     nvme.remove_active_block(&key);
                 }
             })
-            .await
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+            .await;
         }
 
         return Ok(());
@@ -24718,7 +24707,7 @@ async fn flush_one_active_block(
 /// is the reclaim worker pool's gather step and the seam
 /// `tests/meta_entry_economy_tests.rs` drives to pin those counters.
 pub async fn drain_reclaim_batch(
-    rx: &mut tokio::sync::mpsc::Receiver<u64>,
+    rx: &mut squeezefs_ipc::sqz_channel::mpsc::Receiver<u64>,
     cap: usize,
     window: std::time::Duration,
 ) -> Option<Vec<u64>> {
@@ -24731,7 +24720,7 @@ pub async fn drain_reclaim_batch(
 /// batch would leak its inos until the next mount).
 async fn gather_reclaim_batch(
     first: u64,
-    rx: &mut tokio::sync::mpsc::Receiver<u64>,
+    rx: &mut squeezefs_ipc::sqz_channel::mpsc::Receiver<u64>,
     cap: usize,
     window: std::time::Duration,
 ) -> Vec<u64> {
@@ -24753,11 +24742,11 @@ async fn gather_reclaim_batch(
     while batch.len() < cap {
         match rx.try_recv() {
             Ok(ino) => batch.push(ino),
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+            Err(squeezefs_ipc::sqz_channel::mpsc::error::TryRecvError::Disconnected) => {
                 channel_closed = true;
                 break;
             }
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+            Err(squeezefs_ipc::sqz_channel::mpsc::error::TryRecvError::Empty) => break,
         }
     }
     // D4.a fill-vs-window attribution: how did this gather close? Cap
@@ -24785,7 +24774,7 @@ async fn gather_reclaim_batch(
 }
 
 async fn run_reclaim_worker_pool(
-    mut rx: tokio::sync::mpsc::Receiver<u64>,
+    mut rx: squeezefs_ipc::sqz_channel::mpsc::Receiver<u64>,
     fs: SqueezefsFilesystem,
     concurrency: usize,
 ) {
@@ -24809,7 +24798,7 @@ async fn run_reclaim_worker_pool(
         .map(|v| v.min(1000))
         .unwrap_or(20);
     let window = std::time::Duration::from_millis(window_ms);
-    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let semaphore = std::sync::Arc::new(squeezefs_ipc::sqz_semaphore::Semaphore::new(concurrency));
     let fs_arc = std::sync::Arc::new(fs);
     loop {
         // IDLE-EXIT-AND-RESPAWN (the 1c immortal-fs lesson — see
@@ -24863,7 +24852,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn writeback_requeue_on_full_queue_never_goes_sticky() {
         let ino = 990_001u64;
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<WritebackRequest>(1);
+        let (tx, mut rx) = squeezefs_ipc::sqz_channel::mpsc::channel::<WritebackRequest>(1);
         // Occupy the single slot so the requeue hits Full.
         tx.try_send(WritebackRequest {
             ino: 1,
@@ -24901,7 +24890,7 @@ mod tests {
     async fn writeback_exhausted_retries_requeue_forever_not_sticky() {
         let ino = 990_002u64;
         let before = METRICS.writeback_retry_exhaustions.load(Ordering::Relaxed);
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<WritebackRequest>(8);
+        let (tx, mut rx) = squeezefs_ipc::sqz_channel::mpsc::channel::<WritebackRequest>(8);
         let req = WritebackRequest {
             ino,
             block_idx: 3,

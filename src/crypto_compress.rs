@@ -1039,9 +1039,7 @@ impl CryptoCompressState {
             return self.process_write(data);
         }
         let state = self.clone();
-        tokio::task::spawn_blocking(move || state.process_write(data))
-            .await
-            .map_err(|e| SqueezefsError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
+        squeezefs_ipc::sqz_blocking::run_blocking(move || state.process_write(data)).await
     }
 
     pub async fn process_read_async(
@@ -1056,12 +1054,11 @@ impl CryptoCompressState {
             return Ok(bytes::Bytes::from(res.into_owned()));
         }
         let state = self.clone();
-        tokio::task::spawn_blocking(move || {
+        squeezefs_ipc::sqz_blocking::run_blocking(move || {
             let res = state.process_read(&data)?;
             Ok(bytes::Bytes::from(res.into_owned()))
         })
         .await
-        .map_err(|e| SqueezefsError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
     }
 }
 

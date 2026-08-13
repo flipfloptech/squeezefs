@@ -894,7 +894,7 @@ fn bench_reclaim_enqueue(c: &mut Criterion) {
     group.bench_function("try_send_burst_1024", |b| {
         b.iter_batched(
             || {
-                let (tx, rx) = tokio::sync::mpsc::channel::<u64>(200_000);
+                let (tx, rx) = squeezefs_ipc::sqz_channel::mpsc::channel::<u64>(200_000);
                 (ReclaimEnqueue::new(tx), rx)
             },
             |(q, rx)| {

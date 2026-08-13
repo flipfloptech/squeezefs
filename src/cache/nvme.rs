@@ -1,11 +1,11 @@
 use crate::error::{Result, SqueezefsError};
 use bytes::Bytes;
 use log::{error, info};
+use squeezefs_ipc::sqz_channel::mpsc;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::mpsc;
-use tokio::time::{self, Duration};
+use std::time::Duration;
 
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -1017,9 +1017,9 @@ pub struct NvmeStaging {
     /// per-inode metadata lock). Weak — the router owns this cache.
     data_router:
         std::sync::Arc<std::sync::OnceLock<std::sync::Weak<crate::routing::DataRouterInner>>>,
-    pub space_freed_notify: std::sync::Arc<tokio::sync::Notify>,
+    pub space_freed_notify: std::sync::Arc<squeezefs_ipc::sqz_notify::Notify>,
     pub staged_writes_in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    pub staged_drained_notify: std::sync::Arc<tokio::sync::Notify>,
+    pub staged_drained_notify: std::sync::Arc<squeezefs_ipc::sqz_notify::Notify>,
 
     // Hypertier NVMe cache instances
     pub read_nvme_cache: std::sync::Arc<crate::tiering::nvme::NvmeCache>,
@@ -1315,11 +1315,11 @@ impl NvmeStaging {
             staged_ledger,
             active_block_index,
             data_router: std::sync::Arc::new(std::sync::OnceLock::new()),
-            space_freed_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+            space_freed_notify: std::sync::Arc::new(squeezefs_ipc::sqz_notify::Notify::new()),
             staged_writes_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
                 staging_nvme_cache.list_keys().len(),
             )),
-            staged_drained_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+            staged_drained_notify: std::sync::Arc::new(squeezefs_ipc::sqz_notify::Notify::new()),
             read_nvme_cache,
             staging_nvme_cache,
             crypto: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -1418,9 +1418,7 @@ impl NvmeStaging {
             self.kick_promotion(file_id, 64).await;
             let deadline = std::time::Instant::now() + Duration::from_millis(2000);
             loop {
-                let notified = self.space_freed_notify.notified();
-                tokio::pin!(notified);
-                if squeezefs_ipc::sqz_time::timeout_at(deadline, notified)
+                if squeezefs_ipc::sqz_time::timeout_at(deadline, self.space_freed_notify.notified())
                     .await
                     .is_err()
                 {
@@ -1463,7 +1461,7 @@ impl NvmeStaging {
             let file_id_owned = file_id.to_string();
             let key_clone = key_bytes.clone();
             let data_clone = data.clone();
-            tokio::task::spawn_blocking(move || {
+            squeezefs_ipc::sqz_blocking::run_blocking(move || {
                 let mut entry = ledger.entry_sync(file_id_owned).or_insert((0, 0));
                 let is_new = staging.get(&key_clone).is_none();
                 // Memory-mapped copy directly (lock-free, zero disk syscall wait).
@@ -1489,7 +1487,6 @@ impl NvmeStaging {
                 }
             })
             .await
-            .map_err(|e| SqueezefsError::Io(std::io::Error::other(e.to_string())))?
         };
         if !admitted {
             return Err(SqueezefsError::Io(std::io::Error::new(
@@ -1670,7 +1667,7 @@ impl NvmeStaging {
         let staging = self.staging_nvme_cache.clone();
         let file_id_owned = file_id.to_string();
         let key_bytes = Bytes::copy_from_slice(file_id.as_bytes());
-        tokio::task::spawn_blocking(move || {
+        squeezefs_ipc::sqz_blocking::run_blocking(move || {
             let scc::hash_map::Entry::Occupied(mut entry) = ledger.entry_sync(file_id_owned) else {
                 return false;
             };
@@ -1684,7 +1681,6 @@ impl NvmeStaging {
             true
         })
         .await
-        .unwrap_or(false)
     }
 
     /// Bump `file_id`'s stage generation under its ledger entry lock (the
@@ -1696,7 +1692,7 @@ impl NvmeStaging {
     pub async fn bump_staged_generation(&self, file_id: &str) {
         let ledger = self.staged_ledger.clone();
         let fid = file_id.to_string();
-        let _ = tokio::task::spawn_blocking(move || {
+        squeezefs_ipc::sqz_blocking::run_blocking(move || {
             if let scc::hash_map::Entry::Occupied(mut entry) = ledger.entry_sync(fid) {
                 let (cost, _) = *entry.get();
                 *entry.get_mut() = (cost, next_stage_generation());
@@ -1920,22 +1916,20 @@ impl NvmeStaging {
     /// [`Self::remove_active_block`] on the blocking pool, for async callers.
     pub async fn remove_active_block_async(&self, key: String) -> Result<Option<Vec<u8>>> {
         let nvme = self.clone();
-        tokio::task::spawn_blocking(move || nvme.remove_active_block(&key))
-            .await
-            .map_err(|e| SqueezefsError::Io(std::io::Error::other(e.to_string())))
+        Ok(squeezefs_ipc::sqz_blocking::run_blocking(move || nvme.remove_active_block(&key)).await)
     }
 
     /// Remove many active blocks in ONE blocking-pool hop (delete/reclaim
     /// paths sweep every block index of an inode).
     pub async fn remove_active_blocks_async(&self, keys: Vec<String>) -> Result<()> {
         let nvme = self.clone();
-        tokio::task::spawn_blocking(move || {
+        squeezefs_ipc::sqz_blocking::run_blocking(move || {
             for key in keys {
                 nvme.remove_active_block(&key);
             }
         })
-        .await
-        .map_err(|e| SqueezefsError::Io(std::io::Error::other(e.to_string())))
+        .await;
+        Ok(())
     }
 
     /// [`Self::remove_staged`] on the blocking pool, for async callers.
@@ -1950,9 +1944,10 @@ impl NvmeStaging {
         gen: u64,
     ) -> Result<bool> {
         let nvme = self.clone();
-        tokio::task::spawn_blocking(move || nvme.remove_staged_if_generation(&file_id, gen))
-            .await
-            .map_err(|e| SqueezefsError::Io(std::io::Error::other(e.to_string())))
+        Ok(squeezefs_ipc::sqz_blocking::run_blocking(move || {
+            nvme.remove_staged_if_generation(&file_id, gen)
+        })
+        .await)
     }
 
     /// [`Self::put_active_block`] on the blocking pool, for async callers.
@@ -1964,9 +1959,10 @@ impl NvmeStaging {
         fencing_token: u64,
     ) -> Result<bool> {
         let nvme = self.clone();
-        tokio::task::spawn_blocking(move || nvme.put_active_block(&key, &data, fencing_token))
-            .await
-            .map_err(|e| SqueezefsError::Io(std::io::Error::other(e.to_string())))
+        Ok(squeezefs_ipc::sqz_blocking::run_blocking(move || {
+            nvme.put_active_block(&key, &data, fencing_token)
+        })
+        .await)
     }
 
     /// [`Self::read_staged`] into a caller-provided pooled buffer — the
@@ -2102,36 +2098,35 @@ impl NvmeStaging {
             let flush_timeout = Duration::from_millis(500);
 
             loop {
-                let sleep = time::sleep(flush_timeout);
-                tokio::pin!(sleep);
+                // Recv-vs-flush-deadline (the retired two-arm select):
+                // a fresh deadline per iteration, exactly like the
+                // per-iteration `sleep` it replaces.
+                match squeezefs_ipc::sqz_time::timeout(flush_timeout, write_rx.recv()).await {
+                    Ok(Some(pending)) => {
+                        current_bytes += pending.padded_size;
+                        batch.push(pending);
 
-                tokio::select! {
-                    res = write_rx.recv() => {
-                        match res {
-                            Some(pending) => {
-                                current_bytes += pending.padded_size;
-                                batch.push(pending);
-
-                                // Promote immediately under capacity pressure
-                                // (writers may be gate-blocked on freed space);
-                                // otherwise batch up to amortize.
-                                if current_bytes >= max_batch_bytes
-                                    || gauge.load(std::sync::atomic::Ordering::Relaxed) > high_water
-                                {
-                                    Self::promote_batch(&data_router, &mut batch).await;
-                                    current_bytes = 0;
-                                }
-                            }
-                            None => {
-                                if !batch.is_empty() {
-                                    info!("NVMe Staging: Channel closed. Promoting remaining {} staged writes.", batch.len());
-                                    Self::promote_batch(&data_router, &mut batch).await;
-                                }
-                                break;
-                            }
+                        // Promote immediately under capacity pressure
+                        // (writers may be gate-blocked on freed space);
+                        // otherwise batch up to amortize.
+                        if current_bytes >= max_batch_bytes
+                            || gauge.load(std::sync::atomic::Ordering::Relaxed) > high_water
+                        {
+                            Self::promote_batch(&data_router, &mut batch).await;
+                            current_bytes = 0;
                         }
                     }
-                    _ = &mut sleep => {
+                    Ok(None) => {
+                        if !batch.is_empty() {
+                            info!(
+                                "NVMe Staging: Channel closed. Promoting remaining {} staged writes.",
+                                batch.len()
+                            );
+                            Self::promote_batch(&data_router, &mut batch).await;
+                        }
+                        break;
+                    }
+                    Err(_) => {
                         if !batch.is_empty() {
                             Self::promote_batch(&data_router, &mut batch).await;
                             current_bytes = 0;

@@ -191,7 +191,7 @@ pub struct DeviceOverlayRecord {
     pub(crate) mint_owner: std::sync::Mutex<Option<crate::assembly_tasks::MintedBlockGuard>>,
     /// Waiters on the record leaving the registry (frozen-record
     /// writers, drain rendezvous).
-    pub retired: tokio::sync::Notify,
+    pub retired: squeezefs_ipc::sqz_notify::Notify,
     /// Waiters on the in-flight store set changing (the settle's
     /// event wait — ACK-early wedge fix 2026-08-13: the retired
     /// `yield_now` spin, polled as a FUSED task on the queue worker's
@@ -330,7 +330,7 @@ impl DeviceOverlayRegistry {
             fence_token,
             fsck_guard: std::sync::Mutex::new(Some(fsck_guard)),
             mint_owner: std::sync::Mutex::new(Some(mint_owner)),
-            retired: tokio::sync::Notify::new(),
+            retired: squeezefs_ipc::sqz_notify::Notify::new(),
             inflight_change: tokio::sync::Notify::new(),
         });
         match self.records.entry_sync((ino, block)) {

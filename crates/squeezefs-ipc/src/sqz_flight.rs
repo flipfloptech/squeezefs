@@ -118,6 +118,13 @@ impl<T: Clone> Sender<T> {
         }
     }
 
+    /// Identity: do two handles share ONE flight? (tokio
+    /// `broadcast::Sender::same_channel` parity — the single-flight
+    /// registry's remove-if-current guard depends on it.)
+    pub fn same_channel(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.shared, &other.shared)
+    }
+
     /// Live cohort interest (waiter count; diagnostic parity with
     /// broadcast's `receiver_count`).
     pub fn waiter_count(&self) -> usize {

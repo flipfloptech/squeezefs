@@ -6,7 +6,7 @@ use std::sync::Arc;
 /// Dehydration channel, typed with the victim's sticky class (R4 / §5.3):
 /// plumbed BEHAVIOR-NEUTRAL in PR 3 (the worker still dehydrates every
 /// class); PR 4 flips the protected-only gate on this information.
-type EvictReceiver = tokio::sync::mpsc::Receiver<(String, Bytes, EvictClass)>;
+type EvictReceiver = squeezefs_ipc::sqz_channel::mpsc::Receiver<(String, Bytes, EvictClass)>;
 
 /// Insert flavor: the (protected, referenced) bit pairs the clock shard
 /// distinguishes (§5.4/§5.5).
@@ -28,7 +28,7 @@ enum PutClass {
 pub struct LruCache {
     inner: Arc<crate::tiering::memory::MemoryCache>,
     max_bytes: u64,
-    evict_tx: tokio::sync::mpsc::Sender<(String, Bytes, EvictClass)>,
+    evict_tx: squeezefs_ipc::sqz_channel::mpsc::Sender<(String, Bytes, EvictClass)>,
     evict_rx: Arc<std::sync::Mutex<Option<EvictReceiver>>>,
     /// LIVE payload bytes parked in the eviction channel (R5): the send
     /// side adds, the dehydration worker subtracts per message. The QUICK
@@ -127,7 +127,7 @@ impl LruCache {
             actual_bytes as usize,
             actual_shards,
         ));
-        let (evict_tx, evict_rx) = tokio::sync::mpsc::channel(16384);
+        let (evict_tx, evict_rx) = squeezefs_ipc::sqz_channel::mpsc::channel(16384);
         Self {
             inner,
             max_bytes: actual_bytes,

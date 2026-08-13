@@ -225,7 +225,7 @@ impl TieredCache {
                                 let _ = nvme_clone_inner
                                     .cache_read_block_validated_self(&key_clone, data_clone);
                             } else {
-                                let _ = tokio::task::spawn_blocking(move || {
+                                let _ = squeezefs_ipc::sqz_blocking::run_blocking(move || {
                                     nvme_clone_inner
                                         .cache_read_block_validated_self(&key_clone, data_clone)
                                 })
@@ -300,10 +300,12 @@ impl TieredCache {
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     } else {
                                         let nvme_inner = nvme_clone.clone();
-                                        let _ = tokio::task::spawn_blocking(move || {
-                                            nvme_inner.cache_read_block_validated_self(&key, data)
-                                        })
-                                        .await;
+                                        let _ =
+                                            squeezefs_ipc::sqz_blocking::run_blocking(move || {
+                                                nvme_inner
+                                                    .cache_read_block_validated_self(&key, data)
+                                            })
+                                            .await;
                                     }
                                 }
                             }

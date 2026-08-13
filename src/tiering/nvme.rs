@@ -1640,11 +1640,10 @@ impl NvmeCache {
             if dev.online.load(Ordering::Relaxed) {
                 for shard_idx in 0..dev.shards.len() {
                     let dev_clone = dev.clone();
-                    tokio::task::spawn_blocking(move || dev_clone.shards[shard_idx].sync_all())
-                        .await
-                        .map_err(|e| {
-                            crate::error::SqueezefsError::Io(std::io::Error::other(e.to_string()))
-                        })??;
+                    squeezefs_ipc::sqz_blocking::run_blocking(move || {
+                        dev_clone.shards[shard_idx].sync_all()
+                    })
+                    .await?;
                 }
             }
         }
@@ -1662,11 +1661,10 @@ impl NvmeCache {
                 let exists = dev.shards[shard_idx].get(key).is_some();
                 if exists {
                     let dev_clone = dev.clone();
-                    tokio::task::spawn_blocking(move || dev_clone.shards[shard_idx].sync_all())
-                        .await
-                        .map_err(|e| {
-                            crate::error::SqueezefsError::Io(std::io::Error::other(e.to_string()))
-                        })??;
+                    squeezefs_ipc::sqz_blocking::run_blocking(move || {
+                        dev_clone.shards[shard_idx].sync_all()
+                    })
+                    .await?;
                     return Ok(());
                 }
             }

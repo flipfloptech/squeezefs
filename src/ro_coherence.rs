@@ -266,7 +266,7 @@ pub fn spawn_reader_revalidation(
     volumes: Vec<Arc<KvMetaBackend>>,
     stop_flag: Arc<std::sync::atomic::AtomicBool>,
     wake: Arc<tokio::sync::Notify>,
-) -> tokio::task::JoinHandle<()> {
+) -> squeezefs_ipc::sqz_channel::oneshot::Receiver<()> {
     let poller = RevalidationPoller::derived();
     let interval = poller.interval();
     log::info!(
@@ -276,74 +276,70 @@ pub fn spawn_reader_revalidation(
         interval,
         poller.staleness_bound(),
     );
-    tokio::spawn(crate::detached::contain(
-        "reader_revalidation",
-        async move {
-            loop {
-                tokio::select! {
-                    _ = wake.notified() => {}
-                    _ = tokio::time::sleep(interval) => {}
-                }
-                if stop_flag.load(Ordering::Acquire) {
-                    log::info!("reader revalidation stopping (dismount)");
-                    return;
-                }
-                // Spec §6.8 item 3: the pass's START is what qualifies an
-                // acknowledgement (the ledger read must post-date the label
-                // by the staleness bound), so it is captured BEFORE the
-                // first volume is polled.
-                let pass_start = Instant::now();
-                let mut advanced_any = false;
-                for vol in &volumes {
-                    match poller.poll_at(vol, pass_start).await {
-                        // Not due yet (a wake arrived early) — nothing to do.
-                        Ok(None) => {}
-                        Ok(Some(out)) if out.advanced => {
-                            advanced_any = true;
-                            log::debug!(
-                                "reader revalidation: {} epoch {} → {} ({} node(s) dropped, {} \
+    crate::meta_exec::spawn_meta_join("reader_revalidation", async move {
+        loop {
+            // Park until the poll cadence elapses or a wake nudges us
+            // early (the retired two-arm `select!` — a notify is only a
+            // promptness hint, so the timeout IS the authority's cadence).
+            let _ = squeezefs_ipc::sqz_time::timeout(interval, wake.notified()).await;
+            if stop_flag.load(Ordering::Acquire) {
+                log::info!("reader revalidation stopping (dismount)");
+                return;
+            }
+            // Spec §6.8 item 3: the pass's START is what qualifies an
+            // acknowledgement (the ledger read must post-date the label
+            // by the staleness bound), so it is captured BEFORE the
+            // first volume is polled.
+            let pass_start = Instant::now();
+            let mut advanced_any = false;
+            for vol in &volumes {
+                match poller.poll_at(vol, pass_start).await {
+                    // Not due yet (a wake arrived early) — nothing to do.
+                    Ok(None) => {}
+                    Ok(Some(out)) if out.advanced => {
+                        advanced_any = true;
+                        log::debug!(
+                            "reader revalidation: {} epoch {} → {} ({} node(s) dropped, {} \
                                  retained, {} block key(s) purged)",
-                                vol.device_path().display(),
-                                out.from_epoch,
-                                out.epoch,
-                                out.dropped,
-                                out.retained,
-                                out.keys_purged,
-                            );
-                        }
-                        // The inert poll — the common case under an idle
-                        // writer, and deliberately free (no drop, no purge).
-                        Ok(Some(_)) => {}
-                        Err(e) => log::warn!(
-                            "reader revalidation pass failed on {}: {e} (the reader keeps \
-                         serving its current epoch and retries next pass)",
-                            vol.device_path().display()
-                        ),
+                            vol.device_path().display(),
+                            out.from_epoch,
+                            out.epoch,
+                            out.dropped,
+                            out.retained,
+                            out.keys_purged,
+                        );
                     }
-                }
-                // **Spec §6.8 item 3 — where the acknowledgement is
-                // emitted.** Right here, at the END of a pass, and only
-                // when that pass ran the R-6 purge (`advanced_any`): the
-                // ack means "I have FINISHED using anything freed at or
-                // before this label", so it may not be emitted before the
-                // purge that makes it true, nor before the drain window
-                // that lets pre-purge serves and daemon-cached layouts
-                // expire. `free_grace::reader_pass_completed` owns that
-                // ladder; the value then rides the next lease renewal, so
-                // the reader still writes nothing, anywhere. Inert on a
-                // mount that is not a plane member.
-                if let Some(label) = crate::free_grace::reader_pass_completed(
-                    reader_clock_ms(&pass_start),
-                    advanced_any,
-                ) {
-                    log::debug!(
-                        "reader acknowledged freed-offset label {label}: the writer may \
-                         reallocate everything it freed at or before it (spec §6.8 item 3)"
-                    );
+                    // The inert poll — the common case under an idle
+                    // writer, and deliberately free (no drop, no purge).
+                    Ok(Some(_)) => {}
+                    Err(e) => log::warn!(
+                        "reader revalidation pass failed on {}: {e} (the reader keeps \
+                         serving its current epoch and retries next pass)",
+                        vol.device_path().display()
+                    ),
                 }
             }
-        },
-    ))
+            // **Spec §6.8 item 3 — where the acknowledgement is
+            // emitted.** Right here, at the END of a pass, and only
+            // when that pass ran the R-6 purge (`advanced_any`): the
+            // ack means "I have FINISHED using anything freed at or
+            // before this label", so it may not be emitted before the
+            // purge that makes it true, nor before the drain window
+            // that lets pre-purge serves and daemon-cached layouts
+            // expire. `free_grace::reader_pass_completed` owns that
+            // ladder; the value then rides the next lease renewal, so
+            // the reader still writes nothing, anywhere. Inert on a
+            // mount that is not a plane member.
+            if let Some(label) =
+                crate::free_grace::reader_pass_completed(reader_clock_ms(&pass_start), advanced_any)
+            {
+                log::debug!(
+                    "reader acknowledged freed-offset label {label}: the writer may \
+                         reallocate everything it freed at or before it (spec §6.8 item 3)"
+                );
+            }
+        }
+    })
 }
 
 /// The pass-start instant in the MEMBER's clock frame, in ms.

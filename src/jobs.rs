@@ -35,11 +35,11 @@
 use crate::fuse_client::METRICS;
 use crate::meta_backend::{Metadata, RoutedMetaBackend};
 use serde::{Deserialize, Serialize};
+use squeezefs_ipc::sqz_notify::Notify;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use tokio::sync::Notify;
 
 /// Reserved xattr prefix for fabric records on ino 1 (§5.1.2; screened
 /// by the VAL-2 allowlist —
@@ -592,7 +592,7 @@ pub fn clear_evacuate_pre_publish_hook() {
 async fn fire_pre_publish_hook(ino: u64, block_idx: u32) {
     let hook = EVAC_PRE_PUBLISH_HOOK.read().clone();
     if let Some(h) = hook {
-        let _ = tokio::task::spawn_blocking(move || h(ino, block_idx)).await;
+        squeezefs_ipc::sqz_blocking::run_blocking(move || h(ino, block_idx)).await;
     }
 }
 
@@ -1200,7 +1200,7 @@ impl JobFabric {
         job_id: &str,
         timeout: Duration,
     ) -> crate::error::Result<JobState> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = std::time::Instant::now() + timeout;
         loop {
             let Some(st) = self.status(job_id).await? else {
                 return Err(crate::error::SqueezefsError::InvalidOperation(format!(
@@ -1210,7 +1210,7 @@ impl JobFabric {
             if st.state.is_terminal() {
                 return Ok(st.state);
             }
-            if tokio::time::Instant::now() >= deadline {
+            if std::time::Instant::now() >= deadline {
                 return Err(crate::error::SqueezefsError::InvalidOperation(format!(
                     "job {job_id} not terminal within {timeout:?}"
                 )));
@@ -1223,7 +1223,7 @@ impl JobFabric {
                     None => std::future::pending().await,
                 }
             };
-            let _ = tokio::time::timeout(Duration::from_millis(50), notified).await;
+            let _ = squeezefs_ipc::sqz_time::timeout(Duration::from_millis(50), notified).await;
         }
     }
 
@@ -1388,7 +1388,7 @@ impl JobFabric {
         // tests/job_fabric_tests.rs park-window tests).
         let park_delay = TEST_JOB_PARK_DELAY_MS.load(Ordering::Relaxed);
         if park_delay > 0 {
-            tokio::time::sleep(Duration::from_millis(park_delay)).await;
+            squeezefs_ipc::sqz_time::sleep(Duration::from_millis(park_delay)).await;
         }
         if ctl.settle_park() == JobState::Queued {
             // The resume won inside the window: re-assert Queued
@@ -1409,7 +1409,7 @@ impl JobFabric {
     /// duty-adherence gate holds.
     async fn duty_park(ctl: &JobCtl, task_elapsed: Duration) {
         const SLICE: Duration = Duration::from_millis(50);
-        let started = tokio::time::Instant::now();
+        let started = std::time::Instant::now();
         loop {
             if ctl.cancelled.load(Ordering::SeqCst) || ctl.paused.load(Ordering::SeqCst) {
                 return; // the vehicle's park/cancel arm owns the exit
@@ -1422,7 +1422,7 @@ impl JobFabric {
             if served >= total {
                 return;
             }
-            tokio::time::sleep((total - served).min(SLICE)).await;
+            squeezefs_ipc::sqz_time::sleep((total - served).min(SLICE)).await;
         }
     }
 
@@ -1526,7 +1526,7 @@ impl JobFabric {
 
     /// One pending-work wake for the wire dispatcher (the same notify
     /// the local pool parks on).
-    pub(crate) fn work_notified(&self) -> tokio::sync::futures::Notified<'_> {
+    pub(crate) fn work_notified(&self) -> impl std::future::Future<Output = ()> + '_ {
         self.work.notified()
     }
 
@@ -1539,8 +1539,11 @@ impl JobFabric {
             let Some((job_id, ctl)) = self.claim_next(false) else {
                 // Park until submitted/resumed work (bounded so a lost
                 // notify cannot strand the pool).
-                let _ =
-                    tokio::time::timeout(Duration::from_millis(500), self.work.notified()).await;
+                let _ = squeezefs_ipc::sqz_time::timeout(
+                    Duration::from_millis(500),
+                    self.work.notified(),
+                )
+                .await;
                 continue;
             };
             ctl.set_state(JobState::Running);
@@ -1656,19 +1659,28 @@ impl JobFabric {
         // cooperative flag (pause is treated as cancel — a detection run
         // re-submits cheaply; there is no partial-resume state).
         let cancel = opts.cancel.clone();
-        let watcher = {
+        // Stop latch (the D0 heartbeat precedent — sqz-meta tasks are
+        // never aborted mid-poll): the watcher exits within one 100 ms
+        // slice of the run finishing; a late `cancel.store` against a
+        // finished run's flag is harmless (the flag is per-run).
+        let watcher_stop = Arc::new(AtomicBool::new(false));
+        {
             let cancel = cancel.clone();
             let ctl = Arc::clone(ctl);
-            tokio::spawn(async move {
+            let stop = Arc::clone(&watcher_stop);
+            crate::meta_exec::spawn_meta("fsck_cancel_watcher", async move {
                 loop {
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
                     if ctl.cancelled.load(Ordering::SeqCst) || ctl.paused.load(Ordering::SeqCst) {
                         cancel.store(true, Ordering::SeqCst);
                         return;
                     }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    squeezefs_ipc::sqz_time::sleep(Duration::from_millis(100)).await;
                 }
-            })
-        };
+            });
+        }
         let outcome = crate::fsck::run(&fsck_ctx, &opts).await;
         // PR VL6b (§5.6a): repair consumes the run's VERIFIED findings on
         // the coordinator — dry-run plans only; apply executes each action
@@ -1695,8 +1707,7 @@ impl JobFabric {
             },
             Err(e) => Err(e),
         };
-        watcher.abort();
-        let _ = watcher.await;
+        watcher_stop.store(true, Ordering::Release);
         if ctl.cancelled.load(Ordering::SeqCst) {
             let _ = self.checkpoint_as(job_id, ctl, JobState::Cancelled).await;
             ctl.set_state(JobState::Cancelled);
@@ -1837,7 +1848,7 @@ impl JobFabric {
     /// plan regeneration (a re-run re-censuses — compaction is
     /// idempotent, an already-folded leaf is no longer a candidate).
     async fn run_defrag_meta(&self, job_id: &str, ctl: &JobCtl) {
-        let mut last_checkpoint = tokio::time::Instant::now();
+        let mut last_checkpoint = std::time::Instant::now();
         for kv in self.meta.volumes.iter() {
             if ctl.cancelled.load(Ordering::SeqCst) {
                 let _ = self.checkpoint_as(job_id, ctl, JobState::Cancelled).await;
@@ -1869,7 +1880,7 @@ impl JobFabric {
                 if ctl.cancelled.load(Ordering::SeqCst) || ctl.paused.load(Ordering::SeqCst) {
                     break;
                 }
-                let start = tokio::time::Instant::now();
+                let start = std::time::Instant::now();
                 match kv.defrag_compact_nodes(chunk).await {
                     Ok(kicked) => {
                         METRICS
@@ -1888,7 +1899,7 @@ impl JobFabric {
                 }
                 if last_checkpoint.elapsed() >= Duration::from_secs(CHECKPOINT_SECS) {
                     let _ = self.checkpoint(job_id, ctl).await;
-                    last_checkpoint = tokio::time::Instant::now();
+                    last_checkpoint = std::time::Instant::now();
                 }
                 Self::duty_park(ctl, start.elapsed()).await;
             }
@@ -1927,7 +1938,7 @@ impl JobFabric {
         let targets = (hook.targets)();
         ctl.tasks_total
             .store(targets.len() as u64, Ordering::Relaxed);
-        let mut last_checkpoint = tokio::time::Instant::now();
+        let mut last_checkpoint = std::time::Instant::now();
         for (ino, b) in targets {
             if ctl.cancelled.load(Ordering::SeqCst) {
                 let _ = self.checkpoint_as(job_id, ctl, JobState::Cancelled).await;
@@ -1938,7 +1949,7 @@ impl JobFabric {
                 self.park_paused(job_id, ctl).await;
                 return;
             }
-            let start = tokio::time::Instant::now();
+            let start = std::time::Instant::now();
             match (hook.kick)(ino, b).await {
                 Ok(true) => {
                     METRICS.defrag_folds_kicked.fetch_add(1, Ordering::Relaxed);
@@ -1954,15 +1965,16 @@ impl JobFabric {
             METRICS.job_tasks_done.fetch_add(1, Ordering::Relaxed);
             if last_checkpoint.elapsed() >= Duration::from_secs(CHECKPOINT_SECS) {
                 let _ = self.checkpoint(job_id, ctl).await;
-                last_checkpoint = tokio::time::Instant::now();
+                last_checkpoint = std::time::Instant::now();
             }
             Self::duty_park(ctl, start.elapsed()).await;
         }
         if let Some(ctx) = self.mover.as_ref() {
             let router = ctx.router.clone();
-            let _ =
-                tokio::task::spawn_blocking(move || crate::defrag::refresh_d1_d3_gauges(&router))
-                    .await;
+            squeezefs_ipc::sqz_blocking::run_blocking(move || {
+                crate::defrag::refresh_d1_d3_gauges(&router)
+            })
+            .await;
         }
         let _ = self.checkpoint_as(job_id, ctl, JobState::Completed).await;
         METRICS.job_completed.fetch_add(1, Ordering::Relaxed);
@@ -1973,7 +1985,7 @@ impl JobFabric {
     /// live-re-read); checkpoint on the §5.1.2 cadence.
     async fn run_noop(&self, job_id: &str, ctl: &JobCtl) {
         let mut since_checkpoint = 0u64;
-        let mut last_checkpoint = tokio::time::Instant::now();
+        let mut last_checkpoint = std::time::Instant::now();
         loop {
             if ctl.cancelled.load(Ordering::SeqCst) {
                 let _ = self.checkpoint_as(job_id, ctl, JobState::Cancelled).await;
@@ -1994,10 +2006,10 @@ impl JobFabric {
                 return;
             }
 
-            let start = tokio::time::Instant::now();
+            let start = std::time::Instant::now();
             match &ctl.job_type {
                 JobType::Noop { task_ms, .. } => {
-                    tokio::time::sleep(Duration::from_millis(*task_ms)).await;
+                    squeezefs_ipc::sqz_time::sleep(Duration::from_millis(*task_ms)).await;
                 }
                 _ => unreachable!("run_noop only executes Noop jobs"),
             }
@@ -2015,7 +2027,7 @@ impl JobFabric {
             {
                 let _ = self.checkpoint(job_id, ctl).await;
                 since_checkpoint = 0;
-                last_checkpoint = tokio::time::Instant::now();
+                last_checkpoint = std::time::Instant::now();
             }
 
             // KD-3: duty-cycle throttle, live re-read per task.
@@ -2062,9 +2074,9 @@ impl JobFabric {
             "mover jobs need a mover context (not wired on this fabric)".to_string()
         })?;
         let block_size = ctx.router.block_size.load(Ordering::Relaxed);
-        let mut last_checkpoint = tokio::time::Instant::now();
+        let mut last_checkpoint = std::time::Instant::now();
         let mut since_checkpoint = 0u64;
-        let started = tokio::time::Instant::now();
+        let started = std::time::Instant::now();
         let moved_at_start = METRICS.evacuate_bytes_moved.load(Ordering::Relaxed);
         let mut defrag_passes = 0u32;
 
@@ -2278,7 +2290,7 @@ impl JobFabric {
                 };
                 let window = &census.tasks[task_i..(task_i + width).min(census.tasks.len())];
                 task_i += window.len();
-                let start = tokio::time::Instant::now();
+                let start = std::time::Instant::now();
                 let outcomes = futures::future::join_all(
                     window
                         .iter()
@@ -2314,7 +2326,7 @@ impl JobFabric {
                     let _ = self.checkpoint(job_id, ctl).await;
                     ctx.write_rate.observe();
                     since_checkpoint = 0;
-                    last_checkpoint = tokio::time::Instant::now();
+                    last_checkpoint = std::time::Instant::now();
                 }
                 // KD-3: duty-cycle throttle, live re-read per task
                 // (width is 1 whenever the throttle is active).
@@ -2380,7 +2392,7 @@ impl JobFabric {
             if let MoverObjective::Defrag { .. } = objective {
                 defrag_passes += 1;
                 let router = ctx.router.clone();
-                let _ = tokio::task::spawn_blocking(move || {
+                squeezefs_ipc::sqz_blocking::run_blocking(move || {
                     crate::defrag::refresh_d1_d3_gauges(&router)
                 })
                 .await;
@@ -2409,7 +2421,7 @@ impl JobFabric {
                 // No forward progress possible right now (quiescence
                 // waits / in-flight victim allocations): bounded backoff
                 // before the next idempotent re-plan.
-                tokio::time::sleep(REPLAN_BACKOFF).await;
+                squeezefs_ipc::sqz_time::sleep(REPLAN_BACKOFF).await;
             }
         }
     }

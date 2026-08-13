@@ -982,18 +982,15 @@ pub async fn arm_mount_data_plane(
                 & crate::meta_backend::kv::superblock::FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA
                 != 0
         });
-    tokio::task::spawn_blocking(move || arm_data_plane(posture, &data_paths, stamped))
+    squeezefs_ipc::sqz_blocking::run_blocking(move || arm_data_plane(posture, &data_paths, stamped))
         .await
-        .map_err(|e| {
-            SqueezefsError::InvalidOperation(format!("data-plane arming task failed: {e}"))
-        })?
 }
 
 /// Release a hold off the async runtime (the reservation ioctls are
 /// blocking). Unmount teardown and the job wire's last-departure release
 /// both go through here.
 pub async fn release_hold(hold: WeroHold) {
-    let _ = tokio::task::spawn_blocking(move || drop(hold)).await;
+    squeezefs_ipc::sqz_blocking::run_blocking(move || drop(hold)).await;
 }
 
 /// Quarantine every offset of `dests` on `allocator` under `epoch` — the

@@ -241,7 +241,6 @@ pub struct MultiWriterArm {
     owner: Arc<WriteCustodyOwner>,
     wero: Option<WeroHold>,
     stop: Arc<AtomicBool>,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
     endpoint: String,
 }
 
@@ -250,7 +249,6 @@ impl std::fmt::Debug for MultiWriterArm {
         f.debug_struct("MultiWriterArm")
             .field("endpoint", &self.endpoint)
             .field("owner", &self.owner)
-            .field("tasks", &self.tasks.len())
             .finish_non_exhaustive()
     }
 }
@@ -270,12 +268,12 @@ impl MultiWriterArm {
     /// ownership, uninstall both custody halves, and release the WERO hold
     /// off the async runtime (its ioctls are blocking).
     pub async fn disarm(mut self) {
+        // Stop latch (the D0 heartbeat precedent — sqz-meta tasks are
+        // never aborted mid-poll): the sweep loop checks `stop` after
+        // every cadence sleep and exits before touching the owner again.
         self.stop.store(true, Ordering::Release);
         if let Some(listener) = self.listener.take() {
             listener.shutdown();
-        }
-        for task in self.tasks.drain(..) {
-            task.abort();
         }
         data_grant::uninstall_custody_client();
         data_grant::uninstall_custody_owner();
@@ -373,13 +371,10 @@ pub async fn arm_multi_writer(
     // Rung 3: the substrate. S7's own arm takes (or JOINS) the WERO hold and
     // refuses a namespace that advertises no reservation support, naming it.
     let paths = data_paths.to_vec();
-    let wero = tokio::task::spawn_blocking(move || {
+    let wero = squeezefs_ipc::sqz_blocking::run_blocking(move || {
         data_custody::arm_data_plane(CustodyPosture::MultiWriter, &paths, true)
     })
-    .await
-    .map_err(|e| {
-        SqueezefsError::InvalidOperation(format!("multi-writer data-plane arming task failed: {e}"))
-    })??;
+    .await?;
 
     // Rung 4: the membership plane. A co-writer that cannot be SEEN cannot
     // be EVICTED, and eviction is what mints the dead epoch S7's quarantine
@@ -605,7 +600,7 @@ pub async fn arm_multi_writer(
     crate::meta_ship::arm_ownership(map);
 
     let stop = Arc::new(AtomicBool::new(false));
-    let cadence = spawn_cadence(Arc::clone(&owner), wero.clone(), Arc::clone(&stop), renew);
+    spawn_cadence(Arc::clone(&owner), wero.clone(), Arc::clone(&stop), renew);
 
     log::warn!(
         "MULTI-WRITER ARMED (DLM S9) on {endpoint}: era {term}, custody authority '{}', \
@@ -622,7 +617,6 @@ pub async fn arm_multi_writer(
         owner,
         wero,
         stop,
-        tasks: vec![cadence],
         endpoint,
     }))
 }
@@ -715,10 +709,10 @@ fn spawn_cadence(
     wero: Option<WeroHold>,
     stop: Arc<AtomicBool>,
     cadence: Duration,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(crate::detached::contain("mw_custody_sweep", async move {
+) {
+    crate::meta_exec::spawn_meta_contained("mw_custody_sweep", async move {
         loop {
-            tokio::time::sleep(cadence).await;
+            squeezefs_ipc::sqz_time::sleep(cadence).await;
             if stop.load(Ordering::Acquire) {
                 return;
             }
@@ -749,9 +743,8 @@ fn spawn_cadence(
                     continue;
                 }
                 let victim = dead.pr_key;
-                let landed = tokio::task::spawn_blocking(move || hold.preempt(victim))
-                    .await
-                    .unwrap_or(0);
+                let landed =
+                    squeezefs_ipc::sqz_blocking::run_blocking(move || hold.preempt(victim)).await;
                 match data_grant::DrainProof::preempt_landed(landed) {
                     Some(proof) => {
                         owner.release_dead(&dead, proof);
@@ -765,5 +758,5 @@ fn spawn_cadence(
                 }
             }
         }
-    }))
+    })
 }

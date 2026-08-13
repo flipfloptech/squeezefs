@@ -1041,30 +1041,34 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
         // never guessed from).
         let unthrottled = opts.throttle_pct == 0 || opts.throttle_pct >= 100;
         let (census, referenced) = if unthrottled {
-            let mut walks = tokio::task::JoinSet::new();
+            let mut walks = Vec::new();
             for (vol_idx, kv) in ctx.meta.volumes.iter().enumerate() {
                 for tree_idx in 0..kv.trees().len() {
                     let kv = kv.clone();
                     let cancel = opts.cancel.clone();
                     let pct = opts.throttle_pct;
-                    walks.spawn(async move {
-                        walk_one_tree_c1(kv, vol_idx, tree_idx, pct, cancel).await
-                    });
+                    walks.push(crate::meta_exec::spawn_meta_join(
+                        "fsck_c1_walk",
+                        async move { walk_one_tree_c1(kv, vol_idx, tree_idx, pct, cancel).await },
+                    ));
                 }
             }
             // The C4/C5 staging scan overlaps too (its own dirs +
             // per-custody-key getattr — disjoint from the walks).
-            let staging = tokio::spawn(scan_staging(
-                ctx.meta.clone(),
-                ctx.staging_dirs.clone(),
-                ctx.expected_generation.clone(),
-                opts.shard,
-            ));
+            let staging = crate::meta_exec::spawn_meta_join(
+                "fsck_staging_scan",
+                scan_staging(
+                    ctx.meta.clone(),
+                    ctx.staging_dirs.clone(),
+                    ctx.expected_generation.clone(),
+                    opts.shard,
+                ),
+            );
             // C9's referenced-ino pass: one dentry-tree walk, disjoint
             // from the census (which walks `TREE_INODES`), so it overlaps
             // too — the difference is taken after both land, and neither
             // side depends on the other's order.
-            let refs_pass = tokio::spawn({
+            let refs_pass = crate::meta_exec::spawn_meta_join("fsck_c9_refs", {
                 let meta = ctx.meta.clone();
                 let shard = opts.shard;
                 let pct = opts.throttle_pct;
@@ -1072,8 +1076,10 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
                 async move { build_referenced_inos(meta, shard, pct, cancel, None).await }
             });
             let census = walk_census(ctx, opts, &mut counters).await?;
-            while let Some(joined) = walks.join_next().await {
-                let (nodes_walked, walk_suspects) = joined.map_err(|e| {
+            // All walks must land before the pass proceeds; awaiting in
+            // submission order is equivalent (results only accumulate).
+            for walk in walks {
+                let (nodes_walked, walk_suspects) = walk.await.map_err(|e| {
                     crate::error::SqueezefsError::InvalidOperation(format!(
                         "fsck C1 walk task failed: {e}"
                     ))
@@ -1223,7 +1229,7 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
         if !suspects.is_empty() {
             if online {
                 // ---- Settle (§5.6 step 2) ----
-                tokio::time::sleep(opts.settle).await;
+                squeezefs_ipc::sqz_time::sleep(opts.settle).await;
                 for v in &vols {
                     v.alloc.fsck_bump_epoch();
                 }
@@ -3453,7 +3459,7 @@ async fn throttle(opts: &FsckOptions, elapsed: Duration) {
 /// the spawned per-tree C1 walks use.
 async fn throttle_sleep(throttle_pct: u32, elapsed: Duration) {
     if let Some(delay) = crate::jobs::job_throttle_sleep(elapsed, throttle_pct) {
-        tokio::time::sleep(delay).await;
+        squeezefs_ipc::sqz_time::sleep(delay).await;
     }
 }
 
@@ -3650,7 +3656,11 @@ impl Quarantine {
             std::process::id()
         );
         let dir = home.join(run_id);
-        tokio::fs::create_dir_all(&dir).await.map_err(|e| {
+        {
+            let dir = dir.clone();
+            squeezefs_ipc::sqz_blocking::run_blocking(move || std::fs::create_dir_all(&dir)).await
+        }
+        .map_err(|e| {
             SqueezefsError::Io(std::io::Error::new(
                 e.kind(),
                 format!("creating quarantine dir {}: {e}", dir.display()),

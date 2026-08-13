@@ -206,7 +206,7 @@ pub(crate) struct ZcFetchMsg {
     fd: RawFd,
     off: u64,
     len: u32,
-    done: tokio::sync::oneshot::Sender<i32>,
+    done: crate::sqz_channel::oneshot::Sender<i32>,
 }
 
 /// A handler-initiated zc device STORE (the D14 write-side direct leg):
@@ -219,7 +219,7 @@ pub(crate) struct ZcStoreMsg {
     ent_idx: u16,
     fd: RawFd,
     dev_off: u64,
-    done: tokio::sync::oneshot::Sender<i32>,
+    done: crate::sqz_channel::oneshot::Sender<i32>,
 }
 
 /// A handler-requested LAZY WRITE-payload extraction
@@ -229,7 +229,7 @@ pub(crate) struct ZcStoreMsg {
 pub(crate) struct ZcExtractMsg {
     qid: u16,
     ent_idx: u16,
-    done: tokio::sync::oneshot::Sender<io::Result<Bytes>>,
+    done: crate::sqz_channel::oneshot::Sender<io::Result<Bytes>>,
 }
 
 /// One message to a drain-group worker (commit channel payload).
@@ -3235,7 +3235,7 @@ impl FuseOverUring {
                 "zc fetch: session not zc-armed",
             ));
         }
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = crate::sqz_channel::oneshot::channel();
         let g = self
             .group_of
             .get(qid as usize)
@@ -3328,7 +3328,7 @@ impl FuseOverUring {
                 "zc store: session not zc-armed",
             ));
         }
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = crate::sqz_channel::oneshot::channel();
         let g = self
             .group_of
             .get(qid as usize)
@@ -3380,7 +3380,7 @@ impl FuseOverUring {
                 "zc extract: session not zc-armed",
             ));
         }
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = crate::sqz_channel::oneshot::channel();
         let g = self
             .group_of
             .get(qid as usize)
@@ -4774,7 +4774,7 @@ fn queue_worker(
         /// A LAZY extraction completed: mint the §5.4 lease over the
         /// bounce bytes and answer the parked handler's oneshot.
         Lazy {
-            done: tokio::sync::oneshot::Sender<io::Result<Bytes>>,
+            done: crate::sqz_channel::oneshot::Sender<io::Result<Bytes>>,
             len: u32,
         },
         /// An AT-DELIVERY extraction completed: mint the lease and push

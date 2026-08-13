@@ -103,6 +103,16 @@ pub mod env_knob_core;
 pub mod exec_core;
 pub mod path;
 pub mod raw;
+// First-party blocking-work offload (the rip-tokio-total sweep) — same
+// share pattern; `run_blocking` resolves `crate::sqz_channel` through
+// the include below.
+#[path = "../../squeezefs-ipc/src/sqz_blocking.rs"]
+pub mod sqz_blocking;
+// First-party oneshot/mpsc/watch channels (the rip-tokio-total sweep) —
+// same share pattern; unbounded parks resolve `crate::sqz_time`'s
+// ticked backstop through the include below.
+#[path = "../../squeezefs-ipc/src/sqz_channel.rs"]
+pub mod sqz_channel;
 #[path = "../../squeezefs-ipc/src/sqz_exec.rs"]
 pub mod sqz_exec;
 // First-party timer service (the rip-tokio-out sweep, 2026-08-13) —

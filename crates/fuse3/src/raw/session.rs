@@ -32,11 +32,11 @@ use nix::mount::MntFlags;
     feature = "tokio-runtime",
     feature = "unprivileged"
 ))]
-use tokio::process::Command;
+use std::process::Command;
+#[cfg(feature = "tokio-runtime")]
+use tokio::task;
 #[cfg(feature = "tokio-runtime")]
 use tokio::task::JoinHandle;
-#[cfg(feature = "tokio-runtime")]
-use tokio::{fs::read_dir, task};
 use tracing::{debug, debug_span, error, instrument, warn, Instrument, Span};
 
 #[cfg(all(target_os = "linux", feature = "unprivileged"))]
@@ -398,11 +398,10 @@ impl MountHandleInner {
             // TODO: freebsd mount is unprivileged, then unmount is unprivileged too?
             #[cfg(target_os = "freebsd")]
             {
-                task::spawn_blocking(move || {
+                crate::sqz_blocking::run_blocking(move || {
                     mount::unmount(&self.mount_path, MntFlags::MNT_SYNCHRONOUS)
                 })
-                .await
-                .unwrap()?;
+                .await?;
             }
 
             #[cfg(target_os = "linux")]
@@ -415,10 +414,17 @@ impl MountHandleInner {
                         if attempt > 0 {
                             crate::sqz_time::sleep(std::time::Duration::from_millis(100)).await;
                         }
-                        let mut child = Command::new(&binary_path)
-                            .args([OsStr::new("-u"), self.mount_path.as_os_str()])
-                            .spawn()?;
-                        if child.wait().await?.success() {
+                        // std::process::Command spawn + wait on the blocking
+                        // pool (fusermount3 is syscall-class subprocess work).
+                        let binary_path = binary_path.clone();
+                        let mount_path = self.mount_path.clone();
+                        let status = crate::sqz_blocking::run_blocking(move || {
+                            Command::new(&binary_path)
+                                .args([OsStr::new("-u"), mount_path.as_os_str()])
+                                .status()
+                        })
+                        .await?;
+                        if status.success() {
                             success = true;
                             break;
                         }
@@ -437,9 +443,7 @@ impl MountHandleInner {
                         crate::sqz_time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                     let mp = mount_path.clone();
-                    let res = task::spawn_blocking(move || mount::umount(&mp))
-                        .await
-                        .unwrap();
+                    let res = crate::sqz_blocking::run_blocking(move || mount::umount(&mp)).await;
                     if res.is_ok() {
                         success = true;
                         break;
@@ -592,8 +596,16 @@ impl<FS> Session<FS> {
 #[cfg(feature = "tokio-runtime")]
 impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
     async fn mount_empty_check(&self, mount_path: &Path) -> IoResult<()> {
+        // std::fs::read_dir on the blocking pool (one-shot mount-time
+        // probe; `Some(Ok(_))` = the directory has a readable first entry,
+        // the tokio `next_entry() == Ok(Some(_))` shape).
+        let mount_path_buf = mount_path.to_path_buf();
         if !self.mount_options.nonempty
-            && matches!(read_dir(mount_path).await?.next_entry().await, Ok(Some(_)))
+            && crate::sqz_blocking::run_blocking(move || {
+                std::fs::read_dir(mount_path_buf)
+                    .map(|mut entries| matches!(entries.next(), Some(Ok(_))))
+            })
+            .await?
         {
             return Err(IoError::new(
                 ErrorKind::AlreadyExists,

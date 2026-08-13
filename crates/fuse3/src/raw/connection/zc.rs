@@ -276,7 +276,7 @@ pub(crate) enum ZcPend {
     /// bytes read). The slot's reply commit comes LATER via the normal
     /// path.
     HandlerFetch {
-        done: tokio::sync::oneshot::Sender<i32>,
+        done: crate::sqz_channel::oneshot::Sender<i32>,
     },
     /// A handler-initiated device STORE (`WRITE_FIXED(device fd ←
     /// slot)`, the D14 write-side direct leg): the WRITE payload's
@@ -286,7 +286,7 @@ pub(crate) enum ZcPend {
     /// AT THE CONSUMING SITE (the root patch path), never here, so a
     /// caller-side validation failure can never leave a phantom count.
     HandlerStore {
-        done: tokio::sync::oneshot::Sender<i32>,
+        done: crate::sqz_channel::oneshot::Sender<i32>,
     },
     /// A handler-requested LAZY payload extraction (`WRITE_FIXED(slot →
     /// memfd)`, dispatch-before-extraction): the delivered request was
@@ -294,7 +294,7 @@ pub(crate) enum ZcPend {
     /// shape materializes it here — the CQE mints the §5.4 lease over
     /// the bounce slot and answers the oneshot.
     LazyExtract {
-        done: tokio::sync::oneshot::Sender<io::Result<bytes::Bytes>>,
+        done: crate::sqz_channel::oneshot::Sender<io::Result<bytes::Bytes>>,
         len: u32,
     },
     /// An AT-DELIVERY payload extraction (`WRITE_FIXED(slot → memfd)`,

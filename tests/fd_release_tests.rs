@@ -32,19 +32,23 @@ fn count_tmp_fds() -> usize {
         .count()
 }
 
-/// Non-async on purpose: the graph is built and dropped inside a scoped
-/// runtime so the count runs AFTER runtime teardown — live background
-/// workers (merge worker, health probe) cannot alias as leaks.
+/// Non-async on purpose; the count CONVERGES rather than reads
+/// instantly (rip-tokio-total port): background workers (merge worker,
+/// health probe, dehydrate workers, reclaim worker) now live on the
+/// process-lifetime sqz pools with BOUNDED exit edges — weak-upgrade
+/// failure, last-clone-drop stop guards, channel closure — each firing
+/// within one 2 s tick of the graph drop. The contract this pins is
+/// unchanged and stronger than the old scoped-runtime form: no
+/// IMMORTAL fd hold (the convicted Arc cycle held forever), AND every
+/// worker exit edge actually fires (the immortal-fs law's fd face —
+/// the old form never verified the workers released anything, it
+/// killed them with the runtime).
 #[test]
 fn dropped_router_graph_releases_all_segment_fds() {
     let base = count_tmp_fds();
     {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
+        {
+            squeezefs_ipc::sqz_blocking::block_on(async {
             let dlm = DlmClient::new().unwrap();
             let b = NamedTempFile::new().unwrap();
             std::fs::File::create(b.path())
@@ -69,12 +73,23 @@ fn dropped_router_graph_releases_all_segment_fds() {
             let router = DataRouter::new(dlm.clone(), cache, ba, nvme);
             let _ = router;
         });
-        drop(rt);
+        }
     }
-    let leaked = count_tmp_fds().saturating_sub(base);
-    assert_eq!(
-        leaked, 0,
-        "a dropped DataRouter graph must release every segment fd — {leaked} \
-         still open (the read_tier_purge ↔ backend_router Arc cycle is back?)"
-    );
+    // Converge-within-bound: the workers' exit edges are tick-cadenced
+    // (2 s); 10 s = five ticks of margin. A count that never converges
+    // is an IMMORTAL hold — the convicted cycle class.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let leaked = count_tmp_fds().saturating_sub(base);
+        if leaked == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a dropped DataRouter graph must release every segment fd — {leaked} \
+             still open after 10 s (an IMMORTAL hold: the read_tier_purge ↔ \
+             backend_router Arc cycle, or a worker exit edge that never fires)"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }

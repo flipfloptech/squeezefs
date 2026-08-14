@@ -2676,7 +2676,18 @@ const RING_PARK_RECHECK: std::time::Duration = std::time::Duration::from_millis(
 /// t32qd32/fleet wash-or-better with −10 % daemon CPU, completion
 /// wakes ≈ 0 at depth. `SQUEEZEFS_IL_REAP_PARK_MAX` is the measurement
 /// lever (clamp 0..=4096, read once).
-const REAP_EVENT_PARK_MAX: usize = 2;
+///
+/// RE-SIZED **2 → 24** (2026-08-13 fleet-residue campaign, counted on
+/// the sqz-sync park-race fix): the 2026-07-28 herd that priced 24 out
+/// predates BOTH the r2 batch-wake threshold (the doorbell now wakes at
+/// the k-th completion — `sizing::reap_batch_wake_threshold` — so an
+/// event-parked deep reaper no longer pays a wake per completion) and
+/// the lost-wake fix. Re-counted double A-B-B-A, TCP devsub, engagement
+/// exact: write 32×8 129–136 k vs 100–120 k at 2 (+14 % median), write
+/// 16×16 +7 %, 32×32 wash, qd1 RTT preserved (p99 94 vs 98 µs), read
+/// 32×8 +2.8 % / 32×32 +1.4 % with equal-or-better p99 — no losing
+/// shape. The blind quantum sleep is now the >24 regime only.
+const REAP_EVENT_PARK_MAX: usize = 24;
 
 fn reap_event_park_max() -> usize {
     static V: OnceLock<usize> = OnceLock::new();
@@ -2924,7 +2935,7 @@ mod reap_park_max_tests {
     /// explicit measurement lever, clamped, unparseable ⇒ default.
     #[test]
     fn reap_park_max_default_and_clamp() {
-        assert_eq!(reap_event_park_max_from(None), 2);
+        assert_eq!(reap_event_park_max_from(None), 24);
         assert_eq!(reap_event_park_max_from(Some("0")), 0);
         assert_eq!(reap_event_park_max_from(Some("64")), 64);
         assert_eq!(
@@ -2932,7 +2943,7 @@ mod reap_park_max_tests {
             4096,
             "clamp ceiling"
         );
-        assert_eq!(reap_event_park_max_from(Some("garbage")), 2);
+        assert_eq!(reap_event_park_max_from(Some("garbage")), 24);
     }
 
     /// The deep-regime batch-reap quantum lever (shim-iops campaign,

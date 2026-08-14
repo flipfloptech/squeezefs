@@ -6456,6 +6456,20 @@ const fn regular_open_reply_flags() -> u32 {
 /// FUSE_NOTIFY_INVAL_INODE push through the fuse3 Notify handle
 /// (`start_mount`, next to `kernel_notify`); tests inject recorders (the
 /// `ipc_service::Invalidator` hook precedent).
+/// Per-ino DIO-write page-coherence word (see the `page_cache_inos`
+/// field doc): live buffered handles, the page-instantiation
+/// generation, and the quiescent clean latch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageCoherence {
+    /// Live buffered (non-O_DIRECT) handles.
+    pub buffered_handles: u32,
+    /// Bumped by every page-instantiating serve.
+    pub gen: u64,
+    /// `Some(g)` = a whole-file invalidation latched clean at gen `g`;
+    /// clean iff `clean_at == Some(gen) && buffered_handles == 0`.
+    pub clean_at: Option<u64>,
+}
+
 pub type DioInvalSink =
     std::sync::Arc<dyn Fn(u64, u64, u32) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
 
@@ -6891,7 +6905,23 @@ pub struct SqueezefsFilesystem {
     /// lineages pay ZERO sideband traffic. Residual (documented): pages
     /// minted by mmap over an O_DIRECT-only fd are invisible to us — the
     /// same mixing POSIX already declares incoherent for O_DIRECT.
-    page_cache_inos: std::sync::Arc<scc::HashSet<u64>>,
+    ///
+    /// QUIESCENT-LINEAGE latch (write-wall campaign, 2026-08-13): the
+    /// value is the ino's [`PageCoherence`] word — live buffered-handle
+    /// count + page-instantiation generation + the clean latch. With
+    /// zero live buffered handles, ONE whole-file invalidation proves
+    /// the ino page-free and latches `clean_at = gen`; every later DIO
+    /// write elides the notify until something page-instantiating (a
+    /// READ serve, a buffered open, a WRITE_CACHE/buffered write — the
+    /// complete instantiation vector set: mmap fault-ins arrive as
+    /// READs, dirty-folio laundering arrives as WRITE_CACHE) bumps
+    /// `gen` and un-latches. Misaccounting degrades to the OLD per-op
+    /// behavior (handles stuck high ⇒ per-segment invals), never past
+    /// the generic/451 law. Field conviction: `fuse_dio_write_invals`
+    /// = every op of a 367k-op rand-4k row — each an AWAITED kernel
+    /// invalidate serialized on the kernel's per-inode invalidate
+    /// mutex, the measured ~4.5-effective-concurrency cap on one file.
+    page_cache_inos: std::sync::Arc<scc::HashMap<u64, PageCoherence>>,
     /// generic/451 — the DIO-write page-coherence sink cell: production
     /// (`start_mount`) wires a ranged FUSE_NOTIFY_INVAL_INODE push through
     /// the fuse3 Notify handle (the `kernel_notify` pattern); tests inject
@@ -7169,7 +7199,7 @@ impl SqueezefsFilesystem {
             },
             reclaim_inflight: std::sync::Arc::new(scc::HashSet::new()),
             killpriv_clean: std::sync::Arc::new(scc::HashSet::new()),
-            page_cache_inos: std::sync::Arc::new(scc::HashSet::new()),
+            page_cache_inos: std::sync::Arc::new(scc::HashMap::new()),
             dio_inval_sink: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(None)),
             attr_inval_sink: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(None)),
             reclaim_semaphore: std::sync::Arc::new(squeezefs_ipc::sqz_semaphore::Semaphore::new(
@@ -10388,15 +10418,71 @@ impl SqueezefsFilesystem {
     /// concurrent handler tasks (the strip-setid/killpriv awaited-notify
     /// precedent).
     async fn post_dio_write_coherence(&self, ino: u64, offset: u64, written: u32) {
-        if !self.page_cache_inos.contains_sync(&ino) {
+        let Some(pc) = self.page_cache_inos.read_sync(&ino, |_, v| *v) else {
+            return; // no buffered history ever — pure-DIO lineage
+        };
+        // The quiescent-lineage latch: proven page-free ⇒ nothing owed.
+        if pc.buffered_handles == 0 && pc.clean_at == Some(pc.gen) {
             return;
         }
-        if let Some(sink) = self.dio_inval_sink.load().as_ref() {
-            METRICS
-                .fuse_dio_write_invals
-                .fetch_add(1, Ordering::Relaxed);
+        let Some(sink) = self.dio_inval_sink.load().as_ref().clone() else {
+            return;
+        };
+        METRICS
+            .fuse_dio_write_invals
+            .fetch_add(1, Ordering::Relaxed);
+        if pc.buffered_handles > 0 {
+            // Live buffered readers: the per-segment ranged law,
+            // verbatim (generic/451 — the racing-reader shape).
             sink(ino, offset, written).await;
+            return;
         }
+        // Quiescent: ONE whole-file invalidation ((0,0) = off..EOF in
+        // the notify encoding) proves the ino page-free, then latch —
+        // but only if no instantiation raced the inval (the gen was
+        // captured BEFORE the await; a racer's bump refuses the latch
+        // and the next write pays again).
+        let g = pc.gen;
+        sink(ino, 0, 0).await;
+        self.page_cache_inos.update_sync(&ino, |_, v| {
+            if v.gen == g && v.buffered_handles == 0 {
+                v.clean_at = Some(g);
+            }
+        });
+    }
+
+    /// A buffered open/create: count the handle and bump the
+    /// instantiation generation (the kernel may now mint pages).
+    fn arm_buffered_open(&self, ino: u64) {
+        let _ = self
+            .page_cache_inos
+            .entry_sync(ino)
+            .and_modify(|v| {
+                v.buffered_handles = v.buffered_handles.saturating_add(1);
+                v.gen = v.gen.wrapping_add(1);
+            })
+            .or_insert(PageCoherence {
+                buffered_handles: 1,
+                gen: 1,
+                clean_at: None,
+            });
+    }
+
+    /// A buffered handle closed. No gen bump: pages it minted are
+    /// handled by the first quiescent write's whole-file invalidation.
+    fn note_buffered_release(&self, ino: u64) {
+        self.page_cache_inos.update_sync(&ino, |_, v| {
+            v.buffered_handles = v.buffered_handles.saturating_sub(1);
+        });
+    }
+
+    /// A page-instantiating serve (READ, buffered/WRITE_CACHE write):
+    /// un-latch. Bumped BEFORE the reply that lets the kernel
+    /// instantiate the page, so a racer can never be latched over.
+    fn note_page_instantiation(&self, ino: u64) {
+        self.page_cache_inos.update_sync(&ino, |_, v| {
+            v.gen = v.gen.wrapping_add(1);
+        });
     }
 
     /// FUSE_HANDLE_KILLPRIV_V2 kill obligation for a flagged WRITE
@@ -18718,7 +18804,7 @@ impl Filesystem for SqueezefsFilesystem {
             // the open handler (aio-dio-cycle-write's init is O_DIRECT|
             // O_CREAT, which must NOT arm it).
             if flags & (libc::O_DIRECT as u32) == 0 {
-                let _ = self.page_cache_inos.insert_sync(inode.ino);
+                self.arm_buffered_open(inode.ino);
             }
             // FUSE-3k: CREATE returns an entry AND a handle — one lookup
             // reference (the kernel forgets it like any other) plus the open
@@ -18874,7 +18960,7 @@ impl Filesystem for SqueezefsFilesystem {
         // (and, under FOPEN_KEEP_CACHE, retain) pages for this ino — arm
         // the DIO-write coherence gate. Swept at final FORGET.
         if flags & (libc::O_DIRECT as u32) == 0 {
-            let _ = self.page_cache_inos.insert_sync(inode);
+            self.arm_buffered_open(inode);
         }
         // File handle is just the inode number for simplicity in this design
         Ok(ReplyOpen {
@@ -18936,6 +19022,13 @@ impl Filesystem for SqueezefsFilesystem {
             METRICS
                 .read_odirect_requests
                 .fetch_add(1, Ordering::Relaxed);
+        } else if _req.unique != 0 {
+            // Quiescent-lineage un-latch (page-coherence law): a KERNEL
+            // buffered READ instantiates page-cache folios (mmap
+            // fault-ins arrive here too) — bumped BEFORE the reply, so
+            // the next DIO write invalidates again. Ring-origin serves
+            // (`unique == 0`) touch no kernel pages and skip the bump.
+            self.note_page_instantiation(ino);
         }
         // Ring-originated requests (the IPC handoff path) carry
         // `unique == 0` — `DataPlaneSink::ring_request` is the only
@@ -19619,6 +19712,13 @@ impl Filesystem for SqueezefsFilesystem {
         // carry them. Consumed at the reply edge below.
         let dio_coherence = flags & (libc::O_DIRECT as u32) != 0
             && write_flags & fuse3::raw::flags::FUSE_WRITE_CACHE == 0;
+        if !dio_coherence && _req.unique != 0 {
+            // Page-coherence un-latch: a buffered/WRITE_CACHE kernel
+            // write means kernel folios exist for this ino (writearound
+            // instantiation or dirty-folio laundering) — the clean latch
+            // must not survive it.
+            self.note_page_instantiation(ino);
+        }
 
         // D1.d: this open generation now has flushable state.
         self.mark_handle_dirty(ino);
@@ -21724,6 +21824,13 @@ impl Filesystem for SqueezefsFilesystem {
     ) -> FuseResult<()> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         debug!("FUSE Release: ino = {}", ino);
+        // Quiescent-lineage accounting: a buffered handle closed (the
+        // kernel echoes the open flags; an O_DIRECT fh never counted, so
+        // saturating_sub keeps a missed echo in the SAFE direction —
+        // handles stuck high = per-segment invals, the old behavior).
+        if (_flags as i32) & libc::O_DIRECT == 0 {
+            self.note_buffered_release(ino);
+        }
 
         if is_virtual_ino(ino) {
             self.open_virtual_files.remove(&fh);

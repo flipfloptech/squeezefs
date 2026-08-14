@@ -275,6 +275,86 @@ async fn final_forget_sweeps_the_buffered_history() {
     );
 }
 
+/// The QUIESCENT-LINEAGE elision (write-wall campaign, 2026-08-13 — the
+/// per-inode write conviction: `fuse_dio_write_invals` = every op of a
+/// 367k-op rand-4k row, each an AWAITED kernel invalidate round trip
+/// serialized on the kernel's per-inode invalidate mutex — the measured
+/// ~4.5-effective-concurrency cap on one file): once the buffered
+/// lineage is QUIESCENT — zero live buffered handles AND no
+/// page-instantiating op since the last invalidation — the range is
+/// PROVEN page-free and the notify is owed nothing. One inval latches
+/// the clean state; the storm elides the rest. The generic/451 law is
+/// untouched: any live buffered handle (a racing reader) keeps
+/// per-segment invalidation, and any READ serve / buffered open /
+/// WRITE_CACHE write un-latches (the gen bump orders BEFORE the reply
+/// that lets the kernel instantiate the page — a mid-inval racer can
+/// never be latched over).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quiescent_dio_storm_invalidates_once_not_per_write() {
+    let h = make().await;
+    let c0 = inval_counter();
+    // Buffered lineage that goes QUIESCENT: create buffered (arms),
+    // then release the one buffered handle (fio's layout-pass shape).
+    let ino = create_file(&h, "quiescent", 0).await;
+    h.fs.release(h.req, ino, ino, 0, 0, false).await.unwrap();
+
+    // The storm: 64 O_DIRECT writes. The FIRST owes the invalidation
+    // (pages may predate the release); the rest are proven page-free.
+    for i in 0..64u64 {
+        write_at(&h, ino, i * 4096, 4096, O_DIRECT, 0).await;
+    }
+    assert_eq!(
+        invals(&h).len(),
+        1,
+        "a quiescent buffered lineage pays ONE invalidation, not one per \
+         write (the per-op awaited kernel round trip was the measured \
+         single-file write-concurrency cap)"
+    );
+    assert_eq!(
+        inval_counter() - c0,
+        1,
+        "the engagement counter mirrors the single paid notify"
+    );
+
+    // A buffered reader arriving UN-latches: its open bumps the gen.
+    h.fs.open(h.req, ino, 0, 0).await.unwrap();
+    write_at(&h, ino, 0, 4096, O_DIRECT, 0).await;
+    assert_eq!(
+        invals(&h).len(),
+        2,
+        "a fresh buffered open must un-latch the clean state (the \
+         generic/451 racing-reader law is untouched)"
+    );
+}
+
+/// The un-latch vector the storm cannot see: a READ serve on the
+/// (handle-free) ino — the kernel re-instantiating pages via readahead
+/// on a still-referenced mapping — must break the clean latch so the
+/// NEXT O_DIRECT write invalidates again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_serve_unlatches_the_clean_state() {
+    let h = make().await;
+    let ino = create_file(&h, "readunlatch", 0).await;
+    write_at(&h, ino, 0, 16 * 1024, O_DIRECT, 0).await;
+    h.fs.release(h.req, ino, ino, 0, 0, false).await.unwrap();
+
+    // Latch: first storm write invals, second elides.
+    write_at(&h, ino, 0, 4096, O_DIRECT, 0).await;
+    write_at(&h, ino, 4096, 4096, O_DIRECT, 0).await;
+    let after_latch = invals(&h).len();
+
+    // A buffered READ serve (flags without O_DIRECT) — page-instantiating.
+    let _ = h.fs.read(h.req, ino, ino, 0, 4096, 0).await.unwrap();
+
+    write_at(&h, ino, 8192, 4096, O_DIRECT, 0).await;
+    assert_eq!(
+        invals(&h).len(),
+        after_latch + 1,
+        "a READ serve must un-latch (the served bytes let the kernel \
+         instantiate a page the next DIO write must kill)"
+    );
+}
+
 /// Kernel-split parallel DIO segments (FOPEN_PARALLEL_DIRECT_WRITES —
 /// splits are the NORMAL case) each invalidate their OWN range: the AIO
 /// completes only when every segment acked, so the union of the ranged

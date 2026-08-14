@@ -5913,6 +5913,20 @@ pub struct Metrics {
     pub overlay_publishes: Align64<AtomicU64>,
     /// Byte face of [`Self::overlay_publishes`] (whole blocks).
     pub overlay_published_bytes: Align64<AtomicU64>,
+    /// §5.4 arm (a) engagement (B4b, design-overlay-overwrite):
+    /// completed OVERWRITE overlays FED to the rewrite epoch
+    /// (`rewrite_shadow_record` — RAM-only publication; the epoch's
+    /// close is the one durable save). Kept apart from
+    /// [`Self::overlay_publishes`] (the durable per-record flip): the
+    /// durable-publish vs RAM-only-feed split must stay readable
+    /// (§5.4a).
+    pub overlay_epoch_feeds: Align64<AtomicU64>,
+    /// Overwrite records that published via the durable merge instead
+    /// of the feed — the shadow-off degenerate (arm (b) surviving as
+    /// the `SQUEEZEFS_REWRITE_SHADOW=0` A/B lever) and the
+    /// `NotShadowed` fallback. **> 0 with the shadow lever ON is a
+    /// bug** (§11).
+    pub overlay_feed_fallbacks: Align64<AtomicU64>,
     /// §6.2 step-3 gap seeds (partial overlays only — the B4
     /// falsifier's instrument; ≈ 0 on full-coverage streams).
     pub overlay_gap_seeds: Align64<AtomicU64>,
@@ -9331,6 +9345,8 @@ impl SqueezefsFilesystem {
                 "overlay_read_serve_bytes": METRICS.overlay_read_serve_bytes.load(Ordering::Relaxed),
                 "overlay_publishes": METRICS.overlay_publishes.load(Ordering::Relaxed),
                 "overlay_published_bytes": METRICS.overlay_published_bytes.load(Ordering::Relaxed),
+                "overlay_epoch_feeds": METRICS.overlay_epoch_feeds.load(Ordering::Relaxed),
+                "overlay_feed_fallbacks": METRICS.overlay_feed_fallbacks.load(Ordering::Relaxed),
                 "overlay_gap_seeds": METRICS.overlay_gap_seeds.load(Ordering::Relaxed),
                 "overlay_gap_seed_bytes": METRICS.overlay_gap_seed_bytes.load(Ordering::Relaxed),
                 "overlay_open": METRICS.overlay_open.load(Ordering::Relaxed),
@@ -12870,7 +12886,10 @@ impl SqueezefsFilesystem {
                 // Frozen/terminal UNDER OUR HELD GUARD means the detached
                 // publisher has not acquired the guard yet — steal its
                 // work (publish/teardown inline), then decline: the block
-                // is mapped now and rides the ordinary path.
+                // is mapped now and rides the ordinary path. DELIBERATE
+                // close-hint dropper (§5.4 venue law): this write
+                // declines into a path whose own durability boundaries
+                // follow; the idle sweeper / next fsync back the hint.
                 write_phase(ino, offset_hint, b, WP_OV_SETTLE_PRE);
                 self.settle_overlay_block_locked(ino, b, false).await?;
                 return Ok(false);
@@ -12941,6 +12960,8 @@ impl SqueezefsFilesystem {
                     .overlay_claim_conflicts
                     .fetch_add(1, Ordering::Relaxed);
                 write_phase(ino, offset_hint, b, WP_OV_SETTLE_RETRY);
+                // DELIBERATE close-hint dropper (§5.4 venue law) — the
+                // accumulation fallback's own boundaries follow.
                 self.settle_overlay_block_locked(ino, b, false).await?;
                 return Ok(false);
             }
@@ -13395,19 +13416,42 @@ impl SqueezefsFilesystem {
     /// Settle one block's overlay UNDER the caller's held
     /// `BLOCK_FLUSH_LOCKS` guard: freeze (if Open), await the in-flight
     /// set, seed uncovered gaps with ZEROS (law 5's dual — the
-    /// fresh/hole shape's complement is zeros by definition), optionally
-    /// barrier the device (§6.2 step 4, fsync only), publish the map+ref
-    /// flip in ONE tx (law 7), and retire the record. Terminal records
-    /// run their law-9 teardown disposition instead.
+    /// fresh/hole shape's complement is zeros by definition; old-binding
+    /// gap seeding is PR B4c-i's), optionally barrier the device (§6.2
+    /// step 4, fsync only), then run the **§5.4 publish split**
+    /// (design-overlay-overwrite):
+    ///
+    /// * **overwrite record ∧ shadow lever ON** — FEED the rewrite
+    ///   epoch (`rewrite_shadow_record`): the dest key becomes the
+    ///   epoch's B key and the EPOCH owns publication, the displaced
+    ///   park, the deferred free, the fencing law and every crash
+    ///   window (arm (a), KD-B4-1). The record retires through the
+    ///   `Fed` terminal (§5.4a — disarm-without-free).
+    /// * **fresh records, and the shadow-off degenerate** — the ONE-tx
+    ///   durable map+ref flip (law 7) with the FIND-M11-A fencing-retry
+    ///   convergence; displaced keys (the degenerate's old binding)
+    ///   free strictly AFTER the publish — the upload path's non-shadow
+    ///   order (`upload_block_publish_phase`).
+    ///
+    /// Terminal records run their law-9 teardown disposition instead.
+    ///
+    /// Returns the **close-owed hint** (§5.4's venue law): `true` iff
+    /// the feed reported epoch coverage complete (KD-1.6). The settle
+    /// NEVER calls `close_rewrite_epoch` itself — the close takes (3.5)
+    /// and frees (the tree's self-described worst park amplifier), so
+    /// it belongs to the guard-DROPPING caller (the `:14798` RES-1
+    /// posture). The hint is latency/economy only, never correctness:
+    /// any venue may drop it — a fed epoch stays registered, and the
+    /// 5 s idle sweeper + the next fsync are the backstops.
     pub(crate) async fn settle_overlay_block_locked(
         &self,
         ino: u64,
         b: u32,
         barrier: bool,
-    ) -> Result<(), SqueezefsError> {
+    ) -> Result<bool, SqueezefsError> {
         use crate::overlay_core::OverlayState;
         let Some(rec) = self.device_overlays.get(ino, b) else {
-            return Ok(());
+            return Ok(false);
         };
         match rec.core.state() {
             OverlayState::Open => {
@@ -13416,7 +13460,7 @@ impl SqueezefsFilesystem {
             OverlayState::Frozen => {}
             _terminal => {
                 self.teardown_overlay_block_locked(ino, b, &rec).await;
-                return Ok(());
+                return Ok(false);
             }
         }
         self.await_overlay_inflight(&rec).await;
@@ -13466,8 +13510,70 @@ impl SqueezefsFilesystem {
             // law — the upload_full_block_sized(false) posture).
             0
         };
+        // §8.2's user-byte term (both arms): the covered APP bytes —
+        // gap seeds are device bytes, never user bytes.
+        let covered_app_bytes = rec.core.covered_bytes();
+
+        // ---- §5.4 publish split, arm (a): the FEED.
+        if rec.core.old_binding().is_some() && crate::routing::rewrite_shadow_enabled() {
+            // Guard-ownership transfer (KD-B4-3): the fsck C2/C3 guard
+            // moves INTO the epoch (`epoch.guards` — continuous
+            // visibility, record → epoch), taken OUT of the record
+            // BEFORE retire so the teardown's clear clears an
+            // already-empty slot (§5.4a's ordering sentence). The
+            // `MintedBlockGuard` disarms at the Fed teardown because
+            // the epoch's dispositions (swap-publish /
+            // fence-free-nothing) ARE the rollback contract from here.
+            let taken = rec
+                .fsck_guard
+                .lock()
+                .expect("overlay fsck guard mutex poisoned")
+                .take();
+            if let Some(guard) = taken {
+                match self
+                    .router
+                    .rewrite_shadow_record(ino, b, new_key.clone(), min_size, guard)
+                    .await
+                {
+                    crate::routing::ShadowRecordOutcome::Shadowed {
+                        displaced_prev,
+                        coverage_complete,
+                    } => {
+                        // §8.2 SLO attribution — vehicle-blind (mirrors
+                        // `upload_block_publish_phase`): user bytes =
+                        // covered app bytes; device bytes = the whole
+                        // block the dest received (stores + gap seeds).
+                        if displaced_prev {
+                            METRICS.rewrite_blocks.fetch_add(1, Ordering::Relaxed);
+                            METRICS
+                                .rewrite_user_bytes
+                                .fetch_add(covered_app_bytes, Ordering::Relaxed);
+                            METRICS
+                                .rewrite_device_write_bytes
+                                .fetch_add(block_size, Ordering::Relaxed);
+                        }
+                        rec.core.mark_fed();
+                        METRICS.overlay_epoch_feeds.fetch_add(1, Ordering::Relaxed);
+                        self.teardown_overlay_block_locked(ino, b, &rec).await;
+                        return Ok(coverage_complete);
+                    }
+                    crate::routing::ShadowRecordOutcome::NotShadowed(guard) => {
+                        // Not displacing (or the RMW base fetch failed):
+                        // put the guard back and fall through to the
+                        // durable merge, which redoes the fetch and owns
+                        // its own error path (the §5.4 degenerate arm).
+                        *rec.fsck_guard
+                            .lock()
+                            .expect("overlay fsck guard mutex poisoned") = Some(guard);
+                    }
+                }
+            }
+        }
+
+        // ---- §5.4's durable-merge arm: fresh records and the
+        // shadow-off degenerate.
         let mut token = self.dlm.get_fencing_token_ino(ino).max(rec.fence_token);
-        loop {
+        let displaced = loop {
             match self
                 .router
                 .merge_block_mappings_coalesced(
@@ -13479,7 +13585,7 @@ impl SqueezefsFilesystem {
                 )
                 .await
             {
-                Ok(_) => break,
+                Ok(d) => break d,
                 Err(e @ SqueezefsError::FencingTokenExpired { .. }) => {
                     match self.fencing_retry_token(ino, token) {
                         Some(fresh) => token = fresh,
@@ -13499,14 +13605,41 @@ impl SqueezefsFilesystem {
                 // is never freed; the next durability boundary retries.
                 Err(e) => return Err(e),
             }
-        }
+        };
         rec.core.mark_published();
         self.teardown_overlay_block_locked(ino, b, &rec).await;
         METRICS.overlay_publishes.fetch_add(1, Ordering::Relaxed);
         METRICS
             .overlay_published_bytes
             .fetch_add(block_size, Ordering::Relaxed);
-        Ok(())
+        if rec.core.old_binding().is_some() {
+            // The degenerate arm engaged: the ONLY place the overlay
+            // itself ever durably displaces an old binding. Counted —
+            // growth with the shadow lever ON is a bug (§11).
+            METRICS
+                .overlay_feed_fallbacks
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        // §8.2 on the degenerate too (the upload path's non-shadow arm,
+        // verbatim): a publish that displaced a different mapping is a
+        // rewrite-class block, whatever the vehicle.
+        if !displaced.is_empty() {
+            METRICS.rewrite_blocks.fetch_add(1, Ordering::Relaxed);
+            METRICS
+                .rewrite_user_bytes
+                .fetch_add(covered_app_bytes, Ordering::Relaxed);
+            METRICS
+                .rewrite_device_write_bytes
+                .fetch_add(block_size, Ordering::Relaxed);
+        }
+        // Displaced keys free only AFTER the new map is published
+        // (durable + cached) and the record retired — no reader can
+        // resolve the block to a key being freed (the
+        // `upload_block_publish_phase` order).
+        for bk in displaced {
+            let _ = self.router.backend_router.free_block(&bk).await;
+        }
+        Ok(false)
     }
 
     /// Law-9 teardown under the held guard: waits out the in-flight set
@@ -13532,7 +13665,10 @@ impl SqueezefsFilesystem {
 
     /// Take the block guard and settle one overlay (the detached
     /// publish body, the read-path drain unit, the accumulation-write
-    /// screen's slow arm).
+    /// screen's slow arm). This is the §5.4 venue law's primary ACTING
+    /// venue: settle → `drop(block_guard)` → act on the close-owed
+    /// hint (the `:14798` posture — the close takes (3.5) and frees,
+    /// never under the block guard).
     pub(crate) async fn drain_device_overlay_block(
         &self,
         ino: u64,
@@ -13545,7 +13681,21 @@ impl SqueezefsFilesystem {
         let (block_guard, _w) = block_lock_acquire_timed(ino, b, BlockLockSite::OverlayPrune).await;
         let res = self.settle_overlay_block_locked(ino, b, barrier).await;
         drop(block_guard);
-        res
+        match res {
+            Ok(true) => {
+                // KD-1.6 coverage close, guard dropped. Failure stays a
+                // warn: the hint is never a correctness obligation —
+                // the fed epoch stays registered (the idle sweeper and
+                // the next fsync are the backstops).
+                let token = self.dlm.get_fencing_token_ino(ino);
+                if let Err(e) = self.router.close_rewrite_epoch(ino, token).await {
+                    warn!("overlay-fed coverage epoch close for ino {ino} failed: {e:?}");
+                }
+                Ok(())
+            }
+            Ok(false) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Drain (publish) every overlay of `ino` whose block starts below
@@ -13566,6 +13716,12 @@ impl SqueezefsFilesystem {
         for b in self.device_overlays.blocks_of(ino) {
             let (block_guard, _w) =
                 block_lock_acquire_timed(ino, b, BlockLockSite::OverlayPrune).await;
+            // §5.4 venue law: this drain is a DELIBERATE close-hint
+            // DROPPER — the shape-change entries (truncate/unlink/
+            // clone/punch) own their epochs' triggers themselves, and
+            // the fsync leg closes unconditionally right after this
+            // drain (`flush_inode_to_backend`); the idle sweeper is the
+            // backstop for the rest.
             let res = if (b as u64) * block_size >= keep_below {
                 if let Some(rec) = self.device_overlays.get(ino, b) {
                     if rec.core.supersede() || rec.core.state().is_terminal() {
@@ -13578,12 +13734,125 @@ impl SqueezefsFilesystem {
                 }
                 Ok(())
             } else {
-                self.settle_overlay_block_locked(ino, b, barrier).await
+                self.settle_overlay_block_locked(ino, b, barrier)
+                    .await
+                    .map(|_close_owed| ())
             };
             drop(block_guard);
             res?;
         }
         Ok(())
+    }
+
+    /// **B4b TEST SEAM — narrowed at B4c-ii** (when the §5.1
+    /// one-3.5-section capture+install lands in the store path and
+    /// suites mint overwrite records through real writes; the
+    /// mapped-decline gates are closed until then). Installs an
+    /// OVERWRITE overlay record on a MAPPED striped block the way the
+    /// B4c-ii store path will: under the block guard — dest mint
+    /// (law 2), both owners armed, the CURRENT mapping captured as
+    /// `old_binding`, registry install, then one aligned segment stored
+    /// to the dest with its coverage published at the CQE (law 3).
+    /// `#[doc(hidden)] pub` per the `routing::set_test_zc_slot_wrap`
+    /// house precedent (`tests/overlay_overwrite_tests.rs` is the
+    /// consumer — hazard pins need integration-scale fixtures while
+    /// `DeviceOverlayRegistry::install` stays `pub(crate)`).
+    #[doc(hidden)]
+    pub async fn test_install_overwrite_overlay(
+        &self,
+        ino: u64,
+        b: u32,
+        rel: usize,
+        payload: &[u8],
+    ) -> Result<(), SqueezefsError> {
+        let block_size = self.router.block_size.load(Ordering::Relaxed) as usize;
+        if rel % 4096 != 0
+            || payload.is_empty()
+            || payload.len() % 4096 != 0
+            || rel + payload.len() > block_size
+        {
+            return Err(SqueezefsError::InvalidOperation(
+                "overwrite-overlay seam: v1 aligned single-block segments only".into(),
+            ));
+        }
+        let (block_guard, _w) = block_lock_acquire_timed(ino, b, BlockLockSite::OverlayPrune).await;
+        let old_binding = self
+            .router
+            .metadata_cache
+            .get(&ino)
+            .and_then(|m| m.block_map.as_ref().and_then(|bm| bm.get(&b).cloned()))
+            .ok_or_else(|| {
+                SqueezefsError::InvalidOperation(format!(
+                    "overwrite-overlay seam: ino {ino} block {b} carries no mapping — \
+                     the overwrite shape requires one"
+                ))
+            })?;
+        let (be_id, allocator, device) = self.router.backend_router.get_active_backend()?;
+        let dest_offset = allocator.allocate_block().await?;
+        let fsck_guard = allocator.inflight_register(dest_offset);
+        let mint_owner = crate::assembly_tasks::MintedBlockGuard::new(
+            std::sync::Arc::clone(&allocator),
+            dest_offset,
+        );
+        let fencing_token = self.dlm.get_fencing_token_ino(ino);
+        let rec = self
+            .device_overlays
+            .install(
+                ino,
+                b,
+                block_size as u32,
+                be_id,
+                dest_offset,
+                device,
+                allocator,
+                fencing_token,
+                Some(old_binding),
+                fsck_guard,
+                mint_owner,
+            )
+            .ok_or_else(|| {
+                SqueezefsError::InvalidOperation(
+                    "overwrite-overlay seam: a record already exists on this (ino, block)".into(),
+                )
+            })?;
+        let first_page = rel / crate::overlay_core::OVERLAY_PAGE;
+        let pages = payload.len().div_ceil(crate::overlay_core::OVERLAY_PAGE);
+        let ticket = rec.core.begin_store(first_page, pages).map_err(|r| {
+            SqueezefsError::InvalidOperation(format!(
+                "overwrite-overlay seam: begin_store refused a fresh record: {r:?}"
+            ))
+        })?;
+        let mut buf = crate::cache::pool::BUFFER_POOL.alloc();
+        if payload.len() > buf.capacity() {
+            buf.resize(payload.len(), 0);
+        }
+        buf.backing_mut()[..payload.len()].copy_from_slice(payload);
+        buf.set_written_len(payload.len());
+        let res = rec
+            .device
+            .write_block(rec.dest_offset + rel as u64, buf.into_bytes())
+            .await;
+        let _ = rec.complete_store_and_wake(ticket, res.is_ok());
+        drop(block_guard);
+        res
+    }
+
+    /// **B4b TEST SEAM — narrowed at B4c-ii.** Takes the block guard,
+    /// settles (the §5.4 publish split), drops the guard and returns
+    /// the RAW close-owed hint WITHOUT acting on it — the venue-law
+    /// pin's instrument (`close_never_runs_under_block_guard` observes
+    /// the epoch still open across this call).
+    #[doc(hidden)]
+    pub async fn test_settle_overlay_block(
+        &self,
+        ino: u64,
+        b: u32,
+        barrier: bool,
+    ) -> Result<bool, SqueezefsError> {
+        let (block_guard, _w) = block_lock_acquire_timed(ino, b, BlockLockSite::OverlayPrune).await;
+        let res = self.settle_overlay_block_locked(ino, b, barrier).await;
+        drop(block_guard);
+        res
     }
 
     /// Resolve `(parent, name)` → ino for the unlink-path overlay drain
@@ -13966,9 +14235,34 @@ impl SqueezefsFilesystem {
                 // may never coexist on one block.
                 if crate::device_overlay::any_open_fast() {
                     write_phase(ino, offset, b as u32, WP_OVERLAY_SETTLE);
-                    if let Err(e) = self.settle_overlay_block_locked(ino, b as u32, false).await {
-                        std::mem::drop(block_guard);
-                        return Err(e);
+                    match self.settle_overlay_block_locked(ino, b as u32, false).await {
+                        Err(e) => {
+                            std::mem::drop(block_guard);
+                            return Err(e);
+                        }
+                        Ok(true) => {
+                            // §5.4 venue law: this handler keeps its
+                            // guard for the write below, so the
+                            // close-owed hint is acted on DETACHED —
+                            // the close takes (3.5) and frees, never
+                            // under the held block guard (the `:14798`
+                            // posture). A spawn failure loses only a
+                            // hint (idle sweeper / fsync backstops).
+                            let fs = self.clone();
+                            let close_ino = ino;
+                            crate::detached::tpc_spawn_guarded("overlay_epoch_close", async move {
+                                let token = fs.dlm.get_fencing_token_ino(close_ino);
+                                if let Err(e) =
+                                    fs.router.close_rewrite_epoch(close_ino, token).await
+                                {
+                                    warn!(
+                                        "overlay-fed epoch close for ino \
+                                             {close_ino} failed: {e:?}"
+                                    );
+                                }
+                            });
+                        }
+                        Ok(false) => {}
                     }
                 }
 

@@ -480,3 +480,142 @@ mod overlay_dma_bytes_tests {
         assert_ne!(out.as_ptr(), src.as_ptr());
     }
 }
+
+/// PR B4a (design-overlay-overwrite rev 4, §5.4a) — the `Fed` teardown
+/// disposition, pinned BEHAVIORALLY where `pub(crate)` reaches (the
+/// `overlay_dma_bytes_tests` precedent): red-first, compile-red until
+/// the grown `install` signature, `old_binding` and `mark_fed` land.
+#[cfg(test)]
+mod overlay_fed_disposition_tests {
+    use super::*;
+    use crate::fuse_client::METRICS;
+    use std::sync::atomic::Ordering;
+
+    /// A fed record's teardown DISARMS WITHOUT FREEING (ownership
+    /// transferred to the rewrite epoch at the feed — KD-B4-3; freeing
+    /// the dest here is the KD-1.11 corruption: it is the epoch's
+    /// pending B key), and the `overlay_teardown_nonterminal` tripwire
+    /// never fires on a feed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fed_teardown_disarms_without_free_and_without_tripwire() {
+        let reg = DeviceOverlayRegistry::new();
+        let backing = tempfile::NamedTempFile::new().unwrap();
+        let device = Arc::new(crate::nvme_dev::NvmeBlockDev::new(
+            backing.path().to_str().unwrap(),
+        ));
+        let allocator = Arc::new(
+            crate::block_allocator::BlockAllocator::new("b4a-fed")
+                .await
+                .unwrap(),
+        );
+        let dest = allocator.allocate_block().await.unwrap();
+        let fsck_guard = allocator.inflight_register(dest);
+        let mint = crate::assembly_tasks::MintedBlockGuard::new(Arc::clone(&allocator), dest);
+
+        let trips0 = METRICS.invariant_tripwires.load(Ordering::Relaxed);
+        let rec = reg
+            .install(
+                7,
+                3,
+                65536,
+                "vol-b4a".into(),
+                dest,
+                device,
+                Arc::clone(&allocator),
+                1,
+                Some("bk:0:0".to_string()),
+                fsck_guard,
+                mint,
+            )
+            .expect("install on an empty registry");
+        assert_eq!(
+            rec.core.old_binding(),
+            Some("bk:0:0"),
+            "the registry must thread the §5.1 capture into the record"
+        );
+
+        // The settle's publish split shape: freeze → (feed) → teardown.
+        assert!(rec.core.freeze(), "Open → Frozen");
+        assert!(rec.core.mark_fed(), "Frozen → Fed");
+        assert!(rec.core.rollback_admissible());
+        rec.run_teardown_disposition();
+        reg.retire(7, 3, &rec);
+
+        assert_eq!(
+            METRICS.invariant_tripwires.load(Ordering::Relaxed) - trips0,
+            0,
+            "the overlay_teardown_nonterminal tripwire must never fire on a feed"
+        );
+        assert!(
+            rec.mint_owner.lock().unwrap().is_none(),
+            "the mint owner leaves the record at teardown"
+        );
+        assert!(
+            rec.fsck_guard.lock().unwrap().is_none(),
+            "the fsck guard slot clears at teardown (already-empty once \
+             the B4b feed takes it — §5.4a's ordering sentence)"
+        );
+
+        // Disarm-WITHOUT-free: the dest never re-enters the free supply.
+        // A regression routing Fed through the Superseded arm frees via
+        // the mint guard's DETACHED drop (sqz-meta pool), so the negative
+        // is observed over a bounded window: the free-list probe
+        // (`claim_free_for_trim` — Some ⇔ the offset is free) must stay
+        // None throughout, and a fresh mint must not hand `dest` back.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        while std::time::Instant::now() < deadline {
+            assert!(
+                allocator.claim_free_for_trim(dest).is_none(),
+                "a FED record's teardown freed its destination — the \
+                 KD-1.11 corruption (§5.4a: disarm-without-free)"
+            );
+            tokio::task::yield_now().await;
+        }
+        let next = allocator.allocate_block().await.unwrap();
+        assert_ne!(
+            next, dest,
+            "the fed dest is the epoch's pending B key — it must never \
+             be re-mintable"
+        );
+    }
+
+    /// The fresh arm threads `None` (B2 shape unchanged: law 5's gaps
+    /// stay zeros) — the grown signature must not disturb it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fresh_install_carries_no_old_binding() {
+        let reg = DeviceOverlayRegistry::new();
+        let backing = tempfile::NamedTempFile::new().unwrap();
+        let device = Arc::new(crate::nvme_dev::NvmeBlockDev::new(
+            backing.path().to_str().unwrap(),
+        ));
+        let allocator = Arc::new(
+            crate::block_allocator::BlockAllocator::new("b4a-fresh")
+                .await
+                .unwrap(),
+        );
+        let dest = allocator.allocate_block().await.unwrap();
+        let fsck_guard = allocator.inflight_register(dest);
+        let mint = crate::assembly_tasks::MintedBlockGuard::new(Arc::clone(&allocator), dest);
+        let rec = reg
+            .install(
+                9,
+                0,
+                65536,
+                "vol-b4a".into(),
+                dest,
+                device,
+                Arc::clone(&allocator),
+                1,
+                None,
+                fsck_guard,
+                mint,
+            )
+            .expect("install on an empty registry");
+        assert_eq!(rec.core.old_binding(), None);
+        // Leave the registry/gauges clean: supersede + teardown (the
+        // armed mint guard's drop frees the fixture's dest, detached).
+        assert!(rec.core.supersede());
+        rec.run_teardown_disposition();
+        reg.retire(9, 0, &rec);
+    }
+}

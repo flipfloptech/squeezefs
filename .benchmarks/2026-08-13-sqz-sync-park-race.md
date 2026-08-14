@@ -84,6 +84,14 @@ with the device at 79/256 concurrency — the residue, not the device, was the w
   never box constants).
 * Scout losers (single legs, not counted): `REAP_QUANTUM_US=10` −13 %, `IPC_SPIN_US=50` −24 %.
 
+**Sustained-state rows (90 s, retuned pair, thirds-flat per the 2026-07-29 rule):**
+il 1-file qd32 (1 GiB) = **126k flat (−2.4 % drift)**; il 32×8 fleet = **144k flat (+4.1 %)**.
+Engagement exact on both (13.1 M / 11.4 M ring writes accounted). Cumulative vs the dev tip's
+governing rows: 1-file 14–68k bistable → 126k; fleet ~96–115k → 144k. One real finding from
+the sustained discipline: a 128 MiB single hot file DECAYS 45k → 32k (−28 %) — the
+whole-file-rewrite churn shape (reclaim/displacement backlog), a separate wall from this
+campaign's, left named for the rewrite program.
+
 Open next: the remaining 759 µs client residue + the 315 µs dd admit queueing term
 (dequeue → slab insert on the svc thread) — together they hold ~146 of the offered 256
 in-flights off the device.

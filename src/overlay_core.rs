@@ -34,7 +34,18 @@
 //!   `Superseded` ⇒ the `MintedBlockGuard` frees; `Published` ⇒ the
 //!   guard DISARMS (durable map/ref publication transferred ownership);
 //!   `FenceDropped` ⇒ disarm **without** freeing (W5 — nothing freed
-//!   post-fence, successor recovery owns the accounting).
+//!   post-fence, successor recovery owns the accounting); `Fed` ⇒
+//!   disarm **without** freeing (B4a, design-overlay-overwrite §5.4a —
+//!   ownership transferred to the rewrite epoch at the feed, KD-B4-3:
+//!   the dest is the epoch's pending B key, so freeing it here is the
+//!   KD-1.11 corruption).
+//! * **The §5.1 old-binding capture (B4a)** — an OVERWRITE record
+//!   carries the displaced mapping string captured at install
+//!   ([`OverlayRecordCore::old_binding`]), IMMUTABLE for the record's
+//!   life (no mutator exists — the §5.6 lock-free compose stays
+//!   two-word because the capture needs no revalidation word of its
+//!   own). `None` ⇔ the fresh/hole shape (law 5's gaps are zeros);
+//!   `Some` ⇔ gaps compose/seed from the old binding (§5.6(1)/§5.8).
 //!
 //! The coverage LAW is the shared [`crate::coverage_core::CoverageUnion`]
 //! (KD-OV-2 — one union for RAM and device accumulation); this module
@@ -61,8 +72,8 @@ use crate::placed_core::PlacedClaims;
 /// gate: segments are LBA-aligned, offset and length 4 KiB multiples).
 pub const OVERLAY_PAGE: usize = crate::placed_core::CLAIM_PAGE;
 
-/// The record lifecycle (§2.1 `state`). `Published`, `Superseded` and
-/// `FenceDropped` are terminal.
+/// The record lifecycle (§2.1 `state`). `Published`, `Superseded`,
+/// `FenceDropped` and `Fed` are terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum OverlayState {
@@ -79,6 +90,16 @@ pub enum OverlayState {
     /// The D0 writer guard fenced this mount (W5): publish refused,
     /// nothing freed, successor recovery owns all accounting.
     FenceDropped = 4,
+    /// The settle's publish split FED the completed overwrite overlay
+    /// to the rewrite epoch (design-overlay-overwrite §5.4a): the dest
+    /// key is now the epoch's B key and the EPOCH owns publication, the
+    /// displaced park, the deferred free, the fencing law and every
+    /// crash window (KD-B4-1). DISTINCT from `Published` — never a
+    /// reuse — because (a) the `overlay_publishes` (durable) vs
+    /// `overlay_epoch_feeds` (RAM-only) accounting split must be
+    /// readable off the record, and (b) a fed record observed after a
+    /// fenced epoch is a debugging fact `Published` would erase.
+    Fed = 5,
 }
 
 impl OverlayState {
@@ -88,6 +109,9 @@ impl OverlayState {
             1 => Self::Frozen,
             2 => Self::Published,
             3 => Self::Superseded,
+            5 => Self::Fed,
+            // Unknown words decode to the free-NOTHING arm (the
+            // conservative disposition), as before B4a.
             _ => Self::FenceDropped,
         }
     }
@@ -96,7 +120,7 @@ impl OverlayState {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Published | Self::Superseded | Self::FenceDropped
+            Self::Published | Self::Superseded | Self::FenceDropped | Self::Fed
         )
     }
 }
@@ -182,12 +206,32 @@ pub struct OverlayRecordCore {
     /// mutated under the caller's block lock; the atomic face above is
     /// its reader-visible projection.
     union: Mutex<CoverageUnion>,
+    /// The §5.1 old-binding capture (B4a): the displaced durable mapping
+    /// string of an OVERWRITE record, captured at install and IMMUTABLE
+    /// for the record's life (private field, getter only — no mutator
+    /// exists by construction). `None` ⇔ the fresh/hole shape. A
+    /// read-composition/gap-seed SOURCE, never custody: only the epoch
+    /// ever parks or frees the old key (§5.4's hazard-1/2 discharge).
+    old_binding: Option<String>,
 }
 
 impl OverlayRecordCore {
-    /// A fresh `Open` record over a `len`-byte block. `birth` is the
-    /// registry's monotone record identity.
+    /// A fresh/hole `Open` record over a `len`-byte block (no old
+    /// binding — law 5's gaps are zeros). `birth` is the registry's
+    /// monotone record identity.
     pub fn new(len: u32, birth: u64) -> Self {
+        Self::with_binding(len, birth, None)
+    }
+
+    /// An OVERWRITE `Open` record (B4a, §5.1): `old_binding` is the
+    /// displaced mapping captured in the SAME `INODE_META_LOCKS`
+    /// section as the registry install (the one-3.5-section rule —
+    /// B4c-ii's caller obligation), immutable from birth.
+    pub fn new_overwrite(len: u32, birth: u64, old_binding: String) -> Self {
+        Self::with_binding(len, birth, Some(old_binding))
+    }
+
+    fn with_binding(len: u32, birth: u64, old_binding: Option<String>) -> Self {
         let pages = (len as usize).div_ceil(OVERLAY_PAGE).max(1);
         let covered = (0..pages.div_ceil(64))
             .map(|_| AtomicU64::new(0))
@@ -203,12 +247,21 @@ impl OverlayRecordCore {
             claims: PlacedClaims::new(len as usize),
             covered,
             union: Mutex::new(CoverageUnion::new()),
+            old_binding,
         }
     }
 
     /// Record identity (the §5.2 dest-identity component).
     pub fn birth(&self) -> u64 {
         self.birth
+    }
+
+    /// The §5.1 immutable old-binding capture: `Some` names the gap
+    /// composition/seed source of an overwrite record (§5.6(1)/§5.8);
+    /// `None` is the fresh/hole shape (gaps are zeros — law 5). This
+    /// getter is the ONLY old-binding surface.
+    pub fn old_binding(&self) -> Option<&str> {
+        self.old_binding.as_deref()
     }
 
     /// Block size in bytes.
@@ -453,12 +506,29 @@ impl OverlayRecordCore {
     }
 
     /// `Frozen → Published` — only ever from the freeze (the §6.2
-    /// sequence), and never from a fenced/superseded record.
+    /// sequence), and never from a fenced/superseded/fed record.
     pub fn mark_published(&self) -> bool {
         self.state
             .compare_exchange(
                 OverlayState::Frozen as u8,
                 OverlayState::Published as u8,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    /// `Frozen → Fed` (B4a, §5.4a) — only ever from the freeze (the
+    /// settle's publish split runs freeze → drain → seed → feed), and
+    /// never from a fenced/superseded/published record: the epoch
+    /// becomes the ONE pending-binding authority at this instant
+    /// (KD-B4-1), so no durable publish may ever follow on the record
+    /// itself.
+    pub fn mark_fed(&self) -> bool {
+        self.state
+            .compare_exchange(
+                OverlayState::Frozen as u8,
+                OverlayState::Fed as u8,
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             )

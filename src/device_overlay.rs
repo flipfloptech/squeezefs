@@ -22,7 +22,12 @@
 //!   per-terminal-state: `Published` ⇒ DISARM (the durable map/ref
 //!   publish transferred ownership); `Superseded` ⇒ the guard's drop
 //!   FREES; `FenceDropped` ⇒ disarm WITHOUT freeing (W5 — nothing
-//!   freed post-fence, successor recovery owns the accounting);
+//!   freed post-fence, successor recovery owns the accounting); `Fed`
+//!   ⇒ disarm WITHOUT freeing (B4a, design-overlay-overwrite §5.4a —
+//!   ownership transferred to the rewrite epoch at the feed, KD-B4-3:
+//!   the dest is the epoch's pending B key and the epoch's
+//!   dispositions — swap-publish / fence-free-nothing — ARE the
+//!   rollback contract from that point);
 //! * the ino's **fencing token** captured at install (the FIND-M11-A
 //!   face — publication re-presents the current generation through the
 //!   same retry law the write-through uses).
@@ -218,6 +223,10 @@ impl DeviceOverlayRecord {
 
     /// Terminal teardown disposition (law 9 / KD-OV-11 — see module
     /// docs). Callers prove `core.rollback_admissible()` first.
+    ///
+    /// The match is EXHAUSTIVE ON PURPOSE — no catch-all (B4a): a new
+    /// `OverlayState` variant must name its disposition HERE (and in the
+    /// `overlay_core_tests` pinned table) or fail the compile.
     pub(crate) fn run_teardown_disposition(&self) {
         debug_assert!(self.core.rollback_admissible());
         let mut mint = self
@@ -227,6 +236,17 @@ impl DeviceOverlayRecord {
         match self.core.state() {
             crate::overlay_core::OverlayState::Published => {
                 // Ownership transferred to the durable map: disarm.
+                if let Some(m) = mint.as_mut() {
+                    m.disarm();
+                }
+            }
+            crate::overlay_core::OverlayState::Fed => {
+                // §5.4a (KD-B4-3): ownership transferred to the rewrite
+                // epoch at the feed — disarm WITHOUT freeing. The dest
+                // is the epoch's pending B key: freeing it here is the
+                // KD-1.11 freed-key-in-a-pending-map corruption. Kept
+                // distinct from `Published` so the durable-publish vs
+                // RAM-only-feed split stays readable off the record.
                 if let Some(m) = mint.as_mut() {
                     m.disarm();
                 }
@@ -242,12 +262,11 @@ impl DeviceOverlayRecord {
             crate::overlay_core::OverlayState::Superseded => {
                 // The guard's drop frees the unpublished destination.
             }
-            s => {
+            crate::overlay_core::OverlayState::Open | crate::overlay_core::OverlayState::Frozen => {
                 crate::note_invariant_tripwire(
                     "overlay_teardown_nonterminal",
                     "overlay teardown disposition ran on a non-terminal record",
                 );
-                let _ = s;
                 if let Some(m) = mint.as_mut() {
                     m.disarm();
                 }
@@ -303,9 +322,17 @@ impl DeviceOverlayRegistry {
         out
     }
 
-    /// Install a fresh record (callers hold the block's
-    /// `BLOCK_FLUSH_LOCKS` guard — the §10 install order). Returns the
-    /// record, or `None` if one already exists (the caller joins it).
+    /// Install a record (callers hold the block's `BLOCK_FLUSH_LOCKS`
+    /// guard — the §10 install order). Returns the record, or `None` if
+    /// one already exists (the caller joins it).
+    ///
+    /// `old_binding` is the B4a §5.1 capture: `None` ⇔ the fresh/hole
+    /// shape (every B2 caller); `Some(mapping)` ⇔ an OVERWRITE record
+    /// whose gaps compose/seed from the displaced binding. The capture
+    /// and this install must share ONE `INODE_META_LOCKS` section (the
+    /// §5.1 one-section rule — B4c-ii's caller obligation: a capture
+    /// that dropped 3.5 before installing can be born already-displaced,
+    /// the KD-1.11 resurrection class at birth).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn install(
         &self,
@@ -317,12 +344,17 @@ impl DeviceOverlayRegistry {
         device: Arc<crate::nvme_dev::NvmeBlockDev>,
         allocator: Arc<crate::block_allocator::BlockAllocator>,
         fence_token: u64,
+        old_binding: Option<String>,
         fsck_guard: crate::block_allocator::InflightAllocGuard,
         mint_owner: crate::assembly_tasks::MintedBlockGuard,
     ) -> Option<Arc<DeviceOverlayRecord>> {
         let birth = self.birth.fetch_add(1, Ordering::Relaxed) + 1;
+        let core = match old_binding {
+            Some(old) => OverlayRecordCore::new_overwrite(block_size, birth, old),
+            None => OverlayRecordCore::new(block_size, birth),
+        };
         let rec = Arc::new(DeviceOverlayRecord {
-            core: OverlayRecordCore::new(block_size, birth),
+            core,
             be_id,
             dest_offset,
             device,

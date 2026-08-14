@@ -12900,6 +12900,10 @@ impl SqueezefsFilesystem {
                     device,
                     allocator,
                     fencing_token,
+                    // Fresh/hole shape (the mapped decline above): no old
+                    // binding. The overwrite capture — inside the ONE
+                    // 3.5 section, §5.1 — is PR B4c-ii's.
+                    None,
                     fsck_guard,
                     mint_owner,
                 ) {

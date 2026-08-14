@@ -2733,15 +2733,17 @@ const REAP_EVENT_PARK_MAX: usize = 24;
 /// session under `SQUEEZEFS_IL_SPARSE_BATCH_MARKS=0` (the A/B control).
 /// Pre-latch the 2026-07-28 herd priced sparse marks out; the
 /// wake-collapse latch bounds an era at one syscall, which re-opens
-/// them — but the local A-B-B-A counted a LOSS at defaults (2026-08-14,
-/// TCP devsub, engagement exact: 32×8 write −3 % at gauge 0.92→0.29,
-/// read fleet −3.5 % at 0.76→0.27, wakes −66..−70 % — the k-th-
-/// completion delivery delay outprices the syscall savings when the
-/// reapers are not CPU-starved). **Default OFF**: a FIELD measurement
-/// lever for the design's named target venue (80 %-CPU saturated
-/// reaper fleets — the "local hides it" class; OQ2's remaining half),
-/// the SQPOLL precedent — a knob, measured not-recommended locally,
-/// never an ambient default.
+/// them. **Default ON — the FIELD adjudication (2026-08-14)**: the
+/// saturated-reaper field fleet (the design's named target venue)
+/// counted consistently higher IOPS with the marks engaged — the
+/// "local hides it" class landing exactly as OQ2 predicted. The local
+/// unsaturated-venue cost stays recorded (TCP devsub A-B-B-A,
+/// engagement exact: 32×8 write −3 % at gauge 0.92→0.29, read fleet
+/// −3.5 % at 0.76→0.27, wakes −66..−70 % — the k-th-completion
+/// delivery delay outprices the syscall savings when reapers are NOT
+/// CPU-starved); `=0` is the A/B control for latency-sensitive
+/// unsaturated mounts. qd1 stays inert BY DERIVATION (single-pending
+/// sessions park event-exact).
 fn sparse_park_k(pending_on_session: usize) -> u32 {
     if !sparse_batch_marks() || pending_on_session <= 1 {
         return 1;
@@ -2766,7 +2768,7 @@ fn sparse_batch_marks() -> bool {
 fn sparse_batch_marks_from(v: Option<&str>) -> bool {
     match crate::env_knob_core::parse_bool("SQUEEZEFS_IL_SPARSE_BATCH_MARKS", v) {
         Ok(Some(b)) => b,
-        _ => false,
+        _ => true,
     }
 }
 
@@ -3020,22 +3022,20 @@ mod reap_park_max_tests {
         // qd1 wake-IS-the-contract hard gate), regardless of the lever.
         assert_eq!(sparse_park_k(0), 1);
         assert_eq!(sparse_park_k(1), 1);
-        // Default OFF: every population parks event-exact.
-        assert_eq!(sparse_park_k(8), 1);
-        // The derivation the field lever engages: the deep arm's
-        // threshold over the session's own pending population —
-        // qd8 -> 2 (the 32x8 fleet shape), qd16 -> 4, qd24 -> 6.
-        use squeezefs_ipc::sizing::reap_batch_wake_threshold as thr;
-        assert_eq!(thr(8), 2);
-        assert_eq!(thr(16), 4);
-        assert_eq!(thr(24), 6);
-        // Lever spellings: =1 engages, =0/absent/garbage stay OFF
-        // (shim announce-and-default, never kill the host).
+        // Default ON (field adjudication 2026-08-14): the derivation —
+        // the deep arm's threshold over the session's own pending
+        // population: qd8 -> 2 (the 32x8 fleet shape), qd16 -> 4.
+        assert_eq!(sparse_park_k(8), 2);
+        assert_eq!(sparse_park_k(16), 4);
+        assert_eq!(sparse_park_k(24), 6);
+        // Lever spellings: =0 is the A/B control (latency-sensitive
+        // unsaturated mounts); absent/garbage = ON (shim
+        // announce-and-default, never kill the host).
         assert!(!sparse_batch_marks_from(Some("0")));
-        assert!(sparse_batch_marks_from(Some("1")), "the field lever");
-        assert!(!sparse_batch_marks_from(None), "default OFF");
+        assert!(sparse_batch_marks_from(Some("1")));
+        assert!(sparse_batch_marks_from(None), "default ON");
         assert!(
-            !sparse_batch_marks_from(Some("garbage")),
+            sparse_batch_marks_from(Some("garbage")),
             "announce-and-default"
         );
     }

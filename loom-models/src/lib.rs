@@ -228,14 +228,14 @@ pub mod coverage_core;
 pub mod cow_core;
 #[path = "../../src/meta_backend/kv/epoch_core.rs"]
 pub mod epoch_core;
+#[path = "../../crates/squeezefs-ipc/src/exec_core.rs"]
+pub mod exec_core;
 #[path = "../../crates/squeezefs-preload/src/fd_table_core.rs"]
 pub mod fd_table_core;
 #[path = "../../src/gauge_core.rs"]
 pub mod gauge_core;
 #[path = "../../src/incarnation_core.rs"]
 pub mod incarnation_core;
-#[path = "../../crates/squeezefs-ipc/src/exec_core.rs"]
-pub mod exec_core;
 #[path = "../../crates/squeezefs-ipc/src/cqe_core.rs"]
 pub mod ipc_cqe_core;
 #[path = "../../crates/squeezefs-ipc/src/ring_core.rs"]
@@ -258,12 +258,12 @@ pub mod patch_clone_core;
 pub mod placed_core;
 #[path = "../../src/refcount_core.rs"]
 pub mod refcount_core;
-#[path = "../../src/sqz_sync_core.rs"]
-pub mod sqz_sync_core;
 #[path = "../../src/meta_backend/kv/slot_cursor_core.rs"]
 pub mod slot_cursor_core;
 #[path = "../../src/meta_backend/slot_gate_core.rs"]
 pub mod slot_gate_core;
+#[path = "../../src/sqz_sync_core.rs"]
+pub mod sqz_sync_core;
 #[path = "../../crates/fuse3/src/raw/connection/wake_core.rs"]
 pub mod wake_core;
 #[path = "../../src/write_pipeline_core.rs"]
@@ -2906,10 +2906,7 @@ mod models {
                     // Latch arm live (the shipped default posture);
                     // `Collapsed` implies an earlier `Wake` already set
                     // the witness (threads join before the assert).
-                    if matches!(
-                        cqe.complete(true),
-                        ipc_cqe_core::CompleteOutcome::Wake
-                    ) {
+                    if matches!(cqe.complete(true), ipc_cqe_core::CompleteOutcome::Wake) {
                         wake.store(true, Ordering::SeqCst);
                     }
                 })
@@ -2989,10 +2986,7 @@ mod models {
                     // Latch arm live (the shipped default posture);
                     // `Collapsed` implies an earlier `Wake` already set
                     // the witness (threads join before the assert).
-                    if matches!(
-                        cqe.complete(true),
-                        ipc_cqe_core::CompleteOutcome::Wake
-                    ) {
+                    if matches!(cqe.complete(true), ipc_cqe_core::CompleteOutcome::Wake) {
                         wake.store(true, Ordering::SeqCst);
                     }
                 })
@@ -3090,10 +3084,7 @@ mod models {
                 thread::spawn(move || {
                     assert!(slot.try_begin_serve(), "submitted slot must serve");
                     let _slot_waiter = slot.complete();
-                    if matches!(
-                        cqe.complete(true),
-                        ipc_cqe_core::CompleteOutcome::Wake
-                    ) {
+                    if matches!(cqe.complete(true), ipc_cqe_core::CompleteOutcome::Wake) {
                         wakes.fetch_add(1, Ordering::SeqCst);
                     }
                 })
@@ -3204,8 +3195,8 @@ mod models {
                     w_b.store(false, Ordering::SeqCst);
                     let scan_found = slot.is_done_for(gen);
                     // Kernel-strength admission read (see model 1).
-                    let admitted = !scan_found
-                        && cqe.seq_word().fetch_add(0, Ordering::SeqCst) == expected;
+                    let admitted =
+                        !scan_found && cqe.seq_word().fetch_add(0, Ordering::SeqCst) == expected;
                     (admitted, scan_found, expected)
                 })
             };
@@ -3213,8 +3204,7 @@ mod models {
             w_a.store(false, Ordering::SeqCst);
             let scan_a = slot.is_done_for(gen);
             // Kernel-strength admission read (see model 1).
-            let admitted_a = !scan_a
-                && cqe.seq_word().fetch_add(0, Ordering::SeqCst) == expected_a;
+            let admitted_a = !scan_a && cqe.seq_word().fetch_add(0, Ordering::SeqCst) == expected_a;
 
             let (admitted_b, scan_b, expected_b) = parker_b.join().unwrap();
             let outcome = server.join().unwrap();
@@ -3234,10 +3224,8 @@ mod models {
             // latch consumed and no wake witnessed (the latch-broken
             // signature; the clear-before-register weakening lands
             // exactly there).
-            let payable_or_pending = || {
-                cqe.wake_paid() == 0
-                    || cqe.seq().wrapping_sub(cqe.wake_at()) >= (1 << 31)
-            };
+            let payable_or_pending =
+                || cqe.wake_paid() == 0 || cqe.seq().wrapping_sub(cqe.wake_at()) >= (1 << 31);
             if admitted_a && !w_a.load(Ordering::SeqCst) {
                 assert!(
                     payable_or_pending(),
@@ -4248,12 +4236,19 @@ mod models {
     /// memory-model ordering of its own — the protocol words must carry
     /// ALL the exclusion): version consistency across both words is the
     /// invariant.
+    ///
+    /// B4a (design-overlay-overwrite §5.1): the record is minted
+    /// OVERWRITE-SHAPED (old_binding present) — the word protocol is
+    /// old-binding-blind (the capture is immutable and carries no
+    /// ordering role; KD-B4-4: no new fence protocol), re-verified here
+    /// over the grown transition set.
     #[test]
     fn overlay_validated_serve_is_never_torn() {
         loom::model(|| {
-            let r = Arc::new(overlay_core::OverlayRecordCore::new(
+            let r = Arc::new(overlay_core::OverlayRecordCore::new_overwrite(
                 2 * overlay_core::OVERLAY_PAGE as u32,
                 1,
+                "bk:42:0".to_string(),
             ));
             let d0 = Arc::new(AtomicUsize::new(0));
             let d1 = Arc::new(AtomicUsize::new(0));
@@ -4298,12 +4293,18 @@ mod models {
     /// publish, or is visible in the in-flight set until its CQE — so a
     /// freezer that observes `inflight_empty()` has seen the FINAL
     /// coverage (no store can publish after that observation).
+    ///
+    /// B4a: minted OVERWRITE-SHAPED, and the model's tail exercises the
+    /// grown transition (§5.4a): the drained frozen record FEEDS
+    /// (Frozen → Fed) — terminal, never publishable, rollback
+    /// admissible. Same Dekker pair, no new fence (KD-B4-4).
     #[test]
     fn overlay_freeze_drain_observes_final_coverage() {
         loom::model(|| {
-            let r = Arc::new(overlay_core::OverlayRecordCore::new(
+            let r = Arc::new(overlay_core::OverlayRecordCore::new_overwrite(
                 overlay_core::OVERLAY_PAGE as u32,
                 1,
+                "bk:42:0".to_string(),
             ));
             let stored = Arc::new(AtomicBool::new(false));
 
@@ -4358,6 +4359,36 @@ mod models {
                     Err(overlay_core::StoreRefusal::NotOpen)
                 ),
                 "a frozen record admitted a new segment"
+            );
+
+            // B4a §5.4a — the settle's publish split on the drained
+            // frozen record: Frozen → Fed, after which the epoch is the
+            // ONE pending-binding authority (no durable publish may
+            // follow on the record), the old-binding capture is intact,
+            // and law 9 admits the teardown (whose disposition is
+            // disarm-without-free — the prod half, pinned in
+            // device_overlay's own tests).
+            assert!(r.mark_fed(), "Frozen → Fed failed on a drained record");
+            assert!(
+                !r.mark_published(),
+                "a fed record durably published (KD-B4-1: one authority)"
+            );
+            assert!(!r.mark_fed(), "the feed fired twice");
+            assert_eq!(
+                r.old_binding(),
+                Some("bk:42:0"),
+                "the §5.1 capture must survive the feed verbatim"
+            );
+            assert!(
+                r.rollback_admissible(),
+                "terminal + drained in-flight set must admit teardown"
+            );
+            assert!(
+                matches!(
+                    r.begin_store(0, 1),
+                    Err(overlay_core::StoreRefusal::NotOpen)
+                ),
+                "a fed record admitted a new segment"
             );
         });
     }

@@ -129,10 +129,19 @@ falsification: **rand-write il rows must pre-create the file set** (`--create_on
 warmup ≥ the layout horizon) — a row containing its own layout pass overstates the handler
 share and understates the patch share.
 
-What still stands from part 3: the **worker-count scheduling conviction** (32 procs = 154k vs
-4 procs = 242k at equal offered depth, PSI 32 % vs 5 %) — the client-side wake fan-out at
-0.94 daemon wakes/op is the remaining fleet-shape term, and it is a client-topology/wake-
-economy design item, not an eligibility one.
+What still stands from part 3: the **worker-count scheduling conviction**, now re-counted
+CLEAN (written fileset via the pre-fill rule, fixed 4 GiB total, fixed 256 offered in-flights):
+32×8 = **185k** / 8×32 = **227k** / 4×64 = **257k** (p99 23.7 → 11.3 ms; the 4-proc row is
+**91 % of the raw substrate ceiling**, 281k). Two coupled terms: the client wake fan-out
+(0.94 daemon wakes/op × 32 parked reapers), and the patch share falling with process count
+(94 % at 4 procs → 76 % at 32 — the residual handler share at high fan-in is the second half
+of the same wall). The `unmapped=0` columns on every written-fileset row are the layout-theory
+confirmation in production counters.
+
+**Honest headline rows after the pre-fill rule** (the earlier "sustained 144k" carried its own
+layout pass): il rand-4k overwrite 32×8 = **183–185k**, 1×32 = **126k** (p99 750 µs), 4×64 =
+**257k**. The venue's raw ceiling is 281k — the shim write plane at low fan-in is within 9 %
+of the device.
 
 ## Standing consequences
 

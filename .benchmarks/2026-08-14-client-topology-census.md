@@ -44,14 +44,37 @@ Note: the NUMA campaign's service-thread pins are NODE-level (`numa_core` neares
 process mask) — structurally inert on this 1-node box, so nothing currently constrains
 placement here.
 
-## Open next (the attribution still owed before any lever)
+## The attribution rounds (same day — three theories killed, one term counted)
 
-1. **Wake-placement attribution**: `perf sched` (or `sched:sched_wakeup` tracepoints) over a
-   short 32×8 window — count wakee-placement decisions (same-CPU-as-waker vs idle-CPU) and
-   migrations/s per class; confirm or kill the pile-up theory against the idle-CPU census.
-2. If confirmed, the lever class is **daemon thread placement** (derived per-CPU spread for
-   svc/dd/tpc within the process mask — topology-derived, never a constant; possibly
-   `SCHED_IDLE`-class demotion for non-latency lanes), with the qd1/1×32 latency shapes as
-   hard gates.
-3. The client half, if any, is affinity HINTS only (the shim owns no threads) — and may be
-   nothing.
+**Round 1 — wake placement (tracepoints, 5 s window, 3.26 M wakeups):** the pile-up theory is
+DEAD: 90–96 % of wakeups land on idle CPUs (svc 90 %, tpc 91 %, fio 96 %); the busy-target-
+with-idle-available arm is only 4–10 %. What the trace DID show: **~360k migrations/s**
+(fio 206k/s, tpc 73k/s, svc 44k/s) and interrupt-context wakers dominating ("other" class =
+softirq/irq on the nvme-tcp and futex paths).
+
+**Round 2 — static partitions (taskset scouts): every variant LOSES.** free 174k; daemon
+pinned 0–15 = 119k; hard partition 16/16 = 115k; clients pinned = 159k; partition 24/8 = 162k.
+The scheduler's own placement beats every static mask — the placement-lever class is dead on
+this box (and the NUMA campaign's node pins stay the only sanctioned placement machinery).
+
+**Round 3 — C-state exit latency: falsified.** `/dev/cpu_dma_latency = 0` clamp: 164k vs
+168k free (wash; box idle states POLL/C1/C2/C3, 0/1/18/350 µs).
+
+**Round 4 — park-cycle latency: COUNTED REAL.** The svc threads park ~50k/s at fan-in; every
+park costs the next burst a wake→run cycle. `SQUEEZEFS_IPC_SPIN_US` dose-response (single
+legs): 20 → +2 %, **100 → +6 %**, 200 → +4 %, 400 → +2 %, 800 → +4 % (plateau ≈ 100–200 µs).
+Counted A-B-B-A at 100 µs: **183/182k vs 166/176k (+6.7 % median), p99 23,987 vs 24,773 µs,
+both orders, engagement exact.** The 2026-07-26 record priced this lever as a CPU-taxing
+explicit fleet lever — at 17 % box utilization the tax is free, which is exactly the
+derivation opportunity.
+
+## The lever design this hands the next PR
+
+**Adaptive svc spin derived from observed idleness** — never a constant default: spin the
+empty-pass window only while the recent pass-occupancy/park-rate says the lane is in the
+park-churn regime and the process has CPU headroom (utilization-derived, cores-scaled, the
+probe-governor pattern); bleed to 0 under saturation (the CPU-theft posture the record
+demands) and on latency shapes (qd1 hard gate). The +6.7 % counted ceiling at 32×8 is the
+acceptance bar; the remaining topology gap (185k → 257k by client count) past that term is
+dominated by client-side worker park/wake cycles (fio's own threads — not ours) and the
+migration churn the scheduler chooses (counted, but every static override loses).

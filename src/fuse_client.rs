@@ -6012,6 +6012,21 @@ pub struct Metrics {
     /// reaping client means the parked gate stopped eliding (the
     /// pre-campaign one-wake-syscall-per-completion posture).
     pub ipc_cqe_wake_elided: Align64<AtomicU64>,
+    /// Wake-economy campaign L1 (design-il-wake-economy; instruments-
+    /// first — the mechanism lands with the PR 2 wake-collapse latch):
+    /// mark-passed completions toward a parked reaper whose FUTEX_WAKE
+    /// the per-era `wake_paid` latch elided. Extends the gauge's
+    /// denominator to `writes/(writes+elided+collapsed)` (≤ 0.25 at
+    /// 32×8 is the G2 target); structurally 0 until PR 2 lands and on
+    /// `SQUEEZEFS_IPC_CQE_WAKE_LATCH=0` mounts.
+    pub ipc_cqe_wake_collapsed: Align64<AtomicU64>,
+    /// Wake-economy campaign L4 (instruments-first — the mechanism is
+    /// the decision-gated PR 4 pass-scoped wake flush): end-of-drain-
+    /// pass cqe wake syscalls issued by the svc thread on behalf of the
+    /// sessions its pass completed into. `flushes ≤ sessions × passes`
+    /// by construction; structurally 0 until PR 4 lands (if its gate
+    /// prices it in).
+    pub ipc_cqe_pass_wake_flushes: Align64<AtomicU64>,
     /// DIALED P1 direct-drive families (design-preload-interception
     /// §5.5/§12 fallback shape; `perf/ipc-direct-drive`): governed ranged
     /// ring reads the service thread submitted DIRECTLY on the ipc-host-
@@ -9313,6 +9328,8 @@ impl SqueezefsFilesystem {
                 "ipc_inval_attrs_only": METRICS.ipc_inval_attrs_only.load(Ordering::Relaxed),
                 "ipc_cqe_wake_writes": METRICS.ipc_cqe_wake_writes.load(Ordering::Relaxed),
                 "ipc_cqe_wake_elided": METRICS.ipc_cqe_wake_elided.load(Ordering::Relaxed),
+                "ipc_cqe_wake_collapsed": METRICS.ipc_cqe_wake_collapsed.load(Ordering::Relaxed),
+                "ipc_cqe_pass_wake_flushes": METRICS.ipc_cqe_pass_wake_flushes.load(Ordering::Relaxed),
                 // DIALED P1 direct-drive (perf/ipc-direct-drive): the
                 // governed miss shape served from the ipc-host uring +
                 // the prelude decision ledger.

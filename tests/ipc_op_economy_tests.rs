@@ -780,3 +780,39 @@ async fn parked_reaper_is_woken_by_completion_cqe_wake() {
     session.arena_read_into(0, &mut got);
     assert_eq!(got, expect, "parked-reap read served the right bytes");
 }
+
+// ---------------------------------------------------------------------------
+// Wake-economy campaign instruments (design-il-wake-economy PR 1 —
+// instruments-first: the counters register and export at 0 AHEAD of
+// their mechanisms; the L1 latch wires `ipc_cqe_wake_collapsed` in PR 2
+// and the L4 pass flush wires `ipc_cqe_pass_wake_flushes` in PR 4).
+// ---------------------------------------------------------------------------
+
+/// PR 1 contract: both campaign counters exist in METRICS and export on
+/// the stats inode, at 0 with no mechanism landed (a rig written against
+/// the columns must read zeros, never missing keys).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wake_economy_instruments_register_and_export_at_zero() {
+    let fx = Fixture::new("wake-econ-instr").await;
+    assert_eq!(
+        METRICS.ipc_cqe_wake_collapsed.load(Ordering::Relaxed),
+        0,
+        "no mechanism is landed: the latch counter must register at 0"
+    );
+    assert_eq!(
+        METRICS.ipc_cqe_pass_wake_flushes.load(Ordering::Relaxed),
+        0,
+        "no mechanism is landed: the pass-flush counter must register at 0"
+    );
+    let stats = fx.fs.generate_stats_json().await;
+    let v: serde_json::Value = serde_json::from_str(&stats).expect("stats json parses");
+    let m = v.get("metrics").expect("metrics object");
+    for key in ["ipc_cqe_wake_collapsed", "ipc_cqe_pass_wake_flushes"] {
+        assert_eq!(
+            m.get(key).and_then(|x| x.as_u64()),
+            Some(0),
+            "stats inode must export {key} at 0 ahead of its mechanism"
+        );
+    }
+    fx.shutdown();
+}

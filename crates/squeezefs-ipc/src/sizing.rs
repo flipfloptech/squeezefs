@@ -53,7 +53,9 @@ pub const SESSION_REGISTRY_SLOTS: usize = 32;
 /// for the derivation (the ceiling = half the registry: two
 /// concurrently-bound mounts' worth of headroom).
 pub fn il_sessions_default(cpus: usize) -> usize {
-    (cpus / 4).clamp(2, SESSION_REGISTRY_SLOTS / 2)
+    // Allocation math ROUNDS UP (user ruling 2026-08-14: slightly more
+    // than not enough — a fractional share derives the next whole unit).
+    cpus.div_ceil(4).clamp(2, SESSION_REGISTRY_SLOTS / 2)
 }
 
 /// The daemon's il drain-LANE width — `clamp(3×cpus/8, 2, 64)` — sizing
@@ -96,7 +98,10 @@ pub fn il_sessions_default(cpus: usize) -> usize {
 /// their own measured cpus/4 slopes: this class is the daemon drain lane
 /// only.
 pub fn il_drain_lanes_default(cpus: usize) -> usize {
-    (cpus.saturating_mul(3) / 8).clamp(2, 64)
+    // Allocation math ROUNDS UP (user ruling 2026-08-14 — the write-lane
+    // precedent: a fractional 3.x share derived 3 in the field and sat a
+    // lane short of the wall).
+    cpus.saturating_mul(3).div_ceil(8).clamp(2, 64)
 }
 
 /// The hybrid lane gate's **lane-RTT delta class** (ruling D14's
@@ -178,6 +183,10 @@ pub fn kernel_lane_min_default(
 /// only its own pending ops are guaranteed to produce them) — the
 /// ceiling DOMINATES the floor, so degenerate pending never violates it.
 pub fn reap_batch_wake_threshold(pending: usize) -> u32 {
+    // Deliberately FLOOR (the 2026-08-14 round-up ruling is for
+    // ALLOCATIONS — lanes/threads/buffers, where more-than-enough is
+    // the safe side). This is a WAKE THRESHOLD: rounding it up means a
+    // LATER wake — the unsafe direction for delivery latency.
     (pending / 4).max(2).min(pending.max(1)) as u32
 }
 
@@ -194,8 +203,8 @@ mod tests {
         assert_eq!(il_sessions_default(16), 4);
         assert_eq!(
             il_sessions_default(22),
-            5,
-            "non-multiple-of-4 boxes truncate"
+            6,
+            "non-multiple-of-4 boxes round UP (2026-08-14 allocation ruling)"
         );
         assert_eq!(
             il_sessions_default(32),

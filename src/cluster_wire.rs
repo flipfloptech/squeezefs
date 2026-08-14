@@ -1118,7 +1118,9 @@ pub fn default_service_threads() -> usize {
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    let derived = (cpus / 8).clamp(1, 8);
+    // Allocation math rounds UP (2026-08-14 ruling): a fractional
+    // share of the box derives the next whole RPC lane.
+    let derived = cpus.div_ceil(8).clamp(1, 8);
     let want = crate::env_knobs::opt_int_knob::<usize>("SQUEEZEFS_CLUSTER_WIRE_SVC_THREADS")
         .unwrap_or(derived);
     want.clamp(1, cpus.max(1))

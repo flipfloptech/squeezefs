@@ -76,7 +76,11 @@ const EWMA_SHIFT: u32 = 3;
 /// busy ≥ 80 %.)
 pub fn busy_ceiling_pct(lanes: usize, cores: usize) -> u32 {
     let cores = cores.max(1);
-    let spin_share = (100 * lanes) / cores; // lanes/cores, in percent
+    // The 2026-08-14 rounding doctrine, PROTECTIVE-BOUND direction:
+    // allocations round up, but this is a safety ceiling — the spin
+    // SHARE rounds UP so the ceiling rounds DOWN (a fractional share
+    // must count fully against headroom, never partially).
+    let spin_share = (100 * lanes).div_ceil(cores);
     100u32.saturating_sub(spin_share.min(100) as u32)
 }
 
@@ -236,7 +240,7 @@ mod tests {
     #[test]
     fn saturation_disengages() {
         let ceiling = busy_ceiling_pct(12, 32);
-        assert_eq!(ceiling, 63, "12 lanes / 32 cores: 100 - 37.5 = 62.5 -> 63");
+        assert_eq!(ceiling, 62, "12 lanes / 32 cores: share ceils to 38 -> 62");
         assert_eq!(
             window(50_000, ceiling, 12, 32, 3),
             Duration::from_micros(SPIN_WINDOW_US),
@@ -254,8 +258,16 @@ mod tests {
     /// at 0 (never spin on a box the lanes already saturate).
     #[test]
     fn ceiling_derives_from_lanes_and_cores() {
-        assert_eq!(busy_ceiling_pct(2, 32), 94, "2 lanes on 32 cores");
-        assert_eq!(busy_ceiling_pct(24, 64), 63, "3xcpus/8 at 64 cores");
+        assert_eq!(
+            busy_ceiling_pct(2, 32),
+            93,
+            "2 lanes on 32 cores (share ceils)"
+        );
+        assert_eq!(
+            busy_ceiling_pct(24, 64),
+            62,
+            "3xcpus/8 at 64 cores (share ceils)"
+        );
         assert_eq!(busy_ceiling_pct(2, 2), 0, "lanes == cores: never");
         assert_eq!(busy_ceiling_pct(64, 4), 0, "saturating, no underflow");
     }

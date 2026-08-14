@@ -541,16 +541,22 @@ fn read_bounce_pool_routing_and_home_recycle() {
 #[test]
 fn io_lanes_derivation_table() {
     use squeezefs::nvme_dev::io_lanes_for;
-    // The read field shape: 32 CPUs / 8 data namespaces => 4 submitting
-    // threads (nvme-tcp queues) per device.
+    // Exact divisions are unchanged by the ceiling (2026-08-14 field
+    // re-derivation — the user ruling: a fractional share rounds UP, a
+    // submission lane is cheap and the per-connection wall is not).
+    // The read field shape: 32 CPUs / 8 data namespaces => 4.
     assert_eq!(io_lanes_for(32, 8), 4);
-    // The WRITE field shape (2026-08-07 decomposition): 32 CPUs / 5 data
-    // namespaces => 6 submitting threads per device.
-    assert_eq!(io_lanes_for(32, 5), 6);
+    // Fractional shares round UP now: 32 / 5 = 6.4 => 7 (was 6 — the
+    // 2026-08-14 field mount derived 3 of a fractional 4-ish share and
+    // sat a lane short of its wall).
+    assert_eq!(io_lanes_for(32, 5), 7);
     // The local devsub: 32 / 4 => 8.
     assert_eq!(io_lanes_for(32, 4), 8);
+    // The field conviction shape: a ~3.x share must derive 4, not 3.
+    assert_eq!(io_lanes_for(30, 8), 4);
     // Self-bounding: one device may use every CPU (the raw row's shape);
-    // more devices than CPUs floors at 1 (never zero).
+    // more devices than CPUs still derives 1 whole lane (ceil of a
+    // fraction below 1 is 1 — never zero, never more than needed).
     assert_eq!(io_lanes_for(32, 1), 32);
     assert_eq!(io_lanes_for(4, 8), 1);
     assert_eq!(io_lanes_for(0, 0), 1, "degenerate inputs floor at 1");

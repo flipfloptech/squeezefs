@@ -1316,13 +1316,17 @@ fn coarse_monotonic_ms() -> u64 {
 /// fan out with the SAME derivation, by block-offset affinity (see
 /// [`write_lane_index`]).
 ///
-/// The count derives — never a constant: `cpus / data_devices`, floor 1
-/// (a device never loses its worker), self-bounded by `cpus` (total
-/// submitting threads per plane ≈ the machine, the raw row's own shape
-/// when devices = 1). Explicit `SQUEEZEFS_NVME_READ_LANES` /
-/// `SQUEEZEFS_NVME_WRITE_LANES` win verbatim at the arming site.
+/// The count derives — never a constant: `ceil(cpus / data_devices)`
+/// (CEILING since 2026-08-14, user ruling on the field mount that
+/// derived 3 of a fractional ~3.x share and sat a lane short of the
+/// per-connection wall: a fractional share rounds UP — a submission
+/// lane is cheap, the wall is not), floor 1 (a device never loses its
+/// worker), self-bounded by `cpus` (total submitting threads per plane
+/// ≈ the machine, the raw row's own shape when devices = 1). Explicit
+/// `SQUEEZEFS_NVME_READ_LANES` / `SQUEEZEFS_NVME_WRITE_LANES` win
+/// verbatim at the arming site.
 pub fn io_lanes_for(cpus: usize, data_devices: usize) -> usize {
-    (cpus / data_devices.max(1)).clamp(1, cpus.max(1))
+    cpus.div_ceil(data_devices.max(1)).clamp(1, cpus.max(1))
 }
 
 /// The write-lane pick — a PURE function of the block offset:

@@ -68,15 +68,19 @@ impl Future for Acquire<'_> {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let (granted, wake) = self.core.try_acquire(self.want, self.id);
+        // Grant-or-enqueue is ONE core critical section (park-racing-
+        // release fix, 2026-08-13): the retired try_acquire-then-
+        // register shape left a window where a release saw an empty
+        // queue and the waiter then parked wakeless — a 2 s tick stall
+        // that FIFO courtesy amplified into a full convoy freeze.
+        let mut id = self.id;
+        let (granted, wake) = self.core.poll_acquire(self.want, &mut id, cx.waker());
+        self.id = id;
         wake_all(wake);
         if granted {
-            // Any queue entry was removed inside try_acquire.
-            self.id = None;
+            // Any queue entry was removed inside poll_acquire.
             return Poll::Ready(());
         }
-        let id = self.core.register(self.want, self.id, cx.waker());
-        self.id = Some(id);
         Poll::Pending
     }
 }
@@ -84,7 +88,9 @@ impl Future for Acquire<'_> {
 impl Drop for Acquire<'_> {
     fn drop(&mut self) {
         if let Some(id) = self.id {
-            self.core.unregister(id);
+            // A cancelled FRONT waiter may have absorbed a release's
+            // wake — unregister hands it to the new front.
+            wake_all(self.core.unregister(id));
         }
     }
 }

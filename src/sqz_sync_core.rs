@@ -125,7 +125,85 @@ impl<W: Clone> LockCore<W> {
         (false, Vec::new())
     }
 
-    /// Register (or refresh) a waiter. Returns its id.
+    /// The poll-shaped attempt: **grant-or-enqueue under ONE critical
+    /// section** (park-racing-release fix, 2026-08-13). The retired
+    /// shape ran `try_acquire` and `register` as two separate holds, so
+    /// a release could land between them — it saw an empty queue, woke
+    /// nobody, and flipped the lock FREE; the waiter then parked with no
+    /// wake in flight, and under FIFO courtesy every fresh contender
+    /// queued behind the stranded front until its 2 s tick (the field's
+    /// stall-punctuated `write_lock_wait_exclusive` histogram). Here the
+    /// interior mutex serializes the two: either the release ran first
+    /// (this call sees the freed lock and grants) or this call ran first
+    /// (the release sees the queued waiter and returns its waker).
+    ///
+    /// `my_id` is the waiter's queue identity: `None` = fresh attempt
+    /// (FIFO courtesy — yields to any queue), `Some` = queued re-contend
+    /// (barges — the dead-waiter tick rail). Cleared on grant; set on
+    /// first park. A parked re-poll refreshes the waker in place, so the
+    /// FIFO position survives the tick.
+    pub fn poll_acquire(&self, want: Want, my_id: &mut Option<u64>, waker: &W) -> (bool, Vec<W>) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let at_front = match *my_id {
+            Some(id) => st.queue.front().map(|w| w.id) == Some(id),
+            None => st.queue.is_empty(),
+        };
+        match want {
+            Want::Shared => {
+                let blocked_by_writer_wait = !at_front
+                    && st.queue.iter().any(|w| w.want == Want::Exclusive)
+                    && my_id.is_none();
+                if !st.writer && !blocked_by_writer_wait {
+                    st.readers += 1;
+                    if let Some(id) = my_id.take() {
+                        st.queue.retain(|w| w.id != id);
+                    }
+                    let wake = Self::front_wakers(&st);
+                    return (true, wake);
+                }
+            }
+            Want::Exclusive => {
+                if !st.writer && st.readers == 0 && (my_id.is_some() || at_front) {
+                    st.writer = true;
+                    if let Some(id) = my_id.take() {
+                        st.queue.retain(|w| w.id != id);
+                    }
+                    return (true, Vec::new());
+                }
+            }
+        }
+        // Not grantable: park (or refresh the waker) under the SAME hold.
+        match *my_id {
+            Some(id) => {
+                if let Some(w) = st.queue.iter_mut().find(|w| w.id == id) {
+                    w.waker = waker.clone();
+                } else {
+                    // Defensive re-queue (semaphore parity): an entry
+                    // vanished without a grant re-parks at the back.
+                    st.queue.push_back(WaitEntry {
+                        id,
+                        want,
+                        waker: waker.clone(),
+                    });
+                }
+            }
+            None => {
+                let id = st.next_id;
+                st.next_id += 1;
+                st.queue.push_back(WaitEntry {
+                    id,
+                    want,
+                    waker: waker.clone(),
+                });
+                *my_id = Some(id);
+            }
+        }
+        (false, Vec::new())
+    }
+
+    /// Register a waiter without an acquisition attempt (loom's
+    /// dead-waiter harness; the shipped wrapper parks via
+    /// [`Self::poll_acquire`]). Returns its id.
     pub fn register(&self, want: Want, my_id: Option<u64>, waker: &W) -> u64 {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(id) = my_id {
@@ -145,10 +223,19 @@ impl<W: Clone> LockCore<W> {
     }
 
     /// Unlink a waiter (acquire-future cancellation — nothing was ever
-    /// reserved for it, so cancellation leaks nothing).
-    pub fn unregister(&self, id: u64) {
+    /// reserved for it, so cancellation leaks nothing). Returns the
+    /// wakers to wake: a cancelled FRONT waiter may have absorbed a
+    /// release's wake, so the new front is woken in its stead — a
+    /// spurious wake costs one re-poll; a lost one costs a tick.
+    pub fn unregister(&self, id: u64) -> Vec<W> {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let was_front = st.queue.front().map(|w| w.id) == Some(id);
         st.queue.retain(|w| w.id != id);
+        if was_front {
+            Self::front_wakers(&st)
+        } else {
+            Vec::new()
+        }
     }
 
     /// Release one shared hold; returns the wakers to wake (nonempty only

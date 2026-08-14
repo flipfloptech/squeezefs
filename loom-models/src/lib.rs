@@ -4626,6 +4626,88 @@ mod sqz_sync_models {
         });
     }
 
+    /// The park-racing-release stranding (field conviction 2026-08-13,
+    /// the 2 s-bucket stalls in `write_lock_wait_exclusive` on BOTH the
+    /// dev-tip and latch binaries): the shipped `Acquire::poll` ran
+    /// `try_acquire` and `register` as TWO critical sections, so a
+    /// release could land between them — it sees an empty queue, wakes
+    /// nobody, and flips the lock FREE; the waiter then parks into the
+    /// queue with no wake in flight. Under FIFO courtesy every fresh
+    /// contender queues behind the stranded front, so the whole convoy
+    /// freezes until the front's 2 s tick. The law: the stranded state
+    /// — lock free + waiter queued + no wake returned — must be
+    /// UNREPRESENTABLE (grant-or-enqueue is one critical section,
+    /// serialized against release).
+    #[test]
+    fn a_parking_waiter_racing_release_is_never_stranded() {
+        loom::model(|| {
+            let core: Arc<LockCore<u32>> = Arc::new(LockCore::new());
+            let (granted, _) = core.try_acquire(Want::Exclusive, None);
+            assert!(granted, "fresh lock must grant");
+
+            // The waiter thread runs the shipped poll shape: one
+            // grant-or-enqueue attempt against the holder's release.
+            let c2 = core.clone();
+            let t2 = thread::spawn(move || {
+                let mut id = None;
+                let (won, wake) = c2.poll_acquire(Want::Exclusive, &mut id, &7u32);
+                (won, wake)
+            });
+
+            // Holder releases concurrently.
+            let woken = core.release_exclusive();
+            let (t2_won, t2_wake) = t2.join().unwrap();
+
+            if t2_won {
+                // T2 holds: exclusion, and its grant carried no wakers
+                // (exclusive grant wakes nobody).
+                assert!(t2_wake.is_empty());
+                let (fresh, _) = core.try_acquire(Want::Exclusive, None);
+                assert!(!fresh, "exclusion violated");
+            } else {
+                // T2 parked. The release MUST have seen it and returned
+                // its waker — a parked waiter with a free lock and no
+                // wake in flight is the 2 s-tick stall.
+                assert_eq!(
+                    woken,
+                    vec![7u32],
+                    "parked waiter stranded: lock free, queued, no wake (the tick-stall class)"
+                );
+            }
+        });
+    }
+
+    /// The cancelled-front handoff: a woken front waiter whose acquire
+    /// future is DROPPED before re-polling (task cancellation) takes
+    /// its wake to the grave — `unregister` must hand the front wake to
+    /// the next waiter, or that waiter sleeps until its tick.
+    #[test]
+    fn cancelling_the_front_waiter_hands_the_wake_to_the_next() {
+        loom::model(|| {
+            let core: LockCore<u32> = LockCore::new();
+            let (granted, _) = core.try_acquire(Want::Exclusive, None);
+            assert!(granted);
+            let mut a = None;
+            let mut b = None;
+            let (wa, _) = core.poll_acquire(Want::Exclusive, &mut a, &1u32);
+            let (wb, _) = core.poll_acquire(Want::Exclusive, &mut b, &2u32);
+            assert!(!wa && !wb, "holder present: both must queue");
+            // Release wakes the front (waiter 1)…
+            let woken = core.release_exclusive();
+            assert_eq!(woken, vec![1u32]);
+            // …which cancels before re-polling. Its wake dies with it;
+            // unregister must pass it on.
+            let handoff = core.unregister(a.expect("queued"));
+            assert_eq!(
+                handoff,
+                vec![2u32],
+                "cancelled front waiter must hand its wake to the next"
+            );
+            let (g, _) = core.poll_acquire(Want::Exclusive, &mut b, &2u32);
+            assert!(g, "handed-off waiter re-contends and wins");
+        });
+    }
+
     /// Reader/writer exclusion across the release race: a shared grant
     /// must never observe the exclusive holder still inside.
     #[test]

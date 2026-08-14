@@ -416,7 +416,9 @@ fn documented_defaults_match_the_shipped_ones() {
         ("SQUEEZEFS_RECLAIM_CAP_PARK_MS", "1000"),
         ("SQUEEZEFS_IPC_IDLE_SECS", "300"),
         ("SQUEEZEFS_IPC_SPIN_US", "0"),
-        ("SQUEEZEFS_IL_REAP_PARK_MAX", "2"),
+        // 2 -> 24: the 2026-08-13 fleet-residue recount (commit 047783a0)
+        // — an intentional counted retune, not convention drift.
+        ("SQUEEZEFS_IL_REAP_PARK_MAX", "24"),
         ("SQUEEZEFS_FSCK_SETTLE_MS", "2000"),
         ("SQUEEZEFS_NT_COPY_MIN", "262144"),
         ("SQUEEZEFS_TIMEOUT", "30"),

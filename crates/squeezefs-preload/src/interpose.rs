@@ -2601,6 +2601,7 @@ unsafe fn aio_reap_served(
             // (kernel completions cannot wake a futex).
             entries.clear();
             parked_tokens.clear();
+            let mut any_batched = false;
             for (token, _) in parks.iter() {
                 if parked_tokens.contains(token) {
                     continue;
@@ -2608,7 +2609,23 @@ unsafe fn aio_reap_served(
                 let Some(session) = registry().by_token(*token) else {
                     continue; // session gone: its poll resolves next pass
                 };
-                entries.push(session.cqe_park_begin());
+                // Sparse-arm batch marks (wake-economy OQ2, 2026-08-14):
+                // the park mark is the deep arm's derived threshold over
+                // THIS session's pending population (k ≤ pending — the
+                // liveness cap; a 1-pending session derives k = 1, so
+                // the qd1 wake-IS-the-contract shape is inert by
+                // construction). Pre-latch this was priced OUT (the
+                // 2026-07-28 wake herd: every mark-passed completion
+                // re-paid); the wake-collapse latch bounds an era at one
+                // syscall, which is what re-opens the mark. The wait
+                // below tightens its bound to the reap quantum whenever
+                // any k > 1 (the deep arm's age-bound law — a stalled
+                // stream costs one re-scan per quantum, never a
+                // stranded straggler).
+                let pending_here = parks.iter().filter(|(t, _)| t == token).count();
+                let k = sparse_park_k(pending_here);
+                any_batched |= k > 1;
+                entries.push(session.cqe_park_begin_batch(k));
                 parked_tokens.push(*token);
             }
             // The mandatory post-registration re-scan.
@@ -2639,6 +2656,14 @@ unsafe fn aio_reap_served(
                 KERNEL_LANE_SLICE
             } else {
                 RING_PARK_RECHECK
+            };
+            // Batch-marked parks age-bound at the reap quantum (the
+            // deep arm's law): a below-mark straggler is observed one
+            // quantum late at worst, never at the coarse re-check cap.
+            let cap = if any_batched {
+                cap.min(reap_quantum())
+            } else {
+                cap
             };
             let bound = match deadline {
                 None => cap,
@@ -2699,6 +2724,51 @@ const RING_PARK_RECHECK: std::time::Duration = std::time::Duration::from_millis(
 /// 32×8 +2.8 % / 32×32 +1.4 % with equal-or-better p99 — no losing
 /// shape. The blind quantum sleep is now the >24 regime only.
 const REAP_EVENT_PARK_MAX: usize = 24;
+
+/// Sparse-arm batch mark (wake-economy OQ2, 2026-08-14 — the era-rate
+/// floor fix): the sparse event park's per-session mark, the deep arm's
+/// `reap_batch_wake_threshold` over THIS session's pending population.
+/// 1 (= the pre-campaign event-exact posture) for single-pending
+/// sessions BY DERIVATION (the threshold's liveness cap), and for every
+/// session under `SQUEEZEFS_IL_SPARSE_BATCH_MARKS=0` (the A/B control).
+/// Pre-latch the 2026-07-28 herd priced sparse marks out; the
+/// wake-collapse latch bounds an era at one syscall, which re-opens
+/// them — but the local A-B-B-A counted a LOSS at defaults (2026-08-14,
+/// TCP devsub, engagement exact: 32×8 write −3 % at gauge 0.92→0.29,
+/// read fleet −3.5 % at 0.76→0.27, wakes −66..−70 % — the k-th-
+/// completion delivery delay outprices the syscall savings when the
+/// reapers are not CPU-starved). **Default OFF**: a FIELD measurement
+/// lever for the design's named target venue (80 %-CPU saturated
+/// reaper fleets — the "local hides it" class; OQ2's remaining half),
+/// the SQPOLL precedent — a knob, measured not-recommended locally,
+/// never an ambient default.
+fn sparse_park_k(pending_on_session: usize) -> u32 {
+    if !sparse_batch_marks() || pending_on_session <= 1 {
+        return 1;
+    }
+    squeezefs_ipc::sizing::reap_batch_wake_threshold(pending_on_session)
+}
+
+fn sparse_batch_marks() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        sparse_batch_marks_from(
+            std::env::var("SQUEEZEFS_IL_SPARSE_BATCH_MARKS")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// Pure sizing form (unit-pinned like `reap_event_park_max_from`).
+/// Shim asymmetry (ENG-10): a bad value keeps the default, announced —
+/// never kills the host app.
+fn sparse_batch_marks_from(v: Option<&str>) -> bool {
+    match crate::env_knob_core::parse_bool("SQUEEZEFS_IL_SPARSE_BATCH_MARKS", v) {
+        Ok(Some(b)) => b,
+        _ => false,
+    }
+}
 
 fn reap_event_park_max() -> usize {
     static V: OnceLock<usize> = OnceLock::new();
@@ -2944,6 +3014,32 @@ mod reap_park_max_tests {
     /// A/B — see the constant's doc: shared-session wake herding above
     /// qd2, latency-contract event parks at/below); the env form is an
     /// explicit measurement lever, clamped, unparseable ⇒ default.
+    #[test]
+    fn sparse_park_k_derives_and_gates() {
+        // Single-pending sessions are event-exact BY DERIVATION (the
+        // qd1 wake-IS-the-contract hard gate), regardless of the lever.
+        assert_eq!(sparse_park_k(0), 1);
+        assert_eq!(sparse_park_k(1), 1);
+        // Default OFF: every population parks event-exact.
+        assert_eq!(sparse_park_k(8), 1);
+        // The derivation the field lever engages: the deep arm's
+        // threshold over the session's own pending population —
+        // qd8 -> 2 (the 32x8 fleet shape), qd16 -> 4, qd24 -> 6.
+        use squeezefs_ipc::sizing::reap_batch_wake_threshold as thr;
+        assert_eq!(thr(8), 2);
+        assert_eq!(thr(16), 4);
+        assert_eq!(thr(24), 6);
+        // Lever spellings: =1 engages, =0/absent/garbage stay OFF
+        // (shim announce-and-default, never kill the host).
+        assert!(!sparse_batch_marks_from(Some("0")));
+        assert!(sparse_batch_marks_from(Some("1")), "the field lever");
+        assert!(!sparse_batch_marks_from(None), "default OFF");
+        assert!(
+            !sparse_batch_marks_from(Some("garbage")),
+            "announce-and-default"
+        );
+    }
+
     #[test]
     fn reap_park_max_default_and_clamp() {
         assert_eq!(reap_event_park_max_from(None), 24);

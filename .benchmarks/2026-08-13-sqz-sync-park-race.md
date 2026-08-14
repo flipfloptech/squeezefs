@@ -92,9 +92,30 @@ the sustained discipline: a 128 MiB single hot file DECAYS 45k → 32k (−28 %)
 whole-file-rewrite churn shape (reclaim/displacement backlog), a separate wall from this
 campaign's, left named for the rewrite program.
 
-Open next: the remaining 759 µs client residue + the 315 µs dd admit queueing term
-(dequeue → slab insert on the svc thread) — together they hold ~146 of the offered 256
-in-flights off the device.
+## The 759 µs residue attribution (same day, part 3)
+
+The residue is **worker-count scheduling, amplified by the handler-handoff share** — counted:
+
+1. **Submit is clean**: fio slat 2.7 µs at 32×8 — the ring publish never blocks.
+2. **Process-count sweep (same offered depth where noted)**: 32×8 = 154k (clat 1656 µs,
+   CPU PSI-some 32 % of the window) / 16×8 = 186k / 8×8 = 218k / **8×32 = 228k** /
+   **4×64 = 242k** (PSI 5 %). Depth exonerated, worker count convicted: at 256 offered
+   in-flights, 4 processes beat 32 processes by **57 %**. fio `--thread` (32 workers, one
+   process) is WORSE (111k) — it is scheduling/wake fan-out, not process overhead.
+3. **The wake fan-out multiplier is the handler-lane share.** Steady-state (128 MiB files)
+   write-lane ledger closes exactly: `patch_writes` 1.585M (55 % — dd in-place) +
+   `patch_ineligible_unmapped` 1.015M (35 %) + `overlay` 274k (9.5 %) ≈ all 2.876M ring
+   writes. On FULLY-WRITTEN inline-mapped files (`layout_indirect_map_reads` = 0), 35 %
+   unmapped means the per-block mapping is probed MID-CYCLE: ring write → active buffer →
+   flush → publish → mapped again, revisited every ~7 ms at this rate — the probe lands
+   before the publish restores the map. Every such op pays the handler handoff (an extra
+   cross-thread wake + lane dispatch), and at 32 client processes those wakes are what the
+   PSI shows as runqueue starvation.
+
+The prize named for the next campaign: **dd-eligibility across the publish cycle** (serve the
+W1 patch against the block's current custody even while the active/publish window is open —
+needs the §5.1 fence-protocol treatment, a design item, not a lever), worth an estimated
++60 % on the 32-process fleet shape (its 4-process ceiling is 242k on this venue).
 
 ## Standing consequences
 

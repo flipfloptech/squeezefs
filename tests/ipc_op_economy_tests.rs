@@ -835,3 +835,47 @@ async fn wake_economy_instruments_register_and_export_at_zero() {
     }
     fx.shutdown();
 }
+
+/// Wake-economy v6 client-page trio (PR 2): a client-written
+/// `il_park_eras` / `il_slot_reroutes` / `il_submit_harvested` census
+/// aggregates through `IpcHost::wake_economy_snapshot` into the stats
+/// inode verbatim (untrusted display words, the lane-gate discipline).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wake_economy_client_page_trio_aggregates_to_stats() {
+    let _serial = serial().await;
+    let fx = Fixture::new("wake-econ-page").await;
+    fx.salt_inos(3).await;
+    let ino = fx.create_file("page.bin").await;
+    let payload = deterministic_bytes(64 * 1024, 7);
+    fx.fuse_write(ino, 0, &payload).await;
+    let dir = tempfile::tempdir().unwrap();
+    let fd = buffered_standin(&fx, &dir, "standin.bin", ino);
+    let (session, _binding) = ClientSession::establish(&fx, &fd);
+
+    // Client half: write the trio onto the shm stats page exactly where
+    // the shim's Session would.
+    // SAFETY: the harness owns the mapping; the stats page is at
+    // layout.stats_off (one ClientStatsPage).
+    let page = unsafe {
+        &*(session.base.add(session.layout.stats_off as usize)
+            as *const squeezefs_ipc::layout::ClientStatsPage)
+    };
+    page.note_park_era();
+    page.note_park_era();
+    page.note_slot_reroute();
+    page.il_submit_harvested
+        .fetch_add(5, std::sync::atomic::Ordering::Relaxed);
+
+    // Daemon half: the host's aggregation (reaped folds + live-session
+    // page sums) — the exact call the stats JSON export makes. (The
+    // JSON key presence is `wake_economy_instruments_register_and_
+    // export_at_zero`'s pin; attaching the fixture's host to the fs
+    // handle here poisons the NEXT fixture's write path — a
+    // test-isolation hazard, not a product path, so the aggregation is
+    // asserted on the host directly.)
+    let (harv, eras, reroutes) = fx.host.wake_economy_snapshot();
+    assert_eq!(eras, 2, "park eras must aggregate verbatim");
+    assert_eq!(reroutes, 1, "slot reroutes must aggregate verbatim");
+    assert_eq!(harv, 5, "submit harvest must aggregate verbatim");
+    fx.shutdown();
+}

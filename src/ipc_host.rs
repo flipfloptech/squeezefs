@@ -426,15 +426,37 @@ impl SlotCompletion {
         // `ipc_cqe_doorbell_*` loom-verified elision — an unparked
         // reaping client costs zero completion wake syscalls, the former
         // per-completion collect-and-wake serialization term). Breadth
-        // i32::MAX: every parked reaper on the session re-scans.
+        // i32::MAX: every parked reaper on the session re-scans. Since
+        // the wake-economy campaign (2026-08-14) the latch arm bounds a
+        // park ERA at one syscall — `Collapsed` counts the elisions
+        // (the L1 engagement instrument; loom `ipc_cqe_latched_*`).
         let cqe = &self.map.header().cqe;
-        if cqe.complete() {
-            METRICS.ipc_cqe_wake_writes.fetch_add(1, Ordering::Relaxed);
-            futex_wake(cqe.seq_word(), i32::MAX);
-        } else {
-            METRICS.ipc_cqe_wake_elided.fetch_add(1, Ordering::Relaxed);
+        match cqe.complete(cqe_wake_latch()) {
+            squeezefs_ipc::cqe_core::CompleteOutcome::Wake => {
+                METRICS.ipc_cqe_wake_writes.fetch_add(1, Ordering::Relaxed);
+                futex_wake(cqe.seq_word(), i32::MAX);
+            }
+            squeezefs_ipc::cqe_core::CompleteOutcome::Collapsed => {
+                METRICS
+                    .ipc_cqe_wake_collapsed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            squeezefs_ipc::cqe_core::CompleteOutcome::Elided => {
+                METRICS.ipc_cqe_wake_elided.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
+}
+
+/// The wake-collapse latch arm, resolved ONCE (the `reap_event_park_max`
+/// OnceLock pattern): `cqe_core.rs` is dependency-free (loom
+/// `#[path]`-includes it), so the knob rides the `complete(latch)`
+/// signature instead of an env read in the core. Default ON — the
+/// counted L1 lever; `SQUEEZEFS_IPC_CQE_WAKE_LATCH=0` is the A/B control
+/// (the shipped wake-per-mark-passed body, verbatim).
+fn cqe_wake_latch() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| crate::env_knobs::bool_knob("SQUEEZEFS_IPC_CQE_WAKE_LATCH", true))
 }
 
 impl Drop for SlotCompletion {
@@ -1238,6 +1260,12 @@ pub struct IpcHost {
     /// Untrusted client words, display-only (§5.3.1 rule 1).
     lane_gate_reaped_routes: AtomicU64,
     lane_gate_reaped_bytes: AtomicU64,
+    /// Wake-economy v6 reaped folds (same discipline as the lane-gate
+    /// pair above: dead sessions fold once at teardown, live sessions
+    /// sum on demand — untrusted client words, display-only).
+    il_reaped_submit_harvested: AtomicU64,
+    il_reaped_park_eras: AtomicU64,
+    il_reaped_slot_reroutes: AtomicU64,
 }
 
 /// One deferred arena-prep job — a `Weak` on purpose (prep-liveness fix,
@@ -1392,6 +1420,9 @@ impl IpcHost {
             arena_prep_skipped_pressure: AtomicU64::new(0),
             lane_gate_reaped_routes: AtomicU64::new(0),
             lane_gate_reaped_bytes: AtomicU64::new(0),
+            il_reaped_submit_harvested: AtomicU64::new(0),
+            il_reaped_park_eras: AtomicU64::new(0),
+            il_reaped_slot_reroutes: AtomicU64::new(0),
         });
         // Spawn-on-bind (ingest-economy 2026-07-28): the gauge reports
         // SPAWNED service threads — 0 until a session admits. No thread
@@ -1653,6 +1684,34 @@ impl IpcHost {
             threshold = threshold.max(t);
         }
         (routes, bytes, threshold)
+    }
+
+    /// Wake-economy v6 display snapshot `(il_submit_harvested,
+    /// il_park_eras, il_slot_reroutes)`: reaped folds + live-session
+    /// page sums, same one-lock-hold discipline as
+    /// [`Self::lane_gate_snapshot`]. Untrusted client words, summed
+    /// verbatim, display-only (§5.3.1 rule 1) — the PR 3 scout's gate
+    /// reads `il_slot_reroutes` off this export on poison-free rows.
+    pub fn wake_economy_snapshot(&self) -> (u64, u64, u64) {
+        let (mut harv, mut eras, mut reroutes, sessions) = {
+            let sessions = self
+                .sessions
+                .lock()
+                .expect("session registry mutex never poisons");
+            (
+                self.il_reaped_submit_harvested.load(Ordering::Relaxed),
+                self.il_reaped_park_eras.load(Ordering::Relaxed),
+                self.il_reaped_slot_reroutes.load(Ordering::Relaxed),
+                sessions.values().cloned().collect::<Vec<Arc<IpcSession>>>(),
+            )
+        };
+        for s in sessions {
+            let (h, e, r) = s.map.stats_page().snapshot_wake_economy();
+            harv = harv.wrapping_add(h);
+            eras = eras.wrapping_add(e);
+            reroutes = reroutes.wrapping_add(r);
+        }
+        (harv, eras, reroutes)
     }
 
     /// Synthesize the bootstrap virtual-xattr blob (§5.2) for this host.
@@ -2419,6 +2478,13 @@ impl IpcHost {
                 .fetch_add(routes, Ordering::Relaxed);
             self.lane_gate_reaped_bytes
                 .fetch_add(bytes, Ordering::Relaxed);
+            // Wake-economy v6: same one-half-of-the-sum discipline.
+            let (harv, eras, reroutes) = session.map.stats_page().snapshot_wake_economy();
+            self.il_reaped_submit_harvested
+                .fetch_add(harv, Ordering::Relaxed);
+            self.il_reaped_park_eras.fetch_add(eras, Ordering::Relaxed);
+            self.il_reaped_slot_reroutes
+                .fetch_add(reroutes, Ordering::Relaxed);
         }
         // A stale snapshot may drain this session for at most one more
         // pass (safe: the mapping is Arc-held, bindings are cleared, the

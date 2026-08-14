@@ -92,18 +92,32 @@ fn bench_cqe_doorbell(c: &mut Criterion) {
     let mut g = c.benchmark_group("cqe_doorbell");
     g.throughput(Throughput::Elements(1));
 
+    use squeezefs_ipc::cqe_core::CompleteOutcome;
+
     let bell = CqeDoorbell::new();
     g.bench_function("complete_unparked", |b| {
         b.iter(|| {
-            assert!(!bell.complete(), "no reaper is parked");
+            assert_eq!(
+                bell.complete(true),
+                CompleteOutcome::Elided,
+                "no reaper is parked"
+            );
         })
     });
 
     let parked_bell = CqeDoorbell::new();
     let _snapshot = parked_bell.park_begin(); // one parked reaper, held
     g.bench_function("complete_parked", |b| {
+        // Latch arm live (the shipped default): the first iteration pays
+        // (`Wake`), every later one collapses — the steady-state cost
+        // priced here IS the collapse arm (one CAS-fail), the campaign's
+        // hot path at fan-in.
         b.iter(|| {
-            assert!(parked_bell.complete(), "a parked reaper needs the wake");
+            assert_ne!(
+                parked_bell.complete(true),
+                CompleteOutcome::Elided,
+                "a parked mark-passed completion never elides"
+            );
         })
     });
     parked_bell.park_end();

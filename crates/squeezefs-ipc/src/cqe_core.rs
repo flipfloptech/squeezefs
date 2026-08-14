@@ -110,7 +110,35 @@ pub struct CqeDoorbell {
     /// (bounded by its §5.3.1-rule-5 wait bound); scribbling it behind
     /// restores the wake-per-completion posture — bounded self-harm.
     wake_at: AtomicU32,
-    _pad: u32,
+    /// Wake-collapse latch (wake-economy campaign 2026-08-14, the
+    /// former `_pad` — struct stays 16 bytes, same header line): a
+    /// per-PARK-ERA once-flag. The daemon's mark-passed completion
+    /// CASes 0→1 — the winner pays the era's ONE `FUTEX_WAKE`
+    /// (breadth `i32::MAX`), losers collapse the syscall (the shipped
+    /// protocol re-paid on EVERY mark-passed completion until re-park —
+    /// the counted 0.94 wakes/op fan-in term). Cleared by
+    /// `park_begin[_batch]` AFTER the parked registration + fence and
+    /// BEFORE the seq snapshot (the ordering the loom strand models
+    /// pin); deliberately NOT cleared at `park_end` — a successor-less
+    /// era must not bequeath `wake_paid = 1` to the next parker
+    /// (`latch_new_era_is_payable`). Client-writable shm like its
+    /// siblings: scribbling 1 suppresses only the scribbler's own
+    /// reaper's wakes (bounded by its §5.3.1-rule-5 wait bound);
+    /// scribbling 0 restores wake-per-completion — bounded self-harm.
+    wake_paid: AtomicU32,
+}
+
+/// Daemon-side completion outcome (replaces the former bool): `Wake` =
+/// pay the `FUTEX_WAKE` syscall; `Collapsed` = a parked reaper is
+/// mark-passed but this era's wake is already paid/in flight (the latch
+/// elision — counted apart from `Elided` because it is the campaign's
+/// engagement instrument); `Elided` = no parked reaper, or every parked
+/// mark still ahead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompleteOutcome {
+    Elided,
+    Collapsed,
+    Wake,
 }
 
 impl Default for CqeDoorbell {
@@ -125,19 +153,31 @@ impl CqeDoorbell {
             seq: AtomicU32::new(0),
             parked: AtomicU32::new(0),
             wake_at: AtomicU32::new(0),
-            _pad: 0,
+            wake_paid: AtomicU32::new(0),
         }
     }
 
     /// Daemon, after the slot's DONE publish: bump the completion seq;
-    /// returns `true` when a parked reaper needs a `FUTEX_WAKE` on
-    /// [`Self::seq_word`] (breadth `i32::MAX` — split submitter/reaper
-    /// pairs may both park). `false` = elide the syscall: no one is
+    /// [`CompleteOutcome::Wake`] = a parked reaper needs a `FUTEX_WAKE`
+    /// on [`Self::seq_word`] (breadth `i32::MAX` — split
+    /// submitter/reaper pairs may both park). `Elided` = no one is
     /// parked (a concurrent parker's post-registration scan or failed
     /// admission covers it — module docs), or every parked reaper's
     /// batch mark is still ahead (its own admission proof makes each
     /// below-mark completion survivable — §batch-wake threshold).
-    pub fn complete(&self) -> bool {
+    ///
+    /// `latch`: the wake-collapse arm (wake-economy 2026-08-14). This
+    /// file is dependency-free (loom `#[path]`-includes it — module
+    /// docs), so it can never read an env knob: the caller resolves
+    /// `SQUEEZEFS_IPC_CQE_WAKE_LATCH` once and passes it. `false` = the
+    /// shipped wake-per-mark-passed body verbatim (`Wake` on every
+    /// mark-passed completion — the pre-campaign posture, the A/B
+    /// control). `true` = mark-passed completions CAS the per-era
+    /// `wake_paid` latch: the winner pays the era's one syscall,
+    /// losers return `Collapsed`. Strand-freedom under the latch is
+    /// the loom models' `ipc_cqe_latched_*` obligation (era-scoped
+    /// witnesses — module docs on the clear ordering).
+    pub fn complete(&self, latch: bool) -> CompleteOutcome {
         // Store→load across two locations (the Dekker shape): the
         // explicit fence is LOAD-BEARING, not belt-and-braces — it is
         // what makes this side's bump globally ordered against the
@@ -147,7 +187,7 @@ impl CqeDoorbell {
         let seq = self.seq.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
         fence(Ordering::SeqCst);
         if self.parked.load(Ordering::SeqCst) == 0 {
-            return false;
+            return CompleteOutcome::Elided;
         }
         // Batch gate: wake once the bumped seq has REACHED the earliest
         // parked mark (wrapping order — `at ≤ seq`). A stale mark left
@@ -155,7 +195,25 @@ impl CqeDoorbell {
         // reached and over-wakes: the pre-campaign posture, never a
         // strand.
         let at = self.wake_at.load(Ordering::SeqCst);
-        seq.wrapping_sub(at) < (1 << 31)
+        if seq.wrapping_sub(at) >= (1 << 31) {
+            return CompleteOutcome::Elided;
+        }
+        if !latch {
+            // Shipped posture, verbatim: every mark-passed completion
+            // pays (the A/B control arm — bit-identical to the retired
+            // `return true`).
+            return CompleteOutcome::Wake;
+        }
+        match self
+            .wake_paid
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            // This era's ONE syscall.
+            Ok(_) => CompleteOutcome::Wake,
+            // A wake for this era is already paid/in flight: elide the
+            // syscall (the fan-in collapse — the campaign's lever).
+            Err(_) => CompleteOutcome::Collapsed,
+        }
     }
 
     /// Client reaper: register parked intent and snapshot the expected
@@ -184,6 +242,26 @@ impl CqeDoorbell {
         // [`Self::complete`]).
         let prior = self.parked.fetch_add(1, Ordering::SeqCst);
         fence(Ordering::SeqCst);
+        // Wake-collapse era start (2026-08-14): clear the latch AFTER
+        // the registration + fence and BEFORE the snapshot (a completer
+        // whose bump follows the snapshot also follows this clear, so
+        // the era's first mark-passed completion always finds a payable
+        // latch — the strand argument's case 2). Honest weakening
+        // ledger (2026-08-14 runs): moving the clear BEFORE the
+        // registration passes the models — the design's prediction (a)
+        // was FALSIFIED, because a completer's parked-gate runs before
+        // its CAS, so a pre-registration clear can never be consumed by
+        // an eliding completer; the position is kept for the documented
+        // era definition, not by counterexample. DELETING the clear is
+        // the real teeth (`latch_new_era_is_payable` — a paid era would
+        // poison every successor); the two Dekker fence drops fail two
+        // models each (re-verified on the latched body). A completer racing the
+        // clear→mark window below reads the STALE previous mark
+        // (at-or-behind the seq ⇒ reads-as-reached) against the
+        // freshly cleared latch and over-pays one wake — benign,
+        // bounded, the same class as the racy `wake_at` store
+        // documented at the first-parker arm.
+        self.wake_paid.store(0, Ordering::SeqCst);
         let snap = self.seq.load(Ordering::SeqCst);
         let target = snap.wrapping_add(k);
         if prior == 0 {
@@ -231,25 +309,43 @@ impl CqeDoorbell {
     pub fn parked(&self) -> u32 {
         self.parked.load(Ordering::SeqCst)
     }
+
+    /// Current batch-wake mark (diagnostics / model assertions).
+    pub fn wake_at(&self) -> u32 {
+        self.wake_at.load(Ordering::SeqCst)
+    }
+
+    /// Current wake-collapse latch state (diagnostics / model
+    /// assertions — the loom strand models' payable-era check).
+    pub fn wake_paid(&self) -> u32 {
+        self.wake_paid.load(Ordering::SeqCst)
+    }
 }
 
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
 
+    /// The latch=false parity arm — these walks pin the SHIPPED
+    /// wake-per-mark-passed posture verbatim (the A/B control);
+    /// the latch arm's walks live below.
+    fn wakes(d: &CqeDoorbell) -> bool {
+        matches!(d.complete(false), CompleteOutcome::Wake)
+    }
+
     /// Sequential protocol walk: completions toward an unparked reaper
     /// elide; a parked reaper gates the wake on; park_end releases it.
     #[test]
     fn wake_gated_on_parked_count() {
         let d = CqeDoorbell::new();
-        assert!(!d.complete(), "no reaper parked: elide the wake");
-        assert!(!d.complete(), "still elided");
+        assert!(!wakes(&d), "no reaper parked: elide the wake");
+        assert!(!wakes(&d), "still elided");
         let expected = d.park_begin();
         assert_eq!(expected, 2, "snapshot reads the completions so far");
-        assert!(d.complete(), "parked reaper must be woken");
+        assert!(wakes(&d), "parked reaper must be woken");
         assert_ne!(d.seq(), expected, "the bump fails the wait's admission");
         d.park_end();
-        assert!(!d.complete(), "after park_end the wake elides again");
+        assert!(!wakes(&d), "after park_end the wake elides again");
     }
 
     /// Batch threshold walk (reap-fanin 2026-08-08): a k=3 park elides
@@ -262,18 +358,18 @@ mod tests {
         let d = CqeDoorbell::new();
         let snap = d.park_begin_batch(3);
         assert_eq!(snap, 0, "snapshot reads the completions so far");
-        assert!(!d.complete(), "1st completion below the mark: elide");
-        assert!(!d.complete(), "2nd completion below the mark: elide");
-        assert!(d.complete(), "3rd completion reaches the mark: wake");
-        assert!(d.complete(), "past the mark stays woken until re-park");
+        assert!(!wakes(&d), "1st completion below the mark: elide");
+        assert!(!wakes(&d), "2nd completion below the mark: elide");
+        assert!(wakes(&d), "3rd completion reaches the mark: wake");
+        assert!(wakes(&d), "past the mark stays woken until re-park");
         d.park_end();
-        assert!(!d.complete(), "unparked: elide again");
+        assert!(!wakes(&d), "unparked: elide again");
         // Re-park after the era: a fresh mark, counted from the new
         // snapshot (the stale-mark state never leaks into a new park).
         let snap2 = d.park_begin_batch(2);
         assert_eq!(snap2, 5, "five completions so far (incl. the elided one)");
-        assert!(!d.complete(), "fresh era: 1st below the new mark");
-        assert!(d.complete(), "fresh era: 2nd reaches it");
+        assert!(!wakes(&d), "fresh era: 1st below the new mark");
+        assert!(wakes(&d), "fresh era: 2nd reaches it");
         d.park_end();
     }
 
@@ -284,7 +380,7 @@ mod tests {
     fn park_begin_is_batch_one() {
         let d = CqeDoorbell::new();
         let _ = d.park_begin();
-        assert!(d.complete(), "k=1: first completion wakes");
+        assert!(wakes(&d), "k=1: first completion wakes");
         d.park_end();
     }
 
@@ -297,9 +393,9 @@ mod tests {
         let d = CqeDoorbell::new();
         let _s1 = d.park_begin_batch(8); // mark 8
         let _s2 = d.park_begin_batch(2); // mark 2 — earlier, must win
-        assert!(!d.complete(), "1st below both marks: elide");
+        assert!(!wakes(&d), "1st below both marks: elide");
         assert!(
-            d.complete(),
+            wakes(&d),
             "2nd reaches the earlier mark: wake (breadth covers both)"
         );
         d.park_end();
@@ -309,13 +405,13 @@ mod tests {
         // elided completions later B parks k=2 at seq 5 (mark 7) — the
         // fetch_update must adopt 7 (11 is later than 7 relative to B's
         // snapshot), so completion 7 lands the wake.
-        assert!(!d.complete(), "seq 3: unparked interlude, elide");
+        assert!(!wakes(&d), "seq 3: unparked interlude, elide");
         let _a = d.park_begin_batch(8); // snap 3, mark 11
-        assert!(!d.complete(), "seq 4: below 11");
-        assert!(!d.complete(), "seq 5: below 11");
+        assert!(!wakes(&d), "seq 4: below 11");
+        assert!(!wakes(&d), "seq 5: below 11");
         let _b = d.park_begin_batch(2); // snap 5, mark 7 — earlier, wins
-        assert!(!d.complete(), "seq 6: below 7");
-        assert!(d.complete(), "seq 7: B's mark reached");
+        assert!(!wakes(&d), "seq 6: below 7");
+        assert!(wakes(&d), "seq 7: B's mark reached");
         d.park_end();
         d.park_end();
     }
@@ -328,10 +424,103 @@ mod tests {
         let _e1 = d.park_begin();
         let _e2 = d.park_begin();
         assert_eq!(d.parked(), 2);
-        assert!(d.complete());
+        assert!(wakes(&d));
         d.park_end();
-        assert!(d.complete(), "second parker still needs the wake");
+        assert!(wakes(&d), "second parker still needs the wake");
         d.park_end();
-        assert!(!d.complete());
+        assert!(!wakes(&d));
+    }
+
+    // -- The wake-collapse latch arm (wake-economy 2026-08-14) ----------
+
+    /// The collapse walk: under the latch a park era pays exactly ONE
+    /// wake — the first mark-passed completion CAS-wins, every later
+    /// one collapses (the shipped posture re-paid all three).
+    #[test]
+    fn latch_collapses_an_era_to_one_wake() {
+        let d = CqeDoorbell::new();
+        let _e = d.park_begin();
+        assert_eq!(d.complete(true), CompleteOutcome::Wake, "era's one syscall");
+        assert_eq!(d.complete(true), CompleteOutcome::Collapsed);
+        assert_eq!(d.complete(true), CompleteOutcome::Collapsed);
+        d.park_end();
+        assert_eq!(
+            d.complete(true),
+            CompleteOutcome::Elided,
+            "unparked completions elide regardless of the latch"
+        );
+    }
+
+    /// The new-era law (loom weakening (b)'s unit half): a fresh
+    /// `park_begin` re-arms the latch — the clear lives at era START,
+    /// never at `park_end`, so a successor-less era cannot bequeath
+    /// `wake_paid = 1` to the next parker.
+    #[test]
+    fn latch_new_era_is_payable() {
+        let d = CqeDoorbell::new();
+        let _e = d.park_begin();
+        assert_eq!(d.complete(true), CompleteOutcome::Wake);
+        assert_eq!(d.complete(true), CompleteOutcome::Collapsed);
+        d.park_end();
+        // The era ended with the latch SET and no successor cleared it
+        // yet — the next park must start payable.
+        let _e2 = d.park_begin();
+        assert_eq!(
+            d.complete(true),
+            CompleteOutcome::Wake,
+            "a new park era's first mark-passed completion must pay, \
+             not inherit the previous era's paid latch"
+        );
+        d.park_end();
+    }
+
+    /// qd1 inertness (the wake-IS-the-contract shape, G3 hard gate):
+    /// under the latch a k=1 park's FIRST completion still pays
+    /// immediately — the latch changes nothing before the first wake.
+    #[test]
+    fn latch_first_completion_still_pays_immediately() {
+        let d = CqeDoorbell::new();
+        let _e = d.park_begin();
+        assert_eq!(
+            d.complete(true),
+            CompleteOutcome::Wake,
+            "qd1 RTT: the first post-park completion pays, latch or not"
+        );
+        d.park_end();
+    }
+
+    /// latch=false bit-parity: the control arm walks identically to the
+    /// retired bool body — every mark-passed completion pays, below-mark
+    /// and unparked completions elide (the batch walk re-run on the
+    /// enum, outcomes named).
+    #[test]
+    fn latch_false_is_the_shipped_posture_verbatim() {
+        let d = CqeDoorbell::new();
+        assert_eq!(d.complete(false), CompleteOutcome::Elided, "unparked");
+        let _s = d.park_begin_batch(3);
+        assert_eq!(d.complete(false), CompleteOutcome::Elided, "below mark");
+        assert_eq!(d.complete(false), CompleteOutcome::Elided, "below mark");
+        assert_eq!(d.complete(false), CompleteOutcome::Wake, "mark reached");
+        assert_eq!(
+            d.complete(false),
+            CompleteOutcome::Wake,
+            "past the mark stays woken until re-park — the shipped
+             re-pay posture, never Collapsed on the control arm"
+        );
+        d.park_end();
+        assert_eq!(d.complete(false), CompleteOutcome::Elided, "unparked");
+    }
+
+    /// The latch composes with the batch mark: below-mark completions
+    /// elide (no CAS — the latch is untouched), the k-th pays, the
+    /// (k+1)-th collapses.
+    #[test]
+    fn latch_composes_with_the_batch_mark() {
+        let d = CqeDoorbell::new();
+        let _s = d.park_begin_batch(2);
+        assert_eq!(d.complete(true), CompleteOutcome::Elided, "below mark");
+        assert_eq!(d.complete(true), CompleteOutcome::Wake, "k-th pays");
+        assert_eq!(d.complete(true), CompleteOutcome::Collapsed, "collapsed");
+        d.park_end();
     }
 }

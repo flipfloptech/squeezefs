@@ -2903,7 +2903,13 @@ mod models {
                     // The reaper does not set per-slot WAITER bits — the
                     // cqe doorbell owns the completion-direction wake.
                     let _slot_waiter = slot.complete();
-                    if cqe.complete() {
+                    // Latch arm live (the shipped default posture);
+                    // `Collapsed` implies an earlier `Wake` already set
+                    // the witness (threads join before the assert).
+                    if matches!(
+                        cqe.complete(true),
+                        ipc_cqe_core::CompleteOutcome::Wake
+                    ) {
                         wake.store(true, Ordering::SeqCst);
                     }
                 })
@@ -2980,7 +2986,13 @@ mod models {
                 thread::spawn(move || {
                     assert!(slot.try_begin_serve(), "submitted slot must serve");
                     let _slot_waiter = slot.complete();
-                    if cqe.complete() {
+                    // Latch arm live (the shipped default posture);
+                    // `Collapsed` implies an earlier `Wake` already set
+                    // the witness (threads join before the assert).
+                    if matches!(
+                        cqe.complete(true),
+                        ipc_cqe_core::CompleteOutcome::Wake
+                    ) {
                         wake.store(true, Ordering::SeqCst);
                     }
                 })
@@ -3020,6 +3032,237 @@ mod models {
             cqe.park_end();
             assert!(a.is_done_for(gen_a), "op a completed exactly once");
             assert!(b.is_done_for(gen_b), "op b completed exactly once");
+        });
+    }
+
+    /// IPC completion doorbell, WAKE-COLLAPSE LATCH arm (`ipc_cqe_core`
+    /// `complete(latch = true)`, wake-economy campaign 2026-08-14 —
+    /// design-il-wake-economy Lever 1): the per-park-era `wake_paid`
+    /// latch bounds the daemon at ONE `FUTEX_WAKE` per era where the
+    /// shipped protocol re-paid on every mark-passed completion (the
+    /// counted 0.94 wakes/op fan-in term). TWO completers race one
+    /// k=1 parker with the latch live.
+    ///
+    /// **Witness fidelity** (the design's model-fidelity requirement):
+    /// the one-shot bool of the k=1/batch models is adequate only when
+    /// every mark-passed completion re-pays. Under the latch the
+    /// dangerous class is a wake paid BEFORE the parker's admission
+    /// (lost in real futex semantics) with every later completion
+    /// collapsing — so the witness is ERA-SCOPED: reset by the parker
+    /// right after `park_begin` (mirroring the latch clear), counted by
+    /// completers only on `Wake`. Soundness of the reset point: a Wake
+    /// whose seq bump precedes the parker's snapshot fails the parker's
+    /// admission (no sleep — no strand to witness); one whose bump
+    /// follows the snapshot also follows the latch clear, so its CAS
+    /// runs against the cleared word and pays, landing AFTER the reset.
+    ///
+    /// The admitted branch asserts BOTH halves of the law: covered
+    /// (witness ≥ 1 — no strand) AND collapsed (witness == 1 — the era
+    /// paid exactly one syscall for two completions; the second must
+    /// return `Collapsed`, or the latch is not engaging).
+    ///
+    /// Weakening evidence (verified 2026-08-14, then restored): (a)
+    /// permuting `park_begin_batch` to clear-latch-before-register
+    /// strands this model (a completer between clear and register
+    /// CAS-wins, elides toward `parked == 0`, and the era's real wake
+    /// is collapsed); (b) clearing the latch at `park_end` instead of
+    /// `park_begin` fails `latch_new_era_is_payable` (cqe_core unit —
+    /// a successor-less era leaves `wake_paid = 1` for the next
+    /// parker); (c) the two existing Dekker weakenings still fail the
+    /// k=1/batch models above (re-verified on the latched body).
+    #[test]
+    fn ipc_cqe_latched_parked_reaper_never_stranded() {
+        loom::model(|| {
+            let a = Arc::new(ipc_slot_core::SlotCore::new());
+            let b = Arc::new(ipc_slot_core::SlotCore::new());
+            let cqe = Arc::new(ipc_cqe_core::CqeDoorbell::new());
+            let wakes = Arc::new(AtomicUsize::new(0));
+
+            let gen_a = a.try_claim().expect("fresh slot a must claim");
+            a.publish_submitted();
+            let gen_b = b.try_claim().expect("fresh slot b must claim");
+            b.publish_submitted();
+
+            let mk_server = |slot: &Arc<ipc_slot_core::SlotCore>| {
+                let slot = Arc::clone(slot);
+                let cqe = Arc::clone(&cqe);
+                let wakes = Arc::clone(&wakes);
+                thread::spawn(move || {
+                    assert!(slot.try_begin_serve(), "submitted slot must serve");
+                    let _slot_waiter = slot.complete();
+                    if matches!(
+                        cqe.complete(true),
+                        ipc_cqe_core::CompleteOutcome::Wake
+                    ) {
+                        wakes.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+            };
+            let s1 = mk_server(&a);
+            let s2 = mk_server(&b);
+
+            // Reaper: register (+ latch clear inside) → era-scoped
+            // witness reset → mandatory re-scan → futex admission.
+            let expected = cqe.park_begin();
+            wakes.store(0, Ordering::SeqCst);
+            let scan_found = a.is_done_for(gen_a) || b.is_done_for(gen_b);
+            if !scan_found {
+                // The futex admission models FUTEX_WAIT's KERNEL-strength
+                // read: the kernel validates the word under the futex
+                // bucket lock — a latest-value read, which in loom is an
+                // RMW, never a plain load (a plain SeqCst load may read
+                // stale under loom's weaker-than-C++ SC modeling; with
+                // the era-scoped witness reset that manufactures a false
+                // strand — a completer whose bump "already happened"
+                // admitting the parker anyway. The existing models keep
+                // their plain-load admission because their one-shot
+                // witness is erasure-free; this model's reset makes the
+                // fidelity load-bearing).
+                let admitted = cqe.seq_word().fetch_add(0, Ordering::SeqCst) == expected;
+                s1.join().unwrap();
+                s2.join().unwrap();
+                if admitted {
+                    let w = wakes.load(Ordering::SeqCst);
+                    assert!(
+                        w >= 1,
+                        "latched cqe strand: reaper admitted the park, both \
+                         ops completed, and no post-era wake is coming \
+                         (expected {expected}, seq now {}, parked {}, \
+                          a_done {}, b_done {})",
+                        cqe.seq(),
+                        cqe.parked(),
+                        a.is_done_for(gen_a),
+                        b.is_done_for(gen_b),
+                    );
+                    assert_eq!(
+                        w, 1,
+                        "latch not engaging: an admitted era paid {w} wake \
+                         syscalls for two completions — the second must \
+                         collapse"
+                    );
+                }
+            } else {
+                s1.join().unwrap();
+                s2.join().unwrap();
+            }
+            cqe.park_end();
+            assert!(a.is_done_for(gen_a), "op a completed exactly once");
+            assert!(b.is_done_for(gen_b), "op b completed exactly once");
+        });
+    }
+
+    /// Latch arm, TWO parkers (the split submitter/reaper pair —
+    /// design-il-wake-economy Lever 1 strand item 3): one completion,
+    /// both parkers k=1, latch live. The paid wake's breadth
+    /// (`i32::MAX`, unchanged) covers every parker asleep at pay time —
+    /// modeled as PER-PARKER witnesses the completer sets together on
+    /// `Wake`, each reset only by its own parker's era start (a wake
+    /// paid before a parker's reset is lost to THAT parker, exactly
+    /// real futex pre-wait semantics; a later parker's era clear must
+    /// never erase a delivery to an already-admitted sibling). Each
+    /// admitted parker must end covered by scan, failed admission, or
+    /// a post-its-era wake.
+    #[test]
+    fn ipc_cqe_latch_two_parkers_covered() {
+        loom::model(|| {
+            let slot = Arc::new(ipc_slot_core::SlotCore::new());
+            let cqe = Arc::new(ipc_cqe_core::CqeDoorbell::new());
+            let w_a = Arc::new(AtomicBool::new(false));
+            let w_b = Arc::new(AtomicBool::new(false));
+
+            let gen = slot.try_claim().expect("fresh slot must claim");
+            slot.publish_submitted();
+
+            let server = {
+                let slot = Arc::clone(&slot);
+                let cqe = Arc::clone(&cqe);
+                let w_a = Arc::clone(&w_a);
+                let w_b = Arc::clone(&w_b);
+                thread::spawn(move || {
+                    assert!(slot.try_begin_serve(), "submitted slot must serve");
+                    let _slot_waiter = slot.complete();
+                    let out = cqe.complete(true);
+                    if matches!(out, ipc_cqe_core::CompleteOutcome::Wake) {
+                        // Breadth i32::MAX: one syscall reaches every
+                        // parked reaper on the session.
+                        w_a.store(true, Ordering::SeqCst);
+                        w_b.store(true, Ordering::SeqCst);
+                    }
+                    out
+                })
+            };
+
+            // Parker B on its own thread; parker A inline. Each: park
+            // (latch clear inside) → own-era witness reset → re-scan →
+            // admission.
+            let parker_b = {
+                let slot = Arc::clone(&slot);
+                let cqe = Arc::clone(&cqe);
+                let w_b = Arc::clone(&w_b);
+                thread::spawn(move || {
+                    let expected = cqe.park_begin();
+                    w_b.store(false, Ordering::SeqCst);
+                    let scan_found = slot.is_done_for(gen);
+                    // Kernel-strength admission read (see model 1).
+                    let admitted = !scan_found
+                        && cqe.seq_word().fetch_add(0, Ordering::SeqCst) == expected;
+                    (admitted, scan_found, expected)
+                })
+            };
+            let expected_a = cqe.park_begin();
+            w_a.store(false, Ordering::SeqCst);
+            let scan_a = slot.is_done_for(gen);
+            // Kernel-strength admission read (see model 1).
+            let admitted_a = !scan_a
+                && cqe.seq_word().fetch_add(0, Ordering::SeqCst) == expected_a;
+
+            let (admitted_b, scan_b, expected_b) = parker_b.join().unwrap();
+            let outcome = server.join().unwrap();
+
+            // The shipped two-parker contract is wake OR the parker's own
+            // §5.3.1-rule-5 age bound — the mark-overwrite race (a second
+            // parker's compose reading a stale mark under loom's
+            // weaker-than-C++ SC and clobbering a live one) is the
+            // DOCUMENTED bounded-delay class of the SHIPPED protocol
+            // (cqe_core first-parker store comment), reachable here with
+            // the latch entirely disengaged (outcome Elided at the mark
+            // check). The latch obligation is therefore NO PERMANENT
+            // STRAND: an admitted parker without a delivered wake must be
+            // in a still-payable era — latch clear (a future completion
+            // CASes and pays) or mark ahead (a future completion reaches
+            // it and then finds the latch) — never mark-reached with the
+            // latch consumed and no wake witnessed (the latch-broken
+            // signature; the clear-before-register weakening lands
+            // exactly there).
+            let payable_or_pending = || {
+                cqe.wake_paid() == 0
+                    || cqe.seq().wrapping_sub(cqe.wake_at()) >= (1 << 31)
+            };
+            if admitted_a && !w_a.load(Ordering::SeqCst) {
+                assert!(
+                    payable_or_pending(),
+                    "two-parker LATCH strand: parker A admitted, unwoken, \
+                     era consumed (mark reached, wake_paid set) — no future \
+                     completion can pay"
+                );
+            }
+            if admitted_b && !w_b.load(Ordering::SeqCst) {
+                assert!(
+                    payable_or_pending(),
+                    "two-parker LATCH strand: parker B admitted, unwoken, \
+                     era consumed (mark reached, wake_paid set) — no future \
+                     completion can pay (expected_b {expected_b}, \
+                      scan_b {scan_b}, expected_a {expected_a}, \
+                      scan_a {scan_a}, admitted_a {admitted_a}, seq {}, \
+                      w_a {}, outcome {outcome:?}, wake_at {})",
+                    cqe.seq(),
+                    w_a.load(Ordering::SeqCst),
+                    cqe.wake_at(),
+                );
+            }
+            cqe.park_end();
+            cqe.park_end();
+            assert!(slot.is_done_for(gen), "the op completed exactly once");
         });
     }
 

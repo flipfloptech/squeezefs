@@ -53,7 +53,15 @@ use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 /// client→daemon ring-ingress term, 2026-08-08), and the
 /// [`CqeDoorbell`] grew its batch-wake mark (8 → 16 bytes, same header
 /// line — the fan-in reap park). Coarse bump per the discipline.
-pub const IPC_ABI: u32 = 5;
+/// v6: the wake-economy campaign (design-il-wake-economy, 2026-08-14) —
+/// ONE coarse bump covering both of its layout-module changes: the
+/// [`CqeDoorbell`]'s pad word became the per-park-era `wake_paid`
+/// wake-collapse latch (semantic change, struct stays 16 bytes at the
+/// same header offset), and [`ClientStatsPage`] gained the campaign's
+/// shim-side counters (`il_submit_harvested` / `il_park_eras` /
+/// `il_slot_reroutes` — the PR 3 scout's decision-gate instrument rides
+/// this bump because a bump-free PR cannot carry a page field).
+pub const IPC_ABI: u32 = 6;
 
 /// Session mapping magic: `SQZIPC01` little-endian.
 pub const IPC_MAGIC: u64 = u64::from_le_bytes(*b"SQZIPC01");
@@ -404,7 +412,26 @@ pub struct ClientStatsPage {
     /// published once at establish, exported as the
     /// `ipc_lane_gate_threshold_bytes` gauge (max over live sessions).
     pub lane_gate_threshold_bytes: AtomicU64,
-    _reserved: [u8; PAGE_BYTES as usize - 24],
+    /// Wake-economy v6 fields (design-il-wake-economy; all client-
+    /// written, daemon-summed verbatim — untrusted display words like
+    /// their v4 siblings):
+    /// completed events a client `io_submit` harvested inline from its
+    /// own CQ side (the PR 3 reap-on-submit scout; 0 with the lever
+    /// off — its engagement instrument).
+    pub il_submit_harvested: AtomicU64,
+    /// Client reap park eras begun (cqe park_begin[_batch] calls) — the
+    /// denominator for wakes-per-era attribution and PR 3's
+    /// pre-registered predicted-wash falsification input.
+    pub il_park_eras: AtomicU64,
+    /// Ring submissions rerouted to the kernel lane because
+    /// `submit_op` found NO SLOT (true slot exhaustion only — the
+    /// counting site gates on `!poisoned()`, since both poison arms
+    /// also return None; a poison flood is a failure investigation,
+    /// never a slot-pressure signal). The PR 3 scout's decision gate
+    /// reads this rate on poison-free rows; the split-attributable
+    /// engagement rule adds it to `ipc_ops_write` on scout rows.
+    pub il_slot_reroutes: AtomicU64,
+    _reserved: [u8; PAGE_BYTES as usize - 48],
 }
 
 impl ClientStatsPage {
@@ -415,6 +442,17 @@ impl ClientStatsPage {
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
+    /// Client: record one park era begun (wake-economy v6).
+    pub fn note_park_era(&self) {
+        self.il_park_eras.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Client: record one slot-exhaustion kernel-lane reroute
+    /// (wake-economy v6 — the counting site gates on `!poisoned()`).
+    pub fn note_slot_reroute(&self) {
+        self.il_slot_reroutes.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Daemon: one display snapshot `(routes, bytes, threshold)` —
     /// untrusted client words, summed verbatim into the export.
     pub fn snapshot(&self) -> (u64, u64, u64) {
@@ -422,6 +460,17 @@ impl ClientStatsPage {
             self.lane_gate_kernel_routes.load(Ordering::Relaxed),
             self.lane_gate_kernel_bytes.load(Ordering::Relaxed),
             self.lane_gate_threshold_bytes.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Daemon: the wake-economy v6 snapshot
+    /// `(submit_harvested, park_eras, slot_reroutes)` — untrusted
+    /// client words, summed verbatim into the export.
+    pub fn snapshot_wake_economy(&self) -> (u64, u64, u64) {
+        (
+            self.il_submit_harvested.load(Ordering::Relaxed),
+            self.il_park_eras.load(Ordering::Relaxed),
+            self.il_slot_reroutes.load(Ordering::Relaxed),
         )
     }
 }

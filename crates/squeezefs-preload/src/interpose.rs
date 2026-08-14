@@ -2020,15 +2020,26 @@ impl RingLane for SessionRing<'_> {
         let b = table().lookup(io.aio_fildes)?;
         let session = registry().by_token(b.session)?;
         let is_read = io.aio_lio_opcode == IOCB_CMD_PREAD;
-        let ticket = if is_read {
-            session.submit_pread_nowait(b.binding_id, io.nbytes as usize, io.offset as u64)?
+        let submitted = if is_read {
+            session.submit_pread_nowait(b.binding_id, io.nbytes as usize, io.offset as u64)
         } else {
             // SAFETY: PWRITE buf/nbytes are the app's contract with
             // io_submit; the payload is copied to the slab NOW, so the
             // app's buffer is free the moment io_submit returns.
             let data =
                 unsafe { std::slice::from_raw_parts(io.buf as *const u8, io.nbytes as usize) };
-            session.submit_pwrite_nowait(b.binding_id, data, io.offset as u64)?
+            session.submit_pwrite_nowait(b.binding_id, data, io.offset as u64)
+        };
+        let ticket = match submitted {
+            Some(t) => t,
+            None => {
+                // Wake-economy v6 (`il_slot_reroutes`): a `None` here is
+                // slot exhaustion OR a poisoned session (`submit_op`'s
+                // three None arms) — the poison gate lives inside
+                // `note_slot_reroute` (one policy point; see its doc).
+                session.note_slot_reroute();
+                return None;
+            }
         };
         let live = LiveTicket {
             session: b.session,

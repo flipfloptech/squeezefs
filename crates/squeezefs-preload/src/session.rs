@@ -1158,6 +1158,22 @@ impl Session {
         self.stats_page().note_kernel_route(bytes);
     }
 
+    /// Wake-economy v6: record one slot-exhaustion kernel-lane reroute
+    /// (the PR 3 scout's decision-gate instrument). The poison gate
+    /// lives HERE (one policy point): both `submit_op` poison arms also
+    /// return `None`, and a poison flood is a failure investigation,
+    /// never a slot-pressure signal (design-il-wake-economy Lever 2) —
+    /// so a poisoned session's reroutes count nothing. The residual
+    /// cross-thread race (a genuine exhaustion racing a concurrent
+    /// poison) can only UNDERCOUNT — the conservative direction for a
+    /// decision gate whose pre-registered prediction is zero.
+    pub fn note_slot_reroute(&self) {
+        if self.poisoned() {
+            return;
+        }
+        self.stats_page().note_slot_reroute();
+    }
+
     /// Fire a positional read without waiting. `None` = no slot or
     /// poisoned (client-visible backpressure — the batch prefix ends
     /// there, §5.5.1). The claimed slot stays claimed until
@@ -1215,6 +1231,9 @@ impl Session {
     pub fn cqe_park_begin(&self) -> WaitEntry<'_> {
         let cqe = &self.header().cqe;
         let expected = cqe.park_begin();
+        // Wake-economy v6: era census onto the client stats page (the
+        // wakes-per-era denominator; untrusted display word).
+        self.stats_page().note_park_era();
         WaitEntry {
             word: cqe.seq_word(),
             expected,
@@ -1234,6 +1253,8 @@ impl Session {
     pub fn cqe_park_begin_batch(&self, k: u32) -> WaitEntry<'_> {
         let cqe = &self.header().cqe;
         let expected = cqe.park_begin_batch(k);
+        // Wake-economy v6: era census (see `cqe_park_begin`).
+        self.stats_page().note_park_era();
         WaitEntry {
             word: cqe.seq_word(),
             expected,

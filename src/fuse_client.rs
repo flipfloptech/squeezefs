@@ -8407,6 +8407,16 @@ impl SqueezefsFilesystem {
             .as_ref()
             .map(|h| h.lane_gate_snapshot())
             .unwrap_or((0, 0, 0));
+        // Wake-economy v6 client-page trio (design-il-wake-economy):
+        // same reaped-fold + live-sum discipline; (0, 0, 0) on
+        // non-interception mounts so the keys always export.
+        let (il_submit_harvested, il_park_eras, il_slot_reroutes) = self
+            .ipc_host
+            .load()
+            .as_ref()
+            .as_ref()
+            .map(|h| h.wake_economy_snapshot())
+            .unwrap_or((0, 0, 0));
 
         let mut stats_obj = serde_json::json!({
             // Build identity (docs/operations.md §Versioning & releases):
@@ -9245,6 +9255,16 @@ impl SqueezefsFilesystem {
                 // its small-op traffic.
                 "ipc_lane_gate_kernel_routes": lane_gate_kernel_routes,
                 "ipc_lane_gate_kernel_bytes": lane_gate_kernel_bytes,
+                // Wake-economy v6 shim-side trio (client stats page,
+                // summed verbatim — untrusted display words):
+                // `il_slot_reroutes` is the PR 3 scout's decision-gate
+                // input (valid only on rows whose ipc_sessions_poisoned
+                // delta is 0); `il_park_eras` is the wakes-per-era
+                // denominator; `il_submit_harvested` engages with the
+                // PR 3 lever only (0 until then).
+                "il_submit_harvested": il_submit_harvested,
+                "il_park_eras": il_park_eras,
+                "il_slot_reroutes": il_slot_reroutes,
                 "ipc_lane_gate_threshold_bytes": lane_gate_threshold_bytes,
                 "ipc_service_threads": METRICS.ipc_service_threads.load(Ordering::Relaxed),
                 "ipc_session_owners": METRICS.ipc_session_owners.load(Ordering::Relaxed),

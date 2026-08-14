@@ -112,10 +112,27 @@ The residue is **worker-count scheduling, amplified by the handler-handoff share
    cross-thread wake + lane dispatch), and at 32 client processes those wakes are what the
    PSI shows as runqueue starvation.
 
-The prize named for the next campaign: **dd-eligibility across the publish cycle** (serve the
-W1 patch against the block's current custody even while the active/publish window is open —
-needs the §5.1 fence-protocol treatment, a design item, not a lever), worth an estimated
-+60 % on the 32-process fleet shape (its 4-process ceiling is 242k on this venue).
+~~The prize named for the next campaign: dd-eligibility across the publish cycle~~ —
+**FALSIFIED 2026-08-14** by the refetch instrument (built red-first as commit `2abe2094`,
+reverted and dropped from the branch per the falsified-lever rule): with the clean-entry
+backend-refetch arm live, `patch_unmapped_refetches ≡ patch_ineligible_unmapped` EXACTLY
+(1,014,723 = 1,014,723 per leg) — every "unmapped" verdict was confirmed by the backend, and
+the count is CONSTANT (~1.0145M) across legs of different op totals. The 35 % class is
+**fio's layout pass bleeding into the measurement window** (32 × 128 MiB ÷ 4 KiB ≈ 1.05M
+genuine first-touch writes of never-mapped blocks; the plain cells have no warmup, and the
+5 s-warmup cells lay out ~0.6 GiB of 4 GiB before the window opens). There is no stale-cache
+class and no mid-publish-cycle unmapped class. A-B-B-A IOPS: wash (169–180k vs 176–181k).
+
+Corrected steady-state write-lane split (RF2 leg, layout ops subtracted): **~78 % dd patches**,
+~22 % handler (overlay/block_lock/shape residual). Standing measurement-hygiene rule from this
+falsification: **rand-write il rows must pre-create the file set** (`--create_only=1` pass, or
+warmup ≥ the layout horizon) — a row containing its own layout pass overstates the handler
+share and understates the patch share.
+
+What still stands from part 3: the **worker-count scheduling conviction** (32 procs = 154k vs
+4 procs = 242k at equal offered depth, PSI 32 % vs 5 %) — the client-side wake fan-out at
+0.94 daemon wakes/op is the remaining fleet-shape term, and it is a client-topology/wake-
+economy design item, not an eligibility one.
 
 ## Standing consequences
 

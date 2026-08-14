@@ -531,9 +531,15 @@ async fn hazard4_one_fsync_authority() {
     let _l = levers(true);
     let h = make_harness("b4b_hazard4").await;
 
-    // Leg A (overlay-fed): overwrite block 0 through the seam; the
-    // fsync window contains the feed (RAM-only — ZERO entries) + the
-    // one epoch-close save.
+    // The un-fed control must be SHAPE-IDENTICAL minus the feed, so
+    // both legs ride the SAME vehicle (the seam) and only the shadow
+    // lever differs: a FUSE-write control carries its own write-side
+    // echo/attr commit, which is today's accumulation shape, not the
+    // feed's doing (measured: real-write control = fed leg + 1, the
+    // write's own traffic — the INVERSE of the hazard direction).
+
+    // Leg A (overlay-FED): the fsync window contains the feed (RAM-only
+    // — ZERO entries) + the one epoch-close save.
     let ino_a = striped_fixture(&h, "fa", 2, 4).await;
     let va = pattern(FBS as usize, 15);
     h.fs.test_install_overwrite_overlay(ino_a, 0, 0, &va)
@@ -544,16 +550,20 @@ async fn hazard4_one_fsync_authority() {
     fsync(&h, ino_a).await;
     let ja = journal_entries() - ja0;
 
-    // Leg B (the un-fed control): the SAME overwrite via the ordinary
-    // accumulation write-through (whose publish feeds the epoch on the
-    // pipeline's own arm) — then the same fsync-window measurement.
+    // Leg B (the UN-FED control): the same seam overwrite with the
+    // shadow lever OFF — the fsync window contains the degenerate's
+    // ONE durable merge and a no-op close.
+    squeezefs::routing::set_rewrite_shadow(false);
     let ino_b = striped_fixture(&h, "fb", 2, 5).await;
     let vb = pattern(FBS as usize, 17);
-    write_at(&h, ino_b, 0, &vb).await;
+    h.fs.test_install_overwrite_overlay(ino_b, 0, 0, &vb)
+        .await
+        .expect("seam install (control)");
     quiesce(&h).await;
     let jb0 = journal_entries();
     fsync(&h, ino_b).await;
     let jb = journal_entries() - jb0;
+    squeezefs::routing::set_rewrite_shadow(true);
 
     assert_eq!(
         ja, jb,
@@ -561,6 +571,7 @@ async fn hazard4_one_fsync_authority() {
          the un-fed control — one fsync authority, one save, the ref \
          deltas riding the SAME tx (law 7)"
     );
+    assert!(ja >= 1, "premise: the window contains the one publish save");
     assert_eq!(read_at(&h, ino_a, 0, FBS as usize).await, va);
     assert_eq!(read_at(&h, ino_b, 0, FBS as usize).await, vb);
 }
@@ -579,6 +590,7 @@ async fn hazard5_ref_drift_zero() {
     let h = make_harness("b4b_hazard5").await;
     std::env::remove_var("SQUEEZEFS_TEST_STAMP_BLOCK_REFS");
     let ino = striped_fixture(&h, "f1", 2, 6).await;
+    let fb0 = fallbacks();
 
     // Two full overwrite-feed-close cycles on block 0.
     for seed in [19u8, 21u8] {
@@ -606,7 +618,11 @@ async fn hazard5_ref_drift_zero() {
          overlay-fed publishes must be ZERO (the feed notes Delete-old + \
          Put-new exactly once into the publish tx): {drift:?}"
     );
-    assert_eq!(m64(&METRICS.overlay_feed_fallbacks), 0, "no fallbacks");
+    assert_eq!(
+        fallbacks() - fb0,
+        0,
+        "no fallbacks with the shadow lever ON"
+    );
 }
 
 // ---------------------------------------------------------------------------

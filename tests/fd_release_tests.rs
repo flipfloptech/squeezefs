@@ -49,30 +49,30 @@ fn dropped_router_graph_releases_all_segment_fds() {
     {
         {
             squeezefs_ipc::sqz_blocking::block_on(async {
-            let dlm = DlmClient::new().unwrap();
-            let b = NamedTempFile::new().unwrap();
-            std::fs::File::create(b.path())
-                .unwrap()
-                .set_len(64 * 1024 * 1024)
+                let dlm = DlmClient::new().unwrap();
+                let b = NamedTempFile::new().unwrap();
+                std::fs::File::create(b.path())
+                    .unwrap()
+                    .set_len(64 * 1024 * 1024)
+                    .unwrap();
+                let nvme = Arc::new(NvmeBlockDev::new(b.path().to_str().unwrap()));
+                let ba = Arc::new(BlockAllocator::new("fd_release_ns").await.unwrap());
+                let s = tempdir().unwrap();
+                let cache = TieredCache::new(
+                    vec![s.path().to_path_buf()],
+                    Some("64MB"),
+                    Some("64MB"),
+                    Some("128MB"),
+                    Some("128MB"),
+                    ba.clone(),
+                    nvme.clone(),
+                    None,
+                )
+                .await
                 .unwrap();
-            let nvme = Arc::new(NvmeBlockDev::new(b.path().to_str().unwrap()));
-            let ba = Arc::new(BlockAllocator::new("fd_release_ns").await.unwrap());
-            let s = tempdir().unwrap();
-            let cache = TieredCache::new(
-                vec![s.path().to_path_buf()],
-                Some("64MB"),
-                Some("64MB"),
-                Some("128MB"),
-                Some("128MB"),
-                ba.clone(),
-                nvme.clone(),
-                None,
-            )
-            .await
-            .unwrap();
-            let router = DataRouter::new(dlm.clone(), cache, ba, nvme);
-            let _ = router;
-        });
+                let router = DataRouter::new(dlm.clone(), cache, ba, nvme);
+                let _ = router;
+            });
         }
     }
     // Converge-within-bound: the workers' exit edges are tick-cadenced

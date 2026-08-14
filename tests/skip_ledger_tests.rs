@@ -352,3 +352,58 @@ fn the_mount_gated_suites_all_use_the_shared_gate() {
         );
     }
 }
+
+#[test]
+fn the_capability_gated_suites_all_ride_the_zc_capability_gate() {
+    // TEST-2, capability edition: every `tests/*.rs` suite that declares a
+    // capability-class skip must be NAMED in the packaged consumer of
+    // `SQUEEZEFS_TEST_REQUIRE_CAPABILITY=1` (`tests/run_zc_capability_gate.sh`
+    // — the root-run leg). Without this pin a new zc suite self-skips
+    // forever on the one box that HAS the sqz kernel: unprivileged `cargo
+    // test` can never arm FUSE_URING_ZERO_COPY (the kernel gates it on
+    // CAP_SYS_ADMIN), so "all green" would mean the zero-copy surface was
+    // never executed anywhere — the phantom-green posture the mount gate
+    // killed, replayed on the capability class. Auto-discovered, not a
+    // hand-list: a fourth capability suite fails HERE until the gate
+    // script runs it.
+    let tests_dir = repo_root().join("tests");
+    let script = std::fs::read_to_string(tests_dir.join("run_zc_capability_gate.sh"))
+        .expect("tests/run_zc_capability_gate.sh exists (the capability-gate leg)");
+    assert!(
+        script.contains("SQUEEZEFS_TEST_REQUIRE_CAPABILITY=1"),
+        "the capability gate must export SQUEEZEFS_TEST_REQUIRE_CAPABILITY=1 — \
+         without it every decline is a ledgered skip, not a failure"
+    );
+    let mut capability_suites: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&tests_dir).expect("read tests/") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("utf8 test stem")
+            .to_string();
+        if name == "skip_ledger_tests" {
+            continue; // this file names the class in prose, not as a gate
+        }
+        let src = std::fs::read_to_string(&path).expect("read test suite");
+        if src.contains("SkipClass::Capability") {
+            capability_suites.push(name);
+        }
+    }
+    assert!(
+        !capability_suites.is_empty(),
+        "no capability-class suites found — if the class was retired, retire \
+         this pin and the gate script with it"
+    );
+    for suite in &capability_suites {
+        assert!(
+            script.contains(suite.as_str()),
+            "{suite} declares SkipClass::Capability but is not named in \
+             tests/run_zc_capability_gate.sh — it can never be promoted to \
+             run on a capable box (add it to the gate's SUITES list)"
+        );
+    }
+}

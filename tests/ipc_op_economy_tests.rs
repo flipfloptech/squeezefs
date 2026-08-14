@@ -123,6 +123,21 @@ fn allocs_now() -> u64 {
 // fixture (the preload_parity_tests shape)
 // ---------------------------------------------------------------------------
 
+/// Global-counter-window serializer (the rand_write_amp_tests pattern):
+/// these tests assert deltas of PROCESS-GLOBAL wake/alloc counters over
+/// their own op windows, so two of them overlapping in libtest's
+/// parallel mode cross-contaminate (the gate's --test-threads=1 never
+/// sees it; bare `cargo test` did — parked_reaper's one paid wake landed
+/// inside unparked's window).
+static SERIAL: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
+
 async fn sandbox_fs() -> (
     squeezefs::fuse_client::SqueezefsFilesystem,
     tempfile::NamedTempFile,
@@ -532,6 +547,7 @@ fn measure_warm_window(session: &ClientSession, binding: u64, offset: u64, ops: 
 /// the campaign's profiling instrument.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn warm_fast_path_serves_are_allocation_free() {
+    let _serial = serial().await;
     let fx = Fixture::new("warmalloc").await;
     fx.salt_inos(3).await;
 
@@ -642,6 +658,7 @@ fn print_site_table() {
 /// a reaper that is not parked).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unparked_completions_elide_cqe_wakes() {
+    let _serial = serial().await;
     let fx = Fixture::new("cqeelide").await;
     fx.salt_inos(5).await;
     let ino = fx.create_file("cqe.bin").await;
@@ -697,6 +714,7 @@ async fn unparked_completions_elide_cqe_wakes() {
 /// thread returns well inside the 5 s bound.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parked_reaper_is_woken_by_completion_cqe_wake() {
+    let _serial = serial().await;
     let fx = Fixture::new("cqewake").await;
     fx.salt_inos(7).await;
     let ino = fx.create_file("cqew.bin").await;
@@ -793,6 +811,7 @@ async fn parked_reaper_is_woken_by_completion_cqe_wake() {
 /// the columns must read zeros, never missing keys).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wake_economy_instruments_register_and_export_at_zero() {
+    let _serial = serial().await;
     let fx = Fixture::new("wake-econ-instr").await;
     assert_eq!(
         METRICS.ipc_cqe_wake_collapsed.load(Ordering::Relaxed),

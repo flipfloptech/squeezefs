@@ -1445,7 +1445,7 @@ impl IpcHost {
             svc_spawned: std::sync::atomic::AtomicUsize::new(0),
             started: Instant::now(),
             spin_static: service_spin_window(),
-            spin_adaptive: crate::env_knobs::bool_knob("SQUEEZEFS_IPC_SPIN_ADAPTIVE", false),
+            spin_adaptive: crate::env_knobs::bool_knob("SQUEEZEFS_IPC_SPIN_ADAPTIVE", true),
             spin_headroom: crate::spin_governor::HeadroomGauge::new(),
             spin_lanes: service_thread_count(),
             spin_cores: crate::cpu::process_parallelism(),

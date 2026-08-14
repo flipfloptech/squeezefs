@@ -3912,7 +3912,8 @@ async fn current_mapping_present(ctx: &FsckCtx, ino: u64, block_idx: u32, mappin
 /// key is deliberately NOT freed: for C7 the physical block is
 /// preserved for forensics; for C2-lost there is nothing allocated to
 /// free.
-async fn flip_mapping_damaged(
+#[doc(hidden)] // visible for the B4c-i belt pin (tests/overlay_overwrite_tests.rs)
+pub async fn flip_mapping_damaged(
     ctx: &FsckCtx,
     ino: u64,
     block_idx: u32,

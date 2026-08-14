@@ -326,6 +326,48 @@ pub(crate) struct QueuedPublish {
     /// `publish_phase_ns` queue_wait records at pass drain, total at
     /// terminal fan-out.
     enqueued_at: std::time::Instant,
+    /// KD-B4-11: the settle's self-publish provenance marker. Scope is
+    /// the per-ino APPLY pass (this conveyor is keyed by ino) — the
+    /// marker is consumed at apply and never serialized into the
+    /// save/`publish_commit_group` path (the layer-split invariant: the
+    /// one multi-ino aggregation lives downstream at the save layer and
+    /// is marker-blind by construction).
+    overlay_self_publish: Option<OverlaySelfPublish>,
+}
+
+/// KD-B4-11 (design-overlay-overwrite §5.7): the settle's explicit
+/// self-publish provenance — the §5.2 destination-identity word.
+/// Births never repeat across re-opened records (the registry's
+/// monotone counter); the dest offset makes the word doubly robust.
+/// Never state-based (Frozen-exemption would blind the belt) and never
+/// record-retire-based (the record must stay registered through its own
+/// merge — the record-gone-⇒-published compose rule).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OverlaySelfPublish {
+    pub block: u32,
+    pub dest_offset: u64,
+    pub birth: u64,
+}
+
+/// §5.7 (B4c-i): the injected device-overlay foreign-merge surface —
+/// see `DataRouterInner::overlay_hooks`. Every closure is pure with
+/// respect to teardown: `probe` reads, `supersede` is the overlay
+/// core's CAS, `retire` SPAWNS a detached terminal-record retire
+/// (never runs one inline), `blocks_of` enumerates for the
+/// `TruncateFrom` arm.
+pub(crate) struct OverlayMergeHooks {
+    /// Live (Open|Frozen) record on `(ino, b)` → its §5.2 identity
+    /// `(dest_offset, birth)`.
+    pub probe: std::sync::Arc<dyn Fn(u64, u32) -> Option<(u64, u64)> + Send + Sync>,
+    /// `Open | Frozen → Superseded` CAS; `true` = this call marked it.
+    pub supersede: std::sync::Arc<dyn Fn(u64, u32) -> bool + Send + Sync>,
+    /// The ino's live overlay blocks (drain-frequency scan).
+    pub blocks_of: std::sync::Arc<dyn Fn(u64) -> Vec<u32> + Send + Sync>,
+    /// Schedule the detached retire of one hook-marked block (the
+    /// caller's post-3.5 venue — without it a marked record retires
+    /// only when some later path touches its block, holding
+    /// `overlay_open` nonzero and degrading `any_open_fast` mount-wide).
+    pub retire: std::sync::Arc<dyn Fn(u64, u32) + Send + Sync>,
 }
 
 /// `SQUEEZEFS_PUBLISH_COALESCE_MAX` cell: max block-publish ops drained
@@ -3398,6 +3440,14 @@ pub struct DataRouterInner {
     /// bare routers never latch, so nothing is refused.
     pub(crate) reclaim_probe:
         once_cell::sync::OnceCell<std::sync::Arc<dyn Fn(u64) -> bool + Send + Sync>>,
+    /// §5.7 (B4c-i, design-overlay-overwrite): the injected
+    /// device-overlay foreign-merge surface — the `reclaim_probe` /
+    /// QuiesceProbe pattern (wired by `SqueezefsFilesystem::new`; bare
+    /// routers screen nothing). The surface is a pure probe + the
+    /// `supersede()` CAS + a detached-retire SCHEDULER, so the router
+    /// gains NO teardown authority (the MARK-only rule's structural
+    /// form).
+    pub(crate) overlay_hooks: once_cell::sync::OnceCell<OverlayMergeHooks>,
     pub cache: TieredCache,
     pub block_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
     pub nvme_writer: std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
@@ -6240,6 +6290,7 @@ impl DataRouter {
                 dlm,
                 meta_backend: once_cell::sync::OnceCell::new(),
                 reclaim_probe: once_cell::sync::OnceCell::new(),
+                overlay_hooks: once_cell::sync::OnceCell::new(),
                 cache,
                 block_allocator,
                 nvme_writer,
@@ -6347,6 +6398,126 @@ impl DataRouter {
     #[inline]
     pub(crate) fn ino_reclaim_in_flight(&self, ino: u64) -> bool {
         self.reclaim_probe.get().is_some_and(|p| p(ino))
+    }
+
+    /// Wire the §5.7 overlay foreign-merge surface (the
+    /// `set_reclaim_probe` pattern). First wiring wins.
+    pub(crate) fn set_overlay_merge_hooks(&self, hooks: OverlayMergeHooks) {
+        let _ = self.overlay_hooks.set(hooks);
+    }
+
+    /// The wired hooks, gated on the registry-wide fast path: `None`
+    /// on bare routers AND on overlay-free mounts (one relaxed gauge
+    /// load — the no-overlay fleet pays nothing at the hook sites).
+    #[inline]
+    pub(crate) fn overlay_hooks_live(&self) -> Option<&OverlayMergeHooks> {
+        let h = self.overlay_hooks.get()?;
+        if !crate::device_overlay::any_open_fast() {
+            return None;
+        }
+        Some(h)
+    }
+
+    /// §5.7 `Merge`-class screen (MARK-only — runs inside the caller's
+    /// `INODE_META_LOCKS` section): the settle's OWN publish is
+    /// provenance-exempt (KD-B4-11); a FOREIGN `Merge` on an
+    /// open-overlay index is unreachable past the one-authority screen
+    /// ⇒ tripwire + containment (the durable map is the authority the
+    /// moment the foreign merge commits — keeping the record alive
+    /// would serve dest bytes the durable authority displaced). Marked
+    /// blocks join `touched` for the caller's post-3.5 detached retire.
+    fn overlay_screen_merge<I: IntoIterator<Item = u32>>(
+        &self,
+        ino: u64,
+        indices: I,
+        marker: Option<&OverlaySelfPublish>,
+        touched: &mut Vec<u32>,
+    ) {
+        let Some(h) = self.overlay_hooks_live() else {
+            return;
+        };
+        for b in indices {
+            let Some((dest_offset, birth)) = (h.probe)(ino, b) else {
+                continue;
+            };
+            if marker
+                .is_some_and(|m| m.block == b && m.dest_offset == dest_offset && m.birth == birth)
+            {
+                // The settle's own publish — the record stays Frozen and
+                // registered through its merge (retiring it first opens
+                // the record-gone-⇒-published generic/209 window).
+                continue;
+            }
+            crate::note_invariant_tripwire(
+                "overlay_foreign_merge",
+                "a foreign un-marked Merge reached an open-overlay index — \
+                 a one-authority-screen escape (contained: superseded)",
+            );
+            if (h.supersede)(ino, b) {
+                METRICS
+                    .overlay_superseded_by_merge
+                    .fetch_add(1, Ordering::Relaxed);
+                touched.push(b);
+            }
+        }
+    }
+
+    /// §5.7 `MergeExpected`-class screen (the layer-2 belt for
+    /// guard-less callers — fsck's `flip_mapping_damaged`): `true` ⇒
+    /// SKIP-APPLY this entry — a content-preserving mover/repair carries
+    /// no new user bytes, so superseding here would drop ACK-early
+    /// acked custody without a fence (never-lossy; only the D0 fence
+    /// may drop acked custody — FIND-M11-A). The skipped caller
+    /// re-plans (mover) or refuses (repair) on its own contract.
+    fn overlay_skip_expected(&self, ino: u64, b: u32) -> bool {
+        let Some(h) = self.overlay_hooks_live() else {
+            return false;
+        };
+        if (h.probe)(ino, b).is_some() {
+            METRICS.overlay_mover_skips.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+
+    /// §5.7 discarding-class screen (`TruncateFrom` / `RemoveBlocks`):
+    /// the durable op discards the range's data by definition — a
+    /// truncate/punch IS a newer write of nothing — so the record marks
+    /// `Superseded` (the correct newest-wins outcome; the mint owner
+    /// frees the unpublished dest at the detached retire). The belt for
+    /// any discarding path reaching the primitive without the entry
+    /// drain.
+    fn overlay_screen_discard<I: IntoIterator<Item = u32>>(
+        &self,
+        ino: u64,
+        indices: I,
+        touched: &mut Vec<u32>,
+    ) {
+        let Some(h) = self.overlay_hooks_live() else {
+            return;
+        };
+        for b in indices {
+            if (h.probe)(ino, b).is_some() && (h.supersede)(ino, b) {
+                METRICS
+                    .overlay_superseded_by_merge
+                    .fetch_add(1, Ordering::Relaxed);
+                touched.push(b);
+            }
+        }
+    }
+
+    /// The caller's post-3.5 retire venue (§5.7's MARK-only rule, other
+    /// half): schedule one detached retire per hook-marked block. Call
+    /// AFTER the primitive's `INODE_META_LOCKS` guard dropped.
+    fn overlay_schedule_retires(&self, ino: u64, touched: Vec<u32>) {
+        if touched.is_empty() {
+            return;
+        }
+        if let Some(h) = self.overlay_hooks.get() {
+            for b in touched {
+                (h.retire)(ino, b);
+            }
+        }
     }
 
     pub fn set_crypto(&self, crypto: crate::crypto_compress::CryptoCompressState) {
@@ -10123,6 +10294,34 @@ impl DataRouter {
         fencing_token: u64,
         expected_epoch: Option<u64>,
     ) -> Result<Option<Vec<String>>> {
+        self.merge_block_mappings_marked(
+            ino,
+            op,
+            min_size,
+            layout_flip,
+            fencing_token,
+            expected_epoch,
+            None,
+        )
+        .await
+    }
+
+    /// The primitive's full form (B4c-i): `overlay_self_publish` is the
+    /// KD-B4-11 provenance marker — `Some` ONLY on the overlay settle's
+    /// own publish (the serialized `SQUEEZEFS_PUBLISH_COALESCE_MAX<=1`
+    /// leg; the conveyor leg carries it on `QueuedPublish`). Every
+    /// other caller routes through the marker-less wrappers above.
+    #[allow(clippy::too_many_arguments)]
+    async fn merge_block_mappings_marked(
+        &self,
+        ino: u64,
+        op: BlockMapOp<'_>,
+        min_size: u64,
+        layout_flip: LayoutFlip,
+        fencing_token: u64,
+        expected_epoch: Option<u64>,
+        overlay_self_publish: Option<&OverlaySelfPublish>,
+    ) -> Result<Option<Vec<String>>> {
         let _map_guard = meta_lock_acquire(ino).await;
 
         let epoch_word = LAYOUT_PRUNE_EPOCHS.get_inode_lock(ino);
@@ -10192,6 +10391,10 @@ impl DataRouter {
         // computation cover write-through, promotion, mover republish,
         // truncate and punch alike.
         let mut ref_changes: Vec<(u32, String, bool)> = Vec::new();
+        // §5.7 (B4c-i): hook-marked blocks — collected under this 3.5
+        // section (MARK-only), retired detached by this fn's tail AFTER
+        // the guard drops.
+        let mut overlay_touched: Vec<u32> = Vec::new();
         let purge = |bk: &str| {
             // Purge every cache tier for a displaced/removed key: its offset
             // will be reallocated under the SAME key string once freed, and
@@ -10207,6 +10410,15 @@ impl DataRouter {
                 // displaced-and-freed key
                 // (`tests/rewrite_shadow_supersede_tests.rs`).
                 self.supersede_shadow_bindings(ino, entries.iter().map(|(b, _)| *b));
+                // §5.7 `Merge` class: self-publish exempt by provenance;
+                // a foreign merge on an open-overlay index = tripwire +
+                // containment.
+                self.overlay_screen_merge(
+                    ino,
+                    entries.iter().map(|(b, _)| *b),
+                    overlay_self_publish,
+                    &mut overlay_touched,
+                );
                 for (b, new_key) in entries {
                     match block_map.insert(*b, new_key.clone()) {
                         Some(prev) if prev != *new_key => {
@@ -10237,6 +10449,18 @@ impl DataRouter {
                 // stale, not the epoch's.
                 let mut applied_idxs: Vec<u32> = Vec::new();
                 for (b, expected, new_key) in entries {
+                    // §5.7 `MergeExpected` class (the layer-2 belt): an
+                    // open/frozen device-overlay record on the index ⇒
+                    // SKIP-APPLY — never supersede (a content-preserving
+                    // mover/repair would replace ACK-early acked custody
+                    // with a copy of the old image, fence-less: the
+                    // never-lossy violation). The skipped entry returns
+                    // no displaced match, which is the caller's own
+                    // refusal/re-plan contract (`flip_mapping_damaged`'s
+                    // `false` arm; the mover's deferral).
+                    if self.overlay_skip_expected(ino, *b) {
+                        continue;
+                    }
                     match block_map.get(b) {
                         // Merge only where the mover's captured mapping is
                         // still current — the supersession law: a mismatch
@@ -10271,6 +10495,19 @@ impl DataRouter {
                 // durable map never bound (left in place they resurrect on
                 // refill and a later extend reads a freed key).
                 self.supersede_shadow_bindings_from(ino, new_size, block_size);
+                // §5.7 discarding class: overlays wholly at/beyond the
+                // cut mark Superseded (their data is being discarded —
+                // newest-wins; the entry drains handle the drained path,
+                // this is the belt for un-drained reachers). Enumerated
+                // from the REGISTRY, not the map — overlay-only blocks
+                // the durable map never bound must not survive the cut.
+                if let Some(h) = self.overlay_hooks_live() {
+                    let past_cut: Vec<u32> = (h.blocks_of)(ino)
+                        .into_iter()
+                        .filter(|&b| (b as u64) * block_size >= new_size)
+                        .collect();
+                    self.overlay_screen_discard(ino, past_cut, &mut overlay_touched);
+                }
                 block_map.retain(|&b, bk| {
                     if (b as u64) * block_size >= new_size {
                         purge(bk);
@@ -10288,6 +10525,8 @@ impl DataRouter {
                 // everywhere, shadow included (unconditional — a
                 // shadow-only binding for a punched index is stale too).
                 self.supersede_shadow_bindings(ino, idxs.iter().copied());
+                // §5.7 discarding class (the punch belt).
+                self.overlay_screen_discard(ino, idxs.iter().copied(), &mut overlay_touched);
                 for &b in idxs {
                     if let Some(bk) = block_map.remove(&b) {
                         purge(&bk);
@@ -10339,8 +10578,17 @@ impl DataRouter {
         // that same commit (one tx = one checksummed journal entry), so a
         // crash can never leave the ledger and the map disagreeing.
         let refs = self.block_ref_ops(ino, &ref_changes);
-        self.save_metadata_to_backend_refs(ino, &current, fencing_token, &refs)
-            .await?;
+        let save_res = self
+            .save_metadata_to_backend_refs(ino, &current, fencing_token, &refs)
+            .await;
+        // §5.7's retire venue: AFTER this primitive's 3.5 section exits
+        // (the retire takes the block guard and runs the teardown — the
+        // MARK-only rule's other half). Scheduled on the error path too:
+        // a hook-marked record is terminal either way, and stranding it
+        // would hold `overlay_open` nonzero mount-wide.
+        drop(_map_guard);
+        self.overlay_schedule_retires(ino, overlay_touched);
+        save_res?;
         Ok(Some(displaced))
     }
 
@@ -10370,18 +10618,46 @@ impl DataRouter {
         flip: LayoutFlip,
         fencing_token: u64,
     ) -> Result<Vec<String>> {
+        self.merge_block_mappings_coalesced_marked(
+            ino,
+            entries,
+            min_size,
+            flip,
+            fencing_token,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::merge_block_mappings_coalesced`] carrying the KD-B4-11
+    /// self-publish provenance marker — the overlay settle's publish
+    /// vehicle (`Some` only there). The marker rides `QueuedPublish` on
+    /// the conveyor leg and the direct primitive on the serialized
+    /// lever leg; both consume it at the per-ino APPLY layer.
+    pub(crate) async fn merge_block_mappings_coalesced_marked(
+        &self,
+        ino: u64,
+        entries: Vec<(u32, String)>,
+        min_size: u64,
+        flip: LayoutFlip,
+        fencing_token: u64,
+        overlay_self_publish: Option<OverlaySelfPublish>,
+    ) -> Result<Vec<String>> {
         if publish_coalesce_max() <= 1 {
             // A/B lever (`SQUEEZEFS_PUBLISH_COALESCE_MAX=1`): the
             // pre-campaign serialized per-op path, verbatim.
             return self
-                .merge_block_mappings(
+                .merge_block_mappings_marked(
                     ino,
                     BlockMapOp::Merge(&entries),
                     min_size,
                     flip,
                     fencing_token,
+                    None,
+                    overlay_self_publish.as_ref(),
                 )
-                .await;
+                .await
+                .map(|d| d.expect("unconditional merge cannot be epoch-refused"));
         }
         let conveyor = match self.publish_conveyors.read_sync(&ino, |_, c| c.clone()) {
             Some(c) => c,
@@ -10409,6 +10685,7 @@ impl DataRouter {
                 fencing_token,
                 done,
                 enqueued_at: std::time::Instant::now(),
+                overlay_self_publish,
             },
             blocks,
         );
@@ -10607,6 +10884,9 @@ impl DataRouter {
         // ledger either). Rides the batch's ONE save, so the aggregated
         // publish stays one journal entry, accounting included.
         let mut ref_changes: Vec<(u32, String, bool)> = Vec::new();
+        // §5.7: hook-marked blocks — retired detached after this pass's
+        // 3.5 section exits.
+        let mut overlay_touched: Vec<u32> = Vec::new();
         let mut save_token = 0u64;
         for op in batch {
             // Per-op fencing: a stale op fails ALONE (the supersession
@@ -10626,6 +10906,17 @@ impl DataRouter {
             // shadow bindings so no refetch-compose resurrects a
             // displaced-and-freed key.
             self.supersede_shadow_bindings(ino, op.entries.iter().map(|(b, _)| *b));
+            // §5.7 `Merge` class, conveyor face (KD-B4-11): the marker's
+            // scope is exactly THIS per-ino apply pass — per-ENTRY in a
+            // coalesced batch, so sibling ops in the same pass stay
+            // screened; the save/`publish_commit_group` layers below are
+            // marker-blind by construction.
+            self.overlay_screen_merge(
+                ino,
+                op.entries.iter().map(|(b, _)| *b),
+                op.overlay_self_publish.as_ref(),
+                &mut overlay_touched,
+            );
             for (b, new_key) in &op.entries {
                 match block_map.insert(*b, new_key.clone()) {
                     Some(prev) if prev != *new_key => {
@@ -10684,6 +10975,8 @@ impl DataRouter {
             }));
         }
         if applied.is_empty() {
+            drop(_map_guard);
+            self.overlay_schedule_retires(ino, overlay_touched);
             return;
         }
         METRICS
@@ -10712,6 +11005,9 @@ impl DataRouter {
                 }
             }
         }
+        // §5.7's retire venue (post-3.5): see merge_block_mappings_marked.
+        drop(_map_guard);
+        self.overlay_schedule_retires(ino, overlay_touched);
     }
 
     /// Bump the RAM metadata entry's size floor (write handler's

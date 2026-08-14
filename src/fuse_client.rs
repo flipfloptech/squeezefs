@@ -5554,6 +5554,12 @@ pub struct Metrics {
     /// `active_block:` entry owns the block (accumulation in progress —
     /// merge into it, today's path).
     pub patch_ineligible_overlay: Align64<AtomicU64>,
+    /// Clause 8 (B4c-i, design-overlay-overwrite §5.5): a live
+    /// DEVICE-overlay record on the block. Deliberately apart from the
+    /// W2 `patch_ineligible_overlay` bucket AND the S11 clause-7
+    /// `patch_ineligible_range_shared` — the ledgers must not merge
+    /// (predicate-rot detection depends on the split).
+    pub patch_ineligible_device_overlay: Align64<AtomicU64>,
     /// Predicate 4 failures: block refcount != 1 (clone-shared — CoW).
     pub patch_ineligible_shared: Align64<AtomicU64>,
     /// **Clause 7** failures (DLM stage S11 — pre-rc spec §6.7/§6.3): the
@@ -5932,6 +5938,32 @@ pub struct Metrics {
     pub overlay_gap_seeds: Align64<AtomicU64>,
     /// Byte face of [`Self::overlay_gap_seeds`].
     pub overlay_gap_seed_bytes: Align64<AtomicU64>,
+    /// §5.8 (B4c-i): the SUBSET of [`Self::overlay_gap_seed_bytes`]
+    /// sourced from the OLD BINDING (overwrite records; fresh records
+    /// keep zeros — law 5). The §5.8 falsifier instrument: ≈ 0 on
+    /// sequential shapes; material growth = eligibility narrows before
+    /// the ladder proceeds (never a steady-state RMW engine).
+    pub overlay_gap_seed_old_bytes: Align64<AtomicU64>,
+    /// §5.6(1) (B4c-i): open-overlay compose serves whose gap ranges
+    /// came from the captured old binding (overwrite records).
+    pub overlay_read_gap_serves: Align64<AtomicU64>,
+    /// Byte face of [`Self::overlay_read_gap_serves`] — the gap bytes
+    /// served from the old binding.
+    pub overlay_read_gap_bytes: Align64<AtomicU64>,
+    /// §5.7 (B4c-i): `MergeExpected` skips under a live overlay —
+    /// counted at BOTH layers (the mover quiesce-probe deferral and the
+    /// primitive belt for guard-less callers). Growth under mover
+    /// passes is the hook WORKING (acked custody preserved; the
+    /// mover/repair re-plans or refuses).
+    pub overlay_mover_skips: Align64<AtomicU64>,
+    /// §5.7 (B4c-i): the DISCARDING-class belt engaging — a
+    /// `TruncateFrom`/`RemoveBlocks` reaching the primitive un-drained
+    /// marked the record Superseded (pair with
+    /// `rewrite_shadow_superseded`). A FOREIGN un-marked `Merge`
+    /// additionally trips `invariant_tripwires`
+    /// (`overlay_foreign_merge`) — that pair must stay 0 on healthy
+    /// mounts now that the settle's own publish is provenance-exempt.
+    pub overlay_superseded_by_merge: Align64<AtomicU64>,
     /// GAUGE: live overlay records — must return to 0 at quiesce (the
     /// `rewrite_shadow_open_epochs` law); the read/write probe hooks'
     /// `overlay_open == 0` fast path rides it.
@@ -6666,6 +6698,7 @@ pub struct IpcDirectWriteSnapshot {
     pub t0_ns: u64,
 }
 
+#[derive(Debug)]
 pub enum IpcReadProbe {
     /// `offset ≥ size` under the guarded size authority: complete 0 bytes.
     Eof,
@@ -7278,6 +7311,48 @@ impl SqueezefsFilesystem {
                 .set_reclaim_probe(std::sync::Arc::new(move |ino: u64| {
                     latch.contains_sync(&ino)
                 }));
+        }
+        // §5.7 (B4c-i, design-overlay-overwrite): the overlay
+        // foreign-merge surface — the QuiesceProbe/reclaim_probe
+        // injection pattern. Every closure captures ONLY the registry
+        // Arc (a leaf — no fs/router cycle, the defrag_fold_hook
+        // lesson): probe + supersede are pure; retire SPAWNS a detached
+        // terminal-record teardown (never inline — the MARK-only rule's
+        // structural form; the spawned task takes the block guard (3)
+        // itself, a fresh acquisition with no held-lock edges).
+        {
+            let reg_probe = fs.device_overlays.clone();
+            let reg_sup = fs.device_overlays.clone();
+            let reg_blocks = fs.device_overlays.clone();
+            let reg_retire = fs.device_overlays.clone();
+            fs.router
+                .set_overlay_merge_hooks(crate::routing::OverlayMergeHooks {
+                    probe: std::sync::Arc::new(move |ino, b| {
+                        reg_probe.get(ino, b).and_then(|r| {
+                            (!r.core.state().is_terminal()).then(|| (r.dest_offset, r.core.birth()))
+                        })
+                    }),
+                    supersede: std::sync::Arc::new(move |ino, b| {
+                        reg_sup.get(ino, b).is_some_and(|r| r.core.supersede())
+                    }),
+                    blocks_of: std::sync::Arc::new(move |ino| reg_blocks.blocks_of(ino)),
+                    retire: std::sync::Arc::new(move |ino, b| {
+                        let reg = reg_retire.clone();
+                        crate::detached::tpc_spawn_guarded("overlay_hook_retire", async move {
+                            let (guard, _w) =
+                                block_lock_acquire_timed(ino, b, BlockLockSite::OverlayPrune).await;
+                            if let Some(rec) = reg.get(ino, b) {
+                                if rec.core.state().is_terminal() {
+                                    await_overlay_inflight_on(&rec.core, &rec.inflight_change)
+                                        .await;
+                                    rec.run_teardown_disposition();
+                                    reg.retire(ino, b, &rec);
+                                }
+                            }
+                            drop(guard);
+                        });
+                    }),
+                });
         }
         fs
     }
@@ -7907,7 +7982,21 @@ impl SqueezefsFilesystem {
     pub fn mover_quiesce_probe(&self) -> crate::jobs::QuiesceProbe {
         let bufs = self.active_block_buffers.clone();
         let router = self.router.clone();
+        let overlays = self.device_overlays.clone();
         std::sync::Arc::new(move |ino, b| {
+            // §5.7 layer 1 (B4c-i): a live device-overlay record is the
+            // one custody form this probe predates — NOT quiescent (the
+            // mover defers and re-plans; by the revisit the record has
+            // fed and the ordinary expected-mismatch skip takes over).
+            // Counted here; the primitive belt counts its own layer.
+            if crate::device_overlay::any_open_fast() {
+                if let Some(rec) = overlays.get(ino, b as u32) {
+                    if !rec.core.state().is_terminal() {
+                        METRICS.overlay_mover_skips.fetch_add(1, Ordering::Relaxed);
+                        return false;
+                    }
+                }
+            }
             let key = crate::keys::active_block(ino, b).to_string();
             let ext = crate::keys::active_block_ext(ino, b).to_string();
             !bufs.contains_key(&key)
@@ -9128,6 +9217,7 @@ impl SqueezefsFilesystem {
                 "patch_ineligible_decorated": METRICS.patch_ineligible_decorated.load(Ordering::Relaxed),
                 "patch_ineligible_unaligned": METRICS.patch_ineligible_unaligned.load(Ordering::Relaxed),
                 "patch_ineligible_overlay": METRICS.patch_ineligible_overlay.load(Ordering::Relaxed),
+                "patch_ineligible_device_overlay": METRICS.patch_ineligible_device_overlay.load(Ordering::Relaxed),
                 "patch_ineligible_shared": METRICS.patch_ineligible_shared.load(Ordering::Relaxed),
                 "patch_ineligible_range_shared": METRICS.patch_ineligible_range_shared.load(Ordering::Relaxed),
                 "patch_ineligible_transform": METRICS.patch_ineligible_transform.load(Ordering::Relaxed),
@@ -9347,6 +9437,11 @@ impl SqueezefsFilesystem {
                 "overlay_published_bytes": METRICS.overlay_published_bytes.load(Ordering::Relaxed),
                 "overlay_epoch_feeds": METRICS.overlay_epoch_feeds.load(Ordering::Relaxed),
                 "overlay_feed_fallbacks": METRICS.overlay_feed_fallbacks.load(Ordering::Relaxed),
+                "overlay_gap_seed_old_bytes": METRICS.overlay_gap_seed_old_bytes.load(Ordering::Relaxed),
+                "overlay_read_gap_serves": METRICS.overlay_read_gap_serves.load(Ordering::Relaxed),
+                "overlay_read_gap_bytes": METRICS.overlay_read_gap_bytes.load(Ordering::Relaxed),
+                "overlay_mover_skips": METRICS.overlay_mover_skips.load(Ordering::Relaxed),
+                "overlay_superseded_by_merge": METRICS.overlay_superseded_by_merge.load(Ordering::Relaxed),
                 "overlay_gap_seeds": METRICS.overlay_gap_seeds.load(Ordering::Relaxed),
                 "overlay_gap_seed_bytes": METRICS.overlay_gap_seed_bytes.load(Ordering::Relaxed),
                 "overlay_open": METRICS.overlay_open.load(Ordering::Relaxed),
@@ -11271,6 +11366,19 @@ impl SqueezefsFilesystem {
             // Multi-block reads flush dirty active blocks first (async).
             return (IpcReadProbe::Miss, meta);
         }
+        // KD-OV-13 live (B4c-i): a live device-overlay record owns the
+        // block's newest bytes and this sync path cannot run the §5.2
+        // compose — DEMOTE (the handoff's handler runs compose-first).
+        // The fresh shape was structurally safe (no durable mapping ⇒
+        // no tier key); the OVERWRITE population is not: the map still
+        // names the OLD key, whose hot/hold/read-cache entries are the
+        // R1 stale-serve class. One relaxed gauge load on overlay-free
+        // mounts (the ipc_direct_read_probe screen's twin).
+        if crate::device_overlay::any_open_fast()
+            && self.device_overlays.get(ino, start_block as u32).is_some()
+        {
+            return (IpcReadProbe::Miss, meta);
+        }
         let cache_key = crate::keys::active_block_stack(ino, start_block);
         let Some(buf) = self.active_block_buffers.get(cache_key.as_str()) else {
             // No active buffer: try the SYNC tier serves (staging mmap
@@ -12436,6 +12544,25 @@ impl SqueezefsFilesystem {
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(false);
         }
+        // Clause 8 (B4c-i, design-overlay-overwrite §5.5): a live
+        // DEVICE-overlay record on the block ⇒ decline. Its dest owns
+        // the newest covered bytes and the eventual remap publish would
+        // discard an in-place patch of the OLD offset — the silent
+        // lost-update shape, reachable only on the overwrite population
+        // (fresh blocks are `patch_ineligible_unmapped`). Both paths run
+        // under the same `BLOCK_FLUSH_LOCKS` guard, so this probe plus
+        // the shared serialization closes R3 with NO new fence
+        // (KD-B4-4). Own ledger bucket — the W2 bucket above must stay
+        // separate (predicate-rot detection depends on the split). The
+        // declined write falls through the handler ladder: the
+        // one-authority screen settles the overlay and accumulation
+        // proceeds on the published binding.
+        if crate::device_overlay::any_open_fast() && self.device_overlays.get(ino, b).is_some() {
+            METRICS
+                .patch_ineligible_device_overlay
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        }
         // Predicate 3 — passthrough only (a compressed/encrypted image
         // cannot be patched in place).
         if !self.router.get_crypto().is_passthrough() {
@@ -13465,10 +13592,19 @@ impl SqueezefsFilesystem {
         }
         self.await_overlay_inflight(&rec).await;
 
-        // §6.2 step 3 — seed gaps to a WHOLE block (zeros: the B2 shape
-        // has no old binding). A fully-covered overlay pays nothing.
+        // §6.2 step 3 — seed gaps to a WHOLE block. Fresh/hole records
+        // seed ZEROS (law 5: the shape's complement is zeros by
+        // definition); overwrite records seed from the CAPTURED OLD
+        // BINDING (§5.8 — the one copy a partial overwrite pays, off
+        // the ACK path, through the same decorated-safe funnel the
+        // compose uses; counted in its own family, NEVER the write-path
+        // seed tripwire). A fully-covered overlay pays nothing.
         let gaps = rec.core.gaps();
         let app_complete = gaps.is_empty();
+        let old_image = match (gaps.is_empty(), rec.core.old_binding()) {
+            (false, Some(old_key)) => Some(self.router.read_nvme_block(old_key).await?),
+            _ => None,
+        };
         for &(gs, ge) in &gaps {
             let glen = (ge - gs) as usize;
             let mut buf = crate::cache::pool::BUFFER_POOL.alloc();
@@ -13476,6 +13612,19 @@ impl SqueezefsFilesystem {
                 buf.resize(glen, 0);
             }
             buf.backing_mut()[..glen].fill(0);
+            if let Some(old) = &old_image {
+                // The old image may be SHORTER than the block (a
+                // decorated/promoted-staged stored image): bytes beyond
+                // it were holes — they stay zeros.
+                let lo = (gs as usize).min(old.len());
+                let hi = (ge as usize).min(old.len());
+                if lo < hi {
+                    buf.backing_mut()[..hi - lo].copy_from_slice(&old[lo..hi]);
+                }
+                METRICS
+                    .overlay_gap_seed_old_bytes
+                    .fetch_add(glen as u64, Ordering::Relaxed);
+            }
             buf.set_written_len(glen);
             rec.device
                 .write_block(rec.dest_offset + gs as u64, buf.into_bytes())
@@ -13571,17 +13720,30 @@ impl SqueezefsFilesystem {
         }
 
         // ---- §5.4's durable-merge arm: fresh records and the
-        // shadow-off degenerate.
+        // shadow-off degenerate. The op carries the KD-B4-11
+        // self-publish provenance marker: the record is still FROZEN and
+        // REGISTERED while its own merge runs (retiring it first opens
+        // the record-gone-⇒-published generic/209 window), so the §5.7
+        // hook must be told this is the settle's own publish — an
+        // unexempted hook would fire on every healthy overlay publish
+        // and its containment would free the dest this merge just
+        // published (the belt manufacturing KD-1.11).
+        let marker = crate::routing::OverlaySelfPublish {
+            block: b,
+            dest_offset: rec.dest_offset,
+            birth: rec.core.birth(),
+        };
         let mut token = self.dlm.get_fencing_token_ino(ino).max(rec.fence_token);
         let displaced = loop {
             match self
                 .router
-                .merge_block_mappings_coalesced(
+                .merge_block_mappings_coalesced_marked(
                     ino,
                     vec![(b, new_key.clone())],
                     min_size,
                     crate::routing::LayoutFlip::ToStripedKeepStagedIdentity,
                     token,
+                    Some(marker),
                 )
                 .await
             {
@@ -13950,6 +14112,11 @@ impl SqueezefsFilesystem {
                 return None;
             }
             let mut out = vec![0u8; take];
+            // Covered runs DMA from the dest; the complement (the gap
+            // ranges within [rel, rel+take)) is collected as we walk —
+            // runs come back coalesced and ascending.
+            let mut gap_ranges: Vec<(usize, usize)> = Vec::new();
+            let mut cursor = rel;
             for (ps, pc) in rec.core.covered_runs(first_page, pages) {
                 let run_lo = ps * crate::overlay_core::OVERLAY_PAGE;
                 let run_hi = ((ps + pc) * crate::overlay_core::OVERLAY_PAGE).min(blk);
@@ -13958,6 +14125,10 @@ impl SqueezefsFilesystem {
                 if from >= to {
                     continue;
                 }
+                if from > cursor {
+                    gap_ranges.push((cursor, from));
+                }
+                cursor = cursor.max(to);
                 let n = to - from;
                 match rec
                     .device
@@ -13976,11 +14147,50 @@ impl SqueezefsFilesystem {
                     Err(e) => return Some(Err(e)),
                 }
             }
+            if cursor < rel + take {
+                gap_ranges.push((cursor, rel + take));
+            }
+            // §5.6(1) (B4c-i): overwrite records serve gaps from the
+            // CAPTURED old binding through the decorated-safe fetch
+            // funnel — identity-stable for the record's life (the §5.1
+            // one-section capture + the §5.7 hook), so no revalidation
+            // word of its own; the §5.2 generation/inflight loop below
+            // covers the dest⊕old composition as one snapshot. Fresh
+            // records keep zeros (law 5). A gap-fetch failure DECLINES
+            // to the drain path (never EIO for legal churn — the
+            // ordinary read ladder owns the rebind machinery).
+            let mut gap_bytes = 0u64;
+            if !gap_ranges.is_empty() {
+                if let Some(old_key) = rec.core.old_binding() {
+                    let old = match self.router.read_nvme_block(old_key).await {
+                        Ok(o) => o,
+                        Err(_) => return None,
+                    };
+                    for &(lo, hi) in &gap_ranges {
+                        // Bytes beyond a short old image (decorated /
+                        // promoted-staged) were holes: they stay zeros.
+                        let s = lo.min(old.len());
+                        let e = hi.min(old.len());
+                        if s < e {
+                            out[lo - rel..lo - rel + (e - s)].copy_from_slice(&old[s..e]);
+                        }
+                        gap_bytes += (hi - lo) as u64;
+                    }
+                }
+            }
             if rec.core.read_valid(snap) && !rec.core.range_inflight(first_page, pages) {
                 METRICS.overlay_read_serves.fetch_add(1, Ordering::Relaxed);
                 METRICS
                     .overlay_read_serve_bytes
                     .fetch_add(take as u64, Ordering::Relaxed);
+                if gap_bytes > 0 {
+                    METRICS
+                        .overlay_read_gap_serves
+                        .fetch_add(1, Ordering::Relaxed);
+                    METRICS
+                        .overlay_read_gap_bytes
+                        .fetch_add(gap_bytes, Ordering::Relaxed);
+                }
                 return Some(Ok(out));
             }
         }

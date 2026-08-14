@@ -64,6 +64,30 @@ checks and parks under one lock) — only the rwlock/mutex core had the split.
 **rand-4k write, 32 threads × separate files, psync** (regression check): F 70.4k/68.8k vs
 A 68.7k/68.2k, p99 1811/1942 vs 1926/1909 — par-to-ahead, tick_delta 0 across the board.
 
+## Follow-on: the fleet-residue recount (same day, governing il rows)
+
+Doctrine (user, 2026-08-13): **IOPS verdicts govern on the IL shim; throughput on the kernel
+zero-copy path.** The fleet attribution ledger (32×8 il randwrite, OP_PROFILE window + iostat)
+split fio clat 2415 µs into 77 ingress + 1040 weighted-server + **~1300 µs client residue**,
+with the device at 79/256 concurrency — the residue, not the device, was the wall.
+
+* **`REAP_EVENT_PARK_MAX` 2 → 24 (shipped default retune, commit `047783a0`)**: the
+  2026-07-28 wake herd that priced 24 out predates the r2 batch-wake threshold; re-counted
+  with no losing shape (write 32×8 +12–14 %, 16×16 +7 %, 32×32 wash, qd1 RTT preserved, reads
+  +1.4–2.8 %). KD-7 lesson re-learned: a dirty-stamped shim against a clean daemon runs
+  PASSTHROUGH — the engagement columns caught it (`ipc_w_delta=0`), rows discarded.
+* Post-retune ledger: 143k IOPS, residue 1298 → **759 µs**, device concurrency 79 → 110,
+  dd admit 315 µs (svc-thread intra-pass queueing, not CPU — see below).
+* **Width re-sweep FALSIFIED (again)**: lanes 8/12/16/24 → 126/136/132/129k — the derived
+  `3×cpus/8` (= 12 here) is still the interior optimum on the fixed binary; the 2026-08-06
+  slope stands unchanged (user law re-affirmed: tuning lands as derivations of cores/memory,
+  never box constants).
+* Scout losers (single legs, not counted): `REAP_QUANTUM_US=10` −13 %, `IPC_SPIN_US=50` −24 %.
+
+Open next: the remaining 759 µs client residue + the 315 µs dd admit queueing term
+(dequeue → slab insert on the svc thread) — together they hold ~146 of the offered 256
+in-flights off the device.
+
 ## Standing consequences
 
 - `lock_ticked_reregisters` is restored to its design meaning: **0 on healthy schedules**.

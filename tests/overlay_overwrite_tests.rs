@@ -103,20 +103,33 @@ struct H {
     fs: Arc<SqueezefsFilesystem>,
     routed: Arc<squeezefs::meta_backend::RoutedMetaBackend>,
     req: Request,
-    _backing: NamedTempFile,
-    _m: NamedTempFile,
+    backing: NamedTempFile,
+    m: NamedTempFile,
     staging_path: std::path::PathBuf,
     _s: tempfile::TempDir,
 }
 
 async fn make_harness_capped(test_id: &str, capacity_blocks: Option<u64>) -> H {
-    std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", FBS.to_string());
     let backing = NamedTempFile::new().unwrap();
     std::fs::File::create(backing.path())
         .unwrap()
         .set_len(256 * 1024 * 1024)
         .unwrap();
     let m = NamedTempFile::new().unwrap();
+    make_harness_on(test_id, backing, m, true, capacity_blocks).await
+}
+
+/// The remount-capable constructor (the rewrite_shadow_tests kill-9
+/// pattern): `format = false` re-opens EXISTING volumes and runs the
+/// recovery walk — the crash-matrix session-2 shape.
+async fn make_harness_on(
+    test_id: &str,
+    backing: NamedTempFile,
+    m: NamedTempFile,
+    format: bool,
+    capacity_blocks: Option<u64>,
+) -> H {
+    std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", FBS.to_string());
     let dlm = DlmClient::new().unwrap();
     let nvme = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(
         backing.path().to_str().unwrap(),
@@ -142,25 +155,36 @@ async fn make_harness_capped(test_id: &str, capacity_blocks: Option<u64>) -> H {
     let router = DataRouter::new(dlm.clone(), cache, ba.clone(), nvme);
     let mut fs = SqueezefsFilesystem::new(router, dlm, 1000, 1000);
 
-    squeezefs::meta_backend::kv::builder::format_v3(
-        m.path(),
-        128 * 1024 * 1024,
-        &squeezefs::meta_backend::kv::builder::FormatV3Options {
-            node_size: squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE,
-            journal_len_override: None,
-            force: true,
-            full_wipe: false,
-            format_config_xattr: None,
-        },
-    )
-    .await
-    .expect("format v3 meta volume");
+    if format {
+        squeezefs::meta_backend::kv::builder::format_v3(
+            m.path(),
+            128 * 1024 * 1024,
+            &squeezefs::meta_backend::kv::builder::FormatV3Options {
+                node_size: squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE,
+                journal_len_override: None,
+                force: true,
+                full_wipe: false,
+                format_config_xattr: None,
+            },
+        )
+        .await
+        .expect("format v3 meta volume");
+    }
     let kv = squeezefs::meta_backend::kv::backend::KvMetaBackend::open(m.path())
         .await
         .expect("open v3 meta volume");
     let routed = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![kv]));
     fs.router.set_meta_backend(routed.clone());
     fs.meta_backend = Some(routed.clone());
+    if !format {
+        // Remount shape: rebuild the allocator population from durable
+        // maps (the recovery walk — what reclaims unpublished dests).
+        for kv in &routed.volumes {
+            ba.recover_active_blocks_v3(kv, &fs.router.backend_router)
+                .await
+                .expect("allocator recovery");
+        }
+    }
 
     let req = Request {
         unique: 1,
@@ -173,8 +197,8 @@ async fn make_harness_capped(test_id: &str, capacity_blocks: Option<u64>) -> H {
         fs: Arc::new(fs),
         routed,
         req,
-        _backing: backing,
-        _m: m,
+        backing,
+        m,
         staging_path,
         _s: s,
     }
@@ -1610,4 +1634,686 @@ async fn compose_vs_close_storm_with_hot_reclaim() {
             r.await.expect("reader task");
         }
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// PR B4c-ii — the overwrite arm LIVE (design-overlay-overwrite rev 4
+// §5.1 the ONE-3.5-section capture+install, §5.3 the two-half crash
+// matrix, KD-B4-8/9). Red-first: this section references
+// `SQUEEZEFS_OVERLAY_OVERWRITE` / `SQUEEZEFS_OVERLAY_CLOSE_BARRIER`
+// (registry + tri-state readers + test pins), the §5.1/§11 counters
+// (`overlay_overwrite_installs/_bytes`, `overlay_ineligible_shadow_bound`,
+// `overlay_enospc_declines`) and the capture-stall seam — none exist
+// until B4c-ii lands. The kill-9 half pins OW-1..OW-7 EXACTLY; kill-9
+// greens never adjudicate OW-8 (§5.3) — OW-8 is the TEST-1 power-cut
+// pin plus its OQ-5 green twin.
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Bounded condition wait (the overlay_ack_early_tests helper): the
+/// detached publish/feed is asynchronous by design.
+async fn eventually(mut f: impl FnMut() -> bool, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !f() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "eventually timed out: {what}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+/// The live-arm posture: overlay ON (Bytes vehicle for in-process
+/// writes), the OVERWRITE lever ON, ACK-after-CQE (deterministic
+/// coverage), patch OFF (whole-segment shapes stay on the overlay).
+fn live_levers() -> LeverGuard {
+    let g = levers(true);
+    squeezefs::device_overlay::set_device_overlay_for_tests(true, true);
+    squeezefs::device_overlay::set_overlay_overwrite_for_tests(true);
+    g
+}
+
+fn ow_installs() -> u64 {
+    m64(&METRICS.overlay_overwrite_installs)
+}
+fn ow_bytes() -> u64 {
+    m64(&METRICS.overlay_overwrite_bytes)
+}
+
+// ---------------------------------------------------------------------------
+// Knob registry drift pins (ENG-10) + the A/B gate restored.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overwrite_knob_registry_defaults() {
+    let _g = serial().await;
+    assert_eq!(
+        squeezefs::env_knobs::lookup("SQUEEZEFS_OVERLAY_OVERWRITE")
+            .expect("registered (ENG-10)")
+            .default,
+        "on",
+        "KD-B4-9: the overwrite arm ships default ON (efficiency doctrine)"
+    );
+    assert_eq!(
+        squeezefs::env_knobs::lookup("SQUEEZEFS_OVERLAY_CLOSE_BARRIER")
+            .expect("registered (ENG-10)")
+            .default,
+        "off",
+        "OQ-5: the barrier-before-close lever is deliberately NOT taken \
+         by default (the DUR-2 class ships in the rewrite program's own \
+         non-fsync closes — B4d prices it)"
+    );
+}
+
+/// The engagement face + the A/B gate: an aligned whole-block overwrite
+/// of a mapped striped block rides the overlay (installs/bytes counted,
+/// the feed follows, zero accumulation write-through); the lever OFF
+/// restores the B2 fresh-only gate verbatim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_mapped_overwrite_rides_the_overlay_end_to_end() {
+    let _g = serial().await;
+    let _l = live_levers();
+    let h = make_harness("b4c2_live").await;
+    let old = pattern((2 * FBS) as usize, 70).to_vec();
+    let ino = striped_fixture_with(&h, "f1", &old).await;
+    let map_a = ram_block_map(&h, ino).await;
+
+    let (i0, b0, fe0, wt0, t0) = (
+        ow_installs(),
+        ow_bytes(),
+        feeds(),
+        m64(&METRICS.write_through_blocks),
+        trips(),
+    );
+    let v = vec![0x71u8; FBS as usize];
+    write_at(&h, ino, 0, &v).await;
+    eventually(
+        || ow_installs() > i0 && feeds() > fe0,
+        "the live overwrite must install an overwrite record and feed \
+         the epoch (detached publish)",
+    )
+    .await;
+    assert_eq!(
+        ow_bytes() - b0,
+        FBS,
+        "overlay_overwrite_bytes counts at the store CQE — the \
+         overwrite-arm subset of overlay_store_bytes (KD-B4-10)"
+    );
+    assert_eq!(
+        m64(&METRICS.write_through_blocks) - wt0,
+        0,
+        "the merge-share collapse's micro face: the overwrite block \
+         never rides the accumulation write-through"
+    );
+    assert_eq!(read_at(&h, ino, 0, FBS as usize).await, v, "RYW");
+    fsync(&h, ino).await;
+    let durable = durable_block_map(&h, ino).await;
+    assert_ne!(durable.get(&0), map_a.get(&0), "durably swapped");
+    assert_eq!(durable.get(&1), map_a.get(&1), "block 1 untouched");
+    assert_eq!(read_at(&h, ino, 0, FBS as usize).await, v);
+    assert_eq!(trips() - t0, 0, "no tripwire anywhere on the live path");
+
+    // The A/B gate: lever OFF = the B2 fresh-only gate verbatim.
+    squeezefs::device_overlay::set_overlay_overwrite_for_tests(false);
+    let (i1, wt1) = (ow_installs(), m64(&METRICS.write_through_blocks));
+    let v2 = vec![0x72u8; FBS as usize];
+    write_at(&h, ino, 0, &v2).await;
+    fsync(&h, ino).await;
+    quiesce(&h).await;
+    assert_eq!(
+        ow_installs() - i1,
+        0,
+        "lever OFF: the mapped decline is restored (the B2 gate)"
+    );
+    assert!(
+        m64(&METRICS.write_through_blocks) > wt1,
+        "lever OFF: the overwrite rode accumulation"
+    );
+    assert_eq!(read_at(&h, ino, 0, FBS as usize).await, v2, "byte-exact");
+}
+
+/// §5.1's two named declines: a shadow-BOUND block declines loudly
+/// (`overlay_ineligible_shadow_bound` — the accumulation path's
+/// same-epoch re-rewrite owns that shape, OQ-3) and a `StorageFull`
+/// dest mint DECLINES to accumulation (never errors the write —
+/// KD-B4-8: the parked-A supply is exactly what the epoch's KD-1.7
+/// early-close ladder recycles).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overwrite_install_declines_shadow_bound_and_enospc() {
+    let _g = serial().await;
+    // Leg 1 — shadow-bound: an epoch already binds the block.
+    {
+        let _l = live_levers();
+        let h = make_harness("b4c2_shadowbound").await;
+        let old = pattern((2 * FBS) as usize, 73).to_vec();
+        let ino = striped_fixture_with(&h, "f1", &old).await;
+        // Bind block 0 in an epoch via the ACCUMULATION feed (lever off
+        // for one write).
+        squeezefs::device_overlay::set_overlay_overwrite_for_tests(false);
+        write_at(&h, ino, 0, &vec![0x74u8; FBS as usize]).await;
+        quiesce(&h).await;
+        assert!(open_epochs() > 0, "premise: the epoch binds block 0");
+        squeezefs::device_overlay::set_overlay_overwrite_for_tests(true);
+
+        let (i0, sb0) = (ow_installs(), m64(&METRICS.overlay_ineligible_shadow_bound));
+        let v = vec![0x75u8; FBS as usize];
+        write_at(&h, ino, 0, &v).await;
+        fsync(&h, ino).await;
+        quiesce(&h).await;
+        assert_eq!(
+            ow_installs() - i0,
+            0,
+            "a shadow-bound block must DECLINE the overlay (hazard 1: the \
+             captured old_binding would be an unpublished B key the epoch \
+             already owns)"
+        );
+        assert!(
+            m64(&METRICS.overlay_ineligible_shadow_bound) > sb0,
+            "counted decline (OQ-3's demand instrument)"
+        );
+        assert_eq!(read_at(&h, ino, 0, FBS as usize).await, v, "byte-exact");
+    }
+    // Leg 2 — ENOSPC: capacity 2 blocks, both held by the fixture.
+    {
+        let _l = live_levers();
+        squeezefs::block_reclaim::set_elision_class_all(true);
+        let h = make_harness_capped("b4c2_enospc", Some(2)).await;
+        let old = pattern((2 * FBS) as usize, 76).to_vec();
+        let ino = striped_fixture_with(&h, "f1", &old).await;
+
+        let (e0, i0) = (m64(&METRICS.overlay_enospc_declines), ow_installs());
+        let v = vec![0x77u8; FBS as usize];
+        // The dest mint MUST hit StorageFull (0 free blocks) — the write
+        // still SUCCEEDS through accumulation + the epoch's ENOSPC
+        // early-close ladder (R7).
+        write_at(&h, ino, 0, &v).await;
+        fsync(&h, ino).await;
+        quiesce(&h).await;
+        assert!(
+            m64(&METRICS.overlay_enospc_declines) > e0,
+            "the StorageFull mint must be a COUNTED decline, never an error"
+        );
+        assert_eq!(ow_installs() - i0, 0, "no record installed");
+        assert_eq!(read_at(&h, ino, 0, FBS as usize).await, v, "converged");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §5.1 — the ONE-3.5-section capture+install (the interleave pin).
+// ---------------------------------------------------------------------------
+
+/// A record can never be born with a displaced `old_binding`: the
+/// capture and the install share one `INODE_META_LOCKS` section, so a
+/// foreign durable merge PARKS on the section instead of interleaving
+/// (driven through the capture-stall seam). The parked merge then runs
+/// against the INSTALLED record and takes the §5.7 skip — never the
+/// foreign-merge tripwire, never a stale birth.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn capture_and_install_share_one_meta_section() {
+    let _g = serial().await;
+    let _l = live_levers();
+    let h = Arc::new(make_harness("b4c2_interleave").await);
+    let old = pattern((2 * FBS) as usize, 78).to_vec();
+    let ino = striped_fixture_with(&h, "f1", &old).await;
+    let old_key = ram_block_map(&h, ino)
+        .await
+        .get(&0)
+        .cloned()
+        .expect("mapped");
+
+    // Stall INSIDE the capture+install section (after capture, before
+    // install): 300 ms — the foreign merge below must WAIT it out.
+    squeezefs::fuse_client::set_test_overlay_capture_stall_ms(300);
+    let (t0, sk0) = (trips(), mover_skips());
+
+    let writer = {
+        let h = h.clone();
+        tokio::spawn(async move {
+            // PARTIAL overwrite (the record stays Open afterwards).
+            let seg = vec![0x79u8; PAGE as usize];
+            write_at(&h, ino, 0, &seg).await;
+        })
+    };
+    // Give the writer time to ENTER the stalled section (bounded ramp —
+    // the stall itself is the synchronization window).
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+    // The foreign mover-shape merge: must PARK on the ino's meta section
+    // until the capture+install completes, then SKIP (the §5.7 belt).
+    let merge_t0 = std::time::Instant::now();
+    let entries = [(0u32, old_key.clone(), format!("{old_key}#moved"))];
+    let token = h.fs.dlm().get_fencing_token_ino(ino);
+    let displaced =
+        h.fs.router
+            .merge_block_mappings(
+                ino,
+                squeezefs::routing::BlockMapOp::MergeExpected(&entries),
+                0,
+                squeezefs::routing::LayoutFlip::KeepLayout,
+                token,
+            )
+            .await
+            .expect("foreign merge");
+    let waited = merge_t0.elapsed();
+    squeezefs::fuse_client::set_test_overlay_capture_stall_ms(0);
+    writer.await.expect("writer");
+
+    assert!(
+        waited >= std::time::Duration::from_millis(150),
+        "§5.1: the foreign merge must PARK on the ONE capture+install \
+         meta section (waited only {waited:?} — the capture ran outside \
+         the section, the stale-birth window is open)"
+    );
+    assert!(
+        !displaced.iter().any(|d| d == &old_key),
+        "the post-install merge SKIPPED the overlaid index"
+    );
+    assert!(mover_skips() > sk0, "the belt counted the skip");
+    assert_eq!(trips() - t0, 0, "never the foreign-merge tripwire");
+    assert_eq!(
+        ram_block_map(&h, ino).await.get(&0),
+        Some(&old_key),
+        "the map is untouched — the record was born with the CURRENT \
+         binding, not a displaced one"
+    );
+    // The record's capture is current: the gap read serves the OLD image
+    // (a stale birth would read a moved/freed key).
+    let got = read_at(&h, ino, 0, FBS as usize).await;
+    assert!(got[..PAGE as usize].iter().all(|&x| x == 0x79));
+    assert_eq!(&got[PAGE as usize..], &old[PAGE as usize..FBS as usize]);
+    fsync(&h, ino).await;
+}
+
+// ---------------------------------------------------------------------------
+// The kill-9 crash matrix — OW-1..OW-7 (§5.3 first half; OW-4 is the
+// v3 torn-entry law, pinned by the KV suites — detected-and-ignored ≡
+// OW-1 — and stated here rather than re-pinned).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kill9_crash_matrix_ow1_to_ow7() {
+    let _g = serial().await;
+    let _l = live_levers();
+    squeezefs::block_reclaim::set_elision_class_all(false);
+
+    // Each case: session 1 shapes the crash point, DROP (kill-9), then
+    // session 2 (remount + recovery walk) asserts the §5.3 outcome and
+    // runs fsck (findings must be 0 — no leak, no double free).
+    for case in ["ow1", "ow2", "ow3", "ow5", "ow6", "ow7"] {
+        let backing = NamedTempFile::new().unwrap();
+        std::fs::File::create(backing.path())
+            .unwrap()
+            .set_len(256 * 1024 * 1024)
+            .unwrap();
+        let m = NamedTempFile::new().unwrap();
+        let old = pattern((2 * FBS) as usize, 80).to_vec();
+        let newv = vec![0x8Cu8; FBS as usize];
+
+        let (ino, expect_block0_new) = {
+            let h = make_harness_on(&format!("b4c2_{case}_s1"), backing, m, true, None).await;
+            let ino = striped_fixture_with(&h, "f1", &old).await;
+            let expect_new = match case {
+                // OW-1: ACKed, record OPEN (partial coverage), DMA'd —
+                // map = old entirely at the crash.
+                "ow1" => {
+                    write_at(&h, ino, 0, &newv[..PAGE as usize]).await;
+                    false
+                }
+                // OW-2: coverage complete, epoch FED, no durable save.
+                "ow2" => {
+                    write_at(&h, ino, 0, &newv).await;
+                    eventually(|| open_epochs() > 0, "the detached feed").await;
+                    false
+                }
+                // OW-3: intermediate save committed mid-epoch — the
+                // persisted new binding is REAL (DMA-complete before the
+                // feed, O1); its displaced old key is durably
+                // unreferenced ⇒ recovery frees it.
+                "ow3" => {
+                    write_at(&h, ino, 0, &newv).await;
+                    eventually(|| open_epochs() > 0, "the detached feed").await;
+                    let token = h.fs.dlm().get_fencing_token_ino(ino);
+                    h.fs.router
+                        .persist_dirty_layout_if_needed(&squeezefs::keys::inode_path(ino), token)
+                        .await
+                        .expect("mid-epoch save");
+                    true
+                }
+                // OW-5: swap durable (fsync close), displaced frees
+                // enqueued but the reclaim may not have run — crash now.
+                "ow5" => {
+                    write_at(&h, ino, 0, &newv).await;
+                    fsync(&h, ino).await;
+                    true
+                }
+                // OW-6: FENCED pre-publish — the close publishes nothing
+                // and frees nothing (W5); successor recovery owns all.
+                "ow6" => {
+                    write_at(&h, ino, 0, &newv).await;
+                    eventually(|| open_epochs() > 0, "the detached feed").await;
+                    let f0 = terminal_frees();
+                    let path = squeezefs::keys::inode_path(ino);
+                    let stale = squeezefs::dlm::test_bump_fencing_generation(&path) - 1;
+                    let res = h.fs.router.close_rewrite_epoch(ino, stale).await;
+                    assert!(res.is_err(), "a fenced close must refuse loud");
+                    assert_eq!(terminal_frees() - f0, 0, "W5: freed NOTHING");
+                    false
+                }
+                // OW-7: mid-fsync — data barrier done, meta publish not.
+                "ow7" => {
+                    write_at(&h, ino, 0, &newv).await;
+                    eventually(|| open_epochs() > 0, "the detached feed").await;
+                    h.fs.router
+                        .backend_router
+                        .flush_data_devices()
+                        .await
+                        .expect("data barrier");
+                    false
+                }
+                _ => unreachable!(),
+            };
+            quiesce(&h).await;
+            // KILL-9: drop the daemon with whatever state the case left.
+            let H { fs, backing, m, .. } = h;
+            drop(fs);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // Session 2 — remount over the SAME volumes.
+            let h2 = make_harness_on(&format!("b4c2_{case}_s2"), backing, m, false, None).await;
+            let got = read_at(&h2, ino, 0, FBS as usize).await;
+            if expect_new {
+                assert_eq!(
+                    got, newv,
+                    "{case}: a persisted binding is REAL (DMA-complete \
+                     before any feed — O1)"
+                );
+            } else {
+                assert_eq!(
+                    &got[..],
+                    &old[..FBS as usize],
+                    "{case}: the OLD image survives byte-intact (never \
+                     torn — nothing ever wrote the old offset, KD-B4-2)"
+                );
+            }
+            assert_eq!(
+                &read_at(&h2, ino, FBS, FBS as usize).await[..],
+                &old[FBS as usize..],
+                "{case}: block 1 untouched"
+            );
+            // No leak, no double free: exactly the referenced blocks are
+            // allocated (the dest was reclaimed by the census unless a
+            // durable save named it).
+            assert_eq!(
+                h2.fs.router.block_allocator.get_used_blocks(),
+                2,
+                "{case}: recovery census — referenced blocks only \
+                 (unpublished dests free-listed, displaced olds freed \
+                 exactly once)"
+            );
+            // The volume stays fully writable + fsck-clean.
+            let report = run_fsck(&fsck_ctx(&h2), &online_opts())
+                .await
+                .expect("fsck");
+            assert!(
+                report.findings.is_empty(),
+                "{case}: fsck findings must be 0 across the matrix: {:?}",
+                report.findings
+            );
+            (ino, expect_new)
+        };
+        let _ = (ino, expect_block0_new);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OW-8 (§5.3 second half — POWER LOSS, the TEST-1 harness): kill-9
+// greens never adjudicate this window.
+// ---------------------------------------------------------------------------
+
+/// The disclosure pin: an UNBARRIERED coverage-close of an overlay-fed
+/// epoch on a volatile-cache device loses the dest bytes on power loss
+/// — the range reads dest residue, exactly as OW-8 states (the DUR-2
+/// class inherited verbatim from the shipped rewrite program). A
+/// documentation pin: any accidental barrier-order change flips it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ow8_window_is_exactly_as_disclosed() {
+    let _g = serial().await;
+    let _l = live_levers();
+    struct CutGuard;
+    impl Drop for CutGuard {
+        fn drop(&mut self) {
+            squeezefs::dev_power_cut::clear_faults();
+        }
+    }
+    let _cut = CutGuard;
+    let h = make_harness("b4c2_ow8").await;
+    let old = pattern((2 * FBS) as usize, 90).to_vec();
+    let ino = striped_fixture_with(&h, "f1", &old).await;
+
+    // Arm the DATA device only (meta rides its own file). The fixture is
+    // already barriered (fsync above).
+    let data_path = h.backing.path().to_path_buf();
+    squeezefs::dev_power_cut::arm_power_cut(&data_path);
+
+    // Whole-FILE overwrite: the second feed completes epoch coverage —
+    // the detached publisher's close fires (KD-1.6), UNBARRIERED with
+    // the OQ-5 lever off (the shipped default).
+    let s0 = swaps();
+    let newv = pattern((2 * FBS) as usize, 91).to_vec();
+    write_at(&h, ino, 0, &newv[..FBS as usize]).await;
+    write_at(&h, ino, FBS, &newv[FBS as usize..]).await;
+    eventually(
+        || swaps() > s0,
+        "the coverage-triggered close must fire (unbarriered)",
+    )
+    .await;
+    quiesce(&h).await;
+
+    // POWER LOSS: revert everything un-barriered on the data device,
+    // then remount.
+    let reverted = squeezefs::dev_power_cut::power_cut(&data_path);
+    assert!(reverted > 0, "premise: the dest bytes were volatile");
+    squeezefs::dev_power_cut::clear_faults();
+    let H { fs, backing, m, .. } = h;
+    drop(fs);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let h2 = make_harness_on("b4c2_ow8_s2", backing, m, false, None).await;
+    let got = read_at(&h2, ino, 0, (2 * FBS) as usize).await;
+    assert_ne!(
+        got, newv,
+        "OW-8: the range must NOT read the new bytes (the map durably \
+         names a dest whose bytes never left the volatile cache)"
+    );
+    assert_ne!(
+        got, old,
+        "OW-8: nor the old image (its key is durably unreferenced) — \
+         dest residue, exactly the documented DUR-2 disclosure"
+    );
+}
+
+/// The OQ-5 GREEN TWIN (lands with the disclosure pin so B4d's pricing
+/// leg arrives with its correctness half written): the same sequence
+/// behind `SQUEEZEFS_OVERLAY_CLOSE_BARRIER=1` barriers the data device
+/// BEFORE the coverage close — the window closes, the range reads the
+/// new bytes through the power cut.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn oq5_barrier_before_close_closes_the_ow8_window() {
+    let _g = serial().await;
+    let _l = live_levers();
+    squeezefs::device_overlay::set_overlay_close_barrier_for_tests(true);
+    struct CutGuard;
+    impl Drop for CutGuard {
+        fn drop(&mut self) {
+            squeezefs::dev_power_cut::clear_faults();
+        }
+    }
+    let _cut = CutGuard;
+    let h = make_harness("b4c2_oq5").await;
+    let old = pattern((2 * FBS) as usize, 92).to_vec();
+    let ino = striped_fixture_with(&h, "f1", &old).await;
+    let data_path = h.backing.path().to_path_buf();
+    squeezefs::dev_power_cut::arm_power_cut(&data_path);
+
+    let s0 = swaps();
+    let newv = pattern((2 * FBS) as usize, 93).to_vec();
+    write_at(&h, ino, 0, &newv[..FBS as usize]).await;
+    write_at(&h, ino, FBS, &newv[FBS as usize..]).await;
+    eventually(|| swaps() > s0, "the coverage close (barriered)").await;
+    quiesce(&h).await;
+
+    let _ = squeezefs::dev_power_cut::power_cut(&data_path);
+    squeezefs::dev_power_cut::clear_faults();
+    let H { fs, backing, m, .. } = h;
+    drop(fs);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let h2 = make_harness_on("b4c2_oq5_s2", backing, m, false, None).await;
+    assert_eq!(
+        read_at(&h2, ino, 0, (2 * FBS) as usize).await,
+        newv,
+        "OQ-5 twin: the barrier-before-close lever must close the OW-8 \
+         window (the new bytes survive the power cut)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// R1's B4c-ii gate: the generic/209 storm + serialized discriminator +
+// the generic/551 sibling shape, with overwrite overlays ENGAGED.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gen209_storm_with_overwrite_overlays_engaged() {
+    let _g = serial().await;
+    let _l = live_levers();
+    let h = Arc::new(make_harness("b4c2_209").await);
+    let ino = striped_fixture_with(&h, "f1", &pattern((2 * FBS) as usize, 94)).await;
+
+    const FILE: u64 = 2 * FBS;
+    const PASSES: u8 = 8;
+    let i0 = ow_installs();
+
+    let (tx, rx) = tokio::sync::watch::channel((0u8, FILE));
+    let writer = {
+        let h = h.clone();
+        tokio::spawn(async move {
+            for pass in 1..=PASSES {
+                let _ = tx.send((pass, 0));
+                let buf = vec![pass; PAGE as usize];
+                for off in (0..FILE).step_by(PAGE as usize) {
+                    write_at(&h, ino, off, &buf).await;
+                    let _ = tx.send((pass, off + PAGE));
+                    if (off / PAGE) % 4 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }
+            drop(tx);
+        })
+    };
+    let reader = {
+        let h = h.clone();
+        let mut rx = rx.clone();
+        tokio::spawn(async move {
+            loop {
+                let (pass, end) = *rx.borrow_and_update();
+                if pass >= 1 && end >= PAGE {
+                    let off = ((end - PAGE) / PAGE) * PAGE;
+                    let got = read_at(&h, ino, off, PAGE as usize).await;
+                    let (cur_pass, cur_end) = *rx.borrow();
+                    if cur_pass == pass {
+                        for (i, &b) in got.iter().enumerate() {
+                            let pos = off + i as u64;
+                            assert!(
+                                !(pos < cur_end.min(end) && b < pass),
+                                "READER FOUND OLD BYTE {b} at {pos} (pass \
+                                 {pass}) — generic/209 with overwrite \
+                                 overlays engaged"
+                            );
+                        }
+                    }
+                }
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        })
+    };
+    writer.await.unwrap();
+    reader.await.unwrap();
+    assert!(
+        ow_installs() > i0,
+        "engagement: the storm must have minted overwrite overlays"
+    );
+    fsync(&h, ino).await;
+    let fin = read_at(&h, ino, 0, FILE as usize).await;
+    assert!(fin.iter().all(|&b| b == PASSES), "post-storm exact");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serialized_overwrite_discriminator_with_overlays() {
+    let _g = serial().await;
+    let _l = live_levers();
+    let h = make_harness("b4c2_209det").await;
+    let ino = striped_fixture_with(&h, "f1", &pattern((2 * FBS) as usize, 95)).await;
+    // Page-by-page value 1 across both blocks, verifying after EVERY
+    // write that all previously written pages still read 1 (a stale
+    // seed source reverts a neighbor — the write-path bug class).
+    for p in 0..(2 * FBS / PAGE) {
+        write_at(&h, ino, p * PAGE, &vec![1u8; PAGE as usize]).await;
+        let got = read_at(&h, ino, 0, ((p + 1) * PAGE) as usize).await;
+        assert!(
+            got.iter().all(|&b| b == 1),
+            "a SERIALIZED overwrite reverted a neighbor after page {p} — \
+             write-path seed-source bug (generic/209 discriminator)"
+        );
+    }
+    fsync(&h, ino).await;
+}
+
+/// generic/551, the MAPPED population (the ack_early suite pins the
+/// fresh-block shape): a single-block sibling rides the OVERWRITE
+/// overlay; the straddler's slice settles it (one-authority screen) and
+/// classifies its seed off a STALE size snapshot — the sibling's
+/// published bytes must survive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sibling_aio_551_shape_on_the_mapped_population() {
+    let _g = serial().await;
+    let _l = live_levers();
+    let h = make_harness("b4c2_551").await;
+    let old = pattern((3 * FBS) as usize, 96).to_vec();
+    let ino = striped_fixture_with(&h, "f1", &old).await;
+
+    // Sibling A: aligned PAGE at block 1 rel PAGE — the overwrite
+    // overlay owns the MAPPED block.
+    let a = vec![0x5Au8; PAGE as usize];
+    let i0 = ow_installs();
+    write_at(&h, ino, FBS + PAGE, &a).await;
+    assert!(ow_installs() > i0, "A must ride the overwrite overlay");
+
+    // Straddler B (blocks 0→1) presented with the STALE snapshot.
+    let token = h.fs.dlm().get_fencing_token_ino(ino);
+    h.fs.write_file_staged(
+        ino,
+        FBS - PAGE,
+        bytes::Bytes::from(vec![0x5Bu8; 2 * PAGE as usize]),
+        3 * FBS, // the stale request-entry snapshot
+        token,
+    )
+    .await
+    .expect("straddler B");
+
+    let back = read_at(&h, ino, FBS + PAGE, PAGE as usize).await;
+    assert_eq!(back, a, "A's published overlay bytes survive (551)");
+    // The block's UNTOUCHED ranges keep the old image (the overwrite
+    // edition's twist: the complement is the OLD binding, never zeros).
+    assert_eq!(
+        &read_at(&h, ino, FBS + 2 * PAGE, PAGE as usize).await[..],
+        &old[(FBS + 2 * PAGE) as usize..(FBS + 3 * PAGE) as usize],
+        "the old image survives at the coverage complement"
+    );
+    fsync(&h, ino).await;
+    assert_eq!(
+        read_at(&h, ino, FBS + PAGE, PAGE as usize).await,
+        a,
+        "durable"
+    );
+    let bband = read_at(&h, ino, FBS - PAGE, 2 * PAGE as usize).await;
+    assert_eq!(bband, vec![0x5Bu8; 2 * PAGE as usize], "B's bytes intact");
 }

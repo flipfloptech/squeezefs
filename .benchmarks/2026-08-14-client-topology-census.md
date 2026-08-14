@@ -78,3 +78,35 @@ demands) and on latency shapes (qd1 hard gate). The +6.7 % counted ceiling at 32
 acceptance bar; the remaining topology gap (185k → 257k by client count) past that term is
 dominated by client-side worker park/wake cycles (fio's own threads — not ours) and the
 migration churn the scheduler chooses (counted, but every static override loses).
+
+## The governor rounds (same day — built, iterated, adjudicated default OFF)
+
+`src/spin_governor.rs` + wiring (`SQUEEZEFS_IPC_SPIN_ADAPTIVE`, instruments
+`ipc_spin_{window_us,absorbed_parks,disengaged_busy}`). Three counted iterations, each a
+falsification honestly kept in the code docs:
+
+1. **2×EWMA sizing — falsified**: fan-in parks are micro (µs), so the proportional window
+   derived ~10–20 µs and counted a WASH against its own control. The engaged magnitude became
+   the measured 100 µs plateau constant; regime membership stays derived.
+2. **2× headroom margin — falsified by its own engagement probe**: `disengaged_busy` = 1.64M
+   of 1.82M park cycles — /proc/stat busy includes the workload's own nvme-tcp softirq, so the
+   25 % ceiling refused the exact venue where the static window won. Re-derived at 1×
+   (busy + lanes/cores ≤ 100 → 63 % here).
+3. **Temporal-only regime test — falsified by the qd1 hard gate**: qd1 parks are RTT-spaced
+   (≈ 44 µs, INSIDE the rail) and the engaged governor cost qd1 **2.5×** (22.7k → 9.0k, p99
+   70 → 157 µs) and 1×32 −13 %. The structural guard landed: **multi-session lanes only**
+   (fan-in interleave is what a spin absorbs; a single session's park is the sync lane's
+   productive RTT wait — the 2026-07-26 protected row).
+
+**Final guarded form, counted (32×8 A-B-B-A ×2 + guards)**: qd1 22.3k/p99 77 µs ✓, 1×32 par ✓,
+fleet parks **−40 %** (1.01–1.14M vs 1.83–1.92M) with absorbed 547–698k — and **IOPS wash**
+(G 180/182/183/186/186/190 vs C 172/177/180/181/184/189 across the day). Decisively: the
+morning's static-100 **+6.7 % did not replicate** across the afternoon (the control band alone
+spans 166–189k — foreign-load variance the user accepted working through).
+
+**Adjudication (the falsified-lever rule): default OFF.** The machinery ships as a field
+measurement lever with live instruments and the three guards (the SQPOLL precedent); the
+park-cycle term is real (parks −40 %, absorbed counts) but is not the fleet wall's dominant
+term on this venue. The topology campaign's honest residual: the 185k→257k client-count gap
+is dominated by client-side effects (fio's own park/wake cadence at qd8/proc — not ours to
+thread) and scheduler-chosen migration churn that every static override made WORSE.

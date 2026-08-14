@@ -117,8 +117,29 @@ const CTL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// the sync lane is a protected row. The multi-session/fleet wins that
 /// ship by default come from the event-driven reap + the epoch-cached
 /// snapshot; libaio-only fleets raise this knob for the rest.
-fn service_spin_window() -> Duration {
+fn service_spin_window() -> Option<Duration> {
     service_spin_window_from(std::env::var("SQUEEZEFS_IPC_SPIN_US").ok().as_deref())
+}
+
+/// One `/proc/stat` aggregate reading for the spin governor's headroom
+/// gauge: `(busy_jiffies, total_jiffies)` over the whole box (busy =
+/// total − idle − iowait). Cadence-gated by the gauge (≤ 10 reads/s
+/// across all lanes); None on any parse surprise (the gauge keeps its
+/// last honest percent).
+fn read_proc_stat_busy() -> Option<(u64, u64)> {
+    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+    let line = stat.lines().next()?;
+    let mut fields = line.split_whitespace();
+    if fields.next()? != "cpu" {
+        return None;
+    }
+    let vals: Vec<u64> = fields.take(8).filter_map(|f| f.parse().ok()).collect();
+    if vals.len() < 5 {
+        return None;
+    }
+    let total: u64 = vals.iter().sum();
+    let idle = vals[3] + vals.get(4).copied().unwrap_or(0);
+    Some((total.saturating_sub(idle), total))
 }
 
 /// The message the daemon logs exactly once when the KD-7 skew gate has
@@ -151,32 +172,38 @@ pub fn allow_dev_lever() -> bool {
 }
 
 /// Pure sizing form (unit-pinned): the 2026-07-26 reap-economy A/B
-/// adjudicated the DEFAULT as 0 (`1508ea9` — every nonzero ambient
-/// window taxed the protected sync lane), but the landed code kept the
-/// sweep side's 30 µs — a doc-code divergence this pin closes.
-fn service_spin_window_from(v: Option<&str>) -> Duration {
-    let us = v
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0)
-        .clamp(0, 10_000);
-    Duration::from_micros(us)
+/// adjudicated the STATIC default as 0 (`1508ea9` — every nonzero
+/// ambient window taxed the protected sync lane). Since the 2026-08-14
+/// client-topology campaign the ABSENT knob means the ADAPTIVE governor
+/// (`crate::spin_governor` — churn-derived window, theft-guarded by the
+/// derived busy ceiling); an EXPLICIT value (including `0`) is the
+/// static window verbatim, governor off (explicit-wins-verbatim, the
+/// ipc-cap law).
+fn service_spin_window_from(v: Option<&str>) -> Option<Duration> {
+    let v = v?;
+    let us = v.trim().parse::<u64>().ok()?.clamp(0, 10_000);
+    Some(Duration::from_micros(us))
 }
 
 #[cfg(test)]
 mod spin_window_tests {
     use super::*;
 
-    /// The adjudicated default (reap-economy note §5–6, commit
-    /// `1508ea9`): **0** — the spin window is an explicit fleet lever,
-    /// never an ambient tax on the sync lane.
+    /// The absent knob routes to the ADAPTIVE governor (2026-08-14
+    /// client-topology campaign); the 2026-07-26 static-0 verdict lives
+    /// on as the governor's theft guard (its busy ceiling), and an
+    /// explicit `0` still pins the static-off posture verbatim.
     #[test]
-    fn spin_window_default_is_zero() {
+    fn spin_window_absent_is_adaptive() {
         assert_eq!(
             service_spin_window_from(None),
-            Duration::ZERO,
-            "the adjudicated SQUEEZEFS_IPC_SPIN_US default is 0 (an explicit \
-             fleet lever, not an ambient tax) — 1508ea9 landed the verdict in \
-             the doc comment but not the code"
+            None,
+            "absent = the adaptive governor path"
+        );
+        assert_eq!(
+            service_spin_window_from(Some("0")),
+            Some(Duration::ZERO),
+            "explicit 0 = static off, verbatim (governor off)"
         );
     }
 
@@ -185,17 +212,19 @@ mod spin_window_tests {
     fn spin_window_explicit_and_clamped() {
         assert_eq!(
             service_spin_window_from(Some("20")),
-            Duration::from_micros(20)
+            Some(Duration::from_micros(20))
         );
         assert_eq!(
             service_spin_window_from(Some("999999")),
-            Duration::from_micros(10_000),
+            Some(Duration::from_micros(10_000)),
             "clamp ceiling"
         );
         assert_eq!(
             service_spin_window_from(Some("garbage")),
-            service_spin_window_from(None),
-            "unparseable falls back to the default"
+            None,
+            "unparseable = announced by the registry gate; the governor \
+             path here (the daemon refuses malformed knobs at startup, so \
+             this arm is unreachable in production)"
         );
     }
 }
@@ -1209,15 +1238,25 @@ pub struct IpcHost {
     svc_spawned: std::sync::atomic::AtomicUsize,
     /// Host epoch for the sessions' `last_active_ms` clocks.
     started: Instant,
-    /// The empty-pass spin window ([`service_spin_window`]) — resolved
-    /// ONCE at [`Self::spawn`], on the caller's thread, so the knob has
-    /// a deterministic read point. Reading the env on each service
+    /// The EXPLICIT empty-pass spin window ([`service_spin_window`],
+    /// None = the adaptive governor) — resolved ONCE at [`Self::spawn`],
+    /// on the caller's thread, so the knob has a deterministic read
+    /// point. Reading the env on each service
     /// thread's first pass raced the spawner (threads spawn lazily at
     /// session admission — ingest-economy 2026-07-28), which is exactly
     /// the race `preload_session_tests::service_thread_stays_hot_…`
     /// kept losing under in-binary contention (set_var → spawn →
     /// remove_var vs the admission-time thread start).
-    spin_window: Duration,
+    spin_static: Option<Duration>,
+    /// Adaptive spin governor state (client-topology campaign,
+    /// 2026-08-14 — `crate::spin_governor` module docs): the shared
+    /// headroom gauge plus the lanes/cores pair its theft ceiling
+    /// derives from. Live only when `spin_static` is None and
+    /// `SQUEEZEFS_IPC_SPIN_ADAPTIVE` (default on) holds.
+    spin_adaptive: bool,
+    spin_headroom: crate::spin_governor::HeadroomGauge,
+    spin_lanes: usize,
+    spin_cores: usize,
     shutting_down: AtomicBool,
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
     /// Live ctl connections (VAL-5b/VAL-5d): incremented in the accept
@@ -1405,7 +1444,11 @@ impl IpcHost {
             owner_loads: Mutex::new(vec![0; service_threads]),
             svc_spawned: std::sync::atomic::AtomicUsize::new(0),
             started: Instant::now(),
-            spin_window: service_spin_window(),
+            spin_static: service_spin_window(),
+            spin_adaptive: crate::env_knobs::bool_knob("SQUEEZEFS_IPC_SPIN_ADAPTIVE", false),
+            spin_headroom: crate::spin_governor::HeadroomGauge::new(),
+            spin_lanes: service_thread_count(),
+            spin_cores: crate::cpu::process_parallelism(),
             shutting_down: AtomicBool::new(false),
             threads: Mutex::new(Vec::new()),
             ctl_live: std::sync::atomic::AtomicUsize::new(0),
@@ -2855,7 +2898,12 @@ impl IpcHost {
                                        // always being first in the collected order.
         let mut rr_start = 0usize;
         let mut last_progress = Instant::now();
-        let spin_window = self.spin_window;
+        // Adaptive spin state (client-topology 2026-08-14): the lane's
+        // own park-duration EWMA is the churn signal; `spin_active`
+        // marks passes inside a live window so an absorbed park (work
+        // arrived before we parked) is countable.
+        let mut ewma_park_ns: u64 = 0;
+        let mut spin_active = false;
         // Reused park snapshot (op-economy): the doorbell-snapshot Vec is
         // cleared+refilled per park, never reallocated — qd1 RTT shapes
         // park once per op, so per-park allocations are per-op costs.
@@ -2890,15 +2938,63 @@ impl IpcHost {
                 crate::fuse_client::ipc_drain_flush_record(t_flush);
                 crate::fuse_client::ipc_drain_pass_record(t_pass);
                 last_progress = Instant::now();
+                if spin_active {
+                    // The spin absorbed what would have been a
+                    // park/wake cycle — the governor's win, counted.
+                    METRICS
+                        .ipc_spin_absorbed_parks
+                        .fetch_add(1, Ordering::Relaxed);
+                    spin_active = false;
+                }
                 continue;
             }
             METRICS
                 .ipc_drain_empty_passes
                 .fetch_add(1, Ordering::Relaxed);
+            // The spin window: explicit knob verbatim, else the adaptive
+            // governor (churn-derived, theft-guarded — module docs on
+            // `crate::spin_governor`). Sessions-empty lanes never spin
+            // (no doorbell to absorb; the park below is the right park).
+            let spin_window = match self.spin_static {
+                Some(w) => w,
+                None if self.spin_adaptive && !sessions.is_empty() => {
+                    let now = crate::mono_core::monotonic_ns_u64();
+                    if self.spin_headroom.should_sample(now) {
+                        if let Some((busy, total)) = read_proc_stat_busy() {
+                            self.spin_headroom.publish(busy, total);
+                        }
+                    }
+                    let w = crate::spin_governor::window(
+                        ewma_park_ns,
+                        self.spin_headroom.busy_pct(),
+                        self.spin_lanes,
+                        self.spin_cores,
+                        sessions.len(),
+                    );
+                    METRICS
+                        .ipc_spin_window_us
+                        .store(w.as_micros() as u64, Ordering::Relaxed);
+                    if w.is_zero()
+                        && sessions.len() >= 2
+                        && ewma_park_ns > 0
+                        && ewma_park_ns <= crate::spin_governor::SPIN_RAIL_US * 1_000
+                    {
+                        // In the churn regime but refused by the busy
+                        // ceiling — the theft guard engaging.
+                        METRICS
+                            .ipc_spin_disengaged_busy
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    w
+                }
+                None => Duration::ZERO,
+            };
             if last_progress.elapsed() < spin_window {
+                spin_active = true;
                 std::hint::spin_loop();
                 continue;
             }
+            spin_active = false;
             // Park (bounded — §5.3.1 rule 5): set every owned session's
             // parked flag, SNAPSHOT every doorbell, re-scan (the
             // disarm→scan law: a submission published before the flag was
@@ -2953,12 +3049,21 @@ impl IpcHost {
                     std::thread::park_timeout(SERVICE_PARK_MAX);
                 } else {
                     METRICS.ipc_service_parks.fetch_add(1, Ordering::Relaxed);
+                    let t_park = Instant::now();
                     futex_wait_many(
                         sessions
                             .iter()
                             .zip(&observed)
                             .map(|(s, o)| (&s.map.header().doorbell, *o)),
                         SERVICE_PARK_MAX,
+                    );
+                    // The governor's churn signal: how long this park
+                    // actually lasted (short = a spin would have
+                    // absorbed it; the SERVICE_PARK_MAX-bounded idle
+                    // park folds in long and disengages the window).
+                    ewma_park_ns = crate::spin_governor::fold_park(
+                        ewma_park_ns,
+                        t_park.elapsed().as_nanos() as u64,
                     );
                 }
             } else {

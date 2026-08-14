@@ -415,7 +415,13 @@ fn documented_defaults_match_the_shipped_ones() {
         ("SQUEEZEFS_RECLAIM_BATCH_BLOCKS", "64"),
         ("SQUEEZEFS_RECLAIM_CAP_PARK_MS", "1000"),
         ("SQUEEZEFS_IPC_IDLE_SECS", "300"),
-        ("SQUEEZEFS_IPC_SPIN_US", "0"),
+        // "0" -> adaptive: the 2026-08-14 client-topology governor
+        // (absent = derived window; explicit values incl. 0 verbatim) —
+        // an intentional counted change, not convention drift.
+        (
+            "SQUEEZEFS_IPC_SPIN_US",
+            "0 (absent; =1 on SQUEEZEFS_IPC_SPIN_ADAPTIVE routes absent to the governor)",
+        ),
         // 2 -> 24: the 2026-08-13 fleet-residue recount (commit 047783a0)
         // — an intentional counted retune, not convention drift.
         ("SQUEEZEFS_IL_REAP_PARK_MAX", "24"),

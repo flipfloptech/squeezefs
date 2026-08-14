@@ -1,7 +1,7 @@
 #![allow(clippy::style, clippy::complexity, clippy::pedantic)]
 // The stats-inode `serde_json::json!` literal exceeds the default macro
 // recursion limit (128) — compile-time only, no runtime effect.
-#![recursion_limit = "2048"]
+#![recursion_limit = "4096"]
 pub mod mem_budget;
 pub mod nt_copy;
 // Session-arena THP helper — canonical file in the squeezefs-ipc tree,
@@ -201,6 +201,7 @@ pub mod sqz_sync;
 /// reference `crate::sqz_time`, which this re-export satisfies in the
 /// root crate (fuse3 owns a real module of the same name).
 pub use squeezefs_ipc::sqz_time;
+pub mod spin_governor;
 pub mod sqz_sync_core;
 pub mod storage;
 pub mod stripe_locks;

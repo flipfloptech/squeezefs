@@ -6002,6 +6002,20 @@ pub struct Metrics {
     /// append-free workload; zero on an APPEND workload means the
     /// exemption regressed and `lseek(SEEK_END)` is reading stale sizes.
     pub ipc_inval_attrs_only: Align64<AtomicU64>,
+    /// Adaptive spin governor (client-topology 2026-08-14,
+    /// `crate::spin_governor`): the most recent churn-derived window,
+    /// µs (0 = disengaged — idle EWMA, busy ceiling, no sessions, or
+    /// the static/off postures). The live engagement gauge.
+    pub ipc_spin_window_us: Align64<AtomicU64>,
+    /// Spin passes that received work before parking — each one is a
+    /// park/wake cycle absorbed (the governor's win; compare against
+    /// `ipc_service_parks`).
+    pub ipc_spin_absorbed_parks: Align64<AtomicU64>,
+    /// Window computations refused by the derived busy ceiling while
+    /// the lane was in the churn regime — the 2026-07-26 theft guard
+    /// ENGAGING (growth under saturation is the guard working; growth
+    /// on an idle box is a headroom-sampling bug).
+    pub ipc_spin_disengaged_busy: Align64<AtomicU64>,
     /// Completion-doorbell wakes PAID (op-economy 2026-07-28, the
     /// `transport_wake_*` naming discipline): a completion observed a
     /// parked reaper and issued the cqe `FUTEX_WAKE`. Sparse-regime
@@ -9346,6 +9360,9 @@ impl SqueezefsFilesystem {
                 "ipc_inval_notifies": METRICS.ipc_inval_notifies.load(Ordering::Relaxed),
                 "ipc_inval_suppressed": METRICS.ipc_inval_suppressed.load(Ordering::Relaxed),
                 "ipc_inval_attrs_only": METRICS.ipc_inval_attrs_only.load(Ordering::Relaxed),
+                "ipc_spin_window_us": METRICS.ipc_spin_window_us.load(Ordering::Relaxed),
+                "ipc_spin_absorbed_parks": METRICS.ipc_spin_absorbed_parks.load(Ordering::Relaxed),
+                "ipc_spin_disengaged_busy": METRICS.ipc_spin_disengaged_busy.load(Ordering::Relaxed),
                 "ipc_cqe_wake_writes": METRICS.ipc_cqe_wake_writes.load(Ordering::Relaxed),
                 "ipc_cqe_wake_elided": METRICS.ipc_cqe_wake_elided.load(Ordering::Relaxed),
                 "ipc_cqe_wake_collapsed": METRICS.ipc_cqe_wake_collapsed.load(Ordering::Relaxed),

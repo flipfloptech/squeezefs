@@ -77,32 +77,35 @@
 #                 pause/--vm land with rung 6b (qemu members); partition/
 #                 netem/--netns land with rung 7 (the netem venue)
 #
-# RUNG-6 FINDING #2 (2026-08-15, this rig's smoke leg — reported, NOT
-# silently worked around): on a MULTI-meta-volume set, a LIVE S5 reader
-# never converges on content the writer creates AFTER the reader mounts —
-# readdir lists the new dentry (one volume's tree) while lookup/getattr of
-# the child ENOENTs FOREVER (`d?????????` in ls -la), minutes past the
-# published 2 s staleness bound, with revalidation epochs advancing, nodes
-# dropping and `dirty_skips == 0`. A FRESH reader mounted after the write
-# resolves the same records instantly (byte-identical sha256), so the
-# durable state and routing are fine: the live reader's inode-plane view is
-# what stays frozen. Discriminated on this box: MDS_COUNT=1 converges in
-# 2.0 s (green); MDS_COUNT=2 never converges. The rig therefore DEFAULTS to
-# one metadata volume until the product fix + its red-first cargo repro
-# land (the repro-port mandate); `SQZ_MWFLEET_MDS_COUNT=2` + the smoke leg
-# is the live repro meanwhile. Related face, guarded separately (see
-# mount_reader_verified): a reader bootstrapping into a non-empty journal
-# tail replays it as DIRTY RAM records that pin its node-cache view forever
-# (`meta_kv_revalidate_dirty_skips` fires — a must-stay-0 tripwire).
+# RUNG-6 FINDINGS (2026-08-15) — FIXED, kept as this rig's history + the
+# live regression tripwires it still asserts:
+#   #1 (reader dirty-tail pin): a reader bootstrapping into a non-empty
+#      writer journal tail replayed it as DIRTY RAM records nothing on a
+#      read-only mount could ever flush — the S5 drop pass refused those
+#      nodes forever (`meta_kv_revalidate_dirty_skips` climbed) and their
+#      view froze at mount-time state. Fixed: the reader DECLARATION
+#      absolves the replay residue (arm_reader_revalidation). Cargo pin:
+#      readonly_mount_tests::reader_bootstrap_into_a_dirty_journal_tail_never_pins_nodes.
+#      mount_reader_verified below remains as the LIVE tripwire (a nonzero
+#      dirty_skips is a regression — die loud, no remount workaround).
+#   #2 (multi-meta-volume live-reader non-convergence): one shared
+#      RevalidationPoller driven per-volume let volume 0's cadence mark
+#      suppress every sibling each pass — only meta volume 0 ever
+#      revalidated (readdir-sees/lookup-misses, `d?????????`). Fixed:
+#      poll_set_at makes ONE cadence decision per pass and polls EVERY
+#      volume. Cargo pin:
+#      readonly_mount_tests::a_live_reader_set_revalidates_every_meta_volume.
+#      The rig defaults back to a MULTI-meta-volume set (MDS_COUNT=2) so
+#      the smoke leg keeps exercising the fixed shape live.
 #
 # Env knobs
 #   SQZ_BIN                     squeezefs binary (default target/release,
 #                               falls back to target/debug — the
 #                               mw_two_registrants_leg.sh discipline)
 #   SQZ_MWFLEET_N=2             fleet width (create arg wins)
-#   SQZ_MWFLEET_MDS_COUNT=1     metadata volumes (1 until FINDING #2's fix
-#                               lands — 2+ is the live repro of the
-#                               multi-volume reader-coherence bug)
+#   SQZ_MWFLEET_MDS_COUNT=2     metadata volumes (multi-volume by default —
+#                               the fixed FINDING-#2 shape stays exercised
+#                               live; 1 remains valid for narrow bisects)
 #   SQZ_MWFLEET_OSS_COUNT=2     data volumes
 #   SQZ_MWFLEET_OSS_GB=4        zram disksize GiB per data volume
 #   SQZ_MWFLEET_INSTANCE=mwfleet   devsub instance suffix ([a-z0-9]{1,8})
@@ -120,10 +123,10 @@ SQZ="${SQZ_BIN:-$REPO/target/release/squeezefs}"
 [ -x "$SQZ" ] || SQZ="$REPO/target/debug/squeezefs"
 
 N_DEFAULT="${SQZ_MWFLEET_N:-2}"
-# Default 1: see RUNG-6 FINDING #2 in the header (multi-meta-volume live
-# readers never converge — 2+ is the repro knob, not an operational choice,
-# until the fix lands).
-MDS_COUNT="${SQZ_MWFLEET_MDS_COUNT:-1}"
+# Default 2: multi-meta-volume is the field shape (production sets run 4)
+# and the FIXED rung-6 finding #2's live regression venue — see the
+# FINDINGS note in the header.
+MDS_COUNT="${SQZ_MWFLEET_MDS_COUNT:-2}"
 OSS_COUNT="${SQZ_MWFLEET_OSS_COUNT:-2}"
 OSS_GB="${SQZ_MWFLEET_OSS_GB:-4}"
 INSTANCE="${SQZ_MWFLEET_INSTANCE:-mwfleet}"
@@ -350,41 +353,28 @@ mount_member() { # idx
     log "member $idx ($role) up at $mnt (pid $pid)"
 }
 
-# RUNG-6 FINDING (2026-08-15, reported with this rig — NOT a silent
-# workaround): a reader that bootstraps while the writer's journal tail is
-# non-empty replays that tail into its node cache as DIRTY RAM records;
-# nothing on a read-only mount ever flushes them, so the S5 revalidation
-# drop pass refuses those nodes FOREVER (`meta_kv_revalidate_dirty_skips`,
-# a must-stay-0 tripwire, climbs; node_cache logs "the pass will never
-# drop such a node") and the reader's view of them is pinned at mount-time
-# state — an UNBOUNDED violation of the published staleness bound. Until
-# the product fix lands (red-first repro owed per the repro-port mandate),
-# the rig mounts readers only on a CLEAN bootstrap: quiesce-wait, then
-# verify each reader replayed no dirty tail, remounting into the next
-# checkpoint window when it did (bounded, loud — the writer's 10 s client
-# heartbeat keeps a narrow race window open even at quiesce).
+# RUNG-6 FINDING #1's LIVE regression tripwire (the finding is FIXED — see
+# the FINDINGS note in the header; cargo pin
+# readonly_mount_tests::reader_bootstrap_into_a_dirty_journal_tail_never_pins_nodes):
+# a reader may now bootstrap into ANY journal-tail state — the reader
+# declaration absolves the replayed dirty residue — so a nonzero
+# `meta_kv_revalidate_dirty_skips` after an epoch advance is a REGRESSION,
+# never a re-roll. One mount, one nudge, one verdict; die loud.
 mount_reader_verified() { # idx
-    local idx="$1" attempt probe w_mnt r_mnt skips
+    local idx="$1" probe w_mnt r_mnt skips
     w_mnt="$(mnt_of 0)"
     r_mnt="$(mnt_of "$idx")"
-    for attempt in 1 2 3; do
-        mount_member "$idx"
-        # Nudge the writer so the reader's revalidation epoch ADVANCES —
-        # the dirty-skip tripwire only fires on an epoch advance over a
-        # pinned node, so a quiet writer would hide the pin.
-        probe="$w_mnt/.mwfleet-bootstrap-probe"
-        date >"$probe" && sync
-        sleep 2.5 # >= 2 reader revalidation polls (1 s cadence)
-        skips="$(stat_field "$r_mnt" meta_kv_revalidate_dirty_skips)"
-        rm -f "$probe"
-        if [ "$skips" = "0" ]; then
-            return 0
-        fi
-        warn "reader $idx replayed a dirty journal tail (meta_kv_revalidate_dirty_skips=$skips — the RUNG-6 pinned-node finding); remounting into the next checkpoint window (attempt $attempt/3)"
-        unmount_member "$idx"
-        sleep 2
-    done
-    die "reader $idx could not bootstrap clean of the pinned-node shape after 3 attempts — see the RUNG-6 FINDING note above this function"
+    mount_member "$idx"
+    # Nudge the writer so the reader's revalidation epoch ADVANCES — the
+    # dirty-skip tripwire only fires on an epoch advance over a pinned
+    # node, so a quiet writer would hide a regression.
+    probe="$w_mnt/.mwfleet-bootstrap-probe"
+    date >"$probe" && sync
+    sleep 2.5 # >= 2 reader revalidation polls (1 s cadence)
+    skips="$(stat_field "$r_mnt" meta_kv_revalidate_dirty_skips)"
+    rm -f "$probe"
+    [ "$skips" = "0" ] ||
+        die "reader $idx: meta_kv_revalidate_dirty_skips=$skips — the FIXED rung-6 pinned-node finding regressed (must stay 0 on every posture; see the FINDINGS note in the header)"
 }
 
 unmount_member() { # idx
@@ -609,11 +599,9 @@ create_fleet() {
     done
     log "reader-safety verified (format-time data paths still name their recorded NQNs)"
 
-    # Quiesce: let the writer's first-writable-mount minting churn reach a
-    # checkpoint (<=1 s cadence + margin) so reader bootstraps replay an
-    # empty journal tail — see the RUNG-6 FINDING note at
-    # mount_reader_verified.
-    sleep 3
+    # No quiesce wait: readers bootstrap into ANY journal-tail state since
+    # the rung-6 finding #1 fix (the declaration absolves the replayed
+    # residue) — mount_reader_verified asserts the tripwire stays 0.
 
     local idx
     for ((idx = 1; idx < n; idx++)); do

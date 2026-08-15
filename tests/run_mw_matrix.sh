@@ -201,9 +201,10 @@ for i in idxs:
         violations.append(f"m{i}: invariant_tripwires moved")
     if num(p1.get("meta_kv_revalidate_dirty_skips", 0)) != 0:
         violations.append(
-            f"m{i}: meta_kv_revalidate_dirty_skips != 0 — the rung-6 pinned-node "
-            "finding (a reader replayed a dirty journal tail; its staleness bound "
-            "is void for the pinned nodes)"
+            f"m{i}: meta_kv_revalidate_dirty_skips != 0 — the FIXED rung-6 "
+            "pinned-node finding regressed (must stay 0 on every posture; "
+            "cargo pin readonly_mount_tests::"
+            "reader_bootstrap_into_a_dirty_journal_tail_never_pins_nodes)"
         )
     posture = p1.get("mount_posture", "?")
     if posture == "writer" and row["jrnl_d"] <= 0:

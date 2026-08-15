@@ -1101,9 +1101,41 @@ impl WriteCustodyOwner {
             }
         };
         let token = lease.fencing_token();
-        let grant_id =
-            self.table
-                .commit_grant(&req.client, req.lease_epoch, req.ino, req.span, lease);
+        // Validate-and-commit as ONE step under the table's own
+        // linearization — never check-then-commit across the arbitration
+        // await above: a lease that died while this acquire was parked
+        // (revoked, or swept by the mw_custody_sweep cadence task)
+        // retires the acquisition as a CONFLICT, and dropping the
+        // arbiter lease keeps the bytes grantable — custody is never
+        // committed under a dead epoch. Found by the rung-4
+        // grant_table_core loom model BEFORE any fleet armed (S9 dark);
+        // pinned by `a_granted_custody_never_outlives_its_lease` and the
+        // cargo repro `a_revoke_during_a_parked_acquire_never_commits_custody`.
+        let grant_id = match self.table.commit_grant_if_current(
+            &req.client,
+            req.lease_epoch,
+            req.ino,
+            req.span,
+            lease,
+        ) {
+            Ok(id) => id,
+            Err(dead_lease) => {
+                drop(dead_lease);
+                self.conflicts.fetch_add(1, Ordering::Relaxed);
+                CONFLICTS.fetch_add(1, Ordering::Relaxed);
+                log::warn!(
+                    "S9: refusing custody of inode_{} {:?} to '{}': its lease epoch {} died \
+                     while the acquire was parked in arbitration (revoked or swept mid-await) \
+                     — the acquisition retires as a conflict and the client must self-fence \
+                     and re-join",
+                    req.ino,
+                    req.span,
+                    req.client,
+                    req.lease_epoch
+                );
+                return Err(CUSTODY_CONFLICT);
+            }
+        };
         self.granted.fetch_add(1, Ordering::Relaxed);
         log::debug!(
             "S9: granted custody {grant_id} of inode_{} {:?} to '{}' at token {token:#x}",
@@ -1382,9 +1414,34 @@ impl WriteCustodyOwner {
                 continue;
             };
             let token = lease.fencing_token();
-            let grant_id = self
-                .table
-                .commit_grant(&req.client, req.lease_epoch, *ino, None, lease);
+            // The same validate-and-commit step as `grant()` (the rung-4
+            // loom finding's fix): a reclaiming lease that died while
+            // this arbitration awaited retires THIS ino's re-assertion
+            // as a conflict (the reclaim's conflict form — the ino is
+            // simply not in the reply) rather than committing custody
+            // under a dead epoch.
+            let grant_id = match self.table.commit_grant_if_current(
+                &req.client,
+                req.lease_epoch,
+                *ino,
+                None,
+                lease,
+            ) {
+                Ok(id) => id,
+                Err(dead_lease) => {
+                    drop(dead_lease);
+                    self.conflicts.fetch_add(1, Ordering::Relaxed);
+                    CONFLICTS.fetch_add(1, Ordering::Relaxed);
+                    log::warn!(
+                        "S9: reclaim of inode_{ino} by '{}' refused: its lease epoch {} \
+                             died while the re-assertion was parked in arbitration — the ino \
+                             is omitted from the reply and the client must re-join",
+                        req.client,
+                        req.lease_epoch
+                    );
+                    continue;
+                }
+            };
             self.granted.fetch_add(1, Ordering::Relaxed);
             out.push(GrantRecord {
                 schema: CUSTODY_SCHEMA,

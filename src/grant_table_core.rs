@@ -23,6 +23,10 @@
 //!   `clients` removal is the linearization point — racing revoke /
 //!   expiry paths retire a client's grants and quarantine its in-flight
 //!   set exactly once);
+//! * **a grant can never outlive its lease**
+//!   ([`Self::commit_grant_if_current`] — validate-and-commit as ONE
+//!   step under the `clients` lock, never check-then-commit across the
+//!   arbitration await: the rung-4 loom finding's fix);
 //! * **the grace window admits reclaim only and closes exactly once**
 //!   (deadline close or full re-assertion, whichever first).
 //!
@@ -213,15 +217,38 @@ impl<L> GrantTableCore<L> {
         self.lock_clients().values().any(|l| l.epoch == epoch)
     }
 
-    /// Record a granted custody, minting its grant id.
-    pub fn commit_grant(
+    /// Record a granted custody — **validate-and-commit as ONE
+    /// linearization step** (the rung-4 loom finding's fix, adjudicated
+    /// 2026-08-15): the client's lease epoch is re-validated under the
+    /// `clients` lock and the grant is inserted while that lock is still
+    /// held, so a racing kill can only linearize BEFORE this commit (the
+    /// commit refuses — `Err` hands the caller's own lease back for
+    /// release) or AFTER it (its grant scan then retires this grant).
+    /// There is no third interleaving — the orphan-grant wedge the
+    /// pre-fix check-then-commit across the arbitration await admitted
+    /// (loom `a_granted_custody_never_outlives_its_lease`; RED at commit
+    /// `ea34796c` against the unconditional-commit form, which IS this
+    /// method's weakening evidence).
+    ///
+    /// Lock order: `clients` then `grants`, nested HERE only; no path in
+    /// this module takes `grants` before `clients`, so the nesting is
+    /// acyclic.
+    pub fn commit_grant_if_current(
         &self,
         client: &str,
         lease_epoch: u64,
         ino: u64,
         span: Option<(u64, u64)>,
         lease: L,
-    ) -> u64 {
+    ) -> std::result::Result<u64, L> {
+        let clients = self.lock_clients();
+        let current = clients
+            .get(client)
+            .map(|l| l.epoch == lease_epoch)
+            .unwrap_or(false);
+        if !current {
+            return Err(lease);
+        }
         let grant_id = self.next_grant.fetch_add(1, Ordering::AcqRel);
         let _ = self.lock_grants().insert(
             grant_id,
@@ -233,7 +260,8 @@ impl<L> GrantTableCore<L> {
                 lease,
             },
         );
-        grant_id
+        drop(clients);
+        Ok(grant_id)
     }
 
     /// Renew a client lease if `epoch` is its current custody: re-anchor

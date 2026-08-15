@@ -218,7 +218,11 @@
 //!   can never revive it; lease epochs are minted monotonically and
 //!   never reused. Mutex-serialized table ops (the `conveyor_core`
 //!   class), so the models exercise the protocol invariants across the
-//!   shipped op SEQUENCES (the notify precedent).
+//!   shipped op SEQUENCES (the notify precedent) — including `grant()`'s
+//!   check → arbitration-await → commit window, where the ONE-step
+//!   `commit_grant_if_current` is what keeps a mid-await revoke from
+//!   minting an orphan grant (the rung-4 STOP finding, RED at commit
+//!   `ea34796c` against the pre-fix unconditional commit).
 //! - [`token_cache_core`] (DLM S8, spec §6.9's named obligation;
 //!   KD-MW-10): the client token cache's word protocol — invariants:
 //!   per-object generations are MONOTONE under racing/replayed owner
@@ -5474,8 +5478,12 @@ mod grant_table_models {
             let epoch = table.join(CLIENT, 0x77, None, 0, TTL_MS, |_| {
                 panic!("a fresh join kills nobody")
             });
-            let g1 = table.commit_grant(CLIENT, epoch, 9, None, 0xA);
-            let g2 = table.commit_grant(CLIENT, epoch, 10, Some((0, 4096)), 0xB);
+            let g1 = table
+                .commit_grant_if_current(CLIENT, epoch, 9, None, 0xA)
+                .expect("a live lease commits");
+            let g2 = table
+                .commit_grant_if_current(CLIENT, epoch, 10, Some((0, 4096)), 0xB)
+                .expect("a live lease commits");
 
             let a = {
                 let table = Arc::clone(&table);
@@ -5514,7 +5522,9 @@ mod grant_table_models {
             let e1 = table.join(CLIENT, 0x77, None, 0, TTL_MS, |_| {
                 panic!("a fresh join kills nobody")
             });
-            let g1 = table.commit_grant(CLIENT, e1, 9, None, 0xA);
+            let g1 = table
+                .commit_grant_if_current(CLIENT, e1, 9, None, 0xA)
+                .expect("a live lease commits");
 
             let rejoin = {
                 let table = Arc::clone(&table);
@@ -5553,11 +5563,19 @@ mod grant_table_models {
 
     /// The `grant()` verb's window: the shipped sequence is
     /// `lease_current` → (the authority's arbitration AWAITS) →
-    /// `commit_grant`. Custody law: a grant must never OUTLIVE its lease
-    /// — after any interleaving with a revoke, every grant left in the
-    /// table belongs to a live lease (a revoke's contract is "the bytes
-    /// become grantable again", and an orphan grant would hold the
-    /// authority's own arbiter lease forever).
+    /// `commit_grant_if_current`. Custody law: a grant must never
+    /// OUTLIVE its lease — after any interleaving with a revoke, every
+    /// grant left in the table belongs to a live lease (a revoke's
+    /// contract is "the bytes become grantable again", and an orphan
+    /// grant would hold the authority's own arbiter lease forever).
+    ///
+    /// Weakening evidence: the pre-fix unconditional `commit_grant` (the
+    /// check-then-commit-across-the-await shape) fails this model — that
+    /// is the rung-4 STOP finding itself, recorded RED at commit
+    /// `ea34796c` with the failing schedule (T1 lease_current=true → T2
+    /// revoke returns the empty grant cohort → T1 commits under the dead
+    /// epoch). The mutex-serialized fix introduces no new fence or
+    /// ordering, so no memory-ordering weakening is owed here.
     #[test]
     fn a_granted_custody_never_outlives_its_lease() {
         loom::model(|| {
@@ -5570,10 +5588,15 @@ mod grant_table_models {
                 let table = Arc::clone(&table);
                 thread::spawn(move || {
                     // The shipped `WriteCustodyOwner::grant` shape: the
-                    // lease check, then the arbitration await (loom's
-                    // preemption point), then the commit.
+                    // early lease check, then the arbitration await
+                    // (loom's preemption point), then the ONE-step
+                    // validate-and-commit — a lease that died mid-await
+                    // hands the arbiter lease back (`Err`) as a
+                    // conflict, never an orphan commit.
                     if table.lease_current(CLIENT, epoch) {
-                        Some(table.commit_grant(CLIENT, epoch, 9, None, 0xA))
+                        table
+                            .commit_grant_if_current(CLIENT, epoch, 9, None, 0xA)
+                            .ok()
                     } else {
                         None
                     }
@@ -5601,6 +5624,21 @@ mod grant_table_models {
                     killed.is_some(),
                 );
             }
+            // Closure: a grant that committed BEFORE the kill's
+            // linearization retires WITH the kill; a refused one was
+            // never in the table. Either way custody converges to zero
+            // (the wedge's absence).
+            let killed = killed.expect("the lease existed, so exactly one revoke kills it");
+            if let Some(id) = granted {
+                assert_eq!(
+                    killed.grant_ids,
+                    vec![id],
+                    "a pre-kill commit must be retired by the kill's own scan"
+                );
+            } else {
+                assert!(killed.grant_ids.is_empty());
+            }
+            assert_eq!(table.grants_len(), 0, "custody converges at quiesce");
         });
     }
 }

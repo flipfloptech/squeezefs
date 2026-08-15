@@ -425,18 +425,27 @@ async fn the_reader_lags_by_exactly_one_polled_checkpoint() {
     be.shutdown().await.expect("shutdown");
 }
 
-/// A dirty node is NEVER dropped by a revalidation pass — it holds RAM
-/// records no disk image has yet — and the skip is counted as the
-/// must-stay-0 tripwire that says "someone armed reader revalidation on a
-/// mount that writes".
+/// The dirty-node law, split at the DECLARATION (rung-6 fleet finding #1,
+/// 2026-08-15):
+///
+/// * dirt from BEFORE the arm is the bootstrap replay's residue — records
+///   the WRITER persists, which a reader can never checkpoint — so the arm
+///   ABSOLVES it and the drop pass treats the node like any clean one
+///   (un-absolved it was pinned forever: `dirty_skips` climbing per epoch,
+///   the view frozen at mount-time state);
+/// * dirt from AFTER the arm still holds RAM records no disk image has and
+///   nothing here may persist — the pass keeps the node and counts the
+///   must-stay-0 tripwire that says "someone armed reader revalidation on
+///   a mount that WRITES".
 #[tokio::test]
-async fn revalidation_never_drops_a_dirty_node_and_counts_the_tripwire() {
+async fn revalidation_absolves_prearm_dirt_and_counts_postarm_dirt() {
     let (_f, cache, addrs) = cache_with_nodes(2, 0).await;
     let alloc =
         Arc::new(squeezefs::meta_backend::kv::alloc_ext::ExtentAllocator::format(8, 0, 4096));
     let mut ctx = SmoContext::new(alloc);
     let seq = Arc::new(AtomicU64::new(1));
-    // A tree over the same cache gives us a legitimate dirty node.
+    // A tree over the same cache gives us a legitimate dirty node — the
+    // bootstrap-replay shape (mount replay rides the same apply path).
     let tree = KvTree::create(cache.clone(), &mut ctx, TREE_INODES, seq)
         .await
         .expect("create tree");
@@ -444,33 +453,63 @@ async fn revalidation_never_drops_a_dirty_node_and_counts_the_tripwire() {
         .await
         .expect("insert");
     let leaf = tree.resolve_leaf(&inode_key(7)).await.expect("resolve");
-    assert_ne!(leaf.dirty_floor(), u64::MAX, "the leaf is dirty");
+    assert_ne!(leaf.dirty_floor(), u64::MAX, "the leaf is dirty pre-arm");
 
     cache
         .arm_revalidation(&RootEpoch::synthetic(1, 0, &[]), None)
         .expect("arm");
+    assert_eq!(
+        leaf.dirty_floor(),
+        u64::MAX,
+        "the reader declaration absolves pre-arm (bootstrap-replay) dirt — \
+         a reader has no checkpoint task to discharge it"
+    );
     let before = META_KV_REVALIDATE_DIRTY_SKIPS.load(Ordering::Acquire);
     let out = cache.revalidate(&RootEpoch::synthetic(2, 0, &[]));
     assert!(out.advanced);
-    assert_eq!(out.skipped_dirty, 1, "the dirty leaf was skipped");
+    assert_eq!(
+        out.skipped_dirty, 0,
+        "absolved replay residue never trips the drop pass"
+    );
+    assert_eq!(
+        META_KV_REVALIDATE_DIRTY_SKIPS.load(Ordering::Acquire) - before,
+        0,
+        "the tripwire stays 0 on the reader posture"
+    );
+    // EVERY node dropped: the absolved leaf alongside the hand-written
+    // clean extents (the epoch step's whole point).
+    assert!(
+        !cache.contains(leaf.addr()),
+        "an absolved node drops like any clean node — keeping it was the \
+         rung-6 pinned-view shape"
+    );
+    for a in &addrs {
+        assert!(!cache.contains(*a), "clean node {a:#x} must be dropped");
+    }
+
+    // Post-arm dirt: the write-mount simulation (the apply gate refuses
+    // real reader mutations, so the floor is re-lowered directly — exactly
+    // the state a mount that WRITES would leave). This is the tripwire's
+    // one remaining meaning.
+    let leaf2 = tree.resolve_leaf(&inode_key(7)).await.expect("re-resolve");
+    leaf2.restore_dirty_floor(5);
+    let before = META_KV_REVALIDATE_DIRTY_SKIPS.load(Ordering::Acquire);
+    let out = cache.revalidate(&RootEpoch::synthetic(3, 0, &[]));
+    assert!(out.advanced);
+    assert_eq!(
+        out.skipped_dirty, 1,
+        "post-arm dirt was skipped, not dropped"
+    );
     assert_eq!(
         META_KV_REVALIDATE_DIRTY_SKIPS.load(Ordering::Acquire) - before,
         1,
         "and the tripwire counted it"
     );
     assert!(
-        cache.contains(leaf.addr()),
-        "a dirty node keeps its mapping — dropping it would lose RAM records"
+        cache.contains(leaf2.addr()),
+        "a post-arm dirty node keeps its mapping — dropping it would lose \
+         RAM records no disk image has"
     );
-    // Every CLEAN node went (the tree's own root leaf is the dirty one, and
-    // a single-leaf tree resolves to it, so it may occupy one of the
-    // hand-written extents).
-    for a in addrs.iter().filter(|a| **a != leaf.addr()) {
-        assert!(
-            !cache.contains(*a),
-            "clean node {a:#x} must still be dropped alongside the skip"
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------

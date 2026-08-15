@@ -82,7 +82,7 @@
 //!
 //! # WERO on data namespaces
 //!
-//! Write Exclusive – Registrants Only (rtype 2) on the DATA namespaces is
+//! Write Exclusive – Registrants Only (rtype 3) on the DATA namespaces is
 //! the cross-host half: a zombie's DMA is rejected by the DEVICE, not by
 //! its own latch. The protocol machinery is
 //! [`crate::meta_backend::reservation`]'s (D0's rtype-1 Write Exclusive on
@@ -470,7 +470,7 @@ pub enum CustodyPosture {
     MultiWriter,
 }
 
-/// Which half of a WERO (rtype 2) hold this process owns.
+/// Which half of a WERO (rtype 3) hold this process owns.
 ///
 /// The distinction is the whole of DLM S9's co-writer admission rung 5:
 /// under Write Exclusive – Registrants Only **every registrant writes**,
@@ -687,7 +687,7 @@ pub fn acquire_wero(paths: &[PathBuf]) -> Option<WeroHold> {
     reg.insert((key_set, HoldRole::Holder), Arc::downgrade(&inner));
     METRICS.data_plane_fence_mode.store(1, Ordering::Relaxed);
     log::info!(
-        "data-plane WERO (rtype 2) acquired on {} namespace(s), key {key:#x} — guarantee \
+        "data-plane WERO (rtype 3) acquired on {} namespace(s), key {key:#x} — guarantee \
          class pr: an unregistered (fenced) host's writes are rejected by the device",
         inner.paths.len()
     );
@@ -744,7 +744,7 @@ impl WeroRegistrantJoin {
 }
 
 /// **DLM S9 — the co-writer's device half**: REGISTER this process's key
-/// under the authority's *standing* WERO (rtype 2) reservation on every
+/// under the authority's *standing* WERO (rtype 3) reservation on every
 /// data namespace, and report what the device says.
 ///
 /// This is deliberately not [`acquire_wero`]: a co-writer must never
@@ -847,7 +847,7 @@ pub fn join_wero_as_registrant(data_paths: &[PathBuf]) -> Result<WeroRegistrantJ
             unregister_partial(&clients, key);
             return Err(SqueezefsError::InvalidOperation(format!(
                 "co-writer WERO join refuses: data namespace {} holds no Write Exclusive – \
-                 Registrants Only (rtype 2) reservation (holder {held:?}, rtype {}). Either no \
+                 Registrants Only (rtype 3) reservation (holder {held:?}, rtype {}). Either no \
                  authority is fencing this data plane, or it holds an rtype under which OUR \
                  registration grants no write access — admitting would produce a mount whose \
                  every DMA the device rejects. Arm the authority's multi-writer plane first",
@@ -955,7 +955,7 @@ pub fn arm_data_plane(
     }
     let hold = acquire_wero(data_paths).ok_or_else(|| {
         SqueezefsError::InvalidOperation(
-            "multi-writer data plane refuses to arm: the WERO (rtype 2) acquire did not land \
+            "multi-writer data plane refuses to arm: the WERO (rtype 3) acquire did not land \
              on every data namespace — a partial fence is not a fence (the acquire log names \
              the namespace that refused)"
                 .to_string(),

@@ -446,7 +446,7 @@ fn live_wero_admits_registered_second_association_and_refuses_unregistered() {
 
     let client = NvmeReservationClient::open(Path::new(&node))
         .expect("the product reservation client opens the namespace");
-    const KEY_A: u64 = 0x2026_00A;
+    const KEY_A: u64 = 0x0202_600A;
     client.register(KEY_A).expect("product register (A)");
     client
         .acquire_write_exclusive_registrants_only(KEY_A)
@@ -488,20 +488,50 @@ fn live_wero_admits_registered_second_association_and_refuses_unregistered() {
     let ctrl_b = wait_controller(&nqn, &host_b).expect("controller B attaches");
     assert_ne!(ctrl_a, ctrl_b, "two associations, two controllers");
 
+    // Controller attach is asynchronous past the sysfs attrs: the char
+    // device's nsid-1 passthru answers ENOTTY until the controller's
+    // namespace scan attaches the ns (its `nvme*n*` path-node child
+    // appears under the controller dir). Wait, then retry the register
+    // briefly — a persistent failure is a real failure.
+    let ctrl_dir = PathBuf::from("/sys/class/nvme").join(&ctrl_b);
+    for _ in 0..40 {
+        let has_ns = std::fs::read_dir(&ctrl_dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok()).any(|e| {
+                    let n = e.file_name().to_string_lossy().into_owned();
+                    e.path().is_dir() && n.starts_with("nvme") && n.contains('n')
+                })
+            })
+            .unwrap_or(false);
+        if has_ns {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
     let dev_b = format!("/dev/{ctrl_b}");
-    let out = nvme_cli(&[
-        "resv-register",
-        &dev_b,
-        "-n",
-        "1",
-        "--nrkey=0x202600b",
-        "--cptpl=0",
-    ]);
-    assert!(
-        out.status.success(),
-        "register (B) failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let mut registered = false;
+    let mut last_err = String::new();
+    for _ in 0..20 {
+        let out = nvme_cli(&[
+            "resv-register",
+            &dev_b,
+            "-n",
+            "1",
+            "--nrkey=0x202600b",
+            "--cptpl=0",
+        ]);
+        if out.status.success() {
+            registered = true;
+            break;
+        }
+        last_err = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    assert!(registered, "register (B) failed after retries: {last_err}");
 
     // THE SPEC SEMANTICS: a registered non-holder READS and WRITES under
     // the WERO hold. (Under the pre-fix rtype-2 Exclusive Access hold

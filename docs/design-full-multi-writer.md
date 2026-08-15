@@ -282,7 +282,7 @@ sequenceDiagram
   participant R as Reader mounts
   participant T as nvmet-tcp target (localhost)
   A->>A: mount stamped set, SQUEEZEFS_MEMBERSHIP_BIND=auto
-  A->>T: WERO hold (rtype 2) on data namespaces (S7)
+  A->>T: WERO hold (rtype 3) on data namespaces (S7)
   R->>A: membership join (member-reader), free-grace acks arm
   A->>A: SQUEEZEFS_MULTI_WRITER=1, MW_BIND, MW_MEMBERS=<client ids>
   A->>A: claim-set entries committed (bit 14), lanes derived (W=2^⌈log2(K+1)⌉)

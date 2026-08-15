@@ -44,7 +44,7 @@
 //!   verify-read against the submitted checksums BEFORE publish —
 //!   sampled under TLS, **mandatory-100 % on plaintext**.
 //! - **WERO fence (rung 2)**: the coordinator acquires **Write
-//!   Exclusive – Registrants Only** (rtype 2) on the data namespaces at
+//!   Exclusive – Registrants Only** (rtype 3) on the data namespaces at
 //!   first remote enrollment, releases at last departure, and preempts
 //!   an expired worker host's registration where `RESCAP` supports it
 //!   (`job_remote_pr_preempts`; guarantee class in
@@ -1882,7 +1882,7 @@ impl JobWireHost {
         match acquired {
             Some(f) => {
                 log::info!(
-                    "job wire: WERO (rtype 2) held on the data namespaces (key {:#x}) — \
+                    "job wire: WERO (rtype 3) held on the data namespaces (key {:#x}) — \
                      guarantee class pr (expired worker hosts will be PR-preempted). The \
                      hold is the process's ONE data-plane reservation (DLM S7, \
                      data_custody::acquire_wero): an S7-armed mount and this fence share \

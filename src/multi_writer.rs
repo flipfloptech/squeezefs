@@ -27,7 +27,7 @@
 //!    path**, because ruling **D9** means nothing stamps them today.
 //! 3. **The substrate** (§6.9's S9 guarantee: *"full multi-writer on PR
 //!    substrates; **refused on non-PR**"*): [`crate::data_custody`]'s own
-//!    arm takes the WERO (rtype 2) hold, joining the standing one rather
+//!    arm takes the WERO (rtype 3) hold, joining the standing one rather
 //!    than forking a second key, and refuses a namespace that advertises no
 //!    reservation support — naming it.
 //! 4. **The membership plane**, because a co-writer that cannot be *seen*

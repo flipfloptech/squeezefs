@@ -76,7 +76,7 @@ pub struct ReservationReport {
     pub registrants: Vec<ReservationRegistrant>,
     /// The held reservation's TYPE (0 = none held). DLM S9 needs it: a
     /// co-writer's admission rung 5 must prove the standing hold is
-    /// **Write Exclusive – Registrants Only** (rtype 2), because a
+    /// **Write Exclusive – Registrants Only** (rtype 3), because a
     /// registration under an rtype-1 Write Exclusive grants no write
     /// access at all — admitting such a co-writer would be a mount whose
     /// every DMA the device rejects.
@@ -90,7 +90,7 @@ impl ReservationReport {
     }
 
     /// `true` ⇔ a **Write Exclusive – Registrants Only** reservation
-    /// (rtype 2 — the shared-data-namespace fence) is held: every
+    /// (rtype 3 — the shared-data-namespace fence) is held: every
     /// registrant writes, unregistered hosts are rejected by the device.
     pub fn is_wero(&self) -> bool {
         self.holder_key.is_some() && u32::from(self.rtype) == RTYPE_WRITE_EXCLUSIVE_REGISTRANTS_ONLY
@@ -184,7 +184,7 @@ pub trait ReservationClient: Send + Sync + std::fmt::Debug {
     fn acquire_write_exclusive(&self, key: u64) -> io::Result<()>;
 
     /// Reservation Acquire, **Write Exclusive – Registrants Only**
-    /// (WERO, rtype 2 — design-volume-lifecycle §5.1.6 / KD-15): every
+    /// (WERO, rtype 3 — design-volume-lifecycle §5.1.6 / KD-15): every
     /// *registered* host keeps writing; only unregistered hosts are
     /// write-blocked. The job-wire coordinator's fence on shared **data**
     /// namespaces while remote workers are enrolled — disjoint from D0's
@@ -198,7 +198,7 @@ pub trait ReservationClient: Send + Sync + std::fmt::Debug {
     /// victim (design §5.0 B1 pt 3).
     fn preempt(&self, key: u64, victim_key: u64) -> io::Result<()>;
 
-    /// PREEMPT under a standing WERO reservation (rtype 2): remove the
+    /// PREEMPT under a standing WERO reservation (rtype 3): remove the
     /// expired worker host's registration — its resumed DMA is
     /// device-rejected — while the reservation (and every other
     /// registrant's write access) stands (design-volume-lifecycle
@@ -208,7 +208,7 @@ pub trait ReservationClient: Send + Sync + std::fmt::Debug {
     /// Reservation Release (clean unmount).
     fn release(&self, key: u64) -> io::Result<()>;
 
-    /// Release a WERO (rtype 2) reservation — the job-wire coordinator's
+    /// Release a WERO (rtype 3) reservation — the job-wire coordinator's
     /// last-remote-departure teardown; like [`Self::release`] it leaves
     /// zero residue (the registration is dropped with it).
     fn release_registrants_only(&self, key: u64) -> io::Result<()>;
@@ -443,7 +443,16 @@ const NVME_CMD_RESV_RELEASE: u8 = 0x15;
 const RTYPE_WRITE_EXCLUSIVE: u32 = 1;
 /// Reservation type: Write Exclusive – Registrants Only (registrants
 /// write, unregistered hosts blocked — the §5.1.6 job-wire fence).
-const RTYPE_WRITE_EXCLUSIVE_REGISTRANTS_ONLY: u32 = 2;
+///
+/// **3, per the NVMe Base Spec / the kernel's `enum nvme_pr_type`**
+/// (`include/linux/nvme.h`: 1 = Write Exclusive, 2 = Exclusive Access,
+/// 3 = Write Exclusive – Registrants Only). This constant shipped as
+/// `2` until the `fix/wero-rtype` rung: rtype 2 is EXCLUSIVE ACCESS,
+/// under which a REGISTERED second host is refused reads AND writes
+/// (measured live on kernel nvmet, 2026-08-15) — the opposite of the
+/// registrants-may-write fence every consumer means. Pinned against
+/// the enum values in `tests/wero_rtype_tests.rs`.
+const RTYPE_WRITE_EXCLUSIVE_REGISTRANTS_ONLY: u32 = 3;
 /// NVMe generic status: Reservation Conflict.
 const NVME_SC_RESERVATION_CONFLICT: i32 = 0x83;
 
@@ -597,7 +606,7 @@ impl NvmeReservationClient {
 
     /// Reservation Acquire / Preempt: 16 B payload `[crkey, prkey]`,
     /// reservation type in CDW10 bits 15:8 (rtype 1 = D0's Write
-    /// Exclusive, rtype 2 = the §5.1.6 WERO fence).
+    /// Exclusive, rtype 3 = the §5.1.6 WERO fence).
     fn resv_acquire(&self, racqa: u32, rtype: u32, crkey: u64, prkey: u64) -> io::Result<()> {
         let mut data = [0u8; 16];
         data[..8].copy_from_slice(&crkey.to_le_bytes());
@@ -816,7 +825,7 @@ struct FakeRegistrant {
 struct FakeNsState {
     holder: Option<u64>,
     /// The held reservation's type — meaningful only while `holder` is
-    /// `Some` (rtype 1 = Write Exclusive, rtype 2 = WERO).
+    /// `Some` (rtype 1 = Write Exclusive, rtype 3 = WERO).
     rtype: u32,
     registered: Vec<FakeRegistrant>,
 }
@@ -892,7 +901,7 @@ impl FakeNvmeNamespace {
     /// under `wire_host_id` — the reservation-gating law the real target
     /// enforces per command (the §5.1.6 fence-observation hook): no
     /// reservation ⇒ open; Write Exclusive (rtype 1) ⇒ only the holder's
-    /// host; Write Exclusive – Registrants Only (rtype 2) ⇒ any
+    /// host; Write Exclusive – Registrants Only (rtype 3) ⇒ any
     /// registered host, unregistered hosts rejected.
     pub fn write_allowed(&self, wire_host_id: &[u8]) -> bool {
         let st = self.state.lock().unwrap();

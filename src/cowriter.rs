@@ -42,7 +42,7 @@
 //! | **2** | every volume of the set carries the six S9 capability bits, **bit 14 (`KV_CLAIM_SET`) included**, and its claim set is the DURABLE record | a half-engaged set is not a claim set. Un-engaged, membership IS the singular `writer_claim` read through a projection — a record that expresses *exclusion* and cannot represent a second member, so admitting off it would be admitting off nothing |
 //! | **3** | that durable set names **this node** as a `Writer` member | self-assertion. Admission is by durable **enrollment**, written by the authority (see below), never by a claim the joining node makes about itself at open time |
 //! | **4** | the membership plane is armed, this mount holds a **live** member lease from the authority, and the rendezvous era is not older than the claim's | a co-writer with no live authority has no custody source and — the part that matters — no **evictor**: S6's eviction is what mints the dead epoch its offsets are quarantined under. It must refuse, not proceed hopefully |
-//! | **5** | a PR-capable substrate whose **standing WERO (rtype 2) hold names this node as a registrant** | §6.7's *"multi-writer refuses to arm on non-PR substrates"* applies to the ADMISSION decision too. A co-writer whose DMA the device cannot reject is a co-writer nothing can fence, and its death could never produce a drain proof (the proof IS the preempt of this registrant key) |
+//! | **5** | a PR-capable substrate whose **standing WERO (rtype 3) hold names this node as a registrant** | §6.7's *"multi-writer refuses to arm on non-PR substrates"* applies to the ADMISSION decision too. A co-writer whose DMA the device cannot reject is a co-writer nothing can fence, and its death could never produce a drain proof (the proof IS the preempt of this registrant key) |
 //!
 //! # Who writes the claim-set member entry (the crux)
 //!
@@ -659,7 +659,7 @@ fn rung_5_device_registrant(req: &AdmissionRequest) -> Result<&RegistrantEvidenc
     if !ev.wero {
         return Err(refuse(
             5,
-            "the held reservation is not Write Exclusive – Registrants Only (rtype 2). Under any \
+            "the held reservation is not Write Exclusive – Registrants Only (rtype 3). Under any \
              other type this node's registration grants no write access, so admitting would \
              produce a mount whose every DMA the device rejects — fail-closed, but a lie about \
              the posture"

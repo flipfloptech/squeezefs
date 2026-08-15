@@ -24,7 +24,7 @@
 //!   enter the do-not-publish quarantine set
 //!   (`job_remote_quarantined_destinations`).
 //! - **WERO fence (rung 2)**: `acquire_write_exclusive_registrants_only`
-//!   (rtype 2) beside D0's rtype-1 acquire — registrants write,
+//!   (rtype 3) beside D0's rtype-1 acquire — registrants write,
 //!   unregistered hosts are blocked, a preempted key's host is
 //!   device-rejected while other registrants proceed; the coordinator
 //!   holds WERO from first enrollment to last departure and preempts an
@@ -179,7 +179,7 @@ async fn poll_until(what: &str, deadline: Duration, mut f: impl FnMut() -> bool)
 }
 
 // ---------------------------------------------------------------------------
-// WERO (rtype 2) — the reservation.rs extension at the fake seam
+// WERO (rtype 3) — the reservation.rs extension at the fake seam
 // ---------------------------------------------------------------------------
 
 #[test]

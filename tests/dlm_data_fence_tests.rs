@@ -29,7 +29,7 @@
 //!   verbatim (§6.7 "Recovery"), pushed DOWN into the allocator so the
 //!   fresh-destination law is structural instead of asserted.
 //! * **WERO on data namespaces** — Write Exclusive – Registrants Only
-//!   (rtype 2) held for the mount lifetime, so a zombie's DMA is rejected
+//!   (rtype 3) held for the mount lifetime, so a zombie's DMA is rejected
 //!   by the DEVICE and not merely by its own latch. Multi-writer
 //!   **refuses to arm** where the substrate cannot enforce it (§6.7 "On
 //!   external consensus": that includes the repo's own loop substrate).

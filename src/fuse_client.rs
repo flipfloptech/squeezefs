@@ -4943,7 +4943,7 @@ pub struct Metrics {
     /// — the flow instrument paired with the gauge above.
     pub dlm_quarantine_releases: Align64<AtomicU64>,
     /// DLM **S7**: the DATA plane's guarantee class — `1` = a WERO
-    /// (rtype 2) reservation is held on every configured data namespace
+    /// (rtype 3) reservation is held on every configured data namespace
     /// (a fenced writer's DMA is rejected by the DEVICE), `0` = detection
     /// grade (the local custody-epoch fence only). The data-plane twin of
     /// `writer_guard_mode`; see docs/operations.md §Single-writer mount

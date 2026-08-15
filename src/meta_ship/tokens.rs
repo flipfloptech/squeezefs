@@ -61,8 +61,9 @@
 
 use super::wire::TokenGrant;
 use crate::dlm::{compose_token, GRANT_SEQ_BITS};
+use crate::token_cache_core::{record_grant_ordered, EraFloor, TokenSlot};
 use once_cell::sync::Lazy;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Absolute override for the derived entry cap.
 pub const TOKEN_CACHE_MAX_ENV: &str = "SQUEEZEFS_DLM_TOKEN_CACHE_MAX";
@@ -84,20 +85,15 @@ const ENTRY_FLOOR: usize = 4096;
 /// open files and its dirty set, never by objects ever touched.
 const BUDGET_DIVISOR: u64 = 8192;
 
-struct Entry {
-    token: AtomicU64,
-    term: AtomicU64,
-    /// Second-chance reference bit: set on every serve, cleared by a
-    /// sweep, and its clearing is what earns the entry one more pass.
-    used: AtomicBool,
-}
-
-static CACHE: Lazy<scc::HashMap<u64, Entry>> = Lazy::new(scc::HashMap::new);
+// The per-entry word protocol (monotone token/term merge, the
+// second-chance reference bit) lives in `crate::token_cache_core` —
+// spec §6.9's `token_cache_core` loom obligation, model-checked there.
+static CACHE: Lazy<scc::HashMap<u64, TokenSlot>> = Lazy::new(scc::HashMap::new);
 
 /// The owner era the cache last learned — a miss's floor, and the reason a
 /// miss degrades exactly as a fresh mount does rather than answering 0 on
 /// a volume whose records name eras.
-static OWNER_TERM: AtomicU64 = AtomicU64::new(0);
+static OWNER_TERM: EraFloor = EraFloor::new();
 
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
@@ -117,38 +113,33 @@ pub fn cache_cap() -> usize {
 
 /// Record the owner's era (learned from every reply frame). Monotone.
 pub fn record_owner_term(term: u64) {
-    OWNER_TERM.fetch_max(term, Ordering::AcqRel);
+    OWNER_TERM.record(term);
 }
 
 /// The era the cache serves a miss in.
 pub fn owner_term() -> u64 {
-    OWNER_TERM.load(Ordering::Acquire)
+    OWNER_TERM.get()
 }
 
 /// Record a grant an owner sent us. Monotone per object: a reordered or
 /// replayed reply can never lower an object's generation.
+///
+/// The era floor is recorded BEFORE the grant becomes findable
+/// ([`record_grant_ordered`] — the core's order, weakening-verified in
+/// its loom model): an entry the sweep later retires must never expose a
+/// miss whose floor predates the grant's own era.
 pub fn record_grant(grant: &TokenGrant) {
-    record_owner_term(grant.term);
-    GRANTS.fetch_add(1, Ordering::Relaxed);
-    let updated = CACHE.read_sync(&grant.ino, |_, e| {
-        e.token.fetch_max(grant.token, Ordering::AcqRel);
-        e.term.fetch_max(grant.term, Ordering::AcqRel);
-        e.used.store(true, Ordering::Relaxed);
+    record_grant_ordered(&OWNER_TERM, grant.term, || {
+        GRANTS.fetch_add(1, Ordering::Relaxed);
+        let updated = CACHE.read_sync(&grant.ino, |_, e| e.merge(grant.token, grant.term));
+        if updated.is_some() {
+            return;
+        }
+        if CACHE.len() >= cache_cap() {
+            sweep();
+        }
+        let _ = CACHE.insert_sync(grant.ino, TokenSlot::granted(grant.token, grant.term));
     });
-    if updated.is_some() {
-        return;
-    }
-    if CACHE.len() >= cache_cap() {
-        sweep();
-    }
-    let _ = CACHE.insert_sync(
-        grant.ino,
-        Entry {
-            token: AtomicU64::new(grant.token),
-            term: AtomicU64::new(grant.term),
-            used: AtomicBool::new(true),
-        },
-    );
 }
 
 /// One bounded second-chance pass: entries used since the last sweep are
@@ -156,7 +147,7 @@ pub fn record_grant(grant: &TokenGrant) {
 fn sweep() {
     let mut retired = 0u64;
     CACHE.retain_sync(|_, e| {
-        if e.used.swap(false, Ordering::AcqRel) {
+        if e.keep_for_another_pass() {
             true
         } else {
             retired += 1;
@@ -185,10 +176,7 @@ fn sweep() {
 /// tripwire — see the module docs for why that is the only sound
 /// direction and why it is loud.
 pub fn foreign_fencing_token(ino: u64) -> u64 {
-    if let Some(token) = CACHE.read_sync(&ino, |_, e| {
-        e.used.store(true, Ordering::Relaxed);
-        e.token.load(Ordering::Acquire)
-    }) {
+    if let Some(token) = CACHE.read_sync(&ino, |_, e| e.serve()) {
         HITS.fetch_add(1, Ordering::Relaxed);
         return token;
     }

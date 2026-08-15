@@ -128,6 +128,10 @@ pub mod free_grace;
 pub mod fsck;
 pub mod fuse_client;
 pub(crate) mod gauge_core;
+// DLM S9's custody grant table (spec §6.9's `grant_table_core` loom
+// obligation, KD-MW-10) — the client-lease/grant/grace protocol core
+// `data_grant.rs` runs on, `#[path]`-included by loom-models.
+pub(crate) mod grant_table_core;
 pub mod health;
 pub(crate) mod incarnation_core;
 pub mod ipc_direct;
@@ -142,6 +146,10 @@ pub mod keyfile;
 /// `docs/design-mw-cursors-and-incarnation.md`.
 pub mod lane_core;
 pub mod layout_wire;
+// DLM S6's lease-clock law + member lease words (spec §6.9's
+// `lease_clock_core` loom obligation, KD-MW-10) — the T_self arithmetic
+// and the re-anchor word protocol `membership.rs` runs on.
+pub(crate) mod lease_clock_core;
 // DLM stage S6 — membership off the journal (each module's own `//!` docs
 // are the documentation; an outer `///` here would re-root their intra-doc
 // links in `crate` and break every one of them, which is the shape
@@ -205,7 +213,11 @@ pub mod spin_governor;
 pub mod sqz_sync_core;
 pub mod storage;
 pub mod stripe_locks;
+// The S8 client token cache's word protocol (spec §6.9's
+// `token_cache_core` loom obligation, KD-MW-10) — the monotone grant
+// slot + era floor `meta_ship/tokens.rs` runs on.
 pub mod supervisor;
+pub(crate) mod token_cache_core;
 pub mod uring_fs;
 pub mod version;
 /// DUR-2: the data-volume volatile-write-cache probe

@@ -653,6 +653,18 @@ impl Default for LeaseClock {
 /// documented physical reason).
 pub const MONOTONIC_RATE_DRIFT_PPM: u64 = 500;
 
+/// Exact `u128`-nanosecond → `Duration` conversion (the
+/// [`crate::lease_clock_core`] law runs in the nanosecond frame; every
+/// value it returns is bounded by an input `Duration`'s own nanos, so the
+/// split below cannot lose precision or overflow `Duration`'s range).
+fn duration_from_nanos_u128(nanos: u128) -> Duration {
+    const NANOS_PER_SEC: u128 = 1_000_000_000;
+    Duration::new(
+        (nanos / NANOS_PER_SEC) as u64,
+        (nanos % NANOS_PER_SEC) as u32,
+    )
+}
+
 /// The two lease clocks (§6.7 "Two lease clocks, and the client's is
 /// stricter"): `T_self = T_owner − 2·skew_max − D_purge`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -726,10 +738,16 @@ impl LeaseClocks {
     /// clamps — when `2·skew_max + D_purge ≥ T_owner`: a member that
     /// cannot fail-stop before the owner may re-grant is the divergence
     /// this asymmetry exists to prevent, and silently shortening someone
-    /// else's lease would hide it.
+    /// else's lease would hide it. The arithmetic itself lives in
+    /// [`crate::lease_clock_core`] (spec §6.9's `lease_clock_core` loom
+    /// obligation — the law's exact nanosecond form, deterministic tests
+    /// there).
     pub fn with_params(t_owner: Duration, skew_max: Duration, d_purge: Duration) -> Result<Self> {
-        let reserve = 2 * skew_max + d_purge;
-        if reserve >= t_owner {
+        let Some(t_self) = crate::lease_clock_core::t_self_nanos(
+            t_owner.as_nanos(),
+            skew_max.as_nanos(),
+            d_purge.as_nanos(),
+        ) else {
             return Err(SqueezefsError::InvalidOperation(format!(
                 "membership lease clocks refuse to arm: T_self = T_owner − 2·skew_max − \
                  D_purge = {t_owner:?} − 2×{skew_max:?} − {d_purge:?} is not positive, so a \
@@ -738,10 +756,14 @@ impl LeaseClocks {
                  SQUEEZEFS_MEMBERSHIP_LEASE_TTL_MS, or lower \
                  SQUEEZEFS_MEMBERSHIP_SKEW_MAX_MS / SQUEEZEFS_MEMBERSHIP_PURGE_MS"
             )));
-        }
-        let t_self = t_owner - reserve;
+        };
+        let t_self = duration_from_nanos_u128(t_self);
         let shipped_beat = Duration::from_secs(CLIENT_HEARTBEAT_INTERVAL_SECS);
-        let renew_interval = (t_self / 3).min(shipped_beat).max(Duration::from_millis(1));
+        let renew_interval =
+            duration_from_nanos_u128(crate::lease_clock_core::renew_interval_nanos(
+                t_self.as_nanos(),
+                shipped_beat.as_nanos(),
+            ));
         Ok(Self {
             t_owner,
             skew_max,
@@ -813,8 +835,7 @@ impl Grant {
     /// zero here means a hostile/garbled grant — which must fail-stop
     /// immediately rather than be trusted).
     pub fn t_self_ms(&self) -> u64 {
-        self.t_owner_ms
-            .saturating_sub(2 * self.skew_max_ms + self.d_purge_ms)
+        crate::lease_clock_core::t_self_ms(self.t_owner_ms, self.skew_max_ms, self.d_purge_ms)
     }
 }
 
@@ -1499,26 +1520,12 @@ pub struct SelfFence {
 pub struct MemberSession {
     id: String,
     role: MemberRole,
-    epoch: AtomicU64,
-    t_self_deadline_ms: AtomicU64,
-    renew_at_ms: AtomicU64,
-    acked_free_epoch: AtomicU64,
-    /// §6.8 item 3: the causal LABEL the last grant carried — the owner's
-    /// own monotonic instant of that grant. A member never reads a foreign
-    /// clock as a deadline (§6.7's law, unchanged); it echoes this value
-    /// back once it has finished with everything freed at or before it, so
-    /// the comparison the writer performs is between two readings of ONE
-    /// clock.
-    learned_label: AtomicU64,
-    /// The member-clock instant at which that label was learned — the
-    /// anchor the acknowledgement ladder's qualification wait measures
-    /// from (its own clock, for its own durations).
-    learned_at_ms: AtomicU64,
-    /// The grant's `skew_max` / `D_purge`, kept so the ladder's two waits
-    /// are the plane's own numbers rather than a second derivation.
-    skew_max_ms: AtomicU64,
-    d_purge_ms: AtomicU64,
-    fenced: AtomicBool,
+    /// The lease words — deadline, renewal, §6.8-item-3 label/anchor
+    /// pair, fence latch — extracted to [`crate::lease_clock_core`]
+    /// (spec §6.9's `lease_clock_core` loom obligation): the
+    /// anchor-before-label publication order in `renewed` is
+    /// weakening-verified there.
+    words: crate::lease_clock_core::MemberLeaseWords,
     clock: LeaseClock,
 }
 
@@ -1535,15 +1542,15 @@ impl MemberSession {
         let s = Self {
             id: id.to_string(),
             role,
-            epoch: AtomicU64::new(grant.epoch),
-            t_self_deadline_ms: AtomicU64::new(anchor_ms + grant.t_self_ms()),
-            renew_at_ms: AtomicU64::new(anchor_ms + grant.renew_ms),
-            acked_free_epoch: AtomicU64::new(0),
-            learned_label: AtomicU64::new(grant.granted_at_owner_ms),
-            learned_at_ms: AtomicU64::new(anchor_ms),
-            skew_max_ms: AtomicU64::new(grant.skew_max_ms),
-            d_purge_ms: AtomicU64::new(grant.d_purge_ms),
-            fenced: AtomicBool::new(false),
+            words: crate::lease_clock_core::MemberLeaseWords::adopt(
+                grant.epoch,
+                grant.t_self_ms(),
+                grant.renew_ms,
+                grant.skew_max_ms,
+                grant.d_purge_ms,
+                grant.granted_at_owner_ms,
+                anchor_ms,
+            ),
             clock,
         };
         log::info!(
@@ -1561,41 +1568,36 @@ impl MemberSession {
     }
 
     /// Re-anchor on a successful renewal — including the §6.8 item-3 label
-    /// this grant carried (monotone: a label is never un-learned).
+    /// this grant carried (monotone: a label is never un-learned; the
+    /// anchor-before-label publication order is the core's, verified by
+    /// weakening in its loom model).
     pub fn renewed(&self, grant: &Grant, anchor_ms: u64) {
-        self.epoch.store(grant.epoch, Ordering::Release);
-        self.t_self_deadline_ms
-            .store(anchor_ms + grant.t_self_ms(), Ordering::Release);
-        self.renew_at_ms
-            .store(anchor_ms + grant.renew_ms, Ordering::Release);
-        self.skew_max_ms.store(grant.skew_max_ms, Ordering::Release);
-        self.d_purge_ms.store(grant.d_purge_ms, Ordering::Release);
-        if grant.granted_at_owner_ms > self.learned_label.load(Ordering::Acquire) {
-            // Order matters: the anchor is published FIRST, so a ladder
-            // that observes the new label can never pair it with the old
-            // (earlier) anchor and qualify too soon.
-            self.learned_at_ms.store(anchor_ms, Ordering::Release);
-            self.learned_label
-                .store(grant.granted_at_owner_ms, Ordering::Release);
-        }
+        self.words.renewed(
+            grant.epoch,
+            grant.t_self_ms(),
+            grant.renew_ms,
+            grant.skew_max_ms,
+            grant.d_purge_ms,
+            grant.granted_at_owner_ms,
+            anchor_ms,
+        );
     }
 
     /// §6.8 item 3: the label last learned from the owner and the
     /// member-clock instant it arrived — the acknowledgement ladder's two
     /// inputs ([`crate::free_grace::ReaderAckLadder`]).
     pub fn learned_label(&self) -> (u64, u64) {
-        let label = self.learned_label.load(Ordering::Acquire);
-        (label, self.learned_at_ms.load(Ordering::Acquire))
+        self.words.learned_label()
     }
 
     /// The grant's clock-skew bound, ms (the ladder's qualification term).
     pub fn skew_max_ms(&self) -> u64 {
-        self.skew_max_ms.load(Ordering::Acquire)
+        self.words.skew_max_ms()
     }
 
     /// The grant's `D_purge`, ms (the ladder's drain term).
     pub fn d_purge_ms(&self) -> u64 {
-        self.d_purge_ms.load(Ordering::Acquire)
+        self.words.d_purge_ms()
     }
 
     /// This member's own clock, in ms — the frame every wait above is
@@ -1616,41 +1618,40 @@ impl MemberSession {
 
     /// The lease epoch to present on the next renewal.
     pub fn epoch(&self) -> u64 {
-        self.epoch.load(Ordering::Acquire)
+        self.words.epoch()
     }
 
     /// The member's own deadline, in its clock's milliseconds.
     pub fn t_self_deadline_ms(&self) -> u64 {
-        self.t_self_deadline_ms.load(Ordering::Acquire)
+        self.words.t_self_deadline_ms()
     }
 
     /// When the next renewal is due.
     pub fn renew_at_ms(&self) -> u64 {
-        self.renew_at_ms.load(Ordering::Acquire)
+        self.words.renew_at_ms()
     }
 
     /// `true` ⇔ the member is past its own deadline and MUST fail-stop now
     /// — before the owner's TTL lets the objects be granted elsewhere.
     pub fn self_fence_due(&self) -> bool {
-        !self.fenced.load(Ordering::Acquire)
-            && self.clock.now_ms() >= self.t_self_deadline_ms.load(Ordering::Acquire)
+        self.words.self_fence_due(self.clock.now_ms())
     }
 
     /// Acknowledge having passed freed-offset `epoch` (§6.8 item 3): the
     /// value rides the next renewal, and the owner keeps the minimum across
     /// live members. Monotone — an acknowledgement is never withdrawn.
     pub fn ack_free_epoch(&self, epoch: u64) {
-        self.acked_free_epoch.fetch_max(epoch, Ordering::AcqRel);
+        self.words.ack_free_epoch(epoch);
     }
 
     /// The freed-offset epoch this member has acknowledged.
     pub fn acked_free_epoch(&self) -> u64 {
-        self.acked_free_epoch.load(Ordering::Acquire)
+        self.words.acked_free_epoch()
     }
 
     /// `true` ⇔ this session has fail-stopped.
     pub fn fenced(&self) -> bool {
-        self.fenced.load(Ordering::Acquire)
+        self.words.fenced()
     }
 
     /// **Fail-stop the affected objects ourselves** (§6.7): a writer
@@ -1658,7 +1659,7 @@ impl MemberSession {
     /// have re-granted; a reader is told to purge everything it caches.
     /// False-positive eviction then costs availability, never divergence.
     pub fn self_fence(&self, reason: &str) -> SelfFence {
-        let first = !self.fenced.swap(true, Ordering::AcqRel);
+        let first = self.words.fence();
         if first {
             METRICS
                 .membership_self_fences

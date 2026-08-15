@@ -620,30 +620,14 @@ pub struct OwnerStats {
     pub clients: u64,
 }
 
-struct ClientLease {
-    epoch: u64,
-    pr_key: u64,
-    renewed_ms: u64,
-    deadline_ms: u64,
-    inflight: Vec<u64>,
-    /// Grants whose custody died while this client was away — drained by
-    /// its next renewal (the pull-based revocation channel).
-    dead_grants: Vec<u64>,
-}
-
-struct GrantState {
-    client: String,
-    lease_epoch: u64,
-    ino: u64,
-    span: Option<(u64, u64)>,
-    /// The authority's OWN lease, held on the client's behalf. Dropping it
-    /// is what makes the bytes grantable again — so a revoke is
-    /// structurally a drop, not a bookkeeping edit. It is also the grant's
-    /// TOKEN of record: [`WriteCustodyOwner::grants_snapshot`] reads it from
-    /// here rather than from a copy, so an audit can never disagree with the
-    /// custody that is actually held.
-    lease: LockLease,
-}
+// The lease/grant records themselves (`LeaseState` / `GrantEntry`) live in
+// [`crate::grant_table_core`] — spec §6.9's `grant_table_core` loom
+// obligation. The authority's OWN lease rides each grant entry: dropping
+// it is what makes the bytes grantable again — so a revoke is structurally
+// a drop, not a bookkeeping edit — and it is also the grant's TOKEN of
+// record: [`WriteCustodyOwner::grants_snapshot`] reads it from there
+// rather than from a copy, so an audit can never disagree with the custody
+// that is actually held.
 
 /// One live grant as an audit sees it — the custody half of
 /// `squeezefs clients`: which peer holds which bytes of which object, under
@@ -656,11 +640,6 @@ pub struct GrantAudit {
     pub ino: u64,
     pub span: Option<(u64, u64)>,
     pub token: u64,
-}
-
-struct Grace {
-    until_ms: u64,
-    expected: std::collections::BTreeSet<String>,
 }
 
 /// The **write-custody authority**: the node that arbitrates who may write
@@ -685,11 +664,9 @@ pub struct WriteCustodyOwner {
     /// on an authority with no enrolled co-writer — and then every lease
     /// says SOLO, which installs no partition anywhere.
     lanes: ArcSwapOption<crate::alloc_lane_grant::LaneAssignment>,
-    clients: scc::HashMap<String, ClientLease>,
-    grants: scc::HashMap<u64, GrantState>,
-    next_epoch: AtomicU64,
-    next_grant: AtomicU64,
-    grace: parking_lot::Mutex<Option<Grace>>,
+    /// The grant table — client leases, live grants, the grace window and
+    /// the two mint words ([`crate::grant_table_core`], loom-modeled).
+    table: crate::grant_table_core::GrantTableCore<LockLease>,
     quarantine: Option<Arc<dyn CustodyQuarantine>>,
     granted: AtomicU64,
     released: AtomicU64,
@@ -707,8 +684,8 @@ impl std::fmt::Debug for WriteCustodyOwner {
         f.debug_struct("WriteCustodyOwner")
             .field("id", &self.id)
             .field("term", &self.term)
-            .field("clients", &self.clients.len())
-            .field("grants", &self.grants.len())
+            .field("clients", &self.table.clients_len())
+            .field("grants", &self.table.grants_len())
             .field("in_grace", &self.in_grace())
             .finish_non_exhaustive()
     }
@@ -781,11 +758,7 @@ impl WriteCustodyOwner {
             clock,
             arbiter: LocalLockManager::new()?,
             lanes: ArcSwapOption::empty(),
-            clients: scc::HashMap::new(),
-            grants: scc::HashMap::new(),
-            next_epoch: AtomicU64::new(1),
-            next_grant: AtomicU64::new(1),
-            grace: parking_lot::Mutex::new(None),
+            table: crate::grant_table_core::GrantTableCore::new(),
             quarantine,
             granted: AtomicU64::new(0),
             released: AtomicU64::new(0),
@@ -816,27 +789,21 @@ impl WriteCustodyOwner {
 
     /// Live grants.
     pub fn held(&self) -> usize {
-        self.grants.len()
+        self.table.grants_len()
     }
 
     /// Every live grant, ordered by grant id — the audit surface (see
     /// [`GrantAudit`]). Bounded by live custody, never by grants ever
     /// issued.
     pub fn grants_snapshot(&self) -> Vec<GrantAudit> {
-        let mut out = Vec::with_capacity(self.grants.len());
-        self.grants.iter_sync(|id, g| {
-            out.push(GrantAudit {
-                grant_id: *id,
-                client: g.client.clone(),
-                lease_epoch: g.lease_epoch,
-                ino: g.ino,
-                span: g.span,
-                token: g.lease.fencing_token(),
-            });
-            true
-        });
-        out.sort_by_key(|g| g.grant_id);
-        out
+        self.table.grants_snapshot_with(|id, g| GrantAudit {
+            grant_id: id,
+            client: g.client.clone(),
+            lease_epoch: g.lease_epoch,
+            ino: g.ino,
+            span: g.span,
+            token: g.lease.fencing_token(),
+        })
     }
 
     /// Per-instance counters.
@@ -851,8 +818,8 @@ impl WriteCustodyOwner {
             reclaims: self.reclaims.load(Ordering::Relaxed),
             grace_conflicts: self.grace_conflicts.load(Ordering::Relaxed),
             unknown_leases: self.unknown_leases.load(Ordering::Relaxed),
-            held: self.grants.len() as u64,
-            clients: self.clients.len() as u64,
+            held: self.table.grants_len() as u64,
+            clients: self.table.clients_len() as u64,
         }
     }
 
@@ -985,15 +952,7 @@ impl WriteCustodyOwner {
     /// `Err(reason)` is the operator-facing refusal text (`client` is the
     /// audit string it names).
     pub fn check_free(&self, client: &str, lease_epoch: u64) -> std::result::Result<(), String> {
-        let mut live = false;
-        self.clients.iter_sync(|_, l| {
-            if l.epoch == lease_epoch {
-                live = true;
-                return false;
-            }
-            true
-        });
-        if !live {
+        if !self.table.epoch_live(lease_epoch) {
             return Err(format!(
                 "S9: refusing a displaced-block free from '{client}': lease epoch {lease_epoch} \
                  is not custody on authority '{}' (revoked, swept past its TTL, or minted by a \
@@ -1036,30 +995,30 @@ impl WriteCustodyOwner {
             )));
         }
         let now = self.clock.now_ms();
-        let epoch = self.next_epoch.fetch_add(1, Ordering::AcqRel);
         // A re-join REPLACES the prior lease (same identity, new epoch):
         // the client is telling us it lost its view, and keeping the old
         // epoch alive would leave custody nobody presents. Its GRANTS are
         // revoked with it — a client that cannot present its lease cannot
         // present its grants either, and bytes nobody can name must become
-        // grantable.
-        if let Some(prior) = self.clients.read_sync(&req.client, |_, l| l.epoch) {
-            if Some(prior) != req.prior_epoch || req.prior_epoch.is_none() {
-                self.revoke_client(
+        // grantable. The mint / replace / kill-before-new-lease order is
+        // the core's ([`crate::grant_table_core::GrantTableCore::join`],
+        // loom-modeled): the dead epoch's quarantine runs BEFORE the new
+        // lease becomes visible.
+        let epoch = self.table.join(
+            &req.client,
+            req.pr_key,
+            req.prior_epoch,
+            now,
+            self.clocks.t_owner.as_millis() as u64,
+            |killed| {
+                self.revokes.fetch_add(1, Ordering::Relaxed);
+                REVOKES.fetch_add(1, Ordering::Relaxed);
+                let prior = killed.lease.epoch;
+                self.finish_kill(
                     &req.client,
+                    killed,
                     &format!("re-joined with a fresh lease (prior epoch {prior})"),
                 );
-            }
-        }
-        let _ = self.clients.insert_sync(
-            req.client.clone(),
-            ClientLease {
-                epoch,
-                pr_key: req.pr_key,
-                renewed_ms: now,
-                deadline_ms: now + self.clocks.t_owner.as_millis() as u64,
-                inflight: Vec::new(),
-                dead_grants: Vec::new(),
             },
         );
         log::info!(
@@ -1076,16 +1035,14 @@ impl WriteCustodyOwner {
 
     /// Is `client`'s presented lease epoch its current custody?
     fn lease_current(&self, client: &str, epoch: u64) -> bool {
-        self.clients
-            .read_sync(client, |_, l| l.epoch == epoch)
-            .unwrap_or(false)
+        self.table.lease_current(client, epoch)
     }
 
     /// A client's OWNER-side deadline in this clock's milliseconds — the
     /// instant after which the authority may grant its bytes elsewhere. The
     /// contract the client's stricter deadline is measured against.
     pub fn lease_deadline_ms(&self, client: &str) -> Option<u64> {
-        self.clients.read_sync(client, |_, l| l.deadline_ms)
+        self.table.lease_deadline_ms(client)
     }
 
     /// Grant write custody: the authority takes ITS OWN lease on the bytes
@@ -1143,18 +1100,10 @@ impl WriteCustodyOwner {
                 return Err(CUSTODY_CONFLICT);
             }
         };
-        let grant_id = self.next_grant.fetch_add(1, Ordering::AcqRel);
         let token = lease.fencing_token();
-        let _ = self.grants.insert_sync(
-            grant_id,
-            GrantState {
-                client: req.client.clone(),
-                lease_epoch: req.lease_epoch,
-                ino: req.ino,
-                span: req.span,
-                lease,
-            },
-        );
+        let grant_id =
+            self.table
+                .commit_grant(&req.client, req.lease_epoch, req.ino, req.span, lease);
         self.granted.fetch_add(1, Ordering::Relaxed);
         log::debug!(
             "S9: granted custody {grant_id} of inode_{} {:?} to '{}' at token {token:#x}",
@@ -1184,21 +1133,8 @@ impl WriteCustodyOwner {
     ) -> std::result::Result<RenewReplyFrame, u16> {
         let now = self.clock.now_ms();
         let ttl = self.clocks.t_owner.as_millis() as u64;
-        let mut dead_grants = Vec::new();
-        let updated = self
-            .clients
-            .update_sync(client, |_, l| {
-                if l.epoch != lease_epoch {
-                    return false;
-                }
-                l.renewed_ms = now;
-                l.deadline_ms = now + ttl;
-                l.inflight = inflight.to_vec();
-                dead_grants = std::mem::take(&mut l.dead_grants);
-                true
-            })
-            .unwrap_or(false);
-        if !updated {
+        let dead_grants = self.table.renew(client, lease_epoch, now, ttl, inflight);
+        let Some(dead_grants) = dead_grants else {
             self.unknown_leases.fetch_add(1, Ordering::Relaxed);
             UNKNOWN_LEASES.fetch_add(1, Ordering::Relaxed);
             log::warn!(
@@ -1208,7 +1144,7 @@ impl WriteCustodyOwner {
                 self.id
             );
             return Err(CUSTODY_UNKNOWN_LEASE);
-        }
+        };
         self.renewals.fetch_add(1, Ordering::Relaxed);
         Ok(RenewReplyFrame {
             schema: CUSTODY_SCHEMA,
@@ -1220,19 +1156,9 @@ impl WriteCustodyOwner {
     /// Retire named grants at the client's request. Dropping the
     /// authority's own lease is what makes the bytes grantable again.
     pub fn release(&self, client: &str, grant_ids: &[u64]) -> usize {
-        let mut n = 0;
-        for id in grant_ids {
-            let mine = self
-                .grants
-                .read_sync(id, |_, g| g.client == client)
-                .unwrap_or(false);
-            if !mine {
-                continue;
-            }
-            if self.grants.remove_sync(id).is_some() {
-                n += 1;
-                self.released.fetch_add(1, Ordering::Relaxed);
-            }
+        let n = self.table.release(client, grant_ids);
+        if n > 0 {
+            self.released.fetch_add(n as u64, Ordering::Relaxed);
         }
         n
     }
@@ -1245,12 +1171,12 @@ impl WriteCustodyOwner {
     /// Returns one [`DeadCustody`] — the cohort a [`DrainProof`] releases.
     /// Empty when the client was not a member.
     pub fn revoke_client(&self, client: &str, reason: &str) -> Vec<DeadCustody> {
-        let Some((_, lease)) = self.clients.remove_sync(client) else {
+        let Some(killed) = self.table.revoke(client) else {
             return Vec::new();
         };
         self.revokes.fetch_add(1, Ordering::Relaxed);
         REVOKES.fetch_add(1, Ordering::Relaxed);
-        Vec::from_iter(self.kill(client, lease, reason))
+        Vec::from_iter(self.finish_kill(client, killed, reason))
     }
 
     /// Sweep every client lease past the authority's TTL (§6.7 "Recovery",
@@ -1258,27 +1184,22 @@ impl WriteCustodyOwner {
     /// handler lane.
     pub fn expire_due(&self) -> Vec<DeadCustody> {
         let now = self.clock.now_ms();
-        let mut due: Vec<String> = Vec::new();
-        self.clients.iter_sync(|id, l| {
-            // `>=`: the lease expires AT the deadline, which is the instant
-            // the client's own (strictly earlier) deadline was measured
-            // against.
-            if now >= l.deadline_ms {
-                due.push(id.clone());
-            }
-            true
-        });
-        due.sort();
+        // `>=` inside the scan: the lease expires AT the deadline, which is
+        // the instant the client's own (strictly earlier) deadline was
+        // measured against.
+        let due = self.table.expire_scan(now);
         let mut out = Vec::new();
         for id in due {
-            let Some((_, lease)) = self.clients.remove_sync(&id) else {
+            // Pop ownership (`revoke` removes the lease or answers None):
+            // a racing revoke path retires this client exactly once.
+            let Some(killed) = self.table.revoke(&id) else {
                 continue;
             };
             self.expiries.fetch_add(1, Ordering::Relaxed);
             EXPIRIES.fetch_add(1, Ordering::Relaxed);
-            out.extend(self.kill(
+            out.extend(self.finish_kill(
                 &id,
-                lease,
+                killed,
                 &format!(
                     "lease TTL {:?} expired without a renewal",
                     self.clocks.t_owner
@@ -1288,23 +1209,21 @@ impl WriteCustodyOwner {
         out
     }
 
-    /// The common death path: retire the client's grants, mint its dead
-    /// epoch, quarantine its declared destinations.
-    fn kill(&self, client: &str, lease: ClientLease, reason: &str) -> Option<DeadCustody> {
-        let mut grants: Vec<u64> = Vec::new();
-        self.grants.iter_sync(|id, g| {
-            if g.client == client {
-                grants.push(*id);
-            }
-            true
-        });
-        grants.sort_unstable();
-        for id in &grants {
-            // Dropping the authority's lease releases the bytes. The
-            // grant's client is told at its next renewal — the pull-based
-            // revocation channel — and it is bounded by its own T_self.
-            let _ = self.grants.remove_sync(id);
-        }
+    /// The common death path's daemon half: the table half
+    /// ([`crate::grant_table_core::GrantTableCore::revoke`]) already
+    /// removed the lease and dropped the retired grants' own leases
+    /// (releasing the bytes — the grant's client is told at its next
+    /// renewal, the pull-based revocation channel, bounded by its own
+    /// T_self); here the dead epoch is minted and the declared
+    /// destinations enter the S7 quarantine.
+    fn finish_kill(
+        &self,
+        client: &str,
+        killed: crate::grant_table_core::Killed,
+        reason: &str,
+    ) -> Option<DeadCustody> {
+        let crate::grant_table_core::Killed { lease, grant_ids } = killed;
+        let grants = grant_ids;
         let epoch = crate::data_custody::declare_dead_epoch(&format!(
             "S9: co-writer '{client}' custody revoked by authority '{}' ({reason})",
             self.id
@@ -1368,41 +1287,33 @@ impl WriteCustodyOwner {
     /// deadline.
     pub fn open_grace(&self, expected: Vec<String>) {
         let until = self.clock.now_ms() + self.clocks.grace.as_millis() as u64;
-        let expected: std::collections::BTreeSet<String> = expected.into_iter().collect();
+        let awaiting = self.table.open_grace(until, expected);
         log::warn!(
             "S9: custody authority '{}' opened a failover grace window for {:?}: reclaim only, \
-             conflicting fresh acquires refused; awaiting re-assertion from {} prior \
+             conflicting fresh acquires refused; awaiting re-assertion from {awaiting} prior \
              co-writer(s) (without the window, failover is a cluster-wide forced-flush storm \
              — spec §6.7)",
             self.id,
             self.clocks.grace,
-            expected.len()
         );
-        *self.grace.lock() = Some(Grace {
-            until_ms: until,
-            expected,
-        });
     }
 
     /// `true` ⇔ the grace window is open (it closes on full re-assertion or
     /// at its deadline, whichever comes first).
     pub fn in_grace(&self) -> bool {
-        let mut guard = self.grace.lock();
-        let Some(g) = guard.as_ref() else {
-            return false;
-        };
-        if self.clock.now_ms() >= g.until_ms {
-            log::info!(
-                "S9: custody authority '{}' closed its grace window on the deadline with {} \
-                 co-writer(s) never re-asserting — their custody is gone and fresh acquires \
-                 are admitted again",
-                self.id,
-                g.expected.len()
-            );
-            *guard = None;
-            return false;
+        match self.table.probe_grace(self.clock.now_ms()) {
+            crate::grant_table_core::GraceProbe::Closed => false,
+            crate::grant_table_core::GraceProbe::ClosedNow { never_reasserted } => {
+                log::info!(
+                    "S9: custody authority '{}' closed its grace window on the deadline with \
+                     {never_reasserted} co-writer(s) never re-asserting — their custody is gone \
+                     and fresh acquires are admitted again",
+                    self.id,
+                );
+                false
+            }
+            crate::grant_table_core::GraceProbe::Open => true,
         }
-        true
     }
 
     /// Milliseconds left in the grace window (`0` = closed).
@@ -1410,26 +1321,16 @@ impl WriteCustodyOwner {
         if !self.in_grace() {
             return 0;
         }
-        let guard = self.grace.lock();
-        guard
-            .as_ref()
-            .map(|g| g.until_ms.saturating_sub(self.clock.now_ms()))
-            .unwrap_or(0)
+        self.table.grace_remaining_ms(self.clock.now_ms())
     }
 
     fn note_reclaim(&self, client: &str) {
-        let mut guard = self.grace.lock();
-        let Some(g) = guard.as_mut() else {
-            return;
-        };
-        g.expected.remove(client);
-        if g.expected.is_empty() {
+        if self.table.note_reclaim(client) == crate::grant_table_core::ReclaimNote::ClosedEarly {
             log::info!(
                 "S9: custody authority '{}' — every prior co-writer re-asserted, grace window \
                  closed early",
                 self.id
             );
-            *guard = None;
         }
     }
 
@@ -1480,18 +1381,10 @@ impl WriteCustodyOwner {
                 CONFLICTS.fetch_add(1, Ordering::Relaxed);
                 continue;
             };
-            let grant_id = self.next_grant.fetch_add(1, Ordering::AcqRel);
             let token = lease.fencing_token();
-            let _ = self.grants.insert_sync(
-                grant_id,
-                GrantState {
-                    client: req.client.clone(),
-                    lease_epoch: req.lease_epoch,
-                    ino: *ino,
-                    span: None,
-                    lease,
-                },
-            );
+            let grant_id = self
+                .table
+                .commit_grant(&req.client, req.lease_epoch, *ino, None, lease);
             self.granted.fetch_add(1, Ordering::Relaxed);
             out.push(GrantRecord {
                 schema: CUSTODY_SCHEMA,

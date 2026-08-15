@@ -95,3 +95,36 @@ first-touch sentinel at par (ON 875–982 vs OFF 797–931 MiB/s bands overlap).
 * Ladder: **B4d and B4e are DONE**; the parent `docs/design-device-overlay.md` B4 row flips to
   DONE via this note. The write-amp rig's overlay-overwrite engagement columns remain a rig
   follow-on (the columns exist on the stats inode; the B4d cells extracted them directly).
+
+## Depth addendum (2026-08-15, same box/binary — the offered-load probes)
+
+The +2–3.5 % headline above UNDERSTATED the arm: the qd4 row shape was offered-load-bound
+(8 jobs × qd4 = 128 MiB in flight against a ~4 ms round trip), which masked the win. The probe
+legs (fresh mount per leg, 60 s sustained, engagement columns from the same snapshot discipline):
+
+| Leg | Shape | Sustained | daemon j/GiB | Engagement |
+|---|---|---|---|---|
+| ONref | 8×qd4 | 32.1 GiB/s | 26.7 | ow 0.999, amp 1.0000 |
+| **ONq16** | 16×qd8 | **41.6 GiB/s** | 39.5 | ow 0.970, amp 1.0000, trips 0 |
+| ONboth | 16×qd8 + fusion lever | 41.4 GiB/s | 40.5 | fusions **0** (label-only) |
+| ONfuse | 8×qd4 + fusion lever | 31.9 GiB/s | 26.6 | fusions **0** (label-only) |
+| **OFFq16** | 16×qd8 | **30.1 GiB/s** | 63.7 | control |
+
+1. **The control is depth-FLAT** (31.0 at qd4 → 30.1 at 4× offered load): the B2 merge path is
+   pinned at ~31 GiB/s by the daemon merge-copy CPU wall regardless of load — the original
+   conviction, confirmed from the demand side. The sar capture during a control-class row shows
+   both ports balanced at ~64 % util: a third of the wire idle while the control sits flat.
+2. **The arm scales to the wires**: ON at 16×qd8 = 41.6 GiB/s = 357 Gb/s = **89 % of 2×200 GbE
+   raw line rate** (≈ practical nvme-tcp line rate), engagement exact. At the deep shape the arm
+   is **+38 % throughput at −38 % CPU/byte** vs the control. The remaining write wall on this
+   hardware is the fabric itself.
+3. **The fusion probes are label-only**: `SQUEEZEFS_FUSE_ZC_FUSION_MAX=4194304` turned but
+   `fuse3_zc_write_fusions` stayed 0 — an upstream eligibility screen keeps whole-block 4 MiB
+   stores off the fused path (the vehicle targets the W1/small population). The zc-write
+   extraction (`fuse3_zc_write_extract_bytes` ≈ 100 % of row bytes, one memory pass/byte)
+   remains a NAMED, unadjudicated CPU term — an efficiency-doctrine follow-on (extend fusion
+   eligibility to whole-block held stores), not a bandwidth term at 89 % line rate.
+4. Fresh-pass rows in all legs are 64 GiB/≈2.1 s bursts — label-only per the sustained rule; a
+   real fresh-ingest number needs a time-based first-touch row over never-written files.
+5. CPU/GiB rises with depth on the arm (26.7 → 39.5) — queue-worker economics at depth; the
+   next "same for less effort" candidate once the wire wall is confirmed during a 41-class row.

@@ -114,10 +114,13 @@ legs (fresh mount per leg, 60 s sustained, engagement columns from the same snap
    pinned at ~31 GiB/s by the daemon merge-copy CPU wall regardless of load — the original
    conviction, confirmed from the demand side. The sar capture during a control-class row shows
    both ports balanced at ~64 % util: a third of the wire idle while the control sits flat.
-2. **The arm scales to the wires**: ON at 16×qd8 = 41.6 GiB/s = 357 Gb/s = **89 % of 2×200 GbE
-   raw line rate** (≈ practical nvme-tcp line rate), engagement exact. At the deep shape the arm
-   is **+38 % throughput at −38 % CPU/byte** vs the control. The remaining write wall on this
-   hardware is the fabric itself.
+2. **The arm scales to the wires — CONFIRMED at the NIC**: ON at 16×qd8 = 41.6 GiB/s = 357 Gb/s
+   payload; sar during the row (`ONwire`, a repeat leg at 41.6) shows BOTH ports at **90.3–90.7 %
+   ifutil, balanced to < 2 %** (22.05–22.14 GB/s TX each ≈ 44.3 GB/s on the wire vs 44.7 GB/s
+   payload — the delta is TCP/NVMe framing). ~90 % is practical nvme-tcp line rate on 200 GbE.
+   At the deep shape the arm is **+38 % throughput at −38 % CPU/byte** vs the control. The
+   remaining write wall on this hardware is the fabric itself — more bandwidth means more/faster
+   ports (or an offloaded transport), not software.
 3. **The fusion probes are label-only**: `SQUEEZEFS_FUSE_ZC_FUSION_MAX=4194304` turned but
    `fuse3_zc_write_fusions` stayed 0 — an upstream eligibility screen keeps whole-block 4 MiB
    stores off the fused path (the vehicle targets the W1/small population). The zc-write

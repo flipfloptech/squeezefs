@@ -7,6 +7,14 @@ use std::sync::Arc;
 /// class); PR 4 flips the protected-only gate on this information.
 type EvictReceiver = squeezefs_ipc::sqz_channel::mpsc::Receiver<(String, Bytes, EvictClass)>;
 
+/// LRU shard count, pure form (tie-tested in the derivation sweep):
+/// `max(cores.next_power_of_two(), 16)` — power-of-two for the shard
+/// mask, floor 16 = the shipped contention posture on small boxes.
+/// `cores` is the fleet-share-DIVIDED sizing root (KD-MW-14 rung 3c).
+pub fn shard_count_from(cores: usize) -> usize {
+    std::cmp::max(cores.next_power_of_two(), 16)
+}
+
 /// Insert flavor: the (protected, referenced) bit pairs the clock shard
 /// distinguishes (§5.4/§5.5).
 enum PutClass {
@@ -85,10 +93,11 @@ impl LruCache {
     /// shard count is reduced (never below 1) until each shard holds at
     /// least `min_shard_bytes`.
     pub fn with_capacity_min_shard(max_bytes: u64, min_shard_bytes: u64) -> Self {
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(16);
-        let mut num_shards = std::cmp::max(cores.next_power_of_two(), 16);
+        // Sharded on the fleet-share-DIVIDED root (KD-MW-14 rung 3c;
+        // caches construct on core-pinned mount workers, so the retired
+        // direct available_parallelism() read was also the Hang-1
+        // pinned-first-toucher class).
+        let mut num_shards = shard_count_from(crate::cpu::process_parallelism());
         if min_shard_bytes > 0 {
             while num_shards > 1 && max_bytes / (num_shards as u64) < min_shard_bytes {
                 num_shards /= 2;

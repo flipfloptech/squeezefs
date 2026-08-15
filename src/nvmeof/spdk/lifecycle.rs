@@ -947,6 +947,9 @@ pub fn install(
         &log,
         &mut configure,
     )?;
+    // Fleet share does NOT apply (KD-MW-14 rung 3c, class c): -j sizes a
+    // one-shot external `make` for the SPDK source build (an install
+    // act), not a daemon resource.
     let jobs = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);

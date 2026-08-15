@@ -57,6 +57,16 @@ async fn read_format_config(first_meta: &str) -> Result<crate::FormatConfig> {
 ///
 /// Unparseable `SUDO_UID`/`SUDO_GID` values fall back per-field to the
 /// effective identity (never a panic on a hostile environment).
+/// Format-verb concurrent volume-format pool width, pure form
+/// (tie-tested in the derivation sweep; moved out of `main.rs`'s format
+/// arm as KD-MW-14 rung 3c): `cpus × 2` — format tasks are I/O-parked
+/// device work, so the permit pool oversubscribes the (fleet-share-
+/// DIVIDED) core root ×2; floor 2 keeps a degenerate root formatting a
+/// meta+data pair concurrently.
+pub fn format_pool_permits(cpus: usize) -> usize {
+    cpus.saturating_mul(2).max(2)
+}
+
 pub fn resolve_invoking_owner(
     euid: u32,
     egid: u32,

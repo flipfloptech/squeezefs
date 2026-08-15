@@ -13,7 +13,9 @@
 //!   core count (no free constants): cap = `cpus × 16` (blocking work
 //!   is I/O-parked, not CPU-bound — the oversubscription mirrors the
 //!   class), floor 8 (physical minimum useful parallel blocking
-//!   capacity on any host). Idle threads exit after [`IDLE_REAP`].
+//!   capacity on any host) — where `cpus` is the fleet-share-DIVIDED
+//!   sizing root the daemon feeds ([`set_sizing_parallelism`], KD-MW-14
+//!   rung 3c). Idle threads exit after [`IDLE_REAP`].
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -25,6 +27,44 @@ use std::time::Duration;
 /// Idle blocking threads park this long, then exit (cached-thread
 /// hygiene; respawn on demand is one thread::spawn).
 const IDLE_REAP: Duration = Duration::from_secs(10);
+
+/// The CPU count the pool SIZES with, fed by the embedding daemon.
+///
+/// KD-MW-14 rung 3c: this crate cannot depend on the root crate, so the
+/// daemon feeds the fleet-share-DIVIDED sizing root
+/// (`crate::cpu::process_parallelism()`) here at startup — the sizing.rs
+/// pattern (pure forms fed a `cpus` the caller resolves), adapted for a
+/// process-global lazy pool. First set wins (the pool caches its cap at
+/// first use anyway); unfed embeddings (unit tests, foreign hosts) fall
+/// back to the raw mask below.
+static SIZING_CPUS: OnceLock<usize> = OnceLock::new();
+
+/// Feed the sizing CPU root (the daemon calls this with the DIVIDED
+/// `process_parallelism()` before any blocking offload). Idempotent:
+/// the first value wins.
+pub fn set_sizing_parallelism(cpus: usize) {
+    let _ = SIZING_CPUS.set(cpus.max(1));
+}
+
+/// Pure pool-cap form (tie-tested by the root suite's derivation sweep):
+/// `cpus × 16` — blocking work is I/O-parked, not CPU-bound, so the
+/// admitted width oversubscribes the (divided) core root ×16; floor 8 =
+/// the minimum useful parallel blocking capacity on any host.
+pub fn pool_cap_from(cpus: usize) -> usize {
+    cpus.saturating_mul(16).max(8)
+}
+
+/// The sizing CPU count: the daemon-fed divided root, or — for unfed
+/// embeddings only — the calling thread's mask (the daemon never relies
+/// on this arm, which is what keeps the Hang-1 pinned-first-toucher
+/// class and the fleet-share bypass out of the shipped binary).
+fn sizing_parallelism() -> usize {
+    SIZING_CPUS.get().copied().unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    })
+}
 
 /// Run a future to completion on the calling OS thread (the bootstrap /
 /// lane-edge executor). The waker unparks this thread; the loop
@@ -85,9 +125,6 @@ struct Pool {
 fn pool() -> &'static Pool {
     static P: OnceLock<Pool> = OnceLock::new();
     P.get_or_init(|| {
-        let cpus = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
         Pool {
             state: Mutex::new(PoolState {
                 queue: VecDeque::new(),
@@ -96,10 +133,9 @@ fn pool() -> &'static Pool {
                 seq: 0,
             }),
             ready: Condvar::new(),
-            // Derived: blocking work parks in syscalls, so the admitted
-            // width oversubscribes cores ×16; floor 8 = the minimum
-            // useful parallel blocking capacity on any host.
-            cap: (cpus * 16).max(8),
+            // Derived from the daemon-fed DIVIDED sizing root (KD-MW-14
+            // rung 3c) via the pure form above.
+            cap: pool_cap_from(sizing_parallelism()),
         }
     })
 }

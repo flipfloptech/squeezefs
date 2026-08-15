@@ -32,16 +32,23 @@ struct MetaExec {
     next: AtomicUsize,
 }
 
-static META_EXEC: once_cell::sync::Lazy<MetaExec> = once_cell::sync::Lazy::new(|| {
-    let n = if std::thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(1)
-        > 1
-    {
+/// Lane population, pure form (tie-tested in the derivation sweep): 2,
+/// or 1 on an EFFECTIVE uniprocessor — the population is a handful of
+/// mostly-parked loops, not a throughput venue. `cpus` is the
+/// fleet-share-DIVIDED sizing root (KD-MW-14 rung 3c; the retired direct
+/// `available_parallelism()` read was also the Hang-1
+/// pinned-first-toucher class — this Lazy can be first touched from a
+/// pinned worker).
+pub fn meta_lanes_from(cpus: usize) -> usize {
+    if cpus > 1 {
         2
     } else {
         1
-    };
+    }
+}
+
+static META_EXEC: once_cell::sync::Lazy<MetaExec> = once_cell::sync::Lazy::new(|| {
+    let n = meta_lanes_from(crate::cpu::process_parallelism());
     let mut lanes = Vec::with_capacity(n);
     for i in 0..n {
         let exec = LaneExec::new();

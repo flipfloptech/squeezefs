@@ -18,6 +18,19 @@ use zeroize::{Zeroize, Zeroizing};
 /// reads never worked, so there is no behavior to preserve).
 const FRAME_LEN_BYTES: usize = 4;
 
+/// §5.7 scratch-pool capacity, pure form (tie-tested in the derivation
+/// sweep): `(cores / 4).clamp(4, 16)`. Small on purpose: the queue is
+/// FIFO, so a capacity far above the concurrent-transform count rotates
+/// every handout through a cache-cold worst-case buffer (measured
+/// +4..10 % on the 4 MiB lz4/aes micro-benches at cores × 4 buffers).
+/// Pool-empty handouts fall back to a fresh aligned allocation — exactly
+/// the pre-pool per-transform cost, paid only by burst excess over this
+/// steady-state hot set. `cores` is the fleet-share-DIVIDED sizing root
+/// (KD-MW-14 rung 3c).
+pub fn scratch_pool_capacity_from(cores: usize) -> usize {
+    (cores / 4).clamp(4, 16)
+}
+
 /// FIND-RW4-A store-raw escape marker (bit 31 of the frame word): the
 /// image payload was stored RAW — compression was attempted and did not
 /// shrink the block (incompressible data expands under lz4/zstd), so the
@@ -436,17 +449,11 @@ impl CryptoCompressState {
             let buf_size = self
                 .worst_case_scratch_len(block_size)
                 .next_multiple_of(POOLED_BUF_ALIGN);
-            let cores = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4);
-            // Small on purpose: the queue is FIFO, so a capacity far above
-            // the concurrent-transform count rotates every handout through a
-            // cache-cold worst-case buffer (measured +4..10% on the 4 MiB
-            // lz4/aes micro-benches at cores*4 buffers). Pool-empty handouts
-            // fall back to a fresh aligned allocation — exactly today's
-            // per-transform cost, paid only by burst excess over this
-            // steady-state hot set.
-            let capacity = (cores / 4).clamp(4, 16);
+            // Sized from the fleet-share-DIVIDED root (KD-MW-14 rung 3c;
+            // this init runs on core-pinned workers, so the retired
+            // direct available_parallelism() read was also the Hang-1
+            // pinned-first-toucher class).
+            let capacity = scratch_pool_capacity_from(crate::cpu::process_parallelism());
             Arc::new(BufferPool::new(capacity, buf_size))
         });
     }

@@ -927,6 +927,9 @@ pub fn resolve_shape(
     let threads_auto = threads.is_none();
     let resolved_threads = threads.unwrap_or_else(|| {
         clamp_auto_threads(
+            // Fleet share does NOT apply (KD-MW-14 rung 3c, class c):
+            // this sizes the BENCH TOOL's own load generation against
+            // the machine under test, not a daemon resource.
             std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1),

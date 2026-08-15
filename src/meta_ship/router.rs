@@ -78,15 +78,25 @@ pub static TEST_SHIP_DRAIN_HOLD_MS: AtomicU64 = AtomicU64::new(0);
 /// frame become that many transactions on the owner's conveyor, so sizing
 /// a frame past what the owner can drain in one pass buys queueing, not
 /// throughput. Floored at 64 (the shipped M7 posture) and ceilinged so a
-/// frame stays inside the wire's CONTROL class.
+/// frame stays inside the wire's CONTROL class. `cpus` is the
+/// fleet-share-DIVIDED sizing root (KD-MW-14 rung 3c — the retired
+/// direct `available_parallelism()` read bypassed the divisor and was
+/// calling-thread-mask exposed).
 pub fn batch_max() -> usize {
-    if let Some(explicit) = crate::env_knobs::opt_int_knob::<usize>(BATCH_MAX_ENV) {
+    batch_max_from(
+        crate::env_knobs::opt_int_knob::<usize>(BATCH_MAX_ENV),
+        crate::cpu::process_parallelism(),
+    )
+}
+
+/// Pure form (tie-tested in the derivation sweep): explicit wins
+/// verbatim within its admissible range; derived = `(cpus × 2).clamp(64,
+/// 4096)` — floor 64 = the shipped M7 posture.
+pub fn batch_max_from(explicit: Option<usize>, cpus: usize) -> usize {
+    if let Some(explicit) = explicit {
         return explicit.clamp(1, 4096);
     }
-    let cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    (cpus * 2).clamp(64, 4096)
+    cpus.saturating_mul(2).clamp(64, 4096)
 }
 
 /// Where a verb executes.

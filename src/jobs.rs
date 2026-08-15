@@ -988,6 +988,18 @@ impl JobCtl {
 
 /// The coordinator-side fabric. One per mounted daemon (or per offline
 /// D0-guarded coordinator process).
+/// VL2 fabric worker default, pure form (tie-tested in the derivation
+/// sweep; moved out of `main.rs`'s mount arm as KD-MW-14 rung 3c):
+/// `(cpus / 4).clamp(2, 8)` — the L4 service posture's slope, floored so
+/// a small box still runs a coordinator pair and ceilinged so a big one
+/// does not spawn a worker farm for a duty-cycled maintenance plane.
+/// `cpus` is the fleet-share-DIVIDED sizing root; the retired direct
+/// `available_parallelism()` read in the mount arm ran on core-pinned
+/// tokio workers (the Hang-1 pinned-first-toucher class).
+pub fn fabric_workers_default(cpus: usize) -> usize {
+    cpus.div_euclid(4).clamp(2, 8)
+}
+
 pub struct JobFabric {
     meta: Arc<RoutedMetaBackend>,
     jobs: parking_lot::Mutex<HashMap<String, Arc<JobCtl>>>,

@@ -1115,15 +1115,22 @@ const TLS_HALF_POLL_TICK: Duration = Duration::from_millis(100);
 /// the connection cap ([`RpcListenerConfig::max_connections`]) is what
 /// bounds serve threads.
 pub fn default_service_threads() -> usize {
-    let cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    // Allocation math rounds UP (2026-08-14 ruling): a fractional
-    // share of the box derives the next whole RPC lane.
+    // Sized from the fleet-share-DIVIDED root (KD-MW-14 rung 3c — the
+    // retired direct available_parallelism() read bypassed the divisor).
+    service_threads_from(
+        crate::env_knobs::opt_int_knob::<usize>("SQUEEZEFS_CLUSTER_WIRE_SVC_THREADS"),
+        crate::cpu::process_parallelism(),
+    )
+}
+
+/// Pure form (tie-tested in the derivation sweep): derived =
+/// `ceil(cpus / 8).clamp(1, 8)` — allocation math rounds UP (2026-08-14
+/// ruling: a fractional share of the box derives the next whole RPC
+/// lane); explicit wins verbatim, and neither ever oversubscribes the
+/// (divided) root.
+pub fn service_threads_from(explicit: Option<usize>, cpus: usize) -> usize {
     let derived = cpus.div_ceil(8).clamp(1, 8);
-    let want = crate::env_knobs::opt_int_knob::<usize>("SQUEEZEFS_CLUSTER_WIRE_SVC_THREADS")
-        .unwrap_or(derived);
-    want.clamp(1, cpus.max(1))
+    explicit.unwrap_or(derived).clamp(1, cpus.max(1))
 }
 
 // ---------------------------------------------------------------------------
@@ -1447,11 +1454,15 @@ impl Default for RpcListenerConfig {
 /// derive from system resources), floored so a small box still admits a
 /// real peer population and ceilinged so a large one still has a bound.
 pub fn default_max_connections() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(8)
-        .saturating_mul(16)
-        .clamp(64, 1024)
+    // Sized from the fleet-share-DIVIDED root (KD-MW-14 rung 3c).
+    max_connections_from(crate::cpu::process_parallelism())
+}
+
+/// Pure form (tie-tested in the derivation sweep): `(cpus × 16).clamp(64,
+/// 1024)` — floored so a small box still admits a real peer population,
+/// ceilinged so a large one still has a bound.
+pub fn max_connections_from(cpus: usize) -> usize {
+    cpus.saturating_mul(16).clamp(64, 1024)
 }
 
 /// Listener counters. `mac_failures` and `service_refusals` are

@@ -108,6 +108,10 @@ fn sessions_per_mount() -> usize {
     *K.get_or_init(|| {
         sessions_per_mount_from(
             std::env::var("SQUEEZEFS_IL_SESSIONS").ok().as_deref(),
+            // Fleet share does NOT apply (KD-MW-14 rung 3c, class c):
+            // the shim sizes the CLIENT application's sessions from the
+            // client process's own mask — the daemon divisor governs
+            // daemon resources only.
             std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(8),

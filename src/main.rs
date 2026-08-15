@@ -2486,6 +2486,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
+    // KD-MW-14 rung 3c: feed squeezefs-ipc's blocking pool the fleet-
+    // share-DIVIDED sizing root before its first offload (the crate
+    // cannot depend on `squeezefs::cpu`, so the daemon feeds it — the
+    // sizing.rs pattern; unfed embeddings fall back to the raw mask).
+    // After the ENG-10 gate on purpose: SQUEEZEFS_FLEET_SHARE is
+    // validated before the root reads it.
+    squeezefs_ipc::sqz_blocking::set_sizing_parallelism(squeezefs::cpu::process_parallelism());
+
     let mut cli = Cli::parse();
 
     // ENG-3 (the daemon must be audible): the --log-file target must be
@@ -3934,10 +3942,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let quick = !full;
-            let num_cores = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4);
-            let pool_size = num_cores * 2;
+            // Pool width from the fleet-share-DIVIDED root (KD-MW-14
+            // rung 3c) via the tie-tested pure form.
+            let pool_size =
+                squeezefs::config_ops::format_pool_permits(squeezefs::cpu::process_parallelism());
             let semaphore =
                 std::sync::Arc::new(squeezefs_ipc::sqz_semaphore::Semaphore::new(pool_size));
             let mp = std::sync::Arc::new(indicatif::MultiProgress::new());
@@ -5587,11 +5595,13 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                      cannot write their durable records)"
                 );
             } else {
-                let fabric_workers = std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(8)
-                    .div_euclid(4)
-                    .clamp(2, 8);
+                // Worker width from the fleet-share-DIVIDED root
+                // (KD-MW-14 rung 3c) via the tie-tested pure form; this
+                // arm runs on core-pinned workers, so the retired direct
+                // available_parallelism() read was also the Hang-1
+                // pinned-first-toucher class.
+                let fabric_workers =
+                    squeezefs::jobs::fabric_workers_default(squeezefs::cpu::process_parallelism());
                 // VL4: the mover context — the data router + this mount's
                 // quiescence probe (RAM active buffers + staging records) —
                 // arms the evacuate/rebalance job types on the fabric.

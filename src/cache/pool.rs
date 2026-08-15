@@ -310,11 +310,25 @@ impl AsRef<[u8]> for PooledBufOwner {
     }
 }
 
+/// Whole-block pool capacity, pure form (tie-tested in the derivation
+/// sweep): `max(cores × 16, 64)` — `cores` is the fleet-share-DIVIDED
+/// sizing root (KD-MW-14 rung 3c; these Lazies are first touched from
+/// core-pinned workers, so the retired direct `available_parallelism()`
+/// reads were also the Hang-1 pinned-first-toucher class — a pinned
+/// first toucher saw ONE cpu and collapsed the pool to its floor).
+pub fn block_pool_capacity_from(cores: usize) -> usize {
+    std::cmp::max(cores.saturating_mul(16), 64)
+}
+
+/// Ranged read-bounce pool capacity, pure form (tie-tested in the
+/// derivation sweep): `max(cores × 64, 512)` — sized for miss-path
+/// concurrency (hundreds of in-flight sub-block reads), not block count.
+pub fn ranged_pool_capacity_from(cores: usize) -> usize {
+    std::cmp::max(cores.saturating_mul(64), 512)
+}
+
 pub static BUFFER_POOL: Lazy<Arc<BufferPool>> = Lazy::new(|| {
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    let capacity = std::cmp::max(cores * 16, 64);
+    let capacity = block_pool_capacity_from(crate::cpu::process_parallelism());
     Arc::new(BufferPool::new(capacity, 4 * 1024 * 1024))
 });
 
@@ -629,10 +643,8 @@ impl Drop for AlignedBufPool {
 }
 
 pub static ALIGNED_BUF_POOL: Lazy<Arc<AlignedBufPool>> = Lazy::new(|| {
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    let capacity = std::cmp::max(cores * 16, 64);
+    // Same derived shape as BUFFER_POOL, from the DIVIDED root.
+    let capacity = block_pool_capacity_from(crate::cpu::process_parallelism());
     Arc::new(AlignedBufPool::new(capacity, 4 * 1024 * 1024))
 });
 
@@ -649,18 +661,15 @@ pub static ALIGNED_BUF_POOL: Lazy<Arc<AlignedBufPool>> = Lazy::new(|| {
 pub const RANGED_BUF_SIZE: usize = 64 * 1024;
 
 pub static RANGED_BUF_POOL: Lazy<Arc<AlignedBufPool>> = Lazy::new(|| {
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    // Sized for miss-path concurrency (hundreds of in-flight sub-block
-    // reads), not block count: 64 KiB backings are cheap (cores × 64 ≈
-    // 92 MiB on a 23-CPU box), and exhaustion degrades to ordinary
-    // allocation — counted by `aligned_pool_misses`.
+    // Derived via `ranged_pool_capacity_from` (the DIVIDED root): 64 KiB
+    // backings are cheap (cores × 64 ≈ 92 MiB on a 23-CPU box), and
+    // exhaustion degrades to ordinary allocation — counted by
+    // `aligned_pool_misses`.
     // Slab-backed (PERF-4 (b)): the NvmeBlockDev workers register the
     // slab as ONE io_uring fixed buffer, so ranged cold fills DMA without
     // per-op page pins. Same derived byte budget as before — one mapping
     // instead of `capacity` of them.
-    let capacity = std::cmp::max(cores * 64, 512);
+    let capacity = ranged_pool_capacity_from(crate::cpu::process_parallelism());
     Arc::new(AlignedBufPool::new_slabbed(capacity, RANGED_BUF_SIZE))
 });
 

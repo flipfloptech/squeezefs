@@ -949,7 +949,12 @@ fn bench_writer_scope(c: &mut Criterion) {
     });
     for (label, scope) in [
         ("disengaged", None),
-        ("engaged", Some(0x0123_4567_89ab_cdefu64)),
+        // KD-MW-2: an engaged MOUNT's scope is the pair (node, slot) —
+        // the shape every scoped mint now renders.
+        (
+            "engaged",
+            Some(ws::WriterScope::new(0x0123_4567_89ab_cdef, 0x00c0_ffee)),
+        ),
     ] {
         ws::engage(scope);
         // Mint: heap (the layout/flush paths) and zero-heap stack (the
@@ -1006,13 +1011,14 @@ fn bench_writer_scope(c: &mut Criterion) {
 
     // The item-10 root-level decision (once per staging root per mount).
     let set = "v3:00112233445566778899aabbccddeeff|v3:ffeeddccbbaa99887766554433221100";
-    let scoped = ws::staging_generation(set, Some(0x0123_4567_89ab_cdef));
+    let pair = ws::WriterScope::new(0x0123_4567_89ab_cdef, 0x00c0_ffee);
+    let scoped = ws::staging_generation(set, Some(pair));
     group.bench_function("classify_generation_match", |b| {
         b.iter(|| {
             black_box(ws::classify_generation(
                 black_box(&scoped),
                 black_box(&scoped),
-                black_box(Some(0x0123_4567_89ab_cdef)),
+                black_box(Some(pair)),
             ))
         });
     });
@@ -1365,6 +1371,7 @@ fn bench_free_grace_gate(c: &mut Criterion) {
         boot: "bench".to_string(),
         prior_epoch: None,
         pr_key: 0,
+        mount: None,
     }) {
         JoinOutcome::Granted(_) => {}
         JoinOutcome::Refused { reason, .. } => panic!("bench join refused: {reason}"),

@@ -224,16 +224,23 @@ pub fn rostered_members() -> Vec<String> {
         .collect()
 }
 
-/// This node's **durable enrollment identity**: `node_{16 hex}` over the
-/// writer-scope node token (see the module docs on why it is a node
-/// identity and not a mount uuid). Refuses loud exactly as
+/// This client's **durable enrollment identity** (KD-MW-2, design
+/// design-full-multi-writer §5.1): the pair `node_{16 hex}.m{8 hex}` —
+/// the writer-scope node token plus this mount's mount slot — or the bare
+/// `node_{16 hex}` form when this process has no mount slot (offline
+/// verbs, tests; a bare id is also what a SLOT-WILDCARD roster entry
+/// names, see [`crate::membership::member_id_matches`]). See the module
+/// docs on why the node half is a node identity and not a mount uuid;
+/// the slot half is what keeps two co-located mounts' identities apart.
+/// Refuses loud exactly as
 /// [`crate::writer_scope::resolve_node_identity`] does — an unstable
 /// identity would enroll one host and admit another.
 pub fn node_member_id() -> Result<String> {
-    Ok(format!(
-        "node_{:016x}",
-        crate::writer_scope::resolve_node_identity()?.token
-    ))
+    let node = crate::writer_scope::resolve_node_identity()?.token;
+    Ok(match crate::writer_scope::mount_slot() {
+        0 => format!("node_{node:016x}"),
+        slot => format!("node_{node:016x}.m{slot:08x}"),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -511,7 +518,13 @@ fn rung_3_durable_enrollment(req: &AdmissionRequest) -> Result<()> {
             .claim_set
             .as_ref()
             .expect("rung 2 established a durable claim set");
-        let named = set.members.iter().find(|m| m.identity.id == req.node_id);
+        // KD-MW-2: entries match exactly, or as a bare-node SLOT WILDCARD
+        // (`node_{16 hex}` names every mount slot of that node — the
+        // single-mount-host convenience the §11 grammar keeps).
+        let named = set
+            .members
+            .iter()
+            .find(|m| crate::membership::member_id_matches(&m.identity.id, &req.node_id));
         match named {
             Some(m) if m.identity.role == MemberRole::Writer => {}
             Some(_) => {

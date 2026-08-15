@@ -183,6 +183,20 @@ enum Commands {
         #[command(subcommand)]
         action: VolumeActions,
     },
+    // Anchor: design-full-multi-writer §5.1(b) (KD-MW-2, crash window
+    // MW-1b) — the moved-mount-point residue resolution verbs.
+    /// Resolve moved-mount-point staging residue (adopt or discard)
+    ///
+    /// On a writer-scoped volume set, staging roots are bound to a
+    /// client identity (node + mount slot). Remounting at a different
+    /// path strands the old slot's staged residue; every mount reports
+    /// it loudly until it is resolved here (or adopted by mounting with
+    /// -o client_slot=<hex8>). Offline verbs: they take the format-grade
+    /// live-client refusal and never touch a live mount's roots.
+    Staging {
+        #[command(subcommand)]
+        action: StagingActions,
+    },
     // Anchor: design-volume-lifecycle §6 (the maintenance-job fabric).
     /// Control maintenance jobs
     ///
@@ -1155,6 +1169,41 @@ enum TargetActions {
         /// DPDK hugepage memory (spdk_tgt -s) to bake, in MiB (default 1024)
         #[arg(long)]
         dpdk_mem_mb: Option<u64>,
+    },
+}
+
+// Anchor: design-full-multi-writer §5.1(b) — `staging adopt|discard`.
+#[derive(Subcommand, Debug, Clone)]
+enum StagingActions {
+    /// Re-bind a dead client slot's staging residue to this node
+    ///
+    /// The residue root's generation marker is re-bound (the crash-safe
+    /// KD-8 two-phase rebind) from the dead slot to this node, so the
+    /// next mount of this set on this node adopts its durable staged
+    /// payloads. PENDING write custody refuses the rebind (its record
+    /// keys carry the dead slot and cannot be re-keyed): drain it first
+    /// by mounting with -o client_slot=<hex8>.
+    Adopt {
+        /// The residue mount slot (hex8, from the mount report or
+        /// `squeezefs clients`)
+        #[arg(long)]
+        slot: String,
+        /// Metadata URI (sqmeta://...) or a metadata volume path
+        meta_uri: String,
+    },
+    /// Destroy a dead client slot's staging residue
+    ///
+    /// Enumerates every live staged custody key it destroys (the
+    /// attested-verb loudness class), then removes the residue root.
+    /// The staged bytes are gone by design — this is the stale-token
+    /// orphan-discard posture made an explicit operator act.
+    Discard {
+        /// The residue mount slot (hex8, from the mount report or
+        /// `squeezefs clients`)
+        #[arg(long)]
+        slot: String,
+        /// Metadata URI (sqmeta://...) or a metadata volume path
+        meta_uri: String,
     },
 }
 
@@ -3984,6 +4033,59 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             };
             run_clients_report(&meta_lvs, json).await?;
         }
+        // Anchor: design-full-multi-writer §5.1(b) (KD-MW-2, MW-1b).
+        Commands::Staging { action } => {
+            squeezefs::set_fs_prefix("squeezefs");
+            let parse_target = |uri: &str| -> Result<Vec<String>, Box<dyn std::error::Error>> {
+                if uri.starts_with("sqmeta://") {
+                    Ok(parse_block_uri(uri, "sqmeta://")?)
+                } else {
+                    Ok(vec![uri.to_string()])
+                }
+            };
+            match action {
+                StagingActions::Adopt { slot, meta_uri } => {
+                    let slot = squeezefs::writer_scope::parse_client_slot(&slot)?;
+                    let meta_lvs = parse_target(&meta_uri)?;
+                    let dirs = squeezefs::config_ops::staging_adopt(&meta_lvs, slot).await?;
+                    println!(
+                        "Adopted slot m{slot:08x}'s staging residue to this node ({} root(s)):",
+                        dirs.len()
+                    );
+                    for d in &dirs {
+                        println!("  {}", d.display());
+                    }
+                    println!(
+                        "The next mount of this volume set on this node binds the re-bound \
+                         root(s) and recovers their durable staged payloads."
+                    );
+                }
+                StagingActions::Discard { slot, meta_uri } => {
+                    let slot = squeezefs::writer_scope::parse_client_slot(&slot)?;
+                    let meta_lvs = parse_target(&meta_uri)?;
+                    let (dirs, keys) =
+                        squeezefs::config_ops::staging_discard(&meta_lvs, slot).await?;
+                    // The attested-verb loudness class: every destroyed
+                    // key and root is enumerated.
+                    println!(
+                        "DESTROYED slot m{slot:08x}'s staging residue: {} root(s), {} live \
+                         staged custody unit(s).",
+                        dirs.len(),
+                        keys.len()
+                    );
+                    for d in &dirs {
+                        println!("  root: {}", d.display());
+                    }
+                    for k in &keys {
+                        println!("  freed: {k}");
+                    }
+                    println!(
+                        "Those staged bytes are gone by design (the stale-token \
+                         orphan-discard posture, made an explicit operator act)."
+                    );
+                }
+            }
+        }
         Commands::Volume { action } => {
             squeezefs::set_fs_prefix("squeezefs");
             let live = |t: &str| !t.starts_with("sqmeta://");
@@ -4629,7 +4731,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // down the striped/inline paths instead of the staged tier.
             let staging_dirs = format_config.disk_cache_paths.clone().unwrap_or_default();
 
-            let mut active_staging_dirs = staging_dirs;
+            let mut active_staging_dirs = staging_dirs.clone();
             let fs_name = "squeezefs".to_string();
 
             let sanitized_mount = mountpoint
@@ -4777,27 +4879,93 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // from a different host.
             squeezefs::fuse_client::set_entry_generation(&fs_generation);
 
+            // KD-MW-2 (design-full-multi-writer §5.1): the CLIENT identity
+            // is the pair `(node_token, mount_slot)`. The slot is derived
+            // from the CANONICALIZED mount point (mount-point-stable — a
+            // restart of the same mount point is the SAME client, which is
+            // what keeps staged-crash recovery a continuity law; distinct
+            // across co-located mounts), or given explicitly with
+            // `-o client_slot=<hex8>` (the moved-mount-point remedy). A
+            // malformed value REFUSES the mount (parse_client_slot's law).
+            let client_slot_override =
+                squeezefs::writer_scope::client_slot_from_options(options.as_deref())?;
+            let canonical_mount = std::fs::canonicalize(&mountpoint)
+                .unwrap_or_else(|_| mountpoint.clone())
+                .to_string_lossy()
+                .into_owned();
+            let mount_slot = client_slot_override
+                .unwrap_or_else(|| squeezefs::writer_scope::derive_mount_slot(&canonical_mount));
+            squeezefs::writer_scope::set_mount_identity(mount_slot, &canonical_mount);
+
             // §6.2 items 8/10 (incompat bit 10, ruling D9 — nothing stamps
             // it today, so this resolves to `None` on every shipped
             // volume): a writer-scoped set labels its staging keys and its
-            // staging-generation stamp with this NODE's identity, so a
-            // peer's records and a peer's staging root can be classified
-            // instead of silently adopted.
-            let writer_scope = squeezefs::writer_scope::resolve_scope_for_set(&meta_lvs).await?;
+            // staging-generation stamp with this CLIENT's identity — the
+            // (node, mount_slot) pair — so a peer's records and a peer's
+            // staging root can be classified instead of silently adopted,
+            // including a co-located sibling mount's (KD-MW-2).
+            let writer_scope = squeezefs::writer_scope::resolve_scope_for_set(&meta_lvs)
+                .await?
+                .map(|s| squeezefs::writer_scope::WriterScope::new(s.node, mount_slot));
             squeezefs::writer_scope::engage(writer_scope);
             let staging_generation =
                 squeezefs::writer_scope::staging_generation(&fs_generation, writer_scope);
             match writer_scope {
-                Some(token) => log::info!(
-                    "writer-scoped staging ENGAGED: node scope w_{token:016x} \
+                Some(scope) => log::info!(
+                    "writer-scoped staging ENGAGED: client scope {} \
                      (staging generation \"{staging_generation}\") — staging keys carry \
-                     the scope and this node's staging roots are bound to it"
+                     the scope and this client's staging roots are bound to it",
+                    scope.render()
                 ),
-                None => log::debug!(
-                    "writer-scoped staging disengaged (volume set does not carry incompat \
-                     bit {}) — keys and staging stamps are byte-identical to prior releases",
-                    squeezefs::meta_backend::kv::superblock::WRITER_SCOPED_STAGING_BIT
-                ),
+                None => {
+                    if let Some(slot) = client_slot_override {
+                        // Announced-inert, never a refusal (the
+                        // SQUEEZEFS_DELEGATION posture): residue only
+                        // exists on writer-scoped sets, so there is
+                        // nothing the override could adopt here.
+                        log::warn!(
+                            "-o client_slot={slot:08x} is INERT on this mount: the volume set \
+                             is not writer-scoped (incompat bit 10 unstamped), so staging \
+                             carries no mount-slot identity to override"
+                        );
+                    }
+                    log::debug!(
+                        "writer-scoped staging disengaged (volume set does not carry incompat \
+                         bit {}) — keys and staging stamps are byte-identical to prior releases",
+                        squeezefs::meta_backend::kv::superblock::WRITER_SCOPED_STAGING_BIT
+                    )
+                }
+            }
+
+            // The moved-mount-point law (design §5.1, crash window MW-1b)
+            // — SCOPED mounts only, so un-scoped solo mounts stay
+            // byte-identical: own this mount's staging roots (liveness
+            // locks), refuse an observed mount-slot collision (OQ-5),
+            // adopt exact-pair siblings (the `-o client_slot=` remedy) and
+            // verb-adopted node roots, and report foreign-slot residue
+            // LOUD on every mount until it is resolved.
+            if writer_scope.is_some() {
+                let containers: Vec<PathBuf> =
+                    staging_dirs.iter().map(|d| d.join(&fs_name)).collect();
+                let scan = squeezefs::config_ops::mount_scoped_staging_prelude(
+                    &containers,
+                    &active_staging_dirs,
+                    &canonical_mount,
+                    &staging_generation,
+                )
+                .await?;
+                for dir in scan.adopted {
+                    active_staging_dirs.push(dir);
+                }
+                if let Some(report) = squeezefs::config_ops::residue_report(&scan.residue) {
+                    // Loud at DEFAULT verbosity (the staging-discard
+                    // precedent): console line + structured record. The
+                    // mount proceeds — the residue is not this client's to
+                    // touch — and the report repeats on every mount until
+                    // an operator resolves it (the never-lossy law).
+                    eprintln!("{report}");
+                    log::error!("{report}");
+                }
             }
 
             let cache = TieredCache::new(
@@ -6574,6 +6742,20 @@ async fn run_clients_report(
         count_state("dead"),
     );
 
+    // KD-MW-2 / MW-1b (design-full-multi-writer §5.1): THIS NODE's
+    // slot-decorated staging roots — including residue-holding DEAD client
+    // slots, so an operator can list the slot value a `-o client_slot=`
+    // remedy needs. Local by nature (staging is node-local); empty on
+    // un-scoped sets and nodes without roots. A scan failure degrades to
+    // "no rows" loudly rather than failing the report.
+    let residue = match squeezefs::config_ops::slot_residue_for_set(meta_lvs).await {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("staging residue scan skipped: {e}");
+            Vec::new()
+        }
+    };
+
     if json {
         let clients: Vec<serde_json::Value> = rows
             .iter()
@@ -6581,6 +6763,18 @@ async fn run_clients_report(
                 let mut v = r.to_json();
                 v["volume"] = serde_json::Value::String(path.clone());
                 v
+            })
+            .collect();
+        let residue_rows: Vec<serde_json::Value> = residue
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "slot": format!("m{:08x}", r.scope.slot),
+                    "scope": r.scope.render(),
+                    "dir": r.dir.display().to_string(),
+                    "live_owner": r.live_owner,
+                    "live_units": r.live_units,
+                })
             })
             .collect();
         println!(
@@ -6591,10 +6785,38 @@ async fn run_clients_report(
                 "live": live,
                 "stale": stale,
                 "dead": dead,
+                "staging_slots": residue_rows,
             }))?
         );
         return Ok(());
     }
+
+    let print_residue = |residue: &[squeezefs::config_ops::SlotResidue]| {
+        if residue.is_empty() {
+            return;
+        }
+        println!("\nStaging slots on THIS NODE (writer-scoped set):");
+        for r in residue {
+            if r.live_owner {
+                println!(
+                    "  slot m{:08x} at {} — OWNED by a live mount",
+                    r.scope.slot,
+                    r.dir.display()
+                );
+            } else {
+                println!(
+                    "  slot m{:08x} at {} — DEAD client slot, {} live staged unit(s): adopt \
+                     with `mount … -o client_slot={:08x}` or `squeezefs staging adopt --slot \
+                     {:08x} <sqmeta-uri>`; destroy with `squeezefs staging discard`",
+                    r.scope.slot,
+                    r.dir.display(),
+                    r.live_units.len(),
+                    r.scope.slot,
+                    r.scope.slot,
+                );
+            }
+        }
+    };
 
     if rows.is_empty() {
         println!(
@@ -6602,6 +6824,7 @@ async fn run_clients_report(
              holds this filesystem.",
             meta_lvs.len()
         );
+        print_residue(&residue);
         return Ok(());
     }
     println!(
@@ -6625,6 +6848,7 @@ async fn run_clients_report(
         "{} registration(s): {live} live, {stale} stale, {dead} dead (reclaimable).",
         rows.len()
     );
+    print_residue(&residue);
     Ok(())
 }
 

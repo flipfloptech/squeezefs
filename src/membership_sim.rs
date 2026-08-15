@@ -209,6 +209,7 @@ fn join_request(id: &str, role: MemberRole, endpoint: Option<String>) -> JoinReq
         boot: "sim".to_string(),
         prior_epoch: None,
         pr_key: 0,
+        mount: None,
     }
 }
 

@@ -8769,8 +8769,19 @@ impl SqueezefsFilesystem {
                 "uring_queue_full": METRICS.uring_queue_full.load(Ordering::Relaxed),
                 "staging_generation_discards": METRICS.staging_generation_discards.load(Ordering::Relaxed),
                 "staging_writer_scope": match crate::writer_scope::engaged_scope() {
-                    Some(t) => format!("w_{t:016x}"),
+                    // KD-MW-2: the pair renders `w_{node}.m{slot}`; a
+                    // node-only scope keeps the pre-pair `w_{node}` form.
+                    Some(s) => s.render(),
                     None => "none".to_string(),
+                },
+                // KD-MW-2: this mount's client-identity slot (`m{8 hex}`;
+                // "none" before the mount path records it — offline
+                // processes). Present whether or not the staging scope is
+                // engaged: the slot is CLIENT identity, bit 10 only
+                // decides whether staging keys carry it.
+                "client_slot": match crate::writer_scope::mount_slot() {
+                    0 => "none".to_string(),
+                    slot => format!("m{slot:08x}"),
                 },
                 "staging_scope_upgrades": METRICS.staging_scope_upgrades.load(Ordering::Relaxed),
                 "staging_foreign_scope_refusals": METRICS.staging_foreign_scope_refusals.load(Ordering::Relaxed),

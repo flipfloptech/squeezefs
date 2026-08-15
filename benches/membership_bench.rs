@@ -85,6 +85,7 @@ fn owner_with(members: usize) -> (Arc<MembershipOwner>, Vec<(String, u64)>, Arc<
             boot: "bench-boot".to_string(),
             prior_epoch: None,
             pr_key: 0,
+            mount: None,
         };
         match owner.join(req) {
             JoinOutcome::Granted(g) => ids.push((id, g.epoch)),

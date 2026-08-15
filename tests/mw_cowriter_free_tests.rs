@@ -1048,6 +1048,7 @@ async fn shipped_frees_enter_the_grace_ring_when_the_reader_plane_is_armed() {
         boot: "boot-free-test".to_string(),
         prior_epoch: None,
         pr_key: 0,
+        mount: None,
     }) {
         JoinOutcome::Granted(g) => g,
         JoinOutcome::Refused { reason, .. } => panic!("join refused: {reason}"),
@@ -1245,6 +1246,7 @@ async fn two_co_writers_rewrite_disjoint_files_while_a_reader_acks() {
         boot: "boot-storm".to_string(),
         prior_epoch: None,
         pr_key: 0,
+        mount: None,
     }) {
         JoinOutcome::Granted(g) => g,
         JoinOutcome::Refused { reason, .. } => panic!("join refused: {reason}"),

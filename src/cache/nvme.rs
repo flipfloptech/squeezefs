@@ -371,16 +371,18 @@ async fn bind_staging_generation(dir: &std::path::Path, fs_generation: &str) -> 
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let msg = format!(
                 "STAGING WRITER-SCOPE REFUSAL at {}: this staging root is bound to \
-                 filesystem generation \"{fs_generation}\"'s set but to node scope \
-                 w_{other:016x} (ours: {}), and it holds LIVE staged write custody \
+                 filesystem generation \"{fs_generation}\"'s set but to writer scope \
+                 {other} (ours: {}), and it holds LIVE staged write custody \
                  ({} unit(s), e.g. {:?}) — refusing the staging root as a unit. Those \
-                 bytes are another writer's acked custody: this node cannot flush them \
-                 (their payload ring is that node's) and must not wipe them. Remedy: \
-                 mount on the node that owns them and let writeback drain, or give this \
-                 mount a node-private staging path (`squeezefs config set-cache-paths`)",
+                 bytes are another writer's acked custody: this client cannot flush them \
+                 (their payload ring is that client's) and must not wipe them. Remedy: \
+                 mount as the client that owns them (its node, and — for a mount-slot \
+                 scope — its mount point, or `-o client_slot=<hex8>`) and let writeback \
+                 drain, or give this mount a private staging path (`squeezefs config \
+                 set-cache-paths`)",
                 dir.display(),
                 match want_scope {
-                    Some(t) => format!("w_{t:016x}"),
+                    Some(s) => s.render(),
                     None => "none (this volume set is not writer-scoped)".to_string(),
                 },
                 live.len(),
@@ -397,7 +399,7 @@ async fn bind_staging_generation(dir: &std::path::Path, fs_generation: &str) -> 
             .staging_foreign_scope_discards
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let msg = format!(
-            "staging root {} was bound to node scope w_{other:016x} but carries no live \
+            "staging root {} was bound to writer scope {other} but carries no live \
              staged write custody — discarding its dead content (lossless) and stamping \
              \"{fs_generation}\"",
             dir.display(),

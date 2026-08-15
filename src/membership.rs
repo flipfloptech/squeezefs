@@ -168,6 +168,27 @@ impl MemberRole {
     }
 }
 
+/// KD-MW-2 (design-full-multi-writer §5.1): does a roster/claim-set entry
+/// name `client_id`?
+///
+/// Client identities are the pair `node_{16 hex}.m{8 hex}`; a BARE
+/// `node_{16 hex}` entry is the **slot wildcard** (§11: "bare `node_`
+/// form still accepted = slot wildcard for single-mount hosts"), matching
+/// every mount slot of that node. A pair-form entry matches exactly.
+/// Entries that are not node ids at all (the membership owner's uuid, a
+/// D0 claim uuid) match only exactly.
+pub fn member_id_matches(entry: &str, client_id: &str) -> bool {
+    if entry == client_id {
+        return true;
+    }
+    if !entry.contains('.') {
+        if let Some(rest) = client_id.strip_prefix(entry) {
+            return rest.starts_with(".m");
+        }
+    }
+    false
+}
+
 /// Who a member is — the durable half of membership (identity survives a
 /// crash and must be recovered; liveness does not).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -755,6 +776,13 @@ pub struct JoinRequest {
     pub prior_epoch: Option<u64>,
     /// The member's NVMe registrant key (`0` = none).
     pub pr_key: u64,
+    /// The member's canonicalized mount point (KD-MW-2), when it is a
+    /// mount. What lets an OQ-5 mount-slot collision refusal name BOTH
+    /// colliding mount points; `None` (harnesses, non-mount processes)
+    /// disables the collision check for this join — an unnameable
+    /// collision would be a guess, not an observation.
+    #[serde(default)]
+    pub mount: Option<String>,
 }
 
 /// The lease grant: what the member needs to compute its stricter clock.
@@ -849,6 +877,10 @@ pub struct MemberSnapshot {
     /// (`MountRegistration::state`), so an operator reads ONE
     /// classification whether a row came from a record or from the plane.
     pub state: String,
+    /// The member's canonicalized mount point (KD-MW-2), when it reported
+    /// one at join.
+    #[serde(default)]
+    pub mount: Option<String>,
 }
 
 /// A member removed from the census: its epoch is dead, and its blocks are
@@ -879,6 +911,7 @@ struct MemberState {
     renewed_ms: u64,
     deadline_ms: u64,
     acked_free_epoch: u64,
+    mount: Option<String>,
 }
 
 struct Grace {
@@ -1020,6 +1053,45 @@ impl MembershipOwner {
                 retry_after_ms: retry,
             };
         }
+        // OQ-5's resolved form (design-full-multi-writer §5.1 / §17): an
+        // observed mount-slot collision WITHIN ONE CLAIM SET refuses the
+        // mount loud, naming both colliding mount points and the
+        // `-o client_slot=` remedy. The observation: a LIVE member of this
+        // plane already presents `req.id` from a DIFFERENT mount point —
+        // two distinct mount points derived (or were given) one mount
+        // slot, so client identity stopped being injective. A re-join
+        // from the SAME mount point (crash successor, reclaim, restart)
+        // stays what it always was: a replace.
+        if let (Some(theirs), Some(ours_mount)) = (
+            self.members.read_sync(&req.id, |_, st| {
+                if now < st.deadline_ms {
+                    st.mount.clone()
+                } else {
+                    None
+                }
+            }),
+            req.mount.as_deref(),
+        ) {
+            if let Some(theirs) = theirs {
+                if theirs != ours_mount {
+                    let reason = format!(
+                        "MOUNT-SLOT COLLISION (design-full-multi-writer §5.1, OQ-5): member \
+                         '{}' is LIVE at mount point '{theirs}' while a mount at \
+                         '{ours_mount}' presents the same client identity. Two distinct mount \
+                         points of one claim set derived — or were given — one mount slot; \
+                         client identity must stay injective. Remedy: give one of them a \
+                         distinct explicit slot with `-o client_slot=<hex8>` and re-enroll \
+                         that id",
+                        req.id
+                    );
+                    log::error!("membership: {reason}");
+                    return JoinOutcome::Refused {
+                        reason,
+                        retry_after_ms: self.clocks.t_owner.as_millis() as u64,
+                    };
+                }
+            }
+        }
         let epoch = self.next_epoch.fetch_add(1, Ordering::AcqRel);
         let join_seq = self.next_join_seq.fetch_add(1, Ordering::AcqRel);
         let state = MemberState {
@@ -1032,6 +1104,7 @@ impl MembershipOwner {
             renewed_ms: now,
             deadline_ms: now + self.clocks.t_owner.as_millis() as u64,
             acked_free_epoch: 0,
+            mount: req.mount.clone(),
         };
         // A re-join REPLACES the prior state (same identity, new epoch):
         // the member is telling us it lost its lease view, and keeping the
@@ -1149,6 +1222,7 @@ impl MembershipOwner {
                         } else {
                             "stale".to_string()
                         },
+                        mount: st.mount.clone(),
                     },
                 ));
             }
@@ -2095,6 +2169,9 @@ async fn join_member_on(
         boot: crate::meta_backend::kv::backend::read_boot_id(),
         prior_epoch: None,
         pr_key,
+        // KD-MW-2: the canonicalized mount point, so an OQ-5 slot
+        // collision can be observed and named at the owner.
+        mount: crate::writer_scope::mount_point().map(str::to_string),
     };
     let clock = LeaseClock::monotonic();
     let client = match crate::membership_wire::MemberClient::join(

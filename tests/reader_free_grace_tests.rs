@@ -166,6 +166,7 @@ fn join(owner: &MembershipOwner, id: &str, role: MemberRole) -> Grant {
         boot: "boot-grace-test".to_string(),
         prior_epoch: None,
         pr_key: 0,
+        mount: None,
     }) {
         JoinOutcome::Granted(g) => g,
         JoinOutcome::Refused { reason, .. } => panic!("join refused: {reason}"),

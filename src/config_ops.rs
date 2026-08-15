@@ -2500,3 +2500,547 @@ async fn update_meta_config_mirror(meta_lvs: &[String]) -> Result<()> {
     }
     out
 }
+
+// ---------------------------------------------------------------------------
+// PR MW-1 (design-full-multi-writer §5.1, KD-MW-2): the moved-mount-point
+// law — staging-root liveness locks, the foreign-slot residue scan, the
+// mount-side sibling adoption, and the `squeezefs staging adopt|discard`
+// verbs. Crash window MW-1b's contract: foreign-slot staged residue of the
+// same set+node is detected at mount, reported LOUD on EVERY mount until
+// resolved, rendered by `squeezefs clients`, and resolved by an explicit
+// operator act — never silently stranded (the never-lossy law) and never
+// silently destroyed.
+// ---------------------------------------------------------------------------
+
+/// The per-staging-root liveness lock: a daemon-lifetime `flock(LOCK_EX)`
+/// a SCOPED mount holds on every staging root it has bound (the D0
+/// Layer-A flock discipline — kernel-arbitrated, instant crash reclaim).
+/// It is what lets the residue scan and the `staging` verbs distinguish a
+/// LIVE co-located sibling's root (skip silently / refuse to touch) from
+/// a DEAD client's residue (report / resolve). Un-scoped mounts take no
+/// lock: only pair-decorated markers are ever classified as residue, and
+/// only scoped binaries mint those — so the solo-dark footprint is zero.
+pub const STAGING_OWNER_LOCK: &str = ".squeezefs_owner.lock";
+
+/// The `staging adopt` verb's tombstone: marks a residue root whose
+/// marker was re-bound to the NODE-ONLY scope by an explicit operator
+/// act, which is what authorizes the next scoped mount of this set on
+/// this node to bind it (winner-takes via the liveness lock). Without the
+/// tombstone a node-only-marked sibling is NEVER auto-bound — a KD-8
+/// membership verb also restamps roots node-only, and auto-binding those
+/// would let one co-located mount swallow its siblings' roots after an
+/// `add-meta`.
+pub const STAGING_NODE_ADOPTED_MARKER: &str = ".squeezefs_adopted_to_node";
+
+/// Locks held for the daemon's lifetime on every staging root this mount
+/// has bound or adopted (dropping a `File` releases its flock, so they
+/// are parked here).
+static STAGING_ROOT_LOCKS: std::sync::Mutex<Vec<std::fs::File>> = std::sync::Mutex::new(Vec::new());
+
+/// `flock` a staging root's liveness lock file. `Ok(None)` = the lock is
+/// HELD by a live process; `Ok(Some(file))` = acquired (hold the `File`
+/// to keep it). `create` = mint the lock file if absent (owners create,
+/// probes do not).
+fn try_staging_root_lock(dir: &Path, create: bool) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    let path = dir.join(STAGING_OWNER_LOCK);
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(create)
+        .mode(0o600)
+        .open(&path)
+    {
+        Ok(f) => f,
+        // No lock file and we may not create one: nothing holds it (a
+        // pre-pair binary's root, or a probe over a never-locked root).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !create => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    // SAFETY: valid owned fd; LOCK_NB never blocks.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(Some(file));
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        return Ok(None);
+    }
+    Err(err)
+}
+
+/// `true` ⇔ a live process holds `dir`'s staging-root liveness lock.
+/// A missing lock file reads as DEAD: only scoped binaries mint
+/// pair-decorated markers, and every scoped mount takes the lock — so a
+/// pair-marked root without a lock file is a crashed/departed client's
+/// (or a pre-pair binary's, whose markers are never pair-decorated).
+pub fn staging_root_owner_is_live(dir: &Path) -> bool {
+    if !dir.join(STAGING_OWNER_LOCK).exists() {
+        return false;
+    }
+    match try_staging_root_lock(dir, false) {
+        Ok(Some(_probe)) => false, // acquired ⇒ nobody held it (drop releases)
+        Ok(None) => true,
+        // An unreadable lock file proves nothing either way — treat as
+        // LIVE, the do-not-touch direction (never destroy on ambiguity).
+        Err(_) => true,
+    }
+}
+
+/// Release every parked staging-root liveness lock — the unmount/teardown
+/// half of [`hold_staging_root_lock`] (a daemon exit releases them anyway;
+/// the in-process suites simulate successive mounts and need the explicit
+/// release, because `flock` treats a second fd of one file in one process
+/// as a second owner).
+pub fn release_staging_root_locks() {
+    STAGING_ROOT_LOCKS
+        .lock()
+        .expect("staging root lock registry poisoned")
+        .clear();
+}
+
+/// Acquire and PARK a staging root's liveness lock for the daemon's
+/// lifetime. Refuses loud when a live process already holds it.
+pub fn hold_staging_root_lock(dir: &Path) -> Result<()> {
+    match try_staging_root_lock(dir, true) {
+        Ok(Some(file)) => {
+            STAGING_ROOT_LOCKS
+                .lock()
+                .expect("staging root lock registry poisoned")
+                .push(file);
+            Ok(())
+        }
+        Ok(None) => Err(SqueezefsError::InvalidOperation(format!(
+            "staging root {} is HELD by a live process (its {STAGING_OWNER_LOCK} flock is \
+             taken) — another mount owns this root",
+            dir.display()
+        ))),
+        Err(e) => Err(SqueezefsError::Io(std::io::Error::new(
+            e.kind(),
+            format!(
+                "cannot take the staging-root liveness lock at {}: {e}",
+                dir.display()
+            ),
+        ))),
+    }
+}
+
+/// One same-node staging root bound to a mount slot (KD-MW-2): the
+/// residue scan's row, the `squeezefs clients` residue row, and the
+/// `staging adopt|discard` verbs' unit.
+#[derive(Debug, Clone)]
+pub struct SlotResidue {
+    /// The staging root.
+    pub dir: PathBuf,
+    /// The scope its marker carries (same node as ours, slotted).
+    pub scope: crate::writer_scope::WriterScope,
+    /// Live staged write-custody keys (sample, up to 8) — empty means the
+    /// root holds no live custody (its content is discardable-lossless,
+    /// but it is still an operator's to resolve, never auto-destroyed).
+    pub live_units: Vec<String>,
+    /// `true` ⇔ a live process holds the root's liveness lock (a live
+    /// co-located sibling mount — not residue; the scan reports it only
+    /// so the verbs can refuse to touch it).
+    pub live_owner: bool,
+}
+
+/// Enumerate this node's slot-decorated staging roots for one volume set:
+/// every sibling directory under `containers` whose generation marker
+/// names `set_generation`'s set, OUR `node`, and a nonzero mount slot
+/// (optionally filtered to `want_slot`). Directories in `exclude` (the
+/// calling mount's own roots) are skipped.
+pub async fn find_slot_roots(
+    containers: &[PathBuf],
+    exclude: &[PathBuf],
+    set_generation: &str,
+    node: u64,
+    want_slot: Option<u32>,
+) -> Vec<SlotResidue> {
+    let (want_set, _) = crate::writer_scope::split_staging_generation(set_generation);
+    let mut out = Vec::new();
+    for container in containers {
+        let Ok(entries) = std::fs::read_dir(container) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !entry.metadata().map(|m| m.is_dir()).unwrap_or(false)
+                || entry.file_name() == "cache_segment"
+                || exclude.contains(&dir)
+            {
+                continue;
+            }
+            let Ok(Some(marker)) = crate::cache::read_staging_generation_marker(&dir).await else {
+                continue;
+            };
+            let (marker_set, Some(scope)) = crate::writer_scope::split_staging_generation(&marker)
+            else {
+                continue;
+            };
+            if marker_set != want_set
+                || scope.node != node
+                || scope.slot == 0
+                || want_slot.is_some_and(|s| s != scope.slot)
+            {
+                continue;
+            }
+            let live_owner = staging_root_owner_is_live(&dir);
+            let live_units = crate::cache::scan_live_staged_custody(&dir, 8)
+                .await
+                .unwrap_or_default();
+            out.push(SlotResidue {
+                dir,
+                scope,
+                live_units,
+                live_owner,
+            });
+        }
+    }
+    out
+}
+
+/// What the mount-side sibling walk decided (design §5.1(a) + the
+/// `-o client_slot=` adoption arm).
+#[derive(Debug)]
+pub struct ScopedSiblingScan {
+    /// Sibling roots ADOPTED into this mount's staging-dir set: their
+    /// markers carry exactly OUR pair (the `-o client_slot=` remedy, or a
+    /// spelling-variant of our own mount point), or the node-only scope
+    /// plus the `staging adopt` tombstone. Liveness locks already held.
+    pub adopted: Vec<PathBuf>,
+    /// Foreign-slot DEAD roots holding live staged custody — the MW-1b
+    /// residue this mount must report LOUD (and must not touch).
+    pub residue: Vec<SlotResidue>,
+}
+
+/// The scoped mount's staging prelude (design §5.1; runs ONLY when the
+/// writer scope is engaged, so un-scoped solo mounts are byte-identical
+/// to prior releases):
+///
+/// 1. take the liveness lock on every OWN staging root;
+/// 2. refuse LOUD on an exact-pair LIVE sibling (OQ-5's resolved form —
+///    an observed mount-slot collision within one claim set refuses the
+///    mount, naming both mount points and the `-o client_slot=` remedy);
+/// 3. adopt exact-pair DEAD siblings (the `-o client_slot=` adoption arm:
+///    same client identity, different directory spelling) and node-only
+///    tombstoned roots (the `staging adopt` verb's completion half);
+/// 4. collect the foreign-slot dead residue for the caller's report.
+pub async fn mount_scoped_staging_prelude(
+    containers: &[PathBuf],
+    own_dirs: &[PathBuf],
+    mount_point: &str,
+    staging_generation: &str,
+) -> Result<ScopedSiblingScan> {
+    use crate::writer_scope::GenerationBinding;
+    let (_, Some(ours)) = crate::writer_scope::split_staging_generation(staging_generation) else {
+        return Ok(ScopedSiblingScan {
+            adopted: Vec::new(),
+            residue: Vec::new(),
+        });
+    };
+    for dir in own_dirs {
+        hold_staging_root_lock(dir).map_err(|e| {
+            SqueezefsError::InvalidOperation(format!(
+                "cannot own this mount's staging root: {e}. If a previous mount at this \
+                 mount point is still running, unmount it first",
+            ))
+        })?;
+    }
+    let mut scan = ScopedSiblingScan {
+        adopted: Vec::new(),
+        residue: Vec::new(),
+    };
+    for container in containers {
+        let Ok(entries) = std::fs::read_dir(container) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !entry.metadata().map(|m| m.is_dir()).unwrap_or(false)
+                || entry.file_name() == "cache_segment"
+                || own_dirs.contains(&dir)
+            {
+                continue;
+            }
+            let Ok(Some(marker)) = crate::cache::read_staging_generation_marker(&dir).await else {
+                continue;
+            };
+            match crate::writer_scope::classify_generation(&marker, staging_generation, Some(ours))
+            {
+                GenerationBinding::Match => {
+                    if staging_root_owner_is_live(&dir) {
+                        // OQ-5's resolved form: two LIVE mounts of one
+                        // claim set presenting ONE client identity.
+                        return Err(SqueezefsError::InvalidOperation(format!(
+                            "MOUNT-SLOT COLLISION (design-full-multi-writer §5.1, OQ-5): this \
+                             mount at '{mount_point}' presents writer scope {} but a LIVE mount \
+                             already owns staging root {} under the same identity (the root's \
+                             directory name is that mount's sanitized mount point). Two mount \
+                             points of one claim set derived — or were given — one mount slot; \
+                             client identity must stay injective. Remedy: give one of them a \
+                             distinct explicit slot with `-o client_slot=<hex8>`",
+                            ours.render(),
+                            dir.display(),
+                        )));
+                    }
+                    log::warn!(
+                        "ADOPTING staging root {} (design §5.1): its marker carries exactly this \
+                         mount's writer scope {} — the `-o client_slot=` adoption arm (or a \
+                         spelling variant of this mount point). Its staged custody recovers as \
+                         OURS through the normal mount-time recovery scan",
+                        dir.display(),
+                        ours.render(),
+                    );
+                    hold_staging_root_lock(&dir)?;
+                    scan.adopted.push(dir);
+                }
+                GenerationBinding::ScopeUpgrade => {
+                    // Only a marker that CARRIES the node-only scope AND
+                    // the `staging adopt` tombstone is bindable here (see
+                    // STAGING_NODE_ADOPTED_MARKER on why bare node-only
+                    // roots are never auto-bound).
+                    let (_, marker_scope) = crate::writer_scope::split_staging_generation(&marker);
+                    let tombstone = dir.join(STAGING_NODE_ADOPTED_MARKER);
+                    if marker_scope.is_some_and(|m| m.is_node_only())
+                        && tombstone.exists()
+                        && !staging_root_owner_is_live(&dir)
+                    {
+                        match try_staging_root_lock(&dir, true) {
+                            Ok(Some(file)) => {
+                                STAGING_ROOT_LOCKS
+                                    .lock()
+                                    .expect("staging root lock registry poisoned")
+                                    .push(file);
+                                let _ = std::fs::remove_file(&tombstone);
+                                log::warn!(
+                                    "ADOPTING node-adopted staging root {} (design §5.1(b)): \
+                                     `squeezefs staging adopt` re-bound it to this node and this \
+                                     mount won its liveness lock — binding it; its durable \
+                                     staged payloads recover as ours",
+                                    dir.display(),
+                                );
+                                scan.adopted.push(dir);
+                            }
+                            // Lost the race to a co-located sibling (or the
+                            // lock is unreadable): theirs, not ours.
+                            _ => {}
+                        }
+                    }
+                }
+                GenerationBinding::ForeignScope(m)
+                    if m.node == ours.node && m.slot != 0 && !staging_root_owner_is_live(&dir) =>
+                {
+                    let live_units = crate::cache::scan_live_staged_custody(&dir, 8)
+                        .await
+                        .unwrap_or_default();
+                    if !live_units.is_empty() {
+                        scan.residue.push(SlotResidue {
+                            dir,
+                            scope: m,
+                            live_units,
+                            live_owner: false,
+                        });
+                    }
+                }
+                // Live co-located siblings, other nodes' roots, foreign
+                // sets, un-scoped roots: not ours to touch or report.
+                _ => {}
+            }
+        }
+    }
+    Ok(scan)
+}
+
+/// Render the MW-1b residue report (design §5.1(a)): LOUD, repeated on
+/// every mount until resolved, naming each residue slot and the exact
+/// remedy string. `None` when there is nothing to report.
+pub fn residue_report(residue: &[SlotResidue]) -> Option<String> {
+    if residue.is_empty() {
+        return None;
+    }
+    let mut out = format!(
+        "MOVED-MOUNT-POINT STAGING RESIDUE (design-full-multi-writer §5.1, crash window \
+         MW-1b): {} staging root(s) on this node hold LIVE staged write custody under this \
+         volume set and node but a FOREIGN mount slot — acked staged work, possibly awaiting \
+         writeback, stranded by a mount-point move. Nothing is adopted or discarded \
+         automatically, and this report repeats on EVERY mount until it is resolved:",
+        residue.len()
+    );
+    for r in residue {
+        out.push_str(&format!(
+            "\n  slot m{slot:08x} at {dir}: {n} live staged unit(s), e.g. {units:?}\n    \
+             remedy: remount at the original path, or mount with -o client_slot={slot:08x} to \
+             adopt; or `squeezefs staging adopt --slot {slot:08x} <sqmeta-uri>` (re-bind the \
+             residue to this node) / `squeezefs staging discard --slot {slot:08x} \
+             <sqmeta-uri>` (destroy it)",
+            slot = r.scope.slot,
+            dir = r.dir.display(),
+            n = r.live_units.len(),
+            units = r.live_units,
+        ));
+    }
+    Some(out)
+}
+
+/// The `squeezefs clients` residue arm: enumerate THIS NODE's
+/// slot-decorated staging roots for the set (probe-only — no guard, no
+/// writes), so an operator can LIST the slot value a `-o client_slot=`
+/// remedy needs (design §5.1: "residue-holding dead client slots").
+pub async fn slot_residue_for_set(meta_lvs: &[String]) -> Result<Vec<SlotResidue>> {
+    let Some(scope) = crate::writer_scope::resolve_scope_for_set(meta_lvs).await? else {
+        return Ok(Vec::new());
+    };
+    let set = crate::meta_backend::volume_set_generation(meta_lvs).await?;
+    let cfg = read_format_config(&meta_lvs[0]).await?;
+    let containers: Vec<PathBuf> = cfg
+        .disk_cache_paths
+        .clone()
+        .unwrap_or_default()
+        .iter()
+        .map(|d| d.join(&cfg.name))
+        .collect();
+    Ok(find_slot_roots(&containers, &[], &set, scope.node, None).await)
+}
+
+/// Shared preamble of the `staging adopt|discard` verbs: the live-client
+/// gate on every volume (the D0-guarded offline-verb posture — the
+/// `set-cache-paths` pattern), scope + generation resolution, and the
+/// residue-root lookup for `slot`. Refuses loud when the set is not
+/// writer-scoped, has no staging paths, no roots match, or any matching
+/// root has a LIVE owner.
+async fn staging_verb_roots(
+    meta_lvs: &[String],
+    slot: u32,
+) -> Result<(String, crate::writer_scope::WriterScope, Vec<SlotResidue>)> {
+    if meta_lvs.is_empty() {
+        return Err(SqueezefsError::InvalidOperation(
+            "no metadata volumes named".to_string(),
+        ));
+    }
+    for path in meta_lvs {
+        crate::meta_backend::kv::builder::format_preflight(Path::new(path), true).await?;
+    }
+    let Some(scope) = crate::writer_scope::resolve_scope_for_set(meta_lvs).await? else {
+        return Err(SqueezefsError::InvalidOperation(
+            "this volume set is not writer-scoped (incompat bit 10 is not stamped on every \
+             volume), so no mount-slot staging residue can exist for it"
+                .to_string(),
+        ));
+    };
+    let set = crate::meta_backend::volume_set_generation(meta_lvs).await?;
+    let cfg = read_format_config(&meta_lvs[0]).await?;
+    let containers: Vec<PathBuf> = cfg
+        .disk_cache_paths
+        .clone()
+        .unwrap_or_default()
+        .iter()
+        .map(|d| d.join(&cfg.name))
+        .collect();
+    if containers.is_empty() {
+        return Err(SqueezefsError::InvalidOperation(
+            "this filesystem is cache-less (no staging paths in its format config) — it \
+             carries no staging residue"
+                .to_string(),
+        ));
+    }
+    let roots = find_slot_roots(&containers, &[], &set, scope.node, Some(slot)).await;
+    if roots.is_empty() {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "no staging root on this node is bound to slot m{slot:08x} of this volume set and \
+             node (searched {} container(s): {containers:?}). `squeezefs clients` lists the \
+             residue slots this node holds",
+            containers.len(),
+        )));
+    }
+    if let Some(live) = roots.iter().find(|r| r.live_owner) {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "staging root {} (slot m{slot:08x}) is owned by a LIVE mount — refusing to touch a \
+             live client's staging root. Unmount it first",
+            live.dir.display(),
+        )));
+    }
+    Ok((set, scope, roots))
+}
+
+/// `squeezefs staging adopt --slot <hex8> <sqmeta-uri>` (design §5.1(b)):
+/// re-bind slot `slot`'s residue roots to the invoking identity — the
+/// NODE (a CLI process has no mount point, so its identity is the
+/// node-only scope) — via the KD-8 two-phase rebind machinery, D0-guarded.
+///
+/// KD-8's own refusal law carries over verbatim: PENDING write custody
+/// (`active_block:` / `active_block_ext:` records) refuses the rebind,
+/// because those records' keys carry the DEAD slot's scope and a root
+/// rebind cannot re-key them — the drain path for live custody is a mount
+/// with `-o client_slot=<hex8>` (writeback drains it, then this verb or a
+/// clean unmount leaves nothing behind). Durable staged payloads (uuid
+/// file ids, unscoped keys) rebind and are recovered by the next scoped
+/// mount of this set on this node, which finds the re-bound root through
+/// its tombstone ([`STAGING_NODE_ADOPTED_MARKER`]) and wins it by
+/// liveness lock.
+pub async fn staging_adopt(meta_lvs: &[String], slot: u32) -> Result<Vec<PathBuf>> {
+    let (set, scope, roots) = staging_verb_roots(meta_lvs, slot).await?;
+    let old_gen = crate::writer_scope::staging_generation(
+        &set,
+        Some(crate::writer_scope::WriterScope::new(scope.node, slot)),
+    );
+    let new_gen = crate::writer_scope::staging_generation(&set, Some(scope));
+    let dirs: Vec<PathBuf> = roots.iter().map(|r| r.dir.clone()).collect();
+    staging_rebind_prepare(&dirs, &old_gen, &new_gen)
+        .await
+        .map_err(|e| {
+            SqueezefsError::InvalidOperation(format!(
+                "{e}. For MOVED-MOUNT-POINT residue the drain mount is `mount … -o \
+                 client_slot={slot:08x}` — it adopts the residue as its own identity, and \
+                 writeback drains the pending custody"
+            ))
+        })?;
+    staging_rebind_finalize(&dirs, &new_gen).await?;
+    for dir in &dirs {
+        // The tombstone that authorizes the next mount to bind this root.
+        crate::uring_fs::write_all(
+            &dir.join(STAGING_NODE_ADOPTED_MARKER),
+            format!(
+                "adopted-to-node from slot m{slot:08x} at unix {}\n",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            )
+            .into_bytes(),
+        )
+        .await?;
+    }
+    Ok(dirs)
+}
+
+/// `squeezefs staging discard --slot <hex8> <sqmeta-uri>` (design
+/// §5.1(b)): DESTROY slot `slot`'s residue roots — the stale-token
+/// orphan-discard posture made an explicit operator act, with the freed
+/// keys enumerated (the attested-verb loudness class: the caller prints
+/// every key and every directory this returned). D0-guarded; refuses a
+/// live owner's root.
+pub async fn staging_discard(
+    meta_lvs: &[String],
+    slot: u32,
+) -> Result<(Vec<PathBuf>, Vec<String>)> {
+    let (_, _, roots) = staging_verb_roots(meta_lvs, slot).await?;
+    let mut freed_keys = Vec::new();
+    let mut dirs = Vec::new();
+    for r in &roots {
+        // Enumerate EVERY live staged custody key before destruction —
+        // never destroy silently (the attestation half of the verb).
+        let keys = crate::cache::scan_live_staged_custody(&r.dir, usize::MAX)
+            .await
+            .unwrap_or_default();
+        freed_keys.extend(keys);
+        std::fs::remove_dir_all(&r.dir).map_err(|e| {
+            SqueezefsError::Io(std::io::Error::new(
+                e.kind(),
+                format!("destroying residue root {}: {e}", r.dir.display()),
+            ))
+        })?;
+        dirs.push(r.dir.clone());
+    }
+    Ok((dirs, freed_keys))
+}

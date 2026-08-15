@@ -1366,3 +1366,49 @@ async fn the_registrant_join_never_takes_a_second_reservation() {
     );
     reservation::clear_override(&data);
 }
+
+/// KD-MW-2 (design-full-multi-writer §5.1 / §11): rung 3 matches the
+/// roster grammar — a PAIR client id (`node_{16 hex}.m{8 hex}`) is
+/// admitted by its exact entry AND by the bare-node SLOT-WILDCARD entry,
+/// while an entry naming a DIFFERENT slot of the same node refuses (two
+/// co-located mounts are two clients).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rung_3_matches_the_pair_grammar_and_the_bare_node_wildcard() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "meta0", true).await;
+    let pair_id = "node_00000000deadbeef.m00c0ffee";
+
+    // Exact pair entry admits.
+    let mut req = full_request(std::slice::from_ref(&vol));
+    req.node_id = pair_id.to_string();
+    req.volumes[0].claim_set = Some(full_claim_set(pair_id, "authority-membership-owner"));
+    cowriter::classify_admission(&req).expect("an exact pair entry admits");
+
+    // The bare-node wildcard entry admits the pair id.
+    let mut req = full_request(std::slice::from_ref(&vol));
+    req.node_id = pair_id.to_string();
+    req.volumes[0].claim_set = Some(full_claim_set(
+        "node_00000000deadbeef",
+        "authority-membership-owner",
+    ));
+    cowriter::classify_admission(&req)
+        .expect("the bare node entry is the slot wildcard (§11 grammar)");
+
+    // A DIFFERENT slot's entry refuses: a co-located sibling's enrollment
+    // is not ours.
+    let mut req = full_request(std::slice::from_ref(&vol));
+    req.node_id = pair_id.to_string();
+    req.volumes[0].claim_set = Some(full_claim_set(
+        "node_00000000deadbeef.m0badc0de",
+        "authority-membership-owner",
+    ));
+    let err = cowriter::classify_admission(&req)
+        .expect_err("another mount slot's enrollment must not admit this one")
+        .to_string();
+    assert!(
+        err.contains(pair_id),
+        "the refusal prints the pair id an operator must enroll: {err}"
+    );
+}

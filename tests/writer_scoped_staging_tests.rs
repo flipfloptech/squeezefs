@@ -79,9 +79,27 @@ impl Drop for ScopeGuard {
     }
 }
 
+/// Engage the NODE-ONLY scope (the pre-pair form every existing contract
+/// pins; offline-process identity).
 fn engage(token: u64) -> ScopeGuard {
-    ws::engage(Some(token));
+    ws::engage(Some(ws::WriterScope::node_only(token)));
     ScopeGuard
+}
+
+/// Engage a PAIR scope (KD-MW-2: a mount's `(node, mount_slot)` identity).
+fn engage_pair(token: u64, slot: u32) -> ScopeGuard {
+    ws::engage(Some(ws::WriterScope::new(token, slot)));
+    ScopeGuard
+}
+
+/// Shorthand for the node-only scope value.
+fn node(token: u64) -> ws::WriterScope {
+    ws::WriterScope::node_only(token)
+}
+
+/// Shorthand for a pair scope value.
+fn pair(token: u64, slot: u32) -> ws::WriterScope {
+    ws::WriterScope::new(token, slot)
 }
 
 const NODE_A: u64 = 0x0123_4567_89ab_cdef;
@@ -266,7 +284,7 @@ async fn scope_upgrade_adopts_pre_change_staging_without_discarding() {
     let discards_before = staging_discards();
     let upgrades_before = scope_upgrades();
     let _sg = engage(NODE_A);
-    let scoped = ws::staging_generation(set, Some(NODE_A));
+    let scoped = ws::staging_generation(set, Some(node(NODE_A)));
     let c = cache_at(staging.path(), data.path(), "upg-b", Some(&scoped))
         .await
         .unwrap();
@@ -410,7 +428,7 @@ async fn key_classification_covers_legacy_mine_foreign_and_unprovable() {
     {
         let _sg = engage(NODE_A);
         assert_eq!(ws::classify_key(&a), ws::KeyOwner::Mine);
-        assert_eq!(ws::classify_key(&b), ws::KeyOwner::Foreign(NODE_B));
+        assert_eq!(ws::classify_key(&b), ws::KeyOwner::Foreign(node(NODE_B)));
         assert_eq!(ws::classify_key(&legacy), ws::KeyOwner::Legacy);
         assert!(ws::key_is_mine(&a) && ws::key_is_mine(&legacy));
         assert!(!ws::key_is_mine(&b));
@@ -418,7 +436,7 @@ async fn key_classification_covers_legacy_mine_foreign_and_unprovable() {
     ws::engage(None);
     assert_eq!(
         ws::classify_key(&a),
-        ws::KeyOwner::Unprovable(NODE_A),
+        ws::KeyOwner::Unprovable(node(NODE_A)),
         "a scoped record under an unscoped mount is unprovable, never ours"
     );
     assert!(!ws::key_is_mine(&a));
@@ -527,9 +545,12 @@ async fn node_identity_is_stable_process_independent_and_host_distinct() {
 #[tokio::test]
 async fn staging_generation_decoration_round_trips() {
     let set = "v3:aabbccddeeff00112233445566778899|v3:00112233445566778899aabbccddeeff";
-    let scoped = ws::staging_generation(set, Some(NODE_A));
+    let scoped = ws::staging_generation(set, Some(node(NODE_A)));
     assert_eq!(scoped, format!("{set}@node:{NODE_A:016x}"));
-    assert_eq!(ws::split_staging_generation(&scoped), (set, Some(NODE_A)));
+    assert_eq!(
+        ws::split_staging_generation(&scoped),
+        (set, Some(node(NODE_A)))
+    );
     assert_eq!(ws::split_staging_generation(set), (set, None));
     // Garbled decorations degrade to "the whole thing is the set part",
     // never to a wrong node token.
@@ -548,11 +569,11 @@ async fn staging_generation_decoration_round_trips() {
 async fn generation_classification_table() {
     let set = "v3:1111111111111111111111111111111f";
     let other = "v3:2222222222222222222222222222222f";
-    let a = ws::staging_generation(set, Some(NODE_A));
-    let b = ws::staging_generation(set, Some(NODE_B));
+    let a = ws::staging_generation(set, Some(node(NODE_A)));
+    let b = ws::staging_generation(set, Some(node(NODE_B)));
 
     assert_eq!(
-        ws::classify_generation(&a, &a, Some(NODE_A)),
+        ws::classify_generation(&a, &a, Some(node(NODE_A))),
         ws::GenerationBinding::Match
     );
     assert_eq!(
@@ -560,28 +581,28 @@ async fn generation_classification_table() {
         ws::GenerationBinding::Match
     );
     assert_eq!(
-        ws::classify_generation(set, &a, Some(NODE_A)),
+        ws::classify_generation(set, &a, Some(node(NODE_A))),
         ws::GenerationBinding::ScopeUpgrade,
         "a bare marker on a scoped set is the upgrade arm, not a discard"
     );
     assert_eq!(
-        ws::classify_generation(&b, &a, Some(NODE_A)),
-        ws::GenerationBinding::ForeignScope(NODE_B)
+        ws::classify_generation(&b, &a, Some(node(NODE_A))),
+        ws::GenerationBinding::ForeignScope(node(NODE_B))
     );
     assert_eq!(
         ws::classify_generation(&a, set, None),
-        ws::GenerationBinding::ForeignScope(NODE_A),
+        ws::GenerationBinding::ForeignScope(node(NODE_A)),
         "an unscoped mount cannot claim a scoped root"
     );
     assert_eq!(
-        ws::classify_generation(other, &a, Some(NODE_A)),
+        ws::classify_generation(other, &a, Some(node(NODE_A))),
         ws::GenerationBinding::ForeignSet
     );
     assert_eq!(
         ws::classify_generation(
-            &ws::staging_generation(other, Some(NODE_A)),
+            &ws::staging_generation(other, Some(node(NODE_A))),
             &a,
-            Some(NODE_A)
+            Some(node(NODE_A))
         ),
         ws::GenerationBinding::ForeignSet,
         "the SET part decides first — our own scope on a dead set is dead"
@@ -606,7 +627,7 @@ async fn foreign_node_root_with_live_custody_refuses_the_mount() {
     // Node B populates the root (live custody, no clean drain).
     {
         let _sg = engage(NODE_B);
-        let gen_b = ws::staging_generation(set, Some(NODE_B));
+        let gen_b = ws::staging_generation(set, Some(node(NODE_B)));
         let c = cache_at(staging.path(), data.path(), "foreign-b", Some(&gen_b))
             .await
             .unwrap();
@@ -622,7 +643,7 @@ async fn foreign_node_root_with_live_custody_refuses_the_mount() {
 
     // Node A mounts the same root: refusal, not a wipe.
     let _sg = engage(NODE_A);
-    let gen_a = ws::staging_generation(set, Some(NODE_A));
+    let gen_a = ws::staging_generation(set, Some(node(NODE_A)));
     let msg = match cache_at(staging.path(), data.path(), "foreign-a", Some(&gen_a)).await {
         Ok(_) => panic!("a peer's live custody must refuse the staging root as a unit"),
         Err(e) => e.to_string(),
@@ -646,7 +667,7 @@ async fn foreign_node_root_with_live_custody_refuses_the_mount() {
         marker(staging.path()).unwrap(),
         format!(
             "squeezefs-staging-generation-v1\n{}\n",
-            ws::staging_generation(set, Some(NODE_B))
+            ws::staging_generation(set, Some(node(NODE_B)))
         ),
         "the peer's marker must be untouched"
     );
@@ -670,7 +691,7 @@ async fn foreign_node_root_without_live_custody_is_discarded_losslessly() {
     std::fs::create_dir_all(staging.path().join("staging_segment")).unwrap();
     squeezefs::cache::write_staging_generation_marker(
         staging.path(),
-        &ws::staging_generation(set, Some(NODE_B)),
+        &ws::staging_generation(set, Some(node(NODE_B))),
     )
     .await
     .unwrap();
@@ -679,7 +700,7 @@ async fn foreign_node_root_without_live_custody_is_discarded_losslessly() {
         .staging_foreign_scope_discards
         .load(Ordering::Relaxed);
     let _sg = engage(NODE_A);
-    let gen_a = ws::staging_generation(set, Some(NODE_A));
+    let gen_a = ws::staging_generation(set, Some(node(NODE_A)));
     let _c = cache_at(staging.path(), data.path(), "foreign-dead", Some(&gen_a))
         .await
         .expect("a dead foreign root must not block the mount");
@@ -705,7 +726,7 @@ async fn foreign_scoped_records_are_never_adopted_and_never_wiped() {
     let staging = tempdir().unwrap();
     let data = NamedTempFile::new().unwrap();
     let set = "v3:5555555555555555555555555555555f";
-    let gen_a = ws::staging_generation(set, Some(NODE_A));
+    let gen_a = ws::staging_generation(set, Some(node(NODE_A)));
     let foreign_key = format!("active_block:inode_8:block_0{}", suffix(NODE_B));
     let mine_key = format!("active_block:inode_8:block_1{}", suffix(NODE_A));
 
@@ -783,7 +804,7 @@ async fn extent_sweep_leaves_foreign_records_and_recovers_ours() {
     .unwrap();
 
     let _sg = engage(NODE_A);
-    let gen_a = ws::staging_generation("v3:03030303030303030303030303030303", Some(NODE_A));
+    let gen_a = ws::staging_generation("v3:03030303030303030303030303030303", Some(node(NODE_A)));
 
     let dlm = squeezefs::dlm::DlmClient::new().unwrap();
     let cache = cache_at(staging.path(), data.path(), "extsweep", Some(&gen_a))
@@ -924,8 +945,8 @@ async fn kd8_rebind_composes_with_node_scoping() {
     let new_set = "v3:6666666666666666666666666666666f|v3:7777777777777777777777777777777f";
 
     let _sg = engage(NODE_A);
-    let old_gen = ws::staging_generation(old_set, Some(NODE_A));
-    let new_gen = ws::staging_generation(new_set, Some(NODE_A));
+    let old_gen = ws::staging_generation(old_set, Some(node(NODE_A)));
+    let new_gen = ws::staging_generation(new_set, Some(node(NODE_A)));
 
     // A durable staged-layout payload (uuid file id — the class KD-8
     // REBINDS rather than refuses) in a root bound to the old generation.
@@ -1037,8 +1058,8 @@ async fn kd8_rebind_of_an_unscoped_root_never_discards_staged_payloads() {
     // generations, and the root still bound to the bare old generation
     // MUST be carried across.
     let _sg = engage(NODE_A);
-    let old_gen = ws::staging_generation(old_set, Some(NODE_A));
-    let new_gen = ws::staging_generation(new_set, Some(NODE_A));
+    let old_gen = ws::staging_generation(old_set, Some(node(NODE_A)));
+    let new_gen = ws::staging_generation(new_set, Some(node(NODE_A)));
     let dirs = vec![staging.path().to_path_buf()];
     squeezefs::config_ops::staging_rebind_prepare(&dirs, &old_gen, &new_gen)
         .await
@@ -1074,14 +1095,14 @@ async fn kd8_rebind_of_an_unscoped_root_never_discards_staged_payloads() {
 #[tokio::test]
 async fn kd8_membership_test_accepts_the_unscoped_binding() {
     let set = "v3:8888888888888888888888888888888f";
-    let scoped = ws::staging_generation(set, Some(NODE_A));
+    let scoped = ws::staging_generation(set, Some(node(NODE_A)));
     assert!(
         ws::marker_is_rebindable(set, &scoped),
         "a bare-marker root MUST be rebindable under a scoped set"
     );
     assert!(ws::marker_is_rebindable(&scoped, &scoped));
     assert!(
-        !ws::marker_is_rebindable(&ws::staging_generation(set, Some(NODE_B)), &scoped),
+        !ws::marker_is_rebindable(&ws::staging_generation(set, Some(node(NODE_B))), &scoped),
         "a peer's root is never ours to rebind"
     );
     assert!(
@@ -1099,8 +1120,8 @@ async fn kd8_prepare_refuses_pending_and_foreign_custody() {
     let staging = tempdir().unwrap();
     let set = "v3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaf";
     let _sg = engage(NODE_A);
-    let old_gen = ws::staging_generation(set, Some(NODE_A));
-    let new_gen = ws::staging_generation("v3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbf", Some(NODE_A));
+    let old_gen = ws::staging_generation(set, Some(node(NODE_A)));
+    let new_gen = ws::staging_generation("v3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbf", Some(node(NODE_A)));
     squeezefs::cache::write_staging_generation_marker(staging.path(), &old_gen)
         .await
         .unwrap();
@@ -1219,4 +1240,681 @@ fn production_format_never_stamps_the_writer_scope_bit() {
     assert_eq!(STAGING_FORMAT_VERSION, 3);
     assert_eq!(staging_format_write_version(false), 2);
     assert_eq!(staging_format_write_version(true), 3);
+}
+
+// ---------------------------------------------------------------------------
+// 8. KD-MW-2 (design-full-multi-writer §5.1) — the client scope is the PAIR
+// `(node_token, mount_slot)`, and the moved-mount-point law (MW-1b)
+// ---------------------------------------------------------------------------
+
+const SLOT_A: u32 = 0x00c0_ffee;
+const SLOT_B: u32 = 0x0badc0de;
+
+fn pair_suffix(token: u64, slot: u32) -> String {
+    format!(":w_{token:016x}.m{slot:08x}")
+}
+
+/// Co-located scopes classify APART (the rung-1 red-first pin): two
+/// mounts of one node with distinct slots are distinct clients at both
+/// grammar levels — keys and staging generations — while the same-node
+/// node-only forms stay grandfathered (the pre-pair upgrade arms).
+#[tokio::test]
+async fn co_located_pair_scopes_classify_apart() {
+    let _g = serial().await;
+    let key_a = format!(
+        "active_block:inode_1:block_0{}",
+        pair_suffix(NODE_A, SLOT_A)
+    );
+    let key_b = format!(
+        "active_block:inode_1:block_0{}",
+        pair_suffix(NODE_A, SLOT_B)
+    );
+    let key_node = format!("active_block:inode_1:block_0{}", suffix(NODE_A));
+    {
+        let _sg = engage_pair(NODE_A, SLOT_A);
+        assert_eq!(ws::classify_key(&key_a), ws::KeyOwner::Mine);
+        assert_eq!(
+            ws::classify_key(&key_b),
+            ws::KeyOwner::Foreign(pair(NODE_A, SLOT_B)),
+            "a co-located sibling's record is FOREIGN — never adopted"
+        );
+        assert_eq!(
+            ws::classify_key(&key_node),
+            ws::KeyOwner::Mine,
+            "a pre-pair node-only record is grandfathered ours (same D0 argument)"
+        );
+        // A foreign NODE stays foreign regardless of slot.
+        let key_bn = format!(
+            "active_block:inode_1:block_0{}",
+            pair_suffix(NODE_B, SLOT_A)
+        );
+        assert_eq!(
+            ws::classify_key(&key_bn),
+            ws::KeyOwner::Foreign(pair(NODE_B, SLOT_A))
+        );
+        // Strip is exact for the pair form too.
+        assert_eq!(ws::strip_key_scope(&key_a), "active_block:inode_1:block_0");
+    }
+    // A node-only identity (the OFFLINE processes) cannot claim a slotted
+    // record: it cannot prove WHICH mount's record it is.
+    {
+        let _sg = engage(NODE_A);
+        assert_eq!(
+            ws::classify_key(&key_a),
+            ws::KeyOwner::Foreign(pair(NODE_A, SLOT_A))
+        );
+    }
+
+    // The generation table, pair arms.
+    let set = "v3:1212121212121212121212121212121f";
+    let gen_a = ws::staging_generation(set, Some(pair(NODE_A, SLOT_A)));
+    let gen_b = ws::staging_generation(set, Some(pair(NODE_A, SLOT_B)));
+    let gen_node = ws::staging_generation(set, Some(node(NODE_A)));
+    assert_eq!(
+        ws::classify_generation(&gen_a, &gen_a, Some(pair(NODE_A, SLOT_A))),
+        ws::GenerationBinding::Match
+    );
+    assert_eq!(
+        ws::classify_generation(&gen_b, &gen_a, Some(pair(NODE_A, SLOT_A))),
+        ws::GenerationBinding::ForeignScope(pair(NODE_A, SLOT_B)),
+        "a co-located sibling's ROOT is foreign — never adopted, never wiped"
+    );
+    assert_eq!(
+        ws::classify_generation(&gen_node, &gen_a, Some(pair(NODE_A, SLOT_A))),
+        ws::GenerationBinding::ScopeUpgrade,
+        "a pre-pair node-only root upgrades (adopt + re-stamp)"
+    );
+    assert_eq!(
+        ws::classify_generation(&gen_a, &gen_node, Some(node(NODE_A))),
+        ws::GenerationBinding::ScopeUpgrade,
+        "the OFFLINE node-only identity may rebind this node's slotted roots \
+         (the KD-8 data-loss-avoidance direction)"
+    );
+    assert_eq!(
+        ws::classify_generation(
+            &ws::staging_generation(set, Some(pair(NODE_B, SLOT_A))),
+            &gen_a,
+            Some(pair(NODE_A, SLOT_A))
+        ),
+        ws::GenerationBinding::ForeignScope(pair(NODE_B, SLOT_A)),
+        "another node's slotted root is foreign regardless of slot"
+    );
+}
+
+/// Stack and heap mints agree under a PAIR scope, and the pair suffix is
+/// what every scoped key carries (the item-8 grammar, KD-MW-2 form).
+#[tokio::test]
+async fn pair_scope_mints_agree_and_carry_the_pair() {
+    let _g = serial().await;
+    let _sg = engage_pair(NODE_A, SLOT_A);
+    let s = pair_suffix(NODE_A, SLOT_A);
+    assert_eq!(
+        &*squeezefs::keys::active_block(7, 3),
+        format!("active_block:inode_7:block_3{s}")
+    );
+    assert_eq!(
+        &*squeezefs::keys::active_block_stack(7, 3),
+        &*squeezefs::keys::active_block(7, 3)
+    );
+    assert_eq!(
+        &*squeezefs::keys::active_block_ext_path_stack("inode_7", 3).unwrap(),
+        &*squeezefs::keys::active_block_ext_for_path("inode_7", 3)
+    );
+    assert_eq!(&*squeezefs::keys::mapping("fid"), format!("mapping:fid{s}"));
+}
+
+/// Co-located records in ONE ring are never cross-adopted (the rung-1
+/// red-first pin at the ring level): the sibling slot's record is not
+/// occupancy-indexed, not budget-counted, and left intact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn co_located_records_are_never_cross_adopted() {
+    let _g = serial().await;
+    let staging = tempdir().unwrap();
+    let data = NamedTempFile::new().unwrap();
+    let set = "v3:1313131313131313131313131313131f";
+    let gen_a = ws::staging_generation(set, Some(pair(NODE_A, SLOT_A)));
+    let mine = format!(
+        "active_block:inode_8:block_1{}",
+        pair_suffix(NODE_A, SLOT_A)
+    );
+    let sibling = format!(
+        "active_block:inode_8:block_0{}",
+        pair_suffix(NODE_A, SLOT_B)
+    );
+
+    let _sg = engage_pair(NODE_A, SLOT_A);
+    {
+        let c = cache_at(staging.path(), data.path(), "colo-1", Some(&gen_a))
+            .await
+            .unwrap();
+        assert!(c
+            .nvme
+            .put_active_block(&mine, &vec![0x31u8; BS as usize], 7));
+        assert!(c
+            .nvme
+            .put_active_block(&sibling, &vec![0x32u8; BS as usize], 7));
+    }
+    let c = cache_at(staging.path(), data.path(), "colo-2", Some(&gen_a))
+        .await
+        .unwrap();
+    assert!(c.nvme.has_staged_active_block(&mine), "ours adopts");
+    assert!(
+        !c.nvme.has_staged_active_block(&sibling),
+        "a co-located sibling's record must never enter the occupancy index"
+    );
+    assert!(
+        c.nvme.list_staged_files().contains(&sibling),
+        "and must still be present in the ring — never wiped"
+    );
+}
+
+/// The crash-recovery continuity law under pairs (rung-1 red-first pin):
+/// a successor mount of the SAME mount point — the same pair — adopts its
+/// predecessor's residue exactly as before (Match, no discard).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_mount_point_successor_adopts_its_own_pair_residue() {
+    let _g = serial().await;
+    let staging = tempdir().unwrap();
+    let data = NamedTempFile::new().unwrap();
+    let set = "v3:1414141414141414141414141414141f";
+    let gen = ws::staging_generation(set, Some(pair(NODE_A, SLOT_A)));
+
+    let _sg = engage_pair(NODE_A, SLOT_A);
+    {
+        let c = cache_at(staging.path(), data.path(), "succ-1", Some(&gen))
+            .await
+            .unwrap();
+        assert!(c.nvme.put_active_block(
+            &squeezefs::keys::active_block(9, 0),
+            &vec![0x41u8; BS as usize],
+            7
+        ));
+    }
+    let discards = staging_discards();
+    let c = cache_at(staging.path(), data.path(), "succ-2", Some(&gen))
+        .await
+        .unwrap();
+    assert_eq!(staging_discards(), discards, "no discard on a warm restart");
+    assert!(
+        c.nvme
+            .has_staged_active_block(&squeezefs::keys::active_block(9, 0)),
+        "the same mount point's successor adopts its own residue"
+    );
+    // The slot derivation is what makes "same mount point" mean "same
+    // client": stable across restarts, distinct across paths.
+    assert_eq!(
+        ws::derive_mount_slot("/mnt/x"),
+        ws::derive_mount_slot("/mnt/x")
+    );
+    assert_ne!(
+        ws::derive_mount_slot("/mnt/x"),
+        ws::derive_mount_slot("/mnt/y")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 9. MW-1b — the moved-mount-point law, end to end (report / adopt /
+// discard / collision), over the config_ops machinery the mount wires in
+// ---------------------------------------------------------------------------
+
+/// A minimal-but-complete format config (the `base_format_config` fixture
+/// shape the fsck suites use — `FormatConfig` has no serde defaults).
+fn mw1b_format_config() -> squeezefs::FormatConfig {
+    squeezefs::FormatConfig {
+        name: "squeezefs".to_string(),
+        block_size: BS,
+        capacity: 1 << 30,
+        inodes: 1_000_000,
+        compression: "none".to_string(),
+        encrypt_algo: "none".to_string(),
+        encrypt_key: None,
+        encrypt_key_ref: None,
+        mem_cache_size: None,
+        disk_cache_size: None,
+        disk_cache_paths: None,
+        data_lv: None,
+        data_volumes: None,
+        read_cache_size: None,
+        write_cache_size: None,
+        read_mem_cache_size: None,
+        write_mem_cache_size: None,
+        dismount_wait: None,
+        upload_delay: None,
+        fuse_io_uring_sqpoll_idle_ms: None,
+        meta_routing_width: None,
+        meta_slot_runs: None,
+        meta_volumes: None,
+    }
+}
+
+/// Everything the MW-1b fixtures need: a bit-10-stamped meta volume whose
+/// format config declares `cache_root` as its staging path, a pinned node
+/// identity, and the set generation.
+struct Mw1bFixture {
+    _dir: tempfile::TempDir,
+    meta: NamedTempFile,
+    container: std::path::PathBuf,
+    node: u64,
+    set: String,
+    saved_node_id_file: Option<String>,
+}
+
+impl Mw1bFixture {
+    async fn new() -> Self {
+        let dir = tempdir().unwrap();
+        let cache_root = dir.path().join("cache");
+        let container = cache_root.join("squeezefs");
+        std::fs::create_dir_all(&container).unwrap();
+
+        // Pin the node identity through the env seam (deterministic and
+        // hermetic — the verbs resolve it themselves).
+        let id_file = dir.path().join("node-id");
+        std::fs::write(&id_file, "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\n").unwrap();
+        let saved = std::env::var("SQUEEZEFS_NODE_ID_FILE").ok();
+        std::env::set_var("SQUEEZEFS_NODE_ID_FILE", &id_file);
+        let node = ws::resolve_node_identity().expect("pinned identity").token;
+
+        let meta = NamedTempFile::new().unwrap();
+        meta.as_file().set_len(96 * 1024 * 1024).unwrap();
+        let mut cfg = mw1b_format_config();
+        cfg.disk_cache_paths = Some(vec![cache_root.clone()]);
+        std::env::set_var("SQUEEZEFS_TEST_STAMP_WRITER_SCOPE", "1");
+        squeezefs::meta_backend::kv::builder::format_v3(
+            meta.path(),
+            96 * 1024 * 1024,
+            &squeezefs::meta_backend::kv::builder::FormatV3Options {
+                node_size: squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE,
+                journal_len_override: None,
+                force: true,
+                full_wipe: false,
+                format_config_xattr: Some(serde_json::to_vec(&cfg).unwrap()),
+            },
+        )
+        .await
+        .unwrap();
+        std::env::remove_var("SQUEEZEFS_TEST_STAMP_WRITER_SCOPE");
+        let meta_lvs = vec![meta.path().to_string_lossy().into_owned()];
+        let set = squeezefs::meta_backend::volume_set_generation(&meta_lvs)
+            .await
+            .unwrap();
+        Self {
+            _dir: dir,
+            meta,
+            container,
+            node,
+            set,
+            saved_node_id_file: saved,
+        }
+    }
+
+    fn meta_lvs(&self) -> Vec<String> {
+        vec![self.meta.path().to_string_lossy().into_owned()]
+    }
+
+    /// Mint a residue staging root bound to `(node, slot)` carrying one
+    /// live staged custody record under `key`.
+    async fn seed_residue(&self, dirname: &str, slot: u32, key: &str) -> std::path::PathBuf {
+        let dir = self.container.join(dirname);
+        std::fs::create_dir_all(&dir).unwrap();
+        squeezefs::cache::write_staging_generation_marker(
+            &dir,
+            &ws::staging_generation(&self.set, Some(pair(self.node, slot))),
+        )
+        .await
+        .unwrap();
+        squeezefs::cache::seed_staged_custody_for_test(&dir, key)
+            .await
+            .unwrap();
+        dir
+    }
+}
+
+impl Drop for Mw1bFixture {
+    fn drop(&mut self) {
+        squeezefs::config_ops::release_staging_root_locks();
+        match self.saved_node_id_file.take() {
+            Some(v) => std::env::set_var("SQUEEZEFS_NODE_ID_FILE", v),
+            None => std::env::remove_var("SQUEEZEFS_NODE_ID_FILE"),
+        }
+    }
+}
+
+/// MW-1b (the rung-1 red-first pin): moved-path residue is reported on
+/// EVERY mount until resolved; `staging discard` destroys exactly the
+/// reported residue with its keys enumerated; afterwards the report is
+/// clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn moved_mount_point_residue_is_reported_until_discarded() {
+    let _g = serial().await;
+    let fx = Mw1bFixture::new().await;
+    let residue_key = format!(
+        "active_block:inode_2:block_0{}",
+        pair_suffix(fx.node, SLOT_A)
+    );
+    let residue_dir = fx.seed_residue("mnt_old", SLOT_A, &residue_key).await;
+    let own_dir = fx.container.join("mnt_new");
+    std::fs::create_dir_all(&own_dir).unwrap();
+    let our_gen = ws::staging_generation(&fx.set, Some(pair(fx.node, SLOT_B)));
+
+    // Mount 1: the residue is detected and the report names the slot and
+    // BOTH remedies.
+    let scan = squeezefs::config_ops::mount_scoped_staging_prelude(
+        std::slice::from_ref(&fx.container),
+        std::slice::from_ref(&own_dir),
+        "/mnt/new",
+        &our_gen,
+    )
+    .await
+    .expect("the mount proceeds — the residue is not ours to touch");
+    assert!(scan.adopted.is_empty(), "a foreign slot is never adopted");
+    assert_eq!(scan.residue.len(), 1, "the residue must be detected");
+    assert_eq!(scan.residue[0].scope, pair(fx.node, SLOT_A));
+    let report =
+        squeezefs::config_ops::residue_report(&scan.residue).expect("residue must render a report");
+    assert!(report.contains("MOVED-MOUNT-POINT"), "{report}");
+    assert!(
+        report.contains(&format!("client_slot={SLOT_A:08x}")),
+        "the report names the -o client_slot remedy: {report}"
+    );
+    assert!(
+        report.contains("remount at the original path"),
+        "the report names the design's remedy string: {report}"
+    );
+    assert!(
+        report.contains("staging adopt") && report.contains("staging discard"),
+        "the report names both verbs: {report}"
+    );
+    squeezefs::config_ops::release_staging_root_locks();
+
+    // Mount 2: STILL reported (never silently stranded, never auto-fixed).
+    let scan = squeezefs::config_ops::mount_scoped_staging_prelude(
+        std::slice::from_ref(&fx.container),
+        std::slice::from_ref(&own_dir),
+        "/mnt/new",
+        &our_gen,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        scan.residue.len(),
+        1,
+        "the report repeats on every mount until resolved"
+    );
+    squeezefs::config_ops::release_staging_root_locks();
+
+    // `squeezefs clients` renders the residue slot (the listing an
+    // operator copies the hex8 from).
+    let listed = squeezefs::config_ops::slot_residue_for_set(&fx.meta_lvs())
+        .await
+        .unwrap();
+    assert!(
+        listed
+            .iter()
+            .any(|r| r.scope == pair(fx.node, SLOT_A) && !r.live_owner),
+        "clients must list the dead residue slot: {listed:?}"
+    );
+
+    // Discard destroys it, enumerating the freed keys (attested verb).
+    let (dirs, keys) = squeezefs::config_ops::staging_discard(&fx.meta_lvs(), SLOT_A)
+        .await
+        .expect("discard resolves the residue");
+    assert_eq!(dirs, vec![residue_dir.clone()]);
+    assert!(
+        keys.contains(&residue_key),
+        "the destroyed custody keys are enumerated: {keys:?}"
+    );
+    assert!(!residue_dir.exists(), "the residue root is destroyed");
+
+    // Mount 3: clean.
+    let scan = squeezefs::config_ops::mount_scoped_staging_prelude(
+        std::slice::from_ref(&fx.container),
+        std::slice::from_ref(&own_dir),
+        "/mnt/new",
+        &our_gen,
+    )
+    .await
+    .unwrap();
+    assert!(
+        scan.residue.is_empty(),
+        "after discard the report must be clean"
+    );
+}
+
+/// `staging adopt` re-binds durable residue to the node (KD-8 two-phase),
+/// the NEXT mount binds it (tombstone + liveness-lock winner-takes), and
+/// pending BLOCK custody refuses the verb naming the `-o client_slot`
+/// drain remedy (KD-8's own law, carried over).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn staging_adopt_rebinds_durable_residue_for_the_next_mount() {
+    let _g = serial().await;
+    let fx = Mw1bFixture::new().await;
+    // Durable staged payload: a uuid file-id record (UNSCOPED key — the
+    // class KD-8 rebinds rather than refuses).
+    let residue_dir = fx
+        .seed_residue("mnt_gone", SLOT_A, "8f14e45fceea167a5a36dedd4bea2543")
+        .await;
+
+    let adopted = squeezefs::config_ops::staging_adopt(&fx.meta_lvs(), SLOT_A)
+        .await
+        .expect("durable residue adopts");
+    assert_eq!(adopted, vec![residue_dir.clone()]);
+    assert_eq!(
+        std::fs::read_to_string(residue_dir.join(STAGING_GENERATION_MARKER)).unwrap(),
+        format!(
+            "squeezefs-staging-generation-v1\n{}\n",
+            ws::staging_generation(&fx.set, Some(node(fx.node)))
+        ),
+        "the root is re-bound to the invoking identity — the NODE"
+    );
+    assert!(
+        residue_dir
+            .join(squeezefs::config_ops::STAGING_NODE_ADOPTED_MARKER)
+            .exists(),
+        "the adopt tombstone authorizes the next mount to bind it"
+    );
+
+    // The residue listing no longer names the slot (it is node-bound now).
+    let listed = squeezefs::config_ops::slot_residue_for_set(&fx.meta_lvs())
+        .await
+        .unwrap();
+    assert!(listed.is_empty(), "adopted residue leaves the slot listing");
+
+    // The next scoped mount of this set on this node BINDS it.
+    let own_dir = fx.container.join("mnt_new");
+    std::fs::create_dir_all(&own_dir).unwrap();
+    let our_gen = ws::staging_generation(&fx.set, Some(pair(fx.node, SLOT_B)));
+    let scan = squeezefs::config_ops::mount_scoped_staging_prelude(
+        std::slice::from_ref(&fx.container),
+        std::slice::from_ref(&own_dir),
+        "/mnt/new",
+        &our_gen,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        scan.adopted,
+        vec![residue_dir.clone()],
+        "the verb-adopted root is bound by the next mount"
+    );
+    assert!(
+        !residue_dir
+            .join(squeezefs::config_ops::STAGING_NODE_ADOPTED_MARKER)
+            .exists(),
+        "binding consumes the tombstone"
+    );
+    squeezefs::config_ops::release_staging_root_locks();
+
+    // Pending BLOCK custody refuses the verb (KD-8's law) and names the
+    // drain remedy.
+    let blocked_key = format!(
+        "active_block:inode_3:block_0{}",
+        pair_suffix(fx.node, SLOT_B)
+    );
+    fx.seed_residue("mnt_blocked", SLOT_B, &blocked_key).await;
+    let err = squeezefs::config_ops::staging_adopt(&fx.meta_lvs(), SLOT_B)
+        .await
+        .expect_err("pending write custody refuses the rebind")
+        .to_string();
+    assert!(
+        err.contains(&format!("client_slot={SLOT_B:08x}")),
+        "the refusal names the -o client_slot drain remedy: {err}"
+    );
+}
+
+/// The `-o client_slot=<hex8>` adoption arm: a mount presenting the
+/// residue's exact pair BINDS the residue root (its marker is a Match) and
+/// reports nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_slot_override_adopts_the_exact_pair_residue() {
+    let _g = serial().await;
+    let fx = Mw1bFixture::new().await;
+    let residue_key = format!(
+        "active_block:inode_4:block_0{}",
+        pair_suffix(fx.node, SLOT_A)
+    );
+    let residue_dir = fx.seed_residue("mnt_before", SLOT_A, &residue_key).await;
+    let own_dir = fx.container.join("mnt_after");
+    std::fs::create_dir_all(&own_dir).unwrap();
+
+    // The override makes OUR pair the residue's pair.
+    let our_gen = ws::staging_generation(&fx.set, Some(pair(fx.node, SLOT_A)));
+    let scan = squeezefs::config_ops::mount_scoped_staging_prelude(
+        std::slice::from_ref(&fx.container),
+        std::slice::from_ref(&own_dir),
+        "/mnt/after",
+        &our_gen,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        scan.adopted,
+        vec![residue_dir],
+        "an exact-pair dead sibling is ADOPTED (the client_slot remedy)"
+    );
+    assert!(scan.residue.is_empty(), "adopted residue is not reported");
+    squeezefs::config_ops::release_staging_root_locks();
+}
+
+/// OQ-5's resolved form, the LOCAL observation arm: an exact-pair sibling
+/// root owned by a LIVE mount refuses the mount loud, naming the collision
+/// class and the `-o client_slot=` remedy. The verbs refuse a live owner's
+/// root too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_live_pair_collision_refuses_the_mount_and_the_verbs() {
+    let _g = serial().await;
+    let fx = Mw1bFixture::new().await;
+    let residue_key = format!(
+        "active_block:inode_5:block_0{}",
+        pair_suffix(fx.node, SLOT_A)
+    );
+    let sibling_dir = fx.seed_residue("mnt_live", SLOT_A, &residue_key).await;
+    // Simulate the live sibling: hold its liveness lock.
+    squeezefs::config_ops::hold_staging_root_lock(&sibling_dir).unwrap();
+
+    let own_dir = fx.container.join("mnt_second");
+    std::fs::create_dir_all(&own_dir).unwrap();
+    let our_gen = ws::staging_generation(&fx.set, Some(pair(fx.node, SLOT_A)));
+    let err = squeezefs::config_ops::mount_scoped_staging_prelude(
+        std::slice::from_ref(&fx.container),
+        std::slice::from_ref(&own_dir),
+        "/mnt/second",
+        &our_gen,
+    )
+    .await
+    .expect_err("two LIVE mounts must never share one client identity")
+    .to_string();
+    assert!(err.contains("MOUNT-SLOT COLLISION"), "{err}");
+    assert!(
+        err.contains("client_slot"),
+        "the refusal names the remedy: {err}"
+    );
+    assert!(err.contains("/mnt/second"), "names our mount point: {err}");
+    squeezefs::config_ops::release_staging_root_locks();
+
+    // The verbs refuse a live owner's root as well.
+    squeezefs::config_ops::hold_staging_root_lock(&sibling_dir).unwrap();
+    let err = squeezefs::config_ops::staging_discard(&fx.meta_lvs(), SLOT_A)
+        .await
+        .expect_err("a live owner's root is never destroyed")
+        .to_string();
+    assert!(err.contains("LIVE"), "{err}");
+    let err = squeezefs::config_ops::staging_adopt(&fx.meta_lvs(), SLOT_A)
+        .await
+        .expect_err("a live owner's root is never re-bound")
+        .to_string();
+    assert!(err.contains("LIVE"), "{err}");
+}
+
+/// The solo-dark pin (rung 1 "ships DARK"): an UN-scoped staging
+/// generation makes the whole mount prelude a structural no-op — no
+/// liveness lock file is minted, nothing is adopted, nothing is reported
+/// — so an un-stamped solo mount's staging tree is byte-identical to
+/// prior releases (the residue machinery only ever engages on
+/// pair-decorated generations, which only bit-10 mounts mint).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unscoped_mount_prelude_is_a_structural_noop() {
+    let _g = serial().await;
+    let dir = tempdir().unwrap();
+    let container = dir.path().join("squeezefs");
+    let own = container.join("mnt_solo");
+    let sibling = container.join("mnt_other");
+    std::fs::create_dir_all(&own).unwrap();
+    std::fs::create_dir_all(&sibling).unwrap();
+    let set = "v3:2323232323232323232323232323232f";
+    squeezefs::cache::write_staging_generation_marker(&sibling, set)
+        .await
+        .unwrap();
+
+    let scan = squeezefs::config_ops::mount_scoped_staging_prelude(
+        std::slice::from_ref(&container),
+        std::slice::from_ref(&own),
+        "/mnt/solo",
+        set, // UN-decorated: the solo posture
+    )
+    .await
+    .unwrap();
+    assert!(scan.adopted.is_empty() && scan.residue.is_empty());
+    assert!(
+        !own.join(squeezefs::config_ops::STAGING_OWNER_LOCK).exists(),
+        "an un-scoped mount mints NO liveness lock file — its staging tree \
+         is byte-identical to prior releases"
+    );
+    assert!(
+        !sibling
+            .join(squeezefs::config_ops::STAGING_OWNER_LOCK)
+            .exists(),
+        "and it never touches a sibling dir"
+    );
+}
+
+/// The verbs are honest about scope: an un-scoped volume set carries no
+/// mount-slot residue, and the verbs refuse rather than scanning for
+/// something that cannot exist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn staging_verbs_refuse_an_unscoped_set() {
+    let _g = serial().await;
+    let meta = NamedTempFile::new().unwrap();
+    meta.as_file().set_len(96 * 1024 * 1024).unwrap();
+    squeezefs::meta_backend::kv::builder::format_v3(
+        meta.path(),
+        96 * 1024 * 1024,
+        &squeezefs::meta_backend::kv::builder::FormatV3Options {
+            node_size: squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE,
+            journal_len_override: None,
+            force: true,
+            full_wipe: false,
+            format_config_xattr: Some(serde_json::to_vec(&mw1b_format_config()).unwrap()),
+        },
+    )
+    .await
+    .unwrap();
+    let meta_lvs = vec![meta.path().to_string_lossy().into_owned()];
+    let err = squeezefs::config_ops::staging_discard(&meta_lvs, SLOT_A)
+        .await
+        .expect_err("an un-scoped set carries no slot residue")
+        .to_string();
+    assert!(
+        err.contains("not writer-scoped"),
+        "the refusal explains why: {err}"
+    );
 }

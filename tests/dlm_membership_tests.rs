@@ -186,6 +186,7 @@ fn join_req(id: &str, role: MemberRole, endpoint: Option<&str>) -> JoinRequest {
         boot: "boot-test".to_string(),
         prior_epoch: None,
         pr_key: 0,
+        mount: None,
     }
 }
 
@@ -1316,4 +1317,107 @@ async fn the_harness_wired_mode_drives_the_real_transport() {
     assert_eq!(report.renewals, 24);
     assert_eq!(report.journal_entries_delta, 0);
     assert!(report.renew_p50_us > 0.0, "the wire has a real latency");
+}
+
+// ---------------------------------------------------------------------------
+// KD-MW-2 (design-full-multi-writer §5.1) — the client-identity pair
+// grammar on the roster/census, and OQ-5's resolved form
+// ---------------------------------------------------------------------------
+
+/// The §11 roster grammar: entries name the pair `node_{16 hex}.m{8 hex}`
+/// exactly, or the bare `node_{16 hex}` form as a SLOT WILDCARD matching
+/// every mount slot of that node. Non-node ids (owner uuids, claim uuids)
+/// match only exactly, and a bare entry never prefix-matches a LONGER
+/// node token.
+#[test]
+fn member_id_grammar_matches_pairs_and_bare_node_wildcards() {
+    use membership::member_id_matches;
+    let bare = "node_00000000deadbeef";
+    let pair_a = "node_00000000deadbeef.m00c0ffee";
+    let pair_b = "node_00000000deadbeef.m0badc0de";
+
+    assert!(member_id_matches(pair_a, pair_a), "exact pair");
+    assert!(
+        !member_id_matches(pair_a, pair_b),
+        "a pair entry is slot-exact"
+    );
+    assert!(member_id_matches(bare, bare), "exact bare");
+    assert!(
+        member_id_matches(bare, pair_a) && member_id_matches(bare, pair_b),
+        "a bare entry is the slot wildcard"
+    );
+    assert!(
+        !member_id_matches(bare, "node_00000000deadbeef00.m00c0ffee"),
+        "a bare entry never prefix-matches a longer token"
+    );
+    assert!(
+        !member_id_matches("node_1111111111111111", pair_a),
+        "a different node never matches"
+    );
+    assert!(
+        !member_id_matches(pair_a, bare),
+        "a pair entry does not match the bare id (an offline process is \
+         not a mount)"
+    );
+    let uuid = "0e2a1a4e-9c1e-4a5f-8a2e-000000000001";
+    assert!(member_id_matches(uuid, uuid));
+    assert!(!member_id_matches(uuid, "some-other-id"));
+}
+
+/// OQ-5's resolved form (rung-1 red-first pin, driven by the explicit
+/// `client_slot` override shape): an observed mount-slot collision within
+/// one claim set's membership plane REFUSES loud, naming BOTH colliding
+/// mount points and the `-o client_slot=` remedy — while a re-join from
+/// the SAME mount point (crash successor) stays a replace, and joiners
+/// that report no mount point are never guessed about.
+#[test]
+fn a_mount_slot_collision_within_one_claim_set_refuses_loud() {
+    let _s = serial();
+    let owner = owner_with(shipped_clocks(), LeaseClock::monotonic(), 7);
+    let id = "node_00000000deadbeef.m00c0ffee";
+
+    let mut req_a = join_req(id, MemberRole::Writer, None);
+    req_a.mount = Some("/mnt/train-a".to_string());
+    let _grant_a = granted(owner.join(req_a));
+
+    // A DIFFERENT mount point presenting the SAME identity: refused,
+    // naming both mount points and the remedy.
+    let mut req_b = join_req(id, MemberRole::Writer, None);
+    req_b.mount = Some("/mnt/train-b".to_string());
+    req_b.pid = std::process::id().wrapping_add(1);
+    match owner.join(req_b) {
+        JoinOutcome::Refused { reason, .. } => {
+            assert!(reason.contains("MOUNT-SLOT COLLISION"), "{reason}");
+            assert!(
+                reason.contains("/mnt/train-a") && reason.contains("/mnt/train-b"),
+                "the refusal names BOTH colliding mount points: {reason}"
+            );
+            assert!(
+                reason.contains("client_slot"),
+                "the refusal names the -o client_slot remedy: {reason}"
+            );
+        }
+        JoinOutcome::Granted(_) => {
+            panic!("two mount points must never share one client identity")
+        }
+    }
+
+    // The census still carries the LIVE member — with its mount point
+    // (what `squeezefs clients` renders so the operator can see who holds
+    // the identity).
+    let (rows, _) = owner.census(0, 16);
+    let row = rows.iter().find(|r| r.id == id).expect("member listed");
+    assert_eq!(row.mount.as_deref(), Some("/mnt/train-a"));
+
+    // The SAME mount point re-joining (a crash successor at the same
+    // path) is the continuity law: a replace, never a collision.
+    let mut req_a2 = join_req(id, MemberRole::Writer, None);
+    req_a2.mount = Some("/mnt/train-a".to_string());
+    req_a2.pid = std::process::id().wrapping_add(2);
+    let _grant = granted(owner.join(req_a2));
+
+    // A joiner with NO mount point recorded is never guessed about: the
+    // collision check needs an observation, not an inference.
+    let anon = join_req(id, MemberRole::Writer, None);
+    let _grant = granted(owner.join(anon));
 }

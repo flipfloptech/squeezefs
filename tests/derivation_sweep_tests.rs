@@ -921,6 +921,379 @@ fn il_drain_lane_width_is_the_three_eighths_lane_pair_slope() {
 }
 
 // ---------------------------------------------------------------------------
+// KD-MW-14 / design-full-multi-writer §5.6 — the fleet-share root divisor
+// (`SQUEEZEFS_FLEET_SHARE`): ONE divisor at the ROOT INPUTS of the derived-
+// sizing tree — the memory-budget root and the sizing CPU-count root — so
+// every downstream formula scales untouched. Derived tier ONLY (absolute >
+// pct > derived precedence unchanged); floors are NEVER divided; the
+// kernel-mandated-geometry exemption class (the FUSE-over-uring queue
+// COUNT) is pinned below. Shares round UP (the rounding doctrine); never
+// auto-detected — operator/rig-set only.
+// ---------------------------------------------------------------------------
+
+/// A machine root chosen for exact arithmetic (320 GiB divides by 4
+/// through both the 70 % RAM law and every downstream fraction), so the
+/// share=4 rows can assert exact quartering, not just formula equality.
+const FLEET_RAM: u64 = 320 * GIB;
+
+/// The memory root: the share divides the SYSTEM inputs (RAM, the cgroup
+/// cage) BEFORE the existing resolution laws (×0.7 / ×0.8) — never the
+/// resolved budget after an explicit knob. Explicit tiers (flag, absolute
+/// env) win verbatim, undivided. `fleet_shared_root` is the one rounding
+/// site: UP (`div_ceil`) per the rounding doctrine.
+#[test]
+fn fleet_share_divides_the_memory_root_derived_tier_only() {
+    use mem_budget::{fleet_shared_root, resolve_budget_from_shared};
+    // Derived RAM leg: root divided BEFORE the 70 % law.
+    assert_eq!(
+        resolve_budget_from_shared(None, None, None, FLEET_RAM, 4),
+        56 * GIB,
+        "320 GiB ÷ 4 = 80 GiB effective RAM ⇒ 70 % = 56 GiB"
+    );
+    // Cgroup leg: the cage is a system root too — divided BEFORE the ×0.8.
+    assert_eq!(
+        resolve_budget_from_shared(None, None, Some(10 * GIB), FLEET_RAM, 4),
+        2 * GIB,
+        "10 GiB cage ÷ 4 = 2.5 GiB ⇒ ×0.8 = 2 GiB"
+    );
+    // EXPLICIT tiers are never divided (absolute > pct > derived,
+    // explicit-wins-verbatim — the ipc-cap precedent).
+    assert_eq!(
+        resolve_budget_from_shared(Some(2 * GIB), Some(3 * GIB), Some(8 * GIB), FLEET_RAM, 4),
+        2 * GIB,
+        "the --mem-budget flag wins verbatim at any share"
+    );
+    assert_eq!(
+        resolve_budget_from_shared(None, Some(3 * GIB), Some(8 * GIB), FLEET_RAM, 4),
+        3 * GIB,
+        "SQUEEZEFS_MEM_BUDGET_MB (absolute env) wins verbatim at any share"
+    );
+    // The rounding doctrine: shares round UP where division allocates.
+    assert_eq!(fleet_shared_root(10, 4), 3, "ceil(10/4) = 3, never 2");
+    assert_eq!(fleet_shared_root(5, 1), 5, "share 1 is the identity");
+    assert_eq!(
+        fleet_shared_root(5, 0),
+        5,
+        "share 0 is defensive-identity (the registry refuses it at startup)"
+    );
+    assert_eq!(fleet_shared_root(u64::MAX, 3), u64::MAX / 3 + 1, "no overflow");
+}
+
+/// The CPU root: `ceil(raw / share)`, never 0 — the effective count every
+/// `crates/squeezefs-ipc/src/sizing.rs`-fed derivation reads.
+#[test]
+fn fleet_share_divides_the_cpu_root_rounding_up() {
+    use squeezefs::cpu::effective_parallelism_from;
+    assert_eq!(effective_parallelism_from(32, 4), 8, "the field box at N=4");
+    assert_eq!(effective_parallelism_from(32, 5), 7, "ceil(6.4) = 7 — round UP");
+    assert_eq!(effective_parallelism_from(33, 4), 9, "ceil(8.25) = 9");
+    assert_eq!(effective_parallelism_from(2, 64), 1, "never 0 — floor 1");
+    assert_eq!(effective_parallelism_from(1, 1), 1);
+    assert_eq!(effective_parallelism_from(0, 4), 1, "degenerate raw never 0");
+    for raw in [1usize, 2, 8, 32, 192] {
+        assert_eq!(
+            effective_parallelism_from(raw, 1),
+            raw,
+            "share 1 is the identity at every machine size"
+        );
+    }
+}
+
+/// The rung-3b red row: share=4 quarters EVERY divisible derived cap —
+/// the derived tier minus the exemption class. Division happens at the
+/// ROOT, so each downstream formula applied to the shared root must
+/// produce exactly the quartered value wherever it is above its floor.
+#[test]
+fn fleet_share_quarters_every_divisible_derived_cap() {
+    use mem_budget::resolve_budget_from_shared;
+    use squeezefs::cpu::effective_parallelism_from;
+    use squeezefs::meta_backend::kv::backend::resolve_node_cache_budget;
+    use squeezefs::meta_backend::kv::checkpoint::resolve_max_dirty_nodes;
+    use squeezefs::zcrx_lane::probe::lane_geometry;
+    use squeezefs_ipc::sizing::il_drain_lanes_default;
+
+    // The memory root and its downstream fractions.
+    let whole = resolve_budget_from_shared(None, None, None, FLEET_RAM, 1);
+    let shared = resolve_budget_from_shared(None, None, None, FLEET_RAM, 4);
+    assert_eq!(whole, 224 * GIB);
+    assert_eq!(shared, whole / 4, "the budget root itself quarters");
+    // Transport payload-buffer cap (budget/8): 28 GiB → 7 GiB.
+    assert_eq!(mem_budget::transport_buffer_cap(shared), 7 * GIB);
+    assert_eq!(
+        mem_budget::transport_buffer_cap(shared),
+        mem_budget::transport_buffer_cap(whole) / 4
+    );
+    // IPC session-arena admission cap (budget/8): same quarter.
+    assert_eq!(
+        mem_budget::ipc_arena_cap(shared),
+        mem_budget::ipc_arena_cap(whole) / 4
+    );
+    // Meta node cache (budget/16, floor 512 MiB): 14 GiB → 3.5 GiB.
+    assert_eq!(
+        resolve_node_cache_budget(shared, None, None),
+        3 * GIB + 512 * MIB
+    );
+    assert_eq!(
+        resolve_node_cache_budget(shared, None, None),
+        resolve_node_cache_budget(whole, None, None) / 4
+    );
+    // Checkpoint dirty-node cap (budget/32 ÷ node): 28672 → 7168.
+    assert_eq!(resolve_max_dirty_nodes(shared, 256 * 1024, None), 7168);
+    assert_eq!(
+        resolve_max_dirty_nodes(shared, 256 * 1024, None),
+        resolve_max_dirty_nodes(whole, 256 * 1024, None) / 4
+    );
+    // Parked-write buffers (budget/16 ÷ block): 3584 → 896.
+    assert_eq!(
+        fuse_client::resolve_parked_cap_buffers(None, shared, 4 * MIB),
+        896
+    );
+    assert_eq!(
+        fuse_client::resolve_parked_cap_buffers(None, shared, 4 * MIB),
+        fuse_client::resolve_parked_cap_buffers(None, whole, 4 * MIB) / 4
+    );
+
+    // The CPU root and its downstream slopes (the field 32-CPU box, N=4).
+    let cpus = effective_parallelism_from(32, 4);
+    assert_eq!(cpus, 8);
+    // Drain-lane width (3×cpus/8): 12 → 3.
+    assert_eq!(il_drain_lanes_default(cpus), il_drain_lanes_default(32) / 4);
+    // NVMe submission fan-out (cpus ÷ devices): 16 → 4 on 2 devices.
+    assert_eq!(
+        squeezefs::nvme_dev::io_lanes_for(cpus, 2),
+        squeezefs::nvme_dev::io_lanes_for(32, 2) / 4
+    );
+    // zcrx lane geometry: (4, 64) → (1, 16) — both axes scale.
+    assert_eq!(lane_geometry(cpus), (1, 16));
+    assert_eq!(lane_geometry(32), (4, 64));
+}
+
+/// Floors are NEVER divided: at every share the derived values hold their
+/// physical-minimum / never-regress-below-shipped floors — silent
+/// starvation below a floor is what the refusal (next test) exists to
+/// prevent, never what a share produces.
+#[test]
+fn fleet_share_floors_hold_and_are_never_divided_at_every_share() {
+    use fuse3::raw::connection::fuse_over_uring::{PAYLOAD_BASE, Q_DEPTH_FLOOR};
+    use mem_budget::resolve_budget_from_shared;
+    use squeezefs::cpu::effective_parallelism_from;
+    use squeezefs::meta_backend::kv::backend::{
+        resolve_commit_batch_txs, resolve_node_cache_budget,
+    };
+    use squeezefs::meta_backend::kv::checkpoint::resolve_max_dirty_nodes;
+    use squeezefs::uring_fs::resolve_worker_count;
+    use squeezefs::zcrx_lane::probe::lane_geometry;
+    use squeezefs_ipc::sizing::{il_drain_lanes_default, il_sessions_default};
+
+    // The floor box (4 GiB / 2 CPUs) at escalating shares.
+    for share in [2usize, 4, 32, 4096] {
+        let b = resolve_budget_from_shared(None, None, None, 4 * GIB, share);
+        assert_eq!(
+            resolve_node_cache_budget(b, None, None),
+            512 * MIB,
+            "node-cache floor holds undivided at share={share}"
+        );
+        assert_eq!(
+            resolve_max_dirty_nodes(b, 256 * 1024, None),
+            4096,
+            "dirty-node floor holds at share={share}"
+        );
+        assert_eq!(
+            fuse_client::resolve_parked_cap_buffers(None, b, 4 * MIB),
+            256,
+            "parked-buffer floor holds at share={share}"
+        );
+        let c = effective_parallelism_from(2, share);
+        assert!(c >= 1, "the CPU root never divides to 0 at share={share}");
+        assert_eq!(resolve_commit_batch_txs(None, c), 64, "M7 floor holds");
+        assert_eq!(il_drain_lanes_default(c), 2, "drain-lane floor holds");
+        assert_eq!(il_sessions_default(c), 2, "session floor holds");
+        assert_eq!(resolve_worker_count(None, c), 4, "uring_fs floor holds");
+        assert_eq!(
+            mem_budget::ipc_session_population_target(c),
+            128,
+            "population floor holds"
+        );
+        assert_eq!(lane_geometry(c), (1, 4), "zcrx physical minima hold");
+    }
+    // The floors the refusal arithmetic reads are the pinned shipped ones.
+    assert_eq!(Q_DEPTH_FLOOR, 4, "the never-regress depth floor");
+    assert_eq!(PAYLOAD_BASE, 1024 * 1024, "the shipped payload ent");
+}
+
+/// share=1 (the default) is byte-identical to today's whole-machine
+/// posture — solo-dark: no divided value, no new refusal, at any budget.
+#[test]
+fn fleet_share_one_is_byte_identical_to_the_whole_machine_posture() {
+    use mem_budget::{fleet_share_floor_refusal, resolve_budget_from, resolve_budget_from_shared};
+    for ram in [4 * GIB, 251_000_000_000, FLEET_RAM] {
+        assert_eq!(
+            resolve_budget_from_shared(None, None, None, ram, 1),
+            resolve_budget_from(None, None, None, ram)
+        );
+        assert_eq!(
+            resolve_budget_from_shared(None, None, Some(10 * GIB), ram, 1),
+            resolve_budget_from(None, None, Some(10 * GIB), ram)
+        );
+        assert_eq!(
+            resolve_budget_from_shared(Some(2 * GIB), None, None, ram, 1),
+            resolve_budget_from(Some(2 * GIB), None, None, ram)
+        );
+    }
+    // Solo never refuses — even a zero budget is today's (non-refusing)
+    // never-regress posture, not a fleet-share arithmetic failure.
+    assert_eq!(fleet_share_floor_refusal(1, 0, 4096), None);
+}
+
+/// A divided root that makes a floor unsatisfiable REFUSES the mount
+/// loud, naming the arithmetic (never a silent clamp below a floor).
+/// The floor demand is the kernel-mandated transport geometry's
+/// never-divided minimum: possible_cpus × Q_DEPTH_FLOOR × PAYLOAD_BASE —
+/// the queue COUNT cannot divide (the exemption class), depth floors at
+/// 4, so this footprint exists per daemon regardless of share.
+#[test]
+fn fleet_share_unsatisfiable_floor_refuses_naming_the_arithmetic() {
+    use mem_budget::fleet_share_floor_refusal;
+    // 32 possible CPUs ⇒ floor = 32 × 4 × 1 MiB = 128 MiB.
+    let floor = 32u64 * 4 * MIB;
+    assert_eq!(floor, 134_217_728);
+    // A satisfied floor mounts (boundary inclusive).
+    assert_eq!(fleet_share_floor_refusal(2, floor, 32), None);
+    assert_eq!(fleet_share_floor_refusal(2, floor + 1, 32), None);
+    // Below the floor: refusal, naming every number in the arithmetic.
+    let msg = fleet_share_floor_refusal(1024, floor - 1, 32)
+        .expect("an unsatisfiable floor must refuse the mount");
+    assert!(
+        msg.contains("SQUEEZEFS_FLEET_SHARE=1024"),
+        "the refusal names the share: {msg}"
+    );
+    assert!(
+        msg.contains("134217727"),
+        "the refusal names the divided budget: {msg}"
+    );
+    assert!(
+        msg.contains("134217728"),
+        "the refusal names the floor demand: {msg}"
+    );
+    assert!(
+        msg.contains("Q_DEPTH_FLOOR"),
+        "the refusal names the floor law: {msg}"
+    );
+    assert!(msg.contains("32"), "the refusal names the possible-CPU count");
+    // Solo (share 1) never refuses — pinned above too; both directions.
+    assert_eq!(fleet_share_floor_refusal(1, floor - 1, 32), None);
+}
+
+/// The kernel-mandated-geometry exemption LIST is pinned to exactly the
+/// kernel-mandated set (§5.6): the FUSE-over-io_uring queue COUNT (one
+/// queue per kernel possible CPU or the session never becomes ready —
+/// `fuse_over_uring.rs:2399/:2425`) and its structural shadows. The pin
+/// is the `possible_cpus(` consumer census across the production trees:
+/// a future kernel-mandated input joins the exemption EXPLICITLY (by
+/// extending this list with its classification), never by drift — and a
+/// derived cap reaching for the exempt root instead of the divided one
+/// is a red test, not a judgment call.
+#[test]
+fn fleet_share_exemption_list_is_pinned_to_the_kernel_mandated_set() {
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                rust_files(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    for tree in [
+        "src",
+        "crates/fuse3/src",
+        "crates/squeezefs-ipc/src",
+        "crates/squeezefs-preload/src",
+    ] {
+        rust_files(&root.join(tree), &mut files);
+    }
+    assert!(files.len() > 100, "census roots wrong: {} files", files.len());
+    let mut consumers = BTreeSet::new();
+    for f in &files {
+        let Ok(text) = std::fs::read_to_string(f) else {
+            continue;
+        };
+        if text.contains("possible_cpus(") {
+            consumers.insert(
+                f.strip_prefix(root)
+                    .expect("census file outside the manifest root")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+    let expected: BTreeSet<String> = [
+        // The exempt root's definition (and the RAW-mask fallback that
+        // keeps kernel geometry undivided even when sysconf fails).
+        "src/cpu.rs",
+        // The op registry shadows the DELIVERED ring geometry
+        // (possible_cpus × Q_DEPTH_DESIRED) — a structural shadow of the
+        // exempt queue count, never a sizing choice.
+        "src/fuse_client.rs",
+        // The fleet-share floor refusal PRICES the exempt geometry's
+        // never-divided footprint (possible_cpus × Q_DEPTH_FLOOR ×
+        // payload) against the divided budget — it reads the exempt
+        // root because the demand it names cannot scale with the share.
+        "src/mem_budget.rs",
+        // The kernel-mandated queue COUNT itself (fuse_uring_create():
+        // one queue per possible CPU; fewer never becomes ready) and the
+        // qid-is-cpu identity check.
+        "crates/fuse3/src/raw/connection/fuse_over_uring.rs",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    assert_eq!(
+        consumers, expected,
+        "the possible_cpus consumer census drifted — a new consumer must \
+         join the §5.6 exemption list EXPLICITLY (kernel-mandated) or read \
+         the divided sizing root (crate::cpu::process_parallelism) instead"
+    );
+}
+
+/// ENG-10: the knob is registered (int, lo = 1 — zero and negatives
+/// refuse at startup per the registry law), default 1, and malformed
+/// values refuse rather than silently defaulting.
+#[test]
+fn fleet_share_knob_is_registered_and_zero_refuses_at_startup() {
+    use squeezefs::env_knobs::{self, Kind};
+    let knob =
+        env_knobs::lookup("SQUEEZEFS_FLEET_SHARE").expect("SQUEEZEFS_FLEET_SHARE must be registered");
+    match knob.kind {
+        Kind::Int { lo, hi } => {
+            assert_eq!(lo, 1, "0 must be OUT of the admissible range");
+            assert!(hi >= 4096, "room for any plausible fleet width");
+        }
+        other => panic!("SQUEEZEFS_FLEET_SHARE must be an Int knob, got {other:?}"),
+    }
+    assert_eq!(knob.default, "1", "default = today's whole-machine posture");
+    for bad in ["0", "-1", "junk", "1.5"] {
+        let v = env_knobs::validate_vars([("SQUEEZEFS_FLEET_SHARE", bad)]);
+        assert!(
+            !v.errors.is_empty(),
+            "SQUEEZEFS_FLEET_SHARE={bad} must refuse at startup"
+        );
+    }
+    for good in ["1", "4", "32"] {
+        let v = env_knobs::validate_vars([("SQUEEZEFS_FLEET_SHARE", good)]);
+        assert!(v.errors.is_empty(), "SQUEEZEFS_FLEET_SHARE={good} is valid");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Hybrid lane gate (2026-08-07): the shim's kernel-lane crossover threshold
 // ---------------------------------------------------------------------------
 

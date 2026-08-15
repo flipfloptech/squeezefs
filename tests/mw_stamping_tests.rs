@@ -313,7 +313,11 @@ async fn mw_s1_crash_between_volumes_refuses_writable_and_resumes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mw_s1b_kill_between_every_adjacent_bit_pair_refuses_then_resumes() {
-    for bits_done in 0..=8usize {
+    // Windows: 0 = marker alone (kill before any bit), 1..=8 = between
+    // each adjacent bit pair, 9 = ALL nine stamped but the marker not yet
+    // deleted (the terminal window — the refusal must ride the marker
+    // alone, since the uniformity check passes there).
+    for bits_done in 0..=9usize {
         let dir = tempfile::tempdir().unwrap();
         let meta = make_file(dir.path(), "m0.meta");
         format_default_set(std::slice::from_ref(&meta)).await;
@@ -335,12 +339,13 @@ async fn mw_s1b_kill_between_every_adjacent_bit_pair_refuses_then_resumes() {
             .expect_err("injected crash surfaces");
 
         // The volume carries a proper PREFIX of the order; bit 11 is
-        // terminal by construction so it is absent in every window.
+        // terminal by construction so it is absent in every window but
+        // the last (all-stamped, marker still up).
         let feat = features_of(&meta).await;
         assert_eq!(
-            feat & sb::FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA,
-            0,
-            "window {bits_done}: bit 11 is TERMINAL — never present mid-sequence"
+            feat & sb::FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA != 0,
+            bits_done == 9,
+            "window {bits_done}: bit 11 is TERMINAL — present only once all nine landed"
         );
         for (i, bit) in ENABLE_ORDER.iter().enumerate() {
             let present = feat & (1u64 << bit) != 0;

@@ -39,7 +39,7 @@ static INODE_META_LOCKS: once_cell::sync::Lazy<StripeLocks<crate::sqz_sync::SqzM
 /// surface, VL10): every acquisition site routes here so a contended wait
 /// on the block-map merge domain shows up in the watchdog's lock-wait
 /// census with its inode named. Fast path = one `try_lock`.
-async fn meta_lock_acquire(ino: u64) -> crate::sqz_sync::SqzMutexGuard<'static, ()> {
+pub(crate) async fn meta_lock_acquire(ino: u64) -> crate::sqz_sync::SqzMutexGuard<'static, ()> {
     crate::fuse_client::census_meta_lock_acquire(INODE_META_LOCKS.get_inode_lock(ino), ino).await
 }
 

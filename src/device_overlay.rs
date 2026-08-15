@@ -91,10 +91,56 @@ pub fn device_overlay_enabled() -> bool {
     }
 }
 
-/// Drop the test pin so the next probe re-reads env / the ON default.
+/// B4c-ii (design-overlay-overwrite §6): the OVERWRITE-arm lever.
+/// Same tri-state + `cfg(test)` posture as [`device_overlay_enabled`]:
+/// the binary defaults ON (KD-B4-9 — the efficiency doctrine), lib
+/// unit-test readers default OFF so accumulation/W1 harnesses keep
+/// their path.
+static OVERWRITE: AtomicU8 = AtomicU8::new(0);
+/// OQ-5: barrier-before-close for overlay-fed epochs (default OFF —
+/// the deliberately-not-taken stronger posture; B4d prices it).
+static CLOSE_BARRIER: AtomicU8 = AtomicU8::new(0);
+
+/// The `SQUEEZEFS_OVERLAY_OVERWRITE` lever (registry entry in
+/// `src/env_knobs.rs`). Engagement additionally requires an armed
+/// overlay ([`device_overlay_enabled`]) — the caller's screen composes
+/// them.
+pub fn overlay_overwrite_enabled() -> bool {
+    match OVERWRITE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let default = !cfg!(test);
+            let on = crate::env_knobs::bool_knob("SQUEEZEFS_OVERLAY_OVERWRITE", default);
+            OVERWRITE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Test override for the overwrite arm (the `set_device_overlay_for_tests`
+/// pattern — no env-order coupling).
+pub fn set_overlay_overwrite_for_tests(enabled: bool) {
+    OVERWRITE.store(if enabled { 2 } else { 1 }, Ordering::Relaxed);
+}
+
+/// The `SQUEEZEFS_OVERLAY_CLOSE_BARRIER` lever (OQ-5; registry entry in
+/// `src/env_knobs.rs`).
+pub fn overlay_close_barrier() -> bool {
+    tri(&CLOSE_BARRIER, "SQUEEZEFS_OVERLAY_CLOSE_BARRIER")
+}
+
+/// Test override for the OQ-5 lever.
+pub fn set_overlay_close_barrier_for_tests(enabled: bool) {
+    CLOSE_BARRIER.store(if enabled { 2 } else { 1 }, Ordering::Relaxed);
+}
+
+/// Drop the test pins so the next probe re-reads env / the defaults.
 pub fn clear_device_overlay_for_tests() {
     ENABLED.store(0, Ordering::Relaxed);
     BYTES_VEHICLE.store(0, Ordering::Relaxed);
+    OVERWRITE.store(0, Ordering::Relaxed);
+    CLOSE_BARRIER.store(0, Ordering::Relaxed);
 }
 
 /// Whether `WritePayload::Bytes` may ride the overlay store.

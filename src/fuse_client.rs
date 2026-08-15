@@ -879,6 +879,23 @@ pub fn set_test_inval_tail_stall_ms(ms: u64) {
     test_inval_tail_stall_cell().store(ms, Ordering::Relaxed);
 }
 
+/// TEST SEAM (B4c-ii, design-overlay-overwrite §5.1): stall INSIDE the
+/// overwrite install's ONE `INODE_META_LOCKS` capture+install section —
+/// after the mapping capture, before the registry install. The §5.1
+/// interleave pin drives a foreign durable merge through the window and
+/// asserts it PARKS on the section (a record can never be born with a
+/// displaced `old_binding`). One relaxed load unset; never set in
+/// production.
+fn test_overlay_capture_stall_cell() -> &'static std::sync::atomic::AtomicU64 {
+    static CELL: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::atomic::AtomicU64::new(0))
+}
+
+/// Set the §5.1 capture-stall seam (tests only; `0` disables).
+pub fn set_test_overlay_capture_stall_ms(ms: u64) {
+    test_overlay_capture_stall_cell().store(ms, Ordering::Relaxed);
+}
+
 /// TEST SEAM (`SQUEEZEFS_TEST_CHECKOUT_STALL_MS`): stall the write
 /// handler inside its BLOCK_FLUSH_LOCKS-held window, strictly after the
 /// overlay checkout/park and before the request-slice merge — the
@@ -5964,6 +5981,22 @@ pub struct Metrics {
     /// (`overlay_foreign_merge`) — that pair must stay 0 on healthy
     /// mounts now that the settle's own publish is provenance-exempt.
     pub overlay_superseded_by_merge: Align64<AtomicU64>,
+    /// B4c-ii: OVERWRITE overlay records installed (the B4 engagement
+    /// face — §11).
+    pub overlay_overwrite_installs: Align64<AtomicU64>,
+    /// B4c-ii: the overwrite-arm SUBSET of [`Self::overlay_store_bytes`],
+    /// counted at the store CQE (KD-B4-10: the closure equation's
+    /// well-formed term — never summed with `overlay_ack_early_bytes`).
+    pub overlay_overwrite_bytes: Align64<AtomicU64>,
+    /// §5.1 decline ledger: a mapped block whose CURRENT binding is a
+    /// RAM-only shadow B key declined the overlay (the epoch owns its
+    /// park — hazard-1 territory; the accumulation path's same-epoch
+    /// re-rewrite serves the shape). OQ-3's demand instrument.
+    pub overlay_ineligible_shadow_bound: Align64<AtomicU64>,
+    /// §5.1 / KD-B4-8: a `StorageFull` dest mint declined the overwrite
+    /// arm to accumulation (whose epoch KD-1.7 early-close ladder
+    /// recycles the parked displaced supply) — never a write error.
+    pub overlay_enospc_declines: Align64<AtomicU64>,
     /// GAUGE: live overlay records — must return to 0 at quiesce (the
     /// `rewrite_shadow_open_epochs` law); the read/write probe hooks'
     /// `overlay_open == 0` fast path rides it.
@@ -9442,6 +9475,10 @@ impl SqueezefsFilesystem {
                 "overlay_read_gap_bytes": METRICS.overlay_read_gap_bytes.load(Ordering::Relaxed),
                 "overlay_mover_skips": METRICS.overlay_mover_skips.load(Ordering::Relaxed),
                 "overlay_superseded_by_merge": METRICS.overlay_superseded_by_merge.load(Ordering::Relaxed),
+                "overlay_overwrite_installs": METRICS.overlay_overwrite_installs.load(Ordering::Relaxed),
+                "overlay_overwrite_bytes": METRICS.overlay_overwrite_bytes.load(Ordering::Relaxed),
+                "overlay_ineligible_shadow_bound": METRICS.overlay_ineligible_shadow_bound.load(Ordering::Relaxed),
+                "overlay_enospc_declines": METRICS.overlay_enospc_declines.load(Ordering::Relaxed),
                 "overlay_gap_seeds": METRICS.overlay_gap_seeds.load(Ordering::Relaxed),
                 "overlay_gap_seed_bytes": METRICS.overlay_gap_seed_bytes.load(Ordering::Relaxed),
                 "overlay_open": METRICS.overlay_open.load(Ordering::Relaxed),
@@ -12921,7 +12958,27 @@ impl SqueezefsFilesystem {
         let Some(bm) = meta.block_map.as_ref() else {
             return false;
         };
-        if bm.contains_key(&(b as u32)) || self.router.rewrite_epoch_binds_block(ino, b as u32) {
+        // B4c-ii: mapped blocks are hold-eligible under the overwrite
+        // lever (the whole point — the slot retains at delivery; a stale
+        // TRUE only costs one late extraction). Two carve-outs:
+        // shadow-bound blocks stay declined (the §5.1 one-authority
+        // arm), and PATCH-SHAPED mapped writes (≤ the W1 cap) stay on
+        // the patch ladder's hold rules — the patch runs FIRST in the
+        // handler ladder and owns that population, and its O_DIRECT
+        // vehicle is the HELD slot (late WRITE_FIXED), the opposite of
+        // the overlay's extract-at-delivery posture. A patch that then
+        // declines at state time (clause 8, shared, …) costs one late
+        // extraction — the documented stale-verdict price.
+        if bm.contains_key(&(b as u32)) {
+            if !crate::device_overlay::overlay_overwrite_enabled() {
+                return false;
+            }
+            let cap = patch_max_bytes();
+            if cap != 0 && u64::from(len) <= cap {
+                return false;
+            }
+        }
+        if self.router.rewrite_epoch_binds_block(ino, b as u32) {
             return false;
         }
         let key = crate::keys::active_block_stack(ino, b);
@@ -12981,18 +13038,32 @@ impl SqueezefsFilesystem {
             return Ok(false);
         }
         let Some(bm) = meta.block_map.as_ref() else {
-            // Indirect-mapped layouts: conservatively decline in B2 (a
-            // fresh block cannot be PROVEN unmapped without the map).
+            // Indirect-mapped layouts: conservatively decline (neither
+            // freshness nor the capture can be PROVEN without the map).
             return Ok(false);
         };
-        if bm.contains_key(&b) {
-            // An old binding exists — the overwrite shape is PR B4.
+        // The cheap pre-filter; the AUTHORITATIVE overwrite verdict
+        // (capture + shadow-bound re-check) runs under the §5.1 meta
+        // section at install below. The caller's screen already holds
+        // the aligned/single-block/passthrough/no-verification conjuncts
+        // for both shapes.
+        let overwrite_shape = bm.contains_key(&b);
+        if overwrite_shape && !crate::device_overlay::overlay_overwrite_enabled() {
+            // The B2 fresh-only gate (the A/B lever's OFF leg).
             return Ok(false);
         }
         if self.router.rewrite_epoch_binds_block(ino, b) {
-            // A pending shadow binding exists for THIS block: the
-            // KD-OV-12 one-authority law — decline (accumulation; the
-            // B4 coexistence arm is what would relax this).
+            // A pending shadow binding exists for THIS block (KD-OV-12
+            // one-authority): decline — the captured old_binding would
+            // be an unpublished B key whose park/free the epoch already
+            // owns (hazard 1). The accumulation path's same-epoch
+            // re-rewrite owns the shape (§5.1; OQ-3's relaxation owns
+            // any future demand).
+            if overwrite_shape {
+                METRICS
+                    .overlay_ineligible_shadow_bound
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             return Ok(false);
         }
         if self.active_block_buffers.contains_key(cache_key)
@@ -13031,29 +13102,115 @@ impl SqueezefsFilesystem {
                     return Ok(false);
                 }
                 write_phase(ino, offset_hint, b, WP_OV_ALLOC);
-                let dest_offset = allocator.allocate_block().await?;
+                let dest_offset = match allocator.allocate_block().await {
+                    Ok(o) => o,
+                    // KD-B4-8: a StorageFull mint on the overwrite shape
+                    // DECLINES to accumulation — the parked-A population
+                    // is exactly the free supply the epoch's KD-1.7
+                    // ENOSPC early-close ladder recycles; a propagated
+                    // error would fail a write that ladder can serve.
+                    // (Fresh-shape mints keep the loud path: no parked
+                    // supply exists to recycle.)
+                    Err(SqueezefsError::Io(ref e))
+                        if overwrite_shape && e.kind() == std::io::ErrorKind::StorageFull =>
+                    {
+                        METRICS
+                            .overlay_enospc_declines
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Ok(false);
+                    }
+                    Err(e) => return Err(e),
+                };
                 let fsck_guard = allocator.inflight_register(dest_offset);
                 let mint_owner = crate::assembly_tasks::MintedBlockGuard::new(
                     std::sync::Arc::clone(&allocator),
                     dest_offset,
                 );
-                match self.device_overlays.install(
-                    ino,
-                    b,
-                    block_size as u32,
-                    be_id,
-                    dest_offset,
-                    device,
-                    allocator,
-                    fencing_token,
-                    // Fresh/hole shape (the mapped decline above): no old
-                    // binding. The overwrite capture — inside the ONE
-                    // 3.5 section, §5.1 — is PR B4c-ii's.
-                    None,
-                    fsck_guard,
-                    mint_owner,
-                ) {
-                    Some(r) => r,
+                // §5.1 (normative): the OVERWRITE capture and the
+                // registry install execute inside ONE
+                // `INODE_META_LOCKS(ino)` section, taken under the
+                // caller's held `BLOCK_FLUSH_LOCKS` — the (3)→(3.5)
+                // extended order, no new edges. The block guard alone
+                // closes NOTHING against foreign durable merges (the
+                // merge primitive never takes (1)/(3), and fsck's
+                // `flip_mapping_damaged` / the conveyor pass hold no
+                // block guard): a capture that dropped 3.5 before
+                // installing would let a foreign merge run its whole 3.5
+                // section — including the §5.7 hook, which can only
+                // supersede records it can SEE — in the gap, and the
+                // record would be born naming a displaced key whose
+                // free is already scheduled (the KD-1.11 resurrection
+                // class at birth). Fresh installs carry no capture and
+                // keep the lock-free B2 path. Every decline below drops
+                // the ARMED mint owner, which frees the reservation.
+                let installed = if overwrite_shape {
+                    let _cap_guard = crate::routing::meta_lock_acquire(ino).await;
+                    // Re-derive the verdict UNDER the section (the
+                    // screen above was the cheap pre-filter; the RAM
+                    // map is the authority and every foreign merge
+                    // mutates it under this same lock).
+                    let old_binding = self
+                        .router
+                        .metadata_cache
+                        .get(&ino)
+                        .filter(|m| m.file_type == "striped")
+                        .and_then(|m| m.block_map.as_ref().and_then(|bm| bm.get(&b).cloned()));
+                    let Some(old_binding) = old_binding else {
+                        // The mapping vanished between screen and lock
+                        // (truncate/punch raced): decline to the ladder.
+                        return Ok(false);
+                    };
+                    if self.router.rewrite_epoch_binds_block(ino, b) {
+                        METRICS
+                            .overlay_ineligible_shadow_bound
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Ok(false);
+                    }
+                    // TEST SEAM: the §5.1 interleave pin's window —
+                    // after capture, before install (a foreign merge
+                    // driven through it must PARK on this section).
+                    let stall = test_overlay_capture_stall_cell().load(Ordering::Relaxed);
+                    if stall > 0 {
+                        squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(stall))
+                            .await;
+                    }
+                    self.device_overlays.install(
+                        ino,
+                        b,
+                        block_size as u32,
+                        be_id,
+                        dest_offset,
+                        device,
+                        allocator,
+                        fencing_token,
+                        Some(old_binding),
+                        fsck_guard,
+                        mint_owner,
+                    )
+                } else {
+                    self.device_overlays.install(
+                        ino,
+                        b,
+                        block_size as u32,
+                        be_id,
+                        dest_offset,
+                        device,
+                        allocator,
+                        fencing_token,
+                        None,
+                        fsck_guard,
+                        mint_owner,
+                    )
+                };
+                match installed {
+                    Some(r) => {
+                        if overwrite_shape {
+                            METRICS
+                                .overlay_overwrite_installs
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        r
+                    }
                     None => {
                         // Lost an install race (structurally impossible
                         // under the held guard) — the dropped mint owner
@@ -13272,6 +13429,12 @@ impl SqueezefsFilesystem {
         METRICS
             .overlay_store_bytes
             .fetch_add(len as u64, Ordering::Relaxed);
+        if rec.core.old_binding().is_some() {
+            // KD-B4-10: the CQE-counted overwrite subset.
+            METRICS
+                .overlay_overwrite_bytes
+                .fetch_add(len as u64, Ordering::Relaxed);
+        }
         match verdict {
             crate::overlay_core::CompleteVerdict::Covered { coverage_complete } => {
                 if coverage_complete {
@@ -13432,6 +13595,11 @@ impl SqueezefsFilesystem {
             METRICS
                 .overlay_store_bytes
                 .fetch_add(len as u64, Ordering::Relaxed);
+            if rec.core.old_binding().is_some() {
+                METRICS
+                    .overlay_overwrite_bytes
+                    .fetch_add(len as u64, Ordering::Relaxed);
+            }
         }
         match verdict {
             crate::overlay_core::CompleteVerdict::Covered { coverage_complete } => {
@@ -13517,6 +13685,11 @@ impl SqueezefsFilesystem {
             METRICS
                 .overlay_store_bytes
                 .fetch_add(len as u64, Ordering::Relaxed);
+            if rec.core.old_binding().is_some() {
+                METRICS
+                    .overlay_overwrite_bytes
+                    .fetch_add(len as u64, Ordering::Relaxed);
+            }
         }
         match verdict {
             crate::overlay_core::CompleteVerdict::Covered { coverage_complete } => {
@@ -13701,7 +13874,32 @@ impl SqueezefsFilesystem {
                                 .rewrite_device_write_bytes
                                 .fetch_add(block_size, Ordering::Relaxed);
                         }
-                        rec.core.mark_fed();
+                        if !rec.core.mark_fed() {
+                            // A GUARD-LESS discarding belt (§5.7
+                            // TruncateFrom/RemoveBlocks) superseded the
+                            // record mid-settle, post-freeze. The feed
+                            // above ALREADY transferred dest ownership
+                            // to the epoch — the Superseded teardown
+                            // below must DISARM, never free (the
+                            // 2026-08-14 stress_recycled_keys_v3
+                            // conviction: the freed dest was the
+                            // epoch's live B key; recycled, it bound
+                            // TWO blocks to one offset — the KD-1.11
+                            // corruption in the flesh). The discarding
+                            // op's own primitive owns the binding it
+                            // pruned; a feed serialized AFTER it
+                            // re-binds beyond the pruned size, which
+                            // the generic/795 size law keeps invisible
+                            // until a newer write overwrites it.
+                            if let Some(m) = rec
+                                .mint_owner
+                                .lock()
+                                .expect("overlay mint owner mutex poisoned")
+                                .as_mut()
+                            {
+                                m.disarm();
+                            }
+                        }
                         METRICS.overlay_epoch_feeds.fetch_add(1, Ordering::Relaxed);
                         self.teardown_overlay_block_locked(ino, b, &rec).await;
                         return Ok(coverage_complete);
@@ -13768,7 +13966,20 @@ impl SqueezefsFilesystem {
                 Err(e) => return Err(e),
             }
         };
-        rec.core.mark_published();
+        if !rec.core.mark_published() {
+            // Same law as the feed arm above (the §5.7 discarding belt
+            // raced the settle post-freeze): the merge DURABLY published
+            // the dest into the map — the Superseded teardown must
+            // disarm, never free a key the map now names (KD-1.11).
+            if let Some(m) = rec
+                .mint_owner
+                .lock()
+                .expect("overlay mint owner mutex poisoned")
+                .as_mut()
+            {
+                m.disarm();
+            }
+        }
         self.teardown_overlay_block_locked(ino, b, &rec).await;
         METRICS.overlay_publishes.fetch_add(1, Ordering::Relaxed);
         METRICS
@@ -13849,6 +14060,15 @@ impl SqueezefsFilesystem {
                 // warn: the hint is never a correctness obligation —
                 // the fed epoch stays registered (the idle sweeper and
                 // the next fsync are the backstops).
+                // OQ-5 lever (B4c-ii, default OFF): barrier the data
+                // devices BEFORE the coverage close, upgrading it out of
+                // the OW-8 DUR-2 volatility class. B4d prices it; the
+                // green twin proves it.
+                if crate::device_overlay::overlay_close_barrier() {
+                    if let Err(e) = self.router.backend_router.flush_data_devices().await {
+                        warn!("OQ-5 pre-close data barrier for ino {ino} failed: {e:?}");
+                    }
+                }
                 let token = self.dlm.get_fencing_token_ino(ino);
                 if let Err(e) = self.router.close_rewrite_epoch(ino, token).await {
                     warn!("overlay-fed coverage epoch close for ino {ino} failed: {e:?}");
@@ -13906,19 +14126,18 @@ impl SqueezefsFilesystem {
         Ok(())
     }
 
-    /// **B4b TEST SEAM — narrowed at B4c-ii** (when the §5.1
-    /// one-3.5-section capture+install lands in the store path and
-    /// suites mint overwrite records through real writes; the
-    /// mapped-decline gates are closed until then). Installs an
-    /// OVERWRITE overlay record on a MAPPED striped block the way the
-    /// B4c-ii store path will: under the block guard — dest mint
-    /// (law 2), both owners armed, the CURRENT mapping captured as
-    /// `old_binding`, registry install, then one aligned segment stored
-    /// to the dest with its coverage published at the CQE (law 3).
-    /// `#[doc(hidden)] pub` per the `routing::set_test_zc_slot_wrap`
-    /// house precedent (`tests/overlay_overwrite_tests.rs` is the
-    /// consumer — hazard pins need integration-scale fixtures while
-    /// `DeviceOverlayRegistry::install` stays `pub(crate)`).
+    /// **TEST SEAM (B4b; re-adjudicated at B4c-ii — KEPT).** The live
+    /// store path now mints overwrite records, but a coverage-COMPLETE
+    /// live write immediately spawns the detached publish (freeze →
+    /// feed → close hint), so an OPEN whole-block record — the state
+    /// the hazard/crash pins must hold still and inspect — is not
+    /// deterministically reachable through real writes. This seam
+    /// fabricates exactly the store path's product (guard-held dest
+    /// mint per law 2, both owners, current-mapping capture, registry
+    /// install, one covered store — law 3) WITHOUT the detached
+    /// continuation; deleting it would trade deterministic law pins for
+    /// timing-dependent ones. `#[doc(hidden)] pub` per the
+    /// `routing::set_test_zc_slot_wrap` house precedent.
     #[doc(hidden)]
     pub async fn test_install_overwrite_overlay(
         &self,
@@ -13999,11 +14218,12 @@ impl SqueezefsFilesystem {
         res
     }
 
-    /// **B4b TEST SEAM — narrowed at B4c-ii.** Takes the block guard,
-    /// settles (the §5.4 publish split), drops the guard and returns
-    /// the RAW close-owed hint WITHOUT acting on it — the venue-law
-    /// pin's instrument (`close_never_runs_under_block_guard` observes
-    /// the epoch still open across this call).
+    /// **TEST SEAM (B4b; re-adjudicated at B4c-ii — KEPT).** Takes the
+    /// block guard, settles (the §5.4 publish split), drops the guard
+    /// and returns the RAW close-owed hint WITHOUT acting on it — the
+    /// venue-law pin's instrument (`close_never_runs_under_block_guard`
+    /// observes the epoch still open across this call; no product venue
+    /// exposes the un-acted hint).
     #[doc(hidden)]
     pub async fn test_settle_overlay_block(
         &self,
@@ -14177,6 +14397,25 @@ impl SqueezefsFilesystem {
                         gap_bytes += (hi - lo) as u64;
                     }
                 }
+            }
+            // Post-fetch revalidation. The TERMINAL re-check is
+            // LOAD-BEARING and must run AFTER every device fetch (the
+            // 2026-08-14 stress_recycled_keys_v3 conviction — a real
+            // wrong-serve, not a premise): the feed retires the record
+            // and the epoch close then FREES the displaced old key,
+            // whose offset recycles under churn — a gap fetch straddling
+            // feed→close→free→reuse returns the NEW tenant's bytes while
+            // the generation stays EQUAL (`mark_fed` never bumps it) and
+            // no claim is live. The same shape covers a Superseded
+            // record's freed dest. Every free is ordered strictly AFTER
+            // the SeqCst terminal CAS (the §5.2 deferred-free law /
+            // law-9 teardown), so a serve that observes ¬terminal HERE
+            // cannot have fetched post-free bytes. Same protocol words,
+            // one more read — no new fence (KD-B4-4). Terminal ⇒ decline
+            // to the drain path (record-gone-⇒-published: the ordinary
+            // ladder re-resolves through the updated map).
+            if rec.core.state().is_terminal() {
+                return None;
             }
             if rec.core.read_valid(snap) && !rec.core.range_inflight(first_page, pages) {
                 METRICS.overlay_read_serves.fetch_add(1, Ordering::Relaxed);
@@ -14461,6 +14700,17 @@ impl SqueezefsFilesystem {
                             let fs = self.clone();
                             let close_ino = ino;
                             crate::detached::tpc_spawn_guarded("overlay_epoch_close", async move {
+                                // OQ-5 lever (see the drain venue).
+                                if crate::device_overlay::overlay_close_barrier() {
+                                    if let Err(e) =
+                                        fs.router.backend_router.flush_data_devices().await
+                                    {
+                                        warn!(
+                                            "OQ-5 pre-close data barrier for ino \
+                                             {close_ino} failed: {e:?}"
+                                        );
+                                    }
+                                }
                                 let token = fs.dlm.get_fencing_token_ino(close_ino);
                                 if let Err(e) =
                                     fs.router.close_rewrite_epoch(close_ino, token).await

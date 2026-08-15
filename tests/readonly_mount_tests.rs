@@ -964,3 +964,272 @@ fn the_read_only_latch_defaults_off() {
          never-taken branch, nothing more"
     );
 }
+
+// ===========================================================================
+// The rung-6 fleet findings (2026-08-15) — the repro-port mandate's cargo
+// pins. Found live by tests/mw_fleet.sh + tests/run_mw_matrix.sh smoke.
+// ===========================================================================
+
+/// **Rung-6 finding #1 — the reader dirty-tail pin.** A reader that
+/// bootstraps while the writer's journal tail is non-empty replays that
+/// tail as DIRTY RAM records (`apply_replayed` rides the commit path's
+/// `apply_locked`, which lowers `dirty_floor`). On a WRITER that is
+/// correct — its checkpoint task flushes them — but a reader can never
+/// checkpoint: the records are the writer's to persist. Un-absolved, the
+/// S5 drop pass refuses those nodes FOREVER (`meta_kv_revalidate_dirty_skips`
+/// — a must-stay-0 tripwire — climbs on every epoch) and the reader's view
+/// of them freezes at mount-time state: an UNBOUNDED violation of the
+/// published staleness bound.
+///
+/// The contract pinned here: the reader DECLARATION
+/// (`arm_reader_revalidation`) absolves the bootstrap replay's dirty
+/// residue, so the drop pass treats those nodes like any clean node —
+/// `dirty_skips` stays 0, and both the replayed-tail record and post-mount
+/// writes become visible after one epoch step.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reader_bootstrap_into_a_dirty_journal_tail_never_pins_nodes() {
+    use squeezefs::meta_backend::kv::revalidate::{revalidation_stats, RevalidationPoller};
+
+    let vol = fresh_volume().await;
+    let writer = KvMetaBackend::open(vol.path()).await.expect("write mount");
+    Metadata::create(writer.as_ref(), 1, "pre-tail", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .expect("pre-tail create");
+    writer.checkpoint_now().await.expect("settle checkpoint");
+
+    // A committed-but-uncheckpointed transaction: the journal tail the
+    // reader bootstraps into. The writer's ≤1 s cadence can race this
+    // fixture on a loaded box, so the dirty-bootstrap CONTROL below
+    // retries with a fresh tail rather than passing vacuously.
+    let mut reader = None;
+    for attempt in 0..3 {
+        Metadata::create(
+            writer.as_ref(),
+            1,
+            &format!("in-tail-{attempt}"),
+            libc::S_IFREG | 0o644,
+            0,
+            0,
+        )
+        .await
+        .expect("in-tail create");
+        let r = KvMetaBackend::open_read_only(vol.path())
+            .await
+            .expect("read-only mount");
+        if r.node_cache_gauge().1 > 0 {
+            reader = Some((r, attempt));
+            break;
+        }
+        // The writer checkpointed under us — the tail was empty. Re-roll.
+    }
+    let (reader, attempt) = reader.expect(
+        "control: the bootstrap replay never observed a dirty journal tail \
+         across 3 attempts — the fixture lost every race to the writer's \
+         checkpoint cadence (re-run; this is the fixture, not the product)",
+    );
+
+    let before = revalidation_stats();
+    reader
+        .arm_reader_revalidation(None)
+        .expect("the reader declaration");
+    assert_eq!(
+        reader.node_cache_gauge().1,
+        0,
+        "arming reader revalidation must ABSOLVE the bootstrap replay's \
+         dirty residue: a reader has no checkpoint task, so a kept dirty \
+         floor can never be discharged and pins the node forever"
+    );
+
+    // The writer moves on: a post-mount create, then a checkpoint the
+    // reader will observe as an epoch step.
+    Metadata::create(
+        writer.as_ref(),
+        1,
+        "post-mount",
+        libc::S_IFREG | 0o644,
+        0,
+        0,
+    )
+    .await
+    .expect("post-mount create");
+    writer.checkpoint_now().await.expect("checkpoint");
+
+    let poller = RevalidationPoller::new(1);
+    let out = poller
+        .poll_at(&reader, std::time::Instant::now())
+        .await
+        .expect("the poll must succeed")
+        .expect("the poll was due");
+    assert!(out.advanced, "the reader must observe the new checkpoint");
+    assert_eq!(
+        out.skipped_dirty, 0,
+        "the drop pass must not meet reader-replayed dirty nodes \
+         (the rung-6 pinned-node shape)"
+    );
+    let after = revalidation_stats();
+    assert_eq!(
+        after.dirty_skips - before.dirty_skips,
+        0,
+        "meta_kv_revalidate_dirty_skips is a must-stay-0 tripwire on EVERY \
+         posture — it may only ever mean 'revalidation armed on a mount \
+         that writes', never 'a reader bootstrapped into a journal tail'"
+    );
+
+    // Convergence, both faces: the replayed-tail record is still resolvable
+    // (the checkpoint the epoch adopted covers the very window the replay
+    // read) and the post-mount write became visible.
+    Metadata::lookup(reader.as_ref(), 1, &format!("in-tail-{attempt}"))
+        .await
+        .expect("the replayed-tail record must survive the epoch step");
+    Metadata::lookup(reader.as_ref(), 1, "post-mount")
+        .await
+        .expect("a post-mount write must become visible within one epoch step");
+
+    writer.shutdown().await.expect("writer shutdown");
+}
+
+/// **Rung-6 finding #2 — multi-meta-volume live-reader non-convergence**
+/// (the field-relevant one: production sets run 4 meta volumes). On a
+/// 2-volume set a LIVE reader never observed post-mount content: readdir
+/// listed the new dentry while lookup/getattr of the child ENOENT'd
+/// forever (`d?????????` in ls -la), with revalidation epochs advancing
+/// and `dirty_skips == 0`, while a FRESH reader resolved the same records
+/// instantly.
+///
+/// Root cause: `RevalidationPoller`'s cadence mark (`last`) is per-POLLER
+/// state, and the S5 task drove one shared poller through a per-volume
+/// `poll_at` loop at one pass instant — volume 0's `mark` made `due_at`
+/// false for every sibling on the same pass, every pass, forever. Only
+/// meta volume 0 ever revalidated: the parent's dentry tree (volume 0)
+/// advanced while the child's inode record (volume 1) stayed frozen at
+/// the reader's mount-time snapshot — exactly the readdir-sees/
+/// lookup-misses split observed live.
+///
+/// The contract pinned here: ONE pass over the set makes ONE cadence
+/// decision and polls EVERY volume.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_live_reader_set_revalidates_every_meta_volume() {
+    use squeezefs::meta_backend::kv::builder::format_v3_stamped;
+    use squeezefs::meta_backend::kv::revalidate::RevalidationPoller;
+    use squeezefs::meta_backend::{
+        open_routed_meta_set, open_routed_meta_set_read_only, plan_meta_slot_set_with_width,
+    };
+
+    const SET_VOL_LEN: u64 = 128 * 1024 * 1024;
+    let dir = tempfile::tempdir().unwrap();
+    let metas: Vec<std::path::PathBuf> = (0..2)
+        .map(|i| {
+            let p = dir.path().join(format!("meta{i}"));
+            std::fs::File::create(&p)
+                .unwrap()
+                .set_len(SET_VOL_LEN)
+                .unwrap();
+            p
+        })
+        .collect();
+    let plan = plan_meta_slot_set_with_width(metas.len(), 8).expect("slot plan");
+    let set_opts = squeezefs::meta_backend::kv::builder::FormatV3Options {
+        node_size: squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE,
+        journal_len_override: None,
+        force: true,
+        full_wipe: false,
+        format_config_xattr: None,
+    };
+    for (i, m) in metas.iter().enumerate() {
+        format_v3_stamped(m, SET_VOL_LEN, &set_opts, plan.stamps[i].clone())
+            .await
+            .expect("format stamped set member");
+    }
+    let paths: Vec<String> = metas.iter().map(|m| m.display().to_string()).collect();
+
+    let writer = open_routed_meta_set(&paths).await.expect("writer set");
+    // Settle every volume so the reader bootstraps an empty journal tail —
+    // this pin must stay independent of the dirty-tail finding above.
+    for vol in &writer.volumes {
+        vol.checkpoint_now().await.expect("settle checkpoint");
+    }
+
+    // The LIVE reader mounts BEFORE the content exists (the field shape).
+    let reader = open_routed_meta_set_read_only(&paths)
+        .await
+        .expect("reader set");
+    for vol in &reader.volumes {
+        vol.arm_reader_revalidation(None).expect("arm volume");
+    }
+    let armed_epochs: Vec<u64> = reader.volumes.iter().map(|v| v.reader_epoch()).collect();
+
+    // Post-mount content on EVERY volume (the mint rotor round-robins the
+    // healthy set, so a handful of creates covers both), then checkpoint
+    // the whole set.
+    let mut name_on_vol: Vec<Option<(String, u64)>> = vec![None; writer.volumes.len()];
+    for i in 0..32 {
+        let name = format!("f{i}");
+        let ino = writer
+            .create(1, &name, libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .expect("create")
+            .ino;
+        let (v_idx, _) = writer.route_ino(ino);
+        if name_on_vol[v_idx].is_none() {
+            name_on_vol[v_idx] = Some((name, ino));
+        }
+        if name_on_vol.iter().all(|x| x.is_some()) {
+            break;
+        }
+    }
+    let names: Vec<(String, u64)> = name_on_vol
+        .into_iter()
+        .map(|x| x.expect("the mint rotor must reach every volume of the set"))
+        .collect();
+    for vol in &writer.volumes {
+        vol.checkpoint_now().await.expect("checkpoint");
+    }
+
+    // ONE revalidation pass over the SET, exactly as the mount task drives
+    // it: one shared poller, one pass instant.
+    let poller = RevalidationPoller::new(1);
+    let outcomes = poller
+        .poll_set_at(&reader.volumes, std::time::Instant::now())
+        .await;
+    assert_eq!(
+        outcomes.len(),
+        reader.volumes.len(),
+        "one pass must POLL every volume of the set — a pass whose cadence \
+         mark suppresses the siblings leaves their inode planes frozen \
+         FOREVER (rung-6 finding #2)"
+    );
+    for (idx, res) in &outcomes {
+        let out = res.as_ref().expect("per-volume poll must succeed");
+        assert!(
+            out.advanced,
+            "volume {idx} must adopt the writer's new checkpoint in this pass"
+        );
+    }
+    for (i, v) in reader.volumes.iter().enumerate() {
+        assert!(
+            v.reader_epoch() > armed_epochs[i],
+            "volume {i} never advanced past its arm-time epoch — the \
+             readdir-sees/lookup-misses split (only volume 0 revalidating)"
+        );
+    }
+
+    // The observed field faces, both healed within ONE pass: the dentry
+    // resolves AND the child inode record resolves, on every volume.
+    for (name, ino) in &names {
+        let hit = reader
+            .lookup(1, name)
+            .await
+            .unwrap_or_else(|e| panic!("lookup of {name} must resolve on the live reader: {e}"));
+        assert_eq!(hit.ino, *ino, "the dentry names the created ino");
+        reader.getattr(*ino).await.unwrap_or_else(|e| {
+            panic!(
+                "getattr of ino {ino:#x} ({name}) must resolve — ENOENT here \
+                 is the live field shape (d????????? in ls -la): {e}"
+            )
+        });
+    }
+
+    for vol in &writer.volumes {
+        vol.shutdown().await.expect("volume shutdown");
+    }
+}

@@ -56,7 +56,11 @@ pub fn comm_name_with(base: &str, mount_slot: u32) -> String {
     let suffix_nibble = mount_slot & 0xf;
     // suffix = "m" + one hex char: 2 bytes, always ASCII.
     let keep = COMM_MAX - 2;
-    let base = if base.len() > keep { &base[..keep] } else { base };
+    let base = if base.len() > keep {
+        &base[..keep]
+    } else {
+        base
+    };
     format!("{base}m{suffix_nibble:x}")
 }
 

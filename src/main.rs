@@ -2716,14 +2716,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .unwrap_or_else(|_| mountpoint_path.clone())
                             .to_string_lossy()
                             .into_owned();
-                        let slot = squeezefs::writer_scope::client_slot_from_options(
-                            options.as_deref(),
-                        )
-                        .ok()
-                        .flatten()
-                        .unwrap_or_else(|| {
-                            squeezefs::writer_scope::derive_mount_slot(&canonical)
-                        });
+                        let slot =
+                            squeezefs::writer_scope::client_slot_from_options(options.as_deref())
+                                .ok()
+                                .flatten()
+                                .unwrap_or_else(|| {
+                                    squeezefs::writer_scope::derive_mount_slot(&canonical)
+                                });
                         squeezefs_ipc::comm_core::set_comm_tag(slot);
                         let env_secs = |key: &str, default: u64| {
                             std::env::var(key)

@@ -595,7 +595,7 @@ fn default_posture_is_node_scoped_lever_restores_core_pins() {
         .collect();
     let workers: Vec<_> = affs
         .iter()
-        .filter(|(c, _)| c.starts_with("fuse-over-uring"))
+        .filter(|(c, _)| c.starts_with("f3-ur"))
         .collect();
     assert!(!lanes.is_empty(), "no fuse3-tpc lanes visible: {affs:?}");
     assert!(!workers.is_empty(), "no fuse-over-uring threads visible");
@@ -629,8 +629,7 @@ fn default_posture_is_node_scoped_lever_restores_core_pins() {
         );
     }
     assert!(
-        affs.iter()
-            .any(|(c, n)| c.starts_with("fuse-over-uring") && *n == 1),
+        affs.iter().any(|(c, n)| c.starts_with("f3-ur") && *n == 1),
         "core lever: at least the online-qid queue workers must be 1-CPU pinned"
     );
     m.unmount();

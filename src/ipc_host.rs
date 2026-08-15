@@ -2837,7 +2837,9 @@ impl IpcHost {
             let service_host = Arc::clone(self);
             threads.push(
                 std::thread::Builder::new()
-                    .name(squeezefs_ipc::comm_core::comm_name(&format!("sqz-ipc-svc{spawned}")))
+                    .name(squeezefs_ipc::comm_core::comm_name(&format!(
+                        "sqz-ipc-svc{spawned}"
+                    )))
                     .spawn(move || service_host.service_loop(spawned))?,
             );
             spawned += 1;

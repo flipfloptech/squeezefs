@@ -985,7 +985,9 @@ impl DirectDriveEngine {
         }
         let engine = Arc::clone(self);
         match std::thread::Builder::new()
-            .name(squeezefs_ipc::comm_core::comm_name(&format!("sqz-ipc-dd{idx}")))
+            .name(squeezefs_ipc::comm_core::comm_name(&format!(
+                "sqz-ipc-dd{idx}"
+            )))
             .spawn(move || engine.reap_loop(idx))
         {
             Ok(handle) => {

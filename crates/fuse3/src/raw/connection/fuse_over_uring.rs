@@ -2813,14 +2813,18 @@ impl FuseOverUring {
             let commit_rx = commit_rxs.remove(0);
             let err_tx = err_tx.clone();
             let qids = pool.groups[gi].qids.clone();
-            // Thread-name compat: a singleton group keeps today's
-            // per-queue name; multi-member groups carry first-last as a
-            // membership LABEL, not a range (comm truncates at 15 chars
-            // anyway).
+            // Thread names: a singleton group carries its queue id;
+            // multi-member groups carry first-last as a membership
+            // LABEL, not a range. Base shortened from
+            // "fuse-over-uring-…" (PR 3, per-mount comm suffixes): the
+            // old 17+-char spelling kernel-truncated to exactly
+            // "fuse-over-uring" — index-less, and with no room for the
+            // mount suffix inside the 15-char budget. "f3-ur…" keeps
+            // the indices AND the suffix visible for the first time.
             let name = crate::comm_core::comm_name(&if qids.len() == 1 {
-                format!("fuse-over-uring-{}", qids[0])
+                format!("f3-ur{}", qids[0])
             } else {
-                format!("fuse-over-uring-{}-{}", qids[0], qids[qids.len() - 1])
+                format!("f3-ur{}-{}", qids[0], qids[qids.len() - 1])
             });
             let h = std::thread::Builder::new()
                 .name(name)
@@ -2890,7 +2894,9 @@ impl FuseOverUring {
         {
             let watch = pool.clone();
             let h = std::thread::Builder::new()
-                .name(crate::comm_core::comm_name("fuse-over-uring-watch"))
+                // Base shortened from "fuse-over-uring-watch" (PR 3):
+                // see the queue-worker naming above.
+                .name(crate::comm_core::comm_name("f3-ur-watch"))
                 .spawn(move || connection_watch(watch))
                 .map_err(io::Error::other)?;
             pool.workers.lock().unwrap().push(h);

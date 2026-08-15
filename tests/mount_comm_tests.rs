@@ -65,8 +65,8 @@ fn comm_names_fit_the_kernel_budget_for_every_base_in_the_tree() {
         "fuse3-tpc-fallback",
         "fuse3-mount",
         "fuse3-unmount",
-        "fuse-over-uring-0-511",
-        "fuse-over-uring-watch",
+        "f3-ur0-511",
+        "f3-ur-watch",
         "sqfs-supervise-probe",
     ];
     for base in bases {

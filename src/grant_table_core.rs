@@ -282,6 +282,12 @@ impl<L> GrantTableCore<L> {
     /// every grant it held, DROPPING each `L` (the bytes become grantable
     /// during the call, exactly as the shipped scan did). Returns the
     /// removed lease + the retired grant ids, sorted.
+    ///
+    /// Pop ownership is load-bearing and weakening-verified (loom
+    /// `racing_kill_paths_retire_a_client_exactly_once`): substituting a
+    /// check-then-remove across two lock takes lets an operator revoke
+    /// and the TTL sweep BOTH claim the death — two quarantine cohorts
+    /// and two dead epochs for one client.
     pub fn revoke(&self, client: &str) -> Option<Killed> {
         let lease = self.lock_clients().remove(client)?;
         let mut grants = self.lock_grants();

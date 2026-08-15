@@ -207,6 +207,39 @@
 //!     never reads armed; and the fork walk's demote fires at most once
 //!     per cell (dup siblings share one).
 //!
+//! - [`grant_table_core`] (DLM S9, spec §6.9's named obligation;
+//!   KD-MW-10): the custody grant table behind `WriteCustodyOwner` —
+//!   client leases, live grants, the failover grace window, the two
+//!   mint words. Invariants: racing kill paths (operator revoke vs the
+//!   TTL sweep) retire a client's custody EXACTLY once (the `clients`
+//!   removal is the pop-ownership linearization point — one quarantine
+//!   cohort, one dead epoch, never two); a re-join replaces the lease,
+//!   its unpresentable custody dies with it, and a stale-epoch renewal
+//!   can never revive it; lease epochs are minted monotonically and
+//!   never reused. Mutex-serialized table ops (the `conveyor_core`
+//!   class), so the models exercise the protocol invariants across the
+//!   shipped op SEQUENCES (the notify precedent).
+//! - [`token_cache_core`] (DLM S8, spec §6.9's named obligation;
+//!   KD-MW-10): the client token cache's word protocol — invariants:
+//!   per-object generations are MONOTONE under racing/replayed owner
+//!   replies (`fetch_max` merge — weakening to a load-compare-store
+//!   loses the race and regresses a served token); the owner-era floor
+//!   never regresses; and the record ORDER (`record_grant_ordered`:
+//!   floor BEFORE publish) means an entry the second-chance sweep
+//!   retires can never expose a miss whose floor predates the grant's
+//!   own era (flipping the order fails the model; the publish/retire
+//!   edge itself is the `scc` bucket's synchronization — a stated
+//!   precondition, the `ipc_ring_core` lesson).
+//! - [`lease_clock_core`] (DLM S6, spec §6.9's named obligation;
+//!   KD-MW-10): the `T_self = T_owner − 2·skew_max − D_purge` law's
+//!   words — invariants: a §6.8-item-3 ladder that observes a renewal's
+//!   NEW label can never pair it with the OLD anchor (the
+//!   anchor-before-label publication order in `renewed`;
+//!   weakening-verified: flipping the two stores, or weakening the
+//!   label's Release/Acquire pair to Relaxed, admits the skewed pair);
+//!   and the self-fence latch runs its side effects exactly once under
+//!   racing fencers (swap — a load-then-store double-fires).
+//!
 //! `cargo test` here compiles the cores against std atomics and runs
 //! nothing.
 
@@ -234,6 +267,8 @@ pub mod exec_core;
 pub mod fd_table_core;
 #[path = "../../src/gauge_core.rs"]
 pub mod gauge_core;
+#[path = "../../src/grant_table_core.rs"]
+pub mod grant_table_core;
 #[path = "../../src/incarnation_core.rs"]
 pub mod incarnation_core;
 #[path = "../../crates/squeezefs-ipc/src/cqe_core.rs"]
@@ -246,6 +281,8 @@ pub mod ipc_slot_core;
 pub mod journal_core;
 #[path = "../../src/lane_core.rs"]
 pub mod lane_core;
+#[path = "../../src/lease_clock_core.rs"]
+pub mod lease_clock_core;
 #[path = "../../crates/fuse3/src/raw/connection/lease_core.rs"]
 pub mod lease_core;
 #[path = "../../src/meta_backend/kv/node_state_core.rs"]
@@ -264,6 +301,8 @@ pub mod slot_cursor_core;
 pub mod slot_gate_core;
 #[path = "../../src/sqz_sync_core.rs"]
 pub mod sqz_sync_core;
+#[path = "../../src/token_cache_core.rs"]
+pub mod token_cache_core;
 #[path = "../../crates/fuse3/src/raw/connection/wake_core.rs"]
 pub mod wake_core;
 #[path = "../../src/write_pipeline_core.rs"]
@@ -5126,6 +5165,389 @@ mod sqz_exec_models {
             // the terminal state absorbs and no enqueue is owed.
             assert!(!enq, "a wake racing completion must never enqueue");
             assert_eq!(st.load(), exec_core::COMPLETE);
+        });
+    }
+}
+
+#[cfg(all(test, loom))]
+mod lease_clock_models {
+    //! [`lease_clock_core`] (DLM S6, spec §6.9's `lease_clock_core`
+    //! obligation, KD-MW-10): the member lease words behind
+    //! `membership::MemberSession`.
+    //!
+    //! Model precondition (stated because the model cannot see its
+    //! violation — the `ipc_ring_core` lesson): ONE renewer per session —
+    //! structural in the shipped code (the renewal cadence task is the
+    //! only caller of `renewed`); the readers here are the §6.8-item-3
+    //! acknowledgement ladder and the fence paths, which are the real
+    //! concurrent population.
+    use crate::lease_clock_core::MemberLeaseWords;
+    use loom::sync::Arc;
+    use loom::thread;
+
+    const OLD_LABEL: u64 = 100;
+    const OLD_ANCHOR: u64 = 10;
+    const NEW_LABEL: u64 = 200;
+    const NEW_ANCHOR: u64 = 50;
+
+    /// The §6.8-item-3 pairing law: a ladder that observes a renewal's
+    /// NEW label must read the NEW anchor beside it — the old (earlier)
+    /// anchor would make the qualification wait measure from an instant
+    /// before the label was learned, qualifying too soon.
+    ///
+    /// **The ladder reader runs on a SPAWNED thread — load-bearing for
+    /// exploration, not just style** (found 2026-08-15 while verifying
+    /// the weakenings below): with the reader on loom's MAIN thread,
+    /// loom 0.7 never exhibits the outcome "reader observes a guarded
+    /// writer's LATER same-location store while missing its sibling" —
+    /// the shipped `renewed` guard (`label > learned_label.load`) is
+    /// exactly such a same-location prior load, and the flip weakening
+    /// stayed GREEN main-thread while the identical shape with a
+    /// spawned reader goes red (probe pair: bare two-store writer red
+    /// either way; guard-load writer red only with a spawned reader).
+    /// Any future model of a guarded publication must spawn its reader.
+    ///
+    /// Weakening evidence (verified 2026-08-15 against the spawned
+    /// reader, then restored): (a) permuting `renewed`'s two stores
+    /// (label before anchor) admits `(NEW_LABEL, OLD_ANCHOR)` and fails
+    /// this assert; (b) weakening the label's Release store / Acquire
+    /// load pair to `Relaxed` admits the same skewed pair (the anchor's
+    /// own Release cannot order a load that never synchronizes with it).
+    #[test]
+    fn renewal_label_never_pairs_with_the_old_anchor() {
+        loom::model(|| {
+            let words = Arc::new(MemberLeaseWords::adopt(
+                1, 43_000, 10_000, 25, 2_000, OLD_LABEL, OLD_ANCHOR,
+            ));
+
+            let renewer = {
+                let words = Arc::clone(&words);
+                thread::spawn(move || {
+                    words.renewed(2, 43_000, 10_000, 25, 2_000, NEW_LABEL, NEW_ANCHOR);
+                })
+            };
+            // The acknowledgement ladder's read: label first (Acquire).
+            let ladder = {
+                let words = Arc::clone(&words);
+                thread::spawn(move || {
+                    let (label, anchor) = words.learned_label();
+                    match label {
+                        // The OLD label MAY pair with the NEW anchor
+                        // (the anchor publishes first, by design): the
+                        // ladder then measures an old label from a
+                        // LATER instant — it waits longer, the
+                        // conservative direction.
+                        OLD_LABEL => assert!(
+                            anchor == OLD_ANCHOR || anchor == NEW_ANCHOR,
+                            "an anchor that was never published: {anchor}"
+                        ),
+                        NEW_LABEL => assert_eq!(
+                            anchor, NEW_ANCHOR,
+                            "skewed pair: the new label was observed with the OLD \
+                             anchor — the ladder would qualify too soon"
+                        ),
+                        other => panic!("a label that was never published: {other}"),
+                    }
+                })
+            };
+
+            renewer.join().unwrap();
+            ladder.join().unwrap();
+            let (label, anchor) = words.learned_label();
+            assert_eq!((label, anchor), (NEW_LABEL, NEW_ANCHOR));
+            assert_eq!(words.epoch(), 2);
+        });
+    }
+
+    /// The fence latch is exactly-once: racing fencers (the renewal
+    /// failure path and the deadline watchdog) run the side-effect arm
+    /// (metrics, custody poison) exactly once.
+    ///
+    /// Weakening evidence (verified 2026-08-15, then restored): replacing
+    /// `fence`'s swap with a load-then-store lets both racers read
+    /// `false` and BOTH claim first — the custody poison would double.
+    #[test]
+    fn self_fence_side_effects_run_exactly_once() {
+        loom::model(|| {
+            let words = Arc::new(MemberLeaseWords::adopt(
+                1, 43_000, 10_000, 25, 2_000, OLD_LABEL, OLD_ANCHOR,
+            ));
+
+            let a = {
+                let words = Arc::clone(&words);
+                thread::spawn(move || words.fence())
+            };
+            let b = {
+                let words = Arc::clone(&words);
+                thread::spawn(move || words.fence())
+            };
+            let (fa, fb) = (a.join().unwrap(), b.join().unwrap());
+            assert!(
+                fa ^ fb,
+                "racing fencers must yield exactly one FIRST: {fa}/{fb}"
+            );
+            assert!(words.fenced());
+            assert!(
+                !words.self_fence_due(u64::MAX),
+                "a fenced session is never due again"
+            );
+        });
+    }
+}
+
+#[cfg(all(test, loom))]
+mod token_cache_models {
+    //! [`token_cache_core`] (DLM S8, spec §6.9's `token_cache_core`
+    //! obligation, KD-MW-10): the client token cache's word protocol.
+    //!
+    //! Model precondition (stated, the `ipc_ring_core` lesson): entry
+    //! FINDABILITY (insert / retain / remove) is the `scc::HashMap`
+    //! bucket's own synchronization in `meta_ship/tokens.rs`; the
+    //! presence cell below stands in for it with the Release/Acquire
+    //! edge scc provides. The words each entry carries — and the
+    //! floor-before-publish record order — are the shipped core under
+    //! test.
+    use crate::token_cache_core::{record_grant_ordered, EraFloor, TokenSlot};
+    use loom::sync::atomic::{AtomicU64, Ordering};
+    use loom::sync::Arc;
+    use loom::thread;
+
+    /// Per-object monotonicity: racing/replayed owner replies converge
+    /// to the max and a served generation never regresses.
+    ///
+    /// Weakening evidence (verified 2026-08-15, then restored): replacing
+    /// `merge`'s `fetch_max` with a load-compare-store (the classic lost
+    /// update) lets the lower racer overwrite the higher one — the final
+    /// serve reads 5 after 7 was granted, the exact backward move every
+    /// consumer comparison (`<`, `==`, `.max()`) is unsound against.
+    #[test]
+    fn racing_grants_converge_to_the_max_and_never_regress() {
+        loom::model(|| {
+            let slot = Arc::new(TokenSlot::granted(1, 1));
+
+            let low = {
+                let slot = Arc::clone(&slot);
+                thread::spawn(move || slot.merge(5, 2))
+            };
+            let high = {
+                let slot = Arc::clone(&slot);
+                thread::spawn(move || slot.merge(7, 3))
+            };
+
+            // A concurrent reader (the fencing-read site): two serves
+            // never move backwards, and only published generations are
+            // ever visible.
+            let first = slot.serve();
+            let second = slot.serve();
+            assert!(
+                second >= first,
+                "a served generation regressed: {first} then {second}"
+            );
+            for t in [first, second] {
+                assert!(
+                    t == 1 || t == 5 || t == 7,
+                    "a generation that was never granted: {t}"
+                );
+            }
+
+            low.join().unwrap();
+            high.join().unwrap();
+            assert_eq!(slot.serve(), 7, "the merge must converge to the max");
+        });
+    }
+
+    /// The era floor is monotone under racing records (a reordered reply
+    /// never lowers the era a miss floors on).
+    ///
+    /// Weakening evidence (verified 2026-08-15, then restored): the same
+    /// load-compare-store substitution in `EraFloor::record` regresses
+    /// the floor under the race.
+    #[test]
+    fn era_floor_is_monotone_under_racing_records() {
+        loom::model(|| {
+            let floor = Arc::new(EraFloor::new());
+
+            let lo = {
+                let floor = Arc::clone(&floor);
+                thread::spawn(move || floor.record(3))
+            };
+            let hi = {
+                let floor = Arc::clone(&floor);
+                thread::spawn(move || floor.record(5))
+            };
+
+            let r1 = floor.get();
+            let r2 = floor.get();
+            assert!(r2 >= r1, "the floor regressed: {r1} then {r2}");
+
+            lo.join().unwrap();
+            hi.join().unwrap();
+            assert_eq!(floor.get(), 5, "the floor must converge to the max era");
+        });
+    }
+
+    /// The record ORDER (`record_grant_ordered`): the floor is recorded
+    /// BEFORE the grant becomes findable, so a sweep that retires the
+    /// entry can never expose a miss whose floor predates the grant's
+    /// own era (§6.11's inversion — too low adopts a superseded record).
+    ///
+    /// The presence cell is the scc-bucket stand-in (stated
+    /// precondition): store(Release) = `insert_sync`'s publication,
+    /// swap(AcqRel) = the sweep's retire observing the entry.
+    ///
+    /// Weakening evidence (verified 2026-08-15, then restored): flipping
+    /// `record_grant_ordered` to publish-then-record lets the sweeper
+    /// retire the entry and read a floor of 0 — a miss served in a
+    /// pre-grant era. The sweeper runs on a SPAWNED thread (the
+    /// main-thread-reader exploration hole recorded on
+    /// `renewal_label_never_pairs_with_the_old_anchor`).
+    #[test]
+    fn a_retired_grant_never_lowers_the_miss_floor() {
+        loom::model(|| {
+            let floor = Arc::new(EraFloor::new());
+            let present = Arc::new(AtomicU64::new(0));
+
+            let granter = {
+                let floor = Arc::clone(&floor);
+                let present = Arc::clone(&present);
+                thread::spawn(move || {
+                    // The shipped `record_grant` shape: floor first, then
+                    // the entry becomes findable.
+                    record_grant_ordered(&floor, 5, || present.store(1, Ordering::Release));
+                })
+            };
+
+            // The sweeper-then-miss path: retiring the entry means the
+            // publication was OBSERVED, so the floor recorded before it
+            // must be visible to the miss that follows.
+            let sweeper = {
+                let floor = Arc::clone(&floor);
+                let present = Arc::clone(&present);
+                thread::spawn(move || {
+                    if present.swap(0, Ordering::AcqRel) == 1 {
+                        assert!(
+                            floor.get() >= 5,
+                            "a miss after retiring the era-5 grant floored at {} — \
+                             pre-era stamps would classify LIVE",
+                            floor.get()
+                        );
+                    }
+                })
+            };
+
+            granter.join().unwrap();
+            sweeper.join().unwrap();
+        });
+    }
+}
+
+#[cfg(all(test, loom))]
+mod grant_table_models {
+    //! [`grant_table_core`] (DLM S9, spec §6.9's `grant_table_core`
+    //! obligation, KD-MW-10): the custody grant table behind
+    //! `WriteCustodyOwner` — mutex-serialized table ops (the
+    //! `conveyor_core` class), so the models exercise the protocol
+    //! invariants across the shipped op SEQUENCES (the notify
+    //! precedent): kill exactly-once by pop ownership, re-join
+    //! replacement, epoch mint monotonicity, and the `grant()` verb's
+    //! check-then-await-then-commit window.
+    //!
+    //! `L = u64` stands in for the authority's own `LockLease` (the
+    //! model checks table custody, not the arbiter — dropping the lease
+    //! is `LocalLockManager`'s law, exercised by the owning cargo
+    //! suites).
+    use crate::grant_table_core::GrantTableCore;
+    use loom::sync::Arc;
+    use loom::thread;
+
+    const CLIENT: &str = "node-a";
+    const TTL_MS: u64 = 45_000;
+
+    /// Racing kill paths — an operator revoke against the TTL sweep's
+    /// kill (both are `revoke` by pop ownership) — retire a client's
+    /// custody EXACTLY once: one lease, one grant-id cohort, never two
+    /// quarantines for one death.
+    #[test]
+    fn racing_kill_paths_retire_a_client_exactly_once() {
+        loom::model(|| {
+            let table: Arc<GrantTableCore<u64>> = Arc::new(GrantTableCore::new());
+            let epoch = table.join(CLIENT, 0x77, None, 0, TTL_MS, |_| {
+                panic!("a fresh join kills nobody")
+            });
+            let g1 = table.commit_grant(CLIENT, epoch, 9, None, 0xA);
+            let g2 = table.commit_grant(CLIENT, epoch, 10, Some((0, 4096)), 0xB);
+
+            let a = {
+                let table = Arc::clone(&table);
+                thread::spawn(move || table.revoke(CLIENT))
+            };
+            let b = {
+                let table = Arc::clone(&table);
+                thread::spawn(move || table.revoke(CLIENT))
+            };
+            let (ka, kb) = (a.join().unwrap(), b.join().unwrap());
+            assert!(
+                ka.is_some() ^ kb.is_some(),
+                "one death must produce exactly one Killed cohort"
+            );
+            let killed = ka.or(kb).expect("one killer won");
+            assert_eq!(killed.lease.epoch, epoch);
+            assert_eq!(
+                killed.grant_ids,
+                vec![g1, g2],
+                "the whole custody retires with the lease, sorted"
+            );
+            assert_eq!(table.grants_len(), 0, "the bytes are grantable again");
+            assert_eq!(table.clients_len(), 0);
+            assert!(!table.epoch_live(epoch), "a dead epoch never validates");
+        });
+    }
+
+    /// A re-join replaces the lease: the prior epoch's custody dies with
+    /// it (killed BEFORE the new lease is visible — the shipped order),
+    /// epochs mint monotonically, and a stale-epoch renewal can never
+    /// revive the dead lease.
+    #[test]
+    fn a_rejoin_replaces_the_lease_and_a_stale_renew_never_revives_it() {
+        loom::model(|| {
+            let table: Arc<GrantTableCore<u64>> = Arc::new(GrantTableCore::new());
+            let e1 = table.join(CLIENT, 0x77, None, 0, TTL_MS, |_| {
+                panic!("a fresh join kills nobody")
+            });
+            let g1 = table.commit_grant(CLIENT, e1, 9, None, 0xA);
+
+            let rejoin = {
+                let table = Arc::clone(&table);
+                thread::spawn(move || {
+                    let mut killed_epoch = None;
+                    let e2 = table.join(CLIENT, 0x78, None, 100, TTL_MS, |killed| {
+                        killed_epoch = Some(killed.lease.epoch);
+                        assert_eq!(killed.grant_ids, vec![g1]);
+                    });
+                    (e2, killed_epoch)
+                })
+            };
+            let renewer = {
+                let table = Arc::clone(&table);
+                thread::spawn(move || table.renew(CLIENT, e1, 50, TTL_MS, &[42]))
+            };
+
+            let (e2, killed_epoch) = rejoin.join().unwrap();
+            let _renew_outcome = renewer.join().unwrap();
+
+            assert!(e2 > e1, "epochs mint monotonically, never reused");
+            assert_eq!(
+                killed_epoch,
+                Some(e1),
+                "the prior lease dies with the re-join"
+            );
+            assert!(!table.lease_current(CLIENT, e1));
+            assert!(table.lease_current(CLIENT, e2));
+            assert!(
+                table.renew(CLIENT, e1, 200, TTL_MS, &[]).is_none(),
+                "a stale-epoch renewal after the replacement must refuse"
+            );
+            assert_eq!(table.grants_len(), 0, "e1's custody did not survive");
         });
     }
 }

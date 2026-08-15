@@ -2120,7 +2120,28 @@ impl NodeCache {
         // which is the same "content may be a hair newer than the epoch"
         // posture every in-cycle load already has (staleness is a bound,
         // not a snapshot).
-        self.for_each_node(|n| n.stamp_epoch(epoch.ledger_seq));
+        //
+        // AND absolve the bootstrap replay's dirty residue (rung-6 fleet
+        // finding #1, 2026-08-15): a mount that opened into a non-empty
+        // writer journal tail replayed it as DIRTY records — correct on a
+        // writer, whose checkpoint task discharges the floors, but those
+        // records are the WRITER's to persist and a reader has no
+        // checkpoint task. A floor kept here can never be discharged, so
+        // the drop pass would refuse the node on EVERY epoch step
+        // (`dirty_skips` climbing, the view pinned at mount-time state —
+        // an unbounded violation of the published staleness bound).
+        // Absolution is sound: the records keep serving from RAM until the
+        // next epoch step, and any epoch this reader adopts is a writer
+        // checkpoint whose flush pass covered the very journal window the
+        // replay read — or, in the deferred-flush corner (a clamped tail),
+        // the dropped node re-pages to exactly the checkpoint state the S5
+        // contract promises, never below it. From here on a dirty node in
+        // the drop pass again means exactly what the tripwire says:
+        // revalidation armed on a mount that WRITES.
+        self.for_each_node(|n| {
+            n.stamp_epoch(epoch.ledger_seq);
+            let _ = n.take_dirty_floor();
+        });
         if let Some(sink) = purge {
             let _ = self.purge_sink.set(sink);
         }

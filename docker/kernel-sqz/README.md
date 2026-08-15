@@ -15,14 +15,26 @@ found closed on the field kernel:
 Result: **`6.19.14-sqz`** EL8 kernel RPMs (Rocky 8.10 installable),
 built in a pinned Rocky 8 + gcc-toolset-14 + pahole v1.30 container.
 
-**v2 (2026-08-04 + 2026-08-09):** the series is 29 patches. 2026-08-04
-authored `FUSE_TIME_LIMITS` (now **0028**). 2026-08-09 inserted **0025**
-(abort-race: imu-held folio refs on zc registrations) after Koong 0024
-and appended **0029** (zc payload retention — Approach B ACK-early
-accelerator). Old 0025–0027 became 0026–0028. Selective zc delivery
-(0030) is not in the series — §4.3 gate rides the boot-test 4 KiB
-armed-vs-disarmed row. Spec `docs/design-zc-write-kernel-v2.md`,
-evidence `.benchmarks/2026-08-09-kernel-zc-write-v2.md`.
+**v2 (2026-08-04 + 2026-08-09):** the zc-write wave took the series to
+29 patches. 2026-08-04 authored `FUSE_TIME_LIMITS` (now **0028**).
+2026-08-09 inserted **0025** (abort-race: imu-held folio refs on zc
+registrations) after Koong 0024 and appended **0029** (zc payload
+retention — Approach B ACK-early accelerator). Old 0025–0027 became
+0026–0028. Selective zc delivery was refused FINAL on measurement —
+§4.3 gate rode the boot-test 4 KiB armed-vs-disarmed row (its retired
+"0030" shorthand slot is reused by the unrelated nvme patch below).
+Spec `docs/design-zc-write-kernel-v2.md`, evidence
+`.benchmarks/2026-08-09-kernel-zc-write-v2.md`.
+
+**Rung 5b (2026-08-15):** the series is **30 patches** — **0030** adds
+opt-in **host-scoped fabric subsystems**
+(`nvme_core.fabrics_host_scoped_subsystems=Y`: fabric subsystems group
+by `(subsysnqn, hostnqn)` so co-located per-mount identities never
+merge under one multipath head — the multi-writer rung-6 STOP finding's
+fix; default off = byte-identical). Authored on the **7.1 track first**
+(the authoring-order ruling), backported offsets-only to 6.19.14.
+Design `docs/design-mw-multipath-kernel.md`; boot validation is rung
+6b's qemu guest.
 
 **Strata ruling (USER DECISION 2026-08-02): the kmod-sqzfuse stratum
 is KILLED.** There are exactly **two strata**: (1) **stock-graceful**
@@ -38,11 +50,11 @@ maintained; do not resurrect it.
 |---|---|
 | `Dockerfile` | pinned EL8 build image (gcc-toolset-14, from-source pahole v1.30 for BTF) |
 | `build.sh` | host wrapper: image build + capped (`--cpus 16`, `nice`) kernel build; artifacts → `dist/kernel-sqz/` |
-| `build-kernel.sh` | in-container: sha256-pinned tarball → 29 patches → config assembly → checklist assertion (fail loud) → `make binrpm-pkg` |
+| `build-kernel.sh` | in-container: sha256-pinned tarball → 30 patches → config assembly → checklist assertion (fail loud) → `make binrpm-pkg` |
 | `SERIES.md` | the series manifest: message-ids, base ruling, conflict resolutions, 0025/0029 |
 | `V2-CANDIDATES.md` | the v2 scoping manifest (ranked candidates; rank 1 = TIME_LIMITS, now patch 0028) |
-| `patches/` | `git format-patch` export (0001–0024 Koong + 0025 abort-race + 0026 docs + 0027 seam + 0028 TIME_LIMITS + 0029 retention) |
-| `patches-7.1/` | the **linux-7.1.6 rebase** of the same 29 patches (the D13 latest-mainline track — see *The 7.1 track* below) |
+| `patches/` | `git format-patch` export (0001–0024 Koong + 0025 abort-race + 0026 docs + 0027 seam + 0028 TIME_LIMITS + 0029 retention + 0030 nvme host-scoped subsystems — rung 5b) |
+| `patches-7.1/` | the **linux-7.1.6 rebase** of the same 30 patches (the D13 latest-mainline track — 0030 was AUTHORED here first; see *The 7.1 track* below) |
 | `config-base-7.1.2-1.el8.elrepo.x86_64` | the field client's running config (the base; copied read-only 2026-08-01) |
 | `config-fragment` | the ENABLE CHECKLIST — every entry asserted in the final `.config` |
 | `probes/` | capability probes (see below) |

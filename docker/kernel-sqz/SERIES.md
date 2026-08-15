@@ -2,7 +2,7 @@
 
 The sqz kernel = **linux-6.19.14** (kernel.org stable, sha256
 `cde8bf6739be4a0777fedbbba5330b8188c55680c45a922a4dfa289cbec6f185`)
-+ the 29 patches in `patches/` + the client base config + `config-fragment`,
++ the 30 patches in `patches/` + the client base config + `config-fragment`,
 built `LOCALVERSION=-sqz` → `uname -r` = `6.19.14-sqz`.
 
 **v2 delta (2026-08-04 + 2026-08-09):** the 2026-08-04 scoping campaign

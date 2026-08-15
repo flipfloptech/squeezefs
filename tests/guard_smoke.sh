@@ -9,6 +9,12 @@
 # the scoping rig's guard-smoke (removed from the tree — history:
 # `.agents/spdk-scoping/guard-smoke.sh` at c615e3a).
 #
+# Family sibling: tests/mw_two_registrants_leg.sh — the rung-2 per-mount
+# host-identity leg (design-full-multi-writer KD-MW-3/§5.2): two PR
+# registrants from ONE box via the product connect path
+# (`nvmeof connect --hostnqn/--hostid`) on nvmet-tcp (resv_enable=1),
+# preempt one, assert the DEVICE rejects the preempted holder.
+#
 # Usage
 #   sudo tests/guard_smoke.sh [--stack spdk|nvmet] [--loops N] [--ptpl]
 #

@@ -10,9 +10,10 @@
 //!   before the call are released; later `notified()` calls park).
 //! * `notified().await` — parks under the [`crate::sqz_channel::ticked`]
 //!   backstop: a lost wake costs one TICK, never a wedge (the sqz-sync
-//!   law). The waiter keeps ONE registration across ticks and re-checks
-//!   the permit + epoch on every poll under the same lock every
-//!   notifier mutates under — no lost-wake window by construction.
+//!   law). The waiter registers **at creation** (see [`Notify::notified`]
+//!   — the todo-24 wedge law), keeps ONE registration across ticks and
+//!   re-checks the permit + epoch on every poll under the same lock
+//!   every notifier mutates under — no lost-wake window by construction.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -102,13 +103,20 @@ impl Notify {
         }
     }
 
-    pub async fn notified(&self) {
-        let fut = Notified {
-            notify: self,
-            id: None,
-            registered_epoch: 0,
-        };
-        ticked(fut).await
+    /// Park until notified. **Registers AT CREATION** (todo-24, the
+    /// meta-slot-migration wedge): the future this returns is already
+    /// enabled, so a `notify_one`/`notify_waiters` landing between the
+    /// call and the first poll is never lost — which is what makes the
+    /// create-recheck-await idiom (`wait_completed_upto`, the admission
+    /// loop, the hold seams) sound. The retired `async fn` shape was
+    /// inert until first poll: a `notify_waiters` in that window bumped
+    /// the epoch BEFORE registration and the waiter parked forever —
+    /// unhealable by the tick, which re-polls only the inner
+    /// epoch-gated future, never the caller's outer condition.
+    pub fn notified(&self) -> impl Future<Output = ()> + '_ {
+        let mut fut = self.notified_raw();
+        fut.enable();
+        ticked(fut)
     }
 
     /// The tokio `Notified` + `enable()` shape: a HANDLE future you can

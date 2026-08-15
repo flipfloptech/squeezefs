@@ -732,6 +732,13 @@ impl JournalRing {
             if self.completed_upto() >= pos {
                 return;
             }
+            // Registration happens AT `notified()` creation (the todo-24
+            // wedge law — sqz_notify): the re-check below therefore
+            // covers every completion before the registration, and the
+            // registration covers every one after it. With the retired
+            // lazy-registration `notified()` a complete() landing
+            // between the re-check and the first poll was LOST — the
+            // conveyor pass parked here forever, wedging its committer.
             let notified = self.completion_notify.notified();
             if self.completed_upto() >= pos {
                 return;

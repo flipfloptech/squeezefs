@@ -141,6 +141,46 @@ applied clean.
    composes with 7.1's list_del+kfree AVAILABLE path. 6.19: `io_uring_sqe_cmd`;
    cancel moves RETAINED onto `ent_in_userspace` like AVAILABLE.
 
+9. **patch 30 (NEW 2026-08-15; sqz-authored — nvme host-scoped fabric
+   subsystems, opt-in)** — the multi-writer program's rung-5b fix
+   (design note `docs/design-mw-multipath-kernel.md`; the rung-6 STOP
+   finding, design-full-multi-writer §5.2): on `nvme_core.multipath=Y`
+   kernels `__nvme_find_get_subsystem()` matches subsysnqn ALONE, so
+   two co-located per-mount host identities merge under ONE multipath
+   head whose round-robin voids per-mount PR fencing. New opt-in
+   module param **`nvme_core.fabrics_host_scoped_subsystems`** (bool,
+   default off, perm 0444 — boot-scoped so the subsystem match can
+   never go asymmetric): fabric controllers group subsystems by
+   `(subsysnqn, hostnqn)`; `struct nvme_subsystem` gains
+   `host_scope[NVMF_NQN_SIZE]` (empty = unscoped — param off and PCIe
+   are byte-identical to upstream); `nvme_global_check_duplicate_ids()`
+   skips host-scoped SIBLINGS of one subsysnqn (they present the same
+   target namespaces on purpose — without the skip the fabric arm
+   refuses the second identity's namespace as a duplicate ID); new
+   read-only `sqz_host_scope` subsystem sysfs attr (guest-validation /
+   daemon observability). Connect-time dedup needs no change
+   (`nvmf_ctlr_matches_baseopts` already compares the host pair);
+   target-side PR state is per-namespace keyed by hostid, so host-side
+   splitting cannot fork fencing truth. Files:
+   `drivers/nvme/host/{core.c,nvme.h,sysfs.c}` — the series' first
+   `drivers/nvme/` patch, zero hunk overlap with 0001–0029.
+   **AUTHORING ORDER REVERSED (user ruling 2026-08-15)**: authored and
+   compile-verified on the **7.1.6 track FIRST** (the locally-running
+   kernel — `make LLVM=1 drivers/nvme/host/` with the running
+   `7.1.6-1-cachyos-sqz` config on the fully-patched pristine tree,
+   zero new warnings; full 30-patch series re-verified `patch -p1
+   --fuzz=0` clean on a fresh extraction), then backported to 6.19.14.
+   Backport adaptations are **offsets-only** (the touched regions are
+   code-identical across the trees; 6.19's extra
+   `subsys->awupf = …` line and `kzalloc` vs `kzalloc_obj` idiom sit
+   outside every hunk — the adaptation table lives in the design
+   note §4). NOT boot-verified — rung 6b's qemu guest owns
+   boot/behavior validation (no host reboot on the critical path).
+   Number-reuse note: "0030" was earlier planning shorthand for
+   selective zc delivery, whose refusal is FINAL on measurement
+   (2026-08-09) — that slot was never built, and this unrelated nvme
+   patch takes the number.
+
 `patches/` is the `git format-patch` export of the resolved transplant;
 `build-kernel.sh` applies it with `patch -p1 --fuzz=0` (any regression
 in the transplant fails loud at apply time).

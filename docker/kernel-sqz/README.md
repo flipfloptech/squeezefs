@@ -94,12 +94,15 @@ reboot
 
 ## The 7.1 track (`patches-7.1/`) — D13 latest-mainline rebase
 
-**Base: linux-7.1.6** (kernel.org; the CachyOS 7.1.6-1 line). The same 29
+**Base: linux-7.1.6** (kernel.org; the CachyOS 7.1.6-1 line). The same 30
 patches, semantically rebased 2026-08-06 onto 7.1.6 (0025/0029 landed
-2026-08-09) for local zc-capable boots via the CachyOS kernel manager.
+2026-08-09; **0030 nvme host-scoped fabric subsystems was AUTHORED on
+this track first** — rung-5b authoring-order ruling 2026-08-15 — then
+backported to 6.19.14) for local zc-capable boots via the CachyOS
+kernel manager.
 **6.19.14 stays the FIELD series** (the EL8 fleet RPMs, `patches/`); 7.1
 is the D13 latest-mainline track. Concatenated manager-ready form:
-`~/sqz-kmbuf-zc-7.1.6-v2.patch` = `cat patches-7.1/00*.patch` — applies
+`~/sqz-kmbuf-zc-7.1.6-v3.patch` = `cat patches-7.1/00*.patch` (v2 = the 29-patch predecessor) — applies
 sequentially `patch -p1 --fuzz=0` clean (verified on a fresh pristine
 7.1.6 extraction). Compile-proof: `make io_uring/ fs/fuse/` with the
 running CachyOS 7.1.6 config, zero new warnings (0025 and 0029). The
@@ -159,6 +162,7 @@ patch carries its `[sqz 7.1.6 rebase]` note in the commit body.
 | 0025 abort-race | identical besides context offsets; `io_buffer_register_bvec` + `fuse_uring_set_up_zero_copy` shape is shared |
 | 0027 seam (was 26) | ported as-is — **still required**: 7.1's `io_buffer_add_list()` is the int-returning stable form, and patch 03's register path inherits the unchecked call |
 | 0029 retention | `io_uring_sqe128_cmd`; cancel composes FRRS_RETAINED with 7.1's list_del+kfree AVAILABLE path; 6.19 cancel moves RETAINED to `ent_in_userspace` |
+| 0030 nvme host-scoped fabric subsystems | **authoring order reversed** (rung-5b ruling 2026-08-15): authored + compile-verified ON 7.1.6 first, then backported — the 6.19 adaptations are offsets-only (`subsys->awupf` / `kzalloc` idiom sit outside every hunk); first `drivers/nvme/` patch in the series |
 
 ### CachyOS kernel manager notes
 

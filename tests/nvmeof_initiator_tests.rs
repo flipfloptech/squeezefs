@@ -29,7 +29,7 @@ use std::path::Path;
 use squeezefs::nvmeof::fabric::subsysnqn_of_namespace;
 use squeezefs::nvmeof::initiator::{
     connect_target, connected_fabric_disks_at, disconnect_controllers_at, fabrics_connect_string,
-    find_device_for_nqn_at, nvme_cli_connect_args, ConnectOptions,
+    find_device_for_nqn_at, multipath_merged_shape_at, nvme_cli_connect_args, ConnectOptions,
 };
 
 const NQN_A: &str = "nqn.2026-07.io.squeezefs:share-aaaa";
@@ -101,6 +101,54 @@ fn test_multipath_layout_returns_head_node_never_controller_path_node() {
         dev.as_deref(),
         Some("/dev/nvme0n1"),
         "multipath resolution must return the subsystem head node, never nvme0c0n1"
+    );
+}
+
+#[test]
+fn test_multipath_merged_shape_rides_the_same_injection_seam() {
+    // rung 5b (the rung-6 STOP finding): a head served by controllers
+    // carrying two distinct hostnqns is the MULTIPATH-MERGED shape; one
+    // hostnqn (same-identity multipath) is not. Exercised here through
+    // this suite's fixture conventions so the detection walk stays
+    // pinned beside the resolution walks it composes with.
+    let t = tempfile::tempdir().unwrap();
+    let (subsys, nvme) = roots(&t);
+    let host_a = ("hostnqn", "nqn.2014-08.org.nvmexpress:uuid:aa-1");
+    let host_b = ("hostnqn", "nqn.2014-08.org.nvmexpress:uuid:bb-2");
+    let hostid_a = ("hostid", "aaaaaaaa-0000-0000-0000-000000000001");
+    let hostid_b = ("hostid", "bbbbbbbb-0000-0000-0000-000000000002");
+    mk_entry(
+        &nvme,
+        "nvme0",
+        &[("subsysnqn", NQN_A), host_a, hostid_a],
+        &["nvme0c0n1"],
+    );
+    mk_entry(
+        &nvme,
+        "nvme1",
+        &[("subsysnqn", NQN_A), host_b, hostid_b],
+        &["nvme1c1n1"],
+    );
+    mk_entry(
+        &subsys,
+        "nvme-subsys0",
+        &[("subsysnqn", NQN_A)],
+        &["nvme0n1"],
+    );
+
+    let merged = multipath_merged_shape_at(&subsys, &nvme, "/dev/nvme0n1")
+        .expect("walk must not error")
+        .expect("two distinct hostnqns serving one head = merged");
+    assert_eq!(merged.subsysnqn, NQN_A);
+    assert_eq!(merged.hostnqns.len(), 2, "{:?}", merged.hostnqns);
+
+    // Same-identity second path: not merged.
+    std::fs::write(nvme.join("nvme1").join("hostnqn"), format!("{}\n", host_a.1)).unwrap();
+    std::fs::write(nvme.join("nvme1").join("hostid"), format!("{}\n", hostid_a.1)).unwrap();
+    assert_eq!(
+        multipath_merged_shape_at(&subsys, &nvme, "/dev/nvme0n1").expect("walk must not error"),
+        None,
+        "same-identity multipath is the healthy shape"
     );
 }
 

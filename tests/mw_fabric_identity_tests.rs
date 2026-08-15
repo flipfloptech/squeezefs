@@ -48,8 +48,8 @@ use squeezefs::meta_backend::reservation::{
 };
 use squeezefs::nvmeof::initiator::{
     controller_identities_for_device_at, explicit_host_identity_from, fabric_ladder_verdict,
-    find_device_for_nqn_under_identity_at, nvme_cli_connect_args, ConnectOptions, FabricPlane,
-    LadderOutcome, VolumeShape,
+    find_device_for_nqn_under_identity_at, multipath_merged_shape_at, nvme_cli_connect_args,
+    ConnectOptions, FabricPlane, LadderOutcome, MultipathMergedShape, VolumeShape,
 };
 use squeezefs::{fabric_endpoint_record_name, FabricEndpoint, FABRIC_ENDPOINT_RECORD_PREFIX};
 
@@ -542,6 +542,7 @@ fn data_shape<'a>(record: bool, actual: &'a [HostIdentity]) -> VolumeShape<'a> {
         descriptor: "vol-0000000000000001",
         has_endpoint_record: record,
         actual,
+        multipath_merged: None,
     }
 }
 
@@ -551,6 +552,7 @@ fn meta_shape(actual: &[HostIdentity]) -> VolumeShape<'_> {
         descriptor: "/dev/nvme9n1",
         has_endpoint_record: false,
         actual,
+        multipath_merged: None,
     }
 }
 
@@ -692,6 +694,261 @@ fn ladder_bootstrap_meta_without_controller_identity_accepts_unverified() {
         fabric_ladder_verdict(Some(&a), &meta_shape(&[]))
             .expect("verification-inapplicable META accepted with the loud warning"),
         LadderOutcome::AcceptUnverified
+    );
+}
+
+// ===========================================================================
+// rung 5b — the multipath-MERGED shape (the rung-6 STOP finding): a
+// subsystem head whose SERVING controllers carry >1 distinct hostnqn.
+// On nvme_core.multipath=Y kernels the kernel groups fabric controllers
+// by subsysnqn IGNORING hostnqn, so co-located identities merge under
+// ONE shared head whose round-robin voids per-mount device fencing.
+// Detection rides the same §6.8 sysfs injection seam; the rule-2
+// refusal must NAME the shape and BOTH remedies (the sqz kernel's
+// nvme_core.fabrics_host_scoped_subsystems=Y, and stock
+// nvme_core.multipath=N as the documented workaround).
+// ===========================================================================
+
+#[test]
+fn multipath_merged_shape_detects_two_hostnqns_under_one_head() {
+    let t = tempfile::tempdir().unwrap();
+    let (subsys, nvme) = roots(&t);
+    let a = id_a();
+    let b = id_b();
+    // The stock multipath=Y merged shape: two controllers under two
+    // identities serve ONE subsystem; the visible node is the one head.
+    // (No controller entries inside the subsystem dir — the attr-match
+    // fallback arm.)
+    mk_entry(&nvme, "nvme0", &ctrl_attrs(NQN_SUBSYS, &a), &["nvme0c0n1"]);
+    mk_entry(&nvme, "nvme1", &ctrl_attrs(NQN_SUBSYS, &b), &["nvme1c1n1"]);
+    mk_entry(
+        &subsys,
+        "nvme-subsys0",
+        &[("subsysnqn", NQN_SUBSYS)],
+        &["nvme0n1"],
+    );
+
+    let merged = multipath_merged_shape_at(&subsys, &nvme, "/dev/nvme0n1")
+        .expect("walk must not error")
+        .expect("two distinct hostnqns under one head IS the merged shape");
+    assert_eq!(merged.head, "/dev/nvme0n1");
+    assert_eq!(merged.subsysnqn, NQN_SUBSYS);
+    let mut want = vec![a.hostnqn.clone(), b.hostnqn.clone()];
+    want.sort();
+    assert_eq!(
+        merged.hostnqns, want,
+        "the distinct serving hostnqns, sorted (deterministic messages)"
+    );
+}
+
+#[test]
+fn multipath_merged_shape_single_identity_multipath_is_none() {
+    let t = tempfile::tempdir().unwrap();
+    let (subsys, nvme) = roots(&t);
+    let a = id_a();
+    // Same-identity multipath (N paths, ONE hostnqn) is the healthy
+    // upstream shape — never "merged".
+    mk_entry(&nvme, "nvme0", &ctrl_attrs(NQN_SUBSYS, &a), &["nvme0c0n1"]);
+    mk_entry(&nvme, "nvme1", &ctrl_attrs(NQN_SUBSYS, &a), &["nvme1c1n1"]);
+    mk_entry(
+        &subsys,
+        "nvme-subsys0",
+        &[("subsysnqn", NQN_SUBSYS)],
+        &["nvme0n1"],
+    );
+
+    assert_eq!(
+        multipath_merged_shape_at(&subsys, &nvme, "/dev/nvme0n1").expect("walk must not error"),
+        None,
+        "one hostnqn serving the head = dedicated, not merged"
+    );
+}
+
+#[test]
+fn multipath_merged_shape_scopes_to_the_subsystem_dirs_controller_entries() {
+    let t = tempfile::tempdir().unwrap();
+    let (subsys, nvme) = roots(&t);
+    let a = id_a();
+    let b = id_b();
+    // The sqz host-scoped kernel shape: TWO sibling subsystems share one
+    // subsysnqn (grouped apart by hostnqn), each carrying its OWN
+    // controller entry (the kernel's sysfs_create_link membership) and
+    // its OWN head. A global subsysnqn-attr walk would conflate the
+    // siblings and read every dedicated scoped head as "merged" — the
+    // serving set MUST be the subsystem dir's controller entries when
+    // they exist.
+    mk_entry(&nvme, "nvme0", &ctrl_attrs(NQN_SUBSYS, &a), &["nvme0c0n1"]);
+    mk_entry(&nvme, "nvme1", &ctrl_attrs(NQN_SUBSYS, &b), &["nvme1c1n1"]);
+    mk_entry(
+        &subsys,
+        "nvme-subsys0",
+        &[("subsysnqn", NQN_SUBSYS)],
+        &["nvme0n1"],
+    );
+    mk_entry(
+        &subsys,
+        "nvme-subsys1",
+        &[("subsysnqn", NQN_SUBSYS)],
+        &["nvme1n1"],
+    );
+    // Controller entries inside each subsystem dir (fixture stand-ins
+    // for the kernel's controller links — dirs carrying the same attrs
+    // the linked controller dir answers).
+    for (sdir, ctrl, id) in [("nvme-subsys0", "nvme0", &a), ("nvme-subsys1", "nvme1", &b)] {
+        let dir = subsys.join(sdir).join(ctrl);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (file, contents) in ctrl_attrs(NQN_SUBSYS, id) {
+            std::fs::write(dir.join(file), format!("{contents}\n")).unwrap();
+        }
+    }
+
+    assert_eq!(
+        multipath_merged_shape_at(&subsys, &nvme, "/dev/nvme0n1").expect("walk must not error"),
+        None,
+        "a host-scoped sibling head is DEDICATED — membership is the \
+         subsystem dir's controller entries, never the global attr match"
+    );
+    assert_eq!(
+        multipath_merged_shape_at(&subsys, &nvme, "/dev/nvme1n1").expect("walk must not error"),
+        None,
+        "the other sibling likewise"
+    );
+}
+
+#[test]
+fn multipath_merged_shape_non_head_and_identityless_paths_are_none() {
+    let t = tempfile::tempdir().unwrap();
+    let (subsys, nvme) = roots(&t);
+    let a = id_a();
+    // A per-controller namespace node (multipath=N shape): no subsystem
+    // dir carries it — never merged.
+    mk_entry(&nvme, "nvme0", &ctrl_attrs(NQN_SUBSYS, &a), &["nvme0n1"]);
+    assert_eq!(
+        multipath_merged_shape_at(&subsys, &nvme, "/dev/nvme0n1").expect("walk must not error"),
+        None
+    );
+    // Non-NVMe paths are honest None.
+    assert_eq!(
+        multipath_merged_shape_at(&subsys, &nvme, "/dev/zram0").expect("walk must not error"),
+        None
+    );
+    // A head served by identity-LESS controllers (local PCIe under
+    // multipath=Y): zero hostnqns, never merged.
+    mk_entry(&nvme, "nvme2", &[("subsysnqn", "pcie-subsys")], &["nvme2c2n1"]);
+    mk_entry(
+        &subsys,
+        "nvme-subsys2",
+        &[("subsysnqn", "pcie-subsys")],
+        &["nvme2n1"],
+    );
+    assert_eq!(
+        multipath_merged_shape_at(&subsys, &nvme, "/dev/nvme2n1").expect("walk must not error"),
+        None,
+        "identity-less controllers contribute no hostnqn — a PCIe head is never merged"
+    );
+}
+
+fn merged_fixture() -> MultipathMergedShape {
+    let mut hostnqns = vec![id_a().hostnqn, id_b().hostnqn];
+    hostnqns.sort();
+    MultipathMergedShape {
+        head: "/dev/nvme0n1".to_string(),
+        subsysnqn: NQN_SUBSYS.to_string(),
+        hostnqns,
+    }
+}
+
+#[test]
+fn ladder_multipath_merged_refusal_names_the_shape_and_both_remedies() {
+    let a = id_a();
+    let both = [id_a(), id_b()];
+    let merged = merged_fixture();
+    let shape = VolumeShape {
+        plane: FabricPlane::Meta,
+        descriptor: "/dev/nvme0n1",
+        has_endpoint_record: false,
+        actual: &both,
+        multipath_merged: Some(&merged),
+    };
+    let err = fabric_ladder_verdict(Some(&a), &shape)
+        .expect_err("a merged head under explicit identity refuses");
+    for needle in [
+        "multipath-merged",
+        "/dev/nvme0n1",
+        NQN_SUBSYS,
+        &id_a().hostnqn,
+        &id_b().hostnqn,
+        "nvme_core.fabrics_host_scoped_subsystems=Y",
+        "nvme_core.multipath=N",
+    ] {
+        assert!(
+            err.to_lowercase().contains(&needle.to_lowercase()),
+            "the merged refusal must name the shape and BOTH remedies \
+             verbatim — missing '{needle}' in: {err}"
+        );
+    }
+}
+
+#[test]
+fn ladder_multipath_merged_refuses_even_when_actual_identities_cannot() {
+    // The degenerate face: serving controllers carry hostnqn but no
+    // hostid, so the actual-identity list is EMPTY (half an identity is
+    // no identity) and the generic rule-2 foreign-find cannot fire. The
+    // merged shape must refuse on its own — a shared head can never be
+    // accepted because its identities were half-populated.
+    let a = id_a();
+    let merged = merged_fixture();
+    let shape = VolumeShape {
+        plane: FabricPlane::Meta,
+        descriptor: "/dev/nvme0n1",
+        has_endpoint_record: false,
+        actual: &[],
+        multipath_merged: Some(&merged),
+    };
+    assert!(
+        fabric_ladder_verdict(Some(&a), &shape).is_err(),
+        "merged refuses independent of the HostIdentity pair census"
+    );
+}
+
+#[test]
+fn ladder_multipath_merged_without_explicit_identity_accepts_unchanged() {
+    // Without explicit identity nothing changes (the ladder's accept-all
+    // law) — the guarantee-row gauges keep reading actual identities.
+    let both = [id_a(), id_b()];
+    let merged = merged_fixture();
+    let shape = VolumeShape {
+        plane: FabricPlane::Meta,
+        descriptor: "/dev/nvme0n1",
+        has_endpoint_record: false,
+        actual: &both,
+        multipath_merged: Some(&merged),
+    };
+    assert_eq!(
+        fabric_ladder_verdict(None, &shape).expect("no explicit identity accepts"),
+        LadderOutcome::Accept
+    );
+}
+
+#[test]
+fn ladder_multipath_merged_data_with_record_still_daemon_connects() {
+    // Precedence unchanged: a record-covered DATA volume never opens the
+    // shared path at all — DaemonConnect wins ahead of rule 2, and the
+    // daemon's own post-connect resolution is what refuses on a merged
+    // kernel (find_device_for_nqn_under_identity's dedicated-only law).
+    let a = id_a();
+    let both = [id_a(), id_b()];
+    let merged = merged_fixture();
+    let shape = VolumeShape {
+        plane: FabricPlane::Data,
+        descriptor: "vol-0000000000000001",
+        has_endpoint_record: true,
+        actual: &both,
+        multipath_merged: Some(&merged),
+    };
+    assert_eq!(
+        fabric_ladder_verdict(Some(&a), &shape).expect("record-covered data daemon-connects"),
+        LadderOutcome::DaemonConnect
     );
 }
 

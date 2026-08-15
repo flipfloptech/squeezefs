@@ -319,7 +319,58 @@ pub async fn open_routed_meta_set(paths: &[String]) -> Result<std::sync::Arc<Rou
         disc.routing_width,
         &disc.slot_to_volume,
     )?;
+    // KD-MW-1 (design-full-multi-writer §6.2 mechanism ii): the bit-11
+    // uniformity half of the writable-mount refusal predicate, checked
+    // BEFORE any guard is taken (superblock reads only). The marker half
+    // needs volume 0's xattr tree and runs after the guarded opens below.
+    refuse_mixed_multi_writer_set(&disc.ordered_paths).await?;
     let backends = open_meta_volume_set(&disc.ordered_paths).await?;
+    // §6.2 mechanism i: a writable mount refuses while the `mw_upgrade:`
+    // intent marker exists (covers shape (b) on ANY volume — the marker
+    // precedes any bit write). The `volume enable-multi-writer` verb's own
+    // D0-guarded per-volume opens are the ONE marker-tolerant writable
+    // open; they never route through this gate by construction.
+    let marker = backends[0]
+        .getxattr(1, crate::MW_UPGRADE_MARKER_XATTR)
+        .await;
+    let refusal = match &marker {
+        Ok(Some(raw)) => {
+            let named = match crate::MwUpgradeMarker::decode(raw) {
+                Ok(m) => format!("covering volumes {:?}", m.volumes),
+                Err(e) => format!("(marker undecodable: {e})"),
+            };
+            Some(crate::error::SqueezefsError::InvalidOperation(format!(
+                "refusing a writable mount: a multi-writer upgrade-intent marker \
+                 (`{}`) is present on volume 0 {named} — a `squeezefs volume \
+                 enable-multi-writer` run crashed mid-upgrade. Re-run `squeezefs \
+                 volume enable-multi-writer <sqmeta-uri>` (idempotent, resumes \
+                 from the crash point); read-only mounts keep serving",
+                crate::MW_UPGRADE_MARKER_XATTR
+            )))
+        }
+        Ok(None) => None,
+        // A marker probe that cannot be READ refuses too (never guess).
+        Err(_) => Some(crate::error::SqueezefsError::InvalidOperation(format!(
+            "refusing a writable mount: the multi-writer upgrade-intent marker \
+             probe on volume 0 failed ({})",
+            marker
+                .as_ref()
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default()
+        ))),
+    };
+    if let Some(err) = refusal {
+        for be in &backends {
+            if let Err(te) = be.shutdown().await {
+                log::warn!(
+                    "releasing guard on {:?} after the mw_upgrade marker refusal failed: {te}",
+                    be.device_path()
+                );
+            }
+        }
+        return Err(err);
+    }
     let routed = std::sync::Arc::new(RoutedMetaBackend::with_slot_map_and_natives(
         backends,
         disc.routing_width,
@@ -2954,6 +3005,68 @@ pub fn plan_meta_slot_set_with_width(volume_count: usize, width: u32) -> Result<
 /// metadata view and must not adopt the old set's staging — while a
 /// STAMPED set's canonical order rides `member_position`, making the
 /// generation identical under any operator URI ordering (§5.5.1a).
+/// The bit-11 uniformity half of the KD-MW-1 writable-mount refusal
+/// predicate (design-full-multi-writer §6.2 mechanism ii), over the set's
+/// CANONICAL path order. Refuses iff:
+///
+/// * any volume carries bit 11 (`KV_MULTI_WRITER_DATA`) **without the
+///   other eight** [`kv::superblock::MULTI_WRITER_FORMAT_BITS`] members —
+///   the enable verb stamps bit 11 TERMINAL per volume by construction,
+///   so this state can only come from a foreign tool or corruption
+///   (refused naming fsck, never auto-repaired);
+/// * bit-11 presence **differs across the set** (shape (a) — a crash
+///   between volumes), refused naming the lagging volume(s) and the
+///   resume remedy.
+///
+/// Shape (c) — legitimately partial populations NOT including bit 11
+/// (standalone bit 7, Phase-8 bit-15 stamps, bit-5 runtime stamps, the
+/// pre-mw six-bit test populations MINUS bit 11, …) — never trips either
+/// arm: those are exactly today's legal field states, grandfathered.
+pub async fn refuse_mixed_multi_writer_set(ordered_paths: &[String]) -> Result<()> {
+    use kv::superblock::{
+        FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA as BIT11, MULTI_WRITER_FORMAT_BITS as ALL_NINE,
+    };
+    let mut mw_volumes: Vec<&str> = Vec::new();
+    let mut lagging: Vec<&str> = Vec::new();
+    for path in ordered_paths {
+        let features = match kv::superblock::classify_volume(std::path::Path::new(path)).await? {
+            kv::superblock::VolumeFormat::V3(sb) => sb.features_incompat,
+            // Blank/legacy volumes fail the open gate downstream with
+            // their own precise errors; the mw predicate has nothing
+            // to say about them.
+            _ => continue,
+        };
+        if features & BIT11 != 0 {
+            if features & ALL_NINE != ALL_NINE {
+                return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                    "refusing a writable mount: metadata volume {path} carries the \
+                     multi-writer data-plane bit (11) WITHOUT the other eight \
+                     multi-writer format bits — the enable verb stamps bit 11 last \
+                     by construction, so this is a foreign-tool or corruption \
+                     state. Run `squeezefs fsck` on the volume; no automatic \
+                     repair is attempted (features {features:#x})"
+                )));
+            }
+            mw_volumes.push(path);
+        } else {
+            lagging.push(path);
+        }
+    }
+    if !mw_volumes.is_empty() && !lagging.is_empty() {
+        return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+            "refusing a writable mount: bit-11 (multi-writer) presence differs \
+             across the metadata set — {mw:?} are multi-writer-capable while \
+             {lag:?} lag (a `squeezefs volume enable-multi-writer` run crashed \
+             between volumes). Re-run `squeezefs volume enable-multi-writer \
+             <sqmeta-uri>` (idempotent) to converge; read-only mounts keep \
+             serving",
+            mw = mw_volumes,
+            lag = lagging,
+        )));
+    }
+    Ok(())
+}
+
 pub async fn volume_set_generation(meta_lvs: &[String]) -> Result<String> {
     let disc = discover_meta_set(meta_lvs).await?;
     Ok(generation_from_uuids(&disc.uuids))

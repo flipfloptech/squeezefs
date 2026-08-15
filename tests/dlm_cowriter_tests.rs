@@ -162,8 +162,13 @@ fn opts() -> FormatV3Options {
     }
 }
 
-/// Stamp the six S9 capability bits — the Phase-8 reformat window's act,
-/// offline, between format and open (a mount reads the superblock once).
+/// Stamp the FULL nine-bit multi-writer set — `volume enable-multi-writer`'s
+/// act (KD-MW-1), offline, between format and open. The ARM requires only
+/// its six capability bits, but since PR 5 the writable-mount gate enforces
+/// the §6.2 bit-11 uniformity invariant ("bit 11 set ⇒ all nine set"), so a
+/// bit-11 fixture volume must carry the whole set. Bits 8/12/15 are
+/// behaviorally inert for these suites (partitioned-solo is byte-identical;
+/// solo ino minting is lane 0 = dense).
 async fn stamp_capabilities(path: &Path) {
     for (what, res) in [
         ("durable-term", sb::set_durable_term_bit(path).await),
@@ -172,18 +177,27 @@ async fn stamp_capabilities(path: &Path) {
             sb::set_block_refcounts_bit(path).await,
         ),
         (
-            "writer-scoped-staging",
-            sb::set_writer_scoped_staging_bit(path).await,
+            "durable-layout-versions",
+            sb::set_layout_versions_bit(path).await,
         ),
-        (
-            "multi-writer-data",
-            sb::set_multi_writer_data_bit(path).await,
-        ),
+        ("ino-lanes", sb::set_ino_lanes_bit(path).await),
         (
             "block-key-incarnation",
             sb::set_block_key_incarnation_bit(path).await,
         ),
+        (
+            "partitioned-append",
+            sb::set_partitioned_append_bit(path).await,
+        ),
+        (
+            "writer-scoped-staging",
+            sb::set_writer_scoped_staging_bit(path).await,
+        ),
         ("claim-set", sb::set_claim_set_bit(path).await),
+        (
+            "multi-writer-data",
+            sb::set_multi_writer_data_bit(path).await,
+        ),
     ] {
         res.unwrap_or_else(|e| panic!("stamping {what} failed: {e}"));
     }

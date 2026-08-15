@@ -90,6 +90,17 @@ enum Commands {
         /// Subsystem NQN of NVMe-oF target
         #[arg(long)]
         subnqn: Option<String>,
+        /// Format the set multi-writer-capable (dark opt-in)
+        ///
+        /// Stamps the nine multi-writer incompat bits
+        /// (7,8,9,10,11,12,13,14,15) on every metadata volume at plan
+        /// time — one act, never piecemeal. The default format stays
+        /// today's single-writer-era posture while the multi-writer
+        /// arm-and-prove campaign runs; pre-multi-writer binaries refuse
+        /// to open a stamped set. Existing sets upgrade offline with
+        /// `squeezefs volume enable-multi-writer`.
+        #[arg(long)]
+        multi_writer: bool,
         /// Force formatting even if a squeezefs volume is already detected
         #[arg(long, short = 'f')]
         force: bool,
@@ -1342,6 +1353,26 @@ enum VolumeActions {
         /// slots) or an explicit list ("1,3,5")
         #[arg(long, default_value = "1")]
         take_slots: String,
+    },
+    // Anchors: design-full-multi-writer §6.2 pt 2 (KD-MW-1); crash
+    // windows MW-S1/S1b/S2/S3 (§10). Offline D0-guarded coordinator,
+    // the add-meta posture.
+    /// Upgrade an existing volume set to multi-writer-capable
+    ///
+    /// Stamps the nine multi-writer incompat bits on every metadata
+    /// volume of the set in one invocation (dependency order, bit 11
+    /// terminal), bracketed by a durable upgrade-intent marker: a
+    /// writable mount refuses while the upgrade is incomplete.
+    /// Idempotent and crash-resumable: re-run with the same URI. There
+    /// is no downgrade verb (forward-only); pre-multi-writer binaries
+    /// refuse to open the upgraded set.
+    ///
+    /// Offline verb: unmount first and pass the sqmeta:// URI. The
+    /// coordinator takes the exclusive writer guard before its first
+    /// write; a concurrent invocation refuses on the guard.
+    EnableMultiWriter {
+        /// sqmeta:// URI of the metadata volume set
+        target: String,
     },
     // Anchors: design-volume-lifecycle §5.5.2 (PR VL5b) — bulk copy +
     // conveyor delta tee + the §5.5.2a cutover gate + the §5.5.2b flip.
@@ -3654,6 +3685,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             ip: _,
             port: _,
             subnqn: _,
+            multi_writer,
             force,
             full,
             inodes,
@@ -3822,6 +3854,14 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 squeezefs::meta_backend::MINT_SPREAD
                     .min((meta_slot_plan.routing_width as usize).div_ceil(meta_lvs.len().max(1))),
             );
+            if multi_writer {
+                println!(
+                    "Multi-writer: stamping the nine multi-writer format bits \
+                     (7,8,9,10,11,12,13,14,15) on every metadata volume — one act \
+                     (KD-MW-1). Pre-multi-writer binaries refuse this set loud; \
+                     solo mounts behave identically."
+                );
+            }
 
             let requested_block_size = parse_human_readable_size(&block_size)?;
             // Every logical block lives in one fixed allocator chunk: a
@@ -3988,14 +4028,28 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             full_wipe: !quick,
                             format_config_xattr: config_xattr,
                         };
-                        squeezefs::meta_backend::kv::builder::format_v3_stamped(
-                            Path::new(&path),
-                            volume_len,
-                            &opts,
-                            stamp,
-                        )
-                        .await
-                        .map(|_| ())
+                        // KD-MW-1 Phase A (design-full-multi-writer §6.2
+                        // pt 1): `--multi-writer` stamps the nine mw bits
+                        // at plan time — one act, never piecemeal.
+                        if multi_writer {
+                            squeezefs::meta_backend::kv::builder::format_v3_stamped_multi_writer(
+                                Path::new(&path),
+                                volume_len,
+                                &opts,
+                                stamp,
+                            )
+                            .await
+                            .map(|_| ())
+                        } else {
+                            squeezefs::meta_backend::kv::builder::format_v3_stamped(
+                                Path::new(&path),
+                                volume_len,
+                                &opts,
+                                stamp,
+                            )
+                            .await
+                            .map(|_| ())
+                        }
                         .map_err(|e| {
                             format!("Failed to format metadata volume '{}': {}", path, e)
                         })?;
@@ -4348,6 +4402,33 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                          with the EXTENDED URI (all members listed); the old URI now \
                          refuses loud."
                     );
+                }
+                VolumeActions::EnableMultiWriter { target } => {
+                    if live(&target) {
+                        return Err("volume enable-multi-writer is an OFFLINE verb \
+                             (design-full-multi-writer §6.2: the ordered nine-bit stamp \
+                             runs under a D0-guarded coordinator, the add-meta posture): \
+                             unmount first and pass the sqmeta:// URI"
+                            .into());
+                    }
+                    let meta_lvs = parse_block_uri(&target, "sqmeta://")?;
+                    let report = squeezefs::config_ops::enable_multi_writer(&meta_lvs).await?;
+                    if report.bits_stamped == 0 {
+                        println!(
+                            "Volume set is already multi-writer-capable ({} volume(s)); \
+                             nothing written.",
+                            report.volumes.len()
+                        );
+                    } else {
+                        println!(
+                            "Upgraded {} metadata volume(s) to multi-writer-capable \
+                             ({} bit stamp(s) written; intent marker deleted). \
+                             Pre-multi-writer binaries refuse this set loud; there is \
+                             no downgrade verb — `format --force` reformats.",
+                            report.volumes.len(),
+                            report.bits_stamped
+                        );
+                    }
                 }
                 VolumeActions::MigrateMetaSlot {
                     target,

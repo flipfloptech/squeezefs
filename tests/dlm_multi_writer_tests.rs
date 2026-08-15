@@ -876,12 +876,17 @@ async fn the_mount_arm_refuses_an_unstamped_format_naming_the_bit() {
     shutdown(&routed).await;
 }
 
-/// Stamp the capability bits S9's arm requires through the OFFLINE paths —
-/// which is exactly what the Phase-8 reformat window does. Deliberately
-/// not the full known-bit set: bits 8 (partitioned append) and 12 (ino
-/// lanes) express TWO APPENDERS PER VOLUME, and S9's ownership granularity
-/// is the volume, so every §6.2 single-appender structure still has
-/// exactly one appender.
+/// Stamp the FULL nine-bit multi-writer set through the OFFLINE paths —
+/// what `squeezefs volume enable-multi-writer` does (KD-MW-1,
+/// design-full-multi-writer §6.2). The ARM still *requires* only its six
+/// capability bits (`REQUIRED_INCOMPAT`, pinned below), but since PR 5
+/// the writable-mount gate enforces the bit-11 uniformity invariant —
+/// *"bit 11 set ⇒ all nine set"* — so a bit-11 fixture volume must carry
+/// the whole set or the mount refuses it as a foreign-tool state. Bits 8
+/// (partitioned append) and 12 (ino lanes) stay behaviorally inert here:
+/// S9's ownership granularity is the volume, so every §6.2
+/// single-appender structure still has exactly one appender
+/// (partitioned-solo is byte-identical by the §6.3 evidence gate).
 async fn stamp_capabilities(path: &Path) {
     for (what, res) in [
         ("durable-term", sb::set_durable_term_bit(path).await),
@@ -890,18 +895,27 @@ async fn stamp_capabilities(path: &Path) {
             sb::set_block_refcounts_bit(path).await,
         ),
         (
-            "writer-scoped-staging",
-            sb::set_writer_scoped_staging_bit(path).await,
+            "durable-layout-versions",
+            sb::set_layout_versions_bit(path).await,
         ),
-        (
-            "multi-writer-data",
-            sb::set_multi_writer_data_bit(path).await,
-        ),
+        ("ino-lanes", sb::set_ino_lanes_bit(path).await),
         (
             "block-key-incarnation",
             sb::set_block_key_incarnation_bit(path).await,
         ),
+        (
+            "partitioned-append",
+            sb::set_partitioned_append_bit(path).await,
+        ),
+        (
+            "writer-scoped-staging",
+            sb::set_writer_scoped_staging_bit(path).await,
+        ),
         ("claim-set", sb::set_claim_set_bit(path).await),
+        (
+            "multi-writer-data",
+            sb::set_multi_writer_data_bit(path).await,
+        ),
     ] {
         res.unwrap_or_else(|e| panic!("stamping {what} failed: {e}"));
     }

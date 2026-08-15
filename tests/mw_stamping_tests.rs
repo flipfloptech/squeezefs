@@ -49,7 +49,9 @@ use squeezefs::meta_backend::kv::superblock as sb;
 use squeezefs::meta_backend::kv::superblock::{
     classify_volume, VolumeFormat, FEATURES_INCOMPAT_KNOWN, MULTI_WRITER_FORMAT_BITS,
 };
-use squeezefs::meta_backend::{open_routed_meta_set, open_volume_probe, plan_meta_slot_set};
+use squeezefs::meta_backend::{
+    open_routed_meta_set, open_volume_probe, plan_meta_slot_set, Metadata,
+};
 use squeezefs::MW_UPGRADE_MARKER_XATTR;
 
 const VOL_LEN: u64 = 128 * 1024 * 1024;
@@ -231,7 +233,10 @@ async fn enable_multi_writer_stamps_ordered_idempotent_and_deletes_the_marker() 
 
     // Idempotent re-run: nothing left to stamp, no marker minted.
     let rerun = enable_multi_writer(&paths).await.expect("re-run");
-    assert_eq!(rerun.bits_stamped, 0, "re-running an upgraded set is a no-op");
+    assert_eq!(
+        rerun.bits_stamped, 0,
+        "re-running an upgraded set is a no-op"
+    );
     assert!(read_marker(&metas[0]).await.is_none());
 }
 
@@ -267,7 +272,10 @@ async fn mw_s1_crash_between_volumes_refuses_writable_and_resumes() {
     // State on media: volume 0 fully stamped, volume 1 untouched, marker up.
     assert!(has_all_nine(features_of(&metas[0]).await));
     assert!(has_none_beyond_default(features_of(&metas[1]).await));
-    assert!(read_marker(&metas[0]).await.is_some(), "marker survives the crash");
+    assert!(
+        read_marker(&metas[0]).await.is_some(),
+        "marker survives the crash"
+    );
 
     // A writable mount refuses, naming the lagging volume + the remedy.
     let refused = open_routed_meta_set(&paths).await;
@@ -290,7 +298,9 @@ async fn mw_s1_crash_between_volumes_refuses_writable_and_resumes() {
     assert!(report.bits_stamped > 0, "volume 1's bits still had to land");
     assert!(has_all_nine(features_of(&metas[1]).await));
     assert!(read_marker(&metas[0]).await.is_none());
-    let routed = open_routed_meta_set(&paths).await.expect("mount after resume");
+    let routed = open_routed_meta_set(&paths)
+        .await
+        .expect("mount after resume");
     for vol in &routed.volumes {
         vol.shutdown().await.expect("clean shutdown");
     }
@@ -371,7 +381,9 @@ async fn mw_s1b_kill_between_every_adjacent_bit_pair_refuses_then_resumes() {
         enable_multi_writer(&paths).await.expect("resume");
         assert!(has_all_nine(features_of(&meta).await));
         assert!(read_marker(&meta).await.is_none());
-        let routed = open_routed_meta_set(&paths).await.expect("mount after resume");
+        let routed = open_routed_meta_set(&paths)
+            .await
+            .expect("mount after resume");
         for vol in &routed.volumes {
             vol.shutdown().await.expect("clean shutdown");
         }
@@ -396,7 +408,9 @@ async fn mw_s2_first_writable_mount_minting_acts_fire_and_are_idempotent() {
     // accounting engages; bit 8's partition read adopts the pre-partition
     // records; bit 10's staging scope is armed (no staging dirs here — the
     // meta-side arm is the open itself succeeding under the bit).
-    let routed = open_routed_meta_set(&paths).await.expect("first stamped mount");
+    let routed = open_routed_meta_set(&paths)
+        .await
+        .expect("first stamped mount");
     assert!(
         routed.volumes[0].block_refs_engaged(),
         "bit 9: the stamp engages durable block accounting on the next mount"
@@ -416,7 +430,9 @@ async fn mw_s2_first_writable_mount_minting_acts_fire_and_are_idempotent() {
 
     // MW-S2's law: the minting acts are idempotent across a remount — the
     // second mount adopts the minted structures and the data is intact.
-    let routed = open_routed_meta_set(&paths).await.expect("second stamped mount");
+    let routed = open_routed_meta_set(&paths)
+        .await
+        .expect("second stamped mount");
     assert!(routed.volumes[0].block_refs_engaged());
     let got = routed.lookup(1, "minted").await.expect("lookup");
     assert_eq!(got.ino, ino, "ino stable across the stamped remount");
@@ -526,7 +542,9 @@ async fn orphan_bit_11_without_the_other_eight_refuses_naming_fsck() {
     let dir = tempfile::tempdir().unwrap();
     let meta = make_file(dir.path(), "m0.meta");
     format_default_set(std::slice::from_ref(&meta)).await;
-    sb::set_multi_writer_data_bit(&meta).await.expect("stamp 11");
+    sb::set_multi_writer_data_bit(&meta)
+        .await
+        .expect("stamp 11");
     let paths = uris(std::slice::from_ref(&meta));
     let err = match open_routed_meta_set(&paths).await {
         Ok(routed) => {
@@ -626,7 +644,10 @@ async fn concurrent_enable_invocation_refuses_on_the_d0_guard() {
     // The refusal happened BEFORE the verb's first write: no marker, no bit.
     assert!(has_none_beyond_default(features_of(&meta).await), "{msg}");
     holder.shutdown().await.expect("release");
-    assert!(read_marker(&meta).await.is_none(), "no marker leaked: {msg}");
+    assert!(
+        read_marker(&meta).await.is_none(),
+        "no marker leaked: {msg}"
+    );
 
     // Extended: the marker-tolerant RESUME open serializes the same way.
     let hooks = EnableMwHooks {
@@ -635,7 +656,10 @@ async fn concurrent_enable_invocation_refuses_on_the_d0_guard() {
     enable_multi_writer_with(&paths, &hooks)
         .await
         .expect_err("injected crash");
-    assert!(read_marker(&meta).await.is_some(), "crashed state: marker up");
+    assert!(
+        read_marker(&meta).await.is_some(),
+        "crashed state: marker up"
+    );
     let holder = KvMetaBackend::open(&meta).await.expect("guard holder");
     enable_multi_writer(&paths)
         .await

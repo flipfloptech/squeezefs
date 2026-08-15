@@ -1018,6 +1018,109 @@ impl FabricEndpoint {
     }
 }
 
+/// The durable **multi-writer upgrade-intent marker** record name
+/// (KD-MW-1, design-full-multi-writer §6.2 mechanism i): written as the
+/// FIRST act of `squeezefs volume enable-multi-writer` on **ino 1 of
+/// volume 0** (the KD-2 plane — whole-tx atomic, torn-immune, offline
+/// probe-readable; VAL-2-allowlist-invisible like `job:` /
+/// `alloc_lane:` / `fabric_endpoint:`), and DELETED as its LAST act
+/// after every volume's terminal bit (bit 11). A writable mount refuses
+/// while the marker exists — the enable verb's own D0-guarded open is
+/// the ONE marker-tolerant writable open (it never routes through
+/// [`meta_backend::open_routed_meta_set`]'s gate by construction).
+pub const MW_UPGRADE_MARKER_XATTR: &str = "mw_upgrade:intent";
+
+/// [`MwUpgradeMarker`] wire version. A record carrying anything else
+/// refuses **loud** (forward-only): an unknown version means a newer
+/// binary began an upgrade this one cannot reason about.
+pub const MW_UPGRADE_MARKER_VERSION: u8 = 1;
+
+/// The `mw_upgrade:` intent marker's content (§6.2 mechanism i): the
+/// TARGET bit set and the canonical volume list the crashed-or-running
+/// upgrade covers, so a resume can verify it is completing the SAME act
+/// and a mount refusal can name the remedy precisely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MwUpgradeMarker {
+    /// The target incompat bit set (the nine
+    /// [`meta_backend::kv::superblock::MULTI_WRITER_FORMAT_BITS`]).
+    pub bits: u64,
+    /// The set's volume paths in canonical member order (volume 0 first).
+    pub volumes: Vec<String>,
+}
+
+impl MwUpgradeMarker {
+    /// Versioned + checksummed record image (the [`FabricEndpoint`]
+    /// pattern): `version u8 | bits u64 LE | count u16 LE |
+    /// (len u16 LE | bytes) × volumes | xxh3-64 LE of everything before`.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(
+            1 + 8 + 2 + self.volumes.iter().map(|v| 2 + v.len()).sum::<usize>() + 8,
+        );
+        out.push(MW_UPGRADE_MARKER_VERSION);
+        out.extend_from_slice(&self.bits.to_le_bytes());
+        out.extend_from_slice(&(self.volumes.len() as u16).to_le_bytes());
+        for v in &self.volumes {
+            let b = v.as_bytes();
+            out.extend_from_slice(&(b.len() as u16).to_le_bytes());
+            out.extend_from_slice(b);
+        }
+        let sum = xxhash_rust::xxh3::xxh3_64(&out);
+        out.extend_from_slice(&sum.to_le_bytes());
+        out
+    }
+
+    /// Decode + verify. Torn (checksum), truncated, and future-version
+    /// images all refuse loud — a marker that cannot be interpreted still
+    /// refuses the mount (presence alone is the refusal predicate), but
+    /// never silently misnames the remedy.
+    pub fn decode(raw: &[u8]) -> std::result::Result<Self, String> {
+        if raw.len() < 1 + 8 + 2 + 8 {
+            return Err(format!(
+                "mw_upgrade marker too short ({} B) — torn or foreign",
+                raw.len()
+            ));
+        }
+        let (body, sum_bytes) = raw.split_at(raw.len() - 8);
+        let want = u64::from_le_bytes(sum_bytes.try_into().expect("8 B split"));
+        if xxhash_rust::xxh3::xxh3_64(body) != want {
+            return Err(
+                "mw_upgrade marker checksum mismatch — torn write or corruption".to_string(),
+            );
+        }
+        if body[0] != MW_UPGRADE_MARKER_VERSION {
+            return Err(format!(
+                "mw_upgrade marker version {} is not the supported version {} — a newer \
+                 binary began this upgrade; finish it with that binary",
+                body[0], MW_UPGRADE_MARKER_VERSION
+            ));
+        }
+        let bits = u64::from_le_bytes(body[1..9].try_into().expect("8 B"));
+        let count = u16::from_le_bytes(body[9..11].try_into().expect("2 B")) as usize;
+        let mut pos = 11usize;
+        let mut volumes = Vec::with_capacity(count);
+        for _ in 0..count {
+            if pos + 2 > body.len() {
+                return Err("mw_upgrade marker truncated before a volume entry".to_string());
+            }
+            let len = u16::from_le_bytes(body[pos..pos + 2].try_into().expect("2 B")) as usize;
+            pos += 2;
+            if pos + len > body.len() {
+                return Err("mw_upgrade marker truncated inside a volume entry".to_string());
+            }
+            volumes.push(
+                std::str::from_utf8(&body[pos..pos + len])
+                    .map_err(|_| "mw_upgrade marker volume entry is not UTF-8".to_string())?
+                    .to_string(),
+            );
+            pos += len;
+        }
+        if pos != body.len() {
+            return Err("mw_upgrade marker carries trailing bytes — torn or foreign".to_string());
+        }
+        Ok(Self { bits, volumes })
+    }
+}
+
 /// The grandfathered id of a legacy (`data_lv`) member: the device-path
 /// basename, byte-identical to what mount has always registered.
 pub fn legacy_volume_id(path: &str) -> String {

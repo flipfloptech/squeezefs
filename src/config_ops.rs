@@ -1970,6 +1970,238 @@ pub enum AddMetaCrash {
     SurvivorStamps,
 }
 
+/// The §6.2 MW-S1b crash seams of [`enable_multi_writer_with`]
+/// (design-full-multi-writer §10): each injects a hard error AFTER the
+/// named durable write, so the on-media state is exactly the kill-9
+/// window's (the [`AddMetaCrash`] pattern).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EnableMwCrash {
+    /// After the `mw_upgrade:` intent marker landed durably on volume 0,
+    /// before ANY bit write (MW-S1's "kill before any bit" face).
+    AfterMarker,
+    /// After `bits_done` bits (1..=9, in the §6.2 order
+    /// 7→9→15→12→13→8→10→14→11) landed on canonical volume `volume`,
+    /// before the next bit / volume / the marker delete. `bits_done = 9`
+    /// on a non-final volume is MW-S1 (crash BETWEEN volumes); on the
+    /// final volume it is the all-stamped-marker-still-up window.
+    AfterBit { volume: usize, bits_done: usize },
+}
+
+/// Test seams for [`enable_multi_writer_with`] (MW-S1/S1b).
+#[derive(Default)]
+pub struct EnableMwHooks {
+    pub crash_after: Option<EnableMwCrash>,
+}
+
+/// What [`enable_multi_writer`] did.
+#[derive(Debug, Clone)]
+pub struct EnableMwReport {
+    /// Newly-written bits across the whole set (0 = the set was already
+    /// fully multi-writer-capable and the verb wrote nothing).
+    pub bits_stamped: usize,
+    /// The set's volumes in canonical member order (volume 0 first).
+    pub volumes: Vec<String>,
+}
+
+/// The §6.2 per-volume stamp order (KD-MW-1): dependencies first — bit 13
+/// after bit 7 per its own refusal law — and bit 11 deliberately
+/// TERMINAL, which is what makes *"bit 11 set ⇒ all nine set"* an
+/// invariant the mount gate can enforce
+/// ([`crate::meta_backend::refuse_mixed_multi_writer_set`]).
+const MW_ENABLE_ORDER: [u64; 9] = [7, 9, 15, 12, 13, 8, 10, 14, 11];
+
+async fn stamp_mw_bit(
+    path: &Path,
+    bit: u64,
+) -> std::result::Result<bool, crate::meta_backend::kv::KvError> {
+    use crate::meta_backend::kv::superblock as sb;
+    match bit {
+        7 => sb::set_durable_term_bit(path).await,
+        8 => sb::set_partitioned_append_bit(path).await,
+        9 => sb::set_block_refcounts_bit(path).await,
+        10 => sb::set_writer_scoped_staging_bit(path).await,
+        11 => sb::set_multi_writer_data_bit(path).await,
+        12 => sb::set_ino_lanes_bit(path).await,
+        13 => sb::set_block_key_incarnation_bit(path).await,
+        14 => sb::set_claim_set_bit(path).await,
+        15 => sb::set_layout_versions_bit(path).await,
+        other => unreachable!("bit {other} is not in the MW_ENABLE_ORDER set"),
+    }
+}
+
+/// `squeezefs volume enable-multi-writer <sqmeta-uri>` — the KD-MW-1
+/// upgrade verb for EXISTING volume sets (design-full-multi-writer §6.2
+/// pt 2): **offline** (the `add-meta` D0-guarded coordinator posture),
+/// all volumes of the set in ONE invocation, per-volume bit order
+/// `7→9→15→12→13→8→10→14→11` (`MW_ENABLE_ORDER`), each stamp barriered
+/// (the superblock bit-setters' existing
+/// semantics), idempotent (each setter is a no-op on a set bit) and
+/// crash-resumable (re-run with the same URI).
+///
+/// The two §6.2 mechanisms:
+///
+/// 1. **The `mw_upgrade:` intent marker** — the verb's FIRST act writes
+///    one [`crate::MwUpgradeMarker`] record on ino 1 of volume 0 (the
+///    KD-2 plane) naming the target bit set + canonical volume list, and
+///    its LAST act (after every volume's terminal bit 11) deletes it. A
+///    writable mount refuses while the marker exists.
+/// 2. **Serialization** — the verb asserts the D0 guard (a guarded
+///    [`KvMetaBackend::open`] of volume 0, held across every write) before
+///    its first write, so `set_incompat_bit`'s unsynchronized RMW has
+///    exactly one setter: a second concurrent invocation refuses on the
+///    guard, and no runtime stamper can run because the set is offline.
+///    This guarded open is **the ONE marker-tolerant writable open**
+///    (scoped here by construction — it never routes through
+///    [`crate::meta_backend::open_routed_meta_set`]'s gate), which is what
+///    lets the verb resume its own crashed run.
+pub async fn enable_multi_writer(meta_lvs: &[String]) -> Result<EnableMwReport> {
+    enable_multi_writer_with(meta_lvs, &EnableMwHooks::default()).await
+}
+
+/// [`enable_multi_writer`] with the §10 MW-S1/S1b crash seams exposed.
+pub async fn enable_multi_writer_with(
+    meta_lvs: &[String],
+    hooks: &EnableMwHooks,
+) -> Result<EnableMwReport> {
+    use crate::meta_backend::kv::backend::KvMetaBackend;
+    use crate::meta_backend::kv::superblock as sb;
+
+    // Live-client gate on EVERY volume before anything is touched (the
+    // add-meta posture; `true` = the already-formatted refusal does not
+    // apply — upgrading formatted volumes is the whole point).
+    for path in meta_lvs {
+        crate::meta_backend::kv::builder::format_preflight(Path::new(path), true)
+            .await
+            .map_err(|e| {
+                SqueezefsError::InvalidOperation(format!("volume enable-multi-writer refused: {e}"))
+            })?;
+    }
+
+    // Canonical member order (§5.5.1a discovery — volume 0 first). The
+    // marker lives on volume 0 of THIS order, so resume and mount-gate
+    // reads agree on where to look regardless of URI order.
+    let disc = crate::meta_backend::discover_meta_set(meta_lvs).await?;
+    let ordered = disc.ordered_paths.clone();
+
+    // The D0 guard on volume 0, asserted BEFORE the first write and held
+    // across every write of the verb (the sole-setter serialization law).
+    let vol0 = KvMetaBackend::open(Path::new(&ordered[0])).await?;
+
+    let body = async {
+        let existing = vol0.getxattr(1, crate::MW_UPGRADE_MARKER_XATTR).await?;
+        let already_uniform = {
+            let mut all = true;
+            for path in &ordered {
+                let features = match sb::classify_volume(Path::new(path)).await? {
+                    sb::VolumeFormat::V3(s) => s.features_incompat,
+                    _ => 0,
+                };
+                if features & sb::MULTI_WRITER_FORMAT_BITS != sb::MULTI_WRITER_FORMAT_BITS {
+                    all = false;
+                }
+            }
+            all
+        };
+        match &existing {
+            Some(raw) => {
+                // Resume: the marker must name the SAME act — refusing a
+                // mismatched list is what keeps "one invocation covers the
+                // whole set" true across a crash.
+                let marker = crate::MwUpgradeMarker::decode(raw).map_err(|e| {
+                    SqueezefsError::InvalidOperation(format!(
+                        "volume enable-multi-writer: the crashed run's intent marker is \
+                         unusable ({e}) — refusing to guess the target set"
+                    ))
+                })?;
+                if marker.volumes != ordered {
+                    return Err(SqueezefsError::InvalidOperation(format!(
+                        "volume enable-multi-writer: an upgrade-intent marker already \
+                         names volumes {:?} — re-run the verb with exactly that set \
+                         (this invocation named {:?})",
+                        marker.volumes, ordered
+                    )));
+                }
+            }
+            None if already_uniform => {
+                // Nothing to do and nothing was written — idempotent no-op.
+                return Ok(0usize);
+            }
+            None => {
+                // FIRST act: the durable intent marker, journal-committed
+                // and checkpointed BEFORE any bit write (§6.2 mechanism i —
+                // it is what covers shape (b) on any volume, including
+                // volume 0 itself).
+                let marker = crate::MwUpgradeMarker {
+                    bits: sb::MULTI_WRITER_FORMAT_BITS,
+                    volumes: ordered.clone(),
+                };
+                vol0.setxattr_internal(1, crate::MW_UPGRADE_MARKER_XATTR, &marker.encode())
+                    .await?;
+                vol0.checkpoint_now().await.map_err(|e| {
+                    SqueezefsError::InvalidOperation(format!(
+                        "volume enable-multi-writer: the intent marker did not land \
+                         durably: {e}"
+                    ))
+                })?;
+            }
+        }
+        if hooks.crash_after == Some(EnableMwCrash::AfterMarker) {
+            return Err(SqueezefsError::InvalidOperation(
+                "crash injection (enable-multi-writer: after the intent marker)".to_string(),
+            ));
+        }
+
+        // Per-volume ordered stamping — idempotent per bit, barriered per
+        // write (the existing `set_incompat_bit` semantics). Volume 0's
+        // sector 0 may be rewritten while its backend is open: the live
+        // backend never writes sector 0 (checkpoints flip the root
+        // ledger), and the per-path RMW lock serializes in-process.
+        let mut stamped = 0usize;
+        for (vi, path) in ordered.iter().enumerate() {
+            for (bi, bit) in MW_ENABLE_ORDER.iter().enumerate() {
+                if stamp_mw_bit(Path::new(path), *bit).await? {
+                    stamped += 1;
+                }
+                if hooks.crash_after
+                    == Some(EnableMwCrash::AfterBit {
+                        volume: vi,
+                        bits_done: bi + 1,
+                    })
+                {
+                    return Err(SqueezefsError::InvalidOperation(format!(
+                        "crash injection (enable-multi-writer: volume {vi} after \
+                         {} bit(s))",
+                        bi + 1
+                    )));
+                }
+            }
+        }
+
+        // LAST act (after every volume's terminal bit): delete the marker
+        // and checkpoint, re-admitting writable mounts.
+        vol0.removexattr_internal(1, crate::MW_UPGRADE_MARKER_XATTR)
+            .await?;
+        vol0.checkpoint_now().await.map_err(|e| {
+            SqueezefsError::InvalidOperation(format!(
+                "volume enable-multi-writer: the marker delete did not land durably: {e}"
+            ))
+        })?;
+        Ok(stamped)
+    }
+    .await;
+
+    // Release the guard on every path (a real kill-9 releases the flock
+    // the same way; the durable state the seams simulate is unchanged by
+    // this clean release).
+    if let Err(e) = vol0.shutdown().await {
+        log::warn!("releasing guard after enable-multi-writer: {e}");
+    }
+    Ok(EnableMwReport {
+        bits_stamped: body?,
+        volumes: ordered,
+    })
+}
+
 /// `squeezefs volume add-meta` — the OFFLINE D0-guarded coordinator
 /// (design-volume-lifecycle §5.5.2 Add, the VL4 `remove_data_volume_
 /// offline` posture): KD-8 staging barrier → format the new member →
@@ -2036,6 +2268,57 @@ pub async fn add_meta_volume_with(
     let resume_evidence = dev_stamp
         .as_ref()
         .is_some_and(|st| usize::from(st.member_count) == meta_lvs.len() + 1);
+
+    // KD-MW-1 (design-full-multi-writer §6.2, the two interaction rules):
+    // the bit-11 uniformity law read AT the add, BEFORE anything
+    // destructive. A bit-11-uniform set stamps the new member to match
+    // (`set_multi_writer` selects the mw format arm below); the converse —
+    // a bit-11 volume joining a non-upgraded set — refuses here, and a
+    // MIXED set refuses naming its own resume remedy.
+    let bit11_of = |fmt: &crate::meta_backend::kv::superblock::VolumeFormat| match fmt {
+        crate::meta_backend::kv::superblock::VolumeFormat::V3(sb) => {
+            sb.features_incompat
+                & crate::meta_backend::kv::superblock::FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA
+                != 0
+        }
+        _ => false,
+    };
+    let mut member_mw = Vec::with_capacity(members.len());
+    for m in &members {
+        member_mw.push(bit11_of(
+            &crate::meta_backend::kv::superblock::classify_volume(Path::new(&m.path)).await?,
+        ));
+    }
+    let set_multi_writer = member_mw.iter().all(|&b| b) && !member_mw.is_empty();
+    if !set_multi_writer && member_mw.iter().any(|&b| b) {
+        return Err(SqueezefsError::InvalidOperation(
+            "volume add-meta refused: bit-11 (multi-writer) presence differs across the \
+             existing set — converge it first with `squeezefs volume \
+             enable-multi-writer <sqmeta-uri>` (idempotent), then re-run the add"
+                .to_string(),
+        ));
+    }
+    let device_mw = matches!(
+        crate::meta_backend::kv::superblock::classify_volume(Path::new(device)).await,
+        Ok(ref fmt) if bit11_of(fmt)
+    );
+    if device_mw && !set_multi_writer {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "volume add-meta refused: device {device} carries the multi-writer data-plane \
+             bit (11) but the set it would join is not multi-writer-capable — the bit-11 \
+             uniformity law (design-full-multi-writer §6.2) holds at the add in both \
+             directions. Upgrade the set first (`squeezefs volume enable-multi-writer`) \
+             or add an unformatted device"
+        )));
+    }
+    if set_multi_writer && dev_stamp.is_some() && !device_mw {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "volume add-meta refused: device {device} is a crashed prior member WITHOUT \
+             the multi-writer bits while the set is multi-writer-capable — a mixed-era \
+             resume. Finish it with `squeezefs volume enable-multi-writer <sqmeta-uri>` \
+             over the extended set after the add converges, or reformat the device"
+        )));
+    }
 
     // Config-less sets (library/test harnesses format volumes without
     // the bootstrap xattr) simply have no staging dirs to barrier.
@@ -2210,22 +2493,37 @@ pub async fn add_meta_volume_with(
             full_wipe: false,
             format_config_xattr: None,
         };
-        crate::meta_backend::kv::builder::format_v3_stamped(
-            Path::new(device),
-            volume_len,
-            &opts,
-            crate::meta_backend::kv::checkpoint::MembershipStamp {
-                set_uuid: members[0].stamp.set_uuid,
-                set_epoch: epoch,
-                member_position: new_position,
-                member_count: old_count + 1,
-                routing_width: width,
-                slots_hosted: crate::meta_backend::kv::slot_set::SlotSet::new(),
-                native_slot: None,
-                slot_cursors: Vec::new(),
-            },
-        )
-        .await?;
+        let stamp = crate::meta_backend::kv::checkpoint::MembershipStamp {
+            set_uuid: members[0].stamp.set_uuid,
+            set_epoch: epoch,
+            member_position: new_position,
+            member_count: old_count + 1,
+            routing_width: width,
+            slots_hosted: crate::meta_backend::kv::slot_set::SlotSet::new(),
+            native_slot: None,
+            slot_cursors: Vec::new(),
+        };
+        if set_multi_writer {
+            // §6.2 interaction rule 1: growing a bit-11-uniform set stamps
+            // the new member to match AS PART OF THE ADD — the fresh-format
+            // arm (one plan, one superblock write; no marker needed, a
+            // fresh volume has no prior state to sequence through).
+            crate::meta_backend::kv::builder::format_v3_stamped_multi_writer(
+                Path::new(device),
+                volume_len,
+                &opts,
+                stamp,
+            )
+            .await?;
+        } else {
+            crate::meta_backend::kv::builder::format_v3_stamped(
+                Path::new(device),
+                volume_len,
+                &opts,
+                stamp,
+            )
+            .await?;
+        }
     }
 
     // KD-8 phase 1 (the §5.5.2b write-0 class: durable, flips nothing):

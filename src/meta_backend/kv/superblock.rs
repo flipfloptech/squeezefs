@@ -513,6 +513,31 @@ pub const FEATURE_INCOMPAT_KV_CLAIM_SET: u64 = 1 << 14;
 /// parallel claim a red gate instead of silent on-disk aliasing).
 pub const FEATURE_INCOMPAT_KV_LAYOUT_VERSIONS: u64 = 1 << 15;
 
+/// The **one-act multi-writer stamp set** (KD-MW-1,
+/// docs/design-full-multi-writer.md §6.1/§6.2): the nine incompat bits a
+/// multi-writer-capable format carries — 7 (durable term), 8 (partitioned
+/// append), 9 (block refcounts), 10 (writer-scoped staging), 11 (mw data
+/// plane), 12 (ino lanes), 13 (incarnation keys — requires 7), 14 (claim
+/// set), 15 (layout versions).
+///
+/// The bit-9 lesson generalized: a PARTIALLY-engaged multi-writer format
+/// is the dangerous state, so the nine stamp as ONE act — `format
+/// --multi-writer` (all nine in one planned superblock write) or the
+/// ordered, crash-resumable `squeezefs volume enable-multi-writer` verb
+/// (per-volume order 7→9→15→12→13→8→10→14→11, bit 11 deliberately
+/// TERMINAL so *"bit 11 set ⇒ all nine set"* is an invariant the mount
+/// gate can enforce — [`crate::meta_backend::open_routed_meta_set`]'s
+/// §6.2 refusal predicate).
+pub const MULTI_WRITER_FORMAT_BITS: u64 = FEATURE_INCOMPAT_KV_DURABLE_TERM
+    | FEATURE_INCOMPAT_KV_PARTITIONED_APPEND
+    | FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS
+    | FEATURE_INCOMPAT_KV_WRITER_SCOPED_STAGING
+    | FEATURE_INCOMPAT_KV_MULTI_WRITER_DATA
+    | FEATURE_INCOMPAT_KV_INO_LANES
+    | FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION
+    | FEATURE_INCOMPAT_KV_CLAIM_SET
+    | FEATURE_INCOMPAT_KV_LAYOUT_VERSIONS;
+
 /// Incompat feature bits this binary understands. Any other set bit
 /// refuses the mount naming the bit (§6.1).
 pub const FEATURES_INCOMPAT_KNOWN: u64 = FEATURE_INCOMPAT_KV_V3
@@ -1460,6 +1485,30 @@ pub async fn set_block_refcounts_bit(path: &Path) -> Result<bool, KvError> {
         path,
         FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS,
         "durable-block-refcounts",
+    )
+    .await
+}
+
+/// Stamp [`FEATURE_INCOMPAT_KV_PARTITIONED_APPEND`] on `path`'s superblock
+/// — the §6.2 items-2/3/4 upgrade path (the batched Phase-8 reformat
+/// window / the KD-MW-1 `enable-multi-writer` verb; **mount NEVER calls
+/// this**, ruling D9). Returns whether the bit was newly set. The volume
+/// must be offline (the caller holds the D0 guard).
+///
+/// Ordering note, same class as bits 7/9/10/11: the bit gates no
+/// silently-misdecoded record. A pre-item-2/3/4 binary refuses a stamped
+/// volume outright, and the partitioned FORMS (per-appender sub-rings,
+/// suffix-ed ledger records, per-appender bitmap budgets) only ever come
+/// from a mount that saw the bit AND was armed for W > 1 appenders — a
+/// stamped SOLO mount reads the existing un-partitioned records as
+/// appender 0's (the [`super::checkpoint::LedgerRecord::append_partition`]
+/// `None` arm) and stays structure-byte-identical (§6.3's
+/// partitioned-solo evidence gate). Stamp-then-crash is therefore inert.
+pub async fn set_partitioned_append_bit(path: &Path) -> Result<bool, KvError> {
+    set_incompat_bit(
+        path,
+        FEATURE_INCOMPAT_KV_PARTITIONED_APPEND,
+        "partitioned-append",
     )
     .await
 }

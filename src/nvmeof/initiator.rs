@@ -360,6 +360,123 @@ pub fn controller_identities_for_device(dev_path: &str) -> std::io::Result<Vec<H
     )
 }
 
+/// Controller-shaped sysfs entry name — strictly `nvme<digits>` (the
+/// controller links a subsystem dir carries; never a namespace child
+/// like `nvme0n1`, whose digits are broken by the `n`).
+fn is_controller_entry_name(name: &str) -> bool {
+    name.strip_prefix("nvme")
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The multipath-MERGED shape (rung 5b — the rung-6 STOP finding): a
+/// subsystem HEAD node whose serving controllers carry more than one
+/// distinct hostnqn. On `nvme_core.multipath=Y` kernels the kernel
+/// groups fabric controllers by subsysnqn IGNORING hostnqn, so two
+/// co-located per-mount identities merge under ONE shared head whose
+/// round-robin voids per-mount device fencing — the shape rule 2's
+/// refusal must NAME, with both remedies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultipathMergedShape {
+    /// The head block device (`/dev/nvmeXnY`).
+    pub head: String,
+    /// The subsystem's NQN.
+    pub subsysnqn: String,
+    /// The DISTINCT hostnqns of the serving controllers, sorted
+    /// (deterministic messages).
+    pub hostnqns: Vec<String>,
+}
+
+/// Detect the multipath-merged shape under a namespace block device,
+/// from explicit sysfs roots (the §6.8 injection seam; production
+/// wraps with the real roots via [`multipath_merged_shape`]).
+///
+/// Serving-controller membership is **subsystem-dir-scoped**: when the
+/// head's subsystem dir carries controller entries (`nvme<N>` — the
+/// kernel's `sysfs_create_link` membership), exactly those controllers
+/// are the serving set; only a link-less dir falls back to global
+/// subsysnqn-attr matching. The scoping is load-bearing on the sqz
+/// host-scoped kernel (`nvme_core.fabrics_host_scoped_subsystems=Y`,
+/// `docs/design-mw-multipath-kernel.md`): scoped SIBLING subsystems
+/// share a subsysnqn by design, so an attr-matched walk would read
+/// every dedicated scoped head as merged.
+///
+/// * Non-NVMe / per-controller (non-head) nodes → `None`.
+/// * One distinct hostnqn (same-identity multipath) → `None`.
+/// * Identity-less controllers (local PCIe) contribute no hostnqn — a
+///   PCIe head is never merged.
+pub fn multipath_merged_shape_at(
+    subsystem_root: &Path,
+    nvme_root: &Path,
+    dev_path: &str,
+) -> std::io::Result<Option<MultipathMergedShape>> {
+    let name = Path::new(dev_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if split_nvme_namespace(&name).is_none() {
+        return Ok(None);
+    }
+    for subsys in sorted_child_dirs(subsystem_root)? {
+        if !has_child_dir(&subsys, &name) {
+            continue;
+        }
+        let Some(subsysnqn) = read_attr(&subsys, "subsysnqn") else {
+            continue;
+        };
+        let mut hostnqns: Vec<String> = Vec::new();
+        let push = |nqn: String, hostnqns: &mut Vec<String>| {
+            if !hostnqns.contains(&nqn) {
+                hostnqns.push(nqn);
+            }
+        };
+        // The subsystem dir's own controller entries first (symlinks
+        // resolve as dirs through `is_dir()`).
+        let mut saw_controller_entry = false;
+        for entry in fs::read_dir(&subsys)? {
+            let entry = entry?;
+            let child = entry.file_name().to_string_lossy().to_string();
+            if !is_controller_entry_name(&child) || !entry.path().is_dir() {
+                continue;
+            }
+            saw_controller_entry = true;
+            if let Some(nqn) = read_attr(&entry.path(), "hostnqn") {
+                push(nqn, &mut hostnqns);
+            }
+        }
+        if !saw_controller_entry {
+            // Link-less fallback: every controller whose subsysnqn attr
+            // matches (the pre-scoping approximation — exact on stock
+            // kernels, where one subsysnqn is one subsystem).
+            for ctrl in sorted_child_dirs(nvme_root)? {
+                if attr_matches(&ctrl, "subsysnqn", &subsysnqn)? {
+                    if let Some(nqn) = read_attr(&ctrl, "hostnqn") {
+                        push(nqn, &mut hostnqns);
+                    }
+                }
+            }
+        }
+        if hostnqns.len() > 1 {
+            hostnqns.sort();
+            return Ok(Some(MultipathMergedShape {
+                head: dev_path.to_string(),
+                subsysnqn,
+                hostnqns,
+            }));
+        }
+        return Ok(None);
+    }
+    Ok(None)
+}
+
+/// [`multipath_merged_shape_at`] on the real sysfs roots.
+pub fn multipath_merged_shape(dev_path: &str) -> std::io::Result<Option<MultipathMergedShape>> {
+    multipath_merged_shape_at(
+        Path::new(SYSFS_NVME_SUBSYSTEM),
+        Path::new(SYSFS_NVME),
+        dev_path,
+    )
+}
+
 /// §5.2 rule 1's resolution half: the namespace block device serving
 /// `subnqn` **under a controller carrying OUR identity** — never a
 /// global/operator-shared device path. Two co-located mounts of one
@@ -452,6 +569,12 @@ pub struct VolumeShape<'a> {
     /// (rule 2's sysfs answer) — empty = no fabric controller (file,
     /// zram, local PCIe).
     pub actual: &'a [HostIdentity],
+    /// rung 5b: the multipath-MERGED shape under the device path, when
+    /// detected ([`multipath_merged_shape_at`]) — upgrades rule 2's
+    /// refusal to name the shape and both remedies. `None` = not a
+    /// merged head (or detection not run — the generic rule-2 text
+    /// still protects).
+    pub multipath_merged: Option<&'a MultipathMergedShape>,
 }
 
 /// The ladder's accept arms.
@@ -501,6 +624,34 @@ pub fn fabric_ladder_verdict(
     // daemon's OWN resolved device is the wiring's job).
     if shape.plane == FabricPlane::Data && shape.has_endpoint_record {
         return Ok(LadderOutcome::DaemonConnect);
+    }
+    // Shape (i), the multipath-MERGED face (rung 5b): a subsystem head
+    // served by >1 distinct hostnqn refuses NAMING the shape and both
+    // remedies — ahead of (and independent of) the generic foreign-pair
+    // find, because a merged head must refuse even when half-populated
+    // identities empty the HostIdentity census.
+    if let Some(merged) = shape.multipath_merged {
+        return Err(format!(
+            "mount refused (rule 2, design-full-multi-writer §5.2, rung 5b): {} '{}' rides \
+             the MULTIPATH-MERGED shape — subsystem head {} ({}) is served by controllers \
+             carrying {} distinct hostnqns ({}). nvme_core.multipath=Y kernels group fabric \
+             controllers by subsysnqn IGNORING hostnqn, so co-located identities' paths \
+             merge under ONE shared head whose round-robin voids per-mount device fencing. \
+             Remedies: boot the sqz kernel with nvme_core.fabrics_host_scoped_subsystems=Y \
+             (host-scoped fabric subsystems — each identity gets its own subsystem head and \
+             /dev node; docs/design-mw-multipath-kernel.md), or boot a stock kernel with \
+             nvme_core.multipath=N (per-controller namespace nodes — the documented \
+             stock-kernel workaround)",
+            match shape.plane {
+                FabricPlane::Meta => "META volume",
+                FabricPlane::Data => "data volume",
+            },
+            shape.descriptor,
+            merged.head,
+            merged.subsysnqn,
+            merged.hostnqns.len(),
+            merged.hostnqns.join(", "),
+        ));
     }
     // Shape (i): rule 2 — a foreign actual identity under the device
     // path this mount WOULD use refuses on both planes.

@@ -143,8 +143,16 @@ fn test_multipath_merged_shape_rides_the_same_injection_seam() {
     assert_eq!(merged.hostnqns.len(), 2, "{:?}", merged.hostnqns);
 
     // Same-identity second path: not merged.
-    std::fs::write(nvme.join("nvme1").join("hostnqn"), format!("{}\n", host_a.1)).unwrap();
-    std::fs::write(nvme.join("nvme1").join("hostid"), format!("{}\n", hostid_a.1)).unwrap();
+    std::fs::write(
+        nvme.join("nvme1").join("hostnqn"),
+        format!("{}\n", host_a.1),
+    )
+    .unwrap();
+    std::fs::write(
+        nvme.join("nvme1").join("hostid"),
+        format!("{}\n", hostid_a.1),
+    )
+    .unwrap();
     assert_eq!(
         multipath_merged_shape_at(&subsys, &nvme, "/dev/nvme0n1").expect("walk must not error"),
         None,

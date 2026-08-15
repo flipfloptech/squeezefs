@@ -834,7 +834,12 @@ fn multipath_merged_shape_non_head_and_identityless_paths_are_none() {
     );
     // A head served by identity-LESS controllers (local PCIe under
     // multipath=Y): zero hostnqns, never merged.
-    mk_entry(&nvme, "nvme2", &[("subsysnqn", "pcie-subsys")], &["nvme2c2n1"]);
+    mk_entry(
+        &nvme,
+        "nvme2",
+        &[("subsysnqn", "pcie-subsys")],
+        &["nvme2c2n1"],
+    );
     mk_entry(
         &subsys,
         "nvme-subsys2",

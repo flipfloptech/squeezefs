@@ -4893,11 +4893,22 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         );
                         Vec::new()
                     });
+                // rung 5b: detect the multipath-MERGED shape so the
+                // rule-2 refusal can name it + both remedies.
+                let merged = squeezefs::nvmeof::initiator::multipath_merged_shape(path)
+                    .unwrap_or_else(|e| {
+                        log::warn!(
+                            "multipath-merged sysfs walk failed for {path}: {e} — reading \
+                             as not-merged (the generic rule-2 text still protects)"
+                        );
+                        None
+                    });
                 let shape = squeezefs::nvmeof::initiator::VolumeShape {
                     plane: squeezefs::nvmeof::initiator::FabricPlane::Meta,
                     descriptor: path,
                     has_endpoint_record: false,
                     actual: &actual,
+                    multipath_merged: merged.as_ref(),
                 };
                 match squeezefs::nvmeof::initiator::fabric_ladder_verdict(
                     fabric_identity.as_ref(),
@@ -5139,11 +5150,24 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             );
                             Vec::new()
                         });
+                    // rung 5b: merged-shape detection on the path this
+                    // mount WOULD use (record-covered volumes never
+                    // open it — DaemonConnect wins ahead of rule 2).
+                    let merged =
+                        fab::multipath_merged_shape(&rec.backing_dev).unwrap_or_else(|e| {
+                            log::warn!(
+                                "multipath-merged sysfs walk failed for {}: {e} — reading \
+                                 as not-merged (the generic rule-2 text still protects)",
+                                rec.backing_dev
+                            );
+                            None
+                        });
                     let shape = fab::VolumeShape {
                         plane: fab::FabricPlane::Data,
                         descriptor: &rec.id,
                         has_endpoint_record: endpoint.is_some(),
                         actual: &actual,
+                        multipath_merged: merged.as_ref(),
                     };
                     match fab::fabric_ladder_verdict(Some(identity), &shape) {
                         Ok(fab::LadderOutcome::DaemonConnect) => {

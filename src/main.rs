@@ -408,6 +408,16 @@ enum Commands {
         #[arg(long, value_delimiter = ',', alias = "cache-dir")]
         disk_cache_paths: Option<Vec<PathBuf>>,
 
+        /// Rejected at mount time: fabric coordinates are declared by
+        /// the administrator
+        ///
+        /// A data volume's NVMe-oF connect coordinates are durable
+        /// records written by `squeezefs config set-fabric-endpoints`;
+        /// mount reads them and can never override them. Passing this
+        /// flag is an error, never a silent ignore.
+        #[arg(long, value_delimiter = ',')]
+        fabric_endpoints: Option<Vec<String>>,
+
         /// SqueezeFS LVM/Physical Data Volume paths
         #[arg(
             long,
@@ -1047,6 +1057,20 @@ enum NvmeofActions {
         /// caps the request at the target's limit. Minimum 1.
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
         nr_io_queues: Option<u32>,
+
+        /// Host NQN this connection presents (pair with --hostid)
+        ///
+        /// Per-connection host identity: each distinct hostnqn/hostid
+        /// pair is its own PR registrant on the target. Default: the
+        /// /etc/nvme convention. Pair-or-neither: configuring one
+        /// without the other is an error (a mismatched pair is how
+        /// registrants alias).
+        #[arg(long, requires = "hostid")]
+        hostnqn: Option<String>,
+
+        /// Host ID this connection presents (pair with --hostnqn)
+        #[arg(long, requires = "hostnqn")]
+        hostid: Option<String>,
     },
     /// Disconnect local client from a remote NVMe-oF target
     Disconnect {
@@ -1447,6 +1471,28 @@ enum ConfigActions {
     },
     /// Show the staging/cache directories recorded at format
     GetCachePaths {
+        /// Metadata URI (sqmeta://...) of the filesystem to inspect
+        uri: String,
+    },
+    /// Declare data volumes' NVMe-oF connect coordinates
+    ///
+    /// Writes one durable record per named volume. Guarded like format:
+    /// fails while any client has the volume mounted. Under an explicit
+    /// per-mount host identity (-o hostnqn=/hostid=), mount connects its
+    /// own controllers from these records — mount itself can never set
+    /// or override them.
+    SetFabricEndpoints {
+        /// Metadata URI (sqmeta://...) of the filesystem to change
+        uri: String,
+        /// Specs: <vol-id>=<traddr>:<trsvcid>:<subnqn>
+        ///
+        /// The vol-id is the durable volume id (see `squeezefs volume
+        /// list`). Bracket an IPv6 traddr: [::1]:4420:nqn...
+        #[arg(required = true)]
+        endpoints: Vec<String>,
+    },
+    /// Show the recorded fabric-endpoint coordinates per data volume
+    GetFabricEndpoints {
         /// Metadata URI (sqmeta://...) of the filesystem to inspect
         uri: String,
     },
@@ -2476,6 +2522,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
+    // KD-MW-15 (design-full-multi-writer §5.2 rule 1): a data volume's
+    // fabric connect coordinates are DURABLE ADMIN-DECLARED records —
+    // mount reads them and can never override them (the cache-path-policy
+    // precedent verbatim: a mount-line coordinate flag is a LOUD error,
+    // never a silent ignore). Checked before daemonizing: instant.
+    if let Commands::Mount {
+        fabric_endpoints: Some(_),
+        ..
+    } = &cli.command
+    {
+        eprintln!(
+            "Error: fabric-endpoint coordinates are declared by the administrator; use \
+             `squeezefs config set-fabric-endpoints` to change them (mount does not accept \
+             --fabric-endpoints — mount reads the durable records, never overrides them)"
+        );
+        std::process::exit(1);
+    }
+
     // Mountpoint preflight in the PARENT, before daemonizing and before any
     // volume is touched: the daemon's refusal conditions (exists / is a
     // directory / is empty / not a stale attachment) fail instantly with a
@@ -3446,12 +3510,19 @@ fn dispatch_nvmeof(action: NvmeofActions) -> Result<(), squeezefs::nvmeof::stack
             host_traddr,
             host_iface,
             nr_io_queues,
+            hostnqn,
+            hostid,
         } => {
             println!("Connecting to NVMe-oF target at {}:{}...", ip, port);
+            // Pair-or-neither is enforced by clap (`requires` both ways).
+            let identity = hostnqn.zip(hostid).map(|(hostnqn, hostid)| {
+                squeezefs::meta_backend::reservation::HostIdentity { hostnqn, hostid }
+            });
             let opts = squeezefs::nvmeof::ConnectOptions {
                 host_traddr,
                 host_iface,
                 nr_io_queues,
+                identity,
             };
             let dev = squeezefs::nvmeof::connect_target(&ip, port, &subnqn, &opts)?;
             if dev.starts_with("/dev/") {
@@ -4519,6 +4590,9 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             mem_cache_size,
             disk_cache_size,
             disk_cache_paths: _,
+            // Rejected pre-daemonize in `main` (KD-MW-15): mount reads the
+            // durable fabric_endpoint: records, never overrides them.
+            fabric_endpoints: _,
             data_lv: backing_dev,
             ip: _,
             port: _,
@@ -4635,6 +4709,69 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                      Admission runs a five-rung ladder and refuses loudly naming the rung; see \
                      docs/operations.md §Multi-writer co-writer mounts."
                 );
+            }
+
+            // KD-MW-3 (design-full-multi-writer §5.2): the EXPLICIT
+            // per-mount host identity — pair-or-neither, option > env per
+            // field. Resolved before any volume is touched, because it
+            // decides how the data plane's devices are reached at all.
+            let fabric_identity =
+                match squeezefs::nvmeof::initiator::explicit_host_identity(options.as_deref()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("\x1b[91mERROR\x1b[0m mount refused: {e}");
+                        return Err(e.into());
+                    }
+                };
+            if let Some(id) = &fabric_identity {
+                println!(
+                    "Per-mount NVMe-oF host identity ENGAGED (KD-MW-3): hostnqn={} hostid={} — \
+                     this mount is its own PR registrant; data-plane connects are daemon-owned \
+                     from the durable fabric_endpoint: records, and every backing device's \
+                     ACTUAL controller identity is verified (rule 2).",
+                    id.hostnqn, id.hostid
+                );
+            }
+
+            // §5.2 rule 2 + the bootstrap exemption (KD-MW-15): the META
+            // volumes are operator-established connections — verify each
+            // device's ACTUAL controller identity from sysfs. Matching =
+            // accepted; mismatching = refused loud; no fabric controller
+            // (file/zram/local-PCIe backing) = verification inapplicable,
+            // stated loud — never silently-as-verified.
+            for path in &meta_lvs {
+                let actual = squeezefs::nvmeof::initiator::controller_identities_for_device(path)
+                    .unwrap_or_else(|e| {
+                        log::warn!(
+                            "rule-2 sysfs walk failed for {path}: {e} — reading as no \
+                                    fabric controller identity"
+                        );
+                        Vec::new()
+                    });
+                let shape = squeezefs::nvmeof::initiator::VolumeShape {
+                    plane: squeezefs::nvmeof::initiator::FabricPlane::Meta,
+                    descriptor: path,
+                    has_endpoint_record: false,
+                    actual: &actual,
+                };
+                match squeezefs::nvmeof::initiator::fabric_ladder_verdict(
+                    fabric_identity.as_ref(),
+                    &shape,
+                ) {
+                    Ok(squeezefs::nvmeof::initiator::LadderOutcome::AcceptUnverified) => {
+                        log::warn!(
+                            "META volume {path}: explicit per-mount identity is configured but \
+                             the device carries no fabric controller identity — rule-2 \
+                             verification is INAPPLICABLE on this substrate (the bootstrap \
+                             exemption accepts it, stated loud)"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("\x1b[91mERROR\x1b[0m {e}");
+                        return Err(e.into());
+                    }
+                }
             }
 
             // Version-gated bootstrap (PR K6a): root-inode presence and
@@ -4822,13 +4959,142 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // VL4: retired records are id-tombstones (path cleared, kept
             // forever — KD-5); the mount registers `Active|Draining|
             // disabled` members only.
-            let mount_records: Vec<squeezefs::DataVolumeRecord> = volume_records
+            let mut mount_records: Vec<squeezefs::DataVolumeRecord> = volume_records
                 .iter()
                 .filter(|r| r.state != squeezefs::VOL_STATE_RETIRED)
                 .cloned()
                 .collect();
             if mount_records.is_empty() {
                 return Err("Error: no data volumes specified or configured".into());
+            }
+
+            // §5.2 rules 1–2, the DATA plane (KD-MW-15): under explicit
+            // identity every data volume resolves through a DAEMON-OWNED
+            // controller from its durable fabric_endpoint: record — never
+            // an operator-shared/global device path — and the full
+            // refusal ladder runs per volume (missing record refuses
+            // naming the verb, UNIFORMLY; a foreign-identity path refuses
+            // naming rule 2). Without explicit identity nothing changes.
+            if let Some(identity) = &fabric_identity {
+                use squeezefs::nvmeof::initiator as fab;
+                let endpoint_rows = squeezefs::config_ops::get_fabric_endpoints(&meta_lvs)
+                    .await
+                    .map_err(|e| format!("cannot read fabric_endpoint records: {e}"))?;
+                for rec in &mut mount_records {
+                    let endpoint = endpoint_rows
+                        .iter()
+                        .find(|(r, _)| r.id == rec.id)
+                        .and_then(|(_, ep)| ep.clone());
+                    let actual = fab::controller_identities_for_device(&rec.backing_dev)
+                        .unwrap_or_else(|e| {
+                            log::warn!(
+                                "rule-2 sysfs walk failed for {}: {e} — reading as no fabric \
+                                 controller identity",
+                                rec.backing_dev
+                            );
+                            Vec::new()
+                        });
+                    let shape = fab::VolumeShape {
+                        plane: fab::FabricPlane::Data,
+                        descriptor: &rec.id,
+                        has_endpoint_record: endpoint.is_some(),
+                        actual: &actual,
+                    };
+                    match fab::fabric_ladder_verdict(Some(identity), &shape) {
+                        Ok(fab::LadderOutcome::DaemonConnect) => {
+                            let ep = endpoint.expect("DaemonConnect implies a record");
+                            // Idempotent remount: a controller already
+                            // riding OUR OWN per-mount identity can only
+                            // be this mount's — reuse it; otherwise issue
+                            // the daemon's own fabrics connect from the
+                            // record and resolve the namespace UNDER OUR
+                            // CONTROLLER (never the global subnqn walk).
+                            let resolved =
+                                match fab::find_device_for_nqn_under_identity(&ep.subnqn, identity)
+                                {
+                                    Ok(Some(dev)) => dev,
+                                    Ok(None) => {
+                                        let port: u16 = ep.trsvcid.parse().map_err(|_| {
+                                            format!(
+                                                "fabric_endpoint record for volume '{}' carries \
+                                             non-numeric trsvcid '{}' — re-declare it with \
+                                             `squeezefs config set-fabric-endpoints`",
+                                                rec.id, ep.trsvcid
+                                            )
+                                        })?;
+                                        let opts = fab::ConnectOptions {
+                                            identity: Some(identity.clone()),
+                                            ..Default::default()
+                                        };
+                                        squeezefs::nvmeof::connect_target(
+                                            &ep.traddr, port, &ep.subnqn, &opts,
+                                        )
+                                        .map_err(|e| {
+                                            format!(
+                                                "daemon-owned connect for data volume '{}' \
+                                             ({}) failed: {e}",
+                                                rec.id,
+                                                ep.render()
+                                            )
+                                        })?;
+                                        fab::find_device_for_nqn_under_identity(
+                                            &ep.subnqn, identity,
+                                        )
+                                        .map_err(|e| format!("post-connect sysfs walk: {e}"))?
+                                        .ok_or_else(
+                                            || {
+                                                format!(
+                                                    "daemon-owned connect for data volume '{}' \
+                                                 ({}) produced no namespace under this \
+                                                 mount's identity (hostnqn={})",
+                                                    rec.id,
+                                                    ep.render(),
+                                                    identity.hostnqn
+                                                )
+                                            },
+                                        )?
+                                    }
+                                    Err(e) => {
+                                        return Err(format!(
+                                            "identity-scoped device resolution failed for data \
+                                         volume '{}': {e}",
+                                            rec.id
+                                        )
+                                        .into());
+                                    }
+                                };
+                            // Post-connect rule-2 re-verification of the
+                            // daemon's OWN resolved device (defense in
+                            // depth — a mismatch here is a broken fabric).
+                            let post = fab::controller_identities_for_device(&resolved)
+                                .unwrap_or_default();
+                            if post.iter().any(|id| id != identity) {
+                                return Err(format!(
+                                    "mount refused (rule 2): the daemon-owned device {} for \
+                                     data volume '{}' reports a controller identity that is \
+                                     not this mount's configured pair — the fabric is \
+                                     mis-sharing the subsystem",
+                                    resolved, rec.id
+                                )
+                                .into());
+                            }
+                            log::info!(
+                                "data volume '{}': daemon-owned controller resolved at {} \
+                                 (record {}, hostnqn={})",
+                                rec.id,
+                                resolved,
+                                ep.render(),
+                                identity.hostnqn
+                            );
+                            rec.backing_dev = resolved;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            eprintln!("\x1b[91mERROR\x1b[0m {e}");
+                            return Err(e.into());
+                        }
+                    }
+                }
             }
             let resolved_data_lvs: Vec<String> = mount_records
                 .iter()
@@ -5749,6 +6015,39 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             );
                         }
                         _ => println!("none (cache-less)"),
+                    }
+                }
+                ConfigActions::SetFabricEndpoints { uri, endpoints } => {
+                    let meta_lvs = parse_block_uri(&uri, "sqmeta://")?;
+                    let mut entries = Vec::with_capacity(endpoints.len());
+                    for spec in &endpoints {
+                        entries.push(
+                            squeezefs::config_ops::parse_fabric_endpoint_spec(spec)
+                                .map_err(|e| format!("{e}"))?,
+                        );
+                    }
+                    squeezefs::config_ops::set_fabric_endpoints(&meta_lvs, &entries)
+                        .await
+                        .map_err(|e| format!("cannot set fabric endpoints: {e}"))?;
+                    for (vol_id, ep) in &entries {
+                        println!("{vol_id}\t{}", ep.render());
+                    }
+                    println!(
+                        "Fabric endpoints recorded (durable). Mounts with an explicit \
+                         per-mount host identity connect their own controllers from these \
+                         records (KD-MW-15)."
+                    );
+                }
+                ConfigActions::GetFabricEndpoints { uri } => {
+                    let meta_lvs = parse_block_uri(&uri, "sqmeta://")?;
+                    let rows = squeezefs::config_ops::get_fabric_endpoints(&meta_lvs)
+                        .await
+                        .map_err(|e| format!("cannot read fabric endpoints: {e}"))?;
+                    for (rec, ep) in rows {
+                        match ep {
+                            Some(ep) => println!("{}\t{}", rec.id, ep.render()),
+                            None => println!("{}\tnone", rec.id),
+                        }
                     }
                 }
                 ConfigActions::DiskCache(action) => {

@@ -3844,6 +3844,38 @@ impl KvMetaBackend {
                 Err(e) => return Err(self.pr_error("reservation acquire", e)),
             }
             self.pr_active.store(true, Ordering::Release);
+
+            // §5.4 (design-full-multi-writer) — the shared-identity
+            // gauge, computed from ACTUAL identities (the device's
+            // report + this association's wire host id, never configured
+            // strings): another registration under OUR host identifier
+            // means the device sees ONE host for two holders, so fencing
+            // between those mounts is process-local, not
+            // device-enforced. Loud warning + `pr_registrant_shared`.
+            let shared_probe = async {
+                let report = rsv_call(&rsv, |c| c.report()).await.ok()?;
+                let wire = rsv_call(&rsv, |c| c.wire_host_id()).await.ok()?;
+                Some(
+                    crate::meta_backend::reservation::registrant_identity_shared(
+                        &report, key, &wire,
+                    ),
+                )
+            }
+            .await;
+            if let Some(true) = shared_probe {
+                log::warn!(
+                    "meta volume {}: the device reports ANOTHER registration under this \
+                     association's host identifier — a co-located mount is sharing this \
+                     mount's hostnqn/hostid pair, so fencing between the two is \
+                     PROCESS-LOCAL, not device-enforced (design-full-multi-writer §5.4). \
+                     Give each mount its own identity (SQUEEZEFS_HOSTNQN/SQUEEZEFS_HOSTID \
+                     or -o hostnqn=/hostid=) to restore the device-enforced class",
+                    self.path.display()
+                );
+                crate::fuse_client::METRICS
+                    .pr_registrant_shared
+                    .store(1, Ordering::Relaxed);
+            }
         }
 
         // Ring-recovery preflight (the preserved 2026-07-26 md-storm

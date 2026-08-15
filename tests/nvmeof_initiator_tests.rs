@@ -402,6 +402,7 @@ fn test_nvme_cli_args_combined_options_extend_the_base() {
         host_traddr: Some("10.0.0.2".to_string()),
         host_iface: Some("eth1".to_string()),
         nr_io_queues: Some(4),
+        identity: None,
     };
     let args = nvme_cli_connect_args("10.0.0.1", 4420, NQN_A, &opts);
     let base = nvme_cli_connect_args("10.0.0.1", 4420, NQN_A, &ConnectOptions::default());
@@ -457,6 +458,7 @@ fn test_fabrics_string_maps_options_to_kernel_option_names() {
             host_traddr: Some("10.0.0.2".to_string()),
             host_iface: Some("eth1".to_string()),
             nr_io_queues: Some(8),
+            identity: None,
         },
     );
     for needle in ["host_traddr=10.0.0.2", "host_iface=eth1", "nr_io_queues=8"] {

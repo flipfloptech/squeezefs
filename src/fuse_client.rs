@@ -4608,6 +4608,14 @@ pub struct Metrics {
     /// §5.1.2 reserved-xattr screen refusals (get/set/remove on a
     /// reserved internal name through FUSE) — tamper-attempt tripwire.
     pub fuse_reserved_xattr_refusals: Align64<AtomicU64>,
+    /// design-full-multi-writer §5.4 (KD-MW-3): 0/1 — the device
+    /// reported another registration under THIS association's host
+    /// identifier (a co-located mount sharing our hostnqn/hostid pair),
+    /// so fencing between the two mounts is process-local, not
+    /// device-enforced. Computed from ACTUAL identities (the
+    /// Reservation Report + the association's wire host id), never
+    /// configured strings; paired with the loud mount warning.
+    pub pr_registrant_shared: Align64<AtomicU64>,
     /// Job-fabric counters (design-volume-lifecycle §10, PR VL2).
     pub job_submitted: Align64<AtomicU64>,
     pub job_completed: Align64<AtomicU64>,
@@ -8807,6 +8815,7 @@ impl SqueezefsFilesystem {
                 "writeback_errors_latched": METRICS.writeback_errors_latched.load(Ordering::Relaxed),
                 "writeback_errors_reported": METRICS.writeback_errors_reported.load(Ordering::Relaxed),
                 "fuse_reserved_xattr_refusals": METRICS.fuse_reserved_xattr_refusals.load(Ordering::Relaxed),
+                "pr_registrant_shared": METRICS.pr_registrant_shared.load(Ordering::Relaxed),
                 "job_submitted": METRICS.job_submitted.load(Ordering::Relaxed),
                 "job_completed": METRICS.job_completed.load(Ordering::Relaxed),
                 "job_cancelled": METRICS.job_cancelled.load(Ordering::Relaxed),

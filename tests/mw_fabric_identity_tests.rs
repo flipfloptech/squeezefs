@@ -57,16 +57,14 @@ const NQN_SUBSYS: &str = "nqn.2026-08.io.squeezefs:mwvol-aaaa";
 
 fn id_a() -> HostIdentity {
     HostIdentity {
-        hostnqn: "nqn.2014-08.org.nvmexpress:uuid:aaaaaaaa-0000-0000-0000-000000000001"
-            .to_string(),
+        hostnqn: "nqn.2014-08.org.nvmexpress:uuid:aaaaaaaa-0000-0000-0000-000000000001".to_string(),
         hostid: "aaaaaaaa-0000-0000-0000-000000000001".to_string(),
     }
 }
 
 fn id_b() -> HostIdentity {
     HostIdentity {
-        hostnqn: "nqn.2014-08.org.nvmexpress:uuid:bbbbbbbb-0000-0000-0000-000000000002"
-            .to_string(),
+        hostnqn: "nqn.2014-08.org.nvmexpress:uuid:bbbbbbbb-0000-0000-0000-000000000002".to_string(),
         hostid: "bbbbbbbb-0000-0000-0000-000000000002".to_string(),
     }
 }
@@ -127,7 +125,10 @@ fn explicit_identity_mount_options_win_over_env_per_field() {
         .expect("option+env merged pair is valid")
         .expect("pair present");
     assert_eq!(got.hostnqn, b.hostnqn, "-o hostnqn= wins over the env knob");
-    assert_eq!(got.hostid, a.hostid, "unoverridden field keeps the env value");
+    assert_eq!(
+        got.hostid, a.hostid,
+        "unoverridden field keeps the env value"
+    );
 }
 
 #[test]
@@ -189,8 +190,14 @@ fn fabric_endpoint_future_version_refuses_loud() {
         trsvcid: "4420".to_string(),
         subnqn: NQN_SUBSYS.to_string(),
     };
+    // A FUTURE binary writes a well-formed (checksummed) image under the
+    // next version: bump the version byte and re-checksum, exactly as
+    // that binary would.
     let mut bytes = ep.encode();
+    bytes.truncate(bytes.len() - 8);
     bytes[0] = bytes[0].wrapping_add(1);
+    let sum = xxhash_rust::xxh3::xxh3_64(&bytes);
+    bytes.extend_from_slice(&sum.to_le_bytes());
     let err = FabricEndpoint::decode(&bytes)
         .expect_err("a future record version refuses loud (forward-only)");
     assert!(
@@ -264,7 +271,10 @@ fn endpoint_spec_parses_with_colons_in_the_nqn() {
     assert_eq!(vol, "vol-0000000000000001");
     assert_eq!(ep.traddr, "127.0.0.1");
     assert_eq!(ep.trsvcid, "54129");
-    assert_eq!(ep.subnqn, NQN_SUBSYS, "NQNs carry colons — split first-two only");
+    assert_eq!(
+        ep.subnqn, NQN_SUBSYS,
+        "NQNs carry colons — split first-two only"
+    );
 }
 
 #[test]
@@ -280,13 +290,13 @@ fn endpoint_spec_parses_bracketed_ipv6_traddr() {
 #[test]
 fn endpoint_spec_malformed_shapes_refuse_loud() {
     for bad in [
-        "vol-0000000000000001",                    // no '='
-        "vol-0000000000000001=127.0.0.1",          // missing trsvcid+subnqn
-        "vol-0000000000000001=127.0.0.1:4420",     // missing subnqn
-        "=127.0.0.1:4420:nqn.x",                   // empty vol id
-        "vol-0000000000000001=127.0.0.1::nqn.x",   // empty trsvcid
-        "vol-0000000000000001=:4420:nqn.x",        // empty traddr
-        "vol-0000000000000001=[::1:4420:nqn.x",    // unterminated bracket
+        "vol-0000000000000001",                  // no '='
+        "vol-0000000000000001=127.0.0.1",        // missing trsvcid+subnqn
+        "vol-0000000000000001=127.0.0.1:4420",   // missing subnqn
+        "=127.0.0.1:4420:nqn.x",                 // empty vol id
+        "vol-0000000000000001=127.0.0.1::nqn.x", // empty trsvcid
+        "vol-0000000000000001=:4420:nqn.x",      // empty traddr
+        "vol-0000000000000001=[::1:4420:nqn.x",  // unterminated bracket
     ] {
         let err = parse_fabric_endpoint_spec(bad)
             .map(|_| ())
@@ -342,7 +352,11 @@ fn actual_identity_reads_from_the_serving_controller() {
 
     let ids = controller_identities_for_device_at(&subsys, &nvme, "/dev/nvme0n1")
         .expect("walk must not error");
-    assert_eq!(ids, vec![a], "the controller's hostnqn/hostid attrs verbatim");
+    assert_eq!(
+        ids,
+        vec![a],
+        "the controller's hostnqn/hostid attrs verbatim"
+    );
 }
 
 #[test]
@@ -356,11 +370,20 @@ fn actual_identity_multipath_head_node_collects_every_serving_controller() {
     // identities — a shared head node can never verify as dedicated.
     mk_entry(&nvme, "nvme0", &ctrl_attrs(NQN_SUBSYS, &a), &["nvme0c0n1"]);
     mk_entry(&nvme, "nvme1", &ctrl_attrs(NQN_SUBSYS, &b), &["nvme1c1n1"]);
-    mk_entry(&subsys, "nvme-subsys0", &[("subsysnqn", NQN_SUBSYS)], &["nvme0n1"]);
+    mk_entry(
+        &subsys,
+        "nvme-subsys0",
+        &[("subsysnqn", NQN_SUBSYS)],
+        &["nvme0n1"],
+    );
 
     let ids = controller_identities_for_device_at(&subsys, &nvme, "/dev/nvme0n1")
         .expect("walk must not error");
-    assert_eq!(ids.len(), 2, "both serving controllers' identities: {ids:?}");
+    assert_eq!(
+        ids.len(),
+        2,
+        "both serving controllers' identities: {ids:?}"
+    );
     assert!(ids.contains(&a) && ids.contains(&b));
 }
 
@@ -410,8 +433,16 @@ fn identity_resolution_two_controllers_one_subnqn_pick_our_own() {
         .expect("walk must not error");
     let dev_b = find_device_for_nqn_under_identity_at(&subsys, &nvme, NQN_SUBSYS, &b)
         .expect("walk must not error");
-    assert_eq!(dev_a.as_deref(), Some("/dev/nvme0n1"), "mount A's controller");
-    assert_eq!(dev_b.as_deref(), Some("/dev/nvme1n1"), "mount B's controller");
+    assert_eq!(
+        dev_a.as_deref(),
+        Some("/dev/nvme0n1"),
+        "mount A's controller"
+    );
+    assert_eq!(
+        dev_b.as_deref(),
+        Some("/dev/nvme1n1"),
+        "mount B's controller"
+    );
 }
 
 #[test]
@@ -437,7 +468,12 @@ fn identity_resolution_multipath_head_only_when_dedicated() {
     // Dedicated multipath: every controller of the subsystem is OURS —
     // the head node is safely this mount's.
     mk_entry(&nvme, "nvme0", &ctrl_attrs(NQN_SUBSYS, &a), &["nvme0c0n1"]);
-    mk_entry(&subsys, "nvme-subsys0", &[("subsysnqn", NQN_SUBSYS)], &["nvme0n1"]);
+    mk_entry(
+        &subsys,
+        "nvme-subsys0",
+        &[("subsysnqn", NQN_SUBSYS)],
+        &["nvme0n1"],
+    );
     assert_eq!(
         find_device_for_nqn_under_identity_at(&subsys, &nvme, NQN_SUBSYS, &a)
             .expect("walk must not error")
@@ -448,7 +484,12 @@ fn identity_resolution_multipath_head_only_when_dedicated() {
 
     // Shared multipath: a foreign controller also serves the subsystem —
     // the head node round-robins BOTH identities and must never resolve.
-    mk_entry(&nvme, "nvme1", &ctrl_attrs(NQN_SUBSYS, &id_b()), &["nvme1c1n1"]);
+    mk_entry(
+        &nvme,
+        "nvme1",
+        &ctrl_attrs(NQN_SUBSYS, &id_b()),
+        &["nvme1c1n1"],
+    );
     assert_eq!(
         find_device_for_nqn_under_identity_at(&subsys, &nvme, NQN_SUBSYS, &a)
             .expect("walk must not error"),
@@ -474,11 +515,13 @@ fn nvme_cli_args_carry_the_explicit_identity_pair() {
         },
     );
     assert!(
-        args.windows(2).any(|w| w == ["--hostnqn", a.hostnqn.as_str()]),
+        args.windows(2)
+            .any(|w| w == ["--hostnqn", a.hostnqn.as_str()]),
         "--hostnqn passes through: {args:?}"
     );
     assert!(
-        args.windows(2).any(|w| w == ["--hostid", a.hostid.as_str()]),
+        args.windows(2)
+            .any(|w| w == ["--hostid", a.hostid.as_str()]),
         "--hostid passes through: {args:?}"
     );
 
@@ -892,7 +935,8 @@ fn cli_mount_rejects_the_fabric_endpoints_flag_naming_the_verb() {
         .arg(&mnt)
         .arg("--fabric-endpoints")
         .arg(format!("vol-0000000000000001=127.0.0.1:4420:{NQN_SUBSYS}"));
-    let (out, elapsed) = run_with_deadline(cmd, Duration::from_secs(10), "mount --fabric-endpoints");
+    let (out, elapsed) =
+        run_with_deadline(cmd, Duration::from_secs(10), "mount --fabric-endpoints");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         !out.status.success(),
@@ -931,7 +975,10 @@ fn cli_mount_pair_or_neither_refusal_is_instant() {
         !out.status.success(),
         "-o hostnqn= without hostid must refuse; stderr:\n{stderr}"
     );
-    assert!(elapsed < Duration::from_secs(5), "instant, took {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "instant, took {elapsed:?}"
+    );
     assert!(
         stderr.contains("hostid"),
         "names the missing half: {stderr}"
@@ -966,7 +1013,8 @@ fn cli_mount_explicit_identity_without_records_refuses_never_inert() {
             .arg(format!("sqmeta://{}", meta.display()))
             .arg(&mnt);
         if let Some((nqn, hid)) = &env_pair {
-            cmd.env("SQUEEZEFS_HOSTNQN", nqn).env("SQUEEZEFS_HOSTID", hid);
+            cmd.env("SQUEEZEFS_HOSTNQN", nqn)
+                .env("SQUEEZEFS_HOSTID", hid);
         }
         if !opt.is_empty() {
             cmd.arg("-o").arg(&opt);

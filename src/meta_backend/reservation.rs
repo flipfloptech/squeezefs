@@ -97,6 +97,32 @@ impl ReservationReport {
     }
 }
 
+/// §5.2 rule 2's gauge input (design-full-multi-writer, KD-MW-3 /
+/// `pr_registrant_shared`): does the device attribute ANOTHER
+/// registration (a different rkey) to OUR association's Host
+/// Identifier? That is the shared-identity shape — two co-located
+/// mounts riding one hostnqn/hostid pair, so the device sees ONE host
+/// for both and fencing between them degrades to process-local.
+///
+/// Computed from the device's ACTUAL answer (the Reservation Report's
+/// registrant host ids vs the association's `wire_host_id`), never from
+/// configured strings — a shared-connection degradation can never hide
+/// behind a configured-but-inert knob. An empty own wire id matches
+/// nothing (fail-closed, the register-ladder convention).
+pub fn registrant_identity_shared(
+    report: &ReservationReport,
+    our_key: u64,
+    our_wire_id: &[u8],
+) -> bool {
+    if our_wire_id.is_empty() {
+        return false;
+    }
+    report
+        .registrants
+        .iter()
+        .any(|r| r.rkey != our_key && r.host_id == our_wire_id)
+}
+
 /// The reservation-conflict errno class (design §5.0 B1 pt 3: "the
 /// kernel-mapped errno for the reservation-conflict block status —
 /// `EBADE` class; M1 pins the exact mapping"): the block layer maps

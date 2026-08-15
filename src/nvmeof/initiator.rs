@@ -34,10 +34,30 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use uuid::Uuid;
 
+use crate::meta_backend::reservation::HostIdentity;
+
 use super::fabric::{split_nvme_namespace, SYSFS_NVME, SYSFS_NVME_SUBSYSTEM};
 use super::{check_root, execute_cmd};
 
+/// KD-MW-3 (design-full-multi-writer §5.2): the per-mount host-identity
+/// knob pair. Registered in `src/env_knobs.rs` (ENG-10); the pair law
+/// itself lives in [`explicit_host_identity_from`], because a knob
+/// registry validates VALUES, never cross-knob constraints.
+pub const HOSTNQN_KNOB: &str = "SQUEEZEFS_HOSTNQN";
+/// See [`HOSTNQN_KNOB`].
+pub const HOSTID_KNOB: &str = "SQUEEZEFS_HOSTID";
+
 fn get_host_id() -> String {
+    // KD-MW-3 override arm: explicit wins verbatim (ENG-10 precedence).
+    // The pair-or-neither law was enforced at process entry
+    // (`explicit_host_identity`), so an individual read here can never
+    // observe a half-configured pair on a product path.
+    if let Ok(v) = std::env::var(HOSTID_KNOB) {
+        let v = v.trim().to_string();
+        if !v.is_empty() {
+            return v;
+        }
+    }
     if let Ok(content) = fs::read_to_string("/etc/nvme/hostid") {
         let trimmed = content.trim().to_string();
         if !trimmed.is_empty() {
@@ -51,6 +71,13 @@ fn get_host_id() -> String {
 }
 
 fn get_host_nqn() -> String {
+    // KD-MW-3 override arm — see `get_host_id`.
+    if let Ok(v) = std::env::var(HOSTNQN_KNOB) {
+        let v = v.trim().to_string();
+        if !v.is_empty() {
+            return v;
+        }
+    }
     if let Ok(content) = fs::read_to_string("/etc/nvme/hostnqn") {
         let trimmed = content.trim().to_string();
         if !trimmed.is_empty() {
@@ -61,6 +88,80 @@ fn get_host_nqn() -> String {
     let _ = fs::create_dir_all("/etc/nvme");
     let _ = fs::write("/etc/nvme/hostnqn", &new_nqn);
     new_nqn
+}
+
+/// One `-o` mount-option value by key (`hostnqn=` / `hostid=`), with the
+/// ENG-10 shape: a PRESENT key with an empty value is malformed (never
+/// silently absent — the `client_slot_from_options` parse-or-refuse
+/// posture, because identity has no safe default direction).
+fn identity_option(opts: Option<&str>, key: &str) -> Result<Option<String>, String> {
+    let Some(opts) = opts else { return Ok(None) };
+    for opt in opts.split(',') {
+        if let Some(v) = opt.trim().strip_prefix(key) {
+            let v = v.trim();
+            if v.is_empty() {
+                return Err(format!(
+                    "-o {key} carries an empty value — a malformed identity half is a refusal, \
+                     never a silent absence (KD-MW-3)"
+                ));
+            }
+            return Ok(Some(v.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+/// KD-MW-3: resolve the EXPLICIT per-mount host identity from injectable
+/// sources — env knob values and the `-o` mount-option string. Per field
+/// the option wins over the env knob (explicit > env, ENG-10); absent =
+/// unset/empty/whitespace. **Pair-or-neither**: a resolved half without
+/// its partner refuses loud, because a mount presenting an overridden
+/// hostnqn under the host's default hostid (or vice versa) is exactly
+/// how registrants alias on the device.
+///
+/// `None` = no explicit identity anywhere — today's `/etc/nvme` posture
+/// verbatim, the shipped default.
+pub fn explicit_host_identity_from(
+    env_nqn: Option<&str>,
+    env_id: Option<&str>,
+    options: Option<&str>,
+) -> Result<Option<HostIdentity>, String> {
+    let present = |v: Option<&str>| -> Option<String> {
+        v.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let nqn = match identity_option(options, "hostnqn=")? {
+        Some(v) => Some(v),
+        None => present(env_nqn),
+    };
+    let id = match identity_option(options, "hostid=")? {
+        Some(v) => Some(v),
+        None => present(env_id),
+    };
+    match (nqn, id) {
+        (None, None) => Ok(None),
+        (Some(hostnqn), Some(hostid)) => Ok(Some(HostIdentity { hostnqn, hostid })),
+        (Some(_), None) => Err(format!(
+            "per-mount host identity is PAIR-OR-NEITHER (KD-MW-3): hostnqn is configured \
+             ({HOSTNQN_KNOB} / -o hostnqn=) but hostid is not — set {HOSTID_KNOB} / \
+             -o hostid= too, or unset both. A hostnqn presented under the host's default \
+             hostid is how registrants alias on the device"
+        )),
+        (None, Some(_)) => Err(format!(
+            "per-mount host identity is PAIR-OR-NEITHER (KD-MW-3): hostid is configured \
+             ({HOSTID_KNOB} / -o hostid=) but hostnqn is not — set {HOSTNQN_KNOB} / \
+             -o hostnqn= too, or unset both. A hostid presented under the host's default \
+             hostnqn is how registrants alias on the device"
+        )),
+    }
+}
+
+/// [`explicit_host_identity_from`] over the live process environment.
+pub fn explicit_host_identity(options: Option<&str>) -> Result<Option<HostIdentity>, String> {
+    let env_nqn = std::env::var(HOSTNQN_KNOB).ok();
+    let env_id = std::env::var(HOSTID_KNOB).ok();
+    explicit_host_identity_from(env_nqn.as_deref(), env_id.as_deref(), options)
 }
 
 /// Sorted child directories of a sysfs class root. An absent root is an
@@ -157,6 +258,299 @@ fn find_device_for_nqn(subnqn: &str) -> std::io::Result<Option<String>> {
     )
 }
 
+/// Trimmed contents of a sysfs attribute file, `None` when absent or
+/// blank (a controller without fabric identity attrs — local PCIe — is
+/// an honest no-identity answer, never an error).
+fn read_attr(dir: &Path, attr: &str) -> Option<String> {
+    let raw = fs::read_to_string(dir.join(attr)).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// The fabric [`HostIdentity`] a controller directory carries
+/// (`hostnqn` + `hostid` sysfs attrs), `None` when either is absent —
+/// half an identity is no identity (the pair law's sysfs face).
+fn controller_identity(dir: &Path) -> Option<HostIdentity> {
+    Some(HostIdentity {
+        hostnqn: read_attr(dir, "hostnqn")?,
+        hostid: read_attr(dir, "hostid")?,
+    })
+}
+
+/// Whether controller dir `ctrl` carries a child directory named
+/// exactly `ns` (the non-multipath per-controller namespace shape).
+fn has_child_dir(ctrl: &Path, ns: &str) -> bool {
+    ctrl.join(ns).is_dir()
+}
+
+/// §5.2 rule 2 — the ACTUAL controller identity/identities under a
+/// namespace block device, from explicit sysfs roots (the §6.8
+/// injection seam; production wraps with the real roots).
+///
+/// * Non-NVMe paths (files, zram, partitions of nothing) → empty.
+/// * A controller with no `hostnqn`/`hostid` attrs (local PCIe) →
+///   contributes nothing — honest no-fabric-identity.
+/// * A multipath HEAD node collects the identity of EVERY controller
+///   serving its subsystem (a head shared between two identities can
+///   never verify as dedicated — the shared shape must be visible).
+///
+/// Deduplicated, sorted (deterministic messages).
+pub fn controller_identities_for_device_at(
+    subsystem_root: &Path,
+    nvme_root: &Path,
+    dev_path: &str,
+) -> std::io::Result<Vec<HostIdentity>> {
+    let name = Path::new(dev_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if split_nvme_namespace(&name).is_none() {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<HostIdentity> = Vec::new();
+    let mut push = |id: HostIdentity| {
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    };
+    // Direct per-controller namespace (non-multipath): the controller
+    // whose child dir IS this block device.
+    let mut owning_nqn: Option<String> = None;
+    for ctrl in sorted_child_dirs(nvme_root)? {
+        if has_child_dir(&ctrl, &name) {
+            if let Some(id) = controller_identity(&ctrl) {
+                push(id);
+            }
+            if owning_nqn.is_none() {
+                owning_nqn = read_attr(&ctrl, "subsysnqn");
+            }
+        }
+    }
+    // Multipath head node: the namespace lives under the SUBSYSTEM;
+    // every controller with that subsysnqn serves it.
+    for subsys in sorted_child_dirs(subsystem_root)? {
+        if !has_child_dir(&subsys, &name) {
+            continue;
+        }
+        let Some(nqn) = read_attr(&subsys, "subsysnqn") else {
+            continue;
+        };
+        for ctrl in sorted_child_dirs(nvme_root)? {
+            if attr_matches(&ctrl, "subsysnqn", &nqn)? {
+                if let Some(id) = controller_identity(&ctrl) {
+                    push(id);
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| (&a.hostnqn, &a.hostid).cmp(&(&b.hostnqn, &b.hostid)));
+    Ok(out)
+}
+
+/// [`controller_identities_for_device_at`] on the real sysfs roots.
+pub fn controller_identities_for_device(dev_path: &str) -> std::io::Result<Vec<HostIdentity>> {
+    controller_identities_for_device_at(
+        Path::new(SYSFS_NVME_SUBSYSTEM),
+        Path::new(SYSFS_NVME),
+        dev_path,
+    )
+}
+
+/// §5.2 rule 1's resolution half: the namespace block device serving
+/// `subnqn` **under a controller carrying OUR identity** — never a
+/// global/operator-shared device path. Two co-located mounts of one
+/// subsystem each resolve their OWN controller's node.
+///
+/// Shapes:
+/// * per-controller namespace nodes (non-multipath / `multipath=N`):
+///   the identity-matching controller's strict-shape child;
+/// * multipath HEAD node: returned only when EVERY controller of the
+///   subsystem carries our identity (a dedicated controller set) —
+///   a head round-robining a foreign identity is never handed out;
+/// * no identity-matching controller → honest `None`.
+pub fn find_device_for_nqn_under_identity_at(
+    subsystem_root: &Path,
+    nvme_root: &Path,
+    subnqn: &str,
+    identity: &HostIdentity,
+) -> std::io::Result<Option<String>> {
+    let mut ours = Vec::new();
+    let mut foreign_serves = false;
+    for ctrl in sorted_child_dirs(nvme_root)? {
+        if !attr_matches(&ctrl, "subsysnqn", subnqn)? {
+            continue;
+        }
+        match controller_identity(&ctrl) {
+            Some(id) if id == *identity => ours.push(ctrl),
+            _ => foreign_serves = true,
+        }
+    }
+    // Per-controller namespace node under our own controller first.
+    for ctrl in &ours {
+        if let Some(ns) = first_namespace_block_child(ctrl)? {
+            return Ok(Some(format!("/dev/{}", ns)));
+        }
+    }
+    // Multipath head node — dedicated controller sets only.
+    if !ours.is_empty() && !foreign_serves {
+        for subsys in sorted_child_dirs(subsystem_root)? {
+            if attr_matches(&subsys, "subsysnqn", subnqn)? {
+                if let Some(ns) = first_namespace_block_child(&subsys)? {
+                    return Ok(Some(format!("/dev/{}", ns)));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// [`find_device_for_nqn_under_identity_at`] on the real sysfs roots.
+pub fn find_device_for_nqn_under_identity(
+    subnqn: &str,
+    identity: &HostIdentity,
+) -> std::io::Result<Option<String>> {
+    find_device_for_nqn_under_identity_at(
+        Path::new(SYSFS_NVME_SUBSYSTEM),
+        Path::new(SYSFS_NVME),
+        subnqn,
+        identity,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// The §5.2 refusal ladder (design-full-multi-writer, KD-MW-15) — the pure
+// per-volume decision core the mount drives. Decidable at every shape.
+// ---------------------------------------------------------------------------
+
+/// Which plane a volume belongs to — the ladder's bootstrap split:
+/// `fabric_endpoint:` records live on ino 1 of the META plane, so a
+/// META volume's coordinates structurally cannot come from a record
+/// stored behind the very connect they would describe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FabricPlane {
+    /// Operator-established connects (the ONE bootstrap exemption),
+    /// rule-2 sysfs-verified.
+    Meta,
+    /// Daemon-owned connects from the durable records, full stop.
+    Data,
+}
+
+/// One volume's decidable inputs.
+#[derive(Debug, Clone)]
+pub struct VolumeShape<'a> {
+    pub plane: FabricPlane,
+    /// For messages: the durable volume id (data) or device path (meta).
+    pub descriptor: &'a str,
+    /// Whether a durable `fabric_endpoint:` record names this DATA
+    /// volume's coordinates (always false on the META plane).
+    pub has_endpoint_record: bool,
+    /// The ACTUAL controller identities under the volume's device path
+    /// (rule 2's sysfs answer) — empty = no fabric controller (file,
+    /// zram, local PCIe).
+    pub actual: &'a [HostIdentity],
+}
+
+/// The ladder's accept arms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LadderOutcome {
+    /// Proceed with the volume's device path as-is.
+    Accept,
+    /// META only: no fabric controller identity exists under the device
+    /// — rule-2 verification is INAPPLICABLE and the mount must say so
+    /// loud (never a silent pass-as-verified).
+    AcceptUnverified,
+    /// DATA under explicit identity with a durable record: the daemon
+    /// issues its OWN fabrics connect from the record and resolves the
+    /// namespace under its own controller.
+    DaemonConnect,
+}
+
+/// The §5.2 refusal ladder, decidable at every shape (explicit identity
+/// set — with `explicit == None` everything accepts unchanged, and the
+/// actual identities feed `pr_registrant_shared` / the guarantee row
+/// instead of a refusal):
+///
+/// * **(i) shared/foreign-identity device path** (meta or data): any
+///   actual controller identity ≠ the configured pair ⇒ refuse loud
+///   naming rule 2 — the inert-knob shape (a configured identity must
+///   never silently degrade to someone else's connection).
+/// * **(ii) DATA volume with no `fabric_endpoint:` record** ⇒ refuse
+///   loud naming the verb — **uniformly**, including the edge where the
+///   operator pre-connected a DEDICATED data controller whose actual
+///   identity MATCHES the configured pair: explicit identity means
+///   daemon-owned data-plane connects, full stop (one rule keeps the
+///   ladder decidable; "was this controller really dedicated?" must
+///   never be a per-mount judgment).
+/// * **(iii) META volumes** — the bootstrap exemption: matching actual
+///   identity accepted; no fabric identity accepted-unverified (loud).
+pub fn fabric_ladder_verdict(
+    explicit: Option<&HostIdentity>,
+    shape: &VolumeShape<'_>,
+) -> Result<LadderOutcome, String> {
+    let Some(want) = explicit else {
+        return Ok(LadderOutcome::Accept);
+    };
+    // A record-covered DATA volume is a daemon-owned connect: the mount
+    // never opens the recorded/global path at all, so a co-located
+    // sibling's controller on the same subsystem is not this volume's
+    // shape-(i) input (the post-connect rule-2 re-verification of the
+    // daemon's OWN resolved device is the wiring's job).
+    if shape.plane == FabricPlane::Data && shape.has_endpoint_record {
+        return Ok(LadderOutcome::DaemonConnect);
+    }
+    // Shape (i): rule 2 — a foreign actual identity under the device
+    // path this mount WOULD use refuses on both planes.
+    if let Some(foreign) = shape.actual.iter().find(|id| *id != want) {
+        return Err(format!(
+            "mount refused (rule 2, design-full-multi-writer §5.2): {} '{}' rides a \
+             controller whose ACTUAL identity (hostnqn={}, hostid={}) is not this mount's \
+             configured pair (hostnqn={}, hostid={}). An explicit per-mount identity is \
+             never inert: it must not silently degrade to a connection established under \
+             another identity. Remedy: declare the volume's coordinates with `squeezefs \
+             config set-fabric-endpoints` so this mount connects its own controller, or \
+             unset the explicit identity pair",
+            match shape.plane {
+                FabricPlane::Meta => "META volume",
+                FabricPlane::Data => "data volume",
+            },
+            shape.descriptor,
+            foreign.hostnqn,
+            foreign.hostid,
+            want.hostnqn,
+            want.hostid,
+        ));
+    }
+    match shape.plane {
+        FabricPlane::Data => {
+            // Shape (ii), UNIFORM: matching pre-connected dedicated
+            // controllers refuse exactly like recordless files.
+            Err(format!(
+                "mount refused (KD-MW-15, design-full-multi-writer §5.2): explicit \
+                 per-mount identity is configured but data volume '{}' has no durable \
+                 fabric_endpoint: record — explicit identity means daemon-owned \
+                 data-plane connects, full stop (a pre-connected controller is refused \
+                 even when its identity matches). Remedy: `squeezefs config \
+                 set-fabric-endpoints <sqmeta-uri> {}=<traddr>:<trsvcid>:<subnqn>`, or \
+                 drop the explicit-identity knobs",
+                shape.descriptor, shape.descriptor,
+            ))
+        }
+        FabricPlane::Meta => {
+            // The bootstrap exemption: operator-established connects,
+            // rule-2-verified above. No identity to verify = say so loud.
+            if shape.actual.is_empty() {
+                Ok(LadderOutcome::AcceptUnverified)
+            } else {
+                Ok(LadderOutcome::Accept)
+            }
+        }
+    }
+}
+
 /// Optional connect-time path/queue controls (the 2026-07-25
 /// live-cluster findings): pin the fabric connection's source
 /// address/interface on multi-homed hosts (same-subnet dual-NIC setups
@@ -176,6 +570,13 @@ pub struct ConnectOptions {
     /// Upper bound on requested I/O queues, ≥ 1
     /// (nvme-cli `--nr-io-queues` / fabrics `nr_io_queues=`).
     pub nr_io_queues: Option<u32>,
+    /// KD-MW-3: the EXPLICIT host identity this connection presents
+    /// (nvme-cli `--hostnqn`/`--hostid` / fabrics `hostnqn=`/`hostid=`).
+    /// `None` = the `/etc/nvme` convention (with the env-knob override
+    /// arm), today's behavior verbatim. Always a full pair — the
+    /// pair-or-neither law is enforced at resolution
+    /// ([`explicit_host_identity_from`]), never here.
+    pub identity: Option<HostIdentity>,
 }
 
 /// The nvme-cli argv for one connect. Pure and injectable (tested
@@ -209,6 +610,12 @@ pub fn nvme_cli_connect_args(
     if let Some(n) = opts.nr_io_queues {
         args.push("--nr-io-queues".to_string());
         args.push(n.to_string());
+    }
+    if let Some(id) = &opts.identity {
+        args.push("--hostnqn".to_string());
+        args.push(id.hostnqn.clone());
+        args.push("--hostid".to_string());
+        args.push(id.hostid.clone());
     }
     args
 }
@@ -274,8 +681,13 @@ fn connect_target_single(
             ));
         }
 
-        let ctrl_conn_str =
-            fabrics_connect_string(ip, port, subnqn, &get_host_nqn(), &get_host_id(), opts);
+        // KD-MW-3: an explicit identity wins verbatim; otherwise the
+        // `/etc/nvme` convention (with the env-knob override arm).
+        let (hostnqn, hostid) = match &opts.identity {
+            Some(id) => (id.hostnqn.clone(), id.hostid.clone()),
+            None => (get_host_nqn(), get_host_id()),
+        };
+        let ctrl_conn_str = fabrics_connect_string(ip, port, subnqn, &hostnqn, &hostid, opts);
         fs::write(&dev_fabrics, &ctrl_conn_str)?;
     }
     Ok(())

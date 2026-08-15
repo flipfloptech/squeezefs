@@ -886,6 +886,126 @@ pub struct MetaVolumeRecord {
     pub added_ts: u64,
 }
 
+/// Record-name prefix of the durable per-DATA-volume fabric-endpoint
+/// coordinates (KD-MW-15, design-full-multi-writer §5.2 rule 1).
+/// Unprefixed internal family on ino 1, beside `writer_claim` /
+/// `job:` / `alloc_lane:` — screened from FUSE by the VAL-2 xattr
+/// ALLOWLIST (`kv::backend::xattr_name_allowed` admits only `user.*` /
+/// `security.*` / `trusted.*`), so the records are invisible/EPERM
+/// through FUSE by construction.
+pub const FABRIC_ENDPOINT_RECORD_PREFIX: &str = "fabric_endpoint:";
+
+/// [`FabricEndpoint`] wire version. A record carrying anything else
+/// refuses **loud** (forward-only): an unknown version means a newer
+/// binary declared coordinates this one cannot interpret, and guessing
+/// would connect a mount to a device it may not own.
+pub const FABRIC_ENDPOINT_VERSION: u8 = 1;
+
+/// The durable record's name: `fabric_endpoint:{vol_tag:016x}` — the
+/// tag decodes the durable `vol-{16 hex}` id verbatim and hashes
+/// grandfathered legacy ids ([`meta_backend::kv::block_refs::volume_tag`],
+/// KD-5: never a path, an ordinal, or a set position).
+pub fn fabric_endpoint_record_name(volume_id: &str) -> String {
+    format!(
+        "{}{:016x}",
+        FABRIC_ENDPOINT_RECORD_PREFIX,
+        meta_backend::kv::block_refs::volume_tag(volume_id)
+    )
+}
+
+/// One DATA volume's admin-declared NVMe-oF connect coordinates
+/// (KD-MW-15): written ONLY by `squeezefs config set-fabric-endpoints`
+/// (the `set-cache-paths` pattern — mount READS, never overrides), the
+/// source rule 1's daemon-owned connects resolve from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FabricEndpoint {
+    /// Transport address (the target's IP; IPv6 accepted).
+    pub traddr: String,
+    /// Transport service id (the target's port, as the fabrics string
+    /// carries it — a string per the NVMe-oF convention).
+    pub trsvcid: String,
+    /// Subsystem NQN serving the volume's namespace.
+    pub subnqn: String,
+}
+
+impl FabricEndpoint {
+    /// Versioned + checksummed record image:
+    /// `version u8 | (len u16 LE | bytes) × {traddr, trsvcid, subnqn} |
+    /// xxh3-64 LE of everything before it`.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(
+            1 + 3 * 2 + self.traddr.len() + self.trsvcid.len() + self.subnqn.len() + 8,
+        );
+        out.push(FABRIC_ENDPOINT_VERSION);
+        for field in [&self.traddr, &self.trsvcid, &self.subnqn] {
+            let b = field.as_bytes();
+            out.extend_from_slice(&(b.len() as u16).to_le_bytes());
+            out.extend_from_slice(b);
+        }
+        let sum = xxhash_rust::xxh3::xxh3_64(&out);
+        out.extend_from_slice(&sum.to_le_bytes());
+        out
+    }
+
+    /// Decode + verify. Torn (checksum), truncated, and future-version
+    /// images all refuse loud — never a guessed coordinate.
+    pub fn decode(raw: &[u8]) -> std::result::Result<Self, String> {
+        if raw.len() < 1 + 3 * 2 + 8 {
+            return Err(format!(
+                "fabric_endpoint record too short ({} B) — torn or foreign",
+                raw.len()
+            ));
+        }
+        let (body, sum_bytes) = raw.split_at(raw.len() - 8);
+        let want = u64::from_le_bytes(sum_bytes.try_into().expect("8 B split"));
+        if xxhash_rust::xxh3::xxh3_64(body) != want {
+            return Err(
+                "fabric_endpoint record checksum mismatch — torn write or corruption \
+                        (refusing to connect from a damaged coordinate record)"
+                    .to_string(),
+            );
+        }
+        if body[0] != FABRIC_ENDPOINT_VERSION {
+            return Err(format!(
+                "fabric_endpoint record version {} is not the supported version {} — a newer \
+                 binary declared these coordinates; upgrade this binary (forward-only)",
+                body[0], FABRIC_ENDPOINT_VERSION
+            ));
+        }
+        let mut off = 1usize;
+        let mut fields = Vec::with_capacity(3);
+        for what in ["traddr", "trsvcid", "subnqn"] {
+            if off + 2 > body.len() {
+                return Err(format!("fabric_endpoint record truncated before {what}"));
+            }
+            let len = u16::from_le_bytes(body[off..off + 2].try_into().expect("2 B")) as usize;
+            off += 2;
+            if off + len > body.len() {
+                return Err(format!("fabric_endpoint record truncated inside {what}"));
+            }
+            let s = std::str::from_utf8(&body[off..off + len])
+                .map_err(|_| format!("fabric_endpoint record {what} is not UTF-8"))?;
+            fields.push(s.to_string());
+            off += len;
+        }
+        if off != body.len() {
+            return Err("fabric_endpoint record carries trailing bytes — torn or foreign".into());
+        }
+        let mut it = fields.into_iter();
+        Ok(FabricEndpoint {
+            traddr: it.next().expect("3 fields"),
+            trsvcid: it.next().expect("3 fields"),
+            subnqn: it.next().expect("3 fields"),
+        })
+    }
+
+    /// The human/CLI rendering (`get-fabric-endpoints`, refusal texts):
+    /// `traddr:trsvcid:subnqn`.
+    pub fn render(&self) -> String {
+        format!("{}:{}:{}", self.traddr, self.trsvcid, self.subnqn)
+    }
+}
+
 /// The grandfathered id of a legacy (`data_lv`) member: the device-path
 /// basename, byte-identical to what mount has always registered.
 pub fn legacy_volume_id(path: &str) -> String {

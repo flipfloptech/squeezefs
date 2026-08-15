@@ -598,6 +598,157 @@ pub async fn set_cache_paths(
     Ok(())
 }
 
+/// `squeezefs config set-fabric-endpoints <sqmeta-uri>
+/// <vol-id>=<traddr>:<trsvcid>:<subnqn> ...` — the spec-grammar parser
+/// (KD-MW-15). Splits at the FIRST `=`, then the first two `:`
+/// boundaries of the remainder — NQNs carry colons, so the subnqn is
+/// everything after the second separator. IPv6 transport addresses are
+/// bracketed (`[::1]:4420:nqn...`); the brackets are grammar, not part
+/// of the stored traddr.
+pub fn parse_fabric_endpoint_spec(spec: &str) -> Result<(String, crate::FabricEndpoint)> {
+    let grammar = |why: &str| {
+        SqueezefsError::InvalidOperation(format!(
+            "fabric-endpoint spec '{spec}' is invalid ({why}); the grammar is \
+             <vol-id>=<traddr>:<trsvcid>:<subnqn> (bracket an IPv6 traddr: \
+             [::1]:4420:nqn...)"
+        ))
+    };
+    let (vol_id, rest) = spec
+        .split_once('=')
+        .ok_or_else(|| grammar("no '=' between the vol-id and the coordinates"))?;
+    let vol_id = vol_id.trim();
+    if vol_id.is_empty() {
+        return Err(grammar("empty vol-id"));
+    }
+    let (traddr, rest) = if let Some(bracketed) = rest.strip_prefix('[') {
+        let (addr, after) = bracketed
+            .split_once(']')
+            .ok_or_else(|| grammar("unterminated '[' in the traddr"))?;
+        let after = after
+            .strip_prefix(':')
+            .ok_or_else(|| grammar("expected ':' after the bracketed traddr"))?;
+        (addr, after)
+    } else {
+        rest.split_once(':')
+            .ok_or_else(|| grammar("no ':' between traddr and trsvcid"))?
+    };
+    let (trsvcid, subnqn) = rest
+        .split_once(':')
+        .ok_or_else(|| grammar("no ':' between trsvcid and subnqn"))?;
+    if traddr.is_empty() {
+        return Err(grammar("empty traddr"));
+    }
+    if trsvcid.is_empty() {
+        return Err(grammar("empty trsvcid"));
+    }
+    if subnqn.is_empty() {
+        return Err(grammar("empty subnqn"));
+    }
+    Ok((
+        vol_id.to_string(),
+        crate::FabricEndpoint {
+            traddr: traddr.to_string(),
+            trsvcid: trsvcid.to_string(),
+            subnqn: subnqn.to_string(),
+        },
+    ))
+}
+
+/// `squeezefs config set-fabric-endpoints`: the ONLY way to declare a
+/// DATA volume's NVMe-oF connect coordinates (KD-MW-15 — mount rejects
+/// the flag; the cache-path-policy precedent verbatim). Guarded exactly
+/// like [`set_cache_paths`]:
+///
+/// - every metadata volume runs the `format_preflight` live-client gate
+///   (changing the coordinate a mount would connect from under a live
+///   client is never safe);
+/// - the volume set must be formatted, and every named vol-id must be a
+///   member of the durable data-volume set (coordinates for a volume the
+///   set does not have are a typo, refused loud naming the id) —
+///   all checked BEFORE anything is written;
+/// - the records commit as ino-1 xattrs on the config-home volume
+///   (versioned + checksummed [`crate::FabricEndpoint`] images under
+///   [`crate::fabric_endpoint_record_name`], VAL-2-allowlist-invisible),
+///   journal-durable, closed with a clean checkpoint shutdown.
+pub async fn set_fabric_endpoints(
+    meta_lvs: &[String],
+    entries: &[(String, crate::FabricEndpoint)],
+) -> Result<()> {
+    if entries.is_empty() {
+        return Err(SqueezefsError::InvalidOperation(
+            "at least one <vol-id>=<traddr>:<trsvcid>:<subnqn> spec is required".to_string(),
+        ));
+    }
+
+    // 1. Live-client gate on EVERY volume before anything is touched.
+    for path in meta_lvs {
+        crate::meta_backend::kv::builder::format_preflight(Path::new(path), true).await?;
+    }
+
+    // 2. The set must be formatted; every named id must be a member.
+    let cfg = read_volume_format_config(meta_lvs).await?;
+    let records = cfg.resolved_data_volumes();
+    for (vol_id, _) in entries {
+        if !records.iter().any(|r| &r.id == vol_id) {
+            let known: Vec<&str> = records.iter().map(|r| r.id.as_str()).collect();
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "'{vol_id}' is not a member of this set's durable data-volume records \
+                 (known ids: {}) — fabric-endpoint coordinates name volumes by their \
+                 durable id (KD-5); see `squeezefs volume list`",
+                known.join(", ")
+            )));
+        }
+    }
+
+    // 3. Commit the records on the config-home volume (one guarded open,
+    //    journal-durable, clean shutdown).
+    let home = config_home_volume(meta_lvs).await?;
+    let vol = crate::meta_backend::open_volume_for_mount(&home).await?;
+    let outcome = async {
+        for (vol_id, ep) in entries {
+            // VAL-2: the daemon's OWN record writer rides the unscreened
+            // internal entry point (the set_cache_paths precedent — the
+            // allowlist is the client boundary, never a ban on the
+            // administrator of the record).
+            vol.setxattr_internal(1, &crate::fabric_endpoint_record_name(vol_id), &ep.encode())
+                .await?;
+        }
+        Ok::<(), SqueezefsError>(())
+    }
+    .await;
+    vol.shutdown().await.map_err(SqueezefsError::from)?;
+    outcome
+}
+
+/// `squeezefs config get-fabric-endpoints` / the mount-side record read:
+/// every durable data-volume record with its declared endpoint (or
+/// `None`). Read-only probe — safe beside a live mount. A damaged or
+/// future-version record refuses loud here (never a guessed coordinate).
+pub async fn get_fabric_endpoints(
+    meta_lvs: &[String],
+) -> Result<Vec<(crate::DataVolumeRecord, Option<crate::FabricEndpoint>)>> {
+    let home = config_home_volume(meta_lvs).await?;
+    let cfg = read_format_config(&home).await?;
+    let records = cfg.resolved_data_volumes();
+    let vol = crate::meta_backend::open_volume_probe(&home).await?;
+    let root = vol.slot0_root_ino();
+    let mut out = Vec::with_capacity(records.len());
+    for rec in records {
+        let name = crate::fabric_endpoint_record_name(&rec.id);
+        let ep = match vol.getxattr(root, &name).await? {
+            Some(raw) => Some(crate::FabricEndpoint::decode(&raw).map_err(|e| {
+                SqueezefsError::InvalidOperation(format!(
+                    "fabric_endpoint record for volume '{}' is unusable: {e}",
+                    rec.id
+                ))
+            })?),
+            None => None,
+        };
+        out.push((rec, ep));
+    }
+    Ok(out)
+}
+
 /// Read the format config off the config-home metadata volume (the host
 /// of routing slot 0 — the first volume for legacy sets) via a read-only
 /// probe (the `volume list` / `df` access pattern — safe beside a live

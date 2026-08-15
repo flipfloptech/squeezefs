@@ -113,6 +113,8 @@ pub static KNOBS: &[Knob] = &[
     k("SQUEEZEFS_IL_BUILD_COMMIT", Kind::BuildTime, "git", "The shim's build commit (KD-7 daemon/shim pairing)."),
     // -- CLI / process ---------------------------------------------------
     k("SQUEEZEFS_META_URI", Kind::Str, "none", "Default sqmeta:// URI for the verbs that take one (clap env)."),
+    k("SQUEEZEFS_HOSTNQN", Kind::Str, "none (/etc/nvme/hostnqn)", "KD-MW-3 (design-full-multi-writer §5.2): per-mount NVMe-oF host NQN — every fabrics connection this daemon makes presents it, making the mount its own PR registrant. PAIR-OR-NEITHER with SQUEEZEFS_HOSTID (exactly one configured refuses the mount — a mismatched pair is how registrants alias); explicit identity REQUIRES daemon-owned data-plane connects from durable fabric_endpoint: records (`config set-fabric-endpoints`) and is verified against the ACTUAL controller identity under every device fd. `-o hostnqn=` wins over the env knob."),
+    k("SQUEEZEFS_HOSTID", Kind::Str, "none (/etc/nvme/hostid)", "KD-MW-3: the paired per-mount NVMe-oF host id (see SQUEEZEFS_HOSTNQN — pair-or-neither). `-o hostid=` wins over the env knob."),
     k("SQUEEZEFS_ENCRYPT_KEY_FILE", Kind::Str, "/etc/squeezefs/keys/<id>.key", "Encryption key material path (docs/design-key-handling.md)."),
     k("SQUEEZEFS_DAEMON_PIPE", int(0, i32::MAX as i128), "none", "Internal: fd the forked daemon writes `ready` to. Set by the parent, never by hand."),
     k("SQUEEZEFS_TIMEOUT", int(1, 86_400), "30", "Metadata-operation timeout, seconds (memoized at launch)."),

@@ -1713,16 +1713,17 @@ async fn overwrite_knob_registry_defaults() {
         squeezefs::env_knobs::lookup("SQUEEZEFS_OVERLAY_OVERWRITE")
             .expect("registered (ENG-10)")
             .default,
-        "off",
-        "FIELD-PENDING (user ruling 2026-08-15, supersedes KD-B4-9's ON until \
-         the B4e field row): the local B4d A-B-B-A failed the above-control \
-         gate in both orders (ON 783-940 vs OFF 1149-1161 MiB/s sustained — \
-         the device-bound zram-tcp venue rewards the control's BDP-depth \
-         pipelining; engagement exact, rewrite_amp 1.0000, daemon CPU/GiB \
-         -30%), so the falsified-lever rule ships it OFF as a documented \
-         field lever. The field (CPU-bound, the 96.6% merge-share wall) is \
-         the deciding venue — flip this pin WITH the registry line when the \
-         field row adjudicates"
+        "on",
+        "KD-B4-9 ON, FIELD-ADJUDICATED (2026-08-15, the B4e row — \
+         .benchmarks/2026-08-15-overlay-b4-overwrite.md): the deciding \
+         CPU-bound field venue won BOTH orders (32.1 vs 31.0 / 31.6 vs \
+         30.9 GiB/s sustained) at HALF the daemon CPU (26.5-27.3 vs \
+         52.7-53.1 jiffies/GiB), engagement exact (overwrite share 0.999, \
+         nt_copy share 1.000 -> 0.001, rewrite_amp 1.0000, fallbacks/ \
+         tripwires 0). The local device-bound zram-tcp venue prefers OFF \
+         (control's BDP-depth pipelining wins there, -2 to -30% by qd) — \
+         recorded on the registry line as the venue split; `0` is the \
+         restored B2 control"
     );
     assert_eq!(
         squeezefs::env_knobs::lookup("SQUEEZEFS_OVERLAY_CLOSE_BARRIER")

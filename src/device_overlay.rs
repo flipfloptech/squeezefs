@@ -92,15 +92,16 @@ pub fn device_overlay_enabled() -> bool {
 }
 
 /// B4c-ii (design-overlay-overwrite §6): the OVERWRITE-arm lever.
-/// Same tri-state posture as [`device_overlay_enabled`]. Default OFF —
-/// FIELD-PENDING (user ruling 2026-08-15, supersedes KD-B4-9's ON): the
-/// local B4d A-B-B-A failed the above-control gate in both orders on
-/// the device-bound zram-tcp venue (the control's BDP-depth pipelining
-/// wins there; engagement exact, rewrite_amp 1.0000, daemon CPU/GiB
-/// −30 %), so the falsified-lever rule ships the arm as a documented
-/// FIELD lever until the B4e field row (the CPU-bound merge-share wall)
-/// adjudicates the default. Flip HERE + the registry line + the drift
-/// pin together.
+/// Same tri-state posture as [`device_overlay_enabled`]. Default ON
+/// (KD-B4-9), FIELD-ADJUDICATED 2026-08-15 (the B4e row —
+/// `.benchmarks/2026-08-15-overlay-b4-overwrite.md`): the deciding
+/// CPU-bound field venue won both A-B-B-A orders at HALF the daemon
+/// CPU with engagement exact; the device-bound local venue's
+/// preference for OFF is the recorded venue split on the registry
+/// line. Flip HERE + the registry line + the drift pin together.
+/// Binary default only — lib unit-test readers default OFF (the
+/// accumulation/W1 harnesses' premise), integration suites pin
+/// explicitly.
 static OVERWRITE: AtomicU8 = AtomicU8::new(0);
 /// OQ-5: barrier-before-close for overlay-fed epochs (default OFF —
 /// the deliberately-not-taken stronger posture; B4d prices it).
@@ -115,7 +116,8 @@ pub fn overlay_overwrite_enabled() -> bool {
         1 => false,
         2 => true,
         _ => {
-            let on = crate::env_knobs::bool_knob("SQUEEZEFS_OVERLAY_OVERWRITE", false);
+            let default = !cfg!(test);
+            let on = crate::env_knobs::bool_knob("SQUEEZEFS_OVERLAY_OVERWRITE", default);
             OVERWRITE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
             on
         }

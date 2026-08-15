@@ -38,6 +38,10 @@ SUITES=(
   fuse_zc_write_fusion_tests
   zc_bridge_cqe_wedge_tests
   bench_tests
+  # Live WERO-semantics leg (fix/wero-rtype): root + kernel nvmet +
+  # nvme-cli — the sqz box has all three, so REQUIRE_CAPABILITY turns
+  # its decline into a failure here.
+  wero_rtype_tests
 )
 
 LEDGER="${SQUEEZEFS_TEST_SKIP_LEDGER:-$PWD/target/skip-ledger-capability.jsonl}"

@@ -189,23 +189,35 @@ impl RevalidationPoller {
 
     /// One revalidation pass over a reader's volume SET — the composition
     /// `crate::ro_coherence::spawn_reader_revalidation` drives once per
-    /// cadence tick. Returns one `(volume index, outcome)` entry per volume
-    /// actually POLLED this call: a volume the cadence skipped contributes
-    /// no entry, and a failing volume never suppresses its siblings'
-    /// entries (the driver logs each failure and the reader keeps serving
-    /// that volume's current epoch).
+    /// cadence tick. **One cadence decision for the whole pass**: due is
+    /// checked ONCE and marked ONCE, then every volume is polled.
+    ///
+    /// Why this cannot be a per-volume [`Self::poll_at`] loop (rung-6 fleet
+    /// finding #2, 2026-08-15): the cadence mark (`last`) is per-POLLER
+    /// state, so on a shared poller the first volume's `mark` made
+    /// `due_at(pass_start)` false for every sibling on the same pass — and
+    /// every subsequent pass repeated the pattern. Only meta volume 0 ever
+    /// revalidated on a multi-volume set: the parent's dentry tree advanced
+    /// while a child's inode record on another volume stayed frozen at the
+    /// reader's mount-time snapshot, the live readdir-sees/lookup-misses
+    /// split (`d?????????`), minutes past the published staleness bound.
+    ///
+    /// Returns one `(volume index, outcome)` entry per volume — empty when
+    /// the pass was not due. A failing volume never suppresses its
+    /// siblings' entries (the driver logs each failure and the reader keeps
+    /// serving that volume's current epoch).
     pub async fn poll_set_at(
         &self,
         volumes: &[Arc<KvMetaBackend>],
         now: Instant,
     ) -> Vec<(usize, Result<RevalidateOutcome, KvError>)> {
+        if !self.due_at(now) {
+            return Vec::new();
+        }
+        self.mark(now);
         let mut out = Vec::with_capacity(volumes.len());
         for (idx, vol) in volumes.iter().enumerate() {
-            match self.poll_at(vol, now).await {
-                Ok(None) => {}
-                Ok(Some(o)) => out.push((idx, Ok(o))),
-                Err(e) => out.push((idx, Err(e))),
-            }
+            out.push((idx, vol.revalidate_reader().await));
         }
         out
     }

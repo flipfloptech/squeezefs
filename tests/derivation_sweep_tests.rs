@@ -1313,6 +1313,279 @@ fn fleet_share_knob_is_registered_and_zero_refuses_at_startup() {
 }
 
 // ---------------------------------------------------------------------------
+// KD-MW-14 rung 3c — the fleet-share RESIDUE list (the 3b follow-on):
+// every pre-existing DAEMON-SIZING site that bypassed the divided root via
+// a direct `std::thread::available_parallelism()` read now derives through
+// a pure tie-tested form fed by `crate::cpu::process_parallelism()` (which
+// also retires each site's Hang-1 pinned-first-toucher exposure by
+// construction — the process mask is calling-thread independent). share=4
+// rows prove the quarter; floors are never divided; the reader census pins
+// the surviving non-daemon set so a 15th direct reader is a red test.
+// ---------------------------------------------------------------------------
+
+/// share=4 quarters every residue site's derivation (via the pure forms —
+/// division happens at the CPU root, so each formula applied to the
+/// shared root must produce exactly the quartered value wherever it is
+/// above its floor/clamps; where a clamp masks the quarter at the field
+/// shape, a bigger canonical box shows it and the field row pins the
+/// clamp).
+#[test]
+fn fleet_share_quarters_the_residue_site_derivations() {
+    use squeezefs::cpu::effective_parallelism_from;
+
+    // The field box (32 CPUs) at share=4 ⇒ the 8-CPU effective root.
+    let field = effective_parallelism_from(32, 4);
+    assert_eq!(field, 8);
+
+    // squeezefs-ipc blocking pool cap (cpus × 16, floor 8) — the daemon
+    // FEEDS the divided root at startup (`set_sizing_parallelism`); the
+    // pure form is what it sizes with.
+    use squeezefs_ipc::sqz_blocking::pool_cap_from;
+    assert_eq!(pool_cap_from(32), 512);
+    assert_eq!(pool_cap_from(field), 128, "= 512/4");
+
+    // Whole-block buffer pools (cores × 16, floor 64).
+    use squeezefs::cache::pool::{block_pool_capacity_from, ranged_pool_capacity_from};
+    assert_eq!(block_pool_capacity_from(32), 512);
+    assert_eq!(block_pool_capacity_from(field), 128, "= 512/4");
+    // Ranged read-bounce pool (cores × 64, floor 512): the quarter lands
+    // exactly ON the floor at the field shape.
+    assert_eq!(ranged_pool_capacity_from(32), 2048);
+    assert_eq!(ranged_pool_capacity_from(field), 512, "= 2048/4");
+
+    // LRU shard count (next_power_of_two, floor 16): the quarter is
+    // visible on the 128-core box; the field box lands on the floor.
+    use squeezefs::cache::lru::shard_count_from;
+    assert_eq!(shard_count_from(128), 128);
+    assert_eq!(shard_count_from(effective_parallelism_from(128, 4)), 32);
+    assert_eq!(shard_count_from(field), 16, "shard floor holds");
+
+    // Crypto scratch-pool capacity (cores/4, clamp [4, 16]): the quarter
+    // is visible on the 64-core box; the field share lands on the floor.
+    use squeezefs::crypto_compress::scratch_pool_capacity_from;
+    assert_eq!(scratch_pool_capacity_from(64), 16);
+    assert_eq!(
+        scratch_pool_capacity_from(effective_parallelism_from(64, 4)),
+        4,
+        "= 16/4"
+    );
+
+    // cluster_wire owner-side RPC lanes (ceil(cpus/8), clamp [1, 8]).
+    use squeezefs::cluster_wire::{max_connections_from, service_threads_from};
+    assert_eq!(service_threads_from(None, 32), 4);
+    assert_eq!(service_threads_from(None, field), 1, "= 4/4");
+    // cluster_wire connection cap (cpus × 16, clamp [64, 1024]).
+    assert_eq!(max_connections_from(32), 512);
+    assert_eq!(max_connections_from(field), 128, "= 512/4");
+
+    // meta_ship per-frame batch cap (cpus × 2, clamp [64, 4096]): the
+    // quarter is visible on the 256-core box; the field shape sits on the
+    // M7 floor at both shares.
+    use squeezefs::meta_ship::router::batch_max_from;
+    assert_eq!(batch_max_from(None, 256), 512);
+    assert_eq!(
+        batch_max_from(None, effective_parallelism_from(256, 4)),
+        128,
+        "= 512/4"
+    );
+    assert_eq!(batch_max_from(None, field), 64, "M7 floor holds");
+
+    // Job-fabric workers (cpus/4, clamp [2, 8]).
+    use squeezefs::jobs::fabric_workers_default;
+    assert_eq!(fabric_workers_default(32), 8);
+    assert_eq!(fabric_workers_default(field), 2, "= 8/4");
+
+    // Format-verb concurrent volume-format pool (cpus × 2).
+    use squeezefs::config_ops::format_pool_permits;
+    assert_eq!(format_pool_permits(32), 64);
+    assert_eq!(format_pool_permits(field), 16, "= 64/4");
+
+    // sqz-meta lane population (2, or 1 on an EFFECTIVE uniprocessor —
+    // a share can collapse a 2-CPU box to one lane).
+    use squeezefs::meta_exec::meta_lanes_from;
+    assert_eq!(meta_lanes_from(32), 2);
+    assert_eq!(meta_lanes_from(field), 2);
+    assert_eq!(meta_lanes_from(effective_parallelism_from(2, 4)), 1);
+}
+
+/// Floors hold undivided at every share (the 2-CPU floor box collapsed
+/// to an effective 1): silent starvation below a floor is never what a
+/// share produces — physical minima / never-regress-below-shipped only.
+#[test]
+fn residue_site_floors_hold_at_every_share() {
+    use squeezefs::cpu::effective_parallelism_from;
+    for share in [2usize, 4, 32, 4096] {
+        let c = effective_parallelism_from(2, share);
+        assert_eq!(c, 1, "the CPU root floors at 1 (share={share})");
+        assert!(
+            squeezefs_ipc::sqz_blocking::pool_cap_from(c) >= 8,
+            "blocking-pool floor holds at share={share}"
+        );
+        assert_eq!(
+            squeezefs::cache::pool::block_pool_capacity_from(c),
+            64,
+            "whole-block pool floor holds at share={share}"
+        );
+        assert_eq!(
+            squeezefs::cache::pool::ranged_pool_capacity_from(c),
+            512,
+            "ranged pool floor holds at share={share}"
+        );
+        assert_eq!(
+            squeezefs::cache::lru::shard_count_from(c),
+            16,
+            "LRU shard floor holds at share={share}"
+        );
+        assert_eq!(
+            squeezefs::crypto_compress::scratch_pool_capacity_from(c),
+            4,
+            "scratch-pool floor holds at share={share}"
+        );
+        assert_eq!(
+            squeezefs::cluster_wire::service_threads_from(None, c),
+            1,
+            "RPC-lane floor holds at share={share}"
+        );
+        assert_eq!(
+            squeezefs::cluster_wire::max_connections_from(c),
+            64,
+            "connection-cap floor holds at share={share}"
+        );
+        assert_eq!(
+            squeezefs::meta_ship::router::batch_max_from(None, c),
+            64,
+            "M7 batch floor holds at share={share}"
+        );
+        assert_eq!(
+            squeezefs::jobs::fabric_workers_default(c),
+            2,
+            "fabric-worker floor holds at share={share}"
+        );
+        assert_eq!(
+            squeezefs::config_ops::format_pool_permits(c),
+            2,
+            "format pool never sizes to 0 at share={share}"
+        );
+        assert_eq!(
+            squeezefs::meta_exec::meta_lanes_from(c),
+            1,
+            "uniprocessor lane minimum at share={share}"
+        );
+    }
+}
+
+/// Explicit levers stay verbatim through the extracted pure forms (the
+/// ipc-cap precedence law: explicit wins, bounded only by its own
+/// admissible range / the never-oversubscribe rail — never re-divided).
+#[test]
+fn residue_site_explicit_levers_stay_verbatim() {
+    use squeezefs::cluster_wire::service_threads_from;
+    use squeezefs::meta_ship::router::batch_max_from;
+    assert_eq!(batch_max_from(Some(8), 1), 8, "explicit wins verbatim");
+    assert_eq!(batch_max_from(Some(9999), 256), 4096, "range clamp only");
+    assert_eq!(service_threads_from(Some(6), 32), 6, "explicit wins");
+    assert_eq!(
+        service_threads_from(Some(16), 4),
+        4,
+        "never oversubscribes the (divided) root"
+    );
+}
+
+/// The `std::thread::available_parallelism` reader census: after rung 3c
+/// the direct readers are exactly the NON-daemon-sizing set — the sizing
+/// roots' own syscall fallbacks (src/cpu.rs, sqz_blocking's unfed-embedding
+/// fallback), the bench tool's load generation, the one-shot SPDK build's
+/// make -j, the CLIENT-process shim, and the fuse3 fork's internal
+/// fallbacks/shards (its own excluded workspace; the transport's queue
+/// COUNT is the exempt possible-CPUs census above). A new direct reader
+/// is a red test, never a drift: daemon sizing reads the divided root
+/// (`crate::cpu::process_parallelism`) — or, inside squeezefs-ipc, the
+/// parallelism the daemon feeds — instead.
+#[test]
+fn available_parallelism_reader_census_is_pinned_to_the_non_daemon_set() {
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                rust_files(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    for tree in [
+        "src",
+        "crates/fuse3/src",
+        "crates/squeezefs-ipc/src",
+        "crates/squeezefs-preload/src",
+    ] {
+        rust_files(&root.join(tree), &mut files);
+    }
+    assert!(
+        files.len() > 100,
+        "census roots wrong: {} files",
+        files.len()
+    );
+    let mut readers = BTreeSet::new();
+    for f in &files {
+        let Ok(text) = std::fs::read_to_string(f) else {
+            continue;
+        };
+        if text.contains("std::thread::available_parallelism") {
+            readers.insert(
+                f.strip_prefix(root)
+                    .expect("census file outside the manifest root")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+    let expected: BTreeSet<String> = [
+        // The divided sizing root's OWN syscall fallback (and module doc).
+        "src/cpu.rs",
+        // The bench TOOL's load-generation width — measures the machine
+        // under test, not a daemon resource (class c).
+        "src/bench.rs",
+        // One-shot external `make -j` for the SPDK source build — a
+        // build-process width, not a daemon resource (class c).
+        "src/nvmeof/spdk/lifecycle.rs",
+        // The blocking pool's unfed-embedding fallback: the daemon feeds
+        // the divided root via `set_sizing_parallelism` at startup;
+        // foreign hosts/unit tests fall back to the raw mask.
+        "crates/squeezefs-ipc/src/sqz_blocking.rs",
+        // The CLIENT-process shim sizes the client's sessions from the
+        // client's own mask — the fleet divisor governs daemon resources
+        // only (class c).
+        "crates/squeezefs-preload/src/interpose.rs",
+        // fuse3 fork (its own excluded workspace): the TPC scheduler's
+        // defensive fallback for an empty process mask, the phase-table
+        // shard count, and the kernel-possible-CPUs sysconf fallback
+        // (the exempt geometry class).
+        "crates/fuse3/src/raw/session.rs",
+        "crates/fuse3/src/raw/read_phase.rs",
+        "crates/fuse3/src/raw/connection/fuse_over_uring.rs",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    assert_eq!(
+        readers, expected,
+        "the available_parallelism reader census drifted — a daemon-sizing \
+         site must read the divided root (crate::cpu::process_parallelism, \
+         or the parallelism the daemon feeds into squeezefs-ipc), and a \
+         genuine non-daemon reader joins this list EXPLICITLY with its \
+         classification"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Hybrid lane gate (2026-08-07): the shim's kernel-lane crossover threshold
 // ---------------------------------------------------------------------------
 

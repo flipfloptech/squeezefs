@@ -73,7 +73,7 @@ pub fn arm() -> std::io::Result<squeezefs_ipc::sqz_channel::mpsc::Receiver<Sig>>
 
     let (tx, rx) = squeezefs_ipc::sqz_channel::mpsc::channel::<Sig>(16);
     std::thread::Builder::new()
-        .name("sqz-signal".to_string())
+        .name(squeezefs_ipc::comm_core::comm_name("sqz-signal"))
         .spawn(move || {
             let mut buf = [0u8; 16];
             loop {

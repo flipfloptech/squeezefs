@@ -80,7 +80,7 @@ fn service() -> &'static Service {
             next_id: AtomicU64::new(1),
         }));
         std::thread::Builder::new()
-            .name("sqz-timer".to_string())
+            .name(crate::comm_core::comm_name("sqz-timer"))
             .spawn(move || service_loop(svc))
             .expect("sqz-timer thread spawns");
         svc

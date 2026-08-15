@@ -75,7 +75,7 @@ fn watch() -> &'static Watch {
             next_gen: std::sync::atomic::AtomicU64::new(1),
         }));
         std::thread::Builder::new()
-            .name("sqz-fdwatch".to_string())
+            .name(crate::comm_core::comm_name("sqz-fdwatch"))
             .spawn(move || service_loop(w))
             .expect("sqz-fdwatch thread spawns");
         w

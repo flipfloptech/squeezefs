@@ -2587,6 +2587,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         daemon: true,
         supervise,
         ref meta_lv,
+        ref options,
         ..
     } = &cli.command
     {
@@ -2702,6 +2703,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // It knows the daemon PID from its own fork —
                         // kill-by-PID discipline for free. std-only loop
                         // (the parent never starts a tokio runtime).
+                        //
+                        // PR 3 (design-full-multi-writer §5.3): N co-located
+                        // supervisors are distinct processes with per-mount
+                        // state by construction (sysfs conn id from the
+                        // mount's own st_dev, PID from the fork, no
+                        // pidfiles) — the one shared artifact was the probe
+                        // thread's comm, so seed the same per-mount suffix
+                        // the daemon derives (same slot law incl. the
+                        // -o client_slot override).
+                        let canonical = std::fs::canonicalize(&mountpoint_path)
+                            .unwrap_or_else(|_| mountpoint_path.clone())
+                            .to_string_lossy()
+                            .into_owned();
+                        let slot = squeezefs::writer_scope::client_slot_from_options(
+                            options.as_deref(),
+                        )
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| {
+                            squeezefs::writer_scope::derive_mount_slot(&canonical)
+                        });
+                        squeezefs_ipc::comm_core::set_comm_tag(slot);
                         let env_secs = |key: &str, default: u64| {
                             std::env::var(key)
                                 .ok()
@@ -4723,6 +4746,28 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
 
+            // KD-MW-2 (design-full-multi-writer §5.1): the CLIENT identity
+            // is the pair `(node_token, mount_slot)`. The slot is derived
+            // from the CANONICALIZED mount point (mount-point-stable — a
+            // restart of the same mount point is the SAME client, which is
+            // what keeps staged-crash recovery a continuity law; distinct
+            // across co-located mounts), or given explicitly with
+            // `-o client_slot=<hex8>` (the moved-mount-point remedy). A
+            // malformed value REFUSES the mount (parse_client_slot's law).
+            // Resolved HERE, before any volume/backend is touched (PR 3):
+            // set_mount_identity also seeds the per-mount thread-comm
+            // suffix, and the lazily-spawned named populations (sqz-meta,
+            // sqz-timer, …) first spawn inside the backend opens below.
+            let client_slot_override =
+                squeezefs::writer_scope::client_slot_from_options(options.as_deref())?;
+            let canonical_mount = std::fs::canonicalize(&mountpoint)
+                .unwrap_or_else(|_| mountpoint.clone())
+                .to_string_lossy()
+                .into_owned();
+            let mount_slot = client_slot_override
+                .unwrap_or_else(|| squeezefs::writer_scope::derive_mount_slot(&canonical_mount));
+            squeezefs::writer_scope::set_mount_identity(mount_slot, &canonical_mount);
+
             // KD-MW-3 (design-full-multi-writer §5.2): the EXPLICIT
             // per-mount host identity — pair-or-neither, option > env per
             // field. Resolved before any volume is touched, because it
@@ -5156,24 +5201,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // identity in would ESTALE every handle when the set is served
             // from a different host.
             squeezefs::fuse_client::set_entry_generation(&fs_generation);
-
-            // KD-MW-2 (design-full-multi-writer §5.1): the CLIENT identity
-            // is the pair `(node_token, mount_slot)`. The slot is derived
-            // from the CANONICALIZED mount point (mount-point-stable — a
-            // restart of the same mount point is the SAME client, which is
-            // what keeps staged-crash recovery a continuity law; distinct
-            // across co-located mounts), or given explicitly with
-            // `-o client_slot=<hex8>` (the moved-mount-point remedy). A
-            // malformed value REFUSES the mount (parse_client_slot's law).
-            let client_slot_override =
-                squeezefs::writer_scope::client_slot_from_options(options.as_deref())?;
-            let canonical_mount = std::fs::canonicalize(&mountpoint)
-                .unwrap_or_else(|_| mountpoint.clone())
-                .to_string_lossy()
-                .into_owned();
-            let mount_slot = client_slot_override
-                .unwrap_or_else(|| squeezefs::writer_scope::derive_mount_slot(&canonical_mount));
-            squeezefs::writer_scope::set_mount_identity(mount_slot, &canonical_mount);
 
             // §6.2 items 8/10 (incompat bit 10, ruling D9 — nothing stamps
             // it today, so this resolves to `None` on every shipped

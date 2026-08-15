@@ -2817,11 +2817,11 @@ impl FuseOverUring {
             // per-queue name; multi-member groups carry first-last as a
             // membership LABEL, not a range (comm truncates at 15 chars
             // anyway).
-            let name = if qids.len() == 1 {
+            let name = crate::comm_core::comm_name(&if qids.len() == 1 {
                 format!("fuse-over-uring-{}", qids[0])
             } else {
                 format!("fuse-over-uring-{}-{}", qids[0], qids[qids.len() - 1])
-            };
+            });
             let h = std::thread::Builder::new()
                 .name(name)
                 .spawn(move || {
@@ -2890,7 +2890,7 @@ impl FuseOverUring {
         {
             let watch = pool.clone();
             let h = std::thread::Builder::new()
-                .name("fuse-over-uring-watch".into())
+                .name(crate::comm_core::comm_name("fuse-over-uring-watch"))
                 .spawn(move || connection_watch(watch))
                 .map_err(io::Error::other)?;
             pool.workers.lock().unwrap().push(h);

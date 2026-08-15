@@ -438,9 +438,17 @@ static MOUNT_POINT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// Record this mount's client-identity half (KD-MW-2): the mount slot and
 /// the canonicalized mount point it was derived from (or overridden for).
-/// Called ONCE per process from the mount path, before any plane joins.
+/// Called ONCE per process from the mount path, before any plane joins —
+/// and before the named thread populations spawn, because it also seeds
+/// the per-mount comm suffix (design-full-multi-writer §5.3, PR 3) into
+/// EVERY crate copy of `comm_core`: squeezefs-ipc's real-dependency
+/// static (the root crate's own sites resolve through it) and the fuse3
+/// fork's `#[path]`-included copy (its own static, invisible to the
+/// former — the production-sharing precedent's one cost).
 pub fn set_mount_identity(slot: u32, canonical_mount_point: &str) {
     MOUNT_SLOT.store(slot, std::sync::atomic::Ordering::Release);
+    squeezefs_ipc::comm_core::set_comm_tag(slot);
+    fuse3::comm_core::set_comm_tag(slot);
     let _ = MOUNT_POINT.set(canonical_mount_point.to_string());
 }
 

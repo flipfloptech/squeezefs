@@ -1474,14 +1474,18 @@ impl IpcHost {
 
         let accept_host = Arc::clone(&host);
         let accept = std::thread::Builder::new()
-            .name("sqz-ipc-accept".into())
+            .name(squeezefs_ipc::comm_core::comm_name("sqz-ipc-accept"))
             .spawn(move || accept_host.accept_loop(AcceptOn::Abstract))?;
         let mut spawned = vec![accept];
         if host.path_listener.is_some() {
             let path_host = Arc::clone(&host);
             spawned.push(
                 std::thread::Builder::new()
-                    .name("sqz-ipc-accept-p".into())
+                    // Base shortened from "sqz-ipc-accept-p" (PR 3,
+                    // comm suffixes): the old 16-char base both blew the
+                    // 15-char comm budget AND base-truncated onto the
+                    // abstract accept thread's exact spelling.
+                    .name(squeezefs_ipc::comm_core::comm_name("sqz-ipc-accp"))
                     .spawn(move || path_host.accept_loop(AcceptOn::Path))?,
             );
         }
@@ -1489,7 +1493,7 @@ impl IpcHost {
             let reap_host = Arc::clone(&host);
             spawned.push(
                 std::thread::Builder::new()
-                    .name("sqz-ipc-reap".into())
+                    .name(squeezefs_ipc::comm_core::comm_name("sqz-ipc-reap"))
                     .spawn(move || reap_host.reap_loop())?,
             );
         }
@@ -1840,7 +1844,7 @@ impl IpcHost {
             self.ctl_live.fetch_add(1, Ordering::Relaxed);
             let host = Arc::clone(&self);
             let handle = std::thread::Builder::new()
-                .name("sqz-ipc-ctl".into())
+                .name(squeezefs_ipc::comm_core::comm_name("sqz-ipc-ctl"))
                 .spawn(move || host.connection_loop(sock));
             match handle {
                 Ok(h) => {
@@ -2622,7 +2626,7 @@ impl IpcHost {
             let (sender, rx) = std::sync::mpsc::channel::<ThpPrepJob>();
             let worker_host = Arc::clone(self);
             match std::thread::Builder::new()
-                .name("sqz-ipc-thp".into())
+                .name(squeezefs_ipc::comm_core::comm_name("sqz-ipc-thp"))
                 .spawn(move || worker_host.thp_prep_loop(rx))
             {
                 Ok(handle) => {
@@ -2833,7 +2837,7 @@ impl IpcHost {
             let service_host = Arc::clone(self);
             threads.push(
                 std::thread::Builder::new()
-                    .name(format!("sqz-ipc-svc{spawned}"))
+                    .name(squeezefs_ipc::comm_core::comm_name(&format!("sqz-ipc-svc{spawned}")))
                     .spawn(move || service_host.service_loop(spawned))?,
             );
             spawned += 1;

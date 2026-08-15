@@ -24,6 +24,13 @@
 //! The protocol is same-host, same-boot, and version-locked to the build
 //! commit (design KD-7) — explicitly **not** a stable ABI.
 
+// Per-mount thread-comm suffixes (design-full-multi-writer §5.3, PR 3):
+// a real module HERE (one static shared by the root crate and the shim
+// through the normal dependency) and `#[path]`-included by the fuse3
+// fork, whose copy the daemon seeds separately (the module docs carry
+// the law). A plain comment for the same doc-scope reason as
+// `env_knob_core` below.
+pub mod comm_core;
 pub mod cqe_core;
 // The ONE env-knob parsing convention (ENG-10) — pure, dependency-free, and
 // `#[path]`-shared into the root crate, the fuse3 fork and the preload shim

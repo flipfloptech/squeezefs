@@ -91,6 +91,14 @@ pub mod latency_core;
 // through this include.
 #[path = "../../squeezefs-ipc/src/env_knob_core.rs"]
 pub mod env_knob_core;
+// Per-mount thread-comm suffixes (design-full-multi-writer §5.3, PR 3) —
+// same share pattern. This copy's tag STATIC is the fork's own: the
+// daemon seeds it explicitly from `writer_scope::set_mount_identity`
+// alongside squeezefs-ipc's (an unseeded copy keeps bare names — the
+// standalone-suite posture). `sqz_time`/`sqz_fdwatch` below resolve
+// `crate::comm_core` through this include.
+#[path = "../../squeezefs-ipc/src/comm_core.rs"]
+pub mod comm_core;
 // The sqz-exec first-party task executor + its loom-modeled delivery
 // state word (design-sqz-sync Stage 1b) — canonical files in the
 // squeezefs-ipc tree, `#[path]`-included here for the TPC handler-lane

@@ -47,7 +47,7 @@ static META_EXEC: once_cell::sync::Lazy<MetaExec> = once_cell::sync::Lazy::new(|
         let exec = LaneExec::new();
         let ex = exec.clone();
         std::thread::Builder::new()
-            .name(format!("sqz-meta{i}"))
+            .name(squeezefs_ipc::comm_core::comm_name(&format!("sqz-meta{i}")))
             .spawn(move || {
                 // rip-tokio-total: no ambient runtime — timers ride the
                 // sqz-timer thread, delivery rides this lane.

@@ -365,7 +365,7 @@ impl Drop for MountHandle {
             // no executor, and the old fire-and-forget spawn discarded
             // the result the same way.
             std::thread::Builder::new()
-                .name("fuse3-unmount".to_string())
+                .name(crate::comm_core::comm_name("fuse3-unmount"))
                 .spawn(move || {
                     let _ = crate::sqz_blocking::block_on(inner.inner_unmount());
                 })
@@ -403,7 +403,7 @@ impl MountTask {
         let (tx, rx) = crate::sqz_channel::oneshot::channel();
         let latch = finished.clone();
         std::thread::Builder::new()
-            .name("fuse3-mount".to_string())
+            .name(crate::comm_core::comm_name("fuse3-mount"))
             .spawn(move || {
                 let res = crate::sqz_blocking::block_on(fut);
                 // Latch BEFORE send: an `is_finished()` observer never
@@ -5625,7 +5625,7 @@ impl TpcScheduler {
             // "sqz-ipc-svcN" (the field capture mis-attributed lane CPU
             // to the service threads exactly this way).
             std::thread::Builder::new()
-                .name(format!("fuse3-tpc{i}"))
+                .name(crate::comm_core::comm_name(&format!("fuse3-tpc{i}")))
                 .spawn(move || {
                     // Liveness word: flipped on ANY exit path (normal or
                     // panic) so the dead-lane re-dispatch gate is honest.
@@ -5676,7 +5676,7 @@ impl TpcScheduler {
             // completion — loud on spawn failure, never a silent drop,
             // and no ambient runtime requirement.
             std::thread::Builder::new()
-                .name("fuse3-tpc-fallback".to_string())
+                .name(crate::comm_core::comm_name("fuse3-tpc-fallback"))
                 .spawn(move || crate::sqz_blocking::block_on(fut))
                 .expect("fuse3-tpc-fallback thread spawns");
             return;

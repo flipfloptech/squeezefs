@@ -206,7 +206,7 @@ pub fn probe_stats_inode(mountpoint: &Path, timeout: Duration) -> bool {
     let (tx, rx) = std::sync::mpsc::channel();
     let target = mountpoint.join(".stats");
     std::thread::Builder::new()
-        .name("sqfs-supervise-probe".into())
+        .name(squeezefs_ipc::comm_core::comm_name("sqfs-supervise-probe"))
         .spawn(move || {
             let ok = std::fs::metadata(&target).is_ok();
             let _ = tx.send(ok);

@@ -6272,9 +6272,10 @@ impl DataRouter {
             );
         }
 
-        let mut sys = sysinfo::System::new();
-        sys.refresh_memory();
-        let total_memory = sys.total_memory();
+        // The fleet-SHARED system-RAM root (KD-MW-14 §5.6 — one divisor
+        // at the root, the /200_000 slope below untouched; share 1 is
+        // the raw probe, byte-identical).
+        let total_memory = crate::mem_budget::shared_system_ram_bytes();
         // Cache capacity in ENTRIES, derived from RAM: one cached layout
         // entry per 200 KB of physical memory (an entry is a
         // `CachedMetadata` + inline layout map — hundreds of bytes to a

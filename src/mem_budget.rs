@@ -534,7 +534,10 @@ impl MemBudget {
     /// Resolve the budget NOW with the sampler's exact §5.7 order (flag →
     /// env → cgroup `memory.max` × 0.8 → 70 % RAM). Mount-time consumers
     /// (the L1 transport payload-buffer cap) size against this so their
-    /// footprint agrees with what the 1 Hz sampler will enforce.
+    /// footprint agrees with what the 1 Hz sampler will enforce. The
+    /// SYSTEM roots (cgroup cage, RAM) enter divided by the fleet share
+    /// (KD-MW-14 / design-full-multi-writer §5.6 — derived tier only; the
+    /// flag and the absolute env win verbatim, undivided).
     pub fn resolve_budget_now(&self) -> u64 {
         let flag = match self.flag_budget.load(Relaxed) {
             0 => None,
@@ -544,7 +547,27 @@ impl MemBudget {
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map(|mb| mb * 1024 * 1024);
-        resolve_budget_from(flag, env, read_cgroup_memory_max(), system_ram_bytes())
+        resolve_budget_from_shared(
+            flag,
+            env,
+            read_cgroup_memory_max(),
+            system_ram_bytes(),
+            crate::cpu::fleet_share(),
+        )
+    }
+
+    /// Whether an EXPLICIT budget tier is engaged (the `--mem-budget`
+    /// flag or the absolute `SQUEEZEFS_MEM_BUDGET_MB` env) — the tiers
+    /// the fleet-share divisor never touches, and therefore the tiers
+    /// whose presence stands the §5.6 floor refusal down (an explicit
+    /// budget is the operator's own statement; only a DIVIDED root can
+    /// make a floor "unsatisfiable" in the refusal's sense).
+    fn explicit_budget_engaged(&self) -> bool {
+        self.flag_budget.load(Relaxed) != 0
+            || std::env::var("SQUEEZEFS_MEM_BUDGET_MB")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .is_some()
     }
 
     /// Production tick: resolve the budget (flag → env → cgroup × 0.8
@@ -940,6 +963,107 @@ pub fn resolve_budget_from(
         return c / 10 * 8;
     }
     ram / 10 * 7
+}
+
+/// KD-MW-14 (design-full-multi-writer §5.6): one system-root value's
+/// fleet share — `ceil(value / share)`, the ONE rounding site (UP, per
+/// the rounding doctrine: mild oversubscription of divisible resources
+/// is acceptable; silent starvation below a floor is not — floors are
+/// enforced downstream, never divided here). `share ≤ 1` is the
+/// identity (the registry refuses 0 at startup; this is the defensive
+/// library-embedding posture, never a clamp of an admitted value).
+pub fn fleet_shared_root(value: u64, share: usize) -> u64 {
+    value.div_ceil(share.max(1) as u64)
+}
+
+/// [`resolve_budget_from`] with the fleet-share divisor applied at the
+/// SYSTEM root inputs (§5.6): the cgroup cage and the RAM total become
+/// `ceil(system / share)` BEFORE the existing ×0.8 / ×0.7 laws, so the
+/// derived tier scales through the untouched formulas. The explicit
+/// tiers (flag, absolute env) pass through verbatim — the divisor
+/// modifies the derived tier only.
+pub fn resolve_budget_from_shared(
+    flag: Option<u64>,
+    env: Option<u64>,
+    cgroup_max: Option<u64>,
+    ram: u64,
+    share: usize,
+) -> u64 {
+    resolve_budget_from(
+        flag,
+        env,
+        cgroup_max.map(|c| fleet_shared_root(c, share)),
+        fleet_shared_root(ram, share),
+    )
+}
+
+/// The fleet-shared SYSTEM-RAM root (§5.6): every derived cap that sizes
+/// straight off physical memory (the RAM LRU tiers, the RAM-derived
+/// entry-count caches) reads THIS accessor instead of probing `sysinfo`
+/// itself — one divisor at the root, downstream formulas untouched.
+/// Share 1 (the default) is byte-identical to the raw probe. Percentage
+/// spellings resolved against this base honor §5.6's "percentages apply
+/// to the shared budget".
+pub fn shared_system_ram_bytes() -> u64 {
+    fleet_shared_root(system_ram_bytes(), crate::cpu::fleet_share())
+}
+
+/// §5.6's floor-refusal arithmetic, pure (the tie-test form): floors are
+/// NEVER divided, so a share whose divided derived budget cannot hold
+/// the kernel-mandated transport floor — `possible_cpus ×
+/// Q_DEPTH_FLOOR × PAYLOAD_BASE`, the per-daemon footprint the exemption
+/// class pins (the queue COUNT cannot divide; depth floors at
+/// `Q_DEPTH_FLOOR` by the never-regress law) — REFUSES the mount loud,
+/// naming the arithmetic, never silently oversubscribing the machine
+/// N×. Share 1 never refuses: the solo posture is today's (the floor
+/// oversubscribing a tiny budget mildly is the shipped never-regress
+/// behavior, not a fleet arithmetic failure).
+pub fn fleet_share_floor_refusal(
+    share: usize,
+    divided_budget: u64,
+    possible_cpus: usize,
+) -> Option<String> {
+    if share <= 1 {
+        return None;
+    }
+    use fuse3::raw::connection::fuse_over_uring::{PAYLOAD_BASE, Q_DEPTH_FLOOR};
+    let floor = possible_cpus as u64 * Q_DEPTH_FLOOR as u64 * PAYLOAD_BASE as u64;
+    if divided_budget >= floor {
+        return None;
+    }
+    Some(format!(
+        "SQUEEZEFS_FLEET_SHARE={share}: the divided derived memory budget \
+         {divided_budget} B cannot satisfy the never-divided transport payload \
+         floor {floor} B (= {possible_cpus} kernel possible CPUs × Q_DEPTH_FLOOR \
+         {qd} × {pb} B payload — kernel-mandated queue geometry, fleet-share \
+         EXEMPT per KD-MW-14). Floors hold per daemon regardless of share, so \
+         this share oversubscribes the machine instead of dividing it: reduce \
+         SQUEEZEFS_FLEET_SHARE, or set an explicit --mem-budget / \
+         SQUEEZEFS_MEM_BUDGET_MB (absolute overrides win verbatim and own \
+         their own arithmetic)",
+        qd = Q_DEPTH_FLOOR,
+        pb = PAYLOAD_BASE,
+    ))
+}
+
+/// The mount-time face of [`fleet_share_floor_refusal`]: reads the live
+/// share, stands down when an EXPLICIT budget tier is engaged (explicit
+/// wins verbatim — only a divided root can make a floor unsatisfiable),
+/// and otherwise prices the divided derived budget against the exempt
+/// transport-floor demand. `None` = mount proceeds.
+pub fn fleet_share_mount_refusal() -> Option<String> {
+    let share = crate::cpu::fleet_share();
+    if share <= 1 || MEM_BUDGET.explicit_budget_engaged() {
+        return None;
+    }
+    let divided = resolve_budget_from_shared(
+        None,
+        None,
+        read_cgroup_memory_max(),
+        system_ram_bytes(),
+        share,
+    );
+    fleet_share_floor_refusal(share, divided, crate::cpu::possible_cpus())
 }
 
 /// Red halves the parked-buffer spill threshold (§5.7 Red row — the early

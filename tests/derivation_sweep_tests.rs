@@ -976,7 +976,11 @@ fn fleet_share_divides_the_memory_root_derived_tier_only() {
         5,
         "share 0 is defensive-identity (the registry refuses it at startup)"
     );
-    assert_eq!(fleet_shared_root(u64::MAX, 3), u64::MAX / 3 + 1, "no overflow");
+    assert_eq!(
+        fleet_shared_root(u64::MAX, 2),
+        u64::MAX / 2 + 1,
+        "no overflow"
+    );
 }
 
 /// The CPU root: `ceil(raw / share)`, never 0 — the effective count every
@@ -985,11 +989,19 @@ fn fleet_share_divides_the_memory_root_derived_tier_only() {
 fn fleet_share_divides_the_cpu_root_rounding_up() {
     use squeezefs::cpu::effective_parallelism_from;
     assert_eq!(effective_parallelism_from(32, 4), 8, "the field box at N=4");
-    assert_eq!(effective_parallelism_from(32, 5), 7, "ceil(6.4) = 7 — round UP");
+    assert_eq!(
+        effective_parallelism_from(32, 5),
+        7,
+        "ceil(6.4) = 7 — round UP"
+    );
     assert_eq!(effective_parallelism_from(33, 4), 9, "ceil(8.25) = 9");
     assert_eq!(effective_parallelism_from(2, 64), 1, "never 0 — floor 1");
     assert_eq!(effective_parallelism_from(1, 1), 1);
-    assert_eq!(effective_parallelism_from(0, 4), 1, "degenerate raw never 0");
+    assert_eq!(
+        effective_parallelism_from(0, 4),
+        1,
+        "degenerate raw never 0"
+    );
     for raw in [1usize, 2, 8, 32, 192] {
         assert_eq!(
             effective_parallelism_from(raw, 1),
@@ -1179,7 +1191,10 @@ fn fleet_share_unsatisfiable_floor_refuses_naming_the_arithmetic() {
         msg.contains("Q_DEPTH_FLOOR"),
         "the refusal names the floor law: {msg}"
     );
-    assert!(msg.contains("32"), "the refusal names the possible-CPU count");
+    assert!(
+        msg.contains("32"),
+        "the refusal names the possible-CPU count"
+    );
     // Solo (share 1) never refuses — pinned above too; both directions.
     assert_eq!(fleet_share_floor_refusal(1, floor - 1, 32), None);
 }
@@ -1220,7 +1235,11 @@ fn fleet_share_exemption_list_is_pinned_to_the_kernel_mandated_set() {
     ] {
         rust_files(&root.join(tree), &mut files);
     }
-    assert!(files.len() > 100, "census roots wrong: {} files", files.len());
+    assert!(
+        files.len() > 100,
+        "census roots wrong: {} files",
+        files.len()
+    );
     let mut consumers = BTreeSet::new();
     for f in &files {
         let Ok(text) = std::fs::read_to_string(f) else {
@@ -1270,8 +1289,8 @@ fn fleet_share_exemption_list_is_pinned_to_the_kernel_mandated_set() {
 #[test]
 fn fleet_share_knob_is_registered_and_zero_refuses_at_startup() {
     use squeezefs::env_knobs::{self, Kind};
-    let knob =
-        env_knobs::lookup("SQUEEZEFS_FLEET_SHARE").expect("SQUEEZEFS_FLEET_SHARE must be registered");
+    let knob = env_knobs::lookup("SQUEEZEFS_FLEET_SHARE")
+        .expect("SQUEEZEFS_FLEET_SHARE must be registered");
     match knob.kind {
         Kind::Int { lo, hi } => {
             assert_eq!(lo, 1, "0 must be OUT of the admissible range");

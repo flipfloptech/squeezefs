@@ -1,4 +1,3 @@
-use crate::error::Result;
 use crate::tiering::memory::EvictClass;
 use bytes::Bytes;
 use std::sync::Arc;
@@ -67,16 +66,11 @@ pub struct LruCache {
 }
 
 impl LruCache {
-    pub fn new() -> Result<Self> {
-        // Query host system memory
-        let mut sys = sysinfo::System::new();
-        sys.refresh_memory();
-        let total_memory = sys.total_memory(); // In bytes
-
-        // Default to 20% of system RAM
-        let max_bytes = total_memory / 5;
-        Ok(Self::with_capacity(max_bytes))
-    }
+    // (The former `new()` — a 20 %-of-system-RAM default constructor —
+    // had NO callers and was the last system-RAM sizing read outside the
+    // fleet-shared root (KD-MW-14 §5.6): deleted per the no-dead-code
+    // law rather than converted. Every live construction sizes
+    // explicitly via `with_capacity*`.)
 
     /// Construct with a custom memory limit in bytes.
     pub fn with_capacity(max_bytes: u64) -> Self {

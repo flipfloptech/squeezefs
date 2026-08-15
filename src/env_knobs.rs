@@ -122,6 +122,8 @@ pub static KNOBS: &[Knob] = &[
     k("SQUEEZEFS_SUPERVISE_UNRESPONSIVE_SECS", int(1, 86_400), "30", "`mount --supervise` unresponsiveness threshold before abort, seconds."),
     // -- Memory budget (R5) ---------------------------------------------
     k("SQUEEZEFS_MEM_BUDGET_MB", int(1, 1 << 30), "derived", "R5 memory budget, MiB (absolute > pct > cgroup/RAM derivation)."),
+    // -- Fleet share (KD-MW-14, design-full-multi-writer §5.6) -----------
+    k("SQUEEZEFS_FLEET_SHARE", int(1, 4096), "1", "KD-MW-14 (design-full-multi-writer §5.6): N co-located daemons divide the machine — ONE divisor applied at the ROOT INPUTS of the derived-sizing tree (the memory-budget root and the sizing CPU-count root become ceil(system/share)), so every downstream derived formula scales untouched. DERIVED TIER ONLY: explicit absolute/percentage knobs keep winning verbatim; FLOORS are never divided (a share whose divided budget cannot satisfy the never-divided transport floor refuses the MOUNT naming the arithmetic); the kernel-mandated-geometry exemption class (the FUSE-over-uring queue COUNT — one queue per possible CPU or the session never becomes ready) is pinned by tie test. Never auto-detected: set by the operator or the mw_fleet.sh rig. 1 = today's whole-machine posture, byte-identical."),
     // -- Metadata (KV v3) -----------------------------------------------
     k("SQUEEZEFS_META_NODE_CACHE_MB", int(1, 1 << 30), "derived", "Per-volume KV node-cache budget, MiB (absolute wins over _PCT)."),
     k("SQUEEZEFS_META_NODE_CACHE_PCT", int(1, 100), "derived", "Per-volume KV node-cache budget as a percentage of the R5 budget."),

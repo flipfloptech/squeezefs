@@ -7195,9 +7195,10 @@ impl SqueezefsFilesystem {
         let (writeback_tx, writeback_rx) = squeezefs_ipc::sqz_channel::mpsc::channel(queue_cap);
         let (fold_tx, fold_rx) = squeezefs_ipc::sqz_channel::mpsc::channel(1024);
         let (reclaim_tx, reclaim_rx) = squeezefs_ipc::sqz_channel::mpsc::channel(100000);
-        let mut sys = sysinfo::System::new();
-        sys.refresh_memory();
-        let total_memory = sys.total_memory();
+        // The fleet-SHARED system-RAM root (KD-MW-14 §5.6 — one divisor
+        // at the root, the entry-count slopes below untouched; share 1
+        // is the raw probe, byte-identical).
+        let total_memory = crate::mem_budget::shared_system_ram_bytes();
         let dir_entry_capacity = std::cmp::max(50_000, total_memory / 200_000);
         // DLM S5 item 4 — TTL alignment (spec §6.8: "`dir_entry_cache_v3`'s
         // 300 s TTL cut to match"). §6.3 lists this cache first among the

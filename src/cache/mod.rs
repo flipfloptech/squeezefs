@@ -97,10 +97,12 @@ impl TieredCache {
     ) -> Result<Self> {
         let gds = gds::GdsCache::new(staging_dirs.clone());
 
-        // 1. Get memory size limit
-        let mut sys = sysinfo::System::new();
-        sys.refresh_memory();
-        let total_memory = sys.total_memory(); // In bytes
+        // 1. Get memory size limit — the fleet-SHARED system-RAM root
+        // (KD-MW-14 / design-full-multi-writer §5.6: one divisor at the
+        // root; the /10 tier fractions below stay untouched, percentage
+        // spellings resolve against the shared base, absolute spellings
+        // win verbatim. Share 1 = the raw probe, byte-identical).
+        let total_memory = crate::mem_budget::shared_system_ram_bytes();
 
         let read_mem_limit =
             if let Some(cfg) = read_mem_cache_size.filter(|c| !c.is_empty() && *c != "none") {

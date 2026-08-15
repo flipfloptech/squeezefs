@@ -2890,14 +2890,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } = &cli.command
     {
         // R5 (§5.7): the flag wins the budget resolution order. Parsed
-        // before mount so the sampler's first tick already sees it.
+        // before mount so the sampler's first tick already sees it. A
+        // percentage spelling resolves against the fleet-SHARED system
+        // root (KD-MW-14 / §5.6: "percentages apply to the shared
+        // budget"; share 1 = the raw probe, byte-identical); an absolute
+        // spelling is unaffected by the base and wins verbatim.
         if let Some(ref mb) = mem_budget {
-            let mut sys = sysinfo::System::new();
-            sys.refresh_memory();
-            match squeezefs::cache::parse_size_string(mb, sys.total_memory()) {
+            match squeezefs::cache::parse_size_string(
+                mb,
+                squeezefs::mem_budget::shared_system_ram_bytes(),
+            ) {
                 Ok(bytes) => squeezefs::mem_budget::MEM_BUDGET.set_flag_budget(bytes),
                 Err(e) => mount_bootstrap_fail(&format!("invalid --mem-budget: {e}")),
             }
+        }
+        // KD-MW-14 (§5.6): floors are never divided — a fleet share whose
+        // divided DERIVED budget cannot hold the kernel-mandated transport
+        // floor refuses the mount here, naming the arithmetic (explicit
+        // budget tiers win verbatim and stand the check down).
+        if let Some(report) = squeezefs::mem_budget::fleet_share_mount_refusal() {
+            mount_bootstrap_fail(&report);
         }
         // NOTE: failures below may run in the daemonized CHILD (stderr →
         // /dev/null or the log file): `mount_bootstrap_fail` also reports

@@ -5550,4 +5550,57 @@ mod grant_table_models {
             assert_eq!(table.grants_len(), 0, "e1's custody did not survive");
         });
     }
+
+    /// The `grant()` verb's window: the shipped sequence is
+    /// `lease_current` → (the authority's arbitration AWAITS) →
+    /// `commit_grant`. Custody law: a grant must never OUTLIVE its lease
+    /// — after any interleaving with a revoke, every grant left in the
+    /// table belongs to a live lease (a revoke's contract is "the bytes
+    /// become grantable again", and an orphan grant would hold the
+    /// authority's own arbiter lease forever).
+    #[test]
+    fn a_granted_custody_never_outlives_its_lease() {
+        loom::model(|| {
+            let table: Arc<GrantTableCore<u64>> = Arc::new(GrantTableCore::new());
+            let epoch = table.join(CLIENT, 0x77, None, 0, TTL_MS, |_| {
+                panic!("a fresh join kills nobody")
+            });
+
+            let granter = {
+                let table = Arc::clone(&table);
+                thread::spawn(move || {
+                    // The shipped `WriteCustodyOwner::grant` shape: the
+                    // lease check, then the arbitration await (loom's
+                    // preemption point), then the commit.
+                    if table.lease_current(CLIENT, epoch) {
+                        Some(table.commit_grant(CLIENT, epoch, 9, None, 0xA))
+                    } else {
+                        None
+                    }
+                })
+            };
+            let killer = {
+                let table = Arc::clone(&table);
+                thread::spawn(move || table.revoke(CLIENT))
+            };
+
+            let granted = granter.join().unwrap();
+            let killed = killer.join().unwrap();
+
+            // The revoke observed whatever custody existed at its
+            // linearization point; everything REMAINING must belong to a
+            // live lease.
+            let orphans = table.grants_snapshot_with(|id, g| (id, g.client.clone(), g.lease_epoch));
+            for (id, client, lease_epoch) in &orphans {
+                assert!(
+                    table.lease_current(client, *lease_epoch),
+                    "orphan custody: grant {id} for '{client}' rides dead lease epoch \
+                     {lease_epoch} (granted={granted:?}, killed={}) — the authority's own \
+                     arbiter lease on those bytes is now unreachable and the ino is \
+                     unigrantable forever",
+                    killed.is_some(),
+                );
+            }
+        });
+    }
 }

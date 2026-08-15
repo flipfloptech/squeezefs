@@ -1344,3 +1344,106 @@ async fn a_revoke_under_load_stops_one_writer_and_not_the_other() {
     drop(la);
     drop(lb);
 }
+
+// ---------------------------------------------------------------------------
+// 16. The grant()-vs-revoke window (the rung-4 grant_table_core loom finding)
+// ---------------------------------------------------------------------------
+
+/// Contract (the rung-4 `grant_table_core` loom model
+/// `a_granted_custody_never_outlives_its_lease`, adjudicated 2026-08-15):
+/// a lease that dies while its acquire is PARKED in the authority's
+/// arbitration never receives committed custody. The mid-await revoke
+/// retires the acquisition as `CUSTODY_CONFLICT`, the authority's own
+/// arbiter lease releases with it, `dlm_custody_held` converges to 0 at
+/// quiesce, and a subsequent acquire of the SAME ino SUCCEEDS — the
+/// orphan-grant wedge's absence, pinned behaviorally.
+///
+/// The window is deterministic without a seam (current-thread runtime —
+/// yields, never sleeps): "node-b" holds custody of the ino, so
+/// "node-a"'s acquire passes its lease check and PARKS in arbitration
+/// (`is_finished` proves the arrangement); the revoke lands while it is
+/// parked; releasing node-b's hold then wakes the parked arbitration
+/// AFTER the lease died — exactly the loom model's failing schedule.
+#[tokio::test]
+async fn a_revoke_during_a_parked_acquire_never_commits_custody() {
+    let _serial = serial();
+    let _restore = restore();
+    let (owner, _ms) = owner_with_quarantine(None).await;
+
+    let join = |client: &str| data_grant::JoinFrame {
+        schema: data_grant::CUSTODY_SCHEMA,
+        client: client.to_string(),
+        pr_key: 0,
+        prior_epoch: None,
+    };
+    let acquire = |client: &str, epoch: u64, wait_ms: u64| data_grant::AcquireFrame {
+        schema: data_grant::CUSTODY_SCHEMA,
+        client: client.to_string(),
+        lease_epoch: epoch,
+        ino: 9,
+        span: None,
+        concurrent_write: false,
+        wait_ms,
+    };
+
+    let lease_a = owner.join(&join("node-a")).expect("node-a joins");
+    let lease_b = owner.join(&join("node-b")).expect("node-b joins");
+
+    // node-b holds the ino: node-a's acquire must park in arbitration.
+    let held_b = owner
+        .grant(&acquire("node-b", lease_b.epoch, 0))
+        .await
+        .expect("node-b takes custody of ino 9");
+
+    let parked = {
+        let owner = Arc::clone(&owner);
+        let frame = acquire("node-a", lease_a.epoch, 60_000);
+        tokio::spawn(async move { owner.grant(&frame).await })
+    };
+    // Current-thread runtime: yields run the acquire to its arbitration
+    // park (it cannot complete — node-b holds the bytes).
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !parked.is_finished(),
+        "the acquire must be parked in arbitration behind node-b's hold"
+    );
+
+    // The revoke lands mid-arbitration — the loom schedule's step.
+    let dead = owner.revoke_client("node-a", "test: revoked while its acquire was parked");
+    assert_eq!(dead.len(), 1, "node-a's custody died");
+
+    // Releasing node-b's hold wakes the parked arbitration AFTER the
+    // lease died.
+    assert_eq!(owner.release("node-b", &[held_b.grant_id]), 1);
+
+    let outcome = parked.await.expect("the acquire task completes");
+    assert_eq!(
+        outcome.err(),
+        Some(data_grant::CUSTODY_CONFLICT),
+        "custody committed under a DEAD lease epoch: the mid-await revoke must retire \
+         the acquisition as a conflict, never hand out an orphan grant"
+    );
+
+    // Convergence at quiesce: nothing held, nothing leaked.
+    assert_eq!(
+        owner.held(),
+        0,
+        "dlm_custody_held must converge to 0 — an orphan grant here is the permanent wedge"
+    );
+    assert!(owner.grants_snapshot().is_empty());
+
+    // The wedge's absence: the SAME ino is grantable again.
+    let lease_c = owner.join(&join("node-c")).expect("node-c joins");
+    let regrant = owner
+        .grant(&acquire("node-c", lease_c.epoch, 0))
+        .await
+        .expect(
+            "custody of the ino must be grantable after the revoke — a refusal here IS \
+             the orphan-grant wedge",
+        );
+    assert_eq!(owner.held(), 1);
+    assert_eq!(owner.release("node-c", &[regrant.grant_id]), 1);
+    assert_eq!(owner.held(), 0);
+}

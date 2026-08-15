@@ -719,4 +719,136 @@ DD_SERVES1=$(stats ipc_direct_drive_serves)
 [ "$(stats ipc_sessions_poisoned)" -eq 0 ] || fail "poisoned sessions after the direct-drive soak"
 echo "OK: direct-drive kill-9 soak (5 cycles, engaged +$((DD_SERVES1-DD_SERVES0)) serves, zero residue)"
 
+# 2m. TWO CONCURRENT interception mounts (design-full-multi-writer §5.3,
+# PR 3 `fix/mw-colocated-collisions` — the rung's acceptance leg): with
+# N `-o interception` mounts on one box, one shim process must bind each
+# fd to the RIGHT mount's session host — discovery is keyed by MOUNT
+# PATH (the bootstrap xattr is answered by the fd's own mount; the §5.2
+# rule-3 fd screen refuses foreign-mount fds). Engagement counters per
+# mount prove which session served: a file on mount A must never ride
+# mount B's ring. Plus the same rung's comm-suffix row live: explicit
+# `-o client_slot` makes the per-daemon suffixes deterministic (ma/mb).
+MOUNT_DIR_B="${MOUNT_DIR_B:-/tmp/squeezefs_il_mount_b}"
+STAGING_DIR_B="${STAGING_DIR_B:-/tmp/squeezefs_il_staging_b}"
+LOG_B=/tmp/squeezefs_il_gate_b.log
+
+umount "$MOUNT_DIR" 2>/dev/null || umount -l "$MOUNT_DIR" 2>/dev/null || true
+deadline=$((SECONDS + 20))
+while pgrep -x squeezefs >/dev/null 2>&1; do
+    if [ "$SECONDS" -ge "$deadline" ]; then
+        killall -9 squeezefs 2>/dev/null || true
+        sleep 1
+        break
+    fi
+    sleep 0.5
+done
+umount "$MOUNT_DIR_B" 2>/dev/null || umount -l "$MOUNT_DIR_B" 2>/dev/null || true
+mkdir -p "$MOUNT_DIR_B" "$STAGING_DIR_B"
+rm -f "$LOG_B"
+truncate -s 1G /dev/shm/squeezefs_il_meta_b
+truncate -s 1G /dev/shm/squeezefs_il_backend_b
+
+cleanup_two_mounts() {
+    umount "$MOUNT_DIR" 2>/dev/null || umount -l "$MOUNT_DIR" 2>/dev/null || true
+    umount "$MOUNT_DIR_B" 2>/dev/null || umount -l "$MOUNT_DIR_B" 2>/dev/null || true
+    rm -f /dev/shm/squeezefs_il_meta /dev/shm/squeezefs_il_backend \
+        /dev/shm/squeezefs_il_meta_b /dev/shm/squeezefs_il_backend_b
+    rm -rf "$T" "$STAGING_DIR" "$STAGING_DIR_B"
+}
+trap cleanup_two_mounts EXIT
+
+"$SQUEEZEFS_BIN" format \
+    sqmeta:///dev/shm/squeezefs_il_meta_b \
+    sqdata:///dev/shm/squeezefs_il_backend_b \
+    --disk-cache-paths "$STAGING_DIR_B" \
+    --force
+
+RUST_LOG=info "$SQUEEZEFS_BIN" mount \
+    sqmeta:///dev/shm/squeezefs_il_meta \
+    "$MOUNT_DIR" \
+    --daemon --interception --disk-cache-size 500MB \
+    --log-file "$LOG" --allow-other -o client_slot=0000000a
+RUST_LOG=info "$SQUEEZEFS_BIN" mount \
+    sqmeta:///dev/shm/squeezefs_il_meta_b \
+    "$MOUNT_DIR_B" \
+    --daemon --interception --disk-cache-size 500MB \
+    --log-file "$LOG_B" --allow-other -o client_slot=0000000b
+sleep 3
+mountpoint -q "$MOUNT_DIR" || { cat "$LOG" || true; fail "two-mount leg: mount A failed"; }
+mountpoint -q "$MOUNT_DIR_B" || { cat "$LOG_B" || true; fail "two-mount leg: mount B failed"; }
+chmod 1777 "$MOUNT_DIR" "$MOUNT_DIR_B"
+
+stats_b() { # stats_b <key>
+    python3 -c "import json,sys; print(json.load(open('$MOUNT_DIR_B/.stats'))['metrics'].get('$1', 0))"
+}
+
+# One shim PROCESS, fds bound on BOTH mounts (the discovery test proper:
+# both blobs live in one registry, sessions keyed by the fd's mount).
+A_R0=$(stats ipc_ops_read);   A_W0=$(stats ipc_ops_write)
+B_R0=$(stats_b ipc_ops_read); B_W0=$(stats_b ipc_ops_write)
+LD_PRELOAD="$SO" SQUEEZEFS_IPC_ALLOW_DEV=1 python3 - "$MOUNT_DIR" "$MOUNT_DIR_B" <<'EOF'
+import os, sys
+pa, pb = sys.argv[1], sys.argv[2]
+fa = os.open(pa + "/two_a.bin", os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+fb = os.open(pb + "/two_b.bin", os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+da = b"A" * 65536
+db = b"B" * 65536
+for i in range(64):
+    assert os.pwrite(fa, da, i * 65536) == 65536
+    assert os.pwrite(fb, db, i * 65536) == 65536
+for i in range(64):
+    assert os.pread(fa, 65536, i * 65536) == da, "mount A content wrong"
+    assert os.pread(fb, 65536, i * 65536) == db, "mount B content wrong"
+os.close(fa); os.close(fb)
+EOF
+A_R1=$(stats ipc_ops_read);   A_W1=$(stats ipc_ops_write)
+B_R1=$(stats_b ipc_ops_read); B_W1=$(stats_b ipc_ops_write)
+[ "$((A_W1 - A_W0))" -ge 64 ] && [ "$((A_R1 - A_R0))" -ge 64 ] \
+    || fail "two-mount leg: mount A ops bypassed its ring (r Δ$((A_R1-A_R0)), w Δ$((A_W1-A_W0)))"
+[ "$((B_W1 - B_W0))" -ge 64 ] && [ "$((B_R1 - B_R0))" -ge 64 ] \
+    || fail "two-mount leg: mount B ops bypassed its ring (r Δ$((B_R1-B_R0)), w Δ$((B_W1-B_W0)))"
+echo "OK: one shim process, both mounts served by their own rings" \
+     "(A r+$((A_R1-A_R0))/w+$((A_W1-A_W0)), B r+$((B_R1-B_R0))/w+$((B_W1-B_W0)))"
+
+# Never-cross: exercise ONLY mount B — mount A's ring counters must not
+# move at all (a file on mount B never rides mount A's ring).
+A_R2=$(stats ipc_ops_read);   A_W2=$(stats ipc_ops_write)
+B_R2=$(stats_b ipc_ops_read)
+ILP dd if="$MOUNT_DIR_B/two_b.bin" of=/dev/null bs=64k status=none
+A_R3=$(stats ipc_ops_read);   A_W3=$(stats ipc_ops_write)
+B_R3=$(stats_b ipc_ops_read)
+[ "$((B_R3 - B_R2))" -ge 32 ] || fail "two-mount leg: B-only reads bypassed B's ring (Δ$((B_R3-B_R2)))"
+[ "$A_R3" -eq "$A_R2" ] && [ "$A_W3" -eq "$A_W2" ] \
+    || fail "two-mount leg: B-only traffic moved mount A's ring (r Δ$((A_R3-A_R2)), w Δ$((A_W3-A_W2))) — cross-mount serve"
+echo "OK: never-cross (B-only traffic: B r+$((B_R3-B_R2)), A rings dead still)"
+
+# Comm suffixes (the same rung's attribution row): with the explicit
+# client_slot values the suffixes are deterministic — daemon A's named
+# threads end in "ma", B's in "mb", and every comm fits the kernel's
+# 15-char budget. Match daemons to mounts by their cmdline mount arg.
+PID_A=""; PID_B=""
+for pid in $(pgrep -x squeezefs); do
+    if tr '\0' '\n' < "/proc/$pid/cmdline" | grep -qx "$MOUNT_DIR_B"; then PID_B=$pid
+    elif tr '\0' '\n' < "/proc/$pid/cmdline" | grep -qx "$MOUNT_DIR"; then PID_A=$pid
+    fi
+done
+[ -n "$PID_A" ] && [ -n "$PID_B" ] || fail "two-mount leg: could not map daemons to mounts"
+check_comms() { # check_comms <pid> <suffix> <label>
+    local pid=$1 sfx=$2 label=$3 comms
+    comms=$(cat /proc/"$pid"/task/*/comm 2>/dev/null || true)
+    while IFS= read -r c; do
+        [ "${#c}" -le 15 ] || fail "two-mount leg: $label thread comm '$c' blows the 15-char budget"
+    done <<<"$comms"
+    echo "$comms" | grep -Eq "^sqz-ipc-svc[0-9]+$sfx\$" \
+        || fail "two-mount leg: $label has no sqz-ipc-svc*$sfx thread (comm suffix missing)"
+    echo "$comms" | grep -Eq "^sqz-meta[0-9]+$sfx\$" \
+        || fail "two-mount leg: $label has no sqz-meta*$sfx thread (comm suffix missing)"
+}
+check_comms "$PID_A" ma "daemon A"
+check_comms "$PID_B" mb "daemon B"
+echo "OK: per-mount comm suffixes (daemon A *ma, daemon B *mb, all within budget)"
+
+umount "$MOUNT_DIR_B" 2>/dev/null || umount -l "$MOUNT_DIR_B" 2>/dev/null || true
+echo "OK: two concurrent interception mounts (discovery by mount path, never-cross, comm suffixes)"
+
 echo "PRELOAD GATE (both legs) PASSED"

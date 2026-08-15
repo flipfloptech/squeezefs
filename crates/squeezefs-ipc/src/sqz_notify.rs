@@ -284,6 +284,42 @@ mod tests {
         block_on(fut);
     }
 
+    /// THE meta-slot-migration wedge pin (todo-24, 2026-08-15 — the
+    /// `test_remove_meta_capacity_preflight_refuses_honestly` ~50 %
+    /// futex-park): a `notify_waiters` landing between `notified()`
+    /// CREATION and its first poll was LOST — the old `async fn` body
+    /// was inert until polled, so the waiter registered AFTER the epoch
+    /// bump (live capture: waiter `registered_epoch == st.epoch`,
+    /// `completed_upto == pos`, waiter list len 1) and parked forever.
+    /// The journal's `wait_completed_upto` create-recheck-await idiom
+    /// depends on creation-time registration; the tick backstop only
+    /// re-polls the INNER epoch-gated future, so it can never heal
+    /// this. Law: `notified()` registers AT CREATION.
+    #[test]
+    fn notify_between_creation_and_first_poll_is_never_lost() {
+        let n = Notify::new();
+        let fut = n.notified(); // created, NOT yet polled
+        n.notify_waiters(); // the wake that used to be lost
+        let out = block_on(crate::sqz_time::timeout(Duration::from_millis(300), fut));
+        assert!(
+            out.is_ok(),
+            "a notify_waiters between notified() creation and its first poll \
+             must complete the waiter (creation-time registration)"
+        );
+    }
+
+    /// The same law for `notify_one` (its stored permit already covered
+    /// the pre-registration shape; pinned so the eager-registration
+    /// change can never regress it).
+    #[test]
+    fn notify_one_between_creation_and_first_poll_is_never_lost() {
+        let n = Notify::new();
+        let fut = n.notified();
+        n.notify_one();
+        let out = block_on(crate::sqz_time::timeout(Duration::from_millis(300), fut));
+        assert!(out.is_ok(), "notify_one before the first poll must serve");
+    }
+
     #[test]
     fn notify_waiters_releases_registered_only() {
         let n = Arc::new(Notify::new());

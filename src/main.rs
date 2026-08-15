@@ -190,7 +190,7 @@ enum Commands {
     /// On a writer-scoped volume set, staging roots are bound to a
     /// client identity (node + mount slot). Remounting at a different
     /// path strands the old slot's staged residue; every mount reports
-    /// it loudly until it is resolved here (or adopted by mounting with
+    /// it until it is resolved here (or adopted by mounting with
     /// -o client_slot=<hex8>). Offline verbs: they take the format-grade
     /// live-client refusal and never touch a live mount's roots.
     Staging {
@@ -1201,10 +1201,10 @@ enum TargetActions {
 enum StagingActions {
     /// Re-bind a dead client slot's staging residue to this node
     ///
-    /// The residue root's generation marker is re-bound (the crash-safe
-    /// KD-8 two-phase rebind) from the dead slot to this node, so the
-    /// next mount of this set on this node adopts its durable staged
-    /// payloads. PENDING write custody refuses the rebind (its record
+    /// The residue root's generation marker is re-bound (a crash-safe
+    /// two-phase rebind) from the dead slot to this node, so the next
+    /// mount of this set on this node adopts its durable staged
+    /// payloads. Pending write custody refuses the rebind (its record
     /// keys carry the dead slot and cannot be re-keyed): drain it first
     /// by mounting with -o client_slot=<hex8>.
     Adopt {

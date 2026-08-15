@@ -292,16 +292,16 @@ pub fn spawn_reader_revalidation(
             // first volume is polled.
             let pass_start = Instant::now();
             let mut advanced_any = false;
-            for vol in &volumes {
-                match poller.poll_at(vol, pass_start).await {
-                    // Not due yet (a wake arrived early) — nothing to do.
-                    Ok(None) => {}
-                    Ok(Some(out)) if out.advanced => {
+            // One PASS over the whole set (a volume the cadence skipped —
+            // a wake arrived early — contributes no entry).
+            for (idx, res) in poller.poll_set_at(&volumes, pass_start).await {
+                match res {
+                    Ok(out) if out.advanced => {
                         advanced_any = true;
                         log::debug!(
                             "reader revalidation: {} epoch {} → {} ({} node(s) dropped, {} \
                                  retained, {} block key(s) purged)",
-                            vol.device_path().display(),
+                            volumes[idx].device_path().display(),
                             out.from_epoch,
                             out.epoch,
                             out.dropped,
@@ -311,11 +311,11 @@ pub fn spawn_reader_revalidation(
                     }
                     // The inert poll — the common case under an idle
                     // writer, and deliberately free (no drop, no purge).
-                    Ok(Some(_)) => {}
+                    Ok(_) => {}
                     Err(e) => log::warn!(
                         "reader revalidation pass failed on {}: {e} (the reader keeps \
                          serving its current epoch and retries next pass)",
-                        vol.device_path().display()
+                        volumes[idx].device_path().display()
                     ),
                 }
             }

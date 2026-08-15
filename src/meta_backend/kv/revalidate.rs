@@ -172,6 +172,9 @@ impl RevalidationPoller {
 
     /// Poll if due: one ledger read plus, when the record is newer, root
     /// adoption and the drop pass. `Ok(None)` = not due yet.
+    ///
+    /// This is the ONE-volume form (its `mark` is per-poller state); a
+    /// reader mounted over a volume SET drives [`Self::poll_set_at`].
     pub async fn poll_at(
         &self,
         be: &Arc<KvMetaBackend>,
@@ -182,6 +185,29 @@ impl RevalidationPoller {
         }
         self.mark(now);
         be.revalidate_reader().await.map(Some)
+    }
+
+    /// One revalidation pass over a reader's volume SET — the composition
+    /// `crate::ro_coherence::spawn_reader_revalidation` drives once per
+    /// cadence tick. Returns one `(volume index, outcome)` entry per volume
+    /// actually POLLED this call: a volume the cadence skipped contributes
+    /// no entry, and a failing volume never suppresses its siblings'
+    /// entries (the driver logs each failure and the reader keeps serving
+    /// that volume's current epoch).
+    pub async fn poll_set_at(
+        &self,
+        volumes: &[Arc<KvMetaBackend>],
+        now: Instant,
+    ) -> Vec<(usize, Result<RevalidateOutcome, KvError>)> {
+        let mut out = Vec::with_capacity(volumes.len());
+        for (idx, vol) in volumes.iter().enumerate() {
+            match self.poll_at(vol, now).await {
+                Ok(None) => {}
+                Ok(Some(o)) => out.push((idx, Ok(o))),
+                Err(e) => out.push((idx, Err(e))),
+            }
+        }
+        out
     }
 }
 

@@ -342,6 +342,22 @@ async fn parked_read_never_serves_reused_or_freed_key() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parked_read_never_serves_reused_or_freed_key_v3() {
+    // B4c-ii: this pin's PREMISE is the accumulation displace→free→
+    // reuse ABA (the harness asserts the allocator hands b0's freed key
+    // back) — the overwrite overlay changes displacement timing (epoch
+    // park) and breaks the premise, so the lever is OFF here. The
+    // OVERLAY-engaged recycled-key law is pinned by
+    // `stress_recycled_keys_v3` below, which deliberately RUNS WITH the
+    // shipped default (it convicted the 2026-08-14 compose
+    // fetch-vs-terminal wrong-serve).
+    squeezefs::device_overlay::set_overlay_overwrite_for_tests(false);
+    struct LeverReset;
+    impl Drop for LeverReset {
+        fn drop(&mut self) {
+            squeezefs::device_overlay::clear_device_overlay_for_tests();
+        }
+    }
+    let _r = LeverReset;
     parked_read_never_serves_reused_or_freed_key().await;
 }
 

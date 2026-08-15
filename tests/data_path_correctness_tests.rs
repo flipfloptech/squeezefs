@@ -1056,6 +1056,12 @@ async fn test_write_through_reused_key_purges_stale_read_tiers() {
     // (the epoch's own displaced handling is pinned in
     // tests/rewrite_shadow_tests.rs).
     squeezefs::routing::set_rewrite_shadow(false);
+    // B4c-ii: the overwrite OVERLAY (default ON) also owns this shape —
+    // like the patch/in-place/shadow levers above, it is pinned OFF so
+    // the durable CoW displace+free+reuse machinery under test actually
+    // runs (the overlay's own displaced handling is pinned in
+    // tests/overlay_overwrite_tests.rs).
+    squeezefs::device_overlay::set_overlay_overwrite_for_tests(false);
     let block = 65536usize;
     let ino = create(&h, "reuse_purge").await;
     let path = format!("inode_{ino}");
@@ -1140,6 +1146,7 @@ async fn test_write_through_reused_key_purges_stale_read_tiers() {
     );
     squeezefs::fuse_client::set_inplace_overwrite(false);
     squeezefs::routing::set_rewrite_shadow(true);
+    squeezefs::device_overlay::clear_device_overlay_for_tests();
 }
 
 // ---------------------------------------------------------------------------

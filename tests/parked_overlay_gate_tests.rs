@@ -75,6 +75,11 @@ struct H {
 fn reset_knobs(patch_max: u64) {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", BS.to_string());
     squeezefs::fuse_client::set_patch_max_bytes(patch_max);
+    // B4c-ii: the overwrite OVERLAY (default ON) would otherwise own
+    // this suite's aligned mapped overwrites — pinned OFF: the suite's
+    // subject is the ACCUMULATION checkout-park gate (the overlay's own
+    // gate interactions are pinned in tests/overlay_overwrite_tests.rs).
+    squeezefs::device_overlay::set_overlay_overwrite_for_tests(false);
     squeezefs::fuse_client::set_fold_max_extents(64);
     squeezefs::fuse_client::set_fold_max_bytes(1024 * 1024);
     squeezefs::fuse_client::set_parked_cap_buffers(256);

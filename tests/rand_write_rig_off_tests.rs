@@ -72,6 +72,11 @@ async fn make(test_id: &str) -> H {
     // shapes used here are W1 patch-eligible since RW2 — pin the patch
     // OFF for this binary (extent_patch_tests owns patch-on coverage).
     squeezefs::fuse_client::set_patch_max_bytes(0);
+    // B4c-ii: the overwrite OVERLAY (default ON) would take this
+    // suite's aligned mapped overwrites instead of the ACCUMULATION
+    // machinery under test — lever OFF (the overlay's own laws are
+    // pinned in tests/overlay_overwrite_tests.rs).
+    squeezefs::device_overlay::set_overlay_overwrite_for_tests(false);
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", BS.to_string());
     let dlm = DlmClient::new().unwrap();
 

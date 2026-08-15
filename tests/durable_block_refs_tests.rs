@@ -1400,6 +1400,14 @@ async fn fs_durable_refcount(h: &FsH, offset: u64) -> u32 {
 /// delta-eligible by every caller-half clause. Returns
 /// `(a0_key, b1_key, k_new)`.
 async fn fs_shadow_then_mid_epoch_publish(h: &FsH, ino: u64) -> (String, String, String) {
+    // B4c-ii: the overwrite OVERLAY (default ON) would take this
+    // whole-block mapped write and feed the epoch on the DETACHED
+    // publish (its note plumbing is pinned in
+    // tests/overlay_overwrite_tests.rs::hazard5); this helper pins the
+    // ACK-path accumulation feed's synchronous note specifically —
+    // lever OFF for the fixture (callers restore via
+    // clear_device_overlay_for_tests at their end).
+    squeezefs::device_overlay::set_overlay_overwrite_for_tests(false);
     let map_a = fs_ram_map(h, ino).await;
     let a0 = map_a.get(&0).expect("block 0 mapped").clone();
 
@@ -1457,6 +1465,13 @@ async fn fs_shadow_then_mid_epoch_publish(h: &FsH, ino: u64) -> (String, String,
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mid_epoch_delta_publish_cannot_strand_pending_shadow_notes_across_a_crash() {
     let _g = fs_serial().await;
+    struct LeverReset;
+    impl Drop for LeverReset {
+        fn drop(&mut self) {
+            squeezefs::device_overlay::clear_device_overlay_for_tests();
+        }
+    }
+    let _r = LeverReset;
     let meta = NamedTempFile::new().unwrap();
     format_meta_stamped(meta.path()).await;
     let data = data_file();
@@ -1545,6 +1560,13 @@ async fn mid_epoch_delta_publish_cannot_strand_pending_shadow_notes_across_a_cra
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pending_shadow_notes_land_durably_by_the_epoch_close() {
     let _g = fs_serial().await;
+    struct LeverReset;
+    impl Drop for LeverReset {
+        fn drop(&mut self) {
+            squeezefs::device_overlay::clear_device_overlay_for_tests();
+        }
+    }
+    let _r = LeverReset;
     let meta = NamedTempFile::new().unwrap();
     format_meta_stamped(meta.path()).await;
     let data = data_file();

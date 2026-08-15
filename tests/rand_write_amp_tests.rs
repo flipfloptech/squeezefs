@@ -123,6 +123,11 @@ async fn make(test_id: &str) -> H {
     // Default W1 patch posture; accumulation-pipeline pins set 0 AFTER
     // their make() (never leaks forward).
     squeezefs::fuse_client::set_patch_max_bytes(512 * 1024);
+    // B4c-ii: the overwrite OVERLAY (default ON) would take this
+    // suite's aligned mapped overwrites instead of the ACCUMULATION
+    // machinery under test — lever OFF (the overlay's own laws are
+    // pinned in tests/overlay_overwrite_tests.rs).
+    squeezefs::device_overlay::set_overlay_overwrite_for_tests(false);
     let dlm = DlmClient::new().unwrap();
 
     let b = NamedTempFile::new().unwrap();

@@ -1662,6 +1662,29 @@ async fn eventually(mut f: impl FnMut() -> bool, what: &str) {
     }
 }
 
+/// Kill-9 teardown: EXPLICITLY drop every harness field (empirically,
+/// dropping through a `..` rest-pattern left `routed` pinned past the
+/// same-process flock-teardown bound on this suite's shape — the
+/// explicit destructure releases within ms), returning the two backing
+/// files for the session-2 remount.
+fn dismantle(h: H) -> (NamedTempFile, NamedTempFile) {
+    let H {
+        fs,
+        routed,
+        backing,
+        m,
+        staging_path,
+        _s,
+        req,
+    } = h;
+    drop(routed);
+    drop(staging_path);
+    drop(_s);
+    let _ = req;
+    drop(fs);
+    (backing, m)
+}
+
 /// The live-arm posture: overlay ON (Bytes vehicle for in-process
 /// writes), the OVERWRITE lever ON, ACK-after-CQE (deterministic
 /// coverage), patch OFF (whole-segment shapes stay on the overlay).
@@ -2013,10 +2036,8 @@ async fn kill9_crash_matrix_ow1_to_ow7() {
             };
             quiesce(&h).await;
             // KILL-9: drop the daemon with whatever state the case left.
-            let H { fs, backing, m, .. } = h;
-            drop(fs);
+            let (backing, m) = dismantle(h);
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            // Session 2 — remount over the SAME volumes.
             let h2 = make_harness_on(&format!("b4c2_{case}_s2"), backing, m, false, None).await;
             let got = read_at(&h2, ino, 0, FBS as usize).await;
             if expect_new {
@@ -2112,8 +2133,7 @@ async fn ow8_window_is_exactly_as_disclosed() {
     let reverted = squeezefs::dev_power_cut::power_cut(&data_path);
     assert!(reverted > 0, "premise: the dest bytes were volatile");
     squeezefs::dev_power_cut::clear_faults();
-    let H { fs, backing, m, .. } = h;
-    drop(fs);
+    let (backing, m) = dismantle(h);
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let h2 = make_harness_on("b4c2_ow8_s2", backing, m, false, None).await;
     let got = read_at(&h2, ino, 0, (2 * FBS) as usize).await;
@@ -2161,8 +2181,7 @@ async fn oq5_barrier_before_close_closes_the_ow8_window() {
 
     let _ = squeezefs::dev_power_cut::power_cut(&data_path);
     squeezefs::dev_power_cut::clear_faults();
-    let H { fs, backing, m, .. } = h;
-    drop(fs);
+    let (backing, m) = dismantle(h);
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let h2 = make_harness_on("b4c2_oq5_s2", backing, m, false, None).await;
     assert_eq!(
@@ -2199,7 +2218,7 @@ async fn gen209_storm_with_overwrite_overlays_engaged() {
                 for off in (0..FILE).step_by(PAGE as usize) {
                     write_at(&h, ino, off, &buf).await;
                     let _ = tx.send((pass, off + PAGE));
-                    if (off / PAGE) % 4 == 0 {
+                    if (off / PAGE).is_multiple_of(4) {
                         tokio::task::yield_now().await;
                     }
                 }
@@ -2316,4 +2335,98 @@ async fn sibling_aio_551_shape_on_the_mapped_population() {
     );
     let bband = read_at(&h, ino, FBS - PAGE, 2 * PAGE as usize).await;
     assert_eq!(bband, vec![0x5Bu8; 2 * PAGE as usize], "B's bytes intact");
+}
+
+/// The 2026-08-14 stress_recycled_keys_v3 conviction, pinned as a law
+/// storm (the in-tree stress suite runs default-ON as the broad
+/// sentinel; this is the targeted schedule): a GUARD-LESS discarding
+/// belt (`RemoveBlocks` — §5.7) racing a mid-flight settle can win the
+/// record's terminal CAS AFTER the settle's publication transferred
+/// dest ownership (feed/merge). The Superseded teardown must then
+/// DISARM, never free — a freed live B key recycles and binds TWO
+/// blocks to one offset (the KD-1.11 corruption the stress caught at
+/// ~50 %). Law asserts: no two map entries ever share a key, fsck
+/// stays clean, tripwires stay 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn discarding_belt_racing_settle_never_double_owns() {
+    let _g = serial().await;
+    let _l = live_levers();
+    squeezefs::block_reclaim::set_elision_class_all(true);
+    let h = Arc::new(make_harness("b4c2_beltrace").await);
+
+    for round in 0..12u8 {
+        let old = pattern((2 * FBS) as usize, 100 + round).to_vec();
+        let ino = striped_fixture_with(&h, &format!("f{round}"), &old).await;
+        let v = vec![0xB0 + round; FBS as usize];
+        h.fs.test_install_overwrite_overlay(ino, 0, 0, &v)
+            .await
+            .expect("seam install");
+
+        // The race: the settle (feed) vs the guard-less discarding
+        // primitive on the same index.
+        let settle = {
+            let h = h.clone();
+            tokio::spawn(async move { h.fs.test_settle_overlay_block(ino, 0, false).await })
+        };
+        let discard = {
+            let h = h.clone();
+            tokio::spawn(async move {
+                let token = h.fs.dlm().get_fencing_token_ino(ino);
+                let idxs = [0u32];
+                h.fs.router
+                    .merge_block_mappings(
+                        ino,
+                        squeezefs::routing::BlockMapOp::RemoveBlocks(&idxs),
+                        0,
+                        squeezefs::routing::LayoutFlip::KeepLayout,
+                        token,
+                    )
+                    .await
+            })
+        };
+        let _ = settle.await.expect("settle task");
+        let displaced = discard.await.expect("discard task").expect("discard op");
+        // The primitive's contract: the CALLER frees the displaced keys
+        // after the publish (every product discarding caller does —
+        // punch/truncate); the belt-race law needs the same hygiene or
+        // the pruned keys read as C2 leaks of the TEST's own making.
+        for bk in displaced {
+            let _ = h.fs.router.backend_router.free_block(&bk).await;
+        }
+        let token = h.fs.dlm().get_fencing_token_ino(ino);
+        h.fs.router
+            .close_rewrite_epoch(ino, token)
+            .await
+            .expect("close");
+
+        // THE LAW: whatever interleaving won, no two blocks may ever
+        // share one key (the double-owner shape), and the volume stays
+        // fsck-clean with zero tripwires.
+        let ram = ram_block_map(&h, ino).await;
+        let mut seen = std::collections::HashSet::new();
+        for (b, k) in &ram {
+            assert!(
+                seen.insert(k.clone()),
+                "round {round}: blocks share one key (block {b} → {k}; \
+                 map {ram:?}) — the double-owner corruption"
+            );
+        }
+        // Convergence hygiene: the detached retires must close the gauge.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while m64(&METRICS.overlay_open) > 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            m64(&METRICS.overlay_open),
+            0,
+            "round {round}: records retired"
+        );
+    }
+    assert_eq!(trips(), trips(), "sanity");
+    let report = run_fsck(&fsck_ctx(&h), &online_opts()).await.expect("fsck");
+    assert!(
+        report.findings.is_empty(),
+        "belt-race storm must leave the volume fsck-clean: {:?}",
+        report.findings
+    );
 }

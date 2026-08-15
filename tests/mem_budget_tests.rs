@@ -755,6 +755,19 @@ fn force_level(l: Level) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn advisory_integration_phases() {
+    // B4c-ii: the overwrite OVERLAY (default ON) would take this test's
+    // aligned sub-block mapped overwrites instead of the W2 extent PARK
+    // whose R5 gauge/drain contract is under test — lever OFF (the
+    // overlay's own R5 component is `overlay_inflight_bytes`, pinned in
+    // its own suites).
+    squeezefs::device_overlay::set_overlay_overwrite_for_tests(false);
+    struct LeverReset;
+    impl Drop for LeverReset {
+        fn drop(&mut self) {
+            squeezefs::device_overlay::clear_device_overlay_for_tests();
+        }
+    }
+    let _r = LeverReset;
     // ---- Phase A: Yellow pauses dehydration ENTIRELY — protected victims
     // dropped at the worker, never written to the tier (frees the eviction
     // channel's Bytes refs; disk-tier warmth is the cheapest sacrifice).

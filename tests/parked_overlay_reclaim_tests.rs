@@ -86,6 +86,11 @@ async fn make(uuid: [u8; 16], alloc_ns: &str) -> H {
     // patch path OFF so the parked-overlay machinery under test engages
     // (same reason as `write_through_coverage_tests`).
     squeezefs::fuse_client::set_patch_max_bytes(0);
+    // B4c-ii: the overwrite OVERLAY (default ON) would take this
+    // suite's aligned mapped overwrites instead of the W2 parks whose
+    // reclaim ledger is under test — lever OFF (the overlay's own
+    // retire/reclaim laws are pinned in tests/overlay_overwrite_tests.rs).
+    squeezefs::device_overlay::set_overlay_overwrite_for_tests(false);
     let dlm = DlmClient::new().unwrap();
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())

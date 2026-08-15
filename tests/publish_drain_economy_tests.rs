@@ -102,6 +102,11 @@ struct H {
 async fn make(uuid: [u8; 16], alloc_ns: &str, meta: &Path, format: bool) -> H {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", BS.to_string());
     squeezefs::fuse_client::set_patch_max_bytes(0);
+    // B4c-ii: the overwrite OVERLAY (default ON) would take this
+    // suite's aligned mapped overwrites instead of the ACCUMULATION
+    // machinery under test — lever OFF (the overlay's own laws are
+    // pinned in tests/overlay_overwrite_tests.rs).
+    squeezefs::device_overlay::set_overlay_overwrite_for_tests(false);
     let dlm = DlmClient::new().unwrap();
     let b = NamedTempFile::new().unwrap();
     std::fs::File::create(b.path())

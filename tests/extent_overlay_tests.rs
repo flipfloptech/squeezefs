@@ -779,6 +779,20 @@ async fn fold_seeds_decorated_promoted_mapping() {
     // Passthrough volume: the decorated form is what makes the patch
     // ineligible here (patch_ineligible_decorated), which is exactly the
     // W2 customer population.
+    // B4c-ii: decorated mappings are overwrite-OVERLAY-eligible
+    // (KD-B4-7), so the default-ON arm would take this aligned small
+    // write instead of the W2 park under test — lever OFF for this pin
+    // (the W2 decorated population survives on unaligned/transformed
+    // shapes; the overlay's own decorated handling is pinned in
+    // tests/overlay_overwrite_tests.rs).
+    squeezefs::device_overlay::set_overlay_overwrite_for_tests(false);
+    struct LeverReset;
+    impl Drop for LeverReset {
+        fn drop(&mut self) {
+            squeezefs::device_overlay::clear_device_overlay_for_tests();
+        }
+    }
+    let _r = LeverReset;
     let h = make_ext(*b"rw4-decorated-a1", "rw4_ns_i", false, true).await;
     let (ino, mut want) = durable_striped(&h, "dec.dat", 4, 0x18).await;
     let path = squeezefs::keys::inode_path(ino);

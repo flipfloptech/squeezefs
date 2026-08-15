@@ -71,6 +71,7 @@ impl Drop for LeverGuard {
     fn drop(&mut self) {
         squeezefs::routing::set_rewrite_shadow(true);
         squeezefs::fuse_client::set_patch_max_bytes(512 * 1024);
+        squeezefs::device_overlay::clear_device_overlay_for_tests();
     }
 }
 
@@ -89,6 +90,13 @@ async fn make_harness_on(
     format: bool,
     capacity_blocks: Option<u64>,
 ) -> H {
+    // B4c-ii: the overwrite OVERLAY (default ON) would take this
+    // suite's mapped whole-block overwrites instead of the ACCUMULATION
+    // shadow feed under test — lever OFF (LeverGuard restores; the
+    // overlay-fed epoch laws are pinned in
+    // tests/overlay_overwrite_tests.rs).
+    squeezefs::device_overlay::set_overlay_overwrite_for_tests(false);
+
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", FBS.to_string());
     let dlm = DlmClient::new().unwrap();
     let nvme = Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(

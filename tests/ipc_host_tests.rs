@@ -2540,3 +2540,105 @@ fn session_teardown_never_waits_for_prep() {
     std::env::remove_var("SQUEEZEFS_TEST_THP_PREP_STALL_MS");
     host.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// PR 3 — co-located mounts (design-full-multi-writer §5.3, the IPC row):
+// per-mount shim discovery keyed by mount path, unit venue (the gate's
+// two-mount leg is the root/live twin)
+// ---------------------------------------------------------------------------
+
+/// Two co-located session hosts (= two `-o interception` mounts as seen
+/// from one client process). Discovery is keyed by MOUNT PATH by
+/// construction — the bootstrap xattr is answered by the fd's OWN mount,
+/// so a client can only ever learn the socket of the mount its fd lives
+/// on — and this pin holds the two daemon-side halves of that law:
+///
+/// 1. the two hosts' bootstrap blobs advertise DISTINCT sockets (the
+///    per-process-unique `sqz-il0-{pid}-{rand}` name is what makes the
+///    xattr answer unambiguous), and the blob's socket rendezvouses with
+///    ITS OWN host (ECHO serves on A);
+/// 2. the §5.2 rule-3 fd screen refuses a FOREIGN mount's fd at both
+///    ceremonies — HELLO (the credential fd) and BIND — so a file on
+///    mount A structurally cannot ride mount B's ring even if a confused
+///    client connects to B's socket with A's fd. Refusals are counted
+///    (class `mode`), never served.
+#[test]
+fn two_colocated_hosts_discover_by_mount_and_never_cross() {
+    let (host_a, cfg_a) = spawn_host("twomount-a");
+    let (host_b, cfg_b) = spawn_host("twomount-b");
+
+    // "Mount A" = a real file whose st_dev host A expects. "Mount B"
+    // expects a DISPLACED dev (a dev box has no second filesystem to
+    // stat, and the screen keys on st_dev — the FUSE mount device —
+    // which is exactly the mount-path key at the fd level).
+    let mf = mount_file();
+    host_a.set_expected_st_dev(mf.st_dev);
+    host_b.set_expected_st_dev(mf.st_dev.wrapping_add(1));
+
+    // Discovery half 1: distinct sockets per mount, each blob reaching
+    // its OWN host.
+    let blob_a = BootstrapBlob::decode(&host_a.bootstrap_blob()).expect("blob A");
+    let blob_b = BootstrapBlob::decode(&host_b.bootstrap_blob()).expect("blob B");
+    assert_ne!(
+        blob_a.socket, blob_b.socket,
+        "co-located mounts must advertise distinct sockets"
+    );
+    assert_eq!(blob_a.socket, cfg_a.socket_name, "blob A names host A");
+    assert_eq!(blob_b.socket, cfg_b.socket_name, "blob B names host B");
+
+    // Mount A's fd over mount A's advertised socket: full establish +
+    // bind + a served ECHO (engagement on the RIGHT host).
+    let fd = open_flags(&mf.path, libc::O_RDWR);
+    let (sock_a, mut sess_a) = establish(&cfg_a, &host_a, fd.as_raw_fd());
+    let binding = match bind(&sock_a, fd.as_raw_fd()) {
+        CtlMsg::BindOk { binding_id, .. } => binding_id,
+        other => panic!("mount A's fd on host A must bind, got {other:?}"),
+    };
+    let len = 512usize;
+    let arena_off = 4096u64;
+    let payload = sess_a.arena(arena_off, len);
+    let mut sum = 0i64;
+    for (i, b) in payload.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+        sum += i64::from(*b);
+    }
+    let r = sess_a.submit_wait(&SlotDescriptor {
+        op: OP_ECHO,
+        flags: 0,
+        binding,
+        offset: 0,
+        len: len as u32,
+        arena_off,
+    });
+    assert_eq!(r, sum, "host A serves its own mount's fd");
+
+    // Never-cross half 2a: the same fd's HELLO on host B refuses at the
+    // credential screen (rule 3: wrong mount device), counted.
+    let refused_before = METRICS.ipc_bind_refused_mode.load(Ordering::Relaxed);
+    let (_sock, reply, rx_fd) = hello_ok(&cfg_b, &host_b, fd.as_raw_fd());
+    expect_refuse(
+        &reply,
+        RefuseClass::Mode,
+        "mount A's fd as host B's HELLO credential",
+    );
+    assert!(rx_fd.is_none(), "a refused HELLO must carry no session");
+
+    // Never-cross half 2b: the BIND arm — the per-fd screen, not just
+    // the session credential, keys on the mount. No second filesystem
+    // exists on the unit venue, so drive it on host A's LIVE session:
+    // a foreign-dev fd must refuse the same way.
+    host_a.set_expected_st_dev(mf.st_dev.wrapping_add(2)); // A's "mount" moves away
+    expect_bind_refused(
+        &bind(&sock_a, fd.as_raw_fd()),
+        RefuseClass::Mode,
+        "foreign-mount fd BIND",
+    );
+    host_a.set_expected_st_dev(mf.st_dev); // restore for teardown sanity
+    assert!(
+        METRICS.ipc_bind_refused_mode.load(Ordering::Relaxed) >= refused_before + 2,
+        "foreign-mount refusals are counted (class mode), never served"
+    );
+
+    host_a.shutdown();
+    host_b.shutdown();
+}

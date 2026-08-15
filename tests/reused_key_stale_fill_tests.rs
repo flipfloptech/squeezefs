@@ -347,9 +347,10 @@ async fn parked_read_never_serves_reused_or_freed_key_v3() {
     // back) — the overwrite overlay changes displacement timing (epoch
     // park) and breaks the premise, so the lever is OFF here. The
     // OVERLAY-engaged recycled-key law is pinned by
-    // `stress_recycled_keys_v3` below, which deliberately RUNS WITH the
-    // shipped default (it convicted the 2026-08-14 compose
-    // fetch-vs-terminal wrong-serve).
+    // `stress_recycled_keys_v3` below, which pins the arm ON explicitly
+    // (it convicted the 2026-08-14 compose fetch-vs-terminal
+    // wrong-serve; the shipped default is FIELD-PENDING and must not
+    // gate the sentinel).
     squeezefs::device_overlay::set_overlay_overwrite_for_tests(false);
     struct LeverReset;
     impl Drop for LeverReset {
@@ -498,6 +499,20 @@ fn check_stamps(data: &[u8], file_off: u64, tag: &str) {
 }
 
 async fn stress_recycled_keys() {
+    // The OVERLAY-ENGAGED recycled-key sentinel (it convicted the
+    // 2026-08-14 compose fetch-vs-terminal wrong-serve AND the
+    // double-owner free). The arm is pinned ON explicitly — it must
+    // never follow the shipped default, which is FIELD-PENDING (OFF
+    // since the 2026-08-15 ruling): this stress exists to exercise the
+    // arm regardless of what ships.
+    squeezefs::device_overlay::set_overlay_overwrite_for_tests(true);
+    struct LeverReset;
+    impl Drop for LeverReset {
+        fn drop(&mut self) {
+            squeezefs::device_overlay::clear_device_overlay_for_tests();
+        }
+    }
+    let _r = LeverReset;
     let tag = "stress-recycle".to_string();
     let h = Arc::new(make().await);
     let ino = create(&h, "stress").await;

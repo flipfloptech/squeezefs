@@ -1713,8 +1713,16 @@ async fn overwrite_knob_registry_defaults() {
         squeezefs::env_knobs::lookup("SQUEEZEFS_OVERLAY_OVERWRITE")
             .expect("registered (ENG-10)")
             .default,
-        "on",
-        "KD-B4-9: the overwrite arm ships default ON (efficiency doctrine)"
+        "off",
+        "FIELD-PENDING (user ruling 2026-08-15, supersedes KD-B4-9's ON until \
+         the B4e field row): the local B4d A-B-B-A failed the above-control \
+         gate in both orders (ON 783-940 vs OFF 1149-1161 MiB/s sustained — \
+         the device-bound zram-tcp venue rewards the control's BDP-depth \
+         pipelining; engagement exact, rewrite_amp 1.0000, daemon CPU/GiB \
+         -30%), so the falsified-lever rule ships it OFF as a documented \
+         field lever. The field (CPU-bound, the 96.6% merge-share wall) is \
+         the deciding venue — flip this pin WITH the registry line when the \
+         field row adjudicates"
     );
     assert_eq!(
         squeezefs::env_knobs::lookup("SQUEEZEFS_OVERLAY_CLOSE_BARRIER")

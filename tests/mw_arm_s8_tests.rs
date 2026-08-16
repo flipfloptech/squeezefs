@@ -283,7 +283,11 @@ async fn the_authority_listener_serves_the_s8_verb_block() {
         .await
         .expect("the create landed on the AUTHORITY");
     assert_eq!(on_owner.ino, inode.ino);
-    assert_eq!(svc.stats().served, 1, "the owner's service ledger counts it");
+    assert_eq!(
+        svc.stats().served,
+        1,
+        "the owner's service ledger counts it"
+    );
 
     ship::disarm_ownership();
     listener.shutdown();
@@ -335,7 +339,9 @@ async fn a_co_writer_daemons_trait_verbs_ship_instead_of_refusing() {
         SECRET.to_vec(),
     ));
 
-    let refusals_before = METRICS.cowriter_local_commit_refusals.load(Ordering::SeqCst);
+    let refusals_before = METRICS
+        .cowriter_local_commit_refusals
+        .load(Ordering::SeqCst);
     let before = ship::stats();
 
     // The daemon's shape: trait verbs on the backend Arc itself.
@@ -344,7 +350,16 @@ async fn a_co_writer_daemons_trait_verbs_ship_instead_of_refusing() {
         .await
         .expect("create SHIPS instead of refusing at the write gate");
     let after_set = co
-        .setattr(created.ino, Some(0o600), None, None, None, None, Some(4242), None)
+        .setattr(
+            created.ino,
+            Some(0o600),
+            None,
+            None,
+            None,
+            None,
+            Some(4242),
+            None,
+        )
         .await
         .expect("setattr ships");
     assert_eq!(after_set.mode & 0o777, 0o600);
@@ -383,7 +398,9 @@ async fn a_co_writer_daemons_trait_verbs_ship_instead_of_refusing() {
         "the engagement law: the client's shipped == the owner's served"
     );
     assert_eq!(
-        METRICS.cowriter_local_commit_refusals.load(Ordering::SeqCst),
+        METRICS
+            .cowriter_local_commit_refusals
+            .load(Ordering::SeqCst),
         refusals_before,
         "zero un-routed local commits (the S8-b falsifier)"
     );
@@ -437,10 +454,7 @@ async fn an_unarmed_mounts_trait_verbs_never_touch_the_ship_plane() {
         after.shipped_verbs, before.shipped_verbs,
         "nothing shipped on an unarmed mount"
     );
-    assert_eq!(
-        after.batches, before.batches,
-        "no frame was even assembled"
-    );
+    assert_eq!(after.batches, before.batches, "no frame was even assembled");
 
     ship::uninstall_daemon_verb_router();
     shutdown(&solo).await;

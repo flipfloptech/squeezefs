@@ -1698,6 +1698,19 @@ impl AsyncVerbRouter {
             service,
         )
     }
+
+    /// Claim **S8's metadata verb block** for `service` (rung 9 — the S8
+    /// arm's owner half): `VERB_META_BATCH`/`VERB_RECLAIM` ride the SAME
+    /// listener as custody + publish, so an authority that grants write
+    /// custody also answers the shipped `Metadata` verbs — the two halves
+    /// of one mount posture, armed together or not at all.
+    pub fn with_meta(self, service: Arc<crate::meta_ship::MetaShipService>) -> Self {
+        self.with(
+            crate::meta_ship::VERB_META_BATCH,
+            crate::meta_ship::VERB_RECLAIM,
+            service,
+        )
+    }
 }
 
 impl RpcAsyncService for AsyncVerbRouter {

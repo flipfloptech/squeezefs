@@ -565,7 +565,14 @@ pub async fn arm_multi_writer(
 
     let router = AsyncVerbRouter::new()
         .with_custody(Arc::clone(&owner))
-        .with_publish(publish::PublishService::new(Arc::clone(meta)));
+        .with_publish(publish::PublishService::new(Arc::clone(meta)))
+        // Rung 9 — the S8 arm's owner half: the shipped `Metadata` verb
+        // block (VERB_META_BATCH/VERB_RECLAIM) on the SAME listener. The
+        // service adopts the durable era at construction
+        // (`crate::dlm::durable_term()` — rung 5 above proved it nonzero),
+        // so a successor authority's higher term makes every old-era
+        // frame stale by construction (S8's era gate).
+        .with_meta(crate::meta_ship::MetaShipService::new(Arc::clone(meta)));
     let listener = crate::cluster_wire::RpcListener::start_async(
         crate::cluster_wire::RpcListenerConfig {
             bind_addr: bind,

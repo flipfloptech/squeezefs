@@ -973,6 +973,7 @@ impl CoWriterArm {
         self.stop.store(true, Ordering::Release);
         crate::data_grant::uninstall_custody_client();
         crate::meta_ship::publish::uninstall_client();
+        crate::meta_ship::uninstall_daemon_verb_router();
         crate::meta_ship::disarm_ownership();
         if let Some(arm) = self.membership.take() {
             arm.disarm().await;
@@ -1028,6 +1029,18 @@ pub async fn arm(
         &admission.node_id,
         secret.clone(),
     ));
+    // Rung 9 — the S8 arm's client half: the daemon verb router. The FUSE
+    // daemon's `Metadata`-trait verbs (unlink/rename/setattr/xattrs/…)
+    // consult it at the trait impl itself (`meta_backend/mod.rs`), so on
+    // this mount every one of them SHIPS to the authority instead of
+    // refusing at the co-writer write gate — closing "S8's un-routed-daemon
+    // gap": `cowriter.local_commit_refusals` growth on a real workload is a
+    // BUG from here on, exactly as the S8-b falsifier demands.
+    crate::meta_ship::install_daemon_verb_router(crate::meta_ship::MetaShipRouter::new(
+        Arc::clone(meta),
+        &admission.node_id,
+        secret.clone(),
+    ));
 
     // The custody client: the acquire travels, and what comes back is
     // custody the authority ISSUED (adopted with the owner's own token).
@@ -1041,6 +1054,7 @@ pub async fn arm(
     .await
     .map_err(|e| {
         crate::meta_ship::publish::uninstall_client();
+        crate::meta_ship::uninstall_daemon_verb_router();
         crate::meta_ship::disarm_ownership();
         SqueezefsError::InvalidOperation(format!(
             "co-writer arm failed: the custody authority at {} refused or could not be reached \
@@ -1085,6 +1099,7 @@ pub async fn arm(
     {
         crate::data_grant::uninstall_custody_client();
         crate::meta_ship::publish::uninstall_client();
+        crate::meta_ship::uninstall_daemon_verb_router();
         crate::meta_ship::disarm_ownership();
         return Err(SqueezefsError::InvalidOperation(format!(
             "co-writer arm failed: the allocation lane {} of {} the authority granted could not \

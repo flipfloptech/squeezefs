@@ -1918,3 +1918,113 @@ async fn staging_verbs_refuse_an_unscoped_set() {
         "the refusal explains why: {err}"
     );
 }
+
+/// The fstests zero-dwell remount race (2026-08-16 — the stamped-solo
+/// QUICK gate's first live catch, generic/003 abort): `umount(8)` returns
+/// when the kernel FUSE connection closes, but the predecessor daemon's
+/// staging-root liveness flock releases only at PROCESS EXIT — so a
+/// successor mount at the SAME mount point can meet its OWN root held by
+/// a holder that will be gone in milliseconds. A dying holder gets the
+/// bounded wait-out (the `mount_writer_guard_tests::
+/// test_reopen_waits_out_same_process_teardown_pin` precedent, applied to
+/// the staging plane); the mount proceeds, never a refusal. Unstamped
+/// mounts never run the prelude, which is why only the stamped posture
+/// ever saw this.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn own_root_flock_race_with_dying_predecessor_is_absorbed() {
+    let _g = serial().await;
+    let fx = Mw1bFixture::new().await;
+    let own_dir = fx.container.join("mnt_racy");
+    std::fs::create_dir_all(&own_dir).unwrap();
+    let our_gen = ws::staging_generation(&fx.set, Some(pair(fx.node, SLOT_A)));
+
+    // The dying predecessor: a second open-file-description holds the
+    // flock and releases it ~300 ms in — far past any one-shot LOCK_NB
+    // try, well inside the wait bound.
+    let lock_path = own_dir.join(squeezefs::config_ops::STAGING_OWNER_LOCK);
+    let holder = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&holder), libc::LOCK_EX) },
+        0
+    );
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(holder);
+    });
+
+    let started = std::time::Instant::now();
+    let scan = squeezefs::config_ops::mount_scoped_staging_prelude(
+        std::slice::from_ref(&fx.container),
+        std::slice::from_ref(&own_dir),
+        "/mnt/racy",
+        &our_gen,
+    )
+    .await
+    .expect("a dying predecessor's flock is absorbed, never refused");
+    let waited = started.elapsed();
+    assert!(scan.adopted.is_empty() && scan.residue.is_empty());
+    assert!(
+        waited >= std::time::Duration::from_millis(250),
+        "the prelude must actually have waited the holder out (waited {waited:?})"
+    );
+    assert!(
+        waited < std::time::Duration::from_secs(2),
+        "a freed flock is taken promptly, not at the bound (waited {waited:?})"
+    );
+    release.join().unwrap();
+    squeezefs::config_ops::release_staging_root_locks();
+}
+
+/// The posture half: a holder that NEVER releases is a genuinely live
+/// co-located mount collision — after the bounded wait expires the loud
+/// refusal is unchanged (message verbatim: names the root and the held
+/// flock). The wait-out absorbs teardown races; it never weakens the
+/// collision refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn own_root_flock_held_by_live_holder_still_refuses_loud() {
+    let _g = serial().await;
+    let fx = Mw1bFixture::new().await;
+    let own_dir = fx.container.join("mnt_live");
+    std::fs::create_dir_all(&own_dir).unwrap();
+    let our_gen = ws::staging_generation(&fx.set, Some(pair(fx.node, SLOT_A)));
+
+    let lock_path = own_dir.join(squeezefs::config_ops::STAGING_OWNER_LOCK);
+    let holder = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&holder), libc::LOCK_EX) },
+        0
+    );
+
+    let started = std::time::Instant::now();
+    let err = squeezefs::config_ops::mount_scoped_staging_prelude(
+        std::slice::from_ref(&fx.container),
+        std::slice::from_ref(&own_dir),
+        "/mnt/live",
+        &our_gen,
+    )
+    .await
+    .expect_err("a live holder must still refuse")
+    .to_string();
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(2),
+        "the refusal comes only after the full wait bound"
+    );
+    assert!(
+        err.contains("HELD by a live process") && err.contains("unmount it first"),
+        "the refusal text is unchanged: {err}"
+    );
+    drop(holder);
+    squeezefs::config_ops::release_staging_root_locks();
+}

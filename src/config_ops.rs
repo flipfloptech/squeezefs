@@ -3085,6 +3085,35 @@ pub fn hold_staging_root_lock(dir: &Path) -> Result<()> {
     }
 }
 
+/// [`hold_staging_root_lock`] with the bounded teardown-race wait-out
+/// (2026-08-16, the stamped-solo QUICK gate's first live catch —
+/// generic/003's zero-dwell remount): `umount(8)` returns when the kernel
+/// FUSE connection closes, but the predecessor daemon's flock releases
+/// only at PROCESS EXIT, so a successor mount at the same mount point can
+/// meet its OWN root held by a holder that is milliseconds from gone. A
+/// dying holder frees the flock within one poll pass; a genuinely live
+/// co-located collision never does and pays the bound ONCE before the
+/// unchanged loud refusal (the `await_same_process_teardown_flock`
+/// posture, applied to the staging plane — the lock file carries no
+/// holder claim, and every holder of a mount's OWN root is same-mount-
+/// point class, so the bound applies to all of them). Used ONLY for the
+/// prelude's own-dirs arm; probes and adoption arms stay one-shot.
+pub async fn hold_staging_root_lock_waiting(dir: &Path) -> Result<()> {
+    /// Generous vs. a daemon exit's ms-grade lock release; a live
+    /// collision pays it once before the refusal.
+    const TEARDOWN_FLOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+    const POLL: std::time::Duration = std::time::Duration::from_millis(5);
+    let deadline = std::time::Instant::now() + TEARDOWN_FLOCK_WAIT;
+    loop {
+        match hold_staging_root_lock(dir) {
+            Err(SqueezefsError::InvalidOperation(_)) if std::time::Instant::now() < deadline => {
+                squeezefs_ipc::sqz_time::sleep(POLL).await;
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
 /// One same-node staging root bound to a mount slot (KD-MW-2): the
 /// residue scan's row, the `squeezefs clients` residue row, and the
 /// `staging adopt|discard` verbs' unit.
@@ -3199,7 +3228,9 @@ pub async fn mount_scoped_staging_prelude(
         });
     };
     for dir in own_dirs {
-        hold_staging_root_lock(dir).map_err(|e| {
+        // The waiting form: absorbs the predecessor daemon's exit racing a
+        // zero-dwell remount (see `hold_staging_root_lock_waiting`).
+        hold_staging_root_lock_waiting(dir).await.map_err(|e| {
             SqueezefsError::InvalidOperation(format!(
                 "cannot own this mount's staging root: {e}. If a previous mount at this \
                  mount point is still running, unmount it first",

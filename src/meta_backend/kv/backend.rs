@@ -3089,18 +3089,28 @@ impl KvMetaBackend {
     pub async fn drain_pending_times_now(&self) -> Result<u64> {
         let mut total = 0u64;
         loop {
-            if self.write_gate().is_err() {
-                // Failing / shutting-down volume: refinements are µs-grade
-                // time polish — never worth failing a barrier path over.
-                return Ok(total);
-            }
-            // Snapshot up to a batch of inos (scan stops at the cap).
+            // Snapshot up to a batch of inos (scan stops at the cap) —
+            // BEFORE the write gate, deliberately (rung-10 finding #4): a
+            // drain with no work must touch no gate. On a CO-WRITER the
+            // set is empty by construction (nothing parks locally — the
+            // write path's park SHIPS), and the gate's CoWriterMount arm
+            // counts the S8-b falsifier (`cowriter_local_commit_refusals`),
+            // so the old gate-first order counted a false un-routed local
+            // commit on EVERY co-writer fsync.
             let mut batch: Vec<Ino> = Vec::new();
             self.pending_times.iter_sync(|k, _| {
                 batch.push(*k);
                 batch.len() < PENDING_TIMES_DRAIN_BATCH
             });
             if batch.is_empty() {
+                return Ok(total);
+            }
+            if self.write_gate().is_err() {
+                // Failing / shutting-down / gated volume: refinements are
+                // µs-grade time polish — never worth failing a barrier
+                // path over. (With WORK pending on a gated co-writer
+                // volume this is a REAL un-routed-surface signal, and the
+                // gate's own counting arm records it.)
                 return Ok(total);
             }
             let saw_full_batch = batch.len() >= PENDING_TIMES_DRAIN_BATCH;

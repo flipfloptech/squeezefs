@@ -28,7 +28,47 @@
 #   * per-mount log + stats capture (stats snapshots are `cat $MNT/.stats`
 #     — never cp: the aging trap),
 #   * a recorded host-scoped-subsystem capability verdict (rung 5b probe —
-#     see THE 5b GATE below).
+#     see THE 5b GATE below),
+#   * with `--vm=V` (rung 6b): V qemu/KVM GUEST members — each an
+#     independent kernel and independent clock domain (§12) — booted on
+#     the sqz 6.19.14-sqz kernel (patch 0030,
+#     nvme_core.fabrics_host_scoped_subsystems=Y) and dialing the HOST's
+#     nvmet-tcp target. See THE VM LEG below.
+#
+# THE VM LEG (rung 6b — --vm=V, pause/resume, vm-boot/vm-exec/vm-stop):
+#   Networking is qemu USER-NET (slirp) — the simplest robust shape: the
+#   guest's connects to the slirp gateway 10.0.2.2 are re-originated by
+#   the qemu process against the HOST's loopback, so the guest reaches
+#   the instance devsub's nvmet-tcp port (127.0.0.1:$TCP_SVC) at
+#   10.0.2.2:$TCP_SVC with no bridge, no tap, no host interface changes
+#   and no extra privileges. Consequence: fabric addresses are DOMAIN-
+#   RELATIVE (host says 127.0.0.1, guests say 10.0.2.2 — $VM_GW), so
+#   guest-side volume sets record 10.0.2.2 in their fabric_endpoint:
+#   records; guest members joining the HOST-formatted set as fleet
+#   members (S6-b'/rung-7 rows) resolve their meta plane by in-guest
+#   operator connects.
+#   The guest image is a minimal busybox initramfs + the host-built
+#   squeezefs binary over a 9p share (tests/mw_guest_image.sh — NOT a
+#   distro pipeline; boot pair built from the sqz kernel RPMs, so
+#   `--vm` REFUSES loud until docker/kernel-sqz/build.sh has produced
+#   them). Control plane = the share's job executor: `vm-exec <idx>
+#   <script>` runs a shell job inside the guest and returns its rc/
+#   output. `pause <idx>` / `resume <idx>` are qemu monitor stop/cont —
+#   the S6-b' HUNG-KERNEL shape kill-9 cannot produce (the guest's TCP
+#   stack freezes mid-conversation instead of closing); the S6-b' row
+#   itself is rung 7's — this rung ships the verb.
+#   With --vm the devsub is built with ONE EXTRA mds + oss namespace
+#   pair ($GUEST_META_NQN / $GUEST_DATA_NQN), RESERVED for the in-guest
+#   legs (run_mw_matrix.sh vm-hostscope-validate / vm-multi-identity):
+#   no in-guest leg ever adds a path to a subsystem a live HOST writer
+#   rides, and guest-side formats never touch the fleet set. /dev/kvm
+#   absent falls back to TCG, stated loud (correctness legs only).
+#   Zero-residue extends to guests: teardown powers off / kills every
+#   recorded guest AND sweeps any qemu process whose cmdline names this
+#   fleet's state dir; a survivor is teardown-failing residue. Guests
+#   have no disk images (kernel+initramfs boot, 9p share under $STATE);
+#   the cached boot pair lives in target/mw-guest as a BUILD product
+#   (like target/release — not fleet residue).
 #
 # POSTURE (this rung, adjudicated 2026-08-15 — rung 5b):
 #   Co-located multi-IDENTITY mounts (≥2 explicit hostnqn pairs on one
@@ -64,18 +104,29 @@
 #   round-robin its I/O onto an unregistered association (PR-rejected).
 #
 # Verbs
-#   create [N|N=<n>] [--cowriters K] [--require-host-scoped-subsys]
+#   create [N|N=<n>] [--cowriters K] [--vm=V] [--require-host-scoped-subsys]
 #                 build substrate + format + records + mount the fleet
-#                 (refuses if state exists — run teardown first)
-#   status        member table + capability verdict + identity map
+#                 (refuses if state exists — run teardown first); --vm=V
+#                 boots V sqz-kernel guests after the fleet is up
+#   status        member table + capability verdict + identity map + VMs
 #   mount <idx>   (re)mount one member    unmount <idx>   product umount
 #   kill <idx> [--sig 9]   kill a member daemon (the S7-b matrices' verb)
 #   probe-host-scoped      re-print the recorded 5b capability verdict
-#   teardown      unmount + kill + disconnect + substrate teardown +
-#                 ZERO-RESIDUE assertions (exits nonzero on any residue)
-#   pause | partition | netem | --netns | --vm    STUBS — refused loud:
-#                 pause/--vm land with rung 6b (qemu members); partition/
-#                 netem/--netns land with rung 7 (the netem venue)
+#   vm-boot <idx> [--no-hostscope]   boot one guest (ephemeral leg guests
+#                 use idx >= 90; --no-hostscope boots WITHOUT the 0030
+#                 param — the vm-hostscope-validate negative arm)
+#   vm-exec <idx> <script-file|->    run a shell job inside the guest
+#                 (job executor over the 9p share); prints output,
+#                 propagates the job's exit code
+#   vm-stop <idx>          power off one guest (poweroff job -> monitor
+#                 quit -> SIGKILL escalation; console/log preserved)
+#   pause <idx> | resume <idx>       qemu monitor stop/cont on a guest —
+#                 the S6-b' hung-kernel verb (the row is rung 7's)
+#   teardown      guests + unmount + kill + disconnect + substrate
+#                 teardown + ZERO-RESIDUE assertions (exits nonzero on
+#                 any residue, qemu survivors included)
+#   partition | netem | --netns    STUBS — refused loud: they land with
+#                 rung 7 (the netem venue)
 #
 # RUNG-6 FINDINGS (2026-08-15) — FIXED, kept as this rig's history + the
 # live regression tripwires it still asserts:
@@ -111,6 +162,9 @@
 #   SQZ_MWFLEET_INSTANCE=mwfleet   devsub instance suffix ([a-z0-9]{1,8})
 #   SQZ_MWFLEET_STATE_DIR=/run/squeezefs-mwfleet
 #   SQZ_MWFLEET_MNT_ROOT=/mnt/sqz-mwfleet
+#   SQZ_MWFLEET_VM_MEM_MB=3072  guest RAM (R5 derives from it in-guest)
+#   SQZ_MWFLEET_VM_CPUS=4       guest vcpus (fuse-over-uring queue count)
+#   SQZ_MWGUEST_OUT             boot-pair cache (tests/mw_guest_image.sh)
 #
 # Requires: root (re-execs via sudo), nvme-cli, kernel nvmet-tcp, python3.
 # Refusals are LOUD with the reason (the dev_substrate/guard_smoke pattern)
@@ -139,7 +193,14 @@ NQN_PREFIX="nqn.2026-07.io.squeezefs:devsubtcp${INSTANCE}-"
 NVMET_CFS="/sys/kernel/config/nvmet"
 
 MEMBERS="$STATE/members.tsv" # idx role mountpoint logfile hostnqn hostid pid
+VMS="$STATE/vms.tsv"         # idx pid accel hostscope(1|0) vmdir
 CONF="$STATE/config.env"
+
+# Rung-6b guest geometry (see THE VM LEG header note).
+VM_GW="10.0.2.2" # the slirp gateway = the HOST, guest-domain address
+VM_MEM_MB="${SQZ_MWFLEET_VM_MEM_MB:-3072}"
+VM_CPUS="${SQZ_MWFLEET_VM_CPUS:-4}"
+GUEST_IMG_DIR="${SQZ_MWGUEST_OUT:-$REPO/target/mw-guest}"
 
 log() { echo "[mwfleet] $*"; }
 warn() { echo "[mwfleet] WARN: $*" >&2; }
@@ -153,7 +214,7 @@ die() {
 # registry announces them as probable typos on every verb otherwise.
 SCRUB_ENV=("-u" "SQZ_BIN")
 while IFS= read -r __kv; do SCRUB_ENV+=("-u" "${__kv%%=*}"); done \
-    < <(env | grep -E '^(SQZ_MWFLEET_|SQZ_DEVSUB_)' || true)
+    < <(env | grep -E '^(SQZ_MWFLEET_|SQZ_DEVSUB_|SQZ_MWGUEST_)' || true)
 unset __kv
 sqz() { env "${SCRUB_ENV[@]}" "$SQZ" "$@"; }
 
@@ -162,7 +223,7 @@ ensure_root() {
     log "root required (nvmet configfs, mounts, fabrics connects) — re-executing via sudo"
     local knobs=()
     while IFS= read -r kv; do knobs+=("$kv"); done \
-        < <(env | grep -E '^(SQZ_MWFLEET_|SQZ_DEVSUB_|SQZ_BIN=)' || true)
+        < <(env | grep -E '^(SQZ_MWFLEET_|SQZ_DEVSUB_|SQZ_MWGUEST_|SQZ_BIN=)' || true)
     exec sudo env "${knobs[@]}" bash "$0" "$@"
 }
 
@@ -297,6 +358,177 @@ probe_host_scoped() { # meta_nqn create_pid -> echoes 0|1
     if [ "$after" -gt "$before" ]; then echo 1; else echo 0; fi
 }
 
+# --- rung-6b guests (THE VM LEG header note) ---------------------------------
+vm_dir() { echo "$STATE/vm$1"; }
+
+vm_pid() { # idx -> recorded pid or empty
+    [ -f "$VMS" ] || return 0
+    awk -F'\t' -v i="$1" '$1==i {print $2}' "$VMS"
+}
+
+vm_alive() { # idx
+    local pid
+    pid="$(vm_pid "$1")"
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+# HMP over the monitor unix socket (python3 — socat is not a prereq).
+vm_monitor_cmd() { # idx cmd
+    local d
+    d="$(vm_dir "$1")"
+    [ -S "$d/monitor.sock" ] || die "guest $1 has no monitor socket at $d/monitor.sock"
+    python3 - "$d/monitor.sock" "$2" <<'PYEOF'
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX)
+s.connect(sys.argv[1])
+s.settimeout(5)
+try:
+    s.recv(4096)  # the HMP banner
+except OSError:
+    pass
+s.sendall((sys.argv[2] + "\n").encode())
+time.sleep(0.2)
+s.close()
+PYEOF
+}
+
+# Boot one guest. Usage: vm_boot <idx> [--no-hostscope]
+# The 0030 param rides the kernel cmdline by default (the sqz fleet/guest
+# posture, design-mw-multipath-kernel §3); --no-hostscope boots the SAME
+# kernel with the param absent — the vm-hostscope-validate negative arm.
+vm_boot() {
+    local idx="$1" hostscope=1
+    [ "${2:-}" = "--no-hostscope" ] && hostscope=0
+    vm_alive "$idx" && die "guest $idx is already running (pid $(vm_pid "$idx"))"
+    [ -f "$GUEST_IMG_DIR/vmlinuz" ] && [ -f "$GUEST_IMG_DIR/initramfs.img" ] ||
+        die "no guest boot pair at $GUEST_IMG_DIR — build the sqz kernel (docker/kernel-sqz/build.sh), then: tests/mw_guest_image.sh build"
+    command -v qemu-system-x86_64 >/dev/null 2>&1 || die "qemu-system-x86_64 is required for --vm/vm-boot"
+    local d accel append
+    d="$(vm_dir "$idx")"
+    rm -rf "$d" && mkdir -p "$d/share/jobs" "$d/share/bin" "$d/share/lib"
+    # Stage the HOST-BUILT binary + its loader closure onto the 9p share
+    # (rung-6b charter: the binary is shared, never baked into the image).
+    cp "$SQZ" "$d/share/bin/squeezefs"
+    # KD-MW-2: a stable per-guest node identity (the initramfs has no
+    # machine-id; the guest init installs this as /etc/squeezefs/node-id).
+    # Stable across reboots of THIS guest (the vm dir persists for the
+    # fleet's life), distinct across guests and from the host.
+    echo "mwfleet-guest-$INSTANCE-$idx-$(hostname)" >"$d/share/node-id"
+    local lib
+    while IFS= read -r lib; do
+        [ -f "$lib" ] && cp "$lib" "$d/share/lib/"
+    done < <(ldd "$SQZ" 2>/dev/null | awk '{ for (i=1;i<=NF;i++) if ($i ~ /^\//) print $i }' | sort -u)
+    accel=kvm
+    if [ ! -w /dev/kvm ]; then
+        accel=tcg
+        warn "guest $idx: /dev/kvm unavailable — TCG fallback (correctness legs only, stated loud)"
+    fi
+    append="console=ttyS0 rdinit=/init panic=-1"
+    [ "$hostscope" = "1" ] && append="$append nvme_core.fabrics_host_scoped_subsystems=Y"
+    # shellcheck disable=SC2054 # commas live inside quoted qemu option strings
+    local qemu_args=(-machine "q35,accel=$accel")
+    [ "$accel" = "kvm" ] && qemu_args+=(-cpu host)
+    # shellcheck disable=SC2054 # commas live inside quoted qemu option strings
+    qemu_args+=(
+        -smp "$VM_CPUS" -m "$VM_MEM_MB"
+        -kernel "$GUEST_IMG_DIR/vmlinuz" -initrd "$GUEST_IMG_DIR/initramfs.img"
+        -append "$append"
+        -netdev user,id=n0 -device virtio-net-pci,netdev=n0
+        -virtfs "local,path=$d/share,mount_tag=hostshare,security_model=none"
+        -display none -serial "file:$d/console.log"
+        -monitor "unix:$d/monitor.sock,server,nowait"
+        -pidfile "$d/qemu.pid" -daemonize
+    )
+    qemu-system-x86_64 "${qemu_args[@]}" ||
+        die "qemu launch failed for guest $idx (console: $d/console.log)"
+    local pid ready=0 i
+    pid="$(cat "$d/qemu.pid")"
+    for ((i = 0; i < 240; i++)); do
+        [ -f "$d/share/guest-ready" ] && ready=1 && break
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.5
+    done
+    if [ "$ready" != "1" ]; then
+        kill -9 "$pid" 2>/dev/null || true
+        die "guest $idx never reached ready (console tail: $(tail -3 "$d/console.log" 2>/dev/null | tr '\n' ' '))"
+    fi
+    grep -v "^$idx	" "$VMS" >"$VMS.new" 2>/dev/null || true
+    printf '%s\t%s\t%s\t%s\t%s\n' "$idx" "$pid" "$accel" "$hostscope" "$d" >>"$VMS.new"
+    sort -n "$VMS.new" >"$VMS" && rm -f "$VMS.new"
+    log "guest $idx up (pid $pid, accel=$accel, hostscope=$hostscope, kernel $(cat "$d/share/guest-ready"))"
+}
+
+# Run one shell job inside a guest via the share's job executor.
+# Usage: vm_exec <idx> <script-file|-> [timeout-s]  — prints the job's
+# output and propagates its exit code.
+vm_exec() {
+    local idx="$1" src="${2:--}" to="${3:-300}" d seq job rc i
+    vm_alive "$idx" || die "guest $idx is not running"
+    d="$(vm_dir "$idx")"
+    seq=$(($(cat "$d/jobseq" 2>/dev/null || echo 0) + 1))
+    echo "$seq" >"$d/jobseq"
+    job="$d/share/jobs/j$seq"
+    if [ "$src" = "-" ]; then cat >"$job.sh.tmp"; else cp "$src" "$job.sh.tmp"; fi
+    mv "$job.sh.tmp" "$job.sh"
+    for ((i = 0; i < to * 2; i++)); do
+        [ -f "$job.rc" ] && break
+        vm_alive "$idx" || die "guest $idx died mid-job (console: $d/console.log)"
+        sleep 0.5
+    done
+    [ -f "$job.rc" ] || die "guest $idx job j$seq timed out after ${to}s (output so far: $d/share/jobs/j$seq.out)"
+    cat "$job.out" 2>/dev/null || true
+    rc="$(cat "$job.rc")"
+    return "$rc"
+}
+
+vm_pause() { # idx — qemu STOP: the S6-b' hung-kernel shape (verb only
+    # this rung; the row is rung 7's). The guest's TCP stack freezes
+    # mid-conversation instead of closing — the shape kill-9 cannot make.
+    local idx="$1"
+    vm_alive "$idx" || die "guest $idx is not running"
+    vm_monitor_cmd "$idx" stop
+    log "guest $idx PAUSED (qemu stop — vcpus + guest clock frozen, TCP left mid-conversation)"
+}
+
+vm_resume() { # idx — qemu cont
+    local idx="$1"
+    vm_alive "$idx" || die "guest $idx is not running"
+    vm_monitor_cmd "$idx" cont
+    log "guest $idx resumed (qemu cont)"
+}
+
+vm_stop() { # idx — poweroff job -> monitor quit -> SIGKILL; logs preserved
+    local idx="$1" d pid i
+    d="$(vm_dir "$idx")"
+    pid="$(vm_pid "$idx")"
+    [ -n "$pid" ] || {
+        warn "guest $idx has no recorded pid"
+        return 0
+    }
+    if kill -0 "$pid" 2>/dev/null; then
+        # A paused guest cannot run jobs — resume first (best-effort).
+        vm_monitor_cmd "$idx" cont 2>/dev/null || true
+        echo "poweroff -f" >"$d/share/jobs/off.sh.tmp" 2>/dev/null &&
+            mv "$d/share/jobs/off.sh.tmp" "$d/share/jobs/off.sh" 2>/dev/null || true
+        for ((i = 0; i < 20; i++)); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.5
+        done
+        kill -0 "$pid" 2>/dev/null && vm_monitor_cmd "$idx" quit 2>/dev/null || true
+        for ((i = 0; i < 10; i++)); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.5
+        done
+        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+    fi
+    wait_for "guest $idx exit" 40 bash -c "! kill -0 '$pid' 2>/dev/null"
+    if [ -f "$VMS" ]; then
+        grep -v "^$idx	" "$VMS" >"$VMS.new" 2>/dev/null || true
+        mv "$VMS.new" "$VMS"
+    fi
+    log "guest $idx down (console preserved at $d/console.log)"
+}
+
 # --- verbs -------------------------------------------------------------------
 mount_member() { # idx
     require_state
@@ -389,7 +621,7 @@ unmount_member() { # idx
 }
 
 create_fleet() {
-    local n="$N_DEFAULT" cowriters=0 require_hs=0 a
+    local n="$N_DEFAULT" cowriters=0 require_hs=0 vms=0 a
     for a in "$@"; do
         case "$a" in
         N=*) n="${a#N=}" ;;
@@ -398,20 +630,41 @@ create_fleet() {
             ;;
         --cowriters=*) cowriters="${a#--cowriters=}" ;;
         --require-host-scoped-subsys) require_hs=1 ;;
-        --netns | --netem | --netem=* | --vm | --vm=*)
-            die "'$a' is a later rung's surface (netns/netem: rung 7 — the netem venue; --vm: rung 6b qemu members). This rung stubs it loud, never silently ignores it"
+        --vm) die "--vm takes a value (--vm=V)" ;;
+        --vm=*) vms="${a#--vm=}" ;;
+        --netns | --netem | --netem=*)
+            die "'$a' is the rung-7 netem/netns venue — this rung stubs it loud, never silently ignores it"
             ;;
         [0-9]*) n="$a" ;;
         *) die "unknown create argument '$a'" ;;
         esac
     done
     [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] || die "N must be a positive integer (got '$n')"
+    [[ "$vms" =~ ^[0-9]+$ ]] || die "--vm=V needs a non-negative integer (got '$vms')"
     [ -e "$CONF" ] && die "fleet state exists at $STATE — run 'sudo tests/mw_fleet.sh teardown' first"
     ensure_prereqs
+    # --vm preflight FIRST (fail before any substrate exists): the boot
+    # pair must be buildable from the sqz kernel RPMs.
+    if [ "$vms" -gt 0 ]; then
+        command -v qemu-system-x86_64 >/dev/null 2>&1 ||
+            die "--vm=$vms: qemu-system-x86_64 is required"
+        "$REPO/tests/mw_guest_image.sh" build ||
+            die "--vm=$vms: guest boot pair build failed (build the sqz kernel first: docker/kernel-sqz/build.sh)"
+        [ -w /dev/kvm ] ||
+            warn "--vm=$vms: /dev/kvm unavailable — guests will run TCG (correctness legs only)"
+    fi
 
-    log "building tcp devsub instance '$INSTANCE' ($MDS_COUNT mds + $OSS_COUNT oss)"
+    # With guests, ONE EXTRA mds + oss namespace pair is RESERVED for the
+    # in-guest legs (THE VM LEG header note): guest-side connects/formats
+    # never touch a subsystem a live host writer rides.
+    local mds_total="$MDS_COUNT" oss_total="$OSS_COUNT"
+    if [ "$vms" -gt 0 ]; then
+        mds_total=$((MDS_COUNT + 1))
+        oss_total=$((OSS_COUNT + 1))
+    fi
+    log "building tcp devsub instance '$INSTANCE' ($mds_total mds + $oss_total oss$([ "$vms" -gt 0 ] && echo ', last pair RESERVED for guest legs'))"
     SQZ_DEVSUB_TRANSPORT=tcp SQZ_DEVSUB_INSTANCE="$INSTANCE" \
-        SQZ_DEVSUB_MDS_COUNT="$MDS_COUNT" SQZ_DEVSUB_OSS_COUNT="$OSS_COUNT" \
+        SQZ_DEVSUB_MDS_COUNT="$mds_total" SQZ_DEVSUB_OSS_COUNT="$oss_total" \
         SQZ_DEVSUB_OSS_GB="$OSS_GB" \
         "$REPO/tests/dev_substrate.sh" create >/dev/null ||
         die "dev_substrate create failed"
@@ -427,8 +680,17 @@ create_fleet() {
         oss) data_nqns+=("$nqn") ;;
         esac
     done <"$DEVSUB_STATE/manifest.tsv"
-    [ "${#meta_nqns[@]}" -eq "$MDS_COUNT" ] || die "manifest mds count mismatch"
-    [ "${#data_nqns[@]}" -eq "$OSS_COUNT" ] || die "manifest oss count mismatch"
+    [ "${#meta_nqns[@]}" -eq "$mds_total" ] || die "manifest mds count mismatch"
+    [ "${#data_nqns[@]}" -eq "$oss_total" ] || die "manifest oss count mismatch"
+    # Split off the reserved guest-leg pair (the LAST of each role).
+    local guest_meta_nqn="" guest_data_nqn=""
+    if [ "$vms" -gt 0 ]; then
+        guest_meta_nqn="${meta_nqns[$((mds_total - 1))]}"
+        guest_data_nqn="${data_nqns[$((oss_total - 1))]}"
+        meta_nqns=("${meta_nqns[@]:0:$MDS_COUNT}")
+        data_nqns=("${data_nqns[@]:0:$OSS_COUNT}")
+        log "guest-leg reserved namespaces: meta=$guest_meta_nqn data=$guest_data_nqn"
+    fi
 
     # The nvmet port carrying our NQNs — its traddr/trsvcid feed the
     # fabric_endpoint records (read from configfs, never re-derived).
@@ -509,7 +771,16 @@ create_fleet() {
     # --- release every devsub-established controller: the DATA plane must
     # be un-pre-connected (the writer's daemon-owned connects are the point),
     # and the META plane must carry ONLY the writer's identity (rule 2) ------
-    log "disconnecting the devsub's default-identity controllers (all instance NQNs)"
+    # NOTE (rung 6b): the RESERVED guest-leg pair's host controllers stay
+    # CONNECTED on purpose — they are instance-number ANCHORS. The
+    # disconnect/reconnect cycle below restores every fleet head's
+    # format-time /dev name only because the kernel hands out lowest-free
+    # instance numbers; vacating the reserved pair's slots would shift
+    # the daemon-owned data connects onto different numbers and trip the
+    # reader-safety drift refusal. The idle host controllers never carry
+    # I/O (guest legs ride the TARGET through their own guest-kernel
+    # controllers); teardown's instance-NQN sweep drops them.
+    log "disconnecting the devsub's default-identity controllers (fleet NQNs; reserved pair kept as instance anchors)"
     for nqn in "${meta_nqns[@]}" "${data_nqns[@]}"; do
         nvme disconnect -n "$nqn" >/dev/null 2>&1 || true
     done
@@ -568,7 +839,12 @@ create_fleet() {
         echo "W_HOSTID='$W_HOSTID'"
         echo "CREATE_PID='$create_pid'"
         echo "HOST_SCOPED='$host_scoped'"
+        echo "VM_COUNT='$vms'"
+        echo "VM_GW='$VM_GW'"
+        echo "GUEST_META_NQN='$guest_meta_nqn'"
+        echo "GUEST_DATA_NQN='$guest_data_nqn'"
     } >"$CONF"
+    : >"$VMS"
 
     mount_member 0
 
@@ -607,7 +883,12 @@ create_fleet() {
     for ((idx = 1; idx < n; idx++)); do
         mount_reader_verified "$idx"
     done
-    log "fleet up: 1 writer + $((n - 1)) reader(s), SQUEEZEFS_FLEET_SHARE=$n per daemon"
+    # Rung-6b guests LAST (they dial the target the fleet already rides;
+    # they hold no member role this rung — the in-guest legs drive them).
+    for ((idx = 0; idx < vms; idx++)); do
+        vm_boot "$idx"
+    done
+    log "fleet up: 1 writer + $((n - 1)) reader(s) + $vms guest(s), SQUEEZEFS_FLEET_SHARE=$n per daemon"
     status_fleet
 }
 
@@ -626,6 +907,15 @@ status_fleet() {
         fi
         printf '%-4s %-7s %-24s %-6s %-9s %s\n' "$idx" "$role" "$mnt" "$pid" "$live" "$hn"
     done <"$MEMBERS"
+    if [ -s "$VMS" ]; then
+        printf '%-4s %-7s %-6s %-6s %-10s %s\n' VM ACCEL PID LIVE HOSTSCOPE DIR
+        local vidx vpid vaccel vhs vdir vlive
+        while IFS=$'\t' read -r vidx vpid vaccel vhs vdir; do
+            vlive="dead"
+            kill -0 "$vpid" 2>/dev/null && vlive="up"
+            printf '%-4s %-7s %-6s %-6s %-10s %s\n' "$vidx" "$vaccel" "$vpid" "$vlive" "$vhs" "$vdir"
+        done <"$VMS"
+    fi
 }
 
 kill_member() {
@@ -639,6 +929,21 @@ kill_member() {
 
 teardown_fleet() {
     local rc=0
+    # Guests FIRST (leaf consumers of the target; their fabric
+    # connections drop with the qemu process).
+    if [ -f "$VMS" ]; then
+        local vidx
+        while IFS=$'\t' read -r vidx _; do
+            [ -n "$vidx" ] && vm_stop "$vidx" || true
+        done < <(cat "$VMS")
+    fi
+    # Sweep guests the ledger does not know (partial vm-boot residue):
+    # any qemu whose cmdline names this fleet's state dir is ours.
+    local qpid
+    for qpid in $(pgrep -f "qemu-system-x86_64.*$STATE/vm" || true); do
+        kill -9 "$qpid" 2>/dev/null || true
+        log "swept unledgered guest pid $qpid"
+    done
     if [ -f "$MEMBERS" ]; then
         local idx role mnt lg hn hi pid
         while IFS=$'\t' read -r idx role mnt lg hn hi pid; do
@@ -726,6 +1031,10 @@ teardown_fleet() {
         warn "RESIDUE: mounts under $MNT_ROOT survived"
         rc=1
     fi
+    if pgrep -f "qemu-system-x86_64.*$STATE/vm" >/dev/null 2>&1; then
+        warn "RESIDUE: qemu guest process(es) for this fleet survived"
+        rc=1
+    fi
     rm -rf "$STATE"
     rmdir "$MNT_ROOT"/m* "$MNT_ROOT" 2>/dev/null || true
     if [ "$rc" -eq 0 ]; then
@@ -760,11 +1069,28 @@ probe-host-scoped)
     echo "host_scoped=$(cat "$STATE/host_scoped")"
     ;;
 teardown) teardown_fleet ;;
+vm-boot)
+    require_state
+    vm_boot "${1:?vm-boot needs a guest index}" "${2:-}"
+    ;;
+vm-exec)
+    require_state
+    vm_exec "${1:?vm-exec needs a guest index}" "${2:--}" "${3:-300}"
+    ;;
+vm-stop)
+    require_state
+    vm_stop "${1:?vm-stop needs a guest index}"
+    ;;
 pause)
-    die "pause is the rung-6b VM members' verb (qemu 'stop' = hung kernel) — not built this rung"
+    require_state
+    vm_pause "${1:?pause needs a guest index}"
+    ;;
+resume)
+    require_state
+    vm_resume "${1:?resume needs a guest index}"
     ;;
 partition | netem)
     die "$VERB is the rung-7 netem/netns venue — not built this rung"
     ;;
-*) die "unknown verb '$VERB' (create|status|mount|unmount|kill|probe-host-scoped|teardown)" ;;
+*) die "unknown verb '$VERB' (create|status|mount|unmount|kill|probe-host-scoped|vm-boot|vm-exec|vm-stop|pause|resume|teardown)" ;;
 esac

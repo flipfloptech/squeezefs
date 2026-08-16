@@ -43,6 +43,40 @@
 #                       turns the skip into a hard failure (automation on
 #                       5b-kernel boxes). On a capable kernel the body
 #                       still refuses: it lands with rungs 7-10.
+#   vm-hostscope-validate  (rung 6b — needs a fleet created with --vm=V)
+#                       BOOT-VALIDATES sqz kernel patch 0030 inside the
+#                       qemu guest (design-mw-multipath-kernel §6):
+#                       POSITIVE arm on fleet guest 0 (param=Y): the 5b
+#                       probe's param face answers host-scoped=true
+#                       in-guest; two identities' connects to ONE subnqn
+#                       land in TWO subsystems (distinct sqz_host_scope,
+#                       one openable head each, each dir's controller
+#                       links carrying only its identity); a same-
+#                       identity duplicate_connect still MERGES (same-
+#                       identity multipath preserved); dmesg carries no
+#                       "duplicate IDs" refusal. NEGATIVE arm on an
+#                       ephemeral param-OFF guest (idx 90): the same two
+#                       connects MERGE into one subsystem (both hostnqns
+#                       under one dir, empty scope) and an explicit-
+#                       identity mount over the merged head refuses with
+#                       the upgraded rule-2 text naming the shape + both
+#                       remedies. All against the RESERVED guest-leg
+#                       namespace — no live host writer's subsystem is
+#                       ever touched.
+#   vm-multi-identity   (rung 6b — needs --vm=V) the N>=2-identity mount
+#                       shape LIVE inside guest 0 on the 0030 kernel:
+#                       writer A formats --multi-writer over the reserved
+#                       guest pair (records name $VM_GW — the guest-
+#                       domain fabric address), mounts with explicit
+#                       identity (daemon-owned data connects resolve A's
+#                       OWN scoped head); writer-candidate B's explicit-
+#                       identity mount gets ITS OWN scoped head, passes
+#                       rule 2 (the 5b/6b stack unblocks the fabric
+#                       layer) and refuses BEYOND identity at the D0
+#                       single-writer guard (arming is rungs 7-10 —
+#                       posture/admission stay gated). Asserts the two
+#                       heads are distinct and B's refusal is NOT the
+#                       rule-2 class.
 #
 # Usage:  sudo tests/run_mw_matrix.sh <leg> [--require-host-scoped-subsys]
 # Exit:   0 green (or a loud SKIP), nonzero on any INVALID row / violation.
@@ -60,6 +94,7 @@ MEMBERS="$STATE/members.tsv"
 CONF="$STATE/config.env"
 
 log() { echo "[mwmatrix] $*"; }
+warn() { echo "[mwmatrix] WARN: $*" >&2; }
 die() {
     echo "[mwmatrix] ERROR: $*" >&2
     exit 1
@@ -345,6 +380,318 @@ $out"
     log "multipath-negative leg GREEN"
 }
 
+# --- rung-6b guest legs --------------------------------------------------
+MWFLEET="$REPO/tests/mw_fleet.sh"
+
+require_vm_fleet() {
+    [ "${VM_COUNT:-0}" -ge 1 ] ||
+        die "this leg needs a fleet created with --vm=V (sudo tests/mw_fleet.sh create N=2 --vm=1) — the 0030 kernel boots only in the qemu guest"
+    [ -n "${GUEST_META_NQN:-}" ] || die "fleet config carries no reserved guest-leg meta NQN"
+}
+
+guest_id() { printf 'cafef1e7-%04d-4000-8000-%012d' "$1" "$CREATE_PID"; }
+guest_nqn() { echo "nqn.2014-08.org.nvmexpress:uuid:$(guest_id "$1")"; }
+
+# The busybox-sh helper preamble every in-guest job shares: the scoped-
+# subsystem walk (head + controller-link census) in shell.
+guest_job_preamble() {
+    cat <<PREAMBLE
+set -e
+export LD_LIBRARY_PATH=/share/lib
+SQZ=/share/bin/squeezefs
+GW='$VM_GW'
+SVC='$TCP_SVC'
+subsys_dirs_for_nqn() { # nqn -> subsystem dir paths
+    for s in /sys/class/nvme-subsystem/nvme-subsys*; do
+        [ -r "\$s/subsysnqn" ] || continue
+        [ "\$(cat "\$s/subsysnqn")" = "\$1" ] && echo "\$s"
+    done
+}
+head_of_dir() { # subsystem dir -> head name (strict nvme<X>n<Y>)
+    for c in "\$1"/nvme*; do
+        b=\$(basename "\$c")
+        echo "\$b" | grep -qE '^nvme[0-9]+n[0-9]+\$' && { echo "\$b"; return 0; }
+    done
+    return 1
+}
+ctrl_links_of_dir() { # subsystem dir -> "ctrl:hostnqn" lines
+    for c in "\$1"/nvme*; do
+        b=\$(basename "\$c")
+        echo "\$b" | grep -qE '^nvme[0-9]+\$' || continue
+        echo "\$b:\$(cat "\$c/hostnqn" 2>/dev/null)"
+    done
+}
+head_for_scope() { # nqn hostnqn-scope -> head name
+    for s in \$(subsys_dirs_for_nqn "\$1"); do
+        [ "\$(cat "\$s/sqz_host_scope" 2>/dev/null)" = "\$2" ] || continue
+        head_of_dir "\$s" && return 0
+    done
+    return 1
+}
+disconnect_nqn() { # nqn — delete every controller serving it
+    for c in /sys/class/nvme/nvme*; do
+        [ "\$(cat "\$c/subsysnqn" 2>/dev/null)" = "\$1" ] || continue
+        echo 1 >"\$c/delete_controller" 2>/dev/null || true
+    done
+    sleep 1
+}
+PREAMBLE
+}
+
+leg_vm_hostscope_validate() {
+    require_vm_fleet
+    local rowdir a_nqn a_id b_nqn b_id
+    rowdir="$STATE/rows/vmhs-$(date +%s)"
+    mkdir -p "$rowdir"
+    a_nqn="$(guest_nqn 80)" a_id="$(guest_id 80)"
+    b_nqn="$(guest_nqn 81)" b_id="$(guest_id 81)"
+
+    # ---------------- POSITIVE arm: fleet guest 0 (param=Y) ----------------
+    log "positive arm: 0030 grouping proof in fleet guest 0 (param=Y)"
+    {
+        guest_job_preamble
+        cat <<POS
+P=/sys/module/nvme_core/parameters/fabrics_host_scoped_subsystems
+[ -r "\$P" ] || { echo "FAIL: 0030 module param file absent — not the patched kernel"; exit 1; }
+echo "param fabrics_host_scoped_subsystems=\$(cat \$P)"
+[ "\$(cat \$P)" = "Y" ] || { echo "FAIL: param not Y on the fleet guest"; exit 1; }
+# The rung-6 5b probe's PARAM FACE (mw_fleet.sh probe_host_scoped arm a),
+# verbatim glob — must answer host-scoped=true in-guest:
+probe=0
+for f in /sys/module/nvme_core/parameters/*host*scope* /sys/module/nvme_core/parameters/*scope*host*; do
+    [ -r "\$f" ] || continue
+    case "\$(cat "\$f")" in Y|y|1) probe=1 ;; esac
+done
+echo "5b-probe-param-face: host_scoped=\$probe"
+[ "\$probe" = 1 ] || { echo "FAIL: the 5b probe would not unlock multi-identity legs here"; exit 1; }
+NQN='$GUEST_META_NQN'
+\$SQZ nvmeof connect --ip "\$GW" --port "\$SVC" --subnqn "\$NQN" --hostnqn '$a_nqn' --hostid '$a_id'
+\$SQZ nvmeof connect --ip "\$GW" --port "\$SVC" --subnqn "\$NQN" --hostnqn '$b_nqn' --hostid '$b_id'
+sleep 1
+echo "=== scoped census (two identities, one subnqn) ==="
+count=0
+scopes=""
+for s in \$(subsys_dirs_for_nqn "\$NQN"); do
+    count=\$((count + 1))
+    scope=\$(cat "\$s/sqz_host_scope" 2>/dev/null)
+    head=\$(head_of_dir "\$s") || { echo "FAIL: subsystem \$s has no openable head"; exit 1; }
+    [ -b "/dev/\$head" ] || { echo "FAIL: /dev/\$head is not a block device"; exit 1; }
+    heads_n=0
+    for c in "\$s"/nvme*; do b=\$(basename "\$c"); echo "\$b" | grep -qE '^nvme[0-9]+n[0-9]+\$' && heads_n=\$((heads_n + 1)); done
+    [ "\$heads_n" = 1 ] || { echo "FAIL: subsystem \$s carries \$heads_n heads (want 1)"; exit 1; }
+    links=\$(ctrl_links_of_dir "\$s")
+    echo "SUBSYS \$(basename "\$s") scope=\$scope head=\$head ctrls: \$links"
+    [ -n "\$links" ] || { echo "FAIL: subsystem \$s carries no controller links"; exit 1; }
+    for l in \$links; do
+        [ "\${l#*:}" = "\$scope" ] || { echo "FAIL: controller \$l under scope \$scope — the dir is NOT identity-dedicated"; exit 1; }
+    done
+    scopes="\$scopes \$scope"
+done
+echo "subsys_count=\$count scopes=\$scopes"
+[ "\$count" = 2 ] || { echo "FAIL: want TWO host-scoped sibling subsystems, got \$count"; exit 1; }
+echo "\$scopes" | grep -q '$a_nqn' || { echo "FAIL: identity A's scope missing"; exit 1; }
+echo "\$scopes" | grep -q '$b_nqn' || { echo "FAIL: identity B's scope missing"; exit 1; }
+if dmesg | grep -i "duplicate IDs"; then
+    echo "FAIL: the kernel refused a scoped sibling's namespace as a duplicate ID (the 0030 dup-ID skip did not engage)"
+    exit 1
+fi
+echo "=== same-identity multipath preservation (duplicate_connect) ==="
+printf 'transport=tcp,traddr=%s,trsvcid=%s,nqn=%s,hostnqn=%s,hostid=%s,duplicate_connect' \
+    "\$GW" "\$SVC" "\$NQN" '$a_nqn' '$a_id' >/dev/nvme-fabrics
+sleep 1
+count2=0
+for s in \$(subsys_dirs_for_nqn "\$NQN"); do count2=\$((count2 + 1)); done
+[ "\$count2" = 2 ] || { echo "FAIL: same-identity second path minted a THIRD subsystem (\$count2)"; exit 1; }
+a_ctrls=0
+for s in \$(subsys_dirs_for_nqn "\$NQN"); do
+    [ "\$(cat "\$s/sqz_host_scope" 2>/dev/null)" = '$a_nqn' ] || continue
+    for l in \$(ctrl_links_of_dir "\$s"); do a_ctrls=\$((a_ctrls + 1)); done
+    heads_n=0
+    for c in "\$s"/nvme*; do b=\$(basename "\$c"); echo "\$b" | grep -qE '^nvme[0-9]+n[0-9]+\$' && heads_n=\$((heads_n + 1)); done
+    [ "\$heads_n" = 1 ] || { echo "FAIL: A's subsystem grew a second head"; exit 1; }
+done
+[ "\$a_ctrls" = 2 ] || { echo "FAIL: A's subsystem carries \$a_ctrls controller links (want 2 — N paths, one identity, ONE subsystem)"; exit 1; }
+echo "same-identity multipath preserved: 2 paths, 1 subsystem, 1 head"
+disconnect_nqn "\$NQN"
+echo "POSITIVE ARM GREEN"
+POS
+    } >"$rowdir/pos-arm.sh"
+    "$MWFLEET" vm-exec 0 "$rowdir/pos-arm.sh" 420 | tee "$rowdir/pos-arm.out" ||
+        die "positive arm FAILED (output: $rowdir/pos-arm.out)"
+
+    # ------------- NEGATIVE arm: ephemeral param-OFF guest (idx 90) --------
+    log "negative arm: param-off merge control on ephemeral guest 90"
+    "$MWFLEET" vm-boot 90 --no-hostscope
+    {
+        guest_job_preamble
+        cat <<NEG
+P=/sys/module/nvme_core/parameters/fabrics_host_scoped_subsystems
+[ -r "\$P" ] || { echo "FAIL: param file absent — not the patched kernel"; exit 1; }
+echo "param fabrics_host_scoped_subsystems=\$(cat \$P)"
+[ "\$(cat \$P)" = "N" ] || { echo "FAIL: negative arm expects the param OFF"; exit 1; }
+NQN='$GUEST_META_NQN'
+\$SQZ nvmeof connect --ip "\$GW" --port "\$SVC" --subnqn "\$NQN" --hostnqn '$a_nqn' --hostid '$a_id'
+\$SQZ nvmeof connect --ip "\$GW" --port "\$SVC" --subnqn "\$NQN" --hostnqn '$b_nqn' --hostid '$b_id'
+sleep 1
+echo "=== merged census (param off) ==="
+count=0
+merged_dir=""
+for s in \$(subsys_dirs_for_nqn "\$NQN"); do
+    count=\$((count + 1))
+    merged_dir="\$s"
+    echo "SUBSYS \$(basename "\$s") scope='\$(cat "\$s/sqz_host_scope" 2>/dev/null)' ctrls: \$(ctrl_links_of_dir "\$s")"
+done
+[ "\$count" = 1 ] || { echo "FAIL: param-off control expects ONE merged subsystem, got \$count"; exit 1; }
+[ -z "\$(cat "\$merged_dir/sqz_host_scope" 2>/dev/null)" ] || { echo "FAIL: scope not empty with the param off"; exit 1; }
+ctrl_links_of_dir "\$merged_dir" | grep -q '$a_nqn' || { echo "FAIL: A's controller missing from the merged dir"; exit 1; }
+ctrl_links_of_dir "\$merged_dir" | grep -q '$b_nqn' || { echo "FAIL: B's controller missing from the merged dir"; exit 1; }
+head=\$(head_of_dir "\$merged_dir") || { echo "FAIL: merged subsystem has no head"; exit 1; }
+echo "merged shape reproduced: 1 subsystem, head \$head, 2 hostnqns"
+echo "=== upgraded rule-2 refusal over the merged head ==="
+# The mount reads the format config BEFORE the identity ladder — format
+# the reserved pair first so the probe reaches the ladder (offline
+# format over the merged head is fine; no identity in play).
+DNQN='$GUEST_DATA_NQN'
+\$SQZ nvmeof connect --ip "\$GW" --port "\$SVC" --subnqn "\$DNQN" --hostnqn '$a_nqn' --hostid '$a_id'
+sleep 1
+dhead=""
+for s in \$(subsys_dirs_for_nqn "\$DNQN"); do dhead=\$(head_of_dir "\$s") && break; done
+[ -n "\$dhead" ] || { echo "FAIL: no head for the reserved data NQN"; exit 1; }
+\$SQZ format "sqmeta:///dev/\$head" "sqdata:///dev/\$dhead" --force >/tmp/format.out 2>&1 || { cat /tmp/format.out; exit 1; }
+mkdir -p /mnt/neg
+rc=0
+timeout 90 \$SQZ mount "sqmeta:///dev/\$head" /mnt/neg -o 'hostnqn=$a_nqn,hostid=$a_id' >/tmp/refusal.out 2>&1 || rc=\$?
+cat /tmp/refusal.out
+grep -q " /mnt/neg " /proc/mounts && { echo "FAIL: mounted on the merged head"; exit 1; }
+[ "\$rc" != 0 ] || { echo "FAIL: mount exited 0"; exit 1; }
+grep -q 'MULTIPATH-MERGED' /tmp/refusal.out || { echo "FAIL: refusal does not name the shape"; exit 1; }
+grep -q 'fabrics_host_scoped_subsystems=Y' /tmp/refusal.out || { echo "FAIL: refusal does not name the sqz-kernel remedy"; exit 1; }
+grep -q 'multipath=N' /tmp/refusal.out || { echo "FAIL: refusal does not name the stock workaround"; exit 1; }
+disconnect_nqn "\$NQN"
+disconnect_nqn "\$DNQN"
+echo "NEGATIVE ARM GREEN"
+NEG
+    } >"$rowdir/neg-arm.sh"
+    local neg_rc=0
+    "$MWFLEET" vm-exec 90 "$rowdir/neg-arm.sh" 420 | tee "$rowdir/neg-arm.out" || neg_rc=$?
+    "$MWFLEET" vm-stop 90
+    [ "$neg_rc" = 0 ] || die "negative arm FAILED (output: $rowdir/neg-arm.out)"
+    log "vm-hostscope-validate GREEN (both arms; evidence in $rowdir)"
+}
+
+leg_vm_multi_identity() {
+    require_vm_fleet
+    local rowdir a_nqn a_id b_nqn b_id
+    rowdir="$STATE/rows/vmmid-$(date +%s)"
+    mkdir -p "$rowdir"
+    a_nqn="$(guest_nqn 85)" a_id="$(guest_id 85)"
+    b_nqn="$(guest_nqn 86)" b_id="$(guest_id 86)"
+
+    # ---- job 1: writer A — the full explicit-identity mount, in-guest ----
+    {
+        guest_job_preamble
+        cat <<JOBA
+P=/sys/module/nvme_core/parameters/fabrics_host_scoped_subsystems
+[ "\$(cat \$P 2>/dev/null)" = "Y" ] || { echo "FAIL: this leg needs the 0030 kernel armed"; exit 1; }
+MNQN='$GUEST_META_NQN'
+DNQN='$GUEST_DATA_NQN'
+\$SQZ nvmeof connect --ip "\$GW" --port "\$SVC" --subnqn "\$MNQN" --hostnqn '$a_nqn' --hostid '$a_id'
+\$SQZ nvmeof connect --ip "\$GW" --port "\$SVC" --subnqn "\$DNQN" --hostnqn '$a_nqn' --hostid '$a_id'
+sleep 1
+MH=\$(head_for_scope "\$MNQN" '$a_nqn') || { echo "FAIL: no scoped meta head for A"; exit 1; }
+DH=\$(head_for_scope "\$DNQN" '$a_nqn') || { echo "FAIL: no scoped data head for A"; exit 1; }
+echo "A heads: meta=/dev/\$MH data=/dev/\$DH"
+\$SQZ format --multi-writer "sqmeta:///dev/\$MH" "sqdata:///dev/\$DH" --force >/tmp/format.out 2>&1 || { cat /tmp/format.out; exit 1; }
+VOL=\$(\$SQZ volume list "sqmeta:///dev/\$MH" | awk -v b="/dev/\$DH" 'NR>1 && \$NF==b {print \$1}')
+[ -n "\$VOL" ] || { echo "FAIL: no durable volume id for /dev/\$DH"; \$SQZ volume list "sqmeta:///dev/\$MH"; exit 1; }
+# Records carry the GUEST-DOMAIN fabric address (\$GW — THE VM LEG note).
+ep_ok=0
+for t in 1 2 3 4 5; do
+    if \$SQZ config set-fabric-endpoints "sqmeta:///dev/\$MH" "\$VOL=\$GW:\$SVC:\$DNQN" >/tmp/ep.out 2>&1; then ep_ok=1; break; fi
+    grep -q "holds the writer lock" /tmp/ep.out || { cat /tmp/ep.out; exit 1; }
+    sleep 2
+done
+[ "\$ep_ok" = 1 ] || { echo "FAIL: set-fabric-endpoints never cleared the post-format guard"; cat /tmp/ep.out; exit 1; }
+# Un-pre-connect the DATA plane: the writer's daemon-owned connect is the point.
+disconnect_nqn "\$DNQN"
+mkdir -p /mnt/a
+\$SQZ mount "sqmeta:///dev/\$MH" /mnt/a -o 'hostnqn=$a_nqn,hostid=$a_id' --daemon --log-file /tmp/a.log >/tmp/a.mount.out 2>&1 || { cat /tmp/a.mount.out; exit 1; }
+i=0
+while [ \$i -lt 240 ]; do grep -q " /mnt/a " /proc/mounts && break; i=\$((i + 1)); sleep 0.5; done
+grep -q " /mnt/a " /proc/mounts || { echo "FAIL: writer A never mounted"; cat /tmp/a.log; exit 1; }
+grep -q "daemon-owned controller resolved" /tmp/a.log || { echo "FAIL: no daemon-owned connect line (rung-2 engagement)"; exit 1; }
+found=0
+for c in /sys/class/nvme/nvme*; do
+    [ "\$(cat "\$c/subsysnqn" 2>/dev/null)" = "\$DNQN" ] || continue
+    [ "\$(cat "\$c/hostnqn" 2>/dev/null)" = '$a_nqn' ] && found=1
+done
+[ "\$found" = 1 ] || { echo "FAIL: no data controller under A's identity post-mount"; exit 1; }
+echo mw-guest-proof >/mnt/a/proof.txt && sync
+grep -q '"mount_posture": *"writer"' /mnt/a/.stats || { echo "FAIL: posture != writer"; exit 1; }
+echo "A_HEAD=\$MH"
+echo "WRITER A GREEN (mounted, daemon-owned data connect under A, posture=writer)"
+JOBA
+    } >"$rowdir/job-a.sh"
+    "$MWFLEET" vm-exec 0 "$rowdir/job-a.sh" 600 | tee "$rowdir/job-a.out" ||
+        die "writer-A job FAILED (output: $rowdir/job-a.out)"
+    local a_head
+    a_head="$(awk -F= '/^A_HEAD=/ {print $2}' "$rowdir/job-a.out" | tr -d '\r')"
+    [ -n "$a_head" ] || die "writer-A job reported no head"
+
+    # ---- job 2: writer-candidate B — past rule 2, refused beyond identity ----
+    {
+        guest_job_preamble
+        cat <<JOBB
+MNQN='$GUEST_META_NQN'
+\$SQZ nvmeof connect --ip "\$GW" --port "\$SVC" --subnqn "\$MNQN" --hostnqn '$b_nqn' --hostid '$b_id'
+sleep 1
+BH=\$(head_for_scope "\$MNQN" '$b_nqn') || { echo "FAIL: no scoped meta head for B"; exit 1; }
+echo "B head: /dev/\$BH (A's was /dev/$a_head)"
+[ "\$BH" != '$a_head' ] || { echo "FAIL: B resolved A's head — identities merged"; exit 1; }
+mkdir -p /mnt/b
+rc=0
+timeout 120 \$SQZ mount "sqmeta:///dev/\$BH" /mnt/b -o 'hostnqn=$b_nqn,hostid=$b_id' >/tmp/b.out 2>&1 || rc=\$?
+echo "=== B refusal (rc=\$rc) ==="
+cat /tmp/b.out
+grep -q " /mnt/b " /proc/mounts && { echo "FAIL: writer-candidate B MOUNTED under a live writer"; exit 1; }
+[ "\$rc" != 0 ] || { echo "FAIL: B's mount exited 0"; exit 1; }
+# The rule-2 pin matches the REFUSAL class only (the KD-MW-3 engagement
+# banner legitimately says "verified (rule 2)"): both the ladder's
+# "mount refused (rule 2" and the daemon-connect resolution family
+# ("produced no namespace under this mount's identity" / "the fabric is
+# mis-sharing the subsystem") are fabric-layer blocks.
+if grep -Eq 'mount refused \(rule 2|produced no namespace under this|mis-sharing the subsystem' /tmp/b.out; then
+    echo "FAIL: B refused AT the fabric layer — scoped-sibling resolution regressed"
+    exit 1
+fi
+grep -Eqi 'claimed by a live writer|holds the writer lock|single-writer' /tmp/b.out ||
+    { echo "FAIL: B's refusal is not the D0 writer-guard class (beyond identity)"; exit 1; }
+echo "WRITER-CANDIDATE B GREEN (own scoped head, PAST rule 2, refused at the single-writer guard)"
+JOBB
+    } >"$rowdir/job-b.sh"
+    local b_rc=0
+    "$MWFLEET" vm-exec 0 "$rowdir/job-b.sh" 600 | tee "$rowdir/job-b.out" || b_rc=$?
+
+    # ---- job 3: cleanup (always) ----
+    {
+        guest_job_preamble
+        cat <<JOBC
+set +e
+\$SQZ umount /mnt/a >/dev/null 2>&1 || umount -l /mnt/a 2>/dev/null
+i=0
+while [ \$i -lt 120 ]; do grep -q " /mnt/a " /proc/mounts || break; i=\$((i + 1)); sleep 0.5; done
+disconnect_nqn '$GUEST_META_NQN'
+disconnect_nqn '$GUEST_DATA_NQN'
+echo "cleanup done"
+exit 0
+JOBC
+    } >"$rowdir/job-cleanup.sh"
+    "$MWFLEET" vm-exec 0 "$rowdir/job-cleanup.sh" 300 | tee "$rowdir/job-cleanup.out" ||
+        warn "in-guest cleanup reported errors"
+    [ "$b_rc" = 0 ] || die "writer-candidate-B job FAILED (output: $rowdir/job-b.out)"
+    log "vm-multi-identity GREEN (evidence in $rowdir)"
+}
+
 leg_cowriters_admission() {
     if [ "$HOST_SCOPED" != "1" ]; then
         local reason="multi-identity (co-writer) legs need host-scoped fabric subsystems: this kernel merges controllers by subsysnqn ignoring hostnqn (nvme_core.multipath=Y), so co-located identities share one head — rung 5b (the sqz-kernel fix, validated in the rung-6b qemu guest) unlocks them. Stock-kernel workaround: nvme_core.multipath=N (boot parameter)"
@@ -358,5 +705,7 @@ case "$LEG" in
 smoke) leg_smoke ;;
 multipath-negative) leg_multipath_negative ;;
 cowriters-admission) leg_cowriters_admission ;;
-*) die "unknown leg '$LEG' (smoke|multipath-negative|cowriters-admission)" ;;
+vm-hostscope-validate) leg_vm_hostscope_validate ;;
+vm-multi-identity) leg_vm_multi_identity ;;
+*) die "unknown leg '$LEG' (smoke|multipath-negative|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
 esac

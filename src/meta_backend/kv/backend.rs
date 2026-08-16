@@ -4876,6 +4876,20 @@ impl KvMetaBackend {
                     crate::fuse_client::METRICS
                         .cowriter_local_commit_refusals
                         .fetch_add(1, Ordering::Relaxed);
+                    // The S8-b falsifier is a MUST-STAY-0 counter, so the
+                    // one thing that matters when it moves is WHICH surface
+                    // reached this gate — callers absorb the error (their
+                    // fallbacks are correct), which is how rung 10's
+                    // fan-out row found a nonzero count with no line naming
+                    // the culprit. A capture here is off every healthy path
+                    // by construction (the gate refused).
+                    log::error!(
+                        "cowriter_local_commit_refusals: an un-routed daemon surface reached \
+                         the co-writer write gate on {} — the S8 'daemon not switched onto \
+                         the router' gap meeting a real workload. Backtrace:\n{}",
+                        self.path.display(),
+                        std::backtrace::Backtrace::force_capture()
+                    );
                     crate::error::SqueezefsError::InvalidOperation(format!(
                         "metadata mutation on meta volume {} refused: this mount is a CO-WRITER \
                          (DLM S9) and holds NO metadata authority over it — the volume's \

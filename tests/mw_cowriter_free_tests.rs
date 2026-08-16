@@ -1637,3 +1637,47 @@ async fn a_harvest_is_exactly_once_lane_scoped_and_quarantines_undischarged_hand
 
     auth.stop().await;
 }
+
+/// **Rung-10 finding #4** (found live by the s9-fanout row: every
+/// co-writer ended the row with `local_commit_refusals == 2` — one per
+/// fsync — and the backtrace tracer named `drain_pending_times_now` via
+/// `sync_device_for_ino`, the fsync path's M6 times drain): the drain
+/// consulted the WRITE GATE before checking whether it had any work, so a
+/// structurally-EMPTY drain on a co-writer (nothing ever parks locally —
+/// the write path's `park_write_times` SHIPS) counted a false
+/// `cowriter_local_commit_refusals` on every fsync, polluting the S8-b
+/// falsifier ("zero un-routed local commits") with a no-op.
+///
+/// The law: **a drain with no work touches no gate** — the falsifier
+/// counts only a gate refusal that had a commit behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_empty_times_drain_on_a_co_writer_fsync_is_not_a_local_commit_refusal() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "times-drain").await;
+    let dev = data_device(dir.path(), "times-drain.dev");
+    let auth = Authority::start(&vol, &dev, &[NODE_A]).await;
+    let cwr = CoWriter::join(&auth, &vol, &dev, NODE_A).await;
+
+    let refusals_before = METRICS
+        .cowriter_local_commit_refusals
+        .load(Ordering::Relaxed);
+    // The fsync path's exact call (flush_inode_to_backend → sync_device_for_ino
+    // → drain_pending_times_now): the co-writer's pending set is empty BY
+    // CONSTRUCTION, so this must be a pure barrier, not a refused commit.
+    cwr.meta
+        .sync_device_for_ino(1)
+        .await
+        .expect("a co-writer fsync barrier is legal");
+    assert_eq!(
+        METRICS
+            .cowriter_local_commit_refusals
+            .load(Ordering::Relaxed),
+        refusals_before,
+        "an EMPTY times drain moved the S8-b falsifier — the gate was probed before the work \
+         check (rung-10 finding #4)"
+    );
+
+    auth.stop().await;
+}

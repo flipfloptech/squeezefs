@@ -2370,13 +2370,32 @@ pub async fn member_renewal_tick(
         return RenewalTick::Renewed;
     };
     if session.self_fence_due() {
+        // The DEADLINE fence (rung-8 S7-a finding, 2026-08-16): T_self
+        // passed with the lease un-renewed — the frozen/hung-OWNER shape
+        // (S6-b′'s exact dual: there the member froze, here the owner
+        // did). Fence FIRST, always. Then ONE law for every fence a purge
+        // can make clean: a purged READER re-presents FRESH through the
+        // same ladder the not-custody arm uses (`Fenced` is loop-terminal
+        // — returning it here stranded the mount fenced-forever with
+        // `membership_mode` still reading `member`). A WRITER's fence
+        // poisoned process data custody (S7) — terminal, never fresh.
         let fence = session.self_fence(&format!("renewal failed: {e}"));
-        if fence.purge_requested {
-            if let Some(purge) = on_purge {
-                purge();
+        if !fence.purge_requested {
+            return RenewalTick::Fenced;
+        }
+        match on_purge {
+            Some(purge) => purge(),
+            None => {
+                // The defensive law from the not-custody arm, verbatim: a
+                // reader with no purge hook cannot PROVE its view clean.
+                log::error!(
+                    "membership: deadline self-fence and no purge hook is wired — staying \
+                     fenced rather than re-joining over an unpurged cache"
+                );
+                return RenewalTick::Fenced;
             }
         }
-        return RenewalTick::Fenced;
+        return fresh_join_after_fence(client, endpoint, secret, req, clock).await;
     }
     // The failure classifies (the S6-b′ frozen-clock finding, 2026-08-16):
     // an UNKNOWN LEASE means the lease is not custody — fence FIRST. Any
@@ -2437,6 +2456,21 @@ pub async fn member_renewal_tick(
         // never be made clean by a purge, so it never re-presents fresh.
         return RenewalTick::Fenced;
     }
+    fresh_join_after_fence(client, endpoint, secret, req, clock).await
+}
+
+/// The post-fence FRESH re-present, shared by the deadline arm and the
+/// not-custody arm (one ladder — the caller has already fenced AND purged):
+/// `prior_epoch = None` because a dead lease is never resurrected, and a
+/// refused/unreachable join answers [`RenewalTick::RejoinRefused`] so the
+/// renewal loop RETRIES (never the loop-terminal `Fenced`).
+async fn fresh_join_after_fence(
+    client: &mut crate::membership_wire::MemberClient,
+    endpoint: &str,
+    secret: &[u8],
+    req: &JoinRequest,
+    clock: &LeaseClock,
+) -> RenewalTick {
     let mut fresh_req = req.clone();
     fresh_req.prior_epoch = None;
     match crate::membership_wire::MemberClient::join(endpoint, secret, fresh_req, clock.clone())

@@ -153,6 +153,7 @@ impl Drop for Restore {
         data_grant::uninstall_custody_owner();
         publish::uninstall_client();
         publish::uninstall_free_executor();
+        publish::uninstall_harvest_executor();
         ship::disarm_ownership();
         data_custody::test_reset_custody_generation();
         data_custody::test_clear_poison();
@@ -387,6 +388,7 @@ impl Authority {
             Arc::clone(&br),
             Arc::clone(&meta),
         ));
+        publish::install_harvest_executor(cowriter::router_harvest_executor(Arc::clone(&br)));
 
         let router = data_grant::AsyncVerbRouter::new()
             .with_custody(Arc::clone(&owner))
@@ -1441,8 +1443,10 @@ async fn a_co_writer_rewrite_loop_reuses_its_lanes_freed_blocks_and_never_hits_s
 
     // A small store: 64 blocks, W = 2 ⇒ the co-writer's lane holds 32.
     const CAP_BLOCKS: u64 = 64;
-    cwr.alloc.set_capacity_bytes(CAP_BLOCKS * cwr.alloc.chunk_size());
-    auth.alloc.set_capacity_bytes(CAP_BLOCKS * auth.alloc.chunk_size());
+    cwr.alloc
+        .set_capacity_bytes(CAP_BLOCKS * cwr.alloc.chunk_size());
+    auth.alloc
+        .set_capacity_bytes(CAP_BLOCKS * auth.alloc.chunk_size());
     let lane_share = lane::lane_capacity_blocks(CAP_BLOCKS, 2, 1);
     let iterations = lane_share * 3;
 
@@ -1534,7 +1538,10 @@ async fn a_harvest_is_exactly_once_lane_scoped_and_quarantines_undischarged_hand
         .await
         .expect("A's displaced free ships");
     auth.br.reclaim_drain().await;
-    assert!(auth.free_listed(a_idx), "fixture: A is in the lane-1 free supply");
+    assert!(
+        auth.free_listed(a_idx),
+        "fixture: A is in the lane-1 free supply"
+    );
 
     // The harvest: lane-scoped, exactly-once, removed from the source list.
     let got = publish::ship_harvest_lane_free(&auth.endpoint, tag, 1, 2, 16, epoch, 9001)
@@ -1552,7 +1559,10 @@ async fn a_harvest_is_exactly_once_lane_scoped_and_quarantines_undischarged_hand
     let again = publish::ship_harvest_lane_free(&auth.endpoint, tag, 1, 2, 16, epoch, 9001)
         .await
         .expect("the replay is absorbed");
-    assert_eq!(again, got, "the dedup window answered the winner's own grant");
+    assert_eq!(
+        again, got,
+        "the dedup window answered the winner's own grant"
+    );
     assert_eq!(publish::stats().harvest_replays - replays_before, 1);
 
     // A fresh id finds the supply gone.
@@ -1597,7 +1607,10 @@ async fn a_harvest_is_exactly_once_lane_scoped_and_quarantines_undischarged_hand
         .await
         .expect("A's second displaced free ships");
     auth.br.reclaim_drain().await;
-    assert!(auth.free_listed(a_idx), "the full cycle returned A to the supply");
+    assert!(
+        auth.free_listed(a_idx),
+        "the full cycle returned A to the supply"
+    );
 
     // Harvest A once more and let the epoch DIE with the handout
     // undischarged: A must be named in the death cohort (the quarantine's
@@ -1606,7 +1619,9 @@ async fn a_harvest_is_exactly_once_lane_scoped_and_quarantines_undischarged_hand
         .await
         .expect("the third harvest ships");
     assert!(got2.contains(&a_idx));
-    let dead = auth.owner.revoke_client(NODE_A, "test: epoch death with an undischarged handout");
+    let dead = auth
+        .owner
+        .revoke_client(NODE_A, "test: epoch death with an undischarged handout");
     assert_eq!(dead.len(), 1, "one custody died");
     assert!(
         dead[0].offsets.contains(&a_off),

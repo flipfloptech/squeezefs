@@ -1296,6 +1296,13 @@ pub fn authority_accounting_scope_active() -> bool {
 /// incarnation's ids.
 static FREE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Mint one client-side ship request id — shared by the free and harvest
+/// verbs (each has its own dedup window; one monotone sequence keeps ids
+/// unique per process regardless of verb).
+pub(crate) fn next_ship_request_id() -> u64 {
+    FREE_SEQ.fetch_add(1, Ordering::AcqRel) + 1
+}
+
 /// Bounded resend budget for one free verb. A protocol constant, not a
 /// resource cap (nothing here derives from machine size): each resend is
 /// absorbed exactly-once by the owner's dedup window, and past the budget
@@ -1405,7 +1412,7 @@ pub async fn ship_displaced_frees(
 
     for group in groups {
         let epoch = client.lease_epoch();
-        let request_id = FREE_SEQ.fetch_add(1, Ordering::AcqRel) + 1;
+        let request_id = next_ship_request_id();
         let idxs: Vec<u64> = group.entries.iter().map(|(_, _, idx)| *idx).collect();
         let mut attempt = 0u32;
         let shipped = loop {
@@ -1510,6 +1517,7 @@ pub async fn execute_shipped_frees(
     with_authority_accounting(async move {
         let chunk = alloc.chunk_size();
         let mut verdicts = Vec::with_capacity(blocks.len());
+        let mut discharged: Vec<u64> = Vec::new();
         for idx in blocks {
             let offset = idx.saturating_mul(chunk);
             let key = backend.persist_block_key(&be_id, offset);
@@ -1558,11 +1566,109 @@ pub async fn execute_shipped_frees(
                     }
                 }
             };
+            if verdict == FreeVerdict::Freed {
+                // The offset is back under this authority's own ladder, so
+                // any lane-harvest handout of it is DISCHARGED (rung 10):
+                // it is no longer any epoch's reallocation hazard.
+                discharged.push(offset);
+            }
             verdicts.push(verdict);
         }
+        crate::data_grant::discharge_lane_handouts(&discharged);
         Ok(verdicts)
     })
     .await
+}
+
+/// **The owner half of the lane free HARVEST** (rung 10, residual 2 — the
+/// [`crate::meta_ship::publish::HarvestExecutor`] body): hand a validated
+/// co-writer up to `max` free-listed block indices of ITS lane, removing
+/// each from this authority's own free list (exactly-once) and recording
+/// the handout against `lease_epoch` (quarantine-on-death until the
+/// offset's next shipped free discharges it).
+///
+/// When the lane's supply is empty but frees may still sit in the reclaim
+/// queue, the pass drains it once and rescans — the ENOSPC pressure
+/// valve's act, on the one node whose reclaimer is live. Runs under
+/// [`with_authority_accounting`] like the free executor: this IS the
+/// authority's own accounting act, performed for a validated peer.
+pub async fn execute_lane_harvest(
+    backend: &Arc<crate::routing::BackendRouter>,
+    vol_tag: u64,
+    lane: u16,
+    writers: u16,
+    max: u64,
+    lease_epoch: u64,
+) -> Result<Vec<u64>> {
+    let Some((_be_id, alloc)) = backend.allocator_for_volume_tag(vol_tag) else {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "S9: a lane free harvest names data volume tag {vol_tag:#016x}, which this \
+             authority routes no allocator for — refusing rather than handing out offsets of a \
+             guessed volume"
+        )));
+    };
+    let backend = Arc::clone(backend);
+    with_authority_accounting(async move {
+        let max = max.max(1) as usize;
+        let mut out: Vec<u64> = Vec::new();
+        for pass in 0..2u8 {
+            let mut candidates: Vec<u64> = alloc
+                .free_block_indices()
+                .into_iter()
+                .filter(|idx| {
+                    crate::data_alloc_lane::block_lane_of(*idx, writers) == u64::from(lane)
+                })
+                .collect();
+            // Lowest-first: deterministic, and it keeps the handed-out run
+            // as dense as a strided lane allows (the contiguity posture).
+            candidates.sort_unstable();
+            for idx in candidates {
+                if out.len() >= max {
+                    break;
+                }
+                if alloc.take_free_for_lane_grant(idx) {
+                    out.push(idx);
+                }
+            }
+            if !out.is_empty() || pass == 1 {
+                break;
+            }
+            // Nothing free in the lane: the supply may still be queued
+            // behind the reclaim manners law — drain and rescan once.
+            backend.reclaim_drain().await;
+        }
+        if !out.is_empty() {
+            let chunk = alloc.chunk_size();
+            let offsets: Vec<u64> = out.iter().map(|idx| idx * chunk).collect();
+            crate::data_grant::note_lane_handouts(lease_epoch, &offsets);
+            log::info!(
+                "S9: lane free harvest served {} block(s) of lane {lane}/{writers} on vol_tag \
+                 {vol_tag:#016x} to lease epoch {lease_epoch} (removed from this authority's \
+                 free list; quarantine-on-death until discharged)",
+                out.len()
+            );
+        }
+        Ok(out)
+    })
+    .await
+}
+
+/// A [`crate::meta_ship::publish::HarvestExecutor`] over this authority's
+/// data router — installed beside the free executor by
+/// `multi_writer::arm_multi_writer` (and the rigs directly): the free
+/// RETURNS a co-writer's displaced offset to the lane's supply, the
+/// harvest is what makes that supply REACHABLE again.
+pub fn router_harvest_executor(
+    backend: Arc<crate::routing::BackendRouter>,
+) -> crate::meta_ship::publish::HarvestExecutor {
+    Arc::new(
+        move |vol_tag: u64, lane: u16, writers: u16, max: u64, lease_epoch: u64| {
+            let backend = Arc::clone(&backend);
+            Box::pin(async move {
+                execute_lane_harvest(&backend, vol_tag, lane, writers, max, lease_epoch).await
+            })
+        },
+    )
 }
 
 /// A [`crate::meta_ship::publish::FreeExecutor`] over this authority's data

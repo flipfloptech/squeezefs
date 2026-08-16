@@ -668,6 +668,14 @@ pub struct WriteCustodyOwner {
     /// the two mint words ([`crate::grant_table_core`], loom-modeled).
     table: crate::grant_table_core::GrantTableCore<LockLease>,
     quarantine: Option<Arc<dyn CustodyQuarantine>>,
+    /// The lane-harvest HANDOUT ledger (rung 10, residual 2): offsets this
+    /// authority handed a co-writer's lease out of its own free list, keyed
+    /// by lease epoch, undischarged. Merged into the death cohort at
+    /// [`Self::finish_kill`] (the §3.1 zombie window for REUSED offsets),
+    /// discharged when the offset's next shipped free returns it to this
+    /// authority's own ladder. Bounded by the peer's live working set, not
+    /// by time: handout → publish → re-free cycles discharge.
+    handouts: parking_lot::Mutex<std::collections::HashMap<u64, std::collections::BTreeSet<u64>>>,
     granted: AtomicU64,
     released: AtomicU64,
     conflicts: AtomicU64,
@@ -760,6 +768,7 @@ impl WriteCustodyOwner {
             lanes: ArcSwapOption::empty(),
             table: crate::grant_table_core::GrantTableCore::new(),
             quarantine,
+            handouts: parking_lot::Mutex::new(std::collections::HashMap::new()),
             granted: AtomicU64::new(0),
             released: AtomicU64::new(0),
             conflicts: AtomicU64::new(0),
@@ -926,6 +935,47 @@ impl WriteCustodyOwner {
                  not widen a live partition — re-arm the authority (a new era) to admit it"
             )),
         }
+    }
+
+    /// Record lane-harvest handouts against `lease_epoch` (rung 10,
+    /// residual 2 — the harvest executor's act, after it removed the
+    /// offsets from its own free list): an epoch that dies before the
+    /// handed-out offset's reference lands durably takes it into the death
+    /// cohort, exactly like a declared in-flight destination.
+    pub fn note_lane_handouts(&self, lease_epoch: u64, offsets: &[u64]) {
+        if offsets.is_empty() {
+            return;
+        }
+        self.handouts
+            .lock()
+            .entry(lease_epoch)
+            .or_default()
+            .extend(offsets.iter().copied());
+    }
+
+    /// Discharge handouts: `offsets` came back under this authority's own
+    /// ladder (the shipped free that returned them), so they are no longer
+    /// any epoch's reallocation hazard.
+    pub fn discharge_lane_handouts(&self, offsets: &[u64]) {
+        if offsets.is_empty() {
+            return;
+        }
+        let mut map = self.handouts.lock();
+        map.retain(|_, set| {
+            for off in offsets {
+                set.remove(off);
+            }
+            !set.is_empty()
+        });
+    }
+
+    /// The undischarged handouts of `lease_epoch` (test/probe surface).
+    pub fn undischarged_handouts(&self, lease_epoch: u64) -> Vec<u64> {
+        self.handouts
+            .lock()
+            .get(&lease_epoch)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     /// **Validate a shipped displaced-block FREE** (the co-writer free
@@ -1260,14 +1310,27 @@ impl WriteCustodyOwner {
             "S9: co-writer '{client}' custody revoked by authority '{}' ({reason})",
             self.id
         ));
-        let admitted = match (&self.quarantine, lease.inflight.is_empty()) {
-            (Some(sink), false) => sink.quarantine(&lease.inflight, epoch),
+        // The death cohort: the client's DECLARED in-flight set, plus every
+        // undischarged lane-harvest handout of this epoch (rung 10 —
+        // offsets handed out of our own free list whose references never
+        // landed durably: a fenced-but-live holder may still be DMA-ing
+        // into them, and derived recovery would call them free).
+        let mut cohort = lease.inflight.clone();
+        if let Some(handed) = self.handouts.lock().remove(&lease.epoch) {
+            for off in handed {
+                if !cohort.contains(&off) {
+                    cohort.push(off);
+                }
+            }
+        }
+        let admitted = match (&self.quarantine, cohort.is_empty()) {
+            (Some(sink), false) => sink.quarantine(&cohort, epoch),
             (None, false) => {
                 log::error!(
-                    "S9: co-writer '{client}' died holding {} declared in-flight offset(s) but \
+                    "S9: co-writer '{client}' died holding {} in-flight/handed-out offset(s) but \
                      this authority has no quarantine sink — those offsets are NOT protected \
                      from reallocation. A data-plane authority must be armed with one",
-                    lease.inflight.len()
+                    cohort.len()
                 );
                 0
             }
@@ -1285,7 +1348,7 @@ impl WriteCustodyOwner {
             lease_epoch: lease.epoch,
             epoch,
             grants,
-            offsets: lease.inflight,
+            offsets: cohort,
             pr_key: lease.pr_key,
             reason: reason.to_string(),
         })
@@ -2319,6 +2382,32 @@ pub fn validate_free(client: &str, lease_epoch: u64) -> std::result::Result<(), 
         ));
     };
     owner.check_free(client, lease_epoch)
+}
+
+/// Record lane-harvest handouts on the installed authority (rung 10 —
+/// [`WriteCustodyOwner::note_lane_handouts`]). The one caller is the
+/// harvest executor, which runs strictly AFTER the lane + era validation,
+/// so a missing authority here is a torn-down test venue, never a
+/// production window — logged loud, offsets covered by derived recovery.
+pub fn note_lane_handouts(lease_epoch: u64, offsets: &[u64]) {
+    match custody_owner() {
+        Some(owner) => owner.note_lane_handouts(lease_epoch, offsets),
+        None => log::error!(
+            "S9: {} lane-harvest handout(s) for lease epoch {lease_epoch} could not be recorded \
+             — no custody authority is installed (the offsets stay durably unreferenced; \
+             derived recovery owns them)",
+            offsets.len()
+        ),
+    }
+}
+
+/// Discharge lane-harvest handouts on the installed authority (rung 10 —
+/// [`WriteCustodyOwner::discharge_lane_handouts`]): the offsets' next
+/// shipped free returned them to this authority's own ladder.
+pub fn discharge_lane_handouts(offsets: &[u64]) {
+    if let Some(owner) = custody_owner() {
+        owner.discharge_lane_handouts(offsets);
+    }
 }
 
 /// **S4's foreign-home seam, resolved.**

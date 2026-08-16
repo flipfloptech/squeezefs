@@ -493,6 +493,65 @@ pub type LaneReserveSink = Arc<
         + Sync,
 >;
 
+/// The lane free HARVEST sink (rung 10, residual 2): `max blocks` → the
+/// block indices the authority handed this lane back. Boxed async closure
+/// like [`LaneReserveSink`], for the same reason — the allocator must not
+/// learn the metadata plane's types, and the harvest must be `await`ed on
+/// the allocating task (honest backpressure on exactly the starved
+/// writer).
+pub type LaneHarvestSink = Arc<
+    dyn Fn(u64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u64>>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// The production HARVEST sink (co-writer engagements only —
+/// [`crate::alloc_lane_grant::engage_allocator_lane`] wires it beside the
+/// reserve sink): ship one `HarvestLaneFree` verb under the CURRENT lease
+/// epoch with a fresh request id, bounded epoch-stable retries mirroring
+/// the shipped free's (a retry never re-keys; an epoch move abandons —
+/// the authority's handout ledger + quarantine own the loss direction).
+pub fn routed_harvest_sink(volume_id: &str, part: AppendPartition) -> LaneHarvestSink {
+    let vol_tag = crate::meta_backend::kv::block_refs::volume_tag(volume_id);
+    Arc::new(move |max: u64| {
+        Box::pin(async move {
+            let Some(client) = crate::data_grant::custody_client() else {
+                return Err(SqueezefsError::InvalidOperation(
+                    "S9: a lane free harvest has no custody client — no lease epoch to \
+                     present and no authority to ask (arm the co-writer mount)"
+                        .to_string(),
+                ));
+            };
+            let endpoint = client.endpoint().to_string();
+            let epoch = client.lease_epoch();
+            let request_id = crate::cowriter::next_ship_request_id();
+            let mut attempt = 0u32;
+            loop {
+                match crate::meta_ship::publish::ship_harvest_lane_free(
+                    &endpoint,
+                    vol_tag,
+                    part.writer_id(),
+                    part.writers(),
+                    max,
+                    epoch,
+                    request_id,
+                )
+                .await
+                {
+                    Ok(idxs) => return Ok(idxs),
+                    Err(e) => {
+                        attempt += 1;
+                        if client.lease_epoch() != epoch || attempt >= 3 {
+                            return Err(e);
+                        }
+                        squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                }
+            }
+        })
+    })
+}
+
 /// The production sink: one **routed** raise per grain, which on a mount
 /// that holds metadata authority is one `setxattr` on ino 1 — a
 /// whole-tx-atomic, checksummed, torn-immune commit through the M7 conveyor

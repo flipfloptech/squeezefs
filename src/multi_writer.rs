@@ -287,8 +287,9 @@ impl MultiWriterArm {
         crate::alloc_lane_grant::uninstall_frontier_source();
         // The shipped-free EXECUTOR dies with the authority too: a served
         // free with no executor refuses loud rather than stranding half a
-        // ladder on a disarmed mount.
+        // ladder on a disarmed mount. Same for its reuse half.
         publish::uninstall_free_executor();
+        publish::uninstall_harvest_executor();
         if let Some(hold) = self.wero.take() {
             data_custody::release_hold(hold).await;
         }
@@ -586,11 +587,20 @@ pub async fn arm_multi_writer(
             Arc::clone(backend),
             Arc::clone(meta),
         ));
+        // The free's REUSE half (rung 10, residual 2): the lane free
+        // HARVEST executor — what makes a co-writer's freed supply
+        // reachable again. Installed together because a set that returns
+        // offsets to a lane's supply but can never hand them back leaks
+        // toward ENOSPC on a store with free space.
+        publish::install_harvest_executor(crate::cowriter::router_harvest_executor(Arc::clone(
+            backend,
+        )));
         if let Err(e) =
             crate::alloc_lane_grant::engage_authority_lanes(authority_lane, backend, meta).await
         {
             crate::alloc_lane_grant::uninstall_frontier_source();
             publish::uninstall_free_executor();
+            publish::uninstall_harvest_executor();
             if let Some(hold) = wero {
                 data_custody::release_hold(hold).await;
             }

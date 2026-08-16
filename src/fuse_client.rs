@@ -5136,6 +5136,15 @@ pub struct Metrics {
     /// current-width lane record first (the partitioned arm — clause-3
     /// protection carried through the delete). 0 under a solo era.
     pub alloc_lane_stale_records_folded: Align64<AtomicU64>,
+    /// Lane free HARVEST attempts (rung 10, residual 2): a co-writer's
+    /// allocation funnel asking the authority for its lane's freed supply
+    /// at lane exhaustion. 0 on every non-co-writer mount by construction.
+    pub alloc_lane_harvests: Align64<AtomicU64>,
+    /// Block indices ADOPTED from lane free harvests into this mount's own
+    /// free list — the reuse-engagement instrument beside the publish
+    /// ledger's `harvest_shipped_blocks` (a sustained-rewrite row past the
+    /// lane share must grow both, or the mount is burning frontier).
+    pub alloc_lane_harvested_blocks: Align64<AtomicU64>,
     // DLM **S9** (spec §6.2 item 7's consumer half): the CO-WRITER mount
     // posture. All four are 0 on every shipped mount — the posture is
     // opt-in twice over (`SQUEEZEFS_MULTI_WRITER=1` +
@@ -9156,6 +9165,10 @@ impl SqueezefsFilesystem {
                     .load(Ordering::Relaxed),
                 "alloc_lane_stale_records_folded": METRICS
                     .alloc_lane_stale_records_folded
+                    .load(Ordering::Relaxed),
+                "alloc_lane_harvests": METRICS.alloc_lane_harvests.load(Ordering::Relaxed),
+                "alloc_lane_harvested_blocks": METRICS
+                    .alloc_lane_harvested_blocks
                     .load(Ordering::Relaxed),
                 // DLM S9 (spec §6.2 item 7's consumer half): the mount
                 // POSTURE and the co-writer ledger. `mount_posture` is the

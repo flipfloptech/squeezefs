@@ -354,6 +354,12 @@ struct LanePartition {
     /// reservation is then RAM-only and recovery falls back to the derived
     /// floor, which is exactly the pre-partition posture.
     sink: std::sync::OnceLock<crate::data_alloc_lane::LaneReserveSink>,
+    /// The lane free HARVEST sink (rung 10, residual 2) — wired only on
+    /// co-writer engagements ([`crate::alloc_lane_grant`]): at lane
+    /// exhaustion, ask the authority for this lane's freed supply. Absent
+    /// on the authority (its own free list already carries lane-0's
+    /// supply) and everywhere unpartitioned.
+    harvest: std::sync::OnceLock<crate::data_alloc_lane::LaneHarvestSink>,
 }
 
 /// One offset's incarnation state: the loom-verified seqlock word plus,
@@ -452,6 +458,7 @@ impl BlockAllocator {
             reserved_upto: AtomicU64::new(self.highest_block.load(Ordering::Relaxed)),
             grain: crate::data_alloc_lane::reserve_grain_blocks(cap, part.writers()),
             sink: std::sync::OnceLock::new(),
+            harvest: std::sync::OnceLock::new(),
         };
         let grain = installed.grain;
         if self.lanes.set(installed).is_err() {
@@ -498,6 +505,14 @@ impl BlockAllocator {
     pub fn set_lane_reserve_sink(&self, sink: crate::data_alloc_lane::LaneReserveSink) {
         if let Some(lanes) = self.lanes.get() {
             let _ = lanes.sink.set(sink);
+        }
+    }
+
+    /// Wire the lane free HARVEST sink (rung 10 — co-writer engagements
+    /// only; see [`LanePartition::harvest`]).
+    pub fn set_lane_harvest_sink(&self, sink: crate::data_alloc_lane::LaneHarvestSink) {
+        if let Some(lanes) = self.lanes.get() {
+            let _ = lanes.harvest.set(sink);
         }
     }
 
@@ -1425,6 +1440,97 @@ impl BlockAllocator {
             .is_ok()
     }
 
+    /// **Claim one free-listed block for a lane-harvest handout** (rung 10,
+    /// residual 2 — the AUTHORITY side of
+    /// [`crate::cowriter::execute_lane_harvest`]): remove it from this
+    /// allocator's free list so no path here can ever hand it out again —
+    /// the receiving lane holder is its one next owner. Free-list
+    /// membership already implies not-quarantined / not-graced /
+    /// not-inflight (quarantine admission and the grace ring both pull
+    /// offsets OUT of the list), which is the same invariant
+    /// `try_allocate_block` stands on. The claim-cancels-debt law applies
+    /// (KD-4.3): the new owner's write-before-publish rewrites the range,
+    /// so it owes no discard. `true` ⇔ this call won the removal.
+    pub fn take_free_for_lane_grant(&self, block_idx: u64) -> bool {
+        if self.free_blocks.remove(&block_idx).is_none() {
+            return false;
+        }
+        self.cancel_elided_debt(block_idx * self.chunk_size);
+        true
+    }
+
+    /// **Adopt a lane-free grant** (rung 10 — the CO-WRITER side): insert
+    /// harvested block indices into this mount's own free list, where the
+    /// ordinary free-list-first allocation funnel serves them back with the
+    /// full claim discipline (refcount, fresh incarnation — the co-writer's
+    /// own lane-partitioned minter, so the new lifetime stamp can collide
+    /// with nobody's). A foreign-lane index is refused loud (the authority
+    /// mis-serving a lane is exactly the collision the partition forbids);
+    /// a duplicate is refused loud (a double handout is the two-owners
+    /// lineage). Returns the count adopted.
+    pub fn adopt_lane_free_grant(&self, block_idxs: &[u64]) -> u64 {
+        let mut adopted = 0u64;
+        for idx in block_idxs {
+            if !self.lane_is_ours(*idx) {
+                log::error!(
+                    "refusing to adopt harvested block {idx} on volume '{}': its lane is not \
+                     this mount's — a mis-served harvest would mint two owners for one offset",
+                    self._volume_id
+                );
+                continue;
+            }
+            if !self.free_blocks.insert(*idx) {
+                log::error!(
+                    "refusing to adopt harvested block {idx} on volume '{}': it is already on \
+                     this mount's free list — the double-handout lineage",
+                    self._volume_id
+                );
+                continue;
+            }
+            adopted += 1;
+        }
+        if adopted > 0 {
+            let m = &crate::fuse_client::METRICS;
+            m.alloc_lane_harvested_blocks
+                .fetch_add(adopted, Ordering::Relaxed);
+        }
+        adopted
+    }
+
+    /// **The lane free harvest** (rung 10): when this mount's lane is
+    /// exhausted, ask the authority for the lane's freed supply — the
+    /// offsets this mount's own shipped frees returned to "the free supply
+    /// of lane `b % W`", which live on the AUTHORITY's free list and are
+    /// reachable by nobody else. One sink call per exhaustion episode
+    /// (bounded by the reservation grain), adopted straight into the local
+    /// free list. Returns the count adopted; `0` when no partition, no
+    /// sink, or an empty supply — and errors are ABSORBED into `0` (the
+    /// caller's honest `StorageFull` stands; a harvest failure must never
+    /// mask the diagnosis).
+    async fn harvest_lane_supply(&self) -> u64 {
+        let Some(lanes) = self.lanes.get() else {
+            return 0;
+        };
+        let Some(sink) = lanes.harvest.get() else {
+            return 0;
+        };
+        crate::fuse_client::METRICS
+            .alloc_lane_harvests
+            .fetch_add(1, Ordering::Relaxed);
+        match sink(lanes.grain.max(1)).await {
+            Ok(idxs) => self.adopt_lane_free_grant(&idxs),
+            Err(e) => {
+                log::warn!(
+                    "lane free harvest failed on volume '{}' ({e}) — the allocation verdict \
+                     stands (StorageFull if nothing else frees); the lane's supply stays on \
+                     the authority's list",
+                    self._volume_id
+                );
+                0
+            }
+        }
+    }
+
     /// **Retire a co-writer's LOCAL view of a displaced block whose free
     /// SHIPPED** (`crate::cowriter::ship_displaced_frees`, after the
     /// authority's acknowledgement): drop the local refcount entry (the
@@ -1716,6 +1822,18 @@ impl BlockAllocator {
             }
             if !self.grace.is_empty() {
                 crate::free_grace::note_alloc_stall(self.grace.len(), self.grace.bytes());
+            }
+        }
+        // Rung 10 (residual 2) — the lane free HARVEST, before the verdict:
+        // on a co-writer the lane's freed supply lives on the AUTHORITY's
+        // free list (its shipped frees put it there, and the authority's
+        // own lane-filtered funnel can never reach it), so lane exhaustion
+        // asks for it back — grain-batched, adopted into the local free
+        // list, retried through the ordinary funnel. Absent sink/partition
+        // = one OnceLock probe and fall through (every mount today).
+        if is_storage_full(&e) && self.harvest_lane_supply().await > 0 {
+            if let ok @ Ok(_) = self.try_allocate_block() {
+                return self.hand_out_reserved(ok).await;
             }
         }
         if !is_storage_full(&e) || self.space_valve.get().is_none() {

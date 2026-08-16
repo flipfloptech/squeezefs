@@ -325,6 +325,17 @@ pub async fn engage_allocator_lane(
         alloc.volume_id(),
         part.writers(),
     ));
+    if matches!(floor, LaneFloor::Authority) {
+        // Rung 10 (residual 2): only a CO-WRITER needs the harvest — its
+        // shipped frees land on the AUTHORITY's free list, which its own
+        // funnel can never reach. The authority's lane-0 supply is its own
+        // free list already, so wiring the sink there would ship a verb to
+        // itself for offsets one probe away.
+        alloc.set_lane_harvest_sink(crate::data_alloc_lane::routed_harvest_sink(
+            alloc.volume_id(),
+            part,
+        ));
+    }
     let floor_kind = floor;
     let floor = match floor {
         LaneFloor::Local => {

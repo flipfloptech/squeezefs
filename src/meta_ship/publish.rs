@@ -80,7 +80,13 @@ use std::sync::Arc;
 /// speaks 2 cannot serve a shipped free, and a co-writer whose displaced
 /// frees silently vanished would leak every rewritten block until the
 /// authority's next recovery.
-pub const PUBLISH_SCHEMA: u32 = 3;
+///
+/// **4 since the lane free HARVEST landed** (`HarvestLaneFree` +
+/// [`PublishReply::LaneFreeGrant`] joined — rung 10, residual 2): a peer
+/// that speaks 3 cannot hand a co-writer its lane's freed supply back, and
+/// a co-writer whose harvests silently vanished would starve `StorageFull`
+/// on a store with free space.
+pub const PUBLISH_SCHEMA: u32 = 4;
 
 /// First verb of S9's publish block. S3's ping is 0, S8's metadata verbs
 /// are 16/17, S6's membership owns `0x0100..=0x01FF`, S9's custody
@@ -264,6 +270,44 @@ pub enum PublishCall {
         /// Client-chosen, monotone per process — the witness's other half.
         request_id: u64,
     },
+    /// **Harvest the caller's lane's freed supply** — rung 10's residual-2
+    /// seam, the reuse half of the co-writer FREE path.
+    ///
+    /// A shipped free re-enters "the free supply of lane `b % W`" — the
+    /// AUTHORITY's free list, whose own allocation funnel is lane-filtered.
+    /// Without this verb that supply is reachable by NOBODY: the co-writer's
+    /// allocator is frontier-monotone (the rung-9 named residual), so
+    /// sustained rewrite leaks toward ENOSPC on a store with free space.
+    ///
+    /// The owner hands back up to `max` free-listed block indices of the
+    /// CALLER's lane, **removing them from its own free list** (exactly-once
+    /// — nobody can receive an offset twice), draining its reclaim queue
+    /// first when the lane's supply is still queued, and recording every
+    /// handout against `lease_epoch` so an epoch that dies with the
+    /// reference not yet durable quarantines them (the §3.1 zombie window
+    /// closed for REUSED offsets the way the durable frontier closes it for
+    /// fresh mints; the record discharges on the offset's next shipped
+    /// free). Lane + lease are validated against the assignment THIS
+    /// authority made, exactly as `RaiseAllocLane`'s are.
+    ///
+    /// **Retried like `FreeBlocks` and only like it**: the owner keys the
+    /// same dedup-window pattern on `(lease_epoch, request_id)` — a resend
+    /// after a lost reply answers the winner's own grant, and a retry never
+    /// re-keys across a re-join.
+    HarvestLaneFree {
+        /// The durable data-volume identity (KD-5, as above).
+        vol_tag: u64,
+        lane: u16,
+        writers: u16,
+        /// Handout cap, blocks (the caller's reservation grain — derived,
+        /// never a knob).
+        max: u64,
+        /// The custody lease epoch the caller holds — the era gate's input,
+        /// half of the idempotence witness, and the handout ledger's key.
+        lease_epoch: u64,
+        /// Client-chosen, monotone per process — the witness's other half.
+        request_id: u64,
+    },
 }
 
 /// One block's outcome inside a served [`PublishCall::FreeBlocks`].
@@ -297,6 +341,7 @@ impl PublishCall {
             Self::ReaddirStream { .. } => "readdir_stream",
             Self::RaiseAllocLane { .. } => "raise_alloc_lane",
             Self::FreeBlocks { .. } => "free_blocks",
+            Self::HarvestLaneFree { .. } => "harvest_lane_free",
         }
     }
 
@@ -317,7 +362,11 @@ impl PublishCall {
             // routes to. The FREE verb keys on the same plane: block
             // ownership accounting is set-level state, and the node that
             // owns ino 1's volume is the D0 claim holder whose ladder runs.
-            Self::RaiseAllocLane { .. } | Self::FreeBlocks { .. } => vec![1],
+            Self::RaiseAllocLane { .. }
+            | Self::FreeBlocks { .. }
+            | Self::HarvestLaneFree { .. } => {
+                vec![1]
+            }
         }
     }
 }
@@ -339,6 +388,10 @@ pub enum PublishReply {
     LaneFrontier(u64),
     /// `free_blocks`: one verdict per shipped block, in request order.
     FreeVerdicts(Vec<FreeVerdict>),
+    /// `harvest_lane_free`: the handed-out block indices — free-listed
+    /// offsets of the CALLER's lane, removed from the authority's own
+    /// list (exactly-once) and recorded against the caller's lease epoch.
+    LaneFreeGrant(Vec<u64>),
 }
 
 /// A publish request frame.
@@ -406,6 +459,10 @@ static FREE_SERVED_BLOCKS: AtomicU64 = AtomicU64::new(0);
 static FREE_REPLAYS: AtomicU64 = AtomicU64::new(0);
 static FREE_STALE_REFUSALS: AtomicU64 = AtomicU64::new(0);
 static FREE_SHIP_FAILURES: AtomicU64 = AtomicU64::new(0);
+static HARVEST_SHIPPED_BLOCKS: AtomicU64 = AtomicU64::new(0);
+static HARVEST_SERVED_BLOCKS: AtomicU64 = AtomicU64::new(0);
+static HARVEST_REPLAYS: AtomicU64 = AtomicU64::new(0);
+static HARVEST_REFUSALS: AtomicU64 = AtomicU64::new(0);
 
 /// The publish path's shipped-vs-local ledger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -448,6 +505,22 @@ pub struct PublishStats {
     /// derivation (mount recovery / fsck C6) — the leak-safe direction,
     /// but **≈ 0** is the healthy reading.
     pub free_ship_failures: u64,
+    /// Block indices a co-writer received back through the lane free
+    /// HARVEST (client side) — the rung-10 reuse-engagement instrument: a
+    /// sustained-rewrite row whose displaced blocks exceed the lane share
+    /// must grow this, or the mount is burning frontier.
+    pub harvest_shipped_blocks: u64,
+    /// Block indices HANDED OUT by this authority (owner side) — each one
+    /// removed from its own free list and recorded against the caller's
+    /// lease epoch until discharged by the offset's next shipped free.
+    pub harvest_served_blocks: u64,
+    /// Harvest verbs answered from the dedup window (the lost-reply retry
+    /// landing here is the mechanism working).
+    pub harvest_replays: u64,
+    /// Harvest verbs refused — stale era, a lane the caller was not
+    /// assigned, or a width this era does not run. **Must stay 0** on a
+    /// healthy fleet; growth around a revocation is the gate composing.
+    pub harvest_refusals: u64,
 }
 
 /// Read the publish ledger.
@@ -464,6 +537,10 @@ pub fn stats() -> PublishStats {
         free_replays: FREE_REPLAYS.load(Ordering::Relaxed),
         free_stale_refusals: FREE_STALE_REFUSALS.load(Ordering::Relaxed),
         free_ship_failures: FREE_SHIP_FAILURES.load(Ordering::Relaxed),
+        harvest_shipped_blocks: HARVEST_SHIPPED_BLOCKS.load(Ordering::Relaxed),
+        harvest_served_blocks: HARVEST_SERVED_BLOCKS.load(Ordering::Relaxed),
+        harvest_replays: HARVEST_REPLAYS.load(Ordering::Relaxed),
+        harvest_refusals: HARVEST_REFUSALS.load(Ordering::Relaxed),
     }
 }
 
@@ -484,6 +561,10 @@ pub fn stats_json() -> serde_json::Value {
         "free_replays": s.free_replays,
         "free_stale_refusals": s.free_stale_refusals,
         "free_ship_failures": s.free_ship_failures,
+        "harvest_shipped_blocks": s.harvest_shipped_blocks,
+        "harvest_served_blocks": s.harvest_served_blocks,
+        "harvest_replays": s.harvest_replays,
+        "harvest_refusals": s.harvest_refusals,
     })
 }
 
@@ -998,6 +1079,84 @@ fn free_executor() -> Option<FreeExecutor> {
     FREE_EXECUTOR.load_full().map(|e| (*e).clone())
 }
 
+/// The owner-side lane-free HARVEST executor (rung 10, residual 2):
+/// `(vol_tag, lane, writers, max, lease_epoch)` → the handed-out block
+/// indices ([`crate::cowriter::execute_lane_harvest`] over the authority's
+/// data-plane router).
+///
+/// Installed by the multi-writer AUTHORITY arm beside the free executor —
+/// the two are halves of one rewrite economy: the free RETURNS a co-writer's
+/// displaced offset to the lane's supply, the harvest is what makes that
+/// supply REACHABLE again.
+pub type HarvestExecutor = Arc<
+    dyn Fn(u64, u16, u16, u64, u64) -> Pin<Box<dyn Future<Output = Result<Vec<u64>>> + Send>>
+        + Send
+        + Sync,
+>;
+
+static HARVEST_EXECUTOR: Lazy<arc_swap::ArcSwapOption<HarvestExecutor>> =
+    Lazy::new(arc_swap::ArcSwapOption::empty);
+
+/// Install the process's lane-harvest executor (the authority arm's act).
+pub fn install_harvest_executor(exec: HarvestExecutor) {
+    HARVEST_EXECUTOR.store(Some(Arc::new(exec)));
+}
+
+/// Uninstall it (disarm / unmount / test teardown).
+pub fn uninstall_harvest_executor() {
+    HARVEST_EXECUTOR.store(None);
+}
+
+fn harvest_executor() -> Option<HarvestExecutor> {
+    HARVEST_EXECUTOR.load_full().map(|e| (*e).clone())
+}
+
+/// **Ship one lane-free harvest** to the authority at `endpoint` and return
+/// the granted block indices.
+///
+/// The idempotence witness travels verbatim, exactly as
+/// [`ship_free_blocks`]'s does: `(lease_epoch, request_id)` is the owner's
+/// dedup key — a resend after a lost reply answers the winner's own grant,
+/// and a retry never re-keys across a re-join.
+pub async fn ship_harvest_lane_free(
+    endpoint: &str,
+    vol_tag: u64,
+    lane: u16,
+    writers: u16,
+    max: u64,
+    lease_epoch: u64,
+    request_id: u64,
+) -> Result<Vec<u64>> {
+    let Some(client) = CLIENT.load_full() else {
+        REFUSALS.fetch_add(1, Ordering::Relaxed);
+        let msg = format!(
+            "S9: a lane free harvest for vol_tag {vol_tag:#016x} cannot be published — no \
+             publish client is installed (arm the co-writer mount, which installs both halves)"
+        );
+        log::error!("{msg}");
+        return Err(SqueezefsError::InvalidOperation(msg));
+    };
+    let call = PublishCall::HarvestLaneFree {
+        vol_tag,
+        lane,
+        writers,
+        max,
+        lease_epoch,
+        request_id,
+    };
+    match client.ship(endpoint, call).await? {
+        PublishReply::LaneFreeGrant(idxs) => {
+            HARVEST_SHIPPED_BLOCKS.fetch_add(idxs.len() as u64, Ordering::Relaxed);
+            Ok(idxs)
+        }
+        other => Err(protocol_error(
+            "harvest_lane_free",
+            &format!("{other:?}"),
+            "a lane free grant",
+        )),
+    }
+}
+
 /// Count `blocks` abandoned shipped frees (`free_ship_failures` — the
 /// leak-safe direction, loud). The one caller is
 /// [`crate::cowriter::ship_displaced_frees`]'s abandon arm.
@@ -1117,6 +1276,10 @@ pub struct PublishService {
     /// third idempotence pattern). Only `free_blocks` consumes entries;
     /// every other publish call keeps the vocabulary's no-retry law.
     free_dedup: DedupWindow<std::result::Result<Vec<FreeVerdict>, WireError>>,
+    /// The HARVEST verb's exactly-once witness — the same pattern, its own
+    /// window (a grant and a verdict list are different outcomes; sharing
+    /// one window would make their id spaces collide).
+    harvest_dedup: DedupWindow<std::result::Result<Vec<u64>, WireError>>,
     self_ref: std::sync::OnceLock<std::sync::Weak<PublishService>>,
 }
 
@@ -1151,6 +1314,7 @@ impl PublishService {
             inner,
             authority,
             free_dedup: DedupWindow::new(crate::meta_ship::service::dedup_cap()),
+            harvest_dedup: DedupWindow::new(crate::meta_ship::service::dedup_cap()),
             self_ref: std::sync::OnceLock::new(),
         });
         let _ = me.self_ref.set(Arc::downgrade(&me));
@@ -1236,9 +1400,32 @@ impl PublishService {
                 return Self::refuse(req.id, PUBLISH_LANE_REFUSED, reason);
             }
         }
-        // The co-writer FREE path: the ONE retried verb, served through the
-        // era gate and then the dedup window — never through the generic
-        // dispatch below, whose no-retry law it would otherwise weaken.
+        // The lane free HARVEST (rung 10, residual 2): validated exactly as
+        // the raise is — the lane against the assignment THIS authority
+        // made, under the lease epoch it minted — then served through its
+        // own dedup window (it is retried, like the free and only like it).
+        if let PublishCall::HarvestLaneFree {
+            lane,
+            writers,
+            lease_epoch,
+            request_id,
+            ..
+        } = &frame.call
+        {
+            if let Err(reason) =
+                crate::data_grant::validate_lane_raise(&frame.client, *lease_epoch, *lane, *writers)
+            {
+                HARVEST_REFUSALS.fetch_add(1, Ordering::Relaxed);
+                return Self::refuse(req.id, PUBLISH_LANE_REFUSED, reason);
+            }
+            return self
+                .serve_harvest(req.id, *lease_epoch, *request_id, frame.call)
+                .await;
+        }
+        // The co-writer FREE path: retried (like the harvest above and only
+        // it), served through the era gate and then the dedup window —
+        // never through the generic dispatch below, whose no-retry law it
+        // would otherwise weaken.
         if let PublishCall::FreeBlocks {
             lease_epoch,
             request_id,
@@ -1389,6 +1576,92 @@ impl PublishService {
         }
     }
 
+    /// Serve one [`PublishCall::HarvestLaneFree`] through its dedup window
+    /// — the [`Self::serve_free`] pattern verbatim: the winner of
+    /// `(lease_epoch, request_id)` executes on the sqz-meta pool under the
+    /// installed [`HarvestExecutor`]; every duplicate awaits the winner's
+    /// own grant and is counted (`harvest_replays`). The lane + era gate
+    /// already ran in [`Self::serve`].
+    async fn serve_harvest(
+        &self,
+        req_id: u64,
+        lease_epoch: u64,
+        request_id: u64,
+        call: PublishCall,
+    ) -> RpcResponse {
+        let PublishCall::HarvestLaneFree {
+            vol_tag,
+            lane,
+            writers,
+            max,
+            ..
+        } = call
+        else {
+            return Self::refuse(
+                req_id,
+                PUBLISH_MALFORMED,
+                "serve_harvest dispatched a non-harvest call".into(),
+            );
+        };
+        let Some(exec) = harvest_executor() else {
+            return Self::refuse(
+                req_id,
+                PUBLISH_MALFORMED,
+                "S9: a lane free harvest arrived but no harvest executor is installed — the \
+                 ownership plane is armed without its reuse half. Handing out offsets without \
+                 the allocator that owns the free list would mint two owners for one block; \
+                 arm the multi-writer authority (which installs the executor beside the free \
+                 executor)"
+                    .to_string(),
+            );
+        };
+        let (slot, owns) = self.harvest_dedup.slot((lease_epoch, request_id));
+        if !owns {
+            HARVEST_REPLAYS.fetch_add(1, Ordering::Relaxed);
+        }
+        let outcome = slot
+            .get_or_init(|| async move {
+                // The venue rule, verbatim (see serve_free).
+                match crate::meta_exec::spawn_meta_join(
+                    "shipped_lane_harvest",
+                    exec(vol_tag, lane, writers, max, lease_epoch),
+                )
+                .await
+                {
+                    Ok(Ok(idxs)) => {
+                        HARVEST_SERVED_BLOCKS.fetch_add(idxs.len() as u64, Ordering::Relaxed);
+                        Ok(idxs)
+                    }
+                    Ok(Err(e)) => Err(WireError::from_error(&e)),
+                    Err(e) => {
+                        // RES-7/RES-8: recorded — and CACHED, so a replay
+                        // answers the same loud failure instead of handing
+                        // out half a grant twice.
+                        PANICS.fetch_add(1, Ordering::Relaxed);
+                        log::error!("S9 publish owner-side harvest execution unwound: {e}");
+                        Err(WireError::from_error(&SqueezefsError::InvalidOperation(
+                            format!("S9 lane-harvest execution panicked: {e}"),
+                        )))
+                    }
+                }
+            })
+            .await
+            .clone();
+        SERVED.fetch_add(1, Ordering::Relaxed);
+        let frame = PublishReplyFrame {
+            schema: PUBLISH_SCHEMA,
+            outcome: outcome.map(PublishReply::LaneFreeGrant),
+        };
+        match encode(&frame, "harvest_lane_free") {
+            Ok(body) => RpcResponse {
+                id: req_id,
+                status: PUBLISH_OK,
+                body,
+            },
+            Err(e) => Self::refuse(req_id, PUBLISH_MALFORMED, format!("reply encode: {e}")),
+        }
+    }
+
     async fn execute(&self, call: PublishCall) -> Result<PublishReply> {
         match call {
             PublishCall::SetLayoutAndSize {
@@ -1518,6 +1791,14 @@ impl PublishService {
                 Err(SqueezefsError::InvalidOperation(
                     "S9: free_blocks is served only through the dedup window (serve_free) — \
                      dispatching it here would bypass the exactly-once witness"
+                        .to_string(),
+                ))
+            }
+            PublishCall::HarvestLaneFree { .. } => {
+                // Same construction as the free above: only serve_harvest.
+                Err(SqueezefsError::InvalidOperation(
+                    "S9: harvest_lane_free is served only through the dedup window \
+                     (serve_harvest) — dispatching it here would bypass the exactly-once witness"
                         .to_string(),
                 ))
             }

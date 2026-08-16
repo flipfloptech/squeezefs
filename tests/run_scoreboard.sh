@@ -711,8 +711,11 @@ sqz_format() {
         truncate -s 1G "$SQZ_DIR/meta$i.img" || die "truncate meta$i"
         truncate -s "${DATA_VOL_GB}G" "$SQZ_DIR/data$i.img" || die "truncate data$i"
     done
-    # SQUEEZEFS_SB_FORMAT_ARGS: extra format args (e.g. "--multi-writer" for
-    # the stamped-solo posture — the MW §6.3 S4 residual gate). Word-splitting
+    # SQUEEZEFS_SB_FORMAT_ARGS: extra format args. The DEFAULT format is the
+    # stamped (multi-writer-capable) class since the rung-10b Phase-B flip,
+    # so the interesting NON-default posture is "--single-writer" (the
+    # unstamped class; "--multi-writer" stays accepted, announced-inert —
+    # the MW §6.3 S4 residual gate rode this lever pre-flip). Word-splitting
     # is intentional.
     # shellcheck disable=SC2086
     "$SQZ_BIN" format \

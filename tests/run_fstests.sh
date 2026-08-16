@@ -406,8 +406,11 @@ EOF
 #                         tier; ~5 h — run once, never between fixes)
 #
 # SQUEEZEFS_FSTESTS_FORMAT_ARGS: extra `squeezefs format` args baked into the
-# mkfs wrapper (e.g. "--multi-writer" for the stamped-solo posture — the MW
-# §6.3 S4 residual gate runs the QUICK set on a stamped format).
+# mkfs wrapper. Since the rung-10b Phase-B flip the DEFAULT format is the
+# stamped (multi-writer-capable) class, so the interesting NON-default
+# posture is "--single-writer" (the unstamped class); "--multi-writer"
+# stays accepted as an announced-inert spelling of the default. (The MW
+# §6.3 S4 residual gate ran the QUICK set stamped via this lever pre-flip.)
 #
 # SQUEEZEFS_FSTESTS_QUICK is the STANDING REGRESSION SET: every fstests case
 # that has ever caught a real SqueezeFS bug, plus core fsx/fsstress data-path

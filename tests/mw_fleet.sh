@@ -10,7 +10,9 @@
 # What `create N` builds (this rung's shape — see POSTURE below):
 #   * an isolated tcp devsub instance (SQZ_DEVSUB_INSTANCE, disjoint from the
 #     default devsub and from other agents' instances),
-#   * ONE volume set formatted `--multi-writer` (rung 5, KD-MW-1 Phase A),
+#   * ONE volume set formatted multi-writer-capable — the DEFAULT format
+#     class since the rung-10b Phase-B flip (KD-MW-1; `--single-writer` is
+#     the opt-out no fleet ever wants),
 #   * durable `fabric_endpoint:` records written via the PRODUCT verb
 #     `config set-fabric-endpoints` (rung 2, KD-MW-15),
 #   * member 0 = the WRITER, mounted with an EXPLICIT per-mount
@@ -123,15 +125,17 @@
 #   class — the mount takes a WERO (rtype 3) reservation on EVERY data
 #   namespace (data_plane_fence_mode=1) and REFUSES loud on a non-PR
 #   substrate or an unstamped format (this fleet's tcp devsub is nvmet
-#   resv_enable=1 and the set is formatted --multi-writer, so both rungs
-#   hold). The arm's rung 4 requires the membership plane, so
+#   resv_enable=1 and the DEFAULT format stamps the nine bits since the
+#   rung-10b flip, so both rungs hold). The arm's rung 4 requires the
+#   membership plane, so
 #   --multi-writer IMPLIES --membership (auto) when not given explicitly.
 #   Engagement is asserted per mount: data_plane_fence_mode=1 read from
 #   the stats inode + the WERO acquire line in the writer log. SCOPE
 #   (rung 8): the AUTHORITY arm only — the S7 rows fence the WRITER itself.
 #
 # CO-WRITER MEMBERS (rung 9 — the S8 rows; design-full-multi-writer §7.2):
-#   `create --multi-writer --cowriters=K` mounts K CO-LOCATED co-writer
+#   `create --cowriters=K` (which implies the --multi-writer ARM — the
+#   rig flag stays accepted as the explicit spelling) mounts K CO-LOCATED co-writer
 #   members on the index slice 50.. (COWRITER_BASE): the DLM S9 posture —
 #   metadata read-only locally with EVERY metadata verb SHIPPED to the
 #   authority (the REAL S8 shipping client), data DMA its own under a
@@ -759,7 +763,7 @@ mount_member() { # idx [--netns[=<delay_ms>]]
         # registrant key rides the default host association, distinct from
         # the writer's explicit member-0 identity. No 5b kernel needed.
         role="cowriter"
-        [ "${MW:-0}" = "1" ] || die "co-writer members need a --multi-writer fleet (create ... --multi-writer --cowriters=K)"
+        [ "${MW:-0}" = "1" ] || die "co-writer members need a multi-writer-ARMED fleet (create ... --cowriters=K arms it automatically)"
         [ -n "${MW_ENDPOINT:-}" ] || die "no MW_ENDPOINT recorded — the writer's 'MULTI-WRITER ARMED' line was not parsed (writer log: $STATE/m0.log)"
         env_args+=("SQUEEZEFS_MULTI_WRITER=1")
         env_args+=("SQUEEZEFS_MW_ROLE=co-writer")
@@ -1108,10 +1112,11 @@ create_fleet() {
         echo "${data_paths[*]}"
     )"
 
-    # --- format --multi-writer (rung 5) + the durable endpoint records
-    # (rung 2, product verb) --------------------------------------------------
-    log "format --multi-writer over sqmeta://$meta_uri sqdata://$data_uri"
-    sqz format --multi-writer "sqmeta://$meta_uri" "sqdata://$data_uri" --force \
+    # --- format (multi-writer-capable is the DEFAULT class since the
+    # rung-10b Phase-B flip — no flag needed) + the durable endpoint
+    # records (rung 2, product verb) ------------------------------------------
+    log "format (default = multi-writer-capable) over sqmeta://$meta_uri sqdata://$data_uri"
+    sqz format "sqmeta://$meta_uri" "sqdata://$data_uri" --force \
         >"$STATE/format.out" 2>&1 || die "format failed: $(tail -3 "$STATE/format.out")"
 
     # vol ids from the PRODUCT verb (never assumed): id -> backing map.

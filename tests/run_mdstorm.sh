@@ -7,7 +7,9 @@
 #   manydirs create+unlink 100k → rmdir 20k         (100% scale)
 # Rows report ops/s per phase. The MW §6.3 S4 residual runs it A-B-B-A:
 #   sudo tests/run_mdstorm.sh abba          # stamped→unstamped→unstamped→stamped
-#   sudo tests/run_mdstorm.sh leg [--format-args=--multi-writer] [--tag=X]
+#   sudo tests/run_mdstorm.sh leg [--format-args=--single-writer] [--tag=X]
+# (Since the rung-10b Phase-B flip the DEFAULT format is the stamped class;
+# the interesting non-default --format-args posture is --single-writer.)
 # Env: SQZ_MDSTORM_SCALE (pct, default 100), SQZ_MDSTORM_THREADS (default 8),
 #      SQZ_MDSTORM_DIR (substrate dir, default /dev/shm/sqz_mdstorm).
 # Quiet gate: refuses when 1-min load ≥ SQZ_MDSTORM_MAX_LOAD (default 2.0)
@@ -142,10 +144,13 @@ leg)
     ;;
 abba)
     # A-B-B-A: stamped → unstamped → unstamped → stamped (aging-order rule).
-    leg stamped_1 --multi-writer
-    leg unstamped_1
-    leg unstamped_2
-    leg stamped_2 --multi-writer
+    # Since the rung-10b Phase-B flip the DEFAULT format IS the stamped
+    # class, so the stamped legs run bare and the unstamped legs carry the
+    # explicit --single-writer opt-out.
+    leg stamped_1
+    leg unstamped_1 --single-writer
+    leg unstamped_2 --single-writer
+    leg stamped_2
     log "A-B-B-A complete — rows in $DIR/row_*.txt, stats snapshots beside them"
     ;;
 *) die "usage: run_mdstorm.sh [leg|abba] …" ;;

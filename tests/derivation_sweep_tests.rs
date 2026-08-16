@@ -1670,8 +1670,15 @@ fn the_unreclaimable_arm_divides_by_the_fleet_share_like_every_system_root() {
     );
     assert_eq!(
         unreclaimable,
+        5 * GIB / 32,
+        "the cgroup unreclaimable sample divides at the root, the \
+         fleet_shared_root law (5 GiB divides 32 evenly)"
+    );
+    // The rounding face: ceil, never floor (the fleet_shared_root law's
+    // own contract — a divided root never under-states).
+    assert_eq!(
+        tick_inputs(2 * GIB, GIB, 5 * GIB + 1, 32).2,
         5 * GIB / 32 + 1,
-        "the cgroup unreclaimable sample divides at the root (ceil), the \
-         fleet_shared_root law"
+        "a non-even sample rounds UP"
     );
 }

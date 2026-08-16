@@ -983,11 +983,18 @@ pub fn fleet_shared_root(value: u64, share: usize) -> u64 {
 /// The production tick's INPUT composition, pure (the tie-test form):
 /// the budget passes through (already fleet-shared at its SYSTEM roots by
 /// [`resolve_budget_from_shared`]), RSS is per-process by construction
-/// (`/proc/self/statm` is already this daemon's own bytes), and the
-/// cgroup unreclaimable arm rides through verbatim.
+/// (`/proc/self/statm` is already this daemon's own bytes — each daemon's
+/// own balloon stays policed undivided), and the cgroup UNRECLAIMABLE arm
+/// divides by the fleet share at the root: on a co-located fleet N
+/// daemons read ONE `memory.stat`, so the raw sample is the CAGE's
+/// collective residue — comparing it against a 1/N budget over-fires
+/// every daemon's Red/backstop ~N× on a healthy quiet fleet (§5.6 /
+/// KD-MW-14; the rung-7 S6-a N=32 row caught it live: all 32 daemons in
+/// Red with hard backstops at 0.5 GB of own ledger each). One divisor at
+/// the shared system root, downstream level machinery untouched; share 1
+/// is byte-identical to the raw probe.
 pub fn tick_inputs(budget: u64, rss: u64, raw_unreclaimable: u64, share: usize) -> (u64, u64, u64) {
-    let _ = share;
-    (budget, rss, raw_unreclaimable)
+    (budget, rss, fleet_shared_root(raw_unreclaimable, share))
 }
 
 /// SYSTEM root inputs (§5.6): the cgroup cage and the RAM total become

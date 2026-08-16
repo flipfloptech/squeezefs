@@ -37,8 +37,20 @@ pub fn set_fail_next_writes(n: usize) {
     FAIL_NEXT_WRITES.store(n, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Test seam (rung-8 finding #2): the injected write failure carries a
+/// specific ERRNO — the deterministic stand-in for a device completion of
+/// that class (the reservation-conflict EBADE is the S7 device fence's
+/// observable). `0` = the legacy classless injection.
+static FAIL_NEXT_WRITES_ERRNO: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+pub fn set_fail_next_writes_errno(n: usize, errno: i32) {
+    FAIL_NEXT_WRITES_ERRNO.store(errno, std::sync::atomic::Ordering::SeqCst);
+    FAIL_NEXT_WRITES.store(n, std::sync::atomic::Ordering::SeqCst);
+}
+
 pub fn clear_fail_next_writes() {
     FAIL_NEXT_WRITES.store(0, std::sync::atomic::Ordering::SeqCst);
+    FAIL_NEXT_WRITES_ERRNO.store(0, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Test seam: the worker stalls the next N read submissions by
@@ -1663,6 +1675,51 @@ impl NvmeBlockDev {
         crate::data_custody::authorize_dma(carried).map(|_| ())
     }
 
+    /// The ONE write-outcome funnel: every data-plane DMA outcome — real
+    /// completion, barrier, or injected — passes through here on its way
+    /// back to the caller (rung-8 finding #2, the S7-a device-fence row).
+    ///
+    /// A **reservation-conflict** completion (EBADE — the errno class the
+    /// block layer maps NVMe reservation rejection to) is not an I/O
+    /// error: it is the S7 device fence's own enforcement arm firing —
+    /// the device just proved this host's registration is gone (preempted
+    /// by a successor's drain proof, or usurped). The meta plane has had
+    /// exactly this law since D0 (`note_barrier_failure` →
+    /// `guard_fail_stop` on the same class); without it here a preempted
+    /// zombie retried its rejected DMA forever instead of fail-stopping.
+    /// So: latch the device fence, poison process custody, and propagate
+    /// the error UNCHANGED (callers' ladders still see the errno). Every
+    /// OTHER error class passes through untouched — a transient device
+    /// hiccup stays the retry-forever writeback ladder's business, never
+    /// a self-inflicted fail-stop
+    /// (`an_ordinary_write_error_never_latches_the_fence`).
+    fn classify_dma_outcome(&self, res: Result<()>) -> Result<()> {
+        if let Err(crate::error::SqueezefsError::Io(ioe)) = &res {
+            if crate::meta_backend::reservation::is_reservation_conflict(ioe) {
+                if !self
+                    .fence
+                    .halted
+                    .swap(true, std::sync::atomic::Ordering::AcqRel)
+                {
+                    log::error!(
+                        "data volume {}: DEVICE rejected a DMA with the reservation-conflict \
+                         errno class (EBADE/os error 52) — this host's registration under the \
+                         data-plane reservation is gone (preempted by a successor's drain \
+                         proof, or usurped): writer guard FENCED — refusing ALL further \
+                         data-plane DMA permanently (counted in data_dma_fence_refusals; \
+                         remount required — DLM S7)",
+                        self.device_path
+                    );
+                }
+                crate::data_custody::poison(&format!(
+                    "device reservation conflict on data volume {}",
+                    self.device_path
+                ));
+            }
+        }
+        res
+    }
+
     /// Mount-path constructor (DUR-2 decision (a)): probe `O_DIRECT`
     /// FIRST and refuse loudly if the substrate cannot serve it, then
     /// log the volatile-write-cache classification. The worker refuses
@@ -1755,12 +1812,15 @@ impl NvmeBlockDev {
                     0,
                     0,
                 );
-                rx.await.map_err(|e| {
+                let outcome: Result<()> = rx.await.map_err(|e| {
                     crate::error::SqueezefsError::InvalidOperation(format!(
                         "Worker thread closed receiver during data-device barrier: {:?}",
                         e
                     ))
-                })??;
+                })?;
+                // Rung-8 finding #2: a barrier is a write-class command —
+                // a reservation-conflict outcome is the device fence too.
+                self.classify_dma_outcome(outcome)?;
                 drop(_census);
                 crate::dev_power_cut::complete_barrier(&self.device_path, covered);
                 Ok(())
@@ -2015,9 +2075,15 @@ impl NvmeBlockDev {
                 )
                 .is_ok()
             {
-                return Err(crate::error::SqueezefsError::Io(std::io::Error::other(
-                    "injected write_block failure (FAIL_NEXT_WRITES)",
-                )));
+                let errno = FAIL_NEXT_WRITES_ERRNO.load(std::sync::atomic::Ordering::SeqCst);
+                let injected = if errno != 0 {
+                    std::io::Error::from_raw_os_error(errno)
+                } else {
+                    std::io::Error::other("injected write_block failure (FAIL_NEXT_WRITES)")
+                };
+                // Through the SAME outcome funnel a real completion takes,
+                // so an injected errno class exercises the classification.
+                return self.classify_dma_outcome(Err(crate::error::SqueezefsError::Io(injected)));
             }
         }
 
@@ -2180,12 +2246,16 @@ impl NvmeBlockDev {
             0,
             offset,
         );
-        rx_oneshot.await.map_err(|e| {
+        let outcome: Result<()> = rx_oneshot.await.map_err(|e| {
             crate::error::SqueezefsError::InvalidOperation(format!(
                 "Worker thread closed receiver: {:?}",
                 e
             ))
-        })??;
+        })?;
+        // Rung-8 finding #2: the completion rides the ONE outcome funnel —
+        // a reservation-conflict completion latches the fence (see
+        // `classify_dma_outcome`).
+        self.classify_dma_outcome(outcome)?;
         drop(_census);
 
         crate::fuse_client::METRICS

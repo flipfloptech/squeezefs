@@ -339,6 +339,100 @@ async fn fence_poison_is_process_wide_and_sticky() {
     );
 }
 
+/// Rung-8 finding #2 (the S7-a device-fence row's contract, 2026-08-16):
+/// the DEVICE saying "this host is fenced" — a **reservation-conflict
+/// completion** (EBADE, the errno class NVMe reservation rejection maps
+/// to, `blk_status_to_errno`) on a data-plane DMA — is the S7 fence's own
+/// enforcement arm firing, and the zombie must FAIL-STOP on observing it:
+/// latch the device fence, poison process custody, refuse every further
+/// submission (counted). The meta plane already has exactly this law
+/// (`note_barrier_failure` → `guard_fail_stop` on the same errno class);
+/// the data plane treated the completion as any other I/O error, so a
+/// preempted zombie retried its rejected DMA forever instead of dying.
+///
+/// The error itself must propagate UNCHANGED (callers' ladders still see
+/// the Io errno), and the EPOCH class must not move — nothing advanced
+/// this process's custody generation; the split is what tells an operator
+/// "the device fenced me" from "my custody moved".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reservation_conflict_completion_latches_the_fence_and_poisons_custody() {
+    let _serial = serial();
+    let _poison = PoisonGuard;
+    let (_f, dev) = backing(8 * 1024 * 1024);
+    let before = refusals();
+    let before_epoch = epoch_refusals();
+
+    squeezefs::nvme_dev::set_fail_next_writes_errno(1, libc::EBADE);
+    let err = dev
+        .write_block(0, bytes::Bytes::from(vec![7u8; 4096]))
+        .await
+        .expect_err("the injected reservation-conflict completion must fail the write");
+    match &err {
+        SqueezefsError::Io(ioe) => assert_eq!(
+            ioe.raw_os_error(),
+            Some(libc::EBADE),
+            "the errno class propagates unchanged to the caller's ladder"
+        ),
+        other => panic!("the conflict must stay an Io error, got {other:?}"),
+    }
+    squeezefs::nvme_dev::clear_fail_next_writes();
+
+    // The law under test: the device-observed fence is a fence.
+    assert!(
+        dev.fenced(),
+        "a reservation-conflict DMA completion must latch the device fence — the \
+         device just proved this host's registration is gone (rung-8 finding #2)"
+    );
+    assert!(
+        data_custody::poisoned(),
+        "the device-observed fence must poison process custody (a fenced holder is \
+         dead until remount)"
+    );
+
+    // Every further submission refuses loud and counts.
+    let err2 = dev
+        .write_block(4096, bytes::Bytes::from(vec![8u8; 4096]))
+        .await
+        .expect_err("a fenced holder submits nothing");
+    assert!(matches!(err2, SqueezefsError::WriterGuardFenced));
+    assert!(
+        refusals() >= before + 1,
+        "post-latch submissions count in data_dma_fence_refusals"
+    );
+    assert_eq!(
+        epoch_refusals(),
+        before_epoch,
+        "the epoch class must NOT move — no custody generation advanced; the split \
+         is the operator's classifier"
+    );
+}
+
+/// The classifier's negative arm: an ORDINARY write error (EIO-class,
+/// injected via the legacy seam) must NOT latch the fence or poison
+/// custody — transient I/O failure stays the retry-forever writeback
+/// ladder's business, and turning every device hiccup into a fail-stop
+/// would be a self-inflicted outage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ordinary_write_error_never_latches_the_fence() {
+    let _serial = serial();
+    let _poison = PoisonGuard;
+    let (_f, dev) = backing(8 * 1024 * 1024);
+    squeezefs::nvme_dev::set_fail_next_writes(1);
+    let _ = dev
+        .write_block(0, bytes::Bytes::from(vec![9u8; 4096]))
+        .await
+        .expect_err("the injected failure fails the write");
+    squeezefs::nvme_dev::clear_fail_next_writes();
+    assert!(!dev.fenced(), "an ordinary error is not a fence");
+    assert!(
+        !data_custody::poisoned(),
+        "an ordinary error must not poison custody"
+    );
+    dev.write_block(0, bytes::Bytes::from(vec![10u8; 4096]))
+        .await
+        .expect("the device keeps serving after a transient error");
+}
+
 // ---------------------------------------------------------------------------
 // 4 + 5: dead-epoch allocation quarantine
 // ---------------------------------------------------------------------------

@@ -1084,10 +1084,15 @@ leg_s6_vm_fence() {
     mkdir -p "$rowdir"
     g_nqn="$(guest_nqn 70)" g_id="$(guest_id 70)"
 
-    # The in-guest connect PLAN: reproduce the whole format-time instance
-    # numbering (fleet meta+data plus the reserved pair as fillers) so the
-    # reader's format-time data paths resolve to the right namespaces in a
-    # fresh guest kernel. Built host-side from the durable config.
+    # The in-guest connect PLAN: the reader resolves its DATA volumes by
+    # the FORMAT-TIME device paths (the identity-less-reader law), and the
+    # host's format-era instance numbers (real local NVMe occupies the low
+    # slots) cannot be reproduced by a fresh guest kernel's lowest-free
+    # numbering — so the guest connects each fleet NQN, VERIFIES the
+    # resolved head serves exactly that NQN (sysfs — the reader-safety
+    # check's guest face), and then ALIASES the format-time name to it
+    # (a devtmpfs symlink the daemon's open() follows; the verification
+    # is what makes the alias safe, and an occupied name refuses loud).
     local plan meta_basenames
     plan="$(python3 - <<PYPLAN
 import sys
@@ -1096,10 +1101,6 @@ data_paths = "$FORMAT_DATA_PATHS".split(",")
 meta_nqns = "$META_NQNS".split()
 data_nqns = "$DATA_NQNS".split()
 pairs = list(zip(meta_paths, meta_nqns)) + list(zip(data_paths, data_nqns))
-if "$GUEST_META_PATH":
-    pairs.append(("$GUEST_META_PATH", "$GUEST_META_NQN"))
-if "$GUEST_DATA_PATH":
-    pairs.append(("$GUEST_DATA_PATH", "$GUEST_DATA_NQN"))
 rows = []
 for path, nqn in pairs:
     base = path.rsplit("/", 1)[-1]
@@ -1107,9 +1108,6 @@ for path, nqn in pairs:
         sys.exit(f"unexpected head name {base}")
     rows.append((int(base[4:-2]), base, nqn))
 rows.sort()
-ks = [r[0] for r in rows]
-if ks != list(range(len(rows))):
-    sys.exit(f"format-time instance numbers {ks} are not contiguous from 0 — cannot reproduce in a fresh guest kernel")
 for k, base, nqn in rows:
     print(f"{k} {base} {nqn}")
 PYPLAN
@@ -1127,14 +1125,21 @@ print(",".join("/dev/" + p.rsplit("/", 1)[-1] for p in sys.argv[1].split(",")))'
 echo "\$PLAN" | while read -r k base nqn; do
     [ -n "\$nqn" ] || continue
     \$SQZ nvmeof connect --ip "\$GW" --port "\$SVC" --subnqn "\$nqn" --hostnqn '$g_nqn' --hostid '$g_id'
-    i=0
-    while [ \$i -lt 40 ]; do [ -b "/dev/\$base" ] && break; i=\$((i + 1)); sleep 0.5; done
-    [ -b "/dev/\$base" ] || { echo "FAIL: \$nqn did not land at /dev/\$base (numbering drift)"; exit 1; }
     head=""
-    for s in \$(subsys_dirs_for_nqn "\$nqn"); do head=\$(head_of_dir "\$s") && break; done
-    [ "\$head" = "\$base" ] || { echo "FAIL: \$nqn resolves head '\$head', want \$base"; exit 1; }
+    i=0
+    while [ \$i -lt 40 ]; do
+        for s in \$(subsys_dirs_for_nqn "\$nqn"); do head=\$(head_of_dir "\$s") && break; done
+        [ -n "\$head" ] && [ -b "/dev/\$head" ] && break
+        i=\$((i + 1)); sleep 0.5
+    done
+    [ -n "\$head" ] && [ -b "/dev/\$head" ] || { echo "FAIL: \$nqn resolved no openable head in-guest"; exit 1; }
+    if [ "\$head" != "\$base" ]; then
+        [ -e "/dev/\$base" ] && { echo "FAIL: format-time name /dev/\$base is already occupied in-guest — cannot alias safely"; exit 1; }
+        ln -s "/dev/\$head" "/dev/\$base"
+        echo "aliased /dev/\$base -> /dev/\$head (verified serving \$nqn)"
+    fi
 done || exit 1
-echo "connect plan reproduced (format-time numbering verified per-NQN)"
+echo "connect plan resolved (every format-time name verified against its NQN)"
 mkdir -p /mnt/member
 \$SQZ mount "sqmeta://$meta_basenames" /mnt/member --read-only --daemon --log-file /tmp/member.log >/tmp/member.mount.out 2>&1 || { cat /tmp/member.mount.out; cat /tmp/member.log 2>/dev/null; exit 1; }
 i=0
@@ -1143,34 +1148,43 @@ grep -q " /mnt/member " /proc/mounts || { echo "FAIL: member mount never appeare
 i=0
 mode=""
 while [ \$i -lt 60 ]; do
-    mode=\$(grep -o '"membership_mode": *"[a-z]*"' /mnt/member/.stats | grep -o '"[a-z]*"\$' | tr -d '"')
+    mode=\$(grep -o '"membership_mode": *"[a-z]*"' /mnt/member/.stats | grep -o '"[a-z]*"\$' | sed 's/"//g')
     [ "\$mode" = "member" ] && break
     i=\$((i + 1)); sleep 0.5
 done
 [ "\$mode" = "member" ] || { echo "FAIL: guest membership_mode='\$mode' (want member) — cannot dial the owner at $MEMBERSHIP_ENDPOINT?"; grep -i membership /tmp/member.log; exit 1; }
 fences=\$(grep -o '"membership_self_fences": *[0-9]*' /mnt/member/.stats | grep -o '[0-9]*\$')
 epoch=\$(grep -o '"membership_epoch": *[0-9]*' /mnt/member/.stats | grep -o '[0-9]*\$')
+guuid=\$(grep -o "membership MEMBER armed: reader '[0-9a-f-]*'" /tmp/member.log | tail -1 | grep -o "'[0-9a-f-]*'" | sed "s/'//g")
+[ -n "\$guuid" ] || { echo "FAIL: cannot read the guest member uuid from its log"; exit 1; }
 echo "GUEST_FENCES_BASE=\$fences"
 echo "GUEST_EPOCH_BASE=\$epoch"
+echo "GUEST_UUID=\$guuid"
 echo "GUEST MEMBER GREEN (RO mount joined the host fleet's membership plane)"
 JOBA
     } >"$rowdir/job-a.sh"
-    "$MWFLEET" vm-exec 0 "$rowdir/job-a.sh" 600 | tee "$rowdir/job-a.out" ||
-        die "guest member join FAILED (output: $rowdir/job-a.out)"
-    local g_fence0 g_epoch0
-    g_fence0="$(awk -F= '/^GUEST_FENCES_BASE=/ {print $2}' "$rowdir/job-a.out" | tr -d '
-')"
-    g_epoch0="$(awk -F= '/^GUEST_EPOCH_BASE=/ {print $2}' "$rowdir/job-a.out" | tr -d '
-')"
-    [ -n "$g_fence0" ] && [ -n "$g_epoch0" ] || die "guest job reported no baselines"
-
-    local ttl renew_est evict0 log0_evict log0_dead
+    # Settle the census FIRST (the S6-b lesson): stale prior incarnations
+    # (a rig re-run's dead guest member, a remounted reader's old lease)
+    # sweep on the owner's cadence and would false-match any COUNTER-based
+    # eviction wait — so the census must read exactly the live host
+    # members before the guest joins, and the eviction below is keyed on
+    # the guest's OWN member uuid.
+    local ttl renew_est n_host_members
     ttl="$(stat_field 0 membership_lease_ttl_ms)"
     renew_est="$(owner_renew_est_s)"
+    n_host_members="$(($(member_idxs | wc -l) - 1))"
+    wait_stat_eq 0 membership_members "$n_host_members" $(((ttl / 1000) + 3 * renew_est + 30)) "census settle (stale incarnations swept)"
+
+    "$MWFLEET" vm-exec 0 "$rowdir/job-a.sh" 600 | tee "$rowdir/job-a.out" ||
+        die "guest member join FAILED (output: $rowdir/job-a.out)"
+    local g_fence0 g_epoch0 g_uuid
+    g_fence0="$(awk -F= '/^GUEST_FENCES_BASE=/ {print $2}' "$rowdir/job-a.out" | tr -d '\r')"
+    g_epoch0="$(awk -F= '/^GUEST_EPOCH_BASE=/ {print $2}' "$rowdir/job-a.out" | tr -d '\r')"
+    g_uuid="$(awk -F= '/^GUEST_UUID=/ {print $2}' "$rowdir/job-a.out" | tr -d '\r')"
+    [ -n "$g_fence0" ] && [ -n "$g_epoch0" ] && [ -n "$g_uuid" ] ||
+        die "guest job reported no baselines"
+
     snap 0 0 "$rowdir"
-    evict0="$(stat_field 0 membership_evictions)"
-    log0_evict="$(grep -c "EVICTED by owner" "$STATE/m0.log" || true)"
-    log0_dead="$(grep -c "declared DEAD" "$STATE/m0.log" || true)"
     # The owner census must carry the guest (member-reader, mount point
     # /mnt/member) — the S5 gap closed cross-KERNEL for the first time.
     "$SQZ" clients "sqmeta://$META_PATHS" >"$rowdir/clients-joined.out" 2>&1 ||
@@ -1182,13 +1196,12 @@ $(cat "$rowdir/clients-joined.out")"
     # ---- the hung kernel: qemu pause past the owner's TTL ----
     "$MWFLEET" pause 0
     log "guest 0 PAUSED (vcpus + guest clock frozen — the monotonic domain cannot observe T_self)"
-    local evictions
-    evictions="$(wait_stat_ge 0 membership_evictions $((evict0 + 1)) $(((ttl / 1000) + 3 * renew_est + 60)) "owner eviction of the paused guest")"
-    [ "$(grep -c "EVICTED by owner" "$STATE/m0.log")" -gt "$log0_evict" ] ||
-        die "owner log carries no new 'EVICTED by owner' line"
-    [ "$(grep -c "declared DEAD" "$STATE/m0.log")" -gt "$log0_dead" ] ||
-        die "owner log carries no new dead-epoch line — the eviction did not mint the S7 dead epoch"
-    log "owner evicted the paused guest + minted the S7 dead epoch (membership_evictions $evict0 -> $evictions)"
+    wait_log_line "$STATE/m0.log" "member '$g_uuid' (reader) EVICTED" $(((ttl / 1000) + 3 * renew_est + 60)) "owner eviction of the paused guest"
+    grep -F "member '$g_uuid' (reader) EVICTED" "$STATE/m0.log" | grep -q "quarantined" ||
+        die "the guest's eviction line does not name the dead-epoch quarantine"
+    grep -q "declared DEAD (membership: member '$g_uuid'" "$STATE/m0.log" ||
+        die "no dead-epoch mint for the guest's eviction — the S6->S7 handoff did not engage"
+    log "owner evicted the paused guest '$g_uuid' + minted its S7 dead epoch (while the guest kernel was frozen)"
 
     "$MWFLEET" resume 0
     log "guest 0 resumed — it must observe itself dead and self-fence BEFORE holding any fresh lease"
@@ -1214,7 +1227,7 @@ i=0
 mode=""
 epoch=""
 while [ \$i -lt 60 ]; do
-    mode=\$(grep -o '"membership_mode": *"[a-z]*"' /mnt/member/.stats | grep -o '"[a-z]*"\$' | tr -d '"')
+    mode=\$(grep -o '"membership_mode": *"[a-z]*"' /mnt/member/.stats | grep -o '"[a-z]*"\$' | sed 's/"//g')
     epoch=\$(grep -o '"membership_epoch": *[0-9]*' /mnt/member/.stats | grep -o '[0-9]*\$')
     [ "\$mode" = "member" ] && [ -n "\$epoch" ] && [ "\$epoch" != "$g_epoch0" ] && break
     i=\$((i + 1)); sleep 1

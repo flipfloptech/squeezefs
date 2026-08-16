@@ -774,6 +774,39 @@ wait_stat_ge() { # idx key want deadline_s what
     done
 }
 
+# Poll one flattened stats field on member <idx> until it EQUALS <want>.
+wait_stat_eq() { # idx key want deadline_s what
+    local idx="$1" key="$2" want="$3" deadline="$4" what="$5" v t0 now
+    t0="$(date +%s)"
+    while :; do
+        v="$(stat_field "$idx" "$key")"
+        [ "$v" = "$want" ] && return 0
+        now="$(date +%s)"
+        [ $((now - t0)) -lt "$deadline" ] ||
+            die "$what: m$idx $key=$v never reached $want within ${deadline}s"
+        sleep 1
+    done
+}
+
+# Wait for a literal line (grep -F) to appear in a log file.
+wait_log_line() { # file pattern deadline_s what
+    local file="$1" pat="$2" deadline="$3" what="$4" t0 now
+    t0="$(date +%s)"
+    while :; do
+        grep -Fq "$pat" "$file" && return 0
+        now="$(date +%s)"
+        [ $((now - t0)) -lt "$deadline" ] ||
+            die "$what: '$pat' never appeared in $file within ${deadline}s"
+        sleep 1
+    done
+}
+
+# The member uuid a mount's LATEST membership join minted (from its log).
+member_uuid_of() { # idx
+    grep -o "membership MEMBER armed: [a-z-]* '[0-9a-f-]*'" "$STATE/m${1}.log" |
+        tail -1 | grep -o "'[0-9a-f-]*'" | tr -d "'"
+}
+
 # The owner's renewal cadence estimate, seconds: min(10, T_self/3) — the
 # same derivation LeaseClocks ships, read back from the published gauges.
 owner_renew_est_s() {
@@ -861,12 +894,23 @@ refusals = d("membership_grace_refusals")
 members = n - 1
 expected_beats = members * window // max(renew_est, 1)
 per_beat = jrnl / renewals if renewals else float("inf")
+# The OWNER's own cadence residue is N-INDEPENDENT (its client:/
+# writer_claim heartbeats, echo drains, checkpoints — measured ~3 tx per
+# 10 s beat on this tree; the allowance carries 2x headroom). The S6
+# regression the gate exists to catch is journal growth COUPLED to the
+# member beats (the pre-S6 plane paid exactly 1.0 tx per beat), so the
+# bound is: owner allowance + half a tx per beat — N-independent on a
+# healthy plane, violated the moment beats start committing.
+owner_allowance = (window // 10 + 1) * 6
+bound = owner_allowance + renewals // 2
 
 print(f"== s6-journal arithmetic (the spec §6.5 item-3 gate) ==")
 print(f"  members (beating)          : {members}")
 print(f"  window                     : {window}s, renew cadence ~{renew_est}s")
 print(f"  membership_renewals delta  : {renewals} (expected ~{expected_beats})")
-print(f"  meta_kv_journal_entries d  : {jrnl}  <- the OWNER's own residue, N-independent")
+print(f"  meta_kv_journal_entries d  : {jrnl}  <- must stay ~= the OWNER's own N-independent residue")
+print(f"  owner-cadence allowance    : {owner_allowance} (6 tx / 10 s writer cadence, 2x-headroom)")
+print(f"  regression bound           : jrnl < allowance + renewals/2 = {bound}")
 print(f"  journal txs PER BEAT       : {per_beat:.4f} (the pre-S6 plane paid 1.0 per beat)")
 print(f"  pre-S6 equivalent cost     : ~{renewals} journal txs this window would have paid")
 print(f"  registration_commits delta : {reg} (bounded by membership CHANGES; 0 here)")
@@ -876,8 +920,10 @@ print(f"  self_fences/evictions/grace: {fences}/{evict}/{refusals}")
 bad = []
 if renewals < expected_beats // 2:
     bad.append(f"renewals {renewals} < half the expected {expected_beats} — the beat plane is not engaged")
-if per_beat >= 0.25:
-    bad.append(f"journal txs per beat {per_beat:.3f} >= 0.25 — journal growth is coupling to the heartbeat (the S6 regression)")
+if jrnl >= bound:
+    bad.append(f"journal delta {jrnl} >= bound {bound} — journal growth is coupling to the heartbeat (the S6 regression)")
+if members >= 8 and per_beat >= 0.25:
+    bad.append(f"journal txs per beat {per_beat:.3f} >= 0.25 at N={members} beating members — beat-coupled growth (the sharp at-scale face; at small N the owner residue legitimately dominates this ratio)")
 if reg != 0:
     bad.append(f"registration_commits moved ({reg}) with zero membership changes")
 if census < probes:
@@ -918,15 +964,25 @@ leg_s6_fence() {
     "$MWFLEET" mount "$victim" "--netns=$S6_NETEM_MS"
     [ "$(stat_field "$victim" membership_mode)" = "member" ] ||
         die "victim did not re-join through the shaped netns wire"
-    log "victim m$victim re-joined through the netem-shaped netns wire (delayed renewals still inside the deadlines — the shaping is duress, not partition)"
+    local vuuid
+    vuuid="$(member_uuid_of "$victim")"
+    [ -n "$vuuid" ] || die "cannot read the victim's member uuid from its log"
+    log "victim m$victim re-joined through the netem-shaped netns wire as '$vuuid' (delayed renewals still inside the deadlines — the shaping is duress, not partition)"
 
+    # Settle the census FIRST: the unmount->remount dance above leaves the
+    # victim's PRIOR incarnations as stale census entries (a clean unmount
+    # exits before its renewal loop's next wake can send the leave), and
+    # their TTL sweeps would false-match any counter-based eviction wait —
+    # so the eviction below is keyed on the victim's OWN member uuid, and
+    # p0 is taken only once the census carries exactly the live members.
+    local n_members evict_deadline
+    n_members="$(member_idxs | wc -l)"
+    evict_deadline=$(((ttl / 1000) + 3 * renew_est + 30))
+    wait_stat_eq 0 membership_members "$((n_members - 1))" "$evict_deadline" "census settle (stale incarnations swept)"
     local i
     for i in $(member_idxs); do snap "$i" 0 "$rowdir"; done
-    local evict0 fence0 log0_evict log0_dead
-    evict0="$(stat_field 0 membership_evictions)"
+    local fence0
     fence0="$(stat_field "$victim" membership_self_fences)"
-    log0_evict="$(grep -c "EVICTED by owner" "$STATE/m0.log" || true)"
-    log0_dead="$(grep -c "declared DEAD" "$STATE/m0.log" || true)"
 
     # Freeze the victim past T_self AND past the owner's TTL. SIGSTOP
     # leaves its monotonic clock RUNNING (unlike the VM pause), so on
@@ -936,16 +992,15 @@ leg_s6_fence() {
     # owner acting only at ITS deadline.
     "$MWFLEET" kill "$victim" --sig STOP
     log "victim m$victim SIGSTOPped (frozen daemon, running clock)"
-    local evict_deadline
-    evict_deadline=$(((ttl / 1000) + 3 * renew_est + 30))
-    local evictions
-    evictions="$(wait_stat_ge 0 membership_evictions $((evict0 + 1)) "$evict_deadline" "owner eviction")"
-    log "owner evicted the frozen victim (membership_evictions $evict0 -> $evictions)"
-    # The S7 half: the eviction MINTS the dead epoch (S6 -> S7 vocabulary).
-    [ "$(grep -c "EVICTED by owner" "$STATE/m0.log")" -gt "$log0_evict" ] ||
-        die "owner log carries no new 'EVICTED by owner' line"
-    [ "$(grep -c "declared DEAD" "$STATE/m0.log")" -gt "$log0_dead" ] ||
-        die "owner log carries no new dead-epoch line — the eviction did not mint the S7 dead epoch"
+    # The owner must evict THIS incarnation (uuid-keyed — see above) and
+    # the eviction line itself names the S6->S7 handoff: the dead lease
+    # epoch and the do-not-reallocate quarantine.
+    wait_log_line "$STATE/m0.log" "member '$vuuid' (reader) EVICTED" "$evict_deadline" "owner eviction of the frozen victim"
+    grep -F "member '$vuuid' (reader) EVICTED" "$STATE/m0.log" | grep -q "quarantined" ||
+        die "the victim's eviction line does not name the dead-epoch quarantine"
+    grep -q "declared DEAD (membership: member '$vuuid'" "$STATE/m0.log" ||
+        die "no dead-epoch mint for the victim's eviction — the S6->S7 handoff did not engage"
+    log "owner evicted the frozen victim '$vuuid' + minted its S7 dead epoch (while the victim was still frozen)"
 
     "$MWFLEET" kill "$victim" --sig CONT
     log "victim m$victim resumed (SIGCONT) — it must now self-fence on its own clock"

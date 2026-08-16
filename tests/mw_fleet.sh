@@ -681,7 +681,10 @@ mount_member() { # idx [--netns[=<delay_ms>]]
         local launch=(env "${env_args[@]}" "$SQZ")
         if [ "$netns" = "1" ]; then
             netns_setup "$idx"
-            launch=(ip netns exec "$(ns_name "$idx")" env "${env_args[@]}" "$SQZ")
+            # nsenter --net, NEVER `ip netns exec`: the latter unshares a
+            # MOUNT namespace too (to bind /etc/netns + remount /sys), so
+            # the FUSE mount would land invisible to the root mount ns.
+            launch=(nsenter "--net=/run/netns/$(ns_name "$idx")" env "${env_args[@]}" "$SQZ")
         fi
         # DLM S5 reader: no identity, no claim, no registrant (POSTURE).
         "${launch[@]}" mount "sqmeta://$META_PATHS" "$mnt" \

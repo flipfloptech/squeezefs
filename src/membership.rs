@@ -1857,6 +1857,11 @@ pub struct MembershipArm {
     volumes: Vec<Arc<KvMetaBackend>>,
     /// The OWNER's identity — the claim-set entry to withdraw at disarm.
     owner_id: Option<String>,
+    /// A MEMBER's clean-goodbye input: `(owner endpoint, secret, member
+    /// id)` — the disarm dials the leave itself (bounded, best-effort),
+    /// because the renewal loop's next wake never arrives on the umount
+    /// path and a stranded entry waits out a full owner TTL otherwise.
+    member_leave: Option<(String, Vec<u8>, String)>,
     stop: Arc<AtomicBool>,
     mode: &'static str,
 }
@@ -1881,6 +1886,31 @@ impl MembershipArm {
     /// as un-served, and uninstall.
     pub async fn disarm(mut self) {
         self.stop.store(true, Ordering::Release);
+        if let Some((endpoint, secret, id)) = self.member_leave.take() {
+            // The clean goodbye, delivered NOW (the leave() contract: no
+            // TTL wait for a mount that said goodbye). Bounded and
+            // best-effort — an unreachable owner's TTL sweep is the
+            // backstop, and the renewal loop's own leave (if its wake
+            // ever fires first) is a harmless no-op double.
+            match squeezefs_ipc::sqz_time::timeout(
+                Duration::from_secs(2),
+                crate::membership_wire::leave_once(&endpoint, &secret, &id),
+            )
+            .await
+            {
+                Ok(Ok(_)) => log::info!(
+                    "membership: member '{id}' left the census cleanly at disarm (no TTL wait)"
+                ),
+                Ok(Err(e)) => log::warn!(
+                    "membership: clean leave of '{id}' failed ({e}) — the owner's TTL sweep \
+                     is the backstop"
+                ),
+                Err(_) => log::warn!(
+                    "membership: clean leave of '{id}' timed out — the owner's TTL sweep is \
+                     the backstop"
+                ),
+            }
+        }
         let owner = self.plane.is_some();
         if owner {
             // Spec §6.8 item 3: with no plane the bound is `u64::MAX`, so
@@ -2157,6 +2187,7 @@ async fn arm_owner(
         plane: Some(plane),
         volumes,
         owner_id: Some(id),
+        member_leave: None,
         stop,
         mode: "owner",
     }))
@@ -2267,6 +2298,7 @@ async fn join_member_on(
     let session = Arc::clone(client.session());
     install_member(Arc::clone(&session));
     let stop = Arc::new(AtomicBool::new(false));
+    let member_leave = Some((rec.endpoint.clone(), secret.clone(), id.clone()));
     spawn_member_renewal(
         client,
         rec.endpoint.clone(),
@@ -2287,9 +2319,11 @@ async fn join_member_on(
     Ok(Some(MembershipArm {
         plane: None,
         // A member owns no durable record, so it has nothing to clear at
-        // disarm — and must never remove the OWNER's.
+        // disarm — and must never remove the OWNER's. Its clean goodbye
+        // is the wire leave the disarm delivers.
         volumes: Vec::new(),
         owner_id: None,
+        member_leave,
         stop,
         mode: "member",
     }))

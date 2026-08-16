@@ -441,6 +441,31 @@ impl MembershipPlane {
 // The dial side (member)
 // ---------------------------------------------------------------------------
 
+/// One-shot clean leave — the member DISARM path's synchronous goodbye.
+///
+/// `MembershipOwner::leave`'s contract is "no TTL wait for a mount that
+/// said goodbye", and the renewal loop's own leave only fires at its next
+/// wake — which a normal umount never reaches. The disarm therefore dials
+/// the leave itself, bounded and best-effort (the owner's TTL sweep is
+/// the backstop when the wire is already gone). A second leave for the
+/// same id is a no-op at the owner.
+pub async fn leave_once(endpoint: &str, secret: &[u8], id: &str) -> Result<bool> {
+    let mut rpc = RpcClient::connect(endpoint, secret, id, None).await?;
+    let reply = rpc
+        .call(
+            VERB_MEMBERSHIP_LEAVE,
+            encode(&LeaveFrame { id: id.to_string() })?,
+        )
+        .await?;
+    if reply.status != RPC_OK {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "membership leave got status {:#x} from the owner",
+            reply.status
+        )));
+    }
+    Ok(reply.body.first().copied() == Some(1))
+}
+
 /// A member's authenticated session with the owner, plus the member's own
 /// (stricter) lease view.
 pub struct MemberClient {

@@ -61,6 +61,15 @@ pub enum SqueezefsError {
     )]
     IndirectMapFormat { detail: String },
 
+    /// DLM S6: the membership lease this member presented is **not
+    /// custody** (evicted, swept past the owner's TTL, or granted by a
+    /// previous owner) — the wire's `RPC_MEMBERSHIP_UNKNOWN_LEASE` class,
+    /// carried structurally because the member's renewal ladder keys on it:
+    /// the correct response is self-fence (purge) then re-join fresh,
+    /// never a retry (`membership::member_renewal_tick`).
+    #[error("membership lease is not custody: {0}")]
+    MembershipLeaseNotCustody(String),
+
     #[error("GPU Direct Storage error: {0}")]
     GdsError(String),
 
@@ -137,6 +146,9 @@ impl SqueezefsError {
             SqueezefsError::Refused { errno, .. } => *errno,
             SqueezefsError::WriterGuardFenced => libc::EIO,
             SqueezefsError::IndirectMapFormat { .. } => libc::EIO,
+            // A fail-stopped lease reaching a data path is the same class
+            // as a fenced writer guard: the I/O must not proceed.
+            SqueezefsError::MembershipLeaseNotCustody(_) => libc::EIO,
             SqueezefsError::GdsError(_) => libc::EIO,
             SqueezefsError::CacheOverflow => libc::ENOMEM,
             SqueezefsError::Timeout => libc::ETIMEDOUT,

@@ -61,6 +61,9 @@ fn pinned_errno(e: &SqueezefsError) -> libc::c_int {
         // successor mount owns the accounting.
         SqueezefsError::WriterGuardFenced => libc::EIO,
         SqueezefsError::IndirectMapFormat { .. } => libc::EIO,
+        // DLM S6: a fail-stopped lease reaching a data path is the same
+        // class as a fenced writer guard — the I/O must not proceed.
+        SqueezefsError::MembershipLeaseNotCustody(_) => libc::EIO,
         SqueezefsError::GdsError(_) => libc::EIO,
         SqueezefsError::CacheOverflow => libc::ENOMEM,
         SqueezefsError::Timeout => libc::ETIMEDOUT,

@@ -205,6 +205,11 @@ impl RpcService for MembershipService {
                         reason,
                         retry_after_ms,
                     } => Self::refuse(req.id, RPC_MEMBERSHIP_REFUSED, reason, retry_after_ms),
+                    // A dead reclaim: the member must self-fence, then
+                    // re-join fresh — its own status, never a retry.
+                    JoinOutcome::UnknownLease { reason } => {
+                        Self::refuse(req.id, RPC_MEMBERSHIP_UNKNOWN_LEASE, reason, 0)
+                    }
                 },
                 Err(e) => Self::refuse(req.id, RPC_MEMBERSHIP_BAD_REQUEST, e.to_string(), 0),
             },
@@ -494,8 +499,11 @@ impl MemberClient {
             RPC_OK => decode::<Grant>(&reply.body),
             RPC_MEMBERSHIP_UNKNOWN_LEASE => {
                 let r: RefusedFrame = decode(&reply.body)?;
-                Err(SqueezefsError::InvalidOperation(format!(
-                    "membership {what} refused — the presented lease is not custody: {}",
+                // Structural, not prose: the member's renewal ladder keys
+                // on this class — self-fence then re-join, never a retry
+                // (`membership::member_renewal_tick`).
+                Err(SqueezefsError::MembershipLeaseNotCustody(format!(
+                    "membership {what} refused: {}",
                     r.reason
                 )))
             }

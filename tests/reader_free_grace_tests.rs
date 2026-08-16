@@ -170,6 +170,7 @@ fn join(owner: &MembershipOwner, id: &str, role: MemberRole) -> Grant {
     }) {
         JoinOutcome::Granted(g) => g,
         JoinOutcome::Refused { reason, .. } => panic!("join refused: {reason}"),
+        JoinOutcome::UnknownLease { reason } => panic!("join answered UnknownLease: {reason}"),
     }
 }
 

@@ -247,7 +247,7 @@ pub async fn run(cfg: SimConfig) -> Result<SimReport> {
                 let anchor = clock.now_ms();
                 let grant = match owner.join(join_request(&id, role, endpoint)) {
                     JoinOutcome::Granted(g) => g,
-                    JoinOutcome::Refused { reason, .. } => {
+                    JoinOutcome::Refused { reason, .. } | JoinOutcome::UnknownLease { reason } => {
                         return Err(SqueezefsError::InvalidOperation(format!(
                             "membership harness: join of '{id}' refused: {reason}"
                         )))
@@ -380,7 +380,7 @@ pub async fn run(cfg: SimConfig) -> Result<SimReport> {
             req.prior_epoch = owner.epoch_of(id).or(Some(1));
             match successor.join(req) {
                 JoinOutcome::Granted(_) => {}
-                JoinOutcome::Refused { reason, .. } => {
+                JoinOutcome::Refused { reason, .. } | JoinOutcome::UnknownLease { reason } => {
                     return Err(SqueezefsError::InvalidOperation(format!(
                         "membership harness: reclaim of '{id}' refused inside the grace \
                          window: {reason}"

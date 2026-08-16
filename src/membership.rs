@@ -853,6 +853,19 @@ pub enum JoinOutcome {
         /// When to try again, ms.
         retry_after_ms: u64,
     },
+    /// A RECLAIM presenting an epoch this owner does not hold (evicted,
+    /// swept, or a predecessor's), outside any grace window: the prior
+    /// lease is **not custody**, and granting a silent fresh lease here
+    /// would let a frozen-then-thawed member resume serving from its
+    /// stale caches as a live member (the S6-b′ falsifier — a paused
+    /// guest kernel's monotonic clock never observes `T_self`, so the
+    /// member-side deadline cannot fire). The member's correct response
+    /// is **self-fence (purge) then re-join fresh** — the same contract
+    /// `RenewOutcome::UnknownLease` already states for the renewal verb.
+    UnknownLease {
+        /// Operator-facing reason.
+        reason: String,
+    },
 }
 
 /// The outcome of a renewal.
@@ -1073,6 +1086,38 @@ impl MembershipOwner {
                 ),
                 retry_after_ms: retry,
             };
+        }
+        // A reclaim's CONTINUITY is verifiable: either this owner still
+        // holds the member at exactly the presented epoch (the transient-
+        // wire-blip shape — mirror of `renew`'s epoch law), or a failover
+        // grace window is open and re-assertion IS the recovery protocol
+        // (§6.7 — the predecessor's RAM died with it, so the successor
+        // accepts the member's own evidence). Anything else means the
+        // prior lease is NOT custody (evicted, swept, or a dead owner's
+        // grant past its grace), and the member must fence before it may
+        // hold anything fresh — never be handed a silent new lease over
+        // its stale caches (the S6-b′ frozen-clock finding, 2026-08-16).
+        if let Some(prior) = req.prior_epoch {
+            let live_here = self
+                .members
+                .read_sync(&req.id, |_, st| st.epoch == prior)
+                .unwrap_or(false);
+            if !live_here && !self.grace_active() {
+                // The same refusal class the renewal verb counts: the
+                // presented lease is not custody, whichever verb carried it.
+                METRICS
+                    .membership_renew_refusals
+                    .fetch_add(1, Ordering::Relaxed);
+                let reason = format!(
+                    "member '{}' reclaimed lease epoch {prior}, which owner '{}' does not \
+                     hold (evicted, swept past its TTL, or granted by a previous owner) and \
+                     no grace window is open: the prior lease is not custody — self-fence \
+                     (purge) first, then re-join fresh",
+                    req.id, self.id
+                );
+                log::warn!("membership: {reason}");
+                return JoinOutcome::UnknownLease { reason };
+            }
         }
         // OQ-5's resolved form (design-full-multi-writer §5.1 / §17): an
         // observed mount-slot collision WITHIN ONE CLAIM SET refuses the
@@ -1932,13 +1977,26 @@ pub async fn arm_mount_membership(
 /// advertises — the address every member (host readers, netns'd members,
 /// qemu guests) will DIAL, composed from the owner's bind posture and the
 /// port the plane actually bound.
+///
+/// An EXPLICIT bind on a specific address advertises **that address**: the
+/// operator said where the plane is served, and advertising the
+/// primary-interface derivation instead names a place where nothing
+/// listens — every member of that fleet then stays silently invisible
+/// (rung-7 finding, pinned by
+/// `an_explicit_membership_bind_advertises_the_bound_address`). The
+/// unspecified address (`auto` = `0.0.0.0:0`) keeps the primary-interface
+/// derivation: the listener answers on every interface, and `0.0.0.0` is
+/// not dialable.
 pub fn owner_advertise_endpoint(bind_addr: std::net::SocketAddr, bound_port: u16) -> String {
-    let _ = bind_addr;
-    format!(
-        "{}:{}",
-        crate::cluster_wire::local_advertise_ip(),
-        bound_port
-    )
+    if bind_addr.ip().is_unspecified() {
+        format!(
+            "{}:{}",
+            crate::cluster_wire::local_advertise_ip(),
+            bound_port
+        )
+    } else {
+        format!("{}:{}", bind_addr.ip(), bound_port)
+    }
 }
 
 async fn arm_owner(
@@ -2274,16 +2332,28 @@ pub async fn member_renewal_tick(
     on_purge: Option<&Arc<dyn Fn() + Send + Sync>>,
 ) -> RenewalTick {
     let session = Arc::clone(client.session());
-    if let Err(e) = client.renew().await {
-        if session.self_fence_due() {
-            let fence = session.self_fence(&format!("renewal failed: {e}"));
-            if fence.purge_requested {
-                if let Some(purge) = on_purge {
-                    purge();
-                }
+    let Err(e) = client.renew().await else {
+        return RenewalTick::Renewed;
+    };
+    if session.self_fence_due() {
+        let fence = session.self_fence(&format!("renewal failed: {e}"));
+        if fence.purge_requested {
+            if let Some(purge) = on_purge {
+                purge();
             }
-            return RenewalTick::Fenced;
         }
+        return RenewalTick::Fenced;
+    }
+    // The failure classifies (the S6-b′ frozen-clock finding, 2026-08-16):
+    // an UNKNOWN LEASE means the lease is not custody — fence FIRST. Any
+    // other failure is presumed transient, and the member re-asserts as a
+    // RECLAIM (which is what a successor's grace window admits) — but a
+    // reclaim answered UnknownLease lands in the same fence ladder.
+    let mut not_custody = match &e {
+        SqueezefsError::MembershipLeaseNotCustody(reason) => Some(reason.clone()),
+        _ => None,
+    };
+    if not_custody.is_none() {
         log::warn!(
             "membership: renewal failed ({e}) — re-asserting as a reclaim before my \
              own deadline (T_self)"
@@ -2298,13 +2368,62 @@ pub async fn member_renewal_tick(
                 *client = fresh;
                 return RenewalTick::Rejoined;
             }
+            Err(SqueezefsError::MembershipLeaseNotCustody(reason)) => not_custody = Some(reason),
             Err(e) => {
                 log::warn!("membership: reclaim refused ({e}); retrying");
                 return RenewalTick::RejoinRefused;
             }
         }
     }
-    RenewalTick::Renewed
+    // The lease is NOT custody (evicted / swept / a dead owner's grant
+    // past its grace): self-fence BEFORE holding anything fresh — a
+    // frozen-then-thawed member must never resume as a live member on its
+    // stale caches. The wire states this contract on
+    // RPC_MEMBERSHIP_UNKNOWN_LEASE verbatim: "the member's correct
+    // response is self-fence then re-join, not retry."
+    let reason = not_custody.expect("set on both arms above");
+    let fence = session.self_fence(&reason);
+    if fence.purge_requested {
+        match on_purge {
+            Some(purge) => purge(),
+            None => {
+                // A reader with no purge hook cannot PROVE its view clean,
+                // so it must not re-present itself fresh (the arm paths
+                // always wire the S5 purge pass; this is the defensive
+                // law for any future caller that forgets it).
+                log::error!(
+                    "membership: lease not custody and no purge hook is wired — staying \
+                     fenced rather than re-joining over an unpurged cache"
+                );
+                return RenewalTick::Fenced;
+            }
+        }
+    } else {
+        // A WRITER's self-fence poisons process data custody (S7): it can
+        // never be made clean by a purge, so it never re-presents fresh.
+        return RenewalTick::Fenced;
+    }
+    let mut fresh_req = req.clone();
+    fresh_req.prior_epoch = None;
+    match crate::membership_wire::MemberClient::join(endpoint, secret, fresh_req, clock.clone())
+        .await
+    {
+        Ok(fresh) => {
+            log::warn!(
+                "membership: member '{}' re-joined FRESH after its self-fence — clean view, \
+                 new epoch {} (a dead lease is never resurrected)",
+                fresh.session().id(),
+                fresh.session().epoch()
+            );
+            install_member(Arc::clone(fresh.session()));
+            *client = fresh;
+            RenewalTick::FencedAndRejoined
+        }
+        Err(e) => {
+            log::warn!("membership: post-fence fresh join refused ({e}); retrying");
+            RenewalTick::RejoinRefused
+        }
+    }
 }
 
 /// The member's renewal cadence shell: sleep to the renewal due instant,

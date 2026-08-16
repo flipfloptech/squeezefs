@@ -197,6 +197,7 @@ fn granted(out: JoinOutcome) -> membership::Grant {
             reason,
             retry_after_ms,
         } => panic!("join refused ({reason}, retry after {retry_after_ms} ms)"),
+        JoinOutcome::UnknownLease { reason } => panic!("join answered UnknownLease ({reason})"),
     }
 }
 
@@ -949,6 +950,9 @@ fn owner_failover_opens_a_grace_window_admitting_only_reclaim() {
             assert!(retry_after_ms > 0);
         }
         JoinOutcome::Granted(_) => panic!("a fresh acquire must not be granted during grace"),
+        JoinOutcome::UnknownLease { reason } => {
+            panic!("a FRESH acquire is the grace REFUSAL class, never UnknownLease: {reason}")
+        }
     }
     assert_eq!(
         METRICS.membership_grace_refusals.load(Ordering::Relaxed),
@@ -1400,6 +1404,9 @@ fn a_mount_slot_collision_within_one_claim_set_refuses_loud() {
         JoinOutcome::Granted(_) => {
             panic!("two mount points must never share one client identity")
         }
+        JoinOutcome::UnknownLease { reason } => {
+            panic!("a slot collision is the REFUSAL class, never UnknownLease: {reason}")
+        }
     }
 
     // The census still carries the LIVE member — with its mount point
@@ -1460,6 +1467,19 @@ fn an_evicted_reclaim_is_not_granted_as_a_silent_fresh_lease() {
         "a dead reclaim must not be granted as a silent fresh lease — the member must \
          learn its prior lease is not custody (got {out:?})"
     );
+    match out {
+        JoinOutcome::UnknownLease { reason } => {
+            assert!(
+                reason.contains("self-fence"),
+                "the refusal states the member's correct response: {reason}"
+            );
+        }
+        other => panic!("a dead reclaim answers the UnknownLease class, got {other:?}"),
+    }
+
+    // A FRESH join by the same identity stays admissible (the post-fence
+    // re-join): the class is about the dead EPOCH, not the member.
+    let _fresh = granted(owner.join(join_req("thawed", MemberRole::Reader, None)));
 }
 
 /// The MEMBER half, driving the REAL renewal tick: a member with a FROZEN

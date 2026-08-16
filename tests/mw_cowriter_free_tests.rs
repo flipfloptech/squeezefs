@@ -1066,6 +1066,7 @@ async fn shipped_frees_enter_the_grace_ring_when_the_reader_plane_is_armed() {
     }) {
         JoinOutcome::Granted(g) => g,
         JoinOutcome::Refused { reason, .. } => panic!("join refused: {reason}"),
+        JoinOutcome::UnknownLease { reason } => panic!("join answered UnknownLease: {reason}"),
     };
     m_owner.refresh_free_grace_bound();
     assert!(free_grace::armed());
@@ -1264,6 +1265,7 @@ async fn two_co_writers_rewrite_disjoint_files_while_a_reader_acks() {
     }) {
         JoinOutcome::Granted(g) => g,
         JoinOutcome::Refused { reason, .. } => panic!("join refused: {reason}"),
+        JoinOutcome::UnknownLease { reason } => panic!("join answered UnknownLease: {reason}"),
     };
     m_owner.refresh_free_grace_bound();
 

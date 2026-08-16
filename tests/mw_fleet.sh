@@ -717,10 +717,16 @@ mount_member() { # idx [--netns[=<delay_ms>]]
                 env_args+=("SQUEEZEFS_MEMBERSHIP_LEASE_TTL_MS=$MEMBERSHIP_LEASE_TTL_MS")
         fi
         # Rung 8: the S7/S9 AUTHORITY arm — the device-enforced guarantee
-        # class (WERO rtype 3 on every data namespace; SQUEEZEFS_MW_BIND
-        # stays unset = auto, ruling D2). Engagement asserted below.
+        # class (WERO rtype 3 on every data namespace). Rung 9: the bind is
+        # a STABLE rig port (SQZ_MWFLEET_MW_PORT, default 45999), because
+        # the S8-b era split needs a SUCCESSOR authority the old era's
+        # frames can still reach — `auto` mints a fresh ephemeral port per
+        # incarnation, so old-era clients would dial a dead endpoint
+        # forever and the stale-term/era-relearn split could never engage.
+        # (Field topology is the same: operators bind a known port.)
         if [ "${MW:-0}" = "1" ]; then
             env_args+=("SQUEEZEFS_MULTI_WRITER=1")
+            env_args+=("SQUEEZEFS_MW_BIND=0.0.0.0:${SQZ_MWFLEET_MW_PORT:-45999}")
         fi
         # Rung 9: the operator-declared co-writer roster (enrollment is the
         # AUTHORITY's durable act — ops.md §Multi-writer co-writer mounts).

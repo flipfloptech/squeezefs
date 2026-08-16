@@ -2081,6 +2081,14 @@ s8b_storm() { # mnt tag secs faillog — the mdstorm-shaped mixed-verb loop
     echo "$i" >"$faillog.cycles"
 }
 
+# stat_field on a FENCED co-writer mount (dead-until-remount) answers
+# EINVAL/empty — the crucible reads through this defaulting form.
+sfield0() { # idx key -> value or 0
+    local v
+    v="$(stat_field "$1" "$2" 2>/dev/null || true)"
+    echo "${v:-0}"
+}
+
 leg_s8_crucible() {
     # Design row S8-b — the shipped-verb crucible: mdstorm-shaped mixed
     # verbs (create/chmod/utimes/rename/unlink — inline-sized, the
@@ -2128,7 +2136,7 @@ leg_s8_crucible() {
     rsum() {
         local acc=0 i
         for i in "${cws[@]}"; do
-            acc=$((acc + $(stat_field "$i" meta_ship.retries)))
+            acc=$((acc + $(sfield0 "$i" meta_ship.retries)))
         done
         echo "$acc"
     }
@@ -2154,12 +2162,29 @@ leg_s8_crucible() {
             warn "phase A: co-writer m$idx storm recorded $(grep -c . "$rowdir/fail-a-m$idx") failure line(s) during injection (recorded, phase C is the hard gate)"
         fi
     done
+    # The S7 COMPOSITION face (observed live): a kill storm that also
+    # starves a co-writer's custody RENEWAL past its TTL makes the
+    # authority sweep the lease, and the co-writer SELF-FENCES — poisoned,
+    # dead-until-remount (the pull-based revocation law working, never a
+    # bug). Record every fenced member and REMOUNT it (the rung-9
+    # re-admission posture) before the next event.
+    local fenced=0
+    for idx in "${cws[@]}"; do
+        if ! cat "$(mnt_of "$idx")/.stats" >/dev/null 2>&1 ||
+            [ "$(sfield0 "$idx" mount_posture)" != "co-writer" ]; then
+            fenced=$((fenced + 1))
+            log "E1: co-writer m$idx SELF-FENCED under the injection (custody renewal starved past TTL — the S7 law engaging); remounting"
+            "$MWFLEET" unmount "$idx" || true
+            "$MWFLEET" mount "$idx" || die "E1: fenced co-writer m$idx could not re-admit"
+        fi
+    done
+    echo "E1 retries=$((retries1 - retries0)) dedup_hits=$((dedup1 - dedup0)) self_fenced_remounted=$fenced" >>"$rowdir/events.txt"
 
     # ---- E2: authority restart mid-stream (the era split) ---------------
     local stale0 stale1 relearn0 relearn1 t_kill t_up
     relearn0=0
     for idx in "${cws[@]}"; do
-        relearn0=$((relearn0 + $(stat_field "$idx" meta_ship.era_relearns)))
+        relearn0=$((relearn0 + $(sfield0 "$idx" meta_ship.era_relearns)))
     done
     local -a pids2=()
     for idx in "${cws[@]}"; do
@@ -2196,7 +2221,7 @@ leg_s8_crucible() {
         stale1="$(stat_field 0 meta_ship.stale_term_refusals)"
         relearn1=0
         for idx in "${cws[@]}"; do
-            relearn1=$((relearn1 + $(stat_field "$idx" meta_ship.era_relearns)))
+            relearn1=$((relearn1 + $(sfield0 "$idx" meta_ship.era_relearns)))
         done
         [ "$stale1" -gt 0 ] && [ "$relearn1" -gt "$relearn0" ] && break
         sleep 1
@@ -2284,8 +2309,8 @@ $(head -5 "$rowdir/fail-c-m$idx")"
     ship_now=0
     pub_ship=0
     for idx in "${cws[@]}"; do
-        ship_now=$((ship_now + $(stat_field "$idx" meta_ship.shipped_verbs)))
-        pub_ship=$((pub_ship + $(stat_field "$idx" meta_ship_publish.shipped)))
+        ship_now=$((ship_now + $(sfield0 "$idx" meta_ship.shipped_verbs)))
+        pub_ship=$((pub_ship + $(sfield0 "$idx" meta_ship_publish.shipped)))
     done
     served_now="$(stat_field 0 meta_ship.served_verbs)"
     pub_served="$(stat_field 0 meta_ship_publish.served)"

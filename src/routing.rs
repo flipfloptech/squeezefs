@@ -5184,6 +5184,21 @@ impl Drop for InflightBlockReadGuard {
 /// Outcome of a single-block key resolve against a RAM metadata entry
 /// ([`block_key_in`] — the PERF-12 allocation-free face of
 /// `load_striped_block_keys`).
+/// Outcome of one serialized resolve+fetch pass
+/// ([`DataRouter::settled_resolve_fetch_locked`] — callers hold
+/// `BLOCK_FLUSH_LOCKS` (3) + `INODE_META_LOCKS` (3.5)).
+pub(crate) enum SettledFetchOutcome {
+    /// The block is a hole in the CURRENT map (no layout / pruned /
+    /// unmapped): zeros, linearized inside the caller's locked window.
+    Hole,
+    /// The current binding's bytes, incarnation-validated under both locks.
+    Fetched(crate::cache::pool::ReadBlockValue),
+    /// The incarnation moved under both locks — a mutator outside the
+    /// stripe/merge disciplines (`read_settle_lost_serialized` tripwire
+    /// fired); the caller re-acquires and retries, bounded and loud.
+    Lost,
+}
+
 enum BlockKeyResolve<'m> {
     /// The block's current key: borrowed from the live inline map (the
     /// striped default — zero allocation), or freshly formatted on the
@@ -8988,7 +9003,9 @@ impl DataRouter {
     /// device-fetch RTT and the reader provably wins. Cold by
     /// construction (engages only after `SETTLE_HANDOFF` ladder losses —
     /// zero cost on the hot path), counted in
-    /// `stale_binding_escalations`.
+    /// `stale_binding_escalations`. The generic/795 window-class
+    /// escalation (`SqueezefsFilesystem::read_window_settled`) rides the
+    /// same interior — see [`Self::settled_resolve_fetch_locked`].
     ///
     /// Serve proof: the binding is resolved UNDER both locks (the merge
     /// primitive's own base-read pattern — `fetch_metadata` would retake
@@ -9028,74 +9045,10 @@ impl DataRouter {
             )
             .await;
             let _map_guard = meta_lock_acquire(ino).await;
-            // Fresh resolve under both locks. NOTE: `fetch_metadata`
-            // would retake (3.5) on refill — use its refill's own
-            // sources directly (the `grow_layout_size` pattern): any
-            // cached entry is ≥ every completed merge (republished under
-            // the lock we hold); a miss reads the backend serialized ≥
-            // merges, exactly like the refill.
-            let meta = match self.metadata_cache.get(&ino) {
-                Some(m) => Some(m),
-                None => self.fetch_metadata_from_backend(ino).await?,
-            };
-            let Some(meta) = meta else {
-                // No layout at all — the block is a hole in the current
-                // (empty) map: zeros, linearized inside this window.
-                return Ok(None);
-            };
-            if meta.block_map.is_none()
-                && meta.block_map_id.is_none()
-                && meta.block_prefix.is_none()
-            {
-                // No striped layout (concurrent truncate/delete/layout
-                // flip landed before our window): every striped binding
-                // is gone — zeros.
-                return Ok(None);
-            }
-            let cur_key = match block_key_in(&meta, b) {
-                BlockKeyResolve::Key(k) => k.into_owned(),
-                BlockKeyResolve::Hole => return Ok(None),
-                BlockKeyResolve::NeedsAuthority => {
-                    match self
-                        .load_striped_block_keys(file_path, &meta, b, b)
-                        .await?
-                        .pop()
-                        .and_then(|(_, k)| k)
-                    {
-                        Some(k) => k,
-                        None => return Ok(None),
-                    }
-                }
-            };
-            // Test seam (same contract as the ladder's): with both locks
-            // held this window changes NOTHING — that immunity is exactly
-            // what the starvation repro proves.
-            let recheck_delay = TEST_BINDING_RECHECK_DELAY_MS.load(Ordering::Relaxed);
-            if recheck_delay > 0 {
-                squeezefs_ipc::sqz_time::sleep(Duration::from_millis(recheck_delay)).await;
-            }
-            match self.fetch_block_device_true(&cur_key).await {
-                Ok((val, true)) => return Ok(Some(val)),
-                Ok((_, false)) => {
-                    // The key's incarnation word moved while both custody
-                    // domains were held — a mutator outside the
-                    // stripe/merge disciplines (RES-22: loud, never
-                    // fatal; the retry re-resolves from scratch).
-                    crate::note_invariant_tripwire(
-                        "read_settle_lost_serialized",
-                        &format!(
-                            "block {b} of {file_path}: incarnation moved under \
-                             BLOCK_FLUSH_LOCKS + INODE_META_LOCKS (attempt {attempt})"
-                        ),
-                    );
-                }
-                Err(e) => {
-                    // The binding is CURRENT by construction (resolved and
-                    // held under both locks): a fetch/decode failure here
-                    // is a real device/corruption error on real current
-                    // state — the honest EIO that remains.
-                    return Err(e);
-                }
+            match self.settled_resolve_fetch_locked(file_path, b).await? {
+                SettledFetchOutcome::Hole => return Ok(None),
+                SettledFetchOutcome::Fetched(val) => return Ok(Some(val)),
+                SettledFetchOutcome::Lost => continue,
             }
         }
         Err(SqueezefsError::Io(std::io::Error::other(format!(
@@ -9103,6 +9056,90 @@ impl DataRouter {
              settle attempts (binding/incarnation mutator outside the stripe/merge \
              disciplines — see invariant_tripwires)"
         ))))
+    }
+
+    /// The serialized settle arm's INTERIOR (rebind-starvation 2026-08-04,
+    /// factored 2026-08-15 for the generic/795 window-class escalation —
+    /// two callers, ONE copy of the resolve+fetch+incarnation discipline):
+    /// callers HOLD this block's `BLOCK_FLUSH_LOCKS` (3) and the ino's
+    /// `INODE_META_LOCKS` (3.5) — the write path's own extended order, so
+    /// no legal mutator can move the binding or its incarnation across
+    /// this window. `Lost` = the incarnation moved anyway (a mutator
+    /// outside the stripe/merge disciplines — the invariant tripwire has
+    /// fired; the caller re-acquires and retries, bounded and loud).
+    pub(crate) async fn settled_resolve_fetch_locked(
+        &self,
+        file_path: &str,
+        b: u32,
+    ) -> Result<SettledFetchOutcome> {
+        let ino = parse_inode_from_path(file_path);
+        // Fresh resolve under both locks. NOTE: `fetch_metadata`
+        // would retake (3.5) on refill — use its refill's own
+        // sources directly (the `grow_layout_size` pattern): any
+        // cached entry is ≥ every completed merge (republished under
+        // the lock we hold); a miss reads the backend serialized ≥
+        // merges, exactly like the refill.
+        let meta = match self.metadata_cache.get(&ino) {
+            Some(m) => Some(m),
+            None => self.fetch_metadata_from_backend(ino).await?,
+        };
+        let Some(meta) = meta else {
+            // No layout at all — the block is a hole in the current
+            // (empty) map: zeros, linearized inside this window.
+            return Ok(SettledFetchOutcome::Hole);
+        };
+        if meta.block_map.is_none() && meta.block_map_id.is_none() && meta.block_prefix.is_none() {
+            // No striped layout (concurrent truncate/delete/layout
+            // flip landed before our window): every striped binding
+            // is gone — zeros.
+            return Ok(SettledFetchOutcome::Hole);
+        }
+        let cur_key = match block_key_in(&meta, b) {
+            BlockKeyResolve::Key(k) => k.into_owned(),
+            BlockKeyResolve::Hole => return Ok(SettledFetchOutcome::Hole),
+            BlockKeyResolve::NeedsAuthority => {
+                match self
+                    .load_striped_block_keys(file_path, &meta, b, b)
+                    .await?
+                    .pop()
+                    .and_then(|(_, k)| k)
+                {
+                    Some(k) => k,
+                    None => return Ok(SettledFetchOutcome::Hole),
+                }
+            }
+        };
+        // Test seam (same contract as the ladder's): with both locks
+        // held this window changes NOTHING — that immunity is exactly
+        // what the starvation repro proves.
+        let recheck_delay = TEST_BINDING_RECHECK_DELAY_MS.load(Ordering::Relaxed);
+        if recheck_delay > 0 {
+            squeezefs_ipc::sqz_time::sleep(Duration::from_millis(recheck_delay)).await;
+        }
+        match self.fetch_block_device_true(&cur_key).await {
+            Ok((val, true)) => Ok(SettledFetchOutcome::Fetched(val)),
+            Ok((_, false)) => {
+                // The key's incarnation word moved while both custody
+                // domains were held — a mutator outside the
+                // stripe/merge disciplines (RES-22: loud, never
+                // fatal; the caller re-resolves from scratch).
+                crate::note_invariant_tripwire(
+                    "read_settle_lost_serialized",
+                    &format!(
+                        "block {b} of {file_path}: incarnation moved under \
+                         BLOCK_FLUSH_LOCKS + INODE_META_LOCKS"
+                    ),
+                );
+                Ok(SettledFetchOutcome::Lost)
+            }
+            Err(e) => {
+                // The binding is CURRENT by construction (resolved and
+                // held under both locks): a fetch/decode failure here
+                // is a real device/corruption error on real current
+                // state — the honest EIO that remains.
+                Err(e)
+            }
+        }
     }
 
     /// §5.6 dispatch rule (fetch granularity policy): sub-block ranged

@@ -17001,6 +17001,145 @@ impl SqueezefsFilesystem {
         out
     }
 
+    /// The generic/795 WINDOW-CLASS ESCALATION (2026-08-15 round 3 — the
+    /// architectural close): a read window whose post-read validation
+    /// failed is re-served block-by-block under the WRITE PATH'S OWN
+    /// extended lock order — the block's `BLOCK_FLUSH_LOCKS` (3), then
+    /// the ino's `INODE_META_LOCKS` (3.5) — the serialized settle arm's
+    /// law (rebind-starvation 2026-08-04, `stale_binding_escalations`):
+    /// under those locks no overlay can install, store, settle, feed or
+    /// publish for the block, no RAM-overlay mutation and no
+    /// staged-sibling transfer can run, so the per-block serve is correct
+    /// BY LOCK ORDER, not by probe completeness (three rounds of
+    /// probe-completeness defenses each closed a reproduced window and
+    /// left another for a different scheduler — the point-probe era's
+    /// verdict). Engagement gauge: `overlay_window_escalations`.
+    ///
+    /// Per block, ascending, ONE guard at a time (two window blocks can
+    /// share a stripe — holding both would self-deadlock):
+    ///  1. settle any device-overlay record inline (the entry drain's own
+    ///     verb, guard held — its acked bytes publish to the map; the
+    ///     close-owed hint is acted on after every guard drops, the
+    ///     `drain_device_overlay_block` venue law);
+    ///  2. fetch the durable base through the serialized arm's interior
+    ///     (`settled_resolve_fetch_locked`; (3.5) held across the fetch —
+    ///     the settled arm's own shipped posture);
+    ///  3. compose staged sibling (whole-image authority when present,
+    ///     zeros beyond its acked extent — the router's sibling-serve
+    ///     law) else the base, then the RAM overlay's coverage runs on
+    ///     top — the one-authority order, all stations immobile under
+    ///     the held guard.
+    /// A torn multi-block view ACROSS blocks is the racing-read POSIX
+    /// allowance; per BYTE nothing acked can be missed — the law this
+    /// arm makes unconditional.
+    async fn read_window_settled(
+        &self,
+        ino: u64,
+        file_path: &str,
+        offset: u64,
+        read_len: usize,
+    ) -> Result<bytes::Bytes, SqueezefsError> {
+        let block_size = self.router.block_size.load(Ordering::Relaxed);
+        let end = offset + read_len as u64;
+        let start_block = (offset / block_size) as u32;
+        let end_block = ((end - 1) / block_size) as u32;
+        let mut out = vec![0u8; read_len];
+        let mut close_owed = false;
+        for b in start_block..=end_block {
+            let b_start = b as u64 * block_size;
+            let lo = offset.max(b_start);
+            let hi = end.min(b_start + block_size);
+            let out_lo = (lo - offset) as usize;
+            let rel_lo = (lo - b_start) as usize;
+            let rel_hi = (hi - b_start) as usize;
+            let (block_guard, _w) =
+                block_lock_acquire_timed(ino, b, BlockLockSite::ReadSettle).await;
+            // 1. Settle any record: its acked bytes publish to the map,
+            // and the held guard excludes a re-install for the rest of
+            // this block's serve.
+            if self.device_overlays.get(ino, b).is_some() {
+                close_owed |= self.settle_overlay_block_locked(ino, b, false).await?;
+                METRICS.overlay_read_drains.fetch_add(1, Ordering::Relaxed);
+            }
+            // 2. Durable base under (3.5) — bounded Lost retries, the
+            // settled arm's own posture (a Lost already fired the
+            // `read_settle_lost_serialized` tripwire).
+            let mut base: Option<crate::cache::pool::ReadBlockValue> = None;
+            let mut settled = false;
+            for attempt in 0..4u32 {
+                if attempt > 0 {
+                    squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(
+                        1u64 << (attempt - 1).min(3),
+                    ))
+                    .await;
+                }
+                let _map_guard = crate::routing::meta_lock_acquire(ino).await;
+                match self
+                    .router
+                    .settled_resolve_fetch_locked(file_path, b)
+                    .await?
+                {
+                    crate::routing::SettledFetchOutcome::Hole => {
+                        settled = true;
+                        break;
+                    }
+                    crate::routing::SettledFetchOutcome::Fetched(v) => {
+                        base = Some(v);
+                        settled = true;
+                        break;
+                    }
+                    crate::routing::SettledFetchOutcome::Lost => continue,
+                }
+            }
+            if !settled {
+                return Err(SqueezefsError::Io(std::io::Error::other(format!(
+                    "block {b} of inode {ino} did not settle under the escalated \
+                     window serve (see invariant_tripwires)"
+                ))));
+            }
+            // 3. Compose. Staged sibling = the block's whole-image
+            // authority when present (zero-completed to its acked extent
+            // at put — bytes beyond read zeros, the router's own
+            // sibling-serve law); else the durable base (hole = zeros).
+            let cache_key = crate::keys::active_block(ino, b as u64).to_string();
+            if let Some(img) = self.router.cache.nvme.read_staged(&cache_key) {
+                let s = rel_lo.min(img.len());
+                let e = rel_hi.min(img.len());
+                if s < e {
+                    out[out_lo..out_lo + (e - s)].copy_from_slice(&img[s..e]);
+                }
+            } else if let Some(base) = &base {
+                let s = rel_lo.min(base.len());
+                let e = rel_hi.min(base.len());
+                if s < e {
+                    out[out_lo..out_lo + (e - s)].copy_from_slice(&base[s..e]);
+                }
+            }
+            // RAM overlay coverage runs — the newest custody (runs come
+            // back clamped to the asked range).
+            for (abs, d) in self.capture_parked_runs(ino, lo, (hi - lo) as usize) {
+                let run_lo = (abs - offset) as usize;
+                out[run_lo..run_lo + d.len()].copy_from_slice(&d);
+            }
+            drop(block_guard);
+        }
+        if close_owed {
+            // The drain venue's close tail, after every guard dropped
+            // (§5.4 venue law — the close takes (3.5) and frees, never
+            // under a block guard).
+            if crate::device_overlay::overlay_close_barrier() {
+                if let Err(e) = self.router.backend_router.flush_data_devices().await {
+                    warn!("OQ-5 pre-close data barrier for ino {ino} failed: {e:?}");
+                }
+            }
+            let token = self.dlm.get_fencing_token_ino(ino);
+            if let Err(e) = self.router.close_rewrite_epoch(ino, token).await {
+                warn!("escalated-serve epoch close for ino {ino} failed: {e:?}");
+            }
+        }
+        Ok(bytes::Bytes::from(out))
+    }
+
     /// Overlay absolute-offset byte runs onto `data` (read reply base at
     /// `offset`). Allocates only when a run actually intersects the range.
     fn apply_parked_runs(offset: u64, data: bytes::Bytes, runs: &[(u64, Vec<u8>)]) -> bytes::Bytes {
@@ -20431,22 +20570,24 @@ impl Filesystem for SqueezefsFilesystem {
         //  3. the binding fingerprint below detects a block-map publish
         //     that landed mid-read — the one transfer the two captures
         //     cannot see (sibling/overlay → durable binding) — and re-runs
-        //     the read; the fresh pass resolves the published map. Bounded:
-        //     each retry needs another publish inside the ever-smaller
-        //     window; exhaustion serves the last compose (a racing read may
-        //     legally serve any value current within its window);
+        //     the read; the fresh pass resolves the published map. Bounded
+        //     by a small lock-free budget — churn outlasting it ESCALATES
+        //     (below), never serves the last compose;
         //  4. the post-read DEVICE-OVERLAY probe (the 2026-08-15 recopy-
         //     storm conviction — generic/795's flake face): the B4 overlay
         //     is a fourth custody station whose acked bytes live at an
         //     UNPUBLISHED dest — invisible to captures (1)/(2) (RAM
         //     probes) and to fingerprint (3) (an Open/Frozen record moves
-        //     neither map keys nor custody epochs). The entry drain above
-        //     races the install, so a live record found AFTER the router
-        //     read is drained (freeze -> seed -> publish — the entry
-        //     drain's own verb) and the read re-runs; the fresh pass
-        //     resolves the published bytes. Bounded by the same attempts
-        //     budget: each retry needs another install inside the
-        //     ever-smaller window.
+        //     neither map keys nor custody epochs). The probe runs in the
+        //     REVERSE order of the publish (registry before fingerprint —
+        //     the round-2 ordering law);
+        //  5. the ESCALATION (round 3 — the architectural close): ANY
+        //     validation failure the budget does not absorb re-serves the
+        //     whole window through `read_window_settled` — per block,
+        //     BLOCK_FLUSH_LOCKS (3) + INODE_META_LOCKS (3.5), the write
+        //     path's own extended order (the rebind-starvation serialized
+        //     settle law) — correct by lock order, not probe
+        //     completeness. Engagement: `overlay_window_escalations`.
         let mut bindings_before = self
             .read_custody_fingerprint(guard_meta.as_ref(), &file_path, ino, offset, read_len)
             .await;
@@ -20561,27 +20702,39 @@ impl Filesystem for SqueezefsFilesystem {
             let bindings_after = self
                 .read_custody_fingerprint(None, &file_path, ino, offset, read_len)
                 .await;
-            if !overlay_blocks.is_empty() && attempts < 4 {
-                for b in overlay_blocks {
-                    self.drain_device_overlay_block(ino, b, false)
-                        .await
-                        .map_err(map_squeezefs_err)?;
-                    METRICS.overlay_read_drains.fetch_add(1, Ordering::Relaxed);
-                }
-                attempts += 1;
-                zc_enabled = false;
-                // The drains just moved the map: re-fingerprint fresh so
-                // the next pass judges against the post-drain world.
-                bindings_before = self
-                    .read_custody_fingerprint(None, &file_path, ino, offset, read_len)
-                    .await;
-                continue;
-            }
-            if read_custody_fp_matches(&bindings_after, &bindings_before) || attempts >= 4 {
+            if overlay_blocks.is_empty()
+                && read_custody_fp_matches(&bindings_after, &bindings_before)
+            {
                 break (data, backing, router_done_at);
             }
-            attempts += 1;
-            bindings_before = bindings_after;
+            if overlay_blocks.is_empty() && attempts < 2 {
+                // Benign fingerprint churn (a publish landed mid-window):
+                // the historical bounded lock-free re-read — cheap and it
+                // usually converges. A LIVE overlay record never takes
+                // this arm (its bytes are invisible to a lock-free pass
+                // by construction), and churn outlasting the budget
+                // escalates below instead of the retired stale
+                // exhaustion serve.
+                attempts += 1;
+                bindings_before = bindings_after;
+                continue;
+            }
+            // ESCALATE (2026-08-15 round 3 — the architectural close):
+            // validation failed — a live overlay record inside the
+            // window, or fingerprint churn past the lock-free budget.
+            // Re-serve the whole window under the write path's own
+            // extended lock order (`read_window_settled`): correct by
+            // lock order, not probe completeness. This retires the
+            // exhaustion arm's "serve the last compose" — a validation
+            // failure is never served lock-free anymore.
+            METRICS
+                .overlay_window_escalations
+                .fetch_add(1, Ordering::Relaxed);
+            let settled = self
+                .read_window_settled(ino, &file_path, offset, read_len)
+                .await
+                .map_err(map_squeezefs_err)?;
+            break (settled, None, router_done_at);
         };
         // Last iteration's overlay-apply + fingerprint re-check span, then
         // the whole per-op residence.

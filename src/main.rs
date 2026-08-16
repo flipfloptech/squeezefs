@@ -5206,8 +5206,15 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                                                 ep.render()
                                             )
                                         })?;
-                                        fab::find_device_for_nqn_under_identity(
-                                            &ep.subnqn, identity,
+                                        // Bounded settle: connect_target's
+                                        // own wait is satisfied by a scoped
+                                        // SIBLING's head on the host-scoped
+                                        // kernel — poll the identity-scoped
+                                        // walk itself (rung 6b).
+                                        fab::wait_device_for_nqn_under_identity(
+                                            &ep.subnqn,
+                                            identity,
+                                            std::time::Duration::from_secs(5),
                                         )
                                         .map_err(|e| format!("post-connect sysfs walk: {e}"))?
                                         .ok_or_else(

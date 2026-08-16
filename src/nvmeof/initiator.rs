@@ -295,8 +295,13 @@ fn has_child_dir(ctrl: &Path, ns: &str) -> bool {
 /// * A controller with no `hostnqn`/`hostid` attrs (local PCIe) →
 ///   contributes nothing — honest no-fabric-identity.
 /// * A multipath HEAD node collects the identity of EVERY controller
-///   serving its subsystem (a head shared between two identities can
+///   SERVING its subsystem (a head shared between two identities can
 ///   never verify as dedicated — the shared shape must be visible).
+///   Serving membership is subsystem-dir-scoped
+///   ([`subsystem_serving_controller_dirs`], rung 6b): on the sqz
+///   host-scoped kernel a scoped SIBLING shares the subsysnqn, and a
+///   global attr walk would read a foreign identity under a genuinely
+///   dedicated head.
 ///
 /// Deduplicated, sorted (deterministic messages).
 pub fn controller_identities_for_device_at(
@@ -331,19 +336,15 @@ pub fn controller_identities_for_device_at(
         }
     }
     // Multipath head node: the namespace lives under the SUBSYSTEM;
-    // every controller with that subsysnqn serves it.
+    // exactly the subsystem's SERVING controllers serve it (dir-scoped
+    // membership — a scoped sibling's controllers never leak in).
     for subsys in sorted_child_dirs(subsystem_root)? {
         if !has_child_dir(&subsys, &name) {
             continue;
         }
-        let Some(nqn) = read_attr(&subsys, "subsysnqn") else {
-            continue;
-        };
-        for ctrl in sorted_child_dirs(nvme_root)? {
-            if attr_matches(&ctrl, "subsysnqn", &nqn)? {
-                if let Some(id) = controller_identity(&ctrl) {
-                    push(id);
-                }
+        for ctrl in subsystem_serving_controller_dirs(&subsys, nvme_root)? {
+            if let Some(id) = controller_identity(&ctrl) {
+                push(id);
             }
         }
     }
@@ -366,6 +367,48 @@ pub fn controller_identities_for_device(dev_path: &str) -> std::io::Result<Vec<H
 fn is_controller_entry_name(name: &str) -> bool {
     name.strip_prefix("nvme")
         .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The SERVING-controller membership of one subsystem dir — the ONE
+/// membership law every subsystem-head walk rides (rung 6b, the 5b
+/// deferred item): when the subsystem dir carries controller entries
+/// (`nvme<N>` — the kernel's `sysfs_create_link` membership; symlinks
+/// resolve as dirs through `is_dir()`), exactly those controllers are
+/// the serving set; only a link-less dir falls back to global
+/// subsysnqn-attr matching against `nvme_root` (exact on stock kernels,
+/// where one subsysnqn is one subsystem). The scoping is load-bearing
+/// on the sqz host-scoped kernel (`docs/design-mw-multipath-kernel.md`,
+/// validated against the REAL scoped sysfs shape in the rung-6b qemu
+/// guest): scoped SIBLING subsystems share a subsysnqn by design, so a
+/// global attr walk reads every dedicated scoped head as foreign/merged.
+fn subsystem_serving_controller_dirs(
+    subsys_dir: &Path,
+    nvme_root: &Path,
+) -> std::io::Result<Vec<PathBuf>> {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(subsys_dir)? {
+        let entry = entry?;
+        let child = entry.file_name().to_string_lossy().to_string();
+        if is_controller_entry_name(&child) && entry.path().is_dir() {
+            entries.push(entry.path());
+        }
+    }
+    if !entries.is_empty() {
+        entries.sort();
+        return Ok(entries);
+    }
+    // Link-less fallback: every controller whose subsysnqn attr matches
+    // the subsystem's (a dir without a readable subsysnqn serves nobody).
+    let Some(nqn) = read_attr(subsys_dir, "subsysnqn") else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for ctrl in sorted_child_dirs(nvme_root)? {
+        if attr_matches(&ctrl, "subsysnqn", &nqn)? {
+            out.push(ctrl);
+        }
+    }
+    Ok(out)
 }
 
 /// The multipath-MERGED shape (rung 5b — the rung-6 STOP finding): a
@@ -423,35 +466,14 @@ pub fn multipath_merged_shape_at(
         let Some(subsysnqn) = read_attr(&subsys, "subsysnqn") else {
             continue;
         };
+        // Serving membership through the ONE law (rung 6b:
+        // `subsystem_serving_controller_dirs` — dir-scoped entries when
+        // present, global attr fallback when link-less).
         let mut hostnqns: Vec<String> = Vec::new();
-        let push = |nqn: String, hostnqns: &mut Vec<String>| {
-            if !hostnqns.contains(&nqn) {
-                hostnqns.push(nqn);
-            }
-        };
-        // The subsystem dir's own controller entries first (symlinks
-        // resolve as dirs through `is_dir()`).
-        let mut saw_controller_entry = false;
-        for entry in fs::read_dir(&subsys)? {
-            let entry = entry?;
-            let child = entry.file_name().to_string_lossy().to_string();
-            if !is_controller_entry_name(&child) || !entry.path().is_dir() {
-                continue;
-            }
-            saw_controller_entry = true;
-            if let Some(nqn) = read_attr(&entry.path(), "hostnqn") {
-                push(nqn, &mut hostnqns);
-            }
-        }
-        if !saw_controller_entry {
-            // Link-less fallback: every controller whose subsysnqn attr
-            // matches (the pre-scoping approximation — exact on stock
-            // kernels, where one subsysnqn is one subsystem).
-            for ctrl in sorted_child_dirs(nvme_root)? {
-                if attr_matches(&ctrl, "subsysnqn", &subsysnqn)? {
-                    if let Some(nqn) = read_attr(&ctrl, "hostnqn") {
-                        push(nqn, &mut hostnqns);
-                    }
+        for ctrl in subsystem_serving_controller_dirs(&subsys, nvme_root)? {
+            if let Some(nqn) = read_attr(&ctrl, "hostnqn") {
+                if !hostnqns.contains(&nqn) {
+                    hostnqns.push(nqn);
                 }
             }
         }
@@ -485,9 +507,16 @@ pub fn multipath_merged_shape(dev_path: &str) -> std::io::Result<Option<Multipat
 /// Shapes:
 /// * per-controller namespace nodes (non-multipath / `multipath=N`):
 ///   the identity-matching controller's strict-shape child;
-/// * multipath HEAD node: returned only when EVERY controller of the
-///   subsystem carries our identity (a dedicated controller set) —
-///   a head round-robining a foreign identity is never handed out;
+/// * multipath HEAD node: returned only when EVERY controller SERVING
+///   its subsystem carries our identity (a dedicated controller set) —
+///   a head round-robining a foreign identity is never handed out.
+///   Serving membership is subsystem-dir-scoped
+///   ([`subsystem_serving_controller_dirs`], rung 6b — the 5b deferred
+///   item): on the sqz host-scoped kernel scoped SIBLING subsystems
+///   share our subsysnqn, so a global `foreign_serves` computation read
+///   the sibling as foreign and answered `None` for BOTH identities;
+///   each identity must resolve its OWN sibling's head, and a sibling
+///   whose serving set is foreign is SKIPPED, never poisoning;
 /// * no identity-matching controller → honest `None`.
 pub fn find_device_for_nqn_under_identity_at(
     subsystem_root: &Path,
@@ -496,14 +525,12 @@ pub fn find_device_for_nqn_under_identity_at(
     identity: &HostIdentity,
 ) -> std::io::Result<Option<String>> {
     let mut ours = Vec::new();
-    let mut foreign_serves = false;
     for ctrl in sorted_child_dirs(nvme_root)? {
         if !attr_matches(&ctrl, "subsysnqn", subnqn)? {
             continue;
         }
-        match controller_identity(&ctrl) {
-            Some(id) if id == *identity => ours.push(ctrl),
-            _ => foreign_serves = true,
+        if controller_identity(&ctrl).is_some_and(|id| id == *identity) {
+            ours.push(ctrl);
         }
     }
     // Per-controller namespace node under our own controller first.
@@ -512,14 +539,29 @@ pub fn find_device_for_nqn_under_identity_at(
             return Ok(Some(format!("/dev/{}", ns)));
         }
     }
-    // Multipath head node — dedicated controller sets only.
-    if !ours.is_empty() && !foreign_serves {
-        for subsys in sorted_child_dirs(subsystem_root)? {
-            if attr_matches(&subsys, "subsysnqn", subnqn)? {
-                if let Some(ns) = first_namespace_block_child(&subsys)? {
-                    return Ok(Some(format!("/dev/{}", ns)));
-                }
-            }
+    if ours.is_empty() {
+        return Ok(None);
+    }
+    // Multipath head node — dedicated serving sets only, judged PER
+    // SUBSYSTEM DIR (a foreign scoped sibling is skipped; a dir whose
+    // serving set mixes ours and foreign — or carries an identity-LESS
+    // entry, which can never verify as ours — is never handed out).
+    for subsys in sorted_child_dirs(subsystem_root)? {
+        if !attr_matches(&subsys, "subsysnqn", subnqn)? {
+            continue;
+        }
+        let serving = subsystem_serving_controller_dirs(&subsys, nvme_root)?;
+        if serving.is_empty() {
+            continue;
+        }
+        let dedicated = serving
+            .iter()
+            .all(|ctrl| controller_identity(ctrl).is_some_and(|id| id == *identity));
+        if !dedicated {
+            continue;
+        }
+        if let Some(ns) = first_namespace_block_child(&subsys)? {
+            return Ok(Some(format!("/dev/{}", ns)));
         }
     }
     Ok(None)
@@ -536,6 +578,32 @@ pub fn find_device_for_nqn_under_identity(
         subnqn,
         identity,
     )
+}
+
+/// Bounded settle wait around [`find_device_for_nqn_under_identity`]
+/// (rung 6b, found live by the vm-multi-identity leg): the kernel
+/// materializes a new controller's namespaces asynchronously, and
+/// `connect_target`'s own 2 s wait polls the GLOBAL walk — which a
+/// host-scoped SIBLING's already-present head satisfies instantly, so
+/// the identity-scoped resolve after a daemon-owned connect got zero
+/// settle time exactly on the kernel that makes co-located identities
+/// possible. A thin poll wrapper over the seam-tested resolution core;
+/// unresolvable within `timeout` stays an honest `None`.
+pub fn wait_device_for_nqn_under_identity(
+    subnqn: &str,
+    identity: &HostIdentity,
+    timeout: std::time::Duration,
+) -> std::io::Result<Option<String>> {
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(dev) = find_device_for_nqn_under_identity(subnqn, identity)? {
+            return Ok(Some(dev));
+        }
+        if start.elapsed() >= timeout {
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 // ---------------------------------------------------------------------------

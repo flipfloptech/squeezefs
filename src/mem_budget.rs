@@ -572,13 +572,16 @@ impl MemBudget {
 
     /// Production tick: resolve the budget (flag → env → cgroup × 0.8
     /// re-read NOW → 70 % RAM), sample RSS + the cgroup unreclaimable
-    /// set, delegate.
+    /// set, compose the inputs ([`tick_inputs`] — the pure tie-test
+    /// form), delegate.
     pub fn tick(&self) {
-        self.tick_inner(
+        let (budget, rss, unreclaimable) = tick_inputs(
             self.resolve_budget_now(),
             read_rss_bytes(),
             read_cgroup_unreclaimable().unwrap_or(0),
+            crate::cpu::fleet_share(),
         );
+        self.tick_inner(budget, rss, unreclaimable);
     }
 
     /// Serialize the registry for the stats inode: `(name, current, floor,
@@ -977,6 +980,16 @@ pub fn fleet_shared_root(value: u64, share: usize) -> u64 {
 }
 
 /// [`resolve_budget_from`] with the fleet-share divisor applied at the
+/// The production tick's INPUT composition, pure (the tie-test form):
+/// the budget passes through (already fleet-shared at its SYSTEM roots by
+/// [`resolve_budget_from_shared`]), RSS is per-process by construction
+/// (`/proc/self/statm` is already this daemon's own bytes), and the
+/// cgroup unreclaimable arm rides through verbatim.
+pub fn tick_inputs(budget: u64, rss: u64, raw_unreclaimable: u64, share: usize) -> (u64, u64, u64) {
+    let _ = share;
+    (budget, rss, raw_unreclaimable)
+}
+
 /// SYSTEM root inputs (§5.6): the cgroup cage and the RAM total become
 /// `ceil(system / share)` BEFORE the existing ×0.8 / ×0.7 laws, so the
 /// derived tier scales through the untouched formulas. The explicit

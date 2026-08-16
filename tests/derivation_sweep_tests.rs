@@ -1634,3 +1634,44 @@ fn il_kernel_lane_min_derives_from_membw_and_lane_rtt_delta() {
     // caller hands slab == max_op).
     assert_eq!(kernel_lane_min_default(0, 4096, 4096), 4096);
 }
+
+/// §5.6 / KD-MW-14 (rung-7 S6-a finding, 2026-08-16): the cgroup
+/// UNRECLAIMABLE arm is a SHARED system root on a co-located fleet — N
+/// daemons read ONE `memory.stat`, so feeding the whole cage's residue
+/// into a level machine whose budget was divided by N over-fires every
+/// daemon's Red/backstop ~N× on a healthy quiet fleet (the live S6-a
+/// N=32 row: every daemon budget 2.76 GB, shared unreclaimable sample
+/// 4.8 GB, ALL 32 in Red with hard backstops while their own ledgers
+/// read 0.5 GB). The sample must divide at the root exactly like the
+/// budget's system roots do — one divisor, downstream formulas
+/// untouched; share 1 is the identity. Each daemon's OWN balloon stays
+/// policed undivided by the per-process RSS arm.
+#[test]
+fn the_unreclaimable_arm_divides_by_the_fleet_share_like_every_system_root() {
+    use squeezefs::mem_budget::tick_inputs;
+    const GIB: u64 = 1024 * 1024 * 1024;
+    // Share 1: byte-identical passthrough (the solo posture).
+    assert_eq!(
+        tick_inputs(2 * GIB, GIB, 5 * GIB, 1),
+        (2 * GIB, GIB, 5 * GIB)
+    );
+    // Share 32: the shared-cgroup sample enters divided (ceil), so the
+    // fleet's collective residue compares against the collective budget
+    // — not the whole cage against one daemon's 1/32nd slice.
+    let (budget, rss, unreclaimable) = tick_inputs(2 * GIB, GIB, 5 * GIB, 32);
+    assert_eq!(
+        budget,
+        2 * GIB,
+        "the budget was already shared at its roots"
+    );
+    assert_eq!(
+        rss, GIB,
+        "RSS is per-process by construction — never divided"
+    );
+    assert_eq!(
+        unreclaimable,
+        5 * GIB / 32 + 1,
+        "the cgroup unreclaimable sample divides at the root (ceil), the \
+         fleet_shared_root law"
+    );
+}

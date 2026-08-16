@@ -181,6 +181,59 @@
 #                       the matrix restarts from zero on the fixed
 #                       binary. Reader recovery + dirty-skip tripwire
 #                       asserted at matrix end.
+#   s9-fanout [--mb=M]  (rung 10 — needs --multi-writer --cowriters=K;
+#                       design row S9-a) THE FAN-OUT ROW: K co-writers +
+#                       the authority writing DATA concurrently — the
+#                       first true multi-writer data rows. Two phases:
+#                       fresh fan-out (per-member dd conv=fsync — the RW6
+#                       durable discipline), then a concurrent REWRITE of
+#                       the same files (the displaced-free + reuse face:
+#                       co-writer frees SHIP and the lane harvest serves
+#                       reuse). Emits per-member throughput + engagement
+#                       columns (publish shipped/served, free ledger,
+#                       write-through bytes) and the WRITE-AMPLIFICATION
+#                       instrument per the tests/write_amp_rig.sh
+#                       discipline: device bytes / user bytes on the DATA
+#                       namespaces (/proc/diskstats deltas — meta rides
+#                       its own namespaces, so the data delta is exact),
+#                       wareq-sz vs the 4 MiB block size, and the
+#                       block_free_* ledger. ATTRIBUTION LIMIT, stated:
+#                       co-located members share one merged head per
+#                       namespace, so device columns are per-NAMESPACE
+#                       (fleet-aggregate), and per-member attribution is
+#                       stats-side. Ends with the full online fsck + the
+#                       C8 oracle. Per-member size auto-derives from the
+#                       lane share (SQZ_MWMATRIX_S9A_MB / --mb=M caps it).
+#   s9-failover         (rung 10; design row S9-b) authority kill -9
+#                       MID-FAN-OUT: co-writers first write an
+#                       fsync-acked corpus (sha256-recorded), then stream
+#                       under load while the authority dies. The
+#                       successor remounts (rung-8 takeover machinery);
+#                       every co-writer must FENCE or relearn — zero
+#                       silent old-era survivors (the E2 law); the
+#                       fsync-acked corpus must verify byte-identical
+#                       through the successor AND through every
+#                       re-admitted co-writer (zero acked-data loss);
+#                       fsck + C8 clean. Co-writer re-admission is BY
+#                       REMOUNT — the rung-10 documented posture
+#                       (docs/operations.md §Multi-writer co-writer
+#                       mounts, "Failure and re-admission").
+#   s9-colocated-fence [--victim=IDX]  (rung 10; design row S9-c) the
+#                       CO-LOCATED fencing story: the victim co-writer
+#                       shares the PR host identity with its authority,
+#                       so THE DEVICE CANNOT REJECT its DMA (no
+#                       reservation conflict exists for the holder's own
+#                       key — classify_dma_outcome is structurally
+#                       unreachable). SIGSTOP the victim past the
+#                       authority's TTL (custody sweep + membership
+#                       eviction + dead-epoch mint), SIGCONT: the victim
+#                       must fail-stop CLIENT-SIDE (T_self self-fence /
+#                       UnknownLease custody poison) with NO
+#                       device-rejection line in its log — proving the
+#                       epoch/poison gates alone carry the fencing story
+#                       (cargo pin: tests/mw_colocated_fence_tests.rs).
+#                       Blast radius = the victim; fsck + C8 clean;
+#                       victim re-admits by remount.
 #   vm-multi-identity   (rung 6b — needs --vm=V) the N>=2-identity mount
 #                       shape LIVE inside guest 0 on the 0030 kernel:
 #                       writer A formats --multi-writer over the reserved
@@ -245,6 +298,7 @@ S6_NETEM_MS=200
 S6_VICTIM=""
 S7_ROUNDS=10
 S8B_SECS="${SQZ_MWMATRIX_S8B_SECS:-1800}"
+S9A_MB_CAP="${SQZ_MWMATRIX_S9A_MB:-1024}"
 for a in "$@"; do
     case "$a" in
     --require-host-scoped-subsys) REQUIRE_HS=1 ;;
@@ -253,9 +307,11 @@ for a in "$@"; do
     --victim=*) S6_VICTIM="${a#--victim=}" ;;
     --rounds=*) S7_ROUNDS="${a#--rounds=}" ;;
     --secs=*) S8B_SECS="${a#--secs=}" ;;
+    --mb=*) S9A_MB_CAP="${a#--mb=}" ;;
     *) die "unknown argument '$a'" ;;
     esac
 done
+[[ "$S9A_MB_CAP" =~ ^[0-9]+$ ]] && [ "$S9A_MB_CAP" -ge 64 ] || die "--mb takes MiB >= 64 (got '$S9A_MB_CAP')"
 [[ "$S6_WINDOW_S" =~ ^[0-9]+$ ]] || die "--window takes seconds (got '$S6_WINDOW_S')"
 [[ "$S6_NETEM_MS" =~ ^[0-9]+$ ]] || die "--netem takes ms (got '$S6_NETEM_MS')"
 [[ "$S7_ROUNDS" =~ ^[0-9]+$ ]] && [ "$S7_ROUNDS" -ge 1 ] || die "--rounds takes a positive integer (got '$S7_ROUNDS')"
@@ -2343,6 +2399,473 @@ $(head -5 "$rowdir/fail-c-m$idx")"
     log "s8-crucible GREEN (events + snapshots + fail logs in $rowdir)"
 }
 
+# --- rung 10: the S9 rows ------------------------------------------------------
+
+# /proc/diskstats write columns for one device basename: "wios wsect".
+disk_wcols() { # /dev/nvmeXnY
+    awk -v d="$(basename "$1")" '$3==d {print $8, $10}' /proc/diskstats
+}
+
+# Snapshot the write columns of every DATA + META namespace.
+disk_wsnap() { # rowdir phase
+    local out="$1/disk_p$2.tsv" p
+    : >"$out"
+    local IFS=,
+    for p in $FORMAT_DATA_PATHS; do
+        echo "data $(basename "$p") $(disk_wcols "$p")" >>"$out"
+    done
+    for p in $FORMAT_META_PATHS; do
+        echo "meta $(basename "$p") $(disk_wcols "$p")" >>"$out"
+    done
+}
+
+# One member's timed dd, backgrounded; the wall + rc land in $out.
+s9_dd() { # out file mb [extra dd conv flags appended to conv=fsync]
+    local out="$1" f="$2" mb="$3" conv="${4:-fsync}"
+    (
+        local t0 t1 rc=0
+        t0="$(date +%s.%N)"
+        dd if=/dev/zero of="$f" bs=1M count="$mb" conv="$conv" status=none 2>"$out.err" || rc=$?
+        t1="$(date +%s.%N)"
+        echo "$rc $t0 $t1 $mb" >"$out"
+    ) &
+}
+
+leg_s9_fanout() {
+    require_cowriters 1
+    local rowdir cws idx
+    rowdir="$STATE/rows/s9a-$(date +%s)"
+    mkdir -p "$rowdir"
+    mapfile -t cws < <(cowriter_idxs)
+    local k="${#cws[@]}"
+
+    # Foreign-load honesty (the measured-row law): state the box.
+    log "s9-fanout preconditions: loadavg=$(cut -d' ' -f1-3 /proc/loadavg), foreign cargo=$(pgrep -c cargo || true)"
+
+    # Sizing from the LANE SHARE (never a free constant): total data
+    # capacity / the engaged width, phase W at 40% of a lane, rewrite at
+    # half of that — so the row never manufactures an ENOSPC and the
+    # harvest stays the cargo suite's row, not this one's.
+    local total_bytes=0 p w
+    local IFS_SAVE="$IFS"
+    IFS=,
+    for p in $FORMAT_DATA_PATHS; do
+        total_bytes=$((total_bytes + $(blockdev --getsize64 "$p")))
+    done
+    IFS="$IFS_SAVE"
+    w="$(stat_field 0 alloc_lane_writers)"
+    [ -n "$w" ] && [ "$w" -ge 2 ] ||
+        die "s9-fanout: alloc_lane_writers=$w on the authority — a --cowriters fleet must run an engaged allocation partition"
+    local lane_mb=$((total_bytes / w / 1024 / 1024))
+    local mb=$((lane_mb * 40 / 100))
+    [ "$mb" -le "$S9A_MB_CAP" ] || mb="$S9A_MB_CAP"
+    [ "$mb" -ge 64 ] || die "s9-fanout: derived per-member size ${mb}MiB < 64MiB — the volumes are too small for a meaningful row (grow SQZ_MWFLEET_OSS_GB)"
+    local rw_mb=$((mb / 2))
+    log "s9-fanout: $((k + 1)) concurrent writers (authority + $k co-writers), W=$w, lane share ${lane_mb}MiB, phase-W ${mb}MiB/member + phase-R rewrite ${rw_mb}MiB/member (all conv=fsync — durable rows)"
+
+    for idx in $(member_idxs); do snap "$idx" 0 "$rowdir"; done
+    disk_wsnap "$rowdir" 0
+
+    # ---- Phase W: the concurrent fresh fan-out ------------------------------
+    local -a pids=()
+    s9_dd "$rowdir/wall-w-m0" "$(mnt_of 0)/s9a-m0.dat" "$mb"
+    pids+=("$!")
+    for idx in "${cws[@]}"; do
+        s9_dd "$rowdir/wall-w-m$idx" "$(mnt_of "$idx")/s9a-m$idx.dat" "$mb"
+        pids+=("$!")
+    done
+    wait "${pids[@]}" || true
+    for idx in 0 "${cws[@]}"; do
+        read -r rc _ _ _ <"$rowdir/wall-w-m$idx"
+        [ "$rc" = "0" ] || die "s9-fanout phase W: member m$idx's write FAILED (rc=$rc): $(head -2 "$rowdir/wall-w-m$idx.err")"
+    done
+
+    # ---- Phase R: the concurrent in-place REWRITE (displaced frees SHIP) ----
+    pids=()
+    s9_dd "$rowdir/wall-r-m0" "$(mnt_of 0)/s9a-m0.dat" "$rw_mb" fsync,notrunc
+    pids+=("$!")
+    for idx in "${cws[@]}"; do
+        s9_dd "$rowdir/wall-r-m$idx" "$(mnt_of "$idx")/s9a-m$idx.dat" "$rw_mb" fsync,notrunc
+        pids+=("$!")
+    done
+    wait "${pids[@]}" || true
+    for idx in 0 "${cws[@]}"; do
+        read -r rc _ _ _ <"$rowdir/wall-r-m$idx"
+        [ "$rc" = "0" ] || die "s9-fanout phase R: member m$idx's rewrite FAILED (rc=$rc): $(head -2 "$rowdir/wall-r-m$idx.err")"
+    done
+
+    # In-flight settle (writeback + shipped frees + reclaim), then p1.
+    sleep 3
+    disk_wsnap "$rowdir" 1
+    for idx in $(member_idxs); do snap "$idx" 1 "$rowdir"; done
+
+    # ---- The row: engagement + amplification, gated -------------------------
+    python3 - "$rowdir" "$mb" "$rw_mb" "$k" "${cws[@]}" <<'PYS9A' || die "s9-fanout: INVALID ROW"
+import json, sys
+
+rowdir, mb, rw_mb, k = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+cws = sys.argv[5:]
+BLOCK = 4 * 1024 * 1024
+
+def flat(d, out=None, pfx=""):
+    out = {} if out is None else out
+    for kk, v in d.items():
+        if isinstance(v, dict): flat(v, out, pfx + kk + ".")
+        else: out[pfx + kk] = v
+    return out
+
+def load(i, ph):
+    root = json.load(open(f"{rowdir}/m{i}_p{ph}.json"))
+    return flat(root.get("metrics", root))
+
+def wall(tag, i):
+    rc, t0, t1, n = open(f"{rowdir}/wall-{tag}-m{i}").read().split()
+    return float(t1) - float(t0), int(n)
+
+bad = []
+user_bytes = 0
+print(f"== S9-a fan-out row: authority + {k} co-writer(s), phase-W {mb}MiB + phase-R {rw_mb}MiB per member, conv=fsync ==")
+print(f"{'member':<8}{'role':<10}{'W_MBps':<9}{'R_MBps':<9}{'wt_MiB_d':<10}{'pub_ship_d':<11}{'free_ship_d':<12}{'harvest_d':<10}{'lcr':<5}{'enospc':<7}")
+members = [("0", "authority")] + [(i, "cowriter") for i in cws]
+sum_pub_ship = 0
+sum_free_ship = 0
+for i, role in members:
+    d0, d1 = load(i, 0), load(i, 1)
+    dd = lambda kk: int(d1.get(kk, 0) or 0) - int(d0.get(kk, 0) or 0)
+    ww, wn = wall("w", i)
+    rw, rn = wall("r", i)
+    user_bytes += (wn + rn) * 1024 * 1024
+    wt_d = dd("write_through_bytes") // (1024 * 1024)
+    pub_ship = dd("meta_ship_publish.shipped")
+    free_ship = dd("meta_ship_publish.free_shipped_blocks")
+    harv = dd("meta_ship_publish.harvest_shipped_blocks")
+    lcr = int(d1.get("cowriter.local_commit_refusals", 0) or 0)
+    enospc = dd("alloc_lane_enospc_refusals")
+    print(f"m{i:<7}{role:<10}{wn/ww:<9.1f}{rn/rw:<9.1f}{wt_d:<10}{pub_ship:<11}{free_ship:<12}{harv:<10}{lcr:<5}{enospc:<7}")
+    # Engagement gates (charter: each co-writer's shipped publish/free
+    # ledger deltas must account for its blocks).
+    total_mb = wn + rn
+    if wt_d < total_mb * 8 // 10:
+        bad.append(f"m{i}: write_through_bytes delta {wt_d}MiB < 80% of the {total_mb}MiB written — the row did not ride the write-through path")
+    if role == "cowriter":
+        rw_blocks = rn * 1024 * 1024 // BLOCK
+        if pub_ship < 1:
+            bad.append(f"m{i}: meta_ship_publish.shipped delta 0 — a co-writer's publishes must SHIP")
+        if free_ship < rw_blocks // 2:
+            bad.append(f"m{i}: free_shipped_blocks delta {free_ship} < half of the ~{rw_blocks} rewritten blocks — displaced frees are leaking")
+        if lcr != 0:
+            bad.append(f"m{i}: local_commit_refusals={lcr} (un-routed local commits — the S8-b falsifier)")
+        sum_pub_ship += pub_ship
+        sum_free_ship += free_ship
+    if enospc != 0:
+        bad.append(f"m{i}: alloc_lane_enospc_refusals moved ({enospc}) — a writer starved while the set has space")
+    if dd("invariant_tripwires") != 0:
+        bad.append(f"m{i}: invariant_tripwires moved")
+    if dd("mem_budget_hard_backstops") != 0 or dd("parked_gate_timeouts") != 0:
+        bad.append(f"m{i}: R5 columns moved")
+
+# Aggregate engagement: co-writer ships account against the authority's
+# serves (client-first snapshots; ±4/member instrument self-skew).
+a0, a1 = load(0, 0), load(0, 1)
+served_d = int(a1.get("meta_ship_publish.served", 0)) - int(a0.get("meta_ship_publish.served", 0))
+free_served_d = int(a1.get("meta_ship_publish.free_served_blocks", 0)) - int(a0.get("meta_ship_publish.free_served_blocks", 0))
+if served_d + 4 * (k + 1) < sum_pub_ship:
+    bad.append(f"aggregate: authority served {served_d} publish verbs < co-writers' shipped {sum_pub_ship}")
+if free_served_d + 4 * (k + 1) < sum_free_ship:
+    bad.append(f"aggregate: authority free-served {free_served_d} < co-writers' free-shipped {sum_free_ship}")
+for key, name in [("meta_ship_publish.refusals", "publish refusals"),
+                  ("meta_ship_publish.owner_panics", "owner panics"),
+                  ("alloc_lane_raise_refusals", "lane raise refusals"),
+                  ("meta_ship_publish.harvest_refusals", "harvest refusals"),
+                  ("block_free_reclaim_fence_halts", "reclaim fence halts")]:
+    v = int(a1.get(key, 0) or 0)
+    if v != 0:
+        bad.append(f"authority: {name} = {v} (must stay 0)")
+
+# ---- The write-amplification instrument (write_amp_rig discipline) -----
+print("\n== device columns (per NAMESPACE — meta rides its own namespaces, so the data delta is exact;")
+print("   co-located members share one merged head, so per-member device attribution is stats-side) ==")
+p0 = {}
+for line in open(f"{rowdir}/disk_p0.tsv"):
+    cls, dev, wios, wsect = line.split()
+    p0[dev] = (cls, int(wios), int(wsect))
+data_wbytes = 0
+meta_wbytes = 0
+print(f"{'class':<6}{'dev':<12}{'wios_d':<9}{'MiB_d':<9}{'wareq_KiB':<10}")
+for line in open(f"{rowdir}/disk_p1.tsv"):
+    cls, dev, wios, wsect = line.split()
+    dios = int(wios) - p0[dev][1]
+    dbytes = (int(wsect) - p0[dev][2]) * 512
+    if cls == "data": data_wbytes += dbytes
+    else: meta_wbytes += dbytes
+    wareq = dbytes / dios / 1024 if dios else 0.0
+    print(f"{cls:<6}{dev:<12}{dios:<9}{dbytes/1048576:<9.1f}{wareq:<10.1f}")
+amp = data_wbytes / user_bytes if user_bytes else 0.0
+print(f"\nuser bytes {user_bytes/1048576:.0f}MiB, data-namespace device bytes {data_wbytes/1048576:.0f}MiB -> amp {amp:.3f}x (block size 4MiB; meta-namespace bytes {meta_wbytes/1048576:.0f}MiB, separate)")
+for key in ["block_free_reclaim_queued", "block_free_reclaim_commands", "block_free_discards",
+            "block_free_discard_bytes", "block_free_file_punches", "block_free_punch_bytes"]:
+    print(f"  {key}_d = {int(a1.get(key, 0) or 0) - int(a0.get(key, 0) or 0)}")
+if amp > 1.30:
+    bad.append(f"amp {amp:.3f}x > 1.30 on a sequential durable row — write amplification regressed")
+if amp < 0.5:
+    bad.append(f"amp {amp:.3f}x < 0.5 — the instrument is not accounting (wrong devices?)")
+
+if bad:
+    print("S9-a GATE FAILED:", file=sys.stderr)
+    for b in bad:
+        print(f"  {b}", file=sys.stderr)
+    sys.exit(1)
+print("\nS9-a GATE GREEN (engagement exact, amp columns present, tripwires flat)")
+PYS9A
+
+    # ---- The oracle ----------------------------------------------------------
+    local out drift
+    out="$("$SQZ" fsck "$(mnt_of 0)" 2>&1)" || die "s9-fanout: online fsck FAILED:
+$out"
+    echo "$out" >"$rowdir/fsck.out"
+    echo "$out" | grep -q "findings: 0" || die "s9-fanout: fsck findings != 0:
+$out"
+    drift="$(stat_field 0 meta_kv_block_refs_drift)"
+    [ "$drift" = "0" ] || die "s9-fanout: meta_kv_block_refs_drift=$drift (C8 oracle RED)"
+    log "s9-fanout GREEN — fsck findings:0, drift=0 (row + snapshots in $rowdir). Evidence tier: measured-simulated (one box, co-located identities; the 15k extrapolation is the evidence note's arithmetic)"
+}
+
+leg_s9_failover() {
+    require_cowriters 1
+    local rowdir cws idx w_mnt
+    rowdir="$STATE/rows/s9b-$(date +%s)"
+    mkdir -p "$rowdir"
+    mapfile -t cws < <(cowriter_idxs)
+    w_mnt="$(mnt_of 0)"
+    log "s9-failover: authority kill -9 mid-fan-out over ${#cws[@]} co-writer(s); gates = zero silent old-era survivors + zero acked-data loss + fsck/C8 clean; re-admission by remount (the rung-10 documented posture)"
+
+    for idx in $(member_idxs); do snap "$idx" 0 "$rowdir"; done
+
+    # ---- The ACKED corpus: per co-writer, fsync-durable, sha256-recorded ----
+    local f n
+    for idx in "${cws[@]}"; do
+        mkdir -p "$(mnt_of "$idx")/s9b-m$idx"
+        for n in 0 1 2 3 4 5 6 7; do
+            f="$(mnt_of "$idx")/s9b-m$idx/acked-$n.dat"
+            dd if=/dev/urandom of="$f" bs=1M count=4 conv=fsync status=none ||
+                die "s9-failover: corpus write failed on m$idx"
+        done
+        (cd "$(mnt_of "$idx")/s9b-m$idx" && sha256sum acked-*.dat) >"$rowdir/sha-m$idx" ||
+            die "s9-failover: corpus checksum failed on m$idx"
+    done
+    log "acked corpus written + fsynced (8 x 4MiB per co-writer, sha256 recorded)"
+
+    # ---- The fan-out stream the kill lands in --------------------------------
+    local -a pids=()
+    for idx in "${cws[@]}"; do
+        (exec dd if=/dev/zero of="$(mnt_of "$idx")/s9b-m$idx/stream.dat" bs=1M count=16384 conv=fsync status=none) 2>/dev/null &
+        pids+=("$!")
+    done
+    sleep 5
+    for idx in "${!pids[@]}"; do
+        kill -0 "${pids[$idx]}" 2>/dev/null || die "s9-failover: a stream died before the kill"
+    done
+
+    # ---- Kill -9 the authority mid-stream ------------------------------------
+    local w_pid t_kill t_up tries
+    w_pid="$(awk -F'\t' '$1==0 {print $7}' "$MEMBERS")"
+    "$MWFLEET" kill 0 --sig 9
+    t_kill="$(date +%s)"
+    umount -l "$w_mnt" 2>/dev/null || true
+    wait_for_unmounted "$w_mnt"
+    for ((tries = 0; tries < 120; tries++)); do
+        kill -0 "$w_pid" 2>/dev/null || break
+        sleep 0.5
+    done
+    kill -0 "$w_pid" 2>/dev/null && die "s9-failover: the killed authority (pid $w_pid) never exited"
+    "$MWFLEET" mount 0 || die "s9-failover: successor authority remount FAILED"
+    t_up="$(date +%s)"
+    [ "$(stat_field 0 data_plane_fence_mode)" = "1" ] ||
+        die "s9-failover: successor did not re-arm the WERO hold"
+    log "successor authority up in $((t_up - t_kill))s (WERO re-armed)"
+
+    # ---- The fence scan: zero silent old-era survivors (the E2 law) ---------
+    local fenced=0 relearned silent=0
+    for ((tries = 0; tries < 60; tries++)); do
+        fenced=0
+        for idx in "${cws[@]}"; do
+            if ! cat "$(mnt_of "$idx")/.stats" >/dev/null 2>&1 ||
+                [ "$(sfield0 "$idx" mount_posture)" != "co-writer" ]; then
+                fenced=$((fenced + 1))
+            fi
+        done
+        [ "$fenced" -ge "${#cws[@]}" ] && break
+        sleep 1
+    done
+    for idx in "${cws[@]}"; do
+        if cat "$(mnt_of "$idx")/.stats" >/dev/null 2>&1 &&
+            [ "$(sfield0 "$idx" mount_posture)" = "co-writer" ]; then
+            relearned="$(sfield0 "$idx" meta_ship.era_relearns)"
+            if [ "$relearned" = "0" ]; then
+                silent=$((silent + 1))
+                warn "s9-failover: co-writer m$idx SURVIVED with no relearn and no fence — a silent old-era survivor"
+            fi
+        fi
+    done
+    for idx in "${!pids[@]}"; do
+        kill -9 "${pids[$idx]}" 2>/dev/null || true
+        wait "${pids[$idx]}" 2>/dev/null || true
+    done
+    [ "$silent" -eq 0 ] || die "s9-failover: $silent silent old-era survivor(s) — the era fence has a hole"
+    log "fence scan: $fenced/${#cws[@]} co-writer(s) fenced (S7 wins the race; the rest relearned) — zero silent survivors"
+    echo "remount_s=$((t_up - t_kill)) fenced=$fenced silent=$silent" >>"$rowdir/events.txt"
+
+    # ---- Re-admission BY REMOUNT (the documented rung-10 posture) -----------
+    for idx in "${cws[@]}"; do
+        "$MWFLEET" unmount "$idx" || true
+        "$MWFLEET" mount "$idx" ||
+            die "s9-failover: co-writer m$idx could not re-admit under the successor era (its slot id is mount-point-stable — the roster still names it)"
+    done
+    log "all ${#cws[@]} co-writer(s) re-admitted under the successor era (by remount)"
+
+    # ---- ZERO ACKED-DATA LOSS: the corpus verifies EVERYWHERE ----------------
+    for idx in "${cws[@]}"; do
+        (cd "$w_mnt/s9b-m$idx" && sha256sum -c --quiet "$rowdir/sha-m$idx") ||
+            die "s9-failover: ACKED DATA LOSS — m$idx's fsynced corpus does not verify through the SUCCESSOR authority"
+        (cd "$(mnt_of "$idx")/s9b-m$idx" && sha256sum -c --quiet "$rowdir/sha-m$idx") ||
+            die "s9-failover: ACKED DATA LOSS — m$idx's fsynced corpus does not verify through the re-admitted co-writer"
+    done
+    log "acked corpus verified byte-identical through the successor AND every re-admitted co-writer (zero acked-data loss)"
+
+    # ---- The oracle + tripwires ----------------------------------------------
+    local out drift v
+    out="$("$SQZ" fsck "$w_mnt" 2>&1)" || die "s9-failover: online fsck FAILED:
+$out"
+    echo "$out" >"$rowdir/fsck.out"
+    echo "$out" | grep -q "findings: 0" || die "s9-failover: fsck findings != 0:
+$out"
+    drift="$(stat_field 0 meta_kv_block_refs_drift)"
+    [ "$drift" = "0" ] || die "s9-failover: meta_kv_block_refs_drift=$drift (C8 oracle RED)"
+    for v in meta_ship.owner_panics meta_ship_publish.refusals meta_ship_publish.owner_panics invariant_tripwires; do
+        [ "$(stat_field 0 "$v")" = "0" ] || die "s9-failover: successor $v != 0"
+    done
+    for idx in "${cws[@]}"; do
+        [ "$(stat_field "$idx" cowriter.local_commit_refusals)" = "0" ] ||
+            die "s9-failover: re-admitted m$idx local_commit_refusals != 0"
+    done
+    for idx in $(member_idxs); do snap "$idx" 1 "$rowdir"; done
+    log "s9-failover GREEN (events + snapshots + checksums in $rowdir). Automatic re-admission stays the DOCUMENTED deferral (ops.md 'Failure and re-admission')"
+}
+
+leg_s9_colocated_fence() {
+    require_cowriters 1
+    local rowdir cws victim w_mnt ttl renew_est
+    rowdir="$STATE/rows/s9c-$(date +%s)"
+    mkdir -p "$rowdir"
+    mapfile -t cws < <(cowriter_idxs)
+    victim="${S6_VICTIM:-${cws[0]}}"
+    w_mnt="$(mnt_of 0)"
+    ttl="$(stat_field 0 membership_lease_ttl_ms)"
+    renew_est="$(owner_renew_est_s)"
+    log "s9-colocated-fence: victim = co-writer m$victim (CO-LOCATED — shared PR host identity: the device CANNOT reject its DMA; the client-side epoch/poison gates must). T_owner=${ttl}ms"
+
+    for idx in $(member_idxs); do snap "$idx" 0 "$rowdir"; done
+    local evict0 exp0
+    evict0="$(stat_field 0 membership_evictions)"
+    exp0="$(stat_field 0 dlm_custody.dlm_revokes_expired)"
+
+    # ---- Sustained write load on the victim, running when the freeze lands --
+    (exec dd if=/dev/zero of="$(mnt_of "$victim")/s9c-load.dat" bs=1M count=16384 conv=fsync status=none) 2>/dev/null &
+    local dd_pid=$!
+    sleep 3
+    kill -0 "$dd_pid" 2>/dev/null || die "s9-colocated-fence: victim load exited before the freeze"
+
+    # ---- Freeze past the authority's TTL -------------------------------------
+    "$MWFLEET" kill "$victim" --sig STOP
+    log "victim m$victim SIGSTOPped (frozen daemon; its kernel keeps draining already-submitted DMA)"
+    # The authority sweeps: custody lease expiry + membership eviction (the
+    # dead-epoch mint) — both observable on the AUTHORITY's stats.
+    local deadline=$((ttl / 1000 + 6 * renew_est + 90))
+    wait_stat_ge 0 dlm_custody.dlm_revokes_expired $((exp0 + 1)) "$deadline" "authority custody sweep of the frozen victim" >/dev/null
+    log "authority swept the victim's custody lease (dlm_revokes_expired moved)"
+    wait_stat_ge 0 membership_evictions $((evict0 + 1)) "$deadline" "authority eviction of the frozen victim" >/dev/null
+    log "authority evicted the frozen victim + minted its S7 dead epoch"
+
+    # ---- Resume: the fencing story must be CLIENT-SIDE ------------------------
+    "$MWFLEET" kill "$victim" --sig CONT
+    log "victim m$victim resumed (SIGCONT) — its next renewal/deadline check must fail-stop it"
+    # (wait_log_line is grep -F; this wants the ALTERNATION of the two
+    # client-side fail-stop lines, so it polls -E inline.)
+    local t0f
+    t0f="$(date +%s)"
+    while ! grep -Eq "SELF-FENCED|data-plane custody POISONED" "$STATE/m$victim.log"; do
+        [ $(($(date +%s) - t0f)) -lt 120 ] ||
+            die "victim client-side fail-stop: neither 'SELF-FENCED' nor 'data-plane custody POISONED' appeared in m$victim.log within 120s"
+        sleep 1
+    done
+    kill -9 "$dd_pid" 2>/dev/null || true
+    wait "$dd_pid" 2>/dev/null || true
+
+    # THE CLASS ASSERTION: no device rejection existed or was needed. A
+    # co-located identity can never meet a reservation conflict (its key IS
+    # the holder's), so any such line would mean the leg's premise — and
+    # the co-located adoption machinery — is broken.
+    if grep -Eq "os error 52|Invalid exchange|reservation-conflict" "$STATE/m$victim.log"; then
+        die "s9-colocated-fence: the victim's log carries a DEVICE-rejection line — a co-located identity met a reservation conflict, which the shared-key shape makes impossible (the WERO adoption machinery is broken)"
+    fi
+    log "victim fail-stopped CLIENT-SIDE with zero device-rejection lines (the co-located fencing story: epoch/poison gates only — cargo pin tests/mw_colocated_fence_tests.rs)"
+
+    # Best-effort victim counter read (a fenced mount's .stats may be dead
+    # — dead-until-remount; the split law is pinned in cargo either way).
+    local vfence vepoch
+    vfence="$(sfield0 "$victim" data_dma_fence_refusals)"
+    vepoch="$(sfield0 "$victim" data_dma_epoch_refusals)"
+    [ "$vepoch" -le "$vfence" ] ||
+        die "s9-colocated-fence: victim epoch_refusals=$vepoch > fence_refusals=$vfence — the class split inverted"
+    echo "victim fence_refusals=$vfence epoch_refusals=$vepoch (0/0 = stats died with the fence — the log lines above are the primary gate)" >>"$rowdir/events.txt"
+
+    # ---- Blast radius + the oracle -------------------------------------------
+    sleep 2
+    for idx in $(member_idxs); do
+        [ "$idx" = "$victim" ] && continue
+        snap "$idx" 1 "$rowdir"
+        python3 - "$rowdir" "$idx" <<'PYBLAST' || die "s9-colocated-fence: blast radius violated on m$idx"
+import json, sys
+rowdir, i = sys.argv[1], sys.argv[2]
+def flat(d, out=None, pfx=""):
+    out = {} if out is None else out
+    for k, v in d.items():
+        if isinstance(v, dict): flat(v, out, pfx + k + ".")
+        else: out[pfx + k] = v
+    return out
+def load(ph):
+    root = json.load(open(f"{rowdir}/m{i}_p{ph}.json"))
+    return flat(root.get("metrics", root))
+d0, d1 = load(0), load(1)
+dd = lambda k: int(d1.get(k, 0) or 0) - int(d0.get(k, 0) or 0)
+bad = []
+if dd("data_dma_fence_refusals") != 0 or dd("data_dma_epoch_refusals") != 0:
+    bad.append("fence/epoch refusals moved on a non-victim")
+if dd("invariant_tripwires") != 0:
+    bad.append("invariant_tripwires moved")
+if bad:
+    print("\n".join(f"m{i}: {b}" for b in bad), file=sys.stderr)
+    sys.exit(1)
+PYBLAST
+    done
+    local out drift
+    out="$("$SQZ" fsck "$w_mnt" 2>&1)" || die "s9-colocated-fence: online fsck FAILED:
+$out"
+    echo "$out" >"$rowdir/fsck.out"
+    echo "$out" | grep -q "findings: 0" || die "s9-colocated-fence: fsck findings != 0:
+$out"
+    drift="$(stat_field 0 meta_kv_block_refs_drift)"
+    [ "$drift" = "0" ] || die "s9-colocated-fence: meta_kv_block_refs_drift=$drift (C8 oracle RED)"
+
+    # ---- Victim re-admission (by remount — the documented posture) -----------
+    "$MWFLEET" unmount "$victim" || true
+    "$MWFLEET" mount "$victim" ||
+        die "s9-colocated-fence: the fenced victim could not re-admit by remount"
+    [ "$(stat_field "$victim" mount_posture)" = "co-writer" ] ||
+        die "s9-colocated-fence: re-admitted victim posture != co-writer"
+    log "s9-colocated-fence GREEN (victim fenced client-side, device silent, blast radius = victim, fsck clean, re-admitted; rows in $rowdir)"
+}
+
 leg_cowriters_admission() {
     if [ "$HOST_SCOPED" != "1" ]; then
         local reason="multi-identity (co-writer) legs need host-scoped fabric subsystems: this kernel merges controllers by subsysnqn ignoring hostnqn (nvme_core.multipath=Y), so co-located identities share one head — rung 5b (the sqz-kernel fix, validated in the rung-6b qemu guest) unlocks them. Stock-kernel workaround: nvme_core.multipath=N (boot parameter)"
@@ -2362,8 +2885,11 @@ s7-device-fence) leg_s7_device_fence ;;
 s7-kill-matrix) leg_s7_kill_matrix ;;
 s8-serial-ab) leg_s8_serial_ab ;;
 s8-crucible) leg_s8_crucible ;;
+s9-fanout) leg_s9_fanout ;;
+s9-failover) leg_s9_failover ;;
+s9-colocated-fence) leg_s9_colocated_fence ;;
 cowriters-admission) leg_cowriters_admission ;;
 vm-hostscope-validate) leg_vm_hostscope_validate ;;
 vm-multi-identity) leg_vm_multi_identity ;;
-*) die "unknown leg '$LEG' (smoke|multipath-negative|s6-journal|s6-fence|s6-vm-fence|s7-device-fence|s7-kill-matrix|s8-serial-ab|s8-crucible|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
+*) die "unknown leg '$LEG' (smoke|multipath-negative|s6-journal|s6-fence|s6-vm-fence|s7-device-fence|s7-kill-matrix|s8-serial-ab|s8-crucible|s9-fanout|s9-failover|s9-colocated-fence|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
 esac

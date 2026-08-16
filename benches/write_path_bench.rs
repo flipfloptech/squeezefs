@@ -1204,6 +1204,7 @@ fn bench_ro_gate(c: &mut Criterion) {
                     .collect(),
                 authority: Some(AuthorityLeaseEvidence {
                     owner_id,
+                    owner_claim_id: String::new(),
                     endpoint: "127.0.0.1:7000".to_string(),
                     term: 9,
                     live: true,
@@ -1375,6 +1376,7 @@ fn bench_free_grace_gate(c: &mut Criterion) {
     }) {
         JoinOutcome::Granted(_) => {}
         JoinOutcome::Refused { reason, .. } => panic!("bench join refused: {reason}"),
+        JoinOutcome::UnknownLease { .. } => panic!("bench join met an unknown lease"),
     }
     owner.refresh_free_grace_bound();
     assert!(free_grace::armed(), "the armed arm needs the gate live");

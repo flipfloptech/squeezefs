@@ -90,6 +90,7 @@ fn owner_with(members: usize) -> (Arc<MembershipOwner>, Vec<(String, u64)>, Arc<
         match owner.join(req) {
             JoinOutcome::Granted(g) => ids.push((id, g.epoch)),
             JoinOutcome::Refused { reason, .. } => panic!("bench join refused: {reason}"),
+            JoinOutcome::UnknownLease { .. } => panic!("bench join met an unknown lease"),
         }
     }
     (owner, ids, ticks)

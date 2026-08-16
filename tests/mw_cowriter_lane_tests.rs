@@ -1734,3 +1734,111 @@ async fn a_current_width_record_is_never_pruned() {
         v.shutdown().await.expect("clean unmount");
     }
 }
+
+// ===========================================================================
+// 10. Rung-10 live findings (the s9-fanout leg's first run, 2026-08-16):
+//     the custody renewal cadence + the poisoned-mount acquire ladder
+// ===========================================================================
+
+/// **Rung-10 finding #1** (found live: the first true co-writer DATA
+/// fan-out died at ~KB/s): `spawn_custody_renewal` computed `now` from a
+/// FRESHLY MINTED monotonic clock — whose origin is its own creation
+/// instant, so `now ≡ 0` — instead of the client's own lease clock. `due`
+/// therefore equaled the ABSOLUTE deadline instead of the distance to it,
+/// the sleep doubled every cycle (1.3 s → 4 s → 9.3 s → 19.9 s at the
+/// 6 s-TTL fleet), and every co-writer's custody died at its 4th renewal
+/// — invisibly on storming venues (rung 9's crucible re-presents
+/// liveness continuously) and fatally on any mount with an IDLE window.
+///
+/// The law: **the renewal cadence is anchored on the client's OWN clock**
+/// — the same clock its lease words were anchored on. [`WriteCustodyClient::
+/// renewal_due_ms`] is the ONE computation (the loop consumes it), and this
+/// pin gives the client a manual clock at a LARGE origin so any
+/// fresh-clock regression (now ≈ 0) instantly inflates `due` past `T_self`
+/// and fails the assertion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_custody_renewal_cadence_is_anchored_on_the_clients_own_clock() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "renew-clock").await;
+    let auth = Authority::start(&vol, &[NODE_A]).await;
+
+    // The client's clock origin sits FAR from any fresh clock's 0.
+    let origin = 500_000u64;
+    let manual = Arc::new(AtomicU64::new(origin));
+    let client = data_grant::WriteCustodyClient::connect_with_clock(
+        &auth.endpoint,
+        SECRET,
+        NODE_A,
+        squeezefs::membership::LeaseClock::manual(Arc::clone(&manual)),
+        0xB0B0,
+    )
+    .await
+    .expect("the co-writer joins");
+
+    // T_self for the fixture's clocks (3000 − 2·200 − 400 = 2200 ms): the
+    // cadence must always land BEFORE it, from the client's own frame.
+    let due = client.renewal_due_ms();
+    assert!(
+        (1..=2200).contains(&due),
+        "renewal due {due}ms is not within (0, T_self=2200ms] — the cadence is reading a \
+         clock that is not the client's own (the fresh-clock class: now ≈ 0 makes due ≈ \
+         the absolute deadline, doubling every cycle until the lease dies)"
+    );
+
+    // And it stays anchored across a real renewal at an advanced clock.
+    manual.store(origin + due, Ordering::SeqCst);
+    client.renew_all().await.expect("the renewal lands");
+    let due2 = client.renewal_due_ms();
+    assert!(
+        (1..=2200).contains(&due2),
+        "post-renewal due {due2}ms left the client's clock domain"
+    );
+
+    auth.stop().await;
+}
+
+/// **Rung-10 finding #2** (same live run): after the self-fence POISONED
+/// the mount, every FUSE write still paid the FULL POSIX-5 lease-retry
+/// ladder — 35 acquire round-trips and 30 s of budget PER OP, forever —
+/// because the acquire path never consulted the poison latch and
+/// `LockFailed` is the ladder's retry class. A fenced holder is
+/// fail-STOPPED: it must refuse instantly, in the fence's own class
+/// (`WriterGuardFenced`, which every ladder returns immediately), not
+/// grind wedge-shaped 30 s refusals into the op watchdog.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_poisoned_mounts_custody_acquire_fails_fast_in_the_fence_class() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "poison-acquire").await;
+    let auth = Authority::start(&vol, &[NODE_A]).await;
+    let client = data_grant::WriteCustodyClient::connect(&auth.endpoint, SECRET, NODE_A)
+        .await
+        .expect("the co-writer joins");
+
+    data_custody::poison("rung-10 finding #2 pin: T_self fired");
+    let t0 = std::time::Instant::now();
+    let err = client
+        .acquire(
+            42,
+            None,
+            squeezefs::dlm::LockMode::Exclusive,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("a poisoned mount acquires nothing");
+    assert!(
+        matches!(err, squeezefs::error::SqueezefsError::WriterGuardFenced),
+        "the refusal class must be the fence's — the one class every retry ladder returns \
+         immediately (got {err})"
+    );
+    assert!(
+        t0.elapsed() < Duration::from_secs(1),
+        "the refusal must be INSTANT (a fenced holder is fail-stopped, not slow): took {:?}",
+        t0.elapsed()
+    );
+
+    auth.stop().await;
+}

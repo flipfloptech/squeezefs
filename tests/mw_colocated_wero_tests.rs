@@ -249,6 +249,7 @@ async fn co_location_is_decided_by_the_claim_boot_id() {
             authority: Some(AuthorityLeaseEvidence {
                 owner_id: "owner".into(),
                 endpoint: "127.0.0.1:7000".into(),
+                owner_claim_id: String::new(),
                 term: 7,
                 live: true,
                 member_epoch: 1,
@@ -271,6 +272,97 @@ async fn co_location_is_decided_by_the_claim_boot_id() {
         !cowriter::co_located_with_authority(&req("ffffffff-ffff-ffff-ffff-ffffffffffff")),
         "a foreign boot is a remote authority — the register path stays"
     );
+}
+
+/// Rung-9 **finding #3** (live): rung 4's plane-linkage check compared the
+/// membership rendezvous **incarnation uuid** against the claim set's
+/// **durable node ids** — the two identity planes rung-8 finding #3
+/// deliberately split — so every healthy fleet's first co-writer admission
+/// refused ("the durable claim set does not name the membership
+/// authority"). The rendezvous record now carries the owner's durable
+/// claim identity, and rung 4 links through it; a LEGACY record (empty
+/// claim id) keeps the uuid match, so the pre-split shape still links the
+/// pre-split way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rung_4_links_the_plane_through_the_owners_durable_claim_identity() {
+    let mk = |owner_claim_id: &str| -> AdmissionRequest {
+        let node_claim_id = "node_00000000aaaaaaaa.m00000099"; // the AUTHORITY's durable id
+        let mut set = ClaimSet::empty(7);
+        set.durable = true;
+        set.members.push(ClaimSetMember {
+            identity: MemberIdentity {
+                id: node_claim_id.into(),
+                role: MemberRole::Writer,
+                pid: 0,
+                boot: String::new(),
+                endpoint: None,
+                pr_key: AUTHORITY_KEY,
+            },
+            ts: 0,
+        });
+        set.members.push(ClaimSetMember {
+            identity: MemberIdentity {
+                id: "node_00000000bbbbbbbb.m00000001".into(),
+                role: MemberRole::Writer,
+                pid: 0,
+                boot: String::new(),
+                endpoint: None,
+                pr_key: 0xB0B0,
+            },
+            ts: 0,
+        });
+        AdmissionRequest {
+            multi_writer: true,
+            role_co_writer: true,
+            read_only: false,
+            node_id: "node_00000000bbbbbbbb.m00000001".into(),
+            custody_endpoint: Some("127.0.0.1:7100".into()),
+            volumes: vec![VolumeAdmissionEvidence {
+                path: PathBuf::from("/dev/fake-meta"),
+                features_incompat: cowriter::REQUIRED_INCOMPAT,
+                claim: Some(WriterClaim {
+                    id: "authority-claim".into(),
+                    ts: 0,
+                    pid: 4242,
+                    boot: "ffffffff-ffff-ffff-ffff-ffffffffffff".into(),
+                    term: 7,
+                }),
+                claim_set: Some(set.clone()),
+            }],
+            authority: Some(AuthorityLeaseEvidence {
+                // The RAM plane's identity: the INCARNATION uuid — never in
+                // the claim set (the live shape that refused).
+                owner_id: "74fd5dd0-3842-4d3a-ba9c-e88ae2e8c659".into(),
+                endpoint: "127.0.0.1:7000".into(),
+                owner_claim_id: owner_claim_id.into(),
+                term: 7,
+                live: true,
+                member_epoch: 1,
+            }),
+            registrant: Some(RegistrantEvidence {
+                pr_capable: true,
+                wero: true,
+                reservation_held: true,
+                registered: true,
+                key: 0xB0B0,
+                namespaces: 1,
+            }),
+        }
+    };
+
+    // The healthy fleet's shape: the rendezvous carries the durable claim
+    // identity — the ladder ADMITS.
+    cowriter::classify_admission(&mk("node_00000000aaaaaaaa.m00000099"))
+        .expect("the split identity planes link through owner_claim_id");
+
+    // A plane whose claim identity names an id the set does NOT enroll —
+    // and whose uuid isn't enrolled either — still refuses at rung 4 (an
+    // unrelated plane must never admit a node into a set it has no
+    // authority over).
+    let err = cowriter::classify_admission(&mk("node_00000000cccccccc"))
+        .expect_err("an unrelated plane still refuses")
+        .to_string();
+    assert!(err.contains("rung 4"), "the refusal names its rung: {err}");
 }
 
 // ===========================================================================

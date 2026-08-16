@@ -314,6 +314,7 @@ fn authority_evidence(owner_id: &str) -> AuthorityLeaseEvidence {
     AuthorityLeaseEvidence {
         owner_id: owner_id.to_string(),
         endpoint: "127.0.0.1:7000".to_string(),
+        owner_claim_id: String::new(),
         term: 7,
         live: true,
         member_epoch: 3,

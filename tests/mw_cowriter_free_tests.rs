@@ -317,6 +317,7 @@ fn full_request(paths: &[PathBuf], node_id: &str) -> AdmissionRequest {
         authority: Some(AuthorityLeaseEvidence {
             owner_id: AUTHORITY_ID.to_string(),
             endpoint: "127.0.0.1:7000".to_string(),
+            owner_claim_id: String::new(),
             term: 7,
             live: true,
             member_epoch: 3,

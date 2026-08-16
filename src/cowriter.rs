@@ -295,6 +295,10 @@ pub struct AuthorityLeaseEvidence {
     pub owner_id: String,
     /// Where that owner serves the membership plane.
     pub endpoint: String,
+    /// The owner's durable claim-set identity from its rendezvous record
+    /// (rung-9 finding #3 — empty on legacy records; see
+    /// [`crate::membership::OwnerRecord::owner_claim_id`]).
+    pub owner_claim_id: String,
     /// The durable writer era the owner armed in.
     pub term: u64,
     /// `true` ⇔ this mount JOINED and holds a lease — the liveness proof.
@@ -629,20 +633,31 @@ fn rung_4_live_authority(req: &AdmissionRequest) -> Result<&AuthorityLeaseEviden
             ),
         ));
     }
+    // Rung-9 finding #3: the claim set is keyed on DURABLE NODE ids
+    // (rung-8 finding #3's one-identity law) while the rendezvous `id` is
+    // the INCARNATION uuid — comparing the uuid against the set refused
+    // every healthy fleet's first co-writer. The rendezvous record now
+    // carries the owner's claim identity; legacy records (empty) keep the
+    // uuid match, so a pre-split plane still links the pre-split way.
     if !req
         .volumes
         .iter()
         .filter_map(|v| v.claim_set.as_ref())
-        .all(|set| set.members.iter().any(|m| m.identity.id == auth.owner_id))
+        .all(|set| {
+            set.members.iter().any(|m| {
+                m.identity.id == auth.owner_id
+                    || (!auth.owner_claim_id.is_empty() && m.identity.id == auth.owner_claim_id)
+            })
+        })
     {
         return Err(refuse(
             4,
             format!(
-                "the durable claim set does not name the membership authority '{}' we joined as \
-                 a member of this set. The plane that admits co-writers and the set that \
-                 enrolls them must be the same authority, or an unrelated plane could admit a \
-                 node into a set it has no authority over",
-                auth.owner_id
+                "the durable claim set does not name the membership authority '{}' (claim \
+                 identity '{}') we joined as a member of this set. The plane that admits \
+                 co-writers and the set that enrolls them must be the same authority, or an \
+                 unrelated plane could admit a node into a set it has no authority over",
+                auth.owner_id, auth.owner_claim_id
             ),
         ));
     }
@@ -956,6 +971,7 @@ pub async fn gather_admission(
         req.authority = Some(AuthorityLeaseEvidence {
             owner_id: rec.id.clone(),
             endpoint: rec.endpoint.clone(),
+            owner_claim_id: rec.owner_claim_id.clone(),
             term: rec.term,
             live: joined.is_some(),
             member_epoch: crate::membership::installed_member_epoch(),

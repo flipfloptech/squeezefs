@@ -531,6 +531,13 @@ pub struct OwnerRecord {
     /// stricter clock from the owner's actual parameter rather than from a
     /// local assumption.
     pub ttl_ms: u64,
+    /// The owner's **durable claim-set identity** (rung-9 finding #3):
+    /// the KD-MW-2 node id its claim-set entry is keyed on. The rendezvous
+    /// `id` is the INCARNATION uuid (the RAM plane), and rung-8 finding #3
+    /// deliberately split the two — this field is what lets a co-writer's
+    /// rung-4 cross-check link the plane it joined to the set that
+    /// enrolls it. Empty on pre-split records (legacy match by `id`).
+    pub owner_claim_id: String,
     /// Unix seconds of the arm (a change stamp — nothing refreshes it).
     pub ts: u64,
     /// Owner pid.
@@ -547,6 +554,7 @@ impl OwnerRecord {
             "id": self.id,
             "term": self.term,
             "endpoint": self.endpoint,
+            "owner_claim_id": self.owner_claim_id,
             "ttl_ms": self.ttl_ms,
             "ts": self.ts,
             "pid": self.pid,
@@ -564,6 +572,11 @@ impl OwnerRecord {
             id: v.get("id")?.as_str()?.to_string(),
             term: v.get("term").and_then(|x| x.as_u64()).unwrap_or(0),
             endpoint: v.get("endpoint")?.as_str()?.to_string(),
+            owner_claim_id: v
+                .get("owner_claim_id")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string(),
             ttl_ms: v
                 .get("ttl_ms")
                 .and_then(|x| x.as_u64())
@@ -2129,6 +2142,7 @@ async fn arm_owner(
         id: id.clone(),
         term,
         endpoint: endpoint.clone(),
+        owner_claim_id: claim_id.clone(),
         ttl_ms: clocks.t_owner.as_millis() as u64,
         ts: unix_now_secs(),
         pid: std::process::id(),

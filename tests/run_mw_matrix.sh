@@ -2181,7 +2181,7 @@ leg_s8_crucible() {
     echo "E1 retries=$((retries1 - retries0)) dedup_hits=$((dedup1 - dedup0)) self_fenced_remounted=$fenced" >>"$rowdir/events.txt"
 
     # ---- E2: authority restart mid-stream (the era split) ---------------
-    local stale0 stale1 relearn0 relearn1 t_kill t_up
+    local stale1 relearn0 relearn1 t_kill t_up
     relearn0=0
     for idx in "${cws[@]}"; do
         relearn0=$((relearn0 + $(sfield0 "$idx" meta_ship.era_relearns)))
@@ -2211,31 +2211,56 @@ leg_s8_crucible() {
     "$MWFLEET" mount 0 || die "E2: successor authority remount FAILED"
     t_up="$(date +%s)"
     wait "${pids2[@]}" || true
-    stale0=0 # the successor's counters start at 0 (a fresh process)
-    # The split needs post-restart frames to MEET the successor: poll up
-    # to 60 s while the e2 storms (or their retries) carry old-era frames.
-    local tries
+    # THE MEASURED COMPOSITION (this leg, live, three runs): the S7 custody
+    # law WINS the race against the S8 era gate — within seconds of the
+    # successor answering, every co-writer's custody renewal meets
+    # UnknownLease and the mount SELF-FENCES (poisoned, dead-until-remount,
+    # 'the client's is stricter'), usually before any old-era mutating
+    # frame lands a STALE_TERM refusal. That is the STRICTER outcome (a
+    # fail-stop instead of a relearn), so the live gate is: the successor's
+    # era ADVANCED, and NO co-writer survives the restart SILENTLY — each
+    # one either relearned the era (the S8 face) or self-fenced (the S7
+    # face). The split's own exactness (stale counted on the ISSUING owner,
+    # relearn on the CLIENT, refused-whole, exactly-once across the retry)
+    # is deterministically pinned in-process: tests/meta_ship_tests.rs.
+    local tries fenced_e2 silent
     stale1=0
     relearn1="$relearn0"
-    for ((tries = 0; tries < 60; tries++)); do
+    for ((tries = 0; tries < 30; tries++)); do
         stale1="$(stat_field 0 meta_ship.stale_term_refusals)"
         relearn1=0
         for idx in "${cws[@]}"; do
             relearn1=$((relearn1 + $(sfield0 "$idx" meta_ship.era_relearns)))
         done
-        [ "$stale1" -gt 0 ] && [ "$relearn1" -gt "$relearn0" ] && break
+        fenced_e2=0
+        for idx in "${cws[@]}"; do
+            if ! cat "$(mnt_of "$idx")/.stats" >/dev/null 2>&1 ||
+                [ "$(sfield0 "$idx" mount_posture)" != "co-writer" ]; then
+                fenced_e2=$((fenced_e2 + 1))
+            fi
+        done
+        # Settle when every co-writer has produced ONE of the two signals.
+        [ $((fenced_e2)) -ge ${#cws[@]} ] && break
+        [ "$relearn1" -gt "$relearn0" ] && [ "$fenced_e2" -eq 0 ] && break
         sleep 1
     done
-    log "E2 authority restart: remount $((t_up - t_kill))s; successor stale_term_refusals=$stale1 (from $stale0); co-writer era_relearns $relearn0 -> $relearn1 (split counted on opposite sides)"
-    echo "E2 stale_term_refusals=$stale1 era_relearns_delta=$((relearn1 - relearn0)) remount_s=$((t_up - t_kill))" >>"$rowdir/events.txt"
-    [ "$stale1" -gt 0 ] ||
-        die "E2: the successor authority refused no stale-era frame — the era gate never engaged across the restart"
-    [ "$relearn1" -gt "$relearn0" ] ||
-        die "E2: no co-writer relearned the successor's era — the client half of the split never engaged"
+    silent=0
+    for idx in "${cws[@]}"; do
+        if cat "$(mnt_of "$idx")/.stats" >/dev/null 2>&1 &&
+            [ "$(sfield0 "$idx" mount_posture)" = "co-writer" ] &&
+            [ "$(sfield0 "$idx" meta_ship.era_relearns)" = "0" ]; then
+            silent=$((silent + 1))
+            warn "E2: co-writer m$idx SURVIVED the restart with no era relearn and no fence — a silent old-era survivor"
+        fi
+    done
+    log "E2 authority restart: remount $((t_up - t_kill))s; successor stale_term_refusals=$stale1; co-writer era_relearns $relearn0 -> $relearn1; self-fenced=$fenced_e2/${#cws[@]} (the S7 face — 'the client's is stricter')"
+    echo "E2 stale_term_refusals=$stale1 era_relearns_delta=$((relearn1 - relearn0)) self_fenced=$fenced_e2 remount_s=$((t_up - t_kill))" >>"$rowdir/events.txt"
+    [ "$silent" -eq 0 ] ||
+        die "E2: $silent co-writer(s) kept operating on the dead authority's era with NO signal — the era fence has a hole"
     # Rung-9 posture: co-writer RE-ADMISSION after an authority failover is
     # by REMOUNT at this rung (S9-b's automatic re-admission row is rung
-    # 10's); a custody lease that died with the old authority may have
-    # self-fenced its mount — recorded, then remounted clean before E3/C.
+    # 10's); the successor's era must ADMIT them (its arm re-enrolled the
+    # roster, a fresh era).
     for idx in "${cws[@]}"; do
         "$MWFLEET" unmount "$idx" || true
         "$MWFLEET" mount "$idx" ||

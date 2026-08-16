@@ -1376,6 +1376,25 @@ if regs:
 print(regctl, rtype, rkey)'
 }
 
+# Wait until <ctrl> has scanned at least one namespace: reservation ioctls
+# on a controller whose namespaces have not attached yet answer ENOTTY
+# ('Inappropriate ioctl for device') — the run-3 rig lesson. Multipath
+# kernels expose per-path namespaces as nvmeXcYnZ under the controller.
+wait_ctrl_ns() { # nvmeX
+    local t d b
+    for t in $(seq 1 60); do
+        : "$t"
+        for d in "/sys/class/nvme/$1"/nvme*; do
+            b="$(basename "$d")"
+            if [[ "$b" =~ ^nvme[0-9]+(c[0-9]+)?n[0-9]+$ ]]; then
+                return 0
+            fi
+        done
+        sleep 0.25
+    done
+    die "controller $1 never scanned a namespace (reservation ioctls would answer ENOTTY)"
+}
+
 # Delete ONE controller by name (sysfs) — never `nvmeof disconnect <nqn>`,
 # which would drop the WRITER's association on the same NQN too.
 delete_ctrl() { # nvmeX
@@ -1403,8 +1422,25 @@ root = json.load(open(sys.argv[1]))
 print(flat(root.get("metrics", root)).get(sys.argv[2], ""))' "$1" "$2"
 }
 
+# Best-effort operator restore when the s7-device-fence leg dies mid-row:
+# a `die` inside the frozen window would otherwise strand the writer
+# SIGSTOPped (the run-2/run-3 rig lesson — a frozen daemon hangs every
+# later mountpoint/umount probe in D-state). Loud, never a verdict.
+S7_RESTORE_WRITER_PID=""
+S7_RESTORE_DD_PID=""
+s7_restore_on_fail() {
+    local rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    warn "s7-device-fence leg exiting rc=$rc — best-effort restore (SIGCONT writer, kill load)"
+    [ -n "$S7_RESTORE_DD_PID" ] && kill -9 "$S7_RESTORE_DD_PID" 2>/dev/null
+    [ -n "$S7_RESTORE_WRITER_PID" ] && kill -CONT "$S7_RESTORE_WRITER_PID" 2>/dev/null
+    return 0
+}
+
 leg_s7_device_fence() {
     require_mw
+    trap s7_restore_on_fail EXIT
+    S7_RESTORE_WRITER_PID="$(awk -F'\t' '$1==0 {print $7}' "$MEMBERS")"
     local rowdir victim_reader
     rowdir="$STATE/rows/s7fence-$(date +%s)"
     mkdir -p "$rowdir"
@@ -1446,6 +1482,7 @@ leg_s7_device_fence() {
     log "starting sustained write load on the writer mount"
     (exec dd if=/dev/zero of="$w_mnt/s7load.dat" bs=1M count=16384 conv=fsync status=none) &
     local dd_pid=$!
+    S7_RESTORE_DD_PID="$dd_pid"
     sleep 3 # let the pipeline fill (in-flight DMA to resume later)
     kill -0 "$dd_pid" 2>/dev/null || die "write load exited before the freeze (too small for this box?)"
 
@@ -1483,6 +1520,7 @@ leg_s7_device_fence() {
         done
         [ -n "$rctrl" ] || die "no recovery-identity controller for $nqn"
         rctrls+=("$rctrl")
+        wait_ctrl_ns "$rctrl"
         nvme resv-register "/dev/$rctrl" -n 1 --nrkey="$rkey" --cptpl=0 >/dev/null ||
             die "recovery register failed on $nqn"
         nvme resv-acquire "/dev/$rctrl" -n 1 --crkey="$rkey" --prkey="$zkey" \
@@ -1626,6 +1664,7 @@ PYGATE
             sleep 0.25
         done
         if [ -n "$rctrl" ]; then
+            wait_ctrl_ns "$rctrl"
             nvme resv-release "/dev/$rctrl" -n 1 --crkey="$rkey" --rtype=3 >/dev/null 2>&1 || true
             nvme resv-register "/dev/$rctrl" -n 1 --crkey="$rkey" --rrega=1 >/dev/null 2>&1 || true
             delete_ctrl "$rctrl"
@@ -1639,6 +1678,7 @@ PYGATE
         die "restored writer did not re-arm the WERO hold"
     local ttl_s=$((ttl / 1000))
     wait_stat_eq "$victim_reader" membership_mode member $((ttl_s + 6 * renew_est + 90)) "reader re-join of the restored owner"
+    trap - EXIT
     log "s7-device-fence leg GREEN (writer restored, reader re-joined; rows + device truth in $rowdir)"
 }
 

@@ -1487,3 +1487,47 @@ async fn an_authority_and_two_co_writers_allocate_and_the_authority_frees_their_
 
     auth.stop().await;
 }
+
+/// Rung-8 finding #4 (found live by the S7-b kill-matrix + the C6 oracle,
+/// 2026-08-16 — the second face of the claim-identity mismatch): the MW
+/// arm derived the lane map with the membership owner's INCARNATION uuid
+/// as `authority_id` while the claim-set entry it had just written carries
+/// the DURABLE node id — so the authority's OWN entry read as a foreign
+/// co-writer and every solo MW mount ran a W=2 partition against itself:
+/// a phantom lane + reservation frontier (observed live: `lane 0 of 2,
+/// resuming at block 1056` on a 1-member set), whose reserved-never-minted
+/// residue fsck C6 correctly reported as used-vs-tracked drift (~33
+/// blocks/volume/crash) — surviving clean remounts because the frontier
+/// records are durable.
+///
+/// The law: the lane derivation and the claim upsert use ONE identity
+/// (`membership::owner_claim_identity`), and a 1-writer set derives SOLO.
+/// The second arm documents the wrong shape so the mismatch class stays
+/// named: an authority id that does not match its own entry manufactures
+/// a 2-writer partition out of a 1-writer set.
+#[test]
+fn a_one_writer_set_derives_solo_under_the_one_claim_identity_law() {
+    let claim_id = squeezefs::membership::owner_claim_identity("uuid-incarnation-1");
+    let mut set = ClaimSet::empty(7);
+    set.durable = true;
+    set.members.push(member(&claim_id, MemberRole::Writer));
+
+    // The fixed caller's shape: authority_id == its own claim entry.
+    let solo =
+        LaneAssignment::derive(&claim_id, std::slice::from_ref(&set)).expect("a 1-writer set fits");
+    assert!(
+        solo.authority_partition().is_solo(),
+        "a 1-writer set MUST derive SOLO (installs nothing — the single-writer \
+         byte-identity law); a non-solo answer here is the phantom self-lane"
+    );
+
+    // The pre-fix caller's shape, kept as the named wrong form: a foreign
+    // authority id turns the authority's own entry into a co-writer.
+    let phantom = LaneAssignment::derive("uuid-incarnation-1", std::slice::from_ref(&set))
+        .expect("derive answers");
+    assert!(
+        !phantom.authority_partition().is_solo(),
+        "the mismatch shape manufactures W=2 out of a 1-writer set — this arm is \
+         what the caller must never do (it must pass owner_claim_identity)"
+    );
+}

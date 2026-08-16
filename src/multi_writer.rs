@@ -633,7 +633,13 @@ async fn derive_lane_assignment(
     meta: &Arc<RoutedMetaBackend>,
 ) -> Result<Arc<crate::alloc_lane_grant::LaneAssignment>> {
     let me = match crate::membership::installed_owner() {
-        Some(owner) => owner.id().to_string(),
+        // Rung-8 finding #4: the ONE-identity law — the derivation must use
+        // the same DURABLE claim identity `arm_owner` upserted (the owner's
+        // id is the INCARNATION uuid; passing it made the authority's own
+        // claim entry read as a foreign co-writer, so every solo MW mount
+        // ran a phantom W=2 partition against itself and paid a durable
+        // reservation frontier fsck C6 correctly reported as drift).
+        Some(owner) => crate::membership::owner_claim_identity(owner.id()),
         None => {
             log::warn!(
                 "multi-writer: no membership OWNER is installed on this mount, so its own \

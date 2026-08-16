@@ -1787,6 +1787,12 @@ $out"
         [ "$drift" = "0" ] || die "round $round: meta_kv_block_refs_drift=$drift (C8 oracle RED)"
         fence_ref="$(stat_field 0 data_dma_fence_refusals)"
         [ "$fence_ref" = "0" ] || die "round $round: successor data_dma_fence_refusals=$fence_ref (a fresh mount fenced itself)"
+        # Finding-#4 tripwire: a K=0 fleet's authority is SOLO — any
+        # engaged allocation partition here is a phantom lane (the
+        # claim-identity mismatch class, or accreted phantom writers).
+        local lanes
+        lanes="$(stat_field 0 alloc_lane_writers)"
+        [ "$lanes" = "0" ] || die "round $round: alloc_lane_writers=$lanes on a 0-co-writer fleet — a phantom allocation partition is engaged (rung-8 findings #3/#4 class)"
         trip="$(stat_field 0 invariant_tripwires)"
         [ "$trip" = "0" ] || die "round $round: invariant_tripwires=$trip on the successor"
         backstops="$(stat_field 0 mem_budget_hard_backstops)"

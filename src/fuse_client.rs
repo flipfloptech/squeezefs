@@ -13225,7 +13225,8 @@ impl SqueezefsFilesystem {
                 // declines into a path whose own durability boundaries
                 // follow; the idle sweeper / next fsync back the hint.
                 write_phase(ino, offset_hint, b, WP_OV_SETTLE_PRE);
-                self.settle_overlay_block_locked(ino, b, false).await?;
+                // Round 4: converged — never EIO a write on transient churn.
+                self.settle_overlay_block_converged(ino, b, false).await?;
                 return Ok(false);
             }
             None => {
@@ -13240,15 +13241,22 @@ impl SqueezefsFilesystem {
                 write_phase(ino, offset_hint, b, WP_OV_ALLOC);
                 let dest_offset = match allocator.allocate_block().await {
                     Ok(o) => o,
-                    // KD-B4-8: a StorageFull mint on the overwrite shape
-                    // DECLINES to accumulation — the parked-A population
-                    // is exactly the free supply the epoch's KD-1.7
-                    // ENOSPC early-close ladder recycles; a propagated
-                    // error would fail a write that ladder can serve.
-                    // (Fresh-shape mints keep the loud path: no parked
-                    // supply exists to recycle.)
+                    // KD-B4-8, extended to BOTH shapes (round 4,
+                    // 2026-08-15): a StorageFull mint DECLINES to
+                    // accumulation. The overwrite rationale is unchanged
+                    // (the parked-A population is the free supply the
+                    // epoch's KD-1.7 ENOSPC early-close ladder recycles).
+                    // The fresh shape's former loud path ("no parked
+                    // supply exists to recycle") converted TRANSIENT
+                    // space pressure — reclaim lag under settle/publish
+                    // churn — into a hard write EIO, while every other
+                    // write shape rides the never-lossy accumulation
+                    // ladder under the same pressure (park → staging →
+                    // R5; genuine exhaustion still surfaces loud at the
+                    // durability boundaries that own it). Declining IS
+                    // the parked supply.
                     Err(SqueezefsError::Io(ref e))
-                        if overwrite_shape && e.kind() == std::io::ErrorKind::StorageFull =>
+                        if e.kind() == std::io::ErrorKind::StorageFull =>
                     {
                         METRICS
                             .overlay_enospc_declines
@@ -13382,7 +13390,8 @@ impl SqueezefsFilesystem {
                 write_phase(ino, offset_hint, b, WP_OV_SETTLE_RETRY);
                 // DELIBERATE close-hint dropper (§5.4 venue law) — the
                 // accumulation fallback's own boundaries follow.
-                self.settle_overlay_block_locked(ino, b, false).await?;
+                // Round 4: converged — never EIO a write on transient churn.
+                self.settle_overlay_block_converged(ino, b, false).await?;
                 return Ok(false);
             }
         };
@@ -13879,6 +13888,43 @@ impl SqueezefsFilesystem {
     /// posture). The hint is latency/economy only, never correctness:
     /// any venue may drop it — a fed epoch stays registered, and the
     /// 5 s idle sweeper + the next fsync are the backstops.
+    /// [`Self::settle_overlay_block_locked`] with the CONVERGENCE the
+    /// round-4 falsification mandated (2026-08-15: a transient settle
+    /// failure propagated as EIO to a WRITE through the steal/screen
+    /// arms — the storm's writer died at incarnation 10 and the run sat
+    /// out its deadline): transient outcomes resolve by BOUNDED RETRY
+    /// within the arm — the rebind-starvation law verbatim ("an arm
+    /// legal writer churn cannot beat" owes its caller convergence, not
+    /// an errno) — and only a failure that survives the budget stays
+    /// loud (a genuinely-broken device/binding). The destroyed-ino class
+    /// never reaches here (the settle's own verified-NotFound orphan
+    /// disposition below resolves it as `Ok(false)`). Callers hold the
+    /// block guard; the backoff is bounded (≤ 15 ms total) so the hold
+    /// stays short.
+    pub(crate) async fn settle_overlay_block_converged(
+        &self,
+        ino: u64,
+        b: u32,
+        barrier: bool,
+    ) -> Result<bool, SqueezefsError> {
+        const SETTLE_RETRIES: u32 = 4;
+        let mut last: Option<SqueezefsError> = None;
+        for attempt in 0..SETTLE_RETRIES {
+            if attempt > 0 {
+                squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(
+                    1u64 << (attempt - 1).min(3),
+                ))
+                .await;
+            }
+            match self.settle_overlay_block_locked(ino, b, barrier).await {
+                Ok(hint) => return Ok(hint),
+                Err(e @ SqueezefsError::WriterGuardFenced) => return Err(e),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.expect("loop ran"))
+    }
+
     pub(crate) async fn settle_overlay_block_locked(
         &self,
         ino: u64,
@@ -14120,6 +14166,40 @@ impl SqueezefsFilesystem {
                     self.teardown_overlay_block_locked(ino, b, &rec).await;
                     return Err(SqueezefsError::WriterGuardFenced);
                 }
+                // NotFound face of FIND-M11-A, applied to overlay custody
+                // (round 4, 2026-08-15): the merge's layout save fails
+                // `Io(NotFound)` when the ino was unlinked + reclaimed
+                // after this record installed (the recopy storm's
+                // unlink-per-incarnation shape). The record can never
+                // settle (v3 inos are monotonic — the ino never comes
+                // back), so propagating stranded it FROZEN forever: its
+                // dest allocation pinned, `overlay_open` never falling,
+                // and every later settle attempt an errno — the class
+                // that EIO'd reads and (through the steal arms) writes.
+                // VERIFY the inode is truly gone with an authoritative
+                // attr probe — a NotFound from a flaky read must keep
+                // the loud path — then apply the recovery contract LIVE
+                // ("missing inode meta discards orphan active blocks"):
+                // supersede + teardown, whose Superseded mint disposition
+                // frees the never-published dest. Counted on the same
+                // family as the flush unit's discard ack.
+                Err(e) if is_inode_not_found(&e) => {
+                    let truly_gone = match self.meta_backend.as_ref() {
+                        Some(backend) => {
+                            matches!(backend.getattr(ino).await, Err(ref ge) if is_inode_not_found(ge))
+                        }
+                        None => false,
+                    };
+                    if truly_gone {
+                        METRICS
+                            .writeback_orphan_discards
+                            .fetch_add(1, Ordering::Relaxed);
+                        rec.core.supersede();
+                        self.teardown_overlay_block_locked(ino, b, &rec).await;
+                        return Ok(false);
+                    }
+                    return Err(e);
+                }
                 // Any other failure: the record stays FROZEN — the acked
                 // bytes live ONLY at the unpublished destination, so it
                 // is never freed; the next durability boundary retries.
@@ -14212,7 +14292,10 @@ impl SqueezefsFilesystem {
             return Ok(());
         }
         let (block_guard, _w) = block_lock_acquire_timed(ino, b, BlockLockSite::OverlayPrune).await;
-        let res = self.settle_overlay_block_locked(ino, b, barrier).await;
+        // Round 4: converged — transient settle failures resolve inside
+        // the arm (drain callers are reads, detached publishers and
+        // fsync legs; none may see an errno for legal churn).
+        let res = self.settle_overlay_block_converged(ino, b, barrier).await;
         drop(block_guard);
         match res {
             Ok(true) => {
@@ -14270,13 +14353,14 @@ impl SqueezefsFilesystem {
                         self.teardown_overlay_block_locked(ino, b, &rec).await;
                     } else {
                         // Frozen (a publish is owed): drain instead —
-                        // never strand a frozen record.
-                        self.settle_overlay_block_locked(ino, b, barrier).await?;
+                        // never strand a frozen record. (Round 4:
+                        // converged.)
+                        self.settle_overlay_block_converged(ino, b, barrier).await?;
                     }
                 }
                 Ok(())
             } else {
-                self.settle_overlay_block_locked(ino, b, barrier)
+                self.settle_overlay_block_converged(ino, b, barrier)
                     .await
                     .map(|_close_owed| ())
             };
@@ -14849,7 +14933,13 @@ impl SqueezefsFilesystem {
                 // may never coexist on one block.
                 if crate::device_overlay::any_open_fast() {
                     write_phase(ino, offset, b as u32, WP_OVERLAY_SETTLE);
-                    match self.settle_overlay_block_locked(ino, b as u32, false).await {
+                    // Round 4: the CONVERGED form — a transient settle
+                    // failure must not EIO this write (the storm's dead-
+                    // writer falsification); persistent failure stays loud.
+                    match self
+                        .settle_overlay_block_converged(ino, b as u32, false)
+                        .await
+                    {
                         Err(e) => {
                             std::mem::drop(block_guard);
                             return Err(e);
@@ -17098,9 +17188,34 @@ impl SqueezefsFilesystem {
             // 1. Settle any record: its acked bytes publish to the map,
             // and the held guard excludes a re-install for the rest of
             // this block's serve.
-            if self.device_overlays.get(ino, b).is_some() {
-                close_owed |= self.settle_overlay_block_locked(ino, b, false).await?;
-                METRICS.overlay_read_drains.fetch_add(1, Ordering::Relaxed);
+            // Round 4 writer-priority (within the lock-order table, no new
+            // fairness machinery): an OPEN record is the WRITER'S LIVE
+            // streaming vehicle — settling it here forced the writer to
+            // re-install a fresh record (a fresh dest mint) on its very
+            // next chunk, and reader-escalation pressure turned that into
+            // a settle/re-install feedback storm (the round-3 rate jump
+            // and the dead-writer falsification). Under the held guard an
+            // Open record is COMPOSABLE race-free instead: no store can
+            // claim (stores hold this guard), coverage only grows at CQE
+            // behind claims we await, and no transition can retire it
+            // (every settle/teardown holds this guard; the §5.7 guard-less
+            // discarding belt means data legally discarded — serving the
+            // pre-discard bytes is the racing-read allowance). Its covered
+            // pages are read below AFTER the base, in the one-authority
+            // order. Only FROZEN/terminal records — a publish already
+            // owed, the writer already moved on — settle here (converged:
+            // transient failures resolve in the arm, the destroyed-ino
+            // class discards inside the settle, persistent failures stay
+            // loud).
+            let mut open_rec: Option<std::sync::Arc<crate::device_overlay::DeviceOverlayRecord>> =
+                None;
+            if let Some(rec) = self.device_overlays.get(ino, b) {
+                if rec.core.state() == crate::overlay_core::OverlayState::Open {
+                    open_rec = Some(rec);
+                } else {
+                    close_owed |= self.settle_overlay_block_converged(ino, b, false).await?;
+                    METRICS.overlay_read_drains.fetch_add(1, Ordering::Relaxed);
+                }
             }
             // 2. Durable base under (3.5) — bounded Lost retries, the
             // settled arm's own posture (a Lost already fired the
@@ -17154,6 +17269,52 @@ impl SqueezefsFilesystem {
                 let e = rel_hi.min(base.len());
                 if s < e {
                     out[out_lo..out_lo + (e - s)].copy_from_slice(&base[s..e]);
+                }
+            }
+            // The OPEN record's covered pages (round 4 — writer priority):
+            // strictly newer than base/sibling (the one-authority screen
+            // settles any record before accumulation custody can exist,
+            // and an overwrite record's old binding IS the base the gaps
+            // owe — already composed above). Claims are awaited, so
+            // ACK-early bytes are at the dest before we read it; under
+            // the held guard coverage cannot regress and the record
+            // cannot retire.
+            if let Some(rec) = &open_rec {
+                let blk = rec.core.len() as usize;
+                let c_lo = rel_lo.min(blk);
+                let c_hi = rel_hi.min(blk);
+                if c_lo < c_hi {
+                    let first_page = c_lo / crate::overlay_core::OVERLAY_PAGE;
+                    let pages = c_hi.div_ceil(crate::overlay_core::OVERLAY_PAGE) - first_page;
+                    self.await_overlay_pages(rec, first_page, pages).await;
+                    for (ps, pc) in rec.core.covered_runs(first_page, pages) {
+                        let run_lo = (ps * crate::overlay_core::OVERLAY_PAGE).max(c_lo);
+                        let run_hi = ((ps + pc) * crate::overlay_core::OVERLAY_PAGE)
+                            .min(blk)
+                            .min(c_hi);
+                        if run_lo >= run_hi {
+                            continue;
+                        }
+                        let n = run_hi - run_lo;
+                        match rec
+                            .device
+                            .read_block(rec.dest_offset + run_lo as u64, n)
+                            .await
+                        {
+                            Ok(got) if got.len() >= n => {
+                                let o = out_lo + (run_lo - rel_lo);
+                                out[o..o + n].copy_from_slice(&got[..n]);
+                            }
+                            Ok(got) => {
+                                return Err(SqueezefsError::Io(std::io::Error::other(format!(
+                                    "escalated overlay compose short read \
+                                         ({} < {n})",
+                                    got.len()
+                                ))));
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
                 }
             }
             // RAM overlay coverage runs — the newest custody (runs come

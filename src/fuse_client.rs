@@ -919,6 +919,39 @@ pub fn set_test_checkout_stall_ms(ms: u64) {
     test_checkout_stall_cell().store(ms, Ordering::Relaxed);
 }
 
+/// TEST SEAM (read-window stall): park every READ handler strictly AFTER
+/// its entry device-overlay compose/drain and BEFORE its size snapshot —
+/// the generic/795 recopy-flake window (2026-08-15 conviction): a B4
+/// device-overlay INSTALL + store + ACK + size publish landing here
+/// leaves the acked bytes at an unpublished device dest that the pre/post
+/// parked-run captures (RAM probes) and the custody fingerprint (map keys
+/// + custody epochs — an OPEN record bumps neither) cannot see. Load
+/// selects that schedule; this seam selects it deterministically
+/// (tests/write_visibility_tests.rs). Setter-only (in-process suites),
+/// armed = park until cleared; one relaxed load when disarmed; never set
+/// in production.
+fn test_read_window_stall_cell() -> &'static std::sync::atomic::AtomicU64 {
+    static CELL: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::atomic::AtomicU64::new(0))
+}
+
+/// Arm/disarm the read-window stall seam (tests only).
+pub fn set_test_read_window_stall(armed: bool) {
+    test_read_window_stall_cell().store(u64::from(armed), Ordering::Relaxed);
+}
+
+fn test_read_window_stall_entries_cell() -> &'static std::sync::atomic::AtomicU64 {
+    static CELL: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::atomic::AtomicU64::new(0))
+}
+
+/// Read the read-window stall entry count (tests only — the seam's
+/// sequencing observable: the driver polls it to know a reader is parked
+/// INSIDE the window before landing the racing write).
+pub fn test_read_window_stall_entries() -> u64 {
+    test_read_window_stall_entries_cell().load(Ordering::Relaxed)
+}
+
 /// TEST SEAM (`SQUEEZEFS_TEST_ATTR_PUBLISH_STALL_MS`, the KD-5/KD-6
 /// attr-merge race pin — design-write-inode-convoy §4.4 rows 3/13/22):
 /// stall the write handler strictly AFTER its data phase completed
@@ -19946,6 +19979,22 @@ impl Filesystem for SqueezefsFilesystem {
                     )
                     .await
                     .map_err(map_squeezefs_err)?;
+                }
+            }
+        }
+        // TEST SEAM: park this read strictly AFTER its entry overlay
+        // compose/drain and BEFORE its size snapshot — see
+        // `set_test_read_window_stall`. Bounded park (60 s) so a wedged
+        // driver fails a suite loudly instead of hanging it.
+        {
+            let cell = test_read_window_stall_cell();
+            if cell.load(Ordering::Relaxed) != 0 {
+                test_read_window_stall_entries_cell().fetch_add(1, Ordering::Relaxed);
+                let t0 = std::time::Instant::now();
+                while cell.load(Ordering::Relaxed) != 0
+                    && t0.elapsed() < std::time::Duration::from_secs(60)
+                {
+                    squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(2)).await;
                 }
             }
         }

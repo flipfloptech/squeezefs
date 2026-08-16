@@ -1376,3 +1376,108 @@ async fn overlay_compose_read_clamps_to_eof() {
          above ran against the accumulation path only"
     );
 }
+
+/// generic/795 recopy storm — the SECOND deterministic face (conviction
+/// 2026-08-15, tape-attributed at dev tip 9d5ed2d4; survives the two
+/// 2026-08-14 `stress_recycled_keys_v3` fixes): the B4 device overlay is
+/// a FOURTH custody station — a block's acked, size-published bytes can
+/// live at an overlay record's unpublished device dest — and the
+/// multi-block read protocol could not see it. An overlay INSTALL +
+/// store + ACK landing after the reader's entry drain (and before its
+/// size snapshot) is invisible to all three loop defenses: the pre/post
+/// parked-run captures probe RAM overlays only, and the custody
+/// fingerprint hashes map keys + custody epochs, neither of which an
+/// OPEN overlay record moves. The base read then serves the durable
+/// world — the old binding for an overwrite record (correct to the old
+/// image's length, ZEROS beyond: the storm's exact damage shape) or
+/// hole-zeros for a fresh record — inside a reply whose length the
+/// already-published size justified. Both storm labels ("ACKED bytes
+/// lost from visibility", "SIZE LED DATA") are this one hole. The
+/// read-window stall seam selects the schedule deterministically; load
+/// only ever selected it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overlay_installed_inside_read_window_never_hides_acked_bytes() {
+    use std::sync::atomic::Ordering as AtomOrd;
+    let h = Arc::new(make().await);
+    // Pin the overlay ON explicitly (its integration-binary default):
+    // this contract exists to hold ON THE OVERLAY PATH.
+    squeezefs::device_overlay::set_device_overlay_for_tests(true, true);
+
+    let ino = create(&h, "ovl_window").await;
+    let pattern: Vec<u8> = (0..3 * BS as usize)
+        .map(|i| (i % 251) as u8 ^ 0x5A)
+        .collect();
+    // Blocks 0-1 land and publish durably (fsync drains every overlay and
+    // parked buffer): block 2 starts FRESH in every custody station.
+    write_at(&h, ino, 0, &pattern[..2 * BS as usize]).await;
+    fsync(&h, ino).await;
+
+    // Reader: a multi-block window spanning blocks 1-2, parked INSIDE the
+    // read prelude — strictly after its entry overlay drain, before its
+    // size snapshot. This is the storm's window, held open.
+    let entries0 = squeezefs::fuse_client::test_read_window_stall_entries();
+    squeezefs::fuse_client::set_test_read_window_stall(true);
+    let reader = {
+        let h = h.clone();
+        tokio::spawn(async move { h.fs.read(h.req, ino, 0, 2 * BS - 8192, 16384, 0).await })
+    };
+    let t0 = std::time::Instant::now();
+    while squeezefs::fuse_client::test_read_window_stall_entries() == entries0 {
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(30),
+            "reader never reached the stall window"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+
+    // Writer: the first write to block 2 — the fresh-shape device-overlay
+    // store (striped, 4 KiB-aligned, single-block, no custody anywhere).
+    // Its ACK publishes size = 2*BS + 8192 while the reader sits inside
+    // its window and the bytes sit at the overlay's unpublished dest.
+    let installs0 = squeezefs::fuse_client::METRICS
+        .overlay_installs
+        .load(AtomOrd::Relaxed);
+    write_at(
+        &h,
+        ino,
+        2 * BS,
+        &pattern[2 * BS as usize..2 * BS as usize + 8192],
+    )
+    .await;
+    assert!(
+        squeezefs::fuse_client::METRICS
+            .overlay_installs
+            .load(AtomOrd::Relaxed)
+            > installs0,
+        "the racing write never engaged the device overlay — this pins \
+         nothing (engagement law)"
+    );
+
+    // Release the reader; it resumes at its size snapshot (139264 — the
+    // ACK's postlude published it) and composes its reply.
+    squeezefs::fuse_client::set_test_read_window_stall(false);
+    let reply = reader.await.unwrap().expect("read failed");
+    let got = reply.data.as_ref();
+
+    // The reply spans [2*BS-8192, 2*BS+8192): the block-1 tail and the
+    // block-2 head. The head's bytes were ACKED and size-published
+    // strictly before the serve — zeros there are the storm's failure
+    // verbatim ("ACKED bytes lost from visibility", generic/795).
+    assert_eq!(
+        got.len(),
+        16384,
+        "size 2*BS+8192 was published before the serve; the reply must \
+         cover the full window"
+    );
+    let base = (2 * BS - 8192) as usize;
+    for (i, &b) in got.iter().enumerate() {
+        assert_eq!(
+            b,
+            pattern[base + i],
+            "byte at file offset {} is wrong (block-2 head = the overlay's \
+             acked bytes; zeros here = the open overlay record was \
+             invisible to the read window — generic/795)",
+            base + i
+        );
+    }
+}

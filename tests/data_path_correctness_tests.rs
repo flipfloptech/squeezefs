@@ -32,11 +32,7 @@ struct H {
 /// `single_writer` arm exists for the ONE test that pins the bare-offset
 /// key-REUSE machinery, which bit 13 (incarnation keys) deliberately
 /// retires on the stamped class.
-async fn open_v3_meta(
-    path: &std::path::Path,
-    len: u64,
-    single_writer: bool,
-) -> Arc<KvMetaBackend> {
+async fn open_v3_meta(path: &std::path::Path, len: u64, single_writer: bool) -> Arc<KvMetaBackend> {
     let opts = squeezefs::meta_backend::kv::builder::FormatV3Options {
         node_size: DEFAULT_NODE_SIZE,
         journal_len_override: None,

@@ -3507,7 +3507,9 @@ fn unix_now_secs() -> u64 {
 
 /// The same-host dead-pid proof's pid half: `kill(pid, 0) == ESRCH`.
 /// `EPERM` (alive, foreign uid) and success (alive, ours) are NOT proof.
-fn pid_provably_dead(pid: u32) -> bool {
+/// `pub(crate)`: the claim-set prune (rung-8 finding #3) runs the SAME
+/// proof — one dead-holder law, never a second spelling.
+pub(crate) fn pid_provably_dead(pid: u32) -> bool {
     if pid == 0 || pid > i32::MAX as u32 {
         return false;
     }

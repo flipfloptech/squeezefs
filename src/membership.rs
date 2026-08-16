@@ -428,7 +428,41 @@ pub async fn upsert_writer_member(
         _ => ClaimSet::empty(term),
     };
     set.term = set.term.max(term);
-    set.members.retain(|m| m.identity.id != identity.id);
+    // Rung-8 finding #3: PRUNE same-host provably-dead writer entries —
+    // the D0 dead-holder proof (boot-id match scopes the pid to this
+    // boot; `kill(pid,0) == ESRCH` proves death), applied to the roster a
+    // crashed incarnation could never withdraw itself from. Without this,
+    // every kill-9'd authority accreted a phantom durable writer: the
+    // allocation-partition width marched 1 → 2 → 4 across crashes, lanes
+    // stayed reserved for dead uuids, and fsck C6 read the raised
+    // reservation frontier as capacity drift on a HEALTHY volume. Bounds:
+    // a foreign-boot entry is never prunable blind (liveness unknowable
+    // from here — failover grace + operator verbs own that), and a
+    // pid-less roster enrollment (`pid == 0`, empty boot) is deliberately
+    // process-less and never pruned.
+    let my_boot = crate::meta_backend::kv::backend::read_boot_id();
+    set.members.retain(|m| {
+        if m.identity.id == identity.id {
+            return false; // replaced by the push below (existing law)
+        }
+        if m.identity.role != MemberRole::Writer
+            || m.identity.pid == 0
+            || m.identity.boot.is_empty()
+            || m.identity.boot != my_boot
+            || !crate::meta_backend::kv::backend::pid_provably_dead(m.identity.pid)
+        {
+            return true;
+        }
+        log::warn!(
+            "claim set on {}: pruning provably-dead writer entry '{}' (same boot id, pid {} \
+             ESRCH — the D0 dead-holder proof): a crashed incarnation's residue must not \
+             widen the allocation partition (rung-8 finding #3)",
+            be.device_path().display(),
+            m.identity.id,
+            m.identity.pid
+        );
+        false
+    });
     set.members.push(ClaimSetMember {
         identity: identity.clone(),
         ts: unix_now_secs(),
@@ -2069,6 +2103,14 @@ async fn arm_owner(
         }
     }
     let id = uuid::Uuid::new_v4().to_string();
+    // Rung-8 finding #3: the CLAIM-SET identity is the DURABLE node id
+    // (KD-MW-2 — the identity co-writers already enroll under), never the
+    // per-mount uuid: a successor of the same node then REPLACES its dead
+    // predecessor's entry by id instead of accreting one phantom writer
+    // per crash. The uuid stays the INCARNATION id (rendezvous record,
+    // census, lease authority — the RAM plane, where per-incarnation
+    // identity is the point).
+    let claim_id = owner_claim_identity(&id);
     let owner = MembershipOwner::arm(&id, term, prior_term, clocks.clone(), clock.clone())?;
     let plane = crate::membership_wire::MembershipPlane::start(
         crate::membership_wire::MembershipPlaneConfig::for_mount(
@@ -2098,7 +2140,7 @@ async fn arm_owner(
     // device and silently downgrade the guarantee class). A no-op on every
     // volume without incompat bit 14, which is all of them today (D9).
     let identity = MemberIdentity {
-        id: id.clone(),
+        id: claim_id.clone(),
         role: MemberRole::Writer,
         pid: std::process::id(),
         boot: rec.boot.clone(),
@@ -2110,7 +2152,11 @@ async fn arm_owner(
         publish_owner_record(be, &rec).await?;
         if let Some(set) = ClaimSet::load(be).await {
             for m in set.writers() {
-                if m.identity.id != id {
+                // Compare against the DURABLE claim identity: our own
+                // predecessor's entry is US (replace-by-id), never a
+                // grace-expected peer (rung-8 finding #3's phantom grace
+                // windows over the authority's own dead incarnations).
+                if m.identity.id != claim_id {
                     expected.push(m.identity.id.clone());
                 }
             }
@@ -2186,11 +2232,37 @@ async fn arm_owner(
     Ok(Some(MembershipArm {
         plane: Some(plane),
         volumes,
-        owner_id: Some(id),
+        // The DURABLE claim identity — what the disarm withdraws (the
+        // record was upserted under it; rung-8 finding #3).
+        owner_id: Some(claim_id),
         member_leave: None,
         stop,
         mode: "owner",
     }))
+}
+
+/// The authority's **durable claim-set identity** (rung-8 finding #3): the
+/// KD-MW-2 node id (`node_{16 hex}[.m{8 hex}]` — the same identity
+/// co-writers enroll under), so a successor of the same node REPLACES its
+/// dead predecessor's claim-set entry instead of accreting one phantom
+/// writer per crash (each of which widened the allocation partition and
+/// tripped the fsck C6 oracle on a healthy volume). A box with no
+/// resolvable stable node identity falls back to the per-mount
+/// `incarnation` id LOUDLY — accretion returns there (bounded by the
+/// same-host dead-pid prune), but guessing a node token would misclassify
+/// staged custody, which is worse.
+pub fn owner_claim_identity(incarnation: &str) -> String {
+    match crate::cowriter::node_member_id() {
+        Ok(nid) => nid,
+        Err(e) => {
+            log::warn!(
+                "membership: no stable node identity for the claim-set entry ({e}) — falling \
+                 back to the incarnation uuid; crashed incarnations on this host will rely on \
+                 the dead-pid prune alone (rung-8 finding #3)"
+            );
+            incarnation.to_string()
+        }
+    }
 }
 
 async fn arm_member(

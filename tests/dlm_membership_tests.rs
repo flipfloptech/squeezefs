@@ -1577,6 +1577,155 @@ async fn a_frozen_member_whose_lease_died_fences_and_purges_before_rejoining() {
 /// The failover pin the fix must NOT break: a reclaim admitted by a
 /// successor's GRACE WINDOW is continuity — the member re-asserts the
 /// lease it already held and keeps its caches; forcing every member to
+/// Rung-8 finding #3 (found live by the S7-b kill-matrix row, 2026-08-16):
+/// **every crashed authority incarnation accreted a phantom durable
+/// claim-set writer.** `arm_owner` keyed the §6.2 item-7 claim-set entry
+/// on its per-mount random uuid; kill -9 never withdraws; the successor of
+/// the SAME node re-upserted under a fresh uuid and `upsert_writer_member`
+/// retained the dead predecessor. Observed live: member count 1 → 2 → 3
+/// across two kill-9s, the allocation-partition width marching W=1 → 2 →
+/// 4 with lanes reserved for dead uuids, phantom grace windows opened over
+/// the authority's own dead predecessors, and the raised reservation
+/// frontier read by fsck C6 as capacity-census drift — `fsck_findings != 0`
+/// on a healthy volume, and unbounded width decay under crash loops.
+///
+/// Two laws pinned:
+/// 1. the authority's claim-set identity is the DURABLE KD-MW-2 node id
+///    (`owner_claim_identity`), so a successor of the same node REPLACES
+///    its predecessor's entry by id — the same identity co-writers already
+///    enroll under;
+/// 2. the upsert PRUNES same-host provably-dead writer entries (boot-id
+///    match + `kill(pid,0) == ESRCH` — the D0 dead-holder proof), which
+///    heals pre-fix accretion in the field; foreign-boot entries and
+///    pid-less roster enrollments are NEVER pruned (liveness unknowable /
+///    deliberately process-less).
+#[tokio::test]
+async fn a_successor_authoritys_claim_entry_replaces_its_dead_predecessor_never_accretes() {
+    let _serial = serial();
+    let meta = formatted_volume().await;
+    sb::set_claim_set_bit(meta.path())
+        .await
+        .expect("stamp bit 14");
+    let be = KvMetaBackend::open(meta.path()).await.expect("open volume");
+    let my_boot = squeezefs::meta_backend::kv::backend::read_boot_id();
+
+    // A provably-dead same-host pid: spawn-and-reap a child.
+    let dead_pid = {
+        let mut child = std::process::Command::new("true").spawn().expect("spawn");
+        let pid = child.id();
+        child.wait().expect("reap");
+        pid
+    };
+
+    // The dead predecessor incarnation (the pre-fix uuid-keyed shape),
+    // a FOREIGN-host entry (dead pid but a different boot — liveness
+    // unknowable, never prunable), and a pid-less roster enrollment
+    // (deliberately process-less, never prunable).
+    let predecessor = squeezefs::membership::MemberIdentity {
+        id: "uuid-dead-incarnation".to_string(),
+        role: MemberRole::Writer,
+        pid: dead_pid,
+        boot: my_boot.clone(),
+        endpoint: None,
+        pr_key: 0x0dead,
+    };
+    let foreign = squeezefs::membership::MemberIdentity {
+        id: "node_00000000000000ff".to_string(),
+        role: MemberRole::Writer,
+        pid: dead_pid,
+        boot: "some-other-boot".to_string(),
+        endpoint: None,
+        pr_key: 0x0f0e,
+    };
+    let roster = squeezefs::membership::MemberIdentity {
+        id: "node_00000000000000aa.m00000001".to_string(),
+        role: MemberRole::Writer,
+        pid: 0,
+        boot: String::new(),
+        endpoint: None,
+        pr_key: 0,
+    };
+    assert!(membership::upsert_writer_member(&be, &predecessor, 3)
+        .await
+        .expect("seed predecessor"));
+    assert!(membership::upsert_writer_member(&be, &foreign, 3)
+        .await
+        .expect("seed foreign"));
+    assert!(membership::upsert_writer_member(&be, &roster, 3)
+        .await
+        .expect("seed roster"));
+
+    // The SUCCESSOR arms (same node, new incarnation): its upsert must
+    // prune the same-host provably-dead predecessor and keep the other two.
+    let successor = squeezefs::membership::MemberIdentity {
+        id: "node_0000000000000001".to_string(),
+        role: MemberRole::Writer,
+        pid: std::process::id(),
+        boot: my_boot.clone(),
+        endpoint: None,
+        pr_key: 0x51,
+    };
+    assert!(membership::upsert_writer_member(&be, &successor, 4)
+        .await
+        .expect("successor upsert"));
+    let set = ClaimSet::load(&be).await.expect("durable set");
+    let ids: Vec<&str> = set.members.iter().map(|m| m.identity.id.as_str()).collect();
+    assert!(
+        !ids.contains(&"uuid-dead-incarnation"),
+        "the same-host provably-dead predecessor must be PRUNED at the successor's \
+         upsert (the accreting-phantom-writers finding): {ids:?}"
+    );
+    assert!(
+        ids.contains(&"node_00000000000000ff"),
+        "a foreign-boot entry is never prunable blind (liveness unknowable): {ids:?}"
+    );
+    assert!(
+        ids.contains(&"node_00000000000000aa.m00000001"),
+        "a pid-less roster enrollment is deliberately process-less — never pruned: {ids:?}"
+    );
+    assert_eq!(
+        set.members.len(),
+        3,
+        "successor + foreign + roster — never the accreted 4: {ids:?}"
+    );
+
+    // A LIVE same-host sibling (our own pid) must survive an upsert too.
+    assert!(membership::upsert_writer_member(&be, &successor, 4)
+        .await
+        .expect("idempotent re-upsert"));
+    assert_eq!(
+        ClaimSet::load(&be).await.expect("set").members.len(),
+        3,
+        "re-upsert replaces, never duplicates and never prunes the living"
+    );
+    be.shutdown().await.expect("clean shutdown");
+}
+
+/// The identity half of finding #3: the authority's claim-set identity is
+/// the DURABLE node id (stable across incarnations — what makes
+/// replace-by-id heal a crash), never the per-mount uuid.
+#[test]
+fn the_authoritys_claim_identity_is_durable_across_incarnations() {
+    let a = membership::owner_claim_identity("uuid-incarnation-1");
+    let b = membership::owner_claim_identity("uuid-incarnation-2");
+    if a.starts_with("node_") {
+        assert_eq!(
+            a, b,
+            "the claim identity must be STABLE across incarnations — a per-mount uuid \
+             accretes one phantom writer per crash"
+        );
+    } else {
+        // A box with no resolvable stable node identity falls back to the
+        // incarnation id LOUDLY — accretion returns there, but a wrong
+        // node token would misclassify staged custody, which is worse.
+        assert_eq!(
+            a, "uuid-incarnation-1",
+            "the fallback is the incarnation id"
+        );
+        assert_eq!(b, "uuid-incarnation-2");
+    }
+}
+
 /// Rung-8 finding #1 (found live by the S7-a device-fence row, 2026-08-16):
 /// a READER member that self-fences **by its own deadline** (T_self passed
 /// — the frozen/hung-OWNER shape, the exact dual of S6-b′'s frozen member)
@@ -1762,15 +1911,9 @@ async fn a_writer_member_fenced_by_its_own_deadline_never_re_presents() {
     mticks.fetch_add(60_000, Ordering::SeqCst);
     assert!(client.session().self_fence_due());
 
-    let tick = membership::member_renewal_tick(
-        &mut client,
-        &endpoint,
-        &secret,
-        &req,
-        &member_clock,
-        None,
-    )
-    .await;
+    let tick =
+        membership::member_renewal_tick(&mut client, &endpoint, &secret, &req, &member_clock, None)
+            .await;
 
     assert_eq!(
         tick,

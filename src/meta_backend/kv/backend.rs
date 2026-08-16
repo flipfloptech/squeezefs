@@ -3640,8 +3640,19 @@ impl KvMetaBackend {
         const POLL: std::time::Duration = std::time::Duration::from_millis(5);
 
         let (claim, _) = holder.as_ref()?;
-        if claim.pid != std::process::id() || claim.boot != read_boot_id() {
-            return None; // foreign holder: refuse instantly (unchanged posture)
+        let same_process = claim.pid == std::process::id() && claim.boot == read_boot_id();
+        // Rung-9 finding #5 (the S8-b E2 leg, live): a successor mounting
+        // over a PROVABLY-DEAD same-host holder can meet a *transient*
+        // `LOCK_SH` at its one-shot NB acquire — a reader's / co-writer's
+        // released-immediately mount probe (5 rejoining co-writers hammer
+        // them while the authority is dark). The dead holder cannot own
+        // the flock and SH probes release by contract, so this shape gets
+        // the SAME bounded wait-out as the same-process teardown race. A
+        // LIVE same-boot holder and every foreign-boot claim still refuse
+        // instantly (unchanged posture).
+        let dead_same_host = claim.boot == read_boot_id() && pid_provably_dead(claim.pid);
+        if !same_process && !dead_same_host {
+            return None; // live/foreign holder: refuse instantly (unchanged posture)
         }
         let deadline = std::time::Instant::now() + TEARDOWN_FLOCK_WAIT;
         loop {

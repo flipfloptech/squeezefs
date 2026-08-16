@@ -440,6 +440,51 @@ async fn test_dead_pid_proof_same_host_instant_reclaim() {
     be.shutdown().await.unwrap();
 }
 
+/// Rung-9 **finding #5** (live, S8-b's E2 leg): a successor mounting over
+/// a PROVABLY-DEAD same-host holder was refused because a **transient
+/// `LOCK_SH` probe** (a reader's / co-writer's released-immediately mount
+/// probe — 5 rejoining co-writers hammer them while the authority is
+/// dark) happened to overlap the successor's one-shot
+/// `flock(LOCK_EX | LOCK_NB)`. The dead holder cannot be the flock's
+/// owner, and SH probes release by contract, so the successor must WAIT
+/// the transient out (the same bounded window the same-process teardown
+/// race already gets) instead of refusing an instantly-retryable shape.
+/// A genuinely LIVE holder (its pid alive) still refuses instantly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transient_shared_probe_over_a_dead_holders_claim_is_waited_out() {
+    let vol = fresh_volume().await;
+    let crashed = WriterClaim {
+        id: "crashed-under-probe-storm".into(),
+        ts: now_secs(),
+        pid: dead_pid(),
+        boot: our_boot_id(),
+        term: 0,
+    };
+    forge_claim(vol.path(), &crashed).await;
+
+    // The transient: another process class holding LOCK_SH across the
+    // successor's open instant, released ~300 ms in (a probe's lifetime,
+    // generously stretched).
+    let sh_holder = std::fs::OpenOptions::new()
+        .read(true)
+        .open(vol.path())
+        .expect("open for the SH probe");
+    let rc = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&sh_holder), libc::LOCK_SH) };
+    assert_eq!(rc, 0, "the probe's LOCK_SH");
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        drop(sh_holder); // release: the probe ends
+    });
+
+    let be = KvMetaBackend::open(vol.path())
+        .await
+        .expect("a transient SH probe over a dead holder's claim is waited out, never refused");
+    let claim = be.read_writer_claim().await.expect("re-claimed");
+    assert_eq!(claim.pid, std::process::id(), "the claim now names us");
+    releaser.join().unwrap();
+    be.shutdown().await.unwrap();
+}
+
 /// A live same-host pid (boot matches, `kill(pid,0)` succeeds) is NOT a
 /// dead-pid proof: a fresh claim refuses naming the holder.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

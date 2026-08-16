@@ -1213,8 +1213,13 @@ fn spawn_custody_renewal(
 ) {
     crate::meta_exec::spawn_meta_contained("cowriter_custody_renewal", async move {
         loop {
-            let now = crate::membership::LeaseClock::monotonic().now_ms();
-            let due = client.renew_at_ms().saturating_sub(now).max(1);
+            // Rung-10 finding #1: the due distance is the CLIENT's own
+            // clock's (`renewal_due_ms`) — a fresh monotonic clock here
+            // read now ≈ 0, so `due` equaled the absolute deadline and the
+            // cadence doubled every cycle until the lease died at its 4th
+            // renewal (pinned:
+            // the_custody_renewal_cadence_is_anchored_on_the_clients_own_clock).
+            let due = client.renewal_due_ms();
             squeezefs_ipc::sqz_time::sleep(Duration::from_millis(due)).await;
             if stop.load(Ordering::Acquire) {
                 return;

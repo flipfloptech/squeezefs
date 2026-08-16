@@ -1966,6 +1966,22 @@ impl WriteCustodyClient {
         self.lease.load().renew_at_ms()
     }
 
+    /// Milliseconds until the next renewal is due — computed **in the
+    /// client's OWN clock domain**, and the ONE computation the renewal
+    /// cadence consumes (rung-10 finding #1: the loop read a FRESHLY
+    /// MINTED monotonic clock, whose origin is its creation instant, so
+    /// `now ≡ 0` and `due` equaled the ABSOLUTE deadline — the sleep
+    /// doubled every cycle until the lease died at its 4th renewal,
+    /// invisibly on storming venues and fatally on any idle window).
+    /// Never 0: the loop's sleep floor.
+    pub fn renewal_due_ms(&self) -> u64 {
+        self.lease
+            .load()
+            .renew_at_ms()
+            .saturating_sub(self.clock.now_ms())
+            .max(1)
+    }
+
     /// `true` ⇔ this client is past its own deadline and MUST fail-stop now
     /// — before the authority's TTL lets those bytes be granted elsewhere.
     pub fn self_fence_due(&self) -> bool {
@@ -2000,6 +2016,15 @@ impl WriteCustodyClient {
         mode: LockMode,
         wait: Duration,
     ) -> Result<LockLease> {
+        // Rung-10 finding #2: a POISONED mount acquires nothing, INSTANTLY,
+        // in the fence's own class — `WriterGuardFenced` is the one error
+        // every retry ladder returns immediately, while a `LockFailed`
+        // here fed the POSIX-5 ladder 35 round-trips and 30 s of budget
+        // PER OP on a mount that had already fail-stopped. One relaxed
+        // load on the healthy path.
+        if crate::data_custody::poisoned() {
+            return Err(SqueezefsError::WriterGuardFenced);
+        }
         // A queued release must reach the authority BEFORE a new acquire,
         // or a client that released and re-acquired the same span would
         // conflict with itself.

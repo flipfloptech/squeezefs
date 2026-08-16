@@ -1928,6 +1928,19 @@ pub async fn arm_mount_membership(
     arm_owner(meta, volumes, secret, bind_addr).await
 }
 
+/// The endpoint the rendezvous record ([`OwnerRecord::endpoint`])
+/// advertises — the address every member (host readers, netns'd members,
+/// qemu guests) will DIAL, composed from the owner's bind posture and the
+/// port the plane actually bound.
+pub fn owner_advertise_endpoint(bind_addr: std::net::SocketAddr, bound_port: u16) -> String {
+    let _ = bind_addr;
+    format!(
+        "{}:{}",
+        crate::cluster_wire::local_advertise_ip(),
+        bound_port
+    )
+}
+
 async fn arm_owner(
     meta: &Arc<crate::meta_backend::RoutedMetaBackend>,
     volumes: Vec<Arc<KvMetaBackend>>,
@@ -1977,11 +1990,7 @@ async fn arm_owner(
         secret,
         Arc::clone(&owner),
     )?;
-    let endpoint = format!(
-        "{}:{}",
-        crate::cluster_wire::local_advertise_ip(),
-        plane.endpoint().port()
-    );
+    let endpoint = owner_advertise_endpoint(bind_addr, plane.endpoint().port());
     // The ONE durable write of the whole liveness plane, per volume, at
     // arm. A predecessor's grace window opens over the membership its
     // evidence names.
@@ -2228,10 +2237,79 @@ async fn join_member_on(
     }))
 }
 
-/// The member's renewal cadence task: renew, and on failure re-join
-/// (a RECLAIM — it presents the epoch it holds, which is what a
-/// successor's grace window admits) until its OWN deadline, at which point
-/// it fail-stops itself rather than waiting for the owner's TTL.
+/// What one renewal-cadence tick did — returned so the decision is
+/// explicit and testable (the S6-b′ hung-kernel row's repro drives the
+/// REAL tick deterministically instead of racing the spawned loop).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenewalTick {
+    /// The lease renewed; the member's deadline re-anchored on this send.
+    Renewed,
+    /// The member fail-stopped. The cadence loop ends.
+    Fenced,
+    /// The renewal failed transiently but the lease was still custody at
+    /// the owner — the member re-asserted (reclaim) and holds a fresh
+    /// grant with its cached view intact (continuity).
+    Rejoined,
+    /// The lease was NOT custody any more: the member self-fenced and
+    /// purged FIRST, then re-joined FRESH with a clean view (the S6-b′
+    /// law — a frozen-then-thawed member must never resume as a live
+    /// member on its stale caches).
+    FencedAndRejoined,
+    /// The re-join was refused or unreachable; the loop retries.
+    RejoinRefused,
+}
+
+/// One member renewal-cadence decision — the body of the renewal loop
+/// ([`spawn_member_renewal`] is the cadence shell around it): renew, and
+/// on failure re-join (a RECLAIM — it presents the epoch it holds, which
+/// is what a successor's grace window admits) until its OWN deadline, at
+/// which point it fail-stops itself rather than waiting for the owner's
+/// TTL.
+pub async fn member_renewal_tick(
+    client: &mut crate::membership_wire::MemberClient,
+    endpoint: &str,
+    secret: &[u8],
+    req: &JoinRequest,
+    clock: &LeaseClock,
+    on_purge: Option<&Arc<dyn Fn() + Send + Sync>>,
+) -> RenewalTick {
+    let session = Arc::clone(client.session());
+    if let Err(e) = client.renew().await {
+        if session.self_fence_due() {
+            let fence = session.self_fence(&format!("renewal failed: {e}"));
+            if fence.purge_requested {
+                if let Some(purge) = on_purge {
+                    purge();
+                }
+            }
+            return RenewalTick::Fenced;
+        }
+        log::warn!(
+            "membership: renewal failed ({e}) — re-asserting as a reclaim before my \
+             own deadline (T_self)"
+        );
+        let mut reclaim = req.clone();
+        reclaim.prior_epoch = Some(session.epoch());
+        match crate::membership_wire::MemberClient::join(endpoint, secret, reclaim, clock.clone())
+            .await
+        {
+            Ok(fresh) => {
+                install_member(Arc::clone(fresh.session()));
+                *client = fresh;
+                return RenewalTick::Rejoined;
+            }
+            Err(e) => {
+                log::warn!("membership: reclaim refused ({e}); retrying");
+                return RenewalTick::RejoinRefused;
+            }
+        }
+    }
+    RenewalTick::Renewed
+}
+
+/// The member's renewal cadence shell: sleep to the renewal due instant,
+/// honor the stop latch, and run [`member_renewal_tick`] — which owns the
+/// whole renew / reclaim / self-fence decision.
 fn spawn_member_renewal(
     mut client: crate::membership_wire::MemberClient,
     endpoint: String,
@@ -2243,44 +2321,28 @@ fn spawn_member_renewal(
 ) {
     crate::meta_exec::spawn_meta_contained("membership_renewal", async move {
         loop {
-            let session = Arc::clone(client.session());
             let now = clock.now_ms();
-            let due = session.renew_at_ms().saturating_sub(now);
+            let due = client.session().renew_at_ms().saturating_sub(now);
             squeezefs_ipc::sqz_time::sleep(Duration::from_millis(due.max(1))).await;
             if stop.load(Ordering::Acquire) {
                 let _ = client.leave().await;
                 return;
             }
-            if let Err(e) = client.renew().await {
-                if session.self_fence_due() {
-                    let fence = session.self_fence(&format!("renewal failed: {e}"));
-                    if fence.purge_requested {
-                        if let Some(purge) = on_purge.as_ref() {
-                            purge();
-                        }
-                    }
-                    return;
-                }
-                log::warn!(
-                    "membership: renewal failed ({e}) — re-asserting as a reclaim before my \
-                     own deadline (T_self)"
-                );
-                let mut reclaim = req.clone();
-                reclaim.prior_epoch = Some(session.epoch());
-                match crate::membership_wire::MemberClient::join(
-                    &endpoint,
-                    &secret,
-                    reclaim,
-                    clock.clone(),
-                )
-                .await
-                {
-                    Ok(fresh) => {
-                        install_member(Arc::clone(fresh.session()));
-                        client = fresh;
-                    }
-                    Err(e) => log::warn!("membership: reclaim refused ({e}); retrying"),
-                }
+            match member_renewal_tick(
+                &mut client,
+                &endpoint,
+                &secret,
+                &req,
+                &clock,
+                on_purge.as_ref(),
+            )
+            .await
+            {
+                RenewalTick::Fenced => return,
+                RenewalTick::Renewed
+                | RenewalTick::Rejoined
+                | RenewalTick::FencedAndRejoined
+                | RenewalTick::RejoinRefused => {}
             }
         }
     })

@@ -13877,8 +13877,12 @@ impl SqueezefsFilesystem {
         // seed tripwire). A fully-covered overlay pays nothing.
         let gaps = rec.core.gaps();
         let app_complete = gaps.is_empty();
+        // Short-tolerant old-image fetch (the generic/795 settle-wedge
+        // fix): a tail-resident RAW short image must yield its readable
+        // PREFIX — the missing tail is holes (zeros below), never a
+        // Frozen-forever wedge. See `read_nvme_block_old_image`.
         let old_image = match (gaps.is_empty(), rec.core.old_binding()) {
-            (false, Some(old_key)) => Some(self.router.read_nvme_block(old_key).await?),
+            (false, Some(old_key)) => Some(self.router.read_nvme_block_old_image(old_key).await?),
             _ => None,
         };
         for &(gs, ge) in &gaps {
@@ -14485,7 +14489,12 @@ impl SqueezefsFilesystem {
             let mut gap_bytes = 0u64;
             if !gap_ranges.is_empty() {
                 if let Some(old_key) = rec.core.old_binding() {
-                    let old = match self.router.read_nvme_block(old_key).await {
+                    // Short-tolerant (the settle-wedge fix): a tail-
+                    // resident short old image serves its prefix; the
+                    // missing tail stays zeros (the short-image law two
+                    // arms below). Other failures keep the decline-to-
+                    // drain posture.
+                    let old = match self.router.read_nvme_block_old_image(old_key).await {
                         Ok(o) => o,
                         Err(_) => return None,
                     };
@@ -20484,14 +20493,16 @@ impl Filesystem for SqueezefsFilesystem {
             // serve a moved binding from pages the daemon cannot see).
             if data.is_empty() && zc_pass.is_some_and(|z| z.served().is_some()) && read_len > 0 {
                 let post_runs = self.capture_parked_runs(ino, offset, read_len);
+                // ORDER LAW (see the byte path below): registry probe
+                // strictly BEFORE the fingerprint — the reverse of the
+                // publish order.
+                let overlay_live = self.device_overlay_blocks_in_window(ino, offset, read_len);
                 let bindings_after = self
                     .read_custody_fingerprint(None, &file_path, ino, offset, read_len)
                     .await;
                 if post_runs.is_empty()
+                    && overlay_live.is_empty()
                     && read_custody_fp_matches(&bindings_after, &bindings_before)
-                    && self
-                        .device_overlay_blocks_in_window(ino, offset, read_len)
-                        .is_empty()
                 {
                     break (data, backing, router_done_at);
                 }
@@ -20507,9 +20518,27 @@ impl Filesystem for SqueezefsFilesystem {
             let data = Self::apply_parked_runs(offset, data, &pre_runs);
             let data = Self::apply_parked_runs(offset, data, &post_runs);
 
-            let bindings_after = self
-                .read_custody_fingerprint(None, &file_path, ino, offset, read_len)
-                .await;
+            // Defense #4: a LIVE overlay record inside the window means
+            // acked bytes this compose could not see — drain it (the entry
+            // drain's own verb; the settle publishes destination-before-
+            // retire, so the re-read resolves the bytes) and re-run. A
+            // drain failure propagates loud with the record still parked
+            // (never-lossy): serving the compose would serve zeros for
+            // acked bytes.
+            //
+            // ORDER LAW (the 2026-08-15 re-falsification): the two
+            // post-read authority reads run in the REVERSE order of the
+            // custody transfer they validate. Every settle publishes its
+            // destination strictly BEFORE retiring its source (map move
+            // `M` before record retire `R`), so the reader probes the
+            // SOURCE registry first and the DESTINATION fingerprint
+            // second: a miss then requires probe-post-`R` AND
+            // fingerprint-pre-`M`, i.e. `R < M` — a contradiction. The
+            // inverted order left the (fingerprint, probe) gap a whole
+            // settle could land inside, blind to both (the falsification
+            // tape's stale serve; pinned by
+            // `settle_inside_the_validate_gap_never_hides_acked_bytes`).
+            let overlay_blocks = self.device_overlay_blocks_in_window(ino, offset, read_len);
             // TEST SEAM: park between the two post-read authority reads
             // (see `set_test_read_validate_stall` — the ordering-law pin).
             test_stall_park(
@@ -20517,15 +20546,9 @@ impl Filesystem for SqueezefsFilesystem {
                 test_read_validate_stall_entries_cell(),
             )
             .await;
-            // Defense #4: a LIVE overlay record inside the window means
-            // acked bytes this compose could not see — drain it (the entry
-            // drain's own verb; the settle publishes destination-before-
-            // retire, so the re-read resolves the bytes) and re-run. A
-            // drain failure propagates loud with the record still parked
-            // (never-lossy): serving the compose would serve zeros for
-            // acked bytes. Runs before the fingerprint verdict — an open
-            // record invalidates the serve regardless of map movement.
-            let overlay_blocks = self.device_overlay_blocks_in_window(ino, offset, read_len);
+            let bindings_after = self
+                .read_custody_fingerprint(None, &file_path, ino, offset, read_len)
+                .await;
             if !overlay_blocks.is_empty() && attempts < 4 {
                 for b in overlay_blocks {
                     self.drain_device_overlay_block(ino, b, false)

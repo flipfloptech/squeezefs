@@ -312,13 +312,52 @@ fn finish_read(
     if got != size {
         return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
-            format!(
-                "short read: kernel returned {got} of {size} bytes at offset {offset} \
-                 (past-EOF/short reads must not surface recycled buffer bytes)"
-            ),
+            ShortReadPrefix {
+                got,
+                msg: format!(
+                    "short read: kernel returned {got} of {size} bytes at offset {offset} \
+                     (past-EOF/short reads must not surface recycled buffer bytes)"
+                ),
+            },
         )));
     }
     Ok(bytes.slice(0..size))
+}
+
+/// Typed payload of the exact-length contract's `UnexpectedEof` (see
+/// [`finish_read`]): carries the kernel's VALID PREFIX length so the one
+/// sanctioned prefix-tolerant consumer — the overlay old-image funnel,
+/// [`crate::routing::DataRouter::read_nvme_block_old_image`] — can re-read
+/// the honest prefix instead of wedging on a tail-resident short image
+/// (the generic/795 settle-wedge face, 2026-08-15). The exact-length
+/// contract itself is UNCHANGED: every other consumer still fails loud,
+/// and the Display string is byte-identical to the pre-payload message.
+#[derive(Debug)]
+pub struct ShortReadPrefix {
+    /// The kernel-reported valid byte count (the honest prefix).
+    pub got: usize,
+    msg: String,
+}
+
+impl std::fmt::Display for ShortReadPrefix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.msg)
+    }
+}
+
+impl std::error::Error for ShortReadPrefix {}
+
+/// Extract the valid-prefix length from an exact-length-contract failure.
+/// `None` for every other error shape (the caller must propagate loud).
+pub fn short_read_prefix_len(e: &crate::error::SqueezefsError) -> Option<usize> {
+    match e {
+        crate::error::SqueezefsError::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof => {
+            io.get_ref()?
+                .downcast_ref::<ShortReadPrefix>()
+                .map(|s| s.got)
+        }
+        _ => None,
+    }
 }
 
 /// Per-lane WRITE completion watermark (write-lane-fanout campaign,

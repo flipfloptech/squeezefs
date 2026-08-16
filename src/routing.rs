@@ -6623,6 +6623,56 @@ impl DataRouter {
             .await
     }
 
+    /// SHORT-TOLERANT old-image fetch for the device overlay's two gap
+    /// consumers (the settle's gap-seed, §5.8, and the compose's gap
+    /// read, §5.6(1)) — the generic/795 settle-wedge fix (2026-08-15): a
+    /// captured old binding can be a RAW short image RESIDENT AT THE
+    /// BACKING'S TAIL (the staged→striped conversion publishes the
+    /// partial tail block as a raw key whose stored image is shorter
+    /// than the block), and the whole-window read then SHORTS on
+    /// file-backed substrates — the exact-length contract failed it loud
+    /// and the record wedged Frozen forever (every write to the block
+    /// EIO'd through the settle-steal). The image's missing tail is the
+    /// never-written device region — exactly the holes both consumers
+    /// already seed/serve as zeros — so the honest disposition is the
+    /// readable PREFIX, never an error. Real block devices never short
+    /// (all-or-EIO): this funnel is byte-identical to
+    /// [`Self::read_nvme_block`] there. Bounded: the window only ever
+    /// shrinks (LBA-floored, monotone), so the retry terminates. Every
+    /// non-short failure propagates loud, unchanged.
+    pub(crate) async fn read_nvme_block_old_image(&self, block_key: &str) -> Result<bytes::Bytes> {
+        let (_base, off, sz, exact) = self.parse_block_mapping(block_key)?;
+        let cleaned = clean_block_key(block_key);
+        let mut window = if exact {
+            (off as usize + sz).div_ceil(4096) * 4096
+        } else {
+            self.device_block_window()
+        };
+        loop {
+            if window == 0 {
+                // The whole image sits past the backing tail: an empty
+                // prefix — the consumers' short-image discipline serves
+                // zeros for every gap byte.
+                return Ok(bytes::Bytes::new());
+            }
+            match self.backend_router.read_block(&cleaned, window).await {
+                Ok(raw) => {
+                    return Ok(if exact {
+                        let start = (off as usize).min(raw.len());
+                        let end = (off as usize + sz).min(raw.len());
+                        raw.slice(start..end)
+                    } else {
+                        raw
+                    });
+                }
+                Err(e) => match crate::nvme_dev::short_read_prefix_len(&e) {
+                    Some(got) if (got & !4095) < window => window = got & !4095,
+                    _ => return Err(e),
+                },
+            }
+        }
+    }
+
     /// Device window for an UNDECORATED (whole-block) read. Passthrough
     /// volumes read exactly `block_size` (byte-identity — §5.6 ranged
     /// reads and the zero-copy raw-DMA leg depend on it). Transformed

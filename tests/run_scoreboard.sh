@@ -734,10 +734,18 @@ sqz_mount() { # <tag> <cage_mb> [extra mount args...]
     cage_cmd "$memmax" "sqz-$tag"
     pin_cmd
     # shellcheck disable=SC2094 # --log-file is a path arg, not a read
+    # --allow-other (the run_fstests.sh wrapper's precedent): under sudo the
+    # daemon mounts with user_id=$SUDO_UID (the 2026-07-13 ownership
+    # contract), and a non-allow-other FUSE mount denies EVERY other uid —
+    # including root, whose mountpoint/stat readiness probes and elbencho
+    # workloads this runner runs. Without it every sudo-invoked scoreboard
+    # run dies at the first sqz mount (found 2026-08-16 by the stamped-solo
+    # smoke residual, but posture-independent).
     "${CAGE_ARGV[@]}" "${PIN_ARGV[@]}" "$SQZ_BIN" mount \
         "$(sqz_meta_uri)" "$SQZ_MNT" --daemon \
         --mem-budget "${CACHE_MB}M" \
         --disk-cache-size "${CACHE_MB}MB" \
+        --allow-other \
         --log-file "$logf" "$@" >>"$logf" 2>&1
     local i
     for i in $(seq 1 200); do

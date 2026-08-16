@@ -6,7 +6,8 @@ stamped** by a production format (ruling D9); `set_layout_versions_bit` is the
 offline Phase-8 upgrade verb.
 **Contracts:** `tests/mw_layout_version_tests.rs` (+ the extended
 `tests/decoder_property_tests.rs` round-trip and the untouched
-`tests/layout_delta_fold_tests.rs` algebra pins).
+`tests/layout_delta_fold_tests.rs` algebra pins); the §6a shipped-publish
+era gate + witness rides `tests/mw_publish_era_gate_tests.rs`.
 **Sibling record:** the layout delta wire itself is the write-commit-economy
 campaign's (`.benchmarks/2026-07-30-write-commit-economy.md`, incompat bit 5);
 the RMW base-cache serve it composes with is rewrite-publish-drain Lever A
@@ -176,6 +177,112 @@ record can be; there is no crash window to order). Consequences:
 * **Returning the staged link's version on the publish reply** so a co-writer
   can chain without a refetch (`PublishReply::DeltaUsed` → a versioned reply).
 * The fold_forward residual named in §4.
+
+## 6a. The shipped-publish era gate + idempotence witness (finding #6 adjudication, 2026-08-16 — publish schema 5)
+
+**The conviction** (`.benchmarks/2026-08-16-mw-s9-arm.md`, findings ledger #6):
+on the `s9-colocated-fence` leg a co-writer SIGSTOPped past its TTL was swept
+and evicted by the authority; after SIGCONT — in the window before its own
+self-fence — its queued write-through layout publishes were still **applied**,
+and the publish vocabulary's no-retry law composed with the never-lossy
+writeback ladder re-shipped a freeze-window lost-reply publish with no
+idempotence witness. Result: a durably committed **divergent delta chain**
+(fsck C1 on `TREE_XATTRS`) plus 220 C8 findings at drift 48,620. Bit 15
+**detected** it — §4's fold law and §3's gate did their design job ("detects,
+not licenses") — but detection is not prevention: nothing refused the zombie,
+and nothing correlated the re-ship with its lost-reply original. This section
+is the prevention law. Its enforcement lives in `src/meta_ship/publish.rs`
+(schema **5**) + `src/data_grant.rs`; contracts
+`tests/mw_publish_era_gate_tests.rs`.
+
+**Law 1 — the era gate covers the whole MUTATING publish vocabulary.** Every
+mutating `PublishCall` (`SetLayoutAndSize`, `MergeLayoutAndSize`,
+`CommitBlockRefs`, `ParkWriteTimes`, `DestroyInodes`, `CreateWithRdevSize`)
+carries the caller's custody `lease_epoch`, and the owner refuses
+`PUBLISH_STALE_LEASE` when that epoch is not LIVE custody it granted — the
+exact gate `FreeBlocks` already had, generalized (keyed on the epoch alone,
+for `check_free`'s three stated reasons). Gate order on the owner:
+authority (`NOT_OWNER`) → **era** → witness window → dispatch; the era gate
+runs BEFORE the window on purpose (a dead era's replay must never be answered
+from cache, the FreeBlocks precedent verbatim). A refusal applies **nothing**.
+The read verbs (`XattrValueCap`, `ReaddirStream`) stay ungated: they mutate
+nothing, and a zombie's stale read is the S5 reader-staleness class, not a
+durability threat.
+
+**Law 2 — the layout-publish class joins the RETRIED class with an
+idempotence witness** (stated against `publish.rs`'s no-retry doctrine — the
+shape PR 17 already schedules for `WriteExtent`). `SetLayoutAndSize` /
+`MergeLayoutAndSize` / `CommitBlockRefs` carry `(lease_epoch, request_id)`;
+the owner serves them through S8's `DedupWindow` (never a third idempotence
+pattern), so a duplicate application is structurally impossible — a lost-reply
+resend answers the winner's own cached outcome (`meta_ship_publish.replays`).
+The client mints **one** request id per logical publish and resends only the
+**same frame** under the bounded epoch-stable ladder (`ship_free_blocks`'s,
+verbatim: same `(epoch, id)` across attempts, abandon when the epoch moves —
+retries never re-key). Past the budget, the error propagates and the
+writeback ladder re-COMPUTES a **new** logical publish from current state
+(the module's convergence law — a new id is then correct, because the frame
+is a new act); the failed save also **zeroes the RAM chain provenance**
+(`CachedMetadata::layout_version = 0`), so the recomputation claims 0 and the
+§3 gate re-bases it with a full `Put` — convergent by construction, and it
+closes the residual wedge where a lost-reply-then-transport-death retry would
+claim a base the durable head already superseded and refuse forever.
+`ParkWriteTimes` (absolute times, last-writer-wins) and `DestroyInodes`
+(per-ino teardown) stay era-gated but un-witnessed and un-retried;
+`CreateWithRdevSize` keeps the no-retry law absolutely (a resend after a lost
+reply mints a second name — the doctrine's founding case).
+
+**Law 3 — ordering.** Two DIFFERENT publishes of one ino cannot apply out of
+order: locally every layout save runs under `INODE_META_LOCKS` (§5.3's one
+merge discipline) and the per-ino publish conveyor is a single pass task, so
+publish N completes (or fails) before publish N+1's frame is built; on the
+wire, `PublishClient` holds its per-endpoint lane mutex ACROSS the round trip
+(one connection, one in-flight publish per authority), and the owner applies
+under its own 4a + `INODE_META_LOCKS`. The §3 version gate stays the
+**belt** underneath that construction: any residual cross-writer or
+crash-window shape (a delta claiming a base that is not the durable head)
+refuses loud across the wire — now pinned on the shipped face, not only the
+local one.
+
+**The fence signal + the acked-un-fsynced resolution law.** A
+`PUBLISH_STALE_LEASE` refusal whose presented epoch IS the client's *current*
+lease epoch is authoritative proof this mount's custody era is dead, and the
+client composes the full fence at that round trip (the pull-based revocation
+law — learned here instead of at the next renewal): adopted grants marked
+dead + custody generation advanced (the UnknownLease machinery) + the writer
+self-fence (custody **poison** — `WriteCustodyClient::note_publish_era_refused`).
+The refusal surfaces as `WriterGuardFenced`, the fence class every retry
+ladder returns immediately. The zombie's un-shippable acked-un-fsynced writes
+are the **POSIX crash class**: the era death IS the mount's logical crash,
+so with the poison latch set, constant-writeback units failing in the fence
+class resolve as **verified fencing-stale no-ops**
+(`writeback_fence_noops` — FIND-M11-A's "stale fencing tokens discard staged
+work" applied to the shipped-publish path) instead of retrying forever
+against a permanent era refusal. Verification is the one-way poison latch
+(set only by T_self, the D0 fence, or this authoritative refusal — never by
+a transport error), so a LIVE era's work is never dropped; the staged bytes
+are not torn live (fsync stays the loud error surface — its own flush
+refuses in the fence class), and remount's staging recovery applies the
+remount contract to them. A stale refusal for an epoch the client already
+replaced (a re-join raced the frame) fences **nothing** — the guard is
+`presented == current`.
+
+**Compatibility + observability.** `PUBLISH_SCHEMA` 4 → 5; a 4-speaker gets
+`PUBLISH_SCHEMA_MISMATCH` naming both numbers at the first frame (the
+existing law; no incompat bit — the wire is a RAM protocol). New rows on the
+`meta_ship_publish` object: `stale_refusals` (the era gate's row — 0 on a
+healthy fleet, growth around a revocation is the gate composing) and
+`replays` (the layout witness engaging — a lost-reply retry landing here is
+the mechanism working); plus the daemon's `writeback_fence_noops` (the
+quiesce law's counter — 0 on every healthy mount). Solo mounts are
+structurally untouched: the epoch/id are gathered only in the shipped arm,
+behind the same one relaxed load (pinned).
+
+**What PR 17 inherits verbatim for `WriteExtent`:** the era gate input
+(`lease_epoch`, refused `PUBLISH_STALE_LEASE` before the window), the
+`(lease_epoch, request_id)` witness window, the same-frame-only bounded
+epoch-stable resend ladder, the never-re-key law across re-joins, and the
+fence-signal composition on a current-epoch stale refusal.
 
 ## 7. Verification posture (ruling D11)
 

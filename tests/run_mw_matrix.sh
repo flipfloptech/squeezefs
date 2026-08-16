@@ -2167,10 +2167,22 @@ leg_s8_crucible() {
         pids2+=("$!")
     done
     sleep 5
+    local w_pid
+    w_pid="$(awk -F'\t' '$1==0 {print $7}' "$MEMBERS")"
     "$MWFLEET" kill 0 --sig 9
     t_kill="$(date +%s)"
     umount -l "$w_mnt" 2>/dev/null || true
     wait_for_unmounted "$w_mnt"
+    # The daemon-lifetime flock dies WITH THE PROCESS, and a SIGKILL'd
+    # daemon under 5 storming co-writers takes seconds to actually exit —
+    # remounting before then meets a live holder (measured: 'another
+    # squeezefs process holds the writer lock … age=6s').
+    local tries
+    for ((tries = 0; tries < 120; tries++)); do
+        kill -0 "$w_pid" 2>/dev/null || break
+        sleep 0.5
+    done
+    kill -0 "$w_pid" 2>/dev/null && die "E2: the killed authority (pid $w_pid) never exited"
     "$MWFLEET" mount 0 || die "E2: successor authority remount FAILED"
     t_up="$(date +%s)"
     wait "${pids2[@]}" || true
@@ -2211,10 +2223,16 @@ leg_s8_crucible() {
     s8b_storm "$(mnt_of "$victim")" "e3" 60 "$rowdir/fail-e3" &
     local storm3=$!
     sleep 3
+    local v_pid
+    v_pid="$(awk -F'\t' -v i="$victim" '$1==i {print $7}' "$MEMBERS")"
     "$MWFLEET" kill "$victim" --sig 9
     kill -9 "$storm3" 2>/dev/null || true
     wait "$storm3" 2>/dev/null || true
     umount -l "$(mnt_of "$victim")" 2>/dev/null || true
+    for ((tries = 0; tries < 120; tries++)); do
+        kill -0 "$v_pid" 2>/dev/null || break
+        sleep 0.5
+    done
     # The dedup window's exactly-once face: nothing half-applied survives.
     local out
     out="$("$SQZ" fsck "$w_mnt" 2>&1)" ||

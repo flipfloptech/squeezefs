@@ -30,24 +30,28 @@ log() { echo "[mdstorm] $*"; }
 [ "$(id -u)" -eq 0 ] || die "run as root (mount)"
 [ -x "$SQZ_BIN" ] || die "missing $SQZ_BIN (cargo build --release)"
 
-quiet_or_die() {
-    local load
-    load="$(cut -d' ' -f1 /proc/loadavg)"
-    awk -v l="$load" -v m="$MAX_LOAD" 'BEGIN{exit !(l<m)}' ||
-        die "box not quiet (load1=$load >= $MAX_LOAD) — a measured row needs a quiet box"
-    if pgrep -x cargo >/dev/null || pgrep -x rustc >/dev/null; then
-        die "foreign cargo/rustc work running — refuse the measured row"
-    fi
+foreign_work() { # comm-exact, the baseline's protocol (pgrep -f false-positives)
+    pgrep -x cargo >/dev/null || pgrep -x rustc >/dev/null ||
+        pgrep -x fio >/dev/null || pgrep -x elbencho >/dev/null ||
+        pgrep -x fsstress >/dev/null || pgrep -x fsx >/dev/null
 }
 
-quiet_flag() { # -> "clean" | "DIRTY(load=X)"
+quiet_or_die() {
+    # WAIT for quiet rather than refuse outright: the previous leg's own
+    # storm load takes minutes to decay out of load1 — only FOREIGN work
+    # is a refusal, our own echo just needs draining (bounded 10 min).
+    foreign_work && die "foreign cargo/rustc/fio work running — refuse the measured row"
     local load
-    load="$(cut -d' ' -f1 /proc/loadavg)"
-    if awk -v l="$load" -v m="$MAX_LOAD" 'BEGIN{exit !(l<m)}'; then
-        echo clean
-    else
-        echo "DIRTY(load=$load)"
-    fi
+    for _ in $(seq 1 60); do
+        load="$(cut -d' ' -f1 /proc/loadavg)"
+        awk -v l="$load" -v m="$MAX_LOAD" 'BEGIN{exit !(l<m)}' && return 0
+        sleep 10
+    done
+    die "box never went quiet (load1=$load >= $MAX_LOAD after 10 min)"
+}
+
+quiet_flag() { # -> "clean" | "DIRTY(foreign)" — the storm's OWN load is not dirt
+    if foreign_work; then echo "DIRTY(foreign)"; else echo clean; fi
 }
 
 build_storm() {

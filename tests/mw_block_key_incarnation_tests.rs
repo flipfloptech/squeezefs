@@ -38,7 +38,7 @@ use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::{DlmClient, TERM_MAX};
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
-use squeezefs::meta_backend::kv::builder::{format_v3, FormatV3Options};
+use squeezefs::meta_backend::kv::builder::FormatV3Options;
 use squeezefs::meta_backend::kv::journal::AppendPartition;
 use squeezefs::meta_backend::kv::superblock::{
     classify_volume, set_block_key_incarnation_bit, write_superblock_v3, VolumeFormat,

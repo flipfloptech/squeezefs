@@ -1682,3 +1682,75 @@ fn an_explicit_membership_bind_advertises_the_bound_address() {
         "the unspecified address is never advertised ({advertised})"
     );
 }
+
+/// A CLEAN member disarm (the unmount path) must deliver its leave to the
+/// owner BEFORE the process can exit: `MembershipOwner::leave`'s own
+/// contract is "no TTL wait for a mount that said goodbye", but the
+/// stop-latch-only disarm left the leave to the renewal loop's NEXT WAKE
+/// (≤ one renew interval away) — which a normal umount never reaches, so
+/// every cleanly-departed reader lingered in the census (and in
+/// `squeezefs clients`) as live-then-stale for a full owner TTL. Found by
+/// the rung-7 S6-b rig's census-settle wait.
+#[tokio::test]
+async fn a_clean_member_disarm_leaves_the_census_before_process_exit() {
+    let _serial = serial();
+    let secret = b"s6-clean-leave-secret".to_vec();
+    let (oclock, _oticks) = manual_clock();
+    let owner = owner_with(shipped_clocks(), oclock, 5);
+    let plane = MembershipPlane::start(
+        MembershipPlaneConfig::loopback(),
+        secret.clone(),
+        Arc::clone(&owner),
+    )
+    .expect("plane binds loopback");
+    let endpoint = plane.endpoint().to_string();
+
+    // The volume carries the rendezvous record + the enroll secret — the
+    // reader's whole join input (possession of volume access IS cluster
+    // membership, ruling D2).
+    let meta = formatted_volume().await;
+    let be = KvMetaBackend::open(meta.path()).await.expect("open volume");
+    let enroll = serde_json::json!({ "secret": squeezefs::cluster_wire::hex_encode(&secret) });
+    be.setxattr_internal(
+        1,
+        squeezefs::job_wire::JOB_ENROLL_XATTR,
+        enroll.to_string().as_bytes(),
+    )
+    .await
+    .expect("write the enroll record");
+    membership::publish_owner_record(
+        &be,
+        &OwnerRecord {
+            v: 1,
+            id: "owner-clean-leave".into(),
+            term: 5,
+            endpoint,
+            ttl_ms: CLIENT_STALE_TTL_SECS * 1000,
+            ts: now_secs(),
+            pid: std::process::id(),
+            boot: "boot-test".into(),
+        },
+    )
+    .await
+    .expect("publish the rendezvous record");
+
+    let routed = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![
+        Arc::clone(&be),
+    ]));
+    let arm = membership::arm_mount_membership(&routed, true, None)
+        .await
+        .expect("arm must not error")
+        .expect("the reader must join the plane it discovered");
+    assert_eq!(arm.mode(), "member");
+    assert_eq!(owner.len(), 1, "the reader is in the census");
+
+    arm.disarm().await;
+    assert_eq!(
+        owner.len(),
+        0,
+        "a mount that said goodbye must not wait out a TTL — the disarm must \
+         deliver the leave before the process can exit"
+    );
+    plane.shutdown();
+    be.shutdown().await.expect("clean shutdown");
+}

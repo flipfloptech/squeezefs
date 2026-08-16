@@ -1421,3 +1421,244 @@ fn a_mount_slot_collision_within_one_claim_set_refuses_loud() {
     let anon = join_req(id, MemberRole::Writer, None);
     let _grant = granted(owner.join(anon));
 }
+
+// ---------------------------------------------------------------------------
+// 11. Rung 7 (arm S6) — the S6-b′ hung-kernel finding's repro-ports
+// ---------------------------------------------------------------------------
+//
+// The finding (2026-08-16, found building the S6-b′ VM-pause row): a member
+// whose KERNEL froze past the owner's TTL (qemu pause — the shape kill-9
+// cannot produce) resumes with its MONOTONIC CLOCK never having advanced,
+// so `self_fence_due()` is false; its failed renewal then re-joined as a
+// RECLAIM, and the owner GRANTED a silently-fresh lease to an evicted
+// member — which resumed serving from its pre-freeze caches as a live
+// member, never fencing, never purging. That is verbatim the design row's
+// falsifier ("victim's frozen-then-thawed writes land after fence" /
+// "resuming as a live member") and contradicts the wire's own contract:
+// `RPC_MEMBERSHIP_UNKNOWN_LEASE — the member's correct response is
+// self-fence then re-join, not retry`.
+
+/// The OWNER half: a reclaim presenting an epoch this owner does not hold
+/// (evicted, swept, or a predecessor's) must NOT be granted as a silent
+/// fresh lease outside a grace window — the member has to be TOLD its
+/// lease is not custody so it can fence first.
+#[test]
+fn an_evicted_reclaim_is_not_granted_as_a_silent_fresh_lease() {
+    let _serial = serial();
+    let (clock, _ticks) = manual_clock();
+    let owner = owner_with(shipped_clocks(), clock, 5);
+    let grant = granted(owner.join(join_req("thawed", MemberRole::Reader, None)));
+    owner
+        .evict("thawed", "paused past TTL (test)")
+        .expect("evict");
+
+    let mut reclaim = join_req("thawed", MemberRole::Reader, None);
+    reclaim.prior_epoch = Some(grant.epoch);
+    let out = owner.join(reclaim);
+    assert!(
+        !matches!(out, JoinOutcome::Granted(_)),
+        "a dead reclaim must not be granted as a silent fresh lease — the member must \
+         learn its prior lease is not custody (got {out:?})"
+    );
+}
+
+/// The MEMBER half, driving the REAL renewal tick: a member with a FROZEN
+/// monotonic clock (the hung-kernel/VM-pause shape — `self_fence_due()`
+/// can never fire) whose lease the owner evicted must SELF-FENCE and run
+/// its purge BEFORE it holds any fresh lease — never resume as a live
+/// member on its stale caches.
+#[tokio::test]
+async fn a_frozen_member_whose_lease_died_fences_and_purges_before_rejoining() {
+    let _serial = serial();
+    let secret = b"s6-b-prime-secret".to_vec();
+    let (owner_clock, _oticks) = manual_clock();
+    let owner = owner_with(shipped_clocks(), owner_clock, 5);
+    let plane = MembershipPlane::start(
+        MembershipPlaneConfig::loopback(),
+        secret.clone(),
+        Arc::clone(&owner),
+    )
+    .expect("plane binds loopback");
+    let endpoint = plane.endpoint().to_string();
+
+    // The member's clock is FROZEN — a paused guest kernel's monotonic
+    // domain. T_self can never be observed as passed.
+    let (member_clock, _mticks) = manual_clock();
+    let req = join_req("frozen-reader", MemberRole::Reader, None);
+    let mut client = MemberClient::join(&endpoint, &secret, req.clone(), member_clock.clone())
+        .await
+        .expect("join");
+    let paused_session = Arc::clone(client.session());
+    let paused_epoch = paused_session.epoch();
+    assert!(
+        !paused_session.self_fence_due(),
+        "the frozen clock must make T_self unobservable — that is the row's shape"
+    );
+
+    let purges = Arc::new(AtomicU64::new(0));
+    let on_purge: Arc<dyn Fn() + Send + Sync> = {
+        let purges = Arc::clone(&purges);
+        Arc::new(move || {
+            purges.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+    let fences_before = METRICS.membership_self_fences.load(Ordering::Relaxed);
+
+    // The owner expired the lease while the member was frozen.
+    owner
+        .evict(
+            "frozen-reader",
+            "lease TTL expired while the guest was paused (test)",
+        )
+        .expect("evict");
+
+    let tick = membership::member_renewal_tick(
+        &mut client,
+        &endpoint,
+        &secret,
+        &req,
+        &member_clock,
+        Some(&on_purge),
+    )
+    .await;
+
+    assert_eq!(
+        METRICS.membership_self_fences.load(Ordering::Relaxed) - fences_before,
+        1,
+        "the member must self-fence exactly once before resuming (tick answered {tick:?})"
+    );
+    assert!(
+        paused_session.fenced(),
+        "the paused-era session must be FENCED — it is the view whose caches are stale"
+    );
+    assert_eq!(
+        purges.load(Ordering::SeqCst),
+        1,
+        "the reader's purge (drop every cached block) must run BEFORE any fresh lease serves"
+    );
+    assert_eq!(
+        tick,
+        membership::RenewalTick::FencedAndRejoined,
+        "the correct response is self-fence then re-join (the wire's own contract), \
+         never a silent resume as a live member"
+    );
+    assert!(
+        !client.session().fenced(),
+        "the post-fence session is a FRESH, clean-view member"
+    );
+    assert_ne!(
+        client.session().epoch(),
+        paused_epoch,
+        "the fresh lease is a new epoch — the dead one is never resurrected"
+    );
+    plane.shutdown();
+}
+
+/// The failover pin the fix must NOT break: a reclaim admitted by a
+/// successor's GRACE WINDOW is continuity — the member re-asserts the
+/// lease it already held and keeps its caches; forcing every member to
+/// fence+purge at owner failover would be the cluster-wide flush storm the
+/// window exists to prevent (spec §6.7 Recovery).
+#[tokio::test]
+async fn a_grace_window_reclaim_is_continuity_and_never_fences() {
+    let _serial = serial();
+    let secret = b"s6-grace-secret".to_vec();
+    let (clock1, _t1) = manual_clock();
+    let owner1 = owner_with(shipped_clocks(), clock1, 5);
+    let plane1 = MembershipPlane::start(
+        MembershipPlaneConfig::loopback(),
+        secret.clone(),
+        Arc::clone(&owner1),
+    )
+    .expect("plane1 binds");
+    let (member_clock, _mt) = manual_clock();
+    let req = join_req("grace-reader", MemberRole::Reader, None);
+    let mut client = MemberClient::join(
+        &plane1.endpoint().to_string(),
+        &secret,
+        req.clone(),
+        member_clock.clone(),
+    )
+    .await
+    .expect("join owner1");
+
+    // The owner dies; its successor bumps the term, opens grace over the
+    // predecessor's evidence, and serves from a NEW endpoint.
+    plane1.shutdown();
+    let (clock2, _t2) = manual_clock();
+    let owner2 = owner_with(shipped_clocks(), clock2, 6);
+    owner2.open_grace(vec!["grace-reader".to_string()]);
+    let plane2 = MembershipPlane::start(
+        MembershipPlaneConfig::loopback(),
+        secret.clone(),
+        Arc::clone(&owner2),
+    )
+    .expect("plane2 binds");
+
+    let purges = Arc::new(AtomicU64::new(0));
+    let on_purge: Arc<dyn Fn() + Send + Sync> = {
+        let purges = Arc::clone(&purges);
+        Arc::new(move || {
+            purges.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+    let fences_before = METRICS.membership_self_fences.load(Ordering::Relaxed);
+    let reclaims_before = METRICS.membership_grace_reclaims.load(Ordering::Relaxed);
+
+    let tick = membership::member_renewal_tick(
+        &mut client,
+        &plane2.endpoint().to_string(),
+        &secret,
+        &req,
+        &member_clock,
+        Some(&on_purge),
+    )
+    .await;
+
+    assert_eq!(
+        tick,
+        membership::RenewalTick::Rejoined,
+        "a grace-window reclaim is CONTINUITY — re-assert and keep serving"
+    );
+    assert_eq!(
+        METRICS.membership_self_fences.load(Ordering::Relaxed),
+        fences_before,
+        "failover re-assertion must not fence"
+    );
+    assert_eq!(purges.load(Ordering::SeqCst), 0, "and must not purge");
+    assert_eq!(
+        METRICS.membership_grace_reclaims.load(Ordering::Relaxed) - reclaims_before,
+        1,
+        "the successor counted the reclaim"
+    );
+    plane2.shutdown();
+}
+
+/// The rendezvous record must advertise an endpoint members can DIAL: an
+/// explicit `SQUEEZEFS_MEMBERSHIP_BIND=addr:port` on a specific interface
+/// must advertise THAT address — advertising the primary-interface IP
+/// names a place where nothing listens, and every member of that fleet
+/// stays silently invisible (found building the S6-b netns venue, where
+/// the dialable address and the primary IP genuinely differ).
+#[test]
+fn an_explicit_membership_bind_advertises_the_bound_address() {
+    let bind: std::net::SocketAddr = "10.11.12.13:7401".parse().expect("literal");
+    assert_eq!(
+        membership::owner_advertise_endpoint(bind, 7401),
+        "10.11.12.13:7401",
+        "an explicit bind is the operator saying WHERE the plane is served"
+    );
+    // The `auto` posture (0.0.0.0:0) keeps today's behavior: nothing
+    // listens 'at' the unspecified address, so the advertised IP is the
+    // primary-interface derivation.
+    let auto: std::net::SocketAddr = "0.0.0.0:0".parse().expect("literal");
+    let advertised = membership::owner_advertise_endpoint(auto, 4567);
+    assert!(
+        advertised.ends_with(":4567"),
+        "auto advertises the BOUND port ({advertised})"
+    );
+    assert!(
+        !advertised.starts_with("0.0.0.0"),
+        "the unspecified address is never advertised ({advertised})"
+    );
+}

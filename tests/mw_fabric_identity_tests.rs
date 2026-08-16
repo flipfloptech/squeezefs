@@ -853,6 +853,171 @@ fn multipath_merged_shape_non_head_and_identityless_paths_are_none() {
     );
 }
 
+// ===========================================================================
+// rung 6b — scoped-sibling RESOLUTION (the 5b deferred item, landed with
+// the guest validation): on the sqz host-scoped kernel
+// (`nvme_core.fabrics_host_scoped_subsystems=Y`) two sibling subsystems
+// share one subsysnqn, each carrying its OWN controller entries (the
+// kernel's sysfs_create_link membership), its OWN `sqz_host_scope`, and
+// its OWN head. Fixture shape = the REAL scoped sysfs shape observed in
+// the rung-6b qemu guest (6.19.14-sqz, patch 0030) — see the
+// vm-hostscope-validate leg's captured evidence; the design §5 sketch
+// (subsystem-dir controller links as membership) HELD as observed.
+// The pre-6b `foreign_serves` computation was subsysnqn-attr-GLOBAL and
+// read a scoped sibling as foreign (honest None for BOTH identities);
+// resolution must scope serving membership to the subsystem dir's
+// controller entries, exactly like `multipath_merged_shape_at`.
+// ===========================================================================
+
+/// The sqz host-scoped sibling shape: two subsystems, ONE subsysnqn, one
+/// controller + one head each, controller entries inside each subsystem
+/// dir (fixture stand-ins for the kernel's controller links — dirs
+/// carrying the same attrs the linked controller dir answers).
+fn scoped_sibling_fixture(subsys: &Path, nvme: &Path, a: &HostIdentity, b: &HostIdentity) {
+    mk_entry(nvme, "nvme0", &ctrl_attrs(NQN_SUBSYS, a), &["nvme0c0n1"]);
+    mk_entry(nvme, "nvme1", &ctrl_attrs(NQN_SUBSYS, b), &["nvme1c1n1"]);
+    mk_entry(
+        subsys,
+        "nvme-subsys0",
+        &[("subsysnqn", NQN_SUBSYS), ("sqz_host_scope", &a.hostnqn)],
+        &["nvme0n1"],
+    );
+    mk_entry(
+        subsys,
+        "nvme-subsys1",
+        &[("subsysnqn", NQN_SUBSYS), ("sqz_host_scope", &b.hostnqn)],
+        &["nvme1n1"],
+    );
+    for (sdir, ctrl, id) in [("nvme-subsys0", "nvme0", a), ("nvme-subsys1", "nvme1", b)] {
+        let dir = subsys.join(sdir).join(ctrl);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (file, contents) in ctrl_attrs(NQN_SUBSYS, id) {
+            std::fs::write(dir.join(file), format!("{contents}\n")).unwrap();
+        }
+    }
+}
+
+#[test]
+fn identity_resolution_scoped_siblings_resolve_their_own_heads() {
+    let t = tempfile::tempdir().unwrap();
+    let (subsys, nvme) = roots(&t);
+    let a = id_a();
+    let b = id_b();
+    scoped_sibling_fixture(&subsys, &nvme, &a, &b);
+
+    // Each identity resolves ITS sibling's head — the co-located
+    // two-identity shape 0030 exists to produce. A global attr walk
+    // reads the sibling as foreign and answers None for both.
+    assert_eq!(
+        find_device_for_nqn_under_identity_at(&subsys, &nvme, NQN_SUBSYS, &a)
+            .expect("walk must not error")
+            .as_deref(),
+        Some("/dev/nvme0n1"),
+        "identity A resolves its own scoped sibling's head"
+    );
+    assert_eq!(
+        find_device_for_nqn_under_identity_at(&subsys, &nvme, NQN_SUBSYS, &b)
+            .expect("walk must not error")
+            .as_deref(),
+        Some("/dev/nvme1n1"),
+        "identity B resolves its own scoped sibling's head"
+    );
+}
+
+#[test]
+fn identity_resolution_scoped_membership_keeps_the_dedicated_only_law() {
+    let t = tempfile::tempdir().unwrap();
+    let (subsys, nvme) = roots(&t);
+    let a = id_a();
+    let b = id_b();
+    // A subsystem dir whose controller ENTRIES carry both identities (a
+    // merged dir even under linked membership — the stock shape seen
+    // through links, or a misconfigured scope): the dedicated-only law
+    // holds — the head is never handed out to either identity.
+    mk_entry(&nvme, "nvme0", &ctrl_attrs(NQN_SUBSYS, &a), &["nvme0c0n1"]);
+    mk_entry(&nvme, "nvme1", &ctrl_attrs(NQN_SUBSYS, &b), &["nvme1c1n1"]);
+    mk_entry(
+        &subsys,
+        "nvme-subsys0",
+        &[("subsysnqn", NQN_SUBSYS)],
+        &["nvme0n1"],
+    );
+    for (ctrl, id) in [("nvme0", &a), ("nvme1", &b)] {
+        let dir = subsys.join("nvme-subsys0").join(ctrl);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (file, contents) in ctrl_attrs(NQN_SUBSYS, id) {
+            std::fs::write(dir.join(file), format!("{contents}\n")).unwrap();
+        }
+    }
+    for id in [&a, &b] {
+        assert_eq!(
+            find_device_for_nqn_under_identity_at(&subsys, &nvme, NQN_SUBSYS, id)
+                .expect("walk must not error"),
+            None,
+            "a head whose linked membership carries a foreign identity is never handed out"
+        );
+    }
+}
+
+#[test]
+fn identity_resolution_scoped_identityless_entry_is_never_ours() {
+    let t = tempfile::tempdir().unwrap();
+    let (subsys, nvme) = roots(&t);
+    let a = id_a();
+    // A subsystem dir whose serving set contains an identity-LESS
+    // controller entry (no hostnqn/hostid attrs): half an identity is no
+    // identity — the set cannot verify as dedicated to us.
+    mk_entry(&nvme, "nvme0", &ctrl_attrs(NQN_SUBSYS, &a), &["nvme0c0n1"]);
+    mk_entry(
+        &subsys,
+        "nvme-subsys0",
+        &[("subsysnqn", NQN_SUBSYS)],
+        &["nvme0n1"],
+    );
+    let ours = subsys.join("nvme-subsys0").join("nvme0");
+    std::fs::create_dir_all(&ours).unwrap();
+    for (file, contents) in ctrl_attrs(NQN_SUBSYS, &a) {
+        std::fs::write(ours.join(file), format!("{contents}\n")).unwrap();
+    }
+    let bare = subsys.join("nvme-subsys0").join("nvme1");
+    std::fs::create_dir_all(&bare).unwrap();
+    std::fs::write(bare.join("subsysnqn"), format!("{NQN_SUBSYS}\n")).unwrap();
+
+    assert_eq!(
+        find_device_for_nqn_under_identity_at(&subsys, &nvme, NQN_SUBSYS, &a)
+            .expect("walk must not error"),
+        None,
+        "an identity-less serving entry can never verify as ours (fail-closed)"
+    );
+}
+
+#[test]
+fn actual_identity_scoped_sibling_head_reads_only_its_dirs_controllers() {
+    let t = tempfile::tempdir().unwrap();
+    let (subsys, nvme) = roots(&t);
+    let a = id_a();
+    let b = id_b();
+    scoped_sibling_fixture(&subsys, &nvme, &a, &b);
+
+    // Rule 2's census under a scoped sibling's head must read ONLY the
+    // sibling's own linked controllers — the global attr walk collects
+    // the OTHER identity too and refuses a genuinely dedicated head
+    // (exactly how the un-fixed walk would refuse identity B's mount in
+    // the rung-6b guest).
+    assert_eq!(
+        controller_identities_for_device_at(&subsys, &nvme, "/dev/nvme0n1")
+            .expect("walk must not error"),
+        vec![a.clone()],
+        "sibling 0's head carries identity A alone"
+    );
+    assert_eq!(
+        controller_identities_for_device_at(&subsys, &nvme, "/dev/nvme1n1")
+            .expect("walk must not error"),
+        vec![b.clone()],
+        "sibling 1's head carries identity B alone"
+    );
+}
+
 fn merged_fixture() -> MultipathMergedShape {
     let mut hostnqns = vec![id_a().hostnqn, id_b().hostnqn];
     hostnqns.sort();

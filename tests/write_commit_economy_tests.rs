@@ -47,8 +47,14 @@ fn make_file(dir: &Path, name: &str, len: u64) -> PathBuf {
     p
 }
 
+/// Single-writer (unstamped) class: this suite drives the backend's
+/// delta-publish law DIRECTLY with hand-built, version-less
+/// `LayoutDelta`s — the raw pre-bit-15 form. On the rung-10b default
+/// (stamped) class the routing layer mints the version links, and that
+/// composed economy (deltas still O(batch), exactly 16 bytes/link) is
+/// pinned in `tests/mw_layout_version_tests.rs`.
 async fn format_meta(path: &Path) {
-    squeezefs::meta_backend::kv::builder::format_v3(
+    squeezefs::meta_backend::kv::builder::format_v3_single_writer(
         path,
         VOL_LEN,
         &squeezefs::meta_backend::kv::builder::FormatV3Options {

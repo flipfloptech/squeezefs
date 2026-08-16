@@ -1981,7 +1981,13 @@ async fn kill9_crash_matrix_ow1_to_ow7() {
         let newv = vec![0x8Cu8; FBS as usize];
 
         let (ino, expect_block0_new) = {
-            let h = make_harness_on(&format!("b4c2_{case}_s1"), backing, m, true, None).await;
+            // ONE volume identity across both sessions — the production
+            // remount shape (KD-5: vol identity is durable; a remount
+            // never changes it). Distinct per-session ids made the C8
+            // oracle's counted census and the durable ledger disagree by
+            // construction once the rung-10b default format stamped
+            // bit 9 — a harness artifact, not a recovery bug.
+            let h = make_harness_on(&format!("b4c2_{case}"), backing, m, true, None).await;
             let ino = striped_fixture_with(&h, "f1", &old).await;
             let expect_new = match case {
                 // OW-1: ACKed, record OPEN (partial coverage), DMA'd —
@@ -2047,7 +2053,7 @@ async fn kill9_crash_matrix_ow1_to_ow7() {
             // KILL-9: drop the daemon with whatever state the case left.
             let (backing, m) = dismantle(h);
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            let h2 = make_harness_on(&format!("b4c2_{case}_s2"), backing, m, false, None).await;
+            let h2 = make_harness_on(&format!("b4c2_{case}"), backing, m, false, None).await;
             let got = read_at(&h2, ino, 0, FBS as usize).await;
             if expect_new {
                 assert_eq!(

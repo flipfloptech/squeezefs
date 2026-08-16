@@ -13225,8 +13225,10 @@ impl SqueezefsFilesystem {
                 // declines into a path whose own durability boundaries
                 // follow; the idle sweeper / next fsync back the hint.
                 write_phase(ino, offset_hint, b, WP_OV_SETTLE_PRE);
-                // Round 4: converged — never EIO a write on transient churn.
-                self.settle_overlay_block_converged(ino, b, false).await?;
+                // Round 5: the write-arm form — retry forever on
+                // transients (the writeback ladder's law); never EIO a
+                // write for legal churn.
+                self.settle_overlay_block_write_arm(ino, b).await?;
                 return Ok(false);
             }
             None => {
@@ -13390,8 +13392,9 @@ impl SqueezefsFilesystem {
                 write_phase(ino, offset_hint, b, WP_OV_SETTLE_RETRY);
                 // DELIBERATE close-hint dropper (§5.4 venue law) — the
                 // accumulation fallback's own boundaries follow.
-                // Round 4: converged — never EIO a write on transient churn.
-                self.settle_overlay_block_converged(ino, b, false).await?;
+                // Round 5: the write-arm form — retry forever on
+                // transients (the writeback ladder's law).
+                self.settle_overlay_block_write_arm(ino, b).await?;
                 return Ok(false);
             }
         };
@@ -13907,7 +13910,16 @@ impl SqueezefsFilesystem {
         b: u32,
         barrier: bool,
     ) -> Result<bool, SqueezefsError> {
-        const SETTLE_RETRIES: u32 = 4;
+        // The READ/drain-venue budget: the rebind-starvation ladder's own
+        // posture (MAX_REBINDS = 24 with the bounded exponential backoff
+        // tail — `get_block_for_index`'s constants, reused rather than a
+        // fresh number; round 5: the round-4 budget of 4 was a constant
+        // with no lineage and too small for saturated-fabric boxes). The
+        // record stays Frozen and never-lossy between attempts; a failure
+        // outlasting THIS budget on a read/drain venue is the honest EIO
+        // that remains (the write arms ride the retry-forever form below
+        // — the writeback ladder's law).
+        const SETTLE_RETRIES: u32 = 24;
         let mut last: Option<SqueezefsError> = None;
         for attempt in 0..SETTLE_RETRIES {
             if attempt > 0 {
@@ -13923,6 +13935,49 @@ impl SqueezefsFilesystem {
             }
         }
         Err(last.expect("loop ran"))
+    }
+
+    /// The WRITE-ARM settle form (round 5 — the dead-writer law taken to
+    /// its house-law terminal): the data-path writeback ladder is
+    /// RETRY-FOREVER on transients (AGENTS: "transient ⇒ retry forever
+    /// (never-lossy)"), and a WRITE parked on a Frozen record's settle is
+    /// that ladder's shape exactly — the record's acked bytes are
+    /// never-lossy custody, the write cannot legally proceed past them
+    /// (one-authority), and an errno converts legal churn into
+    /// application-visible data-path failure (the round-4/5
+    /// falsifications' dead writer, twice). So: retry forever with the
+    /// bounded backoff, warn loudly at power-of-two attempts (the
+    /// ack-early store's own pattern), fence refusals immediate (the
+    /// remount law owns those). A genuinely-broken device wedges the
+    /// write EXACTLY like the writeback ladder wedges — the watchdog
+    /// names it loudly; that is the shipped posture for every other
+    /// write shape.
+    pub(crate) async fn settle_overlay_block_write_arm(
+        &self,
+        ino: u64,
+        b: u32,
+    ) -> Result<bool, SqueezefsError> {
+        let mut attempt: u64 = 0;
+        loop {
+            match self.settle_overlay_block_locked(ino, b, false).await {
+                Ok(hint) => return Ok(hint),
+                Err(e @ SqueezefsError::WriterGuardFenced) => return Err(e),
+                Err(e) => {
+                    attempt = attempt.saturating_add(1);
+                    if attempt.is_power_of_two() {
+                        warn!(
+                            "write-arm settle for ino {ino} block {b} failed attempt \
+                             {attempt}: {e:?} — the write retries until the settle \
+                             lands (never-lossy; the record stays Frozen)"
+                        );
+                    }
+                    squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(
+                        (1u64 << attempt.min(6)).min(50),
+                    ))
+                    .await;
+                }
+            }
+        }
     }
 
     pub(crate) async fn settle_overlay_block_locked(
@@ -14933,13 +14988,12 @@ impl SqueezefsFilesystem {
                 // may never coexist on one block.
                 if crate::device_overlay::any_open_fast() {
                     write_phase(ino, offset, b as u32, WP_OVERLAY_SETTLE);
-                    // Round 4: the CONVERGED form — a transient settle
-                    // failure must not EIO this write (the storm's dead-
-                    // writer falsification); persistent failure stays loud.
-                    match self
-                        .settle_overlay_block_converged(ino, b as u32, false)
-                        .await
-                    {
+                    // Round 5: the write-arm form — retry forever on
+                    // transients (the writeback ladder's law); a transient
+                    // settle failure must never EIO this write (the
+                    // round-4/5 dead-writer falsifications). Fence
+                    // refusals stay immediate (the remount law owns those).
+                    match self.settle_overlay_block_write_arm(ino, b as u32).await {
                         Err(e) => {
                             std::mem::drop(block_guard);
                             return Err(e);

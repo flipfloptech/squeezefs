@@ -1577,6 +1577,214 @@ async fn a_frozen_member_whose_lease_died_fences_and_purges_before_rejoining() {
 /// The failover pin the fix must NOT break: a reclaim admitted by a
 /// successor's GRACE WINDOW is continuity — the member re-asserts the
 /// lease it already held and keeps its caches; forcing every member to
+/// Rung-8 finding #1 (found live by the S7-a device-fence row, 2026-08-16):
+/// a READER member that self-fences **by its own deadline** (T_self passed
+/// — the frozen/hung-OWNER shape, the exact dual of S6-b′'s frozen member)
+/// purged correctly but `RenewalTick::Fenced` EXITED the renewal loop
+/// permanently: the mount stayed fenced forever, `membership_mode` kept
+/// reading `member` off the stranded session, and zero renewals ever
+/// happened again — the fleet's reader was silently dead until remount.
+/// Only the UnknownLease class got rung-7's fence-then-rejoin ladder. The
+/// law is ONE law for every fence a purge can make clean: fence FIRST,
+/// purge, then re-present FRESH (a dead lease is never resurrected).
+#[tokio::test]
+async fn a_reader_fenced_by_its_own_deadline_purges_and_rejoins_when_the_owner_answers() {
+    let _serial = serial();
+    let secret = b"s7-deadline-fence-secret".to_vec();
+    let (owner_clock, _oticks) = manual_clock();
+    let owner = owner_with(shipped_clocks(), owner_clock, 7);
+    let plane = MembershipPlane::start(
+        MembershipPlaneConfig::loopback(),
+        secret.clone(),
+        Arc::clone(&owner),
+    )
+    .expect("plane binds loopback");
+    let endpoint = plane.endpoint().to_string();
+
+    let (member_clock, mticks) = manual_clock();
+    let req = join_req("deadline-reader", MemberRole::Reader, None);
+    let mut client = MemberClient::join(&endpoint, &secret, req.clone(), member_clock.clone())
+        .await
+        .expect("join");
+    let stranded_session = Arc::clone(client.session());
+    let stranded_epoch = stranded_session.epoch();
+
+    // The owner swept the lease while this member could not renew, and the
+    // member's OWN clock has run past T_self (SIGSTOP leaves the clock
+    // running; a hung owner leaves the member's renewals unanswered).
+    owner
+        .evict(
+            "deadline-reader",
+            "lease TTL expired while the owner was unreachable (test)",
+        )
+        .expect("evict");
+    mticks.fetch_add(60_000, Ordering::SeqCst);
+    assert!(
+        stranded_session.self_fence_due(),
+        "the shape under test IS the deadline arm — T_self must read as passed"
+    );
+
+    let purges = Arc::new(AtomicU64::new(0));
+    let on_purge: Arc<dyn Fn() + Send + Sync> = {
+        let purges = Arc::clone(&purges);
+        Arc::new(move || {
+            purges.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+    let fences_before = METRICS.membership_self_fences.load(Ordering::Relaxed);
+
+    let tick = membership::member_renewal_tick(
+        &mut client,
+        &endpoint,
+        &secret,
+        &req,
+        &member_clock,
+        Some(&on_purge),
+    )
+    .await;
+
+    assert_eq!(
+        METRICS.membership_self_fences.load(Ordering::Relaxed) - fences_before,
+        1,
+        "the member must self-fence exactly once (tick answered {tick:?})"
+    );
+    assert!(stranded_session.fenced(), "the dead-era session is fenced");
+    assert_eq!(
+        purges.load(Ordering::SeqCst),
+        1,
+        "the reader's purge must run before any fresh lease serves"
+    );
+    assert_eq!(
+        tick,
+        membership::RenewalTick::FencedAndRejoined,
+        "a PURGED reader's deadline fence must re-present FRESH — returning Fenced \
+         exits the renewal loop and strands the mount fenced-forever (the rung-8 \
+         S7-a live finding)"
+    );
+    assert!(
+        !client.session().fenced(),
+        "the post-fence session is a fresh, clean-view member"
+    );
+    assert_ne!(
+        client.session().epoch(),
+        stranded_epoch,
+        "the fresh lease is a new epoch — a dead lease is never resurrected"
+    );
+    plane.shutdown();
+}
+
+/// The same deadline fence with the owner still DARK: the tick must answer
+/// `RejoinRefused` (the loop RETRIES until the owner answers) — never the
+/// loop-terminal `Fenced` a purged reader got before the fix.
+#[tokio::test]
+async fn a_reader_fenced_by_deadline_with_the_owner_dark_keeps_retrying() {
+    let _serial = serial();
+    let secret = b"s7-dark-owner-secret".to_vec();
+    let (owner_clock, _oticks) = manual_clock();
+    let owner = owner_with(shipped_clocks(), owner_clock, 7);
+    let plane = MembershipPlane::start(
+        MembershipPlaneConfig::loopback(),
+        secret.clone(),
+        Arc::clone(&owner),
+    )
+    .expect("plane binds loopback");
+    let endpoint = plane.endpoint().to_string();
+
+    let (member_clock, mticks) = manual_clock();
+    let req = join_req("dark-owner-reader", MemberRole::Reader, None);
+    let mut client = MemberClient::join(&endpoint, &secret, req.clone(), member_clock.clone())
+        .await
+        .expect("join");
+
+    // The owner goes DARK (a dead process closes its listener — the fast
+    // half; a frozen one times out — same ladder, slower venue), and the
+    // member's clock runs past T_self.
+    plane.shutdown();
+    mticks.fetch_add(60_000, Ordering::SeqCst);
+    assert!(client.session().self_fence_due());
+
+    let purges = Arc::new(AtomicU64::new(0));
+    let on_purge: Arc<dyn Fn() + Send + Sync> = {
+        let purges = Arc::clone(&purges);
+        Arc::new(move || {
+            purges.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+    let tick = membership::member_renewal_tick(
+        &mut client,
+        &endpoint,
+        &secret,
+        &req,
+        &member_clock,
+        Some(&on_purge),
+    )
+    .await;
+
+    assert_eq!(
+        purges.load(Ordering::SeqCst),
+        1,
+        "the purge runs at the fence, before any re-present attempt"
+    );
+    assert_eq!(
+        tick,
+        membership::RenewalTick::RejoinRefused,
+        "with the owner dark the purged reader must keep RETRYING the fresh join — \
+         Fenced is loop-terminal and strands the mount forever"
+    );
+}
+
+/// The asymmetry the fix must NOT erase: a WRITER member's deadline fence
+/// poisons process data custody (S7) — no purge can make that clean, so a
+/// writer NEVER re-presents fresh. `Fenced` is the correct terminal there.
+#[tokio::test]
+async fn a_writer_member_fenced_by_its_own_deadline_never_re_presents() {
+    let _serial = serial();
+    squeezefs::data_custody::test_clear_poison();
+    let secret = b"s7-writer-fence-secret".to_vec();
+    let (owner_clock, _oticks) = manual_clock();
+    let owner = owner_with(shipped_clocks(), owner_clock, 7);
+    let plane = MembershipPlane::start(
+        MembershipPlaneConfig::loopback(),
+        secret.clone(),
+        Arc::clone(&owner),
+    )
+    .expect("plane binds loopback");
+    let endpoint = plane.endpoint().to_string();
+
+    let (member_clock, mticks) = manual_clock();
+    let req = join_req("deadline-writer", MemberRole::Writer, None);
+    let mut client = MemberClient::join(&endpoint, &secret, req.clone(), member_clock.clone())
+        .await
+        .expect("join");
+    owner
+        .evict("deadline-writer", "lease TTL expired (test)")
+        .expect("evict");
+    mticks.fetch_add(60_000, Ordering::SeqCst);
+    assert!(client.session().self_fence_due());
+
+    let tick = membership::member_renewal_tick(
+        &mut client,
+        &endpoint,
+        &secret,
+        &req,
+        &member_clock,
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        tick,
+        membership::RenewalTick::Fenced,
+        "a writer's deadline fence is terminal — its S7 poison cannot be made clean"
+    );
+    assert!(
+        squeezefs::data_custody::poisoned(),
+        "the writer's self-fence must have poisoned process data custody (S7)"
+    );
+    squeezefs::data_custody::test_clear_poison();
+    plane.shutdown();
+}
+
 /// fence+purge at owner failover would be the cluster-wide flush storm the
 /// window exists to prevent (spec §6.7 Recovery).
 #[tokio::test]

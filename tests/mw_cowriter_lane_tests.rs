@@ -1532,3 +1532,202 @@ fn a_one_writer_set_derives_solo_under_the_one_claim_identity_law() {
          what the caller must never do (it must pass owner_claim_identity)"
     );
 }
+
+// ===========================================================================
+// 9. Phantom-era frontier hygiene (rung 10 — rung-8 finding #4's named
+//    residual: "volumes that already ran the phantom-width eras keep their
+//    stale alloc_lane frontier records + stranded blocks; record hygiene
+//    for retired widths belongs to rungs 9-10")
+// ===========================================================================
+
+/// Contract (residual 1, the SOLO arm): a multi-writer arm whose era derives
+/// SOLO **prunes every `alloc_lane:` record the set carries** — under solo
+/// the records are read by nothing (a solo engagement installs nothing), and
+/// the D0 admission that let this mount arm at all is the proof no live peer
+/// of ANY prior width exists: the claim set is the era, and a solo era means
+/// every prior writer member was explicitly retired from it. Leaving the
+/// records would re-floor every lane of the NEXT partitioned era at a
+/// phantom frontier (recovery clause 3), stranding blocks forever.
+///
+/// RED against dev tip: `prune_stale_lane_records` does not exist — the
+/// records survive every arm, exactly as rung 8's evidence note stated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_solo_era_arm_prunes_every_stale_lane_record() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "prune-solo").await;
+    let meta = Arc::new(
+        squeezefs::meta_backend::open_routed_meta_set(&[vol.display().to_string()])
+            .await
+            .expect("the authority mounts its own set"),
+    );
+    let tag = squeezefs::meta_backend::kv::block_refs::volume_tag(DATA_VOL);
+
+    // The phantom-era residue, exactly as finding #4 minted it: a W=2 era's
+    // frontier records on a set whose claim roster names ONE writer.
+    lane::commit_lane_raise(&meta, tag, 0, 2, 1056, None)
+        .await
+        .expect("the phantom lane-0 record commits");
+    lane::commit_lane_raise(&meta, tag, 1, 2, 640, None)
+        .await
+        .expect("the phantom lane-1 record commits");
+    assert_eq!(
+        lane::load_lane_reservations(&meta, DATA_VOL)
+            .await
+            .expect("records decode")
+            .len(),
+        2,
+        "fixture: the stale records are durable"
+    );
+
+    let pruned_before = METRICS
+        .alloc_lane_stale_records_pruned
+        .load(Ordering::Relaxed);
+    let report = lane::prune_stale_lane_records(&meta, 1)
+        .await
+        .expect("the hygiene pass runs");
+    assert_eq!(report.pruned, 2, "both phantom-era records are deleted");
+    assert_eq!(
+        report.folded, 0,
+        "a solo era folds nothing — there is no current-width record to \
+         carry the protection, and none is needed (the D0 admission is the \
+         no-live-peer proof)"
+    );
+    assert!(
+        lane::load_lane_reservations(&meta, DATA_VOL)
+            .await
+            .expect("records decode")
+            .is_empty(),
+        "the volume carries no alloc_lane residue after the solo prune"
+    );
+    assert_eq!(
+        METRICS
+            .alloc_lane_stale_records_pruned
+            .load(Ordering::Relaxed)
+            - pruned_before,
+        2,
+        "the hygiene pass is gauged (alloc_lane_stale_records_pruned)"
+    );
+    // Idempotent: a second pass finds nothing.
+    let again = lane::prune_stale_lane_records(&meta, 1)
+        .await
+        .expect("the second pass runs");
+    assert_eq!((again.pruned, again.folded), (0, 0));
+
+    for v in &meta.volumes {
+        v.shutdown().await.expect("clean unmount");
+    }
+}
+
+/// Contract (residual 1, the PARTITIONED arm): under a live width `W`, a
+/// record at a FOREIGN width is **folded before it is deleted** — every
+/// current-width lane's record is raised to at least the stale record's
+/// frontier, and only then is the stale record removed. That preserves the
+/// recovery rule's clause-3 guarantee ("a foreign-width record floors every
+/// lane") through the deletion: a fenced-but-live writer of the retired era
+/// may still hold minted-unpublished offsets below that frontier, and no
+/// lane of the CURRENT era may ever mint over them. Fold-then-delete is
+/// also crash-safe by construction: a crash between the fold and the delete
+/// leaves BOTH protections standing, and the next arm's pass converges.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_foreign_width_record_is_folded_into_every_current_lane_before_deletion() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "prune-fold").await;
+    let meta = Arc::new(
+        squeezefs::meta_backend::open_routed_meta_set(&[vol.display().to_string()])
+            .await
+            .expect("the authority mounts its own set"),
+    );
+    let tag = squeezefs::meta_backend::kv::block_refs::volume_tag(DATA_VOL);
+
+    // A retired W=4 era's frontier, plus a CURRENT-era (W=2) record that
+    // must survive the pass untouched except for the fold's raise.
+    lane::commit_lane_raise(&meta, tag, 3, 4, 800, None)
+        .await
+        .expect("the retired-era record commits");
+    lane::commit_lane_raise(&meta, tag, 1, 2, 100, None)
+        .await
+        .expect("the current-era record commits");
+
+    let report = lane::prune_stale_lane_records(&meta, 2)
+        .await
+        .expect("the hygiene pass runs");
+    assert_eq!(report.pruned, 1, "exactly the retired-era record is deleted");
+    assert_eq!(report.folded, 1, "and it was folded first");
+
+    let records = lane::load_lane_reservations(&meta, DATA_VOL)
+        .await
+        .expect("records decode");
+    assert!(
+        records.iter().all(|r| r.writers == 2),
+        "only current-width records remain: {records:?}"
+    );
+    for lane_id in 0..2u16 {
+        let rec = records
+            .iter()
+            .find(|r| r.lane == lane_id)
+            .unwrap_or_else(|| panic!("lane {lane_id} carries a folded record"));
+        assert!(
+            rec.reserved_upto >= 800,
+            "lane {lane_id}'s frontier absorbed the retired era's protection \
+             (got {}, want >= 800)",
+            rec.reserved_upto
+        );
+        // The recovery rule over the POST-PRUNE records still refuses to
+        // mint below the retired era's frontier — the honesty half.
+        let floor = lane::recover_lane_floor(&records, 0, part(2, lane_id));
+        assert!(
+            floor >= 800,
+            "lane {lane_id} recovery floor {floor} dropped below the retired \
+             era's 800 — the fold lost the clause-3 protection"
+        );
+    }
+
+    for v in &meta.volumes {
+        v.shutdown().await.expect("clean unmount");
+    }
+}
+
+/// Contract (residual 1, the KEEP arm): a record at the CURRENT width is
+/// never touched by the hygiene pass — it IS this era's protection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_current_width_record_is_never_pruned() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "prune-keep").await;
+    let meta = Arc::new(
+        squeezefs::meta_backend::open_routed_meta_set(&[vol.display().to_string()])
+            .await
+            .expect("the authority mounts its own set"),
+    );
+    let tag = squeezefs::meta_backend::kv::block_refs::volume_tag(DATA_VOL);
+    lane::commit_lane_raise(&meta, tag, 1, 2, 64, None)
+        .await
+        .expect("the current-era record commits");
+
+    let report = lane::prune_stale_lane_records(&meta, 2)
+        .await
+        .expect("the hygiene pass runs");
+    assert_eq!((report.pruned, report.folded), (0, 0));
+    let records = lane::load_lane_reservations(&meta, DATA_VOL)
+        .await
+        .expect("records decode");
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0],
+        lane::LaneReservation {
+            writers: 2,
+            lane: 1,
+            reserved_upto: 64
+        },
+        "the current-width record is byte-identical after the pass"
+    );
+
+    for v in &meta.volumes {
+        v.shutdown().await.expect("clean unmount");
+    }
+}

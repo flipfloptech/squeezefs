@@ -5126,6 +5126,16 @@ pub struct Metrics {
     /// each volume engages). This is the number capacity planning uses;
     /// adopting a lane lowers it.
     pub alloc_lane_stranded_bytes: Align64<AtomicU64>,
+    /// Stale `alloc_lane:` records **pruned** by the arm-time hygiene pass
+    /// (rung 10 — rung-8 finding #4's residual): records whose width belongs
+    /// to no live claim-set era. Nonzero once per affected volume set, then
+    /// flat — steady growth means something keeps minting retired-era
+    /// frontiers (`data_alloc_lane::prune_stale_lane_records`).
+    pub alloc_lane_stale_records_pruned: Align64<AtomicU64>,
+    /// The subset of pruned records whose frontier was FOLDED into every
+    /// current-width lane record first (the partitioned arm — clause-3
+    /// protection carried through the delete). 0 under a solo era.
+    pub alloc_lane_stale_records_folded: Align64<AtomicU64>,
     // DLM **S9** (spec §6.2 item 7's consumer half): the CO-WRITER mount
     // posture. All four are 0 on every shipped mount — the posture is
     // opt-in twice over (`SQUEEZEFS_MULTI_WRITER=1` +
@@ -9141,6 +9151,12 @@ impl SqueezefsFilesystem {
                 "alloc_lane_adoptions": METRICS.alloc_lane_adoptions.load(Ordering::Relaxed),
                 "alloc_lane_enospc_refusals": METRICS.alloc_lane_enospc_refusals.load(Ordering::Relaxed),
                 "alloc_lane_stranded_bytes": METRICS.alloc_lane_stranded_bytes.load(Ordering::Relaxed),
+                "alloc_lane_stale_records_pruned": METRICS
+                    .alloc_lane_stale_records_pruned
+                    .load(Ordering::Relaxed),
+                "alloc_lane_stale_records_folded": METRICS
+                    .alloc_lane_stale_records_folded
+                    .load(Ordering::Relaxed),
                 // DLM S9 (spec §6.2 item 7's consumer half): the mount
                 // POSTURE and the co-writer ledger. `mount_posture` is the
                 // one word that says which of the three shapes this daemon

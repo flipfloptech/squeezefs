@@ -1655,7 +1655,10 @@ async fn a_foreign_width_record_is_folded_into_every_current_lane_before_deletio
     let report = lane::prune_stale_lane_records(&meta, 2)
         .await
         .expect("the hygiene pass runs");
-    assert_eq!(report.pruned, 1, "exactly the retired-era record is deleted");
+    assert_eq!(
+        report.pruned, 1,
+        "exactly the retired-era record is deleted"
+    );
     assert_eq!(report.folded, 1, "and it was folded first");
 
     let records = lane::load_lane_reservations(&meta, DATA_VOL)

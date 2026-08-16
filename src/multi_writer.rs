@@ -515,6 +515,41 @@ pub async fn arm_multi_writer(
         }
     };
     owner.install_lane_assignment(Arc::clone(&assignment));
+    // Rung 10 — phantom-era frontier hygiene (rung-8 finding #4's named
+    // residual): records of a width no live era runs are pruned HERE, at
+    // the one node that both knows the era's width (it just derived it
+    // from the durable claim set) and holds the metadata authority to
+    // delete them. The pass folds a foreign-width record's protection
+    // into every current-width lane FIRST (clause 3 preserved through the
+    // delete); a solo era deletes outright — its D0 admission is the
+    // no-live-peer proof and a solo engagement reads no records at all.
+    // An undecodable record refuses the arm loud (the load law: a
+    // watermark we cannot read is a floor we cannot honour — and one we
+    // must not delete).
+    match crate::data_alloc_lane::prune_stale_lane_records(meta, assignment.writers()).await {
+        Ok(report) if report.pruned > 0 => {
+            log::warn!(
+                "multi-writer arm: pruned {} stale allocation-lane record(s) ({} folded into \
+                 the current {}-way era first) — retired-width residue is gone from this set \
+                 (alloc_lane_stale_records_pruned)",
+                report.pruned,
+                report.folded,
+                assignment.writers(),
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            if let Some(hold) = wero {
+                data_custody::release_hold(hold).await;
+            }
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "multi-writer refuses to arm: the allocation-lane hygiene pass failed ({e}). A \
+                 lane record that cannot be read or folded is a frontier that cannot be \
+                 honoured — arming over it could let this era mint offsets a retired era's \
+                 fenced writer may still hold"
+            )));
+        }
+    }
     let authority_lane = assignment.authority_partition();
     if !authority_lane.is_solo() {
         let Some(backend) = backend else {

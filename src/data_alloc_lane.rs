@@ -697,6 +697,117 @@ pub async fn load_lane_reservations(
     .await
 }
 
+/// What one [`prune_stale_lane_records`] pass did — explicit so the arm can
+/// log it and the contracts can pin it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LanePruneReport {
+    /// Stale records deleted.
+    pub pruned: u64,
+    /// Stale records whose frontier was FOLDED into every current-width
+    /// lane record before deletion (the partitioned arm; always 0 under a
+    /// solo era).
+    pub folded: u64,
+}
+
+/// **Phantom-era frontier hygiene** (rung 10 — rung-8 finding #4's named
+/// residual): delete every `alloc_lane:` record whose width belongs to no
+/// live claim-set era, preserving the recovery rule's protection through
+/// the deletion.
+///
+/// The era is the DURABLE claim set (`crate::alloc_lane_grant`'s law: the
+/// width is derived from it and from nothing else), so at an authority's
+/// multi-writer arm `current_writers` — the width the era just derived —
+/// is the ONE width whose records are live. Everything else is residue of
+/// a retired era: rung-8 finding #4's phantom self-partition (a solo MW
+/// mount running `W = 2` against itself left `~33 blocks/volume/crash` of
+/// reserved-never-minted frontier that fsck C6 correctly reported as
+/// drift), or an honest past width the roster has since moved off.
+///
+/// Two arms, each with its own safety proof:
+///
+/// * **solo (`current_writers <= 1`): delete everything.** A solo era
+///   reads no records at all (a solo engagement installs nothing), so the
+///   records protect nothing NOW; and the D0 admission that let this
+///   mount arm — plus the claim set naming no other writer, which is what
+///   made the era solo — is the proof that no live peer of ANY prior
+///   width exists (a member leaves the durable set only by an explicit
+///   authority act, and a width change is a new era its survivors must
+///   re-join). A future partitioned era needs no protection from these
+///   records either: it derives its floors from the durable-reference
+///   dense frontier plus the records of ITS OWN era.
+/// * **partitioned (`current_writers > 1`): FOLD, then delete.** A
+///   foreign-width record floors every lane (recovery clause 3) because a
+///   fenced-but-live writer of that era may still hold minted-unpublished
+///   offsets below its frontier. So before a stale record is deleted, its
+///   `reserved_upto` is raised into EVERY current-width lane's record
+///   ([`commit_lane_raise`] — monotone, whole-tx, torn-immune), after
+///   which the clause-3 guarantee is carried by the current era's own
+///   records and the stale one is redundant. Fold-then-delete per record
+///   is crash-safe: a crash between the two leaves both protections
+///   standing and the next arm's pass converges.
+///
+/// Undecodable records refuse the WHOLE pass (the [`load_lane_reservations`]
+/// law: a watermark we cannot read is a floor we cannot honour — and here,
+/// one we must not delete). Gauged on `alloc_lane_stale_records_pruned` /
+/// `alloc_lane_stale_records_folded`.
+pub async fn prune_stale_lane_records(
+    meta: &crate::meta_backend::RoutedMetaBackend,
+    current_writers: u16,
+) -> Result<LanePruneReport> {
+    let mut stale: Vec<(String, u64, LaneReservation)> = Vec::new();
+    for name in crate::meta_backend::Metadata::listxattr(meta, 1).await? {
+        let Some((tag, _lane)) = parse_lane_record_name(&name) else {
+            continue;
+        };
+        let Some(raw) = crate::meta_backend::Metadata::getxattr(meta, 1, &name).await? else {
+            continue;
+        };
+        let rec = LaneReservation::decode(&raw)?;
+        if current_writers <= 1 || rec.writers != current_writers {
+            stale.push((name, tag, rec));
+        }
+    }
+    let mut report = LanePruneReport::default();
+    for (name, tag, rec) in stale {
+        if current_writers > 1 {
+            // The fold: every current-width lane's frontier absorbs the
+            // retired era's protection BEFORE the record carrying it goes.
+            for lane in 0..current_writers {
+                commit_lane_raise(meta, tag, lane, current_writers, rec.reserved_upto, None)
+                    .await?;
+            }
+            report.folded += 1;
+            crate::fuse_client::METRICS
+                .alloc_lane_stale_records_folded
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        crate::meta_backend::Metadata::removexattr(meta, 1, &name).await?;
+        report.pruned += 1;
+        crate::fuse_client::METRICS
+            .alloc_lane_stale_records_pruned
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        log::warn!(
+            "allocation-lane hygiene: pruned stale record '{name}' (lane {} of {}, frontier \
+             {}) — its width belongs to no live claim-set era ({}); \
+             alloc_lane_stale_records_pruned",
+            rec.lane,
+            rec.writers,
+            rec.reserved_upto,
+            if current_writers <= 1 {
+                "this era is SOLO: the records are read by nothing, and the D0 admission is the \
+                 no-live-peer proof"
+                    .to_string()
+            } else {
+                format!(
+                    "folded into every lane of the current {current_writers}-way era first, so \
+                     the clause-3 protection survives the delete"
+                )
+            }
+        );
+    }
+    Ok(report)
+}
+
 /// [`load_lane_reservations`] by durable volume TAG — the form a node serving
 /// a PEER's raise holds (the wire carries the tag, never a volume id string,
 /// because the tag is the durable identity `TREE_BLOCK_REFS` keys on).

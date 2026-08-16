@@ -920,12 +920,31 @@ async fn a_co_writer_ships_metadata_mutations_instead_of_committing_them() {
     let dir = TempDir::new().unwrap();
     let vol = fresh_volume(dir.path(), "meta0", true).await;
 
-    // The authority: a real write mount serving the publish vocabulary.
+    // The authority: a real write mount serving the publish vocabulary —
+    // and, since finding #6's era gate (design-mw-layout-versions §6a),
+    // the custody plane beside it: every mutating publish verb presents a
+    // lease epoch the authority must be able to verify.
     let authority = squeezefs::meta_backend::open_routed_meta_set(&[vol.display().to_string()])
         .await
         .expect("the authority mounts");
+    let custody_owner = WriteCustodyOwner::arm(
+        "the-authority",
+        squeezefs::dlm::durable_term() + 1,
+        squeezefs::dlm::durable_term(),
+        LeaseClocks::with_params(
+            Duration::from_millis(3_000),
+            Duration::from_millis(200),
+            Duration::from_millis(400),
+        )
+        .expect("positive T_self"),
+        LeaseClock::manual(Arc::new(AtomicU64::new(1_000))),
+        None,
+    )
+    .expect("the custody authority arms");
+    data_grant::install_custody_owner(Arc::clone(&custody_owner));
     let listener = {
         let router = data_grant::AsyncVerbRouter::new()
+            .with_custody(Arc::clone(&custody_owner))
             .with_publish(publish::PublishService::new(Arc::clone(&authority)));
         cw::RpcListener::start_async(
             cw::RpcListenerConfig {
@@ -978,6 +997,12 @@ async fn a_co_writer_ships_metadata_mutations_instead_of_committing_them() {
     .expect("an all-foreign owner map");
     ship::arm_ownership(map);
     publish::install_client(publish::PublishClient::new("co-writer-1", SECRET.to_vec()));
+    // The era gate's input: the co-writer joins the custody plane, and its
+    // shipped mutations present the lease epoch the authority minted.
+    let custody_client = WriteCustodyClient::connect(&endpoint, SECRET, "co-writer-1")
+        .await
+        .expect("the co-writer joins the custody plane");
+    data_grant::install_custody_client(Arc::clone(&custody_client));
 
     publish::park_write_times(&co_routed, ino, 4242, 4242)
         .await

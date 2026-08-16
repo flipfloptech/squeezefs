@@ -15,8 +15,8 @@
 //! re-ship**: a freeze-window lost-reply publish re-shipped with no
 //! `(lease_epoch, request_id)` window could re-apply — the s9-colocated-
 //! fence leg's durable divergent delta chain (fsck C1 on `TREE_XATTRS`
-//! + 220 C8 findings, drift 48,620). Bit 15 DETECTED the divergence (its
-//! design role); this suite pins the PREVENTION laws.
+//! plus 220 C8 findings, drift 48,620). Bit 15 DETECTED the divergence
+//! (its design role); this suite pins the PREVENTION laws.
 //!
 //! # The laws under contract (design §6a)
 //!
@@ -49,7 +49,7 @@ use squeezefs::data_custody;
 use squeezefs::data_grant::{self, WriteCustodyClient, WriteCustodyOwner};
 use squeezefs::error::SqueezefsError;
 use squeezefs::fuse_client::{self, METRICS};
-use squeezefs::layout_wire::LayoutDelta;
+use squeezefs::layout_wire::{LayoutDelta, LayoutMetadata};
 use squeezefs::membership::{LeaseClock, LeaseClocks};
 use squeezefs::meta_backend::kv::superblock as sb;
 use squeezefs::meta_backend::{open_routed_meta_set, plan_meta_slot_set, RoutedMetaBackend};
@@ -247,6 +247,21 @@ fn delta(size: u64, key: &str, versions: Option<(u64, u64)>) -> LayoutDelta {
     d
 }
 
+/// A DECODABLE base layout `Put` (the fold applies deltas onto it, so the
+/// bytes must be real bincode `LayoutMetadata`, not an opaque marker).
+fn base_layout_bytes(size: u64) -> Vec<u8> {
+    bincode::serialize(&LayoutMetadata {
+        file_type: "striped".into(),
+        size,
+        block_map_id: None,
+        block_prefix: Some("be://data".into()),
+        file_id: None,
+        data_key: None,
+        block_map: Some(std::collections::HashMap::new()),
+    })
+    .expect("serialize base layout")
+}
+
 async fn owner_size(be: &Arc<RoutedMetaBackend>, ino: u64) -> u64 {
     use squeezefs::meta_backend::Metadata;
     be.getattr(ino).await.expect("the owner has the ino").size
@@ -314,9 +329,16 @@ async fn a_stale_era_layout_publish_refuses_applies_nothing_and_is_the_fence_sig
          immediately): {set_err:?}"
     );
     let d = delta(8192, "be://data:0", None);
-    publish::merge_layout_and_size(&client_be, ino, &d, bytes::Bytes::from_static(b"x"), 8192, Vec::new())
-        .await
-        .expect_err("a swept era's merge_layout_and_size refuses");
+    publish::merge_layout_and_size(
+        &client_be,
+        ino,
+        &d,
+        bytes::Bytes::from_static(b"x"),
+        8192,
+        Vec::new(),
+    )
+    .await
+    .expect_err("a swept era's merge_layout_and_size refuses");
     publish::commit_block_refs(&client_be, ino, &[])
         .await
         .expect_err("a swept era's commit_block_refs refuses");
@@ -394,7 +416,8 @@ async fn a_duplicate_reship_answers_from_the_witness_and_never_clobbers_a_later_
     .await
     .expect("create ships")
     .ino;
-    publish::set_layout_and_size(&client_be, ino, b"layout:v1:base", 4096, &[])
+    let base = base_layout_bytes(4096);
+    publish::set_layout_and_size(&client_be, ino, &base, 4096, &[])
         .await
         .expect("the base Put lands");
 
@@ -403,7 +426,7 @@ async fn a_duplicate_reship_answers_from_the_witness_and_never_clobbers_a_later_
     let p1 = publish::PublishCall::MergeLayoutAndSize {
         ino,
         delta: delta(8192, "be://data:0", Some((0, v1))).encode(),
-        full_layout: b"layout:v2:p1".to_vec(),
+        full_layout: base_layout_bytes(8192),
         size: 8192,
         refs: Vec::new(),
         lease_epoch: epoch,
@@ -419,7 +442,7 @@ async fn a_duplicate_reship_answers_from_the_witness_and_never_clobbers_a_later_
     let p2 = publish::PublishCall::MergeLayoutAndSize {
         ino,
         delta: delta(12288, "be://data:1", Some((v1, v2))).encode(),
-        full_layout: b"layout:v3:p2".to_vec(),
+        full_layout: base_layout_bytes(12288),
         size: 12288,
         refs: Vec::new(),
         lease_epoch: epoch,
@@ -551,7 +574,8 @@ async fn out_of_order_and_cross_era_publishes_refuse() {
     .await
     .expect("create ships")
     .ino;
-    publish::set_layout_and_size(&client_be, ino, b"layout:v1:base", 4096, &[])
+    let base = base_layout_bytes(4096);
+    publish::set_layout_and_size(&client_be, ino, &base, 4096, &[])
         .await
         .expect("the base Put lands");
     let v1 = squeezefs::dlm::mint_layout_version();
@@ -560,7 +584,7 @@ async fn out_of_order_and_cross_era_publishes_refuse() {
         publish::PublishCall::MergeLayoutAndSize {
             ino,
             delta: delta(8192, "be://data:0", Some((0, v1))).encode(),
-            full_layout: b"layout:v2:p1".to_vec(),
+            full_layout: base_layout_bytes(8192),
             size: 8192,
             refs: Vec::new(),
             lease_epoch: epoch1,
@@ -581,7 +605,7 @@ async fn out_of_order_and_cross_era_publishes_refuse() {
             publish::PublishCall::MergeLayoutAndSize {
                 ino,
                 delta: delta(16384, "be://data:9", Some((bogus_base, v_next))).encode(),
-                full_layout: b"layout:vX:ooo".to_vec(),
+                full_layout: base_layout_bytes(16384),
                 size: 16384,
                 refs: Vec::new(),
                 lease_epoch: epoch1,
@@ -676,9 +700,16 @@ async fn the_solo_publish_path_is_structurally_untouched() {
         .await
         .expect("the local layout publish is unchanged");
     let d = delta(8192, "be://data:0", None);
-    publish::merge_layout_and_size(&be, ino, &d, bytes::Bytes::from_static(b"x"), 8192, Vec::new())
-        .await
-        .expect("the local merge is unchanged");
+    publish::merge_layout_and_size(
+        &be,
+        ino,
+        &d,
+        bytes::Bytes::from_static(b"x"),
+        8192,
+        Vec::new(),
+    )
+    .await
+    .expect("the local merge is unchanged");
     publish::commit_block_refs(&be, ino, &[])
         .await
         .expect("the local ref commit is unchanged");
@@ -688,7 +719,11 @@ async fn the_solo_publish_path_is_structurally_untouched() {
 
     let after = publish::stats();
     assert_eq!(after.shipped, before.shipped, "nothing shipped");
-    assert_eq!(after.local, before.local + 5, "every call took the local path");
+    assert_eq!(
+        after.local,
+        before.local + 5,
+        "every call took the local path"
+    );
     assert_eq!(
         after.stale_refusals, before.stale_refusals,
         "the era gate never runs on the local path"

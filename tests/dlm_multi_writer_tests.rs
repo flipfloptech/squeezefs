@@ -138,6 +138,7 @@ struct Restore;
 impl Drop for Restore {
     fn drop(&mut self) {
         data_grant::uninstall_custody_client();
+        data_grant::uninstall_custody_owner();
         publish::uninstall_client();
         ship::disarm_ownership();
         data_custody::test_reset_custody_generation();
@@ -1037,8 +1038,15 @@ async fn the_daemon_publish_surface_ships_to_the_owner() {
 
     let publish_before = publish::stats();
     let (custody, _ms) = owner_with_quarantine(None).await;
+    // Finding #6 (design-mw-layout-versions §6a): every mutating publish
+    // verb is era-gated, so the shipping client holds REAL custody — the
+    // owner is installed (the arm's act) and the client joins for the
+    // lease epoch its frames now present.
+    data_grant::install_custody_owner(Arc::clone(&custody));
     let auth = start_authority(Arc::clone(&custody), Some(Arc::clone(&owner_be)));
     publish::install_client(publish::PublishClient::new("node-a", SECRET.to_vec()));
+    let custody_client = client_for(&auth.endpoint, "node-a").await;
+    data_grant::install_custody_client(Arc::clone(&custody_client));
 
     // Every volume of the client's set is owned by the peer.
     let foreign: Vec<(usize, PeerOwner)> = (0..client_be.volumes.len())

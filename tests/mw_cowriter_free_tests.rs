@@ -897,10 +897,17 @@ async fn a_stale_era_free_verb_is_refused_and_recovery_owns_the_unfreed_block() 
     )
     .await
     .expect_err("a free under a dead lease epoch is refused by era");
-    let msg = err.to_string().to_lowercase();
+    // Finding #6 (design-mw-layout-versions §6a): a stale refusal whose
+    // presented epoch is this client's CURRENT lease surfaces in the FENCE
+    // class and composes the full fence — the pull-based revocation law at
+    // the publish round trip (the operator detail rides the log line).
     assert!(
-        msg.contains("lease") || msg.contains("custody") || msg.contains("era"),
-        "the refusal names the era/lease: {err}"
+        matches!(err, squeezefs::error::SqueezefsError::WriterGuardFenced),
+        "the era refusal surfaces in the fence class: {err}"
+    );
+    assert!(
+        data_custody::poisoned(),
+        "a current-epoch stale refusal IS the fence signal (custody poisoned)"
     );
     assert_eq!(publish::stats().free_stale_refusals - stale_before, 1);
     assert!(

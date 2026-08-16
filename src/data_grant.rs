@@ -1016,6 +1016,33 @@ impl WriteCustodyOwner {
         Ok(())
     }
 
+    /// **Validate a shipped MUTATING publish verb's era** (finding #6,
+    /// design-mw-layout-versions §6a): the presented lease epoch must be
+    /// LIVE custody on this authority. The same law as [`Self::check_free`]
+    /// — keyed on the epoch alone, for the three reasons stated there —
+    /// with the refusal text naming the publish plane: a swept-but-not-yet-
+    /// self-fenced zombie's layout publishes were the divergent-chain mint
+    /// the s9-colocated-fence leg convicted, and a refusal here means
+    /// NOTHING was applied.
+    pub fn check_publish_era(
+        &self,
+        client: &str,
+        lease_epoch: u64,
+    ) -> std::result::Result<(), String> {
+        if !self.table.epoch_live(lease_epoch) {
+            return Err(format!(
+                "S9: refusing a shipped publish from '{client}': lease epoch {lease_epoch} is \
+                 not custody on authority '{}' (revoked, swept past its TTL, or minted by a \
+                 previous era) — a fenced era's publish is the divergent-chain mint (spec §6.2 \
+                 item 9; design-mw-layout-versions §6a). Nothing was applied; the mount must \
+                 self-fence and re-join by remount, and its acked-un-fsynced staged work is \
+                 the POSIX crash class the remount contract owns",
+                self.id
+            ));
+        }
+        Ok(())
+    }
+
     /// Admit a co-writer (fresh, or a re-join that lost its lease view).
     pub fn join(&self, req: &JoinFrame) -> Result<LeaseFrame> {
         if req.client.is_empty() {
@@ -2241,6 +2268,29 @@ impl WriteCustodyClient {
     /// This client's whole custody is gone: every adopted grant is dead and
     /// the custody generation advances, so no in-flight DMA authorized
     /// under it can land.
+    /// **The publish plane's pull-based revocation channel fired** (finding
+    /// #6, design-mw-layout-versions §6a): the authority refused a shipped
+    /// publish `PUBLISH_STALE_LEASE` while `presented` is still this
+    /// client's CURRENT lease epoch — authoritative proof this mount's
+    /// custody era is dead. Compose the FULL fence at this round trip
+    /// instead of waiting for the next renewal: adopted grants dead +
+    /// custody generation advanced (the UnknownLease machinery) **plus**
+    /// the writer self-fence (custody POISON — a swept co-writer cannot
+    /// re-join in place; re-admission is by remount, the documented
+    /// posture).
+    ///
+    /// Returns `false` — and fences NOTHING — when `presented` is an epoch
+    /// this client already replaced (a re-join raced the frame): the
+    /// refusal was about a dead frame, not about the live era.
+    pub fn note_publish_era_refused(&self, presented: u64, detail: &str) -> bool {
+        if self.lease_epoch() != presented {
+            return false;
+        }
+        self.note_lease_lost(detail);
+        self.self_fence(detail);
+        true
+    }
+
     fn note_lease_lost(&self, detail: &str) {
         let mut ids = Vec::new();
         self.grants.iter_sync(|id, _| {
@@ -2407,6 +2457,30 @@ pub fn validate_free(client: &str, lease_epoch: u64) -> std::result::Result<(), 
         ));
     };
     owner.check_free(client, lease_epoch)
+}
+
+/// **Validate a shipped mutating publish verb's era** against the installed
+/// authority ([`WriteCustodyOwner::check_publish_era`]) — the era gate S9's
+/// publish owner runs on the layout-publish class (and every other mutating
+/// verb) BEFORE the witness window (finding #6; design-mw-layout-versions
+/// §6a).
+///
+/// With **no authority installed** the verb is refused for the same reason
+/// the free is: a node serving the publish vocabulary without a custody
+/// authority minted no lease epochs, so it has nothing to check the
+/// presented one against — and applying a layout for an unverifiable era is
+/// exactly the divergent-chain mint the gate exists to prevent.
+pub fn validate_publish_era(client: &str, lease_epoch: u64) -> std::result::Result<(), String> {
+    let Some(owner) = custody_owner() else {
+        return Err(format!(
+            "S9: refusing a shipped publish from '{client}': this node serves the publish \
+             vocabulary but has no custody authority armed, so lease epoch {lease_epoch} cannot \
+             be verified as live custody. Arm the multi-writer authority \
+             (SQUEEZEFS_MULTI_WRITER=1 + SQUEEZEFS_MW_BIND) — a publish applied for an \
+             unverifiable era is a fenced zombie's publish (design-mw-layout-versions §6a)"
+        ));
+    };
+    owner.check_publish_era(client, lease_epoch)
 }
 
 /// Record lane-harvest handouts on the installed authority (rung 10 —

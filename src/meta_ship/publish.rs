@@ -30,15 +30,25 @@
 //!
 //! # What this vocabulary deliberately does NOT do
 //!
-//! * **No retry.** S8's owner-side dedup window is what makes a resend
-//!   safe; this vocabulary has none, and its one non-idempotent verb
-//!   (`create_with_rdev_size`) would create a second name on a resend after
-//!   a lost reply. So a transport failure is REPORTED, never re-applied —
-//!   the writeback ladder above already re-publishes from current state,
-//!   and a layout delta is a *final-state* record (absolute
-//!   `(block_index, key)` inserts), so re-publishing converges instead of
-//!   double-applying. A durable reply cache is S3.5's machinery; the
-//!   retry+window extension is a named residual, not a silent gap.
+//! * **No retry for the UN-WITNESSED verbs.** S8's owner-side dedup window
+//!   is what makes a resend safe, and the one absolutely non-idempotent
+//!   verb (`create_with_rdev_size`) would create a second name on a resend
+//!   after a lost reply — so un-witnessed transport failures are REPORTED,
+//!   never re-applied; the writeback ladder above re-publishes from
+//!   current state and converges. **The layout-publish class
+//!   (`SetLayoutAndSize` / `MergeLayoutAndSize` / `CommitBlockRefs`)
+//!   joined the RETRIED class at schema 5** (finding #6,
+//!   `docs/design-mw-layout-versions.md` §6a — the shape PR 17 schedules
+//!   for `WriteExtent`): it carries the `(lease_epoch, request_id)`
+//!   witness, resends the SAME frame only (bounded, epoch-stable, never
+//!   re-keyed — `ship_witnessed`), and a duplicate answers the winner's
+//!   own cached outcome, because the pre-witness composition of no-retry
+//!   with the never-lossy ladder was exactly the divergent-chain mint the
+//!   s9-colocated-fence leg convicted. **Every mutating verb is also
+//!   ERA-GATED** (`lease_epoch`, refused `PUBLISH_STALE_LEASE` before the
+//!   window): a swept-but-not-yet-self-fenced zombie's publishes refuse
+//!   with nothing applied, and a current-epoch refusal composes the
+//!   client's full fence (the pull-based revocation law).
 //! * **No batching conveyor.** The ops that arrive here are already
 //!   coalesced (the M7 commit conveyor, the publish coalescer's
 //!   `publish_commit_group*`), so a second batching layer would coalesce
@@ -86,7 +96,17 @@ use std::sync::Arc;
 /// that speaks 3 cannot hand a co-writer its lane's freed supply back, and
 /// a co-writer whose harvests silently vanished would starve `StorageFull`
 /// on a store with free space.
-pub const PUBLISH_SCHEMA: u32 = 4;
+///
+/// **5 since the era gate + layout-publish witness landed** (finding #6,
+/// `docs/design-mw-layout-versions.md` §6a): every MUTATING call carries
+/// the caller's custody `lease_epoch` (refused [`PUBLISH_STALE_LEASE`]
+/// when it is not live custody — the FreeBlocks gate, generalized), and
+/// the layout-publish class (`SetLayoutAndSize` / `MergeLayoutAndSize` /
+/// `CommitBlockRefs`) also carries `request_id`, the exactly-once witness.
+/// A 4-speaker's layout publishes would be un-gated and un-witnessed — the
+/// divergent-chain mint — so the honest answer is `PUBLISH_SCHEMA_MISMATCH`
+/// at the first frame.
+pub const PUBLISH_SCHEMA: u32 = 5;
 
 /// First verb of S9's publish block. S3's ping is 0, S8's metadata verbs
 /// are 16/17, S6's membership owns `0x0100..=0x01FF`, S9's custody
@@ -164,34 +184,64 @@ impl From<WireBlockRefOp> for BlockRefOp {
 /// The publish path's calls, arguments verbatim from the non-trait surface.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PublishCall {
+    /// **Layout-publish class** (finding #6, design-mw-layout-versions §6a):
+    /// carries the era gate's input (`lease_epoch`) AND the exactly-once
+    /// witness's other half (`request_id`) — this class is RETRIED
+    /// (same-frame-only, bounded, epoch-stable; see the module docs), which
+    /// only the owner's dedup window makes safe.
     SetLayoutAndSize {
         ino: u64,
         layout: Vec<u8>,
         size: u64,
         refs: Vec<WireBlockRefOp>,
+        /// The custody lease epoch the caller holds — the era gate's input
+        /// and half of the idempotence witness.
+        lease_epoch: u64,
+        /// Client-chosen, monotone per process — the witness's other half.
+        /// ONE id per logical publish; a resend never re-keys.
+        request_id: u64,
     },
     /// The delta travels **encoded** (`LayoutDelta::encode`), which is the
     /// same strict, bounded, magic-checked codec the on-disk record uses —
     /// so the wire cannot express a delta the volume could not store.
+    /// Layout-publish class: era-gated + witnessed (see `SetLayoutAndSize`).
     MergeLayoutAndSize {
         ino: u64,
         delta: Vec<u8>,
         full_layout: Vec<u8>,
         size: u64,
         refs: Vec<WireBlockRefOp>,
+        /// Era gate input + witness half (see `SetLayoutAndSize`).
+        lease_epoch: u64,
+        /// The witness's other half (see `SetLayoutAndSize`).
+        request_id: u64,
     },
+    /// Layout-publish class: era-gated + witnessed (see `SetLayoutAndSize`).
     CommitBlockRefs {
         ino: u64,
         refs: Vec<WireBlockRefOp>,
+        /// Era gate input + witness half (see `SetLayoutAndSize`).
+        lease_epoch: u64,
+        /// The witness's other half (see `SetLayoutAndSize`).
+        request_id: u64,
     },
+    /// Era-gated, un-witnessed and un-retried: absolute times are
+    /// last-writer-wins, so a lost reply converges without a window.
     ParkWriteTimes {
         ino: u64,
         mtime: u64,
         ctime: u64,
+        /// The era gate's input (finding #6 — a zombie parks nothing).
+        lease_epoch: u64,
     },
+    /// Era-gated, un-witnessed and un-retried (per-ino teardown).
     DestroyInodes {
         inos: Vec<u64>,
+        /// The era gate's input.
+        lease_epoch: u64,
     },
+    /// Era-gated; keeps the no-retry law ABSOLUTELY (a resend after a lost
+    /// reply mints a second name — the doctrine's founding case).
     CreateWithRdevSize {
         parent: u64,
         name: String,
@@ -200,6 +250,8 @@ pub enum PublishCall {
         gid: u32,
         rdev: u32,
         initial_size: u64,
+        /// The era gate's input.
+        lease_epoch: u64,
     },
     XattrValueCap {
         ino: u64,
@@ -345,6 +397,66 @@ impl PublishCall {
         }
     }
 
+    /// The lease epoch a MUTATING call presents — `None` for the read
+    /// verbs (`XattrValueCap` / `ReaddirStream`), which mutate nothing (a
+    /// zombie's stale read is the S5 reader-staleness class, never a
+    /// durability threat). This is the CLIENT-side fence-composition
+    /// input; the owner-side gates are matched explicitly in `serve` so
+    /// the free/harvest/raise verbs keep their own gate order and counters.
+    pub fn presented_epoch(&self) -> Option<u64> {
+        match self {
+            Self::SetLayoutAndSize { lease_epoch, .. }
+            | Self::MergeLayoutAndSize { lease_epoch, .. }
+            | Self::CommitBlockRefs { lease_epoch, .. }
+            | Self::ParkWriteTimes { lease_epoch, .. }
+            | Self::DestroyInodes { lease_epoch, .. }
+            | Self::CreateWithRdevSize { lease_epoch, .. }
+            | Self::RaiseAllocLane { lease_epoch, .. }
+            | Self::FreeBlocks { lease_epoch, .. }
+            | Self::HarvestLaneFree { lease_epoch, .. } => Some(*lease_epoch),
+            Self::XattrValueCap { .. } | Self::ReaddirStream { .. } => None,
+        }
+    }
+
+    /// The generic era gate's input (design §6a law 1): the six mutating
+    /// verbs that gained `lease_epoch` at schema 5. The raise/free/harvest
+    /// verbs are deliberately EXCLUDED — they run their own, older gates in
+    /// `serve` (lane validation / `validate_free`) with their own counters.
+    fn era_gated_epoch(&self) -> Option<u64> {
+        match self {
+            Self::SetLayoutAndSize { lease_epoch, .. }
+            | Self::MergeLayoutAndSize { lease_epoch, .. }
+            | Self::CommitBlockRefs { lease_epoch, .. }
+            | Self::ParkWriteTimes { lease_epoch, .. }
+            | Self::DestroyInodes { lease_epoch, .. }
+            | Self::CreateWithRdevSize { lease_epoch, .. } => Some(*lease_epoch),
+            _ => None,
+        }
+    }
+
+    /// The layout-publish class's exactly-once witness key
+    /// `(lease_epoch, request_id)`, `None` for every un-witnessed verb.
+    fn witness(&self) -> Option<(u64, u64)> {
+        match self {
+            Self::SetLayoutAndSize {
+                lease_epoch,
+                request_id,
+                ..
+            }
+            | Self::MergeLayoutAndSize {
+                lease_epoch,
+                request_id,
+                ..
+            }
+            | Self::CommitBlockRefs {
+                lease_epoch,
+                request_id,
+                ..
+            } => Some((*lease_epoch, *request_id)),
+            _ => None,
+        }
+    }
+
     /// Every inode the call names — the authority check's input.
     pub fn named_inos(&self) -> Vec<u64> {
         match self {
@@ -353,7 +465,7 @@ impl PublishCall {
             | Self::CommitBlockRefs { ino, .. }
             | Self::ParkWriteTimes { ino, .. }
             | Self::XattrValueCap { ino } => vec![*ino],
-            Self::DestroyInodes { inos } => inos.clone(),
+            Self::DestroyInodes { inos, .. } => inos.clone(),
             Self::CreateWithRdevSize { parent, .. } => vec![*parent],
             Self::ReaddirStream { dir, .. } => vec![*dir],
             // The reservation record lives on ino 1 (KD-2's plane), so the
@@ -452,6 +564,10 @@ static SERVED: AtomicU64 = AtomicU64::new(0);
 static REFUSALS: AtomicU64 = AtomicU64::new(0);
 static NOT_OWNER: AtomicU64 = AtomicU64::new(0);
 static PANICS: AtomicU64 = AtomicU64::new(0);
+// Finding #6 (design-mw-layout-versions §6a): the generic era gate's
+// refusals and the layout-publish witness's replay hits.
+static STALE_REFUSALS: AtomicU64 = AtomicU64::new(0);
+static REPLAYS: AtomicU64 = AtomicU64::new(0);
 // The co-writer FREE path's own rows (DLM S9; every one is 0 on every
 // shipped mount by construction — nothing installs the verb's halves).
 static FREE_SHIPPED_BLOCKS: AtomicU64 = AtomicU64::new(0);
@@ -482,6 +598,15 @@ pub struct PublishStats {
     pub not_owner: u64,
     /// Owner-side executions that UNWOUND (**must stay 0**).
     pub panics: u64,
+    /// Mutating publish verbs refused BY ERA (the presented lease epoch is
+    /// not live custody) — finding #6's gate. 0 on a healthy fleet; growth
+    /// around a revocation is the gate composing (a swept zombie's layout
+    /// publishes refusing instead of minting a divergent chain).
+    pub stale_refusals: u64,
+    /// Layout-publish verbs answered from the `(lease_epoch, request_id)`
+    /// witness instead of re-applied — a lost-reply retry landing here is
+    /// the mechanism WORKING, not a fault.
+    pub replays: u64,
     /// Displaced blocks whose FREE travelled as a verb (client side) — the
     /// co-writer rewrite path's engagement instrument: on a rewriting
     /// co-writer this tracks its displaced-block count, and 0 beside a
@@ -532,6 +657,8 @@ pub fn stats() -> PublishStats {
         refusals: REFUSALS.load(Ordering::Relaxed),
         not_owner: NOT_OWNER.load(Ordering::Relaxed),
         panics: PANICS.load(Ordering::Relaxed),
+        stale_refusals: STALE_REFUSALS.load(Ordering::Relaxed),
+        replays: REPLAYS.load(Ordering::Relaxed),
         free_shipped_blocks: FREE_SHIPPED_BLOCKS.load(Ordering::Relaxed),
         free_served_blocks: FREE_SERVED_BLOCKS.load(Ordering::Relaxed),
         free_replays: FREE_REPLAYS.load(Ordering::Relaxed),
@@ -556,6 +683,8 @@ pub fn stats_json() -> serde_json::Value {
         "refusals": s.refusals,
         "not_owner_refusals": s.not_owner,
         "owner_panics": s.panics,
+        "stale_refusals": s.stale_refusals,
+        "replays": s.replays,
         "free_shipped_blocks": s.free_shipped_blocks,
         "free_served_blocks": s.free_served_blocks,
         "free_replays": s.free_replays,
@@ -619,11 +748,21 @@ impl PublishClient {
 
     /// Ship one call to `endpoint` and return its outcome.
     ///
-    /// **One attempt, deliberately** — see the module docs: the vocabulary
-    /// has no dedup window, so a resend of `create_with_rdev_size` after a
-    /// lost reply would mint a second name.
+    /// **One attempt, deliberately** — see the module docs: un-witnessed
+    /// verbs have no dedup window, so a resend of `create_with_rdev_size`
+    /// after a lost reply would mint a second name. The witnessed
+    /// layout-publish class rides [`ship_witnessed`], whose bounded
+    /// epoch-stable ladder resends the SAME frame only.
+    ///
+    /// A [`PUBLISH_STALE_LEASE`] answer is the era gate firing (finding
+    /// #6): when the refused epoch IS this client's current lease, the
+    /// full fence composes HERE (`note_publish_era_refused` — the
+    /// pull-based revocation law at the publish round trip), and the
+    /// error surfaces in the fence class (`WriterGuardFenced`) every
+    /// retry ladder returns immediately.
     pub async fn ship(&self, endpoint: &str, call: PublishCall) -> Result<PublishReply> {
         let name = call.name();
+        let presented = call.presented_epoch();
         let body = encode(
             &PublishRequestFrame {
                 schema: PUBLISH_SCHEMA,
@@ -658,6 +797,25 @@ impl PublishClient {
         };
         drop(guard);
         SHIPPED.fetch_add(1, Ordering::Relaxed);
+        if reply.status == PUBLISH_STALE_LEASE {
+            let detail = String::from_utf8_lossy(&reply.body).to_string();
+            let fenced = match (presented, crate::data_grant::custody_client()) {
+                (Some(epoch), Some(client)) => client.note_publish_era_refused(epoch, &detail),
+                _ => false,
+            };
+            log::error!(
+                "S9: the authority at {endpoint} refused {name} BY ERA ({detail}) — nothing \
+                 was applied{}",
+                if fenced {
+                    "; this epoch was our CURRENT lease, so the full fence composed (custody \
+                     poisoned — re-admission is by remount)"
+                } else {
+                    " (the refused epoch is not this mount's current lease — a dead frame, \
+                     not a dead era)"
+                }
+            );
+            return Err(SqueezefsError::WriterGuardFenced);
+        }
         if reply.status != PUBLISH_OK {
             return Err(SqueezefsError::InvalidOperation(format!(
                 "S9: the owner at {endpoint} refused {name} (status {}): {}",
@@ -738,6 +896,52 @@ fn wire_refs(refs: &[BlockRefOp]) -> Vec<WireBlockRefOp> {
     refs.iter().map(WireBlockRefOp::from).collect()
 }
 
+/// The custody lease epoch this mount presents on every MUTATING shipped
+/// publish (finding #6's era gate). `0` with no custody client installed —
+/// the owner then refuses by era, which is the honest shape for an armed
+/// ownership plane missing its custody half (0 is never a live epoch).
+fn current_lease_epoch() -> u64 {
+    crate::data_grant::custody_client()
+        .map(|c| c.lease_epoch())
+        .unwrap_or(0)
+}
+
+/// Bounded resend budget for one witnessed layout publish — the
+/// [`crate::cowriter`] `FREE_SHIP_ATTEMPTS` law, verbatim: a protocol
+/// constant, not a resource cap; each resend is absorbed exactly-once by
+/// the owner's witness window, and past the budget the error propagates to
+/// the writeback ladder, which re-COMPUTES a new logical publish from
+/// current state (the module's convergence law).
+const PUBLISH_SHIP_ATTEMPTS: u32 = 3;
+
+/// Ship one WITNESSED layout-publish call (design-mw-layout-versions §6a
+/// law 2): the SAME frame — same `(lease_epoch, request_id)`, same payload
+/// — under a bounded, epoch-stable retry ladder. **A retry never
+/// re-keys**: if the lease epoch moves under it (revocation → re-join) the
+/// publish is abandoned to the caller, because a resend under a new epoch
+/// is a new act the window cannot correlate. A fence-class refusal
+/// (`PUBLISH_STALE_LEASE` → `WriterGuardFenced`) never retries — the era
+/// is dead and every resend would refuse identically.
+async fn ship_witnessed(peer: &Arc<super::PeerOwner>, call: PublishCall) -> Result<PublishReply> {
+    let epoch = call
+        .presented_epoch()
+        .expect("only witnessed (epoch-bearing) calls ride this ladder");
+    let mut attempt = 0u32;
+    loop {
+        match ship(peer, call.clone()).await {
+            Ok(reply) => return Ok(reply),
+            Err(e @ SqueezefsError::WriterGuardFenced) => return Err(e),
+            Err(e) => {
+                attempt += 1;
+                if current_lease_epoch() != epoch || attempt >= PUBLISH_SHIP_ATTEMPTS {
+                    return Err(e);
+                }
+                squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+    }
+}
+
 fn expect_unit(reply: PublishReply, what: &str) -> Result<()> {
     match reply {
         PublishReply::Unit => Ok(()),
@@ -768,13 +972,15 @@ pub async fn set_layout_and_size(
             be.set_layout_and_size(ino, layout, size, refs).await
         }
         Some(peer) => expect_unit(
-            ship(
+            ship_witnessed(
                 &peer,
                 PublishCall::SetLayoutAndSize {
                     ino,
                     layout: layout.to_vec(),
                     size,
                     refs: wire_refs(refs),
+                    lease_epoch: current_lease_epoch(),
+                    request_id: crate::cowriter::next_ship_request_id(),
                 },
             )
             .await?,
@@ -805,8 +1011,10 @@ pub async fn merge_layout_and_size(
                 full_layout: full_layout.to_vec(),
                 size,
                 refs: wire_refs(&refs),
+                lease_epoch: current_lease_epoch(),
+                request_id: crate::cowriter::next_ship_request_id(),
             };
-            match ship(&peer, call).await? {
+            match ship_witnessed(&peer, call).await? {
                 PublishReply::DeltaUsed(used) => Ok(used),
                 other => Err(protocol_error(
                     "merge_layout_and_size",
@@ -830,11 +1038,13 @@ pub async fn commit_block_refs(
             be.commit_block_refs(ino, refs).await
         }
         Some(peer) => expect_unit(
-            ship(
+            ship_witnessed(
                 &peer,
                 PublishCall::CommitBlockRefs {
                     ino,
                     refs: wire_refs(refs),
+                    lease_epoch: current_lease_epoch(),
+                    request_id: crate::cowriter::next_ship_request_id(),
                 },
             )
             .await?,
@@ -856,7 +1066,16 @@ pub async fn park_write_times(
             be.park_write_times(ino, mtime, ctime).await
         }
         Some(peer) => expect_unit(
-            ship(&peer, PublishCall::ParkWriteTimes { ino, mtime, ctime }).await?,
+            ship(
+                &peer,
+                PublishCall::ParkWriteTimes {
+                    ino,
+                    mtime,
+                    ctime,
+                    lease_epoch: current_lease_epoch(),
+                },
+            )
+            .await?,
             "park_write_times",
         ),
     }
@@ -888,7 +1107,14 @@ pub async fn destroy_inodes(be: &Arc<RoutedMetaBackend>, inos: &[Ino]) -> Result
     }
     for (peer, batch) in remote {
         expect_unit(
-            ship(&peer, PublishCall::DestroyInodes { inos: batch }).await?,
+            ship(
+                &peer,
+                PublishCall::DestroyInodes {
+                    inos: batch,
+                    lease_epoch: current_lease_epoch(),
+                },
+            )
+            .await?,
             "destroy_inodes",
         )?;
     }
@@ -922,6 +1148,7 @@ pub async fn create_with_rdev_size(
                 gid,
                 rdev,
                 initial_size,
+                lease_epoch: current_lease_epoch(),
             };
             match ship(&peer, call).await? {
                 PublishReply::Inode(i) => Ok(Inode::from(i)),
@@ -1273,9 +1500,15 @@ pub struct PublishService {
     authority: Vec<bool>,
     /// The FREE verb's exactly-once witness: `(lease_epoch, request_id)` →
     /// the winner's own outcome — S8's [`DedupWindow`], reused (never a
-    /// third idempotence pattern). Only `free_blocks` consumes entries;
-    /// every other publish call keeps the vocabulary's no-retry law.
+    /// third idempotence pattern).
     free_dedup: DedupWindow<std::result::Result<Vec<FreeVerdict>, WireError>>,
+    /// The LAYOUT-PUBLISH class's exactly-once witness (finding #6, design
+    /// §6a law 2): `SetLayoutAndSize` / `MergeLayoutAndSize` /
+    /// `CommitBlockRefs` joined the retried class, and a freeze-window
+    /// lost-reply re-ship answers the winner's own cached outcome here
+    /// instead of re-applying (the divergent-chain mint, closed). Its own
+    /// window — outcomes are [`PublishReply`]s, not free verdicts.
+    publish_dedup: DedupWindow<std::result::Result<PublishReply, WireError>>,
     /// The HARVEST verb's exactly-once witness — the same pattern, its own
     /// window (a grant and a verdict list are different outcomes; sharing
     /// one window would make their id spaces collide).
@@ -1315,6 +1548,7 @@ impl PublishService {
             authority,
             free_dedup: DedupWindow::new(crate::meta_ship::service::dedup_cap()),
             harvest_dedup: DedupWindow::new(crate::meta_ship::service::dedup_cap()),
+            publish_dedup: DedupWindow::new(crate::meta_ship::service::dedup_cap()),
             self_ref: std::sync::OnceLock::new(),
         });
         let _ = me.self_ref.set(Arc::downgrade(&me));
@@ -1378,6 +1612,27 @@ impl PublishService {
                      writer_claim records)"
                 ),
             );
+        }
+        // Finding #6 (design-mw-layout-versions §6a, law 1): the ERA GATE on
+        // every schema-5 mutating verb — a swept-but-not-yet-self-fenced
+        // zombie's publishes REFUSE here, and a refusal means NOTHING was
+        // applied. Refused BEFORE the witness window on purpose (a dead
+        // era's replay must never be answered from cache — the FreeBlocks
+        // precedent verbatim). The raise/free/harvest verbs keep their own,
+        // older gates below (landed counter surface).
+        if let Some(epoch) = frame.call.era_gated_epoch() {
+            if let Err(reason) = crate::data_grant::validate_publish_era(&frame.client, epoch) {
+                STALE_REFUSALS.fetch_add(1, Ordering::Relaxed);
+                return Self::refuse(req.id, PUBLISH_STALE_LEASE, reason);
+            }
+        }
+        // The layout-publish class (law 2): witnessed — served through its
+        // own dedup window, never through the generic dispatch below,
+        // whose no-retry law it would otherwise weaken.
+        if let Some((epoch, request_id)) = frame.call.witness() {
+            return self
+                .serve_layout_publish(req.id, epoch, request_id, frame.call)
+                .await;
         }
         // DLM S9's allocation-lane seam: the ONE verb whose argument reaches a
         // durable record from a REMOTE caller, so it is validated here —
@@ -1483,6 +1738,73 @@ impl PublishService {
                 body,
             },
             Err(e) => Self::refuse(req.id, PUBLISH_MALFORMED, format!("reply encode: {e}")),
+        }
+    }
+
+    /// Serve one LAYOUT-PUBLISH call (`SetLayoutAndSize` /
+    /// `MergeLayoutAndSize` / `CommitBlockRefs`) through the witness
+    /// window (finding #6, design §6a law 2): the winner of
+    /// `(lease_epoch, request_id)` executes on the sqz-meta pool; every
+    /// duplicate — a freeze-window lost-reply retry, or an overlapping
+    /// resend — awaits the winner's own outcome and is counted
+    /// (`replays`). The era gate already ran in [`Self::serve`], so a
+    /// dead era can never reach (or be answered from) this window.
+    async fn serve_layout_publish(
+        &self,
+        req_id: u64,
+        lease_epoch: u64,
+        request_id: u64,
+        call: PublishCall,
+    ) -> RpcResponse {
+        let Some(me) = self.owned() else {
+            return Self::refuse(
+                req_id,
+                PUBLISH_MALFORMED,
+                "S9 publish service is shutting down — no handle to dispatch on".into(),
+            );
+        };
+        let name = call.name();
+        let (slot, owns) = self.publish_dedup.slot((lease_epoch, request_id));
+        if !owns {
+            REPLAYS.fetch_add(1, Ordering::Relaxed);
+        }
+        let outcome = slot
+            .get_or_init(|| async move {
+                // The venue rule, verbatim (see serve/serve_free): the
+                // commit runs on the sqz-meta pool, never inline on a
+                // `sqz-cluster-svc{n}` lane.
+                match crate::meta_exec::spawn_meta_join("meta_ship_publish_verb", async move {
+                    me.execute(call).await
+                })
+                .await
+                {
+                    Ok(out) => out.map_err(|e| WireError::from_error(&e)),
+                    Err(e) => {
+                        // RES-7/RES-8: the unwind is recorded — and CACHED,
+                        // so a replay answers the same loud failure instead
+                        // of re-running half a commit.
+                        PANICS.fetch_add(1, Ordering::Relaxed);
+                        log::error!("S9 publish owner-side execution of {name} unwound: {e}");
+                        Err(WireError::from_error(&SqueezefsError::InvalidOperation(
+                            format!("S9 publish owner-side execution panicked: {e}"),
+                        )))
+                    }
+                }
+            })
+            .await
+            .clone();
+        SERVED.fetch_add(1, Ordering::Relaxed);
+        let frame = PublishReplyFrame {
+            schema: PUBLISH_SCHEMA,
+            outcome,
+        };
+        match encode(&frame, name) {
+            Ok(body) => RpcResponse {
+                id: req_id,
+                status: PUBLISH_OK,
+                body,
+            },
+            Err(e) => Self::refuse(req_id, PUBLISH_MALFORMED, format!("reply encode: {e}")),
         }
     }
 
@@ -1669,6 +1991,7 @@ impl PublishService {
                 layout,
                 size,
                 refs,
+                ..
             } => {
                 let refs: Vec<BlockRefOp> = refs.into_iter().map(BlockRefOp::from).collect();
                 self.inner
@@ -1682,6 +2005,7 @@ impl PublishService {
                 full_layout,
                 size,
                 refs,
+                ..
             } => {
                 let delta = crate::layout_wire::LayoutDelta::decode(&delta).map_err(|e| {
                     SqueezefsError::InvalidOperation(format!(
@@ -1695,16 +2019,18 @@ impl PublishService {
                     .await?;
                 Ok(PublishReply::DeltaUsed(used))
             }
-            PublishCall::CommitBlockRefs { ino, refs } => {
+            PublishCall::CommitBlockRefs { ino, refs, .. } => {
                 let refs: Vec<BlockRefOp> = refs.into_iter().map(BlockRefOp::from).collect();
                 self.inner.commit_block_refs(ino, &refs).await?;
                 Ok(PublishReply::Unit)
             }
-            PublishCall::ParkWriteTimes { ino, mtime, ctime } => {
+            PublishCall::ParkWriteTimes {
+                ino, mtime, ctime, ..
+            } => {
                 self.inner.park_write_times(ino, mtime, ctime).await?;
                 Ok(PublishReply::Unit)
             }
-            PublishCall::DestroyInodes { inos } => {
+            PublishCall::DestroyInodes { inos, .. } => {
                 self.inner.destroy_inodes(&inos).await?;
                 Ok(PublishReply::Unit)
             }
@@ -1716,6 +2042,7 @@ impl PublishService {
                 gid,
                 rdev,
                 initial_size,
+                ..
             } => {
                 let inode = self
                     .inner

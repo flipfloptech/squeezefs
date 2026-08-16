@@ -1403,3 +1403,222 @@ async fn two_co_writers_rewrite_disjoint_files_while_a_reader_acks() {
 
     auth.stop().await;
 }
+
+// ===========================================================================
+// 8. Rung 10 (residual 2) — co-writer FREED-BLOCK REUSE: the lane free
+//    harvest. Rung 9's shipped free returned displaced offsets to "the free
+//    supply of lane b % W" — but that supply lives on the AUTHORITY's free
+//    list, whose allocation funnel is lane-filtered, so a co-writer's freed
+//    blocks were reachable by NOBODY: the co-writer's own allocator never
+//    learned of them (frontier-monotone for the mount's lifetime — the
+//    rung-9 named residual), and the authority's lane gate refused them.
+//    Sustained rewrite therefore leaked toward ENOSPC on a store with free
+//    space.
+// ===========================================================================
+
+/// **THE residual-2 red** (rung 10 charter, verbatim): a co-writer rewrite
+/// loop on a small volume must reach steady state, never `StorageFull`,
+/// with `alloc_lane_enospc_refusals == 0`. The loop rewrites ONE block ~3×
+/// the co-writer's whole lane share, so it is unreachable on fresh mints
+/// alone: it holds only if the freed supply comes back — the HARVEST
+/// (`PublishCall::HarvestLaneFree`): at lane exhaustion the allocator ships
+/// a lane-scoped harvest to the authority, which hands back free-listed
+/// offsets of THAT lane (removing them from its own list — exactly-once),
+/// draining its reclaim queue first if the lane's supply is still queued.
+///
+/// RED against the wave-A tip: no harvest exists — the loop dies
+/// `StorageFull` at the lane share with the whole store's freed supply
+/// sitting unreachable on the authority's free list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_co_writer_rewrite_loop_reuses_its_lanes_freed_blocks_and_never_hits_storagefull() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "reuse-loop").await;
+    let dev = data_device(dir.path(), "reuse-loop.dev");
+    let auth = Authority::start(&vol, &dev, &[NODE_A]).await;
+    let cwr = CoWriter::join(&auth, &vol, &dev, NODE_A).await;
+
+    // A small store: 64 blocks, W = 2 ⇒ the co-writer's lane holds 32.
+    const CAP_BLOCKS: u64 = 64;
+    cwr.alloc.set_capacity_bytes(CAP_BLOCKS * cwr.alloc.chunk_size());
+    auth.alloc.set_capacity_bytes(CAP_BLOCKS * auth.alloc.chunk_size());
+    let lane_share = lane::lane_capacity_blocks(CAP_BLOCKS, 2, 1);
+    let iterations = lane_share * 3;
+
+    let enospc_before = METRICS.alloc_lane_enospc_refusals.load(Ordering::Relaxed);
+    let chunk = cwr.alloc.chunk_size();
+
+    // Seed: the co-writer's first block, referenced by a real inode.
+    let first_off = cwr
+        .alloc
+        .allocate_block()
+        .await
+        .expect("the first mint is a fresh lane-1 block");
+    let mut cur_idx = first_off / chunk;
+    let ino = authority_file_with_block(&auth, "rewritten-forever.bin", cur_idx).await;
+
+    for i in 0..iterations {
+        assert_eq!(
+            lane::block_lane_of(cur_idx, 2),
+            1,
+            "iteration {i}: every offset this mount holds is in its own residue class"
+        );
+        let new_idx = cwr.rewrite_block(ino, 0, cur_idx).await;
+        cwr.br
+            .free_block(&(cur_idx * chunk).to_string())
+            .await
+            .unwrap_or_else(|e| panic!("iteration {i}: the displaced free ships: {e}"));
+        cur_idx = new_idx;
+    }
+
+    assert_eq!(
+        METRICS.alloc_lane_enospc_refusals.load(Ordering::Relaxed) - enospc_before,
+        0,
+        "steady state: the lane never starved while the set had free space \
+         (the rung-10 residual-2 gate, verbatim)"
+    );
+    let stats = publish::stats();
+    assert!(
+        stats.harvest_served_blocks >= iterations - lane_share,
+        "the loop ran {iterations} rewrites on a {lane_share}-block lane share, so at least \
+         {} offsets came back through the harvest (served {})",
+        iterations - lane_share,
+        stats.harvest_served_blocks
+    );
+    assert!(
+        stats.harvest_shipped_blocks >= iterations - lane_share,
+        "the client-side harvest ledger accounts for the reuse (shipped {})",
+        stats.harvest_shipped_blocks
+    );
+
+    auth.stop().await;
+}
+
+/// Contract: the harvest is **lane-scoped, exactly-once, replay-safe, and
+/// its undischarged handouts join the dead-epoch cohort**.
+///
+/// * a harvest hands out only free-listed offsets of the CALLER's lane and
+///   removes them from the authority's free list (nobody can receive one
+///   twice);
+/// * a REPLAY (same `(lease_epoch, request_id)` — the lost-reply retry) is
+///   absorbed by the dedup window and answers the winner's own grant;
+/// * a fresh id finds the supply gone (exactly-once);
+/// * a handed-out offset whose reference never landed durably is part of
+///   the client's death cohort (`DeadCustody.offsets`) — the §3.1 zombie
+///   window closed for REUSED offsets the way the durable frontier closes
+///   it for fresh mints; a handout DISCHARGED by the offset's next shipped
+///   free is not (it is back under the authority's own ladder);
+/// * a stale-era harvest refuses (`harvest_refusals`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_harvest_is_exactly_once_lane_scoped_and_quarantines_undischarged_handouts() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "harvest").await;
+    let dev = data_device(dir.path(), "harvest.dev");
+    let auth = Authority::start(&vol, &dev, &[NODE_A]).await;
+    let cwr = CoWriter::join(&auth, &vol, &dev, NODE_A).await;
+    let chunk = cwr.alloc.chunk_size();
+    let tag = volume_tag(DATA_VOL);
+    let epoch = cwr.client.lease_epoch();
+
+    // A displaced lane-1 block, freed through the shipped ladder: the
+    // authority's free list now carries it, unreachable by lane-0.
+    let a_off = cwr.alloc.allocate_block().await.expect("mint A");
+    let a_idx = a_off / chunk;
+    let ino = authority_file_with_block(&auth, "harvested.bin", a_idx).await;
+    let b_idx = cwr.rewrite_block(ino, 0, a_idx).await;
+    cwr.br
+        .free_block(&a_off.to_string())
+        .await
+        .expect("A's displaced free ships");
+    auth.br.reclaim_drain().await;
+    assert!(auth.free_listed(a_idx), "fixture: A is in the lane-1 free supply");
+
+    // The harvest: lane-scoped, exactly-once, removed from the source list.
+    let got = publish::ship_harvest_lane_free(&auth.endpoint, tag, 1, 2, 16, epoch, 9001)
+        .await
+        .expect("the harvest ships");
+    assert!(got.contains(&a_idx), "the lane-1 supply came back: {got:?}");
+    assert!(got.iter().all(|i| lane::block_lane_of(*i, 2) == 1));
+    assert!(
+        !auth.free_listed(a_idx),
+        "the handout removed A from the authority's free list (exactly-once)"
+    );
+
+    // Replay (the lost-reply retry): the SAME witness answers the SAME grant.
+    let replays_before = publish::stats().harvest_replays;
+    let again = publish::ship_harvest_lane_free(&auth.endpoint, tag, 1, 2, 16, epoch, 9001)
+        .await
+        .expect("the replay is absorbed");
+    assert_eq!(again, got, "the dedup window answered the winner's own grant");
+    assert_eq!(publish::stats().harvest_replays - replays_before, 1);
+
+    // A fresh id finds the supply gone.
+    let empty = publish::ship_harvest_lane_free(&auth.endpoint, tag, 1, 2, 16, epoch, 9002)
+        .await
+        .expect("the second harvest ships");
+    assert!(empty.is_empty(), "exactly-once: {empty:?}");
+
+    // DISCHARGE: the co-writer reuses A, rewrites away again, and ships its
+    // free — A is back under the authority's own ladder, so the handout is
+    // discharged and A is free-listed again.
+    assert_eq!(cwr.alloc.adopt_lane_free_grant(&got), got.len() as u64);
+    let reused = cwr.alloc.allocate_block().await.expect("reuse");
+    assert_eq!(reused, a_off, "the free-list-first funnel serves A back");
+    cwr.rewrite_block(ino, 0, b_idx).await;
+    auth.meta
+        .commit_block_refs(
+            ino,
+            &[BlockRefOp::taken(BlockRef {
+                vol_tag: tag,
+                block_idx: a_idx,
+                owner_ino: ino,
+                block_index: 1,
+            })],
+        )
+        .await
+        .expect("A's reuse reference commits");
+    auth.meta
+        .commit_block_refs(
+            ino,
+            &[BlockRefOp::released(BlockRef {
+                vol_tag: tag,
+                block_idx: a_idx,
+                owner_ino: ino,
+                block_index: 1,
+            })],
+        )
+        .await
+        .expect("A's displacement releases");
+    cwr.br
+        .free_block(&a_off.to_string())
+        .await
+        .expect("A's second displaced free ships");
+    auth.br.reclaim_drain().await;
+    assert!(auth.free_listed(a_idx), "the full cycle returned A to the supply");
+
+    // Harvest A once more and let the epoch DIE with the handout
+    // undischarged: A must be named in the death cohort (the quarantine's
+    // input), exactly like a declared in-flight destination.
+    let got2 = publish::ship_harvest_lane_free(&auth.endpoint, tag, 1, 2, 16, epoch, 9003)
+        .await
+        .expect("the third harvest ships");
+    assert!(got2.contains(&a_idx));
+    let dead = auth.owner.revoke_client(NODE_A, "test: epoch death with an undischarged handout");
+    assert_eq!(dead.len(), 1, "one custody died");
+    assert!(
+        dead[0].offsets.contains(&a_off),
+        "the undischarged handout joined the dead-epoch cohort (got {:?})",
+        dead[0].offsets
+    );
+
+    // A stale-era harvest refuses loud and is counted.
+    let refusals_before = publish::stats().harvest_refusals;
+    let stale = publish::ship_harvest_lane_free(&auth.endpoint, tag, 1, 2, 16, epoch, 9004).await;
+    assert!(stale.is_err(), "a dead era's harvest is refused");
+    assert_eq!(publish::stats().harvest_refusals - refusals_before, 1);
+
+    auth.stop().await;
+}

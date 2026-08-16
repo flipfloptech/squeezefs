@@ -488,6 +488,16 @@ enum HoldRole {
     /// reservation (a co-writer). Teardown unregisters only — never
     /// releases, because the reservation is not ours to end.
     Registrant,
+    /// This process ADOPTED a same-host authority's standing hold
+    /// (rung-9 finding #1 — the CO-LOCATED co-writer, docs/operations.md
+    /// §Multi-writer co-writer mounts' "honest residual"): it performed
+    /// NO device mutation to join and performs none to leave. PR ioctls
+    /// through a merged multipath head round-robin across associations,
+    /// so a co-located register is unsound (the ladder's own-stale proof
+    /// destroyed a live authority's hold — device-proven 2026-08-16);
+    /// the same-host shape shares the PR arbitration domain anyway, so
+    /// the standing hold IS this mount's fenceability evidence.
+    Adopted,
 }
 
 /// The process's live WERO hold on one data-namespace set. Dropping the
@@ -510,6 +520,10 @@ impl Drop for WeroInner {
                 // the reservation belongs to the authority, and
                 // `unregister` is same-host-scoped by the device.
                 HoldRole::Registrant => client.unregister(self.key),
+                // An adopted hold registered nothing, so it removes
+                // nothing: the device is left exactly as it was found
+                // (the authority's fence stands — finding #1's law).
+                HoldRole::Adopted => Ok(()),
             };
             if let Err(e) = outcome {
                 log::warn!("data-plane WERO {:?} teardown failed: {e}", self.role);
@@ -519,7 +533,9 @@ impl Drop for WeroInner {
             .lock()
             .unwrap()
             .remove(&(self.paths.clone(), self.role));
-        METRICS.data_plane_fence_mode.store(0, Ordering::Relaxed);
+        if self.role != HoldRole::Adopted {
+            METRICS.data_plane_fence_mode.store(0, Ordering::Relaxed);
+        }
         log::info!(
             "data-plane WERO {:?} released on {} namespace(s) (last reference departed)",
             self.role,
@@ -567,6 +583,132 @@ impl WeroHold {
         }
         n
     }
+
+    /// **RE-VERIFY the standing hold against the device and heal what is
+    /// healable** (rung-9 finding #2 — the `writer_guard_pr_reacquires`
+    /// law mirrored onto the data plane). Before this existed the
+    /// authority gauged `data_plane_fence_mode=1` forever, even over a
+    /// reservation the device no longer held: the fence gauge could lie.
+    ///
+    /// * a standing rtype-3 hold under OUR key → [`WeroReverify::Held`];
+    /// * a VANISHED reservation (PTPL-less target power cycle; a peer's
+    ///   erroneous release) → re-register + re-acquire, counted on
+    ///   `data_plane_wero_reacquires` → [`WeroReverify::Healed`];
+    /// * a hold USURPED by a FOREIGN key → **never healed over** (foreign
+    ///   arbitration stays the claim/preempt path — the register ladder's
+    ///   own fail-closed law): process data custody is POISONED (RES-6)
+    ///   and the fence-mode gauge drops → [`WeroReverify::Usurped`];
+    /// * an unhealable loss (re-acquire refused) → poison + gauge drop →
+    ///   [`WeroReverify::Lost`].
+    ///
+    /// Only a [`HoldRole::Holder`] heals (a registrant/adopted hold has no
+    /// reservation of its own to re-take). Blocking (one-shot ioctls) —
+    /// call via `spawn_blocking` from async paths (the S9 cadence sweep
+    /// is the production caller).
+    pub fn reverify_and_heal(&self) -> WeroReverify {
+        if self.inner.role != HoldRole::Holder {
+            return WeroReverify::Held;
+        }
+        let mut healed = false;
+        for (client, path) in self.inner.clients.iter().zip(&self.inner.paths) {
+            let report = match client.report() {
+                Ok(r) => r,
+                Err(e) => {
+                    log::warn!(
+                        "data-plane WERO re-verify: report on {} failed ({e}) — verdict \
+                         deferred to the next sweep, nothing mutated",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            match report.holder_key {
+                Some(k) if k == self.inner.key && report.is_wero() => {}
+                Some(k) if k != self.inner.key => {
+                    let reason = format!(
+                        "data-plane WERO on {} is held by FOREIGN key {k:#x} (ours is {:#x}) — \
+                         this mount's fence was usurped. Foreign arbitration stays the \
+                         claim/preempt path; healing over it would fight a live peer's fence",
+                        path.display(),
+                        self.inner.key
+                    );
+                    log::error!("{reason}");
+                    poison(&reason);
+                    METRICS.data_plane_fence_mode.store(0, Ordering::Relaxed);
+                    return WeroReverify::Usurped { key: k };
+                }
+                // No reservation at all (or a non-WERO rtype under our own
+                // key, the torn shape): the vanished-hold class — re-take
+                // it, exactly as the meta guard re-acquires
+                // (`writer_guard_pr_reacquires`).
+                _ => {
+                    let step = register_ladder(client.as_ref(), self.inner.key)
+                        .map(|_| ())
+                        .and_then(|()| {
+                            client.acquire_write_exclusive_registrants_only(self.inner.key)
+                        });
+                    match step {
+                        Ok(()) => {
+                            WERO_REACQUIRES.fetch_add(1, Ordering::Relaxed);
+                            log::warn!(
+                                "data-plane WERO on {} had VANISHED (target dropped \
+                                 reservations — the pr_reacquires class); re-acquired under \
+                                 key {:#x} (data_plane_wero_reacquires)",
+                                path.display(),
+                                self.inner.key
+                            );
+                            healed = true;
+                        }
+                        Err(e) => {
+                            let reason = format!(
+                                "data-plane WERO on {} vanished and could NOT be re-acquired \
+                                 ({e}) — the device-enforced fence is gone and this mount \
+                                 cannot honestly claim it",
+                                path.display()
+                            );
+                            log::error!("{reason}");
+                            poison(&reason);
+                            METRICS.data_plane_fence_mode.store(0, Ordering::Relaxed);
+                            return WeroReverify::Lost;
+                        }
+                    }
+                }
+            }
+        }
+        if healed {
+            WeroReverify::Healed
+        } else {
+            WeroReverify::Held
+        }
+    }
+}
+
+/// [`WeroHold::reverify_and_heal`]'s verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeroReverify {
+    /// Every namespace holds our rtype-3 reservation — nothing to do.
+    Held,
+    /// At least one vanished hold was re-acquired (counted).
+    Healed,
+    /// A foreign key holds the reservation: custody poisoned, gauge
+    /// dropped, nothing mutated at the device.
+    Usurped {
+        /// The usurper's reservation key.
+        key: u64,
+    },
+    /// A vanished hold could not be re-taken: custody poisoned, gauge
+    /// dropped.
+    Lost,
+}
+
+/// Vanished-hold re-acquires performed by [`WeroHold::reverify_and_heal`]
+/// (`data_plane_wero_reacquires` on the stats inode — the data plane's
+/// `writer_guard_pr_reacquires`).
+static WERO_REACQUIRES: AtomicU64 = AtomicU64::new(0);
+
+/// Read the re-acquire counter.
+pub fn wero_reacquires() -> u64 {
+    WERO_REACQUIRES.load(Ordering::Relaxed)
 }
 
 /// The per-process WERO registry, keyed by the namespace set AND the role
@@ -741,6 +883,150 @@ impl WeroRegistrantJoin {
     pub fn hold(&self) -> &WeroHold {
         &self.hold
     }
+}
+
+/// **DLM S9 — the CO-LOCATED co-writer's device half** (rung-9 finding
+/// #1): ADOPT the same-host authority's standing WERO hold — read-only
+/// evidence, ZERO device mutations, the standing holder key cross-checked
+/// against the durable claim set's ENROLLED writer keys.
+///
+/// Why not [`join_wero_as_registrant`] on this shape: a co-located mount's
+/// PR ioctls travel through the box's merged multipath head, whose
+/// dispatch round-robins across ASSOCIATIONS — so `register` and
+/// `wire_host_id` may ride different (or the authority's own) controllers,
+/// and the register ladder's "own-stale" proof can name the LIVE
+/// authority's HOLDER key. Unregistering a holder key releases the
+/// reservation for the whole set: the first live co-writer mount attempt
+/// did exactly that (device truth after: `rtype 0, regctl 0` — the
+/// destroyed fence, 2026-08-16). On the same-host shape no second key is
+/// needed anyway: docs/operations.md's honest residual says it plainly —
+/// "a co-writer sharing a HOST with its authority is inside the same PR
+/// host identity, so nothing device-side distinguishes them". The
+/// standing hold IS this mount's rung-5 fenceability evidence; its death
+/// is proven by the same-host dead-pid ladder, never by a PR preempt
+/// (which would take the authority's own fence down — see the cadence
+/// sweep's own-key guard).
+///
+/// Refusals (never degrades):
+///   1. a namespace with no reservation support, naming it;
+///   2. a namespace holding no rtype-3 reservation (arm the authority);
+///   3. a holder key the claim set does not ENROLL as a writer's —
+///      adopting an unauthenticated hold would authenticate this mount
+///      against an authority it was never admitted by.
+///
+/// Blocking (one-shot report ioctls) — call via `spawn_blocking`.
+pub fn adopt_wero_colocated(
+    data_paths: &[PathBuf],
+    enrolled_keys: &[u64],
+) -> Result<WeroRegistrantJoin> {
+    if data_paths.is_empty() {
+        return Err(SqueezefsError::InvalidOperation(
+            "co-located WERO adoption refuses: the mount names no data namespace, so there is \
+             nothing to adopt a fence over"
+                .to_string(),
+        ));
+    }
+    let key_set = canonical(data_paths);
+    let mut reg = registry().lock().unwrap();
+    if let Some(existing) = reg
+        .get(&(key_set.clone(), HoldRole::Adopted))
+        .and_then(Weak::upgrade)
+    {
+        let key = existing.key;
+        let namespaces = existing.paths.len();
+        return Ok(WeroRegistrantJoin {
+            hold: WeroHold { inner: existing },
+            evidence: crate::cowriter::RegistrantEvidence {
+                pr_capable: true,
+                wero: true,
+                reservation_held: true,
+                registered: true,
+                key,
+                namespaces,
+            },
+        });
+    }
+    let mut clients: Vec<Arc<dyn ReservationClient>> = Vec::new();
+    let mut adopted_key: Option<u64> = None;
+    for path in &key_set {
+        let Some(client) = resolve_for_mount(path) else {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "co-located WERO adoption refuses: data namespace {} advertises no NVMe \
+                 reservation support (RESCAP=0) — there is no device fence to adopt",
+                path.display()
+            )));
+        };
+        let report = client.report().map_err(|e| {
+            SqueezefsError::InvalidOperation(format!(
+                "co-located WERO adoption refuses: Reservation Report on {} failed: {e} — the \
+                 admission cannot verify the standing hold blind",
+                path.display()
+            ))
+        })?;
+        if !report.is_wero() {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "co-located WERO adoption refuses: data namespace {} holds no Write Exclusive – \
+                 Registrants Only (rtype 3) reservation (holder {:?}, rtype {}). Arm the \
+                 authority's multi-writer plane first",
+                path.display(),
+                report.holder_key,
+                report.rtype
+            )));
+        }
+        let holder = report
+            .holder_key
+            .expect("is_wero() established a holder key");
+        if !enrolled_keys.contains(&holder) {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "co-located WERO adoption refuses: the standing hold on {} is under key \
+                 {holder:#x}, which the durable claim set does not enroll as any writer \
+                 member's registrant key ({enrolled_keys:#x?}) — somebody else's fence is not \
+                 this mount's fenceability evidence",
+                path.display()
+            )));
+        }
+        match adopted_key {
+            None => adopted_key = Some(holder),
+            Some(k) if k == holder => {}
+            Some(k) => {
+                return Err(SqueezefsError::InvalidOperation(format!(
+                    "co-located WERO adoption refuses: the set's namespaces are held under \
+                     DIFFERENT keys ({k:#x} vs {holder:#x} on {}) — a torn fence is not a \
+                     fence; re-arm the authority",
+                    path.display()
+                )));
+            }
+        }
+        clients.push(client);
+    }
+    let key = adopted_key.expect("non-empty path set established a key");
+    let inner = Arc::new(WeroInner {
+        key,
+        paths: key_set.clone(),
+        clients,
+        role: HoldRole::Adopted,
+    });
+    reg.insert((key_set, HoldRole::Adopted), Arc::downgrade(&inner));
+    log::warn!(
+        "data-plane WERO ADOPTED (co-located co-writer, {} namespace(s), authority key \
+         {key:#x}): this mount shares its authority's PR arbitration domain, so the standing \
+         hold is its fenceability evidence and NOTHING was registered — the stated honest \
+         residual (docs/operations.md §Multi-writer co-writer mounts): on this shape the \
+         metadata read-only half is enforced by this mount's own code, not by the device, and \
+         its death is proven by the same-host dead-pid ladder, never by a PR preempt",
+        inner.paths.len()
+    );
+    Ok(WeroRegistrantJoin {
+        hold: WeroHold { inner },
+        evidence: crate::cowriter::RegistrantEvidence {
+            pr_capable: true,
+            wero: true,
+            reservation_held: true,
+            registered: true,
+            key,
+            namespaces: data_paths.len(),
+        },
+    })
 }
 
 /// **DLM S9 — the co-writer's device half**: REGISTER this process's key

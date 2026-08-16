@@ -9109,6 +9109,11 @@ impl SqueezefsFilesystem {
                 "dlm_quarantined_offsets": METRICS.dlm_quarantined_offsets.load(Ordering::Relaxed),
                 "dlm_quarantine_releases": METRICS.dlm_quarantine_releases.load(Ordering::Relaxed),
                 "data_plane_fence_mode": METRICS.data_plane_fence_mode.load(Ordering::Relaxed),
+                // Rung-9 finding #2: vanished-hold re-acquires performed by
+                // the S9 cadence's WERO re-verify — the data plane's
+                // `writer_guard_pr_reacquires` (growth = the target dropped
+                // reservations; audit the fabric).
+                "data_plane_wero_reacquires": crate::data_custody::wero_reacquires(),
                 // DLM S9: the per-client custody generation and its
                 // advances — the epoch's low bits (0 on every
                 // single-writer mount, where nothing revokes custody).

@@ -92,7 +92,9 @@ fn authority_held_ns(tag: &str) -> (Arc<FakeNvmeNamespace>, PathBuf) {
         "nqn.2014-08.org.nvmexpress:uuid:authority",
         "cafef1e7-0000-4000-8000-000000000001",
     );
-    authority.register(AUTHORITY_KEY).expect("authority register");
+    authority
+        .register(AUTHORITY_KEY)
+        .expect("authority register");
     authority
         .acquire_write_exclusive_registrants_only(AUTHORITY_KEY)
         .expect("authority WERO acquire");
@@ -133,7 +135,11 @@ async fn a_co_located_co_writer_adopts_the_standing_hold_and_mutates_nothing() {
         ev.key, AUTHORITY_KEY,
         "the adopted key IS the authority's (same PR arbitration domain — the ops.md residual)"
     );
-    assert_eq!(ns.holder(), Some(AUTHORITY_KEY), "the hold stands untouched");
+    assert_eq!(
+        ns.holder(),
+        Some(AUTHORITY_KEY),
+        "the hold stands untouched"
+    );
     assert!(ns.is_registered(AUTHORITY_KEY));
     assert_eq!(ns.unregister_count(), 0, "adoption unregisters NOTHING");
 
@@ -144,7 +150,11 @@ async fn a_co_located_co_writer_adopts_the_standing_hold_and_mutates_nothing() {
         "an adopted hold's teardown leaves the device exactly as found"
     );
     assert!(ns.is_registered(AUTHORITY_KEY));
-    assert_eq!(ns.unregister_count(), 0, "teardown unregisters NOTHING it never registered");
+    assert_eq!(
+        ns.unregister_count(),
+        0,
+        "teardown unregisters NOTHING it never registered"
+    );
 }
 
 /// Contract: no standing hold ⇒ refuse (the authority's arm is the
@@ -187,7 +197,11 @@ async fn an_adoption_refuses_a_holder_key_the_claim_set_does_not_enroll() {
         err.contains("enroll") || err.contains("claim set"),
         "the refusal names the enrollment cross-check: {err}"
     );
-    assert_eq!(ns.holder(), Some(AUTHORITY_KEY), "and the device is untouched");
+    assert_eq!(
+        ns.holder(),
+        Some(AUTHORITY_KEY),
+        "and the device is untouched"
+    );
 }
 
 /// Contract: the co-located test is the BOOT id — a `writer_claim` whose
@@ -284,7 +298,11 @@ async fn a_vanished_wero_hold_is_detected_and_reacquired_by_reverify() {
     let hold = data_custody::acquire_wero(std::slice::from_ref(&p)).expect("the authority arms");
     let key = hold.key();
     assert_eq!(ns.holder(), Some(key));
-    assert_eq!(hold.reverify_and_heal(), WeroReverify::Held, "a standing hold re-verifies clean");
+    assert_eq!(
+        hold.reverify_and_heal(),
+        WeroReverify::Held,
+        "a standing hold re-verifies clean"
+    );
 
     // The target loses everything (PTPL-less power cycle).
     ns.power_cycle();

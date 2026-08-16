@@ -243,6 +243,30 @@ pub fn node_member_id() -> Result<String> {
     })
 }
 
+/// Is the authority CO-LOCATED with this mount (rung-9 finding #1)?
+///
+/// The test is the D0 `writer_claim`'s **boot id** against this kernel's:
+/// the same boot IS the same host — the shape whose merged multipath head
+/// makes PR mutations unsound (register/wire_host_id ride round-robined
+/// associations) and whose PR arbitration domain is shared anyway
+/// (docs/operations.md §Multi-writer co-writer mounts, the honest
+/// residual). Node-token or identity-string comparisons would be weaker:
+/// both are derivable/spoofable configuration, while the boot id is what
+/// the same-host dead-pid proof already keys on (`WriterClaim.boot`).
+/// Empty evidence (no claim on some volume) answers `false` — the
+/// register path stays, and its own gates decide.
+pub fn co_located_with_authority(req: &AdmissionRequest) -> bool {
+    let Ok(our_boot) = std::fs::read_to_string("/proc/sys/kernel/random/boot_id") else {
+        return false;
+    };
+    let our_boot = our_boot.trim();
+    !req.volumes.is_empty()
+        && req
+            .volumes
+            .iter()
+            .all(|v| v.claim.as_ref().is_some_and(|c| c.boot == our_boot))
+}
+
 // ---------------------------------------------------------------------------
 // The evidence the ladder decides over
 // ---------------------------------------------------------------------------
@@ -848,6 +872,19 @@ pub async fn gather_admission(
     }
     rung_2_engaged_claim_set(&req)?;
     rung_3_durable_enrollment(&req)?;
+    let colocated = co_located_with_authority(&req);
+    let enrolled_writer_keys: Vec<u64> = req
+        .volumes
+        .first()
+        .and_then(|v| v.claim_set.as_ref())
+        .map(|set| {
+            set.members
+                .iter()
+                .filter(|m| m.identity.role == MemberRole::Writer && m.identity.pr_key != 0)
+                .map(|m| m.identity.pr_key)
+                .collect()
+        })
+        .unwrap_or_default();
 
     // Rung 4 — the membership plane: the rendezvous record, then a real
     // JOIN as a writer member (the liveness proof).
@@ -883,11 +920,28 @@ pub async fn gather_admission(
     // registrant key so the authority can preempt us (i.e. so a drain proof
     // about us can exist). Registration is the mutation, so it happens
     // after rungs 1–3 and its failure is rung 5's refusal.
+    //
+    // Rung-9 finding #1: the CO-LOCATED shape (this claim's `boot` is OUR
+    // boot — same kernel, same box, same merged multipath head) must never
+    // run PR MUTATIONS: head ioctls round-robin across associations, so the
+    // register ladder's own-stale proof can name the LIVE authority's
+    // holder key and release the whole set's fence (device-proven). It
+    // ADOPTS the standing hold instead — the ops.md honest residual — with
+    // the holder key cross-checked against the claim set's enrolled writer
+    // keys. Remote co-writers (their own head, sound ladder) keep the
+    // register path.
     let paths = data_paths.to_vec();
-    let wero = squeezefs_ipc::sqz_blocking::run_blocking(move || {
-        crate::data_custody::join_wero_as_registrant(&paths)
-    })
-    .await?;
+    let wero = if colocated {
+        squeezefs_ipc::sqz_blocking::run_blocking(move || {
+            crate::data_custody::adopt_wero_colocated(&paths, &enrolled_writer_keys)
+        })
+        .await?
+    } else {
+        squeezefs_ipc::sqz_blocking::run_blocking(move || {
+            crate::data_custody::join_wero_as_registrant(&paths)
+        })
+        .await?
+    };
     req.registrant = Some(wero.evidence());
 
     if let Some(rec) = rendezvous {

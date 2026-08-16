@@ -727,6 +727,29 @@ fn spawn_cadence(
             if stop.load(Ordering::Acquire) {
                 return;
             }
+            // Rung-9 finding #2: RE-VERIFY the standing WERO against the
+            // device every sweep — before this, the fence-mode gauge read
+            // 1 forever, even over a reservation the device no longer
+            // held (a vanished hold re-acquires and counts on
+            // `data_plane_wero_reacquires`; a foreign-usurped hold
+            // poisons custody and drops the gauge — never healed over).
+            if let Some(hold) = wero.clone() {
+                let verdict =
+                    squeezefs_ipc::sqz_blocking::run_blocking(move || hold.reverify_and_heal())
+                        .await;
+                match verdict {
+                    crate::data_custody::WeroReverify::Held
+                    | crate::data_custody::WeroReverify::Healed => {}
+                    lost => {
+                        log::error!(
+                            "S9 custody sweep: the data-plane WERO hold is gone ({lost:?}) — \
+                             custody is poisoned and no dead-epoch preempt can be issued from \
+                             a fence this mount no longer holds"
+                        );
+                        continue;
+                    }
+                }
+            }
             for dead in owner.expire_due() {
                 log::warn!(
                     "S9: swept co-writer '{}' (lease epoch {}) — {}; {} offset(s) quarantined \
@@ -754,6 +777,24 @@ fn spawn_cadence(
                     continue;
                 }
                 let victim = dead.pr_key;
+                // Rung-9 own-key guard: a CO-LOCATED co-writer's adopted
+                // fenceability key IS this authority's own (shared PR
+                // arbitration domain — the ops.md honest residual), and
+                // preempting it would take down the authority's own fence.
+                // Same-host death is the dead-pid ladder's proof, never a
+                // PR preempt; its offsets stay quarantined until recovery
+                // attests, exactly like the key-less arm above.
+                if victim == hold.key() {
+                    log::warn!(
+                        "S9: dead co-writer '{}' is fenced by THIS authority's own key \
+                         {victim:#x} (the co-located adopted shape) — no preempt can prove it \
+                         drained without destroying our own fence; its {} offset(s) stay \
+                         quarantined until recovery attests",
+                        dead.client,
+                        dead.offsets.len()
+                    );
+                    continue;
+                }
                 let landed =
                     squeezefs_ipc::sqz_blocking::run_blocking(move || hold.preempt(victim)).await;
                 match data_grant::DrainProof::preempt_landed(landed) {

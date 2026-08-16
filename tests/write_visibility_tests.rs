@@ -138,7 +138,14 @@ async fn write_at(h: &H, ino: u64, off: u64, data: &[u8]) {
             0,
         )
         .await
-        .unwrap();
+        // Round 5: the discriminator travels IN the panic (a writer-task
+        // death must be self-attributing on any exit path/stream).
+        .unwrap_or_else(|e| {
+            panic!(
+                "write at off {off} (ino {ino}) failed: {e:?}\n{}",
+                storm_stats_line()
+            )
+        });
     assert_eq!(w.written as usize, data.len(), "short write at off {off}");
 }
 
@@ -991,39 +998,49 @@ async fn serialized_overwrite_never_reverts_neighbors() {
 /// pattern: 795's readers filter EOF and still caught wrong bytes
 /// (zeros / foreign) at stable offsets, self-healing on remount —
 /// a daemon-side transient wrong serve.
-/// Drop-guard stats dump: EVERY exit path of a storm — pass, byte-compare
-/// panic, coverage-deadline panic, writer-death panic — carries the
-/// discriminator counters in its tape (round-4 mandate: the round-3
-/// falsification tape had no gauge line, so the escalation-vs-serve
-/// discrimination the gauges exist for was unavailable). Drop runs on
-/// unwind, so one guard at test start covers all paths.
+/// One greppable line of the discriminator counters ("STORM-STATS …").
+/// Round-5 mandate: the round-4 falsification tape STILL carried no
+/// gauge line (whatever the exit path did to the drop guard's stream),
+/// so the counters now travel INLINE in every panic message — immune to
+/// stream/exit-path issues — and the drop guard prints the same line as
+/// the belt.
+fn storm_stats_line() -> String {
+    use std::sync::atomic::Ordering as O;
+    let m = &squeezefs::fuse_client::METRICS;
+    format!(
+        "STORM-STATS overlay_window_escalations={} stale_binding_escalations={} \
+         overlay_read_drains={} overlay_installs={} overlay_publishes={} \
+         overlay_epoch_feeds={} overlay_feed_fallbacks={} overlay_fence_drops={} \
+         overlay_claim_conflicts={} overlay_ack_early_lost={} \
+         overlay_enospc_declines={} invariant_tripwires={} \
+         write_through_fallbacks={} writeback_orphan_discards={} \
+         writeback_stale_token_retries={} stale_binding_rebinds={}",
+        m.overlay_window_escalations.load(O::Relaxed),
+        m.stale_binding_escalations.load(O::Relaxed),
+        m.overlay_read_drains.load(O::Relaxed),
+        m.overlay_installs.load(O::Relaxed),
+        m.overlay_publishes.load(O::Relaxed),
+        m.overlay_epoch_feeds.load(O::Relaxed),
+        m.overlay_feed_fallbacks.load(O::Relaxed),
+        m.overlay_fence_drops.load(O::Relaxed),
+        m.overlay_claim_conflicts.load(O::Relaxed),
+        m.overlay_ack_early_lost.load(O::Relaxed),
+        m.overlay_enospc_declines.load(O::Relaxed),
+        m.invariant_tripwires.load(O::Relaxed),
+        m.write_through_fallbacks.load(O::Relaxed),
+        m.writeback_orphan_discards.load(O::Relaxed),
+        m.writeback_stale_token_retries.load(O::Relaxed),
+        m.stale_binding_rebinds.load(O::Relaxed),
+    )
+}
+
+/// Drop-guard stats dump (the belt; the panic-inline lines are the
+/// braces). Drop runs on unwind, so one guard at test start covers all
+/// paths that unwind the MAIN test task.
 struct StormStatsDump;
 impl Drop for StormStatsDump {
     fn drop(&mut self) {
-        use std::sync::atomic::Ordering as O;
-        let m = &squeezefs::fuse_client::METRICS;
-        eprintln!(
-            "STORM-STATS overlay_window_escalations={} stale_binding_escalations={} \
-             overlay_read_drains={} overlay_installs={} overlay_publishes={} \
-             overlay_epoch_feeds={} overlay_feed_fallbacks={} overlay_fence_drops={} \
-             overlay_claim_conflicts={} overlay_ack_early_lost={} \
-             invariant_tripwires={} write_through_fallbacks={} \
-             writeback_stale_token_retries={} stale_binding_rebinds={}",
-            m.overlay_window_escalations.load(O::Relaxed),
-            m.stale_binding_escalations.load(O::Relaxed),
-            m.overlay_read_drains.load(O::Relaxed),
-            m.overlay_installs.load(O::Relaxed),
-            m.overlay_publishes.load(O::Relaxed),
-            m.overlay_epoch_feeds.load(O::Relaxed),
-            m.overlay_feed_fallbacks.load(O::Relaxed),
-            m.overlay_fence_drops.load(O::Relaxed),
-            m.overlay_claim_conflicts.load(O::Relaxed),
-            m.overlay_ack_early_lost.load(O::Relaxed),
-            m.invariant_tripwires.load(O::Relaxed),
-            m.write_through_fallbacks.load(O::Relaxed),
-            m.writeback_stale_token_retries.load(O::Relaxed),
-            m.stale_binding_rebinds.load(O::Relaxed),
-        );
+        eprintln!("{}", storm_stats_line());
     }
 }
 
@@ -1133,7 +1150,7 @@ async fn sequential_recopy_readers_never_see_foreign_bytes() {
                     panic!(
                         "foreign bytes served: incarnation {ino} reply off {off} len {} — \
                          {bad} wrong bytes starting at {pos} (ack watermark {watermark}: \
-                         {}); got[{j0}..]={} want={} (generic/795)",
+                         {}); got[{j0}..]={} want={} (generic/795)\n{}",
                         got.len(),
                         if (pos as u64) < watermark {
                             "ACKED bytes lost from visibility"
@@ -1141,7 +1158,8 @@ async fn sequential_recopy_readers_never_see_foreign_bytes() {
                             "SIZE LED DATA (unacked range readable)"
                         },
                         dump.join(""),
-                        wdump.join("")
+                        wdump.join(""),
+                        storm_stats_line()
                     );
                 }
                 served += got.len() as u64;
@@ -1177,19 +1195,32 @@ async fn sequential_recopy_readers_never_see_foreign_bytes() {
         // falsification tape burned 115 s waiting on a writer that died
         // at incarnation 10.
         if writer.is_finished() && c < WRITER_CYCLES {
-            (&mut writer)
-                .await
-                .expect("writer task died before completing its incarnations");
+            let res = (&mut writer).await;
             panic!(
-                "writer task exited early without panic at {c}/{WRITER_CYCLES} \
-                 incarnations — the storm's coverage is a hard gate"
+                "writer task died/exited early at {c}/{WRITER_CYCLES} \
+                 incarnations — the storm's coverage is a hard gate \
+                 (join: {res:?})\n{}",
+                storm_stats_line()
             );
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "generic/795 storm never reached its coverage: {c}/{WRITER_CYCLES} \
-             writer incarnations, {r}/{READER_OPS} reader ops"
-        );
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "generic/795 storm never reached its coverage: {c}/{WRITER_CYCLES} \
+                 writer incarnations, {r}/{READER_OPS} reader ops\n{}",
+                storm_stats_line()
+            );
+        }
+        // FORCED-FAILURE DEMONSTRATION lever (round-5 mandate: at least
+        // one acceptance log must PROVE the discriminator prints on a
+        // failure path): `STORM_FORCE_FAIL=1` fails the storm here, at
+        // coverage-poll cadence, through the same panic-inline vehicle.
+        if std::env::var("STORM_FORCE_FAIL").is_ok() && r > 0 {
+            panic!(
+                "STORM_FORCE_FAIL demonstration panic ({c}/{WRITER_CYCLES} \
+                 incarnations, {r} reader ops)\n{}",
+                storm_stats_line()
+            );
+        }
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1823,11 +1854,14 @@ async fn write_meeting_a_transiently_failing_settle_converges_never_eio() {
     );
 
     // The write to block 1: its screen meets the FROZEN record and must
-    // settle it before accumulation. Inject failures into the next TWO
-    // settle attempts — the converged arm's budget (4) absorbs them.
-    // Pre-fix (raw settle at the write arms): the first injected failure
-    // surfaced as write EIO — the dead-writer tape verbatim.
-    squeezefs::fuse_client::set_test_settle_transient_failures(2);
+    // settle it before accumulation. Inject failures into the next SIX
+    // settle attempts — past the round-4 bounded budget (4), the round-5
+    // falsification's lesson: a write parked on a Frozen record's settle
+    // is the writeback ladder's shape and retries FOREVER on transients
+    // (never-lossy), so ANY finite injected run must converge. Pre-round-4
+    // the first failure EIO'd the write; at round 4's budget the fifth
+    // did — the dead-writer tape, twice.
+    squeezefs::fuse_client::set_test_settle_transient_failures(6);
     write_at(&h, ino, BS + 8192, &pattern[..8192]).await;
     squeezefs::fuse_client::set_test_settle_transient_failures(0);
 

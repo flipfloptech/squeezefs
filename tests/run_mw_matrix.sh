@@ -54,9 +54,10 @@
 #   s8-crucible [--secs=S]  (rung 9; design row S8-b) the shipped-verb
 #                       crucible over every co-writer member: sustained
 #                       mdstorm-shaped mixed verbs (create/chmod/utimes/
-#                       rename/unlink), INJECTED retries via partition
-#                       flaps on a netns co-writer (dedup window
-#                       exercised), an authority kill-9 + remount
+#                       rename/unlink), INJECTED retries via server-side
+#                       TCP session kills at the authority's custody port
+#                       (a veth flap is INVISIBLE to TCP — retransmission
+#                       absorbs it; measured), an authority kill-9 + remount
 #                       mid-stream (the era split: stale_term_refusals on
 #                       the NEW authority vs era_relearns on the clients),
 #                       a co-writer kill-9 mid-stream followed by the
@@ -2094,17 +2095,16 @@ leg_s8_crucible() {
     # falsifier: any un-routed local commit), engagement shipped==served.
     require_cowriters 1
     local secs="$S8B_SECS"
-    local rowdir w_mnt cws cw0 idx
+    local rowdir w_mnt cws idx
     rowdir="$STATE/rows/s8b-$(date +%s)"
     mkdir -p "$rowdir"
     w_mnt="$(mnt_of 0)"
     mapfile -t cws < <(cowriter_idxs)
-    cw0="${cws[0]}"
-    log "s8-crucible: ${#cws[@]} co-writer(s), ${secs}s total (phase A storm -> injected retries -> authority restart -> co-writer kill-9 -> fsck oracle -> phase C storm). Design asks K=5; this fleet runs K=${#cws[@]} (stated in the row)."
+    log "s8-crucible: ${#cws[@]} co-writer(s), ${secs}s total (phase A storm -> injected TCP-kill retries -> authority restart -> co-writer kill-9 -> fsck oracle -> phase C storm). Design asks K=5; this fleet runs K=${#cws[@]} (stated in the row)."
 
-    # The retry injector needs a shapeable wire: cw0 goes netns.
-    "$MWFLEET" unmount "$cw0"
-    "$MWFLEET" mount "$cw0" --netns
+    command -v ss >/dev/null 2>&1 || die "s8-crucible needs iproute2 ss (the E1 TCP-kill injector)"
+    local mw_port="${MW_ENDPOINT##*:}"
+    [ -n "$mw_port" ] || die "no MW_ENDPOINT recorded"
 
     for idx in 0 "${cws[@]}"; do snap "$idx" 0 "$rowdir"; done
 
@@ -2116,31 +2116,43 @@ leg_s8_crucible() {
         pids+=("$!")
     done
 
-    # ---- E1: injected retries (partition flaps on cw0, mid-storm) -------
+    # ---- E1: injected retries (server-side TCP kills, mid-storm) --------
+    # A 2 s veth partition is INVISIBLE to TCP (retransmission absorbs it
+    # — measured: five flaps under storm, zero retries), so the injector
+    # kills the ESTABLISHED wire sessions at the authority's port instead:
+    # the client's next call fails instantly, the router reconnects once
+    # and RESENDS THE SAME IDS (its documented law) — and a kill that
+    # landed after execute-before-reply is answered from the dedup window.
     sleep $((phase_a / 3))
     local retries0 retries1 dedup0 dedup1
-    retries0="$(stat_field "$cw0" meta_ship.retries)"
+    rsum() {
+        local acc=0 i
+        for i in "${cws[@]}"; do
+            acc=$((acc + $(stat_field "$i" meta_ship.retries)))
+        done
+        echo "$acc"
+    }
+    retries0="$(rsum)"
     dedup0="$(stat_field 0 meta_ship.dedup_hits)"
     for _flap in 1 2 3 4 5; do
-        "$MWFLEET" partition "$cw0" on
-        sleep 2
-        "$MWFLEET" partition "$cw0" off
-        sleep 3
+        ss -K state established "( sport = :$mw_port )" >/dev/null 2>&1 || true
+        sleep 4
     done
     wait "${pids[@]}" || true
-    retries1="$(stat_field "$cw0" meta_ship.retries)"
+    retries1="$(rsum)"
     dedup1="$(stat_field 0 meta_ship.dedup_hits)"
-    log "E1 injected retries: retries $retries0 -> $retries1, owner dedup_hits $dedup0 -> $dedup1"
+    log "E1 injected retries: retries(sum) $retries0 -> $retries1, owner dedup_hits $dedup0 -> $dedup1"
     [ "$retries1" -gt "$retries0" ] ||
-        die "E1: five partition flaps under storm injected NO transport retries — the injector did not engage"
-    # Phase-A verdict: cw0's failures during flap windows are the app-level
-    # face of a partitioned wire (bounded errors, honest); every OTHER
-    # co-writer's storm must be error-free.
+        die "E1: five wire-session kills under storm injected NO transport retries — the injector did not engage"
+    [ "$dedup1" -gt "$dedup0" ] ||
+        warn "E1: no dedup-window replay landed (kills never split execute from reply this run) — retries prove the resend law; dedup exactness stays pinned in meta_ship_tests"
+    # Phase-A verdict: failures during the kill windows are recorded and
+    # REPORTED (a kill can consume both of one exchange's attempts); the
+    # hard error-free gate is phase C, after every event settles.
     for idx in "${cws[@]}"; do
-        [ "$idx" = "$cw0" ] && continue
-        [ -s "$rowdir/fail-a-m$idx" ] &&
-            die "phase A: co-writer m$idx storm errored with no injected fault:
-$(head -5 "$rowdir/fail-a-m$idx")"
+        if [ -s "$rowdir/fail-a-m$idx" ]; then
+            warn "phase A: co-writer m$idx storm recorded $(grep -c . "$rowdir/fail-a-m$idx") failure line(s) during injection (recorded, phase C is the hard gate)"
+        fi
     done
 
     # ---- E2: authority restart mid-stream (the era split) ---------------
@@ -2162,14 +2174,37 @@ $(head -5 "$rowdir/fail-a-m$idx")"
     "$MWFLEET" mount 0 || die "E2: successor authority remount FAILED"
     t_up="$(date +%s)"
     wait "${pids2[@]}" || true
-    stale1="$(stat_field 0 meta_ship.stale_term_refusals)"
     stale0=0 # the successor's counters start at 0 (a fresh process)
-    relearn1=0
-    for idx in "${cws[@]}"; do
-        relearn1=$((relearn1 + $(stat_field "$idx" meta_ship.era_relearns)))
+    # The split needs post-restart frames to MEET the successor: poll up
+    # to 60 s while the e2 storms (or their retries) carry old-era frames.
+    local tries
+    stale1=0
+    relearn1="$relearn0"
+    for ((tries = 0; tries < 60; tries++)); do
+        stale1="$(stat_field 0 meta_ship.stale_term_refusals)"
+        relearn1=0
+        for idx in "${cws[@]}"; do
+            relearn1=$((relearn1 + $(stat_field "$idx" meta_ship.era_relearns)))
+        done
+        [ "$stale1" -gt 0 ] && [ "$relearn1" -gt "$relearn0" ] && break
+        sleep 1
     done
     log "E2 authority restart: remount $((t_up - t_kill))s; successor stale_term_refusals=$stale1 (from $stale0); co-writer era_relearns $relearn0 -> $relearn1 (split counted on opposite sides)"
     echo "E2 stale_term_refusals=$stale1 era_relearns_delta=$((relearn1 - relearn0)) remount_s=$((t_up - t_kill))" >>"$rowdir/events.txt"
+    [ "$stale1" -gt 0 ] ||
+        die "E2: the successor authority refused no stale-era frame — the era gate never engaged across the restart"
+    [ "$relearn1" -gt "$relearn0" ] ||
+        die "E2: no co-writer relearned the successor's era — the client half of the split never engaged"
+    # Rung-9 posture: co-writer RE-ADMISSION after an authority failover is
+    # by REMOUNT at this rung (S9-b's automatic re-admission row is rung
+    # 10's); a custody lease that died with the old authority may have
+    # self-fenced its mount — recorded, then remounted clean before E3/C.
+    for idx in "${cws[@]}"; do
+        "$MWFLEET" unmount "$idx" || true
+        "$MWFLEET" mount "$idx" ||
+            die "E2: co-writer m$idx could not re-admit under the successor era"
+    done
+    log "E2: all ${#cws[@]} co-writer(s) re-admitted under the successor era (by remount — the rung-9 posture; automatic re-admission is S9-b/rung 10)"
 
     # ---- E3: co-writer kill -9 mid-stream + the oracle -------------------
     local victim="${cws[$((${#cws[@]} - 1))]}"

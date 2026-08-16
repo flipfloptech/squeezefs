@@ -248,6 +248,44 @@
 #                       posture/admission stay gated). Asserts the two
 #                       heads are distinct and B's refusal is NOT the
 #                       rule-2 class.
+#   s10c-fsck-scale [--corpus-mb=M] [--runs=R]  (rung 10c, KD-MW-16;
+#                       design-mw-fleet-jobs §9 — needs a fleet created
+#                       with --membership and >= 4 members) THE FLEET
+#                       FSCK SCALING ROWS: one corpus written+fsynced on
+#                       the writer, then `squeezefs fsck --scrub` timed
+#                       at fleet widths N=1/2/4 (readers remounted per
+#                       row; every member remounted per RUN so each run
+#                       is cold — the R1b second-touch law keeps one
+#                       scrub pass from warming the disk cache, and the
+#                       remount clears the RAM ghosts). Row validity =
+#                       the engagement ledger (writer deltas:
+#                       job_fleet_shards_dispatched == completed == N-1,
+#                       relocal 0; each reader: job_fleet_worker_shards
+#                       == 1) + the exactly-once coverage law (the
+#                       writer's fsck_inodes_scanned delta is IDENTICAL
+#                       at every width — the coordinator publishes the
+#                       whole fleet's share) + findings: 0 at every N.
+#                       GATE: median wall-clock scales >= 0.6x-linear to
+#                       N=4 (t1/t4 >= 2.4). Quiet-gated: foreign cargo
+#                       work or high load labels the table PROVISIONAL
+#                       (the gate still enforces). Evidence tier:
+#                       measured-simulated (one box, co-located members
+#                       sharing the device + CPUs — stated in the row).
+#   s10c-kill-shard [--corpus-mb=M]  (rung 10c, KD-MW-16 — needs
+#                       --membership and >= 3 members) kill -9 a member
+#                       MID-SHARD: a no-kill baseline learns the fleet's
+#                       exact census total, then a throttled fleet fsck
+#                       runs while reader 1 dies holding its shard. The
+#                       lease expires (job_remote_lease_expiries moves),
+#                       the residue RE-LEASES (relocal or a re-dispatch),
+#                       the pass completes findings: 0 with the census
+#                       total IDENTICAL to the baseline (zero
+#                       double-coverage — the fencing-checked proposal
+#                       law), and read-shard expiry moves NEITHER
+#                       job_remote_pr_preempts NOR the destination
+#                       quarantine (the design-§5 split: a read worker
+#                       DMAs nothing). The victim remounts at leg end
+#                       (zero residue).
 #
 # Usage:  sudo tests/run_mw_matrix.sh <leg> [--require-host-scoped-subsys]
 #         [--window=S] [--netem=MS] [--victim=IDX]   (the s6-* legs)
@@ -299,6 +337,8 @@ S6_VICTIM=""
 S7_ROUNDS=10
 S8B_SECS="${SQZ_MWMATRIX_S8B_SECS:-1800}"
 S9A_MB_CAP="${SQZ_MWMATRIX_S9A_MB:-1024}"
+S10C_MB="${SQZ_MWMATRIX_S10C_MB:-3072}"
+S10C_RUNS="${SQZ_MWMATRIX_S10C_RUNS:-3}"
 for a in "$@"; do
     case "$a" in
     --require-host-scoped-subsys) REQUIRE_HS=1 ;;
@@ -308,6 +348,8 @@ for a in "$@"; do
     --rounds=*) S7_ROUNDS="${a#--rounds=}" ;;
     --secs=*) S8B_SECS="${a#--secs=}" ;;
     --mb=*) S9A_MB_CAP="${a#--mb=}" ;;
+    --corpus-mb=*) S10C_MB="${a#--corpus-mb=}" ;;
+    --runs=*) S10C_RUNS="${a#--runs=}" ;;
     *) die "unknown argument '$a'" ;;
     esac
 done
@@ -316,6 +358,8 @@ done
 [[ "$S6_NETEM_MS" =~ ^[0-9]+$ ]] || die "--netem takes ms (got '$S6_NETEM_MS')"
 [[ "$S7_ROUNDS" =~ ^[0-9]+$ ]] && [ "$S7_ROUNDS" -ge 1 ] || die "--rounds takes a positive integer (got '$S7_ROUNDS')"
 [[ "$S8B_SECS" =~ ^[0-9]+$ ]] && [ "$S8B_SECS" -ge 60 ] || die "--secs takes seconds >= 60 (got '$S8B_SECS')"
+[[ "$S10C_MB" =~ ^[0-9]+$ ]] && [ "$S10C_MB" -ge 256 ] || die "--corpus-mb takes MiB >= 256 (got '$S10C_MB')"
+[[ "$S10C_RUNS" =~ ^[0-9]+$ ]] && [ "$S10C_RUNS" -ge 1 ] || die "--runs takes a positive integer (got '$S10C_RUNS')"
 
 ensure_root "$LEG" "$@"
 # The admin-lane client half of the KD-7 dev override (the daemon half is
@@ -2887,6 +2931,279 @@ $out"
     log "s9-colocated-fence GREEN (victim fenced client-side, device silent, blast radius = victim, fsck clean, re-admitted; rows in $rowdir)"
 }
 
+# --- KD-MW-16 (rung 10c) — fleet-parallel maintenance ------------------------
+
+# One corpus on the writer: n files x file_mb MiB of urandom, fsync'd,
+# then a 2 s settle past the writer's <=1 s checkpoint ceiling so a
+# freshly-mounted reader's coherent view carries it.
+s10c_write_corpus() { # writer_mnt total_mb file_mb
+    local mnt="$1" total_mb="$2" file_mb="$3" n i
+    n=$((total_mb / file_mb))
+    [ "$n" -ge 1 ] || die "s10c: corpus too small ($total_mb MiB / $file_mb MiB files)"
+    mkdir -p "$mnt/fleetscale" || die "s10c: cannot mkdir the corpus dir"
+    log "s10c: writing the corpus — $n x ${file_mb} MiB urandom files (conv=fsync)"
+    for ((i = 0; i < n; i++)); do
+        dd if=/dev/urandom of="$mnt/fleetscale/f$i.bin" bs=1M count="$file_mb" \
+            conv=fsync status=none || die "s10c: corpus write f$i failed"
+    done
+    sync
+    sleep 2
+}
+
+# Remount the coordinator + exactly readers 1..(want-1); wait for the
+# coordinator to see (want-1) enrolled workers. Fresh daemons per call:
+# every run is COLD (remounts clear the RAM tiers and the R1b ghosts;
+# one scrub touch per block never passes second-touch admission).
+s10c_set_width() { # want
+    local want="$1" i deadline w
+    for i in $(member_idxs); do
+        [ "$i" = "0" ] && continue
+        "$MWFLEET" unmount "$i" >/dev/null 2>&1 || true
+    done
+    "$MWFLEET" unmount 0 >/dev/null 2>&1 || true
+    "$MWFLEET" mount 0 >/dev/null || die "s10c: writer remount failed"
+    for ((i = 1; i < want; i++)); do
+        "$MWFLEET" mount "$i" >/dev/null || die "s10c: reader $i remount failed"
+    done
+    deadline=$((SECONDS + 90))
+    while :; do
+        w="$(stat_field 0 job_remote_workers)"
+        [ "${w:-0}" = "$((want - 1))" ] && break
+        [ "$SECONDS" -lt "$deadline" ] ||
+            die "s10c: only ${w:-0}/$((want - 1)) fleet workers enrolled within 90 s (is the fleet created with --membership?)"
+        sleep 1
+    done
+    for ((i = 1; i < want; i++)); do
+        [ "$(stat_field "$i" membership_mode)" = "member" ] ||
+            die "s10c: reader $i is not a membership MEMBER — fleet workers arrive by membership (KD-MW-16)"
+    done
+}
+
+# One timed fleet fsck at the CURRENT width; validates the engagement +
+# coverage row and appends "width run t_ms inodes scrub_bytes" to
+# $rowdir/rows.tsv. Prints nothing on stdout (logs ride stderr).
+s10c_timed_fsck() { # width run rowdir extra_fsck_args...
+    local width="$1" run="$2" rowdir="$3"
+    shift 3
+    local i t0 t1 out rc idxs=(0)
+    for ((i = 1; i < width; i++)); do idxs+=("$i"); done
+    for i in "${idxs[@]}"; do snap "$i" "0w${width}r${run}" "$rowdir"; done
+    t0=$(date +%s%N)
+    set +e
+    out="$("$SQZ" fsck "$(mnt_of 0)" --scrub "$@" 2>&1)"
+    rc=$?
+    set -e
+    t1=$(date +%s%N)
+    echo "$out" >"$rowdir/fsck-w${width}r${run}.log"
+    [ "$rc" = "0" ] || die "s10c: fsck (N=$width run $run) FAILED (rc=$rc): $(head -3 "$rowdir/fsck-w${width}r${run}.log")"
+    echo "$out" | grep -q "findings: 0" || die "s10c: findings != 0 at N=$width run $run:
+$out"
+    for i in "${idxs[@]}"; do snap "$i" "1w${width}r${run}" "$rowdir"; done
+    python3 - "$rowdir" "$width" "$run" "$(((t1 - t0) / 1000000))" 1>&2 <<'PYS10C' || die "s10c: INVALID ROW (N=$width run $run)"
+import json, sys
+
+rowdir, width, run, t_ms = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
+
+def flat(d, out=None, pfx=""):
+    out = {} if out is None else out
+    for k, v in d.items():
+        if isinstance(v, dict):
+            flat(v, out, pfx + k + ".")
+        else:
+            out[pfx + k] = v
+    return out
+
+def load(i, ph):
+    return flat(json.load(open(f"{rowdir}/m{i}_p{ph}w{width}r{run}.json")).get("metrics", {}))
+
+bad = []
+w0, w1 = load(0, 0), load(0, 1)
+d = lambda k: w1.get(k, 0) - w0.get(k, 0)
+if d("job_fleet_shards_dispatched") != width - 1:
+    bad.append(f"writer dispatched {d('job_fleet_shards_dispatched')} != {width-1}")
+if d("job_fleet_shards_completed") != width - 1:
+    bad.append(f"writer completed {d('job_fleet_shards_completed')} != {width-1} (the engagement ledger must close)")
+if d("job_fleet_shards_relocal") != 0:
+    bad.append(f"relocal {d('job_fleet_shards_relocal')} != 0 (a lost shard invalidates a SCALING row)")
+if d("fsck_findings") != 0:
+    bad.append(f"fsck_findings moved by {d('fsck_findings')}")
+inodes = d("fsck_inodes_scanned")
+scrub = d("scrub_bytes_scanned")
+if inodes <= 0:
+    bad.append("writer fsck_inodes_scanned did not move (coverage not accounted)")
+for i in range(1, width):
+    r0, r1 = load(i, 0), load(i, 1)
+    got = r1.get("job_fleet_worker_shards", 0) - r0.get("job_fleet_worker_shards", 0)
+    if got != 1:
+        bad.append(f"reader {i} executed {got} fleet shards != 1")
+if bad:
+    for b in bad:
+        print(f"  INVALID: {b}", file=sys.stderr)
+    sys.exit(1)
+with open(f"{rowdir}/rows.tsv", "a") as f:
+    f.write(f"{width}\t{run}\t{t_ms}\t{inodes}\t{scrub}\n")
+print(f"  N={width} run {run}: {t_ms} ms, inodes {inodes}, scrub_bytes {scrub} (engagement exact)")
+PYS10C
+}
+
+leg_s10c_fsck_scale() {
+    local rowdir members
+    rowdir="$STATE/rows/s10c-fsck-scale-$(date +%s)"
+    mkdir -p "$rowdir"
+    members="$(member_idxs | wc -l)"
+    [ "$members" -ge 4 ] || die "s10c-fsck-scale needs >= 4 members (create N=4 --membership); have $members"
+    local provisional=""
+    if pgrep -x cargo >/dev/null 2>&1; then
+        provisional="PROVISIONAL (foreign cargo work running)"
+    else
+        local load ncpu
+        load="$(cut -d' ' -f1 /proc/loadavg)"
+        ncpu="$(nproc)"
+        awk -v l="$load" -v n="$ncpu" 'BEGIN { exit !(l > n / 2) }' &&
+            provisional="PROVISIONAL (loadavg $load on $ncpu cpus)"
+    fi
+    [ -n "$provisional" ] && warn "quiet gate: $provisional — the table is labeled; the gate still enforces"
+
+    # Corpus once, at N=1 width (writer only, no workers to race).
+    s10c_set_width 1
+    s10c_write_corpus "$(mnt_of 0)" "$S10C_MB" 32
+
+    local width run
+    for width in 1 2 4; do
+        log "s10c-fsck-scale: width N=$width — $S10C_RUNS run(s), every member remounted per run (cold rows)"
+        for ((run = 1; run <= S10C_RUNS; run++)); do
+            s10c_set_width "$width"
+            s10c_timed_fsck "$width" "$run" "$rowdir"
+        done
+    done
+
+    python3 - "$rowdir" "${provisional:-quiet}" <<'PYS10S' || die "s10c-fsck-scale: GATE FAILED"
+import statistics, sys
+
+rowdir, quiet = sys.argv[1], sys.argv[2]
+rows = {}
+inodes = set()
+for line in open(f"{rowdir}/rows.tsv"):
+    w, run, t, ino, scrub = line.split()
+    rows.setdefault(int(w), []).append(int(t))
+    inodes.add(int(ino))
+
+print("== s10c-fsck-scale — fleet fsck wall-clock (ms; median of runs) ==")
+print(f"   quiet gate: {quiet}")
+print("   evidence tier: measured-simulated (one box; co-located members share the device + CPUs)")
+med = {}
+for w in sorted(rows):
+    med[w] = statistics.median(rows[w])
+    print(f"   N={w}: runs {rows[w]} -> median {med[w]} ms")
+if len(inodes) != 1:
+    print(f"COVERAGE VIOLATION: fsck_inodes_scanned differed across rows: {sorted(inodes)}", file=sys.stderr)
+    sys.exit(1)
+print(f"   coverage: fsck_inodes_scanned identical at every width ({inodes.pop()}) — exactly-once holds")
+speedup = med[1] / med[4] if med.get(4) else 0.0
+floor = 0.6 * 4
+print(f"   N=4 speedup: {speedup:.2f}x (gate: >= {floor:.1f}x-of-4 = {floor / 4:.0%}-linear, i.e. t1/t4 >= {floor:.1f})")
+if speedup < floor:
+    print(f"GATE FAILED: t1/t4 = {speedup:.2f} < {floor:.1f} (>=0.6x-linear at N=4)", file=sys.stderr)
+    sys.exit(1)
+print("GATE MET: fleet fsck scales >= 0.6x-linear to N=4")
+PYS10S
+    log "s10c-fsck-scale GREEN (rows + snapshots + fsck logs in $rowdir)"
+}
+
+leg_s10c_kill_shard() {
+    local rowdir members
+    rowdir="$STATE/rows/s10c-kill-shard-$(date +%s)"
+    mkdir -p "$rowdir"
+    members="$(member_idxs | wc -l)"
+    [ "$members" -ge 3 ] || die "s10c-kill-shard needs >= 3 members (create N=3 --membership); have $members"
+
+    s10c_set_width 1
+    s10c_write_corpus "$(mnt_of 0)" "$S10C_MB" 32
+
+    # Baseline (no kill), throttled — learns the fleet's exact census
+    # total AND the shard runtime the kill window rides.
+    s10c_set_width 3
+    log "s10c-kill-shard: baseline fleet fsck (throttle 25 — the KD-3 stretch the kill window rides)"
+    s10c_timed_fsck 3 "base" "$rowdir" --throttle 25
+    local t0_inodes
+    t0_inodes="$(awk -F'\t' '$2=="base" {print $4}' "$rowdir/rows.tsv")"
+    log "s10c-kill-shard: baseline census total = $t0_inodes inodes"
+
+    # The kill run: fresh width, fsck in the background, kill -9 reader 1
+    # the moment both worker shards are IN FLIGHT (dispatched == 2,
+    # completed == 0).
+    s10c_set_width 3
+    local i
+    for i in 0 1 2; do snap "$i" "0kill" "$rowdir"; done
+    local d0 c0 e0 p0 q0 r0
+    d0="$(stat_field 0 job_fleet_shards_dispatched)"
+    c0="$(stat_field 0 job_fleet_shards_completed)"
+    e0="$(stat_field 0 job_remote_lease_expiries)"
+    p0="$(stat_field 0 job_remote_pr_preempts)"
+    q0="$(stat_field 0 job_remote_quarantined_destinations)"
+    r0="$(stat_field 0 job_fleet_shards_relocal)"
+    local wmnt
+    wmnt="$(mnt_of 0)"
+    "$SQZ" fsck "$wmnt" --scrub --throttle 25 >"$rowdir/fsck-kill.log" 2>&1 &
+    local fsck_pid=$!
+    local deadline=$((SECONDS + 120)) dd cc
+    while :; do
+        dd="$(stat_field 0 job_fleet_shards_dispatched)"
+        cc="$(stat_field 0 job_fleet_shards_completed)"
+        if [ "$((dd - d0))" -ge 2 ]; then
+            [ "$((cc - c0))" -eq 0 ] || die "s10c-kill-shard: kill window missed (a shard already completed) — grow --corpus-mb"
+            break
+        fi
+        kill -0 "$fsck_pid" 2>/dev/null || die "s10c-kill-shard: fsck exited before shards dispatched: $(head -3 "$rowdir/fsck-kill.log")"
+        [ "$SECONDS" -lt "$deadline" ] || die "s10c-kill-shard: shards never dispatched within 120 s"
+        sleep 0.5
+    done
+    log "s10c-kill-shard: both worker shards in flight — kill -9 reader 1 MID-SHARD"
+    "$MWFLEET" kill 1 >/dev/null || die "s10c-kill-shard: kill verb failed"
+    local rc=0
+    wait "$fsck_pid" || rc=$?
+    [ "$rc" = "0" ] || die "s10c-kill-shard: fsck FAILED after the kill (rc=$rc): $(tail -5 "$rowdir/fsck-kill.log")"
+    grep -q "findings: 0" "$rowdir/fsck-kill.log" || die "s10c-kill-shard: findings != 0 after the kill:
+$(tail -10 "$rowdir/fsck-kill.log")"
+    snap 0 "1kill" "$rowdir"
+    snap 2 "1kill" "$rowdir"
+
+    local d1 c1 e1 p1 q1 r1 inodes
+    d1="$(stat_field 0 job_fleet_shards_dispatched)"
+    c1="$(stat_field 0 job_fleet_shards_completed)"
+    e1="$(stat_field 0 job_remote_lease_expiries)"
+    p1="$(stat_field 0 job_remote_pr_preempts)"
+    q1="$(stat_field 0 job_remote_quarantined_destinations)"
+    r1="$(stat_field 0 job_fleet_shards_relocal)"
+    inodes="$(python3 - "$rowdir" <<'PYK'
+import json, sys
+def flat(d, out=None, pfx=""):
+    out = {} if out is None else out
+    for k, v in d.items():
+        if isinstance(v, dict): flat(v, out, pfx + k + ".")
+        else: out[pfx + k] = v
+    return out
+rowdir = sys.argv[1]
+p0 = flat(json.load(open(f"{rowdir}/m0_p0kill.json")).get("metrics", {}))
+p1 = flat(json.load(open(f"{rowdir}/m0_p1kill.json")).get("metrics", {}))
+print(p1.get("fsck_inodes_scanned", 0) - p0.get("fsck_inodes_scanned", 0))
+PYK
+)"
+    [ "$((e1 - e0))" -ge 1 ] || die "s10c-kill-shard: the victim's lease never expired (lease_expiries delta $((e1 - e0)))"
+    if [ "$((r1 - r0))" -lt 1 ] && [ "$((d1 - d0))" -lt 3 ]; then
+        die "s10c-kill-shard: the lost residue never re-leased (relocal delta $((r1 - r0)), dispatched delta $((d1 - d0)))"
+    fi
+    [ "$((p1 - p0))" = "0" ] || die "s10c-kill-shard: a READ-shard expiry PR-preempted a host (delta $((p1 - p0))) — the design-§5 split is broken"
+    [ "$((q1 - q0))" = "0" ] || die "s10c-kill-shard: a READ-shard expiry quarantined destinations (delta $((q1 - q0))) — read shards have none"
+    [ "$inodes" = "$t0_inodes" ] || die "s10c-kill-shard: census total $inodes != baseline $t0_inodes — the re-leased residue double- or under-counted"
+    log "s10c-kill-shard: lease expired ($((e1 - e0))), residue re-leased (relocal $((r1 - r0)), redispatch $((d1 - d0 - 2)), completed $((c1 - c0))), census exact ($inodes), preempts/quarantine 0"
+
+    # Zero residue: the victim remounts and is a member again.
+    "$MWFLEET" mount 1 >/dev/null || die "s10c-kill-shard: victim remount failed"
+    [ "$(stat_field 1 mount_posture)" = "reader" ] || die "s10c-kill-shard: remounted victim posture != reader"
+    log "s10c-kill-shard GREEN (events + snapshots in $rowdir; victim remounted)"
+}
+
 leg_cowriters_admission() {
     if [ "$HOST_SCOPED" != "1" ]; then
         local reason="multi-identity (co-writer) legs need host-scoped fabric subsystems: this kernel merges controllers by subsysnqn ignoring hostnqn (nvme_core.multipath=Y), so co-located identities share one head — rung 5b (the sqz-kernel fix, validated in the rung-6b qemu guest) unlocks them. Stock-kernel workaround: nvme_core.multipath=N (boot parameter)"
@@ -2909,8 +3226,10 @@ s8-crucible) leg_s8_crucible ;;
 s9-fanout) leg_s9_fanout ;;
 s9-failover) leg_s9_failover ;;
 s9-colocated-fence) leg_s9_colocated_fence ;;
+s10c-fsck-scale) leg_s10c_fsck_scale ;;
+s10c-kill-shard) leg_s10c_kill_shard ;;
 cowriters-admission) leg_cowriters_admission ;;
 vm-hostscope-validate) leg_vm_hostscope_validate ;;
 vm-multi-identity) leg_vm_multi_identity ;;
-*) die "unknown leg '$LEG' (smoke|multipath-negative|s6-journal|s6-fence|s6-vm-fence|s7-device-fence|s7-kill-matrix|s8-serial-ab|s8-crucible|s9-fanout|s9-failover|s9-colocated-fence|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
+*) die "unknown leg '$LEG' (smoke|multipath-negative|s6-journal|s6-fence|s6-vm-fence|s7-device-fence|s7-kill-matrix|s8-serial-ab|s8-crucible|s9-fanout|s9-failover|s9-colocated-fence|s10c-fsck-scale|s10c-kill-shard|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
 esac

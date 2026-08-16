@@ -1455,9 +1455,26 @@ async fn overlay_installed_inside_read_window_never_hides_acked_bytes() {
 
     // Release the reader; it resumes at its size snapshot (139264 — the
     // ACK's postlude published it) and composes its reply.
+    let esc0 = squeezefs::fuse_client::METRICS
+        .overlay_window_escalations
+        .load(AtomOrd::Relaxed);
     squeezefs::fuse_client::set_test_read_window_stall(false);
     let reply = reader.await.unwrap().expect("read failed");
     let got = reply.data.as_ref();
+
+    // Engagement (the round-3 architectural law): a live record inside
+    // the window is a VALIDATION FAILURE, and every validation failure
+    // re-serves through the serialized settle arm — correctness by lock
+    // order, not probe completeness.
+    assert!(
+        squeezefs::fuse_client::METRICS
+            .overlay_window_escalations
+            .load(AtomOrd::Relaxed)
+            > esc0,
+        "the read never escalated to the serialized window serve \
+         (overlay_window_escalations flat) — the lock-order arm did not \
+         engage, so this pin proves nothing"
+    );
 
     // The reply spans [2*BS-8192, 2*BS+8192): the block-1 tail and the
     // block-2 head. The head's bytes were ACKED and size-published
@@ -1571,10 +1588,26 @@ async fn settle_inside_the_validate_gap_never_hides_acked_bytes() {
     h.fs.test_settle_overlay_block(ino, 2, false)
         .await
         .expect("forced settle failed");
+    let esc0 = squeezefs::fuse_client::METRICS
+        .overlay_window_escalations
+        .load(AtomOrd::Relaxed);
     squeezefs::fuse_client::set_test_read_validate_stall(false);
 
     let reply = reader.await.unwrap().expect("read failed");
     let got = reply.data.as_ref();
+
+    // Engagement (the round-3 architectural law): the probe captured the
+    // live record before the gap, so the validation fails and the serve
+    // must ride the serialized settle arm.
+    assert!(
+        squeezefs::fuse_client::METRICS
+            .overlay_window_escalations
+            .load(AtomOrd::Relaxed)
+            > esc0,
+        "the read never escalated to the serialized window serve \
+         (overlay_window_escalations flat) — the lock-order arm did not \
+         engage, so this pin proves nothing"
+    );
     assert_eq!(
         got.len(),
         16384,

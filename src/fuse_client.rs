@@ -4208,6 +4208,17 @@ pub struct Metrics {
     /// latch-free ladder — benign, a latency signal; pair with
     /// `stale_binding_rebinds`.
     pub stale_binding_escalations: Align64<AtomicU64>,
+    /// generic/795 window-class escalations (2026-08-15 round 3): read
+    /// windows whose post-read validation failed (a live device-overlay
+    /// record inside the window, or custody-fingerprint churn outlasting
+    /// the bounded lock-free retries) and were re-served through the
+    /// SERIALIZED settle arm — per block, `BLOCK_FLUSH_LOCKS` (3) +
+    /// `INODE_META_LOCKS` (3.5), the write path's own extended order, so
+    /// no overlay can install, store, settle, feed or publish mid-serve.
+    /// The `stale_binding_escalations` sibling for the overlay window
+    /// class: growth is a latency signal under overlay/publish churn,
+    /// never a correctness one.
+    pub overlay_window_escalations: Align64<AtomicU64>,
     /// Single-flight waiters served directly from their cohort's carried
     /// `FillResult` (R1a, docs/design-read-path.md §5.2) — the adoption
     /// signal that waiter correctness is publish-independent. Replaces the
@@ -8709,6 +8720,7 @@ impl SqueezefsFilesystem {
                 "cache_hit_ratio": ratio,
                 "stale_binding_rebinds": METRICS.stale_binding_rebinds.load(Ordering::Relaxed),
                 "stale_binding_escalations": METRICS.stale_binding_escalations.load(Ordering::Relaxed),
+                "overlay_window_escalations": METRICS.overlay_window_escalations.load(Ordering::Relaxed),
                 "singleflight_waiter_result_serves": METRICS.singleflight_waiter_result_serves.load(Ordering::Relaxed),
                 "hot_block_hits": METRICS.hot_block_hits.load(Ordering::Relaxed),
                 "hot_block_misses": METRICS.hot_block_misses.load(Ordering::Relaxed),

@@ -5596,6 +5596,26 @@ impl DataRouter {
         Ok(None)
     }
 
+    /// **Zero the RAM chain provenance after a FAILED layout publish**
+    /// (finding #6, design-mw-layout-versions §6a law 2): a failed
+    /// commit/ship may still have APPLIED on the durable side (a lost
+    /// reply past the witnessed resend budget), so the entry's next
+    /// re-computed publish must claim base 0 — the §3 gate then re-bases
+    /// it with a full `Put`, convergent by construction — instead of
+    /// claiming a base the durable head may already have superseded and
+    /// refusing forever. Claim 0 is always legal (the re-base arm), so
+    /// this only ever costs one full save after a failure. Callers hold
+    /// `INODE_META_LOCKS` (every save site does), so the read-modify-
+    /// insert cannot race a concurrent publish of the same ino.
+    pub(crate) fn reset_layout_provenance(&self, ino: u64) {
+        if let Some(mut m) = self.metadata_cache.get(&ino) {
+            if m.layout_version != 0 {
+                m.layout_version = 0;
+                self.metadata_cache.insert(ino, m);
+            }
+        }
+    }
+
     pub(crate) async fn save_metadata_to_backend(
         &self,
         ino: u64,
@@ -6122,6 +6142,7 @@ impl DataRouter {
                 Ok(used) => used,
                 Err(e) => {
                     self.note_block_ref_ops(ino, refill);
+                    self.reset_layout_provenance(ino);
                     return Err(e);
                 }
             }
@@ -6131,6 +6152,7 @@ impl DataRouter {
                     .await
             {
                 self.note_block_ref_ops(ino, refs);
+                self.reset_layout_provenance(ino);
                 return Err(e);
             }
             false

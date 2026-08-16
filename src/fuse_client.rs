@@ -4979,6 +4979,19 @@ pub struct Metrics {
     /// discards orphan active blocks", applied live instead of the
     /// NotFound retry spin (FIND-M11-A's second face).
     pub writeback_orphan_discards: Align64<AtomicU64>,
+    /// Constant-writeback units resolved as VERIFIED fencing-stale no-ops
+    /// (finding #6, design-mw-layout-versions §6a): a fence-class failure
+    /// (`WriterGuardFenced`) observed WITH the one-way custody poison
+    /// latch set — the mount's era is dead (T_self / the D0 fence / an
+    /// authoritative stale-lease publish refusal are the only setters),
+    /// so the unit can never succeed until remount and retrying it
+    /// forever against a permanent era refusal is the wedge. The staged
+    /// bytes are NOT torn live (fsync stays the loud error surface;
+    /// remount's staging recovery owns them — the remount contract). 0 on
+    /// every healthy mount; growth is the acked-un-fsynced POSIX crash
+    /// class being resolved loudly, investigate beside
+    /// `writer_guard_fenced` / `dlm_custody_self_fences`.
+    pub writeback_fence_noops: Align64<AtomicU64>,
     /// Copy-on-write duplications of an active-block accumulation buffer
     /// forced by a live reader snapshot (zero-copy write-path design §5.2).
     /// Sequential streams never pay this; spikes mean read/write contention
@@ -9080,6 +9093,7 @@ impl SqueezefsFilesystem {
                 "writeback_superseded_noops": METRICS.writeback_superseded_noops.load(Ordering::Relaxed),
                 "writeback_stale_token_retries": METRICS.writeback_stale_token_retries.load(Ordering::Relaxed),
                 "writeback_orphan_discards": METRICS.writeback_orphan_discards.load(Ordering::Relaxed),
+                "writeback_fence_noops": METRICS.writeback_fence_noops.load(Ordering::Relaxed),
                 // DLM S5 — the reader-coherence family (0 on write mounts).
                 "read_only_mount": read_only_mount(),
                 // The reader's two DERIVED numbers, machine-readable so the
@@ -25592,6 +25606,22 @@ async fn run_constant_writeback_worker(
             {
                 Ok(()) => {}
                 Err(e) => {
+                    // Finding #6 (design-mw-layout-versions §6a): a
+                    // fence-class failure on a POISONED mount is a
+                    // permanent era refusal — every retry would refuse
+                    // identically until remount, so the unit resolves as
+                    // a VERIFIED fencing-stale no-op instead of wedging
+                    // the ladder (the acked-un-fsynced POSIX crash
+                    // class; staged bytes stay for the remount contract,
+                    // fsync stays the loud error surface).
+                    if writeback_fence_resolution(&e) {
+                        log::error!(
+                            "Constant Writeback: ino {} block {} resolved as a fencing-stale                              no-op — this mount's custody era is dead (poison latch set);                              bytes remain staged until remount (writeback_fence_noops)",
+                            req.ino,
+                            req.block_idx
+                        );
+                        return;
+                    }
                     if matches!(e, SqueezefsError::FencingTokenExpired { .. }) {
                         // Post-FIND-M11-A this is a TRANSIENT acquire-race
                         // (generation bumped between the merge-credential
@@ -25641,6 +25671,26 @@ async fn run_constant_writeback_worker(
 ///   transient bump race (`writeback_stale_token_retries`), never a
 ///   permanently-stale token cycling at capped backoff (the incident_013
 ///   kill-9 livelock).
+/// **The fence-class writeback disposition** (finding #6,
+/// design-mw-layout-versions §6a; contracts
+/// `tests/mw_publish_era_gate_tests.rs`): `true` ⇔ the failed unit resolves
+/// as a VERIFIED fencing-stale no-op — the error is the fence class
+/// (`WriterGuardFenced`) AND the one-way custody poison latch is set. The
+/// latch is the verification: it is set only by T_self, the D0 fence, or an
+/// authoritative stale-lease publish refusal — never by a transport error —
+/// so a LIVE era's work never takes this arm; without the latch (or on any
+/// other error class) the never-lossy retry ladder keeps the unit.
+/// Counts `writeback_fence_noops` when it fires.
+pub fn writeback_fence_resolution(e: &SqueezefsError) -> bool {
+    if matches!(e, SqueezefsError::WriterGuardFenced) && crate::data_custody::poisoned() {
+        METRICS
+            .writeback_fence_noops
+            .fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
+    false
+}
+
 async fn requeue_or_hard_fail(
     requeue_tx: &squeezefs_ipc::sqz_channel::mpsc::Sender<WritebackRequest>,
     mut req: WritebackRequest,

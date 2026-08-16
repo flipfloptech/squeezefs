@@ -467,6 +467,19 @@ increment as "remount this mount"; the remount is cheap (the slot id is
 mount-point-stable, so the roster still names it) and the fleet rig's
 crucibles exercise exactly this path.
 
+Since the finding-#6 fix (`docs/design-mw-layout-versions.md` §6a) the
+publish plane itself is a fence channel: **every mutating shipped publish
+verb carries the mount's lease epoch, and a swept era's publishes REFUSE on
+the authority with nothing applied** (`meta_ship_publish.stale_refusals`).
+A refusal for the mount's *current* epoch composes the same self-fence as a
+failed renewal — the zombie learns it is dead at that round trip. Its
+**acked-un-fsynced writes are the POSIX crash class**: with the poison latch
+set, constant-writeback units resolve as verified fencing-stale no-ops
+(`writeback_fence_noops`) instead of retrying forever; the staged bytes stay
+on disk for the remount's staging recovery ("stale fencing tokens discard
+staged work" — the remount contract), and `fsync` on the fenced mount keeps
+failing loud, so no application is ever told discarded data was durable.
+
 **Live signals on `.stats`:** `mount_posture` (`writer` | `reader` |
 `co-writer`) and the `cowriter` object — `mw_role`, `admissions`,
 `admission_refusals`, `accounting_refusals`, `local_commit_refusals`,

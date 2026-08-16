@@ -27,27 +27,50 @@ struct H {
     _s: TempDir,
 }
 
-/// Format + mount one v3 metadata volume for this harness.
-async fn open_v3_meta(path: &std::path::Path, len: u64) -> Arc<KvMetaBackend> {
-    squeezefs::meta_backend::kv::builder::format_v3(
-        path,
-        len,
-        &squeezefs::meta_backend::kv::builder::FormatV3Options {
-            node_size: DEFAULT_NODE_SIZE,
-            journal_len_override: None,
-            force: true,
-            full_wipe: false,
-            format_config_xattr: None,
-        },
-    )
-    .await
-    .expect("format v3 meta volume");
+/// Format + mount one v3 metadata volume for this harness. The default
+/// arm inherits the rung-10b flip (multi-writer-capable class); the
+/// `single_writer` arm exists for the ONE test that pins the bare-offset
+/// key-REUSE machinery, which bit 13 (incarnation keys) deliberately
+/// retires on the stamped class.
+async fn open_v3_meta(
+    path: &std::path::Path,
+    len: u64,
+    single_writer: bool,
+) -> Arc<KvMetaBackend> {
+    let opts = squeezefs::meta_backend::kv::builder::FormatV3Options {
+        node_size: DEFAULT_NODE_SIZE,
+        journal_len_override: None,
+        force: true,
+        full_wipe: false,
+        format_config_xattr: None,
+    };
+    if single_writer {
+        squeezefs::meta_backend::kv::builder::format_v3_single_writer(path, len, &opts)
+            .await
+            .expect("format v3 meta volume (single-writer class)");
+    } else {
+        squeezefs::meta_backend::kv::builder::format_v3(path, len, &opts)
+            .await
+            .expect("format v3 meta volume");
+    }
     KvMetaBackend::open(path)
         .await
         .expect("open v3 meta volume")
 }
 
 async fn make() -> H {
+    make_inner(false).await
+}
+
+/// [`make`] on the SINGLE-WRITER (unstamped) class — bare-offset block
+/// keys, so a freed offset's key string is REUSABLE (the stamped class
+/// mints a fresh incarnation instead; that protection is pinned in
+/// `tests/mw_block_key_incarnation_tests.rs`).
+async fn make_single_writer() -> H {
+    make_inner(true).await
+}
+
+async fn make_inner(single_writer: bool) -> H {
     // Block size 64 KiB so we cover all three layouts:
     // inline <=4 KiB, staged 4 KiB..64 KiB, striped >64 KiB.
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "65536");
@@ -82,7 +105,7 @@ async fn make() -> H {
 
     let m = NamedTempFile::new().unwrap();
     let routed = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![
-        open_v3_meta(m.path(), 256 * 1024 * 1024).await,
+        open_v3_meta(m.path(), 256 * 1024 * 1024, single_writer).await,
     ]));
     fs.router.set_meta_backend(routed.clone());
     fs.meta_backend = Some(routed);
@@ -1035,7 +1058,10 @@ async fn test_nvme_tier_hit_does_not_repromote_into_ram_lru() {
 /// owner's device bytes forever.
 #[tokio::test]
 async fn test_write_through_reused_key_purges_stale_read_tiers() {
-    let h = make().await;
+    // Single-writer class ON PURPOSE: this test's precondition is that the
+    // allocator REUSES the freed offset's exact key string — bit 13
+    // (stamped by the default class) exists to make that impossible.
+    let h = make_single_writer().await;
     // This test pins the CoW displace/free/reuse machinery (fresh key +
     // freed offset + write-through taking the freed offset). At the 64 KiB
     // sandbox block size a whole-block aligned overwrite is W1

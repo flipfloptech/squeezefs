@@ -3,9 +3,18 @@
 **Status:** IMPLEMENTED with this document — patch `0030` in both sqz
 series tracks (`docker/kernel-sqz/patches-7.1/` authored FIRST per the
 2026-08-15 authoring-order ruling, then backported to
-`docker/kernel-sqz/patches/`). Compile-verified on both tracks; **NOT
-boot-verified** — boot/behavior validation is rung 6b's qemu-guest leg
-(no host reboot on the critical path).
+`docker/kernel-sqz/patches/`). Compile-verified on both tracks;
+**BOOT-VERIFIED on the 6.19.14 track (rung 6b, 2026-08-15)** — the
+qemu-guest legs `tests/run_mw_matrix.sh vm-hostscope-validate` (both
+arms: param=Y two-identity split with per-sibling `sqz_host_scope`/
+heads/controller links + same-identity `duplicate_connect` still
+merging + no dup-ID refusals; param-off merged control + the upgraded
+rule-2 refusal live over the merged head) and `vm-multi-identity`
+(writer A full explicit-identity mount + writer-candidate B past rule 2
+on its OWN scoped head, refused beyond identity at the D0 guard) ran
+GREEN on the KVM guest booting `6.19.14-sqz`. The 7.1 track stays
+compile-verified only (the running host kernel predates 0030 — no host
+reboot on the critical path).
 **Authority:** ruling D13 (custom-kernel work is a first-class product
 surface) + the rung-6 STOP adjudication 2026-08-15 (user: "lets go with
 the sqz-kernel fix for sure") + the authoring-order ruling 2026-08-15
@@ -295,6 +304,28 @@ global and will read a scoped sibling as foreign). That resolution arm
 lands with rung 6b's guest validation, where it can be proven against
 the real scoped sysfs shape instead of a hand-built fixture.
 
+**LANDED with rung 6b (2026-08-15):** the observed scoped sysfs shape
+in the guest MATCHED this note's sketch exactly (sibling subsystems
+share the subsysnqn attr; each dir carries its own `sqz_host_scope`,
+its own strict-shape head child, and its own controller links), so the
+resolution arm shipped against it: serving-controller membership is now
+ONE function (`subsystem_serving_controller_dirs` — subsystem-dir
+controller entries when present, global attr fallback when link-less)
+ridden by all three walks (`multipath_merged_shape_at` verbatim,
+`controller_identities_for_device_at`'s head arm — rule 2 no longer
+reads a sibling's foreign identity under a dedicated scoped head — and
+`find_device_for_nqn_under_identity_at`, whose head arm judges
+dedication PER SUBSYSTEM DIR: a foreign sibling is skipped, never
+poisoning, and a mixed/identity-less serving set is still never handed
+out). Fixture-pinned red-first in `tests/mw_fabric_identity_tests.rs`
+(the `scoped_sibling_fixture` family); proven live by the in-guest
+legs. One composition found live and fixed with it: the daemon-owned
+connect's post-connect resolve now rides a bounded settle poll
+(`wait_device_for_nqn_under_identity`) because `connect_target`'s
+global 2 s namespace wait is satisfied INSTANTLY by an already-present
+sibling head on the scoped kernel, starving the identity-scoped walk of
+settle time.
+
 ## 6. Validation plan (rung 6b — qemu guest, no host reboot)
 
 1. Guest kernel = the sqz build (either track) with
@@ -323,3 +354,16 @@ the real scoped sysfs shape instead of a hand-built fixture.
 **This rung delivers compile evidence only** (both tracks, §SERIES.md
 entries); a kernel that needs booting is a user checkpoint — rung 6b
 owns the boots.
+
+**Rung-6b validation ledger (2026-08-15, KVM guest on 6.19.14-sqz):**
+items 1–3 and 6 ran GREEN as the `vm-hostscope-validate` leg (grouping
+proof incl. same-identity multipath preservation via
+`duplicate_connect`; param-off merged control + the upgraded refusal
+naming both remedies, live over the merged head; no `"duplicate IDs"`
+dmesg lines with both scoped heads sharing one nguid), and the
+`vm-multi-identity` leg additionally proved the two-identity MOUNT
+shape end-to-end (writer A's full explicit-identity mount = the
+single-identity regression half of item 5 on the scoped kernel; the
+host fleet's smoke leg keeps the stock-kernel half). Item 4 (the
+registrant-preempt fencing row) is rung 7+'s arm (S7-a), where the
+custody machinery it gauges arms.

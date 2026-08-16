@@ -174,8 +174,11 @@ applied clean.
    code-identical across the trees; 6.19's extra
    `subsys->awupf = …` line and `kzalloc` vs `kzalloc_obj` idiom sit
    outside every hunk — the adaptation table lives in the design
-   note §4). NOT boot-verified — rung 6b's qemu guest owns
-   boot/behavior validation (no host reboot on the critical path).
+   note §4). BOOT-VERIFIED on this (6.19.14) track by rung 6b's qemu
+   guest legs (2026-08-15 — `tests/run_mw_matrix.sh
+   vm-hostscope-validate` both arms + `vm-multi-identity`; ledger in
+   the design note §6); the 7.1 track stays compile-verified only (no
+   host reboot on the critical path).
    Number-reuse note: "0030" was earlier planning shorthand for
    selective zc delivery, whose refusal is FINAL on measurement
    (2026-08-09) — that slot was never built, and this unrelated nvme

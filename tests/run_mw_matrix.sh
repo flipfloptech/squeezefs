@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2153  # host-side vars interpolated into generated guest scripts (directives cannot reach heredoc bodies; see the vm-hostscope leg)
 # tests/run_mw_matrix.sh — the fleet-row emitter (PR 6, rung 6)
 # =============================================================================
 #
@@ -551,6 +552,10 @@ echo "=== upgraded rule-2 refusal over the merged head ==="
 # The mount reads the format config BEFORE the identity ladder — format
 # the reserved pair first so the probe reaches the ladder (offline
 # format over the merged head is fine; no identity in play).
+# GUEST_DATA_NQN is a HOST-side variable, interpolated at guest-script
+# generation time (the unescaped dollar in this expanding heredoc) —
+# not a misspelling of GUEST_META_NQN (SC2153 disabled file-wide;
+# directives cannot reach heredoc bodies).
 DNQN='$GUEST_DATA_NQN'
 \$SQZ nvmeof connect --ip "\$GW" --port "\$SVC" --subnqn "\$DNQN" --hostnqn '$a_nqn' --hostid '$a_id'
 sleep 1

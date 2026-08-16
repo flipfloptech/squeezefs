@@ -4833,6 +4833,13 @@ pub struct Metrics {
     pub fsck_inflight_exempted: Align64<AtomicU64>,
     /// C3 suspects exempted by the §5.4-step-2 mover pre-publish ledger.
     pub fsck_mover_ledger_exempted: Align64<AtomicU64>,
+    /// DLM S9 (rung-10 finding #5): block-plane verdicts declined because
+    /// the object lives in an allocation LANE this mount does not own —
+    /// C2's foreign-lane exemptions plus C6's whole-census decline under
+    /// an engaged partition (a live peer's blocks are structurally
+    /// untracked by this mount's own-lane census; C8 stays the
+    /// multi-writer oracle). 0 on every unpartitioned mount.
+    pub fsck_foreign_lane_exempted: Align64<AtomicU64>,
     /// C9: dentry records whose TARGET ino the referenced-ino pass
     /// indexed — the cheap-direction pass's engagement gauge (C9 asks
     /// "which inodes are named" once, never "who names me" per inode).
@@ -9004,6 +9011,7 @@ impl SqueezefsFilesystem {
                 "fsck_epoch_exempted": METRICS.fsck_epoch_exempted.load(Ordering::Relaxed),
                 "fsck_inflight_exempted": METRICS.fsck_inflight_exempted.load(Ordering::Relaxed),
                 "fsck_mover_ledger_exempted": METRICS.fsck_mover_ledger_exempted.load(Ordering::Relaxed),
+                "fsck_foreign_lane_exempted": METRICS.fsck_foreign_lane_exempted.load(Ordering::Relaxed),
                 "fsck_dentry_refs_indexed": METRICS.fsck_dentry_refs_indexed.load(Ordering::Relaxed),
                 "fsck_current_era_exempted": METRICS.fsck_current_era_exempted.load(Ordering::Relaxed),
                 // C10 (inode-plane reference consistency). The last three

@@ -486,6 +486,15 @@ pub struct FsckCounters {
     pub epoch_exempted: u64,
     pub inflight_exempted: u64,
     pub mover_ledger_exempted: u64,
+    /// DLM S9 (rung-10 finding #5): block-plane verdicts DECLINED because
+    /// the object lives in an allocation lane this mount does not own —
+    /// a live peer writer's blocks are durably referenced and
+    /// structurally untracked by this mount's own-lane census, so
+    /// adjudicating them here is a category error (C2's foreign-lane
+    /// exemptions + C6's whole-census decline under an engaged
+    /// partition). The cross-writer oracle stays C8; the lane-aligned
+    /// fleet-parallel fsck is rung 10c's (KD-MW-16).
+    pub foreign_lane_exempted: u64,
     pub findings: u64,
     pub scan_secs: u64,
     pub scrub_blocks_scanned: u64,
@@ -1304,6 +1313,7 @@ pub fn merge_reports(reports: &[FsckReport]) -> FsckReport {
         counters.epoch_exempted += r.counters.epoch_exempted;
         counters.inflight_exempted += r.counters.inflight_exempted;
         counters.mover_ledger_exempted += r.counters.mover_ledger_exempted;
+        counters.foreign_lane_exempted += r.counters.foreign_lane_exempted;
         counters.scrub_blocks_scanned += r.counters.scrub_blocks_scanned;
         counters.scrub_bytes_scanned += r.counters.scrub_bytes_scanned;
         counters.scrub_aead_verified += r.counters.scrub_aead_verified;
@@ -2201,6 +2211,25 @@ fn evaluate_allocator_classes(
         let tracked: HashMap<u64, u32> = v.alloc.tracked_offsets().into_iter().collect();
         let capacity = v.alloc.capacity_bytes();
         let chunk = v.alloc.chunk_size();
+        // DLM S9 (rung-10 finding #5): under an ENGAGED allocation
+        // partition this mount's allocator census covers only the lanes it
+        // OWNS. A live peer writer's blocks are durably referenced and
+        // structurally untracked HERE — untracked across every scan epoch,
+        // which is exactly what the settle ladder cannot clear — so a
+        // foreign-lane offset is a PEER's to adjudicate, never a lost
+        // finding on this mount (exempt, counted). The cross-writer
+        // oracle stays C8 (the durable ledger census); the lane-aligned
+        // fleet-parallel fsck is rung 10c's (KD-MW-16).
+        let lane_view = v
+            .alloc
+            .lane_partition()
+            .map(|p| (p.writers(), v.alloc.owned_lane_mask().unwrap_or(1)));
+        let foreign_lane = |off: u64| match lane_view {
+            None => false,
+            Some((w, owned)) => {
+                owned & (1u64 << crate::data_alloc_lane::offset_lane_of(off, chunk, w)) == 0
+            }
+        };
 
         // Leaked / C3: allocator-side ground truth is mount-session RAM —
         // meaningless on a sharded walk (a shard sees only its residue's
@@ -2260,9 +2289,13 @@ fn evaluate_allocator_classes(
                     "offset not aligned to the {chunk} B allocator chunk"
                 )));
             } else if !sharded && !tracked.contains_key(&off) {
-                suspects.push(lost(
-                    "referenced offset is not allocator-tracked".to_string(),
-                ));
+                if foreign_lane(off) {
+                    counters.foreign_lane_exempted += 1;
+                } else {
+                    suspects.push(lost(
+                        "referenced offset is not allocator-tracked".to_string(),
+                    ));
+                }
             }
         }
 
@@ -2275,7 +2308,24 @@ fn evaluate_allocator_classes(
         // spans whole foreground-busy periods (the deferred reclaim
         // backlog), so the old settle-window absorption can no longer
         // cover it (the 2026-07-31 iteration-loop FP).
-        if !sharded {
+        if !sharded && lane_view.is_some() {
+            // Rung-10 finding #5, the C6 half: the used-vs-tracked
+            // arithmetic is SINGLE-WRITER by construction — `highest −
+            // free − inflight − graced` spans every lane while `tracked`
+            // spans only this mount's, so on any engaged partition the
+            // census reads drift the size of the peers' whole population.
+            // C6 therefore DECLINES here (the doctrine that already
+            // declines foreign-lane reconciliation), counted on the same
+            // exemption gauge; C8 remains the multi-writer capacity oracle.
+            counters.foreign_lane_exempted += 1;
+            log::info!(
+                "fsck C6: capacity census declined on '{}' — a {}-way allocation partition is \
+                 engaged and the used-vs-tracked arithmetic is single-writer by construction \
+                 (fsck_foreign_lane_exempted; C8 is the multi-writer oracle)",
+                v.id,
+                lane_view.map(|(w, _)| w).unwrap_or(1),
+            );
+        } else if !sharded {
             let inflight = v
                 .alloc
                 .inflight_offsets()
@@ -3499,6 +3549,8 @@ fn publish_metrics(c: &FsckCounters) {
         .fetch_add(c.inflight_exempted, Ordering::Relaxed);
     m.fsck_mover_ledger_exempted
         .fetch_add(c.mover_ledger_exempted, Ordering::Relaxed);
+    m.fsck_foreign_lane_exempted
+        .fetch_add(c.foreign_lane_exempted, Ordering::Relaxed);
     m.fsck_findings.fetch_add(c.findings, Ordering::Relaxed);
     m.fsck_scan_secs.store(c.scan_secs, Ordering::Relaxed);
     m.scrub_blocks_scanned

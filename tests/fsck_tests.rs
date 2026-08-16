@@ -1520,8 +1520,9 @@ async fn test_c2_and_c6_decline_foreign_lanes_under_an_engaged_partition() {
     // FOREIGN lane (idx % 4 == 1 — a live peer's residue class), one in
     // this mount's OWN lane (idx % 4 == 0 — a genuine lost block).
     let token = fx.fs.dlm().get_fencing_token_ino(ino);
+    const CHUNK: u64 = 4 * 1024 * 1024; // the allocator chunk (4 MiB blocks)
     for (block_index, idx) in [(400u32, 401u64), (401u32, 400u64)] {
-        let off = idx * BLOCK as u64;
+        let off = idx * CHUNK;
         let key = fx
             .fs
             .router
@@ -1542,15 +1543,12 @@ async fn test_c2_and_c6_decline_foreign_lanes_under_an_engaged_partition() {
     }
 
     let report = run_fsck(&fx.ctx(), &online_opts()).await.expect("fsck");
-    let own_lane_off = 400u64 * BLOCK as u64;
-    let foreign_off = 401u64 * BLOCK as u64;
+    let own_lane_off = 400u64 * 4 * 1024 * 1024;
+    let foreign_off = 401u64 * 4 * 1024 * 1024;
     assert!(
-        report
-            .findings
-            .iter()
-            .any(|f| f.class == "C2"
-                && f.evidence.contains("lost")
-                && f.object.contains(&own_lane_off.to_string())),
+        report.findings.iter().any(|f| f.class == "C2"
+            && f.evidence.contains("lost")
+            && f.object.contains(&own_lane_off.to_string())),
         "an OWN-lane phantom must still report C2-lost (the class stays live), got {:?}",
         report.findings
     );

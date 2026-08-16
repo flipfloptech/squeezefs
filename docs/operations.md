@@ -393,7 +393,17 @@ works**, from a lane the authority grants — the design record is
   read-tier purge, reclaim queue, `finish_free` with the freed-offset grace
   period and the dead-epoch quarantine composing inside — exactly as if it
   had freed locally. The freed offset re-enters the free supply of whichever
-  lane the arithmetic (`b % W`) names, reusable by that lane's owner. Retries
+  lane the arithmetic (`b % W`) names — and since rung 10 that supply is
+  actually **reachable** by its lane's holder: at lane exhaustion a co-writer
+  ships a lane free **harvest** (`harvest_lane_free`), and the authority hands
+  back free-listed offsets of that lane (removed from its own list —
+  exactly-once; recorded against the lease epoch so an epoch that dies with
+  the reference not yet durable quarantines them until a drain proof, the
+  same law fresh mints get from the durable frontier). Sustained rewrite
+  therefore reaches steady state instead of leaking toward ENOSPC — read
+  `harvest_shipped_blocks`/`harvest_served_blocks` on the publish ledger and
+  `alloc_lane_harvested_blocks` beside `alloc_lane_enospc_refusals` (which
+  must stay 0). Retries
   are safe (`(lease_epoch, request_id)` is answered exactly-once from the
   authority's dedup window), a fenced mount's in-flight frees are refused by
   era, and a free that never lands is the **leak-safe** direction: the block
@@ -433,6 +443,29 @@ same `reader_staleness_bound_ms` (§6.8 item 2's revalidation and item 5's purge
 are both armed for it). Its own mutations are never stale, because they execute
 on the authority. Everything the reader section says about bounded-not-eliminated
 DATA staleness (§6.8 item 3, not built) applies verbatim.
+
+**Failure and re-admission (the rung-10 posture, stated honestly).** A
+co-writer that loses its custody — its renewal meets `UnknownLease` after a
+revocation or an authority failover, or its own `T_self` deadline fires first
+— **self-fences: it poisons process data custody and is dead until remount.**
+Re-admission after an authority failover is **by remount, deliberately**: the
+successor's era re-enrolls the roster, and a fresh mount re-runs the five-rung
+ladder and joins under a fresh lease epoch. *Automatic in-place re-admission
+was considered at rung 10 and deferred*, because it would require a production
+path that clears the sticky custody poison — and "a fenced holder is dead
+until remount" is a load-bearing safety law, not an implementation accident:
+the poison is what guarantees that **no DMA authorized in the dead era can
+ever land**, every gate in the tree (`authorize_dma`, the reclaim queue's
+fence halt, the write pipeline's fence drop) stands on its one-way latch, and
+a fenced mount also holds fenced-era state a resume would have to prove
+coherent (staged custody, layout caches, local locks minted under the dead
+era). Un-poisoning is therefore a designed transition of its own — it needs
+the S6/S7/S9 planes' adjudication, not a rung's convenience patch. Until it
+lands: run co-writers under `mount --daemon --supervise` or an external
+supervisor and treat a `membership_self_fences`/`dlm_custody_self_fences`
+increment as "remount this mount"; the remount is cheap (the slot id is
+mount-point-stable, so the roster still names it) and the fleet rig's
+crucibles exercise exactly this path.
 
 **Live signals on `.stats`:** `mount_posture` (`writer` | `reader` |
 `co-writer`) and the `cowriter` object — `mw_role`, `admissions`,

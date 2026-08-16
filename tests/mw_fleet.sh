@@ -103,13 +103,46 @@
 #   mounts — adding a path to a subsystem a live writer rides would
 #   round-robin its I/O onto an unregistered association (PR-rejected).
 #
+# MEMBERSHIP ARMING (rung 7 — the S6 rows; design-full-multi-writer §7.2):
+#   `create --membership[=auto|addr:port]` arms the DLM S6 plane: the
+#   WRITER mounts with SQUEEZEFS_MEMBERSHIP_BIND (default `auto`) and
+#   becomes the lease AUTHORITY (its job wire — on by default — writes the
+#   job:enroll root of trust first); READERS need no knob and JOIN at
+#   mount when they find the fresh rendezvous record — the rig asserts
+#   every reader's `membership_mode=member` loudly (a reader that could
+#   not join is invisible-to-census residue, never a quiet green). The
+#   owner's advertised endpoint is parsed from the writer log and
+#   persisted (MEMBERSHIP_ENDPOINT) for the netns/guest reachability
+#   preflights. `--lease-ttl-ms=N` shortens the OWNER's lease TTL
+#   (SQUEEZEFS_MEMBERSHIP_LEASE_TTL_MS — a measurement lever for the
+#   fence rows; the S6-a journal row runs the shipped 45 s clocks).
+#
+# NETNS / NETEM / PARTITION (rung 7 — the S6-b venue; stubs retired):
+#   A READER member can be mounted inside its OWN network namespace
+#   (`mount <idx> --netns[=<delay_ms>]`): a per-member netns + veth pair
+#   (host 10.207.<100+idx>.1/24 <-> ns .2), default route via the host
+#   side, loose rp_filter on the host veth. Only the daemon's USERSPACE
+#   TCP (the membership/cluster wire) rides the netns — the NVMe fabric
+#   is kernel-plane and block devices are namespace-blind, so the reader
+#   serves I/O unchanged while its heartbeat path is shapeable:
+#     netem <idx> <ms|off>   tc netem delay on BOTH veth ends (RTT +2*ms)
+#     partition <idx> on|off veth link down/up (the hard partition)
+#   The writer/owner never mounts in a netns (members must dial its
+#   advertised endpoint). Teardown deletes every fleet netns and asserts
+#   zero netns/veth residue.
+#
 # Verbs
 #   create [N|N=<n>] [--cowriters K] [--vm=V] [--require-host-scoped-subsys]
+#          [--membership[=auto|addr:port]] [--lease-ttl-ms=N]
 #                 build substrate + format + records + mount the fleet
 #                 (refuses if state exists — run teardown first); --vm=V
 #                 boots V sqz-kernel guests after the fleet is up
 #   status        member table + capability verdict + identity map + VMs
-#   mount <idx>   (re)mount one member    unmount <idx>   product umount
+#   mount <idx> [--netns[=<delay_ms>]]   (re)mount one member (readers may
+#                 mount inside their own netns — see NETNS above)
+#   unmount <idx>   product umount
+#   netem <idx> <ms|off>    shape a netns-mounted member's wire (see above)
+#   partition <idx> on|off  hard-partition a netns-mounted member
 #   kill <idx> [--sig 9]   kill a member daemon (the S7-b matrices' verb)
 #   probe-host-scoped      re-print the recorded 5b capability verdict
 #   vm-boot <idx> [--no-hostscope]   boot one guest (ephemeral leg guests
@@ -122,11 +155,9 @@
 #                 quit -> SIGKILL escalation; console/log preserved)
 #   pause <idx> | resume <idx>       qemu monitor stop/cont on a guest —
 #                 the S6-b' hung-kernel verb (the row is rung 7's)
-#   teardown      guests + unmount + kill + disconnect + substrate
+#   teardown      guests + netns + unmount + kill + disconnect + substrate
 #                 teardown + ZERO-RESIDUE assertions (exits nonzero on
-#                 any residue, qemu survivors included)
-#   partition | netem | --netns    STUBS — refused loud: they land with
-#                 rung 7 (the netem venue)
+#                 any residue, qemu survivors and netns/veth included)
 #
 # RUNG-6 FINDINGS (2026-08-15) — FIXED, kept as this rig's history + the
 # live regression tripwires it still asserts:
@@ -529,10 +560,90 @@ vm_stop() { # idx — poweroff job -> monitor quit -> SIGKILL; logs preserved
     log "guest $idx down (console preserved at $d/console.log)"
 }
 
+# --- rung-7 netns/netem plumbing (the S6-b venue — see the header note) ------
+ns_name() { echo "sqzmw-$INSTANCE-m$1"; }
+veth_host() { echo "sqzmw${1}h"; }
+veth_ns() { echo "sqzmw${1}n"; }
+ns_subnet() { echo "10.207.$((100 + $1))"; }
+
+ns_exists() { ip netns list 2>/dev/null | awk '{print $1}' | grep -qx "$(ns_name "$1")"; }
+
+netns_setup() { # idx — create the member's netns + veth + routes
+    local idx="$1" ns hv nv net
+    ns="$(ns_name "$idx")" hv="$(veth_host "$idx")" nv="$(veth_ns "$idx")" net="$(ns_subnet "$idx")"
+    ns_exists "$idx" && die "netns $ns already exists — netns residue from a prior mount (unmount $idx first)"
+    ip netns add "$ns"
+    ip link add "$hv" type veth peer name "$nv"
+    ip link set "$nv" netns "$ns"
+    ip addr add "$net.1/24" dev "$hv"
+    ip link set "$hv" up
+    ip netns exec "$ns" ip addr add "$net.2/24" dev "$nv"
+    ip netns exec "$ns" ip link set lo up
+    ip netns exec "$ns" ip link set "$nv" up
+    ip netns exec "$ns" ip route add default via "$net.1"
+    # The member dials the owner's PRIMARY-interface endpoint through the
+    # veth; strict rp_filter on the host side would drop the 10.207/24
+    # source arriving toward a non-veth local address.
+    sysctl -qw "net.ipv4.conf.$hv.rp_filter=2" || true
+    log "netns $ns up (veth $hv <-> $nv, $net.0/24)"
+}
+
+netns_teardown() { # idx — best-effort delete (veth pair dies with the ns)
+    local idx="$1" ns hv
+    ns="$(ns_name "$idx")" hv="$(veth_host "$idx")"
+    ip netns del "$ns" 2>/dev/null || true
+    ip link del "$hv" 2>/dev/null || true
+}
+
+netem_set() { # idx <ms|off>
+    local idx="$1" spec="$2" ns hv nv
+    ns="$(ns_name "$idx")" hv="$(veth_host "$idx")" nv="$(veth_ns "$idx")"
+    ns_exists "$idx" || die "member $idx is not netns-mounted (mount $idx --netns first)"
+    if [ "$spec" = "off" ]; then
+        tc qdisc del dev "$hv" root 2>/dev/null || true
+        ip netns exec "$ns" tc qdisc del dev "$nv" root 2>/dev/null || true
+        log "netem cleared on member $idx's veth pair"
+        return 0
+    fi
+    [[ "$spec" =~ ^[0-9]+$ ]] || die "netem takes a delay in ms or 'off' (got '$spec')"
+    # BOTH ends (each direction pays the delay once): renewal RTT +2*ms.
+    tc qdisc replace dev "$hv" root netem delay "${spec}ms"
+    ip netns exec "$ns" tc qdisc replace dev "$nv" root netem delay "${spec}ms"
+    log "netem delay ${spec}ms armed on both ends of member $idx's veth (wire RTT +$((spec * 2))ms)"
+    tc -s qdisc show dev "$hv" | head -2
+}
+
+partition_set() { # idx <on|off>
+    local idx="$1" state="$2" hv
+    hv="$(veth_host "$idx")"
+    ns_exists "$idx" || die "member $idx is not netns-mounted (mount $idx --netns first)"
+    case "$state" in
+    on)
+        ip link set "$hv" down
+        log "member $idx PARTITIONED (veth $hv down — the hard-partition shape)"
+        ;;
+    off)
+        ip link set "$hv" up
+        log "member $idx partition healed (veth $hv up)"
+        ;;
+    *) die "partition takes on|off (got '$state')" ;;
+    esac
+}
+
 # --- verbs -------------------------------------------------------------------
-mount_member() { # idx
+mount_member() { # idx [--netns[=<delay_ms>]]
     require_state
-    local idx="$1" mnt log role
+    local idx="$1" mnt log role netns=0 netem_ms=""
+    case "${2:-}" in
+    "") : ;;
+    --netns) netns=1 ;;
+    --netns=*)
+        netns=1
+        netem_ms="${2#--netns=}"
+        [[ "$netem_ms" =~ ^[0-9]+$ ]] || die "--netns=<delay_ms> needs a number (got '$netem_ms')"
+        ;;
+    *) die "unknown mount argument '${2}'" ;;
+    esac
     mnt="$(mnt_of "$idx")"
     log="$STATE/m${idx}.log"
     mkdir -p "$mnt"
@@ -544,6 +655,15 @@ mount_member() { # idx
     env_args+=("SQUEEZEFS_FLEET_SHARE=$FLEET_N") # options before assignments
     if [ "$idx" -eq 0 ]; then
         role="writer"
+        [ "$netns" = "0" ] ||
+            die "the writer/owner never mounts in a netns — members must dial its advertised endpoint (see the NETNS header note)"
+        # Rung 7: the membership arm rides the WRITER (the lease
+        # authority); its job wire (on by default) writes job:enroll first.
+        if [ -n "${MEMBERSHIP:-}" ]; then
+            env_args+=("SQUEEZEFS_MEMBERSHIP_BIND=$MEMBERSHIP")
+            [ -n "${MEMBERSHIP_LEASE_TTL_MS:-}" ] &&
+                env_args+=("SQUEEZEFS_MEMBERSHIP_LEASE_TTL_MS=$MEMBERSHIP_LEASE_TTL_MS")
+        fi
         # The proven N=1 explicit-identity shape: data plane daemon-owned
         # from the fabric_endpoint records. (The KD-MW-3 ENGAGED stdout
         # line stays inside the daemonized child; engagement is asserted
@@ -555,11 +675,20 @@ mount_member() { # idx
             die "writer mount failed: $(cat "$STATE/m0.mount.out")"
     else
         role="reader"
+        # Rung 7 (the S6-b venue): a reader may mount inside its own netns
+        # so its membership wire is shapeable (netem/partition) — block
+        # devices and the FUSE mount are namespace-blind.
+        local launch=(env "${env_args[@]}" "$SQZ")
+        if [ "$netns" = "1" ]; then
+            netns_setup "$idx"
+            launch=(ip netns exec "$(ns_name "$idx")" env "${env_args[@]}" "$SQZ")
+        fi
         # DLM S5 reader: no identity, no claim, no registrant (POSTURE).
-        env "${env_args[@]}" "$SQZ" mount "sqmeta://$META_PATHS" "$mnt" \
+        "${launch[@]}" mount "sqmeta://$META_PATHS" "$mnt" \
             --read-only --daemon --allow-other --log-file "$log" \
             >"$STATE/m${idx}.mount.out" 2>&1 ||
             die "reader $idx mount failed: $(cat "$STATE/m${idx}.mount.out")"
+        [ -n "$netem_ms" ] && netem_set "$idx" "$netem_ms"
     fi
     wait_for "member $idx mountpoint" 40 mountpoint -q "$mnt"
     wait_for "member $idx stats inode" 40 test -s "$mnt/.stats"
@@ -568,6 +697,23 @@ mount_member() { # idx
         # volume's daemon-owned controller (half 2 — sysfs — runs in create).
         grep -q "daemon-owned controller resolved" "$log" ||
             die "writer log carries no 'daemon-owned controller resolved' line — the rung-2 connect path did not engage (log: $log)"
+    fi
+    # Rung 7: membership engagement is asserted PER MOUNT when armed — an
+    # owner that did not arm or a reader that could not join is residue,
+    # never a quiet green (the join is at-mount, so this converges fast;
+    # netns members get the same deadline through their veth).
+    if [ -n "${MEMBERSHIP:-}" ]; then
+        local want_mode got_mode mtry
+        if [ "$idx" -eq 0 ]; then want_mode="owner"; else want_mode="member"; fi
+        got_mode=""
+        for ((mtry = 0; mtry < 60; mtry++)); do
+            got_mode="$(stat_field "$mnt" membership_mode)"
+            [ "$got_mode" = "$want_mode" ] && break
+            sleep 0.5
+        done
+        [ "$got_mode" = "$want_mode" ] ||
+            die "member $idx membership_mode='$got_mode' (want $want_mode) — the S6 plane did not engage (log: $log)"
+        log "member $idx membership engaged (mode=$want_mode)"
     fi
     local pid
     pid="$(daemon_pid_for_mnt "$mnt")"
@@ -617,11 +763,16 @@ unmount_member() { # idx
         sqz umount "$mnt" >/dev/null 2>&1 || umount -l "$mnt" 2>/dev/null || true
     fi
     wait_for "member $idx unmount" 60 bash -c "! mountpoint -q '$mnt'"
+    if ns_exists "$idx"; then
+        netns_teardown "$idx"
+        log "member $idx netns removed"
+    fi
     log "member $idx unmounted"
 }
 
 create_fleet() {
     local n="$N_DEFAULT" cowriters=0 require_hs=0 vms=0 a
+    local membership="${SQZ_MWFLEET_MEMBERSHIP:-}" lease_ttl_ms="${SQZ_MWFLEET_LEASE_TTL_MS:-}"
     for a in "$@"; do
         case "$a" in
         N=*) n="${a#N=}" ;;
@@ -632,15 +783,19 @@ create_fleet() {
         --require-host-scoped-subsys) require_hs=1 ;;
         --vm) die "--vm takes a value (--vm=V)" ;;
         --vm=*) vms="${a#--vm=}" ;;
-        --netns | --netem | --netem=*)
-            die "'$a' is the rung-7 netem/netns venue — this rung stubs it loud, never silently ignores it"
-            ;;
+        --membership) membership="auto" ;;
+        --membership=*) membership="${a#--membership=}" ;;
+        --lease-ttl-ms=*) lease_ttl_ms="${a#--lease-ttl-ms=}" ;;
         [0-9]*) n="$a" ;;
         *) die "unknown create argument '$a'" ;;
         esac
     done
     [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] || die "N must be a positive integer (got '$n')"
     [[ "$vms" =~ ^[0-9]+$ ]] || die "--vm=V needs a non-negative integer (got '$vms')"
+    [ -z "$lease_ttl_ms" ] || [[ "$lease_ttl_ms" =~ ^[0-9]+$ ]] ||
+        die "--lease-ttl-ms takes milliseconds (got '$lease_ttl_ms')"
+    [ -z "$lease_ttl_ms" ] || [ -n "$membership" ] ||
+        die "--lease-ttl-ms is the OWNER's membership lease knob — it needs --membership"
     [ -e "$CONF" ] && die "fleet state exists at $STATE — run 'sudo tests/mw_fleet.sh teardown' first"
     ensure_prereqs
     # --vm preflight FIRST (fail before any substrate exists): the boot
@@ -721,6 +876,19 @@ create_fleet() {
         dev="$(head_for_nqn "$nqn")" || die "no head device for $nqn"
         data_paths+=("$dev")
     done
+
+    # Rung 7 (the S6-b' guest-member row): record the RESERVED pair's
+    # format-era paths too — the in-guest connect plan reproduces the
+    # WHOLE format-time instance numbering, so the fleet's format-time
+    # data paths resolve to the right namespaces inside a fresh guest
+    # kernel (gaps in the numbering would shift every later instance).
+    local guest_meta_path="" guest_data_path=""
+    if [ "$vms" -gt 0 ]; then
+        guest_meta_path="$(head_for_nqn "$guest_meta_nqn")" ||
+            die "no head device for the reserved guest meta NQN"
+        guest_data_path="$(head_for_nqn "$guest_data_nqn")" ||
+            die "no head device for the reserved guest data NQN"
+    fi
 
     local meta_uri data_uri
     meta_uri="$(
@@ -843,10 +1011,25 @@ create_fleet() {
         echo "VM_GW='$VM_GW'"
         echo "GUEST_META_NQN='$guest_meta_nqn'"
         echo "GUEST_DATA_NQN='$guest_data_nqn'"
+        echo "GUEST_META_PATH='$guest_meta_path'"
+        echo "GUEST_DATA_PATH='$guest_data_path'"
+        echo "MEMBERSHIP='$membership'"
+        echo "MEMBERSHIP_LEASE_TTL_MS='$lease_ttl_ms'"
     } >"$CONF"
     : >"$VMS"
 
     mount_member 0
+
+    # Rung 7: persist the owner's ADVERTISED endpoint (what every member —
+    # host, netns'd, or guest — dials), parsed from the arm line the owner
+    # logs; the netns/guest venues preflight reachability against it.
+    if [ -n "$membership" ]; then
+        local memb_ep
+        memb_ep="$(grep -o "membership OWNER armed on [^ ]*" "$STATE/m0.log" | head -1 | awk '{print $NF}')"
+        [ -n "$memb_ep" ] || die "membership armed but the owner log carries no 'membership OWNER armed on' line"
+        echo "MEMBERSHIP_ENDPOINT='$memb_ep'" >>"$CONF"
+        log "membership owner endpoint: $memb_ep (lease TTL ${lease_ttl_ms:-45000 (shipped)} ms)"
+    fi
 
     # Writer engagement (rung 2): every data NQN must now carry a controller
     # under the WRITER's identity — the daemon-owned connect happened.
@@ -982,6 +1165,12 @@ teardown_fleet() {
         kill -9 "$mpid" 2>/dev/null || true
         log "swept stray daemon pid $mpid"
     done
+    # Rung 7: sweep every fleet netns (the veth pair dies with it).
+    local nsn
+    for nsn in $(ip netns list 2>/dev/null | awk '{print $1}' | grep "^sqzmw-$INSTANCE-m" || true); do
+        ip netns del "$nsn" 2>/dev/null || true
+        log "swept netns $nsn"
+    done
     sleep 1
     # Disconnect every controller still serving an instance NQN (writer
     # daemon-owned data connects + operator meta connects + probe leftovers).
@@ -1035,6 +1224,14 @@ teardown_fleet() {
         warn "RESIDUE: qemu guest process(es) for this fleet survived"
         rc=1
     fi
+    if ip netns list 2>/dev/null | awk '{print $1}' | grep -q "^sqzmw-$INSTANCE-m"; then
+        warn "RESIDUE: fleet netns survived"
+        rc=1
+    fi
+    if ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -q "^sqzmw[0-9]*h"; then
+        warn "RESIDUE: fleet veth survived"
+        rc=1
+    fi
     rm -rf "$STATE"
     rmdir "$MNT_ROOT"/m* "$MNT_ROOT" 2>/dev/null || true
     if [ "$rc" -eq 0 ]; then
@@ -1056,7 +1253,7 @@ ensure_root "$VERB" "$@"
 case "$VERB" in
 create) create_fleet "$@" ;;
 status) status_fleet ;;
-mount) mount_member "${1:?mount needs a member index}" ;;
+mount) mount_member "${1:?mount needs a member index}" "${2:-}" ;;
 unmount) unmount_member "${1:?unmount needs a member index}" ;;
 kill)
     IDX="${1:?kill needs a member index}"
@@ -1089,8 +1286,13 @@ resume)
     require_state
     vm_resume "${1:?resume needs a guest index}"
     ;;
-partition | netem)
-    die "$VERB is the rung-7 netem/netns venue — not built this rung"
+netem)
+    require_state
+    netem_set "${1:?netem needs a member index}" "${2:?netem needs a delay in ms, or off}"
     ;;
-*) die "unknown verb '$VERB' (create|status|mount|unmount|kill|probe-host-scoped|vm-boot|vm-exec|vm-stop|pause|resume|teardown)" ;;
+partition)
+    require_state
+    partition_set "${1:?partition needs a member index}" "${2:?partition needs on|off}"
+    ;;
+*) die "unknown verb '$VERB' (create|status|mount|unmount|kill|netem|partition|probe-host-scoped|vm-boot|vm-exec|vm-stop|pause|resume|teardown)" ;;
 esac

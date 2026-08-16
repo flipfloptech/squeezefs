@@ -64,6 +64,44 @@
 #                       remedies. All against the RESERVED guest-leg
 #                       namespace — no live host writer's subsystem is
 #                       ever touched.
+#   s6-journal [--window=S]  (rung 7 — needs a fleet created with
+#                       --membership; design row S6-a) the S6 gate LIVE:
+#                       a sustained quiet window over the whole fleet in
+#                       which `membership_renewals` grows with the
+#                       heartbeat while `meta_kv_journal_entries` does NOT
+#                       grow proportionally (the pre-S6 plane paid ONE
+#                       journal transaction PER BEAT — spec §6.5 item 3's
+#                       455 beats/s serialization); registration commits
+#                       stay flat, the census serves engage (`squeezefs
+#                       clients` probes during the window), self-fences/
+#                       evictions stay 0, and every row carries the §5.5
+#                       R5-pressure columns. Default window 600 s
+#                       (SQZ_MWMATRIX_S6_WINDOW_S / --window=S override —
+#                       shorter windows are labeled in the row).
+#   s6-fence [--netem=MS] [--victim=IDX]  (rung 7; design row S6-b) the
+#                       self-fence clock law under duress: the victim
+#                       reader is remounted into its own netns with netem
+#                       delay (default 200 ms per veth end), SIGSTOPped
+#                       past its T_self and past the owner's TTL; the
+#                       owner must evict (+ mint the S7 dead epoch) while
+#                       the victim is frozen, and the victim must
+#                       SELF-FENCE + purge on resume — self_fences=1 on
+#                       the victim, 0 elsewhere, grace refusals 0.
+#   s6-vm-fence         (rung 7 — needs --vm=V + --membership; design row
+#                       S6-b') the HUNG-KERNEL shape: guest 0 joins the
+#                       host fleet as a READ-ONLY member over the fabric
+#                       (in-guest operator connects reproduce the
+#                       format-time instance numbering), `mw_fleet.sh
+#                       pause` freezes the guest kernel past the owner's
+#                       TTL (its monotonic domain cannot observe T_self —
+#                       the shape kill-9 cannot produce), and on resume
+#                       the guest must observe itself dead and self-fence
+#                       (purge) BEFORE holding any fresh lease — never
+#                       resume as a live member on its stale caches. The
+#                       owner side must have evicted + minted the S7 dead
+#                       epoch. Real halves: the frozen kernel and the
+#                       host-vs-guest clock domains are REAL; large-skew
+#                       injection stays on the membership_sim.rs seam.
 #   vm-multi-identity   (rung 6b — needs --vm=V) the N>=2-identity mount
 #                       shape LIVE inside guest 0 on the 0030 kernel:
 #                       writer A formats --multi-writer over the reserved
@@ -80,6 +118,7 @@
 #                       rule-2 class.
 #
 # Usage:  sudo tests/run_mw_matrix.sh <leg> [--require-host-scoped-subsys]
+#         [--window=S] [--netem=MS] [--victim=IDX]   (the s6-* legs)
 # Exit:   0 green (or a loud SKIP), nonzero on any INVALID row / violation.
 #
 # Requires: root, a live fleet (sudo tests/mw_fleet.sh create N=2), python3.
@@ -121,12 +160,20 @@ LEG="${1:-}"
 }
 shift || true
 REQUIRE_HS=0
+S6_WINDOW_S="${SQZ_MWMATRIX_S6_WINDOW_S:-600}"
+S6_NETEM_MS=200
+S6_VICTIM=""
 for a in "$@"; do
     case "$a" in
     --require-host-scoped-subsys) REQUIRE_HS=1 ;;
+    --window=*) S6_WINDOW_S="${a#--window=}" ;;
+    --netem=*) S6_NETEM_MS="${a#--netem=}" ;;
+    --victim=*) S6_VICTIM="${a#--victim=}" ;;
     *) die "unknown argument '$a'" ;;
     esac
 done
+[[ "$S6_WINDOW_S" =~ ^[0-9]+$ ]] || die "--window takes seconds (got '$S6_WINDOW_S')"
+[[ "$S6_NETEM_MS" =~ ^[0-9]+$ ]] || die "--netem takes ms (got '$S6_NETEM_MS')"
 
 ensure_root "$LEG" "$@"
 command -v python3 >/dev/null 2>&1 || die "python3 is required (the row emitter)"
@@ -194,6 +241,10 @@ DELTA_COLS = [
     ("meta_kv_revalidate_epochs", "reval_epochs_d"),
     ("meta_kv_revalidate_dirty_skips", "reval_dirty_d"),
     ("membership_renewals", "memb_renew_d"),
+    ("membership_registration_commits", "memb_reg_d"),
+    ("membership_self_fences", "memb_fence_d"),
+    ("membership_evictions", "memb_evict_d"),
+    ("membership_census_serves", "memb_census_d"),
     ("meta_ship.shipped_verbs", "ship_d"),
     ("mem_budget_red_events", "r5_red_d"),
     ("mem_budget_hard_backstops", "r5_backstop_d"),
@@ -697,6 +748,470 @@ JOBC
     log "vm-multi-identity GREEN (evidence in $rowdir)"
 }
 
+# --- rung-7 S6 legs (design-full-multi-writer §7.2) ------------------------
+require_membership() {
+    [ -n "${MEMBERSHIP:-}" ] ||
+        die "this leg needs a membership-armed fleet — create it with: sudo tests/mw_fleet.sh create N=<n> --membership"
+    [ "$(stat_field 0 membership_mode)" = "owner" ] ||
+        die "member 0 is not the membership OWNER (membership_mode != owner) — the arm did not engage"
+}
+
+# Poll one flattened stats field on member <idx> until it is >= <want>,
+# within <deadline_s>. Echoes the final value; dies loud on timeout.
+wait_stat_ge() { # idx key want deadline_s what
+    local idx="$1" key="$2" want="$3" deadline="$4" what="$5" v t0 now
+    t0="$(date +%s)"
+    while :; do
+        v="$(stat_field "$idx" "$key")"
+        [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge "$want" ] && {
+            echo "$v"
+            return 0
+        }
+        now="$(date +%s)"
+        [ $((now - t0)) -lt "$deadline" ] ||
+            die "$what: m$idx $key=$v never reached $want within ${deadline}s"
+        sleep 1
+    done
+}
+
+# The owner's renewal cadence estimate, seconds: min(10, T_self/3) — the
+# same derivation LeaseClocks ships, read back from the published gauges.
+owner_renew_est_s() {
+    local tself
+    tself="$(stat_field 0 membership_self_deadline_ms)"
+    python3 -c "print(max(1, min(10, int($tself) // 3000)))"
+}
+
+leg_s6_journal() {
+    require_membership
+    local rowdir n_members
+    rowdir="$STATE/rows/s6journal-$(date +%s)"
+    mkdir -p "$rowdir"
+    n_members="$(member_idxs | wc -l)"
+    [ "$n_members" -ge 2 ] || die "s6-journal needs N>=2"
+    local i
+    for i in $(member_idxs); do
+        [ "$i" = "0" ] && continue
+        [ "$(stat_field "$i" membership_mode)" = "member" ] ||
+            die "reader $i is not a live membership member — the row would under-count beats"
+    done
+    local ttl tself renew_est
+    ttl="$(stat_field 0 membership_lease_ttl_ms)"
+    tself="$(stat_field 0 membership_self_deadline_ms)"
+    renew_est="$(owner_renew_est_s)"
+    log "s6-journal: N=$n_members (1 owner + $((n_members - 1)) members), window ${S6_WINDOW_S}s, owner clocks T_owner=${ttl}ms T_self=${tself}ms, renew cadence ~${renew_est}s"
+
+    for i in $(member_idxs); do snap "$i" 0 "$rowdir"; done
+    # The window is QUIET on purpose: it isolates the liveness plane's
+    # journal cost (the S6 gate is about the BEAT plane, and a quiet
+    # writer's journal delta is exactly the liveness + own-heartbeat
+    # residue). Census probes ride the window — the read side S6 also
+    # replaced (`squeezefs clients` = one record + a paged census RPC).
+    local t0 now probes=0
+    t0="$(date +%s)"
+    while :; do
+        now="$(date +%s)"
+        [ $((now - t0)) -lt "$S6_WINDOW_S" ] || break
+        sleep 30
+        if "$SQZ" clients "sqmeta://$META_PATHS" >"$rowdir/clients.$probes.out" 2>&1; then
+            probes=$((probes + 1))
+        else
+            die "squeezefs clients probe failed mid-window: $(tail -2 "$rowdir/clients.$probes.out")"
+        fi
+    done
+    for i in $(member_idxs); do snap "$i" 1 "$rowdir"; done
+    # Readers must be VISIBLE in the census (the S5 gap this plane closed).
+    grep -q "member-reader" "$rowdir/clients.0.out" ||
+        die "no member-reader row in squeezefs clients — readers stayed invisible:
+$(cat "$rowdir/clients.0.out")"
+    # shellcheck disable=SC2046 # member_idxs is a controlled numeric list
+    emit_rows "$rowdir" s6-journal $(member_idxs)
+
+    # The S6-a gates (design §7.2 row 1), over the owner's snapshots.
+    python3 - "$rowdir" "$n_members" "$S6_WINDOW_S" "$renew_est" "$probes" <<'PYGATE'
+import json, sys
+
+rowdir, n, window, renew_est, probes = (
+    sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]))
+
+def flat(d, out=None, pfx=""):
+    out = {} if out is None else out
+    for k, v in d.items():
+        if isinstance(v, dict):
+            flat(v, out, pfx + k + ".")
+        else:
+            out[pfx + k] = v
+    return out
+
+def load(p):
+    root = json.load(open(p))
+    return flat(root.get("metrics", root))
+
+o0, o1 = load(f"{rowdir}/m0_p0.json"), load(f"{rowdir}/m0_p1.json")
+d = lambda k: int(o1.get(k, 0)) - int(o0.get(k, 0))
+
+renewals = d("membership_renewals")
+jrnl = d("meta_kv_journal_entries")
+reg = d("membership_registration_commits")
+census = d("membership_census_serves")
+evict = d("membership_evictions")
+fences = d("membership_self_fences")
+refusals = d("membership_grace_refusals")
+
+members = n - 1
+expected_beats = members * window // max(renew_est, 1)
+per_beat = jrnl / renewals if renewals else float("inf")
+
+print(f"== s6-journal arithmetic (the spec §6.5 item-3 gate) ==")
+print(f"  members (beating)          : {members}")
+print(f"  window                     : {window}s, renew cadence ~{renew_est}s")
+print(f"  membership_renewals delta  : {renewals} (expected ~{expected_beats})")
+print(f"  meta_kv_journal_entries d  : {jrnl}  <- the OWNER's own residue, N-independent")
+print(f"  journal txs PER BEAT       : {per_beat:.4f} (the pre-S6 plane paid 1.0 per beat)")
+print(f"  pre-S6 equivalent cost     : ~{renewals} journal txs this window would have paid")
+print(f"  registration_commits delta : {reg} (bounded by membership CHANGES; 0 here)")
+print(f"  census_serves delta        : {census} over {probes} clients probes")
+print(f"  self_fences/evictions/grace: {fences}/{evict}/{refusals}")
+
+bad = []
+if renewals < expected_beats // 2:
+    bad.append(f"renewals {renewals} < half the expected {expected_beats} — the beat plane is not engaged")
+if per_beat >= 0.25:
+    bad.append(f"journal txs per beat {per_beat:.3f} >= 0.25 — journal growth is coupling to the heartbeat (the S6 regression)")
+if reg != 0:
+    bad.append(f"registration_commits moved ({reg}) with zero membership changes")
+if census < probes:
+    bad.append(f"census_serves {census} < {probes} probes — the census read side did not engage")
+if fences != 0 or evict != 0 or refusals != 0:
+    bad.append(f"self_fences={fences} evictions={evict} grace_refusals={refusals} on a healthy window (all must be 0)")
+if bad:
+    print("S6-a GATE FAILED:", file=sys.stderr)
+    for b in bad:
+        print(f"  {b}", file=sys.stderr)
+    sys.exit(1)
+print("S6-a GATE GREEN (heartbeat off the journal; census engaged; R5 columns in the row table above)")
+PYGATE
+    log "s6-journal leg GREEN (rows + snapshots in $rowdir)"
+}
+
+leg_s6_fence() {
+    require_membership
+    local rowdir victim
+    rowdir="$STATE/rows/s6fence-$(date +%s)"
+    mkdir -p "$rowdir"
+    victim="${S6_VICTIM:-$(member_idxs | awk '$1!=0' | tail -1)}"
+    [ -n "$victim" ] && [ "$victim" != "0" ] || die "s6-fence needs a reader victim (N>=2)"
+    [ "$(role_of "$victim")" = "reader" ] || die "victim $victim is not a reader"
+
+    local ttl tself renew_est
+    ttl="$(stat_field 0 membership_lease_ttl_ms)"
+    tself="$(stat_field 0 membership_self_deadline_ms)"
+    renew_est="$(owner_renew_est_s)"
+    [ "$tself" -lt "$ttl" ] ||
+        die "clock law violated in the published gauges: T_self ($tself) must be strictly earlier than T_owner ($ttl)"
+    log "s6-fence: victim m$victim, netem ${S6_NETEM_MS}ms/end, T_owner=${ttl}ms T_self=${tself}ms (member fences FIRST by construction)"
+
+    # Remount the victim inside its own netns, with netem shaping its
+    # membership wire (design row S6-b: 'netem +200 ms on one member's
+    # veth, freeze via SIGSTOP past T_self').
+    "$MWFLEET" unmount "$victim"
+    "$MWFLEET" mount "$victim" "--netns=$S6_NETEM_MS"
+    [ "$(stat_field "$victim" membership_mode)" = "member" ] ||
+        die "victim did not re-join through the shaped netns wire"
+    log "victim m$victim re-joined through the netem-shaped netns wire (delayed renewals still inside the deadlines — the shaping is duress, not partition)"
+
+    local i
+    for i in $(member_idxs); do snap "$i" 0 "$rowdir"; done
+    local evict0 fence0 log0_evict log0_dead
+    evict0="$(stat_field 0 membership_evictions)"
+    fence0="$(stat_field "$victim" membership_self_fences)"
+    log0_evict="$(grep -c "EVICTED by owner" "$STATE/m0.log" || true)"
+    log0_dead="$(grep -c "declared DEAD" "$STATE/m0.log" || true)"
+
+    # Freeze the victim past T_self AND past the owner's TTL. SIGSTOP
+    # leaves its monotonic clock RUNNING (unlike the VM pause), so on
+    # resume the member observes T_self passed and fences by its OWN
+    # clock — the row's 'member fences before the owner re-grants' half
+    # is the arithmetic T_self < T_owner asserted above, enforced by the
+    # owner acting only at ITS deadline.
+    "$MWFLEET" kill "$victim" --sig STOP
+    log "victim m$victim SIGSTOPped (frozen daemon, running clock)"
+    local evict_deadline
+    evict_deadline=$(((ttl / 1000) + 3 * renew_est + 30))
+    local evictions
+    evictions="$(wait_stat_ge 0 membership_evictions $((evict0 + 1)) "$evict_deadline" "owner eviction")"
+    log "owner evicted the frozen victim (membership_evictions $evict0 -> $evictions)"
+    # The S7 half: the eviction MINTS the dead epoch (S6 -> S7 vocabulary).
+    [ "$(grep -c "EVICTED by owner" "$STATE/m0.log")" -gt "$log0_evict" ] ||
+        die "owner log carries no new 'EVICTED by owner' line"
+    [ "$(grep -c "declared DEAD" "$STATE/m0.log")" -gt "$log0_dead" ] ||
+        die "owner log carries no new dead-epoch line — the eviction did not mint the S7 dead epoch"
+
+    "$MWFLEET" kill "$victim" --sig CONT
+    log "victim m$victim resumed (SIGCONT) — it must now self-fence on its own clock"
+    local fences
+    fences="$(wait_stat_ge "$victim" membership_self_fences $((fence0 + 1)) $((3 * renew_est + 60)) "victim self-fence")"
+    [ "$fences" = "$((fence0 + 1))" ] ||
+        die "victim self-fenced $((fences - fence0)) times (want exactly 1)"
+    grep -q "SELF-FENCED" "$STATE/m${victim}.log" ||
+        die "victim log carries no SELF-FENCED line"
+    grep -q "membership self-fence: dropped" "$STATE/m${victim}.log" ||
+        die "victim log carries no purge line — the reader fail-stop did not drop its cached blocks"
+    log "victim self-fenced + purged (membership_self_fences $fence0 -> $fences)"
+
+    sleep 3 # let every reader's revalidation cadence tick before p1
+    for i in $(member_idxs); do snap "$i" 1 "$rowdir"; done
+    # Everyone else: ZERO fences, zero grace refusals (the blast radius is
+    # exactly the deliberate victim).
+    python3 - "$rowdir" "$victim" <<'PYGATE'
+import json, sys
+
+rowdir, victim = sys.argv[1], sys.argv[2]
+
+def flat(d, out=None, pfx=""):
+    out = {} if out is None else out
+    for k, v in d.items():
+        if isinstance(v, dict):
+            flat(v, out, pfx + k + ".")
+        else:
+            out[pfx + k] = v
+    return out
+
+def load(p):
+    root = json.load(open(p))
+    return flat(root.get("metrics", root))
+
+import glob, re
+bad = []
+for p1 in glob.glob(f"{rowdir}/m*_p1.json"):
+    i = re.match(r".*/m(\d+)_p1", p1).group(1)
+    d1, d0 = load(p1), load(f"{rowdir}/m{i}_p0.json")
+    fences = int(d1.get("membership_self_fences", 0)) - int(d0.get("membership_self_fences", 0))
+    refusals = int(d1.get("membership_grace_refusals", 0)) - int(d0.get("membership_grace_refusals", 0))
+    if i == victim:
+        if fences != 1:
+            bad.append(f"m{i} (victim): self_fences delta {fences} != 1")
+    elif fences != 0:
+        bad.append(f"m{i}: self_fences delta {fences} != 0 — the blast radius leaked past the victim")
+    if refusals != 0:
+        bad.append(f"m{i}: grace_refusals moved ({refusals}) — no failover happened here")
+if bad:
+    print("S6-b GATE FAILED:", file=sys.stderr)
+    for b in bad:
+        print(f"  {b}", file=sys.stderr)
+    sys.exit(1)
+print("S6-b GATE GREEN (fence exactly on the victim; grace quiet)")
+PYGATE
+    # shellcheck disable=SC2046 # member_idxs is a controlled numeric list
+    emit_rows "$rowdir" s6-fence $(member_idxs)
+
+    # Restore the fleet: clear the shaping, remount the victim normally,
+    # and require it to re-join live.
+    "$MWFLEET" netem "$victim" off
+    "$MWFLEET" unmount "$victim"
+    "$MWFLEET" mount "$victim"
+    [ "$(stat_field "$victim" membership_mode)" = "member" ] ||
+        die "victim did not re-join after the restore remount"
+    log "s6-fence leg GREEN (victim restored; rows + snapshots in $rowdir)"
+}
+
+leg_s6_vm_fence() {
+    require_membership
+    require_vm_fleet
+    [ -n "${MEMBERSHIP_ENDPOINT:-}" ] || die "fleet config carries no MEMBERSHIP_ENDPOINT"
+    case "$MEMBERSHIP_ENDPOINT" in
+    127.0.0.1:* | 0.0.0.0:*)
+        die "the owner advertises $MEMBERSHIP_ENDPOINT, which a guest cannot dial through slirp — this box has no routable primary interface; the S6-b' row needs one"
+        ;;
+    esac
+    local rowdir g_nqn g_id
+    rowdir="$STATE/rows/s6vmfence-$(date +%s)"
+    mkdir -p "$rowdir"
+    g_nqn="$(guest_nqn 70)" g_id="$(guest_id 70)"
+
+    # The in-guest connect PLAN: reproduce the whole format-time instance
+    # numbering (fleet meta+data plus the reserved pair as fillers) so the
+    # reader's format-time data paths resolve to the right namespaces in a
+    # fresh guest kernel. Built host-side from the durable config.
+    local plan meta_basenames
+    plan="$(python3 - <<PYPLAN
+import sys
+meta_paths = "$FORMAT_META_PATHS".split(",")
+data_paths = "$FORMAT_DATA_PATHS".split(",")
+meta_nqns = "$META_NQNS".split()
+data_nqns = "$DATA_NQNS".split()
+pairs = list(zip(meta_paths, meta_nqns)) + list(zip(data_paths, data_nqns))
+if "$GUEST_META_PATH":
+    pairs.append(("$GUEST_META_PATH", "$GUEST_META_NQN"))
+if "$GUEST_DATA_PATH":
+    pairs.append(("$GUEST_DATA_PATH", "$GUEST_DATA_NQN"))
+rows = []
+for path, nqn in pairs:
+    base = path.rsplit("/", 1)[-1]
+    if not (base.startswith("nvme") and base.endswith("n1")):
+        sys.exit(f"unexpected head name {base}")
+    rows.append((int(base[4:-2]), base, nqn))
+rows.sort()
+ks = [r[0] for r in rows]
+if ks != list(range(len(rows))):
+    sys.exit(f"format-time instance numbers {ks} are not contiguous from 0 — cannot reproduce in a fresh guest kernel")
+for k, base, nqn in rows:
+    print(f"{k} {base} {nqn}")
+PYPLAN
+)" || die "connect plan generation failed: $plan"
+    echo "$plan" >"$rowdir/connect-plan"
+    meta_basenames="$(python3 -c 'import sys
+print(",".join("/dev/" + p.rsplit("/", 1)[-1] for p in sys.argv[1].split(",")))' "$FORMAT_META_PATHS")"
+    log "s6-vm-fence: guest connect plan ($(echo "$plan" | wc -l) namespaces), meta URI in-guest: $meta_basenames"
+
+    # ---- job A: join the fleet as a READ-ONLY member, in-guest ----
+    {
+        guest_job_preamble
+        echo "PLAN='$plan'"
+        cat <<JOBA
+echo "\$PLAN" | while read -r k base nqn; do
+    [ -n "\$nqn" ] || continue
+    \$SQZ nvmeof connect --ip "\$GW" --port "\$SVC" --subnqn "\$nqn" --hostnqn '$g_nqn' --hostid '$g_id'
+    i=0
+    while [ \$i -lt 40 ]; do [ -b "/dev/\$base" ] && break; i=\$((i + 1)); sleep 0.5; done
+    [ -b "/dev/\$base" ] || { echo "FAIL: \$nqn did not land at /dev/\$base (numbering drift)"; exit 1; }
+    head=""
+    for s in \$(subsys_dirs_for_nqn "\$nqn"); do head=\$(head_of_dir "\$s") && break; done
+    [ "\$head" = "\$base" ] || { echo "FAIL: \$nqn resolves head '\$head', want \$base"; exit 1; }
+done || exit 1
+echo "connect plan reproduced (format-time numbering verified per-NQN)"
+mkdir -p /mnt/member
+\$SQZ mount "sqmeta://$meta_basenames" /mnt/member --read-only --daemon --log-file /tmp/member.log >/tmp/member.mount.out 2>&1 || { cat /tmp/member.mount.out; cat /tmp/member.log 2>/dev/null; exit 1; }
+i=0
+while [ \$i -lt 240 ]; do grep -q " /mnt/member " /proc/mounts && break; i=\$((i + 1)); sleep 0.5; done
+grep -q " /mnt/member " /proc/mounts || { echo "FAIL: member mount never appeared"; cat /tmp/member.log; exit 1; }
+i=0
+mode=""
+while [ \$i -lt 60 ]; do
+    mode=\$(grep -o '"membership_mode": *"[a-z]*"' /mnt/member/.stats | grep -o '"[a-z]*"\$' | tr -d '"')
+    [ "\$mode" = "member" ] && break
+    i=\$((i + 1)); sleep 0.5
+done
+[ "\$mode" = "member" ] || { echo "FAIL: guest membership_mode='\$mode' (want member) — cannot dial the owner at $MEMBERSHIP_ENDPOINT?"; grep -i membership /tmp/member.log; exit 1; }
+fences=\$(grep -o '"membership_self_fences": *[0-9]*' /mnt/member/.stats | grep -o '[0-9]*\$')
+epoch=\$(grep -o '"membership_epoch": *[0-9]*' /mnt/member/.stats | grep -o '[0-9]*\$')
+echo "GUEST_FENCES_BASE=\$fences"
+echo "GUEST_EPOCH_BASE=\$epoch"
+echo "GUEST MEMBER GREEN (RO mount joined the host fleet's membership plane)"
+JOBA
+    } >"$rowdir/job-a.sh"
+    "$MWFLEET" vm-exec 0 "$rowdir/job-a.sh" 600 | tee "$rowdir/job-a.out" ||
+        die "guest member join FAILED (output: $rowdir/job-a.out)"
+    local g_fence0 g_epoch0
+    g_fence0="$(awk -F= '/^GUEST_FENCES_BASE=/ {print $2}' "$rowdir/job-a.out" | tr -d '
+')"
+    g_epoch0="$(awk -F= '/^GUEST_EPOCH_BASE=/ {print $2}' "$rowdir/job-a.out" | tr -d '
+')"
+    [ -n "$g_fence0" ] && [ -n "$g_epoch0" ] || die "guest job reported no baselines"
+
+    local ttl renew_est evict0 log0_evict log0_dead
+    ttl="$(stat_field 0 membership_lease_ttl_ms)"
+    renew_est="$(owner_renew_est_s)"
+    snap 0 0 "$rowdir"
+    evict0="$(stat_field 0 membership_evictions)"
+    log0_evict="$(grep -c "EVICTED by owner" "$STATE/m0.log" || true)"
+    log0_dead="$(grep -c "declared DEAD" "$STATE/m0.log" || true)"
+    # The owner census must carry the guest (member-reader, mount point
+    # /mnt/member) — the S5 gap closed cross-KERNEL for the first time.
+    "$SQZ" clients "sqmeta://$META_PATHS" >"$rowdir/clients-joined.out" 2>&1 ||
+        die "clients probe failed"
+    grep -q "member-reader" "$rowdir/clients-joined.out" ||
+        die "guest member not visible in squeezefs clients:
+$(cat "$rowdir/clients-joined.out")"
+
+    # ---- the hung kernel: qemu pause past the owner's TTL ----
+    "$MWFLEET" pause 0
+    log "guest 0 PAUSED (vcpus + guest clock frozen — the monotonic domain cannot observe T_self)"
+    local evictions
+    evictions="$(wait_stat_ge 0 membership_evictions $((evict0 + 1)) $(((ttl / 1000) + 3 * renew_est + 60)) "owner eviction of the paused guest")"
+    [ "$(grep -c "EVICTED by owner" "$STATE/m0.log")" -gt "$log0_evict" ] ||
+        die "owner log carries no new 'EVICTED by owner' line"
+    [ "$(grep -c "declared DEAD" "$STATE/m0.log")" -gt "$log0_dead" ] ||
+        die "owner log carries no new dead-epoch line — the eviction did not mint the S7 dead epoch"
+    log "owner evicted the paused guest + minted the S7 dead epoch (membership_evictions $evict0 -> $evictions)"
+
+    "$MWFLEET" resume 0
+    log "guest 0 resumed — it must observe itself dead and self-fence BEFORE holding any fresh lease"
+
+    # ---- job B: the resume law, asserted in-guest ----
+    {
+        guest_job_preamble
+        cat <<JOBB
+i=0
+fences=""
+while [ \$i -lt 120 ]; do
+    fences=\$(grep -o '"membership_self_fences": *[0-9]*' /mnt/member/.stats | grep -o '[0-9]*\$')
+    [ -n "\$fences" ] && [ "\$fences" -gt "$g_fence0" ] && break
+    i=\$((i + 1)); sleep 1
+done
+[ -n "\$fences" ] && [ "\$fences" -gt "$g_fence0" ] || { echo "FAIL: guest never self-fenced after resume (membership_self_fences=\$fences, base $g_fence0) — it resumed as a live member on its stale caches (the S6-b' falsifier)"; grep -i membership /tmp/member.log | tail -5; exit 1; }
+[ "\$fences" = "$((g_fence0 + 1))" ] || { echo "FAIL: guest fenced \$fences times (want exactly $((g_fence0 + 1)))"; exit 1; }
+grep -q "SELF-FENCED" /tmp/member.log || { echo "FAIL: no SELF-FENCED line in the guest daemon log"; exit 1; }
+grep -q "membership self-fence: dropped" /tmp/member.log || { echo "FAIL: no purge line — the reader fail-stop did not drop its cached blocks"; exit 1; }
+# The fixed ladder: fence FIRST, then a FRESH re-join (clean view, new
+# epoch) — availability restored without ever serving the stale view.
+i=0
+mode=""
+epoch=""
+while [ \$i -lt 60 ]; do
+    mode=\$(grep -o '"membership_mode": *"[a-z]*"' /mnt/member/.stats | grep -o '"[a-z]*"\$' | tr -d '"')
+    epoch=\$(grep -o '"membership_epoch": *[0-9]*' /mnt/member/.stats | grep -o '[0-9]*\$')
+    [ "\$mode" = "member" ] && [ -n "\$epoch" ] && [ "\$epoch" != "$g_epoch0" ] && break
+    i=\$((i + 1)); sleep 1
+done
+[ "\$mode" = "member" ] || { echo "FAIL: guest did not re-join fresh after its fence (mode=\$mode)"; exit 1; }
+[ "\$epoch" != "$g_epoch0" ] || { echo "FAIL: guest resurrected its dead epoch $g_epoch0"; exit 1; }
+echo "GUEST_EPOCH_FRESH=\$epoch"
+echo "GUEST RESUME LAW GREEN (fenced + purged FIRST, then re-joined fresh: epoch $g_epoch0 -> \$epoch)"
+JOBB
+    } >"$rowdir/job-b.sh"
+    "$MWFLEET" vm-exec 0 "$rowdir/job-b.sh" 300 | tee "$rowdir/job-b.out" ||
+        die "guest resume-law job FAILED (output: $rowdir/job-b.out)"
+
+    snap 0 1 "$rowdir"
+    local refusals0 refusals1
+    local graceprobe='import json, sys
+def flat(d, out=None, pfx=""):
+    out = {} if out is None else out
+    for k, v in d.items():
+        if isinstance(v, dict): flat(v, out, pfx + k + ".")
+        else: out[pfx + k] = v
+    return out
+root = json.load(open(sys.argv[1]))
+print(flat(root.get("metrics", root)).get("membership_grace_refusals", 0))'
+    refusals0="$(python3 -c "$graceprobe" "$rowdir/m0_p0.json")"
+    refusals1="$(python3 -c "$graceprobe" "$rowdir/m0_p1.json")"
+    [ "$refusals0" = "$refusals1" ] ||
+        die "membership_grace_refusals moved ($refusals0 -> $refusals1) — no failover happened here"
+
+    # ---- job C: cleanup (always) ----
+    {
+        guest_job_preamble
+        cat <<JOBC
+set +e
+\$SQZ umount /mnt/member >/dev/null 2>&1 || umount -l /mnt/member 2>/dev/null
+i=0
+while [ \$i -lt 120 ]; do grep -q " /mnt/member " /proc/mounts || break; i=\$((i + 1)); sleep 0.5; done
+echo "\$PLAN" >/dev/null 2>&1
+for c in /sys/class/nvme/nvme*; do
+    [ "\$(cat "\$c/hostnqn" 2>/dev/null)" = '$g_nqn' ] || continue
+    echo 1 >"\$c/delete_controller" 2>/dev/null
+done
+sleep 1
+echo "cleanup done"
+exit 0
+JOBC
+    } >"$rowdir/job-cleanup.sh"
+    "$MWFLEET" vm-exec 0 "$rowdir/job-cleanup.sh" 300 | tee "$rowdir/job-cleanup.out" ||
+        warn "in-guest cleanup reported errors"
+    log "s6-vm-fence leg GREEN (evidence in $rowdir)"
+}
+
 leg_cowriters_admission() {
     if [ "$HOST_SCOPED" != "1" ]; then
         local reason="multi-identity (co-writer) legs need host-scoped fabric subsystems: this kernel merges controllers by subsysnqn ignoring hostnqn (nvme_core.multipath=Y), so co-located identities share one head — rung 5b (the sqz-kernel fix, validated in the rung-6b qemu guest) unlocks them. Stock-kernel workaround: nvme_core.multipath=N (boot parameter)"
@@ -709,8 +1224,11 @@ leg_cowriters_admission() {
 case "$LEG" in
 smoke) leg_smoke ;;
 multipath-negative) leg_multipath_negative ;;
+s6-journal) leg_s6_journal ;;
+s6-fence) leg_s6_fence ;;
+s6-vm-fence) leg_s6_vm_fence ;;
 cowriters-admission) leg_cowriters_admission ;;
 vm-hostscope-validate) leg_vm_hostscope_validate ;;
 vm-multi-identity) leg_vm_multi_identity ;;
-*) die "unknown leg '$LEG' (smoke|multipath-negative|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
+*) die "unknown leg '$LEG' (smoke|multipath-negative|s6-journal|s6-fence|s6-vm-fence|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
 esac

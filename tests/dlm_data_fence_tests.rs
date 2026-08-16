@@ -396,7 +396,7 @@ async fn a_reservation_conflict_completion_latches_the_fence_and_poisons_custody
         .expect_err("a fenced holder submits nothing");
     assert!(matches!(err2, SqueezefsError::WriterGuardFenced));
     assert!(
-        refusals() >= before + 1,
+        refusals() > before,
         "post-latch submissions count in data_dma_fence_refusals"
     );
     assert_eq!(

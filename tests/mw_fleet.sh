@@ -667,6 +667,11 @@ mount_member() { # idx [--netns[=<delay_ms>]]
     # SqueezeFS knobs and would trip the registry's typo announcement.
     local env_args=("${SCRUB_ENV[@]}")
     env_args+=("SQUEEZEFS_FLEET_SHARE=$FLEET_N") # options before assignments
+    # Dev-tree build identities (`-dirty`) are degenerate under the KD-7
+    # skew gate; the admin lane (online fsck — the S7-b oracle) refuses
+    # them without the counted dev override (the run_preload_gate.sh
+    # precedent — announced loudly on both ends, ipc_binds_dev_override).
+    env_args+=("SQUEEZEFS_IPC_ALLOW_DEV=1")
     if [ "$idx" -eq 0 ]; then
         role="writer"
         [ "$netns" = "0" ] ||

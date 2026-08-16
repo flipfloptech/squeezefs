@@ -1481,3 +1481,211 @@ async fn overlay_installed_inside_read_window_never_hides_acked_bytes() {
         );
     }
 }
+
+/// generic/795 recopy storm — the THIRD deterministic face (the
+/// 2026-08-15 re-falsification, arm 2 of 2): the read loop's two
+/// post-read authority reads ran in the INVERTED order relative to the
+/// custody transfer they validate. Every settle publishes its
+/// destination strictly BEFORE retiring its source (map move `M`, then
+/// record retire `R`, `M < R`); the loop read the custody FINGERPRINT
+/// first (`T_fp`) and the device-overlay REGISTRY second (`T_probe`,
+/// `T_fp < T_probe`). A whole settle landing inside the gap —
+/// `T_fp < M < R < T_probe` — is invisible to both: the fingerprint
+/// compared two pre-`M` snapshots (match) and the probe found the
+/// record already retired (empty), so the loop served the base compose
+/// that had resolved the PRE-move map — old-binding bytes / hole-zeros
+/// for acked, size-published data (the falsification tape's exact
+/// signature at tests line 1092). Probing in the REVERSE order of the
+/// publish makes the miss require `R < T_probe < T_fp < M`, i.e.
+/// `R < M` — a contradiction — closing the window STRUCTURALLY. The
+/// validate-stall seam sits between the two reads and holds a forced
+/// settle inside the gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settle_inside_the_validate_gap_never_hides_acked_bytes() {
+    use std::sync::atomic::Ordering as AtomOrd;
+    let h = Arc::new(make().await);
+    squeezefs::device_overlay::set_device_overlay_for_tests(true, true);
+
+    let ino = create(&h, "ovl_vgap").await;
+    let pattern: Vec<u8> = (0..3 * BS as usize)
+        .map(|i| (i % 251) as u8 ^ 0x5A)
+        .collect();
+    write_at(&h, ino, 0, &pattern[..2 * BS as usize]).await;
+    fsync(&h, ino).await;
+
+    // Reader parks in the PRELUDE window first (so the racing write's
+    // overlay install is invisible to its entry drain and size snapshot
+    // comes after the ACK — the pin-2 fixture, reused).
+    let wentries0 = squeezefs::fuse_client::test_read_window_stall_entries();
+    squeezefs::fuse_client::set_test_read_window_stall(true);
+    let reader = {
+        let h = h.clone();
+        tokio::spawn(async move { h.fs.read(h.req, ino, 0, 2 * BS - 8192, 16384, 0).await })
+    };
+    let t0 = std::time::Instant::now();
+    while squeezefs::fuse_client::test_read_window_stall_entries() == wentries0 {
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(30),
+            "reader never reached the prelude stall window"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+
+    // The racing write: fresh-shape overlay store on block 2, ACK +
+    // size publish while the reader is parked pre-snapshot.
+    let installs0 = squeezefs::fuse_client::METRICS
+        .overlay_installs
+        .load(AtomOrd::Relaxed);
+    write_at(
+        &h,
+        ino,
+        2 * BS,
+        &pattern[2 * BS as usize..2 * BS as usize + 8192],
+    )
+    .await;
+    assert!(
+        squeezefs::fuse_client::METRICS
+            .overlay_installs
+            .load(AtomOrd::Relaxed)
+            > installs0,
+        "the racing write never engaged the device overlay — this pins \
+         nothing (engagement law)"
+    );
+
+    // Move the reader from the prelude window into the VALIDATE gap
+    // (between its two post-read authority reads), then land the whole
+    // settle — publish + retire — inside that gap.
+    let ventries0 = squeezefs::fuse_client::test_read_validate_stall_entries();
+    squeezefs::fuse_client::set_test_read_validate_stall(true);
+    squeezefs::fuse_client::set_test_read_window_stall(false);
+    let t1 = std::time::Instant::now();
+    while squeezefs::fuse_client::test_read_validate_stall_entries() == ventries0 {
+        assert!(
+            t1.elapsed() < std::time::Duration::from_secs(30),
+            "reader never reached the validate gap"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    // The forced settle: freeze -> seed -> publish (map moves) -> retire,
+    // all while the reader sits between its two validation reads.
+    h.fs.test_settle_overlay_block(ino, 2, false)
+        .await
+        .expect("forced settle failed");
+    squeezefs::fuse_client::set_test_read_validate_stall(false);
+
+    let reply = reader.await.unwrap().expect("read failed");
+    let got = reply.data.as_ref();
+    assert_eq!(
+        got.len(),
+        16384,
+        "size 2*BS+8192 was published before the serve; the reply must \
+         cover the full window"
+    );
+    let base = (2 * BS - 8192) as usize;
+    for (i, &b) in got.iter().enumerate() {
+        assert_eq!(
+            b,
+            pattern[base + i],
+            "byte at file offset {} is wrong: the settle that landed inside \
+             the validate gap was invisible to both post-read authority \
+             reads (fingerprint pre-publish, probe post-retire) — the \
+             inverted-probe-order arm of generic/795",
+            base + i
+        );
+    }
+}
+
+/// generic/795 recopy storm — the SETTLE-WEDGE face (the 2026-08-15
+/// re-falsification, arm 1 of 2, tape: `ovl-settle-oldread-FAIL ...
+/// err=UnexpectedEof "short read: kernel returned 8192 of 65536"` in a
+/// forever loop, every write to the block EIO, the storm's coverage
+/// deadline tripped): an overwrite overlay record whose captured old
+/// binding is a RAW short image RESIDENT AT THE BACKING'S TAIL (the
+/// staged->striped conversion publishes the partial tail block as a raw
+/// key with an image shorter than the block — the storm's block-1 shape
+/// on every cycle) cannot settle: the gap-seed's old-image fetch reads
+/// the whole device window, the file-backed substrate answers a SHORT
+/// read past its tail, the exact-length contract fails it loud, and the
+/// record wedges Frozen — every write to the block settles-and-fails
+/// (EIO) forever, every read-path drain likewise. The old image's
+/// missing tail is the never-written device region — holes both
+/// consumers already seed as zeros — so the honest disposition is the
+/// readable PREFIX, not an error. Forced here by truncating the backing
+/// to the image's end (the exact field shape: the allocation frontier
+/// sits beyond the backing tail after churn).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tail_resident_short_old_image_never_wedges_the_settle() {
+    let h = Arc::new(make().await);
+    squeezefs::device_overlay::set_device_overlay_for_tests(true, true);
+
+    let ino = create(&h, "ovl_shortold").await;
+    let pattern: Vec<u8> = (0..(BS + 8192) as usize)
+        .map(|i| (i % 251) as u8 ^ 0x5A)
+        .collect();
+    // ONE write past the stripe threshold: the staged->striped conversion
+    // publishes block 0 full and block 1 as the PARTIAL tail — a raw key
+    // with an 8192-byte stored image (the storm's per-cycle shape).
+    write_at(&h, ino, 0, &pattern).await;
+    fsync(&h, ino).await;
+    let b1_off = {
+        let m =
+            h.fs.router
+                .metadata_cache
+                .get(&ino)
+                .expect("striped meta present");
+        assert_eq!(m.file_type, "striped", "fixture premise: striped layout");
+        let k = m
+            .block_map
+            .as_ref()
+            .and_then(|bm| bm.get(&1))
+            .expect("block 1 mapped")
+            .clone();
+        let off: u64 = k.parse().unwrap_or_else(|_| {
+            panic!(
+                "fixture premise moved: block 1's mapping is no longer a RAW \
+                 key ({k}) — re-derive the tail-resident short-image shape"
+            )
+        });
+        off
+    };
+
+    // Overwrite overlay on block 1 with gaps on both sides of one page:
+    // the settle owes the gaps the OLD image's bytes. Installed BEFORE
+    // the truncation below — the seam's store write extends the backing,
+    // and the field shape this pins has the OLD image at the tail with
+    // the record's dest on a RECYCLED offset elsewhere.
+    h.fs.test_install_overwrite_overlay(ino, 1, 8192, &pattern[..4096])
+        .await
+        .expect("overlay install");
+
+    // Truncate the backing to the OLD image's end: block 1's raw key now
+    // names a TAIL-RESIDENT short image — the settle's whole-window
+    // old-image read shorts (the exact field shape once the allocation
+    // frontier sits beyond the backing tail; in the field the dest is a
+    // recycled low offset, here the truncation stands in for that — the
+    // seam-stored covered page is sacrificed, so only the gap-seeded old
+    // bytes are asserted below).
+    h._b.as_file()
+        .set_len(b1_off + 8192)
+        .expect("backing truncate");
+
+    // Pre-fix: Err(UnexpectedEof "short read ...") forever — the record
+    // wedges Frozen and every write to the block EIOs (the storm's
+    // coverage-deadline face). Post-fix: the old-image fetch serves the
+    // readable PREFIX (its missing tail is the never-written device
+    // region = holes = zeros) and the settle publishes.
+    h.fs.test_settle_overlay_block(ino, 1, false)
+        .await
+        .expect("settle of a tail-resident short old image must not wedge");
+
+    // The old image's acked bytes survive the settle verbatim (served
+    // from the published dest's gap-seeded [0, 8192) range).
+    let got = read_at(&h, ino, BS, 8192).await;
+    assert_eq!(got.len(), 8192, "block-1 tail readable");
+    assert_eq!(
+        &got[..],
+        &pattern[BS as usize..(BS + 8192) as usize],
+        "block-1's acked bytes must survive the settle of a tail-resident \
+         short old image (generic/795 — the settle-wedge face)"
+    );
+}

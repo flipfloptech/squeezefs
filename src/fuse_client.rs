@@ -952,6 +952,55 @@ pub fn test_read_window_stall_entries() -> u64 {
     test_read_window_stall_entries_cell().load(Ordering::Relaxed)
 }
 
+/// TEST SEAM (read-VALIDATE stall): park the read loop's validation
+/// sequence BETWEEN its two post-read authority reads — the device-
+/// overlay registry probe and the custody fingerprint. The moving-custody
+/// transfer publishes destination-then-retires-source (map move `M`
+/// strictly before record retire `R`), so a reader that reads the
+/// FINGERPRINT first and the REGISTRY second leaves a gap a whole settle
+/// (`M` then `R`) can land inside: fingerprint captured pre-`M`, probe
+/// post-`R` — both blind, stale serve (the generic/795 recopy flake's
+/// residual arm, 2026-08-15 falsification). Probing in the REVERSE order
+/// of the publish makes the miss require `R < M` — a contradiction — so
+/// the seam, kept between the two reads, holds the ordering law pinnable
+/// forever. Setter-only; armed = park until cleared; one relaxed load
+/// when disarmed; never set in production.
+fn test_read_validate_stall_cell() -> &'static std::sync::atomic::AtomicU64 {
+    static CELL: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::atomic::AtomicU64::new(0))
+}
+
+/// Arm/disarm the read-validate stall seam (tests only).
+pub fn set_test_read_validate_stall(armed: bool) {
+    test_read_validate_stall_cell().store(u64::from(armed), Ordering::Relaxed);
+}
+
+fn test_read_validate_stall_entries_cell() -> &'static std::sync::atomic::AtomicU64 {
+    static CELL: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::atomic::AtomicU64::new(0))
+}
+
+/// Read the read-validate stall entry count (tests only).
+pub fn test_read_validate_stall_entries() -> u64 {
+    test_read_validate_stall_entries_cell().load(Ordering::Relaxed)
+}
+
+/// Park point shared by the two stall seams above (bounded 60 s so a
+/// wedged driver fails a suite loudly instead of hanging it).
+async fn test_stall_park(
+    cell: &std::sync::atomic::AtomicU64,
+    entries: &std::sync::atomic::AtomicU64,
+) {
+    if cell.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    entries.fetch_add(1, Ordering::Relaxed);
+    let t0 = std::time::Instant::now();
+    while cell.load(Ordering::Relaxed) != 0 && t0.elapsed() < std::time::Duration::from_secs(60) {
+        squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+}
+
 /// TEST SEAM (`SQUEEZEFS_TEST_ATTR_PUBLISH_STALL_MS`, the KD-5/KD-6
 /// attr-merge race pin — design-write-inode-convoy §4.4 rows 3/13/22):
 /// stall the write handler strictly AFTER its data phase completed
@@ -20018,20 +20067,12 @@ impl Filesystem for SqueezefsFilesystem {
         }
         // TEST SEAM: park this read strictly AFTER its entry overlay
         // compose/drain and BEFORE its size snapshot — see
-        // `set_test_read_window_stall`. Bounded park (60 s) so a wedged
-        // driver fails a suite loudly instead of hanging it.
-        {
-            let cell = test_read_window_stall_cell();
-            if cell.load(Ordering::Relaxed) != 0 {
-                test_read_window_stall_entries_cell().fetch_add(1, Ordering::Relaxed);
-                let t0 = std::time::Instant::now();
-                while cell.load(Ordering::Relaxed) != 0
-                    && t0.elapsed() < std::time::Duration::from_secs(60)
-                {
-                    squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(2)).await;
-                }
-            }
-        }
+        // `set_test_read_window_stall`.
+        test_stall_park(
+            test_read_window_stall_cell(),
+            test_read_window_stall_entries_cell(),
+        )
+        .await;
         // Serve-residence decomposition (read_serve_phase_ns, always-on):
         // t0 anchors `prelude` and `total`; the router records the inner
         // phases; `post_validate` covers the last iteration's overlay +
@@ -20469,6 +20510,13 @@ impl Filesystem for SqueezefsFilesystem {
             let bindings_after = self
                 .read_custody_fingerprint(None, &file_path, ino, offset, read_len)
                 .await;
+            // TEST SEAM: park between the two post-read authority reads
+            // (see `set_test_read_validate_stall` — the ordering-law pin).
+            test_stall_park(
+                test_read_validate_stall_cell(),
+                test_read_validate_stall_entries_cell(),
+            )
+            .await;
             // Defense #4: a LIVE overlay record inside the window means
             // acked bytes this compose could not see — drain it (the entry
             // drain's own verb; the settle publishes destination-before-

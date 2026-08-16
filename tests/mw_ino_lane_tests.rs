@@ -56,21 +56,24 @@ fn part(writers: u16, writer: u16) -> AppendPartition {
     AppendPartition::new(writers, writer).expect("legal partition")
 }
 
-/// Format the way `squeezefs format` does today — **without** bit 12
-/// (ruling D9: build the bit, do not stamp it).
+/// Format the SINGLE-WRITER (unstamped) class — the pre-flip default.
+/// This suite's lane contracts exercise bit 12 IN ISOLATION, so the base
+/// image must not carry the rest of the nine-bit set the rung-10b
+/// Phase-B default now stamps.
 async fn format_meta(path: &std::path::Path) {
-    format_v3(path, META_LEN, &opts())
+    squeezefs::meta_backend::kv::builder::format_v3_single_writer(path, META_LEN, &opts())
         .await
-        .expect("format v3 meta volume");
+        .expect("format v3 meta volume (single-writer class)");
 }
 
-/// [`format_meta`] plus the Phase-8 stamp.
+/// [`format_meta`] plus the isolated bit-12 stamp (the upgrade-verb act,
+/// applied alone).
 async fn format_meta_laned(path: &std::path::Path) {
     format_meta(path).await;
     assert!(
         set_ino_lanes_bit(path).await.expect("stamp bit 12"),
-        "a fresh format must NOT already carry bit 12 — stamping is the \
-         Phase-8 window's act, not format's"
+        "a single-writer-class format must NOT already carry bit 12 — \
+         stamping it here in isolation is this suite's whole point"
     );
 }
 
@@ -251,8 +254,9 @@ fn laned_locals_keep_global_ino_stability() {
 /// bit 8, which is silent on-disk ALIASING, not a merge inconvenience — so
 /// the four multi-writer format bits are pinned here: partitioned append 8,
 /// durable block refcounts 9, ino lanes 12, block-key incarnation 13,
-/// pairwise disjoint, all understood by this binary, and none of them
-/// stamped by `format`.
+/// pairwise disjoint, all understood by this binary — stamped by the
+/// DEFAULT `format` since the rung-10b Phase-B flip and by none of the
+/// `--single-writer` class.
 ///
 /// **Bits 12/13, not 10/11** — the same collision, caught a second time:
 /// bits **10** (writer-scoped staging keys, §6.2 item 8) and **11** (the S7
@@ -262,7 +266,7 @@ fn laned_locals_keep_global_ino_stability() {
 /// not yet contain: whichever branch lands first, the wave's two bits must
 /// stay outside `1 << 10 | 1 << 11` forever.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_multi_writer_format_bits_are_disjoint_and_unstamped() {
+async fn the_multi_writer_format_bits_are_disjoint_and_class_scoped() {
     assert_eq!(FEATURE_INCOMPAT_KV_PARTITIONED_APPEND, 1 << 8);
     assert_eq!(FEATURE_INCOMPAT_KV_BLOCK_REFCOUNTS, 1 << 9);
     assert_eq!(
@@ -317,8 +321,24 @@ async fn the_multi_writer_format_bits_are_disjoint_and_unstamped() {
         sb.features_incompat
             & (FEATURE_INCOMPAT_KV_INO_LANES | FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION),
         0,
-        "format must stamp neither bit 12 nor bit 13 — the batched Phase-8 reformat \
-         window owns that act (ruling D9)"
+        "a --single-writer format must stamp neither bit 12 nor bit 13 — the \
+         upgrade verb (or the stamped default class) owns that act"
+    );
+
+    // …and the DEFAULT format stamps BOTH, as part of the one-act nine-bit
+    // set (rung 10b — the Phase-B flip).
+    let mw = NamedTempFile::new().unwrap();
+    format_v3(mw.path(), META_LEN, &opts())
+        .await
+        .expect("default format");
+    let VolumeFormat::V3(sb) = classify_volume(mw.path()).await.unwrap() else {
+        panic!("expected v3");
+    };
+    assert_eq!(
+        sb.features_incompat
+            & (FEATURE_INCOMPAT_KV_INO_LANES | FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION),
+        FEATURE_INCOMPAT_KV_INO_LANES | FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION,
+        "the default format stamps bits 12 and 13 (the Phase-B flip)"
     );
 }
 

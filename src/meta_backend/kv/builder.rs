@@ -119,12 +119,14 @@ pub struct ImageBuilder {
     /// `KV_GUEST_SLOTS` (bit 2). `None` (the default) builds the legacy
     /// byte-identical image.
     membership_stamp: Option<super::checkpoint::MembershipStamp>,
-    /// KD-MW-1 Phase A (`format --multi-writer`,
-    /// docs/design-full-multi-writer.md §6.2 pt 1): stamp the whole
-    /// nine-bit [`super::superblock::MULTI_WRITER_FORMAT_BITS`] set on
-    /// the planned superblock — ONE plan, ONE superblock write, no
-    /// ordering problem. `false` (the default) keeps today's posture
-    /// byte-identical; the Phase-B default flip is rung 10b's act.
+    /// KD-MW-1 (docs/design-full-multi-writer.md §6.2 pt 1): stamp the
+    /// whole nine-bit [`super::superblock::MULTI_WRITER_FORMAT_BITS`]
+    /// set on the planned superblock — ONE plan, ONE superblock write,
+    /// no ordering problem. The BUILDER default stays `false` (its
+    /// determinism contract — the low-level image is the unstamped
+    /// class); since the rung-10b Phase-B flip the PUBLIC formatters
+    /// (`format_v3`/`format_v3_stamped`) set it, and the single-writer
+    /// opt-out variants are what withhold it.
     multi_writer: bool,
 }
 
@@ -167,13 +169,14 @@ impl ImageBuilder {
         self.membership_stamp = Some(stamp);
     }
 
-    /// Make the built image MULTI-WRITER-CAPABLE (KD-MW-1 Phase A): the
+    /// Make the built image MULTI-WRITER-CAPABLE (KD-MW-1; the DEFAULT
+    /// public-formatter class since the rung-10b Phase-B flip): the
     /// planned superblock carries all nine
     /// [`super::superblock::MULTI_WRITER_FORMAT_BITS`] — the one-act
     /// stamp, never piecemeal (the bit-9 lesson generalized). The bit-9
     /// member also plants the empty `TREE_BLOCK_REFS` root at format, so
-    /// a `--multi-writer` image needs no structural mutation at first
-    /// mount beyond the existing minting acts.
+    /// a stamped image needs no structural mutation at first mount
+    /// beyond the existing minting acts.
     pub fn set_multi_writer(&mut self) {
         self.multi_writer = true;
     }
@@ -470,13 +473,15 @@ impl ImageBuilder {
         }
 
         // **Test seam** (`SQUEEZEFS_TEST_STAMP_BLOCK_REFS=1`): stamp
-        // incompat bit 8 at format so a suite can exercise the DURABLE
-        // block-accounting path end to end. Production formats never carry
-        // it (ruling D9 — `SuperblockV3::plan` omits it, and the reason is a
-        // safety property: see the constant's doc), so this is the only way
-        // to point the existing write-path suites at the ledger and let the
+        // incompat bit 9 at format so a suite can exercise the DURABLE
+        // block-accounting path end to end on an otherwise SINGLE-WRITER
+        // (unstamped-class) build. Historically this was the only way to
+        // point the write-path suites at the ledger and let the
         // §6.2-item-1 oracle grade the wiring — which is exactly how the
-        // remaining drift was found and closed.
+        // remaining drift was found and closed; since the rung-10b Phase-B
+        // flip the DEFAULT format carries the bit anyway, so the seam's
+        // remaining job is engaging the ledger under the `--single-writer`
+        // class in isolation.
         //
         // Read through the ONE env-knob convention (ENG-10 — registered in
         // `env_knobs::KNOBS`, so a malformed value refuses at startup rather
@@ -491,9 +496,10 @@ impl ImageBuilder {
         // **Test seam** (`SQUEEZEFS_TEST_STAMP_WRITER_SCOPE=1`): stamp
         // incompat bit 10 (§6.2 items 8/10 — writer-scoped staging) at
         // format, the same posture and for the same reason as the block-refs
-        // seam above: production formats never carry it (ruling D9), so this
-        // is the only way to point the staging/extent/recovery suites at the
-        // scoped key + node-scoped stamp path end to end.
+        // seam above: it points the staging/extent/recovery suites at the
+        // scoped key + node-scoped stamp path IN ISOLATION on a
+        // single-writer-class build (the default format carries the bit
+        // since the rung-10b flip).
         if crate::env_knobs::bool_knob("SQUEEZEFS_TEST_STAMP_WRITER_SCOPE", false) {
             sb.features_incompat |= super::superblock::FEATURE_INCOMPAT_KV_WRITER_SCOPED_STAGING;
         }
@@ -569,9 +575,12 @@ impl ImageBuilder {
             alloc_bitmap_generation: 1,
             node_seq_watermark,
             membership_stamp: self.membership_stamp.clone(),
-            // Ruling D9: format never stamps the partitioned-append bit,
-            // so a fresh volume's bootstrap record is the pre-partition
-            // (suffix-less) form — byte-identical to the shipped image.
+            // A fresh volume's bootstrap record is the pre-partition
+            // (suffix-less) form regardless of the stamped bits: bit 8's
+            // partition ADOPTION of pre-partition records is a first-
+            // writable-mount minting act (design-full-multi-writer §6.2
+            // pt 3), and the single-writer class stays byte-identical to
+            // the pre-flip shipped image.
             append_partition: None,
         };
         write_ledger_slot(path, sb.root_ledger.start, &ledger).await?;
@@ -965,20 +974,16 @@ pub async fn format_preflight(
 /// is a SINGLE-MEMBER dynamic-routing set (synthesized stamp, derived
 /// width — design-dynamic-meta-routing §5.1); multi-member sets format
 /// each member through [`format_v3_stamped`] with one shared plan.
+///
+/// Since the rung-10b **Phase-B default flip** (KD-MW-1,
+/// design-full-multi-writer §6.2 pt 1; user ruling 2026-08-15) the
+/// built image is MULTI-WRITER-CAPABLE: all nine
+/// [`super::superblock::MULTI_WRITER_FORMAT_BITS`] land in the one
+/// planned superblock write. The stamped class mounts solo verbatim
+/// (the stamped-solo S4 gate's posture); the unstamped class — for
+/// recovery-scratch volumes and pre-mw-binary compatibility — is the
+/// explicit [`format_v3_single_writer`] opt-out.
 pub async fn format_v3(
-    path: &Path,
-    volume_len: u64,
-    opts: &FormatV3Options,
-) -> Result<BuiltImage, crate::error::SqueezefsError> {
-    format_v3_inner(path, volume_len, opts, None, false).await
-}
-
-/// [`format_v3`] through the KD-MW-1 Phase-A `--multi-writer` arm: the
-/// built (single-member) image carries all nine
-/// [`super::superblock::MULTI_WRITER_FORMAT_BITS`] — one plan, one
-/// superblock write (design-full-multi-writer §6.2 pt 1). The default
-/// formatter stays today's posture until the rung-10b Phase-B flip.
-pub async fn format_v3_multi_writer(
     path: &Path,
     volume_len: u64,
     opts: &FormatV3Options,
@@ -986,33 +991,52 @@ pub async fn format_v3_multi_writer(
     format_v3_inner(path, volume_len, opts, None, true).await
 }
 
+/// [`format_v3`] through the `--single-writer` opt-out (rung 10b): the
+/// built image is the UNSTAMPED class — today's pre-flip fresh-format
+/// feature word, byte-identical — readable by pre-multi-writer binaries.
+/// The opt-out exists for the format-CLASS boundary only: a stamped
+/// volume mounts solo verbatim, so repair/fsck never needs this
+/// (design-full-multi-writer §6.2 pt 1). Upgrade later with
+/// `squeezefs volume enable-multi-writer`.
+pub async fn format_v3_single_writer(
+    path: &Path,
+    volume_len: u64,
+    opts: &FormatV3Options,
+) -> Result<BuiltImage, crate::error::SqueezefsError> {
+    format_v3_inner(path, volume_len, opts, None, false).await
+}
+
 /// [`format_v3`] for one member of a multi-volume set (PR VL5a,
 /// design-volume-lifecycle §5.5.1a): the built image carries the
 /// caller's `stamp` (one shared [`crate::meta_backend::MetaSlotPlan`]
 /// across the set) in its bootstrap ledger record, plus the stamp bits
-/// on its superblock.
+/// on its superblock. Stamps the nine mw bits like [`format_v3`] (the
+/// Phase-B default class). Also the `volume add-meta` stamp-to-match
+/// arm (design-full-multi-writer §6.2 interaction rule 1): a fresh
+/// member joining a bit-11-uniform set formats through this — one plan,
+/// one superblock write, no marker needed.
 pub async fn format_v3_stamped(
     path: &Path,
     volume_len: u64,
     opts: &FormatV3Options,
     stamp: super::checkpoint::MembershipStamp,
 ) -> Result<BuiltImage, crate::error::SqueezefsError> {
-    format_v3_inner(path, volume_len, opts, Some(stamp), false).await
+    format_v3_inner(path, volume_len, opts, Some(stamp), true).await
 }
 
-/// [`format_v3_stamped`] through the KD-MW-1 Phase-A `--multi-writer` arm
-/// (see [`format_v3_multi_writer`]): one set member, all nine mw bits on
-/// its planned superblock. Also the `volume add-meta` stamp-to-match arm
-/// (design-full-multi-writer §6.2 interaction rule 1): a fresh member
-/// joining a bit-11-uniform set formats through this — one plan, one
-/// superblock write, no marker needed.
-pub async fn format_v3_stamped_multi_writer(
+/// [`format_v3_stamped`] through the `--single-writer` opt-out (see
+/// [`format_v3_single_writer`]): one set member, NONE of the mw bits on
+/// its planned superblock — the pre-flip class. Also the `volume
+/// add-meta` match arm for growing a NON-upgraded set: the §6.2 bit-11
+/// uniformity law reads at the add, so a fresh member joining an
+/// unstamped set must format unstamped.
+pub async fn format_v3_stamped_single_writer(
     path: &Path,
     volume_len: u64,
     opts: &FormatV3Options,
     stamp: super::checkpoint::MembershipStamp,
 ) -> Result<BuiltImage, crate::error::SqueezefsError> {
-    format_v3_inner(path, volume_len, opts, Some(stamp), true).await
+    format_v3_inner(path, volume_len, opts, Some(stamp), false).await
 }
 
 async fn format_v3_inner(

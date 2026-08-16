@@ -4,10 +4,15 @@
 //!
 //! Contracts pinned here BEFORE any implementation:
 //!
-//! - **Phase A (dark opt-in)**: `format --multi-writer` stamps all nine at
-//!   plan time (one plan, one superblock write); the DEFAULT format stays
-//!   today's posture exactly (bits 0/1/6/7 — the Phase-B flip is rung 10b's,
-//!   deliberately NOT this rung's).
+//! - **Phase B (rung 10b — the DEFAULT FLIP, user ruling 2026-08-15)**:
+//!   the DEFAULT `format` stamps all nine at plan time (one plan, one
+//!   superblock write); `--single-writer` is the explicit opt-out that
+//!   formats the pre-flip unstamped class (of the mw set only bit 7, a
+//!   pre-mw fresh-format default, remains); `--multi-writer` survives
+//!   announced-inert; the contradictory pair refuses loud. (Phase A's
+//!   dark `--multi-writer` opt-in was rung 5's; this suite's enable-verb
+//!   contracts run against the single-writer class — the class the verb
+//!   exists to upgrade.)
 //! - **`volume enable-multi-writer`** (offline, D0-guarded, the add-meta
 //!   posture): per-volume bit order 7→9→15→12→13→8→10→14→11 (13 after 7 per
 //!   its own refusal law; 11 deliberately TERMINAL), each stamp barriered,
@@ -43,7 +48,8 @@ use squeezefs::config_ops::{
 };
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::builder::{
-    format_v3, format_v3_multi_writer, format_v3_stamped, FormatV3Options,
+    format_v3, format_v3_single_writer, format_v3_stamped, format_v3_stamped_single_writer,
+    FormatV3Options,
 };
 use squeezefs::meta_backend::kv::superblock as sb;
 use squeezefs::meta_backend::kv::superblock::{
@@ -79,28 +85,25 @@ fn uris(metas: &[PathBuf]) -> Vec<String> {
     metas.iter().map(|p| p.display().to_string()).collect()
 }
 
-/// Format an n-member DEFAULT-posture set (today's fresh-format bits).
-async fn format_default_set(metas: &[PathBuf]) {
+/// Format an n-member SINGLE-WRITER (unstamped-class) set — the pre-flip
+/// posture this suite's enable-verb contracts exist to upgrade FROM.
+async fn format_single_writer_set(metas: &[PathBuf]) {
+    let plan = plan_meta_slot_set(metas.len()).expect("plan");
+    for (i, m) in metas.iter().enumerate() {
+        format_v3_stamped_single_writer(m, VOL_LEN, &opts(), plan.stamps[i].clone())
+            .await
+            .expect("format single-writer member");
+    }
+}
+
+/// Format an n-member multi-writer-capable set — the DEFAULT class since
+/// the rung-10b flip.
+async fn format_mw_set(metas: &[PathBuf]) {
     let plan = plan_meta_slot_set(metas.len()).expect("plan");
     for (i, m) in metas.iter().enumerate() {
         format_v3_stamped(m, VOL_LEN, &opts(), plan.stamps[i].clone())
             .await
-            .expect("format default member");
-    }
-}
-
-/// Format an n-member set through the Phase-A `--multi-writer` arm.
-async fn format_mw_set(metas: &[PathBuf]) {
-    let plan = plan_meta_slot_set(metas.len()).expect("plan");
-    for (i, m) in metas.iter().enumerate() {
-        squeezefs::meta_backend::kv::builder::format_v3_stamped_multi_writer(
-            m,
-            VOL_LEN,
-            &opts(),
-            plan.stamps[i].clone(),
-        )
-        .await
-        .expect("format mw member");
+            .expect("format mw member");
     }
 }
 
@@ -115,9 +118,9 @@ fn has_all_nine(features: u64) -> bool {
     features & MULTI_WRITER_FORMAT_BITS == MULTI_WRITER_FORMAT_BITS
 }
 
-fn has_none_beyond_default(features: u64) -> bool {
-    // Today's fresh-format posture is bits 0/1/6/7 (+2/4 on stamped set
-    // members): of the mw set only bit 7 may be present by default.
+fn has_none_beyond_single_writer(features: u64) -> bool {
+    // The single-writer (pre-flip) posture is bits 0/1/6/7 (+2/4 on
+    // stamped set members): of the mw set only bit 7 may be present.
     features & (MULTI_WRITER_FORMAT_BITS & !sb::FEATURE_INCOMPAT_KV_DURABLE_TERM) == 0
 }
 
@@ -133,40 +136,48 @@ async fn read_marker(vol0: &Path) -> Option<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
-// Phase A: `format --multi-writer` stamps all nine; default stamps none.
+// Phase B (rung 10b): the DEFAULT format stamps all nine;
+// `--single-writer` stamps none.
 // ---------------------------------------------------------------------------
 
-/// §6.2 pt 1 Phase A — the dark opt-in: the mw arm stamps all NINE bits in
-/// one plan/one superblock write, and the default format's feature word is
-/// byte-for-byte today's posture (the Phase-B flip is rung 10b's act).
+/// §6.2 pt 1 Phase B — the flip's library equality pin: the DEFAULT
+/// formatter stamps all NINE bits in one plan/one superblock write, the
+/// `--single-writer` opt-out's feature word is byte-for-byte the pre-flip
+/// posture, and the two classes differ by EXACTLY the nine-bit mask.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn format_multi_writer_stamps_all_nine_and_default_stays_todays_posture() {
+async fn format_default_stamps_all_nine_and_single_writer_stays_the_preflip_posture() {
     let dir = tempfile::tempdir().unwrap();
 
-    let default_vol = make_file(dir.path(), "default.meta");
-    format_v3(&default_vol, VOL_LEN, &opts())
+    let sw_vol = make_file(dir.path(), "sw.meta");
+    format_v3_single_writer(&sw_vol, VOL_LEN, &opts())
         .await
-        .expect("default format");
-    let feat = features_of(&default_vol).await;
+        .expect("single-writer format");
+    let sw_feat = features_of(&sw_vol).await;
     assert!(
-        has_none_beyond_default(feat),
-        "Phase-A pin: the DEFAULT format must stamp none of the mw bits \
-         beyond today's posture (got {feat:#x})"
+        has_none_beyond_single_writer(sw_feat),
+        "--single-writer must stamp none of the mw bits beyond the pre-flip \
+         posture (got {sw_feat:#x})"
     );
     assert_ne!(
-        feat & sb::FEATURE_INCOMPAT_KV_DURABLE_TERM,
+        sw_feat & sb::FEATURE_INCOMPAT_KV_DURABLE_TERM,
         0,
-        "bit 7 is today's fresh-format default and must stay"
+        "bit 7 is a pre-mw fresh-format default and must stay"
     );
 
     let mw_vol = make_file(dir.path(), "mw.meta");
-    format_v3_multi_writer(&mw_vol, VOL_LEN, &opts())
+    format_v3(&mw_vol, VOL_LEN, &opts())
         .await
-        .expect("mw format");
+        .expect("default format");
     let feat = features_of(&mw_vol).await;
     assert!(
         has_all_nine(feat),
-        "--multi-writer must stamp all nine bits (got {feat:#x})"
+        "the DEFAULT format must stamp all nine bits (got {feat:#x})"
+    );
+    assert_eq!(
+        feat,
+        sw_feat | MULTI_WRITER_FORMAT_BITS,
+        "the two classes differ by EXACTLY the nine-bit mask — the flip \
+         changes the format default and nothing else"
     );
 
     // The nine are exactly bits 7..=15 — the §6.1 set, pinned as a mask so
@@ -200,7 +211,7 @@ async fn enable_multi_writer_stamps_ordered_idempotent_and_deletes_the_marker() 
         make_file(dir.path(), "m0.meta"),
         make_file(dir.path(), "m1.meta"),
     ];
-    format_default_set(&metas).await;
+    format_single_writer_set(&metas).await;
     let paths = uris(&metas);
 
     let report = enable_multi_writer(&paths).await.expect("enable");
@@ -251,7 +262,7 @@ async fn mw_s1_crash_between_volumes_refuses_writable_and_resumes() {
         make_file(dir.path(), "m0.meta"),
         make_file(dir.path(), "m1.meta"),
     ];
-    format_default_set(&metas).await;
+    format_single_writer_set(&metas).await;
     let paths = uris(&metas);
 
     // Kill after volume 0's terminal bit (bit 11), before volume 1's first.
@@ -271,7 +282,7 @@ async fn mw_s1_crash_between_volumes_refuses_writable_and_resumes() {
 
     // State on media: volume 0 fully stamped, volume 1 untouched, marker up.
     assert!(has_all_nine(features_of(&metas[0]).await));
-    assert!(has_none_beyond_default(features_of(&metas[1]).await));
+    assert!(has_none_beyond_single_writer(features_of(&metas[1]).await));
     assert!(
         read_marker(&metas[0]).await.is_some(),
         "marker survives the crash"
@@ -320,7 +331,7 @@ async fn mw_s1b_kill_between_every_adjacent_bit_pair_refuses_then_resumes() {
     for bits_done in 0..=9usize {
         let dir = tempfile::tempdir().unwrap();
         let meta = make_file(dir.path(), "m0.meta");
-        format_default_set(std::slice::from_ref(&meta)).await;
+        format_single_writer_set(std::slice::from_ref(&meta)).await;
         let paths = uris(std::slice::from_ref(&meta));
 
         let hooks = EnableMwHooks {
@@ -405,7 +416,7 @@ async fn mw_s1b_kill_between_every_adjacent_bit_pair_refuses_then_resumes() {
 async fn mw_s2_first_writable_mount_minting_acts_fire_and_are_idempotent() {
     let dir = tempfile::tempdir().unwrap();
     let meta = make_file(dir.path(), "m0.meta");
-    format_default_set(std::slice::from_ref(&meta)).await;
+    format_single_writer_set(std::slice::from_ref(&meta)).await;
     let paths = uris(std::slice::from_ref(&meta));
     enable_multi_writer(&paths).await.expect("enable");
 
@@ -479,9 +490,7 @@ async fn mw_s3_all_nine_bits_are_known_and_unknown_bits_refuse() {
     // same one THIS binary applies to bits above its own mask: pin it.
     let dir = tempfile::tempdir().unwrap();
     let meta = make_file(dir.path(), "m0.meta");
-    format_v3_multi_writer(&meta, VOL_LEN, &opts())
-        .await
-        .expect("mw format");
+    format_v3(&meta, VOL_LEN, &opts()).await.expect("mw format");
     let VolumeFormat::V3(mut sbv) = classify_volume(&meta).await.expect("classify") else {
         panic!("v3 expected");
     };
@@ -514,7 +523,7 @@ async fn shape_c_partial_populations_never_trip_the_gate() {
     ] {
         let dir = tempfile::tempdir().unwrap();
         let meta = make_file(dir.path(), "m0.meta");
-        format_default_set(std::slice::from_ref(&meta)).await;
+        format_single_writer_set(std::slice::from_ref(&meta)).await;
         for bit in bits {
             match bit {
                 5 => sb::set_layout_deltas_bit(&meta).await.map(|_| ()),
@@ -546,7 +555,7 @@ async fn shape_c_partial_populations_never_trip_the_gate() {
 async fn orphan_bit_11_without_the_other_eight_refuses_naming_fsck() {
     let dir = tempfile::tempdir().unwrap();
     let meta = make_file(dir.path(), "m0.meta");
-    format_default_set(std::slice::from_ref(&meta)).await;
+    format_single_writer_set(std::slice::from_ref(&meta)).await;
     sb::set_multi_writer_data_bit(&meta)
         .await
         .expect("stamp 11");
@@ -605,12 +614,12 @@ async fn add_meta_onto_a_multi_writer_set_stamps_the_new_member_to_match() {
 async fn add_meta_of_a_bit_11_volume_into_a_non_upgraded_set_refuses() {
     let dir = tempfile::tempdir().unwrap();
     let metas = [make_file(dir.path(), "m0.meta")];
-    format_default_set(&metas).await;
+    format_single_writer_set(&metas).await;
     let paths = uris(&metas);
 
     // A foreign mw volume (its own single-member format).
     let foreign = make_file(dir.path(), "foreign.meta");
-    format_v3_multi_writer(&foreign, VOL_LEN, &opts())
+    format_v3(&foreign, VOL_LEN, &opts())
         .await
         .expect("foreign mw format");
 
@@ -636,7 +645,7 @@ async fn add_meta_of_a_bit_11_volume_into_a_non_upgraded_set_refuses() {
 async fn concurrent_enable_invocation_refuses_on_the_d0_guard() {
     let dir = tempfile::tempdir().unwrap();
     let meta = make_file(dir.path(), "m0.meta");
-    format_default_set(std::slice::from_ref(&meta)).await;
+    format_single_writer_set(std::slice::from_ref(&meta)).await;
     let paths = uris(std::slice::from_ref(&meta));
 
     // A concurrent holder of volume 0's D0 guard (what a live first
@@ -647,7 +656,10 @@ async fn concurrent_enable_invocation_refuses_on_the_d0_guard() {
         .expect_err("a second invocation refuses on the D0 guard");
     let msg = err.to_string();
     // The refusal happened BEFORE the verb's first write: no marker, no bit.
-    assert!(has_none_beyond_default(features_of(&meta).await), "{msg}");
+    assert!(
+        has_none_beyond_single_writer(features_of(&meta).await),
+        "{msg}"
+    );
     holder.shutdown().await.expect("release");
     assert!(
         read_marker(&meta).await.is_none(),
@@ -691,28 +703,6 @@ async fn concurrent_enable_invocation_refuses_on_the_d0_guard() {
 // refuse loud (two contradictory format-class declarations — guessing
 // either way silently formats the class the operator did NOT ask for).
 // ---------------------------------------------------------------------------
-
-/// The library face of the flip: the DEFAULT formatter stamps all nine —
-/// the multi-writer-capable class IS the default class. (The
-/// single-writer opt-out's equality half — its feature word is the
-/// default's minus exactly the nine-bit mask — is pinned below once the
-/// opt-out API exists; the CLI pin `cli_single_writer_formats_the_unstamped_class`
-/// is its red-first face.)
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn phase_b_default_format_stamps_all_nine() {
-    let dir = tempfile::tempdir().unwrap();
-
-    let default_vol = make_file(dir.path(), "default.meta");
-    format_v3(&default_vol, VOL_LEN, &opts())
-        .await
-        .expect("default format");
-    let default_feat = features_of(&default_vol).await;
-    assert!(
-        has_all_nine(default_feat),
-        "Phase-B pin: the DEFAULT format stamps all nine mw bits \
-         (got {default_feat:#x})"
-    );
-}
 
 /// CLI pins drive the real binary (the house CLI-test pattern —
 /// `CARGO_BIN_EXE_squeezefs`); format needs no mount support.
@@ -811,8 +801,9 @@ mod phase_b_cli {
         );
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
-            stdout.contains("single-writer"),
-            "the opt-out announces its class (and the upgrade verb): {stdout}"
+            stdout.to_lowercase().contains("single-writer")
+                && stdout.contains("enable-multi-writer"),
+            "the opt-out announces its class and the upgrade verb: {stdout}"
         );
         let _ = std::fs::remove_dir_all(&base);
     }

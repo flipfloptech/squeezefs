@@ -177,6 +177,10 @@ fn opts() -> squeezefs::meta_backend::kv::builder::FormatV3Options {
 /// One "node's" formatted + opened metadata volume set. `stamp` runs
 /// between format and open, because a mount reads the superblock ONCE (at
 /// open) — which is also why the Phase-8 reformat window is an offline act.
+/// The base is the SINGLE-WRITER (unstamped) class: this suite arms the
+/// capability bits explicitly through [`stamp_capabilities`], and its
+/// refusal arms need them absent (the rung-10b DEFAULT format stamps all
+/// nine).
 async fn sandbox(dir: &Path, tag: &str, volumes: usize) -> (Arc<RoutedMetaBackend>, Vec<PathBuf>) {
     sandbox_stamped(dir, tag, volumes, false).await
 }
@@ -192,7 +196,7 @@ async fn sandbox_stamped(
     let mut paths = Vec::new();
     for i in 0..volumes {
         let p = make_file(dir, &format!("{tag}-meta{i}"), VOL_LEN);
-        squeezefs::meta_backend::kv::builder::format_v3_stamped(
+        squeezefs::meta_backend::kv::builder::format_v3_stamped_single_writer(
             &p,
             VOL_LEN,
             &opts(),
@@ -832,10 +836,10 @@ async fn the_mount_arm_refuses_a_non_pr_substrate() {
 }
 
 /// Contract (ruling **D9**): the arm refuses a format that does not carry
-/// the capability bits — which is EVERY volume in the field, because
-/// nothing stamps them. The refusal names the missing bit and its offline
-/// stamping path, so the operator knows what the Phase-8 reformat window
-/// owes.
+/// the capability bits — pre-flip field volumes and `--single-writer`
+/// formats (the rung-10b DEFAULT stamps them). The refusal names the
+/// missing bit and its offline stamping path, so the operator knows the
+/// `enable-multi-writer` upgrade is owed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_mount_arm_refuses_an_unstamped_format_naming_the_bit() {
     use squeezefs::meta_backend::reservation::{
@@ -844,8 +848,9 @@ async fn the_mount_arm_refuses_an_unstamped_format_naming_the_bit() {
     let _serial = serial();
     let _restore = restore();
     let dir = TempDir::new().unwrap();
-    // A FRESH format: `SuperblockV3::plan` deliberately stamps none of the
-    // multi-writer bits (D9).
+    // A `--single-writer`-class format: none of the multi-writer bits
+    // (the rung-10b DEFAULT format stamps all nine, so the unstamped
+    // shape is now the explicit opt-out's).
     let (routed, _paths) = sandbox(dir.path(), "nobit", 1).await;
     let data = dir.path().join("nobit-data");
     std::fs::File::create(&data)

@@ -328,11 +328,13 @@ pub const FEATURE_INCOMPAT_KV_WRITER_SCOPED_STAGING: u64 = 1 << WRITER_SCOPED_ST
 /// live peer published ahead of the durable references. It takes no bit of
 /// its own — this program has already had five parallel claims.
 ///
-/// **Presence is OPTIONAL and nothing stamps it** (ruling **D9**, the
-/// bit-7/8/9 posture): [`SuperblockV3::plan`] does not set it, mount does
-/// not set it, and no runtime path sets it — [`set_multi_writer_data_bit`]
-/// is the sole stamping path, for the Phase-8 window that lands the §6.2
-/// format changes together. A volume without it behaves exactly as today
+/// **Presence is OPTIONAL** (ruling **D9**, the bit-7/8/9 posture):
+/// [`SuperblockV3::plan`] does not set it and mount does not set it.
+/// Since the rung-10b **Phase-B flip** the public formatters stamp it as
+/// part of the one-act nine-bit [`MULTI_WRITER_FORMAT_BITS`] default
+/// (`--single-writer` opts out — never this bit alone), and
+/// [`set_multi_writer_data_bit`] is the `enable-multi-writer` upgrade
+/// path's TERMINAL stamp. A volume without it behaves exactly as before
 /// and `SQUEEZEFS_MULTI_WRITER=1` refuses the mount loud, naming the bit.
 ///
 /// Old binaries refuse a bit-11 volume loud via their own
@@ -458,10 +460,12 @@ pub const FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION: u64 = 1 << 13;
 /// behaviour is therefore byte-identical — no new key, no changed claim
 /// bytes — which `tests/dlm_membership_tests.rs` pins.
 ///
-/// **Presence is OPTIONAL and nothing stamps it** (ruling D9, the
-/// bit-7/8/9/10/11 posture): [`SuperblockV3::plan`] does not set it, mount
-/// does not set it, and no runtime path sets it — [`set_claim_set_bit`] is
-/// the sole stamping path, for the Phase-8 batched reformat window.
+/// **Presence is OPTIONAL** (ruling D9, the bit-7/8/9/10/11 posture):
+/// [`SuperblockV3::plan`] does not set it and mount does not set it.
+/// Since the rung-10b Phase-B flip the public formatters stamp it as part
+/// of the one-act nine-bit [`MULTI_WRITER_FORMAT_BITS`] default
+/// (`--single-writer` opts out), and [`set_claim_set_bit`] is the
+/// `enable-multi-writer` upgrade path's stamp.
 ///
 /// Old binaries refuse a bit-12 volume loud via their own
 /// [`FEATURES_INCOMPAT_KNOWN`] gate — exactly right: they would read a set
@@ -521,8 +525,10 @@ pub const FEATURE_INCOMPAT_KV_LAYOUT_VERSIONS: u64 = 1 << 15;
 /// set), 15 (layout versions).
 ///
 /// The bit-9 lesson generalized: a PARTIALLY-engaged multi-writer format
-/// is the dangerous state, so the nine stamp as ONE act — `format
-/// --multi-writer` (all nine in one planned superblock write) or the
+/// is the dangerous state, so the nine stamp as ONE act — the DEFAULT
+/// `format` (all nine in one planned superblock write; the rung-10b
+/// Phase-B flip, with `--single-writer` the explicit unstamped-class
+/// opt-out) or the
 /// ordered, crash-resumable `squeezefs volume enable-multi-writer` verb
 /// (per-volume order 7→9→15→12→13→8→10→14→11, bit 11 deliberately
 /// TERMINAL so *"bit 11 set ⇒ all nine set"* is an invariant the mount

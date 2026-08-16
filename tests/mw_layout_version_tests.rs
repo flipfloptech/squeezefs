@@ -94,8 +94,11 @@ fn make_file(dir: &Path, name: &str, len: u64) -> PathBuf {
     p
 }
 
+/// Single-writer (unstamped) class: this suite exercises bit 15 IN
+/// ISOLATION, so the base must not carry the nine-bit set the rung-10b
+/// Phase-B default now stamps.
 async fn format_meta(path: &Path) {
-    squeezefs::meta_backend::kv::builder::format_v3(
+    squeezefs::meta_backend::kv::builder::format_v3_single_writer(
         path,
         VOL_LEN,
         &squeezefs::meta_backend::kv::builder::FormatV3Options {
@@ -110,13 +113,17 @@ async fn format_meta(path: &Path) {
     .expect("format v3");
 }
 
-/// Format + (optionally) stamp bit 15 — the Phase-8 upgrade shape a
-/// test volume is born in. Production `format` NEVER stamps it (D9).
+/// Format (single-writer class) + (optionally) stamp bit 15 — the
+/// isolated upgrade shape a test volume is born in. (The rung-10b DEFAULT
+/// format stamps bit 15 as part of the one-act nine-bit set.)
 async fn format_versioned(path: &Path, stamp: bool) {
     format_meta(path).await;
     if stamp {
         let newly = set_layout_versions_bit(path).await.expect("stamp bit 15");
-        assert!(newly, "fresh format must not carry bit 15 (ruling D9)");
+        assert!(
+            newly,
+            "a single-writer-class format must not already carry bit 15"
+        );
     }
 }
 
@@ -986,7 +993,8 @@ async fn make_fs(meta: &Path, stamp: bool) -> H {
     .unwrap();
     let router = DataRouter::new(dlm.clone(), cache, ba, nvme);
     let mut fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);
-    squeezefs::meta_backend::kv::builder::format_v3(
+    // Single-writer class: `stamp` below adds bit 15 in isolation.
+    squeezefs::meta_backend::kv::builder::format_v3_single_writer(
         meta,
         128 * 1024 * 1024,
         &squeezefs::meta_backend::kv::builder::FormatV3Options {

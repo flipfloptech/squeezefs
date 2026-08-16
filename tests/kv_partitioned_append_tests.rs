@@ -1195,15 +1195,17 @@ fn test_partitioned_append_bit_is_built_but_not_stamped() {
     );
 }
 
-/// The un-stamped path end to end: a volume this binary formats and mounts
-/// comes back with a **byte-identical superblock sector** — no bit 8, no
+/// The un-stamped path end to end: a volume this binary formats
+/// `--single-writer` (the unstamped class — the pre-flip default; since
+/// rung 10b the DEFAULT format stamps the nine mw bits) and mounts comes
+/// back with a **byte-identical superblock sector** — no bit 8, no
 /// partitioned structures, nothing new written. This is the ruling-D9
 /// guarantee ("an existing volume must mount and behave EXACTLY as today")
 /// pinned at the only place it can be observed.
 #[tokio::test]
 async fn test_unstamped_volume_mount_leaves_the_superblock_unchanged() {
     use squeezefs::meta_backend::kv::backend::KvMetaBackend;
-    use squeezefs::meta_backend::kv::builder::{format_v3, FormatV3Options};
+    use squeezefs::meta_backend::kv::builder::{format_v3_single_writer, FormatV3Options};
     use squeezefs::meta_backend::kv::superblock::{
         classify_sector0, classify_volume, VolumeFormat, FEATURE_INCOMPAT_KV_PARTITIONED_APPEND,
     };
@@ -1212,7 +1214,7 @@ async fn test_unstamped_volume_mount_leaves_the_superblock_unchanged() {
     const VOL_LEN: u64 = 64 * 1024 * 1024;
     let f = NamedTempFile::new().unwrap();
     f.as_file().set_len(VOL_LEN).unwrap();
-    format_v3(
+    format_v3_single_writer(
         f.path(),
         VOL_LEN,
         &FormatV3Options {

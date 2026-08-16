@@ -883,13 +883,24 @@ async fn set_scope_resolution_requires_a_unanimously_stamped_set() {
         full_wipe: false,
         format_config_xattr: None,
     };
-    squeezefs::meta_backend::kv::builder::format_v3(plain.path(), 96 * 1024 * 1024, &opts)
-        .await
-        .unwrap();
+    // Single-writer-class bases: the rung-10b DEFAULT format stamps the
+    // whole nine-bit set (bit 10 included), so the unscoped arm and the
+    // seam's isolated bit-10 arm both build on the explicit opt-out.
+    squeezefs::meta_backend::kv::builder::format_v3_single_writer(
+        plain.path(),
+        96 * 1024 * 1024,
+        &opts,
+    )
+    .await
+    .unwrap();
     std::env::set_var("SQUEEZEFS_TEST_STAMP_WRITER_SCOPE", "1");
-    squeezefs::meta_backend::kv::builder::format_v3(stamped.path(), 96 * 1024 * 1024, &opts)
-        .await
-        .unwrap();
+    squeezefs::meta_backend::kv::builder::format_v3_single_writer(
+        stamped.path(),
+        96 * 1024 * 1024,
+        &opts,
+    )
+    .await
+    .unwrap();
     std::env::remove_var("SQUEEZEFS_TEST_STAMP_WRITER_SCOPE");
 
     let p = plain.path().to_string_lossy().into_owned();
@@ -1895,7 +1906,9 @@ async fn staging_verbs_refuse_an_unscoped_set() {
     let _g = serial().await;
     let meta = NamedTempFile::new().unwrap();
     meta.as_file().set_len(96 * 1024 * 1024).unwrap();
-    squeezefs::meta_backend::kv::builder::format_v3(
+    // The unstamped (single-writer) class — the rung-10b default stamps
+    // bit 10, which would make this set SCOPED.
+    squeezefs::meta_backend::kv::builder::format_v3_single_writer(
         meta.path(),
         96 * 1024 * 1024,
         &squeezefs::meta_backend::kv::builder::FormatV3Options {

@@ -2507,8 +2507,9 @@ pub async fn add_meta_volume_with(
             // §6.2 interaction rule 1: growing a bit-11-uniform set stamps
             // the new member to match AS PART OF THE ADD — the fresh-format
             // arm (one plan, one superblock write; no marker needed, a
-            // fresh volume has no prior state to sequence through).
-            crate::meta_backend::kv::builder::format_v3_stamped_multi_writer(
+            // fresh volume has no prior state to sequence through). Since
+            // the rung-10b flip this is also just the default class.
+            crate::meta_backend::kv::builder::format_v3_stamped(
                 Path::new(device),
                 volume_len,
                 &opts,
@@ -2516,7 +2517,12 @@ pub async fn add_meta_volume_with(
             )
             .await?;
         } else {
-            crate::meta_backend::kv::builder::format_v3_stamped(
+            // The SAME uniformity law in the other direction: a
+            // non-upgraded (single-writer-class) set grows with an
+            // UNSTAMPED member — the rung-10b default would mint a
+            // bit-11 volume inside a non-upgraded set, exactly the
+            // mixed shape the mount gate refuses.
+            crate::meta_backend::kv::builder::format_v3_stamped_single_writer(
                 Path::new(device),
                 volume_len,
                 &opts,

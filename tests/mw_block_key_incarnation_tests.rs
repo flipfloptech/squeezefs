@@ -71,22 +71,26 @@ fn opts() -> FormatV3Options {
     }
 }
 
+/// Format the SINGLE-WRITER (unstamped) class — this suite exercises
+/// bit 13 IN ISOLATION, so the base image must not carry the nine-bit
+/// set the rung-10b Phase-B default now stamps.
 async fn format_meta(path: &std::path::Path) {
-    format_v3(path, META_LEN, &opts())
+    squeezefs::meta_backend::kv::builder::format_v3_single_writer(path, META_LEN, &opts())
         .await
-        .expect("format v3 meta volume");
+        .expect("format v3 meta volume (single-writer class)");
 }
 
-/// [`format_meta`] plus the Phase-8 stamp (bit 13). Fresh formats already
-/// carry the durable term (bit 7), which bit 13 REQUIRES.
+/// [`format_meta`] plus the isolated bit-13 stamp (the upgrade-verb act,
+/// applied alone). Single-writer formats already carry the durable term
+/// (bit 7), which bit 13 REQUIRES.
 async fn format_meta_stamped(path: &std::path::Path) {
     format_meta(path).await;
     assert!(
         set_block_key_incarnation_bit(path)
             .await
             .expect("stamp bit 13"),
-        "a fresh format must NOT already carry bit 13 — stamping is the \
-         Phase-8 window's act, not format's (ruling D9)"
+        "a single-writer-class format must NOT already carry bit 13 — \
+         stamping it here in isolation is this suite's whole point"
     );
 }
 

@@ -90,17 +90,31 @@ enum Commands {
         /// Subsystem NQN of NVMe-oF target
         #[arg(long)]
         subnqn: Option<String>,
-        /// Format the set multi-writer-capable (dark opt-in)
+        /// Multi-writer-capable format (accepted; the default — has no
+        /// effect)
         ///
-        /// Stamps the nine multi-writer incompat bits
-        /// (7,8,9,10,11,12,13,14,15) on every metadata volume at plan
-        /// time — one act, never piecemeal. The default format stays
-        /// today's single-writer-era posture while the multi-writer
-        /// arm-and-prove campaign runs; pre-multi-writer binaries refuse
-        /// to open a stamped set. Existing sets upgrade offline with
-        /// `squeezefs volume enable-multi-writer`.
+        /// The nine multi-writer incompat bits (7,8,9,10,11,12,13,14,15)
+        /// stamp on every metadata volume at plan time by default — one
+        /// act, never piecemeal. This flag survives as the accepted,
+        /// no-effect forward spelling from its opt-in era; the explicit
+        /// opt-out is `--single-writer`.
         #[arg(long)]
         multi_writer: bool,
+        /// Format the single-writer (unstamped) class — the explicit
+        /// opt-out
+        ///
+        /// Withholds the nine multi-writer incompat bits, producing the
+        /// pre-flip format class: readable by pre-multi-writer binaries
+        /// — e.g. a recovery scratch volume. The compatibility boundary
+        /// is the one real difference: a stamped volume mounts solo
+        /// verbatim, and repair/fsck verbs run against either class, so
+        /// fixing a filesystem never requires this. Upgrade later with
+        /// `squeezefs volume enable-multi-writer`. Conflicts with
+        /// `--multi-writer`: the two declare contradictory format
+        /// classes, and formatting either silently would produce the
+        /// class the operator did not ask for.
+        #[arg(long, conflicts_with = "multi_writer")]
+        single_writer: bool,
         /// Force formatting even if a squeezefs volume is already detected
         #[arg(long, short = 'f')]
         force: bool,
@@ -1359,10 +1373,12 @@ enum VolumeActions {
     // the add-meta posture.
     /// Upgrade an existing volume set to multi-writer-capable
     ///
-    /// Stamps the nine multi-writer incompat bits on every metadata
-    /// volume of the set in one invocation (dependency order, bit 11
-    /// terminal), bracketed by a durable upgrade-intent marker: a
-    /// writable mount refuses while the upgrade is incomplete.
+    /// For older sets that predate the default flip and for sets
+    /// formatted `--single-writer` (fresh `squeezefs format` stamps the
+    /// bits by default). Stamps the nine multi-writer incompat bits on
+    /// every metadata volume of the set in one invocation (dependency
+    /// order, bit 11 terminal), bracketed by a durable upgrade-intent
+    /// marker: a writable mount refuses while the upgrade is incomplete.
     /// Idempotent and crash-resumable: re-run with the same URI. There
     /// is no downgrade verb (forward-only); pre-multi-writer binaries
     /// refuse to open the upgraded set.
@@ -3686,6 +3702,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             port: _,
             subnqn: _,
             multi_writer,
+            single_writer,
             force,
             full,
             inodes,
@@ -3854,12 +3871,31 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 squeezefs::meta_backend::MINT_SPREAD
                     .min((meta_slot_plan.routing_width as usize).div_ceil(meta_lvs.len().max(1))),
             );
-            if multi_writer {
+            // Rung 10b (the Phase-B default flip, KD-MW-1; user ruling
+            // 2026-08-15): multi-writer-capable IS the default class —
+            // announce which class is being minted either way, so the
+            // operator can see the format-class decision on the record.
+            // (`--single-writer --multi-writer` together never reaches
+            // here: clap refuses the contradictory pair loud.)
+            if single_writer {
                 println!(
-                    "Multi-writer: stamping the nine multi-writer format bits \
-                     (7,8,9,10,11,12,13,14,15) on every metadata volume — one act \
-                     (KD-MW-1). Pre-multi-writer binaries refuse this set loud; \
-                     solo mounts behave identically."
+                    "Single-writer: formatting the unstamped class (none of the nine \
+                     multi-writer format bits) — readable by pre-multi-writer \
+                     binaries, e.g. a recovery scratch volume. Upgrade later with \
+                     `squeezefs volume enable-multi-writer`."
+                );
+            } else {
+                if multi_writer {
+                    println!(
+                        "Note: --multi-writer is the default since the Phase-B flip — \
+                         the flag is accepted and has no effect."
+                    );
+                }
+                println!(
+                    "Multi-writer-capable (the default): stamping the nine multi-writer \
+                     format bits (7,8,9,10,11,12,13,14,15) on every metadata volume — \
+                     one act (KD-MW-1). Pre-multi-writer binaries refuse this set loud; \
+                     solo mounts behave identically (opt out with --single-writer)."
                 );
             }
 
@@ -4028,11 +4064,13 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             full_wipe: !quick,
                             format_config_xattr: config_xattr,
                         };
-                        // KD-MW-1 Phase A (design-full-multi-writer §6.2
-                        // pt 1): `--multi-writer` stamps the nine mw bits
-                        // at plan time — one act, never piecemeal.
-                        if multi_writer {
-                            squeezefs::meta_backend::kv::builder::format_v3_stamped_multi_writer(
+                        // KD-MW-1 (design-full-multi-writer §6.2 pt 1,
+                        // rung 10b): the DEFAULT stamps the nine mw bits
+                        // at plan time — one act, never piecemeal;
+                        // `--single-writer` is the explicit opt-out that
+                        // formats the unstamped class.
+                        if single_writer {
+                            squeezefs::meta_backend::kv::builder::format_v3_stamped_single_writer(
                                 Path::new(&path),
                                 volume_len,
                                 &opts,

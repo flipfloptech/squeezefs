@@ -97,7 +97,7 @@ use squeezefs::membership_wire::{
     RPC_MEMBERSHIP_REFUSED, RPC_MEMBERSHIP_UNKNOWN_LEASE, VERB_MEMBERSHIP_CENSUS,
 };
 use squeezefs::meta_backend::kv::backend::{KvMetaBackend, WriterClaim, WRITER_CLAIM_XATTR};
-use squeezefs::meta_backend::kv::builder::{format_v3, FormatV3Options};
+use squeezefs::meta_backend::kv::builder::{format_v3_single_writer, FormatV3Options};
 use squeezefs::meta_backend::kv::superblock as sb;
 use squeezefs::meta_backend::kv::META_KV_JOURNAL_ENTRIES;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -143,10 +143,14 @@ fn opts() -> FormatV3Options {
     }
 }
 
+/// A SINGLE-WRITER (unstamped-class) volume: this suite exercises the
+/// bit-14 claim set in isolation — engaged arms stamp it explicitly, and
+/// the projection arms need it absent (the rung-10b DEFAULT format would
+/// stamp the whole nine-bit set).
 async fn formatted_volume() -> NamedTempFile {
     let meta = NamedTempFile::new().expect("temp volume");
     meta.as_file().set_len(VOL_LEN).expect("size the volume");
-    format_v3(meta.path(), VOL_LEN, &opts())
+    format_v3_single_writer(meta.path(), VOL_LEN, &opts())
         .await
         .expect("format v3");
     meta

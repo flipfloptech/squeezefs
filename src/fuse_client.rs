@@ -985,6 +985,27 @@ pub fn test_read_validate_stall_entries() -> u64 {
     test_read_validate_stall_entries_cell().load(Ordering::Relaxed)
 }
 
+/// TEST SEAM (settle transient-failure injection — the round-4
+/// dead-writer law's pin vehicle): fail the next `k` overlay settles
+/// with a transient I/O error at entry. The 2026-08-15 round-4
+/// falsification's writer died on `Errno(5)` from a settle reached
+/// through the write path's one-authority screen/steal arms — a class
+/// of failure (device backpressure, transient refusals) load selects
+/// and this seam selects deterministically. The law under pin:
+/// transient settle outcomes CONVERGE by bounded retry inside the arm
+/// (`settle_overlay_block_converged`) — never an errno to a write or
+/// read for legal churn. One relaxed load when disarmed; never set in
+/// production.
+fn test_settle_transient_failures_cell() -> &'static std::sync::atomic::AtomicU64 {
+    static CELL: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::atomic::AtomicU64::new(0))
+}
+
+/// Arm the settle transient-failure seam (tests only; `0` disarms).
+pub fn set_test_settle_transient_failures(k: u64) {
+    test_settle_transient_failures_cell().store(k, Ordering::Relaxed);
+}
+
 /// Park point shared by the two stall seams above (bounded 60 s so a
 /// wedged driver fails a suite loudly instead of hanging it).
 async fn test_stall_park(
@@ -13876,6 +13897,26 @@ impl SqueezefsFilesystem {
             _terminal => {
                 self.teardown_overlay_block_locked(ino, b, &rec).await;
                 return Ok(false);
+            }
+        }
+        // TEST SEAM: injected transient failure (see
+        // `set_test_settle_transient_failures`) — consumed per settle
+        // attempt, strictly AFTER the freeze and BEFORE any device work:
+        // the exact residence of the field's transient classes (gap-seed
+        // / old-image / merge refusals), leaving the record FROZEN with
+        // its acked bytes intact — the never-lossy error arm's state.
+        {
+            let cell = test_settle_transient_failures_cell();
+            let mut k = cell.load(Ordering::Relaxed);
+            while k > 0 {
+                match cell.compare_exchange(k, k - 1, Ordering::Relaxed, Ordering::Relaxed) {
+                    Ok(_) => {
+                        return Err(SqueezefsError::Io(std::io::Error::other(
+                            "test seam: injected transient settle failure",
+                        )));
+                    }
+                    Err(cur) => k = cur,
+                }
             }
         }
         self.await_overlay_inflight(&rec).await;

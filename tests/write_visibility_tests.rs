@@ -47,6 +47,9 @@ const BS: u64 = 65536;
 struct H {
     fs: SqueezefsFilesystem,
     req: Request,
+    /// The data allocator handle (round-4 pins: capacity clamps drive the
+    /// deterministic ENOSPC shapes).
+    ba: Arc<BlockAllocator>,
     _b: NamedTempFile,
     _m: NamedTempFile,
     _s: TempDir,
@@ -76,7 +79,7 @@ async fn make() -> H {
     )
     .await
     .unwrap();
-    let router = DataRouter::new(dlm.clone(), cache, ba, nvme);
+    let router = DataRouter::new(dlm.clone(), cache, ba.clone(), nvme);
     let mut fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);
 
     let m = NamedTempFile::new().unwrap();
@@ -108,6 +111,7 @@ async fn make() -> H {
     H {
         fs,
         req,
+        ba,
         _b: b,
         _m: m,
         _s: s,
@@ -987,8 +991,45 @@ async fn serialized_overwrite_never_reverts_neighbors() {
 /// pattern: 795's readers filter EOF and still caught wrong bytes
 /// (zeros / foreign) at stable offsets, self-healing on remount —
 /// a daemon-side transient wrong serve.
+/// Drop-guard stats dump: EVERY exit path of a storm — pass, byte-compare
+/// panic, coverage-deadline panic, writer-death panic — carries the
+/// discriminator counters in its tape (round-4 mandate: the round-3
+/// falsification tape had no gauge line, so the escalation-vs-serve
+/// discrimination the gauges exist for was unavailable). Drop runs on
+/// unwind, so one guard at test start covers all paths.
+struct StormStatsDump;
+impl Drop for StormStatsDump {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering as O;
+        let m = &squeezefs::fuse_client::METRICS;
+        eprintln!(
+            "STORM-STATS overlay_window_escalations={} stale_binding_escalations={} \
+             overlay_read_drains={} overlay_installs={} overlay_publishes={} \
+             overlay_epoch_feeds={} overlay_feed_fallbacks={} overlay_fence_drops={} \
+             overlay_claim_conflicts={} overlay_ack_early_lost={} \
+             invariant_tripwires={} write_through_fallbacks={} \
+             writeback_stale_token_retries={} stale_binding_rebinds={}",
+            m.overlay_window_escalations.load(O::Relaxed),
+            m.stale_binding_escalations.load(O::Relaxed),
+            m.overlay_read_drains.load(O::Relaxed),
+            m.overlay_installs.load(O::Relaxed),
+            m.overlay_publishes.load(O::Relaxed),
+            m.overlay_epoch_feeds.load(O::Relaxed),
+            m.overlay_feed_fallbacks.load(O::Relaxed),
+            m.overlay_fence_drops.load(O::Relaxed),
+            m.overlay_claim_conflicts.load(O::Relaxed),
+            m.overlay_ack_early_lost.load(O::Relaxed),
+            m.invariant_tripwires.load(O::Relaxed),
+            m.write_through_fallbacks.load(O::Relaxed),
+            m.writeback_stale_token_retries.load(O::Relaxed),
+            m.stale_binding_rebinds.load(O::Relaxed),
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn sequential_recopy_readers_never_see_foreign_bytes() {
+    let _stats = StormStatsDump;
     let h = Arc::new(make().await);
     const LEN: usize = 10 * BS as usize; // 10 blocks: crosses all layouts
     let pattern: Arc<Vec<u8>> = Arc::new((0..LEN).map(|i| (i % 251) as u8 ^ 0x5A).collect());
@@ -1007,7 +1048,7 @@ async fn sequential_recopy_readers_never_see_foreign_bytes() {
     let reads = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // Writer: rm + create + sequential 8 KiB rewrite, forever.
-    let writer = {
+    let mut writer = {
         let h = h.clone();
         let pattern = pattern.clone();
         let stop = stop.clone();
@@ -1129,6 +1170,20 @@ async fn sequential_recopy_readers_never_see_foreign_bytes() {
         );
         if c >= WRITER_CYCLES && r >= READER_OPS {
             break;
+        }
+        // WRITER-PROGRESS hard gate (round 4): a dead writer task (its
+        // write_at unwrapped an error) must fail NOW with its panic, not
+        // sit out the deadline as a coverage shortfall — the round-3
+        // falsification tape burned 115 s waiting on a writer that died
+        // at incarnation 10.
+        if writer.is_finished() && c < WRITER_CYCLES {
+            (&mut writer)
+                .await
+                .expect("writer task died before completing its incarnations");
+            panic!(
+                "writer task exited early without panic at {c}/{WRITER_CYCLES} \
+                 incarnations — the storm's coverage is a hard gate"
+            );
         }
         assert!(
             std::time::Instant::now() < deadline,
@@ -1720,5 +1775,253 @@ async fn tail_resident_short_old_image_never_wedges_the_settle() {
         &pattern[BS as usize..(BS + 8192) as usize],
         "block-1's acked bytes must survive the settle of a tail-resident \
          short old image (generic/795 — the settle-wedge face)"
+    );
+}
+
+/// generic/795 round-4 falsification, arm 1 (the dead-writer tape:
+/// `write_at ... Errno(5)` at incarnation 10, then the coverage
+/// deadline): the write path's one-authority screen/steal arms
+/// propagated a TRANSIENT settle failure — device backpressure, a
+/// transient refusal, any of the classes a 120 s slow-box storm selects
+/// — straight to the WRITE as EIO. The law (the rebind-starvation law
+/// verbatim, applied to the settle unit): transient settle outcomes
+/// CONVERGE by bounded retry inside the arm
+/// (`settle_overlay_block_converged`); only a failure that survives the
+/// budget stays loud. Forced here with the settle transient-failure
+/// seam: a Frozen record on the write's own block, the next TWO settle
+/// attempts injected to fail — the write must still ACK and the acked
+/// bytes must serve.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_meeting_a_transiently_failing_settle_converges_never_eio() {
+    let h = Arc::new(make().await);
+    squeezefs::device_overlay::set_device_overlay_for_tests(true, true);
+    // Patch OFF (the §6 A/B lever): the W1 in-place patch would absorb
+    // this pin's block-1 overwrite before it ever reaches the overlay
+    // screen — the settle-meeting shape under pin needs the overlay
+    // path. Restored below (knob pins must never leak).
+    squeezefs::fuse_client::set_patch_max_bytes(0);
+
+    let ino = create(&h, "ovl_transient").await;
+    let pattern: Vec<u8> = (0..3 * BS as usize)
+        .map(|i| (i % 251) as u8 ^ 0x5A)
+        .collect();
+    write_at(&h, ino, 0, &pattern[..2 * BS as usize]).await;
+    fsync(&h, ino).await;
+
+    // A FROZEN record on block 2 (the seam installs + a manual freeze via
+    // the settle seam's own vehicle): install an overwrite record on the
+    // MAPPED block 1, then freeze it by injecting a failure into a first
+    // settle attempt — the record survives Frozen (the never-lossy error
+    // arm), which is exactly the state the writer's steal arm meets.
+    h.fs.test_install_overwrite_overlay(ino, 1, 8192, &pattern[..4096])
+        .await
+        .expect("overlay install");
+    squeezefs::fuse_client::set_test_settle_transient_failures(1);
+    assert!(
+        h.fs.test_settle_overlay_block(ino, 1, false).await.is_err(),
+        "fixture: the injected settle failure must surface (record Frozen)"
+    );
+
+    // The write to block 1: its screen meets the FROZEN record and must
+    // settle it before accumulation. Inject failures into the next TWO
+    // settle attempts — the converged arm's budget (4) absorbs them.
+    // Pre-fix (raw settle at the write arms): the first injected failure
+    // surfaced as write EIO — the dead-writer tape verbatim.
+    squeezefs::fuse_client::set_test_settle_transient_failures(2);
+    write_at(&h, ino, BS + 8192, &pattern[..8192]).await;
+    squeezefs::fuse_client::set_test_settle_transient_failures(0);
+
+    // The acked bytes serve, and the pre-existing record's custody was
+    // published by the converged settle (block 1 readable end to end).
+    let got = read_at(&h, ino, BS + 8192, 8192).await;
+    assert_eq!(
+        &got[..],
+        &pattern[..8192],
+        "the write that converged past the transient settle failures must \
+         serve its acked bytes (generic/795 round 4 — the dead-writer law)"
+    );
+    // The pre-existing block-1 custody survived the churn too.
+    let got = read_at(&h, ino, BS, 8192).await;
+    assert_eq!(
+        &got[..],
+        &pattern[BS as usize..BS as usize + 8192],
+        "block-1's prior acked bytes must survive the converged settle"
+    );
+    squeezefs::fuse_client::set_patch_max_bytes(512 * 1024);
+}
+
+/// generic/795 round-4 falsification, arm 1's WRITE face by class: the
+/// fresh-shape device-overlay mint kept KD-B4-8's LOUD path on
+/// StorageFull, converting TRANSIENT space pressure (reclaim lag under
+/// settle/publish churn — the storm's steady state on a slow box) into
+/// a hard write EIO, while every other write shape rides the
+/// never-lossy accumulation ladder under the same pressure. Declining
+/// IS the parked supply: the write must ACK through accumulation and
+/// the decline must be counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_overlay_mint_under_space_pressure_declines_never_eio() {
+    use std::sync::atomic::Ordering as AtomOrd;
+    let h = Arc::new(make().await);
+    squeezefs::device_overlay::set_device_overlay_for_tests(true, true);
+
+    let ino = create(&h, "ovl_enospc").await;
+    let pattern: Vec<u8> = (0..2 * BS as usize + 8192)
+        .map(|i| (i % 251) as u8 ^ 0x5A)
+        .collect();
+    write_at(&h, ino, 0, &pattern[..2 * BS as usize]).await;
+    fsync(&h, ino).await;
+
+    // Clamp the allocator to ONE chunk — a capacity every fresh mint
+    // already exceeds (blocks 0-1 + their promo dests sit above it) —
+    // then DRAIN the free list (recycled offsets satisfy an allocate
+    // regardless of the clamp): the next allocate is StorageFull — the
+    // transient-pressure shape, held deterministically.
+    h.ba.set_capacity_bytes(h.ba.chunk_size());
+    let mut drained = 0u32;
+    while h.ba.allocate_block().await.is_ok() {
+        drained += 1;
+        assert!(drained < 10_000, "free list never drained under the clamp");
+    }
+
+    // The write that walks the fresh-shape overlay screen (striped file,
+    // aligned, single-block, block 2 unmapped, no custody anywhere).
+    // Pre-fix: the mint's StorageFull surfaced as write EIO (the storm's
+    // dead-writer tape). Post-fix: the mint DECLINES (counted) and the
+    // write ACKs through the accumulation park, which allocates nothing.
+    let declines0 = squeezefs::fuse_client::METRICS
+        .overlay_enospc_declines
+        .load(AtomOrd::Relaxed);
+    write_at(&h, ino, 2 * BS, &pattern[2 * BS as usize..]).await;
+    assert!(
+        squeezefs::fuse_client::METRICS
+            .overlay_enospc_declines
+            .load(AtomOrd::Relaxed)
+            > declines0,
+        "the fresh-shape mint never took the ENOSPC decline — either the \
+         clamp missed the window or the loud path is back (engagement law)"
+    );
+
+    // The acked bytes serve from the parked custody (no allocation was
+    // needed and none may have happened).
+    let got = read_at(&h, ino, 2 * BS, 8192).await;
+    assert_eq!(
+        &got[..],
+        &pattern[2 * BS as usize..],
+        "acked bytes must serve from the accumulation park"
+    );
+
+    // Unclamp so teardown flushes cleanly.
+    h.ba.set_capacity_bytes(0);
+}
+
+/// generic/795 round-4 falsification, arm 2 (writer starvation): the
+/// round-3 escalation SETTLED every live record it met — an OPEN record
+/// is the writer's live streaming vehicle, so each reader escalation
+/// forced the writer's next chunk to re-install a fresh record (a fresh
+/// dest mint), and reader pressure turned that into a settle/re-install
+/// feedback storm (the round-3 failure-rate jump and the 10/12
+/// dead-writer run). Writer priority WITHIN the lock-order table: an
+/// Open record is COMPOSED under the held block guard (claims awaited,
+/// covered pages read from the dest — race-free by the guard), never
+/// settled; only Frozen/terminal records (a publish already owed)
+/// settle. Pinned as: the window-stall schedule's escalated serve
+/// leaves the writer's record OPEN and publishes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn escalation_composes_an_open_record_never_settles_it() {
+    use std::sync::atomic::Ordering as AtomOrd;
+    let h = Arc::new(make().await);
+    squeezefs::device_overlay::set_device_overlay_for_tests(true, true);
+
+    let ino = create(&h, "ovl_open_keep").await;
+    let pattern: Vec<u8> = (0..3 * BS as usize)
+        .map(|i| (i % 251) as u8 ^ 0x5A)
+        .collect();
+    write_at(&h, ino, 0, &pattern[..2 * BS as usize]).await;
+    fsync(&h, ino).await;
+
+    // The pin-2 window schedule: reader parked pre-snapshot, the racing
+    // write ACKs into a fresh OPEN overlay record on block 2, reader
+    // resumes and must escalate (the record is a validation failure).
+    let wentries0 = squeezefs::fuse_client::test_read_window_stall_entries();
+    squeezefs::fuse_client::set_test_read_window_stall(true);
+    let reader = {
+        let h = h.clone();
+        tokio::spawn(async move { h.fs.read(h.req, ino, 0, 2 * BS - 8192, 16384, 0).await })
+    };
+    let t0 = std::time::Instant::now();
+    while squeezefs::fuse_client::test_read_window_stall_entries() == wentries0 {
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(30),
+            "reader never reached the stall window"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    write_at(
+        &h,
+        ino,
+        2 * BS,
+        &pattern[2 * BS as usize..2 * BS as usize + 8192],
+    )
+    .await;
+
+    let esc0 = squeezefs::fuse_client::METRICS
+        .overlay_window_escalations
+        .load(AtomOrd::Relaxed);
+    let publishes0 = squeezefs::fuse_client::METRICS
+        .overlay_publishes
+        .load(AtomOrd::Relaxed);
+    let feeds0 = squeezefs::fuse_client::METRICS
+        .overlay_epoch_feeds
+        .load(AtomOrd::Relaxed);
+    let open0 = squeezefs::fuse_client::METRICS
+        .overlay_open
+        .load(AtomOrd::Relaxed);
+    squeezefs::fuse_client::set_test_read_window_stall(false);
+    let reply = reader.await.unwrap().expect("read failed");
+    let got = reply.data.as_ref();
+
+    // Escalation engaged AND the serve is byte-exact...
+    assert!(
+        squeezefs::fuse_client::METRICS
+            .overlay_window_escalations
+            .load(AtomOrd::Relaxed)
+            > esc0,
+        "the read never escalated (engagement law)"
+    );
+    let base = (2 * BS - 8192) as usize;
+    assert_eq!(got.len(), 16384, "size was published before the serve");
+    for (i, &byte) in got.iter().enumerate() {
+        assert_eq!(
+            byte,
+            pattern[base + i],
+            "byte at file offset {} is wrong under the escalated OPEN-record \
+             compose",
+            base + i
+        );
+    }
+    // ...and the WRITER'S RECORD SURVIVED: no settle, no publish, no
+    // feed, record still open (writer priority — the round-4 law).
+    assert_eq!(
+        squeezefs::fuse_client::METRICS
+            .overlay_publishes
+            .load(AtomOrd::Relaxed),
+        publishes0,
+        "the escalated serve PUBLISHED the writer's open record — the \
+         settle/re-install feedback storm is back"
+    );
+    assert_eq!(
+        squeezefs::fuse_client::METRICS
+            .overlay_epoch_feeds
+            .load(AtomOrd::Relaxed),
+        feeds0,
+        "the escalated serve FED the writer's open record — the \
+         settle/re-install feedback storm is back"
+    );
+    assert_eq!(
+        squeezefs::fuse_client::METRICS
+            .overlay_open
+            .load(AtomOrd::Relaxed),
+        open0,
+        "the writer's open record must survive the escalated serve"
     );
 }

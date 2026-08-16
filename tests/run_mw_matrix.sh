@@ -1428,12 +1428,45 @@ print(flat(root.get("metrics", root)).get(sys.argv[2], ""))' "$1" "$2"
 # later mountpoint/umount probe in D-state). Loud, never a verdict.
 S7_RESTORE_WRITER_PID=""
 S7_RESTORE_DD_PID=""
+S7_RECOVERY_HELD=0
+S7_RECOVERY_KEY=""
+S7_RECOVERY_NQN=""
+S7_RECOVERY_ID=""
+
+# Release the recovery identity's WERO hold on every data namespace —
+# shared by the leg's own restore section and the fail trap (a stranded
+# recovery reservation makes every later MW mount refuse: 'a partial
+# fence is not a fence' — the s7-b round-1 cascade).
+s7_release_recovery_hold() {
+    [ "$S7_RECOVERY_HELD" = "1" ] || return 0
+    local nqn rctrl i
+    local -a nqns=()
+    read -r -a nqns <<<"$DATA_NQNS"
+    for nqn in "${nqns[@]}"; do
+        "$SQZ" nvmeof connect --ip "$TCP_ADDR" --port "$TCP_SVC" --subnqn "$nqn" \
+            --hostnqn "$S7_RECOVERY_NQN" --hostid "$S7_RECOVERY_ID" >/dev/null 2>&1 || true
+        rctrl=""
+        for i in $(seq 1 40); do
+            rctrl="$(ctrl_for "$nqn" "$S7_RECOVERY_NQN")" && break
+            sleep 0.25
+        done
+        if [ -n "$rctrl" ]; then
+            wait_ctrl_ns "$rctrl"
+            nvme resv-release "/dev/$rctrl" -n 1 --crkey="$S7_RECOVERY_KEY" --rtype=3 >/dev/null 2>&1 || true
+            nvme resv-register "/dev/$rctrl" -n 1 --crkey="$S7_RECOVERY_KEY" --rrega=1 >/dev/null 2>&1 || true
+            delete_ctrl "$rctrl"
+        fi
+    done
+    S7_RECOVERY_HELD=0
+}
+
 s7_restore_on_fail() {
     local rc=$?
     [ "$rc" -eq 0 ] && return 0
-    warn "s7-device-fence leg exiting rc=$rc — best-effort restore (SIGCONT writer, kill load)"
+    warn "s7-device-fence leg exiting rc=$rc — best-effort restore (SIGCONT writer, kill load, release recovery hold)"
     [ -n "$S7_RESTORE_DD_PID" ] && kill -9 "$S7_RESTORE_DD_PID" 2>/dev/null
     [ -n "$S7_RESTORE_WRITER_PID" ] && kill -CONT "$S7_RESTORE_WRITER_PID" 2>/dev/null
+    s7_release_recovery_hold || true
     return 0
 }
 
@@ -1508,6 +1541,7 @@ leg_s7_device_fence() {
     local r_id r_nqn rkey=0x51e7a8 rctrl
     r_id="$(printf 'cafef1e7-%04d-4000-8000-%012d' 87 "$CREATE_PID")"
     r_nqn="nqn.2014-08.org.nvmexpress:uuid:$r_id"
+    S7_RECOVERY_KEY="$rkey" S7_RECOVERY_NQN="$r_nqn" S7_RECOVERY_ID="$r_id" S7_RECOVERY_HELD=1
     local -a rctrls=()
     for nqn in "${data_nqns[@]}"; do
         "$SQZ" nvmeof connect --ip "$TCP_ADDR" --port "$TCP_SVC" --subnqn "$nqn" \
@@ -1565,20 +1599,42 @@ leg_s7_device_fence() {
     wait "$dd_pid" 2>/dev/null || true
 
     # --- the S6->S7 handoff on the resumed owner: evict + dead-epoch mint ---
-    # The owner's TTL sweep finds every member lease that died during the
-    # freeze, evicts it, and mints its S7 dead epoch (a READER's cohort
-    # names no offsets — the gauge law is asserted in the gate below).
-    wait_log_line "$STATE/m0.log" "declared DEAD (membership: member" "$((6 * renew_est + 60))" "owner dead-epoch mint for the expired member lease(s)"
-    log "resumed owner evicted its expired member(s) + minted the S7 dead epoch(s)"
+    # RACE, stated honestly: the fenced reader's retry loop re-presents
+    # FRESH the moment the owner answers (the rung-8 finding-#1 fix), and a
+    # fresh JOIN replaces the dead lease in the owner's RAM table before
+    # the TTL sweep can expire it — so the resumed owner mints a dead epoch
+    # ONLY when its sweep wins that race. Both outcomes are correct
+    # product behavior; the leg accepts EITHER the mint (sweep won) or the
+    # reader's fenced-then-fresh re-join (the fix's path won — its own law
+    # is pinned in cargo, and the S6→S7 mint composition is rung 7's
+    # proven S6-b/S6-b' row). One of the two MUST hold, loudly.
+    local mint_deadline mint_seen=0 t0m
+    mint_deadline=$((6 * renew_est + 30))
+    t0m="$(date +%s)"
+    while :; do
+        if grep -Fq "declared DEAD (membership: member" "$STATE/m0.log"; then
+            mint_seen=1
+            break
+        fi
+        [ $(($(date +%s) - t0m)) -lt "$mint_deadline" ] || break
+        sleep 1
+    done
+    if [ "$mint_seen" = "1" ]; then
+        log "resumed owner evicted its expired member(s) + minted the S7 dead epoch(s) (sweep won the race)"
+    else
+        grep -q "re-joined FRESH after its self-fence" "$STATE/m${victim_reader}.log" ||
+            die "neither the owner's dead-epoch mint nor the reader's fenced-then-fresh re-join happened — the S6->S7 handoff is broken on BOTH arms"
+        log "reader re-presented FRESH before the owner's sweep could expire its dead lease (the finding-#1 fix's path; the mint arm is rung 7's proven row)"
+    fi
 
     sleep 2
     for i in $(member_idxs); do snap "$i" 1 "$rowdir"; done
 
     # --- the leg gate --------------------------------------------------------
-    python3 - "$rowdir" "$victim_reader" <<'PYGATE'
+    python3 - "$rowdir" "$victim_reader" "$mint_seen" <<'PYGATE'
 import glob, json, re, sys
 
-rowdir, victim_reader = sys.argv[1], sys.argv[2]
+rowdir, victim_reader, mint_seen = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
 
 def flat(d, out=None, pfx=""):
     out = {} if out is None else out
@@ -1616,8 +1672,8 @@ for p1 in sorted(glob.glob(f"{rowdir}/m*_p1.json")):
             bad.append(f"m0 (victim): epoch_refusals {epoch} not within [0, fence {fence}]")
         if epoch != 0:
             bad.append(f"m0 (victim): epoch_refusals {epoch} != 0 — nothing advanced the zombie's custody generation in this scoped posture")
-        if evict < 1:
-            bad.append(f"m0: membership_evictions delta {evict} < 1 — the resumed owner never swept its dead member leases")
+        if mint_seen and evict < 1:
+            bad.append(f"m0: membership_evictions delta {evict} < 1 — a dead-epoch mint was observed without its eviction")
         if int(d1.get("write_pipeline_fence_drops", 0)) < 0:
             bad.append("m0: fence_drops went negative (counter corruption)")
     else:
@@ -1655,21 +1711,7 @@ PYGATE
     # reader to re-join the new owner.
     "$MWFLEET" kill 0 --sig 9 || true
     sleep 1
-    for nqn in "${data_nqns[@]}"; do
-        "$SQZ" nvmeof connect --ip "$TCP_ADDR" --port "$TCP_SVC" --subnqn "$nqn" \
-            --hostnqn "$r_nqn" --hostid "$r_id" >/dev/null 2>&1 || true
-        rctrl=""
-        for i in $(seq 1 40); do
-            rctrl="$(ctrl_for "$nqn" "$r_nqn")" && break
-            sleep 0.25
-        done
-        if [ -n "$rctrl" ]; then
-            wait_ctrl_ns "$rctrl"
-            nvme resv-release "/dev/$rctrl" -n 1 --crkey="$rkey" --rtype=3 >/dev/null 2>&1 || true
-            nvme resv-register "/dev/$rctrl" -n 1 --crkey="$rkey" --rrega=1 >/dev/null 2>&1 || true
-            delete_ctrl "$rctrl"
-        fi
-    done
+    s7_release_recovery_hold
     log "recovery reservation released + recovery identity unregistered (the zombie is dead; the successor takes its own hold)"
     umount -l "$w_mnt" 2>/dev/null || true
     wait_for_unmounted "$w_mnt"

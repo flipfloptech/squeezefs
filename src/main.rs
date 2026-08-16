@@ -5700,11 +5700,21 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // `job:` xattrs on ino 1 — the coordinator role belongs to the
             // D0 writer-claim holder by definition (VL2/VL2b), which a
             // reader is not and must never appear to be.
-            if reader_mount {
+            if reader_mount || co_writer_mount {
+                // Rung-9 finding #4: a CO-WRITER took the coordinator arm
+                // here and died at mount — JobWireHost::start writes
+                // `job:enroll` and the fabric's crash-resume adoption
+                // writes `job:` records, all metadata commits the co-writer
+                // write gate refuses (correctly: the coordinator role
+                // belongs to the D0 claim holder by definition, VL2/VL2b).
+                // A co-writer takes the READER posture on this surface;
+                // fleet-parallel job WORKERS arrive by membership
+                // (KD-MW-16, rung 10c), never by hosting a coordinator.
                 log::info!(
-                    "Read-only mount: job fabric, job wire and the frag-gauge worker are \
-                     NOT armed (maintenance jobs are the writer-claim holder's; a reader \
-                     cannot write their durable records)"
+                    "{} mount: job fabric, job wire and the frag-gauge worker are NOT armed \
+                     (maintenance coordination is the writer-claim holder's; this mount \
+                     cannot write their durable records)",
+                    if reader_mount { "Read-only" } else { "Co-writer" }
                 );
             } else {
                 // Worker width from the fleet-share-DIVIDED root

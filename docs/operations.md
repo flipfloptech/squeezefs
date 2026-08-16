@@ -116,7 +116,7 @@ The v3 metadata engine is single-writer by construction, and the mount enforces 
 | — loop-device-backed nvmet namespace (the repo's own file-backed share path, `losetup` wrap) | loop devices expose no PR ⇒ lands in the **"block without PR"** row below — named explicitly because the repo's own tooling creates this shape |
 | Block volume **without** PR support | **Detection-grade**: mounts separated by > ~1 heartbeat are refused; near-simultaneous mounts can both arm; a paused holder cannot detect usurpation — therefore automatic cross-host takeover is disabled (operator-attested `claim clear` only) |
 | File-backed volume shared cross-host (NFS et al.), or containers with private `/dev` nodes | **Unsupported for concurrent-mount protection** — single-host operation of such volumes remains fully guarded by flock (former) / PR-if-available (latter) |
-| **Co-writer mount** (`SQUEEZEFS_MULTI_WRITER=1` + `SQUEEZEFS_MW_ROLE=co-writer`, admitted by the five-rung ladder) | **A second write-capable mount, admitted — and the first row in this table that is** (DLM S9; guarantee class `co-writer`). It is NOT a second *appender*: it takes no `flock`, writes no `writer_claim`, registers no key on the metadata namespaces and spawns no checkpoint task, and its metadata write gate refuses every LOCAL commit — every metadata mutation is **shipped** to the authority, whose ladder above runs unchanged. Its DATA writes are its own, admitted only under a custody lease that authority granted. **What ENFORCES it:** on a PR substrate the authority's rtype-1 Write Exclusive on the metadata namespaces means a co-writer *on another host* is device-blocked from writing metadata at all, and the rtype-3 WERO hold on the data namespaces means a preempted co-writer's DMA is rejected by the namespace; which bytes each co-writer may write is the authority's custody arbitration. **What only DETECTS:** the durable claim-set enrollment and the membership census (they answer *who is attached* and mint the dead epoch a failure is quarantined under — they stop nothing by themselves), and — the honest residual — a co-writer sharing a HOST with its authority is inside the same PR host identity, so nothing device-side distinguishes them: on that shape the metadata read-only half is enforced by this mount's own code, not by the device. **What an operator must have configured:** every rung of the ladder, listed in [Multi-writer co-writer mounts](#multi-writer-co-writer-mounts-dlm-stage-s9) — and note that today no volume passes rung 2, because nothing stamps the capability bits (ruling D9) |
+| **Co-writer mount** (`SQUEEZEFS_MULTI_WRITER=1` + `SQUEEZEFS_MW_ROLE=co-writer`, admitted by the five-rung ladder) | **A second write-capable mount, admitted — and the first row in this table that is** (DLM S9; guarantee class `co-writer`). It is NOT a second *appender*: it takes no `flock`, writes no `writer_claim`, registers no key on the metadata namespaces and spawns no checkpoint task, and its metadata write gate refuses every LOCAL commit — every metadata mutation is **shipped** to the authority, whose ladder above runs unchanged. Its DATA writes are its own, admitted only under a custody lease that authority granted. **What ENFORCES it:** on a PR substrate the authority's rtype-1 Write Exclusive on the metadata namespaces means a co-writer *on another host* is device-blocked from writing metadata at all, and the rtype-3 WERO hold on the data namespaces means a preempted co-writer's DMA is rejected by the namespace; which bytes each co-writer may write is the authority's custody arbitration. **What only DETECTS:** the durable claim-set enrollment and the membership census (they answer *who is attached* and mint the dead epoch a failure is quarantined under — they stop nothing by themselves), and — the honest residual — a co-writer sharing a HOST with its authority is inside the same PR host identity, so nothing device-side distinguishes them: on that shape the metadata read-only half is enforced by this mount's own code, not by the device. **What an operator must have configured:** every rung of the ladder, listed in [Multi-writer co-writer mounts](#multi-writer-co-writer-mounts-dlm-stage-s9). Volumes formatted since the rung-10b Phase-B flip pass rung 2 by default (the format stamps the nine capability bits); pre-flip sets and `--single-writer` formats upgrade offline with `squeezefs volume enable-multi-writer` |
 | **Read-only mount** (`-o ro` / `--read-only`, any substrate) | **Not a writer, and not an obstacle to one** — guarantee class `reader`. A read-only mount takes NO `flock`, writes NO `writer_claim` and registers NO PR key, so (a) it is admitted while a writer holds the volume — including a *fresh foreign* claim, which refuses a write mount — (b) it never refuses a write mount, in either mount order, and (c) it changes nothing about the rows above: a second WRITER is still refused by exactly the same ladder. It mutates no plane (metadata, block allocation, frees, device reclaim, in-place patch/overwrite are all refused) and the kernel mounts it `MS_RDONLY`. Its *consistency* guarantee — which is a separate question from exclusion — is in [Read-only coherent mounts](#read-only-coherent-mounts--o-ro--one-writer-plus-n-readers) |
 
 **What DLM S9 changed, and what it did not.** Every row above except the
@@ -229,7 +229,8 @@ refused rather than executed locally). Every one of these is 0 with
 
 **Status: the mechanism ships and is INERT on every mount today (a single
 writer installs no partition at all). It engages only on a multi-writer mount
-of a volume set carrying incompat bit 11, which nothing stamps — ruling D9.**
+of a volume set carrying incompat bit 11 — the default format class since the
+rung-10b Phase-B flip (`--single-writer` and pre-flip sets omit it).**
 Design: `docs/design-mw-data-alloc-partition.md`; contracts
 `tests/mw_data_alloc_lane_tests.rs`.
 
@@ -300,9 +301,10 @@ construction — compare it against other partitioned mounts, not against a
 single-writer baseline.
 #### Multi-writer co-writer mounts (DLM stage S9)
 
-**Status: the posture and its admission gate ship; no field volume can pass
-rung 2, because nothing stamps the capability bits (ruling D9). Do not plan a
-deployment around this section — plan a reformat window first.** Design:
+**Status: the posture and its admission gate ship. Volumes formatted since
+the rung-10b Phase-B flip pass rung 2 by default (the format stamps the nine
+capability bits); pre-flip sets and `--single-writer` formats need the
+offline `squeezefs volume enable-multi-writer` upgrade first.** Design:
 `docs/pre-rc-engineering-spec.md` §6.2 item 7 (consumer half) / §6.9 S9;
 contracts `tests/dlm_cowriter_tests.rs`.
 
@@ -865,6 +867,8 @@ To centralize block storage connectivity, SqueezeFS utilizes two connection URIs
 
 Initialize physical block maps and metadata. New metadata volumes are formatted as **v3** (CoW KV metadata — see [Format v3](#format-v3-cow-kv-metadata) and [Metadata Durability](#metadata-durability-crash-contract)). Executes concurrently across all target devices.
 
+Since the multi-writer program's **Phase-B default flip** (rung 10b, user ruling 2026-08-15), a fresh format is **multi-writer-capable by default**: the nine multi-writer incompat bits (7–15) stamp on every metadata volume in one planned superblock write (KD-MW-1 — one act, never piecemeal). A stamped volume **mounts solo verbatim** (the stamped-solo S4 gate's posture — measured performance-invisible), and every repair/fsck verb runs under the D0-guarded open regardless of stamps; the one real difference is the **compatibility boundary**: pre-multi-writer binaries refuse a stamped set loudly.
+
 ```bash
 squeezefs format sqmeta://<meta_dev> [sqmeta://...] sqdata://<data_dev> [sqdata://...] [options]
 ```
@@ -876,6 +880,8 @@ squeezefs format sqmeta://<meta_dev> [sqmeta://...] sqdata://<data_dev> [sqdata:
 - `--disk-cache-paths <paths>`: Comma-separated paths to NVMe cache staging directories. **Declared here, at format** — recorded in the format config as the single source of truth. Omit it and the filesystem is **permanently cache-less**: mounts run with RAM tiers + direct block I/O only (no NVMe staging/read-cache tier). Change later with `squeezefs config set-cache-paths`.
 - `--compression <lz4|zstd|none>` / `--encrypt-algo <aes256gcm|chacha20|none>` / `--encrypt-key <path>` (`-` = stdin): transparent per-volume compression / client-side encryption. `--encrypt-key` names a key **file** — never the key itself, which would land on `/proc/<pid>/cmdline` (see [Transparent compression & encryption](#transparent-compression--encryption)).
 - `--mem-cache-size` / `--disk-cache-size` / `--{read,write}-cache-size` / `--{read,write}-mem-cache-size`: cache budget defaults recorded in the format config (overridable per mount).
+- `--single-writer`: Format the **unstamped (pre-flip) class** — none of the nine multi-writer bits. For recovery scratch volumes and anything a **pre-multi-writer binary** must be able to read; fixing a filesystem never *requires* it (see above). Upgrade later with `squeezefs volume enable-multi-writer`. Conflicts with `--multi-writer` (two contradictory class declarations refuse loudly).
+- `--multi-writer`: Accepted, **announced-inert** — multi-writer-capable is the default since the Phase-B flip; the flag survives as the forward spelling from the dark-opt-in era and has no effect.
 - `-f, --force`: Force formatting even if a squeezefs volume is already detected (this is also the reformat path for refused legacy volumes — destroys old contents).
 - `--full`: Performs full block-aligned zero-wiping of the backing device capacity with a progress bar (default is quick-format).
 - `--meta-node-kib <64|128|256|512|1024>`: v3 metadata btree node size in KiB (default `256`). Below `256` prints a warning — the per-volume record-value cap drops to `node_size/4`, so large xattrs / layout maps spill to the indirect mechanism sooner.
@@ -1104,11 +1110,13 @@ squeezefs volume add-meta <sqmeta-uri> <new-device> --take-slots <n|list>  # OFF
 squeezefs volume remove-meta <sqmeta-uri> <victim-device>                  # OFFLINE: unmount first
 squeezefs volume migrate-meta-slot <mountpoint> <slot> <volume-index>      # ONLINE background job
 squeezefs volume repair-set <sqmeta-uri>                # reconcile membership stamps after a crashed change
+squeezefs volume enable-multi-writer <sqmeta-uri>       # OFFLINE: stamp a pre-flip / --single-writer set multi-writer-capable
 ```
 
 - Metadata routing granularity: **format anywhere, grow forever, no knobs** (dynamic meta routing, 2026-08-02). Every format freezes the DERIVED virtual width (65536 slots — never chosen) and spreads minting across 64 slots per metadata volume, so any volume's existing metadata is divisible into ≥ 64 movable slices from birth: a single-metadata-volume filesystem grows to two (or two hundred) by `volume add-meta --take-slots …` / `migrate-meta-slot` with no format-time planning. The retired `format --meta-slots` flag is a hard error naming these verbs; volumes formatted under the old frozen-width scheme refuse loud (reformat required — forward-only).
 - Membership changes are crash-safe: interrupted `add-meta`/`remove-meta` **re-run with the same arguments and converge**; `repair-set` reconciles the stamps when a crash left them mid-flip. Old binaries refuse lifecycle-marked sets loudly (forward-only).
 - Set changes drain local staging first, then rebind the staging generation — durable staged payloads survive the membership change.
+- `enable-multi-writer` stamps the nine multi-writer incompat bits on every volume of the set in one crash-resumable invocation (dependency order, bit 11 terminal, bracketed by a durable intent marker — a writable mount refuses while the upgrade is incomplete; re-run the verb to resume). Fresh formats carry the bits by default since the Phase-B flip, so this verb exists for pre-flip sets and `--single-writer` formats. Forward-only: no downgrade verb; pre-multi-writer binaries refuse the upgraded set. `add-meta` keeps the set uniform in both directions: a fresh member joining a stamped set formats stamped, one joining an unstamped set formats unstamped, and a foreign bit-11 volume refuses to join a non-upgraded set.
 
 ### fsck / scrub
 
@@ -1299,7 +1307,7 @@ to occupy the local commit path. One knob:
 | Knob | Default | Purpose |
 |---|---|---|
 | `SQUEEZEFS_CLUSTER_WIRE_SVC_THREADS` | derived `clamp(cpus/8, 1, 8)` | Owner-side RPC lane count. Absolute override (measurement lever); still clamped to the core count, so it cannot oversubscribe the box. |
-| `SQUEEZEFS_MULTI_WRITER` | off | **DLM S7**: demand a device-enforced multi-writer data plane — a WERO (rtype 3) reservation on every data namespace, held for the mount lifetime. **Refuses the mount loudly** on a substrate without NVMe reservation support (every loop device, including `tests/dev_substrate.sh`'s default) and on a format without incompat bit 11 — nothing stamps that bit today (ruling D9; the capability lands with S8/S9), so this knob currently refuses everywhere and exists to make the substrate/format assertion explicit rather than assumed. Off = the shipped single-writer posture (see [the data-plane guarantee rows](#the-data-plane-dlm-stage-s7)). |
+| `SQUEEZEFS_MULTI_WRITER` | off | **DLM S7**: demand a device-enforced multi-writer data plane — a WERO (rtype 3) reservation on every data namespace, held for the mount lifetime. **Refuses the mount loudly** on a substrate without NVMe reservation support (every loop device, including `tests/dev_substrate.sh`'s default) and on a format without incompat bit 11 — the default format stamps it since the rung-10b Phase-B flip; `--single-writer` formats and pre-flip sets refuse until `squeezefs volume enable-multi-writer`. Off = the shipped single-writer posture (see [the data-plane guarantee rows](#the-data-plane-dlm-stage-s7)). |
 
 What decides cluster performance is the **fabric**, not this wire: on loopback
 at qd1 the authenticated round trip measures single-digit microseconds, while

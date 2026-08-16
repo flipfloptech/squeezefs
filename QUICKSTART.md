@@ -61,7 +61,7 @@ Format the backing files using SqueezeFS URIs (cache/staging paths are **declare
   sqdata://$HOME/squeezefs-sandbox/data.bin \
   --disk-cache-paths ~/squeezefs-sandbox/staging
 ```
-> Metadata volumes format as **v3** (CoW KV metadata) — the only supported metadata format (legacy v2 volumes refuse to mount: reformat required). Optional format knobs (`--meta-node-kib`, `--meta-journal-mb`) and the v3 durability contract are covered in section 6.
+> Metadata volumes format as **v3** (CoW KV metadata) — the only supported metadata format (legacy v2 volumes refuse to mount: reformat required). Fresh formats are **multi-writer-capable by default** (the nine multi-writer incompat bits stamp in one act; solo mounts behave identically) — pass `--single-writer` only when a pre-multi-writer binary must be able to read the volume (e.g. a recovery scratch volume). Optional format knobs (`--meta-node-kib`, `--meta-journal-mb`) and the v3 durability contract are covered in section 6.
 
 ### Step 4: Mount Squeezefs
 The mount reads its cache/staging paths from the format config (passing `--disk-cache-paths` at mount is refused — change paths with `squeezefs config set-cache-paths`):

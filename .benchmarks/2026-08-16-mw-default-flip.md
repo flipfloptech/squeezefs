@@ -140,3 +140,21 @@ and its pins/docs only (the solo-perf non-negotiable held by construction).
    under load) — the unmount completed and leg (b) + the fleet teardown were
    clean; not attributed to the flip (format-class-only change), worth an eye
    on the next quiet-box run.
+
+## Live sanity (the finalizing pass — the authoring subagent died on a model-infra 404 after the audit waves; the orchestrator finalized: config-hack reverted, fmt/note committed, full gate re-run green, legs below run fresh)
+
+* **(a) bare `format` → stamped**: format announces the nine-bit default;
+  solo mount healthy (`mount_posture=writer`, `dlm_rpcs=0`,
+  `meta_kv_block_refs_drift=0`), writer-scoped staging ENGAGED (the
+  stamped-posture tell).
+* **(b) `--single-writer` → unstamped**: format announces the opt-out
+  class; mount healthy, zero scoped-staging lines (the unstamped tell).
+* **conflict**: `--single-writer --multi-writer` refuses loud (clap
+  `conflicts_with`, before any write).
+* **(c) fleet without the flag**: `mw_fleet.sh create N=2 --membership
+  --cowriters=1` brings up writer + reader + ADMITTED co-writer with no
+  `--multi-writer` anywhere; teardown zero residue.
+
+Gate on the finalized tip: fmt clean, 13 suites serial 241/241 green,
+clippy `-D warnings` clean under both configs, markdown PASS, shellcheck
+at the dev baseline.

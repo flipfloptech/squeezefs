@@ -312,6 +312,7 @@ set -u
 SQUEEZEFS_BIN="$SQUEEZEFS_BIN"
 META_SIZE="$META_SIZE"
 DATA_SIZE="$DATA_SIZE"
+FORMAT_EXTRA_ARGS="${SQUEEZEFS_FSTESTS_FORMAT_ARGS:-}"
 EOF
 cat << 'EOF' >> /sbin/mkfs.fuse.squeezefs
 DEV="$1"
@@ -330,12 +331,14 @@ fi
 STAGING_DIR="/tmp/squeezefs_fstests_staging_$(basename "$DEV")"
 mkdir -p "$STAGING_DIR"
 
-# Format
+# Format. FORMAT_EXTRA_ARGS is baked from SQUEEZEFS_FSTESTS_FORMAT_ARGS at
+# runner start (e.g. "--multi-writer" for the stamped-solo posture — the MW
+# S4 residual gate); word-splitting is intentional.
 exec "$SQUEEZEFS_BIN" format \
     "sqmeta://$DEV" \
     "sqdata://$DATA_DEV" \
     --disk-cache-paths "$STAGING_DIR" \
-    --force
+    --force $FORMAT_EXTRA_ARGS
 EOF
 chmod +x /sbin/mkfs.fuse.squeezefs
 
@@ -401,6 +404,10 @@ EOF
 #                         (per-PR data-path tier; minutes, not hours)
 #   - no args           -> full `-g auto` inventory (nightly / release-gate
 #                         tier; ~5 h — run once, never between fixes)
+#
+# SQUEEZEFS_FSTESTS_FORMAT_ARGS: extra `squeezefs format` args baked into the
+# mkfs wrapper (e.g. "--multi-writer" for the stamped-solo posture — the MW
+# §6.3 S4 residual gate runs the QUICK set on a stamped format).
 #
 # SQUEEZEFS_FSTESTS_QUICK is the STANDING REGRESSION SET: every fstests case
 # that has ever caught a real SqueezeFS bug, plus core fsx/fsstress data-path

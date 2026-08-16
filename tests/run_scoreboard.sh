@@ -711,11 +711,15 @@ sqz_format() {
         truncate -s 1G "$SQZ_DIR/meta$i.img" || die "truncate meta$i"
         truncate -s "${DATA_VOL_GB}G" "$SQZ_DIR/data$i.img" || die "truncate data$i"
     done
+    # SQUEEZEFS_SB_FORMAT_ARGS: extra format args (e.g. "--multi-writer" for
+    # the stamped-solo posture — the MW §6.3 S4 residual gate). Word-splitting
+    # is intentional.
+    # shellcheck disable=SC2086
     "$SQZ_BIN" format \
         "$(sqz_meta_uri)" \
         "sqdata://$SQZ_DIR/data1.img,$SQZ_DIR/data2.img,$SQZ_DIR/data3.img,$SQZ_DIR/data4.img" \
         --disk-cache-paths "$SQZ_STAGING" \
-        --force >"$ART/logs/sqz_format_$1.log" 2>&1 ||
+        --force ${SQUEEZEFS_SB_FORMAT_ARGS:-} >"$ART/logs/sqz_format_$1.log" 2>&1 ||
         die "squeezefs format failed (see $ART/logs/sqz_format_$1.log)"
 }
 

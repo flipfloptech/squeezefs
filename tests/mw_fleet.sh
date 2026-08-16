@@ -726,7 +726,14 @@ mount_member() { # idx [--netns[=<delay_ms>]]
         # (Field topology is the same: operators bind a known port.)
         if [ "${MW:-0}" = "1" ]; then
             env_args+=("SQUEEZEFS_MULTI_WRITER=1")
-            env_args+=("SQUEEZEFS_MW_BIND=0.0.0.0:${SQZ_MWFLEET_MW_PORT:-45999}")
+            # Rung-10 rig finding: the port must be CONF-persistent, not
+            # ambient — a successor remounted from a LATER invocation
+            # (matrix legs, operators) that lacks SQZ_MWFLEET_MW_PORT in
+            # its environment would otherwise re-arm on the DEFAULT port
+            # while every co-writer keeps dialing the recorded
+            # MW_ENDPOINT: re-admission then refuses 'Connection refused'
+            # forever (the s9-failover first run's shape).
+            env_args+=("SQUEEZEFS_MW_BIND=0.0.0.0:${SQZ_MWFLEET_MW_PORT:-${MW_PORT:-45999}}")
         fi
         # Rung 9: the operator-declared co-writer roster (enrollment is the
         # AUTHORITY's durable act — ops.md §Multi-writer co-writer mounts).
@@ -1221,6 +1228,7 @@ create_fleet() {
         echo "MEMBERSHIP='$membership'"
         echo "MEMBERSHIP_LEASE_TTL_MS='$lease_ttl_ms'"
         echo "MW='$mw'"
+        echo "MW_PORT='${SQZ_MWFLEET_MW_PORT:-45999}'"
         echo "COWRITERS='$cowriters'"
     } >"$CONF"
     : >"$VMS"

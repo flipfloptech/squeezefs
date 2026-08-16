@@ -922,12 +922,35 @@ probe_cowriter_id() { # idx -> echoes the durable enrollment id
 
 unmount_member() { # idx
     require_state
-    local idx="$1" mnt
+    local idx="$1" mnt pid
     mnt="$(mnt_of "$idx")"
-    if mountpoint -q "$mnt"; then
-        sqz umount "$mnt" >/dev/null 2>&1 || umount -l "$mnt" 2>/dev/null || true
+    pid="$(awk -F'\t' -v i="$idx" '$1==i {print $7}' "$MEMBERS" 2>/dev/null)"
+    # A FENCED co-writer (S7 self-fence: FUSE connection aborted, daemon
+    # poisoned-but-alive) makes `mountpoint -q` LIE (EINVAL reads as
+    # not-mounted) while /proc/mounts still carries the entry — every
+    # probe below is /proc/mounts-based (is_mounted), and the lazy-umount
+    # arm always runs when the entry survives the product verb.
+    if is_mounted "$mnt"; then
+        sqz umount "$mnt" >/dev/null 2>&1 || true
     fi
-    wait_for "member $idx unmount" 60 bash -c "! mountpoint -q '$mnt'"
+    if is_mounted "$mnt"; then
+        umount -l "$mnt" 2>/dev/null || true
+    fi
+    wait_for "member $idx unmount" 60 bash -c "! awk -v m='$mnt' '\$2==m {f=1} END {exit !f}' /proc/mounts"
+    # Reap a lingering daemon (a fenced holder is dead-until-remount BY
+    # CONTRACT; its process surviving a lazy detach would hold the flock
+    # probes and the ledger pid against the successor's slot).
+    if [ -n "$pid" ] && [ "$pid" != "-" ] && kill -0 "$pid" 2>/dev/null; then
+        local t
+        for ((t = 0; t < 20; t++)); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.5
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -9 "$pid" 2>/dev/null || true
+            log "member $idx daemon (pid $pid) reaped after detach (a fenced holder is dead-until-remount)"
+        fi
+    fi
     if ns_exists "$idx"; then
         netns_teardown "$idx"
         log "member $idx netns removed"

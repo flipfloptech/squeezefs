@@ -37,6 +37,36 @@
 #                       verdict, which this leg consults: on a 5b
 #                       host-scoped kernel the merged-head shape does not
 #                       exist and the leg SKIPs loud).
+#   s8-serial-ab        (rung 9 — needs a fleet created with --multi-writer
+#                       --cowriters=1; design row S8-a, spec §6.9 S8's gate
+#                       VERBATIM: "serial tar -x A/B, published even if it
+#                       regresses" — risk R1 accepted as ruling D10). The
+#                       authority-LOCAL serial baseline vs the netns
+#                       co-writer's SHIPPED stream at wire RTT ~0 / 250 µs
+#                       / 1 ms (netem 0/125/500 µs per veth end); publishes
+#                       the ops/s table + the meta_ship_phase_ns /
+#                       meta_ship_owner_phase_ns attribution medians;
+#                       row validity = the engagement law (client shipped
+#                       == owner served on BOTH ledgers) + zero un-routed
+#                       local commits. Instrument: SQZ_MWMATRIX_TAR_SRC=
+#                       <dir> tars a real tree; default synthesizes the
+#                       tar-x shape (labeled).
+#   s8-crucible [--secs=S]  (rung 9; design row S8-b) the shipped-verb
+#                       crucible over every co-writer member: sustained
+#                       mdstorm-shaped mixed verbs (create/chmod/utimes/
+#                       rename/unlink), INJECTED retries via partition
+#                       flaps on a netns co-writer (dedup window
+#                       exercised), an authority kill-9 + remount
+#                       mid-stream (the era split: stale_term_refusals on
+#                       the NEW authority vs era_relearns on the clients),
+#                       a co-writer kill-9 mid-stream followed by the
+#                       online fsck/C8 oracle, then a post-events storm
+#                       that must be error-free. Gates: owner_panics == 0,
+#                       meta_ship_publish.refusals == 0,
+#                       local_commit_refusals == 0 (the falsifier),
+#                       fsck findings: 0. Default 1800 s
+#                       (SQZ_MWMATRIX_S8B_SECS / --secs=S override —
+#                       shorter windows are labeled in the row).
 #   cowriters-admission GATED (the 5b gate): the multi-identity legs rungs
 #                       7-10 build on. Probes the recorded host-scoped
 #                       verdict; on this kernel it SKIPs loud with the
@@ -213,6 +243,7 @@ S6_WINDOW_S="${SQZ_MWMATRIX_S6_WINDOW_S:-600}"
 S6_NETEM_MS=200
 S6_VICTIM=""
 S7_ROUNDS=10
+S8B_SECS="${SQZ_MWMATRIX_S8B_SECS:-1800}"
 for a in "$@"; do
     case "$a" in
     --require-host-scoped-subsys) REQUIRE_HS=1 ;;
@@ -220,12 +251,14 @@ for a in "$@"; do
     --netem=*) S6_NETEM_MS="${a#--netem=}" ;;
     --victim=*) S6_VICTIM="${a#--victim=}" ;;
     --rounds=*) S7_ROUNDS="${a#--rounds=}" ;;
+    --secs=*) S8B_SECS="${a#--secs=}" ;;
     *) die "unknown argument '$a'" ;;
     esac
 done
 [[ "$S6_WINDOW_S" =~ ^[0-9]+$ ]] || die "--window takes seconds (got '$S6_WINDOW_S')"
 [[ "$S6_NETEM_MS" =~ ^[0-9]+$ ]] || die "--netem takes ms (got '$S6_NETEM_MS')"
 [[ "$S7_ROUNDS" =~ ^[0-9]+$ ]] && [ "$S7_ROUNDS" -ge 1 ] || die "--rounds takes a positive integer (got '$S7_ROUNDS')"
+[[ "$S8B_SECS" =~ ^[0-9]+$ ]] && [ "$S8B_SECS" -ge 60 ] || die "--secs takes seconds >= 60 (got '$S8B_SECS')"
 
 ensure_root "$LEG" "$@"
 # The admin-lane client half of the KD-7 dev override (the daemon half is
@@ -1817,6 +1850,379 @@ $out"
     log "s7-kill-matrix GREEN: $S7_ROUNDS/$S7_ROUNDS rounds (table + fsck reports in $rowdir)"
 }
 
+# --- rung 9: the S8 rows ------------------------------------------------------
+
+cowriter_idxs() { awk -F'\t' '$2=="cowriter" {print $1}' "$MEMBERS" | sort -n; }
+
+require_cowriters() { # min
+    require_mw
+    local n
+    n="$(cowriter_idxs | wc -l)"
+    [ "$n" -ge "${1:-1}" ] ||
+        die "this leg needs ${1:-1} co-writer member(s) (found $n) — create the fleet with: sudo tests/mw_fleet.sh create N=2 --multi-writer --cowriters=${1:-1}"
+}
+
+# Weighted-median bucket label of a phase histogram DELTA between two raw
+# stats snapshots, plus its sample count: the attribution instrument the
+# S8-a row publishes (LatencyHistogram is bucket-only by design).
+phase_median() { # p0.json p1.json hist_key phase -> "<median-bucket> n=<count>"
+    python3 - "$1" "$2" "$3" "$4" <<'PYEOF'
+import json, sys
+p0, p1, hist, phase = sys.argv[1:5]
+def load(p):
+    root = json.load(open(p))
+    m = root.get("metrics", root)
+    return m.get(hist, {}).get(phase, {})
+a, b = load(p0), load(p1)
+delta = [(k, (b.get(k, 0) or 0) - (a.get(k, 0) or 0)) for k in b]
+total = sum(n for _, n in delta)
+if total <= 0:
+    print("- n=0")
+    sys.exit(0)
+# Bucket order = the label's numeric bound (parse "<=NNNus/ms/s").
+def bound(lbl):
+    s = lbl.lstrip("<=>")
+    for suf, mul in (("us", 1), ("ms", 1000), ("s", 1000000)):
+        if s.endswith(suf):
+            return int(s[: -len(suf)]) * mul
+    return 1 << 62
+delta.sort(key=lambda kv: bound(kv[0]))
+acc = 0
+for lbl, n in delta:
+    acc += n
+    if acc * 2 >= total:
+        print(f"{lbl} n={total}")
+        break
+PYEOF
+}
+
+# One serial tar -x venue: extract the leg's tarball onto `mnt` under a
+# fresh dir, timed; snapshot writer+cowriter around it; emit the row line.
+s8a_venue() { # rowdir label mnt cw_idx entries tarball
+    local rowdir="$1" label="$2" mnt="$3" cw="$4" entries="$5" tarball="$6"
+    local dest t0 t1 wall ops
+    dest="$mnt/s8a-$label"
+    mkdir -p "$dest"
+    snap 0 "${label}0" "$rowdir"
+    [ -n "$cw" ] && snap "$cw" "${label}0" "$rowdir"
+    t0="$(date +%s.%N)"
+    tar -xf "$tarball" -C "$dest" ||
+        die "s8a venue $label: tar -x FAILED on $mnt (a shipped verb errored — see the daemon logs)"
+    t1="$(date +%s.%N)"
+    snap 0 "${label}1" "$rowdir"
+    [ -n "$cw" ] && snap "$cw" "${label}1" "$rowdir"
+    wall="$(python3 -c "print(f'{$t1-$t0:.2f}')")"
+    ops="$(python3 -c "print(f'{$entries/($t1-$t0):.0f}')")"
+    echo "$label $wall $ops"
+}
+
+s8a_delta() { # rowdir idx label key -> delta of a flattened stats key
+    python3 - "$1" "$2" "$3" "$4" <<'PYEOF'
+import json, sys
+rowdir, idx, label, key = sys.argv[1:5]
+def flat(d, out=None, pfx=""):
+    out = {} if out is None else out
+    for k, v in d.items():
+        if isinstance(v, dict): flat(v, out, pfx + k + ".")
+        else: out[pfx + k] = v
+    return out
+def load(ph):
+    root = json.load(open(f"{rowdir}/m{idx}_p{label}{ph}.json"))
+    return flat(root.get("metrics", root))
+a, b = load(0), load(1)
+va, vb = a.get(key, 0) or 0, b.get(key, 0) or 0
+print(int(vb - va) if isinstance(vb, (int, float)) and isinstance(va, (int, float)) else 0)
+PYEOF
+}
+
+leg_s8_serial_ab() {
+    # Design row S8-a — spec §6.9 S8's gate, VERBATIM: "serial `tar -x`
+    # A/B, published even if it regresses" (risk R1: at 50-150 µs RTT a
+    # serial stream drops from 9,100/s to 6.7-20 k/s before owner
+    # queueing; ruling D10 ACCEPTS it — S10's delegation is the recovery).
+    # Venues: authority-LOCAL baseline, then the netns co-writer at wire
+    # RTT ~0 / 250 µs / 1 ms (netem delay 0/125/500 µs per veth end). The
+    # row's attribution is meta_ship_phase_ns (route/queue_wait/encode/
+    # rtt/decode medians) + the owner-side execute median; its validity is
+    # the engagement law (client shipped == owner served, BOTH ledgers).
+    require_cowriters 1
+    local rowdir cw w_mnt cw_mnt tarball src entries
+    rowdir="$STATE/rows/s8a-$(date +%s)"
+    mkdir -p "$rowdir"
+    cw="$(cowriter_idxs | head -1)"
+    w_mnt="$(mnt_of 0)"
+
+    # The instrument: a real source tree when SQZ_MWMATRIX_TAR_SRC names
+    # one (the linux-src venue), else a synthesized tar-x-shaped tree
+    # (serial create-heavy: dirs + small inline-sized files) — the
+    # fallback the rung-9 brief sanctions, labeled in the row.
+    tarball="$STATE/s8a-src.tar"
+    src="${SQZ_MWMATRIX_TAR_SRC:-}"
+    if [ -n "$src" ]; then
+        [ -d "$src" ] || die "SQZ_MWMATRIX_TAR_SRC='$src' is not a directory"
+        tar -cf "$tarball" -C "$(dirname "$src")" "$(basename "$src")"
+        log "s8a instrument: REAL tree $src"
+    else
+        local synth="$STATE/s8a-tree" d f
+        rm -rf "$synth"
+        for ((d = 0; d < 120; d++)); do
+            mkdir -p "$synth/d$d"
+            for ((f = 0; f < 24; f++)); do
+                head -c $((128 + (d * 24 + f) % 1900)) /dev/zero >"$synth/d$d/f$f.c"
+            done
+        done
+        tar -cf "$tarball" -C "$STATE" s8a-tree
+        log "s8a instrument: SYNTHESIZED tar-x shape (120 dirs x 24 inline-sized files; set SQZ_MWMATRIX_TAR_SRC=<dir> for a real tree)"
+    fi
+    entries="$(tar -tf "$tarball" | wc -l)"
+    log "s8a tarball: $entries entries"
+
+    # The co-writer must sit in a netns so its SHIPPING wire is shapeable;
+    # remount it there (the fleet mounts co-writers plain).
+    "$MWFLEET" unmount "$cw"
+    "$MWFLEET" mount "$cw" --netns
+    cw_mnt="$(mnt_of "$cw")"
+
+    local -a rows=()
+    local out label netem
+    # Venue 1: the authority-LOCAL serial baseline (the S0 reference).
+    out="$(s8a_venue "$rowdir" local "$w_mnt" "" "$entries" "$tarball")"
+    rows+=("$out -")
+    # Venues 2-4: the SHIPPED stream across the RTT ladder.
+    for netem in off 125us 500us; do
+        case "$netem" in
+        off) label="ship-rtt0" ;;
+        125us) label="ship-rtt250us" ;;
+        500us) label="ship-rtt1ms" ;;
+        esac
+        [ "$netem" = "off" ] || "$MWFLEET" netem "$cw" "$netem"
+        out="$(s8a_venue "$rowdir" "$label" "$cw_mnt" "$cw" "$entries" "$tarball")"
+        # Engagement (row validity): the client's shipped verbs == the
+        # owner's served verbs, on BOTH ledgers (S8 trait + S9 publish).
+        local ship_d served_d pub_ship_d pub_served_d batches_d bverbs_d refusals panics lcr
+        ship_d="$(s8a_delta "$rowdir" "$cw" "$label" meta_ship.shipped_verbs)"
+        served_d="$(s8a_delta "$rowdir" 0 "$label" meta_ship.served_verbs)"
+        pub_ship_d="$(s8a_delta "$rowdir" "$cw" "$label" meta_ship_publish.shipped)"
+        pub_served_d="$(s8a_delta "$rowdir" 0 "$label" meta_ship_publish.served)"
+        batches_d="$(s8a_delta "$rowdir" "$cw" "$label" meta_ship.batches)"
+        bverbs_d="$(s8a_delta "$rowdir" "$cw" "$label" meta_ship.batched_verbs)"
+        [ "$ship_d" -gt 0 ] || die "s8a $label: shipped_verbs delta 0 — the row did not engage the S8 plane"
+        [ "$ship_d" -eq "$served_d" ] ||
+            die "s8a $label: ships that don't account — cw shipped=$ship_d vs owner served=$served_d"
+        [ "$pub_ship_d" -eq "$pub_served_d" ] ||
+            die "s8a $label: publish ships that don't account — shipped=$pub_ship_d vs served=$pub_served_d"
+        refusals="$(stat_field 0 meta_ship_publish.refusals)"
+        [ "$refusals" = "0" ] || die "s8a $label: meta_ship_publish.refusals=$refusals (must stay 0)"
+        panics="$(stat_field 0 meta_ship.owner_panics)"
+        [ "$panics" = "0" ] || die "s8a $label: owner_panics=$panics"
+        lcr="$(s8a_delta "$rowdir" "$cw" "$label" cowriter.local_commit_refusals)"
+        [ "$lcr" = "0" ] || die "s8a $label: cowriter.local_commit_refusals moved by $lcr — an un-routed local commit (the S8-b falsifier)"
+        rows+=("$out ship=$ship_d+pub=$pub_ship_d coalesce=$(python3 -c "print(f'{$bverbs_d/max(1,$batches_d):.2f}')")")
+    done
+    "$MWFLEET" netem "$cw" off || true
+
+    # THE PUBLISHED TABLE (spec R1: even if it regresses — it will).
+    echo ""
+    echo "== S8-a: serial tar -x A/B (entries=$entries; venue=tcp devsub; instrument above) =="
+    printf '%-14s %-8s %-8s %s\n' VENUE WALL_S OPS_S ENGAGEMENT
+    local r
+    for r in "${rows[@]}"; do
+        # shellcheck disable=SC2086 # deliberate word split of the row line
+        printf '%-14s %-8s %-8s %s\n' $r
+    done | tee "$rowdir/s8a-table.txt"
+    echo ""
+    echo "== S8-a attribution (phase medians over the ship-rtt1ms venue deltas) =="
+    local ph
+    for ph in route queue_wait encode rtt decode; do
+        printf '  %-11s %s\n' "$ph" "$(phase_median "$rowdir/m${cw}_pship-rtt1ms0.json" "$rowdir/m${cw}_pship-rtt1ms1.json" meta_ship_phase_ns "$ph")"
+    done | tee "$rowdir/s8a-attribution.txt"
+    for ph in admit dispatch execute reply_encode total; do
+        printf '  owner/%-11s %s\n' "$ph" "$(phase_median "$rowdir/m0_pship-rtt1ms0.json" "$rowdir/m0_pship-rtt1ms1.json" meta_ship_owner_phase_ns "$ph")"
+    done | tee -a "$rowdir/s8a-attribution.txt"
+    log "s8-serial-ab PUBLISHED (rows + snapshots in $rowdir)"
+}
+
+s8b_storm() { # mnt tag secs faillog — the mdstorm-shaped mixed-verb loop
+    local mnt="$1" tag="$2" secs="$3" faillog="$4" base i=0 t_end d f
+    base="$mnt/s8b-$tag"
+    mkdir -p "$base"
+    t_end=$(($(date +%s) + secs))
+    while [ "$(date +%s)" -lt "$t_end" ]; do
+        d="$base/dir$((i % 16))"
+        f="$d/f$i"
+        {
+            mkdir -p "$d" &&
+                : >"$f" &&
+                chmod 600 "$f" &&
+                touch -d @1699999999 "$f" &&
+                mv "$f" "$f.r" &&
+                rm "$f.r"
+        } 2>>"$faillog" || echo "op-cycle $i failed at $(date +%s.%N)" >>"$faillog"
+        i=$((i + 1))
+    done
+    echo "$i" >"$faillog.cycles"
+}
+
+leg_s8_crucible() {
+    # Design row S8-b — the shipped-verb crucible: mdstorm-shaped mixed
+    # verbs (create/chmod/utimes/rename/unlink — inline-sized, the
+    # metadata plane's row) sustained across every co-writer, with the
+    # dedup window exercised by INJECTED retries (partition flaps on a
+    # netns co-writer), the era split proven across an authority restart
+    # (stale_term_refusals on the NEW authority / era_relearns on the
+    # clients — counted on opposite sides so one event can never
+    # double-count), a co-writer kill-9 mid-stream, and the fsck/C8
+    # oracle after the events. Gates: owner_panics == 0,
+    # meta_ship_publish.refusals == 0, local_commit_refusals == 0 (the
+    # falsifier: any un-routed local commit), engagement shipped==served.
+    require_cowriters 1
+    local secs="$S8B_SECS"
+    local rowdir w_mnt cws cw0 idx
+    rowdir="$STATE/rows/s8b-$(date +%s)"
+    mkdir -p "$rowdir"
+    w_mnt="$(mnt_of 0)"
+    mapfile -t cws < <(cowriter_idxs)
+    cw0="${cws[0]}"
+    log "s8-crucible: ${#cws[@]} co-writer(s), ${secs}s total (phase A storm -> injected retries -> authority restart -> co-writer kill-9 -> fsck oracle -> phase C storm). Design asks K=5; this fleet runs K=${#cws[@]} (stated in the row)."
+
+    # The retry injector needs a shapeable wire: cw0 goes netns.
+    "$MWFLEET" unmount "$cw0"
+    "$MWFLEET" mount "$cw0" --netns
+
+    for idx in 0 "${cws[@]}"; do snap "$idx" 0 "$rowdir"; done
+
+    # ---- Phase A: quiet sustained storm (must be error-free) ------------
+    local phase_a=$((secs * 4 / 10)) phase_c=$((secs * 3 / 10))
+    local -a pids=()
+    for idx in "${cws[@]}"; do
+        s8b_storm "$(mnt_of "$idx")" "a-m$idx" "$phase_a" "$rowdir/fail-a-m$idx" &
+        pids+=("$!")
+    done
+
+    # ---- E1: injected retries (partition flaps on cw0, mid-storm) -------
+    sleep $((phase_a / 3))
+    local retries0 retries1 dedup0 dedup1
+    retries0="$(stat_field "$cw0" meta_ship.retries)"
+    dedup0="$(stat_field 0 meta_ship.dedup_hits)"
+    for _flap in 1 2 3 4 5; do
+        "$MWFLEET" partition "$cw0" on
+        sleep 2
+        "$MWFLEET" partition "$cw0" off
+        sleep 3
+    done
+    wait "${pids[@]}" || true
+    retries1="$(stat_field "$cw0" meta_ship.retries)"
+    dedup1="$(stat_field 0 meta_ship.dedup_hits)"
+    log "E1 injected retries: retries $retries0 -> $retries1, owner dedup_hits $dedup0 -> $dedup1"
+    [ "$retries1" -gt "$retries0" ] ||
+        die "E1: five partition flaps under storm injected NO transport retries — the injector did not engage"
+    # Phase-A verdict: cw0's failures during flap windows are the app-level
+    # face of a partitioned wire (bounded errors, honest); every OTHER
+    # co-writer's storm must be error-free.
+    for idx in "${cws[@]}"; do
+        [ "$idx" = "$cw0" ] && continue
+        [ -s "$rowdir/fail-a-m$idx" ] &&
+            die "phase A: co-writer m$idx storm errored with no injected fault:
+$(head -5 "$rowdir/fail-a-m$idx")"
+    done
+
+    # ---- E2: authority restart mid-stream (the era split) ---------------
+    local stale0 stale1 relearn0 relearn1 t_kill t_up
+    relearn0=0
+    for idx in "${cws[@]}"; do
+        relearn0=$((relearn0 + $(stat_field "$idx" meta_ship.era_relearns)))
+    done
+    local -a pids2=()
+    for idx in "${cws[@]}"; do
+        s8b_storm "$(mnt_of "$idx")" "e2-m$idx" 45 "$rowdir/fail-e2-m$idx" &
+        pids2+=("$!")
+    done
+    sleep 5
+    "$MWFLEET" kill 0 --sig 9
+    t_kill="$(date +%s)"
+    umount -l "$w_mnt" 2>/dev/null || true
+    wait_for_unmounted "$w_mnt"
+    "$MWFLEET" mount 0 || die "E2: successor authority remount FAILED"
+    t_up="$(date +%s)"
+    wait "${pids2[@]}" || true
+    stale1="$(stat_field 0 meta_ship.stale_term_refusals)"
+    stale0=0 # the successor's counters start at 0 (a fresh process)
+    relearn1=0
+    for idx in "${cws[@]}"; do
+        relearn1=$((relearn1 + $(stat_field "$idx" meta_ship.era_relearns)))
+    done
+    log "E2 authority restart: remount $((t_up - t_kill))s; successor stale_term_refusals=$stale1 (from $stale0); co-writer era_relearns $relearn0 -> $relearn1 (split counted on opposite sides)"
+    echo "E2 stale_term_refusals=$stale1 era_relearns_delta=$((relearn1 - relearn0)) remount_s=$((t_up - t_kill))" >>"$rowdir/events.txt"
+
+    # ---- E3: co-writer kill -9 mid-stream + the oracle -------------------
+    local victim="${cws[$((${#cws[@]} - 1))]}"
+    s8b_storm "$(mnt_of "$victim")" "e3" 60 "$rowdir/fail-e3" &
+    local storm3=$!
+    sleep 3
+    "$MWFLEET" kill "$victim" --sig 9
+    kill -9 "$storm3" 2>/dev/null || true
+    wait "$storm3" 2>/dev/null || true
+    umount -l "$(mnt_of "$victim")" 2>/dev/null || true
+    # The dedup window's exactly-once face: nothing half-applied survives.
+    local out
+    out="$("$SQZ" fsck "$w_mnt" 2>&1)" ||
+        die "E3: online fsck FAILED after the co-writer kill-9:
+$out"
+    echo "$out" >"$rowdir/fsck-e3.out"
+    echo "$out" | grep -q "findings: 0" || die "E3: fsck findings != 0 after a co-writer kill-9:
+$out"
+    local drift
+    drift="$(stat_field 0 meta_kv_block_refs_drift)"
+    [ "$drift" = "0" ] || die "E3: meta_kv_block_refs_drift=$drift (C8 oracle RED)"
+    "$MWFLEET" mount "$victim" || die "E3: the killed co-writer could not RE-ADMIT (its slot id is mount-point-stable, so the roster still names it)"
+    log "E3: co-writer m$victim kill-9 -> fsck findings:0, drift=0, re-admitted"
+
+    # ---- Phase C: post-events storm (must be error-free everywhere) -----
+    local -a pids3=()
+    for idx in "${cws[@]}"; do
+        s8b_storm "$(mnt_of "$idx")" "c-m$idx" "$phase_c" "$rowdir/fail-c-m$idx" &
+        pids3+=("$!")
+    done
+    wait "${pids3[@]}" || true
+    for idx in "${cws[@]}"; do
+        [ -s "$rowdir/fail-c-m$idx" ] &&
+            die "phase C: co-writer m$idx storm errored AFTER the events settled:
+$(head -5 "$rowdir/fail-c-m$idx")"
+    done
+
+    for idx in 0 "${cws[@]}"; do snap "$idx" 1 "$rowdir"; done
+
+    # ---- Verdicts ---------------------------------------------------------
+    local panics refusals lcr trip
+    panics="$(stat_field 0 meta_ship.owner_panics)"
+    [ "$panics" = "0" ] || die "s8b: owner_panics=$panics (must stay 0)"
+    refusals="$(stat_field 0 meta_ship_publish.refusals)"
+    [ "$refusals" = "0" ] || die "s8b: meta_ship_publish.refusals=$refusals (must stay 0)"
+    for idx in "${cws[@]}"; do
+        lcr="$(stat_field "$idx" cowriter.local_commit_refusals)"
+        [ "$lcr" = "0" ] || die "s8b: co-writer m$idx local_commit_refusals=$lcr — an un-routed local commit (THE falsifier)"
+        trip="$(stat_field "$idx" invariant_tripwires)"
+        [ "$trip" = "0" ] || die "s8b: co-writer m$idx invariant_tripwires=$trip"
+    done
+    trip="$(stat_field 0 invariant_tripwires)"
+    [ "$trip" = "0" ] || die "s8b: authority invariant_tripwires=$trip"
+    # Engagement across the whole crucible: since E2 restarted the
+    # authority, engagement is asserted on the POST-E2 half (phase C):
+    # served on the successor >= the sum of phase-C ships is not exactly
+    # decomposable per-phase from totals, so the law is asserted live:
+    local ship_now served_now pub_ship pub_served
+    ship_now=0
+    pub_ship=0
+    for idx in "${cws[@]}"; do
+        ship_now=$((ship_now + $(stat_field "$idx" meta_ship.shipped_verbs)))
+        pub_ship=$((pub_ship + $(stat_field "$idx" meta_ship_publish.shipped)))
+    done
+    served_now="$(stat_field 0 meta_ship.served_verbs)"
+    pub_served="$(stat_field 0 meta_ship_publish.served)"
+    log "s8b ledgers at close: cw shipped(S8)=$ship_now vs successor served=$served_now (pre-E2 serves died with the old authority — recorded, not equated); publish shipped=$pub_ship vs served=$pub_served"
+    log "s8-crucible GREEN (events + snapshots + fail logs in $rowdir)"
+}
+
 leg_cowriters_admission() {
     if [ "$HOST_SCOPED" != "1" ]; then
         local reason="multi-identity (co-writer) legs need host-scoped fabric subsystems: this kernel merges controllers by subsysnqn ignoring hostnqn (nvme_core.multipath=Y), so co-located identities share one head — rung 5b (the sqz-kernel fix, validated in the rung-6b qemu guest) unlocks them. Stock-kernel workaround: nvme_core.multipath=N (boot parameter)"
@@ -1834,8 +2240,10 @@ s6-fence) leg_s6_fence ;;
 s6-vm-fence) leg_s6_vm_fence ;;
 s7-device-fence) leg_s7_device_fence ;;
 s7-kill-matrix) leg_s7_kill_matrix ;;
+s8-serial-ab) leg_s8_serial_ab ;;
+s8-crucible) leg_s8_crucible ;;
 cowriters-admission) leg_cowriters_admission ;;
 vm-hostscope-validate) leg_vm_hostscope_validate ;;
 vm-multi-identity) leg_vm_multi_identity ;;
-*) die "unknown leg '$LEG' (smoke|multipath-negative|s6-journal|s6-fence|s6-vm-fence|s7-device-fence|s7-kill-matrix|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
+*) die "unknown leg '$LEG' (smoke|multipath-negative|s6-journal|s6-fence|s6-vm-fence|s7-device-fence|s7-kill-matrix|s8-serial-ab|s8-crucible|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
 esac

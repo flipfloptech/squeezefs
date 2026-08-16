@@ -128,8 +128,27 @@
 #   --multi-writer IMPLIES --membership (auto) when not given explicitly.
 #   Engagement is asserted per mount: data_plane_fence_mode=1 read from
 #   the stats inode + the WERO acquire line in the writer log. SCOPE
-#   (rung 8): the AUTHORITY arm only — co-writer mounts and custody
-#   handoff are rungs 9-10; the S7 rows fence the WRITER itself.
+#   (rung 8): the AUTHORITY arm only — the S7 rows fence the WRITER itself.
+#
+# CO-WRITER MEMBERS (rung 9 — the S8 rows; design-full-multi-writer §7.2):
+#   `create --multi-writer --cowriters=K` mounts K CO-LOCATED co-writer
+#   members on the index slice 50.. (COWRITER_BASE): the DLM S9 posture —
+#   metadata read-only locally with EVERY metadata verb SHIPPED to the
+#   authority (the REAL S8 shipping client), data DMA its own under a
+#   granted custody lease. Bring-up is the ops.md flow mechanized: each
+#   mountpoint's durable enrollment id (`node_….m…` — KD-MW-2) is
+#   harvested from its rung-3 refusal (probe_cowriter_id, side-effect
+#   free), the AUTHORITY is re-armed with SQUEEZEFS_MW_MEMBERS=<roster>
+#   (enrollment is the authority's durable act — a new era), then the
+#   co-writers mount with SQUEEZEFS_MW_ROLE=co-writer +
+#   SQUEEZEFS_MW_AUTHORITY=<the recorded MW_ENDPOINT>. CO-LOCATED shape
+#   (ops.md §Multi-writer co-writer mounts, the honest residual): they
+#   share the box's PR host identity — no explicit hostnqn, no 5b kernel
+#   needed; their WERO registrant key rides the default host association.
+#   A co-writer may mount in a netns (`mount 50 --netns[=<delay>]`) so its
+#   SHIPPING wire is netem-shapeable — the S8-a RTT-sweep venue (netem now
+#   accepts `<N>us` grain). Engagement asserted per mount: the
+#   'CO-WRITER ADMITTED' log line + mount_posture=co-writer.
 #
 # NETNS / NETEM / PARTITION (rung 7 — the S6-b venue; stubs retired):
 #   A READER member can be mounted inside its OWN network namespace
@@ -155,7 +174,7 @@
 #   mount <idx> [--netns[=<delay_ms>]]   (re)mount one member (readers may
 #                 mount inside their own netns — see NETNS above)
 #   unmount <idx>   product umount
-#   netem <idx> <ms|off>    shape a netns-mounted member's wire (see above)
+#   netem <idx> <ms|Nus|Nms|off>  shape a netns-mounted member's wire
 #   partition <idx> on|off  hard-partition a netns-mounted member
 #   kill <idx> [--sig 9]   kill a member daemon (the S7-b matrices' verb)
 #   probe-host-scoped      re-print the recorded 5b capability verdict
@@ -348,6 +367,10 @@ member_hostid() { printf 'cafef1e7-%04d-4000-8000-%012d' "$1" "$2"; }
 member_hostnqn() { echo "nqn.2014-08.org.nvmexpress:uuid:$(member_hostid "$1" "$2")"; }
 
 mnt_of() { echo "$MNT_ROOT/m$1"; }
+
+# Rung 9: co-writer members live on their own index slice (the VM-slice
+# precedent — readers keep 1..N-1 untouched).
+COWRITER_BASE=50
 
 # /proc/mounts-based liveness: `mountpoint -q` errors (ENOTCONN) on a mount
 # whose FUSE daemon died or lost its devices — exactly the residue teardown
@@ -619,11 +642,21 @@ netem_set() { # idx <ms|off>
         log "netem cleared on member $idx's veth pair"
         return 0
     fi
-    [[ "$spec" =~ ^[0-9]+$ ]] || die "netem takes a delay in ms or 'off' (got '$spec')"
-    # BOTH ends (each direction pays the delay once): renewal RTT +2*ms.
-    tc qdisc replace dev "$hv" root netem delay "${spec}ms"
-    ip netns exec "$ns" tc qdisc replace dev "$nv" root netem delay "${spec}ms"
-    log "netem delay ${spec}ms armed on both ends of member $idx's veth (wire RTT +$((spec * 2))ms)"
+    # Rung 9 (the S8-a RTT sweep needs µs grain): a bare number stays ms
+    # (the rung-7 contract); an explicit `<N>us` / `<N>ms` suffix passes
+    # through to tc verbatim.
+    local unit_spec
+    if [[ "$spec" =~ ^[0-9]+$ ]]; then
+        unit_spec="${spec}ms"
+    elif [[ "$spec" =~ ^[0-9]+(us|ms)$ ]]; then
+        unit_spec="$spec"
+    else
+        die "netem takes a delay in ms, <N>us, <N>ms, or 'off' (got '$spec')"
+    fi
+    # BOTH ends (each direction pays the delay once): wire RTT +2*delay.
+    tc qdisc replace dev "$hv" root netem delay "$unit_spec"
+    ip netns exec "$ns" tc qdisc replace dev "$nv" root netem delay "$unit_spec"
+    log "netem delay $unit_spec armed on both ends of member $idx's veth (wire RTT +2x$unit_spec)"
     tc -s qdisc show dev "$hv" | head -2
 }
 
@@ -689,6 +722,11 @@ mount_member() { # idx [--netns[=<delay_ms>]]
         if [ "${MW:-0}" = "1" ]; then
             env_args+=("SQUEEZEFS_MULTI_WRITER=1")
         fi
+        # Rung 9: the operator-declared co-writer roster (enrollment is the
+        # AUTHORITY's durable act — ops.md §Multi-writer co-writer mounts).
+        if [ -n "${MW_ROSTER:-}" ]; then
+            env_args+=("SQUEEZEFS_MW_MEMBERS=$MW_ROSTER")
+        fi
         # The proven N=1 explicit-identity shape: data plane daemon-owned
         # from the fabric_endpoint records. (The KD-MW-3 ENGAGED stdout
         # line stays inside the daemonized child; engagement is asserted
@@ -698,6 +736,31 @@ mount_member() { # idx [--netns[=<delay_ms>]]
             --daemon --allow-other --log-file "$log" \
             >"$STATE/m0.mount.out" 2>&1 ||
             die "writer mount failed: $(cat "$STATE/m0.mount.out")"
+    elif [ "$idx" -ge "$COWRITER_BASE" ]; then
+        # Rung 9 (the S8 arm): a CO-WRITER member — the DLM S9 posture, the
+        # REAL S8 shipping client (every metadata verb ships to the
+        # authority; data DMA is its own under a granted custody lease).
+        # CO-LOCATED shape (docs/operations.md §Multi-writer co-writer
+        # mounts, the stated honest residual): it shares the box's PR host
+        # identity, so it mounts with NO explicit hostnqn — its WERO
+        # registrant key rides the default host association, distinct from
+        # the writer's explicit member-0 identity. No 5b kernel needed.
+        role="cowriter"
+        [ "${MW:-0}" = "1" ] || die "co-writer members need a --multi-writer fleet (create ... --multi-writer --cowriters=K)"
+        [ -n "${MW_ENDPOINT:-}" ] || die "no MW_ENDPOINT recorded — the writer's 'MULTI-WRITER ARMED' line was not parsed (writer log: $STATE/m0.log)"
+        env_args+=("SQUEEZEFS_MULTI_WRITER=1")
+        env_args+=("SQUEEZEFS_MW_ROLE=co-writer")
+        env_args+=("SQUEEZEFS_MW_AUTHORITY=$MW_ENDPOINT")
+        local launch=(env "${env_args[@]}" "$SQZ")
+        if [ "$netns" = "1" ]; then
+            netns_setup "$idx"
+            launch=(nsenter "--net=/run/netns/$(ns_name "$idx")" env "${env_args[@]}" "$SQZ")
+        fi
+        "${launch[@]}" mount "sqmeta://$META_PATHS" "$mnt" \
+            --daemon --allow-other --log-file "$log" \
+            >"$STATE/m${idx}.mount.out" 2>&1 ||
+            die "co-writer $idx mount failed: $(cat "$STATE/m${idx}.mount.out")"
+        [ -n "$netem_ms" ] && netem_set "$idx" "$netem_ms"
     else
         role="reader"
         # Rung 7 (the S6-b venue): a reader may mount inside its own netns
@@ -720,6 +783,17 @@ mount_member() { # idx [--netns[=<delay_ms>]]
     fi
     wait_for "member $idx mountpoint" 40 mountpoint -q "$mnt"
     wait_for "member $idx stats inode" 40 test -s "$mnt/.stats"
+    if [ "$role" = "cowriter" ]; then
+        # Rung 9 engagement: the five-rung ladder ADMITTED and the mount is
+        # the co-writer posture (never a silently-degraded authority/reader).
+        grep -q "CO-WRITER ADMITTED" "$log" ||
+            die "co-writer $idx log carries no 'CO-WRITER ADMITTED' line — the admission ladder did not engage (log: $log)"
+        local posture
+        posture="$(stat_field "$mnt" mount_posture)"
+        [ "$posture" = "co-writer" ] ||
+            die "co-writer $idx mount_posture='$posture' (want co-writer) — log: $log"
+        log "member $idx co-writer posture engaged (CO-WRITER ADMITTED, mount_posture=co-writer)"
+    fi
     if [ "$idx" -eq 0 ]; then
         # Rung-2 engagement, half 1: the daemon's own log names each data
         # volume's daemon-owned controller (half 2 — sysfs — runs in create).
@@ -801,6 +875,45 @@ mount_reader_verified() { # idx
         die "reader $idx: meta_kv_revalidate_dirty_skips=$skips — the FIXED rung-6 pinned-node finding regressed (must stay 0 on every posture; see the FINDINGS note in the header)"
 }
 
+# Rung 9: parse the writer's ADVERTISED custody+publish endpoint (what a
+# co-writer dials — SQUEEZEFS_MW_AUTHORITY) from its MW arm line, and
+# persist/refresh it in the fleet config (append wins on re-source).
+record_mw_endpoint() {
+    local ep
+    ep="$(sed -n 's/.*MULTI-WRITER ARMED (DLM S9) on \(.*\): era.*/\1/p' "$STATE/m0.log" | tail -1)"
+    [ -n "$ep" ] || die "writer log carries no 'MULTI-WRITER ARMED (DLM S9) on <endpoint>' line (log: $STATE/m0.log)"
+    echo "MW_ENDPOINT='$ep'" >>"$CONF"
+    MW_ENDPOINT="$ep"
+    log "multi-writer authority endpoint: $ep"
+}
+
+# Rung 9, the enrollment harvest (ops.md §Multi-writer co-writer mounts,
+# "Bringing one up" steps 2-3, mechanized): a co-writer mount attempt
+# against an authority whose roster does not name it is REFUSED at rung 3,
+# and the refusal prints this mountpoint's durable enrollment id
+# (`node_{16 hex}.m{8 hex}` — KD-MW-2's (node, mount_slot) pair, stable per
+# mount point). The probe expects exactly that refusal and echoes the id;
+# gather_admission mutates nothing before rung 5, so the probe is
+# side-effect-free.
+probe_cowriter_id() { # idx -> echoes the durable enrollment id
+    local idx="$1" mnt out id
+    mnt="$(mnt_of "$idx")"
+    out="$STATE/m${idx}.probe.out"
+    mkdir -p "$mnt"
+    if env "${SCRUB_ENV[@]}" "SQUEEZEFS_FLEET_SHARE=$FLEET_N" \
+        "SQUEEZEFS_IPC_ALLOW_DEV=1" \
+        "SQUEEZEFS_MULTI_WRITER=1" "SQUEEZEFS_MW_ROLE=co-writer" \
+        "SQUEEZEFS_MW_AUTHORITY=$MW_ENDPOINT" \
+        "$SQZ" mount "sqmeta://$META_PATHS" "$mnt" \
+        --daemon --allow-other --log-file "$STATE/m${idx}.probe.log" \
+        >"$out" 2>&1; then
+        die "co-writer $idx PROBE mount was ADMITTED against a roster that does not name it — rung 3 did not engage (out: $out)"
+    fi
+    id="$(grep -o "Add 'node_[0-9a-f.m]*'" "$out" | head -1 | sed "s/^Add '//; s/'$//")"
+    [ -n "$id" ] || die "co-writer $idx probe refusal carries no enrollment id (want the rung-3 \"Add 'node_…'\" remedy; out: $out)"
+    echo "$id"
+}
+
 unmount_member() { # idx
     require_state
     local idx="$1" mnt
@@ -843,6 +956,12 @@ create_fleet() {
         die "--lease-ttl-ms takes milliseconds (got '$lease_ttl_ms')"
     [ -z "$lease_ttl_ms" ] || [ -n "$membership" ] || [ "$mw" = "1" ] ||
         die "--lease-ttl-ms is the OWNER's membership lease knob — it needs --membership"
+    [[ "$cowriters" =~ ^[0-9]+$ ]] || die "--cowriters=K needs a non-negative integer (got '$cowriters')"
+    if [ "$cowriters" -gt 0 ] && [ "$mw" != "1" ]; then
+        # A co-writer's admission rung 1 demands the opt-in on BOTH halves.
+        mw=1
+        log "--cowriters implies --multi-writer (the admission ladder's rung 1)"
+    fi
     if [ "$mw" = "1" ] && [ -z "$membership" ]; then
         # The MW arm's rung 4 refuses with membership off (a co-writer that
         # cannot be SEEN cannot be EVICTED) — imply the default arm loudly.
@@ -1041,9 +1160,13 @@ create_fleet() {
         die "--require-host-scoped-subsys: this kernel merges fabric subsystems across host identities (nvme_core.multipath=Y). Remedy: the rung-5b sqz kernel (docs/design-full-multi-writer.md rung 5b), or the documented stock-kernel workaround nvme_core.multipath=N (boot parameter)"
     fi
     if [ "$cowriters" != "0" ]; then
-        [ "$host_scoped" = "1" ] ||
-            die "--cowriters=$cowriters needs host-scoped fabric subsystems (rung 5b) — this kernel merges identities under one head (see the POSTURE header note)"
-        die "--cowriters is gated open by the 5b kernel but its leg bodies land with rungs 7-10 (S6 arm onward) — not this rung"
+        # Rung 9: CO-LOCATED co-writers need no 5b kernel — they share the
+        # box's PR host identity (the ops.md honest residual: on this shape
+        # the metadata read-only half is enforced by the mount's own code,
+        # not by the device), so no second fabric identity is created and
+        # the merged-head POSTURE note does not apply. Multi-IDENTITY
+        # (cross-host-shaped) co-writers stay gated on 5b / the VM leg.
+        log "--cowriters=$cowriters: CO-LOCATED co-writers (shared PR host identity — the ops.md honest-residual shape; device-enforced co-writer fencing rows stay 5b/VM territory)"
     fi
 
     # --- persist config, mount the fleet -------------------------------------
@@ -1069,6 +1192,7 @@ create_fleet() {
         echo "MEMBERSHIP='$membership'"
         echo "MEMBERSHIP_LEASE_TTL_MS='$lease_ttl_ms'"
         echo "MW='$mw'"
+        echo "COWRITERS='$cowriters'"
     } >"$CONF"
     : >"$VMS"
 
@@ -1120,12 +1244,39 @@ create_fleet() {
     for ((idx = 1; idx < n; idx++)); do
         mount_reader_verified "$idx"
     done
+
+    # Rung 9: the co-writer bring-up — the ops.md "Bringing one up" flow,
+    # mechanized. Phase 1 harvests each mountpoint's durable enrollment id
+    # from its rung-3 refusal; phase 2 re-arms the AUTHORITY with the
+    # roster (enrollment is the authority's durable act — a new era);
+    # phase 3 mounts the admitted co-writers.
+    if [ "$cowriters" -gt 0 ]; then
+        record_mw_endpoint
+        local roster="" cid cw_idx
+        for ((idx = 0; idx < cowriters; idx++)); do
+            cw_idx=$((COWRITER_BASE + idx))
+            cid="$(probe_cowriter_id "$cw_idx")"
+            log "co-writer $cw_idx enrollment id harvested: $cid"
+            roster="${roster:+$roster,}$cid"
+        done
+        echo "MW_ROSTER='$roster'" >>"$CONF"
+        MW_ROSTER="$roster"
+        export MW_ROSTER
+        log "re-arming the authority with the roster (a new era): $roster"
+        unmount_member 0
+        mount_member 0
+        record_mw_endpoint
+        for ((idx = 0; idx < cowriters; idx++)); do
+            mount_member $((COWRITER_BASE + idx))
+        done
+    fi
+
     # Rung-6b guests LAST (they dial the target the fleet already rides;
     # they hold no member role this rung — the in-guest legs drive them).
     for ((idx = 0; idx < vms; idx++)); do
         vm_boot "$idx"
     done
-    log "fleet up: 1 writer + $((n - 1)) reader(s) + $vms guest(s), SQUEEZEFS_FLEET_SHARE=$n per daemon"
+    log "fleet up: 1 writer + $((n - 1)) reader(s) + $cowriters co-writer(s) + $vms guest(s), SQUEEZEFS_FLEET_SHARE=$n per daemon"
     status_fleet
 }
 

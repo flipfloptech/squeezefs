@@ -556,11 +556,18 @@ impl PublishClient {
         if guard.is_none() {
             *guard = Some(RpcClient::connect(endpoint, &self.secret, &self.peer_id, None).await?);
         }
+        // Rung 9 (S8-a attribution): a publish-vocabulary ship pays the
+        // same authenticated round trip as an S8 trait verb, so it records
+        // the SAME `meta_ship_phase_ns.rtt` phase — the published serial
+        // A/B's rtt column covers the whole shipped stream, not just the
+        // trait half.
+        let t_rtt = std::time::Instant::now();
         let out = guard
             .as_mut()
             .expect("connected above")
             .call(VERB_PUBLISH_CALL, body)
             .await;
+        super::phase_record(super::ShipPhase::Rtt, t_rtt);
         let reply = match out {
             Ok(reply) => reply,
             Err(e) => {

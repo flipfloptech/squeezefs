@@ -680,3 +680,194 @@ async fn concurrent_enable_invocation_refuses_on_the_d0_guard() {
     assert!(has_all_nine(features_of(&meta).await));
     assert!(read_marker(&meta).await.is_none());
 }
+
+// ---------------------------------------------------------------------------
+// Phase B — the DEFAULT FLIP (rung 10b, user ruling 2026-08-15, §6.2 pt 1):
+// `format` stamps the nine bits BY DEFAULT; `--single-writer` is the
+// explicit opt-out that formats the unstamped class (recovery-scratch /
+// pre-mw-binary compatibility — the incompat-bit boundary is the one real
+// difference; a stamped volume mounts solo verbatim); `--multi-writer`
+// survives as the announced-inert forward spelling; both flags together
+// refuse loud (two contradictory format-class declarations — guessing
+// either way silently formats the class the operator did NOT ask for).
+// ---------------------------------------------------------------------------
+
+/// The library face of the flip: the DEFAULT formatter stamps all nine —
+/// the multi-writer-capable class IS the default class. (The
+/// single-writer opt-out's equality half — its feature word is the
+/// default's minus exactly the nine-bit mask — is pinned below once the
+/// opt-out API exists; the CLI pin `cli_single_writer_formats_the_unstamped_class`
+/// is its red-first face.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn phase_b_default_format_stamps_all_nine() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let default_vol = make_file(dir.path(), "default.meta");
+    format_v3(&default_vol, VOL_LEN, &opts())
+        .await
+        .expect("default format");
+    let default_feat = features_of(&default_vol).await;
+    assert!(
+        has_all_nine(default_feat),
+        "Phase-B pin: the DEFAULT format stamps all nine mw bits \
+         (got {default_feat:#x})"
+    );
+}
+
+/// CLI pins drive the real binary (the house CLI-test pattern —
+/// `CARGO_BIN_EXE_squeezefs`); format needs no mount support.
+mod phase_b_cli {
+    use super::*;
+    use std::process::Command;
+
+    fn bin() -> &'static str {
+        env!("CARGO_BIN_EXE_squeezefs")
+    }
+
+    /// Scratch under ~/tmp (repo discipline: scratch lives in ~/tmp).
+    fn scratch(tag: &str) -> PathBuf {
+        let home = std::env::var("HOME").expect("HOME set");
+        let base = std::path::PathBuf::from(home)
+            .join("tmp")
+            .join(format!("sqfs_mwflip_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    fn mk_volumes(base: &Path) -> (PathBuf, PathBuf) {
+        let meta = base.join("meta.bin");
+        let data = base.join("data.bin");
+        std::fs::File::create(&meta)
+            .unwrap()
+            .set_len(256 * 1024 * 1024)
+            .unwrap();
+        std::fs::File::create(&data)
+            .unwrap()
+            .set_len(2 * 1024 * 1024 * 1024)
+            .unwrap();
+        (meta, data)
+    }
+
+    fn format_cmd(meta: &Path, data: &Path, extra: &[&str]) -> std::process::Output {
+        let mut cmd = Command::new(bin());
+        cmd.arg("format")
+            .arg(format!("sqmeta://{}", meta.display()))
+            .arg(format!("sqdata://{}", data.display()))
+            .arg("--force");
+        for a in extra {
+            cmd.arg(a);
+        }
+        cmd.output().expect("run squeezefs format")
+    }
+
+    async fn feat(meta: &Path) -> u64 {
+        features_of(meta).await
+    }
+
+    /// Bare `format` (no flag) stamps all nine and SAYS so on stdout —
+    /// the operator must be able to see which class they just minted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cli_default_format_stamps_all_nine_and_announces_the_class() {
+        let base = scratch("default");
+        let (meta, data) = mk_volumes(&base);
+        let out = format_cmd(&meta, &data, &[]);
+        assert!(
+            out.status.success(),
+            "bare format failed: {}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            has_all_nine(feat(&meta).await),
+            "the DEFAULT `squeezefs format` stamps all nine mw bits"
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("multi-writer") && stdout.contains("--single-writer"),
+            "the default format announces the multi-writer-capable class and \
+             names the opt-out: {stdout}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `--single-writer` formats the unstamped class: of the mw set only
+    /// bit 7 (a pre-mw fresh-format default) may be present.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cli_single_writer_formats_the_unstamped_class() {
+        let base = scratch("sw");
+        let (meta, data) = mk_volumes(&base);
+        let out = format_cmd(&meta, &data, &["--single-writer"]);
+        assert!(
+            out.status.success(),
+            "--single-writer format failed: {}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            feat(&meta).await & MULTI_WRITER_FORMAT_BITS,
+            sb::FEATURE_INCOMPAT_KV_DURABLE_TERM,
+            "--single-writer stamps none of the mw set beyond bit 7"
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("single-writer"),
+            "the opt-out announces its class (and the upgrade verb): {stdout}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `--single-writer --multi-writer` together is a LOUD refusal naming
+    /// both flags — two contradictory class declarations; formatting
+    /// either class silently would mint the one the operator did NOT ask
+    /// for. Nothing may be written before the refusal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cli_single_writer_plus_multi_writer_refuses_loud() {
+        let base = scratch("conflict");
+        let (meta, data) = mk_volumes(&base);
+        let before = std::fs::read(&meta).unwrap()[..4096].to_vec();
+        let out = format_cmd(&meta, &data, &["--single-writer", "--multi-writer"]);
+        assert!(
+            !out.status.success(),
+            "contradictory class flags must refuse: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("--single-writer") && stderr.contains("--multi-writer"),
+            "the refusal names BOTH flags: {stderr}"
+        );
+        assert_eq!(
+            std::fs::read(&meta).unwrap()[..4096],
+            before[..],
+            "the refusal precedes any write — sector 0 untouched"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `--multi-writer` survives as the announced-inert forward spelling:
+    /// accepted, formats the (default) stamped class, and SAYS it is now
+    /// the default — never an error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cli_multi_writer_is_accepted_and_announced_inert() {
+        let base = scratch("mwflag");
+        let (meta, data) = mk_volumes(&base);
+        let out = format_cmd(&meta, &data, &["--multi-writer"]);
+        assert!(
+            out.status.success(),
+            "--multi-writer stays accepted: {}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            has_all_nine(feat(&meta).await),
+            "--multi-writer formats the (default) stamped class"
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("default"),
+            "the flag announces it is now the default (inert): {stdout}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}

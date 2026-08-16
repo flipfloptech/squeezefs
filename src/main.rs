@@ -5714,7 +5714,11 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     "{} mount: job fabric, job wire and the frag-gauge worker are NOT armed \
                      (maintenance coordination is the writer-claim holder's; this mount \
                      cannot write their durable records)",
-                    if reader_mount { "Read-only" } else { "Co-writer" }
+                    if reader_mount {
+                        "Read-only"
+                    } else {
+                        "Co-writer"
+                    }
                 );
             } else {
                 // Worker width from the fleet-share-DIVIDED root

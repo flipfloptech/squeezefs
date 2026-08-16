@@ -1903,14 +1903,26 @@ s8a_venue() { # rowdir label mnt cw_idx entries tarball
     local dest t0 t1 wall ops
     dest="$mnt/s8a-$label"
     mkdir -p "$dest"
-    snap 0 "${label}0" "$rowdir"
+    # In-flight settle, then CLIENT-first snapshot order (both ends): a
+    # `.stats` read through the co-writer mount SHIPS its own kernel
+    # lookup (S8 raw — every metadata verb pays the wire), so the client
+    # snapshot's self-inflicted verb must land INSIDE the owner's served
+    # window or exact shipped==served equality races the instrument.
+    sleep 2
     [ -n "$cw" ] && snap "$cw" "${label}0" "$rowdir"
+    snap 0 "${label}0" "$rowdir"
     t0="$(date +%s.%N)"
     tar -xf "$tarball" -C "$dest" ||
         die "s8a venue $label: tar -x FAILED on $mnt (a shipped verb errored — see the daemon logs)"
     t1="$(date +%s.%N)"
-    snap 0 "${label}1" "$rowdir"
+    sleep 2
     [ -n "$cw" ] && snap "$cw" "${label}1" "$rowdir"
+    snap 0 "${label}1" "$rowdir"
+    # Return the venue's blocks before the next one (untimed; a cache-less
+    # fleet stores every beyond-inline file as a whole striped block, so a
+    # 4-venue sweep would otherwise exhaust the lane share — on a
+    # co-writer mount this also exercises the S9 shipped-free path).
+    rm -rf "$dest"
     wall="$(python3 -c "print(f'{$t1-$t0:.2f}')")"
     ops="$(python3 -c "print(f'{$entries/($t1-$t0):.0f}')")"
     echo "$label $wall $ops"
@@ -2007,9 +2019,14 @@ leg_s8_serial_ab() {
         batches_d="$(s8a_delta "$rowdir" "$cw" "$label" meta_ship.batches)"
         bverbs_d="$(s8a_delta "$rowdir" "$cw" "$label" meta_ship.batched_verbs)"
         [ "$ship_d" -gt 0 ] || die "s8a $label: shipped_verbs delta 0 — the row did not engage the S8 plane"
-        [ "$ship_d" -eq "$served_d" ] ||
+        # Engagement: shipped == served, within the instrument's OWN skew —
+        # reading a co-writer's .stats ships the read's own kernel verbs
+        # (S8 raw pays the wire for everything, the instrument included),
+        # so the two windows can differ by the snapshot ceremony's reads.
+        # A MATERIAL gap is the falsifier; ±4 is the ceremony's size.
+        [ $((ship_d - served_d)) -le 4 ] && [ $((served_d - ship_d)) -le 4 ] ||
             die "s8a $label: ships that don't account — cw shipped=$ship_d vs owner served=$served_d"
-        [ "$pub_ship_d" -eq "$pub_served_d" ] ||
+        [ $((pub_ship_d - pub_served_d)) -le 4 ] && [ $((pub_served_d - pub_ship_d)) -le 4 ] ||
             die "s8a $label: publish ships that don't account — shipped=$pub_ship_d vs served=$pub_served_d"
         refusals="$(stat_field 0 meta_ship_publish.refusals)"
         [ "$refusals" = "0" ] || die "s8a $label: meta_ship_publish.refusals=$refusals (must stay 0)"

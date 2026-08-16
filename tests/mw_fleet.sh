@@ -117,6 +117,20 @@
 #   (SQUEEZEFS_MEMBERSHIP_LEASE_TTL_MS — a measurement lever for the
 #   fence rows; the S6-a journal row runs the shipped 45 s clocks).
 #
+# MULTI-WRITER ARMING (rung 8 — the S7 rows; design-full-multi-writer §7.2):
+#   `create --multi-writer` arms the DLM S7 data-plane custody fence on the
+#   WRITER: SQUEEZEFS_MULTI_WRITER=1 demands the DEVICE-ENFORCED guarantee
+#   class — the mount takes a WERO (rtype 3) reservation on EVERY data
+#   namespace (data_plane_fence_mode=1) and REFUSES loud on a non-PR
+#   substrate or an unstamped format (this fleet's tcp devsub is nvmet
+#   resv_enable=1 and the set is formatted --multi-writer, so both rungs
+#   hold). The arm's rung 4 requires the membership plane, so
+#   --multi-writer IMPLIES --membership (auto) when not given explicitly.
+#   Engagement is asserted per mount: data_plane_fence_mode=1 read from
+#   the stats inode + the WERO acquire line in the writer log. SCOPE
+#   (rung 8): the AUTHORITY arm only — co-writer mounts and custody
+#   handoff are rungs 9-10; the S7 rows fence the WRITER itself.
+#
 # NETNS / NETEM / PARTITION (rung 7 — the S6-b venue; stubs retired):
 #   A READER member can be mounted inside its OWN network namespace
 #   (`mount <idx> --netns[=<delay_ms>]`): a per-member netns + veth pair
@@ -133,7 +147,7 @@
 #
 # Verbs
 #   create [N|N=<n>] [--cowriters K] [--vm=V] [--require-host-scoped-subsys]
-#          [--membership[=auto|addr:port]] [--lease-ttl-ms=N]
+#          [--membership[=auto|addr:port]] [--lease-ttl-ms=N] [--multi-writer]
 #                 build substrate + format + records + mount the fleet
 #                 (refuses if state exists — run teardown first); --vm=V
 #                 boots V sqz-kernel guests after the fleet is up
@@ -664,6 +678,12 @@ mount_member() { # idx [--netns[=<delay_ms>]]
             [ -n "${MEMBERSHIP_LEASE_TTL_MS:-}" ] &&
                 env_args+=("SQUEEZEFS_MEMBERSHIP_LEASE_TTL_MS=$MEMBERSHIP_LEASE_TTL_MS")
         fi
+        # Rung 8: the S7/S9 AUTHORITY arm — the device-enforced guarantee
+        # class (WERO rtype 3 on every data namespace; SQUEEZEFS_MW_BIND
+        # stays unset = auto, ruling D2). Engagement asserted below.
+        if [ "${MW:-0}" = "1" ]; then
+            env_args+=("SQUEEZEFS_MULTI_WRITER=1")
+        fi
         # The proven N=1 explicit-identity shape: data plane daemon-owned
         # from the fabric_endpoint records. (The KD-MW-3 ENGAGED stdout
         # line stays inside the daemonized child; engagement is asserted
@@ -700,6 +720,24 @@ mount_member() { # idx [--netns[=<delay_ms>]]
         # volume's daemon-owned controller (half 2 — sysfs — runs in create).
         grep -q "daemon-owned controller resolved" "$log" ||
             die "writer log carries no 'daemon-owned controller resolved' line — the rung-2 connect path did not engage (log: $log)"
+        # Rung 8 engagement: the MW arm must have taken the WERO hold on
+        # every data namespace — the fence-mode gauge is the instrument
+        # (0 would mean the mount silently degraded to detection grade,
+        # which the arm is contractually forbidden to do: it refuses).
+        if [ "${MW:-0}" = "1" ]; then
+            local fm ftry
+            fm=""
+            for ((ftry = 0; ftry < 40; ftry++)); do
+                fm="$(stat_field "$mnt" data_plane_fence_mode)"
+                [ "$fm" = "1" ] && break
+                sleep 0.5
+            done
+            [ "$fm" = "1" ] ||
+                die "writer data_plane_fence_mode='$fm' (want 1) — the S7 WERO hold did not engage (log: $log)"
+            grep -q "data-plane WERO (rtype 3) acquired" "$log" ||
+                die "writer log carries no 'data-plane WERO (rtype 3) acquired' line — the S7 arm did not engage (log: $log)"
+            log "member 0 multi-writer data plane engaged (data_plane_fence_mode=1, WERO held)"
+        fi
     fi
     # Rung 7: membership engagement is asserted PER MOUNT when armed — an
     # owner that did not arm or a reader that could not join is residue,
@@ -774,7 +812,7 @@ unmount_member() { # idx
 }
 
 create_fleet() {
-    local n="$N_DEFAULT" cowriters=0 require_hs=0 vms=0 a
+    local n="$N_DEFAULT" cowriters=0 require_hs=0 vms=0 mw=0 a
     local membership="${SQZ_MWFLEET_MEMBERSHIP:-}" lease_ttl_ms="${SQZ_MWFLEET_LEASE_TTL_MS:-}"
     for a in "$@"; do
         case "$a" in
@@ -789,6 +827,7 @@ create_fleet() {
         --membership) membership="auto" ;;
         --membership=*) membership="${a#--membership=}" ;;
         --lease-ttl-ms=*) lease_ttl_ms="${a#--lease-ttl-ms=}" ;;
+        --multi-writer) mw=1 ;;
         [0-9]*) n="$a" ;;
         *) die "unknown create argument '$a'" ;;
         esac
@@ -797,8 +836,14 @@ create_fleet() {
     [[ "$vms" =~ ^[0-9]+$ ]] || die "--vm=V needs a non-negative integer (got '$vms')"
     [ -z "$lease_ttl_ms" ] || [[ "$lease_ttl_ms" =~ ^[0-9]+$ ]] ||
         die "--lease-ttl-ms takes milliseconds (got '$lease_ttl_ms')"
-    [ -z "$lease_ttl_ms" ] || [ -n "$membership" ] ||
+    [ -z "$lease_ttl_ms" ] || [ -n "$membership" ] || [ "$mw" = "1" ] ||
         die "--lease-ttl-ms is the OWNER's membership lease knob — it needs --membership"
+    if [ "$mw" = "1" ] && [ -z "$membership" ]; then
+        # The MW arm's rung 4 refuses with membership off (a co-writer that
+        # cannot be SEEN cannot be EVICTED) — imply the default arm loudly.
+        membership="auto"
+        log "--multi-writer implies --membership (the S9 arm's rung 4 refuses with the plane off)"
+    fi
     [ -e "$CONF" ] && die "fleet state exists at $STATE — run 'sudo tests/mw_fleet.sh teardown' first"
     ensure_prereqs
     # --vm preflight FIRST (fail before any substrate exists): the boot
@@ -1018,6 +1063,7 @@ create_fleet() {
         echo "GUEST_DATA_PATH='$guest_data_path'"
         echo "MEMBERSHIP='$membership'"
         echo "MEMBERSHIP_LEASE_TTL_MS='$lease_ttl_ms'"
+        echo "MW='$mw'"
     } >"$CONF"
     : >"$VMS"
 

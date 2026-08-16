@@ -102,6 +102,54 @@
 #                       epoch. Real halves: the frozen kernel and the
 #                       host-vs-guest clock domains are REAL; large-skew
 #                       injection stays on the membership_sim.rs seam.
+#   s7-device-fence     (rung 8 — needs a fleet created with --multi-writer;
+#                       design row S7-a, spec §6.9 S7 gate R2) the DEVICE-
+#                       REJECTION row, SCOPED to the zombie-rejection +
+#                       quarantine half (stated posture: in this rig the
+#                       WRITER is the membership owner, the custody
+#                       authority and the WERO holder — co-writer mounts
+#                       and custody HANDOFF are rungs 9-10, so the frozen
+#                       victim is the armed writer itself and the recovery
+#                       actor is the rig driving the rung-2-proven product
+#                       preempt primitive, the same act a successor's
+#                       drain proof performs). Steps: sustained write load;
+#                       SIGSTOP the armed writer past the membership TTL
+#                       (its reader members observe the frozen owner and
+#                       SELF-FENCE first — the S6 composition face); the
+#                       recovery identity registers + PREEMPTS the
+#                       zombie's WERO key on EVERY data namespace (PR
+#                       preempt observed on target: report re-read); on
+#                       SIGCONT the zombie's resumed DMA must be REJECTED
+#                       BY THE DEVICE (reservation-conflict errno class),
+#                       the zombie must FAIL-STOP its data plane
+#                       (data_dma_fence_refusals moving; epoch_refusals ⊆
+#                       fence_refusals — 0 here BY CONSTRUCTION: no
+#                       custody moved inside the zombie's process), the
+#                       resumed owner's TTL sweep must evict its dead
+#                       members + mint their S7 dead epochs, and
+#                       dlm_quarantined_offsets stays 0 with the reason
+#                       stated (a READER's dead epoch names no offsets;
+#                       the offset-holding cohorts are S9's custody
+#                       grants and the job wire's destinations — their
+#                       no-release-without-a-drain-proof law is pinned in
+#                       cargo by tests/dlm_data_fence_tests.rs).
+#   s7-kill-matrix [--rounds=N]  (rung 8 — needs --multi-writer; design
+#                       row S7-b) kill -9 × N (default 10) of the ARMED
+#                       writer at RANDOMIZED phases under sustained write
+#                       load; each round: kill → dead-mount sweep →
+#                       remount (the successor re-arms MW over the dead
+#                       incarnation's STANDING WERO reservation — the
+#                       device-observed takeover, fence_mode=1 asserted)
+#                       → FULL online fsck with the C8 oracle
+#                       (findings: 0; meta_kv_block_refs_drift == 0 — the
+#                       --multi-writer format stamps bit 9, so the
+#                       durable ledger runs for real) → tripwires flat
+#                       (invariant_tripwires, data_dma_fence_refusals,
+#                       R5 backstops all 0 on the successor). COUNTED-
+#                       RESTART discipline: any failure aborts the count;
+#                       the matrix restarts from zero on the fixed
+#                       binary. Reader recovery + dirty-skip tripwire
+#                       asserted at matrix end.
 #   vm-multi-identity   (rung 6b — needs --vm=V) the N>=2-identity mount
 #                       shape LIVE inside guest 0 on the 0030 kernel:
 #                       writer A formats --multi-writer over the reserved
@@ -119,6 +167,7 @@
 #
 # Usage:  sudo tests/run_mw_matrix.sh <leg> [--require-host-scoped-subsys]
 #         [--window=S] [--netem=MS] [--victim=IDX]   (the s6-* legs)
+#         [--rounds=N]                               (s7-kill-matrix)
 # Exit:   0 green (or a loud SKIP), nonzero on any INVALID row / violation.
 #
 # Requires: root, a live fleet (sudo tests/mw_fleet.sh create N=2), python3.
@@ -163,17 +212,20 @@ REQUIRE_HS=0
 S6_WINDOW_S="${SQZ_MWMATRIX_S6_WINDOW_S:-600}"
 S6_NETEM_MS=200
 S6_VICTIM=""
+S7_ROUNDS=10
 for a in "$@"; do
     case "$a" in
     --require-host-scoped-subsys) REQUIRE_HS=1 ;;
     --window=*) S6_WINDOW_S="${a#--window=}" ;;
     --netem=*) S6_NETEM_MS="${a#--netem=}" ;;
     --victim=*) S6_VICTIM="${a#--victim=}" ;;
+    --rounds=*) S7_ROUNDS="${a#--rounds=}" ;;
     *) die "unknown argument '$a'" ;;
     esac
 done
 [[ "$S6_WINDOW_S" =~ ^[0-9]+$ ]] || die "--window takes seconds (got '$S6_WINDOW_S')"
 [[ "$S6_NETEM_MS" =~ ^[0-9]+$ ]] || die "--netem takes ms (got '$S6_NETEM_MS')"
+[[ "$S7_ROUNDS" =~ ^[0-9]+$ ]] && [ "$S7_ROUNDS" -ge 1 ] || die "--rounds takes a positive integer (got '$S7_ROUNDS')"
 
 ensure_root "$LEG" "$@"
 command -v python3 >/dev/null 2>&1 || die "python3 is required (the row emitter)"
@@ -1280,6 +1332,399 @@ JOBC
     log "s6-vm-fence leg GREEN (evidence in $rowdir)"
 }
 
+# --- rung-8 S7 legs (design-full-multi-writer §7.2 rows S7-a / S7-b) --------
+require_mw() {
+    require_membership
+    [ "${MW:-0}" = "1" ] ||
+        die "this leg needs a multi-writer-armed fleet — create it with: sudo tests/mw_fleet.sh create N=2 --multi-writer [--lease-ttl-ms=15000]"
+    [ "$(stat_field 0 data_plane_fence_mode)" = "1" ] ||
+        die "member 0 data_plane_fence_mode != 1 — the S7 WERO hold is not standing"
+}
+
+# Controller (nvmeX) serving <subsysnqn> under <hostnqn> — the rung-2
+# ctrl-char-dev discipline (the head block node round-robins paths; the
+# char device pins the association).
+ctrl_for() { # subsysnqn hostnqn -> nvmeX
+    local c
+    for c in /sys/class/nvme/nvme*; do
+        [ -d "$c" ] || continue
+        [ "$(cat "$c/subsysnqn" 2>/dev/null)" = "$1" ] || continue
+        [ "$(cat "$c/hostnqn" 2>/dev/null)" = "$2" ] || continue
+        basename "$c"
+        return 0
+    done
+    return 1
+}
+
+# Reservation report probe: prints "<regctl> <rtype> <rkey0>" (rkey0 = the
+# first registrant's key, 0x-hex; '-' when none). nvme-cli json spellings
+# vary across releases — parse defensively.
+resv_probe() { # ctrl-char-dev nsid
+    nvme resv-report "$1" -n "$2" -o json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    r = json.load(sys.stdin)
+except Exception:
+    print("- - -"); raise SystemExit
+regctl = r.get("regctl", 0)
+rtype = r.get("rtype", 0)
+regs = r.get("regctlext") or r.get("regctl_ext") or r.get("regctls") or []
+rkey = "-"
+if regs:
+    k = regs[0].get("rkey", 0)
+    rkey = hex(k) if isinstance(k, int) else str(k)
+print(regctl, rtype, rkey)'
+}
+
+# Delete ONE controller by name (sysfs) — never `nvmeof disconnect <nqn>`,
+# which would drop the WRITER's association on the same NQN too.
+delete_ctrl() { # nvmeX
+    echo 1 >"/sys/class/nvme/$1/delete_controller" 2>/dev/null || true
+    local t
+    for t in $(seq 1 40); do
+        [ -d "/sys/class/nvme/$1" ] || return 0
+        sleep 0.25
+    done
+    warn "controller $1 did not tear down within 10s"
+}
+
+# Read one flattened stats field out of a SNAPSHOT file (frozen daemons
+# cannot serve their stats inode — snapshots are the frozen-window truth).
+snap_field() { # snapfile key
+    python3 -c '
+import json, sys
+def flat(d, out=None, pfx=""):
+    out = {} if out is None else out
+    for k, v in d.items():
+        if isinstance(v, dict): flat(v, out, pfx + k + ".")
+        else: out[pfx + k] = v
+    return out
+root = json.load(open(sys.argv[1]))
+print(flat(root.get("metrics", root)).get(sys.argv[2], ""))' "$1" "$2"
+}
+
+leg_s7_device_fence() {
+    require_mw
+    local rowdir victim_reader
+    rowdir="$STATE/rows/s7fence-$(date +%s)"
+    mkdir -p "$rowdir"
+    victim_reader="$(member_idxs | awk '$1!=0' | head -1)"
+    [ -n "$victim_reader" ] || die "s7-device-fence needs N>=2 (a reader member observes the frozen owner)"
+
+    local w_mnt ttl renew_est
+    w_mnt="$(mnt_of 0)"
+    ttl="$(stat_field 0 membership_lease_ttl_ms)"
+    renew_est="$(owner_renew_est_s)"
+    log "s7-device-fence (SCOPED posture — see header): victim = the ARMED WRITER m0 (owner+authority+WERO holder); recovery actor = the rig via the rung-2 preempt primitive; T_owner=${ttl}ms"
+
+    # --- device-truth p0: the zombie's registrant key per data namespace ----
+    # Read through the WRITER's own daemon-owned controllers (reservation
+    # REPORT is a read; the char dev pins the association).
+    local nqn wctrl regctl rtype zkey="" probe
+    local -a data_nqns=()
+    read -r -a data_nqns <<<"$DATA_NQNS"
+    [ "${#data_nqns[@]}" -ge 1 ] || die "config carries no DATA_NQNS"
+    for nqn in "${data_nqns[@]}"; do
+        wctrl="$(ctrl_for "$nqn" "$W_HOSTNQN")" ||
+            die "no writer-identity controller for data NQN $nqn"
+        probe="$(resv_probe "/dev/$wctrl" 1)"
+        read -r regctl rtype zkey <<<"$probe"
+        [ "$rtype" = "3" ] ||
+            die "$nqn: standing reservation rtype=$rtype (want 3 = WERO) — the S7 hold is not what the arm claims"
+        [ "$regctl" = "1" ] ||
+            die "$nqn: regctl=$regctl (want exactly 1 = the writer) before the recovery actor registers"
+        [ "$zkey" != "-" ] || die "$nqn: no registrant key readable"
+        log "p0 device truth: $nqn rtype=3 regctl=1 zombie key=$zkey (via /dev/$wctrl)"
+    done
+
+    local i
+    for i in $(member_idxs); do snap "$i" 0 "$rowdir"; done
+    local rfence0
+    rfence0="$(stat_field "$victim_reader" membership_self_fences)"
+
+    # --- sustained write load, running when the freeze lands ----------------
+    log "starting sustained write load on the writer mount"
+    (exec dd if=/dev/zero of="$w_mnt/s7load.dat" bs=1M count=16384 conv=fsync status=none) &
+    local dd_pid=$!
+    sleep 3 # let the pipeline fill (in-flight DMA to resume later)
+    kill -0 "$dd_pid" 2>/dev/null || die "write load exited before the freeze (too small for this box?)"
+
+    # --- freeze the armed writer past the membership TTL --------------------
+    "$MWFLEET" kill 0 --sig STOP
+    log "armed writer m0 SIGSTOPped (frozen daemon; its kernel keeps draining already-submitted DMA)"
+    # S6 composition face: the reader member observes the FROZEN owner and
+    # self-fences by its own clock (T_self) before any re-grant could exist.
+    local rfences
+    rfences="$(wait_stat_ge "$victim_reader" membership_self_fences $((rfence0 + 1)) $((ttl / 1000 + 6 * renew_est + 60)) "reader self-fence against the frozen owner")"
+    log "reader m$victim_reader self-fenced against the frozen owner (membership_self_fences $rfence0 -> $rfences) — the S6 owner-death law"
+    # Let already-submitted kernel I/O drain to the single existing path
+    # before a second path exists (merged-head kernels round-robin).
+    sleep 3
+
+    # --- the recovery actor: register + PREEMPT the zombie's key ------------
+    # The rung-2-proven product takeover primitive, per data namespace: a
+    # RECOVERY identity registers its own key and preempts the zombie's
+    # (racqa=1) — the same act a successor's drain proof performs
+    # (WeroHold::preempt). The reservation stays HELD by the recovery key:
+    # releasing it would re-admit the zombie (WERO rejects only while a
+    # reservation stands).
+    local r_id r_nqn rkey=0x51e7a8 rctrl
+    r_id="$(printf 'cafef1e7-%04d-4000-8000-%012d' 87 "$CREATE_PID")"
+    r_nqn="nqn.2014-08.org.nvmexpress:uuid:$r_id"
+    local -a rctrls=()
+    for nqn in "${data_nqns[@]}"; do
+        "$SQZ" nvmeof connect --ip "$TCP_ADDR" --port "$TCP_SVC" --subnqn "$nqn" \
+            --hostnqn "$r_nqn" --hostid "$r_id" >/dev/null 2>&1 ||
+            die "recovery-identity connect failed for $nqn"
+        rctrl=""
+        for i in $(seq 1 40); do
+            rctrl="$(ctrl_for "$nqn" "$r_nqn")" && break
+            sleep 0.25
+        done
+        [ -n "$rctrl" ] || die "no recovery-identity controller for $nqn"
+        rctrls+=("$rctrl")
+        nvme resv-register "/dev/$rctrl" -n 1 --nrkey="$rkey" --cptpl=0 >/dev/null ||
+            die "recovery register failed on $nqn"
+        nvme resv-acquire "/dev/$rctrl" -n 1 --crkey="$rkey" --prkey="$zkey" \
+            --rtype=3 --racqa=1 >/dev/null ||
+            die "recovery preempt of the zombie key $zkey failed on $nqn"
+        probe="$(resv_probe "/dev/$rctrl" 1)"
+        read -r regctl rtype _ <<<"$probe"
+        [ "$regctl" = "1" ] && [ "$rtype" = "3" ] ||
+            die "$nqn post-preempt report: regctl=$regctl rtype=$rtype (want 1/3) — the preempt did not land"
+        log "PR preempt observed on target: $nqn zombie key $zkey removed, recovery key $rkey holds WERO (regctl=1)"
+    done
+    echo "${rctrls[*]}" >"$rowdir/recovery-ctrls"
+    # Drop the recovery PATHS before the zombie resumes: on a merged-head
+    # (multipath=Y) kernel the resumed zombie's I/O must ride ITS OWN
+    # association only. The reservation is host-keyed device state and
+    # stands after the disconnect.
+    for rctrl in "${rctrls[@]}"; do delete_ctrl "$rctrl"; done
+    log "recovery paths dropped (reservation stands, held by $rkey)"
+
+    # --- resume: the zombie's DMA must be rejected BY THE DEVICE ------------
+    "$MWFLEET" kill 0 --sig CONT
+    log "zombie writer m0 resumed (SIGCONT) — its in-flight + new DMA now meets the device fence"
+    # The reservation-conflict errno class (EBADE, 'Invalid exchange') on a
+    # DATA volume, then the zombie's own fail-stop: the fence latch + the
+    # custody poison + refusals counted (data_dma_fence_refusals).
+    local t0 now deadline=120
+    t0="$(date +%s)"
+    while :; do
+        grep -Eq "os error 52|Invalid exchange" "$STATE/m0.log" && break
+        now="$(date +%s)"
+        [ $((now - t0)) -lt "$deadline" ] ||
+            die "no reservation-conflict errno class (EBADE/os error 52) in the zombie's log within ${deadline}s — the device did not reject the resumed DMA"
+        sleep 1
+    done
+    log "device rejection observed: reservation-conflict errno class in the zombie's log"
+    wait_log_line "$STATE/m0.log" "writer guard FENCED" "$deadline" "zombie data-plane fence latch"
+    wait_log_line "$STATE/m0.log" "data-plane custody POISONED" "$deadline" "zombie custody poison"
+    local refusals
+    refusals="$(wait_stat_ge 0 data_dma_fence_refusals 1 "$deadline" "zombie data_dma_fence_refusals")"
+    log "zombie FAIL-STOPPED: fence latched, custody poisoned, data_dma_fence_refusals=$refusals"
+    kill -9 "$dd_pid" 2>/dev/null || true
+    wait "$dd_pid" 2>/dev/null || true
+
+    # --- the S6->S7 handoff on the resumed owner: evict + dead-epoch mint ---
+    # The owner's TTL sweep finds every member lease that died during the
+    # freeze, evicts it, and mints its S7 dead epoch (a READER's cohort
+    # names no offsets — the gauge law is asserted in the gate below).
+    wait_log_line "$STATE/m0.log" "declared DEAD (membership: member" "$((6 * renew_est + 60))" "owner dead-epoch mint for the expired member lease(s)"
+    log "resumed owner evicted its expired member(s) + minted the S7 dead epoch(s)"
+
+    sleep 2
+    for i in $(member_idxs); do snap "$i" 1 "$rowdir"; done
+
+    # --- the leg gate --------------------------------------------------------
+    python3 - "$rowdir" "$victim_reader" <<'PYGATE'
+import glob, json, re, sys
+
+rowdir, victim_reader = sys.argv[1], sys.argv[2]
+
+def flat(d, out=None, pfx=""):
+    out = {} if out is None else out
+    for k, v in d.items():
+        if isinstance(v, dict):
+            flat(v, out, pfx + k + ".")
+        else:
+            out[pfx + k] = v
+    return out
+
+def load(p):
+    root = json.load(open(p))
+    return flat(root.get("metrics", root))
+
+bad = []
+for p1 in sorted(glob.glob(f"{rowdir}/m*_p1.json")):
+    i = re.match(r".*/m(\d+)_p1", p1).group(1)
+    d1, d0 = load(p1), load(f"{rowdir}/m{i}_p0.json")
+    dd = lambda k: int(d1.get(k, 0)) - int(d0.get(k, 0))
+    fence = dd("data_dma_fence_refusals")
+    epoch = dd("data_dma_epoch_refusals")
+    quarantined = int(d1.get("dlm_quarantined_offsets", 0))
+    releases = dd("dlm_quarantine_releases")
+    trip = dd("invariant_tripwires")
+    backstops = dd("mem_budget_hard_backstops")
+    gate_to = dd("parked_gate_timeouts")
+    evict = dd("membership_evictions")
+    if i == "0":
+        # The VICTIM: fenced, refusing, epoch class ⊆ fence class (0 here
+        # BY CONSTRUCTION — no custody moved inside the zombie's process:
+        # no term bump, no revoked grant; the fence is the POISON latch).
+        if fence < 1:
+            bad.append(f"m0 (victim): data_dma_fence_refusals delta {fence} < 1")
+        if not (0 <= epoch <= fence):
+            bad.append(f"m0 (victim): epoch_refusals {epoch} not within [0, fence {fence}]")
+        if epoch != 0:
+            bad.append(f"m0 (victim): epoch_refusals {epoch} != 0 — nothing advanced the zombie's custody generation in this scoped posture")
+        if evict < 1:
+            bad.append(f"m0: membership_evictions delta {evict} < 1 — the resumed owner never swept its dead member leases")
+        if int(d1.get("write_pipeline_fence_drops", 0)) < 0:
+            bad.append("m0: fence_drops went negative (counter corruption)")
+    else:
+        # The BLAST RADIUS: no fence movement anywhere but the victim.
+        if fence != 0 or epoch != 0:
+            bad.append(f"m{i}: data-plane fence/epoch refusals moved ({fence}/{epoch}) on a non-victim")
+        if int(d1.get("data_plane_fence_mode", 0)) != 0:
+            bad.append(f"m{i}: data_plane_fence_mode != 0 on a reader")
+    # The QUARANTINE law (scoped): a READER's dead epoch names no offsets,
+    # so the gauge stays 0 and NOTHING was released without a drain proof.
+    # The offset-holding cohorts (S9 custody grants, job-wire destinations)
+    # are rungs 9-10; their no-release-without-a-proof law is pinned in
+    # cargo (tests/dlm_data_fence_tests.rs).
+    if quarantined != 0:
+        bad.append(f"m{i}: dlm_quarantined_offsets={quarantined} — nothing at this rung may hold offsets")
+    if releases != 0:
+        bad.append(f"m{i}: dlm_quarantine_releases moved ({releases}) with no drain proof issued")
+    if trip != 0:
+        bad.append(f"m{i}: invariant_tripwires moved ({trip})")
+    if backstops != 0 or gate_to != 0:
+        bad.append(f"m{i}: R5 columns moved (backstops={backstops}, gate_timeouts={gate_to})")
+
+if bad:
+    print("S7-a GATE FAILED:", file=sys.stderr)
+    for b in bad:
+        print(f"  {b}", file=sys.stderr)
+    sys.exit(1)
+print("S7-a GATE GREEN (device rejection + zombie fail-stop + preempt observed; quarantine law held; blast radius = the victim)")
+PYGATE
+
+    # --- restore the fleet ----------------------------------------------------
+    # The zombie is DEAD BY DESIGN (a fenced holder is dead until remount):
+    # kill it, clear the recovery hold (safe — the zombie is gone), remount
+    # the writer fresh (a fresh WERO under a fresh key), and require the
+    # reader to re-join the new owner.
+    "$MWFLEET" kill 0 --sig 9 || true
+    sleep 1
+    for nqn in "${data_nqns[@]}"; do
+        "$SQZ" nvmeof connect --ip "$TCP_ADDR" --port "$TCP_SVC" --subnqn "$nqn" \
+            --hostnqn "$r_nqn" --hostid "$r_id" >/dev/null 2>&1 || true
+        rctrl=""
+        for i in $(seq 1 40); do
+            rctrl="$(ctrl_for "$nqn" "$r_nqn")" && break
+            sleep 0.25
+        done
+        if [ -n "$rctrl" ]; then
+            nvme resv-release "/dev/$rctrl" -n 1 --crkey="$rkey" --rtype=3 >/dev/null 2>&1 || true
+            nvme resv-register "/dev/$rctrl" -n 1 --crkey="$rkey" --rrega=1 >/dev/null 2>&1 || true
+            delete_ctrl "$rctrl"
+        fi
+    done
+    log "recovery reservation released + recovery identity unregistered (the zombie is dead; the successor takes its own hold)"
+    umount -l "$w_mnt" 2>/dev/null || true
+    wait_for_unmounted "$w_mnt"
+    "$MWFLEET" mount 0
+    [ "$(stat_field 0 data_plane_fence_mode)" = "1" ] ||
+        die "restored writer did not re-arm the WERO hold"
+    local ttl_s=$((ttl / 1000))
+    wait_stat_eq "$victim_reader" membership_mode member $((ttl_s + 6 * renew_est + 90)) "reader re-join of the restored owner"
+    log "s7-device-fence leg GREEN (writer restored, reader re-joined; rows + device truth in $rowdir)"
+}
+
+wait_for_unmounted() { # mountpoint
+    local t
+    for t in $(seq 1 120); do
+        : "$t"
+        mountpoint -q "$1" || return 0
+        sleep 0.5
+    done
+    die "$1 never unmounted"
+}
+
+leg_s7_kill_matrix() {
+    require_mw
+    local rowdir w_mnt reader_idx
+    rowdir="$STATE/rows/s7kill-$(date +%s)"
+    mkdir -p "$rowdir"
+    w_mnt="$(mnt_of 0)"
+    reader_idx="$(member_idxs | awk '$1!=0' | head -1)"
+    log "s7-kill-matrix: kill -9 x$S7_ROUNDS of the ARMED writer at randomized phases under sustained write load; per round: remount (WERO takeover over the dead incarnation's standing reservation) + FULL online fsck with the C8 oracle. COUNTED-RESTART discipline applies."
+
+    local round phase_ms dd_pid t_kill t_up out findings drift fence_ref trip backstops fm
+    printf '%-6s %-9s %-9s %-10s %-6s %-10s %-6s %s\n' ROUND PHASE_MS REMOUNT_S FSCK DRIFT FENCE_REF TRIP VERDICT | tee "$rowdir/matrix.tsv"
+    for ((round = 1; round <= S7_ROUNDS; round++)); do
+        # Sustained load, randomized kill phase (0.5 .. 8.5 s into it).
+        rm -f "$w_mnt/s7kill.dat" 2>/dev/null || true
+        (exec dd if=/dev/zero of="$w_mnt/s7kill.dat" bs=1M count=16384 conv=fsync status=none) &
+        dd_pid=$!
+        phase_ms=$((500 + RANDOM % 8000))
+        sleep "$(python3 -c "print($phase_ms/1000)")"
+        kill -0 "$dd_pid" 2>/dev/null ||
+            die "round $round: write load died before the kill phase (${phase_ms}ms)"
+        "$MWFLEET" kill 0 --sig 9
+        t_kill="$(date +%s)"
+        kill -9 "$dd_pid" 2>/dev/null || true
+        wait "$dd_pid" 2>/dev/null || true
+        # Sweep the dead FUSE mount, then the successor takes the D0 ladder
+        # AND the WERO takeover (same host identity: the register ladder
+        # replaces the dead incarnation's registration; the acquire lands
+        # on the standing rtype-3 reservation).
+        umount -l "$w_mnt" 2>/dev/null || true
+        wait_for_unmounted "$w_mnt"
+        "$MWFLEET" mount 0 ||
+            die "round $round: successor remount FAILED (the WERO takeover or the D0 ladder refused)"
+        t_up="$(date +%s)"
+        fm="$(stat_field 0 data_plane_fence_mode)"
+        [ "$fm" = "1" ] || die "round $round: successor data_plane_fence_mode=$fm (want 1)"
+        # The oracle: FULL online fsck (C1-C10, C8 ungated on this stamped
+        # format — the durable ledger runs for real).
+        out="$("$SQZ" fsck "$w_mnt" 2>&1)" ||
+            die "round $round: online fsck FAILED or found:
+$out"
+        echo "$out" >"$rowdir/fsck-r$round.out"
+        echo "$out" | grep -q "findings: 0" ||
+            die "round $round: fsck findings != 0:
+$out"
+        findings=0
+        drift="$(stat_field 0 meta_kv_block_refs_drift)"
+        [ "$drift" = "0" ] || die "round $round: meta_kv_block_refs_drift=$drift (C8 oracle RED)"
+        fence_ref="$(stat_field 0 data_dma_fence_refusals)"
+        [ "$fence_ref" = "0" ] || die "round $round: successor data_dma_fence_refusals=$fence_ref (a fresh mount fenced itself)"
+        trip="$(stat_field 0 invariant_tripwires)"
+        [ "$trip" = "0" ] || die "round $round: invariant_tripwires=$trip on the successor"
+        backstops="$(stat_field 0 mem_budget_hard_backstops)"
+        [ "$backstops" = "0" ] || die "round $round: mem_budget_hard_backstops=$backstops (R5 column)"
+        printf '%-6s %-9s %-9s %-10s %-6s %-10s %-6s %s\n' "$round" "$phase_ms" "$((t_up - t_kill))" "findings:$findings" "$drift" "$fence_ref" "$trip" GREEN | tee -a "$rowdir/matrix.tsv"
+    done
+
+    # Matrix-end fleet health: the reader must have re-joined the LAST
+    # successor and its rung-6 tripwire must be flat.
+    if [ -n "$reader_idx" ]; then
+        local ttl ttl_s renew_est
+        ttl="$(stat_field 0 membership_lease_ttl_ms)"
+        ttl_s=$((ttl / 1000))
+        renew_est="$(owner_renew_est_s)"
+        wait_stat_eq "$reader_idx" membership_mode member $((ttl_s + 6 * renew_est + 90)) "reader re-join after the matrix"
+        [ "$(stat_field "$reader_idx" meta_kv_revalidate_dirty_skips)" = "0" ] ||
+            die "reader dirty_skips != 0 after the matrix (the rung-6 finding-#1 tripwire)"
+        [ "$(stat_field "$reader_idx" invariant_tripwires)" = "0" ] ||
+            die "reader invariant_tripwires != 0 after the matrix"
+        log "reader m$reader_idx healthy after the matrix (member, dirty_skips=0, tripwires=0)"
+    fi
+    log "s7-kill-matrix GREEN: $S7_ROUNDS/$S7_ROUNDS rounds (table + fsck reports in $rowdir)"
+}
+
 leg_cowriters_admission() {
     if [ "$HOST_SCOPED" != "1" ]; then
         local reason="multi-identity (co-writer) legs need host-scoped fabric subsystems: this kernel merges controllers by subsysnqn ignoring hostnqn (nvme_core.multipath=Y), so co-located identities share one head — rung 5b (the sqz-kernel fix, validated in the rung-6b qemu guest) unlocks them. Stock-kernel workaround: nvme_core.multipath=N (boot parameter)"
@@ -1295,8 +1740,10 @@ multipath-negative) leg_multipath_negative ;;
 s6-journal) leg_s6_journal ;;
 s6-fence) leg_s6_fence ;;
 s6-vm-fence) leg_s6_vm_fence ;;
+s7-device-fence) leg_s7_device_fence ;;
+s7-kill-matrix) leg_s7_kill_matrix ;;
 cowriters-admission) leg_cowriters_admission ;;
 vm-hostscope-validate) leg_vm_hostscope_validate ;;
 vm-multi-identity) leg_vm_multi_identity ;;
-*) die "unknown leg '$LEG' (smoke|multipath-negative|s6-journal|s6-fence|s6-vm-fence|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
+*) die "unknown leg '$LEG' (smoke|multipath-negative|s6-journal|s6-fence|s6-vm-fence|s7-device-fence|s7-kill-matrix|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
 esac

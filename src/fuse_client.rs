@@ -16897,6 +16897,40 @@ impl SqueezefsFilesystem {
         out
     }
 
+    /// Defense #4 probe of the moving-custody read protocol (fstests
+    /// generic/795 — the 2026-08-15 recopy-storm conviction): the B4
+    /// device overlay is a FOURTH custody station. A block's acked,
+    /// size-published bytes can live at an overlay record's UNPUBLISHED
+    /// device dest, where none of the loop's other defenses can see
+    /// them — the pre/post parked-run captures probe RAM overlays only,
+    /// and the custody fingerprint hashes map keys + custody epochs,
+    /// neither of which an Open/Frozen record moves (install, store and
+    /// ACK all leave both untouched by design). Returns the window's
+    /// blocks currently holding a LIVE (non-terminal) overlay record;
+    /// terminal records need no probe — their publish/feed moved the RAM
+    /// map, which the fingerprint sees. One relaxed gauge load on
+    /// overlay-free mounts (the `any_open_fast` discipline).
+    fn device_overlay_blocks_in_window(&self, ino: u64, offset: u64, len: usize) -> Vec<u32> {
+        if len == 0 || !crate::device_overlay::any_open_fast() {
+            return Vec::new();
+        }
+        let block_size = self.router.block_size.load(Ordering::Relaxed);
+        if block_size == 0 {
+            return Vec::new();
+        }
+        let start_block = (offset / block_size) as u32;
+        let end_block = ((offset + len as u64 - 1) / block_size) as u32;
+        let mut out = Vec::new();
+        for b in start_block..=end_block {
+            if let Some(rec) = self.device_overlays.get(ino, b) {
+                if !rec.core.state().is_terminal() {
+                    out.push(b);
+                }
+            }
+        }
+        out
+    }
+
     /// Overlay absolute-offset byte runs onto `data` (read reply base at
     /// `offset`). Allocates only when a run actually intersects the range.
     fn apply_parked_runs(offset: u64, data: bytes::Bytes, runs: &[(u64, Vec<u8>)]) -> bytes::Bytes {
@@ -20338,7 +20372,19 @@ impl Filesystem for SqueezefsFilesystem {
         //     the read; the fresh pass resolves the published map. Bounded:
         //     each retry needs another publish inside the ever-smaller
         //     window; exhaustion serves the last compose (a racing read may
-        //     legally serve any value current within its window).
+        //     legally serve any value current within its window);
+        //  4. the post-read DEVICE-OVERLAY probe (the 2026-08-15 recopy-
+        //     storm conviction — generic/795's flake face): the B4 overlay
+        //     is a fourth custody station whose acked bytes live at an
+        //     UNPUBLISHED dest — invisible to captures (1)/(2) (RAM
+        //     probes) and to fingerprint (3) (an Open/Frozen record moves
+        //     neither map keys nor custody epochs). The entry drain above
+        //     races the install, so a live record found AFTER the router
+        //     read is drained (freeze -> seed -> publish — the entry
+        //     drain's own verb) and the read re-runs; the fresh pass
+        //     resolves the published bytes. Bounded by the same attempts
+        //     budget: each retry needs another install inside the
+        //     ever-smaller window.
         let mut bindings_before = self
             .read_custody_fingerprint(guard_meta.as_ref(), &file_path, ino, offset, read_len)
             .await;
@@ -20402,6 +20448,9 @@ impl Filesystem for SqueezefsFilesystem {
                     .await;
                 if post_runs.is_empty()
                     && read_custody_fp_matches(&bindings_after, &bindings_before)
+                    && self
+                        .device_overlay_blocks_in_window(ino, offset, read_len)
+                        .is_empty()
                 {
                     break (data, backing, router_done_at);
                 }
@@ -20420,6 +20469,31 @@ impl Filesystem for SqueezefsFilesystem {
             let bindings_after = self
                 .read_custody_fingerprint(None, &file_path, ino, offset, read_len)
                 .await;
+            // Defense #4: a LIVE overlay record inside the window means
+            // acked bytes this compose could not see — drain it (the entry
+            // drain's own verb; the settle publishes destination-before-
+            // retire, so the re-read resolves the bytes) and re-run. A
+            // drain failure propagates loud with the record still parked
+            // (never-lossy): serving the compose would serve zeros for
+            // acked bytes. Runs before the fingerprint verdict — an open
+            // record invalidates the serve regardless of map movement.
+            let overlay_blocks = self.device_overlay_blocks_in_window(ino, offset, read_len);
+            if !overlay_blocks.is_empty() && attempts < 4 {
+                for b in overlay_blocks {
+                    self.drain_device_overlay_block(ino, b, false)
+                        .await
+                        .map_err(map_squeezefs_err)?;
+                    METRICS.overlay_read_drains.fetch_add(1, Ordering::Relaxed);
+                }
+                attempts += 1;
+                zc_enabled = false;
+                // The drains just moved the map: re-fingerprint fresh so
+                // the next pass judges against the post-drain world.
+                bindings_before = self
+                    .read_custody_fingerprint(None, &file_path, ino, offset, read_len)
+                    .await;
+                continue;
+            }
             if read_custody_fp_matches(&bindings_after, &bindings_before) || attempts >= 4 {
                 break (data, backing, router_done_at);
             }

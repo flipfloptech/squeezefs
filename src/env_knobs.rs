@@ -276,6 +276,7 @@ pub static KNOBS: &[Knob] = &[
     k("SQUEEZEFS_META_SHIP_DEDUP_MAX", int(1, 1 << 24), "derived max(batch_max x 128, 8192)", "Owner-side idempotency window entries — how far back a client's retry may reach and still be answered from its original outcome (S8 requirement 6). Retiring an entry only weakens exactly-once for a retry arriving after that many newer ops from the SAME client."),
     k("SQUEEZEFS_DLM_TOKEN_CACHE_MAX", int(1, 1 << 24), "derived max(R5 budget/8192/32 B, 4096)", "Client fencing-token cache entries (S8's resolution of the S4 fencing-read contract; spec §6.5 item 1 requires >= 99.5 % of lock operations served locally). Every eviction costs one loud miss and one shipped getattr refresh, never a wrong answer."),
     // -- Membership plane (DLM S6 — liveness off the journal) ------------
+    k("SQUEEZEFS_FLEET_JOBS", Kind::Bool, "on", "KD-MW-16 (rung 10c, docs/design-mw-fleet-jobs.md): fleet-parallel maintenance participation. On a READER/CO-WRITER mount that has joined the S6 membership plane, `on` (the default) spawns the fleet job worker at mount — it proves storage trust with the job:enroll HMAC (the access it already holds IS the credential) and serves fleet READ shards (fsck census/scrub residues) to the coordinator over the §5.1.6 wire. On the COORDINATOR, `on` lets the fsck detect pass fan out across enrolled read workers (zero enrolled workers = the local run verbatim). `0` disarms both halves on the mount that sets it; it never affects peers."),
     k("SQUEEZEFS_MEMBERSHIP_BIND", Kind::Str, "off", "DLM S6: where this mount serves the membership plane — `off` (default), `auto` (0.0.0.0:0, ruling D2's posture), or an explicit `addr:port`. Armed, a WRITE mount becomes the lease authority (its census is what `squeezefs clients` reads, and readers become visible for the first time) and a READ-ONLY mount joins as a member; the durable footprint is ONE rendezvous record written at arm. Default off because flipping it changes what an operator sees, and the measured validation that would justify a new default is deferred (ruling D11)."),
     k("SQUEEZEFS_MEMBERSHIP_LEASE_TTL_MS", int(1_000, MS_MAX), "45000 (= CLIENT_STALE_TTL_SECS)", "DLM S6: the OWNER's lease TTL, ms. Defaults to the ONE staleness law's 45 s so `live`/`stale` means the same thing on the plane and in the `client:`/`writer_claim` records. The member's own deadline is always stricter: T_self = T_owner − 2·skew_max − D_purge."),
     k("SQUEEZEFS_MEMBERSHIP_SKEW_MAX_MS", int(1, 60_000), "derived max(T_owner × 500 ppm, observed RTT)", "DLM S6 (spec §6.7): clock-skew bound between owner and member, ms. Derived from the physical monotonic-clock rate bound (500 ppm ⇒ 22.5 ms at a 45 s TTL) and the measured renewal RTT, whichever is larger. Raising it shortens T_self; a value that collapses T_self REFUSES the plane rather than clamping."),
@@ -478,6 +479,13 @@ pub fn refusal_report() -> Option<String> {
 /// so the remaining case is a library embedding or a test mutating the
 /// environment mid-process: announce it and keep the documented default —
 /// never silently, never a panic inside a `OnceLock` initializer.
+/// KD-MW-16: fleet-parallel maintenance participation (worker arm on
+/// members, fan-out arm on the coordinator). Default ON; `=0` disarms
+/// this mount's half only.
+pub fn fleet_jobs_enabled() -> bool {
+    bool_knob("SQUEEZEFS_FLEET_JOBS", true)
+}
+
 pub fn bool_knob(key: &str, default: bool) -> bool {
     let raw = std::env::var(key).ok();
     match core::parse_bool(key, raw.as_deref()) {

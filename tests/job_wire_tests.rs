@@ -332,6 +332,7 @@ async fn enrollment_hmac_gate_and_schema_refusal() {
             endpoint_nonce: "nonce-1".into(),
             hmac,
             pr_key: None,
+            caps: 0,
         },
     )
     .expect("send future-schema enroll");
@@ -990,6 +991,7 @@ async fn enrollment_challenge_nonce_is_single_use() {
         endpoint_nonce: "worker-entropy".into(),
         hmac: squeezefs::job_wire::enroll_hmac(&secret, "w-replay", &nonce, "worker-entropy"),
         pr_key: None,
+        caps: 0,
     };
     write_frame(&mut conn, &hello).expect("send hello");
     match read_frame(&mut conn).expect("reply").expect("frame") {
@@ -1052,6 +1054,7 @@ async fn expired_enrollment_challenge_is_refused() {
             endpoint_nonce: "worker-entropy".into(),
             hmac: squeezefs::job_wire::enroll_hmac(&secret, "w-stale", &nonce, "worker-entropy"),
             pr_key: None,
+            caps: 0,
         },
     )
     .expect("send the stale hello");

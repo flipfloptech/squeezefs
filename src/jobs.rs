@@ -1000,6 +1000,56 @@ pub fn fabric_workers_default(cpus: usize) -> usize {
     cpus.div_euclid(4).clamp(2, 8)
 }
 
+// ---------------------------------------------------------------------------
+// KD-MW-16 (rung 10c, `docs/design-mw-fleet-jobs.md`): the fleet
+// read-shard dispatch seam between the fabric's job executors and the
+// §5.1.6 wire host.
+// ---------------------------------------------------------------------------
+
+/// One fleet shard's terminal outcome, delivered to the dispatching
+/// executor: `Some(payload)` = the worker's fencing-checked proposal
+/// (the shard report bytes); `None` = the shard was LOST (lease expiry,
+/// worker abandon, refused/malformed proposal) and the caller must
+/// re-lease it — re-dispatch or run the residue locally.
+#[derive(Debug)]
+pub struct FleetOutcome {
+    pub shard: u32,
+    pub payload: Option<Vec<u8>>,
+}
+
+/// The outcome channel a fleet shard set collects on (unbounded: a
+/// shard set is bounded by the enrolled-worker population, and the
+/// sender side runs on wire OS threads that must never park on a
+/// backpressured executor channel).
+pub type FleetOutcomeTx = squeezefs_ipc::sqz_channel::mpsc::UnboundedSender<FleetOutcome>;
+
+/// The fleet read-shard dispatch seam (KD-MW-16): implemented by
+/// [`crate::job_wire::JobWireHost`] and registered on the fabric at
+/// wire start, consumed by the fsck fleet fan-out
+/// (`crate::fsck::run_fleet`). A trait, deliberately: the fabric owns
+/// jobs and the wire owns sessions/leases — this seam is the ONE edge
+/// between them, and the in-process contracts drive it through the real
+/// host.
+pub trait FleetDispatch: Send + Sync {
+    /// Idle, non-expired sessions advertising `CAP_FLEET_READ` — the
+    /// population a fleet fan-out may shard across right now.
+    fn read_capacity(&self) -> usize;
+    /// Assign one ino-residue read shard (`shard_no` of `shard_count`)
+    /// to an idle read-capable session. Returns `false` when no such
+    /// session exists (the caller runs the residue locally). The shard
+    /// rides the full lease law: TTL + heartbeats, fencing bump on
+    /// expiry, stale proposals refused.
+    fn dispatch_read_shard(
+        &self,
+        job_id: &str,
+        shard_no: u32,
+        shard_count: u32,
+        job_type: &JobType,
+        throttle_pct: u32,
+        tx: &FleetOutcomeTx,
+    ) -> bool;
+}
+
 pub struct JobFabric {
     meta: Arc<RoutedMetaBackend>,
     jobs: parking_lot::Mutex<HashMap<String, Arc<JobCtl>>>,
@@ -1016,6 +1066,12 @@ pub struct JobFabric {
     /// current await point never resumes and nothing later persists
     /// (the documented kill-9 analog the crash-resume soak proves).
     workers_set: squeezefs_ipc::sqz_taskset::OwnedSet,
+    /// KD-MW-16: the fleet read-shard dispatch seam, registered by the
+    /// wire host at start. `Weak`, deliberately — the host holds the
+    /// fabric (`JobWireHost.fabric`), so a strong edge here would be an
+    /// Arc cycle that leaks both past teardown (the `defrag_fold_hook`
+    /// cycle-hygiene precedent).
+    fleet: parking_lot::Mutex<Option<std::sync::Weak<dyn FleetDispatch>>>,
 }
 
 impl JobFabric {
@@ -1043,6 +1099,7 @@ impl JobFabric {
                 "job_worker",
                 crate::meta_exec::spawn_meta,
             ),
+            fleet: parking_lot::Mutex::new(None),
         });
 
         // Crash-resume (KD-6): every durable non-terminal record is
@@ -1300,6 +1357,17 @@ impl JobFabric {
     /// The fabric's meta handle (admin sink / offline probes reuse it).
     pub fn meta_handle(&self) -> &Arc<RoutedMetaBackend> {
         &self.meta
+    }
+
+    /// KD-MW-16: register the fleet read-shard dispatch seam (the wire
+    /// host, at start). `Weak` — see the field note.
+    pub fn set_fleet_dispatch(&self, dispatch: std::sync::Weak<dyn FleetDispatch>) {
+        *self.fleet.lock() = Some(dispatch);
+    }
+
+    /// The registered fleet dispatch, if the wire host is still alive.
+    pub fn fleet_dispatch(&self) -> Option<Arc<dyn FleetDispatch>> {
+        self.fleet.lock().as_ref().and_then(|w| w.upgrade())
     }
 
     /// The configured local worker count — the §5.2 `transient` term's
@@ -1707,7 +1775,17 @@ impl JobFabric {
                 }
             });
         }
-        let outcome = crate::fsck::run(&fsck_ctx, &opts).await;
+        // KD-MW-16 (rung 10c): the detect pass fans out across enrolled
+        // fleet read workers when the wire host has any; with zero
+        // capacity (every single-writer mount) `run_fleet` IS `run` —
+        // the identity is pinned. `SQUEEZEFS_FLEET_JOBS=0` disarms the
+        // fan-out at the coordinator.
+        let fleet = if crate::env_knobs::fleet_jobs_enabled() {
+            self.fleet_dispatch()
+        } else {
+            None
+        };
+        let outcome = crate::fsck::run_fleet(&fsck_ctx, &opts, fleet, job_id).await;
         // PR VL6b (§5.6a): repair consumes the run's VERIFIED findings on
         // the coordinator — dry-run plans only; apply executes each action
         // under the object's lease. A repair error fails the job loudly

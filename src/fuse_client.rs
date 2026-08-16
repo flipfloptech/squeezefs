@@ -4966,6 +4966,26 @@ pub struct Metrics {
     /// Guarantee-class gauge: 1 = `pr` (coordinator holds WERO on every
     /// data namespace), 0 = `deferred-reclaim` (exported as the string).
     pub job_remote_fence_mode: Align64<AtomicU64>,
+    /// KD-MW-16 (rung 10c): fleet READ shards dispatched to enrolled
+    /// members — with `job_fleet_shards_completed`, the fleet-engagement
+    /// pair (a fleet fsck row is INVALID unless completed accounts for
+    /// the dispatched shards).
+    pub job_fleet_shards_dispatched: Align64<AtomicU64>,
+    /// KD-MW-16: fleet READ shard proposals accepted (fencing-current).
+    pub job_fleet_shards_completed: Align64<AtomicU64>,
+    /// KD-MW-16: fleet residues run LOCALLY after a loss (lease expiry,
+    /// abandon, refused proposal) or with no capable worker — the
+    /// re-lease ledger's local arm.
+    pub job_fleet_shards_relocal: Align64<AtomicU64>,
+    /// KD-MW-16 (member side): fleet READ shards this mount executed as
+    /// an enrolled worker — the member-engagement gauge.
+    pub job_fleet_worker_shards: Align64<AtomicU64>,
+    /// KD-MW-16 (member side): shards this member REFUSED because its
+    /// own R5 budget was Red (the abandon is the prompt re-lease law).
+    pub job_fleet_worker_red_aborts: Align64<AtomicU64>,
+    /// KD-MW-16 (gate 3): mover picks deferred because the ino holds a
+    /// live S9 custody grant — the §5.7 probe's custody arm engaging.
+    pub job_mover_custody_defers: Align64<AtomicU64>,
     pub writeback_superseded_noops: Align64<AtomicU64>,
     /// `FencingTokenExpired` failures that reached the retry ladder — a
     /// TRANSIENT generation-bump race post-FIND-M11-A (the merge
@@ -8179,6 +8199,20 @@ impl SqueezefsFilesystem {
         let router = self.router.clone();
         let overlays = self.device_overlays.clone();
         std::sync::Arc::new(move |ino, b| {
+            // KD-MW-16 gate 3 (design-mw-fleet-jobs §6): an ino with a
+            // LIVE S9 custody grant is NOT quiescent — a co-writer may
+            // be DMAing into its blocks under that grant right now, and
+            // a mover that copied one would republish bytes the grantee
+            // is still writing. Defer and re-plan (counted); by the
+            // revisit the grant has been released or the block moved on.
+            if let Some(owner) = crate::data_grant::custody_owner() {
+                if owner.ino_granted(ino) {
+                    METRICS
+                        .job_mover_custody_defers
+                        .fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+            }
             // §5.7 layer 1 (B4c-i): a live device-overlay record is the
             // one custody form this probe predates — NOT quiescent (the
             // mover defers and re-plans; by the revisit the record has
@@ -9090,6 +9124,12 @@ impl SqueezefsFilesystem {
                 // The §5.1.6 guarantee-class gauge, exported as its class
                 // name (the writer_guard_mode precedent).
                 "job_remote_fence_mode": if METRICS.job_remote_fence_mode.load(Ordering::Relaxed) == 1 { "pr" } else { "deferred-reclaim" },
+                "job_fleet_shards_dispatched": METRICS.job_fleet_shards_dispatched.load(Ordering::Relaxed),
+                "job_fleet_shards_completed": METRICS.job_fleet_shards_completed.load(Ordering::Relaxed),
+                "job_fleet_shards_relocal": METRICS.job_fleet_shards_relocal.load(Ordering::Relaxed),
+                "job_fleet_worker_shards": METRICS.job_fleet_worker_shards.load(Ordering::Relaxed),
+                "job_fleet_worker_red_aborts": METRICS.job_fleet_worker_red_aborts.load(Ordering::Relaxed),
+                "job_mover_custody_defers": METRICS.job_mover_custody_defers.load(Ordering::Relaxed),
                 "writeback_superseded_noops": METRICS.writeback_superseded_noops.load(Ordering::Relaxed),
                 "writeback_stale_token_retries": METRICS.writeback_stale_token_retries.load(Ordering::Relaxed),
                 "writeback_orphan_discards": METRICS.writeback_orphan_discards.load(Ordering::Relaxed),

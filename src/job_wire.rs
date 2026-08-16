@@ -156,7 +156,21 @@ use xxhash_rust::xxh3::xxh3_64;
 ///   frame here, which is the honest outcome for a protocol whose byte
 ///   layout changed; the version field makes the refusal legible when the
 ///   bytes happen to parse.
-pub const WIRE_SCHEMA: u32 = 3;
+/// * `4` — **KD-MW-16 fleet read shards** (rung 10c,
+///   `docs/design-mw-fleet-jobs.md`): `Enroll` grew the worker
+///   capability mask, `ShardDescriptor` the fleet residue pair, and the
+///   vocabulary the `ReadShardResult`/`ShardAbandon` frames. Bincode is
+///   positional, so the grown structs do not decode across the bump —
+///   the schema field is what makes that refusal legible.
+pub const WIRE_SCHEMA: u32 = 4;
+
+/// Worker capability bit (`Enroll.caps`, KD-MW-16): this worker executes
+/// **fleet READ shards** (fsck census/scrub residues through
+/// [`ShardDeviceSeam::run_fleet_shard`]). Capability classing is
+/// ROUTING, never security (design-mw-fleet-jobs §2): the coordinator
+/// uses it to pick sessions, and a lying capability buys a shard the
+/// worker can only abandon — re-leased, never trusted.
+pub const CAP_FLEET_READ: u32 = 1 << 0;
 
 /// The per-fabric enrollment-secret record on ino 1 (`job:` prefix ⇒
 /// behind the VL2 reserved-namespace FUSE screen; readable only through
@@ -234,6 +248,12 @@ pub struct ShardDescriptor {
     /// Duty-cycle percentage (KD-3) applied per remote worker.
     pub throttle_pct: u32,
     pub lease_ttl_ms: u64,
+    /// KD-MW-16: `Some((k, n))` = this is a **fleet READ shard** — the
+    /// worker executes the ino-residue `k` of `n` through
+    /// [`ShardDeviceSeam::run_fleet_shard`] and proposes the result as a
+    /// [`WireFrame::ReadShardResult`]. `None` = the whole-job mutating
+    /// shape (destinations + checksums), unchanged.
+    pub fleet: Option<(u32, u32)>,
 }
 
 /// The §5.1.6 job-shard wire vocabulary — the frames, not the transport
@@ -269,6 +289,9 @@ pub enum WireFrame {
         /// preempt it, never register it). `None` ⇒ this worker rides
         /// the deferred-reclaim guarantee class.
         pr_key: Option<u64>,
+        /// KD-MW-16: capability mask ([`CAP_FLEET_READ`]) — shard
+        /// ROUTING, never an authentication claim.
+        caps: u32,
     },
     EnrollOk {
         wire_schema: u32,
@@ -300,6 +323,28 @@ pub enum WireFrame {
     ResultRefused {
         job_id: String,
         shard: u32,
+        reason: String,
+    },
+    /// KD-MW-16: a fleet READ shard's result proposal — the serialized
+    /// shard report. Fencing-checked exactly like [`Self::ResultSubmit`];
+    /// it carries no destinations/checksums because a read shard writes
+    /// nothing (the coordinator's verification is the merge accounting +
+    /// the finalize's own re-verification ladder, design-mw-fleet-jobs
+    /// §4).
+    ReadShardResult {
+        job_id: String,
+        shard: u32,
+        shard_fencing: u64,
+        payload: Vec<u8>,
+    },
+    /// KD-MW-16: the worker refuses/abandons its shard NOW (R5 Red, an
+    /// unsupported capability, a failed local walk) — the PROMPT form of
+    /// the lease-expiry law, so the coordinator re-leases without
+    /// waiting out the TTL. Fencing-checked; a stale abandon is ignored.
+    ShardAbandon {
+        job_id: String,
+        shard: u32,
+        shard_fencing: u64,
         reason: String,
     },
 }
@@ -387,6 +432,24 @@ pub trait ShardDeviceSeam: Send + Sync {
     fn write_block(&self, dest: &DestTuple, data: &[u8]) -> std::io::Result<()>;
     /// Coordinator-side verify-read before publish.
     fn read_block(&self, dest: &DestTuple) -> std::io::Result<Vec<u8>>;
+    /// KD-MW-16 (rung 10c): execute one fleet READ shard — the
+    /// ino-residue `shard_k` of `shard_count` of `job`'s detect pass —
+    /// and return the serialized shard report. Runs on the worker's own
+    /// blocking lane; the KD-3 duty cycle (`throttle_pct`) applies PER
+    /// WORKER inside the walk. Default: refused loud — a seam that does
+    /// not implement the read class must never fake a report
+    /// (capability classing is routing; the refusal re-leases).
+    fn run_fleet_shard(
+        &self,
+        _job: &JobType,
+        _shard_k: u32,
+        _shard_count: u32,
+        _throttle_pct: u32,
+    ) -> std::io::Result<Vec<u8>> {
+        Err(std::io::Error::other(
+            "this seam does not execute fleet read shards (KD-MW-16)",
+        ))
+    }
     /// DLM **S7** (pre-RC spec §6.7 "Recovery"): admit an expired lease's
     /// destinations to the ALLOCATOR's dead-epoch quarantine, so the
     /// fresh-destination law is enforced by the allocator instead of
@@ -1048,6 +1111,8 @@ struct Session {
     id: u64,
     worker_id: String,
     pr_key: Option<u64>,
+    /// KD-MW-16 capability mask from the Enroll frame (routing only).
+    caps: u32,
     writer: Arc<parking_lot::Mutex<AuthedWriter>>,
     /// Holds an assigned shard right now.
     busy: AtomicBool,
@@ -1069,11 +1134,19 @@ struct ShardHolder {
 struct ShardState {
     job_id: String,
     shard: u32,
-    ctl: Arc<JobCtl>,
+    /// The fabric control block — `Some` for whole-job shards (the
+    /// requeue path needs it); `None` for fleet read shards, whose
+    /// re-lease belongs to the dispatching executor via `outcome`.
+    ctl: Option<Arc<JobCtl>>,
     fencing: AtomicU64,
     holder: parking_lot::Mutex<Option<ShardHolder>>,
     destinations: parking_lot::Mutex<Vec<DestTuple>>,
     done: AtomicBool,
+    /// KD-MW-16: `Some((k, n))` = fleet READ shard (no destinations, no
+    /// quarantine, no PR preempt on expiry — design-mw-fleet-jobs §5).
+    fleet: Option<(u32, u32)>,
+    /// The dispatching executor's outcome channel (fleet shards only).
+    outcome: parking_lot::Mutex<Option<crate::jobs::FleetOutcomeTx>>,
 }
 
 /// The authenticated write half of a session: the stream half plus its
@@ -1120,7 +1193,9 @@ pub struct JobWireHost {
     accept_backoffs: AtomicU64,
     next_session: AtomicU64,
     sessions: parking_lot::Mutex<HashMap<u64, Arc<Session>>>,
-    shards: parking_lot::Mutex<HashMap<String, Arc<ShardState>>>,
+    /// Live shard state, keyed `(job_id, shard_no)` — whole jobs ride
+    /// shard 0; fleet read shards ride `1..n` (KD-MW-16).
+    shards: parking_lot::Mutex<HashMap<(String, u32), Arc<ShardState>>>,
     quarantine: parking_lot::Mutex<BTreeSet<DestTuple>>,
     /// WERO fence, held first-enrollment → last-departure. The async
     /// mutex serializes acquire/release transitions.
@@ -1366,6 +1441,14 @@ impl JobWireHost {
                 handles.insert(id, h);
             }
         }
+        // KD-MW-16: register the fleet read-shard dispatch seam on the
+        // fabric (Weak — the host holds the fabric, so a strong edge
+        // would be a leak-grade Arc cycle). Registered even when the
+        // listener posture is off: capacity is simply 0 there, and the
+        // fan-out's zero-capacity arm IS the local run.
+        host.fabric.set_fleet_dispatch(
+            Arc::downgrade(&host) as std::sync::Weak<dyn crate::jobs::FleetDispatch>
+        );
         Ok(host)
     }
 
@@ -1653,6 +1736,7 @@ impl JobWireHost {
             endpoint_nonce,
             hmac,
             pr_key,
+            caps,
         } = hello
         else {
             METRICS
@@ -1741,6 +1825,7 @@ impl JobWireHost {
             id: self.next_session.fetch_add(1, Ordering::SeqCst),
             worker_id: worker_id.clone(),
             pr_key,
+            caps,
             writer: Arc::new(parking_lot::Mutex::new(AuthedWriter { half: wr, tx })),
             busy: AtomicBool::new(false),
             expired: AtomicBool::new(false),
@@ -1813,6 +1898,24 @@ impl JobWireHost {
                     checksums,
                 } => {
                     self.handle_submit(&session, job_id, shard, shard_fencing, checksums)
+                        .await;
+                }
+                WireFrame::ReadShardResult {
+                    job_id,
+                    shard,
+                    shard_fencing,
+                    payload,
+                } => {
+                    self.handle_read_result(&session, job_id, shard, shard_fencing, payload)
+                        .await;
+                }
+                WireFrame::ShardAbandon {
+                    job_id,
+                    shard,
+                    shard_fencing,
+                    reason,
+                } => {
+                    self.handle_abandon(&session, job_id, shard, shard_fencing, &reason)
                         .await;
                 }
                 other => {
@@ -1972,6 +2075,146 @@ impl JobWireHost {
             .cloned()
     }
 
+    /// KD-MW-16: an idle, non-expired session advertising `cap`.
+    fn pick_idle_capable_session(&self, cap: u32) -> Option<Arc<Session>> {
+        self.sessions
+            .lock()
+            .values()
+            .find(|s| {
+                s.caps & cap == cap
+                    && !s.busy.load(Ordering::SeqCst)
+                    && !s.expired.load(Ordering::SeqCst)
+            })
+            .cloned()
+    }
+
+    /// KD-MW-16: idle read-capable sessions right now — the population a
+    /// fleet fan-out may shard across (the [`crate::jobs::FleetDispatch`]
+    /// face, exposed for the contracts and the stats surface).
+    pub fn fleet_read_capacity(&self) -> usize {
+        self.sessions
+            .lock()
+            .values()
+            .filter(|s| {
+                s.caps & CAP_FLEET_READ == CAP_FLEET_READ
+                    && !s.busy.load(Ordering::SeqCst)
+                    && !s.expired.load(Ordering::SeqCst)
+            })
+            .count()
+    }
+
+    // -- fleet read shards (KD-MW-16, design-mw-fleet-jobs §4) -----------------
+
+    /// Handle a fleet READ shard's result proposal: fencing-checked
+    /// exactly like a mutating submission; no verify-read (nothing was
+    /// written — the merge accounting and the coordinator's finalize
+    /// ladder are this class's verification); the payload lands on the
+    /// dispatching executor's outcome channel.
+    async fn handle_read_result(
+        self: &Arc<Self>,
+        session: &Arc<Session>,
+        job_id: String,
+        shard_no: u32,
+        shard_fencing: u64,
+        payload: Vec<u8>,
+    ) {
+        let shard = self
+            .shards
+            .lock()
+            .get(&(job_id.clone(), shard_no))
+            .cloned()
+            .filter(|s| s.fleet.is_some());
+        let Some(shard) = shard else {
+            METRICS
+                .job_remote_refused_stale
+                .fetch_add(1, Ordering::Relaxed);
+            refuse_submit(
+                session,
+                &job_id,
+                shard_no,
+                "unknown fleet shard (reclaimed or never assigned)".into(),
+            );
+            return;
+        };
+        let current = shard.fencing.load(Ordering::SeqCst);
+        if shard_fencing != current || shard.done.load(Ordering::SeqCst) {
+            METRICS
+                .job_remote_refused_stale
+                .fetch_add(1, Ordering::Relaxed);
+            log::warn!(
+                "job wire: session {} proposed fleet shard {job_id}:{shard_no} with stale \
+                 fencing {shard_fencing} (current {current}) — refused \
+                 (job_remote_refused_stale); the residue was re-leased",
+                session.id
+            );
+            refuse_submit(
+                session,
+                &job_id,
+                shard_no,
+                format!("stale shard_fencing {shard_fencing} (current {current})"),
+            );
+            return;
+        }
+
+        shard.done.store(true, Ordering::SeqCst);
+        *shard.holder.lock() = None;
+        session.busy.store(false, Ordering::SeqCst);
+        METRICS
+            .job_remote_submissions
+            .fetch_add(1, Ordering::Relaxed);
+        METRICS
+            .job_fleet_shards_completed
+            .fetch_add(1, Ordering::Relaxed);
+        self.persist_shard_record(&shard, "completed").await;
+        if let Some(tx) = shard.outcome.lock().as_ref() {
+            let _ = tx.send(crate::jobs::FleetOutcome {
+                shard: shard_no,
+                payload: Some(payload),
+            });
+        }
+        let mut w = session.writer.lock();
+        let _ = w.send(&WireFrame::ResultAck {
+            job_id: job_id.clone(),
+            shard: shard_no,
+        });
+    }
+
+    /// Handle a worker's voluntary shard abandon (R5 Red, unsupported
+    /// capability): fencing-checked, then the expiry law runs NOW — the
+    /// prompt form of the TTL (design-mw-fleet-jobs §5).
+    async fn handle_abandon(
+        self: &Arc<Self>,
+        session: &Arc<Session>,
+        job_id: String,
+        shard_no: u32,
+        shard_fencing: u64,
+        reason: &str,
+    ) {
+        let shard = self.shards.lock().get(&(job_id.clone(), shard_no)).cloned();
+        let Some(shard) = shard else {
+            return; // already reclaimed — nothing to abandon
+        };
+        let current = shard.fencing.load(Ordering::SeqCst);
+        if shard_fencing != current || shard.done.load(Ordering::SeqCst) {
+            return; // stale abandon — the expiry law already ran
+        }
+        let held_here = shard
+            .holder
+            .lock()
+            .as_ref()
+            .is_some_and(|h| h.session_id == session.id);
+        if !held_here {
+            return;
+        }
+        log::warn!(
+            "job wire: worker {} ABANDONED shard {job_id}:{shard_no}: {reason} — \
+             re-leasing now (the prompt form of the TTL law)",
+            session.worker_id
+        );
+        self.expire_shard(&shard, &format!("worker abandoned: {reason}"))
+            .await;
+    }
+
     /// Assign one claimed job to `session` as shard 0: pre-allocate
     /// FRESH destinations, arm the lease, persist the shard record,
     /// stream the descriptor.
@@ -1985,15 +2228,17 @@ impl JobWireHost {
         // first assignments start at fencing 0.
         let shard = {
             let mut shards = self.shards.lock();
-            Arc::clone(shards.entry(job_id.to_string()).or_insert_with(|| {
+            Arc::clone(shards.entry((job_id.to_string(), 0)).or_insert_with(|| {
                 Arc::new(ShardState {
                     job_id: job_id.to_string(),
                     shard: 0,
-                    ctl: Arc::clone(ctl),
+                    ctl: Some(Arc::clone(ctl)),
                     fencing: AtomicU64::new(0),
                     holder: parking_lot::Mutex::new(None),
                     destinations: parking_lot::Mutex::new(Vec::new()),
                     done: AtomicBool::new(false),
+                    fleet: None,
+                    outcome: parking_lot::Mutex::new(None),
                 })
             }))
         };
@@ -2034,6 +2279,7 @@ impl JobWireHost {
             block_len: self.seam.block_len() as u32,
             throttle_pct: ctl.throttle.load(Ordering::Relaxed),
             lease_ttl_ms: self.cfg.lease_ttl.as_millis() as u64,
+            fleet: None,
         };
         let mut w = session.writer.lock();
         w.send(&WireFrame::ShardAssign { shard: descriptor })
@@ -2118,6 +2364,39 @@ impl JobWireHost {
         METRICS
             .job_remote_reassignments
             .fetch_add(1, Ordering::Relaxed);
+
+        // KD-MW-16 (design-mw-fleet-jobs §5): a fleet READ shard's expiry
+        // takes the fencing/notify arm ONLY. There are no destinations to
+        // quarantine (nothing was pre-allocated) and NO PR preempt — a
+        // read worker DMAs nothing, and preempting a live host's
+        // registrant key over a lost READ shard would fence its DATA
+        // plane (a co-located co-writer's custody rides that key). The
+        // holder session stays open-but-unassignable so the late
+        // proposal is REFUSED, not dropped; the dispatching executor is
+        // told to re-lease the residue.
+        if shard.fleet.is_some() {
+            log::warn!(
+                "job wire: fleet read shard {}:{} lease of worker {} expired ({why}) — \
+                 fencing bumped to {}, residue handed back for re-lease",
+                shard.job_id,
+                shard.shard,
+                holder.worker_id,
+                shard.fencing.load(Ordering::SeqCst)
+            );
+            if let Some(s) = self.sessions.lock().get(&holder.session_id) {
+                s.expired.store(true, Ordering::SeqCst);
+                s.busy.store(false, Ordering::SeqCst);
+            }
+            self.persist_shard_record(shard, "reclaimed").await;
+            if let Some(tx) = shard.outcome.lock().as_ref() {
+                let _ = tx.send(crate::jobs::FleetOutcome {
+                    shard: shard.shard,
+                    payload: None,
+                });
+            }
+            return;
+        }
+
         log::warn!(
             "job wire: shard {}:{} lease of worker {} expired ({why}) — fencing bumped to \
              {}, destinations quarantined, shard requeued",
@@ -2210,7 +2489,9 @@ impl JobWireHost {
         }
 
         self.persist_shard_record(shard, "reclaimed").await;
-        self.fabric.requeue_remote(&shard.job_id, &shard.ctl).await;
+        if let Some(ctl) = &shard.ctl {
+            self.fabric.requeue_remote(&shard.job_id, ctl).await;
+        }
     }
 
     // -- result submission ------------------------------------------------------
@@ -2224,7 +2505,12 @@ impl JobWireHost {
         shard_fencing: u64,
         checksums: Vec<BlockChecksum>,
     ) {
-        let shard = self.shards.lock().get(&job_id).cloned();
+        let shard = self
+            .shards
+            .lock()
+            .get(&(job_id.clone(), shard_no))
+            .cloned()
+            .filter(|s| s.fleet.is_none());
         let Some(shard) = shard else {
             METRICS
                 .job_remote_refused_stale
@@ -2301,7 +2587,9 @@ impl JobWireHost {
             .job_remote_bytes_moved
             .fetch_add(bytes, Ordering::Relaxed);
         self.persist_shard_record(&shard, "completed").await;
-        self.fabric.remote_complete(&job_id, &shard.ctl).await;
+        if let Some(ctl) = &shard.ctl {
+            self.fabric.remote_complete(&job_id, ctl).await;
+        }
 
         let mut w = session.writer.lock();
         let _ = w.send(&WireFrame::ResultAck {
@@ -2375,6 +2663,122 @@ impl JobWireHost {
     }
 }
 
+/// KD-MW-16 (design-mw-fleet-jobs §4): the fleet read-shard dispatch
+/// seam the fabric's executors consume. Assignment mirrors the whole-job
+/// `assign` — same lease law, same fencing identity across re-dispatches
+/// — minus everything a read shard structurally lacks: destinations,
+/// checksums, verify-reads, quarantine, PR preemption.
+impl crate::jobs::FleetDispatch for JobWireHost {
+    fn read_capacity(&self) -> usize {
+        self.fleet_read_capacity()
+    }
+
+    fn dispatch_read_shard(
+        &self,
+        job_id: &str,
+        shard_no: u32,
+        shard_count: u32,
+        job_type: &JobType,
+        throttle_pct: u32,
+        tx: &crate::jobs::FleetOutcomeTx,
+    ) -> bool {
+        if self.shutdown.load(Ordering::SeqCst) || !self.listening {
+            return false;
+        }
+        let Some(session) = self.pick_idle_capable_session(CAP_FLEET_READ) else {
+            return false;
+        };
+        // Re-dispatches of a lost residue REUSE the shard state (and its
+        // BUMPED fencing) — the stale-refusal law's identity.
+        let shard = {
+            let mut shards = self.shards.lock();
+            Arc::clone(
+                shards
+                    .entry((job_id.to_string(), shard_no))
+                    .or_insert_with(|| {
+                        Arc::new(ShardState {
+                            job_id: job_id.to_string(),
+                            shard: shard_no,
+                            ctl: None,
+                            fencing: AtomicU64::new(0),
+                            holder: parking_lot::Mutex::new(None),
+                            destinations: parking_lot::Mutex::new(Vec::new()),
+                            done: AtomicBool::new(false),
+                            fleet: Some((shard_no, shard_count)),
+                            outcome: parking_lot::Mutex::new(None),
+                        })
+                    }),
+            )
+        };
+        if shard.done.load(Ordering::SeqCst) {
+            return false; // already completed (a late re-lease retry)
+        }
+        *shard.outcome.lock() = Some(tx.clone());
+        *shard.holder.lock() = Some(ShardHolder {
+            session_id: session.id,
+            worker_id: session.worker_id.clone(),
+            lease_expiry: Instant::now() + self.cfg.lease_ttl,
+        });
+        let fencing = shard.fencing.load(Ordering::SeqCst);
+        session.busy.store(true, Ordering::SeqCst);
+
+        let descriptor = ShardDescriptor {
+            job_id: job_id.to_string(),
+            shard: shard_no,
+            shard_fencing: fencing,
+            job_type: job_type.clone(),
+            source_keys: Vec::new(),
+            destinations: Vec::new(),
+            block_len: 0,
+            throttle_pct,
+            lease_ttl_ms: self.cfg.lease_ttl.as_millis() as u64,
+            fleet: Some((shard_no, shard_count)),
+        };
+        let sent = {
+            let mut w = session.writer.lock();
+            w.send(&WireFrame::ShardAssign { shard: descriptor })
+                .is_ok()
+        };
+        if !sent {
+            // The session vanished mid-dispatch: undo, tell the caller to
+            // pick another venue (never a lost residue — the caller still
+            // owns it).
+            *shard.holder.lock() = None;
+            *shard.outcome.lock() = None;
+            session.expired.store(true, Ordering::SeqCst);
+            session.busy.store(false, Ordering::SeqCst);
+            return false;
+        }
+        METRICS.job_remote_shards.fetch_add(1, Ordering::Relaxed);
+        METRICS
+            .job_fleet_shards_dispatched
+            .fetch_add(1, Ordering::Relaxed);
+
+        // Best-effort durable shard record (KD-2 plane) — spawned: this
+        // seam is sync (the executor's fan-out calls it inline) and the
+        // record is advisory, like every checkpoint.
+        let meta = Arc::clone(self.fabric.meta_handle());
+        let record = serde_json::json!({
+            "schema": 1,
+            "job_id": job_id,
+            "shard": shard_no,
+            "state": "assigned",
+            "holder": session.worker_id.clone(),
+            "shard_fencing": fencing,
+            "lease_ttl_ms": self.cfg.lease_ttl.as_millis() as u64,
+            "fleet": [shard_no, shard_count],
+        })
+        .to_string();
+        let name = format!("job:{job_id}:shard:{shard_no}");
+        crate::meta_exec::spawn_meta("fleet_shard_record", async move {
+            if let Err(e) = meta.setxattr(1, &name, record.as_bytes()).await {
+                log::warn!("job wire: fleet shard record {name} persist failed: {e}");
+            }
+        });
+        true
+    }
+}
+
 /// Send one ResultRefused reply (best-effort — a vanished session's
 /// refusal has nowhere to land, which is fine: fencing already holds).
 fn refuse_submit(session: &Arc<Session>, job_id: &str, shard: u32, reason: String) {
@@ -2409,6 +2813,9 @@ pub struct WorkerOptions {
     pub pr_key: Option<u64>,
     /// TLS client config source (must match the coordinator's).
     pub security: Option<ClusterSecurityConfig>,
+    /// KD-MW-16: capability mask advertised at enrollment
+    /// ([`CAP_FLEET_READ`]) — shard routing, never authentication.
+    pub caps: u32,
 }
 
 impl WorkerOptions {
@@ -2419,6 +2826,7 @@ impl WorkerOptions {
             hold_submission: Arc::new(AtomicBool::new(false)),
             pr_key: None,
             security: None,
+            caps: 0,
         }
     }
 }
@@ -2532,6 +2940,7 @@ impl JobWireWorker {
                 endpoint_nonce: nonce.clone(),
                 hmac: enroll_hmac(secret, &opts.worker_id, &server_nonce, &nonce),
                 pr_key: opts.pr_key,
+                caps: opts.caps,
             },
         )?;
         match read_frame_limited(
@@ -2568,6 +2977,14 @@ impl JobWireWorker {
                 "unexpected enrollment reply: {other:?}"
             ))),
         }
+    }
+
+    /// A dup of the connection socket for teardown: `shutdown(Both)`
+    /// wakes the serve loop's parked frame wait (the mount-side fleet
+    /// worker's disarm path — KD-MW-16). Best-effort like the internal
+    /// nudge; `None` on transports without a raw handle.
+    pub fn teardown_nudge(&self) -> Option<std::net::TcpStream> {
+        self.stream.nudge_handle().ok()
     }
 
     /// Serve shards until the coordinator connection closes. Executes
@@ -2692,6 +3109,85 @@ impl JobWireWorker {
             let assigned_deadline = Instant::now() + ttl;
 
             let mut lease_rx = lease_rx.clone();
+
+            // KD-MW-16: fleet READ shards — no destinations, no Noop
+            // task list. The seam executes the residue on the blocking
+            // lane (heartbeats keep the lease renewed underneath) and
+            // the result is proposed fencing-stamped like every
+            // proposal; a seam refusal ABANDONS the shard loudly so the
+            // coordinator re-leases now instead of at the TTL.
+            if let Some((k, n)) = shard.fleet {
+                if !revalidate_lease(&mut lease_rx, assigned_deadline, &writer, &opts, ttl).await {
+                    report.shards_aborted += 1;
+                    continue 'shards;
+                }
+                let seam2 = Arc::clone(&seam);
+                let jt = shard.job_type.clone();
+                let pct = shard.throttle_pct;
+                let outcome =
+                    sqz_blocking::run_blocking(move || seam2.run_fleet_shard(&jt, k, n, pct)).await;
+                match outcome {
+                    Ok(payload) => {
+                        // The pause-before-submit test hook (the zombie
+                        // window the fencing check exists for).
+                        while opts.hold_submission.load(Ordering::SeqCst) {
+                            sqz_time::sleep(Duration::from_millis(20)).await;
+                        }
+                        {
+                            let mut w = writer.lock();
+                            if w.send(&WireFrame::ReadShardResult {
+                                job_id: shard.job_id.clone(),
+                                shard: shard.shard,
+                                shard_fencing: shard.shard_fencing,
+                                payload,
+                            })
+                            .is_err()
+                            {
+                                break 'shards;
+                            }
+                        }
+                        match resp_rx.recv().await {
+                            Some(Ok(())) => {
+                                report.shards_completed += 1;
+                                METRICS
+                                    .job_fleet_worker_shards
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                            Some(Err(reason)) => {
+                                report.submissions_refused += 1;
+                                log::warn!(
+                                    "job worker: fleet shard {}:{} proposal refused: {reason}",
+                                    shard.job_id,
+                                    shard.shard
+                                );
+                            }
+                            None => break 'shards,
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "job worker: fleet shard {}:{} refused locally ({e}) — \
+                             abandoning (the coordinator re-leases now)",
+                            shard.job_id,
+                            shard.shard
+                        );
+                        report.shards_aborted += 1;
+                        let mut w = writer.lock();
+                        if w.send(&WireFrame::ShardAbandon {
+                            job_id: shard.job_id.clone(),
+                            shard: shard.shard,
+                            shard_fencing: shard.shard_fencing,
+                            reason: e.to_string(),
+                        })
+                        .is_err()
+                        {
+                            break 'shards;
+                        }
+                    }
+                }
+                continue 'shards;
+            }
+
             let mut aborted = false;
 
             // 1. Fill the pre-allocated destinations in re-validated

@@ -35,9 +35,7 @@ use fuse3::raw::prelude::Filesystem;
 use fuse3::raw::Request;
 use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::cache::TieredCache;
-use squeezefs::data_grant::{
-    self, AcquireFrame, JoinFrame, WriteCustodyOwner, CUSTODY_SCHEMA,
-};
+use squeezefs::data_grant::{self, AcquireFrame, JoinFrame, WriteCustodyOwner, CUSTODY_SCHEMA};
 use squeezefs::dlm::DlmClient;
 use squeezefs::fleet_worker;
 use squeezefs::fsck::{run as run_fsck, run_fleet, FsckCtx, FsckOptions};
@@ -46,8 +44,8 @@ use squeezefs::job_wire::{
     JobWireConfig, JobWireHost, JobWireWorker, ShardDeviceSeam, WorkerOptions, CAP_FLEET_READ,
 };
 use squeezefs::jobs::{FleetDispatch, JobFabric, JobType};
-use squeezefs::membership::{LeaseClock, LeaseClocks};
 use squeezefs::mem_budget::Level;
+use squeezefs::membership::{LeaseClock, LeaseClocks};
 use squeezefs::nvme_dev::NvmeBlockDev;
 use squeezefs::routing::DataRouter;
 use squeezefs::{DataVolumeRecord, FormatConfig};
@@ -334,7 +332,9 @@ impl ShardDeviceSeam for MemberSeam {
         if n == 0 {
             return Ok(Vec::new());
         }
-        Err(std::io::Error::other("read-class member seam: no allocator"))
+        Err(std::io::Error::other(
+            "read-class member seam: no allocator",
+        ))
     }
     fn read_source(&self, _key: &str) -> std::io::Result<Vec<u8>> {
         Err(std::io::Error::other("read-class member seam: no device"))
@@ -597,12 +597,7 @@ async fn worker_shard_census_feeds_the_coordinator_allocator_classes() {
     // files, each referencing a distinct phantom in-capacity offset, so
     // at least two of the three convicting references travel through
     // WORKER shards whatever the ino residues are.
-    let chunk = fx
-        .fs
-        .router
-        .backend_router
-        .default_allocator
-        .chunk_size();
+    let chunk = fx.fs.router.backend_router.default_allocator.chunk_size();
     for (i, idx) in [400u64, 401, 402].iter().enumerate() {
         let ino = create_file(&fx, &format!("phantom{i}.bin")).await;
         striped_burst(&fx, ino, 2).await;
@@ -808,9 +803,11 @@ async fn lost_read_shard_re_leases_and_the_late_proposal_refuses_stale() {
     // Release the zombie: its LATE proposal must refuse stale, loudly.
     opts.hold_submission
         .store(false, std::sync::atomic::Ordering::SeqCst);
-    poll_until("late proposal refused stale", Duration::from_secs(5), || {
-        METRICS.job_remote_refused_stale.load(Ordering::Relaxed) > stale0
-    })
+    poll_until(
+        "late proposal refused stale",
+        Duration::from_secs(5),
+        || METRICS.job_remote_refused_stale.load(Ordering::Relaxed) > stale0,
+    )
     .await;
 
     host.shutdown().await;
@@ -922,8 +919,14 @@ async fn custody_grant_defers_the_mover_probe() {
     format_meta(&meta, &[&oss1]).await;
     let recs = base_format_config(&[&oss1]).resolved_data_volumes();
     let fx = open_fixture(&meta, &recs).await;
-    let ino = create_file(&fx, "held.bin").await;
-    striped_burst(&fx, ino, 2).await;
+    // The granted ino is SYNTHETIC (a co-writer's file this authority
+    // process never opened): the authority's arbiter shares the
+    // process-local lock table, so an ino the fixture itself holds a
+    // write lease on would CONFLICT at grant time — which is itself
+    // correct behavior (custody arbitration working), but not this
+    // pin's subject. The probe consults the grant table by ino number;
+    // existence is immaterial to the deferral law.
+    let ino: u64 = 777_777;
 
     // Arm a custody authority and grant a (simulated) co-writer
     // whole-inode custody of `ino`.

@@ -815,6 +815,19 @@ impl WriteCustodyOwner {
         })
     }
 
+    /// KD-MW-16 (rung 10c, design-mw-fleet-jobs §6): does ANY live grant
+    /// cover `ino`? The §5.7 mover quiescence probe's custody arm — a
+    /// mover must never republish bytes a co-writer may be DMAing under
+    /// custody. Whole-inode by design: span-granularity deferral would
+    /// buy little (movers re-plan on a cadence) and cost a range check
+    /// this table does not index.
+    pub fn ino_granted(&self, ino: u64) -> bool {
+        self.table
+            .grants_snapshot_with(|_, g| g.ino == ino)
+            .into_iter()
+            .any(|hit| hit)
+    }
+
     /// Per-instance counters.
     pub fn stats(&self) -> OwnerStats {
         OwnerStats {

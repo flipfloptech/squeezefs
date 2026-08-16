@@ -124,6 +124,7 @@ pub mod error;
 // Spec §6.8 item 3 — the freed-offset grace period (the module's own `//!`
 // docs are the documentation; an outer `///` here would re-root its
 // intra-doc links in `crate`, the shape `ro_coherence` already suffers).
+pub mod fleet_worker;
 pub mod free_grace;
 pub mod fsck;
 pub mod fuse_client;

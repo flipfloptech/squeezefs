@@ -192,6 +192,7 @@ fn bench_job_wire_frames(c: &mut Criterion) {
         endpoint_nonce: "9e8d7c6b-5a49-3827-1605-f4e3d2c1b0a9".to_string(),
         hmac: "5f".repeat(32),
         pr_key: Some(0xA0),
+        caps: 1, // CAP_FLEET_READ — the KD-MW-16 member-worker shape
     };
     let submit = WireFrame::ResultSubmit {
         job_id: "job-0f1c2d3e".to_string(),

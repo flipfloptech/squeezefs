@@ -260,6 +260,7 @@
 
 use crate::block_allocator::BlockAllocator;
 use crate::error::{Result, SqueezefsError};
+use crate::fuse_client::METRICS;
 use crate::meta_backend::{Metadata, RoutedMetaBackend};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -313,6 +314,20 @@ pub struct FsckOptions {
     pub settle: Duration,
     /// Cooperative cancellation (fabric cancel).
     pub cancel: Arc<AtomicBool>,
+    /// KD-MW-16 (design-mw-fleet-jobs §3): scan the staging dirs FULL
+    /// (unfiltered by the ino-residue shard). Fleet shards set this —
+    /// staging is per-mount, so each member covers its OWN custody
+    /// records completely and the union is exactly-once by disjointness,
+    /// where a residue-filtered scan would leave every member's
+    /// foreign-residue keys covered by NOBODY.
+    pub staging_full: bool,
+    /// KD-MW-16: the caller (the fleet fan-out — `run_fleet` is the one
+    /// production setter) already holds the allocator scan latch for the
+    /// whole fleet window — do not arm or release it here (a nested
+    /// release would drain the C2/C3 epoch side map mid-fleet). Public
+    /// only because `FsckOptions` is constructed by struct-update in the
+    /// contracts; never set this outside a held-latch scope.
+    pub assume_latched: bool,
 }
 
 impl FsckOptions {
@@ -333,6 +348,8 @@ impl FsckOptions {
             shard: None,
             settle: Self::settle_from_env(),
             cancel: Arc::new(AtomicBool::new(false)),
+            staging_full: false,
+            assume_latched: false,
         }
     }
 
@@ -663,6 +680,23 @@ pub struct PartialCensus {
     /// Canonical volume id → offset → reference count from THIS shard's
     /// ino-residue walk.
     pub refs: HashMap<String, HashMap<u64, u32>>,
+    /// KD-MW-16 (design-mw-fleet-jobs §4): this shard's referenced-
+    /// mapping identities — what the fleet coordinator's FINALIZE needs
+    /// to run the allocator classes over the merged census.
+    /// `#[serde(default)]`: pre-10c reports stay decodable (they merge
+    /// with no mappings and `mappings_complete = true`, which the
+    /// offline `merge-reports` CLI never consults).
+    #[serde(default)]
+    pub mappings: Vec<MappingRef>,
+    /// `false` ⇔ the mapping list was DROPPED (the oversize wire
+    /// degrade) — the fleet coordinator then walks its own census for
+    /// the allocator classes instead (loud, the stated Amdahl term).
+    #[serde(default = "default_true")]
+    pub mappings_complete: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// The structured report (`--json` prints it verbatim; `merge-reports`
@@ -775,24 +809,26 @@ pub fn clear_scrub_read_fault_hook() {
 // Internal census structures
 // ---------------------------------------------------------------------------
 
-/// One referenced mapping (scrub + lost-check unit).
-#[derive(Clone, Debug)]
-struct MappingRef {
-    ino: u64,
-    block_idx: u32,
+/// One referenced mapping (scrub + lost-check unit) — since KD-MW-16
+/// also the fleet shard reports' mapping-identity record
+/// (`PartialCensus::mappings`).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct MappingRef {
+    pub ino: u64,
+    pub block_idx: u32,
     /// The mapping string VERBATIM (decoration included).
-    mapping: String,
+    pub mapping: String,
     /// The CANONICAL volume id + offset the clean base key resolves to
     /// (`"?"`/0 for unresolvable mappings). Referencer matching must key
     /// on BOTH — offsets alias across volumes (a bare default-slot
     /// mapping carries the same offset number as an unrelated `oss2://`
     /// block; the leg-13 drain-concurrent FP root cause).
-    vol: String,
-    offset: u64,
+    pub vol: String,
+    pub offset: u64,
     /// §5.6a quarantined (`damaged:`) mapping: counted for refcount
     /// coherence (the physical block is intentionally preserved), but
     /// never scrubbed and never a lost finding — it IS the repair.
-    damaged: bool,
+    pub damaged: bool,
 }
 
 struct CensusOut {
@@ -1021,12 +1057,16 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
             }
         }
     }
-    let _latch_release = if online {
+    let _latch_release = if online && !opts.assume_latched {
         for v in &vols {
             v.alloc.fsck_begin_scan();
         }
         Some(LatchRelease(vols.iter().map(|v| v.alloc.clone()).collect()))
     } else {
+        // Offline (nothing in flight by definition), or the fleet
+        // fan-out holds the latch for the whole fleet window
+        // (KD-MW-16): arming/releasing here would drain the epoch side
+        // map mid-fleet.
         None
     };
 
@@ -1070,7 +1110,10 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
                     ctx.meta.clone(),
                     ctx.staging_dirs.clone(),
                     ctx.expected_generation.clone(),
-                    opts.shard,
+                    // KD-MW-16: fleet shards scan THIS member's staging
+                    // FULL — dirs are per-mount, so locality (not the
+                    // ino residue) is the exactly-once partition here.
+                    if opts.staging_full { None } else { opts.shard },
                 ),
             );
             // C9's referenced-ino pass: one dentry-tree walk, disjoint
@@ -1111,6 +1154,8 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
             if opts.shard.is_some() {
                 shard_refs = Some(PartialCensus {
                     refs: census.refs.clone(),
+                    mappings: census.mappings.clone(),
+                    mappings_complete: true,
                 });
             }
             (census, refs)
@@ -1123,6 +1168,8 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
             if opts.shard.is_some() {
                 shard_refs = Some(PartialCensus {
                     refs: census.refs.clone(),
+                    mappings: census.mappings.clone(),
+                    mappings_complete: true,
                 });
             }
             // C4/C5 staging scan (serial under throttle — KD-3's duty
@@ -1131,7 +1178,7 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
                 ctx.meta.clone(),
                 ctx.staging_dirs.clone(),
                 ctx.expected_generation.clone(),
-                opts.shard,
+                if opts.staging_full { None } else { opts.shard },
             )
             .await;
             suspects.extend(staging);
@@ -1177,31 +1224,8 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
         // owe, which is exactly why it can be unconditional HERE while
         // MOUNT keeps it behind `SQUEEZEFS_BLOCK_REFS_VERIFY=1` (there the
         // walk is the whole cost the durable records exist to delete).
-        if opts.shard.is_none() && ctx.meta.volumes.iter().any(|kv| kv.block_refs_engaged()) {
-            let chunk = ctx.router.backend_router.default_allocator.chunk_size();
-            match ctx
-                .router
-                .backend_router
-                .verify_durable_block_refs(&ctx.meta)
-                .await
-            {
-                Ok(drift) => {
-                    for (vol, idx, durable, derived) in drift {
-                        suspects.push(Suspect {
-                            kind: SuspectKind::C8DurableRefDrift {
-                                vol,
-                                offset: idx.saturating_mul(chunk),
-                                durable,
-                                derived,
-                            },
-                        });
-                    }
-                }
-                Err(e) => log::warn!(
-                    "fsck C8: durable block-reference comparison failed: {e} (no verdict \
-                 recorded — the class is skipped for this run, never guessed)"
-                ),
-            }
+        if opts.shard.is_none() {
+            evaluate_c8(ctx, &mut suspects).await;
         }
 
         // C9 (the class design-cow-kv-metadata §4.10a owed): live
@@ -1258,6 +1282,8 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
         if opts.shard.is_some() && shard_refs.is_none() {
             shard_refs = Some(PartialCensus {
                 refs: census.refs.clone(),
+                mappings: census.mappings.clone(),
+                mappings_complete: true,
             });
         }
         scrub_c7(ctx, opts, &census, &mut counters, &mut findings).await;
@@ -1290,6 +1316,8 @@ pub fn merge_reports(reports: &[FsckReport]) -> FsckReport {
     let mut findings: Vec<FsckFinding> = Vec::new();
     let mut counters = FsckCounters::default();
     let mut refs: HashMap<String, HashMap<u64, u32>> = HashMap::new();
+    let mut mappings: Vec<MappingRef> = Vec::new();
+    let mut mappings_complete = true;
     let mut mode = "offline".to_string();
     for r in reports {
         findings.extend(r.findings.iter().cloned());
@@ -1329,6 +1357,15 @@ pub fn merge_reports(reports: &[FsckReport]) -> FsckReport {
                     *e.entry(*off).or_insert(0) += c;
                 }
             }
+            // KD-MW-16: mapping identities concatenate (residues are
+            // disjoint by construction); one degraded shard degrades
+            // the union — the finalize's walk fallback is loud.
+            mappings.extend(p.mappings.iter().cloned());
+            mappings_complete &= p.mappings_complete;
+        } else {
+            // A report with NO partial census (an unsharded input)
+            // carries no mapping identities to merge.
+            mappings_complete = false;
         }
     }
     findings.sort();
@@ -1340,9 +1377,319 @@ pub fn merge_reports(reports: &[FsckReport]) -> FsckReport {
         shard: None,
         findings,
         counters,
-        partial: Some(PartialCensus { refs }),
+        partial: Some(PartialCensus {
+            refs,
+            mappings,
+            mappings_complete,
+        }),
         repair: None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// KD-MW-16 (rung 10c) — the fleet fan-out/merge/finalize engine
+// ---------------------------------------------------------------------------
+
+/// Fold the FINALIZE pass's counters into a merged report's (the fields
+/// the allocator classes + verify ladder move; census fields stay the
+/// shards').
+fn fold_finalize_counters(dst: &mut FsckCounters, fin: &FsckCounters) {
+    dst.nodes_walked = dst.nodes_walked.max(fin.nodes_walked);
+    dst.blocks_checked += fin.blocks_checked;
+    dst.refcounts_checked += fin.refcounts_checked;
+    dst.suspects += fin.suspects;
+    dst.suspects_cleared += fin.suspects_cleared;
+    dst.epoch_exempted += fin.epoch_exempted;
+    dst.inflight_exempted += fin.inflight_exempted;
+    dst.mover_ledger_exempted += fin.mover_ledger_exempted;
+    dst.foreign_lane_exempted += fin.foreign_lane_exempted;
+}
+
+/// The **fleet fsck detect pass** (KD-MW-16, `docs/design-mw-fleet-jobs.md`
+/// §4): shard the census across enrolled fleet read workers, merge their
+/// fencing-checked proposals through the EXISTING `merge_reports` union
+/// law, then FINALIZE the allocator classes (C2 tracked / C3 / C6) + C8
+/// on the coordinator over the fleet-merged full reference census, with
+/// the EXISTING verify-before-report ladder.
+///
+/// **Zero capacity is the identity** (pinned): with no dispatch — or no
+/// enrolled read-capable worker — this IS [`run`], byte-for-byte the
+/// shipped single-writer path. A lost shard (TTL expiry, worker abandon,
+/// refused/malformed proposal) is RE-LEASED: re-dispatched to another
+/// idle capable worker, else run locally (`job_fleet_shards_relocal`) —
+/// every residue lands exactly once, and a stale proposal never merges
+/// (the fencing law, `job_remote_refused_stale`).
+pub async fn run_fleet(
+    ctx: &FsckCtx,
+    opts: &FsckOptions,
+    fleet: Option<Arc<dyn crate::jobs::FleetDispatch>>,
+    job_id: &str,
+) -> Result<FsckReport> {
+    let Some(fleet) = fleet else {
+        return run(ctx, opts).await;
+    };
+    // The fan-out is the ONLINE coordinator's (the fabric job); offline
+    // probes keep their zero-coordination `--shards` contract.
+    if opts.mode != FsckMode::Online || fleet.read_capacity() == 0 {
+        return run(ctx, opts).await;
+    }
+    let started = std::time::Instant::now();
+    let workers = fleet.read_capacity() as u32;
+    let n = workers.saturating_add(1);
+
+    // Arm the allocator scan latch for the WHOLE fleet window: the
+    // C2/C3 allocation-epoch side map must span every shard walk, and
+    // the inner runs are told the latch is held (`assume_latched`) so
+    // no nested release can drain it mid-fleet.
+    let vols = volume_allocators(ctx);
+    for v in &vols {
+        v.alloc.fsck_begin_scan();
+    }
+    struct FleetLatchRelease(Vec<Arc<BlockAllocator>>);
+    impl Drop for FleetLatchRelease {
+        fn drop(&mut self) {
+            for a in &self.0 {
+                a.fsck_end_scan();
+            }
+        }
+    }
+    let latch_release = FleetLatchRelease(vols.iter().map(|v| v.alloc.clone()).collect());
+
+    let job_type = crate::jobs::JobType::Fsck {
+        scrub: opts.scrub,
+        scrub_only: opts.scrub_only,
+        repair: false,
+        apply: false,
+        quarantine_dir: None,
+    };
+    let (tx, mut rx) = squeezefs_ipc::sqz_channel::mpsc::unbounded_channel();
+    let mut outstanding: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut local_residues: Vec<u32> = Vec::new();
+    for k in 1..n {
+        if fleet.dispatch_read_shard(job_id, k, n, &job_type, opts.throttle_pct, &tx) {
+            outstanding.insert(k);
+        } else {
+            local_residues.push(k);
+        }
+    }
+    log::info!(
+        "fsck fleet ({job_id}): census partitioned {n} ways — {} worker shard(s) \
+         dispatched, {} residue(s) local (+ the coordinator's shard 0)",
+        outstanding.len(),
+        local_residues.len()
+    );
+
+    // The coordinator's own shard 0 — ONLINE, its suspects machinery
+    // armed; the members run offline-posture over their coherent views.
+    let local_shard = |k: u32| {
+        let mut o = opts.clone();
+        o.shard = Some((k, n));
+        o.staging_full = true;
+        o.assume_latched = true;
+        o
+    };
+    let mut reports = vec![run(ctx, &local_shard(0)).await?];
+    for k in std::mem::take(&mut local_residues) {
+        METRICS
+            .job_fleet_shards_relocal
+            .fetch_add(1, Ordering::Relaxed);
+        reports.push(run(ctx, &local_shard(k)).await?);
+    }
+
+    // Collect worker proposals; a lost/refused residue RE-LEASES —
+    // another idle capable worker first, else locally.
+    let mut worker_counters = FsckCounters::default();
+    while !outstanding.is_empty() {
+        if opts.cancel.load(Ordering::Relaxed) {
+            // Fabric cancel/pause: stop collecting — the job layer owns
+            // the terminal state, and a cancelled detect pass's partial
+            // report is never adjudicated as complete.
+            break;
+        }
+        let Ok(recv) =
+            squeezefs_ipc::sqz_time::timeout(Duration::from_millis(250), rx.recv()).await
+        else {
+            continue;
+        };
+        let Some(out) = recv else {
+            break; // channel closed: the host is gone — relocal below
+        };
+        if !outstanding.contains(&out.shard) {
+            continue; // a duplicate notification for a settled residue
+        }
+        let mut lost_reason: Option<String> = None;
+        match out.payload {
+            Some(bytes) => match serde_json::from_slice::<FsckReport>(&bytes) {
+                Ok(r) if r.shard.as_deref() == Some(format!("{}/{}", out.shard, n).as_str()) => {
+                    outstanding.remove(&out.shard);
+                    // The coordinator's stats account for the WHOLE
+                    // fleet pass (design §4 step 7); findings/scan_secs
+                    // stay per-report (dedupe/max at merge).
+                    let mut c = r.counters.clone();
+                    c.findings = 0;
+                    c.scan_secs = 0;
+                    fold_worker_counters(&mut worker_counters, &c);
+                    reports.push(r);
+                }
+                Ok(r) => {
+                    lost_reason = Some(format!(
+                        "shard identity mismatch: proposed '{}', expected '{}/{}'",
+                        r.shard.as_deref().unwrap_or("<none>"),
+                        out.shard,
+                        n
+                    ));
+                }
+                Err(e) => {
+                    lost_reason = Some(format!("undecodable shard report: {e}"));
+                }
+            },
+            None => {
+                lost_reason = Some("lease lost (expiry/abandon)".to_string());
+            }
+        }
+        if let Some(why) = lost_reason {
+            log::warn!(
+                "fsck fleet ({job_id}): shard {}/{n} was LOST ({why}) — re-leasing",
+                out.shard
+            );
+            if !fleet.dispatch_read_shard(job_id, out.shard, n, &job_type, opts.throttle_pct, &tx) {
+                outstanding.remove(&out.shard);
+                METRICS
+                    .job_fleet_shards_relocal
+                    .fetch_add(1, Ordering::Relaxed);
+                reports.push(run(ctx, &local_shard(out.shard)).await?);
+            }
+        }
+    }
+    // Host gone mid-pass (channel closed): every still-outstanding
+    // residue runs locally — the pass never under-covers.
+    for k in std::mem::take(&mut outstanding)
+        .into_iter()
+        .collect::<std::collections::BTreeSet<u32>>()
+    {
+        if opts.cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        METRICS
+            .job_fleet_shards_relocal
+            .fetch_add(1, Ordering::Relaxed);
+        reports.push(run(ctx, &local_shard(k)).await?);
+    }
+
+    let mut merged = merge_reports(&reports);
+
+    // ---- FINALIZE (design §4 step 6): the allocator classes + C8 over
+    // the fleet-merged full census, with the existing verify ladder ----
+    let mut fin_counters = FsckCounters::default();
+    let mut fin_findings: Vec<FsckFinding> = Vec::new();
+    if !opts.scrub_only && !opts.cancel.load(Ordering::Relaxed) {
+        let mut fin_opts = opts.clone();
+        fin_opts.shard = None;
+        fin_opts.assume_latched = true;
+        let census = match merged.partial.as_ref().filter(|p| p.mappings_complete) {
+            Some(p) => CensusOut {
+                refs: p.refs.clone(),
+                mappings: p.mappings.clone(),
+                // Unresolvable mappings were adjudicated PER SHARD (the
+                // arm runs sharded); re-feeding them would double-report.
+                unresolvable: Vec::new(),
+                live: ino_bitmap(&ctx.meta),
+                odd_nlink: HashMap::new(),
+                odd_nlink_complete: true,
+                complete: true,
+                inodes_scanned: merged.counters.inodes_scanned,
+            },
+            None => {
+                log::warn!(
+                    "fsck fleet ({job_id}): a shard degraded its mapping list (oversize \
+                     wire frame) — the finalize walks the coordinator census instead \
+                     (the stated Amdahl term, design-mw-fleet-jobs §4)"
+                );
+                walk_census(ctx, &fin_opts, &mut fin_counters).await?
+            }
+        };
+        let mut fin_suspects: Vec<Suspect> = Vec::new();
+        evaluate_allocator_classes(
+            &vols,
+            &census,
+            &fin_opts,
+            &mut fin_counters,
+            &mut fin_suspects,
+        );
+        evaluate_c8(ctx, &mut fin_suspects).await;
+        fin_counters.suspects += fin_suspects.len() as u64;
+        if !fin_suspects.is_empty() {
+            squeezefs_ipc::sqz_time::sleep(opts.settle).await;
+            for v in &vols {
+                v.alloc.fsck_bump_epoch();
+            }
+            recheck_suspects(
+                ctx,
+                &fin_opts,
+                &vols,
+                fin_suspects,
+                &mut fin_counters,
+                &mut fin_findings,
+            )
+            .await?;
+        }
+    }
+    drop(latch_release);
+
+    merged.findings.extend(fin_findings);
+    merged.findings.sort();
+    merged.findings.dedup();
+    fold_finalize_counters(&mut merged.counters, &fin_counters);
+    merged.counters.findings = merged.findings.len() as u64;
+    merged.counters.scan_secs = started.elapsed().as_secs();
+    merged.shard = None;
+    merged.mode = "online".to_string();
+
+    // Publish the WORKER + FINALIZE shares on the coordinator's stats
+    // inode (the local shards published themselves inside `run`): the
+    // coordinator's `fsck_*` deltas account for the whole fleet pass
+    // exactly once, and each member's stats carry its own share — the
+    // gate-1 partition-accounting instrument. `findings` rides the
+    // MERGED (deduped) count via the reports, never the per-shard sums.
+    fin_counters.findings = 0;
+    fin_counters.scan_secs = 0;
+    publish_metrics(&worker_counters);
+    publish_metrics(&fin_counters);
+    crate::fuse_client::METRICS
+        .fsck_scan_secs
+        .store(merged.counters.scan_secs, Ordering::Relaxed);
+
+    Ok(merged)
+}
+
+/// Sum a worker shard's census counters into the coordinator-published
+/// aggregate (every field except the merge-adjudicated `findings` and
+/// the per-run `scan_secs`, zeroed by the caller).
+fn fold_worker_counters(dst: &mut FsckCounters, src: &FsckCounters) {
+    dst.inodes_scanned += src.inodes_scanned;
+    dst.nodes_walked = dst.nodes_walked.max(src.nodes_walked);
+    dst.dentry_refs_indexed += src.dentry_refs_indexed;
+    dst.current_era_exempted += src.current_era_exempted;
+    dst.nlink_names_counted += src.nlink_names_counted;
+    dst.nlink_mismatch_high += src.nlink_mismatch_high;
+    dst.nlink_mismatch_low += src.nlink_mismatch_low;
+    dst.nlink_zero_named += src.nlink_zero_named;
+    dst.dangling_dentries += src.dangling_dentries;
+    dst.nlink_transient_cleared += src.nlink_transient_cleared;
+    dst.blocks_checked += src.blocks_checked;
+    dst.refcounts_checked += src.refcounts_checked;
+    dst.suspects += src.suspects;
+    dst.suspects_cleared += src.suspects_cleared;
+    dst.epoch_exempted += src.epoch_exempted;
+    dst.inflight_exempted += src.inflight_exempted;
+    dst.mover_ledger_exempted += src.mover_ledger_exempted;
+    dst.foreign_lane_exempted += src.foreign_lane_exempted;
+    dst.scrub_blocks_scanned += src.scrub_blocks_scanned;
+    dst.scrub_bytes_scanned += src.scrub_bytes_scanned;
+    dst.scrub_aead_verified += src.scrub_aead_verified;
+    dst.scrub_frame_verified += src.scrub_frame_verified;
+    dst.scrub_readability_only += src.scrub_readability_only;
+    dst.scrub_failures += src.scrub_failures;
 }
 
 // ---------------------------------------------------------------------------
@@ -2195,6 +2542,42 @@ async fn layout_mappings_of(ctx: &FsckCtx, ino: u64) -> Vec<MappingRef> {
 // ---------------------------------------------------------------------------
 // C2/C3/C6 evaluation
 // ---------------------------------------------------------------------------
+
+/// C8 (pre-RC spec §6.2 item 1): durable-vs-derived block-reference
+/// drift. Factored out of [`run`] so the KD-MW-16 fleet FINALIZE runs
+/// the identical class (a fleet pass must never cover LESS than the
+/// coordinator's own unsharded run). Skipped (with a warning, never a
+/// guess) when the comparison fails; a volume without the ledger has
+/// nothing to disagree with.
+async fn evaluate_c8(ctx: &FsckCtx, suspects: &mut Vec<Suspect>) {
+    if !ctx.meta.volumes.iter().any(|kv| kv.block_refs_engaged()) {
+        return;
+    }
+    let chunk = ctx.router.backend_router.default_allocator.chunk_size();
+    match ctx
+        .router
+        .backend_router
+        .verify_durable_block_refs(&ctx.meta)
+        .await
+    {
+        Ok(drift) => {
+            for (vol, idx, durable, derived) in drift {
+                suspects.push(Suspect {
+                    kind: SuspectKind::C8DurableRefDrift {
+                        vol,
+                        offset: idx.saturating_mul(chunk),
+                        durable,
+                        derived,
+                    },
+                });
+            }
+        }
+        Err(e) => log::warn!(
+            "fsck C8: durable block-reference comparison failed: {e} (no verdict \
+             recorded — the class is skipped for this run, never guessed)"
+        ),
+    }
+}
 
 fn evaluate_allocator_classes(
     vols: &[VolAlloc],

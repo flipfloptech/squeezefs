@@ -1995,16 +1995,82 @@ async fn run_job_worker(meta_uri: &str) -> Result<(), Box<dyn std::error::Error>
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "unknown-host".to_string());
     let worker_id = format!("{hostname}:{}", std::process::id());
-    let worker = squeezefs::job_wire::JobWireWorker::connect(
-        &endpoint,
-        &secret,
-        squeezefs::job_wire::WorkerOptions::new(&worker_id),
-    )
-    .await
-    .map_err(|e| format!("enrollment failed: {e}"))?;
+    // KD-MW-16 (rung 10c): the manual storage-trust worker is a fleet
+    // READ participant too — census/scrub residues execute over its own
+    // read-only probe opens (the offline engine, zero staging dirs, so
+    // the C4/C5 classes are the mounted members' and the coordinator's).
+    let mut opts = squeezefs::job_wire::WorkerOptions::new(&worker_id);
+    opts.caps = squeezefs::job_wire::CAP_FLEET_READ;
+    let worker = squeezefs::job_wire::JobWireWorker::connect(&endpoint, &secret, opts)
+        .await
+        .map_err(|e| format!("enrollment failed: {e}"))?;
     println!("job worker: enrolled as {worker_id}; serving shards (stop with SIGINT)");
+
+    /// The probe-backed fleet read seam: each shard opens its own
+    /// read-only probe set (the clients/df access pattern — no D0
+    /// claim) and runs the offline engine's residue walk. A refusal
+    /// (e.g. an unreachable volume) ABANDONS the shard — the
+    /// coordinator re-leases; never a faked report.
+    struct ProbeFleetSeam {
+        meta_lvs: Vec<String>,
+    }
+    impl squeezefs::job_wire::ShardDeviceSeam for ProbeFleetSeam {
+        fn plan_blocks(&self, _job: &squeezefs::jobs::JobType) -> usize {
+            0
+        }
+        fn block_len(&self) -> usize {
+            0
+        }
+        fn allocate(&self, n: usize) -> std::io::Result<Vec<squeezefs::job_wire::DestTuple>> {
+            if n == 0 {
+                return Ok(Vec::new());
+            }
+            Err(std::io::Error::other(
+                "the probe fleet seam is read-class: it never allocates destinations",
+            ))
+        }
+        fn read_source(&self, _key: &str) -> std::io::Result<Vec<u8>> {
+            Err(std::io::Error::other("probe fleet seam: no device"))
+        }
+        fn write_block(
+            &self,
+            _dest: &squeezefs::job_wire::DestTuple,
+            _data: &[u8],
+        ) -> std::io::Result<()> {
+            Err(std::io::Error::other("probe fleet seam: no device"))
+        }
+        fn read_block(&self, _dest: &squeezefs::job_wire::DestTuple) -> std::io::Result<Vec<u8>> {
+            Err(std::io::Error::other("probe fleet seam: no device"))
+        }
+        fn run_fleet_shard(
+            &self,
+            job: &squeezefs::jobs::JobType,
+            shard_k: u32,
+            shard_count: u32,
+            throttle_pct: u32,
+        ) -> std::io::Result<Vec<u8>> {
+            let mut o = squeezefs::fsck::FsckOptions::offline();
+            o.shard = Some((shard_k, shard_count));
+            o.throttle_pct = throttle_pct;
+            if let squeezefs::jobs::JobType::Fsck {
+                scrub, scrub_only, ..
+            } = job
+            {
+                o.scrub = *scrub;
+                o.scrub_only = *scrub_only;
+            }
+            let report = squeezefs_ipc::sqz_blocking::block_on(squeezefs::fsck::run_offline(
+                &self.meta_lvs,
+                &o,
+            ))
+            .map_err(|e| std::io::Error::other(format!("probe shard fsck failed: {e}")))?;
+            serde_json::to_vec(&report).map_err(std::io::Error::other)
+        }
+    }
     let report = worker
-        .run(std::sync::Arc::new(squeezefs::job_wire::NoopDeviceSeam))
+        .run(std::sync::Arc::new(ProbeFleetSeam {
+            meta_lvs: meta_lvs.clone(),
+        }))
         .await?;
     println!(
         "job worker: coordinator connection closed — shards completed {}, submissions \
@@ -5952,6 +6018,50 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 None => None,
             };
 
+            // KD-MW-16 (rung 10c, docs/design-mw-fleet-jobs.md §2): a
+            // READER/CO-WRITER member serves fleet READ shards. Workers
+            // arrive BY MEMBERSHIP (the joined S6 session is the
+            // eligibility gate) while authentication stays storage-trust
+            // (the worker reads job:enroll through its own meta backend
+            // — neither law weakens). Deliberately AFTER the membership
+            // and co-writer arms: an unjoined mount is not a member and
+            // must not appear as a fleet worker. SQUEEZEFS_FLEET_JOBS=0
+            // disarms this mount's half.
+            let mut fleet_worker_arm: Option<squeezefs::fleet_worker::FleetWorkerArm> =
+                if (reader_mount || co_writer_mount)
+                    && squeezefs::env_knobs::fleet_jobs_enabled()
+                    && squeezefs::membership::installed_member_session().is_some()
+                {
+                    match squeezefs::cowriter::node_member_id() {
+                        Ok(worker_id) => match squeezefs::fleet_worker::spawn_fleet_worker(
+                            routed_meta_backend.clone(),
+                            fs_engine.router.clone(),
+                            worker_id,
+                        ) {
+                            Ok(arm) => {
+                                log::info!(
+                                    "fleet jobs: member worker armed (KD-MW-16 — fleet \
+                                     read shards; SQUEEZEFS_FLEET_JOBS=0 opts out)"
+                                );
+                                Some(arm)
+                            }
+                            Err(e) => {
+                                log::warn!("fleet jobs: worker spawn failed: {e} — not armed");
+                                None
+                            }
+                        },
+                        Err(e) => {
+                            log::warn!(
+                                "fleet jobs: no stable enrollment identity ({e}) — worker \
+                                 not armed"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
             let opt_idle = if resolved_fuse_io_uring_sqpoll_idle_ms > 0 {
                 Some(resolved_fuse_io_uring_sqpoll_idle_ms)
             } else {
@@ -6010,6 +6120,14 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // mount stops answering liveness (the reverse of the arm's
             // order, so no window exists where custody is granted by a
             // mount that is no longer a member).
+            // KD-MW-16: stop serving fleet shards FIRST — a member that
+            // is about to leave must not hold a shard lease into its own
+            // teardown (the coordinator re-leases the residue the moment
+            // the departure EOF lands).
+            if let Some(fw) = fleet_worker_arm.as_mut() {
+                fw.disarm();
+            }
+            drop(fleet_worker_arm);
             if let Some(mw) = multi_writer_arm {
                 mw.disarm().await;
             }

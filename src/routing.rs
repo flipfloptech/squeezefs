@@ -15692,8 +15692,9 @@ impl DataRouter {
         let mut refs = self.block_ref_ops(ino, &ref_changes);
         let pending = self.take_block_ref_ops(ino);
         if !pending.is_empty() {
-            let mut seen: std::collections::BTreeSet<crate::meta_backend::kv::block_refs::BlockRef> =
-                refs.iter().map(|op| op.reference).collect();
+            let mut seen: std::collections::BTreeSet<
+                crate::meta_backend::kv::block_refs::BlockRef,
+            > = refs.iter().map(|op| op.reference).collect();
             for op in pending {
                 if seen.insert(op.reference) {
                     refs.push(crate::meta_backend::kv::block_refs::BlockRefOp::released(

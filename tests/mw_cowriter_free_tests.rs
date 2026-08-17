@@ -1735,7 +1735,11 @@ async fn a_reclaim_shaped_release_batch_is_exact_idempotent_and_frees_read_freed
     let cwr = CoWriter::join(&auth, &vol, &dev, NODE_A).await;
     let shadow_off = cwr.alloc.allocate_block().await.expect("lane-1 mint");
     let shadow_idx = shadow_off / cwr.alloc.chunk_size();
-    assert_eq!(auth.population(shadow_idx).await, 0, "premise: never staged");
+    assert_eq!(
+        auth.population(shadow_idx).await,
+        0,
+        "premise: never staged"
+    );
 
     let tag = volume_tag(DATA_VOL);
     let epoch = cwr.client.lease_epoch();
@@ -1768,7 +1772,11 @@ async fn a_reclaim_shaped_release_batch_is_exact_idempotent_and_frees_read_freed
         .await
         .expect("the mixed release batch applies");
     assert_eq!(auth.population(old_idx).await, 0, "the staged record died");
-    assert_eq!(auth.population(shadow_idx).await, 0, "the no-op stayed a no-op");
+    assert_eq!(
+        auth.population(shadow_idx).await,
+        0,
+        "the no-op stayed a no-op"
+    );
 
     // Idempotence: the verbatim re-ship (a lost-reply retry never re-keys).
     let replays_before = publish::stats().replays;
@@ -1789,15 +1797,10 @@ async fn a_reclaim_shaped_release_batch_is_exact_idempotent_and_frees_read_freed
 
     // Release-before-free: both frees read Freed — the NonTerminal strand
     // (a free racing its own orphaned record) is structurally gone.
-    let verdicts = publish::ship_free_blocks(
-        &auth.endpoint,
-        tag,
-        vec![shadow_idx, old_idx],
-        epoch,
-        0xC9,
-    )
-    .await
-    .expect("the corpse's frees ship");
+    let verdicts =
+        publish::ship_free_blocks(&auth.endpoint, tag, vec![shadow_idx, old_idx], epoch, 0xC9)
+            .await
+            .expect("the corpse's frees ship");
     assert_eq!(
         verdicts,
         vec![publish::FreeVerdict::Freed, publish::FreeVerdict::Freed],

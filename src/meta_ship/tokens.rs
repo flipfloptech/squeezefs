@@ -337,6 +337,22 @@ pub fn range_token_covering(ino: u64, start: u64, end: u64) -> Option<u64> {
         .flatten()
 }
 
+/// The HULL of this client's cached spans on `ino` — `(min start, max
+/// end)` over live grants, or `None`. The write path's desired-window
+/// seed: unioning the hull into desired is what makes the next ask
+/// EXTEND the held grant instead of minting a stripe-mate (the §9.2
+/// convergence).
+pub fn range_span_hull(ino: u64) -> Option<(u64, u64)> {
+    RANGE_CACHE
+        .read_sync(&ino, |_, spans| {
+            spans
+                .iter()
+                .map(|s| (s.start, s.end))
+                .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
+        })
+        .flatten()
+}
+
 /// Retire one grant from the cache (release / grant-level revocation).
 pub fn retire_range_grant(ino: u64, token: u64) {
     let mut removed = 0u64;

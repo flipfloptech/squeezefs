@@ -6971,6 +6971,15 @@ pub struct SqueezefsFilesystem {
     uid: u32,
     gid: u32,
     active_leases: std::sync::Arc<dashmap::DashMap<u64, crate::dlm::LockLease, ahash::RandomState>>,
+    /// S11 rung 15 (KD-MW-7): this mount's live byte-RANGE leases, keyed
+    /// per ino — populated ONLY on an armed co-writer whose ranged write
+    /// path engaged (`range_custody_enabled` + a foreign-home ino), so a
+    /// single-writer mount never allocates past the empty map (KD-MW-12).
+    /// A Vec because the block-cyclic shape legitimately holds several
+    /// non-coalescible stripes per file; dropping a lease releases its
+    /// custody (the release travels on the client's next drain).
+    active_range_leases:
+        std::sync::Arc<dashmap::DashMap<u64, Vec<crate::dlm::LockLease>, ahash::RandomState>>,
     lease_locks: std::sync::Arc<StripeLocks<crate::sqz_sync::SqzMutex<()>, 4096>>,
     pub active_inode_locks: std::sync::Arc<StripeLocks<crate::sqz_sync::SqzRwLock<()>, 4096>>,
     /// P1-4: capacity-bounded attribute cache (moka TTL + max_capacity).
@@ -7300,6 +7309,7 @@ impl Clone for SqueezefsFilesystem {
             uid: self.uid,
             gid: self.gid,
             active_leases: self.active_leases.clone(),
+            active_range_leases: self.active_range_leases.clone(),
             lease_locks: self.lease_locks.clone(),
             active_inode_locks: self.active_inode_locks.clone(),
             attr_cache: self.attr_cache.clone(),
@@ -7451,6 +7461,9 @@ impl SqueezefsFilesystem {
             uid,
             gid,
             active_leases: std::sync::Arc::new(dashmap::DashMap::with_hasher(
+                ahash::RandomState::new(),
+            )),
+            active_range_leases: std::sync::Arc::new(dashmap::DashMap::with_hasher(
                 ahash::RandomState::new(),
             )),
             lease_locks: std::sync::Arc::new(StripeLocks::new()),
@@ -11832,6 +11845,16 @@ impl SqueezefsFilesystem {
         if let Some(lease) = self.active_leases.get(&ino) {
             return Ok(lease.fencing_token());
         }
+        // S11 rung 15: a file under this mount's RANGE custody serves the
+        // newest range token instead of acquiring whole-file — a
+        // whole-file EX acquire would CONFLICT with the mount's own live
+        // range grants at the authority (fsync/flush/truncate would wedge
+        // against custody this mount itself holds). Empty-map probe on
+        // every shipped mount (the map only ever populates on an armed
+        // co-writer's engaged ranged writes — KD-MW-12).
+        if let Some(token) = self.newest_range_token(ino) {
+            return Ok(token);
+        }
 
         let lock_arc = self.lease_locks.get_lock(ino, 0);
         let start_lease_lock = std::time::Instant::now();
@@ -11840,6 +11863,9 @@ impl SqueezefsFilesystem {
 
         if let Some(lease) = self.active_leases.get(&ino) {
             return Ok(lease.fencing_token());
+        }
+        if let Some(token) = self.newest_range_token(ino) {
+            return Ok(token);
         }
 
         let file_path = crate::keys::inode_path(ino);
@@ -11862,6 +11888,126 @@ impl SqueezefsFilesystem {
         let token = lease.fencing_token();
         self.active_leases.insert(ino, lease);
         Ok(token)
+    }
+
+    /// S11 rung 15: is the RANGED write-custody path engaged for `ino`?
+    /// One relaxed-load ladder that answers `false` on every shipped
+    /// mount before touching anything (KD-MW-12: the whole-file fast path
+    /// is structurally untouched wherever the plane is dark): the
+    /// `SQUEEZEFS_RANGE_CUSTODY` lever (read only when the mw plane is
+    /// armed), an armed co-writer client, and a FOREIGN-home ino (the
+    /// authority's own local files keep whole-file custody — its local
+    /// arm is the shipped path).
+    fn range_write_engaged(&self, ino: u64) -> bool {
+        crate::data_grant::range_custody_enabled()
+            && crate::data_grant::custody_client().is_some()
+            && !crate::dlm_slot::is_local_slot(crate::dlm_slot::slot_of_ino(
+                ino,
+                crate::dlm_slot::routing_width(),
+            ))
+    }
+
+    /// The newest token among this mount's live RANGE leases on `ino`
+    /// (`None` = no range custody — the caller acquires as today). What
+    /// keeps the non-span mutating ops (fsync/flush/truncate/fallocate)
+    /// from acquiring WHOLE-FILE custody over the mount's own live range
+    /// grants — a self-conflict that would wedge every fsync under range
+    /// custody. The newest own token is exactly the mount's local
+    /// generation read (`live_custody_generation` = max over OWN adopted
+    /// grants), so the `presented < current` fencing gates stay coherent.
+    fn newest_range_token(&self, ino: u64) -> Option<u64> {
+        let leases = self.active_range_leases.get(&ino)?;
+        leases.value().iter().map(|l| l.fencing_token()).max()
+    }
+
+    /// **S11 rung 15 — the ranged write lease** (KD-MW-7, §9.2): the
+    /// WRITE handler's acquisition for `[offset, offset+len)`. On every
+    /// shipped mount this IS [`Self::acquire_write_lease`] (one boolean
+    /// ladder ahead of it). On an armed co-writer's foreign-home ino:
+    ///
+    /// 1. a live whole-file lease covers everything (unchanged);
+    /// 2. the client range cache's covering probe serves the granted
+    ///    token lock-free (the ≥99.5 %-local law — subsequent writes
+    ///    inside a granted stripe pay no round trip);
+    /// 3. else acquire: `required` = the write's span, `desired` = its
+    ///    block-aligned window ∪ the held hull, stretched forward by the
+    ///    held length (slow-start doubling — a derived stretch, trimmed
+    ///    by the authority against any peer, so a streaming writer
+    ///    converges to O(log n) extension round trips; the R2-classifier
+    ///    stretch is rung 18's refinement). An EXTENSION widens the held
+    ///    grant in place (same token); a NEW grant's lease parks in
+    ///    `active_range_leases` until release/reclaim.
+    async fn acquire_write_lease_for_span(
+        &self,
+        ino: u64,
+        offset: u64,
+        len: u64,
+    ) -> Result<u64, SqueezefsError> {
+        if len == 0 || !self.range_write_engaged(ino) {
+            return self.acquire_write_lease(ino).await;
+        }
+        let (start, end) = (offset, offset.saturating_add(len));
+        // 1. Whole-file custody covers every span (a mount that took the
+        // whole file before the lever engaged keeps its fast path).
+        if let Some(lease) = self.active_leases.get(&ino) {
+            return Ok(lease.fencing_token());
+        }
+        // 2. The covering probe — the cached-token hot path.
+        if let Some(token) = crate::meta_ship::tokens::range_token_covering(ino, start, end) {
+            return Ok(token);
+        }
+        // 3. The acquire, serialized per ino exactly like the whole-file
+        // slow path (lock order 2 — the lease_locks stripe).
+        let lock_arc = self.lease_locks.get_lock(ino, 0);
+        let start_lease_lock = std::time::Instant::now();
+        let _guard = lock_arc.lock().await;
+        METRICS.lease_lock_wait.record(start_lease_lock.elapsed());
+        if let Some(token) = crate::meta_ship::tokens::range_token_covering(ino, start, end) {
+            return Ok(token);
+        }
+        let block = self.router.block_size.load(Ordering::Relaxed).max(1);
+        let mut desired = crate::dlm::block_align_out((start, end), block);
+        if let Some(hull) = crate::meta_ship::tokens::range_span_hull(ino) {
+            // Union the held hull so an adjacent stream EXTENDS instead of
+            // minting a stripe-mate, then stretch forward by the held
+            // length (doubling): the §9.2 desired-window law makes the
+            // over-ask free — the authority trims it against any peer,
+            // never below required.
+            desired.0 = desired.0.min(hull.0);
+            desired.1 = desired.1.max(hull.1);
+            let held_len = desired.1 - desired.0;
+            desired = crate::dlm::block_align_out(
+                (desired.0, desired.1.saturating_add(held_len)),
+                block,
+            );
+        }
+        let file_path = crate::keys::inode_path(ino);
+        let start_dlm = std::time::Instant::now();
+        let outcome = self
+            .dlm
+            .acquire_lock_range(&file_path, (start, end), desired, DLM_LEASE_WAIT, None)
+            .await;
+        match outcome {
+            Ok(crate::dlm::RangeAcquired::New { lease, .. }) => {
+                METRICS.lease_acquire_ok.fetch_add(1, Ordering::Relaxed);
+                METRICS.dlm_acquire_time.record(start_dlm.elapsed());
+                let token = lease.fencing_token();
+                self.active_range_leases.entry(ino).or_default().push(lease);
+                Ok(token)
+            }
+            Ok(
+                crate::dlm::RangeAcquired::Extended { token, .. }
+                | crate::dlm::RangeAcquired::Covered { token, .. },
+            ) => {
+                METRICS.lease_acquire_ok.fetch_add(1, Ordering::Relaxed);
+                METRICS.dlm_acquire_time.record(start_dlm.elapsed());
+                Ok(token)
+            }
+            Err(e) => {
+                METRICS.lease_acquire_fail.fetch_add(1, Ordering::Relaxed);
+                Err(e)
+            }
+        }
     }
 
     /// **POSIX-5**: acquire the write lease for a user-visible mutating
@@ -11956,6 +12102,13 @@ impl SqueezefsFilesystem {
         if let Some((_, lease)) = self.active_leases.remove(&ino) {
             // Best-effort async release if runtime present.
             drop(lease);
+        }
+        // S11 rung 15: range custody re-earns exactly like the whole-file
+        // lease — the drop queues the releases (they travel on the
+        // client's next drain) and the retry ladder's re-acquire presents
+        // a fresh grant. Empty-map probe on every shipped mount.
+        if let Some((_, leases)) = self.active_range_leases.remove(&ino) {
+            drop(leases);
         }
     }
 
@@ -19128,6 +19281,11 @@ impl SqueezefsFilesystem {
         if let Some((_, lease)) = self.active_leases.remove(&ino) {
             let _ = lease.release().await;
         }
+        if let Some((_, leases)) = self.active_range_leases.remove(&ino) {
+            for lease in leases {
+                let _ = lease.release().await;
+            }
+        }
         self.router.metadata_cache.remove(&ino);
         self.attr_cache.invalidate(&ino);
         self.last_write_end.remove_sync(&ino);
@@ -21474,10 +21632,14 @@ impl Filesystem for SqueezefsFilesystem {
                 }
             }
 
-            // 1. Get or acquire lease (fencing token)
+            // 1. Get or acquire lease (fencing token). S11 rung 15:
+            // the span-aware form — identical to acquire_write_lease on
+            // every mount whose range plane is dark (KD-MW-12), a ranged
+            // required/desired acquire on an armed co-writer's
+            // foreign-home ino.
             let wp_lease = write_phase_start();
             let fencing_token = self
-                .acquire_write_lease(ino)
+                .acquire_write_lease_for_span(ino, offset, wlen as u64)
                 .await
                 .map_err(map_squeezefs_err)?;
             write_phase_record(WritePhase::LeaseAcquire, wp_lease);
@@ -21667,8 +21829,12 @@ impl Filesystem for SqueezefsFilesystem {
                                 return Err(map_squeezefs_err(e));
                             }
                             attempt += 1;
+                            // S11 rung 15: the re-acquire stays span-aware —
+                            // a whole-file re-acquire on a range-custody
+                            // co-writer would conflict with a PEER's live
+                            // ranges and turn a transient fence into EIO.
                             token = self
-                                .acquire_write_lease(ino)
+                                .acquire_write_lease_for_span(ino, offset, wlen as u64)
                                 .await
                                 .map_err(map_squeezefs_err)?;
                             // KD-6: never reuse the entry-time snapshot
@@ -21721,8 +21887,12 @@ impl Filesystem for SqueezefsFilesystem {
                                 return Err(map_squeezefs_err(e));
                             }
                             attempt += 1;
+                            // S11 rung 15: the re-acquire stays span-aware —
+                            // a whole-file re-acquire on a range-custody
+                            // co-writer would conflict with a PEER's live
+                            // ranges and turn a transient fence into EIO.
                             token = self
-                                .acquire_write_lease(ino)
+                                .acquire_write_lease_for_span(ino, offset, wlen as u64)
                                 .await
                                 .map_err(map_squeezefs_err)?;
                             // KD-6: the retry re-runs the protocol against
@@ -23542,6 +23712,14 @@ impl Filesystem for SqueezefsFilesystem {
         if !self.is_open(ino) {
             if let Some((_, lease)) = self.active_leases.remove(&ino) {
                 let _ = lease.release().await;
+            }
+            // S11 rung 15: range custody is per-open-episode exactly like
+            // the whole-file lease — the last close releases it, so the
+            // bytes become grantable to a peer.
+            if let Some((_, leases)) = self.active_range_leases.remove(&ino) {
+                for lease in leases {
+                    let _ = lease.release().await;
+                }
             }
         }
 

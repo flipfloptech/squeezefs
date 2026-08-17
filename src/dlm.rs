@@ -1417,6 +1417,14 @@ impl LockLease {
         self.inner.fencing_token
     }
 
+    /// The span this lease was ACQUIRED over — `None` = whole-inode
+    /// custody. NB: a grant widened by the admit-time merge covers MORE
+    /// than this (the client range cache carries the current hull); the
+    /// acquisition span is the release identity, not the coverage read.
+    pub fn span(&self) -> Option<(u64, u64)> {
+        self.inner.span
+    }
+
     pub async fn release(self) -> Result<()> {
         self.inner.unlock();
         Ok(())

@@ -85,6 +85,26 @@
 #                       under the successor era; fsck+C8 green). The
 #                       surviving-process grace re-assert is pinned in
 #                       cargo (tests/mw_delegation_tests.rs).
+#   s10-intents         (rung 13; KD-MW-13, design §8.2 lever 1's UPDATE
+#                       arm) EXCLUSIVE per-directory UPDATE grants +
+#                       create-intent batches on a --cowriters fleet:
+#                       earn -> local mints (zero wire) + deferred
+#                       setattrs -> fsync(dir) flush (the contract point)
+#                       -> foreign visibility; the OQ-2 live round (the
+#                       owner's ls RECALLS the holder, which FLUSHES
+#                       before the serve); the STORM row (the OQ-2 price,
+#                       published — the reopening trigger's instrument);
+#                       the SQUEEZEFS_UPDATE_INTENTS=0 A/B control; and
+#                       the TWO-SIDED MW-8 kill-9 (pre-fsync = the
+#                       acked-un-fsynced class, loss is a FIFO prefix;
+#                       post-fsync = every name durable), fsck+C8 green
+#                       after each kill.
+#   s10-intents-tarx    (rung 13's measured row; the rung-9 s8-serial-ab
+#                       instrument verbatim) tar -x on the netns co-writer
+#                       at 250 µs RTT, UPDATE intents ON vs OFF, A-B-B-A;
+#                       publishes entries/s + wire verbs/entry either way
+#                       (row 14 owns the formal <=1.10x gate — this row is
+#                       its input). Quiet-gated (cargo + loadavg).
 #   cowriters-admission GATED (the 5b gate): the multi-identity legs rungs
 #                       7-10 build on. Probes the recorded host-scoped
 #                       verdict; on this kernel it SKIPs loud with the
@@ -3442,6 +3462,341 @@ $out"
     log "s10-delegation GREEN (engagement $hits_d hits/$ship_d ships; coherence acked-before-publish; lever-off dark; kill-9 re-earn; fsck+C8 clean). Snapshots in $rowdir"
 }
 
+leg_s10_intents() {
+    # Rung 13 (KD-MW-13; design §8.2 lever 1, the UPDATE arm): EXCLUSIVE
+    # per-directory UPDATE grants + create-intent batches end-to-end on
+    # the LIVE fleet — earn → local mints (zero wire) → fsync(dir) flush →
+    # foreign visibility — plus the OQ-2 recall-forces-flush live round
+    # (the owner's own ls forces the holder's flush), the lever-off A/B
+    # control, the STORM row (the OQ-2 price — the reopening trigger's
+    # live instrument, published never gated), and the TWO-SIDED MW-8
+    # kill (pre-fsync: the acked-un-fsynced class, loss is a FIFO prefix,
+    # never corruption; post-fsync: every name durable — fsync(dir) IS
+    # the contract point), with the fsck/C8 oracle green after each kill.
+    require_cowriters 1
+    local rowdir cw w_mnt cw_mnt n
+    rowdir="$STATE/rows/s10i-$(date +%s)"
+    mkdir -p "$rowdir"
+    cw="$(cowriter_idxs | head -1)"
+    w_mnt="$(mnt_of 0)"
+    cw_mnt="$(mnt_of "$cw")"
+
+    ifield() { # idx key -> value-or-0 (the meta_ship_intent family nests)
+        local v
+        v="$(stat_field "$1" "$2")"
+        echo "${v:-0}"
+    }
+    remount_cw() { # [env assignments...] — kill-free co-writer remount
+        "$MWFLEET" unmount "$cw" || die "s10-intents: co-writer unmount failed"
+        env "$@" "$MWFLEET" mount "$cw" || die "s10-intents: co-writer remount failed"
+    }
+    earn_grant() { # dir-path — the FIRST create ships and EARNS the grant
+        local d="$1" g0 tries
+        g0="$(ifield "$cw" meta_ship_intent.meta_ship_intent_update_grants)"
+        touch "$d/earn" || die "s10-intents: the grant-earning create failed"
+        for ((tries = 0; tries < 40; tries++)); do
+            [ "$(ifield "$cw" meta_ship_intent.meta_ship_intent_update_grants)" -gt "$g0" ] && return 0
+            sleep 0.25
+        done
+        die "s10-intents: no UPDATE grant rode the earning create (grants flat at $g0)"
+    }
+
+    # ---- Phase 1: earn → mint (zero wire) → fsync(dir) → foreign visibility --
+    mkdir -p "$w_mnt/s10i" || die "s10-intents: authority mkdir failed"
+    local files=24 mints0 mints1 ship0 ship1 batches0 verbs0 defer0
+    mkdir -p "$cw_mnt/s10i/d1" || die "s10-intents: co-writer mkdir failed"
+    earn_grant "$cw_mnt/s10i/d1"
+    mints0="$(ifield "$cw" meta_ship_intent.meta_ship_intent_mints)"
+    ship0="$(ifield "$cw" meta_ship.shipped_verbs)"
+    defer0="$(ifield "$cw" meta_ship_intent.meta_ship_intent_deferred_setattrs)"
+    for ((n = 0; n < files; n++)); do
+        echo "payload-$n" >"$cw_mnt/s10i/d1/f$n" || die "s10-intents: minted create failed"
+        touch -d @1700000000 "$cw_mnt/s10i/d1/f$n" || die "s10-intents: deferred utime failed"
+    done
+    mints1="$(ifield "$cw" meta_ship_intent.meta_ship_intent_mints)"
+    ship1="$(ifield "$cw" meta_ship.shipped_verbs)"
+    [ $((mints1 - mints0)) -ge $((files - 2)) ] ||
+        die "s10-intents: only $((mints1 - mints0)) local mints across $files creates — the grant is not minting"
+    # The zero-round-trip law: the mint span ships (near) nothing beyond
+    # the async writeback publishes racing it (data plane) — the ±12
+    # ceremony/writeback allowance is the s8-a instrument-skew law's.
+    [ $((ship1 - ship0)) -le 12 ] ||
+        die "s10-intents: the mint span SHIPPED $((ship1 - ship0)) metadata verbs — creates are not local"
+    [ "$(ifield "$cw" meta_ship_intent.meta_ship_intent_deferred_setattrs)" -gt "$defer0" ] ||
+        die "s10-intents: no setattr deferred into the batch (the tar utime shape is not engaging)"
+    batches0="$(ifield "$cw" meta_ship_intent.meta_ship_intent_batches)"
+    verbs0="$(ifield "$cw" meta_ship_intent.meta_ship_intent_verbs)"
+    sync "$cw_mnt/s10i/d1" || die "s10-intents: fsync(dir) failed"
+    [ "$(ifield "$cw" meta_ship_intent.meta_ship_intent_batches)" -gt "$batches0" ] ||
+        die "s10-intents: fsync(dir) forced no flush frame"
+    local vd bd
+    vd=$(($(ifield "$cw" meta_ship_intent.meta_ship_intent_verbs) - verbs0))
+    bd=$(($(ifield "$cw" meta_ship_intent.meta_ship_intent_batches) - batches0))
+    # Foreign visibility after the contract point: the AUTHORITY sees
+    # every name + the deferred times (owner-current serve; ls here also
+    # exercises the OQ-2 gate against a now-empty queue).
+    ls -1 --color=never "$cw_mnt/s10i/d1" >/dev/null || die "s10-intents: minter ls failed"
+    [ "$(find "$cw_mnt/s10i/d1" -mindepth 1 -maxdepth 1 | wc -l)" = "$((files + 1))" ] ||
+        die "s10-intents: the minter cannot list its own names"
+    ls -1 --color=never "$w_mnt/s10i/d1" >/dev/null || die "s10-intents: authority ls failed"
+    [ "$(find "$w_mnt/s10i/d1" -mindepth 1 -maxdepth 1 | wc -l)" = "$((files + 1))" ] ||
+        die "s10-intents: post-fsync the authority does not see every flushed name"
+    local mt
+    mt="$(stat -c %Y "$w_mnt/s10i/d1/f0")"
+    [ "$mt" = "1700000000" ] ||
+        die "s10-intents: the deferred utime did not apply (owner mtime $mt != 1700000000)"
+    log "phase 1: $((mints1 - mints0)) mints / $((ship1 - ship0)) shipped in the mint span; fsync flushed $vd intents in $bd frame(s) (coalesce $(python3 -c "print(f'{$vd/max(1,$bd):.1f}')")); foreign visibility + deferred times EXACT"
+
+    # ---- Phase 2: OQ-2 recall-forces-flush, live ------------------------------
+    local rr0 ff0 sub
+    sub="$cw_mnt/s10i/d1/sub"
+    mkdir "$sub" || die "s10-intents: minted mkdir failed"
+    echo x >"$sub/pending-child" || die "s10-intents: create into pending dir failed"
+    rr0="$(ifield 0 meta_ship_intent.meta_ship_intent_read_recalls)"
+    ff0="$(ifield "$cw" meta_ship_intent.meta_ship_intent_flush_forces)"
+    echo y >"$cw_mnt/s10i/d1/unsynced" || die "s10-intents: pre-read mint failed"
+    # The foreign read: the OWNER's ls under the granted dir must recall
+    # the holder (forcing its flush) and then serve the acked name — no
+    # fsync ever ran for `unsynced`.
+    ls -1 --color=never "$w_mnt/s10i/d1" >/dev/null || die "s10-intents: owner read failed"
+    [ -e "$w_mnt/s10i/d1/unsynced" ] ||
+        die "s10-intents: the owner's read missed an acked name (recall-forces-flush broken)"
+    [ "$(ifield 0 meta_ship_intent.meta_ship_intent_read_recalls)" -gt "$rr0" ] ||
+        die "s10-intents: the foreign read recalled nothing (read_recalls flat)"
+    [ "$(ifield "$cw" meta_ship_intent.meta_ship_intent_flush_forces)" -gt "$ff0" ] ||
+        die "s10-intents: the recall forced no flush (flush_forces flat)"
+    [ "$(ifield "$cw" dlm_delegation.dlm_delegation_stale_serves)" = "0" ] ||
+        die "s10-intents: stale_serves != 0"
+    log "phase 2: OQ-2 live — the owner's read recalled, the flush applied, the acked name served"
+
+    # ---- Phase 3: the STORM row (the OQ-2 price — published, not gated) ------
+    local rounds=12 t0 t1 sr0 sf0 sd0 sto0
+    mkdir -p "$cw_mnt/s10i/hot" || die "s10-intents: storm mkdir failed"
+    earn_grant "$cw_mnt/s10i/hot"
+    sr0="$(ifield 0 meta_ship_intent.meta_ship_intent_read_recalls)"
+    sf0="$(ifield "$cw" meta_ship_intent.meta_ship_intent_flush_forces)"
+    sd0="$(ifield 0 dlm_recall.dlm_thrash_demotions)"
+    sto0="$(ifield 0 dlm_delegation.dlm_delegation_recall_timeouts)"
+    t0="$(date +%s.%N)"
+    for ((n = 0; n < rounds; n++)); do
+        echo "$n" >"$cw_mnt/s10i/hot/w$n" || die "s10-intents: storm create failed"
+        ls -1 --color=never "$w_mnt/s10i/hot" >/dev/null || die "s10-intents: storm read failed"
+    done
+    t1="$(date +%s.%N)"
+    [ "$(ifield 0 dlm_delegation.dlm_delegation_recall_timeouts)" = "$sto0" ] ||
+        die "s10-intents: storm recalls TIMED OUT under a live holder"
+    {
+        echo "== s10-intents STORM row (OQ-2's price — the reopening trigger's live instrument) =="
+        echo "rounds=$rounds wall=$(python3 -c "print(f'{$t1-$t0:.2f}')")s per_round_ms=$(python3 -c "print(f'{($t1-$t0)*1000/$rounds:.1f}')")"
+        echo "read_recalls_delta=$(($(ifield 0 meta_ship_intent.meta_ship_intent_read_recalls) - sr0))"
+        echo "flush_forces_delta=$(($(ifield "$cw" meta_ship_intent.meta_ship_intent_flush_forces) - sf0))"
+        echo "thrash_demotions_delta=$(($(ifield 0 dlm_recall.dlm_thrash_demotions) - sd0)) (the valve is the brake; demotion under a hot shared dir is DESIGNED)"
+    } | tee "$rowdir/storm-row.txt"
+
+    # ---- Phase 4: the lever-off A/B control -----------------------------------
+    remount_cw SQUEEZEFS_UPDATE_INTENTS=0
+    mkdir -p "$cw_mnt/s10i/off" || die "s10-intents: lever-off mkdir failed"
+    local om0 og0 os0
+    om0="$(ifield "$cw" meta_ship_intent.meta_ship_intent_mints)"
+    og0="$(ifield "$cw" meta_ship_intent.meta_ship_intent_update_grants)"
+    os0="$(ifield "$cw" meta_ship.shipped_verbs)"
+    for ((n = 0; n < 8; n++)); do
+        touch "$cw_mnt/s10i/off/f$n" || die "s10-intents: lever-off create failed"
+    done
+    [ "$(ifield "$cw" meta_ship_intent.meta_ship_intent_mints)" = "$om0" ] ||
+        die "s10-intents: the LEVER-OFF control MINTED — the A/B is not dark"
+    [ "$(ifield "$cw" meta_ship_intent.meta_ship_intent_update_grants)" = "$og0" ] ||
+        die "s10-intents: the lever-off control was GRANTED — the A/B is not dark"
+    [ $(($(ifield "$cw" meta_ship.shipped_verbs) - os0)) -ge 8 ] ||
+        die "s10-intents: the lever-off control did not ship its creates"
+    log "phase 4: lever-off control dark (0 mints/grants, creates shipped); restoring"
+    remount_cw
+
+    # ---- Phase 5: MW-8, BOTH SIDES of fsync(dir) ------------------------------
+    # (a) PRE-fsync: the acked-un-fsynced class — the batch dies with the
+    # client, loss is a FIFO PREFIX of the queue (release kicks flush in
+    # order), and the store is CLEAN (fsck + C8 green). Loss here is the
+    # DISCLOSED class, never an assertion of presence.
+    local kdir="$cw_mnt/s10i/mw8" cw_pid tries present
+    mkdir -p "$kdir" || die "s10-intents: mw8 mkdir failed"
+    earn_grant "$kdir"
+    for ((n = 0; n < 16; n++)); do
+        echo "$n" >"$kdir/pre$n" || die "s10-intents: mw8 pre-fsync create failed"
+    done
+    cw_pid="$(awk -F'\t' -v i="$cw" '$1==i {print $7}' "$MEMBERS")"
+    "$MWFLEET" kill "$cw" --sig 9
+    umount -l "$cw_mnt" 2>/dev/null || true
+    wait_for_unmounted "$cw_mnt"
+    for ((tries = 0; tries < 120; tries++)); do
+        kill -0 "$cw_pid" 2>/dev/null || break
+        sleep 0.5
+    done
+    kill -0 "$cw_pid" 2>/dev/null && die "s10-intents: the killed co-writer (pid $cw_pid) never exited"
+    # The applied set must be a FIFO prefix: if pre_i survived, every
+    # pre_j (j<i) must have (batches apply in order; a hole = reordering).
+    present=-1
+    for ((n = 15; n >= 0; n--)); do
+        if [ -e "$w_mnt/s10i/mw8/pre$n" ]; then
+            present=$n
+            break
+        fi
+    done
+    for ((n = 0; n <= present; n++)); do
+        [ -e "$w_mnt/s10i/mw8/pre$n" ] ||
+            die "s10-intents: MW-8 pre-fsync loss is NOT a FIFO prefix (pre$n missing below pre$present)"
+    done
+    log "phase 5a: pre-fsync kill — $((present + 1))/16 applied (a FIFO prefix; the acked-un-fsynced class, disclosed)"
+    local out drift
+    out="$("$SQZ" fsck "$w_mnt" 2>&1)" || die "s10-intents: fsck after pre-fsync kill FAILED:
+$out"
+    echo "$out" >"$rowdir/fsck-mw8a.out"
+    echo "$out" | grep -q "findings: 0" || die "s10-intents: fsck findings != 0 after pre-fsync kill:
+$out"
+    drift="$(stat_field 0 meta_kv_block_refs_drift)"
+    [ "$drift" = "0" ] || die "s10-intents: drift=$drift after pre-fsync kill"
+
+    # (b) POST-fsync: fsync(dir) IS the contract point — every name durable.
+    for ((tries = 0; tries < 60; tries++)); do
+        "$MWFLEET" mount "$cw" 2>/dev/null && break
+        sleep 2
+    done
+    mountpoint -q "$cw_mnt" || die "s10-intents: co-writer re-admission failed after the kill"
+    mkdir -p "$cw_mnt/s10i/mw8b" || die "s10-intents: mw8b mkdir failed"
+    earn_grant "$cw_mnt/s10i/mw8b"
+    for ((n = 0; n < 16; n++)); do
+        echo "$n" >"$cw_mnt/s10i/mw8b/post$n" || die "s10-intents: mw8b create failed"
+    done
+    sync "$cw_mnt/s10i/mw8b" || die "s10-intents: mw8b fsync(dir) failed"
+    cw_pid="$(awk -F'\t' -v i="$cw" '$1==i {print $7}' "$MEMBERS")"
+    "$MWFLEET" kill "$cw" --sig 9
+    umount -l "$cw_mnt" 2>/dev/null || true
+    wait_for_unmounted "$cw_mnt"
+    for ((tries = 0; tries < 120; tries++)); do
+        kill -0 "$cw_pid" 2>/dev/null || break
+        sleep 0.5
+    done
+    for ((n = 0; n < 16; n++)); do
+        [ -e "$w_mnt/s10i/mw8b/post$n" ] ||
+            die "s10-intents: post$n LOST after fsync(dir) returned — the contract point is broken (MW-8)"
+    done
+    log "phase 5b: post-fsync kill — 16/16 durable (fsync(dir) IS the contract point)"
+    out="$("$SQZ" fsck "$w_mnt" 2>&1)" || die "s10-intents: fsck after post-fsync kill FAILED:
+$out"
+    echo "$out" >"$rowdir/fsck-mw8b.out"
+    echo "$out" | grep -q "findings: 0" || die "s10-intents: fsck findings != 0 after post-fsync kill:
+$out"
+    drift="$(stat_field 0 meta_kv_block_refs_drift)"
+    [ "$drift" = "0" ] || die "s10-intents: drift=$drift after post-fsync kill"
+    for ((tries = 0; tries < 60; tries++)); do
+        "$MWFLEET" mount "$cw" 2>/dev/null && break
+        sleep 2
+    done
+    mountpoint -q "$cw_mnt" || die "s10-intents: final co-writer re-admission failed"
+
+    # ---- The tripwires ---------------------------------------------------------
+    local v
+    for v in meta_ship.owner_panics meta_ship_publish.refusals invariant_tripwires \
+        dlm_delegation.dlm_delegation_stale_serves; do
+        [ "$(ifield 0 "$v")" = "0" ] || die "s10-intents: authority $v != 0"
+    done
+    [ "$(ifield "$cw" meta_ship_intent.meta_ship_intent_refusals)" = "0" ] ||
+        die "s10-intents: meta_ship_intent_refusals != 0 on a healthy fleet (the must-stay-~0 gauge)"
+    [ "$(ifield "$cw" cowriter.local_commit_refusals)" = "0" ] ||
+        die "s10-intents: co-writer local_commit_refusals != 0"
+    log "s10-intents GREEN (mint/flush/visibility; OQ-2 live; storm priced; lever-off dark; MW-8 both sides; fsck+C8 clean x2). Rows in $rowdir"
+}
+
+leg_s10_intents_tarx() {
+    # Rung 13's MEASURED row (the rung-9 serial instrument, verbatim
+    # venue): tar -x on the netns co-writer at wire RTT 250 µs, UPDATE
+    # intents ON vs OFF, A-B-B-A (the store ages ~90 MB/arm). Publishes
+    # entries/s + wire verbs/entry either way — row 14 owns the formal
+    # ≤1.10x gate; this row is its input. Quiet-gate: refuse a loaded box.
+    require_cowriters 1
+    if pgrep -x cargo >/dev/null 2>&1; then
+        die "s10-intents-tarx: a cargo build is running — the measured row needs a quiet box"
+    fi
+    local load
+    load="$(awk '{print int($1)}' /proc/loadavg)"
+    [ "$load" -le 4 ] || die "s10-intents-tarx: loadavg $load > 4 — the measured row needs a quiet box"
+    local rowdir cw w_mnt cw_mnt tarball src entries
+    rowdir="$STATE/rows/s10itarx-$(date +%s)"
+    mkdir -p "$rowdir"
+    cw="$(cowriter_idxs | head -1)"
+    w_mnt="$(mnt_of 0)"
+
+    tarball="$STATE/s10i-src.tar"
+    src="${SQZ_MWMATRIX_TAR_SRC:-}"
+    if [ -n "$src" ]; then
+        [ -d "$src" ] || die "SQZ_MWMATRIX_TAR_SRC='$src' is not a directory"
+        tar -cf "$tarball" -C "$(dirname "$src")" "$(basename "$src")"
+        log "s10i-tarx instrument: REAL tree $src"
+    else
+        local synth="$STATE/s10i-tree" d f
+        rm -rf "$synth"
+        for ((d = 0; d < 120; d++)); do
+            mkdir -p "$synth/d$d"
+            for ((f = 0; f < 24; f++)); do
+                head -c $((128 + (d * 24 + f) % 1900)) /dev/zero >"$synth/d$d/f$f.c"
+            done
+        done
+        tar -cf "$tarball" -C "$STATE" s10i-tree
+        log "s10i-tarx instrument: SYNTHESIZED tar-x shape (set SQZ_MWMATRIX_TAR_SRC=<dir> for a real tree)"
+    fi
+    entries="$(tar -tf "$tarball" | wc -l)"
+    log "s10i-tarx tarball: $entries entries; venue = netns co-writer at netem 125us/end (250 µs RTT), A-B-B-A"
+
+    tarx_arm() { # label intents(1|0) -> row line (also engagement-checked)
+        local label="$1" lever="$2"
+        "$MWFLEET" unmount "$cw" || die "s10i-tarx: unmount failed"
+        SQUEEZEFS_UPDATE_INTENTS="$lever" "$MWFLEET" mount "$cw" --netns ||
+            die "s10i-tarx: co-writer mount failed (lever=$lever)"
+        "$MWFLEET" netem "$cw" 125us || die "s10i-tarx: netem failed"
+        cw_mnt="$(mnt_of "$cw")"
+        local out mints_d ship_d pub_d intents_d verbs_per
+        out="$(s8a_venue "$rowdir" "$label" "$cw_mnt" "$cw" "$entries" "$tarball")"
+        mints_d="$(s8a_delta "$rowdir" "$cw" "$label" meta_ship_intent.meta_ship_intent_mints)"
+        ship_d="$(s8a_delta "$rowdir" "$cw" "$label" meta_ship.shipped_verbs)"
+        pub_d="$(s8a_delta "$rowdir" "$cw" "$label" meta_ship_publish.shipped)"
+        intents_d="$(s8a_delta "$rowdir" "$cw" "$label" meta_ship_intent.meta_ship_intent_verbs)"
+        if [ "$lever" = "1" ]; then
+            [ "$mints_d" -gt 0 ] || die "s10i-tarx $label: intents ON but 0 mints — the row did not engage"
+        else
+            [ "$mints_d" = "0" ] || die "s10i-tarx $label: intents OFF but $mints_d mints — the control is not dark"
+        fi
+        verbs_per="$(python3 -c "print(f'{($ship_d+$pub_d)/$entries:.2f}')")"
+        echo "$out mints=$mints_d ship=$ship_d pub=$pub_d intent_verbs=$intents_d verbs/entry=$verbs_per"
+    }
+
+    local -a rows=()
+    rows+=("$(tarx_arm int-on-1 1)")
+    rows+=("$(tarx_arm int-off-1 0)")
+    rows+=("$(tarx_arm int-off-2 0)")
+    rows+=("$(tarx_arm int-on-2 1)")
+    "$MWFLEET" netem "$cw" off || true
+
+    echo ""
+    echo "== S10 rung-13: serial tar -x, UPDATE intents ON vs OFF (entries=$entries; RTT 250us; A-B-B-A) =="
+    printf '%-10s %-8s %-8s %s\n' ARM WALL_S OPS_S ENGAGEMENT
+    local r
+    for r in "${rows[@]}"; do
+        # shellcheck disable=SC2086 # deliberate word split of the row line
+        printf '%-10s %-8s %-8s %s\n' $r
+    done | tee "$rowdir/s10i-tarx-table.txt"
+
+    # The oracle after the measured sweep.
+    local out drift
+    out="$("$SQZ" fsck "$w_mnt" 2>&1)" || die "s10i-tarx: fsck FAILED:
+$out"
+    echo "$out" >"$rowdir/fsck.out"
+    echo "$out" | grep -q "findings: 0" || die "s10i-tarx: fsck findings != 0:
+$out"
+    drift="$(stat_field 0 meta_kv_block_refs_drift)"
+    [ "$drift" = "0" ] || die "s10i-tarx: drift=$drift"
+    [ "$(stat_field 0 "meta_ship.owner_panics")" = "0" ] || die "s10i-tarx: owner_panics != 0"
+    log "s10-intents-tarx PUBLISHED (table + snapshots in $rowdir)"
+}
+
 leg_cowriters_admission() {
     if [ "$HOST_SCOPED" != "1" ]; then
         local reason="multi-identity (co-writer) legs need host-scoped fabric subsystems: this kernel merges controllers by subsysnqn ignoring hostnqn (nvme_core.multipath=Y), so co-located identities share one head — rung 5b (the sqz-kernel fix, validated in the rung-6b qemu guest) unlocks them. Stock-kernel workaround: nvme_core.multipath=N (boot parameter)"
@@ -3467,8 +3822,10 @@ s9-colocated-fence) leg_s9_colocated_fence ;;
 s10c-fsck-scale) leg_s10c_fsck_scale ;;
 s10c-kill-shard) leg_s10c_kill_shard ;;
 s10-delegation) leg_s10_delegation ;;
+s10-intents) leg_s10_intents ;;
+s10-intents-tarx) leg_s10_intents_tarx ;;
 cowriters-admission) leg_cowriters_admission ;;
 vm-hostscope-validate) leg_vm_hostscope_validate ;;
 vm-multi-identity) leg_vm_multi_identity ;;
-*) die "unknown leg '$LEG' (smoke|multipath-negative|s6-journal|s6-fence|s6-vm-fence|s7-device-fence|s7-kill-matrix|s8-serial-ab|s8-crucible|s9-fanout|s9-failover|s9-colocated-fence|s10c-fsck-scale|s10c-kill-shard|s10-delegation|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
+*) die "unknown leg '$LEG' (smoke|multipath-negative|s6-journal|s6-fence|s6-vm-fence|s7-device-fence|s7-kill-matrix|s8-serial-ab|s8-crucible|s9-fanout|s9-failover|s9-colocated-fence|s10c-fsck-scale|s10c-kill-shard|s10-delegation|s10-intents|s10-intents-tarx|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
 esac

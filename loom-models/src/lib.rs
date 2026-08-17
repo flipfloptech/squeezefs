@@ -297,6 +297,8 @@ pub mod overlay_core;
 pub mod patch_clone_core;
 #[path = "../../src/placed_core.rs"]
 pub mod placed_core;
+#[path = "../../src/range_custody_core.rs"]
+pub mod range_custody_core;
 #[path = "../../src/refcount_core.rs"]
 pub mod refcount_core;
 #[path = "../../src/meta_backend/kv/slot_cursor_core.rs"]
@@ -5639,6 +5641,316 @@ mod grant_table_models {
                 assert!(killed.grant_ids.is_empty());
             }
             assert_eq!(table.grants_len(), 0, "custody converges at quiesce");
+        });
+    }
+}
+
+mod range_custody_models {
+    //! [`range_custody_core`] (DLM S11 rung 15, design-full-multi-writer
+    //! §9.4's four named models; KD-MW-10's fourth core): the
+    //! `FileCustody` conflict/plan/admit/retire protocol plus the
+    //! grant-token publication order, exercised through the SAME
+    //! entry-lock discipline `src/dlm.rs` ships (one critical section
+    //! decides and records — plan can never go stale before its apply).
+    //!
+    //! Weakening evidence (each verified RED by hand, recorded in
+    //! `.benchmarks/2026-08-17-s11-range-wire.md`):
+    //! * model 1/3: splitting probe and admit into two lock sections
+    //!   (check-then-act) double-grants overlapping custody;
+    //! * model 2: probing BEFORE registering wake interest (the
+    //!   enable-after-probe inversion) strands a waiter;
+    //! * model 4: admitting BEFORE raising the stripe floor lets a
+    //!   racing release regress the generation read.
+    use crate::range_custody_core::{
+        publish_floor_then_admit, FileCustody, Grant, LockMode, RangePlan,
+    };
+    use loom::sync::atomic::{AtomicU64, Ordering};
+    use loom::sync::{Arc, Mutex};
+    use loom::thread;
+
+    fn grant(span: (u64, u64), scope: u64, token: u64) -> Grant {
+        Grant {
+            start: span.0,
+            end: span.1,
+            owner_nonce: scope,
+            token,
+            mode: LockMode::Exclusive,
+        }
+    }
+
+    /// §9.4 model 1: concurrent DISJOINT admits never serialize (both
+    /// grant on every interleaving) and an OVERLAPPING pair never
+    /// double-grants — the plan+admit critical section is what makes the
+    /// decision atomic. Weakening (plan in one lock take, admit in a
+    /// second) lets both overlapping planners see a free window and both
+    /// admit: EX custody granted twice over one byte range.
+    #[test]
+    fn disjoint_admits_both_grant_and_overlaps_never_double_grant() {
+        loom::model(|| {
+            let custody = Arc::new(Mutex::new(FileCustody::empty()));
+            let admit = |c: &Arc<Mutex<FileCustody>>,
+                         required: (u64, u64),
+                         scope: u64,
+                         token: u64| {
+                let mut c = c.lock().unwrap();
+                // ONE critical section: plan and apply (the shipped
+                // `acquire_lock_range_scoped` discipline).
+                match c.plan_range(required, required, scope).plan {
+                    RangePlan::New { span } => {
+                        c.admit(Some(span), grant(span, scope, token));
+                        true
+                    }
+                    RangePlan::HeldForeign => false,
+                    other => panic!("fresh scopes never coalesce/cover: {other:?}"),
+                }
+            };
+
+            // T1: [0,4096) scope 1. T2: disjoint [8192,12288) scope 2,
+            // then OVERLAPPING [2048,6144) scope 2.
+            let t1 = {
+                let c = Arc::clone(&custody);
+                thread::spawn(move || admit(&c, (0, 4096), 1, 101))
+            };
+            let t2 = {
+                let c = Arc::clone(&custody);
+                thread::spawn(move || {
+                    let disjoint = admit(&c, (8192, 12288), 2, 102);
+                    let overlap = admit(&c, (2048, 6144), 2, 103);
+                    (disjoint, overlap)
+                })
+            };
+            let g1 = t1.join().unwrap();
+            let (disjoint, overlap) = t2.join().unwrap();
+            assert!(
+                disjoint,
+                "a DISJOINT span must grant on every interleaving (never serialized)"
+            );
+            assert!(
+                g1 ^ overlap,
+                "overlapping EX spans from two scopes: exactly one admits, never both \
+                 (g1={g1}, overlap={overlap})"
+            );
+            let c = custody.lock().unwrap();
+            assert_eq!(
+                c.ranges_len(),
+                2,
+                "one winner of the overlap + the disjoint span"
+            );
+        });
+    }
+
+    /// §9.4 model 2: the release-wake vs acquire race. The waiter
+    /// REGISTERS wake interest (snapshots the wake word) BEFORE probing —
+    /// tokio's documented lost-wakeup discipline, the shipped
+    /// `notified.enable()`-before-probe order. Invariant: a waiter that
+    /// observed Held can never miss the release's wake (the wake word has
+    /// advanced past its snapshot by join). Inverting the order (probe
+    /// then register) interleaves retire+wake between them: the waiter
+    /// saw Held AND its snapshot already contains the only wake — parked
+    /// forever. Second half: after the release, two overlapping waiters
+    /// re-probe under the entry lock — exactly one admits.
+    #[test]
+    fn release_wake_vs_acquire_never_strands_and_admits_exactly_one() {
+        loom::model(|| {
+            let custody = Arc::new(Mutex::new(FileCustody::empty()));
+            custody
+                .lock()
+                .unwrap()
+                .admit(Some((0, 4096)), grant((0, 4096), 9, 100));
+            let wake = Arc::new(AtomicU64::new(0));
+
+            // The holder: retire, then wake (the unlock order).
+            let holder = {
+                let c = Arc::clone(&custody);
+                let w = Arc::clone(&wake);
+                thread::spawn(move || {
+                    let retired = c.lock().unwrap().retire(Some((0, 4096)), 100, 9);
+                    assert!(retired);
+                    w.fetch_add(1, Ordering::Release);
+                })
+            };
+            // The waiter: REGISTER (snapshot) before PROBE.
+            let waiter = {
+                let c = Arc::clone(&custody);
+                let w = Arc::clone(&wake);
+                thread::spawn(move || {
+                    let snapshot = w.load(Ordering::Acquire); // notified.enable()
+                    let held = matches!(
+                        c.lock().unwrap().plan_range((1024, 2048), (1024, 2048), 7).plan,
+                        RangePlan::HeldForeign
+                    );
+                    (snapshot, held)
+                })
+            };
+            holder.join().unwrap();
+            let (snapshot, held) = waiter.join().unwrap();
+            if held {
+                // The waiter parked. The wake it will consume must not
+                // already be inside its snapshot — else it is stranded.
+                assert!(
+                    wake.load(Ordering::Acquire) > snapshot,
+                    "a Held waiter's wake was consumed by its own snapshot \
+                     (lost wakeup — the enable-before-probe order is load-bearing)"
+                );
+            }
+
+            // The woken re-probe: two overlapping waiters, exactly one
+            // admits (the entry lock's own arbitration).
+            let admitted: Vec<bool> = (0..2u64)
+                .map(|i| {
+                    let mut c = custody.lock().unwrap();
+                    match c.plan_range((1024, 2048), (1024, 2048), 20 + i).plan {
+                        RangePlan::New { span } => {
+                            c.admit(Some(span), grant(span, 20 + i, 200 + i));
+                            true
+                        }
+                        RangePlan::HeldForeign => false,
+                        other => panic!("unexpected plan: {other:?}"),
+                    }
+                })
+                .collect();
+            assert_eq!(
+                admitted.iter().filter(|a| **a).count(),
+                1,
+                "exactly one overlapping waiter admits after the release"
+            );
+        });
+    }
+
+    /// §9.4 model 3: a whole-file acquire racing an in-flight range admit
+    /// — one wins, never both (whole-inode EX custody conflicts with
+    /// every span, in both probe directions). The one-critical-section
+    /// discipline is again what closes it; the check-then-act weakening
+    /// grants both.
+    #[test]
+    fn whole_file_vs_range_admit_one_wins_never_both() {
+        loom::model(|| {
+            let custody = Arc::new(Mutex::new(FileCustody::empty()));
+            let whole = {
+                let c = Arc::clone(&custody);
+                thread::spawn(move || {
+                    let mut c = c.lock().unwrap();
+                    if c.conflicts(None, LockMode::Exclusive) {
+                        false
+                    } else {
+                        c.admit(None, grant((0, u64::MAX), 1, 301));
+                        true
+                    }
+                })
+            };
+            let range = {
+                let c = Arc::clone(&custody);
+                thread::spawn(move || {
+                    let mut c = c.lock().unwrap();
+                    match c.plan_range((0, 4096), (0, 4096), 2).plan {
+                        RangePlan::New { span } => {
+                            c.admit(Some(span), grant(span, 2, 302));
+                            true
+                        }
+                        RangePlan::HeldForeign => false,
+                        other => panic!("unexpected plan: {other:?}"),
+                    }
+                })
+            };
+            let w = whole.join().unwrap();
+            let r = range.join().unwrap();
+            assert!(
+                w ^ r,
+                "whole-file EX vs a range admit: exactly one wins (whole={w}, range={r})"
+            );
+        });
+    }
+
+    /// §9.4 model 4 (the suite's contract 5, model-checked): the
+    /// file-generator read NEVER REGRESSES across a range release,
+    /// because [`publish_floor_then_admit`] raises the stripe floor
+    /// BEFORE the grant becomes visible — so a reader that observed the
+    /// granted token from the live entry can never fall back, after the
+    /// release drops the entry, to a floor below it. Weakening
+    /// (admit-then-floor) lets the release land between the two and the
+    /// reader's second read regress below its first.
+    #[test]
+    fn generation_read_never_regresses_across_range_release() {
+        loom::model(|| {
+            let entry: Arc<Mutex<Option<FileCustody>>> = Arc::new(Mutex::new(None));
+            let floor = Arc::new(AtomicU64::new(0));
+            const TOKEN: u64 = 400;
+
+            let read = |entry: &Arc<Mutex<Option<FileCustody>>>, floor: &Arc<AtomicU64>| {
+                let guard = entry.lock().unwrap();
+                match guard.as_ref() {
+                    Some(c) => c.max_token(),
+                    None => floor.load(Ordering::Acquire),
+                }
+            };
+
+            // The granting writer: floor BEFORE visibility (the core's
+            // protocol fn — the weakening target).
+            let writer = {
+                let entry = Arc::clone(&entry);
+                let floor = Arc::clone(&floor);
+                thread::spawn(move || {
+                    publish_floor_then_admit(&floor, TOKEN, || {
+                        *entry.lock().unwrap() =
+                            Some(FileCustody::opened(Some((0, 4096)), grant((0, 4096), 1, TOKEN)));
+                    });
+                })
+            };
+            // The RELEASER is a separate actor (the lease holder's drop —
+            // the shipped unlock runs on whichever task drops last), so
+            // the release can land at ANY point relative to the writer's
+            // two publication steps: that is exactly the window an
+            // admit-before-floor weakening opens.
+            let releaser = {
+                let entry = Arc::clone(&entry);
+                thread::spawn(move || {
+                    let mut guard = entry.lock().unwrap();
+                    let retired = guard
+                        .as_mut()
+                        .map(|c| c.retire(Some((0, 4096)), TOKEN, 1))
+                        .unwrap_or(false);
+                    if retired && guard.as_ref().map(|c| c.is_vacant()).unwrap_or(false) {
+                        *guard = None;
+                    }
+                    retired
+                })
+            };
+            // The reader: two successive reads must be monotone — a
+            // reader that observed the granted token from the live entry
+            // can never fall back, after the release drops it, to a floor
+            // below it.
+            let reader = {
+                let entry = Arc::clone(&entry);
+                let floor = Arc::clone(&floor);
+                thread::spawn(move || {
+                    let first = read(&entry, &floor);
+                    let second = read(&entry, &floor);
+                    assert!(
+                        second >= first,
+                        "the generation read regressed ({first} -> {second}): a granted \
+                         token escaped its floor (the publish-floor-then-admit order is \
+                         load-bearing)"
+                    );
+                })
+            };
+            writer.join().unwrap();
+            let retired = releaser.join().unwrap();
+            reader.join().unwrap();
+            // Quiesce: if the releaser ran before the grant existed, run
+            // the release now (every branch converges to a retired grant).
+            if !retired {
+                let mut guard = entry.lock().unwrap();
+                assert!(guard
+                    .as_mut()
+                    .map(|c| c.retire(Some((0, 4096)), TOKEN, 1))
+                    .unwrap_or(false));
+                *guard = None;
+            }
+            assert_eq!(
+                read(&entry, &floor),
+                TOKEN,
+                "at quiesce the floor covers the retired grant exactly"
+            );
         });
     }
 }

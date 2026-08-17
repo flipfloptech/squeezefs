@@ -2026,3 +2026,92 @@ async fn own_grant_partial_overlap_extends_and_covered_reask_serves() {
     lease.release().await.expect("release");
     assert_eq!(squeezefs::dlm::live_range_records(ino), 0);
 }
+
+// ---------------------------------------------------------------------------
+// DLM S11 **rung 16** — KD-MW-12: the two fast-path clause FACES
+// (`docs/design-full-multi-writer.md` §9.3 items 3/4 + PR-plan row 16).
+// ---------------------------------------------------------------------------
+
+/// Rung 16: the W1 patch clause (`BlockAllocator::patch_range_shared`)
+/// and the B4 overlay clause (`device_overlay::overlay_range_shared`)
+/// consult ONE custody core (`span_range_shared`) and count in SPLIT
+/// ledgers — plus the **multi-grant fencing corollary** (rung 15
+/// residual #2): custody is classified by the PRESENTED token snapshot,
+/// so a STALE token — even an older mint against the mount's own live
+/// grant — refuses BOTH fast paths (conservative refusal; the KD-6
+/// retry ladder converges the write through the CoW-rewrite path, never
+/// through an in-place mutation under a snapshot the custody core does
+/// not recognize).
+#[tokio::test]
+async fn range_clause_faces_share_the_core_and_refuse_stale_tokens() {
+    use squeezefs::block_allocator::BlockAllocator;
+    use squeezefs::fuse_client::METRICS;
+    let ino = 71_016_001u64;
+    let path = format!("inode_{ino}");
+    let d = dlm();
+    let block = (0u64, 4 * MIB);
+    let p = || METRICS.patch_ineligible_range_shared.load(Ordering::Relaxed);
+    let o = || {
+        METRICS
+            .overlay_ineligible_range_shared
+            .load(Ordering::Relaxed)
+    };
+
+    // No custody at all: neither face refuses, neither ledger moves.
+    let (p0, o0) = (p(), o());
+    assert!(
+        !BlockAllocator::patch_range_shared(ino, block.0, block.1, 0),
+        "no custody: the patch face passes"
+    );
+    assert!(
+        !squeezefs::device_overlay::overlay_range_shared(ino, block.0, block.1, 0),
+        "no custody: the overlay face passes"
+    );
+    assert_eq!(p() - p0, 0, "no refusal, no count");
+    assert_eq!(o() - o0, 0, "no refusal, no count");
+
+    // Own covering grant, CURRENT token: own custody never refuses
+    // itself (finding #2's lesson) on EITHER face.
+    let own = d
+        .acquire_lock(&path, Some((0, 4 * MIB)), Duration::from_secs(3))
+        .await
+        .expect("own covering grant");
+    let t = own.fencing_token();
+    assert!(
+        !BlockAllocator::patch_range_shared(ino, block.0, block.1, t),
+        "own covering custody with the CURRENT token: patch passes"
+    );
+    assert!(
+        !squeezefs::device_overlay::overlay_range_shared(ino, block.0, block.1, t),
+        "own covering custody with the CURRENT token: overlay passes"
+    );
+    assert_eq!(p() - p0, 0);
+    assert_eq!(o() - o0, 0);
+
+    // The corollary: a STALE token is NOT custody — a snapshot the core
+    // does not recognize as the live grant's refuses on BOTH faces, each
+    // counted in ITS OWN ledger (the buckets must not merge —
+    // predicate-rot detection depends on the split).
+    assert!(
+        BlockAllocator::patch_range_shared(ino, block.0, block.1, t - 1),
+        "a stale token must refuse the patch face"
+    );
+    assert!(
+        squeezefs::device_overlay::overlay_range_shared(ino, block.0, block.1, t - 1),
+        "a stale token must refuse the overlay face"
+    );
+    assert_eq!(p() - p0, 1, "patch ledger counted exactly its refusal");
+    assert_eq!(o() - o0, 1, "overlay ledger counted exactly its refusal");
+
+    own.release().await.expect("release");
+    // Custody released: both faces pass again with ANY token (nothing
+    // left to violate) and the ledgers stay put.
+    assert!(!BlockAllocator::patch_range_shared(
+        ino, block.0, block.1, 0
+    ));
+    assert!(!squeezefs::device_overlay::overlay_range_shared(
+        ino, block.0, block.1, 0
+    ));
+    assert_eq!(p() - p0, 1);
+    assert_eq!(o() - o0, 1);
+}

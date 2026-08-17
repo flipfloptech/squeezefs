@@ -2445,3 +2445,240 @@ async fn discarding_belt_racing_settle_never_double_owns() {
         report.findings
     );
 }
+
+// ---------------------------------------------------------------------------
+// DLM S11 rung 16 — the B4 §5.1 RANGE clause (KD-MW-12;
+// `docs/design-full-multi-writer.md` §9.3 item 3 + PR-plan row 16): a
+// block any live range grant does not solely cover is OVERLAY-INELIGIBLE,
+// counted `overlay_ineligible_range_shared` — the W1 clause-7 twin
+// (`patch_ineligible_range_shared`). The composed law this section pins
+// red-first: a range-shared span refuses BOTH fast paths — patch AND
+// overlay — so no fast path exists for a shared span and the write rides
+// the CoW-rewrite + shipped-publish path, the only vehicle whose
+// custody/publish laws handle sharing (rung 17's demotion/extent
+// machinery). Grant shapes are minted directly through the DLM (the
+// extent_patch_tests `exclusion_range_shared_custody` recipe): pre-17 the
+// product acquire algebra keeps every live grant edge block-aligned, so
+// these are the POST-demotion shapes the clause exists to guard.
+// ---------------------------------------------------------------------------
+
+fn ow_range_shared() -> u64 {
+    m64(&METRICS.overlay_ineligible_range_shared)
+}
+fn patch_range_shared_refusals() -> u64 {
+    m64(&METRICS.patch_ineligible_range_shared)
+}
+
+/// **The composed pin (the rung-16 charter's red-first):** ONE
+/// patch-shaped write under FOREIGN byte-range custody refuses the W1
+/// patch (clause 7) AND the B4 overlay (the §5.1 range clause) — each
+/// counted in ITS OWN ledger bucket — and still lands byte-exact through
+/// the accumulation (CoW-rewrite) path. The pin is the COMPOSITION: no
+/// fast path exists for a shared span.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn range_shared_span_refuses_both_patch_and_overlay() {
+    let _g = serial().await;
+    let _l = live_levers();
+    // The composed pin needs the patch ladder ARMED (the suite posture
+    // disarms it): both fast paths must refuse the SAME write.
+    squeezefs::fuse_client::set_patch_max_bytes(512 * 1024);
+    let h = make_harness("s11r16_composed").await;
+    let old = pattern((2 * FBS) as usize, 0x21).to_vec();
+    let ino = striped_fixture_with(&h, "f1", &old).await;
+    let size = old.len() as u64;
+    let path = squeezefs::keys::inode_path(ino);
+
+    // Whole-file custody and a byte range are mutually exclusive (S11):
+    // drop the handler's cached lease, then take FOREIGN range custody
+    // over one page of block 0.
+    h.fs.invalidate_local_lease(ino);
+    let foreign_client = DlmClient::new().unwrap();
+    let foreign = foreign_client
+        .acquire_lock(&path, Some((0, PAGE)), std::time::Duration::from_secs(5))
+        .await
+        .expect("foreign range custody");
+    let token = h.fs.router.dlm.get_fencing_token_ino(ino);
+
+    let (p0, o0, sb0, i0, pw0, t0) = (
+        patch_range_shared_refusals(),
+        ow_range_shared(),
+        m64(&METRICS.overlay_ineligible_shadow_bound),
+        ow_installs(),
+        m64(&METRICS.patch_writes),
+        trips(),
+    );
+    // ONE aligned sub-cap non-adjacent non-extending write into mapped
+    // block 0: the handler ladder runs patch THEN overlay — under the
+    // foreign grant BOTH must refuse.
+    let p = pattern(PAGE as usize, 0xC7);
+    h.fs.write_file_staged(ino, 2 * PAGE, bytes::Bytes::from(p.clone()), size, token)
+        .await
+        .expect("write under foreign range custody must LAND (rewrite path)");
+    assert_eq!(
+        patch_range_shared_refusals() - p0,
+        1,
+        "W1 clause 7 refused the in-place patch (counted in its ledger)"
+    );
+    assert_eq!(
+        ow_range_shared() - o0,
+        1,
+        "the B4 §5.1 range clause refused the overlay (counted in ITS ledger) — \
+         the composed law: no fast path exists for a range-shared span"
+    );
+    assert_eq!(ow_installs() - i0, 0, "no overlay record installed");
+    assert_eq!(m64(&METRICS.patch_writes) - pw0, 0, "no patch happened");
+    assert_eq!(
+        m64(&METRICS.overlay_ineligible_shadow_bound) - sb0,
+        0,
+        "the refusal is the RANGE clause, not the shadow-bound bucket — \
+         the ledgers must not merge (predicate-rot detection)"
+    );
+    // Byte-exact under the holder's own verification (RYW), then durable.
+    let mut want = old[..FBS as usize].to_vec();
+    want[2 * PAGE as usize..3 * PAGE as usize].copy_from_slice(&p);
+    assert_eq!(
+        read_at(&h, ino, 0, FBS as usize).await,
+        want,
+        "the refused-fast-path write landed byte-exact via accumulation"
+    );
+    foreign.release().await.expect("release foreign");
+    fsync(&h, ino).await;
+    quiesce(&h).await;
+    assert_eq!(read_at(&h, ino, 0, FBS as usize).await, want, "durable");
+    assert_eq!(trips() - t0, 0, "no tripwire on the composed-refusal path");
+}
+
+/// **Classification correctness (rung 15 finding #2's lesson): own
+/// custody never refuses itself.** The writer's OWN range grant covering
+/// the whole block installs the overlay (the clause is a custody test,
+/// not a range veto), and the SHIPPED whole-file-lease shape is
+/// structurally inert — the counter cannot move (the dark-posture
+/// structural pin; the fast-path tax row is the measured proof).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn own_covering_custody_never_fires_the_range_clause() {
+    let _g = serial().await;
+    let _l = live_levers();
+    let h = make_harness("s11r16_own").await;
+    let old = pattern((2 * FBS) as usize, 0x22).to_vec();
+    let ino = striped_fixture_with(&h, "f1", &old).await;
+    let size = old.len() as u64;
+    let path = squeezefs::keys::inode_path(ino);
+
+    // Arm 1 — OWN range grant covering the whole block: the overlay
+    // proceeds, the clause stays silent.
+    h.fs.invalidate_local_lease(ino);
+    let mine =
+        h.fs.router
+            .dlm
+            .acquire_lock(&path, Some((0, FBS)), std::time::Duration::from_secs(5))
+            .await
+            .expect("own covering range");
+    let token = mine.fencing_token();
+    let (o0, i0) = (ow_range_shared(), ow_installs());
+    let v = vec![0x91u8; FBS as usize];
+    h.fs.write_file_staged(ino, 0, bytes::Bytes::from(v.clone()), size, token)
+        .await
+        .expect("own-covered overwrite");
+    assert_eq!(
+        ow_installs() - i0,
+        1,
+        "own covering custody: the overlay INSTALLS (a clause that refused \
+         here would be the finding-#2 class — own custody refusing itself)"
+    );
+    assert_eq!(ow_range_shared() - o0, 0, "own grant never refuses itself");
+    assert_eq!(read_at(&h, ino, 0, FBS as usize).await, v, "RYW");
+    mine.release().await.expect("release own");
+    fsync(&h, ino).await;
+    quiesce(&h).await;
+
+    // Arm 2 — the SHIPPED shape (a whole-file lease IS whole-inode
+    // custody): structurally inert, counter frozen.
+    let whole =
+        h.fs.router
+            .dlm
+            .acquire_lock(&path, None, std::time::Duration::from_secs(5))
+            .await
+            .expect("whole-file lease");
+    let token = whole.fencing_token();
+    let (o1, i1) = (ow_range_shared(), ow_installs());
+    let v2 = vec![0x92u8; FBS as usize];
+    h.fs.write_file_staged(ino, FBS, bytes::Bytes::from(v2.clone()), size, token)
+        .await
+        .expect("whole-file-custody overwrite");
+    assert_eq!(ow_installs() - i1, 1, "the shipped shape still overlays");
+    assert_eq!(
+        ow_range_shared() - o1,
+        0,
+        "dark posture: a whole-file lease can never fire the range clause"
+    );
+    assert_eq!(read_at(&h, ino, FBS, FBS as usize).await, v2, "RYW");
+    whole.release().await.expect("release whole");
+    fsync(&h, ino).await;
+    quiesce(&h).await;
+}
+
+/// **Both overlay SHAPES are screened** (`design-full-multi-writer` §9.3
+/// item 3 says *a block* — not *a mapped block*): the OVERWRITE shape
+/// (mapped block 0) and the FRESH shape (unmapped block 1 — its eventual
+/// whole-block publish covers every byte too, gap-seeds included) both
+/// refuse under a foreign grant that straddles the two blocks, and both
+/// writes land byte-exact and durable through accumulation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn foreign_range_refuses_fresh_and_overwrite_shapes_durably() {
+    let _g = serial().await;
+    let _l = live_levers();
+    let h = make_harness("s11r16_shapes").await;
+    // ONE mapped block; block 1 stays FRESH (unmapped) — the second
+    // write grows into it under the grant.
+    let old = pattern(FBS as usize, 0x23).to_vec();
+    let ino = striped_fixture_with(&h, "f1", &old).await;
+    let path = squeezefs::keys::inode_path(ino);
+    h.fs.invalidate_local_lease(ino);
+
+    // ONE foreign grant straddling the block boundary: it overlaps BOTH
+    // blocks' spans without covering either.
+    let foreign_client = DlmClient::new().unwrap();
+    let foreign = foreign_client
+        .acquire_lock(
+            &path,
+            Some((FBS - PAGE, FBS + PAGE)),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("foreign straddling range");
+    let token = h.fs.router.dlm.get_fencing_token_ino(ino);
+
+    let (o0, i0, t0) = (ow_range_shared(), ow_installs(), trips());
+    // The OVERWRITE shape: whole-block aligned overwrite of mapped block 0.
+    let v0 = vec![0x93u8; FBS as usize];
+    h.fs.write_file_staged(ino, 0, bytes::Bytes::from(v0.clone()), FBS, token)
+        .await
+        .expect("overwrite shape under foreign range");
+    assert_eq!(
+        ow_range_shared() - o0,
+        1,
+        "the OVERWRITE shape refused under the foreign straddling grant"
+    );
+    // The FRESH shape: an aligned write into unmapped block 1.
+    let v1 = vec![0x94u8; PAGE as usize];
+    h.fs.write_file_staged(ino, FBS, bytes::Bytes::from(v1.clone()), FBS, token)
+        .await
+        .expect("fresh shape under foreign range");
+    assert_eq!(
+        ow_range_shared() - o0,
+        2,
+        "the FRESH shape is screened by the SAME clause (its publish \
+         covers every byte of the block too)"
+    );
+    assert_eq!(ow_installs() - i0, 0, "no overlay record on either shape");
+    foreign.release().await.expect("release foreign");
+    fsync(&h, ino).await;
+    quiesce(&h).await;
+    assert_eq!(read_at(&h, ino, 0, FBS as usize).await, v0, "block 0 durable");
+    assert_eq!(
+        read_at(&h, ino, FBS, PAGE as usize).await,
+        v1,
+        "block 1 durable"
+    );
+    assert_eq!(trips() - t0, 0, "no tripwire anywhere");
+}

@@ -1074,3 +1074,345 @@ async fn custody_grant_defers_the_mover_probe() {
     );
     fx.close().await;
 }
+
+// ---------------------------------------------------------------------------
+// The inode plane is a ONE-VIEW plane (the 2026-08-17 tarx C10 conviction)
+// ---------------------------------------------------------------------------
+//
+// Fleet worker shards run their census over a MEMBER's coherent view —
+// which is staleness-bounded BY DESIGN (DLM S5: per-volume checkpoint
+// projections polled on a cadence). Mid-rm-storm, volume A's dentry view
+// and volume B's inode view sit at DIFFERENT instants, so a member's
+// shard "sees" a dentry whose delete is past A's instant beside a record
+// whose nlink-0/destroy is inside B's — manufacturing EXACTLY the
+// C10ZeroNlinkNamed / C10DanglingDentry loss shapes from a HEALTHY tree,
+// and the member-side verify ladder re-reads the same shifted view, so
+// verification cannot clear it (the leg2 conviction: 25 findings, all
+// self-healed once the reader's poll caught up — no crash, no damage).
+//
+// The law these tests pin: **C9/C10 verdicts are taken from exactly one
+// view — the coordinator's** — worker proposals for the inode plane
+// never merge (they are inadmissible by construction, not merely
+// suspicious), the coordinator re-judges the whole plane from its own
+// RAM-authoritative state through the unchanged ladder, and the
+// loss-direction teeth survive: REAL damage is still found with the
+// fleet plane armed.
+
+/// A member seam that runs the REAL shard fsck and then injects the
+/// inode-plane verdicts a staleness-bounded reader manufactures — the
+/// wire report is the interface, and any bytes a member can propose are
+/// admissible inputs to the coordinator's merge law.
+struct TimeShiftedSeam {
+    ctx: FsckCtx,
+    /// A LIVE, healthy ino the "stale" member claims has nlink 0.
+    forged_zero_nlink: u64,
+    /// A LIVE, healthy dentry the member claims dangles: (vol, key, ino).
+    forged_dangling: (usize, Vec<u8>, u64),
+}
+
+impl ShardDeviceSeam for TimeShiftedSeam {
+    fn plan_blocks(&self, _job: &JobType) -> usize {
+        0
+    }
+    fn block_len(&self) -> usize {
+        0
+    }
+    fn allocate(&self, n: usize) -> std::io::Result<Vec<squeezefs::job_wire::DestTuple>> {
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        Err(std::io::Error::other("read-class seam"))
+    }
+    fn read_source(&self, _key: &str) -> std::io::Result<Vec<u8>> {
+        Err(std::io::Error::other("read-class seam"))
+    }
+    fn write_block(
+        &self,
+        _dest: &squeezefs::job_wire::DestTuple,
+        _data: &[u8],
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::other("read-class seam"))
+    }
+    fn read_block(&self, _dest: &squeezefs::job_wire::DestTuple) -> std::io::Result<Vec<u8>> {
+        Err(std::io::Error::other("read-class seam"))
+    }
+    fn run_fleet_shard(
+        &self,
+        job: &JobType,
+        shard_k: u32,
+        shard_count: u32,
+        throttle_pct: u32,
+    ) -> std::io::Result<Vec<u8>> {
+        let mut o = FsckOptions::offline();
+        o.shard = Some((shard_k, shard_count));
+        o.staging_full = true;
+        o.throttle_pct = throttle_pct;
+        if let JobType::Fsck {
+            scrub, scrub_only, ..
+        } = job
+        {
+            o.scrub = *scrub;
+            o.scrub_only = *scrub_only;
+        }
+        let mut report = squeezefs_ipc::sqz_blocking::block_on(run_fsck(&self.ctx, &o))
+            .map_err(|e| std::io::Error::other(format!("member shard fsck failed: {e}")))?;
+        // The time-shifted view's manufactured verdicts, verbatim shapes.
+        use squeezefs::fsck::{FindingId, FsckFinding};
+        report.findings.push(FsckFinding {
+            class: "C10".to_string(),
+            object: format!("ino {}", self.forged_zero_nlink),
+            evidence: format!(
+                "nlink 0 while 1 dentry name(s) still reference ino {}: DATA-LOSS RISK \
+                 (a stale member view manufactured this)",
+                self.forged_zero_nlink
+            ),
+            identity: Some(FindingId::C10ZeroNlinkNamed {
+                ino: self.forged_zero_nlink,
+            }),
+        });
+        report.counters.nlink_zero_named += 1;
+        let (vol, key, child) = &self.forged_dangling;
+        report.findings.push(FsckFinding {
+            class: "C10".to_string(),
+            object: format!("dentry 1/forged"),
+            evidence: format!(
+                "dangling dentry: a name resolves to ino {child}, which has no inode \
+                 record (a stale member view manufactured this)"
+            ),
+            identity: Some(FindingId::C10DanglingDentry {
+                vol: *vol,
+                key_hex: key.iter().map(|b| format!("{b:02x}")).collect(),
+                child_ino: *child,
+            }),
+        });
+        report.counters.dangling_dentries += 1;
+        report.findings.push(FsckFinding {
+            class: "C9".to_string(),
+            object: format!("ino {}", self.forged_zero_nlink),
+            evidence: "unreferenced inode (a stale member view manufactured this)".to_string(),
+            identity: Some(FindingId::C9Unreferenced {
+                ino: self.forged_zero_nlink,
+            }),
+        });
+        report.counters.findings = report.findings.len() as u64;
+        serde_json::to_vec(&report).map_err(std::io::Error::other)
+    }
+}
+
+/// The exact dentry-tree key of `(root, name)` — the forged dangling
+/// finding's identity input (a collision chain holds several keys for one
+/// name, so the key is the identity).
+async fn dentry_key_of(fx: &Fx, name: &str) -> (usize, Vec<u8>, u64) {
+    use squeezefs::meta_backend::kv::node::key_successor;
+    use squeezefs::meta_backend::kv::record::DentryValue;
+    use squeezefs::meta_backend::kv::tree::KEY_SPACE_MAX;
+    for (vol_idx, kv) in fx.meta.volumes.iter().enumerate() {
+        let dentries = kv.trees()[1];
+        let mut cursor: Vec<u8> = vec![0u8];
+        loop {
+            let page = dentries
+                .range(&cursor, &KEY_SPACE_MAX, 512)
+                .await
+                .expect("dentry walk");
+            let Some((last, _)) = page.last() else { break };
+            cursor = key_successor(last);
+            for (k, v) in &page {
+                if let Ok(d) = DentryValue::decode(v) {
+                    if d.name == name.as_bytes() {
+                        return (vol_idx, k.to_vec(), d.child_ino);
+                    }
+                }
+            }
+        }
+    }
+    panic!("no dentry named {name}");
+}
+
+/// Contract (the 2026-08-17 conviction's fix): a member's INODE-PLANE
+/// verdicts never merge — on a healthy tree a fleet pass whose member
+/// proposes manufactured C9/C10 findings still publishes `findings: 0`,
+/// and the coordinator's C10 tripwires (`fsck_nlink_zero_named`,
+/// `fsck_dangling_dentries`) stay flat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_time_shifted_members_inode_plane_verdicts_never_merge() {
+    let _serial = serial().await;
+    let dir = tempfile::tempdir().unwrap();
+    let meta = make_file(dir.path(), "meta", 256 * 1024 * 1024);
+    let oss1 = make_file(dir.path(), "oss1", 4 << 30);
+    format_meta(&meta, &[&oss1]).await;
+    let recs = base_format_config(&[&oss1]).resolved_data_volumes();
+    let fx = open_fixture(&meta, &recs).await;
+    seed_tree(&fx, 6).await;
+    let healthy = create_file(&fx, "healthy-but-slandered.bin").await;
+    striped_burst(&fx, healthy, 2).await;
+    let dangled = dentry_key_of(&fx, "healthy-but-slandered.bin").await;
+
+    let fab = fabric(&fx.meta).await;
+    let host = JobWireHost::start(
+        fab.clone(),
+        wire_cfg(30_000, 500),
+        Arc::new(squeezefs::job_wire::NoopDeviceSeam),
+    )
+    .await
+    .expect("host start");
+    let seam = TimeShiftedSeam {
+        ctx: fx.ctx(),
+        forged_zero_nlink: healthy,
+        forged_dangling: dangled,
+    };
+    let secret = squeezefs::job_wire::read_enroll_secret(&fx.meta)
+        .await
+        .expect("job:enroll present");
+    let mut wopts = WorkerOptions::new("node-stale");
+    wopts.caps = CAP_FLEET_READ;
+    let worker = JobWireWorker::connect(&host.endpoint().to_string(), &secret, wopts)
+        .await
+        .expect("member enrolls");
+    let mtask = tokio::spawn(async move {
+        worker
+            .run(Arc::new(seam))
+            .await
+            .expect("worker run returns a report")
+    });
+    poll_until("1 read worker enrolled", Duration::from_secs(5), || {
+        host.fleet_read_capacity() == 1
+    })
+    .await;
+
+    let zn0 = METRICS.fsck_nlink_zero_named.load(Ordering::Relaxed);
+    let dd0 = METRICS.fsck_dangling_dentries.load(Ordering::Relaxed);
+
+    let merged = run_fleet(
+        &fx.ctx(),
+        &online_opts(),
+        Some(host.clone() as Arc<dyn FleetDispatch>),
+        "job-stale-1",
+    )
+    .await
+    .expect("fleet run");
+
+    assert!(
+        !merged.has_findings(),
+        "a healthy tree stays findings: 0 no matter what inode-plane verdicts a \
+         staleness-bounded member proposes (they are inadmissible by construction — \
+         the coordinator re-judges the plane from ONE view): {:?}",
+        merged.findings
+    );
+    assert_eq!(
+        METRICS.fsck_nlink_zero_named.load(Ordering::Relaxed),
+        zn0,
+        "fsck_nlink_zero_named is a stop-and-read tripwire — a member's manufactured \
+         verdict must not move it"
+    );
+    assert_eq!(
+        METRICS.fsck_dangling_dentries.load(Ordering::Relaxed),
+        dd0,
+        "fsck_dangling_dentries is the LOSS-direction tripwire — a member's \
+         manufactured verdict must not move it"
+    );
+
+    host.shutdown().await;
+    let _ = mtask.await;
+    fab.shutdown_abrupt().await;
+    fx.close().await;
+}
+
+/// Contract (the teeth): REAL inode-plane damage is still found with the
+/// fleet plane armed — the coordinator's one-view re-judgment carries the
+/// loss-direction detector whole (never weakened by the member strip).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_inode_plane_loss_direction_teeth_survive_the_fleet_plane() {
+    use squeezefs::meta_backend::kv::record::{inode_key, TREE_INODES};
+    let _serial = serial().await;
+    let dir = tempfile::tempdir().unwrap();
+    let meta = make_file(dir.path(), "meta", 256 * 1024 * 1024);
+    let oss1 = make_file(dir.path(), "oss1", 4 << 30);
+    format_meta(&meta, &[&oss1]).await;
+    let recs = base_format_config(&[&oss1]).resolved_data_volumes();
+    let fx = open_fixture(&meta, &recs).await;
+    seed_tree(&fx, 5).await;
+
+    // REAL damage, both loss shapes (the fsck_c10_tests fixtures):
+    // an nlink-0 record a live name still resolves, and a name whose
+    // record was destroyed.
+    let doomed = create_file(&fx, "doomed.bin").await;
+    striped_burst(&fx, doomed, 2).await;
+    {
+        let (v_idx, local) = fx.meta.route_ino(doomed);
+        let kv = &fx.meta.volumes[v_idx];
+        kv.drain_pending_times_now().await.ok();
+        let mut val = kv
+            .read_inode_value_routed(local)
+            .await
+            .expect("read")
+            .expect("record");
+        val.nlink = 0;
+        kv.migration_apply(
+            vec![(TREE_INODES, inode_key(local).to_vec(), val.encode())],
+            vec![],
+        )
+        .await
+        .expect("force nlink 0");
+    }
+    let ghost = create_file(&fx, "ghost.bin").await;
+    {
+        let (v_idx, local) = fx.meta.route_ino(ghost);
+        let kv = &fx.meta.volumes[v_idx];
+        kv.drain_pending_times_now().await.ok();
+        kv.trees()[0]
+            .delete(&inode_key(local))
+            .await
+            .expect("destroy the record, keep the name");
+    }
+
+    let fab = fabric(&fx.meta).await;
+    let host = JobWireHost::start(
+        fab.clone(),
+        wire_cfg(30_000, 500),
+        Arc::new(squeezefs::job_wire::NoopDeviceSeam),
+    )
+    .await
+    .expect("host start");
+    let m1 = spawn_member(
+        &host,
+        &fx.meta,
+        "node-honest",
+        MemberSeam {
+            ctx: fx.ctx(),
+            refuse: None,
+        },
+    )
+    .await;
+    poll_until("1 read worker enrolled", Duration::from_secs(5), || {
+        host.fleet_read_capacity() == 1
+    })
+    .await;
+
+    let merged = run_fleet(
+        &fx.ctx(),
+        &online_opts(),
+        Some(host.clone() as Arc<dyn FleetDispatch>),
+        "job-teeth-1",
+    )
+    .await
+    .expect("fleet run");
+
+    let c10: Vec<_> = merged.findings.iter().filter(|f| f.class == "C10").collect();
+    assert!(
+        c10.iter()
+            .any(|f| f.object.contains(&doomed.to_string()) && f.evidence.contains("nlink 0")),
+        "the fleet pass still finds the REAL zero-nlink-with-name inversion: {:?}",
+        merged.findings
+    );
+    assert!(
+        c10.iter()
+            .any(|f| f.evidence.contains("dangling") && f.evidence.contains(&ghost.to_string())),
+        "the fleet pass still finds the REAL dangling name: {:?}",
+        merged.findings
+    );
+
+    host.shutdown().await;
+    let _ = m1.await;
+    fab.shutdown_abrupt().await;
+    fx.close().await;
+}

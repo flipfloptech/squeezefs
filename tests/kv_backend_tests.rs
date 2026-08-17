@@ -2233,3 +2233,104 @@ async fn xattr_value_cap_is_the_full_xattr_size_max() {
         "one byte over node_size/4 must refuse on small-node volumes"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Directory link counts at FORMAT (the 2026-08-17 tarx underflow conviction)
+// ---------------------------------------------------------------------------
+//
+// The live create/unlink law is `nlink = 2 + subdirectories` (a dir's `.`
+// plus its parent entry — for root, its own `..`), and the parent-side
+// decrement floor (`pv.nlink > 2`) plus the `dir_nlink_underflows`
+// tripwire both assume it. The IMAGE BUILDER minted every directory —
+// root included — at `nlink: 1` and never bumped a parent per child
+// directory, so every fresh volume's root sat one below the law and the
+// FIRST full-tree `rm -rf` sweep fired the underflow tripwire on ino 1,
+// on every tarx-shaped run, forever (the deficit self-suppresses at the
+// floor, which is why nothing else ever noticed).
+
+/// Contract: a fresh format's root carries `nlink == 2` and a
+/// builder-added directory carries `nlink == 2` while bumping its parent
+/// — the BUILT image must agree with what live creates would have left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn format_time_directories_carry_the_two_plus_subdirs_law() {
+    let p = population().await;
+    let b = &p.backend;
+
+    // population(): root holds 2 subdirectories (docs, empty).
+    let root = b.getattr(ROOT_INO).await.expect("root getattr");
+    assert_eq!(
+        root.nlink, 4,
+        "root nlink = 2 + its 2 built subdirectories (got {})",
+        root.nlink
+    );
+    let docs = b.getattr(p.inos["docs"]).await.expect("docs getattr");
+    assert_eq!(
+        docs.nlink, 2,
+        "a built LEAF directory carries nlink 2 (`.` + its parent entry)"
+    );
+}
+
+/// Contract: the PRODUCTION format (root only, `format_v3`) mints root at
+/// exactly 2, and one live mkdir/rmdir cycle through the PRODUCTION
+/// (routed) layer returns it to 2 with the `dir_nlink_underflows`
+/// tripwire flat — the tarx venue fired that tripwire once per full
+/// `rm -rf` sweep on ino 1, on every fresh volume, pre-fix (the deficit
+/// self-suppressed at the parent-decrement floor, which is why nothing
+/// else ever noticed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_production_format_roots_nlink_is_two() {
+    let file = NamedTempFile::new().expect("temp volume");
+    file.as_file().set_len(V3_VOL_LEN).unwrap();
+    squeezefs::meta_backend::kv::builder::format_v3(
+        file.path(),
+        V3_VOL_LEN,
+        &squeezefs::meta_backend::kv::builder::FormatV3Options {
+            node_size: squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE,
+            journal_len_override: None,
+            force: true,
+            full_wipe: false,
+            format_config_xattr: None,
+        },
+    )
+    .await
+    .expect("format v3");
+    let kv = KvMetaBackend::open(file.path())
+        .await
+        .expect("open v3 volume");
+    let routed = RoutedMetaBackend::new(vec![kv]);
+    let root = routed.getattr(ROOT_INO).await.expect("root getattr");
+    assert_eq!(
+        root.nlink, 2,
+        "a fresh production format's empty root counts `.` and its own `..` (got {})",
+        root.nlink
+    );
+    let uf0 = squeezefs::fuse_client::METRICS
+        .dir_nlink_underflows
+        .load(AtomicOrdering::Relaxed);
+    let d = routed
+        .create_with_rdev(ROOT_INO, "dest", libc::S_IFDIR | 0o755, 0, 0, 0)
+        .await
+        .expect("mkdir dest");
+    assert_eq!(d.nlink, 2, "a live-created directory carries nlink 2");
+    assert_eq!(
+        routed.getattr(ROOT_INO).await.unwrap().nlink,
+        3,
+        "the live mkdir bumps root to 2 + 1 subdirectory"
+    );
+    routed.unlink(ROOT_INO, "dest").await.expect("rmdir dest");
+    assert_eq!(
+        routed.getattr(ROOT_INO).await.unwrap().nlink,
+        2,
+        "the sweep returns root to 2"
+    );
+    assert_eq!(
+        squeezefs::fuse_client::METRICS
+            .dir_nlink_underflows
+            .load(AtomicOrdering::Relaxed),
+        uf0,
+        "the rm sweep's final rmdir must NOT hit the parent-decrement floor"
+    );
+    for vol in &routed.volumes {
+        vol.shutdown().await.expect("clean shutdown");
+    }
+}

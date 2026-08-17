@@ -177,6 +177,24 @@ struct Authority {
 }
 
 fn start_authority(inner: Arc<RoutedMetaBackend>, tag: &str) -> Authority {
+    start_authority_geo(
+        inner,
+        tag,
+        // The §9.2 geometry source: one 64 MiB file of 4 MiB blocks — what
+        // makes the demotion barrier's block-sharing probe decidable.
+        Some(data_grant::fixed_range_geometry(16 * BLOCK, BLOCK)),
+    )
+}
+
+/// [`start_authority`] with the geometry source EXPLICIT — `None` is the
+/// shape the PRODUCTION arm actually ran until the zeros-interleave
+/// conviction (`arm_multi_writer` installed no source at all), which is
+/// what the no-geometry pins below reproduce.
+fn start_authority_geo(
+    inner: Arc<RoutedMetaBackend>,
+    tag: &str,
+    geometry: Option<Arc<dyn data_grant::RangeGeometry>>,
+) -> Authority {
     let ms = Arc::new(AtomicU64::new(1_000));
     let clock = LeaseClock::manual(Arc::clone(&ms));
     let clocks = LeaseClocks::with_params(
@@ -194,9 +212,9 @@ fn start_authority(inner: Arc<RoutedMetaBackend>, tag: &str) -> Authority {
         None,
     )
     .expect("the custody authority arms");
-    // The §9.2 geometry source: one 64 MiB file of 4 MiB blocks — what
-    // makes the demotion barrier's block-sharing probe decidable.
-    owner.install_range_geometry(data_grant::fixed_range_geometry(16 * BLOCK, BLOCK));
+    if let Some(geometry) = geometry {
+        owner.install_range_geometry(geometry);
+    }
     data_grant::install_custody_owner(Arc::clone(&owner));
     let router = data_grant::AsyncVerbRouter::new()
         .with_custody(Arc::clone(&owner))
@@ -1831,4 +1849,303 @@ async fn the_local_publish_path_keeps_the_version_gate() {
         "the refusal names the law: {err}"
     );
     shutdown(&be).await;
+}
+
+// ===========================================================================
+// The ZEROS-REWRITE INTERLEAVE conviction (rung 17's open residual —
+// finding #4, `.benchmarks/2026-08-17-s11-zeros-interleave-fix.md`): the
+// custody-scoped full Put (finding #3's fix) was structurally DISARMED on
+// every production mount, because `arm_multi_writer` never installed a
+// `RangeGeometry` source on the custody owner — `install_range_geometry`
+// had exactly two callers, both test fixtures. `custody_scoped_layout`'s
+// no-geometry arm then applied every range holder's full Put VERBATIM
+// ("peer entries at risk" — its own warn text), which is finding #3's
+// clobber unfixed: two co-writers' epoch-close full Puts of one ino
+// revert each other's halves to their private stale bases while the ref
+// ops land — the exact 48-finding C8 mint (dangling takes on every
+// superseded mint + released takes under still-referenced pass-1 keys +
+// the paired double-release free refusals). The live discriminator
+// re-run proved the mint CONTENT-BLIND (iso3 both-urandom and iso6
+// both-zeros mint identically under a uniform barriered harness; zeros
+// was the original instrument's timing accident and its read-back MASK —
+// a reverted map references freed/discarded offsets, which read zeros).
+// The same missing source also kept `block_size = None` at every
+// production ranged acquire, silently disarming the §9.3 demotion
+// barrier ("no geometry, no barrier").
+// ===========================================================================
+
+/// Contract (the conviction's REFUSAL half): a RANGE holder's full Put on
+/// an authority with NO geometry source must never apply verbatim — the
+/// peer's entries survive because the serve REFUSES loud (the scoped
+/// apply is impossible without block walls, and a silent verbatim apply
+/// is the C8 mint). RED at f609f984: the Put applied verbatim and erased
+/// the peer's entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_range_holders_put_without_geometry_refuses_rather_than_reverting_a_peer() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let (owner_be, _p) = sandbox(dir.path(), "own", true).await;
+    let (client_be, _p2) = sandbox(dir.path(), "cli", false).await;
+    // The PRODUCTION shape at the conviction: no geometry source at all.
+    let auth = start_authority_geo(Arc::clone(&owner_be), "assembler-authority", None);
+    let (client, pc) = arm_client(&auth, &client_be).await;
+    let epoch = client.lease_epoch();
+    let ino = shipped_create(&client_be, "nogeo.bin").await;
+    let base = base_layout_bytes(4 * BLOCK, &[(0, "be://data:mine0")]);
+    publish::set_layout_and_size(&client_be, ino, &base, 4 * BLOCK, &[])
+        .await
+        .expect("the base Put lands");
+
+    // This client (NODE_A) takes RANGE custody of block 0 only.
+    let _g = client
+        .acquire_range(ino, (0, BLOCK), (0, BLOCK), Duration::from_secs(1))
+        .await
+        .expect("block-0 range custody");
+
+    // The PEER's newer publish: block 1's entry (the half a stale Put
+    // must never revert).
+    let peer_lease = auth
+        .owner
+        .join(&data_grant::JoinFrame {
+            schema: data_grant::CUSTODY_SCHEMA,
+            client: "node-assembler-b".to_string(),
+            pr_key: 0,
+            prior_epoch: None,
+        })
+        .expect("peer joins");
+    let _pg = auth
+        .owner
+        .grant_ranged(
+            &data_grant::AcquireFrame {
+                schema: data_grant::CUSTODY_SCHEMA,
+                client: "node-assembler-b".to_string(),
+                lease_epoch: peer_lease.epoch,
+                ino,
+                span: Some((BLOCK, 2 * BLOCK)),
+                concurrent_write: false,
+                wait_ms: 5_000,
+                desired: Some((BLOCK, 2 * BLOCK)),
+            },
+            (BLOCK, 2 * BLOCK),
+        )
+        .await
+        .expect("peer's block-1 custody");
+    let pc2 = publish::PublishClient::new("node-assembler-b", SECRET.to_vec());
+    let r = pc2
+        .ship(
+            &auth.endpoint,
+            publish::PublishCall::MergeLayoutAndSize {
+                ino,
+                delta: delta(
+                    4 * BLOCK,
+                    &[(1, "be://data:peer1")],
+                    Some((0, squeezefs::dlm::mint_layout_version())),
+                )
+                .encode(),
+                full_layout: base_layout_bytes(
+                    4 * BLOCK,
+                    &[(0, "be://data:mine0"), (1, "be://data:peer1")],
+                ),
+                size: 4 * BLOCK,
+                refs: Vec::new(),
+                lease_epoch: peer_lease.epoch,
+                request_id: 0xE1,
+            },
+        )
+        .await
+        .expect("the peer's block-1 publish lands");
+    assert!(matches!(
+        r,
+        publish::PublishReply::DeltaUsed { used: true, .. }
+    ));
+
+    // NODE_A's stale full Put (its base never saw the peer's block 1).
+    // With no geometry the owner CANNOT scope it — the serve must refuse
+    // loud (naming the arm), never apply it verbatim.
+    let err = pc
+        .ship(
+            &auth.endpoint,
+            publish::PublishCall::SetLayoutAndSize {
+                ino,
+                layout: base_layout_bytes(4 * BLOCK, &[(0, "be://data:mine0v2")]),
+                size: 4 * BLOCK,
+                refs: Vec::new(),
+                lease_epoch: epoch,
+                request_id: 0xE2,
+            },
+        )
+        .await
+        .expect_err("a range holder's Put without geometry refuses instead of applying verbatim");
+    assert!(
+        format!("{err}").contains("cannot be custody-scoped"),
+        "the refusal names the disarmed scoping: {err}"
+    );
+
+    // Nothing moved: the peer's entry AND the holder's own pre-Put entry
+    // both survive (the refusal applied nothing).
+    let map = owner_layout(&owner_be, ino).await.block_map.expect("map");
+    assert_eq!(
+        map.get(&1).map(String::as_str),
+        Some("be://data:peer1"),
+        "the peer's entry survives — the un-scopable Put was refused, not applied"
+    );
+    assert_eq!(
+        map.get(&0).map(String::as_str),
+        Some("be://data:mine0"),
+        "the holder's durable entry is untouched by the refused Put"
+    );
+
+    auth.listener.shutdown();
+    shutdown(&owner_be).await;
+    shutdown(&client_be).await;
+}
+
+/// Contract (the conviction's ARMING half): the PRODUCTION geometry
+/// source — `multi_writer::router_range_geometry`, the one
+/// `arm_multi_writer` now installs — answers `(size, block)` from the
+/// authority's own planes (layout head size; data-plane block size), and
+/// through it the iso2 interleave scopes: the peer's newer entry
+/// survives a range holder's stale full Put while the holder's
+/// own-custody entry follows it. Compile-RED at f609f984 (the source did
+/// not exist; nothing production-shaped could scope a Put).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_production_range_geometry_arms_the_scoped_put() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let (owner_be, _p) = sandbox(dir.path(), "own", true).await;
+    let (client_be, _p2) = sandbox(dir.path(), "cli", false).await;
+
+    // The production data plane the source reads its block size from.
+    let alloc = Arc::new(
+        squeezefs::block_allocator::BlockAllocator::new("nogeo-data")
+            .await
+            .expect("allocator"),
+    );
+    let chunk = alloc.chunk_size();
+    assert_eq!(chunk, BLOCK, "the suite's shapes assume the default block");
+    let backend = Arc::new(squeezefs::routing::BackendRouter::new(
+        Arc::clone(&alloc),
+        Arc::new(squeezefs::nvme_dev::NvmeBlockDev::new(
+            dir.path().join("nogeo-dev").to_str().unwrap(),
+        )),
+        Arc::new(AtomicU64::new(chunk)),
+    ));
+    let geometry =
+        squeezefs::multi_writer::router_range_geometry(Arc::clone(&owner_be), backend);
+
+    let auth = start_authority_geo(
+        Arc::clone(&owner_be),
+        "assembler-authority",
+        Some(Arc::clone(&geometry)),
+    );
+    let (client, pc) = arm_client(&auth, &client_be).await;
+    let epoch = client.lease_epoch();
+    let ino = shipped_create(&client_be, "prodgeo.bin").await;
+
+    // The source's own contract: absent layout -> (0, block); a
+    // layout-bearing ino -> (its size, block).
+    use squeezefs::data_grant::RangeGeometry as _;
+    assert_eq!(
+        geometry.geometry(ino).await,
+        Some((0, BLOCK)),
+        "absent layout answers size 0 with the data plane's block size"
+    );
+    let base = base_layout_bytes(4 * BLOCK, &[(0, "be://data:mine0")]);
+    publish::set_layout_and_size(&client_be, ino, &base, 4 * BLOCK, &[])
+        .await
+        .expect("the base Put lands");
+    assert_eq!(
+        geometry.geometry(ino).await,
+        Some((4 * BLOCK, BLOCK)),
+        "a layout-bearing ino answers its durable head's size"
+    );
+
+    // The iso2 interleave, production-armed: holder takes block 0, the
+    // peer publishes block 1, the holder ships a STALE full Put.
+    let _g = client
+        .acquire_range(ino, (0, BLOCK), (0, BLOCK), Duration::from_secs(1))
+        .await
+        .expect("block-0 range custody");
+    let peer_lease = auth
+        .owner
+        .join(&data_grant::JoinFrame {
+            schema: data_grant::CUSTODY_SCHEMA,
+            client: "node-assembler-b".to_string(),
+            pr_key: 0,
+            prior_epoch: None,
+        })
+        .expect("peer joins");
+    let _pg = auth
+        .owner
+        .grant_ranged(
+            &data_grant::AcquireFrame {
+                schema: data_grant::CUSTODY_SCHEMA,
+                client: "node-assembler-b".to_string(),
+                lease_epoch: peer_lease.epoch,
+                ino,
+                span: Some((BLOCK, 2 * BLOCK)),
+                concurrent_write: false,
+                wait_ms: 5_000,
+                desired: Some((BLOCK, 2 * BLOCK)),
+            },
+            (BLOCK, 2 * BLOCK),
+        )
+        .await
+        .expect("peer's block-1 custody");
+    let pc2 = publish::PublishClient::new("node-assembler-b", SECRET.to_vec());
+    pc2.ship(
+        &auth.endpoint,
+        publish::PublishCall::MergeLayoutAndSize {
+            ino,
+            delta: delta(
+                4 * BLOCK,
+                &[(1, "be://data:peer1")],
+                Some((0, squeezefs::dlm::mint_layout_version())),
+            )
+            .encode(),
+            full_layout: base_layout_bytes(
+                4 * BLOCK,
+                &[(0, "be://data:mine0"), (1, "be://data:peer1")],
+            ),
+            size: 4 * BLOCK,
+            refs: Vec::new(),
+            lease_epoch: peer_lease.epoch,
+            request_id: 0xE3,
+        },
+    )
+    .await
+    .expect("the peer's block-1 publish lands");
+
+    pc.ship(
+        &auth.endpoint,
+        publish::PublishCall::SetLayoutAndSize {
+            ino,
+            layout: base_layout_bytes(4 * BLOCK, &[(0, "be://data:mine0v2")]),
+            size: 4 * BLOCK,
+            refs: Vec::new(),
+            lease_epoch: epoch,
+            request_id: 0xE4,
+        },
+    )
+    .await
+    .expect("the production-armed scoped Put lands");
+
+    let map = owner_layout(&owner_be, ino).await.block_map.expect("map");
+    assert_eq!(
+        map.get(&0).map(String::as_str),
+        Some("be://data:mine0v2"),
+        "the holder's own-custody entry follows the Put"
+    );
+    assert_eq!(
+        map.get(&1).map(String::as_str),
+        Some("be://data:peer1"),
+        "the peer's newer entry survives the stale full Put — scoping engaged \
+         through the PRODUCTION geometry source"
+    );
+
+    auth.listener.shutdown();
+    shutdown(&owner_be).await;
+    shutdown(&client_be).await;
 }

@@ -1432,6 +1432,12 @@ impl RoutedMetaBackend {
         offset: u64,
         max: usize,
     ) -> Result<Vec<(u64, DirEntry)>> {
+        // Rung 13 — the OQ-2 read gate's LOCAL face (live finding: the
+        // FUSE readdir handler rides THIS non-trait pager, not the trait
+        // readdir, so an ungated stream could serve a directory page
+        // missing a foreign holder's un-flushed intents). One relaxed
+        // load when no delegation host is armed.
+        crate::meta_ship::deleg_read_gate(self, dir).await;
         let (v_idx, local_dir) = self.route_ino(dir);
         self.check_volume_enabled(v_idx)?;
         let _guard = self.volumes[v_idx].dlm().lock_inode_shared(local_dir).await;

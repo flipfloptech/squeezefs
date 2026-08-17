@@ -134,8 +134,12 @@ pub(crate) struct LaneCtx {
 struct Authority {
     seq: u64,
     term: u64,
-    dir_mode: u32,
-    dir_gid: u32,
+    /// D's attributes as this client believes them: the grant image plus
+    /// this client's own folds (mint Δtimes, mkdir Δnlink). Exact under
+    /// exclusivity — a foreign mutation of D recalls this grant first —
+    /// and the LOCAL parent-attr serve built on it deletes the measured
+    /// one-shipped-getattr-per-create (the FUSE D2.c parent refresh).
+    attrs: Inode,
     /// D's name set as this client believes it: the grant census + every
     /// name this client applied since. Exact under exclusivity.
     census: std::collections::HashSet<String>,
@@ -184,6 +188,8 @@ struct Lane {
     fenced: bool,
     /// A cached wire session the flushing winner takes/puts.
     session: Option<crate::cluster_wire::RpcClient>,
+    /// One scheduled release-kick per lane at a time (the coalescer).
+    kick_scheduled: bool,
 }
 
 impl Lane {
@@ -201,6 +207,7 @@ impl Lane {
             flushing: false,
             fenced: false,
             session: None,
+            kick_scheduled: false,
         }
     }
 }
@@ -271,13 +278,14 @@ pub(crate) fn absorb_intent_grant(endpoint: &str, ctx: LaneCtx, grant: &IntentGr
             AUTHORITIES.fetch_add(1, Ordering::Relaxed);
         }
     }
+    let mut attrs = Inode::from(grant.dir_attrs);
+    attrs.ino = grant.dir;
     lane.authorities.insert(
         grant.dir,
         Authority {
             seq: grant.seq,
             term: grant.term,
-            dir_mode: grant.dir_mode,
-            dir_gid: grant.dir_gid,
+            attrs,
             census: grant.census.iter().cloned().collect(),
         },
     );
@@ -405,8 +413,8 @@ pub(crate) fn try_mint_create(
     let is_dir = (mode & libc::S_IFMT) == libc::S_IFDIR;
     let mut final_mode = mode;
     let mut final_gid = gid;
-    if (auth.dir_mode & libc::S_ISGID) != 0 {
-        final_gid = auth.dir_gid;
+    if (auth.attrs.mode & libc::S_ISGID) != 0 {
+        final_gid = auth.attrs.gid;
         if is_dir {
             final_mode |= libc::S_ISGID;
         }
@@ -442,6 +450,15 @@ pub(crate) fn try_mint_create(
     });
     lane.images.insert(ino, inode.clone());
     lane.names.insert((parent, name.to_string()), ino);
+    // Fold the mint into the parent image (the owner's apply stamps the
+    // same Δ — times from the mint instant, nlink for a mkdir).
+    if let Some(auth) = lane.authorities.get_mut(&parent) {
+        auth.attrs.mtime = ts;
+        auth.attrs.ctime = ts;
+        if is_dir {
+            auth.attrs.nlink += 1;
+        }
+    }
     PENDING_OPS.fetch_add(1, Ordering::Relaxed);
     MINTS.fetch_add(1, Ordering::Relaxed);
     if lane.queue.len() >= batch_cap() {
@@ -569,6 +586,23 @@ pub(crate) fn lookup_probe(endpoint: &str, parent: u64, name: &str) -> LookupPro
     }
 }
 
+/// The LOCAL parent-attr serve (the measured live finding's fix): a
+/// LIVE UPDATE authority answers its directory's getattr from the folded
+/// grant image — the FUSE create handler's D2.c parent refresh would
+/// otherwise ship one getattr per minted create.
+pub(crate) fn authority_attr_probe(endpoint: &str, ino: u64) -> Option<Inode> {
+    if AUTHORITIES.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    let st = STATE.lock();
+    let lane = st.lanes.get(endpoint)?;
+    let auth = lane.authorities.get(&ino)?;
+    if !authority_live(endpoint, auth) {
+        return None;
+    }
+    Some(auth.attrs.clone())
+}
+
 /// The pending image of `ino`, if any (the getattr probe).
 pub(crate) fn pending_image(ino: u64) -> Option<Inode> {
     if PENDING_OPS.load(Ordering::Relaxed) == 0 {
@@ -693,9 +727,9 @@ pub async fn fsync_ino_barrier(ino: u64) -> Result<(), i32> {
     }
 }
 
-/// An asynchronous flush kick (release / size bound): never blocks the
-/// caller; the per-lane `flushing` flag self-coalesces bursts into one
-/// frame (the conveyor shape).
+/// An asynchronous flush kick (the size bound): never blocks the caller;
+/// the per-lane `flushing` flag self-coalesces bursts into one frame (the
+/// conveyor shape).
 pub fn kick_flush(endpoint: &str) {
     let ep = endpoint.to_string();
     crate::meta_exec::spawn_meta("meta_ship_intent_flush", async move {
@@ -703,21 +737,51 @@ pub fn kick_flush(endpoint: &str) {
     });
 }
 
-/// Kick every lane holding the given pending ino (the RELEASE hook).
+/// The RELEASE kick's coalescing delay: the §8.2 item-3 "batch-flush
+/// latency" bound for the close-triggered flush. An IMMEDIATE per-release
+/// flush was the first live-leg finding's shape — it raced ahead of tar's
+/// post-close `utimensat`, so every explicit-time set arrived at an
+/// ALREADY-APPLIED ino and shipped (2 wire verbs per file on a
+/// zero-wire path), and it collapsed the batch to one frame per file.
+/// The delay derives from the negative-TTL knob (the same term the
+/// published visibility bound is built from — one law, no new constant);
+/// foreign READS stay exact regardless (OQ-2 recalls force the flush),
+/// so the delay only bounds the MW-8 acked-un-fsynced window.
+fn release_kick_delay_ms() -> u64 {
+    crate::env_knobs::opt_int_knob::<u64>("SQUEEZEFS_FUSE_NEGATIVE_TTL_MS").unwrap_or(1000)
+}
+
+/// Kick every lane holding the given pending ino (the RELEASE hook) —
+/// DELAYED and coalescing: one scheduled flush per lane at a time, so a
+/// tar stream's closes fold into one frame per delay window instead of
+/// one frame per file.
 pub fn kick_if_pending(ino: u64) {
     if PENDING_OPS.load(Ordering::Relaxed) == 0 {
         return;
     }
     let eps: Vec<String> = {
-        let st = STATE.lock();
-        st.lanes
-            .iter()
-            .filter(|(_, l)| l.images.contains_key(&ino))
-            .map(|(e, _)| e.clone())
-            .collect()
+        let mut st = STATE.lock();
+        let mut eps = Vec::new();
+        for (ep, lane) in st.lanes.iter_mut() {
+            if lane.images.contains_key(&ino) && !lane.kick_scheduled {
+                lane.kick_scheduled = true;
+                eps.push(ep.clone());
+            }
+        }
+        eps
     };
     for ep in eps {
-        kick_flush(&ep);
+        let delay = release_kick_delay_ms();
+        crate::meta_exec::spawn_meta("meta_ship_intent_release_kick", async move {
+            squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(delay)).await;
+            {
+                let mut st = STATE.lock();
+                if let Some(lane) = st.lanes.get_mut(&ep) {
+                    lane.kick_scheduled = false;
+                }
+            }
+            let _ = flush_owner(&ep).await;
+        });
     }
 }
 
@@ -1251,6 +1315,9 @@ pub struct IntentStats {
     pub update_declines: u64,
     /// GAUGE: pending intents (queued + in flight).
     pub pending: u64,
+    /// GAUGE: held UPDATE authorities (client face — the live-leg
+    /// absorption instrument).
+    pub authorities: u64,
     /// GAUGE: supply inos remaining across lanes.
     pub supply_remaining: u64,
     /// GAUGE: the published §8.2 visibility bound, ms (post-fsync the
@@ -1298,6 +1365,7 @@ pub fn intent_stats() -> IntentStats {
         update_grants: UPDATE_GRANTS.load(Ordering::Relaxed),
         update_declines: UPDATE_DECLINES.load(Ordering::Relaxed),
         pending,
+        authorities: AUTHORITIES.load(Ordering::Relaxed),
         supply_remaining,
         visibility_bound_ms: visibility_bound_ms(),
     }
@@ -1325,6 +1393,7 @@ pub fn intent_stats_json() -> serde_json::Value {
         "meta_ship_intent_update_grants": s.update_grants,
         "meta_ship_intent_update_declines": s.update_declines,
         "meta_ship_intent_pending": s.pending,
+        "meta_ship_intent_authorities": s.authorities,
         "meta_ship_intent_supply_remaining": s.supply_remaining,
         "meta_ship_intent_visibility_bound_ms": s.visibility_bound_ms,
     })

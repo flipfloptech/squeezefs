@@ -3490,15 +3490,23 @@ leg_s10_intents() {
         "$MWFLEET" unmount "$cw" || die "s10-intents: co-writer unmount failed"
         env "$@" "$MWFLEET" mount "$cw" || die "s10-intents: co-writer remount failed"
     }
-    earn_grant() { # dir-path — the FIRST create ships and EARNS the grant
-        local d="$1" g0 tries
-        g0="$(ifield "$cw" meta_ship_intent.meta_ship_intent_update_grants)"
-        touch "$d/earn" || die "s10-intents: the grant-earning create failed"
+    earn_grant() { # dir-path — one shipped create earns/refreshes the
+        # grant; the client-face ABSORPTION gauge (authorities) is the
+        # signal (the mkdir of the dir itself usually already earned it —
+        # the created-dir preference — so the owner-face grant counter may
+        # legitimately stay flat here).
+        local d="$1" a0 m0 tries
+        a0="$(ifield "$cw" meta_ship_intent.meta_ship_intent_authorities)"
+        m0="$(ifield "$cw" meta_ship_intent.meta_ship_intent_mints)"
+        touch "$d/earn-$RANDOM-$RANDOM" || die "s10-intents: the grant-earning create failed"
         for ((tries = 0; tries < 40; tries++)); do
-            [ "$(ifield "$cw" meta_ship_intent.meta_ship_intent_update_grants)" -gt "$g0" ] && return 0
+            # Earned by THIS ship (gauge rose), or already held (the
+            # create MINTED — e.g. the dir's own mkdir carried the grant).
+            [ "$(ifield "$cw" meta_ship_intent.meta_ship_intent_authorities)" -gt "$a0" ] && return 0
+            [ "$(ifield "$cw" meta_ship_intent.meta_ship_intent_mints)" -gt "$m0" ] && return 0
             sleep 0.25
         done
-        die "s10-intents: no UPDATE grant rode the earning create (grants flat at $g0)"
+        die "s10-intents: no UPDATE authority absorbed on the co-writer (gauge flat at $a0)"
     }
 
     # ---- Phase 1: earn → mint (zero wire) → fsync(dir) → foreign visibility --
@@ -3509,37 +3517,51 @@ leg_s10_intents() {
     mints0="$(ifield "$cw" meta_ship_intent.meta_ship_intent_mints)"
     ship0="$(ifield "$cw" meta_ship.shipped_verbs)"
     defer0="$(ifield "$cw" meta_ship_intent.meta_ship_intent_deferred_setattrs)"
+    batches0="$(ifield "$cw" meta_ship_intent.meta_ship_intent_batches)"
+    verbs0="$(ifield "$cw" meta_ship_intent.meta_ship_intent_verbs)"
+    # The METADATA-plane instrument is create+utime (touch): the write
+    # path's lease/publish ceremony is the DATA plane's (priced by the
+    # tar-x row), and mixing it in here would gate rung 13 on rung-9
+    # machinery it does not own. Measured live: touch = ZERO wire.
     for ((n = 0; n < files; n++)); do
-        echo "payload-$n" >"$cw_mnt/s10i/d1/f$n" || die "s10-intents: minted create failed"
+        touch "$cw_mnt/s10i/d1/f$n" || die "s10-intents: minted create failed"
         touch -d @1700000000 "$cw_mnt/s10i/d1/f$n" || die "s10-intents: deferred utime failed"
     done
     mints1="$(ifield "$cw" meta_ship_intent.meta_ship_intent_mints)"
     ship1="$(ifield "$cw" meta_ship.shipped_verbs)"
     [ $((mints1 - mints0)) -ge $((files - 2)) ] ||
         die "s10-intents: only $((mints1 - mints0)) local mints across $files creates — the grant is not minting"
-    # The zero-round-trip law: the mint span ships (near) nothing beyond
-    # the async writeback publishes racing it (data plane) — the ±12
-    # ceremony/writeback allowance is the s8-a instrument-skew law's.
+    # The zero-round-trip law: the metadata-plane mint span ships (near)
+    # nothing — the ±12 allowance is the s8-a instrument-skew law's (the
+    # .stats snapshot ceremony ships its own verbs).
     [ $((ship1 - ship0)) -le 12 ] ||
         die "s10-intents: the mint span SHIPPED $((ship1 - ship0)) metadata verbs — creates are not local"
+    # One WRITTEN file composes the data plane (create mints, the write's
+    # publish barriers on the pending ino — ungated here, priced by tarx).
+    echo "payload" >"$cw_mnt/s10i/d1/withdata" || die "s10-intents: written mint failed"
     [ "$(ifield "$cw" meta_ship_intent.meta_ship_intent_deferred_setattrs)" -gt "$defer0" ] ||
         die "s10-intents: no setattr deferred into the batch (the tar utime shape is not engaging)"
-    batches0="$(ifield "$cw" meta_ship_intent.meta_ship_intent_batches)"
-    verbs0="$(ifield "$cw" meta_ship_intent.meta_ship_intent_verbs)"
     sync "$cw_mnt/s10i/d1" || die "s10-intents: fsync(dir) failed"
-    [ "$(ifield "$cw" meta_ship_intent.meta_ship_intent_batches)" -gt "$batches0" ] ||
-        die "s10-intents: fsync(dir) forced no flush frame"
+    # fsync(dir) GUARANTEES flushed-ness (the delayed release-kick may
+    # already have shipped part of the span — that is the coalescer
+    # working, not a miss): pending must be 0 and the span's intents must
+    # all have travelled, in however many frames the window coalesced to.
+    [ "$(ifield "$cw" meta_ship_intent.meta_ship_intent_pending)" = "0" ] ||
+        die "s10-intents: pending != 0 after fsync(dir) — the contract point did not flush"
     local vd bd
     vd=$(($(ifield "$cw" meta_ship_intent.meta_ship_intent_verbs) - verbs0))
     bd=$(($(ifield "$cw" meta_ship_intent.meta_ship_intent_batches) - batches0))
+    [ "$bd" -ge 1 ] || die "s10-intents: no flush frame shipped across the whole span"
+    [ "$vd" -ge $((mints1 - mints0)) ] ||
+        die "s10-intents: only $vd intents travelled for $((mints1 - mints0)) mints"
     # Foreign visibility after the contract point: the AUTHORITY sees
     # every name + the deferred times (owner-current serve; ls here also
     # exercises the OQ-2 gate against a now-empty queue).
     ls -1 --color=never "$cw_mnt/s10i/d1" >/dev/null || die "s10-intents: minter ls failed"
-    [ "$(find "$cw_mnt/s10i/d1" -mindepth 1 -maxdepth 1 | wc -l)" = "$((files + 1))" ] ||
+    [ "$(find "$cw_mnt/s10i/d1" -mindepth 1 -maxdepth 1 | wc -l)" = "$((files + 2))" ] ||
         die "s10-intents: the minter cannot list its own names"
     ls -1 --color=never "$w_mnt/s10i/d1" >/dev/null || die "s10-intents: authority ls failed"
-    [ "$(find "$w_mnt/s10i/d1" -mindepth 1 -maxdepth 1 | wc -l)" = "$((files + 1))" ] ||
+    [ "$(find "$w_mnt/s10i/d1" -mindepth 1 -maxdepth 1 | wc -l)" = "$((files + 2))" ] ||
         die "s10-intents: post-fsync the authority does not see every flushed name"
     local mt
     mt="$(stat -c %Y "$w_mnt/s10i/d1/f0")"
@@ -3548,13 +3570,19 @@ leg_s10_intents() {
     log "phase 1: $((mints1 - mints0)) mints / $((ship1 - ship0)) shipped in the mint span; fsync flushed $vd intents in $bd frame(s) (coalesce $(python3 -c "print(f'{$vd/max(1,$bd):.1f}')")); foreign visibility + deferred times EXACT"
 
     # ---- Phase 2: OQ-2 recall-forces-flush, live ------------------------------
-    local rr0 ff0 sub
+    # Phase 1's OWNER-side reads RECALLED d1's grant (the read gate — the
+    # law working); re-earn before the minted shapes below.
+    local rr0 ff0 sub mints2
+    earn_grant "$cw_mnt/s10i/d1"
     sub="$cw_mnt/s10i/d1/sub"
     mkdir "$sub" || die "s10-intents: minted mkdir failed"
     echo x >"$sub/pending-child" || die "s10-intents: create into pending dir failed"
     rr0="$(ifield 0 meta_ship_intent.meta_ship_intent_read_recalls)"
     ff0="$(ifield "$cw" meta_ship_intent.meta_ship_intent_flush_forces)"
+    mints2="$(ifield "$cw" meta_ship_intent.meta_ship_intent_mints)"
     echo y >"$cw_mnt/s10i/d1/unsynced" || die "s10-intents: pre-read mint failed"
+    [ "$(ifield "$cw" meta_ship_intent.meta_ship_intent_mints)" -gt "$mints2" ] ||
+        die "s10-intents: 'unsynced' did not MINT (the phase-2 shape needs a pending name)"
     # The foreign read: the OWNER's ls under the granted dir must recall
     # the holder (forcing its flush) and then serve the acked name — no
     # fsync ever ran for `unsynced`.

@@ -1348,6 +1348,12 @@ impl Metadata for MetaShipRouter {
                 if let Some(image) = super::intents::pending_image(ino) {
                     return Ok(image);
                 }
+                // The UPDATE authority's own directory: serve the folded
+                // grant image (the D2.c parent refresh's per-create
+                // getattr — the measured live finding).
+                if let Some(attrs) = super::intents::authority_attr_probe(&peer.endpoint, ino) {
+                    return Ok(attrs);
+                }
                 if let Some(errno) = super::intents::destroyed_errno(ino) {
                     return Err(SqueezefsError::refused(
                         errno,

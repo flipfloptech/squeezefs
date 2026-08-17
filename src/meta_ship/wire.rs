@@ -688,11 +688,16 @@ pub struct IntentGrant {
     pub seq: u64,
     /// The owner's durable era.
     pub term: u64,
-    /// The directory's mode (setgid inheritance is computed at mint AND
-    /// re-computed at apply; exclusivity keeps the two equal).
-    pub dir_mode: u32,
-    /// The directory's gid (the setgid-inheritance input).
-    pub dir_gid: u32,
+    /// The directory's FULL attributes at grant time — two consumers:
+    /// the setgid-inheritance inputs (mode/gid, computed at mint AND
+    /// re-computed at apply; exclusivity keeps the two equal), and the
+    /// holder's LOCAL parent-attr serve. The second is a measured live
+    /// finding: the FUSE create handler's D2.c parent refresh shipped ONE
+    /// getattr per minted create — the exact round trip the grant exists
+    /// to delete. Exclusivity keeps the image exact (every foreign
+    /// mutation of D recalls this grant first) and the holder folds its
+    /// own mints in (Δtimes, mkdir Δnlink).
+    pub dir_attrs: WireInode,
     /// D's complete name set at grant time (≤ the census budget).
     pub census: Vec<String>,
     /// The mint supply riding this grant (`None` when the reply already

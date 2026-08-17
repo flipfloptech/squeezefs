@@ -266,8 +266,17 @@ struct DelegHost {
     /// Wakes gate waiters (an ack or an expiry moved the holder set).
     ack_notify: squeezefs_ipc::sqz_notify::Notify,
     /// Holders whose recall deadline expired: escalated to membership
-    /// eviction, their poll/reassert refuse `STATUS_DELEG_FENCED`.
-    fenced: parking_lot::Mutex<HashSet<String>>,
+    /// eviction, their poll/reassert refuse `STATUS_DELEG_FENCED`. Keyed
+    /// id → the INCARNATION (client_epoch) that was fenced (rung-13 live
+    /// finding: "re-admission is by remount" was a dead letter when the
+    /// HOLDER died — the remounted same-identity successor presented the
+    /// same id string and stayed fenced forever; a fresh incarnation's
+    /// first frame now clears the record, while the fenced zombie's own
+    /// epoch stays refused).
+    fenced: parking_lot::Mutex<HashMap<String, u64>>,
+    /// The last incarnation each holder presented (what the expire pass
+    /// fences, since a timed-out recall carries no epoch).
+    incarnations: scc::HashMap<String, u64>,
     /// Objects with a mutation in flight (ino → count): grants DECLINE
     /// while registered, closing the grant-vs-mutation window.
     in_flight: scc::HashMap<u64, u64>,
@@ -294,7 +303,8 @@ impl Default for DelegHost {
             outbox: parking_lot::Mutex::new(HashMap::new()),
             poll_notify: squeezefs_ipc::sqz_notify::Notify::new(),
             ack_notify: squeezefs_ipc::sqz_notify::Notify::new(),
-            fenced: parking_lot::Mutex::new(HashSet::new()),
+            fenced: parking_lot::Mutex::new(HashMap::new()),
+            incarnations: scc::HashMap::new(),
             in_flight: scc::HashMap::new(),
             seq: AtomicU64::new(0),
             update_holders: parking_lot::Mutex::new(HashMap::new()),
@@ -492,6 +502,7 @@ impl MetaShipService {
                 return self.refuse(req.id, STATUS_MALFORMED, format!("{e}"));
             }
         };
+        self.note_client_incarnation(&frame.client_id, frame.client_epoch);
         if frame.schema != META_SHIP_SCHEMA {
             return self.refuse(
                 req.id,
@@ -820,7 +831,7 @@ impl MetaShipService {
         if client_id.is_empty() || !tokens::delegation_enabled() {
             return Vec::new();
         }
-        if self.deleg.fenced.lock().contains(client_id) {
+        if self.deleg.fenced.lock().contains_key(client_id) {
             return Vec::new();
         }
         let lane = tokens::global_recall_lane();
@@ -895,7 +906,7 @@ impl MetaShipService {
         let MetaCall::CreateWithRdev { parent, .. } = call else {
             return None;
         };
-        if self.deleg.fenced.lock().contains(client_id) {
+        if self.deleg.fenced.lock().contains_key(client_id) {
             return None;
         }
         let created_dir = match reply {
@@ -1003,8 +1014,7 @@ impl MetaShipService {
                 dir,
                 seq,
                 term: self.term(),
-                dir_mode: dir_inode.mode,
-                dir_gid: dir_inode.gid,
+                dir_attrs: super::wire::WireInode::from(&dir_inode),
                 census,
                 supply,
             });
@@ -1243,9 +1253,40 @@ impl MetaShipService {
         (cfg.deadline / 2).clamp(tokens::RECALL_POLL_PARK_FLOOR, Duration::from_secs(5))
     }
 
-    /// Is `client` fenced on the delegation plane?
+    /// Record the incarnation a holder presented, and clear a stale
+    /// fence: a DIFFERENT epoch is a new process of the same identity —
+    /// the documented re-admission-by-remount posture made real (the
+    /// fenced zombie's own epoch stays refused).
+    fn note_client_incarnation(&self, client: &str, epoch: u64) {
+        if client.is_empty() {
+            return;
+        }
+        match self.deleg.incarnations.entry_sync(client.to_string()) {
+            scc::hash_map::Entry::Occupied(mut o) => {
+                if *o.get() != epoch {
+                    *o.get_mut() = epoch;
+                }
+            }
+            scc::hash_map::Entry::Vacant(v) => {
+                v.insert_entry(epoch);
+            }
+        }
+        let mut fenced = self.deleg.fenced.lock();
+        if let Some(&fenced_epoch) = fenced.get(client) {
+            if fenced_epoch != epoch {
+                fenced.remove(client);
+                log::info!(
+                    "S10 delegation: holder '{client}' re-admitted — a new incarnation \
+                     (epoch {epoch:#x}) replaced the fenced one ({fenced_epoch:#x}); the \
+                     re-admission-by-remount posture"
+                );
+            }
+        }
+    }
+
+    /// Is `client` fenced on the delegation plane (this incarnation)?
     fn deleg_fenced(&self, client: &str) -> bool {
-        self.deleg.fenced.lock().contains(client)
+        self.deleg.fenced.lock().contains_key(client)
     }
 
     /// Distribute freshly issued recall frames into the per-holder outbox
@@ -1280,7 +1321,12 @@ impl MetaShipService {
         let mut newly: HashSet<String> = HashSet::new();
         for t in &dead {
             tokens::note_deleg_recall_timeout();
-            if fenced.insert(t.client.clone()) {
+            let epoch = self
+                .deleg
+                .incarnations
+                .read_sync(&t.client, |_, v| *v)
+                .unwrap_or(0);
+            if fenced.insert(t.client.clone(), epoch).is_none() {
                 newly.insert(t.client.clone());
             }
         }
@@ -1517,6 +1563,7 @@ impl MetaShipService {
                 ),
             );
         }
+        self.note_client_incarnation(&frame.client_id, frame.client_epoch);
         if self.deleg_fenced(&frame.client_id) {
             return self.refuse(
                 req.id,
@@ -1602,6 +1649,7 @@ impl MetaShipService {
                 ),
             );
         }
+        self.note_client_incarnation(&frame.client_id, frame.client_epoch);
         if self.deleg_fenced(&frame.client_id) {
             return self.refuse(
                 req.id,
@@ -1709,6 +1757,7 @@ impl MetaShipService {
                 ),
             );
         }
+        self.note_client_incarnation(&frame.client_id, frame.client_epoch);
         if self.deleg_fenced(&frame.client_id) {
             return self.refuse(
                 req.id,

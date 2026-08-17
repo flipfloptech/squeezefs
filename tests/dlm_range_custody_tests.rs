@@ -38,7 +38,7 @@
 //! Every test owns a private inode band: the lock table and the fencing
 //! mint are process-global statics shared across this binary.
 
-use squeezefs::dlm::{DlmClient, LockMode};
+use squeezefs::dlm::{DlmClient, LockMode, RangeAcquired};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -971,4 +971,946 @@ async fn span_range_shared_classifies_custody() {
         "a partial own range does not license mutating the whole block"
     );
     partial.release().await.expect("release partial");
+}
+
+// ===========================================================================
+// DLM stage **S11 rung 15** — KD-MW-7: distributed byte-range custody ON THE
+// WIRE (`docs/design-full-multi-writer.md` §9.2 + PR-plan row 15).
+//
+// The local algebra above is S11's single-node half; this section takes it
+// to the wire: range grants ride the S9 custody lease, the client caches its
+// granted spans in the S8 token cache, and the authority's admit gains the
+// §9.2 bounds law — required/desired, admit-time coalescing, the
+// geometry-derived per-file span cap `max(16, ceil(size / block_size))`, and
+// the `dlm_grant_table_bytes` R5 byte-budget ceiling with refuse-loud (no
+// free span constants — Issue-19's law).
+//
+// Contracts (numbering continues the local half's):
+//
+//  8. **Required/desired admit** — the grant is the largest desired-subset
+//     that conflicts with nothing, NEVER less than required: a foreign
+//     grant inside desired TRIMS desired (`range_custody_desired_trims`);
+//     a foreign grant overlapping REQUIRED refuses (never a silent trim).
+//  9. **Admit-time coalescing convergence** (the adversarial tiny-ranges
+//     shape — charter red-first pin b): N tiny ADJACENT asks from one
+//     holder converge to O(1) live spans under ONE surviving token, and
+//     the merged custody retires as a unit.
+// 10. **At-budget refusal names the arithmetic** (charter pin a): a
+//     new-span admit past the `dlm_grant_table_bytes` R5 share refuses
+//     LOUD, counted `range_custody_cap_refusals`, converging by release —
+//     required is never silently trimmed to fit.
+// 11. **The block-cyclic shape** (charter pin c — rung 18's acceptance
+//     shape, pinned now): K holders, holder i takes blocks i, i+K, i+2K…
+//     of one large file — grants ≈ blocks-in-file with ZERO refusals below
+//     budget (the Issue-19 class: a constant refusing the workload S11
+//     exists for).
+// 12. **The geometry cap** — `max(16, ceil(size/block_size))` spans per
+//     file: floor 16 is transient pre-coalesce headroom for sub-16-block
+//     files (refuses the 17th non-coalescible span, loud); a larger file's
+//     cap is its own block count (the 17th span admits).
+// 13. **Pull-revocation + T_self** — the custody-lease machinery verbatim:
+//     a revoked holder learns at its next renewal, every adopted range
+//     lease reads dead, the client range cache empties, and the custody
+//     generation advances (never poisons); T_self stays strictly earlier
+//     than the owner's deadline.
+// 14. **Era fencing** — a stale lease epoch's range acquire refuses
+//     UNKNOWN_LEASE; a successor era's grants dominate every prior era's
+//     tokens (ranges share the file's generator — no new token algebra).
+// 15. **The range vector on the lease** — the renewal reply carries the
+//     client's live range grants, and the client cache REBUILDS from it
+//     (the revalidation surface).
+// 16. **The client range cache** (S8 token cache extension) — covering
+//     probes serve the granted token locally; `dlm_token_cache_bytes`
+//     accounts range-span state.
+// 17. **Dark posture** — `SQUEEZEFS_RANGE_CUSTODY` is registered (ENG-10:
+//     Kind::Bool, static default on) and read ONLY when the mw plane is
+//     armed: on an unarmed process the lever answers false even when
+//     forced (the `delegation_enabled` law).
+// 18. **R5 registration** — `dlm_grant_table_bytes` (authority-side) and
+//     `dlm_token_cache_bytes` (client-side) are registered R5 components.
+// ===========================================================================
+
+use squeezefs::cluster_wire as cw;
+use squeezefs::data_grant::{self, RangeAcquireOutcome, WriteCustodyClient, WriteCustodyOwner};
+use squeezefs::membership::{LeaseClock, LeaseClocks};
+
+/// The wire tests' storage-trust secret (S3's root of trust).
+const RANGE_SECRET: &[u8] = b"s11-range-wire-storage-trust-secret";
+
+/// 4 MiB — the shipped block size the desired-rounding doctrine aligns to.
+const BLK: u64 = 4 * MIB;
+
+/// Process-global range-custody state (the grant-table gauge, the budget
+/// seam, the range counters, the client range cache) forces the counting
+/// tests to serialize even in parallel dev runs (the gate runs
+/// `--test-threads=1`; this keeps dev runs deterministic too).
+static RANGE_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Deterministic lease clocks (the S9 suite's law: T_self strictly earlier
+/// than the owner's TTL by construction).
+fn range_clocks() -> (LeaseClocks, LeaseClock) {
+    let clocks = LeaseClocks::with_params(
+        Duration::from_millis(3_000),
+        Duration::from_millis(200),
+        Duration::from_millis(400),
+    )
+    .expect("2*skew + purge < TTL");
+    (clocks, LeaseClock::monotonic())
+}
+
+/// A fixed-geometry source: every ino reads as one `size`-byte file of
+/// `BLK`-byte blocks — the injectable seam the mount arm fills with the
+/// real metadata lookup.
+fn fixed_geometry(size: u64) -> Arc<dyn data_grant::RangeGeometry> {
+    data_grant::fixed_range_geometry(size, BLK)
+}
+
+/// One armed authority + listener (no meta backend, no quarantine — the
+/// custody plane alone), geometry installed.
+fn range_authority(size: u64) -> (Arc<cw::RpcListener>, Arc<WriteCustodyOwner>, String) {
+    let (clocks, clock) = range_clocks();
+    let owner = WriteCustodyOwner::arm(
+        "s11-owner",
+        squeezefs::dlm::durable_term() + 1,
+        squeezefs::dlm::durable_term(),
+        clocks,
+        clock,
+        None,
+    )
+    .expect("the custody authority arms");
+    owner.install_range_geometry(fixed_geometry(size));
+    let router = data_grant::AsyncVerbRouter::new().with_custody(Arc::clone(&owner));
+    let cfg = cw::RpcListenerConfig {
+        bind_addr: "127.0.0.1:0".parse().expect("literal addr"),
+        service_threads: 2,
+        ..cw::RpcListenerConfig::default()
+    };
+    let listener = cw::RpcListener::start_async(cfg, RANGE_SECRET.to_vec(), Arc::new(router))
+        .expect("the S11 authority listens");
+    let endpoint = listener.endpoint().to_string();
+    (listener, owner, endpoint)
+}
+
+async fn range_client(endpoint: &str, id: &str) -> Arc<WriteCustodyClient> {
+    WriteCustodyClient::connect(endpoint, RANGE_SECRET, id)
+        .await
+        .expect("a co-writer dials the S11 authority")
+}
+
+// ---------------------------------------------------------------------------
+// 8. Required/desired admit (local algebra half — the wire rides it)
+// ---------------------------------------------------------------------------
+
+/// Contract 8: the grant is the largest desired-subset conflicting with
+/// nothing, never less than required. A foreign grant inside desired trims
+/// desired (counted); a foreign grant overlapping REQUIRED refuses loud —
+/// a silent trim of required is the §9.2 forbidden answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn required_desired_admit_never_trims_required() {
+    let _g = RANGE_SERIAL.lock().await;
+    let path = "inode_72000001";
+    let d = dlm();
+    let e = dlm();
+    let geometry = Some((64 * BLK, BLK));
+
+    // (a) an uncontended ask gets its full block-aligned desired.
+    let required = (5 * MIB, 6 * MIB);
+    let desired = squeezefs::dlm::block_align_out(required, BLK);
+    assert_eq!(desired, (4 * MIB, 8 * MIB), "outward block alignment");
+    let a = d
+        .acquire_lock_range(path, required, desired, Duration::from_secs(3), geometry)
+        .await
+        .expect("uncontended required/desired acquire");
+    let (a_lease, a_span) = match a {
+        RangeAcquired::New { lease, span } => (lease, span),
+        other => panic!("first ask on a fresh file must be a NEW grant, got {other:?}"),
+    };
+    assert_eq!(
+        a_span, desired,
+        "an uncontended ask is granted its full desired window"
+    );
+
+    // (b) a FOREIGN ask whose desired overlaps the live grant is TRIMMED to
+    // its conflict-free subset — but never below required.
+    let trims_before = squeezefs::dlm::range_custody_stats().desired_trims;
+    let b = e
+        .acquire_lock_range(
+            path,
+            (9 * MIB, 10 * MIB),
+            (4 * MIB, 12 * MIB),
+            Duration::from_secs(3),
+            geometry,
+        )
+        .await
+        .expect("a foreign ask whose REQUIRED is free must grant");
+    let (b_lease, b_span) = match b {
+        RangeAcquired::New { lease, span } => (lease, span),
+        other => panic!("the foreign ask must be a NEW grant, got {other:?}"),
+    };
+    assert!(
+        b_span.0 >= 8 * MIB,
+        "desired must be trimmed off the live foreign grant [4M,8M): got {b_span:?}"
+    );
+    assert!(
+        b_span.0 <= 9 * MIB && b_span.1 >= 10 * MIB,
+        "the granted span must still cover required [9M,10M): got {b_span:?}"
+    );
+    assert!(
+        squeezefs::dlm::range_custody_stats().desired_trims > trims_before,
+        "a trimmed desired must be counted (range_custody_desired_trims)"
+    );
+
+    // (c) a foreign ask whose REQUIRED overlaps live custody REFUSES —
+    // never a silent trim of required.
+    let err = e
+        .acquire_lock_range(
+            path,
+            (7 * MIB, 9 * MIB),
+            (4 * MIB, 12 * MIB),
+            Duration::from_millis(200),
+            geometry,
+        )
+        .await
+        .expect_err("required overlapping foreign custody must refuse, never trim");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("required") || msg.contains("held") || msg.contains("conflict"),
+        "the refusal must name the conflict: {msg}"
+    );
+
+    a_lease.release().await.expect("release a");
+    b_lease.release().await.expect("release b");
+}
+
+// ---------------------------------------------------------------------------
+// 9. Admit-time coalescing (the adversarial tiny-ranges shape) — pin (b)
+// ---------------------------------------------------------------------------
+
+/// Contract 9 (charter red-first pin b): 512 byte-granular ADJACENT asks
+/// from one holder converge to ONE live span under ONE surviving token —
+/// the admit-time merge rides the existing O(n) admit, the table stays
+/// O(1), and the merged custody retires as a unit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn adversarial_tiny_adjacent_asks_coalesce_to_one_span() {
+    let _g = RANGE_SERIAL.lock().await;
+    let ino = 72_000_002u64;
+    let path = format!("inode_{ino}");
+    let d = dlm();
+    let geometry = Some((64 * BLK, BLK));
+
+    let first = d
+        .acquire_lock_range(&path, (0, 4096), (0, 4096), Duration::from_secs(3), geometry)
+        .await
+        .expect("first tiny ask");
+    let (lease, mut span, token) = match first {
+        RangeAcquired::New { lease, span } => {
+            let t = lease.fencing_token();
+            (lease, span, t)
+        }
+        other => panic!("first tiny ask must be NEW, got {other:?}"),
+    };
+
+    let mut extensions = 0u64;
+    for i in 1..512u64 {
+        let req = (i * 4096, (i + 1) * 4096);
+        match d
+            .acquire_lock_range(&path, req, req, Duration::from_secs(3), geometry)
+            .await
+            .unwrap_or_else(|e| panic!("adjacent tiny ask {i} refused: {e:?}"))
+        {
+            RangeAcquired::Extended { token: t, span: s } => {
+                assert_eq!(
+                    t, token,
+                    "an admit-time merge extends the SURVIVING grant — same token"
+                );
+                assert!(s.1 >= req.1 && s.0 == 0, "the union widens: {s:?}");
+                span = s;
+                extensions += 1;
+            }
+            other => panic!(
+                "adjacent same-holder ask {i} must COALESCE (extend), got {other:?} — \
+                 the table is filling with per-ask spans (the Issue-19 bounds failure)"
+            ),
+        }
+    }
+    assert_eq!(extensions, 511);
+    assert_eq!(span, (0, 512 * 4096), "the converged union");
+    assert_eq!(
+        squeezefs::dlm::live_range_records(ino),
+        1,
+        "512 tiny adjacent asks must converge to ONE live span (admit-time coalescing)"
+    );
+
+    // The merged custody is real custody: whole-file conflicts while held…
+    assert!(
+        d.acquire_lock(&path, None, Duration::from_millis(150))
+            .await
+            .is_err(),
+        "whole-file custody must conflict with the coalesced span"
+    );
+    // …and retires AS A UNIT with the one surviving lease.
+    lease.release().await.expect("release the merged grant");
+    assert_eq!(
+        squeezefs::dlm::live_range_records(ino),
+        0,
+        "the merged grant must retire completely with its one lease"
+    );
+    let whole = timeout(
+        Duration::from_secs(3),
+        d.acquire_lock(&path, None, Duration::from_secs(2)),
+    )
+    .await
+    .expect("whole-file acquire hung after the merged release")
+    .expect("no residue after the merged release");
+    whole.release().await.expect("release whole");
+}
+
+// ---------------------------------------------------------------------------
+// 10. The R5 byte-budget ceiling — refuse-loud naming the arithmetic (pin a)
+// ---------------------------------------------------------------------------
+
+/// Contract 10 (charter red-first pin a): a NEW-span admit past the
+/// `dlm_grant_table_bytes` R5 share refuses LOUD — the message names the
+/// live bytes, the record cost and the share (the fleet-share refusal
+/// precedent) — counted `range_custody_cap_refusals`, and the table
+/// converges by release, never by trimming required.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn at_budget_new_span_refuses_loud_naming_the_arithmetic() {
+    let _g = RANGE_SERIAL.lock().await;
+    let ino = 72_000_003u64;
+    let path = format!("inode_{ino}");
+    let d = dlm();
+    let geometry = Some((256 * BLK, BLK));
+
+    // Clamp the share to the live table + 2 records (the seam — production
+    // derives from the R5 budget).
+    let rec = squeezefs::dlm::RANGE_GRANT_RECORD_BYTES;
+    let budget = squeezefs::dlm::grant_table_bytes() + 2 * rec;
+    let prev = squeezefs::dlm::test_swap_range_table_budget(Some(budget));
+
+    let refusals_before = squeezefs::dlm::range_custody_stats().cap_refusals;
+    let mut held = Vec::new();
+    let mut refusal = None;
+    for i in 0..4u64 {
+        // Disjoint, non-adjacent spans (never coalescible): 4 KiB asks a
+        // block apart.
+        let req = (i * BLK, i * BLK + 4096);
+        match d
+            .acquire_lock_range(&path, req, req, Duration::from_millis(300), geometry)
+            .await
+        {
+            Ok(RangeAcquired::New { lease, .. }) => held.push(lease),
+            Ok(other) => panic!("non-adjacent spans cannot coalesce, got {other:?}"),
+            Err(e) => {
+                refusal = Some(format!("{e}"));
+                break;
+            }
+        }
+    }
+    let msg = refusal.expect("the at-budget new-span admit must REFUSE — it granted past the share");
+    assert!(
+        held.len() <= 2,
+        "at most 2 records fit the clamped share, {} were granted",
+        held.len()
+    );
+    assert!(
+        msg.contains("dlm_grant_table_bytes"),
+        "the refusal must name the gauge: {msg}"
+    );
+    assert!(
+        msg.contains(&rec.to_string()),
+        "the refusal must name the per-record cost ({rec} B): {msg}"
+    );
+    assert!(
+        msg.contains(&budget.to_string()),
+        "the refusal must name the share ({budget} B) — the budget arithmetic: {msg}"
+    );
+    assert!(
+        squeezefs::dlm::range_custody_stats().cap_refusals > refusals_before,
+        "the refusal must be counted (range_custody_cap_refusals)"
+    );
+    // Required was refused whole, never trimmed: nothing partial is live.
+    assert_eq!(
+        squeezefs::dlm::live_range_records(ino),
+        held.len(),
+        "a refused acquire must leave NO partial custody (never a silent trim)"
+    );
+
+    // Converge by RELEASE: retiring one grant makes the refused span
+    // admittable again.
+    if let Some(lease) = held.pop() {
+        lease.release().await.expect("release one");
+    }
+    let again = d
+        .acquire_lock_range(
+            &path,
+            (3 * BLK, 3 * BLK + 4096),
+            (3 * BLK, 3 * BLK + 4096),
+            Duration::from_millis(500),
+            geometry,
+        )
+        .await
+        .expect("the budget converges by release");
+    match again {
+        RangeAcquired::New { lease, .. } => lease.release().await.expect("release"),
+        other => panic!("expected a NEW grant post-release, got {other:?}"),
+    }
+    for lease in held {
+        lease.release().await.expect("release");
+    }
+    squeezefs::dlm::test_swap_range_table_budget(prev);
+}
+
+// ---------------------------------------------------------------------------
+// 11. The block-cyclic shape (pin c — the Issue-19 class, adjudicated now)
+// ---------------------------------------------------------------------------
+
+/// Contract 11 (charter red-first pin c): the MPI-IO block-cyclic
+/// decomposition — K holders, holder i takes blocks i, i+K, i+2K… — is the
+/// legitimate NON-coalescible shape: spans are never adjacent per holder by
+/// construction, so the table legitimately approaches one span per block.
+/// It must grant ≈ blocks-in-file with ZERO cap refusals below the byte
+/// budget — any refusal here is the Issue-19 class (a constant refusing the
+/// workload S11 exists for).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn block_cyclic_shape_grants_one_span_per_block_with_zero_refusals() {
+    let _g = RANGE_SERIAL.lock().await;
+    let ino = 72_000_004u64;
+    let path = format!("inode_{ino}");
+    const BLOCKS: u64 = 256;
+    const K: u64 = 4;
+    let geometry = Some((BLOCKS * BLK, BLK));
+
+    let refusals_before = squeezefs::dlm::range_custody_stats().cap_refusals;
+    let grants_before = squeezefs::dlm::range_custody_stats().grants;
+    let bytes_before = squeezefs::dlm::grant_table_bytes();
+
+    let mut set = tokio::task::JoinSet::new();
+    for holder in 0..K {
+        let d = dlm();
+        let path = path.clone();
+        set.spawn(async move {
+            let mut leases = Vec::new();
+            let mut block = holder;
+            while block < BLOCKS {
+                let req = (block * BLK, (block + 1) * BLK);
+                let got = d
+                    .acquire_lock_range(&path, req, req, Duration::from_secs(10), geometry)
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "block-cyclic holder {holder} block {block} REFUSED below budget \
+                             — the Issue-19 class: {e:?}"
+                        )
+                    });
+                match got {
+                    RangeAcquired::New { lease, span } => {
+                        assert_eq!(span, req, "block-aligned required == granted");
+                        leases.push(lease);
+                    }
+                    other => panic!(
+                        "holder {holder} block {block}: round-robin spans are never \
+                         adjacent per holder — nothing may coalesce, got {other:?}"
+                    ),
+                }
+                block += K;
+            }
+            leases
+        });
+    }
+    let mut all = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        all.extend(joined.expect("block-cyclic holder panicked"));
+    }
+
+    assert_eq!(all.len() as u64, BLOCKS, "grants ≈ blocks-in-file, exactly");
+    assert_eq!(
+        squeezefs::dlm::live_range_records(ino),
+        BLOCKS as usize,
+        "one live span per block (the legitimate non-coalescible population)"
+    );
+    let stats = squeezefs::dlm::range_custody_stats();
+    assert_eq!(
+        stats.cap_refusals, refusals_before,
+        "ZERO cap refusals below budget on the block-cyclic shape (Issue-19)"
+    );
+    assert_eq!(stats.grants - grants_before, BLOCKS, "grants delta accounts");
+    let span_bytes = BLOCKS * squeezefs::dlm::RANGE_GRANT_RECORD_BYTES;
+    assert!(
+        squeezefs::dlm::grant_table_bytes() >= bytes_before + span_bytes,
+        "dlm_grant_table_bytes must account ≈ spans × record bytes"
+    );
+    for lease in all {
+        lease.release().await.expect("release");
+    }
+    assert_eq!(
+        squeezefs::dlm::live_range_records(ino),
+        0,
+        "the block-cyclic population retires completely"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 12. The geometry-derived per-file span cap
+// ---------------------------------------------------------------------------
+
+/// Contract 12: the per-file cap is the file's OWN geometry —
+/// `max(16, ceil(size / block_size))` spans. On a sub-16-block file the
+/// floor (16 — transient pre-coalesce headroom) governs and the 17th
+/// non-coalescible span refuses LOUD naming the geometry; on a larger file
+/// the block count governs and the 17th span admits. No free constants.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn geometry_cap_refuses_the_seventeenth_span_on_a_small_file() {
+    let _g = RANGE_SERIAL.lock().await;
+    let d = dlm();
+
+    assert_eq!(squeezefs::dlm::range_span_cap(8 * BLK, BLK), 16, "floor");
+    assert_eq!(
+        squeezefs::dlm::range_span_cap(256 * BLK, BLK),
+        256,
+        "geometry"
+    );
+    assert_eq!(
+        squeezefs::dlm::range_span_cap(256 * BLK + 1, BLK),
+        257,
+        "ceil, never floor-divide"
+    );
+
+    // (a) an 8-block file: cap = max(16, 8) = 16.
+    let path = "inode_72000005";
+    let small = Some((8 * BLK, BLK));
+    let mut held = Vec::new();
+    for i in 0..16u64 {
+        // 4 KiB asks 8 KiB apart: disjoint, non-adjacent, never coalescible.
+        let req = (i * 8192, i * 8192 + 4096);
+        match d
+            .acquire_lock_range(path, req, req, Duration::from_secs(3), small)
+            .await
+            .unwrap_or_else(|e| panic!("span {i} of 16 refused under the floor: {e:?}"))
+        {
+            RangeAcquired::New { lease, .. } => held.push(lease),
+            other => panic!("non-adjacent spans cannot coalesce, got {other:?}"),
+        }
+    }
+    let req17 = (16 * 8192, 16 * 8192 + 4096);
+    let err = d
+        .acquire_lock_range(path, req17, req17, Duration::from_millis(300), small)
+        .await
+        .expect_err("the 17th non-coalescible span on a 16-cap file must refuse");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("16") && (msg.contains("cap") || msg.contains("geometry")),
+        "the refusal must name the geometry cap: {msg}"
+    );
+    let refusals = squeezefs::dlm::range_custody_stats().cap_refusals;
+    assert!(refusals > 0, "the cap refusal is counted");
+
+    // (b) the same 17th span on a 256-block file admits — the cap is the
+    // file's own geometry, never a constant.
+    for lease in held.drain(..) {
+        lease.release().await.expect("release");
+    }
+    let big = Some((256 * BLK, BLK));
+    for i in 0..17u64 {
+        let req = (i * 8192, i * 8192 + 4096);
+        match d
+            .acquire_lock_range(path, req, req, Duration::from_secs(3), big)
+            .await
+            .unwrap_or_else(|e| panic!("span {i} of 17 refused under a 256 cap: {e:?}"))
+        {
+            RangeAcquired::New { lease, .. } => held.push(lease),
+            other => panic!("non-adjacent spans cannot coalesce, got {other:?}"),
+        }
+    }
+    for lease in held {
+        lease.release().await.expect("release");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 8/9/16 on the WIRE: required/desired + coalescing + the client range cache
+// ---------------------------------------------------------------------------
+
+/// Contracts 8+9+16, wire face: a co-writer's `acquire_range` rides the S9
+/// custody lease — the first ask is a NEW grant (adopted locally, cached in
+/// the S8 token cache's range extension), adjacent asks EXTEND it (same
+/// grant_id, same token, widened span, ONE grant on the authority), and the
+/// client range cache serves covering probes locally.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wire_required_desired_rides_the_custody_lease_and_coalesces() {
+    let _g = RANGE_SERIAL.lock().await;
+    squeezefs::meta_ship::tokens::test_clear_range_cache();
+    let (_l, owner, endpoint) = range_authority(64 * BLK);
+    let client = range_client(&endpoint, "s11-cw-a").await;
+    let ino = 72_000_010u64;
+
+    // First ask: required is one sub-block window, desired its block.
+    let required = (MIB, 2 * MIB);
+    let desired = squeezefs::dlm::block_align_out(required, BLK);
+    let held0 = owner.held();
+    let got = client
+        .acquire_range(ino, required, desired, Duration::from_secs(3))
+        .await
+        .expect("the first wire range acquire");
+    let (lease, span0, grant_id, token) = match got {
+        RangeAcquireOutcome::New {
+            lease,
+            span,
+            grant_id,
+        } => {
+            let t = lease.fencing_token();
+            (lease, span, grant_id, t)
+        }
+        other => panic!("first ask must be NEW, got {other:?}"),
+    };
+    assert_eq!(span0, (0, BLK), "block-aligned desired granted whole");
+    assert!(lease.is_held().await, "the adopted range lease is held");
+    assert_eq!(owner.held(), held0 + 1, "one grant on the authority");
+
+    // The client range cache serves a covering probe locally (the
+    // ≥99.5%-local law's mechanism).
+    assert_eq!(
+        squeezefs::meta_ship::tokens::range_token_covering(ino, MIB, 2 * MIB),
+        Some(token),
+        "a covering probe must serve the granted token from the client cache"
+    );
+    assert_eq!(
+        squeezefs::meta_ship::tokens::range_token_covering(ino, 0, 2 * BLK),
+        None,
+        "a probe past the granted span must miss"
+    );
+
+    // Adjacent asks EXTEND the same grant: same id, same token, wider span,
+    // still ONE grant on the authority (the adversarial shape's wire face).
+    for i in 1..8u64 {
+        let req = (i * BLK, i * BLK + 4096);
+        let des = squeezefs::dlm::block_align_out(req, BLK);
+        match client
+            .acquire_range(ino, req, des, Duration::from_secs(3))
+            .await
+            .unwrap_or_else(|e| panic!("adjacent wire ask {i} refused: {e:?}"))
+        {
+            RangeAcquireOutcome::Extended {
+                token: t,
+                span,
+                grant_id: g,
+            } => {
+                assert_eq!(t, token, "the extension keeps the surviving token");
+                assert_eq!(g, grant_id, "the extension keeps the grant identity");
+                assert_eq!(span, (0, (i + 1) * BLK), "the union widens block-wise");
+            }
+            other => panic!("adjacent wire ask {i} must EXTEND, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        owner.held(),
+        held0 + 1,
+        "8 adjacent asks converge to ONE grant on the authority"
+    );
+    assert_eq!(
+        squeezefs::meta_ship::tokens::range_token_covering(ino, 0, 8 * BLK),
+        Some(token),
+        "the client cache widened with the extension"
+    );
+
+    // The widened custody classifies for W1's clause 7: the whole span is
+    // solely owned, a foreign sub-span is not shared.
+    assert!(
+        !squeezefs::dlm::span_range_shared(ino, 2 * BLK, 3 * BLK, token),
+        "the holder's widened grant covers the block — not range-shared"
+    );
+
+    lease.release().await.expect("release");
+    client.drain_releases().await;
+    assert_eq!(owner.held(), held0, "the merged grant retires as a unit");
+}
+
+/// Contract 11, wire face (rung 18's acceptance shape pinned at the wire):
+/// 2 clients take alternating blocks of one file over the wire — every
+/// block grants, zero refusals, the authority's table carries one span per
+/// block, and the two custodies never conflict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn wire_block_cyclic_shape_grants_every_block_with_zero_refusals() {
+    let _g = RANGE_SERIAL.lock().await;
+    squeezefs::meta_ship::tokens::test_clear_range_cache();
+    const BLOCKS: u64 = 32;
+    let (_l, owner, endpoint) = range_authority(BLOCKS * BLK);
+    let ino = 72_000_011u64;
+    let refusals_before = squeezefs::dlm::range_custody_stats().cap_refusals;
+
+    let a = range_client(&endpoint, "s11-cyclic-a").await;
+    let b = range_client(&endpoint, "s11-cyclic-b").await;
+    let held0 = owner.held();
+
+    let mut leases = Vec::new();
+    for block in 0..BLOCKS {
+        let client = if block % 2 == 0 { &a } else { &b };
+        let req = (block * BLK, (block + 1) * BLK);
+        match client
+            .acquire_range(ino, req, req, Duration::from_secs(5))
+            .await
+            .unwrap_or_else(|e| panic!("wire block-cyclic block {block} refused: {e:?}"))
+        {
+            RangeAcquireOutcome::New { lease, span, .. } => {
+                assert_eq!(span, req);
+                leases.push(lease);
+            }
+            other => panic!(
+                "alternating blocks are never same-holder-adjacent — got {other:?}"
+            ),
+        }
+    }
+    assert_eq!(owner.held(), held0 + BLOCKS as usize);
+    assert_eq!(
+        squeezefs::dlm::range_custody_stats().cap_refusals,
+        refusals_before,
+        "zero cap refusals below budget (Issue-19, wire face)"
+    );
+    for lease in leases {
+        lease.release().await.expect("release");
+    }
+    a.drain_releases().await;
+    b.drain_releases().await;
+    assert_eq!(owner.held(), held0, "the wire population retires");
+}
+
+/// Contract 10, wire face: the at-budget refusal TRAVELS — the co-writer's
+/// acquire fails loud with the budget arithmetic in the refusal text (never
+/// a trimmed grant), and a peer's release converges it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wire_at_budget_refusal_travels_loud_and_converges_by_release() {
+    let _g = RANGE_SERIAL.lock().await;
+    squeezefs::meta_ship::tokens::test_clear_range_cache();
+    let (_l, _owner, endpoint) = range_authority(256 * BLK);
+    let client = range_client(&endpoint, "s11-budget-cw").await;
+    let ino = 72_000_012u64;
+
+    let rec = squeezefs::dlm::RANGE_GRANT_RECORD_BYTES;
+    let budget = squeezefs::dlm::grant_table_bytes() + rec;
+    let prev = squeezefs::dlm::test_swap_range_table_budget(Some(budget));
+
+    // One span fits…
+    let req0 = (0, 4096);
+    let first = client
+        .acquire_range(ino, req0, req0, Duration::from_secs(3))
+        .await
+        .expect("one record fits the clamped share");
+    let lease = match first {
+        RangeAcquireOutcome::New { lease, .. } => lease,
+        other => panic!("expected NEW, got {other:?}"),
+    };
+    // …the second (non-coalescible) refuses with the arithmetic.
+    let req1 = (BLK, BLK + 4096);
+    let err = client
+        .acquire_range(ino, req1, req1, Duration::from_millis(500))
+        .await
+        .expect_err("the at-budget wire acquire must refuse loud");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("dlm_grant_table_bytes"),
+        "the wire refusal must carry the budget arithmetic: {msg}"
+    );
+
+    // Converge by release.
+    lease.release().await.expect("release");
+    client.drain_releases().await;
+    let again = client
+        .acquire_range(ino, req1, req1, Duration::from_secs(3))
+        .await
+        .expect("the budget converges by release, wire face");
+    if let RangeAcquireOutcome::New { lease, .. } = again {
+        lease.release().await.expect("release");
+        client.drain_releases().await;
+    }
+    squeezefs::dlm::test_swap_range_table_budget(prev);
+}
+
+// ---------------------------------------------------------------------------
+// 13/14. Pull-revocation + T_self; era fencing
+// ---------------------------------------------------------------------------
+
+/// Contract 13: revocation is PULL — a revoked holder learns at its next
+/// renewal (the custody-lease machinery verbatim): every adopted range
+/// lease reads dead, the client range cache empties, the custody generation
+/// ADVANCES (never poisons), and T_self stays strictly earlier than the
+/// owner's deadline (the S6 law the range plane composes with).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pull_revocation_retires_range_grants_and_composes_with_t_self() {
+    let _g = RANGE_SERIAL.lock().await;
+    squeezefs::meta_ship::tokens::test_clear_range_cache();
+    let (_l, owner, endpoint) = range_authority(64 * BLK);
+    let client = range_client(&endpoint, "s11-revoked-cw").await;
+    let ino = 72_000_013u64;
+
+    // T_self composition: the client's own deadline is strictly earlier
+    // than the owner's re-grant instant — the bound pull-revocation rides.
+    let owner_deadline = owner
+        .lease_deadline_ms(client.id())
+        .expect("the joined client has an owner-side deadline");
+    assert!(
+        client.t_self_deadline_ms() < owner_deadline,
+        "T_self must be strictly earlier than the owner's deadline (S6 law): \
+         {} vs {owner_deadline}",
+        client.t_self_deadline_ms()
+    );
+
+    let r1 = client
+        .acquire_range(ino, (0, BLK), (0, BLK), Duration::from_secs(3))
+        .await
+        .expect("range 1");
+    let r2 = client
+        .acquire_range(ino, (2 * BLK, 3 * BLK), (2 * BLK, 3 * BLK), Duration::from_secs(3))
+        .await
+        .expect("range 2");
+    let (l1, l2) = match (r1, r2) {
+        (
+            RangeAcquireOutcome::New { lease: l1, .. },
+            RangeAcquireOutcome::New { lease: l2, .. },
+        ) => (l1, l2),
+        other => panic!("two disjoint non-adjacent asks must be NEW grants: {other:?}"),
+    };
+    assert!(
+        squeezefs::meta_ship::tokens::range_token_covering(ino, 0, BLK).is_some(),
+        "the cache serves before the revocation"
+    );
+
+    let gen_before = squeezefs::data_custody::custody_generation();
+    let dead = owner.revoke_client(client.id(), "operator revoke (contract 13)");
+    assert_eq!(dead.len(), 1, "one dead custody cohort for the whole client");
+
+    // The pull channel: the next renewal answers "not custody".
+    client
+        .renew_all()
+        .await
+        .expect_err("a revoked lease's renewal must refuse (the pull channel)");
+    assert!(!l1.is_held().await, "revoked range lease 1 reads dead");
+    assert!(!l2.is_held().await, "revoked range lease 2 reads dead");
+    assert!(
+        squeezefs::meta_ship::tokens::range_token_covering(ino, 0, BLK).is_none(),
+        "the client range cache empties with the lease (a dead grant must \
+         never serve a covering probe)"
+    );
+    assert!(
+        squeezefs::data_custody::custody_generation() > gen_before,
+        "losing custody ADVANCES the generation (never poisons)"
+    );
+
+    // Contract 14 (era fencing): the stale lease epoch's next acquire
+    // refuses UNKNOWN_LEASE — the range plane needs no new token algebra.
+    let err = client
+        .acquire_range(ino, (BLK, 2 * BLK), (BLK, 2 * BLK), Duration::from_secs(1))
+        .await
+        .expect_err("a dead lease epoch's range acquire must refuse");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("UNKNOWN_LEASE") || msg.contains("unknown") || msg.contains("not custody"),
+        "the refusal must be the unknown-lease class: {msg}"
+    );
+}
+
+/// Contract 15: the renewal reply carries the client's live RANGE VECTOR,
+/// and the client cache REBUILDS from it — the revalidation surface that
+/// keeps a long-lived co-writer's cached spans honest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn renewal_range_vector_rebuilds_the_client_cache() {
+    let _g = RANGE_SERIAL.lock().await;
+    squeezefs::meta_ship::tokens::test_clear_range_cache();
+    let (_l, _owner, endpoint) = range_authority(64 * BLK);
+    let client = range_client(&endpoint, "s11-vector-cw").await;
+    let ino = 72_000_014u64;
+
+    let got = client
+        .acquire_range(ino, (0, BLK), (0, BLK), Duration::from_secs(3))
+        .await
+        .expect("range");
+    let (lease, token) = match got {
+        RangeAcquireOutcome::New { lease, .. } => {
+            let t = lease.fencing_token();
+            (lease, t)
+        }
+        other => panic!("expected NEW, got {other:?}"),
+    };
+
+    // Drop the client-side cache (the seam), then renew: the reply's range
+    // vector must rebuild it.
+    squeezefs::meta_ship::tokens::test_clear_range_cache();
+    assert!(
+        squeezefs::meta_ship::tokens::range_token_covering(ino, 0, BLK).is_none(),
+        "premise: the cache is cold"
+    );
+    client.renew_all().await.expect("renewal");
+    assert_eq!(
+        squeezefs::meta_ship::tokens::range_token_covering(ino, 0, BLK),
+        Some(token),
+        "the renewal's range vector must rebuild the client cache"
+    );
+    lease.release().await.expect("release");
+    client.drain_releases().await;
+    // A released grant leaves the vector at the NEXT renewal.
+    client.renew_all().await.expect("renewal after release");
+    assert!(
+        squeezefs::meta_ship::tokens::range_token_covering(ino, 0, BLK).is_none(),
+        "a released grant must leave the revalidated cache"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 17/18. Dark posture + R5 registration
+// ---------------------------------------------------------------------------
+
+/// Contract 17: `SQUEEZEFS_RANGE_CUSTODY` is a registered ENG-10 knob
+/// (Kind::Bool, static default on) and is read ONLY when the mw plane is
+/// armed — on this unarmed process the lever answers false even when
+/// forced on (the `delegation_enabled` law), which is what keeps every
+/// shipped mount's whole-file path structurally untouched (KD-MW-12).
+#[tokio::test]
+async fn range_custody_lever_is_registered_and_inert_unarmed() {
+    let knob = squeezefs::env_knobs::lookup("SQUEEZEFS_RANGE_CUSTODY")
+        .expect("SQUEEZEFS_RANGE_CUSTODY must be a registered knob (ENG-10)");
+    assert!(
+        matches!(knob.kind, squeezefs::env_knobs::Kind::Bool),
+        "the lever is Kind::Bool"
+    );
+    assert_eq!(knob.default, "on", "static default on (design §11)");
+
+    // Unarmed: false, even forced (read only when the mw plane is armed).
+    assert!(
+        !squeezefs::data_grant::range_custody_enabled(),
+        "an unarmed process's range-custody lever answers false"
+    );
+    let prev = squeezefs::data_grant::TEST_RANGE_CUSTODY_OVERRIDE
+        .swap(1, std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        !squeezefs::data_grant::range_custody_enabled(),
+        "forced ON while unarmed stays inert — the knob is read only past \
+         the armed gate (announced-inert, never a refusal)"
+    );
+    squeezefs::data_grant::TEST_RANGE_CUSTODY_OVERRIDE
+        .store(prev, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Contract 18: the §9.2 R5 pair is REGISTERED — `dlm_grant_table_bytes`
+/// (authority-side custody records) and `dlm_token_cache_bytes`
+/// (client-side token + range-span state) are both `MEM_BUDGET`
+/// components, floor 0 (custody admission refuses instead of shedding;
+/// the cache re-earns instead of answering wrong).
+#[tokio::test]
+async fn r5_registers_the_grant_table_and_token_cache_components() {
+    squeezefs::dlm::ensure_grant_table_r5();
+    squeezefs::meta_ship::tokens::ensure_token_cache_r5();
+    let comps = squeezefs::mem_budget::MEM_BUDGET.stats_components();
+    let names: Vec<&str> = comps.iter().map(|(n, ..)| *n).collect();
+    assert!(
+        names.contains(&"dlm_grant_table_bytes"),
+        "dlm_grant_table_bytes must be an R5 component (§9.2): {names:?}"
+    );
+    assert!(
+        names.contains(&"dlm_token_cache_bytes"),
+        "dlm_token_cache_bytes must be an R5 component (§9.2): {names:?}"
+    );
+    for (name, _cur, floor, ..) in comps {
+        if name == "dlm_grant_table_bytes" || name == "dlm_token_cache_bytes" {
+            assert_eq!(floor, 0, "{name}: floor 0 — nothing here may pin RAM");
+        }
+    }
 }

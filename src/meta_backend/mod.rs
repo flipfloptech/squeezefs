@@ -1297,6 +1297,33 @@ impl RoutedMetaBackend {
         self.find_dentry_routed(v_idx, local_parent, name).await
     }
 
+    /// The trait `getattr`'s LOCAL body, hook-free (rung 12): the S10
+    /// delegated serve reads the holder's OWN reader-revalidation view
+    /// through this — the trait verb would consult the daemon verb
+    /// router and, on an armed co-writer, route straight back into the
+    /// delegated serve (the live-rig recursion the first fleet mount
+    /// found: `fuse3-tpc` lane stack overflow). Same guard discipline as
+    /// the trait body verbatim.
+    pub async fn getattr_local(&self, ino: Ino) -> Result<Inode> {
+        let (v_idx, local_ino) = self.route_ino(ino);
+        self.check_volume_enabled(v_idx)?;
+        let _guard = self.volumes[v_idx].dlm().lock_inode_shared(local_ino).await;
+        let mut inode = self.read_inode_routed(v_idx, local_ino).await?;
+        inode.ino = ino;
+        Ok(inode)
+    }
+
+    /// The trait `readdir`'s LOCAL body, hook-free (the [`Self::getattr_local`]
+    /// twin — the delegated serve's dentry page read).
+    pub async fn readdir_local(&self, dir: Ino, offset: u64, max: usize) -> Result<Vec<DirEntry>> {
+        let (v_idx, local_dir) = self.route_ino(dir);
+        self.check_volume_enabled(v_idx)?;
+        let _guard = self.volumes[v_idx].dlm().lock_inode_shared(local_dir).await;
+        // `offset` is a readdir cookie; pages resume strictly after its
+        // key suffix (design §5.1).
+        self.volumes[v_idx].readdir(local_dir, offset, max).await
+    }
+
     /// One cookie-paged readdir step against `dir`'s volume (design
     /// §5.1): pages of at most `max` `(resume_cookie, entry)` pairs, each
     /// entry paired with its resume cookie
@@ -2461,12 +2488,7 @@ impl Metadata for RoutedMetaBackend {
         if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[dir]) {
             return r.readdir(dir, offset, max).await;
         }
-        let (v_idx, local_dir) = self.route_ino(dir);
-        self.check_volume_enabled(v_idx)?;
-        let _guard = self.volumes[v_idx].dlm().lock_inode_shared(local_dir).await;
-        // `offset` is a readdir cookie; pages resume strictly after its
-        // key suffix (design §5.1).
-        self.volumes[v_idx].readdir(local_dir, offset, max).await
+        self.readdir_local(dir, offset, max).await
     }
 
     // Takes a SHARED 4a lease internally — see the trait-level doc note
@@ -2475,12 +2497,7 @@ impl Metadata for RoutedMetaBackend {
         if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino]) {
             return r.getattr(ino).await;
         }
-        let (v_idx, local_ino) = self.route_ino(ino);
-        self.check_volume_enabled(v_idx)?;
-        let _guard = self.volumes[v_idx].dlm().lock_inode_shared(local_ino).await;
-        let mut inode = self.read_inode_routed(v_idx, local_ino).await?;
-        inode.ino = ino;
-        Ok(inode)
+        self.getattr_local(ino).await
     }
 
     async fn setattr(

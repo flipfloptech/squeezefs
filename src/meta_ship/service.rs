@@ -745,7 +745,7 @@ impl MetaShipService {
                 tokens::note_deleg_decline();
                 continue;
             }
-            let inode = match self.inner.getattr(ino).await {
+            let inode = match self.inner.getattr_local(ino).await {
                 Ok(i) => i,
                 Err(_) => {
                     lane.surrender(ino, client_id);
@@ -1295,7 +1295,7 @@ impl MetaShipService {
                 lane.surrender(ino, &frame.client_id);
                 continue;
             }
-            let inode = match self.inner.getattr(ino).await {
+            let inode = match self.inner.getattr_local(ino).await {
                 Ok(i) => i,
                 Err(_) => {
                     lane.surrender(ino, &frame.client_id);

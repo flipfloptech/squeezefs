@@ -959,7 +959,11 @@ impl MetaShipRouter {
         if !pg.dir() {
             return DelegLookup::Miss;
         }
-        let Ok(pi) = self.inner.getattr(parent).await else {
+        // `getattr_local`, NEVER the trait verb: on an armed co-writer the
+        // trait body consults the daemon verb router, which routes right
+        // back into this serve — the live-rig recursion (rung-12 finding
+        // #1, a fuse3 lane stack overflow on the first fleet mount).
+        let Ok(pi) = self.inner.getattr_local(parent).await else {
             return DelegLookup::Miss;
         };
         if !pg.stamp_matches(&pi) {
@@ -970,7 +974,7 @@ impl MetaShipRouter {
                 let Some(cg) = tokens::deleg_serve_begin(child, endpoint) else {
                     return DelegLookup::Miss;
                 };
-                let Ok(ci) = self.inner.getattr(child).await else {
+                let Ok(ci) = self.inner.getattr_local(child).await else {
                     return DelegLookup::Miss;
                 };
                 if !cg.stamp_matches(&ci) {
@@ -988,9 +992,10 @@ impl MetaShipRouter {
     }
 
     /// The delegated `getattr` serve: the stamp-check read IS the answer.
+    /// (`getattr_local` — see `deleg_lookup` on the recursion law.)
     async fn deleg_getattr(&self, endpoint: &str, ino: Ino) -> Option<Inode> {
         let g = tokens::deleg_serve_begin(ino, endpoint)?;
-        let i = self.inner.getattr(ino).await.ok()?;
+        let i = self.inner.getattr_local(ino).await.ok()?;
         if !g.stamp_matches(&i) {
             return None;
         }
@@ -1010,11 +1015,11 @@ impl MetaShipRouter {
         if !g.dir() {
             return None;
         }
-        let i = self.inner.getattr(dir).await.ok()?;
+        let i = self.inner.getattr_local(dir).await.ok()?;
         if !g.stamp_matches(&i) {
             return None;
         }
-        let entries = self.inner.readdir(dir, offset, max).await.ok()?;
+        let entries = self.inner.readdir_local(dir, offset, max).await.ok()?;
         g.note_hit();
         Some(entries)
     }

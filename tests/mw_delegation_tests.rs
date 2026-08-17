@@ -72,6 +72,7 @@ struct ArmGuard;
 
 impl Drop for ArmGuard {
     fn drop(&mut self) {
+        ship::uninstall_daemon_verb_router();
         ship::uninstall_delegation_host();
         ship::disarm_ownership();
         ship::TEST_DELEGATION_OVERRIDE.store(0, Ordering::SeqCst);
@@ -174,6 +175,13 @@ async fn fixture() -> Fixture {
     ship::TEST_DELEGATION_OVERRIDE.store(1, Ordering::SeqCst);
 
     let router = MetaShipRouter::new(Arc::clone(&client_be), "node_cafe.m0001", SECRET.to_vec());
+    // The LIVE co-writer shape (rung-12 finding #1's repro): the daemon
+    // verb router is INSTALLED, so the holder's own backend trait verbs
+    // route through the ship plane exactly as a mounted co-writer's do.
+    // Pre-fix, every delegated serve recursed through this hook into
+    // itself (the fleet's fuse3-lane stack overflow); the fix reads the
+    // local view through the hook-free `getattr_local`/`readdir_local`.
+    ship::install_daemon_verb_router(Arc::clone(&router));
     Fixture {
         _dir: dir,
         owner_be,

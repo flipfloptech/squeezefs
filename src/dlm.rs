@@ -1300,6 +1300,23 @@ impl LocalLockManager {
                             return RangeMint::HeldDemotion;
                         }
                         if custody.required_overlaps_licensed(required, scope) {
+                            // Convergence inside a demoted region: a
+                            // stream's licensed asks must EXTEND the
+                            // holder's own record (byte overlap with the
+                            // demoted peers is licensed — nobody DMAs
+                            // there), or the §9.2 geometry cap would
+                            // refuse the very interleave the demotion
+                            // exists to serve.
+                            if let Some((token, span)) = custody.own_adjacent_grant(required, scope)
+                            {
+                                let widened = custody.widen_grant(token, span);
+                                debug_assert!(widened, "plan and apply share one critical section");
+                                RANGE_EXTENSIONS.fetch_add(1, Ordering::Relaxed);
+                                if required != desired {
+                                    RANGE_DESIRED_TRIMS.fetch_add(1, Ordering::Relaxed);
+                                }
+                                return RangeMint::Extended { token, span };
+                            }
                             return admit_new(custody, required, required != desired);
                         }
                         RangeMint::Held
@@ -1307,6 +1324,14 @@ impl LocalLockManager {
                     RangePlan::BridgeRefused => RangeMint::Bridge,
                     RangePlan::Covered { token, span } => RangeMint::Covered { token, span },
                     RangePlan::Extend { token, span } => {
+                        // Rung 17: a widening that would NEWLY share a
+                        // block with a live foreign grant is the same
+                        // demotion shape as a fresh admit — barrier it
+                        // (shares already inside demoted regions are
+                        // licensed and excluded by the probe).
+                        if barrier(custody, span) {
+                            return RangeMint::HeldDemotion;
+                        }
                         // The merge rides the admit: widen in place, keep
                         // the token, mint nothing, add no record — so the
                         // caps structurally cannot refuse a coalescing ask.

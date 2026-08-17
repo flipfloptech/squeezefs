@@ -716,6 +716,24 @@ impl FileCustody {
         true
     }
 
+    /// The holder's own EX grant overlapping or abutting `required`, as
+    /// `(token, union span)` — the licensed-coexistence admit's merge
+    /// target (within a demoted region a stream must still converge to
+    /// O(1) records, or the §9.2 geometry cap refuses the workload the
+    /// demotion exists to serve).
+    pub fn own_adjacent_grant(&self, required: (u64, u64), scope: u64) -> Option<(u64, (u64, u64))> {
+        self.ranges
+            .iter()
+            .filter(|g| g.owner_nonce == scope && g.mode == LockMode::Exclusive)
+            .find(|g| g.end >= required.0 && g.start <= required.1)
+            .map(|g| {
+                (
+                    g.token,
+                    (g.start.min(required.0), g.end.max(required.1)),
+                )
+            })
+    }
+
     /// Mark one demotion pending. `true` = a NEW record (the ledger's
     /// `range_custody_demotions` increment); an existing same-incumbent
     /// overlapping record widens instead (idempotent re-asks from a

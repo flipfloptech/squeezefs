@@ -1484,6 +1484,122 @@ async fn shipped_merges_chain_onto_the_head_and_never_clobber_a_peer() {
     shutdown(&client_be).await;
 }
 
+/// Contract (the s11-range leg's second conviction, found live on the
+/// rung's own from-zero pass — C8 drift 8742 with clean bytes): TWO
+/// same-ino chained merges landing in ONE aggregated conveyor pass, the
+/// second at the CHAIN CAP, must never take the owner-compaction arm
+/// against the COMMITTED fold — that full `Put` erases the earlier
+/// member's just-staged entries from the layout while their ledger refs
+/// land (the C8 mint: "1 durable record vs 0 layout references"). The
+/// law: compaction only when the ino has no earlier member in THIS pass;
+/// a batch-prior ino stays on the chained delta past the cap (the next
+/// pass compacts).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_prior_ino_never_compacts_over_its_own_pass_mates() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let (owner_be, _p) = sandbox(dir.path(), "own", true).await;
+    let (client_be, _p2) = sandbox(dir.path(), "cli", false).await;
+    let auth = start_authority(Arc::clone(&owner_be), "assembler-authority");
+    let (client, pc) = arm_client(&auth, &client_be).await;
+    let epoch = client.lease_epoch();
+    let ino = shipped_create(&client_be, "batchmate.bin").await;
+    let base = base_layout_bytes(4 * BLOCK, &[]);
+    publish::set_layout_and_size(&client_be, ino, &base, 4 * BLOCK, &[])
+        .await
+        .expect("the base Put lands");
+
+    // Drive the durable chain to ONE BELOW the cap: cap = 2, one staged
+    // link — the leg's mid-stream shape.
+    squeezefs::routing::set_layout_delta_chain_override(Some(2));
+    let r = pc
+        .ship(
+            &auth.endpoint,
+            publish::PublishCall::MergeLayoutAndSize {
+                ino,
+                delta: delta(
+                    4 * BLOCK,
+                    &[(0, "be://data:pre0")],
+                    Some((0, squeezefs::dlm::mint_layout_version())),
+                )
+                .encode(),
+                full_layout: base_layout_bytes(4 * BLOCK, &[(0, "be://data:pre0")]),
+                size: 4 * BLOCK,
+                refs: Vec::new(),
+                lease_epoch: epoch,
+                request_id: 0xD0,
+            },
+        )
+        .await
+        .expect("pre-cap link lands");
+    assert!(matches!(r, publish::PublishReply::DeltaUsed { used: true, .. }));
+
+    // Two members of ONE pass for this ino, from TWO clients (two wire
+    // lanes — the leg's two co-writers; one client's lane mutex would
+    // serialize them into separate passes). The conveyor hold seam makes
+    // the single-pass accumulation deterministic. Mate 1 stages the
+    // cap-th delta; mate 2's batch-head read sits AT the cap — pre-fix
+    // it took the owner-compaction arm against the COMMITTED fold and
+    // ERASED mate 1's just-staged entry (the leg's C8 mint: ledger ref
+    // landed, layout entry gone).
+    let pc2 = publish::PublishClient::new("node-assembler-b2", SECRET.to_vec());
+    squeezefs::meta_backend::kv::backend::TEST_LAYOUT_MERGE_HOLD_MS.store(150, Ordering::Relaxed);
+    let (r1, r2) = tokio::join!(
+        pc.ship(
+            &auth.endpoint,
+            publish::PublishCall::MergeLayoutAndSize {
+                ino,
+                delta: delta(
+                    4 * BLOCK,
+                    &[(2, "be://data:mate2")],
+                    Some((0, squeezefs::dlm::mint_layout_version())),
+                )
+                .encode(),
+                full_layout: base_layout_bytes(4 * BLOCK, &[(2, "be://data:mate2")]),
+                size: 4 * BLOCK,
+                refs: Vec::new(),
+                lease_epoch: epoch,
+                request_id: 0xD8,
+            },
+        ),
+        pc2.ship(
+            &auth.endpoint,
+            publish::PublishCall::MergeLayoutAndSize {
+                ino,
+                delta: delta(
+                    4 * BLOCK,
+                    &[(3, "be://data:mate3")],
+                    Some((0, squeezefs::dlm::mint_layout_version())),
+                )
+                .encode(),
+                full_layout: base_layout_bytes(4 * BLOCK, &[(3, "be://data:mate3")]),
+                size: 4 * BLOCK,
+                refs: Vec::new(),
+                lease_epoch: epoch,
+                request_id: 0xD9,
+            },
+        ),
+    );
+    squeezefs::meta_backend::kv::backend::TEST_LAYOUT_MERGE_HOLD_MS.store(0, Ordering::Relaxed);
+    squeezefs::routing::set_layout_delta_chain_override(None);
+    r1.expect("pass mate 1 lands");
+    r2.expect("pass mate 2 lands");
+
+    // The composition: EVERY entry survives — the pre-cap link AND both
+    // pass mates (pre-fix one mate's entry was erased by the other's
+    // committed-fold compaction Put).
+    let final_layout = owner_layout(&owner_be, ino).await;
+    let map = final_layout.block_map.expect("striped map");
+    assert_eq!(map.get(&0).map(String::as_str), Some("be://data:pre0"));
+    assert_eq!(map.get(&2).map(String::as_str), Some("be://data:mate2"));
+    assert_eq!(map.get(&3).map(String::as_str), Some("be://data:mate3"));
+
+    auth.listener.shutdown();
+    shutdown(&owner_be).await;
+    shutdown(&client_be).await;
+}
+
 /// Contract (solo untouched): the LOCAL publish path keeps the §6.2-item-9
 /// version gate byte-identical — a divergent NONZERO claim from the local
 /// path still refuses loud; the chained composition is the SHIPPED arm's

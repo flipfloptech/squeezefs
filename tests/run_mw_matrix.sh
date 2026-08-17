@@ -3389,20 +3389,16 @@ PYS11
     [ "$admitted" = "1" ] || die "s11-range: victim m$m1 could not re-admit by remount within the grace ladder"
     log "victim m$m1 re-admitted by remount"
 
-    # ==== THE COMPOSITION GATE (STANDING RED until rung 17) ==================
-    # The merged two-writer layout read cold + the C8 oracle. Rung 15's
-    # custody plane is proven GREEN above; this block is the CONCURRENT
-    # same-ino layout-publish COMPOSITION — the machinery
-    # design-mw-layout-versions §6 assigns to the S9 publish surface,
-    # adjudicated at rung 16 as WHOLLY rung 17's
-    # (.benchmarks/2026-08-17-s11-b4-clause.md: the race is per-INO
-    # layout-base — the delta-chain/full-save base under two publishers;
-    # bit 15 DETECTS — C8 drift — but detection is not composition, and
-    # the rung-16 B4 clause is a per-BLOCK fast-path screen, orthogonal
-    # by construction). Rung-15 adjudication
-    # (.benchmarks/2026-08-17-s11-range-wire.md): the lever ships
-    # default-OFF, this leg is the composition rung's acceptance surface,
-    # and this gate flipping green is rung 17's live acceptance.
+    # ==== THE COMPOSITION GATE (GREEN since rung 17) ==========================
+    # The merged two-writer layout read cold + the C8 oracle. Standing
+    # RED from rung 15 (adjudicated to rung 17 at rung 16); rung 17's
+    # authority-assembler machinery FLIPPED it: shipped layout merges
+    # CHAIN ONTO THE DURABLE HEAD (owner-restamped claim + owner-minted
+    # link version, the versioned DeltaUsed reply — publish schema 6),
+    # the chain-cap full save stands down for chained targets (the OWNER
+    # compacts from its own folded state), so two co-writers' publishes
+    # of ONE ino compose instead of racing the delta-chain/full-save
+    # base. A red here is a REGRESSION (see the die text below).
     local comp_bad=""
     "$MWFLEET" unmount 0 >/dev/null 2>&1 || true
     "$MWFLEET" mount 0 >/dev/null 2>&1 || die "s11-range: authority remount failed"
@@ -3450,10 +3446,200 @@ PYS11
 
     if [ -n "$comp_bad" ]; then
         die "s11-range COMPOSITION GATE RED (custody half GREEN — engagement/Issue-19/kill-arm/rung-16-clause columns all passed; zero residue): $comp_bad.
-This is the STANDING-RED half (the G-RW2 pattern, live-leg form): concurrent same-ino layout publishes race the delta-chain/full-save base — design-mw-layout-versions §6's named residual, owned by PR row 17 (the authority assembler / WriteExtent publish surface; rung 16 adjudicated the slice — the B4 §5.1 range clause is a per-BLOCK fast-path screen and cannot close a per-INO publish race). Bit 15 + C8 DETECT it (which is this red's instrument); rung 17's landing flips this exact gate green. Adjudications: .benchmarks/2026-08-17-s11-range-wire.md + .benchmarks/2026-08-17-s11-b4-clause.md"
+Rung 17 FLIPPED this gate green (the authority assembler / chain-onto-head shipped merges — .benchmarks/2026-08-17-s11-authority-assembler.md; the standing-red lineage: .benchmarks/2026-08-17-s11-range-wire.md + .benchmarks/2026-08-17-s11-b4-clause.md), so a red here is a REGRESSION of the concurrent same-ino publish composition: check meta_ship_publish.{stale_refusals,replays}, the chain-onto-head arm (KvMetaBackend::merge_layout_and_size_chained), and the C8 oracle's drift attribution."
     fi
     log "s11-range GREEN — the first sub-file multi-writer rows, composition included (snapshots + fsck in $rowdir). Evidence tier: measured-simulated (one box, co-located members)"
 }
+# Rung 17 (KD-MW-8, §9.5's "sub-block exception row" — PRICED, never
+# gating): TWO co-writers stream 4 KiB records into the two halves of ONE
+# 4 MiB block. The second holder's first ask fires the DEMOTION BARRIER
+# (grant withheld until the incumbent's renewal-carried notice is acked);
+# the block then belongs to the AUTHORITY's assembler and BOTH holders'
+# writes ship as WriteExtent records (the symmetric law). Price columns:
+# extent ship rate, the authority daemon's merge CPU (utime+stime delta
+# per served extent), retention residency (→ 0 at quiesce). The full
+# 4K-ALTERNATING anti-shape (non-adjacent slots) meets the §9.2 geometry
+# cap by design — the split-halves interleave is the coalescible face;
+# the alternating face is rung 18's bounds row.
+leg_s11_subblock() {
+    require_cowriters 2
+    [ "${RANGE_CUSTODY:-0}" = "1" ] ||
+        die "s11-subblock needs a range-custody-ARMED fleet: sudo SQZ_MWFLEET_RANGE_CUSTODY=1 tests/mw_fleet.sh create N=1 --cowriters=2"
+    local rowdir cws m1 m2 idx w_mnt
+    rowdir="$STATE/rows/s11sb-$(date +%s)"
+    mkdir -p "$rowdir"
+    mapfile -t cws < <(cowriter_idxs)
+    m1="${cws[0]}"
+    m2="${cws[1]}"
+    w_mnt="$(mnt_of 0)"
+    local rec=4096 half=$((2 * 1024 * 1024))
+    log "s11-subblock: ONE 8MiB striped file; m$m1 streams ${rec}B records over [0,2M), m$m2 over [2M,4M) — sub-block sharing of block 0, the demotion barrier's live venue"
+
+    truncate -s $((8 * 1024 * 1024)) "$w_mnt/s11-subblock.dat" ||
+        die "s11-subblock: authority could not create the shared file"
+    local m0_pid
+    m0_pid="$(daemon_pid_for_mnt "$w_mnt")"
+    [ -n "$m0_pid" ] || die "s11-subblock: no authority daemon pid"
+    cpu_of() { awk '{print $14 + $15}' "/proc/$1/stat"; }
+
+    write_half() { # mnt start_off pattern_byte -> wall_secs (stdout)
+        python3 - "$1/s11-subblock.dat" "$2" "$3" "$rec" "$half" <<'PYW'
+import os, sys, time
+path, start, pat, rec, half = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
+fd = os.open(path, os.O_WRONLY)
+buf = bytes([pat]) * rec
+t0 = time.monotonic()
+off = start
+while off < start + half:
+    os.pwrite(fd, buf, off)
+    off += rec
+os.fsync(fd)
+print(f"{time.monotonic() - t0:.3f}")
+os.close(fd)
+PYW
+    }
+
+    for idx in $(member_idxs); do snap "$idx" 0 "$rowdir"; done
+    local cpu0 cpu1 t_m1a t_m2 t_m1b
+    cpu0="$(cpu_of "$m0_pid")"
+
+    # Phase A: m1's half, PRE-demotion (sole block custody — the baseline
+    # cost of the same stream on the un-demoted path).
+    t_m1a="$(write_half "$(mnt_of "$m1")" 0 17)" ||
+        die "s11-subblock: m$m1's pre-demotion stream failed"
+    log "phase A (m$m1 pre-demotion, local path): ${t_m1a}s for $((half / rec)) records"
+
+    # Phase B: m2's half — the FIRST ask fires the demotion barrier
+    # (renewal-carried notice → m1's quiesce+ack → grant), then every
+    # record ships as an extent. TIMED = barrier + extent-ship cost.
+    for idx in $(member_idxs); do snap "$idx" 1 "$rowdir"; done
+    t_m2="$(write_half "$(mnt_of "$m2")" "$half" 34)" ||
+        die "s11-subblock: m$m2's post-demotion stream failed"
+    log "phase B (m$m2 through the demotion + extent ship): ${t_m2}s for $((half / rec)) records"
+
+    # Phase C: m1 REWRITES its half — now demoted, so the INCUMBENT ships
+    # too (KD-MW-8's symmetric law).
+    for idx in $(member_idxs); do snap "$idx" 2 "$rowdir"; done
+    t_m1b="$(write_half "$(mnt_of "$m1")" 0 51)" ||
+        die "s11-subblock: m$m1's post-demotion stream failed"
+    cpu1="$(cpu_of "$m0_pid")"
+    log "phase C (m$m1 post-demotion — the incumbent ships): ${t_m1b}s for $((half / rec)) records"
+    for idx in $(member_idxs); do snap "$idx" 3 "$rowdir"; done
+
+    # ---- Engagement + the demotion ledger, gated -----------------------------
+    python3 - "$rowdir" "$m1" "$m2" $((half / rec)) <<'PYSB' || die "s11-subblock: INVALID ROW"
+import json, sys
+rowdir, m1, m2, recs = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+def flat(d, out=None, pfx=""):
+    out = {} if out is None else out
+    for k, v in d.items():
+        if isinstance(v, dict): flat(v, out, pfx + k + ".")
+        else: out[pfx + k] = v
+    return out
+def load(i, ph):
+    return flat(json.load(open(f"{rowdir}/m{i}_p{ph}.json")))
+bad = []
+d = lambda i, a, b, k: int(load(i, b).get(k, 0) or 0) - int(load(i, a).get(k, 0) or 0)
+m2_ship = d(m2, 1, 3, "meta_ship_publish.extent_shipped")
+m1_ship = d(m1, 2, 3, "meta_ship_publish.extent_shipped")
+served = d("0", 0, 3, "meta_ship_publish.extent_served")
+flushes = d("0", 0, 3, "meta_ship_publish.extent_flush_forces") \
+    + d(m1, 0, 3, "meta_ship_publish.extent_flush_forces") \
+    + d(m2, 0, 3, "meta_ship_publish.extent_flush_forces")
+dem = d("0", 0, 3, "range_custody.range_custody_demotions")
+acks = d("0", 0, 3, "range_custody.range_custody_demotion_acks")
+fres = d("0", 0, 3, "range_custody.range_custody_demotion_fence_resolves")
+fpub = d("0", 0, 3, "range_custody.range_custody_demotion_fenced_publishes")
+prs = d("0", 0, 3, "patch_ineligible_range_shared")
+ors = d("0", 0, 3, "overlay_ineligible_range_shared")
+ret_end = int(load(m1, 3).get("meta_ship_publish.extent_retained_bytes", 0) or 0) \
+    + int(load(m2, 3).get("meta_ship_publish.extent_retained_bytes", 0) or 0)
+print("== S11 rung-17 sub-block row (PRICED, never gating) ==")
+print(f"m{m2} extent_shipped d={m2_ship} (phase B)  m{m1} d={m1_ship} (phase C)  "
+      f"authority served d={served}  flush_forces={flushes}")
+print(f"demotions d={dem} acks d={acks} fence_resolves d={fres} fenced_publishes d={fpub}")
+print(f"authority clause ledgers: patch_ineligible_range_shared d={prs} "
+      f"overlay_ineligible_range_shared d={ors}")
+print(f"retained_bytes at quiesce: {ret_end}")
+if m2_ship < recs:
+    bad.append(f"m{m2}: extent_shipped d={m2_ship} < {recs} — phase B's records did not ship "
+               "(silent local landing = the row is a lie)")
+if m1_ship < recs:
+    bad.append(f"m{m1}: extent_shipped d={m1_ship} < {recs} — the INCUMBENT's post-demotion "
+               "writes must ship too (KD-MW-8's symmetric law)")
+if served < m2_ship + m1_ship:
+    bad.append(f"authority: extent_served d={served} < shipped {m2_ship + m1_ship} — "
+               "shipped ≡ served is the engagement law")
+if dem < 1: bad.append("no demotion fired — the barrier venue did not engage")
+if dem != acks + fres:
+    bad.append(f"demotion ledger does not close: {dem} != {acks} + {fres}")
+if fres != 0:
+    bad.append(f"fence_resolves={fres} on a healthy row (the clean path is acks)")
+if fpub != 0:
+    bad.append(f"range_custody_demotion_fenced_publishes={fpub} (must stay 0 on the clean path)")
+if prs < 1 or ors < 1:
+    bad.append(f"the rung-16 clause ledgers did not move on the authority's assembly "
+               f"(prs={prs}, ors={ors}) — the demotion row is their live firing venue")
+if ret_end != 0:
+    bad.append(f"extent_retained_bytes={ret_end} after fsync — retention did not release "
+               "(the covering-version law broke)")
+if bad:
+    print("S11 SUB-BLOCK GATE FAILED:", file=sys.stderr)
+    for b in bad: print(f"  {b}", file=sys.stderr)
+    sys.exit(1)
+print("S11 sub-block engagement GREEN (both holders shipped, ledger closed, clauses fired, retention quiesced)")
+PYSB
+
+    # ---- The price table ------------------------------------------------------
+    local cpu_d recs_total
+    cpu_d=$((cpu1 - cpu0))
+    recs_total=$((3 * half / rec))
+    log "PRICE (measured-simulated, tcp devsub, ${rec}B records, $((half / rec)) records/phase):"
+    log "  phase A (pre-demotion local): ${t_m1a}s   phase B (demotion + ship): ${t_m2}s   phase C (incumbent ships): ${t_m1b}s"
+    log "  authority daemon CPU over the row: $cpu_d ticks ($(python3 -c "print(f'{$cpu_d/100:.2f}')")s) for $recs_total records total"
+    log "  authority merge CPU/extent: $(python3 -c "print(f'{$cpu_d * 10_000 / (2 * $half / $rec):.0f}')") µs (phases B+C extents only, upper bound — includes serve+fold+publish)"
+
+    # ---- Cold verify + oracle -------------------------------------------------
+    local comp_bad=""
+    "$MWFLEET" unmount 0 >/dev/null 2>&1 || true
+    "$MWFLEET" mount 0 >/dev/null 2>&1 || die "s11-subblock: authority remount failed"
+    python3 - "$w_mnt/s11-subblock.dat" "$half" <<'PYV' || comp_bad="cold-authority byte verify failed"
+import sys
+path, half = sys.argv[1], int(sys.argv[2])
+data = open(path, "rb").read()
+assert len(data) == 8 * 1024 * 1024, f"size {len(data)}"
+assert data[:half] == bytes([51]) * half, "m1's phase-C half diverged"
+assert data[half:2*half] == bytes([34]) * half, "m2's half diverged"
+assert data[2*half:] == bytes(len(data) - 2*half), "the untouched tail diverged"
+PYV
+    local out drift
+    if out="$("$SQZ" fsck "$w_mnt" 2>&1)"; then
+        echo "$out" >"$rowdir/fsck.out"
+        echo "$out" | grep -q "findings: 0" || comp_bad="${comp_bad:+$comp_bad; }fsck findings != 0"
+    else
+        echo "$out" >"$rowdir/fsck.out"
+        comp_bad="${comp_bad:+$comp_bad; }fsck FAILED"
+    fi
+    drift="$(stat_field 0 meta_kv_block_refs_drift)"
+    [ "$drift" = "0" ] || comp_bad="${comp_bad:+$comp_bad; }meta_kv_block_refs_drift=$drift (C8)"
+    for idx in "$m1" "$m2"; do
+        "$MWFLEET" unmount "$idx" >/dev/null 2>&1 || true
+        local admitted=0 tries
+        for ((tries = 0; tries < 15; tries++)); do
+            if "$MWFLEET" mount "$idx" >/dev/null 2>&1; then admitted=1; break; fi
+            sleep 10
+        done
+        [ "$admitted" = "1" ] || die "s11-subblock: co-writer m$idx could not re-admit after the cold-verify remount"
+    done
+    rm -f "$w_mnt/s11-subblock.dat" || die "s11-subblock: could not remove the leg's file"
+    for idx in $(member_idxs); do
+        cat "$(mnt_of "$idx")/.stats" >/dev/null 2>&1 ||
+            die "s11-subblock: member m$idx is not healthy at leg end"
+    done
+    [ -z "$comp_bad" ] || die "s11-subblock CORRECTNESS RED: $comp_bad"
+    log "s11-subblock GREEN — the sub-block exception row priced (snapshots + fsck in $rowdir). Evidence tier: measured-simulated (one box, co-located members)"
+}
+
 leg_s10c_fsck_scale() {
     local rowdir members
     rowdir="$STATE/rows/s10c-fsck-scale-$(date +%s)"
@@ -4329,6 +4515,7 @@ s9-fanout) leg_s9_fanout ;;
 s9-failover) leg_s9_failover ;;
 s9-colocated-fence) leg_s9_colocated_fence ;;
 s11-range) leg_s11_range ;;
+s11-subblock) leg_s11_subblock ;;
 s10c-fsck-scale) leg_s10c_fsck_scale ;;
 s10c-kill-shard) leg_s10c_kill_shard ;;
 s10-delegation) leg_s10_delegation ;;
@@ -4338,5 +4525,5 @@ s10-placement-tarx) leg_s10_placement_tarx ;;
 cowriters-admission) leg_cowriters_admission ;;
 vm-hostscope-validate) leg_vm_hostscope_validate ;;
 vm-multi-identity) leg_vm_multi_identity ;;
-*) die "unknown leg '$LEG' (smoke|multipath-negative|s6-journal|s6-fence|s6-vm-fence|s7-device-fence|s7-kill-matrix|s8-serial-ab|s8-crucible|s9-fanout|s9-failover|s9-colocated-fence|s11-range|s10c-fsck-scale|s10c-kill-shard|s10-delegation|s10-intents|s10-intents-tarx|s10-placement-tarx|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
+*) die "unknown leg '$LEG' (smoke|multipath-negative|s6-journal|s6-fence|s6-vm-fence|s7-device-fence|s7-kill-matrix|s8-serial-ab|s8-crucible|s9-fanout|s9-failover|s9-colocated-fence|s11-range|s11-subblock|s10c-fsck-scale|s10c-kill-shard|s10-delegation|s10-intents|s10-intents-tarx|s10-placement-tarx|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
 esac

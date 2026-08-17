@@ -7345,6 +7345,26 @@ impl KvMetaBackend {
                             // the folded durable layout + this delta as
                             // one full Put computed from the AUTHORITY's
                             // state.
+                            //
+                            // ONE exception, found live by the rung's own
+                            // from-zero leg (C8 drift 8742, clean bytes):
+                            // an ino with a BATCH-PRIOR member in THIS
+                            // pass must never take the compaction arm —
+                            // `xattrs.lookup` folds the COMMITTED state,
+                            // so the full Put would erase the pass mate's
+                            // just-staged entries while their ledger refs
+                            // land (the exact "1 durable record vs 0
+                            // layout references" mint). A batch-prior ino
+                            // stays on the chained delta past the cap;
+                            // the NEXT pass compacts. Pinned red-first by
+                            // `a_batch_prior_ino_never_compacts_over_its_
+                            // own_pass_mates`.
+                            if !use_delta
+                                && batch_heads.contains_key(&op.ino)
+                                && self.layout_deltas_ready().await
+                            {
+                                use_delta = true;
+                            }
                             let minted = if use_delta {
                                 crate::dlm::mint_layout_version()
                             } else {

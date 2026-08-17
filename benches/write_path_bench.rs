@@ -25,6 +25,12 @@
 //!   `SQUEEZEFS_PUBLISH_COALESCE_MAX` default) and the fold-side
 //!   `apply` (delta onto a 1,024-block base — a 4 GiB file at 4 MiB
 //!   blocks).
+//! * block-map string-encoding bracket (2026-08-17 sizing campaign,
+//!   `.benchmarks/2026-08-17-block-map-encoding-bracket.md`): the
+//!   string mapping forms vs a BENCH-ONLY packed prototype — encode
+//!   rows extend `write_layout_publish`; parse + composed warm-lookup
+//!   rows are `block_map_encoding` (field-shape citations in that
+//!   group's doc).
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use squeezefs::cache::active_block::ActiveBlockBuf;
@@ -456,6 +462,67 @@ fn bench_admission_gate(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Block-map string-encoding bracket (2026-08-17) — BENCH-ONLY packed
+// prototype. SIZING exercise under the 2026-08-01 ruling (displacement
+// requires counted measurement, never suspicion): block mappings are
+// STRINGS in the metadata plane (`CachedMetadata.block_map:
+// Arc<HashMap<u32, String>>`; `persist_block_key` emits bare decimal
+// offsets for the default backend — the overwhelming field population —
+// plus `be://offset`, decorated `bk:off:len`, and the bit-13
+// `offset@base36` forms; `DataRouter::parse_block_mapping`,
+// src/routing.rs:5442, parses them at use sites). This prototype is the
+// hypothetical fixed-width binary form the bracket prices AGAINST the
+// strings — it lives in bench code ONLY and must never migrate into the
+// tree without the format-change rung the evidence note
+// (`.benchmarks/2026-08-17-block-map-encoding-bracket.md`) would have to
+// justify with these numbers.
+// ---------------------------------------------------------------------------
+
+/// Wire bytes per packed record: `offset u64 | incarnation u64 |
+/// rel_off u32 | len u32 | be_slot u16 | form u8 | reserved u8`.
+const PACKED_ENTRY_BYTES: usize = 28;
+
+/// The packed prototype: everything every string form can carry, at fixed
+/// offsets. `form` is the discriminant (0 = bare, 1 = named backend,
+/// 2 = decorated, 3 = stamped); `len == 0` means whole-block
+/// (`exact == false` in `parse_block_mapping` terms); `incarnation == 0`
+/// is `INCARNATION_NONE` (every field key today — ruling D9 stamps
+/// nothing).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct PackedMapping {
+    offset: u64,
+    incarnation: u64,
+    rel_off: u32,
+    len: u32,
+    be_slot: u16,
+    form: u8,
+}
+
+fn packed_encode_into(buf: &mut Vec<u8>, m: &PackedMapping) {
+    buf.extend_from_slice(&m.offset.to_le_bytes());
+    buf.extend_from_slice(&m.incarnation.to_le_bytes());
+    buf.extend_from_slice(&m.rel_off.to_le_bytes());
+    buf.extend_from_slice(&m.len.to_le_bytes());
+    buf.extend_from_slice(&m.be_slot.to_le_bytes());
+    buf.push(m.form);
+    buf.push(0);
+}
+
+/// The packed decode the bracket prices against the string parse: six
+/// fixed-offset little-endian reads (the `#[repr(C)]`-ish struct read).
+fn packed_decode(rec: &[u8]) -> PackedMapping {
+    debug_assert_eq!(rec.len(), PACKED_ENTRY_BYTES);
+    PackedMapping {
+        offset: u64::from_le_bytes(rec[0..8].try_into().expect("fixed")),
+        incarnation: u64::from_le_bytes(rec[8..16].try_into().expect("fixed")),
+        rel_off: u32::from_le_bytes(rec[16..20].try_into().expect("fixed")),
+        len: u32::from_le_bytes(rec[20..24].try_into().expect("fixed")),
+        be_slot: u16::from_le_bytes(rec[24..26].try_into().expect("fixed")),
+        form: rec[26],
+    }
+}
+
 fn bench_layout_publish(c: &mut Criterion) {
     let mut group = c.benchmark_group("write_layout_publish");
 
@@ -606,6 +673,379 @@ fn bench_layout_publish(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(base_bytes.len() as u64));
     group.bench_function("delta_apply_64_on_1024_base", |b| {
         b.iter(|| black_box(delta.apply(black_box(&base_bytes)).expect("apply")));
+    });
+
+    // ---- Block-map string-encoding bracket (2026-08-17): the ENCODE
+    // face. Same shapes as above (full-save-1024 / delta-64 — extend,
+    // don't fork a second spelling), priced against the bench-only
+    // `PackedMapping` prototype, plus the FIELD-form string delta: the
+    // group's standing `sqz:vol-…` keys (~30 B) are a historical shape —
+    // `persist_block_key` emits the bare decimal offset for the default
+    // backend (the overwhelming population, e.g. an 11-digit offset on a
+    // multi-GiB volume), so the bytes verdict needs both string rows.
+    // Field shapes: delta-64 = the `SQUEEZEFS_PUBLISH_COALESCE_MAX`
+    // window (`.benchmarks/2026-07-30-write-commit-economy.md`);
+    // full-save-1024 = a 4 GiB file's inline map at 4 MiB blocks.
+    let field_entries: Vec<(u32, String)> = (1024..1088u32)
+        .map(|b| (b, ((b as u64) * (4 << 20)).to_string()))
+        .collect();
+    let field_delta = LayoutDelta::from_final_state(
+        "striped",
+        (4 << 30) + (64 << 22),
+        Some("bm-00aa11bb"),
+        Some("sqz:vol-00aa11bb"),
+        None,
+        None,
+        field_entries,
+    );
+    let field_delta_bytes = field_delta.encode();
+    group.throughput(Throughput::Bytes(field_delta_bytes.len() as u64));
+    group.bench_function("delta_encode_64_entries_field_bare_keys", |b| {
+        b.iter(|| black_box(field_delta.encode()));
+    });
+
+    let packed_rec = |b: u32| PackedMapping {
+        offset: (b as u64) * (4 << 20),
+        incarnation: 0, // INCARNATION_NONE — every field key today (D9)
+        rel_off: 0,
+        len: 0, // whole-block (exact == false)
+        be_slot: 0,
+        form: 0,
+    };
+    // Packed full save: the whole 1,024-entry map as `block u32 | record`.
+    let packed_full_bytes = 1024 * (4 + PACKED_ENTRY_BYTES);
+    group.throughput(Throughput::Bytes(packed_full_bytes as u64));
+    group.bench_function("packed_full_save_encode_1024", |b| {
+        b.iter(|| {
+            let mut buf = Vec::with_capacity(packed_full_bytes);
+            for blk in 0..1024u32 {
+                buf.extend_from_slice(&blk.to_le_bytes());
+                packed_encode_into(&mut buf, &packed_rec(blk));
+            }
+            black_box(buf)
+        });
+    });
+    // Packed delta-64: encode + decode of the same coalesce window.
+    let packed_delta_bytes = 64 * (4 + PACKED_ENTRY_BYTES);
+    let packed_delta_img: Vec<u8> = {
+        let mut buf = Vec::with_capacity(packed_delta_bytes);
+        for blk in 1024..1088u32 {
+            buf.extend_from_slice(&blk.to_le_bytes());
+            packed_encode_into(&mut buf, &packed_rec(blk));
+        }
+        buf
+    };
+    group.throughput(Throughput::Bytes(packed_delta_bytes as u64));
+    group.bench_function("packed_delta_encode_64_entries", |b| {
+        b.iter(|| {
+            let mut buf = Vec::with_capacity(packed_delta_bytes);
+            for blk in 1024..1088u32 {
+                buf.extend_from_slice(&blk.to_le_bytes());
+                packed_encode_into(&mut buf, &packed_rec(blk));
+            }
+            black_box(buf)
+        });
+    });
+    group.bench_function("packed_delta_decode_64_entries", |b| {
+        b.iter(|| {
+            let img = black_box(&packed_delta_img);
+            let mut sum = 0u64;
+            for rec in img.chunks_exact(4 + PACKED_ENTRY_BYTES) {
+                let blk = u32::from_le_bytes(rec[0..4].try_into().expect("fixed"));
+                let m = packed_decode(&rec[4..]);
+                sum = sum.wrapping_add(blk as u64).wrapping_add(m.offset);
+            }
+            black_box(sum)
+        });
+    });
+
+    // The BYTES table — deterministic, printed once (the `[key bytes]`
+    // precedent): marginal wire bytes per map entry, string vs packed.
+    let empty_delta = LayoutDelta::from_final_state(
+        "striped",
+        (4 << 30) + (64 << 22),
+        Some("bm-00aa11bb"),
+        Some("sqz:vol-00aa11bb"),
+        None,
+        None,
+        Vec::new(),
+    );
+    let empty_len = empty_delta.encode().len();
+    println!(
+        "  [bmap bytes] delta-64 marginal B/entry: string bench-keys {} | string field bare-decimal {} | packed {} (fixed); full-save-1024 total: string {} B | packed {} B",
+        (delta_bytes.len() - empty_len) / 64,
+        (field_delta_bytes.len() - empty_len) / 64,
+        4 + PACKED_ENTRY_BYTES,
+        base_bytes.len(),
+        packed_full_bytes,
+    );
+
+    group.finish();
+}
+
+/// **Block-map string-encoding bracket — the PARSE + warm-lookup face**
+/// (2026-08-17 sizing campaign; encode face extends
+/// `write_layout_publish` above). The question: is the string round-trip
+/// on block mappings a real cost, and would the packed binary form pay
+/// for an on-disk format change? Per the 2026-08-01 ruling, displacement
+/// requires counted measurement — this group is the counted half.
+///
+/// The string parse under test is `DataRouter::parse_block_mapping`
+/// (src/routing.rs:5442). It is deliberately private, so
+/// `parse_block_mapping_mirror` below reproduces its body VERBATIM
+/// (damaged-marker choke point, `://` split, `split(':').collect()`,
+/// 3-part `format!` + integer parses, `parse_block_offset` base
+/// resolution) over the same pub `BackendRouter` machinery — a bench-only
+/// mirror because this campaign's law is zero production changes. If the
+/// production body changes, re-pin this mirror against routing.rs before
+/// trusting a row.
+///
+/// FIELD population weighting (why the mix row is shaped as it is):
+/// * **bare decimal (`"4194304"`) is the overwhelming population** —
+///   `persist_block_key` emits it for every default-slot block, and the
+///   write-commit-economy streaming rows publish 2,048/2,048 whole-block
+///   striped entries (`.benchmarks/2026-07-30-write-commit-economy.md`);
+/// * `be://offset` — multi-volume sets only (VL3+);
+/// * decorated `bk:off:len` — promoted staged / spill / clip publishes,
+///   the W1-INELIGIBLE minority (`patch_ineligible_decorated`);
+/// * `offset@base36` — incompat bit 13, which NOTHING stamps today
+///   (ruling D9): priced as the upgrade's cost, weight zero in the mix.
+///
+/// The composed warm-lookup rows put the parse where it actually runs:
+/// `CachedMetadata.block_map` is `Arc<HashMap<u32, String>>`, so a warm
+/// serve's key resolution is one u32-keyed map get + one string parse —
+/// vs the hypothetical `HashMap<u32, PackedMapping>` get. The
+/// string-hash-vs-u64 term is NOT in scope: the map key is already u32
+/// on both sides.
+///
+/// End-to-end anchors for the proportion verdict (the evidence note's
+/// job): `read_serve_phase_ns.key_resolve` sits in the "rest ≤ 0.01 ms"
+/// tail of the 10.50 ms qd8 read op
+/// (`.benchmarks/2026-08-01-serve-decomposition.md` §3.1), and the
+/// publish side's whole `apply/save_encode` phase is 0.026 ms of the
+/// 4.796 ms/block saturated publish
+/// (`.benchmarks/2026-08-01-rewrite-publish-drain.md` §3).
+fn bench_block_map_encoding(c: &mut Criterion) {
+    use squeezefs::block_allocator::BlockAllocator;
+    use squeezefs::nvme_dev::NvmeBlockDev;
+    use squeezefs::routing::BackendRouter;
+    use squeezefs::routing::{compose_incarnation, encode_incarnation, is_damaged_mapping};
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+    use tokio::runtime::Runtime;
+
+    /// VERBATIM mirror of `DataRouter::parse_block_mapping`
+    /// (src/routing.rs:5442) minus the `&self` plumbing: `default_size`
+    /// stands in for the router's `block_size` Acquire load (performed by
+    /// the caller row, same cost class), and errors panic because every
+    /// bench form is healthy by construction.
+    fn parse_block_mapping_mirror(
+        router: &BackendRouter,
+        default_size: usize,
+        mapping_str: &str,
+    ) -> (u64, u64, usize, bool) {
+        if is_damaged_mapping(mapping_str) {
+            unreachable!("bench forms are healthy");
+        }
+        let (prefix, rest) = match mapping_str.find("://") {
+            Some(pos) => mapping_str.split_at(pos + 3),
+            None => ("", mapping_str),
+        };
+        let parts: Vec<&str> = rest.split(':').collect();
+        if parts.len() == 3 {
+            let bk = router
+                .parse_block_offset(&format!("{prefix}{}", parts[0]))
+                .expect("decorated base");
+            let off = parts[1].parse::<u64>().unwrap_or(0);
+            match parts[2].parse::<usize>() {
+                Ok(sz) => (bk, off, sz, true),
+                Err(_) => (bk, off, default_size, false),
+            }
+        } else {
+            let bk = router
+                .parse_block_offset(mapping_str)
+                .expect("bare/named base");
+            (bk, 0, default_size, false)
+        }
+    }
+
+    let rt = Runtime::new().expect("bench runtime");
+    let backing = tempfile::NamedTempFile::new().expect("backing");
+    let router = rt.block_on(async {
+        let alloc = Arc::new(
+            BlockAllocator::new("bench_bmap_encoding")
+                .await
+                .expect("allocator"),
+        );
+        let dev = Arc::new(NvmeBlockDev::new(backing.path().to_str().expect("path")));
+        BackendRouter::new(alloc, dev, Arc::new(AtomicU64::new(BLOCK as u64)))
+    });
+
+    let mut group = c.benchmark_group("block_map_encoding");
+    group.throughput(Throughput::Elements(1));
+
+    // The four string forms. Offsets are FIELD-realistic 11-digit values
+    // (a multi-GiB volume's block offsets), except the comparability row
+    // `parse_string_bare_decimal_4m`, which reuses the `write_block_key`
+    // group's `4194304` so the two groups can be read against each other.
+    let bare = format!("{}", 511u64 * (4 << 20) * 23); // 11-digit decimal
+    let named = format!("vol-00aa11bb://{bare}");
+    let decorated = format!("{bare}:0:4194304");
+    let stamped = format!(
+        "{bare}@{}",
+        encode_incarnation(compose_incarnation(7, 4_242).expect("stamp"))
+    );
+
+    group.bench_function("parse_string_bare_decimal_4m", |b| {
+        b.iter(|| {
+            black_box(parse_block_mapping_mirror(
+                &router,
+                BLOCK,
+                black_box("4194304"),
+            ))
+        })
+    });
+    group.bench_function("parse_string_bare_decimal_11digit", |b| {
+        b.iter(|| black_box(parse_block_mapping_mirror(&router, BLOCK, black_box(&bare))))
+    });
+    group.bench_function("parse_string_named_backend", |b| {
+        b.iter(|| {
+            black_box(parse_block_mapping_mirror(
+                &router,
+                BLOCK,
+                black_box(&named),
+            ))
+        })
+    });
+    group.bench_function("parse_string_decorated_3part", |b| {
+        b.iter(|| {
+            black_box(parse_block_mapping_mirror(
+                &router,
+                BLOCK,
+                black_box(&decorated),
+            ))
+        })
+    });
+    group.bench_function("parse_string_stamped_base36", |b| {
+        b.iter(|| {
+            black_box(parse_block_mapping_mirror(
+                &router,
+                BLOCK,
+                black_box(&stamped),
+            ))
+        })
+    });
+
+    // The packed decode: six fixed-offset LE reads from the 28-B record.
+    let packed_img: Vec<u8> = {
+        let mut buf = Vec::with_capacity(PACKED_ENTRY_BYTES);
+        packed_encode_into(
+            &mut buf,
+            &PackedMapping {
+                offset: 511u64 * (4 << 20) * 23,
+                incarnation: 0,
+                rel_off: 0,
+                len: 0,
+                be_slot: 0,
+                form: 0,
+            },
+        );
+        buf
+    };
+    group.bench_function("packed_decode_28b", |b| {
+        b.iter(|| black_box(packed_decode(black_box(&packed_img))))
+    });
+
+    // Field-mix sweep, 1,024 mappings: 1,008 bare (the dominant
+    // population) + 8 named + 8 decorated — the weighting rationale is in
+    // the group doc. The packed twin decodes 1,024 records.
+    let mix: Vec<String> = (0..1024u32)
+        .map(|i| {
+            let off = (i as u64) * (4 << 20) + (48u64 << 30);
+            match i % 128 {
+                126 => format!("vol-00aa11bb://{off}"),
+                127 => format!("{off}:0:4194304"),
+                _ => off.to_string(),
+            }
+        })
+        .collect();
+    group.throughput(Throughput::Elements(1024));
+    group.bench_function("parse_string_field_mix_1024", |b| {
+        b.iter(|| {
+            let mut acc = 0u64;
+            for m in black_box(&mix) {
+                acc = acc.wrapping_add(parse_block_mapping_mirror(&router, BLOCK, m).0);
+            }
+            black_box(acc)
+        })
+    });
+    let packed_mix: Vec<u8> = {
+        let mut buf = Vec::with_capacity(1024 * PACKED_ENTRY_BYTES);
+        for i in 0..1024u32 {
+            packed_encode_into(
+                &mut buf,
+                &PackedMapping {
+                    offset: (i as u64) * (4 << 20) + (48u64 << 30),
+                    incarnation: 0,
+                    rel_off: 0,
+                    len: if i % 128 == 127 { 4194304 } else { 0 },
+                    be_slot: u16::from(i % 128 == 126),
+                    form: (i % 128 == 126) as u8 + 2 * (i % 128 == 127) as u8,
+                },
+            );
+        }
+        buf
+    };
+    group.bench_function("packed_decode_mix_1024", |b| {
+        b.iter(|| {
+            let mut acc = 0u64;
+            for rec in black_box(&packed_mix).chunks_exact(PACKED_ENTRY_BYTES) {
+                acc = acc.wrapping_add(packed_decode(rec).offset);
+            }
+            black_box(acc)
+        })
+    });
+
+    // Composed warm-lookup: the shape the serve path actually runs —
+    // `Arc<HashMap<u32, String>>` get + parse vs `HashMap<u32,
+    // PackedMapping>` get. 1,024-entry maps (a 4 GiB file at 4 MiB
+    // blocks), rotating index so the get is not a single hot bucket.
+    let string_map: Arc<HashMap<u32, String>> = Arc::new(
+        (0..1024u32)
+            .map(|b| (b, ((b as u64) * (4 << 20) + (48u64 << 30)).to_string()))
+            .collect(),
+    );
+    let packed_map: HashMap<u32, PackedMapping> = (0..1024u32)
+        .map(|b| {
+            (
+                b,
+                PackedMapping {
+                    offset: (b as u64) * (4 << 20) + (48u64 << 30),
+                    incarnation: 0,
+                    rel_off: 0,
+                    len: 0,
+                    be_slot: 0,
+                    form: 0,
+                },
+            )
+        })
+        .collect();
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("warm_lookup_string_get_parse_1024map", |b| {
+        let mut i = 0u32;
+        b.iter(|| {
+            i = (i + 1) & 1023;
+            let m = string_map.get(black_box(&i)).expect("mapped");
+            black_box(parse_block_mapping_mirror(&router, BLOCK, m))
+        })
+    });
+    group.bench_function("warm_lookup_packed_get_1024map", |b| {
+        let mut i = 0u32;
+        b.iter(|| {
+            i = (i + 1) & 1023;
+            let m = packed_map.get(black_box(&i)).expect("mapped");
+            black_box(m.offset)
+        })
     });
 
     group.finish();
@@ -1850,6 +2290,7 @@ criterion_group!(
     bench_detached_guard,
     bench_admission_gate,
     bench_layout_publish,
+    bench_block_map_encoding,
     bench_block_key_codec,
     bench_indirect_map_codec,
     bench_flush_coalescing

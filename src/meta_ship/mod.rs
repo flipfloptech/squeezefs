@@ -120,8 +120,11 @@ pub use owners::{
 pub use router::{MetaShipRouter, VerbRoute, TEST_SHIP_DRAIN_HOLD_MS};
 pub use service::{owner_authority_token, MetaShipService, ServiceStats};
 pub use tokens::{
-    cache_cap, foreign_fencing_token, record_grant, test_clear_token_cache, token_cache_stats,
-    TokenCacheStats,
+    cache_cap, foreign_fencing_token, global_recall_lane, recall_batch_max_from,
+    recall_cooldown_from, recall_deadline_from, recall_rate_cap_per_s, recall_stats_json,
+    record_grant, revoke_phase_json, test_clear_token_cache, token_cache_stats, GrantDecision,
+    RecallConfig, RecallFrame, RecallLane, RecallLaneStats, TimedOutRecall, TokenCacheStats,
+    RECALL_THRASH_CYCLES,
 };
 pub use wire::*;
 
@@ -376,6 +379,22 @@ pub fn phase_json() -> serde_json::Value {
         phases.insert((*name).to_string(), SHIP_PROF[i].to_json());
     }
     serde_json::Value::Object(phases)
+}
+
+/// The recall lane's LIVE deadline evidence (spec R3's law: derive from
+/// the live p99, never a constant): the shipped-verb round trip
+/// (`meta_ship_phase_ns.rtt` p99) plus the owner-side frame service
+/// (`meta_ship_owner_phase_ns.total` p99) — the two terms a recall's
+/// drain-and-ack must traverse. `None` when neither table has a sample
+/// (an unarmed mount; the derivation then falls back to the lease-TTL
+/// fence bound).
+pub(crate) fn live_recall_evidence_us() -> Option<u64> {
+    let rtt = SHIP_PROF[ShipPhase::Rtt as usize].p99_micros();
+    let owner = OWNER_PROF[OwnerPhase::Total as usize].p99_micros();
+    match (rtt, owner) {
+        (None, None) => None,
+        (a, b) => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
+    }
 }
 
 /// Owner-side phases of one shipped frame (`meta_ship_owner_phase_ns`).

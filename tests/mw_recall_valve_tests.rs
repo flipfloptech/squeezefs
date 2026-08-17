@@ -63,9 +63,7 @@ fn cfg() -> RecallConfig {
 
 fn clients(n: usize) -> Vec<String> {
     // KD-MW-2 identity grammar: (node token, mount slot) pairs.
-    (0..n)
-        .map(|i| format!("node_{i:016x}.m00000001"))
-        .collect()
+    (0..n).map(|i| format!("node_{i:016x}.m00000001")).collect()
 }
 
 /// One storm round: every client grabs the hot object, then a conflicting
@@ -174,7 +172,11 @@ fn spec_r5_the_valve_demotes_the_hot_object_and_the_recall_volume_flattens() {
         before,
         "recall volume is FLAT once demoted — the R5 verdict"
     );
-    assert_eq!(lane.stats().demoted_objects, 1, "the gauge names the demotion");
+    assert_eq!(
+        lane.stats().demoted_objects,
+        1,
+        "the gauge names the demotion"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -274,7 +276,11 @@ fn recalls_batch_one_frame_carries_many_recalls_under_the_rate_cap() {
     );
 
     // Drain: ack → next frame, until done. Frames << recalls.
-    lane.ack_frame(&first[0].client, first[0].frame_id, t0 + Duration::from_millis(2));
+    lane.ack_frame(
+        &first[0].client,
+        first[0].frame_id,
+        t0 + Duration::from_millis(2),
+    );
     let mut now = t0 + Duration::from_millis(3);
     loop {
         let frames = lane.issue_pass(now);
@@ -363,7 +369,11 @@ fn an_unacked_recall_dies_at_the_deadline_and_the_object_is_grantable_again() {
     // And the timed-out client is not wedged: its lane accepts new frames.
     lane.recall_object(ino, t0 + c.deadline + Duration::from_millis(2));
     let next = lane.issue_pass(t0 + c.deadline + Duration::from_millis(3));
-    assert_eq!(next.len(), 1, "the in-flight slot was cleared by the expiry");
+    assert_eq!(
+        next.len(),
+        1,
+        "the in-flight slot was cleared by the expiry"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -539,7 +549,11 @@ fn derivations_tie_to_their_inputs_and_explicit_levers_win_verbatim() {
         16_384,
         "the live wire cap derives the shipped batch"
     );
-    assert_eq!(recall_batch_max_from(Some(8), 1024 * 1024), 8, "explicit wins");
+    assert_eq!(
+        recall_batch_max_from(Some(8), 1024 * 1024),
+        8,
+        "explicit wins"
+    );
     assert_eq!(recall_batch_max_from(None, 64), 1, "floor: never a 0 batch");
 
     // deadline: no live evidence ⇒ the lease TTL (the fence bound is the
@@ -606,7 +620,6 @@ fn latency_histogram_p99_serves_the_deadline_derivation() {
     use squeezefs::fuse_client::LatencyHistogram;
     let h = LatencyHistogram::default();
     assert_eq!(h.p99_micros(), None, "an empty histogram derives nothing");
-    // 99 fast samples + 1 slow: p99 lands on the slow bucket's bound.
     for _ in 0..99 {
         h.record(Duration::from_micros(100));
     }
@@ -615,11 +628,22 @@ fn latency_histogram_p99_serves_the_deadline_derivation() {
         Some(128),
         "single-population p99 = its own bucket bound (≤128 µs)"
     );
+    // Nearest-rank law: a 1-in-100 outlier sits at rank 100, ABOVE the
+    // p99 rank (ceil(0.99 × 100) = 99) — the p99 stays in the fast bucket
+    // (the deadline's ×4 margin is what absorbs sub-1 % tails) …
+    h.record(Duration::from_millis(4));
+    assert_eq!(
+        h.p99_micros(),
+        Some(128),
+        "a sub-1 % tail never moves the p99 (nearest-rank)"
+    );
+    // … while a ≥1 % tail DOES move it into the tail bucket.
+    h.record(Duration::from_millis(4));
     h.record(Duration::from_millis(4));
     assert_eq!(
         h.p99_micros(),
         Some(4096),
-        "the 1-in-100 tail sample IS the p99 bucket"
+        "a ≥1 % tail is the p99 bucket (rank 101 of 102 lands in ≤4 ms)"
     );
 }
 

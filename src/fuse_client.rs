@@ -4080,6 +4080,38 @@ impl LatencyHistogram {
         }
         serde_json::Value::Object(map)
     }
+
+    /// The p99 bucket bound, µs (`None` on an empty histogram) — the live
+    /// evidence the S10 recall deadline derives from (spec R3's law).
+    ///
+    /// Bucket-quantized by construction: the answer is the UPPER bound of
+    /// the bucket where the 99th-percentile sample falls (≤1 µs ⇒ 1, then
+    /// `2^i` µs, the `>16s` tail answering one octave above its floor), so
+    /// a read is up to 2× coarse — every consumer's margin must absorb
+    /// that, which is exactly what the recall deadline's ×4 headroom
+    /// documents.
+    pub fn p99_micros(&self) -> Option<u64> {
+        const N: usize = crate::latency_core::LATENCY_BUCKETS;
+        let counts: [u64; N] = std::array::from_fn(|i| self.buckets[i].load(Ordering::Relaxed));
+        let total: u64 = counts.iter().sum();
+        if total == 0 {
+            return None;
+        }
+        // Rank of the p99 sample: ceil(0.99 × total), in integer form.
+        let rank = total - total / 100;
+        let mut seen = 0u64;
+        for (i, c) in counts.iter().enumerate() {
+            seen += c;
+            if seen >= rank {
+                return Some(match i {
+                    0 => 1,
+                    i if i == N - 1 => 32_000_000, // the >16s tail: one octave above its floor
+                    _ => 1u64 << i,
+                });
+            }
+        }
+        unreachable!("seen reaches total, total >= rank")
+    }
 }
 
 pub struct QueueDepthHistogram {
@@ -9831,6 +9863,23 @@ impl SqueezefsFilesystem {
                 "meta_ship": crate::meta_ship::stats_json(),
                 "meta_ship_phase_ns": crate::meta_ship::phase_json(),
                 "meta_ship_owner_phase_ns": crate::meta_ship::owner_phase_json(),
+                // DLM S10 rung 11 (design-full-multi-writer PR row 11;
+                // spec R5): the RECALL LANE + THRASH VALVE, landed BEFORE
+                // delegation grants exist ("brake before engine"). Every
+                // field is 0 on every shipped mount BY CONSTRUCTION —
+                // nothing grants delegations yet; rows 12–14 inherit the
+                // instrument. `dlm_recall.dlm_revokes_{issued,acked,
+                // timed_out}` is the PUSH-model recall lane's face of the
+                // spec §6.9 family; `dlm_custody.dlm_revokes_{issued,
+                // expired}` stays the S9 custody plane's PULL-model face
+                // (no ack channel, expiry terminal) — same spelling,
+                // scoped by their objects, never a fork.
+                // `dlm_recall.dlm_thrash_demotions` is spec R5's valve-
+                // engagement instrument; the derived caps/deadline are
+                // published as gauges so the operator page can never
+                // drift from the arithmetic in force.
+                "dlm_recall": crate::meta_ship::recall_stats_json(),
+                "dlm_revoke_phase_ns": crate::meta_ship::revoke_phase_json(),
                 // DLM S9 (spec §6.9 S9): the remote write-custody plane and
                 // the daemon's publish path on the wire. `dlm_custody.mode`
                 // is `off` on every single-writer mount and every other

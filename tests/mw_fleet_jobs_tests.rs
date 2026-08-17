@@ -46,6 +46,7 @@ use squeezefs::job_wire::{
 use squeezefs::jobs::{FleetDispatch, JobFabric, JobType};
 use squeezefs::mem_budget::Level;
 use squeezefs::membership::{LeaseClock, LeaseClocks};
+use squeezefs::meta_backend::Metadata as _;
 use squeezefs::nvme_dev::NvmeBlockDev;
 use squeezefs::routing::DataRouter;
 use squeezefs::{DataVolumeRecord, FormatConfig};
@@ -898,6 +899,71 @@ async fn red_member_abandons_promptly_and_the_shard_re_leases() {
     host.shutdown().await;
     let report = m1.await.expect("worker joins");
     assert_eq!(report.shards_aborted, 1, "the member counted its refusal");
+    fab.shutdown_abrupt().await;
+    fx.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// The persisted report survives the fleet's mapping identities
+// ---------------------------------------------------------------------------
+
+/// Repro-port of the rig-found persist failure: the fleet's shard
+/// reports carry the mapping-identity `partial` census (merge-input
+/// data), and a 512-block corpus's REPORT blew the 64 KiB xattr cap —
+/// so NOTHING persisted and the CLI read "no report". The persisted
+/// `job:{id}:report` must exist, decode, and carry NO partial census
+/// (findings + counters are the record).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fsck_job_report_persists_without_the_partial_census() {
+    let _serial = serial().await;
+    let dir = tempfile::tempdir().unwrap();
+    let meta = make_file(dir.path(), "meta", 256 * 1024 * 1024);
+    let oss1 = make_file(dir.path(), "oss1", 4 << 30);
+    format_meta(&meta, &[&oss1]).await;
+    let recs = base_format_config(&[&oss1]).resolved_data_volumes();
+    let fx = open_fixture(&meta, &recs).await;
+    seed_tree(&fx, 4).await;
+
+    let mover = squeezefs::jobs::MoverCtx::router_only(fx.fs.router.clone());
+    let fab = JobFabric::start(fx.meta.clone(), 1, 100, Some(mover))
+        .await
+        .expect("fabric start");
+    let job_id = fab
+        .submit(squeezefs::jobs::JobSpec {
+            job_type: JobType::Fsck {
+                scrub: false,
+                scrub_only: false,
+                repair: false,
+                apply: false,
+                quarantine_dir: None,
+            },
+            throttle_pct: 100,
+        })
+        .await
+        .expect("submit fsck job");
+    let state = fab
+        .wait_terminal(&job_id, Duration::from_secs(60))
+        .await
+        .expect("job reaches terminal state");
+    assert_eq!(state, squeezefs::jobs::JobState::Completed);
+
+    let raw = fx
+        .meta
+        .getxattr(1, &format!("job:{job_id}:report"))
+        .await
+        .expect("meta read")
+        .expect("the report xattr persists (the rig-found regression)");
+    let report: squeezefs::fsck::FsckReport =
+        serde_json::from_slice(&raw).expect("the persisted report decodes");
+    assert!(
+        report.partial.is_none(),
+        "the partial census is merge-input data and never persists"
+    );
+    // This pin's subject is the PERSIST, not cleanliness: the fabric
+    // path stamps expected_generation, and the fixture's tempdir
+    // staging carries no marker, so a C5 finding here is fixture-shape
+    // (the healthy-volume findings-0 law is the other pins' business).
+    assert!(report.counters.inodes_scanned > 0);
     fab.shutdown_abrupt().await;
     fx.close().await;
 }

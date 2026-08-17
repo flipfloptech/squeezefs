@@ -1849,6 +1849,15 @@ impl JobFabric {
                 let name = format!("{JOB_XATTR_PREFIX}{job_id}:report");
                 let cap = self.meta.xattr_value_cap(ROOT_INO).saturating_sub(1024);
                 let mut to_store = report.clone();
+                // KD-MW-16: the partial census is MERGE-INPUT data (the
+                // shard union's refs + mapping identities) — meaningless
+                // in the persisted artifact and, with the rung-10c
+                // mapping identities, large enough to blow the xattr cap
+                // on any real volume (found live: a 512-block corpus's
+                // report was 66 KB against the 64 KiB cap, so NOTHING
+                // persisted and the CLI read "no report"). Findings and
+                // counters are the record; the partial never persists.
+                to_store.partial = None;
                 let mut truncated = 0usize;
                 let mut bytes = serde_json::to_vec(&to_store).unwrap_or_default();
                 while bytes.len() > cap && !to_store.findings.is_empty() {

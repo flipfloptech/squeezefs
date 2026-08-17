@@ -2940,6 +2940,7 @@ s10c_write_corpus() { # writer_mnt total_mb file_mb
     local mnt="$1" total_mb="$2" file_mb="$3" n i
     n=$((total_mb / file_mb))
     [ "$n" -ge 1 ] || die "s10c: corpus too small ($total_mb MiB / $file_mb MiB files)"
+    rm -rf "$mnt/fleetscale" 2>/dev/null || true
     mkdir -p "$mnt/fleetscale" || die "s10c: cannot mkdir the corpus dir"
     log "s10c: writing the corpus — $n x ${file_mb} MiB urandom files (conv=fsync)"
     for ((i = 0; i < n; i++)); do
@@ -3073,7 +3074,12 @@ leg_s10c_fsck_scale() {
         log "s10c-fsck-scale: width N=$width — $S10C_RUNS run(s), every member remounted per run (cold rows)"
         for ((run = 1; run <= S10C_RUNS; run++)); do
             s10c_set_width "$width"
-            s10c_timed_fsck "$width" "$run" "$rowdir"
+            # --throttle 10: the KD-3 duty cycle is the STRETCH
+            # instrument — it applies PER MEMBER (each shard runs at the
+            # same duty), so linearity is preserved and the >=0.6x gate
+            # is a RATIO; unthrottled, this box's zram scrubs the whole
+            # corpus in ~1-2 s, inside the CLI's 500 ms poll quantum.
+            s10c_timed_fsck "$width" "$run" "$rowdir" --throttle 10
         done
     done
 
@@ -3123,8 +3129,8 @@ leg_s10c_kill_shard() {
     # Baseline (no kill), throttled — learns the fleet's exact census
     # total AND the shard runtime the kill window rides.
     s10c_set_width 3
-    log "s10c-kill-shard: baseline fleet fsck (throttle 25 — the KD-3 stretch the kill window rides)"
-    s10c_timed_fsck 3 "base" "$rowdir" --throttle 25
+    log "s10c-kill-shard: baseline fleet fsck (throttle 5 — the KD-3 stretch the kill window rides)"
+    s10c_timed_fsck 3 "base" "$rowdir" --throttle 5
     local t0_inodes
     t0_inodes="$(awk -F'\t' '$2=="base" {print $4}' "$rowdir/rows.tsv")"
     log "s10c-kill-shard: baseline census total = $t0_inodes inodes"
@@ -3144,7 +3150,7 @@ leg_s10c_kill_shard() {
     r0="$(stat_field 0 job_fleet_shards_relocal)"
     local wmnt
     wmnt="$(mnt_of 0)"
-    "$SQZ" fsck "$wmnt" --scrub --throttle 25 >"$rowdir/fsck-kill.log" 2>&1 &
+    "$SQZ" fsck "$wmnt" --scrub --throttle 5 >"$rowdir/fsck-kill.log" 2>&1 &
     local fsck_pid=$!
     local deadline=$((SECONDS + 120)) dd cc
     while :; do
@@ -3156,7 +3162,7 @@ leg_s10c_kill_shard() {
         fi
         kill -0 "$fsck_pid" 2>/dev/null || die "s10c-kill-shard: fsck exited before shards dispatched: $(head -3 "$rowdir/fsck-kill.log")"
         [ "$SECONDS" -lt "$deadline" ] || die "s10c-kill-shard: shards never dispatched within 120 s"
-        sleep 0.5
+        sleep 0.25
     done
     log "s10c-kill-shard: both worker shards in flight — kill -9 reader 1 MID-SHARD"
     "$MWFLEET" kill 1 >/dev/null || die "s10c-kill-shard: kill verb failed"

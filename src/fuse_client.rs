@@ -22320,6 +22320,26 @@ impl Filesystem for SqueezefsFilesystem {
             if set_attr.mode.is_some() {
                 self.killpriv_clean.remove_sync(&ino);
             }
+            // S11 rung 15 (the s11-range leg's finding): an FD-LESS
+            // truncate(2) on an MW-ARMED mount must not STRAND its
+            // whole-file lease — with no open episode there is no RELEASE
+            // to retire it, and whole-file custody conflicts with every
+            // peer's range acquire FOREVER (the MPI rank-0
+            // create-truncate-then-ranks-write shape: the authority's
+            // truncate starved both co-writers' first acquires into EIO).
+            // The durable save above already presented the token, so the
+            // custody has done its serialization work; ftruncate (an open
+            // fd) keeps the cached lease exactly as before (released at
+            // last close), and single-writer mounts keep the cached-lease
+            // reuse unconditionally (the O_TRUNC transient-race fix —
+            // nothing contends with a solo mount's cache).
+            if size_to_set.is_some()
+                && !self.is_open(ino)
+                && (crate::data_grant::custody_owner().is_some()
+                    || crate::data_grant::custody_client().is_some())
+            {
+                self.invalidate_local_lease(ino);
+            }
             let attr = self.inode_to_file_attr(&inode);
             // KD-5: explicitly requested fields SET verbatim (truncate
             // may shrink, utimes may move times backward); everything

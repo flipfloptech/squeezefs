@@ -106,6 +106,10 @@
 /// grants + asynchronous create-intent batches (KD-MW-13).
 pub mod intents;
 pub mod owners;
+/// DLM S10 rung 14: client-owned-slot placement (KD-MW-6) — the per-client
+/// mint-targeting hint + the valve-bounded migration policy over the
+/// existing online `migrate-meta-slot` engine.
+pub mod placement;
 /// DLM stage **S9**: the daemon's *non-trait* publish surface on the wire —
 /// the deliberate gap this module's docs name above, closed as its own
 /// additive vocabulary on its own verb block rather than by growing S8's
@@ -118,7 +122,7 @@ pub mod wire;
 
 pub use owners::{
     arm_ownership, constrain_mint_volume, disarm_ownership, owner_map, owner_of_volume,
-    ownership_armed, owns_volume, OwnerMap, PeerOwner,
+    ownership_armed, owns_volume, rearm_ownership, OwnerMap, PeerOwner,
 };
 pub use router::{MetaShipRouter, VerbRoute, TEST_SHIP_DRAIN_HOLD_MS};
 pub use service::{

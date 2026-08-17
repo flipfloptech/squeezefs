@@ -279,6 +279,9 @@ impl MultiWriterArm {
         data_grant::uninstall_custody_owner();
         publish::uninstall_client();
         crate::meta_ship::uninstall_delegation_host();
+        // Rung 14: the placement policy's vehicle dies with the authority
+        // (its runtime state dies inside disarm_ownership).
+        crate::meta_ship::placement::uninstall_migration_executor();
         crate::meta_ship::disarm_ownership();
         // The lane map dies with the authority (it is era-scoped), and so does
         // the frontier source a served OPEN read. The allocators keep their
@@ -676,6 +679,15 @@ pub async fn arm_multi_writer(
     let map = OwnerMap::for_volumes(meta, Vec::new())?;
     let foreign = map.volume_count() - map.local_volumes();
     crate::meta_ship::arm_ownership(map);
+    // Rung 14 (client-owned-slot placement): the policy's migration
+    // vehicle — the existing online migrate-meta-slot engine over this
+    // authority's own set, re-arming the ownership map at cutover (the
+    // migration-while-armed law). On today's all-local maps the policy's
+    // candidate inversion never fires (no shipping client owns a volume),
+    // so installing the vehicle is reachability, not activity.
+    crate::meta_ship::placement::install_migration_executor(
+        crate::meta_ship::placement::authority_migration_executor(Arc::clone(meta)),
+    );
 
     let stop = Arc::new(AtomicBool::new(false));
     spawn_cadence(Arc::clone(&owner), wero.clone(), Arc::clone(&stop), renew);

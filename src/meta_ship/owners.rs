@@ -159,6 +159,30 @@ impl OwnerMap {
         self.routing_width
     }
 
+    /// The volumes owned by the peer whose identity is `peer_id` — the
+    /// rung-14 placement policy's candidate inversion (the
+    /// fleet-of-authorities question: "does this shipping client own a
+    /// volume I could home its slots on?"). Empty on every shipped fleet
+    /// today, which is what keeps the migration policy structurally dark.
+    pub fn volumes_owned_by(&self, peer_id: &str) -> Vec<usize> {
+        self.volume_owners
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.as_ref().is_some_and(|p| p.peer_id == peer_id))
+            .map(|(v, _)| v)
+            .collect()
+    }
+
+    /// The map's foreign assignments, in [`Self::for_volumes`]'s input
+    /// form — what a re-arm over a fresh slot map preserves.
+    pub fn foreign_assignments(&self) -> Vec<(usize, PeerOwner)> {
+        self.volume_owners
+            .iter()
+            .enumerate()
+            .filter_map(|(v, o)| o.as_ref().map(|p| (v, (**p).clone())))
+            .collect()
+    }
+
     /// Distinct peers named by this map.
     pub fn peers(&self) -> Vec<Arc<PeerOwner>> {
         let mut out: Vec<Arc<PeerOwner>> = Vec::new();
@@ -220,13 +244,30 @@ pub fn arm_ownership(map: Arc<OwnerMap>) {
 }
 
 /// Restore solo mode in both planes: every volume local, every slot
-/// homed here, nothing shipped.
+/// homed here, nothing shipped. Placement state (rung 14) dies with the
+/// plane — assignments and policy evidence are meaningless without an
+/// ownership map to invert.
 pub fn disarm_ownership() {
     if OWNERSHIP_ARMED.swap(false, Ordering::AcqRel) {
         OWNERS.store(None);
         crate::dlm_slot::install_local_slots(None);
+        super::placement::clear_runtime_state();
         log::warn!("metadata function shipping DISARMED (DLM S8): solo authority restored");
     }
+}
+
+/// Re-publish the ownership plane over `routed`'s LIVE slot map with the
+/// standing foreign assignments preserved — the migration-while-armed law
+/// this module's [`arm_ownership`] docs state: a slot migration changes
+/// the derived local slot set, so the cutover must re-arm exactly as it
+/// republishes the routing table. A no-op on an unarmed mount.
+pub fn rearm_ownership(routed: &RoutedMetaBackend) -> Result<()> {
+    let Some(map) = owner_map() else {
+        return Ok(());
+    };
+    let fresh = OwnerMap::for_volumes(routed, map.foreign_assignments())?;
+    arm_ownership(fresh);
+    Ok(())
 }
 
 /// Is an ownership plane installed? **One relaxed load** — the fast path

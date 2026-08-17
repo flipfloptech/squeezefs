@@ -108,6 +108,17 @@ squeezefs_ipc::sqz_task_local! {
     static SHIP_REVOKES: RefCell<Vec<u64>>;
 }
 
+/// The shipping client whose verb is executing on THIS task, if any —
+/// rung 14's placement hint reads it at the mint-slot pick (the same
+/// deep-inside-the-backend position the mutation gate reads it from).
+/// Absent (or empty — "the client wants no delegations") ⇒ `None`.
+pub(crate) fn current_ship_client() -> Option<String> {
+    SHIP_CLIENT
+        .try_with(|c| (!c.is_empty()).then(|| c.clone()))
+        .ok()
+        .flatten()
+}
+
 squeezefs_ipc::sqz_task_local! {
     /// Rung 13: set (to `true`) around an INTENT APPLY's execution. The
     /// mutation gate then keeps the flushing holder's own UPDATE grant on
@@ -1005,6 +1016,16 @@ impl MetaShipService {
                 .insert(dir, client_id.to_string());
             self.deleg.update_count.fetch_add(1, Ordering::Relaxed);
             super::intents::note_update_grant();
+            // Rung 14 (placement): the granted directory joins the
+            // client's hot-slot set and the supply reservation is a
+            // policy event (a grant is a run's first evidence).
+            super::placement::note_client_dir(client_id, self.inner.slot_of_ino(dir) as u16);
+            super::placement::note_supply_event(
+                client_id,
+                &super::placement::PolicyConfig::derived(),
+                Instant::now(),
+                |s| self.inner.slot_volume(s),
+            );
             let census: Vec<String> = entries
                 .into_iter()
                 .filter(|e| e.name != "." && e.name != "..")
@@ -1265,6 +1286,11 @@ impl MetaShipService {
             scc::hash_map::Entry::Occupied(mut o) => {
                 if *o.get() != epoch {
                     *o.get_mut() = epoch;
+                    // Rung 14: a NEW incarnation of this identity — the
+                    // old one's placement state (assignments + policy
+                    // evidence) dies with it, so a zombie's half-run can
+                    // never compose with its successor's into a trigger.
+                    super::placement::fence_client(client);
                 }
             }
             scc::hash_map::Entry::Vacant(v) => {
@@ -1332,6 +1358,9 @@ impl MetaShipService {
         }
         drop(fenced);
         for client in newly {
+            // Rung 14: the fenced holder's placement state dies with its
+            // grants (the era-fencing law's deadline-expiry face).
+            super::placement::fence_client(&client);
             // Rung 13: a fenced holder's EXCLUSIVE UPDATE records die with
             // its grants (the directory is grantable again).
             {
@@ -1828,19 +1857,34 @@ impl MetaShipService {
                 })
                 .await;
             // The refill rides the reply (one reservation per request;
-            // anchored on the root — the supply's placement is the
-            // reservation's own pick).
+            // anchored on the root). It runs INSIDE the client's scope —
+            // rung 14: the supply's slot is the CLIENT's dedicated one
+            // (the placement hint reads the scope at the pick), and a
+            // successful reservation is a policy event (sustained
+            // consumption is the migration trigger's evidence).
             let supply = if supply_request > 0 {
-                match me
-                    .inner
-                    .reserve_intent_supply(1, supply_request.min(super::intents::supply_chunk()))
-                    .await
-                {
-                    Ok((first_global, stride, count)) => Some(super::wire::InoSupply {
-                        first_global,
-                        stride,
-                        count,
-                    }),
+                let reserve = SHIP_CLIENT.scope(client_id.clone(), async {
+                    me.inner
+                        .reserve_intent_supply(
+                            1,
+                            supply_request.min(super::intents::supply_chunk()),
+                        )
+                        .await
+                });
+                match reserve.await {
+                    Ok((first_global, stride, count)) => {
+                        super::placement::note_supply_event(
+                            &client_id,
+                            &super::placement::PolicyConfig::derived(),
+                            Instant::now(),
+                            |s| me.inner.slot_volume(s),
+                        );
+                        Some(super::wire::InoSupply {
+                            first_global,
+                            stride,
+                            count,
+                        })
+                    }
                     Err(e) => {
                         log::warn!("S10 intents: supply refill failed ({e})");
                         None

@@ -132,9 +132,14 @@ async fn fixture(vols: usize, client_owned: &[(usize, &str)]) -> Fixture {
     let mut paths = Vec::new();
     for (i, stamp) in plan.stamps.iter().enumerate().take(vols) {
         let p = make_file(dir.path(), &format!("meta{i}"), VOL_LEN);
-        squeezefs::meta_backend::kv::builder::format_v3_stamped(&p, VOL_LEN, &opts(), stamp.clone())
-            .await
-            .expect("format stamped meta volume");
+        squeezefs::meta_backend::kv::builder::format_v3_stamped(
+            &p,
+            VOL_LEN,
+            &opts(),
+            stamp.clone(),
+        )
+        .await
+        .expect("format stamped meta volume");
         paths.push(p.display().to_string());
     }
 
@@ -599,6 +604,7 @@ async fn two_clients_alternating_on_one_directory_never_ping_pong_the_slot() {
     }
     let cfg = placement::PolicyConfig {
         sustain_runs: 3,
+        thrash_cycles: 3,
         window: Duration::from_secs(60),
         cooldown: Duration::from_secs(480),
     };
@@ -608,9 +614,11 @@ async fn two_clients_alternating_on_one_directory_never_ping_pong_the_slot() {
 
     let t0 = Instant::now();
     let mut now = t0;
-    let mut drive = |client: &str, now: Instant| {
+    // The contended slot's live home never reaches a client-owned volume
+    // (the recording executor moves nothing) — the ping-pong shape.
+    let drive = |client: &str, now: Instant| {
         for _ in 0..cfg.sustain_runs {
-            placement::note_supply_event(client, &cfg, now);
+            placement::note_supply_event(client, &cfg, now, |_| Some(0));
         }
     };
 
@@ -676,7 +684,10 @@ async fn a_fenced_clients_placement_state_dies_with_its_incarnation() {
     intents::fsync_dir_barrier(d).await.expect("flush");
     let before = pstats();
     assert!(before.client_slots >= 1, "state exists before the fence");
-    assert!(before.supply_events >= 1, "evidence exists before the fence");
+    assert!(
+        before.supply_events >= 1,
+        "evidence exists before the fence"
+    );
 
     // The SAME identity presents a NEW incarnation over the wire: the
     // owner's incarnation hook fires and the placement state dies.
@@ -708,6 +719,9 @@ async fn a_fenced_clients_placement_state_dies_with_its_incarnation() {
         after.client_slots, 0,
         "the fenced incarnation's assignments died"
     );
-    assert_eq!(after.sustain_evidence, 0, "the policy evidence died with it");
+    assert_eq!(
+        after.sustain_evidence, 0,
+        "the policy evidence died with it"
+    );
     shutdown(&fx).await;
 }

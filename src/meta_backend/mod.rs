@@ -1041,6 +1041,17 @@ impl RoutedMetaBackend {
         route_ino_width(ino, self.routing_width).0
     }
 
+    /// The volume currently hosting `slot` — one arc-swap load + an
+    /// index (the rung-14 placement policy's live-home lookup). `None`
+    /// for a slot outside the frozen width.
+    pub fn slot_volume(&self, slot: u16) -> Option<usize> {
+        if self.routing_width <= 1 {
+            return (slot == 0).then_some(0);
+        }
+        let t = self.route.load();
+        t.slot_to_volume.get(usize::from(slot)).copied()
+    }
+
     /// `(EFFECTIVE local ino, volumes index)` → global ino over the
     /// frozen W: guest-namespaced locals carry their slot in the high
     /// bits; un-namespaced locals belong to the volume's legacy slot.
@@ -1104,6 +1115,21 @@ impl RoutedMetaBackend {
             return 0;
         }
         let t = self.route.load();
+        // Rung 14 (client-owned-slot placement, KD-MW-6): a mint executing
+        // FOR a shipping client (the owner-side SHIP_CLIENT scope, armed
+        // plane, lever on) lands in that client's DEDICATED slot instead
+        // of the shared rotor — outside the mint set, stable per client —
+        // so the client's minted population is migratable as a unit. One
+        // relaxed load + an absent task-local on every other mount; the
+        // volume-level mint CONSTRAINT (`constrain_mint_volume`) already
+        // ran above this pick, never below it.
+        if let Some(slot) = crate::meta_ship::placement::client_mint_slot(
+            volume_idx,
+            &t.slot_to_volume,
+            &t.mint_slots[volume_idx],
+        ) {
+            return slot;
+        }
         let mints = &t.mint_slots[volume_idx];
         debug_assert!(!mints.is_empty(), "every volume hosts ≥ 1 slot");
         let k = self.mint_rr[volume_idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed)

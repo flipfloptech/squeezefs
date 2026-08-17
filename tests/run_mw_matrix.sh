@@ -105,6 +105,18 @@
 #                       publishes entries/s + wire verbs/entry either way
 #                       (row 14 owns the formal <=1.10x gate — this row is
 #                       its input). Quiet-gated (cargo + loadavg).
+#   s10-placement-tarx  (rung 14's FORMAL GATE row — design §8.3 / PR row
+#                       14) tar -x, A-B-B-A of the co-writer at 250 µs RTT
+#                       (placement+intents ON, the shipped defaults) vs
+#                       the authority-LOCAL S0 baseline, SAME venue/
+#                       binary/tarball. Publishes the gate table + verdict
+#                       (<=1.10x of local) either way — a gate MISS prints
+#                       the honest-statement pointer and exits 0 (the
+#                       charter's explicit alternative); an INVALID row
+#                       (engagement/oracle) exits nonzero. Also proves the
+#                       migration policy's shipped-topology dark posture
+#                       live (candidates == 0 on a one-authority fleet).
+#                       Quiet-gated (cargo + loadavg).
 #   cowriters-admission GATED (the 5b gate): the multi-identity legs rungs
 #                       7-10 build on. Probes the recorded host-scoped
 #                       verdict; on this kernel it SKIPs loud with the
@@ -3825,6 +3837,117 @@ $out"
     log "s10-intents-tarx PUBLISHED (table + snapshots in $rowdir)"
 }
 
+leg_s10_placement_tarx() {
+    # Rung 14's FORMAL GATE (design §8.3, PR row 14): tar -x on the netns
+    # co-writer at wire RTT 250 µs with placement + intents ON (the
+    # shipped defaults) vs the authority-LOCAL S0 baseline — SAME venue,
+    # binary, tarball, store; A-B-B-A (pl, local, local, pl) so store
+    # aging cannot masquerade as a verdict. GATE: pl_median <= 1.10 x
+    # local_median. A miss is a PUBLISHED honest outcome (exit 0 — the
+    # charter's explicit alternative: operations.md + rc-manifest carry
+    # the statement); an INVALID row (engagement, oracle) exits nonzero.
+    require_cowriters 1
+    if pgrep -x cargo >/dev/null 2>&1; then
+        die "s10-placement-tarx: a cargo build is running — the measured row needs a quiet box"
+    fi
+    local load
+    load="$(awk '{print int($1)}' /proc/loadavg)"
+    [ "$load" -le 4 ] || die "s10-placement-tarx: loadavg $load > 4 — the measured row needs a quiet box"
+    local src="${SQZ_MWMATRIX_TAR_SRC:-}"
+    { [ -n "$src" ] && [ -d "$src" ]; } ||
+        die "s10-placement-tarx: the FORMAL gate requires the REAL linux-src tree — set SQZ_MWMATRIX_TAR_SRC=<linux>/fs (a synthesized all-inline tree cannot exercise the oracles)"
+    local rowdir cw w_mnt cw_mnt tarball entries
+    rowdir="$STATE/rows/s10pl-$(date +%s)"
+    mkdir -p "$rowdir"
+    cw="$(cowriter_idxs | head -1)"
+    w_mnt="$(mnt_of 0)"
+    tarball="$STATE/s10pl-src.tar"
+    tar -cf "$tarball" -C "$(dirname "$src")" "$(basename "$src")"
+    entries="$(tar -tf "$tarball" | wc -l)"
+    log "s10pl-tarx instrument: REAL tree $src ($entries entries); venue = netns co-writer at netem 125us/end (250us wire RTT) vs authority-local S0; A-B-B-A"
+
+    # The co-writer at the gate's RTT, shipped-default levers (placement
+    # AND intents ON — the row under test IS the default posture).
+    "$MWFLEET" unmount "$cw" || die "s10pl: unmount failed"
+    "$MWFLEET" mount "$cw" --netns || die "s10pl: netns co-writer mount failed"
+    "$MWFLEET" netem "$cw" 125us || die "s10pl: netem failed"
+    cw_mnt="$(mnt_of "$cw")"
+
+    pl_arm() { # label -> row line (engagement-checked, both planes)
+        local label="$1" out mints_d ship_d pub_d place_d verbs_per
+        out="$(s8a_venue "$rowdir" "$label" "$cw_mnt" "$cw" "$entries" "$tarball")"
+        mints_d="$(s8a_delta "$rowdir" "$cw" "$label" meta_ship_intent.meta_ship_intent_mints)"
+        ship_d="$(s8a_delta "$rowdir" "$cw" "$label" meta_ship.shipped_verbs)"
+        pub_d="$(s8a_delta "$rowdir" "$cw" "$label" meta_ship_publish.shipped)"
+        place_d="$(s8a_delta "$rowdir" 0 "$label" meta_ship_placement.meta_ship_placement_client_slot_mints)"
+        [ "$mints_d" -gt 0 ] || die "s10pl $label: 0 intent mints — the row did not engage the intent plane"
+        [ "$place_d" -gt 0 ] || die "s10pl $label: 0 client-targeted mints on the owner — placement did not engage"
+        verbs_per="$(python3 -c "print(f'{($ship_d+$pub_d)/$entries:.2f}')")"
+        echo "$out mints=$mints_d ship=$ship_d pub=$pub_d place=$place_d verbs/entry=$verbs_per"
+    }
+    local_arm() { # label -> row line (the S0 shape)
+        local label="$1" out
+        out="$(s8a_venue "$rowdir" "$label" "$w_mnt" "" "$entries" "$tarball")"
+        echo "$out local-S0"
+    }
+
+    local -a rows=()
+    rows+=("$(pl_arm pl-on-1)")
+    rows+=("$(local_arm local-1)")
+    rows+=("$(local_arm local-2)")
+    rows+=("$(pl_arm pl-on-2)")
+    "$MWFLEET" netem "$cw" off || true
+
+    # The shipped-topology dark posture, proven LIVE: on a one-authority
+    # fleet no shipping client owns a metadata volume, so the policy's
+    # migration half must never fire (the honest-statement's live face).
+    local cand trig
+    cand="$(stat_field 0 meta_ship_placement.meta_ship_placement_migration_candidates)"
+    trig="$(stat_field 0 meta_ship_placement.meta_ship_placement_migrations_triggered)"
+    [ "$cand" = "0" ] || die "s10pl: migration_candidates=$cand on a one-authority fleet (must be structurally 0)"
+    [ "$trig" = "0" ] || die "s10pl: migrations_triggered=$trig on a one-authority fleet (must be structurally 0)"
+
+    echo ""
+    echo "== S10 rung-14 FORMAL GATE: tar -x, placement+intents ON @250us RTT vs authority-local S0 (entries=$entries; A-B-B-A) =="
+    printf '%-10s %-8s %-8s %s\n' ARM WALL_S OPS_S ENGAGEMENT
+    local r
+    for r in "${rows[@]}"; do
+        # shellcheck disable=SC2086 # deliberate word split of the row line
+        printf '%-10s %-8s %-8s %s\n' $r
+    done | tee "$rowdir/s10pl-table.txt"
+
+    # The verdict (medians of two arms each; A-B-B-A agrees or the table
+    # itself shows the ordering artifact).
+    local pl1 pl2 lo1 lo2
+    pl1="$(echo "${rows[0]}" | awk '{print $2}')"
+    lo1="$(echo "${rows[1]}" | awk '{print $2}')"
+    lo2="$(echo "${rows[2]}" | awk '{print $2}')"
+    pl2="$(echo "${rows[3]}" | awk '{print $2}')"
+    python3 - "$pl1" "$pl2" "$lo1" "$lo2" <<'PYGATE' | tee "$rowdir/s10pl-verdict.txt"
+import sys
+pl = (float(sys.argv[1]) + float(sys.argv[2])) / 2
+lo = (float(sys.argv[3]) + float(sys.argv[4])) / 2
+r = pl / lo
+verdict = "GATE MET" if r <= 1.10 else "GATE NOT MET"
+print(f"gate: co-writer {pl:.2f}s vs local {lo:.2f}s -> {r:.2f}x of S0 (gate <= 1.10x): {verdict}")
+if verdict == "GATE NOT MET":
+    print("the honest product statement governs (the charter's alternative): "
+          "docs/operations.md #Metadata function shipping + docs/rc-manifest.md carry the measured number")
+PYGATE
+
+    # The oracle after the measured sweep.
+    local out drift
+    out="$("$SQZ" fsck "$w_mnt" 2>&1)" || die "s10pl: fsck FAILED:
+$out"
+    echo "$out" >"$rowdir/fsck.out"
+    echo "$out" | grep -q "findings: 0" || die "s10pl: fsck findings != 0:
+$out"
+    drift="$(stat_field 0 meta_kv_block_refs_drift)"
+    [ "$drift" = "0" ] || die "s10pl: drift=$drift"
+    [ "$(stat_field 0 "meta_ship.owner_panics")" = "0" ] || die "s10pl: owner_panics != 0"
+    log "s10-placement-tarx PUBLISHED (table + verdict + snapshots in $rowdir)"
+}
+
 leg_cowriters_admission() {
     if [ "$HOST_SCOPED" != "1" ]; then
         local reason="multi-identity (co-writer) legs need host-scoped fabric subsystems: this kernel merges controllers by subsysnqn ignoring hostnqn (nvme_core.multipath=Y), so co-located identities share one head — rung 5b (the sqz-kernel fix, validated in the rung-6b qemu guest) unlocks them. Stock-kernel workaround: nvme_core.multipath=N (boot parameter)"
@@ -3852,8 +3975,9 @@ s10c-kill-shard) leg_s10c_kill_shard ;;
 s10-delegation) leg_s10_delegation ;;
 s10-intents) leg_s10_intents ;;
 s10-intents-tarx) leg_s10_intents_tarx ;;
+s10-placement-tarx) leg_s10_placement_tarx ;;
 cowriters-admission) leg_cowriters_admission ;;
 vm-hostscope-validate) leg_vm_hostscope_validate ;;
 vm-multi-identity) leg_vm_multi_identity ;;
-*) die "unknown leg '$LEG' (smoke|multipath-negative|s6-journal|s6-fence|s6-vm-fence|s7-device-fence|s7-kill-matrix|s8-serial-ab|s8-crucible|s9-fanout|s9-failover|s9-colocated-fence|s10c-fsck-scale|s10c-kill-shard|s10-delegation|s10-intents|s10-intents-tarx|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
+*) die "unknown leg '$LEG' (smoke|multipath-negative|s6-journal|s6-fence|s6-vm-fence|s7-device-fence|s7-kill-matrix|s8-serial-ab|s8-crucible|s9-fanout|s9-failover|s9-colocated-fence|s10c-fsck-scale|s10c-kill-shard|s10-delegation|s10-intents|s10-intents-tarx|s10-placement-tarx|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
 esac

@@ -9897,6 +9897,17 @@ impl SqueezefsFilesystem {
                 // deferred-error gauge (growth = capacity/quota pressure
                 // reaching the delegated create path).
                 "meta_ship_intent": crate::meta_ship::intents::intent_stats_json(),
+                // Rung 14 — the S10 client-owned-slot placement family
+                // (KD-MW-6): the per-client mint-targeting ledger + the
+                // valve-bounded migration policy. All zero on every mount
+                // without an armed ownership plane BY CONSTRUCTION;
+                // `meta_ship_placement_migration_candidates` is
+                // structurally 0 on every one-authority fleet (no shipping
+                // client owns a metadata volume — the honest shipped-
+                // topology posture, docs/operations.md §Metadata function
+                // shipping), and `meta_ship_placement_thrash_demotions`
+                // is the never-thrash valve's engagement instrument.
+                "meta_ship_placement": crate::meta_ship::placement::placement_stats_json(),
                 // DLM S9 (spec §6.9 S9): the remote write-custody plane and
                 // the daemon's publish path on the wire. `dlm_custody.mode`
                 // is `off` on every single-writer mount and every other

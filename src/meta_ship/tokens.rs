@@ -415,7 +415,10 @@ pub fn recall_rate_cap_per_s(batch_max: usize, deadline: Duration, roster: usize
 /// own `T_owner` when installed (the lane runs on the OWNER — S6's
 /// authority), else the same knob/default `LeaseClocks::derive` reads, so
 /// the two planes can never disagree about what "the lease" means.
-fn recall_lease_ttl() -> Duration {
+/// `pub(crate)`: rung 14's placement valve derives its thrash window from
+/// the same quantity (a slot moving twice inside one lease period is
+/// cycling faster than clients re-home their custody).
+pub(crate) fn recall_lease_ttl() -> Duration {
     if let Some(o) = crate::membership::installed_owner() {
         return o.clocks().t_owner;
     }

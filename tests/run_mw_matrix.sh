@@ -3141,12 +3141,25 @@ PYS10C
 
 leg_s11_range() {
     require_cowriters 2
-    # Rung 15 ships DARK (SQUEEZEFS_RANGE_CUSTODY default-off until rungs
-    # 16/17 land the concurrent same-ino publish composition — the
-    # 2026-08-17 adjudication): this leg REQUIRES an explicitly armed
-    # fleet, and it is that composition's acceptance surface — its final
-    # gate is EXPECTED RED until those rungs land (the G-RW2 standing-RED
-    # pattern, live-leg form).
+    # Rung 15 ships DARK (SQUEEZEFS_RANGE_CUSTODY default-off until the
+    # concurrent same-ino publish composition lands — the 2026-08-17
+    # adjudication): this leg REQUIRES an explicitly armed fleet, and it
+    # is that composition's acceptance surface — its final gate is
+    # EXPECTED RED until it lands (the G-RW2 standing-RED pattern,
+    # live-leg form). Rung 16 adjudicated the composition's OWNER as
+    # wholly rung 17 (the authority assembler / WriteExtent publish
+    # surface — .benchmarks/2026-08-17-s11-b4-clause.md): the layout
+    # publish race is per-INO, so the B4 §5.1 range clause (a per-BLOCK
+    # fast-path screen) cannot close it. Rung 16's live gate HERE is the
+    # zero-misfire columns (prs_d/ors_d — the clause must stay silent on
+    # block-aligned custody, §9.5's aligned-row law) + the ledger-export
+    # check; the clause's FIRING venue is rung 17's demotion-barrier row
+    # (pre-17 the acquire algebra keeps every live grant edge
+    # block-aligned — outward-rounded desired, aligned-wall clipping,
+    # required-conflict serialization — so no product write can reach a
+    # range-shared block on a healthy fleet; the firing half is pinned
+    # in-process against directly-minted sub-block grants, the post-17
+    # shapes).
     [ "${RANGE_CUSTODY:-0}" = "1" ] ||
         die "s11-range needs a range-custody-ARMED fleet: sudo SQZ_MWFLEET_RANGE_CUSTODY=1 tests/mw_fleet.sh create N=1 --cowriters=2"
     local rowdir cws m1 m2 idx w_mnt
@@ -3230,7 +3243,8 @@ def load(i, ph):
     return flat(root.get("metrics", root))
 bad = []
 print("== S11 rung-15 row: 2 co-writers, disjoint range custody of ONE file ==")
-print(f"{'member':<8}{'rng_acq_d':<11}{'rng_ext_d':<11}{'pub_ship_d':<12}{'lcr':<5}")
+print(f"{'member':<8}{'rng_acq_d':<11}{'rng_ext_d':<11}{'pub_ship_d':<12}{'lcr':<5}"
+      f"{'prs_d':<7}{'ors_d':<7}")
 for i in (m1, m2):
     d0, d1 = load(i, 0), load(i, 1)
     dd = lambda k: int(d1.get(k, 0) or 0) - int(d0.get(k, 0) or 0)
@@ -3238,7 +3252,14 @@ for i in (m1, m2):
     ext = dd("dlm_custody.dlm_custody_range_extensions")
     pub = dd("meta_ship_publish.shipped")
     lcr = int(d1.get("cowriter.local_commit_refusals", 0) or 0)
-    print(f"m{i:<7}{acq:<11}{ext:<11}{pub:<12}{lcr:<5}")
+    # Rung 16 (KD-MW-12): the two fast-path range-clause ledgers. On a
+    # BLOCK-ALIGNED ranged row nothing shares a block (§9.5's MPI-IO
+    # law), so both must stay 0 — movement here is the finding-#2 class
+    # (own covering custody refusing itself = the clause misfiring on
+    # every own-covered write of the stream).
+    prs = dd("patch_ineligible_range_shared")
+    ors = dd("overlay_ineligible_range_shared")
+    print(f"m{i:<7}{acq:<11}{ext:<11}{pub:<12}{lcr:<5}{prs:<7}{ors:<7}")
     if acq < 1:
         bad.append(f"m{i}: dlm_custody_range_acquires delta {acq} — the ranged write "
                    "path did NOT engage (silent whole-file fallback = the row is a lie)")
@@ -3246,6 +3267,15 @@ for i in (m1, m2):
         bad.append(f"m{i}: meta_ship_publish.shipped delta 0 — a co-writer's publishes must SHIP")
     if lcr != 0:
         bad.append(f"m{i}: local_commit_refusals={lcr}")
+    if "overlay_ineligible_range_shared" not in d1:
+        bad.append(f"m{i}: overlay_ineligible_range_shared missing from the stats "
+                   "inode — the rung-16 B4 clause ledger is not exported")
+    if prs != 0 or ors != 0:
+        bad.append(f"m{i}: range-clause ledgers moved on a BLOCK-ALIGNED ranged row "
+                   f"(patch_ineligible_range_shared d={prs}, "
+                   f"overlay_ineligible_range_shared d={ors}) — own covering custody "
+                   "refused itself (rung 15 finding #2's class) or a block is "
+                   "unexpectedly shared")
     if dd("invariant_tripwires") != 0:
         bad.append(f"m{i}: invariant_tripwires moved")
     if dd("mem_budget_hard_backstops") != 0 or dd("parked_gate_timeouts") != 0:
@@ -3279,7 +3309,8 @@ if bad:
     for b in bad:
         print(f"  {b}", file=sys.stderr)
     sys.exit(1)
-print("S11 custody GATE GREEN (ranged engagement exact, Issue-19 column 0, zero conflicts, ships accounted)")
+print("S11 custody GATE GREEN (ranged engagement exact, Issue-19 column 0, zero conflicts, "
+      "ships accounted, rung-16 range-clause ledgers exported + silent on aligned custody)")
 PYS11
 
     # ---- Own-mount verification (each writer serves its own acked half) ------
@@ -3358,17 +3389,20 @@ PYS11
     [ "$admitted" = "1" ] || die "s11-range: victim m$m1 could not re-admit by remount within the grace ladder"
     log "victim m$m1 re-admitted by remount"
 
-    # ==== THE COMPOSITION GATE (STANDING RED until rungs 16/17) ==============
+    # ==== THE COMPOSITION GATE (STANDING RED until rung 17) ==================
     # The merged two-writer layout read cold + the C8 oracle. Rung 15's
     # custody plane is proven GREEN above; this block is the CONCURRENT
     # same-ino layout-publish COMPOSITION — the machinery
-    # design-mw-layout-versions §6 assigns to the S9 publish surface and
-    # PR rows 16/17 own (the delta-chain/full-save base races under two
-    # publishers; bit 15 DETECTS — C8 drift — but detection is not
-    # composition). Adjudicated 2026-08-17
+    # design-mw-layout-versions §6 assigns to the S9 publish surface,
+    # adjudicated at rung 16 as WHOLLY rung 17's
+    # (.benchmarks/2026-08-17-s11-b4-clause.md: the race is per-INO
+    # layout-base — the delta-chain/full-save base under two publishers;
+    # bit 15 DETECTS — C8 drift — but detection is not composition, and
+    # the rung-16 B4 clause is a per-BLOCK fast-path screen, orthogonal
+    # by construction). Rung-15 adjudication
     # (.benchmarks/2026-08-17-s11-range-wire.md): the lever ships
-    # default-OFF, this leg is the composition rungs' acceptance surface,
-    # and this gate flipping green is rung 16/17's live acceptance.
+    # default-OFF, this leg is the composition rung's acceptance surface,
+    # and this gate flipping green is rung 17's live acceptance.
     local comp_bad=""
     "$MWFLEET" unmount 0 >/dev/null 2>&1 || true
     "$MWFLEET" mount 0 >/dev/null 2>&1 || die "s11-range: authority remount failed"
@@ -3415,8 +3449,8 @@ PYS11
     for idx in $(member_idxs); do snap "$idx" 2 "$rowdir"; done
 
     if [ -n "$comp_bad" ]; then
-        die "s11-range COMPOSITION GATE RED (custody half GREEN — engagement/Issue-19/kill-arm all passed; zero residue): $comp_bad.
-This is the STANDING-RED half (the G-RW2 pattern, live-leg form): concurrent same-ino layout publishes race the delta-chain/full-save base — design-mw-layout-versions §6's named residual, owned by PR rows 16/17. Bit 15 + C8 DETECT it (which is this red's instrument); rung 16/17's landing flips this exact gate green. Adjudication: .benchmarks/2026-08-17-s11-range-wire.md"
+        die "s11-range COMPOSITION GATE RED (custody half GREEN — engagement/Issue-19/kill-arm/rung-16-clause columns all passed; zero residue): $comp_bad.
+This is the STANDING-RED half (the G-RW2 pattern, live-leg form): concurrent same-ino layout publishes race the delta-chain/full-save base — design-mw-layout-versions §6's named residual, owned by PR row 17 (the authority assembler / WriteExtent publish surface; rung 16 adjudicated the slice — the B4 §5.1 range clause is a per-BLOCK fast-path screen and cannot close a per-INO publish race). Bit 15 + C8 DETECT it (which is this red's instrument); rung 17's landing flips this exact gate green. Adjudications: .benchmarks/2026-08-17-s11-range-wire.md + .benchmarks/2026-08-17-s11-b4-clause.md"
     fi
     log "s11-range GREEN — the first sub-file multi-writer rows, composition included (snapshots + fsck in $rowdir). Evidence tier: measured-simulated (one box, co-located members)"
 }

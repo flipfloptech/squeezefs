@@ -1655,3 +1655,139 @@ async fn pending_shadow_notes_land_durably_by_the_epoch_close() {
     );
     rig.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// Vector C — reclaim of an ino with an OPEN rewrite epoch (the 2026-08-17
+// C8 field conviction: `.benchmarks/2026-08-17-mw-shipped-free-c8-fix.md`).
+//
+// The found composition, exactly: an aligned overwrite of a mapped striped
+// block feeds the rewrite epoch (on a CO-WRITER every such overwrite does —
+// `begin_patch_sole_owner`'s plane gate refuses the W1 patch, so the B4
+// overlay/CoW fallback is the ONLY overwrite vehicle on that posture; on a
+// solo mount the same epoch opens on any displacing whole-block rewrite),
+// which rebinds the RAM map to the fresh key B1 while the DURABLE map still
+// names the displaced key A0 and the {release A0, take B1} pair sits
+// un-drained in the deferred accumulator. `rm` then reclaims the ino before
+// the epoch closes.
+//
+// RED against dev (1536c4f1): `delete_file` computes the corpse's release
+// set from the RAM snapshot — it deletes the record (B1, ino, 0) that was
+// NEVER staged (a no-op) and never deletes (A0, ino, 0), which was; the
+// deferred notes are never drained; `destroy_inodes` then erases the layout
+// that justified A0's record. The sweeper's later close takes the
+// vanished-layout arm — frees A0 but drains nothing. The oracle reports
+// exactly the field finding: `durable 1 vs derived 0` at A0 (fsck C8), on a
+// live mount, no crash needed. On the co-writer the same sequence also
+// answers the shipped free of A0 `NonTerminal` (its record still lives), so
+// the block strands durably-referenced forever.
+// ---------------------------------------------------------------------------
+
+/// Contract: reclaiming an ino whose rewrite epoch is OPEN leaves NO
+/// orphaned durable reference and NO stranded block — the reclaim tears the
+/// epoch down, drains the deferred accounting notes into the corpse's own
+/// release commit (every note maps to a release: a Delete of an absent key
+/// is a no-op by §4.2, so the union is conservative and exact), and frees
+/// the epoch's parked custody with the corpse's blocks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reclaim_of_an_ino_with_an_open_rewrite_epoch_orphans_no_durable_reference() {
+    let _g = fs_serial().await;
+    struct LeverReset;
+    impl Drop for LeverReset {
+        fn drop(&mut self) {
+            squeezefs::device_overlay::clear_device_overlay_for_tests();
+        }
+    }
+    let _r = LeverReset;
+    let meta = NamedTempFile::new().unwrap();
+    format_meta_stamped(meta.path()).await;
+    let data = data_file();
+
+    let h = mount_fs(meta.path(), data.path()).await;
+    let ino = fs_striped_fixture(&h, "vecc_reclaim", 2, 5).await;
+    let a0 = fs_ram_map(&h, ino).await.get(&0).expect("block 0").clone();
+    let a0_off = fs_offset_of(&h, &a0);
+    assert_eq!(
+        fs_durable_refcount(&h, a0_off).await,
+        1,
+        "premise: the fixture's block is durably recorded"
+    );
+
+    // Open the epoch: a whole-block displacing overwrite (the ACK-path
+    // accumulation feed — overlay lever off, the Vector B fixture
+    // discipline). RAM now names B1; durable still names A0; the
+    // {release A0, take B1} pair is parked in the deferred accumulator.
+    squeezefs::device_overlay::set_overlay_overwrite_for_tests(false);
+    let ob = open_epochs();
+    fs_write_at(&h, ino, 0, &pattern(FUSE_BLOCK as usize, 6)).await;
+    fs_quiesce(&h).await;
+    assert_eq!(open_epochs(), ob + 1, "premise: the epoch is open");
+    let b1 = fs_ram_map(&h, ino).await.get(&0).expect("block 0").clone();
+    assert_ne!(b1, a0, "premise: the shadow rebound block 0");
+    let b1_off = fs_offset_of(&h, &b1);
+
+    // The reclaim's data teardown, production order
+    // (`fuse_client::reclaim_orphaned_batch`): unlink committed first (rm),
+    // then `delete_file`, then the batched destroy.
+    h.routed.unlink(1, "vecc_reclaim").await.expect("unlink");
+    h.fs.router
+        .delete_file(&squeezefs::keys::inode_path(ino))
+        .await
+        .expect("delete_file");
+    // Captured HERE (before the close below can decrement it), asserted
+    // after the headline oracle: the reclaim itself must have torn the
+    // epoch down.
+    let epochs_after_delete = open_epochs();
+    h.routed.destroy_inodes(&[ino]).await.expect("destroy");
+
+    // The sweeper's later act on dev (the vanished-layout close) — after
+    // the fix this is a structural no-op, and it must never re-strand.
+    let token = h.fs.router.dlm.get_fencing_token_ino(ino);
+    let _ = h.fs.router.close_rewrite_epoch(ino, token).await;
+
+    // The oracle — the exact field finding shape: an orphaned record is
+    // `durable 1 vs derived 0` (fsck C8) on a LIVE mount.
+    let drift =
+        h.fs.router
+            .backend_router
+            .verify_durable_block_refs(&h.routed)
+            .await
+            .expect("verification pass");
+    assert!(
+        drift.is_empty(),
+        "reclaim of an ino with an OPEN rewrite epoch orphaned durable reference(s) — \
+         the 2026-08-17 co-writer tar+rm C8 drift, in process: {drift:?}"
+    );
+    assert_eq!(
+        epochs_after_delete, ob,
+        "the reclaim must tear the OPEN epoch down — an epoch that outlives its ino's \
+         data teardown is what strands the deferred accounting (the C8 leak)"
+    );
+    assert_eq!(
+        fs_durable_refcount(&h, a0_off).await,
+        0,
+        "the displaced key's durable record must not outlive its destroyed owner"
+    );
+    assert_eq!(
+        fs_durable_refcount(&h, b1_off).await,
+        0,
+        "the shadow key's record (never staged) stays absent"
+    );
+    // Space returns on BOTH keys: the corpse's mapped block through the map
+    // walk, the epoch's parked displaced custody through the teardown
+    // (FIND-M11-A's reclaimed-ino orphan-discard — never live acked data).
+    assert_eq!(
+        h.alloc.refcount(a0_off),
+        None,
+        "the displaced block must be freed with the corpse, not stranded"
+    );
+    assert_eq!(
+        h.alloc.refcount(b1_off),
+        None,
+        "the corpse's mapped block frees exactly as before"
+    );
+
+    h.routed.volumes[0]
+        .shutdown()
+        .await
+        .expect("clean shutdown");
+}

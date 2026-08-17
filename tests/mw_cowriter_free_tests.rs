@@ -1688,3 +1688,126 @@ async fn an_empty_times_drain_on_a_co_writer_fsync_is_not_a_local_commit_refusal
 
     auth.stop().await;
 }
+
+/// **The reclaim-shaped release batch** (the 2026-08-17 C8 fix's wire
+/// face — `.benchmarks/2026-08-17-mw-shipped-free-c8-fix.md`): when a
+/// co-writer reclaims an ino whose rewrite epoch was still OPEN,
+/// `delete_file` ships ONE witnessed `CommitBlockRefs` whose release set
+/// is the union of the snapshot map's bindings and the drained deferred
+/// notes — which means the frame legitimately carries a `Delete` for a
+/// record that was NEVER staged (the shadow key the RAM map named)
+/// beside the `Delete` for the record that WAS (the displaced key the
+/// durable map still named). Pinned here, over the real wire:
+///
+/// * the mixed batch applies exactly — the staged record dies, the
+///   absent key's `Delete` is a no-op, the ledger reads 0 for both;
+/// * the frame is IDEMPOTENT under the finding-#6 witness: a verbatim
+///   re-ship answers the winner's cached outcome, stages nothing
+///   (journal-entry equality), and is counted as a replay;
+/// * release-before-free heals the strand: the subsequent shipped frees
+///   of BOTH blocks answer `Freed` — never the `NonTerminal` the field
+///   run logged 6 of (a free arriving while the orphaned record still
+///   held the ledger's population above zero);
+/// * both offsets re-enter the authority's free supply.
+///
+/// (The era gate's own arm — a swept epoch's `commit_block_refs` refuses
+/// with nothing applied — is the standing pin in
+/// `mw_publish_era_gate_tests`; this frame changes nothing about it.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reclaim_shaped_release_batch_is_exact_idempotent_and_frees_read_freed() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "reclaim-batch").await;
+    let dev = data_device(dir.path(), "reclaim-batch.dev");
+    let auth = Authority::start(&vol, &dev, &[NODE_A]).await;
+
+    // The durable state at reclaim time, exactly: the ino's STAGED record
+    // names the displaced key (old_idx — the authority-written block the
+    // epoch displaced); the shadow key (shadow_idx — the co-writer's CoW
+    // dest) was never staged, because its take still sat in the deferred
+    // accumulator when the reclaim drained it.
+    let old_off = auth.alloc.allocate_block().await.expect("lane-0 mint");
+    let old_idx = old_off / auth.alloc.chunk_size();
+    let ino = authority_file_with_block(&auth, "reclaimed.bin", old_idx).await;
+    assert_eq!(auth.population(old_idx).await, 1);
+
+    let cwr = CoWriter::join(&auth, &vol, &dev, NODE_A).await;
+    let shadow_off = cwr.alloc.allocate_block().await.expect("lane-1 mint");
+    let shadow_idx = shadow_off / cwr.alloc.chunk_size();
+    assert_eq!(auth.population(shadow_idx).await, 0, "premise: never staged");
+
+    let tag = volume_tag(DATA_VOL);
+    let epoch = cwr.client.lease_epoch();
+    let pc = publish::PublishClient::new(NODE_A, SECRET.to_vec());
+    let frame = publish::PublishCall::CommitBlockRefs {
+        ino,
+        refs: vec![
+            // The RAM map's binding — the no-op arm.
+            publish::WireBlockRefOp {
+                vol_tag: tag,
+                block_idx: shadow_idx,
+                owner_ino: ino,
+                block_index: 0,
+                take: false,
+            },
+            // The drained note — the record that must die.
+            publish::WireBlockRefOp {
+                vol_tag: tag,
+                block_idx: old_idx,
+                owner_ino: ino,
+                block_index: 0,
+                take: false,
+            },
+        ],
+        lease_epoch: epoch,
+        request_id: 0xC8,
+    };
+    let first = pc
+        .ship(&auth.endpoint, frame.clone())
+        .await
+        .expect("the mixed release batch applies");
+    assert_eq!(auth.population(old_idx).await, 0, "the staged record died");
+    assert_eq!(auth.population(shadow_idx).await, 0, "the no-op stayed a no-op");
+
+    // Idempotence: the verbatim re-ship (a lost-reply retry never re-keys).
+    let replays_before = publish::stats().replays;
+    let journal_before =
+        squeezefs::meta_backend::kv::META_KV_JOURNAL_ENTRIES.load(Ordering::Relaxed);
+    let replayed = pc
+        .ship(&auth.endpoint, frame)
+        .await
+        .expect("the duplicate is ANSWERED, not re-applied");
+    assert_eq!(replayed, first, "a replay answers the winner's own outcome");
+    assert_eq!(publish::stats().replays - replays_before, 1);
+    assert_eq!(
+        squeezefs::meta_backend::kv::META_KV_JOURNAL_ENTRIES.load(Ordering::Relaxed),
+        journal_before,
+        "journal-entry equality: the duplicate staged NOTHING"
+    );
+    assert_eq!(auth.population(old_idx).await, 0);
+
+    // Release-before-free: both frees read Freed — the NonTerminal strand
+    // (a free racing its own orphaned record) is structurally gone.
+    let verdicts = publish::ship_free_blocks(
+        &auth.endpoint,
+        tag,
+        vec![shadow_idx, old_idx],
+        epoch,
+        0xC9,
+    )
+    .await
+    .expect("the corpse's frees ship");
+    assert_eq!(
+        verdicts,
+        vec![publish::FreeVerdict::Freed, publish::FreeVerdict::Freed],
+        "release-before-free must read Freed on BOTH keys — NonTerminal here is the \
+         orphaned-record strand the field run logged"
+    );
+    auth.br.reclaim_drain().await;
+    assert!(auth.free_listed(old_idx), "the displaced offset returned");
+    assert!(auth.free_listed(shadow_idx), "the shadow offset returned");
+
+    drop(cwr);
+    auth.stop().await;
+}

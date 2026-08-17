@@ -15543,8 +15543,38 @@ impl DataRouter {
         // pre-insert yet commit post-snapshot — the leaked-refcount window.
         // (fetch_metadata's fast path serves the RAM cache WITHOUT the
         // lock, so it cannot be the fence itself.)
+        //
+        // The same fence tears down the ino's OPEN rewrite epoch (the
+        // 2026-08-17 co-writer tar+rm C8 conviction,
+        // `.benchmarks/2026-08-17-mw-shipped-free-c8-fix.md`): an epoch's
+        // shadow bindings are RAM-only — the durable map still names the
+        // keys it displaced, and each rebind's {release, take} pair sits
+        // un-drained in `pending_block_refs`. Left registered, the
+        // sweeper's post-destroy close takes the vanished-layout arm: it
+        // frees the displaced keys but drains NOTHING, so every displaced
+        // key's durable record outlives the layout that justified it
+        // forever (fsck C8 `durable 1 vs derived 0`; on a co-writer the
+        // shipped free of that key then answers NonTerminal and the block
+        // strands durably-referenced). Removal is race-free here: the
+        // admitted reclaim proved no open handles exist, so no shadow
+        // record can run (records ride the write path), and holding the
+        // fence lock across the remove orders it against a mid-flight
+        // close (which re-registers under this same lock on a transient
+        // failure). The epoch's parked custody joins the corpse's frees
+        // below; its deferred accounting notes join the corpse's release
+        // commit (both the FIND-M11-A reclaimed-ino orphan-discard law —
+        // nlink is 0 and nothing is open, never live acked data).
         let ino_for_fence = parse_inode_from_path(file_path);
-        drop(meta_lock_acquire(ino_for_fence).await);
+        let reclaimed_epoch = {
+            let fence = meta_lock_acquire(ino_for_fence).await;
+            let epoch = self
+                .inner
+                .rewrite_epochs
+                .remove_sync(&ino_for_fence)
+                .map(|(_, e)| e);
+            drop(fence);
+            epoch
+        };
         let meta = self.fetch_metadata(file_path).await?;
 
         let mut blocks_to_free: Vec<String> = Vec::new();
@@ -15585,6 +15615,44 @@ impl DataRouter {
             }
         }
 
+        // The torn-down epoch's parked custody joins the corpse's frees
+        // (see the fence comment above). Guards drop FIRST (deregister the
+        // B owners — `close_rewrite_epoch`'s order), then:
+        //
+        // * every DISPLACED key (the durable map's previous bindings —
+        //   parked for the swap that will now never run) — disjoint from
+        //   the snapshot map by construction (a displaced key left it);
+        // * every SHADOW value the snapshot map does not name: with a live
+        //   RAM entry the map already carries the shadow bindings (the
+        //   record inserted them), but an evicted entry refetched the
+        //   DURABLE map above (the KD-1.9 compose needs the registered
+        //   epoch this fence just removed), and the shadow's B keys would
+        //   otherwise strand allocated with no owner (fsck C2).
+        //
+        // Their durable records need nothing here beyond the pending-note
+        // drain below: a displaced key's release rides it, and a shadow
+        // key's record was never staged (its take is still pending).
+        if let Some(epoch) = reclaimed_epoch {
+            while epoch.guards.pop().is_some() {}
+            while let Some(k) = epoch.displaced.pop() {
+                blocks_to_free.push(clean_block_key(&k));
+            }
+            let mapped: std::collections::HashSet<&str> =
+                blocks_to_free.iter().map(|s| s.as_str()).collect();
+            let mut shadow_only: Vec<String> = Vec::new();
+            epoch.shadow.iter_sync(|_, k| {
+                let cleaned = clean_block_key(k);
+                if !mapped.contains(cleaned.as_str()) {
+                    shadow_only.push(cleaned);
+                }
+                true
+            });
+            drop(mapped);
+            blocks_to_free.extend(shadow_only);
+            blocks_to_free.sort_unstable();
+            blocks_to_free.dedup();
+        }
+
         // Spec §6.2 item 1 — release the corpse's durable references
         // BEFORE the blocks themselves, and in their own commit.
         //
@@ -15607,8 +15675,34 @@ impl DataRouter {
         // publish path (the no-second-commit rule is about the block
         // publish), and `destroy_inodes` is a batched multi-ino commit that
         // does not — and should not — decode layouts to learn block keys.
-        if !ref_changes.is_empty() {
-            let refs = self.block_ref_ops(ino, &ref_changes);
+        //
+        // The corpse's DEFERRED accounting notes drain into this same
+        // release commit (the C8 conviction's other half): the snapshot map
+        // above may carry bindings whose durable counterpart is still the
+        // PREVIOUS key — the notes are the exact durable→RAM delta — so
+        // releases computed from the map alone delete records that were
+        // never staged and orphan the ones that were. Every drained op maps
+        // to a RELEASE of its reference: a drained RELEASE names exactly
+        // the durable record the map no longer shows, and a drained TAKE
+        // names one the map-derived set already covers or one that was
+        // never staged — a `Delete` of an absent key is a no-op (§4.10's
+        // idempotent-replay posture), so the union is conservative and
+        // exact. Dedup is O(pending) and pending is bounded by the ino's
+        // un-persisted rebinds (never file size — the sparse-corpse law).
+        let mut refs = self.block_ref_ops(ino, &ref_changes);
+        let pending = self.take_block_ref_ops(ino);
+        if !pending.is_empty() {
+            let mut seen: std::collections::BTreeSet<crate::meta_backend::kv::block_refs::BlockRef> =
+                refs.iter().map(|op| op.reference).collect();
+            for op in pending {
+                if seen.insert(op.reference) {
+                    refs.push(crate::meta_backend::kv::block_refs::BlockRefOp::released(
+                        op.reference,
+                    ));
+                }
+            }
+        }
+        if !refs.is_empty() {
             if let Err(e) = self.release_block_refs(ino, &refs).await {
                 // Never block the reclaim on the ledger: a failed release
                 // is the conservative window above (blocks stay accounted

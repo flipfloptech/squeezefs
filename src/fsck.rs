@@ -1655,6 +1655,7 @@ pub async fn run_fleet(
     fin_counters.scan_secs = 0;
     publish_metrics(&worker_counters);
     publish_metrics(&fin_counters);
+    fleet.retire_fleet_shards(job_id);
     crate::fuse_client::METRICS
         .fsck_scan_secs
         .store(merged.counters.scan_secs, Ordering::Relaxed);

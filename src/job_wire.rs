@@ -2777,6 +2777,12 @@ impl crate::jobs::FleetDispatch for JobWireHost {
         });
         true
     }
+
+    fn retire_fleet_shards(&self, job_id: &str) {
+        self.shards
+            .lock()
+            .retain(|(jid, _), s| jid != job_id || s.fleet.is_none());
+    }
 }
 
 /// Send one ResultRefused reply (best-effort — a vanished session's

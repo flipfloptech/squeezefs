@@ -1048,6 +1048,12 @@ pub trait FleetDispatch: Send + Sync {
         throttle_pct: u32,
         tx: &FleetOutcomeTx,
     ) -> bool;
+    /// Drop the job's fleet shard state at pass end (the coordinator's
+    /// live map is per-`(job, shard)`; without retirement every fleet
+    /// pass would grow it by N-1 forever). A zombie's LATE proposal
+    /// still refuses stale after retirement — the unknown-shard arm is
+    /// the same refusal class.
+    fn retire_fleet_shards(&self, job_id: &str);
 }
 
 pub struct JobFabric {

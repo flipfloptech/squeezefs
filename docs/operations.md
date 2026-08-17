@@ -1347,10 +1347,39 @@ so there is nothing for a remote node to serialize into.
 * **Serial workloads are the known cost** (`tar -x`, `make`, `rsync`): a serial
   stream pays one fabric round trip per operation, which spec §6.10 R1 prices
   at 9,100/s → 6.7–20 k/s at 50–150 µs RTT. That regression is accepted
-  (ruling D10) and will be **published** with its own measured A/B; the
-  recovery is S10's subtree delegation. Concurrent streams amortize: verbs to
-  one owner coalesce into one frame, and `meta_ship.batched_verbs /
-  meta_ship.batches` is the live coalesce factor.
+  (ruling D10) and is **published, measured** (real linux-src `fs/` tar -x,
+  netem 250 µs wire RTT, A-B-B-A): S8 raw runs **0.14× of authority-local**;
+  with the S10 recovery levers ON — subtree delegations
+  (`SQUEEZEFS_DELEGATION`) + UPDATE intents (`SQUEEZEFS_UPDATE_INTENTS`) +
+  client-owned-slot placement (`SQUEEZEFS_SLOT_PLACEMENT`), all default-on —
+  it recovers to **0.149× (6.73× the local wall; 160–162 entries/s vs
+  1,057–1,105 local)** with the create/utime plane fully local
+  (`.benchmarks/2026-08-17-s10-slot-placement.md`). The spec-§6.9 S10 gate
+  ("tar -x back to ≤ 1.10× of S0") is **NOT met on the shipped topology, and
+  cannot be**: exactly one node holds every metadata volume's D0 claim, a
+  co-writer is metadata-read-only, so no client-owned slot exists to place
+  its work into and the residual ~11.7 shipped verbs/entry are per-entry
+  reads plus per-file custody/publish ceremony. Spec R1's own fallback is
+  therefore the product statement: **remote clients are throughput-oriented;
+  latency-sensitive serial metadata work runs on the owner.** Concurrent
+  streams amortize: verbs to one owner coalesce into one frame, and
+  `meta_ship.batched_verbs / meta_ship.batches` is the live coalesce factor.
+* **Client-owned-slot placement** (DLM S10 rung 14, `SQUEEZEFS_SLOT_PLACEMENT`,
+  default on, read only when the ownership plane is armed): an armed authority
+  mints each shipping client's fresh inos into a slot **dedicated to that
+  client** — outside the volume's mint rotor, stable per client — so a
+  client's minted population is migratable as ONE unit through the existing
+  online `migrate-meta-slot` engine. The auto-policy migrates a SUSTAINED
+  client's hot slots toward a metadata volume that client **owns**, after
+  which its verbs on those inos run locally (it IS the S8 authority for
+  them). On every fleet the product can mount today no shipping client owns
+  a volume, so the migration half is **structurally dark**
+  (`meta_ship_placement_migration_candidates` stays 0 — proven live by the
+  gate row) while the mint-targeting half engages
+  (`meta_ship_placement_client_slot_mints`). The policy is valve-bounded (the
+  rung-11 arithmetic, no knob): alternating clients can never ping-pong a
+  shared directory's slot — it demotes to stay-put for the derived cooldown
+  (`meta_ship_placement_thrash_demotions`).
 * **Failover** (when an owner dies and a successor takes its volumes): the
   successor bumps its durable era before arming, which makes every request and
   every token from the old era stale by construction, then opens a **grace

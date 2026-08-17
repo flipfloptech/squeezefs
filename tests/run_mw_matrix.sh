@@ -368,8 +368,11 @@ ensure_root() {
     [ "$(id -u)" -eq 0 ] && return 0
     log "root required (fleet mounts, stats inodes) — re-executing via sudo"
     local knobs=()
+    # SQZ_MWMATRIX_* rides too (rung 14): the tarx legs' TAR_SRC was
+    # silently dropped by the re-exec, downgrading a real-tree run to the
+    # synthesized fallback unless invoked as root directly.
     while IFS= read -r kv; do knobs+=("$kv"); done \
-        < <(env | grep -E '^(SQZ_MWFLEET_|SQZ_BIN=)' || true)
+        < <(env | grep -E '^(SQZ_MWFLEET_|SQZ_MWMATRIX_|SQZ_BIN=)' || true)
     exec sudo env "${knobs[@]}" bash "$0" "$@"
 }
 

@@ -165,15 +165,78 @@ Commits (branch `fix/s11-zeros-interleave-c8`):
   fsck findings 0, `meta_kv_block_refs_drift` 0, zero residue.
 * **Gate text restored** (`tests/run_mw_matrix.sh`): the narrowed
   standing-red adjudication is retired; a composition failure is now a
-  plain REGRESSION naming this note.
+  plain REGRESSION naming this note. The `SQUEEZEFS_RANGE_CUSTODY`
+  registry justification amended the same way (default stays OFF; the
+  default-ON revisit is rung 18's, behind this gate staying green).
 * Touched + adjacent suites serial: green (list in the gates section).
-* `s9-fanout` + `s10-intents-tarx`: one run each, green (rung 17's owed
-  re-runs).
+* **`s9-fanout`**: green on a fresh promptly-run fleet (engagement
+  exact, amp columns present, tripwires flat, fsck 0 / drift 0). A
+  first attempt on a fleet that had sat idle ~10 min failed with fsync
+  EINVAL — the authority's cluster-wire 60 s idle-session reaper closed
+  the publish session and the next lane-raise verb refused
+  (`alloc_lane_raise_refusals`, "the coordinator closed the session")
+  instead of reconnecting; recorded as a venue residual below, not a
+  composition fault (fresh-run green ×1; the leg has always run
+  promptly after create).
+* **`s10-intents-tarx`**: green on a fresh `SQZ_MWFLEET_OSS_GB=32`
+  fleet with the REAL linux-src `fs/` tree (2384 entries; A-B-B-A rows:
+  intents ON 14.54/14.65 verbs/entry vs OFF 17.41/17.55). Two venue
+  notes: (a) an aged fleet (post-s9-fanout churn) refuses with meta
+  ENOSPC on utime — fresh fleet per measured leg is the standing
+  discipline; (b) the default 4 GiB×2 data set is STRUCTURALLY too
+  small for a real-tree tarx on a co-writer (no staging ⇒ every
+  non-inline file costs a whole 4 MiB striped block; 2384 entries ≈
+  9.3 GiB of block accounting) — the 32 GiB thin-zram venue costs only
+  the written pages.
 
 ## The `s11-subblock` priced leg (acceptance item 4)
 
-Run once on the fixed binary (its venue findings 5a/5b were rung 17's).
-RESULT: recorded below — see the run section appended after execution.
+Run once on the fixed binary (fresh fleet,
+`--membership --lease-ttl-ms=6000` — finding 5b's venue; note the rig
+nuance: `--lease-ttl-ms` requires an explicit `--membership`). The leg
+now runs **further than either of rung 17's attempts**: the §9.3
+demotion barrier fired LIVE for the first time (it had never fired on a
+production mount — "no geometry, no barrier" — until this fix armed it):
+`range_custody_demotions 1 ≡ demotion_acks 1`, extents shipped and
+served through the assembler (`extent_served 6`, `extent_replays 4` —
+the witness engaging under resends), `extent_parks 2` /
+`extent_escalations 1` on the authority's W2 overlay.
+
+**Blocked before the price table by a NEW venue finding** (reachable
+only now that the barrier arms): under the two-holder same-block extent
+churn, the AUTHORITY-side assembler fold path exhausts the
+NON-ESCALATING settle ladder — m51's `FlushExtents` returned
+`EIO "block 0 of inode_2 did not settle after 24 binding rebinds"`
+(authority `stale_binding_rebinds` = 48; the read path's
+rebind-starvation fix escalates to the serialized settle arm, the fold
+venue does not). This is the sub-block plane's own machinery — OUT OF
+SCOPE for the zeros-interleave conviction (fixing it means extending
+the 2026-08-04 rebind-starvation escalation into the assembler fold, a
+red-first ladder of its own). The price table stays rung 18's, now with
+THREE named venue findings: 5a (POSIX-5 ladder on the ranged acquire),
+5b (barrier bound vs DLM_LEASE_WAIT), and this fold-settle exhaustion.
+
+## Gates
+
+* Touched + adjacent suites, serial (19 suites, all green):
+  mw_authority_assembler **17** (15 rails + the 2 new pins),
+  mw_publish_era_gate 5, dlm_range_custody 33, dlm_multi_writer 16,
+  mw_layout_version 11, mw_cowriter_free 13, mw_cowriter_lane 23,
+  dlm_cowriter 18, meta_ship 15, publish_coalesce 6,
+  publish_drain_economy 7, write_commit_economy 2, write_commit_crash 2,
+  layout_delta_fold 9, durable_block_refs 15, mw_truncate_lease_strand
+  1, overlay_overwrite 32, env_knob_convention 21, skip_ledger 11.
+* `cargo clippy --all-targets --all-features -- -D warnings` +
+  `cargo clippy --all-targets -- -D warnings` (shipped config): clean.
+* `cargo fmt --check`: clean. shellcheck: clean (`run_mw_matrix.sh`).
+* markdown link check: PASS (265 files, 0 broken).
+* No new env knobs (ENG-10: one existing registry text amended); no
+  loom (no lock-free core touched — the fix is an install + a refusal
+  arm under the existing serve serialization).
+* Zero-residue teardown asserted after every fleet (final:
+  `teardown complete — zero residue`, no state dirs, no stray
+  /dev/nvme* plain files, no mounts).
+* Full `task check`: DEFERRED per the rung charter.
 
 ## Residuals for rung 18 (updated from rung 17's ledger)
 
@@ -183,13 +246,24 @@ RESULT: recorded below — see the run section appended after execution.
    now MORE load-bearing because the demotion barrier is armed in
    production for the first time (it had never fired on a live mount
    before this fix).
-3. §9.5 MPI-IO / adversarial / block-cyclic rows (rung 18 proper).
-4. free_grace ack cadence under rewrite churn (rung 17 finding 5c).
-5. A RANGE holder whose custody was RELEASED before its straggler Put
+3. **The assembler fold-settle exhaustion** (NEW, found by the subblock
+   run above): the authority's fold path under two-holder same-block
+   extent churn exits the 24-rebind ladder as EIO on `FlushExtents`
+   instead of escalating to the serialized settle arm (the read path's
+   2026-08-04 fix). Blocks the `s11-subblock` price table.
+4. §9.5 MPI-IO / adversarial / block-cyclic rows (rung 18 proper).
+5. free_grace ack cadence under rewrite churn (rung 17 finding 5c).
+6. A RANGE holder whose custody was RELEASED before its straggler Put
    serves still applies verbatim (the `ClientCustodyShape::None` arm is
    the pre-custody class by rung 17's law). Unreachable in the leg
    (saves ship synchronously under held custody); a post-release
    straggler-publish class wants its own adjudication at rung 18.
-6. Rung 17 residuals 5 (whole-block re-acquire corner, spill-sink
+7. The cluster-wire idle-session reaper vs the publish client: a
+   lane-raise (and any witnessed verb) whose session was idle-reaped
+   refuses instead of reconnecting — surfaced as fsync EINVAL on an
+   idle-then-driven co-writer (the s9-fanout first-attempt shape).
+   The witnessed-resend machinery makes a reconnect-and-resend safe by
+   construction; wire it.
+8. Rung 17 residuals 5 (whole-block re-acquire corner, spill-sink
    recovery, zc-prefilled read-overlay corner, retention-overlay vs
    concurrent truncate) and rung 15's 4–6 — unchanged.

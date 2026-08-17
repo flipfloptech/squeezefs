@@ -768,6 +768,9 @@ mount_member() { # idx [--netns[=<delay_ms>]]
         env_args+=("SQUEEZEFS_MULTI_WRITER=1")
         env_args+=("SQUEEZEFS_MW_ROLE=co-writer")
         env_args+=("SQUEEZEFS_MW_AUTHORITY=$MW_ENDPOINT")
+        # Rung 15: the fleet's recorded range-custody posture (see the
+        # CONF block) — explicit-arm only, never ambient.
+        [ "${RANGE_CUSTODY:-0}" = "1" ] && env_args+=("SQUEEZEFS_RANGE_CUSTODY=1")
         local launch=(env "${env_args[@]}" "$SQZ")
         if [ "$netns" = "1" ]; then
             netns_setup "$idx"
@@ -1235,6 +1238,13 @@ create_fleet() {
         echo "MW='$mw'"
         echo "MW_PORT='${SQZ_MWFLEET_MW_PORT:-45999}'"
         echo "COWRITERS='$cowriters'"
+        # Rung 15 (KD-MW-7): SQZ_MWFLEET_RANGE_CUSTODY=1 at create arms
+        # SQUEEZEFS_RANGE_CUSTODY on every co-writer mount (the lever
+        # ships default-OFF until rungs 16/17 land the concurrent same-ino
+        # publish composition — the 2026-08-17 adjudication; the s11-range
+        # leg requires an armed fleet and is that composition's
+        # acceptance surface).
+        echo "RANGE_CUSTODY='${SQZ_MWFLEET_RANGE_CUSTODY:-0}'"
     } >"$CONF"
     : >"$VMS"
 

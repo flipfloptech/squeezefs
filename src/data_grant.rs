@@ -492,12 +492,12 @@ fn custody_census() -> serde_json::Value {
     )
 }
 
-/// The S11 A/B lever (design §11): ENG-10 `Kind::Bool`, static default
-/// **on**, read only when the mw plane is armed — the
-/// `SQUEEZEFS_DELEGATION` form verbatim. `=1` on an unarmed mount is
-/// announced-inert (every range gauge structurally 0), never a refusal;
-/// `=0` on an armed mount is the A/B control the S11 rows compare
-/// against.
+/// The S11 lever: ENG-10 `Kind::Bool`, read only when the mw plane is
+/// armed — the `SQUEEZEFS_DELEGATION` form. **Static default OFF until
+/// rungs 16/17 land** (adjudicated 2026-08-17 against §11's provisional
+/// default-on: the concurrent same-ino layout-publish composition is
+/// their machinery — see the registry entry and the rung-15 evidence
+/// note); set-but-unarmed is announced-inert, never a refusal.
 pub const RANGE_CUSTODY_ENV: &str = "SQUEEZEFS_RANGE_CUSTODY";
 
 /// **Test seam** (the `TEST_DELEGATION_OVERRIDE` precedent): `0` = read
@@ -516,7 +516,7 @@ pub fn range_custody_enabled() -> bool {
         2 => return false,
         _ => {}
     }
-    crate::meta_ship::ownership_armed() && crate::env_knobs::bool_knob(RANGE_CUSTODY_ENV, true)
+    crate::meta_ship::ownership_armed() && crate::env_knobs::bool_knob(RANGE_CUSTODY_ENV, false)
 }
 
 /// `off` (nothing armed — the shipped default), `authority` (this mount

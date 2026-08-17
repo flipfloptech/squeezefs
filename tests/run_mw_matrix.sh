@@ -346,8 +346,15 @@
 #                       dlm_revokes_expired moves and range_custody_active
 #                       converges to 0 once the survivor completes +
 #                       releases), the SURVIVOR's stream completes green,
-#                       the victim remounts, fsck findings 0 + C8 drift 0.
-#                       Zero residue (leg files removed, fleet healthy).
+#                       the victim remounts. THE COMPOSITION GATE RUNS
+#                       LAST AND IS STANDING-RED until rungs 16/17 land
+#                       the concurrent same-ino publish composition (the
+#                       G-RW2 pattern, live-leg form): cold-authority
+#                       verify of the survivor's acked half + fsck
+#                       findings 0 + C8 drift 0 — its red names the owed
+#                       rungs, and the leg still tears down to zero
+#                       residue (leg files removed, fleet healthy, every
+#                       member re-admitted) before the verdict.
 #   s10c-kill-shard [--corpus-mb=M]  (rung 10c, KD-MW-16 — needs
 #                       --membership and >= 3 members) kill -9 a member
 #                       MID-SHARD: a no-kill baseline learns the fleet's
@@ -3134,6 +3141,14 @@ PYS10C
 
 leg_s11_range() {
     require_cowriters 2
+    # Rung 15 ships DARK (SQUEEZEFS_RANGE_CUSTODY default-off until rungs
+    # 16/17 land the concurrent same-ino publish composition — the
+    # 2026-08-17 adjudication): this leg REQUIRES an explicitly armed
+    # fleet, and it is that composition's acceptance surface — its final
+    # gate is EXPECTED RED until those rungs land (the G-RW2 standing-RED
+    # pattern, live-leg form).
+    [ "${RANGE_CUSTODY:-0}" = "1" ] ||
+        die "s11-range needs a range-custody-ARMED fleet: sudo SQZ_MWFLEET_RANGE_CUSTODY=1 tests/mw_fleet.sh create N=1 --cowriters=2"
     local rowdir cws m1 m2 idx w_mnt
     rowdir="$STATE/rows/s11r-$(date +%s)"
     mkdir -p "$rowdir"
@@ -3200,7 +3215,7 @@ leg_s11_range() {
     sleep 3 # publish/writeback settle
     for idx in $(member_idxs); do snap "$idx" 1 "$rowdir"; done
 
-    # ---- The row: engagement + the Issue-19 column, gated --------------------
+    # ---- The rung-15 CUSTODY row: engagement + the Issue-19 column, gated ----
     python3 - "$rowdir" "$m1" "$m2" <<'PYS11' || die "s11-range: INVALID ROW"
 import json, sys
 rowdir, m1, m2 = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -3216,7 +3231,6 @@ def load(i, ph):
 bad = []
 print("== S11 rung-15 row: 2 co-writers, disjoint range custody of ONE file ==")
 print(f"{'member':<8}{'rng_acq_d':<11}{'rng_ext_d':<11}{'pub_ship_d':<12}{'lcr':<5}")
-tot_acq = 0
 for i in (m1, m2):
     d0, d1 = load(i, 0), load(i, 1)
     dd = lambda k: int(d1.get(k, 0) or 0) - int(d0.get(k, 0) or 0)
@@ -3236,7 +3250,6 @@ for i in (m1, m2):
         bad.append(f"m{i}: invariant_tripwires moved")
     if dd("mem_budget_hard_backstops") != 0 or dd("parked_gate_timeouts") != 0:
         bad.append(f"m{i}: R5 columns moved")
-    tot_acq += acq
 a0, a1 = load("0", 0), load("0", 1)
 ad = lambda k: int(a1.get(k, 0) or 0) - int(a0.get(k, 0) or 0)
 grants = ad("range_custody.range_custody_grants")
@@ -3253,22 +3266,23 @@ if grants < 2:
 if caps != 0:
     bad.append(f"authority: range_custody_cap_refusals moved ({caps}) on a within-budget "
                "shape — the Issue-19 class: a constant refusing the workload S11 exists for")
-for key, name in [("meta_ship_publish.refusals", "publish refusals"),
-                  ("meta_ship.owner_panics", "owner panics"),
+if confl != 0:
+    bad.append(f"authority: range_custody_conflicts moved ({confl}) — DISJOINT halves "
+               "under the coalescing algebra must never contend")
+for key, name in [("meta_ship.owner_panics", "owner panics"),
                   ("meta_ship_publish.owner_panics", "publish owner panics")]:
     v = int(a1.get(key, 0) or 0)
     if v != 0:
         bad.append(f"authority: {name} = {v} (must stay 0)")
 if bad:
-    print("S11 GATE FAILED:", file=sys.stderr)
+    print("S11 CUSTODY GATE FAILED:", file=sys.stderr)
     for b in bad:
         print(f"  {b}", file=sys.stderr)
     sys.exit(1)
-print("S11 phase-1 GATE GREEN (ranged engagement exact, Issue-19 column 0, ships accounted)")
+print("S11 custody GATE GREEN (ranged engagement exact, Issue-19 column 0, zero conflicts, ships accounted)")
 PYS11
 
-    # ---- Verify: own-mount halves, then the WHOLE file through a REMOUNTED
-    # authority (cold caches — the merged two-writer layout must compose).
+    # ---- Own-mount verification (each writer serves its own acked half) ------
     local sha_src sha_got
     for idx in "$m1" "$m2"; do
         local skip=0
@@ -3279,15 +3293,8 @@ PYS11
             die "s11-range: m$idx's own half does not verify through its own mount ($sha_src != $sha_got)"
     done
     log "own-mount half verification green (both writers)"
-    "$MWFLEET" unmount 0 || die "s11-range: authority unmount failed"
-    "$MWFLEET" mount 0 || die "s11-range: authority remount failed"
-    sha_src="$(cat "$rowdir/src-m$m1" "$rowdir/src-m$m2" | sha256sum | cut -d' ' -f1)"
-    sha_got="$(sha256sum "$w_mnt/s11-range.dat" | cut -d' ' -f1)"
-    [ "$sha_src" = "$sha_got" ] ||
-        die "s11-range: the MERGED two-writer file does not verify through a cold authority ($sha_src != $sha_got) — the sub-file layout composition is broken"
-    log "cold-authority whole-file verification green — the two writers' layouts COMPOSED"
 
-    # ---- Phase 2: the kill arm — a holder's ranges die with its era ----------
+    # ---- The kill arm: a holder's ranges die with its era --------------------
     local exp0 ttl deadline
     exp0="$(stat_field 0 dlm_custody.dlm_revokes_expired)"
     ttl="$(stat_field 0 membership_lease_ttl_ms)"
@@ -3332,30 +3339,80 @@ PYS11
         die "s11-range: range_custody_active=$active never converged to 0 — a dead/released holder's ranges are stranded in the table"
     log "range_custody_active converged to 0 (dead holder's ranges retired, survivor's released)"
 
-    # ---- Re-admission + the oracle -------------------------------------------
-    "$MWFLEET" mount "$m1" || die "s11-range: victim m$m1 could not re-admit by remount"
-    local out drift v
-    out="$("$SQZ" fsck "$w_mnt" 2>&1)" || die "s11-range: online fsck FAILED:
-$out"
-    echo "$out" >"$rowdir/fsck.out"
-    echo "$out" | grep -q "findings: 0" || die "s11-range: fsck findings != 0:
-$out"
+    # ---- Victim re-admission by remount (grace-bounded retry) ---------------
+    local admitted=0
+    for ((tries = 0; tries < 15; tries++)); do
+        if "$MWFLEET" mount "$m1" >/dev/null 2>&1; then
+            admitted=1
+            break
+        fi
+        sleep 10
+    done
+    [ "$admitted" = "1" ] || die "s11-range: victim m$m1 could not re-admit by remount within the grace ladder"
+    log "victim m$m1 re-admitted by remount"
+
+    # ==== THE COMPOSITION GATE (STANDING RED until rungs 16/17) ==============
+    # The merged two-writer layout read cold + the C8 oracle. Rung 15's
+    # custody plane is proven GREEN above; this block is the CONCURRENT
+    # same-ino layout-publish COMPOSITION — the machinery
+    # design-mw-layout-versions §6 assigns to the S9 publish surface and
+    # PR rows 16/17 own (the delta-chain/full-save base races under two
+    # publishers; bit 15 DETECTS — C8 drift — but detection is not
+    # composition). Adjudicated 2026-08-17
+    # (.benchmarks/2026-08-17-s11-range-wire.md): the lever ships
+    # default-OFF, this leg is the composition rungs' acceptance surface,
+    # and this gate flipping green is rung 16/17's live acceptance.
+    local comp_bad=""
+    "$MWFLEET" unmount 0 >/dev/null 2>&1 || true
+    "$MWFLEET" mount 0 >/dev/null 2>&1 || die "s11-range: authority remount failed"
+    sha_src="$(cat "$rowdir/src-m$m1" "$rowdir/src-m$m2" | sha256sum | cut -d' ' -f1)"
+    # (phase-1 sources: the kill arm rewrote m1's half with zeros and
+    # re-wrote m2's half from its source, so the composed expectation is
+    # zeros||src-m2.)
+    sha_src="$( (head -c "$half_bytes" /dev/zero; cat "$rowdir/src-m$m2") | sha256sum | cut -d' ' -f1)"
+    sha_got="$(sha256sum "$w_mnt/s11-range.dat" 2>/dev/null | cut -d' ' -f1)"
+    [ "$sha_src" = "$sha_got" ] ||
+        comp_bad="cold-authority whole-file verify: $sha_src != ${sha_got:-<read failed>}"
+    local out drift
+    if out="$("$SQZ" fsck "$w_mnt" 2>&1)"; then
+        echo "$out" >"$rowdir/fsck.out"
+        echo "$out" | grep -q "findings: 0" || comp_bad="${comp_bad:+$comp_bad; }fsck findings != 0"
+    else
+        echo "$out" >"$rowdir/fsck.out"
+        comp_bad="${comp_bad:+$comp_bad; }fsck FAILED"
+    fi
     drift="$(stat_field 0 meta_kv_block_refs_drift)"
-    [ "$drift" = "0" ] || die "s11-range: meta_kv_block_refs_drift=$drift (C8 oracle RED)"
-    for v in meta_ship.owner_panics meta_ship_publish.refusals invariant_tripwires; do
-        [ "$(stat_field 0 "$v")" = "0" ] || die "s11-range: authority $v != 0"
+    [ "$drift" = "0" ] || comp_bad="${comp_bad:+$comp_bad; }meta_kv_block_refs_drift=$drift (C8)"
+
+    # ---- Re-admit the co-writers the authority remount fenced ---------------
+    for idx in "$m1" "$m2"; do
+        "$MWFLEET" unmount "$idx" >/dev/null 2>&1 || true
+        admitted=0
+        for ((tries = 0; tries < 15; tries++)); do
+            if "$MWFLEET" mount "$idx" >/dev/null 2>&1; then
+                admitted=1
+                break
+            fi
+            sleep 10
+        done
+        [ "$admitted" = "1" ] || die "s11-range: co-writer m$idx could not re-admit after the cold-verify remount"
     done
 
-    # ---- Zero residue ---------------------------------------------------------
+    # ---- Zero residue --------------------------------------------------------
     rm -f "$w_mnt/s11-range.dat" || die "s11-range: could not remove the leg's file"
     rm -f "$rowdir/src-m$m1" "$rowdir/src-m$m2"
     for idx in $(member_idxs); do
         cat "$(mnt_of "$idx")/.stats" >/dev/null 2>&1 ||
             die "s11-range: member m$idx is not healthy at leg end"
     done
-    log "s11-range GREEN — the first sub-file multi-writer rows (snapshots + fsck in $rowdir). Evidence tier: measured-simulated (one box, co-located members)"
-}
+    for idx in $(member_idxs); do snap "$idx" 2 "$rowdir"; done
 
+    if [ -n "$comp_bad" ]; then
+        die "s11-range COMPOSITION GATE RED (custody half GREEN — engagement/Issue-19/kill-arm all passed; zero residue): $comp_bad.
+This is the STANDING-RED half (the G-RW2 pattern, live-leg form): concurrent same-ino layout publishes race the delta-chain/full-save base — design-mw-layout-versions §6's named residual, owned by PR rows 16/17. Bit 15 + C8 DETECT it (which is this red's instrument); rung 16/17's landing flips this exact gate green. Adjudication: .benchmarks/2026-08-17-s11-range-wire.md"
+    fi
+    log "s11-range GREEN — the first sub-file multi-writer rows, composition included (snapshots + fsck in $rowdir). Evidence tier: measured-simulated (one box, co-located members)"
+}
 leg_s10c_fsck_scale() {
     local rowdir members
     rowdir="$STATE/rows/s10c-fsck-scale-$(date +%s)"

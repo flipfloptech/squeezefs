@@ -1023,9 +1023,11 @@ async fn span_range_shared_classifies_custody() {
 //     probes serve the granted token locally; `dlm_token_cache_bytes`
 //     accounts range-span state.
 // 17. **Dark posture** — `SQUEEZEFS_RANGE_CUSTODY` is registered (ENG-10:
-//     Kind::Bool, static default on) and read ONLY when the mw plane is
-//     armed: on an unarmed process the lever answers false even when
-//     forced (the `delegation_enabled` law).
+//     Kind::Bool, static default OFF until rungs 16/17 — the 2026-08-17
+//     adjudication) and read ONLY when the mw plane is
+//     armed (and defaults OFF until rungs 16/17 land the publish
+//     composition — adjudicated 2026-08-17): on an unarmed process the
+//     lever answers false even when forced (the `delegation_enabled` law).
 // 18. **R5 registration** — `dlm_grant_table_bytes` (authority-side) and
 //     `dlm_token_cache_bytes` (client-side) are registered R5 components.
 // ===========================================================================
@@ -1859,7 +1861,8 @@ async fn renewal_range_vector_rebuilds_the_client_cache() {
 // ---------------------------------------------------------------------------
 
 /// Contract 17: `SQUEEZEFS_RANGE_CUSTODY` is a registered ENG-10 knob
-/// (Kind::Bool, static default on) and is read ONLY when the mw plane is
+/// (Kind::Bool, static default OFF until rungs 16/17 land the publish
+/// composition — the 2026-08-17 adjudication) and is read ONLY when the mw plane is
 /// armed — on this unarmed process the lever answers false even when
 /// forced on (the `delegation_enabled` law), which is what keeps every
 /// shipped mount's whole-file path structurally untouched (KD-MW-12).
@@ -1871,7 +1874,13 @@ async fn range_custody_lever_is_registered_and_inert_unarmed() {
         matches!(knob.kind, squeezefs::env_knobs::Kind::Bool),
         "the lever is Kind::Bool"
     );
-    assert_eq!(knob.default, "on", "static default on (design §11)");
+    assert_eq!(
+        knob.default, "off",
+        "static default OFF until rungs 16/17 land the concurrent same-ino \
+         publish composition (adjudicated 2026-08-17 — the never-lossy law \
+         outranks §11's provisional default-on; the s11-range leg arms it \
+         explicitly)"
+    );
 
     // Unarmed: false, even forced (read only when the mw plane is armed).
     assert!(

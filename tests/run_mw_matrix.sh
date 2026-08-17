@@ -3141,25 +3141,25 @@ PYS10C
 
 leg_s11_range() {
     require_cowriters 2
-    # Rung 15 ships DARK (SQUEEZEFS_RANGE_CUSTODY default-off until the
-    # concurrent same-ino publish composition lands — the 2026-08-17
-    # adjudication): this leg REQUIRES an explicitly armed fleet, and it
-    # is that composition's acceptance surface — its final gate is
-    # EXPECTED RED until it lands (the G-RW2 standing-RED pattern,
-    # live-leg form). Rung 16 adjudicated the composition's OWNER as
-    # wholly rung 17 (the authority assembler / WriteExtent publish
-    # surface — .benchmarks/2026-08-17-s11-b4-clause.md): the layout
-    # publish race is per-INO, so the B4 §5.1 range clause (a per-BLOCK
-    # fast-path screen) cannot close it. Rung 16's live gate HERE is the
+    # Rung 15 ships DARK (SQUEEZEFS_RANGE_CUSTODY default-off; the
+    # default-on revisit is rung 18's, behind this gate staying green):
+    # this leg REQUIRES an explicitly armed fleet, and it is the
+    # concurrent same-ino publish composition's acceptance surface. The
+    # composition LANDED: rung 17 shipped the machinery (chain-onto-head,
+    # batch-prior compaction, custody-scoped Puts) and the
+    # zeros-interleave fix armed it in production (the missing
+    # range-geometry install —
+    # .benchmarks/2026-08-17-s11-zeros-interleave-fix.md), flipping this
+    # gate GREEN ×3 from zero. Any red here is a REGRESSION now, never a
+    # standing adjudication. Rung 16's live gate HERE is the
     # zero-misfire columns (prs_d/ors_d — the clause must stay silent on
     # block-aligned custody, §9.5's aligned-row law) + the ledger-export
-    # check; the clause's FIRING venue is rung 17's demotion-barrier row
-    # (pre-17 the acquire algebra keeps every live grant edge
-    # block-aligned — outward-rounded desired, aligned-wall clipping,
-    # required-conflict serialization — so no product write can reach a
-    # range-shared block on a healthy fleet; the firing half is pinned
-    # in-process against directly-minted sub-block grants, the post-17
-    # shapes).
+    # check; the clause's FIRING venue is the demotion-barrier row
+    # (the acquire algebra keeps every live grant edge block-aligned —
+    # outward-rounded desired, aligned-wall clipping, required-conflict
+    # serialization — so no product write can reach a range-shared block
+    # on this leg's shape; the firing half is pinned in-process against
+    # directly-minted sub-block grants and runs live in s11-subblock).
     [ "${RANGE_CUSTODY:-0}" = "1" ] ||
         die "s11-range needs a range-custody-ARMED fleet: sudo SQZ_MWFLEET_RANGE_CUSTODY=1 tests/mw_fleet.sh create N=1 --cowriters=2"
     local rowdir cws m1 m2 idx w_mnt
@@ -3389,21 +3389,20 @@ PYS11
     [ "$admitted" = "1" ] || die "s11-range: victim m$m1 could not re-admit by remount within the grace ladder"
     log "victim m$m1 re-admitted by remount"
 
-    # ==== THE COMPOSITION GATE (rung 17: byte half GREEN, C8 half
-    # ==== STANDING RED — narrowed) ============================================
+    # ==== THE COMPOSITION GATE (GREEN — flipped ×3 from zero,
+    # ==== 2026-08-17) =========================================================
     # The merged two-writer layout read cold + the C8 oracle. Rung 17's
-    # chain-onto-head machinery flipped the BYTE half (the cold verify
-    # passes — pre-17 it failed): shipped layout merges CHAIN ONTO THE
-    # DURABLE HEAD (owner-restamped claim + owner-minted link version,
-    # the versioned DeltaUsed reply — publish schema 6), the chain-cap
-    # full save stands down for chained targets, batch-prior pass mates
-    # never compact over each other, and shipped full Puts are
-    # CUSTODY-SCOPED. The C8/fsck half stays STANDING RED on ONE
-    # characterized residual (rung-17 evidence note, findings ledger):
-    # the kill arm's zeros-rewrite loop (content-identical rewrite on
-    # the LOW half racing a differing-content HIGH-half peer) still
-    # mints dangling ledger takes + double-release free refusals —
-    # the iso2..iso6 discriminator matrix in the note pins the shape.
+    # chain-onto-head machinery flipped the BYTE half (shipped layout
+    # merges CHAIN ONTO THE DURABLE HEAD — owner-restamped claim +
+    # owner-minted link version, the versioned DeltaUsed reply, publish
+    # schema 6; the chain-cap full save stands down for chained targets;
+    # batch-prior pass mates never compact over each other), and the
+    # zeros-interleave fix flipped the C8 half: shipped full Puts are
+    # CUSTODY-SCOPED **and the scoping is armed in production** (the
+    # range-geometry source `arm_multi_writer` was missing — a range
+    # holder's Put now applies scoped or REFUSES, never verbatim;
+    # .benchmarks/2026-08-17-s11-zeros-interleave-fix.md). Any failure
+    # below is a REGRESSION.
     local comp_bad=""
     "$MWFLEET" unmount 0 >/dev/null 2>&1 || true
     "$MWFLEET" mount 0 >/dev/null 2>&1 || die "s11-range: authority remount failed"
@@ -3450,8 +3449,8 @@ PYS11
     for idx in $(member_idxs); do snap "$idx" 2 "$rowdir"; done
 
     if [ -n "$comp_bad" ]; then
-        die "s11-range COMPOSITION GATE RED (custody half GREEN — engagement/Issue-19/kill-arm/rung-16-clause columns all passed; zero residue): $comp_bad.
-Rung 17 NARROWED this standing red (.benchmarks/2026-08-17-s11-authority-assembler.md): the BYTE half is green (chain-onto-head shipped merges — a cold-verify mismatch here is a REGRESSION), three composition convictions are fixed+pinned (divergence-refusal wedge, batch-prior pass-mate compaction, un-scoped shipped full Puts), and the residual C8 mint is the characterized zeros-rewrite interleave (the note's iso2..iso6 matrix) owned by the rung-18 ladder. Lineage: .benchmarks/2026-08-17-s11-range-wire.md + .benchmarks/2026-08-17-s11-b4-clause.md."
+        die "s11-range COMPOSITION GATE FAILED — a REGRESSION (this gate flipped GREEN x3 from zero on 2026-08-17): $comp_bad.
+The composition is LANDED machinery: chain-onto-head shipped merges + batch-prior compaction + custody-scoped shipped full Puts (rung 17, .benchmarks/2026-08-17-s11-authority-assembler.md) with the scoping ARMED in production by the range-geometry install and the scoped-or-refused Put law (.benchmarks/2026-08-17-s11-zeros-interleave-fix.md). A cold-verify mismatch, fsck finding, or C8 drift here reintroduces a fixed conviction — stop and read those two notes. Lineage: .benchmarks/2026-08-17-s11-range-wire.md + .benchmarks/2026-08-17-s11-b4-clause.md."
     fi
     log "s11-range GREEN — the first sub-file multi-writer rows, composition included (snapshots + fsck in $rowdir). Evidence tier: measured-simulated (one box, co-located members)"
 }

@@ -90,7 +90,7 @@ dlm_multi_writer, durable_block_refs, env_knob_convention, skip_ledger).
 
 Venue: the tcp devsub fleet (`tests/mw_fleet.sh create 4 --membership`,
 nvmet-tcp on 127.0.0.1, 2 mds null_blk + 2 oss zram, one box), binary
-`189da82d4608` release (default features), **quiet** (no foreign cargo,
+`9d629c49dedb` release (default features), **quiet** (no foreign cargo,
 loadavg ≈ 3.8 / 32 cpus). Instrument: `time`d `squeezefs fsck <mnt0>
 --scrub --throttle 10` (the CLI's 500 ms status poll is inside every
 row equally); corpus = 96 × 32 MiB urandom files (3 GiB), written+

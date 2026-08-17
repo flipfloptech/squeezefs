@@ -218,8 +218,9 @@ fn the_wire_vocabulary_covers_every_shipped_trait_member() {
     const _: () = assert!(ship::VERB_RECLAIM != cw::VERB_PING);
     assert_eq!(
         ship::META_SHIP_SCHEMA,
-        2,
-        "the vocabulary's schema (2 since rung 12's delegation verbs — design §11 'schema +1')"
+        3,
+        "the vocabulary's schema (2 since rung 12's delegation verbs — design §11 'schema +1'; \
+         3 since rung 13's UPDATE intents)"
     );
 
     // The dedup window and the grace gate both key on this classification.
@@ -368,6 +369,7 @@ fn frames_round_trip_and_untrusted_bytes_refuse_loud() {
                 }],
                 revokes: vec![7],
                 revoke_fence: 9,
+                intent_grant: None,
             },
             ship::MetaOpResult {
                 id: 2,
@@ -379,6 +381,7 @@ fn frames_round_trip_and_untrusted_bytes_refuse_loud() {
                 delegs: Vec::new(),
                 revokes: Vec::new(),
                 revoke_fence: 0,
+                intent_grant: None,
             },
         ],
     };

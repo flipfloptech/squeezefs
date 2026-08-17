@@ -85,7 +85,16 @@ use serde::{Deserialize, Serialize};
 /// vocabulary gains the [`VERB_DELEG_RECALL`] / [`VERB_DELEG_REASSERT`]
 /// verbs. A schema-1 peer refuses loud (KD-MW-11: wire schema versions
 /// carry compatibility; no incompat bit — delegations are RAM).
-pub const META_SHIP_SCHEMA: u32 = 2;
+///
+/// **3** (rung 13 — KD-MW-13 per-directory EXCLUSIVE UPDATE grants +
+/// asynchronous create-intent batches): per-op results gain the optional
+/// [`IntentGrant`] (the UPDATE authority: dentry census + ino supply,
+/// riding the reply of a shipped create — the intent-lock law applied to
+/// mint authority), and the vocabulary gains [`VERB_DELEG_INTENT`] — the
+/// batched intent-apply verb, era-gated on the custody `lease_epoch` and
+/// witnessed on `(lease_epoch, request_id)` FROM BIRTH (the rung-9
+/// finding-#6 law: a custody-bearing mutation verb never ships un-gated).
+pub const META_SHIP_SCHEMA: u32 = 3;
 
 /// `cluster_wire` RPC verb carrying a batch of metadata calls. S3 reserved
 /// 0 for its ping and S4's lock verbs take the low numbers; the metadata
@@ -135,15 +144,33 @@ pub const VERB_DELEG_RECALL: u16 = VERB_DELEG_BASE;
 /// its grace window and receives fresh-era grants; un-reasserted grants
 /// are gone (the NFSv4 law; the `VERB_RECLAIM` shape one plane up).
 pub const VERB_DELEG_REASSERT: u16 = VERB_DELEG_BASE + 1;
+/// The **intent batch** (rung 13, KD-MW-13): the UPDATE holder's flush —
+/// an ordered batch of locally-acked child mutations (creates at
+/// pre-supplied inos + deferred setattrs on pending inos) applied by the
+/// owner. Era-gated (owner term + custody lease epoch) and witnessed
+/// (`(lease_epoch, request_id)` dedup) FROM BIRTH.
+pub const VERB_DELEG_INTENT: u16 = VERB_DELEG_BASE + 2;
 /// Last verb of the delegation block.
 pub const VERB_DELEG_LAST: u16 = 0x04FF;
 
+/// Frame status (rung 13): the intent batch presented a custody lease
+/// epoch the authority cannot verify as live custody — the batch dies
+/// with the custody fence (the publish path's `PUBLISH_STALE_LEASE` law
+/// on this verb). Refused BEFORE the witness window: a dead era's replay
+/// must never be answered from cache.
+pub const STATUS_INTENT_LEASE: u16 = 39;
+
 /// The LOOKUP capability bit (design §8.2's mode table): dentry + attr
 /// reads of the delegated object serve from the holder's
-/// reader-revalidation view under the coherence promise. `UPDATE`/`PERM`/
-/// `XATTR` are rows 13+'s and deliberately not defined yet — an undefined
-/// bit cannot be granted by accident.
+/// reader-revalidation view under the coherence promise. `PERM`/`XATTR`
+/// are later rows' and deliberately not defined yet — an undefined bit
+/// cannot be granted by accident.
 pub const DELEG_CLASS_LOOKUP: u8 = 1;
+/// The UPDATE capability bit (rung 13, KD-MW-13): child-entry MINT
+/// authority over one directory — EXCLUSIVE per directory (recall-on-
+/// conflict), carried as [`IntentGrant`] beside the LOOKUP-class
+/// [`DelegGrant`]s (a bitmask so one entry can carry both classes).
+pub const DELEG_CLASS_UPDATE: u8 = 2;
 
 /// The verbs on the wire — the trait census above, one code each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -560,6 +587,13 @@ pub struct MetaOpResult {
     /// arrival (the cross-session grant/recall ordering law — see
     /// [`DelegGrant::seq`]). `0` when `revokes` is empty.
     pub revoke_fence: u64,
+    /// The piggybacked **EXCLUSIVE UPDATE grant** (rung 13, schema 3):
+    /// rides the reply of a successful shipped CREATE into a directory
+    /// this client may hold mint authority over (the parent, and the
+    /// created directory itself). `None` on every other verb, on
+    /// refusals, on lever-off owners, and when the exclusivity/valve/
+    /// census gates decline.
+    pub intent_grant: Option<IntentGrant>,
 }
 
 /// The stamp a delegation grant carries: the object's volume's **commit
@@ -608,6 +642,166 @@ pub struct DelegGrant {
     pub term: u64,
     /// The view-currency stamp (see [`DelegStamp`]).
     pub stamp: DelegStamp,
+}
+
+/// A **pre-reserved ino supply** (rung 13): the mint authority's number
+/// half. The owner reserves `count` fresh locals from ONE (volume, slot)
+/// cursor by advancing it — so the numbers can never be re-minted by the
+/// owner within its incarnation — and the holder mints
+/// `first_global + k × stride` locally. Unused inos BURN at grant death
+/// (§4.8's monotonic-allocation law: a burned ino is free), and a supply
+/// never survives an owner era: the flush frame presents the supply's own
+/// `owner_term`, so a successor's era gate refuses every stale-supply
+/// apply before its recovered cursor could collide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InoSupply {
+    /// The first reserved GLOBAL ino.
+    pub first_global: u64,
+    /// Global stride between consecutive reserved locals (the routing
+    /// width's slot encoding is affine in the local — asserted at
+    /// reservation).
+    pub stride: u64,
+    /// Reserved count.
+    pub count: u32,
+}
+
+/// The **EXCLUSIVE UPDATE grant** (rung 13, KD-MW-13): per-directory
+/// child-entry mint authority, riding the reply of the shipped create the
+/// client was already issuing (the intent-lock law).
+///
+/// The `census` is the §8.2 "dentry-version revalidation at grant",
+/// discharged as the ENTRY SET itself: D's names snapshotted at grant
+/// time, bounded by the wire's CONTROL budget (an over-budget directory
+/// DECLINES the grant — the design's priced fallback, never a correctness
+/// fork). Exclusivity keeps it exact thereafter — every foreign mutation
+/// of D recalls this grant first, and the holder folds its OWN mutations
+/// in — so a local negative lookup IS authoritative and `O_EXCL` is
+/// decidable locally. A volume-wide watermark deliberately does NOT gate
+/// mints: it never settles under a create storm (the rung-12 measured
+/// tar-x disengagement), which is exactly the shape this grant exists for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntentGrant {
+    /// The delegated directory.
+    pub dir: u64,
+    /// Owner-minted monotone sequence (the [`DelegGrant::seq`] space —
+    /// recalls fence both classes with one number).
+    pub seq: u64,
+    /// The owner's durable era.
+    pub term: u64,
+    /// The directory's mode (setgid inheritance is computed at mint AND
+    /// re-computed at apply; exclusivity keeps the two equal).
+    pub dir_mode: u32,
+    /// The directory's gid (the setgid-inheritance input).
+    pub dir_gid: u32,
+    /// D's complete name set at grant time (≤ the census budget).
+    pub census: Vec<String>,
+    /// The mint supply riding this grant (`None` when the reply already
+    /// carried one — one supply chunk per reply).
+    pub supply: Option<InoSupply>,
+}
+
+/// One locally-acked child mutation inside an intent batch (rung 13).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IntentCall {
+    /// A create at a PRE-SUPPLIED global ino (the client minted the
+    /// number from its [`InoSupply`]; the owner applies the record AT
+    /// that ino). `ts_ns` is the client's mint instant — the applied
+    /// record's times, so a `stat` answers the same times before and
+    /// after the flush.
+    CreateAt {
+        parent: u64,
+        name: String,
+        ino: u64,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        rdev: u32,
+        initial_size: u64,
+        ts_ns: u64,
+    },
+    /// A deferred setattr on a PENDING ino (the tar `utimensat` shape) —
+    /// ordered strictly after the create it names inside the batch.
+    /// Deliberately sizeless: a size change is a data-plane act and
+    /// barriers + ships instead.
+    SetattrAt {
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        atime: Option<u64>,
+        mtime: Option<u64>,
+        ctime: Option<u64>,
+    },
+}
+
+impl IntentCall {
+    /// The directory whose deferred-refusal latch a failure of this op
+    /// lands on.
+    pub fn latch_dir(&self, pending_dir_of: impl Fn(u64) -> Option<u64>) -> Option<u64> {
+        match self {
+            IntentCall::CreateAt { parent, .. } => Some(*parent),
+            IntentCall::SetattrAt { ino, .. } => pending_dir_of(*ino),
+        }
+    }
+}
+
+/// One intent op: the witness id plus the call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntentOp {
+    /// Client-chosen, monotone per process — the `(lease_epoch,
+    /// request_id)` witness's other half.
+    pub request_id: u64,
+    pub call: IntentCall,
+}
+
+/// The intent batch (the **VERB_DELEG_INTENT** request): one flush of the
+/// holder's pending intents, executed IN ORDER on the owner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntentBatchFrame {
+    pub schema: u32,
+    pub client_epoch: u64,
+    /// The holder's KD-MW-2 identity (the grant bookkeeping's key AND the
+    /// custody-lease identity the era gate verifies).
+    pub client_id: String,
+    /// The owner era the batch's supply + grants were minted under. A
+    /// mismatch refuses the frame WHOLE — which is what makes a dead
+    /// era's supply structurally un-appliable (see [`InoSupply`]).
+    pub owner_term: u64,
+    /// The custody lease epoch (the era gate's input — intents die with
+    /// the custody fence).
+    pub lease_epoch: u64,
+    /// Refill request: how many supply inos the holder wants back on the
+    /// reply (0 = none).
+    pub supply_request: u32,
+    /// Executed in ORDER: in-batch causality is submission order (a
+    /// create and the setattr that names it ride one batch, ordered).
+    pub ops: Vec<IntentOp>,
+}
+
+/// One intent op's outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntentResult {
+    pub request_id: u64,
+    /// `Err` = the deferred refusal (§8.2 law 2): the client latches the
+    /// errno onto the directory and DESTROYS the local mint.
+    pub outcome: std::result::Result<(), WireError>,
+    /// Reply-ridden revocations of the FLUSHING holder's own LOOKUP-class
+    /// grants that this op's apply invalidated (the self-conflict
+    /// surrender law, on this verb's reply).
+    pub revokes: Vec<u64>,
+    /// The fence for `revokes` (see [`MetaOpResult::revoke_fence`]).
+    pub revoke_fence: u64,
+}
+
+/// The intent batch's reply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntentBatchReply {
+    pub schema: u32,
+    pub owner_term: u64,
+    pub results: Vec<IntentResult>,
+    /// The requested supply refill (`None` when none was requested or the
+    /// reservation could not be made).
+    pub supply: Option<InoSupply>,
 }
 
 /// A batch of calls against ONE owner: the **pipelining unit**.
@@ -852,4 +1046,24 @@ pub fn encode_deleg_reassert_reply(frame: &DelegReassertReply) -> Result<Vec<u8>
 /// Decode a re-assertion reply (**untrusted** — bounded).
 pub fn decode_deleg_reassert_reply(bytes: &[u8]) -> Result<DelegReassertReply> {
     decode(bytes, "deleg reassert reply")
+}
+
+/// Encode an intent batch.
+pub fn encode_intent_batch(frame: &IntentBatchFrame) -> Result<Vec<u8>> {
+    encode(frame, "intent batch")
+}
+
+/// Decode an intent batch (**untrusted** — bounded).
+pub fn decode_intent_batch(bytes: &[u8]) -> Result<IntentBatchFrame> {
+    decode(bytes, "intent batch")
+}
+
+/// Encode an intent batch reply.
+pub fn encode_intent_batch_reply(frame: &IntentBatchReply) -> Result<Vec<u8>> {
+    encode(frame, "intent batch reply")
+}
+
+/// Decode an intent batch reply (**untrusted** — bounded).
+pub fn decode_intent_batch_reply(bytes: &[u8]) -> Result<IntentBatchReply> {
+    decode(bytes, "intent batch reply")
 }

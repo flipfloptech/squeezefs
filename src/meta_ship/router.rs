@@ -310,6 +310,67 @@ impl MetaShipRouter {
         self.ship_ops_with_term(peer, ops, term).await
     }
 
+    /// This router's wire identity for the intent lane (rung 13).
+    pub(crate) fn intent_ctx(&self) -> super::intents::LaneCtx {
+        super::intents::LaneCtx {
+            peer_id: Arc::clone(&self.peer_id),
+            secret: Arc::clone(&self.secret),
+            client_epoch: self.client_epoch,
+        }
+    }
+
+    /// The ordering barrier (rung 13): a SHIPPED verb naming pending
+    /// intent state (a pending ino, a pending name, a dir with pending
+    /// ops) flushes first — owner-side application order always respects
+    /// local causality. One relaxed load when nothing is pending.
+    async fn intent_barrier(&self, inos: &[u64], pairs: &[(u64, &str)]) -> Result<()> {
+        if !super::intents::barrier_needed(inos, pairs) {
+            return Ok(());
+        }
+        super::intents::flush_all(true).await.map_err(|errno| {
+            SqueezefsError::refused(
+                errno,
+                "S10 intents: the ordering barrier's flush failed — refusing the shipped verb \
+                 rather than letting it overtake the un-applied intents it names"
+                    .to_string(),
+            )
+        })
+    }
+
+    /// [`Self::intent_barrier`] for one `MetaCall` (the generic mutating
+    /// ship arm's form).
+    async fn intent_barrier_call(&self, call: &MetaCall) -> Result<()> {
+        let inos = call.named_inos();
+        match call {
+            MetaCall::LookupDentry { parent, name }
+            | MetaCall::CreateWithRdev { parent, name, .. }
+            | MetaCall::Unlink { parent, name } => {
+                self.intent_barrier(&inos, &[(*parent, name.as_str())])
+                    .await
+            }
+            MetaCall::Rename {
+                old_parent,
+                old_name,
+                new_parent,
+                new_name,
+                ..
+            } => {
+                self.intent_barrier(
+                    &inos,
+                    &[
+                        (*old_parent, old_name.as_str()),
+                        (*new_parent, new_name.as_str()),
+                    ],
+                )
+                .await
+            }
+            MetaCall::Link { new_parent, .. } => {
+                self.intent_barrier(&inos, &[(*new_parent, "")]).await
+            }
+            _ => self.intent_barrier(&inos, &[]).await,
+        }
+    }
+
     /// Absorb one result's delegation payloads (rung 12): reply-ridden
     /// revocations FIRST (they must land before the caller's await
     /// returns — read-your-own-writes), then the piggybacked grants, then
@@ -326,6 +387,16 @@ impl MetaShipRouter {
                 tokens::RevokeKind::Reply,
             )
             .await;
+        }
+        // Rung 13: the piggybacked EXCLUSIVE UPDATE grant (census + ino
+        // supply) installs into the intent lane, and the recall channel
+        // must run for it (exclusivity is only enforceable while a recall
+        // can reach us — the mint gate checks channel freshness).
+        if let Some(g) = &result.intent_grant {
+            if super::intents::update_intents_enabled() {
+                super::intents::absorb_intent_grant(&peer.endpoint, self.intent_ctx(), g);
+                self.ensure_recall_channel(peer);
+            }
         }
         if result.delegs.is_empty() || !tokens::delegation_enabled() {
             return;
@@ -1062,17 +1133,36 @@ impl Metadata for MetaShipRouter {
             // ino-only answer means the child is owned elsewhere, so the
             // getattr routes on its own below.
             VerbRoute::Ship(peer) => {
-                // Rung 12: the delegated serve — ZERO round trips when the
-                // parent (and child) are delegated and view-current.
-                match self.deleg_lookup(&peer.endpoint, parent, name).await {
-                    DelegLookup::Hit(inode) => return Ok(inode),
-                    DelegLookup::Negative => {
+                // Rung 13: the intent probes FIRST — a pending mint serves
+                // its image, an UPDATE-governed census answers negatives
+                // authoritatively, and census names SHIP (the reader view
+                // may lag our own applies, so the rung-12 delegated serve
+                // is forbidden while the authority governs the dir).
+                let mut census_governs = false;
+                match super::intents::lookup_probe(&peer.endpoint, parent, name) {
+                    super::intents::LookupProbe::Image(inode) => return Ok(inode),
+                    super::intents::LookupProbe::Negative => {
                         return Err(SqueezefsError::Io(std::io::Error::new(
                             std::io::ErrorKind::NotFound,
                             format!("Dentry {name} not found in parent {parent}"),
                         )))
                     }
-                    DelegLookup::Miss => {}
+                    super::intents::LookupProbe::Ship => census_governs = true,
+                    super::intents::LookupProbe::None => {}
+                }
+                // Rung 12: the delegated serve — ZERO round trips when the
+                // parent (and child) are delegated and view-current.
+                if !census_governs {
+                    match self.deleg_lookup(&peer.endpoint, parent, name).await {
+                        DelegLookup::Hit(inode) => return Ok(inode),
+                        DelegLookup::Negative => {
+                            return Err(SqueezefsError::Io(std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                format!("Dentry {name} not found in parent {parent}"),
+                            )))
+                        }
+                        DelegLookup::Miss => {}
+                    }
                 }
                 match self.ship_one(&peer, call).await? {
                     MetaReply::Inode(inode) => return Ok(Inode::from(inode)),
@@ -1115,6 +1205,28 @@ impl Metadata for MetaShipRouter {
                     .await
             }
             VerbRoute::Ship(peer) => {
+                // Rung 13 — the LOCAL MINT (§8.2's zero-round-trip create):
+                // under a live EXCLUSIVE UPDATE grant on the parent, the
+                // create acks from the local intent; the census answers
+                // O_EXCL exactly; declines fall through to the shipped
+                // path (which is also what EARNS the grant).
+                match super::intents::try_mint_create(
+                    &peer.endpoint,
+                    parent,
+                    name,
+                    mode,
+                    uid,
+                    gid,
+                    rdev,
+                    0,
+                ) {
+                    super::intents::MintOutcome::Minted(inode) => return Ok(inode),
+                    super::intents::MintOutcome::Exists => {
+                        return Err(SqueezefsError::already_exists("File already exists"))
+                    }
+                    super::intents::MintOutcome::NotEligible => {}
+                }
+                self.intent_barrier_call(&call).await?;
                 expect_inode(self.ship_one(&peer, call).await?, MetaVerb::CreateWithRdev)
             }
         }
@@ -1131,6 +1243,7 @@ impl Metadata for MetaShipRouter {
                 self.inner.unlink(parent, name).await
             }
             VerbRoute::Ship(peer) => {
+                self.intent_barrier_call(&call).await?;
                 expect_ino(self.ship_one(&peer, call).await?, MetaVerb::Unlink)
             }
         }
@@ -1148,6 +1261,7 @@ impl Metadata for MetaShipRouter {
                 self.inner.link(ino, new_parent, new_name).await
             }
             VerbRoute::Ship(peer) => {
+                self.intent_barrier_call(&call).await?;
                 expect_inode(self.ship_one(&peer, call).await?, MetaVerb::Link)
             }
         }
@@ -1176,6 +1290,7 @@ impl Metadata for MetaShipRouter {
                     .await
             }
             VerbRoute::Ship(peer) => {
+                self.intent_barrier_call(&call).await?;
                 expect_unit(self.ship_one(&peer, call).await?, MetaVerb::Rename)
             }
         }
@@ -1193,8 +1308,17 @@ impl Metadata for MetaShipRouter {
                 self.inner.readdir(dir, offset, max).await
             }
             VerbRoute::Ship(peer) => {
-                if let Some(entries) = self.deleg_readdir(&peer.endpoint, dir, offset, max).await {
-                    return Ok(entries);
+                // Rung 13: pending intents in the dir flush first (the
+                // shipped page must be complete), and the rung-12
+                // view-serve is forbidden while an UPDATE authority
+                // governs the dir (the view may lag our own applies).
+                self.intent_barrier(&[dir], &[]).await?;
+                if !super::intents::authority_governs(&peer.endpoint, dir) {
+                    if let Some(entries) =
+                        self.deleg_readdir(&peer.endpoint, dir, offset, max).await
+                    {
+                        return Ok(entries);
+                    }
                 }
                 match self.ship_one(&peer, call).await? {
                     MetaReply::Dir(entries) => {
@@ -1218,6 +1342,21 @@ impl Metadata for MetaShipRouter {
                 self.inner.getattr(ino).await
             }
             VerbRoute::Ship(peer) => {
+                // Rung 13: a pending mint serves its image; a destroyed
+                // mint answers the owner's latched errno (§8.2's child
+                // poison).
+                if let Some(image) = super::intents::pending_image(ino) {
+                    return Ok(image);
+                }
+                if let Some(errno) = super::intents::destroyed_errno(ino) {
+                    return Err(SqueezefsError::refused(
+                        errno,
+                        format!(
+                            "ino {ino} was a locally-minted intent whose apply was refused \
+                             (the deferred-error law) — the mint is destroyed"
+                        ),
+                    ));
+                }
                 if let Some(inode) = self.deleg_getattr(&peer.endpoint, ino).await {
                     return Ok(inode);
                 }
@@ -1256,6 +1395,33 @@ impl Metadata for MetaShipRouter {
                     .await
             }
             VerbRoute::Ship(peer) => {
+                // Rung 13: a setattr on a PENDING ino defers INTO the
+                // batch (the tar utimensat shape — zero wire, ordered
+                // after the create it names); size changes and
+                // non-pending inos take the barriered shipped path.
+                if let Some(image) = super::intents::try_defer_setattr(
+                    &peer.endpoint,
+                    ino,
+                    mode,
+                    uid,
+                    gid,
+                    size,
+                    atime,
+                    mtime,
+                    ctime,
+                ) {
+                    return Ok(image);
+                }
+                if let Some(errno) = super::intents::destroyed_errno(ino) {
+                    return Err(SqueezefsError::refused(
+                        errno,
+                        format!(
+                            "ino {ino} was a locally-minted intent whose apply was refused \
+                             (the deferred-error law) — the mint is destroyed"
+                        ),
+                    ));
+                }
+                self.intent_barrier_call(&call).await?;
                 expect_inode(self.ship_one(&peer, call).await?, MetaVerb::Setattr)
             }
         }
@@ -1271,14 +1437,17 @@ impl Metadata for MetaShipRouter {
                 note_local();
                 self.inner.getxattr(ino, name).await
             }
-            VerbRoute::Ship(peer) => match self.ship_one(&peer, call).await? {
-                MetaReply::Xattr(value) => Ok(value),
-                other => Err(super::protocol_error(
-                    MetaVerb::Getxattr,
-                    &format!("{other:?}"),
-                    "an xattr value",
-                )),
-            },
+            VerbRoute::Ship(peer) => {
+                self.intent_barrier(&[ino], &[]).await?;
+                match self.ship_one(&peer, call).await? {
+                    MetaReply::Xattr(value) => Ok(value),
+                    other => Err(super::protocol_error(
+                        MetaVerb::Getxattr,
+                        &format!("{other:?}"),
+                        "an xattr value",
+                    )),
+                }
+            }
         }
     }
 
@@ -1294,6 +1463,7 @@ impl Metadata for MetaShipRouter {
                 self.inner.setxattr(ino, name, value).await
             }
             VerbRoute::Ship(peer) => {
+                self.intent_barrier_call(&call).await?;
                 expect_unit(self.ship_one(&peer, call).await?, MetaVerb::Setxattr)
             }
         }
@@ -1310,6 +1480,7 @@ impl Metadata for MetaShipRouter {
                 self.inner.removexattr(ino, name).await
             }
             VerbRoute::Ship(peer) => {
+                self.intent_barrier_call(&call).await?;
                 expect_unit(self.ship_one(&peer, call).await?, MetaVerb::Removexattr)
             }
         }
@@ -1322,14 +1493,17 @@ impl Metadata for MetaShipRouter {
                 note_local();
                 self.inner.listxattr(ino).await
             }
-            VerbRoute::Ship(peer) => match self.ship_one(&peer, call).await? {
-                MetaReply::Names(names) => Ok(names),
-                other => Err(super::protocol_error(
-                    MetaVerb::Listxattr,
-                    &format!("{other:?}"),
-                    "an xattr name list",
-                )),
-            },
+            VerbRoute::Ship(peer) => {
+                self.intent_barrier(&[ino], &[]).await?;
+                match self.ship_one(&peer, call).await? {
+                    MetaReply::Names(names) => Ok(names),
+                    other => Err(super::protocol_error(
+                        MetaVerb::Listxattr,
+                        &format!("{other:?}"),
+                        "an xattr name list",
+                    )),
+                }
+            }
         }
     }
 
@@ -1341,6 +1515,7 @@ impl Metadata for MetaShipRouter {
                 self.inner.destroy_inode(ino).await
             }
             VerbRoute::Ship(peer) => {
+                self.intent_barrier_call(&call).await?;
                 expect_unit(self.ship_one(&peer, call).await?, MetaVerb::DestroyInode)
             }
         }

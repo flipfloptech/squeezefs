@@ -260,8 +260,9 @@ fn lane() -> ship::RecallLaneStats {
 fn the_wire_carries_the_delegation_vocabulary_and_refuses_untrusted_bytes() {
     assert_eq!(
         ship::META_SHIP_SCHEMA,
-        2,
-        "the delegation verbs are the schema-2 bump (design §11: 'schema +1')"
+        3,
+        "the delegation verbs joined at the schema-2 bump (design §11: 'schema +1'); \
+         rung 13's UPDATE intents are the schema-3 bump on the same vocabulary"
     );
     // Verb block: its own range, disjoint from ping (0), meta batch
     // (16/17), custody (0x0200), publish (0x0300).

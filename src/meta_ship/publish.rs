@@ -896,6 +896,25 @@ fn wire_refs(refs: &[BlockRefOp]) -> Vec<WireBlockRefOp> {
     refs.iter().map(WireBlockRefOp::from).collect()
 }
 
+/// Rung 13 — the publish-path ORDERING BARRIER: a shipped publish naming
+/// a PENDING intent ino (a locally-minted, not-yet-applied create) must
+/// flush the intent batch first, or the publish would reach the owner
+/// before the record it names exists. One relaxed load when nothing is
+/// pending.
+async fn intent_barrier_inos(inos: &[Ino]) -> Result<()> {
+    if !super::intents::barrier_needed(inos, &[]) {
+        return Ok(());
+    }
+    super::intents::flush_all(true).await.map_err(|errno| {
+        SqueezefsError::refused(
+            errno,
+            "S10 intents: the publish barrier's flush failed — refusing the publish rather \
+             than letting it overtake the un-applied create it names"
+                .to_string(),
+        )
+    })
+}
+
 /// The custody lease epoch this mount presents on every MUTATING shipped
 /// publish (finding #6's era gate). `0` with no custody client installed —
 /// the owner then refuses by era, which is the honest shape for an armed
@@ -971,21 +990,24 @@ pub async fn set_layout_and_size(
             note_local();
             be.set_layout_and_size(ino, layout, size, refs).await
         }
-        Some(peer) => expect_unit(
-            ship_witnessed(
-                &peer,
-                PublishCall::SetLayoutAndSize {
-                    ino,
-                    layout: layout.to_vec(),
-                    size,
-                    refs: wire_refs(refs),
-                    lease_epoch: current_lease_epoch(),
-                    request_id: crate::cowriter::next_ship_request_id(),
-                },
+        Some(peer) => {
+            intent_barrier_inos(&[ino]).await?;
+            expect_unit(
+                ship_witnessed(
+                    &peer,
+                    PublishCall::SetLayoutAndSize {
+                        ino,
+                        layout: layout.to_vec(),
+                        size,
+                        refs: wire_refs(refs),
+                        lease_epoch: current_lease_epoch(),
+                        request_id: crate::cowriter::next_ship_request_id(),
+                    },
+                )
+                .await?,
+                "set_layout_and_size",
             )
-            .await?,
-            "set_layout_and_size",
-        ),
+        }
     }
 }
 
@@ -1005,6 +1027,7 @@ pub async fn merge_layout_and_size(
                 .await
         }
         Some(peer) => {
+            intent_barrier_inos(&[ino]).await?;
             let call = PublishCall::MergeLayoutAndSize {
                 ino,
                 delta: delta.encode(),
@@ -1037,19 +1060,22 @@ pub async fn commit_block_refs(
             note_local();
             be.commit_block_refs(ino, refs).await
         }
-        Some(peer) => expect_unit(
-            ship_witnessed(
-                &peer,
-                PublishCall::CommitBlockRefs {
-                    ino,
-                    refs: wire_refs(refs),
-                    lease_epoch: current_lease_epoch(),
-                    request_id: crate::cowriter::next_ship_request_id(),
-                },
+        Some(peer) => {
+            intent_barrier_inos(&[ino]).await?;
+            expect_unit(
+                ship_witnessed(
+                    &peer,
+                    PublishCall::CommitBlockRefs {
+                        ino,
+                        refs: wire_refs(refs),
+                        lease_epoch: current_lease_epoch(),
+                        request_id: crate::cowriter::next_ship_request_id(),
+                    },
+                )
+                .await?,
+                "commit_block_refs",
             )
-            .await?,
-            "commit_block_refs",
-        ),
+        }
     }
 }
 
@@ -1065,19 +1091,22 @@ pub async fn park_write_times(
             note_local();
             be.park_write_times(ino, mtime, ctime).await
         }
-        Some(peer) => expect_unit(
-            ship(
-                &peer,
-                PublishCall::ParkWriteTimes {
-                    ino,
-                    mtime,
-                    ctime,
-                    lease_epoch: current_lease_epoch(),
-                },
+        Some(peer) => {
+            intent_barrier_inos(&[ino]).await?;
+            expect_unit(
+                ship(
+                    &peer,
+                    PublishCall::ParkWriteTimes {
+                        ino,
+                        mtime,
+                        ctime,
+                        lease_epoch: current_lease_epoch(),
+                    },
+                )
+                .await?,
+                "park_write_times",
             )
-            .await?,
-            "park_write_times",
-        ),
+        }
     }
 }
 
@@ -1106,6 +1135,7 @@ pub async fn destroy_inodes(be: &Arc<RoutedMetaBackend>, inos: &[Ino]) -> Result
         be.destroy_inodes(&local).await?;
     }
     for (peer, batch) in remote {
+        intent_barrier_inos(&batch).await?;
         expect_unit(
             ship(
                 &peer,
@@ -1140,6 +1170,26 @@ pub async fn create_with_rdev_size(
                 .await
         }
         Some(peer) => {
+            // Rung 13: symlinks/sized creates mint locally too under a
+            // live UPDATE grant (the target payload's own publish then
+            // barriers on the pending ino, forcing the flush).
+            match super::intents::try_mint_create(
+                &peer.endpoint,
+                parent,
+                name,
+                mode,
+                uid,
+                gid,
+                rdev,
+                initial_size,
+            ) {
+                super::intents::MintOutcome::Minted(inode) => return Ok(inode),
+                super::intents::MintOutcome::Exists => {
+                    return Err(SqueezefsError::already_exists("File already exists"))
+                }
+                super::intents::MintOutcome::NotEligible => {}
+            }
+            intent_barrier_inos(&[parent]).await?;
             let call = PublishCall::CreateWithRdevSize {
                 parent,
                 name: name.to_string(),

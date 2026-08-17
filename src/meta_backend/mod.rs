@@ -508,6 +508,18 @@ pub fn route_ino_width(ino: Ino, width: u64) -> (u64, Ino) {
     ((ino - 2) % width, (ino - 2) / width + 2)
 }
 
+/// The intent-apply create preset (rung 13, KD-MW-13): the pre-supplied
+/// GLOBAL ino + the client's mint instant — see
+/// [`RoutedMetaBackend::create_with_rdev_preset`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntentCreatePreset {
+    /// The child's pre-supplied global ino (from an owner-reserved
+    /// [`crate::meta_ship::InoSupply`]).
+    pub global_ino: Ino,
+    /// The client's mint instant (the record's times).
+    pub ts_ns: u64,
+}
+
 /// [`route_ino_width`]'s exact inverse: `(local ino, slot)` → global ino
 /// over the frozen width. Identity for `W ≤ 1`; local 1 on slot 0 is
 /// the root pin.
@@ -1136,6 +1148,73 @@ impl RoutedMetaBackend {
         self.allocate_local_ino_in_slot(volume_idx, mint)
     }
 
+    /// Reserve `count` consecutive fresh inos from ONE (volume, slot)
+    /// cursor — the rung-13 **intent-supply** grant (KD-MW-13): the
+    /// UPDATE-grant holder mints child inos from this range locally, and
+    /// because the reservation IS a cursor advance the owner can never
+    /// re-mint them within its incarnation (unused ones burn, §4.8; a
+    /// dead era's supply is fenced on the wire — see
+    /// [`crate::meta_ship::InoSupply`]). Returns `(first_global, stride,
+    /// count)`: the routing width's slot encoding is affine in the local,
+    /// asserted here rather than assumed.
+    ///
+    /// Placement note (stated, not hidden): the whole supply rides one
+    /// slot of one owned volume — mint-spread and client-owned-slot
+    /// placement for intent mints are PR-14's lever, not this rung's.
+    pub async fn reserve_intent_supply(&self, parent: Ino, count: u32) -> Result<(u64, u64, u32)> {
+        let count = count.max(1);
+        let (parent_v_idx, _) = self.route_ino(parent);
+        let target_v_idx = crate::meta_ship::constrain_mint_volume(
+            self.pick_mint_volume(parent_v_idx).await,
+            parent_v_idx,
+        );
+        self.check_volume_enabled(target_v_idx)?;
+        let mint_slot = self.pick_mint_slot(target_v_idx);
+        // The cursor advance rides the slot gate exactly as a create's
+        // mint does (a flip mid-advance would strand the range on the
+        // source's travelled cursor).
+        let mut pass = SlotGatePass::default();
+        self.slot_gate_extend_slots(&mut pass, &[mint_slot]).await;
+        if self.routing_width <= 1 {
+            // The in-RAM test constructor's W ≤ 1 identity: global == local.
+            let first = self.volumes[target_v_idx].reserve_ino_range(u64::from(count));
+            return Ok((first, 1, count));
+        }
+        let first_raw = if self.legacy_slot[target_v_idx] == Some(mint_slot as u16) {
+            let raw = self.volumes[target_v_idx].reserve_ino_range(u64::from(count));
+            if raw.saturating_add(u64::from(count)) >= GUEST_NS_BASE {
+                return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                    "volume {target_v_idx}: an intent-supply reservation of {count} would cross \
+                     the native local-ino namespace into the guest partition \
+                     (watermark {raw:#x})"
+                )));
+            }
+            raw
+        } else {
+            self.volumes[target_v_idx]
+                .reserve_guest_ino_range(mint_slot as u16, u64::from(count))?
+        };
+        let g0 = make_global_ino_width(first_raw, mint_slot, self.routing_width);
+        let g1 = make_global_ino_width(first_raw + 1, mint_slot, self.routing_width);
+        let stride = g1 - g0;
+        let g_last = make_global_ino_width(
+            first_raw + u64::from(count) - 1,
+            mint_slot,
+            self.routing_width,
+        );
+        if g_last != g0 + u64::from(count - 1) * stride {
+            // Structurally impossible for the modular slot encoding —
+            // refused loud rather than assumed (a non-affine range would
+            // hand the client numbers that route elsewhere).
+            return Err(crate::error::SqueezefsError::InvalidOperation(
+                "intent-supply reservation: the global ino encoding is not affine over the \
+                 reserved range (routing bug)"
+                    .to_string(),
+            ));
+        }
+        Ok((g0, stride, count))
+    }
+
     // -----------------------------------------------------------------
     // PR VL5b §5.5.2a: the per-slot cutover gate — checked at mutating
     // op entry BEFORE any 4a `lock_many`; parked ops hold no DLM or
@@ -1383,6 +1462,31 @@ impl RoutedMetaBackend {
         rdev: u32,
         initial_size: u64,
     ) -> Result<Inode> {
+        self.create_with_rdev_preset(parent, name, mode, uid, gid, rdev, initial_size, None)
+            .await
+    }
+
+    /// [`Self::create_with_rdev_size`] with an optional **intent preset**
+    /// (rung 13, KD-MW-13): the child's GLOBAL ino was pre-supplied to an
+    /// UPDATE-grant holder (the owner's own cursor reservation, so the
+    /// number can never collide within this incarnation) and the times
+    /// are the client's mint instant. The preset arm skips the mint
+    /// picks (the ino's own route IS the target) and answers a REPLAYED
+    /// apply idempotently: an existing dentry naming exactly the preset
+    /// ino is the op's own earlier apply (the witness-by-construction the
+    /// explicit ino buys), never an EEXIST.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_with_rdev_preset(
+        &self,
+        parent: Ino,
+        name: &str,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        rdev: u32,
+        initial_size: u64,
+        preset: Option<IntentCreatePreset>,
+    ) -> Result<Inode> {
         // S10 coherence law (rung 12) — BEFORE any 4a acquisition, like
         // the cutover gate below: a create mutates the parent's dentry
         // set + times, so every outstanding delegation on the parent is
@@ -1403,18 +1507,25 @@ impl RoutedMetaBackend {
         // to a volume THIS node owns, because a volume's journal ring,
         // extent bitmap and root ledger have exactly one appender. Unarmed
         // — every mount that ships today — this is one relaxed load and
-        // the pick verbatim.
-        let target_v_idx = crate::meta_ship::constrain_mint_volume(
-            self.pick_mint_volume(parent_v_idx).await,
-            parent_v_idx,
-        );
+        // the pick verbatim. A PRESET ino routes itself: the supply was
+        // reserved on an owned volume's cursor at grant time.
+        let target_v_idx = match &preset {
+            Some(p) => self.route_ino(p.global_ino).0,
+            None => crate::meta_ship::constrain_mint_volume(
+                self.pick_mint_volume(parent_v_idx).await,
+                parent_v_idx,
+            ),
+        };
         self.check_volume_enabled(target_v_idx)?;
         // The mint slot is a touched slot too (the new inode record
         // lands in its keyspace) — still before any 4a lock. The rotor
         // picks it HERE so the gate covers the exact slot the mint will
         // use (design-dynamic-meta-routing §5.4). A park here can span
         // a flip: re-derive the parent's route after.
-        let mint_slot = self.pick_mint_slot(target_v_idx);
+        let mint_slot = match &preset {
+            Some(p) => self.slot_of_ino(p.global_ino),
+            None => self.pick_mint_slot(target_v_idx),
+        };
         {
             if self.slot_gate_extend_slots(&mut _gate, &[mint_slot]).await
                 && self.route_ino(parent) != (parent_v_idx, local_parent)
@@ -1456,15 +1567,41 @@ impl RoutedMetaBackend {
         let guards: std::sync::Arc<[dlm::DlmGuard]> =
             std::sync::Arc::from(vec![parent_guard, dentry_guard]);
 
+        // The preset REPLAY tiebreak (under the dentry guard): a dentry
+        // already naming exactly the preset ino is this op's own earlier
+        // apply — answer its record rather than EEXIST (the owner-failover
+        // at-least-once shape; a dentry naming a DIFFERENT ino stays the
+        // genuine EEXIST the arms below refuse).
+        if let Some(p) = &preset {
+            if let Some((existing, _)) = self
+                .find_dentry_routed(parent_v_idx, local_parent, name)
+                .await?
+            {
+                if existing == p.global_ino {
+                    let (child_v, child_local) = self.route_ino(existing);
+                    let mut inode = self.read_inode_routed(child_v, child_local).await?;
+                    inode.ino = existing;
+                    return Ok(inode);
+                }
+                return Err(crate::error::SqueezefsError::already_exists(
+                    "File already exists",
+                ));
+            }
+        }
+        let ts_override = preset.as_ref().map(|p| p.ts_ns);
+
         if parent_v_idx == target_v_idx {
             // Same-volume create: ONE whole-tx journal entry with the
             // routed semantics (design §4.4). The routed layer allocates
             // the (effective local, global) pair — PR VL5b: mints ride
             // the volume's mint slot's keyspace/cursor, so the backend
             // stays keyspace-agnostic. (A failed create burns the ino —
-            // the standing §4.8 monotonic-allocation law.)
-            let (new_local, new_global) =
-                self.allocate_local_ino_in_slot(target_v_idx, mint_slot)?;
+            // the standing §4.8 monotonic-allocation law.) A preset pair
+            // was allocated at grant time and routes itself.
+            let (new_local, new_global) = match &preset {
+                Some(p) => (self.route_ino(p.global_ino).1, p.global_ino),
+                None => self.allocate_local_ino_in_slot(target_v_idx, mint_slot)?,
+            };
             let be = &self.volumes[target_v_idx];
             let out = be
                 .routed_create_local(
@@ -1477,6 +1614,7 @@ impl RoutedMetaBackend {
                     initial_size,
                     new_local,
                     new_global,
+                    ts_override,
                     guards,
                 )
                 .await;
@@ -1511,9 +1649,11 @@ impl RoutedMetaBackend {
             let is_dir_flag = is_dir;
             // Target side: mint the child inode record (PR VL5b: the
             // routed allocation rides the GATED mint slot's
-            // keyspace/cursor).
-            let (new_local_ino, global_child_ino) =
-                self.allocate_local_ino_in_slot(target_v_idx, mint_slot)?;
+            // keyspace/cursor; a preset pair routes itself).
+            let (new_local_ino, global_child_ino) = match &preset {
+                Some(p) => (self.route_ino(p.global_ino).1, p.global_ino),
+                None => self.allocate_local_ino_in_slot(target_v_idx, mint_slot)?,
+            };
             let target_be = &self.volumes[target_v_idx];
             let minted = target_be
                 .routed_mint_inode(
@@ -1523,6 +1663,7 @@ impl RoutedMetaBackend {
                     final_gid,
                     rdev,
                     initial_size,
+                    ts_override,
                     guards.clone(),
                 )
                 .await;
@@ -1617,6 +1758,11 @@ impl Metadata for RoutedMetaBackend {
                 format!("no dentry names ino {parent} — cannot resolve \"..\""),
             )));
         }
+        // Rung 13 — the OQ-2 read gate's LOCAL face: the owner's own
+        // lookup under a directory with an outstanding foreign UPDATE
+        // grant recalls it (forcing the holder's intent flush) BEFORE the
+        // serve. One relaxed load when no delegation host is armed.
+        crate::meta_ship::deleg_read_gate(self, parent).await;
         let (v_idx, local_parent) = self.route_ino(parent);
         self.check_volume_enabled(v_idx)?;
         // Drop the D-guard before getattr's I-lock (canonical class order —
@@ -2505,6 +2651,9 @@ impl Metadata for RoutedMetaBackend {
         if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[dir]) {
             return r.readdir(dir, offset, max).await;
         }
+        // Rung 13 — the OQ-2 read gate's LOCAL face (see the trait
+        // lookup's note).
+        crate::meta_ship::deleg_read_gate(self, dir).await;
         self.readdir_local(dir, offset, max).await
     }
 

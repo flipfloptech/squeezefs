@@ -53,6 +53,13 @@ impl SlotCursor {
         self.next.fetch_add(1, Ordering::AcqRel)
     }
 
+    /// Reserve `n` consecutive locals (rung 13's intent-supply grant):
+    /// one `fetch_add`, same no-reuse discipline — unused reservations
+    /// burn exactly as a failed create's ino does.
+    pub fn mint_range(&self, n: u64) -> u64 {
+        self.next.fetch_add(n, Ordering::AcqRel)
+    }
+
     /// The publication snapshot the checkpoint task writes into the
     /// ledger record: every mint whose record-apply happened-before this
     /// load is strictly below the returned value.

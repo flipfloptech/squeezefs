@@ -73,6 +73,24 @@ use std::time::{Duration, Instant};
 /// delegation suite can DEMONSTRATE the stale serve the law prevents.
 pub static TEST_DELEG_COHERENCE_LAW: AtomicBool = AtomicBool::new(true);
 
+/// **Test seam** (rung 13; the same never-a-knob law): `false` disables
+/// the OQ-2 foreign-read gate so the intent suite's PERMANENT red half
+/// can demonstrate the stale foreign NEGATIVE the recall-forces-flush law
+/// prevents.
+pub static TEST_INTENT_READ_GATE: AtomicBool = AtomicBool::new(true);
+
+/// **Test seam** (rung 13, the charter's arm-2 injection): a nonzero
+/// errno refuses every intent-op APPLY with it — the deferred-error law's
+/// deterministic driver (`fsync(dir)` must surface exactly this number).
+pub static TEST_INTENT_APPLY_ERRNO: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(0);
+
+/// **Test seam** (rung 13): pin the intent-supply chunk (0 = the derived
+/// `intents::supply_chunk`) so the exhaustion/refill arms are
+/// deterministic.
+pub static TEST_INTENT_SUPPLY_CHUNK: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
 squeezefs_ipc::sqz_task_local! {
     /// The shipping CLIENT whose verb is currently executing on this
     /// owner (set by `run_batch` around the batch's execution) — what
@@ -88,6 +106,17 @@ squeezefs_ipc::sqz_task_local! {
     /// so the revocation reaches the holder WITH the mutation's own
     /// reply (read-your-own-writes by construction, zero added rounds).
     static SHIP_REVOKES: RefCell<Vec<u64>>;
+}
+
+squeezefs_ipc::sqz_task_local! {
+    /// Rung 13: set (to `true`) around an INTENT APPLY's execution. The
+    /// mutation gate then keeps the flushing holder's own UPDATE grant on
+    /// the batch's directories alive (the grant IS the authority to apply
+    /// these mutations — surrendering it per op would orphan the
+    /// owner-side exclusivity record and kill the grant at the first
+    /// fsync), while still recalling and waiting out every FOREIGN
+    /// holder (the coherence law, unchanged).
+    static SHIP_INTENT_APPLY: bool;
 }
 
 /// Absolute override for the derived dedup-window size.
@@ -246,6 +275,17 @@ struct DelegHost {
     /// BEFORE the lane records a grant, so a recall's frame-build fence
     /// covers every grant it could name.
     seq: AtomicU64,
+    /// Rung 13: the EXCLUSIVE UPDATE holder per directory (§8.2 law 1) —
+    /// dir → client id; validity is coupled to the recall lane's live
+    /// grant (`lane.holds(dir, client)`), checked at every consult.
+    update_holders: parking_lot::Mutex<HashMap<u64, String>>,
+    /// Lock-free population gauge of `update_holders` — the read gate's
+    /// one-relaxed-load fast path.
+    update_count: AtomicU64,
+    /// The intent-apply witness: `(lease_epoch, request_id)` → the
+    /// winner's outcome (the S8/publish `DedupWindow`, reused — never a
+    /// third idempotence pattern).
+    intent_dedup: DedupWindow<IntentResult>,
 }
 
 impl Default for DelegHost {
@@ -257,6 +297,9 @@ impl Default for DelegHost {
             fenced: parking_lot::Mutex::new(HashSet::new()),
             in_flight: scc::HashMap::new(),
             seq: AtomicU64::new(0),
+            update_holders: parking_lot::Mutex::new(HashMap::new()),
+            update_count: AtomicU64::new(0),
+            intent_dedup: DedupWindow::new(dedup_cap()),
         }
     }
 }
@@ -430,6 +473,7 @@ impl MetaShipService {
             VERB_RECLAIM => self.serve_reclaim(&req).await,
             VERB_DELEG_RECALL => self.serve_deleg_poll(&req).await,
             VERB_DELEG_REASSERT => self.serve_deleg_reassert(&req).await,
+            VERB_DELEG_INTENT => self.serve_deleg_intent(&req).await,
             other => RpcResponse {
                 id: req.id,
                 status: crate::cluster_wire::RPC_UNKNOWN_VERB,
@@ -632,6 +676,21 @@ impl MetaShipService {
         // Reset the reply-revoke accumulator for THIS op (ops run
         // serially inside one batch scope).
         let _ = SHIP_REVOKES.try_with(|r| r.borrow_mut().clear());
+        // Rung 13 — the OQ-2 foreign-read gate (recall-forces-flush): a
+        // foreign client's lookup/readdir under a directory with an
+        // outstanding UPDATE grant recalls it (which flushes the holder's
+        // intent batch) BEFORE the serve — coherence over latency on the
+        // foreign path. Self reads never recall (the holder answers its
+        // own pending names locally).
+        match call {
+            MetaCall::LookupDentry { parent, .. } => {
+                self.intent_read_gate(*parent, client_id).await;
+            }
+            MetaCall::Readdir { dir, .. } => {
+                self.intent_read_gate(*dir, client_id).await;
+            }
+            _ => {}
+        }
         let t = Instant::now();
         let out = self.execute_inner(call).await;
         super::owner_phase_record(OwnerPhase::Execute, t);
@@ -651,6 +710,7 @@ impl MetaShipService {
             Ok(reply) => {
                 let ino = self.grant_object(call, &reply);
                 let delegs = self.issue_delegs(client_id, call, &reply).await;
+                let intent_grant = self.issue_update_grant(client_id, call, &reply).await;
                 MetaOpResult {
                     id,
                     outcome: Ok(reply),
@@ -662,6 +722,7 @@ impl MetaShipService {
                     delegs,
                     revokes,
                     revoke_fence,
+                    intent_grant,
                 }
             }
             Err(e) => MetaOpResult {
@@ -671,8 +732,45 @@ impl MetaShipService {
                 delegs: Vec::new(),
                 revokes,
                 revoke_fence,
+                intent_grant: None,
             },
         }
+    }
+
+    /// Is `dir`'s EXCLUSIVE UPDATE grant held by a client OTHER than
+    /// `asking`? Lazily cleans records whose lane grant died.
+    fn foreign_update_holder(&self, dir: u64, asking: Option<&str>) -> bool {
+        if self.deleg.update_count.load(Ordering::Relaxed) == 0 {
+            return false;
+        }
+        let lane = tokens::global_recall_lane();
+        let mut holders = self.deleg.update_holders.lock();
+        match holders.get(&dir) {
+            None => false,
+            Some(client) => {
+                if !lane.holds(dir, client) {
+                    holders.remove(&dir);
+                    self.deleg.update_count.fetch_sub(1, Ordering::Relaxed);
+                    return false;
+                }
+                asking != Some(client.as_str())
+            }
+        }
+    }
+
+    /// The OQ-2 read gate's body: recall `dir`'s outstanding grants and
+    /// wait them out (ack or deadline) — the recall FORCES the holder's
+    /// flush, so the serve that follows is exact. `asking` empty = the
+    /// owner's own local read (every holder is foreign to it).
+    pub(crate) async fn intent_read_gate(&self, dir: u64, asking: &str) {
+        if !TEST_INTENT_READ_GATE.load(Ordering::Relaxed) {
+            return;
+        }
+        if !self.foreign_update_holder(dir, (!asking.is_empty()).then_some(asking)) {
+            return;
+        }
+        super::intents::note_intent_read_recall();
+        self.recall_and_wait(&[dir], None).await;
     }
 
     /// Which objects a successful LOOKUP-class reply may carry delegations
@@ -767,6 +865,151 @@ impl MetaShipService {
             });
         }
         out
+    }
+
+    /// Issue the piggybacked **EXCLUSIVE UPDATE grant** for one successful
+    /// SHIPPED CREATE (rung 13, KD-MW-13): the intent-lock law applied to
+    /// mint authority — the create the client was already shipping earns
+    /// it the right to mint the NEXT ones locally.
+    ///
+    /// Target preference: the CREATED DIRECTORY when the create is a
+    /// mkdir (the tar populate target), else the PARENT. One grant per
+    /// reply (wire economy; the other candidate earns on the next RPC).
+    ///
+    /// The gate order is the LOOKUP path's (grant-vs-mutation race closed
+    /// structurally), plus the §8.2 law-1 arms: EXCLUSIVITY (a live
+    /// foreign holder declines — its recall was already forced by this
+    /// create's own mutation gate, so a live record here is a racing
+    /// grant, never a stale one), the VALVE (`try_grant` demotes hot
+    /// directories — the storm brake), and the CENSUS BUDGET (an
+    /// over-budget directory declines — the priced fallback).
+    async fn issue_update_grant(
+        &self,
+        client_id: &str,
+        call: &MetaCall,
+        reply: &MetaReply,
+    ) -> Option<IntentGrant> {
+        if client_id.is_empty() || !super::intents::update_intents_enabled() {
+            return None;
+        }
+        let MetaCall::CreateWithRdev { parent, .. } = call else {
+            return None;
+        };
+        if self.deleg.fenced.lock().contains(client_id) {
+            return None;
+        }
+        let created_dir = match reply {
+            MetaReply::Inode(i) if (i.mode & libc::S_IFMT) == libc::S_IFDIR => Some(i.ino),
+            _ => None,
+        };
+        let lane = tokens::global_recall_lane();
+        for dir in [created_dir, Some(*parent)].into_iter().flatten() {
+            if !self.has_authority(dir) {
+                continue;
+            }
+            // Exclusivity (§8.2 law 1): one holder per directory.
+            {
+                let mut holders = self.deleg.update_holders.lock();
+                match holders.get(&dir) {
+                    Some(c) if c == client_id => {} // re-issue to the same holder
+                    Some(c) if lane.holds(dir, c) => {
+                        super::intents::note_update_decline();
+                        continue;
+                    }
+                    Some(_) => {
+                        // The lane grant died (recall/timeout): the record
+                        // is stale — retire it and proceed.
+                        holders.remove(&dir);
+                        self.deleg.update_count.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    None => {}
+                }
+            }
+            if self.deleg.in_flight.contains_sync(&dir) {
+                super::intents::note_update_decline();
+                continue;
+            }
+            let seq = self.deleg.seq.fetch_add(1, Ordering::AcqRel) + 1;
+            match lane.try_grant(dir, client_id, Instant::now()) {
+                tokens::GrantDecision::Demoted { .. } => continue,
+                tokens::GrantDecision::Granted => {}
+            }
+            if self.deleg.in_flight.contains_sync(&dir) {
+                lane.surrender(dir, client_id);
+                super::intents::note_update_decline();
+                continue;
+            }
+            // The census + parent attrs — read AFTER the lane record and
+            // the in-flight re-check (the rung-12 stamp law's position:
+            // past this point any racing mutation sees the record and
+            // recalls us).
+            let census_max = intent_census_max();
+            let entries = match self.inner.readdir_local(dir, 0, census_max + 1).await {
+                Ok(e) => e,
+                Err(_) => {
+                    lane.surrender(dir, client_id);
+                    super::intents::note_update_decline();
+                    continue;
+                }
+            };
+            if entries.len() > census_max {
+                // Over the grant budget: the §8.2 priced fallback — the
+                // grant declines, creates ship as today.
+                lane.surrender(dir, client_id);
+                super::intents::note_update_decline();
+                continue;
+            }
+            let dir_inode = match self.inner.getattr_local(dir).await {
+                Ok(i) => i,
+                Err(_) => {
+                    lane.surrender(dir, client_id);
+                    super::intents::note_update_decline();
+                    continue;
+                }
+            };
+            if (dir_inode.mode & libc::S_IFMT) != libc::S_IFDIR {
+                lane.surrender(dir, client_id);
+                super::intents::note_update_decline();
+                continue;
+            }
+            // The mint supply rides the grant (one chunk per reply).
+            let chunk = super::intents::supply_chunk();
+            let supply = match self.inner.reserve_intent_supply(dir, chunk).await {
+                Ok((first_global, stride, count)) => Some(super::wire::InoSupply {
+                    first_global,
+                    stride,
+                    count,
+                }),
+                Err(e) => {
+                    log::warn!(
+                        "S10 intents: supply reservation for dir {dir} failed ({e}) — granting \
+                         census-only (mints decline until a flush refill succeeds)"
+                    );
+                    None
+                }
+            };
+            self.deleg
+                .update_holders
+                .lock()
+                .insert(dir, client_id.to_string());
+            self.deleg.update_count.fetch_add(1, Ordering::Relaxed);
+            super::intents::note_update_grant();
+            let census: Vec<String> = entries
+                .into_iter()
+                .filter(|e| e.name != "." && e.name != "..")
+                .map(|e| e.name)
+                .collect();
+            return Some(IntentGrant {
+                dir,
+                seq,
+                term: self.term(),
+                dir_mode: dir_inode.mode,
+                dir_gid: dir_inode.gid,
+                census,
+                supply,
+            });
+        }
+        None
     }
 
     /// Which object's generation rides this reply: the object the verb
@@ -1043,6 +1286,19 @@ impl MetaShipService {
         }
         drop(fenced);
         for client in newly {
+            // Rung 13: a fenced holder's EXCLUSIVE UPDATE records die with
+            // its grants (the directory is grantable again).
+            {
+                let mut holders = self.deleg.update_holders.lock();
+                let before = holders.len();
+                holders.retain(|_, c| c != &client);
+                let removed = before - holders.len();
+                if removed > 0 {
+                    self.deleg
+                        .update_count
+                        .fetch_sub(removed as u64, Ordering::Relaxed);
+                }
+            }
             log::error!(
                 "S10 delegation: holder '{client}' missed its recall deadline — its grants are \
                  DEAD, the holder is FENCED on the delegation plane (poll/re-assert refuse; \
@@ -1103,22 +1359,50 @@ impl MetaShipService {
             .try_with(|c| c.clone())
             .ok()
             .filter(|c| !c.is_empty());
-        let mut wait_inos: Vec<u64> = Vec::new();
+        // Rung 13: inside an INTENT APPLY, the flushing holder's own
+        // UPDATE grant on the batch's directories stays LIVE (it is the
+        // authority these mutations execute under; surrendering it would
+        // orphan the exclusivity record and recall the flusher into its
+        // own flush). Foreign holders are recalled and waited out exactly
+        // as before.
+        let intent_apply = SHIP_INTENT_APPLY.try_with(|v| *v).unwrap_or(false);
+        let mut wait_inos: Vec<(u64, bool)> = Vec::new();
         for &ino in &registered {
+            let keep_self = intent_apply
+                && mutator.as_deref().is_some_and(|c| {
+                    let holders = self.deleg.update_holders.lock();
+                    holders.get(&ino).is_some_and(|h| h == c)
+                });
             // The self-conflict: the mutating holder's own grant retires
             // as a SURRENDER riding this op's reply — never a wire recall
             // (zero added rounds on the serial mutate-then-lookup shape).
-            if let Some(c) = &mutator {
-                if lane.surrender(ino, c) {
-                    let _ = SHIP_REVOKES.try_with(|r| r.borrow_mut().push(ino));
+            if !keep_self {
+                if let Some(c) = &mutator {
+                    if lane.surrender(ino, c) {
+                        let _ = SHIP_REVOKES.try_with(|r| r.borrow_mut().push(ino));
+                        // The surrendered grant may have been the UPDATE
+                        // authority: retire the exclusivity record with it.
+                        let mut holders = self.deleg.update_holders.lock();
+                        if holders.get(&ino).is_some_and(|h| h == c) {
+                            holders.remove(&ino);
+                            self.deleg.update_count.fetch_sub(1, Ordering::Relaxed);
+                        }
+                    }
                 }
             }
-            if lane.recall_object(ino, now) > 0 {
-                wait_inos.push(ino);
-            } else if lane.holders(ino) > 0 {
-                // Recalls already pending from an earlier conflict —
-                // still ours to wait out.
-                wait_inos.push(ino);
+            let skip = if keep_self { mutator.as_deref() } else { None };
+            if lane.recall_object_excluding(ino, skip, now) > 0 {
+                wait_inos.push((ino, keep_self));
+            } else {
+                let remaining = match skip {
+                    Some(c) => lane.holders_excluding(ino, c),
+                    None => lane.holders(ino),
+                };
+                if remaining > 0 {
+                    // Recalls already pending from an earlier conflict —
+                    // still ours to wait out.
+                    wait_inos.push((ino, keep_self));
+                }
             }
         }
         if wait_inos.is_empty() {
@@ -1134,7 +1418,17 @@ impl MetaShipService {
             // frame) issue as their holder's slot frees.
             self.deleg_distribute(lane.issue_pass(Instant::now()));
             let notified = self.deleg.ack_notify.notified();
-            if wait_inos.iter().all(|&ino| lane.holders(ino) == 0) {
+            let all_clear = wait_inos.iter().all(|&(ino, keep_self)| {
+                if keep_self {
+                    match &mutator {
+                        Some(c) => lane.holders_excluding(ino, c) == 0,
+                        None => lane.holders(ino) == 0,
+                    }
+                } else {
+                    lane.holders(ino) == 0
+                }
+            });
+            if all_clear {
                 break;
             }
             // Wake on ack/expiry, bounded by the tick (the expire pass's
@@ -1143,6 +1437,49 @@ impl MetaShipService {
         }
         super::deleg_phase_record(super::DelegPhase::GateWait, t0);
         Some(registered)
+    }
+
+    /// Recall every outstanding grant on `inos` (optionally excluding one
+    /// holder) and wait them out — the OQ-2 read gate's engine, the
+    /// mutation gate's loop factored for a uniform exclusion.
+    async fn recall_and_wait(&self, inos: &[u64], exclude: Option<&str>) {
+        let lane = tokens::global_recall_lane();
+        let now = Instant::now();
+        let mut wait_inos: Vec<u64> = Vec::new();
+        for &ino in inos {
+            if lane.recall_object_excluding(ino, exclude, now) > 0 {
+                wait_inos.push(ino);
+            } else {
+                let remaining = match exclude {
+                    Some(c) => lane.holders_excluding(ino, c),
+                    None => lane.holders(ino),
+                };
+                if remaining > 0 {
+                    wait_inos.push(ino);
+                }
+            }
+        }
+        if wait_inos.is_empty() {
+            return;
+        }
+        self.deleg_distribute(lane.issue_pass(now));
+        let cfg = lane.config();
+        let tick = (cfg.deadline / 16).clamp(Duration::from_millis(1), Duration::from_millis(100));
+        let t0 = Instant::now();
+        loop {
+            self.deleg_expire_pass(Instant::now());
+            self.deleg_distribute(lane.issue_pass(Instant::now()));
+            let notified = self.deleg.ack_notify.notified();
+            let all_clear = wait_inos.iter().all(|&ino| match exclude {
+                Some(c) => lane.holders_excluding(ino, c) == 0,
+                None => lane.holders(ino) == 0,
+            });
+            if all_clear {
+                break;
+            }
+            let _ = squeezefs_ipc::sqz_time::timeout(tick, notified).await;
+        }
+        super::deleg_phase_record(super::DelegPhase::GateWait, t0);
     }
 
     /// The permit's release half: the mutation committed (or failed) —
@@ -1342,6 +1679,293 @@ impl MetaShipService {
             ),
         }
     }
+
+    /// The **DelegIntent** verb (rung 13): apply one flushed intent batch
+    /// IN ORDER, era-gated + witnessed FROM BIRTH (the rung-9 finding-#6
+    /// law):
+    ///
+    /// 1. schema / fenced-holder / **owner-term** gates — the term is the
+    ///    SUPPLY's era, so a successor refuses a dead era's numbers whole
+    ///    before its recovered cursor could collide;
+    /// 2. the **custody era gate** (`validate_publish_era` — the exact
+    ///    validator the publish path runs): intents die with the custody
+    ///    fence, refused BEFORE the witness window (a dead era's replay
+    ///    must never be answered from cache);
+    /// 3. the **grace gate** (intent applies are fresh mutations);
+    /// 4. per op, the `(lease_epoch, request_id)` **witness**: a replay
+    ///    answers the winner's own outcome, never a double-apply.
+    async fn serve_deleg_intent(&self, req: &RpcRequest) -> RpcResponse {
+        let frame = match decode_intent_batch(&req.body) {
+            Ok(f) => f,
+            Err(e) => return self.refuse(req.id, STATUS_MALFORMED, format!("{e}")),
+        };
+        if frame.schema != META_SHIP_SCHEMA {
+            return self.refuse(
+                req.id,
+                STATUS_SCHEMA,
+                format!(
+                    "intent batch schema {} != {META_SHIP_SCHEMA} — refused rather than guessed",
+                    frame.schema
+                ),
+            );
+        }
+        if self.deleg_fenced(&frame.client_id) {
+            return self.refuse(
+                req.id,
+                STATUS_DELEG_FENCED,
+                format!(
+                    "holder '{}' is FENCED on the delegation plane — its intent batches die \
+                     with its grants; re-admission is by remount",
+                    frame.client_id
+                ),
+            );
+        }
+        let term = self.term();
+        if frame.owner_term != term {
+            self.stale_term.fetch_add(1, Ordering::Relaxed);
+            super::STALE_TERM_REFUSALS.fetch_add(1, Ordering::Relaxed);
+            return RpcResponse {
+                id: req.id,
+                status: STATUS_STALE_TERM,
+                body: format!(
+                    "intent batch names era {} and this owner is in era {term} — a dead era's \
+                     supply must never reach a record (refused whole, nothing applied)",
+                    frame.owner_term
+                )
+                .into_bytes(),
+            };
+        }
+        if let Err(reason) =
+            crate::data_grant::validate_publish_era(&frame.client_id, frame.lease_epoch)
+        {
+            super::intents::note_intent_stale_refusal();
+            return self.refuse(req.id, STATUS_INTENT_LEASE, reason);
+        }
+        if self.in_grace() && !frame.ops.is_empty() {
+            return self.refuse(
+                req.id,
+                STATUS_IN_GRACE,
+                format!(
+                    "owner is inside its failover grace window (era {term}): an intent batch \
+                     is a fresh mutation — reclaim first, then retry (spec §6.7 Recovery)"
+                ),
+            );
+        }
+        // The handoff (the serve_batch law): execution on the sqz-meta
+        // pool, under the SHIP_CLIENT + SHIP_INTENT_APPLY scopes.
+        let Some(me) = self.owned() else {
+            return self.refuse(
+                req.id,
+                STATUS_MALFORMED,
+                "S8 owner service is shutting down — no handle to dispatch the batch on".into(),
+            );
+        };
+        let client_id = frame.client_id.clone();
+        let lease_epoch = frame.lease_epoch;
+        let ops = frame.ops;
+        let supply_request = frame.supply_request;
+        let joined = crate::meta_exec::spawn_meta_join("meta_ship_intent_apply", async move {
+            let results = SHIP_CLIENT
+                .scope(client_id.clone(), async {
+                    SHIP_INTENT_APPLY
+                        .scope(true, async {
+                            let mut out = Vec::with_capacity(ops.len());
+                            for op in ops {
+                                out.push(me.run_intent_op(lease_epoch, op).await);
+                            }
+                            out
+                        })
+                        .await
+                })
+                .await;
+            // The refill rides the reply (one reservation per request;
+            // anchored on the root — the supply's placement is the
+            // reservation's own pick).
+            let supply = if supply_request > 0 {
+                match me
+                    .inner
+                    .reserve_intent_supply(1, supply_request.min(super::intents::supply_chunk()))
+                    .await
+                {
+                    Ok((first_global, stride, count)) => Some(super::wire::InoSupply {
+                        first_global,
+                        stride,
+                        count,
+                    }),
+                    Err(e) => {
+                        log::warn!("S10 intents: supply refill failed ({e})");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            (results, supply)
+        })
+        .await;
+        let (results, supply) = match joined {
+            Ok(out) => out,
+            Err(e) => {
+                self.panics.fetch_add(1, Ordering::Relaxed);
+                super::OWNER_PANICS.fetch_add(1, Ordering::Relaxed);
+                log::error!("S10 intent-batch execution unwound: {e}");
+                return RpcResponse {
+                    id: req.id,
+                    status: STATUS_PANIC,
+                    body: format!("S10 intent-batch execution panicked: {e}").into_bytes(),
+                };
+            }
+        };
+        let reply = IntentBatchReply {
+            schema: META_SHIP_SCHEMA,
+            owner_term: term,
+            results,
+            supply,
+        };
+        match encode_intent_batch_reply(&reply) {
+            Ok(body) => RpcResponse {
+                id: req.id,
+                status: STATUS_OK,
+                body,
+            },
+            Err(e) => self.refuse(
+                req.id,
+                STATUS_MALFORMED,
+                format!("intent reply encode: {e}"),
+            ),
+        }
+    }
+
+    /// One intent op through the witness window — keyed `(lease_epoch,
+    /// request_id)` per the charter (the publish window's key, the rung-9
+    /// finding-#6 shape): the winner executes, a replay awaits + answers
+    /// the winner's own outcome.
+    async fn run_intent_op(&self, lease_epoch: u64, op: IntentOp) -> IntentResult {
+        let (slot, owns) = self.deleg.intent_dedup.slot((lease_epoch, op.request_id));
+        if !owns {
+            super::intents::note_intent_replay();
+            self.dedup_hits.fetch_add(1, Ordering::Relaxed);
+            super::DEDUP_HITS.fetch_add(1, Ordering::Relaxed);
+        }
+        let request_id = op.request_id;
+        let call = op.call.clone();
+        slot.get_or_init(|| async { self.execute_intent(request_id, &call).await })
+            .await
+            .clone()
+    }
+
+    /// Execute one intent op (the winner's arm).
+    async fn execute_intent(&self, request_id: u64, call: &IntentCall) -> IntentResult {
+        let _ = SHIP_REVOKES.try_with(|r| r.borrow_mut().clear());
+        let injected = TEST_INTENT_APPLY_ERRNO.load(Ordering::Relaxed);
+        let out: crate::error::Result<()> = if injected != 0 {
+            Err(SqueezefsError::refused(
+                injected,
+                "injected intent-apply refusal (TEST_INTENT_APPLY_ERRNO)".to_string(),
+            ))
+        } else {
+            match call {
+                IntentCall::CreateAt {
+                    parent,
+                    name,
+                    ino,
+                    mode,
+                    uid,
+                    gid,
+                    rdev,
+                    initial_size,
+                    ts_ns,
+                } => {
+                    if !self.has_authority(*parent) || !self.has_authority(*ino) {
+                        self.not_owner.fetch_add(1, Ordering::Relaxed);
+                        super::NOT_OWNER_REFUSALS.fetch_add(1, Ordering::Relaxed);
+                        Err(SqueezefsError::refused(
+                            libc::EREMOTE,
+                            format!(
+                                "intent create ({parent}, '{name}') → ino {ino} names a volume \
+                                 this node holds no authority over"
+                            ),
+                        ))
+                    } else {
+                        self.inner
+                            .create_with_rdev_preset(
+                                *parent,
+                                name,
+                                *mode,
+                                *uid,
+                                *gid,
+                                *rdev,
+                                *initial_size,
+                                Some(crate::meta_backend::IntentCreatePreset {
+                                    global_ino: *ino,
+                                    ts_ns: *ts_ns,
+                                }),
+                            )
+                            .await
+                            .map(|_| ())
+                    }
+                }
+                IntentCall::SetattrAt {
+                    ino,
+                    mode,
+                    uid,
+                    gid,
+                    atime,
+                    mtime,
+                    ctime,
+                } => {
+                    if !self.has_authority(*ino) {
+                        self.not_owner.fetch_add(1, Ordering::Relaxed);
+                        super::NOT_OWNER_REFUSALS.fetch_add(1, Ordering::Relaxed);
+                        Err(SqueezefsError::refused(
+                            libc::EREMOTE,
+                            format!("intent setattr names foreign ino {ino}"),
+                        ))
+                    } else {
+                        self.inner
+                            .setattr(*ino, *mode, *uid, *gid, None, *atime, *mtime, *ctime)
+                            .await
+                            .map(|_| ())
+                    }
+                }
+            }
+        };
+        self.served.fetch_add(1, Ordering::Relaxed);
+        super::SERVED_VERBS.fetch_add(1, Ordering::Relaxed);
+        let revokes: Vec<u64> = SHIP_REVOKES
+            .try_with(|r| r.borrow_mut().drain(..).collect())
+            .unwrap_or_default();
+        let revoke_fence = if revokes.is_empty() {
+            0
+        } else {
+            self.deleg.seq.load(Ordering::Acquire)
+        };
+        match out {
+            Ok(()) => {
+                super::intents::note_intent_applied();
+                IntentResult {
+                    request_id,
+                    outcome: Ok(()),
+                    revokes,
+                    revoke_fence,
+                }
+            }
+            Err(e) => IntentResult {
+                request_id,
+                outcome: Err(WireError::from_error(&e)),
+                revokes,
+                revoke_fence,
+            },
+        }
+    }
+}
+
+/// The census budget (the §8.2 "grant budget" — a directory too large to
+/// carry declines the UPDATE grant): derived from the wire's CONTROL
+/// frame class — half the frame at a 64 B/name budget, floored for small
+/// boxes, capped so a grant stays a small fraction of the frame.
+pub(crate) fn intent_census_max() -> usize {
+    ((crate::cluster_wire::CONTROL_MAX_FRAME_BYTES as usize) / 2 / 64).clamp(256, 65_536)
 }
 
 impl RpcAsyncService for MetaShipService {

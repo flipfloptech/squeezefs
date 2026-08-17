@@ -1944,6 +1944,24 @@ impl KvMetaBackend {
         Ok(c.mint())
     }
 
+    /// Reserve `n` consecutive GUEST locals for hosted slot `slot` (the
+    /// [`Self::reserve_ino_range`] twin — rung 13's intent supply; same
+    /// lazy virgin-slot creation as [`Self::allocate_guest_ino`]).
+    pub fn reserve_guest_ino_range(&self, slot: u16, n: u64) -> Result<Ino> {
+        if let Some(c) = self.guest_cursors.read_sync(&slot, |_, v| v.clone()) {
+            return Ok(c.mint_range(n));
+        }
+        let fresh = Arc::new(super::slot_cursor_core::SlotCursor::new(2));
+        let c = match self.guest_cursors.insert_sync(slot, fresh.clone()) {
+            Ok(()) => fresh,
+            Err(_) => self
+                .guest_cursors
+                .read_sync(&slot, |_, v| v.clone())
+                .ok_or_else(|| self.eio("guest cursor raced out (impossible)"))?,
+        };
+        Ok(c.mint_range(n))
+    }
+
     /// LIVE guest-cursor count (mint-spread + travelled cursors — what
     /// the next checkpoint's stamp will carry): the
     /// `meta_slot_stamp_cursors_max` encoding-budget pressure gauge's
@@ -2717,6 +2735,18 @@ impl KvMetaBackend {
     /// ranges waste nothing that matters).
     pub fn allocate_ino(&self) -> Ino {
         self.next_ino.fetch_add(1, Ordering::AcqRel)
+    }
+
+    /// Reserve `n` consecutive NATIVE locals (rung 13's intent-supply
+    /// grant): one `fetch_add` over the same §4.8 watermark, so the
+    /// reserved numbers can never be re-minted by this incarnation and
+    /// unused ones burn exactly as a failed create's ino does. Cursor
+    /// recovery after a restart may reuse an un-APPLIED reservation's
+    /// numbers — which is why a supply is era-bound on the wire
+    /// ([`crate::meta_ship::InoSupply`]): a stale-era flush refuses whole
+    /// before any such number could reach a record.
+    pub fn reserve_ino_range(&self, n: u64) -> Ino {
+        self.next_ino.fetch_add(n, Ordering::AcqRel)
     }
 
     /// §4.4 pt 4 escalation state: repeated journal-write failures latch
@@ -6340,6 +6370,11 @@ impl KvMetaBackend {
         // this volume's index) — so this backend stays keyspace-agnostic.
         local_ino: Ino,
         global_ino: Ino,
+        // Rung 13 (UPDATE intents): the CLIENT's mint instant for an
+        // intent apply — the record's times, so a stat answers the same
+        // times before and after the flush. `None` = the owner's clock
+        // (every ordinary create).
+        ts_override: Option<u64>,
         guards: Arc<[DlmGuard]>,
     ) -> Result<Inode> {
         self.write_gate()?;
@@ -6361,7 +6396,7 @@ impl KvMetaBackend {
             }
         }
         let is_dir = (mode & libc::S_IFMT) == libc::S_IFDIR;
-        let now = Self::now_ns();
+        let now = ts_override.unwrap_or_else(Self::now_ns);
         let child = InodeValue {
             mode: final_mode,
             uid,
@@ -6403,11 +6438,13 @@ impl KvMetaBackend {
         rdev: u32,
         // POSIX-3: see `routed_create_local`.
         initial_size: u64,
+        // Rung 13: see `routed_create_local`.
+        ts_override: Option<u64>,
         guards: Arc<[DlmGuard]>,
     ) -> Result<InodeValue> {
         self.write_gate()?;
         let is_dir = (mode & libc::S_IFMT) == libc::S_IFDIR;
-        let now = Self::now_ns();
+        let now = ts_override.unwrap_or_else(Self::now_ns);
         let v = InodeValue {
             mode,
             uid,

@@ -129,7 +129,6 @@ struct Fixture {
     client_be: Arc<RoutedMetaBackend>,
     listener: Arc<cw::RpcListener>,
     svc: Arc<MetaShipService>,
-    custody_owner: Arc<WriteCustodyOwner>,
     custody_client: Arc<WriteCustodyClient>,
     endpoint: String,
     _router: Arc<MetaShipRouter>,
@@ -137,6 +136,11 @@ struct Fixture {
 }
 
 async fn fixture() -> Fixture {
+    // A short, pinned recall deadline (the registered measurement lever):
+    // several arms drive RAW wire clients that deliberately never service
+    // a recall channel, and the dark 45 s TTL would park every
+    // conflicting op past the wire's 10 s call timeout.
+    std::env::set_var("SQUEEZEFS_DLM_RECALL_DEADLINE_MS", "500");
     let dir = tempfile::tempdir().expect("tempdir");
     let plan = plan_meta_slot_set(1).expect("derived plan");
     let p = make_file(dir.path(), "meta0", VOL_LEN);
@@ -192,7 +196,9 @@ async fn fixture() -> Fixture {
     let verb_router = Arc::new(
         squeezefs::data_grant::AsyncVerbRouter::new()
             .with_meta(Arc::clone(&svc))
-            .with_custody(Arc::clone(&custody_owner)),
+            // (the global install above keeps the authority alive; this
+            // clone is the router's own handle)
+            .with_custody(custody_owner),
     );
     let listener = cw::RpcListener::start_async(cfg, SECRET.to_vec(), verb_router)
         .expect("owner-side listener starts");
@@ -227,7 +233,6 @@ async fn fixture() -> Fixture {
         client_be,
         listener,
         svc,
-        custody_owner,
         custody_client,
         endpoint,
         _router: router,
@@ -282,10 +287,26 @@ async fn earn_update(fx: &Fixture, dirname: &str) -> (u64, u64) {
     (d, f0)
 }
 
-/// Ship one raw S8 batch as a SECOND client (the two-client arms).
+/// Ship one raw S8 batch as a SECOND client (the two-client arms). The
+/// FRAME identity is empty — "the client wants no delegations" (the wire
+/// doc's own escape) — because a raw client never services a recall
+/// channel, and a grant issued to it would park every later conflicting
+/// op on the recall deadline.
 async fn ship_raw(
     endpoint: &str,
     client_id: &str,
+    epoch: u64,
+    ops: Vec<MetaOp>,
+) -> Vec<ship::MetaOpResult> {
+    ship_raw_as(endpoint, client_id, "", epoch, ops).await
+}
+
+/// [`ship_raw`] with an explicit FRAME identity (the fence arm needs its
+/// manual holder to actually EARN the grant it then abandons).
+async fn ship_raw_as(
+    endpoint: &str,
+    client_id: &str,
+    frame_client: &str,
     epoch: u64,
     ops: Vec<MetaOp>,
 ) -> Vec<ship::MetaOpResult> {
@@ -295,12 +316,15 @@ async fn ship_raw(
     let frame = MetaRequestFrame {
         schema: ship::META_SHIP_SCHEMA,
         client_epoch: epoch,
-        client_id: client_id.to_string(),
+        client_id: frame_client.to_string(),
         owner_term: 0,
         ops,
     };
     let reply = raw
-        .call(ship::VERB_META_BATCH, ship::encode_request(&frame).expect("encode"))
+        .call(
+            ship::VERB_META_BATCH,
+            ship::encode_request(&frame).expect("encode"),
+        )
         .await
         .expect("raw batch round-trips");
     assert_eq!(reply.status, cw::RPC_OK, "raw batch admitted");
@@ -344,8 +368,7 @@ fn the_wire_carries_the_intent_vocabulary_and_refuses_untrusted_bytes() {
     assert_eq!(ship::VERB_DELEG_INTENT, 0x0402);
     assert_eq!(DELEG_CLASS_LOOKUP, 1);
     assert_eq!(
-        DELEG_CLASS_UPDATE,
-        2,
+        DELEG_CLASS_UPDATE, 2,
         "the UPDATE capability bit (bitmask with LOOKUP)"
     );
 
@@ -433,6 +456,7 @@ async fn an_update_grant_rides_the_first_shipped_create_and_mints_answer_locally
 
     let ship0 = ship::stats().shipped_verbs;
     let mints0 = istats().mints;
+    let refusals0 = istats().refusals;
 
     // Local mints: no wire.
     let mut minted = Vec::new();
@@ -490,9 +514,15 @@ async fn an_update_grant_rides_the_first_shipped_create_and_mints_answer_locally
         "pending lookup/getattr + census negative are all LOCAL"
     );
 
-    // Invisible on the owner until the flush.
+    // Invisible on the owner until the flush — probed through the
+    // HOOK-FREE dentry read (the trait lookup's OQ-2 local read gate
+    // would FORCE the flush, which is the law working, not the probe).
     assert!(
-        Metadata::lookup(fx.owner_be.as_ref(), d, "m0").await.is_err(),
+        fx.owner_be
+            .lookup_dentry(d, "m0")
+            .await
+            .expect("hook-free dentry read")
+            .is_none(),
         "an un-flushed mint must not be visible owner-side"
     );
 
@@ -519,7 +549,11 @@ async fn an_update_grant_rides_the_first_shipped_create_and_mints_answer_locally
         .expect("applied name resolves for the minter");
     assert_eq!(looked.ino, minted[0]);
 
-    assert_eq!(istats().refusals, 0, "no deferred refusals on this path");
+    assert_eq!(
+        istats().refusals,
+        refusals0,
+        "no deferred refusals on this path"
+    );
     shutdown(&fx).await;
 }
 
@@ -703,14 +737,24 @@ async fn an_injected_apply_enospc_surfaces_at_fsync_dir_and_destroys_the_local_m
         .await
         .expect_err("fsync(dir) surfaces the deferred refusal");
     assert_eq!(errno, libc::ENOSPC, "the owner's errno, verbatim");
-    assert_eq!(istats().refusals, refusals0 + 1, "meta_ship_intent_refusals counts it");
-    assert_eq!(istats().mint_destroys, destroys0 + 1, "the local mint is DESTROYED");
+    assert_eq!(
+        istats().refusals,
+        refusals0 + 1,
+        "meta_ship_intent_refusals counts it"
+    );
+    assert_eq!(
+        istats().mint_destroys,
+        destroys0 + 1,
+        "the local mint is DESTROYED"
+    );
     ship::TEST_INTENT_APPLY_ERRNO.store(0, Ordering::SeqCst);
 
     // The destroyed mint no longer serves: the lookup misses the image
     // (and the owner never applied the name).
     assert!(
-        Metadata::lookup(fx.client_be.as_ref(), d, "doomed").await.is_err(),
+        Metadata::lookup(fx.client_be.as_ref(), d, "doomed")
+            .await
+            .is_err(),
         "a stale local name must not survive the refusal"
     );
     assert!(
@@ -718,7 +762,9 @@ async fn an_injected_apply_enospc_surfaces_at_fsync_dir_and_destroys_the_local_m
         "the destroyed image must not serve by ino"
     );
     assert!(
-        Metadata::lookup(fx.owner_be.as_ref(), d, "doomed").await.is_err(),
+        Metadata::lookup(fx.owner_be.as_ref(), d, "doomed")
+            .await
+            .is_err(),
         "nothing was applied owner-side"
     );
 
@@ -745,9 +791,13 @@ async fn an_injected_apply_enospc_surfaces_at_fsync_dir_and_destroys_the_local_m
 async fn a_foreign_negative_lookup_goes_positive_after_fsync_dir_within_the_published_bound() {
     let _plane = PLANE.lock().await;
     let fx = fixture().await;
-    let (d, _f0) = earn_update(&fx, "vis").await;
+    let d = Metadata::create(fx.owner_be.as_ref(), 1, "vis", DIR, 0, 0)
+        .await
+        .expect("owner mkdir")
+        .ino;
 
-    // The foreign negative BEFORE the mint (B's shipped lookup).
+    // The foreign negative BEFORE any grant exists (a foreign read after
+    // the grant would recall it — the OQ-2 law — which is its own test).
     let results = ship_raw(
         &fx.endpoint,
         NODE_B,
@@ -766,6 +816,15 @@ async fn a_foreign_negative_lookup_goes_positive_after_fsync_dir_within_the_publ
         libc::ENOENT
     );
 
+    // Earn the grant, then MINT the name locally.
+    let grants0 = istats().update_grants;
+    Metadata::create(fx.client_be.as_ref(), d, "f0", FILE, 0, 0)
+        .await
+        .expect("the grant-earning shipped create");
+    wait_for("the UPDATE grant", || {
+        istats().update_grants > grants0 && intents::holds_update_authority(d)
+    })
+    .await;
     let ino = Metadata::create(fx.client_be.as_ref(), d, "appears", FILE, 0, 0)
         .await
         .expect("the local mint")
@@ -869,6 +928,7 @@ async fn a_foreign_read_recalls_the_update_grant_and_forces_the_flush() {
         .ino;
     let flushes0 = istats().flush_forces;
     let reads0 = istats().read_recalls;
+    let timeouts0 = ship::delegation_stats().recall_timeouts;
     let results = ship_raw(
         &fx.endpoint,
         NODE_B,
@@ -882,7 +942,11 @@ async fn a_foreign_read_recalls_the_update_grant_and_forces_the_flush() {
         }],
     )
     .await;
-    match results[0].outcome.as_ref().expect("the flushed name serves") {
+    match results[0]
+        .outcome
+        .as_ref()
+        .expect("the flushed name serves")
+    {
         MetaReply::Inode(i) => assert_eq!(i.ino, ino),
         MetaReply::Ino(i) => assert_eq!(*i, ino),
         other => panic!("lookup answered {other:?}"),
@@ -892,7 +956,11 @@ async fn a_foreign_read_recalls_the_update_grant_and_forces_the_flush() {
         istats().flush_forces > flushes0,
         "the recall FORCED the flush before the serve"
     );
-    assert_eq!(ship::delegation_stats().recall_timeouts, 0);
+    assert_eq!(
+        ship::delegation_stats().recall_timeouts,
+        timeouts0,
+        "the recall was ACKED (flush-then-ack), never timed out"
+    );
     shutdown(&fx).await;
 }
 
@@ -954,7 +1022,10 @@ async fn a_replayed_intent_batch_answers_the_winner_and_never_double_applies() {
         d2.results[0].outcome.is_ok(),
         "the replay answers the winner's own outcome"
     );
-    assert!(istats().replays > replays0, "the witness counted the replay");
+    assert!(
+        istats().replays > replays0,
+        "the witness counted the replay"
+    );
 
     // Never double-applied: exactly one dentry, resolving to the op's ino.
     let entries = Metadata::readdir(fx.owner_be.as_ref(), d, 0, 1024)
@@ -1008,7 +1079,9 @@ async fn a_stale_term_intent_frame_refuses_whole() {
         "an old-era intent frame is stale by construction — refused whole"
     );
     assert!(
-        Metadata::lookup(fx.owner_be.as_ref(), d, "stale").await.is_err(),
+        Metadata::lookup(fx.owner_be.as_ref(), d, "stale")
+            .await
+            .is_err(),
         "nothing was applied"
     );
     shutdown(&fx).await;
@@ -1055,7 +1128,9 @@ async fn intents_die_with_the_custody_fence() {
     );
     assert!(istats().stale_refusals > stale0);
     assert!(
-        Metadata::lookup(fx.owner_be.as_ref(), d, "zombie").await.is_err(),
+        Metadata::lookup(fx.owner_be.as_ref(), d, "zombie")
+            .await
+            .is_err(),
         "a fenced holder's intent never applies"
     );
     shutdown(&fx).await;
@@ -1076,8 +1151,9 @@ async fn a_fenced_holders_intent_batch_refuses() {
         .ino;
     // A manual holder earns a LOOKUP grant and never services its recall
     // channel; the conflicting create fences it at the deadline.
-    let results = ship_raw(
+    let results = ship_raw_as(
         &fx.endpoint,
+        "manual-holder",
         "manual-holder",
         99,
         vec![MetaOp {
@@ -1179,7 +1255,9 @@ async fn a_shipped_mutation_naming_pending_state_flushes_first() {
         "the barrier flushed before the ship"
     );
     assert!(
-        Metadata::lookup(fx.owner_be.as_ref(), d, "ephemeral").await.is_err(),
+        Metadata::lookup(fx.owner_be.as_ref(), d, "ephemeral")
+            .await
+            .is_err(),
         "created-then-unlinked: nothing survives"
     );
     shutdown(&fx).await;
@@ -1201,7 +1279,11 @@ async fn a_create_into_a_pending_directory_flushes_then_earns_its_own_grant() {
         .expect("the mkdir intent")
         .ino;
     assert!(
-        Metadata::lookup(fx.owner_be.as_ref(), d, "sub").await.is_err(),
+        fx.owner_be
+            .lookup_dentry(d, "sub")
+            .await
+            .expect("hook-free dentry read")
+            .is_none(),
         "the pending mkdir is not owner-visible yet"
     );
     // The first create INTO the pending directory barriers + ships +
@@ -1248,7 +1330,9 @@ async fn an_unflushed_batch_dies_with_the_client_and_a_flushed_batch_is_durable(
     Metadata::create(fx.client_be.as_ref(), d, "durable", FILE, 0, 0)
         .await
         .expect("mint");
-    intents::fsync_dir_barrier(d).await.expect("the contract point");
+    intents::fsync_dir_barrier(d)
+        .await
+        .expect("the contract point");
 
     // Un-flushed half: acked, then the client DIES (state dropped).
     Metadata::create(fx.client_be.as_ref(), d, "lost", FILE, 0, 0)
@@ -1260,7 +1344,9 @@ async fn an_unflushed_batch_dies_with_the_client_and_a_flushed_batch_is_durable(
         .await
         .expect("the fsynced name survived — fsync(dir) IS the contract point");
     assert!(
-        Metadata::lookup(fx.owner_be.as_ref(), d, "lost").await.is_err(),
+        Metadata::lookup(fx.owner_be.as_ref(), d, "lost")
+            .await
+            .is_err(),
         "the un-fsynced batch died with the client (MW-8, disclosed)"
     );
     shutdown(&fx).await;
@@ -1284,38 +1370,41 @@ async fn the_grant_ping_pong_storm_engages_the_valve_before_fanout_hurts() {
     let (d, _f0) = earn_update(&fx, "storm").await;
 
     let demotions0 = ship::global_recall_lane().stats().thrash_demotions;
-    // Alternate: A mints one name (holding the grant), B ships one (the
-    // conflict — recall + re-grant to B... and back). Each B create is a
-    // grant→recall episode on D.
-    for round in 0..12 {
+    let timeouts0 = ship::delegation_stats().recall_timeouts;
+    let flushes0 = istats().flush_forces;
+    let t0 = std::time::Instant::now();
+    // One round = A creates (minting under the grant when held, shipping
+    // and RE-EARNING it otherwise) and a foreign reader probes the hot
+    // directory (the OQ-2 recall-forces-flush conflict). Every round is a
+    // grant→recall episode on D — the exact thrash shape spec R5's valve
+    // exists for.
+    let mut minted_rounds = 0u32;
+    for round in 0..12u64 {
         if intents::holds_update_authority(d) {
-            Metadata::create(fx.client_be.as_ref(), d, &format!("a{round}"), FILE, 0, 0)
-                .await
-                .expect("A's create");
-        } else {
-            Metadata::create(fx.client_be.as_ref(), d, &format!("a{round}"), FILE, 0, 0)
-                .await
-                .expect("A's (shipped) create");
+            minted_rounds += 1;
         }
+        Metadata::create(fx.client_be.as_ref(), d, &format!("a{round}"), FILE, 0, 0)
+            .await
+            .expect("A's storm create");
         let results = ship_raw(
             &fx.endpoint,
             NODE_B,
             50,
             vec![MetaOp {
                 id: round + 1,
-                call: MetaCall::CreateWithRdev {
+                call: MetaCall::LookupDentry {
                     parent: d,
-                    name: format!("b{round}"),
-                    mode: FILE,
-                    uid: 0,
-                    gid: 0,
-                    rdev: 0,
+                    name: format!("a{round}"),
                 },
             }],
         )
         .await;
-        assert!(results[0].outcome.is_ok(), "B's storm create applies");
+        assert!(
+            results[0].outcome.is_ok(),
+            "B's storm read serves the acked name (recall-forces-flush)"
+        );
     }
+    let wall = t0.elapsed();
     let lane = ship::global_recall_lane().stats();
     assert!(
         lane.thrash_demotions > demotions0,
@@ -1324,7 +1413,21 @@ async fn the_grant_ping_pong_storm_engages_the_valve_before_fanout_hurts() {
         demotions0,
         lane.thrash_demotions
     );
-    assert_eq!(ship::delegation_stats().recall_timeouts, 0, "no dead recalls");
+    assert_eq!(
+        ship::delegation_stats().recall_timeouts,
+        timeouts0,
+        "no dead recalls — every storm recall was acked (the flush-then-ack path)"
+    );
+    // THE PRICE (the OQ-2 reopening trigger's cargo instrument — the leg's
+    // live storm row publishes the wall-clock beside it): printed, never
+    // gated here.
+    println!(
+        "OQ-2 storm price: 12 rounds in {wall:?} ({} minted rounds, {} forced flushes, \
+         {} demotions)",
+        minted_rounds,
+        istats().flush_forces - flushes0,
+        lane.thrash_demotions - demotions0
+    );
     // Post-demotion the directory still WORKS — creates ship, exactly one
     // ack per name (the demoted posture is owner-served, never wedged).
     Metadata::create(fx.client_be.as_ref(), d, "post-demotion", FILE, 0, 0)
@@ -1352,22 +1455,37 @@ async fn the_dark_posture_exports_zeros_and_pays_nothing() {
         !intents::update_intents_enabled(),
         "unarmed ⇒ intents structurally off (the knob is read only when armed)"
     );
+    // The live-state gauges are 0 on the dark posture BY CONSTRUCTION
+    // (the cumulative counters are process-global across this serial
+    // binary's earlier tests — the per-mount zero pin is the leg's).
     let s = istats();
     assert_eq!(
-        (s.batches, s.verbs, s.flush_forces, s.refusals, s.mints, s.pending),
-        (0, 0, 0, 0, 0, 0),
-        "every intent counter is 0 on the dark posture BY CONSTRUCTION"
+        (s.pending, s.supply_remaining),
+        (0, 0),
+        "no pending intents, no supply on the dark posture"
     );
+    assert!(!intents::holds_update_authority(1));
+    let before = istats();
     intents::fsync_dir_barrier(1)
         .await
         .expect("the dark fsync barrier is a clean no-op");
+    assert_eq!(
+        istats().flush_forces,
+        before.flush_forces,
+        "the dark fsync barrier pays nothing"
+    );
 
-    // The stats-inode object exports (the design-§13 spellings) as zeros.
+    // The stats-inode object exports the design-§13 spellings.
     let json = intents::intent_stats_json();
-    assert_eq!(json["meta_ship_intent_batches"], 0);
-    assert_eq!(json["meta_ship_intent_verbs"], 0);
-    assert_eq!(json["meta_ship_intent_flush_forces"], 0);
-    assert_eq!(json["meta_ship_intent_refusals"], 0);
+    for key in [
+        "meta_ship_intent_batches",
+        "meta_ship_intent_verbs",
+        "meta_ship_intent_flush_forces",
+        "meta_ship_intent_refusals",
+        "meta_ship_intent_visibility_bound_ms",
+    ] {
+        assert!(json.get(key).is_some(), "{key} must export");
+    }
 }
 
 /// The A/B lever: `TEST_INTENTS_OVERRIDE = 2` (the `SQUEEZEFS_UPDATE_INTENTS=0`

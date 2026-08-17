@@ -9889,6 +9889,14 @@ impl SqueezefsFilesystem {
                 // the loud escalate-to-eviction one.
                 "dlm_delegation": crate::meta_ship::delegation_stats_json(),
                 "dlm_delegation_recall_phase_ns": crate::meta_ship::delegation_recall_phase_json(),
+                // Rung 13 — the S10 UPDATE-intent family (KD-MW-13,
+                // design §13's meta_ship_intent_* spellings): the local
+                // mint/flush ledger. All zero on every mount without an
+                // armed delegation plane BY CONSTRUCTION;
+                // `meta_ship_intent_refusals` is the must-stay-≈0
+                // deferred-error gauge (growth = capacity/quota pressure
+                // reaching the delegated create path).
+                "meta_ship_intent": crate::meta_ship::intents::intent_stats_json(),
                 // DLM S9 (spec §6.9 S9): the remote write-custody plane and
                 // the daemon's publish path on the wire. `dlm_custody.mode`
                 // is `off` on every single-writer mount and every other
@@ -23452,6 +23460,14 @@ impl Filesystem for SqueezefsFilesystem {
         let prof = OpProf::begin(FuseOpKind::Release, ino);
         prof.mark_backend_start();
 
+        // Rung 13 (design §8.2's flush-forcing triggers): RELEASE of an
+        // intent-minted PENDING child kicks an ASYNCHRONOUS flush — it
+        // bounds the acked-un-fsynced window without serializing the
+        // minter (fsync(dir) stays the synchronous contract point; the
+        // per-lane flush slot self-coalesces close bursts into one
+        // frame). One relaxed load when nothing is pending.
+        crate::meta_ship::intents::kick_if_pending(ino);
+
         // D1.d (§5.1, PR M5): a never-dirtied open generation skips the
         // lease acquire and the per-close background flush task — there is
         // nothing to flush. Lease/lock/open-count/reclaim bookkeeping
@@ -23539,6 +23555,16 @@ impl Filesystem for SqueezefsFilesystem {
             return Err(Errno::from(errno));
         }
 
+        // Rung 13 (KD-MW-13): fsync of a PENDING intent-minted file forces
+        // the intent flush first (the file's existence must be durable for
+        // its data durability to mean anything); a DESTROYED mint answers
+        // the owner's latched errno (the §8.2 child poison). One relaxed
+        // load on every mount without pending intents.
+        if let Err(errno) = crate::meta_ship::intents::fsync_ino_barrier(ino).await {
+            error!("FUSE Fsync: intent barrier for ino {ino} reports errno {errno}");
+            return Err(Errno::from(errno));
+        }
+
         // P0-3: durable ops must not mask backend write failures.
         let prof = OpProf::begin(FuseOpKind::Fsync, ino);
         prof.mark_backend_start();
@@ -23574,6 +23600,17 @@ impl Filesystem for SqueezefsFilesystem {
     async fn fsyncdir(&self, _req: Request, ino: u64, _fh: u64, _datasync: bool) -> FuseResult<()> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
         debug!("FUSE Fsyncdir: ino = {}", ino);
+        // Rung 13 (KD-MW-13): fsync(dir) is the intent batch's CONTRACT
+        // POINT — flush every pending intent, then surface (and consume —
+        // the errseq law) the directory's deferred apply-refusal latch.
+        // One relaxed load on every mount without pending intents.
+        if let Err(errno) = crate::meta_ship::intents::fsync_dir_barrier(ino).await {
+            error!(
+                "FUSE Fsyncdir: reporting deferred intent-apply refusal for dir {ino}: {errno} \
+                 (the §8.2 deferred-error law — the locally-acked mint was destroyed)"
+            );
+            return Err(Errno::from(errno));
+        }
         if let Some(backend) = self.meta_backend.as_ref() {
             backend
                 .sync_all_devices()

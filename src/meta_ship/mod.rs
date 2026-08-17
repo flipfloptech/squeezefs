@@ -102,6 +102,9 @@
 //! decomposed into queue wait, encode, RTT, decode and owner-side execute
 //! instead of being a single mystery number.
 
+/// DLM S10 rung 13: the client half of the per-directory EXCLUSIVE UPDATE
+/// grants + asynchronous create-intent batches (KD-MW-13).
+pub mod intents;
 pub mod owners;
 /// DLM stage **S9**: the daemon's *non-trait* publish surface on the wire —
 /// the deliberate gap this module's docs name above, closed as its own
@@ -118,7 +121,10 @@ pub use owners::{
     ownership_armed, owns_volume, OwnerMap, PeerOwner,
 };
 pub use router::{MetaShipRouter, VerbRoute, TEST_SHIP_DRAIN_HOLD_MS};
-pub use service::{owner_authority_token, MetaShipService, ServiceStats, TEST_DELEG_COHERENCE_LAW};
+pub use service::{
+    owner_authority_token, MetaShipService, ServiceStats, TEST_DELEG_COHERENCE_LAW,
+    TEST_INTENT_APPLY_ERRNO, TEST_INTENT_READ_GATE, TEST_INTENT_SUPPLY_CHUNK,
+};
 pub use tokens::{
     cache_cap, deleg_kernel_ttl_stretch, delegation_enabled, delegation_stats,
     delegation_stats_json, foreign_fencing_token, global_recall_lane, install_delegation,
@@ -268,6 +274,25 @@ pub async fn deleg_mutation_gate(
     host.deleg_mutation_begin(inos)
         .await
         .map(|inos| DelegGatePermit { svc: host, inos })
+}
+
+/// **The OQ-2 read gate's LOCAL face** (rung 13): the owner's own
+/// lookup/readdir of a directory with an outstanding foreign UPDATE grant
+/// recalls it first (which flushes the holder's intent batch), exactly as
+/// a shipped foreign read does — otherwise the owner's own `ls` could
+/// miss un-flushed foreign intents unboundedly. One relaxed load when no
+/// delegation host is armed; one more when no UPDATE grant exists.
+pub async fn deleg_read_gate(be: &crate::meta_backend::RoutedMetaBackend, dir: u64) {
+    if !DELEG_HOST_ARMED.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(host) = DELEG_HOST.load_full() else {
+        return;
+    };
+    if !std::ptr::eq(Arc::as_ptr(host.inner()), be as *const _) {
+        return;
+    }
+    host.intent_read_gate(dir, "").await;
 }
 
 /// Should a mutation site pay participant RESOLUTION (the unlink/rename

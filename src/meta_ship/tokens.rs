@@ -783,32 +783,7 @@ impl RecallLane {
     /// recalls coalesce. Stamps the object's thrash slot — the recall
     /// half of the cycle evidence.
     pub fn recall_object(&self, ino: u64, now: Instant) -> usize {
-        let mut st = self.state.lock();
-        let holders: Vec<String> = st
-            .grants
-            .get(&ino)
-            .map(|s| s.iter().cloned().collect())
-            .unwrap_or_default();
-        if holders.is_empty() {
-            return 0;
-        }
-        let mut enqueued = 0usize;
-        for client in holders {
-            if !st.requested.entry(client.clone()).or_default().insert(ino) {
-                self.coalesced.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-            st.pending
-                .entry(client)
-                .or_default()
-                .push_back(PendingRecall {
-                    ino,
-                    enqueued_at: now,
-                });
-            enqueued += 1;
-        }
-        st.thrash.entry(ino).or_default().last_recall_at = Some(now);
-        enqueued
+        self.recall_object_excluding(ino, None, now)
     }
 
     /// The batched, rate-limited issue pass: for every client with queued
@@ -976,6 +951,68 @@ impl RecallLane {
             .get(&ino)
             .map(|s| s.len())
             .unwrap_or(0)
+    }
+
+    /// Outstanding holders of `ino` EXCLUDING `client` (rung 13: the
+    /// intent apply's gate waits out every FOREIGN holder while the
+    /// flushing UPDATE holder's own grant stays live — surrendering it
+    /// would orphan the owner-side authority record and deadlock the
+    /// recall the flush itself answers).
+    pub fn holders_excluding(&self, ino: u64, client: &str) -> usize {
+        self.state
+            .lock()
+            .grants
+            .get(&ino)
+            .map(|s| s.iter().filter(|c| c.as_str() != client).count())
+            .unwrap_or(0)
+    }
+
+    /// Does `client` hold a live grant on `ino`? (The owner-side UPDATE
+    /// exclusivity table's liveness check.)
+    pub fn holds(&self, ino: u64, client: &str) -> bool {
+        self.state
+            .lock()
+            .grants
+            .get(&ino)
+            .is_some_and(|s| s.contains(client))
+    }
+
+    /// [`Self::recall_object`] excluding one holder (rung 13: the intent
+    /// apply recalls every FOREIGN grant on the directory and never its
+    /// own — a wire recall to the flushing holder mid-flush would recurse
+    /// the recall-forces-flush law into itself).
+    pub fn recall_object_excluding(&self, ino: u64, skip: Option<&str>, now: Instant) -> usize {
+        let mut st = self.state.lock();
+        let holders: Vec<String> = st
+            .grants
+            .get(&ino)
+            .map(|s| {
+                s.iter()
+                    .filter(|c| skip != Some(c.as_str()))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        if holders.is_empty() {
+            return 0;
+        }
+        let mut enqueued = 0usize;
+        for client in holders {
+            if !st.requested.entry(client.clone()).or_default().insert(ino) {
+                self.coalesced.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            st.pending
+                .entry(client)
+                .or_default()
+                .push_back(PendingRecall {
+                    ino,
+                    enqueued_at: now,
+                });
+            enqueued += 1;
+        }
+        st.thrash.entry(ino).or_default().last_recall_at = Some(now);
+        enqueued
     }
 
     /// Counter snapshot + gauges.
@@ -1280,6 +1317,12 @@ fn fire_inval_sink(ino: u64) {
     }
 }
 
+/// The intents module's face of the invalidation sink (a destroyed mint's
+/// kernel invalidation — rung 13).
+pub(crate) fn fire_deleg_inval(ino: u64) {
+    fire_inval_sink(ino);
+}
+
 /// The R5 registration (design §13: "bytes rides R5") — sheddable at
 /// weight 1 with floor 0: every dropped entry costs one re-earned grant,
 /// never a wrong answer (the token-cache retirement law).
@@ -1426,7 +1469,13 @@ pub(crate) fn deleg_channel(endpoint: &str) -> Arc<DelegChannel> {
 pub(crate) fn deleg_channel_mark_ok(endpoint: &str, park_ms: u64, term: u64) {
     let ch = deleg_channel(endpoint);
     ch.park_ms.store(park_ms.max(1), Ordering::Relaxed);
-    ch.term.fetch_max(term, Ordering::AcqRel);
+    let prev = ch.term.fetch_max(term, Ordering::AcqRel);
+    if term > prev && prev > 0 {
+        // Rung 13: a failover observed — un-flushed intents were minted
+        // from the dead era's supply and can never apply (the era gate
+        // refuses them whole); they die through the §8.2 error channel.
+        super::intents::owner_era_moved(endpoint, term);
+    }
     ch.last_ok_ms.store(now_ms(), Ordering::Release);
     ch.healthy.store(true, Ordering::Release);
     DELEG_CHANNEL_ROUNDS.fetch_add(1, Ordering::Relaxed);
@@ -1549,6 +1598,27 @@ pub(crate) enum RevokeKind {
 /// the caller queues the ack only after this returns), drop the entries,
 /// and push the kernel invalidation for each (the TTL-stretch bound).
 pub(crate) async fn revoke_delegations(
+    endpoint: &str,
+    inos: &[u64],
+    fence_term: u64,
+    fence_seq: u64,
+    kind: RevokeKind,
+) {
+    // Rung 13 — **recall-forces-flush** (OQ-2's resolved form): a recall
+    // naming a held UPDATE authority flushes its intent batch BEFORE the
+    // drain/ack below, so the recaller's conflicting serve or mutation
+    // orders strictly after every locally-acked intent (the O_EXCL
+    // exactly-one-ack ordering proof). One relaxed load when no authority
+    // exists.
+    super::intents::revoke_update_authorities(endpoint, inos).await;
+    revoke_delegations_no_intents(endpoint, inos, fence_term, fence_seq, kind).await;
+}
+
+/// [`revoke_delegations`] WITHOUT the intents hook — the arm the intent
+/// flush's own reply-revoke absorption calls (a flush's reply must never
+/// recurse into another flush; the apply's gate keeps the flusher's
+/// UPDATE grants, so these revokes only ever name LOOKUP-class entries).
+pub(crate) async fn revoke_delegations_no_intents(
     endpoint: &str,
     inos: &[u64],
     fence_term: u64,

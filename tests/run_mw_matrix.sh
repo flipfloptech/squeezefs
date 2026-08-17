@@ -3389,16 +3389,21 @@ PYS11
     [ "$admitted" = "1" ] || die "s11-range: victim m$m1 could not re-admit by remount within the grace ladder"
     log "victim m$m1 re-admitted by remount"
 
-    # ==== THE COMPOSITION GATE (GREEN since rung 17) ==========================
-    # The merged two-writer layout read cold + the C8 oracle. Standing
-    # RED from rung 15 (adjudicated to rung 17 at rung 16); rung 17's
-    # authority-assembler machinery FLIPPED it: shipped layout merges
-    # CHAIN ONTO THE DURABLE HEAD (owner-restamped claim + owner-minted
-    # link version, the versioned DeltaUsed reply — publish schema 6),
-    # the chain-cap full save stands down for chained targets (the OWNER
-    # compacts from its own folded state), so two co-writers' publishes
-    # of ONE ino compose instead of racing the delta-chain/full-save
-    # base. A red here is a REGRESSION (see the die text below).
+    # ==== THE COMPOSITION GATE (rung 17: byte half GREEN, C8 half
+    # ==== STANDING RED — narrowed) ============================================
+    # The merged two-writer layout read cold + the C8 oracle. Rung 17's
+    # chain-onto-head machinery flipped the BYTE half (the cold verify
+    # passes — pre-17 it failed): shipped layout merges CHAIN ONTO THE
+    # DURABLE HEAD (owner-restamped claim + owner-minted link version,
+    # the versioned DeltaUsed reply — publish schema 6), the chain-cap
+    # full save stands down for chained targets, batch-prior pass mates
+    # never compact over each other, and shipped full Puts are
+    # CUSTODY-SCOPED. The C8/fsck half stays STANDING RED on ONE
+    # characterized residual (rung-17 evidence note, findings ledger):
+    # the kill arm's zeros-rewrite loop (content-identical rewrite on
+    # the LOW half racing a differing-content HIGH-half peer) still
+    # mints dangling ledger takes + double-release free refusals —
+    # the iso2..iso6 discriminator matrix in the note pins the shape.
     local comp_bad=""
     "$MWFLEET" unmount 0 >/dev/null 2>&1 || true
     "$MWFLEET" mount 0 >/dev/null 2>&1 || die "s11-range: authority remount failed"
@@ -3446,7 +3451,7 @@ PYS11
 
     if [ -n "$comp_bad" ]; then
         die "s11-range COMPOSITION GATE RED (custody half GREEN — engagement/Issue-19/kill-arm/rung-16-clause columns all passed; zero residue): $comp_bad.
-Rung 17 FLIPPED this gate green (the authority assembler / chain-onto-head shipped merges — .benchmarks/2026-08-17-s11-authority-assembler.md; the standing-red lineage: .benchmarks/2026-08-17-s11-range-wire.md + .benchmarks/2026-08-17-s11-b4-clause.md), so a red here is a REGRESSION of the concurrent same-ino publish composition: check meta_ship_publish.{stale_refusals,replays}, the chain-onto-head arm (KvMetaBackend::merge_layout_and_size_chained), and the C8 oracle's drift attribution."
+Rung 17 NARROWED this standing red (.benchmarks/2026-08-17-s11-authority-assembler.md): the BYTE half is green (chain-onto-head shipped merges — a cold-verify mismatch here is a REGRESSION), three composition convictions are fixed+pinned (divergence-refusal wedge, batch-prior pass-mate compaction, un-scoped shipped full Puts), and the residual C8 mint is the characterized zeros-rewrite interleave (the note's iso2..iso6 matrix) owned by the rung-18 ladder. Lineage: .benchmarks/2026-08-17-s11-range-wire.md + .benchmarks/2026-08-17-s11-b4-clause.md."
     fi
     log "s11-range GREEN — the first sub-file multi-writer rows, composition included (snapshots + fsck in $rowdir). Evidence tier: measured-simulated (one box, co-located members)"
 }
@@ -3478,12 +3483,50 @@ leg_s11_subblock() {
     truncate -s $((8 * 1024 * 1024)) "$w_mnt/s11-subblock.dat" ||
         die "s11-subblock: authority could not create the shared file"
     local m0_pid
-    m0_pid="$(daemon_pid_for_mnt "$w_mnt")"
+    m0_pid="$(pgrep -f "squeezefs.*mount.*$w_mnt" | head -1)"
     [ -n "$m0_pid" ] || die "s11-subblock: no authority daemon pid"
     cpu_of() { awk '{print $14 + $15}' "/proc/$1/stat"; }
 
-    write_half() { # mnt start_off pattern_byte -> wall_secs (stdout)
-        python3 - "$1/s11-subblock.dat" "$2" "$3" "$rec" "$half" <<'PYW'
+    for idx in $(member_idxs); do snap "$idx" 0 "$rowdir"; done
+    local cpu0 cpu1 t_m2
+    cpu0="$(cpu_of "$m0_pid")"
+
+    # The INCUMBENT's LIVE stream (the §9.3 shape verbatim: "holder A
+    # direct-DMAing a block-aligned grant; B acquires an overlapping-block
+    # range MID-STREAM"): m1 holds ONE OPEN FD and loops over its half —
+    # its grant stays live across the whole row (a per-phase close would
+    # RELEASE the grant and dissolve the sharing before it exists, which
+    # is exactly what this leg's first cut proved). Final pass pattern 51.
+    (
+        python3 - "$(mnt_of "$m1")/s11-subblock.dat" 0 "$rec" "$half" >"$rowdir/a-passes" 2>"$rowdir/a.err"
+        echo $? >"$rowdir/a-rc"
+    ) <<'PYA' &
+import os, sys, time
+path, start, rec, half = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+fd = os.open(path, os.O_WRONLY)
+deadline = time.monotonic() + 9.0
+n = 0
+while True:
+    n += 1
+    last = time.monotonic() >= deadline
+    pat = 51 if last else 16 + (n % 8)
+    buf = bytes([pat]) * rec
+    t0 = time.monotonic()
+    off = start
+    while off < start + half:
+        os.pwrite(fd, buf, off)
+        off += rec
+    os.fsync(fd)
+    print(f"pass {n} pat {pat} {time.monotonic() - t0:.3f}s", flush=True)
+    if last:
+        break
+os.close(fd)
+PYA
+    local a_pid=$!
+    sleep 1
+    # B acquires MID-STREAM: the barrier parks its first record's grant
+    # until A's renewal-carried notice is acked; every record then ships.
+    t_m2="$(python3 - "$(mnt_of "$m2")/s11-subblock.dat" "$half" 34 "$rec" "$half" <<'PYB'
 import os, sys, time
 path, start, pat, rec, half = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
 fd = os.open(path, os.O_WRONLY)
@@ -3496,34 +3539,14 @@ while off < start + half:
 os.fsync(fd)
 print(f"{time.monotonic() - t0:.3f}")
 os.close(fd)
-PYW
-    }
-
-    for idx in $(member_idxs); do snap "$idx" 0 "$rowdir"; done
-    local cpu0 cpu1 t_m1a t_m2 t_m1b
-    cpu0="$(cpu_of "$m0_pid")"
-
-    # Phase A: m1's half, PRE-demotion (sole block custody — the baseline
-    # cost of the same stream on the un-demoted path).
-    t_m1a="$(write_half "$(mnt_of "$m1")" 0 17)" ||
-        die "s11-subblock: m$m1's pre-demotion stream failed"
-    log "phase A (m$m1 pre-demotion, local path): ${t_m1a}s for $((half / rec)) records"
-
-    # Phase B: m2's half — the FIRST ask fires the demotion barrier
-    # (renewal-carried notice → m1's quiesce+ack → grant), then every
-    # record ships as an extent. TIMED = barrier + extent-ship cost.
-    for idx in $(member_idxs); do snap "$idx" 1 "$rowdir"; done
-    t_m2="$(write_half "$(mnt_of "$m2")" "$half" 34)" ||
-        die "s11-subblock: m$m2's post-demotion stream failed"
+PYB
+)" || die "s11-subblock: m$m2's through-demotion stream failed"
     log "phase B (m$m2 through the demotion + extent ship): ${t_m2}s for $((half / rec)) records"
-
-    # Phase C: m1 REWRITES its half — now demoted, so the INCUMBENT ships
-    # too (KD-MW-8's symmetric law).
-    for idx in $(member_idxs); do snap "$idx" 2 "$rowdir"; done
-    t_m1b="$(write_half "$(mnt_of "$m1")" 0 51)" ||
-        die "s11-subblock: m$m1's post-demotion stream failed"
+    wait "$a_pid" || true
+    [ "$(cat "$rowdir/a-rc" 2>/dev/null)" = "0" ] ||
+        die "s11-subblock: m$m1's live stream failed: $(head -3 "$rowdir/a.err" 2>/dev/null)"
     cpu1="$(cpu_of "$m0_pid")"
-    log "phase C (m$m1 post-demotion — the incumbent ships): ${t_m1b}s for $((half / rec)) records"
+    log "phase A/C (m$m1's live stream, pre→post demotion): $(head -1 "$rowdir/a-passes") … $(tail -1 "$rowdir/a-passes")"
     for idx in $(member_idxs); do snap "$idx" 3 "$rowdir"; done
 
     # ---- Engagement + the demotion ledger, gated -----------------------------
@@ -3540,8 +3563,8 @@ def load(i, ph):
     return flat(json.load(open(f"{rowdir}/m{i}_p{ph}.json")))
 bad = []
 d = lambda i, a, b, k: int(load(i, b).get(k, 0) or 0) - int(load(i, a).get(k, 0) or 0)
-m2_ship = d(m2, 1, 3, "meta_ship_publish.extent_shipped")
-m1_ship = d(m1, 2, 3, "meta_ship_publish.extent_shipped")
+m2_ship = d(m2, 0, 3, "meta_ship_publish.extent_shipped")
+m1_ship = d(m1, 0, 3, "meta_ship_publish.extent_shipped")
 served = d("0", 0, 3, "meta_ship_publish.extent_served")
 flushes = d("0", 0, 3, "meta_ship_publish.extent_flush_forces") \
     + d(m1, 0, 3, "meta_ship_publish.extent_flush_forces") \
@@ -3591,13 +3614,30 @@ print("S11 sub-block engagement GREEN (both holders shipped, ledger closed, clau
 PYSB
 
     # ---- The price table ------------------------------------------------------
-    local cpu_d recs_total
+    local cpu_d shipped_total
     cpu_d=$((cpu1 - cpu0))
-    recs_total=$((3 * half / rec))
-    log "PRICE (measured-simulated, tcp devsub, ${rec}B records, $((half / rec)) records/phase):"
-    log "  phase A (pre-demotion local): ${t_m1a}s   phase B (demotion + ship): ${t_m2}s   phase C (incumbent ships): ${t_m1b}s"
-    log "  authority daemon CPU over the row: $cpu_d ticks ($(python3 -c "print(f'{$cpu_d/100:.2f}')")s) for $recs_total records total"
-    log "  authority merge CPU/extent: $(python3 -c "print(f'{$cpu_d * 10_000 / (2 * $half / $rec):.0f}')") µs (phases B+C extents only, upper bound — includes serve+fold+publish)"
+    shipped_total="$(python3 - "$rowdir" "$m1" "$m2" <<'PYT'
+import json, sys
+rowdir, m1, m2 = sys.argv[1], sys.argv[2], sys.argv[3]
+def flat(d, out=None, pfx=""):
+    out = {} if out is None else out
+    for k, v in d.items():
+        if isinstance(v, dict): flat(v, out, pfx + k + ".")
+        else: out[pfx + k] = v
+    return out
+def load(i, ph):
+    return flat(json.load(open(f"{rowdir}/m{i}_p{ph}.json")))
+t = 0
+for i in (m1, m2):
+    t += int(load(i, 3).get("meta_ship_publish.extent_shipped", 0) or 0) - \
+         int(load(i, 0).get("meta_ship_publish.extent_shipped", 0) or 0)
+print(t)
+PYT
+)"
+    log "PRICE (measured-simulated, tcp devsub, ${rec}B records, $((half / rec)) records/pass):"
+    log "  incumbent per-pass walls (pre → post demotion): see $rowdir/a-passes; B through-demotion: ${t_m2}s for $((half / rec)) records"
+    log "  extents shipped (both holders): $shipped_total; authority daemon CPU over the row: $cpu_d ticks ($(python3 -c "print(f'{$cpu_d/100:.2f}')")s)"
+    log "  authority CPU/extent: $(python3 -c "print(f'{$cpu_d * 10_000 / max(1, $shipped_total):.0f}')") µs (upper bound — serve+merge+fold+publish inclusive)"
 
     # ---- Cold verify + oracle -------------------------------------------------
     local comp_bad=""

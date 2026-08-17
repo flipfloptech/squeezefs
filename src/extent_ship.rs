@@ -105,9 +105,7 @@ pub fn retained_bytes() -> u64 {
 
 /// Retained extents (RAM + spilled) for `ino`.
 pub fn retained_count(ino: u64) -> usize {
-    RETAINED
-        .read_sync(&ino, |_, v| v.len())
-        .unwrap_or(0)
+    RETAINED.read_sync(&ino, |_, v| v.len()).unwrap_or(0)
 }
 
 /// Any retention at all? (One relaxed load — the fsync/read gates.)
@@ -141,8 +139,7 @@ pub fn uninstall_spill_sink() {
 /// BEFORE the ack travels (the §9.3 order: mark local → quiesce → ack).
 /// The mount arm installs the real drain (the write path's own lock
 /// chain); a missing hook quiesces nothing — honest for wire-only tests.
-pub type QuiesceHook =
-    Arc<dyn Fn(u64) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+pub type QuiesceHook = Arc<dyn Fn(u64) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 static QUIESCE: Lazy<arc_swap::ArcSwapOption<QuiesceHook>> =
     Lazy::new(arc_swap::ArcSwapOption::empty);
@@ -341,7 +338,14 @@ pub async fn ship_extent(
     let abs = block_index
         .saturating_mul(crate::routing::default_block_size())
         .saturating_add(u64::from(offset_in_block));
-    retain(ino, block_index, offset_in_block, abs, data.clone(), request_id);
+    retain(
+        ino,
+        block_index,
+        offset_in_block,
+        abs,
+        data.clone(),
+        request_id,
+    );
     match crate::meta_ship::publish::write_extent(
         be,
         ino,

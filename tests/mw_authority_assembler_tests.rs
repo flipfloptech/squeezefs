@@ -301,9 +301,13 @@ async fn shipped_create(client_be: &Arc<RoutedMetaBackend>, name: &str) -> u64 {
 
 /// The mock assembler: records every merged extent, applies it to a
 /// per-(ino, block) image, and answers a canned covering version.
+/// One recorded assembler merge: `(client, ino, block_index,
+/// offset_in_block, data)`.
+type MergeRec = (String, u64, u64, u32, Vec<u8>);
+
 #[derive(Debug, Default)]
 struct MockAssembler {
-    merges: parking_lot::Mutex<Vec<(String, u64, u64, u32, Vec<u8>)>>,
+    merges: parking_lot::Mutex<Vec<MergeRec>>,
     images: parking_lot::Mutex<std::collections::HashMap<(u64, u64), Vec<u8>>>,
     covering: AtomicU64, // 0 = answer None
 }
@@ -509,7 +513,10 @@ async fn the_demotion_barrier_withholds_the_grant_until_the_incumbents_ack() {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(marked, "B's block-sharing acquire marked a demotion pending");
+    assert!(
+        marked,
+        "B's block-sharing acquire marked a demotion pending"
+    );
     assert!(!b_task.is_finished(), "B's grant is WITHHELD (parked)");
 
     // The notice names the incumbent: A's token, block 0's region.
@@ -562,7 +569,9 @@ async fn the_demotion_barrier_withholds_the_grant_until_the_incumbents_ack() {
             "the demoted block classifies range-shared under {token:#x}"
         );
     }
-    let prs0 = METRICS.patch_ineligible_range_shared.load(Ordering::Relaxed);
+    let prs0 = METRICS
+        .patch_ineligible_range_shared
+        .load(Ordering::Relaxed);
     let ors0 = METRICS
         .overlay_ineligible_range_shared
         .load(Ordering::Relaxed);
@@ -575,7 +584,10 @@ async fn the_demotion_barrier_withholds_the_grant_until_the_incumbents_ack() {
         "the B4 §5.1 clause fires on the demoted block"
     );
     assert_eq!(
-        METRICS.patch_ineligible_range_shared.load(Ordering::Relaxed) - prs0,
+        METRICS
+            .patch_ineligible_range_shared
+            .load(Ordering::Relaxed)
+            - prs0,
         1
     );
     assert_eq!(
@@ -1104,9 +1116,16 @@ async fn release_path_1_an_ack_with_a_covering_version_releases_immediately() {
     asm.install();
 
     let before = extent_ship::retained_bytes();
-    extent_ship::ship_extent(&client_be, ino, 0, 0, bytes::Bytes::from_static(b"covered"), 1)
-        .await
-        .expect("the extent ships");
+    extent_ship::ship_extent(
+        &client_be,
+        ino,
+        0,
+        0,
+        bytes::Bytes::from_static(b"covered"),
+        1,
+    )
+    .await
+    .expect("the extent ships");
     assert_eq!(
         extent_ship::retained_bytes(),
         before,
@@ -1138,9 +1157,16 @@ async fn release_path_2_renewal_observation_releases_covered_extents() {
     asm.install(); // covering = 0 → the ack answers None
 
     let before = extent_ship::retained_bytes();
-    extent_ship::ship_extent(&client_be, ino, 0, 0, bytes::Bytes::from_static(b"retained"), 1)
-        .await
-        .expect("the extent ships");
+    extent_ship::ship_extent(
+        &client_be,
+        ino,
+        0,
+        0,
+        bytes::Bytes::from_static(b"retained"),
+        1,
+    )
+    .await
+    .expect("the extent ships");
     assert!(
         extent_ship::retained_bytes() > before,
         "an ack WITHOUT a covering version retains — ack alone never releases"
@@ -1184,9 +1210,16 @@ async fn release_path_3_flush_extents_forces_the_publish_and_releases() {
 
     let s0 = extent_stats();
     let before = extent_ship::retained_bytes();
-    extent_ship::ship_extent(&client_be, ino, 0, 0, bytes::Bytes::from_static(b"fsynced"), 1)
-        .await
-        .expect("the extent ships");
+    extent_ship::ship_extent(
+        &client_be,
+        ino,
+        0,
+        0,
+        bytes::Bytes::from_static(b"fsynced"),
+        1,
+    )
+    .await
+    .expect("the extent ships");
     assert!(extent_ship::retained_bytes() > before);
     let covering = extent_ship::flush_ino(&client_be, ino)
         .await
@@ -1235,16 +1268,9 @@ async fn release_path_4_at_budget_retention_spills_instead_of_blocking() {
     let s0 = extent_stats();
     // Two extents: the second pushes past the 64-byte budget and the
     // FIRST (oldest, acked) spills — the writer is never blocked.
-    extent_ship::ship_extent(
-        &client_be,
-        ino,
-        0,
-        0,
-        bytes::Bytes::from(vec![0xAA; 48]),
-        1,
-    )
-    .await
-    .expect("extent 1 ships");
+    extent_ship::ship_extent(&client_be, ino, 0, 0, bytes::Bytes::from(vec![0xAA; 48]), 1)
+        .await
+        .expect("extent 1 ships");
     extent_ship::ship_extent(
         &client_be,
         ino,
@@ -1421,7 +1447,10 @@ async fn shipped_merges_chain_onto_the_head_and_never_clobber_a_peer() {
     let publish::PublishReply::DeltaUsed { used, version: v1 } = r1 else {
         panic!("the merge reply carries the staged version: {r1:?}");
     };
-    assert!(used, "the shipped merge STAGED a delta (never a full-Put re-base)");
+    assert!(
+        used,
+        "the shipped merge STAGED a delta (never a full-Put re-base)"
+    );
     assert_ne!(v1, 0, "the staged link's version travels on the reply");
 
     // Writer 2 (a second holder's frame): its private view NEVER SAW
@@ -1466,7 +1495,10 @@ async fn shipped_merges_chain_onto_the_head_and_never_clobber_a_peer() {
         lease_epoch: epoch,
         request_id: 0xC3,
     };
-    let r3 = pc.ship(&auth.endpoint, p3).await.expect("the stale claim chains");
+    let r3 = pc
+        .ship(&auth.endpoint, p3)
+        .await
+        .expect("the stale claim chains");
     let publish::PublishReply::DeltaUsed { used, .. } = r3 else {
         panic!("reply shape: {r3:?}");
     };
@@ -1533,7 +1565,10 @@ async fn a_batch_prior_ino_never_compacts_over_its_own_pass_mates() {
         )
         .await
         .expect("pre-cap link lands");
-    assert!(matches!(r, publish::PublishReply::DeltaUsed { used: true, .. }));
+    assert!(matches!(
+        r,
+        publish::PublishReply::DeltaUsed { used: true, .. }
+    ));
 
     // Two members of ONE pass for this ino, from TWO clients (two wire
     // lanes — the leg's two co-writers; one client's lane mutex would
@@ -1594,6 +1629,151 @@ async fn a_batch_prior_ino_never_compacts_over_its_own_pass_mates() {
     assert_eq!(map.get(&0).map(String::as_str), Some("be://data:pre0"));
     assert_eq!(map.get(&2).map(String::as_str), Some("be://data:mate2"));
     assert_eq!(map.get(&3).map(String::as_str), Some("be://data:mate3"));
+
+    auth.listener.shutdown();
+    shutdown(&owner_be).await;
+    shutdown(&client_be).await;
+}
+
+/// Contract (the s11-range leg's THIRD conviction — the zeros/remove
+/// class): a shipped **full Put** (`SetLayoutAndSize` — the vehicle of
+/// every save the delta wire cannot express, hole-punch removals above
+/// all) is authoritative EXACTLY FOR THE SHIPPER'S CUSTODY SPANS. The
+/// owner applies it CUSTODY-SCOPED: durable entries for blocks the
+/// shipper's live grants do not overlap are PRESERVED (a concurrent
+/// peer's publish between the shipper's base read and this apply must
+/// never be erased by an unconditional Put — the C8 dangler + double-
+/// release mint the leg convicted); entries INSIDE its custody follow
+/// the Put verbatim (absence there IS the removal intent). A whole-file
+/// holder's Put stays fully authoritative (unscoped — solo/whole-file
+/// byte-identical).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shipped_full_put_is_custody_scoped_and_never_erases_a_peer() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let (owner_be, _p) = sandbox(dir.path(), "own", true).await;
+    let (client_be, _p2) = sandbox(dir.path(), "cli", false).await;
+    let auth = start_authority(Arc::clone(&owner_be), "assembler-authority");
+    let (client, pc) = arm_client(&auth, &client_be).await;
+    let epoch = client.lease_epoch();
+    let ino = shipped_create(&client_be, "scoped.bin").await;
+    let base = base_layout_bytes(4 * BLOCK, &[]);
+    publish::set_layout_and_size(&client_be, ino, &base, 4 * BLOCK, &[])
+        .await
+        .expect("the base Put lands");
+
+    // This client (NODE_A) takes RANGE custody of block 0 only.
+    let _g = client
+        .acquire_range(ino, (0, BLOCK), (0, BLOCK), Duration::from_secs(1))
+        .await
+        .expect("block-0 range custody");
+
+    // The PEER's publish (a second holder's frame): block 1's entry.
+    let peer_lease = auth
+        .owner
+        .join(&data_grant::JoinFrame {
+            schema: data_grant::CUSTODY_SCHEMA,
+            client: "node-assembler-b".to_string(),
+            pr_key: 0,
+            prior_epoch: None,
+        })
+        .expect("peer joins");
+    let _pg = auth
+        .owner
+        .grant_ranged(
+            &data_grant::AcquireFrame {
+                schema: data_grant::CUSTODY_SCHEMA,
+                client: "node-assembler-b".to_string(),
+                lease_epoch: peer_lease.epoch,
+                ino,
+                span: Some((BLOCK, 2 * BLOCK)),
+                concurrent_write: false,
+                wait_ms: 5_000,
+                desired: Some((BLOCK, 2 * BLOCK)),
+            },
+            (BLOCK, 2 * BLOCK),
+        )
+        .await
+        .expect("peer's block-1 custody");
+    let pc2 = publish::PublishClient::new("node-assembler-b", SECRET.to_vec());
+    let r = pc2
+        .ship(
+            &auth.endpoint,
+            publish::PublishCall::MergeLayoutAndSize {
+                ino,
+                delta: delta(
+                    4 * BLOCK,
+                    &[(1, "be://data:peer1")],
+                    Some((0, squeezefs::dlm::mint_layout_version())),
+                )
+                .encode(),
+                full_layout: base_layout_bytes(4 * BLOCK, &[(1, "be://data:peer1")]),
+                size: 4 * BLOCK,
+                refs: Vec::new(),
+                lease_epoch: peer_lease.epoch,
+                request_id: 0xF1,
+            },
+        )
+        .await
+        .expect("the peer's block-1 publish lands");
+    assert!(matches!(
+        r,
+        publish::PublishReply::DeltaUsed { used: true, .. }
+    ));
+
+    // NODE_A ships a FULL PUT computed from a base that NEVER SAW the
+    // peer's block 1 (the zeros/remove-class save's exact shape): block 0
+    // present, block 1 ABSENT. Pre-fix the owner applied it verbatim and
+    // erased the peer's entry (its ledger take dangling — the C8 mint).
+    pc.ship(
+        &auth.endpoint,
+        publish::PublishCall::SetLayoutAndSize {
+            ino,
+            layout: base_layout_bytes(4 * BLOCK, &[(0, "be://data:mine0")]),
+            size: 4 * BLOCK,
+            refs: Vec::new(),
+            lease_epoch: epoch,
+            request_id: 0xF2,
+        },
+    )
+    .await
+    .expect("the scoped full Put lands");
+
+    let map = owner_layout(&owner_be, ino).await.block_map.expect("map");
+    assert_eq!(
+        map.get(&0).map(String::as_str),
+        Some("be://data:mine0"),
+        "the shipper's own-custody entry follows the Put"
+    );
+    assert_eq!(
+        map.get(&1).map(String::as_str),
+        Some("be://data:peer1"),
+        "the PEER's entry survives — a shipped full Put is custody-scoped"
+    );
+
+    // The removal intent INSIDE custody still works: a Put absent block 0
+    // removes it while the peer's entry keeps surviving.
+    pc.ship(
+        &auth.endpoint,
+        publish::PublishCall::SetLayoutAndSize {
+            ino,
+            layout: base_layout_bytes(4 * BLOCK, &[]),
+            size: 4 * BLOCK,
+            refs: Vec::new(),
+            lease_epoch: epoch,
+            request_id: 0xF3,
+        },
+    )
+    .await
+    .expect("the removal-class Put lands");
+    let map = owner_layout(&owner_be, ino).await.block_map.expect("map");
+    assert_eq!(map.get(&0), None, "absence inside custody IS the removal");
+    assert_eq!(
+        map.get(&1).map(String::as_str),
+        Some("be://data:peer1"),
+        "the peer's entry still survives the removal-class Put"
+    );
 
     auth.listener.shutdown();
     shutdown(&owner_be).await;

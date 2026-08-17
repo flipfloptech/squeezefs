@@ -575,15 +575,22 @@ pub enum PublishReply {
     /// chain-without-refetch input (design-mw-layout-versions §6's named
     /// residual): the co-writer stamps its RAM provenance from the reply
     /// so its next delta claims the right base with no round trip.
-    DeltaUsed { used: bool, version: u64 },
+    DeltaUsed {
+        used: bool,
+        version: u64,
+    },
     /// `write_extent` (rung 17): `covering_version` is `Some` **iff the
     /// covering publish has already run** — releasing the shipper's
     /// retention at the round trip; `None` retains (release rides the
     /// pull surfaces — §9.3's retention law).
-    ExtentAck { covering_version: Option<u64> },
+    ExtentAck {
+        covering_version: Option<u64>,
+    },
     /// `flush_extents` (rung 17): the covering layout version after the
     /// forced fold+publish — the fsync barrier's answer.
-    FlushDone { covering_version: u64 },
+    FlushDone {
+        covering_version: u64,
+    },
     /// `create_with_rdev_size`.
     Inode(WireInode),
     /// `xattr_value_cap`.
@@ -979,6 +986,16 @@ impl PublishClient {
 
 static CLIENT: Lazy<arc_swap::ArcSwapOption<PublishClient>> =
     Lazy::new(arc_swap::ArcSwapOption::empty);
+
+/// Rung 17: the OWNER-side per-ino serialization of served layout-class
+/// verbs (design §6a law 3's owner half, made structural): the
+/// custody-scoped full Put reads the durable layout BEFORE its commit,
+/// and two clients' serves of one ino must not interleave in that window
+/// (the backend's own 4a guard covers the commit, not the read). Striped;
+/// collisions only serialize spuriously.
+static SERVE_INO_LOCKS: Lazy<
+    crate::stripe_locks::StripeLocks<crate::sqz_sync::SqzMutex<()>, 1024>,
+> = Lazy::new(crate::stripe_locks::StripeLocks::new);
 
 /// Install the process's publish client (the multi-writer mount arm's act).
 pub fn install_client(client: Arc<PublishClient>) {
@@ -1665,9 +1682,7 @@ pub struct ExtentFrame {
 /// version when the extent is ALREADY covered by a durable publish
 /// (`Some` releases the shipper's retention at the ack), else `None`.
 pub type ExtentMergeExec = Arc<
-    dyn Fn(ExtentFrame) -> Pin<Box<dyn Future<Output = Result<Option<u64>>> + Send>>
-        + Send
-        + Sync,
+    dyn Fn(ExtentFrame) -> Pin<Box<dyn Future<Output = Result<Option<u64>>> + Send>> + Send + Sync,
 >;
 
 static EXTENT_MERGE_EXEC: Lazy<arc_swap::ArcSwapOption<ExtentMergeExec>> =
@@ -2163,6 +2178,11 @@ impl PublishService {
                 // commit runs on the sqz-meta pool, never inline on a
                 // `sqz-cluster-svc{n}` lane.
                 match crate::meta_exec::spawn_meta_join("meta_ship_publish_verb", async move {
+                    // Rung 17: per-ino serialization across the whole
+                    // serve (the scoped Put's read + commit — see
+                    // `SERVE_INO_LOCKS`).
+                    let ino = call.named_inos().first().copied().unwrap_or(0);
+                    let _ino_guard = SERVE_INO_LOCKS.get_inode_lock(ino).lock().await;
                     me.execute(&client, call).await
                 })
                 .await
@@ -2378,6 +2398,77 @@ impl PublishService {
         }
     }
 
+    /// Rung 17 — **the custody-scoped full Put** (the s11-range leg's
+    /// zeros/remove-class conviction): a shipped `SetLayoutAndSize` is
+    /// computed from the SHIPPER's base view, which under two live
+    /// custodians legitimately lags a peer's publishes — applying it
+    /// verbatim erased the peer's newer entries while their ledger refs
+    /// stayed (the C8 dangler + the double-release free refusals). The
+    /// law: a RANGE holder's Put is authoritative exactly for its
+    /// custody spans' blocks — inside them the Put's presence/absence is
+    /// the truth (absence IS the removal intent); outside them the
+    /// durable entries are preserved. A whole-file holder's (and the
+    /// pre-custody publish class's) Put stays verbatim, so solo and
+    /// whole-file mounts are byte-identical.
+    async fn custody_scoped_layout(&self, client: &str, ino: u64, shipped: Vec<u8>) -> Vec<u8> {
+        let Some(owner) = crate::data_grant::custody_owner() else {
+            return shipped;
+        };
+        let spans = match owner.client_custody_on(client, ino) {
+            crate::data_grant::ClientCustodyShape::Ranges(spans) => spans,
+            _ => return shipped,
+        };
+        let Some((_size, block)) = owner.geometry_of(ino).await else {
+            log::warn!(
+                "S11: a range holder's full Put for ino {ino} cannot be custody-scoped — no \
+                 geometry source installed; applying verbatim (peer entries at risk — arm \
+                 the geometry source with the range plane)"
+            );
+            return shipped;
+        };
+        if block == 0 {
+            return shipped;
+        }
+        use crate::meta_backend::Metadata as _;
+        let durable = match self.inner.getxattr(ino, "layout").await {
+            Ok(Some(bytes)) => bytes,
+            _ => return shipped, // no current layout — first Put, verbatim
+        };
+        let (Ok(mut cur), Ok(mut new)) = (
+            crate::layout_wire::decode_base_layout(&durable),
+            crate::layout_wire::decode_base_layout(&shipped),
+        ) else {
+            return shipped; // JSON-era/undecodable base: the legacy verbatim arm
+        };
+        let mut map = cur.block_map.take().unwrap_or_default();
+        let new_map = new.block_map.take().unwrap_or_default();
+        let in_custody = |b: u32| {
+            let bs = u64::from(b) * block;
+            let be = bs + block;
+            spans.iter().any(|&(s, e)| e > bs && s < be)
+        };
+        map.retain(|b, _| !(in_custody(*b) && !new_map.contains_key(b)));
+        for (b, k) in new_map {
+            if in_custody(b) {
+                map.insert(b, k);
+            }
+        }
+        // Non-map fields follow the Put (same layout class); size never
+        // regresses a peer's growth (truncation is the setattr plane's).
+        new.size = new.size.max(cur.size);
+        new.block_map = Some(map);
+        match crate::layout_wire::encode_layout(&new) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                log::error!(
+                    "S11: custody-scoped layout re-encode failed for ino {ino} ({e}) — \
+                     applying the shipped Put verbatim"
+                );
+                shipped
+            }
+        }
+    }
+
     async fn execute(&self, client: &str, call: PublishCall) -> Result<PublishReply> {
         match call {
             PublishCall::SetLayoutAndSize {
@@ -2388,6 +2479,7 @@ impl PublishService {
                 ..
             } => {
                 let refs: Vec<BlockRefOp> = refs.into_iter().map(BlockRefOp::from).collect();
+                let layout = self.custody_scoped_layout(client, ino, layout).await;
                 self.inner
                     .set_layout_and_size(ino, &layout, size, &refs)
                     .await?;

@@ -179,6 +179,21 @@ pub const CUSTODY_MALFORMED: u16 = 0x45;
 /// remedy is release/backoff, never waiting on a holder.
 pub const CUSTODY_AT_CAPACITY: u16 = 0x46;
 
+/// Rung 17: one client's live custody SHAPE on an ino — the
+/// custody-scoped full-Put law's input (see
+/// [`WriteCustodyOwner::client_custody_on`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientCustodyShape {
+    /// No live grants (the pre-custody publish class — Puts apply
+    /// verbatim, exactly as every shipped Put did before ranges existed).
+    None,
+    /// Whole-file custody: Puts stay fully authoritative.
+    WholeFile,
+    /// Range custody: a shipped full Put is authoritative only INSIDE
+    /// these spans' blocks.
+    Ranges(Vec<(u64, u64)>),
+}
+
 /// A client's join (or re-join after losing its lease view).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinFrame {
@@ -1576,6 +1591,42 @@ impl WriteCustodyOwner {
                 );
                 Err((status, reason))
             }
+        }
+    }
+
+    /// Rung 17 (the custody-scoped full Put): `client`'s live custody
+    /// SHAPE on `ino` — `None` (no grants: the pre-custody publish
+    /// class), `WholeFile` (fully authoritative Puts), or the live range
+    /// spans. O(live grants), an episode operation.
+    pub fn client_custody_on(&self, client: &str, ino: u64) -> ClientCustodyShape {
+        let mut spans: Vec<(u64, u64)> = Vec::new();
+        let mut whole = false;
+        for g in self
+            .table
+            .grants_snapshot_with(|_, g| (g.client == client && g.ino == ino).then_some(g.span))
+        {
+            match g {
+                Some(None) => whole = true,
+                Some(Some(span)) => spans.push(span),
+                None => {}
+            }
+        }
+        if whole {
+            ClientCustodyShape::WholeFile
+        } else if spans.is_empty() {
+            ClientCustodyShape::None
+        } else {
+            ClientCustodyShape::Ranges(spans)
+        }
+    }
+
+    /// The installed §9.2 geometry source's answer for `ino` (`None` = no
+    /// source / unresolvable — the scoping arm then stands down).
+    pub async fn geometry_of(&self, ino: u64) -> Option<(u64, u64)> {
+        let source = self.geometry.read().clone();
+        match source {
+            Some(g) => g.geometry(ino).await,
+            None => None,
         }
     }
 

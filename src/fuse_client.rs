@@ -11932,8 +11932,7 @@ impl SqueezefsFilesystem {
         let bs = self.router.block_size.load(Ordering::Relaxed).max(1);
         let first = offset / bs;
         let last = (offset + len - 1) / bs;
-        (first..=last)
-            .any(|b| crate::dlm::span_range_shared(ino, b * bs, (b + 1) * bs, token))
+        (first..=last).any(|b| crate::dlm::span_range_shared(ino, b * bs, (b + 1) * bs, token))
     }
 
     /// Rung 17 (KD-MW-8's symmetric law): dispatch one striped write
@@ -26670,7 +26669,6 @@ mod tests {
         assert!(check_component_name_len(OsStr::new(&"b".repeat(255))).is_ok());
     }
 }
-
 
 /// Rung 17: the read handler body, housed behind the retained-extent
 /// overlay wrapper (the trait `read` above delegates here verbatim).

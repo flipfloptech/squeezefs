@@ -7407,10 +7407,9 @@ impl KvMetaBackend {
                                         continue;
                                     }
                                 };
-                                let applied = crate::layout_wire::LayoutDelta::decode(
-                                    &op.delta_wire,
-                                )
-                                .and_then(|d| d.apply(&folded));
+                                let applied =
+                                    crate::layout_wire::LayoutDelta::decode(&op.delta_wire)
+                                        .and_then(|d| d.apply(&folded));
                                 match applied {
                                     Ok(full) => chained_full = Some(full),
                                     Err(e) => {
@@ -7583,7 +7582,8 @@ impl KvMetaBackend {
         // incompat bit durably stamped (the one-time ratchet).
         let mut use_delta = false;
         let mut staged_version = 0u64;
-        let mut delta_versions = (delta.version != 0).then_some((delta.base_version, delta.version));
+        let mut delta_versions =
+            (delta.version != 0).then_some((delta.base_version, delta.version));
         let mut chained_full: Option<Vec<u8>> = None;
         if existing {
             if let Some(cur) = self.xattrs.lookup(&key).await? {
@@ -7628,7 +7628,8 @@ impl KvMetaBackend {
                 } else if use_delta && self.layout_versions_stamped() {
                     // Spec §6.2 item 9: the durable base-name gate — Stage /
                     // re-base / REFUSE loud (see `admit_versioned_delta`).
-                    use_delta = self.admit_versioned_delta(ino, delta_versions, depth, head_versions)?;
+                    use_delta =
+                        self.admit_versioned_delta(ino, delta_versions, depth, head_versions)?;
                     if use_delta {
                         staged_version = delta.version;
                     }

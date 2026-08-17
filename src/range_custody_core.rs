@@ -607,9 +607,7 @@ impl FileCustody {
         // Rung 17: a DEMOTED region is authority-assembled for EVERY
         // holder — a sole covering grant is still extent-ship-only there
         // (KD-MW-8's custody transfer). One `is_empty` probe shipped.
-        if !self.demoted.is_empty()
-            && self.demoted.iter().any(|&(s, e)| e > start && s < end)
-        {
+        if !self.demoted.is_empty() && self.demoted.iter().any(|&(s, e)| e > start && s < end) {
             return true;
         }
         self.candidates(start, end)
@@ -721,17 +719,16 @@ impl FileCustody {
     /// target (within a demoted region a stream must still converge to
     /// O(1) records, or the §9.2 geometry cap refuses the workload the
     /// demotion exists to serve).
-    pub fn own_adjacent_grant(&self, required: (u64, u64), scope: u64) -> Option<(u64, (u64, u64))> {
+    pub fn own_adjacent_grant(
+        &self,
+        required: (u64, u64),
+        scope: u64,
+    ) -> Option<(u64, (u64, u64))> {
         self.ranges
             .iter()
             .filter(|g| g.owner_nonce == scope && g.mode == LockMode::Exclusive)
             .find(|g| g.end >= required.0 && g.start <= required.1)
-            .map(|g| {
-                (
-                    g.token,
-                    (g.start.min(required.0), g.end.max(required.1)),
-                )
-            })
+            .map(|g| (g.token, (g.start.min(required.0), g.end.max(required.1))))
     }
 
     /// Mark one demotion pending. `true` = a NEW record (the ledger's
@@ -740,9 +737,7 @@ impl FileCustody {
     /// parked waiter's re-plans never double-count).
     pub fn mark_demotion_pending(&mut self, region: (u64, u64), incumbent_token: u64) -> bool {
         if let Some(p) = self.pending.iter_mut().find(|p| {
-            p.incumbent_token == incumbent_token
-                && p.region.1 >= region.0
-                && p.region.0 <= region.1
+            p.incumbent_token == incumbent_token && p.region.1 >= region.0 && p.region.0 <= region.1
         }) {
             p.region.0 = p.region.0.min(region.0);
             p.region.1 = p.region.1.max(region.1);

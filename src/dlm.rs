@@ -1190,18 +1190,35 @@ impl LocalLockManager {
         /// The one-critical-section outcome (plan AND apply under the
         /// entry lock — a plan can never go stale before its admit).
         enum RangeMint {
-            New { token: u64, span: (u64, u64) },
-            Extended { token: u64, span: (u64, u64) },
-            Covered { token: u64, span: (u64, u64) },
+            New {
+                token: u64,
+                span: (u64, u64),
+            },
+            Extended {
+                token: u64,
+                span: (u64, u64),
+            },
+            Covered {
+                token: u64,
+                span: (u64, u64),
+            },
             Held,
             /// Rung 17: parked behind the §9.3 grant-issuance demotion
             /// barrier (pendings marked; the incumbent's ack — or its
             /// lease death — wakes this waiter).
             HeldDemotion,
             Bridge,
-            CapGeometry { live: usize, cap: u64 },
-            CapBudget { bytes: u64, budget: u64 },
-            Red { bytes: u64 },
+            CapGeometry {
+                live: usize,
+                cap: u64,
+            },
+            CapBudget {
+                bytes: u64,
+                budget: u64,
+            },
+            Red {
+                bytes: u64,
+            },
             Exhausted(u64),
         }
 
@@ -1216,52 +1233,50 @@ impl LocalLockManager {
                 // The §9.2 bounds + mint + admit for a NEW record over
                 // `span` (shared by the plan's New arm and the rung-17
                 // licensed-coexistence admit).
-                let admit_new = |custody: &mut FileCustody,
-                                 span: (u64, u64),
-                                 trimmed: bool|
-                 -> RangeMint {
-                    // The §9.2 bounds, in refusal order: the file's own
-                    // geometry, then the R5 byte budget, then the Red
-                    // clamp. All BEFORE the mint (never burn a token
-                    // on a refused acquisition).
-                    let live = custody.ranges_len();
-                    if let Some(cap) = span_cap {
-                        if (live as u64) >= cap {
-                            return RangeMint::CapGeometry { live, cap };
-                        }
-                    }
-                    let bytes = grant_table_bytes();
-                    let budget = range_table_budget_bytes();
-                    if bytes + RANGE_GRANT_RECORD_BYTES > budget {
-                        return RangeMint::CapBudget { bytes, budget };
-                    }
-                    if mem_red {
-                        return RangeMint::Red { bytes };
-                    }
-                    match mint_token() {
-                        Err(seq) => RangeMint::Exhausted(seq),
-                        Ok(token) => {
-                            if trimmed {
-                                RANGE_DESIRED_TRIMS.fetch_add(1, Ordering::Relaxed);
+                let admit_new =
+                    |custody: &mut FileCustody, span: (u64, u64), trimmed: bool| -> RangeMint {
+                        // The §9.2 bounds, in refusal order: the file's own
+                        // geometry, then the R5 byte budget, then the Red
+                        // clamp. All BEFORE the mint (never burn a token
+                        // on a refused acquisition).
+                        let live = custody.ranges_len();
+                        if let Some(cap) = span_cap {
+                            if (live as u64) >= cap {
+                                return RangeMint::CapGeometry { live, cap };
                             }
-                            publish_floor_then_admit(grant_floor(&key), token, || {
-                                custody.admit(
-                                    Some(span),
-                                    Grant {
-                                        start: span.0,
-                                        end: span.1,
-                                        owner_nonce: scope,
-                                        token,
-                                        mode: LockMode::Exclusive,
-                                    },
-                                )
-                            });
-                            note_record_admitted(Some(span));
-                            RANGE_GRANTS.fetch_add(1, Ordering::Relaxed);
-                            RangeMint::New { token, span }
                         }
-                    }
-                };
+                        let bytes = grant_table_bytes();
+                        let budget = range_table_budget_bytes();
+                        if bytes + RANGE_GRANT_RECORD_BYTES > budget {
+                            return RangeMint::CapBudget { bytes, budget };
+                        }
+                        if mem_red {
+                            return RangeMint::Red { bytes };
+                        }
+                        match mint_token() {
+                            Err(seq) => RangeMint::Exhausted(seq),
+                            Ok(token) => {
+                                if trimmed {
+                                    RANGE_DESIRED_TRIMS.fetch_add(1, Ordering::Relaxed);
+                                }
+                                publish_floor_then_admit(grant_floor(&key), token, || {
+                                    custody.admit(
+                                        Some(span),
+                                        Grant {
+                                            start: span.0,
+                                            end: span.1,
+                                            owner_nonce: scope,
+                                            token,
+                                            mode: LockMode::Exclusive,
+                                        },
+                                    )
+                                });
+                                note_record_admitted(Some(span));
+                                RANGE_GRANTS.fetch_add(1, Ordering::Relaxed);
+                                RangeMint::New { token, span }
+                            }
+                        }
+                    };
                 // Rung 17 (§9.3): the grant-issuance DEMOTION BARRIER.
                 // `ask` is the span whose issuance would share a block
                 // with a live foreign grant: mark one pending per

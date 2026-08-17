@@ -371,10 +371,22 @@ impl FileCustody {
             if !g.overlaps(required.0, required.1) {
                 continue;
             }
-            if g.owner_nonce != scope || !g.mode.compatible_with(mode) || g.mode != mode {
-                // Foreign, or an incompatible/different-mode own grant
-                // (a CW self-grant is not mergeable custody for an EX
-                // ask): required cannot be granted whole right now.
+            if g.owner_nonce != scope || g.mode != mode {
+                // Foreign, or a different-mode own grant (a CW self-grant
+                // is not mergeable custody for an EX ask): required cannot
+                // be granted whole right now.
+                //
+                // Deliberately NOT `!compatible_with`: the §6.7 matrix
+                // governs two DIFFERENT holders, and EX‖EX is incompatible
+                // by that matrix — classifying the holder's OWN grant
+                // through it made every frontier-crossing chunk (a
+                // required window partially overlapping the held span,
+                // which every non-block-aligned writeback chunk produces)
+                // read as FOREIGN custody: a lone streaming co-writer
+                // waited out its whole budget ON ITSELF and died EIO (the
+                // s11-range leg's second live finding, 2026-08-17 —
+                // repro-ported as
+                // `own_grant_partial_overlap_extends_and_covered_reask_serves`).
                 return RangeDecision {
                     plan: RangePlan::HeldForeign,
                     trimmed: false,

@@ -1914,3 +1914,82 @@ async fn r5_registers_the_grant_table_and_token_cache_components() {
         }
     }
 }
+
+/// **The s11-range leg's second live finding (2026-08-17), repro-ported**:
+/// a required window PARTIALLY OVERLAPPING the holder's OWN grant — the
+/// frontier-crossing shape every non-block-aligned writeback chunk
+/// produces (write [15.7M,16.6M) against a held [0,16M)) — must EXTEND
+/// the grant, and a fully-covered re-ask must answer COVERED. The shipped
+/// plan classified the holder's own EX grant as FOREIGN custody
+/// (`!compatible_with` — EX‖EX is incompatible BY THE MATRIX, but the
+/// matrix governs two DIFFERENT holders; one holder's own grant is
+/// mergeable custody), so a lone streaming co-writer waited out its whole
+/// budget ON ITSELF and died EIO — with no peer anywhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn own_grant_partial_overlap_extends_and_covered_reask_serves() {
+    let _g = RANGE_SERIAL.lock().await;
+    let ino = 72_000_020u64;
+    let path = format!("inode_{ino}");
+    let d = dlm();
+    let geometry = Some((64 * BLK, BLK));
+
+    // The stream's first chunk: grant [0, 4M).
+    let first = d
+        .acquire_lock_range(&path, (0, MIB), (0, BLK), Duration::from_secs(3), geometry)
+        .await
+        .expect("first chunk");
+    let (lease, token) = match first {
+        RangeAcquired::New { lease, span } => {
+            assert_eq!(span, (0, BLK));
+            let t = lease.fencing_token();
+            (lease, t)
+        }
+        other => panic!("expected NEW, got {other:?}"),
+    };
+
+    // The frontier-crossing chunk: [3.7M, 4.6M) overlaps [0,4M) AND
+    // extends past it — the holder's own custody must EXTEND, never read
+    // as a foreign holder to wait on (the live EIO shape).
+    let crossing = (BLK - 300 * 1024, BLK + 400 * 1024);
+    let desired = squeezefs::dlm::block_align_out(crossing, BLK);
+    match d
+        .acquire_lock_range(&path, crossing, desired, Duration::from_millis(800), geometry)
+        .await
+        .expect("a frontier-crossing chunk must not starve on the holder's OWN grant")
+    {
+        RangeAcquired::Extended { token: t, span } => {
+            assert_eq!(t, token, "the extension keeps the surviving token");
+            assert_eq!(span, (0, 2 * BLK), "the union covers the crossing chunk");
+        }
+        other => panic!("a same-scope partial overlap must EXTEND, got {other:?}"),
+    }
+    assert_eq!(
+        squeezefs::dlm::live_range_records(ino),
+        1,
+        "still ONE grant after the frontier crossing"
+    );
+
+    // A fully-covered re-ask (the cache-cold idempotent shape) answers
+    // COVERED — same token, no mutation, no mint.
+    match d
+        .acquire_lock_range(
+            &path,
+            (MIB, 2 * MIB),
+            (MIB, 2 * MIB),
+            Duration::from_millis(800),
+            geometry,
+        )
+        .await
+        .expect("a covered re-ask must serve, not starve")
+    {
+        RangeAcquired::Covered { token: t, span } => {
+            assert_eq!(t, token);
+            assert_eq!(span, (0, 2 * BLK), "the covering grant's own span");
+        }
+        other => panic!("a covered re-ask must answer COVERED, got {other:?}"),
+    }
+    let stats = squeezefs::dlm::range_custody_stats();
+    assert!(stats.covered_serves > 0, "covered serves must be countable");
+    lease.release().await.expect("release");
+    assert_eq!(squeezefs::dlm::live_range_records(ino), 0);
+}

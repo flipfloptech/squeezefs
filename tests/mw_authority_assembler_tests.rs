@@ -2032,8 +2032,7 @@ async fn the_production_range_geometry_arms_the_scoped_put() {
         )),
         Arc::new(AtomicU64::new(chunk)),
     ));
-    let geometry =
-        squeezefs::multi_writer::router_range_geometry(Arc::clone(&owner_be), backend);
+    let geometry = squeezefs::multi_writer::router_range_geometry(Arc::clone(&owner_be), backend);
 
     let auth = start_authority_geo(
         Arc::clone(&owner_be),
@@ -2046,7 +2045,6 @@ async fn the_production_range_geometry_arms_the_scoped_put() {
 
     // The source's own contract: absent layout -> (0, block); a
     // layout-bearing ino -> (its size, block).
-    use squeezefs::data_grant::RangeGeometry as _;
     assert_eq!(
         geometry.geometry(ino).await,
         Some((0, BLOCK)),

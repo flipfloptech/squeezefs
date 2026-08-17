@@ -2410,35 +2410,59 @@ impl PublishService {
     /// durable entries are preserved. A whole-file holder's (and the
     /// pre-custody publish class's) Put stays verbatim, so solo and
     /// whole-file mounts are byte-identical.
-    async fn custody_scoped_layout(&self, client: &str, ino: u64, shipped: Vec<u8>) -> Vec<u8> {
+    ///
+    /// Rung 18 (the zeros-interleave conviction,
+    /// `.benchmarks/2026-08-17-s11-zeros-interleave-fix.md`): a RANGE
+    /// holder's Put is applied **scoped or not at all**. The former
+    /// no-geometry arm warned and applied VERBATIM — and since
+    /// `arm_multi_writer` installed no geometry source, that arm WAS the
+    /// production path: every epoch-close full Put reverted the peer's
+    /// half to the shipper's stale base while the ref ops landed (the
+    /// 48-finding C8 mint). The refusal is the never-lossy direction:
+    /// the client's save error refills its deferred refs and the
+    /// writeback ladder re-publishes; on a correctly-armed authority
+    /// (the production source now installed at arm) the arm is
+    /// unreachable.
+    async fn custody_scoped_layout(
+        &self,
+        client: &str,
+        ino: u64,
+        shipped: Vec<u8>,
+    ) -> Result<Vec<u8>> {
         let Some(owner) = crate::data_grant::custody_owner() else {
-            return shipped;
+            return Ok(shipped);
         };
         let spans = match owner.client_custody_on(client, ino) {
             crate::data_grant::ClientCustodyShape::Ranges(spans) => spans,
-            _ => return shipped,
+            _ => return Ok(shipped),
         };
-        let Some((_size, block)) = owner.geometry_of(ino).await else {
-            log::warn!(
-                "S11: a range holder's full Put for ino {ino} cannot be custody-scoped — no \
-                 geometry source installed; applying verbatim (peer entries at risk — arm \
-                 the geometry source with the range plane)"
-            );
-            return shipped;
+        let block = match owner.geometry_of(ino).await {
+            Some((_size, block)) if block > 0 => block,
+            other => {
+                return Err(SqueezefsError::InvalidOperation(format!(
+                    "S11: range holder '{client}'s full Put for ino {ino} cannot be \
+                     custody-scoped ({}) — refusing rather than applying it verbatim: an \
+                     unscoped Put reverts a concurrent peer's entries to this shipper's \
+                     stale base while both ref streams land (the zeros-interleave C8 \
+                     mint). Arm the authority's range plane with its geometry source \
+                     (multi_writer::router_range_geometry)",
+                    match other {
+                        None => "no geometry source installed",
+                        Some(_) => "the geometry source answered block size 0",
+                    }
+                )));
+            }
         };
-        if block == 0 {
-            return shipped;
-        }
         use crate::meta_backend::Metadata as _;
         let durable = match self.inner.getxattr(ino, "layout").await {
             Ok(Some(bytes)) => bytes,
-            _ => return shipped, // no current layout — first Put, verbatim
+            _ => return Ok(shipped), // no current layout — first Put, verbatim
         };
         let (Ok(mut cur), Ok(mut new)) = (
             crate::layout_wire::decode_base_layout(&durable),
             crate::layout_wire::decode_base_layout(&shipped),
         ) else {
-            return shipped; // JSON-era/undecodable base: the legacy verbatim arm
+            return Ok(shipped); // JSON-era/undecodable base: the legacy verbatim arm
         };
         let mut map = cur.block_map.take().unwrap_or_default();
         let new_map = new.block_map.take().unwrap_or_default();
@@ -2457,16 +2481,16 @@ impl PublishService {
         // regresses a peer's growth (truncation is the setattr plane's).
         new.size = new.size.max(cur.size);
         new.block_map = Some(map);
-        match crate::layout_wire::encode_layout(&new) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                log::error!(
-                    "S11: custody-scoped layout re-encode failed for ino {ino} ({e}) — \
-                     applying the shipped Put verbatim"
-                );
-                shipped
-            }
-        }
+        // Scoped or not at all (rung 18): a re-encode failure refuses —
+        // the retired fallback applied the shipped Put verbatim, which is
+        // the same peer-reverting mint the no-geometry arm minted.
+        crate::layout_wire::encode_layout(&new).map_err(|e| {
+            SqueezefsError::InvalidOperation(format!(
+                "S11: custody-scoped layout re-encode failed for ino {ino} ({e}) — refusing \
+                 rather than applying range holder '{client}'s Put verbatim (the \
+                 zeros-interleave C8 mint)"
+            ))
+        })
     }
 
     async fn execute(&self, client: &str, call: PublishCall) -> Result<PublishReply> {
@@ -2479,7 +2503,7 @@ impl PublishService {
                 ..
             } => {
                 let refs: Vec<BlockRefOp> = refs.into_iter().map(BlockRefOp::from).collect();
-                let layout = self.custody_scoped_layout(client, ino, layout).await;
+                let layout = self.custody_scoped_layout(client, ino, layout).await?;
                 self.inner
                     .set_layout_and_size(ino, &layout, size, &refs)
                     .await?;

@@ -204,6 +204,56 @@ impl CustodyQuarantine for RouterQuarantine {
     }
 }
 
+/// Rung 18 (the zeros-interleave conviction): the **PRODUCTION §9.2
+/// range-geometry source** — the answer `custody_scoped_layout` scopes a
+/// range holder's full Put with, and the per-file span cap + §9.3
+/// demotion-barrier block walls at every ranged acquire. `(size, block)`
+/// from the authority's OWN planes: size = the ino's durable layout
+/// head's (0 when absent/undecodable — the span cap floors at 16 and the
+/// scoping arm only consumes `block`); block = the data plane's live
+/// block size. Never a constant — the Issue-19 law.
+pub fn router_range_geometry(
+    meta: Arc<RoutedMetaBackend>,
+    backend: Arc<crate::routing::BackendRouter>,
+) -> Arc<dyn data_grant::RangeGeometry> {
+    struct RouterRangeGeometry {
+        meta: Arc<RoutedMetaBackend>,
+        backend: Arc<crate::routing::BackendRouter>,
+    }
+    impl std::fmt::Debug for RouterRangeGeometry {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("RouterRangeGeometry")
+                .finish_non_exhaustive()
+        }
+    }
+    impl data_grant::RangeGeometry for RouterRangeGeometry {
+        fn geometry(
+            &self,
+            ino: u64,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<(u64, u64)>> + Send + '_>>
+        {
+            Box::pin(async move {
+                let block = self.backend.block_size.load(Ordering::Relaxed);
+                if block == 0 {
+                    // A zero block size cannot express block walls — no
+                    // answer (the scoped Put then REFUSES rather than
+                    // guessing; the acquire runs the byte budget alone).
+                    return None;
+                }
+                use crate::meta_backend::Metadata as _;
+                let size = match self.meta.getxattr(ino, "layout").await {
+                    Ok(Some(bytes)) => crate::layout_wire::decode_base_layout(&bytes)
+                        .map(|l| l.size)
+                        .unwrap_or(0),
+                    _ => 0,
+                };
+                Some((size, block))
+            })
+        }
+    }
+    Arc::new(RouterRangeGeometry { meta, backend })
+}
+
 /// Where the authority binds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Bind {
@@ -668,6 +718,21 @@ pub async fn arm_multi_writer(
         crate::cluster_wire::local_advertise_ip(),
         listener.endpoint().port()
     );
+    // Rung 18 (the zeros-interleave conviction,
+    // `.benchmarks/2026-08-17-s11-zeros-interleave-fix.md`): the §9.2
+    // RANGE GEOMETRY source, from the authority's OWN planes. Until this
+    // install, `install_range_geometry` had exactly two callers — both
+    // test fixtures — so on every production mount `custody_scoped_layout`
+    // ran its no-geometry arm (a range holder's full Put applied VERBATIM:
+    // finding #3's peer-reverting clobber, the s11-range gate's standing
+    // C8 mint) and every ranged acquire ran with `block_size = None`,
+    // which also disarmed the §9.3 demotion barrier ("no geometry, no
+    // barrier"). Installed for any arm with a data-plane router — the
+    // solo arm included, so a later co-writer enrollment never runs a
+    // window with grants and no geometry.
+    if let Some(backend) = backend {
+        owner.install_range_geometry(router_range_geometry(Arc::clone(meta), Arc::clone(backend)));
+    }
     data_grant::install_custody_owner(Arc::clone(&owner));
     publish::install_client(publish::PublishClient::new(owner.id(), secret));
 

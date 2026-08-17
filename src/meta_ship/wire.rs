@@ -78,7 +78,14 @@ use serde::{Deserialize, Serialize};
 
 /// The verb vocabulary's schema. Bumped when a verb's payload changes;
 /// independent of the transport's framing version.
-pub const META_SHIP_SCHEMA: u32 = 1;
+///
+/// **2** (rung 12 — S10 LOOKUP-class delegations, design §11 "schema +1"):
+/// request frames carry the client's KD-MW-2 identity, per-op results
+/// carry piggybacked [`DelegGrant`]s and reply-ridden revocations, and the
+/// vocabulary gains the [`VERB_DELEG_RECALL`] / [`VERB_DELEG_REASSERT`]
+/// verbs. A schema-1 peer refuses loud (KD-MW-11: wire schema versions
+/// carry compatibility; no incompat bit — delegations are RAM).
+pub const META_SHIP_SCHEMA: u32 = 2;
 
 /// `cluster_wire` RPC verb carrying a batch of metadata calls. S3 reserved
 /// 0 for its ping and S4's lock verbs take the low numbers; the metadata
@@ -106,6 +113,37 @@ pub const STATUS_MALFORMED: u16 = 35;
 pub const STATUS_NOT_OWNER: u16 = 36;
 /// Frame status: the owner-side execution PANICKED (must-stay-0).
 pub const STATUS_PANIC: u16 = 37;
+/// Frame status: the caller is a FENCED delegation holder — its recall
+/// deadline expired and it was escalated to membership eviction (rung-11
+/// law: a timed-out grant is DEAD). Its poll and re-assert refuse whole;
+/// re-admission is by remount, the documented posture.
+pub const STATUS_DELEG_FENCED: u16 = 38;
+
+/// The delegation verb block: its own range so the S8 metadata block
+/// (16/17), S9 custody (`0x0200`) and publish (`0x0300`) can all grow
+/// without collision.
+pub const VERB_DELEG_BASE: u16 = 0x0400;
+/// The holder's standing **recall channel** (the DelegRecall verb): the
+/// client's call IS the channel — the owner parks it until recalls are
+/// pending (or its park bound elapses) and answers with the batched
+/// [`WireRecallFrame`]s; the client's NEXT call on the channel carries the
+/// acks. Owner-initiated push over a dial-only wire, without a second
+/// listener.
+pub const VERB_DELEG_RECALL: u16 = VERB_DELEG_BASE;
+/// Grace re-assertion (the DelegReassert verb): delegations are RAM
+/// (KD-MW-5), so a holder re-asserts them to a successor authority inside
+/// its grace window and receives fresh-era grants; un-reasserted grants
+/// are gone (the NFSv4 law; the `VERB_RECLAIM` shape one plane up).
+pub const VERB_DELEG_REASSERT: u16 = VERB_DELEG_BASE + 1;
+/// Last verb of the delegation block.
+pub const VERB_DELEG_LAST: u16 = 0x04FF;
+
+/// The LOOKUP capability bit (design §8.2's mode table): dentry + attr
+/// reads of the delegated object serve from the holder's
+/// reader-revalidation view under the coherence promise. `UPDATE`/`PERM`/
+/// `XATTR` are rows 13+'s and deliberately not defined yet — an undefined
+/// bit cannot be granted by accident.
+pub const DELEG_CLASS_LOOKUP: u8 = 1;
 
 /// The verbs on the wire — the trait census above, one code each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -503,6 +541,66 @@ pub struct MetaOpResult {
     /// The piggybacked grant (absent when the op's object does not exist
     /// or the outcome was a refusal).
     pub grant: Option<TokenGrant>,
+    /// Piggybacked **delegation grants** (S10, schema 2): the intent-lock
+    /// law applied to delegations — acquisition rides the reply of the
+    /// metadata RPC the client was already issuing, never its own round
+    /// trip. A LOOKUP-class verb over-issues here (the parent AND the
+    /// resolved child — Ceph's move); empty on mutations, refusals, and
+    /// lever-off owners.
+    pub delegs: Vec<DelegGrant>,
+    /// Reply-ridden **revocations** (S10): the mutating holder's OWN
+    /// grants on the objects this op invalidated. They die with this
+    /// reply — the client drops them before the caller's await returns
+    /// (read-your-own-writes by construction) — never through a wire
+    /// recall, so a serial mutate-then-lookup stream pays zero added
+    /// round trips (the tar-x shape the design's R1 recovery is for).
+    pub revokes: Vec<u64>,
+    /// The owner's delegation-sequence fence at revoke time: any in-flight
+    /// grant on a revoked ino with `seq <= revoke_fence` is dead on
+    /// arrival (the cross-session grant/recall ordering law — see
+    /// [`DelegGrant::seq`]). `0` when `revokes` is empty.
+    pub revoke_fence: u64,
+}
+
+/// The stamp a delegation grant carries: the object's change-visible
+/// attributes as the OWNER knew them at grant time. The holder serves
+/// locally only while its own reader-revalidation view of the object
+/// MATCHES the stamp — which closes the warming window (a view that has
+/// not caught up serves nothing) without tightening the reader staleness
+/// bound. Soundness: the v3 KV's whole-tx atomicity + checkpoint-prefix
+/// visibility mean a view whose inode record matches the stamp includes
+/// every transaction up to the one that produced it — the dentry set is
+/// exactly as current as the attrs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegStamp {
+    pub ctime: u64,
+    pub mtime: u64,
+    pub size: u64,
+}
+
+/// A **delegation grant** (S10 lever 1): a capability token over one
+/// object, granted by the owning authority and cached client-side. RAM
+/// only (KD-MW-5) — reconstructed by re-assertion after failover, never
+/// durable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegGrant {
+    /// The delegated object.
+    pub ino: u64,
+    /// Capability bits ([`DELEG_CLASS_LOOKUP`] is the only defined one).
+    pub class: u8,
+    /// Is the object a directory (whether dentry reads are servable)?
+    pub dir: bool,
+    /// Owner-minted monotone sequence. Grants and recalls travel on
+    /// DIFFERENT sessions (the batch lane vs the recall channel), so a
+    /// recall carries the fence `seq` at issue and the client drops any
+    /// later-arriving grant at or below it — the reordering race closed
+    /// without cross-session ordering.
+    pub seq: u64,
+    /// The owner's durable era (a failover's fresh grants carry the
+    /// successor's term; stale-era entries never serve).
+    pub term: u64,
+    /// The view-currency stamp (see [`DelegStamp`]).
+    pub stamp: DelegStamp,
 }
 
 /// A batch of calls against ONE owner: the **pipelining unit**.
@@ -512,6 +610,13 @@ pub struct MetaRequestFrame {
     /// The client's incarnation — half of the dedup key, and what makes a
     /// restarted client's reused ids un-confusable with its old ones.
     pub client_epoch: u64,
+    /// The client's KD-MW-2 identity (`node_{16hex}.m{8hex}` in
+    /// production) — the key delegation grants and recalls are
+    /// bookkept under (schema 2). Within storage trust: whoever holds the
+    /// enrollment secret is inside the trust domain, so the id is
+    /// correlation, not authentication (design §Security: S10 adds no new
+    /// trust class). Empty = the client wants no delegations.
+    pub client_id: String,
     /// The era the client believes the owner is in; `0` = "unknown, tell
     /// me" (the first frame of a session).
     pub owner_term: u64,
@@ -545,6 +650,86 @@ pub struct ReclaimReplyFrame {
     pub schema: u32,
     pub owner_term: u64,
     pub grants: Vec<TokenGrant>,
+}
+
+/// The holder's recall-channel round (the **DelegRecall** verb's request):
+/// one standing call per (holder, owner). Carries the acks for the frames
+/// the holder finished draining — so ack latency after delivery is one
+/// round trip, and the owner's `ack_frame` correlation fires before this
+/// round parks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegPollFrame {
+    pub schema: u32,
+    pub client_epoch: u64,
+    /// The holder's KD-MW-2 identity (must match the grants' bookkeeping).
+    pub client_id: String,
+    /// Frame ids (rung-11 `RecallFrame::frame_id`) the holder has fully
+    /// drained: every named object's local serves completed and the
+    /// entries dropped BEFORE the ack was queued (the never-serve-after-
+    /// ack law).
+    pub acks: Vec<u64>,
+}
+
+/// One batched recall as it crosses the wire — the rung-11
+/// `RecallFrame`'s payload half (`client` is the channel's own identity,
+/// so it does not travel).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireRecallFrame {
+    /// Ack correlation id (rung-11 lane).
+    pub frame_id: u64,
+    /// The recalled objects (≤ the lane's derived `batch_max`).
+    pub inos: Vec<u64>,
+}
+
+/// The recall channel's answer: pending recalls (possibly none — a park
+/// bound elapsed), plus the numbers the holder's own validity arithmetic
+/// consumes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegPollReply {
+    pub schema: u32,
+    /// The owner's era at reply time (the same relearn every reply
+    /// carries).
+    pub owner_term: u64,
+    /// The recalls pending for THIS holder.
+    pub frames: Vec<WireRecallFrame>,
+    /// The delegation-sequence fence at frame-build time: any in-flight
+    /// grant on a recalled ino with `seq <= fence_seq` is dead on arrival
+    /// (see [`DelegGrant::seq`]).
+    pub fence_seq: u64,
+    /// The owner's park bound for this channel, ms — the holder's
+    /// channel-freshness input (serves suspend when the last completed
+    /// round ages past the derived window).
+    pub park_ms: u64,
+    /// The owner's live recall deadline, ms (published so the two ends
+    /// cannot disagree about the arithmetic in force — the
+    /// `free_grace_bound` publish-the-derivation pattern).
+    pub deadline_ms: u64,
+}
+
+/// Grace re-assertion (the **DelegReassert** verb's request): the
+/// delegations this holder held before the failover/disconnect.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegReassertFrame {
+    pub schema: u32,
+    pub client_epoch: u64,
+    pub client_id: String,
+    /// The held objects. Bounded by the CONTROL frame cap like everything
+    /// else on this wire.
+    pub inos: Vec<u64>,
+}
+
+/// The re-assertion's answer: fresh-era grants for the objects the
+/// successor re-admitted (fresh stamps — the predecessor may have applied
+/// mutations the holder never saw, and the stamp check makes the holder's
+/// serves wait for its view to catch up). An ino absent from `grants` is
+/// GONE (the valve refused it, the authority moved, or the object died).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegReassertReply {
+    pub schema: u32,
+    pub owner_term: u64,
+    pub grants: Vec<DelegGrant>,
+    /// The fence at re-admission (same law as the poll reply's).
+    pub fence_seq: u64,
 }
 
 /// Decode-side allocation bound: a metadata batch is a CONTROL-class
@@ -620,4 +805,44 @@ pub fn encode_reclaim_reply(frame: &ReclaimReplyFrame) -> Result<Vec<u8>> {
 /// Decode a reclaim reply (**untrusted** — bounded).
 pub fn decode_reclaim_reply(bytes: &[u8]) -> Result<ReclaimReplyFrame> {
     decode(bytes, "reclaim reply")
+}
+
+/// Encode a recall-channel round.
+pub fn encode_deleg_poll(frame: &DelegPollFrame) -> Result<Vec<u8>> {
+    encode(frame, "deleg poll")
+}
+
+/// Decode a recall-channel round (**untrusted** — bounded).
+pub fn decode_deleg_poll(bytes: &[u8]) -> Result<DelegPollFrame> {
+    decode(bytes, "deleg poll")
+}
+
+/// Encode a recall-channel reply.
+pub fn encode_deleg_poll_reply(frame: &DelegPollReply) -> Result<Vec<u8>> {
+    encode(frame, "deleg poll reply")
+}
+
+/// Decode a recall-channel reply (**untrusted** — bounded).
+pub fn decode_deleg_poll_reply(bytes: &[u8]) -> Result<DelegPollReply> {
+    decode(bytes, "deleg poll reply")
+}
+
+/// Encode a re-assertion.
+pub fn encode_deleg_reassert(frame: &DelegReassertFrame) -> Result<Vec<u8>> {
+    encode(frame, "deleg reassert")
+}
+
+/// Decode a re-assertion (**untrusted** — bounded).
+pub fn decode_deleg_reassert(bytes: &[u8]) -> Result<DelegReassertFrame> {
+    decode(bytes, "deleg reassert")
+}
+
+/// Encode a re-assertion reply.
+pub fn encode_deleg_reassert_reply(frame: &DelegReassertReply) -> Result<Vec<u8>> {
+    encode(frame, "deleg reassert reply")
+}
+
+/// Decode a re-assertion reply (**untrusted** — bounded).
+pub fn decode_deleg_reassert_reply(bytes: &[u8]) -> Result<DelegReassertReply> {
+    decode(bytes, "deleg reassert reply")
 }

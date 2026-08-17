@@ -52,17 +52,43 @@
 //! needs the node cache's third gate state — the residual
 //! `kv/revalidate.rs` names — and is not S8's to invent.
 
+use super::tokens;
 use super::wire::*;
 use super::OwnerPhase;
 use crate::cluster_wire::{RpcAsyncService, RpcRequest, RpcResponse};
 use crate::error::SqueezefsError;
 use crate::meta_backend::{Metadata, RoutedMetaBackend};
-use std::collections::VecDeque;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// **Test seam** (rung 12; the `RecallConfig { valve: false }` precedent —
+/// deliberately NOT a knob: the coherence law must not be operationally
+/// removable). `false` disables the owner-side
+/// recall-before-conflicting-publish gate so the permanent red half of the
+/// delegation suite can DEMONSTRATE the stale serve the law prevents.
+pub static TEST_DELEG_COHERENCE_LAW: AtomicBool = AtomicBool::new(true);
+
+squeezefs_ipc::sqz_task_local! {
+    /// The shipping CLIENT whose verb is currently executing on this
+    /// owner (set by `run_batch` around the batch's execution) — what
+    /// lets the mutation gate, running deep inside the backend's trait
+    /// impl, tell a self-conflict (surrender onto the reply) from a
+    /// foreign one (wire recall). Absent on owner-local mutations.
+    static SHIP_CLIENT: String;
+}
+
+squeezefs_ipc::sqz_task_local! {
+    /// The reply-revoke accumulator: inos whose grants the currently
+    /// executing op surrendered. Drained into the op's `MetaOpResult`
+    /// so the revocation reaches the holder WITH the mutation's own
+    /// reply (read-your-own-writes by construction, zero added rounds).
+    static SHIP_REVOKES: RefCell<Vec<u64>>;
+}
 
 /// Absolute override for the derived dedup-window size.
 pub const DEDUP_MAX_ENV: &str = "SQUEEZEFS_META_SHIP_DEDUP_MAX";
@@ -190,10 +216,49 @@ pub struct MetaShipService {
     not_owner: AtomicU64,
     cross_owner: AtomicU64,
     panics: AtomicU64,
+    /// The S10 delegation host state (rung 12).
+    deleg: DelegHost,
     /// A `Weak` to itself, so the batch handoff can hand an OWNED handle
     /// to the sqz-meta pool without the trait impl having to be on
     /// `Arc<Self>` (the `KvMetaBackend::conveyor_self` precedent).
     self_ref: std::sync::OnceLock<std::sync::Weak<MetaShipService>>,
+}
+
+/// The owner-side delegation state: recall outbox + wakeups, the fenced
+/// holder set, the in-flight-mutation registry the grant path declines
+/// against, and the grant sequence the reordering fence is built on.
+struct DelegHost {
+    /// Issued-but-undelivered recall frames per holder (the rung-11
+    /// lane's `issue_pass` output, parked until the holder's channel
+    /// round picks them up).
+    outbox: parking_lot::Mutex<HashMap<String, Vec<WireRecallFrame>>>,
+    /// Wakes parked recall-channel rounds (a recall was enqueued).
+    poll_notify: squeezefs_ipc::sqz_notify::Notify,
+    /// Wakes gate waiters (an ack or an expiry moved the holder set).
+    ack_notify: squeezefs_ipc::sqz_notify::Notify,
+    /// Holders whose recall deadline expired: escalated to membership
+    /// eviction, their poll/reassert refuse `STATUS_DELEG_FENCED`.
+    fenced: parking_lot::Mutex<HashSet<String>>,
+    /// Objects with a mutation in flight (ino → count): grants DECLINE
+    /// while registered, closing the grant-vs-mutation window.
+    in_flight: scc::HashMap<u64, u64>,
+    /// The delegation-grant sequence (per owner incarnation): minted
+    /// BEFORE the lane records a grant, so a recall's frame-build fence
+    /// covers every grant it could name.
+    seq: AtomicU64,
+}
+
+impl Default for DelegHost {
+    fn default() -> Self {
+        Self {
+            outbox: parking_lot::Mutex::new(HashMap::new()),
+            poll_notify: squeezefs_ipc::sqz_notify::Notify::new(),
+            ack_notify: squeezefs_ipc::sqz_notify::Notify::new(),
+            fenced: parking_lot::Mutex::new(HashSet::new()),
+            in_flight: scc::HashMap::new(),
+            seq: AtomicU64::new(0),
+        }
+    }
 }
 
 impl std::fmt::Debug for MetaShipService {
@@ -242,6 +307,7 @@ impl MetaShipService {
             not_owner: AtomicU64::new(0),
             cross_owner: AtomicU64::new(0),
             panics: AtomicU64::new(0),
+            deleg: DelegHost::default(),
             self_ref: std::sync::OnceLock::new(),
         });
         let _ = me.self_ref.set(Arc::downgrade(&me));
@@ -251,6 +317,13 @@ impl MetaShipService {
     /// An owned handle to this service (the handoff's requirement).
     fn owned(&self) -> Option<Arc<Self>> {
         self.self_ref.get().and_then(|w| w.upgrade())
+    }
+
+    /// The backend this owner executes against (the mutation gate's
+    /// ptr-eq identity — a foreign instance must never be gated by
+    /// another mount's host, the `daemon_verb_router` law).
+    pub(crate) fn inner(&self) -> &Arc<RoutedMetaBackend> {
+        &self.inner
     }
 
     /// The era this owner mints and admits in.
@@ -355,6 +428,8 @@ impl MetaShipService {
         let out = match req.verb {
             VERB_META_BATCH => self.serve_batch(&req, t_total).await,
             VERB_RECLAIM => self.serve_reclaim(&req).await,
+            VERB_DELEG_RECALL => self.serve_deleg_poll(&req).await,
+            VERB_DELEG_REASSERT => self.serve_deleg_reassert(&req).await,
             other => RpcResponse {
                 id: req.id,
                 status: crate::cluster_wire::RPC_UNKNOWN_VERB,
@@ -507,21 +582,38 @@ impl MetaShipService {
     /// Execute a batch's ops **in order** — in-batch causality is
     /// submission order, which is what lets a client pipeline a create and
     /// a lookup of the same name in one frame.
+    ///
+    /// The whole batch runs inside the `SHIP_CLIENT`/`SHIP_REVOKES`
+    /// task-local scopes (rung 12): the mutation gate — which fires deep
+    /// inside the backend's trait impl, where no client identity can be a
+    /// parameter — reads the mutator's identity from the scope, and the
+    /// surrenders it performs accumulate into each op's reply.
     async fn run_batch(&self, frame: MetaRequestFrame) -> Vec<MetaOpResult> {
-        let mut out = Vec::with_capacity(frame.ops.len());
-        for op in frame.ops {
-            out.push(self.run_op(frame.client_epoch, op).await);
-        }
-        out
+        let client_epoch = frame.client_epoch;
+        let client_id = frame.client_id.clone();
+        let ops = frame.ops;
+        SHIP_CLIENT
+            .scope(client_id.clone(), async move {
+                SHIP_REVOKES
+                    .scope(RefCell::new(Vec::new()), async move {
+                        let mut out = Vec::with_capacity(ops.len());
+                        for op in ops {
+                            out.push(self.run_op(client_epoch, &client_id, op).await);
+                        }
+                        out
+                    })
+                    .await
+            })
+            .await
     }
 
-    async fn run_op(&self, client_epoch: u64, op: MetaOp) -> MetaOpResult {
+    async fn run_op(&self, client_epoch: u64, client_id: &str, op: MetaOp) -> MetaOpResult {
         // Reads are naturally idempotent, so they never consume a window
         // entry — the window is spent only where a replay would otherwise
         // double-apply or lie (a replayed create answering EEXIST, a
         // replayed unlink answering ENOENT).
         if !op.call.mutating() {
-            return self.execute(op.id, &op.call).await;
+            return self.execute(op.id, &op.call, client_id).await;
         }
         let (slot, owns) = self.dedup.slot((client_epoch, op.id));
         if !owns {
@@ -530,20 +622,35 @@ impl MetaShipService {
         }
         let id = op.id;
         let call = op.call.clone();
-        slot.get_or_init(|| async { self.execute(id, &call).await })
+        let client = client_id.to_string();
+        slot.get_or_init(|| async { self.execute(id, &call, &client).await })
             .await
             .clone()
     }
 
-    async fn execute(&self, id: u64, call: &MetaCall) -> MetaOpResult {
+    async fn execute(&self, id: u64, call: &MetaCall, client_id: &str) -> MetaOpResult {
+        // Reset the reply-revoke accumulator for THIS op (ops run
+        // serially inside one batch scope).
+        let _ = SHIP_REVOKES.try_with(|r| r.borrow_mut().clear());
         let t = Instant::now();
         let out = self.execute_inner(call).await;
         super::owner_phase_record(OwnerPhase::Execute, t);
         self.served.fetch_add(1, Ordering::Relaxed);
         super::SERVED_VERBS.fetch_add(1, Ordering::Relaxed);
+        // Drain the surrenders the gate performed for THIS client during
+        // the op — they ride the reply (the self-conflict law).
+        let revokes: Vec<u64> = SHIP_REVOKES
+            .try_with(|r| r.borrow_mut().drain(..).collect())
+            .unwrap_or_default();
+        let revoke_fence = if revokes.is_empty() {
+            0
+        } else {
+            self.deleg.seq.load(Ordering::Acquire)
+        };
         match out {
             Ok(reply) => {
                 let ino = self.grant_object(call, &reply);
+                let delegs = self.issue_delegs(client_id, call, &reply).await;
                 MetaOpResult {
                     id,
                     outcome: Ok(reply),
@@ -552,14 +659,115 @@ impl MetaShipService {
                         token: owner_authority_token(ino),
                         term: self.term(),
                     }),
+                    delegs,
+                    revokes,
+                    revoke_fence,
                 }
             }
             Err(e) => MetaOpResult {
                 id,
                 outcome: Err(WireError::from_error(&e)),
                 grant: None,
+                delegs: Vec::new(),
+                revokes,
+                revoke_fence,
             },
         }
+    }
+
+    /// Which objects a successful LOOKUP-class reply may carry delegations
+    /// for (the over-issue law: a lookup earns the PARENT and the resolved
+    /// child — Ceph's move; a getattr its object; a readdir its
+    /// directory). Mutations and refusals earn nothing.
+    fn deleg_targets(call: &MetaCall, reply: &MetaReply) -> Vec<u64> {
+        match call {
+            MetaCall::LookupDentry { parent, .. } => {
+                let mut t = vec![*parent];
+                if let MetaReply::Inode(i) = reply {
+                    t.push(i.ino);
+                }
+                t
+            }
+            MetaCall::Getattr { ino } => vec![*ino],
+            MetaCall::Readdir { dir, .. } => vec![*dir],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Issue the piggybacked delegation grants for one successful
+    /// LOOKUP-class op (rung 12).
+    ///
+    /// The ordering here is load-bearing (the grant-vs-mutation
+    /// check-then-act race, closed structurally):
+    ///
+    /// 1. pre-check `in_flight` (cheap decline);
+    /// 2. mint `seq` BEFORE the lane records the grant — so any recall's
+    ///    frame-build fence (read after `issue_pass`) covers every grant
+    ///    it could name;
+    /// 3. `try_grant` records it (the valve's gate — `Demoted` means
+    ///    owner-served, no grant);
+    /// 4. RE-CHECK `in_flight`: a mutation that raced in either shows
+    ///    here (we retract by `surrender` — the grant was never sent) or
+    ///    had already deregistered, i.e. committed, before this check;
+    /// 5. read the STAMP only now — past step 4 it is post-commit for any
+    ///    mutation the recall snapshot could have missed, so a stamp can
+    ///    never name a state older than an un-recalled mutation.
+    async fn issue_delegs(
+        &self,
+        client_id: &str,
+        call: &MetaCall,
+        reply: &MetaReply,
+    ) -> Vec<DelegGrant> {
+        if client_id.is_empty() || !tokens::delegation_enabled() {
+            return Vec::new();
+        }
+        if self.deleg.fenced.lock().contains(client_id) {
+            return Vec::new();
+        }
+        let lane = tokens::global_recall_lane();
+        let mut out = Vec::new();
+        for ino in Self::deleg_targets(call, reply) {
+            if out.iter().any(|g: &DelegGrant| g.ino == ino) || !self.has_authority(ino) {
+                continue;
+            }
+            if self.deleg.in_flight.contains_sync(&ino) {
+                tokens::note_deleg_decline();
+                continue;
+            }
+            let seq = self.deleg.seq.fetch_add(1, Ordering::AcqRel) + 1;
+            match lane.try_grant(ino, client_id, Instant::now()) {
+                tokens::GrantDecision::Demoted { .. } => continue,
+                tokens::GrantDecision::Granted => {}
+            }
+            if self.deleg.in_flight.contains_sync(&ino) {
+                // Raced a mutation's gate: retract the never-sent grant.
+                lane.surrender(ino, client_id);
+                tokens::note_deleg_decline();
+                continue;
+            }
+            let inode = match self.inner.getattr(ino).await {
+                Ok(i) => i,
+                Err(_) => {
+                    lane.surrender(ino, client_id);
+                    tokens::note_deleg_decline();
+                    continue;
+                }
+            };
+            tokens::note_deleg_grant_issued();
+            out.push(DelegGrant {
+                ino,
+                class: DELEG_CLASS_LOOKUP,
+                dir: (inode.mode & libc::S_IFMT) == libc::S_IFDIR,
+                seq,
+                term: self.term(),
+                stamp: DelegStamp {
+                    ctime: inode.ctime,
+                    mtime: inode.mtime,
+                    size: inode.size,
+                },
+            });
+        }
+        out
     }
 
     /// Which object's generation rides this reply: the object the verb
@@ -773,6 +981,366 @@ impl MetaShipService {
                 req.id,
                 STATUS_MALFORMED,
                 format!("reclaim reply encode: {e}"),
+            ),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Rung 12 — the delegation host (S10's owner half).
+    // -----------------------------------------------------------------
+
+    /// The recall channel's park bound: how long an empty poll round may
+    /// sit at the owner before answering empty. Derived from the live
+    /// recall deadline (never a constant): half of it, floored at the
+    /// 100 ms scheduling grain, ceilinged at 5 s — strictly under the
+    /// wire's 10 s dial/call socket timeout so a parked round can never
+    /// be mistaken for a dead session. Published on every reply (the
+    /// holder's freshness arithmetic consumes it).
+    fn deleg_park(&self, cfg: &tokens::RecallConfig) -> Duration {
+        (cfg.deadline / 2).clamp(Duration::from_millis(100), Duration::from_secs(5))
+    }
+
+    /// Is `client` fenced on the delegation plane?
+    fn deleg_fenced(&self, client: &str) -> bool {
+        self.deleg.fenced.lock().contains(client)
+    }
+
+    /// Distribute freshly issued recall frames into the per-holder outbox
+    /// and wake every parked channel round.
+    fn deleg_distribute(&self, frames: Vec<tokens::RecallFrame>) {
+        if frames.is_empty() {
+            return;
+        }
+        let mut outbox = self.deleg.outbox.lock();
+        for f in frames {
+            outbox.entry(f.client).or_default().push(WireRecallFrame {
+                frame_id: f.frame_id,
+                inos: f.inos,
+            });
+        }
+        drop(outbox);
+        self.deleg.poll_notify.notify_waiters();
+    }
+
+    /// The deadline sweep + escalation: every timed-out recall is LOUD
+    /// (`dlm_delegation_recall_timeouts`), fences the holder on this
+    /// plane, and — when the membership plane is armed — evicts it
+    /// (minting the S7 dead epoch; rung-11 residual #2, discharged). The
+    /// grant is already DEAD (the lane retired it); the fence is what
+    /// keeps a zombie holder from re-earning one without a remount.
+    fn deleg_expire_pass(&self, now: Instant) {
+        let dead = tokens::global_recall_lane().expire_overdue(now);
+        if dead.is_empty() {
+            return;
+        }
+        let mut fenced = self.deleg.fenced.lock();
+        let mut newly: HashSet<String> = HashSet::new();
+        for t in &dead {
+            tokens::note_deleg_recall_timeout();
+            if fenced.insert(t.client.clone()) {
+                newly.insert(t.client.clone());
+            }
+        }
+        drop(fenced);
+        for client in newly {
+            log::error!(
+                "S10 delegation: holder '{client}' missed its recall deadline — its grants are \
+                 DEAD, the holder is FENCED on the delegation plane (poll/re-assert refuse; \
+                 re-admission is by remount), and the timeout escalates to membership eviction \
+                 (the transport_lease_overlong law: loud, never a silent wait)"
+            );
+            if let Some(owner) = crate::membership::installed_owner() {
+                if owner
+                    .evict(&client, "S10 delegation recall deadline expired")
+                    .is_some()
+                {
+                    tokens::note_deleg_eviction();
+                }
+            }
+        }
+        self.deleg.ack_notify.notify_waiters();
+    }
+
+    /// **The coherence law** (design §8.2: recall-before-conflicting-
+    /// publish): called through [`super::deleg_mutation_gate`] by the
+    /// `RoutedMetaBackend` mutation surface with the objects the mutation
+    /// invalidates, BEFORE any 4a acquisition (a waiting mutation holds
+    /// no locks; the M7 conveyor batches strictly AFTER this returns, so
+    /// the recall-ack happens-before the tx enqueue happens-before the
+    /// commit — the two orderings never meet).
+    ///
+    /// Returns the registered ino set (the permit's payload), or `None`
+    /// when the law seam is off (the permanent red half) — in which case
+    /// nothing is registered and nothing is recalled.
+    pub(crate) async fn deleg_mutation_begin(&self, inos: &[u64]) -> Option<Vec<u64>> {
+        if !TEST_DELEG_COHERENCE_LAW.load(Ordering::Relaxed) {
+            return None;
+        }
+        let lane = tokens::global_recall_lane();
+        // Register FIRST (grants decline from here), then recall: a grant
+        // path that misses the recall snapshot re-checks this registry
+        // after recording, so the window is closed from both sides.
+        let mut registered = Vec::with_capacity(inos.len());
+        for &ino in inos {
+            if registered.contains(&ino) {
+                continue;
+            }
+            match self.deleg.in_flight.entry_sync(ino) {
+                scc::hash_map::Entry::Occupied(mut o) => *o.get_mut() += 1,
+                scc::hash_map::Entry::Vacant(v) => {
+                    v.insert_entry(1);
+                }
+            }
+            registered.push(ino);
+        }
+        if lane.outstanding_now() == 0 {
+            // The common armed-but-idle shape: nothing delegated anywhere,
+            // one atomic answers it.
+            return Some(registered);
+        }
+        let now = Instant::now();
+        let mutator = SHIP_CLIENT
+            .try_with(|c| c.clone())
+            .ok()
+            .filter(|c| !c.is_empty());
+        let mut wait_inos: Vec<u64> = Vec::new();
+        for &ino in &registered {
+            // The self-conflict: the mutating holder's own grant retires
+            // as a SURRENDER riding this op's reply — never a wire recall
+            // (zero added rounds on the serial mutate-then-lookup shape).
+            if let Some(c) = &mutator {
+                if lane.surrender(ino, c) {
+                    let _ = SHIP_REVOKES.try_with(|r| r.borrow_mut().push(ino));
+                }
+            }
+            if lane.recall_object(ino, now) > 0 {
+                wait_inos.push(ino);
+            } else if lane.holders(ino) > 0 {
+                // Recalls already pending from an earlier conflict —
+                // still ours to wait out.
+                wait_inos.push(ino);
+            }
+        }
+        if wait_inos.is_empty() {
+            return Some(registered);
+        }
+        self.deleg_distribute(lane.issue_pass(now));
+        let cfg = lane.config();
+        let tick = (cfg.deadline / 16).clamp(Duration::from_millis(1), Duration::from_millis(100));
+        let t0 = Instant::now();
+        loop {
+            self.deleg_expire_pass(Instant::now());
+            // Newly pending recalls (rate-deferred behind an in-flight
+            // frame) issue as their holder's slot frees.
+            self.deleg_distribute(lane.issue_pass(Instant::now()));
+            let notified = self.deleg.ack_notify.notified();
+            if wait_inos.iter().all(|&ino| lane.holders(ino) == 0) {
+                break;
+            }
+            // Wake on ack/expiry, bounded by the tick (the expire pass's
+            // cadence) — the sqz timeout is the select-with-sleep form.
+            let _ = squeezefs_ipc::sqz_time::timeout(tick, notified).await;
+        }
+        super::deleg_phase_record(super::DelegPhase::GateWait, t0);
+        Some(registered)
+    }
+
+    /// The permit's release half: the mutation committed (or failed) —
+    /// grants on its objects may issue again.
+    pub(crate) fn deleg_mutation_end(&self, inos: &[u64]) {
+        for &ino in inos {
+            let mut remove = false;
+            if let Some(mut entry) = self.deleg.in_flight.get_sync(&ino) {
+                let c = entry.get_mut();
+                *c -= 1;
+                remove = *c == 0;
+            }
+            if remove {
+                let _ = self.deleg.in_flight.remove_if_sync(&ino, |c| *c == 0);
+            }
+        }
+    }
+
+    /// The **DelegRecall** verb: the holder's standing recall channel.
+    /// Acks first (they free gate waiters), then drain-or-park up to the
+    /// derived bound; the reply carries the frames plus the numbers the
+    /// holder's validity arithmetic needs.
+    async fn serve_deleg_poll(&self, req: &RpcRequest) -> RpcResponse {
+        let frame = match decode_deleg_poll(&req.body) {
+            Ok(f) => f,
+            Err(e) => return self.refuse(req.id, STATUS_MALFORMED, format!("{e}")),
+        };
+        if frame.schema != META_SHIP_SCHEMA {
+            return self.refuse(
+                req.id,
+                STATUS_SCHEMA,
+                format!(
+                    "deleg poll schema {} != {META_SHIP_SCHEMA} — refused rather than guessed",
+                    frame.schema
+                ),
+            );
+        }
+        if self.deleg_fenced(&frame.client_id) {
+            return self.refuse(
+                req.id,
+                STATUS_DELEG_FENCED,
+                format!(
+                    "holder '{}' is FENCED on the delegation plane (a recall deadline expired; \
+                     re-admission is by remount)",
+                    frame.client_id
+                ),
+            );
+        }
+        let lane = tokens::global_recall_lane();
+        let now = Instant::now();
+        for frame_id in &frame.acks {
+            lane.ack_frame(&frame.client_id, *frame_id, now);
+        }
+        if !frame.acks.is_empty() {
+            self.deleg.ack_notify.notify_waiters();
+        }
+        let cfg = lane.config();
+        let park = self.deleg_park(&cfg);
+        let deadline_at = Instant::now() + park;
+        let frames = loop {
+            let notified = self.deleg.poll_notify.notified();
+            self.deleg_distribute(lane.issue_pass(Instant::now()));
+            let mine = {
+                let mut outbox = self.deleg.outbox.lock();
+                outbox.remove(&frame.client_id).unwrap_or_default()
+            };
+            if !mine.is_empty() {
+                break mine;
+            }
+            let remaining = deadline_at.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break Vec::new();
+            }
+            let _ = squeezefs_ipc::sqz_time::timeout(
+                remaining.min(Duration::from_millis(250)),
+                notified,
+            )
+            .await;
+        };
+        let reply = DelegPollReply {
+            schema: META_SHIP_SCHEMA,
+            owner_term: self.term(),
+            frames,
+            fence_seq: self.deleg.seq.load(Ordering::Acquire),
+            park_ms: park.as_millis() as u64,
+            deadline_ms: cfg.deadline.as_millis() as u64,
+        };
+        match encode_deleg_poll_reply(&reply) {
+            Ok(body) => RpcResponse {
+                id: req.id,
+                status: STATUS_OK,
+                body,
+            },
+            Err(e) => self.refuse(req.id, STATUS_MALFORMED, format!("poll reply encode: {e}")),
+        }
+    }
+
+    /// The **DelegReassert** verb: a holder re-asserts the delegations it
+    /// held across an authority restart or a channel outage (KD-MW-5:
+    /// they are RAM — re-assertion is the reconstruction). Admitted
+    /// whether or not the grace window is open (the reclaim precedent:
+    /// re-asserting state is not acquiring it); every object passes the
+    /// same valve gate and in-flight decline as a fresh grant, and the
+    /// grants carry FRESH stamps — the predecessor may have applied
+    /// mutations this holder never saw, and the stamp check makes its
+    /// serves wait for its view to catch up.
+    async fn serve_deleg_reassert(&self, req: &RpcRequest) -> RpcResponse {
+        let frame = match decode_deleg_reassert(&req.body) {
+            Ok(f) => f,
+            Err(e) => return self.refuse(req.id, STATUS_MALFORMED, format!("{e}")),
+        };
+        if frame.schema != META_SHIP_SCHEMA {
+            return self.refuse(
+                req.id,
+                STATUS_SCHEMA,
+                format!(
+                    "deleg reassert schema {} != {META_SHIP_SCHEMA} — refused rather than \
+                     guessed",
+                    frame.schema
+                ),
+            );
+        }
+        if self.deleg_fenced(&frame.client_id) {
+            return self.refuse(
+                req.id,
+                STATUS_DELEG_FENCED,
+                format!(
+                    "holder '{}' is FENCED on the delegation plane — its grants died with the \
+                     recall deadline; re-admission is by remount",
+                    frame.client_id
+                ),
+            );
+        }
+        let lane = tokens::global_recall_lane();
+        let asserted = frame.inos.len();
+        let mut grants = Vec::new();
+        for ino in frame.inos {
+            if !self.has_authority(ino)
+                || self.deleg.in_flight.contains_sync(&ino)
+                || grants.iter().any(|g: &DelegGrant| g.ino == ino)
+            {
+                continue;
+            }
+            let seq = self.deleg.seq.fetch_add(1, Ordering::AcqRel) + 1;
+            match lane.try_grant(ino, &frame.client_id, Instant::now()) {
+                tokens::GrantDecision::Demoted { .. } => continue,
+                tokens::GrantDecision::Granted => {}
+            }
+            if self.deleg.in_flight.contains_sync(&ino) {
+                lane.surrender(ino, &frame.client_id);
+                continue;
+            }
+            let inode = match self.inner.getattr(ino).await {
+                Ok(i) => i,
+                Err(_) => {
+                    lane.surrender(ino, &frame.client_id);
+                    continue;
+                }
+            };
+            tokens::note_deleg_grant_issued();
+            grants.push(DelegGrant {
+                ino,
+                class: DELEG_CLASS_LOOKUP,
+                dir: (inode.mode & libc::S_IFMT) == libc::S_IFDIR,
+                seq,
+                term: self.term(),
+                stamp: DelegStamp {
+                    ctime: inode.ctime,
+                    mtime: inode.mtime,
+                    size: inode.size,
+                },
+            });
+        }
+        log::info!(
+            "S10 delegation: holder '{}' re-asserted {} object(s), {} re-admitted in era {} \
+             (grace {})",
+            frame.client_id,
+            asserted,
+            grants.len(),
+            self.term(),
+            if self.in_grace() { "open" } else { "closed" }
+        );
+        let reply = DelegReassertReply {
+            schema: META_SHIP_SCHEMA,
+            owner_term: self.term(),
+            grants,
+            fence_seq: self.deleg.seq.load(Ordering::Acquire),
+        };
+        match encode_deleg_reassert_reply(&reply) {
+            Ok(body) => RpcResponse {
+                id: req.id,
+                status: STATUS_OK,
+                body,
+            },
+            Err(e) => self.refuse(
+                req.id,
+                STATUS_MALFORMED,
+                format!("reassert reply encode: {e}"),
             ),
         }
     }

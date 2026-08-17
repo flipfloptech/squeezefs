@@ -141,6 +141,13 @@ pub struct MetaShipRouter {
     client_epoch: u64,
     next_id: AtomicU64,
     lanes: scc::HashMap<String, Arc<ShipLane>>,
+    /// Owners with a running recall channel (rung 12): one standing
+    /// DelegRecall round per owner, spawned lazily on the first grant
+    /// absorbed from it.
+    deleg_channels: scc::HashMap<String, ()>,
+    /// A `Weak` to self for the channel tasks (they end when the router
+    /// is dropped — structured lifetime without a join registry).
+    self_ref: std::sync::OnceLock<std::sync::Weak<MetaShipRouter>>,
 }
 
 impl std::fmt::Debug for MetaShipRouter {
@@ -158,14 +165,18 @@ impl MetaShipRouter {
     /// storage membership with `secret` (the `job:enroll` value).
     pub fn new(inner: Arc<RoutedMetaBackend>, peer_id: &str, secret: Vec<u8>) -> Arc<Self> {
         let (epoch, _) = uuid::Uuid::new_v4().as_u64_pair();
-        Arc::new(Self {
+        let me = Arc::new(Self {
             inner,
             peer_id: Arc::from(peer_id),
             secret: Arc::new(secret),
             client_epoch: epoch,
             next_id: AtomicU64::new(1),
             lanes: scc::HashMap::new(),
-        })
+            deleg_channels: scc::HashMap::new(),
+            self_ref: std::sync::OnceLock::new(),
+        });
+        let _ = me.self_ref.set(Arc::downgrade(&me));
+        me
     }
 
     /// The backend underneath (the local path's target, and the surface
@@ -299,6 +310,65 @@ impl MetaShipRouter {
         self.ship_ops_with_term(peer, ops, term).await
     }
 
+    /// Absorb one result's delegation payloads (rung 12): reply-ridden
+    /// revocations FIRST (they must land before the caller's await
+    /// returns — read-your-own-writes), then the piggybacked grants, then
+    /// make sure the recall channel to this owner is running (the grants
+    /// are serveable only while it is).
+    async fn absorb_delegation(&self, peer: &Arc<PeerOwner>, result: &MetaOpResult) {
+        if !result.revokes.is_empty() {
+            let fence_term = self.owner_term(&peer.endpoint).unwrap_or(0);
+            tokens::revoke_delegations(
+                &peer.endpoint,
+                &result.revokes,
+                fence_term,
+                result.revoke_fence,
+                tokens::RevokeKind::Reply,
+            )
+            .await;
+        }
+        if result.delegs.is_empty() || !tokens::delegation_enabled() {
+            return;
+        }
+        for g in &result.delegs {
+            tokens::install_delegation(&peer.endpoint, g);
+        }
+        self.ensure_recall_channel(peer);
+    }
+
+    /// Spawn the standing recall channel to `peer` once (rung 12): the
+    /// client's call IS the owner→holder push path on this dial-only wire
+    /// — the owner parks it and answers the instant a recall is enqueued.
+    /// The channel record is primed healthy-from-spawn so the grants a
+    /// reply just installed can serve during the first round's flight; a
+    /// failed connect marks it down (fail-closed) immediately.
+    pub(crate) fn ensure_recall_channel(&self, peer: &Arc<PeerOwner>) {
+        if self
+            .deleg_channels
+            .read_sync(&peer.endpoint, |_, _| ())
+            .is_some()
+        {
+            return;
+        }
+        if self
+            .deleg_channels
+            .insert_sync(peer.endpoint.clone(), ())
+            .is_err()
+        {
+            return; // raced another absorb — one channel per owner
+        }
+        let _ = tokens::deleg_channel(&peer.endpoint);
+        let weak = self.self_ref.get().cloned().expect("set at construction");
+        let peer = Arc::clone(peer);
+        let peer_id = Arc::clone(&self.peer_id);
+        let secret = Arc::clone(&self.secret);
+        let epoch = self.client_epoch;
+        crate::meta_exec::spawn_meta(
+            "meta_ship_deleg_channel",
+            deleg_channel_run(weak, peer, peer_id, secret, epoch),
+        );
+    }
+
     /// [`Self::ship_ops`] naming the era explicitly — the shape a client
     /// that believes a stale era produces, which is exactly what the
     /// owner's era gate must refuse.
@@ -336,6 +406,7 @@ impl MetaShipRouter {
             if let Some(grant) = &result.grant {
                 tokens::record_grant(grant);
             }
+            self.absorb_delegation(peer, result).await;
         }
         Ok(out)
     }
@@ -513,6 +584,7 @@ impl LaneDrain {
         let body = encode_request(&MetaRequestFrame {
             schema: META_SHIP_SCHEMA,
             client_epoch: self.client_epoch,
+            client_id: self.peer_id.to_string(),
             owner_term,
             ops,
         })?;
@@ -629,6 +701,206 @@ impl LaneDrain {
     }
 }
 
+/// The standing recall channel to one owner (rung 12 — the DelegRecall
+/// verb's client half): connect → RE-ASSERT everything held/suspended →
+/// poll rounds forever. Every transport failure SUSPENDS the owner's
+/// delegations first (fail-closed: serves stop the instant the channel is
+/// not known-good) and re-asserts them on reconnect (KD-MW-5's NFSv4
+/// reconstruction). A `STATUS_DELEG_FENCED` answer is terminal: the
+/// holder's grants died with a recall deadline; re-admission is by
+/// remount.
+async fn deleg_channel_run(
+    router: std::sync::Weak<MetaShipRouter>,
+    peer: Arc<PeerOwner>,
+    peer_id: Arc<str>,
+    secret: Arc<Vec<u8>>,
+    client_epoch: u64,
+) {
+    let ep = peer.endpoint.clone();
+    let mut pending_acks: Vec<u64> = Vec::new();
+    let mut reassert: Vec<u64> = Vec::new();
+    let mut session: Option<crate::cluster_wire::RpcClient> = None;
+    let mut backoff = Duration::from_millis(50);
+    loop {
+        if router.upgrade().is_none() || !tokens::delegation_enabled() {
+            tokens::deleg_channel_mark_down(&ep);
+            return;
+        }
+        if session.is_none() {
+            match crate::cluster_wire::RpcClient::connect(&ep, &secret, &peer_id, None).await {
+                Ok(c) => {
+                    session = Some(c);
+                    backoff = Duration::from_millis(50);
+                    // Re-assert: still-held entries + everything a
+                    // suspension parked. Un-reasserted = gone.
+                    let mut inos = tokens::held_delegation_inos(&ep);
+                    inos.append(&mut reassert);
+                    inos.sort_unstable();
+                    inos.dedup();
+                    if !inos.is_empty()
+                        && !deleg_reassert_round(&mut session, &ep, &peer_id, client_epoch, &inos)
+                            .await
+                    {
+                        // Fenced: terminal for this channel.
+                        let _ = tokens::suspend_owner_delegations(&ep);
+                        return;
+                    }
+                }
+                Err(e) => {
+                    log::debug!("S10 delegation channel to {ep}: connect failed ({e}) — retrying");
+                    reassert.extend(tokens::suspend_owner_delegations(&ep));
+                    squeezefs_ipc::sqz_time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(1));
+                    continue;
+                }
+            }
+            if session.is_none() {
+                // The re-assert round failed on transport: suspend + retry.
+                reassert.extend(tokens::suspend_owner_delegations(&ep));
+                squeezefs_ipc::sqz_time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(1));
+                continue;
+            }
+        }
+        // One poll round: acks out, recalls in, park at the owner between.
+        let acks = std::mem::take(&mut pending_acks);
+        let frame = DelegPollFrame {
+            schema: META_SHIP_SCHEMA,
+            client_epoch,
+            client_id: peer_id.to_string(),
+            acks: acks.clone(),
+        };
+        let body = match encode_deleg_poll(&frame) {
+            Ok(b) => b,
+            Err(e) => {
+                log::error!("S10 delegation channel to {ep}: poll encode failed ({e}) — closing");
+                let _ = tokens::suspend_owner_delegations(&ep);
+                return;
+            }
+        };
+        let outcome = session
+            .as_mut()
+            .expect("connected above")
+            .call(VERB_DELEG_RECALL, body)
+            .await;
+        match outcome {
+            Ok(reply) if reply.status == crate::cluster_wire::RPC_OK => {
+                match decode_deleg_poll_reply(&reply.body) {
+                    Ok(pr) => {
+                        tokens::deleg_channel_mark_ok(&ep, pr.park_ms, pr.owner_term);
+                        for f in &pr.frames {
+                            // Drain-then-ack: revoke waits for in-flight
+                            // serves, so the ack the NEXT round carries can
+                            // never precede a serve it should have fenced.
+                            tokens::revoke_delegations(
+                                &ep,
+                                &f.inos,
+                                pr.owner_term,
+                                pr.fence_seq,
+                                tokens::RevokeKind::Recall,
+                            )
+                            .await;
+                            pending_acks.push(f.frame_id);
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("S10 delegation channel to {ep}: undecodable poll reply ({e})");
+                        pending_acks.extend(acks);
+                        session = None;
+                        reassert.extend(tokens::suspend_owner_delegations(&ep));
+                    }
+                }
+            }
+            Ok(reply) if reply.status == STATUS_DELEG_FENCED => {
+                log::error!(
+                    "S10 delegation: this holder is FENCED by {ep} (a recall deadline expired) — \
+                     dropping every delegation from it; re-admission is by remount"
+                );
+                let _ = tokens::suspend_owner_delegations(&ep);
+                return;
+            }
+            Ok(reply) => {
+                log::warn!(
+                    "S10 delegation channel to {ep}: poll refused (status {}) — reconnecting",
+                    reply.status
+                );
+                pending_acks.extend(acks);
+                session = None;
+                reassert.extend(tokens::suspend_owner_delegations(&ep));
+                squeezefs_ipc::sqz_time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(1));
+            }
+            Err(e) => {
+                log::debug!("S10 delegation channel to {ep}: poll failed ({e}) — reconnecting");
+                pending_acks.extend(acks);
+                session = None;
+                reassert.extend(tokens::suspend_owner_delegations(&ep));
+                squeezefs_ipc::sqz_time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(1));
+            }
+        }
+    }
+}
+
+/// One re-assertion round. `true` = proceed (grants absorbed, or a
+/// transport failure the caller retries — signalled by clearing the
+/// session); `false` = FENCED, terminal.
+async fn deleg_reassert_round(
+    session: &mut Option<crate::cluster_wire::RpcClient>,
+    ep: &str,
+    peer_id: &str,
+    client_epoch: u64,
+    inos: &[u64],
+) -> bool {
+    let frame = DelegReassertFrame {
+        schema: META_SHIP_SCHEMA,
+        client_epoch,
+        client_id: peer_id.to_string(),
+        inos: inos.to_vec(),
+    };
+    let body = match encode_deleg_reassert(&frame) {
+        Ok(b) => b,
+        Err(_) => {
+            *session = None;
+            return true;
+        }
+    };
+    match session
+        .as_mut()
+        .expect("connected")
+        .call(VERB_DELEG_REASSERT, body)
+        .await
+    {
+        Ok(reply) if reply.status == crate::cluster_wire::RPC_OK => {
+            match decode_deleg_reassert_reply(&reply.body) {
+                Ok(rr) => {
+                    // Un-reasserted = gone (NFSv4): drop what the
+                    // successor did not re-admit, absorb what it did.
+                    let admitted: std::collections::HashSet<u64> =
+                        rr.grants.iter().map(|g| g.ino).collect();
+                    let gone: Vec<u64> = inos
+                        .iter()
+                        .copied()
+                        .filter(|i| !admitted.contains(i))
+                        .collect();
+                    tokens::drop_delegations(ep, &gone);
+                    tokens::absorb_reassert_reply(ep, &rr);
+                    true
+                }
+                Err(_) => {
+                    *session = None;
+                    true
+                }
+            }
+        }
+        Ok(reply) if reply.status == STATUS_DELEG_FENCED => false,
+        Ok(_) | Err(_) => {
+            *session = None;
+            true
+        }
+    }
+}
+
 /// Unwrap a reply the caller expects to be an inode.
 fn expect_inode(reply: MetaReply, verb: MetaVerb) -> Result<Inode> {
     match reply {
@@ -659,6 +931,93 @@ fn expect_unit(reply: MetaReply, verb: MetaVerb) -> Result<()> {
 /// relaxed increment, so the shipped-vs-local ledger is complete.
 fn note_local() {
     super::LOCAL_VERBS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A delegated `lookup`'s three outcomes.
+enum DelegLookup {
+    /// Not servable — ship as today.
+    Miss,
+    /// Served locally (parent dentry + child attrs, both delegated and
+    /// view-current).
+    Hit(Inode),
+    /// An AUTHORITATIVE local negative: the parent's grant is live and
+    /// view-current, so its dentry set is exact (the coherence law's
+    /// EEXIST/ENOENT-decidable-locally argument, read side).
+    Negative,
+}
+
+impl MetaShipRouter {
+    /// The delegated `lookup` serve (rung 12): parent dentry resolution
+    /// under the parent's grant, child attrs under the child's own — a
+    /// partial cover (dentry known, child not delegated) deliberately
+    /// ships the WHOLE verb, because a shipped lookup costs the same one
+    /// round trip and re-earns the child's grant for next time.
+    async fn deleg_lookup(&self, endpoint: &str, parent: Ino, name: &str) -> DelegLookup {
+        let Some(pg) = tokens::deleg_serve_begin(parent, endpoint) else {
+            return DelegLookup::Miss;
+        };
+        if !pg.dir() {
+            return DelegLookup::Miss;
+        }
+        let Ok(pi) = self.inner.getattr(parent).await else {
+            return DelegLookup::Miss;
+        };
+        if !pg.stamp_matches(&pi) {
+            return DelegLookup::Miss;
+        }
+        match self.inner.lookup_dentry(parent, name).await {
+            Ok(Some((child, _ft))) => {
+                let Some(cg) = tokens::deleg_serve_begin(child, endpoint) else {
+                    return DelegLookup::Miss;
+                };
+                let Ok(ci) = self.inner.getattr(child).await else {
+                    return DelegLookup::Miss;
+                };
+                if !cg.stamp_matches(&ci) {
+                    return DelegLookup::Miss;
+                }
+                pg.note_hit();
+                DelegLookup::Hit(ci)
+            }
+            Ok(None) => {
+                pg.note_hit();
+                DelegLookup::Negative
+            }
+            Err(_) => DelegLookup::Miss,
+        }
+    }
+
+    /// The delegated `getattr` serve: the stamp-check read IS the answer.
+    async fn deleg_getattr(&self, endpoint: &str, ino: Ino) -> Option<Inode> {
+        let g = tokens::deleg_serve_begin(ino, endpoint)?;
+        let i = self.inner.getattr(ino).await.ok()?;
+        if !g.stamp_matches(&i) {
+            return None;
+        }
+        g.note_hit();
+        Some(i)
+    }
+
+    /// The delegated `readdir` serve.
+    async fn deleg_readdir(
+        &self,
+        endpoint: &str,
+        dir: Ino,
+        offset: u64,
+        max: usize,
+    ) -> Option<Vec<DirEntry>> {
+        let g = tokens::deleg_serve_begin(dir, endpoint)?;
+        if !g.dir() {
+            return None;
+        }
+        let i = self.inner.getattr(dir).await.ok()?;
+        if !g.stamp_matches(&i) {
+            return None;
+        }
+        let entries = self.inner.readdir(dir, offset, max).await.ok()?;
+        g.note_hit();
+        Some(entries)
+    }
 }
 
 #[async_trait::async_trait]
@@ -702,17 +1061,31 @@ impl Metadata for MetaShipRouter {
             // shipped lookup is ONE round trip rather than two. An
             // ino-only answer means the child is owned elsewhere, so the
             // getattr routes on its own below.
-            VerbRoute::Ship(peer) => match self.ship_one(&peer, call).await? {
-                MetaReply::Inode(inode) => return Ok(Inode::from(inode)),
-                MetaReply::Ino(child) => child,
-                other => {
-                    return Err(super::protocol_error(
-                        MetaVerb::LookupDentry,
-                        &format!("{other:?}"),
-                        "an inode or a child ino",
-                    ))
+            VerbRoute::Ship(peer) => {
+                // Rung 12: the delegated serve — ZERO round trips when the
+                // parent (and child) are delegated and view-current.
+                match self.deleg_lookup(&peer.endpoint, parent, name).await {
+                    DelegLookup::Hit(inode) => return Ok(inode),
+                    DelegLookup::Negative => {
+                        return Err(SqueezefsError::Io(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("Dentry {name} not found in parent {parent}"),
+                        )))
+                    }
+                    DelegLookup::Miss => {}
                 }
-            },
+                match self.ship_one(&peer, call).await? {
+                    MetaReply::Inode(inode) => return Ok(Inode::from(inode)),
+                    MetaReply::Ino(child) => child,
+                    other => {
+                        return Err(super::protocol_error(
+                            MetaVerb::LookupDentry,
+                            &format!("{other:?}"),
+                            "an inode or a child ino",
+                        ))
+                    }
+                }
+            }
         };
         self.getattr(child).await
     }
@@ -819,14 +1192,21 @@ impl Metadata for MetaShipRouter {
                 note_local();
                 self.inner.readdir(dir, offset, max).await
             }
-            VerbRoute::Ship(peer) => match self.ship_one(&peer, call).await? {
-                MetaReply::Dir(entries) => Ok(entries.into_iter().map(DirEntry::from).collect()),
-                other => Err(super::protocol_error(
-                    MetaVerb::Readdir,
-                    &format!("{other:?}"),
-                    "a directory page",
-                )),
-            },
+            VerbRoute::Ship(peer) => {
+                if let Some(entries) = self.deleg_readdir(&peer.endpoint, dir, offset, max).await {
+                    return Ok(entries);
+                }
+                match self.ship_one(&peer, call).await? {
+                    MetaReply::Dir(entries) => {
+                        Ok(entries.into_iter().map(DirEntry::from).collect())
+                    }
+                    other => Err(super::protocol_error(
+                        MetaVerb::Readdir,
+                        &format!("{other:?}"),
+                        "a directory page",
+                    )),
+                }
+            }
         }
     }
 
@@ -838,6 +1218,9 @@ impl Metadata for MetaShipRouter {
                 self.inner.getattr(ino).await
             }
             VerbRoute::Ship(peer) => {
+                if let Some(inode) = self.deleg_getattr(&peer.endpoint, ino).await {
+                    return Ok(inode);
+                }
                 expect_inode(self.ship_one(&peer, call).await?, MetaVerb::Getattr)
             }
         }

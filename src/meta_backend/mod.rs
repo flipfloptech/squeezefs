@@ -1339,6 +1339,13 @@ impl RoutedMetaBackend {
         rdev: u32,
         initial_size: u64,
     ) -> Result<Inode> {
+        // S10 coherence law (rung 12) — BEFORE any 4a acquisition, like
+        // the cutover gate below: a create mutates the parent's dentry
+        // set + times, so every outstanding delegation on the parent is
+        // recalled (acked or expired-dead) before this apply, and no new
+        // grant can issue into the window while the permit is held. One
+        // relaxed load on every mount without a delegation host.
+        let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &[parent]).await;
         // §5.5.2a cutover gate: BEFORE any 4a acquisition — a parked
         // create holds nothing. Routes are derived AFTER admission: a
         // park can span a flip, and held entries pin the map (the drain
@@ -1611,6 +1618,20 @@ impl Metadata for RoutedMetaBackend {
         if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[parent]) {
             return r.unlink(parent, name).await;
         }
+        // S10 coherence law (rung 12): the parent's dentry set mutates,
+        // and the CHILD may itself be a delegated object (rmdir of a
+        // delegated directory). The child read is paid only while
+        // delegations are actually outstanding on this host; the
+        // resolution is advisory exactly like the owner's cross-owner
+        // pre-check — the recall correctness backstop is the grant
+        // decline the held permit enforces.
+        let mut deleg_set = vec![parent];
+        if crate::meta_ship::deleg_gate_wants_children(self) {
+            if let Ok(Some((child, _))) = self.lookup_dentry(parent, name).await {
+                deleg_set.push(child);
+            }
+        }
+        let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &deleg_set).await;
         // §5.5.2a cutover gate — before any 4a acquisition (and before
         // route derivation: a park can span a flip); the child's slot
         // joins after phase-1 discovery (holding nothing).
@@ -1843,6 +1864,10 @@ impl Metadata for RoutedMetaBackend {
         if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino, new_parent]) {
             return r.link(ino, new_parent, new_name).await;
         }
+        // S10 coherence law (rung 12): the parent's dentry set and the
+        // linked inode's nlink/ctime both mutate — both participants are
+        // parameters, so no resolution is needed.
+        let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &[new_parent, ino]).await;
         // §5.5.2a cutover gate — both inos are parameters, both slots
         // declared before any 4a acquisition (and before route
         // derivation: a park can span a flip).
@@ -2020,6 +2045,20 @@ impl Metadata for RoutedMetaBackend {
             ));
         }
 
+        // S10 coherence law (rung 12): both parents' dentry sets mutate;
+        // the moved child's ctime moves, and a rename-over destroys the
+        // target — both children may be delegated objects, so they join
+        // the recall set when delegations are outstanding (advisory
+        // resolution; the held permit's grant decline is the backstop).
+        let mut deleg_set = vec![old_parent, new_parent];
+        if crate::meta_ship::deleg_gate_wants_children(self) {
+            for (parent, name) in [(old_parent, old_name), (new_parent, new_name)] {
+                if let Ok(Some((child, _))) = self.lookup_dentry(parent, name).await {
+                    deleg_set.push(child);
+                }
+            }
+        }
+        let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &deleg_set).await;
         // §5.5.2a cutover gate — the deterministic G-VL-4 cross-slot-
         // rename case: BOTH parents' slots checked before any 4a
         // acquisition (and before route derivation — a park can span a
@@ -2460,6 +2499,9 @@ impl Metadata for RoutedMetaBackend {
                 .setattr(ino, mode, uid, gid, size, atime, mtime, ctime)
                 .await;
         }
+        // S10 coherence law (rung 12): attrs are exactly what a LOOKUP
+        // delegation serves.
+        let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &[ino]).await;
         // §5.5.2a cutover gate — before the 4a I-guard (and before
         // route derivation: a park can span a flip).
         let _gate = self.slot_gate_enter(&[ino]).await;
@@ -2497,6 +2539,9 @@ impl Metadata for RoutedMetaBackend {
         if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino]) {
             return r.setxattr(ino, name, value).await;
         }
+        // S10 coherence law (rung 12): an xattr change moves ctime — the
+        // delegated getattr's truth.
+        let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &[ino]).await;
         // §5.5.2a cutover gate — before the 4a I-guard (and before
         // route derivation: a park can span a flip).
         let _gate = self.slot_gate_enter(&[ino]).await;
@@ -2521,6 +2566,8 @@ impl Metadata for RoutedMetaBackend {
         if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino]) {
             return r.removexattr(ino, name).await;
         }
+        // S10 coherence law (rung 12): ctime moves (the setxattr twin).
+        let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &[ino]).await;
         // §5.5.2a cutover gate — before the 4a I-guard (and before
         // route derivation: a park can span a flip).
         let _gate = self.slot_gate_enter(&[ino]).await;
@@ -2555,6 +2602,10 @@ impl Metadata for RoutedMetaBackend {
         if let Some(r) = crate::meta_ship::daemon_verb_router(self, &[ino]) {
             return r.destroy_inode(ino).await;
         }
+        // S10 coherence law (rung 12): a destroyed record must not stay
+        // servable under a grant (the unlink already recalled the parent;
+        // this covers the object itself).
+        let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &[ino]).await;
         // §5.5.2a cutover gate — before the backend's own locks and
         // before route derivation.
         let _gate = self.slot_gate_enter(&[ino]).await;
@@ -2602,6 +2653,12 @@ impl RoutedMetaBackend {
         size: u64,
         block_refs: &[crate::meta_backend::kv::block_refs::BlockRefOp],
     ) -> Result<()> {
+        // S10 coherence law (rung 12): a layout publish changes the
+        // object's size/mtime — the CONFLICTING PUBLISH the design's
+        // recall-before-conflicting-publish clause names. Covers the
+        // authority's own writeback AND the S9 shipped publishes (both
+        // funnel here).
+        let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &[ino]).await;
         // §5.5.2a cutover gate — before the backend's own I-guard and
         // before route derivation.
         let _gate = self.slot_gate_enter(&[ino]).await;
@@ -2646,6 +2703,10 @@ impl RoutedMetaBackend {
         size: u64,
         block_refs: Vec<crate::meta_backend::kv::block_refs::BlockRefOp>,
     ) -> Result<bool> {
+        // S10 coherence law (rung 12) — the `set_layout_and_size`
+        // discipline: the delta publish is the same conflicting-publish
+        // class.
+        let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &[ino]).await;
         // §5.5.2a cutover gate — before the backend's own I-guard and
         // before route derivation (the `set_layout_and_size` discipline).
         let _gate = self.slot_gate_enter(&[ino]).await;

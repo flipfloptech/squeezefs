@@ -278,6 +278,7 @@ impl MultiWriterArm {
         data_grant::uninstall_custody_client();
         data_grant::uninstall_custody_owner();
         publish::uninstall_client();
+        crate::meta_ship::uninstall_delegation_host();
         crate::meta_ship::disarm_ownership();
         // The lane map dies with the authority (it is era-scoped), and so does
         // the frontier source a served OPEN read. The allocators keep their
@@ -322,6 +323,19 @@ pub async fn arm_mount_multi_writer(
             "multi-writer not requested (SQUEEZEFS_MULTI_WRITER is off — the shipped posture: \
              the D0 guard arbitrates and the data plane is fenced locally by the custody epoch)"
         );
+        // Rung 12, design §11: `SQUEEZEFS_DELEGATION` set on an unarmed
+        // mount is ANNOUNCED-INERT — a startup notice, never a refusal
+        // (the SQUEEZEFS_MW_ROLE "read only when armed" precedent).
+        if std::env::var(crate::meta_ship::DELEGATION_ENV)
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+        {
+            log::info!(
+                "SQUEEZEFS_DELEGATION is set but no multi-writer plane is armed on this mount — \
+                 the S10 delegation lever is INERT here (every dlm_delegation gauge stays 0 by \
+                 construction); it engages only on mounts whose ownership plane is armed"
+            );
+        }
         return Ok(None);
     }
     // DLM S9: this is the AUTHORITY's arm. A mount that declared
@@ -608,17 +622,23 @@ pub async fn arm_multi_writer(
         }
     }
 
+    // Rung 9 — the S8 arm's owner half: the shipped `Metadata` verb
+    // block (VERB_META_BATCH/VERB_RECLAIM) on the SAME listener. The
+    // service adopts the durable era at construction
+    // (`crate::dlm::durable_term()` — rung 5 above proved it nonzero),
+    // so a successor authority's higher term makes every old-era
+    // frame stale by construction (S8's era gate).
+    let meta_svc = crate::meta_ship::MetaShipService::new(Arc::clone(meta));
+    // Rung 12 — the S10 delegation host: the SAME service serves the
+    // DelegRecall/DelegReassert block, and installing it is what arms the
+    // coherence gate on this backend's mutation surface (grants may only
+    // exist where the recall-before-conflicting-publish law is enforced).
+    crate::meta_ship::install_delegation_host(Arc::clone(&meta_svc));
     let router = AsyncVerbRouter::new()
         .with_custody(Arc::clone(&owner))
         .with_publish(publish::PublishService::new(Arc::clone(meta)))
-        // Rung 9 — the S8 arm's owner half: the shipped `Metadata` verb
-        // block (VERB_META_BATCH/VERB_RECLAIM) on the SAME listener. The
-        // service adopts the durable era at construction
-        // (`crate::dlm::durable_term()` — rung 5 above proved it nonzero),
-        // so a successor authority's higher term makes every old-era
-        // frame stale by construction (S8's era gate).
-        .with_meta(crate::meta_ship::MetaShipService::new(Arc::clone(meta)));
-    let listener = crate::cluster_wire::RpcListener::start_async(
+        .with_meta(meta_svc);
+    let listener = match crate::cluster_wire::RpcListener::start_async(
         crate::cluster_wire::RpcListenerConfig {
             bind_addr: bind,
             security: None,
@@ -627,7 +647,15 @@ pub async fn arm_multi_writer(
         },
         secret.clone(),
         Arc::new(router),
-    )?;
+    ) {
+        Ok(l) => l,
+        Err(e) => {
+            // A host with no listener can never receive an ack — grants
+            // must not exist without their recall wire.
+            crate::meta_ship::uninstall_delegation_host();
+            return Err(e);
+        }
+    };
     let endpoint = format!(
         "{}:{}",
         crate::cluster_wire::local_advertise_ip(),

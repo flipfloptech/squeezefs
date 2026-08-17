@@ -755,6 +755,7 @@ fn bench_meta_ship_verbs(c: &mut Criterion) {
     let batch = |ops: Vec<MetaOp>| MetaRequestFrame {
         schema: META_SHIP_SCHEMA,
         client_epoch: 0x5eed_1234_dead_beef,
+        client_id: "node_cafe0123456789ab.m00000001".to_string(),
         owner_term: 7,
         ops,
     };

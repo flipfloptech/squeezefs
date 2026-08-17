@@ -9880,6 +9880,15 @@ impl SqueezefsFilesystem {
                 // drift from the arithmetic in force.
                 "dlm_recall": crate::meta_ship::recall_stats_json(),
                 "dlm_revoke_phase_ns": crate::meta_ship::revoke_phase_json(),
+                // Rung 12 — the S10 delegation family (design §13):
+                // delegation-scoped counters COMPOSING with the rung-11
+                // lane's above. All zero on every mount without an armed
+                // delegation plane BY CONSTRUCTION;
+                // `dlm_delegation_stale_serves` is the must-stay-0
+                // coherence tripwire and `dlm_delegation_recall_timeouts`
+                // the loud escalate-to-eviction one.
+                "dlm_delegation": crate::meta_ship::delegation_stats_json(),
+                "dlm_delegation_recall_phase_ns": crate::meta_ship::delegation_recall_phase_json(),
                 // DLM S9 (spec §6.9 S9): the remote write-custody plane and
                 // the daemon's publish path on the wire. `dlm_custody.mode`
                 // is `off` on every single-writer mount and every other
@@ -20182,10 +20191,20 @@ impl Filesystem for SqueezefsFilesystem {
             prof.mark_backend_done();
             let attr = attr_res.map_err(map_squeezefs_err)?;
 
-            Ok(ReplyAttr {
-                ttl: self.kernel_ttls.attr,
-                attr,
-            })
+            // Rung 12 — the S10 reader-TTL stretch (attr face): a live,
+            // channel-fresh delegation is the coherence promise (the
+            // owner recalls before any conflicting mutation publishes),
+            // so the kernel attr TTL may stretch to the delegation's own
+            // validity horizon — and the recall-drop pushes
+            // notify_inval_inode through the installed sink, which is
+            // what bounds the stretched staleness. `None` (every
+            // non-delegated object and every unarmed mount) keeps the
+            // per-class default verbatim.
+            let ttl = match crate::meta_ship::deleg_kernel_ttl_stretch(ino) {
+                Some(stretch) => self.kernel_ttls.attr.max(stretch),
+                None => self.kernel_ttls.attr,
+            };
+            Ok(ReplyAttr { ttl, attr })
         };
 
         getattr_future.await
@@ -25200,6 +25219,25 @@ pub async fn start_mount<P: AsRef<Path>>(
     // The general daemon-side notify (generic/683 setid strip et al).
     fs.kernel_notify
         .store(std::sync::Arc::new(Some(session.get_notify())));
+    // Rung 12 — the S10 delegation recall-invalidation sink: a dropped
+    // delegation pushes an attrs-only FUSE_NOTIFY_INVAL_INODE, which is
+    // what bounds the STRETCHED kernel attr TTL a delegated getattr reply
+    // carries (design §8.2: "the recall is what bounds staleness"). The
+    // async enqueue is the right form here — the stretched-TTL staleness
+    // it cuts short is attr-only, the exact `push_attrs_only_inval`
+    // ordering adjudication.
+    {
+        let notify_cell = fs.kernel_notify.clone();
+        crate::meta_ship::set_deleg_inval_sink(Some(std::sync::Arc::new(move |ino| {
+            let notify_cell = notify_cell.clone();
+            crate::meta_exec::spawn_meta("deleg_recall_inval", async move {
+                let notify = notify_cell.load().as_ref().clone();
+                if let Some(notify) = notify {
+                    notify.invalid_inode(ino, -1, 0).await;
+                }
+            });
+        })));
+    }
     // generic/451: arm the DIO-write page-coherence sink — a ranged
     // FUSE_NOTIFY_INVAL_INODE per gated O_DIRECT write, awaited by the
     // write handler before its reply (ack ⇒ coherent; the law and its

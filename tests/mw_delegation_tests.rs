@@ -78,6 +78,10 @@ impl Drop for ArmGuard {
         ship::TEST_DELEG_COHERENCE_LAW.store(true, Ordering::SeqCst);
         ship::test_clear_delegations();
         ship::test_clear_token_cache();
+        // The GLOBAL lane's grant/thrash state must not leak into the
+        // next test's identically-numbered inos (fresh volume per test —
+        // ino numbering restarts).
+        ship::global_recall_lane().test_clear_state();
         ship::set_deleg_inval_sink(None);
         std::env::remove_var("SQUEEZEFS_DLM_RECALL_DEADLINE_MS");
     }
@@ -113,13 +117,6 @@ struct Fixture {
     endpoint: String,
     router: Arc<MetaShipRouter>,
     _arm: ArmGuard,
-}
-
-impl Fixture {
-    /// The holder's peer handle for manual wire work.
-    fn peer(&self) -> Arc<PeerOwner> {
-        Arc::new(PeerOwner::new("node_cafe.m0001", &self.endpoint))
-    }
 }
 
 async fn fixture() -> Fixture {
@@ -168,6 +165,10 @@ async fn fixture() -> Fixture {
         .map(|v| (v, PeerOwner::new("owner-a", &endpoint)))
         .collect();
     let map = OwnerMap::for_volumes(&client_be, foreign).expect("owner map");
+    // A fresh plane for this fixture: the previous test's lane state
+    // names THIS volume's ino numbers (every fixture volume starts at 1).
+    ship::global_recall_lane().test_clear_state();
+    ship::test_clear_delegations();
     ship::arm_ownership(map);
     let _arm = ArmGuard;
     ship::TEST_DELEGATION_OVERRIDE.store(1, Ordering::SeqCst);
@@ -250,7 +251,7 @@ fn the_wire_carries_the_delegation_vocabulary_and_refuses_untrusted_bytes() {
     // (16/17), custody (0x0200), publish (0x0300).
     assert_eq!(ship::VERB_DELEG_RECALL, 0x0400);
     assert_eq!(ship::VERB_DELEG_REASSERT, 0x0401);
-    assert!(ship::VERB_DELEG_RECALL > ship::VERB_RECLAIM);
+    const _: () = assert!(ship::VERB_DELEG_RECALL > ship::VERB_RECLAIM);
     assert_eq!(DELEG_CLASS_LOOKUP, 1, "the LOOKUP capability bit");
 
     let poll = DelegPollFrame {
@@ -582,14 +583,16 @@ async fn the_coherence_law_recalls_before_the_conflicting_mutation_applies() {
         .await
         .expect("owner create");
     catch_up(&fx).await;
+    let rounds0 = deleg().channel_rounds;
     fx.router.lookup(dir_ino, "old").await.expect("lookup");
     let hits0 = deleg().hits;
     fx.router.lookup(dir_ino, "old").await.expect("lookup");
     assert!(deleg().hits > hits0, "the delegation must be serving");
     // The recall channel must be live before the conflict fires (it spun
-    // up on grant absorption; the first poll parks at the owner).
+    // up on grant absorption; the first poll parks at the owner). DELTA
+    // against this fixture: the counter is process-global cumulative.
     wait_for("the recall channel's first round", || {
-        deleg().channel_rounds >= 1
+        deleg().channel_rounds > rounds0
     })
     .await;
 
@@ -621,7 +624,11 @@ async fn the_coherence_law_recalls_before_the_conflicting_mutation_applies() {
         .await
         .expect("the post-recall serve sees the mutation");
     assert!(got.ino > 0);
-    assert_eq!(deleg().stale_serves, 0, "the must-stay-0 coherence tripwire");
+    assert_eq!(
+        deleg().stale_serves,
+        0,
+        "the must-stay-0 coherence tripwire"
+    );
     shutdown(&fx).await;
 }
 
@@ -862,12 +869,13 @@ async fn grace_reassertion_across_an_authority_restart() {
         .await
         .expect("owner create");
     catch_up(&fx).await;
+    let rounds0 = deleg().channel_rounds;
     fx.router.lookup(dir_ino, "seed").await.expect("lookup");
     let hits0 = deleg().hits;
     fx.router.lookup(dir_ino, "seed").await.expect("lookup");
     assert!(deleg().hits > hits0, "the delegation must be serving");
     wait_for("the recall channel's first round", || {
-        deleg().channel_rounds >= 1
+        deleg().channel_rounds > rounds0
     })
     .await;
 
@@ -908,15 +916,26 @@ async fn grace_reassertion_across_an_authority_restart() {
     .await;
 
     // In-window: a conflicting FRESH mutation refuses (the grace law).
-    let err = fx
-        .router
-        .create_with_rdev(dir_ino, "conflict", FILE, 0, 0, 0)
-        .await
-        .expect_err("a fresh mutation must refuse inside the grace window");
-    assert!(
-        format!("{err}").contains("grace"),
-        "the refusal names the window: {err}"
-    );
+    // The FIRST attempt may meet the ERA gate instead (the client still
+    // believes the predecessor's term; the refusal teaches it — "learn
+    // the new era so the caller's retry is admissible"), so the grace
+    // refusal is asserted on the post-relearn retry.
+    let mut grace_refusal = None;
+    for _ in 0..3 {
+        let err = fx
+            .router
+            .create_with_rdev(dir_ino, "conflict", FILE, 0, 0, 0)
+            .await
+            .expect_err("a fresh mutation must refuse inside the grace window");
+        let msg = format!("{err}");
+        if msg.contains("stale writer era") {
+            continue; // the era relearn — retry now names the successor
+        }
+        grace_refusal = Some(msg);
+        break;
+    }
+    let msg = grace_refusal.expect("every attempt met the era gate — the relearn never landed");
+    assert!(msg.contains("grace"), "the refusal names the window: {msg}");
 
     // The re-asserted delegation serves — current, zero stale serves.
     let hits1 = deleg().hits;
@@ -1087,9 +1106,13 @@ async fn kernel_ttl_stretch_rides_delegations_and_recall_invalidates() {
         None,
         "no delegation, no stretch"
     );
-    fx.router.getattr(dir_ino).await.expect("grant-earning getattr");
+    let rounds0 = deleg().channel_rounds;
+    fx.router
+        .getattr(dir_ino)
+        .await
+        .expect("grant-earning getattr");
     wait_for("the recall channel's first round", || {
-        deleg().channel_rounds >= 1
+        deleg().channel_rounds > rounds0
     })
     .await;
     let stretch = ship::deleg_kernel_ttl_stretch(dir_ino)

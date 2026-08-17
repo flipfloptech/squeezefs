@@ -513,6 +513,12 @@ pub struct RecallLaneStats {
     pub rate_deferred: u64,
     /// Acks that matched no in-flight frame (protocol hygiene).
     pub stale_acks: u64,
+    /// Grants returned WITHOUT a wire recall (rung 12: the mutating
+    /// holder's own grant dies with its mutation's reply — the
+    /// self-conflict never rides the recall lane, and it never stamps the
+    /// thrash slot, because the valve protects the WIRE fan-out and a
+    /// surrender has none).
+    pub surrenders: u64,
     /// Grants admitted.
     pub grants: u64,
     /// Grants refused while demoted (the valve's refusal gauge).
@@ -597,10 +603,15 @@ pub struct RecallLane {
     coalesced: AtomicU64,
     rate_deferred: AtomicU64,
     stale_acks: AtomicU64,
+    surrenders: AtomicU64,
     grants: AtomicU64,
     grant_refusals: AtomicU64,
     thrash_demotions: AtomicU64,
     repromotions: AtomicU64,
+    /// GAUGE mirror of the outstanding (grant, holder) population — the
+    /// lock-free fast probe the rung-12 mutation gate reads before paying
+    /// anything (zero grants ⇒ the gate is one relaxed load + one atomic).
+    outstanding_fast: AtomicU64,
 }
 
 impl RecallLane {
@@ -616,10 +627,12 @@ impl RecallLane {
             coalesced: AtomicU64::new(0),
             rate_deferred: AtomicU64::new(0),
             stale_acks: AtomicU64::new(0),
+            surrenders: AtomicU64::new(0),
             grants: AtomicU64::new(0),
             grant_refusals: AtomicU64::new(0),
             thrash_demotions: AtomicU64::new(0),
             repromotions: AtomicU64::new(0),
+            outstanding_fast: AtomicU64::new(0),
         }
     }
 
@@ -698,9 +711,45 @@ impl RecallLane {
                 }
             }
         }
-        st.grants.entry(ino).or_default().insert(client.to_string());
+        if st.grants.entry(ino).or_default().insert(client.to_string()) {
+            self.outstanding_fast.fetch_add(1, Ordering::Relaxed);
+        }
         self.grants.fetch_add(1, Ordering::Relaxed);
         GrantDecision::Granted
+    }
+
+    /// A grant returned WITHOUT the wire (rung 12): the holder itself is
+    /// the conflicting mutator — its grant retires as the mutation
+    /// executes and the revocation rides the mutation's own reply, so no
+    /// recall frame, no ack round, and no thrash-slot stamp (the valve
+    /// protects wire fan-out; a surrender has none). Also the grant-path
+    /// RETRACTION arm: a grant recorded and then found un-issuable (the
+    /// in-flight-mutation re-check, a vanished object) is taken back
+    /// before it was ever sent. Returns whether a grant was held.
+    pub fn surrender(&self, ino: u64, client: &str) -> bool {
+        let mut st = self.state.lock();
+        let held = match st.grants.get_mut(&ino) {
+            Some(hs) => {
+                let removed = hs.remove(client);
+                if hs.is_empty() {
+                    st.grants.remove(&ino);
+                }
+                removed
+            }
+            None => false,
+        };
+        if held {
+            self.outstanding_fast.fetch_sub(1, Ordering::Relaxed);
+            self.surrenders.fetch_add(1, Ordering::Relaxed);
+        }
+        held
+    }
+
+    /// Lock-free probe of the outstanding (grant, holder) population —
+    /// what lets the rung-12 mutation gate cost one atomic when nothing
+    /// is delegated.
+    pub fn outstanding_now(&self) -> u64 {
+        self.outstanding_fast.load(Ordering::Relaxed)
     }
 
     /// Owner-initiated recall of EVERY outstanding grant on `ino`
@@ -823,7 +872,9 @@ impl RecallLane {
         for r in &f.recalls {
             self.phases[PH_ACK_WAIT].record(now.saturating_duration_since(f.issued_at));
             self.phases[PH_TOTAL].record(now.saturating_duration_since(r.enqueued_at));
-            retire_recall(&mut st, client, r.ino);
+            if retire_recall(&mut st, client, r.ino) {
+                self.outstanding_fast.fetch_sub(1, Ordering::Relaxed);
+            }
         }
         self.acked
             .fetch_add(f.recalls.len() as u64, Ordering::Relaxed);
@@ -862,7 +913,9 @@ impl RecallLane {
             );
             for r in f.recalls {
                 self.phases[PH_TOTAL].record(now.saturating_duration_since(r.enqueued_at));
-                retire_recall(&mut st, &client, r.ino);
+                if retire_recall(&mut st, &client, r.ino) {
+                    self.outstanding_fast.fetch_sub(1, Ordering::Relaxed);
+                }
                 self.timed_out.fetch_add(1, Ordering::Relaxed);
                 out.push(TimedOutRecall {
                     client: client.clone(),
@@ -872,6 +925,22 @@ impl RecallLane {
             }
         }
         out
+    }
+
+    /// **Test seam**: drop the lane's whole grant/recall/thrash state
+    /// (counters stay — suites assert deltas). What lets a suite binary
+    /// run its tests against fresh volumes whose ino numbering restarts,
+    /// without one test's thrash slots or stranded grants leaking into
+    /// the next test's identically-numbered objects. Production never
+    /// calls it.
+    pub fn test_clear_state(&self) {
+        let mut st = self.state.lock();
+        st.grants.clear();
+        st.requested.clear();
+        st.thrash.clear();
+        st.pending.clear();
+        st.inflight.clear();
+        self.outstanding_fast.store(0, Ordering::Relaxed);
     }
 
     /// Outstanding holders of `ino`.
@@ -906,6 +975,7 @@ impl RecallLane {
             coalesced: self.coalesced.load(Ordering::Relaxed),
             rate_deferred: self.rate_deferred.load(Ordering::Relaxed),
             stale_acks: self.stale_acks.load(Ordering::Relaxed),
+            surrenders: self.surrenders.load(Ordering::Relaxed),
             grants: self.grants.load(Ordering::Relaxed),
             grant_refusals: self.grant_refusals.load(Ordering::Relaxed),
             thrash_demotions: self.thrash_demotions.load(Ordering::Relaxed),
@@ -929,20 +999,26 @@ impl RecallLane {
 }
 
 /// A recall reached its terminal outcome (ack or timeout): the grant and
-/// the dedupe entry retire together.
-fn retire_recall(st: &mut LaneState, client: &str, ino: u64) {
-    if let Some(hs) = st.grants.get_mut(&ino) {
-        hs.remove(client);
-        if hs.is_empty() {
-            st.grants.remove(&ino);
+/// the dedupe entry retire together. Returns whether a grant was actually
+/// removed (the caller maintains the lock-free outstanding gauge).
+fn retire_recall(st: &mut LaneState, client: &str, ino: u64) -> bool {
+    let removed = match st.grants.get_mut(&ino) {
+        Some(hs) => {
+            let removed = hs.remove(client);
+            if hs.is_empty() {
+                st.grants.remove(&ino);
+            }
+            removed
         }
-    }
+        None => false,
+    };
     if let Some(req) = st.requested.get_mut(client) {
         req.remove(&ino);
         if req.is_empty() {
             st.requested.remove(client);
         }
     }
+    removed
 }
 
 /// The process-global lane — the one the stats inode exports and the one
@@ -977,6 +1053,7 @@ pub fn recall_stats_json() -> serde_json::Value {
         "dlm_recall_coalesced": s.coalesced,
         "dlm_recall_rate_deferred": s.rate_deferred,
         "dlm_recall_stale_acks": s.stale_acks,
+        "dlm_recall_surrenders": s.surrenders,
         "dlm_recall_grants": s.grants,
         "dlm_recall_grant_refusals": s.grant_refusals,
         "dlm_thrash_demotions": s.thrash_demotions,
@@ -998,4 +1075,696 @@ pub fn recall_stats_json() -> serde_json::Value {
 /// `dlm_revoke_phase_ns` for the stats inode (the global lane's table).
 pub fn revoke_phase_json() -> serde_json::Value {
     global_recall_lane().phase_json()
+}
+
+// ===========================================================================
+// DLM S10 rung 12 — the CLIENT DELEGATION CACHE (the engine's holder half).
+//
+// `docs/design-full-multi-writer.md` §8.2 lever 1: a delegation is a
+// capability token over an object, piggybacked on the replies of metadata
+// RPCs the holder was already issuing, serving LOOKUP-class verbs from the
+// holder's reader-revalidation view under the owner-enforced coherence law
+// (recall-before-conflicting-publish). RAM only (KD-MW-5).
+//
+// # Why a serve is sound (the three gates, in order)
+//
+// 1. **The stamp gate** closes the warming window: an entry serves only
+//    when the holder's LOCAL view of the object matches the grant's
+//    `DelegStamp` byte for byte — v3's whole-tx atomicity + checkpoint-
+//    prefix visibility mean a matching inode record implies the view
+//    includes every transaction up to the one that produced the stamp, so
+//    the dentry set is exactly as current as the attrs.
+// 2. **The recall channel's freshness** bounds delivery: serves run only
+//    while the holder's standing DelegRecall round is fresh (a completed
+//    round within the derived window), so a recall reaches the holder
+//    promptly or serving stops on its own. The pathological cases (a
+//    holder that answers nothing) are bounded by the S6 membership
+//    arithmetic — a timed-out recall escalates to eviction and the
+//    member's own `T_self` self-fence fires before the owner re-grants
+//    (the S9 custody plane's exact posture: "the window is bounded by its
+//    own T_self self-fence, never by its belief").
+// 3. **The era gate**: an entry's `term` must match the channel's learned
+//    owner term — a failover's survivors re-assert and re-install under
+//    the successor's era, never serve across it.
+//
+// # The grant/recall reordering law (the fence)
+//
+// Grants ride the batch lane; recalls ride the recall channel — two
+// sessions, no cross-ordering. Every recall carries the owner's
+// delegation-sequence FENCE at frame-build time; the holder tombstones the
+// recalled inos at that fence and drops any later-arriving grant at or
+// below it. Owner-side, a grant's `seq` is minted BEFORE the lane records
+// it, so any grant the recall could have named is ≤ the fence — a dropped
+// grant is only ever a lost optimization (the next shipped verb re-earns
+// it), never a correctness event.
+// ===========================================================================
+
+use super::wire::{DelegGrant, DelegStamp};
+use std::sync::atomic::AtomicU8;
+use std::sync::Arc;
+
+/// The S10 A/B lever (design §11): ENG-10 `Kind::Bool`, static default
+/// **on**, read only when the mw plane is armed (`ownership_armed`) — the
+/// `SQUEEZEFS_MW_ROLE` precedent. `=1` on an unarmed mount is
+/// announced-inert; `=0` on an armed mount is the A/B control.
+pub const DELEGATION_ENV: &str = "SQUEEZEFS_DELEGATION";
+
+/// **Test seam** (the `TEST_SHIP_DRAIN_HOLD_MS` precedent): `0` = read the
+/// env knob, `1` = force on, `2` = force off — so one suite binary can pin
+/// both sides of the A/B without racing process-global env mutation.
+pub static TEST_DELEGATION_OVERRIDE: AtomicU8 = AtomicU8::new(0);
+
+/// Is the delegation plane live on this process? One relaxed load on every
+/// unarmed mount (the solo re-gate's law) — the knob is consulted only
+/// past the armed gate.
+pub fn delegation_enabled() -> bool {
+    match TEST_DELEGATION_OVERRIDE.load(Ordering::Relaxed) {
+        1 => return super::ownership_armed(),
+        2 => return false,
+        _ => {}
+    }
+    super::ownership_armed() && crate::env_knobs::bool_knob(DELEGATION_ENV, true)
+}
+
+/// Entry state: serving.
+const DELEG_LIVE: u8 = 0;
+/// Entry state: recalled/suspended — no NEW serve begins; in-flight serves
+/// drain.
+const DELEG_REVOKED: u8 = 1;
+/// Entry state: the recall was ACKED (drain complete). A serve completing
+/// in this state is the must-stay-0 `dlm_delegation_stale_serves`
+/// tripwire — structurally unreachable because the ack waits for the
+/// drain, and counted so a future regression is loud, never silent.
+const DELEG_ACKED: u8 = 2;
+
+/// One held delegation.
+struct DelegEntry {
+    endpoint: Arc<str>,
+    class: u8,
+    dir: bool,
+    seq: u64,
+    term: u64,
+    stamp: DelegStamp,
+    state: AtomicU8,
+    /// Local serves in flight (the never-serve-after-ack law: the recall
+    /// drain waits for this to reach 0 BEFORE the ack is queued).
+    inflight: AtomicU64,
+    /// Second-chance reference bit (the token cache's retirement law).
+    used: std::sync::atomic::AtomicBool,
+    /// Signaled by every serve completion while revoked — what the drain
+    /// parks on (never a sleep-as-synchronization).
+    drain: squeezefs_ipc::sqz_notify::Notify,
+}
+
+/// Bytes charged per cached delegation: the entry, its `Arc`, and the
+/// `scc` bucket slot (same accounting style as [`ENTRY_BYTES`]).
+const DELEG_ENTRY_BYTES: u64 = 96;
+
+static DELEG_CACHE: Lazy<scc::HashMap<u64, Arc<DelegEntry>>> = Lazy::new(scc::HashMap::new);
+
+/// The grant/recall reordering fence: ino → `(term, seq)` floor. A grant
+/// at or below its object's floor is dead on arrival.
+static DELEG_TOMBSTONES: Lazy<scc::HashMap<u64, (u64, u64)>> = Lazy::new(scc::HashMap::new);
+
+/// Per-owner recall-channel health — the holder-side serve gate.
+pub(crate) struct DelegChannel {
+    pub(crate) healthy: std::sync::atomic::AtomicBool,
+    /// Monotonic ms (process epoch) of the last completed round.
+    pub(crate) last_ok_ms: AtomicU64,
+    /// The owner's published park bound, ms (the freshness window input).
+    pub(crate) park_ms: AtomicU64,
+    /// The owner era the channel last learned.
+    pub(crate) term: AtomicU64,
+}
+
+static DELEG_CHANNELS: Lazy<scc::HashMap<String, Arc<DelegChannel>>> = Lazy::new(scc::HashMap::new);
+
+/// Process monotonic epoch for the channel arithmetic.
+static DELEG_EPOCH: Lazy<Instant> = Lazy::new(Instant::now);
+
+fn now_ms() -> u64 {
+    DELEG_EPOCH.elapsed().as_millis() as u64
+}
+
+/// Conservative park default a channel is born with (the spawn-to-first-
+/// round window): the owner's own floor-to-ceiling park derivation lands
+/// in [100 ms, 5 s]; 1 s keeps the initial freshness window tight while
+/// the first round is in flight, and the first reply replaces it with the
+/// owner's published number.
+const DELEG_PARK_DEFAULT_MS: u64 = 1_000;
+
+/// Freshness slack over two park rounds: scheduling + one RTT of grace.
+const DELEG_FRESH_SLACK_MS: u64 = 2_000;
+
+// The `dlm_delegation` family (design §13). Client-face counters live
+// here; the owner-face counters (grants issued, declines, timeouts) are
+// incremented by the service through the `note_*` fns so the whole family
+// assembles in ONE place.
+static DELEG_GRANTS_ISSUED: AtomicU64 = AtomicU64::new(0);
+static DELEG_DECLINES: AtomicU64 = AtomicU64::new(0);
+static DELEG_INSTALLS: AtomicU64 = AtomicU64::new(0);
+static DELEG_HITS: AtomicU64 = AtomicU64::new(0);
+static DELEG_RECALLS: AtomicU64 = AtomicU64::new(0);
+static DELEG_REASSERTS: AtomicU64 = AtomicU64::new(0);
+static DELEG_REPLY_REVOKES: AtomicU64 = AtomicU64::new(0);
+static DELEG_STALE_SERVES: AtomicU64 = AtomicU64::new(0);
+static DELEG_RECALL_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+static DELEG_TOMBSTONE_DROPS: AtomicU64 = AtomicU64::new(0);
+static DELEG_CHANNEL_SUSPENDS: AtomicU64 = AtomicU64::new(0);
+static DELEG_CHANNEL_ROUNDS: AtomicU64 = AtomicU64::new(0);
+static DELEG_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// The recall-invalidation sink: the FUSE mount installs a closure that
+/// pushes `notify_inval_inode` for a dropped delegation, which is what
+/// bounds the STRETCHED kernel attr TTL (design §8.2: "the recall is what
+/// bounds staleness"). `None` (tests, unmounted processes) = the drop
+/// still stops daemon-side serves.
+#[allow(clippy::type_complexity)]
+static DELEG_INVAL_SINK: Lazy<parking_lot::RwLock<Option<Arc<dyn Fn(u64) + Send + Sync>>>> =
+    Lazy::new(|| parking_lot::RwLock::new(None));
+
+/// Install (or clear) the kernel-invalidation sink.
+pub fn set_deleg_inval_sink(sink: Option<Arc<dyn Fn(u64) + Send + Sync>>) {
+    *DELEG_INVAL_SINK.write() = sink;
+}
+
+fn fire_inval_sink(ino: u64) {
+    let sink = DELEG_INVAL_SINK.read().clone();
+    if let Some(sink) = sink {
+        sink(ino);
+    }
+}
+
+/// The R5 registration (design §13: "bytes rides R5") — sheddable at
+/// weight 1 with floor 0: every dropped entry costs one re-earned grant,
+/// never a wrong answer (the token-cache retirement law).
+static DELEG_R5: std::sync::Once = std::sync::Once::new();
+
+fn ensure_deleg_r5() {
+    DELEG_R5.call_once(|| {
+        crate::mem_budget::MEM_BUDGET.register(crate::mem_budget::Component::new(
+            "dlm_delegation_entries",
+            0,
+            1,
+            Arc::new(|| DELEG_CACHE.len() as u64 * DELEG_ENTRY_BYTES),
+            Arc::new(|_| {
+                DELEG_CACHE.retain_sync(|_, _| false);
+            }),
+        ));
+    });
+}
+
+/// The cache's entry cap: the token cache's derivation verbatim (same
+/// budget share, same floor) — one law, not two.
+fn deleg_cache_cap() -> usize {
+    cache_cap()
+}
+
+/// One bounded second-chance pass (the token-cache sweep's law).
+fn deleg_sweep() {
+    let mut retired = 0u64;
+    DELEG_CACHE.retain_sync(|_, e| {
+        if e.used.swap(false, Ordering::Relaxed) {
+            true
+        } else {
+            retired += 1;
+            false
+        }
+    });
+    if retired == 0 {
+        DELEG_CACHE.retain_sync(|_, _| false);
+    }
+}
+
+/// Owner face: a delegation grant rode a reply.
+pub(crate) fn note_deleg_grant_issued() {
+    DELEG_GRANTS_ISSUED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Owner face: a grant was declined (in-flight mutation, vanished object).
+pub(crate) fn note_deleg_decline() {
+    DELEG_DECLINES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Owner face: a delegation recall timed out (LOUD; the caller escalates
+/// to membership eviction — the rung-11 residual #2 discharged).
+pub(crate) fn note_deleg_recall_timeout() {
+    DELEG_RECALL_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Owner face: a timed-out holder was evicted from the membership plane.
+pub(crate) fn note_deleg_eviction() {
+    DELEG_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Client face: a re-assertion round completed against a (successor)
+/// owner.
+pub(crate) fn note_deleg_reassert_round() {
+    DELEG_REASSERTS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Install a piggybacked grant. Tombstoned, capped, monotone per object
+/// (an older or equal `(term, seq)` never displaces a newer entry).
+pub fn install_delegation(endpoint: &str, grant: &DelegGrant) {
+    ensure_deleg_r5();
+    if let Some((t_term, t_seq)) = DELEG_TOMBSTONES.read_sync(&grant.ino, |_, v| *v) {
+        // The fence: a grant at or below its object's floor is dead on
+        // arrival (it was minted before a recall that already retired it
+        // owner-side — installing it would serve with no recall coming).
+        if grant.term < t_term || (grant.term == t_term && grant.seq <= t_seq) {
+            DELEG_TOMBSTONE_DROPS.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let _ = DELEG_TOMBSTONES.remove_sync(&grant.ino);
+    }
+    if DELEG_CACHE.len() >= deleg_cache_cap() {
+        deleg_sweep();
+    }
+    // The grant rode an authenticated reply, so it IS era evidence: the
+    // channel adopts it monotonically (the lane's `learn_term` law), which
+    // is what lets a grant serve during the channel's first round's
+    // flight. A failover's higher term still invalidates every older
+    // entry — `fetch_max` only ever rises.
+    deleg_channel(endpoint)
+        .term
+        .fetch_max(grant.term, Ordering::AcqRel);
+    let fresh = Arc::new(DelegEntry {
+        endpoint: Arc::from(endpoint),
+        class: grant.class,
+        dir: grant.dir,
+        seq: grant.seq,
+        term: grant.term,
+        stamp: grant.stamp,
+        state: AtomicU8::new(DELEG_LIVE),
+        inflight: AtomicU64::new(0),
+        used: std::sync::atomic::AtomicBool::new(true),
+        drain: squeezefs_ipc::sqz_notify::Notify::new(),
+    });
+    match DELEG_CACHE.entry_sync(grant.ino) {
+        scc::hash_map::Entry::Occupied(mut o) => {
+            let cur = o.get();
+            if grant.term > cur.term || (grant.term == cur.term && grant.seq > cur.seq) {
+                *o.get_mut() = fresh;
+                DELEG_INSTALLS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        scc::hash_map::Entry::Vacant(v) => {
+            v.insert_entry(fresh);
+            DELEG_INSTALLS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The channel registry entry for `endpoint` (created on first use —
+/// healthy from spawn so the grant-to-first-round window can serve; a
+/// failed connect marks it down immediately).
+pub(crate) fn deleg_channel(endpoint: &str) -> Arc<DelegChannel> {
+    if let Some(ch) = DELEG_CHANNELS.read_sync(endpoint, |_, v| Arc::clone(v)) {
+        return ch;
+    }
+    let fresh = Arc::new(DelegChannel {
+        healthy: std::sync::atomic::AtomicBool::new(true),
+        last_ok_ms: AtomicU64::new(now_ms()),
+        park_ms: AtomicU64::new(DELEG_PARK_DEFAULT_MS),
+        term: AtomicU64::new(0),
+    });
+    match DELEG_CHANNELS.insert_sync(endpoint.to_string(), Arc::clone(&fresh)) {
+        Ok(()) => fresh,
+        Err(_) => DELEG_CHANNELS
+            .read_sync(endpoint, |_, v| Arc::clone(v))
+            .unwrap_or(fresh),
+    }
+}
+
+/// A recall-channel round completed: refresh the freshness clock, adopt
+/// the owner's published park bound and era.
+pub(crate) fn deleg_channel_mark_ok(endpoint: &str, park_ms: u64, term: u64) {
+    let ch = deleg_channel(endpoint);
+    ch.park_ms.store(park_ms.max(1), Ordering::Relaxed);
+    ch.term.fetch_max(term, Ordering::AcqRel);
+    ch.last_ok_ms.store(now_ms(), Ordering::Release);
+    ch.healthy.store(true, Ordering::Release);
+    DELEG_CHANNEL_ROUNDS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The channel failed (connect refused, call error, fence): serves stop
+/// NOW — fail-closed.
+pub(crate) fn deleg_channel_mark_down(endpoint: &str) {
+    if let Some(ch) = DELEG_CHANNELS.read_sync(endpoint, |_, v| Arc::clone(v)) {
+        ch.healthy.store(false, Ordering::Release);
+    }
+}
+
+/// Is the recall channel fresh enough to serve under? Healthy AND the
+/// last completed round is within two park rounds + slack — a recall
+/// issued while we can serve is deliverable within the window, and the
+/// pathological remainder is bounded by the S6 eviction/T_self arithmetic
+/// (the S9 custody plane's documented posture).
+pub(crate) fn deleg_channel_fresh(endpoint: &str) -> bool {
+    let Some(ch) = DELEG_CHANNELS.read_sync(endpoint, |_, v| Arc::clone(v)) else {
+        return false;
+    };
+    if !ch.healthy.load(Ordering::Acquire) {
+        return false;
+    }
+    let age = now_ms().saturating_sub(ch.last_ok_ms.load(Ordering::Acquire));
+    age <= ch.park_ms.load(Ordering::Relaxed).saturating_mul(2) + DELEG_FRESH_SLACK_MS
+}
+
+/// An in-flight delegated serve: RAII over the entry's inflight count —
+/// what the recall drain waits on, and what makes a serve-after-ack a
+/// counted tripwire instead of a silent possibility.
+pub struct DelegServeGuard {
+    entry: Arc<DelegEntry>,
+}
+
+impl DelegServeGuard {
+    /// Does the holder's local view match the grant's stamp?
+    pub fn stamp_matches(&self, inode: &crate::meta_backend::Inode) -> bool {
+        self.entry.stamp.ctime == inode.ctime
+            && self.entry.stamp.mtime == inode.mtime
+            && self.entry.stamp.size == inode.size
+    }
+
+    /// Is the delegated object a directory (dentry reads servable)?
+    pub fn dir(&self) -> bool {
+        self.entry.dir
+    }
+
+    /// Count one delegated serve on the hits ledger.
+    pub fn note_hit(&self) {
+        DELEG_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl Drop for DelegServeGuard {
+    fn drop(&mut self) {
+        self.entry.inflight.fetch_sub(1, Ordering::AcqRel);
+        if self.entry.state.load(Ordering::Acquire) == DELEG_ACKED {
+            // Structurally unreachable (the ack waits for the drain); if
+            // it ever fires it is the coherence bug the design's
+            // must-stay-0 tripwire exists to make LOUD.
+            DELEG_STALE_SERVES.fetch_add(1, Ordering::Relaxed);
+            crate::note_invariant_tripwire(
+                "meta_ship::deleg_stale_serve",
+                "a delegated serve completed AFTER its recall was acked — the drain-before-ack \
+                 law broke (dlm_delegation_stale_serves)",
+            );
+        }
+        self.entry.drain.notify_waiters();
+    }
+}
+
+/// Begin a delegated serve of `ino` against the owner at `endpoint`:
+/// `None` unless the lever is on, the entry is LIVE and era-current, its
+/// class covers LOOKUP, and the recall channel is fresh. The stamp gate is
+/// the CALLER's (it owns the local view read).
+pub fn deleg_serve_begin(ino: u64, endpoint: &str) -> Option<DelegServeGuard> {
+    if !delegation_enabled() {
+        return None;
+    }
+    let entry = DELEG_CACHE.read_sync(&ino, |_, e| Arc::clone(e))?;
+    if entry.state.load(Ordering::Acquire) != DELEG_LIVE
+        || entry.class & super::wire::DELEG_CLASS_LOOKUP == 0
+        || entry.endpoint.as_ref() != endpoint
+    {
+        return None;
+    }
+    if !deleg_channel_fresh(endpoint)
+        || entry.term != deleg_channel(endpoint).term.load(Ordering::Acquire)
+    {
+        return None;
+    }
+    entry.used.store(true, Ordering::Relaxed);
+    entry.inflight.fetch_add(1, Ordering::AcqRel);
+    // Re-check the state AFTER registering: a recall that revoked between
+    // the check and the register would otherwise miss this serve in its
+    // drain.
+    if entry.state.load(Ordering::Acquire) != DELEG_LIVE {
+        entry.inflight.fetch_sub(1, Ordering::AcqRel);
+        entry.drain.notify_waiters();
+        return None;
+    }
+    Some(DelegServeGuard { entry })
+}
+
+/// Why a set of delegations is being revoked (the counter it lands on).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RevokeKind {
+    /// A recall frame from the owner's recall channel.
+    Recall,
+    /// A revocation riding the holder's own mutation reply (the
+    /// self-conflict surrender's client half).
+    Reply,
+}
+
+/// Revoke the named delegations: tombstone at the fence, stop new serves,
+/// WAIT for in-flight serves to drain (the never-serve-after-ack law:
+/// the caller queues the ack only after this returns), drop the entries,
+/// and push the kernel invalidation for each (the TTL-stretch bound).
+pub(crate) async fn revoke_delegations(
+    endpoint: &str,
+    inos: &[u64],
+    fence_term: u64,
+    fence_seq: u64,
+    kind: RevokeKind,
+) {
+    let t0 = Instant::now();
+    for &ino in inos {
+        // The fence floor: max-merge (a later recall never lowers it).
+        match DELEG_TOMBSTONES.entry_sync(ino) {
+            scc::hash_map::Entry::Occupied(mut o) => {
+                let v = o.get_mut();
+                if (fence_term, fence_seq) > *v {
+                    *v = (fence_term, fence_seq);
+                }
+            }
+            scc::hash_map::Entry::Vacant(v) => {
+                v.insert_entry((fence_term, fence_seq));
+            }
+        }
+        let Some(entry) = DELEG_CACHE.read_sync(&ino, |_, e| Arc::clone(e)) else {
+            continue;
+        };
+        if entry.endpoint.as_ref() != endpoint {
+            continue;
+        }
+        entry.state.store(DELEG_REVOKED, Ordering::Release);
+        match kind {
+            RevokeKind::Recall => DELEG_RECALLS.fetch_add(1, Ordering::Relaxed),
+            RevokeKind::Reply => DELEG_REPLY_REVOKES.fetch_add(1, Ordering::Relaxed),
+        };
+        // Drain: no new serve begins (the state gate), and every
+        // completing serve notifies.
+        loop {
+            let notified = entry.drain.notified();
+            if entry.inflight.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            notified.await;
+        }
+        entry.state.store(DELEG_ACKED, Ordering::Release);
+        let _ = DELEG_CACHE.remove_sync(&ino);
+        fire_inval_sink(ino);
+    }
+    super::deleg_phase_record(super::DelegPhase::HolderDrain, t0);
+}
+
+/// The channel died (transport error, listener restart): every entry from
+/// that owner stops serving NOW and is dropped; the returned inos are the
+/// re-assertion set the channel presents on reconnect (KD-MW-5's NFSv4
+/// law). In-flight serves complete — they began inside the freshness
+/// window — and their guards' drop sees `REVOKED`, never `ACKED` (there
+/// is no ack to order against).
+pub(crate) fn suspend_owner_delegations(endpoint: &str) -> Vec<u64> {
+    let mut suspended = Vec::new();
+    DELEG_CACHE.retain_sync(|ino, e| {
+        if e.endpoint.as_ref() == endpoint {
+            e.state.store(DELEG_REVOKED, Ordering::Release);
+            suspended.push(*ino);
+            false
+        } else {
+            true
+        }
+    });
+    if !suspended.is_empty() {
+        DELEG_CHANNEL_SUSPENDS.fetch_add(1, Ordering::Relaxed);
+        for &ino in &suspended {
+            fire_inval_sink(ino);
+        }
+    }
+    deleg_channel_mark_down(endpoint);
+    suspended
+}
+
+/// Drop the named delegations WITHOUT counting them as recalls or reply
+/// revokes: the re-assertion answer's "gone" arm (the successor did not
+/// re-admit them — NFSv4's un-reasserted-is-gone law). Serves stop
+/// immediately; in-flight ones complete under the suspension semantics
+/// (no ack to order against).
+pub(crate) fn drop_delegations(endpoint: &str, inos: &[u64]) {
+    for &ino in inos {
+        let Some(entry) = DELEG_CACHE.read_sync(&ino, |_, e| Arc::clone(e)) else {
+            continue;
+        };
+        if entry.endpoint.as_ref() != endpoint {
+            continue;
+        }
+        entry.state.store(DELEG_REVOKED, Ordering::Release);
+        let _ = DELEG_CACHE.remove_sync(&ino);
+        fire_inval_sink(ino);
+    }
+}
+
+/// The live entries held against `endpoint` — the re-assertion set's
+/// still-held half.
+pub(crate) fn held_delegation_inos(endpoint: &str) -> Vec<u64> {
+    let mut inos = Vec::new();
+    DELEG_CACHE.retain_sync(|ino, e| {
+        if e.endpoint.as_ref() == endpoint && e.state.load(Ordering::Acquire) == DELEG_LIVE {
+            inos.push(*ino);
+        }
+        true
+    });
+    inos
+}
+
+/// Absorb a re-assertion reply: entries NOT re-admitted are gone (the
+/// NFSv4 law), re-admitted ones re-install with the successor's fresh
+/// stamps and era. The tombstone floors from the PREDECESSOR's era are
+/// cleared for re-admitted objects — the successor's sequence space is its
+/// own.
+pub(crate) fn absorb_reassert_reply(endpoint: &str, reply: &super::wire::DelegReassertReply) {
+    for g in &reply.grants {
+        let _ = DELEG_TOMBSTONES.remove_sync(&g.ino);
+        install_delegation(endpoint, g);
+    }
+    // The round itself is channel evidence: adopt the successor's era and
+    // refresh the freshness clock (park stays whatever the channel knew —
+    // the next poll reply republishes the owner's derivation).
+    let ch = deleg_channel(endpoint);
+    let park = ch.park_ms.load(Ordering::Relaxed);
+    deleg_channel_mark_ok(endpoint, park, reply.owner_term);
+    note_deleg_reassert_round();
+}
+
+/// The kernel-TTL stretch (design §8.2: "kernel TTLs under a delegation
+/// stretch"): the remaining serve-validity horizon of a live, era-current,
+/// channel-fresh delegation — the recall (which pushes the invalidation
+/// sink) is what bounds the stretched staleness. `None` = no stretch (the
+/// per-class default governs). ATTR face only in this rung; the entry
+/// face needs per-name tracking and belongs to rung 13's per-directory
+/// machinery (stated in the rung-12 evidence note).
+pub fn deleg_kernel_ttl_stretch(ino: u64) -> Option<Duration> {
+    if !delegation_enabled() {
+        return None;
+    }
+    let entry = DELEG_CACHE.read_sync(&ino, |_, e| Arc::clone(e))?;
+    if entry.state.load(Ordering::Acquire) != DELEG_LIVE {
+        return None;
+    }
+    let ch = DELEG_CHANNELS.read_sync(entry.endpoint.as_ref(), |_, v| Arc::clone(v))?;
+    if !ch.healthy.load(Ordering::Acquire) || entry.term != ch.term.load(Ordering::Acquire) {
+        return None;
+    }
+    let window = ch.park_ms.load(Ordering::Relaxed).saturating_mul(2) + DELEG_FRESH_SLACK_MS;
+    let age = now_ms().saturating_sub(ch.last_ok_ms.load(Ordering::Acquire));
+    let remaining = window.saturating_sub(age);
+    if remaining == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(remaining))
+    }
+}
+
+/// **Test seam**: drop every delegation, tombstone and channel record so a
+/// suite can exercise the cold arms deliberately. Production never calls
+/// it.
+pub fn test_clear_delegations() {
+    DELEG_CACHE.retain_sync(|_, _| false);
+    DELEG_TOMBSTONES.retain_sync(|_, _| false);
+    DELEG_CHANNELS.retain_sync(|_, _| false);
+}
+
+/// The `dlm_delegation` family snapshot (design §13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DelegationStats {
+    /// Owner face: grants issued onto replies.
+    pub grants: u64,
+    /// Owner face: grants declined (in-flight mutation, vanished object).
+    pub declines: u64,
+    /// Client face: grants installed into the cache.
+    pub installs: u64,
+    /// Client face: delegated local serves (one per verb).
+    pub hits: u64,
+    /// Client face: delegations dropped by wire recalls.
+    pub recalls: u64,
+    /// Client face: re-assertion rounds completed.
+    pub reasserts: u64,
+    /// Client face: delegations dropped by reply-ridden revocations (the
+    /// self-conflict surrender's client half).
+    pub reply_revokes: u64,
+    /// **Must stay 0**: a serve completed after its recall was acked.
+    pub stale_serves: u64,
+    /// Owner face, LOUD: delegation recalls declared dead at the deadline
+    /// (each escalates toward membership eviction).
+    pub recall_timeouts: u64,
+    /// Owner face: timed-out holders actually evicted from an armed
+    /// membership plane (≤ recall_timeouts; the plane may be off).
+    pub evictions: u64,
+    /// Client face: in-flight grants dropped at the reordering fence.
+    pub tombstone_drops: u64,
+    /// Client face: channel failures that suspended an owner's entries.
+    pub channel_suspends: u64,
+    /// Client face: completed recall-channel rounds.
+    pub channel_rounds: u64,
+    /// GAUGE: cached delegations.
+    pub entries: u64,
+    /// GAUGE: their byte charge (the R5 component's reading).
+    pub bytes: u64,
+}
+
+/// Read the family.
+pub fn delegation_stats() -> DelegationStats {
+    let entries = DELEG_CACHE.len() as u64;
+    DelegationStats {
+        grants: DELEG_GRANTS_ISSUED.load(Ordering::Relaxed),
+        declines: DELEG_DECLINES.load(Ordering::Relaxed),
+        installs: DELEG_INSTALLS.load(Ordering::Relaxed),
+        hits: DELEG_HITS.load(Ordering::Relaxed),
+        recalls: DELEG_RECALLS.load(Ordering::Relaxed),
+        reasserts: DELEG_REASSERTS.load(Ordering::Relaxed),
+        reply_revokes: DELEG_REPLY_REVOKES.load(Ordering::Relaxed),
+        stale_serves: DELEG_STALE_SERVES.load(Ordering::Relaxed),
+        recall_timeouts: DELEG_RECALL_TIMEOUTS.load(Ordering::Relaxed),
+        evictions: DELEG_EVICTIONS.load(Ordering::Relaxed),
+        tombstone_drops: DELEG_TOMBSTONE_DROPS.load(Ordering::Relaxed),
+        channel_suspends: DELEG_CHANNEL_SUSPENDS.load(Ordering::Relaxed),
+        channel_rounds: DELEG_CHANNEL_ROUNDS.load(Ordering::Relaxed),
+        entries,
+        bytes: entries * DELEG_ENTRY_BYTES,
+    }
+}
+
+/// The `dlm_delegation` stats-inode object (design §13's spellings; the
+/// extra engagement gauges are additive).
+pub fn delegation_stats_json() -> serde_json::Value {
+    let s = delegation_stats();
+    serde_json::json!({
+        "dlm_delegation_grants": s.grants,
+        "dlm_delegation_declines": s.declines,
+        "dlm_delegation_installs": s.installs,
+        "dlm_delegation_hits": s.hits,
+        "dlm_delegation_recalls": s.recalls,
+        "dlm_delegation_reasserts": s.reasserts,
+        "dlm_delegation_reply_revokes": s.reply_revokes,
+        "dlm_delegation_stale_serves": s.stale_serves,
+        "dlm_delegation_recall_timeouts": s.recall_timeouts,
+        "dlm_delegation_evictions": s.evictions,
+        "dlm_delegation_tombstone_drops": s.tombstone_drops,
+        "dlm_delegation_channel_suspends": s.channel_suspends,
+        "dlm_delegation_channel_rounds": s.channel_rounds,
+        "dlm_delegation_entries": s.entries,
+        "dlm_delegation_bytes": s.bytes,
+    })
 }

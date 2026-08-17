@@ -118,13 +118,15 @@ pub use owners::{
     ownership_armed, owns_volume, OwnerMap, PeerOwner,
 };
 pub use router::{MetaShipRouter, VerbRoute, TEST_SHIP_DRAIN_HOLD_MS};
-pub use service::{owner_authority_token, MetaShipService, ServiceStats};
+pub use service::{owner_authority_token, MetaShipService, ServiceStats, TEST_DELEG_COHERENCE_LAW};
 pub use tokens::{
-    cache_cap, foreign_fencing_token, global_recall_lane, recall_batch_max_from,
-    recall_cooldown_from, recall_deadline_from, recall_rate_cap_per_s, recall_stats_json,
-    record_grant, revoke_phase_json, test_clear_token_cache, token_cache_stats, GrantDecision,
-    RecallConfig, RecallFrame, RecallLane, RecallLaneStats, TimedOutRecall, TokenCacheStats,
-    RECALL_THRASH_CYCLES,
+    cache_cap, deleg_kernel_ttl_stretch, delegation_enabled, delegation_stats,
+    delegation_stats_json, foreign_fencing_token, global_recall_lane, install_delegation,
+    recall_batch_max_from, recall_cooldown_from, recall_deadline_from, recall_rate_cap_per_s,
+    recall_stats_json, record_grant, revoke_phase_json, set_deleg_inval_sink,
+    test_clear_delegations, test_clear_token_cache, token_cache_stats, DelegationStats,
+    GrantDecision, RecallConfig, RecallFrame, RecallLane, RecallLaneStats, TimedOutRecall,
+    TokenCacheStats, DELEGATION_ENV, RECALL_THRASH_CYCLES, TEST_DELEGATION_OVERRIDE,
 };
 pub use wire::*;
 
@@ -194,6 +196,127 @@ pub fn daemon_verb_router(
     } else {
         None
     }
+}
+
+// ---------------------------------------------------------------------------
+// The DELEGATION HOST (rung 12 — S10's owner half on this process).
+//
+// Installed by the multi-writer arm beside the S8 owner service (and by
+// the delegation suites); the RoutedMetaBackend mutation surface consults
+// [`deleg_mutation_gate`] at verb entry — the same one-place-no-bypass
+// argument as the daemon verb router above. Solo cost: one relaxed load.
+// ---------------------------------------------------------------------------
+
+/// Is a delegation host installed (the one-relaxed-load fast path).
+static DELEG_HOST_ARMED: AtomicBool = AtomicBool::new(false);
+
+static DELEG_HOST: Lazy<arc_swap::ArcSwapOption<service::MetaShipService>> =
+    Lazy::new(arc_swap::ArcSwapOption::const_empty);
+
+/// Install the process-global delegation host (the multi-writer arm's
+/// act, beside `install_daemon_verb_router`).
+pub fn install_delegation_host(svc: Arc<service::MetaShipService>) {
+    DELEG_HOST.store(Some(svc));
+    DELEG_HOST_ARMED.store(true, Ordering::Release);
+}
+
+/// Remove it (disarm/teardown; a stale install is inert — the armed load
+/// gates first).
+pub fn uninstall_delegation_host() {
+    DELEG_HOST_ARMED.store(false, Ordering::Release);
+    DELEG_HOST.store(None);
+}
+
+/// Held across a gated mutation's execution: while alive, delegation
+/// grants on the named objects DECLINE (the grant-vs-mutation
+/// check-then-act race's structural half — see `service.rs`).
+pub struct DelegGatePermit {
+    svc: Arc<service::MetaShipService>,
+    inos: Vec<u64>,
+}
+
+impl Drop for DelegGatePermit {
+    fn drop(&mut self) {
+        self.svc.deleg_mutation_end(&self.inos);
+    }
+}
+
+/// **The coherence law's entry point** (design §8.2: recall-before-
+/// conflicting-publish, enforced OWNER-side): called by the
+/// `RoutedMetaBackend` mutation surface — trait verbs AND the layout
+/// publish funnels — BEFORE any 4a acquisition, with the objects the
+/// mutation invalidates. Recalls every outstanding delegation on them
+/// through the rung-11 lane (the mutating client's own grant surrenders
+/// onto its reply instead) and returns only when every recall is acked or
+/// expired-dead. The returned permit is held across the mutation so no
+/// grant can be issued into the window.
+///
+/// Solo cost: ONE relaxed load (`DELEG_HOST_ARMED`). Armed-but-idle cost:
+/// one more atomic (the lane's outstanding gauge) — the gate pays real
+/// work only while delegations exist.
+pub async fn deleg_mutation_gate(
+    be: &crate::meta_backend::RoutedMetaBackend,
+    inos: &[u64],
+) -> Option<DelegGatePermit> {
+    if !DELEG_HOST_ARMED.load(Ordering::Relaxed) {
+        return None;
+    }
+    let host = DELEG_HOST.load_full()?;
+    if !std::ptr::eq(Arc::as_ptr(host.inner()), be as *const _) {
+        return None;
+    }
+    host.deleg_mutation_begin(inos)
+        .await
+        .map(|inos| DelegGatePermit { svc: host, inos })
+}
+
+/// Should a mutation site pay participant RESOLUTION (the unlink/rename
+/// child reads) for the gate? Only when the host is armed over `be` AND
+/// delegations are actually outstanding — so the resolution cost is zero
+/// everywhere the plane is dark.
+pub fn deleg_gate_wants_children(be: &crate::meta_backend::RoutedMetaBackend) -> bool {
+    if !DELEG_HOST_ARMED.load(Ordering::Relaxed) {
+        return false;
+    }
+    let Some(host) = DELEG_HOST.load_full() else {
+        return false;
+    };
+    std::ptr::eq(Arc::as_ptr(host.inner()), be as *const _)
+        && tokens::global_recall_lane().outstanding_now() > 0
+}
+
+/// Phases of one delegation revocation (`dlm_delegation_recall_phase_ns` —
+/// design §13; composes with the rung-11 lane's `dlm_revoke_phase_ns`:
+/// the lane times issue/ack_wait, this table times the two halves the
+/// DELEGATION adds around it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum DelegPhase {
+    /// Owner side: the mutation gate's recall-issued → all-clear wait.
+    GateWait = 0,
+    /// Holder side: recall received → entries drained and dropped.
+    HolderDrain = 1,
+}
+
+const DELEG_PHASES: usize = 2;
+const DELEG_PHASE_NAMES: [&str; DELEG_PHASES] = ["gate_wait", "holder_drain"];
+
+static DELEG_PROF: Lazy<[LatencyHistogram; DELEG_PHASES]> =
+    Lazy::new(|| std::array::from_fn(|_| LatencyHistogram::default()));
+
+/// Record a delegation phase span started at `t0`.
+#[inline]
+pub(crate) fn deleg_phase_record(phase: DelegPhase, t0: std::time::Instant) {
+    DELEG_PROF[phase as usize].record(t0.elapsed());
+}
+
+/// `dlm_delegation_recall_phase_ns` — the delegation-scoped decomposition.
+pub fn delegation_recall_phase_json() -> serde_json::Value {
+    let mut phases = serde_json::Map::new();
+    for (i, name) in DELEG_PHASE_NAMES.iter().enumerate() {
+        phases.insert((*name).to_string(), DELEG_PROF[i].to_json());
+    }
+    serde_json::Value::Object(phases)
 }
 
 // ---------------------------------------------------------------------------

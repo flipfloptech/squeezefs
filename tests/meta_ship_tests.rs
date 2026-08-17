@@ -83,10 +83,19 @@ struct ArmGuard;
 impl Drop for ArmGuard {
     fn drop(&mut self) {
         ship::disarm_ownership();
+        ship::TEST_DELEGATION_OVERRIDE.store(0, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
 fn arm(map: Arc<OwnerMap>) -> ArmGuard {
+    // This suite tests the S8 SHIPPING mechanics against deliberately
+    // FOREIGN sandboxes (the client's local backend is a different
+    // filesystem — the fencing-read contract's venue). Rung 12's
+    // delegations assume the production co-writer shape (the client's
+    // inner is a reader view of the SAME set), so the lever is pinned
+    // OFF here: delegated-serve behavior has its own suite
+    // (tests/mw_delegation_tests.rs) with the same-set fixture.
+    ship::TEST_DELEGATION_OVERRIDE.store(2, std::sync::atomic::Ordering::SeqCst);
     ship::arm_ownership(map);
     ArmGuard
 }
@@ -207,7 +216,11 @@ fn the_wire_vocabulary_covers_every_shipped_trait_member() {
     // fact, so it is asserted in a const block — the compiler is the gate).
     const _: () = assert!(ship::VERB_META_BATCH != cw::VERB_PING);
     const _: () = assert!(ship::VERB_RECLAIM != cw::VERB_PING);
-    assert_eq!(ship::META_SHIP_SCHEMA, 1, "the vocabulary's schema");
+    assert_eq!(
+        ship::META_SHIP_SCHEMA,
+        2,
+        "the vocabulary's schema (2 since rung 12's delegation verbs — design §11 'schema +1')"
+    );
 
     // The dedup window and the grace gate both key on this classification.
     for (verb, mutating) in [
@@ -311,6 +324,7 @@ fn frames_round_trip_and_untrusted_bytes_refuse_loud() {
     let frame = ship::MetaRequestFrame {
         schema: ship::META_SHIP_SCHEMA,
         client_epoch: 0xdead_beef,
+        client_id: "node_cafe.m0001".into(),
         owner_term: 3,
         ops,
     };
@@ -344,6 +358,20 @@ fn frames_round_trip_and_untrusted_bytes_refuse_loud() {
                     token: 7,
                     term: 4,
                 }),
+                delegs: vec![ship::DelegGrant {
+                    ino: 42,
+                    class: ship::DELEG_CLASS_LOOKUP,
+                    dir: false,
+                    seq: 9,
+                    term: 4,
+                    stamp: ship::DelegStamp {
+                        ctime: 1,
+                        mtime: 2,
+                        size: 3,
+                    },
+                }],
+                revokes: vec![7],
+                revoke_fence: 9,
             },
             ship::MetaOpResult {
                 id: 2,
@@ -352,6 +380,9 @@ fn frames_round_trip_and_untrusted_bytes_refuse_loud() {
                     msg: "no such thing".into(),
                 }),
                 grant: None,
+                delegs: Vec::new(),
+                revokes: Vec::new(),
+                revoke_fence: 0,
             },
         ],
     };

@@ -3299,9 +3299,15 @@ PYS11
     exp0="$(stat_field 0 dlm_custody.dlm_revokes_expired)"
     ttl="$(stat_field 0 membership_lease_ttl_ms)"
     deadline=$((ttl / 1000 + 90))
-    # Long rewrites of the same halves; the kill lands mid-stream.
-    (exec dd if=/dev/zero of="$(mnt_of "$m1")/s11-range.dat" bs=4M seek=0 \
-        count=$((half_mb / 4)) conv=fsync,notrunc status=none) 2>"$rowdir/k-m$m1.err" &
+    # The victim rewrites its half in an endless loop (a 64MiB half
+    # finishes in well under a second on this venue — a single pass would
+    # complete before the kill lands); the survivor's single re-write is
+    # the acked-durability side.
+    (
+        exec bash -c 'while :; do
+            dd if=/dev/zero of="$1" bs=4M seek=0 count="$2" conv=fsync,notrunc status=none || exit
+        done' _ "$(mnt_of "$m1")/s11-range.dat" "$((half_mb / 4))"
+    ) 2>"$rowdir/k-m$m1.err" &
     local dd1=$!
     (
         rc=0
@@ -3315,6 +3321,7 @@ PYS11
     "$MWFLEET" kill "$m1" --sig 9
     log "victim m$m1 killed -9 MID-REWRITE (its dd dies with the mount — expected; the survivor must not notice)"
     umount -l "$(mnt_of "$m1")" 2>/dev/null || true
+    pkill -9 -P "$dd1" 2>/dev/null || true
     kill -9 "$dd1" 2>/dev/null || true
     wait "$dd1" 2>/dev/null || true
     # The survivor's stream completes green.

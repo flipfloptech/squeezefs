@@ -1201,7 +1201,13 @@ async fn adversarial_tiny_adjacent_asks_coalesce_to_one_span() {
     let geometry = Some((64 * BLK, BLK));
 
     let first = d
-        .acquire_lock_range(&path, (0, 4096), (0, 4096), Duration::from_secs(3), geometry)
+        .acquire_lock_range(
+            &path,
+            (0, 4096),
+            (0, 4096),
+            Duration::from_secs(3),
+            geometry,
+        )
         .await
         .expect("first tiny ask");
     let (lease, mut span, token) = match first {
@@ -1309,7 +1315,8 @@ async fn at_budget_new_span_refuses_loud_naming_the_arithmetic() {
             }
         }
     }
-    let msg = refusal.expect("the at-budget new-span admit must REFUSE — it granted past the share");
+    let msg =
+        refusal.expect("the at-budget new-span admit must REFUSE — it granted past the share");
     assert!(
         held.len() <= 2,
         "at most 2 records fit the clamped share, {} were granted",
@@ -1436,7 +1443,11 @@ async fn block_cyclic_shape_grants_one_span_per_block_with_zero_refusals() {
         stats.cap_refusals, refusals_before,
         "ZERO cap refusals below budget on the block-cyclic shape (Issue-19)"
     );
-    assert_eq!(stats.grants - grants_before, BLOCKS, "grants delta accounts");
+    assert_eq!(
+        stats.grants - grants_before,
+        BLOCKS,
+        "grants delta accounts"
+    );
     let span_bytes = BLOCKS * squeezefs::dlm::RANGE_GRANT_RECORD_BYTES;
     assert!(
         squeezefs::dlm::grant_table_bytes() >= bytes_before + span_bytes,
@@ -1657,9 +1668,7 @@ async fn wire_block_cyclic_shape_grants_every_block_with_zero_refusals() {
                 assert_eq!(span, req);
                 leases.push(lease);
             }
-            other => panic!(
-                "alternating blocks are never same-holder-adjacent — got {other:?}"
-            ),
+            other => panic!("alternating blocks are never same-holder-adjacent — got {other:?}"),
         }
     }
     assert_eq!(owner.held(), held0 + BLOCKS as usize);
@@ -1761,7 +1770,12 @@ async fn pull_revocation_retires_range_grants_and_composes_with_t_self() {
         .await
         .expect("range 1");
     let r2 = client
-        .acquire_range(ino, (2 * BLK, 3 * BLK), (2 * BLK, 3 * BLK), Duration::from_secs(3))
+        .acquire_range(
+            ino,
+            (2 * BLK, 3 * BLK),
+            (2 * BLK, 3 * BLK),
+            Duration::from_secs(3),
+        )
         .await
         .expect("range 2");
     let (l1, l2) = match (r1, r2) {
@@ -1778,7 +1792,11 @@ async fn pull_revocation_retires_range_grants_and_composes_with_t_self() {
 
     let gen_before = squeezefs::data_custody::custody_generation();
     let dead = owner.revoke_client(client.id(), "operator revoke (contract 13)");
-    assert_eq!(dead.len(), 1, "one dead custody cohort for the whole client");
+    assert_eq!(
+        dead.len(),
+        1,
+        "one dead custody cohort for the whole client"
+    );
 
     // The pull channel: the next renewal answers "not custody".
     client
@@ -1962,7 +1980,13 @@ async fn own_grant_partial_overlap_extends_and_covered_reask_serves() {
     let crossing = (BLK - 300 * 1024, BLK + 400 * 1024);
     let desired = squeezefs::dlm::block_align_out(crossing, BLK);
     match d
-        .acquire_lock_range(&path, crossing, desired, Duration::from_millis(800), geometry)
+        .acquire_lock_range(
+            &path,
+            crossing,
+            desired,
+            Duration::from_millis(800),
+            geometry,
+        )
         .await
         .expect("a frontier-crossing chunk must not starve on the holder's OWN grant")
     {

@@ -11976,10 +11976,8 @@ impl SqueezefsFilesystem {
             desired.0 = desired.0.min(hull.0);
             desired.1 = desired.1.max(hull.1);
             let held_len = desired.1 - desired.0;
-            desired = crate::dlm::block_align_out(
-                (desired.0, desired.1.saturating_add(held_len)),
-                block,
-            );
+            desired =
+                crate::dlm::block_align_out((desired.0, desired.1.saturating_add(held_len)), block);
         }
         let file_path = crate::keys::inode_path(ino);
         let start_dlm = std::time::Instant::now();

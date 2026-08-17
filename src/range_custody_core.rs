@@ -340,7 +340,12 @@ impl FileCustody {
     ///    left neighbor wins when both abut, the right one having already
     ///    clipped the window so nothing is absorbed);
     /// 5. else ⇒ [`RangePlan::New`] over the window.
-    pub fn plan_range(&self, required: (u64, u64), desired: (u64, u64), scope: u64) -> RangeDecision {
+    pub fn plan_range(
+        &self,
+        required: (u64, u64),
+        desired: (u64, u64),
+        scope: u64,
+    ) -> RangeDecision {
         debug_assert!(required.0 < required.1);
         debug_assert!(desired.0 <= required.0 && desired.1 >= required.1);
         let mode = LockMode::Exclusive;
@@ -581,11 +586,7 @@ impl FileCustody {
 /// release drop the entry and a reader fall back to a floor below the
 /// grant: a generation regression, the stale-reject arm's death.
 #[inline]
-pub fn publish_floor_then_admit<R>(
-    floor: &AtomicU64,
-    token: u64,
-    admit: impl FnOnce() -> R,
-) -> R {
+pub fn publish_floor_then_admit<R>(floor: &AtomicU64, token: u64, admit: impl FnOnce() -> R) -> R {
     floor.fetch_max(token, Ordering::AcqRel);
     admit()
 }

@@ -441,14 +441,13 @@ pub fn range_table_budget_bytes() -> u64 {
 pub fn ensure_grant_table_r5() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        crate::mem_budget::MEM_BUDGET
-            .register(crate::mem_budget::Component::new(
-                "dlm_grant_table_bytes",
-                0,
-                0, // weight 0: never shed — admission refuses instead (§9.2)
-                Arc::new(grant_table_bytes),
-                Arc::new(|_| {}),
-            ));
+        crate::mem_budget::MEM_BUDGET.register(crate::mem_budget::Component::new(
+            "dlm_grant_table_bytes",
+            0,
+            0, // weight 0: never shed — admission refuses instead (§9.2)
+            Arc::new(grant_table_bytes),
+            Arc::new(|_| {}),
+        ));
     });
 }
 

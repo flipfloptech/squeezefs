@@ -605,10 +605,7 @@ pub trait RangeGeometry: Send + Sync + std::fmt::Debug {
     /// The file's `(size, block_size)`, or `None` when the ino cannot be
     /// resolved (the cap arm then stands down for this ask; the byte
     /// budget still governs).
-    fn geometry(
-        &self,
-        ino: u64,
-    ) -> Pin<Box<dyn Future<Output = Option<(u64, u64)>> + Send + '_>>;
+    fn geometry(&self, ino: u64) -> Pin<Box<dyn Future<Output = Option<(u64, u64)>> + Send + '_>>;
 }
 
 /// A fixed-shape [`RangeGeometry`]: every ino reads as one `size`-byte
@@ -2586,10 +2583,7 @@ impl WriteCustodyClient {
                  custody wider than was arbitrated"
             )));
         };
-        if let Some(handle) = self
-            .grants
-            .read_sync(&grant.grant_id, |_, g| Arc::clone(g))
-        {
+        if let Some(handle) = self.grants.read_sync(&grant.grant_id, |_, g| Arc::clone(g)) {
             // The EXTENSION face: the authority widened a grant this
             // client already holds. Widen the adopted record (same token,
             // same release identity) and the cached span; the existing

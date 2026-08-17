@@ -118,11 +118,10 @@ async fn make(uuid: [u8; 16], alloc_ns: &str) -> H {
 /// Create a file the way the kernel's `truncate(2)`-by-path leaves it:
 /// created, then CLOSED (no live handle — the fd-less shape).
 async fn create_closed(h: &H, name: &str) -> u64 {
-    let created = h
-        .fs
-        .create(h.req, 1, OsStr::new(name), libc::S_IFREG | 0o644, 0)
-        .await
-        .unwrap();
+    let created =
+        h.fs.create(h.req, 1, OsStr::new(name), libc::S_IFREG | 0o644, 0)
+            .await
+            .unwrap();
     let ino = created.attr.ino;
     h.fs.release(h.req, ino, created.fh, 0, 0, false)
         .await

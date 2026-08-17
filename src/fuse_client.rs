@@ -6206,6 +6206,18 @@ pub struct Metrics {
     /// park — hazard-1 territory; the accumulation path's same-epoch
     /// re-rewrite serves the shape). OQ-3's demand instrument.
     pub overlay_ineligible_shadow_bound: Align64<AtomicU64>,
+    /// §5.1 **range clause** (DLM S11 rung 16 — KD-MW-12,
+    /// design-full-multi-writer §9.3 item 3): the overlay arm declined
+    /// because the block's bytes are under BYTE-RANGE custody this
+    /// writer does not solely own — the W1 clause-7 twin
+    /// (`patch_ineligible_range_shared`), kept in its OWN bucket (the
+    /// ledgers must not merge). BOTH shapes are screened (the overlay's
+    /// publish covers every byte of the block, fresh gap-seeds
+    /// included). **0 on every shipped mount** (a whole-file lease IS
+    /// whole-inode custody; no verb issues range grants without the mw
+    /// arm): growth means range custody engaged on shared blocks or the
+    /// predicate rotted.
+    pub overlay_ineligible_range_shared: Align64<AtomicU64>,
     /// §5.1 / KD-B4-8: a `StorageFull` dest mint declined the overwrite
     /// arm to accumulation (whose epoch KD-1.7 early-close ladder
     /// recycles the parked displaced supply) — never a write error.
@@ -9755,6 +9767,7 @@ impl SqueezefsFilesystem {
                 "overlay_overwrite_installs": METRICS.overlay_overwrite_installs.load(Ordering::Relaxed),
                 "overlay_overwrite_bytes": METRICS.overlay_overwrite_bytes.load(Ordering::Relaxed),
                 "overlay_ineligible_shadow_bound": METRICS.overlay_ineligible_shadow_bound.load(Ordering::Relaxed),
+                "overlay_ineligible_range_shared": METRICS.overlay_ineligible_range_shared.load(Ordering::Relaxed),
                 "overlay_enospc_declines": METRICS.overlay_enospc_declines.load(Ordering::Relaxed),
                 "overlay_gap_seeds": METRICS.overlay_gap_seeds.load(Ordering::Relaxed),
                 "overlay_gap_seed_bytes": METRICS.overlay_gap_seed_bytes.load(Ordering::Relaxed),
@@ -13397,7 +13410,11 @@ impl SqueezefsFilesystem {
     /// ladder (sync, lock-free — the gate runs on the transport
     /// worker): the same screen `try_device_overlay_store` re-runs
     /// under the block guard. A cache MISS is honest ineligibility for
-    /// HOLDING purposes.
+    /// HOLDING purposes. Deliberately RANGE-BLIND (S11 rung 16 —
+    /// KD-MW-12): the B4 §5.1 range clause runs only in the
+    /// authoritative screen; a stale TRUE on a range-shared block costs
+    /// one late extraction (the documented stale-verdict price), and
+    /// the transport worker stays custody-free.
     pub(crate) fn overlay_hold_eligible(&self, ino: u64, offset: u64, len: u32) -> bool {
         if !crate::device_overlay::device_overlay_enabled() {
             return false;
@@ -13541,6 +13558,31 @@ impl SqueezefsFilesystem {
                 .nvme
                 .has_staged_extent_record(&crate::keys::active_block_ext(ino, b as u64))
         {
+            return Ok(false);
+        }
+        // B4 §5.1 RANGE clause (DLM S11 rung 16 — KD-MW-12; the W1
+        // clause-7 twin, design-full-multi-writer §9.3 item 3): a block
+        // any live range grant does not solely cover is
+        // overlay-ineligible — BOTH shapes (the eventual whole-block
+        // publish covers every byte, fresh gap-seeds included), so the
+        // write rides the CoW-rewrite + shipped-publish path, the only
+        // vehicle whose custody/publish laws handle sharing (rung 17's
+        // demotion/extent machinery). ONE probe at the screen, ahead of
+        // the registry: grants are not serialized by the 3.5 meta
+        // section, so an under-lock re-check buys no atomicity — the
+        // issuance-time closure is rung 17's demotion barrier, and the
+        // bit-15 layout-version gate backstops the crash/late windows.
+        // Guards install AND join alike (a store on an Open record still
+        // feeds the whole-block publish). Structurally inert on every
+        // shipped mount: no live ranges ⇒ one O(1) empty-table probe
+        // (the KD-MW-12 fast-path tax row's proof).
+        let block_span_start = u64::from(b) * block_size as u64;
+        if crate::device_overlay::overlay_range_shared(
+            ino,
+            block_span_start,
+            block_span_start + block_size as u64,
+            fencing_token,
+        ) {
             return Ok(false);
         }
 
@@ -19545,7 +19587,9 @@ impl Filesystem for SqueezefsFilesystem {
     /// bounded, counted `fuse3_zc_write_lazy_extractions` path):
     /// refcount == 1 (§5.1 predicate 4 — needs the allocator's
     /// unstable-mark protocol, a mutation) and byte-range custody
-    /// (clause 7 — inert on shipped mounts). A stale TRUE (overlay
+    /// (W1 clause 7 AND the B4 §5.1 range clause — both inert on
+    /// shipped mounts, both owned by the authoritative screens; S11
+    /// rung 16 kept this gate range-blind). A stale TRUE (overlay
     /// parked / clone pinned / size grown between delivery and handler)
     /// extracts late exactly once; a stale FALSE only forfeits one
     /// direct-DMA candidate (the pooled patch vehicle still serves the

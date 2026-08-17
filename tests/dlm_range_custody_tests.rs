@@ -2050,7 +2050,11 @@ async fn range_clause_faces_share_the_core_and_refuse_stale_tokens() {
     let path = format!("inode_{ino}");
     let d = dlm();
     let block = (0u64, 4 * MIB);
-    let p = || METRICS.patch_ineligible_range_shared.load(Ordering::Relaxed);
+    let p = || {
+        METRICS
+            .patch_ineligible_range_shared
+            .load(Ordering::Relaxed)
+    };
     let o = || {
         METRICS
             .overlay_ineligible_range_shared

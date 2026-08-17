@@ -130,6 +130,43 @@ pub fn set_overlay_overwrite_for_tests(enabled: bool) {
     OVERWRITE.store(if enabled { 2 } else { 1 }, Ordering::Relaxed);
 }
 
+/// B4 §5.1 **range clause** — DLM S11 rung 16 (KD-MW-12;
+/// `docs/design-full-multi-writer.md` §9.3 item 3): *a block any live
+/// range grant does not solely cover is overlay-ineligible*. The
+/// [`crate::block_allocator::BlockAllocator::patch_range_shared`] twin,
+/// consulting the SAME custody core (`dlm::span_range_shared`) and
+/// counting in its OWN ledger bucket
+/// (`overlay_ineligible_range_shared` — the buckets must not merge,
+/// predicate-rot detection depends on the split).
+///
+/// Why the overlay needs whole-block custody exactly like W1: the
+/// overlay's eventual publish covers EVERY byte of the block —
+/// old-binding gap composition on the overwrite shape, zero/old gap
+/// seeding on the fresh shape — so a foreign sub-block writer's bytes
+/// would be composed away by the settle→rewrite-epoch feed. Both fast
+/// paths closed, the write rides the CoW-rewrite + shipped-publish path,
+/// the only vehicle whose custody/publish laws handle sharing (rung 17's
+/// demotion/extent machinery).
+///
+/// Callers pass the **whole block's** logical span (the W1 law verbatim:
+/// the custody the publish demands is custody of the block).
+/// `true` ⇒ ineligible (counted); `false` ⇒ the shipped shapes: no live
+/// custody, a whole-file lease (whole-inode custody — every shipped
+/// mount, so the clause is structurally inert there), or a range grant
+/// this writer solely owns covering the block. **0 on every shipped
+/// mount**: no verb issues range grants without the mw arm, so the
+/// solo/dark cost is one O(1) empty-table probe (the KD-MW-12 fast-path
+/// tax row's structural half).
+pub fn overlay_range_shared(ino: u64, block_start: u64, block_end: u64, holder_token: u64) -> bool {
+    if !crate::dlm::span_range_shared(ino, block_start, block_end, holder_token) {
+        return false;
+    }
+    crate::fuse_client::METRICS
+        .overlay_ineligible_range_shared
+        .fetch_add(1, Ordering::Relaxed);
+    true
+}
+
 /// The `SQUEEZEFS_OVERLAY_CLOSE_BARRIER` lever (OQ-5; registry entry in
 /// `src/env_knobs.rs`).
 pub fn overlay_close_barrier() -> bool {

@@ -174,6 +174,7 @@ mapped(b) ∧ striped-authority ∧ passthrough ∧ ¬write_verification
         ∧ no staged custody (active_block / active_block_ext) [existing]
         ∧ no live W2 extent overlay on the block              [existing]
         ∧ ¬rewrite_epoch_binds_block(ino, b)   — see below
+        ∧ ¬range_shared(block span)            — S11 rung 16, see below
   ⇒ install an OVERWRITE overlay record (old_binding = the mapping string)
 ```
 
@@ -200,6 +201,27 @@ Load-bearing points, each with its measured or structural reason:
   already owns that shape, and the field row (one pass per block per
   window) never hits it. Counted `overlay_ineligible_shadow_bound`; if a
   workload shows it hot, OQ-3 owns the relaxation.
+* **The RANGE clause screens BOTH shapes** (DLM S11 rung 16 — KD-MW-12;
+  `design-full-multi-writer.md` §9.3 item 3): *a block any live range
+  grant does not solely cover is overlay-ineligible*, counted
+  `overlay_ineligible_range_shared` — the W1 clause-7 twin
+  (`device_overlay::overlay_range_shared`, the same custody core
+  `dlm::span_range_shared`, its own ledger bucket). The overlay's
+  eventual publish covers EVERY byte of the block (old-binding gap
+  composition on the overwrite shape, gap seeding on the fresh shape),
+  so a foreign sub-block writer's bytes would be composed away by the
+  settle→rewrite-epoch feed; both fast paths closed, the write rides
+  the CoW-rewrite + shipped-publish path — the only vehicle whose
+  custody/publish laws handle sharing (§9.3's demotion/extent
+  machinery, PR row 17). ONE probe at the screen, ahead of the
+  registry (guards install AND join): grants are not serialized by the
+  3.5 meta section, so an under-lock re-check buys no atomicity — the
+  issuance-time closure is rung 17's demotion barrier, and the bit-15
+  layout-version gate backstops the crash/late windows. Structurally
+  inert on every shipped mount (no live ranges ⇒ one O(1) empty-table
+  probe — the KD-MW-12 fast-path tax row's proof); the hold gates stay
+  deliberately RANGE-BLIND (a stale TRUE costs one late extraction,
+  the documented stale-verdict price).
 * **`StorageFull` at the dest mint DECLINES (Ok(false)), never errors.**
   On an overwrite row the parked-A population is exactly the free supply
   the epoch's ENOSPC early-close ladder (KD-1.7) reclaims — the
@@ -876,6 +898,7 @@ family (`src/fuse_client.rs:5854+`):
 | `overlay_epoch_feeds` / `overlay_feed_fallbacks` | arm (a) vs the shadow-off degenerate; `fallbacks > 0` with the lever ON is a bug |
 | `overlay_gap_seed_old_bytes` | the §5.8 falsifier instrument (subset of `overlay_gap_seed_bytes`); ≈ 0 on sequential shapes |
 | `overlay_ineligible_shadow_bound`, `overlay_enospc_declines` | the two new decline ledgers (§5.1) |
+| `overlay_ineligible_range_shared` | the S11 rung-16 range clause (§5.1) — the W1 clause-7 twin, kept apart from `patch_ineligible_range_shared` and from `overlay_ineligible_shadow_bound` (the ledgers must not merge). **0 on every shipped mount** (whole-file leases ARE whole-inode custody; no verb issues ranges without the mw arm) and **0 on block-aligned ranged rows** (`design-full-multi-writer.md` §9.5's MPI-IO gate: nothing should share a block) — growth means range custody engaged on sub-block-shared blocks (rung 17's demotion territory) or the predicate rotted |
 | `patch_ineligible_device_overlay` | W1 clause 8 (kept apart from both the W2 `patch_ineligible_overlay` bucket and the S11 clause-7 `patch_ineligible_range_shared`) |
 | `overlay_mover_skips` | the §5.7 `MergeExpected` skip engaging — counted at BOTH layers (the mover quiesce-probe deferral and the primitive belt for guard-less callers); acked custody preserved, mover/repair re-plans or refuses — growth under mover passes is the hook working |
 | `overlay_superseded_by_merge` | the §5.7 DISCARDING-class belt engaging (`TruncateFrom`/`RemoveBlocks` reaching the primitive un-drained) — pair with `rewrite_shadow_superseded`; a FOREIGN un-marked `Merge` additionally trips `invariant_tripwires` (`overlay_foreign_merge`) — **must stay 0 on healthy mounts** now that the settle's own publish is provenance-exempted (§5.7): any growth is a real one-authority-screen escape, never publish noise |

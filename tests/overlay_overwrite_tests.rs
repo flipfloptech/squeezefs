@@ -2592,7 +2592,10 @@ async fn own_covering_custody_never_fires_the_range_clause() {
     quiesce(&h).await;
 
     // Arm 2 — the SHIPPED shape (a whole-file lease IS whole-inode
-    // custody): structurally inert, counter frozen.
+    // custody): structurally inert, counter frozen. Arm 1's fsync ran
+    // the handler, which cached a whole-file lease — drop it first (two
+    // whole-file EX grants conflict).
+    h.fs.invalidate_local_lease(ino);
     let whole =
         h.fs.router
             .dlm
@@ -2628,20 +2631,36 @@ async fn foreign_range_refuses_fresh_and_overwrite_shapes_durably() {
     let _g = serial().await;
     let _l = live_levers();
     let h = make_harness("s11r16_shapes").await;
-    // ONE mapped block; block 1 stays FRESH (unmapped) — the second
-    // write grows into it under the grant.
-    let old = pattern(FBS as usize, 0x23).to_vec();
+    // TWO mapped blocks (the striped-promotion floor of this harness);
+    // block 2 stays FRESH (unmapped) — the second write grows into it
+    // under the grant.
+    let old = pattern((2 * FBS) as usize, 0x23).to_vec();
     let ino = striped_fixture_with(&h, "f1", &old).await;
     let path = squeezefs::keys::inode_path(ino);
+    // Grow the file over block 2 SPARSE (the setattr handler owns the
+    // size publish — `write_file_staged` alone never grows i_size, and
+    // reads clamp to it), BEFORE custody changes hands.
+    h.fs.setattr(
+        h.req,
+        ino,
+        None,
+        fuse3::SetAttr {
+            size: Some(3 * FBS),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("sparse grow over block 2");
+    let size = 3 * FBS;
     h.fs.invalidate_local_lease(ino);
 
-    // ONE foreign grant straddling the block boundary: it overlaps BOTH
-    // blocks' spans without covering either.
+    // ONE foreign grant straddling the block-1/block-2 boundary: it
+    // overlaps BOTH blocks' spans without covering either.
     let foreign_client = DlmClient::new().unwrap();
     let foreign = foreign_client
         .acquire_lock(
             &path,
-            Some((FBS - PAGE, FBS + PAGE)),
+            Some((2 * FBS - PAGE, 2 * FBS + PAGE)),
             std::time::Duration::from_secs(5),
         )
         .await
@@ -2649,9 +2668,9 @@ async fn foreign_range_refuses_fresh_and_overwrite_shapes_durably() {
     let token = h.fs.router.dlm.get_fencing_token_ino(ino);
 
     let (o0, i0, t0) = (ow_range_shared(), ow_installs(), trips());
-    // The OVERWRITE shape: whole-block aligned overwrite of mapped block 0.
+    // The OVERWRITE shape: whole-block aligned overwrite of mapped block 1.
     let v0 = vec![0x93u8; FBS as usize];
-    h.fs.write_file_staged(ino, 0, bytes::Bytes::from(v0.clone()), FBS, token)
+    h.fs.write_file_staged(ino, FBS, bytes::Bytes::from(v0.clone()), size, token)
         .await
         .expect("overwrite shape under foreign range");
     assert_eq!(
@@ -2659,9 +2678,9 @@ async fn foreign_range_refuses_fresh_and_overwrite_shapes_durably() {
         1,
         "the OVERWRITE shape refused under the foreign straddling grant"
     );
-    // The FRESH shape: an aligned write into unmapped block 1.
+    // The FRESH shape: an aligned write into unmapped block 2.
     let v1 = vec![0x94u8; PAGE as usize];
-    h.fs.write_file_staged(ino, FBS, bytes::Bytes::from(v1.clone()), FBS, token)
+    h.fs.write_file_staged(ino, 2 * FBS, bytes::Bytes::from(v1.clone()), size, token)
         .await
         .expect("fresh shape under foreign range");
     assert_eq!(
@@ -2674,11 +2693,15 @@ async fn foreign_range_refuses_fresh_and_overwrite_shapes_durably() {
     foreign.release().await.expect("release foreign");
     fsync(&h, ino).await;
     quiesce(&h).await;
-    assert_eq!(read_at(&h, ino, 0, FBS as usize).await, v0, "block 0 durable");
     assert_eq!(
-        read_at(&h, ino, FBS, PAGE as usize).await,
-        v1,
+        read_at(&h, ino, FBS, FBS as usize).await,
+        v0,
         "block 1 durable"
+    );
+    assert_eq!(
+        read_at(&h, ino, 2 * FBS, PAGE as usize).await,
+        v1,
+        "block 2 durable"
     );
     assert_eq!(trips() - t0, 0, "no tripwire anywhere");
 }

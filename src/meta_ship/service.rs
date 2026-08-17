@@ -992,12 +992,13 @@ impl MetaShipService {
     /// The recall channel's park bound: how long an empty poll round may
     /// sit at the owner before answering empty. Derived from the live
     /// recall deadline (never a constant): half of it, floored at the
-    /// 100 ms scheduling grain, ceilinged at 5 s — strictly under the
-    /// wire's 10 s dial/call socket timeout so a parked round can never
-    /// be mistaken for a dead session. Published on every reply (the
-    /// holder's freshness arithmetic consumes it).
+    /// park grain (the same floor the deadline's delivery term is built
+    /// from — the two derivations cannot drift apart), ceilinged at 5 s —
+    /// strictly under the wire's 10 s dial/call socket timeout so a
+    /// parked round can never be mistaken for a dead session. Published
+    /// on every reply (the holder's freshness arithmetic consumes it).
     fn deleg_park(&self, cfg: &tokens::RecallConfig) -> Duration {
-        (cfg.deadline / 2).clamp(Duration::from_millis(100), Duration::from_secs(5))
+        (cfg.deadline / 2).clamp(tokens::RECALL_POLL_PARK_FLOOR, Duration::from_secs(5))
     }
 
     /// Is `client` fenced on the delegation plane?

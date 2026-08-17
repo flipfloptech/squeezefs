@@ -152,7 +152,15 @@ async fn fixture() -> Fixture {
         service_threads: 2,
         ..cw::RpcListenerConfig::default()
     };
-    let listener = cw::RpcListener::start_async(cfg, SECRET.to_vec(), svc.clone())
+    // Served through the PRODUCTION verb router, not a bare service
+    // listener (rung-12 live finding #2's repro): the first fleet run's
+    // `with_meta` did not claim the delegation verb block, every poll
+    // answered RPC_UNKNOWN_VERB, the undeliverable recall timed out at
+    // the deadline and the HEALTHY holder was evicted. With the router
+    // in the fixture, an unrouted verb makes this whole suite red.
+    let verb_router =
+        Arc::new(squeezefs::data_grant::AsyncVerbRouter::new().with_meta(Arc::clone(&svc)));
+    let listener = cw::RpcListener::start_async(cfg, SECRET.to_vec(), verb_router)
         .expect("owner-side listener starts");
     let endpoint = listener.endpoint().to_string();
 
@@ -895,6 +903,8 @@ async fn grace_reassertion_across_an_authority_restart() {
     svc2.bump_term(fx.svc.term() + 1);
     svc2.open_grace(Duration::from_secs(30));
     ship::install_delegation_host(Arc::clone(&svc2));
+    let verb_router2 =
+        Arc::new(squeezefs::data_grant::AsyncVerbRouter::new().with_meta(Arc::clone(&svc2)));
     let mut listener2 = None;
     for _ in 0..100 {
         match cw::RpcListener::start_async(
@@ -904,7 +914,7 @@ async fn grace_reassertion_across_an_authority_restart() {
                 ..cw::RpcListenerConfig::default()
             },
             SECRET.to_vec(),
-            svc2.clone(),
+            Arc::clone(&verb_router2) as Arc<dyn cw::RpcAsyncService>,
         ) {
             Ok(l) => {
                 listener2 = Some(l);

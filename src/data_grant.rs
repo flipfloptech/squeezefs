@@ -1807,10 +1807,25 @@ impl AsyncVerbRouter {
     /// listener as custody + publish, so an authority that grants write
     /// custody also answers the shipped `Metadata` verbs — the two halves
     /// of one mount posture, armed together or not at all.
+    ///
+    /// Rung 12: the SAME service also serves the S10 delegation block
+    /// (`VERB_DELEG_RECALL`/`VERB_DELEG_REASSERT` — the holder's standing
+    /// recall channel and the grace re-assertion), claimed here so an
+    /// authority can never grant delegations whose recall wire is
+    /// unrouted. Live finding #2: the first fleet run granted, then
+    /// answered every poll `RPC_UNKNOWN_VERB` — the recall was
+    /// undeliverable, timed out at the derived deadline, and the healthy
+    /// holder was EVICTED (the escalation working, aimed at the wrong
+    /// culprit).
     pub fn with_meta(self, service: Arc<crate::meta_ship::MetaShipService>) -> Self {
         self.with(
             crate::meta_ship::VERB_META_BATCH,
             crate::meta_ship::VERB_RECLAIM,
+            Arc::clone(&service) as Arc<dyn RpcAsyncService>,
+        )
+        .with(
+            crate::meta_ship::VERB_DELEG_BASE,
+            crate::meta_ship::VERB_DELEG_LAST,
             service,
         )
     }

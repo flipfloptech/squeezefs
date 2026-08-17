@@ -557,19 +557,27 @@ fn derivations_tie_to_their_inputs_and_explicit_levers_win_verbatim() {
     assert_eq!(recall_batch_max_from(None, 64), 1, "floor: never a 0 batch");
 
     // deadline: no live evidence ⇒ the lease TTL (the fence bound is the
-    // only derivable bound with zero samples); live evidence ⇒ 4 × p99,
-    // floored at the 1 ms timer grain, ceilinged at the TTL.
+    // only derivable bound with zero samples); live evidence ⇒ 4 × p99
+    // PLUS the wire's structural delivery term (rung-12 live finding #3:
+    // recalls travel on the holder's STANDING POLL, whose turnaround —
+    // deliver round + ack round, one park floor each — exists at zero
+    // load; the un-termed derivation read 1 ms on a loopback fleet and a
+    // HEALTHY holder was timed out and membership-evicted before its
+    // poll could possibly answer), ceilinged at the TTL.
     let ttl = Duration::from_secs(45);
+    let delivery = Duration::from_millis(200); // 2 × the 100 ms park floor
     assert_eq!(recall_deadline_from(None, None, ttl), ttl);
     assert_eq!(
         recall_deadline_from(None, Some(360), ttl),
-        Duration::from_micros(4 * 360),
-        "4 × (rtt_p99 + owner_total_p99)"
+        Duration::from_micros(4 * 360) + delivery,
+        "4 × (rtt_p99 + owner_total_p99) + the poll delivery term"
     );
     assert_eq!(
         recall_deadline_from(None, Some(10), ttl),
-        Duration::from_millis(1),
-        "the 1 ms floor (timer grain — below it a deadline is unmeasurable)"
+        Duration::from_micros(40) + delivery,
+        "the delivery term is STRUCTURAL: even negligible load evidence \
+         must never price the deadline below one deliver+ack poll \
+         turnaround (the healthy-holder-evicted class)"
     );
     assert_eq!(
         recall_deadline_from(None, Some(20_000_000), ttl),

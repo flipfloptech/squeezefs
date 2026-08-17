@@ -325,6 +325,27 @@ const RECALL_DEADLINE_MARGIN: u64 = 4;
 /// — below it a deadline is unmeasurable, not strict.
 const RECALL_DEADLINE_FLOOR: Duration = Duration::from_millis(1);
 
+/// The recall-channel PARK floor: how short an empty holder round may be
+/// (the owner's park derivation clamps at this — `MetaShipService::
+/// deleg_park`). A constant scheduling grain, not a tuning value: below
+/// it the standing poll degenerates into a busy loop.
+pub(crate) const RECALL_POLL_PARK_FLOOR: Duration = Duration::from_millis(100);
+
+/// The **delivery term** the rung-12 wire added to the deadline
+/// derivation (live finding #3): rung 11 priced the deadline as
+/// `4 × (rtt_p99 + owner_p99)` — the drain-and-ack terms — but its own
+/// residual #1 left the WIRE half unbuilt, and the wire that landed is a
+/// standing poll: a recall issued while the holder's round is
+/// mid-turnaround waits up to one park floor for the next round, and its
+/// ack rides the round after. On the first fleet run the un-termed
+/// derivation read **1 ms** (4× loopback p99, clamped to the floor) and
+/// a HEALTHY holder was timed out and membership-EVICTED before its poll
+/// could possibly answer. Two park floors is the structural bound of
+/// that turnaround (deliver + ack rounds), independent of load evidence
+/// — the p99 terms keep pricing the load-dependent halves.
+const RECALL_DELIVERY_TERM: Duration =
+    Duration::from_millis(2 * RECALL_POLL_PARK_FLOOR.as_millis() as u64);
+
 /// The recall batch cap: entries per frame, derived from the wire's own
 /// CONTROL-class bound (explicit lever wins verbatim — the precedence
 /// law). At the shipped 1 MiB cap: 16,384 recalls/frame, so spec R6's
@@ -340,10 +361,13 @@ pub fn recall_batch_max_from(explicit: Option<usize>, frame_cap_bytes: u32) -> u
 /// The recall deadline (spec R3's law — never a constant):
 ///
 /// * explicit lever wins verbatim;
-/// * live evidence ⇒ `4 × (rtt_p99 + owner_total_p99)`, floored at the
-///   1 ms timer grain, ceilinged at the membership lease TTL (past the
-///   TTL the S6/S7 fence arithmetic bounds the client anyway — waiting
-///   longer buys nothing);
+/// * live evidence ⇒ `4 × (rtt_p99 + owner_total_p99)` **plus the wire's
+///   structural delivery term** (rung 12: recalls travel on the holder's
+///   standing poll — up to two park floors of turnaround exist even at
+///   zero load; see [`RECALL_DELIVERY_TERM`]), floored at the 1 ms timer
+///   grain, ceilinged at the membership lease TTL (past the TTL the
+///   S6/S7 fence arithmetic bounds the client anyway — waiting longer
+///   buys nothing);
 /// * zero samples ⇒ the TTL itself, the only derivable bound with no
 ///   evidence (conservative toward the fence bound; on an armed mount
 ///   the grant's own metadata RPC has already fed the histograms).
@@ -359,6 +383,7 @@ pub fn recall_deadline_from(
     match live_p99_us {
         None => ceiling,
         Some(us) => Duration::from_micros(us.saturating_mul(RECALL_DEADLINE_MARGIN))
+            .saturating_add(RECALL_DELIVERY_TERM)
             .clamp(RECALL_DEADLINE_FLOOR, ceiling),
     }
 }

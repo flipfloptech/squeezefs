@@ -141,7 +141,17 @@ impl ImageBuilder {
             InodeSpec {
                 value: InodeValue {
                     mode: libc::S_IFDIR | 0o755,
-                    nlink: 1,
+                    // The live law: a directory's nlink is 2 +
+                    // subdirectories (`.` plus its parent entry — for
+                    // root, its own `..`). The parent-side decrement
+                    // floor (`pv.nlink > 2`) and the
+                    // `dir_nlink_underflows` tripwire both assume it;
+                    // the historical `1` sat one below the law, so the
+                    // FIRST full-tree `rm -rf` sweep on every fresh
+                    // volume fired the tripwire on ino 1 (the 2026-08-17
+                    // tarx conviction) — the deficit self-suppressed at
+                    // the floor, which is why nothing else noticed.
+                    nlink: 2,
                     ..Default::default()
                 },
             },
@@ -241,10 +251,20 @@ impl ImageBuilder {
             mode,
             uid,
             gid,
-            nlink: 1,
+            // The live create law (`routed_create_local`): a fresh
+            // directory counts `.` and its parent entry — and the
+            // parent gains one for this child's `..`. Built images must
+            // agree with what a live mkdir would have left, or the
+            // parent-decrement floor fires on the first full sweep.
+            nlink: 2,
             ..Default::default()
         });
         self.dentries.entry(ino).or_default();
+        self.inodes
+            .get_mut(&parent)
+            .expect("bind validated the parent")
+            .value
+            .nlink += 1;
         Ok(ino)
     }
 

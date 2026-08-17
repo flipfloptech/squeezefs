@@ -128,6 +128,14 @@ impl ShardDeviceSeam for MountFleetSeam {
         opts.shard = Some((shard_k, shard_count));
         opts.staging_full = true;
         opts.throttle_pct = throttle_pct;
+        // The one-view law (`FsckOptions::inode_plane`): this member's
+        // coherent view is staleness-bounded (S5) and its per-volume
+        // checkpoint projections sit at different instants mid-churn, so
+        // C9/C10 verdicts taken here manufacture the count/name loss
+        // shapes from a healthy tree. The coordinator's finalize judges
+        // the whole plane from its one view; this shard contributes the
+        // census/refs the block-plane finalize needs and nothing else.
+        opts.inode_plane = false;
         if let JobType::Fsck {
             scrub, scrub_only, ..
         } = job

@@ -328,6 +328,22 @@ pub struct FsckOptions {
     /// only because `FsckOptions` is constructed by struct-update in the
     /// contracts; never set this outside a held-latch scope.
     pub assume_latched: bool,
+    /// Evaluate the INODE-PLANE classes (C9/C10) in this run. `true`
+    /// everywhere except the FLEET plane (KD-MW-16), where the plane is
+    /// a **one-view plane**: its verdicts are census-vs-dentry-pass
+    /// AGREEMENT, so both walks and every verification read must share
+    /// one authority's coherent instant. A fleet member's shard runs
+    /// over its S5 staleness-bounded reader view, whose per-volume
+    /// checkpoint projections sit at DIFFERENT instants mid-churn — a
+    /// dentry read at volume A's older instant beside its record at
+    /// volume B's newer one manufactures exactly the
+    /// `C10ZeroNlinkNamed`/`C10DanglingDentry` loss shapes from a
+    /// healthy tree, and the member-side ladder re-reads the same
+    /// shifted view, so verification cannot clear it (the 2026-08-17
+    /// tarx conviction: 25 findings, all self-healed once the reader's
+    /// poll caught up). Fleet shards therefore skip the plane and
+    /// `run_fleet`'s finalize judges it whole, on the coordinator.
+    pub inode_plane: bool,
 }
 
 impl FsckOptions {
@@ -350,6 +366,7 @@ impl FsckOptions {
             cancel: Arc::new(AtomicBool::new(false)),
             staging_full: false,
             assume_latched: false,
+            inode_plane: true,
         }
     }
 
@@ -1236,7 +1253,15 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
         // C10 rides the SAME two sets in the other direction (plus the
         // name counts the same pass carried): nlink vs the names, and
         // everything the referenced set names that the live set does not.
-        match (referenced.as_ref(), census.live.truncated()) {
+        //
+        // The inode plane is a ONE-VIEW plane (see `FsckOptions::
+        // inode_plane`): fleet shards skip it here — their referenced
+        // set still feeds the census merge — and `run_fleet`'s finalize
+        // judges it whole over the coordinator's own coherent view.
+        match (
+            referenced.as_ref().filter(|_| opts.inode_plane),
+            census.live.truncated(),
+        ) {
             (Some(refs), false) => {
                 evaluate_c9_unreferenced(
                     ctx,
@@ -1403,6 +1428,18 @@ fn fold_finalize_counters(dst: &mut FsckCounters, fin: &FsckCounters) {
     dst.inflight_exempted += fin.inflight_exempted;
     dst.mover_ledger_exempted += fin.mover_ledger_exempted;
     dst.foreign_lane_exempted += fin.foreign_lane_exempted;
+    // The inode plane is judged exclusively at finalize (one-view law):
+    // its counters exist only here — shards skip the classes and member
+    // proposals are stripped — so the fold is exact, never a double
+    // count.
+    dst.dentry_refs_indexed += fin.dentry_refs_indexed;
+    dst.current_era_exempted += fin.current_era_exempted;
+    dst.nlink_names_counted += fin.nlink_names_counted;
+    dst.nlink_mismatch_high += fin.nlink_mismatch_high;
+    dst.nlink_mismatch_low += fin.nlink_mismatch_low;
+    dst.nlink_zero_named += fin.nlink_zero_named;
+    dst.dangling_dentries += fin.dangling_dentries;
+    dst.nlink_transient_cleared += fin.nlink_transient_cleared;
 }
 
 /// The **fleet fsck detect pass** (KD-MW-16, `docs/design-mw-fleet-jobs.md`
@@ -1481,11 +1518,18 @@ pub async fn run_fleet(
 
     // The coordinator's own shard 0 — ONLINE, its suspects machinery
     // armed; the members run offline-posture over their coherent views.
+    // The INODE PLANE (C9/C10) is skipped by every shard — local and
+    // member alike — and judged WHOLE at finalize over the coordinator's
+    // one coherent view (see `FsckOptions::inode_plane`): a member's
+    // S5-bounded view mixes per-volume instants and manufactures the
+    // count/name loss shapes from a healthy tree, and a locally-sharded
+    // judgment beside a finalize-whole one would double-report residue 0.
     let local_shard = |k: u32| {
         let mut o = opts.clone();
         o.shard = Some((k, n));
         o.staging_full = true;
         o.assume_latched = true;
+        o.inode_plane = false;
         o
     };
     let mut reports = vec![run(ctx, &local_shard(0)).await?];
@@ -1520,8 +1564,29 @@ pub async fn run_fleet(
         let mut lost_reason: Option<String> = None;
         match out.payload {
             Some(bytes) => match serde_json::from_slice::<FsckReport>(&bytes) {
-                Ok(r) if r.shard.as_deref() == Some(format!("{}/{}", out.shard, n).as_str()) => {
+                Ok(mut r)
+                    if r.shard.as_deref() == Some(format!("{}/{}", out.shard, n).as_str()) =>
+                {
                     outstanding.remove(&out.shard);
+                    // The inode plane is inadmissible FROM A MEMBER by
+                    // construction (one-view law — the module doc on
+                    // `FsckOptions::inode_plane`): a fleet worker of this
+                    // binary never proposes it, so anything stripped here
+                    // is an older/foreign binary's time-shifted verdict —
+                    // dropped LOUDLY, never merged, never counted on the
+                    // coordinator's C9/C10 tripwires. The finalize below
+                    // re-judges the whole plane from one coherent view,
+                    // so no coverage is lost.
+                    let stripped = strip_inode_plane_proposals(&mut r);
+                    if stripped > 0 {
+                        log::warn!(
+                            "fsck fleet ({job_id}): shard {}/{n} proposed {stripped} \
+                             inode-plane (C9/C10) finding(s) — inadmissible from a \
+                             member's staleness-bounded view (one-view law); dropped, \
+                             and the coordinator finalize re-judges the plane",
+                            out.shard
+                        );
+                    }
                     // The coordinator's stats account for the WHOLE
                     // fleet pass (design §4 step 7); findings/scan_secs
                     // stay per-report (dedupe/max at merge).
@@ -1617,6 +1682,67 @@ pub async fn run_fleet(
             &mut fin_suspects,
         );
         evaluate_c8(ctx, &mut fin_suspects).await;
+
+        // ---- The INODE PLANE, judged WHOLE and from ONE view (the
+        // 2026-08-17 tarx C10 conviction; `FsckOptions::inode_plane`) ----
+        //
+        // Every shard — member and local alike — skipped C9/C10: their
+        // verdicts are census-vs-dentry-pass AGREEMENT, which only means
+        // something when both walks and every verification read share one
+        // authority's coherent instant. A member's S5 reader view mixes
+        // per-volume checkpoint instants mid-churn and manufactures the
+        // loss-direction shapes from a healthy tree (25 self-healing
+        // findings on the leg2 capture); the coordinator's own walk is the
+        // one view that exists. Cost: one census + one dentry pass on the
+        // coordinator — the stated Amdahl term of the fleet fan-out
+        // (design-mw-fleet-jobs §4), paid so the plane's teeth stay exact.
+        // The verification ladder below (settle → witness bracket → fresh
+        // pass → 4a lease re-check → intent exemption) is the unchanged
+        // `recheck_suspects` machinery, shared with the allocator classes'
+        // finalize.
+        if !opts.cancel.load(Ordering::Relaxed) {
+            let (ip_refs, ip_indexed) = build_referenced_inos(
+                ctx.meta.clone(),
+                None,
+                opts.throttle_pct,
+                opts.cancel.clone(),
+                None,
+            )
+            .await;
+            fin_counters.dentry_refs_indexed += ip_indexed;
+            let ip_census = walk_census(ctx, &fin_opts, &mut fin_counters).await?;
+            match (ip_refs.as_ref(), ip_census.live.truncated()) {
+                (Some(refs), false) => {
+                    evaluate_c9_unreferenced(
+                        ctx,
+                        &ip_census.live,
+                        &refs.refs,
+                        &mut fin_counters,
+                        &mut fin_suspects,
+                    )
+                    .await;
+                    evaluate_c10_inode_plane(
+                        ctx,
+                        &fin_opts,
+                        &ip_census,
+                        refs,
+                        &mut fin_counters,
+                        &mut fin_suspects,
+                    )
+                    .await;
+                }
+                (Some(_), true) => log::warn!(
+                    "fsck fleet ({job_id}): the live-inode set reached its derived byte \
+                     budget ({} B) — the inode-plane classes record no verdict for this \
+                     run",
+                    ino_set_byte_budget()
+                ),
+                (None, _) => log::warn!(
+                    "fsck fleet ({job_id}): the coordinator dentry pass did not complete \
+                     — the inode-plane classes record no verdict for this run"
+                ),
+            }
+        }
         fin_counters.suspects += fin_suspects.len() as u64;
         if !fin_suspects.is_empty() {
             squeezefs_ipc::sqz_time::sleep(opts.settle).await;
@@ -1661,6 +1787,32 @@ pub async fn run_fleet(
         .store(merged.counters.scan_secs, Ordering::Relaxed);
 
     Ok(merged)
+}
+
+/// Drop every INODE-PLANE (C9/C10) finding a fleet member proposed and
+/// zero its inode-plane counters — the one-view law's wire face (see
+/// `FsckOptions::inode_plane`): a member's verdicts on this plane are
+/// inadmissible by construction (its S5 view mixes per-volume instants),
+/// this binary's workers never produce them, and the coordinator's
+/// finalize re-judges the plane whole — so anything arriving here is an
+/// older/foreign binary's time-shifted mirage and must neither merge nor
+/// move the coordinator's `fsck_nlink_zero_named`/`fsck_dangling_dentries`
+/// stop-and-read tripwires. Returns how many findings were dropped.
+fn strip_inode_plane_proposals(r: &mut FsckReport) -> usize {
+    let before = r.findings.len();
+    r.findings
+        .retain(|f| !matches!(f.class.as_str(), "C9" | "C10"));
+    let stripped = before - r.findings.len();
+    let c = &mut r.counters;
+    c.nlink_mismatch_high = 0;
+    c.nlink_mismatch_low = 0;
+    c.nlink_zero_named = 0;
+    c.dangling_dentries = 0;
+    c.nlink_names_counted = 0;
+    c.nlink_transient_cleared = 0;
+    c.current_era_exempted = 0;
+    c.findings = r.findings.len() as u64;
+    stripped
 }
 
 /// Sum a worker shard's census counters into the coordinator-published

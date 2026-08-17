@@ -1174,7 +1174,7 @@ impl ShardDeviceSeam for TimeShiftedSeam {
         let (vol, key, child) = &self.forged_dangling;
         report.findings.push(FsckFinding {
             class: "C10".to_string(),
-            object: format!("dentry 1/forged"),
+            object: "dentry 1/forged".to_string(),
             evidence: format!(
                 "dangling dentry: a name resolves to ino {child}, which has no inode \
                  record (a stale member view manufactured this)"
@@ -1397,7 +1397,11 @@ async fn the_inode_plane_loss_direction_teeth_survive_the_fleet_plane() {
     .await
     .expect("fleet run");
 
-    let c10: Vec<_> = merged.findings.iter().filter(|f| f.class == "C10").collect();
+    let c10: Vec<_> = merged
+        .findings
+        .iter()
+        .filter(|f| f.class == "C10")
+        .collect();
     assert!(
         c10.iter()
             .any(|f| f.object.contains(&doomed.to_string()) && f.evidence.contains("nlink 0")),

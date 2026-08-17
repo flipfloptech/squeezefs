@@ -86,13 +86,74 @@ Touched sibling suites green serially (job_wire, fsck, fsck_c9/c10,
 fsck_repair, defrag, interaction, job_fabric, job_worker_panic,
 dlm_multi_writer, durable_block_refs, env_knob_convention, skip_ledger).
 
-## 4. The scaling rows (rig leg `s10c-fsck-scale`)
+## 4. The scaling rows (rig leg `s10c-fsck-scale`) — GATE MET
 
-<!-- FILLED BY THE RUN -->
+Venue: the tcp devsub fleet (`tests/mw_fleet.sh create 4 --membership`,
+nvmet-tcp on 127.0.0.1, 2 mds null_blk + 2 oss zram, one box), binary
+`189da82d4608` release (default features), **quiet** (no foreign cargo,
+loadavg ≈ 3.8 / 32 cpus). Instrument: `time`d `squeezefs fsck <mnt0>
+--scrub --throttle 10` (the CLI's 500 ms status poll is inside every
+row equally); corpus = 96 × 32 MiB urandom files (3 GiB), written+
+fsync'd once; EVERY member remounted per run (cold rows — the R1b
+second-touch law keeps a single scrub pass from warming the disk cache,
+and the remount clears the RAM ghosts; run-to-run spread came out
+±3 ms). **The KD-3 throttle is the stretch instrument**: unthrottled,
+this box's zram scrubs the whole corpus inside the CLI poll quantum;
+the duty cycle applies PER MEMBER, so linearity — and the ratio the
+gate is defined on — is preserved.
 
-## 5. Kill-9 mid-shard (rig leg `s10c-kill-shard`)
+| Width | runs (ms) | median (ms) | speedup vs N=1 |
+|---|---|---|---|
+| N=1 | 12529, 12528, 12525 | **12528** | 1.00× |
+| N=2 | 6518, 6516, 6516 | **6516** | 1.92× |
+| N=4 | 5013, 5014, 5016 | **5014** | **2.50×** |
 
-<!-- FILLED BY THE RUN -->
+* **Gate: MET** — 2.50× ≥ 2.4 (= 0.6×-linear at N=4). Evidence tier:
+  **measured-simulated** (one box; co-located daemons share the device
+  and CPUs — the parallelism across daemon PROCESSES is real, the
+  device is one).
+* **Coverage law held exactly**: the coordinator's
+  `fsck_inodes_scanned` delta was **98 at every width and every run**
+  (96 files + the corpus dir + root) — the residue partition covers the
+  census exactly once, and the coordinator's published counters account
+  for the whole fleet pass. `scrub_bytes_scanned` delta =
+  3,221,225,472 B (the corpus, byte-exact) at every width.
+* **Engagement exact on every run**: `job_fleet_shards_dispatched` ==
+  `job_fleet_shards_completed` == N−1, `job_fleet_shards_relocal` == 0,
+  each reader's `job_fleet_worker_shards` == 1, findings: 0 at every N.
+* Attribution of the N=2→4 sub-linearity (1.30× step): the per-member
+  scrub share falls to ~0.75 GiB (~4 s throttled) while the row keeps
+  ~1 s of width-independent terms — the coordinator-only C8
+  walk+ledger scan, the census/dentry/C1 walks each member repeats, the
+  job submit/poll ceremony — so the fixed floor shows exactly where
+  design-mw-fleet-jobs §4 predicts (the finalize is the stated Amdahl
+  term). N=1→2 is 1.92× (near-perfect halving of the dominant term).
+
+## 5. Kill-9 mid-shard (rig leg `s10c-kill-shard`) — GREEN
+
+Same fleet, corpus 2 GiB, `--throttle 5` (the kill window's stretch).
+A no-kill baseline learned the fleet census total (66 inodes, 7.0–7.5 s
+wall); the kill run then killed **reader 1 with SIGKILL while both
+worker shards were IN FLIGHT** (dispatched delta == 2, completed 0):
+
+* the victim's lease expired (`job_remote_lease_expiries` +1);
+* the residue **re-leased by re-dispatch to the surviving reader**
+  (dispatched +3 total, relocal 0, completed 2) — the fencing-checked
+  re-lease across workers, the charter's exact shape;
+* the pass completed **findings: 0** with the census total IDENTICAL
+  to the baseline (66) — **zero double-coverage** (a stale proposal
+  cannot merge: fencing; the in-process pin also proves the late-
+  proposal refusal, which a SIGKILLed daemon cannot exercise live);
+* **`job_remote_pr_preempts` delta 0 and destination-quarantine delta
+  0** — the design-§5 read-shard expiry split held live (a read worker
+  DMAs nothing; its host's registrant key is never preempted);
+* the victim remounted at leg end (stale-FUSE endpoint reaped),
+  posture `reader` — zero residue; fleet teardown afterwards asserted
+  zero residue.
+
+First attempt of this leg (counted-restart discipline: it aborted the
+count) found the **report-persist bug** (§7 → fixed + repro-ported):
+the acceptance pass above is a from-zero green of the fixed binary.
 
 ## 6. New observability (stats inode; registered in the JSON)
 
@@ -106,7 +167,20 @@ local arm). Member: `job_fleet_worker_shards`,
 fire for fleet shards under the same laws. Knob: `SQUEEZEFS_FLEET_JOBS`
 (bool, default on — ENG-10 registry entry).
 
-## 7. Residuals
+## 7. Rig-found bug (fixed + repro-ported)
+
+The kill leg's FIRST run failed at the baseline: the fleet shard
+reports' mapping identities made the 512-block corpus's `job:{id}:report`
+**66,499 B against the 64 KiB xattr cap** — the persist failed, so the
+CLI read "no report". Fix: the partial census is MERGE-INPUT data and
+never persists (`to_store.partial = None` in `run_fsck_job`);
+repro-ported as
+`fsck_job_report_persists_without_the_partial_census` (the full
+fabric-job path). The same run sized the venue (zram scrubs the corpus
+inside the CLI poll quantum), which is why the legs ride the KD-3
+throttle as their stretch instrument.
+
+## 8. Residuals
 
 * Deferrals 1–3 of §2 (recorded in the design doc with reasons).
 * The scale rows are **measured-simulated** (one box: co-located

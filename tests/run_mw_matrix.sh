@@ -3204,7 +3204,9 @@ PYK
     [ "$inodes" = "$t0_inodes" ] || die "s10c-kill-shard: census total $inodes != baseline $t0_inodes — the re-leased residue double- or under-counted"
     log "s10c-kill-shard: lease expired ($((e1 - e0))), residue re-leased (relocal $((r1 - r0)), redispatch $((d1 - d0 - 2)), completed $((c1 - c0))), census exact ($inodes), preempts/quarantine 0"
 
-    # Zero residue: the victim remounts and is a member again.
+    # Zero residue: the victim remounts and is a member again. kill -9
+    # leaves a stale FUSE endpoint (ENOTCONN) — reap it first.
+    fusermount3 -u "$(mnt_of 1)" 2>/dev/null || umount -l "$(mnt_of 1)" 2>/dev/null || true
     "$MWFLEET" mount 1 >/dev/null || die "s10c-kill-shard: victim remount failed"
     [ "$(stat_field 1 mount_posture)" = "reader" ] || die "s10c-kill-shard: remounted victim posture != reader"
     log "s10c-kill-shard GREEN (events + snapshots in $rowdir; victim remounted)"

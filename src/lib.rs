@@ -129,6 +129,12 @@ pub mod free_grace;
 pub mod fsck;
 pub mod fuse_client;
 pub(crate) mod gauge_core;
+// DLM S11's byte-range custody core (spec §6.9's fourth named loom
+// obligation, KD-MW-10; design-full-multi-writer §9.4): the `FileCustody`
+// interval algebra + the rung-15 required/desired admit with admit-time
+// coalescing, `#[path]`-included by `loom-models`. `src/dlm.rs` re-exports
+// its public face (`LockMode`, the alignment/cap arithmetic).
+pub(crate) mod range_custody_core;
 // DLM S9's custody grant table (spec §6.9's `grant_table_core` loom
 // obligation, KD-MW-10) — the client-lease/grant/grace protocol core
 // `data_grant.rs` runs on, `#[path]`-included by loom-models.

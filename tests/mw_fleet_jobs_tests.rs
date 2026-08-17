@@ -1030,6 +1030,7 @@ async fn custody_grant_defers_the_mover_probe() {
             span: None,
             concurrent_write: false,
             wait_ms: 500,
+            desired: None,
         })
         .await
         .expect("whole-inode custody granted");

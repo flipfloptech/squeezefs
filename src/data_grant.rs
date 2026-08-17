@@ -111,7 +111,16 @@ use std::time::{Duration, Instant};
 /// with no lane and then either refuse every allocation or — far worse —
 /// mint DENSE offsets across every peer's residue class, so the mismatch
 /// must be a loud refusal at the join rather than a field with a default.
-pub const CUSTODY_SCHEMA: u32 = 2;
+///
+/// **3 since S11 rung 15** (KD-MW-7, design §9.2/§11): the acquire carries
+/// the required/desired pair ([`AcquireFrame::desired`]) and the renewal
+/// reply carries the client's live **range vector**
+/// ([`RenewReplyFrame::ranges`] — the revalidation surface the client
+/// range cache rebuilds from). A peer that speaks 2 would decode a
+/// desired-bearing acquire as a plain span (granting less than the law
+/// requires) and silently drop the range vector, so the mismatch stays a
+/// loud refusal.
+pub const CUSTODY_SCHEMA: u32 = 3;
 
 /// First verb of S9's block. S3 reserved 0 for its ping, S8's metadata
 /// vocabulary took 16/17, S6's membership owns `0x0100..=0x01FF`; custody
@@ -145,6 +154,13 @@ pub const CUSTODY_IN_GRACE: u16 = 0x43;
 pub const CUSTODY_SCHEMA_MISMATCH: u16 = 0x44;
 /// Status: undecodable body (bounded, refused loud).
 pub const CUSTODY_MALFORMED: u16 = 0x45;
+/// Status: the §9.2 bounds refused a NEW range span — the geometry cap,
+/// the `dlm_grant_table_bytes` R5 byte budget, or the Red clamp. The body
+/// carries the refusal's budget arithmetic verbatim (the fleet-share
+/// precedent: refusals name their numbers). Distinct from
+/// [`CUSTODY_CONFLICT`] because nothing HOLDS the bytes — the client's
+/// remedy is release/backoff, never waiting on a holder.
+pub const CUSTODY_AT_CAPACITY: u16 = 0x46;
 
 /// A client's join (or re-join after losing its lease view).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,7 +238,8 @@ pub struct AcquireFrame {
     pub lease_epoch: u64,
     pub ino: u64,
     /// `None` = whole-inode custody; `Some((start,end))` = `[start,end)`
-    /// with **end exclusive**.
+    /// with **end exclusive**. On the S11 required/desired path this is
+    /// **required** — the span the write needs, never trimmed.
     pub span: Option<(u64, u64)>,
     /// `true` = CW (concurrent write); `false` = EX.
     pub concurrent_write: bool,
@@ -230,6 +247,12 @@ pub struct AcquireFrame {
     /// renewal cadence (a client that cannot get custody within a cadence
     /// must be TOLD, not held on a service lane).
     pub wait_ms: u64,
+    /// **S11 rung 15** (schema 3): the best-effort desired window ⊇
+    /// `span` — block-aligned outward by the client (the §9.2 rounding
+    /// doctrine), always trimmable against live custody. `Some` selects
+    /// the required/desired admit (EX-only, KD-MW-9); `None` is the plain
+    /// S9 acquire, byte-identical to schema 2's semantics.
+    pub desired: Option<(u64, u64)>,
 }
 
 /// One live grant as the client sees it.
@@ -259,6 +282,23 @@ pub struct RenewFrame {
     pub inflight: Vec<u64>,
 }
 
+/// One live range grant as the renewal reply carries it — the **range
+/// vector on the lease** (S11 rung 15, design §11: *"custody lease
+/// carries optional range vector"*): the authority's own record of this
+/// client's live byte-range custody, authoritative for presence AND
+/// absence, from which the client range cache rebuilds
+/// (`meta_ship::tokens::replace_range_grants`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RangeVecEntry {
+    pub grant_id: u64,
+    pub ino: u64,
+    /// `[start, end)`, end exclusive — possibly WIDER than any single ask
+    /// (the admit-time merge widens grants in place).
+    pub span: (u64, u64),
+    /// The grant's fencing token (the file's generator — no new algebra).
+    pub token: u64,
+}
+
 /// A renewal's answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RenewReplyFrame {
@@ -267,6 +307,10 @@ pub struct RenewReplyFrame {
     /// Grants of this client the authority no longer holds (revoked while
     /// the client was away). The pull-based revocation channel.
     pub dead_grants: Vec<u64>,
+    /// **S11 rung 15** (schema 3): this client's live RANGE grants — the
+    /// lease's range vector (revalidation surface; empty for a client
+    /// holding only whole-file custody).
+    pub ranges: Vec<RangeVecEntry>,
 }
 
 /// A release of named grants.
@@ -344,6 +388,10 @@ static RPCS: AtomicU64 = AtomicU64::new(0);
 static QUARANTINED: AtomicU64 = AtomicU64::new(0);
 static PROOFS: AtomicU64 = AtomicU64::new(0);
 static SELF_FENCES: AtomicU64 = AtomicU64::new(0);
+// S11 rung 15 — the client's wire-face range ledger (the authority-side
+// family lives in `crate::dlm::range_custody_stats`).
+static RANGE_ACQUIRES_CLIENT: AtomicU64 = AtomicU64::new(0);
+static RANGE_EXTENSIONS_CLIENT: AtomicU64 = AtomicU64::new(0);
 
 /// The client-side view of the custody ledger (the owner's own per-instance
 /// counters are [`WriteCustodyOwner::stats`]).
@@ -399,6 +447,10 @@ pub fn stats_json() -> serde_json::Value {
         "dlm_custody_grace_conflicts": GRACE_CONFLICTS.load(Ordering::Relaxed),
         "dlm_custody_quarantined_offsets": QUARANTINED.load(Ordering::Relaxed),
         "dlm_custody_drain_proofs": PROOFS.load(Ordering::Relaxed),
+        // S11 rung 15 — the client's wire-face range ledger (the
+        // authority-side family is the `range_custody` object).
+        "dlm_custody_range_acquires": RANGE_ACQUIRES_CLIENT.load(Ordering::Relaxed),
+        "dlm_custody_range_extensions": RANGE_EXTENSIONS_CLIENT.load(Ordering::Relaxed),
         "dlm_custody_held": OWNER
             .load()
             .as_ref()
@@ -438,6 +490,33 @@ fn custody_census() -> serde_json::Value {
             })
             .collect(),
     )
+}
+
+/// The S11 A/B lever (design §11): ENG-10 `Kind::Bool`, static default
+/// **on**, read only when the mw plane is armed — the
+/// `SQUEEZEFS_DELEGATION` form verbatim. `=1` on an unarmed mount is
+/// announced-inert (every range gauge structurally 0), never a refusal;
+/// `=0` on an armed mount is the A/B control the S11 rows compare
+/// against.
+pub const RANGE_CUSTODY_ENV: &str = "SQUEEZEFS_RANGE_CUSTODY";
+
+/// **Test seam** (the `TEST_DELEGATION_OVERRIDE` precedent): `0` = read
+/// the env knob, `1` = force on, `2` = force off — so one suite binary can
+/// pin both sides of the A/B without racing process-global env mutation.
+pub static TEST_RANGE_CUSTODY_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// Is the range-custody plane live on this process? One relaxed load on
+/// every unarmed mount (the solo re-gate's law) — the knob is consulted
+/// only past the armed gate, which is what keeps KD-MW-12's whole-file
+/// fast path structurally untouched everywhere the plane is dark.
+pub fn range_custody_enabled() -> bool {
+    match TEST_RANGE_CUSTODY_OVERRIDE.load(Ordering::Relaxed) {
+        1 => return crate::meta_ship::ownership_armed(),
+        2 => return false,
+        _ => {}
+    }
+    crate::meta_ship::ownership_armed() && crate::env_knobs::bool_knob(RANGE_CUSTODY_ENV, true)
 }
 
 /// `off` (nothing armed — the shipped default), `authority` (this mount
@@ -513,6 +592,44 @@ pub trait CustodyQuarantine: Send + Sync + std::fmt::Debug {
     /// Release `epoch`'s whole cohort — reachable only with a
     /// [`DrainProof`].
     fn release(&self, epoch: DeadEpoch) -> usize;
+}
+
+/// The per-file geometry source the §9.2 span cap derives from —
+/// `(file_size_bytes, block_size)` for an ino, behind a trait so the
+/// custody authority never needs a metadata backend of its own (the
+/// [`CustodyQuarantine`] pattern: the mount arm supplies the real
+/// metadata lookup; a test supplies a fixed shape; an authority with no
+/// source runs the byte budget alone — `None` here, because a conjured
+/// default size would be exactly the constant Issue-19 forbids).
+pub trait RangeGeometry: Send + Sync + std::fmt::Debug {
+    /// The file's `(size, block_size)`, or `None` when the ino cannot be
+    /// resolved (the cap arm then stands down for this ask; the byte
+    /// budget still governs).
+    fn geometry(
+        &self,
+        ino: u64,
+    ) -> Pin<Box<dyn Future<Output = Option<(u64, u64)>> + Send + '_>>;
+}
+
+/// A fixed-shape [`RangeGeometry`]: every ino reads as one `size`-byte
+/// file of `block_size`-byte blocks — the test seam, and the honest
+/// answer for single-file rigs.
+pub fn fixed_range_geometry(size: u64, block_size: u64) -> Arc<dyn RangeGeometry> {
+    #[derive(Debug)]
+    struct Fixed {
+        size: u64,
+        block_size: u64,
+    }
+    impl RangeGeometry for Fixed {
+        fn geometry(
+            &self,
+            _ino: u64,
+        ) -> Pin<Box<dyn Future<Output = Option<(u64, u64)>> + Send + '_>> {
+            let out = Some((self.size, self.block_size));
+            Box::pin(async move { out })
+        }
+    }
+    Arc::new(Fixed { size, block_size })
 }
 
 /// **Evidence that a dead epoch can no longer submit DMA.**
@@ -667,6 +784,12 @@ pub struct WriteCustodyOwner {
     /// The grant table — client leases, live grants, the grace window and
     /// the two mint words ([`crate::grant_table_core`], loom-modeled).
     table: crate::grant_table_core::GrantTableCore<LockLease>,
+    /// S11 rung 15: the §9.2 span-cap geometry source (`None` = no source
+    /// installed — the byte budget alone governs; the mount arm installs
+    /// the metadata-backed lookup, tests a fixed shape). A lock, not an
+    /// ArcSwap: read once per RANGED acquire (an episode event), never on
+    /// a hot path.
+    geometry: parking_lot::RwLock<Option<Arc<dyn RangeGeometry>>>,
     quarantine: Option<Arc<dyn CustodyQuarantine>>,
     /// The lane-harvest HANDOUT ledger (rung 10, residual 2): offsets this
     /// authority handed a co-writer's lease out of its own free list, keyed
@@ -767,6 +890,7 @@ impl WriteCustodyOwner {
             arbiter: LocalLockManager::new()?,
             lanes: ArcSwapOption::empty(),
             table: crate::grant_table_core::GrantTableCore::new(),
+            geometry: parking_lot::RwLock::new(None),
             quarantine,
             handouts: parking_lot::Mutex::new(std::collections::HashMap::new()),
             granted: AtomicU64::new(0),
@@ -794,6 +918,14 @@ impl WriteCustodyOwner {
     /// The lease parameters clients are granted under.
     pub fn clocks(&self) -> &LeaseClocks {
         &self.clocks
+    }
+
+    /// Install the §9.2 span-cap geometry source (S11 rung 15 — the
+    /// `install_lane_assignment` pattern: post-arm, no signature change).
+    /// Without one the per-file cap stands down and the byte budget alone
+    /// bounds the table (documented in [`RangeGeometry`]).
+    pub fn install_range_geometry(&self, source: Arc<dyn RangeGeometry>) {
+        *self.geometry.write() = Some(source);
     }
 
     /// Live grants.
@@ -1244,6 +1376,167 @@ impl WriteCustodyOwner {
         })
     }
 
+    /// **S11 rung 15 — the required/desired grant** (KD-MW-7, §9.2): the
+    /// range face of [`Self::grant`], carrying the refusal DETAIL so the
+    /// budget arithmetic reaches the refused client verbatim (the
+    /// fleet-share precedent — a `u16` alone would strand the numbers on
+    /// the authority's log).
+    ///
+    /// The arbitration is [`LocalLockManager::acquire_lock_range_scoped`]
+    /// under the client-lease merge scope
+    /// ([`crate::dlm::range_scope_for_epoch`]): one scope per lease, so
+    /// one client's adjacent stripes coalesce and two clients' never do.
+    /// An EXTENSION answers the client's EXISTING grant id with the
+    /// widened span and the SURVIVING token — the client widens its
+    /// adopted record and its cached span; nothing re-mints, so every
+    /// in-flight write fencing on that grant stays current.
+    pub async fn grant_ranged(
+        &self,
+        req: &AcquireFrame,
+        desired: (u64, u64),
+    ) -> std::result::Result<GrantRecord, (u16, String)> {
+        let named = |status: u16| (status, status_name(status).to_string());
+        if req.schema != CUSTODY_SCHEMA {
+            return Err(named(CUSTODY_SCHEMA_MISMATCH));
+        }
+        if req.concurrent_write {
+            // KD-MW-9: v1 issues EX only — the desired path never carries
+            // a mode.
+            return Err((
+                CUSTODY_MALFORMED,
+                "S11: the required/desired path issues EX only (KD-MW-9's v1 issuance law) \
+                 — a CW range has no issuer"
+                    .to_string(),
+            ));
+        }
+        let Some(required) = req.span else {
+            return Err((
+                CUSTODY_MALFORMED,
+                "S11: a desired window without a required span — required is the \
+                 never-trimmed floor and must be present"
+                    .to_string(),
+            ));
+        };
+        if !self.lease_current(&req.client, req.lease_epoch) {
+            self.unknown_leases.fetch_add(1, Ordering::Relaxed);
+            UNKNOWN_LEASES.fetch_add(1, Ordering::Relaxed);
+            return Err(named(CUSTODY_UNKNOWN_LEASE));
+        }
+        if self.in_grace() {
+            self.grace_conflicts.fetch_add(1, Ordering::Relaxed);
+            GRACE_CONFLICTS.fetch_add(1, Ordering::Relaxed);
+            return Err(named(CUSTODY_IN_GRACE));
+        }
+        // The §9.2 cap's geometry, resolved through the installed source
+        // (None = no source, the byte budget alone governs — a conjured
+        // size would be the Issue-19 constant).
+        let geometry = {
+            let source = self.geometry.read().clone();
+            match source {
+                Some(g) => g.geometry(req.ino).await,
+                None => None,
+            }
+        };
+        let scope = crate::dlm::range_scope_for_epoch(req.lease_epoch);
+        let budget = Duration::from_millis(req.wait_ms).min(self.clocks.renew_interval);
+        let path = format!("inode_{}", req.ino);
+        let t_arb = Instant::now();
+        let outcome = self
+            .arbiter
+            .acquire_lock_range_scoped(&path, required, desired, budget, geometry, Some(scope))
+            .await;
+        phase_record(CustodyPhase::Arbitrate, t_arb);
+        let record = |grant_id: u64, span: (u64, u64), token: u64| GrantRecord {
+            schema: CUSTODY_SCHEMA,
+            grant_id,
+            ino: req.ino,
+            span: Some(span),
+            token,
+            term: self.term,
+            custody_epoch: crate::dlm::compose_token(self.term, req.lease_epoch),
+        };
+        match outcome {
+            Ok(crate::dlm::RangeAcquired::New { lease, span }) => {
+                let token = lease.fencing_token();
+                // Validate-and-commit as ONE step (the rung-4 loom
+                // finding's law — see `grant`).
+                match self.table.commit_grant_if_current(
+                    &req.client,
+                    req.lease_epoch,
+                    req.ino,
+                    Some(span),
+                    lease,
+                ) {
+                    Ok(grant_id) => {
+                        self.granted.fetch_add(1, Ordering::Relaxed);
+                        Ok(record(grant_id, span, token))
+                    }
+                    Err(dead_lease) => {
+                        drop(dead_lease);
+                        self.conflicts.fetch_add(1, Ordering::Relaxed);
+                        CONFLICTS.fetch_add(1, Ordering::Relaxed);
+                        Err(named(CUSTODY_CONFLICT))
+                    }
+                }
+            }
+            Ok(
+                crate::dlm::RangeAcquired::Extended { token, span }
+                | crate::dlm::RangeAcquired::Covered { token, span },
+            ) => {
+                // The widened/covering grant is one THIS CLIENT already
+                // holds (the merge scope is its lease) — answer its
+                // existing id with the current span. A miss means a
+                // racing revoke retired the (already-widened) record with
+                // the lease: the whole union was freed together, and the
+                // client must self-fence and re-join — the same answer
+                // `grant`'s commit refusal gives.
+                match self.grant_id_by_token(&req.client, token) {
+                    Some(grant_id) => {
+                        self.table.widen_grant_span(grant_id, Some(span));
+                        Ok(record(grant_id, span, token))
+                    }
+                    None => {
+                        self.conflicts.fetch_add(1, Ordering::Relaxed);
+                        CONFLICTS.fetch_add(1, Ordering::Relaxed);
+                        Err(named(CUSTODY_CONFLICT))
+                    }
+                }
+            }
+            Err(e) => {
+                let reason = e.to_string();
+                let status = if crate::dlm::is_range_capacity_refusal(&reason) {
+                    CUSTODY_AT_CAPACITY
+                } else {
+                    self.conflicts.fetch_add(1, Ordering::Relaxed);
+                    CONFLICTS.fetch_add(1, Ordering::Relaxed);
+                    CUSTODY_CONFLICT
+                };
+                log::warn!(
+                    "S11: refusing range custody of inode_{} [{},{}) to '{}' ({}): {reason}",
+                    req.ino,
+                    required.0,
+                    required.1,
+                    req.client,
+                    status_name(status)
+                );
+                Err((status, reason))
+            }
+        }
+    }
+
+    /// The grant id of `client`'s live grant carrying `token` (tokens are
+    /// globally unique, so an answer names exactly one grant). O(live
+    /// grants) — an episode operation, bounded by the §9.2 caps.
+    fn grant_id_by_token(&self, client: &str, token: u64) -> Option<u64> {
+        self.table
+            .grants_snapshot_with(|id, g| {
+                (g.client == client && g.lease.fencing_token() == token).then_some(id)
+            })
+            .into_iter()
+            .flatten()
+            .next()
+    }
+
     /// Renew a client lease, absorbing its in-flight destination set and
     /// reporting which of its grants have died. One `scc` probe — this is
     /// the plane's hot operation and it commits nothing.
@@ -1268,10 +1561,34 @@ impl WriteCustodyOwner {
             return Err(CUSTODY_UNKNOWN_LEASE);
         };
         self.renewals.fetch_add(1, Ordering::Relaxed);
+        // S11 rung 15: the lease's RANGE VECTOR — this client's live range
+        // grants, from the authority's own table (authoritative for
+        // presence AND absence; the client cache rebuilds from it).
+        // O(live grants) on the heartbeat cadence — bounded by the §9.2
+        // caps; a per-client index is the 1-TiB-shape residual, priced
+        // when rung 18's rows demand it.
+        let ranges = self
+            .table
+            .grants_snapshot_with(|id, g| {
+                (g.client == client)
+                    .then(|| {
+                        g.span.map(|span| RangeVecEntry {
+                            grant_id: id,
+                            ino: g.ino,
+                            span,
+                            token: g.lease.fencing_token(),
+                        })
+                    })
+                    .flatten()
+            })
+            .into_iter()
+            .flatten()
+            .collect();
         Ok(RenewReplyFrame {
             schema: CUSTODY_SCHEMA,
             lease: self.lease_frame(client, lease_epoch, now),
             dead_grants,
+            ranges,
         })
     }
 
@@ -1501,6 +1818,7 @@ impl WriteCustodyOwner {
                 // with its RAM, so anything that conflicts is a LIVE
                 // conflict the client must be told about.
                 wait_ms: 0,
+                desired: None,
             };
             // Deliberately NOT `self.grant()`: that path refuses inside the
             // grace window, and admitting reclaim is the window's entire
@@ -1626,6 +1944,27 @@ impl CustodyService {
             },
             VERB_CUSTODY_ACQUIRE => match decode::<AcquireFrame>(&req.body, "acquire") {
                 Err(e) => Self::refuse(req.id, CUSTODY_MALFORMED, format!("{e}")),
+                // S11 rung 15: a desired-bearing acquire takes the
+                // required/desired path, whose refusals carry their DETAIL
+                // (the budget arithmetic must reach the refused client —
+                // the fleet-share refusal precedent).
+                Ok(frame) if frame.desired.is_some() => {
+                    let desired = frame.desired.expect("guarded");
+                    match self.owner.grant_ranged(&frame, desired).await {
+                        Ok(grant) => reply(req.id, &grant, "range grant"),
+                        Err((status, detail)) => Self::refuse(
+                            req.id,
+                            status,
+                            format!(
+                                "range custody of inode_{} {:?} refused to '{}' ({}): {detail}",
+                                frame.ino,
+                                frame.span,
+                                frame.client,
+                                status_name(status)
+                            ),
+                        ),
+                    }
+                }
                 Ok(frame) => match self.owner.grant(&frame).await {
                     Ok(grant) => reply(req.id, &grant, "grant"),
                     Err(status) => Self::refuse(
@@ -1711,6 +2050,7 @@ fn status_name(status: u16) -> &'static str {
         CUSTODY_IN_GRACE => "grace window: reclaim only",
         CUSTODY_SCHEMA_MISMATCH => "schema mismatch",
         CUSTODY_MALFORMED => "malformed",
+        CUSTODY_AT_CAPACITY => "at capacity: §9.2 bounds refused a new span",
         _ => "refused",
     }
 }
@@ -1865,17 +2205,55 @@ struct ClientGrant {
     /// is deferred to [`WriteCustodyClient::drain_releases`] (the renewal
     /// cadence drains it, and so does the next acquire).
     pending: Arc<parking_lot::Mutex<Vec<u64>>>,
+    /// S11 rung 15: the grant's object + token, so a range grant's death
+    /// (release or revocation) retires its client-cache span immediately —
+    /// a dead grant serving a covering probe is the one wrong answer the
+    /// cache has available. `token == 0` ⇔ not a range grant (no cache
+    /// state to retire; the S1 mint starts at 1, so 0 is never a token).
+    ino: u64,
+    token: u64,
+}
+
+impl ClientGrant {
+    /// Drop this grant's client-cache range span, if it carries one.
+    fn retire_cached_span(&self) {
+        if self.token != 0 {
+            crate::meta_ship::tokens::retire_range_grant(self.ino, self.token);
+        }
+    }
 }
 
 impl crate::dlm::RemoteGrant for ClientGrant {
     fn release(&self) {
         if self.live.swap(false, Ordering::AcqRel) {
+            self.retire_cached_span();
             self.pending.lock().push(self.grant_id);
         }
     }
     fn live(&self) -> bool {
         self.live.load(Ordering::Acquire)
     }
+}
+
+/// One [`WriteCustodyClient::acquire_range`] outcome (S11 rung 15).
+#[derive(Debug)]
+pub enum RangeAcquireOutcome {
+    /// A fresh grant: hold the lease — dropping/releasing it retires the
+    /// span (and travels to the authority on the next drain).
+    New {
+        lease: LockLease,
+        /// The granted span (the conflict-free desired-subset, ⊇ required).
+        span: (u64, u64),
+        grant_id: u64,
+    },
+    /// The authority WIDENED a grant this client already holds (the §9.2
+    /// admit-time merge): same grant id, same token, wider span. The
+    /// EXISTING lease handle is the custody — no new handle exists.
+    Extended {
+        token: u64,
+        span: (u64, u64),
+        grant_id: u64,
+    },
 }
 
 /// A **co-writer**: it holds write custody granted by another node's
@@ -2092,6 +2470,7 @@ impl WriteCustodyClient {
             span,
             concurrent_write: mode == LockMode::ConcurrentWrite,
             wait_ms: wait.as_millis().min(u64::MAX as u128) as u64,
+            desired: None,
         };
         let body = encode(&frame, "acquire")?;
         let t = Instant::now();
@@ -2122,6 +2501,8 @@ impl WriteCustodyClient {
             grant_id: grant.grant_id,
             live: AtomicBool::new(true),
             pending: Arc::clone(&self.pending_releases),
+            ino: grant.ino,
+            token: 0, // plain acquires carry no client-cache range span
         });
         let _ = self.grants.insert_sync(grant.grant_id, Arc::clone(&handle));
         crate::data_custody::adopt_custody_generation(crate::dlm::token_grant_seq(
@@ -2137,6 +2518,132 @@ impl WriteCustodyClient {
         phase_record(CustodyPhase::Adopt, t_adopt);
         GRANTS.fetch_add(1, Ordering::Relaxed);
         Ok(lease)
+    }
+
+    /// **S11 rung 15 — acquire EX byte-range custody by the §9.2
+    /// required/desired law** (KD-MW-7): `required` is the span the write
+    /// needs (granted whole or refused loud — never trimmed); `desired`
+    /// the best-effort block-aligned stretch (always trimmable against
+    /// live custody). The grant rides this client's S9 custody lease and
+    /// is cached in the S8 token cache's range extension
+    /// (`meta_ship::tokens::record_range_grant`), so subsequent writes
+    /// inside the granted span pay one lock-free covering probe — the
+    /// ≥99.5 %-local law's mechanism.
+    ///
+    /// An ask adjacent to a span this client already holds comes back as
+    /// [`RangeAcquireOutcome::Extended`]: the authority WIDENED the
+    /// existing grant (same grant id, same token — the admit-time merge),
+    /// this client's adopted record and cached span widen to match, and
+    /// **no new lease exists** — the original handle now covers the wider
+    /// span. Like `acquire`, never retried on transport failure (no dedup
+    /// window — a re-sent acquire could strand an unnameable grant).
+    pub async fn acquire_range(
+        &self,
+        ino: u64,
+        required: (u64, u64),
+        desired: (u64, u64),
+        wait: Duration,
+    ) -> Result<RangeAcquireOutcome> {
+        if crate::data_custody::poisoned() {
+            return Err(SqueezefsError::WriterGuardFenced);
+        }
+        self.drain_releases().await;
+        let frame = AcquireFrame {
+            schema: CUSTODY_SCHEMA,
+            client: self.id.clone(),
+            lease_epoch: self.lease_epoch.load(Ordering::Acquire),
+            ino,
+            span: Some(required),
+            concurrent_write: false, // KD-MW-9: v1 issues EX only
+            wait_ms: wait.as_millis().min(u64::MAX as u128) as u64,
+            desired: Some(desired),
+        };
+        let body = encode(&frame, "range acquire")?;
+        let t = Instant::now();
+        let reply = self.call_once(VERB_CUSTODY_ACQUIRE, body).await?;
+        phase_record(CustodyPhase::Rtt, t);
+        if reply.status != CUSTODY_OK {
+            let detail = String::from_utf8_lossy(&reply.body).to_string();
+            if reply.status == CUSTODY_UNKNOWN_LEASE {
+                self.note_lease_lost(&detail);
+            }
+            return Err(SqueezefsError::LockFailed {
+                reason: format!(
+                    "S11: the custody authority at {} refused range custody of inode_{ino} \
+                     [{},{}) ({}): {detail}",
+                    self.endpoint,
+                    required.0,
+                    required.1,
+                    status_name(reply.status)
+                ),
+            });
+        }
+        let grant: GrantRecord = decode(&reply.body, "range grant")?;
+        let Some(span) = grant.span else {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "S11: the authority answered a range acquire on inode_{ino} with a \
+                 WHOLE-FILE grant record — refusing the adoption rather than caching \
+                 custody wider than was arbitrated"
+            )));
+        };
+        if let Some(handle) = self
+            .grants
+            .read_sync(&grant.grant_id, |_, g| Arc::clone(g))
+        {
+            // The EXTENSION face: the authority widened a grant this
+            // client already holds. Widen the adopted record (same token,
+            // same release identity) and the cached span; the existing
+            // lease handle is the custody — no new handle exists.
+            if !crate::dlm::widen_adopted_grant(ino, grant.token, span) {
+                // The local record died between the reply and this widen
+                // (a racing lease loss retired it whole). The honest
+                // answer is the lease-lost class — the caller re-joins.
+                handle.live.store(false, Ordering::Release);
+                return Err(SqueezefsError::LockFailed {
+                    reason: format!(
+                        "S11: the authority extended grant {} on inode_{ino}, but this \
+                         client's adopted record is gone (custody died mid-extension) — \
+                         self-fence and re-join",
+                        grant.grant_id
+                    ),
+                });
+            }
+            crate::meta_ship::tokens::record_range_grant(ino, span, grant.token);
+            RANGE_EXTENSIONS_CLIENT.fetch_add(1, Ordering::Relaxed);
+            return Ok(RangeAcquireOutcome::Extended {
+                token: grant.token,
+                span,
+                grant_id: grant.grant_id,
+            });
+        }
+        let t_adopt = Instant::now();
+        let handle = Arc::new(ClientGrant {
+            grant_id: grant.grant_id,
+            live: AtomicBool::new(true),
+            pending: Arc::clone(&self.pending_releases),
+            ino,
+            token: grant.token,
+        });
+        let _ = self.grants.insert_sync(grant.grant_id, Arc::clone(&handle));
+        crate::data_custody::adopt_custody_generation(crate::dlm::token_grant_seq(
+            grant.custody_epoch,
+        ));
+        let lease = crate::dlm::adopt_remote_grant(
+            ino,
+            Some(span),
+            grant.token,
+            LockMode::Exclusive,
+            handle as Arc<dyn crate::dlm::RemoteGrant>,
+        )?;
+        crate::meta_ship::tokens::record_range_grant(ino, span, grant.token);
+        phase_record(CustodyPhase::Adopt, t_adopt);
+        GRANTS.fetch_add(1, Ordering::Relaxed);
+        RANGE_ACQUIRES_CLIENT.fetch_add(1, Ordering::Relaxed);
+        Ok(RangeAcquireOutcome::New {
+            lease,
+            span,
+            grant_id: grant.grant_id,
+        })
     }
 
     /// Renew the client lease, carrying the declared in-flight set and
@@ -2212,6 +2719,16 @@ impl WriteCustodyClient {
                 r.dead_grants.len()
             ));
         }
+        // S11 rung 15: the lease's RANGE VECTOR revalidates the client
+        // range cache — the authority's record is authoritative for
+        // presence AND absence, so a release/revocation whose local
+        // retire was lost still leaves the cache at the next heartbeat.
+        crate::meta_ship::tokens::replace_range_grants(
+            &r.ranges
+                .iter()
+                .map(|e| (e.ino, e.span, e.token))
+                .collect::<Vec<_>>(),
+        );
         Ok(())
     }
 
@@ -2289,6 +2806,10 @@ impl WriteCustodyClient {
             // already retired it, so telling it again would be a lie about
             // a grant we no longer hold.
             handle.live.store(false, Ordering::Release);
+            // A dead range grant's cached span must die with it — a
+            // covering probe serving a retired token is the one wrong
+            // answer the cache has available (S11 rung 15).
+            handle.retire_cached_span();
         }
         let _ = self.grants.remove_sync(&grant_id);
     }
@@ -2328,6 +2849,10 @@ impl WriteCustodyClient {
         for id in ids {
             self.mark_dead(id);
         }
+        // S11 rung 15: a client whose LEASE died holds no range custody
+        // at all — the whole range cache dies with it (per-grant retires
+        // above cover the known ids; this closes any residue).
+        crate::meta_ship::tokens::clear_range_grants();
         crate::data_custody::advance_custody_generation(&format!(
             "S9: this node's custody lease is no longer custody ({detail})"
         ));
@@ -2546,6 +3071,39 @@ pub fn discharge_lane_handouts(offsets: &[u64]) {
 ///
 /// With no client armed the refusal stands, and it now names the missing
 /// half rather than a future stage.
+/// **S11 rung 15**: ship a required/desired range acquire to the home's
+/// owner (the [`acquire_remote`] pattern for the range face), mapping the
+/// wire outcome back into the local [`crate::dlm::RangeAcquired`] shape
+/// the homing entry point answers with.
+pub async fn acquire_remote_range(
+    ino: u64,
+    required: (u64, u64),
+    desired: (u64, u64),
+    ttl: Duration,
+    slot: u64,
+) -> Result<crate::dlm::RangeAcquired> {
+    let Some(client) = custody_client() else {
+        let reason = format!(
+            "S11: lock object inode_{ino} homes on slot {slot}, which this node's lock \
+             authority does not own, and no remote write-custody client is armed — refusing \
+             the range acquire [{},{}) rather than granting custody the owner never issued. \
+             Arm the multi-writer mount (SQUEEZEFS_MULTI_WRITER=1 with a PR-capable substrate \
+             and a stamped format) so the acquire can travel",
+            required.0, required.1
+        );
+        log::error!("{reason}");
+        return Err(SqueezefsError::LockFailed { reason });
+    };
+    match client.acquire_range(ino, required, desired, ttl).await? {
+        RangeAcquireOutcome::New { lease, span, .. } => {
+            Ok(crate::dlm::RangeAcquired::New { lease, span })
+        }
+        RangeAcquireOutcome::Extended { token, span, .. } => {
+            Ok(crate::dlm::RangeAcquired::Extended { token, span })
+        }
+    }
+}
+
 pub async fn acquire_remote(
     ino: u64,
     span: Option<(u64, u64)>,

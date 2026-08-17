@@ -1411,6 +1411,7 @@ async fn a_revoke_during_a_parked_acquire_never_commits_custody() {
         span: None,
         concurrent_write: false,
         wait_ms,
+        desired: None,
     };
 
     let lease_a = owner.join(&join("node-a")).expect("node-a joins");

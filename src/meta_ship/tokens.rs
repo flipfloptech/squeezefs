@@ -210,7 +210,11 @@ pub struct TokenCacheStats {
     pub evictions: u64,
     pub grants: u64,
     pub entries: u64,
+    /// Whole-object entries PLUS the S11 range-span extension (§9.2:
+    /// `dlm_token_cache_bytes` is "extended to count range-span state").
     pub bytes: u64,
+    /// Live cached range spans (the S11 rung-15 extension's gauge).
+    pub range_spans: u64,
     pub cap_entries: u64,
     pub owner_term: u64,
 }
@@ -218,13 +222,15 @@ pub struct TokenCacheStats {
 /// Read the cache's counters.
 pub fn token_cache_stats() -> TokenCacheStats {
     let entries = CACHE.len() as u64;
+    let range_spans = RANGE_SPANS.load(Ordering::Relaxed);
     TokenCacheStats {
         hits: HITS.load(Ordering::Relaxed),
         misses: MISSES.load(Ordering::Relaxed),
         evictions: EVICTIONS.load(Ordering::Relaxed),
         grants: GRANTS.load(Ordering::Relaxed),
         entries,
-        bytes: entries * ENTRY_BYTES,
+        bytes: entries * ENTRY_BYTES + range_spans * RANGE_SPAN_BYTES,
+        range_spans,
         cap_entries: cache_cap() as u64,
         owner_term: owner_term(),
     }
@@ -241,6 +247,166 @@ pub fn test_clear_token_cache() {
 /// The composed-token width, re-exported for the callers that need to
 /// reason about a miss's floor without importing the DLM.
 pub const TOKEN_GRANT_BITS: u32 = GRANT_SEQ_BITS;
+
+// ===========================================================================
+// DLM S11 rung 15 — the CLIENT RANGE CACHE (KD-MW-7,
+// docs/design-full-multi-writer.md §9.2: range grants are "cached
+// client-side in the S8 token cache keyed (ino, [start,end), mode,
+// token)").
+//
+// Unlike the whole-object token cache above (a bounded cache of owner
+// ANSWERS, retired by a clock sweep), the range cache mirrors LIVE
+// CUSTODY: entries enter on grant/extension, widen with the admit-time
+// merge, leave on release/lease-loss, and are REBUILT verbatim from the
+// renewal reply's range vector (the revalidation surface) — so its
+// population is bounded by this client's live grants, which the
+// authority's §9.2 caps already bound. Shedding it is always safe: the
+// next probe misses and the write path re-acquires (never a wrong
+// answer), which is why its R5 registration is floor-0/weight-1.
+// ===========================================================================
+
+/// Bytes charged per cached range span (the `dlm_grant_table_bytes`
+/// estimate's client-side twin — §9.2's ~48 B span arithmetic).
+const RANGE_SPAN_BYTES: u64 = 48;
+
+/// One cached range grant: the span and the token the grant carries
+/// (mode is EX by KD-MW-9's v1 issuance law — a mode field would be a
+/// constant).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RangeSpan {
+    start: u64,
+    end: u64,
+    token: u64,
+}
+
+/// Per-ino live range grants, small and sorted-by-start (the population
+/// is this client's live grants on one file — the §9.2 cap's bound).
+static RANGE_CACHE: Lazy<scc::HashMap<u64, Vec<RangeSpan>>> = Lazy::new(scc::HashMap::new);
+
+/// Cached range spans across all inos (the `dlm_token_cache_bytes` range
+/// extension's gauge word).
+static RANGE_SPANS: AtomicU64 = AtomicU64::new(0);
+
+/// Record (or WIDEN — same token, wider span: the admit-time merge's
+/// client face) a granted range.
+pub fn record_range_grant(ino: u64, span: (u64, u64), token: u64) {
+    ensure_token_cache_r5();
+    let mut added = 0i64;
+    let mut update = |spans: &mut Vec<RangeSpan>| {
+        if let Some(existing) = spans.iter_mut().find(|s| s.token == token) {
+            existing.start = existing.start.min(span.0);
+            existing.end = existing.end.max(span.1);
+        } else {
+            spans.push(RangeSpan {
+                start: span.0,
+                end: span.1,
+                token,
+            });
+            spans.sort_unstable_by_key(|s| s.start);
+            added = 1;
+        }
+    };
+    match RANGE_CACHE.entry_sync(ino) {
+        scc::hash_map::Entry::Occupied(mut occ) => update(occ.get_mut()),
+        scc::hash_map::Entry::Vacant(vac) => {
+            let mut spans = Vec::with_capacity(1);
+            update(&mut spans);
+            let _ = vac.insert_entry(spans);
+        }
+    }
+    if added > 0 {
+        RANGE_SPANS.fetch_add(added as u64, Ordering::Relaxed);
+    }
+}
+
+/// The covering probe: the token of a live cached grant covering
+/// `[start, end)` whole, or `None` (the caller acquires). This is the
+/// §6.5-item-1 mechanism for range writers — subsequent writes inside a
+/// granted stripe pay one lock-free read, no round trip.
+pub fn range_token_covering(ino: u64, start: u64, end: u64) -> Option<u64> {
+    if start >= end {
+        return None;
+    }
+    RANGE_CACHE
+        .read_sync(&ino, |_, spans| {
+            spans
+                .iter()
+                .find(|s| s.start <= start && s.end >= end)
+                .map(|s| s.token)
+        })
+        .flatten()
+}
+
+/// Retire one grant from the cache (release / grant-level revocation).
+pub fn retire_range_grant(ino: u64, token: u64) {
+    let mut removed = 0u64;
+    let _ = RANGE_CACHE.remove_if_sync(&ino, |spans| {
+        let before = spans.len();
+        spans.retain(|s| s.token != token);
+        removed = (before - spans.len()) as u64;
+        spans.is_empty()
+    });
+    if removed > 0 {
+        RANGE_SPANS.fetch_sub(removed, Ordering::Relaxed);
+    }
+}
+
+/// Drop EVERY cached range grant — the lease-loss path (a client whose
+/// custody lease died holds no range custody at all: a dead grant serving
+/// a covering probe would be the one wrong answer available here).
+pub fn clear_range_grants() {
+    let mut removed = 0u64;
+    RANGE_CACHE.retain_sync(|_, spans| {
+        removed += spans.len() as u64;
+        false
+    });
+    if removed > 0 {
+        RANGE_SPANS.fetch_sub(removed, Ordering::Relaxed);
+    }
+}
+
+/// **The renewal revalidation** (design §11: "custody lease carries
+/// optional range vector"): REPLACE the whole cache with the authority's
+/// answer — the vector is the authority's own record of this client's
+/// live range grants, so it is authoritative for presence AND absence
+/// (a released/revoked grant leaves the cache at the next renewal even
+/// if the local retire was lost).
+pub fn replace_range_grants(entries: &[(u64, (u64, u64), u64)]) {
+    clear_range_grants();
+    for (ino, span, token) in entries {
+        record_range_grant(*ino, *span, *token);
+    }
+}
+
+/// **Test seam**: drop the range cache, so a suite can exercise the cold
+/// arm and the renewal rebuild deliberately.
+pub fn test_clear_range_cache() {
+    clear_range_grants();
+}
+
+/// Register `dlm_token_cache_bytes` with the R5 authority (§9.2: the
+/// client-side member of the spec-named R5 pair). Floor 0, weight 1: both
+/// halves are re-earnable caches — the token half re-learns from the next
+/// owner reply, the range half from the next renewal's range vector — so
+/// a shed costs round trips, never a wrong answer.
+pub fn ensure_token_cache_r5() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        crate::mem_budget::MEM_BUDGET.register(crate::mem_budget::Component::new(
+            "dlm_token_cache_bytes",
+            0,
+            1,
+            std::sync::Arc::new(|| {
+                CACHE.len() as u64 * ENTRY_BYTES
+                    + RANGE_SPANS.load(Ordering::Relaxed) * RANGE_SPAN_BYTES
+            }),
+            std::sync::Arc::new(|_| {
+                CACHE.retain_sync(|_, _| false);
+                clear_range_grants();
+            }),
+        ));
+    });
+}
 
 // ===========================================================================
 // DLM S10 rung 11 — the RECALL LANE + THRASH VALVE ("brake before engine").

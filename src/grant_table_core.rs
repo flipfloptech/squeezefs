@@ -288,6 +288,20 @@ impl<L> GrantTableCore<L> {
         }
     }
 
+    /// S11 rung 15: record the WIDENED span of a grant the arbiter's
+    /// admit-time merge extended (the audit/reclaim surface must agree
+    /// with the custody actually held). `false` ⇔ the grant is gone (a
+    /// racing kill retired it — the widened record died whole with it).
+    pub fn widen_grant_span(&self, grant_id: u64, span: Option<(u64, u64)>) -> bool {
+        match self.lock_grants().get_mut(&grant_id) {
+            Some(g) => {
+                g.span = span;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Retire named grants at the client's request (ownership-checked).
     /// Dropping the `L` is what makes the bytes grantable again.
     pub fn release(&self, client: &str, grant_ids: &[u64]) -> usize {

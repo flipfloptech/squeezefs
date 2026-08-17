@@ -9922,6 +9922,13 @@ impl SqueezefsFilesystem {
                 // is the deferred S9 fan-out row's attribution (D11).
                 "dlm_custody": crate::data_grant::stats_json(),
                 "dlm_custody_phase_ns": crate::data_grant::phase_json(),
+                // S11 rung 15 (KD-MW-7): the byte-range custody ledger —
+                // grants/extensions/coalescing + the §9.2 refuse-loud
+                // bounds (`range_custody_cap_refusals` ≈ 0 below budget is
+                // the Issue-19 falsifier) and the spec-named R5 gauge
+                // `dlm_grant_table_bytes`. 0 in every field on a
+                // single-writer mount BY CONSTRUCTION.
+                "range_custody": crate::dlm::range_custody_stats_json(),
                 "meta_ship_publish": crate::meta_ship::publish::stats_json(),
                 "writeback_queue_depth": METRICS.writeback_queue_depth.to_json(),
                 "meta_flush_deferred": METRICS.meta_flush_deferred.load(Ordering::Relaxed),

@@ -31,12 +31,22 @@
 //! custody (W1's seventh ineligibility clause).
 
 use crate::error::Result;
+use crate::range_custody_core::{publish_floor_then_admit, FileCustody, Grant, RangePlan};
 use crate::stripe_locks::StripeLocks;
 use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use xxhash_rust::xxh3::xxh3_64;
+
+// The interval algebra itself — `LockMode`, the `FileCustody` sorted
+// interval list, the §9.2 required/desired plan with admit-time
+// coalescing, and the alignment/cap arithmetic — lives in
+// [`crate::range_custody_core`] (spec §6.9's fourth named loom
+// obligation, KD-MW-10; `#[path]`-included by `loom-models`). This module
+// keeps the POLICY: the lock table, the mint, the waiter protocol, the
+// R5 byte-budget ceiling and the geometry cap enforcement.
+pub use crate::range_custody_core::{block_align_out, range_span_cap, LockMode};
 
 /// Typed lock/fencing object key — the **file identity**.
 ///
@@ -81,278 +91,6 @@ impl ObjectKey {
             Self::Ino(i) => *i,
             Self::Path(p) => xxh3_64(p.as_bytes()),
         }
-    }
-}
-
-/// Lock mode (spec §6.7 "Lock modes": *"Four modes plus capability bits
-/// (NL / CR / CW / EX with LOOKUP, UPDATE, PERM, LAYOUT, XATTR, DATA
-/// bits) covers every shape in this filesystem … CW should ship disabled
-/// until a verb issues it, per the no-dead-code rule"*).
-///
-/// **Shipped subset, and why it is a subset.** The no-dead-code law
-/// admits a public surface the stage above needs; it does not admit modes
-/// with no issuer, no observable semantic and no test:
-///
-/// | Mode | State | Issuer |
-/// |------|-------|--------|
-/// | **EX** — exclusive | shipped, default | every production acquire (`acquire_lock`) |
-/// | **CW** — concurrent write | **shipped DISABLED** ([`test_arm_cw_mode`]) | none yet — S9/S11 issue it; §6.7 requires the mode to exist and to be unreachable until then |
-/// | *CR* — concurrent read | absent | nothing takes a READ lease (§6.2 census: readers take no leases at all). It lands with **S5** read-only coherent mounts, which is the verb that gives it meaning |
-/// | *NL* — null | absent | NL exists to park a resource handle across a *conversion*; this manager has no conversion verb and no client-side handle to park, so an NL variant would be unconstructible-and-unobservable. It lands with **S9**'s conversion protocol |
-/// | capability bits | absent | LOOKUP/UPDATE/PERM/XATTR partition *metadata* locks, and metadata ops take no cluster lease today (§6.2). They land with **S8** function-shipped metadata, whose verbs are the issuers |
-///
-/// The compatibility matrix over the shipped modes:
-///
-/// ```text
-///        EX   CW
-///   EX    N    N
-///   CW    N    Y
-/// ```
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum LockMode {
-    /// EX — exclusive custody of the span: compatible with nothing.
-    Exclusive,
-    /// CW — concurrent write: two CW holders may cover the same span and
-    /// coordinate at a finer grain themselves (the classic DLM semantic).
-    /// **Ships disabled** — [`LocalLockManager::acquire_lock_mode`]
-    /// refuses it until [`test_arm_cw_mode`] arms it.
-    ConcurrentWrite,
-}
-
-impl LockMode {
-    /// The §6.7 compatibility matrix: `true` ⇔ two grants in these modes
-    /// may cover overlapping bytes at the same time.
-    pub const fn compatible_with(self, other: Self) -> bool {
-        matches!(
-            (self, other),
-            (Self::ConcurrentWrite, Self::ConcurrentWrite)
-        )
-    }
-}
-
-/// One live grant in a file's custody table: the span it protects, its
-/// owner, its mode, and the fencing token minted at grant. The token is
-/// globally unique (S1's single mint), which makes it the grant's exact
-/// removal identity — two grants of the same span by the same client
-/// (possible only under compatible modes) can never be confused.
-#[derive(Clone, Copy, Debug)]
-struct Grant {
-    start: u64,
-    end: u64,
-    owner_nonce: u64,
-    token: u64,
-    mode: LockMode,
-}
-
-impl Grant {
-    #[inline]
-    fn overlaps(&self, start: u64, end: u64) -> bool {
-        self.end > start && self.start < end
-    }
-
-    #[inline]
-    fn covers(&self, start: u64, end: u64) -> bool {
-        self.start <= start && self.end >= end
-    }
-
-    #[inline]
-    fn len(&self) -> u64 {
-        self.end - self.start
-    }
-}
-
-/// A file's custody: the whole-file slot plus the live byte-range grants,
-/// as a **sorted interval list** (S11 — spec §6.9).
-///
-/// **Why a sorted `Vec` and not a tree.** Acquisition is per
-/// *open-for-write episode*, not per op (`get_or_acquire_lease` caches in
-/// `active_leases` — §6.2), so this structure is not on the op hot path;
-/// what it must be is cheap at the population it actually sees and free
-/// for the whole-file path that ships today. The population bound is
-/// **live grants on ONE file** = concurrently held leases on it (entries
-/// are retired at release, never accumulated per span ever locked) —
-/// one per writing application/rank, so tens, not millions. At that size
-/// a contiguous 40-byte-element array beats every pointer structure on
-/// constants, and it costs ZERO when empty (`Vec::new` does not
-/// allocate), which is what keeps the shipped whole-file path unchanged.
-///
-/// Costs:
-///
-/// | Operation | Cost |
-/// |---|---|
-/// | whole-file EX acquire / release (the shipped path) | O(1) — two `is_empty` probes |
-/// | range acquire (conflict probe) | O(log n + c), `c` = grants in the stab window |
-/// | range acquire (admit) | O(n) memmove |
-/// | range release | O(log n) locate + O(n) memmove (+ O(n) only when the widest grant leaves) |
-/// | fencing read (`read_identity`) | O(1) — `max_token` |
-/// | [`span_range_shared`] (the W1 clause) | O(log n + c) |
-///
-/// The stab window: any grant overlapping `[s,e)` has `start < e` and
-/// `start + len > s`, and `len ≤ widest`, so the candidates are exactly
-/// the grants with `start ∈ (s − widest, e)` — two `partition_point`s.
-/// `widest` is a monotone over-approximation on admit (max) and exact on
-/// release (recomputed only when the widest grant is the one leaving), so
-/// it can never shrink below a live grant's length and can never miss a
-/// conflict.
-struct FileCustody {
-    /// Live `range: None` grants — whole-inode custody. A list, not an
-    /// `Option`: under a compatible mode (CW) two whole-file grants may
-    /// coexist, and silently overwriting one would strand its release.
-    /// EX — every shipped acquire — keeps this at most one deep, and the
-    /// fast path only ever asks `is_empty()`.
-    wholes: Vec<Grant>,
-    /// Live byte-range grants, sorted by `(start, token)`.
-    ranges: Vec<Grant>,
-    /// `max(end − start)` over `ranges` — the stab-window bound.
-    widest: u64,
-    /// The newest fencing token granted while this entry has been live:
-    /// the object's exact generation read (see [`read_identity`]).
-    max_token: u64,
-}
-
-impl FileCustody {
-    /// A fresh entry holding exactly `grant`.
-    fn opened(span: Option<(u64, u64)>, grant: Grant) -> Self {
-        let mut custody = Self {
-            wholes: Vec::new(),
-            ranges: Vec::new(),
-            widest: 0,
-            max_token: 0,
-        };
-        custody.admit(span, grant);
-        custody
-    }
-
-    /// The grants that could overlap `[start, end)` — the stab window.
-    fn candidates(&self, start: u64, end: u64) -> &[Grant] {
-        if self.ranges.is_empty() {
-            return &[];
-        }
-        let lo = self
-            .ranges
-            .partition_point(|g| g.start.saturating_add(self.widest) <= start);
-        let hi = self.ranges.partition_point(|g| g.start < end);
-        &self.ranges[lo..hi.max(lo)]
-    }
-
-    /// Would a `span`/`mode` request conflict with what is live?
-    fn conflicts(&self, span: Option<(u64, u64)>, mode: LockMode) -> bool {
-        // Whole-inode custody covers every span, so it is checked first
-        // whatever the request is. EX (the shipped mode) makes this
-        // `!is_empty()`.
-        if self.wholes.iter().any(|w| !w.mode.compatible_with(mode)) {
-            return true;
-        }
-        match span {
-            // A whole-file request covers every span on the file, so any
-            // incompatible live range conflicts. EX — every shipped
-            // acquire — short-circuits to `is_empty()`: O(1), the
-            // pre-S11 cost.
-            None => match mode {
-                LockMode::Exclusive => !self.ranges.is_empty(),
-                _ => self.ranges.iter().any(|g| !g.mode.compatible_with(mode)),
-            },
-            Some((start, end)) => self
-                .candidates(start, end)
-                .iter()
-                .any(|g| g.overlaps(start, end) && !g.mode.compatible_with(mode)),
-        }
-    }
-
-    /// Record a granted lock. Callers must have cleared [`Self::conflicts`].
-    fn admit(&mut self, span: Option<(u64, u64)>, grant: Grant) {
-        self.max_token = self.max_token.max(grant.token);
-        match span {
-            None => self.wholes.push(grant),
-            Some(_) => {
-                let at = self
-                    .ranges
-                    .partition_point(|g| (g.start, g.token) < (grant.start, grant.token));
-                self.widest = self.widest.max(grant.len());
-                self.ranges.insert(at, grant);
-            }
-        }
-    }
-
-    /// Retire one grant, nonce- and token-conditional (the pre-S11
-    /// `remove_if_sync(|held| held.owner_nonce == nonce)` discipline,
-    /// strengthened by the globally unique token). `true` ⇔ something was
-    /// retired, which is what licenses the waiter wake.
-    fn retire(&mut self, span: Option<(u64, u64)>, token: u64, owner_nonce: u64) -> bool {
-        let mine = |g: &Grant| g.token == token && g.owner_nonce == owner_nonce;
-        match span {
-            None => match self.wholes.iter().position(mine) {
-                Some(at) => {
-                    self.wholes.remove(at);
-                    true
-                }
-                None => false,
-            },
-            Some((start, _)) => {
-                // The list is sorted by `(start, token)` and that pair is
-                // exactly this grant's insertion key, so the search lands
-                // on it or on a stranger.
-                let at = self
-                    .ranges
-                    .partition_point(|g| (g.start, g.token) < (start, token));
-                match self.ranges.get(at) {
-                    Some(g) if mine(g) => {
-                        let len = g.len();
-                        self.ranges.remove(at);
-                        if self.ranges.is_empty() {
-                            self.widest = 0;
-                        } else if len == self.widest {
-                            self.widest =
-                                self.ranges.iter().map(Grant::len).max().unwrap_or_default();
-                        }
-                        true
-                    }
-                    _ => false,
-                }
-            }
-        }
-    }
-
-    /// Is a grant carrying `token` live on this file?
-    ///
-    /// A token is globally unique per mint, so an affirmative answer names
-    /// exactly ONE grant — which is what lets DLM S9's adoption recognise
-    /// "this is the grant I was just issued, seen from the grantee's side".
-    fn holds_token(&self, token: u64) -> bool {
-        self.wholes
-            .iter()
-            .chain(self.ranges.iter())
-            .any(|g| g.token == token)
-    }
-
-    /// Does this client still hold the grant a lease names?
-    fn holds(&self, token: u64, owner_nonce: u64) -> bool {
-        self.wholes
-            .iter()
-            .chain(self.ranges.iter())
-            .any(|g| g.token == token && g.owner_nonce == owner_nonce)
-    }
-
-    fn is_vacant(&self) -> bool {
-        self.wholes.is_empty() && self.ranges.is_empty()
-    }
-
-    /// Raise the object's readable generation without taking custody
-    /// (the [`test_bump_fencing_generation`] seam).
-    fn bump_generation(&mut self, token: u64) {
-        self.max_token = self.max_token.max(token);
-    }
-
-    /// W1 clause 7's question: is `[start, end)` under byte-range custody
-    /// that `holder_token`'s writer does not solely own?
-    ///
-    /// A live WHOLE-FILE grant is whole-inode custody by definition and is
-    /// therefore never range-shared — which is why the clause is inert on
-    /// the shipped write path (it takes exactly that lease).
-    fn span_is_range_shared(&self, start: u64, end: u64, holder_token: u64) -> bool {
-        self.candidates(start, end)
-            .iter()
-            .any(|g| g.overlaps(start, end) && (g.token != holder_token || !g.covers(start, end)))
     }
 }
 
@@ -513,10 +251,12 @@ pub fn adopt_remote_grant(
                 conflicted = true;
             } else {
                 custody.admit(span, grant);
+                note_record_admitted(span);
             }
         }
         scc::hash_map::Entry::Vacant(vac) => {
             let _ = vac.insert_entry(FileCustody::opened(span, grant));
+            note_record_admitted(span);
         }
     }
     if conflicted {
@@ -569,7 +309,7 @@ pub fn adopt_remote_grant(
 /// floor (a monotone over-approximation) — and on a foreign-home object the
 /// sound fallback is not the floor but S8's cached grant.
 pub fn live_custody_generation(ino: u64) -> Option<u64> {
-    LOCK_MAP.read_sync(&ObjectKey::Ino(ino), |_, custody| custody.max_token)
+    LOCK_MAP.read_sync(&ObjectKey::Ino(ino), |_, custody| custody.max_token())
 }
 
 pub fn span_range_shared(ino: u64, start: u64, end: u64, holder_token: u64) -> bool {
@@ -579,6 +319,243 @@ pub fn span_range_shared(ino: u64, start: u64, end: u64, holder_token: u64) -> b
     LOCK_MAP
         .read_sync(&ObjectKey::Ino(ino), |_, custody| {
             custody.span_is_range_shared(start, end, holder_token)
+        })
+        .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
+// DLM S11 rung 15 — the §9.2 bounds/R5 policy (KD-MW-7,
+// docs/design-full-multi-writer.md; PR-plan row 15)
+// ---------------------------------------------------------------------------
+
+/// Bytes charged per live grant record for the `dlm_grant_table_bytes`
+/// gauge: the 40-byte [`Grant`] plus its amortized `Vec` slot — the §9.2
+/// arithmetic's "~48 B" (*"spans are ~48 B, so even the 1 TiB block-cyclic
+/// shape is ~262,144 spans ≈ 12 MiB"*). A billing estimate for the R5
+/// authority, not a byte-exact malloc trace (the metadata_cache precedent:
+/// the VALUE is the ceiling, not the accounting).
+pub const RANGE_GRANT_RECORD_BYTES: u64 = 48;
+
+/// Live grant records across the process's custody table — wholes AND
+/// ranges (§9.2: the gauge is "`FileCustody` wholes + ranges"), issued and
+/// adopted alike: every record is RAM this process holds.
+static GRANT_RECORDS: AtomicU64 = AtomicU64::new(0);
+
+// The S11 range-custody ledger (design §13's named family).
+static RANGE_GRANTS: AtomicU64 = AtomicU64::new(0);
+static RANGE_EXTENSIONS: AtomicU64 = AtomicU64::new(0);
+static RANGE_COVERED_SERVES: AtomicU64 = AtomicU64::new(0);
+static RANGE_RELEASES: AtomicU64 = AtomicU64::new(0);
+static RANGE_ACTIVE: AtomicU64 = AtomicU64::new(0);
+static RANGE_CONFLICTS: AtomicU64 = AtomicU64::new(0);
+static RANGE_WAITS: AtomicU64 = AtomicU64::new(0);
+static RANGE_DESIRED_TRIMS: AtomicU64 = AtomicU64::new(0);
+static RANGE_CAP_REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+/// A grant record became live (any admit site — issue or adoption).
+fn note_record_admitted(span: Option<(u64, u64)>) {
+    GRANT_RECORDS.fetch_add(1, Ordering::Relaxed);
+    if span.is_some() {
+        RANGE_ACTIVE.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A grant record retired (the one unlock path).
+fn note_record_retired(span: Option<(u64, u64)>) {
+    GRANT_RECORDS.fetch_sub(1, Ordering::Relaxed);
+    if span.is_some() {
+        RANGE_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+        RANGE_RELEASES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The `dlm_grant_table_bytes` gauge (§9.2's spec-named R5 component):
+/// live grant records × the per-record estimate.
+pub fn grant_table_bytes() -> u64 {
+    GRANT_RECORDS.load(Ordering::Relaxed) * RANGE_GRANT_RECORD_BYTES
+}
+
+/// Live byte-range grant records on one inode — the per-file face of the
+/// gauge (race-free per ino, which is what the convergence contracts
+/// assert against).
+pub fn live_range_records(ino: u64) -> usize {
+    LOCK_MAP
+        .read_sync(&ObjectKey::Ino(ino), |_, custody| custody.ranges_len())
+        .unwrap_or(0)
+}
+
+/// The budget seam (the `test_swap_grant_seq` precedent): `Some(bytes)`
+/// replaces the derived share, `None` restores it. Production never calls
+/// it — the derived share cannot be reached deterministically by a test
+/// without weeks of grants. (`Some(0)` is not expressible; 0 is the
+/// "derived" sentinel, and a zero share would refuse every grant — a
+/// configuration no test wants.)
+static RANGE_BUDGET_OVERRIDE: AtomicU64 = AtomicU64::new(0);
+
+/// **Test seam**: swap the range grant-table byte budget.
+pub fn test_swap_range_table_budget(bytes: Option<u64>) -> Option<u64> {
+    let prev = RANGE_BUDGET_OVERRIDE.swap(bytes.unwrap_or(0), Ordering::AcqRel);
+    (prev != 0).then_some(prev)
+}
+
+/// Is `reason` a §9.2 capacity-class refusal (geometry cap, byte budget,
+/// Red clamp — as opposed to a conflicting-custody one)? The wire's
+/// status classifier (`CUSTODY_AT_CAPACITY` vs `CUSTODY_CONFLICT`),
+/// matching the three refusal messages' own distinctive phrases so no
+/// second error taxonomy exists — the reason text IS the operator
+/// surface, and each phrase has exactly one producer in
+/// [`LocalLockManager::acquire_lock_range_scoped`].
+pub fn is_range_capacity_refusal(reason: &str) -> bool {
+    reason.contains("geometry-derived span cap")
+        || reason.contains("dlm_grant_table_bytes")
+        || reason.contains("R5 authority is RED")
+}
+
+/// The grant table's byte budget — the `dlm_grant_table_bytes` R5 share,
+/// enforced at admission (§9.2: *"the real ceiling is the byte budget …
+/// At budget the acquire refuses loud … never a silent trim of
+/// required"*).
+///
+/// Derived: `R5 budget / 256`, floor 16 MiB. The divisor prices custody
+/// bookkeeping as a sliver of the memory budget (64 MiB at the 16 GiB
+/// reference — ~1.4 M live spans); the floor's reason: §9.2's own
+/// arithmetic prices the 1 TiB block-cyclic decomposition at ~262,144
+/// spans ≈ 12 MiB, and a share below it would refuse the workload S11
+/// exists for — the Issue-19 class (a constant refusing a legitimate
+/// shape). No env knob: the seam above is the only override, and it is a
+/// test seam.
+pub fn range_table_budget_bytes() -> u64 {
+    let over = RANGE_BUDGET_OVERRIDE.load(Ordering::Acquire);
+    if over != 0 {
+        return over;
+    }
+    (crate::mem_budget::MEM_BUDGET.budget_bytes() / 256).max(16 * 1024 * 1024)
+}
+
+/// Register `dlm_grant_table_bytes` with the R5 authority (§9.2: both
+/// gauges are R5 components). Floor 0, weight 0: live custody can never
+/// be SHED — dropping a grant a holder still presents would be silent
+/// revocation — so the pressure response is at ADMISSION (the ceiling
+/// above refuses loud, and a Red level clamps new admits; converge by
+/// release, never OOM — the write_pipeline_inflight law).
+pub fn ensure_grant_table_r5() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        crate::mem_budget::MEM_BUDGET
+            .register(crate::mem_budget::Component::new(
+                "dlm_grant_table_bytes",
+                0,
+                0, // weight 0: never shed — admission refuses instead (§9.2)
+                Arc::new(grant_table_bytes),
+                Arc::new(|_| {}),
+            ));
+    });
+}
+
+/// The S11 range-custody ledger snapshot (design §13's family).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RangeCustodyStats {
+    /// NEW range grants admitted (issue-side: local acquires and the
+    /// authority's arbiter — a client's adoption repeats its authority's
+    /// issue and is deliberately not double-counted).
+    pub grants: u64,
+    /// Admit-time merges: asks answered by WIDENING an existing grant
+    /// (the §9.2 coalescing engaging — the adversarial shape's converge).
+    pub extensions: u64,
+    /// Asks answered by an existing covering grant (idempotent re-asks —
+    /// a healthy client's cache serves these without a round trip).
+    pub covered_serves: u64,
+    /// Range grant records retired.
+    pub releases: u64,
+    /// Live range grant records (gauge).
+    pub active: u64,
+    /// Ranged acquires refused for conflicting custody.
+    pub conflicts: u64,
+    /// Ranged acquires that parked at least once before resolving.
+    pub waits: u64,
+    /// Grants whose DESIRED was clipped against live custody (required is
+    /// structurally never trimmed).
+    pub desired_trims: u64,
+    /// Admissions refused by the geometry cap or the R5 byte budget —
+    /// the refuse-loud arm (≈ 0 on legitimate shapes below budget: the
+    /// Issue-19 falsifier).
+    pub cap_refusals: u64,
+}
+
+/// Read the process's range-custody ledger.
+pub fn range_custody_stats() -> RangeCustodyStats {
+    RangeCustodyStats {
+        grants: RANGE_GRANTS.load(Ordering::Relaxed),
+        extensions: RANGE_EXTENSIONS.load(Ordering::Relaxed),
+        covered_serves: RANGE_COVERED_SERVES.load(Ordering::Relaxed),
+        releases: RANGE_RELEASES.load(Ordering::Relaxed),
+        active: RANGE_ACTIVE.load(Ordering::Relaxed),
+        conflicts: RANGE_CONFLICTS.load(Ordering::Relaxed),
+        waits: RANGE_WAITS.load(Ordering::Relaxed),
+        desired_trims: RANGE_DESIRED_TRIMS.load(Ordering::Relaxed),
+        cap_refusals: RANGE_CAP_REFUSALS.load(Ordering::Relaxed),
+    }
+}
+
+/// The `range_custody` stats-inode object (design §13) — 0 in every field
+/// on a single-writer mount BY CONSTRUCTION (no product verb issues a
+/// range grant without the armed co-writer path).
+pub fn range_custody_stats_json() -> serde_json::Value {
+    let s = range_custody_stats();
+    serde_json::json!({
+        "range_custody_grants": s.grants,
+        "range_custody_extensions": s.extensions,
+        "range_custody_covered_serves": s.covered_serves,
+        "range_custody_releases": s.releases,
+        "range_custody_active": s.active,
+        "range_custody_conflicts": s.conflicts,
+        "range_custody_waits": s.waits,
+        "range_custody_desired_trims": s.desired_trims,
+        "range_custody_cap_refusals": s.cap_refusals,
+        "dlm_grant_table_bytes": grant_table_bytes(),
+        "dlm_grant_table_budget_bytes": range_table_budget_bytes(),
+    })
+}
+
+/// One [`LocalLockManager::acquire_lock_range`] outcome.
+#[derive(Debug)]
+pub enum RangeAcquired {
+    /// A fresh grant: hold the lease — dropping/releasing it retires the
+    /// span.
+    New {
+        lease: LockLease,
+        /// The granted span — the conflict-free desired-subset, ⊇ required.
+        span: (u64, u64),
+    },
+    /// An existing same-scope grant was WIDENED in place (the §9.2
+    /// admit-time merge): same token, same release identity, wider span.
+    /// No new lease exists — the original holder's lease now covers
+    /// `span`.
+    Extended { token: u64, span: (u64, u64) },
+    /// An existing same-scope grant already covers `required` (idempotent
+    /// re-ask). Nothing was mutated and nothing was minted.
+    Covered { token: u64, span: (u64, u64) },
+}
+
+/// The merge-scope namespace for an authority's per-lease grants: lease
+/// epochs and process client nonces are both small integers minted from 1,
+/// so the high bit keeps the two scope spaces disjoint (a process would
+/// need 2^63 `DlmClient` constructions to collide — not a reachable
+/// state).
+pub fn range_scope_for_epoch(lease_epoch: u64) -> u64 {
+    lease_epoch | (1 << 63)
+}
+
+/// DLM S9's client half of an EXTENSION: the authority widened a grant
+/// this process had already adopted — widen the local record to match
+/// (same token, same release identity; the local table is a repeat of the
+/// authority's decision, so no local conflict probe re-arbitrates it).
+/// `false` ⇔ no local record carries `token` (the grant died between the
+/// reply and this call — the caller treats it as lease-lost).
+pub fn widen_adopted_grant(ino: u64, token: u64, span: (u64, u64)) -> bool {
+    LOCK_MAP
+        .update_sync(&ObjectKey::Ino(ino), |_, custody| {
+            custody.widen_grant(token, span)
         })
         .unwrap_or(false)
 }
@@ -756,7 +733,7 @@ fn grant_floor(identity: &ObjectKey) -> &'static AtomicU64 {
 /// the identity, so retiring the last grant cannot lower it.
 fn read_identity(identity: &ObjectKey) -> u64 {
     LOCK_MAP
-        .read_sync(identity, |_, custody| custody.max_token)
+        .read_sync(identity, |_, custody| custody.max_token())
         .unwrap_or_else(|| {
             grant_floor(identity)
                 .load(Ordering::Acquire)
@@ -950,8 +927,16 @@ impl LocalLockManager {
                         match mint_token() {
                             Err(seq) => Mint::Exhausted(seq),
                             Ok(token) => {
-                                grant_floor(&key).fetch_max(token, Ordering::AcqRel);
-                                custody.admit(range, self.grant(range, token, mode));
+                                // The S1 publication order, through the
+                                // core's own protocol fn (loom-modeled):
+                                // floor BEFORE visibility.
+                                publish_floor_then_admit(grant_floor(&key), token, || {
+                                    custody.admit(range, self.grant(range, token, mode))
+                                });
+                                note_record_admitted(range);
+                                if range.is_some() {
+                                    RANGE_GRANTS.fetch_add(1, Ordering::Relaxed);
+                                }
                                 Mint::Granted(token)
                             }
                         }
@@ -963,11 +948,16 @@ impl LocalLockManager {
                     // inserted — the caller holds no lock.
                     Err(seq) => Mint::Exhausted(seq),
                     Ok(token) => {
-                        grant_floor(&key).fetch_max(token, Ordering::AcqRel);
-                        let _ = vac.insert_entry(FileCustody::opened(
-                            range,
-                            self.grant(range, token, mode),
-                        ));
+                        publish_floor_then_admit(grant_floor(&key), token, || {
+                            let _ = vac.insert_entry(FileCustody::opened(
+                                range,
+                                self.grant(range, token, mode),
+                            ));
+                        });
+                        note_record_admitted(range);
+                        if range.is_some() {
+                            RANGE_GRANTS.fetch_add(1, Ordering::Relaxed);
+                        }
                         Mint::Granted(token)
                     }
                 },
@@ -1008,6 +998,286 @@ impl LocalLockManager {
                          wait budget"
                     ),
                 });
+            }
+        }
+    }
+
+    /// Acquire an **EX byte-range** lease by the §9.2 required/desired
+    /// law: grant the largest desired-subset that conflicts with nothing —
+    /// **never less than `required`** (a foreign grant overlapping
+    /// required waits/refuses; desired is always trimmable), with
+    /// **admit-time coalescing** (an ask adjacent to or overlapping the
+    /// same scope's live grant WIDENS that grant — same token, no new
+    /// record — which is what converges the adversarial tiny-ranges shape
+    /// to O(1) spans), the **geometry-derived per-file span cap**
+    /// `max(16, ceil(size / block_size))` and the **`dlm_grant_table_bytes`
+    /// R5 byte-budget ceiling**, both refuse-loud naming their arithmetic
+    /// (no free span constants — Issue-19's law).
+    ///
+    /// EX-only by construction: KD-MW-9's v1 issuance law (*"v1 issues EX
+    /// only"*) — the moded span path stays [`Self::acquire_lock_mode`],
+    /// where CW ships disabled.
+    ///
+    /// `geometry` = `(file_size, block_size)` for the per-file cap;
+    /// `None` (an authority with no geometry source) runs the byte budget
+    /// alone — a conjured default size would be exactly the constant
+    /// Issue-19 forbids.
+    pub async fn acquire_lock_range(
+        &self,
+        file_path: &str,
+        required: (u64, u64),
+        desired: (u64, u64),
+        ttl: Duration,
+        geometry: Option<(u64, u64)>,
+    ) -> Result<RangeAcquired> {
+        self.acquire_lock_range_scoped(file_path, required, desired, ttl, geometry, None)
+            .await
+    }
+
+    /// [`Self::acquire_lock_range`] with an explicit MERGE SCOPE — the
+    /// holder identity grants coalesce under. The S9 authority passes
+    /// [`range_scope_for_epoch`] of the client's lease epoch (one scope
+    /// per client lease); `None` = this manager's own nonce (the local
+    /// caller).
+    pub async fn acquire_lock_range_scoped(
+        &self,
+        file_path: &str,
+        required: (u64, u64),
+        desired: (u64, u64),
+        ttl: Duration,
+        geometry: Option<(u64, u64)>,
+        merge_scope: Option<u64>,
+    ) -> Result<RangeAcquired> {
+        if required.0 >= required.1 {
+            let reason = format!(
+                "malformed required range [{},{}) on {file_path}: spans are [start,end) with \
+                 end EXCLUSIVE and must be non-empty — refusing to grant custody over zero \
+                 bytes",
+                required.0, required.1
+            );
+            log::error!("{reason}");
+            return Err(crate::error::SqueezefsError::LockFailed { reason });
+        }
+        if desired.0 > required.0 || desired.1 < required.1 {
+            let reason = format!(
+                "malformed desired window [{},{}) on {file_path}: desired must CONTAIN \
+                 required [{},{}) (desired is the best-effort stretch, required the \
+                 never-trimmed floor — §9.2)",
+                desired.0, desired.1, required.0, required.1
+            );
+            log::error!("{reason}");
+            return Err(crate::error::SqueezefsError::LockFailed { reason });
+        }
+        let scope = merge_scope.unwrap_or(self.client_nonce);
+        let span_cap = geometry.map(|(size, block)| range_span_cap(size, block));
+        let key = ObjectKey::from_path(file_path);
+        let notify = LOCK_WAITERS.get_inode_lock(key.stripe_seed());
+        let deadline = std::time::Instant::now() + ttl;
+        let mut parked = false;
+
+        /// The one-critical-section outcome (plan AND apply under the
+        /// entry lock — a plan can never go stale before its admit).
+        enum RangeMint {
+            New { token: u64, span: (u64, u64) },
+            Extended { token: u64, span: (u64, u64) },
+            Covered { token: u64, span: (u64, u64) },
+            Held,
+            Bridge,
+            CapGeometry { live: usize, cap: u64 },
+            CapBudget { bytes: u64, budget: u64 },
+            Red { bytes: u64 },
+            Exhausted(u64),
+        }
+
+        loop {
+            let mut notified = notify.notified_raw();
+            // Register interest BEFORE the availability check (the
+            // lost-wakeup discipline).
+            notified.enable();
+
+            let mem_red = crate::mem_budget::level() == crate::mem_budget::Level::Red;
+            let decide = |custody: &mut FileCustody| -> RangeMint {
+                let decision = custody.plan_range(required, desired, scope);
+                match decision.plan {
+                    RangePlan::HeldForeign => RangeMint::Held,
+                    RangePlan::BridgeRefused => RangeMint::Bridge,
+                    RangePlan::Covered { token, span } => RangeMint::Covered { token, span },
+                    RangePlan::Extend { token, span } => {
+                        // The merge rides the admit: widen in place, keep
+                        // the token, mint nothing, add no record — so the
+                        // caps structurally cannot refuse a coalescing ask.
+                        if decision.trimmed {
+                            RANGE_DESIRED_TRIMS.fetch_add(1, Ordering::Relaxed);
+                        }
+                        let widened = custody.widen_grant(token, span);
+                        debug_assert!(widened, "plan and apply share one critical section");
+                        RANGE_EXTENSIONS.fetch_add(1, Ordering::Relaxed);
+                        RangeMint::Extended { token, span }
+                    }
+                    RangePlan::New { span } => {
+                        // The §9.2 bounds, in refusal order: the file's own
+                        // geometry, then the R5 byte budget, then the Red
+                        // clamp. All BEFORE the mint (never burn a token
+                        // on a refused acquisition).
+                        let live = custody.ranges_len();
+                        if let Some(cap) = span_cap {
+                            if (live as u64) >= cap {
+                                return RangeMint::CapGeometry { live, cap };
+                            }
+                        }
+                        let bytes = grant_table_bytes();
+                        let budget = range_table_budget_bytes();
+                        if bytes + RANGE_GRANT_RECORD_BYTES > budget {
+                            return RangeMint::CapBudget { bytes, budget };
+                        }
+                        if mem_red {
+                            return RangeMint::Red { bytes };
+                        }
+                        match mint_token() {
+                            Err(seq) => RangeMint::Exhausted(seq),
+                            Ok(token) => {
+                                if decision.trimmed {
+                                    RANGE_DESIRED_TRIMS.fetch_add(1, Ordering::Relaxed);
+                                }
+                                publish_floor_then_admit(grant_floor(&key), token, || {
+                                    custody.admit(
+                                        Some(span),
+                                        Grant {
+                                            start: span.0,
+                                            end: span.1,
+                                            owner_nonce: scope,
+                                            token,
+                                            mode: LockMode::Exclusive,
+                                        },
+                                    )
+                                });
+                                note_record_admitted(Some(span));
+                                RANGE_GRANTS.fetch_add(1, Ordering::Relaxed);
+                                RangeMint::New { token, span }
+                            }
+                        }
+                    }
+                }
+            };
+
+            let outcome = match LOCK_MAP.entry_sync(key.clone()) {
+                scc::hash_map::Entry::Occupied(mut occ) => decide(occ.get_mut()),
+                scc::hash_map::Entry::Vacant(vac) => {
+                    let mut fresh = FileCustody::empty();
+                    let outcome = decide(&mut fresh);
+                    if !fresh.is_vacant() {
+                        let _ = vac.insert_entry(fresh);
+                    }
+                    outcome
+                }
+            };
+
+            match outcome {
+                RangeMint::New { token, span } => {
+                    return Ok(RangeAcquired::New {
+                        lease: LockLease {
+                            inner: Arc::new(LockLeaseInner {
+                                key,
+                                span: Some(span),
+                                client_nonce: scope,
+                                fencing_token: token,
+                                released: AtomicBool::new(false),
+                                remote: None,
+                            }),
+                        },
+                        span,
+                    });
+                }
+                RangeMint::Extended { token, span } => {
+                    return Ok(RangeAcquired::Extended { token, span });
+                }
+                RangeMint::Covered { token, span } => {
+                    RANGE_COVERED_SERVES.fetch_add(1, Ordering::Relaxed);
+                    return Ok(RangeAcquired::Covered { token, span });
+                }
+                RangeMint::Bridge => {
+                    let reason = format!(
+                        "range acquire [{},{}) on {file_path}: required overlaps TWO OR MORE \
+                         of this holder's own live grants (the bridge ask) — merging would \
+                         absorb a second live grant record whose release handle is \
+                         outstanding, so the shape refuses loud; a client whose range cache \
+                         answers covering probes never builds it (§9.2)",
+                        required.0, required.1
+                    );
+                    log::error!("{reason}");
+                    return Err(crate::error::SqueezefsError::LockFailed { reason });
+                }
+                RangeMint::CapGeometry { live, cap } => {
+                    RANGE_CAP_REFUSALS.fetch_add(1, Ordering::Relaxed);
+                    let reason = format!(
+                        "range acquire [{},{}) on {file_path}: the file already carries \
+                         {live} live range grants, at its geometry-derived span cap {cap} = \
+                         max(16, ceil(size / block_size)) — a NEW span refuses loud (never a \
+                         silent trim of required); release or let coalescible custody merge \
+                         (§9.2; the cap is the file's own geometry, never a constant)",
+                        required.0, required.1
+                    );
+                    log::error!("{reason}");
+                    return Err(crate::error::SqueezefsError::LockFailed { reason });
+                }
+                RangeMint::CapBudget { bytes, budget } => {
+                    RANGE_CAP_REFUSALS.fetch_add(1, Ordering::Relaxed);
+                    let reason = format!(
+                        "range acquire [{},{}) on {file_path}: the grant table is at its R5 \
+                         byte budget — dlm_grant_table_bytes {bytes} B + {RANGE_GRANT_RECORD_BYTES} B \
+                         for the new record would exceed the share {budget} B (derived: R5 \
+                         budget / 256, floor 16 MiB) — refusing loud rather than trimming \
+                         required; the table converges by RELEASE (§9.2)",
+                        required.0, required.1
+                    );
+                    log::error!("{reason}");
+                    return Err(crate::error::SqueezefsError::LockFailed { reason });
+                }
+                RangeMint::Red { bytes } => {
+                    RANGE_CAP_REFUSALS.fetch_add(1, Ordering::Relaxed);
+                    let reason = format!(
+                        "range acquire [{},{}) on {file_path}: the R5 authority is RED — new \
+                         grant admissions are clamped (dlm_grant_table_bytes {bytes} B; \
+                         custody is never shed, so pressure answers at admission and \
+                         converges by release — §9.2's Red law)",
+                        required.0, required.1
+                    );
+                    log::error!("{reason}");
+                    return Err(crate::error::SqueezefsError::LockFailed { reason });
+                }
+                RangeMint::Exhausted(seq) => {
+                    let reason = format!(
+                        "fencing grant space exhausted: sequence {seq} exceeds the {}-bit \
+                         budget ({GRANT_SEQ_MAX}) of writer term {} — refusing to mint (a \
+                         carry into the term field would forge a newer era); remount to \
+                         start a fresh term",
+                        GRANT_SEQ_BITS,
+                        durable_term()
+                    );
+                    log::error!("{reason}");
+                    return Err(crate::error::SqueezefsError::LockFailed { reason });
+                }
+                RangeMint::Held => {
+                    if !parked {
+                        parked = true;
+                        RANGE_WAITS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if squeezefs_ipc::sqz_time::timeout_at(deadline, notified)
+                        .await
+                        .is_err()
+                    {
+                        RANGE_CONFLICTS.fetch_add(1, Ordering::Relaxed);
+                        return Err(crate::error::SqueezefsError::LockFailed {
+                            reason: format!(
+                                "range [{},{}) on {file_path} is held by foreign custody \
+                                 overlapping REQUIRED after the {ttl:?} wait budget — \
+                                 refusing loud (required is never silently trimmed to fit — \
+                                 §9.2)",
+                                required.0, required.1
+                            ),
+                        });
+                    }
+                }
             }
         }
     }
@@ -1083,6 +1353,9 @@ impl LockLeaseInner {
             retired = custody.retire(self.span, self.fencing_token, self.client_nonce);
             custody.is_vacant()
         });
+        if retired {
+            note_record_retired(self.span);
+        }
         if retired {
             LOCK_WAITERS
                 .get_inode_lock(self.key.stripe_seed())

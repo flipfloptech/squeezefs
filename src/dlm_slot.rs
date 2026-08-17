@@ -308,6 +308,47 @@ impl SlotLockManager {
             .await
     }
 
+    /// **S11 rung 15**: acquire an EX byte-range lease by the §9.2
+    /// required/desired law, homed exactly like every other acquire —
+    /// local homes run [`LocalLockManager::acquire_lock_range`] (the
+    /// solo/authority arm); a foreign home SHIPS the pair to its owner
+    /// over the S9 custody lease ([`crate::data_grant::acquire_remote_range`]),
+    /// whose reply is adopted (New) or widened in place (Extended — the
+    /// admit-time merge's client face).
+    ///
+    /// `geometry` feeds the per-file span cap on the LOCAL arm only: on
+    /// the shipped arm the OWNER's installed geometry source is
+    /// authoritative (a client-declared size would let a misbehaving
+    /// client widen its own cap).
+    pub async fn acquire_lock_range(
+        &self,
+        file_path: &str,
+        required: (u64, u64),
+        desired: (u64, u64),
+        ttl: Duration,
+        geometry: Option<(u64, u64)>,
+    ) -> Result<crate::dlm::RangeAcquired> {
+        let slot = lock_home_slot(file_path);
+        if !is_local_slot(slot) {
+            DLM_RPCS.fetch_add(1, Ordering::Relaxed);
+            let Some(ino) = crate::dlm::ino_of_path(file_path) else {
+                let reason = format!(
+                    "S11: lock object {file_path} is not an inode object and homes on slot \
+                     {slot}, which this node does not own — there is no remote custody verb \
+                     for a non-inode object, so this refuses rather than granting custody \
+                     the owner never issued"
+                );
+                log::error!("{reason}");
+                return Err(SqueezefsError::LockFailed { reason });
+            };
+            return crate::data_grant::acquire_remote_range(ino, required, desired, ttl, slot)
+                .await;
+        }
+        self.local
+            .acquire_lock_range(file_path, required, desired, ttl, geometry)
+            .await
+    }
+
     /// Current fencing generation for a path-form object key — homed since
     /// **S8** (see [`Self::get_fencing_token_ino`]).
     pub fn get_fencing_token(&self, file_path: &str) -> u64 {

@@ -644,6 +644,7 @@ fn bench_s9_custody(c: &mut Criterion) {
                 span: None,
                 concurrent_write: false,
                 wait_ms: 0,
+                desired: None,
             };
             let owner = &owner;
             async move {
@@ -669,6 +670,7 @@ fn bench_s9_custody(c: &mut Criterion) {
                 span: Some((block * (4 << 20), (block + 1) * (4 << 20))),
                 concurrent_write: false,
                 wait_ms: 0,
+                desired: None,
             };
             let owner = &owner;
             async move {

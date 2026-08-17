@@ -478,6 +478,8 @@ pub fn stats_json() -> serde_json::Value {
         "dlm_token_cache_grants": t.grants,
         "dlm_token_cache_entries": t.entries,
         "dlm_token_cache_bytes": t.bytes,
+        // The S11 rung-15 range extension (§9.2): live cached range spans.
+        "dlm_token_cache_range_spans": t.range_spans,
         "dlm_token_cache_cap_entries": t.cap_entries,
         "dlm_token_cache_owner_term": t.owner_term,
     })

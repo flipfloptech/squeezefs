@@ -68,6 +68,23 @@
 #                       fsck findings: 0. Default 1800 s
 #                       (SQZ_MWMATRIX_S8B_SECS / --secs=S override —
 #                       shorter windows are labeled in the row).
+#   s10-delegation      (rung 12; design row §8.2 lever 1) LOOKUP-class
+#                       delegations end-to-end on a --cowriters fleet:
+#                       grant -> serve-local -> foreign-mutation -> recall
+#                       -> CURRENT serve. Engagement = the wire-verb
+#                       ledger (a delegated stat pass must NOT ship;
+#                       dlm_delegation.* deltas account the serves);
+#                       coherence = the authority's create in a delegated
+#                       dir returns only after the holder ACKED the
+#                       recall, and the holder sees the fresh name
+#                       IMMEDIATELY (no staleness window). Includes the
+#                       SQUEEZEFS_DELEGATION=0 A/B control mount (dark:
+#                       zero hits, everything ships) and an authority
+#                       kill-9 pass (holder re-admits by remount — the
+#                       rung-10 documented posture — re-EARNS delegations
+#                       under the successor era; fsck+C8 green). The
+#                       surviving-process grace re-assert is pinned in
+#                       cargo (tests/mw_delegation_tests.rs).
 #   cowriters-admission GATED (the 5b gate): the multi-identity legs rungs
 #                       7-10 build on. Probes the recorded host-scoped
 #                       verdict; on this kernel it SKIPs loud with the
@@ -3212,6 +3229,202 @@ PYK
     log "s10c-kill-shard GREEN (events + snapshots in $rowdir; victim remounted)"
 }
 
+leg_s10_delegation() {
+    # Rung 12 (design §8.2 lever 1 + PR row 12): LOOKUP-class delegations
+    # end-to-end on the LIVE fleet — grant → serve-local → foreign
+    # mutation → recall → CURRENT serve — plus the lever-off A/B control
+    # and an authority kill-9 re-assertion pass. The engagement
+    # instrument is the wire-verb ledger: delegated LOOKUPs must NOT
+    # ship (that is the point), and `dlm_delegation.*` deltas must
+    # account for the serves. The in-place grace re-assert (a holder
+    # PROCESS surviving an authority restart) is pinned in cargo
+    # (tests/mw_delegation_tests.rs::grace_reassertion_...); the live
+    # fleet's co-writer posture is re-admission-BY-REMOUNT (the rung-10
+    # documented posture), so the kill-9 pass here proves the remounted
+    # holder RE-EARNS delegations and serves current, with the fsck/C8
+    # oracle green after the kill.
+    require_cowriters 1
+    local rowdir cw w_mnt cw_mnt files n
+    rowdir="$STATE/rows/s10d-$(date +%s)"
+    mkdir -p "$rowdir"
+    cw="$(cowriter_idxs | head -1)"
+    w_mnt="$(mnt_of 0)"
+    cw_mnt="$(mnt_of "$cw")"
+    files=24
+
+    dfield() { # idx key -> value-or-0 (the dlm_delegation family nests)
+        local v
+        v="$(stat_field "$1" "$2")"
+        echo "${v:-0}"
+    }
+    drop_dentries() { # force the next stat/ls to the DAEMON (kernel
+        # dentry+inode caches dropped; daemon-side delegations are
+        # untouched — they are the thing under test)
+        sync
+        echo 2 >/proc/sys/vm/drop_caches
+    }
+    warm_delegations() { # earn grants: one shipped pass over the tree
+        drop_dentries
+        ls -l "$cw_mnt/s10-deleg" >/dev/null || die "s10-delegation: warm ls failed"
+        for ((n = 0; n < files; n++)); do
+            stat "$cw_mnt/s10-deleg/f$n" >/dev/null || die "s10-delegation: warm stat failed"
+        done
+    }
+    wait_delegated_serving() { # poll until a delegated serve engages
+        # (the co-writer's reader view must catch up to the grant stamps
+        # — bounded by reader_staleness_bound_ms — and the recall
+        # channel's first round must complete)
+        local tries h0 h1
+        for ((tries = 0; tries < 60; tries++)); do
+            warm_delegations
+            h0="$(dfield "$cw" dlm_delegation.dlm_delegation_hits)"
+            drop_dentries
+            stat "$cw_mnt/s10-deleg/f0" >/dev/null 2>&1 || true
+            h1="$(dfield "$cw" dlm_delegation.dlm_delegation_hits)"
+            [ "$h1" -gt "$h0" ] && return 0
+            sleep 1
+        done
+        die "s10-delegation: delegated serves never engaged within 60s (hits flat at $h1 — view catch-up or the recall channel is broken)"
+    }
+
+    # ---- Phase 0: the tree, built by the AUTHORITY ---------------------------
+    mkdir -p "$w_mnt/s10-deleg" || die "s10-delegation: mkdir failed"
+    for ((n = 0; n < files; n++)); do
+        echo "payload-$n" >"$w_mnt/s10-deleg/f$n" || die "s10-delegation: seed write failed"
+    done
+    sync "$w_mnt/s10-deleg" 2>/dev/null || true
+    log "tree built on the authority ($files files); waiting for the co-writer's delegated serves to engage"
+    wait_delegated_serving
+
+    # ---- Phase 1: ENGAGEMENT — delegated LOOKUPs do not ship -----------------
+    for idx in $(member_idxs); do snap "$idx" 0 "$rowdir"; done
+    local hits0 ship0 hits1 ship1 hits_d ship_d grants0
+    hits0="$(dfield "$cw" dlm_delegation.dlm_delegation_hits)"
+    ship0="$(dfield "$cw" meta_ship.shipped_verbs)"
+    grants0="$(dfield 0 dlm_delegation.dlm_delegation_grants)"
+    drop_dentries
+    ls -l "$cw_mnt/s10-deleg" >/dev/null || die "s10-delegation: measured ls failed"
+    for ((n = 0; n < files; n++)); do
+        stat "$cw_mnt/s10-deleg/f$n" >/dev/null || die "s10-delegation: measured stat failed"
+    done
+    hits1="$(dfield "$cw" dlm_delegation.dlm_delegation_hits)"
+    ship1="$(dfield "$cw" meta_ship.shipped_verbs)"
+    hits_d=$((hits1 - hits0))
+    ship_d=$((ship1 - ship0))
+    [ "$hits_d" -ge "$files" ] ||
+        die "s10-delegation: only $hits_d delegated serves across a $files-file stat pass — the delegation is not serving"
+    # The point of S10: the delegated pass ships (near) nothing. The
+    # allowance is the instrument's own ceremony (reading a co-writer's
+    # .stats ships its verbs — the s8-a ±4 law, two snapshots + probes).
+    [ "$ship_d" -le 12 ] ||
+        die "s10-delegation: the delegated stat pass SHIPPED $ship_d verbs (hits=$hits_d) — delegated LOOKUPs must not ship"
+    log "engagement: $hits_d delegated serves, $ship_d shipped verbs (ceremony skew), owner grants so far: $grants0"
+
+    # ---- Phase 2: THE COHERENCE LAW, live ------------------------------------
+    # The authority's create in the delegated directory must RECALL the
+    # holder before it applies — proven two ways: the recall ledger moves
+    # (acked >= 1, timeouts 0), and the holder sees the fresh name
+    # IMMEDIATELY after the create returns (no staleness window, no
+    # sleep: the recall preceded the publish).
+    local acked0 acked1 to0 to1
+    warm_delegations
+    wait_delegated_serving
+    acked0="$(dfield 0 dlm_recall.dlm_revokes_acked)"
+    to0="$(dfield 0 dlm_delegation.dlm_delegation_recall_timeouts)"
+    touch "$w_mnt/s10-deleg/fresh-coherence" || die "s10-delegation: the gated create failed"
+    acked1="$(dfield 0 dlm_recall.dlm_revokes_acked)"
+    to1="$(dfield 0 dlm_delegation.dlm_delegation_recall_timeouts)"
+    [ "$acked1" -gt "$acked0" ] ||
+        die "s10-delegation: the conflicting create applied without an ACKED recall (acked $acked0 -> $acked1) — the coherence law did not engage"
+    [ "$to1" = "$to0" ] ||
+        die "s10-delegation: recall TIMED OUT under a live holder (timeouts $to0 -> $to1) — the channel is broken"
+    drop_dentries
+    stat "$cw_mnt/s10-deleg/fresh-coherence" >/dev/null ||
+        die "s10-delegation: STALE SERVE — the holder cannot see a name whose create already returned (recall-before-publish broken)"
+    [ "$(dfield "$cw" dlm_delegation.dlm_delegation_stale_serves)" = "0" ] ||
+        die "s10-delegation: dlm_delegation_stale_serves moved on the holder (must stay 0)"
+    log "coherence: recall acked before the publish; the fresh name visible on the holder IMMEDIATELY after create returned"
+
+    # ---- Phase 3: the LEVER-OFF A/B control ----------------------------------
+    "$MWFLEET" unmount "$cw" || die "s10-delegation: control unmount failed"
+    SQUEEZEFS_DELEGATION=0 "$MWFLEET" mount "$cw" || die "s10-delegation: lever-off control mount failed"
+    local c_hits0 c_hits1 c_ship0 c_ship1
+    drop_dentries
+    ls -l "$cw_mnt/s10-deleg" >/dev/null || die "s10-delegation: control warm failed"
+    c_hits0="$(dfield "$cw" dlm_delegation.dlm_delegation_hits)"
+    c_ship0="$(dfield "$cw" meta_ship.shipped_verbs)"
+    drop_dentries
+    for ((n = 0; n < files; n++)); do
+        stat "$cw_mnt/s10-deleg/f$n" >/dev/null || die "s10-delegation: control stat failed"
+    done
+    c_hits1="$(dfield "$cw" dlm_delegation.dlm_delegation_hits)"
+    c_ship1="$(dfield "$cw" meta_ship.shipped_verbs)"
+    [ "$c_hits1" = "$c_hits0" ] ||
+        die "s10-delegation: the LEVER-OFF control served $((c_hits1 - c_hits0)) delegated hits — the A/B control is not dark"
+    [ $((c_ship1 - c_ship0)) -ge "$files" ] ||
+        die "s10-delegation: the lever-off control shipped only $((c_ship1 - c_ship0)) verbs across $files stats — the control did not engage the wire"
+    log "lever-off control: 0 delegated serves, $((c_ship1 - c_ship0)) shipped verbs (the A/B holds); restoring the lever-on mount"
+    "$MWFLEET" unmount "$cw" || die "s10-delegation: control restore unmount failed"
+    "$MWFLEET" mount "$cw" || die "s10-delegation: lever-on restore mount failed"
+    wait_delegated_serving
+
+    # ---- Phase 4: authority kill-9 + the re-assertion pass -------------------
+    # Live posture: the co-writer self-fences on the dead lease and
+    # re-admits BY REMOUNT (rung-10's documented deferral); the remounted
+    # holder must RE-EARN delegations against the successor era, serve
+    # current, and the oracle must be green after the kill. (The
+    # surviving-process grace re-assert is the cargo suite's — a live
+    # co-writer does not survive its authority here.)
+    local w_pid t_kill t_up tries
+    w_pid="$(awk -F'\t' '$1==0 {print $7}' "$MEMBERS")"
+    "$MWFLEET" kill 0 --sig 9
+    t_kill="$(date +%s)"
+    umount -l "$w_mnt" 2>/dev/null || true
+    wait_for_unmounted "$w_mnt"
+    for ((tries = 0; tries < 120; tries++)); do
+        kill -0 "$w_pid" 2>/dev/null || break
+        sleep 0.5
+    done
+    kill -0 "$w_pid" 2>/dev/null && die "s10-delegation: the killed authority (pid $w_pid) never exited"
+    "$MWFLEET" mount 0 || die "s10-delegation: successor authority remount FAILED"
+    t_up="$(date +%s)"
+    log "successor authority up in $((t_up - t_kill))s; re-admitting the holder by remount (the documented posture)"
+    "$MWFLEET" unmount "$cw" || true
+    "$MWFLEET" mount "$cw" ||
+        die "s10-delegation: co-writer could not re-admit under the successor era"
+    wait_delegated_serving
+    # One more live coherence round under the SUCCESSOR era.
+    acked0="$(dfield 0 dlm_recall.dlm_revokes_acked)"
+    touch "$w_mnt/s10-deleg/fresh-after-failover" || die "s10-delegation: post-failover create failed"
+    acked1="$(dfield 0 dlm_recall.dlm_revokes_acked)"
+    [ "$acked1" -gt "$acked0" ] ||
+        die "s10-delegation: the successor's coherence law did not engage (acked flat)"
+    drop_dentries
+    stat "$cw_mnt/s10-deleg/fresh-after-failover" >/dev/null ||
+        die "s10-delegation: STALE SERVE after failover — the re-earned delegation broke coherence"
+    log "post-failover: delegations re-earned under the successor era, coherence law live"
+
+    # ---- The oracle + tripwires ----------------------------------------------
+    local out drift v
+    out="$("$SQZ" fsck "$w_mnt" 2>&1)" || die "s10-delegation: online fsck FAILED:
+$out"
+    echo "$out" >"$rowdir/fsck.out"
+    echo "$out" | grep -q "findings: 0" || die "s10-delegation: fsck findings != 0:
+$out"
+    drift="$(stat_field 0 meta_kv_block_refs_drift)"
+    [ "$drift" = "0" ] || die "s10-delegation: meta_kv_block_refs_drift=$drift (C8 oracle RED)"
+    for v in meta_ship.owner_panics meta_ship_publish.refusals invariant_tripwires \
+        dlm_delegation.dlm_delegation_stale_serves dlm_delegation.dlm_delegation_recall_timeouts; do
+        [ "$(dfield 0 "$v")" = "0" ] || die "s10-delegation: successor $v != 0"
+    done
+    [ "$(dfield "$cw" dlm_delegation.dlm_delegation_stale_serves)" = "0" ] ||
+        die "s10-delegation: holder stale_serves != 0 (the must-stay-0 coherence tripwire)"
+    [ "$(dfield "$cw" cowriter.local_commit_refusals)" = "0" ] ||
+        die "s10-delegation: re-admitted holder local_commit_refusals != 0"
+    for idx in $(member_idxs); do snap "$idx" 1 "$rowdir"; done
+    log "s10-delegation GREEN (engagement $hits_d hits/$ship_d ships; coherence acked-before-publish; lever-off dark; kill-9 re-earn; fsck+C8 clean). Snapshots in $rowdir"
+}
+
 leg_cowriters_admission() {
     if [ "$HOST_SCOPED" != "1" ]; then
         local reason="multi-identity (co-writer) legs need host-scoped fabric subsystems: this kernel merges controllers by subsysnqn ignoring hostnqn (nvme_core.multipath=Y), so co-located identities share one head — rung 5b (the sqz-kernel fix, validated in the rung-6b qemu guest) unlocks them. Stock-kernel workaround: nvme_core.multipath=N (boot parameter)"
@@ -3236,8 +3449,9 @@ s9-failover) leg_s9_failover ;;
 s9-colocated-fence) leg_s9_colocated_fence ;;
 s10c-fsck-scale) leg_s10c_fsck_scale ;;
 s10c-kill-shard) leg_s10c_kill_shard ;;
+s10-delegation) leg_s10_delegation ;;
 cowriters-admission) leg_cowriters_admission ;;
 vm-hostscope-validate) leg_vm_hostscope_validate ;;
 vm-multi-identity) leg_vm_multi_identity ;;
-*) die "unknown leg '$LEG' (smoke|multipath-negative|s6-journal|s6-fence|s6-vm-fence|s7-device-fence|s7-kill-matrix|s8-serial-ab|s8-crucible|s9-fanout|s9-failover|s9-colocated-fence|s10c-fsck-scale|s10c-kill-shard|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
+*) die "unknown leg '$LEG' (smoke|multipath-negative|s6-journal|s6-fence|s6-vm-fence|s7-device-fence|s7-kill-matrix|s8-serial-ab|s8-crucible|s9-fanout|s9-failover|s9-colocated-fence|s10c-fsck-scale|s10c-kill-shard|s10-delegation|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
 esac

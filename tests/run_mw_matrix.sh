@@ -3263,9 +3263,15 @@ leg_s10_delegation() {
         sync
         echo 2 >/proc/sys/vm/drop_caches
     }
-    warm_delegations() { # earn grants: one shipped pass over the tree
+    warm_delegations() { # earn grants: one shipped pass over the tree.
+        # `ls -1 --color=never` + `stat`, never `ls -l`: the long form
+        # issues getxattr/listxattr per entry (ACL/security probes), and
+        # the XATTR delegation class is rows 13+'s — those verbs SHIP by
+        # design in rung 12 and would pollute the LOOKUP-class ledger
+        # (measured live: ls -l = exactly its 25 xattr calls shipped;
+        # stat = 0).
         drop_dentries
-        ls -l "$cw_mnt/s10-deleg" >/dev/null || die "s10-delegation: warm ls failed"
+        ls -1 --color=never "$cw_mnt/s10-deleg" >/dev/null || die "s10-delegation: warm ls failed"
         for ((n = 0; n < files; n++)); do
             stat "$cw_mnt/s10-deleg/f$n" >/dev/null || die "s10-delegation: warm stat failed"
         done
@@ -3303,7 +3309,7 @@ leg_s10_delegation() {
     ship0="$(dfield "$cw" meta_ship.shipped_verbs)"
     grants0="$(dfield 0 dlm_delegation.dlm_delegation_grants)"
     drop_dentries
-    ls -l "$cw_mnt/s10-deleg" >/dev/null || die "s10-delegation: measured ls failed"
+    ls -1 --color=never "$cw_mnt/s10-deleg" >/dev/null || die "s10-delegation: measured ls failed"
     for ((n = 0; n < files; n++)); do
         stat "$cw_mnt/s10-deleg/f$n" >/dev/null || die "s10-delegation: measured stat failed"
     done
@@ -3350,7 +3356,7 @@ leg_s10_delegation() {
     SQUEEZEFS_DELEGATION=0 "$MWFLEET" mount "$cw" || die "s10-delegation: lever-off control mount failed"
     local c_hits0 c_hits1 c_ship0 c_ship1
     drop_dentries
-    ls -l "$cw_mnt/s10-deleg" >/dev/null || die "s10-delegation: control warm failed"
+    ls -1 --color=never "$cw_mnt/s10-deleg" >/dev/null || die "s10-delegation: control warm failed"
     c_hits0="$(dfield "$cw" dlm_delegation.dlm_delegation_hits)"
     c_ship0="$(dfield "$cw" meta_ship.shipped_verbs)"
     drop_dentries
@@ -3390,6 +3396,17 @@ leg_s10_delegation() {
     t_up="$(date +%s)"
     log "successor authority up in $((t_up - t_kill))s; re-admitting the holder by remount (the documented posture)"
     "$MWFLEET" unmount "$cw" || true
+    # A remounted co-writer is a FRESH membership acquire, which the
+    # successor's grace window refuses by design (reclaim only — the
+    # S6/S8 law this rung's cargo suite pins for the surviving-process
+    # shape). Wait the window out, as an operator's retry would.
+    local grace
+    for ((tries = 0; tries < 90; tries++)); do
+        grace="$(stat_field 0 membership_grace_remaining_ms)"
+        [ -z "$grace" ] || [ "$grace" = "0" ] && break
+        sleep 1
+    done
+    log "successor grace window closed (waited ${tries}s); re-admitting the holder"
     "$MWFLEET" mount "$cw" ||
         die "s10-delegation: co-writer could not re-admit under the successor era"
     wait_delegated_serving

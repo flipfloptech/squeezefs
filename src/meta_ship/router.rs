@@ -956,30 +956,29 @@ impl MetaShipRouter {
         let Some(pg) = tokens::deleg_serve_begin(parent, endpoint) else {
             return DelegLookup::Miss;
         };
-        if !pg.dir() {
+        // The currency law (live finding #4): the view's covered journal
+        // prefix must reach the grant's commit watermark — an aliasing
+        // attr compare served a stale authoritative negative on the
+        // first fleet tar -x.
+        if !pg.dir() || !pg.view_current(self.inner.view_watermark_of(parent)) {
             return DelegLookup::Miss;
         }
-        // `getattr_local`, NEVER the trait verb: on an armed co-writer the
-        // trait body consults the daemon verb router, which routes right
-        // back into this serve — the live-rig recursion (rung-12 finding
-        // #1, a fuse3 lane stack overflow on the first fleet mount).
-        let Ok(pi) = self.inner.getattr_local(parent).await else {
-            return DelegLookup::Miss;
-        };
-        if !pg.stamp_matches(&pi) {
-            return DelegLookup::Miss;
-        }
+        // `lookup_dentry`/`getattr_local`, NEVER the trait verbs: on an
+        // armed co-writer a trait body consults the daemon verb router,
+        // which routes right back into this serve — the live-rig
+        // recursion (rung-12 finding #1, a fuse3 lane stack overflow on
+        // the first fleet mount).
         match self.inner.lookup_dentry(parent, name).await {
             Ok(Some((child, _ft))) => {
                 let Some(cg) = tokens::deleg_serve_begin(child, endpoint) else {
                     return DelegLookup::Miss;
                 };
+                if !cg.view_current(self.inner.view_watermark_of(child)) {
+                    return DelegLookup::Miss;
+                }
                 let Ok(ci) = self.inner.getattr_local(child).await else {
                     return DelegLookup::Miss;
                 };
-                if !cg.stamp_matches(&ci) {
-                    return DelegLookup::Miss;
-                }
                 pg.note_hit();
                 DelegLookup::Hit(ci)
             }
@@ -991,14 +990,14 @@ impl MetaShipRouter {
         }
     }
 
-    /// The delegated `getattr` serve: the stamp-check read IS the answer.
-    /// (`getattr_local` — see `deleg_lookup` on the recursion law.)
+    /// The delegated `getattr` serve (`getattr_local` — see
+    /// `deleg_lookup` on the recursion and currency laws).
     async fn deleg_getattr(&self, endpoint: &str, ino: Ino) -> Option<Inode> {
         let g = tokens::deleg_serve_begin(ino, endpoint)?;
-        let i = self.inner.getattr_local(ino).await.ok()?;
-        if !g.stamp_matches(&i) {
+        if !g.view_current(self.inner.view_watermark_of(ino)) {
             return None;
         }
+        let i = self.inner.getattr_local(ino).await.ok()?;
         g.note_hit();
         Some(i)
     }
@@ -1012,11 +1011,7 @@ impl MetaShipRouter {
         max: usize,
     ) -> Option<Vec<DirEntry>> {
         let g = tokens::deleg_serve_begin(dir, endpoint)?;
-        if !g.dir() {
-            return None;
-        }
-        let i = self.inner.getattr_local(dir).await.ok()?;
-        if !g.stamp_matches(&i) {
+        if !g.dir() || !g.view_current(self.inner.view_watermark_of(dir)) {
             return None;
         }
         let entries = self.inner.readdir_local(dir, offset, max).await.ok()?;

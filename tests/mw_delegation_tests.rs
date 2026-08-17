@@ -508,6 +508,83 @@ async fn a_view_behind_the_grant_stamp_never_serves() {
     shutdown(&fx).await;
 }
 
+/// **Live finding #4's repro (the attr-aliasing class).** The first fleet
+/// `tar -x` served a stale authoritative NEGATIVE (`utime: No such file
+/// or directory` on a just-created directory): the original stamp was the
+/// parent's `(ctime, mtime, size)` triple, and attr triples ALIAS — the
+/// holder's behind-the-commit view carried the same attrs as the grant's
+/// mint while its dentry set lacked the new child. The currency token is
+/// now the volume's journal COMMIT WATERMARK, which cannot alias. This
+/// pin builds the aliasing shape deterministically: mutate the delegated
+/// directory, then RESTORE its visible attrs byte-identically (the
+/// kernel-echo setattr shape), and assert the behind-the-commit view
+/// still refuses to serve — the ghost child must be FOUND (shipped,
+/// owner-current), never locally denied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_currency_token_survives_attr_aliasing() {
+    let _plane = PLANE.lock().await;
+    let fx = fixture().await;
+
+    let dir_ino = Metadata::create(fx.owner_be.as_ref(), 1, "aliasdir", DIR, 0, 0)
+        .await
+        .expect("owner mkdir")
+        .ino;
+    Metadata::create(fx.owner_be.as_ref(), dir_ino, "seed", FILE, 0, 0)
+        .await
+        .expect("owner create");
+    catch_up(&fx).await;
+    let before = fx.owner_be.getattr_local(dir_ino).await.expect("attrs");
+
+    // The aliasing mutation pair: a create the view has NOT seen, then
+    // the parent's visible attrs restored byte-identically.
+    Metadata::create(fx.owner_be.as_ref(), dir_ino, "ghost", FILE, 0, 0)
+        .await
+        .expect("the ghost create");
+    Metadata::setattr(
+        fx.owner_be.as_ref(),
+        dir_ino,
+        None,
+        None,
+        None,
+        None,
+        Some(before.atime),
+        Some(before.mtime),
+        Some(before.ctime),
+    )
+    .await
+    .expect("restore the parent's attrs (the aliasing shape)");
+
+    // Earn the delegation AFTER the mutations (nothing to recall), with
+    // the holder's view still behind them.
+    fx.router
+        .lookup(dir_ino, "seed")
+        .await
+        .expect("grant-earning lookup");
+    let hits0 = deleg().hits;
+    let got = fx
+        .router
+        .lookup(dir_ino, "ghost")
+        .await
+        .expect("the ghost must be FOUND (shipped, owner-current) — a local ENOENT here is finding #4's stale negative");
+    assert!(got.ino > 0);
+    assert_eq!(
+        deleg().hits,
+        hits0,
+        "a behind-the-watermark view must never serve, attrs notwithstanding"
+    );
+
+    // And once the view genuinely covers the mint, serving resumes.
+    catch_up(&fx).await;
+    fx.router.lookup(dir_ino, "seed").await.expect("lookup");
+    fx.router.lookup(dir_ino, "ghost").await.expect("lookup");
+    wait_for("the delegated serve after catch-up", || {
+        deleg().hits > hits0
+    })
+    .await;
+    assert_eq!(deleg().stale_serves, 0);
+    shutdown(&fx).await;
+}
+
 // ===========================================================================
 // 4. THE RED HALF (permanent): without the law, the holder serves stale
 // ===========================================================================

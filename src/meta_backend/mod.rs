@@ -1313,6 +1313,23 @@ impl RoutedMetaBackend {
         Ok(inode)
     }
 
+    /// The **commit watermark** of `ino`'s volume (rung 12): the journal
+    /// reservation frontier every committed transaction sits below — the
+    /// S10 delegation grant's view-currency stamp.
+    pub fn commit_watermark_of(&self, ino: Ino) -> u64 {
+        let (v_idx, _) = self.route_ino(ino);
+        self.volumes[v_idx].commit_watermark()
+    }
+
+    /// The **view watermark** of `ino`'s volume: the journal prefix this
+    /// mount's RAM-authoritative view covers (a reader/co-writer's
+    /// adopted checkpoint tail; the commit frontier itself on a write
+    /// mount). `view ≥ grant` is the delegated serve's currency law.
+    pub fn view_watermark_of(&self, ino: Ino) -> u64 {
+        let (v_idx, _) = self.route_ino(ino);
+        self.volumes[v_idx].view_watermark()
+    }
+
     /// The trait `readdir`'s LOCAL body, hook-free (the [`Self::getattr_local`]
     /// twin — the delegated serve's dentry page read).
     pub async fn readdir_local(&self, dir: Ino, offset: u64, max: usize) -> Result<Vec<DirEntry>> {

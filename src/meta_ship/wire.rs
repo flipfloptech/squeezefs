@@ -562,20 +562,27 @@ pub struct MetaOpResult {
     pub revoke_fence: u64,
 }
 
-/// The stamp a delegation grant carries: the object's change-visible
-/// attributes as the OWNER knew them at grant time. The holder serves
-/// locally only while its own reader-revalidation view of the object
-/// MATCHES the stamp — which closes the warming window (a view that has
+/// The stamp a delegation grant carries: the object's volume's **commit
+/// watermark** (journal reservation frontier) at grant time. The holder
+/// serves locally only while its own view's covered journal prefix
+/// reaches the stamp — which closes the warming window (a view that has
 /// not caught up serves nothing) without tightening the reader staleness
 /// bound. Soundness: the v3 KV's whole-tx atomicity + checkpoint-prefix
-/// visibility mean a view whose inode record matches the stamp includes
-/// every transaction up to the one that produced it — the dentry set is
-/// exactly as current as the attrs.
+/// visibility mean a view whose tail covers the watermark includes every
+/// transaction at or below the grant's mint — the dentry set is exactly
+/// as current as the grant.
+///
+/// **Why a journal position and not the inode's `(ctime, mtime, size)`**
+/// (rung-12 live finding #4): the attr triple ALIASES — two creates
+/// inside one clock tick leave the parent's attrs equal while its dentry
+/// set differs, and the first fleet `tar -x` served a stale
+/// authoritative NEGATIVE (`utime: No such file or directory` on a
+/// just-created directory) from exactly that window. A reservation
+/// frontier cannot alias.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DelegStamp {
-    pub ctime: u64,
-    pub mtime: u64,
-    pub size: u64,
+    /// The object's volume's commit watermark at grant time.
+    pub watermark: u64,
 }
 
 /// A **delegation grant** (S10 lever 1): a capability token over one

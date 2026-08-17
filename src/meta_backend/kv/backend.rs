@@ -2926,6 +2926,36 @@ impl KvMetaBackend {
     /// discharges the floors and the next one clears the hole. Bounded:
     /// floors drain in one cycle and in-flight reservations are finite,
     /// so a stuck tail is a real defect — fail loud.
+    /// This volume's **commit watermark**: the journal ring's reservation
+    /// frontier — every transaction ever committed here sits strictly
+    /// below it. Rung 12 (live finding #4): the S10 delegation grant
+    /// carries it as the view-currency token, because the inode's
+    /// `(ctime, mtime, size)` triple ALIASES under serial-create rates —
+    /// two creates inside one clock tick leave the parent's stamp equal
+    /// while its dentry set differs, and the fleet's `tar -x` served a
+    /// stale authoritative NEGATIVE from exactly that window. A journal
+    /// position cannot alias.
+    pub fn commit_watermark(&self) -> u64 {
+        self.ring.core().head()
+    }
+
+    /// The **view watermark** of this volume's RAM-authoritative state:
+    /// the journal position its node cache's adopted ledger record
+    /// covers. On a WRITE mount the RAM state is the commit frontier
+    /// itself (commits apply to RAM before the journal write — §4.4), so
+    /// the answer is [`Self::commit_watermark`]; on a READER/co-writer
+    /// view it is the adopted checkpoint's `journal_tail_seq` — the
+    /// prefix bound revalidation maintains. `view ≥ grant` is the
+    /// delegated serve's currency law: a covered prefix includes every
+    /// transaction at or below the grant's mint.
+    pub fn view_watermark(&self) -> u64 {
+        if self.read_only {
+            self.cache.durable_tail()
+        } else {
+            self.ring.core().head()
+        }
+    }
+
     pub async fn checkpoint_past(&self, pos: u64) -> std::result::Result<(), KvError> {
         let mut smo = self.smo.lock().await;
         for _ in 0..8 {

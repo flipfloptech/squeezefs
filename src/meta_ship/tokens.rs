@@ -1464,11 +1464,12 @@ pub struct DelegServeGuard {
 }
 
 impl DelegServeGuard {
-    /// Does the holder's local view match the grant's stamp?
-    pub fn stamp_matches(&self, inode: &crate::meta_backend::Inode) -> bool {
-        self.entry.stamp.ctime == inode.ctime
-            && self.entry.stamp.mtime == inode.mtime
-            && self.entry.stamp.size == inode.size
+    /// Is the holder's view CURRENT for this grant — does its covered
+    /// journal prefix reach the grant's commit watermark? (`>=`: a view
+    /// past the mint can only contain transactions the coherence law has
+    /// already recalled this grant for, or the grant's own era.)
+    pub fn view_current(&self, view_watermark: u64) -> bool {
+        view_watermark >= self.entry.stamp.watermark
     }
 
     /// Is the delegated object a directory (dentry reads servable)?

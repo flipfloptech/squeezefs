@@ -364,11 +364,7 @@ fn frames_round_trip_and_untrusted_bytes_refuse_loud() {
                     dir: false,
                     seq: 9,
                     term: 4,
-                    stamp: ship::DelegStamp {
-                        ctime: 1,
-                        mtime: 2,
-                        size: 3,
-                    },
+                    stamp: ship::DelegStamp { watermark: 4096 },
                 }],
                 revokes: vec![7],
                 revoke_fence: 9,

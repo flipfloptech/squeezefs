@@ -709,9 +709,10 @@ impl MetaShipService {
     /// 4. RE-CHECK `in_flight`: a mutation that raced in either shows
     ///    here (we retract by `surrender` — the grant was never sent) or
     ///    had already deregistered, i.e. committed, before this check;
-    /// 5. read the STAMP only now — past step 4 it is post-commit for any
-    ///    mutation the recall snapshot could have missed, so a stamp can
-    ///    never name a state older than an un-recalled mutation.
+    /// 5. read the STAMP (the volume's commit watermark) only now — past
+    ///    step 4 it covers any mutation the recall snapshot could have
+    ///    missed, so a stamp can never name a state older than an
+    ///    un-recalled mutation.
     async fn issue_delegs(
         &self,
         client_id: &str,
@@ -761,9 +762,7 @@ impl MetaShipService {
                 seq,
                 term: self.term(),
                 stamp: DelegStamp {
-                    ctime: inode.ctime,
-                    mtime: inode.mtime,
-                    size: inode.size,
+                    watermark: self.inner.commit_watermark_of(ino),
                 },
             });
         }
@@ -1311,9 +1310,7 @@ impl MetaShipService {
                 seq,
                 term: self.term(),
                 stamp: DelegStamp {
-                    ctime: inode.ctime,
-                    mtime: inode.mtime,
-                    size: inode.size,
+                    watermark: self.inner.commit_watermark_of(ino),
                 },
             });
         }

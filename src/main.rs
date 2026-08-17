@@ -6001,6 +6001,16 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             .await
             .map_err(|e| format!("multi-writer refused to arm: {e}"))?;
 
+            // Rung 17 (KD-MW-8): the AUTHORITY's extent ASSEMBLER — the
+            // production merge/flush executors over this mount's own
+            // write path (sub-block-shared blocks' extents ship here and
+            // the authority publishes once, as the single publisher).
+            // Installed only on the authority posture; the mw disarm
+            // uninstalls them beside the free/harvest executors.
+            if multi_writer_arm.is_some() {
+                fs_engine.install_extent_assembler();
+            }
+
             // DLM S9: the CO-WRITER's own arm — the client halves of the same
             // three planes the authority serves. It installs the ownership map
             // (the authority owns EVERY volume, so every metadata verb ships),
@@ -6017,6 +6027,14 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 ),
                 None => None,
             };
+
+            // Rung 17 (KD-MW-8): the CO-WRITER's extent hooks — the
+            // demotion quiesce barrier and the coverage-release cache
+            // invalidation (read-your-writes hands off to the covering
+            // publish the moment retention releases).
+            if co_writer_arm.is_some() {
+                fs_engine.install_cowriter_extent_hooks();
+            }
 
             // KD-MW-16 (rung 10c, docs/design-mw-fleet-jobs.md §2): a
             // READER/CO-WRITER member serves fleet READ shards. Workers

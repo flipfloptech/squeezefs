@@ -11920,6 +11920,171 @@ impl SqueezefsFilesystem {
             ))
     }
 
+    /// Rung 17 (KD-MW-8): does `[offset, offset+len)` touch a block whose
+    /// custody is RANGE-SHARED under `token` — a demoted block, or a
+    /// block this mount's grant does not solely cover? Empty-map probe
+    /// per block on every shipped mount; a write spans ≤ 2 blocks in
+    /// practice (max_write < block size).
+    fn write_touches_shared_block(&self, ino: u64, offset: u64, len: u64, token: u64) -> bool {
+        if len == 0 {
+            return false;
+        }
+        let bs = self.router.block_size.load(Ordering::Relaxed).max(1);
+        let first = offset / bs;
+        let last = (offset + len - 1) / bs;
+        (first..=last)
+            .any(|b| crate::dlm::span_range_shared(ino, b * bs, (b + 1) * bs, token))
+    }
+
+    /// Rung 17 (KD-MW-8's symmetric law): dispatch one striped write
+    /// whose span touches range-shared custody — SHARED blocks' slices
+    /// ship as extents to the AUTHORITY (the assembler, the block's
+    /// single publisher) and are retained until coverage
+    /// (`crate::extent_ship`); solely-owned blocks' slices keep the
+    /// ordinary striped path.
+    async fn write_shared_striped(
+        &self,
+        ino: u64,
+        offset: u64,
+        data: bytes::Bytes,
+        existing_size: u64,
+        token: u64,
+    ) -> Result<(), SqueezefsError> {
+        let Some(backend) = self.meta_backend.as_ref() else {
+            return Err(SqueezefsError::InvalidOperation(
+                "extent ship needs a routed meta backend (shared-block custody without one \
+                 is unreachable — the mw arm requires it)"
+                    .to_string(),
+            ));
+        };
+        let bs = self.router.block_size.load(Ordering::Relaxed).max(1);
+        let mut cursor = 0usize;
+        while cursor < data.len() {
+            let abs = offset + cursor as u64;
+            let block = abs / bs;
+            let rel = (abs % bs) as u32;
+            let take = ((bs - (abs % bs)) as usize).min(data.len() - cursor);
+            let bstart = block * bs;
+            if crate::dlm::span_range_shared(ino, bstart, bstart + bs, token) {
+                crate::extent_ship::ship_extent(
+                    backend,
+                    ino,
+                    block,
+                    rel,
+                    data.slice(cursor..cursor + take),
+                    token,
+                )
+                .await?;
+            } else {
+                self.write_file_staged(
+                    ino,
+                    abs,
+                    data.slice(cursor..cursor + take),
+                    existing_size,
+                    token,
+                )
+                .await?;
+            }
+            cursor += take;
+        }
+        Ok(())
+    }
+
+    /// Rung 17 (§9.3's custody transfer): the AUTHORITY's assembly of one
+    /// shipped extent — the write rides THIS mount's ordinary write path
+    /// (the block is range-shared here too, so W1/B4 decline and the
+    /// bytes park in the W2 extent overlay; the fold publishes once, and
+    /// the local publish CHAINS because the ino is granted), with every
+    /// DMA authorized under the authority's OWN epoch (`authorize_dma`'s
+    /// submission-time arm — never as an exercise of a shipper's grant)
+    /// and fenced at the CURRENT generation. Returns `None`: coverage
+    /// advances at the flush force / fold completion, never at the merge.
+    pub async fn assemble_shipped_extent(
+        &self,
+        ino: u64,
+        block_index: u64,
+        offset_in_block: u32,
+        data: bytes::Bytes,
+    ) -> Result<Option<u64>, SqueezefsError> {
+        let token = self.dlm.get_fencing_token_ino(ino);
+        let bs = self.router.block_size.load(Ordering::Relaxed).max(1);
+        let abs = block_index
+            .saturating_mul(bs)
+            .saturating_add(u64::from(offset_in_block));
+        let existing = self
+            .router
+            .fetch_metadata(&crate::keys::inode_path(ino))
+            .await
+            .map(|m| m.size)
+            .unwrap_or(0);
+        self.write_file_staged(ino, abs, data, existing, token)
+            .await?;
+        Ok(None)
+    }
+
+    /// Rung 17: the AUTHORITY's `FlushExtents` force — flush the ino's
+    /// assembled extents through the ordinary fsync ladder (fold + layout
+    /// persist + ONE meta barrier) and answer the covering durable head
+    /// version.
+    pub async fn flush_shipped_extents(&self, ino: u64) -> Result<u64, SqueezefsError> {
+        let token = self.dlm.get_fencing_token_ino(ino);
+        self.flush_inode_to_backend(ino, token).await?;
+        let Some(backend) = self.meta_backend.as_ref() else {
+            return Err(SqueezefsError::InvalidOperation(
+                "flush_shipped_extents needs a routed meta backend".to_string(),
+            ));
+        };
+        backend.layout_head_version(ino).await
+    }
+
+    /// Rung 17: install the AUTHORITY's production assembler executors
+    /// (the mount arm's act, beside the free/harvest executors; the
+    /// multi-writer disarm uninstalls them).
+    pub fn install_extent_assembler(&self) {
+        let fs = self.clone();
+        crate::meta_ship::publish::install_extent_merge_executor(std::sync::Arc::new(
+            move |frame: crate::meta_ship::publish::ExtentFrame| {
+                let fs = fs.clone();
+                Box::pin(async move {
+                    fs.assemble_shipped_extent(
+                        frame.ino,
+                        frame.block_index,
+                        frame.offset_in_block,
+                        bytes::Bytes::from(frame.data),
+                    )
+                    .await
+                })
+            },
+        ));
+        let fs = self.clone();
+        crate::meta_ship::publish::install_extent_flush_executor(std::sync::Arc::new(
+            move |ino: u64| {
+                let fs = fs.clone();
+                Box::pin(async move { fs.flush_shipped_extents(ino).await })
+            },
+        ));
+    }
+
+    /// Rung 17: install the CO-WRITER's extent hooks (the mount arm's
+    /// act): the demotion QUIESCE (drain in-flight publishes of the ino —
+    /// the §5.3 merge-discipline mutex is the barrier every in-flight
+    /// layout publish holds) and the RELEASE notifier (a covered ino's
+    /// cached layout may be stale — drop it so the next read refetches
+    /// the covering publish).
+    pub fn install_cowriter_extent_hooks(&self) {
+        let router = self.router.clone();
+        crate::extent_ship::install_quiesce_hook(std::sync::Arc::new(move |ino: u64| {
+            let router = router.clone();
+            Box::pin(async move {
+                router.quiesce_ino_meta(ino).await;
+            })
+        }));
+        let router = self.router.clone();
+        crate::extent_ship::install_release_hook(std::sync::Arc::new(move |ino: u64| {
+            router.metadata_cache.remove(&ino);
+        }));
+    }
+
     /// The newest token among this mount's live RANGE leases on `ino`
     /// (`None` = no range custody — the caller acquires as today). What
     /// keeps the non-span mutating ops (fsync/flush/truncate/fallocate)
@@ -20751,658 +20916,39 @@ impl Filesystem for SqueezefsFilesystem {
 
     async fn read(
         &self,
-        _req: Request,
+        req: Request,
         ino: u64,
         fh: u64,
         offset: u64,
         size: u32,
         flags: u32,
     ) -> FuseResult<ReplyData> {
-        METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
-        crate::coz_progress!("fuse_read");
-        debug!(
-            "FUSE Read: ino = {}, fh = {}, offset = {}, size = {}, flags = {:#x}",
-            ino, fh, offset, size, flags
-        );
-        // R1b classifier inputs (§5.3) + hybrid I/O (user directive
-        // 2026-07-15): the kernel sends the file's open flags on every
-        // READ; O_DIRECT is counted here and handed to the routing layer
-        // as the per-request `ReadClassHint` — under the DEFAULT hybrid
-        // policy it only labels observability (O_DIRECT serves/admits
-        // exactly like buffered), and combined with the mount-scoped
-        // `direct_device_true` escape it selects the strictly device-true
-        // diagnostic path.
-        let odirect = flags & (libc::O_DIRECT as u32) != 0;
-        if odirect {
-            METRICS
-                .read_odirect_requests
-                .fetch_add(1, Ordering::Relaxed);
-        } else if _req.unique != 0 {
-            // Quiescent-lineage un-latch (page-coherence law): a KERNEL
-            // buffered READ instantiates page-cache folios (mmap
-            // fault-ins arrive here too) — bumped BEFORE the reply, so
-            // the next DIO write invalidates again. Ring-origin serves
-            // (`unique == 0`) touch no kernel pages and skip the bump.
-            self.note_page_instantiation(ino);
-        }
-        // Ring-originated requests (the IPC handoff path) carry
-        // `unique == 0` — `DataPlaneSink::ring_request` is the only
-        // unique-0 Request producer on the read path (kernel uniques are
-        // kernel-allocated and nonzero). Those ops already fed the
-        // stream lanes at the sink (`ring_read_lane_touch`); observing
-        // them again in `pipeline_touch` would declassify the stream
-        // that routed them here (§5.3 — pinned by
-        // tests/read_saturation_tests.rs).
-        // E-IL2 arena-dest probe (before the hint so the NT exemption
-        // travels with the class): a ring-origin handoff's task-local
-        // window override, if any (see `ipc_service::ipc_read_dest_override`).
-        let arena_dest = crate::ipc_service::ipc_read_dest_override(size);
-        let mut read_hint = crate::routing::ReadClassHint {
-            odirect,
-            dest_arena: arena_dest.is_some(),
-            lane_pre_fed: _req.unique == 0,
-            dest_lease: false,
-        };
-
-        if is_virtual_ino(ino) {
-            // Serve priority: the OPEN's fh pin (one generation per open),
-            // then — generation inos — the registry payload verbatim
-            // (frozen size; ESTALE once retired), then — canonical fixed
-            // inos only — a fresh regenerate (the legacy fh-less serve an
-            // old consumer may still drive).
-            let bytes: std::sync::Arc<Vec<u8>> =
-                if let Some(cached) = self.open_virtual_files.get(&fh) {
-                    cached.value().clone()
-                } else if virtual_gen_class(ino).is_some() {
-                    match self.virtual_gen_payloads.get(&ino) {
-                        Some(e) => e.payload.clone(),
-                        None => return Err(Errno::from(libc::ESTALE)),
-                    }
-                } else if ino == STATS_INODE {
-                    std::sync::Arc::new(self.generate_stats_json().await.into_bytes())
-                } else {
-                    std::sync::Arc::new(self.generate_config_json().await.into_bytes())
-                };
-            debug!(
-                "FUSE Read virtual: ino = {ino}, fh = {fh}, len = {}",
-                bytes.len()
-            );
-            if offset >= bytes.len() as u64 {
+        // Rung 17 (KD-MW-8): overlay this mount's RETAINED shared-block
+        // extents onto the served bytes — read-your-writes for sub-block
+        // writes of a DEMOTED block whose covering publish has not landed
+        // yet (the retention store holds the mount's newest bytes for
+        // exactly those ranges). One relaxed load on every mount with no
+        // retention — which is every shipped mount, by construction. A
+        // zc-prefilled reply already landed in the transport's registered
+        // window and cannot be patched here; retention-window inos are
+        // the sub-block exception path and never arm the dest lease in
+        // practice — the composed corner is the rung's named residual.
+        let reply = self.read_impl(req, ino, fh, offset, size, flags).await?;
+        if crate::extent_ship::any_retained()
+            && !is_virtual_ino(ino)
+            && reply.zc_prefilled.is_none()
+            && crate::extent_ship::retained_count(ino) > 0
+        {
+            let mut buf = reply.data.to_vec();
+            if crate::extent_ship::overlay_retained(ino, offset, &mut buf) {
                 return Ok(ReplyData {
-                    data: Vec::new().into(),
+                    data: buf.into(),
                     backing: None,
                     zc_prefilled: None,
                 });
             }
-            let start = offset as usize;
-            let end = std::cmp::min(bytes.len(), start + size as usize);
-            // SAFETY: start < bytes.len() checked above, and end is clamped to bytes.len()
-            let slice = unsafe { bytes.get_unchecked(start..end) };
-            return Ok(ReplyData {
-                data: slice.to_vec().into(),
-                backing: None,
-                zc_prefilled: None,
-            });
         }
-
-        let prof = OpProf::begin(FuseOpKind::Read, ino);
-        // Overlay reads compose first (covered → dest, gaps → zeros)
-        // so a 1 MiB read of a 1 MiB store does not zero-seed the rest
-        // of the 4 MiB block. Drain is the multi-block / terminal
-        // fallback. One relaxed gauge load on overlay-free mounts.
-        if crate::device_overlay::any_open_fast() {
-            match self.try_serve_overlay_read(ino, offset, size).await {
-                Some(Ok(buf)) => {
-                    return Ok(ReplyData {
-                        data: buf.into(),
-                        backing: None,
-                        zc_prefilled: None,
-                    });
-                }
-                Some(Err(e)) => return Err(map_squeezefs_err(e)),
-                None => {
-                    self.drain_device_overlays_range(
-                        ino,
-                        offset,
-                        offset.saturating_add(size as u64),
-                    )
-                    .await
-                    .map_err(map_squeezefs_err)?;
-                }
-            }
-        }
-        // TEST SEAM: park this read strictly AFTER its entry overlay
-        // compose/drain and BEFORE its size snapshot — see
-        // `set_test_read_window_stall`.
-        test_stall_park(
-            test_read_window_stall_cell(),
-            test_read_window_stall_entries_cell(),
-        )
-        .await;
-        // Serve-residence decomposition (read_serve_phase_ns, always-on):
-        // t0 anchors `prelude` and `total`; the router records the inner
-        // phases; `post_validate` covers the last iteration's overlay +
-        // fingerprint work. Error exits deliberately record nothing (they
-        // are loud on their own).
-        let serve_t0 = std::time::Instant::now();
-        // PERF-12: stack key (`inode_{ino}` always fits) — one heap
-        // allocation per READ removed; every consumer takes `&str`.
-        let file_path = crate::keys::inode_path_stack(ino);
-        let file_path: &str = &file_path;
-        let lock = self.get_inode_lock_ref(ino);
-
-        // Short critical section only: size bound + active-buffer hit.
-        // Must NOT hold the inode read lock across flush or backend I/O —
-        // flush_single_active_block upgrades to write() and tokio RwLock is
-        // not re-entrant (self-deadlock under multi-block / active-block reads).
-        let (file_size, active_hit, guard_meta) = {
-            let _guard = lock.read().await;
-
-            let mut file_size = if let Some((attr, _)) = self.attr_cache.get(&ino) {
-                attr.size
-            } else {
-                let backend = self
-                    .meta_backend
-                    .as_ref()
-                    .ok_or_else(|| {
-                        SqueezefsError::InvalidOperation(
-                            "Metadata backend not initialized".to_string(),
-                        )
-                    })
-                    .map_err(map_squeezefs_err)?;
-                // Fail LOUD on a dead/erroring ino — the old `.unwrap_or(0)`
-                // fabricated size 0, and the kernel zero-extends a short
-                // read up to its cached i_size (fuse_short_read): a
-                // destroyed-under-fd or transiently-erroring inode read as
-                // silent full-length zeros instead of an error
-                // (generic/795).
-                backend
-                    .getattr(ino)
-                    .await
-                    .map(|inode| inode.size)
-                    .map_err(map_squeezefs_err)?
-            };
-
-            // Size coherency: prefer the router metadata cache, which the write
-            // path updates synchronously. The durable inode/attr caches can lag
-            // a just-committed write until its deferred flush, so without this a
-            // read racing a write (kernel readahead under the writeback cache)
-            // would observe a stale size (0 on a fresh file), return a short
-            // read, and let the kernel cache zero pages — silent read-after-
-            // write corruption.
-            // Captured once and reused below (P2 per-op economy): the
-            // pre-read custody fingerprint and the router descent's first
-            // attempt both build from this snapshot instead of re-probing
-            // the cache — an older-than-instant snapshot is CONSERVATIVE
-            // for the fingerprint (movement since capture shows up as a
-            // post-side mismatch → one bounded retry; epoch monotonicity
-            // forbids ABA), and the router re-validates freshness before
-            // trusting the hint.
-            let guard_meta = self.router.metadata_cache.get(&ino);
-            if let Some(m) = &guard_meta {
-                file_size = m.size;
-            }
-
-            if offset >= file_size {
-                return Ok(ReplyData {
-                    data: Vec::new().into(),
-                    backing: None,
-                    zc_prefilled: None,
-                });
-            }
-
-            let read_len = std::cmp::min(size as u64, file_size - offset) as usize;
-            let block_size = self.router.block_size.load(Ordering::Relaxed);
-            let start_block = offset / block_size;
-            let end_block = (offset + read_len as u64 - 1) / block_size;
-
-            if start_block == end_block {
-                // PERF-12: stack key — the heap `CompactString` + `String`
-                // this minted were two allocations per READ for a value used
-                // only as a map probe.
-                let cache_key = crate::keys::active_block_stack(ino, start_block);
-                let cache_key: &str = &cache_key;
-                if let Some(buf) = self.active_block_buffers.get(cache_key) {
-                    let block_start = start_block * block_size;
-                    let rel_offset = (offset - block_start) as usize;
-                    let rel_end = rel_offset + read_len;
-                    // W2 extent overlay (§5.2 — "overlay never invisible"):
-                    // serve covered ∩ range from the parked slabs and the
-                    // complement from the base tiers/ranged read (zeros for
-                    // a hole-backed overlay) — never materialize a
-                    // block-size image on the read path. Runs + deferral
-                    // are captured under the entry guard; the guard drops
-                    // before the base read (a racing fold publishes the
-                    // SAME bytes into the base — idempotent overlay).
-                    if buf.value().is_extent_repr() {
-                        let deferred = buf.value().seed_deferred();
-                        let covered = buf.value().covered_contains(rel_offset, rel_end);
-                        let runs = buf.value().extent_runs_in(rel_offset, rel_end);
-                        drop(buf);
-                        let mut out = vec![0u8; read_len];
-                        if deferred && !covered {
-                            let (base, _backing) = self
-                                .router
-                                .read_file_range_zero_copy(
-                                    &file_path,
-                                    offset,
-                                    read_len as u32,
-                                    None,
-                                    read_hint,
-                                )
-                                .await
-                                .map_err(map_squeezefs_err)?;
-                            let n = base.len().min(read_len);
-                            out[..n].copy_from_slice(&base[..n]);
-                        }
-                        for (s, d) in runs {
-                            let lo = s - rel_offset;
-                            out[lo..lo + d.len()].copy_from_slice(&d);
-                        }
-                        return Ok(ReplyData {
-                            data: bytes::Bytes::from(out),
-                            backing: None,
-                            zc_prefilled: None,
-                        });
-                    }
-                    // Zero-copy CoW-stable snapshot: immutable for the
-                    // reply's whole lifetime — a later write to this block
-                    // copies instead of mutating these bytes (P0 fix).
-                    // Coverage-aware (§5.3 + RW3b multi-run): snapshot +
-                    // coverage queries are read under the same entry guard,
-                    // so they are mutually consistent; memset elision means
-                    // the gaps of a Fresh buffer hold recycled pool bytes
-                    // that must NEVER be served through the kernel — a read
-                    // inside the covered runs serves the zero-copy slice, a
-                    // Fresh read overlapping a gap composes zeros + runs,
-                    // and a deferred read overlapping a gap materializes
-                    // (the gap owes OLD bytes, item B).
-                    let contained = buf.value().covered_contains(rel_offset, rel_end);
-                    let deferred = buf.value().seed_deferred();
-                    if !contained && !deferred {
-                        // Rare sparse read overlapping the gaps of a Fresh
-                        // buffer: build the reply in a fresh buffer — zeros
-                        // plus written runs ∩ range — WITHOUT mutating the
-                        // shared buffer (zeroing in place here would be a
-                        // mutation outside BLOCK_FLUSH_LOCKS). Runs +
-                        // snapshot captured under the same guard.
-                        let snapshot = buf.value().snapshot();
-                        let runs = buf.value().covered_runs_in(rel_offset, rel_end);
-                        drop(buf);
-                        let mut out = vec![0u8; read_len];
-                        for (s, e) in runs {
-                            out[s - rel_offset..e - rel_offset].copy_from_slice(&snapshot[s..e]);
-                        }
-                        return Ok(ReplyData {
-                            data: bytes::Bytes::from(out),
-                            backing: None,
-                            zc_prefilled: None,
-                        });
-                    }
-                    if contained {
-                        // Common case (every content-valid entry and every
-                        // sequential read): zero-copy slice.
-                        let snapshot = buf.value().snapshot();
-                        drop(buf);
-                        return Ok(ReplyData {
-                            data: snapshot.slice(rel_offset..rel_end),
-                            backing: None,
-                            zc_prefilled: None,
-                        });
-                    }
-                    drop(buf);
-                    {
-                        // Item B: the uncovered complement owes the OLD
-                        // block's bytes (not zeros). Materialize under the
-                        // block lock — the reader pays the read the writer
-                        // deferred — then serve the merged content.
-                        // OVERLAY NEVER INVISIBLE (the QUICK 075/112
-                        // transient): the buffer stays PARKED across the
-                        // fetch await — checking it out here made every
-                        // concurrent single-block read (kernel readahead,
-                        // AIO) fall to the backend and serve pre-merge
-                        // bytes. The held block lock excludes mutators, so
-                        // the fill applies synchronously via a short-lived
-                        // map guard afterwards (never a guard across an
-                        // await — the §5.5 executor-starvation wedge
-                        // class). On a failed fetch the buffer is parked
-                        // unchanged (never-lossy) and the read fails loud.
-                        let _block_guard =
-                            block_lock_acquire(ino, start_block as u32, BlockLockSite::ReadSeed)
-                                .await;
-                        let still_deferred = self
-                            .active_block_buffers
-                            .get(cache_key)
-                            .map(|e| e.value().seed_deferred());
-                        match still_deferred {
-                            Some(true) => {
-                                let image = self
-                                    .fetch_seed_image(&file_path, start_block as u32)
-                                    .await
-                                    .map_err(map_squeezefs_err)?;
-                                if let Some(mut entry) =
-                                    self.active_block_buffers.get_mut(cache_key)
-                                {
-                                    entry
-                                        .value_mut()
-                                        .fill_complement_from(image.as_deref().unwrap_or(&[]));
-                                    let snap = entry.value().snapshot();
-                                    drop(entry);
-                                    return Ok(ReplyData {
-                                        data: snap.slice(rel_offset..rel_end),
-                                        backing: None,
-                                        zc_prefilled: None,
-                                    });
-                                }
-                                // Vanished between fetch and fill — the lock
-                                // forbids it; fall through to a backend read
-                                // (now authoritative) rather than abort a
-                                // read path.
-                            }
-                            Some(false) => {
-                                // A racing flush/write materialized it first:
-                                // serve the now content-valid snapshot.
-                                if let Some(entry) = self.active_block_buffers.get(cache_key) {
-                                    let snap = entry.value().snapshot();
-                                    drop(entry);
-                                    return Ok(ReplyData {
-                                        data: snap.slice(rel_offset..rel_end),
-                                        backing: None,
-                                        zc_prefilled: None,
-                                    });
-                                }
-                            }
-                            None => {}
-                        }
-                        // Buffer vanished (flushed meanwhile): fall through
-                        // to the normal backend read below.
-                    }
-                }
-                (file_size, false, guard_meta)
-            } else {
-                (file_size, true, guard_meta) // need flush of dirty active blocks first
-            }
-        };
-
-        let read_len = std::cmp::min(size as u64, file_size - offset) as usize;
-
-        let guard_meta = if active_hit {
-            let fencing_token = self.dlm.get_fencing_token_ino(ino);
-            let _ = self
-                .flush_active_blocks_with_retry(ino, fencing_token)
-                .await;
-            // The flush may have published bindings / retired overlays:
-            // re-snapshot so the pre-fingerprint and router hint see the
-            // post-flush layout (multi-block windows only — the hot
-            // single-block path never flushes here).
-            self.router.metadata_cache.get(&ino)
-        } else {
-            guard_meta
-        };
-
-        // Serve destination: ring-origin handoffs carry the op's
-        // validated arena window as a task-local override (E-IL2,
-        // read-copy-count 2026-08-02 — the il twin of the registered
-        // uring payload dest, probed above into `read_hint.dest_arena`;
-        // exposure argument at `ipc_service::ipc_read_dest_override`);
-        // kernel requests derive the registered ent payload from the
-        // connection as before.
-        // FUSE-4e: the transport's LENGTH rides along as the window's cap.
-        // `get_payload_buffer` always returned `(ptr, len)` and this site
-        // used to drop the length (`.map(|(ptr, _sz)| ptr)`), leaving the
-        // kernel's honoring of the negotiated `max_pages` as the only bound
-        // on every serve that writes into the payload region.
-        let conn_guard = self.session_connection.load();
-        let dest = arena_dest
-            .or_else(|| {
-                conn_guard
-                    .as_ref()
-                    .as_ref()
-                    .and_then(|conn| conn.get_payload_buffer(_req.slot))
-            })
-            // SAFETY: both windows are this request's own for the handler
-            // invocation — the registered ent payload under the §5.4 lease
-            // protocol (its re-arm is gated on the lease), and the il arena
-            // window under the descriptor-validated session custody
-            // (`ipc_read_dest_override`).
-            .map(|(ptr, cap)| unsafe { crate::routing::ReadDest::new(ptr, cap) });
-        // READ dest-window lease admission (copy-elimination phase 1):
-        // kernel ent-payload dests only — arena windows keep their il
-        // composition (direct-drive already dest-DMAs the aligned il
-        // cold path; the consumer-distance law is different there), and
-        // the lever is the A/B control. The router composes this with
-        // the per-request geometry (alignment, sub-block, passthrough).
-        read_hint.dest_lease =
-            dest.is_some() && !read_hint.dest_arena && self.router.dest_lease_enabled();
-
-        // FUSE-zc direct leg (K1 kill, 2026-08-06): on a zc-armed session
-        // the READ's own pages sit behind the transport's sparse slot —
-        // mint the device-fetch handle the router's cold leg drives
-        // (device DMA straight into the caller's pages; the daemon serve
-        // pass AND the kernel's COMMIT folio copy both deleted). Kernel
-        // ring slots only: il arena overrides never ride FUSE replies,
-        // and `dest` still points at the transport BOUNCE, so every warm/
-        // ineligible serve keeps its venue unchanged.
-        let zc_serve = conn_guard
-            .as_ref()
-            .as_ref()
-            .filter(|c| c.zc_armed() && _req.slot.is_ring() && arena_dest.is_none())
-            .map(|conn| {
-                let conn = conn.clone();
-                let slot = _req.slot;
-                crate::routing::ZcReadServe::new(Box::new(move |fd, off, len| {
-                    let conn = conn.clone();
-                    Box::pin(async move { conn.zc_device_fetch(slot, fd, off, len).await })
-                }))
-            });
-
-        // OVERLAY NEVER INVISIBLE — the moving-custody read protocol
-        // (fstests generic/795, VL10 release gate). A block's acked bytes
-        // live in exactly one live authority at a time — RAM overlay →
-        // staged sibling → durable binding — and every transfer publishes
-        // its destination strictly BEFORE retiring its source (under the
-        // block's flush lock). This read is deliberately lock-free, so a
-        // transfer landing INSIDE the read window can invert the reader's
-        // probe order: the router resolved the block map before the
-        // publish, while the overlay/sibling probes ran after the retire —
-        // acked bytes invisible to every tier this pass touched (zeros
-        // served at the head of a just-completed block, the 795 cmp
-        // signature). Three layered defenses, all load-bearing:
-        //
-        //  1. pre-captured overlay runs (before the router read) close the
-        //     overlay-retired-during-read face;
-        //  2. the post-read capture (strictly newer where both exist)
-        //     closes the park-created-during-read face;
-        //  3. the binding fingerprint below detects a block-map publish
-        //     that landed mid-read — the one transfer the two captures
-        //     cannot see (sibling/overlay → durable binding) — and re-runs
-        //     the read; the fresh pass resolves the published map. Bounded
-        //     by a small lock-free budget — churn outlasting it ESCALATES
-        //     (below), never serves the last compose;
-        //  4. the post-read DEVICE-OVERLAY probe (the 2026-08-15 recopy-
-        //     storm conviction — generic/795's flake face): the B4 overlay
-        //     is a fourth custody station whose acked bytes live at an
-        //     UNPUBLISHED dest — invisible to captures (1)/(2) (RAM
-        //     probes) and to fingerprint (3) (an Open/Frozen record moves
-        //     neither map keys nor custody epochs). The probe runs in the
-        //     REVERSE order of the publish (registry before fingerprint —
-        //     the round-2 ordering law);
-        //  5. the ESCALATION (round 3 — the architectural close): ANY
-        //     validation failure the budget does not absorb re-serves the
-        //     whole window through `read_window_settled` — per block,
-        //     BLOCK_FLUSH_LOCKS (3) + INODE_META_LOCKS (3.5), the write
-        //     path's own extended order (the rebind-starvation serialized
-        //     settle law) — correct by lock order, not probe
-        //     completeness. Engagement: `overlay_window_escalations`.
-        let mut bindings_before = self
-            .read_custody_fingerprint(guard_meta.as_ref(), &file_path, ino, offset, read_len)
-            .await;
-        // The router's first attempt reuses the handler snapshot (one moka
-        // get + clone saved per read); retries re-resolve fresh — a retry
-        // IS the movement signal.
-        let mut meta_hint = guard_meta;
-        let mut attempts = 0u32;
-        // FUSE-zc: one direct-leg attempt per request; any post-serve
-        // movement (parked overlay runs, custody fingerprint) disables
-        // the leg and re-reads through the ordinary ladder, whose reply
-        // bridges through the transport bounce and OVERWRITES the pages.
-        let mut zc_enabled = true;
-        let (data, backing, router_done_at) = loop {
-            let pre_runs = self.capture_parked_runs(ino, offset, read_len);
-
-            // The zc leg composes with the overlay-never-invisible law by
-            // DECLINING whenever parked runs exist for this window — a
-            // page-resident serve cannot be overlay-composed.
-            let zc_pass = zc_serve
-                .as_ref()
-                .filter(|_| zc_enabled && pre_runs.is_empty());
-
-            // Backend / cache read without holding the inode lock (readers
-            // scale).
-            let read_future = self.router.read_file_range_zero_copy_with_meta(
-                &file_path,
-                offset,
-                read_len as u32,
-                dest,
-                read_hint,
-                meta_hint.take(),
-                zc_pass,
-            );
-            if attempts == 0 {
-                // First dispatch only: retries are movement-signal
-                // re-reads, not prelude work.
-                read_serve_phase_record(ReadServePhase::Prelude, serve_t0);
-            }
-            prof.mark_backend_start();
-            let read_res = read_future.await;
-            prof.mark_backend_done();
-            let router_done_at = std::time::Instant::now();
-            let (data, backing) = match read_res {
-                Ok(res) => res,
-                Err(e) => {
-                    error!("FUSE Read error: {:?}", e);
-                    return Err(map_squeezefs_err(e));
-                }
-            };
-
-            // FUSE-zc direct serve: the payload is IN THE CALLER'S PAGES
-            // (empty reply body + latched length). Validate the same
-            // movement signals the byte path validates; on ANY of them
-            // re-read with the leg disabled (never compose overlays or
-            // serve a moved binding from pages the daemon cannot see).
-            if data.is_empty() && zc_pass.is_some_and(|z| z.served().is_some()) && read_len > 0 {
-                let post_runs = self.capture_parked_runs(ino, offset, read_len);
-                // ORDER LAW (see the byte path below): registry probe
-                // strictly BEFORE the fingerprint — the reverse of the
-                // publish order.
-                let overlay_live = self.device_overlay_blocks_in_window(ino, offset, read_len);
-                let bindings_after = self
-                    .read_custody_fingerprint(None, &file_path, ino, offset, read_len)
-                    .await;
-                if post_runs.is_empty()
-                    && overlay_live.is_empty()
-                    && read_custody_fp_matches(&bindings_after, &bindings_before)
-                {
-                    break (data, backing, router_done_at);
-                }
-                zc_enabled = false;
-                bindings_before = bindings_after;
-                // Deliberately NOT counted against `attempts`: the
-                // ordinary re-read below must always run at least once
-                // (an empty body is never a servable last compose).
-                continue;
-            }
-
-            let post_runs = self.capture_parked_runs(ino, offset, data.len());
-            let data = Self::apply_parked_runs(offset, data, &pre_runs);
-            let data = Self::apply_parked_runs(offset, data, &post_runs);
-
-            // Defense #4: a LIVE overlay record inside the window means
-            // acked bytes this compose could not see — drain it (the entry
-            // drain's own verb; the settle publishes destination-before-
-            // retire, so the re-read resolves the bytes) and re-run. A
-            // drain failure propagates loud with the record still parked
-            // (never-lossy): serving the compose would serve zeros for
-            // acked bytes.
-            //
-            // ORDER LAW (the 2026-08-15 re-falsification): the two
-            // post-read authority reads run in the REVERSE order of the
-            // custody transfer they validate. Every settle publishes its
-            // destination strictly BEFORE retiring its source (map move
-            // `M` before record retire `R`), so the reader probes the
-            // SOURCE registry first and the DESTINATION fingerprint
-            // second: a miss then requires probe-post-`R` AND
-            // fingerprint-pre-`M`, i.e. `R < M` — a contradiction. The
-            // inverted order left the (fingerprint, probe) gap a whole
-            // settle could land inside, blind to both (the falsification
-            // tape's stale serve; pinned by
-            // `settle_inside_the_validate_gap_never_hides_acked_bytes`).
-            let overlay_blocks = self.device_overlay_blocks_in_window(ino, offset, read_len);
-            // TEST SEAM: park between the two post-read authority reads
-            // (see `set_test_read_validate_stall` — the ordering-law pin).
-            test_stall_park(
-                test_read_validate_stall_cell(),
-                test_read_validate_stall_entries_cell(),
-            )
-            .await;
-            let bindings_after = self
-                .read_custody_fingerprint(None, &file_path, ino, offset, read_len)
-                .await;
-            if overlay_blocks.is_empty()
-                && read_custody_fp_matches(&bindings_after, &bindings_before)
-            {
-                break (data, backing, router_done_at);
-            }
-            if overlay_blocks.is_empty() && attempts < 2 {
-                // Benign fingerprint churn (a publish landed mid-window):
-                // the historical bounded lock-free re-read — cheap and it
-                // usually converges. A LIVE overlay record never takes
-                // this arm (its bytes are invisible to a lock-free pass
-                // by construction), and churn outlasting the budget
-                // escalates below instead of the retired stale
-                // exhaustion serve.
-                attempts += 1;
-                bindings_before = bindings_after;
-                continue;
-            }
-            // ESCALATE (2026-08-15 round 3 — the architectural close):
-            // validation failed — a live overlay record inside the
-            // window, or fingerprint churn past the lock-free budget.
-            // Re-serve the whole window under the write path's own
-            // extended lock order (`read_window_settled`): correct by
-            // lock order, not probe completeness. This retires the
-            // exhaustion arm's "serve the last compose" — a validation
-            // failure is never served lock-free anymore.
-            METRICS
-                .overlay_window_escalations
-                .fetch_add(1, Ordering::Relaxed);
-            let settled = self
-                .read_window_settled(ino, &file_path, offset, read_len)
-                .await
-                .map_err(map_squeezefs_err)?;
-            break (settled, None, router_done_at);
-        };
-        // Last iteration's overlay-apply + fingerprint re-check span, then
-        // the whole per-op residence.
-        read_serve_phase_record(ReadServePhase::PostValidate, router_done_at);
-        read_serve_phase_record(ReadServePhase::Total, serve_t0);
-        // FUSE-zc direct serve: reply header + length only (the session's
-        // prefilled commit) — the payload already sits in the caller's
-        // pages.
-        if data.is_empty() && read_len > 0 {
-            if let Some(n) = zc_serve.as_ref().and_then(|z| z.served()) {
-                return Ok(ReplyData {
-                    data,
-                    backing,
-                    zc_prefilled: Some(n),
-                });
-            }
-        }
-        Ok(ReplyData {
-            data,
-            backing,
-            zc_prefilled: None,
-        })
+        Ok(reply)
     }
 
     async fn write(
@@ -21911,41 +21457,79 @@ impl Filesystem for SqueezefsFilesystem {
                 // BLOCK_FLUSH_LOCKS serialize the data path.
                 drop(guard);
                 write_phase_record(WritePhase::RouteClassify, wp_route);
-                // FIND-RW5-A face 3: a transient adjacent-bump fence
-                // (our own lease churn — single-writer mount) retries once
-                // with a fresh lease instead of surfacing EIO; a second
-                // fence is genuine and stays loud.
-                let mut token = fencing_token;
-                let mut attempt = 0u32;
-                loop {
-                    match self
-                        .write_file_staged(ino, offset, payload.clone(), effective_old_size, token)
-                        .await
-                    {
-                        Ok(()) => break,
-                        Err(e @ SqueezefsError::FencingTokenExpired { .. }) => {
-                            self.invalidate_local_lease(ino);
-                            if attempt >= 1 {
-                                return Err(map_squeezefs_err(e));
+                // Rung 17 (KD-MW-8): a write touching a RANGE-SHARED
+                // block on an armed co-writer ships those blocks' bytes
+                // as EXTENTS to the AUTHORITY — the block's single
+                // publisher — and retains them until coverage; unshared
+                // slices keep the ordinary striped path. Two relaxed
+                // loads + an empty-map probe on every shipped mount
+                // (KD-MW-12), and unreachable on any mount until a
+                // demotion marks sharing.
+                if self.range_write_engaged(ino)
+                    && self.write_touches_shared_block(ino, offset, wlen as u64, fencing_token)
+                {
+                    // §5.4 lease-severance: retention outlives this
+                    // handler invocation, so the payload materializes and
+                    // severs before anything is retained/shipped.
+                    let slot_bytes = payload.materialize().await.map_err(|e| {
+                        error!("FUSE Write: slot payload materialize failed: {e}");
+                        Errno::from(libc::EIO)
+                    })?;
+                    let data_bytes = sever_payload(&slot_bytes);
+                    self.write_shared_striped(
+                        ino,
+                        offset,
+                        data_bytes,
+                        effective_old_size,
+                        fencing_token,
+                    )
+                    .await
+                    .map_err(map_squeezefs_err)?;
+                } else {
+                    // FIND-RW5-A face 3: a transient adjacent-bump fence
+                    // (our own lease churn — single-writer mount) retries
+                    // once with a fresh lease instead of surfacing EIO; a
+                    // second fence is genuine and stays loud.
+                    let mut token = fencing_token;
+                    let mut attempt = 0u32;
+                    loop {
+                        match self
+                            .write_file_staged(
+                                ino,
+                                offset,
+                                payload.clone(),
+                                effective_old_size,
+                                token,
+                            )
+                            .await
+                        {
+                            Ok(()) => break,
+                            Err(e @ SqueezefsError::FencingTokenExpired { .. }) => {
+                                self.invalidate_local_lease(ino);
+                                if attempt >= 1 {
+                                    return Err(map_squeezefs_err(e));
+                                }
+                                attempt += 1;
+                                // S11 rung 15: the re-acquire stays
+                                // span-aware — a whole-file re-acquire on
+                                // a range-custody co-writer would conflict
+                                // with a PEER's live ranges and turn a
+                                // transient fence into EIO.
+                                token = self
+                                    .acquire_write_lease_for_span(ino, offset, wlen as u64)
+                                    .await
+                                    .map_err(map_squeezefs_err)?;
+                                // KD-6: the retry re-runs the protocol
+                                // against the CURRENT world, never the
+                                // entry-time snapshot (no guard is held
+                                // here — the fetch-capable resolution is
+                                // legal).
+                                if let Ok(m) = self.router.fetch_metadata(file_path).await {
+                                    effective_old_size = m.size;
+                                }
                             }
-                            attempt += 1;
-                            // S11 rung 15: the re-acquire stays span-aware —
-                            // a whole-file re-acquire on a range-custody
-                            // co-writer would conflict with a PEER's live
-                            // ranges and turn a transient fence into EIO.
-                            token = self
-                                .acquire_write_lease_for_span(ino, offset, wlen as u64)
-                                .await
-                                .map_err(map_squeezefs_err)?;
-                            // KD-6: the retry re-runs the protocol against
-                            // the CURRENT world, never the entry-time
-                            // snapshot (no guard is held here — the
-                            // fetch-capable resolution is legal).
-                            if let Ok(m) = self.router.fetch_metadata(file_path).await {
-                                effective_old_size = m.size;
-                            }
+                            Err(e) => return Err(map_squeezefs_err(e)),
                         }
-                        Err(e) => return Err(map_squeezefs_err(e)),
                     }
                 }
             }
@@ -23849,6 +23433,20 @@ impl Filesystem for SqueezefsFilesystem {
         if let Err(e) = self.flush_inode_to_backend(ino, fencing_token).await {
             error!("FUSE Fsync failed for ino {}: {:?}", ino, e);
             return Err(map_squeezefs_err(e));
+        }
+        // Rung 17 (§9.3's retention law): a sub-block writer's fsync
+        // CHAINS through the AUTHORITY's publish barrier for every
+        // retained extent — the synchronous FlushExtents force, whose
+        // reply's covering version releases the retention (release path
+        // 3). One relaxed load on every mount with no retention, which
+        // is every shipped mount by construction.
+        if crate::extent_ship::any_retained() && crate::extent_ship::retained_count(ino) > 0 {
+            if let Some(backend) = self.meta_backend.as_ref() {
+                if let Err(e) = crate::extent_ship::flush_ino(backend, ino).await {
+                    error!("FUSE Fsync: FlushExtents barrier for ino {ino} failed: {e:?}");
+                    return Err(map_squeezefs_err(e));
+                }
+            }
         }
         prof.mark_backend_done();
 
@@ -27070,5 +26668,666 @@ mod tests {
         assert!(check_component_name_len(OsStr::new("")).is_ok());
         assert!(check_component_name_len(OsStr::new("x")).is_ok());
         assert!(check_component_name_len(OsStr::new(&"b".repeat(255))).is_ok());
+    }
+}
+
+
+/// Rung 17: the read handler body, housed behind the retained-extent
+/// overlay wrapper (the trait `read` above delegates here verbatim).
+impl SqueezefsFilesystem {
+    pub(crate) async fn read_impl(
+        &self,
+        _req: Request,
+        ino: u64,
+        fh: u64,
+        offset: u64,
+        size: u32,
+        flags: u32,
+    ) -> FuseResult<ReplyData> {
+        METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
+        crate::coz_progress!("fuse_read");
+        debug!(
+            "FUSE Read: ino = {}, fh = {}, offset = {}, size = {}, flags = {:#x}",
+            ino, fh, offset, size, flags
+        );
+        // R1b classifier inputs (§5.3) + hybrid I/O (user directive
+        // 2026-07-15): the kernel sends the file's open flags on every
+        // READ; O_DIRECT is counted here and handed to the routing layer
+        // as the per-request `ReadClassHint` — under the DEFAULT hybrid
+        // policy it only labels observability (O_DIRECT serves/admits
+        // exactly like buffered), and combined with the mount-scoped
+        // `direct_device_true` escape it selects the strictly device-true
+        // diagnostic path.
+        let odirect = flags & (libc::O_DIRECT as u32) != 0;
+        if odirect {
+            METRICS
+                .read_odirect_requests
+                .fetch_add(1, Ordering::Relaxed);
+        } else if _req.unique != 0 {
+            // Quiescent-lineage un-latch (page-coherence law): a KERNEL
+            // buffered READ instantiates page-cache folios (mmap
+            // fault-ins arrive here too) — bumped BEFORE the reply, so
+            // the next DIO write invalidates again. Ring-origin serves
+            // (`unique == 0`) touch no kernel pages and skip the bump.
+            self.note_page_instantiation(ino);
+        }
+        // Ring-originated requests (the IPC handoff path) carry
+        // `unique == 0` — `DataPlaneSink::ring_request` is the only
+        // unique-0 Request producer on the read path (kernel uniques are
+        // kernel-allocated and nonzero). Those ops already fed the
+        // stream lanes at the sink (`ring_read_lane_touch`); observing
+        // them again in `pipeline_touch` would declassify the stream
+        // that routed them here (§5.3 — pinned by
+        // tests/read_saturation_tests.rs).
+        // E-IL2 arena-dest probe (before the hint so the NT exemption
+        // travels with the class): a ring-origin handoff's task-local
+        // window override, if any (see `ipc_service::ipc_read_dest_override`).
+        let arena_dest = crate::ipc_service::ipc_read_dest_override(size);
+        let mut read_hint = crate::routing::ReadClassHint {
+            odirect,
+            dest_arena: arena_dest.is_some(),
+            lane_pre_fed: _req.unique == 0,
+            dest_lease: false,
+        };
+
+        if is_virtual_ino(ino) {
+            // Serve priority: the OPEN's fh pin (one generation per open),
+            // then — generation inos — the registry payload verbatim
+            // (frozen size; ESTALE once retired), then — canonical fixed
+            // inos only — a fresh regenerate (the legacy fh-less serve an
+            // old consumer may still drive).
+            let bytes: std::sync::Arc<Vec<u8>> =
+                if let Some(cached) = self.open_virtual_files.get(&fh) {
+                    cached.value().clone()
+                } else if virtual_gen_class(ino).is_some() {
+                    match self.virtual_gen_payloads.get(&ino) {
+                        Some(e) => e.payload.clone(),
+                        None => return Err(Errno::from(libc::ESTALE)),
+                    }
+                } else if ino == STATS_INODE {
+                    std::sync::Arc::new(self.generate_stats_json().await.into_bytes())
+                } else {
+                    std::sync::Arc::new(self.generate_config_json().await.into_bytes())
+                };
+            debug!(
+                "FUSE Read virtual: ino = {ino}, fh = {fh}, len = {}",
+                bytes.len()
+            );
+            if offset >= bytes.len() as u64 {
+                return Ok(ReplyData {
+                    data: Vec::new().into(),
+                    backing: None,
+                    zc_prefilled: None,
+                });
+            }
+            let start = offset as usize;
+            let end = std::cmp::min(bytes.len(), start + size as usize);
+            // SAFETY: start < bytes.len() checked above, and end is clamped to bytes.len()
+            let slice = unsafe { bytes.get_unchecked(start..end) };
+            return Ok(ReplyData {
+                data: slice.to_vec().into(),
+                backing: None,
+                zc_prefilled: None,
+            });
+        }
+
+        let prof = OpProf::begin(FuseOpKind::Read, ino);
+        // Overlay reads compose first (covered → dest, gaps → zeros)
+        // so a 1 MiB read of a 1 MiB store does not zero-seed the rest
+        // of the 4 MiB block. Drain is the multi-block / terminal
+        // fallback. One relaxed gauge load on overlay-free mounts.
+        if crate::device_overlay::any_open_fast() {
+            match self.try_serve_overlay_read(ino, offset, size).await {
+                Some(Ok(buf)) => {
+                    return Ok(ReplyData {
+                        data: buf.into(),
+                        backing: None,
+                        zc_prefilled: None,
+                    });
+                }
+                Some(Err(e)) => return Err(map_squeezefs_err(e)),
+                None => {
+                    self.drain_device_overlays_range(
+                        ino,
+                        offset,
+                        offset.saturating_add(size as u64),
+                    )
+                    .await
+                    .map_err(map_squeezefs_err)?;
+                }
+            }
+        }
+        // TEST SEAM: park this read strictly AFTER its entry overlay
+        // compose/drain and BEFORE its size snapshot — see
+        // `set_test_read_window_stall`.
+        test_stall_park(
+            test_read_window_stall_cell(),
+            test_read_window_stall_entries_cell(),
+        )
+        .await;
+        // Serve-residence decomposition (read_serve_phase_ns, always-on):
+        // t0 anchors `prelude` and `total`; the router records the inner
+        // phases; `post_validate` covers the last iteration's overlay +
+        // fingerprint work. Error exits deliberately record nothing (they
+        // are loud on their own).
+        let serve_t0 = std::time::Instant::now();
+        // PERF-12: stack key (`inode_{ino}` always fits) — one heap
+        // allocation per READ removed; every consumer takes `&str`.
+        let file_path = crate::keys::inode_path_stack(ino);
+        let file_path: &str = &file_path;
+        let lock = self.get_inode_lock_ref(ino);
+
+        // Short critical section only: size bound + active-buffer hit.
+        // Must NOT hold the inode read lock across flush or backend I/O —
+        // flush_single_active_block upgrades to write() and tokio RwLock is
+        // not re-entrant (self-deadlock under multi-block / active-block reads).
+        let (file_size, active_hit, guard_meta) = {
+            let _guard = lock.read().await;
+
+            let mut file_size = if let Some((attr, _)) = self.attr_cache.get(&ino) {
+                attr.size
+            } else {
+                let backend = self
+                    .meta_backend
+                    .as_ref()
+                    .ok_or_else(|| {
+                        SqueezefsError::InvalidOperation(
+                            "Metadata backend not initialized".to_string(),
+                        )
+                    })
+                    .map_err(map_squeezefs_err)?;
+                // Fail LOUD on a dead/erroring ino — the old `.unwrap_or(0)`
+                // fabricated size 0, and the kernel zero-extends a short
+                // read up to its cached i_size (fuse_short_read): a
+                // destroyed-under-fd or transiently-erroring inode read as
+                // silent full-length zeros instead of an error
+                // (generic/795).
+                backend
+                    .getattr(ino)
+                    .await
+                    .map(|inode| inode.size)
+                    .map_err(map_squeezefs_err)?
+            };
+
+            // Size coherency: prefer the router metadata cache, which the write
+            // path updates synchronously. The durable inode/attr caches can lag
+            // a just-committed write until its deferred flush, so without this a
+            // read racing a write (kernel readahead under the writeback cache)
+            // would observe a stale size (0 on a fresh file), return a short
+            // read, and let the kernel cache zero pages — silent read-after-
+            // write corruption.
+            // Captured once and reused below (P2 per-op economy): the
+            // pre-read custody fingerprint and the router descent's first
+            // attempt both build from this snapshot instead of re-probing
+            // the cache — an older-than-instant snapshot is CONSERVATIVE
+            // for the fingerprint (movement since capture shows up as a
+            // post-side mismatch → one bounded retry; epoch monotonicity
+            // forbids ABA), and the router re-validates freshness before
+            // trusting the hint.
+            let guard_meta = self.router.metadata_cache.get(&ino);
+            if let Some(m) = &guard_meta {
+                file_size = m.size;
+            }
+
+            if offset >= file_size {
+                return Ok(ReplyData {
+                    data: Vec::new().into(),
+                    backing: None,
+                    zc_prefilled: None,
+                });
+            }
+
+            let read_len = std::cmp::min(size as u64, file_size - offset) as usize;
+            let block_size = self.router.block_size.load(Ordering::Relaxed);
+            let start_block = offset / block_size;
+            let end_block = (offset + read_len as u64 - 1) / block_size;
+
+            if start_block == end_block {
+                // PERF-12: stack key — the heap `CompactString` + `String`
+                // this minted were two allocations per READ for a value used
+                // only as a map probe.
+                let cache_key = crate::keys::active_block_stack(ino, start_block);
+                let cache_key: &str = &cache_key;
+                if let Some(buf) = self.active_block_buffers.get(cache_key) {
+                    let block_start = start_block * block_size;
+                    let rel_offset = (offset - block_start) as usize;
+                    let rel_end = rel_offset + read_len;
+                    // W2 extent overlay (§5.2 — "overlay never invisible"):
+                    // serve covered ∩ range from the parked slabs and the
+                    // complement from the base tiers/ranged read (zeros for
+                    // a hole-backed overlay) — never materialize a
+                    // block-size image on the read path. Runs + deferral
+                    // are captured under the entry guard; the guard drops
+                    // before the base read (a racing fold publishes the
+                    // SAME bytes into the base — idempotent overlay).
+                    if buf.value().is_extent_repr() {
+                        let deferred = buf.value().seed_deferred();
+                        let covered = buf.value().covered_contains(rel_offset, rel_end);
+                        let runs = buf.value().extent_runs_in(rel_offset, rel_end);
+                        drop(buf);
+                        let mut out = vec![0u8; read_len];
+                        if deferred && !covered {
+                            let (base, _backing) = self
+                                .router
+                                .read_file_range_zero_copy(
+                                    &file_path,
+                                    offset,
+                                    read_len as u32,
+                                    None,
+                                    read_hint,
+                                )
+                                .await
+                                .map_err(map_squeezefs_err)?;
+                            let n = base.len().min(read_len);
+                            out[..n].copy_from_slice(&base[..n]);
+                        }
+                        for (s, d) in runs {
+                            let lo = s - rel_offset;
+                            out[lo..lo + d.len()].copy_from_slice(&d);
+                        }
+                        return Ok(ReplyData {
+                            data: bytes::Bytes::from(out),
+                            backing: None,
+                            zc_prefilled: None,
+                        });
+                    }
+                    // Zero-copy CoW-stable snapshot: immutable for the
+                    // reply's whole lifetime — a later write to this block
+                    // copies instead of mutating these bytes (P0 fix).
+                    // Coverage-aware (§5.3 + RW3b multi-run): snapshot +
+                    // coverage queries are read under the same entry guard,
+                    // so they are mutually consistent; memset elision means
+                    // the gaps of a Fresh buffer hold recycled pool bytes
+                    // that must NEVER be served through the kernel — a read
+                    // inside the covered runs serves the zero-copy slice, a
+                    // Fresh read overlapping a gap composes zeros + runs,
+                    // and a deferred read overlapping a gap materializes
+                    // (the gap owes OLD bytes, item B).
+                    let contained = buf.value().covered_contains(rel_offset, rel_end);
+                    let deferred = buf.value().seed_deferred();
+                    if !contained && !deferred {
+                        // Rare sparse read overlapping the gaps of a Fresh
+                        // buffer: build the reply in a fresh buffer — zeros
+                        // plus written runs ∩ range — WITHOUT mutating the
+                        // shared buffer (zeroing in place here would be a
+                        // mutation outside BLOCK_FLUSH_LOCKS). Runs +
+                        // snapshot captured under the same guard.
+                        let snapshot = buf.value().snapshot();
+                        let runs = buf.value().covered_runs_in(rel_offset, rel_end);
+                        drop(buf);
+                        let mut out = vec![0u8; read_len];
+                        for (s, e) in runs {
+                            out[s - rel_offset..e - rel_offset].copy_from_slice(&snapshot[s..e]);
+                        }
+                        return Ok(ReplyData {
+                            data: bytes::Bytes::from(out),
+                            backing: None,
+                            zc_prefilled: None,
+                        });
+                    }
+                    if contained {
+                        // Common case (every content-valid entry and every
+                        // sequential read): zero-copy slice.
+                        let snapshot = buf.value().snapshot();
+                        drop(buf);
+                        return Ok(ReplyData {
+                            data: snapshot.slice(rel_offset..rel_end),
+                            backing: None,
+                            zc_prefilled: None,
+                        });
+                    }
+                    drop(buf);
+                    {
+                        // Item B: the uncovered complement owes the OLD
+                        // block's bytes (not zeros). Materialize under the
+                        // block lock — the reader pays the read the writer
+                        // deferred — then serve the merged content.
+                        // OVERLAY NEVER INVISIBLE (the QUICK 075/112
+                        // transient): the buffer stays PARKED across the
+                        // fetch await — checking it out here made every
+                        // concurrent single-block read (kernel readahead,
+                        // AIO) fall to the backend and serve pre-merge
+                        // bytes. The held block lock excludes mutators, so
+                        // the fill applies synchronously via a short-lived
+                        // map guard afterwards (never a guard across an
+                        // await — the §5.5 executor-starvation wedge
+                        // class). On a failed fetch the buffer is parked
+                        // unchanged (never-lossy) and the read fails loud.
+                        let _block_guard =
+                            block_lock_acquire(ino, start_block as u32, BlockLockSite::ReadSeed)
+                                .await;
+                        let still_deferred = self
+                            .active_block_buffers
+                            .get(cache_key)
+                            .map(|e| e.value().seed_deferred());
+                        match still_deferred {
+                            Some(true) => {
+                                let image = self
+                                    .fetch_seed_image(&file_path, start_block as u32)
+                                    .await
+                                    .map_err(map_squeezefs_err)?;
+                                if let Some(mut entry) =
+                                    self.active_block_buffers.get_mut(cache_key)
+                                {
+                                    entry
+                                        .value_mut()
+                                        .fill_complement_from(image.as_deref().unwrap_or(&[]));
+                                    let snap = entry.value().snapshot();
+                                    drop(entry);
+                                    return Ok(ReplyData {
+                                        data: snap.slice(rel_offset..rel_end),
+                                        backing: None,
+                                        zc_prefilled: None,
+                                    });
+                                }
+                                // Vanished between fetch and fill — the lock
+                                // forbids it; fall through to a backend read
+                                // (now authoritative) rather than abort a
+                                // read path.
+                            }
+                            Some(false) => {
+                                // A racing flush/write materialized it first:
+                                // serve the now content-valid snapshot.
+                                if let Some(entry) = self.active_block_buffers.get(cache_key) {
+                                    let snap = entry.value().snapshot();
+                                    drop(entry);
+                                    return Ok(ReplyData {
+                                        data: snap.slice(rel_offset..rel_end),
+                                        backing: None,
+                                        zc_prefilled: None,
+                                    });
+                                }
+                            }
+                            None => {}
+                        }
+                        // Buffer vanished (flushed meanwhile): fall through
+                        // to the normal backend read below.
+                    }
+                }
+                (file_size, false, guard_meta)
+            } else {
+                (file_size, true, guard_meta) // need flush of dirty active blocks first
+            }
+        };
+
+        let read_len = std::cmp::min(size as u64, file_size - offset) as usize;
+
+        let guard_meta = if active_hit {
+            let fencing_token = self.dlm.get_fencing_token_ino(ino);
+            let _ = self
+                .flush_active_blocks_with_retry(ino, fencing_token)
+                .await;
+            // The flush may have published bindings / retired overlays:
+            // re-snapshot so the pre-fingerprint and router hint see the
+            // post-flush layout (multi-block windows only — the hot
+            // single-block path never flushes here).
+            self.router.metadata_cache.get(&ino)
+        } else {
+            guard_meta
+        };
+
+        // Serve destination: ring-origin handoffs carry the op's
+        // validated arena window as a task-local override (E-IL2,
+        // read-copy-count 2026-08-02 — the il twin of the registered
+        // uring payload dest, probed above into `read_hint.dest_arena`;
+        // exposure argument at `ipc_service::ipc_read_dest_override`);
+        // kernel requests derive the registered ent payload from the
+        // connection as before.
+        // FUSE-4e: the transport's LENGTH rides along as the window's cap.
+        // `get_payload_buffer` always returned `(ptr, len)` and this site
+        // used to drop the length (`.map(|(ptr, _sz)| ptr)`), leaving the
+        // kernel's honoring of the negotiated `max_pages` as the only bound
+        // on every serve that writes into the payload region.
+        let conn_guard = self.session_connection.load();
+        let dest = arena_dest
+            .or_else(|| {
+                conn_guard
+                    .as_ref()
+                    .as_ref()
+                    .and_then(|conn| conn.get_payload_buffer(_req.slot))
+            })
+            // SAFETY: both windows are this request's own for the handler
+            // invocation — the registered ent payload under the §5.4 lease
+            // protocol (its re-arm is gated on the lease), and the il arena
+            // window under the descriptor-validated session custody
+            // (`ipc_read_dest_override`).
+            .map(|(ptr, cap)| unsafe { crate::routing::ReadDest::new(ptr, cap) });
+        // READ dest-window lease admission (copy-elimination phase 1):
+        // kernel ent-payload dests only — arena windows keep their il
+        // composition (direct-drive already dest-DMAs the aligned il
+        // cold path; the consumer-distance law is different there), and
+        // the lever is the A/B control. The router composes this with
+        // the per-request geometry (alignment, sub-block, passthrough).
+        read_hint.dest_lease =
+            dest.is_some() && !read_hint.dest_arena && self.router.dest_lease_enabled();
+
+        // FUSE-zc direct leg (K1 kill, 2026-08-06): on a zc-armed session
+        // the READ's own pages sit behind the transport's sparse slot —
+        // mint the device-fetch handle the router's cold leg drives
+        // (device DMA straight into the caller's pages; the daemon serve
+        // pass AND the kernel's COMMIT folio copy both deleted). Kernel
+        // ring slots only: il arena overrides never ride FUSE replies,
+        // and `dest` still points at the transport BOUNCE, so every warm/
+        // ineligible serve keeps its venue unchanged.
+        let zc_serve = conn_guard
+            .as_ref()
+            .as_ref()
+            .filter(|c| c.zc_armed() && _req.slot.is_ring() && arena_dest.is_none())
+            .map(|conn| {
+                let conn = conn.clone();
+                let slot = _req.slot;
+                crate::routing::ZcReadServe::new(Box::new(move |fd, off, len| {
+                    let conn = conn.clone();
+                    Box::pin(async move { conn.zc_device_fetch(slot, fd, off, len).await })
+                }))
+            });
+
+        // OVERLAY NEVER INVISIBLE — the moving-custody read protocol
+        // (fstests generic/795, VL10 release gate). A block's acked bytes
+        // live in exactly one live authority at a time — RAM overlay →
+        // staged sibling → durable binding — and every transfer publishes
+        // its destination strictly BEFORE retiring its source (under the
+        // block's flush lock). This read is deliberately lock-free, so a
+        // transfer landing INSIDE the read window can invert the reader's
+        // probe order: the router resolved the block map before the
+        // publish, while the overlay/sibling probes ran after the retire —
+        // acked bytes invisible to every tier this pass touched (zeros
+        // served at the head of a just-completed block, the 795 cmp
+        // signature). Three layered defenses, all load-bearing:
+        //
+        //  1. pre-captured overlay runs (before the router read) close the
+        //     overlay-retired-during-read face;
+        //  2. the post-read capture (strictly newer where both exist)
+        //     closes the park-created-during-read face;
+        //  3. the binding fingerprint below detects a block-map publish
+        //     that landed mid-read — the one transfer the two captures
+        //     cannot see (sibling/overlay → durable binding) — and re-runs
+        //     the read; the fresh pass resolves the published map. Bounded
+        //     by a small lock-free budget — churn outlasting it ESCALATES
+        //     (below), never serves the last compose;
+        //  4. the post-read DEVICE-OVERLAY probe (the 2026-08-15 recopy-
+        //     storm conviction — generic/795's flake face): the B4 overlay
+        //     is a fourth custody station whose acked bytes live at an
+        //     UNPUBLISHED dest — invisible to captures (1)/(2) (RAM
+        //     probes) and to fingerprint (3) (an Open/Frozen record moves
+        //     neither map keys nor custody epochs). The probe runs in the
+        //     REVERSE order of the publish (registry before fingerprint —
+        //     the round-2 ordering law);
+        //  5. the ESCALATION (round 3 — the architectural close): ANY
+        //     validation failure the budget does not absorb re-serves the
+        //     whole window through `read_window_settled` — per block,
+        //     BLOCK_FLUSH_LOCKS (3) + INODE_META_LOCKS (3.5), the write
+        //     path's own extended order (the rebind-starvation serialized
+        //     settle law) — correct by lock order, not probe
+        //     completeness. Engagement: `overlay_window_escalations`.
+        let mut bindings_before = self
+            .read_custody_fingerprint(guard_meta.as_ref(), &file_path, ino, offset, read_len)
+            .await;
+        // The router's first attempt reuses the handler snapshot (one moka
+        // get + clone saved per read); retries re-resolve fresh — a retry
+        // IS the movement signal.
+        let mut meta_hint = guard_meta;
+        let mut attempts = 0u32;
+        // FUSE-zc: one direct-leg attempt per request; any post-serve
+        // movement (parked overlay runs, custody fingerprint) disables
+        // the leg and re-reads through the ordinary ladder, whose reply
+        // bridges through the transport bounce and OVERWRITES the pages.
+        let mut zc_enabled = true;
+        let (data, backing, router_done_at) = loop {
+            let pre_runs = self.capture_parked_runs(ino, offset, read_len);
+
+            // The zc leg composes with the overlay-never-invisible law by
+            // DECLINING whenever parked runs exist for this window — a
+            // page-resident serve cannot be overlay-composed.
+            let zc_pass = zc_serve
+                .as_ref()
+                .filter(|_| zc_enabled && pre_runs.is_empty());
+
+            // Backend / cache read without holding the inode lock (readers
+            // scale).
+            let read_future = self.router.read_file_range_zero_copy_with_meta(
+                &file_path,
+                offset,
+                read_len as u32,
+                dest,
+                read_hint,
+                meta_hint.take(),
+                zc_pass,
+            );
+            if attempts == 0 {
+                // First dispatch only: retries are movement-signal
+                // re-reads, not prelude work.
+                read_serve_phase_record(ReadServePhase::Prelude, serve_t0);
+            }
+            prof.mark_backend_start();
+            let read_res = read_future.await;
+            prof.mark_backend_done();
+            let router_done_at = std::time::Instant::now();
+            let (data, backing) = match read_res {
+                Ok(res) => res,
+                Err(e) => {
+                    error!("FUSE Read error: {:?}", e);
+                    return Err(map_squeezefs_err(e));
+                }
+            };
+
+            // FUSE-zc direct serve: the payload is IN THE CALLER'S PAGES
+            // (empty reply body + latched length). Validate the same
+            // movement signals the byte path validates; on ANY of them
+            // re-read with the leg disabled (never compose overlays or
+            // serve a moved binding from pages the daemon cannot see).
+            if data.is_empty() && zc_pass.is_some_and(|z| z.served().is_some()) && read_len > 0 {
+                let post_runs = self.capture_parked_runs(ino, offset, read_len);
+                // ORDER LAW (see the byte path below): registry probe
+                // strictly BEFORE the fingerprint — the reverse of the
+                // publish order.
+                let overlay_live = self.device_overlay_blocks_in_window(ino, offset, read_len);
+                let bindings_after = self
+                    .read_custody_fingerprint(None, &file_path, ino, offset, read_len)
+                    .await;
+                if post_runs.is_empty()
+                    && overlay_live.is_empty()
+                    && read_custody_fp_matches(&bindings_after, &bindings_before)
+                {
+                    break (data, backing, router_done_at);
+                }
+                zc_enabled = false;
+                bindings_before = bindings_after;
+                // Deliberately NOT counted against `attempts`: the
+                // ordinary re-read below must always run at least once
+                // (an empty body is never a servable last compose).
+                continue;
+            }
+
+            let post_runs = self.capture_parked_runs(ino, offset, data.len());
+            let data = Self::apply_parked_runs(offset, data, &pre_runs);
+            let data = Self::apply_parked_runs(offset, data, &post_runs);
+
+            // Defense #4: a LIVE overlay record inside the window means
+            // acked bytes this compose could not see — drain it (the entry
+            // drain's own verb; the settle publishes destination-before-
+            // retire, so the re-read resolves the bytes) and re-run. A
+            // drain failure propagates loud with the record still parked
+            // (never-lossy): serving the compose would serve zeros for
+            // acked bytes.
+            //
+            // ORDER LAW (the 2026-08-15 re-falsification): the two
+            // post-read authority reads run in the REVERSE order of the
+            // custody transfer they validate. Every settle publishes its
+            // destination strictly BEFORE retiring its source (map move
+            // `M` before record retire `R`), so the reader probes the
+            // SOURCE registry first and the DESTINATION fingerprint
+            // second: a miss then requires probe-post-`R` AND
+            // fingerprint-pre-`M`, i.e. `R < M` — a contradiction. The
+            // inverted order left the (fingerprint, probe) gap a whole
+            // settle could land inside, blind to both (the falsification
+            // tape's stale serve; pinned by
+            // `settle_inside_the_validate_gap_never_hides_acked_bytes`).
+            let overlay_blocks = self.device_overlay_blocks_in_window(ino, offset, read_len);
+            // TEST SEAM: park between the two post-read authority reads
+            // (see `set_test_read_validate_stall` — the ordering-law pin).
+            test_stall_park(
+                test_read_validate_stall_cell(),
+                test_read_validate_stall_entries_cell(),
+            )
+            .await;
+            let bindings_after = self
+                .read_custody_fingerprint(None, &file_path, ino, offset, read_len)
+                .await;
+            if overlay_blocks.is_empty()
+                && read_custody_fp_matches(&bindings_after, &bindings_before)
+            {
+                break (data, backing, router_done_at);
+            }
+            if overlay_blocks.is_empty() && attempts < 2 {
+                // Benign fingerprint churn (a publish landed mid-window):
+                // the historical bounded lock-free re-read — cheap and it
+                // usually converges. A LIVE overlay record never takes
+                // this arm (its bytes are invisible to a lock-free pass
+                // by construction), and churn outlasting the budget
+                // escalates below instead of the retired stale
+                // exhaustion serve.
+                attempts += 1;
+                bindings_before = bindings_after;
+                continue;
+            }
+            // ESCALATE (2026-08-15 round 3 — the architectural close):
+            // validation failed — a live overlay record inside the
+            // window, or fingerprint churn past the lock-free budget.
+            // Re-serve the whole window under the write path's own
+            // extended lock order (`read_window_settled`): correct by
+            // lock order, not probe completeness. This retires the
+            // exhaustion arm's "serve the last compose" — a validation
+            // failure is never served lock-free anymore.
+            METRICS
+                .overlay_window_escalations
+                .fetch_add(1, Ordering::Relaxed);
+            let settled = self
+                .read_window_settled(ino, &file_path, offset, read_len)
+                .await
+                .map_err(map_squeezefs_err)?;
+            break (settled, None, router_done_at);
+        };
+        // Last iteration's overlay-apply + fingerprint re-check span, then
+        // the whole per-op residence.
+        read_serve_phase_record(ReadServePhase::PostValidate, router_done_at);
+        read_serve_phase_record(ReadServePhase::Total, serve_t0);
+        // FUSE-zc direct serve: reply header + length only (the session's
+        // prefilled commit) — the payload already sits in the caller's
+        // pages.
+        if data.is_empty() && read_len > 0 {
+            if let Some(n) = zc_serve.as_ref().and_then(|z| z.served()) {
+                return Ok(ReplyData {
+                    data,
+                    backing,
+                    zc_prefilled: Some(n),
+                });
+            }
+        }
+        Ok(ReplyData {
+            data,
+            backing,
+            zc_prefilled: None,
+        })
     }
 }

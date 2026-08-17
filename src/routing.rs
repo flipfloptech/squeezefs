@@ -5727,6 +5727,16 @@ impl DataRouter {
     /// not happened yet (see the `pending_block_refs` field): the caller is
     /// inside the `INODE_META_LOCKS` section that mutated the RAM map and
     /// is NOT persisting it in this call.
+    /// Rung 17 (§9.3's quiesce): BARRIER on the ino's §5.3 merge
+    /// discipline — every in-flight layout publish holds the ino's
+    /// `INODE_META_LOCKS` mutex across its merge, so acquiring and
+    /// dropping it here proves the publishes that predate the demotion
+    /// notice have drained (the incumbent's "drain in-flight publishes"
+    /// step, run BEFORE the ack travels).
+    pub async fn quiesce_ino_meta(&self, ino: u64) {
+        drop(crate::routing::meta_lock_acquire(ino).await);
+    }
+
     pub(crate) fn note_block_ref_ops(
         &self,
         ino: u64,

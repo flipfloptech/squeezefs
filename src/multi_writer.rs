@@ -291,9 +291,13 @@ impl MultiWriterArm {
         crate::alloc_lane_grant::uninstall_frontier_source();
         // The shipped-free EXECUTOR dies with the authority too: a served
         // free with no executor refuses loud rather than stranding half a
-        // ladder on a disarmed mount. Same for its reuse half.
+        // ladder on a disarmed mount. Same for its reuse half — and for
+        // rung 17's extent ASSEMBLER pair (a served extent with no
+        // assembler refuses loud rather than acking bytes nobody merges).
         publish::uninstall_free_executor();
         publish::uninstall_harvest_executor();
+        publish::uninstall_extent_merge_executor();
+        publish::uninstall_extent_flush_executor();
         if let Some(hold) = self.wero.take() {
             data_custody::release_hold(hold).await;
         }

@@ -1045,6 +1045,12 @@ impl CoWriterArm {
         crate::meta_ship::publish::uninstall_client();
         crate::meta_ship::uninstall_daemon_verb_router();
         crate::meta_ship::disarm_ownership();
+        // Rung 17: the extent hooks die with the co-writer (retention
+        // itself survives in RAM only as long as the process — MW-10's
+        // acked-un-fsynced class owns a crash's residue).
+        crate::extent_ship::uninstall_quiesce_hook();
+        crate::extent_ship::uninstall_release_hook();
+        crate::extent_ship::uninstall_spill_sink();
         if let Some(arm) = self.membership.take() {
             arm.disarm().await;
         }

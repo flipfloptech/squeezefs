@@ -320,6 +320,34 @@
 #                       (the gate still enforces). Evidence tier:
 #                       measured-simulated (one box, co-located members
 #                       sharing the device + CPUs — stated in the row).
+#   s11-range [--mb=M]  (rung 15, KD-MW-7 — needs a fleet created with
+#                       --multi-writer --cowriters=2) THE FIRST SUB-FILE
+#                       MULTI-WRITER ROWS: the authority creates ONE
+#                       striped file; TWO co-writers acquire DISJOINT
+#                       byte-range custody of it over the S9 custody wire
+#                       (the §9.2 required/desired admit — each holder's
+#                       stream coalesces to ONE widened grant) and write
+#                       their halves CONCURRENTLY under those grants
+#                       (dd conv=fsync — durable rows). Engagement: each
+#                       co-writer's dlm_custody_range_acquires delta >= 1
+#                       (the ranged path ENGAGED, never a silent
+#                       whole-file fallback), the authority's
+#                       range_custody ledger accounts (grants >= 2,
+#                       extensions reported) with cap_refusals delta == 0
+#                       (the Issue-19 column: a within-budget legitimate
+#                       shape refused = INVALID row) and publish ships
+#                       accounted per co-writer. Verify: each half sha256
+#                       through its writer's own mount, then the WHOLE
+#                       file through a REMOUNTED authority (cold caches —
+#                       the merged two-writer layout must compose
+#                       byte-identically). Kill arm: kill -9 one holder
+#                       MID-REWRITE — its ranges die with its era (the
+#                       authority's custody sweep retires them:
+#                       dlm_revokes_expired moves and range_custody_active
+#                       converges to 0 once the survivor completes +
+#                       releases), the SURVIVOR's stream completes green,
+#                       the victim remounts, fsck findings 0 + C8 drift 0.
+#                       Zero residue (leg files removed, fleet healthy).
 #   s10c-kill-shard [--corpus-mb=M]  (rung 10c, KD-MW-16 — needs
 #                       --membership and >= 3 members) kill -9 a member
 #                       MID-SHARD: a no-kill baseline learns the fleet's
@@ -389,6 +417,7 @@ S6_VICTIM=""
 S7_ROUNDS=10
 S8B_SECS="${SQZ_MWMATRIX_S8B_SECS:-1800}"
 S9A_MB_CAP="${SQZ_MWMATRIX_S9A_MB:-1024}"
+S11_MB_CAP="${SQZ_MWMATRIX_S11_MB:-256}"
 S10C_MB="${SQZ_MWMATRIX_S10C_MB:-3072}"
 S10C_RUNS="${SQZ_MWMATRIX_S10C_RUNS:-3}"
 for a in "$@"; do
@@ -399,13 +428,17 @@ for a in "$@"; do
     --victim=*) S6_VICTIM="${a#--victim=}" ;;
     --rounds=*) S7_ROUNDS="${a#--rounds=}" ;;
     --secs=*) S8B_SECS="${a#--secs=}" ;;
-    --mb=*) S9A_MB_CAP="${a#--mb=}" ;;
+    --mb=*)
+        S9A_MB_CAP="${a#--mb=}"
+        S11_MB_CAP="${a#--mb=}"
+        ;;
     --corpus-mb=*) S10C_MB="${a#--corpus-mb=}" ;;
     --runs=*) S10C_RUNS="${a#--runs=}" ;;
     *) die "unknown argument '$a'" ;;
     esac
 done
 [[ "$S9A_MB_CAP" =~ ^[0-9]+$ ]] && [ "$S9A_MB_CAP" -ge 64 ] || die "--mb takes MiB >= 64 (got '$S9A_MB_CAP')"
+[[ "$S11_MB_CAP" =~ ^[0-9]+$ ]] && [ "$S11_MB_CAP" -ge 64 ] || die "--mb takes MiB >= 64 (got '$S11_MB_CAP')"
 [[ "$S6_WINDOW_S" =~ ^[0-9]+$ ]] || die "--window takes seconds (got '$S6_WINDOW_S')"
 [[ "$S6_NETEM_MS" =~ ^[0-9]+$ ]] || die "--netem takes ms (got '$S6_NETEM_MS')"
 [[ "$S7_ROUNDS" =~ ^[0-9]+$ ]] && [ "$S7_ROUNDS" -ge 1 ] || die "--rounds takes a positive integer (got '$S7_ROUNDS')"
@@ -3099,6 +3132,230 @@ print(f"  N={width} run {run}: {t_ms} ms, inodes {inodes}, scrub_bytes {scrub} (
 PYS10C
 }
 
+leg_s11_range() {
+    require_cowriters 2
+    local rowdir cws m1 m2 idx w_mnt
+    rowdir="$STATE/rows/s11r-$(date +%s)"
+    mkdir -p "$rowdir"
+    mapfile -t cws < <(cowriter_idxs)
+    m1="${cws[0]}"
+    m2="${cws[1]}"
+    w_mnt="$(mnt_of 0)"
+
+    # Sizing from the LANE SHARE (never a free constant — the s9-fanout
+    # law): each half at 20% of a lane, capped, floor 64 MiB.
+    local total_bytes=0 p w
+    local IFS_SAVE="$IFS"
+    IFS=,
+    for p in $FORMAT_DATA_PATHS; do
+        total_bytes=$((total_bytes + $(blockdev --getsize64 "$p")))
+    done
+    IFS="$IFS_SAVE"
+    w="$(stat_field 0 alloc_lane_writers)"
+    [ -n "$w" ] && [ "$w" -ge 2 ] ||
+        die "s11-range: alloc_lane_writers=$w — a --cowriters fleet must run an engaged allocation partition"
+    local lane_mb=$((total_bytes / w / 1024 / 1024))
+    local half_mb=$((lane_mb * 20 / 100))
+    [ "$half_mb" -le "$S11_MB_CAP" ] || half_mb="$S11_MB_CAP"
+    [ "$half_mb" -ge 64 ] || die "s11-range: derived half ${half_mb}MiB < 64MiB — grow SQZ_MWFLEET_OSS_GB"
+    local half_bytes=$((half_mb * 1024 * 1024))
+    log "s11-range: ONE $((2 * half_mb))MiB striped file, co-writer m$m1 takes [0,${half_mb}M), m$m2 takes [${half_mb}M,$((2 * half_mb))M) — disjoint range custody, concurrent durable writes (KD-MW-7, the first sub-file multi-writer rows)"
+
+    # The authority creates the shared file (striped by size; the halves
+    # are written by the CO-WRITERS only).
+    truncate -s $((2 * half_bytes)) "$w_mnt/s11-range.dat" ||
+        die "s11-range: authority could not create the shared file"
+
+    # Deterministic sources (verify needs bytes, not /dev/urandom-in-place).
+    head -c "$half_bytes" /dev/urandom >"$rowdir/src-m$m1"
+    head -c "$half_bytes" /dev/urandom >"$rowdir/src-m$m2"
+
+    for idx in $(member_idxs); do snap "$idx" 0 "$rowdir"; done
+
+    # ---- Phase 1: the CONCURRENT disjoint-half writes ------------------------
+    local -a pids=()
+    (
+        t0="$(date +%s.%N)"
+        rc=0
+        dd if="$rowdir/src-m$m1" of="$(mnt_of "$m1")/s11-range.dat" bs=4M \
+            seek=0 conv=fsync,notrunc status=none 2>"$rowdir/w-m$m1.err" || rc=$?
+        echo "$rc $t0 $(date +%s.%N)" >"$rowdir/w-m$m1"
+    ) &
+    pids+=("$!")
+    (
+        t0="$(date +%s.%N)"
+        rc=0
+        dd if="$rowdir/src-m$m2" of="$(mnt_of "$m2")/s11-range.dat" bs=4M \
+            seek=$((half_mb / 4)) conv=fsync,notrunc status=none 2>"$rowdir/w-m$m2.err" || rc=$?
+        echo "$rc $t0 $(date +%s.%N)" >"$rowdir/w-m$m2"
+    ) &
+    pids+=("$!")
+    wait "${pids[@]}" || true
+    local rc t0 t1
+    for idx in "$m1" "$m2"; do
+        read -r rc t0 t1 <"$rowdir/w-m$idx"
+        [ "$rc" = "0" ] || die "s11-range: m$idx's half FAILED (rc=$rc): $(head -3 "$rowdir/w-m$idx.err")"
+        log "m$idx wrote its ${half_mb}MiB half in $(python3 -c "print(f'{$t1-$t0:.1f}')")s (concurrent, conv=fsync)"
+    done
+    sleep 3 # publish/writeback settle
+    for idx in $(member_idxs); do snap "$idx" 1 "$rowdir"; done
+
+    # ---- The row: engagement + the Issue-19 column, gated --------------------
+    python3 - "$rowdir" "$m1" "$m2" <<'PYS11' || die "s11-range: INVALID ROW"
+import json, sys
+rowdir, m1, m2 = sys.argv[1], sys.argv[2], sys.argv[3]
+def flat(d, out=None, pfx=""):
+    out = {} if out is None else out
+    for k, v in d.items():
+        if isinstance(v, dict): flat(v, out, pfx + k + ".")
+        else: out[pfx + k] = v
+    return out
+def load(i, ph):
+    root = json.load(open(f"{rowdir}/m{i}_p{ph}.json"))
+    return flat(root.get("metrics", root))
+bad = []
+print("== S11 rung-15 row: 2 co-writers, disjoint range custody of ONE file ==")
+print(f"{'member':<8}{'rng_acq_d':<11}{'rng_ext_d':<11}{'pub_ship_d':<12}{'lcr':<5}")
+tot_acq = 0
+for i in (m1, m2):
+    d0, d1 = load(i, 0), load(i, 1)
+    dd = lambda k: int(d1.get(k, 0) or 0) - int(d0.get(k, 0) or 0)
+    acq = dd("dlm_custody.dlm_custody_range_acquires")
+    ext = dd("dlm_custody.dlm_custody_range_extensions")
+    pub = dd("meta_ship_publish.shipped")
+    lcr = int(d1.get("cowriter.local_commit_refusals", 0) or 0)
+    print(f"m{i:<7}{acq:<11}{ext:<11}{pub:<12}{lcr:<5}")
+    if acq < 1:
+        bad.append(f"m{i}: dlm_custody_range_acquires delta {acq} — the ranged write "
+                   "path did NOT engage (silent whole-file fallback = the row is a lie)")
+    if pub < 1:
+        bad.append(f"m{i}: meta_ship_publish.shipped delta 0 — a co-writer's publishes must SHIP")
+    if lcr != 0:
+        bad.append(f"m{i}: local_commit_refusals={lcr}")
+    if dd("invariant_tripwires") != 0:
+        bad.append(f"m{i}: invariant_tripwires moved")
+    if dd("mem_budget_hard_backstops") != 0 or dd("parked_gate_timeouts") != 0:
+        bad.append(f"m{i}: R5 columns moved")
+    tot_acq += acq
+a0, a1 = load("0", 0), load("0", 1)
+ad = lambda k: int(a1.get(k, 0) or 0) - int(a0.get(k, 0) or 0)
+grants = ad("range_custody.range_custody_grants")
+exts = ad("range_custody.range_custody_extensions")
+trims = ad("range_custody.range_custody_desired_trims")
+caps = ad("range_custody.range_custody_cap_refusals")
+confl = ad("range_custody.range_custody_conflicts")
+tbl = int(a1.get("range_custody.dlm_grant_table_bytes", 0) or 0)
+print(f"authority: grants_d={grants} extensions_d={exts} desired_trims_d={trims} "
+      f"cap_refusals_d={caps} conflicts_d={confl} table_bytes={tbl}")
+if grants < 2:
+    bad.append(f"authority: range_custody_grants delta {grants} < 2 — the two holders' "
+               "grants must be issued (and their streams coalesce into them)")
+if caps != 0:
+    bad.append(f"authority: range_custody_cap_refusals moved ({caps}) on a within-budget "
+               "shape — the Issue-19 class: a constant refusing the workload S11 exists for")
+for key, name in [("meta_ship_publish.refusals", "publish refusals"),
+                  ("meta_ship.owner_panics", "owner panics"),
+                  ("meta_ship_publish.owner_panics", "publish owner panics")]:
+    v = int(a1.get(key, 0) or 0)
+    if v != 0:
+        bad.append(f"authority: {name} = {v} (must stay 0)")
+if bad:
+    print("S11 GATE FAILED:", file=sys.stderr)
+    for b in bad:
+        print(f"  {b}", file=sys.stderr)
+    sys.exit(1)
+print("S11 phase-1 GATE GREEN (ranged engagement exact, Issue-19 column 0, ships accounted)")
+PYS11
+
+    # ---- Verify: own-mount halves, then the WHOLE file through a REMOUNTED
+    # authority (cold caches — the merged two-writer layout must compose).
+    local sha_src sha_got
+    for idx in "$m1" "$m2"; do
+        local skip=0
+        [ "$idx" = "$m2" ] && skip=$((half_mb / 4))
+        sha_src="$(sha256sum "$rowdir/src-m$idx" | cut -d' ' -f1)"
+        sha_got="$(dd if="$(mnt_of "$idx")/s11-range.dat" bs=4M skip="$skip" count=$((half_mb / 4)) status=none | sha256sum | cut -d' ' -f1)"
+        [ "$sha_src" = "$sha_got" ] ||
+            die "s11-range: m$idx's own half does not verify through its own mount ($sha_src != $sha_got)"
+    done
+    log "own-mount half verification green (both writers)"
+    "$MWFLEET" unmount 0 || die "s11-range: authority unmount failed"
+    "$MWFLEET" mount 0 || die "s11-range: authority remount failed"
+    sha_src="$(cat "$rowdir/src-m$m1" "$rowdir/src-m$m2" | sha256sum | cut -d' ' -f1)"
+    sha_got="$(sha256sum "$w_mnt/s11-range.dat" | cut -d' ' -f1)"
+    [ "$sha_src" = "$sha_got" ] ||
+        die "s11-range: the MERGED two-writer file does not verify through a cold authority ($sha_src != $sha_got) — the sub-file layout composition is broken"
+    log "cold-authority whole-file verification green — the two writers' layouts COMPOSED"
+
+    # ---- Phase 2: the kill arm — a holder's ranges die with its era ----------
+    local exp0 ttl deadline
+    exp0="$(stat_field 0 dlm_custody.dlm_revokes_expired)"
+    ttl="$(stat_field 0 membership_lease_ttl_ms)"
+    deadline=$((ttl / 1000 + 90))
+    # Long rewrites of the same halves; the kill lands mid-stream.
+    (exec dd if=/dev/zero of="$(mnt_of "$m1")/s11-range.dat" bs=4M seek=0 \
+        count=$((half_mb / 4)) conv=fsync,notrunc status=none) 2>"$rowdir/k-m$m1.err" &
+    local dd1=$!
+    (
+        rc=0
+        dd if="$rowdir/src-m$m2" of="$(mnt_of "$m2")/s11-range.dat" bs=4M \
+            seek=$((half_mb / 4)) conv=fsync,notrunc status=none 2>"$rowdir/k-m$m2.err" || rc=$?
+        echo "$rc" >"$rowdir/k-m$m2"
+    ) &
+    local dd2=$!
+    sleep 2
+    kill -0 "$dd1" 2>/dev/null || die "s11-range: the victim's rewrite exited before the kill"
+    "$MWFLEET" kill "$m1" --sig 9
+    log "victim m$m1 killed -9 MID-REWRITE (its dd dies with the mount — expected; the survivor must not notice)"
+    umount -l "$(mnt_of "$m1")" 2>/dev/null || true
+    kill -9 "$dd1" 2>/dev/null || true
+    wait "$dd1" 2>/dev/null || true
+    # The survivor's stream completes green.
+    wait "$dd2" || true
+    read -r rc <"$rowdir/k-m$m2"
+    [ "$rc" = "0" ] || die "s11-range: the SURVIVOR m$m2's rewrite FAILED (rc=$rc) after the peer's kill: $(head -3 "$rowdir/k-m$m2.err")"
+    log "survivor m$m2's rewrite completed green through the peer's death"
+    # The authority sweeps the dead holder: its lease expires and its
+    # ranges die with its era.
+    wait_stat_ge 0 dlm_custody.dlm_revokes_expired $((exp0 + 1)) "$deadline" \
+        "authority custody sweep of the killed range holder" >/dev/null
+    log "authority swept the victim's lease (dlm_revokes_expired moved) — its ranges died with its era"
+    # Convergence: once the survivor's releases travel (renewal-cadence
+    # drain), NO range custody remains live on the authority.
+    local tries active
+    for ((tries = 0; tries < 60; tries++)); do
+        active="$(stat_field 0 range_custody.range_custody_active)"
+        [ "$active" = "0" ] && break
+        sleep 1
+    done
+    [ "$active" = "0" ] ||
+        die "s11-range: range_custody_active=$active never converged to 0 — a dead/released holder's ranges are stranded in the table"
+    log "range_custody_active converged to 0 (dead holder's ranges retired, survivor's released)"
+
+    # ---- Re-admission + the oracle -------------------------------------------
+    "$MWFLEET" mount "$m1" || die "s11-range: victim m$m1 could not re-admit by remount"
+    local out drift v
+    out="$("$SQZ" fsck "$w_mnt" 2>&1)" || die "s11-range: online fsck FAILED:
+$out"
+    echo "$out" >"$rowdir/fsck.out"
+    echo "$out" | grep -q "findings: 0" || die "s11-range: fsck findings != 0:
+$out"
+    drift="$(stat_field 0 meta_kv_block_refs_drift)"
+    [ "$drift" = "0" ] || die "s11-range: meta_kv_block_refs_drift=$drift (C8 oracle RED)"
+    for v in meta_ship.owner_panics meta_ship_publish.refusals invariant_tripwires; do
+        [ "$(stat_field 0 "$v")" = "0" ] || die "s11-range: authority $v != 0"
+    done
+
+    # ---- Zero residue ---------------------------------------------------------
+    rm -f "$w_mnt/s11-range.dat" || die "s11-range: could not remove the leg's file"
+    rm -f "$rowdir/src-m$m1" "$rowdir/src-m$m2"
+    for idx in $(member_idxs); do
+        cat "$(mnt_of "$idx")/.stats" >/dev/null 2>&1 ||
+            die "s11-range: member m$idx is not healthy at leg end"
+    done
+    log "s11-range GREEN — the first sub-file multi-writer rows (snapshots + fsck in $rowdir). Evidence tier: measured-simulated (one box, co-located members)"
+}
+
 leg_s10c_fsck_scale() {
     local rowdir members
     rowdir="$STATE/rows/s10c-fsck-scale-$(date +%s)"
@@ -3973,6 +4230,7 @@ s8-crucible) leg_s8_crucible ;;
 s9-fanout) leg_s9_fanout ;;
 s9-failover) leg_s9_failover ;;
 s9-colocated-fence) leg_s9_colocated_fence ;;
+s11-range) leg_s11_range ;;
 s10c-fsck-scale) leg_s10c_fsck_scale ;;
 s10c-kill-shard) leg_s10c_kill_shard ;;
 s10-delegation) leg_s10_delegation ;;
@@ -3982,5 +4240,5 @@ s10-placement-tarx) leg_s10_placement_tarx ;;
 cowriters-admission) leg_cowriters_admission ;;
 vm-hostscope-validate) leg_vm_hostscope_validate ;;
 vm-multi-identity) leg_vm_multi_identity ;;
-*) die "unknown leg '$LEG' (smoke|multipath-negative|s6-journal|s6-fence|s6-vm-fence|s7-device-fence|s7-kill-matrix|s8-serial-ab|s8-crucible|s9-fanout|s9-failover|s9-colocated-fence|s10c-fsck-scale|s10c-kill-shard|s10-delegation|s10-intents|s10-intents-tarx|s10-placement-tarx|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
+*) die "unknown leg '$LEG' (smoke|multipath-negative|s6-journal|s6-fence|s6-vm-fence|s7-device-fence|s7-kill-matrix|s8-serial-ab|s8-crucible|s9-fanout|s9-failover|s9-colocated-fence|s11-range|s10c-fsck-scale|s10c-kill-shard|s10-delegation|s10-intents|s10-intents-tarx|s10-placement-tarx|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
 esac

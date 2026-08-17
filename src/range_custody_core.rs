@@ -184,6 +184,27 @@ pub struct RangeDecision {
     pub trimmed: bool,
 }
 
+/// One §9.3 **demotion-pending** record (DLM S11 rung 17, KD-MW-8): a
+/// second holder's acquire would SHARE A BLOCK with `incumbent_token`'s
+/// live grant, so the ask parks and the incumbent owes an ACK (carried
+/// on its renewal reply) before any grant can issue over `region`. The
+/// record is RAM state on the arbiter's `FileCustody` entry — it dies
+/// with the authority (MW-13's law: a demotion in flight when the
+/// authority dies restarts from zero on the successor).
+#[derive(Clone, Copy, Debug)]
+pub struct DemotionPending {
+    /// The block-aligned region being demoted.
+    pub region: (u64, u64),
+    /// The incumbent grant's token (the renewal notice's key — the
+    /// incumbent acks by naming it; its retire sweeps the pending
+    /// through the fence column).
+    pub incumbent_token: u64,
+    /// `true` once the incumbent acked (quiesced + re-routed): grants
+    /// over `region` may now issue — coexistence licensed, the region is
+    /// authority-assembled.
+    pub acked: bool,
+}
+
 /// A file's custody: the whole-file slot plus the live byte-range grants,
 /// as a **sorted interval list** (S11 — spec §6.9).
 ///
@@ -234,6 +255,15 @@ pub struct FileCustody {
     /// The newest fencing token granted while this entry has been live:
     /// the object's exact generation read (see `dlm::read_identity`).
     max_token: u64,
+    /// Rung 17 (§9.3): the **demoted regions** — block-aligned spans
+    /// whose data-plane custody transferred to the AUTHORITY (every
+    /// holder's writes there ship as extents; `span_is_range_shared`
+    /// answers TRUE for any overlap). Empty on every shipped mount —
+    /// one `is_empty` probe on the hot paths (KD-MW-12).
+    demoted: Vec<(u64, u64)>,
+    /// Rung 17 (§9.3): the live demotion-pending records (the
+    /// grant-issuance barrier's state). Empty everywhere shipped.
+    pending: Vec<DemotionPending>,
 }
 
 impl FileCustody {
@@ -244,6 +274,8 @@ impl FileCustody {
             ranges: Vec::new(),
             widest: 0,
             max_token: 0,
+            demoted: Vec::new(),
+            pending: Vec::new(),
         }
     }
 
@@ -572,9 +604,186 @@ impl FileCustody {
     /// therefore never range-shared — which is why the clause is inert on
     /// the shipped write path (it takes exactly that lease).
     pub fn span_is_range_shared(&self, start: u64, end: u64, holder_token: u64) -> bool {
+        // Rung 17: a DEMOTED region is authority-assembled for EVERY
+        // holder — a sole covering grant is still extent-ship-only there
+        // (KD-MW-8's custody transfer). One `is_empty` probe shipped.
+        if !self.demoted.is_empty()
+            && self.demoted.iter().any(|&(s, e)| e > start && s < end)
+        {
+            return true;
+        }
         self.candidates(start, end)
             .iter()
             .any(|g| g.overlaps(start, end) && (g.token != holder_token || !g.covers(start, end)))
+    }
+
+    // -----------------------------------------------------------------
+    // Rung 17 (§9.3) — the demotion barrier's core state transitions.
+    // Callers hold the entry lock (the plan/admit discipline).
+    // -----------------------------------------------------------------
+
+    /// Any whole-file custody live? (The demotion story is range-vs-range
+    /// by design — a whole-file holder keeps the plain conflict law.)
+    pub fn has_wholes(&self) -> bool {
+        !self.wholes.is_empty()
+    }
+
+    /// The live demoted regions (the grant reply carries them so an
+    /// adopting client marks its local table).
+    pub fn demoted_regions(&self) -> Vec<(u64, u64)> {
+        self.demoted.clone()
+    }
+
+    /// Mark `region` demoted (merge-inserted; overlapping/abutting
+    /// regions union).
+    pub fn adopt_demoted(&mut self, region: (u64, u64)) {
+        debug_assert!(region.0 < region.1);
+        let (mut s, mut e) = region;
+        self.demoted.retain(|&(rs, re)| {
+            if re >= s && rs <= e {
+                s = s.min(rs);
+                e = e.max(re);
+                false
+            } else {
+                true
+            }
+        });
+        let at = self.demoted.partition_point(|&(rs, _)| rs < s);
+        self.demoted.insert(at, (s, e));
+    }
+
+    /// Is `[start, end)` wholly inside the demoted regions?
+    pub fn span_within_demoted(&self, start: u64, end: u64) -> bool {
+        // Regions are disjoint and sorted; a span within must sit inside
+        // ONE region (unions coalesce abutting regions).
+        self.demoted
+            .iter()
+            .any(|&(rs, re)| rs <= start && re >= end)
+    }
+
+    /// Foreign range grants whose **block hull** overlaps `span`'s block
+    /// hull OUTSIDE the demoted regions — the §9.3 stab: each answer is
+    /// `(incumbent_token, incumbent_scope, shared block-aligned region)`.
+    /// Byte-overlapping grants are included (their carve is the same
+    /// demotion); shares wholly inside demoted regions are licensed and
+    /// excluded.
+    pub fn foreign_block_sharers(
+        &self,
+        span: (u64, u64),
+        block_size: u64,
+        scope: u64,
+    ) -> Vec<(u64, u64, (u64, u64))> {
+        if block_size == 0 || self.ranges.is_empty() {
+            return Vec::new();
+        }
+        let hull = block_align_out(span, block_size);
+        let mut out = Vec::new();
+        for g in self.candidates(hull.0, hull.1) {
+            if g.owner_nonce == scope || !g.overlaps(hull.0, hull.1) {
+                continue;
+            }
+            let g_hull = block_align_out((g.start, g.end), block_size);
+            let s = hull.0.max(g_hull.0);
+            let e = hull.1.min(g_hull.1);
+            if s >= e || self.span_within_demoted(s, e) {
+                continue;
+            }
+            out.push((g.token, g.owner_nonce, (s, e)));
+        }
+        out
+    }
+
+    /// Are ALL of `required`'s conflicting overlaps LICENSED — i.e. every
+    /// foreign (or own-incompatible-mode) byte overlap lies wholly inside
+    /// a demoted region? The coexistence admit's safety check: within a
+    /// demoted region nobody DMAs (every holder ships extents and the
+    /// AUTHORITY is the single publisher), so EX byte overlap is
+    /// tolerable there and only there.
+    pub fn required_overlaps_licensed(&self, required: (u64, u64), scope: u64) -> bool {
+        for g in self.candidates(required.0, required.1) {
+            if !g.overlaps(required.0, required.1) {
+                continue;
+            }
+            if g.owner_nonce == scope && g.mode == LockMode::Exclusive {
+                continue; // the own-EX arm is plan_range's (Covered/Extend)
+            }
+            let s = required.0.max(g.start);
+            let e = required.1.min(g.end);
+            if !self.span_within_demoted(s, e) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Mark one demotion pending. `true` = a NEW record (the ledger's
+    /// `range_custody_demotions` increment); an existing same-incumbent
+    /// overlapping record widens instead (idempotent re-asks from a
+    /// parked waiter's re-plans never double-count).
+    pub fn mark_demotion_pending(&mut self, region: (u64, u64), incumbent_token: u64) -> bool {
+        if let Some(p) = self.pending.iter_mut().find(|p| {
+            p.incumbent_token == incumbent_token
+                && p.region.1 >= region.0
+                && p.region.0 <= region.1
+        }) {
+            p.region.0 = p.region.0.min(region.0);
+            p.region.1 = p.region.1.max(region.1);
+            return false;
+        }
+        self.pending.push(DemotionPending {
+            region,
+            incumbent_token,
+            acked: false,
+        });
+        true
+    }
+
+    /// The UNACKED pendings naming `incumbent_token` — the renewal
+    /// notice's read (composed under this same entry serialization).
+    pub fn demotion_notices_for_token(&self, incumbent_token: u64) -> Vec<(u64, u64)> {
+        self.pending
+            .iter()
+            .filter(|p| !p.acked && p.incumbent_token == incumbent_token)
+            .map(|p| p.region)
+            .collect()
+    }
+
+    /// The incumbent's ACK: mark every pending naming `(token, region)`
+    /// acked and adopt the region as DEMOTED (authority-assembled).
+    /// `true` = at least one pending newly acked.
+    pub fn ack_demotion(&mut self, incumbent_token: u64, region: (u64, u64)) -> bool {
+        let mut acked = false;
+        for p in self.pending.iter_mut() {
+            if !p.acked
+                && p.incumbent_token == incumbent_token
+                && p.region.1 >= region.0
+                && p.region.0 <= region.1
+            {
+                p.acked = true;
+                acked = true;
+            }
+        }
+        if acked {
+            self.adopt_demoted(region);
+        }
+        acked
+    }
+
+    /// Sweep the pendings whose INCUMBENT grant just retired
+    /// (release / revocation / lease expiry): the barrier resolves
+    /// through the **fence column** — the incumbent's custody over the
+    /// block is provably retired without an ack. Returns the number of
+    /// UN-ACKED pendings resolved (the `demotion_fence_resolves`
+    /// increment; acked ones were already counted as acks).
+    pub fn sweep_pendings_of(&mut self, incumbent_token: u64) -> usize {
+        let before = self
+            .pending
+            .iter()
+            .filter(|p| !p.acked && p.incumbent_token == incumbent_token)
+            .count();
+        self.pending
+            .retain(|p| p.incumbent_token != incumbent_token);
+        before
     }
 }
 

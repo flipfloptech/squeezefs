@@ -595,11 +595,19 @@ async fn out_of_order_and_cross_era_publishes_refuse() {
     .expect("the first link applies");
 
     // (a) OUT OF ORDER / foreign provenance: a delta claiming a base the
-    // durable head never was — the two-writers-disagree shape §3 refuses.
+    // durable head never was. **Rung 17 superseded the refusal on the
+    // SHIPPED arm** (KD-MW-8's composition law, the rung-15 residual-1
+    // machinery this suite's own §6a text scheduled for PR 17): the
+    // owner CHAINS the delta onto the durable head under its own 4a
+    // I-guard, re-minting the link version from ITS sequencer — the
+    // divergence refusal survives verbatim on the LOCAL path (pinned in
+    // mw_authority_assembler_tests::the_local_publish_path_keeps_the_
+    // version_gate), and the clobber-by-full-Put re-base this refusal
+    // used to feed is structurally gone.
     let bogus_base = squeezefs::dlm::mint_layout_version();
     let v_next = squeezefs::dlm::mint_layout_version();
     let journal_before = journal_entries();
-    let err = pc
+    let reply = pc
         .ship(
             &auth.endpoint,
             publish::PublishCall::MergeLayoutAndSize {
@@ -613,19 +621,21 @@ async fn out_of_order_and_cross_era_publishes_refuse() {
             },
         )
         .await
-        .expect_err("a divergent-base delta refuses loud across the wire");
-    assert!(
-        err.to_string().contains("6.2")
-            || err.to_string().to_lowercase().contains("divergent")
-            || err.to_string().to_lowercase().contains("base"),
-        "the refusal names the version-gate divergence: {err}"
-    );
+        .expect("rung 17: a divergent-base SHIPPED delta chains onto the head");
+    let publish::PublishReply::DeltaUsed { used, version } = reply else {
+        panic!("the merge reply carries the staged version: {reply:?}");
+    };
+    assert!(used, "the chained delta STAGED (never a full-Put re-base)");
+    assert_ne!(version, 0, "the owner-minted link version travels back");
     assert_eq!(
         owner_size(&owner_be, ino).await,
-        8192,
-        "a refused out-of-order publish applies nothing"
+        16384,
+        "the chained publish applied on top of the durable head"
     );
-    assert_eq!(journal_entries(), journal_before);
+    assert!(
+        journal_entries() > journal_before,
+        "the chained delta staged a real commit"
+    );
 
     // (b) CROSS ERA: revoke + re-join (a new lease epoch), then present
     // the DEAD epoch.

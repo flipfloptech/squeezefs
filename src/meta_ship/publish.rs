@@ -106,7 +106,18 @@ use std::sync::Arc;
 /// A 4-speaker's layout publishes would be un-gated and un-witnessed — the
 /// divergent-chain mint — so the honest answer is `PUBLISH_SCHEMA_MISMATCH`
 /// at the first frame.
-pub const PUBLISH_SCHEMA: u32 = 5;
+///
+/// **6 since the AUTHORITY ASSEMBLER landed** (DLM S11 rung 17, KD-MW-8
+/// revised — `docs/design-full-multi-writer.md` §9.3; the design text
+/// says "publish schema 4", written before HarvestLaneFree took 3→4 and
+/// finding #6 took 4→5 — the CONTENT governs, adjudicated in the rung's
+/// evidence note): `WriteExtent` (a sub-block-shared block's bytes,
+/// shipped to the authority that assembles and publishes as the SINGLE
+/// publisher) + `FlushExtents` (the fsync force) joined, and the
+/// `MergeLayoutAndSize` reply gained the STAGED LINK'S VERSION
+/// ([`PublishReply::DeltaUsed`] became a struct variant) — the
+/// chain-without-refetch input a 5-speaker cannot decode.
+pub const PUBLISH_SCHEMA: u32 = 6;
 
 /// First verb of S9's publish block. S3's ping is 0, S8's metadata verbs
 /// are 16/17, S6's membership owns `0x0100..=0x01FF`, S9's custody
@@ -360,6 +371,50 @@ pub enum PublishCall {
         /// Client-chosen, monotone per process — the witness's other half.
         request_id: u64,
     },
+    /// **One sub-block extent of a SHARED block, shipped to the
+    /// AUTHORITY** — DLM S11 rung 17 (KD-MW-8 revised, design §9.3): a
+    /// block two live range grants share demotes to authority-assembled,
+    /// and BOTH holders' writes to it travel here (the W2 extent-record
+    /// vocabulary: offset-in-block, bytes, fencing token). The authority
+    /// merges via the existing extent overlay/fold and publishes once —
+    /// the SINGLE publisher for the block.
+    ///
+    /// **Joins the RETRIED class — stated against this module's no-retry
+    /// doctrine** (the module docs' opening law): like the layout-publish
+    /// class at schema 5 and the free/harvest verbs before it, the
+    /// `(lease_epoch, request_id)` witness is exactly what makes a
+    /// same-frame resend safe (a lost-reply retry answers the winner's
+    /// own ack), and the era gate refuses a dead epoch BEFORE the window.
+    WriteExtent {
+        ino: u64,
+        /// The block's index (`offset / block_size`) — the assembler's
+        /// merge key.
+        block_index: u64,
+        /// Offset INSIDE the block (the W2 extent vocabulary).
+        offset_in_block: u32,
+        data: Vec<u8>,
+        /// The shipper's own range-grant fencing token (audit; the era
+        /// gate's authority is `lease_epoch`).
+        token: u64,
+        /// Era gate input + witness half.
+        lease_epoch: u64,
+        /// The witness's other half.
+        request_id: u64,
+    },
+    /// **The fsync force** (rung 17, §9.3's retention law): fold and
+    /// publish every extent the authority holds for `ino`, answering the
+    /// covering layout version — a sub-block writer's fsync chains
+    /// through the AUTHORITY's publish barrier for every retained extent
+    /// (the shipped-free precedent's synchronous form). Witnessed and
+    /// retried (idempotent: a duplicate flush re-answers the winner's
+    /// covering version).
+    FlushExtents {
+        ino: u64,
+        /// Era gate input + witness half.
+        lease_epoch: u64,
+        /// The witness's other half.
+        request_id: u64,
+    },
 }
 
 /// One block's outcome inside a served [`PublishCall::FreeBlocks`].
@@ -394,6 +449,8 @@ impl PublishCall {
             Self::RaiseAllocLane { .. } => "raise_alloc_lane",
             Self::FreeBlocks { .. } => "free_blocks",
             Self::HarvestLaneFree { .. } => "harvest_lane_free",
+            Self::WriteExtent { .. } => "write_extent",
+            Self::FlushExtents { .. } => "flush_extents",
         }
     }
 
@@ -413,15 +470,19 @@ impl PublishCall {
             | Self::CreateWithRdevSize { lease_epoch, .. }
             | Self::RaiseAllocLane { lease_epoch, .. }
             | Self::FreeBlocks { lease_epoch, .. }
-            | Self::HarvestLaneFree { lease_epoch, .. } => Some(*lease_epoch),
+            | Self::HarvestLaneFree { lease_epoch, .. }
+            | Self::WriteExtent { lease_epoch, .. }
+            | Self::FlushExtents { lease_epoch, .. } => Some(*lease_epoch),
             Self::XattrValueCap { .. } | Self::ReaddirStream { .. } => None,
         }
     }
 
     /// The generic era gate's input (design §6a law 1): the six mutating
-    /// verbs that gained `lease_epoch` at schema 5. The raise/free/harvest
-    /// verbs are deliberately EXCLUDED — they run their own, older gates in
-    /// `serve` (lane validation / `validate_free`) with their own counters.
+    /// verbs that gained `lease_epoch` at schema 5, plus rung 17's extent
+    /// pair (whose refusals land on their OWN counter —
+    /// `extent_stale_refusals`). The raise/free/harvest verbs are
+    /// deliberately EXCLUDED — they run their own, older gates in `serve`
+    /// (lane validation / `validate_free`) with their own counters.
     fn era_gated_epoch(&self) -> Option<u64> {
         match self {
             Self::SetLayoutAndSize { lease_epoch, .. }
@@ -429,13 +490,23 @@ impl PublishCall {
             | Self::CommitBlockRefs { lease_epoch, .. }
             | Self::ParkWriteTimes { lease_epoch, .. }
             | Self::DestroyInodes { lease_epoch, .. }
-            | Self::CreateWithRdevSize { lease_epoch, .. } => Some(*lease_epoch),
+            | Self::CreateWithRdevSize { lease_epoch, .. }
+            | Self::WriteExtent { lease_epoch, .. }
+            | Self::FlushExtents { lease_epoch, .. } => Some(*lease_epoch),
             _ => None,
         }
     }
 
+    /// Rung 17's extent class (its own ledger rows).
+    fn is_extent(&self) -> bool {
+        matches!(self, Self::WriteExtent { .. } | Self::FlushExtents { .. })
+    }
+
     /// The layout-publish class's exactly-once witness key
     /// `(lease_epoch, request_id)`, `None` for every un-witnessed verb.
+    /// Rung 17: the extent class rides the SAME window (its replies are
+    /// [`PublishReply`]s and witness ids come from ONE client sequence,
+    /// so the id spaces cannot collide).
     fn witness(&self) -> Option<(u64, u64)> {
         match self {
             Self::SetLayoutAndSize {
@@ -452,6 +523,16 @@ impl PublishCall {
                 lease_epoch,
                 request_id,
                 ..
+            }
+            | Self::WriteExtent {
+                lease_epoch,
+                request_id,
+                ..
+            }
+            | Self::FlushExtents {
+                lease_epoch,
+                request_id,
+                ..
             } => Some((*lease_epoch, *request_id)),
             _ => None,
         }
@@ -464,6 +545,8 @@ impl PublishCall {
             | Self::MergeLayoutAndSize { ino, .. }
             | Self::CommitBlockRefs { ino, .. }
             | Self::ParkWriteTimes { ino, .. }
+            | Self::WriteExtent { ino, .. }
+            | Self::FlushExtents { ino, .. }
             | Self::XattrValueCap { ino } => vec![*ino],
             Self::DestroyInodes { inos, .. } => inos.clone(),
             Self::CreateWithRdevSize { parent, .. } => vec![*parent],
@@ -487,8 +570,20 @@ impl PublishCall {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PublishReply {
     Unit,
-    /// `merge_layout_and_size`: whether a delta record was staged.
-    DeltaUsed(bool),
+    /// `merge_layout_and_size`: whether a delta record was staged, and
+    /// the STAGED LINK'S VERSION (0 on a full-Put commit) — rung 17's
+    /// chain-without-refetch input (design-mw-layout-versions §6's named
+    /// residual): the co-writer stamps its RAM provenance from the reply
+    /// so its next delta claims the right base with no round trip.
+    DeltaUsed { used: bool, version: u64 },
+    /// `write_extent` (rung 17): `covering_version` is `Some` **iff the
+    /// covering publish has already run** — releasing the shipper's
+    /// retention at the round trip; `None` retains (release rides the
+    /// pull surfaces — §9.3's retention law).
+    ExtentAck { covering_version: Option<u64> },
+    /// `flush_extents` (rung 17): the covering layout version after the
+    /// forced fold+publish — the fsync barrier's answer.
+    FlushDone { covering_version: u64 },
     /// `create_with_rdev_size`.
     Inode(WireInode),
     /// `xattr_value_cap`.
@@ -579,6 +674,20 @@ static HARVEST_SHIPPED_BLOCKS: AtomicU64 = AtomicU64::new(0);
 static HARVEST_SERVED_BLOCKS: AtomicU64 = AtomicU64::new(0);
 static HARVEST_REPLAYS: AtomicU64 = AtomicU64::new(0);
 static HARVEST_REFUSALS: AtomicU64 = AtomicU64::new(0);
+// Rung 17 — the extent-assembler ledger (design §13's
+// `publish.extent_*` family; shipped ≡ served is the engagement law).
+static EXTENT_SHIPPED: AtomicU64 = AtomicU64::new(0);
+static EXTENT_SERVED: AtomicU64 = AtomicU64::new(0);
+static EXTENT_REPLAYS: AtomicU64 = AtomicU64::new(0);
+static EXTENT_STALE_REFUSALS: AtomicU64 = AtomicU64::new(0);
+static EXTENT_FLUSH_FORCES: AtomicU64 = AtomicU64::new(0);
+static EXTENT_SPILLS: AtomicU64 = AtomicU64::new(0);
+
+/// The at-budget W2 spill's counter (incremented by
+/// [`crate::extent_ship`]'s spill arm — release path 4's engagement).
+pub(crate) fn note_extent_spill() {
+    EXTENT_SPILLS.fetch_add(1, Ordering::Relaxed);
+}
 
 /// The publish path's shipped-vs-local ledger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -646,6 +755,24 @@ pub struct PublishStats {
     /// assigned, or a width this era does not run. **Must stay 0** on a
     /// healthy fleet; growth around a revocation is the gate composing.
     pub harvest_refusals: u64,
+    /// Extents SHIPPED to an authority (client side) — the sub-block
+    /// exception row's engagement instrument: every sub-block write to a
+    /// shared block must account here (both holders — the demotion is
+    /// symmetric).
+    pub extent_shipped: u64,
+    /// Extents MERGED by this authority's assembler (owner side) —
+    /// `shipped ≡ served` is the engagement law.
+    pub extent_served: u64,
+    /// Extent verbs answered from the witness window (a lost-reply retry
+    /// landing here is the mechanism WORKING).
+    pub extent_replays: u64,
+    /// Extent verbs refused BY ERA (the extent face of `stale_refusals`;
+    /// 0 on a healthy fleet).
+    pub extent_stale_refusals: u64,
+    /// `FlushExtents` fsync-force RPCs shipped.
+    pub extent_flush_forces: u64,
+    /// At-budget W2 spills of retained extents (release path 4).
+    pub extent_spills: u64,
 }
 
 /// Read the publish ledger.
@@ -668,6 +795,12 @@ pub fn stats() -> PublishStats {
         harvest_served_blocks: HARVEST_SERVED_BLOCKS.load(Ordering::Relaxed),
         harvest_replays: HARVEST_REPLAYS.load(Ordering::Relaxed),
         harvest_refusals: HARVEST_REFUSALS.load(Ordering::Relaxed),
+        extent_shipped: EXTENT_SHIPPED.load(Ordering::Relaxed),
+        extent_served: EXTENT_SERVED.load(Ordering::Relaxed),
+        extent_replays: EXTENT_REPLAYS.load(Ordering::Relaxed),
+        extent_stale_refusals: EXTENT_STALE_REFUSALS.load(Ordering::Relaxed),
+        extent_flush_forces: EXTENT_FLUSH_FORCES.load(Ordering::Relaxed),
+        extent_spills: EXTENT_SPILLS.load(Ordering::Relaxed),
     }
 }
 
@@ -694,6 +827,15 @@ pub fn stats_json() -> serde_json::Value {
         "harvest_served_blocks": s.harvest_served_blocks,
         "harvest_replays": s.harvest_replays,
         "harvest_refusals": s.harvest_refusals,
+        "extent_shipped": s.extent_shipped,
+        "extent_served": s.extent_served,
+        "extent_replays": s.extent_replays,
+        "extent_stale_refusals": s.extent_stale_refusals,
+        "extent_flush_forces": s.extent_flush_forces,
+        "extent_spills": s.extent_spills,
+        // §9.3's live retention gauge (→ 0 at quiesce — falsifiable
+        // against the four release paths).
+        "extent_retained_bytes": crate::extent_ship::retained_bytes(),
     })
 }
 
@@ -896,6 +1038,19 @@ fn wire_refs(refs: &[BlockRefOp]) -> Vec<WireBlockRefOp> {
     refs.iter().map(WireBlockRefOp::from).collect()
 }
 
+/// Rung 17: does `ino`'s layout merge take the CHAIN-ONTO-HEAD arm — a
+/// foreign-home ino (the merge ships and the OWNER chains it) or an ino
+/// this authority granted live foreign custody on (its own RAM
+/// provenance goes stale under served shipped merges)? One relaxed-load
+/// ladder on every solo mount (`ownership_armed` false, `custody_owner`
+/// None).
+pub fn merge_is_chained(be: &Arc<RoutedMetaBackend>, ino: Ino) -> bool {
+    owner_of(be, ino).is_some()
+        || crate::data_grant::custody_owner()
+            .map(|o| o.ino_granted(ino))
+            .unwrap_or(false)
+}
+
 /// Rung 13 — the publish-path ORDERING BARRIER: a shipped publish naming
 /// a PENDING intent ino (a locally-minted, not-yet-applied create) must
 /// flush the intent batch first, or the publish would reach the owner
@@ -1011,7 +1166,11 @@ pub async fn set_layout_and_size(
     }
 }
 
-/// Routed [`RoutedMetaBackend::merge_layout_and_size`].
+/// Routed [`RoutedMetaBackend::merge_layout_and_size`]. Returns
+/// `(use_delta, staged_version)` — the staged link's version (0 on a
+/// full-Put commit), which the caller stamps into the RAM provenance so
+/// the next delta claims the right base (rung 17's chain-without-refetch
+/// law; on the un-chained local arm the version is the delta's own).
 pub async fn merge_layout_and_size(
     be: &Arc<RoutedMetaBackend>,
     ino: Ino,
@@ -1019,12 +1178,28 @@ pub async fn merge_layout_and_size(
     full_layout: bytes::Bytes,
     size: u64,
     refs: Vec<BlockRefOp>,
-) -> Result<bool> {
+) -> Result<(bool, u64)> {
     match owner_of(be, ino) {
         None => {
             note_local();
-            be.merge_layout_and_size(ino, delta, full_layout, size, refs)
-                .await
+            // Rung 17: the AUTHORITY's own publishes on an ino with live
+            // foreign custody must ALSO chain onto the head — its RAM
+            // provenance goes stale under every served shipped merge, and
+            // the un-chained gate would refuse (then full-Put-clobber the
+            // peers' blocks). One relaxed probe on every solo mount
+            // (`custody_owner()` is None).
+            let granted = crate::data_grant::custody_owner()
+                .map(|o| o.ino_granted(ino))
+                .unwrap_or(false);
+            if granted {
+                be.merge_layout_and_size_chained(ino, delta, full_layout, size, refs)
+                    .await
+            } else {
+                let used = be
+                    .merge_layout_and_size(ino, delta, full_layout, size, refs)
+                    .await?;
+                Ok((used, if used { delta.version } else { 0 }))
+            }
         }
         Some(peer) => {
             intent_barrier_inos(&[ino]).await?;
@@ -1038,11 +1213,89 @@ pub async fn merge_layout_and_size(
                 request_id: crate::cowriter::next_ship_request_id(),
             };
             match ship_witnessed(&peer, call).await? {
-                PublishReply::DeltaUsed(used) => Ok(used),
+                PublishReply::DeltaUsed { used, version } => Ok((used, version)),
                 other => Err(protocol_error(
                     "merge_layout_and_size",
                     &format!("{other:?}"),
                     "a delta-used flag",
+                )),
+            }
+        }
+    }
+}
+
+/// **Ship one sub-block extent of a SHARED block to its authority**
+/// (rung 17, KD-MW-8) and return the ack's `covering_version` (`Some`
+/// iff the covering publish already ran — the shipper's retention
+/// releases at the round trip). Rides the witnessed same-frame bounded
+/// epoch-stable resend ladder; a local-home ino REFUSES loud (the
+/// authority never ships extents to itself — its writes ARE the
+/// assembly).
+pub async fn write_extent(
+    be: &Arc<RoutedMetaBackend>,
+    ino: Ino,
+    block_index: u64,
+    offset_in_block: u32,
+    data: Vec<u8>,
+    token: u64,
+    request_id: u64,
+) -> Result<Option<u64>> {
+    match owner_of(be, ino) {
+        None => Err(SqueezefsError::InvalidOperation(format!(
+            "S11: write_extent for ino {ino} routes LOCALLY — the authority assembles its \
+             own writes through its write path, never through the extent wire (a local \
+             extent ship is a routing bug worth a loud refusal)"
+        ))),
+        Some(peer) => {
+            intent_barrier_inos(&[ino]).await?;
+            let call = PublishCall::WriteExtent {
+                ino,
+                block_index,
+                offset_in_block,
+                data,
+                token,
+                lease_epoch: current_lease_epoch(),
+                request_id,
+            };
+            match ship_witnessed(&peer, call).await? {
+                PublishReply::ExtentAck { covering_version } => {
+                    EXTENT_SHIPPED.fetch_add(1, Ordering::Relaxed);
+                    Ok(covering_version)
+                }
+                other => Err(protocol_error(
+                    "write_extent",
+                    &format!("{other:?}"),
+                    "an extent ack",
+                )),
+            }
+        }
+    }
+}
+
+/// **The fsync force** (rung 17, §9.3's retention law): fold + publish
+/// every extent the authority holds for `ino`, returning the covering
+/// layout version. Witnessed and retried (idempotent).
+pub async fn flush_extents(be: &Arc<RoutedMetaBackend>, ino: Ino) -> Result<u64> {
+    match owner_of(be, ino) {
+        None => Err(SqueezefsError::InvalidOperation(format!(
+            "S11: flush_extents for ino {ino} routes LOCALLY — nothing was ever shipped \
+             (the authority's own fsync is its ordinary flush path)"
+        ))),
+        Some(peer) => {
+            let call = PublishCall::FlushExtents {
+                ino,
+                lease_epoch: current_lease_epoch(),
+                request_id: crate::cowriter::next_ship_request_id(),
+            };
+            match ship_witnessed(&peer, call).await? {
+                PublishReply::FlushDone { covering_version } => {
+                    EXTENT_FLUSH_FORCES.fetch_add(1, Ordering::Relaxed);
+                    Ok(covering_version)
+                }
+                other => Err(protocol_error(
+                    "flush_extents",
+                    &format!("{other:?}"),
+                    "a covering version",
                 )),
             }
         }
@@ -1388,6 +1641,76 @@ fn harvest_executor() -> Option<HarvestExecutor> {
     HARVEST_EXECUTOR.load_full().map(|e| (*e).clone())
 }
 
+/// One shipped extent as the owner-side assembler executor receives it
+/// (rung 17): the wire frame's fields plus the shipper's identity (the
+/// coverage ledger's key).
+#[derive(Debug, Clone)]
+pub struct ExtentFrame {
+    pub client: String,
+    pub ino: u64,
+    pub block_index: u64,
+    pub offset_in_block: u32,
+    pub data: Vec<u8>,
+    pub token: u64,
+    pub lease_epoch: u64,
+    pub request_id: u64,
+}
+
+/// The owner-side extent MERGE executor (rung 17): merge one shipped
+/// extent into the authority's assembly for `(ino, block_index)` —
+/// production: the fs's extent overlay under `BLOCK_FLUSH_LOCKS`, with
+/// every assembly DMA authorized under the AUTHORITY'S OWN epoch
+/// (`data_custody::authorize_dma(None)` — never as an exercise of a
+/// shipper's grant; the §9.3 custody transfer). Returns the covering
+/// version when the extent is ALREADY covered by a durable publish
+/// (`Some` releases the shipper's retention at the ack), else `None`.
+pub type ExtentMergeExec = Arc<
+    dyn Fn(ExtentFrame) -> Pin<Box<dyn Future<Output = Result<Option<u64>>> + Send>>
+        + Send
+        + Sync,
+>;
+
+static EXTENT_MERGE_EXEC: Lazy<arc_swap::ArcSwapOption<ExtentMergeExec>> =
+    Lazy::new(arc_swap::ArcSwapOption::empty);
+
+/// Install the assembler's merge executor (the authority arm's act).
+pub fn install_extent_merge_executor(exec: ExtentMergeExec) {
+    EXTENT_MERGE_EXEC.store(Some(Arc::new(exec)));
+}
+
+/// Uninstall it (disarm / unmount / test teardown).
+pub fn uninstall_extent_merge_executor() {
+    EXTENT_MERGE_EXEC.store(None);
+}
+
+fn extent_merge_executor() -> Option<ExtentMergeExec> {
+    EXTENT_MERGE_EXEC.load_full().map(|e| (*e).clone())
+}
+
+/// The owner-side extent FLUSH executor (rung 17's fsync force): fold and
+/// publish every assembled extent for `ino`, answer the covering layout
+/// version. Production advances the coverage ledger
+/// ([`crate::extent_ship::owner_note_covered`]) before answering.
+pub type ExtentFlushExec =
+    Arc<dyn Fn(u64) -> Pin<Box<dyn Future<Output = Result<u64>> + Send>> + Send + Sync>;
+
+static EXTENT_FLUSH_EXEC: Lazy<arc_swap::ArcSwapOption<ExtentFlushExec>> =
+    Lazy::new(arc_swap::ArcSwapOption::empty);
+
+/// Install the assembler's flush executor (the authority arm's act).
+pub fn install_extent_flush_executor(exec: ExtentFlushExec) {
+    EXTENT_FLUSH_EXEC.store(Some(Arc::new(exec)));
+}
+
+/// Uninstall it (disarm / unmount / test teardown).
+pub fn uninstall_extent_flush_executor() {
+    EXTENT_FLUSH_EXEC.store(None);
+}
+
+fn extent_flush_executor() -> Option<ExtentFlushExec> {
+    EXTENT_FLUSH_EXEC.load_full().map(|e| (*e).clone())
+}
+
 /// **Ship one lane-free harvest** to the authority at `endpoint` and return
 /// the granted block indices.
 ///
@@ -1672,16 +1995,24 @@ impl PublishService {
         // older gates below (landed counter surface).
         if let Some(epoch) = frame.call.era_gated_epoch() {
             if let Err(reason) = crate::data_grant::validate_publish_era(&frame.client, epoch) {
-                STALE_REFUSALS.fetch_add(1, Ordering::Relaxed);
+                // Rung 17: the extent class's era refusals land on their
+                // OWN row (`extent_stale_refusals`); the layout class
+                // keeps the finding-#6 row.
+                if frame.call.is_extent() {
+                    EXTENT_STALE_REFUSALS.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    STALE_REFUSALS.fetch_add(1, Ordering::Relaxed);
+                }
                 return Self::refuse(req.id, PUBLISH_STALE_LEASE, reason);
             }
         }
-        // The layout-publish class (law 2): witnessed — served through its
-        // own dedup window, never through the generic dispatch below,
-        // whose no-retry law it would otherwise weaken.
+        // The layout-publish class (law 2) and rung 17's extent class:
+        // witnessed — served through the dedup window, never through the
+        // generic dispatch below, whose no-retry law it would otherwise
+        // weaken.
         if let Some((epoch, request_id)) = frame.call.witness() {
             return self
-                .serve_layout_publish(req.id, epoch, request_id, frame.call)
+                .serve_layout_publish(req.id, epoch, request_id, frame.client, frame.call)
                 .await;
         }
         // DLM S9's allocation-lane seam: the ONE verb whose argument reaches a
@@ -1757,8 +2088,10 @@ impl PublishService {
             );
         };
         let name = frame.call.name();
+        let client = frame.client;
+        let call = frame.call;
         let joined = crate::meta_exec::spawn_meta_join("meta_ship_publish_verb", async move {
-            me.execute(frame.call).await
+            me.execute(&client, call).await
         })
         .await;
         let outcome = match joined {
@@ -1804,6 +2137,7 @@ impl PublishService {
         req_id: u64,
         lease_epoch: u64,
         request_id: u64,
+        client: String,
         call: PublishCall,
     ) -> RpcResponse {
         let Some(me) = self.owned() else {
@@ -1814,9 +2148,14 @@ impl PublishService {
             );
         };
         let name = call.name();
+        let is_extent = call.is_extent();
         let (slot, owns) = self.publish_dedup.slot((lease_epoch, request_id));
         if !owns {
-            REPLAYS.fetch_add(1, Ordering::Relaxed);
+            if is_extent {
+                EXTENT_REPLAYS.fetch_add(1, Ordering::Relaxed);
+            } else {
+                REPLAYS.fetch_add(1, Ordering::Relaxed);
+            }
         }
         let outcome = slot
             .get_or_init(|| async move {
@@ -1824,7 +2163,7 @@ impl PublishService {
                 // commit runs on the sqz-meta pool, never inline on a
                 // `sqz-cluster-svc{n}` lane.
                 match crate::meta_exec::spawn_meta_join("meta_ship_publish_verb", async move {
-                    me.execute(call).await
+                    me.execute(&client, call).await
                 })
                 .await
                 {
@@ -1844,6 +2183,11 @@ impl PublishService {
             .await
             .clone();
         SERVED.fetch_add(1, Ordering::Relaxed);
+        // `shipped ≡ served` is the engagement law: served counts the
+        // WINNER's execution only (a replay is its own row).
+        if is_extent && owns && outcome.is_ok() {
+            EXTENT_SERVED.fetch_add(1, Ordering::Relaxed);
+        }
         let frame = PublishReplyFrame {
             schema: PUBLISH_SCHEMA,
             outcome,
@@ -2034,7 +2378,7 @@ impl PublishService {
         }
     }
 
-    async fn execute(&self, call: PublishCall) -> Result<PublishReply> {
+    async fn execute(&self, client: &str, call: PublishCall) -> Result<PublishReply> {
         match call {
             PublishCall::SetLayoutAndSize {
                 ino,
@@ -2063,11 +2407,80 @@ impl PublishService {
                     ))
                 })?;
                 let refs: Vec<BlockRefOp> = refs.into_iter().map(BlockRefOp::from).collect();
-                let used = self
+                // Rung 17 (KD-MW-8's composition law): a SHIPPED merge
+                // CHAINS ONTO THE DURABLE HEAD — the claim re-stamps
+                // under the backend's own 4a I-guard and the link
+                // version re-mints from THIS authority's sequencer, so
+                // two co-writers' publishes of one ino compose instead
+                // of refusing (the refetch wedge) or re-basing with a
+                // private full layout (the s11-range C8 clobber). The
+                // reply carries the staged version: the co-writer chains
+                // without a refetch.
+                let (used, version) = self
                     .inner
-                    .merge_layout_and_size(ino, &delta, bytes::Bytes::from(full_layout), size, refs)
+                    .merge_layout_and_size_chained(
+                        ino,
+                        &delta,
+                        bytes::Bytes::from(full_layout),
+                        size,
+                        refs,
+                    )
                     .await?;
-                Ok(PublishReply::DeltaUsed(used))
+                Ok(PublishReply::DeltaUsed { used, version })
+            }
+            PublishCall::WriteExtent {
+                ino,
+                block_index,
+                offset_in_block,
+                data,
+                token,
+                lease_epoch,
+                request_id,
+            } => {
+                let Some(exec) = extent_merge_executor() else {
+                    return Err(SqueezefsError::InvalidOperation(
+                        "S11: a shipped extent arrived but no assembler executor is \
+                         installed — the ownership plane is armed without its assembly \
+                         half; arm the multi-writer authority (which installs the extent \
+                         merge executor beside the free executor)"
+                            .to_string(),
+                    ));
+                };
+                let covering = exec(ExtentFrame {
+                    client: client.to_string(),
+                    ino,
+                    block_index,
+                    offset_in_block,
+                    data,
+                    token,
+                    lease_epoch,
+                    request_id,
+                })
+                .await?;
+                // The coverage ledger: merged now; covered iff the
+                // executor proved a covering publish already ran.
+                crate::extent_ship::owner_note_merge(client, ino, request_id);
+                if let Some(v) = covering {
+                    crate::extent_ship::owner_note_covered(ino, v);
+                }
+                Ok(PublishReply::ExtentAck {
+                    covering_version: covering,
+                })
+            }
+            PublishCall::FlushExtents { ino, .. } => {
+                let Some(exec) = extent_flush_executor() else {
+                    return Err(SqueezefsError::InvalidOperation(
+                        "S11: a FlushExtents force arrived but no assembler flush executor \
+                         is installed — the ownership plane is armed without its assembly \
+                         half; arm the multi-writer authority"
+                            .to_string(),
+                    ));
+                };
+                let covering_version = exec(ino).await?;
+                // Every extent merged before this force is covered by the
+                // publish the force just committed.
+                crate::extent_ship::owner_note_covered(ino, covering_version);
+                Ok(PublishReply::FlushDone { covering_version })
             }
             PublishCall::CommitBlockRefs { ino, refs, .. } => {
                 let refs: Vec<BlockRefOp> = refs.into_iter().map(BlockRefOp::from).collect();

@@ -4760,7 +4760,18 @@ struct QueuedLayoutMerge {
     /// into the batch's ONE aggregated transaction alongside its layout
     /// record — the accounting aggregates exactly as the saves do.
     block_refs: Vec<super::block_refs::BlockRefOp>,
-    done: squeezefs_ipc::sqz_channel::oneshot::Sender<crate::error::Result<bool>>,
+    /// DLM S11 rung 17 (KD-MW-8's composition law): **chain onto the
+    /// durable head** instead of gate-refusing a divergent claim or
+    /// re-basing with the caller's private full layout. `true` only for
+    /// the S9 SHIPPED publish serve and the authority's own publishes on
+    /// an ino with live foreign custody — both structurally unreachable
+    /// on a solo mount (`false` keeps the shipped semantics verbatim).
+    chain: bool,
+    /// The submitter's result channel: `(use_delta, staged_version)` —
+    /// the staged link's version (0 on a full-Put/unversioned commit),
+    /// which is what lets a co-writer chain without a refetch (the
+    /// design-mw-layout-versions §6 residual this rung pays).
+    done: squeezefs_ipc::sqz_channel::oneshot::Sender<crate::error::Result<(bool, u64)>>,
 }
 
 struct QueuedTx {
@@ -7020,6 +7031,49 @@ impl KvMetaBackend {
         size: u64,
         block_refs: Vec<super::block_refs::BlockRefOp>,
     ) -> Result<bool> {
+        self.merge_layout_and_size_ext(ino, delta, full_layout, size, block_refs, false)
+            .await
+            .map(|(used, _version)| used)
+    }
+
+    /// DLM S11 rung 17 — [`Self::merge_layout_and_size`] in **chain-onto-
+    /// head** mode (KD-MW-8's composition law; the design-mw-layout-
+    /// versions §6 residual this rung pays): on a `KV_LAYOUT_VERSIONS`
+    /// volume the delta's base claim is RE-STAMPED, under this backend's
+    /// own 4a I-guard, to the durable head just probed, and its link
+    /// version is re-minted from THIS process's sequencer — so a shipped
+    /// co-writer's delta composes onto whatever head its peers produced
+    /// instead of refusing (the refetch wedge) or re-basing with the
+    /// caller's private full layout (the clobber that minted the
+    /// s11-range leg's C8 drift). At the chain cap the OWNER compacts:
+    /// the folded durable layout + this delta re-base as one full `Put`
+    /// computed from the AUTHORITY's state, never the caller's.
+    ///
+    /// Returns `(use_delta, staged_version)` — the staged link's version
+    /// (0 on a full-Put commit), the publish reply's chain-without-
+    /// refetch input. Unreachable from any solo path (the callers are
+    /// the S9 publish serve and the granted-ino local arm).
+    pub async fn merge_layout_and_size_chained(
+        &self,
+        ino: Ino,
+        delta: &crate::layout_wire::LayoutDelta,
+        full_layout: Bytes,
+        size: u64,
+        block_refs: Vec<super::block_refs::BlockRefOp>,
+    ) -> Result<(bool, u64)> {
+        self.merge_layout_and_size_ext(ino, delta, full_layout, size, block_refs, true)
+            .await
+    }
+
+    async fn merge_layout_and_size_ext(
+        &self,
+        ino: Ino,
+        delta: &crate::layout_wire::LayoutDelta,
+        full_layout: Bytes,
+        size: u64,
+        block_refs: Vec<super::block_refs::BlockRefOp>,
+        chain: bool,
+    ) -> Result<(bool, u64)> {
         // Rewrite-publish-drain Lever B (2026-08-01): delta-class layout
         // saves aggregate on the per-volume layout-merge conveyor — one
         // multi-ino KvTx per drained window (one journal entry, one ring
@@ -7033,7 +7087,7 @@ impl KvMetaBackend {
         self.write_gate()?;
         if crate::routing::publish_commit_group_max() == Some(1) {
             return self
-                .merge_layout_and_size_direct(ino, delta, &full_layout, size, &block_refs)
+                .merge_layout_and_size_direct(ino, delta, &full_layout, size, &block_refs, chain)
                 .await;
         }
         let (done, rx) = squeezefs_ipc::sqz_channel::oneshot::channel();
@@ -7056,6 +7110,7 @@ impl KvMetaBackend {
                 full_layout,
                 size,
                 block_refs,
+                chain,
                 done,
             },
             weight,
@@ -7189,12 +7244,15 @@ impl KvMetaBackend {
         let mut tx = KvTx::new();
         // Per-op outcomes: staged members await the shared commit;
         // failed members own their error immediately.
+        #[allow(clippy::type_complexity)]
         let mut staged: Vec<(
-            squeezefs_ipc::sqz_channel::oneshot::Sender<crate::error::Result<bool>>,
+            squeezefs_ipc::sqz_channel::oneshot::Sender<crate::error::Result<(bool, u64)>>,
             bool,
+            u64,
         )> = Vec::new();
+        #[allow(clippy::type_complexity)]
         let mut failed: Vec<(
-            squeezefs_ipc::sqz_channel::oneshot::Sender<crate::error::Result<bool>>,
+            squeezefs_ipc::sqz_channel::oneshot::Sender<crate::error::Result<(bool, u64)>>,
             crate::error::SqueezefsError,
         )> = Vec::new();
         // Spec §6.2 item 9 (versioned volumes): the tree probe reads the
@@ -7205,7 +7263,7 @@ impl KvMetaBackend {
         let versions_stamped = self.layout_versions_stamped();
         let mut batch_heads: std::collections::HashMap<Ino, (u32, Option<(u64, u64)>)> =
             std::collections::HashMap::new();
-        for op in batch {
+        for mut op in batch {
             let t_iread = std::time::Instant::now();
             let v = match self.read_inode_value(op.ino).await {
                 Ok(Some(mut v)) => {
@@ -7243,6 +7301,11 @@ impl KvMetaBackend {
             // base + the durable incompat ratchet.
             let mut use_delta = false;
             let mut probe_depth = 0u32;
+            // Rung 17: the staged link's version (0 = full Put /
+            // unversioned) and the chain-onto-head compaction override
+            // (the folded-durable full Put replacing the caller's).
+            let mut staged_version = 0u64;
+            let mut chained_full: Option<Vec<u8>> = None;
             if existing {
                 match self.xattrs.lookup(&key).await {
                     Ok(Some(cur)) => {
@@ -7270,10 +7333,86 @@ impl KvMetaBackend {
                         if base_ok && max_chain > 0 && depth < max_chain {
                             use_delta = self.layout_deltas_ready().await;
                         }
-                        // Spec §6.2 item 9: the durable base-name gate —
-                        // Stage / re-base / REFUSE loud (per member: a
-                        // diverged claim fails ALONE, survivors commit).
-                        if use_delta && versions_stamped {
+                        if op.chain && versions_stamped && base_ok {
+                            // KD-MW-8's composition law (rung 17): the
+                            // SHIPPED/granted-ino arm never gate-refuses
+                            // and never re-bases with the caller's
+                            // private full layout. Below the cap the
+                            // claim RE-STAMPS onto the durable head (the
+                            // link version re-minted from THIS process's
+                            // sequencer — cross-writer versions cannot
+                            // collide); at the cap the OWNER compacts:
+                            // the folded durable layout + this delta as
+                            // one full Put computed from the AUTHORITY's
+                            // state.
+                            let minted = if use_delta {
+                                crate::dlm::mint_layout_version()
+                            } else {
+                                0
+                            };
+                            if use_delta && minted != 0 {
+                                let head_v = head_versions.map(|(_, v)| v).unwrap_or(0);
+                                match crate::layout_wire::restamp_delta_versions(
+                                    &op.delta_wire,
+                                    head_v,
+                                    minted,
+                                ) {
+                                    Ok(wire) => {
+                                        op.delta_wire = Bytes::from(wire);
+                                        staged_version = minted;
+                                    }
+                                    Err(e) => {
+                                        failed.push((
+                                            op.done,
+                                            crate::error::SqueezefsError::InvalidOperation(
+                                                format!(
+                                                    "rung 17: undecodable shipped layout \
+                                                     delta for ino {}: {e}",
+                                                    op.ino
+                                                ),
+                                            ),
+                                        ));
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                // The owner-side compaction: fold the
+                                // durable current + this delta into one
+                                // full Put (never the caller's layout).
+                                use_delta = false;
+                                let folded = match XattrValue::decode(&cur) {
+                                    Ok(x) => x.value.to_vec(),
+                                    Err(e) => {
+                                        failed.push((op.done, e.into()));
+                                        continue;
+                                    }
+                                };
+                                let applied = crate::layout_wire::LayoutDelta::decode(
+                                    &op.delta_wire,
+                                )
+                                .and_then(|d| d.apply(&folded));
+                                match applied {
+                                    Ok(full) => chained_full = Some(full),
+                                    Err(e) => {
+                                        failed.push((
+                                            op.done,
+                                            crate::error::SqueezefsError::InvalidOperation(
+                                                format!(
+                                                    "rung 17: owner-side chain compaction \
+                                                     failed for ino {}: {e}",
+                                                    op.ino
+                                                ),
+                                            ),
+                                        ));
+                                        continue;
+                                    }
+                                }
+                            }
+                        } else if use_delta && versions_stamped {
+                            // Spec §6.2 item 9: the durable base-name gate
+                            // — Stage / re-base / REFUSE loud (per member:
+                            // a diverged claim fails ALONE, survivors
+                            // commit).
                             match self.admit_versioned_delta(
                                 op.ino,
                                 crate::layout_wire::layout_delta_versions(&op.delta_wire),
@@ -7285,6 +7424,12 @@ impl KvMetaBackend {
                                     failed.push((op.done, e));
                                     continue;
                                 }
+                            }
+                            if use_delta {
+                                staged_version =
+                                    crate::layout_wire::layout_delta_versions(&op.delta_wire)
+                                        .map(|(_, v)| v)
+                                        .unwrap_or(0);
                             }
                         }
                     }
@@ -7319,7 +7464,11 @@ impl KvMetaBackend {
                 tx.stage_delta_raw(TREE_XATTRS, key, op.delta_wire);
             } else {
                 super::META_KV_LAYOUT_FULL_COMMITS.fetch_add(1, Ordering::Relaxed);
-                let full = match XattrValue::encode_parts(b"layout", &op.full_layout) {
+                let full_src: &[u8] = match &chained_full {
+                    Some(full) => full,
+                    None => &op.full_layout,
+                };
+                let full = match XattrValue::encode_parts(b"layout", full_src) {
                     Ok(f) => f,
                     Err(e) => {
                         failed.push((op.done, e.into()));
@@ -7338,7 +7487,7 @@ impl KvMetaBackend {
             if self.block_refs.is_some() {
                 tx.stage_block_refs(&op.block_refs);
             }
-            staged.push((op.done, use_delta));
+            staged.push((op.done, use_delta, staged_version));
         }
         for (done, e) in failed {
             let _ = done.send(Err(e));
@@ -7359,13 +7508,13 @@ impl KvMetaBackend {
         publish_phase_record(PublishPhase::CommitTxWait, t_tx);
         match out {
             Ok(()) => {
-                for (done, use_delta) in staged {
-                    let _ = done.send(Ok(use_delta));
+                for (done, use_delta, staged_version) in staged {
+                    let _ = done.send(Ok((use_delta, staged_version)));
                 }
             }
             Err(e) => {
                 let e: crate::error::SqueezefsError = e.into();
-                for (done, _) in staged {
+                for (done, _, _) in staged {
                     let _ = done.send(Err(dup_err(&e)));
                 }
             }
@@ -7374,7 +7523,9 @@ impl KvMetaBackend {
     }
 
     /// The pre-aggregation single-ino body (the
-    /// `SQUEEZEFS_PUBLISH_COMMIT_GROUP_MAX=1` A/B path, verbatim).
+    /// `SQUEEZEFS_PUBLISH_COMMIT_GROUP_MAX=1` A/B path, verbatim; `chain`
+    /// selects the rung-17 chain-onto-head arm — see
+    /// [`Self::merge_layout_and_size_chained`]).
     async fn merge_layout_and_size_direct(
         &self,
         ino: Ino,
@@ -7382,7 +7533,8 @@ impl KvMetaBackend {
         full_layout: &[u8],
         size: u64,
         block_refs: &[super::block_refs::BlockRefOp],
-    ) -> Result<bool> {
+        chain: bool,
+    ) -> Result<(bool, u64)> {
         use crate::fuse_client::{publish_phase_record, PublishPhase};
         self.write_gate()?;
         // Publish decomposition (2026-08-01): the meta_commit interior —
@@ -7410,6 +7562,9 @@ impl KvMetaBackend {
         // onto (one point lookup under the held I-guard), and the
         // incompat bit durably stamped (the one-time ratchet).
         let mut use_delta = false;
+        let mut staged_version = 0u64;
+        let mut delta_versions = (delta.version != 0).then_some((delta.base_version, delta.version));
+        let mut chained_full: Option<Vec<u8>> = None;
         if existing {
             if let Some(cur) = self.xattrs.lookup(&key).await? {
                 let base_ok = XattrValue::decode(&cur)
@@ -7426,11 +7581,37 @@ impl KvMetaBackend {
                 if base_ok && max_chain > 0 && depth < max_chain {
                     use_delta = self.layout_deltas_ready().await;
                 }
-                // Spec §6.2 item 9: the durable base-name gate — Stage /
-                // re-base / REFUSE loud (see `admit_versioned_delta`).
-                if use_delta && self.layout_versions_stamped() {
-                    let dv = (delta.version != 0).then_some((delta.base_version, delta.version));
-                    use_delta = self.admit_versioned_delta(ino, dv, depth, head_versions)?;
+                if chain && self.layout_versions_stamped() && base_ok {
+                    // KD-MW-8 rung 17 (see `merge_layout_and_size_chained`
+                    // and the aggregated pass's twin): re-stamp onto the
+                    // durable head below the cap; owner-side compaction
+                    // at it.
+                    let minted = if use_delta {
+                        crate::dlm::mint_layout_version()
+                    } else {
+                        0
+                    };
+                    if use_delta && minted != 0 {
+                        let head_v = head_versions.map(|(_, ver)| ver).unwrap_or(0);
+                        delta_versions = Some((head_v, minted));
+                        staged_version = minted;
+                    } else {
+                        use_delta = false;
+                        let folded = XattrValue::decode(&cur)?.value.to_vec();
+                        let full = delta.apply(&folded).map_err(|e| {
+                            crate::error::SqueezefsError::InvalidOperation(format!(
+                                "rung 17: owner-side chain compaction failed for ino {ino}: {e}"
+                            ))
+                        })?;
+                        chained_full = Some(full);
+                    }
+                } else if use_delta && self.layout_versions_stamped() {
+                    // Spec §6.2 item 9: the durable base-name gate — Stage /
+                    // re-base / REFUSE loud (see `admit_versioned_delta`).
+                    use_delta = self.admit_versioned_delta(ino, delta_versions, depth, head_versions)?;
+                    if use_delta {
+                        staged_version = delta.version;
+                    }
                 }
             }
         }
@@ -7439,7 +7620,16 @@ impl KvMetaBackend {
             // §6.2 item 9 strip seam: only a KV_LAYOUT_VERSIONS volume
             // stores the versioned wire (see `merge_layout_and_size`).
             let wire = if self.layout_versions_stamped() {
-                delta.encode()
+                match delta_versions {
+                    // The chained restamp: the encode carries the
+                    // owner-assigned pair, never the caller's claim.
+                    Some((base, ver)) if chain => {
+                        let mut d = delta.clone();
+                        d.set_versions(base, ver);
+                        d.encode()
+                    }
+                    _ => delta.encode(),
+                }
             } else {
                 delta.encode_unversioned()
             };
@@ -7448,10 +7638,14 @@ impl KvMetaBackend {
             tx.stage_delta_raw(TREE_XATTRS, key, wire);
         } else {
             super::META_KV_LAYOUT_FULL_COMMITS.fetch_add(1, Ordering::Relaxed);
+            let full_src: &[u8] = match &chained_full {
+                Some(full) => full,
+                None => full_layout,
+            };
             tx.stage_put(
                 TREE_XATTRS,
                 key,
-                XattrValue::encode_parts(b"layout", full_layout)?,
+                XattrValue::encode_parts(b"layout", full_src)?,
             );
         }
         tx.stage_put(TREE_INODES, inode_key(ino), v.encode());
@@ -7463,7 +7657,21 @@ impl KvMetaBackend {
         let t_tx = std::time::Instant::now();
         self.commit_tx(tx).await?;
         publish_phase_record(PublishPhase::CommitTxWait, t_tx);
-        Ok(use_delta)
+        Ok((use_delta, staged_version))
+    }
+
+    /// Rung 17's covering-version probe: the ino's durable layout-chain
+    /// HEAD version (0 = no layout / bare `Put` / unversioned head). A
+    /// read-side probe — no guard, no commit; monotone consumers only
+    /// (`≥` watermark compares), per the fencing-read law.
+    pub async fn layout_head_version(&self, ino: Ino) -> Result<u64> {
+        let tx = KvTx::new();
+        let (existing, key) = self.xattr_slot(&tx, ino, "layout").await?;
+        if !existing {
+            return Ok(0);
+        }
+        let (_depth, head) = self.xattrs.delta_chain_probe(&key).await?;
+        Ok(head.map(|(_, v)| v).unwrap_or(0))
     }
 
     /// Spec §6.2 item 9: whether this volume carries the

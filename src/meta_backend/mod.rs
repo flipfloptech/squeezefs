@@ -2936,6 +2936,44 @@ impl RoutedMetaBackend {
         out
     }
 
+    /// DLM S11 rung 17 — [`Self::merge_layout_and_size`] in **chain-onto-
+    /// head** mode (KD-MW-8's composition law): the S9 publish serve and
+    /// the authority's own granted-ino publishes route here, so a
+    /// co-writer's delta composes onto whatever durable head its peers
+    /// produced. Returns `(use_delta, staged_version)` — the staged
+    /// link's version travels back on the publish reply (the
+    /// design-mw-layout-versions §6 chain-without-refetch residual).
+    pub async fn merge_layout_and_size_chained(
+        &self,
+        ino: Ino,
+        delta: &crate::layout_wire::LayoutDelta,
+        full_layout: bytes::Bytes,
+        size: u64,
+        block_refs: Vec<crate::meta_backend::kv::block_refs::BlockRefOp>,
+    ) -> Result<(bool, u64)> {
+        let _deleg_gate = crate::meta_ship::deleg_mutation_gate(self, &[ino]).await;
+        let _gate = self.slot_gate_enter(&[ino]).await;
+        let (v_idx, local_ino) = self.route_ino(ino);
+        self.check_volume_enabled(v_idx)?;
+        let out = self.volumes[v_idx]
+            .merge_layout_and_size_chained(local_ino, delta, full_layout, size, block_refs)
+            .await;
+        if out.is_err() {
+            self.mirror_volume_failure(v_idx);
+        }
+        out
+    }
+
+    /// The ino's durable layout-chain HEAD version (0 = bare `Put` /
+    /// no layout / unversioned head) — rung 17's covering-version probe
+    /// (the `FlushExtents` reply and the retention release watermark
+    /// read it).
+    pub async fn layout_head_version(&self, ino: Ino) -> Result<u64> {
+        let (v_idx, local_ino) = self.route_ino(ino);
+        self.check_volume_enabled(v_idx)?;
+        self.volumes[v_idx].layout_head_version(local_ino).await
+    }
+
     /// Park a WRITE op's kernel-domain times stamp as the ino's pending
     /// refinement (generic/003 remount-divergence fix): the ONE durable
     /// authority for the write's mtime/ctime — the same stamp the FUSE

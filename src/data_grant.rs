@@ -120,7 +120,20 @@ use std::time::{Duration, Instant};
 /// desired-bearing acquire as a plain span (granting less than the law
 /// requires) and silently drop the range vector, so the mismatch stays a
 /// loud refusal.
-pub const CUSTODY_SCHEMA: u32 = 3;
+///
+/// **4 since S11 rung 17** (KD-MW-8's demotion barrier, design §9.3): the
+/// renewal reply carries the incumbent's **demotion notices**
+/// ([`RenewReplyFrame::demotions`] — composed under the same
+/// `FileCustody` serialization that parked the second holder) and the
+/// **extent coverage watermarks** ([`RenewReplyFrame::extent_covered`] —
+/// the retention release's pull surface), and
+/// [`VERB_CUSTODY_DEMOTE_ACK`] joined. (A sub-block grantee needs no
+/// demoted-region mark of its own: a grant that does not cover a whole
+/// block already classifies that block range-shared — the whole-block
+/// re-acquire corner is the rung's named residual.) A 3-speaker would
+/// silently drop the notice — the exact two-publishers window the
+/// barrier exists to close — so the mismatch stays a loud refusal.
+pub const CUSTODY_SCHEMA: u32 = 4;
 
 /// First verb of S9's block. S3 reserved 0 for its ping, S8's metadata
 /// vocabulary took 16/17, S6's membership owns `0x0100..=0x01FF`; custody
@@ -139,6 +152,10 @@ pub const VERB_CUSTODY_RENEW: u16 = VERB_CUSTODY_BASE + 2;
 pub const VERB_CUSTODY_RELEASE: u16 = VERB_CUSTODY_BASE + 3;
 /// Re-assert custody inside a successor's grace window.
 pub const VERB_CUSTODY_RECLAIM: u16 = VERB_CUSTODY_BASE + 4;
+/// Rung 17 (§9.3): the incumbent's demotion ACK — the client-initiated
+/// RPC that retires its direct-DMA custody over the demoted block and
+/// lets the parked second holder's grant issue.
+pub const VERB_CUSTODY_DEMOTE_ACK: u16 = VERB_CUSTODY_BASE + 5;
 
 /// Status: the call succeeded.
 pub const CUSTODY_OK: u16 = RPC_OK;
@@ -299,6 +316,21 @@ pub struct RangeVecEntry {
     pub token: u64,
 }
 
+/// Rung 17 (§9.3): one renewal-carried **demotion notice** — a second
+/// holder's acquire parked on `region` of `ino`, and THIS client's
+/// grant (`incumbent_token`) must quiesce its direct DMA there,
+/// re-route to extent-ship, and ACK ([`VERB_CUSTODY_DEMOTE_ACK`]).
+/// Composed under the same `FileCustody` serialization that parked the
+/// waiter, so a reply composed after the pending-mark always carries it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DemotionNotice {
+    pub ino: u64,
+    /// The block-aligned region demoting to authority-assembled.
+    pub region: (u64, u64),
+    /// The addressee grant — this client acks by naming it.
+    pub incumbent_token: u64,
+}
+
 /// A renewal's answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RenewReplyFrame {
@@ -311,6 +343,26 @@ pub struct RenewReplyFrame {
     /// lease's range vector (revalidation surface; empty for a client
     /// holding only whole-file custody).
     pub ranges: Vec<RangeVecEntry>,
+    /// **Rung 17** (schema 4): the demotion notices addressed to this
+    /// client's grants — the §9.3 pull channel (reply-carried on a
+    /// client-initiated RPC is not a push).
+    pub demotions: Vec<DemotionNotice>,
+    /// **Rung 17** (schema 4): per-ino covered witness-id watermarks —
+    /// the retention release's renewal-observation surface (`(ino,
+    /// covered_upto_request_id)`; the client releases every retained
+    /// extent at or below the watermark).
+    pub extent_covered: Vec<(u64, u64)>,
+}
+
+/// Rung 17: the incumbent's demotion ack.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DemoteAckFrame {
+    pub schema: u32,
+    pub client: String,
+    pub lease_epoch: u64,
+    pub ino: u64,
+    pub incumbent_token: u64,
+    pub region: (u64, u64),
 }
 
 /// A release of named grants.
@@ -328,8 +380,14 @@ pub struct ReclaimFrame {
     pub schema: u32,
     pub client: String,
     pub lease_epoch: u64,
-    /// The objects this client held before the failover.
+    /// The objects this client held WHOLE-FILE before the failover.
     pub inos: Vec<u64>,
+    /// **Rung 17** (schema 4): the RANGE grants this client held — MW-13's
+    /// law needs a range holder to re-assert its ORIGINAL block-aligned
+    /// grant (never a silent whole-file widening, which would conflict
+    /// with every surviving peer's ranges) in the successor's grace
+    /// window. `(ino, [start, end))` per span, re-granted EX.
+    pub ranges: Vec<(u64, (u64, u64))>,
 }
 
 /// The reclaim's answer: fresh-era grants for what was admitted.
@@ -1564,7 +1622,7 @@ impl WriteCustodyOwner {
         // O(live grants) on the heartbeat cadence — bounded by the §9.2
         // caps; a per-client index is the 1-TiB-shape residual, priced
         // when rung 18's rows demand it.
-        let ranges = self
+        let ranges: Vec<RangeVecEntry> = self
             .table
             .grants_snapshot_with(|id, g| {
                 (g.client == client)
@@ -1581,12 +1639,51 @@ impl WriteCustodyOwner {
             .into_iter()
             .flatten()
             .collect();
+        // Rung 17 (§9.3): the demotion notices addressed to this client's
+        // grants. The read serializes on the SAME `FileCustody` entry the
+        // pending-mark mutated (the arbiter's LOCK_MAP), so a reply
+        // composed after the mark ALWAYS carries the notice — the
+        // in-flight-renewal race pin's mechanism.
+        let mut demotions = Vec::new();
+        for entry in &ranges {
+            for region in crate::dlm::demotion_notices_for(entry.ino, entry.token) {
+                demotions.push(DemotionNotice {
+                    ino: entry.ino,
+                    region,
+                    incumbent_token: entry.token,
+                });
+            }
+        }
+        // Rung 17: the coverage watermarks — the retention release's
+        // renewal-observation surface (pull only).
+        let extent_covered = crate::extent_ship::owner_covered_watermarks(client);
         Ok(RenewReplyFrame {
             schema: CUSTODY_SCHEMA,
             lease: self.lease_frame(client, lease_epoch, now),
             dead_grants,
             ranges,
+            demotions,
+            extent_covered,
         })
+    }
+
+    /// Rung 17 (§9.3): serve one demotion ACK — validate the lease, mark
+    /// the pending acked (the region reads DEMOTED from here on), wake
+    /// the parked waiter. `Err(status)` mirrors [`Self::renew`]'s law.
+    pub fn demote_ack(
+        &self,
+        client: &str,
+        lease_epoch: u64,
+        ino: u64,
+        incumbent_token: u64,
+        region: (u64, u64),
+    ) -> std::result::Result<bool, u16> {
+        if !self.lease_current(client, lease_epoch) {
+            self.unknown_leases.fetch_add(1, Ordering::Relaxed);
+            UNKNOWN_LEASES.fetch_add(1, Ordering::Relaxed);
+            return Err(CUSTODY_UNKNOWN_LEASE);
+        }
+        Ok(crate::dlm::ack_demotion(ino, incumbent_token, region))
     }
 
     /// Retire named grants at the client's request. Dropping the
@@ -1802,14 +1899,24 @@ impl WriteCustodyOwner {
             UNKNOWN_LEASES.fetch_add(1, Ordering::Relaxed);
             return Err(CUSTODY_UNKNOWN_LEASE);
         }
-        let mut out = Vec::with_capacity(frame.inos.len());
-        for ino in &frame.inos {
+        let mut out = Vec::with_capacity(frame.inos.len() + frame.ranges.len());
+        // Rung 17: whole-file re-assertions (span None) and RANGE
+        // re-assertions ride one loop — a range holder re-asserts its
+        // ORIGINAL span (MW-13's law), never a whole-file widening.
+        let asks: Vec<(u64, Option<(u64, u64)>)> = frame
+            .inos
+            .iter()
+            .map(|ino| (*ino, None))
+            .chain(frame.ranges.iter().map(|(ino, span)| (*ino, Some(*span))))
+            .collect();
+        for (ino, span) in &asks {
+            let ino = *ino;
             let req = AcquireFrame {
                 schema: CUSTODY_SCHEMA,
                 client: frame.client.clone(),
                 lease_epoch: frame.lease_epoch,
-                ino: *ino,
-                span: None,
+                ino,
+                span: *span,
                 concurrent_write: false,
                 // A reclaim never waits: the predecessor's grants are gone
                 // with its RAM, so anything that conflicts is a LIVE
@@ -1824,7 +1931,7 @@ impl WriteCustodyOwner {
             let path = format!("inode_{ino}");
             let Ok(lease) = self
                 .arbiter
-                .acquire_lock_mode(&path, None, mode, Duration::from_millis(0))
+                .acquire_lock_mode(&path, *span, mode, Duration::from_millis(0))
                 .await
             else {
                 self.conflicts.fetch_add(1, Ordering::Relaxed);
@@ -1841,8 +1948,8 @@ impl WriteCustodyOwner {
             let grant_id = match self.table.commit_grant_if_current(
                 &req.client,
                 req.lease_epoch,
-                *ino,
-                None,
+                ino,
+                *span,
                 lease,
             ) {
                 Ok(id) => id,
@@ -1864,8 +1971,8 @@ impl WriteCustodyOwner {
             out.push(GrantRecord {
                 schema: CUSTODY_SCHEMA,
                 grant_id,
-                ino: *ino,
-                span: None,
+                ino,
+                span: *span,
                 token,
                 term: self.term,
                 custody_epoch: crate::dlm::compose_token(self.term, frame.lease_epoch),
@@ -2008,6 +2115,40 @@ impl CustodyService {
                         body: (n as u64).to_le_bytes().to_vec(),
                     }
                 }
+            },
+            VERB_CUSTODY_DEMOTE_ACK => match decode::<DemoteAckFrame>(&req.body, "demote ack") {
+                Err(e) => Self::refuse(req.id, CUSTODY_MALFORMED, format!("{e}")),
+                Ok(frame) if frame.schema != CUSTODY_SCHEMA => Self::refuse(
+                    req.id,
+                    CUSTODY_SCHEMA_MISMATCH,
+                    format!(
+                        "peer speaks custody schema {} and this authority speaks \
+                         {CUSTODY_SCHEMA}",
+                        frame.schema
+                    ),
+                ),
+                Ok(frame) => match self.owner.demote_ack(
+                    &frame.client,
+                    frame.lease_epoch,
+                    frame.ino,
+                    frame.incumbent_token,
+                    frame.region,
+                ) {
+                    Ok(acked) => RpcResponse {
+                        id: req.id,
+                        status: CUSTODY_OK,
+                        body: vec![u8::from(acked)],
+                    },
+                    Err(status) => Self::refuse(
+                        req.id,
+                        status,
+                        format!(
+                            "demotion ack from '{}' refused ({})",
+                            frame.client,
+                            status_name(status)
+                        ),
+                    ),
+                },
             },
             VERB_CUSTODY_RECLAIM => match decode::<ReclaimFrame>(&req.body, "reclaim") {
                 Err(e) => Self::refuse(req.id, CUSTODY_MALFORMED, format!("{e}")),
@@ -2723,17 +2864,95 @@ impl WriteCustodyClient {
                 .map(|e| (e.ino, e.span, e.token))
                 .collect::<Vec<_>>(),
         );
+        // Rung 17 (§9.3): the renewal-carried DEMOTION NOTICES — the
+        // §9.3 order is load-bearing: (1) mark the region demoted in the
+        // LOCAL table so every subsequent write to it classifies
+        // extent-ship, (2) QUIESCE the in-flight direct publishes, (3)
+        // only then ACK — the authority issues the parked grant the
+        // moment the ack lands, so a single publisher holds at every
+        // instant.
+        for notice in &r.demotions {
+            crate::extent_ship::note_demotion(notice.ino, notice.region).await;
+            if let Err(e) = self
+                .ack_demotion(notice.ino, notice.incumbent_token, notice.region)
+                .await
+            {
+                // Never fatal: the un-acked pending resolves at this
+                // lease's expiry on the OWNER's clock (the barrier's
+                // bound) — loud, because the window is now the TTL.
+                log::warn!(
+                    "S9: demotion ack for ino {} {:?} failed ({e}) — the barrier resolves \
+                     at this lease's expiry on the authority's clock",
+                    notice.ino,
+                    notice.region
+                );
+            }
+        }
+        // Rung 17: the coverage watermarks release retained extents
+        // (release path 2 — pull only, never on ack).
+        for (ino, upto) in &r.extent_covered {
+            crate::extent_ship::release_covered(*ino, *upto);
+        }
         Ok(())
+    }
+
+    /// Rung 17 (§9.3): ship one demotion ACK — the client-initiated RPC
+    /// that retires this mount's direct-DMA custody over the demoted
+    /// region (the caller has already marked the region locally and
+    /// quiesced).
+    pub async fn ack_demotion(
+        &self,
+        ino: u64,
+        incumbent_token: u64,
+        region: (u64, u64),
+    ) -> Result<bool> {
+        let frame = DemoteAckFrame {
+            schema: CUSTODY_SCHEMA,
+            client: self.id.clone(),
+            lease_epoch: self.lease_epoch.load(Ordering::Acquire),
+            ino,
+            incumbent_token,
+            region,
+        };
+        let body = encode(&frame, "demote ack")?;
+        let reply = self.call_retrying(VERB_CUSTODY_DEMOTE_ACK, body).await?;
+        if reply.status != CUSTODY_OK {
+            let detail = String::from_utf8_lossy(&reply.body).to_string();
+            if reply.status == CUSTODY_UNKNOWN_LEASE {
+                self.note_lease_lost(&detail);
+            }
+            return Err(SqueezefsError::LockFailed {
+                reason: format!(
+                    "S9: demotion ack refused by {} ({}): {detail}",
+                    self.endpoint,
+                    status_name(reply.status)
+                ),
+            });
+        }
+        Ok(reply.body.first().copied().unwrap_or(0) != 0)
     }
 
     /// Re-assert custody of `inos` inside a successor's grace window,
     /// adopting the fresh-era grants it returns.
     pub async fn reclaim(&self, inos: &[u64]) -> Result<Vec<GrantRecord>> {
+        self.reclaim_with_ranges(inos, &[]).await
+    }
+
+    /// [`Self::reclaim`] carrying RANGE re-assertions too (rung 17,
+    /// MW-13's law: a range holder re-asserts its ORIGINAL block-aligned
+    /// grant — never a whole-file widening that would conflict with a
+    /// surviving peer's ranges).
+    pub async fn reclaim_with_ranges(
+        &self,
+        inos: &[u64],
+        ranges: &[(u64, (u64, u64))],
+    ) -> Result<Vec<GrantRecord>> {
         let frame = ReclaimFrame {
             schema: CUSTODY_SCHEMA,
             client: self.id.clone(),
             lease_epoch: self.lease_epoch.load(Ordering::Acquire),
             inos: inos.to_vec(),
+            ranges: ranges.to_vec(),
         };
         let body = encode(&frame, "reclaim")?;
         let reply = self.call_retrying(VERB_CUSTODY_RECLAIM, body).await?;

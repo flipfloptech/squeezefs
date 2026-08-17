@@ -121,6 +121,9 @@ pub mod dlm_slot;
 // scope, which silently breaks them.
 pub mod env_knobs;
 pub mod error;
+// DLM S11 rung 17 (KD-MW-8): the extent-ship client retention store +
+// the authority's coverage ledger — the sub-block-shared-block plane.
+pub mod extent_ship;
 // Spec §6.8 item 3 — the freed-offset grace period (the module's own `//!`
 // docs are the documentation; an outer `///` here would re-root its
 // intra-doc links in `crate`, the shape `ro_coherence` already suffers).

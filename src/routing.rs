@@ -6084,6 +6084,14 @@ impl DataRouter {
         }
 
         let max_chain = layout_delta_max_chain();
+        // Rung 17 (KD-MW-8): a CHAINED publish target — a foreign-home
+        // ino (the merge SHIPS) or an ino with live foreign custody on
+        // this authority — composes on the owner's chain-onto-head arm,
+        // so the RAM chain-cap full save (a private-view clobber under
+        // two publishers) stands down: the OWNER compacts the durable
+        // chain from ITS OWN folded state at the cap. One relaxed-load
+        // ladder on every solo mount.
+        let merge_chained = crate::meta_ship::publish::merge_is_chained(backend, ino);
         let delta_eligible = publish_entries.is_some()
             // Vector B: drained deferred notes describe map changes outside
             // this save's entries — they ride full-save-class commits only
@@ -6091,7 +6099,8 @@ impl DataRouter {
             && !has_deferred_refs
             && !needs_indirect
             && max_chain > 0
-            && m.layout_delta_chain < max_chain
+            && (m.layout_delta_chain < max_chain
+                || (merge_chained && m.layout_delta_chain != LAYOUT_DELTA_CHAIN_INELIGIBLE))
             && !m
                 .block_map_id
                 .as_deref()
@@ -6139,8 +6148,27 @@ impl DataRouter {
             )
             .await
             {
-                Ok(used) => used,
+                Ok((used, staged_version)) => {
+                    // Rung 17: on a CHAINED target the OWNER re-minted the
+                    // staged link — the reply's version is the provenance
+                    // the next delta must claim (chain-without-refetch);
+                    // on the local un-chained arm it is this save's own
+                    // mint, unchanged.
+                    if used {
+                        minted_version = staged_version;
+                    }
+                    used
+                }
                 Err(e) => {
+                    // The §9.3 loser-law tripwire: a version-gate refusal
+                    // on demoted custody is the crash-window path (≈ 0 —
+                    // the demotion barrier makes it unreachable steady
+                    // state); the empty-Vec probe costs nothing elsewhere.
+                    if format!("{e}").contains("item 9")
+                        && !crate::dlm::demoted_regions(ino).is_empty()
+                    {
+                        crate::dlm::note_demotion_fenced_publish();
+                    }
                     self.note_block_ref_ops(ino, refill);
                     self.reset_layout_provenance(ino);
                     return Err(e);

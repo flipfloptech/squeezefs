@@ -209,6 +209,39 @@ pub fn layout_delta_versions(payload: &[u8]) -> Option<(u64, u64)> {
     (version != 0).then_some((base_version, version))
 }
 
+/// DLM S11 rung 17 (KD-MW-8's composition law): re-stamp an ENCODED
+/// layout delta's `(base_version, version)` pair — the owner-side
+/// **chain-onto-head** primitive. A shipped delta's claim names the
+/// co-writer's private belief of the base; the authority, serving it
+/// under its own 4a I-guard, re-bases the claim onto the DURABLE head it
+/// just probed and re-mints the link version from its OWN sequencer (one
+/// mint per volume set ⇒ cross-writer link versions can never collide).
+///
+/// Fast path: the versioned wire's pair sits at fixed offsets `3..19` —
+/// patched in place. Slow path (an unversioned wire — flag bit 4 clear):
+/// decode → stamp → re-encode. `version` must be nonzero (0 is the
+/// reserved unversioned value); a zero version answers the input
+/// unchanged, which the gate then re-bases — never a panic on a mint
+/// exhaustion.
+pub fn restamp_delta_versions(
+    payload: &[u8],
+    base_version: u64,
+    version: u64,
+) -> Result<Vec<u8>, LayoutWireError> {
+    if version == 0 {
+        return Ok(payload.to_vec());
+    }
+    if payload.len() >= 19 && is_layout_delta(payload) && payload[2] & F_VERSIONED != 0 {
+        let mut out = payload.to_vec();
+        out[3..11].copy_from_slice(&base_version.to_le_bytes());
+        out[11..19].copy_from_slice(&version.to_le_bytes());
+        return Ok(out);
+    }
+    let mut decoded = LayoutDelta::decode(payload)?;
+    decoded.set_versions(base_version, version);
+    Ok(decoded.encode())
+}
+
 /// The §6.2 item-9 **commit-gate verdict** for one delta admission on a
 /// `KV_LAYOUT_VERSIONS` volume — pure (unit-testable), called by the
 /// backend's merge paths with the delta's own version pair, the durable

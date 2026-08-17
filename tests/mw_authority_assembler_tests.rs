@@ -409,7 +409,8 @@ async fn write_extent_is_era_gated_witnessed_and_served_through_the_assembler() 
     assert_eq!(s2.extent_replays - s1.extent_replays, 1);
 
     // The era gate: a frame naming an epoch that is not live custody
-    // refuses BEFORE the window, merging nothing.
+    // refuses BEFORE the window, merging nothing and staging nothing.
+    let journal_before = journal_entries();
     let stale = publish::PublishCall::WriteExtent {
         ino,
         block_index: 0,
@@ -429,6 +430,11 @@ async fn write_extent_is_era_gated_witnessed_and_served_through_the_assembler() 
         "the refusal is the era gate's class: {err:?}"
     );
     assert_eq!(asm.merges.lock().len(), 1, "nothing was merged");
+    assert_eq!(
+        journal_entries(),
+        journal_before,
+        "a refused extent stages no journal entry (applies nothing)"
+    );
     let s3 = extent_stats();
     assert_eq!(s3.extent_stale_refusals - s2.extent_stale_refusals, 1);
 
@@ -663,16 +669,12 @@ async fn an_unacked_demotion_resolves_when_the_incumbents_grant_dies() {
         "the kill row closes the ledger through the FENCE column"
     );
     assert_eq!(d1.demotion_acks, d0.demotion_acks);
-    // A fence-resolved barrier marks nothing demoted: B is the block's
-    // sole holder and keeps clean custody.
-    let b_token = match &b {
-        squeezefs::dlm::RangeAcquired::New { lease, .. } => lease.fencing_token(),
-        other => panic!("B's grant is NEW: {other:?}"),
-    };
+    // A fence-resolved barrier marks NOTHING demoted: the survivor gets
+    // clean (un-demoted) custody — the dead incumbent's era is fenced by
+    // quarantine/era machinery, not by an assembly that never started.
     assert!(
-        !squeezefs::dlm::span_range_shared(ino, 0, BLOCK, b_token)
-            || squeezefs::dlm::live_range_records(ino) > 1,
-        "a fence-resolved demotion leaves the survivor whole-block-sole"
+        squeezefs::dlm::demoted_regions(ino).is_empty(),
+        "a fence-resolved demotion marks no demoted region"
     );
     match b {
         squeezefs::dlm::RangeAcquired::New { lease, .. } => lease.release().await.unwrap(),
@@ -1008,11 +1010,22 @@ async fn mw13_authority_death_mid_demotion_a_reasserts_and_the_demotion_restarts
         .await
         .expect("A re-joins the successor");
     data_grant::install_custody_client(Arc::clone(&client2));
-    let reclaimed = client2.reclaim(&[ino]).await.expect("A re-asserts");
+    // MW-13's law verbatim: A re-asserts its ORIGINAL BLOCK-ALIGNED
+    // RANGE grant (never a whole-file widening, which would conflict
+    // with surviving peers' ranges and make B's re-ask a plain wait).
+    let reclaimed = client2
+        .reclaim_with_ranges(&[], &[(ino, (0, BLOCK))])
+        .await
+        .expect("A re-asserts");
     assert_eq!(
         reclaimed.len(),
         1,
         "A re-asserted its ORIGINAL grant in the grace window"
+    );
+    assert_eq!(
+        reclaimed[0].span,
+        Some((0, BLOCK)),
+        "the re-assertion is the original span"
     );
 
     // B re-issues against the successor: the demotion restarts from
@@ -1312,8 +1325,14 @@ async fn mw11_authority_death_between_ack_and_publish_loses_no_acked_fsynced_byt
     );
 
     // The successor: fresh assembler (its overlay is EMPTY — the merge
-    // died with authority 1's RAM), grace window, re-join, RE-SHIP.
+    // died with authority 1's RAM), grace window, re-join, RE-SHIP. The
+    // ownership map re-arms at the successor's endpoint (the failover
+    // relearn every S9-b row already exercises).
     let auth2 = start_authority(Arc::clone(&owner_be), "assembler-authority-2");
+    let foreign2: Vec<(usize, PeerOwner)> = (0..client_be.volumes.len())
+        .map(|v| (v, PeerOwner::new("assembler-authority-2", &auth2.endpoint)))
+        .collect();
+    ship::arm_ownership(OwnerMap::for_volumes(&client_be, foreign2).expect("owner map"));
     let asm2 = Arc::new(MockAssembler::default());
     asm2.install();
     asm2.install_flush(0xC2);

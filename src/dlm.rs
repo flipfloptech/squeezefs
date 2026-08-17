@@ -351,6 +351,18 @@ static RANGE_CONFLICTS: AtomicU64 = AtomicU64::new(0);
 static RANGE_WAITS: AtomicU64 = AtomicU64::new(0);
 static RANGE_DESIRED_TRIMS: AtomicU64 = AtomicU64::new(0);
 static RANGE_CAP_REFUSALS: AtomicU64 = AtomicU64::new(0);
+// Rung 17 — the §9.3 demotion-barrier family. The CLOSED LEDGER LAW is
+// `demotions ≡ acks + fence_resolves` on EVERY posture (healthy fleet:
+// fence_resolves == 0; kill rows close through the fence column), and
+// `demotion_fenced_publishes` is the ≈0 loser-law tripwire (a
+// version-gate-fenced direct publish on a demoted block is the
+// crash-window path, never steady state).
+static RANGE_DEMOTIONS: AtomicU64 = AtomicU64::new(0);
+static RANGE_DEMOTION_ACKS: AtomicU64 = AtomicU64::new(0);
+static RANGE_DEMOTION_FENCE_RESOLVES: AtomicU64 = AtomicU64::new(0);
+static RANGE_DEMOTION_FENCED_PUBLISHES: AtomicU64 = AtomicU64::new(0);
+static RANGE_DEMOTION_WAIT: Lazy<crate::fuse_client::LatencyHistogram> =
+    Lazy::new(crate::fuse_client::LatencyHistogram::default);
 
 /// A grant record became live (any admit site — issue or adoption).
 fn note_record_admitted(span: Option<(u64, u64)>) {
@@ -479,6 +491,19 @@ pub struct RangeCustodyStats {
     /// the refuse-loud arm (≈ 0 on legitimate shapes below budget: the
     /// Issue-19 falsifier).
     pub cap_refusals: u64,
+    /// §9.3 demotion episodes MARKED (a block-sharing acquire parked
+    /// behind the grant-issuance barrier).
+    pub demotions: u64,
+    /// Demotions resolved by the incumbent's ACK (renewal-carried
+    /// notice → quiesce → client-initiated ack RPC) — the clean path.
+    pub demotion_acks: u64,
+    /// Demotions resolved by the incumbent's grant DEATH (release /
+    /// revocation / lease expiry on the OWNER's clock) — the fence
+    /// column; 0 on a healthy fleet.
+    pub demotion_fence_resolves: u64,
+    /// The loser-law tripwire (≈ 0): a version-gate-fenced direct
+    /// publish observed on a demoted block — the crash-window path.
+    pub demotion_fenced_publishes: u64,
 }
 
 /// Read the process's range-custody ledger.
@@ -493,6 +518,10 @@ pub fn range_custody_stats() -> RangeCustodyStats {
         waits: RANGE_WAITS.load(Ordering::Relaxed),
         desired_trims: RANGE_DESIRED_TRIMS.load(Ordering::Relaxed),
         cap_refusals: RANGE_CAP_REFUSALS.load(Ordering::Relaxed),
+        demotions: RANGE_DEMOTIONS.load(Ordering::Relaxed),
+        demotion_acks: RANGE_DEMOTION_ACKS.load(Ordering::Relaxed),
+        demotion_fence_resolves: RANGE_DEMOTION_FENCE_RESOLVES.load(Ordering::Relaxed),
+        demotion_fenced_publishes: RANGE_DEMOTION_FENCED_PUBLISHES.load(Ordering::Relaxed),
     }
 }
 
@@ -511,9 +540,85 @@ pub fn range_custody_stats_json() -> serde_json::Value {
         "range_custody_waits": s.waits,
         "range_custody_desired_trims": s.desired_trims,
         "range_custody_cap_refusals": s.cap_refusals,
+        "range_custody_demotions": s.demotions,
+        "range_custody_demotion_acks": s.demotion_acks,
+        "range_custody_demotion_fence_resolves": s.demotion_fence_resolves,
+        "range_custody_demotion_fenced_publishes": s.demotion_fenced_publishes,
+        "range_custody_demotion_wait_ns": RANGE_DEMOTION_WAIT.to_json(),
         "dlm_grant_table_bytes": grant_table_bytes(),
         "dlm_grant_table_budget_bytes": range_table_budget_bytes(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// DLM S11 rung 17 — the §9.3 demotion barrier's public surface (KD-MW-8)
+// ---------------------------------------------------------------------------
+
+/// The UNACKED demotion notices naming `incumbent_token` on `ino` — the
+/// renewal reply's read, composed under the SAME `FileCustody` entry
+/// serialization that parked the waiter (the in-flight-renewal race pin:
+/// a reply composed after the pending-mark always observes it).
+pub fn demotion_notices_for(ino: u64, incumbent_token: u64) -> Vec<(u64, u64)> {
+    LOCK_MAP
+        .read_sync(&ObjectKey::Ino(ino), |_, custody| {
+            custody.demotion_notices_for_token(incumbent_token)
+        })
+        .unwrap_or_default()
+}
+
+/// The incumbent's ACK (a client-initiated RPC's landing point): mark
+/// the pending acked, adopt the region as DEMOTED (authority-assembled),
+/// count it, and wake the file's stripe so the parked waiter re-plans.
+pub fn ack_demotion(ino: u64, incumbent_token: u64, region: (u64, u64)) -> bool {
+    if region.0 >= region.1 {
+        return false;
+    }
+    let key = ObjectKey::Ino(ino);
+    let acked = LOCK_MAP
+        .update_sync(&key, |_, custody| {
+            custody.ack_demotion(incumbent_token, region)
+        })
+        .unwrap_or(false);
+    if acked {
+        RANGE_DEMOTION_ACKS.fetch_add(1, Ordering::Relaxed);
+        LOCK_WAITERS
+            .get_inode_lock(key.stripe_seed())
+            .notify_waiters();
+    }
+    acked
+}
+
+/// The CLIENT half of a demotion: mark `region` demoted in this
+/// process's own custody table, so its local `span_range_shared` probes
+/// (the W1/B4 clauses, the write path's extent-ship classification)
+/// answer TRUE for the region. `false` ⇔ no live entry (the caller holds
+/// no custody on the ino — nothing to re-route).
+pub fn adopt_demoted_region(ino: u64, region: (u64, u64)) -> bool {
+    if region.0 >= region.1 {
+        return false;
+    }
+    LOCK_MAP
+        .update_sync(&ObjectKey::Ino(ino), |_, custody| {
+            custody.adopt_demoted(region);
+            true
+        })
+        .unwrap_or(false)
+}
+
+/// The live demoted regions on `ino` (the grant reply carries them so an
+/// adopting co-writer marks its local table before its first write).
+pub fn demoted_regions(ino: u64) -> Vec<(u64, u64)> {
+    LOCK_MAP
+        .read_sync(&ObjectKey::Ino(ino), |_, custody| custody.demoted_regions())
+        .unwrap_or_default()
+}
+
+/// The §9.3 loser-law tripwire: a version-gate-fenced direct publish
+/// observed on an ino with demoted custody (`≈ 0` — the crash-window
+/// path; the loser re-ships its own bytes as extents, never
+/// retry-as-whole-block).
+pub fn note_demotion_fenced_publish() {
+    RANGE_DEMOTION_FENCED_PUBLISHES.fetch_add(1, Ordering::Relaxed);
 }
 
 /// One [`LocalLockManager::acquire_lock_range`] outcome.
@@ -1069,10 +1174,18 @@ impl LocalLockManager {
         }
         let scope = merge_scope.unwrap_or(self.client_nonce);
         let span_cap = geometry.map(|(size, block)| range_span_cap(size, block));
+        // Rung 17 (§9.3): the demotion barrier's block-sharing probe is
+        // decidable only with a block size — no geometry, no barrier
+        // (an ask then parks on the plain conflict law, unchanged).
+        let block_size = geometry.map(|(_, block)| block).filter(|b| *b > 0);
         let key = ObjectKey::from_path(file_path);
         let notify = LOCK_WAITERS.get_inode_lock(key.stripe_seed());
         let deadline = std::time::Instant::now() + ttl;
         let mut parked = false;
+        // Rung 17: set when THIS ask parks behind the demotion barrier —
+        // the admit records the renewal-bounded window it waited
+        // (`range_custody_demotion_wait_ns`).
+        let mut barrier_parked_at: Option<std::time::Instant> = None;
 
         /// The one-critical-section outcome (plan AND apply under the
         /// entry lock — a plan can never go stale before its admit).
@@ -1081,6 +1194,10 @@ impl LocalLockManager {
             Extended { token: u64, span: (u64, u64) },
             Covered { token: u64, span: (u64, u64) },
             Held,
+            /// Rung 17: parked behind the §9.3 grant-issuance demotion
+            /// barrier (pendings marked; the incumbent's ack — or its
+            /// lease death — wakes this waiter).
+            HeldDemotion,
             Bridge,
             CapGeometry { live: usize, cap: u64 },
             CapBudget { bytes: u64, budget: u64 },
@@ -1096,9 +1213,97 @@ impl LocalLockManager {
 
             let mem_red = crate::mem_budget::level() == crate::mem_budget::Level::Red;
             let decide = |custody: &mut FileCustody| -> RangeMint {
+                // The §9.2 bounds + mint + admit for a NEW record over
+                // `span` (shared by the plan's New arm and the rung-17
+                // licensed-coexistence admit).
+                let admit_new = |custody: &mut FileCustody,
+                                 span: (u64, u64),
+                                 trimmed: bool|
+                 -> RangeMint {
+                    // The §9.2 bounds, in refusal order: the file's own
+                    // geometry, then the R5 byte budget, then the Red
+                    // clamp. All BEFORE the mint (never burn a token
+                    // on a refused acquisition).
+                    let live = custody.ranges_len();
+                    if let Some(cap) = span_cap {
+                        if (live as u64) >= cap {
+                            return RangeMint::CapGeometry { live, cap };
+                        }
+                    }
+                    let bytes = grant_table_bytes();
+                    let budget = range_table_budget_bytes();
+                    if bytes + RANGE_GRANT_RECORD_BYTES > budget {
+                        return RangeMint::CapBudget { bytes, budget };
+                    }
+                    if mem_red {
+                        return RangeMint::Red { bytes };
+                    }
+                    match mint_token() {
+                        Err(seq) => RangeMint::Exhausted(seq),
+                        Ok(token) => {
+                            if trimmed {
+                                RANGE_DESIRED_TRIMS.fetch_add(1, Ordering::Relaxed);
+                            }
+                            publish_floor_then_admit(grant_floor(&key), token, || {
+                                custody.admit(
+                                    Some(span),
+                                    Grant {
+                                        start: span.0,
+                                        end: span.1,
+                                        owner_nonce: scope,
+                                        token,
+                                        mode: LockMode::Exclusive,
+                                    },
+                                )
+                            });
+                            note_record_admitted(Some(span));
+                            RANGE_GRANTS.fetch_add(1, Ordering::Relaxed);
+                            RangeMint::New { token, span }
+                        }
+                    }
+                };
+                // Rung 17 (§9.3): the grant-issuance DEMOTION BARRIER.
+                // `ask` is the span whose issuance would share a block
+                // with a live foreign grant: mark one pending per
+                // un-acked sharer (the incumbent learns on its next
+                // renewal reply) and PARK — the grant is withheld until
+                // every sharer acked (its region then reads demoted and
+                // the sharer probe excludes it) or died (the retire
+                // sweep resolves through the fence column).
+                let barrier = |custody: &mut FileCustody, ask: (u64, u64)| -> bool {
+                    let Some(bs) = block_size else { return false };
+                    let sharers = custody.foreign_block_sharers(ask, bs, scope);
+                    if sharers.is_empty() {
+                        return false;
+                    }
+                    for (token, _sscope, region) in sharers {
+                        if custody.mark_demotion_pending(region, token) {
+                            RANGE_DEMOTIONS.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    true
+                };
                 let decision = custody.plan_range(required, desired, scope);
                 match decision.plan {
-                    RangePlan::HeldForeign => RangeMint::Held,
+                    RangePlan::HeldForeign => {
+                        // Rung 17: foreign custody overlaps REQUIRED. If
+                        // every overlap lies inside a DEMOTED region the
+                        // coexistence is licensed (nobody DMAs there —
+                        // the authority assembles) and REQUIRED admits
+                        // exactly; otherwise the barrier marks pendings
+                        // (range sharers only — wholes keep the plain
+                        // conflict law) and the ask parks.
+                        if block_size.is_none() || custody.has_wholes() {
+                            return RangeMint::Held;
+                        }
+                        if barrier(custody, required) {
+                            return RangeMint::HeldDemotion;
+                        }
+                        if custody.required_overlaps_licensed(required, scope) {
+                            return admit_new(custody, required, required != desired);
+                        }
+                        RangeMint::Held
+                    }
                     RangePlan::BridgeRefused => RangeMint::Bridge,
                     RangePlan::Covered { token, span } => RangeMint::Covered { token, span },
                     RangePlan::Extend { token, span } => {
@@ -1114,47 +1319,13 @@ impl LocalLockManager {
                         RangeMint::Extended { token, span }
                     }
                     RangePlan::New { span } => {
-                        // The §9.2 bounds, in refusal order: the file's own
-                        // geometry, then the R5 byte budget, then the Red
-                        // clamp. All BEFORE the mint (never burn a token
-                        // on a refused acquisition).
-                        let live = custody.ranges_len();
-                        if let Some(cap) = span_cap {
-                            if (live as u64) >= cap {
-                                return RangeMint::CapGeometry { live, cap };
-                            }
+                        // Rung 17: a byte-disjoint window that would
+                        // SHARE A BLOCK with a live foreign grant is the
+                        // other demotion shape — barrier before admit.
+                        if barrier(custody, span) {
+                            return RangeMint::HeldDemotion;
                         }
-                        let bytes = grant_table_bytes();
-                        let budget = range_table_budget_bytes();
-                        if bytes + RANGE_GRANT_RECORD_BYTES > budget {
-                            return RangeMint::CapBudget { bytes, budget };
-                        }
-                        if mem_red {
-                            return RangeMint::Red { bytes };
-                        }
-                        match mint_token() {
-                            Err(seq) => RangeMint::Exhausted(seq),
-                            Ok(token) => {
-                                if decision.trimmed {
-                                    RANGE_DESIRED_TRIMS.fetch_add(1, Ordering::Relaxed);
-                                }
-                                publish_floor_then_admit(grant_floor(&key), token, || {
-                                    custody.admit(
-                                        Some(span),
-                                        Grant {
-                                            start: span.0,
-                                            end: span.1,
-                                            owner_nonce: scope,
-                                            token,
-                                            mode: LockMode::Exclusive,
-                                        },
-                                    )
-                                });
-                                note_record_admitted(Some(span));
-                                RANGE_GRANTS.fetch_add(1, Ordering::Relaxed);
-                                RangeMint::New { token, span }
-                            }
-                        }
+                        admit_new(custody, span, decision.trimmed)
                     }
                 }
             };
@@ -1173,6 +1344,11 @@ impl LocalLockManager {
 
             match outcome {
                 RangeMint::New { token, span } => {
+                    if let Some(t0) = barrier_parked_at {
+                        // The demotion barrier's renewal-bounded window,
+                        // priced (§13's `wait_ns`).
+                        RANGE_DEMOTION_WAIT.record(t0.elapsed());
+                    }
                     return Ok(RangeAcquired::New {
                         lease: LockLease {
                             inner: Arc::new(LockLeaseInner {
@@ -1256,7 +1432,10 @@ impl LocalLockManager {
                     log::error!("{reason}");
                     return Err(crate::error::SqueezefsError::LockFailed { reason });
                 }
-                RangeMint::Held => {
+                held @ (RangeMint::Held | RangeMint::HeldDemotion) => {
+                    if matches!(held, RangeMint::HeldDemotion) && barrier_parked_at.is_none() {
+                        barrier_parked_at = Some(std::time::Instant::now());
+                    }
                     if !parked {
                         parked = true;
                         RANGE_WAITS.fetch_add(1, Ordering::Relaxed);
@@ -1348,12 +1527,24 @@ impl LockLeaseInner {
             remote.release();
         }
         let mut retired = false;
+        let mut fence_resolved = 0usize;
         let _ = LOCK_MAP.remove_if_sync(&self.key, |custody| {
             retired = custody.retire(self.span, self.fencing_token, self.client_nonce);
+            if retired {
+                // Rung 17 (§9.3): a retiring INCUMBENT resolves its
+                // un-acked demotion pendings through the FENCE column —
+                // its custody over the shared blocks is provably retired
+                // (release, revocation, or lease expiry on the owner's
+                // clock), so the barrier's waiters may proceed.
+                fence_resolved = custody.sweep_pendings_of(self.fencing_token);
+            }
             custody.is_vacant()
         });
         if retired {
             note_record_retired(self.span);
+        }
+        if fence_resolved > 0 {
+            RANGE_DEMOTION_FENCE_RESOLVES.fetch_add(fence_resolved as u64, Ordering::Relaxed);
         }
         if retired {
             LOCK_WAITERS

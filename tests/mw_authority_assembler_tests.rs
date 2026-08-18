@@ -2232,3 +2232,101 @@ async fn an_extent_larger_than_the_wire_cap_ships_chunked_and_assembles_exact() 
     shutdown(&owner_be).await;
     shutdown(&client_be).await;
 }
+
+// ===========================================================================
+// Rung 18: a scoped Put's truth-span EXCLUDES demoted regions
+// ===========================================================================
+
+/// Contract (CONVICTED LIVE on the s11-subblock priced row, 2026-08-18 —
+/// fsck `[C2] leaked block` + `[C8] 1 durable record vs 0 layout
+/// references`, drift 2): the custody-scoped Put's truth-span was the
+/// holder's SPANS — including bytes inside a DEMOTED region, where the
+/// holder never DMAs (KD-MW-8: the AUTHORITY is the single publisher of
+/// a demoted block; every holder ships extents) and its RAM map is
+/// legitimately stale. The holder's epoch-close Put then re-inserted its
+/// STALE key for the demoted block, REVERTING the authority's assembly —
+/// the assembly's key lost its map reference while its take stood (the
+/// C8 dangling-take + C2 leak pair), and until the next fold re-covered
+/// it the map named superseded bytes.
+///
+/// The law: a demoted region is NOBODY's Put-truth — the scoped apply
+/// preserves the DURABLE (authority-assembled) entry for any block
+/// overlapping a demoted region, both directions (the holder's stale
+/// presence never overwrites; its absence never removes).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scoped_put_never_reverts_a_demoted_blocks_assembly() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let (owner_be, _p) = sandbox(dir.path(), "own-dem", true).await;
+    let (client_be, _p2) = sandbox(dir.path(), "cli-dem", false).await;
+    let auth = start_authority(Arc::clone(&owner_be), "assembler-authority");
+    let (client, pc) = arm_client(&auth, &client_be).await;
+    let epoch = client.lease_epoch();
+    let ino = shipped_create(&client_be, "demoted.bin").await;
+
+    // The holder's custody: blocks 0..2 (its stream's stripes).
+    let _g = client
+        .acquire_range(ino, (0, 2 * BLOCK), (0, 2 * BLOCK), Duration::from_secs(1))
+        .await
+        .expect("blocks 0-1 range custody");
+
+    // The AUTHORITY's assembly published block 0 (the fold's merge) —
+    // and block 0 is DEMOTED (the barrier acked: both holders ship
+    // extents there, the authority assembles).
+    let base = base_layout_bytes(
+        2 * BLOCK,
+        &[(0, "be://data/K_assembly"), (1, "be://data/K_holder_old")],
+    );
+    use squeezefs::meta_backend::Metadata as _;
+    owner_be
+        .set_layout_and_size(ino, &base, 2 * BLOCK, &[])
+        .await
+        .expect("the authority's assembled layout");
+    assert!(
+        squeezefs::dlm::adopt_demoted_region(ino, (0, BLOCK)),
+        "block 0's region marks demoted on the authority's own table"
+    );
+
+    // The holder's epoch-close full Put: its RAM view of block 0 is
+    // STALE (it never DMAs a demoted block); block 1 is its live truth.
+    let put = base_layout_bytes(
+        2 * BLOCK,
+        &[(0, "be://data/K_stale"), (1, "be://data/K_holder_new")],
+    );
+    let reply = pc
+        .ship(
+            &auth.endpoint,
+            publish::PublishCall::SetLayoutAndSize {
+                ino,
+                layout: put,
+                size: 2 * BLOCK,
+                refs: vec![],
+                lease_epoch: epoch,
+                request_id: 0xD3,
+            },
+        )
+        .await
+        .expect("the scoped Put lands");
+    assert!(matches!(reply, publish::PublishReply::Unit), "{reply:?}");
+
+    let final_layout = owner_layout(&owner_be, ino).await;
+    let map = final_layout.block_map.expect("striped map");
+    assert_eq!(
+        map.get(&0).map(String::as_str),
+        Some("be://data/K_assembly"),
+        "a DEMOTED block's durable entry is the AUTHORITY's assembly — a \
+         holder's stale Put must never revert it (the s11-subblock C8/C2 \
+         mint)"
+    );
+    assert_eq!(
+        map.get(&1).map(String::as_str),
+        Some("be://data/K_holder_new"),
+        "the holder's NON-demoted custody still applies (the scoping law \
+         unchanged outside demoted regions)"
+    );
+
+    auth.listener.shutdown();
+    shutdown(&owner_be).await;
+    shutdown(&client_be).await;
+}

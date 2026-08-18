@@ -53,7 +53,7 @@ use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::builder::{BuilderConfig, ImageBuilder};
 use squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE;
 use squeezefs::meta_backend::RoutedMetaBackend;
-use squeezefs::meta_ship::{self as ship, OwnerMap, PeerOwner};
+use squeezefs::meta_ship::{self as ship, publish, OwnerMap, PeerOwner};
 use squeezefs::routing::DataRouter;
 use std::ffi::OsStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -94,6 +94,7 @@ impl Drop for Restore {
         data_grant::TEST_RANGE_CUSTODY_OVERRIDE.store(0, Ordering::Relaxed);
         data_grant::uninstall_custody_client();
         data_grant::uninstall_custody_owner();
+        publish::uninstall_client();
         ship::disarm_ownership();
         squeezefs::data_custody::test_reset_custody_generation();
         squeezefs::data_custody::test_clear_poison();
@@ -188,6 +189,16 @@ struct Authority {
 }
 
 fn start_authority(tag: &str) -> Authority {
+    start_authority_be(tag, None)
+}
+
+/// [`start_authority`] with a PUBLISH service over `be` — the fsync-
+/// bearing pins' shape (a co-writer's fsync ships its layout publishes;
+/// without the service the row dies on the loud no-client refusal).
+fn start_authority_be(
+    tag: &str,
+    be: Option<Arc<squeezefs::meta_backend::RoutedMetaBackend>>,
+) -> Authority {
     let ms = Arc::new(AtomicU64::new(1_000));
     let clock = LeaseClock::manual(Arc::clone(&ms));
     let clocks = LeaseClocks::with_params(
@@ -208,8 +219,22 @@ fn start_authority(tag: &str) -> Authority {
     // Deliberately NO geometry source: a foreign overlap parks on the
     // PLAIN conflict law ("no geometry, no barrier") — this suite pins
     // the ladder, not the demotion barrier's resolution.
+    if be.is_some() {
+        // The publish-bearing shape serves custody-scoped Puts, whose
+        // law is scoped-or-REFUSED (the zeros-interleave fix): arm the
+        // §9.2 geometry source (fixed 4 MiB blocks — the fs fixture's
+        // default block size).
+        owner.install_range_geometry(data_grant::fixed_range_geometry(
+            64 * 4 * 1024 * 1024,
+            4 * 1024 * 1024,
+        ));
+    }
     data_grant::install_custody_owner(Arc::clone(&owner));
-    let router = data_grant::AsyncVerbRouter::new().with_custody(owner);
+    let mut router = data_grant::AsyncVerbRouter::new().with_custody(owner);
+    if let Some(be) = be {
+        router = router.with_publish(publish::PublishService::new(be));
+    }
+    let router = router;
     let listener = squeezefs::cluster_wire::RpcListener::start_async(
         squeezefs::cluster_wire::RpcListenerConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -237,6 +262,10 @@ async fn arm_cowriter(auth: &Authority, h: &H) -> Arc<WriteCustodyClient> {
         .map(|v| (v, PeerOwner::new("ladder-authority", &auth.endpoint)))
         .collect();
     ship::arm_ownership(OwnerMap::for_volumes(&routed, foreign).expect("owner map"));
+    publish::install_client(publish::PublishClient::new(
+        "node-ladder-a",
+        SECRET.to_vec(),
+    ));
     let client = WriteCustodyClient::connect(&auth.endpoint, SECRET, "node-ladder-a")
         .await
         .expect("the co-writer joins the custody plane");
@@ -700,4 +729,80 @@ async fn the_divergence_refusal_is_the_retried_supersession_class() {
         squeezefs::fuse_client::writeback_error_is_terminal(&corrupt),
         "every OTHER corrupt-encoding refusal stays terminal"
     );
+}
+
+/// **A range writer fences on its OWN lease token** (§9.2's law verbatim,
+/// made real at width — rung-15 residual #2's composed pin, convicted
+/// live on the MPI-IO row: every new stripe grant advances the ino's max
+/// generation, so every in-flight writeback unit presenting its own
+/// older-but-LIVE grant token read as superseded — 1,841 stale-token
+/// retries against 20 MiB of progress, the convergence ladder livelocked
+/// by the acquire storm it was converging toward). The pin: two
+/// non-adjacent stripes (two grants, two tokens), one fsync — ZERO
+/// stale-token retries (each unit's own live token IS current custody);
+/// the remount/supersession refusal (a token that is neither current nor
+/// live) stays intact elsewhere. (The width-32 RACE itself — writes
+/// minting new stripes concurrently with in-flight writeback units — is
+/// the live leg's falsifier per the repro-port exception; this pin is
+/// the law's structural guard on the deterministic two-stripe shape.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_range_writers_own_live_token_never_reads_stale() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let _serial = serial();
+    let _restore = Restore;
+    let h = Arc::new(make(*b"ranged-ladder-06", "ranged-ladder-6").await);
+    let auth = start_authority_be(
+        "ladder-authority-6",
+        Some(h.fs.meta_backend.as_ref().unwrap().clone()),
+    );
+    for pad_name in ["pad-f.dat", "pad-g.dat", "pad-h.dat", "pad-i.dat"] {
+        let pad =
+            h.fs.create(h.req, 1, OsStr::new(pad_name), libc::S_IFREG | 0o644, 0)
+                .await
+                .unwrap();
+        h.fs.release(h.req, pad.attr.ino, pad.fh, 0, 0, false)
+            .await
+            .unwrap();
+    }
+    let (ino, fh) = create_striped_open(&h, "stripes.dat").await;
+    let _client = arm_cowriter(&auth, &h).await;
+
+    const BLK: u64 = 4 * 1024 * 1024;
+    let retries_before = METRICS
+        .writeback_stale_token_retries
+        .load(Ordering::Relaxed);
+    // Two NON-ADJACENT stripes: two grants, two tokens (the second mint
+    // advances the ino's max generation past the first unit's token).
+    for off in [0u64, 8 * BLK] {
+        let written =
+            h.fs.write(
+                h.req,
+                ino,
+                fh,
+                off,
+                bytes::Bytes::from(vec![0x44u8; BLK as usize]),
+                0,
+                0,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("stripe write at {off}: {e:?}"))
+            .written;
+        assert_eq!(written as u64, BLK);
+    }
+    h.fs.fsync(h.req, ino, fh, false)
+        .await
+        .unwrap_or_else(|e| panic!("fsync across two live grants: {e:?}"));
+    let retries = METRICS
+        .writeback_stale_token_retries
+        .load(Ordering::Relaxed)
+        - retries_before;
+    assert_eq!(
+        retries, 0,
+        "a unit presenting its OWN live grant token is CURRENT custody — \
+         {retries} stale-token retries mean the write path fences on the \
+         ino's max generation instead of §9.2's own-lease law (the MPI-IO \
+         row's livelock)"
+    );
+
+    auth.listener.shutdown();
 }

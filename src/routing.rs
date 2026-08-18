@@ -5795,9 +5795,21 @@ impl DataRouter {
             SqueezefsError::InvalidOperation("Metadata backend not initialized".to_string())
         })?;
 
-        // Fencing check
+        // Fencing check. Rung 18 (§9.2's own law, made real at width:
+        // "a range writer fences on its own lease token — no new token
+        // algebra"): under byte-range custody EVERY new stripe grant
+        // advances the ino's max generation, so a unit presenting an
+        // OLDER-but-STILL-LIVE grant token is CURRENT custody, not a
+        // superseded writer — without this arm the 32-rank block-cyclic
+        // acquire storm livelocks the convergence ladder (every in-flight
+        // writeback reads stale forever while new stripes keep minting:
+        // 1,841 stale-token retries against 20 MiB of progress on the
+        // live row). A token that is neither current NOR a live grant
+        // keeps the full refusal (the remount/supersession law verbatim).
         let current_fencing = self.inner.dlm.get_fencing_token_ino(ino);
-        if fencing_token < current_fencing {
+        if fencing_token < current_fencing
+            && !crate::meta_ship::tokens::range_token_live(ino, fencing_token)
+        {
             return Err(SqueezefsError::FencingTokenExpired {
                 token: fencing_token,
                 expected: current_fencing,

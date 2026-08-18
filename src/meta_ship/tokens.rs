@@ -337,6 +337,19 @@ pub fn range_token_covering(ino: u64, start: u64, end: u64) -> Option<u64> {
         .flatten()
 }
 
+/// Is `token` a STILL-LIVE cached range grant of `ino` (rung 18)? The
+/// §9.2 fencing law's probe — "a range writer fences on its own lease
+/// token": a writeback unit whose grant is alive is CURRENT custody even
+/// when a sibling stripe's newer grant moved the ino's max generation
+/// (the block-cyclic acquire storm otherwise livelocks the convergence
+/// ladder — every in-flight unit reads stale forever while new stripes
+/// keep minting).
+pub fn range_token_live(ino: u64, token: u64) -> bool {
+    RANGE_CACHE
+        .read_sync(&ino, |_, spans| spans.iter().any(|s| s.token == token))
+        .unwrap_or(false)
+}
+
 /// The HULL of this client's cached spans on `ino` — `(min start, max
 /// end)` over live grants, or `None`. The write path's desired-window
 /// seed: unioning the hull into desired is what makes the next ask

@@ -3771,15 +3771,11 @@ PYV
             die "s11-subblock: member m$idx is not healthy at leg end"
     done
     [ -z "$comp_bad" ] || die "s11-subblock CORRECTNESS RED: $comp_bad
-STANDING-RED ADJUDICATION (rung 18, 2026-08-18 — the G-RW2 pattern): the row's
-ENGAGEMENT + PRICE halves are green machinery; the fsck/C8 half stands red on
-ONE named residual — the authority's fs-level displaced-release/settle windows
-vs SERVED direct merges (three faces fixed and pinned this rung: the
-demoted-truth scope, the serve-window serialization, the served-layout RAM
-invalidation; the fourth — the fold's displaced-set/seed-incarnation vs the
-served free path, drift ≈ 2, one dangling take, leak-safe and oracle-detected —
-is rung 19's, named in .benchmarks/2026-08-18-s11-mpiio-row.md). A DIFFERENT
-failure shape here is a plain regression."
+The rung-18 standing-red (the fourth dangling-take face) RETIRED at rung 19:
+the authority's composed commits recompute their durable accounting from the
+composition itself (.benchmarks/2026-08-18-s11-widthn-refs-fix.md — this leg
+went GREEN x3 from zero on that fix). ANY drift here is a REGRESSION of the
+width-N refs/lineage composition, not a known residual."
     log "s11-subblock GREEN — the sub-block exception row priced (snapshots + fsck in $rowdir). Evidence tier: measured-simulated (one box, co-located members)"
 }
 
@@ -4039,15 +4035,16 @@ PYE
             die "s11-mpiio: member m$idx is not healthy at leg end"
     done
     [ -z "$comp_bad" ] || die "s11-mpiio CORRECTNESS RED: $comp_bad
-STANDING-RED ADJUDICATION (rung 18, 2026-08-18): a C8 drift here at fleet
-width is the CONCURRENT SAME-INO PUBLISH REFS-COMPOSITION residual — caller-
-computed block-ref deltas are not atomic with the chain-composed map under
-concurrent same-ino publishers (the conveyor/chain plane; the shape is a
-swapped pair per race: one durable-without-map take + one map-without-durable
-entry, oracle-detected, leak-safe, bytes unaffected — the read-back gates are
-the byte truth). Rung 19 owns it; .benchmarks/2026-08-18-s11-mpiio-row.md
-carries the mechanism ledger. A DIFFERENT failure shape here is a plain
-regression."
+The rung-18 standing-red (the width-N same-ino publish refs composition)
+RETIRED at rung 19: the authority computes displaced/inserted INSIDE the
+chained merge / scoped Put, node compaction preserves the version lineage a
+live link claims, and the accounting owner is the GLOBAL ino
+(.benchmarks/2026-08-18-s11-widthn-refs-fix.md). ANY C8 drift here is a
+REGRESSION of that composition — with ONE named exception: a shared file
+whose composed map exceeds the inline cap (~6 GiB at 4 MiB blocks) spills
+indirect, and concurrent publishes onto the indirect head REFUSE loud
+(retried-class fsync EIO, never drift) until the blob-aware composition
+lands (rung 20 residual #1)."
     log "s11-mpiio GREEN${provisional:+ [$provisional]} — the MPI-IO acceptance row (outputs + snapshots + fsck in $rowdir). Evidence tier: measured-simulated (one box, co-located members)"
 }
 
@@ -4171,15 +4168,16 @@ PYBC
         [ "$admitted" = "1" ] || die "s11-blockcyclic: co-writer m$idx could not re-admit"
     done
     [ -z "$comp_bad" ] || die "s11-blockcyclic CORRECTNESS RED: $comp_bad
-STANDING-RED ADJUDICATION (rung 18, 2026-08-18): a C8 drift here at fleet
-width is the CONCURRENT SAME-INO PUBLISH REFS-COMPOSITION residual — caller-
-computed block-ref deltas are not atomic with the chain-composed map under
-concurrent same-ino publishers (the conveyor/chain plane; the shape is a
-swapped pair per race: one durable-without-map take + one map-without-durable
-entry, oracle-detected, leak-safe, bytes unaffected — the read-back gates are
-the byte truth). Rung 19 owns it; .benchmarks/2026-08-18-s11-mpiio-row.md
-carries the mechanism ledger. A DIFFERENT failure shape here is a plain
-regression."
+The rung-18 standing-red (the width-N same-ino publish refs composition)
+RETIRED at rung 19: the authority computes displaced/inserted INSIDE the
+chained merge / scoped Put, node compaction preserves the version lineage a
+live link claims, and the accounting owner is the GLOBAL ino
+(.benchmarks/2026-08-18-s11-widthn-refs-fix.md). ANY C8 drift here is a
+REGRESSION of that composition — with ONE named exception: a shared file
+whose composed map exceeds the inline cap (~6 GiB at 4 MiB blocks) spills
+indirect, and concurrent publishes onto the indirect head REFUSE loud
+(retried-class fsync EIO, never drift) until the blob-aware composition
+lands (rung 20 residual #1)."
     log "s11-blockcyclic GREEN — the Issue-19 shape adjudicated live (outputs in $rowdir). Evidence tier: measured-simulated (one box, co-located members)"
 }
 

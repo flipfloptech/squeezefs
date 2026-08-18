@@ -2330,3 +2330,101 @@ async fn a_scoped_put_never_reverts_a_demoted_blocks_assembly() {
     shutdown(&owner_be).await;
     shutdown(&client_be).await;
 }
+
+/// Contract (the dangling-take mint's SECOND face, same live row): a
+/// served scoped Put reads the durable head, composes, and commits under
+/// the per-ino serve stripe — but the AUTHORITY's OWN layout publishes
+/// of a range-granted ino (the assembler's fold, its writeback) ran
+/// OUTSIDE it, so a fold's merge landing inside a Put's read→commit
+/// window was erased by the Put's composed full map: the fold's
+/// freshly-taken key lost its map reference while its take stood (fsck
+/// [C8] '1 durable vs 0 layout references [ino 2 idx 0]' + [C2] leak on
+/// the re-run). The law, structurally: a LOCAL layout publish of a
+/// RANGE-GRANTED ino serializes under the SAME serve stripe (and a
+/// custody-free ino pays nothing — the guard is None).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_publish_of_a_range_granted_ino_parks_on_the_serve_window() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let (owner_be, _p) = sandbox(dir.path(), "own-window", true).await;
+    let auth = start_authority(Arc::clone(&owner_be), "assembler-authority");
+
+    // A range-granted ino on the authority's own table (the arbiter's
+    // LOCK_MAP is process-global — the owner's grant IS the state). Both
+    // inos are REAL records (the local publish path reads the inode).
+    let ino = publish::create_with_rdev_size(&owner_be, 1, "window.bin", libc::S_IFREG | 0o644, 0, 0, 0, 0)
+        .await
+        .expect("local create")
+        .ino;
+    let free_ino = publish::create_with_rdev_size(&owner_be, 1, "solo.bin", libc::S_IFREG | 0o644, 0, 0, 0, 0)
+        .await
+        .expect("local create")
+        .ino;
+    let lease = auth
+        .owner
+        .join(&data_grant::JoinFrame {
+            schema: data_grant::CUSTODY_SCHEMA,
+            client: "node-window-a".to_string(),
+            pr_key: 0,
+            prior_epoch: None,
+        })
+        .expect("holder joins");
+    let _grant = auth
+        .owner
+        .grant_ranged(
+            &data_grant::AcquireFrame {
+                schema: data_grant::CUSTODY_SCHEMA,
+                client: "node-window-a".to_string(),
+                lease_epoch: lease.epoch,
+                ino,
+                span: Some((0, BLOCK)),
+                concurrent_write: false,
+                wait_ms: 1_000,
+                desired: Some((0, BLOCK)),
+            },
+            (0, BLOCK),
+        )
+        .await
+        .expect("the range grant");
+
+    // Hold the serve window open (the scoped Put's read→commit span),
+    // then drive the authority's own LOCAL publish: it must PARK until
+    // the window closes — never land inside it.
+    let window = publish::test_lock_serve_ino(ino).await;
+    let be = Arc::clone(&owner_be);
+    let base = base_layout_bytes(BLOCK, &[(0, "be://data/K_fold")]);
+    let publish_task = tokio::spawn(async move {
+        publish::set_layout_and_size(&be, ino, &base, BLOCK, &[]).await
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !publish_task.is_finished(),
+        "a LOCAL layout publish of a RANGE-GRANTED ino landed INSIDE a held \
+         serve window — the fold-vs-scoped-Put erasure race is open (the \
+         s11-subblock dangling-take mint)"
+    );
+    drop(window);
+    publish_task
+        .await
+        .expect("publish task")
+        .expect("the parked publish lands after the window closes");
+
+    // The custody-free control: no grant, no guard — a local publish of
+    // an un-granted ino never pays the stripe (KD-MW-12's shape).
+    let window2 = publish::test_lock_serve_ino(free_ino).await;
+    let be2 = Arc::clone(&owner_be);
+    let base2 = base_layout_bytes(BLOCK, &[(0, "be://data/K_solo")]);
+    let free_task = tokio::spawn(async move {
+        publish::set_layout_and_size(&be2, free_ino, &base2, BLOCK, &[]).await
+    });
+    tokio::time::timeout(Duration::from_secs(5), free_task)
+        .await
+        .expect("a custody-free ino's local publish never parks on the serve stripe")
+        .expect("publish task")
+        .expect("publish ok");
+    drop(window2);
+
+    auth.listener.shutdown();
+    shutdown(&owner_be).await;
+}

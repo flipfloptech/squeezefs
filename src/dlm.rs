@@ -616,6 +616,17 @@ pub fn demoted_regions(ino: u64) -> Vec<(u64, u64)> {
         .unwrap_or_default()
 }
 
+/// Does `ino` carry any LIVE byte-range grant (rung 18)? The local-
+/// publish serve-window guard's predicate: an authority's OWN layout
+/// publish of a range-granted ino must serialize with the served scoped
+/// Puts (whose read→compose→commit spans the serve stripe) — one map
+/// probe, `false` on every file without range custody.
+pub fn ino_has_range_custody(ino: u64) -> bool {
+    LOCK_MAP
+        .read_sync(&ObjectKey::Ino(ino), |_, custody| custody.ranges_len() > 0)
+        .unwrap_or(false)
+}
+
 /// The §9.3 loser-law tripwire: a version-gate-fenced direct publish
 /// observed on an ino with demoted custody (`≈ 0` — the crash-window
 /// path; the loser re-ships its own bytes as extents, never

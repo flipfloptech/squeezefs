@@ -1065,6 +1065,36 @@ static SERVE_INO_LOCKS: Lazy<
     crate::stripe_locks::StripeLocks<crate::sqz_sync::SqzMutex<()>, 1024>,
 > = Lazy::new(crate::stripe_locks::StripeLocks::new);
 
+/// Rung 18 — the LOCAL half of the serve-window law (the s11-subblock
+/// C8/C2 dangling-take mint's second face): a served scoped Put reads
+/// the durable head, composes, and commits under `SERVE_INO_LOCKS`; the
+/// AUTHORITY's OWN layout publishes of a RANGE-GRANTED ino (the
+/// assembler's fold, its writeback) ran outside it, so a fold's merge
+/// landing inside a Put's read→commit window was erased by the Put's
+/// full map — the fold's freshly-taken key lost its reference while its
+/// take stood. A local publish of a range-granted ino therefore takes
+/// the SAME stripe (one relaxed probe + one map read on every solo
+/// mount: `custody_owner()` is None). The serve wrapper deliberately
+/// exempts the EXTENT verbs so their executors' folds can take this
+/// guard at the funnel without self-deadlocking.
+async fn local_publish_guard(
+    ino: Ino,
+) -> Option<crate::sqz_sync::SqzMutexGuard<'static, ()>> {
+    if crate::data_grant::custody_owner().is_some() && crate::dlm::ino_has_range_custody(ino) {
+        Some(SERVE_INO_LOCKS.get_inode_lock(ino).lock().await)
+    } else {
+        None
+    }
+}
+
+/// Test seam (the structural pin's venue): the serve stripe for `ino`,
+/// so a suite can hold the serve window open and prove a local publish
+/// of a range-granted ino PARKS on it.
+#[doc(hidden)]
+pub async fn test_lock_serve_ino(ino: Ino) -> crate::sqz_sync::SqzMutexGuard<'static, ()> {
+    SERVE_INO_LOCKS.get_inode_lock(ino).lock().await
+}
+
 /// Install the process's publish client (the multi-writer mount arm's act).
 pub fn install_client(client: Arc<PublishClient>) {
     CLIENT.store(Some(client));
@@ -1228,6 +1258,7 @@ pub async fn set_layout_and_size(
     match owner_of(be, ino) {
         None => {
             note_local();
+            let _serve_window = local_publish_guard(ino).await;
             be.set_layout_and_size(ino, layout, size, refs).await
         }
         Some(peer) => {
@@ -1276,6 +1307,7 @@ pub async fn merge_layout_and_size(
             let granted = crate::data_grant::custody_owner()
                 .map(|o| o.ino_granted(ino))
                 .unwrap_or(false);
+            let _serve_window = local_publish_guard(ino).await;
             if granted {
                 be.merge_layout_and_size_chained(ino, delta, full_layout, size, refs)
                     .await
@@ -2248,9 +2280,20 @@ impl PublishService {
                 match crate::meta_exec::spawn_meta_join("meta_ship_publish_verb", async move {
                     // Rung 17: per-ino serialization across the whole
                     // serve (the scoped Put's read + commit — see
-                    // `SERVE_INO_LOCKS`).
+                    // `SERVE_INO_LOCKS`). Rung 18: the EXTENT verbs are
+                    // exempt HERE — their executors run the fs's own
+                    // write path, whose local layout publishes now take
+                    // this very stripe at the funnel
+                    // (`local_publish_guard`), so holding it across the
+                    // executor would self-deadlock the FlushExtents fold;
+                    // extent merges carry their own per-block stripe
+                    // discipline.
                     let ino = call.named_inos().first().copied().unwrap_or(0);
-                    let _ino_guard = SERVE_INO_LOCKS.get_inode_lock(ino).lock().await;
+                    let _ino_guard = if call.is_extent() {
+                        None
+                    } else {
+                        Some(SERVE_INO_LOCKS.get_inode_lock(ino).lock().await)
+                    };
                     me.execute(&client, call).await
                 })
                 .await

@@ -59,6 +59,17 @@ struct H {
 
 async fn make(uuid: [u8; 16], alloc_ns: &str) -> H {
     std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", "65536");
+    // Park the checkpoint timer (the registry's own idiom — the day-long
+    // ceiling exists for this): the 50 ms cadence tick barriers land in
+    // the SAME `meta_device_syncs` funnel the ordering leg asserts on
+    // (fuse_client.rs's funnel table), so a background tick firing inside
+    // the fault window read as "the metadata barrier ran despite a failed
+    // data barrier" — the 2026-08-18 consolidation gate's catch, convicted
+    // deterministically (bare 0/3 vs pinned 5/5; the fsync path itself
+    // never barriers meta after a failed data barrier). With the timer
+    // parked the assertion keeps FULL teeth: any growth in the window is
+    // the fsync path's own.
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "3600000");
     // Partial-coverage overwrites must ride the staging/flush machinery
     // this suite pins, not the W1 in-place patch (at production block
     // sizes a 1 MiB write into a 4 MiB block is patch-oversize anyway).

@@ -149,6 +149,30 @@ Secure Boot boxes additionally need the one-time
 `mokutil --import /var/lib/dkms/mok.pub` + reboot enrollment or the
 built modules will refuse to load.
 
+## 3c. Lustre-build preflights (field-verified 2026-08-18)
+
+* **`.config` in the devel tree**: DKMS/kbuild external builds need only
+  `include/config/auto.conf` + `Module.symvers` (DOCA builds fine), but
+  Lustre's configure demands the literal
+  `/lib/modules/<sqz>/build/.config`, which the sqz kernel-devel tree
+  does not ship — configure dies "Kernel config could not be found".
+  Fix: `cp /boot/config-<sqz-kver> .../build/.config`, or
+  `modprobe configs && zcat /proc/config.gz > .../build/.config`. No
+  `make` needed after (the prepare artifacts already exist).
+  *Residual for the kernel-sqz tree: the devel RPM should ship
+  `.config` so this preflight dies.*
+* **Configure line** (from the gcc-toolset-14 shell): `./configure
+  --disable-server --with-linux=/lib/modules/<sqz-kver>/build` plus
+  `--with-o2ib=/usr/src/ofa_kernel/default` ONLY on o2ib (IB/RoCE
+  verbs) LNet sites — that path is the DOCA `mlnx-ofa_kernel` headers,
+  the reason MOFED core must build first there. tcp-LNet sites omit it
+  and MOFED leaves Lustre's build path entirely.
+* **Version law**: master (or newest 2.17.x) only — the tested ceiling
+  is 6.12-class kernels; 2.15/2.16 will not approach a 6.19 build.
+  Compile-time kernel-API breaks past configure are the REAL Path-C
+  verdict for the Lustre half; if they pile up, fall back to Path A/B
+  rather than maintaining a per-rebase port.
+
 ## 4. The probe checklist that picks the path (run these first, ~10 min)
 
 On each storage node:

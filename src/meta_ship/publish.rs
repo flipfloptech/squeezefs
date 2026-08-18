@@ -502,6 +502,38 @@ impl PublishCall {
         matches!(self, Self::WriteExtent { .. } | Self::FlushExtents { .. })
     }
 
+    /// May a TRANSPORT-failed ship of this call reconnect and RESEND the
+    /// same frame (rung 18, residual (d) — the idle-reap conviction: the
+    /// cluster wire's 60 s idle-session reaper closed a co-writer's
+    /// publish session between rows and the next lane raise refused
+    /// instead of reconnecting, surfacing as EINVAL on a healthy fleet)?
+    ///
+    /// Resend-safe classes, each with its own exactly-once argument:
+    /// * the **witnessed** class — the owner's `(lease_epoch,
+    ///   request_id)` window absorbs a duplicate (design §6a law 2);
+    /// * **`FreeBlocks`** — the RETRIED class by rung 9's law (its own
+    ///   dedup window + per-block verdicts);
+    /// * **`RaiseAllocLane` / `HarvestLaneFree`** — MONOTONE: the
+    ///   frontier only rises and a harvest re-serves from the authority's
+    ///   own free list, so a duplicate re-answers the standing state;
+    /// * the **pure reads** (`XattrValueCap` / `ReaddirStream`) — they
+    ///   mutate nothing.
+    ///
+    /// Everything else (the un-witnessed mutators: create/destroy/times)
+    /// keeps ONE attempt — a resend after a lost reply is a second act no
+    /// window can correlate (a resent create mints a second name).
+    fn transport_resend_safe(&self) -> bool {
+        self.witness().is_some()
+            || matches!(
+                self,
+                Self::FreeBlocks { .. }
+                    | Self::RaiseAllocLane { .. }
+                    | Self::HarvestLaneFree { .. }
+                    | Self::XattrValueCap { .. }
+                    | Self::ReaddirStream { .. }
+            )
+    }
+
     /// The layout-publish class's exactly-once witness key
     /// `(lease_epoch, request_id)`, `None` for every un-witnessed verb.
     /// Rung 17: the extent class rides the SAME window (its replies are
@@ -912,6 +944,7 @@ impl PublishClient {
     pub async fn ship(&self, endpoint: &str, call: PublishCall) -> Result<PublishReply> {
         let name = call.name();
         let presented = call.presented_epoch();
+        let resend_safe = call.transport_resend_safe();
         let body = encode(
             &PublishRequestFrame {
                 schema: PUBLISH_SCHEMA,
@@ -922,27 +955,62 @@ impl PublishClient {
         )?;
         let lane = self.lane(endpoint);
         let mut guard = lane.lock().await;
-        if guard.is_none() {
-            *guard = Some(RpcClient::connect(endpoint, &self.secret, &self.peer_id, None).await?);
-        }
-        // Rung 9 (S8-a attribution): a publish-vocabulary ship pays the
-        // same authenticated round trip as an S8 trait verb, so it records
-        // the SAME `meta_ship_phase_ns.rtt` phase — the published serial
-        // A/B's rtt column covers the whole shipped stream, not just the
-        // trait half.
-        let t_rtt = std::time::Instant::now();
-        let out = guard
-            .as_mut()
-            .expect("connected above")
-            .call(VERB_PUBLISH_CALL, body)
-            .await;
-        super::phase_record(super::ShipPhase::Rtt, t_rtt);
-        let reply = match out {
-            Ok(reply) => reply,
-            Err(e) => {
-                *guard = None;
-                return Err(e);
+        // Rung 18 (residual d — the idle-reap conviction): a TRANSPORT
+        // failure on a resend-safe call reconnects and resends the SAME
+        // frame once (the S8 batch precedent; classification is
+        // STRUCTURAL — a refusal comes back as Ok(reply) with a status,
+        // so a call error is always the dead-session class). The live
+        // fleet's 60 s idle-session reaper makes a dead first session the
+        // NORMAL state of any verb that follows a quiet spell.
+        let attempts = if resend_safe { 2 } else { 1 };
+        let mut reply = None;
+        let mut last_err = None;
+        for attempt in 0..attempts {
+            if guard.is_none() {
+                match RpcClient::connect(endpoint, &self.secret, &self.peer_id, None).await {
+                    Ok(c) => *guard = Some(c),
+                    Err(e) => {
+                        last_err = Some(e);
+                        continue;
+                    }
+                }
             }
+            // Rung 9 (S8-a attribution): a publish-vocabulary ship pays the
+            // same authenticated round trip as an S8 trait verb, so it records
+            // the SAME `meta_ship_phase_ns.rtt` phase — the published serial
+            // A/B's rtt column covers the whole shipped stream, not just the
+            // trait half.
+            let t_rtt = std::time::Instant::now();
+            let out = guard
+                .as_mut()
+                .expect("connected above")
+                .call(VERB_PUBLISH_CALL, body.clone())
+                .await;
+            super::phase_record(super::ShipPhase::Rtt, t_rtt);
+            match out {
+                Ok(r) => {
+                    reply = Some(r);
+                    break;
+                }
+                Err(e) => {
+                    *guard = None;
+                    if attempt + 1 < attempts {
+                        log::warn!(
+                            "S9: publish {name} to {endpoint} failed ({e}) — reconnecting and \
+                             resending the same frame (resend-safe class: witnessed / monotone \
+                             / read; the idle-session reaper makes a dead first session normal)"
+                        );
+                    }
+                    last_err = Some(e);
+                }
+            }
+        }
+        let Some(reply) = reply else {
+            return Err(last_err.unwrap_or_else(|| {
+                SqueezefsError::InvalidOperation(format!(
+                    "S9: no session to {endpoint} and no error to report for {name}"
+                ))
+            }));
         };
         drop(guard);
         SHIPPED.fetch_add(1, Ordering::Relaxed);

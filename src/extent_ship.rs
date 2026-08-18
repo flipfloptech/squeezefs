@@ -331,6 +331,34 @@ pub async fn ship_extent(
     if data.is_empty() {
         return Ok(());
     }
+    // Rung 18 (the s11-subblock live EINVAL): a BUFFERED writer's records
+    // coalesce in the page cache and legally arrive as one
+    // max_write-sized (1 MiB) FUSE WRITE — whose single-frame ship the
+    // cluster wire's CONTROL cap refuses. An over-cap payload CHUNKS into
+    // byte-adjacent sub-extents, each its own witnessed frame with its
+    // own retention record (retention granularity == wire granularity, so
+    // every coverage-release path — ack, watermark, flush, spill — keeps
+    // its meaning). The margin leaves room for the frame envelope
+    // (measured 57 B; 4 KiB keeps it alignment-friendly and future-proof).
+    let cap =
+        (crate::cluster_wire::CONTROL_MAX_FRAME_BYTES as usize).saturating_sub(4096).max(4096);
+    if data.len() > cap {
+        let mut off = 0usize;
+        while off < data.len() {
+            let end = (off + cap).min(data.len());
+            Box::pin(ship_extent(
+                be,
+                ino,
+                block_index,
+                offset_in_block + off as u32,
+                data.slice(off..end),
+                token,
+            ))
+            .await?;
+            off = end;
+        }
+        return Ok(());
+    }
     let request_id = crate::cowriter::next_ship_request_id();
     // The read-overlay key: the mount's live block geometry (one relaxed
     // load; extents are minted against the same geometry the write path

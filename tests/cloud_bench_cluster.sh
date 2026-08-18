@@ -13,20 +13,25 @@
 #     ($SSH_KEY_FILE) readable by you.
 #   * Spot vCPU quota for the preset ("All Standard (A, C, D, H, I, M, R, T,
 #     Z) Spot Instance Requests"): i4i preset needs 96 vCPUs, i3en preset
-#     needs 288 vCPUs.
+#     needs 288 vCPUs, mw preset needs 32 vCPUs.
 #   * Pre-built artifacts in $ARTIFACT_DIR (this script DEPLOYS, it does not
 #     build): `squeezefs` (linux-gnu, glibc ≤ the AMI's — use the
-#     `task build:ubuntu2404` dist output), optionally `libsqueezefs_il.so`,
-#     and a DYNAMIC `elbencho` binary (the pinned static one cannot load the
-#     il shim; dynamic is the house rule for any instrument that may run il).
+#     `task build:ubuntu2404` dist output; the mw preset rides the Ubuntu
+#     26.04 AMI and wants `task build:ubuntu2604`), optionally
+#     `libsqueezefs_il.so`, and a DYNAMIC `elbencho` binary (the pinned
+#     static one cannot load the il shim; dynamic is the house rule for any
+#     instrument that may run il). The mw preset's instrument is the pinned
+#     ior the s11-mpiio leg builds ON the client — elbencho is optional there.
 #
 # Cost table (spot prices move; these are planning numbers, and the
 # max-spend guard below is the real protection):
 #
-#   preset  instance        x6 cluster  instance store/node        est. spot $/hr
-#   ------  --------------  ----------  -------------------------  --------------
-#   i4i     i4i.4xlarge     96 vCPU     1 x 3,750 GB Nitro NVMe    ~$3-4/hr   (the IOPS venue)
-#   i3en    i3en.12xlarge   288 vCPU    4 x 7,500 GB NVMe          ~$10-14/hr (the throughput venue)
+#   preset  instance        cluster            instance store/node        est. spot $/hr
+#   ------  --------------  -----------------  -------------------------  --------------
+#   i4i     i4i.4xlarge     x6 (96 vCPU)       1 x 3,750 GB Nitro NVMe    ~$3-4/hr   (the IOPS venue)
+#   i3en    i3en.12xlarge   x6 (288 vCPU)      4 x 7,500 GB NVMe          ~$10-14/hr (the throughput venue)
+#   mw      i4i.2xlarge     x4 (32 vCPU)       1 x 1,875 GB Nitro NVMe    ~$0.5-0.8/hr (the MW MPI-IO venue;
+#                                                                          campaign ~2-3 h => ~$1.5-3 total)
 #
 # NO burst-class (t2/t3/t3a/t4g) instances, ever: CPU-credit throttling makes
 # a median a function of the credit balance (not the code under test), their
@@ -45,6 +50,18 @@
 #   tests/cloud_bench_cluster.sh assemble
 #   tests/cloud_bench_cluster.sh bench       # results -> .benchmarks/cloud/<ts>/
 #   tests/cloud_bench_cluster.sh status
+#   tests/cloud_bench_cluster.sh teardown
+#
+# The MULTI-WRITER MPI-IO arm (the cheapest adequate venue for the
+# shared-vs-disjoint s11-mpiio ior row over a REAL nvme-tcp network — see
+# docs/field-mpiio-runbook.md §Cloud venue). Pass PRESET=mw (or --preset mw)
+# on EVERY subcommand: the preset selects the role shape, the AMI and the
+# artifact defaults, and only the node list persists in cluster state:
+#
+#   MAX_CLUSTER_HOURS=3 PRESET=mw tests/cloud_bench_cluster.sh launch
+#   PRESET=mw tests/cloud_bench_cluster.sh deploy       # needs dist/ubuntu2604
+#   PRESET=mw tests/cloud_bench_cluster.sh assemble-mw
+#   PRESET=mw tests/cloud_bench_cluster.sh bench-mw     # rows -> .benchmarks/cloud/<ts>/
 #   tests/cloud_bench_cluster.sh teardown
 #
 # Every subcommand takes --dry-run (prints the aws/ssh commands, executes
@@ -71,22 +88,30 @@ AWS_AZ="${AWS_AZ:-us-east-1a}"
 # --- Instance preset ------------------------------------------------------
 # i4i    = i4i.4xlarge  x N  (~$3-4/hr cluster on spot)   — the IOPS venue
 # i3en   = i3en.12xlarge x N (~$10-14/hr cluster on spot) — the throughput venue
+# mw     = i4i.2xlarge  x 4  (~$0.5-0.8/hr cluster on spot) — the CHEAPEST
+#          adequate venue for the multi-writer s11-mpiio MPI-IO row
+#          (assemble-mw / bench-mw); Ubuntu 26.04 AMI + dist/ubuntu2604
+#          artifacts by default (the MW kernel floors — see AMI below)
 # custom = use INSTANCE_TYPE below verbatim (still burst-class-refused)
 PRESET="${PRESET:-i4i}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-}"          # only read when PRESET=custom
 
-# --- Node roles (default 2 mds + 2 oss + 1 client + 1 spare = 6 nodes) -----
-# The spare is a job worker / second load generator (`squeezefs job worker`,
-# extra elbencho client); the battery itself drives from client0.
-N_MDS="${N_MDS:-2}"
-N_OSS="${N_OSS:-2}"
-N_CLIENT="${N_CLIENT:-1}"
-N_SPARE="${N_SPARE:-1}"
+# --- Node roles --------------------------------------------------------------
+# Defaults are PRESET-dependent (resolved after preset selection below; an
+# explicit env value always wins): i4i/i3en/custom = 2 mds + 2 oss +
+# 1 client + 1 spare = 6 nodes (the spare is a job worker / second load
+# generator; the battery drives from client0); mw = 1 mds + 2 oss +
+# 1 client = 4 nodes, NO spare (cheapness is the ruling — the MPI-IO row's
+# whole fleet is CO-LOCATED on client0 and needs no second load generator).
+N_MDS="${N_MDS:-}"
+N_OSS="${N_OSS:-}"
+N_CLIENT="${N_CLIENT:-}"
+N_SPARE="${N_SPARE:-}"
 
 # --- SSH ---------------------------------------------------------------
 KEY_NAME="${KEY_NAME:-squeezefs-bench}"          # EC2 key pair name (must exist in region)
 SSH_KEY_FILE="${SSH_KEY_FILE:-$HOME/.ssh/squeezefs-bench.pem}"
-REMOTE_USER="${REMOTE_USER:-ubuntu}"             # matches the Ubuntu 24.04 AMI below
+REMOTE_USER="${REMOTE_USER:-ubuntu}"             # matches the Ubuntu AMIs below (24.04/26.04)
 OPERATOR_CIDR="${OPERATOR_CIDR:-}"               # empty = auto-detect via checkip.amazonaws.com
 
 # --- Max-spend guard (REQUIRED for launch/full) -----------------------------
@@ -94,15 +119,65 @@ OPERATOR_CIDR="${OPERATOR_CIDR:-}"               # empty = auto-detect via check
 # teardown-at-deadline process as the safety net.
 MAX_CLUSTER_HOURS="${MAX_CLUSTER_HOURS:-}"
 
-# --- Artifacts to deploy (built elsewhere — task build:ubuntu2404) ----------
-ARTIFACT_DIR="${ARTIFACT_DIR:-dist/ubuntu2404}"
-ELBENCHO_BIN="${ELBENCHO_BIN:-$ARTIFACT_DIR/elbencho}"   # DYNAMIC build (house rule)
+# --- AMI (SSM parameter path; default is PRESET-dependent) -------------------
+# i4i/i3en/custom ride Ubuntu 24.04 (unchanged). mw needs TWO kernel floors
+# the 24.04 GA kernel lacks — client FUSE-over-io_uring
+# (/sys/module/fuse/parameters/enable_uring, mainline v6.14+) and
+# storage-node nvmet Persistent Reservations (resv_enable, v6.13+; the S9
+# multi-writer arm refuses non-PR substrates) — so it defaults to Ubuntu
+# 26.04 LTS. The floor is NEVER trusted from the AMI: assemble-mw probes
+# both and refuses loud with the remedy.
+AMI_SSM_PARAM="${AMI_SSM_PARAM:-}"
+
+# --- Artifacts to deploy (built elsewhere; this script never builds) ---------
+# Default is PRESET-dependent: dist/ubuntu2404 (task build:ubuntu2404) for
+# i4i/i3en/custom, dist/ubuntu2604 (task build:ubuntu2604) for mw — the
+# artifact's glibc must match the AMI.
+ARTIFACT_DIR="${ARTIFACT_DIR:-}"
+ELBENCHO_BIN="${ELBENCHO_BIN:-}"   # DYNAMIC build (house rule); default
+                                   # $ARTIFACT_DIR/elbencho once resolved
 
 # --- Filesystem shape (mirrors tests/cluster_reset.sh) ----------------------
 NQN_PREFIX="nqn.2026-07.io.squeezefs"
 MOUNTPOINT="/scratch/mnt"
 CACHE_DIR="/scratch/cache"
 MOUNT_EXTRA="--interception --allow-other --log-file /tmp/sqz.log"
+
+# --- Multi-writer fleet shape (PRESET=mw: assemble-mw / bench-mw) ------------
+# CO-LOCATED (docs/operations.md §Multi-writer co-writer mounts): the
+# authority and every co-writer mount on client0 and share the box's default
+# NVMe host identity — the proven tests/cluster_reset_v5_mw.sh field recipe.
+MW_COWRITERS="${MW_COWRITERS:-2}"   # co-writer mounts at $MOUNTPOINT-cw1..K.
+                                    # 2 = the s11-mpiio leg's floor, sized for
+                                    # the cheap 8-vCPU client (1 authority +
+                                    # 2 co-writer daemons + 2x4 ior ranks);
+                                    # the field/design shape is 8 — raise it
+                                    # together with the client instance size.
+MW_PORT="${MW_PORT:-45999}"         # authority custody/publish bind — STABLE
+                                    # (the mw_fleet rung-10 finding: `auto`
+                                    # mints a fresh ephemeral port per
+                                    # incarnation, so a remounted authority
+                                    # would be undialable by the recorded
+                                    # endpoint forever)
+MW_MEMBERSHIP_BIND="${MW_MEMBERSHIP_BIND:-auto}"  # the S9 arm's rung 4
+                                                  # requires the membership
+                                                  # plane armed
+MW_RANGE_CUSTODY="${MW_RANGE_CUSTODY:-1}"  # on every co-writer — the
+                                           # s11-mpiio row REQUIRES it (the
+                                           # product default stays OFF; the
+                                           # leg's engagement gate convicts
+                                           # an unarmed fleet at probe time)
+MW_FLEET_SHARE="${MW_FLEET_SHARE:-}"       # SQUEEZEFS_FLEET_SHARE per daemon;
+                                           # EMPTY = derived 1+MW_COWRITERS
+                                           # (KD-MW-14: N co-located daemons
+                                           # divide the machine)
+MW_IOR_PROCS="${MW_IOR_PROCS:-4}"          # ior procs per co-writer mount
+                                           # (the leg's --procs, 1..16)
+MW_MOUNT_EXTRA="--allow-other"             # NO --interception on MW mounts
+                                           # (the proven mw_fleet/v5-mw
+                                           # recipe — the MPI-IO row drives
+                                           # the kernel FUSE path); per-mount
+                                           # --log-file is appended per daemon
 
 # --- Benchmark battery knobs ------------------------------------------------
 BENCH_THREADS=16          # thread count for 1m + seq rows
@@ -137,14 +212,25 @@ subcommands:
   assemble   share instance-store NVMe from storage nodes (squeezefs nvmeof
              share, nvmet), connect from the client (single-path — one NIC),
              format, mount, build_commit verification
+  assemble-mw  (PRESET=mw) the same fabric steps as assemble, DIVERGING at
+             the mount into the tests/cluster_reset_v5_mw.sh multi-writer
+             fleet recipe: 1 authority + $MW_COWRITERS co-writers co-located
+             on client0 (rung-3 enrollment harvest, roster re-arm, posture
+             gates), nvmet PR assert per storage node + nvme resv-report per
+             data namespace, both MW kernel floors probed loud
   bench      run the standing elbencho battery; results land in
              .benchmarks/cloud/<timestamp>/ with full row labeling
+  bench-mw   (PRESET=mw) run the s11-mpiio shared-vs-disjoint MPI-IO ior row
+             (tests/run_mw_matrix.sh external-mounts mode) over the MW fleet;
+             rows -> .benchmarks/cloud/<timestamp>/ (cloud rows are a THIRD
+             substrate class — never spliced into devsub medians)
   status     instance table, elapsed cluster-hours vs the max-spend guard,
              estimated spend
   teardown   terminate instances, delete SG/launch template/placement group,
              cancel the deadline guard, tag-scoped final sweep (fails loudly
              on any still-billing resource). Idempotent.
   full       launch -> deploy -> assemble -> bench -> teardown
+             (PRESET=mw: launch -> deploy -> assemble-mw -> bench-mw -> teardown)
 
 flags:
   --dry-run          print every aws/ssh command instead of executing (no
@@ -153,10 +239,14 @@ flags:
                      guard and the failure trap)
   --cluster-id ID    operate on a specific cluster (default: the one recorded
                      in .cloud-bench/current)
-  --preset P         i4i | i3en | custom (overrides $PRESET)
+  --preset P         i4i | i3en | mw | custom (overrides $PRESET)
 
 The max-spend guard: launch/full refuse unless MAX_CLUSTER_HOURS is a
 positive integer. See the header quickstart for the cost table.
+
+Pass PRESET (env or --preset) on EVERY subcommand of an mw cluster — the
+preset selects the role shape, the AMI and the artifact defaults; only the
+node list persists in cluster state.
 EOF
 }
 
@@ -196,12 +286,50 @@ case "$PRESET" in
     INSTANCE_TYPE="i3en.12xlarge"
     EST_CLUSTER_HOURLY="~\$10-14/hr (spot, 6 nodes)"
     ;;
+  mw)
+    # ONE launch template + ONE spot fleet covers every node (the existing
+    # launch structure), so the mw preset is UNIFORM i4i.2xlarge rather than
+    # per-role client/storage types — a per-role split (i4i.xlarge storage +
+    # i4i.2xlarge client) would need a second template + fleet and complicate
+    # the teardown/guard surface for ~$0.2/hr of savings at this node count.
+    # i4i.2xlarge: 8 vCPU, 1 x 1,875 GB instance-store Nitro NVMe, "up to
+    # 12.5 Gbps" network. The client runs the whole co-located fleet
+    # (1 authority + MW_COWRITERS co-writer daemons + the ior ranks); the
+    # storage nodes idle at one nvmet target each.
+    #
+    # Small-instance "up to N Gbps" network baselines are BURST-shaped too
+    # (unlike CPU credits, not refused): the s11-mpiio row survives because
+    # it is a same-substrate shared-vs-disjoint RATIO with internal A-B-B-A
+    # brackets, and the leg's flatness/self-sizing gates catch credit sag —
+    # but the row stamp records the instance types so the label stays honest.
+    INSTANCE_TYPE="i4i.2xlarge"
+    EST_CLUSTER_HOURLY="~\$0.5-0.8/hr (spot, 4 nodes; planning number)"
+    ;;
   custom)
     [ -n "$INSTANCE_TYPE" ] || die "PRESET=custom requires INSTANCE_TYPE"
     EST_CLUSTER_HOURLY="unknown (custom preset — check spot pricing yourself)"
     ;;
-  *) die "PRESET must be i4i | i3en | custom (got: $PRESET)" ;;
+  *) die "PRESET must be i4i | i3en | mw | custom (got: $PRESET)" ;;
 esac
+
+# Preset-dependent defaults (an explicit env value always wins — see the
+# config block notes on roles, AMI kernel floors, and artifact glibc).
+if [ "$PRESET" = "mw" ]; then
+  N_MDS="${N_MDS:-1}"
+  N_OSS="${N_OSS:-2}"
+  N_CLIENT="${N_CLIENT:-1}"
+  N_SPARE="${N_SPARE:-0}"
+  AMI_SSM_PARAM="${AMI_SSM_PARAM:-/aws/service/canonical/ubuntu/server/26.04/stable/current/amd64/hvm/ebs-gp3/ami-id}"
+  ARTIFACT_DIR="${ARTIFACT_DIR:-dist/ubuntu2604}"
+else
+  N_MDS="${N_MDS:-2}"
+  N_OSS="${N_OSS:-2}"
+  N_CLIENT="${N_CLIENT:-1}"
+  N_SPARE="${N_SPARE:-1}"
+  AMI_SSM_PARAM="${AMI_SSM_PARAM:-/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id}"
+  ARTIFACT_DIR="${ARTIFACT_DIR:-dist/ubuntu2404}"
+fi
+ELBENCHO_BIN="${ELBENCHO_BIN:-$ARTIFACT_DIR/elbencho}"
 
 # Burst-class refusal — credit-throttled CPU/network + no instance store means
 # every row would be INVALID under the labeling discipline. Non-negotiable.
@@ -415,6 +543,13 @@ role_of() { # role_of <name> -> mds|oss|client|spare
   esac
 }
 
+mw_shape_check() { # the MW fleet knobs, validated before anything costly
+  [[ "$MW_COWRITERS" =~ ^[0-9]+$ ]] && [ "$MW_COWRITERS" -ge 2 ] \
+    || die "MW_COWRITERS must be an integer >= 2 (the s11-mpiio leg's floor; got: $MW_COWRITERS)"
+  [[ "$MW_IOR_PROCS" =~ ^[0-9]+$ ]] && [ "$MW_IOR_PROCS" -ge 1 ] && [ "$MW_IOR_PROCS" -le 16 ] \
+    || die "MW_IOR_PROCS must be 1..16 (the leg's --procs range; got: $MW_IOR_PROCS)"
+}
+
 # ---------------------------------------------------------------------------
 # Global EXIT trap — one handler covers launch (partial-resource cleanup),
 # full (best-effort teardown on mid-run failure), and bench (spot-monitor
@@ -471,10 +606,10 @@ cmd_launch() {
     echo "  detected $OPERATOR_CIDR"
   fi
 
-  log "launch 2/7: AMI (Ubuntu 24.04 LTS via SSM) + default subnet in $AWS_AZ"
+  log "launch 2/7: AMI via SSM ($AMI_SSM_PARAM) + default subnet in $AWS_AZ"
   local ami
   ami="$(awsq "ami-dryrun" ssm get-parameter \
-    --name /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id \
+    --name "$AMI_SSM_PARAM" \
     --query Parameter.Value --output text)"
   SUBNET_ID="$(awsq "subnet-dryrun" ec2 describe-subnets \
     --filters "Name=availability-zone,Values=$AWS_AZ" "Name=default-for-az,Values=true" \
@@ -612,8 +747,16 @@ cmd_deploy() {
   local sqz="$ARTIFACT_DIR/squeezefs"
   local shim="$ARTIFACT_DIR/libsqueezefs_il.so"
   if ! $DRY_RUN; then
-    [ -x "$sqz" ] || die "squeezefs artifact missing/not executable: $sqz (build elsewhere: task build:ubuntu2404)"
-    [ -x "$ELBENCHO_BIN" ] || die "elbencho artifact missing: $ELBENCHO_BIN (must be a DYNAMIC build)"
+    [ -x "$sqz" ] || die "squeezefs artifact missing/not executable: $sqz (build elsewhere: task build:${ARTIFACT_DIR##*/})"
+    if [ ! -x "$ELBENCHO_BIN" ]; then
+      if [ "$PRESET" = "mw" ]; then
+        # The MW row's instrument is the pinned ior the s11-mpiio leg builds
+        # ON the client — elbencho only matters if you also run `bench`.
+        warn "no dynamic elbencho at $ELBENCHO_BIN — the elbencho battery (bench) is unavailable on this cluster; bench-mw is unaffected"
+      else
+        die "elbencho artifact missing: $ELBENCHO_BIN (must be a DYNAMIC build)"
+      fi
+    fi
   fi
   local sqz_sha="dryrun-sha"
   if ! $DRY_RUN; then
@@ -639,12 +782,25 @@ got=$(sha256sum "$BIN" | awk '{print $1}')
 "$BIN" --version
 EOS
     if [ "$(role_of "$name")" = "client" ] || [ "$(role_of "$name")" = "spare" ]; then
-      push "$ELBENCHO_BIN" "$ip" "$REMOTE_DIR/elbencho"
+      if $DRY_RUN || [ -x "$ELBENCHO_BIN" ]; then
+        push "$ELBENCHO_BIN" "$ip" "$REMOTE_DIR/elbencho"
+      fi
       if $DRY_RUN || [ -f "$shim" ]; then
         push "$shim" "$ip" "$REMOTE_DIR/libsqueezefs_il.so"
       else
         warn "no il shim at $shim — il rows unavailable on this cluster (kernel-FUSE rows unaffected)"
       fi
+    fi
+    if [ "$PRESET" = "mw" ] && [ "$(role_of "$name")" = "client" ]; then
+      # bench-mw prerequisites: the s11-mpiio leg builds the pinned ior 4.0.0
+      # on the client (mpicc + curl + gcc + make, fetched from github over
+      # the client's internet) and runs it under mpirun; python3 drives the
+      # leg's row emitter and the .stats readiness/engagement gates.
+      remote "$ip" <<'EOS'
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+apt-get -qq install -y openmpi-bin libopenmpi-dev python3 curl gcc make >/dev/null
+EOS
     fi
   done
   echo
@@ -652,29 +808,25 @@ EOS
 }
 
 # ---------------------------------------------------------------------------
-# assemble — instance-store discovery, nvmet shares, single-path connect,
-# format, mount, build_commit ritual. Idempotent: re-running unshares,
-# disconnects and rebuilds from scratch (fresh format — data is destroyed).
+# Shared assemble machinery — ONE copy each of the fabric-step scripts, so
+# assemble and assemble-mw can never diverge on them. Every script is
+# parameterized purely via env and fed to `remote` from a variable, so the
+# dry-run print and the real run can never diverge either.
 # ---------------------------------------------------------------------------
-cmd_assemble() {
-  require_local_tools
-  load_state --placeholder-ok
-  confirm "assemble REFORMATS the cluster volumes (any prior benchmark data on $CID is destroyed)."
 
-  local client_ip
-  client_ip="$(node_pub client0)"
-
-  log "assemble 1/4: client prologue — unmount + disconnect survivors (idempotency)"
-  remote "$client_ip" SQZ="$REMOTE_DIR/squeezefs" MNT="$MOUNTPOINT" NQN_PREFIX="$NQN_PREFIX" <<'EOS'
+# Client prologue: unmount every ${MNT}* mount (reverse-sorted so co-writer
+# mounts unmount before the authority they dial — this also reaps a prior MW
+# fleet under a plain re-assemble), kill stray daemons, then LOUDLY verify
+# the disconnect (survivors auto-reconnect to rebuilt shares and poison the
+# connect step — same failure mode as tests/cluster_reset.sh).
+CLIENT_PROLOGUE_SCRIPT="$(cat <<'EOS'
 set -euo pipefail
-if mountpoint -q "$MNT" 2>/dev/null; then
-  umount "$MNT" || umount -l "$MNT" || true
-  sleep 2
-fi
+while read -r m; do
+  umount "$m" || umount -l "$m" || true
+done < <(awk -v m="$MNT" '$2 == m || index($2, m "-cw") == 1 {print $2}' /proc/mounts | sort -r)
+sleep 2
 pkill -f 'squeezefs moun[t]' 2>/dev/null || true
 sleep 1
-# LOUD disconnect verification (survivors auto-reconnect to rebuilt shares
-# and poison the connect step — same failure mode as tests/cluster_reset.sh)
 for c in /sys/class/nvme/nvme*/subsysnqn; do
   [ -e "$c" ] || continue
   nqn=$(cat "$c")
@@ -690,14 +842,14 @@ for _ in $(seq 1 15); do
 done
 [ "$gone" = 1 ] || { echo "could not disconnect all $NQN_PREFIX connections" >&2; exit 1; }
 EOS
+)"
 
-  log "assemble 2/4: storage nodes — instance-store NVMe discovery + nvmet share"
-  # One script for every storage node, parameterized purely via env (kept in
-  # a variable so the dry-run print and the real run can never diverge).
-  # Instance-store devices carry model "Amazon EC2 NVMe Instance Storage";
-  # EBS devices ("Amazon Elastic Block Store") are deliberately excluded.
-  local storage_share_script
-  storage_share_script="$(cat <<'EOS'
+# Storage-node share: instance-store discovery + `squeezefs nvmeof share`
+# (nvmet stack — the product verb writes resv_enable=1 before enable when
+# the kernel offers the knob). Instance-store devices carry model "Amazon
+# EC2 NVMe Instance Storage"; EBS devices ("Amazon Elastic Block Store")
+# are deliberately excluded.
+STORAGE_SHARE_SCRIPT="$(cat <<'EOS'
 set -euo pipefail
 modprobe nvmet nvmet-tcp 2>/dev/null || true
 devs=()
@@ -720,47 +872,12 @@ for d in "${devs[@]}"; do
 done
 EOS
 )"
-  local meta_specs="" data_specs=""   # csv of nqn@private_ip
-  local idx name role ip priv shares nqn
-  for idx in "${!NODE_NAMES[@]}"; do
-    name="${NODE_NAMES[$idx]}"
-    role="$(role_of "$name")"
-    { [ "$role" = "mds" ] || [ "$role" = "oss" ]; } || continue
-    ip="${NODE_PUB[$idx]}"; priv="${NODE_PRIV[$idx]}"
-    echo "-- $name ($ip, fabric $priv)"
-    # mds shares only its first instance-store device (meta needs little);
-    # oss shares every instance-store namespace it has (i4i.4xlarge: 1,
-    # i3en.12xlarge: 4).
-    if $DRY_RUN; then
-      remote "$ip" NAME="$name" KIND="$role" NQN_BASE="$NQN_PREFIX" PRIV_IP="$priv" SQZ="$REMOTE_DIR/squeezefs" \
-        <<<"$storage_share_script"
-      shares="$NQN_PREFIX:$name-d0"     # canned: 1 device/node in dry-run
-    else
-      shares="$(remote "$ip" NAME="$name" KIND="$role" NQN_BASE="$NQN_PREFIX" PRIV_IP="$priv" SQZ="$REMOTE_DIR/squeezefs" \
-        <<<"$storage_share_script" | awk '/^SHARED /{print $2}')"
-      [ -n "$shares" ] || die "$name shared nothing"
-    fi
-    for nqn in $shares; do
-      if [ "$role" = "mds" ]; then
-        meta_specs="${meta_specs:+$meta_specs,}$nqn@$priv"
-      else
-        data_specs="${data_specs:+$data_specs,}$nqn@$priv"
-      fi
-      echo "   shared $nqn @ $priv"
-    done
-  done
-  [ -n "$meta_specs" ] && [ -n "$data_specs" ] || die "assemble produced empty share lists (meta='$meta_specs' data='$data_specs')"
 
-  log "assemble 3/4: client — single-path connect, format, mount"
-  # Cloud note: these instances have ONE NIC, so this is a SINGLE-PATH
-  # connect per subsystem — no second-path loop and no iopolicy step (the
-  # round-robin iopolicy write in tests/cluster_reset.sh only matters with
-  # two fabric paths; with one path it is a no-op, so it is skipped here
-  # on purpose).
-  remote "$client_ip" \
-    SQZ="$REMOTE_DIR/squeezefs" MNT="$MOUNTPOINT" CACHE="$CACHE_DIR" \
-    META_SPECS="$meta_specs" DATA_SPECS="$data_specs" \
-    MOUNT_EXTRA_STR="$(printf '%s' "$MOUNT_EXTRA" | tr ' ' ',')" <<'EOS'
+# Client fabric: local instance store -> /scratch, single-path connect per
+# subsystem, optional end-to-end PR verify (MW_PR_VERIFY=1), format, then
+# either the plain single mount or none (MW_SKIP_MOUNT=1 — the MW fleet
+# recipe owns the mounts). Records the meta URI for the later steps.
+CLIENT_FABRIC_SCRIPT="$(cat <<'EOS'
 set -euo pipefail
 modprobe nvme-tcp 2>/dev/null || true
 
@@ -818,33 +935,407 @@ connect_all() { # connect_all <csv nqn@ip> -> resolved /dev list (in csv order)
 
 meta_devs="$(connect_all "$META_SPECS")"
 data_devs="$(connect_all "$DATA_SPECS")"
+if [ "${MW_PR_VERIFY:-0}" = 1 ]; then
+  # v5-mw end-to-end PR verify: resv-report must SUCCEED on every DATA
+  # namespace (the report may be empty; the command failing means the
+  # fabric does not transport Persistent Reservations and the S9 arm will
+  # refuse the mount).
+  IFS=, read -ra DDEVS <<<"$data_devs"
+  for d in "${DDEVS[@]}"; do
+    nvme resv-report "$d" >/dev/null 2>&1 || {
+      echo "nvme resv-report $d FAILED — the fabric does not transport Persistent Reservations end-to-end (storage-node kernel nvmet PR = mainline v6.13+; the mw preset's Ubuntu 26.04 AMI ships it)" >&2
+      exit 1
+    }
+  done
+  echo "PR verify: resv-report OK on all ${#DDEVS[@]} data namespaces"
+fi
 META_URI="sqmeta://$meta_devs"
 DATA_URI="sqdata://$data_devs"
 echo "format: $META_URI $DATA_URI"
 "$SQZ" format "$META_URI" "$DATA_URI" --disk-cache-paths "$CACHE"
-
-read -ra EXTRA <<<"$(printf '%s' "$MOUNT_EXTRA_STR" | tr ',' ' ')"
-"$SQZ" mount "$META_URI" "$MNT" --daemon "${EXTRA[@]}"
-sleep 2
-mountpoint -q "$MNT" || { echo "mount did not come up" >&2; exit 1; }
 echo "$META_URI" >/etc/squeezefs-bench-meta-uri
+if [ "${MW_SKIP_MOUNT:-0}" != 1 ]; then
+  read -ra EXTRA <<<"$(printf '%s' "$MOUNT_EXTRA_STR" | tr ',' ' ')"
+  "$SQZ" mount "$META_URI" "$MNT" --daemon "${EXTRA[@]}"
+  sleep 2
+  mountpoint -q "$MNT" || { echo "mount did not come up" >&2; exit 1; }
+fi
 EOS
+)"
 
-  log "assemble 4/4: build_commit verification ritual"
-  # The mounted daemon must be the deployed artifact: the .stats build_commit
-  # must appear in `squeezefs --version` of the deployed binary.
-  remote "$client_ip" SQZ="$REMOTE_DIR/squeezefs" MNT="$MOUNTPOINT" <<'EOS'
+# share_storage_nodes — run STORAGE_SHARE_SCRIPT on every mds/oss node and
+# fill SHARED_META_SPECS/SHARED_DATA_SPECS (csv of nqn@private_ip). mds
+# shares only its first instance-store device (meta needs little); oss
+# shares every instance-store namespace it has (i4i.4xlarge: 1,
+# i3en.12xlarge: 4, i4i.2xlarge: 1).
+SHARED_META_SPECS=""
+SHARED_DATA_SPECS=""
+share_storage_nodes() {
+  SHARED_META_SPECS=""
+  SHARED_DATA_SPECS=""
+  local idx name role ip priv shares nqn
+  for idx in "${!NODE_NAMES[@]}"; do
+    name="${NODE_NAMES[$idx]}"
+    role="$(role_of "$name")"
+    { [ "$role" = "mds" ] || [ "$role" = "oss" ]; } || continue
+    ip="${NODE_PUB[$idx]}"; priv="${NODE_PRIV[$idx]}"
+    echo "-- $name ($ip, fabric $priv)"
+    if $DRY_RUN; then
+      remote "$ip" NAME="$name" KIND="$role" NQN_BASE="$NQN_PREFIX" PRIV_IP="$priv" SQZ="$REMOTE_DIR/squeezefs" \
+        <<<"$STORAGE_SHARE_SCRIPT"
+      shares="$NQN_PREFIX:$name-d0"     # canned: 1 device/node in dry-run
+    else
+      shares="$(remote "$ip" NAME="$name" KIND="$role" NQN_BASE="$NQN_PREFIX" PRIV_IP="$priv" SQZ="$REMOTE_DIR/squeezefs" \
+        <<<"$STORAGE_SHARE_SCRIPT" | awk '/^SHARED /{print $2}')"
+      [ -n "$shares" ] || die "$name shared nothing"
+    fi
+    for nqn in $shares; do
+      if [ "$role" = "mds" ]; then
+        SHARED_META_SPECS="${SHARED_META_SPECS:+$SHARED_META_SPECS,}$nqn@$priv"
+      else
+        SHARED_DATA_SPECS="${SHARED_DATA_SPECS:+$SHARED_DATA_SPECS,}$nqn@$priv"
+      fi
+      echo "   shared $nqn @ $priv"
+    done
+  done
+  [ -n "$SHARED_META_SPECS" ] && [ -n "$SHARED_DATA_SPECS" ] \
+    || die "assemble produced empty share lists (meta='$SHARED_META_SPECS' data='$SHARED_DATA_SPECS')"
+}
+
+# assert_storage_pr — the v5-mw PR ASSERTION, per storage node. The product
+# share verb writes resv_enable=1 BEFORE enable when the kernel offers the
+# knob; on a kernel WITHOUT nvmet PR it only prints a detection-grade note.
+# The S9 multi-writer arm refuses non-PR at mount time — fail HERE at
+# target-build time instead, naming the node and the remedy, and
+# distinguishing "no knob" (kernel lacks nvmet PR, mainline v6.13+) from
+# "knob present but 0".
+assert_storage_pr() {
+  local idx name role ip
+  for idx in "${!NODE_NAMES[@]}"; do
+    name="${NODE_NAMES[$idx]}"
+    role="$(role_of "$name")"
+    { [ "$role" = "mds" ] || [ "$role" = "oss" ]; } || continue
+    ip="${NODE_PUB[$idx]}"
+    remote "$ip" NQN_PREFIX="$NQN_PREFIX" NODE="$name" <<'EOS' \
+      || die "storage node $name: PR assertion failed (see above) — the S9 multi-writer arm would refuse this substrate"
+set -u
+cfg=/sys/kernel/config/nvmet
+fail=0; n=0
+for s in "$cfg"/subsystems/"$NQN_PREFIX"*; do
+  [ -d "$s" ] || continue
+  n=$((n + 1))
+  r="$s/namespaces/1/resv_enable"
+  if [ ! -f "$r" ]; then
+    echo "FATAL[$NODE]: $(basename "$s"): nvmet exposes NO resv_enable knob — this node's kernel $(uname -r) lacks nvmet Persistent Reservations (mainline v6.13+; the mw preset's default Ubuntu 26.04 AMI ships it — check AMI_SSM_PARAM). Update the NODE kernel/nvmet module." >&2
+    fail=1
+  elif [ "$(cat "$r")" != "1" ]; then
+    echo "FATAL[$NODE]: $(basename "$s"): resv_enable=$(cat "$r") (want 1 — the product share verb writes it before enable when the knob exists)" >&2
+    fail=1
+  fi
+done
+[ "$n" -gt 0 ] || { echo "FATAL[$NODE]: no prefixed subsystems found after share" >&2; exit 1; }
+[ "$fail" -eq 0 ] && echo "  PR assert: $n namespace(s) resv_enable=1 on $NODE"
+exit "$fail"
+EOS
+  done
+}
+
+# verify_build_commit <client-ip> <mounts-csv> — every mounted daemon must
+# be the deployed artifact: the .stats build_commit must appear in
+# `squeezefs --version` of the deployed binary (KD-7 spirit).
+verify_build_commit() {
+  remote "$1" SQZ="$REMOTE_DIR/squeezefs" MNTS="$2" <<'EOS'
 set -euo pipefail
 ver="$("$SQZ" --version)"
-commit="$(grep -oE '"build_commit": *"[0-9a-f]+"' "$MNT/.stats" | grep -oE '[0-9a-f]{7,40}' | head -1)"
-[ -n "$commit" ] || { echo "no build_commit in $MNT/.stats" >&2; exit 1; }
-case "$ver" in
-  *"$commit"*) echo "build_commit OK: $commit ($ver)" ;;
-  *) echo "build_commit MISMATCH: mounted daemon reports $commit but deployed binary is '$ver'" >&2; exit 1 ;;
-esac
+IFS=, read -ra MS <<<"$MNTS"
+for m in "${MS[@]}"; do
+  commit="$(grep -oE '"build_commit": *"[0-9a-f]+"' "$m/.stats" | grep -oE '[0-9a-f]{7,40}' | head -1)"
+  [ -n "$commit" ] || { echo "no build_commit in $m/.stats" >&2; exit 1; }
+  case "$ver" in
+    *"$commit"*) echo "build_commit OK: $m -> $commit" ;;
+    *) echo "build_commit MISMATCH on $m: mounted daemon reports $commit but deployed binary is '$ver'" >&2; exit 1 ;;
+  esac
+done
+echo "build_commit ritual: ${#MS[@]} mount(s) verified against '$ver'"
 EOS
+}
+
+# ---------------------------------------------------------------------------
+# assemble — instance-store discovery, nvmet shares, single-path connect,
+# format, mount, build_commit ritual. Idempotent: re-running unshares,
+# disconnects and rebuilds from scratch (fresh format — data is destroyed).
+# ---------------------------------------------------------------------------
+cmd_assemble() {
+  require_local_tools
+  load_state --placeholder-ok
+  confirm "assemble REFORMATS the cluster volumes (any prior benchmark data on $CID is destroyed)."
+
+  local client_ip
+  client_ip="$(node_pub client0)"
+
+  log "assemble 1/4: client prologue — unmount + disconnect survivors (idempotency)"
+  remote "$client_ip" SQZ="$REMOTE_DIR/squeezefs" MNT="$MOUNTPOINT" NQN_PREFIX="$NQN_PREFIX" \
+    <<<"$CLIENT_PROLOGUE_SCRIPT"
+
+  log "assemble 2/4: storage nodes — instance-store NVMe discovery + nvmet share"
+  share_storage_nodes
+
+  log "assemble 3/4: client — single-path connect, format, mount"
+  # Cloud note: these instances have ONE NIC, so this is a SINGLE-PATH
+  # connect per subsystem — no second-path loop and no iopolicy step (the
+  # round-robin iopolicy write in tests/cluster_reset.sh only matters with
+  # two fabric paths; with one path it is a no-op, so it is skipped here
+  # on purpose).
+  remote "$client_ip" \
+    SQZ="$REMOTE_DIR/squeezefs" MNT="$MOUNTPOINT" CACHE="$CACHE_DIR" \
+    META_SPECS="$SHARED_META_SPECS" DATA_SPECS="$SHARED_DATA_SPECS" \
+    MOUNT_EXTRA_STR="$(printf '%s' "$MOUNT_EXTRA" | tr ' ' ',')" \
+    <<<"$CLIENT_FABRIC_SCRIPT"
+
+  log "assemble 4/4: build_commit verification ritual"
+  verify_build_commit "$client_ip" "$MOUNTPOINT"
   echo
   echo "Cluster assembled and mounted at $MOUNTPOINT on client0. Next: tests/cloud_bench_cluster.sh bench"
+}
+
+# ---------------------------------------------------------------------------
+# assemble-mw — the MULTI-WRITER fleet shape (PRESET=mw): the same fabric
+# steps as assemble (prologue, instance-store shares, single-path connect,
+# format with client instance-store staging), DIVERGING at the mount into
+# the tests/cluster_reset_v5_mw.sh recipe — 1 authority at $MOUNTPOINT +
+# $MW_COWRITERS co-writers at $MOUNTPOINT-cw1..K, CO-LOCATED on client0
+# (default NVMe host identity: no per-mount hostnqn/hostid, no
+# fabric_endpoint records, no host-scoped-subsystem kernel — patch 0030 is
+# multi-identity-only). Two hard kernel floors, both probed loud (never
+# trusted from the AMI): client FUSE-over-io_uring (mainline v6.14+) and
+# storage-node nvmet Persistent Reservations (v6.13+ — the S9 arm refuses
+# non-PR substrates). Idempotent: re-running reaps the fleet and rebuilds
+# from scratch (fresh format — data is destroyed).
+# ---------------------------------------------------------------------------
+cmd_assemble_mw() {
+  require_local_tools
+  load_state --placeholder-ok
+  mw_shape_check
+  local fleet_share
+  fleet_share="${MW_FLEET_SHARE:-$((1 + MW_COWRITERS))}"
+  confirm "assemble-mw REFORMATS the cluster volumes (any prior benchmark data on $CID is destroyed) and mounts 1 authority + $MW_COWRITERS co-writer daemons on client0."
+
+  local client_ip
+  client_ip="$(node_pub client0)"
+
+  log "assemble-mw 1/6: client kernel floor — FUSE-over-io_uring (v6.14+)"
+  remote "$client_ip" <<'EOS'
+set -euo pipefail
+modprobe fuse 2>/dev/null || true
+[ -e /sys/module/fuse/parameters/enable_uring ] || {
+  echo "FATAL: client kernel $(uname -r) lacks FUSE-over-io_uring (no /sys/module/fuse/parameters/enable_uring; mainline v6.14+ needed) — every SqueezeFS mount requires the transport. Remedy: launch with the mw preset's default Ubuntu 26.04 AMI (AMI_SSM_PARAM) or any v6.14+ kernel." >&2
+  exit 1
+}
+echo "client kernel $(uname -r): fuse.enable_uring present"
+EOS
+
+  log "assemble-mw 2/6: client prologue — unmount fleet + disconnect survivors (idempotency)"
+  remote "$client_ip" SQZ="$REMOTE_DIR/squeezefs" MNT="$MOUNTPOINT" NQN_PREFIX="$NQN_PREFIX" \
+    <<<"$CLIENT_PROLOGUE_SCRIPT"
+
+  log "assemble-mw 3/6: storage nodes — instance-store share + nvmet PR assert (resv_enable=1; v6.13+ floor)"
+  share_storage_nodes
+  assert_storage_pr
+
+  log "assemble-mw 4/6: client — single-path connect, PR verify (nvme resv-report per data namespace), format"
+  remote "$client_ip" \
+    SQZ="$REMOTE_DIR/squeezefs" MNT="$MOUNTPOINT" CACHE="$CACHE_DIR" \
+    META_SPECS="$SHARED_META_SPECS" DATA_SPECS="$SHARED_DATA_SPECS" \
+    MOUNT_EXTRA_STR="$(printf '%s' "$MW_MOUNT_EXTRA" | tr ' ' ',')" \
+    MW_PR_VERIFY=1 MW_SKIP_MOUNT=1 \
+    <<<"$CLIENT_FABRIC_SCRIPT"
+
+  log "assemble-mw 5/6: mount the multi-writer fleet — authority + $MW_COWRITERS co-writers (FLEET_SHARE=$fleet_share, MW port $MW_PORT)"
+  # The v5-mw §5 recipe, co-located on client0: authority phase-1 arm (no
+  # roster) -> per-co-writer enrollment-id probes (each mount attempt is
+  # REFUSED at rung 3; the refusal prints the durable id the roster needs;
+  # gather_admission mutates nothing before rung 5, so the probe is
+  # side-effect-free) -> re-arm the authority with the harvested roster
+  # (enrollment is the AUTHORITY's durable act, a new era) -> mount the
+  # admitted co-writers. SUDO_* is scrubbed from every daemon launch so the
+  # daemon posture (mount ownership, admin-lane identity) is
+  # root-deterministic regardless of sudo-vs-root-shell (the admin lane
+  # admits peercred uid 0 — src/ipc_host.rs). Every mount readiness-gates on
+  # its own log lines + .stats posture — a silently-degraded arm is
+  # contractually impossible.
+  remote "$client_ip" \
+    SQZ="$REMOTE_DIR/squeezefs" MNT="$MOUNTPOINT" \
+    COWRITERS="$MW_COWRITERS" FLEET_SHARE="$fleet_share" \
+    MW_PORT="$MW_PORT" MEMBERSHIP_BIND="$MW_MEMBERSHIP_BIND" \
+    RANGE_CUSTODY="$MW_RANGE_CUSTODY" \
+    MOUNT_EXTRA_STR="$(printf '%s' "$MW_MOUNT_EXTRA" | tr ' ' ',')" <<'EOS'
+set -euo pipefail
+die() { echo "FATAL: $*" >&2; exit 1; }
+[ -s /etc/squeezefs-bench-meta-uri ] || die "no recorded meta URI — the connect/format step did not run"
+META_URI="$(cat /etc/squeezefs-bench-meta-uri)"
+read -ra EXTRA <<<"$(printf '%s' "$MOUNT_EXTRA_STR" | tr ',' ' ')"
+AUTH_LOG=/tmp/sqz-mw-authority.log
+
+# One flattened stats-inode field (the JSON nests under "metrics") — the
+# v5-mw / mw_fleet stat_field helper verbatim.
+stat_field() { # mountpoint key -> value
+  cat "$1/.stats" | python3 -c '
+import json, sys
+def flat(d, out, pfx=""):
+    for k, v in d.items():
+        if isinstance(v, dict): flat(v, out, pfx + k + ".")
+        else: out[pfx + k] = v
+    return out
+root = json.load(sys.stdin)
+print(flat(root.get("metrics", root), {}).get(sys.argv[1], ""))' "$2"
+}
+
+wait_for() { # description tries cmd...
+  local what="$1" tries="$2" i
+  shift 2
+  for ((i = 0; i < tries; i++)); do
+    "$@" >/dev/null 2>&1 && return 0
+    sleep 0.5
+  done
+  die "timed out waiting for $what"
+}
+
+poll_stat() { # mountpoint key want tries what
+  local mnt="$1" key="$2" want="$3" tries="$4" what="$5" v i
+  v=""
+  for ((i = 0; i < tries; i++)); do
+    v="$(stat_field "$mnt" "$key" 2>/dev/null || true)"
+    [ "$v" = "$want" ] && return 0
+    sleep 0.5
+  done
+  die "$what: $key='$v' (want $want)"
+}
+
+unmount_and_reap() { # mountpoint (idempotent — v5-mw verbatim)
+  local mnt="$1" pid t
+  pid="$(pgrep -f "squeezefs.*mount.*$mnt" | head -1 || true)"
+  if awk -v m="$mnt" '$2==m {f=1} END {exit !f}' /proc/mounts; then
+    env -u SUDO_UID -u SUDO_GID -u SUDO_USER "$SQZ" umount "$mnt" >/dev/null 2>&1 || true
+  fi
+  if awk -v m="$mnt" '$2==m {f=1} END {exit !f}' /proc/mounts; then
+    umount -l "$mnt" 2>/dev/null || true
+  fi
+  wait_for "unmount of $mnt" 60 bash -c "! awk -v m='$mnt' '\$2==m {f=1} END {exit !f}' /proc/mounts"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    for ((t = 0; t < 20; t++)); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.5
+    done
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+}
+
+MW_ENDPOINT=""
+mount_authority() { # [roster] — phase-1 arm, or the roster re-arm (a new era)
+  local roster="${1:-}"
+  local env_args=(env -u SUDO_UID -u SUDO_GID -u SUDO_USER
+    "SQUEEZEFS_FLEET_SHARE=$FLEET_SHARE"
+    "SQUEEZEFS_IPC_ALLOW_DEV=1"
+    "SQUEEZEFS_MEMBERSHIP_BIND=$MEMBERSHIP_BIND"
+    "SQUEEZEFS_MULTI_WRITER=1"
+    "SQUEEZEFS_MW_BIND=0.0.0.0:$MW_PORT")
+  [ -n "$roster" ] && env_args+=("SQUEEZEFS_MW_MEMBERS=$roster")
+  mkdir -p "$MNT"
+  "${env_args[@]}" "$SQZ" mount "$META_URI" "$MNT" \
+    --daemon "${EXTRA[@]}" --log-file "$AUTH_LOG" \
+    >/tmp/sqz-mw-authority.mount.out 2>&1 ||
+    die "authority mount failed: $(cat /tmp/sqz-mw-authority.mount.out)"
+  wait_for "authority mountpoint" 120 mountpoint -q "$MNT"
+  wait_for "authority stats inode" 120 test -s "$MNT/.stats"
+  # Rung-8 engagement gates (mw_fleet mount_member verbatim): the WERO hold
+  # must stand (fence-mode gauge + the acquire log line) and the S6 plane
+  # must own — a silently-degraded arm is contractually impossible, so a
+  # miss here is a refusal we somehow did not see; die loud either way.
+  poll_stat "$MNT" data_plane_fence_mode 1 120 \
+    "authority: the S7 WERO hold did not engage (log: $AUTH_LOG)"
+  grep -q "data-plane WERO (rtype 3) acquired" "$AUTH_LOG" ||
+    die "authority log carries no 'data-plane WERO (rtype 3) acquired' line (log: $AUTH_LOG)"
+  poll_stat "$MNT" membership_mode owner 120 \
+    "authority: the S6 membership plane did not engage (log: $AUTH_LOG)"
+  MW_ENDPOINT="$(sed -n 's/.*MULTI-WRITER ARMED (DLM S9) on \(.*\): era.*/\1/p' "$AUTH_LOG" | tail -1)"
+  [ -n "$MW_ENDPOINT" ] ||
+    die "authority log carries no 'MULTI-WRITER ARMED (DLM S9) on <endpoint>' line (log: $AUTH_LOG)"
+  echo "  authority up at $MNT (WERO held, membership owner, MW endpoint $MW_ENDPOINT)"
+}
+
+cowriter_env() { # -> the co-writer daemon env (v5-mw / mw_fleet verbatim)
+  echo env -u SUDO_UID -u SUDO_GID -u SUDO_USER \
+    "SQUEEZEFS_FLEET_SHARE=$FLEET_SHARE" \
+    "SQUEEZEFS_IPC_ALLOW_DEV=1" \
+    "SQUEEZEFS_MULTI_WRITER=1" \
+    "SQUEEZEFS_MW_ROLE=co-writer" \
+    "SQUEEZEFS_MW_AUTHORITY=$MW_ENDPOINT" \
+    "$([ "$RANGE_CUSTODY" = "1" ] && echo SQUEEZEFS_RANGE_CUSTODY=1 || echo SQUEEZEFS_RANGE_CUSTODY=0)"
+}
+
+probe_cowriter_id() { # mountpoint probe-out probe-log -> echoes the enrollment id
+  local mnt="$1" out="$2" plog="$3" id
+  mkdir -p "$mnt"
+  # A co-writer mount against a roster that does not name it is REFUSED at
+  # rung 3, and the refusal prints this mountpoint's durable enrollment id
+  # (KD-MW-2 node_{16 hex}.m{8 hex}). gather_admission mutates nothing
+  # before rung 5 — the probe is side-effect-free. cowriter_env is a
+  # deliberate word list.
+  if $(cowriter_env) "$SQZ" mount "$META_URI" "$mnt" \
+    --daemon "${EXTRA[@]}" --log-file "$plog" >"$out" 2>&1; then
+    die "co-writer PROBE mount at $mnt was ADMITTED against an empty roster — rung 3 did not engage (out: $out)"
+  fi
+  id="$(grep -o "Add 'node_[0-9a-f.m]*'" "$out" | head -1 | sed "s/^Add '//; s/'$//")"
+  [ -n "$id" ] || die "co-writer probe refusal at $mnt carries no enrollment id (want the rung-3 \"Add 'node_...'\" remedy; out: $out)"
+  echo "$id"
+}
+
+mount_cowriter() { # idx
+  local i="$1" mnt clog
+  mnt="$MNT-cw$i"
+  clog="/tmp/sqz-mw-cw$i.log"
+  mkdir -p "$mnt"
+  # Rung-9 engagement (v5-mw verbatim): the five-rung ladder ADMITTED and
+  # the mount is the co-writer posture, never a silently-degraded one.
+  $(cowriter_env) "$SQZ" mount "$META_URI" "$mnt" \
+    --daemon "${EXTRA[@]}" --log-file "$clog" \
+    >"/tmp/sqz-mw-cw$i.mount.out" 2>&1 ||
+    die "co-writer $i mount failed: $(cat "/tmp/sqz-mw-cw$i.mount.out")"
+  wait_for "co-writer $i mountpoint" 120 mountpoint -q "$mnt"
+  wait_for "co-writer $i stats inode" 120 test -s "$mnt/.stats"
+  grep -q "CO-WRITER ADMITTED" "$clog" ||
+    die "co-writer $i log carries no 'CO-WRITER ADMITTED' line — the admission ladder did not engage (log: $clog)"
+  poll_stat "$mnt" mount_posture co-writer 40 "co-writer $i posture (log: $clog)"
+  poll_stat "$mnt" membership_mode member 120 "co-writer $i: the S6 join did not engage (log: $clog)"
+  echo "  co-writer $i up at $mnt (ADMITTED, posture=co-writer, membership=member)"
+}
+
+mount_authority
+ROSTER=""
+for ((i = 1; i <= COWRITERS; i++)); do
+  id="$(probe_cowriter_id "$MNT-cw$i" "/tmp/sqz-mw-cw$i.probe.out" "/tmp/sqz-mw-cw$i.probe.log")"
+  echo "  co-writer $i enrollment id harvested: $id"
+  ROSTER="${ROSTER:+$ROSTER,}$id"
+done
+echo "  re-arming the authority with the roster (a new era): $ROSTER"
+unmount_and_reap "$MNT"
+mount_authority "$ROSTER"
+for ((i = 1; i <= COWRITERS; i++)); do
+  mount_cowriter "$i"
+done
+MOUNT_LIST="$MNT"
+for ((i = 1; i <= COWRITERS; i++)); do MOUNT_LIST="$MOUNT_LIST,$MNT-cw$i"; done
+echo "MW fleet ready: SQZ_MWMATRIX_MOUNTS=$MOUNT_LIST"
+EOS
+
+  log "assemble-mw 6/6: build_commit verification ritual across ALL mounts"
+  local mounts_csv i
+  mounts_csv="$MOUNTPOINT"
+  for ((i = 1; i <= MW_COWRITERS; i++)); do mounts_csv="$mounts_csv,$MOUNTPOINT-cw$i"; done
+  verify_build_commit "$client_ip" "$mounts_csv"
+  echo
+  echo "MW fleet assembled: authority $MOUNTPOINT + $MW_COWRITERS co-writers ($MOUNTPOINT-cw1..cw$MW_COWRITERS) on client0."
+  echo "Next: PRESET=mw tests/cloud_bench_cluster.sh bench-mw"
 }
 
 # ---------------------------------------------------------------------------
@@ -1067,6 +1558,120 @@ EOS
 }
 
 # ---------------------------------------------------------------------------
+# bench-mw — the s11-mpiio shared-vs-disjoint MPI-IO ior row over the MW
+# fleet (assemble-mw first). Pushes tests/run_mw_matrix.sh to the client
+# under a repo-shaped dir and drives its EXTERNAL-MOUNTS mode as root: the
+# leg builds the pinned ior 4.0.0 on the client (sha256-checked, from
+# github over the client's internet), self-sizes a >=60 s sustained window,
+# gates shared >= 0.8x disjoint in BOTH internal A-B-B-A brackets, verifies
+# engagement exactly, and runs the warm fsck/C8 oracle. Rows are pulled
+# back under $RESULTS_ROOT/<ts>/ with the house labeling: a cloud row is
+# measured-real over a real nvme-tcp network but a THIRD substrate class —
+# never spliced into devsub loop/tcp medians (docs/rc-manifest.md tiers).
+# ---------------------------------------------------------------------------
+cmd_bench_mw() {
+  require_local_tools
+  load_state --placeholder-ok
+  mw_shape_check
+  CLIENT_IP="$(node_pub client0)"
+
+  local ts
+  ts="$(date +%Y-%m-%d-%H%M%S)"
+  BENCH_DIR="$RESULTS_ROOT/$ts"
+  if $DRY_RUN; then
+    echo "(dry-run: results would land in $BENCH_DIR — nothing is written)"
+  else
+    mkdir -p "$BENCH_DIR"
+  fi
+
+  local mounts_csv i
+  mounts_csv="$MOUNTPOINT"
+  for ((i = 1; i <= MW_COWRITERS; i++)); do mounts_csv="$mounts_csv,$MOUNTPOINT-cw$i"; done
+
+  log "bench-mw: fleet-liveness + client toolchain preflight"
+  remote "$CLIENT_IP" MNTS="$mounts_csv" <<'EOS'
+set -euo pipefail
+IFS=, read -ra MS <<<"$MNTS"
+for m in "${MS[@]}"; do
+  mountpoint -q "$m" || { echo "MW fleet not assembled: $m is not mounted (run assemble-mw)" >&2; exit 1; }
+done
+for t in mpirun mpicc curl gcc make python3; do
+  command -v "$t" >/dev/null 2>&1 || { echo "client lacks $t — re-run: PRESET=mw tests/cloud_bench_cluster.sh deploy" >&2; exit 1; }
+done
+echo "fleet live (${#MS[@]} mounts), MPI toolchain present"
+EOS
+
+  log "bench-mw: push tests/run_mw_matrix.sh (repo-shaped: the leg derives REPO from its own dirname/.. and builds ior into REPO/target/mw-ior)"
+  push "$(dirname "$SCRIPT_PATH")/run_mw_matrix.sh" "$CLIENT_IP" "$REMOTE_DIR/repo/tests/run_mw_matrix.sh"
+
+  local row_cmd
+  row_cmd="SQZ_BIN=$REMOTE_DIR/squeezefs SQZ_MWMATRIX_MOUNTS=$mounts_csv SQZ_MWMATRIX_ROWDIR=$REMOTE_DIR/mw-rows bash $REMOTE_DIR/repo/tests/run_mw_matrix.sh s11-mpiio --procs=$MW_IOR_PROCS"
+  mw_manifest() {
+    echo "cluster=$CID preset=$PRESET instance_type=$INSTANCE_TYPE az=$AWS_AZ region=$AWS_REGION market=spot"
+    echo "row=s11-mpiio shared-vs-disjoint (tests/run_mw_matrix.sh external-mounts mode)"
+    echo "fleet: 1 authority + $MW_COWRITERS co-writers co-located on client0; mounts=$mounts_csv; procs/mount=$MW_IOR_PROCS"
+    echo "instrument=pinned ior 4.0.0 + mpirun (exact versions printed by the leg in the row output)"
+    echo "substrate=aws-spot/$INSTANCE_TYPE/$AWS_AZ (instance-store NVMe over nvmet-tcp, single NIC) — cloud substrate, a THIRD class: never spliced into devsub loop/tcp medians (docs/rc-manifest.md tiers)"
+    echo "repo_commit=$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+    echo "discipline: spot interruption mid-row => COUNT ABORTED, restart from zero (never splice)"
+    echo "ts=$ts"
+  }
+  mw_row_stamp() { # the house labeling discipline, MW face
+    echo "# row=s11-mpiio-shared-vs-disjoint"
+    echo "# order=$BENCH_ORDER"
+    echo "# instrument=pinned ior 4.0.0 + mpirun (exact versions in the leg output below)"
+    echo "# substrate=aws-spot/$INSTANCE_TYPE/$AWS_AZ (instance-store NVMe over nvmet-tcp, single NIC) — cloud substrate (third class — never spliced into devsub medians)"
+    echo "# venue=cloud-bench-cluster/$PRESET cluster=$CID cowriters=$MW_COWRITERS procs=$MW_IOR_PROCS"
+    echo "# ts=$(date -u +%FT%TZ)"
+    echo "# cmd=$row_cmd"
+  }
+
+  log "bench-mw: s11-mpiio row -> $BENCH_DIR"
+  spot_monitor_start
+  assert_fleet_running
+  BENCH_ORDER=1
+  local rowfile="$BENCH_DIR/01-s11-mpiio-shared-vs-disjoint.txt"
+  if $DRY_RUN; then
+    echo "-- manifest.txt would contain:"; mw_manifest | sed 's/^/   /'
+    mw_row_stamp                                    # shown, not written
+    printf '  (row output would be captured to %s)\n' "$rowfile"
+    remote "$CLIENT_IP" <<EOS
+set -euo pipefail
+mkdir -p "$REMOTE_DIR/mw-rows" "$REMOTE_DIR/repo/target"
+$row_cmd
+EOS
+  else
+    mw_manifest >"$BENCH_DIR/manifest.txt"
+    mw_row_stamp >"$rowfile"
+    remote "$CLIENT_IP" <<EOS | tee -a "$rowfile"
+set -euo pipefail
+mkdir -p "$REMOTE_DIR/mw-rows" "$REMOTE_DIR/repo/target"
+$row_cmd
+EOS
+  fi
+  spot_monitor_stop
+  assert_fleet_running   # the row counts only if the fleet survived it
+
+  log "bench-mw: pull rows + fleet logs"
+  if ! $DRY_RUN; then
+    # --log-file is 0600 root (VAL-7h): stage world-readable copies inside
+    # the rows dir so the unprivileged scp below can carry everything home.
+    remote "$CLIENT_IP" ROWDIR="$REMOTE_DIR/mw-rows" <<'EOS'
+set -euo pipefail
+mkdir -p "$ROWDIR/logs"
+for f in /tmp/sqz-mw-*.log /tmp/sqz-mw-*.mount.out /tmp/sqz-mw-*.probe.out; do
+  [ -f "$f" ] && install -m 0644 "$f" "$ROWDIR/logs/" || true
+done
+chmod -R a+rX "$ROWDIR"
+EOS
+  fi
+  run scp -r "${SSH_OPTS[@]}" -i "$SSH_KEY_FILE" \
+    "$REMOTE_USER@$CLIENT_IP:$REMOTE_DIR/mw-rows" "$BENCH_DIR/mw-rows"
+  echo
+  echo "s11-mpiio row complete. Results: $BENCH_DIR (stamped row + manifest; per-phase ior outputs, stats snapshots and fsck report under mw-rows/; fleet verified running end-to-end — count valid)"
+}
+
+# ---------------------------------------------------------------------------
 # status
 # ---------------------------------------------------------------------------
 cmd_status() {
@@ -1211,16 +1816,22 @@ cmd_teardown() {
 }
 
 # ---------------------------------------------------------------------------
-# full — launch -> deploy -> assemble -> bench -> teardown. The global EXIT
-# trap best-effort-tears-down on any failure past a successful launch.
+# full — launch -> deploy -> assemble -> bench -> teardown (PRESET=mw swaps
+# in assemble-mw/bench-mw). The global EXIT trap best-effort-tears-down on
+# any failure past a successful launch.
 # ---------------------------------------------------------------------------
 cmd_full() {
   FULL_ACTIVE=true
   cmd_launch
   ASSUME_YES=true       # the cost confirmation already happened at launch
   cmd_deploy
-  cmd_assemble
-  cmd_bench
+  if [ "$PRESET" = "mw" ]; then
+    cmd_assemble_mw
+    cmd_bench_mw
+  else
+    cmd_assemble
+    cmd_bench
+  fi
   cmd_teardown
 }
 
@@ -1232,7 +1843,9 @@ case "$SUBCMD" in
   launch)            cmd_launch ;;
   deploy)            cmd_deploy ;;
   assemble)          cmd_assemble ;;
+  assemble-mw)       cmd_assemble_mw ;;
   bench)             cmd_bench ;;
+  bench-mw)          cmd_bench_mw ;;
   status)            cmd_status ;;
   teardown)          cmd_teardown ;;
   full)              cmd_full ;;

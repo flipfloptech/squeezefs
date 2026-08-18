@@ -4518,17 +4518,25 @@ PYV
         # continue LOUD-labeled. ANY other finding dies.
         local out drift
         out="$("$SQZ" fsck "$w_mnt" 2>&1)" || {
-            if [ "$(echo "$out" | grep -c '^\s*\[C')" = "2" ] &&
-                echo "$out" | grep -q '\[C2\].*leaked block' &&
-                echo "$out" | grep -q '\[C8\].*1 durable record(s)'; then
-                warn "cell A round $round: the ADJUDICATED fourth-face pair (one C2+C8 dangling take) — standing-red, rung 19's; the custody/era laws' halves are green"
+            # The FACE, exactly: every finding is a C2 'leaked block' or a
+            # C8 '1 durable vs 0' — in matched pairs (fsck is report-only,
+            # so each round's pair PERSISTS and the count accumulates one
+            # pair per demoted-churn round). Any other class/text dies.
+            local c2 c8 other
+            c2="$(echo "$out" | grep -c '\[C2\].*leaked block' || true)"
+            c8="$(echo "$out" | grep -c '\[C8\].*1 durable record(s)' || true)"
+            other="$(echo "$out" | grep -c '^\s*\[C' || true)"
+            if [ "$c2" -ge 1 ] && [ "$c2" = "$c8" ] && [ "$((c2 + c8))" = "$other" ]; then
+                warn "cell A round $round: the ADJUDICATED fourth-face shape ($c2 C2+C8 dangling-take pair(s), accumulated report-only across rounds) — standing-red, rung 19's; the custody/era laws' halves are green"
             else
                 die "cell A round $round: fsck FAILED with a NON-adjudicated shape: $(echo "$out" | tail -4)"
             fi
         }
         drift="$(stat_field 0 meta_kv_block_refs_drift)"
-        [ "$drift" = "0" ] || [ "$drift" = "2" ] ||
-            die "cell A round $round: C8 drift=$drift (the adjudicated pair reads 2; anything else is a regression)"
+        case "$drift" in 0 | 2 | 4 | 6) ;; *)
+            die "cell A round $round: C8 drift=$drift (the adjudicated face reads 2 per accumulated pair; anything else is a regression)"
+            ;;
+        esac
         # The cold-verify bounce fenced every co-writer AGAIN (the S7
         # posture) — re-admit the fleet before the next cell.
         for idx in $(cowriter_idxs); do

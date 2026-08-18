@@ -251,6 +251,9 @@ N_DEFAULT="${SQZ_MWFLEET_N:-2}"
 MDS_COUNT="${SQZ_MWFLEET_MDS_COUNT:-2}"
 OSS_COUNT="${SQZ_MWFLEET_OSS_COUNT:-2}"
 OSS_GB="${SQZ_MWFLEET_OSS_GB:-4}"
+# Rung 18: create-recorded like RANGE_CUSTODY (remount-stable — a member
+# remounted mid-leg must keep the fleet's publish-group posture).
+PUBLISH_GROUP_MAX="${SQZ_MWFLEET_PUBLISH_GROUP_MAX:-}"
 INSTANCE="${SQZ_MWFLEET_INSTANCE:-mwfleet}"
 STATE="${SQZ_MWFLEET_STATE_DIR:-/run/squeezefs-mwfleet}"
 MNT_ROOT="${SQZ_MWFLEET_MNT_ROOT:-/mnt/sqz-mwfleet}"
@@ -704,6 +707,14 @@ mount_member() { # idx [--netns[=<delay_ms>]]
     # SqueezeFS knobs and would trip the registry's typo announcement.
     local env_args=("${SCRUB_ENV[@]}")
     env_args+=("SQUEEZEFS_FLEET_SHARE=$FLEET_N") # options before assignments
+    # Rung 18 (the width-N conveyor-composition standing-red's A/B lever):
+    # SQZ_MWFLEET_PUBLISH_GROUP_MAX=N at create rides into every daemon as
+    # SQUEEZEFS_PUBLISH_COMMIT_GROUP_MAX — `1` is the registered
+    # pre-Lever-B per-save commit path (the measurement control the
+    # MPI-IO row runs under while rung 19 owns the aggregated window's
+    # same-ino composition; never an operational escape).
+    [ -n "${PUBLISH_GROUP_MAX:-}" ] &&
+        env_args+=("SQUEEZEFS_PUBLISH_COMMIT_GROUP_MAX=$PUBLISH_GROUP_MAX")
     # Dev-tree build identities (`-dirty`) are degenerate under the KD-7
     # skew gate; the admin lane (online fsck — the S7-b oracle) refuses
     # them without the counted dev override (the run_preload_gate.sh
@@ -1245,6 +1256,7 @@ create_fleet() {
         # leg requires an armed fleet and is that composition's
         # acceptance surface).
         echo "RANGE_CUSTODY='${SQZ_MWFLEET_RANGE_CUSTODY:-0}'"
+        echo "PUBLISH_GROUP_MAX='${SQZ_MWFLEET_PUBLISH_GROUP_MAX:-}'"
     } >"$CONF"
     : >"$VMS"
 

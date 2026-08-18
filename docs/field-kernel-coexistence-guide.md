@@ -173,6 +173,37 @@ built modules will refuse to load.
   verdict for the Lustre half; if they pile up, fall back to Path A/B
   rather than maintaining a per-rebase port.
 
+## 3d. FIELD ADJUDICATION (2026-08-18): the site Lustre is DDN 2.14 — Paths B and C are FALSIFIED for the client
+
+The first full Path-C attempt on the client reached the Lustre compile
+and hit the real walls: the site client is **`lustre-client
+2.14.0_ddn255`** (a DDN/EXAScaler vendor branch), and against
+6.19.14-sqz it breaks on (a) the **memdesc/folio migration** —
+`page->flags` is now a typed `memdesc_flags_t`, so every raw
+`set_bit(..., &page->flags)` in `lustre_compat.h`/libcfs fails
+(`SetPagePrivate2` was the first of hundreds; upstream absorbed this
+class via folio conversions, and `PG_private_2` itself is leaving the
+kernel), and (b) 2.14-vintage libcfs debug macros vs GCC 14 + 6.19
+headers ("aggregate value used where an integer was expected").
+Verdict:
+
+* **Path C is DEAD for Lustre**: porting a 2.14 vendor fork across the
+  folio/memdesc migration is a multi-week job, re-carried per sqz
+  rebase, and forks the site off the DDN-supported client. (Path C's
+  MOFED half SUCCEEDED — DOCA-OFED 3.4.0 core builds on 6.19.14-sqz
+  under gcc-toolset-14 — recorded for whenever OFED userspace is
+  wanted on the sqz kernel.)
+* **Path B is DEAD for the client**: the negotiated kernel would have
+  to be inside ddn255's supported matrix (EL8/EL9-class, 4.18/5.14) —
+  no realistic fuse-over-io_uring backport exists at that distance.
+  The DDN-client ceiling and the sqz-client floor do not intersect.
+  (Path B may still serve the NODES if they need a supported-matrix
+  kernel with only the small nvmet-PR backport.)
+* **Remaining: Path A (reboot windows) and Path D (dedicated
+  client/VM)** — both zero-porting. If the §4 node probes show no
+  Lustre duty on the storage nodes, they sit on the sqz kernel
+  permanently and only the client juggles.
+
 ## 4. The probe checklist that picks the path (run these first, ~10 min)
 
 On each storage node:

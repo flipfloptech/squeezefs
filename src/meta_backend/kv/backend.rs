@@ -7353,6 +7353,39 @@ impl KvMetaBackend {
                         if base_ok && max_chain > 0 && depth < max_chain {
                             use_delta = self.layout_deltas_ready().await;
                         }
+                        // Rung 19 (the MPI-IO row's live conviction): an
+                        // INDIRECT head can neither fold a delta (the
+                        // fold's own law calls a staged one corruption —
+                        // "layout delta base unusable: indirect base",
+                        // and the `{`-peek above admitted exactly that:
+                        // every subsequent lookup/checkpoint of the key
+                        // then refuses FOREVER) nor absorb the owner-side
+                        // compaction (apply refuses the same base). A
+                        // chained member on one REFUSES with the
+                        // retried-class marker and stages NOTHING; the
+                        // caller's ladder re-composes from the refetched
+                        // indirect truth. Solo/un-chained members are
+                        // untouched (their caller half already gates on
+                        // its own RAM `block_map_id`).
+                        let head_indirect = op.chain
+                            && versions_stamped
+                            && base_ok
+                            && XattrValue::decode(&cur).is_ok_and(|x| {
+                                matches!(
+                                    crate::layout_wire::decode_base_layout(&x.value),
+                                    Err(e) if format!("{e}").contains("indirect")
+                                )
+                            });
+                        if head_indirect {
+                            failed.push((
+                                op.done,
+                                crate::error::SqueezefsError::InvalidOperation(format!(
+                                    "layout delta base unusable: indirect base — ino {}'s                                      durable head spilled to an indirect map; a chained                                      delta cannot fold onto it and a partial full Put                                      would clobber it (rung 19: refetch and recompose)",
+                                    op.ino
+                                )),
+                            ));
+                            continue;
+                        }
                         if op.chain && versions_stamped && base_ok {
                             // KD-MW-8's composition law (rung 17): the
                             // SHIPPED/granted-ino arm never gate-refuses
@@ -7724,6 +7757,22 @@ impl KvMetaBackend {
                 let (depth, head_versions) = self.xattrs.delta_chain_probe(&key).await?;
                 if base_ok && max_chain > 0 && depth < max_chain {
                     use_delta = self.layout_deltas_ready().await;
+                }
+                // Rung 19: the chained indirect-head refusal (the
+                // aggregated pass's twin — see there).
+                if chain
+                    && self.layout_versions_stamped()
+                    && base_ok
+                    && XattrValue::decode(&cur).is_ok_and(|x| {
+                        matches!(
+                            crate::layout_wire::decode_base_layout(&x.value),
+                            Err(e) if format!("{e}").contains("indirect")
+                        )
+                    })
+                {
+                    return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                        "layout delta base unusable: indirect base — ino {ino}'s durable                          head spilled to an indirect map; a chained delta cannot fold onto                          it and a partial full Put would clobber it (rung 19: refetch and                          recompose)"
+                    )));
                 }
                 if chain && self.layout_versions_stamped() && base_ok {
                     // KD-MW-8 rung 17 (see `merge_layout_and_size_chained`

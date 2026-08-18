@@ -2636,10 +2636,28 @@ impl PublishService {
             Ok(Some(bytes)) => bytes,
             _ => return Ok((shipped, None)), // no current layout — first Put, verbatim
         };
-        let (Ok(mut cur), Ok(mut new)) = (
+        let (cur_dec, new_dec) = (
             crate::layout_wire::decode_base_layout(&durable),
             crate::layout_wire::decode_base_layout(&shipped),
-        ) else {
+        );
+        // Rung 19 (the MPI-IO row's live conviction — the 10 GiB face):
+        // an INDIRECT layout on EITHER side of a RANGE holder's Put is
+        // un-composable at the meta plane (the blob is a data-plane
+        // read), and the retired verbatim arm replaced a whole-file map
+        // with the shipper's partial view — the zeros-interleave clobber
+        // at spill scale. "Scoped or not at all" (rung 18's own law):
+        // REFUSE, retried-class, naming the base.
+        let indirect = |r: &std::result::Result<
+            crate::layout_wire::LayoutMetadata,
+            crate::layout_wire::LayoutWireError,
+        >| { matches!(r, Err(e) if format!("{e}").contains("indirect")) };
+        if indirect(&cur_dec) || indirect(&new_dec) {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "layout delta base unusable: indirect base — range holder '{client}'s full                  Put for ino {ino} meets an indirect map ({} side); a custody-scoped                  compose cannot read the blob at the meta plane, and verbatim apply is                  the whole-map clobber (rung 19: refetch and recompose)",
+                if indirect(&cur_dec) { "durable" } else { "shipped" }
+            )));
+        }
+        let (Ok(mut cur), Ok(mut new)) = (cur_dec, new_dec) else {
             // JSON-era/undecodable base: the legacy verbatim arm.
             return Ok((shipped, None));
         };

@@ -523,6 +523,182 @@ async fn the_chained_recompute_keys_records_by_the_global_ino() {
 }
 
 // ===========================================================================
+// 1c. The indirect head: never stage a delta, never clobber (the MPI-IO
+//     row's live conviction — "layout delta base unusable: indirect base")
+// ===========================================================================
+
+fn indirect_layout_bytes(size: u64) -> Vec<u8> {
+    bincode::serialize(&LayoutMetadata {
+        file_type: "striped".into(),
+        size,
+        block_map_id: Some("indirect:be://data:999".into()),
+        block_prefix: Some("be://data".into()),
+        file_id: None,
+        data_key: None,
+        block_map: None,
+    })
+    .expect("serialize indirect layout")
+}
+
+/// Contract (the MPI-IO row's live conviction, this branch: at 10 GiB the
+/// head legally goes `indirect:` under a co-writer's spill, and the chain
+/// gate's `{`-peek admitted deltas onto it — the fold's own law calls
+/// that CORRUPTION, every subsequent lookup/checkpoint of the key refuses
+/// forever ("layout delta base unusable: indirect base", 5,000+ failed
+/// ticks, fsync terminal-EIO). The law: a CHAINED merge onto an indirect
+/// head REFUSES with the retried-class marker — it can neither fold onto
+/// the blob (the meta plane cannot read it) nor full-Put the caller's
+/// partial map over it (the zeros-interleave clobber) — and stages
+/// NOTHING.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chained_merge_onto_an_indirect_head_refuses_and_stages_nothing() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let (be, _p) = sandbox(dir.path(), "own-indirect", true).await;
+    install_test_resolver();
+    let vol = &be.volumes[0];
+    let ino = {
+        use squeezefs::meta_backend::Metadata as _;
+        vol.create(1, "big.bin", libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .expect("inode")
+            .ino
+    };
+    vol.set_layout_and_size(ino, &indirect_layout_bytes(16 * BLOCK), 16 * BLOCK, &[])
+        .await
+        .expect("the indirect head lands");
+
+    let d = delta(
+        16 * BLOCK,
+        &[(3, "be://data:D3")],
+        (0, squeezefs::dlm::mint_layout_version()),
+    );
+    let err = vol
+        .merge_layout_and_size_chained(
+            ino,
+            ino,
+            &d,
+            bytes::Bytes::from(base_layout_bytes(16 * BLOCK, &[(3, "be://data:D3")])),
+            16 * BLOCK,
+            vec![],
+        )
+        .await
+        .expect_err(
+            "a chained merge onto an indirect head must REFUSE — staged, the \
+             delta poisons every subsequent fold of the key",
+        );
+    let text = format!("{err}");
+    assert!(
+        text.contains("indirect base"),
+        "the refusal carries the retried-class marker (the writeback \
+         ladder's classifier keys on it): {text}"
+    );
+    // Nothing staged: the head still folds clean to the indirect layout
+    // (raw bincode decode — `decode_base_layout` refuses indirect bases
+    // by design, which is the very law the gate now enforces).
+    use squeezefs::meta_backend::Metadata as _;
+    let raw = be
+        .getxattr(ino, "layout")
+        .await
+        .expect("head still readable — nothing corrupted the chain")
+        .expect("layout present");
+    let l: LayoutMetadata = bincode::deserialize(&raw).expect("still the indirect head");
+    assert_eq!(l.block_map_id.as_deref(), Some("indirect:be://data:999"));
+
+    for vol in &be.volumes {
+        vol.shutdown().await.expect("shutdown");
+    }
+}
+
+/// Contract (the same face's Put half): a RANGE holder's full Put onto an
+/// INDIRECT durable head must REFUSE — the scoped compose cannot read
+/// either blob at the meta plane, and the retired verbatim arm replaces
+/// the whole-file map with the shipper's partial view (the
+/// zeros-interleave clobber at 10 GiB scale). "Scoped or not at all",
+/// rung 18's own law, extended to the base the scope cannot decode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_range_holders_put_onto_an_indirect_head_refuses_not_clobbers() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let (owner_be, _p) = sandbox(dir.path(), "own-indput", true).await;
+    let (client_be, _p2) = sandbox(dir.path(), "cli-indput", false).await;
+    let auth = start_authority(Arc::clone(&owner_be), "widthn-authority");
+    let (client, pc) = arm_client(&auth, &client_be).await;
+    install_test_resolver();
+    let epoch = client.lease_epoch();
+    let ino = shipped_create(&client_be, "indput.bin").await;
+
+    // The indirect durable head (a peer's spill).
+    let reply = pc
+        .ship(
+            &auth.endpoint,
+            publish::PublishCall::SetLayoutAndSize {
+                ino,
+                layout: indirect_layout_bytes(16 * BLOCK),
+                size: 16 * BLOCK,
+                refs: vec![],
+                lease_epoch: epoch,
+                request_id: 0xA1,
+            },
+        )
+        .await
+        .expect("the indirect head lands (pre-custody verbatim)");
+    assert!(matches!(reply, publish::PublishReply::Unit), "{reply:?}");
+
+    // The holder's custody + its partial-view full Put.
+    let _g = client
+        .acquire_range(
+            ino,
+            (0, BLOCK),
+            (0, BLOCK),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("block 0 range custody");
+    let out = pc
+        .ship(
+            &auth.endpoint,
+            publish::PublishCall::SetLayoutAndSize {
+                ino,
+                layout: base_layout_bytes(16 * BLOCK, &[(0, "be://data:K0")]),
+                size: 16 * BLOCK,
+                refs: vec![frame_op("be://data:K0", ino, 0, true)],
+                lease_epoch: epoch,
+                request_id: 0xA2,
+            },
+        )
+        .await;
+    match out {
+        Err(e) => {
+            let text = format!("{e}");
+            assert!(
+                text.contains("indirect"),
+                "the refusal names the indirect head: {text}"
+            );
+        }
+        Ok(reply) => panic!(
+            "a range holder's Put onto an indirect head applied ({reply:?}) — \
+             the verbatim arm just replaced a whole-file map with one block"
+        ),
+    }
+    // The head survives untouched (raw decode — see the gate pin's note).
+    use squeezefs::meta_backend::Metadata as _;
+    let raw = owner_be
+        .getxattr(ino, "layout")
+        .await
+        .expect("head readable")
+        .expect("layout present");
+    let l: LayoutMetadata = bincode::deserialize(&raw).expect("still the indirect head");
+    assert_eq!(l.block_map_id.as_deref(), Some("indirect:be://data:999"));
+
+    auth.listener.shutdown();
+    shutdown(&owner_be).await;
+    shutdown(&client_be).await;
+}
+
+// ===========================================================================
 // 2. The custody-scoped Put's accounting follows the composition
 // ===========================================================================
 

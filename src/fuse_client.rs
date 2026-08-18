@@ -1862,8 +1862,18 @@ pub fn writeback_error_is_terminal(e: &SqueezefsError) -> bool {
     // (InvalidOperation), the coalesced-pass wrap (Io), and the SHIPPED
     // face (the owner's refusal decodes as Refused{errno} through the
     // publish wire's WireError round trip) — the marker is the class.
-    if format!("{e}").contains("divergent layout-delta chain") {
-        return false;
+    // Second sibling (same live row, next pass): "layout delta base
+    // unusable: indirect base" — the OWNER's chain-cap compaction went
+    // INDIRECT while this co-writer's delta was in flight; the cure is
+    // the same refetch-and-recompute (the reset provenance makes the
+    // next save read the indirect head and take the full/indirect path).
+    {
+        let text = format!("{e}");
+        if text.contains("divergent layout-delta chain")
+            || text.contains("layout delta base unusable")
+        {
+            return false;
+        }
     }
     match e {
         // Supersession + lease races: the ladder's own healthy churn.

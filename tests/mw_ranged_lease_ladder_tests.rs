@@ -722,6 +722,14 @@ async fn the_divergence_refusal_is_the_retried_supersession_class() {
         !squeezefs::fuse_client::writeback_error_is_terminal(&shipped),
         "the SHIPPED face (the owner's refusal decoded Refused{{errno}}          through the publish wire) is the same class"
     );
+    let indirect = squeezefs::error::SqueezefsError::refused(
+        libc::EINVAL,
+        "Invalid operation: kv metadata: corrupt KV encoding: layout delta base unusable:          indirect base — its map lives in a data-plane blob; a delta cannot fold onto it",
+    );
+    assert!(
+        !squeezefs::fuse_client::writeback_error_is_terminal(&indirect),
+        "the owner's mid-flight INDIRECT flip is the same refetch-and-recompute class"
+    );
     let corrupt = squeezefs::error::SqueezefsError::InvalidOperation(
         "kv metadata: corrupt KV encoding: bad checksum".to_string(),
     );

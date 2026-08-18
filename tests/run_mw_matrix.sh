@@ -3770,7 +3770,16 @@ PYV
         cat "$(mnt_of "$idx")/.stats" >/dev/null 2>&1 ||
             die "s11-subblock: member m$idx is not healthy at leg end"
     done
-    [ -z "$comp_bad" ] || die "s11-subblock CORRECTNESS RED: $comp_bad"
+    [ -z "$comp_bad" ] || die "s11-subblock CORRECTNESS RED: $comp_bad
+STANDING-RED ADJUDICATION (rung 18, 2026-08-18 — the G-RW2 pattern): the row's
+ENGAGEMENT + PRICE halves are green machinery; the fsck/C8 half stands red on
+ONE named residual — the authority's fs-level displaced-release/settle windows
+vs SERVED direct merges (three faces fixed and pinned this rung: the
+demoted-truth scope, the serve-window serialization, the served-layout RAM
+invalidation; the fourth — the fold's displaced-set/seed-incarnation vs the
+served free path, drift ≈ 2, one dangling take, leak-safe and oracle-detected —
+is rung 19's, named in .benchmarks/2026-08-18-s11-mpiio-row.md). A DIFFERENT
+failure shape here is a plain regression."
     log "s11-subblock GREEN — the sub-block exception row priced (snapshots + fsck in $rowdir). Evidence tier: measured-simulated (one box, co-located members)"
 }
 

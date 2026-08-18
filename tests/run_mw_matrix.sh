@@ -370,10 +370,82 @@
 #                       quarantine (the design-§5 split: a read worker
 #                       DMAs nothing). The victim remounts at leg end
 #                       (zero residue).
+#   s11-mpiio [--procs=P]  (rung 18, §9.5 — needs a range-custody-ARMED
+#                       fleet, --cowriters>=2; the design shape is 8)
+#                       THE MPI-IO ACCEPTANCE ROW: `ior` (PINNED release
+#                       4.0.0 + sha256, built on demand into
+#                       target/mw-ior — OQ-4's adjudication), POSIX api,
+#                       MPMD over the co-writer mounts (each app context
+#                       names its own mount's path of ONE shared file —
+#                       global ranks interleave 4 MiB-aligned segments
+#                       block-cyclically), P procs per mount (default 4).
+#                       A-B-B-A: shared, disjoint (-F file-per-proc,
+#                       same fleet/geometry), disjoint, shared — each
+#                       phase self-sized by a probe pass to a sustained
+#                       >=60 s window of >=3 iterations (flatness gated:
+#                       first-vs-last steady iteration within 30%).
+#                       GATE: BOTH brackets shared >= 0.8x disjoint.
+#                       Engagement exact: every co-writer's ranged
+#                       acquires engaged, authority grants account,
+#                       cap_refusals == 0 (Issue-19), demotions == 0 and
+#                       patch/overlay range-shared clauses == 0 (aligned
+#                       rows share nothing), publish ships accounted.
+#                       Correctness: ior read-back-exact (-r -R -C, the
+#                       reorder-tasks cross-mount check under a fixed -G
+#                       signature) + cold-authority fsck + C8 drift 0.
+#   s11-blockcyclic     (rung 18, §9.5 — needs a range-custody-ARMED
+#                       fleet) THE NON-COALESCIBLE LEGITIMATE SHAPE: one
+#                       ior proc per co-writer mount, round-robin
+#                       block-cyclic decomposition of one file (a
+#                       holder's spans are NEVER adjacent by
+#                       construction — nothing coalesces). GATES: grants
+#                       ~= blocks-in-file with ZERO cap refusals below
+#                       the R5 byte budget (the Issue-19 shape
+#                       adjudicated live, not discovered), the live
+#                       span table (range_custody_active,
+#                       dlm_grant_table_bytes sampled DURING the write)
+#                       accounts ~= spans x 48 B, and the aggregate
+#                       stays within band (>= 0.8x) of a same-width
+#                       disjoint (-F) control. fsck + C8 clean.
+#   s11-tiny            (rung 18, §9.5 — needs --cowriters>=2) THE
+#                       ADVERSARIAL TINY-RANGES BOUNDS ROW, live face:
+#                       one co-writer floods byte-granular unaligned
+#                       tiny writes across one file (required-only-class
+#                       asks; desired block-aligns) while a SECOND
+#                       co-writer's own-file fsync ops sample foreign-
+#                       client latency. GATES: admit-time coalescing
+#                       holds live spans <= the file's geometry cap
+#                       (spans ~= O(file blocks)), dlm_grant_table_bytes
+#                       bounded (<= spans x 48 B + wholes, << budget),
+#                       zero cap refusals (a within-budget shape refused
+#                       = the Issue-19 class), no wedge (every write
+#                       completes), foreign-client latency during the
+#                       storm within 5x its baseline median (reported
+#                       exact). The AT-BUDGET refusal law itself is the
+#                       standing in-process pin set (rung 15 pins a/b +
+#                       the wire face — refusals name the arithmetic and
+#                       converge by release); no live sub-budget shape
+#                       can reach the derived byte budget honestly.
+#   s11-killrange [--rounds=N]  (rung 18, §9.5 — needs a range-custody-
+#                       ARMED fleet, --cowriters>=2) THE RANGE KILL
+#                       MATRIX. Cell H x N (default 10): kill -9 a range
+#                       HOLDER mid-write — the survivor's concurrent
+#                       stream completes green, the authority sweeps the
+#                       victim's era (dlm_revokes_expired moves,
+#                       range_custody_active converges to 0),
+#                       dlm_custody_grace_conflicts == 0, the victim
+#                       re-admits by remount, fsck + C8 clean AFTER
+#                       EVERY CELL. Cell A x 2: kill -9 the AUTHORITY
+#                       mid-ASSEMBLY (two-holder sub-block extent churn
+#                       live) — the authority remounts, co-writers
+#                       re-admit, retained extents re-ship idempotently
+#                       (MW-11's live face), the re-driven pass
+#                       completes, bytes verify cold, fsck + C8 clean.
 #
 # Usage:  sudo tests/run_mw_matrix.sh <leg> [--require-host-scoped-subsys]
 #         [--window=S] [--netem=MS] [--victim=IDX]   (the s6-* legs)
-#         [--rounds=N]                               (s7-kill-matrix)
+#         [--rounds=N]                               (s7-kill-matrix, s11-killrange)
+#         [--procs=P]                                (s11-mpiio)
 # Exit:   0 green (or a loud SKIP), nonzero on any INVALID row / violation.
 #
 # Requires: root, a live fleet (sudo tests/mw_fleet.sh create N=2), python3.
@@ -441,9 +513,13 @@ for a in "$@"; do
         ;;
     --corpus-mb=*) S10C_MB="${a#--corpus-mb=}" ;;
     --runs=*) S10C_RUNS="${a#--runs=}" ;;
+    --procs=*) S11_PROCS="${a#--procs=}" ;;
     *) die "unknown argument '$a'" ;;
     esac
 done
+S11_PROCS="${S11_PROCS:-4}"
+[[ "$S11_PROCS" =~ ^[0-9]+$ ]] && [ "$S11_PROCS" -ge 1 ] && [ "$S11_PROCS" -le 16 ] ||
+    die "--procs takes 1..16 (got '$S11_PROCS')"
 [[ "$S9A_MB_CAP" =~ ^[0-9]+$ ]] && [ "$S9A_MB_CAP" -ge 64 ] || die "--mb takes MiB >= 64 (got '$S9A_MB_CAP')"
 [[ "$S11_MB_CAP" =~ ^[0-9]+$ ]] && [ "$S11_MB_CAP" -ge 64 ] || die "--mb takes MiB >= 64 (got '$S11_MB_CAP')"
 [[ "$S6_WINDOW_S" =~ ^[0-9]+$ ]] || die "--window takes seconds (got '$S6_WINDOW_S')"
@@ -3426,7 +3502,12 @@ PYS11
     [ "$drift" = "0" ] || comp_bad="${comp_bad:+$comp_bad; }meta_kv_block_refs_drift=$drift (C8)"
 
     # ---- Re-admit the co-writers the authority remount fenced ---------------
-    for idx in "$m1" "$m2"; do
+    # ALL of them, not just the leg's participants: an authority bounce
+    # SELF-FENCES every co-writer's membership/custody lease (the S7
+    # designed posture — "a fenced holder is dead until remount"), so a
+    # wider fleet's bystanders wedge unless re-admitted here (found live
+    # on the rung-18 8-co-writer fleet: m52..m57 fenced at leg end).
+    for idx in $(cowriter_idxs); do
         "$MWFLEET" unmount "$idx" >/dev/null 2>&1 || true
         admitted=0
         for ((tries = 0; tries < 15; tries++)); do
@@ -3661,7 +3742,9 @@ PYV
     fi
     drift="$(stat_field 0 meta_kv_block_refs_drift)"
     [ "$drift" = "0" ] || comp_bad="${comp_bad:+$comp_bad; }meta_kv_block_refs_drift=$drift (C8)"
-    for idx in "$m1" "$m2"; do
+    # ALL co-writers, not just the participants (the authority bounce
+    # fences every one — the s11-range re-admit note applies verbatim).
+    for idx in $(cowriter_idxs); do
         "$MWFLEET" unmount "$idx" >/dev/null 2>&1 || true
         local admitted=0 tries
         for ((tries = 0; tries < 15; tries++)); do
@@ -3677,6 +3760,721 @@ PYV
     done
     [ -z "$comp_bad" ] || die "s11-subblock CORRECTNESS RED: $comp_bad"
     log "s11-subblock GREEN — the sub-block exception row priced (snapshots + fsck in $rowdir). Evidence tier: measured-simulated (one box, co-located members)"
+}
+
+# =============================================================================
+# Rung 18 (§9.5): the S11 closing rows — MPI-IO / block-cyclic / tiny-ranges
+# bounds / range kill matrix. `ior` is the PINNED external instrument
+# (OQ-4's orchestrator-adopted default: "ior, pinned release + checksum,
+# scoreboard-style"); it builds on demand into target/mw-ior (a BUILD
+# product, the target/mw-guest precedent — never fleet residue).
+# =============================================================================
+
+IOR_VERSION="4.0.0"
+IOR_SHA256="510b7d4ad0f287375848121aa5a1f9842db077c1d81ad0dde738e96255298158"
+IOR_URL="https://github.com/hpc/ior/releases/download/$IOR_VERSION/ior-$IOR_VERSION.tar.gz"
+IOR_BIN="$REPO/target/mw-ior/ior-$IOR_VERSION/src/ior"
+
+ensure_ior() {
+    command -v mpirun >/dev/null 2>&1 ||
+        die "the MPI-IO rows need an MPI launcher (openmpi/mpich mpirun) on PATH — install the distro package (versions are recorded in the row)"
+    [ -x "$IOR_BIN" ] && return 0
+    command -v mpicc >/dev/null 2>&1 ||
+        die "building the pinned ior needs mpicc (openmpi/mpich devel) on PATH"
+    command -v curl >/dev/null 2>&1 || die "building the pinned ior needs curl"
+    local bdir="$REPO/target/mw-ior"
+    mkdir -p "$bdir"
+    local tarball="$bdir/ior-$IOR_VERSION.tar.gz"
+    if [ ! -f "$tarball" ] || ! echo "$IOR_SHA256  $tarball" | sha256sum -c --quiet - 2>/dev/null; then
+        log "fetching pinned ior $IOR_VERSION"
+        curl -fsSL -o "$tarball" "$IOR_URL" || die "could not fetch $IOR_URL (the pin: $IOR_SHA256)"
+    fi
+    echo "$IOR_SHA256  $tarball" | sha256sum -c --quiet - ||
+        die "ior tarball checksum MISMATCH (expected $IOR_SHA256) — refusing an unpinned instrument"
+    (
+        cd "$bdir" && tar xzf "$tarball" && cd "ior-$IOR_VERSION" &&
+            # -std=gnu17: ior 4.0.0's option.c calls a ()-declared fn
+            # pointer with an argument — an error under GCC>=15's C23
+            # default, legal pre-C23 (recorded build nuance, not a patch).
+            ./configure --without-hdf5 --without-ncmpi CFLAGS="-std=gnu17 -O2" >configure.log 2>&1 &&
+            make -j"$(nproc)" >make.log 2>&1
+    ) || die "pinned ior build failed — see $bdir/ior-$IOR_VERSION/{configure,make}.log"
+    [ -x "$IOR_BIN" ] || die "ior build produced no binary at $IOR_BIN"
+    log "pinned ior $IOR_VERSION ready ($IOR_BIN, sha256 $IOR_SHA256)"
+}
+
+# One MPMD ior invocation over the co-writer mounts: every app context
+# carries IDENTICAL options apart from -o (its own mount's path of the
+# SAME file — global ranks compose one shared-file layout; proven
+# semantics: `tasks: K*P`, single-shared-file, one inode). stdout to $1.
+run_ior() { # outfile procs_per_mount fname extra-ior-args...
+    local outfile="$1" procs="$2" fname="$3"
+    shift 3
+    local args=() idx first=1
+    for idx in $(cowriter_idxs); do
+        [ "$first" = "1" ] || args+=(":")
+        first=0
+        args+=(-np "$procs" "$IOR_BIN" -a POSIX -o "$(mnt_of "$idx")/$fname" "$@")
+    done
+    # --bind-to none: 32 ranks + N daemons share the cores — MPI core
+    # binding would pin ranks onto the daemons' lanes. Root launch is the
+    # matrix's own posture (ensure_root), hence --allow-run-as-root.
+    timeout 1200 mpirun --allow-run-as-root --bind-to none "${args[@]}" >"$outfile" 2>&1 || {
+        tail -5 "$outfile" >&2
+        die "ior invocation failed (rc=$? — full output in $outfile)"
+    }
+}
+
+# Per-iteration bandwidths (MiB/s) of one access class from an ior run:
+# the short per-iteration Results rows (the ~26-field 'Summary of all
+# tests' row is excluded by the field-count guard).
+ior_iter_bws() { # outfile write|read
+    awk -v cls="$2" '$1 == cls && NF <= 12 { print $2 }' "$1"
+}
+
+leg_s11_mpiio() {
+    require_cowriters 2
+    [ "${RANGE_CUSTODY:-0}" = "1" ] ||
+        die "s11-mpiio needs a range-custody-ARMED fleet: sudo SQZ_MWFLEET_RANGE_CUSTODY=1 tests/mw_fleet.sh create N=1 --cowriters=8"
+    ensure_ior
+    local rowdir cws k ranks idx w_mnt
+    rowdir="$STATE/rows/s11mpiio-$(date +%s)"
+    mkdir -p "$rowdir"
+    mapfile -t cws < <(cowriter_idxs)
+    k="${#cws[@]}"
+    ranks=$((k * S11_PROCS))
+    w_mnt="$(mnt_of 0)"
+    local sig=$((RANDOM * 32768 + RANDOM + 1))
+    log "s11-mpiio: $k co-writer mounts x $S11_PROCS procs = $ranks ranks, ONE shared file, 4 MiB-aligned block-cyclic segments (ior $IOR_VERSION POSIX MPMD, -G $sig); baseline = -F file-per-proc, SAME fleet/geometry; A-B-B-A"
+    log "instrument: ior $IOR_VERSION (sha256 $IOR_SHA256) + $(mpirun --version 2>&1 | head -1); substrate: tcp devsub (nvmet-tcp localhost)"
+    local provisional=""
+    pgrep -x cargo >/dev/null 2>&1 && provisional="PROVISIONAL (foreign cargo work running)"
+    [ -n "$provisional" ] && warn "quiet gate: $provisional — the table is labeled; the gate still enforces"
+
+    # ---- probe: self-size the sustained window --------------------------------
+    local s_probe=8 probe_bytes
+    probe_bytes=$((ranks * 4 * s_probe))
+    truncate -s "$((probe_bytes * 1024 * 1024))" "$w_mnt/s11-mpiio.dat" ||
+        die "s11-mpiio: authority could not create the shared file"
+    run_ior "$rowdir/probe.out" "$S11_PROCS" "s11-mpiio.dat" \
+        -b 4m -t 4m -s "$s_probe" -w -e -k -E -G "$sig" -i 1
+    local bw_probe
+    bw_probe="$(ior_iter_bws "$rowdir/probe.out" write | head -1)"
+    [ -n "$bw_probe" ] || die "s11-mpiio: probe parsed no write bandwidth ($rowdir/probe.out)"
+    # Target ~22 s per iteration, >=3 steady iterations after the
+    # allocation pass; file capped at 10 GiB (zram budget).
+    local s_row n_iter
+    s_row="$(python3 -c "
+bw=$bw_probe; r=$ranks
+s=int(bw*22/(r*4))
+cap=int(10*1024/(r*4))
+print(max(8, min(s, cap)))")"
+    n_iter="$(python3 -c "
+bw=$bw_probe; r=$ranks; s=$s_row
+wall=r*4*s/max(bw,1)
+import math
+print(max(4, min(24, math.ceil(70/max(wall,0.1))+1)))")"
+    local row_mb=$((ranks * 4 * s_row))
+    log "probe: $bw_probe MiB/s aggregate -> file ${row_mb} MiB (s=$s_row), $n_iter iterations/phase (sustained window sized >=60 s + >=3 steady iterations)"
+    truncate -s "$((row_mb * 1024 * 1024))" "$w_mnt/s11-mpiio.dat"
+
+    # ---- A-B-B-A ---------------------------------------------------------------
+    local phase=0
+    for idx in $(member_idxs); do snap "$idx" 0 "$rowdir"; done
+    declare -A PHASE_BW PHASE_ITERS
+    run_phase() { # label shared|fpp
+        phase=$((phase + 1))
+        local label="$1" mode="$2" extra=()
+        [ "$mode" = "fpp" ] && extra+=(-F)
+        local t0 t1
+        t0="$(date +%s)"
+        run_ior "$rowdir/$label.out" "$S11_PROCS" \
+            "$([ "$mode" = "fpp" ] && echo "s11-mpiio-fpp.dat" || echo "s11-mpiio.dat")" \
+            -b 4m -t 4m -s "$s_row" -w -e -k -E -G "$sig" -i "$n_iter" "${extra[@]}"
+        t1="$(date +%s)"
+        local bws
+        bws="$(ior_iter_bws "$rowdir/$label.out" write | tr '\n' ' ')"
+        PHASE_ITERS[$label]="$bws"
+        # Steady mean = iterations 2..N (iteration 1 is the allocation/
+        # first-touch regime, reported separately); flatness = first vs
+        # last steady iteration within 30%.
+        # shellcheck disable=SC2086 # $bws is a deliberate word-split list of per-iteration numbers
+        PHASE_BW[$label]="$(python3 - "$label" $bws <<'PYF'
+import sys
+label = sys.argv[1]
+bws = [float(x) for x in sys.argv[2:]]
+if len(bws) < 4:
+    print(f"phase {label}: only {len(bws)} iterations — the sustained window needs >= 4", file=sys.stderr)
+    sys.exit(1)
+steady = bws[1:]
+first, last = steady[0], steady[-1]
+if last < 0.70 * first:
+    print(f"phase {label}: NOT SUSTAINED — steady iterations decay {first:.0f} -> {last:.0f} MiB/s (> 30%): a burst number that decays is a FAILED row", file=sys.stderr)
+    sys.exit(1)
+print(f"{sum(steady)/len(steady):.1f}")
+PYF
+)" || die "s11-mpiio: phase $label failed the sustained-window gate"
+        log "phase $label ($mode): steady ${PHASE_BW[$label]} MiB/s over $((t1 - t0))s wall (iters: ${PHASE_ITERS[$label]})"
+        for idx in $(member_idxs); do snap "$idx" "$phase" "$rowdir"; done
+    }
+    run_phase A1 shared
+    run_phase B1 fpp
+    run_phase B2 fpp
+    run_phase A2 shared
+
+    # ---- the ≥0.8× gate, BOTH brackets ----------------------------------------
+    python3 - "${PHASE_BW[A1]}" "${PHASE_BW[B1]}" "${PHASE_BW[B2]}" "${PHASE_BW[A2]}" <<'PYG' || die "s11-mpiio GATE FAILED"
+import sys
+a1, b1, b2, a2 = (float(x) for x in sys.argv[1:5])
+r1, r2 = a1 / b1, a2 / b2
+print(f"A-B-B-A: shared {a1:.0f} / disjoint {b1:.0f} = {r1:.3f}; shared {a2:.0f} / disjoint {b2:.0f} = {r2:.3f}")
+if r1 < 0.8 or r2 < 0.8:
+    print(f"S11 MPI-IO GATE FAILED: shared/disjoint bracket below 0.8x (r1={r1:.3f}, r2={r2:.3f})", file=sys.stderr)
+    sys.exit(1)
+print(f"S11 MPI-IO GATE: shared >= 0.8x disjoint in BOTH brackets (min {min(r1, r2):.3f})")
+PYG
+
+    # ---- engagement, exact ------------------------------------------------------
+    python3 - "$rowdir" "$k" "$phase" "${cws[@]}" <<'PYE' || die "s11-mpiio: INVALID ROW (engagement)"
+import json, sys
+rowdir, k, last = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+cws = sys.argv[4:]
+def flat(d, out=None, pfx=""):
+    out = {} if out is None else out
+    for kk, v in d.items():
+        if isinstance(v, dict): flat(v, out, pfx + kk + ".")
+        else: out[pfx + kk] = v
+    return out
+def load(i, ph): return flat(json.load(open(f"{rowdir}/m{i}_p{ph}.json")))
+d = lambda i, a, b, key: int(load(i, b).get(key, 0) or 0) - int(load(i, a).get(key, 0) or 0)
+bad = []
+for m in cws:
+    ranged = d(m, 0, last, "dlm_custody.dlm_custody_range_acquires") \
+        + d(m, 0, last, "dlm_custody.dlm_custody_range_extensions")
+    shipped = d(m, 0, last, "meta_ship_publish.shipped")
+    print(f"m{m}: ranged acquires+extensions d={ranged} publish shipped d={shipped}")
+    if ranged < 1:
+        bad.append(f"m{m}: the ranged path never engaged (a silent whole-file fallback = the row is a lie)")
+    if shipped < 1:
+        bad.append(f"m{m}: no publish shipped — the co-writer's layout publishes must travel")
+grants = d("0", 0, last, "range_custody.range_custody_grants")
+caps = d("0", 0, last, "range_custody.range_custody_cap_refusals")
+dem = d("0", 0, last, "range_custody.range_custody_demotions")
+prs = d("0", 0, last, "patch_ineligible_range_shared")
+ors = d("0", 0, last, "overlay_ineligible_range_shared")
+conflicts = d("0", 0, last, "range_custody.range_custody_conflicts")
+trims = d("0", 0, last, "range_custody.range_custody_desired_trims")
+print(f"authority: grants d={grants} cap_refusals d={caps} demotions d={dem} conflicts d={conflicts} desired_trims d={trims} prs d={prs} ors d={ors}")
+if grants < k: bad.append(f"authority grants d={grants} < {k} mounts — stripes unaccounted")
+if caps != 0: bad.append(f"range_custody_cap_refusals d={caps} on a within-budget shape — the Issue-19 class")
+if dem != 0: bad.append(f"demotions d={dem} on a 4MiB-ALIGNED row — fabricated block sharing")
+if prs != 0 or ors != 0: bad.append(f"range-shared clause ledgers moved (prs={prs}, ors={ors}) — nothing should share a block on aligned rows")
+if bad:
+    print("S11 MPI-IO ENGAGEMENT FAILED:", file=sys.stderr)
+    for b in bad: print(f"  {b}", file=sys.stderr)
+    sys.exit(1)
+print("S11 MPI-IO engagement GREEN (ranged engaged on every mount, Issue-19 column 0, zero fabricated sharing)")
+PYE
+
+    # ---- correctness: cross-mount read-back exact + cold oracle ----------------
+    run_ior "$rowdir/readcheck.out" "$S11_PROCS" "s11-mpiio.dat" \
+        -b 4m -t 4m -s "$s_row" -r -R -C -k -E -G "$sig" -i 1
+    grep -qiE "incorrect|error" "$rowdir/readcheck.out" &&
+        die "s11-mpiio: read-back-exact FAILED (reorder-tasks cross-mount check): $(grep -icE 'incorrect' "$rowdir/readcheck.out") bad transfers — $rowdir/readcheck.out"
+    log "read-back exact: $(ior_iter_bws "$rowdir/readcheck.out" read | head -1) MiB/s aggregate reorder-read, zero data-check errors"
+
+    for idx in "${cws[@]}"; do
+        rm -f "$(mnt_of "$idx")/s11-mpiio-fpp.dat".* 2>/dev/null || true
+    done
+    local comp_bad=""
+    "$MWFLEET" unmount 0 >/dev/null 2>&1 || true
+    "$MWFLEET" mount 0 >/dev/null 2>&1 || die "s11-mpiio: authority remount failed"
+    local out drift
+    if out="$("$SQZ" fsck "$w_mnt" 2>&1)"; then
+        echo "$out" >"$rowdir/fsck.out"
+        echo "$out" | grep -q "findings: 0" || comp_bad="fsck findings != 0"
+    else
+        echo "$out" >"$rowdir/fsck.out"
+        comp_bad="fsck FAILED"
+    fi
+    drift="$(stat_field 0 meta_kv_block_refs_drift)"
+    [ "$drift" = "0" ] || comp_bad="${comp_bad:+$comp_bad; }meta_kv_block_refs_drift=$drift (C8)"
+    rm -f "$w_mnt/s11-mpiio.dat" || die "s11-mpiio: could not remove the leg's file"
+    for idx in "${cws[@]}"; do
+        "$MWFLEET" unmount "$idx" >/dev/null 2>&1 || true
+        local admitted=0 tries
+        for ((tries = 0; tries < 15; tries++)); do
+            if "$MWFLEET" mount "$idx" >/dev/null 2>&1; then admitted=1; break; fi
+            sleep 10
+        done
+        [ "$admitted" = "1" ] || die "s11-mpiio: co-writer m$idx could not re-admit after the cold remount"
+    done
+    for idx in $(member_idxs); do
+        cat "$(mnt_of "$idx")/.stats" >/dev/null 2>&1 ||
+            die "s11-mpiio: member m$idx is not healthy at leg end"
+    done
+    [ -z "$comp_bad" ] || die "s11-mpiio CORRECTNESS RED: $comp_bad"
+    log "s11-mpiio GREEN${provisional:+ [$provisional]} — the MPI-IO acceptance row (outputs + snapshots + fsck in $rowdir). Evidence tier: measured-simulated (one box, co-located members)"
+}
+
+leg_s11_blockcyclic() {
+    require_cowriters 2
+    [ "${RANGE_CUSTODY:-0}" = "1" ] ||
+        die "s11-blockcyclic needs a range-custody-ARMED fleet: sudo SQZ_MWFLEET_RANGE_CUSTODY=1 tests/mw_fleet.sh create N=1 --cowriters=8"
+    ensure_ior
+    local rowdir cws k idx w_mnt
+    rowdir="$STATE/rows/s11bc-$(date +%s)"
+    mkdir -p "$rowdir"
+    mapfile -t cws < <(cowriter_idxs)
+    k="${#cws[@]}"
+    w_mnt="$(mnt_of 0)"
+    local sig=$((RANDOM * 32768 + RANDOM + 2))
+    # ~512 blocks: enough that the span table's O(blocks) population is a
+    # real statement, small enough for a bounded row.
+    local s_bc=$((512 / k)) blocks=$((512 / k * k)) file_mb=$((512 / k * k * 4))
+    log "s11-blockcyclic: $k mounts x 1 proc, round-robin block-cyclic over ONE ${file_mb}MiB file ($blocks x 4MiB blocks; a holder's spans NEVER adjacent — nothing coalesces); control = same-width -F"
+    truncate -s $((file_mb * 1024 * 1024)) "$w_mnt/s11-bc.dat" ||
+        die "s11-blockcyclic: authority could not create the file"
+
+    for idx in $(member_idxs); do snap "$idx" 0 "$rowdir"; done
+    # The live span-table sampler: the population only exists while the
+    # write phase runs (grants release at close), so the gauge is sampled
+    # DURING, max-held.
+    (
+        max_active=0 max_bytes=0
+        while [ ! -f "$rowdir/.sampler-stop" ]; do
+            a="$(stat_field 0 range_custody.range_custody_active 2>/dev/null || echo 0)"
+            b="$(stat_field 0 range_custody.dlm_grant_table_bytes 2>/dev/null || echo 0)"
+            [ -n "$a" ] && [ "$a" -gt "$max_active" ] 2>/dev/null && max_active="$a"
+            [ -n "$b" ] && [ "$b" -gt "$max_bytes" ] 2>/dev/null && max_bytes="$b"
+            echo "$max_active $max_bytes" >"$rowdir/sampler.out"
+            sleep 0.5
+        done
+    ) &
+    local sampler_pid=$!
+    run_ior "$rowdir/bc.out" 1 "s11-bc.dat" -b 4m -t 4m -s "$s_bc" -w -e -k -E -G "$sig" -i 1
+    touch "$rowdir/.sampler-stop"
+    wait "$sampler_pid" 2>/dev/null || true
+    for idx in $(member_idxs); do snap "$idx" 1 "$rowdir"; done
+    local bc_bw
+    bc_bw="$(ior_iter_bws "$rowdir/bc.out" write | head -1)"
+
+    # Same-width disjoint control (the band's denominator).
+    run_ior "$rowdir/bc-ctl.out" 1 "s11-bc-fpp.dat" -b 4m -t 4m -s "$s_bc" -w -e -k -G "$sig" -i 1 -F
+    local ctl_bw
+    ctl_bw="$(ior_iter_bws "$rowdir/bc-ctl.out" write | head -1)"
+    for idx in $(member_idxs); do snap "$idx" 2 "$rowdir"; done
+
+    local max_active max_bytes
+    read -r max_active max_bytes <"$rowdir/sampler.out"
+    log "block-cyclic: $bc_bw MiB/s vs same-width disjoint control $ctl_bw MiB/s; live span table max: active=$max_active grant_table_bytes=$max_bytes (expected ~= $blocks spans x 48 B + wholes)"
+
+    python3 - "$rowdir" "$blocks" "$k" "$max_active" "$max_bytes" "$bc_bw" "$ctl_bw" <<'PYBC' || die "s11-blockcyclic: GATE FAILED"
+import json, sys
+rowdir, blocks, k, max_active, max_bytes, bc_bw, ctl_bw = \
+    sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]), float(sys.argv[6]), float(sys.argv[7])
+def flat(d, out=None, pfx=""):
+    out = {} if out is None else out
+    for kk, v in d.items():
+        if isinstance(v, dict): flat(v, out, pfx + kk + ".")
+        else: out[pfx + kk] = v
+    return out
+def load(i, ph): return flat(json.load(open(f"{rowdir}/m{i}_p{ph}.json")))
+d = lambda i, a, b, key: int(load(i, b).get(key, 0) or 0) - int(load(i, a).get(key, 0) or 0)
+bad = []
+grants = d("0", 0, 1, "range_custody.range_custody_grants")
+caps = d("0", 0, 2, "range_custody.range_custody_cap_refusals")
+dem = d("0", 0, 2, "range_custody.range_custody_demotions")
+budget = int(load("0", 1).get("range_custody.dlm_grant_table_budget_bytes", 0) or 0)
+print(f"grants d={grants} (blocks={blocks})  cap_refusals d={caps}  demotions d={dem}")
+print(f"span table max: active={max_active} bytes={max_bytes} (budget {budget})")
+if grants < blocks:
+    bad.append(f"grants d={grants} < blocks {blocks} — the non-coalescible shape must mint ~one span per block")
+if caps != 0:
+    bad.append(f"range_custody_cap_refusals d={caps} on a within-budget block-cyclic shape — THE ISSUE-19 CLASS: a constant refusing the workload S11 exists for")
+if dem != 0:
+    bad.append(f"demotions d={dem} on an aligned block-cyclic row — fabricated sharing")
+if max_active < int(0.8 * blocks):
+    bad.append(f"live span population max {max_active} < 0.8x blocks {blocks} — the table never held the decomposition")
+if budget and max_bytes > budget:
+    bad.append(f"grant table bytes {max_bytes} exceeded the R5 share {budget}")
+if bc_bw < 0.8 * ctl_bw:
+    bad.append(f"block-cyclic aggregate {bc_bw:.0f} MiB/s below 0.8x its same-width disjoint control {ctl_bw:.0f}")
+if bad:
+    print("S11 BLOCK-CYCLIC GATE FAILED:", file=sys.stderr)
+    for b in bad: print(f"  {b}", file=sys.stderr)
+    sys.exit(1)
+print(f"S11 block-cyclic GREEN: grants ~= blocks ({grants}/{blocks}), ZERO cap refusals, table bounded ({max_bytes} B <= {budget} B), band {bc_bw/ctl_bw:.3f}x")
+PYBC
+
+    for idx in "${cws[@]}"; do
+        rm -f "$(mnt_of "$idx")/s11-bc-fpp.dat".* 2>/dev/null || true
+    done
+    local comp_bad="" out drift
+    "$MWFLEET" unmount 0 >/dev/null 2>&1 || true
+    "$MWFLEET" mount 0 >/dev/null 2>&1 || die "s11-blockcyclic: authority remount failed"
+    if out="$("$SQZ" fsck "$w_mnt" 2>&1)"; then
+        echo "$out" >"$rowdir/fsck.out"
+        echo "$out" | grep -q "findings: 0" || comp_bad="fsck findings != 0"
+    else
+        echo "$out" >"$rowdir/fsck.out"
+        comp_bad="fsck FAILED"
+    fi
+    drift="$(stat_field 0 meta_kv_block_refs_drift)"
+    [ "$drift" = "0" ] || comp_bad="${comp_bad:+$comp_bad; }meta_kv_block_refs_drift=$drift (C8)"
+    rm -f "$w_mnt/s11-bc.dat"
+    for idx in "${cws[@]}"; do
+        "$MWFLEET" unmount "$idx" >/dev/null 2>&1 || true
+        local admitted=0 tries
+        for ((tries = 0; tries < 15; tries++)); do
+            if "$MWFLEET" mount "$idx" >/dev/null 2>&1; then admitted=1; break; fi
+            sleep 10
+        done
+        [ "$admitted" = "1" ] || die "s11-blockcyclic: co-writer m$idx could not re-admit"
+    done
+    [ -z "$comp_bad" ] || die "s11-blockcyclic CORRECTNESS RED: $comp_bad"
+    log "s11-blockcyclic GREEN — the Issue-19 shape adjudicated live (outputs in $rowdir). Evidence tier: measured-simulated (one box, co-located members)"
+}
+
+leg_s11_tiny() {
+    require_cowriters 2
+    [ "${RANGE_CUSTODY:-0}" = "1" ] ||
+        die "s11-tiny needs a range-custody-ARMED fleet"
+    local rowdir cws m1 m2 w_mnt idx
+    rowdir="$STATE/rows/s11tiny-$(date +%s)"
+    mkdir -p "$rowdir"
+    mapfile -t cws < <(cowriter_idxs)
+    m1="${cws[0]}"
+    m2="${cws[1]}"
+    w_mnt="$(mnt_of 0)"
+    log "s11-tiny: co-writer m$m1 floods 4096 byte-granular unaligned tiny writes across ONE 64MiB file (16 blocks); co-writer m$m2's own-file fsync ops sample foreign-client latency before/during"
+    truncate -s $((64 * 1024 * 1024)) "$w_mnt/s11-tiny.dat" ||
+        die "s11-tiny: authority could not create the file"
+
+    # Foreign-client latency BASELINE (m2, own file, 20 fsync'd 4KiB ops).
+    lat_probe() { # idx outfile
+        python3 - "$(mnt_of "$1")/s11-tiny-probe-$1.dat" >"$2" <<'PYL'
+import os, sys, time
+path = sys.argv[1]
+fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o644)
+buf = b"\x44" * 4096
+for i in range(20):
+    t0 = time.monotonic()
+    os.pwrite(fd, buf, i * 4096)
+    os.fsync(fd)
+    print(f"{(time.monotonic() - t0) * 1000:.2f}")
+os.close(fd)
+PYL
+    }
+    lat_probe "$m2" "$rowdir/lat-before"
+
+    for idx in 0 "$m1" "$m2"; do snap "$idx" 0 "$rowdir"; done
+    # The storm + the DURING-probe, concurrent.
+    (
+        python3 - "$(mnt_of "$m1")/s11-tiny.dat" >"$rowdir/storm.out" 2>&1 <<'PYS'
+import os, random, sys, time
+path = sys.argv[1]
+fd = os.open(path, os.O_WRONLY)
+rng = random.Random(0x511)
+buf = b"\x77" * 137
+t0 = time.monotonic()
+for _ in range(4096):
+    off = rng.randrange(0, 64 * 1024 * 1024 - 137)
+    os.pwrite(fd, buf, off)
+os.fsync(fd)
+os.close(fd)
+print(f"storm complete: 4096 x 137B unaligned writes in {time.monotonic() - t0:.2f}s")
+PYS
+        echo $? >"$rowdir/storm-rc"
+    ) &
+    local storm_pid=$!
+    # Sample the live span table while the storm runs.
+    (
+        max_active=0 max_bytes=0
+        while kill -0 "$storm_pid" 2>/dev/null; do
+            a="$(stat_field 0 range_custody.range_custody_active 2>/dev/null || echo 0)"
+            b="$(stat_field 0 range_custody.dlm_grant_table_bytes 2>/dev/null || echo 0)"
+            [ -n "$a" ] && [ "$a" -gt "$max_active" ] 2>/dev/null && max_active="$a"
+            [ -n "$b" ] && [ "$b" -gt "$max_bytes" ] 2>/dev/null && max_bytes="$b"
+            echo "$max_active $max_bytes" >"$rowdir/sampler.out"
+            sleep 0.2
+        done
+    ) &
+    local sampler_pid=$!
+    lat_probe "$m2" "$rowdir/lat-during"
+    wait "$storm_pid" 2>/dev/null || true
+    wait "$sampler_pid" 2>/dev/null || true
+    [ "$(cat "$rowdir/storm-rc" 2>/dev/null)" = "0" ] ||
+        die "s11-tiny: the tiny-write storm FAILED (a wedge or refusal on a within-budget shape): $(tail -3 "$rowdir/storm.out")"
+    log "$(head -1 "$rowdir/storm.out")"
+    for idx in 0 "$m1" "$m2"; do snap "$idx" 1 "$rowdir"; done
+
+    local max_active=0 max_bytes=0
+    [ -f "$rowdir/sampler.out" ] && read -r max_active max_bytes <"$rowdir/sampler.out"
+    python3 - "$rowdir" "$m1" "$max_active" "$max_bytes" <<'PYT' || die "s11-tiny: GATE FAILED"
+import json, statistics, sys
+rowdir, m1, max_active, max_bytes = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+def flat(d, out=None, pfx=""):
+    out = {} if out is None else out
+    for kk, v in d.items():
+        if isinstance(v, dict): flat(v, out, pfx + kk + ".")
+        else: out[pfx + kk] = v
+    return out
+def load(i, ph): return flat(json.load(open(f"{rowdir}/m{i}_p{ph}.json")))
+d = lambda i, a, b, key: int(load(i, b).get(key, 0) or 0) - int(load(i, a).get(key, 0) or 0)
+bad = []
+caps = d("0", 0, 1, "range_custody.range_custody_cap_refusals")
+grants = d("0", 0, 1, "range_custody.range_custody_grants")
+ext = d("0", 0, 1, "range_custody.range_custody_extensions")
+budget = int(load("0", 1).get("range_custody.dlm_grant_table_budget_bytes", 0) or 0)
+before = [float(x) for x in open(f"{rowdir}/lat-before")]
+during = [float(x) for x in open(f"{rowdir}/lat-during")]
+mb, md = statistics.median(before), statistics.median(during)
+# The file is 16 blocks; the geometry cap is max(16, blocks) = 16: the
+# coalescing law must hold the live population AT OR UNDER it.
+print(f"storm: grants d={grants} extensions d={ext} cap_refusals d={caps}")
+print(f"live span table max: active={max_active} bytes={max_bytes} (budget {budget}; 16-block file => <= 16+1 spans expected)")
+print(f"foreign-client latency median: before {mb:.2f} ms -> during {md:.2f} ms ({md/max(mb,0.01):.2f}x)")
+if caps != 0:
+    bad.append(f"cap_refusals d={caps}: a within-budget tiny-ranges shape refused — the Issue-19 class")
+if max_active > 17:
+    bad.append(f"live spans peaked at {max_active} on a 16-block file — admit-time coalescing is not holding O(file blocks)")
+if budget and max_bytes > budget:
+    bad.append(f"grant table bytes {max_bytes} exceeded the R5 share {budget}")
+if md > 5 * max(mb, 0.01):
+    bad.append(f"foreign-client latency collateral: {md:.2f} ms during vs {mb:.2f} ms before (> 5x)")
+if bad:
+    print("S11 TINY-RANGES GATE FAILED:", file=sys.stderr)
+    for b in bad: print(f"  {b}", file=sys.stderr)
+    sys.exit(1)
+print("S11 tiny-ranges bounds GREEN: coalescing holds O(blocks), table bounded, zero refusals, no wedge, foreign latency within band")
+PYT
+
+    rm -f "$w_mnt/s11-tiny.dat" "$(mnt_of "$m2")/s11-tiny-probe-$m2.dat"
+    local out drift comp_bad=""
+    if out="$("$SQZ" fsck "$w_mnt" 2>&1)"; then
+        echo "$out" | grep -q "findings: 0" || comp_bad="fsck findings != 0"
+    else
+        comp_bad="fsck FAILED"
+    fi
+    echo "$out" >"$rowdir/fsck.out"
+    drift="$(stat_field 0 meta_kv_block_refs_drift)"
+    [ "$drift" = "0" ] || comp_bad="${comp_bad:+$comp_bad; }drift=$drift"
+    [ -z "$comp_bad" ] || die "s11-tiny CORRECTNESS RED: $comp_bad"
+    log "s11-tiny GREEN — the adversarial bounds row, live face (at-budget refusal law = the standing rung-15 in-process pins). Row in $rowdir"
+}
+
+leg_s11_killrange() {
+    require_cowriters 2
+    [ "${RANGE_CUSTODY:-0}" = "1" ] ||
+        die "s11-killrange needs a range-custody-ARMED fleet"
+    local rounds="$S7_ROUNDS" rowdir cws m1 m2 w_mnt idx round
+    rowdir="$STATE/rows/s11kr-$(date +%s)"
+    mkdir -p "$rowdir"
+    mapfile -t cws < <(cowriter_idxs)
+    m1="${cws[0]}"
+    m2="${cws[1]}"
+    w_mnt="$(mnt_of 0)"
+    log "s11-killrange: cell H x $rounds (kill -9 a range HOLDER mid-write) + cell A x 2 (kill -9 the AUTHORITY mid-assembly); fsck + C8 after EVERY cell"
+
+    # ---- Cell H: holder kill -9 mid-write, x rounds ---------------------------
+    local half_mb=32 half_bytes=$((32 * 1024 * 1024))
+    for ((round = 1; round <= rounds; round++)); do
+        local f="s11-kr-h$round.dat"
+        truncate -s $((2 * half_bytes)) "$w_mnt/$f" || die "cell H round $round: create failed"
+        snap 0 "h${round}a" "$rowdir"
+        dd if=/dev/urandom of="$rowdir/src-h$round" bs=1M count="$half_mb" status=none
+        # Victim m1 writes low half (kill mid-write); survivor m2 writes high.
+        (
+            while :; do
+                dd if=/dev/zero of="$(mnt_of "$m1")/$f" bs=4M count=$((half_mb / 4)) \
+                    conv=fsync,notrunc oflag=seek_bytes seek=0 2>/dev/null || exit 0
+            done
+        ) &
+        local v_pid=$!
+        (
+            dd if="$rowdir/src-h$round" of="$(mnt_of "$m2")/$f" bs=4M \
+                conv=fsync,notrunc oflag=seek_bytes seek="$half_bytes" 2>"$rowdir/k-m$m2-$round.err"
+            echo $? >"$rowdir/k-rc-$round"
+        ) &
+        local s_pid=$!
+        sleep 1
+        local d_pid
+        d_pid="$(pgrep -f "squeezefs.*mount.*$(mnt_of "$m1")" | head -1)"
+        [ -n "$d_pid" ] || die "cell H round $round: no victim daemon pid"
+        kill -9 "$d_pid"
+        kill "$v_pid" 2>/dev/null || true
+        wait "$v_pid" 2>/dev/null || true
+        wait "$s_pid" 2>/dev/null || true
+        [ "$(cat "$rowdir/k-rc-$round" 2>/dev/null)" = "0" ] ||
+            die "cell H round $round: the SURVIVOR m$m2's stream FAILED after the peer's kill: $(head -3 "$rowdir/k-m$m2-$round.err")"
+        # The era law: the authority sweeps the victim's lease; its ranges
+        # die with the era; the table converges.
+        local swept=0 tries active
+        for ((tries = 0; tries < 40; tries++)); do
+            active="$(stat_field 0 range_custody.range_custody_active)"
+            [ "$active" = "0" ] && { swept=1; break; }
+            sleep 2
+        done
+        [ "$swept" = "1" ] ||
+            die "cell H round $round: range_custody_active=$active never converged to 0 — a dead holder's ranges are stranded"
+        local gcon
+        gcon="$(stat_field 0 dlm_custody.dlm_custody_grace_conflicts)"
+        [ "$gcon" = "0" ] || die "cell H round $round: dlm_custody_grace_conflicts=$gcon (must stay 0)"
+        # Victim re-admits (grace ladder).
+        umount -l "$(mnt_of "$m1")" 2>/dev/null || true
+        local admitted=0
+        for ((tries = 0; tries < 15; tries++)); do
+            if "$MWFLEET" mount "$m1" >/dev/null 2>&1; then admitted=1; break; fi
+            sleep 10
+        done
+        [ "$admitted" = "1" ] || die "cell H round $round: victim m$m1 could not re-admit"
+        # Survivor's half verifies; fsck + C8 clean AFTER EVERY CELL.
+        local sha_src sha_got out drift
+        sha_src="$(sha256sum "$rowdir/src-h$round" | cut -d' ' -f1)"
+        sha_got="$(dd if="$(mnt_of "$m2")/$f" bs=4M skip=$((half_mb / 4)) count=$((half_mb / 4)) status=none | sha256sum | cut -d' ' -f1)"
+        [ "$sha_src" = "$sha_got" ] || die "cell H round $round: the survivor's acked half diverged"
+        out="$("$SQZ" fsck "$w_mnt" 2>&1)" || die "cell H round $round: fsck FAILED: $(echo "$out" | tail -3)"
+        echo "$out" | grep -q "findings: 0" || die "cell H round $round: fsck findings != 0"
+        drift="$(stat_field 0 meta_kv_block_refs_drift)"
+        [ "$drift" = "0" ] || die "cell H round $round: C8 drift=$drift"
+        rm -f "$w_mnt/$f" "$rowdir/src-h$round"
+        log "cell H round $round/$rounds GREEN (victim swept, survivor exact, fsck+C8 clean)"
+    done
+
+    # ---- Cell A: authority kill -9 mid-assembly, x2 ---------------------------
+    for round in 1 2; do
+        local f="s11-kr-a$round.dat"
+        truncate -s $((8 * 1024 * 1024)) "$w_mnt/$f" || die "cell A round $round: create failed"
+        # Two-holder sub-block extent churn (the demotion + assembler live),
+        # long-running: the kill lands MID-assembly.
+        (
+            python3 - "$(mnt_of "$m1")/$f" 0 >"$rowdir/a1-$round.out" 2>&1 <<'PYA'
+import os, sys, time
+path, start = sys.argv[1], int(sys.argv[2])
+fd = os.open(path, os.O_WRONLY)
+buf = b"\x61" * 4096
+deadline = time.monotonic() + 30
+while time.monotonic() < deadline:
+    off = start
+    while off < start + 2 * 1024 * 1024:
+        os.pwrite(fd, buf, off)
+        off += 4096
+    try:
+        os.fsync(fd)
+    except OSError as e:
+        print(f"fsync interrupted (expected across the authority kill): {e}", flush=True)
+        time.sleep(1)
+os.close(fd)
+print("holder A stream done", flush=True)
+PYA
+        ) &
+        local a_pid=$!
+        (
+            python3 - "$(mnt_of "$m2")/$f" $((2 * 1024 * 1024)) >"$rowdir/a2-$round.out" 2>&1 <<'PYB'
+import os, sys, time
+path, start = sys.argv[1], int(sys.argv[2])
+fd = os.open(path, os.O_WRONLY)
+buf = b"\x62" * 4096
+deadline = time.monotonic() + 30
+while time.monotonic() < deadline:
+    off = start
+    while off < start + 2 * 1024 * 1024:
+        os.pwrite(fd, buf, off)
+        off += 4096
+    try:
+        os.fsync(fd)
+    except OSError as e:
+        print(f"fsync interrupted (expected across the authority kill): {e}", flush=True)
+        time.sleep(1)
+os.close(fd)
+print("holder B stream done", flush=True)
+PYB
+        ) &
+        local b_pid=$!
+        # Let the demotion + extent ship engage, then kill the ASSEMBLER.
+        local engaged=0 tries served
+        for ((tries = 0; tries < 20; tries++)); do
+            served="$(stat_field 0 meta_ship_publish.extent_served 2>/dev/null || echo 0)"
+            [ -n "$served" ] && [ "$served" -gt 0 ] 2>/dev/null && { engaged=1; break; }
+            sleep 1
+        done
+        [ "$engaged" = "1" ] || warn "cell A round $round: extent ship not yet observed pre-kill (the kill still lands mid-custody)"
+        local auth_pid
+        auth_pid="$(pgrep -f "squeezefs.*mount.*$w_mnt" | head -1)"
+        [ -n "$auth_pid" ] || die "cell A round $round: no authority daemon pid"
+        kill -9 "$auth_pid"
+        log "cell A round $round: authority killed -9 mid-assembly"
+        wait "$a_pid" 2>/dev/null || true
+        wait "$b_pid" 2>/dev/null || true
+        # Recover the fleet: authority first, then the co-writers.
+        umount -l "$w_mnt" 2>/dev/null || true
+        local admitted=0
+        for ((tries = 0; tries < 15; tries++)); do
+            if "$MWFLEET" mount 0 >/dev/null 2>&1; then admitted=1; break; fi
+            sleep 5
+        done
+        [ "$admitted" = "1" ] || die "cell A round $round: authority could not remount"
+        for idx in $(cowriter_idxs); do
+            "$MWFLEET" unmount "$idx" >/dev/null 2>&1 || true
+            admitted=0
+            for ((tries = 0; tries < 15; tries++)); do
+                if "$MWFLEET" mount "$idx" >/dev/null 2>&1; then admitted=1; break; fi
+                sleep 10
+            done
+            [ "$admitted" = "1" ] || die "cell A round $round: co-writer m$idx could not re-admit after the authority kill"
+        done
+        # Re-drive a short two-holder pass on the recovered fleet: the
+        # plane must serve again (re-grant, re-demote, re-assemble).
+        snap 0 "a${round}r" "$rowdir"
+        python3 - "$(mnt_of "$m1")/$f" 0 <<'PYR' || die "cell A round $round: post-recovery holder-A pass failed"
+import os, sys
+path, start = sys.argv[1], int(sys.argv[2])
+fd = os.open(path, os.O_WRONLY)
+buf = b"\x63" * 4096
+off = start
+while off < start + 2 * 1024 * 1024:
+    os.pwrite(fd, buf, off)
+    off += 4096
+os.fsync(fd)
+os.close(fd)
+PYR
+        python3 - "$(mnt_of "$m2")/$f" $((2 * 1024 * 1024)) <<'PYR2' || die "cell A round $round: post-recovery holder-B pass failed"
+import os, sys
+path, start = sys.argv[1], int(sys.argv[2])
+fd = os.open(path, os.O_WRONLY)
+buf = b"\x64" * 4096
+off = start
+while off < start + 2 * 1024 * 1024:
+    os.pwrite(fd, buf, off)
+    off += 4096
+os.fsync(fd)
+os.close(fd)
+PYR2
+        # Cold byte verify of the ACKED final passes + the oracle.
+        "$MWFLEET" unmount 0 >/dev/null 2>&1 || true
+        "$MWFLEET" mount 0 >/dev/null 2>&1 || die "cell A round $round: cold remount failed"
+        python3 - "$w_mnt/$f" <<'PYV' || die "cell A round $round: cold byte verify FAILED (acked post-recovery bytes lost)"
+import sys
+data = open(sys.argv[1], "rb").read()
+half = 2 * 1024 * 1024
+assert data[:half] == b"\x63" * half, "holder A's post-recovery acked half diverged"
+assert data[half:2 * half] == b"\x64" * half, "holder B's post-recovery acked half diverged"
+PYV
+        local out drift
+        out="$("$SQZ" fsck "$w_mnt" 2>&1)" || die "cell A round $round: fsck FAILED: $(echo "$out" | tail -3)"
+        echo "$out" | grep -q "findings: 0" || die "cell A round $round: fsck findings != 0: $(echo "$out" | tail -3)"
+        drift="$(stat_field 0 meta_kv_block_refs_drift)"
+        [ "$drift" = "0" ] || die "cell A round $round: C8 drift=$drift"
+        rm -f "$w_mnt/$f"
+        log "cell A round $round/2 GREEN (authority killed mid-assembly, fleet recovered, re-driven pass exact, fsck+C8 clean)"
+    done
+
+    for idx in $(member_idxs); do
+        cat "$(mnt_of "$idx")/.stats" >/dev/null 2>&1 ||
+            die "s11-killrange: member m$idx is not healthy at leg end"
+    done
+    log "s11-killrange GREEN — cell H x $rounds + cell A x 2, fsck+C8 clean after every cell. Evidence tier: measured-simulated (one box, co-located members)"
 }
 
 leg_s10c_fsck_scale() {
@@ -4555,6 +5353,10 @@ s9-failover) leg_s9_failover ;;
 s9-colocated-fence) leg_s9_colocated_fence ;;
 s11-range) leg_s11_range ;;
 s11-subblock) leg_s11_subblock ;;
+s11-mpiio) leg_s11_mpiio ;;
+s11-blockcyclic) leg_s11_blockcyclic ;;
+s11-tiny) leg_s11_tiny ;;
+s11-killrange) leg_s11_killrange ;;
 s10c-fsck-scale) leg_s10c_fsck_scale ;;
 s10c-kill-shard) leg_s10c_kill_shard ;;
 s10-delegation) leg_s10_delegation ;;
@@ -4564,5 +5366,5 @@ s10-placement-tarx) leg_s10_placement_tarx ;;
 cowriters-admission) leg_cowriters_admission ;;
 vm-hostscope-validate) leg_vm_hostscope_validate ;;
 vm-multi-identity) leg_vm_multi_identity ;;
-*) die "unknown leg '$LEG' (smoke|multipath-negative|s6-journal|s6-fence|s6-vm-fence|s7-device-fence|s7-kill-matrix|s8-serial-ab|s8-crucible|s9-fanout|s9-failover|s9-colocated-fence|s11-range|s11-subblock|s10c-fsck-scale|s10c-kill-shard|s10-delegation|s10-intents|s10-intents-tarx|s10-placement-tarx|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
+*) die "unknown leg '$LEG' (smoke|multipath-negative|s6-journal|s6-fence|s6-vm-fence|s7-device-fence|s7-kill-matrix|s8-serial-ab|s8-crucible|s9-fanout|s9-failover|s9-colocated-fence|s11-range|s11-subblock|s11-mpiio|s11-blockcyclic|s11-tiny|s11-killrange|s10c-fsck-scale|s10c-kill-shard|s10-delegation|s10-intents|s10-intents-tarx|s10-placement-tarx|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
 esac

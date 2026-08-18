@@ -727,13 +727,11 @@ async fn reassigned_shard_gets_fresh_destinations_and_expired_ones_quarantined()
 
     // Worker 2 (healthy) gets the reassigned shard — with FRESHLY
     // allocated destinations, never the expired lease's.
-    let w2 = JobWireWorker::connect(
-        &host.endpoint().to_string(),
-        &secret,
-        WorkerOptions::new("w-new"),
-    )
-    .await
-    .expect("enroll w2");
+    let w2_opts = WorkerOptions::new("w-new");
+    let w2_acks = w2_opts.acks_received.clone();
+    let w2 = JobWireWorker::connect(&host.endpoint().to_string(), &secret, w2_opts)
+        .await
+        .expect("enroll w2");
     let run2 = tokio::spawn(w2.run(seam.clone()));
 
     poll_until("fresh allocation", Duration::from_secs(10), || {
@@ -767,6 +765,18 @@ async fn reassigned_shard_gets_fresh_destinations_and_expired_ones_quarantined()
         moved0 + (BLOCKS * BLOCK_LEN) as u64
     );
 
+    // The coordinator's shutdown hard-kills sockets by design, so worker
+    // 2's local ledger legally races an in-flight accept ack (the
+    // 2026-08-18 consolidation-gate catch: every durable law above had
+    // already passed; only the report read 0). Wait for the ack to LAND
+    // before shutting down — deterministic, and the assertion keeps its
+    // full teeth.
+    poll_until(
+        "worker 2's accept ack lands",
+        Duration::from_secs(10),
+        || w2_acks.load(Ordering::Relaxed) == 1,
+    )
+    .await;
     host.shutdown().await;
     run1.abort();
     let _ = run1.await;

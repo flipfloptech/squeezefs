@@ -2822,6 +2822,15 @@ pub struct WorkerOptions {
     /// KD-MW-16: capability mask advertised at enrollment
     /// ([`CAP_FLEET_READ`]) — shard routing, never authentication.
     pub caps: u32,
+    /// Test observable (the `hold_submission` precedent): bumps when a
+    /// submission ACCEPT ack lands at this worker. A coordinator
+    /// `shutdown()` hard-kills sockets by design, so a worker's local
+    /// `shards_completed` legally races an in-flight ack — the
+    /// 2026-08-18 consolidation gate caught a suite asserting the
+    /// report through that race. Polling this before shutdown makes the
+    /// assertion deterministic without weakening it. Never read by
+    /// product code.
+    pub acks_received: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl WorkerOptions {
@@ -2833,6 +2842,7 @@ impl WorkerOptions {
             pr_key: None,
             security: None,
             caps: 0,
+            acks_received: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 }
@@ -3323,7 +3333,11 @@ impl JobWireWorker {
                 }
             }
             match resp_rx.recv().await {
-                Some(Ok(())) => report.shards_completed += 1,
+                Some(Ok(())) => {
+                    report.shards_completed += 1;
+                    opts.acks_received
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 Some(Err(reason)) => {
                     report.submissions_refused += 1;
                     log::warn!(

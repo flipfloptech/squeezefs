@@ -5,7 +5,7 @@
 | **Title** | The FULL MULTI-WRITER program: arming the built planes, subtree delegation (S10), byte-range custody (S11), and same-machine multi-mount client fleets |
 | **Author** | (design agent; adjudication owner: user) |
 | **Date** | 2026-08-15 |
-| **Status** | **Consensus (4 review rounds, 28 issues, 0 open)** — 2026-08-15 |
+| **Status** | **Consensus (4 review rounds, 28 issues, 0 open)** — 2026-08-15; **PROGRAM CLOSED 2026-08-18** — all 19 rungs + the fix campaigns landed (per-rung SHAs in the PR-plan table; closing record `.benchmarks/2026-08-18-mw-program-closing.md`; the rung-20 residual board is §Program closing below) |
 | **Repo state audited** | branch `dev`, tip `1814be0f` (B4 wire-wall record) |
 | **Binding inputs** | AGENTS.md (one source of truth); `docs/pre-rc-engineering-spec.md` §6 (esp. §6.2, §6.5, §6.7, §6.8, §6.9 S0–S11, §6.10–6.12); `docs/design-mw-data-alloc-partition.md`; `docs/design-mw-cursors-and-incarnation.md`; `docs/design-mw-layout-versions.md`; `docs/design-dynamic-meta-routing.md`; `docs/design-overlay-overwrite.md` (B4, OW crash-window precedent) |
 | **User charter (verbatim)** | (1) "we need MPI-IO shape i.e S11 everything up to it as well FULL MULTI WRITER SUPPORT"; (2) "I'd also like to be able to mount the same filesystem multiple times on the same 'machine' and each mount be a 'client' so to speak so we can test from a single node."; (3) "we should avoid AWS at all costs until we absolutely need it" |
@@ -551,7 +551,7 @@ Ordered ladder; every rung red-first, carries its suites + evidence note, ships 
 | 5 | `feat/mw-stamping` | `src/main.rs` (`format --multi-writer`, `volume enable-multi-writer` incl. the `mw_upgrade:` intent marker, the `add-meta` stamp-to-match arm), `kv/superblock.rs` (plan arm), the §6.2 refusal predicate (marker + bit-11 uniformity + orphan-bit-11 tripwire, shape-(c) grandfathering, **the marker-tolerant scope of the verb's own guarded open**); `tests/mw_stamping_tests.rs` | — | KD-MW-1: one-act stamping, ordered, idempotent, crash-resumable; sole-setter serialization under the D0-guarded offline open (concurrent-invocation refusal test, extended to cover the marker-tolerant resume open); the two §6.2 interaction rules pinned both directions (**`add-meta` stamps to match a bit-11-uniform set; a bit-11 volume refuses joining a non-upgraded set**); repros: MW-S1, **MW-S1b (kill between every adjacent bit pair)**, MW-S2/S3, and the shape-(c) non-trigger case (standalone bit 7/15 volumes mount as today); gate: **stamped-solo S4 re-run** A-B-B-A within noise + stamped-solo external QUICK set |
 | 5b | `feat/sqz-kernel-mw-multipath` + `fix/mw-multipath-refusal` | `docker/kernel-sqz/` (new patch + SERIES.md), `docs/design-mw-multipath-kernel.md`, `src/nvmeof/initiator.rs` (rule-2 multipath detection refusal) | 2,5 | **The rung-6 STOP finding, adjudicated 2026-08-15** (user ruling: "lets go with the sqz-kernel fix for sure"): §5.2's per-identity `/dev` node assumption is FALSE on `nvme_core.multipath=Y` kernels (the upstream default) — the kernel groups controllers by subsysnqn IGNORING hostnqn, so two co-located identities' paths merge under ONE shared head whose round-robin voids per-mount device fencing (rung 2's ladder already refuses it, correctly). The product answer is a **sqz-kernel patch** (ruling D13): group/segregate fabric subsystems by `(subsysnqn, hostnqn)` so co-located identities never merge — its own short design pass (`docs/design-mw-multipath-kernel.md`, the design-zc-write-kernel-v2 precedent), patch into the sqz series, validated INSIDE the 6b qemu guest (no host reboot on the critical path). **Authoring order (user ruling 2026-08-15, verbatim: "should be built around the latest 7.1.x kernel code we run locally and then back ported to the 6.19.14 kernel")**: the patch is authored and build-verified against the series' 7.1.x track FIRST (the locally-running first-class kernel — `patches-7.1/`, the 7.1.6-sqz line), then backported to the 6.19.14 base track; both tracks carry it in SERIES.md. Stock multipath=Y kernels keep the refusal, upgraded to NAME the shape and the remedy (sqz kernel, or multipath=N boot param as the documented stock-kernel workaround). N=1 explicit-identity mounts (the field posture) proven working end-to-end and unaffected |
 | 6 | `test/mw-fleet-rig` | `tests/mw_fleet.sh`, `tests/run_mw_matrix.sh` | 1,2,3,3b,5,**5b** | §5.5 harness: N daemons, per-mount identity/hostnqn (no pre-connected devices — the product resolution path is exercised), netns/netem, `SQUEEZEFS_FLEET_SHARE=N` export, per-mount stats capture, engagement + R5-pressure column row emitter; smoke leg on tcp devsub |
-| 6b | `test/mw-fleet-vm-leg` | `tests/mw_fleet.sh` (`--vm V`, `pause` verb), qemu/KVM guest image plumbing | 6 | The §12 residual venue: V guest members over the host's nvmet-tcp port; owns rows S6-b′ (hung-kernel self-fence via VM pause) and the real-clock-domain tolerance leg; **lands within Phase B — a stated condition of the "AWS not needed" recommendation (KD-MW-4)** |
+| 6b | `test/mw-fleet-vm-leg` | `tests/mw_fleet.sh` (`--vm V`, `pause` verb), qemu/KVM guest image plumbing | 6 | The §12 residual venue: V guest members over the host's nvmet-tcp port; owns rows S6-b′ (hung-kernel self-fence via VM pause) and the real-clock-domain tolerance leg; **lands within Phase B — a stated condition of the "AWS not needed" recommendation (KD-MW-4)**. **LANDED 2026-08-16** — scoped siblings `bcf03b86`/`0787f606`, the VM leg `fbfc5443`, 0030 boot-validation ledger `9d5ed2d4` — the condition was met |
 | 7 | `test/mw-arm-s6` | rig legs; `membership_sim.rs` seams as needed | 6,6b | S6-a/S6-b/S6-b′ rows (journal non-growth at N=32 with R5-pressure columns; self-fence clock law under SIGSTOP+netem and VM pause); evidence note `.benchmarks/…-mw-s6-arm.md` |
 | 8 | `test/mw-arm-s7` | rig legs; red repros for any finding | 6 | S7-a device-rejection row (spec R2) + S7-b kill-9 ×10 matrix with fsck/C8 oracle after every kill; counted-restart discipline |
 | 9 | `test/mw-arm-s8` | rig legs; `meta_ship` fixes as found | 7,8 | S8-a R1 `tar -x` A/B across netem sweep **published**; S8-b shipped-verb crucible (dedup/era/panic tripwires); evidence note is the R1 baseline S10 must recover |
@@ -566,6 +566,128 @@ Ordered ladder; every rung red-first, carries its suites + evidence note, ships 
 | 16 | `feat/s11-b4-clause-and-pins` | `src/fuse_client.rs`/`routing.rs` (B4 §5.1 `overlay_ineligible_range_shared` clause), composed-behavior pins, stats rows | 15 | KD-MW-12. **The W1 seventh clause is already live by construction** (`patch_range_shared` consulted unconditionally on the shipped path — `fuse_client.rs:12553`/`:15981`; PR 15 making grants issuable is what engages it; nothing to flip). This rung's content: the B4 overlay screen clause + **PINNING the composed behavior** (red-first: a range-shared span refuses BOTH patch and overlay) + the **fast-path tax row** (single-writer A-B-B-A within noise — the 41.6 GiB/s guard) |
 | 17 | `feat/s11-authority-assembler` | `src/meta_ship/publish.rs` (`WriteExtent` schema 4 **joining the retried class — stated against the module's `publish.rs:33` no-retry doctrine**, `FlushExtents` fsync force, served/replay ledger), `src/dlm.rs` `FileCustody` (shared-block demotion detection + **the grant-issuance demotion barrier**: park, renewal-carried notice **composed under the same `FileCustody` serialization that parked B** — the in-flight-renewal race pin — ack-or-owner-clock-lease-expiry), `src/data_custody.rs` (demotion custody transfer — authority assembly under its own epoch), client-side **extent retention + the four pull release paths** (ack-carried `covering_version`, renewal/revalidation observation, `FlushExtents`, at-budget W2 spill; rides `parked_extent_bytes`); MW-10/11/13 crash repros | 15,16 | KD-MW-8 (revised): both holders of a sub-block-shared block ship extents to the AUTHORITY; **the demotion-barrier red-first case** (grant withheld until ack; single publisher throughout; fenced-publish counter 0 on the clean path; loser law = re-ship-as-extents); exactly-once under the dedup window across failover (retention releases on covering-version visibility, never on ack — red-first: kill the authority between ack and publish, assert zero acked-fsynced loss; MW-13: kill mid-demotion, A re-asserts, demotion restarts); one red-first case per release path; sub-block exception row priced incl. authority merge CPU |
 | 18 | `test/s11-mpiio-row` | rig leg (`ior` pinned release), `tests/run_mw_matrix.sh` S11 rows | 16,17 | The MPI-IO acceptance row (≥0.8× disjoint-baseline, engagement exact), the **adversarial tiny-ranges bounds row**, the **block-cyclic row** (zero cap refusals below budget — the Issue-19 shape adjudicated, not discovered), the **demotion-barrier row**, range kill matrix, evidence note closes the S11 gate. **LANDED 2026-08-18** (`.benchmarks/2026-08-18-s11-mpiio-row.md`): rows run on pinned ior 4.0.0 — block-cyclic/tiny/demotion/kill adjudicated live (ten red-first product fixes); the gate closes CONDITIONALLY: the MPI-IO throughput row is blocked at width 32 on the same-ino publish REFS composition and the sub-block fourth dangling-take face — both standing-red in the legs' own gates, rung 19's |
-| 19 | `docs/mw-guarantees` | `docs/operations.md` (guarantee tables §5.4, delegation, range custody, capacity, fleet-share sizing), `AGENTS.md` + `README` scale-claim correction (§6.12) **plus the standing AGENTS.md bit-numbering staleness** (it still calls durable block refcounts "incompat bit 8"; the code and this design say bit 9 — `FEATURE_INCOMPAT_KV_PARTITIONED_APPEND = 1<<8`), `docs/rc-manifest.md` evidence-tier rows | 10,14,18 | Docs-class PR; markdown gate only |
+| 19 | `docs/mw-guarantees` | `docs/operations.md` (guarantee tables §5.4, delegation, range custody, capacity, fleet-share sizing), `AGENTS.md` + `README` scale-claim correction (§6.12) **plus the standing AGENTS.md bit-numbering staleness** (it still calls durable block refcounts "incompat bit 8"; the code and this design say bit 9 — `FEATURE_INCOMPAT_KV_PARTITIONED_APPEND = 1<<8`), `docs/rc-manifest.md` evidence-tier rows | 10,14,18 | Docs-class PR; markdown gate only. **LANDED 2026-08-18** — this rung (branch `docs/mw-guarantees`; closing record `.benchmarks/2026-08-18-mw-program-closing.md`); the width-N fix campaign rode this rung's window and is annotated on row 18 |
 
 Dependency shape: 1→2→3 and 3b/4/5 are parallel-safe with each other; 6 gates all arming and 6b (the VM leg) must land within Phase B; 9's published baseline is 14's gate input; 11 deliberately precedes 12 (brake before engine); 16 must merge before 17 exposes sub-block sharing to real workloads.
+
+### Fix-campaign footnotes (not rungs — found by the rungs' own oracles, each red-first)
+
+| Campaign | Found by | What it was | Landed | Evidence |
+|---|---|---|---|---|
+| `fix/mw-publish-era-gate` | rung 10's s9-colocated-fence trailing oracle (finding #6) | a swept-but-not-yet-self-fenced zombie's layout publishes still APPLIED (no era gate on the layout-publish verbs) + no idempotence witness for lost-reply re-ships — a durably-committed divergent delta chain | design §6a `59033aad`, red `c180272b`, feat `c151368a`/`79c69fea`, note `9b959343` | `.benchmarks/2026-08-16-mw-publish-era-gate.md` (publish schema 5; leg GREEN ×3 from zero) |
+| `fix/mw-shipped-free-c8-drift` | rung 13's tarx leg — the FIRST leg to fsck a co-writer tar+rm sweep | reclaim of an ino with an OPEN rewrite epoch never drained the epoch's parked custody or `pending_block_refs` — one orphaned durable ref + one durably-referenced unreachable block per victim (posture-blind class, reached via the co-writer patch-plane refusal) | red `d196909f`, fix `b1aeb6a8`, note `55d88138` | `.benchmarks/2026-08-17-mw-shipped-free-c8-fix.md` |
+| `fix/mw-xv-unlink-c10` | the same leg's rm sweep (C10 findings) | a detector-plane MIRAGE: fleet fsck shards read C9/C10 through per-volume checkpoint projections at different instants — the inode plane is a ONE-VIEW plane, judged whole on the coordinator; plus the format-time root-nlink −1 law | red `d6827891`, fix `5077323c`, note `633b2a08` | `.benchmarks/2026-08-17-mw-xv-unlink-c10-fix.md` (the write path was proven innocent FIRST) |
+| `fix/s11-zeros-interleave-c8` | rung 17's narrowed standing-red | the production arm never installed the range-geometry source — every range holder's full Put applied VERBATIM ("peer entries at risk", its own warn text); zeros-dependence FALSIFIED (content-blind) | red `fa518409`, fix `e174b03b`, gate restore `8bb6ee5d`, note `28cab7a9` | `.benchmarks/2026-08-17-s11-zeros-interleave-fix.md` (composition gate ×3 GREEN) |
+| `fix/s11-widthn-refs` (rung 19's window) | rung 18's two standing-reds at width 8–32 | a FAMILY OF FOUR: the compaction fork latch, the swapped-pair caller-frame refs mint, the volume-local-ino identity hole (this campaign's own first-cut regression, caught by its own instruments), the indirect-head hole | red `f686b7eb`, fixes `9af96955`/`5f2a3813`/`44b5d73b`, verdict `8ce5d60c` | `.benchmarks/2026-08-18-s11-widthn-refs-fix.md` (**the MPI-IO verdict ISSUED: MET**) |
+| `perf/block-map-encoding-bracket` (sizing, never merged as product) | user question 2026-08-17 | is the block-map string round-trip worth a packed on-disk format change? Counted answer: the displaceable term is ≈ 45–57 ns/mapping — **displacement NOT justified** | bench rows `d7e6d26e`, note `70eaf8c1` | `.benchmarks/2026-08-17-block-map-encoding-bracket.md` |
+
+---
+
+## Program closing (2026-08-18)
+
+All 19 rungs landed, 2026-08-15 → 2026-08-18; summary record
+`.benchmarks/2026-08-18-mw-program-closing.md`. The verdicts, one line each:
+the stamped-solo S4 re-gate PASSED (solo is performance-invisible, so the
+Phase-B flip made **`format` multi-writer-capable by default**); S6–S9 are
+**armed and proven** (journal-free liveness at N=32, REAL device rejection,
+the R1 tar-x row published, zero acked-data loss across authority failover);
+KD-MW-16 fleet maintenance MET its scale gate (2.50× at N=4); S10's tar-x
+gate is **NOT MET by architecture** and the honest product statement governs
+(6.73× — remote clients are throughput-oriented); S11's **MPI-IO verdict is
+MET** (1.411×/2.273× ≥ 0.8×, read-back exact, oracle clean).
+
+### What shipped vs what is dark by default
+
+| Surface | Shipped posture |
+|---|---|
+| `format` | **Multi-writer-capable by default** (nine bits, one act); `--single-writer` = the pre-flip class; `volume enable-multi-writer` = the offline upgrade |
+| A plain mount | Arms NOTHING — every distributed plane dark, the solo re-gate law (`dlm_rpcs == 0`) re-proven at every rung |
+| Membership (S6) | `SQUEEZEFS_MEMBERSHIP_BIND` — off by default |
+| Multi-writer (S7/S8/S9) | `SQUEEZEFS_MULTI_WRITER=1` + the five-rung co-writer admission — opt-in; refuses non-PR substrates and unstamped formats loudly |
+| Delegations / intents / placement (S10) | Default **on**, read ONLY when the mw plane is armed (announced-inert otherwise) |
+| Byte-range custody (S11) | `SQUEEZEFS_RANGE_CUSTODY` — **default OFF** (upheld three times; flip preconditions on the residual board) |
+| Fleet-parallel jobs (10c) | Default on for JOINED members (`SQUEEZEFS_FLEET_JOBS`); zero-capacity fleet run ≡ the local run |
+| Fleet share (3b) | `SQUEEZEFS_FLEET_SHARE` default 1 = whole-machine (set per co-located daemon) |
+| sqz kernel 0030 | In both kernel tracks; stock `multipath=Y` kernels keep the loud rule-2 refusal + remedies |
+
+### The rung-20 residual board (ordered — the next program's input)
+
+Collected from every evidence note's own residual section; nothing else is
+outstanding. Items 1–2 are the S11 completion pair; 3 is the named unlock for
+the S10 gate; the rest are carried, priced, and loud where they can fire.
+
+1. **The indirect-map width-N composition** (the width-N campaign's fix-4
+   named gap): a shared file whose composed map exceeds the inline cap
+   (≈ 6 GiB at 4 MiB blocks) spills `indirect:`, and concurrent chained
+   publishes onto it **refuse fail-safe** (fsync EIO, retried-class, volume
+   never poisoned). Needs the blob-aware owner-side merge (the authority CAN
+   read the blob — the data router is armed; the meta plane cannot).
+   Acceptance: the MPI-IO leg at ≥ 750 MiB/s probe bandwidth (it self-sizes
+   to 10 GiB). `.benchmarks/2026-08-18-s11-widthn-refs-fix.md`.
+2. **The `SQUEEZEFS_RANGE_CUSTODY` default flip** — upheld OFF three times
+   (rungs 15/17/18). Preconditions now exactly two: residual 1 closed, and
+   the `s11-range` + §9.5 row gates green ×3 from zero on the flipped
+   default.
+3. **Per-volume claim admission — the fleet-of-authorities recipe** (§6.10
+   R4): a client holding the D0 claim on ≥ 1 volume of a shared set is what
+   makes the S10 tar-x gate meetable and inverts `mint_redirects` for real.
+   Needs the D0 Layer-B2 per-volume admission + partial-writer open + the
+   claim set naming per-volume owners; the placement machinery is landed,
+   dark, and pinned against the shape (`tests/mw_slot_placement_tests.rs`).
+   Cross-owner slot migration (a shipped migration form through the
+   `install_migration_executor` seam) rides with it.
+   `.benchmarks/2026-08-17-s10-slot-placement.md`.
+4. **Automatic co-writer re-admission** (S9-b's documented deferral):
+   un-poisoning a fenced mount is a designed transition needing the
+   S6/S7/S9 planes' adjudication — "a fenced holder is dead until remount"
+   is load-bearing. Posture until then: supervise + remount on the
+   self-fence gauges (operations.md carries it).
+5. **The width-8+ fan-out venue**: `s9-fanout` at width 8 on a
+   custody-armed fleet wedged in shipped-free double-release churn (recorded
+   at rungs 18/19 as new territory, not a regression — the leg's proven
+   venue is width 2 and it is green there from zero). The width-N family's
+   remaining live shape.
+6. **Free-grace ack cadence under rewrite churn** (rung-17 finding 5c,
+   reproduced at scale): a storm's deferrals outrun reader releases —
+   `free_grace_offsets` climbs and lane-share ENOSPC follows (a 32 GiB
+   lane exhausted in ~460 passes). Wants its own row + a pressure-coupled
+   release valve; `free_grace_alloc_stalls` is the live instrument.
+7. **The kernel-split sequential-frontier extend RTT** (the v2 desired
+   stretch): live dd streams pay ~1 extend round trip per block (63/64
+   extensions on `s11-range`; sub-1 % at localhost). The R2-classifier
+   window is the fabric-venue refinement.
+8. **The S8 serial-residual decomposition** (rungs 13/14 residuals): per-verb
+   owner-side attribution of the ~11.7 shipped verbs/entry (a verb histogram
+   on `meta_ship_owner_phase_ns`'s keying), the applied-name attr-serve
+   cache, and the pooled-across-dirs intent supply — the inputs any further
+   serial-latency work needs before touching machinery.
+9. **Range-custody economy items** (rung-15 residuals 4–6 + rung-11
+   residual 3, all carried): the per-client aggregate budget split, the
+   owner-side `client_ranges` O(live grants) renewal scan (the 1 TiB-shape
+   economy item), the `range_custody_grant_census` VAL-7a export, and
+   partial recall acks (never priced in by any storm row).
+10. **Delegation watermarks under multi-appender volumes**: the grant/view
+    watermark comparison must name the bit-8 partition on the day one
+    volume has TWO appenders (S8 multi-owner; today's one-appender-per-volume
+    keeps it sound). Fleet-jobs' deferred pair lives in the same future:
+    cross-writer lane reconcile (C8 stays the block-plane oracle) and
+    mover/repair shard distribution (the `wire_executable` gap); fleet
+    inode-plane sharding needs a coherent-instant protocol (coordinator-
+    serial today, by the C10 one-view law).
+11. **Pre-fix field damage stays visible, never healed silently** (the
+    forward-only law): pre-fix volumes keep their orphaned C8 records
+    (report-only) and their root-nlink −1 (self-suppressed at the decrement
+    floor). Reformat is the clean path.
+12. **Carried non-MW standing red**:
+    `fsync_durability_contract_tests::test_data_barrier_precedes_the_metadata_barrier`
+    fails deterministically on dev on the flip note's box (pre-existing —
+    verified against the un-flipped tree; `.benchmarks/2026-08-16-mw-default-flip.md`
+    residual 1). Owed its own red-first branch; not re-adjudicated by this
+    program.
+13. **Rig-class notes** (no product change owed): the ior venue pins
+    (`--map-by :OVERSUBSCRIBE`, `-std=gnu17` under GCC ≥ 15 — recorded in
+    `run_mw_matrix.sh`), the kept-vs-deleted publish-plane/delete-plane
+    fsck discriminator worth packaging if the width-N family recurs, the
+    `SQZ_DEVSUB` NQN-reuse reconnect-latency nuisance, and the S6 owner-
+    cadence journal allowance (a measured constant — re-derive, never
+    widen).

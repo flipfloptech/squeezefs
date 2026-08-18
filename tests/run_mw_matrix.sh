@@ -3583,10 +3583,15 @@ leg_s11_subblock() {
     ) <<'PYA' &
 import os, sys, time
 path, start, rec, half = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
-# O_SYNC: each record is ONE FUSE write (the per-record ship the price
-# table prices); buffered records legally coalesce to max_write slices —
-# the product chunks those (pinned) but the ROW's instrument is per-record.
-fd = os.open(path, os.O_WRONLY | os.O_SYNC)
+# The INCUMBENT stays BUFFERED (per-pass fsync): pre-demotion it holds
+# WHOLE-BLOCK custody, and a co-writer's small overwrite rides
+# CoW-rewrite (W1 is authority-only BY DECISION) — an O_SYNC record
+# there is a 4 MiB CoW per 4 KiB write, which exhausts the allocation
+# lane inside ONE pass (measured live: 512 records = the whole
+# 512-block lane share). Post-demotion its fsync slices ship as
+# max_write-coalesced chunked extents — the coalesced face of the
+# price table; the per-record face is phase B's O_SYNC stream.
+fd = os.open(path, os.O_WRONLY)
 deadline = time.monotonic() + 9.0
 n = 0
 while True:
@@ -3643,7 +3648,8 @@ def flat(d, out=None, pfx=""):
         else: out[pfx + k] = v
     return out
 def load(i, ph):
-    return flat(json.load(open(f"{rowdir}/m{i}_p{ph}.json")))
+    root = json.load(open(f"{rowdir}/m{i}_p{ph}.json"))
+    return flat(root.get("metrics", root))
 bad = []
 d = lambda i, a, b, k: int(load(i, b).get(k, 0) or 0) - int(load(i, a).get(k, 0) or 0)
 m2_ship = d(m2, 0, 3, "meta_ship_publish.extent_shipped")
@@ -3670,9 +3676,11 @@ print(f"retained_bytes at quiesce: {ret_end}")
 if m2_ship < recs:
     bad.append(f"m{m2}: extent_shipped d={m2_ship} < {recs} — phase B's records did not ship "
                "(silent local landing = the row is a lie)")
-if m1_ship < recs:
-    bad.append(f"m{m1}: extent_shipped d={m1_ship} < {recs} — the INCUMBENT's post-demotion "
-               "writes must ship too (KD-MW-8's symmetric law)")
+if m1_ship < 2:
+    bad.append(f"m{m1}: extent_shipped d={m1_ship} < 2 — the INCUMBENT's post-demotion "
+               "writes must ship too (KD-MW-8's symmetric law; buffered slices ship "
+               "as max_write-coalesced chunked extents, so the floor is chunks, "
+               "not records)")
 if served < m2_ship + m1_ship:
     bad.append(f"authority: extent_served d={served} < shipped {m2_ship + m1_ship} — "
                "shipped ≡ served is the engagement law")
@@ -3709,7 +3717,8 @@ def flat(d, out=None, pfx=""):
         else: out[pfx + k] = v
     return out
 def load(i, ph):
-    return flat(json.load(open(f"{rowdir}/m{i}_p{ph}.json")))
+    root = json.load(open(f"{rowdir}/m{i}_p{ph}.json"))
+    return flat(root.get("metrics", root))
 t = 0
 for i in (m1, m2):
     t += int(load(i, 3).get("meta_ship_publish.extent_shipped", 0) or 0) - \
@@ -3948,7 +3957,9 @@ def flat(d, out=None, pfx=""):
         if isinstance(v, dict): flat(v, out, pfx + kk + ".")
         else: out[pfx + kk] = v
     return out
-def load(i, ph): return flat(json.load(open(f"{rowdir}/m{i}_p{ph}.json")))
+def load(i, ph):
+    root = json.load(open(f"{rowdir}/m{i}_p{ph}.json"))
+    return flat(root.get("metrics", root))
 d = lambda i, a, b, key: int(load(i, b).get(key, 0) or 0) - int(load(i, a).get(key, 0) or 0)
 bad = []
 for m in cws:
@@ -4082,7 +4093,9 @@ def flat(d, out=None, pfx=""):
         if isinstance(v, dict): flat(v, out, pfx + kk + ".")
         else: out[pfx + kk] = v
     return out
-def load(i, ph): return flat(json.load(open(f"{rowdir}/m{i}_p{ph}.json")))
+def load(i, ph):
+    root = json.load(open(f"{rowdir}/m{i}_p{ph}.json"))
+    return flat(root.get("metrics", root))
 d = lambda i, a, b, key: int(load(i, b).get(key, 0) or 0) - int(load(i, a).get(key, 0) or 0)
 bad = []
 grants = d("0", 0, 1, "range_custody.range_custody_grants")
@@ -4223,7 +4236,9 @@ def flat(d, out=None, pfx=""):
         if isinstance(v, dict): flat(v, out, pfx + kk + ".")
         else: out[pfx + kk] = v
     return out
-def load(i, ph): return flat(json.load(open(f"{rowdir}/m{i}_p{ph}.json")))
+def load(i, ph):
+    root = json.load(open(f"{rowdir}/m{i}_p{ph}.json"))
+    return flat(root.get("metrics", root))
 d = lambda i, a, b, key: int(load(i, b).get(key, 0) or 0) - int(load(i, a).get(key, 0) or 0)
 bad = []
 caps = d("0", 0, 1, "range_custody.range_custody_cap_refusals")

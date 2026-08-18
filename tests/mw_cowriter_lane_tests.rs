@@ -325,6 +325,13 @@ struct Authority {
 
 impl Authority {
     async fn start(vol: &Path, members: &[&str]) -> Authority {
+        Self::start_idle(vol, members, None).await
+    }
+
+    /// [`Self::start`] with the cluster wire's SESSION IDLE TIMEOUT
+    /// overridden — the rung-18 residual-(d) venue: the live fleet's 60 s
+    /// idle reaper, shortened so a test can outlive a session honestly.
+    async fn start_idle(vol: &Path, members: &[&str], idle: Option<Duration>) -> Authority {
         let meta = squeezefs::meta_backend::open_routed_meta_set(&[vol.display().to_string()])
             .await
             .expect("the authority mounts its own set");
@@ -354,16 +361,16 @@ impl Authority {
         let router = data_grant::AsyncVerbRouter::new()
             .with_custody(Arc::clone(&owner))
             .with_publish(publish::PublishService::new(Arc::clone(&meta)));
-        let listener = cw::RpcListener::start_async(
-            cw::RpcListenerConfig {
-                bind_addr: "127.0.0.1:0".parse().unwrap(),
-                service_threads: 2,
-                ..cw::RpcListenerConfig::default()
-            },
-            SECRET.to_vec(),
-            Arc::new(router),
-        )
-        .expect("the authority listens");
+        let mut cfg = cw::RpcListenerConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            service_threads: 2,
+            ..cw::RpcListenerConfig::default()
+        };
+        if let Some(idle) = idle {
+            cfg.session_idle_timeout = idle;
+        }
+        let listener = cw::RpcListener::start_async(cfg, SECRET.to_vec(), Arc::new(router))
+            .expect("the authority listens");
         let endpoint = listener.endpoint().to_string();
         Authority {
             listener,
@@ -1840,5 +1847,80 @@ async fn a_poisoned_mounts_custody_acquire_fails_fast_in_the_fence_class() {
         t0.elapsed()
     );
 
+    auth.stop().await;
+}
+
+// ===========================================================================
+// Rung 18 residual (d): the idle-reaped publish session reconnects
+// ===========================================================================
+
+/// Contract (CONVICTED LIVE on the s11-subblock leg, 2026-08-18): the
+/// cluster wire's 60 s idle-session reaper closed a co-writer's publish
+/// session between rows, and its next LANE RAISE refused ("cluster wire:
+/// the coordinator closed the session") instead of reconnecting — the
+/// allocator then refused the freshly-claimed offset ("its lane
+/// reservation could not be made durable") and the application saw
+/// EINVAL on a healthy fleet, with `alloc_lane_raise_refusals` (a
+/// must-stay-0 tripwire) moving. The rung-17 s9-fanout first-attempt
+/// failure was the same class (residual (d) of the zeros-interleave
+/// note).
+///
+/// The law: a TRANSPORT-failed publish of a RESEND-SAFE verb reconnects
+/// and resends the SAME frame, once — the S8 batch precedent ("the
+/// owner's dedup window makes the resend exactly-once"). Resend-safe =
+/// the witnessed class (the `(lease_epoch, request_id)` window), the
+/// lane raise (its window is MONOTONICITY itself: the frontier only
+/// rises and the reply answers the frontier in force), and the pure
+/// reads. Un-witnessed mutators keep ONE attempt — a resent create
+/// after a lost reply mints a second name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_idle_reaped_publish_session_reconnects_and_the_raise_lands() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "cw-idlereap").await;
+    let auth =
+        Authority::start_idle(&vol, &[NODE_A], Some(Duration::from_millis(300))).await;
+    let cw = CoWriter::join(&auth, &vol, NODE_A, 0).await;
+    let p = cw.part();
+    cw.engage().await; // ships the OPEN raise — the session now exists
+    let tag = squeezefs::meta_backend::kv::block_refs::volume_tag(DATA_VOL);
+
+    // The venue is the SERVER's own clock: its read timeout reaps the
+    // idle session (the live fleet's 60 s, shortened above to 300 ms).
+    // Nothing client-side can observe the reap without sending a frame —
+    // which would reset the idle clock — so this sleep IS the venue, not
+    // a synchronization shortcut.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+
+    let refusals_before = METRICS.alloc_lane_raise_refusals.load(Ordering::Relaxed);
+    let frontier = publish::raise_alloc_lane(&cw.meta, tag, p.writer_id(), p.writers(), 10_000)
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "a lane raise on an idle-reaped session must RECONNECT AND \
+                 RESEND (the raise is monotone — a duplicate re-answers the \
+                 standing frontier), never refuse: {e:?} (rung-18 residual \
+                 (d), the s11-subblock live conviction)"
+            )
+        });
+    assert!(frontier >= 10_000, "the raise landed: frontier {frontier}");
+    assert_eq!(
+        METRICS.alloc_lane_raise_refusals.load(Ordering::Relaxed),
+        refusals_before,
+        "alloc_lane_raise_refusals is a must-stay-0 tripwire — a reconnect \
+         is not a refusal"
+    );
+    let rec = auth
+        .record_for(p.writer_id())
+        .await
+        .expect("the reservation record exists");
+    assert!(
+        rec.reserved_upto >= 10_000,
+        "the resent raise committed durably (reserved_upto {})",
+        rec.reserved_upto
+    );
+
+    drop(cw);
     auth.stop().await;
 }

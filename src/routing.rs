@@ -11144,8 +11144,15 @@ impl DataRouter {
         let mut save_token = 0u64;
         for op in batch {
             // Per-op fencing: a stale op fails ALONE (the supersession
-            // law); the batch's fresh members proceed.
-            if op.fencing_token < current_fencing {
+            // law); the batch's fresh members proceed. Rung 18 (§9.2's
+            // own-lease law, the save arm's twin): a token that is a
+            // STILL-LIVE range grant of this ino is CURRENT custody —
+            // under byte-range custody every new stripe advances the max
+            // generation, and fencing in-flight siblings on it livelocks
+            // the width-N row (the MPI-IO conviction).
+            if op.fencing_token < current_fencing
+                && !crate::meta_ship::tokens::range_token_live(ino, op.fencing_token)
+            {
                 fenced.push(Outcome {
                     done: op.done,
                     payload: op.fencing_token,
@@ -11652,7 +11659,11 @@ impl DataRouter {
         let meta_key = crate::keys::metadata_for_path(file_path);
 
         let current_fencing = self.dlm.get_fencing_token_ino(ino);
-        if fencing_token < current_fencing {
+        if fencing_token < current_fencing
+            // Rung 18 (§9.2's own-lease law — the save arm's twin): a
+            // still-live range grant's token is CURRENT custody.
+            && !crate::meta_ship::tokens::range_token_live(ino, fencing_token)
+        {
             return Err(crate::error::SqueezefsError::FencingTokenExpired {
                 token: fencing_token,
                 expected: current_fencing,

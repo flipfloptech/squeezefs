@@ -15422,7 +15422,11 @@ impl SqueezefsFilesystem {
         let payload: crate::routing::WritePayload = payload.into();
         {
             let current_fencing = self.dlm.get_fencing_token_ino(ino);
-            if fencing_token < current_fencing {
+            if fencing_token < current_fencing
+                // Rung 18 (§9.2's own-lease law): a still-live range
+                // grant's token is CURRENT custody.
+                && !crate::meta_ship::tokens::range_token_live(ino, fencing_token)
+            {
                 return Err(SqueezefsError::FencingTokenExpired {
                     token: fencing_token,
                     expected: current_fencing,

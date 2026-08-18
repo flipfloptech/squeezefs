@@ -1198,6 +1198,33 @@ fn scratch(tag: &str) -> PathBuf {
     base
 }
 
+/// Same-box-relative "instant" yardstick (the bench-baseline discipline
+/// applied to wall-clock test bounds): the elapsed cost of the SAME
+/// binary's `--version` spawn, measured once per process UNDER THE SAME
+/// LOAD as the assertions that consume it. The 2026-08-18 consolidation
+/// gate caught the fixed `< 5 s` guess blowing at 6.7 s while the full
+/// serial battery owned the box — the refusal itself was correct and
+/// loud. A refusal bound of `max(quiet_floor, K x yardstick)` keeps the
+/// quiet-box teeth verbatim and stretches honestly with load instead of
+/// guessing an absolute number.
+fn instant_yardstick() -> Duration {
+    static YARDSTICK: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *YARDSTICK.get_or_init(|| {
+        let t0 = Instant::now();
+        let _ = Command::new(bin())
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        t0.elapsed().max(Duration::from_millis(10))
+    })
+}
+
+/// `max(quiet_floor, k x yardstick)` — the calibrated refusal bound.
+fn instant_bound(quiet_floor: Duration, k: u32) -> Duration {
+    quiet_floor.max(instant_yardstick() * k)
+}
+
 fn run_with_deadline(mut cmd: Command, deadline: Duration, what: &str) -> (Output, Duration) {
     let start = Instant::now();
     let mut child = cmd
@@ -1362,16 +1389,16 @@ fn cli_mount_rejects_the_fabric_endpoints_flag_naming_the_verb() {
         .arg(&mnt)
         .arg("--fabric-endpoints")
         .arg(format!("vol-0000000000000001=127.0.0.1:4420:{NQN_SUBSYS}"));
-    let (out, elapsed) =
-        run_with_deadline(cmd, Duration::from_secs(10), "mount --fabric-endpoints");
+    let bound = instant_bound(Duration::from_secs(5), 20);
+    let (out, elapsed) = run_with_deadline(cmd, bound * 2, "mount --fabric-endpoints");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         !out.status.success(),
         "mount --fabric-endpoints must FAIL; stderr:\n{stderr}"
     );
     assert!(
-        elapsed < Duration::from_secs(5),
-        "rejection must be instant, took {elapsed:?}"
+        elapsed < bound,
+        "rejection must be instant (bound {bound:?}), took {elapsed:?}"
     );
     assert!(
         stderr.contains("config set-fabric-endpoints"),
@@ -1396,15 +1423,16 @@ fn cli_mount_pair_or_neither_refusal_is_instant() {
         .arg(&mnt)
         .arg("-o")
         .arg(format!("hostnqn={}", id_a().hostnqn));
-    let (out, elapsed) = run_with_deadline(cmd, Duration::from_secs(10), "mount half-pair");
+    let bound = instant_bound(Duration::from_secs(5), 20);
+    let (out, elapsed) = run_with_deadline(cmd, bound * 2, "mount half-pair");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         !out.status.success(),
         "-o hostnqn= without hostid must refuse; stderr:\n{stderr}"
     );
     assert!(
-        elapsed < Duration::from_secs(5),
-        "instant, took {elapsed:?}"
+        elapsed < bound,
+        "instant (bound {bound:?}), took {elapsed:?}"
     );
     assert!(
         stderr.contains("hostid"),
@@ -1446,16 +1474,16 @@ fn cli_mount_explicit_identity_without_records_refuses_never_inert() {
         if !opt.is_empty() {
             cmd.arg("-o").arg(&opt);
         }
-        let (out, elapsed) =
-            run_with_deadline(cmd, Duration::from_secs(30), "mount explicit identity");
+        let bound = instant_bound(Duration::from_secs(20), 80);
+        let (out, elapsed) = run_with_deadline(cmd, bound * 2, "mount explicit identity");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
             !out.status.success(),
             "{label}: explicit identity + no record must refuse (never inert); stderr:\n{stderr}"
         );
         assert!(
-            elapsed < Duration::from_secs(20),
-            "{label}: the refusal is a mount-time gate, took {elapsed:?}"
+            elapsed < bound,
+            "{label}: the refusal is a mount-time gate (bound {bound:?}), took {elapsed:?}"
         );
         assert!(
             stderr.contains("set-fabric-endpoints"),

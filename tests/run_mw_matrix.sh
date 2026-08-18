@@ -4529,6 +4529,17 @@ PYV
         drift="$(stat_field 0 meta_kv_block_refs_drift)"
         [ "$drift" = "0" ] || [ "$drift" = "2" ] ||
             die "cell A round $round: C8 drift=$drift (the adjudicated pair reads 2; anything else is a regression)"
+        # The cold-verify bounce fenced every co-writer AGAIN (the S7
+        # posture) — re-admit the fleet before the next cell.
+        for idx in $(cowriter_idxs); do
+            "$MWFLEET" unmount "$idx" >/dev/null 2>&1 || true
+            admitted=0
+            for ((tries = 0; tries < 15; tries++)); do
+                if "$MWFLEET" mount "$idx" >/dev/null 2>&1; then admitted=1; break; fi
+                sleep 10
+            done
+            [ "$admitted" = "1" ] || die "cell A round $round: co-writer m$idx could not re-admit after the cold verify"
+        done
         rm -f "$w_mnt/$f"
         log "cell A round $round/2 GREEN (authority killed mid-assembly, fleet recovered, re-driven pass exact, fsck+C8 clean)"
     done

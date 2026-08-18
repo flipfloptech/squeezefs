@@ -112,6 +112,43 @@ natural fabric identity (the 0030 ruling's point), so nothing on the
 host changes. Combine with Path A's node half. Cost: hardware/VM
 plumbing; the 200GbE row then measures the passthrough path.
 
+## 3b. Toolchain parity — required for EVERY path that builds modules (field-verified 2026-08-18)
+
+The sqz kernels are built with **gcc-toolset-14** (the kernel's own
+stamp: `gcc (GCC) 14.2.1 ... (Red Hat 14.2.1-11)`), and their kbuild
+flags include GCC>=13.1 options (`-fmin-function-alignment=16`). Rocky
+8.10's base compiler is GCC 8.5, so ANY out-of-tree build against
+`/lib/modules/<sqz>/build` — DOCA-OFED DKMS, Lustre, anything — fails
+with `unrecognized command line option '-fmin-function-alignment=16'`
+until the matching toolset is on PATH (first field attempt hit exactly
+this):
+
+```
+dnf install gcc-toolset-14
+source /opt/rh/gcc-toolset-14/enable     # per-shell
+# durable for dnf/cron-triggered DKMS rebuilds on this kernel:
+echo 'source /opt/rh/gcc-toolset-14/enable' > /etc/profile.d/zz-gcc14-for-sqz-kernel.sh
+```
+
+rpm scriptlets inherit the invoking shell's environment, so `dnf
+install/reinstall <mod>-dkms` from the enabled shell builds correctly;
+the manual form is `dkms build <mod>/<ver> -k <sqz-kver> && dkms
+install ...` from the same shell. The "compiler differs from the one
+used to build the kernel" warning disappears once versions match.
+
+Field triage notes from the first DOCA-OFED 3.4.0 attempt on
+6.19.14-sqz (Rocky 8.10): install the CORE `mlnx-ofa_kernel-dkms`
+FIRST and read its verdict before anything else — the profile's
+`isert-dkms` aborts on `BUILD_DEPENDS: mlnx-ofa_kernel` when the core
+is absent (a cascade, not a compile failure), and `xpmem`/`ucx-xpmem`/
+`isert` are HPC-SHMEM/iSER extras needed by nothing in this program
+(exclude them: `--exclude=xpmem\*,ucx-xpmem,isert-dkms`). The
+`doca-ofed` meta-package reports "Complete!" even when every module
+scriptlet failed — `dkms status` is the truth, never the rpm summary.
+Secure Boot boxes additionally need the one-time
+`mokutil --import /var/lib/dkms/mok.pub` + reboot enrollment or the
+built modules will refuse to load.
+
 ## 4. The probe checklist that picks the path (run these first, ~10 min)
 
 On each storage node:

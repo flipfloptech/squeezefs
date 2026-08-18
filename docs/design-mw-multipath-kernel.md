@@ -1,5 +1,19 @@
 # MW multipath kernel fix — host-scoped fabric subsystems (rung 5b)
 
+**Posture (user ruling 2026-08-18): "we will absolutely almost never
+need that patch."** Recorded so it is citable: the entire S8→S11 arming
+ladder, the co-located field shape, and every acceptance row ran with
+`host_scoped=0` — the shipped co-located posture (one fabric identity
+per kernel, N filesystem clients over it) plus natural per-kernel
+identities across machines/VMs cover every real topology. The patch's
+ONLY futures are test velocity (N distinct-looking clients on one
+kernel without VMs) and same-machine device-enforced inter-mount
+fencing — nice-to-haves, never blockers. Consequences: (a) the RULE-2
+loud refusal is the load-bearing piece on stock kernels and ships
+regardless; (b) the patch stays a maintained-but-opt-in artifact
+(param default off, zero cost unused); (c) no rebase urgency — it may
+lag new kernel series until an actual need appears.
+
 **Status:** IMPLEMENTED with this document — patch `0030` in both sqz
 series tracks (`docker/kernel-sqz/patches-7.1/` authored FIRST per the
 2026-08-15 authoring-order ruling, then backported to

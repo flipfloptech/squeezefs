@@ -98,6 +98,43 @@ use super::KvError;
 /// Key length: `vol_tag | block_idx | owner_ino | block_index`.
 pub const BLOCK_REF_KEY_LEN: usize = 8 + 8 + 8 + 4;
 
+// ---------------------------------------------------------------------------
+// The authority-side key resolver (DLM S11 rung 19 — the width-N refs
+// composition).
+// ---------------------------------------------------------------------------
+
+/// Resolve a block KEY STRING to its durable reference — the data
+/// router's `block_ref_for` behind a process-global hook, installed at
+/// multi-writer arm (`multi_writer::arm_multi_writer`, beside the range
+/// geometry source). The authority-COMPOSED layout commits (the
+/// chain-onto-head merge, the custody-scoped Put) recompute their
+/// accounting from the composition itself, and this is how the meta
+/// backend — which owns no data-plane router — names the displaced and
+/// inserted keys' `(vol_tag, block_idx)`. `None` from the resolver means
+/// the key is not allocator-tracked (the same class the mount-time walk
+/// skips); the caller counts it in `META_KV_BLOCK_REFS_UNRESOLVED`,
+/// mirroring the router's own discipline.
+pub type BlockRefResolverFn = std::sync::Arc<dyn Fn(&str, u64, u32) -> Option<BlockRef> + Send + Sync>;
+
+static BLOCK_REF_RESOLVER: once_cell::sync::Lazy<arc_swap::ArcSwapOption<BlockRefResolverFn>> =
+    once_cell::sync::Lazy::new(arc_swap::ArcSwapOption::empty);
+
+/// Install the resolver (multi-writer arm / test fixture).
+pub fn install_block_ref_resolver(resolver: BlockRefResolverFn) {
+    BLOCK_REF_RESOLVER.store(Some(std::sync::Arc::new(resolver)));
+}
+
+/// Uninstall it (disarm / test teardown).
+pub fn uninstall_block_ref_resolver() {
+    BLOCK_REF_RESOLVER.store(None);
+}
+
+/// The installed resolver, if any — one relaxed load on every un-armed
+/// mount.
+pub fn block_ref_resolver() -> Option<BlockRefResolverFn> {
+    BLOCK_REF_RESOLVER.load_full().map(|a| (*a).clone())
+}
+
 /// Length of the `(vol_tag, block_idx)` refcount prefix — the range a
 /// refcount read scans ([`block_range`]).
 pub const BLOCK_REF_PREFIX_LEN: usize = 16;

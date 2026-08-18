@@ -451,6 +451,125 @@ mod tests {
         Record::put(inode_key(ino).to_vec(), seq, iv(seq).encode())
     }
 
+    // -- §6.2 item-9 lineage across compaction (DLM S11 rung 19) -------------
+
+    fn layout_put(key: &[u8], seq: u64, map: &[(u32, &str)]) -> Record {
+        let layout = crate::layout_wire::LayoutMetadata {
+            file_type: "striped".into(),
+            size: 4096,
+            block_map_id: None,
+            block_prefix: Some("be://data".into()),
+            file_id: None,
+            data_key: None,
+            block_map: Some(map.iter().map(|(b, k)| (*b, k.to_string())).collect()),
+        };
+        let value = super::super::record::XattrValue::encode_parts(
+            b"layout",
+            &bincode::serialize(&layout).expect("layout encodes"),
+        )
+        .expect("xattr value encodes");
+        Record::put(key.to_vec(), seq, value)
+    }
+
+    fn layout_link(key: &[u8], seq: u64, entries: &[(u32, &str)], versions: (u64, u64)) -> Record {
+        let mut d = crate::layout_wire::LayoutDelta::from_final_state(
+            "striped",
+            4096,
+            None,
+            Some("be://data"),
+            None,
+            None,
+            entries
+                .iter()
+                .map(|(b, k)| (*b, k.to_string()))
+                .collect::<Vec<_>>(),
+        );
+        d.set_versions(versions.0, versions.1);
+        Record {
+            key: key.to_vec(),
+            seq,
+            kind: RecordKind::Delta,
+            value: d.encode(),
+        }
+    }
+
+    /// Contract (spec §6.2 item 9 at width N — the rung-19 fork latch,
+    /// convicted live on the s11-blockcyclic row: "divergent layout-delta
+    /// chain … link seq 3024497 names base version 0x800000001d6 but folds
+    /// onto 0x0", 5,421 failed checkpoint ticks, the layout unreadable to
+    /// the C8 walk): a link's base claim is gated at COMMIT against the
+    /// then-durable head, so node compaction that collapses that head into
+    /// a bare `Put` UNDERNEATH an already-committed (or in-flight-gated)
+    /// later link makes every subsequent fold of the key refuse forever.
+    /// The law: compaction of a chain whose NEWEST record is a VERSIONED
+    /// layout link folds everything BELOW the link and RETAINS the link
+    /// itself, claim restamped to 0 (it is now its segment's first link) —
+    /// so any live later claim still verifies, and the folded value is
+    /// byte-equal either way.
+    #[test]
+    fn compaction_preserves_the_lineage_a_live_link_claims() {
+        let key = b"xattr-layout-key".to_vec();
+        let base = layout_put(&key, 1, &[(0, "be://data:a")]);
+        let d1 = layout_link(&key, 2, &[(1, "be://data:b")], (0, 0x11));
+        let d2 = layout_link(&key, 3, &[(2, "be://data:c")], (0x11, 0x12));
+        let img = build_bset(&[base, d1, d2], 3).expect("chain bset builds");
+        let view = BsetView::parse(&img).expect("chain bset parses");
+
+        let folded = compact(&[view], 0).expect("compaction folds the chain");
+
+        // A LIVE later link, committed against the pre-compaction head
+        // (claim 0x12) — exactly what the commit gate admitted while the
+        // checkpoint task compacted concurrently.
+        let d3 = layout_link(&key, 4, &[(3, "be://data:d")], (0x12, 0x13));
+        let mut newest_first: Vec<RecordRef<'_>> = vec![d3.record_ref()];
+        newest_first.extend(folded.iter().rev().map(|r| r.record_ref()));
+        let fold = fold_newest_first(newest_first.into_iter()).expect(
+            "a later link claiming the pre-compaction head folds CLEAN — \
+             compaction must preserve the lineage it collapses (the width-N \
+             fork latch)",
+        );
+        let Folded::Put { value, .. } = fold else {
+            panic!("the composed layout folds to a live value: {fold:?}");
+        };
+        let x = super::super::record::XattrValue::decode(&value).expect("xattr envelope");
+        let l = crate::layout_wire::decode_base_layout(&x.value).expect("inline layout");
+        let map = l.block_map.expect("striped map");
+        for (b, k) in [
+            (0, "be://data:a"),
+            (1, "be://data:b"),
+            (2, "be://data:c"),
+            (3, "be://data:d"),
+        ] {
+            assert_eq!(
+                map.get(&b).map(String::as_str),
+                Some(k),
+                "block {b} survives compaction + the live link's fold"
+            );
+        }
+    }
+
+    /// The posture guard beside the lineage rule: unversioned chains (and
+    /// inode-delta chains) keep compacting to ONE folded record per key —
+    /// solo volumes stay byte-identical.
+    #[test]
+    fn compaction_of_unversioned_chains_stays_single_record() {
+        let key = inode_key(9).to_vec();
+        let records = vec![
+            put(9, 1),
+            Record::delta(key.clone(), 2, &InodeDelta::times(5, 6)),
+            Record::delta(key.clone(), 3, &InodeDelta::times(7, 8)),
+        ];
+        let img = build_bset(&records, 3).expect("inode chain builds");
+        let view = BsetView::parse(&img).expect("parses");
+        let folded = compact(&[view], 0).expect("folds");
+        assert_eq!(
+            folded.len(),
+            1,
+            "an inode-delta chain compacts to one folded Put (no lineage to keep)"
+        );
+        assert_eq!(folded[0].kind, RecordKind::Put);
+    }
+
     /// Recompute and restamp the checksum of a (possibly doctored) image so
     /// bounds/ordering validation is reached past the checksum gate.
     fn restamp_checksum(buf: &mut [u8]) {

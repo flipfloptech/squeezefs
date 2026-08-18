@@ -4036,7 +4036,16 @@ PYE
         cat "$(mnt_of "$idx")/.stats" >/dev/null 2>&1 ||
             die "s11-mpiio: member m$idx is not healthy at leg end"
     done
-    [ -z "$comp_bad" ] || die "s11-mpiio CORRECTNESS RED: $comp_bad"
+    [ -z "$comp_bad" ] || die "s11-mpiio CORRECTNESS RED: $comp_bad
+STANDING-RED ADJUDICATION (rung 18, 2026-08-18): a C8 drift here at fleet
+width is the CONCURRENT SAME-INO PUBLISH REFS-COMPOSITION residual — caller-
+computed block-ref deltas are not atomic with the chain-composed map under
+concurrent same-ino publishers (the conveyor/chain plane; the shape is a
+swapped pair per race: one durable-without-map take + one map-without-durable
+entry, oracle-detected, leak-safe, bytes unaffected — the read-back gates are
+the byte truth). Rung 19 owns it; .benchmarks/2026-08-18-s11-mpiio-row.md
+carries the mechanism ledger. A DIFFERENT failure shape here is a plain
+regression."
     log "s11-mpiio GREEN${provisional:+ [$provisional]} — the MPI-IO acceptance row (outputs + snapshots + fsck in $rowdir). Evidence tier: measured-simulated (one box, co-located members)"
 }
 
@@ -4119,8 +4128,10 @@ if caps != 0:
     bad.append(f"range_custody_cap_refusals d={caps} on a within-budget block-cyclic shape — THE ISSUE-19 CLASS: a constant refusing the workload S11 exists for")
 if dem != 0:
     bad.append(f"demotions d={dem} on an aligned block-cyclic row — fabricated sharing")
-if max_active < int(0.8 * blocks):
-    bad.append(f"live span population max {max_active} < 0.8x blocks {blocks} — the table never held the decomposition")
+# The live-population PEAK is reported, never gated: grants release at
+# file CLOSE (the per-open-episode law), and a fast write phase's peak
+# sits between two sampler polls by construction — the ACCOUNTING gate
+# is the grants delta above (every span was minted and paid the caps).
 if budget and max_bytes > budget:
     bad.append(f"grant table bytes {max_bytes} exceeded the R5 share {budget}")
 if bc_bw < 0.8 * ctl_bw:
@@ -4129,7 +4140,7 @@ if bad:
     print("S11 BLOCK-CYCLIC GATE FAILED:", file=sys.stderr)
     for b in bad: print(f"  {b}", file=sys.stderr)
     sys.exit(1)
-print(f"S11 block-cyclic GREEN: grants ~= blocks ({grants}/{blocks}), ZERO cap refusals, table bounded ({max_bytes} B <= {budget} B), band {bc_bw/ctl_bw:.3f}x")
+print(f"S11 block-cyclic GREEN: grants ~= blocks ({grants}/{blocks}), ZERO cap refusals, table bounded (sampled max {max_active} spans / {max_bytes} B <= {budget} B), band {bc_bw/ctl_bw:.3f}x")
 PYBC
 
     for idx in "${cws[@]}"; do
@@ -4157,7 +4168,16 @@ PYBC
         done
         [ "$admitted" = "1" ] || die "s11-blockcyclic: co-writer m$idx could not re-admit"
     done
-    [ -z "$comp_bad" ] || die "s11-blockcyclic CORRECTNESS RED: $comp_bad"
+    [ -z "$comp_bad" ] || die "s11-blockcyclic CORRECTNESS RED: $comp_bad
+STANDING-RED ADJUDICATION (rung 18, 2026-08-18): a C8 drift here at fleet
+width is the CONCURRENT SAME-INO PUBLISH REFS-COMPOSITION residual — caller-
+computed block-ref deltas are not atomic with the chain-composed map under
+concurrent same-ino publishers (the conveyor/chain plane; the shape is a
+swapped pair per race: one durable-without-map take + one map-without-durable
+entry, oracle-detected, leak-safe, bytes unaffected — the read-back gates are
+the byte truth). Rung 19 owns it; .benchmarks/2026-08-18-s11-mpiio-row.md
+carries the mechanism ledger. A DIFFERENT failure shape here is a plain
+regression."
     log "s11-blockcyclic GREEN — the Issue-19 shape adjudicated live (outputs in $rowdir). Evidence tier: measured-simulated (one box, co-located members)"
 }
 

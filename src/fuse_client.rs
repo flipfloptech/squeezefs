@@ -7004,6 +7004,16 @@ pub struct SqueezefsFilesystem {
     /// custody (the release travels on the client's next drain).
     active_range_leases:
         std::sync::Arc<dashmap::DashMap<u64, Vec<crate::dlm::LockLease>, ahash::RandomState>>,
+    /// S11 rung 18 (the desired-stretch v2): per-ino WRITE frontier — the
+    /// previous ranged write's end offset. `frontier == next start` is
+    /// the sequential-stream gate for the desired window's forward
+    /// doubling (the classifier-shaped stretch residual #3 named): a
+    /// strided writer never doubles (one extend RTT per stripe, no
+    /// over-grab of a peer's territory), a streaming writer keeps the
+    /// O(log n) convergence. Populated ONLY on the engaged ranged path
+    /// (KD-MW-12 — empty on every shipped mount); entries retire with
+    /// the ino's range leases.
+    range_stream_frontier: std::sync::Arc<dashmap::DashMap<u64, u64, ahash::RandomState>>,
     lease_locks: std::sync::Arc<StripeLocks<crate::sqz_sync::SqzMutex<()>, 4096>>,
     pub active_inode_locks: std::sync::Arc<StripeLocks<crate::sqz_sync::SqzRwLock<()>, 4096>>,
     /// P1-4: capacity-bounded attribute cache (moka TTL + max_capacity).
@@ -7334,6 +7344,7 @@ impl Clone for SqueezefsFilesystem {
             gid: self.gid,
             active_leases: self.active_leases.clone(),
             active_range_leases: self.active_range_leases.clone(),
+            range_stream_frontier: self.range_stream_frontier.clone(),
             lease_locks: self.lease_locks.clone(),
             active_inode_locks: self.active_inode_locks.clone(),
             attr_cache: self.attr_cache.clone(),
@@ -7488,6 +7499,9 @@ impl SqueezefsFilesystem {
                 ahash::RandomState::new(),
             )),
             active_range_leases: std::sync::Arc::new(dashmap::DashMap::with_hasher(
+                ahash::RandomState::new(),
+            )),
+            range_stream_frontier: std::sync::Arc::new(dashmap::DashMap::with_hasher(
                 ahash::RandomState::new(),
             )),
             lease_locks: std::sync::Arc::new(StripeLocks::new()),
@@ -12146,6 +12160,15 @@ impl SqueezefsFilesystem {
         if let Some(token) = crate::meta_ship::tokens::range_token_covering(ino, start, end) {
             return Ok(token);
         }
+        // The v2 sequential gate (rung 18, residual #3): does this write
+        // extend the ino's previous ranged write? Updated on EVERY
+        // engaged write — covered serves advance the stream too. Racing
+        // writers of one ino read as non-sequential (conservative: no
+        // doubling, never an over-grab).
+        let sequential = self
+            .range_stream_frontier
+            .insert(ino, end)
+            .is_some_and(|prev| prev == start);
         // 3. The acquire — riding the POSIX-5 retry ladder exactly like
         // the whole-file path (MW rung 18; rung-17 findings 5a/5b): a
         // LOST `DLM_LEASE_WAIT` is a retry, never EIO, for the watchdog
@@ -12157,7 +12180,7 @@ impl SqueezefsFilesystem {
         // covers the barrier's bound, and a holder that never lets go
         // still fails loud (`lease_retry_exhaustions`).
         acquire_lease_with_retry(ino, get_fuse_timeout(), |wait| {
-            self.ranged_lease_attempt(ino, start, end, wait)
+            self.ranged_lease_attempt(ino, start, end, sequential, wait)
         })
         .await
     }
@@ -12172,6 +12195,7 @@ impl SqueezefsFilesystem {
         ino: u64,
         start: u64,
         end: u64,
+        sequential: bool,
         wait: Duration,
     ) -> Result<u64, SqueezefsError> {
         let lock_arc = self.lease_locks.get_lock(ino, 0);
@@ -12183,14 +12207,26 @@ impl SqueezefsFilesystem {
         }
         let block = self.router.block_size.load(Ordering::Relaxed).max(1);
         let mut desired = crate::dlm::block_align_out((start, end), block);
-        if let Some(hull) = crate::meta_ship::tokens::range_span_hull(ino) {
-            // Union the held hull so an adjacent stream EXTENDS instead of
-            // minting a stripe-mate, then stretch forward by the held
-            // length (doubling): the §9.2 desired-window law makes the
-            // over-ask free — the authority trims it against any peer,
-            // never below required.
-            desired.0 = desired.0.min(hull.0);
-            desired.1 = desired.1.max(hull.1);
+        // The v2 desired law (rung 18, residual #3 — the stretch is "the
+        // ior row's business"): union ONLY an own span that OVERLAPS or
+        // ABUTS the aligned ask (a genuine stream extension widens the
+        // grant instead of minting a stripe-mate), and forward-double
+        // ONLY on a sequentially-advancing write frontier. The v1
+        // whole-hull union bridged the GAPS between a strided writer's
+        // stripes — the MPI-IO/block-cyclic decompositions — grabbing
+        // custody the holder never writes: a peer's later REQUIRED then
+        // conflicted and the §9.3 barrier demoted an unshared aligned
+        // block to authority assembly (fabricated sharing on the rows
+        // whose falsifier is "nothing should share a block"). Desired
+        // stays always-trimmable (the authority clips it against any
+        // peer, never below required).
+        if let Some(adj) =
+            crate::meta_ship::tokens::range_span_abutting(ino, desired.0, desired.1)
+        {
+            desired.0 = desired.0.min(adj.0);
+            desired.1 = desired.1.max(adj.1);
+        }
+        if sequential {
             let held_len = desired.1 - desired.0;
             desired =
                 crate::dlm::block_align_out((desired.0, desired.1.saturating_add(held_len)), block);
@@ -12324,6 +12360,7 @@ impl SqueezefsFilesystem {
         if let Some((_, leases)) = self.active_range_leases.remove(&ino) {
             drop(leases);
         }
+        self.range_stream_frontier.remove(&ino);
     }
 
     fn block_write_needs_existing_data(
@@ -19534,6 +19571,7 @@ impl SqueezefsFilesystem {
                 let _ = lease.release().await;
             }
         }
+        self.range_stream_frontier.remove(&ino);
         self.router.metadata_cache.remove(&ino);
         self.attr_cache.invalidate(&ino);
         self.last_write_end.remove_sync(&ino);
@@ -23410,6 +23448,7 @@ impl Filesystem for SqueezefsFilesystem {
                     let _ = lease.release().await;
                 }
             }
+            self.range_stream_frontier.remove(&ino);
         }
 
         // POSIX locks are kernel-local (no daemon table): close-time lock

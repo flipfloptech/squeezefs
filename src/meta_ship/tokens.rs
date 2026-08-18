@@ -353,6 +353,25 @@ pub fn range_span_hull(ino: u64) -> Option<(u64, u64)> {
         .flatten()
 }
 
+/// The hull of this mount's cached spans that OVERLAP or ABUT
+/// `[start, end)` — the v2 desired-stretch's union source (rung 18): a
+/// genuine stream extension touches the ask's own window, while a
+/// DISJOINT stripe (the strided/block-cyclic shape) is excluded — the v1
+/// whole-hull union bridged the gaps between a strided writer's stripes
+/// and fabricated cross-mount conflicts on custody the holder never
+/// writes (the `strided_asks_never_bridge_the_gap` pin).
+pub fn range_span_abutting(ino: u64, start: u64, end: u64) -> Option<(u64, u64)> {
+    RANGE_CACHE
+        .read_sync(&ino, |_, spans| {
+            spans
+                .iter()
+                .filter(|s| s.end >= start && s.start <= end)
+                .map(|s| (s.start, s.end))
+                .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
+        })
+        .flatten()
+}
+
 /// Retire one grant from the cache (release / grant-level revocation).
 pub fn retire_range_grant(ino: u64, token: u64) {
     let mut removed = 0u64;

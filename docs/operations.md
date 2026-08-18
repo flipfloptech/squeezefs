@@ -8,9 +8,12 @@ This is the operator reference for SqueezeFS: the durability contract and its gu
 - [Durability & crash contract](#durability--crash-contract)
   - [Metadata Durability (crash contract)](#metadata-durability-crash-contract)
   - [Single-writer mount guard (guarantee classes)](#single-writer-mount-guard-guarantee-classes)
+  - [Write custody & visibility by mount posture (§5.4)](#write-custody--visibility-by-mount-posture-the-54-guarantee-tables)
+  - [The DATA plane (DLM S7)](#the-data-plane-dlm-stage-s7)
   - [Multi-writer data plane (DLM S9)](#multi-writer-data-plane-dlm-stage-s9)
   - [Multi-writer capacity planning — the allocation partition](#multi-writer-capacity-planning--the-data-plane-allocation-partition)
   - [Multi-writer co-writer mounts (DLM S9)](#multi-writer-co-writer-mounts-dlm-stage-s9)
+  - [Byte-range custody (DLM S11)](#byte-range-custody-dlm-stage-s11)
   - [Read-only coherent mounts (`-o ro`)](#read-only-coherent-mounts--o-ro--one-writer-plus-n-readers)
   - [Format v3 (CoW KV metadata)](#format-v3-cow-kv-metadata)
   - [Read-only coherent mounts — the stated consistency model](#read-only-coherent-mounts--the-stated-consistency-model-metadata)
@@ -29,6 +32,7 @@ This is the operator reference for SqueezeFS: the durability contract and its gu
   - [Mount (`squeezefs mount`)](#mount-squeezefs-mount)
   - [LD_PRELOAD interception (`-o interception`)](#ld_preload-interception--o-interception--security-posture--unsupported-mixes)
   - [Multi-user mounts — the single-tenant resource posture](#multi-user-mounts--the-single-tenant-resource-posture)
+  - [Fleet-share sizing (co-located daemon fleets)](#fleet-share-sizing-co-located-daemon-fleets)
   - [Cache/staging paths (`squeezefs config`)](#cachestaging-paths-squeezefs-config)
   - [Transparent compression & encryption](#transparent-compression--encryption)
   - [Read-path tuning](#read-path-tuning-mount-env-design-docsdesign-read-pathmd)
@@ -48,6 +52,7 @@ This is the operator reference for SqueezeFS: the durability contract and its gu
   - [Jobs & distributed execution](#jobs--distributed-execution)
   - [Cluster wire (the one cluster transport)](#cluster-wire-the-one-cluster-transport)
   - [Metadata function shipping (DLM S8)](#metadata-function-shipping-dlm-s8)
+  - [Subtree delegations & UPDATE intents (DLM S10)](#subtree-delegations--update-intents-dlm-stage-s10)
   - [Membership plane — lease-based liveness (DLM S6)](#membership-plane--lease-based-liveness-dlm-s6)
   - [Freed-offset grace period (spec §6.8 item 3)](#freed-offset-grace-period-spec-68-item-3)
 - [Observability](#observability)
@@ -136,6 +141,33 @@ capability S9 exists to add. The custody half of it is
 [Multi-writer data plane](#multi-writer-data-plane-dlm-stage-s9); the mount
 half is [Multi-writer co-writer mounts](#multi-writer-co-writer-mounts-dlm-stage-s9).
 
+#### Write custody & visibility by mount posture (the §5.4 guarantee tables)
+
+The one table that answers, per mount posture: *who may write what, what a
+mount sees, and what fences it*. Every row cites the gauges that prove the
+posture live and the measurement record that adjudicated it
+(design `docs/design-full-multi-writer.md` §5.4; program closing record
+`.benchmarks/2026-08-18-mw-program-closing.md`).
+
+| Posture (how you get it) | Write custody | What this mount SEES | What fences it | Evidence |
+|---|---|---|---|---|
+| **Solo writer, single-writer format** (`format --single-writer`, or any pre-flip volume; a plain write mount) | Everything, locally — the D0 guard's classic row. Full POSIX, whole-tx atomic metadata | Its own state, immediately (it is the only writer) | Its own D0 latch: flock loss is impossible while alive; PR fencing on `RESCAP` substrates; `writer_guard_fenced` | The shipped baseline; guarantee-class table above |
+| **Solo writer, multi-writer-capable format** (bare `format` — the DEFAULT class since the rung-10b flip stamps the nine capability bits) | Identical to the row above **by measurement, not just by construction**: `dlm_rpcs == 0`, no partition installs (`alloc_lane_writers == 0`), the bit-9 durable block-ref ledger runs live with `meta_kv_block_refs_drift == 0` | Same | Same | S4 re-gate A-B-B-A within noise (seq/rand: `.benchmarks/2026-08-15-mw-s4-regate.md`; mdstorm + scoreboard smoke + external QUICK set: `.benchmarks/2026-08-16-mw-s4-residuals.md`) |
+| **Reader** (`-o ro`) | None — every write plane refuses at three gates | The writer's most recent **checkpoint** it has polled: bounded monotone staleness, published as `reader_staleness_bound_ms` (2 s shipped defaults). DATA half *eliminated* with the membership plane armed (freed-offset grace), *bounded* with it off — the default | Nothing fences a reader's writes (none exist); a lapsed member self-fences its **caches** at `T_self` and re-joins fresh | [Read-only coherent mounts](#read-only-coherent-mounts--o-ro--one-writer-plus-n-readers); S6 arm rows `.benchmarks/2026-08-16-mw-s6-arm.md` |
+| **Co-writer, whole-file custody** (the five-rung admission ladder — see [Multi-writer co-writer mounts](#multi-writer-co-writer-mounts-dlm-stage-s9)) | DATA bytes of files/offsets it holds a **custody lease** on, DMA'd directly under its custody epoch; fresh blocks from its granted allocation lane. Metadata: none locally — every mutation SHIPS to the authority (`local_commit_refusals` must stay 0) | A reader's checkpoint view **plus** its own mutations current (they execute on the authority — read-your-own-writes over the wire); under a LOOKUP delegation, coherence-promised local serves (see [Subtree delegations](#subtree-delegations--update-intents-dlm-stage-s10)) | Three composed layers, strictly ordered: its own `T_self` self-fence (fires before the authority may re-grant), the authority's revocation/era gate (every mutating publish carries the lease epoch — a swept era's publishes refuse with nothing applied, `meta_ship_publish.stale_refusals`), and the DEVICE (WERO rejection of a preempted registrant's DMA — proven live, EBADE class). A fenced co-writer is dead until remount | S8 arm `.benchmarks/2026-08-16-mw-s8-arm.md` (5.3 M shipped mutations, zero un-routed commits); S9 arm `.benchmarks/2026-08-16-mw-s9-arm.md` (fan-out / failover with zero acked-data loss); era gate `.benchmarks/2026-08-16-mw-publish-era-gate.md`; device rejection `.benchmarks/2026-08-16-mw-s7-arm.md` |
+| **Ranged co-writer** (`SQUEEZEFS_RANGE_CUSTODY=1` on an armed co-writer — **default OFF**; see [Byte-range custody](#byte-range-custody-dlm-stage-s11)) | Byte ranges of SHARED files under EX range grants (sub-grants of the custody lease): block-aligned spans DMA directly; a sub-block-shared block demotes to **authority-assembled** — both holders ship extents, the authority merges and publishes, single publisher per block at every instant | As the co-writer row, plus its own retained extents overlay its reads (read-your-own-writes for un-published sub-block ships) | The co-writer row's three layers, plus the demotion barrier (`demotions ≡ acks + fence_resolves`) and the bit-15 layout-version gate as the crash backstop | S11 rows on pinned ior 4.0.0: `.benchmarks/2026-08-18-s11-mpiio-row.md` + `.benchmarks/2026-08-18-s11-widthn-refs-fix.md` (MPI-IO verdict **MET**: A-B-B-A shared/file-per-proc ≥ 0.8× both brackets — 1.411× / 2.273×; read-back exact; fsck + C8 clean) |
+
+**Fencing class per PAIR of mounts** (the co-location split — design §5.4's
+second table). What enforces exclusion between two write-capable mounts
+depends on whether the DEVICE can tell them apart:
+
+| Pair of mounts | Write-exclusion / fencing class |
+|---|---|
+| Distinct hosts, PR substrate | **Device-enforced** — WERO rejects a fenced host's DMA; the preempt of its registrant key is the drain proof. Proven live: `.benchmarks/2026-08-16-mw-s7-arm.md` (S7-a: reservation-conflict rejection + fail-stop on a real nvmet-tcp kernel target) |
+| Co-located, distinct hostnqn (`SQUEEZEFS_HOSTNQN`/`SQUEEZEFS_HOSTID` per mount, pair-or-neither) | **Device-enforced** — the same row as distinct hosts. Requires the sqz kernel's host-scoped fabric subsystems (patch 0030, `docs/design-mw-multipath-kernel.md`): stock `nvme_core.multipath=Y` kernels merge two identities' paths under ONE head, which voids per-mount fencing — the mount **refuses** that shape loudly, naming the sqz kernel and the `multipath=N` boot-param workaround as the remedies |
+| Co-located, shared hostnqn (the default when identity is not split) | The device sees ONE registrant: fencing between the two mounts is **process-local** (flock + custody epochs + the `authorize_dma` poison latch). This is the fleet rig's own honest-residual shape, and the client-side story is proven and pinned (`tests/mw_colocated_fence_tests.rs`; S9-c in `.benchmarks/2026-08-16-mw-s9-arm.md`) |
+| Any pair, non-PR substrate | Multi-writer **refuses to arm** (unchanged S9 law — a co-writer the device cannot reject is a co-writer nothing can fence) |
+
 #### The DATA plane (DLM stage S7)
 
 The rows above are the **metadata** plane: the guard claims meta volumes, and its reservations cover meta namespaces only. The data plane is fenced separately, and what it *enforces* versus what it only *detects* also depends on the substrate. Design: `docs/pre-rc-engineering-spec.md` §6.7/§7 RES-6; contracts: `tests/dlm_data_fence_tests.rs`.
@@ -144,7 +176,7 @@ The rows above are the **metadata** plane: the guard claims meta volumes, and it
 |---|---|---|---|
 | **Single-writer** (the default; no `SQUEEZEFS_MULTI_WRITER`) | any | **DMA submission** — every data-plane write passes one authorization point that refuses when this mount's D0 guard is fenced *or* when the submission's **custody epoch** (the durable writer term) is no longer current, so an upload admitted before a custody change can never land after it. Refusals are `EIO` and counted (`data_dma_fence_refusals`, class split `data_dma_epoch_refusals`). Device reclaims (discard/punch) cease permanently on the same latch (`block_free_reclaim_fence_halts`) | A **remote** host's writes to the same data namespace. Nothing device-side stops them; the D0 guard is what keeps a second write mount from existing, and its own guarantee class (the table above) is therefore the real bound |
 | **Multi-writer opt-in** (`SQUEEZEFS_MULTI_WRITER=1`) — PR-capable data namespaces, a format carrying **all six** capability bits, and an armed membership plane | NVMe/NVMe-oF with `RESCAP` support | Everything above **plus the device**: a **WERO (Write Exclusive – Registrants Only, rtype 3)** reservation is held on every data namespace for the mount lifetime, so an unregistered — i.e. fenced/preempted — host's writes are rejected **by the namespace**, while every legitimate registrant (the coordinator, enrolled remote job workers, co-writers) keeps writing. A dead epoch's PR preempt is the **drain proof** that releases its quarantined blocks. Gauge: `data_plane_fence_mode` = 1. Since **DLM S9** this row also carries remote write custody — see [Multi-writer data plane](#multi-writer-data-plane-dlm-stage-s9) | — |
-| **Multi-writer opt-in** on anything else | loop devices (incl. `tests/dev_substrate.sh`'s default), file-backed volumes, any `RESCAP=0` namespace, a format missing one of the six bits, a membership plane that is off, or `SQUEEZEFS_MW_BIND=off` | **The mount is REFUSED, loudly, naming the namespace, the missing bit (and its offline stamping path), or the absent plane.** Multi-writer over a substrate that can only detect a rogue writer is not a supported configuration (spec §6.7 "On external consensus"). Nothing stamps the capability bits today (ruling D9), so this row is where **every** volume currently falls | — |
+| **Multi-writer opt-in** on anything else | loop devices (incl. `tests/dev_substrate.sh`'s default), file-backed volumes, any `RESCAP=0` namespace, a format missing one of the six bits, a membership plane that is off, or `SQUEEZEFS_MW_BIND=off` | **The mount is REFUSED, loudly, naming the namespace, the missing bit (and its offline stamping path), or the absent plane.** Multi-writer over a substrate that can only detect a rogue writer is not a supported configuration (spec §6.7 "On external consensus"). Volumes formatted since the rung-10b Phase-B flip carry the capability bits by default; pre-flip and `--single-writer` volumes land here until `squeezefs volume enable-multi-writer` upgrades them offline — and ANY volume on a non-PR substrate (loop devices, plain files, `RESCAP=0`) stays here regardless of its bits | — |
 
 **Dead-epoch blocks are quarantined, not reused.** When a custody epoch dies (a remote worker's lease TTL fires, a client is proven dead), its blocks enter a **do-not-reallocate quarantine**: they are taken out of the free list, a terminal free of one *defers* its free-list publish, and only a **drain proof** releases them (the landed WERO preempt on a PR substrate; recovery's proof of death otherwise). Live gauge `dlm_quarantined_offsets`, flow `dlm_quarantine_releases`. Operational consequence, by design: **quarantined space is unavailable until the proof arrives** — a store with no free space outside the quarantine refuses `ENOSPC` rather than handing a possibly-live zombie's offset to a new owner. On a detection-grade substrate the cohort waits for the next mount's recovery walk (the job wire's documented `deferred-reclaim` class), so `dlm_quarantined_offsets` staying high there is expected, not a leak.
 
@@ -166,10 +198,20 @@ Live signals on the `.stats` inode: `writer_guard_mode` per volume (`flock+pr` =
 
 #### Multi-writer data plane (DLM stage S9)
 
-**Status: the mechanism ships and the AUTHORITY half is production-shaped. It
-cannot be armed on a field volume yet, and the two reasons are named below —
-do not plan a deployment around this section.** Design:
-`docs/pre-rc-engineering-spec.md` §6.9 S9 / §6.7; contracts
+**Status: armed and proven.** The plane is opt-in per mount
+(`SQUEEZEFS_MULTI_WRITER=1`) and was proven at crucible discipline on the
+single-node fleet rig — real daemons, real nvmet-tcp kernel target with PR
+(`resv_enable=1`), kill-9 / freeze / failover matrices with the fsck + C8
+oracle green after every kill (`.benchmarks/2026-08-16-mw-s9-arm.md`,
+`.benchmarks/2026-08-16-mw-publish-era-gate.md`; evidence tier
+measured-simulated — one box, co-located members; the S7 device-rejection
+half is measured-real on the same target,
+`.benchmarks/2026-08-16-mw-s7-arm.md`). Since the rung-10b Phase-B flip the
+default `format` stamps the capability bits, so a fresh volume set passes the
+format rung out of the box; a field deployment additionally needs PR-capable
+data namespaces (rung 5 below — the arm refuses anything less). Design:
+`docs/pre-rc-engineering-spec.md` §6.9 S9 / §6.7 +
+`docs/design-full-multi-writer.md`; contracts
 `tests/dlm_multi_writer_tests.rs`.
 
 What it is: `SQUEEZEFS_MULTI_WRITER=1` arms three planes together —
@@ -195,19 +237,23 @@ block refcounts), 10 (writer-scoped staging), 11 (multi-writer data), 13
 are deliberately **not** required: they express two appenders on ONE volume,
 and ownership granularity is the volume. **S9 introduces no new bit.**
 
-**The two things standing between this and a live cluster** (stated here
-because an operator will otherwise discover them as a refusal):
+**The two blockers that once stood between this and a live cluster are both
+closed** (kept here because older notes cite them):
 
-1. **Nothing stamps the capability bits** (ruling D9). Every field volume
-   fails the format rung. The Phase-8 batched reformat window is where they
-   land.
+1. ~~Nothing stamps the capability bits (ruling D9).~~ **Closed by the
+   rung-10b Phase-B flip** (user ruling 2026-08-15;
+   `.benchmarks/2026-08-16-mw-default-flip.md`): the default `format` stamps
+   all nine multi-writer bits — `--single-writer` is the explicit opt-out —
+   and pre-flip sets upgrade offline with
+   `squeezefs volume enable-multi-writer` (one act, ordered, idempotent,
+   crash-resumable). The flip gated on the stamped-solo S4 re-gate: solo
+   mounts of a stamped format are within noise on every row class with
+   `dlm_rpcs == 0`.
 2. ~~The D0 guard still refuses a second write mount on every substrate.~~
-   **Closed**: the co-writer posture and its admission gate now exist —
+   **Closed**: the co-writer posture and its admission gate exist —
    [Multi-writer co-writer mounts](#multi-writer-co-writer-mounts-dlm-stage-s9).
    The D0 gate itself was not weakened to do it (a co-writer enters through a
-   second door that requires a five-rung admission decision), so blocker 1
-   still gates the field: with no volume carrying bit 14, no node can be
-   enrolled and rung 2 refuses every set.
+   second door that requires a five-rung admission decision).
 
 Operator surface: `SQUEEZEFS_MULTI_WRITER=1` (arm; refuses loudly, naming the
 missing piece), `SQUEEZEFS_MW_BIND` (`auto` — the default — / `addr:port` /
@@ -299,6 +345,25 @@ stride coarser: a run of blocks a writer owns is `W`-strided rather than dense.
 `frag_d1_contiguity` therefore reads lower on a partitioned volume by
 construction — compare it against other partitioned mounts, not against a
 single-writer baseline.
+
+Three more capacity rows to plan with (verified against the arm campaign,
+`.benchmarks/2026-08-16-mw-s9-arm.md` / `.benchmarks/2026-08-18-s11-mpiio-row.md`):
+
+* **The width is fixed for the authority's era.** Enrolling another writer
+  means re-arming the authority (a new era) — plan the roster before the
+  arm, because a mid-era join is refused at the custody grant, never
+  squeezed into a live partition.
+* **Sustained rewrite reaches steady state through the lane free HARVEST**
+  (see the co-writer section): a co-writer's displaced frees return to its
+  own reachable supply, so rewrite workloads do not consume the virgin
+  share monotonically. `alloc_lane_harvested_blocks` beside
+  `alloc_lane_enospc_refusals == 0` is the healthy shape.
+* **A reader-armed fleet under sustained rewrite churn couples capacity to
+  reader acknowledgement**: every displaced free also waits out the
+  freed-offset grace ring, and a storm whose deferrals outrun releases
+  climbs `free_grace_offsets` toward lane-share ENOSPC (a measured shape —
+  the program's residual board carries the pressure-coupled release valve).
+  Watch `free_grace_alloc_stalls` on rewrite-heavy reader-armed fleets.
 #### Multi-writer co-writer mounts (DLM stage S9)
 
 **Status: the posture and its admission gate ship. Volumes formatted since
@@ -443,8 +508,10 @@ visible.
 the most recent checkpoint it has polled, with the same derived cadence and the
 same `reader_staleness_bound_ms` (§6.8 item 2's revalidation and item 5's purge
 are both armed for it). Its own mutations are never stale, because they execute
-on the authority. Everything the reader section says about bounded-not-eliminated
-DATA staleness (§6.8 item 3, not built) applies verbatim.
+on the authority. Everything the reader section says about DATA staleness
+applies verbatim — bounded with the membership plane off, eliminated with it
+armed (§6.8 item 3, the
+[freed-offset grace period](#freed-offset-grace-period-spec-68-item-3)).
 
 **Failure and re-admission (the rung-10 posture, stated honestly).** A
 co-writer that loses its custody — its renewal meets `UnknownLease` after a
@@ -503,34 +570,147 @@ unreturned-until-recovery offset). Read them beside the custody ledger
 (`dlm_custody.*`), the rest of the publish ledger (whose `refusals` must
 stay 0) and `data_plane_fence_mode` = 1.
 
-**What an end-to-end two-host write still needs, plainly.** The machinery is
-complete — since the shipped free path that includes the **rewrite** shape,
-end to end: lane-granted allocation, custody-authorized DMA, shipped
-publishes, and the displaced block freed through the authority's full ladder
-with the offset reusable by its lane's owner (the former "a co-writer
-appends" caveat is retired; ruling D8's mixed rewrite workload is expressible)
-— and it is *unreachable in the field* until two things land that no code
-change can substitute for:
+**What an end-to-end two-host write needs, plainly.** The machinery is
+complete — lane-granted allocation, custody-authorized DMA, shipped
+publishes (era-gated and witnessed), and the displaced block freed through
+the authority's full ladder with the offset reusable by its lane's owner
+(ruling D8's mixed rewrite workload is expressible) — and it was **proven
+end to end on the single-node fleet rig** (N real daemons, real nvmet-tcp
+kernel target with PR, plus a qemu/KVM guest member as an independent
+kernel and clock domain — `.benchmarks/2026-08-16-mw-s{6,7,8,9}-arm.md`).
+What a FIELD deployment needs:
 
-1. **the capability bits are stamped.** Nothing stamps bits 7/9/10/11/13/14
-   (ruling D9), so every volume in existence fails the co-writer ladder's rung 2
-   and the authority's own arm. The Phase-8 offline reformat window is what
-   stamps them (`superblock::set_*_bit`), and until then a co-writer mount
-   refuses before it opens anything;
-2. **real PR hardware.** Rung 5 demands a standing WERO (rtype 3) reservation
-   whose registrants include this node, on namespaces that actually advertise
-   `RESCAP` — which the repo's loop substrate does not. Without the device half
-   a co-writer can be detected but not rejected, and its death can never produce
-   the drain proof that releases its quarantined offsets.
+1. **a multi-writer-capable format** — the default class since the rung-10b
+   flip; pre-flip and `--single-writer` sets upgrade offline with
+   `squeezefs volume enable-multi-writer`;
+2. **real PR namespaces.** Rung 5 demands a standing WERO (rtype 3)
+   reservation whose registrants include this node, on namespaces that
+   actually advertise `RESCAP` — loop devices and plain files do not.
+   Without the device half a co-writer can be detected but not rejected,
+   and its death can never produce the drain proof that releases its
+   quarantined offsets. (nvmet-tcp with `resv_enable=1` qualifies — it is
+   exactly what the proving fleet runs.)
 
-And these remain undemonstrable in one process regardless: two independent node
-caches diverging (one process shares one cache), the device's rejection of a
-preempted co-writer's DMA (a fake namespace pins the decision, never the
-silicon), the same-host PR host-identity residual noted in the guarantee-class
-table, and the allocation residuals in
+What a second *physical* machine adds beyond the proven single-node fleet is
+real NIC/fabric congestion physics (a perf concern, not a correctness one —
+design §12), and the honest residuals that remain are: the same-host shared
+PR-identity shape in the guarantee-class table (split it with per-mount
+`SQUEEZEFS_HOSTNQN`/`SQUEEZEFS_HOSTID` on an sqz kernel — patch 0030,
+`docs/design-mw-multipath-kernel.md`), and the allocation residuals in
 [`docs/design-mw-data-alloc-partition.md`](design-mw-data-alloc-partition.md)
 §9a.6 (lane-scoped lifetime stamps, and a co-writer declaring its in-flight
 destinations so S7's quarantine covers them).
+
+#### Byte-range custody (DLM stage S11)
+
+**Status: built, proven on the §9.5 acceptance rows, and shipped
+`SQUEEZEFS_RANGE_CUSTODY=off` — arming it is an explicit per-mount act.**
+This is the MPI-IO shape: two or more co-writers hold **disjoint byte ranges
+of ONE file** and write them concurrently. Design:
+`docs/design-full-multi-writer.md` §9; contracts
+`tests/dlm_range_custody_tests.rs` + `tests/mw_authority_assembler_tests.rs`;
+loom `range_custody_core` (4 models, weakening-verified); evidence:
+`.benchmarks/2026-08-17-s11-range-wire.md` (the wire),
+`.benchmarks/2026-08-17-s11-b4-clause.md` (the composed fast-path refusals),
+`.benchmarks/2026-08-17-s11-authority-assembler.md` +
+`.benchmarks/2026-08-17-s11-zeros-interleave-fix.md` (the assembler),
+`.benchmarks/2026-08-18-s11-mpiio-row.md` +
+`.benchmarks/2026-08-18-s11-widthn-refs-fix.md` (the acceptance rows).
+
+**Arming it.** On an armed multi-writer fleet (authority + admitted
+co-writers), set `SQUEEZEFS_RANGE_CUSTODY=1` on the co-writer mounts. Set
+while the multi-writer plane is NOT armed it is **announced-inert** at mount
+(a startup notice; every `range_custody_*` gauge stays structurally 0) —
+never a refusal. The fleet rig arms it with `SQZ_MWFLEET_RANGE_CUSTODY=1`.
+
+**What is granted.** **EX ranges only** in v1 (whole-file EX stays the
+default; CR/CW modes are built but not issuable — KD-MW-9). A range grant is
+a **sub-grant of the S9 custody lease**, arbitrated by the file's authority,
+cached client-side, revalidated by the range vector every renewal reply
+carries. Ranges share the FILE's fencing generator — no new token algebra —
+and a range writer fences on its **own** lease token.
+
+- **Required vs desired**: the acquire carries `required` (the write's exact
+  span — **never silently trimmed**; a refusal is loud or the grant covers
+  it) and `desired` (block-aligned outward, stretched only along a
+  sequentially-advancing write frontier or an abutting own span — the v2
+  stretch, so strided/block-cyclic decompositions never fabricate cross-mount
+  conflicts). Adjacent same-holder grants **coalesce at admit** (4,096
+  byte-granular asks converge to ~2 live spans, measured).
+- **Budgets and refusals — no free constants**: the per-file span cap is the
+  file's own geometry (`max(16, ceil(size / block_size))`); the real ceiling
+  is the R5 byte budget `dlm_grant_table_bytes` (derived `R5/256`, floor
+  16 MiB — sized so even a 1 TiB block-cyclic decomposition fits). At budget
+  the acquire **refuses loud naming the arithmetic**, counted
+  `range_custody_cap_refusals` — which must stay **0** on any within-budget
+  shape (the block-cyclic acceptance row pinned it: grants ≈ blocks-in-file,
+  zero refusals).
+- **The whole-file fast path is structurally untouched**: a file with zero
+  live range grants probes an empty table O(1); on a solo mount the plane is
+  unreachable (no verb issues ranges without the arm). The single-writer
+  41.6 GiB/s row is guarded by the fast-path tax row on every S11 rung.
+
+**Block-aligned ranges DMA directly; sub-block sharing demotes to the
+authority.** The block is the unit of CoW, refcount and overlay, so when two
+live grants share ONE block the block becomes **authority-assembled**: both
+holders ship their writes to that block as extents
+(`meta_ship_publish.extent_*` ledger — `shipped ≡ served` is the engagement
+law), the authority merges via the extent overlay and publishes once, single
+publisher per block at every instant. The transition is barriered **at grant
+issuance**: the overlapping grant is not issued until the incumbent
+acknowledged the demotion (carried on its next renewal reply) or its lease
+expired on the authority's clock — the closed ledger is
+`range_custody_demotions ≡ demotion_acks + demotion_fence_resolves`
+(healthy fleet: `fence_resolves == 0`), with
+`range_custody_demotion_fenced_publishes` the ≈ 0 crash-window tripwire.
+A shipper **retains** each extent until the covering layout version is
+visible (release is pull-only: ack-carried version, renewal observation,
+the synchronous `FlushExtents` an `fsync` forces, or the at-budget W2
+spill), so an authority death between ack and publish loses nothing acked —
+**a sub-block writer's `fsync` chains through the authority's publish
+barrier**. Priced as the D1 exception path: ≈ 3 ms authority CPU per extent
+upper bound vs the aligned rows' direct DMA
+(`.benchmarks/2026-08-18-s11-mpiio-row.md` §4). The W1 in-place patch and
+the B4 device overlay both refuse a range-shared span
+(`patch_ineligible_range_shared` / `overlay_ineligible_range_shared` — one
+custody core, two ledger buckets; both 0 on aligned rows).
+
+**The measured verdicts** (pinned ior 4.0.0, 8 mounts × 4 procs = 32 ranks,
+one shared file, tcp devsub; evidence tier measured-simulated):
+
+| Row | Verdict |
+|---|---|
+| MPI-IO acceptance (shared vs file-per-proc, A-B-B-A) | **MET** — ≥ 0.8× in both brackets (1.411× / 2.273×); engagement exact, zero cap refusals/conflicts/demotions on the aligned decomposition; read-back exact; cold fsck findings 0, C8 drift 0 |
+| Block-cyclic (the never-coalescing legitimate shape) | grants ≈ blocks, **zero** cap refusals, table bounded (peak ~1.9 KB vs a 345 MB budget), 1.52–2.5× its disjoint control; fsck/C8 green ×3 from zero |
+| Adversarial tiny-ranges (bounds falsifier) | 4,096 byte-granular unaligned writes in 0.78 s → 2 grants + 15 extensions; foreign-client latency 1.02× |
+| Demotion barrier + sub-block price | `demotions 1 ≡ acks 1`, fenced publishes 0, retention → 0 at quiesce; fsck/C8 green ×3 from zero |
+| Range kill matrix | kill -9 holders and the authority mid-assembly: quarantine covers, peers unaffected, retained extents re-ship idempotently, `dlm_custody_grace_conflicts == 0`, oracle green every round |
+
+**Why the default stays OFF, and the one boundary to know.** The composed
+map of a shared file past the inline cap (**≈ 6 GiB at the shipped 4 MiB
+block**) spills to an `indirect:` head, and concurrent chained publishes
+onto one **refuse fail-safe** — the writer's `fsync` fails loud (EIO,
+retried-class), the volume is never poisoned, fsck stays clean — until the
+blob-aware owner-side merge lands (the program's named rung-20 residual,
+`.benchmarks/2026-08-18-s11-widthn-refs-fix.md`). The default flip is gated
+on that composition plus ×3 from-zero re-runs of the row gates on the
+flipped default; until then, arm it explicitly on fleets whose shared files
+fit the inline-map domain.
+
+**Live signals** (`.stats`): the `range_custody` object —
+`grants` / `extensions` / `covered_serves` / `releases` / `active` /
+`conflicts` / `waits` / `desired_trims` / `cap_refusals` (must stay 0
+within budget), the demotion family
+`demotions` / `demotion_acks` / `demotion_fence_resolves` /
+`demotion_wait_ns` / `demotion_fenced_publishes` (≈ 0), and
+`dlm_grant_table_bytes` (authority side, an R5 component that refuses
+admission rather than shedding custody); client-side
+`dlm_custody_range_{acquires,extensions}` and
+`dlm_token_cache_range_spans` counted into `dlm_token_cache_bytes`; the
+extent plane on `meta_ship_publish.extent_{shipped,served,replays,
+stale_refusals,retained_bytes,flush_forces,spills}` (`retained_bytes` → 0
+at quiesce); and the two fast-path refusal ledgers
+`patch_ineligible_range_shared` / `overlay_ineligible_range_shared`.
 
 ### Read-only coherent mounts (`-o ro`) — one writer plus N readers
 
@@ -952,6 +1132,47 @@ What this means concretely:
 - **What IS per-uid.** Exactly two things, both on the interception control plane, both admission caps rather than accounting: `per_uid_session_cap` (concurrent IPC sessions per uid — derived, `clamp(session-shm admission cap ÷ per-session arena, 64, 4096)`, i.e. the session population the budget can actually hold; `mem_budget::ipc_per_uid_session_cap`, no knob of its own — the budget knobs are the levers) and the `ipc_session_arenas` R5 component's shed = refuse-new-sessions behavior. Neither bounds the FUSE path.
 - **Access control is separate and IS enforced.** `-o default_permissions` puts POSIX mode/ACL checks in the kernel, POSIX advisory locks are kernel-arbitrated per mount (see the DLM section in [AGENTS.md](../AGENTS.md)), the reserved-xattr screen keeps daemon records invisible through FUSE (`fuse_reserved_xattr_refusals`), the `.stats`/`.config` inodes are `0400` owned by the mount uid with their key census opt-in (`SQUEEZEFS_STATS_KEY_CENSUS=1`), staging/read-cache trees are `0700`/`0600`, and the ADMIN lane admits only uid 0 or `-o admin_uid=N`. **Confidentiality and integrity are multi-user-safe; resource consumption is not partitioned.**
 - **Why this is the honest answer for the design target.** The 15,000+-node target (ruling D1) scales by NODES: each node runs its own daemon over its own mount, so cluster multi-tenancy is a *scheduler* property (one mount per training job / per container), and per-uid accounting inside a single daemon would buy nothing for it while adding a per-op charge to the hot path. If a future deployment genuinely needs several untrusted uids sharing one daemon's budget, that is a new program — per-uid R5 sub-budgets plus a per-uid admission gate — and it must arrive with its own measured cost, not as a claim made here.
+
+### Fleet-share sizing (co-located daemon fleets)
+
+**Every resource derivation in the tree reads the WHOLE machine** — the R5
+memory budget, transport payload arenas, drain-lane ceilings, conveyor
+batches, blocking pools. That is correct at one daemon per host and wrong by
+N× the moment N daemons share a machine (same-machine multi-mount clients
+are a product surface — each mount is its own client identity,
+`docs/design-full-multi-writer.md` §5). The sizing law (KD-MW-14):
+
+| Knob | Default | Purpose |
+|---|---|---|
+| `SQUEEZEFS_FLEET_SHARE` | `1` (= today's whole-machine posture) | Integer ≥ 1: a divisor applied **once, at the root inputs of the derivation tree** — the effective memory budget and effective CPU count become `ceil(system / share)`, and every downstream derived value scales through the existing formulas untouched. Set it to the number of co-located daemons, per daemon (the fleet rig exports it automatically; it is never auto-detected — daemons discovering each other to divide a machine would be a coordination plane where a knob suffices) |
+
+The rules an operator must know:
+
+- **It modifies the derived tier only.** Explicit absolute knobs still win
+  verbatim; percentage knobs apply to the shared budget
+  (`absolute > percentage > derived`, unchanged).
+- **Floors are never divided.** Physical minima and never-regress-below-
+  shipped floors hold per daemon regardless of the share; a share that
+  cannot satisfy its floors **refuses loudly at startup, naming the
+  arithmetic** — never a silent clamp below a floor.
+- **Kernel-mandated geometry is exempt** (and pinned by a tie test): the
+  FUSE-over-io_uring queue COUNT is one queue per kernel possible CPU per
+  mount — a session with fewer never becomes ready — so N daemons always
+  hold N × possible-CPUs queues. The *memory* behind those queues DOES
+  scale: per-queue depth degrades to fit the divided payload-buffer cap.
+- **The cgroup-unreclaimable pressure arm divides through the same root**:
+  in a shared cage the arm reads the CAGE's residue, so without the divisor
+  all N quiet daemons read each other's anon as their own pressure — the
+  proven failure was all 32 daemons in Red with tier publishes paused
+  fleet-wide (`.benchmarks/2026-08-16-mw-s6-arm.md`, finding #4). Per-process
+  RSS stays undivided, so each daemon's own balloon is still policed at
+  full strength.
+
+Proven at N=32 on one 32-CPU box (the S6-a row: R5-pressure columns flat
+fleet-wide — `mem_budget_red_events` 0, `hard_backstops` 0,
+`parked_gate_timeouts` 0 on all 32 daemons). Tie tests:
+`tests/derivation_sweep_tests.rs` (share=4 quarters every divisible derived
+cap; the exemption list is pinned to exactly the kernel-mandated set).
 
 ### Cache/staging paths (`squeezefs config`)
 
@@ -1406,6 +1627,103 @@ the `dlm_token_cache_*` family — of which **`dlm_token_cache_misses` and
 `meta_ship_owner_phase_ns` decompose the added latency (route / queue wait /
 encode / RTT / decode, and admit / dispatch / execute / reply encode) so a
 regression can be attributed to a term instead of to "the network".
+
+### Subtree delegations & UPDATE intents (DLM stage S10)
+
+**Status: built, proven live on the fleet rig, and default-ON — but read
+only when the multi-writer ownership plane is armed, so every shipped mount
+pays one relaxed load and nothing else.** These are the S8 serial-latency
+recovery levers (design `docs/design-full-multi-writer.md` §8; evidence
+`.benchmarks/2026-08-17-s10-{recall-valve,delegation,update-intents,slot-placement}.md`).
+The honest bottom line lives in the section above: even with all three
+levers ON, serial `tar -x` on a co-writer at 250 µs RTT runs **6.73× the
+authority-local wall** — remote clients are throughput-oriented;
+latency-sensitive serial metadata work runs on the owner.
+
+**LOOKUP delegations** (`SQUEEZEFS_DELEGATION`, default on when armed; `=0`
+is the A/B control; set-but-unarmed is announced-inert). A delegation is a
+RAM capability token granted **piggybacked on a metadata reply the client
+was already receiving** (acquisition never costs its own round trip; a
+lookup earns the parent and the resolved child). What it buys: the holder
+serves lookups / getattrs / readdirs — including **authoritative negative
+answers** — from its local reader view, with zero wire traffic (the live
+leg: 26 delegated serves, 0 shipped verbs across a 24-file stat pass; the
+lever-off control shipped 50).
+
+- **The coherence law**: the owner **recalls before any conflicting
+  mutation publishes** — the mutation gate completes recall + ack before
+  the transaction enqueues — and a holder drains in-flight serves before
+  acknowledging a recall. `dlm_delegation_stale_serves` is the must-stay-0
+  tripwire. Measured live: the authority's `touch` in a delegated directory
+  returned only after the holder's ack, and the holder saw the fresh name
+  immediately — no staleness window.
+- **The staleness bound IS the recall**: under a live delegation the kernel
+  attr TTL stretches to the channel-validity horizon, because the
+  delegation is the coherence promise (the recall is what bounds
+  staleness, not a timer). Grant currency is the volume's **journal commit
+  watermark** — never an attr triple, which aliases under serial-create
+  rates (the rung-12 live finding).
+- **The recall valve** (no knob — structural): recall fan-out is
+  rate-limited and batched with **derived** caps and deadlines
+  (`dlm_recall_batch_max`, `dlm_recall_deadline_ms`,
+  `dlm_recall_rate_cap_per_s` — all published on `.stats` so this page
+  cannot drift), and an object cycling grant→recall ≥ 3 times inside the
+  window **demotes to owner-served** for a derived cooldown
+  (`dlm_thrash_demotions`) — a hot shared directory can never storm the
+  wire. Overdue recalls are loud (`dlm_delegation_recall_timeouts`),
+  fence the holder on this plane, and evict it from an armed membership
+  plane.
+
+**UPDATE intents** (`SQUEEZEFS_UPDATE_INTENTS`, default on when armed and
+under delegation; `=0` is the A/B control). Per-directory **EXCLUSIVE**
+UPDATE authority, earned on a shipped create's reply: the holder then
+creates children **locally** — ino pre-supplied from an owner cursor
+reservation, `O_EXCL` decidable locally against the grant-carried name
+census — and ships ordered intent batches asynchronously (live coalesce ≈
+25 intents/frame; deferred `utimes` ride the same lane, which is the tar
+shape). What an operator must know:
+
+- **`fsync(dir)` is the contract point**: an unshipped batch dies with the
+  client (the acked-un-fsynced crash class, disclosed — MW-8), and a
+  deferred apply-refusal (ENOSPC/quota at the owner) surfaces at
+  `fsync(dir)`/close per the POSIX-16 errseq precedent, destroying the
+  local mint and counting `meta_ship_intent_refusals` (must stay ≈ 0).
+- **Foreign readers force the flush** (OQ-2): a foreign lookup/readdir
+  under a delegated directory recalls the grant, which flushes the batch
+  BEFORE the foreign serve — coherence over latency, priced at ~2 ms per
+  foreign-read round at RTT ≈ 0. The published visibility bound is
+  `meta_ship_intent_visibility_bound_ms`.
+- Measured: intents take the 250 µs tar-x row from 144–145 to 161–162
+  entries/s (−17 % wire verbs/entry) with the create/utime plane fully
+  local — real, and deliberately NOT the ≤ 1.10×-of-local recovery, which
+  needs per-volume claim admission (the fleet-of-authorities recipe,
+  future work).
+
+**Client-owned-slot placement** (`SQUEEZEFS_SLOT_PLACEMENT`, default on
+when armed) is documented in the S8 section above: mint targeting engages
+today (each shipping client's fresh inos land in a dedicated, migratable
+slot); the migration half is structurally dark until a shipping client can
+OWN a volume.
+
+**Failover**: delegations and intents are RAM — a holder re-asserts in the
+successor's grace window (NFSv4 pattern), un-reasserted grants are gone,
+and a dead holder's batch follows MW-8. All state dies with a fenced
+incarnation; a remounted successor of the same mount point earns fresh
+grants (the incarnation fence clears on its first frame).
+
+**Live signals** (`.stats`): the `dlm_delegation` family
+(`grants` / `hits` / `recalls` / `reasserts` / `entries` / `bytes` —
+bytes ride R5 as a sheddable component; tripwires
+`stale_serves` must-stay-0, `recall_timeouts` loud), the `dlm_recall`
+object (issued/acked/timed_out/frames/coalesced/rate_deferred +
+`dlm_thrash_demotions` / `repromotions` + the published derivations),
+`dlm_revoke_phase_ns` / `dlm_delegation_recall_phase_ns`, and the
+`meta_ship_intent` object (`batches` / `verbs` — the coalesce factor —
+`flush_forces`, `refusals` ≈ 0, `mints`, `local_negatives`,
+`deferred_setattrs`, owner-face `applied` / `replays` /
+`stale_refusals` / `read_recalls`, and the published
+`meta_ship_intent_visibility_bound_ms`).
+
 ### Membership plane — lease-based liveness (DLM S6)
 
 **What it replaces.** Every mounted client used to prove it was alive by
@@ -1466,9 +1784,12 @@ forced-flush storm at the worst possible moment.
 one holder. A volume carrying the claim-set capability additionally records
 the **set of writer members**, each with its identity, endpoint and NVMe
 registrant key, in one `claim_set` record rewritten only when membership
-changes. Nothing stamps that capability today, so every shipped volume reads
+changes. Volumes formatted since the rung-10b flip carry the capability (bit
+14) by default; a volume without it — pre-flip or `--single-writer` — reads
 the singleton *projection* of `writer_claim` instead: no new record, no
 changed claim bytes, and single-writer behaviour byte-for-byte as before.
+Either way, an UN-ENGAGED set (no multi-writer arm) never writes a
+`claim_set` key.
 The registrant keys are the device-side face of set membership — several
 registrants under **one** shared reservation, never a second reservation.
 

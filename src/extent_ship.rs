@@ -340,8 +340,9 @@ pub async fn ship_extent(
     // every coverage-release path — ack, watermark, flush, spill — keeps
     // its meaning). The margin leaves room for the frame envelope
     // (measured 57 B; 4 KiB keeps it alignment-friendly and future-proof).
-    let cap =
-        (crate::cluster_wire::CONTROL_MAX_FRAME_BYTES as usize).saturating_sub(4096).max(4096);
+    let cap = (crate::cluster_wire::CONTROL_MAX_FRAME_BYTES as usize)
+        .saturating_sub(4096)
+        .max(4096);
     if data.len() > cap {
         let mut off = 0usize;
         while off < data.len() {

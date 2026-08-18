@@ -304,12 +304,11 @@ async fn create_striped_open(h: &H, name: &str) -> (u64, u64) {
     h.fs.release(h.req, ino, created.fh, 0, 0, false)
         .await
         .unwrap();
-    let fh = h
-        .fs
-        .open(h.req, ino, libc::O_WRONLY as u32, 0)
-        .await
-        .expect("reopen for the contended writes")
-        .fh;
+    let fh =
+        h.fs.open(h.req, ino, libc::O_WRONLY as u32, 0)
+            .await
+            .expect("reopen for the contended writes")
+            .fh;
     (ino, fh)
 }
 
@@ -404,16 +403,13 @@ async fn ranged_write_lease_survives_one_lost_wait_and_retries() {
     }
     lease.release().await.expect("peer releases");
 
-    let reply = writer
-        .await
-        .expect("writer task")
-        .unwrap_or_else(|e| {
-            panic!(
-                "the ranged write lease must ride the POSIX-5 ladder — one \
+    let reply = writer.await.expect("writer task").unwrap_or_else(|e| {
+        panic!(
+            "the ranged write lease must ride the POSIX-5 ladder — one \
                  lost DLM_LEASE_WAIT is a retry, never EIO (rung-17 finding \
                  5a, the s11-subblock live venue): {e:?}"
-            )
-        });
+        )
+    });
     assert_eq!(reply.written, 4096, "the retried write completes whole");
     assert!(
         METRICS.lease_retry_waits.load(Ordering::Relaxed) > retries_before,
@@ -452,9 +448,8 @@ async fn ranged_write_lease_exhaustion_stays_loud_eio_after_the_budget() {
 
     let exhaustions_before = METRICS.lease_retry_exhaustions.load(Ordering::Relaxed);
     let t0 = std::time::Instant::now();
-    let err = h
-        .fs
-        .write(
+    let err =
+        h.fs.write(
             h.req,
             ino,
             fh,
@@ -551,11 +546,7 @@ async fn strided_asks_never_bridge_the_gap_between_own_stripes() {
     let peer = DlmClient::new().unwrap();
     let path = squeezefs::keys::inode_path(ino);
     let probe = peer
-        .acquire_lock(
-            &path,
-            Some((4 * BLK, 5 * BLK)),
-            Duration::from_millis(500),
-        )
+        .acquire_lock(&path, Some((4 * BLK, 5 * BLK)), Duration::from_millis(500))
         .await
         .unwrap_or_else(|e| {
             panic!(
@@ -645,9 +636,15 @@ async fn the_geometry_source_reads_a_truncate_created_files_size() {
     let _restore = Restore;
     let h = Arc::new(make(*b"ranged-ladder-05", "ranged-ladder-5").await);
     let created =
-        h.fs.create(h.req, 1, OsStr::new("rank0-sparse.dat"), libc::S_IFREG | 0o644, 0)
-            .await
-            .unwrap();
+        h.fs.create(
+            h.req,
+            1,
+            OsStr::new("rank0-sparse.dat"),
+            libc::S_IFREG | 0o644,
+            0,
+        )
+        .await
+        .unwrap();
     let ino = created.attr.ino;
     h.fs.release(h.req, ino, created.fh, 0, 0, false)
         .await
@@ -714,10 +711,7 @@ async fn the_divergence_refusal_is_the_retried_supersession_class() {
         !squeezefs::fuse_client::writeback_error_is_terminal(&wrapped),
         "the coalesced-pass wrap of the same refusal is the same class"
     );
-    let shipped = squeezefs::error::SqueezefsError::refused(
-        libc::EINVAL,
-        format!("{raw}"),
-    );
+    let shipped = squeezefs::error::SqueezefsError::refused(libc::EINVAL, format!("{raw}"));
     assert!(
         !squeezefs::fuse_client::writeback_error_is_terminal(&shipped),
         "the SHIPPED face (the owner's refusal decoded Refused{{errno}}          through the publish wire) is the same class"

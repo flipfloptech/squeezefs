@@ -2214,20 +2214,23 @@ async fn an_extent_larger_than_the_wire_cap_ships_chunked_and_assembles_exact() 
         "shipped ≡ served (the engagement law holds per chunk)"
     );
 
-    // Byte-exact assembly across the chunk boundary.
-    let images = asm.images.lock();
-    let img = images
-        .get(&(ino, 0))
-        .expect("the assembler holds block 0's image");
-    assert!(
-        img.len() >= 4096 + len,
-        "the merged image covers the whole span"
-    );
-    assert_eq!(
-        &img[4096..4096 + len],
-        &data[..],
-        "the assembled bytes are exact across the chunk boundary"
-    );
+    // Byte-exact assembly across the chunk boundary (guard dropped
+    // before the async teardown — clippy::await_holding_lock).
+    {
+        let images = asm.images.lock();
+        let img = images
+            .get(&(ino, 0))
+            .expect("the assembler holds block 0's image");
+        assert!(
+            img.len() >= 4096 + len,
+            "the merged image covers the whole span"
+        );
+        assert_eq!(
+            &img[4096..4096 + len],
+            &data[..],
+            "the assembled bytes are exact across the chunk boundary"
+        );
+    }
 
     auth.listener.shutdown();
     shutdown(&owner_be).await;
@@ -2279,7 +2282,6 @@ async fn a_scoped_put_never_reverts_a_demoted_blocks_assembly() {
         2 * BLOCK,
         &[(0, "be://data/K_assembly"), (1, "be://data/K_holder_old")],
     );
-    use squeezefs::meta_backend::Metadata as _;
     owner_be
         .set_layout_and_size(ino, &base, 2 * BLOCK, &[])
         .await
@@ -2354,14 +2356,24 @@ async fn a_local_publish_of_a_range_granted_ino_parks_on_the_serve_window() {
     // A range-granted ino on the authority's own table (the arbiter's
     // LOCK_MAP is process-global — the owner's grant IS the state). Both
     // inos are REAL records (the local publish path reads the inode).
-    let ino = publish::create_with_rdev_size(&owner_be, 1, "window.bin", libc::S_IFREG | 0o644, 0, 0, 0, 0)
-        .await
-        .expect("local create")
-        .ino;
-    let free_ino = publish::create_with_rdev_size(&owner_be, 1, "solo.bin", libc::S_IFREG | 0o644, 0, 0, 0, 0)
-        .await
-        .expect("local create")
-        .ino;
+    let ino = publish::create_with_rdev_size(
+        &owner_be,
+        1,
+        "window.bin",
+        libc::S_IFREG | 0o644,
+        0,
+        0,
+        0,
+        0,
+    )
+    .await
+    .expect("local create")
+    .ino;
+    let free_ino =
+        publish::create_with_rdev_size(&owner_be, 1, "solo.bin", libc::S_IFREG | 0o644, 0, 0, 0, 0)
+            .await
+            .expect("local create")
+            .ino;
     let lease = auth
         .owner
         .join(&data_grant::JoinFrame {
@@ -2395,9 +2407,10 @@ async fn a_local_publish_of_a_range_granted_ino_parks_on_the_serve_window() {
     let window = publish::test_lock_serve_ino(ino).await;
     let be = Arc::clone(&owner_be);
     let base = base_layout_bytes(BLOCK, &[(0, "be://data/K_fold")]);
-    let publish_task = tokio::spawn(async move {
-        publish::set_layout_and_size(&be, ino, &base, BLOCK, &[]).await
-    });
+    let publish_task =
+        tokio::spawn(
+            async move { publish::set_layout_and_size(&be, ino, &base, BLOCK, &[]).await },
+        );
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
         !publish_task.is_finished(),

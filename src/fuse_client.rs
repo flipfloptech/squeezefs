@@ -12262,8 +12262,7 @@ impl SqueezefsFilesystem {
         // whose falsifier is "nothing should share a block"). Desired
         // stays always-trimmable (the authority clips it against any
         // peer, never below required).
-        if let Some(adj) =
-            crate::meta_ship::tokens::range_span_abutting(ino, desired.0, desired.1)
+        if let Some(adj) = crate::meta_ship::tokens::range_span_abutting(ino, desired.0, desired.1)
         {
             desired.0 = desired.0.min(adj.0);
             desired.1 = desired.1.max(adj.1);

@@ -606,17 +606,13 @@ async fn fold_seed_survives_stripe_free_displacement_storm_no_rebind_eio() {
         // park; write-path seed fetches are deleted, so the seed defers
         // to the fold).
         write_at(&h, ino, BLK as u64 * BS + 1037, &pat(100, 0x5A)).await;
-        let ran = h
-            .fs
-            .fold_extent_block(ino, BLK)
-            .await
-            .unwrap_or_else(|e| {
-                panic!(
-                    "round {round}: the fold's deferred seed fetch must never \
+        let ran = h.fs.fold_extent_block(ino, BLK).await.unwrap_or_else(|e| {
+            panic!(
+                "round {round}: the fold's deferred seed fetch must never \
                      EIO because (3.5)-only publishers are busy (the \
                      s11-subblock FlushExtents EIO signature), got {e:?}"
-                )
-            });
+            )
+        });
         assert!(ran, "round {round}: the parked extent state must fold");
         if round >= 2 && METRICS.seed_settle_escalations.load(Ordering::Relaxed) > before {
             engaged = true;

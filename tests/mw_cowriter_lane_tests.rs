@@ -1879,8 +1879,7 @@ async fn an_idle_reaped_publish_session_reconnects_and_the_raise_lands() {
     let _restore = restore();
     let dir = TempDir::new().unwrap();
     let vol = fresh_volume(dir.path(), "cw-idlereap").await;
-    let auth =
-        Authority::start_idle(&vol, &[NODE_A], Some(Duration::from_millis(300))).await;
+    let auth = Authority::start_idle(&vol, &[NODE_A], Some(Duration::from_millis(300))).await;
     let cw = CoWriter::join(&auth, &vol, NODE_A, 0).await;
     let p = cw.part();
     cw.engage().await; // ships the OPEN raise — the session now exists

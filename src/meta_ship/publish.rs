@@ -1092,9 +1092,7 @@ static SERVE_INO_LOCKS: Lazy<
 /// mount: `custody_owner()` is None). The serve wrapper deliberately
 /// exempts the EXTENT verbs so their executors' folds can take this
 /// guard at the funnel without self-deadlocking.
-async fn local_publish_guard(
-    ino: Ino,
-) -> Option<crate::sqz_sync::SqzMutexGuard<'static, ()>> {
+async fn local_publish_guard(ino: Ino) -> Option<crate::sqz_sync::SqzMutexGuard<'static, ()>> {
     if crate::data_grant::custody_owner().is_some() && crate::dlm::ino_has_range_custody(ino) {
         Some(SERVE_INO_LOCKS.get_inode_lock(ino).lock().await)
     } else {

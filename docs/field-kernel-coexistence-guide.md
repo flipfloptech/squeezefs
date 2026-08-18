@@ -1,0 +1,141 @@
+# Field kernel coexistence guide — MOFED + Lustre + the sqz kernel on Rocky 8.10
+
+**Status: this is the BLOCKER for the field MPI-IO row**
+(`docs/field-mpiio-runbook.md`). The field boxes are Rocky 8.10 and carry
+a day job: Mellanox OFED (mlx5, 2×200GbE) and the Lustre client. The
+multi-writer test stack wants newer-kernel features on specific roles.
+This guide is the decision tree for making those coexist — including the
+paths where the conflict never has to be solved at all. Facts below are
+dated 2026-08-18; re-verify the two vendor matrices before committing to
+Path B or C.
+
+---
+
+## 1. What actually needs which kernel (the requirements are SPLIT by role)
+
+| Role | Hard requirement | Probe (truth over version strings) | Needs MOFED? | Needs Lustre? |
+|---|---|---|---|---|
+| **Storage nodes** (nvmet targets) | nvmet **Persistent Reservations** (mainline **v6.13+**, `drivers/nvme/target/pr.c`; some vendor trees backport) | the transient configfs probe in the runbook's Preflight 2 (`resv_enable` attribute exists) | Not for nvme-**tcp** serving (in-tree `mlx5_core` drives the NIC; no RDMA used) | Only if the node ALSO mounts/serves Lustre — check, don't assume |
+| **Client** (aqs-37) | **FUSE-over-io_uring** (mainline v6.14+; the sqz kernels add the kmbuf extras the perf rows used) | `ls /sys/module/fuse/parameters/enable_uring` on the kernel it will boot for the test | Not for nvme-tcp or the test (no RDMA in this path) | Only for its day job — NOT for the test |
+
+Two consequences worth internalizing before touching anything:
+
+* **nvme-tcp does not use RDMA.** In-tree `mlx5_core`/`mlx5e` in any
+  6.19/7.1-class kernel is *newer* than the driver in any shipping
+  MOFED/DOCA and drives ConnectX NICs for plain TCP at full rate. MOFED
+  is required only for the OFED/RDMA userspace, site tooling, and
+  Lustre-over-IB (`ko2iblnd`). **If the test window can run without
+  Lustre mounted, MOFED is not needed on the sqz kernel at all.**
+* **Patch 0030 is irrelevant here** (user ruling 2026-08-18, recorded in
+  `docs/design-mw-multipath-kernel.md`): co-located co-writers share the
+  client's one fabric identity; real second clients bring their own.
+
+## 2. The vendor matrices (why "just build the kmods" is not a plan)
+
+* **MOFED → DOCA-OFED**: standalone MLNX_OFED ended Oct 2024 (LTS
+  security fixes to ~Oct 2027); the current mechanism is DOCA-Host with
+  **DKMS** as the rebuild path (`doca-extra` /
+  `/opt/mellanox/doca/tools/doca-kernel-support` for packaging). The
+  official Rocky **8.10 support row is the stock `4.18.0-553` kernel
+  only**; NVIDIA's own docs say the custom-kernel tooling "does not
+  support fully customized or unofficial kernels". A 6.19/7.1 sqz kernel
+  is exactly that — DKMS may compile or may not, per rebase, forever.
+* **Lustre client**: out-of-tree kmods, tested only against enterprise
+  kernels. 2.16 tops out at 6.8-class (Ubuntu 24.04); **2.17
+  (2025-12-29) tops out at the RHEL 10.1 6.12-class kernel**; mainline
+  beyond ~6.12/6.14 needs master-branch patches (LU-18475 etc.) and real
+  porting. **No released Lustre client has ever been tested on a
+  6.19/7.1 kernel.** Building master against the sqz kernel is a porting
+  project with a per-rebase tail, not a build step.
+
+The honest reading: making MOFED + Lustre run *on* the sqz kernel
+(Path C) is the worst of the four options. The tree below orders them.
+
+## 3. The decision tree
+
+### Path A — role isolation + reboot windows (RECOMMENDED; zero porting)
+
+The conflict dissolves if the sqz kernel never has to host MOFED/Lustre:
+
+1. **Storage nodes**: if a node's day job does not include Lustre/IB
+   duty (probe: `lsmod | grep -E 'lustre|lnet|ko2iblnd|mlx5_ib'`,
+   `systemctl list-units | grep -i lustre`, `mount -t lustre`), boot it
+   on the **sqz kernel RPMs** (`docker/kernel-sqz/`, 6.19.x track —
+   nvmet PR included) for the test epoch. Nothing else on a target node
+   needs MOFED for nvme-tcp serving.
+2. **Client**: boot the test window into the sqz kernel with **in-tree
+   mlx5**, Lustre unmounted for the window; reboot back to the site
+   kernel after. Sanity ladder on first boot: NIC link at 200Gb
+   (`ethtool <if> | grep Speed`), a plain `iperf3` row between client
+   and one node, then the runbook's Preflight 1/4.
+3. If the client's **current** kernel already passes the
+   `enable_uring` probe (it ran the 41.6 GiB/s-era rows on sqz-class
+   kernels — check what it boots today), the client half of this path is
+   already done.
+
+Cost: reboot windows and a maintenance slot. Porting: none. This is the
+only path with no per-rebase tail.
+
+### Path B — one negotiated kernel for everything (the real coexistence fix)
+
+If the boxes must run Lustre + MOFED + sqz **simultaneously** on one
+kernel, pick the newest kernel all three tolerate and meet in the
+middle: a **6.12-class EL10-alike** (DOCA supports RHEL 10.x 6.12;
+Lustre 2.17 client is *tested* on RHEL 10.1's 6.12) with the sqz patch
+set rebased onto it plus two feature backports:
+
+| Backport | From | Size |
+|---|---|---|
+| nvmet PR (`target/pr.c`) | v6.13 | moderate, self-contained (nodes only — skip on the client kernel) |
+| FUSE-over-io_uring (+ the sqz kmbuf extras) | v6.14 + sqz series | the heavy one (client only — skip on node kernels) |
+
+Note the role split applies here too: the CLIENT kernel needs the fuse
+backport but not nvmet PR; the NODES need PR but not fuse — two small
+variant builds beat one maximal kernel. MOFED lands via DOCA DKMS
+(6.12-class is inside its tested world), Lustre 2.17 client via DKMS or
+source against the same tree. Cost: a kernel-team backport program and a
+frozen kernel version; sqz features that later depend on >6.12
+primitives would re-open the negotiation.
+
+### Path C — DKMS-everything on the sqz 6.19/7.1 kernel (LAST resort)
+
+DOCA-OFED DKMS + Lustre **master** source-built against the sqz kernel.
+Both are explicitly outside their vendors' tested worlds; expect build
+breaks at every sqz rebase and undebuggable vendor-side refusals. Only
+justified if Paths A/B/D are all ruled out by site policy.
+
+### Path D — a dedicated test client (sidestep on the client side)
+
+Put the sqz client role on hardware (or a VM with NIC passthrough/SR-IOV)
+that has no Lustre/MOFED duty. A VM is its own kernel and its own
+natural fabric identity (the 0030 ruling's point), so nothing on the
+host changes. Combine with Path A's node half. Cost: hardware/VM
+plumbing; the 200GbE row then measures the passthrough path.
+
+## 4. The probe checklist that picks the path (run these first, ~10 min)
+
+On each storage node:
+```
+lsmod | grep -E 'lustre|lnet|ko2iblnd|mlx5_ib' || echo "no lustre/IB duty"
+mount -t lustre || true
+# nvmet PR probe: runbook Preflight 2 (transient configfs resv_enable)
+```
+On the client:
+```
+uname -r; ls /sys/module/fuse/parameters/enable_uring && echo "fuse-over-uring PRESENT"
+lsmod | grep -E 'lustre|lnet' || echo "no lustre mounted right now"
+ofed_info -s 2>/dev/null || echo "no MOFED stack on this kernel"
+ethtool <200g-if> | grep -E 'Speed|Link'
+```
+Decision rule: if the nodes show no Lustre/IB duty AND the client can
+take reboot windows → **Path A, start today**. If simultaneous
+coexistence is mandatory → **Path B**, and the deliverable to schedule is
+the 6.12-class dual-variant backport build. C and D are fallbacks.
+
+## 5. What happens after unblock
+
+Nothing in the test procedure changes: `docs/field-mpiio-runbook.md`
+Preflights 1–4, then `tests/cluster_reset_v5_mw.sh --dry-run` → the reset
+→ the printed `SQZ_MWMATRIX_MOUNTS=… s11-mpiio` line. The row lands at
+measured-real tier beside the local verdict
+(`.benchmarks/2026-08-18-s11-mpiio-row.md`, 1.411×/2.273×).

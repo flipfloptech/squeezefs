@@ -20,6 +20,19 @@ co-writer mounts at `/scratch/tmp/test-cw1..8`, logs at
 
 ---
 
+## Preflight 0 — the kernel-coexistence BLOCKER (read first)
+
+The field boxes are Rocky 8.10 with a MOFED + Lustre day job; the roles
+below want newer-kernel features. **Until the coexistence question is
+settled, this runbook cannot be executed** — the decision tree (four
+paths, probe checklist, vendor-matrix facts) lives in
+`docs/field-kernel-coexistence-guide.md`. Short form: nvme-tcp needs no
+MOFED and the test window needs no Lustre, so the recommended path is
+role isolation + reboot windows (no porting at all); the true
+one-kernel-for-everything fix is a negotiated 6.12-class build with two
+small backports. Run the guide's §4 probe checklist first — it picks the
+path in ~10 minutes.
+
 ## Preflight 1 — CLIENT kernel (expected: NO change needed)
 
 ```

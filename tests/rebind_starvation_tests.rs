@@ -545,3 +545,91 @@ async fn fetch_error_on_current_binding_stays_loud_eio() {
          never the exhaustion exit: {msg}"
     );
 }
+
+/// Face 4 — the STRIPE-HOLDING SEED fetch (MW rung-18 residual (a); the
+/// s11-subblock live finding, `.benchmarks/2026-08-17-s11-zeros-interleave-fix.md`
+/// §"The s11-subblock priced leg"): under two-holder same-block extent
+/// churn the AUTHORITY assembler's fold exhausted the NON-escalating
+/// 24-rebind ladder and surfaced `EIO "block 0 of inode_2 did not settle
+/// after 24 binding rebinds"` on a co-writer's `FlushExtents` — an
+/// fsync-path data-plane EIO under LEGAL publish churn, the 2026-08-04
+/// field starvation wearing the fold's clothes.
+///
+/// The fold's seed fetch (`fetch_seed_image` — the item-B deferred RMW
+/// base) runs UNDER the fold's held `BLOCK_FLUSH_LOCKS` stripe, so the
+/// read path's settle arm — which ACQUIRES (3) — was structurally
+/// unavailable to it, and the ladder's non-escalating exhaustion claimed
+/// "genuinely broken binding". That claim is falsified by the
+/// (3.5)-only publisher class (`write_striped` promotions,
+/// `copy_file_range`, the Lever-B publish conveyor, a concurrent
+/// assembler publish of a NEIGHBOR representation): legal churn that
+/// never takes this block's stripe can starve a stripe-holding seed
+/// fetch forever. The law pinned: exhaustion on the stripe-held seed
+/// posture hands off to the CALLER-STRIPE settle arm — one
+/// resolve-then-fetch under `INODE_META_LOCKS` (3.5) alone, the caller's
+/// held (3) completing the write path's own extended order — counted in
+/// `seed_settle_escalations`, never EIO.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fold_seed_survives_stripe_free_displacement_storm_no_rebind_eio() {
+    let _g = serial().await;
+    let h = Arc::new(make(*b"rebind-starve-04", "rbs_ns_4").await);
+    let (ino, _base) = durable_striped(&h, "folded.dat").await;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let gens = Arc::new(AtomicU64::new(0));
+    let storm = {
+        let stop = stop.clone();
+        let gens = gens.clone();
+        let h = h.clone();
+        tokio::spawn(async move {
+            while !stop.load(Ordering::Acquire) {
+                let g = gens.load(Ordering::Relaxed) + 1;
+                // The (3.5)-only publisher class: displaces the fold's
+                // seed binding without ever touching the block stripe
+                // the fold holds.
+                displace_once(&h, ino, g).await;
+                gens.store(g, Ordering::Release);
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+
+    let _seam = SeamGuard::arm(SEAM_STRIPE_FREE_MS);
+    let before = METRICS.seed_settle_escalations.load(Ordering::Relaxed);
+    // Engagement rounds (the face-1 venue-sensitivity note applies
+    // verbatim): every round pins the never-EIO half; the loop retries —
+    // bounded — until the caller-stripe settle arm provably engaged.
+    let mut engaged = false;
+    for round in 0..12u32 {
+        // Park a fresh extent overlay with a DEFERRED seed in the stormed
+        // block (an unaligned sub-block span is patch-ineligible — the W2
+        // park; write-path seed fetches are deleted, so the seed defers
+        // to the fold).
+        write_at(&h, ino, BLK as u64 * BS + 1037, &pat(100, 0x5A)).await;
+        let ran = h
+            .fs
+            .fold_extent_block(ino, BLK)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "round {round}: the fold's deferred seed fetch must never \
+                     EIO because (3.5)-only publishers are busy (the \
+                     s11-subblock FlushExtents EIO signature), got {e:?}"
+                )
+            });
+        assert!(ran, "round {round}: the parked extent state must fold");
+        if round >= 2 && METRICS.seed_settle_escalations.load(Ordering::Relaxed) > before {
+            engaged = true;
+            break;
+        }
+    }
+    assert!(
+        engaged,
+        "the caller-stripe settle arm is the engagement the storm must \
+         have forced within 12 seam-widened rounds (seed_settle_escalations \
+         stayed at {before})"
+    );
+
+    stop.store(true, Ordering::Release);
+    storm.await.unwrap();
+}

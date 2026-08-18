@@ -299,7 +299,10 @@ async fn shipped_create(client_be: &Arc<RoutedMetaBackend>, name: &str) -> u64 {
         .ino
 }
 
-async fn owner_map(be: &Arc<RoutedMetaBackend>, ino: u64) -> std::collections::HashMap<u32, String> {
+async fn owner_map(
+    be: &Arc<RoutedMetaBackend>,
+    ino: u64,
+) -> std::collections::HashMap<u32, String> {
     use squeezefs::meta_backend::Metadata;
     let raw = be
         .getxattr(ino, "layout")
@@ -470,7 +473,10 @@ async fn a_scoped_puts_refs_follow_the_composition_not_the_callers_frame() {
             &auth.endpoint,
             publish::PublishCall::SetLayoutAndSize {
                 ino,
-                layout: base_layout_bytes(2 * BLOCK, &[(0, "be://data:K_old"), (1, "be://data:K_peer")]),
+                layout: base_layout_bytes(
+                    2 * BLOCK,
+                    &[(0, "be://data:K_old"), (1, "be://data:K_peer")],
+                ),
                 size: 2 * BLOCK,
                 refs: vec![
                     frame_op("be://data:K_old", ino, 0, true),

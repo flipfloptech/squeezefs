@@ -991,34 +991,81 @@ where
     Ok(Folded::Absent)
 }
 
-/// Compaction fold (§4.2): identical algebra; the output contains one folded
-/// `Put` (or nothing) per key. **Tombstone elision rule**: a `Delete` may be
-/// dropped only if its seq is **strictly below** `durable_tail` (the durable
-/// checkpoint tail at compaction time) — a tombstone still inside the replay
-/// window must survive, or replay could resurrect the key from an older
-/// journal `Put` it was shadowing.
+/// Compaction fold (§4.2): identical algebra; the output contains at most
+/// one folded `Put` — plus, for a versioned layout chain, the retained
+/// head link (below) — per key. **Tombstone elision rule**: a `Delete`
+/// may be dropped only if its seq is **strictly below** `durable_tail`
+/// (the durable checkpoint tail at compaction time) — a tombstone still
+/// inside the replay window must survive, or replay could resurrect the
+/// key from an older journal `Put` it was shadowing.
+///
+/// **The §6.2 item-9 lineage rule (DLM S11 rung 19 — the width-N fork
+/// latch, convicted live on the s11-blockcyclic row: "divergent
+/// layout-delta chain … names base version 0x800000001d6 but folds onto
+/// 0x0", 5,421 failed checkpoint ticks, the layout unreadable to the C8
+/// walk):** when the group's NEWEST record is a VERSIONED layout link,
+/// folding the whole chain into a bare `Put` erases the head version
+/// that a LATER link may already claim — the commit gate stamps claims
+/// against the durable head under the 4a I-guard, but nothing orders
+/// that stamp against THIS task (the checkpoint/SMO plane takes no 4a),
+/// so a legally-gated link applied after the node swap folds onto `0x0`
+/// and every subsequent fold of the key refuses forever. The rule:
+/// fold everything BELOW the newest link and RETAIN the link itself,
+/// claim restamped to 0 (it is now its segment's first link — the
+/// fold's own law for a bare-`Put` base). The folded value is byte-equal
+/// either way; any live later claim still verifies. Unversioned chains
+/// (and every non-layout key) keep the single-record output byte-
+/// identical — solo volumes never pay the extra record.
 ///
 /// `group_newest_first` must hold one key's records, newest-seq-first.
+/// The returned records are `(key, seq)`-ascending, ready for
+/// [`super::bset::build_bset`].
 pub fn compact_fold(
     group_newest_first: &[RecordRef<'_>],
     durable_tail: u64,
-) -> Result<Option<Record>, KvError> {
+) -> Result<Vec<Record>, KvError> {
     let Some(first) = group_newest_first.first() else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     let key = first.key;
     debug_assert!(
         group_newest_first.iter().all(|r| r.key == key),
         "compact_fold takes one key's records"
     );
+    if first.kind == RecordKind::Delta && layout_wire::is_layout_delta(first.value) {
+        if let Some((_claimed, version)) = layout_wire::layout_delta_versions(first.value) {
+            // The lineage rule: fold the prefix (everything below the
+            // newest link); retain the link claiming 0. A prefix that
+            // folds to a tombstone or to nothing keeps the plain algebra
+            // below — a delta above a tombstone is dead, and an orphan
+            // chain stays the §4.2 counted no-op.
+            if let Folded::Put { value, seq } =
+                fold_newest_first(group_newest_first[1..].iter().copied())?
+            {
+                let restamped = layout_wire::restamp_delta_versions(first.value, 0, version)
+                    .map_err(|e| {
+                        KvError::Corrupt(format!("lineage restamp of a layout link failed: {e}"))
+                    })?;
+                return Ok(vec![
+                    Record::put(key.to_vec(), seq, value.into_owned()),
+                    Record {
+                        key: key.to_vec(),
+                        seq: first.seq,
+                        kind: RecordKind::Delta,
+                        value: restamped,
+                    },
+                ]);
+            }
+        }
+    }
     match fold_newest_first(group_newest_first.iter().copied())? {
-        Folded::Put { value, seq } => Ok(Some(Record::put(key.to_vec(), seq, value.into_owned()))),
+        Folded::Put { value, seq } => Ok(vec![Record::put(key.to_vec(), seq, value.into_owned())]),
         // Still inside the replay window (seq ≥ tail): the tombstone must
         // survive in the node (§4.2 elision rule).
         Folded::Tombstone { seq } if seq >= durable_tail => {
-            Ok(Some(Record::delete(key.to_vec(), seq)))
+            Ok(vec![Record::delete(key.to_vec(), seq)])
         }
-        Folded::Tombstone { .. } | Folded::Absent => Ok(None),
+        Folded::Tombstone { .. } | Folded::Absent => Ok(Vec::new()),
     }
 }
 
@@ -1918,17 +1965,18 @@ mod tests {
         let group = [d.record_ref()];
 
         // seq < durable_tail ⇒ elide (checkpoint-covered, replay can't resurrect).
-        assert_eq!(compact_fold(&group, 8).expect("fold"), None);
+        assert_eq!(compact_fold(&group, 8).expect("fold"), Vec::new());
         // seq == durable_tail ⇒ still inside the replay window ⇒ MUST survive.
-        let kept = compact_fold(&group, 7)
-            .expect("fold")
-            .expect("tombstone kept");
+        let folded = compact_fold(&group, 7).expect("fold");
+        let [kept] = folded.as_slice() else {
+            panic!("tombstone kept as the single output: {folded:?}");
+        };
         assert_eq!(kept.kind, RecordKind::Delete);
         assert_eq!(kept.seq, 7);
         assert_eq!(kept.key, k());
         assert!(kept.value.is_empty());
         // Anything older than the tombstone is inside the window too.
-        assert!(compact_fold(&group, 0).expect("fold").is_some());
+        assert!(!compact_fold(&group, 0).expect("fold").is_empty());
     }
 
     #[test]
@@ -1936,7 +1984,10 @@ mod tests {
         // Delta + base ⇒ one folded Put carrying the newest seq.
         let recs = [dtimes(5, 50, 55), put(2, &iv(1))];
         let group: Vec<RecordRef<'_>> = recs.iter().map(|r| r.record_ref()).collect();
-        let out = compact_fold(&group, 0).expect("fold").expect("live key");
+        let folded = compact_fold(&group, 0).expect("fold");
+        let [out] = folded.as_slice() else {
+            panic!("one folded Put: {folded:?}");
+        };
         assert_eq!(out.kind, RecordKind::Put);
         assert_eq!(out.seq, 5);
         let folded = InodeValue::decode(&out.value).expect("decodes");
@@ -1945,23 +1996,26 @@ mod tests {
         // Shadowed Puts collapse to the newest.
         let recs = [put(5, &iv(2)), put(2, &iv(1))];
         let group: Vec<RecordRef<'_>> = recs.iter().map(|r| r.record_ref()).collect();
-        let out = compact_fold(&group, 0).expect("fold").expect("live key");
-        assert_eq!((out.seq, out.value), (5, iv(2).encode()));
+        let folded = compact_fold(&group, 0).expect("fold");
+        let [out] = folded.as_slice() else {
+            panic!("one folded Put: {folded:?}");
+        };
+        assert_eq!((out.seq, out.value.clone()), (5, iv(2).encode()));
 
         // Orphan deltas compact to nothing (counted).
         let before = META_KV_DELTA_ORPHANS.load(Ordering::Relaxed);
         let recs = [dtimes(5, 50, 55)];
         let group: Vec<RecordRef<'_>> = recs.iter().map(|r| r.record_ref()).collect();
-        assert_eq!(compact_fold(&group, 0).expect("fold"), None);
+        assert_eq!(compact_fold(&group, 0).expect("fold"), Vec::new());
         assert_eq!(META_KV_DELTA_ORPHANS.load(Ordering::Relaxed), before + 1);
 
         // Tombstone below the tail shadows the Put AND elides: key vanishes.
         let recs = [del(7), put(3, &iv(1))];
         let group: Vec<RecordRef<'_>> = recs.iter().map(|r| r.record_ref()).collect();
-        assert_eq!(compact_fold(&group, 8).expect("fold"), None);
+        assert_eq!(compact_fold(&group, 8).expect("fold"), Vec::new());
 
         // Empty group is a no-op.
-        assert_eq!(compact_fold(&[], 0).expect("fold"), None);
+        assert_eq!(compact_fold(&[], 0).expect("fold"), Vec::new());
     }
 
     // -- the fold-forward step (PR M9 §5.7 D7.a: incremental ≡ from-scratch) --
@@ -2073,9 +2127,7 @@ mod tests {
         let mut out = Vec::new();
         for refs in groups.values_mut() {
             refs.sort_by(|a, b| b.seq.cmp(&a.seq));
-            if let Some(rec) = compact_fold(refs, durable_tail).expect("compaction fold") {
-                out.push(rec);
-            }
+            out.extend(compact_fold(refs, durable_tail).expect("compaction fold"));
         }
         out
     }

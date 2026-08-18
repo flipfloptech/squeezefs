@@ -266,9 +266,13 @@ fn compact_fold_materializes_layout_chain_into_one_put() {
         publish_delta(6, 7, 7 * 4096, 12),
     ];
     let refs: Vec<_> = recs.iter().rev().map(|r| r.record_ref()).collect();
-    let out = compact_fold(&refs, 0)
-        .expect("compaction fold must handle layout deltas")
-        .expect("live key compacts to a Put");
+    let folded = compact_fold(&refs, 0).expect("compaction fold must handle layout deltas");
+    // UNVERSIONED chains stay single-record (the rung-19 lineage rule
+    // engages only on versioned links — see
+    // `compaction_preserves_the_lineage_a_live_link_claims`).
+    let [out] = folded.as_slice() else {
+        panic!("an unversioned chain compacts to one Put: {folded:?}");
+    };
     assert_eq!(out.kind, RecordKind::Put);
     let x = XattrValue::decode(&out.value).expect("compacted value is an XattrValue");
     let got: LayoutMetadata = bincode::deserialize(&x.value).expect("layout");

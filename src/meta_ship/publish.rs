@@ -2590,18 +2590,29 @@ impl PublishService {
     /// writeback ladder re-publishes; on a correctly-armed authority
     /// (the production source now installed at arm) the arm is
     /// unreachable.
+    ///
+    /// Rung 19 (the width-N refs composition): the SCOPED arm also
+    /// returns the recomputed durable accounting — the diff of the
+    /// durable head against the map it composed, through the armed
+    /// [`crate::meta_backend::kv::block_refs::block_ref_resolver`]. An
+    /// entry the scope DROPS contributes NOTHING: the caller's frame,
+    /// staged verbatim, mints exactly one swapped pair per dropped entry
+    /// (a durable-without-map take + a map-without-durable entry — the
+    /// s11-blockcyclic drift arithmetic). `None` on every verbatim arm
+    /// (and with no resolver armed): the caller's ops stand, byte-
+    /// identical to the pre-rung-19 shape.
     async fn custody_scoped_layout(
         &self,
         client: &str,
         ino: u64,
         shipped: Vec<u8>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<(Vec<u8>, Option<Vec<BlockRefOp>>)> {
         let Some(owner) = crate::data_grant::custody_owner() else {
-            return Ok(shipped);
+            return Ok((shipped, None));
         };
         let spans = match owner.client_custody_on(client, ino) {
             crate::data_grant::ClientCustodyShape::Ranges(spans) => spans,
-            _ => return Ok(shipped),
+            _ => return Ok((shipped, None)),
         };
         let block = match owner.geometry_of(ino).await {
             Some((_size, block)) if block > 0 => block,
@@ -2623,13 +2634,14 @@ impl PublishService {
         use crate::meta_backend::Metadata as _;
         let durable = match self.inner.getxattr(ino, "layout").await {
             Ok(Some(bytes)) => bytes,
-            _ => return Ok(shipped), // no current layout — first Put, verbatim
+            _ => return Ok((shipped, None)), // no current layout — first Put, verbatim
         };
         let (Ok(mut cur), Ok(mut new)) = (
             crate::layout_wire::decode_base_layout(&durable),
             crate::layout_wire::decode_base_layout(&shipped),
         ) else {
-            return Ok(shipped); // JSON-era/undecodable base: the legacy verbatim arm
+            // JSON-era/undecodable base: the legacy verbatim arm.
+            return Ok((shipped, None));
         };
         let mut map = cur.block_map.take().unwrap_or_default();
         let new_map = new.block_map.take().unwrap_or_default();
@@ -2648,12 +2660,51 @@ impl PublishService {
             spans.iter().any(|&(s, e)| e > bs && s < be)
                 && !demoted.iter().any(|&(s, e)| e > bs && s < be)
         };
+        // Rung 19: the pre-compose head — what the accounting diffs
+        // against (the map the composition displaces FROM).
+        let head = map.clone();
         map.retain(|b, _| !(in_custody(*b) && !new_map.contains_key(b)));
         for (b, k) in new_map {
             if in_custody(b) {
                 map.insert(b, k);
             }
         }
+        // Rung 19 (the width-N refs composition): the accounting IS the
+        // head→composed diff. With no resolver armed the caller's frame
+        // stands (today's shape — production arm installs the resolver).
+        let refs = crate::meta_backend::kv::block_refs::block_ref_resolver().map(|resolver| {
+            let mut out: Vec<BlockRefOp> = Vec::new();
+            let resolve =
+                |key: &str, idx: u32, take: bool, out: &mut Vec<BlockRefOp>| match resolver(
+                    key, ino, idx,
+                ) {
+                    Some(r) => out.push(if take {
+                        BlockRefOp::taken(r)
+                    } else {
+                        BlockRefOp::released(r)
+                    }),
+                    None => {
+                        crate::meta_backend::kv::META_KV_BLOCK_REFS_UNRESOLVED
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                };
+            for (b, k) in &map {
+                match head.get(b) {
+                    Some(prev) if prev == k => {}
+                    Some(prev) => {
+                        resolve(prev, *b, false, &mut out);
+                        resolve(k, *b, true, &mut out);
+                    }
+                    None => resolve(k, *b, true, &mut out),
+                }
+            }
+            for (b, prev) in &head {
+                if !map.contains_key(b) {
+                    resolve(prev, *b, false, &mut out);
+                }
+            }
+            out
+        });
         // Non-map fields follow the Put (same layout class); size never
         // regresses a peer's growth (truncation is the setattr plane's).
         new.size = new.size.max(cur.size);
@@ -2661,13 +2712,14 @@ impl PublishService {
         // Scoped or not at all (rung 18): a re-encode failure refuses —
         // the retired fallback applied the shipped Put verbatim, which is
         // the same peer-reverting mint the no-geometry arm minted.
-        crate::layout_wire::encode_layout(&new).map_err(|e| {
+        let encoded = crate::layout_wire::encode_layout(&new).map_err(|e| {
             SqueezefsError::InvalidOperation(format!(
                 "S11: custody-scoped layout re-encode failed for ino {ino} ({e}) — refusing \
                  rather than applying range holder '{client}'s Put verbatim (the \
                  zeros-interleave C8 mint)"
             ))
-        })
+        })?;
+        Ok((encoded, refs))
     }
 
     async fn execute(&self, client: &str, call: PublishCall) -> Result<PublishReply> {
@@ -2680,7 +2732,20 @@ impl PublishService {
                 ..
             } => {
                 let refs: Vec<BlockRefOp> = refs.into_iter().map(BlockRefOp::from).collect();
-                let layout = self.custody_scoped_layout(client, ino, layout).await?;
+                let (layout, recomputed) = self.custody_scoped_layout(client, ino, layout).await?;
+                // Rung 19: on the SCOPED arm the accounting is the
+                // composition's own diff; the caller's MAP-BLOB ops (the
+                // indirect blob custody transfer — index-disjoint from
+                // map entries, and unreachable on the scoped arm's
+                // inline-only bases) travel verbatim beside it. Every
+                // verbatim arm keeps the caller's frame byte-identical.
+                let refs: Vec<BlockRefOp> = match recomputed {
+                    Some(mut r) => {
+                        r.extend(refs.iter().filter(|o| o.reference.is_map_blob()).copied());
+                        r
+                    }
+                    None => refs,
+                };
                 self.inner
                     .set_layout_and_size(ino, &layout, size, &refs)
                     .await?;

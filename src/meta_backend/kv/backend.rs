@@ -7451,6 +7451,26 @@ impl KvMetaBackend {
                                         .unwrap_or(0);
                             }
                         }
+                        // Rung 19 (the width-N refs composition): a CHAINED
+                        // member's accounting is recomputed from the
+                        // transition this commit performs — the entries
+                        // onto the folded head — replacing the caller's
+                        // frame. Un-chained members (the solo path) keep
+                        // their ops verbatim. The restamp above rewrites
+                        // only the wire's version pair, so decoding here
+                        // reads the same entries the caller shipped.
+                        if op.chain && self.block_refs.is_some() {
+                            if let Ok(d) = crate::layout_wire::LayoutDelta::decode(&op.delta_wire) {
+                                if let Some(refs) = Self::recompute_chained_refs(
+                                    &cur,
+                                    &d.entries,
+                                    op.ino,
+                                    &op.block_refs,
+                                ) {
+                                    op.block_refs = refs;
+                                }
+                            }
+                        }
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -7541,6 +7561,76 @@ impl KvMetaBackend {
         guard.clean = true;
     }
 
+    /// DLM S11 rung 19 — **the width-N refs composition**: recompute a
+    /// CHAINED merge's staged durable accounting from the transition this
+    /// commit actually performs — the delta's entries applied onto the
+    /// FOLDED durable head (`cur`, just looked up under this member's own
+    /// 4a I-guard) — never the caller's frame. At width N the caller
+    /// computed its ops against its private RAM base under its own
+    /// `INODE_META_LOCKS`, which legitimately lags its peers: staged
+    /// verbatim, the head's displaced binding is stranded ("1 durable vs
+    /// 0 layout references" — the s11-blockcyclic C8 face) and a stale
+    /// caller release deletes a record the composition KEEPS (the
+    /// swapped pair's loss half). O(batch + inline-head decode): the
+    /// head decode is bounded by the xattr value cap (a format constant),
+    /// paid only on the chained (multi-writer) plane — the solo path
+    /// never calls this.
+    ///
+    /// `None` keeps the caller's ops: no resolver armed (un-armed mounts,
+    /// where chained merges cannot occur in production —
+    /// `multi_writer::arm_multi_writer` installs it) or a head that is
+    /// not an inline decodable layout (the indirect/legacy face — a
+    /// recorded rung-19 residual; the caller's frame is today's shape
+    /// there). The caller's MAP-BLOB ops (the indirect blob custody
+    /// transfer, index-disjoint from map entries) always travel verbatim.
+    fn recompute_chained_refs(
+        cur: &[u8],
+        entries: &[(u32, String)],
+        ino: Ino,
+        caller: &[super::block_refs::BlockRefOp],
+    ) -> Option<Vec<super::block_refs::BlockRefOp>> {
+        use super::block_refs::BlockRefOp;
+        let resolver = super::block_refs::block_ref_resolver()?;
+        let x = XattrValue::decode(cur).ok()?;
+        let base = crate::layout_wire::decode_base_layout(&x.value).ok()?;
+        let head = base.block_map.unwrap_or_default();
+        let mut out: Vec<BlockRefOp> = Vec::with_capacity(entries.len() + 1);
+        let resolve = |key: &str, idx: u32, take: bool, out: &mut Vec<BlockRefOp>| {
+            match resolver(key, ino, idx) {
+                Some(r) => out.push(if take {
+                    BlockRefOp::taken(r)
+                } else {
+                    BlockRefOp::released(r)
+                }),
+                // The same discipline as the router's `block_ref_for`
+                // sites: an unresolvable key is counted, never silent.
+                None => {
+                    super::META_KV_BLOCK_REFS_UNRESOLVED.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        };
+        // Entries walk IN ORDER over a live view — a batch may name one
+        // index twice and the transitions compose left to right.
+        let mut view: std::collections::HashMap<u32, &str> = std::collections::HashMap::new();
+        for (idx, key) in entries {
+            let prev = view
+                .get(idx)
+                .copied()
+                .or_else(|| head.get(idx).map(String::as_str));
+            match prev {
+                Some(p) if p == key => {}
+                Some(p) => {
+                    resolve(p, *idx, false, &mut out);
+                    resolve(key, *idx, true, &mut out);
+                }
+                None => resolve(key, *idx, true, &mut out),
+            }
+            view.insert(*idx, key);
+        }
+        out.extend(caller.iter().filter(|o| o.reference.is_map_blob()).copied());
+        Some(out)
+    }
+
     /// The pre-aggregation single-ino body (the
     /// `SQUEEZEFS_PUBLISH_COMMIT_GROUP_MAX=1` A/B path, verbatim; `chain`
     /// selects the rung-17 chain-onto-head arm — see
@@ -7585,6 +7675,10 @@ impl KvMetaBackend {
         let mut delta_versions =
             (delta.version != 0).then_some((delta.base_version, delta.version));
         let mut chained_full: Option<Vec<u8>> = None;
+        // Rung 19 (the width-N refs composition): the CHAINED arm's
+        // recomputed accounting — `None` keeps the caller's ops (the solo
+        // path verbatim).
+        let mut refs_override: Option<Vec<super::block_refs::BlockRefOp>> = None;
         if existing {
             if let Some(cur) = self.xattrs.lookup(&key).await? {
                 let base_ok = XattrValue::decode(&cur)
@@ -7634,6 +7728,14 @@ impl KvMetaBackend {
                         staged_version = delta.version;
                     }
                 }
+                // Rung 19 (the width-N refs composition — the aggregated
+                // pass's twin): a CHAINED merge's accounting is the
+                // entries-onto-the-folded-head transition, never the
+                // caller's frame.
+                if chain && self.block_refs.is_some() {
+                    refs_override =
+                        Self::recompute_chained_refs(&cur, &delta.entries, ino, block_refs);
+                }
             }
         }
         publish_phase_record(PublishPhase::CommitSlotProbe, t_slot);
@@ -7672,7 +7774,7 @@ impl KvMetaBackend {
         tx.stage_put(TREE_INODES, inode_key(ino), v.encode());
         // Spec §6.2 item 1: accounting rides THIS tx (no second commit).
         if self.block_refs.is_some() {
-            tx.stage_block_refs(block_refs);
+            tx.stage_block_refs(refs_override.as_deref().unwrap_or(block_refs));
         }
         tx.hold_guards(guards);
         let t_tx = std::time::Instant::now();

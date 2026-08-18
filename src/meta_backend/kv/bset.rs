@@ -395,27 +395,26 @@ pub fn lookup<'a>(sources: &[BsetView<'a>], key: &[u8]) -> Result<Folded<'a>, Kv
     fold_newest_first(matches.into_iter().map(|(_, r)| r))
 }
 
-/// Compact sources into one folded record per surviving key: n-way merge,
-/// group by key, [`super::record::compact_fold`] each group under the §4.2
-/// tombstone elision rule. The output is strictly key-ascending and
-/// key-unique — directly buildable into a fresh bset.
+/// Compact sources into the folded record set per surviving key: n-way
+/// merge, group by key, [`super::record::compact_fold`] each group under
+/// the §4.2 tombstone elision rule (plus the §6.2 item-9 lineage rule —
+/// a versioned layout chain compacts to its folded base PLUS the
+/// retained head link, so a live later claim still verifies). The output
+/// is strictly `(key, seq)`-ascending — directly buildable into a fresh
+/// bset.
 pub fn compact<'a>(sources: &[BsetView<'a>], durable_tail: u64) -> Result<Vec<Record>, KvError> {
     let mut out = Vec::new();
     let mut group: Vec<RecordRef<'a>> = Vec::new();
     for r in merge(sources) {
         if let Some(first) = group.first() {
             if first.key != r.key {
-                if let Some(rec) = compact_fold(&group, durable_tail)? {
-                    out.push(rec);
-                }
+                out.extend(compact_fold(&group, durable_tail)?);
                 group.clear();
             }
         }
         group.push(r);
     }
-    if let Some(rec) = compact_fold(&group, durable_tail)? {
-        out.push(rec);
-    }
+    out.extend(compact_fold(&group, durable_tail)?);
     Ok(out)
 }
 

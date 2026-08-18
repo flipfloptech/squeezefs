@@ -365,6 +365,9 @@ impl MultiWriterArm {
         publish::uninstall_extent_merge_executor();
         publish::uninstall_extent_flush_executor();
         publish::uninstall_served_layout_invalidation();
+        // Rung 19: the refs resolver dies with the authority (it holds
+        // the data router; a disarmed mount serves no composed commits).
+        crate::meta_backend::kv::block_refs::uninstall_block_ref_resolver();
         if let Some(hold) = self.wero.take() {
             data_custody::release_hold(hold).await;
         }
@@ -749,6 +752,18 @@ pub async fn arm_multi_writer(
     // window with grants and no geometry.
     if let Some(backend) = backend {
         owner.install_range_geometry(router_range_geometry(Arc::clone(meta), Arc::clone(backend)));
+        // Rung 19 (the width-N refs composition): the authority-composed
+        // layout commits — the chain-onto-head merge and the custody-
+        // scoped Put — recompute their durable accounting from the
+        // composition itself, and this resolver (the router's
+        // `block_ref_for` behind the block_refs hook) is how the meta
+        // plane names the displaced/inserted keys' `(vol_tag, block_idx)`.
+        // Without it the caller's frame stands verbatim — the bc row's
+        // swapped-pair C8 mint — so it arms wherever the geometry does.
+        let refs_backend = Arc::clone(backend);
+        crate::meta_backend::kv::block_refs::install_block_ref_resolver(Arc::new(
+            move |key: &str, ino: u64, idx: u32| refs_backend.block_ref_for(key, ino, idx),
+        ));
     }
     data_grant::install_custody_owner(Arc::clone(&owner));
     publish::install_client(publish::PublishClient::new(owner.id(), secret));

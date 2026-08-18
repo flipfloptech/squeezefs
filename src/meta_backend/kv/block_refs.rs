@@ -114,7 +114,8 @@ pub const BLOCK_REF_KEY_LEN: usize = 8 + 8 + 8 + 4;
 /// the key is not allocator-tracked (the same class the mount-time walk
 /// skips); the caller counts it in `META_KV_BLOCK_REFS_UNRESOLVED`,
 /// mirroring the router's own discipline.
-pub type BlockRefResolverFn = std::sync::Arc<dyn Fn(&str, u64, u32) -> Option<BlockRef> + Send + Sync>;
+pub type BlockRefResolverFn =
+    std::sync::Arc<dyn Fn(&str, u64, u32) -> Option<BlockRef> + Send + Sync>;
 
 static BLOCK_REF_RESOLVER: once_cell::sync::Lazy<arc_swap::ArcSwapOption<BlockRefResolverFn>> =
     once_cell::sync::Lazy::new(arc_swap::ArcSwapOption::empty);

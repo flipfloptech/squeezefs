@@ -3840,7 +3840,9 @@ run_ior() { # outfile procs_per_mount fname extra-ior-args...
     # --bind-to none: 32 ranks + N daemons share the cores — MPI core
     # binding would pin ranks onto the daemons' lanes. Root launch is the
     # matrix's own posture (ensure_root), hence --allow-run-as-root.
-    timeout 1200 mpirun --allow-run-as-root --bind-to none "${args[@]}" >"$outfile" 2>&1 || {
+    # --map-by :OVERSUBSCRIBE: PRRTE's default slot count is PHYSICAL
+    # cores; the row's ranks are IO-blocked and legitimately exceed it.
+    timeout 1200 mpirun --allow-run-as-root --bind-to none --map-by :OVERSUBSCRIBE "${args[@]}" >"$outfile" 2>&1 || {
         tail -5 "$outfile" >&2
         die "ior invocation failed (rc=$? — full output in $outfile)"
     }

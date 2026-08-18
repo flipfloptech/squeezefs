@@ -443,6 +443,86 @@ async fn a_chained_merge_recomputes_refs_against_the_live_head() {
 }
 
 // ===========================================================================
+// 1b. The recompute keys records by the GLOBAL ino (the armD conviction)
+// ===========================================================================
+
+/// Contract (the live conviction's identity face): the block-reference
+/// key law is `owner_ino = the GLOBAL ino` (`block_refs.rs`'s own words).
+/// The chained recompute runs INSIDE the KV volume, whose `ino` is the
+/// ROUTED-LOCAL identity — on a hosted slot that reads
+/// `((slot+1) << 40) | local`, and a record keyed by it is a PHANTOM no
+/// release, no delete-path teardown and no oracle walk can ever match
+/// (the armD tape: `owner_ino = 0xE754_0000_0000_02` beside live global
+/// inos). The routed layer therefore threads the GLOBAL ino down as the
+/// accounting owner, and the staged records carry IT.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_chained_recompute_keys_records_by_the_global_ino() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let (be, _p) = sandbox(dir.path(), "own-ident", true).await;
+    install_test_resolver();
+
+    // The hosted-slot SHAPE without the slot machinery: the KV volume is
+    // handed one (local) ino while the accounting owner is a DIFFERENT
+    // (global) identity — distinct on purpose, exactly what a hosted
+    // slot's `((slot+1) << 40) | local` routing produces live.
+    let vol = &be.volumes[0];
+    let local_rec = {
+        use squeezefs::meta_backend::Metadata as _;
+        vol.create(1, "local.bin", libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .expect("local inode")
+    };
+    let local_ino = local_rec.ino;
+    let global_ino: u64 = local_ino + 59220;
+    // A live base at the local slot key (the chained arm needs an
+    // existing decodable head).
+    vol.set_layout_and_size(
+        local_ino,
+        &base_layout_bytes(BLOCK, &[(0, "be://data:A")]),
+        BLOCK,
+        &[],
+    )
+    .await
+    .expect("base Put lands");
+
+    let d = delta(
+        BLOCK,
+        &[(0, "be://data:B")],
+        (0, squeezefs::dlm::mint_layout_version()),
+    );
+    let (_used, _v) = vol
+        .merge_layout_and_size_chained(
+            local_ino,
+            global_ino,
+            &d,
+            bytes::Bytes::from(base_layout_bytes(BLOCK, &[(0, "be://data:B")])),
+            BLOCK,
+            vec![],
+        )
+        .await
+        .expect("chained merge lands");
+
+    let mut owners: Vec<u64> = Vec::new();
+    for kv in &be.volumes {
+        for r in kv.block_ref_scan(TEST_TAG).await.expect("scan") {
+            owners.push(r.owner_ino);
+        }
+    }
+    assert_eq!(
+        owners,
+        vec![global_ino],
+        "the recomputed record keys on the GLOBAL ino — a local/guest-\
+         namespaced owner is a phantom record nothing can ever release"
+    );
+
+    for vol in &be.volumes {
+        vol.shutdown().await.expect("shutdown");
+    }
+}
+
+// ===========================================================================
 // 2. The custody-scoped Put's accounting follows the composition
 // ===========================================================================
 

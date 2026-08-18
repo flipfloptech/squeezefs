@@ -124,6 +124,7 @@ fn wce_crash_child_entry() {
                 backend
                     .merge_layout_and_size(
                         ino,
+                        ino,
                         &delta,
                         bytes::Bytes::from(full.clone()),
                         layout.size,

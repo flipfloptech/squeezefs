@@ -2928,7 +2928,7 @@ impl RoutedMetaBackend {
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
         let out = self.volumes[v_idx]
-            .merge_layout_and_size(local_ino, delta, full_layout, size, block_refs)
+            .merge_layout_and_size(local_ino, ino, delta, full_layout, size, block_refs)
             .await;
         if out.is_err() {
             self.mirror_volume_failure(v_idx);
@@ -2956,7 +2956,7 @@ impl RoutedMetaBackend {
         let (v_idx, local_ino) = self.route_ino(ino);
         self.check_volume_enabled(v_idx)?;
         let out = self.volumes[v_idx]
-            .merge_layout_and_size_chained(local_ino, delta, full_layout, size, block_refs)
+            .merge_layout_and_size_chained(local_ino, ino, delta, full_layout, size, block_refs)
             .await;
         if out.is_err() {
             self.mirror_volume_failure(v_idx);

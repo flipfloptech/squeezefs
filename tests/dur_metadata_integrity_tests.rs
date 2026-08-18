@@ -634,6 +634,7 @@ async fn dur8b_the_chain_cap_bounds_the_durable_delta_chain() {
         let used = kv
             .merge_layout_and_size(
                 ino,
+                ino,
                 &delta,
                 bytes::Bytes::from(full),
                 layout.size,

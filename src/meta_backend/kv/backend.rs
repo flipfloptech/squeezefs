@@ -4750,6 +4750,13 @@ struct UndoKey {
 /// channel (`use_delta` on success — the caller's chain accounting).
 struct QueuedLayoutMerge {
     ino: Ino,
+    /// Rung 19: the GLOBAL ino the durable block-reference records key on
+    /// (`block_refs` law: `owner_ino` is the GLOBAL ino — the routed
+    /// layer's pre-`route_ino` identity, NOT the volume-local/guest-
+    /// namespaced `ino` above, which on a hosted slot reads
+    /// `((slot+1) << 40) | local` and keyed the armD conviction's phantom
+    /// records).
+    refs_owner: Ino,
     /// Pre-encoded `LayoutDelta` wire bytes (encoded once, at enqueue).
     delta_wire: Bytes,
     /// The caller-provided full layout — the always-correct fallback
@@ -7026,12 +7033,13 @@ impl KvMetaBackend {
     pub async fn merge_layout_and_size(
         &self,
         ino: Ino,
+        refs_owner: Ino,
         delta: &crate::layout_wire::LayoutDelta,
         full_layout: Bytes,
         size: u64,
         block_refs: Vec<super::block_refs::BlockRefOp>,
     ) -> Result<bool> {
-        self.merge_layout_and_size_ext(ino, delta, full_layout, size, block_refs, false)
+        self.merge_layout_and_size_ext(ino, refs_owner, delta, full_layout, size, block_refs, false)
             .await
             .map(|(used, _version)| used)
     }
@@ -7056,18 +7064,21 @@ impl KvMetaBackend {
     pub async fn merge_layout_and_size_chained(
         &self,
         ino: Ino,
+        refs_owner: Ino,
         delta: &crate::layout_wire::LayoutDelta,
         full_layout: Bytes,
         size: u64,
         block_refs: Vec<super::block_refs::BlockRefOp>,
     ) -> Result<(bool, u64)> {
-        self.merge_layout_and_size_ext(ino, delta, full_layout, size, block_refs, true)
+        self.merge_layout_and_size_ext(ino, refs_owner, delta, full_layout, size, block_refs, true)
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn merge_layout_and_size_ext(
         &self,
         ino: Ino,
+        refs_owner: Ino,
         delta: &crate::layout_wire::LayoutDelta,
         full_layout: Bytes,
         size: u64,
@@ -7087,7 +7098,15 @@ impl KvMetaBackend {
         self.write_gate()?;
         if crate::routing::publish_commit_group_max() == Some(1) {
             return self
-                .merge_layout_and_size_direct(ino, delta, &full_layout, size, &block_refs, chain)
+                .merge_layout_and_size_direct(
+                    ino,
+                    refs_owner,
+                    delta,
+                    &full_layout,
+                    size,
+                    &block_refs,
+                    chain,
+                )
                 .await;
         }
         let (done, rx) = squeezefs_ipc::sqz_channel::oneshot::channel();
@@ -7106,6 +7125,7 @@ impl KvMetaBackend {
         self.layout_conveyor.enqueue(
             QueuedLayoutMerge {
                 ino,
+                refs_owner,
                 delta_wire,
                 full_layout,
                 size,
@@ -7464,7 +7484,7 @@ impl KvMetaBackend {
                                 if let Some(refs) = Self::recompute_chained_refs(
                                     &cur,
                                     &d.entries,
-                                    op.ino,
+                                    op.refs_owner,
                                     &op.block_refs,
                                 ) {
                                     op.block_refs = refs;
@@ -7583,6 +7603,14 @@ impl KvMetaBackend {
     /// recorded rung-19 residual; the caller's frame is today's shape
     /// there). The caller's MAP-BLOB ops (the indirect blob custody
     /// transfer, index-disjoint from map entries) always travel verbatim.
+    ///
+    /// `ino` is the accounting OWNER — the GLOBAL ino (the routed layer's
+    /// pre-`route_ino` identity). The block-reference key law
+    /// (`block_refs.rs`: "owner_ino: the referencing inode (GLOBAL ino)")
+    /// is load-bearing: resolving with the volume-LOCAL ino keys phantom
+    /// records on a hosted slot (`((slot+1) << 40) | local` — the armD
+    /// conviction) that no release, no delete-path teardown and no oracle
+    /// walk can ever match.
     fn recompute_chained_refs(
         cur: &[u8],
         entries: &[(u32, String)],
@@ -7635,9 +7663,11 @@ impl KvMetaBackend {
     /// `SQUEEZEFS_PUBLISH_COMMIT_GROUP_MAX=1` A/B path, verbatim; `chain`
     /// selects the rung-17 chain-onto-head arm — see
     /// [`Self::merge_layout_and_size_chained`]).
+    #[allow(clippy::too_many_arguments)]
     async fn merge_layout_and_size_direct(
         &self,
         ino: Ino,
+        refs_owner: Ino,
         delta: &crate::layout_wire::LayoutDelta,
         full_layout: &[u8],
         size: u64,
@@ -7734,7 +7764,7 @@ impl KvMetaBackend {
                 // caller's frame.
                 if chain && self.block_refs.is_some() {
                     refs_override =
-                        Self::recompute_chained_refs(&cur, &delta.entries, ino, block_refs);
+                        Self::recompute_chained_refs(&cur, &delta.entries, refs_owner, block_refs);
                 }
             }
         }

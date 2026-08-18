@@ -234,3 +234,66 @@ Only) with `regctl >= 1`, and the authority's `.stats` reads
   fsck/C8). Per the repro-port mandate, a field-found product failure
   comes home as a cargo repro with its fix — capture the whole rowdir
   plus `/scratch/tmp/logs/sqz-mw-*.log` before tearing down.
+
+---
+
+## Cloud venue (cheapest shape)
+
+When the field cluster is off-limits, the same row runs on AWS EC2 spot
+via `tests/cloud_bench_cluster.sh` — the standing cloud tool grew an MW
+arm (`PRESET=mw`; user ruling: "it's really about CHEAPNESS when we do
+cloud testing"): **1 client + 1 mds + 2 oss = 4 × i4i.2xlarge spot
+instances, no spare**. The fleet is the co-located v5-mw shape (1
+authority + `MW_COWRITERS` co-writers, default 2 — the leg's floor,
+sized for the 8-vCPU client; the field/design shape stays 8, so state
+the co-writer width on any row that compares the two). One tool, one
+state dir: the MW cluster rides the same max-spend guard
+(`MAX_CLUSTER_HOURS`), teardown-at-deadline process, spot-interruption
+abort, and tag-scoped teardown sweep as every other preset.
+
+The one-command sequence (pass `PRESET=mw` on **every** subcommand — it
+selects the role shape, the AMI and the artifact defaults; only the node
+list persists in cluster state). Run each with `--dry-run` first — it
+prints the exact aws/ssh transcript and needs no credentials:
+
+```
+MAX_CLUSTER_HOURS=3 PRESET=mw tests/cloud_bench_cluster.sh launch
+PRESET=mw tests/cloud_bench_cluster.sh deploy       # needs dist/ubuntu2604 (task build:ubuntu2604)
+PRESET=mw tests/cloud_bench_cluster.sh assemble-mw  # fabric + the v5-mw fleet recipe
+PRESET=mw tests/cloud_bench_cluster.sh bench-mw     # the s11-mpiio row; rows -> .benchmarks/cloud/<ts>/
+tests/cloud_bench_cluster.sh teardown
+```
+
+**Kernel floors + AMI.** The mw preset defaults to the Ubuntu 26.04 LTS
+AMI (`AMI_SSM_PARAM` overrides the SSM path) because the MW arm carries
+both kernel floors from this runbook: the client needs
+FUSE-over-io_uring (preflight 1, mainline v6.14+) and the storage nodes
+need nvmet Persistent Reservations (preflight 2, v6.13+). Neither is
+trusted from the AMI: `assemble-mw` probes `fuse.enable_uring` on the
+client and asserts `resv_enable=1` per shared namespace on every storage
+node (the v5 FATAL pattern — "no knob = kernel lacks nvmet PR"
+distinguished from "knob=0"), then verifies `nvme resv-report`
+end-to-end per data namespace before the format. Artifacts default to
+`dist/ubuntu2604` — the deployed glibc must match the AMI.
+
+**Planning cost** (spot prices move; these are planning numbers —
+`MAX_CLUSTER_HOURS` is the real protection: launch refuses without it
+and installs a detached teardown-at-deadline guard):
+
+| shape | est. spot $/hr | campaign (~2–3 h) |
+|---|---|---|
+| 4 × i4i.2xlarge (1 client + 1 mds + 2 oss) | ~$0.5–0.8/hr | ~$1.5–3 total |
+
+**Evidence tier.** A cloud row is **measured-real over a real nvme-tcp
+network** — but a **THIRD substrate class** (`docs/rc-manifest.md`
+tiers): never spliced into devsub loop/tcp medians, and not the field
+fabric either — state the class in any note that cites it. The row
+label states instrument (pinned ior 4.0.0 + mpirun, printed by the
+leg), substrate (instance types + AZ + single NIC), and market (spot).
+The small instances' "up to N Gbps" network baselines are burst-shaped;
+the row survives because it is a same-substrate shared-vs-disjoint
+RATIO with internal A-B-B-A brackets and the leg's flatness/self-sizing
+gates catch credit sag — the stamp records the instance types so the
+label stays honest. A spot interruption mid-row ABORTS the count
+(multi-run discipline: restart from zero on a fresh cluster; partial
+results are labeled INVALID, never spliced).

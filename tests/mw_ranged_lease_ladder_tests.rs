@@ -655,3 +655,41 @@ async fn the_geometry_source_reads_a_truncate_created_files_size() {
          exists for (the MPI-IO row's live wedge)"
     );
 }
+
+/// The §6.2-item-9 divergence refusal is the SUPERSESSION class (rung 18
+/// — the MPI-IO row's width-32 conviction: 32 concurrent ranged
+/// publishers of one ino keep the owner's chain compacting, and every
+/// in-flight delta naming the prior base refused "divergent
+/// layout-delta chain ... folds onto 0x0" — which the writeback
+/// classifier latched TERMINAL, EINVAL'd the app's fsync (POSIX-16) and
+/// aborted the row. The save's refusal arm resets the ino's RAM
+/// provenance, so a retry refetches and converges: the class is
+/// RETRIED, on both its faces (the raw refusal and the coalesced-pass
+/// Io wrap). The width-N behavior itself is the live leg's falsifier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_divergence_refusal_is_the_retried_supersession_class() {
+    let raw = squeezefs::error::SqueezefsError::InvalidOperation(
+        "kv metadata: corrupt KV encoding: divergent layout-delta chain (spec §6.2 item 9): \
+         link seq 767296 names base version 0x30000000727 but folds onto 0x0"
+            .to_string(),
+    );
+    assert!(
+        !squeezefs::fuse_client::writeback_error_is_terminal(&raw),
+        "the divergence refusal must be retried (the owner re-based; the \
+         recompute converges), never latched EINVAL"
+    );
+    let wrapped = squeezefs::error::SqueezefsError::Io(std::io::Error::other(format!(
+        "coalesced publish failed: {raw}"
+    )));
+    assert!(
+        !squeezefs::fuse_client::writeback_error_is_terminal(&wrapped),
+        "the coalesced-pass wrap of the same refusal is the same class"
+    );
+    let corrupt = squeezefs::error::SqueezefsError::InvalidOperation(
+        "kv metadata: corrupt KV encoding: bad checksum".to_string(),
+    );
+    assert!(
+        squeezefs::fuse_client::writeback_error_is_terminal(&corrupt),
+        "every OTHER corrupt-encoding refusal stays terminal"
+    );
+}

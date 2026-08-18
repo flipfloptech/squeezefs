@@ -1845,7 +1845,24 @@ pub fn op_watchdog_tick(threshold: Duration) -> Vec<OverdueOp> {
 /// answer), and only failures that will never resolve themselves reach
 /// the latch. Superseded/no-op resolutions never get here at all — the
 /// flush unit returns `Ok` for them (FIND-M11-A).
-fn writeback_error_is_terminal(e: &SqueezefsError) -> bool {
+/// `#[doc(hidden)] pub` for the rung-18 classifier pin only (the live
+/// MPI-IO row is the behavioral falsifier — the width-N shape is not
+/// reproducible in-process).
+#[doc(hidden)]
+pub fn writeback_error_is_terminal(e: &SqueezefsError) -> bool {
+    // Rung 18 (the MPI-IO row's width-32 conviction): the §6.2-item-9
+    // divergence refusal ("divergent layout-delta chain") is the
+    // SUPERSESSION class under concurrent same-ino publishers — the
+    // owner compacted/re-based the chain while this save's delta named
+    // the prior base. The save's error arm already RESET the ino's RAM
+    // provenance, so the recompute refetches and converges: retried,
+    // never latched EINVAL into the app's fsync (POSIX-16 is for
+    // failures retrying cannot land). One string probe, error path only.
+    if matches!(e, SqueezefsError::InvalidOperation(_) | SqueezefsError::Io(_))
+        && format!("{e}").contains("divergent layout-delta chain")
+    {
+        return false;
+    }
     match e {
         // Supersession + lease races: the ladder's own healthy churn.
         SqueezefsError::FencingTokenExpired { .. } | SqueezefsError::LockFailed { .. } => false,

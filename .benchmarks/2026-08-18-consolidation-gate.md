@@ -8,8 +8,9 @@ clippy both configs + fmt + shellcheck + markdown) but never the
 end-to-end pass. On the program's close (`3e38af43`) the user lifted the
 deferral ("go ahead"). This note records the consolidation: six runs,
 five catches, every catch convicted with controls and fixed on its own
-ff-merged branch, and the final run **GREEN FROM ZERO** on `5f40a1c1`'s
-parent tip (`GATE-EXIT=0`, `/tmp/gate6.log` preserved this session).
+ff-merged branch, and the final run **GREEN FROM ZERO** on dev
+`164d6056` — the sparse-settle fix tip (`GATE-EXIT=0`, `/tmp/gate6.log`
+preserved this session).
 
 ## The verdict (run 6, from zero, every leg)
 

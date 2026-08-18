@@ -1858,9 +1858,11 @@ pub fn writeback_error_is_terminal(e: &SqueezefsError) -> bool {
     // provenance, so the recompute refetches and converges: retried,
     // never latched EINVAL into the app's fsync (POSIX-16 is for
     // failures retrying cannot land). One string probe, error path only.
-    if matches!(e, SqueezefsError::InvalidOperation(_) | SqueezefsError::Io(_))
-        && format!("{e}").contains("divergent layout-delta chain")
-    {
+    // The class travels in three coats: the LOCAL refusal
+    // (InvalidOperation), the coalesced-pass wrap (Io), and the SHIPPED
+    // face (the owner's refusal decodes as Refused{errno} through the
+    // publish wire's WireError round trip) — the marker is the class.
+    if format!("{e}").contains("divergent layout-delta chain") {
         return false;
     }
     match e {

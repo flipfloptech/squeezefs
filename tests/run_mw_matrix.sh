@@ -3583,7 +3583,10 @@ leg_s11_subblock() {
     ) <<'PYA' &
 import os, sys, time
 path, start, rec, half = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
-fd = os.open(path, os.O_WRONLY)
+# O_SYNC: each record is ONE FUSE write (the per-record ship the price
+# table prices); buffered records legally coalesce to max_write slices —
+# the product chunks those (pinned) but the ROW's instrument is per-record.
+fd = os.open(path, os.O_WRONLY | os.O_SYNC)
 deadline = time.monotonic() + 9.0
 n = 0
 while True:
@@ -3609,7 +3612,7 @@ PYA
     t_m2="$(python3 - "$(mnt_of "$m2")/s11-subblock.dat" "$half" 34 "$rec" "$half" <<'PYB'
 import os, sys, time
 path, start, pat, rec, half = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
-fd = os.open(path, os.O_WRONLY)
+fd = os.open(path, os.O_WRONLY | os.O_SYNC)
 buf = bytes([pat]) * rec
 t0 = time.monotonic()
 off = start

@@ -458,3 +458,143 @@ async fn ranged_write_lease_exhaustion_stays_loud_eio_after_the_budget() {
 
     auth.listener.shutdown();
 }
+
+/// **The desired-window stretch, v2** (rung-15 residual #3 — "the
+/// desired-window stream stretch ... the R2-classifier window and the
+/// measured ≥99.5 %-local verdict are the ior row's business"): the v1
+/// stretch unioned the mount's whole span HULL and always doubled
+/// forward. On an INTERLEAVED decomposition (the §9.5 MPI-IO/block-cyclic
+/// rows: a mount's stripes are strided, never adjacent) the hull spans
+/// every gap between the mount's own stripes — so the second ask's
+/// desired GRABBED the unclaimed gaps, a peer's later REQUIRED for its
+/// own block then conflicted with custody the grabber never writes, and
+/// the §9.3 barrier demoted an aligned block to authority assembly (the
+/// anti-shape) — fabricated sharing on rows where "nothing should share
+/// a block" is the falsifier. The v2 law: union only an
+/// OVERLAPPING-or-ABUTTING own span (a genuine stream extension), and
+/// forward-double only on a sequentially-advancing per-ino write
+/// frontier (the classifier-shaped gate — a strided writer pays one
+/// extend RTT per stripe, a streaming writer keeps O(log n)).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn strided_asks_never_bridge_the_gap_between_own_stripes() {
+    let _serial = serial();
+    let _restore = Restore;
+    let auth = start_authority("ladder-authority-3");
+    let h = Arc::new(make(*b"ranged-ladder-03", "ranged-ladder-3").await);
+    // Private inode band: two pads (the suite convention).
+    for pad_name in ["pad-a.dat", "pad-b.dat"] {
+        let pad =
+            h.fs.create(h.req, 1, OsStr::new(pad_name), libc::S_IFREG | 0o644, 0)
+                .await
+                .unwrap();
+        h.fs.release(h.req, pad.attr.ino, pad.fh, 0, 0, false)
+            .await
+            .unwrap();
+    }
+    let (ino, fh) = create_striped_open(&h, "strided.dat").await;
+    let _client = arm_cowriter(&auth, &h).await;
+
+    const BLK: u64 = 4 * 1024 * 1024;
+    // The strided shape: this mount's stripes are blocks 0 and 8 — never
+    // adjacent (the block-cyclic per-holder law).
+    for off in [0u64, 8 * BLK] {
+        let written =
+            h.fs.write(
+                h.req,
+                ino,
+                fh,
+                off,
+                bytes::Bytes::from(vec![0x22u8; BLK as usize]),
+                0,
+                0,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("strided ranged write at {off} failed: {e:?}"))
+            .written;
+        assert_eq!(written as u64, BLK);
+    }
+
+    // The falsifier: block 4 — inside the GAP between this mount's
+    // stripes — must be FREE custody. Pre-v2 the second ask's hull-union
+    // desired grabbed [block 1, block 8), so this foreign acquire
+    // conflicted (and, with geometry armed, would have fabricated a
+    // demotion of an unshared block).
+    let peer = DlmClient::new().unwrap();
+    let path = squeezefs::keys::inode_path(ino);
+    let probe = peer
+        .acquire_lock(
+            &path,
+            Some((4 * BLK, 5 * BLK)),
+            Duration::from_millis(500),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "a strided holder's desired must never bridge its own gap: \
+                 the peer's acquire of untouched block 4 conflicted — the \
+                 hull-union grab fabricated custody over blocks the holder \
+                 never writes: {e:?}"
+            )
+        });
+    probe.release().await.expect("probe releases");
+
+    auth.listener.shutdown();
+}
+
+/// The stretch's OTHER half survives v2: a genuinely SEQUENTIAL stream
+/// still converges by extension + forward doubling — O(log n) round
+/// trips, never one per block (the ≥99.5 %-local law's streaming face,
+/// preserved verbatim from the rung-15 live leg's "1 acquire + 3
+/// extensions per 64 MiB half").
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sequential_stream_still_converges_by_extension_and_doubling() {
+    let _serial = serial();
+    let _restore = Restore;
+    let auth = start_authority("ladder-authority-4");
+    let h = Arc::new(make(*b"ranged-ladder-04", "ranged-ladder-4").await);
+    for pad_name in ["pad-c.dat", "pad-d.dat", "pad-e.dat"] {
+        let pad =
+            h.fs.create(h.req, 1, OsStr::new(pad_name), libc::S_IFREG | 0o644, 0)
+                .await
+                .unwrap();
+        h.fs.release(h.req, pad.attr.ino, pad.fh, 0, 0, false)
+            .await
+            .unwrap();
+    }
+    let (ino, fh) = create_striped_open(&h, "stream.dat").await;
+    let _client = arm_cowriter(&auth, &h).await;
+
+    const BLK: u64 = 4 * 1024 * 1024;
+    let s0 = squeezefs::dlm::range_custody_stats();
+    for b in 0..8u64 {
+        let written =
+            h.fs.write(
+                h.req,
+                ino,
+                fh,
+                b * BLK,
+                bytes::Bytes::from(vec![0x33u8; BLK as usize]),
+                0,
+                0,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("sequential ranged write block {b} failed: {e:?}"))
+            .written;
+        assert_eq!(written as u64, BLK);
+    }
+    let s1 = squeezefs::dlm::range_custody_stats();
+    let grants = s1.grants - s0.grants;
+    let extensions = s1.extensions - s0.extensions;
+    assert_eq!(
+        grants, 1,
+        "one stream = ONE grant record (extensions widen it in place)"
+    );
+    assert!(
+        extensions <= 3,
+        "8 sequential blocks must converge in O(log n) extensions \
+         (doubling engaged) — got {extensions} (v1 measured 3; one per \
+         block = 7 means the stretch died)"
+    );
+
+    auth.listener.shutdown();
+}

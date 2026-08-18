@@ -12089,6 +12089,19 @@ impl SqueezefsFilesystem {
                 Box::pin(async move { fs.flush_shipped_extents(ino).await })
             },
         ));
+        // Rung 18: the served-layout coherence sink — a co-writer's
+        // SERVED publish commits on the backend directly, so this
+        // authority fs's RAM view of the ino must refetch (its fold's
+        // displaced-release set was otherwise computed from a view that
+        // never saw the peer's last direct merge — the dangling-take
+        // mint's third face).
+        let fs = self.clone();
+        crate::meta_ship::publish::install_served_layout_invalidation(std::sync::Arc::new(
+            move |ino: u64| {
+                fs.router.metadata_cache.remove(&ino);
+                fs.attr_cache.invalidate(&ino);
+            },
+        ));
     }
 
     /// Rung 17: install the CO-WRITER's extent hooks (the mount arm's

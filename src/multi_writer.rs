@@ -348,6 +348,7 @@ impl MultiWriterArm {
         publish::uninstall_harvest_executor();
         publish::uninstall_extent_merge_executor();
         publish::uninstall_extent_flush_executor();
+        publish::uninstall_served_layout_invalidation();
         if let Some(hold) = self.wero.take() {
             data_custody::release_hold(hold).await;
         }

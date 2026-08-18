@@ -502,6 +502,21 @@ impl PublishCall {
         matches!(self, Self::WriteExtent { .. } | Self::FlushExtents { .. })
     }
 
+    /// Does a SERVE of this call mutate an ino's durable LAYOUT plane
+    /// directly on the backend (rung 18 — the served-layout invalidation
+    /// sink's class)? The extent verbs are excluded: their executors run
+    /// the authority fs's own write path, which keeps its RAM view
+    /// coherent by construction.
+    fn serves_mutate_layout(&self) -> bool {
+        matches!(
+            self,
+            Self::SetLayoutAndSize { .. }
+                | Self::MergeLayoutAndSize { .. }
+                | Self::CommitBlockRefs { .. }
+                | Self::DestroyInodes { .. }
+        )
+    }
+
     /// May a TRANSPORT-failed ship of this call reconnect and RESEND the
     /// same frame (rung 18, residual (d) — the idle-reap conviction: the
     /// cluster wire's 60 s idle-session reaper closed a co-writer's
@@ -1822,6 +1837,38 @@ pub fn uninstall_extent_flush_executor() {
     EXTENT_FLUSH_EXEC.store(None);
 }
 
+/// Rung 18 — the AUTHORITY-side coherence sink (the s11-subblock
+/// dangling-take mint's THIRD face): a SERVED layout-class publish
+/// commits on the backend DIRECTLY, bypassing the authority's own
+/// fs-level RAM metadata cache — so its fold/writeback later computed a
+/// DISPLACED-release set from a view that never saw the co-writer's last
+/// direct merge, and the superseded key's take dangled ([C8] '1 durable
+/// vs 0 layout references' + [C2] leak). The mount arm installs the
+/// authority fs's invalidation here (`metadata_cache.remove` + attr
+/// invalidate — the co-writer side has carried the mirror-image
+/// `install_release_hook` since rung 17); the serve wrapper calls it for
+/// every successfully committed layout-MUTATING verb's named inos.
+pub type ServedLayoutInval = Arc<dyn Fn(u64) + Send + Sync>;
+
+static SERVED_LAYOUT_INVAL: Lazy<arc_swap::ArcSwapOption<ServedLayoutInval>> =
+    Lazy::new(arc_swap::ArcSwapOption::empty);
+
+pub fn install_served_layout_invalidation(sink: ServedLayoutInval) {
+    SERVED_LAYOUT_INVAL.store(Some(Arc::new(sink)));
+}
+
+pub fn uninstall_served_layout_invalidation() {
+    SERVED_LAYOUT_INVAL.store(None);
+}
+
+fn note_served_layout_commit(inos: &[u64]) {
+    if let Some(sink) = SERVED_LAYOUT_INVAL.load_full() {
+        for ino in inos {
+            sink(*ino);
+        }
+    }
+}
+
 fn extent_flush_executor() -> Option<ExtentFlushExec> {
     EXTENT_FLUSH_EXEC.load_full().map(|e| (*e).clone())
 }
@@ -2294,7 +2341,18 @@ impl PublishService {
                     } else {
                         Some(SERVE_INO_LOCKS.get_inode_lock(ino).lock().await)
                     };
-                    me.execute(&client, call).await
+                    // Rung 18: a committed layout-class serve invalidates
+                    // the authority fs's RAM view of the named inos (the
+                    // served commit bypassed it — see the sink's doc).
+                    let inval_inos = call
+                        .serves_mutate_layout()
+                        .then(|| call.named_inos())
+                        .unwrap_or_default();
+                    let out = me.execute(&client, call).await;
+                    if out.is_ok() {
+                        note_served_layout_commit(&inval_inos);
+                    }
+                    out
                 })
                 .await
                 {

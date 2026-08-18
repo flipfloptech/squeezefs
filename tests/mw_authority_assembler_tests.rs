@@ -102,6 +102,7 @@ impl Drop for Restore {
         publish::uninstall_client();
         publish::uninstall_extent_merge_executor();
         publish::uninstall_extent_flush_executor();
+        publish::uninstall_served_layout_invalidation();
         ship::disarm_ownership();
         data_custody::test_reset_custody_generation();
         data_custody::test_clear_poison();
@@ -2427,4 +2428,76 @@ async fn a_local_publish_of_a_range_granted_ino_parks_on_the_serve_window() {
 
     auth.listener.shutdown();
     shutdown(&owner_be).await;
+}
+
+/// Contract (the mint's THIRD face, same live row): a SERVED
+/// layout-class publish commits on the backend directly — the authority
+/// fs's RAM view of the ino must be INVALIDATED at that commit, or its
+/// own fold's displaced-release set is computed from a view that never
+/// saw the peer's last direct merge (the dangling-take + leak pair,
+/// reproduced at drift 2 on the run AFTER the first two faces were
+/// fixed). The pin: the installed sink fires with the served verb's ino
+/// on the committed path and stays silent on a refused one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_served_layout_publish_invalidates_the_authoritys_ram_view() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let (owner_be, _p) = sandbox(dir.path(), "own-inval", true).await;
+    let (client_be, _p2) = sandbox(dir.path(), "cli-inval", false).await;
+    let auth = start_authority(Arc::clone(&owner_be), "assembler-authority");
+    let (client, pc) = arm_client(&auth, &client_be).await;
+    let epoch = client.lease_epoch();
+    let ino = shipped_create(&client_be, "inval.bin").await;
+
+    let seen: Arc<parking_lot::Mutex<Vec<u64>>> = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    publish::install_served_layout_invalidation(Arc::new(move |i: u64| {
+        sink.lock().push(i);
+    }));
+
+    let base = base_layout_bytes(BLOCK, &[(0, "be://data/K_direct")]);
+    pc.ship(
+        &auth.endpoint,
+        publish::PublishCall::SetLayoutAndSize {
+            ino,
+            layout: base,
+            size: BLOCK,
+            refs: vec![],
+            lease_epoch: epoch,
+            request_id: 0xF1,
+        },
+    )
+    .await
+    .expect("the served Put lands");
+    assert!(
+        seen.lock().contains(&ino),
+        "a COMMITTED served layout publish must invalidate the authority \
+         fs's RAM view of ino {ino} (the dangling-take mint's third face) \
+         — sink saw {:?}",
+        seen.lock()
+    );
+
+    // The refused path stays silent (nothing was applied).
+    seen.lock().clear();
+    let stale = publish::PublishCall::SetLayoutAndSize {
+        ino,
+        layout: base_layout_bytes(BLOCK, &[(0, "be://data/K_zombie")]),
+        size: BLOCK,
+        refs: vec![],
+        lease_epoch: epoch + 999,
+        request_id: 0xF2,
+    };
+    let _ = pc
+        .ship(&auth.endpoint, stale)
+        .await
+        .expect_err("a dead era's Put refuses");
+    assert!(
+        seen.lock().is_empty(),
+        "a REFUSED serve applied nothing and must invalidate nothing"
+    );
+
+    auth.listener.shutdown();
+    shutdown(&owner_be).await;
+    shutdown(&client_be).await;
 }

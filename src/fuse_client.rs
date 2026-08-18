@@ -4272,6 +4272,18 @@ pub struct Metrics {
     /// class: growth is a latency signal under overlay/publish churn,
     /// never a correctness one.
     pub overlay_window_escalations: Align64<AtomicU64>,
+    /// Rebind-ladder exhaustions on a STRIPE-HOLDING seed fetch
+    /// (`fetch_seed_image` — the item-B deferred RMW base / W2 fold seed;
+    /// every caller holds this block's `BLOCK_FLUSH_LOCKS`) that escalated
+    /// to the CALLER-STRIPE settle arm ((3.5) alone under the caller's
+    /// held (3) — the write path's own extended order) instead of
+    /// surfacing EIO (MW rung 18: the authority assembler's fold exhausted
+    /// 24 rebinds into an fsync-path `FlushExtents` EIO under legal
+    /// (3.5)-only publish churn — the 2026-08-04 starvation class, fold
+    /// face). The `stale_binding_escalations` sibling for the seed
+    /// posture: growth is a latency signal under sustained publish churn,
+    /// never a correctness one.
+    pub seed_settle_escalations: Align64<AtomicU64>,
     /// Single-flight waiters served directly from their cohort's carried
     /// `FillResult` (R1a, docs/design-read-path.md §5.2) — the adoption
     /// signal that waiter correctness is publish-independent. Replaces the
@@ -8871,6 +8883,7 @@ impl SqueezefsFilesystem {
                 "cache_hit_ratio": ratio,
                 "stale_binding_rebinds": METRICS.stale_binding_rebinds.load(Ordering::Relaxed),
                 "stale_binding_escalations": METRICS.stale_binding_escalations.load(Ordering::Relaxed),
+                "seed_settle_escalations": METRICS.seed_settle_escalations.load(Ordering::Relaxed),
                 "overlay_window_escalations": METRICS.overlay_window_escalations.load(Ordering::Relaxed),
                 "singleflight_waiter_result_serves": METRICS.singleflight_waiter_result_serves.load(Ordering::Relaxed),
                 "hot_block_hits": METRICS.hot_block_hits.load(Ordering::Relaxed),
@@ -12133,8 +12146,34 @@ impl SqueezefsFilesystem {
         if let Some(token) = crate::meta_ship::tokens::range_token_covering(ino, start, end) {
             return Ok(token);
         }
-        // 3. The acquire, serialized per ino exactly like the whole-file
-        // slow path (lock order 2 — the lease_locks stripe).
+        // 3. The acquire — riding the POSIX-5 retry ladder exactly like
+        // the whole-file path (MW rung 18; rung-17 findings 5a/5b): a
+        // LOST `DLM_LEASE_WAIT` is a retry, never EIO, for the watchdog
+        // budget. This is what reconciles the §9.3 demotion barrier's
+        // RENEWAL-BOUNDED resolution (the notice rides the incumbent's
+        // next renewal reply — up to TTL/3 ≈ 15 s at the shipped 45 s
+        // membership TTL) with the 5 s per-attempt wait: the attempt
+        // stays bounded, the BUDGET (SQUEEZEFS_TIMEOUT, default 30 s)
+        // covers the barrier's bound, and a holder that never lets go
+        // still fails loud (`lease_retry_exhaustions`).
+        acquire_lease_with_retry(ino, get_fuse_timeout(), |wait| {
+            self.ranged_lease_attempt(ino, start, end, wait)
+        })
+        .await
+    }
+
+    /// One ranged-acquire attempt (the POSIX-5 ladder's closure body):
+    /// serialized per ino exactly like the whole-file slow path (lock
+    /// order 2 — the lease_locks stripe), covering re-probe under the
+    /// lock (a racing attempt may have widened custody past us), then the
+    /// §9.2 required/desired acquire bounded by this attempt's `wait`.
+    async fn ranged_lease_attempt(
+        &self,
+        ino: u64,
+        start: u64,
+        end: u64,
+        wait: Duration,
+    ) -> Result<u64, SqueezefsError> {
         let lock_arc = self.lease_locks.get_lock(ino, 0);
         let start_lease_lock = std::time::Instant::now();
         let _guard = lock_arc.lock().await;
@@ -12160,7 +12199,7 @@ impl SqueezefsFilesystem {
         let start_dlm = std::time::Instant::now();
         let outcome = self
             .dlm
-            .acquire_lock_range(&file_path, (start, end), desired, DLM_LEASE_WAIT, None)
+            .acquire_lock_range(&file_path, (start, end), desired, wait, None)
             .await;
         match outcome {
             Ok(crate::dlm::RangeAcquired::New { lease, .. }) => {
@@ -12357,12 +12396,17 @@ impl SqueezefsFilesystem {
             if let Some(bk) = old_block_key {
                 existing = self
                     .router
-                    // VL8 item 7: NO contention escalation — several
-                    // fetch_seed_image callers hold this very block's
+                    // VL8 item 7: NO contention escalation — EVERY
+                    // fetch_seed_image caller holds this very block's
                     // BLOCK_FLUSH_LOCKS stripe across the seed fetch
                     // (OVERLAY NEVER INVISIBLE); the stripe is not
-                    // reentrant.
-                    .get_block_for_index(file_path, b, Some(&bk), false, false)
+                    // reentrant. MW rung 18 (the s11-subblock fold-settle
+                    // exhaustion): ladder exhaustion on this posture is
+                    // STARVATION under legal (3.5)-only publish churn, so
+                    // it hands off to the caller-stripe settle arm —
+                    // (3.5) alone under the caller's held (3) — instead
+                    // of the fsync-path EIO (`seed_settle_escalations`).
+                    .get_block_for_index_stripe_held(file_path, b, Some(&bk))
                     .await?;
             }
         }

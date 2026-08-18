@@ -8840,9 +8840,37 @@ impl DataRouter {
             resolved_key,
             device_true,
             escalate_contended,
+            false,
             None,
         )
         .await
+    }
+
+    /// [`Self::get_block_for_index`] for the **stripe-holding seed
+    /// posture** (`fetch_seed_image` — the item-B deferred RMW base and
+    /// the W2 fold seed): the caller HOLDS this block's
+    /// `BLOCK_FLUSH_LOCKS` stripe (3), so the ladder must not
+    /// contention-escalate (the stripe is not reentrant) — but its
+    /// exhaustion is STARVATION, not a broken binding, whenever a
+    /// (3.5)-only publisher class (`write_striped` promotions,
+    /// `copy_file_range`, the Lever-B publish conveyor, a concurrent
+    /// assembler publish) legally churns the binding under the held
+    /// stripe. The MW rung-18 conviction (the s11-subblock leg,
+    /// `.benchmarks/2026-08-17-s11-zeros-interleave-fix.md`): the
+    /// authority assembler's fold exhausted 24 rebinds into an fsync-path
+    /// EIO on `FlushExtents`. Exhaustion here hands off to the
+    /// CALLER-STRIPE settle arm
+    /// ([`Self::get_block_for_index_settled_stripe_held`]) — (3.5) alone,
+    /// the caller's held (3) completing the write path's own extended
+    /// order — instead of the loud exhaustion error.
+    pub(crate) async fn get_block_for_index_stripe_held(
+        &self,
+        file_path: &str,
+        b: u32,
+        resolved_key: Option<&str>,
+    ) -> Result<Option<crate::cache::pool::ReadBlockValue>> {
+        self.get_block_for_index_class(file_path, b, resolved_key, false, false, true, None)
+            .await
     }
 
     /// [`Self::get_block_for_index`] with an explicit fill-provenance
@@ -8851,6 +8879,7 @@ impl DataRouter {
     /// ghost escalation (`FillClass::Escalation` — see the class doc):
     /// its fill must await the tier publish it escalated FOR. Crate-only
     /// because [`FillClass`] is crate-only.
+    #[allow(clippy::too_many_arguments)] // one internal funnel; every caller is a named wrapper
     pub(crate) async fn get_block_for_index_class(
         &self,
         file_path: &str,
@@ -8858,8 +8887,15 @@ impl DataRouter {
         resolved_key: Option<&str>,
         device_true: bool,
         escalate_contended: bool,
+        stripe_held_settle: bool,
         fill_class_override: Option<FillClass>,
     ) -> Result<Option<crate::cache::pool::ReadBlockValue>> {
+        debug_assert!(
+            !(escalate_contended && stripe_held_settle),
+            "the two exhaustion postures are mutually exclusive: a caller \
+             either holds this block's stripe (stripe_held_settle) or may \
+             take it (escalate_contended)"
+        );
         // Each retry re-resolves against the freshest map. The ladder is
         // the FIND-RW5-A liveness sequence (the generic/464 dominant EIO
         // face: `fill_valid=false` on an UNCHANGED binding, 8 fast losses
@@ -9032,6 +9068,16 @@ impl DataRouter {
             // acquisition cannot self-deadlock.
             return self.get_block_for_index_settled(file_path, b).await;
         }
+        if stripe_held_settle {
+            // Stripe-holding SEED exhaustion = the same starvation wearing
+            // the fold's clothes (MW rung 18, the s11-subblock FlushExtents
+            // EIO): (3.5)-only publishers legally churn the binding under
+            // the caller's held stripe. Hand off to the caller-stripe
+            // settle arm — (3.5) alone, the caller's (3) already held.
+            return self
+                .get_block_for_index_settled_stripe_held(file_path, b)
+                .await;
+        }
         Err(SqueezefsError::Io(std::io::Error::other(format!(
             "block {b} of {file_path} did not settle after {ladder_cap} binding rebinds"
         ))))
@@ -9115,6 +9161,53 @@ impl DataRouter {
             "block {b} of {file_path} did not settle after {SETTLE_ATTEMPTS} serialized \
              settle attempts (binding/incarnation mutator outside the stripe/merge \
              disciplines — see invariant_tripwires)"
+        ))))
+    }
+
+    /// The CALLER-STRIPE settle arm (MW rung 18 — the assembler
+    /// fold-settle exhaustion, the s11-subblock live finding): the
+    /// stripe-holding-seed twin of [`Self::get_block_for_index_settled`].
+    /// The caller ALREADY HOLDS this block's `BLOCK_FLUSH_LOCKS` (3) —
+    /// the `fetch_seed_image` contract, every caller verified — so this
+    /// arm acquires only `INODE_META_LOCKS` (3.5): the composed pair is
+    /// the write path's own extended order (3) → (3.5), and the
+    /// [`Self::settled_resolve_fetch_locked`] serve proof holds verbatim
+    /// (both custody domains held, the binding cannot legally move, an
+    /// incarnation move is the loud tripwire). Re-taking (3) here would
+    /// self-deadlock — the stripe is not reentrant, which is exactly why
+    /// the ladder's `escalate_contended` arm was unavailable to seed
+    /// fetches and the exhaustion wore an fsync-path EIO. Counted in
+    /// `seed_settle_escalations` (the `stale_binding_escalations` sibling
+    /// for the stripe-held seed posture — a latency signal under legal
+    /// (3.5)-only publish churn, never a correctness one).
+    async fn get_block_for_index_settled_stripe_held(
+        &self,
+        file_path: &str,
+        b: u32,
+    ) -> Result<Option<crate::cache::pool::ReadBlockValue>> {
+        // Retries exist ONLY for the invariant-violation case (no legal
+        // mutator can force a loss under both locks) — small and loud.
+        const SETTLE_ATTEMPTS: usize = 4;
+        let ino = parse_inode_from_path(file_path);
+        METRICS
+            .seed_settle_escalations
+            .fetch_add(1, Ordering::Relaxed);
+        for attempt in 0..SETTLE_ATTEMPTS {
+            if attempt > 0 {
+                squeezefs_ipc::sqz_time::sleep(Duration::from_millis(1u64 << (attempt - 1).min(3)))
+                    .await;
+            }
+            let _map_guard = meta_lock_acquire(ino).await;
+            match self.settled_resolve_fetch_locked(file_path, b).await? {
+                SettledFetchOutcome::Hole => return Ok(None),
+                SettledFetchOutcome::Fetched(val) => return Ok(Some(val)),
+                SettledFetchOutcome::Lost => continue,
+            }
+        }
+        Err(SqueezefsError::Io(std::io::Error::other(format!(
+            "block {b} of {file_path} did not settle after {SETTLE_ATTEMPTS} serialized \
+             stripe-held settle attempts (binding/incarnation mutator outside the \
+             stripe/merge disciplines — see invariant_tripwires)"
         ))))
     }
 
@@ -9352,6 +9445,7 @@ impl DataRouter {
                             resolved_key,
                             false,
                             true,
+                            false,
                             Some(FillClass::Escalation),
                         )
                         .await?;

@@ -598,3 +598,60 @@ async fn sequential_stream_still_converges_by_extension_and_doubling() {
 
     auth.listener.shutdown();
 }
+
+/// **The geometry source's size read** (rung 18 — the Issue-19 class
+/// firing at the SOURCE, convicted live on the MPI-IO row): the
+/// production `router_range_geometry` read the ino's size from the
+/// LAYOUT head — absent on a truncate-created sparse file (the rank-0
+/// create-truncate shape stamps size in the INODE record), so a 10 GiB
+/// shared file answered size 0, the §9.2 span cap floored at
+/// `max(16, ceil(0/block)) = 16`, and the 32-rank row's 17th live span
+/// refused "at capacity" — a CONSTANT refusing the workload S11 exists
+/// for, wearing the floor's clothes. The law: the geometry size is the
+/// MAX of the inode record's size and the layout head's (growth
+/// published in either plane counts; absent-both is honestly 0).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_geometry_source_reads_a_truncate_created_files_size() {
+    let _serial = serial();
+    let _restore = Restore;
+    let h = Arc::new(make(*b"ranged-ladder-05", "ranged-ladder-5").await);
+    let created =
+        h.fs.create(h.req, 1, OsStr::new("rank0-sparse.dat"), libc::S_IFREG | 0o644, 0)
+            .await
+            .unwrap();
+    let ino = created.attr.ino;
+    h.fs.release(h.req, ino, created.fh, 0, 0, false)
+        .await
+        .unwrap();
+    // The rank-0 shape: truncate(2) to the full decomposition size — no
+    // layout exists, the size lives in the inode record.
+    let size = 40 * 4 * 1024 * 1024u64; // 40 blocks
+    h.fs.setattr(
+        h.req,
+        ino,
+        None,
+        fuse3::SetAttr {
+            size: Some(size),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let geometry = squeezefs::multi_writer::router_range_geometry(
+        h.fs.meta_backend.as_ref().unwrap().clone(),
+        h.fs.router.backend_router.clone(),
+    );
+    let (g_size, g_block) = geometry
+        .geometry(ino)
+        .await
+        .expect("the source answers on a live data plane");
+    assert!(g_block > 0, "block size");
+    assert!(
+        g_size >= size,
+        "the geometry size must see the truncate-created inode size \
+         ({size}), got {g_size} — a 0 answer floors the §9.2 span cap at \
+         16 and refuses the 17th stripe of the very decomposition S11 \
+         exists for (the MPI-IO row's live wedge)"
+    );
+}

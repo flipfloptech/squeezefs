@@ -241,13 +241,29 @@ pub fn router_range_geometry(
                     return None;
                 }
                 use crate::meta_backend::Metadata as _;
-                let size = match self.meta.getxattr(ino, "layout").await {
+                // Rung 18 (the MPI-IO row's live wedge — the Issue-19
+                // class at the SOURCE): size is the MAX of the INODE
+                // record's (the truncate/setattr truth — the rank-0
+                // create-truncate shape has no layout at all) and the
+                // layout head's (which can be a CHAINED/indirect head
+                // decode_base_layout cannot read — a 10 GiB shared file
+                // answered 0, the span cap floored at 16, and the
+                // 32-rank decomposition's 17th stripe refused "at
+                // capacity"). Growth published in either plane counts;
+                // absent-both is honestly 0.
+                let inode_size = self
+                    .meta
+                    .getattr(ino)
+                    .await
+                    .map(|rec| rec.size)
+                    .unwrap_or(0);
+                let layout_size = match self.meta.getxattr(ino, "layout").await {
                     Ok(Some(bytes)) => crate::layout_wire::decode_base_layout(&bytes)
                         .map(|l| l.size)
                         .unwrap_or(0),
                     _ => 0,
                 };
-                Some((size, block))
+                Some((inode_size.max(layout_size), block))
             })
         }
     }

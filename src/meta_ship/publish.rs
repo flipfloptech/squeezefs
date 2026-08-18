@@ -2534,10 +2534,20 @@ impl PublishService {
         };
         let mut map = cur.block_map.take().unwrap_or_default();
         let new_map = new.block_map.take().unwrap_or_default();
+        // Rung 18 (the s11-subblock C8/C2 mint): a DEMOTED region is
+        // NOBODY's Put-truth — the authority is the single publisher of a
+        // demoted block (KD-MW-8: every holder ships extents there and
+        // never DMAs, so its RAM map for that block is legitimately
+        // stale). A block overlapping a demoted region keeps its DURABLE
+        // (authority-assembled) entry in both directions: the holder's
+        // stale presence never overwrites it, its absence never removes
+        // it.
+        let demoted = crate::dlm::demoted_regions(ino);
         let in_custody = |b: u32| {
             let bs = u64::from(b) * block;
             let be = bs + block;
             spans.iter().any(|&(s, e)| e > bs && s < be)
+                && !demoted.iter().any(|&(s, e)| e > bs && s < be)
         };
         map.retain(|b, _| !(in_custody(*b) && !new_map.contains_key(b)));
         for (b, k) in new_map {

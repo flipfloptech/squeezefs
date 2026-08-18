@@ -607,6 +607,9 @@ pub fn adopt_demoted_region(ino: u64, region: (u64, u64)) -> bool {
 
 /// The live demoted regions on `ino` (the grant reply carries them so an
 /// adopting co-writer marks its local table before its first write).
+/// Since rung 18 also the custody-scoped Put's EXCLUSION input: inside a
+/// demoted region the AUTHORITY is the single publisher (KD-MW-8), so no
+/// holder's Put is truth there.
 pub fn demoted_regions(ino: u64) -> Vec<(u64, u64)> {
     LOCK_MAP
         .read_sync(&ObjectKey::Ino(ino), |_, custody| custody.demoted_regions())

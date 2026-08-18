@@ -2147,3 +2147,88 @@ async fn the_production_range_geometry_arms_the_scoped_put() {
     shutdown(&owner_be).await;
     shutdown(&client_be).await;
 }
+
+// ===========================================================================
+// Rung 18: the kernel-coalesced oversized extent ships CHUNKED
+// ===========================================================================
+
+/// Contract (CONVICTED LIVE on the s11-subblock leg, 2026-08-18): a
+/// BUFFERED writer's 4 KiB records coalesce in the page cache and arrive
+/// as ONE 1 MiB FUSE WRITE (`max_write`) — a legal, ordinary shape — and
+/// the extent-ship of that slice built a 1,048,633 B publish frame, which
+/// the cluster wire's CONTROL class cap (1 MiB) refused: the app saw
+/// EINVAL on a healthy fleet ("S9 publish write_extent of 1048633 B
+/// exceeds the cluster wire's CONTROL class cap").
+///
+/// The law: [`extent_ship::ship_extent`] CHUNKS a payload larger than the
+/// wire's admissible envelope into byte-adjacent sub-extents, each its own
+/// witnessed frame (own `request_id`, own retention record — retention
+/// granularity == wire granularity, so every coverage-release path keeps
+/// its meaning), and the assembler's merged image is byte-exact across
+/// the chunk boundary. The wire cap itself stays (a loud guard against
+/// any OTHER oversized frame class).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_extent_larger_than_the_wire_cap_ships_chunked_and_assembles_exact() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let (owner_be, _p) = sandbox(dir.path(), "own-chunk", true).await;
+    let (client_be, _p2) = sandbox(dir.path(), "cli-chunk", false).await;
+    let auth = start_authority(Arc::clone(&owner_be), "assembler-authority");
+    let (_client, _pc) = arm_client(&auth, &client_be).await;
+    let ino = shipped_create(&client_be, "chunked.bin").await;
+
+    let asm = Arc::new(MockAssembler::default());
+    asm.install();
+
+    // 1 MiB + 8 KiB: strictly larger than the control frame cap, so the
+    // pre-fix single-frame ship REFUSES (the live EINVAL signature).
+    let len = 1024 * 1024 + 8192;
+    let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+    let s0 = extent_stats();
+    extent_ship::ship_extent(
+        &client_be,
+        ino,
+        0,
+        4096,
+        bytes::Bytes::from(data.clone()),
+        0,
+    )
+    .await
+    .unwrap_or_else(|e| {
+        panic!(
+            "a kernel-coalesced slice larger than the wire cap must ship \
+             CHUNKED, never refuse (the s11-subblock live EINVAL): {e:?}"
+        )
+    });
+    let s1 = extent_stats();
+    assert!(
+        s1.extent_shipped - s0.extent_shipped >= 2,
+        "an over-cap payload is at least two witnessed frames (shipped d={})",
+        s1.extent_shipped - s0.extent_shipped
+    );
+    assert_eq!(
+        s1.extent_served - s0.extent_served,
+        s1.extent_shipped - s0.extent_shipped,
+        "shipped ≡ served (the engagement law holds per chunk)"
+    );
+
+    // Byte-exact assembly across the chunk boundary.
+    let images = asm.images.lock();
+    let img = images
+        .get(&(ino, 0))
+        .expect("the assembler holds block 0's image");
+    assert!(
+        img.len() >= 4096 + len,
+        "the merged image covers the whole span"
+    );
+    assert_eq!(
+        &img[4096..4096 + len],
+        &data[..],
+        "the assembled bytes are exact across the chunk boundary"
+    );
+
+    auth.listener.shutdown();
+    shutdown(&owner_be).await;
+    shutdown(&client_be).await;
+}

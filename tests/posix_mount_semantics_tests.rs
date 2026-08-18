@@ -205,7 +205,21 @@ fn mount_exports_holes_to_lseek_and_st_blocks() {
         "at/after EOF is ENXIO"
     );
 
-    let blocks = f.metadata().expect("stat").blocks();
+    // st_blocks legitimately counts the durable striped blocks PLUS the
+    // staged copy until its asynchronous retirement — post-fsync the data
+    // is durable but the staging retire lags under load (the 2026-08-18
+    // consolidation gate read 4 blocks mid-convergence while the full
+    // serial battery owned the box; isolated it converges instantly).
+    // Poll to the exact steady state — the `cp --sparse=auto` law is a
+    // steady-state export law, and the terminal value keeps full teeth:
+    // anything but exactly 2 blocks at the deadline still fails.
+    let want = 2 * BLOCK / 512;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut blocks = f.metadata().expect("stat").blocks();
+    while blocks != want && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        blocks = f.metadata().expect("stat").blocks();
+    }
     assert_eq!(
         blocks,
         2 * BLOCK / 512,

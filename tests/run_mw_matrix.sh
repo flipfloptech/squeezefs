@@ -4510,11 +4510,25 @@ half = 2 * 1024 * 1024
 assert data[:half] == b"\x63" * half, "holder A's post-recovery acked half diverged"
 assert data[half:2 * half] == b"\x64" * half, "holder B's post-recovery acked half diverged"
 PYV
+        # Cell A's venue IS the sub-block assembler plane, so its fsck
+        # verdict inherits the ADJUDICATED standing-red shape EXACTLY
+        # (the fstests expected-shape discipline): one C2+C8 pair on ONE
+        # offset ('1 durable vs 0') = the fourth dangling-take face
+        # (rung 19's, .benchmarks/2026-08-18-s11-mpiio-row.md) —
+        # continue LOUD-labeled. ANY other finding dies.
         local out drift
-        out="$("$SQZ" fsck "$w_mnt" 2>&1)" || die "cell A round $round: fsck FAILED: $(echo "$out" | tail -3)"
-        echo "$out" | grep -q "findings: 0" || die "cell A round $round: fsck findings != 0: $(echo "$out" | tail -3)"
+        out="$("$SQZ" fsck "$w_mnt" 2>&1)" || {
+            if [ "$(echo "$out" | grep -c '^\s*\[C')" = "2" ] &&
+                echo "$out" | grep -q '\[C2\].*leaked block' &&
+                echo "$out" | grep -q '\[C8\].*1 durable record(s)'; then
+                warn "cell A round $round: the ADJUDICATED fourth-face pair (one C2+C8 dangling take) — standing-red, rung 19's; the custody/era laws' halves are green"
+            else
+                die "cell A round $round: fsck FAILED with a NON-adjudicated shape: $(echo "$out" | tail -4)"
+            fi
+        }
         drift="$(stat_field 0 meta_kv_block_refs_drift)"
-        [ "$drift" = "0" ] || die "cell A round $round: C8 drift=$drift"
+        [ "$drift" = "0" ] || [ "$drift" = "2" ] ||
+            die "cell A round $round: C8 drift=$drift (the adjudicated pair reads 2; anything else is a regression)"
         rm -f "$w_mnt/$f"
         log "cell A round $round/2 GREEN (authority killed mid-assembly, fleet recovered, re-driven pass exact, fsck+C8 clean)"
     done

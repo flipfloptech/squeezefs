@@ -93,7 +93,7 @@ for attempt in 1 2 3; do
   for f in /sys/class/nvme/nvme*/subsysnqn; do
     [ -e "$f" ] || continue
     nqn=$(cat "$f")
-    case "$nqn" in "$NQN_PREFIX"*) "$SQZ" nvmeof disconnect --subnqn "$nqn" 2>&1 | sed 's/^/    /' || true;; esac
+    case "$nqn" in "$NQN_PREFIX"*) "$SQZ" nvmeof disconnect "$nqn" 2>&1 | sed 's/^/    /' || true;; esac
   done
   gone=1
   for _ in $(seq 1 15); do

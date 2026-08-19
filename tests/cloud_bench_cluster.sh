@@ -840,7 +840,8 @@ sleep 1
 for c in /sys/class/nvme/nvme*/subsysnqn; do
   [ -e "$c" ] || continue
   nqn=$(cat "$c")
-  case "$nqn" in "$NQN_PREFIX"*) "$SQZ" nvmeof disconnect --subnqn "$nqn" || true ;; esac
+  # (`nvmeof disconnect` takes the SUBNQN positionally — the v4 recipe's note.)
+  case "$nqn" in "$NQN_PREFIX"*) "$SQZ" nvmeof disconnect "$nqn" || true ;; esac
 done
 gone=0
 for _ in $(seq 1 15); do

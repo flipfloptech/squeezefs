@@ -384,10 +384,10 @@
 #                       phase self-sized by a probe pass to a sustained
 #                       >=60 s window of >=3 iterations (flatness gated:
 #                       first-vs-last steady iteration within 30%); the
-#                       shared file is EXPLICITLY capped at 5,120 MiB —
-#                       inside the inline-map domain (~6 GiB at 4 MiB
-#                       blocks; the indirect spill is rung 20 residual
-#                       #1's fail-safe refusal, never a row). Runs over
+#                       shared file is capped at 10,240 MiB — the zram
+#                       substrate budget, NOT a correctness boundary:
+#                       the indirect domain composes (rung 20 residual
+#                       #1's blob-aware owner-side merge). Runs over
 #                       the mwfleet MEMBERS table, or over LIVE external
 #                       mounts via SQZ_MWMATRIX_MOUNTS (the FIELD venue —
 #                       see the EXTERNAL-MOUNTS MODE note below).
@@ -4027,16 +4027,15 @@ leg_s11_mpiio() {
         log "range-custody conviction: every co-writer's ranged ledger moved across the probe pass"
     fi
     # Target ~22 s per iteration, >=3 steady iterations after the allocation
-    # pass. THE FILE CAP IS THE INLINE-MAP BOUNDARY, explicit and honest:
-    # past ~6 GiB at 4 MiB blocks the shared file's composed map spills
-    # `indirect:`, and concurrent chained publishes onto an indirect head
-    # REFUSE loud-and-fail-safe (retried-class fsync EIO — fix 4 + rung-20
-    # residual #1, .benchmarks/2026-08-18-s11-widthn-refs-fix.md). 5,120 MiB
-    # is the PROVEN verdict sizing with margin under the boundary; a fast
-    # fabric (the 200GbE field probe) self-sizes INTO the cap instead of
-    # into the refusal. The pre-cap 10 GiB zram-budget clamp is retired —
-    # it sat past the boundary and turned fast probes into surprise EIO.
-    local inline_cap_mb=5120
+    # pass. The file cap is the 10 GiB zram-budget clamp, RESTORED: the
+    # ~6 GiB inline-map boundary (past which the shared file's composed map
+    # spills `indirect:`) is no longer a refusal wall — the blob-aware
+    # owner-side merge (rung 20 residual #1) rehydrates the blob and
+    # COMPOSES chained/scoped publishes onto the full map, so a fast fabric
+    # (the 200GbE field probe) self-sizing into the indirect domain is now
+    # a covered row, not surprise fsync EIO (the retired fail-safe:
+    # .benchmarks/2026-08-18-s11-widthn-refs-fix.md fix 4).
+    local inline_cap_mb=10240
     local s_row n_iter s_capped
     read -r s_row s_capped <<<"$(python3 -c "
 bw=$bw_probe; r=$ranks
@@ -4044,8 +4043,6 @@ s=int(bw*22/(r*4))
 cap=int($inline_cap_mb/(r*4))
 print(max(8, min(s, cap)), 1 if s > cap else 0)")"
     local row_mb=$((ranks * 4 * s_row))
-    [ "$row_mb" -le "$inline_cap_mb" ] ||
-        die "s11-mpiio: $ranks ranks x 4 MiB x 8 segments (the sizing floor) = ${row_mb} MiB exceeds the ${inline_cap_mb} MiB inline-map cap — reduce --procs or the mount count (the indirect-map width-N composition is rung 20 residual #1)"
     # Iteration count: ~70 s of steady window. When the inline-map cap binds
     # (fast fabrics), per-iteration wall shrinks — allow up to 128 iterations
     # to keep the >=60 s window instead of silently shipping a short row.
@@ -4057,11 +4054,11 @@ wall=r*4*s/max(bw,1)
 import math
 print(max(4, min($iter_ceil, math.ceil(70/max(wall,0.1))+1)))")"
     if [ "$s_capped" = "1" ]; then
-        log "self-sizer wanted $(python3 -c "print(int($bw_probe*22/($ranks*4))*$ranks*4)") MiB — CAPPED to ${row_mb} MiB (s=$s_row): the shared file stays inside the inline-map domain (~6 GiB at 4 MiB blocks; the indirect spill is a fail-safe refusal until the rung-20 blob-aware composition lands). Iteration ceiling raised to $iter_ceil to preserve the sustained window."
+        log "self-sizer wanted $(python3 -c "print(int($bw_probe*22/($ranks*4))*$ranks*4)") MiB — CAPPED to ${row_mb} MiB (s=$s_row): the 10 GiB zram-budget clamp (the indirect domain COMPOSES now — the rung-20 blob-aware owner-side merge; this cap is substrate budget, not a correctness boundary). Iteration ceiling raised to $iter_ceil to preserve the sustained window."
         local est_window
         est_window="$(python3 -c "print(int($n_iter*$ranks*4*$s_row/max($bw_probe,1)))")"
         [ "$est_window" -ge 60 ] ||
-            warn "sustained window ~${est_window}s < 60s at the probed rate — bounded by the inline-map cap (rung-20 residual #1); the row is LABELED by its own iteration table, read it with that bound in mind"
+            warn "sustained window ~${est_window}s < 60s at the probed rate — bounded by the 10 GiB zram-budget cap; the row is LABELED by its own iteration table, read it with that bound in mind"
     fi
     log "probe: $bw_probe MiB/s aggregate -> file ${row_mb} MiB (s=$s_row), $n_iter iterations/phase (sustained window sized >=60 s + >=3 steady iterations)"
     truncate -s "$((row_mb * 1024 * 1024))" "$w_mnt/s11-mpiio.dat"
@@ -4220,11 +4217,11 @@ RETIRED at rung 19: the authority computes displaced/inserted INSIDE the
 chained merge / scoped Put, node compaction preserves the version lineage a
 live link claims, and the accounting owner is the GLOBAL ino
 (.benchmarks/2026-08-18-s11-widthn-refs-fix.md). ANY C8 drift here is a
-REGRESSION of that composition — with ONE named exception: a shared file
-whose composed map exceeds the inline cap (~6 GiB at 4 MiB blocks) spills
-indirect, and concurrent publishes onto the indirect head REFUSE loud
-(retried-class fsync EIO, never drift) until the blob-aware composition
-lands (rung 20 residual #1)."
+REGRESSION of that composition — INCLUDING the indirect domain: past the
+inline cap (~6 GiB at 4 MiB blocks) the composed map spills indirect and
+the blob-aware owner-side merge (rung 20 residual #1, landed) rehydrates
+the blob and composes chained/scoped publishes onto the full map, so a
+refusal or drift there is a regression too."
     if [ "$EXT_MODE" = "1" ]; then
         log "s11-mpiio GREEN${provisional:+ [$provisional]} — the MPI-IO acceptance row over EXTERNAL mounts (outputs + snapshots + fsck in $rowdir). Evidence tier: the HARNESS's venue states it (real-fabric field rows are a different tier from the local fleet's measured-simulated ones — docs/rc-manifest.md); oracle: warm-authority"
     else
@@ -4357,11 +4354,11 @@ RETIRED at rung 19: the authority computes displaced/inserted INSIDE the
 chained merge / scoped Put, node compaction preserves the version lineage a
 live link claims, and the accounting owner is the GLOBAL ino
 (.benchmarks/2026-08-18-s11-widthn-refs-fix.md). ANY C8 drift here is a
-REGRESSION of that composition — with ONE named exception: a shared file
-whose composed map exceeds the inline cap (~6 GiB at 4 MiB blocks) spills
-indirect, and concurrent publishes onto the indirect head REFUSE loud
-(retried-class fsync EIO, never drift) until the blob-aware composition
-lands (rung 20 residual #1)."
+REGRESSION of that composition — INCLUDING the indirect domain: past the
+inline cap (~6 GiB at 4 MiB blocks) the composed map spills indirect and
+the blob-aware owner-side merge (rung 20 residual #1, landed) rehydrates
+the blob and composes chained/scoped publishes onto the full map, so a
+refusal or drift there is a regression too."
     log "s11-blockcyclic GREEN — the Issue-19 shape adjudicated live (outputs in $rowdir). Evidence tier: measured-simulated (one box, co-located members)"
 }
 

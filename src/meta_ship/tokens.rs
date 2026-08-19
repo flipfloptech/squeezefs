@@ -229,7 +229,9 @@ pub fn token_cache_stats() -> TokenCacheStats {
         evictions: EVICTIONS.load(Ordering::Relaxed),
         grants: GRANTS.load(Ordering::Relaxed),
         entries,
-        bytes: entries * ENTRY_BYTES + range_spans * RANGE_SPAN_BYTES,
+        bytes: entries * ENTRY_BYTES
+            + range_spans * RANGE_SPAN_BYTES
+            + STRETCH_CEILINGS.len() as u64 * STRETCH_CEILING_BYTES,
         range_spans,
         cap_entries: cache_cap() as u64,
         owner_term: owner_term(),
@@ -272,11 +274,18 @@ const RANGE_SPAN_BYTES: u64 = 48;
 /// One cached range grant: the span and the token the grant carries
 /// (mode is EX by KD-MW-9's v1 issuance law — a mode field would be a
 /// constant).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 struct RangeSpan {
     start: u64,
     end: u64,
     token: u64,
+    /// §9.3a: the max byte end this client has been SERVED write custody
+    /// for through this grant — the written high-water the tail-shrink
+    /// ack answers. `fetch_max`ed at every covering serve and acquire
+    /// outcome (before the write proceeds), lock-free per the hot-path
+    /// law, so a shrink that reads it AFTER narrowing the span (under the
+    /// same entry serialization) can never miss a served write.
+    written: AtomicU64,
 }
 
 /// Per-ino live range grants, small and sorted-by-start (the population
@@ -286,6 +295,35 @@ static RANGE_CACHE: Lazy<scc::HashMap<u64, Vec<RangeSpan>>> = Lazy::new(scc::Has
 /// Cached range spans across all inos (the `dlm_token_cache_bytes` range
 /// extension's gauge word).
 static RANGE_SPANS: AtomicU64 = AtomicU64::new(0);
+
+/// §9.3a: one learned **stretch ceiling** — what a tail-shrink notice
+/// taught this client about the ino's contention neighborhood.
+#[derive(Debug, Clone, Copy)]
+struct StretchCeiling {
+    /// The shrink's floor (an absolute boundary a peer claimed past) —
+    /// a later grant covering at-or-beyond it proves the peer released
+    /// and clears the ceiling.
+    floor: u64,
+    /// The stretch LENGTH that survived beyond this client's written
+    /// frontier at notice time (`floor − watermark`, saturating). The
+    /// clamp law caps future sequential doublings at this length beyond
+    /// the ask's own aligned end — 0 on an exact-boundary shrink, i.e.
+    /// "stop doubling on this ino": the honest posture for a
+    /// block-cyclic interleave, whose EVERY stretch crosses a peer run.
+    stretch_len: u64,
+}
+
+/// §9.3a: per-ino learned stretch ceilings. Bounded by the live-granted
+/// ino population: pruned at every renewal rebuild (an ino with no live
+/// grant left has ended its custody episode), cleared by a covering
+/// grant past the floor, and dropped whole with the cache (lease loss /
+/// the R5 shed).
+static STRETCH_CEILINGS: Lazy<scc::HashMap<u64, StretchCeiling>> = Lazy::new(scc::HashMap::new);
+
+/// Bytes charged per learned ceiling in the `dlm_token_cache_bytes`
+/// gauge (key + two words, scc slot amortized — the RANGE_SPAN_BYTES
+/// estimate's shape).
+const STRETCH_CEILING_BYTES: u64 = 24;
 
 /// Record (or WIDEN — same token, wider span: the admit-time merge's
 /// client face) a granted range.
@@ -301,6 +339,7 @@ pub fn record_range_grant(ino: u64, span: (u64, u64), token: u64) {
                 start: span.0,
                 end: span.1,
                 token,
+                written: AtomicU64::new(0),
             });
             spans.sort_unstable_by_key(|s| s.start);
             added = 1;
@@ -317,12 +356,27 @@ pub fn record_range_grant(ino: u64, span: (u64, u64), token: u64) {
     if added > 0 {
         RANGE_SPANS.fetch_add(added as u64, Ordering::Relaxed);
     }
+    // §9.3a: a grant covering ACROSS a learned ceiling's floor proves the
+    // peer released the boundary itself — the ceiling clears (the world
+    // changed; the next shrink, if any, re-teaches). A disjoint grant
+    // merely BEYOND the floor proves nothing: the block-cyclic shape
+    // grants a new stripe past the floor every stride while the peer
+    // still holds the boundary.
+    let _ = STRETCH_CEILINGS.remove_if_sync(&ino, |c| span.0 <= c.floor && span.1 > c.floor);
 }
 
 /// The covering probe: the token of a live cached grant covering
 /// `[start, end)` whole, or `None` (the caller acquires). This is the
 /// §6.5-item-1 mechanism for range writers — subsequent writes inside a
 /// granted stripe pay one lock-free read, no round trip.
+///
+/// The probe IS the write path's custody serve (both call sites are the
+/// ranged write lease), so a hit also `fetch_max`es the grant's written
+/// high-water to `end` (§9.3a): the mark lands BEFORE the token is
+/// answered, so a tail-shrink that later narrows this span under the same
+/// entry serialization always observes every serve that beat it. A future
+/// read-side consumer of covering probes must split off a mark-free
+/// variant rather than reuse this one.
 pub fn range_token_covering(ino: u64, start: u64, end: u64) -> Option<u64> {
     if start >= end {
         return None;
@@ -332,9 +386,75 @@ pub fn range_token_covering(ino: u64, start: u64, end: u64) -> Option<u64> {
             spans
                 .iter()
                 .find(|s| s.start <= start && s.end >= end)
-                .map(|s| s.token)
+                .map(|s| {
+                    s.written.fetch_max(end, Ordering::Relaxed);
+                    s.token
+                })
         })
         .flatten()
+}
+
+/// §9.3a: record that this client was served write custody up to `upto`
+/// through the grant carrying `token` — the acquire-outcome face of the
+/// covering probe's mark (a write whose custody arrived as a fresh
+/// New/Extended/Covered wire answer never passed the probe).
+pub fn note_range_write(ino: u64, token: u64, upto: u64) {
+    let _ = RANGE_CACHE.read_sync(&ino, |_, spans| {
+        if let Some(s) = spans.iter().find(|s| s.token == token) {
+            s.written.fetch_max(upto, Ordering::Relaxed);
+        }
+    });
+}
+
+/// §9.3a: the client half of a tail shrink — narrow the cached span
+/// carrying `token` to end at `floor` (the covering cache stops serving
+/// the released tail), then answer the grant's written high-water, read
+/// AFTER the narrow under the same entry serialization (any serve that
+/// beat the shrink is visible in the mark, so the ack can never
+/// under-report a served write). `None` ⇔ no cached entry (an R5 shed
+/// dropped it): the honest answer is "unknown", and the caller acks
+/// `u64::MAX` so the authority escalates instead of releasing.
+pub fn shrink_range_grant(ino: u64, token: u64, floor: u64) -> Option<u64> {
+    RANGE_CACHE
+        .update_sync(&ino, |_, spans| {
+            spans.iter_mut().find(|s| s.token == token).map(|s| {
+                if floor > s.start && floor < s.end {
+                    s.end = floor;
+                }
+                s.written.load(Ordering::Relaxed)
+            })
+        })
+        .flatten()
+}
+
+/// §9.3a: learn a stretch ceiling from a shrink notice — the surviving
+/// stretch length beyond this client's written frontier
+/// (`floor − watermark`, saturating; an unknown watermark learns 0, the
+/// stop-doubling posture). The clamp consumer is
+/// [`stretch_ceiling`]; the lifecycle is the range cache's (pruned at
+/// renewal rebuilds, cleared by a covering grant past the floor).
+pub fn note_stretch_ceiling(ino: u64, floor: u64, watermark: u64) {
+    let ceiling = StretchCeiling {
+        floor,
+        stretch_len: floor.saturating_sub(watermark),
+    };
+    match STRETCH_CEILINGS.entry_sync(ino) {
+        scc::hash_map::Entry::Occupied(mut occ) => {
+            let c = occ.get_mut();
+            // Repeat lessons converge on the tighter posture.
+            c.floor = c.floor.max(ceiling.floor);
+            c.stretch_len = c.stretch_len.min(ceiling.stretch_len);
+        }
+        scc::hash_map::Entry::Vacant(vac) => {
+            let _ = vac.insert_entry(ceiling);
+        }
+    }
+}
+
+/// §9.3a: the learned stretch-length cap for `ino`, or `None` (no shrink
+/// has taught this ino anything — stretch freely).
+pub fn stretch_ceiling(ino: u64) -> Option<u64> {
+    STRETCH_CEILINGS.read_sync(&ino, |_, c| c.stretch_len)
 }
 
 /// Is `token` a STILL-LIVE cached range grant of `ino` (rung 18)? The
@@ -386,23 +506,41 @@ pub fn range_span_abutting(ino: u64, start: u64, end: u64) -> Option<(u64, u64)>
 }
 
 /// Retire one grant from the cache (release / grant-level revocation).
+/// An ino whose LAST span leaves has ended its custody episode — its
+/// learned stretch ceiling (§9.3a) retires with it.
 pub fn retire_range_grant(ino: u64, token: u64) {
     let mut removed = 0u64;
+    let mut episode_over = false;
     let _ = RANGE_CACHE.remove_if_sync(&ino, |spans| {
         let before = spans.len();
         spans.retain(|s| s.token != token);
         removed = (before - spans.len()) as u64;
-        spans.is_empty()
+        episode_over = spans.is_empty();
+        episode_over
     });
     if removed > 0 {
         RANGE_SPANS.fetch_sub(removed, Ordering::Relaxed);
+    }
+    if episode_over {
+        let _ = STRETCH_CEILINGS.remove_sync(&ino);
     }
 }
 
 /// Drop EVERY cached range grant — the lease-loss path (a client whose
 /// custody lease died holds no range custody at all: a dead grant serving
-/// a covering probe would be the one wrong answer available here).
+/// a covering probe would be the one wrong answer available here). The
+/// learned stretch ceilings (§9.3a) drop with it — a fresh epoch
+/// re-learns from its own shrinks.
 pub fn clear_range_grants() {
+    clear_range_spans();
+    STRETCH_CEILINGS.retain_sync(|_, _| false);
+}
+
+/// The span half of [`clear_range_grants`] — the renewal rebuild's clear,
+/// which must NOT drop the learned ceilings (§9.3a: a ceiling survives
+/// while its ino's custody episode is live; the rebuild prunes the dead
+/// ones itself).
+fn clear_range_spans() {
     let mut removed = 0u64;
     RANGE_CACHE.retain_sync(|_, spans| {
         removed += spans.len() as u64;
@@ -419,11 +557,34 @@ pub fn clear_range_grants() {
 /// live range grants, so it is authoritative for presence AND absence
 /// (a released/revoked grant leaves the cache at the next renewal even
 /// if the local retire was lost).
+///
+/// §9.3a: the written high-waters survive the rebuild — they are CLIENT
+/// knowledge the authority's vector cannot carry, and losing them across
+/// a renewal would let a tail-shrink ack under-report served writes (the
+/// order-is-load-bearing law's other face). The learned stretch ceilings
+/// are pruned to the inos the vector still names: an ino with no live
+/// grant has ended its custody episode.
 pub fn replace_range_grants(entries: &[(u64, (u64, u64), u64)]) {
-    clear_range_grants();
+    let mut marks: Vec<(u64, u64, u64)> = Vec::new();
+    RANGE_CACHE.iter_sync(|ino, spans| {
+        for s in spans {
+            let w = s.written.load(Ordering::Relaxed);
+            if w > 0 {
+                marks.push((*ino, s.token, w));
+            }
+        }
+        true
+    });
+    clear_range_spans();
     for (ino, span, token) in entries {
         record_range_grant(*ino, *span, *token);
     }
+    for (ino, token, w) in marks {
+        // No-op where the vector no longer names the grant (the retired
+        // custody carries no obligations).
+        note_range_write(ino, token, w);
+    }
+    STRETCH_CEILINGS.retain_sync(|ino, _| RANGE_CACHE.read_sync(ino, |_, _| ()).is_some());
 }
 
 /// **Test seam**: drop the range cache, so a suite can exercise the cold
@@ -447,6 +608,7 @@ pub fn ensure_token_cache_r5() {
             std::sync::Arc::new(|| {
                 CACHE.len() as u64 * ENTRY_BYTES
                     + RANGE_SPANS.load(Ordering::Relaxed) * RANGE_SPAN_BYTES
+                    + STRETCH_CEILINGS.len() as u64 * STRETCH_CEILING_BYTES
             }),
             std::sync::Arc::new(|_| {
                 CACHE.retain_sync(|_, _| false);

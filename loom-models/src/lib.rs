@@ -5675,6 +5675,9 @@ mod range_custody_models {
             owner_nonce: scope,
             token,
             mode: LockMode::Exclusive,
+            // §9.3a's identity case: the models' asks carry no desired
+            // stretch, so the whole span is the required union.
+            required: span,
         }
     }
 

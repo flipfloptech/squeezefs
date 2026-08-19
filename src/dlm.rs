@@ -46,7 +46,7 @@ use xxhash_rust::xxh3::xxh3_64;
 // obligation, KD-MW-10; `#[path]`-included by `loom-models`). This module
 // keeps the POLICY: the lock table, the mint, the waiter protocol, the
 // R5 byte-budget ceiling and the geometry cap enforcement.
-pub use crate::range_custody_core::{block_align_out, range_span_cap, LockMode};
+pub use crate::range_custody_core::{block_align_out, range_span_cap, LockMode, ShrinkResolution};
 
 /// Typed lock/fencing object key — the **file identity**.
 ///
@@ -231,6 +231,13 @@ pub fn adopt_remote_grant(
         owner_nonce: client_nonce,
         token,
         mode,
+        // §9.3a: an adopted record repeats the AUTHORITY's decision — the
+        // client's table never arbitrates a shrink, so span-as-required
+        // is the honest identity here (no local tail exists).
+        required: (
+            span.map(|(s, _)| s).unwrap_or(0),
+            span.map(|(_, e)| e).unwrap_or(u64::MAX),
+        ),
     };
     grant_floor(&key).fetch_max(token, Ordering::AcqRel);
     let mut conflicted = false;
@@ -363,6 +370,22 @@ static RANGE_DEMOTION_FENCE_RESOLVES: AtomicU64 = AtomicU64::new(0);
 static RANGE_DEMOTION_FENCED_PUBLISHES: AtomicU64 = AtomicU64::new(0);
 static RANGE_DEMOTION_WAIT: Lazy<crate::fuse_client::LatencyHistogram> =
     Lazy::new(crate::fuse_client::LatencyHistogram::default);
+// §9.3a — the tail-shrink family (residual board item 7's fix). The CLOSED
+// LEDGER LAW is `tail_shrinks ≡ tail_shrink_acks + tail_shrink_fence_resolves`
+// on EVERY posture (healthy fleet: fence_resolves == 0; kill rows close
+// through the fence column — the demotion ledger's law verbatim), and
+// `shrink_demotions` is the expected-≈0-on-disjoint-workloads escalation
+// gauge: a shrink that resolved [`ShrinkResolution::Demoted`] because the
+// incumbent HAD written into the contested tail — sticky demotion's only
+// remaining fabrication-adjacent path. `stretch_ceiling_clamps` is the
+// CLIENT half: sequential-doubling stretches clamped by a learned ceiling
+// (a prior shrink on the ino), the counter that says the repeat-collision
+// amplification is being prevented at the source.
+static RANGE_TAIL_SHRINKS: AtomicU64 = AtomicU64::new(0);
+static RANGE_TAIL_SHRINK_ACKS: AtomicU64 = AtomicU64::new(0);
+static RANGE_TAIL_SHRINK_FENCE_RESOLVES: AtomicU64 = AtomicU64::new(0);
+static RANGE_SHRINK_DEMOTIONS: AtomicU64 = AtomicU64::new(0);
+static RANGE_STRETCH_CEILING_CLAMPS: AtomicU64 = AtomicU64::new(0);
 
 /// A grant record became live (any admit site — issue or adoption).
 fn note_record_admitted(span: Option<(u64, u64)>) {
@@ -504,6 +527,29 @@ pub struct RangeCustodyStats {
     /// The loser-law tripwire (≈ 0): a version-gate-fenced direct
     /// publish observed on a demoted block — the crash-window path.
     pub demotion_fenced_publishes: u64,
+    /// §9.3a shrink episodes MARKED (a foreign REQUIRED overlapping ONLY
+    /// a grant's desired-minted stretch tail parked behind the shrink
+    /// barrier instead of fabricating a demotion) — the fix's engagement
+    /// gauge. Closed ledger: `tail_shrinks ≡ acks + fence_resolves`.
+    pub tail_shrinks: u64,
+    /// Shrinks resolved by the incumbent's ACK (renewal-carried notice →
+    /// cache shrink → watermark answer) — the clean path, whichever
+    /// resolution the watermark selected.
+    pub tail_shrink_acks: u64,
+    /// Shrinks resolved by the incumbent's grant DEATH (release /
+    /// revocation / lease expiry) — the fence column; 0 on a healthy
+    /// fleet.
+    pub tail_shrink_fence_resolves: u64,
+    /// Shrinks whose ack ESCALATED to the honest demotion barrier because
+    /// the incumbent HAD written into the contested tail
+    /// ([`ShrinkResolution::Demoted`]) — expected ≈ 0 on disjoint
+    /// workloads; sticky demotion's only remaining fabrication-adjacent
+    /// path.
+    pub shrink_demotions: u64,
+    /// CLIENT side: sequential-doubling stretches clamped by a learned
+    /// ceiling (a prior shrink on the ino) — the repeat-collision
+    /// prevention engaging.
+    pub stretch_ceiling_clamps: u64,
 }
 
 /// Read the process's range-custody ledger.
@@ -522,6 +568,11 @@ pub fn range_custody_stats() -> RangeCustodyStats {
         demotion_acks: RANGE_DEMOTION_ACKS.load(Ordering::Relaxed),
         demotion_fence_resolves: RANGE_DEMOTION_FENCE_RESOLVES.load(Ordering::Relaxed),
         demotion_fenced_publishes: RANGE_DEMOTION_FENCED_PUBLISHES.load(Ordering::Relaxed),
+        tail_shrinks: RANGE_TAIL_SHRINKS.load(Ordering::Relaxed),
+        tail_shrink_acks: RANGE_TAIL_SHRINK_ACKS.load(Ordering::Relaxed),
+        tail_shrink_fence_resolves: RANGE_TAIL_SHRINK_FENCE_RESOLVES.load(Ordering::Relaxed),
+        shrink_demotions: RANGE_SHRINK_DEMOTIONS.load(Ordering::Relaxed),
+        stretch_ceiling_clamps: RANGE_STRETCH_CEILING_CLAMPS.load(Ordering::Relaxed),
     }
 }
 
@@ -544,6 +595,11 @@ pub fn range_custody_stats_json() -> serde_json::Value {
         "range_custody_demotion_acks": s.demotion_acks,
         "range_custody_demotion_fence_resolves": s.demotion_fence_resolves,
         "range_custody_demotion_fenced_publishes": s.demotion_fenced_publishes,
+        "range_custody_tail_shrinks": s.tail_shrinks,
+        "range_custody_tail_shrink_acks": s.tail_shrink_acks,
+        "range_custody_tail_shrink_fence_resolves": s.tail_shrink_fence_resolves,
+        "range_custody_shrink_demotions": s.shrink_demotions,
+        "range_custody_stretch_ceiling_clamps": s.stretch_ceiling_clamps,
         "range_custody_demotion_wait_ns": RANGE_DEMOTION_WAIT.to_json(),
         "dlm_grant_table_bytes": grant_table_bytes(),
         "dlm_grant_table_budget_bytes": range_table_budget_bytes(),
@@ -586,6 +642,83 @@ pub fn ack_demotion(ino: u64, incumbent_token: u64, region: (u64, u64)) -> bool 
             .notify_waiters();
     }
     acked
+}
+
+// ---------------------------------------------------------------------------
+// DLM S11 §9.3a — the tail-shrink arm's public surface (residual item 7)
+// ---------------------------------------------------------------------------
+
+/// The pending SHRINK notice naming `incumbent_token` on `ino` — the
+/// renewal reply's read (composed under the same `FileCustody` entry
+/// serialization that parked the asker, the demotion notice's
+/// in-flight-renewal race pin verbatim). The answer is the block-hulled
+/// FLOOR the incumbent's tail is asked to release back to.
+pub fn shrink_notice_for(ino: u64, incumbent_token: u64) -> Option<u64> {
+    LOCK_MAP
+        .read_sync(&ObjectKey::Ino(ino), |_, custody| {
+            custody.shrink_notice_for_token(incumbent_token)
+        })
+        .flatten()
+}
+
+/// The incumbent's shrink ACK (a client-initiated RPC's landing point):
+/// resolve the pending against the client's written high-water, count the
+/// resolution, and wake the file's stripe so the parked asker re-plans —
+/// against the shrunk span ([`ShrinkResolution::Shrunk`]: exclusive
+/// custody, no demotion) or into the EXISTING demotion barrier
+/// ([`ShrinkResolution::Demoted`]: the client truly wrote there — sticky
+/// demotion reserved for TRUE sharing, counted
+/// `range_custody_shrink_demotions`).
+pub fn ack_tail_shrink(ino: u64, incumbent_token: u64, watermark: u64) -> ShrinkResolution {
+    let key = ObjectKey::Ino(ino);
+    let (resolution, demotions_fence_resolved) = LOCK_MAP
+        .update_sync(&key, |_, custody| {
+            custody.ack_tail_shrink(incumbent_token, watermark)
+        })
+        .unwrap_or((ShrinkResolution::None, 0));
+    match resolution {
+        ShrinkResolution::None => {}
+        ShrinkResolution::Shrunk { .. } => {
+            RANGE_TAIL_SHRINK_ACKS.fetch_add(1, Ordering::Relaxed);
+        }
+        ShrinkResolution::Demoted { .. } => {
+            // The escalating ack still CLOSES the shrink ledger (it is an
+            // ack), and is additionally counted as the escalation gauge.
+            RANGE_TAIL_SHRINK_ACKS.fetch_add(1, Ordering::Relaxed);
+            RANGE_SHRINK_DEMOTIONS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    if demotions_fence_resolved > 0 {
+        // Demotion pendings made moot by the shrink (their region's
+        // custody provably retired) close through the demotion ledger's
+        // fence column — the `sweep_pendings_of` law.
+        RANGE_DEMOTION_FENCE_RESOLVES.fetch_add(demotions_fence_resolved as u64, Ordering::Relaxed);
+    }
+    if resolution != ShrinkResolution::None {
+        LOCK_WAITERS
+            .get_inode_lock(key.stripe_seed())
+            .notify_waiters();
+    }
+    resolution
+}
+
+/// The CLIENT half of a shrink: narrow this process's own adopted record
+/// to `new_end` so every local consumer (`span_range_shared`, the W1/B4
+/// clauses, covering probes through the custody table) stops claiming the
+/// released tail. `false` ⇔ no local record carries `token` (a racing
+/// lease loss retired it whole — nothing left to shrink).
+pub fn shrink_adopted_grant(ino: u64, token: u64, new_end: u64) -> bool {
+    LOCK_MAP
+        .update_sync(&ObjectKey::Ino(ino), |_, custody| {
+            custody.shrink_grant_tail(token, new_end)
+        })
+        .unwrap_or(false)
+}
+
+/// Count one CLIENT-side stretch clamp (`ranged_lease_attempt`'s learned
+/// ceiling engaging — the repeat-collision prevention's gauge).
+pub fn note_stretch_ceiling_clamp() {
+    RANGE_STRETCH_CEILING_CLAMPS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// The CLIENT half of a demotion: mark `region` demoted in this
@@ -670,10 +803,18 @@ pub fn range_scope_for_epoch(lease_epoch: u64) -> u64 {
 /// authority's decision, so no local conflict probe re-arbitrates it).
 /// `false` ⇔ no local record carries `token` (the grant died between the
 /// reply and this call — the caller treats it as lease-lost).
-pub fn widen_adopted_grant(ino: u64, token: u64, span: (u64, u64)) -> bool {
+///
+/// `required` is the client's OWN never-trim ask that produced the
+/// extension — NEVER the widened span (§9.3a): when the authority shares
+/// this process the adopted record IS the authority's arbiter record (the
+/// `adopt_remote_grant` attach case — every single-host deployment and
+/// the in-process suites), so a span-as-required union here would stamp
+/// the whole desired-minted stretch as honest custody and structurally
+/// disable the tail-shrink arm on exactly those deployments.
+pub fn widen_adopted_grant(ino: u64, token: u64, span: (u64, u64), required: (u64, u64)) -> bool {
     LOCK_MAP
         .update_sync(&ObjectKey::Ino(ino), |_, custody| {
-            custody.widen_grant(token, span)
+            custody.widen_grant(token, span, required)
         })
         .unwrap_or(false)
 }
@@ -1282,6 +1423,11 @@ impl LocalLockManager {
                                             owner_nonce: scope,
                                             token,
                                             mode: LockMode::Exclusive,
+                                            // §9.3a: the ask's never-trim
+                                            // floor — everything beyond
+                                            // its hull is shrinkable
+                                            // stretch.
+                                            required,
                                         },
                                     )
                                 });
@@ -1299,14 +1445,28 @@ impl LocalLockManager {
                 // every sharer acked (its region then reads demoted and
                 // the sharer probe excludes it) or died (the retire
                 // sweep resolves through the fence column).
+                //
+                // §9.3a (residual item 7's fix): a sharer whose shared
+                // region lies wholly at-or-beyond its REQUIRED-union
+                // hull is sharing only the desired-minted STRETCH TAIL —
+                // the shape the fabric venue proved fabricates demotions
+                // on fully-aligned disjoint rows. That sharer marks a
+                // SHRINK pending (floor = the shared region's start, the
+                // block boundary that frees this ask) instead: the asker
+                // parks on the same machinery, and the incumbent's ack
+                // releases the tail rather than demoting the block.
                 let barrier = |custody: &mut FileCustody, ask: (u64, u64)| -> bool {
                     let Some(bs) = block_size else { return false };
                     let sharers = custody.foreign_block_sharers(ask, bs, scope);
                     if sharers.is_empty() {
                         return false;
                     }
-                    for (token, _sscope, region) in sharers {
-                        if custody.mark_demotion_pending(region, token) {
+                    for sharer in sharers {
+                        if sharer.region.0 >= sharer.required_hull_end {
+                            if custody.mark_shrink_pending(sharer.token, sharer.region.0, bs) {
+                                RANGE_TAIL_SHRINKS.fetch_add(1, Ordering::Relaxed);
+                            }
+                        } else if custody.mark_demotion_pending(sharer.region, sharer.token) {
                             RANGE_DEMOTIONS.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -1338,7 +1498,7 @@ impl LocalLockManager {
                             // exists to serve.
                             if let Some((token, span)) = custody.own_adjacent_grant(required, scope)
                             {
-                                let widened = custody.widen_grant(token, span);
+                                let widened = custody.widen_grant(token, span, required);
                                 debug_assert!(widened, "plan and apply share one critical section");
                                 RANGE_EXTENSIONS.fetch_add(1, Ordering::Relaxed);
                                 if required != desired {
@@ -1351,7 +1511,16 @@ impl LocalLockManager {
                         RangeMint::Held
                     }
                     RangePlan::BridgeRefused => RangeMint::Bridge,
-                    RangePlan::Covered { token, span } => RangeMint::Covered { token, span },
+                    RangePlan::Covered { token, span } => {
+                        // §9.3a: a COVERED serve is the holder actively
+                        // claiming these bytes — union its required into
+                        // the grant's watermark so a tail byte re-asked
+                        // over the wire mid-shrink resolves the late ack
+                        // as Demoted (honest custody), never as a release
+                        // of bytes the holder may be DMAing.
+                        custody.note_required(token, required);
+                        RangeMint::Covered { token, span }
+                    }
                     RangePlan::Extend { token, span } => {
                         // Rung 17: a widening that would NEWLY share a
                         // block with a live foreign grant is the same
@@ -1367,7 +1536,7 @@ impl LocalLockManager {
                         if decision.trimmed {
                             RANGE_DESIRED_TRIMS.fetch_add(1, Ordering::Relaxed);
                         }
-                        let widened = custody.widen_grant(token, span);
+                        let widened = custody.widen_grant(token, span, required);
                         debug_assert!(widened, "plan and apply share one critical section");
                         RANGE_EXTENSIONS.fetch_add(1, Ordering::Relaxed);
                         RangeMint::Extended { token, span }
@@ -1525,6 +1694,10 @@ impl LocalLockManager {
             owner_nonce: self.client_nonce,
             token,
             mode,
+            // Plain moded acquires carry no desired stretch: the whole
+            // span IS the required ask (§9.3a's identity case — no
+            // shrinkable tail exists, classifications stay byte-identical).
+            required: (start, end),
         }
     }
 }
@@ -1582,6 +1755,7 @@ impl LockLeaseInner {
         }
         let mut retired = false;
         let mut fence_resolved = 0usize;
+        let mut shrink_fence_resolved = 0usize;
         let _ = LOCK_MAP.remove_if_sync(&self.key, |custody| {
             retired = custody.retire(self.span, self.fencing_token, self.client_nonce);
             if retired {
@@ -1591,6 +1765,10 @@ impl LockLeaseInner {
                 // (release, revocation, or lease expiry on the owner's
                 // clock), so the barrier's waiters may proceed.
                 fence_resolved = custody.sweep_pendings_of(self.fencing_token);
+                // §9.3a: its shrink pendings resolve the same way — the
+                // whole grant died, so the contested tail is trivially
+                // retired without an ack.
+                shrink_fence_resolved = custody.sweep_shrink_pendings_of(self.fencing_token);
             }
             custody.is_vacant()
         });
@@ -1599,6 +1777,10 @@ impl LockLeaseInner {
         }
         if fence_resolved > 0 {
             RANGE_DEMOTION_FENCE_RESOLVES.fetch_add(fence_resolved as u64, Ordering::Relaxed);
+        }
+        if shrink_fence_resolved > 0 {
+            RANGE_TAIL_SHRINK_FENCE_RESOLVES
+                .fetch_add(shrink_fence_resolved as u64, Ordering::Relaxed);
         }
         if retired {
             LOCK_WAITERS

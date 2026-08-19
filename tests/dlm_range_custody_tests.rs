@@ -2219,8 +2219,8 @@ async fn a_foreign_required_over_the_stretch_tail_shrinks_instead_of_demoting() 
 
     // The renewal-reply read: one notice naming A's grant at the
     // block-hulled floor that frees B's ask.
-    let floor = squeezefs::dlm::shrink_notice_for(ino, a_token)
-        .expect("one unacked shrink notice for A");
+    let floor =
+        squeezefs::dlm::shrink_notice_for(ino, a_token).expect("one unacked shrink notice for A");
     assert_eq!(floor, 4 * BLK, "the floor is B's ask-start block boundary");
 
     // A's ack: its written high-water sits inside its REQUIRED block —
@@ -2249,17 +2249,17 @@ async fn a_foreign_required_over_the_stretch_tail_shrinks_instead_of_demoting() 
     let s1 = squeezefs::dlm::range_custody_stats();
     assert_eq!(s1.tail_shrinks - s0.tail_shrinks, 1);
     assert_eq!(s1.tail_shrink_acks - s0.tail_shrink_acks, 1);
-    assert_eq!(
-        s1.tail_shrink_fence_resolves,
-        s0.tail_shrink_fence_resolves
-    );
+    assert_eq!(s1.tail_shrink_fence_resolves, s0.tail_shrink_fence_resolves);
     assert_eq!(
         s1.tail_shrinks - s0.tail_shrinks,
         (s1.tail_shrink_acks - s0.tail_shrink_acks)
             + (s1.tail_shrink_fence_resolves - s0.tail_shrink_fence_resolves),
         "tail_shrinks ≡ acks + fence_resolves"
     );
-    assert_eq!(s1.demotions, s0.demotions, "zero demotions on the clean path");
+    assert_eq!(
+        s1.demotions, s0.demotions,
+        "zero demotions on the clean path"
+    );
     assert_eq!(s1.shrink_demotions, s0.shrink_demotions);
     assert!(
         squeezefs::dlm::demoted_regions(ino).is_empty(),
@@ -2386,7 +2386,10 @@ async fn a_written_tail_still_demotes_honestly() {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(!b_task.is_finished(), "B stays parked behind the demotion barrier");
+    assert!(
+        !b_task.is_finished(),
+        "B stays parked behind the demotion barrier"
+    );
     let notices = squeezefs::dlm::demotion_notices_for(ino, a_token);
     assert_eq!(notices.len(), 1, "one demotion notice for A");
     let region = notices[0];

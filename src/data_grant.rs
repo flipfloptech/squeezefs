@@ -133,7 +133,18 @@ use std::time::{Duration, Instant};
 /// re-acquire corner is the rung's named residual.) A 3-speaker would
 /// silently drop the notice — the exact two-publishers window the
 /// barrier exists to close — so the mismatch stays a loud refusal.
-pub const CUSTODY_SCHEMA: u32 = 4;
+///
+/// **5 since §9.3a's tail shrink** (residual board item 7's fix,
+/// `.benchmarks/2026-08-19-blob-aware-merge-and-fabric-venue.md` §3): the
+/// renewal reply carries the incumbent's **tail-shrink notices**
+/// ([`RenewReplyFrame::shrinks`] — composed under the same `FileCustody`
+/// serialization that parked the asker, the demotion notice's own race
+/// pin), and [`VERB_CUSTODY_SHRINK_ACK`] joined (the incumbent answers
+/// its written high-water inside the contested tail). A 4-speaker would
+/// silently drop the notice and hold the asker to the incumbent's lease
+/// TTL — the retry-amplification shape the fix deletes — so the mismatch
+/// stays a loud refusal.
+pub const CUSTODY_SCHEMA: u32 = 5;
 
 /// First verb of S9's block. S3 reserved 0 for its ping, S8's metadata
 /// vocabulary took 16/17, S6's membership owns `0x0100..=0x01FF`; custody
@@ -156,6 +167,12 @@ pub const VERB_CUSTODY_RECLAIM: u16 = VERB_CUSTODY_BASE + 4;
 /// RPC that retires its direct-DMA custody over the demoted block and
 /// lets the parked second holder's grant issue.
 pub const VERB_CUSTODY_DEMOTE_ACK: u16 = VERB_CUSTODY_BASE + 5;
+/// §9.3a: the incumbent's tail-shrink ACK — the client-initiated RPC
+/// answering its written high-water inside the contested stretch tail;
+/// the authority resolves the pending shrink against it and the parked
+/// asker's grant issues (exclusive on an unwritten tail, or through the
+/// existing demotion barrier on a written one).
+pub const VERB_CUSTODY_SHRINK_ACK: u16 = VERB_CUSTODY_BASE + 6;
 
 /// Status: the call succeeded.
 pub const CUSTODY_OK: u16 = RPC_OK;
@@ -346,6 +363,23 @@ pub struct DemotionNotice {
     pub incumbent_token: u64,
 }
 
+/// §9.3a (schema 5): one renewal-carried **tail-shrink notice** — a
+/// second holder's REQUIRED ask parked wholly inside `incumbent_token`'s
+/// desired-minted stretch tail on `ino`, and THIS client is asked to
+/// release the tail back to `floor` (block-hulled). The client shrinks
+/// its covering cache FIRST (the tail must stop serving before the ack
+/// travels — order load-bearing), then answers its written high-water
+/// ([`VERB_CUSTODY_SHRINK_ACK`]). Composed under the same `FileCustody`
+/// serialization that parked the asker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShrinkNotice {
+    pub ino: u64,
+    /// The block-hulled boundary the tail is asked to release back to.
+    pub floor: u64,
+    /// The addressee grant — this client acks by naming it.
+    pub incumbent_token: u64,
+}
+
 /// A renewal's answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RenewReplyFrame {
@@ -367,6 +401,9 @@ pub struct RenewReplyFrame {
     /// covered_upto_request_id)`; the client releases every retained
     /// extent at or below the watermark).
     pub extent_covered: Vec<(u64, u64)>,
+    /// **§9.3a** (schema 5): the tail-shrink notices addressed to this
+    /// client's grants — the same pull channel the demotion notices ride.
+    pub shrinks: Vec<ShrinkNotice>,
 }
 
 /// Rung 17: the incumbent's demotion ack.
@@ -378,6 +415,22 @@ pub struct DemoteAckFrame {
     pub ino: u64,
     pub incumbent_token: u64,
     pub region: (u64, u64),
+}
+
+/// §9.3a: the incumbent's tail-shrink ack — its written high-water inside
+/// the grant (`u64::MAX` = "unknown: my cache no longer carries the
+/// mark, treat my whole span as potentially written" — the shed-cache
+/// degradation, which resolves as an escalation, never a release).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShrinkAckFrame {
+    pub schema: u32,
+    pub client: String,
+    pub lease_epoch: u64,
+    pub ino: u64,
+    pub incumbent_token: u64,
+    /// The max byte end this client served write custody for through the
+    /// named grant.
+    pub watermark: u64,
 }
 
 /// A release of named grants.
@@ -1705,6 +1758,20 @@ impl WriteCustodyOwner {
                 });
             }
         }
+        // §9.3a: the tail-shrink notices addressed to this client's
+        // grants — the same serialization argument as the demotion read
+        // above (a reply composed after the pending-mark always carries
+        // the notice).
+        let mut shrinks = Vec::new();
+        for entry in &ranges {
+            if let Some(floor) = crate::dlm::shrink_notice_for(entry.ino, entry.token) {
+                shrinks.push(ShrinkNotice {
+                    ino: entry.ino,
+                    floor,
+                    incumbent_token: entry.token,
+                });
+            }
+        }
         // Rung 17: the coverage watermarks — the retention release's
         // renewal-observation surface (pull only).
         let extent_covered = crate::extent_ship::owner_covered_watermarks(client);
@@ -1715,6 +1782,7 @@ impl WriteCustodyOwner {
             ranges,
             demotions,
             extent_covered,
+            shrinks,
         })
     }
 
@@ -1735,6 +1803,48 @@ impl WriteCustodyOwner {
             return Err(CUSTODY_UNKNOWN_LEASE);
         }
         Ok(crate::dlm::ack_demotion(ino, incumbent_token, region))
+    }
+
+    /// §9.3a: serve one tail-shrink ACK — validate the lease, resolve the
+    /// pending against the client's written high-water, and reflect the
+    /// arbiter's shrink into the OWNER's own grant record so the next
+    /// renewal's range vector cannot resurrect the released tail into the
+    /// client's cache. `Err(status)` mirrors [`Self::renew`]'s law.
+    pub fn shrink_ack(
+        &self,
+        client: &str,
+        lease_epoch: u64,
+        ino: u64,
+        incumbent_token: u64,
+        watermark: u64,
+    ) -> std::result::Result<crate::dlm::ShrinkResolution, u16> {
+        if !self.lease_current(client, lease_epoch) {
+            self.unknown_leases.fetch_add(1, Ordering::Relaxed);
+            UNKNOWN_LEASES.fetch_add(1, Ordering::Relaxed);
+            return Err(CUSTODY_UNKNOWN_LEASE);
+        }
+        let resolution = crate::dlm::ack_tail_shrink(ino, incumbent_token, watermark);
+        let new_end = match resolution {
+            crate::dlm::ShrinkResolution::None => None,
+            crate::dlm::ShrinkResolution::Shrunk { floor } => Some(floor),
+            crate::dlm::ShrinkResolution::Demoted { new_end } => Some(new_end),
+        };
+        if let Some(new_end) = new_end {
+            if let Some(grant_id) = self.grant_id_by_token(client, incumbent_token) {
+                let span = self
+                    .table
+                    .grants_snapshot_with(|id, g| (id == grant_id).then_some(g.span))
+                    .into_iter()
+                    .flatten()
+                    .next()
+                    .flatten();
+                if let Some((start, end)) = span {
+                    self.table
+                        .widen_grant_span(grant_id, Some((start, new_end.min(end))));
+                }
+            }
+        }
+        Ok(resolution)
     }
 
     /// Retire named grants at the client's request. Dropping the
@@ -2195,6 +2305,47 @@ impl CustodyService {
                         status,
                         format!(
                             "demotion ack from '{}' refused ({})",
+                            frame.client,
+                            status_name(status)
+                        ),
+                    ),
+                },
+            },
+            VERB_CUSTODY_SHRINK_ACK => match decode::<ShrinkAckFrame>(&req.body, "shrink ack") {
+                Err(e) => Self::refuse(req.id, CUSTODY_MALFORMED, format!("{e}")),
+                Ok(frame) if frame.schema != CUSTODY_SCHEMA => Self::refuse(
+                    req.id,
+                    CUSTODY_SCHEMA_MISMATCH,
+                    format!(
+                        "peer speaks custody schema {} and this authority speaks \
+                         {CUSTODY_SCHEMA}",
+                        frame.schema
+                    ),
+                ),
+                Ok(frame) => match self.owner.shrink_ack(
+                    &frame.client,
+                    frame.lease_epoch,
+                    frame.ino,
+                    frame.incumbent_token,
+                    frame.watermark,
+                ) {
+                    Ok(resolution) => RpcResponse {
+                        id: req.id,
+                        status: CUSTODY_OK,
+                        // One resolution byte: 0 = no pending (stale ack),
+                        // 1 = shrunk to the floor, 2 = escalated to the
+                        // demotion barrier (the client had written there).
+                        body: vec![match resolution {
+                            crate::dlm::ShrinkResolution::None => 0u8,
+                            crate::dlm::ShrinkResolution::Shrunk { .. } => 1,
+                            crate::dlm::ShrinkResolution::Demoted { .. } => 2,
+                        }],
+                    },
+                    Err(status) => Self::refuse(
+                        req.id,
+                        status,
+                        format!(
+                            "tail-shrink ack from '{}' refused ({})",
                             frame.client,
                             status_name(status)
                         ),
@@ -2779,8 +2930,12 @@ impl WriteCustodyClient {
             // The EXTENSION face: the authority widened a grant this
             // client already holds. Widen the adopted record (same token,
             // same release identity) and the cached span; the existing
-            // lease handle is the custody — no new handle exists.
-            if !crate::dlm::widen_adopted_grant(ino, grant.token, span) {
+            // lease handle is the custody — no new handle exists. The
+            // required union carries THIS ask's required, never the span
+            // (§9.3a — on a shared-process authority the adopted record
+            // IS the arbiter record, and a span-wide union would erase
+            // the tail the shrink arm reclaims).
+            if !crate::dlm::widen_adopted_grant(ino, grant.token, span, required) {
                 // The local record died between the reply and this widen
                 // (a racing lease loss retired it whole). The honest
                 // answer is the lease-lost class — the caller re-joins.
@@ -2944,6 +3099,51 @@ impl WriteCustodyClient {
         for (ino, upto) in &r.extent_covered {
             crate::extent_ship::release_covered(*ino, *upto);
         }
+        // §9.3a: the renewal-carried TAIL-SHRINK notices. The order is
+        // load-bearing: (1) the covering cache stops serving the released
+        // tail (so no later write can be served custody of bytes this ack
+        // gives away), (2) the written high-water is read AFTER that
+        // shrink (any serve that beat it is visible in the mark — the
+        // fetch_max happens under the serve itself), (3) the local
+        // adopted record narrows, (4) the ino learns its stretch ceiling
+        // (the repeat-collision prevention), (5) only then does the ack
+        // travel. A missing cache entry (an R5 shed) answers `u64::MAX` —
+        // "unknown, treat my whole span as written" — which the authority
+        // resolves as an escalation, never a release.
+        for notice in &r.shrinks {
+            let watermark = crate::meta_ship::tokens::shrink_range_grant(
+                notice.ino,
+                notice.incumbent_token,
+                notice.floor,
+            )
+            .unwrap_or(u64::MAX);
+            // The local record narrows to what this client can still
+            // honestly claim: the floor, or its own written high-water
+            // where that reaches past it (the authority keeps the written
+            // hull too — the Demoted arm). An unknown watermark
+            // (u64::MAX) narrows nothing, matching the authority's
+            // escalate-don't-release resolution.
+            crate::dlm::shrink_adopted_grant(
+                notice.ino,
+                notice.incumbent_token,
+                notice.floor.max(watermark),
+            );
+            crate::meta_ship::tokens::note_stretch_ceiling(notice.ino, notice.floor, watermark);
+            if let Err(e) = self
+                .ack_tail_shrink(notice.ino, notice.incumbent_token, watermark)
+                .await
+            {
+                // Never fatal: the un-acked pending resolves at this
+                // lease's expiry on the OWNER's clock (the fence column)
+                // — loud, because the asker's window is now the TTL.
+                log::warn!(
+                    "S11 §9.3a: tail-shrink ack for ino {} floor {} failed ({e}) — the \
+                     barrier resolves at this lease's expiry on the authority's clock",
+                    notice.ino,
+                    notice.floor
+                );
+            }
+        }
         Ok(())
     }
 
@@ -2981,6 +3181,44 @@ impl WriteCustodyClient {
             });
         }
         Ok(reply.body.first().copied().unwrap_or(0) != 0)
+    }
+
+    /// §9.3a: ship one tail-shrink ACK — the client-initiated RPC that
+    /// answers this mount's written high-water inside the contested tail
+    /// (the caller has already shrunk the covering cache and the local
+    /// adopted record). The reply's resolution byte: 0 = no pending
+    /// (stale ack), 1 = shrunk to the floor, 2 = escalated to the
+    /// demotion barrier.
+    pub async fn ack_tail_shrink(
+        &self,
+        ino: u64,
+        incumbent_token: u64,
+        watermark: u64,
+    ) -> Result<u8> {
+        let frame = ShrinkAckFrame {
+            schema: CUSTODY_SCHEMA,
+            client: self.id.clone(),
+            lease_epoch: self.lease_epoch.load(Ordering::Acquire),
+            ino,
+            incumbent_token,
+            watermark,
+        };
+        let body = encode(&frame, "shrink ack")?;
+        let reply = self.call_retrying(VERB_CUSTODY_SHRINK_ACK, body).await?;
+        if reply.status != CUSTODY_OK {
+            let detail = String::from_utf8_lossy(&reply.body).to_string();
+            if reply.status == CUSTODY_UNKNOWN_LEASE {
+                self.note_lease_lost(&detail);
+            }
+            return Err(SqueezefsError::LockFailed {
+                reason: format!(
+                    "S11 §9.3a: tail-shrink ack refused by {} ({}): {detail}",
+                    self.endpoint,
+                    status_name(reply.status)
+                ),
+            });
+        }
+        Ok(reply.body.first().copied().unwrap_or(0))
     }
 
     /// Re-assert custody of `inos` inside a successor's grace window,

@@ -12278,8 +12278,31 @@ impl SqueezefsFilesystem {
         }
         if sequential {
             let held_len = desired.1 - desired.0;
-            desired =
+            let stretched =
                 crate::dlm::block_align_out((desired.0, desired.1.saturating_add(held_len)), block);
+            // §9.3a (residual item 7's client half): the LEARNED STRETCH
+            // CEILING. A prior tail shrink on this ino taught us the
+            // stretch length that survived beyond our written frontier —
+            // cap the doubling's mint at that length beyond the ask's own
+            // aligned end (rounded DOWN to block grain: never re-mint a
+            // block a peer claimed), so a steady block-cyclic interleave
+            // pays at most ONE shrink round per episode instead of one
+            // per stride (the fabric row's 822-conflict amplification).
+            // The abutting union above is never clamped — it only ever
+            // names custody this mount already holds.
+            desired.1 = match crate::meta_ship::tokens::stretch_ceiling(ino) {
+                Some(len) => {
+                    let aligned_ask_end = crate::dlm::block_align_out((start, end), block).1;
+                    let allowance = aligned_ask_end.saturating_add(len - (len % block.max(1)));
+                    let capped = stretched.1.min(allowance.max(desired.1));
+                    if capped < stretched.1 {
+                        crate::dlm::note_stretch_ceiling_clamp();
+                    }
+                    capped
+                }
+                None => stretched.1,
+            };
+            desired.0 = stretched.0;
         }
         let file_path = crate::keys::inode_path(ino);
         let start_dlm = std::time::Instant::now();
@@ -12293,6 +12316,11 @@ impl SqueezefsFilesystem {
                 METRICS.dlm_acquire_time.record(start_dlm.elapsed());
                 let token = lease.fencing_token();
                 self.active_range_leases.entry(ino).or_default().push(lease);
+                // §9.3a: this write's custody arrived as a wire answer,
+                // never through the covering probe — mark the grant's
+                // written high-water so a later tail-shrink ack accounts
+                // for it.
+                crate::meta_ship::tokens::note_range_write(ino, token, end);
                 Ok(token)
             }
             Ok(
@@ -12301,6 +12329,7 @@ impl SqueezefsFilesystem {
             ) => {
                 METRICS.lease_acquire_ok.fetch_add(1, Ordering::Relaxed);
                 METRICS.dlm_acquire_time.record(start_dlm.elapsed());
+                crate::meta_ship::tokens::note_range_write(ino, token, end);
                 Ok(token)
             }
             Err(e) => {

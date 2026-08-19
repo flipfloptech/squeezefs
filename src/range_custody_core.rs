@@ -97,6 +97,17 @@ pub struct Grant {
     pub owner_nonce: u64,
     pub token: u64,
     pub mode: LockMode,
+    /// §9.3a (residual item 7's fix): the UNION of every REQUIRED span
+    /// admitted or extended into this grant — the never-trimmed floors
+    /// the holder actually asked for, as opposed to the desired-minted
+    /// STRETCH the span may carry beyond them. The authority knows these
+    /// exactly (every admit/extend names its required; a Covered serve
+    /// unions too), so `[required-hull end, end)` is the tail the
+    /// tail-shrink arm may reclaim without fabricating a demotion.
+    /// Equals `(start, end)` wherever no stretch exists (whole-file
+    /// grants, adopted client records, plain moded admits) — which is
+    /// what keeps every pre-§9.3a classification byte-identical there.
+    pub required: (u64, u64),
 }
 
 impl Grant {
@@ -191,6 +202,60 @@ pub struct RangeDecision {
 /// record is RAM state on the arbiter's `FileCustody` entry — it dies
 /// with the authority (MW-13's law: a demotion in flight when the
 /// authority dies restarts from zero on the successor).
+/// One [`FileCustody::foreign_block_sharers`] answer: a foreign grant
+/// whose block hull shares blocks with the probed span, plus the §9.3a
+/// classification input (`region.0 >= required_hull_end` ⇔ the share lies
+/// wholly in the grant's desired-minted tail — the shrink arm; anything
+/// else is honest custody — the demotion barrier).
+#[derive(Clone, Copy, Debug)]
+pub struct BlockSharer {
+    pub token: u64,
+    /// The shared block-aligned region.
+    pub region: (u64, u64),
+    /// The sharer grant's REQUIRED-union block hull end.
+    pub required_hull_end: u64,
+}
+
+/// One §9.3a **shrink-pending** record (residual board item 7's fix): a
+/// second holder's REQUIRED ask overlaps `incumbent_token`'s live grant
+/// ONLY in its desired-minted stretch tail (no byte of the ask's block
+/// hull touches the grant's required-union hull), so instead of the
+/// demotion barrier the grant is marked for a TAIL SHRINK back to
+/// `floor`: the asker parks on the same wait machinery, the notice rides
+/// the incumbent's next renewal reply, and the incumbent answers its own
+/// written high-water inside the contested tail. RAM state, like
+/// [`DemotionPending`] — it dies with the authority.
+#[derive(Clone, Copy, Debug)]
+pub struct ShrinkPending {
+    /// The addressee grant's token (the renewal notice's key).
+    pub incumbent_token: u64,
+    /// The block-hulled boundary that frees every parked ask: the grant's
+    /// tail shrinks back to it iff the incumbent's written high-water is
+    /// at or below it. Multiple askers merge to the MIN floor.
+    pub floor: u64,
+    /// The block geometry the barrier classified under — the same hulls
+    /// the ack must resolve with.
+    pub block: u64,
+}
+
+/// `FileCustody::ack_tail_shrink`'s resolution — what the incumbent's
+/// written high-water made of the pending shrink.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShrinkResolution {
+    /// No live shrink pending named the token (a stale or duplicate ack).
+    None,
+    /// The contested tail was UNWRITTEN: the grant span shrank to `floor`
+    /// and the parked ask proceeds to EXCLUSIVE custody — no demotion, no
+    /// shared clauses, transient.
+    Shrunk { floor: u64 },
+    /// The incumbent HAD written into the contested tail: the grant
+    /// shrank only to the watermark's block hull (`new_end`) and the ask
+    /// still overlaps honest custody — the EXISTING demotion barrier now
+    /// arbitrates (the asker's re-plan marks it). Sticky demotion is
+    /// thereby reserved for TRUE sharing.
+    Demoted { new_end: u64 },
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct DemotionPending {
     /// The block-aligned region being demoted.
@@ -264,6 +329,9 @@ pub struct FileCustody {
     /// Rung 17 (§9.3): the live demotion-pending records (the
     /// grant-issuance barrier's state). Empty everywhere shipped.
     pending: Vec<DemotionPending>,
+    /// §9.3a: the live shrink-pending records (one per incumbent token —
+    /// merged to the MIN floor). Empty everywhere shipped.
+    shrink_pending: Vec<ShrinkPending>,
 }
 
 impl FileCustody {
@@ -276,6 +344,7 @@ impl FileCustody {
             max_token: 0,
             demoted: Vec::new(),
             pending: Vec::new(),
+            shrink_pending: Vec::new(),
         }
     }
 
@@ -495,13 +564,16 @@ impl FileCustody {
 
     /// Apply a [`RangePlan::Extend`]: widen the grant carrying `token` to
     /// `span` (its union with the clipped window — computed under this
-    /// same entry lock). The record is re-positioned to keep the
-    /// `(start, token)` sort order; its token and owner survive (the
-    /// extension mints nothing — the client's cached token, and every
-    /// in-flight write fencing on it, stay current). `false` ⇔ no grant
-    /// carries `token` (a caller applying a stale plan — impossible under
-    /// the one-critical-section discipline, honest for the loom model).
-    pub fn widen_grant(&mut self, token: u64, span: (u64, u64)) -> bool {
+    /// same entry lock), unioning `required` into the grant's
+    /// required-union watermark (§9.3a — the extension's own never-trim
+    /// floor is honest custody the tail-shrink arm must not reclaim). The
+    /// record is re-positioned to keep the `(start, token)` sort order;
+    /// its token and owner survive (the extension mints nothing — the
+    /// client's cached token, and every in-flight write fencing on it,
+    /// stay current). `false` ⇔ no grant carries `token` (a caller
+    /// applying a stale plan — impossible under the one-critical-section
+    /// discipline, honest for the loom model).
+    pub fn widen_grant(&mut self, token: u64, span: (u64, u64), required: (u64, u64)) -> bool {
         let Some(at) = self.ranges.iter().position(|g| g.token == token) else {
             return false;
         };
@@ -509,11 +581,55 @@ impl FileCustody {
         debug_assert!(span.0 <= g.start && span.1 >= g.end, "widen only unions");
         g.start = span.0;
         g.end = span.1;
+        g.required.0 = g.required.0.min(required.0);
+        g.required.1 = g.required.1.max(required.1);
         let at = self
             .ranges
             .partition_point(|r| (r.start, r.token) < (g.start, g.token));
         self.widest = self.widest.max(g.len());
         self.ranges.insert(at, g);
+        true
+    }
+
+    /// §9.3a: union `required` into the grant's required-union watermark
+    /// WITHOUT widening its span — the COVERED serve's mutation. A wire
+    /// re-ask served Covered proves the holder is actively claiming those
+    /// bytes, and recording it is what closes the ack race: a tail byte
+    /// Covered-served after the shrink notice travelled raises the
+    /// required union past the floor, so the late-arriving ack resolves
+    /// [`ShrinkResolution::Demoted`] instead of releasing a byte the
+    /// holder may be DMAing (the client-local face of the same race is
+    /// closed by the cache-shrink-before-watermark-read order).
+    pub fn note_required(&mut self, token: u64, required: (u64, u64)) {
+        if let Some(g) = self.ranges.iter_mut().find(|g| g.token == token) {
+            g.required.0 = g.required.0.min(required.0);
+            g.required.1 = g.required.1.max(required.1);
+        }
+    }
+
+    /// §9.3a: shrink the grant carrying `token` to end at `new_end` (never
+    /// widening; the span order key `(start, token)` is untouched). The
+    /// CLIENT half of a shrink — its adopted record narrows to match the
+    /// authority's resolution; the required union narrows with the span
+    /// (an adopted record's required IS its span). `false` ⇔ no grant
+    /// carries `token`.
+    pub fn shrink_grant_tail(&mut self, token: u64, new_end: u64) -> bool {
+        let Some(at) = self.ranges.iter().position(|g| g.token == token) else {
+            return false;
+        };
+        let g = &mut self.ranges[at];
+        if new_end >= g.end || new_end <= g.start {
+            // Never widen; never shrink to empty (a full release is the
+            // retire path's job, with its own wake and accounting).
+            return new_end >= g.end;
+        }
+        let old_len = g.end - g.start;
+        g.end = new_end;
+        g.required.1 = g.required.1.min(new_end);
+        g.required.0 = g.required.0.min(g.required.1);
+        if old_len == self.widest {
+            self.widest = self.ranges.iter().map(Grant::len).max().unwrap_or_default();
+        }
         true
     }
 
@@ -660,17 +776,19 @@ impl FileCustody {
     }
 
     /// Foreign range grants whose **block hull** overlaps `span`'s block
-    /// hull OUTSIDE the demoted regions — the §9.3 stab: each answer is
-    /// `(incumbent_token, incumbent_scope, shared block-aligned region)`.
-    /// Byte-overlapping grants are included (their carve is the same
-    /// demotion); shares wholly inside demoted regions are licensed and
-    /// excluded.
+    /// hull OUTSIDE the demoted regions — the §9.3 stab. Byte-overlapping
+    /// grants are included (their carve is the same demotion); shares
+    /// wholly inside demoted regions are licensed and excluded. Each
+    /// answer carries the sharer's REQUIRED-union hull end (§9.3a): a
+    /// share lying wholly at-or-beyond it is a share with the grant's
+    /// desired-minted TAIL only, which the shrink arm reclaims instead of
+    /// demoting.
     pub fn foreign_block_sharers(
         &self,
         span: (u64, u64),
         block_size: u64,
         scope: u64,
-    ) -> Vec<(u64, u64, (u64, u64))> {
+    ) -> Vec<BlockSharer> {
         if block_size == 0 || self.ranges.is_empty() {
             return Vec::new();
         }
@@ -686,7 +804,11 @@ impl FileCustody {
             if s >= e || self.span_within_demoted(s, e) {
                 continue;
             }
-            out.push((g.token, g.owner_nonce, (s, e)));
+            out.push(BlockSharer {
+                token: g.token,
+                region: (s, e),
+                required_hull_end: block_align_out(g.required, block_size).1,
+            });
         }
         out
     }
@@ -795,6 +917,153 @@ impl FileCustody {
             .filter(|p| !p.acked && p.incumbent_token == incumbent_token)
             .count();
         self.pending
+            .retain(|p| p.incumbent_token != incumbent_token);
+        before
+    }
+
+    // -----------------------------------------------------------------
+    // §9.3a — the tail-shrink arm's core state transitions (residual
+    // board item 7's fix). Callers hold the entry lock, exactly like the
+    // demotion transitions above.
+    // -----------------------------------------------------------------
+
+    /// Mark one tail shrink pending. `true` = a NEW record (the ledger's
+    /// `range_custody_tail_shrinks` increment); an existing same-incumbent
+    /// record deepens to the MIN floor instead (idempotent re-asks from a
+    /// parked waiter's re-plans never double-count, and a second asker
+    /// with a deeper boundary merges — one shrink frees them all).
+    pub fn mark_shrink_pending(&mut self, incumbent_token: u64, floor: u64, block: u64) -> bool {
+        debug_assert!(block > 0);
+        if let Some(p) = self
+            .shrink_pending
+            .iter_mut()
+            .find(|p| p.incumbent_token == incumbent_token)
+        {
+            p.floor = p.floor.min(floor);
+            return false;
+        }
+        self.shrink_pending.push(ShrinkPending {
+            incumbent_token,
+            floor,
+            block,
+        });
+        true
+    }
+
+    /// The pending shrink floor naming `incumbent_token` — the renewal
+    /// notice's read (composed under this same entry serialization, the
+    /// demotion notice's in-flight-renewal race pin verbatim).
+    pub fn shrink_notice_for_token(&self, incumbent_token: u64) -> Option<u64> {
+        self.shrink_pending
+            .iter()
+            .find(|p| p.incumbent_token == incumbent_token)
+            .map(|p| p.floor)
+    }
+
+    /// The incumbent's shrink ACK: resolve the pending against its written
+    /// high-water `watermark` (the max byte end it served write custody
+    /// for inside the grant; `u64::MAX` = "unknown — treat my whole span
+    /// as potentially written", the shed-cache degradation).
+    ///
+    /// Returns the resolution plus the number of UN-ACKED demotion
+    /// pendings of the same incumbent that became provably moot because
+    /// the shrink retired the incumbent's custody past their region —
+    /// resolved through the demotion ledger's FENCE column (custody
+    /// provably retired without an ack, the `sweep_pendings_of` law).
+    pub fn ack_tail_shrink(
+        &mut self,
+        incumbent_token: u64,
+        watermark: u64,
+    ) -> (ShrinkResolution, usize) {
+        let Some(at) = self
+            .shrink_pending
+            .iter()
+            .position(|p| p.incumbent_token == incumbent_token)
+        else {
+            return (ShrinkResolution::None, 0);
+        };
+        let pending = self.shrink_pending.remove(at);
+        let Some(g_at) = self.ranges.iter().position(|g| g.token == incumbent_token) else {
+            // The grant died between mark and ack — its retire already
+            // swept the barrier's waiters through the fence column; the
+            // late ack resolves to nothing. (Unreachable through the
+            // shipped retire, which sweeps shrink pendings too; honest
+            // for a direct core caller.)
+            return (ShrinkResolution::None, 0);
+        };
+        let (old_len, resolution, new_end) = {
+            let g = &mut self.ranges[g_at];
+            let req_hull_end = block_align_out(g.required, pending.block).1;
+            let w_hull_end = if watermark == 0 {
+                0
+            } else {
+                watermark
+                    .div_ceil(pending.block)
+                    .saturating_mul(pending.block)
+            };
+            let honest_end = req_hull_end.max(w_hull_end).min(g.end);
+            let old_len = g.end - g.start;
+            if honest_end <= pending.floor {
+                // The contested tail is unwritten: release it whole.
+                let floor = pending.floor.min(g.end).max(g.start);
+                g.end = floor;
+                g.required.1 = g.required.1.min(floor);
+                (old_len, ShrinkResolution::Shrunk { floor }, floor)
+            } else {
+                // The incumbent truly wrote into the tail: keep the
+                // written hull — it is honest custody now (union the
+                // watermark into required so every later classification
+                // reads it as such) — and let the EXISTING demotion
+                // barrier arbitrate the still-contested blocks.
+                g.end = honest_end;
+                g.required.1 = g.required.1.max(watermark.min(honest_end));
+                (
+                    old_len,
+                    ShrinkResolution::Demoted {
+                        new_end: honest_end,
+                    },
+                    honest_end,
+                )
+            }
+        };
+        if old_len == self.widest {
+            self.widest = self.ranges.iter().map(Grant::len).max().unwrap_or_default();
+        }
+        // Demotion pendings of this incumbent wholly beyond the shrunk
+        // end are moot — their region's custody is provably retired
+        // (the fence column); partial overlaps clamp to the new end so a
+        // later ack cannot adopt-demote blocks the incumbent no longer
+        // holds.
+        let mut fence_resolved = 0usize;
+        self.pending.retain_mut(|p| {
+            if p.incumbent_token != incumbent_token {
+                return true;
+            }
+            if p.region.0 >= new_end {
+                if !p.acked {
+                    fence_resolved += 1;
+                }
+                return false;
+            }
+            p.region.1 = p.region.1.min(new_end.max(p.region.0));
+            true
+        });
+        (resolution, fence_resolved)
+    }
+
+    /// Sweep the shrink pendings whose INCUMBENT grant just retired
+    /// (release / revocation / lease expiry): the whole grant died, so
+    /// the shrink resolves trivially through the **fence column** —
+    /// custody over the contested tail is provably retired without an
+    /// ack. Returns the number resolved (the
+    /// `range_custody_tail_shrink_fence_resolves` increment).
+    pub fn sweep_shrink_pendings_of(&mut self, incumbent_token: u64) -> usize {
+        let before = self
+            .shrink_pending
+            .iter()
+            .filter(|p| p.incumbent_token == incumbent_token)
+            .count();
+        self.shrink_pending
             .retain(|p| p.incumbent_token != incumbent_token);
         before
     }

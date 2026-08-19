@@ -914,9 +914,11 @@ async fn the_learned_ceiling_stops_repeat_stretch_collisions() {
             .await
         })
     };
-    wait_until(9, "the peer's tail required never marked a SHRINK pending", || {
-        squeezefs::dlm::range_custody_stats().tail_shrinks > s0.tail_shrinks
-    })
+    wait_until(
+        9,
+        "the peer's tail required never marked a SHRINK pending",
+        || squeezefs::dlm::range_custody_stats().tail_shrinks > s0.tail_shrinks,
+    )
     .await;
     assert_eq!(
         squeezefs::dlm::range_custody_stats().demotions,
@@ -996,7 +998,10 @@ async fn the_learned_ceiling_stops_repeat_stretch_collisions() {
              free — a park here is the repeat-collision shape",
         );
     let s3 = squeezefs::dlm::range_custody_stats();
-    assert_eq!(s3.tail_shrinks, s2.tail_shrinks, "no shrink round for the probe");
+    assert_eq!(
+        s3.tail_shrinks, s2.tail_shrinks,
+        "no shrink round for the probe"
+    );
     assert_eq!(s3.demotions, s2.demotions);
     match probe {
         squeezefs::dlm::RangeAcquired::New { lease, .. } => {
@@ -1099,9 +1104,11 @@ async fn zero_true_sharing_keeps_the_shared_clauses_silent() {
             .await
         })
     };
-    wait_until(9, "the peer's run-1 required never marked a SHRINK pending", || {
-        squeezefs::dlm::range_custody_stats().tail_shrinks > s0.tail_shrinks
-    })
+    wait_until(
+        9,
+        "the peer's run-1 required never marked a SHRINK pending",
+        || squeezefs::dlm::range_custody_stats().tail_shrinks > s0.tail_shrinks,
+    )
     .await;
     client
         .renew_all()
@@ -1163,7 +1170,10 @@ async fn zero_true_sharing_keeps_the_shared_clauses_silent() {
         0,
         "zero true sharing: the B4 range-clause ledger must not move"
     );
-    assert_eq!(s1.demotions, s0.demotions, "zero demotions on the aligned interleave");
+    assert_eq!(
+        s1.demotions, s0.demotions,
+        "zero demotions on the aligned interleave"
+    );
     assert_eq!(s1.shrink_demotions, s0.shrink_demotions);
     assert!(
         squeezefs::dlm::demoted_regions(ino).is_empty(),

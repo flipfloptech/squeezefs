@@ -663,6 +663,22 @@ expired on the authority's clock — the closed ledger is
 `range_custody_demotions ≡ demotion_acks + demotion_fence_resolves`
 (healthy fleet: `fence_resolves == 0`), with
 `range_custody_demotion_fenced_publishes` the ≈ 0 crash-window tripwire.
+
+**Demotion is reserved for TRUE sharing — a stretch-tail overlap SHRINKS
+instead (§9.3a, 2026-08-19).** A grant remembers the union of the REQUIRED
+spans it was asked for; a peer's required landing only in the
+desired-minted stretch beyond that union marks the grant *shrink-pending*
+(`range_custody_tail_shrinks`) — the incumbent's next renewal carries the
+notice, its client stops serving the tail, answers its written high-water,
+and the tail is released: the asker gets exclusive custody with **no
+demotion and no shared clauses**. Only an incumbent that truly wrote into
+the contested tail escalates to the demotion barrier
+(`range_custody_shrink_demotions`, ≈ 0 on disjoint workloads). The closed
+ledger is `range_custody_tail_shrinks ≡ tail_shrink_acks +
+tail_shrink_fence_resolves` (healthy fleet: `fence_resolves == 0`), and the
+client learns a per-file stretch ceiling from each shrink
+(`range_custody_stretch_ceiling_clamps`) so a steady block-cyclic
+interleave pays at most one shrink round per custody episode.
 A shipper **retains** each extent until the covering layout version is
 visible (release is pull-only: ack-carried version, renewal observation,
 the synchronous `FlushExtents` an `fsync` forces, or the at-budget W2
@@ -702,7 +718,11 @@ fit the inline-map domain.
 `conflicts` / `waits` / `desired_trims` / `cap_refusals` (must stay 0
 within budget), the demotion family
 `demotions` / `demotion_acks` / `demotion_fence_resolves` /
-`demotion_wait_ns` / `demotion_fenced_publishes` (≈ 0), and
+`demotion_wait_ns` / `demotion_fenced_publishes` (≈ 0), the §9.3a
+tail-shrink family `tail_shrinks` / `tail_shrink_acks` /
+`tail_shrink_fence_resolves` (`shrinks ≡ acks + fence_resolves`) /
+`shrink_demotions` (≈ 0 on disjoint workloads) /
+`stretch_ceiling_clamps` (client side), and
 `dlm_grant_table_bytes` (authority side, an R5 component that refuses
 admission rather than shedding custody); client-side
 `dlm_custody_range_{acquires,extensions}` and

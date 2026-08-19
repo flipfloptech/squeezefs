@@ -808,3 +808,376 @@ async fn a_range_writers_own_live_token_never_reads_stale() {
 
     auth.listener.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// §9.3a — the required-watermark TAIL SHRINK, end to end (residual board
+// item 7's fix; measured conviction
+// `.benchmarks/2026-08-19-blob-aware-merge-and-fabric-venue.md` §3). The
+// production round trip under test: the mount's forward doubling stretches
+// its grant past what it writes; a peer's REQUIRED in the stretch tail
+// parks on the SHRINK barrier (never the demotion barrier); the notice
+// rides the mount's next renewal reply; the client shrinks its covering
+// cache BEFORE the ack travels, answers its written high-water, and the
+// peer is granted EXCLUSIVE custody — plus the client-side LEARNED
+// STRETCH CEILING that stops the same interleave from colliding again.
+// ---------------------------------------------------------------------------
+
+/// Poll a stats predicate on a bounded deadline (the suite's
+/// wait_one_lost_wait pattern, generalized — no magic sleeps: the
+/// counters are the schedule).
+async fn wait_until(secs: u64, what: &str, probe: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        if probe() {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "{what}");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// **The learned stretch ceiling** (§9.3a's client half): a shrink notice
+/// teaches the client the stretch LENGTH that survived beyond its written
+/// frontier; future sequential doublings on that ino clamp to it
+/// (`range_custody_stretch_ceiling_clamps`), so a steady block-cyclic
+/// interleave pays at most ONE shrink round per custody episode — never
+/// one per stride (the fabric row's 822-conflict retry amplification).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_learned_ceiling_stops_repeat_stretch_collisions() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let _serial = serial();
+    let _restore = Restore;
+    let h = Arc::new(make(*b"ranged-ladder-07", "ranged-ladder-7").await);
+    let auth = start_authority_be(
+        "ladder-authority-7",
+        Some(h.fs.meta_backend.as_ref().unwrap().clone()),
+    );
+    // Private inode band: five pads (the suite convention).
+    for pad_name in [
+        "pad-j.dat",
+        "pad-k.dat",
+        "pad-l.dat",
+        "pad-m.dat",
+        "pad-n.dat",
+    ] {
+        let pad =
+            h.fs.create(h.req, 1, OsStr::new(pad_name), libc::S_IFREG | 0o644, 0)
+                .await
+                .unwrap();
+        h.fs.release(h.req, pad.attr.ino, pad.fh, 0, 0, false)
+            .await
+            .unwrap();
+    }
+    let (ino, fh) = create_striped_open(&h, "cyclic.dat").await;
+    let client = arm_cowriter(&auth, &h).await;
+
+    const BLK: u64 = 4 * 1024 * 1024;
+    let geometry = Some((64 * BLK, BLK));
+    let path = squeezefs::keys::inode_path(ino);
+    let s0 = squeezefs::dlm::range_custody_stats();
+
+    // Run 1 (the mount's first stride): blocks 0-1, sequential — the
+    // doubling stretches custody to [0, 16M) while the mount only ever
+    // writes [0, 8M).
+    for off in [0u64, BLK] {
+        let written =
+            h.fs.write(
+                h.req,
+                ino,
+                fh,
+                off,
+                bytes::Bytes::from(vec![0x22u8; BLK as usize]),
+                0,
+                0,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("run-1 write at {off} failed: {e:?}"))
+            .written;
+        assert_eq!(written as u64, BLK);
+    }
+
+    // The peer's block-2 required lands in the stretch tail: it must park
+    // on the SHRINK barrier — never the demotion barrier.
+    let peer = squeezefs::dlm::LocalLockManager::new().expect("peer manager");
+    let peer_task = {
+        let peer = peer.clone();
+        let path = path.clone();
+        tokio::spawn(async move {
+            peer.acquire_lock_range_scoped(
+                &path,
+                (2 * BLK, 3 * BLK),
+                (2 * BLK, 3 * BLK),
+                Duration::from_secs(20),
+                geometry,
+                Some(0xB),
+            )
+            .await
+        })
+    };
+    wait_until(9, "the peer's tail required never marked a SHRINK pending", || {
+        squeezefs::dlm::range_custody_stats().tail_shrinks > s0.tail_shrinks
+    })
+    .await;
+    assert_eq!(
+        squeezefs::dlm::range_custody_stats().demotions,
+        s0.demotions,
+        "a tail-only overlap must never fabricate a demotion"
+    );
+
+    // The notice rides the incumbent's renewal reply; the client answers
+    // its written high-water (8M ≤ the 8M floor) and the peer's grant
+    // issues EXCLUSIVE.
+    client
+        .renew_all()
+        .await
+        .expect("the incumbent's renewal carries the shrink notice");
+    let peer_grant = tokio::time::timeout(Duration::from_secs(10), peer_task)
+        .await
+        .expect("the peer resolves after the shrink ack")
+        .expect("join")
+        .expect("the peer's grant issues");
+    let peer_lease = match peer_grant {
+        squeezefs::dlm::RangeAcquired::New { lease, span } => {
+            assert_eq!(span, (2 * BLK, 3 * BLK), "the peer gets exactly its ask");
+            lease
+        }
+        other => panic!("the peer's grant is NEW exclusive custody: {other:?}"),
+    };
+    let s1 = squeezefs::dlm::range_custody_stats();
+    assert_eq!(s1.tail_shrinks - s0.tail_shrinks, 1);
+    assert_eq!(s1.tail_shrink_acks - s0.tail_shrink_acks, 1);
+    assert_eq!(s1.demotions, s0.demotions, "zero demotions throughout");
+
+    // Run 2 (the mount's next stride): blocks 4-5. The learned ceiling
+    // clamps the doubling, so the stretch never crosses into unclaimed
+    // foreign territory again.
+    for off in [4 * BLK, 5 * BLK] {
+        let written =
+            h.fs.write(
+                h.req,
+                ino,
+                fh,
+                off,
+                bytes::Bytes::from(vec![0x33u8; BLK as usize]),
+                0,
+                0,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("run-2 write at {off} failed: {e:?}"))
+            .written;
+        assert_eq!(written as u64, BLK);
+    }
+    let s2 = squeezefs::dlm::range_custody_stats();
+    assert!(
+        s2.stretch_ceiling_clamps > s1.stretch_ceiling_clamps,
+        "the learned ceiling must clamp the run-2 doubling \
+         (range_custody_stretch_ceiling_clamps)"
+    );
+    assert_eq!(
+        s2.tail_shrinks, s1.tail_shrinks,
+        "no second shrink round on the steady interleave"
+    );
+
+    // The falsifier: block 6 — exactly where the UN-clamped doubling
+    // would have stretched — is free custody NOW, without a shrink round
+    // (pre-fix this parks on a fabricated pending and dies on the ttl).
+    let probe = peer
+        .acquire_lock_range_scoped(
+            &path,
+            (6 * BLK, 7 * BLK),
+            (6 * BLK, 7 * BLK),
+            Duration::from_secs(2),
+            geometry,
+            Some(0xB),
+        )
+        .await
+        .expect(
+            "the mount's clamped stretch must leave the peer's next run \
+             free — a park here is the repeat-collision shape",
+        );
+    let s3 = squeezefs::dlm::range_custody_stats();
+    assert_eq!(s3.tail_shrinks, s2.tail_shrinks, "no shrink round for the probe");
+    assert_eq!(s3.demotions, s2.demotions);
+    match probe {
+        squeezefs::dlm::RangeAcquired::New { lease, .. } => {
+            lease.release().await.expect("probe releases")
+        }
+        other => panic!("the probe's grant is NEW: {other:?}"),
+    }
+    peer_lease.release().await.expect("peer releases");
+
+    drop(client);
+    auth.listener.shutdown();
+}
+
+/// **Zero true sharing keeps the shared clauses silent**: the full
+/// block-cyclic interleave — the mount owns runs {0-1, 4-5, 8-9}, the
+/// peer owns runs {2-3, 6-7} — with ZERO true block sharing must run
+/// with `patch_ineligible_range_shared` and
+/// `overlay_ineligible_range_shared` deltas 0, zero demotions, nothing
+/// demoted, every write of the mount acked whole and every acquire of
+/// the peer granted — and the shrink ledger closed at quiesce.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn zero_true_sharing_keeps_the_shared_clauses_silent() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let _serial = serial();
+    let _restore = Restore;
+    let h = Arc::new(make(*b"ranged-ladder-08", "ranged-ladder-8").await);
+    let auth = start_authority_be(
+        "ladder-authority-8",
+        Some(h.fs.meta_backend.as_ref().unwrap().clone()),
+    );
+    for pad_name in [
+        "pad-o.dat",
+        "pad-p.dat",
+        "pad-q.dat",
+        "pad-r.dat",
+        "pad-s.dat",
+        "pad-t.dat",
+    ] {
+        let pad =
+            h.fs.create(h.req, 1, OsStr::new(pad_name), libc::S_IFREG | 0o644, 0)
+                .await
+                .unwrap();
+        h.fs.release(h.req, pad.attr.ino, pad.fh, 0, 0, false)
+            .await
+            .unwrap();
+    }
+    let (ino, fh) = create_striped_open(&h, "interleave.dat").await;
+    let client = arm_cowriter(&auth, &h).await;
+
+    const BLK: u64 = 4 * 1024 * 1024;
+    let geometry = Some((64 * BLK, BLK));
+    let path = squeezefs::keys::inode_path(ino);
+    let s0 = squeezefs::dlm::range_custody_stats();
+    let p0 = METRICS
+        .patch_ineligible_range_shared
+        .load(Ordering::Relaxed);
+    let o0 = METRICS
+        .overlay_ineligible_range_shared
+        .load(Ordering::Relaxed);
+
+    let write = |off: u64, fill: u8| {
+        let h = h.clone();
+        async move {
+            let written =
+                h.fs.write(
+                    h.req,
+                    ino,
+                    fh,
+                    off,
+                    bytes::Bytes::from(vec![fill; BLK as usize]),
+                    0,
+                    0,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("interleave write at {off} failed: {e:?}"))
+                .written;
+            assert_eq!(written as u64, BLK, "every write acks whole");
+        }
+    };
+
+    // Mount run 1: blocks 0-1 (the doubling stretches past 8M).
+    write(0, 0x41).await;
+    write(BLK, 0x42).await;
+
+    // Peer run 1: blocks 2-3 — the transient shrink round (the ONE
+    // allowed round per episode), resolved over the renewal channel.
+    let peer = squeezefs::dlm::LocalLockManager::new().expect("peer manager");
+    let peer_task = {
+        let peer = peer.clone();
+        let path = path.clone();
+        tokio::spawn(async move {
+            peer.acquire_lock_range_scoped(
+                &path,
+                (2 * BLK, 4 * BLK),
+                (2 * BLK, 4 * BLK),
+                Duration::from_secs(20),
+                geometry,
+                Some(0xB),
+            )
+            .await
+        })
+    };
+    wait_until(9, "the peer's run-1 required never marked a SHRINK pending", || {
+        squeezefs::dlm::range_custody_stats().tail_shrinks > s0.tail_shrinks
+    })
+    .await;
+    client
+        .renew_all()
+        .await
+        .expect("the incumbent's renewal carries the shrink notice");
+    let peer_lease_1 = match tokio::time::timeout(Duration::from_secs(10), peer_task)
+        .await
+        .expect("the peer resolves after the shrink ack")
+        .expect("join")
+        .expect("the peer's run-1 grant issues")
+    {
+        squeezefs::dlm::RangeAcquired::New { lease, .. } => lease,
+        other => panic!("the peer's run-1 grant is NEW: {other:?}"),
+    };
+
+    // Mount run 2: blocks 4-5 (ceiling-clamped stretch).
+    write(4 * BLK, 0x43).await;
+    write(5 * BLK, 0x44).await;
+
+    // Peer run 2: blocks 6-7 — must grant immediately, no round of any
+    // kind (the clamp left the run unclaimed).
+    let peer_lease_2 = match peer
+        .acquire_lock_range_scoped(
+            &path,
+            (6 * BLK, 8 * BLK),
+            (6 * BLK, 8 * BLK),
+            Duration::from_secs(2),
+            geometry,
+            Some(0xB),
+        )
+        .await
+        .expect("the peer's run-2 acquire grants immediately")
+    {
+        squeezefs::dlm::RangeAcquired::New { lease, .. } => lease,
+        other => panic!("the peer's run-2 grant is NEW: {other:?}"),
+    };
+
+    // Mount run 3: blocks 8-9, plus a covered RE-write of block 1 (an
+    // overwrite beside a foreign boundary — the W1/B4 probes fire on own
+    // custody and must stay silent).
+    write(8 * BLK, 0x45).await;
+    write(9 * BLK, 0x46).await;
+    write(BLK, 0x47).await;
+
+    let s1 = squeezefs::dlm::range_custody_stats();
+    assert_eq!(
+        METRICS
+            .patch_ineligible_range_shared
+            .load(Ordering::Relaxed)
+            - p0,
+        0,
+        "zero true sharing: the W1 clause-7 ledger must not move"
+    );
+    assert_eq!(
+        METRICS
+            .overlay_ineligible_range_shared
+            .load(Ordering::Relaxed)
+            - o0,
+        0,
+        "zero true sharing: the B4 range-clause ledger must not move"
+    );
+    assert_eq!(s1.demotions, s0.demotions, "zero demotions on the aligned interleave");
+    assert_eq!(s1.shrink_demotions, s0.shrink_demotions);
+    assert!(
+        squeezefs::dlm::demoted_regions(ino).is_empty(),
+        "nothing authority-assembled on a zero-sharing row"
+    );
+    assert_eq!(
+        s1.tail_shrinks - s0.tail_shrinks,
+        (s1.tail_shrink_acks - s0.tail_shrink_acks)
+            + (s1.tail_shrink_fence_resolves - s0.tail_shrink_fence_resolves),
+        "the shrink ledger closes at quiesce"
+    );
+
+    peer_lease_1.release().await.expect("peer run-1 releases");
+    peer_lease_2.release().await.expect("peer run-2 releases");
+    drop(client);
+    auth.listener.shutdown();
+}

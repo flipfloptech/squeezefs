@@ -2119,3 +2119,396 @@ async fn range_clause_faces_share_the_core_and_refuse_stale_tokens() {
     assert_eq!(p() - p0, 1);
     assert_eq!(o() - o0, 1);
 }
+
+// ---------------------------------------------------------------------------
+// DLM S11 §9.3a — the required-watermark TAIL SHRINK (residual board item 7's
+// fix; measured conviction
+// `.benchmarks/2026-08-19-blob-aware-merge-and-fabric-venue.md` §3: the first
+// real-fabric venue's 8-rank block-cyclic ior row — 4 MiB-aligned, ZERO true
+// block sharing — fabricated +822 custody conflicts, +2,367 desired trims and
+// +9 demotions, with demotion waits bucketing to ≤4 s, because the forward
+// doubling GRANTS the stretched desired over a peer's unclaimed run and the
+// `Grant` recorded only the SPAN — no memory of required vs stretch).
+//
+// The fix: a grant carries the UNION of every REQUIRED span admitted or
+// extended into it; a foreign REQUIRED ask overlapping ONLY the desired-
+// minted tail (block-hulled with the barrier's own geometry) marks the
+// grant SHRINK-pending instead of demotion-pending, the incumbent answers
+// its written high-water on the same renewal channel, and the tail is
+// RELEASED — exclusive custody for the asker, no demotion, no sticky
+// shared clauses. Sticky demotion is reserved for TRUE sharing (a client
+// that really wrote into the contested tail). Closed ledger law:
+// `tail_shrinks ≡ tail_shrink_acks + tail_shrink_fence_resolves`.
+// ---------------------------------------------------------------------------
+
+/// §9.3a contract 1: a foreign REQUIRED over the stretch tail SHRINKS the
+/// incumbent instead of demoting the block. The asker parks exactly like
+/// a demotion barrier (same wait machinery); the incumbent's ack — its
+/// written high-water at or below the floor — shrinks the grant span back
+/// to the floor and the asker is granted EXCLUSIVE custody: `demotions`
+/// delta 0, `tail_shrinks` delta 1, nothing demoted, and the released
+/// tail is genuinely free custody afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_foreign_required_over_the_stretch_tail_shrinks_instead_of_demoting() {
+    let _g = RANGE_SERIAL.lock().await;
+    let mgr = squeezefs::dlm::LocalLockManager::new().expect("local manager");
+    let ino: u64 = 74_200_001;
+    let path = format!("inode_{ino}");
+    let geometry = Some((64 * BLK, BLK));
+    let s0 = squeezefs::dlm::range_custody_stats();
+
+    // A: the post-doubling shape — required block 3, desired blocks 0..8
+    // (the stretch the forward doubling mints on a live stream).
+    let a = mgr
+        .acquire_lock_range_scoped(
+            &path,
+            (3 * BLK, 4 * BLK),
+            (0, 8 * BLK),
+            Duration::from_secs(1),
+            geometry,
+            Some(0xA),
+        )
+        .await
+        .expect("A's stretched grant issues uncontended");
+    let (a_lease, a_token) = match a {
+        RangeAcquired::New { lease, span } => {
+            assert_eq!(span, (0, 8 * BLK), "the uncontended desired grants whole");
+            let t = lease.fencing_token();
+            (lease, t)
+        }
+        other => panic!("A's grant is NEW: {other:?}"),
+    };
+
+    // B: required block 4 — inside A's TAIL, wholly outside A's required
+    // hull (block 3). Pre-fix this marked a DEMOTION pending: fabricated
+    // block sharing on a shape with zero true sharing.
+    let b_task = {
+        let mgr = mgr.clone();
+        let path = path.clone();
+        tokio::spawn(async move {
+            mgr.acquire_lock_range_scoped(
+                &path,
+                (4 * BLK, 5 * BLK),
+                (4 * BLK, 5 * BLK),
+                Duration::from_secs(30),
+                geometry,
+                Some(0xB),
+            )
+            .await
+        })
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(9);
+    loop {
+        if squeezefs::dlm::range_custody_stats().tail_shrinks > s0.tail_shrinks {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "B's tail-only required never marked a SHRINK pending — the \
+             §9.3a arm did not engage"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!b_task.is_finished(), "B parks behind the shrink barrier");
+    assert_eq!(
+        squeezefs::dlm::range_custody_stats().demotions,
+        s0.demotions,
+        "a tail-only overlap must never mark a demotion (the fabrication \
+         the fix exists to delete)"
+    );
+
+    // The renewal-reply read: one notice naming A's grant at the
+    // block-hulled floor that frees B's ask.
+    let floor = squeezefs::dlm::shrink_notice_for(ino, a_token)
+        .expect("one unacked shrink notice for A");
+    assert_eq!(floor, 4 * BLK, "the floor is B's ask-start block boundary");
+
+    // A's ack: its written high-water sits inside its REQUIRED block —
+    // below the floor — so the tail releases whole.
+    let resolution = squeezefs::dlm::ack_tail_shrink(ino, a_token, 3 * BLK + 512 * 1024);
+    assert_eq!(
+        resolution,
+        squeezefs::dlm::ShrinkResolution::Shrunk { floor: 4 * BLK },
+        "an unwritten tail shrinks to the floor"
+    );
+
+    // B's grant issues EXCLUSIVE — no demotion, nothing authority-assembled.
+    let b = tokio::time::timeout(Duration::from_secs(10), b_task)
+        .await
+        .expect("B resolves after the shrink ack")
+        .expect("join")
+        .expect("B's grant issues");
+    let b_lease = match b {
+        RangeAcquired::New { lease, span } => {
+            assert_eq!(span, (4 * BLK, 5 * BLK), "B gets exactly its ask");
+            lease
+        }
+        other => panic!("B's grant is NEW exclusive custody: {other:?}"),
+    };
+
+    let s1 = squeezefs::dlm::range_custody_stats();
+    assert_eq!(s1.tail_shrinks - s0.tail_shrinks, 1);
+    assert_eq!(s1.tail_shrink_acks - s0.tail_shrink_acks, 1);
+    assert_eq!(
+        s1.tail_shrink_fence_resolves,
+        s0.tail_shrink_fence_resolves
+    );
+    assert_eq!(
+        s1.tail_shrinks - s0.tail_shrinks,
+        (s1.tail_shrink_acks - s0.tail_shrink_acks)
+            + (s1.tail_shrink_fence_resolves - s0.tail_shrink_fence_resolves),
+        "tail_shrinks ≡ acks + fence_resolves"
+    );
+    assert_eq!(s1.demotions, s0.demotions, "zero demotions on the clean path");
+    assert_eq!(s1.shrink_demotions, s0.shrink_demotions);
+    assert!(
+        squeezefs::dlm::demoted_regions(ino).is_empty(),
+        "the coexistence is PHYSICAL (disjoint spans), never licensed"
+    );
+
+    // A's span ends at the floor: a third scope's ask beyond B grants
+    // immediately, with no new pendings of either kind.
+    let c = mgr
+        .acquire_lock_range_scoped(
+            &path,
+            (5 * BLK, 6 * BLK),
+            (5 * BLK, 6 * BLK),
+            Duration::from_millis(500),
+            geometry,
+            Some(0xC),
+        )
+        .await
+        .expect("the released tail is free custody — C grants immediately");
+    let s2 = squeezefs::dlm::range_custody_stats();
+    assert_eq!(s2.tail_shrinks, s1.tail_shrinks, "no second shrink round");
+    assert_eq!(s2.demotions, s1.demotions);
+    match c {
+        RangeAcquired::New { lease, .. } => lease.release().await.expect("release C"),
+        other => panic!("C's grant is NEW: {other:?}"),
+    }
+    b_lease.release().await.expect("release B");
+    a_lease.release().await.expect("release A");
+}
+
+/// §9.3a contract 2: a WRITTEN tail still demotes honestly. The incumbent
+/// really wrote into the contested blocks (covered serves the authority
+/// never saw), so its ack carries a high-water INSIDE the ask — the
+/// authority shrinks only to the watermark hull, and the still-contested
+/// block runs the EXISTING demotion barrier: sticky demotion is reserved
+/// for TRUE sharing, counted `shrink_demotions`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_written_tail_still_demotes_honestly() {
+    let _g = RANGE_SERIAL.lock().await;
+    let mgr = squeezefs::dlm::LocalLockManager::new().expect("local manager");
+    let ino: u64 = 74_200_002;
+    let path = format!("inode_{ino}");
+    let geometry = Some((64 * BLK, BLK));
+    let s0 = squeezefs::dlm::range_custody_stats();
+
+    let a = mgr
+        .acquire_lock_range_scoped(
+            &path,
+            (3 * BLK, 4 * BLK),
+            (0, 8 * BLK),
+            Duration::from_secs(1),
+            geometry,
+            Some(0xA),
+        )
+        .await
+        .expect("A's stretched grant issues");
+    let (a_lease, a_token) = match a {
+        RangeAcquired::New { lease, .. } => {
+            let t = lease.fencing_token();
+            (lease, t)
+        }
+        other => panic!("A's grant is NEW: {other:?}"),
+    };
+
+    let b_task = {
+        let mgr = mgr.clone();
+        let path = path.clone();
+        tokio::spawn(async move {
+            mgr.acquire_lock_range_scoped(
+                &path,
+                (4 * BLK, 5 * BLK),
+                (4 * BLK, 5 * BLK),
+                Duration::from_secs(30),
+                geometry,
+                Some(0xB),
+            )
+            .await
+        })
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(9);
+    loop {
+        if squeezefs::dlm::range_custody_stats().tail_shrinks > s0.tail_shrinks {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "B's tail-only required never marked a SHRINK pending"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // A's ack: high-water one MiB INTO the contested block — A truly
+    // wrote there. The shrink must NOT release those bytes.
+    let resolution = squeezefs::dlm::ack_tail_shrink(ino, a_token, 4 * BLK + MIB);
+    assert_eq!(
+        resolution,
+        squeezefs::dlm::ShrinkResolution::Demoted { new_end: 5 * BLK },
+        "a written tail shrinks only to the watermark hull and escalates"
+    );
+    let s1 = squeezefs::dlm::range_custody_stats();
+    assert_eq!(s1.tail_shrinks - s0.tail_shrinks, 1);
+    assert_eq!(
+        s1.tail_shrink_acks - s0.tail_shrink_acks,
+        1,
+        "the escalating ack still closes the shrink ledger"
+    );
+    assert_eq!(
+        s1.shrink_demotions - s0.shrink_demotions,
+        1,
+        "the escalation is counted — the only remaining demotion-adjacent \
+         path on a disjoint workload"
+    );
+
+    // B re-plans on the wake and hits the HONEST demotion barrier over
+    // the truly-shared block.
+    let deadline = std::time::Instant::now() + Duration::from_secs(9);
+    loop {
+        if squeezefs::dlm::range_custody_stats().demotions > s0.demotions {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the written tail must escalate to the existing demotion barrier"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!b_task.is_finished(), "B stays parked behind the demotion barrier");
+    let notices = squeezefs::dlm::demotion_notices_for(ino, a_token);
+    assert_eq!(notices.len(), 1, "one demotion notice for A");
+    let region = notices[0];
+    assert!(
+        region.0 <= 4 * BLK && region.1 >= 5 * BLK,
+        "the demotion region covers the truly-shared block: {region:?}"
+    );
+    assert!(
+        squeezefs::dlm::ack_demotion(ino, a_token, region),
+        "A's demotion ack lands"
+    );
+    let b = tokio::time::timeout(Duration::from_secs(10), b_task)
+        .await
+        .expect("B resolves after the demotion ack")
+        .expect("join")
+        .expect("B's grant issues under licensed coexistence");
+    let (b_lease, b_token) = match b {
+        RangeAcquired::New { lease, .. } => {
+            let t = lease.fencing_token();
+            (lease, t)
+        }
+        other => panic!("B's grant is NEW: {other:?}"),
+    };
+
+    // The demoted block classifies range-shared for BOTH holders: sticky
+    // demotion reserved for true sharing, exactly as before the fix.
+    for token in [a_token, b_token] {
+        assert!(
+            squeezefs::dlm::span_range_shared(ino, 4 * BLK, 5 * BLK, token),
+            "the truly-shared block classifies range-shared under {token:#x}"
+        );
+    }
+    let s2 = squeezefs::dlm::range_custody_stats();
+    assert_eq!(
+        s2.demotions - s0.demotions,
+        (s2.demotion_acks - s0.demotion_acks)
+            + (s2.demotion_fence_resolves - s0.demotion_fence_resolves),
+        "the demotion ledger still closes"
+    );
+
+    b_lease.release().await.expect("release B");
+    a_lease.release().await.expect("release A");
+}
+
+/// §9.3a's ledger law, fence column: an incumbent whose grant DIES
+/// un-acked (release / revocation / lease expiry) resolves its shrink
+/// pending through the fence — the whole grant retired, so the shrink
+/// resolves trivially — and the ledger closes
+/// `tail_shrinks ≡ acks + fence_resolves` with zero acks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_tail_shrink_ledger_closes_through_the_fence_column() {
+    let _g = RANGE_SERIAL.lock().await;
+    let mgr = squeezefs::dlm::LocalLockManager::new().expect("local manager");
+    let ino: u64 = 74_200_003;
+    let path = format!("inode_{ino}");
+    let geometry = Some((64 * BLK, BLK));
+    let s0 = squeezefs::dlm::range_custody_stats();
+
+    let a = mgr
+        .acquire_lock_range_scoped(
+            &path,
+            (3 * BLK, 4 * BLK),
+            (0, 8 * BLK),
+            Duration::from_secs(1),
+            geometry,
+            Some(0xA),
+        )
+        .await
+        .expect("A's stretched grant issues");
+    let a_lease = match a {
+        RangeAcquired::New { lease, .. } => lease,
+        other => panic!("A's grant is NEW: {other:?}"),
+    };
+    let b_task = {
+        let mgr = mgr.clone();
+        let path = path.clone();
+        tokio::spawn(async move {
+            mgr.acquire_lock_range_scoped(
+                &path,
+                (4 * BLK, 5 * BLK),
+                (4 * BLK, 5 * BLK),
+                Duration::from_secs(30),
+                geometry,
+                Some(0xB),
+            )
+            .await
+        })
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(9);
+    loop {
+        if squeezefs::dlm::range_custody_stats().tail_shrinks > s0.tail_shrinks {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "B's tail-only required never marked a SHRINK pending"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // A's grant dies un-acked: the shrink resolves through the fence.
+    a_lease.release().await.expect("A releases un-acked");
+    let b = tokio::time::timeout(Duration::from_secs(10), b_task)
+        .await
+        .expect("B resolves at the incumbent's death")
+        .expect("join")
+        .expect("B's grant issues");
+    let s1 = squeezefs::dlm::range_custody_stats();
+    assert_eq!(s1.tail_shrinks - s0.tail_shrinks, 1);
+    assert_eq!(s1.tail_shrink_acks, s0.tail_shrink_acks, "no ack existed");
+    assert_eq!(
+        s1.tail_shrink_fence_resolves - s0.tail_shrink_fence_resolves,
+        1,
+        "the kill row closes the ledger through the FENCE column"
+    );
+    assert_eq!(s1.demotions, s0.demotions);
+    assert!(
+        squeezefs::dlm::demoted_regions(ino).is_empty(),
+        "a fence-resolved shrink marks no demoted region"
+    );
+    match b {
+        RangeAcquired::New { lease, .. } => lease.release().await.expect("release B"),
+        other => panic!("B's grant is NEW: {other:?}"),
+    }
+}

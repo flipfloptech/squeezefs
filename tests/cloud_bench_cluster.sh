@@ -917,7 +917,11 @@ connect_all() { # connect_all <csv nqn@ip> -> resolved /dev list (in csv order)
       [ -e "$c" ] || continue
       [ "$(cat "$c")" = "$nqn" ] && { live=1; break; }
     done
-    [ "$live" = 1 ] || "$SQZ" nvmeof connect --ip "$ip" --subnqn "$nqn"
+    # >&2: the connect verb prints progress on stdout ("Connecting to
+    # NVMe-oF target at ...") and this function's stdout IS the captured
+    # device CSV — swallowed chatter reached resv-report as a "device"
+    # (the 2026-08-19 mw-preset false "no PR transport" abort).
+    [ "$live" = 1 ] || "$SQZ" nvmeof connect --ip "$ip" --subnqn "$nqn" >&2
   done
   for spec in "${SPECS[@]}"; do
     nqn="${spec%@*}"

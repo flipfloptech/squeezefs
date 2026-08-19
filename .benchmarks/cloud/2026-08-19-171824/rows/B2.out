@@ -1,0 +1,57 @@
+IOR-4.0.0: MPI Coordinated Test of Parallel I/O
+Began               : Wed Aug 19 21:23:09 2026
+Command line        : /opt/squeezefs-bench/repo/target/mw-ior/ior-4.0.0/src/ior -a POSIX -b 4m -t 4m -s 29 -w -e -k -E -G 724035788 -i 5 -F -o /scratch/mnt-cw1/s11-mpiio-fpp.dat
+Machine             : Linux ip-172-31-39-208
+TestID              : 0
+StartTime           : Wed Aug 19 21:23:09 2026
+WARNING: The file "/scratch/mnt-cw1/s11-mpiio-fpp.dat.00000001" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw2/s11-mpiio-fpp.dat.00000007" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw2/s11-mpiio-fpp.dat.00000005" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw2/s11-mpiio-fpp.dat.00000004" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw1/s11-mpiio-fpp.dat.00000003" exists already and will be overwritten
+Path                : /scratch/mnt-cw1/s11-mpiio-fpp.dat.00000000
+FS                  : 3.4 TiB   Used FS: 0.6%   Inodes: 1.0 Mi   Used Inodes: 0.0%
+
+Options: 
+api                 : POSIX
+apiVersion          : 
+test filename       : /scratch/mnt-cw1/s11-mpiio-fpp.dat
+access              : file-per-process
+type                : independent
+segments            : 29
+ordering in a file  : sequential
+ordering inter file : no tasks offsets
+nodes               : 1
+tasks               : 8
+clients per node    : 8
+repetitions         : 5
+xfersize            : 4 MiB
+blocksize           : 4 MiB
+aggregate filesize  : 928 MiB
+
+Results: 
+WARNING: The file "/scratch/mnt-cw2/s11-mpiio-fpp.dat.00000006" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw1/s11-mpiio-fpp.dat.00000002" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw1/s11-mpiio-fpp.dat.00000000" exists already and will be overwritten
+
+access    bw(MiB/s)  IOPS       Latency(s)  block(KiB) xfer(KiB)  open(s)    wr/rd(s)   close(s)   total(s)   iter
+------    ---------  ----       ----------  ---------- ---------  --------   --------   --------   --------   ----
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+write     29.41      7.39       1.27        4096       4096       0.000282   31.41      30.44      31.55      0   
+WARNING: fsync(15) failed
+write     28.66      7.18       0.892620    4096       4096       0.003106   32.33      31.66      32.38      1   
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+write     28.28      7.10       1.97        4096       4096       0.000313   32.67      31.06      32.81      2   
+write     395.19     98.81      1.78        4096       4096       0.000377   2.35       0.565214   2.35       3   
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+write     29.22      7.33       1.36        4096       4096       0.000282   31.63      30.55      31.76      4   
+
+Summary of all tests:
+Operation   Max(MiB)   Min(MiB)  Mean(MiB)     StdDev   Max(OPs)   Min(OPs)  Mean(OPs)     StdDev    Mean(s) Stonewall(s) Stonewall(MiB) Test# #Tasks tPN reps fPP reord reordoff reordrand seed segcnt   blksiz    xsize aggs(MiB)   API RefNum
+write         395.19      28.28     102.15     146.52      98.80       7.07      25.54      36.63   26.16788         NA            NA     0      8   8    5   1     0        1         0    0     29  4194304  4194304     928.0 POSIX      0
+Finished            : Wed Aug 19 21:25:20 2026

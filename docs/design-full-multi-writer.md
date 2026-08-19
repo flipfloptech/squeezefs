@@ -617,17 +617,29 @@ outstanding. Items 1–2 are the S11 completion pair; 3 is the named unlock for
 the S10 gate; the rest are carried, priced, and loud where they can fire.
 
 1. **The indirect-map width-N composition** (the width-N campaign's fix-4
-   named gap): a shared file whose composed map exceeds the inline cap
-   (≈ 6 GiB at 4 MiB blocks) spills `indirect:`, and concurrent chained
-   publishes onto it **refuse fail-safe** (fsync EIO, retried-class, volume
-   never poisoned). Needs the blob-aware owner-side merge (the authority CAN
-   read the blob — the data router is armed; the meta plane cannot).
-   Acceptance: the MPI-IO leg at ≥ 750 MiB/s probe bandwidth (it self-sizes
-   to 10 GiB). `.benchmarks/2026-08-18-s11-widthn-refs-fix.md`.
+   named gap) — **IMPLEMENTED 2026-08-19** (`feat/s11-blob-aware-merge`,
+   `5ed65ebe`; `.benchmarks/2026-08-19-blob-aware-merge-and-fabric-venue.md`):
+   the blob-aware owner-side merge composes all three sites onto the
+   rehydrated full map through the arm-installed `indirect_map` hook
+   (unarmed mounts keep the refusal verbatim; engagement gauge
+   `publish_blob_composes`; contracts `tests/mw_widthn_refs_tests.rs` §1d),
+   and the s11-mpiio rig sizes back into the 10 GiB domain. Ran the
+   indirect domain LIVE (probe 1,582 MiB/s → 10,240 MiB shared file,
+   12 iterations, zero fsync EIO — structurally impossible pre-branch).
+   **The acceptance row itself stays OPEN**: the only venue measured that
+   reaches ≥ 750 MiB/s probe (the strixhalo laptop) fails the sustained
+   flatness gate thermally, and the cheap fabric venue reaches neither
+   the bandwidth nor a valid engagement (see item 7). Re-run under
+   thermal mitigation is the open path.
+   `.benchmarks/2026-08-18-s11-widthn-refs-fix.md`.
 2. **The `SQUEEZEFS_RANGE_CUSTODY` default flip** — upheld OFF three times
    (rungs 15/17/18). Preconditions now exactly two: residual 1 closed, and
    the `s11-range` + §9.5 row gates green ×3 from zero on the flipped
-   default.
+   default. **2026-08-19 addendum**: the first real-fabric venue showed
+   the ranged plane fabricating custody contention on fully-aligned
+   disjoint writes (item 7's capture) — the flip now ALSO reads that
+   finding's fix, or a recorded ruling that localhost-gate green
+   suffices, as an input (the evidence note's verdict 4).
 3. **Per-volume claim admission — the fleet-of-authorities recipe** (§6.10
    R4): a client holding the D0 claim on ≥ 1 volume of a shared set is what
    makes the S10 tar-x gate meetable and inverts `mint_redirects` for real.
@@ -652,10 +664,24 @@ the S10 gate; the rest are carried, priced, and loud where they can fire.
    `free_grace_offsets` climbs and lane-share ENOSPC follows (a 32 GiB
    lane exhausted in ~460 passes). Wants its own row + a pressure-coupled
    release valve; `free_grace_alloc_stalls` is the live instrument.
+   **First live capture 2026-08-19** (the real-fabric mw venue):
+   `free_grace_offsets` 0 → 825 across one 8-rank row, never draining
+   (`.benchmarks/2026-08-19-blob-aware-merge-and-fabric-venue.md` §3).
 7. **The kernel-split sequential-frontier extend RTT** (the v2 desired
    stretch): live dd streams pay ~1 extend round trip per block (63/64
    extensions on `s11-range`; sub-1 % at localhost). The R2-classifier
-   window is the fabric-venue refinement.
+   window is the fabric-venue refinement. **UPGRADED to a measured
+   product finding 2026-08-19**: at real fabric RTT (AWS nvmet-tcp,
+   4 × i4i.2xlarge) the desire/extend machinery FABRICATES custody
+   contention on fully-aligned disjoint writes — 822
+   `dlm_custody_conflicts` + 2,367 `desired_trims` + 9 demotions in one
+   8-rank 4 MiB-aligned row, with demotion-barrier waits reaching the
+   ≤4 s buckets (pull-based revocation waits for the holder's renewal).
+   The s11-mpiio engagement gate correctly INVALIDATES such rows, which
+   means every fabric-venue s11 acceptance is blocked behind this fix.
+   Deserves its own red-first campaign; evidence + harvested per-phase
+   snapshots: `.benchmarks/2026-08-19-blob-aware-merge-and-fabric-venue.md`
+   §3 + `.benchmarks/cloud/2026-08-19-171824/rows/`.
 8. **The S8 serial-residual decomposition** (rungs 13/14 residuals): per-verb
    owner-side attribution of the ~11.7 shipped verbs/entry (a verb histogram
    on `meta_ship_owner_phase_ns`'s keying), the applied-name attr-serve

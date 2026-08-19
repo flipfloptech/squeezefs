@@ -1,0 +1,8 @@
+cluster=sqzbench-20260819-165213 preset=mw instance_type=i4i.2xlarge az=us-east-1b region=us-east-1 market=spot placement=none
+row=s11-mpiio shared-vs-disjoint (tests/run_mw_matrix.sh external-mounts mode)
+fleet: 1 authority + 2 co-writers co-located on client0; mounts=/scratch/mnt,/scratch/mnt-cw1,/scratch/mnt-cw2; procs/mount=4
+instrument=pinned ior 4.0.0 + mpirun (exact versions printed by the leg in the row output)
+substrate=aws-spot/i4i.2xlarge/us-east-1b (instance-store NVMe over nvmet-tcp, single NIC) — cloud substrate, a THIRD class: never spliced into devsub loop/tcp medians (docs/rc-manifest.md tiers)
+repo_commit=094b092a9e4323b7b1d0d6728e279cda4a984977
+discipline: spot interruption mid-row => COUNT ABORTED, restart from zero (never splice)
+ts=2026-08-19-165947

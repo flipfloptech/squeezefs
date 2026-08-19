@@ -1,0 +1,45 @@
+IOR-4.0.0: MPI Coordinated Test of Parallel I/O
+Began               : Wed Aug 19 21:21:00 2026
+Command line        : /opt/squeezefs-bench/repo/target/mw-ior/ior-4.0.0/src/ior -a POSIX -b 4m -t 4m -s 29 -w -e -k -E -G 724035788 -i 5 -F -o /scratch/mnt-cw1/s11-mpiio-fpp.dat
+Machine             : Linux ip-172-31-39-208
+TestID              : 0
+StartTime           : Wed Aug 19 21:21:00 2026
+Path                : /scratch/mnt-cw1/s11-mpiio-fpp.dat.00000000
+FS                  : 3.4 TiB   Used FS: 0.3%   Inodes: 1.0 Mi   Used Inodes: 0.0%
+
+Options: 
+api                 : POSIX
+apiVersion          : 
+test filename       : /scratch/mnt-cw1/s11-mpiio-fpp.dat
+access              : file-per-process
+type                : independent
+segments            : 29
+ordering in a file  : sequential
+ordering inter file : no tasks offsets
+nodes               : 1
+tasks               : 8
+clients per node    : 8
+repetitions         : 5
+xfersize            : 4 MiB
+blocksize           : 4 MiB
+aggregate filesize  : 928 MiB
+
+Results: 
+
+access    bw(MiB/s)  IOPS       Latency(s)  block(KiB) xfer(KiB)  open(s)    wr/rd(s)   close(s)   total(s)   iter
+------    ---------  ----       ----------  ---------- ---------  --------   --------   --------   --------   ----
+WARNING: fsync(15) failed
+write     29.59      7.42       31.27       4096       4096       0.009397   31.27      30.41      31.36      0   
+WARNING: fsync(15) failed
+write     29.95      7.51       30.88       4096       4096       0.000208   30.88      30.18      30.98      1   
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+write     28.38      7.10       30.78       4096       4096       0.002173   32.65      32.00      32.70      2   
+WARNING: fsync(15) failed
+write     30.03      7.54       0.605061    4096       4096       0.000423   30.76      30.30      30.90      3   
+write     383.60     95.91      2.36        4096       4096       0.000850   2.42       0.464821   2.42       4   
+
+Summary of all tests:
+Operation   Max(MiB)   Min(MiB)  Mean(MiB)     StdDev   Max(OPs)   Min(OPs)  Mean(OPs)     StdDev    Mean(s) Stonewall(s) Stonewall(MiB) Test# #Tasks tPN reps fPP reord reordoff reordrand seed segcnt   blksiz    xsize aggs(MiB)   API RefNum
+write         383.60      28.38     100.31     141.65      95.90       7.09      25.08      35.41   25.67293         NA            NA     0      8   8    5   1     0        1         0    0     29  4194304  4194304     928.0 POSIX      0
+Finished            : Wed Aug 19 21:23:08 2026

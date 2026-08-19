@@ -678,12 +678,19 @@ the S10 gate; the rest are carried, priced, and loud where they can fire.
     forward-only law): pre-fix volumes keep their orphaned C8 records
     (report-only) and their root-nlink −1 (self-suppressed at the decrement
     floor). Reformat is the clean path.
-12. **Carried non-MW standing red**:
+12. **Carried non-MW standing red — RETIRED 2026-08-18 (`07456d21`)**:
     `fsync_durability_contract_tests::test_data_barrier_precedes_the_metadata_barrier`
-    fails deterministically on dev on the flip note's box (pre-existing —
+    failed deterministically on dev on the flip note's box (pre-existing —
     verified against the un-flipped tree; `.benchmarks/2026-08-16-mw-default-flip.md`
-    residual 1). Owed its own red-first branch; not re-adjudicated by this
-    program.
+    residual 1). Adjudicated a HARNESS race, not a durability hole: the
+    50 ms checkpoint cadence tick barriers land in the same
+    `meta_device_syncs` funnel the assertion reads, so a background tick
+    inside the fault window read as "metadata barrier ran despite a failed
+    data barrier" (bare 0/3 red vs timer-parked 5/5 green; the fsync path
+    itself early-returns before any meta barrier on a failed data barrier).
+    The pin parks the timer via `SQUEEZEFS_META_FLUSH_INTERVAL_MS` — the
+    registry's own idiom — keeping the assertion's full teeth. Re-verified
+    green 2026-08-19 (serial gate shape + 5× default-parallel).
 13. **Rig-class notes** (no product change owed): the ior venue pins
     (`--map-by :OVERSUBSCRIBE`, `-std=gnu17` under GCC ≥ 15 — recorded in
     `run_mw_matrix.sh`), the kept-vs-deleted publish-plane/delete-plane

@@ -5427,6 +5427,14 @@ pub struct Metrics {
     pub layout_indirect_map_reads: Align64<AtomicU64>,
     /// Bytes read by `layout_indirect_map_reads`.
     pub layout_indirect_map_read_bytes: Align64<AtomicU64>,
+    /// The engagement gauge for the rung-20 residual-1 compose arm —
+    /// owner-side blob-aware compositions (chained merges + scoped Puts
+    /// onto/from indirect heads: rehydrate the blob, compose onto the
+    /// FULL map, fresh CoW blob or inline collapse, accounting
+    /// recomputed against the full head). 0 on unarmed mounts by
+    /// construction (the `indirect_map_io` hook installs only at
+    /// multi-writer arm; unarmed the sites keep the rung-19 refusal).
+    pub publish_blob_composes: Align64<AtomicU64>,
     // Terminal-free device reclaim economy (the shim-write-amplification
     // fix — `.benchmarks/2026-07-27-shim-write-amplification.md`;
     // classification `routing::free_reclaim_op`, contract
@@ -9528,6 +9536,7 @@ impl SqueezefsFilesystem {
                 "publish_indirect_blob_bytes": METRICS.publish_indirect_blob_bytes.load(Ordering::Relaxed),
                 "layout_indirect_map_reads": METRICS.layout_indirect_map_reads.load(Ordering::Relaxed),
                 "layout_indirect_map_read_bytes": METRICS.layout_indirect_map_read_bytes.load(Ordering::Relaxed),
+                "publish_blob_composes": METRICS.publish_blob_composes.load(Ordering::Relaxed),
                 "layout_delta_commits": crate::meta_backend::kv::META_KV_LAYOUT_DELTA_COMMITS.load(Ordering::Relaxed),
                 "layout_full_commits": crate::meta_backend::kv::META_KV_LAYOUT_FULL_COMMITS.load(Ordering::Relaxed),
                 "layout_delta_bytes": crate::meta_backend::kv::META_KV_LAYOUT_DELTA_BYTES.load(Ordering::Relaxed),

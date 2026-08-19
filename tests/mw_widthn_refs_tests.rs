@@ -240,11 +240,16 @@ fn install_test_resolver() {
     }));
 }
 
+/// The 1d pins' in-memory blob store (key → decoded map entries).
+type BlobStore = Arc<Mutex<HashMap<String, Vec<(u32, String)>>>>;
+/// A boxed hook future (the `IndirectMapIo` closure shapes).
+type MapIoFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+
 /// Handles into the in-memory blob store the 1d pins' map hook serves —
 /// the oracle for "which blob holds which map" and "which blob keys the
 /// commit freed".
 struct MapIoHandles {
-    blobs: Arc<Mutex<HashMap<String, Vec<(u32, String)>>>>,
+    blobs: BlobStore,
     freed: Arc<Mutex<Vec<String>>>,
 }
 
@@ -255,16 +260,13 @@ struct MapIoHandles {
 /// production hook (`multi_writer::arm_multi_writer`) is the router's
 /// read/spill/free ladder behind the same seam.
 fn install_test_map_io() -> MapIoHandles {
-    let blobs: Arc<Mutex<HashMap<String, Vec<(u32, String)>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let blobs: BlobStore = Arc::new(Mutex::new(HashMap::new()));
     let freed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let seq = Arc::new(AtomicU64::new(0));
 
     let b = Arc::clone(&blobs);
     let read = Arc::new(
-        move |key: String| -> Pin<
-            Box<dyn Future<Output = Result<Vec<(u32, String)>, SqueezefsError>> + Send>,
-        > {
+        move |key: String| -> MapIoFut<Result<Vec<(u32, String)>, SqueezefsError>> {
             let b = Arc::clone(&b);
             Box::pin(async move {
                 b.lock().unwrap().get(&key).cloned().ok_or_else(|| {
@@ -278,9 +280,7 @@ fn install_test_map_io() -> MapIoHandles {
     let write = Arc::new(
         move |_ino: u64,
               entries: Vec<(u32, String)>|
-              -> Pin<
-            Box<dyn Future<Output = Result<(String, IndirectBlobGuard), SqueezefsError>> + Send>,
-        > {
+              -> MapIoFut<Result<(String, IndirectBlobGuard), SqueezefsError>> {
             let b = Arc::clone(&b);
             let s = Arc::clone(&s);
             Box::pin(async move {
@@ -292,14 +292,12 @@ fn install_test_map_io() -> MapIoHandles {
         },
     );
     let f = Arc::clone(&freed);
-    let free = Arc::new(
-        move |key: String| -> Pin<Box<dyn Future<Output = ()> + Send>> {
-            let f = Arc::clone(&f);
-            Box::pin(async move {
-                f.lock().unwrap().push(key);
-            })
-        },
-    );
+    let free = Arc::new(move |key: String| -> MapIoFut<()> {
+        let f = Arc::clone(&f);
+        Box::pin(async move {
+            f.lock().unwrap().push(key);
+        })
+    });
     indirect_map::install_indirect_map_io(IndirectMapIo { read, write, free });
     MapIoHandles { blobs, freed }
 }
@@ -913,7 +911,10 @@ async fn an_armed_chained_merge_composes_onto_the_indirect_head() {
         "the composed head names the FRESH blob (CoW — never the \
          predecessor rewritten in place)"
     );
-    assert!(head.block_map.is_none(), "an indirect head carries no inline map");
+    assert!(
+        head.block_map.is_none(),
+        "an indirect head carries no inline map"
+    );
 
     // The fresh blob holds the FULL composed map: planted with block 3
     // replaced.
@@ -1010,12 +1011,7 @@ async fn an_armed_scoped_put_composes_over_the_indirect_durable_head() {
                 refs: vec![
                     frame_op("be://data:K_old", ino, 0, true),
                     frame_op("be://data:K_peer", ino, 5, true),
-                    frame_op(
-                        "be://data:999",
-                        ino,
-                        block_refs::BLOCK_INDEX_MAP_BLOB,
-                        true,
-                    ),
+                    frame_op("be://data:999", ino, block_refs::BLOCK_INDEX_MAP_BLOB, true),
                 ],
                 lease_epoch: epoch,
                 request_id: 0xB1,
@@ -1166,12 +1162,7 @@ async fn an_armed_scoped_put_reads_the_shipped_side_blob() {
                 refs: vec![
                     frame_op("be://data:K_new", ino, 0, true),
                     frame_op("be://data:K_mine", ino, 5, true),
-                    frame_op(
-                        "be://data:999",
-                        ino,
-                        block_refs::BLOCK_INDEX_MAP_BLOB,
-                        true,
-                    ),
+                    frame_op("be://data:999", ino, block_refs::BLOCK_INDEX_MAP_BLOB, true),
                 ],
                 lease_epoch: epoch,
                 request_id: 0xB4,
@@ -1331,10 +1322,7 @@ async fn armed_batch_mates_compose_onto_the_accumulated_view() {
     freed.sort_unstable();
     assert_eq!(
         freed,
-        vec![
-            "be://data:999".to_string(),
-            "be://data:fresh-1".to_string()
-        ],
+        vec!["be://data:999".to_string(), "be://data:fresh-1".to_string()],
         "the displaced predecessor and the superseded intermediate blob \
          both freed after the ONE commit"
     );

@@ -109,7 +109,10 @@ pub fn parse_inode_from_path(path: &str) -> u64 {
 /// covers the KV record framing (xattr name + envelope) so the persisted
 /// `"layout"` value stays under the node layer's own record cap, with slack
 /// for the non-block-map layout fields. 4 KiB at every knob setting.
-const LAYOUT_INLINE_HEADROOM: usize = 4096;
+/// `pub` since rung 20 residual 1: the custody-scoped compose
+/// (`meta_ship::publish`) derives the SAME inline ceiling when deciding
+/// whether a rehydrated composition collapses back inline or re-spills.
+pub const LAYOUT_INLINE_HEADROOM: usize = 4096;
 
 /// The persisted `"layout"` xattr value — lives in [`crate::layout_wire`]
 /// since the write-commit-economy campaign (the KV fold layer folds

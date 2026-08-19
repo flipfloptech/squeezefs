@@ -270,6 +270,119 @@ pub fn router_range_geometry(
     Arc::new(RouterRangeGeometry { meta, backend })
 }
 
+/// Rung 20 residual 1: the PRODUCTION indirect-map I/O hook — the
+/// authority's data router behind the
+/// [`crate::meta_backend::kv::indirect_map`] seam, so the owner-side
+/// compose sites can rehydrate/rewrite/free indirect map blobs.
+///
+/// * `read` — one whole-block device read + the versioned decode
+///   ([`crate::routing::decode_indirect_block_map`]), counted on the
+///   existing `layout_indirect_map_read{s,_bytes}` gauges.
+/// * `write` — the router spill arm's ladder VERBATIM (DUR-6): encode,
+///   one-block bound check (LOUD overflow), pad to 4096, allocate on the
+///   active backend, in-flight register + RES-9 mint guard, persist key,
+///   `write_block`, **`flush()`** (§3 — the blob is durable BEFORE the
+///   naming commit), counted on `publish_indirect_blob_bytes`.
+/// * `free` — best-effort terminal free of a DISPLACED blob (called
+///   strictly post-commit); failure is a warn, never an error — the
+///   ledger already released the reference, and `trim --full`/remount
+///   derivation reclaims stragglers.
+fn indirect_map_io_for(
+    backend: Arc<crate::routing::BackendRouter>,
+) -> crate::meta_backend::kv::indirect_map::IndirectMapIo {
+    use crate::meta_backend::kv::indirect_map::{IndirectBlobGuard, IndirectMapIo};
+    use std::future::Future;
+    use std::pin::Pin;
+
+    let read_router = Arc::clone(&backend);
+    let read = Arc::new(
+        move |key: String| -> Pin<Box<dyn Future<Output = Result<Vec<(u32, String)>>> + Send>> {
+            let router = Arc::clone(&read_router);
+            Box::pin(async move {
+                let block_size = router.block_size.load(Ordering::Relaxed) as usize;
+                let raw = router.read_block(&key, block_size).await?;
+                crate::fuse_client::METRICS
+                    .layout_indirect_map_reads
+                    .fetch_add(1, Ordering::Relaxed);
+                crate::fuse_client::METRICS
+                    .layout_indirect_map_read_bytes
+                    .fetch_add(raw.len() as u64, Ordering::Relaxed);
+                crate::routing::decode_indirect_block_map(&raw)
+            })
+        },
+    );
+
+    let write_router = Arc::clone(&backend);
+    let write = Arc::new(
+        move |ino: u64,
+              entries: Vec<(u32, String)>|
+              -> Pin<Box<dyn Future<Output = Result<(String, IndirectBlobGuard)>> + Send>> {
+            let router = Arc::clone(&write_router);
+            Box::pin(async move {
+                let map: std::collections::HashMap<u32, String> = entries.into_iter().collect();
+                let mut serialized = crate::routing::encode_indirect_block_map(&map)?;
+                // The blob lives in ONE allocator block and the fetch path
+                // reads exactly one block back — overflow fails LOUD (writing
+                // past the block would corrupt the neighboring allocation).
+                let block_size = router.block_size.load(Ordering::Relaxed) as usize;
+                if serialized.len() > block_size {
+                    return Err(SqueezefsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "rung 20: composed indirect block map for ino {ino} ({} entries, \
+                         {} B serialized) exceeds one {block_size} B block",
+                            map.len(),
+                            serialized.len()
+                        ),
+                    )));
+                }
+                let aligned_len = (serialized.len() + 4095) & !4095;
+                serialized.resize(aligned_len, 0);
+                let (be_id, block_allocator, nvme_writer) = router.get_active_backend()?;
+                let offset = block_allocator.allocate_block().await?;
+                let inflight = block_allocator.inflight_register(offset);
+                // RES-9: any `?` between here and the caller's naming commit
+                // frees the fresh blob instead of leaking an allocated block
+                // no map will ever name.
+                let minted = crate::assembly_tasks::MintedBlockGuard::new(
+                    Arc::clone(&block_allocator),
+                    offset,
+                );
+                let block_key = router.persist_block_key(&be_id, offset);
+                let data = bytes::Bytes::from(serialized);
+                let blob_len = data.len() as u64;
+                nvme_writer.write_block(offset, data).await?;
+                // DUR-6 §3 — barrier BEFORE the naming commit: the device
+                // write is volatile until its cache is flushed, and a commit
+                // naming un-flushed bytes can lose the map on power loss.
+                nvme_writer.flush().await?;
+                crate::fuse_client::METRICS
+                    .publish_indirect_blob_bytes
+                    .fetch_add(blob_len, Ordering::Relaxed);
+                Ok((block_key, IndirectBlobGuard::new(inflight, minted)))
+            })
+        },
+    );
+
+    let free_router = Arc::clone(&backend);
+    let free = Arc::new(
+        move |key: String| -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            let router = Arc::clone(&free_router);
+            Box::pin(async move {
+                if let Err(e) = router.free_block(&key).await {
+                    log::warn!(
+                        "rung 20: freeing displaced indirect map blob '{key}' failed ({e}) — \
+                         the ledger already released it; trim --full / remount derivation \
+                         reclaims the block"
+                    );
+                }
+            })
+        },
+    );
+
+    IndirectMapIo { read, write, free }
+}
+
 /// Where the authority binds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Bind {
@@ -368,6 +481,10 @@ impl MultiWriterArm {
         // Rung 19: the refs resolver dies with the authority (it holds
         // the data router; a disarmed mount serves no composed commits).
         crate::meta_backend::kv::block_refs::uninstall_block_ref_resolver();
+        // Rung 20: the indirect-map I/O hook dies with it too (same
+        // router; a disarmed mount's indirect heads go back to the
+        // fail-safe refusal).
+        crate::meta_backend::kv::indirect_map::uninstall_indirect_map_io();
         if let Some(hold) = self.wero.take() {
             data_custody::release_hold(hold).await;
         }
@@ -763,6 +880,17 @@ pub async fn arm_multi_writer(
         let refs_backend = Arc::clone(backend);
         crate::meta_backend::kv::block_refs::install_block_ref_resolver(Arc::new(
             move |key: &str, ino: u64, idx: u32| refs_backend.block_ref_for(key, ino, idx),
+        ));
+        // Rung 20 residual 1 (the blob-aware owner-side merge): the
+        // indirect-map I/O hook — the authority's data router lent to the
+        // meta plane, so the three owner-side compose sites (the
+        // aggregated conveyor member, the direct chained merge, the
+        // custody-scoped Put) REHYDRATE an indirect head's blob and
+        // compose onto the FULL map instead of refusing forever (the
+        // s11-mpiio row's retried-class fsync-EIO wedge). Arms wherever
+        // the refs resolver does; unarmed mounts keep the refusal.
+        crate::meta_backend::kv::indirect_map::install_indirect_map_io(indirect_map_io_for(
+            Arc::clone(backend),
         ));
     }
     data_grant::install_custody_owner(Arc::clone(&owner));

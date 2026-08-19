@@ -2018,6 +2018,23 @@ pub async fn readdir_stream(
 // The owner side
 // ---------------------------------------------------------------------------
 
+/// Rung 20 residual 1: the custody-scoped compose's blob custody, carried
+/// from [`PublishService::custody_scoped_layout`] back to the `execute()`
+/// arm — `Default` (all-inert) on every verbatim/inline arm.
+#[derive(Default)]
+struct ScopedBlobCustody {
+    /// RES-9 guard for a freshly written re-spill blob: disarmed after
+    /// `set_layout_and_size` lands; dropped ARMED on any error path
+    /// (freeing the fresh blob).
+    fresh: Option<crate::meta_backend::kv::indirect_map::IndirectBlobGuard>,
+    /// The compose arm recomputes blob custody ENTIRELY — the caller's
+    /// `is_map_blob()` frame ops must NOT extend the recomputed refs.
+    drop_caller_blob_ops: bool,
+    /// Displaced blob keys (the durable side's old blob) freed strictly
+    /// AFTER the commit stopped naming them.
+    free_after_commit: Vec<String>,
+}
+
 /// The publish path executed for a peer, against the volumes this node has
 /// authority over.
 ///
@@ -2601,18 +2618,28 @@ impl PublishService {
     /// s11-blockcyclic drift arithmetic). `None` on every verbatim arm
     /// (and with no resolver armed): the caller's ops stand, byte-
     /// identical to the pre-rung-19 shape.
+    ///
+    /// Rung 20 residual 1 (the blob-aware compose): with the
+    /// [`crate::meta_backend::kv::indirect_map::indirect_map_io`] hook
+    /// armed, an INDIRECT layout on EITHER side rehydrates from its blob
+    /// and the scoped compose runs over FULL maps; the composed result
+    /// re-encodes inline where it fits (the collapse arm) or re-spills
+    /// to a fresh CoW blob. Unarmed mounts keep the refusal verbatim.
+    /// The third return value is the compose's blob custody (RES-9
+    /// guard, post-commit frees, and the drop-caller-blob-ops verdict) —
+    /// `Default` on every verbatim arm.
     async fn custody_scoped_layout(
         &self,
         client: &str,
         ino: u64,
         shipped: Vec<u8>,
-    ) -> Result<(Vec<u8>, Option<Vec<BlockRefOp>>)> {
+    ) -> Result<(Vec<u8>, Option<Vec<BlockRefOp>>, ScopedBlobCustody)> {
         let Some(owner) = crate::data_grant::custody_owner() else {
-            return Ok((shipped, None));
+            return Ok((shipped, None, ScopedBlobCustody::default()));
         };
         let spans = match owner.client_custody_on(client, ino) {
             crate::data_grant::ClientCustodyShape::Ranges(spans) => spans,
-            _ => return Ok((shipped, None)),
+            _ => return Ok((shipped, None, ScopedBlobCustody::default())),
         };
         let block = match owner.geometry_of(ino).await {
             Some((_size, block)) if block > 0 => block,
@@ -2634,7 +2661,8 @@ impl PublishService {
         use crate::meta_backend::Metadata as _;
         let durable = match self.inner.getxattr(ino, "layout").await {
             Ok(Some(bytes)) => bytes,
-            _ => return Ok((shipped, None)), // no current layout — first Put, verbatim
+            // no current layout — first Put, verbatim
+            _ => return Ok((shipped, None, ScopedBlobCustody::default())),
         };
         let (cur_dec, new_dec) = (
             crate::layout_wire::decode_base_layout(&durable),
@@ -2642,24 +2670,93 @@ impl PublishService {
         );
         // Rung 19 (the MPI-IO row's live conviction — the 10 GiB face):
         // an INDIRECT layout on EITHER side of a RANGE holder's Put is
-        // un-composable at the meta plane (the blob is a data-plane
-        // read), and the retired verbatim arm replaced a whole-file map
-        // with the shipper's partial view — the zeros-interleave clobber
-        // at spill scale. "Scoped or not at all" (rung 18's own law):
-        // REFUSE, retried-class, naming the base.
+        // un-composable at the meta plane UNARMED (the blob is a
+        // data-plane read), and the retired verbatim arm replaced a
+        // whole-file map with the shipper's partial view — the
+        // zeros-interleave clobber at spill scale. "Scoped or not at
+        // all" (rung 18's own law): REFUSE, retried-class, naming the
+        // base. Rung 20 residual 1: an ARMED authority has a data router
+        // (`indirect_map_io`), so either side REHYDRATES from its blob
+        // and the scoped compose runs over FULL maps.
         let indirect = |r: &std::result::Result<
             crate::layout_wire::LayoutMetadata,
             crate::layout_wire::LayoutWireError,
         >| { matches!(r, Err(e) if format!("{e}").contains("indirect")) };
-        if indirect(&cur_dec) || indirect(&new_dec) {
+        let durable_indirect = indirect(&cur_dec);
+        let shipped_indirect = indirect(&new_dec);
+        let rehydrated = durable_indirect || shipped_indirect;
+        let map_io = crate::meta_backend::kv::indirect_map::indirect_map_io();
+        if rehydrated && map_io.is_none() {
             return Err(SqueezefsError::InvalidOperation(format!(
                 "layout delta base unusable: indirect base — range holder '{client}'s full                  Put for ino {ino} meets an indirect map ({} side); a custody-scoped                  compose cannot read the blob at the meta plane, and verbatim apply is                  the whole-map clobber (rung 19: refetch and recompose)",
-                if indirect(&cur_dec) { "durable" } else { "shipped" }
+                if durable_indirect { "durable" } else { "shipped" }
             )));
         }
-        let (Ok(mut cur), Ok(mut new)) = (cur_dec, new_dec) else {
-            // JSON-era/undecodable base: the legacy verbatim arm.
-            return Ok((shipped, None));
+        // Rehydrate one indirect side: raw-decode the head, read its
+        // blob, hold the FULL map inline for the compose. Failures
+        // refuse loud (retried-class context) — never verbatim apply.
+        let rehydrate = |bytes: Vec<u8>, side: &'static str| {
+            let io = map_io.clone();
+            async move {
+                let io = io.ok_or_else(|| {
+                    SqueezefsError::InvalidOperation(format!(
+                        "S11: indirect {side} layout for ino {ino} with no indirect-map hook"
+                    ))
+                })?;
+                let mut head = crate::layout_wire::decode_layout_any(&bytes).map_err(|e| {
+                    SqueezefsError::InvalidOperation(format!(
+                        "rung 20: undecodable indirect {side} layout for ino {ino}: {e}"
+                    ))
+                })?;
+                let blob = head
+                    .block_map_id
+                    .as_deref()
+                    .and_then(|id| id.strip_prefix("indirect:"))
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        SqueezefsError::InvalidOperation(format!(
+                            "rung 20: indirect {side} layout for ino {ino} names no blob"
+                        ))
+                    })?;
+                let full = (io.read)(blob.clone()).await?;
+                head.block_map = Some(full.into_iter().collect());
+                Ok::<_, SqueezefsError>((head, blob))
+            }
+        };
+        // A MIXED shape (one side indirect, the other legacy/undecodable)
+        // must keep the pre-compose REFUSAL posture: before rung 20 the
+        // indirect refusal fired ahead of the legacy verbatim arm, and
+        // relaxing it to verbatim-apply would be exactly the whole-map
+        // clobber the refusal exists to prevent.
+        let mixed_refusal = |side: &'static str| {
+            SqueezefsError::InvalidOperation(format!(
+                "S11: range holder '{client}'s Put for ino {ino} mixes an indirect layout \
+                 with a legacy/undecodable {side} base — refusing rather than applying it \
+                 verbatim (the whole-map clobber)"
+            ))
+        };
+        let mut durable_old_blob: Option<String> = None;
+        let mut cur = if durable_indirect {
+            let (head, blob) = rehydrate(durable, "durable").await?;
+            durable_old_blob = Some(blob);
+            head
+        } else {
+            match cur_dec {
+                Ok(c) => c,
+                Err(_) if shipped_indirect => return Err(mixed_refusal("durable")),
+                // JSON-era/undecodable base: the legacy verbatim arm.
+                Err(_) => return Ok((shipped, None, ScopedBlobCustody::default())),
+            }
+        };
+        let mut new = if shipped_indirect {
+            rehydrate(shipped.clone(), "shipped").await?.0
+        } else {
+            match new_dec {
+                Ok(n) => n,
+                Err(_) if durable_indirect => return Err(mixed_refusal("shipped")),
+                // JSON-era/undecodable base: the legacy verbatim arm.
+                Err(_) => return Ok((shipped, None, ScopedBlobCustody::default())),
+            }
         };
         let mut map = cur.block_map.take().unwrap_or_default();
         let new_map = new.block_map.take().unwrap_or_default();
@@ -2727,6 +2824,76 @@ impl PublishService {
         // regresses a peer's growth (truncation is the setattr plane's).
         new.size = new.size.max(cur.size);
         new.block_map = Some(map);
+        // Rung 20 residual 1: a rehydrated composition owns its own
+        // naming — the re-encode decision (inline collapse vs re-spill)
+        // is the owner's, derived from the SAME inline ceiling the
+        // router's spill arm uses. The caller's map-blob frame ops are
+        // DROPPED either way (blob custody is recomputed here); the
+        // SHIPPED blob's device block is NOT freed by the owner — it
+        // stays the shipper's own lifecycle (its `old_indirect_to_free`
+        // tail or remount derivation reclaims it: bounded one-blob
+        // residue).
+        let mut blob_custody = ScopedBlobCustody::default();
+        let mut refs = refs;
+        if rehydrated {
+            blob_custody.drop_caller_blob_ops = true;
+            new.block_map_id = None;
+            let inline_cap = self
+                .inner
+                .xattr_value_cap(ino)
+                .saturating_sub(crate::routing::LAYOUT_INLINE_HEADROOM);
+            let inline_encoded = crate::layout_wire::encode_layout(&new).map_err(|e| {
+                SqueezefsError::InvalidOperation(format!(
+                    "S11: custody-scoped layout re-encode failed for ino {ino} ({e}) — \
+                     refusing rather than applying range holder '{client}'s Put verbatim \
+                     (the zeros-interleave C8 mint)"
+                ))
+            })?;
+            let encoded = if inline_encoded.len() > inline_cap {
+                // Re-spill: fresh CoW blob (the hook's write FLUSHES
+                // before returning — DUR-6 §3), guarded until the commit
+                // names it.
+                let io = map_io.ok_or_else(|| {
+                    SqueezefsError::InvalidOperation(format!(
+                        "S11: rehydrated compose for ino {ino} with no indirect-map hook"
+                    ))
+                })?;
+                let full_map = new.block_map.take().unwrap_or_default();
+                let mut sorted: Vec<(u32, String)> = full_map.into_iter().collect();
+                sorted.sort_unstable_by_key(|&(b, _)| b);
+                let (fresh, guard) = (io.write)(ino, sorted).await?;
+                new.block_map_id = Some(format!("indirect:{fresh}"));
+                if let Some(r) = refs.as_mut() {
+                    crate::meta_backend::kv::indirect_map::push_map_blob_transfer_op(
+                        r, &fresh, ino, true,
+                    );
+                }
+                blob_custody.fresh = Some(guard);
+                crate::layout_wire::encode_layout(&new).map_err(|e| {
+                    SqueezefsError::InvalidOperation(format!(
+                        "S11: custody-scoped layout re-encode failed for ino {ino} ({e}) — \
+                         refusing rather than applying range holder '{client}'s Put verbatim \
+                         (the zeros-interleave C8 mint)"
+                    ))
+                })?
+            } else {
+                inline_encoded
+            };
+            // Either way the composed head stops naming the DURABLE old
+            // blob: release its record, free it after the commit.
+            if let Some(old) = durable_old_blob {
+                if let Some(r) = refs.as_mut() {
+                    crate::meta_backend::kv::indirect_map::push_map_blob_transfer_op(
+                        r, &old, ino, false,
+                    );
+                }
+                blob_custody.free_after_commit.push(old);
+            }
+            crate::fuse_client::METRICS
+                .publish_blob_composes
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok((encoded, refs, blob_custody));
+        }
         // Scoped or not at all (rung 18): a re-encode failure refuses —
         // the retired fallback applied the shipped Put verbatim, which is
         // the same peer-reverting mint the no-geometry arm minted.
@@ -2737,7 +2904,7 @@ impl PublishService {
                  zeros-interleave C8 mint)"
             ))
         })?;
-        Ok((encoded, refs))
+        Ok((encoded, refs, blob_custody))
     }
 
     async fn execute(&self, client: &str, call: PublishCall) -> Result<PublishReply> {
@@ -2750,16 +2917,22 @@ impl PublishService {
                 ..
             } => {
                 let refs: Vec<BlockRefOp> = refs.into_iter().map(BlockRefOp::from).collect();
-                let (layout, recomputed) = self.custody_scoped_layout(client, ino, layout).await?;
+                let (layout, recomputed, mut blob_custody) =
+                    self.custody_scoped_layout(client, ino, layout).await?;
                 // Rung 19: on the SCOPED arm the accounting is the
                 // composition's own diff; the caller's MAP-BLOB ops (the
                 // indirect blob custody transfer — index-disjoint from
-                // map entries, and unreachable on the scoped arm's
-                // inline-only bases) travel verbatim beside it. Every
-                // verbatim arm keeps the caller's frame byte-identical.
+                // map entries) travel verbatim beside it — EXCEPT on the
+                // rung-20 compose arm, where the owner recomputes blob
+                // custody entirely and the caller's blob ops are DROPPED
+                // (staged verbatim they double-count / mis-name blobs
+                // the composition renamed). Every verbatim arm keeps the
+                // caller's frame byte-identical.
                 let refs: Vec<BlockRefOp> = match recomputed {
                     Some(mut r) => {
-                        r.extend(refs.iter().filter(|o| o.reference.is_map_blob()).copied());
+                        if !blob_custody.drop_caller_blob_ops {
+                            r.extend(refs.iter().filter(|o| o.reference.is_map_blob()).copied());
+                        }
                         r
                     }
                     None => refs,
@@ -2767,6 +2940,20 @@ impl PublishService {
                 self.inner
                     .set_layout_and_size(ino, &layout, size, &refs)
                     .await?;
+                // Rung 20: the commit named the fresh blob — custody
+                // transfers (an error above dropped the guard ARMED,
+                // freeing the fresh blob) — and the displaced durable
+                // blob is freed only NOW (the DUR-6 CoW law).
+                if let Some(g) = blob_custody.fresh.as_mut() {
+                    g.disarm();
+                }
+                if !blob_custody.free_after_commit.is_empty() {
+                    if let Some(io) = crate::meta_backend::kv::indirect_map::indirect_map_io() {
+                        for blob_key in blob_custody.free_after_commit {
+                            (io.free)(blob_key).await;
+                        }
+                    }
+                }
                 Ok(PublishReply::Unit)
             }
             PublishCall::MergeLayoutAndSize {

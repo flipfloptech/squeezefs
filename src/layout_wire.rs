@@ -612,18 +612,29 @@ impl LayoutDelta {
     }
 }
 
-/// Decode a delta's BASE layout value with the refusal ladder (module
-/// docs "Refusals"): legacy-JSON, undecodable, and `indirect:` bases
-/// are loud errors — a delta staged onto any of them is corruption.
-pub fn decode_base_layout(base: &[u8]) -> Result<LayoutMetadata, LayoutWireError> {
+/// Decode a layout value WITHOUT the indirect refusal (legacy-JSON and
+/// undecodable bases still refuse loud). For the OWNER's blob-aware
+/// compose ONLY (rung 20 residual 1: an armed authority rehydrates the
+/// blob through `indirect_map_io` and composes onto the FULL map) — the
+/// fold layer must keep refusing indirect bases via
+/// [`decode_base_layout`], which is what keeps a delta staged onto one
+/// classified as corruption.
+pub fn decode_layout_any(base: &[u8]) -> Result<LayoutMetadata, LayoutWireError> {
     if base.first() == Some(&b'{') {
         return Err(LayoutWireError::BadBase(
             "legacy JSON layout base — deltas require a bincode base".into(),
         ));
     }
-    let layout: LayoutMetadata = bincode::deserialize(base).map_err(|e| {
+    bincode::deserialize(base).map_err(|e| {
         LayoutWireError::BadBase(format!("base does not decode as a bincode layout: {e}"))
-    })?;
+    })
+}
+
+/// Decode a delta's BASE layout value with the refusal ladder (module
+/// docs "Refusals"): legacy-JSON, undecodable, and `indirect:` bases
+/// are loud errors — a delta staged onto any of them is corruption.
+pub fn decode_base_layout(base: &[u8]) -> Result<LayoutMetadata, LayoutWireError> {
+    let layout = decode_layout_any(base)?;
     if layout
         .block_map_id
         .as_deref()

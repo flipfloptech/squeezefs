@@ -7263,12 +7263,15 @@ impl KvMetaBackend {
 
         let mut tx = KvTx::new();
         // Per-op outcomes: staged members await the shared commit;
-        // failed members own their error immediately.
+        // failed members own their error immediately. The fourth field
+        // is the rung-20 compose arm's RES-9 blob guard (disarmed on
+        // commit Ok; dropped-armed on Err, freeing the fresh blob).
         #[allow(clippy::type_complexity)]
         let mut staged: Vec<(
             squeezefs_ipc::sqz_channel::oneshot::Sender<crate::error::Result<(bool, u64)>>,
             bool,
             u64,
+            Option<super::indirect_map::IndirectBlobGuard>,
         )> = Vec::new();
         #[allow(clippy::type_complexity)]
         let mut failed: Vec<(
@@ -7283,6 +7286,31 @@ impl KvMetaBackend {
         let versions_stamped = self.layout_versions_stamped();
         let mut batch_heads: std::collections::HashMap<Ino, (u32, Option<(u64, u64)>)> =
             std::collections::HashMap::new();
+        // Rung 20 residual 1 — the PASS-LOCAL compose memo (the batch-
+        // prior law's blob face): same-ino batch mates compose onto the
+        // ACCUMULATED view, never a re-read of the COMMITTED blob —
+        // `xattrs.lookup` folds committed state, so re-reading would
+        // erase a pass mate's just-staged entries while their ledger refs
+        // land (the exact "1 durable vs 0 layout references" mint).
+        struct ComposedState {
+            /// The accumulated composed layout, its FULL map held
+            /// `Some(..)` inside the memo (the staged Puts carry
+            /// `block_map: None` + the fresh blob's name).
+            layout: crate::layout_wire::LayoutMetadata,
+            /// The COMMITTED head's blob — displaced once, by the first
+            /// successful compose.
+            old_blob: String,
+            /// The latest staged-but-uncommitted fresh blob for this ino
+            /// (a successor member releases + frees it).
+            prior_fresh: Option<String>,
+        }
+        let mut composed_heads: std::collections::HashMap<Ino, ComposedState> =
+            std::collections::HashMap::new();
+        // Blob keys the commit stops naming: freed strictly AFTER commit
+        // Ok (old blobs once per composed ino + every superseded
+        // intermediate fresh key); on commit Err freed NEVER (the
+        // committed heads still name the old blobs).
+        let mut displaced_blobs: Vec<String> = Vec::new();
         for mut op in batch {
             let t_iread = std::time::Instant::now();
             let v = match self.read_inode_value(op.ino).await {
@@ -7326,6 +7354,9 @@ impl KvMetaBackend {
             // (the folded-durable full Put replacing the caller's).
             let mut staged_version = 0u64;
             let mut chained_full: Option<Vec<u8>> = None;
+            // Rung 20 residual 1: this member's fresh-blob RES-9 guard
+            // (compose arm only) — disarmed with the batch commit.
+            let mut member_blob_guard: Option<super::indirect_map::IndirectBlobGuard> = None;
             if existing {
                 match self.xattrs.lookup(&key).await {
                     Ok(Some(cur)) => {
@@ -7377,16 +7408,201 @@ impl KvMetaBackend {
                                 )
                             });
                         if head_indirect {
-                            failed.push((
-                                op.done,
-                                crate::error::SqueezefsError::InvalidOperation(format!(
-                                    "layout delta base unusable: indirect base — ino {}'s                                      durable head spilled to an indirect map; a chained                                      delta cannot fold onto it and a partial full Put                                      would clobber it (rung 19: refetch and recompose)",
-                                    op.ino
-                                )),
-                            ));
-                            continue;
-                        }
-                        if op.chain && versions_stamped && base_ok {
+                            // Rung 20 residual 1: UNARMED keeps the
+                            // refusal verbatim; an ARMED authority
+                            // composes onto the FULL rehydrated map,
+                            // through the PASS-LOCAL memo so same-ino
+                            // batch mates accumulate (the batch-prior
+                            // law's blob face — a re-read of the
+                            // COMMITTED blob would erase a mate's
+                            // just-staged entries).
+                            let Some(io) = super::indirect_map::indirect_map_io() else {
+                                failed.push((
+                                    op.done,
+                                    crate::error::SqueezefsError::InvalidOperation(format!(
+                                        "layout delta base unusable: indirect base — ino {}'s                                      durable head spilled to an indirect map; a chained                                      delta cannot fold onto it and a partial full Put                                      would clobber it (rung 19: refetch and recompose)",
+                                        op.ino
+                                    )),
+                                ));
+                                continue;
+                            };
+                            let state = match composed_heads.entry(op.ino) {
+                                std::collections::hash_map::Entry::Occupied(entry) => {
+                                    entry.into_mut()
+                                }
+                                std::collections::hash_map::Entry::Vacant(vacant) => {
+                                    // First same-ino member: rehydrate the
+                                    // COMMITTED blob into the memo. No
+                                    // displaced-name bookkeeping yet — the
+                                    // old blob is displaced only by the
+                                    // first compose that actually STAGES.
+                                    let head = match XattrValue::decode(&cur) {
+                                        Ok(x) => {
+                                            match crate::layout_wire::decode_layout_any(&x.value) {
+                                                Ok(h) => h,
+                                                Err(e) => {
+                                                    failed.push((
+                                                        op.done,
+                                                        crate::error::SqueezefsError::InvalidOperation(
+                                                            format!(
+                                                                "rung 20: undecodable indirect head \
+                                                                 for ino {}: {e}",
+                                                                op.ino
+                                                            ),
+                                                        ),
+                                                    ));
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            failed.push((op.done, e.into()));
+                                            continue;
+                                        }
+                                    };
+                                    let Some(old_blob) = head
+                                        .block_map_id
+                                        .as_deref()
+                                        .and_then(|id| id.strip_prefix("indirect:"))
+                                        .map(str::to_string)
+                                    else {
+                                        // The gate matched the decode ERROR
+                                        // TEXT; the head itself names no
+                                        // blob — refuse verbatim.
+                                        failed.push((
+                                            op.done,
+                                            crate::error::SqueezefsError::InvalidOperation(format!(
+                                                "layout delta base unusable: indirect base — ino {}'s                                      durable head spilled to an indirect map; a chained                                      delta cannot fold onto it and a partial full Put                                      would clobber it (rung 19: refetch and recompose)",
+                                                op.ino
+                                            )),
+                                        ));
+                                        continue;
+                                    };
+                                    // The blob read happens BEFORE any KvTx
+                                    // staging (no node locks held; the 4a
+                                    // I-guards across data I/O follow the
+                                    // conveyor precedent).
+                                    let full = match (io.read)(old_blob.clone()).await {
+                                        Ok(f) => f,
+                                        Err(e) => {
+                                            failed.push((op.done, e));
+                                            continue;
+                                        }
+                                    };
+                                    let mut layout = head;
+                                    layout.block_map = Some(full.into_iter().collect());
+                                    vacant.insert(ComposedState {
+                                        layout,
+                                        old_blob,
+                                        prior_fresh: None,
+                                    })
+                                }
+                            };
+                            let d = match crate::layout_wire::LayoutDelta::decode(&op.delta_wire) {
+                                Ok(d) => d,
+                                Err(e) => {
+                                    failed.push((
+                                        op.done,
+                                        crate::error::SqueezefsError::InvalidOperation(format!(
+                                            "rung 20: undecodable shipped layout delta for \
+                                             ino {}: {e}",
+                                            op.ino
+                                        )),
+                                    ));
+                                    continue;
+                                }
+                            };
+                            // The accounting: this member's entries
+                            // against the ACCUMULATED view (the memo's
+                            // map, pre-apply).
+                            let mut composed_refs = if self.block_refs.is_some() {
+                                state.layout.block_map.as_ref().and_then(|memo_map| {
+                                    Self::recompute_refs_against_map(
+                                        memo_map,
+                                        &d.entries,
+                                        op.refs_owner,
+                                        &op.block_refs,
+                                    )
+                                })
+                            } else {
+                                None
+                            };
+                            // Candidate = memo + this delta. Committed
+                            // into the memo ONLY after its blob write
+                            // succeeds — a failed mate must not corrupt
+                            // the view its pass successors compose onto.
+                            let mut candidate = state.layout.clone();
+                            d.apply_to(&mut candidate);
+                            // `apply_to` clobbered `block_map_id` with
+                            // the caller's stale id — the fresh key
+                            // overrides below.
+                            let candidate_map = candidate.block_map.take().unwrap_or_default();
+                            let mut sorted: Vec<(u32, String)> =
+                                candidate_map.iter().map(|(b, k)| (*b, k.clone())).collect();
+                            sorted.sort_unstable_by_key(|&(b, _)| b);
+                            let (new_key, guard) = match (io.write)(op.ino, sorted).await {
+                                Ok(w) => w,
+                                Err(e) => {
+                                    failed.push((op.done, e));
+                                    continue;
+                                }
+                            };
+                            candidate.block_map_id = Some(format!("indirect:{new_key}"));
+                            let full = match crate::layout_wire::encode_layout(&candidate) {
+                                Ok(f) => f,
+                                Err(e) => {
+                                    failed.push((
+                                        op.done,
+                                        crate::error::SqueezefsError::InvalidOperation(format!(
+                                            "rung 20: composed indirect head re-encode failed \
+                                             for ino {}: {e}",
+                                            op.ino
+                                        )),
+                                    ));
+                                    continue;
+                                }
+                            };
+                            // The blob custody transfer: the PRIOR staged
+                            // name (this pass's latest fresh key, else
+                            // the committed blob) released, the fresh
+                            // taken.
+                            let prior_named = state
+                                .prior_fresh
+                                .clone()
+                                .unwrap_or_else(|| state.old_blob.clone());
+                            if let Some(refs) = composed_refs.as_mut() {
+                                super::indirect_map::push_map_blob_transfer_op(
+                                    refs,
+                                    &prior_named,
+                                    op.refs_owner,
+                                    false,
+                                );
+                                super::indirect_map::push_map_blob_transfer_op(
+                                    refs,
+                                    &new_key,
+                                    op.refs_owner,
+                                    true,
+                                );
+                            }
+                            if let Some(refs) = composed_refs {
+                                op.block_refs = refs;
+                            }
+                            // Staging is certain from here: commit the
+                            // candidate into the memo and record the name
+                            // the commit stops carrying.
+                            match state.prior_fresh.replace(new_key) {
+                                Some(prev) => displaced_blobs.push(prev),
+                                None => displaced_blobs.push(state.old_blob.clone()),
+                            }
+                            state.layout = candidate;
+                            state.layout.block_map = Some(candidate_map);
+                            chained_full = Some(full);
+                            use_delta = false;
+                            member_blob_guard = Some(guard);
+                            crate::fuse_client::METRICS
+                                .publish_blob_composes
+                                .fetch_add(1, Ordering::Relaxed);
+                        } else if op.chain && versions_stamped && base_ok {
                             // KD-MW-8's composition law (rung 17): the
                             // SHIPPED/granted-ino arm never gate-refuses
                             // and never re-bases with the caller's
@@ -7511,8 +7727,13 @@ impl KvMetaBackend {
                         // frame. Un-chained members (the solo path) keep
                         // their ops verbatim. The restamp above rewrites
                         // only the wire's version pair, so decoding here
-                        // reads the same entries the caller shipped.
-                        if op.chain && self.block_refs.is_some() {
+                        // reads the same entries the caller shipped. The
+                        // rung-20 compose arm already owns its accounting
+                        // (recomputed against the ACCUMULATED view) —
+                        // re-running here would clobber it back to the
+                        // caller's frame (`recompute_chained_refs`
+                        // returns `None` on an indirect head).
+                        if op.chain && self.block_refs.is_some() && !head_indirect {
                             if let Ok(d) = crate::layout_wire::LayoutDelta::decode(&op.delta_wire) {
                                 if let Some(refs) = Self::recompute_chained_refs(
                                     &cur,
@@ -7579,7 +7800,7 @@ impl KvMetaBackend {
             if self.block_refs.is_some() {
                 tx.stage_block_refs(&op.block_refs);
             }
-            staged.push((op.done, use_delta, staged_version));
+            staged.push((op.done, use_delta, staged_version, member_blob_guard));
         }
         for (done, e) in failed {
             let _ = done.send(Err(e));
@@ -7600,13 +7821,33 @@ impl KvMetaBackend {
         publish_phase_record(PublishPhase::CommitTxWait, t_tx);
         match out {
             Ok(()) => {
-                for (done, use_delta, staged_version) in staged {
+                for (done, use_delta, staged_version, blob_guard) in staged {
+                    // Rung 20: the batch commit named this member's fresh
+                    // blob — custody transfers.
+                    if let Some(mut g) = blob_guard {
+                        g.disarm();
+                    }
                     let _ = done.send(Ok((use_delta, staged_version)));
+                }
+                // Rung 20: the names the commit stopped carrying (old
+                // blobs + superseded intermediates) are freed only NOW —
+                // the DUR-6 CoW law (freeing before the barrier would
+                // destroy a still-committed map).
+                if !displaced_blobs.is_empty() {
+                    if let Some(io) = super::indirect_map::indirect_map_io() {
+                        for blob_key in displaced_blobs {
+                            (io.free)(blob_key).await;
+                        }
+                    }
                 }
             }
             Err(e) => {
                 let e: crate::error::SqueezefsError = e.into();
-                for (done, _, _) in staged {
+                // The fresh-blob guards drop ARMED with `staged` — every
+                // composed member's fresh blob is freed; the displaced
+                // names are freed NEVER (the committed heads still carry
+                // them).
+                for (done, _, _, _blob_guard) in staged {
                     let _ = done.send(Err(dup_err(&e)));
                 }
             }
@@ -7632,10 +7873,12 @@ impl KvMetaBackend {
     /// `None` keeps the caller's ops: no resolver armed (un-armed mounts,
     /// where chained merges cannot occur in production —
     /// `multi_writer::arm_multi_writer` installs it) or a head that is
-    /// not an inline decodable layout (the indirect/legacy face — a
-    /// recorded rung-19 residual; the caller's frame is today's shape
-    /// there). The caller's MAP-BLOB ops (the indirect blob custody
-    /// transfer, index-disjoint from map entries) always travel verbatim.
+    /// not an inline decodable layout (the legacy/undecodable face; the
+    /// INDIRECT face routes through the rung-20 compose arms before this
+    /// is ever called — they recompute against the FULL rehydrated map
+    /// via [`Self::recompute_refs_against_map`]). The caller's MAP-BLOB
+    /// ops (the indirect blob custody transfer, index-disjoint from map
+    /// entries) always travel verbatim.
     ///
     /// `ino` is the accounting OWNER — the GLOBAL ino (the routed layer's
     /// pre-`route_ino` identity). The block-reference key law
@@ -7650,11 +7893,26 @@ impl KvMetaBackend {
         ino: Ino,
         caller: &[super::block_refs::BlockRefOp],
     ) -> Option<Vec<super::block_refs::BlockRefOp>> {
-        use super::block_refs::BlockRefOp;
-        let resolver = super::block_refs::block_ref_resolver()?;
         let x = XattrValue::decode(cur).ok()?;
         let base = crate::layout_wire::decode_base_layout(&x.value).ok()?;
         let head = base.block_map.unwrap_or_default();
+        Self::recompute_refs_against_map(&head, entries, ino, caller)
+    }
+
+    /// The composed-view refs walk over an EXPLICIT head map — the
+    /// blob-aware compose arms (rung 20 residual 1) hand it the FULL
+    /// rehydrated map, [`Self::recompute_chained_refs`] the inline head.
+    /// Identical in-order composed-view transitions + the caller
+    /// `is_map_blob()` verbatim-extend; `None` = no resolver armed (the
+    /// caller's ops stand, byte-identical to the pre-rung-19 shape).
+    fn recompute_refs_against_map(
+        head: &std::collections::HashMap<u32, String>,
+        entries: &[(u32, String)],
+        ino: Ino,
+        caller: &[super::block_refs::BlockRefOp],
+    ) -> Option<Vec<super::block_refs::BlockRefOp>> {
+        use super::block_refs::BlockRefOp;
+        let resolver = super::block_refs::block_ref_resolver()?;
         let mut out: Vec<BlockRefOp> = Vec::with_capacity(entries.len() + 1);
         let resolve = |key: &str, idx: u32, take: bool, out: &mut Vec<BlockRefOp>| {
             match resolver(key, ino, idx) {
@@ -7742,6 +8000,11 @@ impl KvMetaBackend {
         // recomputed accounting — `None` keeps the caller's ops (the solo
         // path verbatim).
         let mut refs_override: Option<Vec<super::block_refs::BlockRefOp>> = None;
+        // Rung 20 residual 1 (the blob-aware compose): RES-9 custody for
+        // the fresh CoW blob until the commit lands, and the displaced
+        // predecessor's post-commit free.
+        let mut fresh_blob_guard: Option<super::indirect_map::IndirectBlobGuard> = None;
+        let mut displaced_blob: Option<String> = None;
         if existing {
             if let Some(cur) = self.xattrs.lookup(&key).await? {
                 let base_ok = XattrValue::decode(&cur)
@@ -7758,9 +8021,16 @@ impl KvMetaBackend {
                 if base_ok && max_chain > 0 && depth < max_chain {
                     use_delta = self.layout_deltas_ready().await;
                 }
-                // Rung 19: the chained indirect-head refusal (the
-                // aggregated pass's twin — see there).
-                if chain
+                // Rung 19: the chained indirect-head gate (the aggregated
+                // pass's twin — see there). UNARMED it refuses verbatim
+                // (fail-safe, retried-class). An ARMED authority (rung 20
+                // residual 1) HAS a data router — the blob rehydrates,
+                // the delta applies onto the FULL map, a fresh CoW blob
+                // is written (flushed BEFORE the naming commit — DUR-6
+                // §3), and the commit stages a full Put naming it, the
+                // accounting recomputed against the full head plus the
+                // blob custody transfer.
+                let head_indirect = chain
                     && self.layout_versions_stamped()
                     && base_ok
                     && XattrValue::decode(&cur).is_ok_and(|x| {
@@ -7768,13 +8038,85 @@ impl KvMetaBackend {
                             crate::layout_wire::decode_base_layout(&x.value),
                             Err(e) if format!("{e}").contains("indirect")
                         )
-                    })
-                {
-                    return Err(crate::error::SqueezefsError::InvalidOperation(format!(
-                        "layout delta base unusable: indirect base — ino {ino}'s durable                          head spilled to an indirect map; a chained delta cannot fold onto                          it and a partial full Put would clobber it (rung 19: refetch and                          recompose)"
-                    )));
-                }
-                if chain && self.layout_versions_stamped() && base_ok {
+                    });
+                if head_indirect {
+                    let Some(io) = super::indirect_map::indirect_map_io() else {
+                        return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                            "layout delta base unusable: indirect base — ino {ino}'s durable                          head spilled to an indirect map; a chained delta cannot fold onto                          it and a partial full Put would clobber it (rung 19: refetch and                          recompose)"
+                        )));
+                    };
+                    let x = XattrValue::decode(&cur)?;
+                    let head = crate::layout_wire::decode_layout_any(&x.value).map_err(|e| {
+                        crate::error::SqueezefsError::InvalidOperation(format!(
+                            "rung 20: undecodable indirect head for ino {ino}: {e}"
+                        ))
+                    })?;
+                    // The gate matched on the decode ERROR TEXT; re-derive
+                    // the blob key honestly from the head itself.
+                    let Some(old_blob) = head
+                        .block_map_id
+                        .as_deref()
+                        .and_then(|id| id.strip_prefix("indirect:"))
+                        .map(str::to_string)
+                    else {
+                        return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                            "layout delta base unusable: indirect base — ino {ino}'s durable                          head spilled to an indirect map; a chained delta cannot fold onto                          it and a partial full Put would clobber it (rung 19: refetch and                          recompose)"
+                        )));
+                    };
+                    // The blob read/write happens BEFORE any KvTx staging
+                    // — no node locks are held here (commit takes leaf
+                    // locks internally); the held 4a I-guard across data
+                    // I/O follows the conveyor precedent.
+                    let full_entries = (io.read)(old_blob.clone()).await?;
+                    let full_map: std::collections::HashMap<u32, String> =
+                        full_entries.into_iter().collect();
+                    // The accounting: the delta's entries against the
+                    // FULL head (the map-entry half; the blob custody
+                    // transfer joins once the fresh key exists).
+                    let mut composed_refs = if self.block_refs.is_some() {
+                        Self::recompute_refs_against_map(
+                            &full_map,
+                            &delta.entries,
+                            refs_owner,
+                            block_refs,
+                        )
+                    } else {
+                        None
+                    };
+                    let mut composed = head;
+                    composed.block_map = Some(full_map);
+                    delta.apply_to(&mut composed);
+                    // `apply_to` clobbered `block_map_id` with the
+                    // caller's stale id — the fresh key overrides below.
+                    let final_map = composed.block_map.take().unwrap_or_default();
+                    let mut sorted: Vec<(u32, String)> = final_map.into_iter().collect();
+                    sorted.sort_unstable_by_key(|&(b, _)| b);
+                    let (new_key, guard) = (io.write)(ino, sorted).await?;
+                    composed.block_map_id = Some(format!("indirect:{new_key}"));
+                    if let Some(refs) = composed_refs.as_mut() {
+                        super::indirect_map::push_map_blob_transfer_op(
+                            refs, &old_blob, refs_owner, false,
+                        );
+                        super::indirect_map::push_map_blob_transfer_op(
+                            refs, &new_key, refs_owner, true,
+                        );
+                    }
+                    chained_full =
+                        Some(crate::layout_wire::encode_layout(&composed).map_err(|e| {
+                            crate::error::SqueezefsError::InvalidOperation(format!(
+                                "rung 20: composed indirect head re-encode failed for ino \
+                                 {ino}: {e}"
+                            ))
+                        })?);
+                    refs_override = composed_refs;
+                    use_delta = false;
+                    staged_version = 0;
+                    fresh_blob_guard = Some(guard);
+                    displaced_blob = Some(old_blob);
+                    crate::fuse_client::METRICS
+                        .publish_blob_composes
+                        .fetch_add(1, Ordering::Relaxed);
+                } else if chain && self.layout_versions_stamped() && base_ok {
                     // KD-MW-8 rung 17 (see `merge_layout_and_size_chained`
                     // and the aggregated pass's twin): re-stamp onto the
                     // durable head below the cap; owner-side compaction
@@ -7810,8 +8152,11 @@ impl KvMetaBackend {
                 // Rung 19 (the width-N refs composition — the aggregated
                 // pass's twin): a CHAINED merge's accounting is the
                 // entries-onto-the-folded-head transition, never the
-                // caller's frame.
-                if chain && self.block_refs.is_some() {
+                // caller's frame. The compose arm above already owns its
+                // accounting (recomputed against the FULL rehydrated
+                // head), and this call would clobber it back to `None`
+                // (`decode_base_layout` refuses indirect heads).
+                if chain && self.block_refs.is_some() && !head_indirect {
                     refs_override =
                         Self::recompute_chained_refs(&cur, &delta.entries, refs_owner, block_refs);
                 }
@@ -7859,6 +8204,20 @@ impl KvMetaBackend {
         let t_tx = std::time::Instant::now();
         self.commit_tx(tx).await?;
         publish_phase_record(PublishPhase::CommitTxWait, t_tx);
+        // Rung 20 residual 1: the commit named the fresh blob — custody
+        // transfers (the RES-9 mint guard stands down; an ERROR path
+        // above dropped it armed instead, freeing the fresh blob), and
+        // the DISPLACED predecessor is freed only NOW: the commit just
+        // stopped naming it, and freeing before the barrier would
+        // destroy the still-committed map (the DUR-6 CoW law).
+        if let Some(mut guard) = fresh_blob_guard {
+            guard.disarm();
+        }
+        if let Some(old) = displaced_blob {
+            if let Some(io) = super::indirect_map::indirect_map_io() {
+                (io.free)(old).await;
+            }
+        }
         Ok((use_delta, staged_version))
     }
 

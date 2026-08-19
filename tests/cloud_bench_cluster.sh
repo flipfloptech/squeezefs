@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # cloud_bench_cluster.sh — stand up, exercise, and tear down an occasional
-# SqueezeFS benchmark cluster on AWS EC2 SPOT instances.
+# SqueezeFS benchmark cluster on AWS EC2 (on-demand by default; MARKET=spot opts in).
 #
 # ============================ OPERATOR QUICKSTART ===========================
 #
@@ -88,6 +88,14 @@ AWS_AZ="${AWS_AZ:-us-east-1a}"
 # none (no placement group — the fallback when the cluster-PG spot pool is
 # dry; same-AZ networking only, and the row label carries the placement).
 PLACEMENT_STRATEGY="${PLACEMENT_STRATEGY:-cluster}"
+# on-demand (default) | spot. Default flipped 2026-08-19 (user ruling):
+# a spot reclaim 20 minutes into the mw acceptance session aborted the
+# count (the multi-run discipline restarts counted runs from zero), so
+# determinism is worth the ~2-3x hourly premium at these cluster sizes
+# (~$2.75/hr on-demand for the 4-node mw preset). MARKET=spot remains
+# the opt-in discount for uncounted/exploratory sessions; the market is
+# stamped into every row label either way.
+MARKET="${MARKET:-on-demand}"
 
 # --- Instance preset ------------------------------------------------------
 # i4i    = i4i.4xlarge  x N  (~$3-4/hr cluster on spot)   — the IOPS venue
@@ -284,11 +292,11 @@ done
 case "$PRESET" in
   i4i)
     INSTANCE_TYPE="i4i.4xlarge"
-    EST_CLUSTER_HOURLY="~\$3-4/hr (spot, 6 nodes)"
+    EST_CLUSTER_HOURLY="~\$12-17/hr on-demand / ~\$3-4/hr spot (6 nodes)"
     ;;
   i3en)
     INSTANCE_TYPE="i3en.12xlarge"
-    EST_CLUSTER_HOURLY="~\$10-14/hr (spot, 6 nodes)"
+    EST_CLUSTER_HOURLY="~\$30-45/hr on-demand / ~\$10-14/hr spot (6 nodes)"
     ;;
   mw)
     # ONE launch template + ONE spot fleet covers every node (the existing
@@ -307,11 +315,11 @@ case "$PRESET" in
     # brackets, and the leg's flatness/self-sizing gates catch credit sag —
     # but the row stamp records the instance types so the label stays honest.
     INSTANCE_TYPE="i4i.2xlarge"
-    EST_CLUSTER_HOURLY="~\$0.5-0.8/hr (spot, 4 nodes; planning number)"
+    EST_CLUSTER_HOURLY="~\$2.7-2.8/hr on-demand / ~\$0.5-0.8/hr spot (4 nodes; planning numbers)"
     ;;
   custom)
     [ -n "$INSTANCE_TYPE" ] || die "PRESET=custom requires INSTANCE_TYPE"
-    EST_CLUSTER_HOURLY="unknown (custom preset — check spot pricing yourself)"
+    EST_CLUSTER_HOURLY="unknown (custom preset — check $MARKET pricing yourself)"
     ;;
   *) die "PRESET must be i4i | i3en | mw | custom (got: $PRESET)" ;;
 esac
@@ -596,7 +604,7 @@ cmd_launch() {
   STATE_DIR="$STATE_ROOT/$CID"
   PG_NAME="$CID"
 
-  confirm "About to launch $N_TOTAL x $INSTANCE_TYPE SPOT instances in $AWS_AZ ($EST_CLUSTER_HOURLY), max $MAX_CLUSTER_HOURS cluster-hour(s), cluster id $CID. This COSTS MONEY."
+  confirm "About to launch $N_TOTAL x $INSTANCE_TYPE ${MARKET^^} instances in $AWS_AZ ($EST_CLUSTER_HOURLY), max $MAX_CLUSTER_HOURS cluster-hour(s), cluster id $CID. This COSTS MONEY."
 
   log "launch 1/7: operator IP for the SSH ingress rule"
   if [ -n "$OPERATOR_CIDR" ]; then
@@ -651,21 +659,26 @@ cmd_launch() {
     --tag-specifications "ResourceType=launch-template,Tags=[{Key=$TAG_KEY,Value=$CID}]" \
     --launch-template-data "{\"ImageId\":\"$ami\",\"KeyName\":\"$KEY_NAME\",\"SecurityGroupIds\":[\"$SG_ID\"]$([ "$PLACEMENT_STRATEGY" != none ] && printf ',"Placement":{"GroupName":"%s"}' "$PG_NAME"),\"TagSpecifications\":[{\"ResourceType\":\"instance\",\"Tags\":[{\"Key\":\"$TAG_KEY\",\"Value\":\"$CID\"}]}]}" \
     --query 'LaunchTemplate.LaunchTemplateId' --output text)"
-  # capacity-optimized = fewest interruptions, which is what protects the
-  # counted-run discipline. type=instant returns instance ids synchronously.
+  # on-demand (default): no interruption risk — what protects the
+  # counted-run discipline outright. spot: capacity-optimized = fewest
+  # interruptions. type=instant returns instance ids synchronously.
   local canned_ids i
   canned_ids=""
   for ((i = 0; i < N_TOTAL; i++)); do canned_ids+="i-dryrun$i "; done
+  local market_args=()
+  if [ "$MARKET" = "spot" ]; then
+    market_args+=(--spot-options 'AllocationStrategy=capacity-optimized,InstanceInterruptionBehavior=terminate')
+  fi
   local ids_text
   ids_text="$(awsq "$canned_ids" ec2 create-fleet --type instant \
     --launch-template-configs "[{\"LaunchTemplateSpecification\":{\"LaunchTemplateId\":\"$LT_ID\",\"Version\":\"\$Latest\"},\"Overrides\":[{\"InstanceType\":\"$INSTANCE_TYPE\",\"SubnetId\":\"$SUBNET_ID\",\"AvailabilityZone\":\"$AWS_AZ\"}]}]" \
-    --spot-options 'AllocationStrategy=capacity-optimized,InstanceInterruptionBehavior=terminate' \
-    --target-capacity-specification "TotalTargetCapacity=$N_TOTAL,DefaultTargetCapacityType=spot" \
+    "${market_args[@]}" \
+    --target-capacity-specification "TotalTargetCapacity=$N_TOTAL,DefaultTargetCapacityType=$MARKET" \
     --tag-specifications "ResourceType=fleet,Tags=[{Key=$TAG_KEY,Value=$CID}]" \
     --query 'Instances[].InstanceIds[]' --output text)"
   mapfile -t NODE_IDS < <(xargs -n1 <<<"$ids_text")
   [ "${#NODE_IDS[@]}" -eq "$N_TOTAL" ] \
-    || die "spot fleet delivered ${#NODE_IDS[@]}/$N_TOTAL instances (insufficient spot capacity for $INSTANCE_TYPE in $AWS_AZ?) — tearing down"
+    || die "$MARKET fleet delivered ${#NODE_IDS[@]}/$N_TOTAL instances (insufficient $MARKET capacity for $INSTANCE_TYPE in $AWS_AZ?) — tearing down"
   echo "  instances: ${NODE_IDS[*]}"
 
   log "launch 5/7: wait until running (timeout ~10 min), fetch IPs, tag roles"
@@ -1423,7 +1436,7 @@ row_stamp() { # row_stamp <label> <cmd> — the house labeling discipline, per r
   echo "# row=$1"
   echo "# order=$BENCH_ORDER"
   echo "# instrument=$ELB_VER (dynamic; sync drivers unless --iodepth stated in cmd)"
-  echo "# substrate=aws-spot/$INSTANCE_TYPE/$AWS_AZ/pg-$PLACEMENT_STRATEGY (instance-store NVMe over nvmet-tcp, single NIC)"
+  echo "# substrate=aws-$MARKET/$INSTANCE_TYPE/$AWS_AZ/pg-$PLACEMENT_STRATEGY (instance-store NVMe over nvmet-tcp, single NIC)"
   echo "# venue=cloud-bench-cluster/$PRESET cluster=$CID"
   echo "# ts=$(date -u +%FT%TZ)"
   echo "# cmd=$2"
@@ -1499,9 +1512,9 @@ EOS
   local G="$MOUNTPOINT/bench/g{1..$BENCH_THREADS}"
 
   manifest() {
-    echo "cluster=$CID preset=$PRESET instance_type=$INSTANCE_TYPE az=$AWS_AZ region=$AWS_REGION market=spot placement=$PLACEMENT_STRATEGY"
+    echo "cluster=$CID preset=$PRESET instance_type=$INSTANCE_TYPE az=$AWS_AZ region=$AWS_REGION market=$MARKET placement=$PLACEMENT_STRATEGY"
     echo "instrument=$ELB_VER"
-    echo "substrate=aws-spot/$INSTANCE_TYPE/$AWS_AZ/pg-$PLACEMENT_STRATEGY — a THIRD substrate class: never mix into devsub loop/tcp medians"
+    echo "substrate=aws-$MARKET/$INSTANCE_TYPE/$AWS_AZ/pg-$PLACEMENT_STRATEGY — a THIRD substrate class: never mix into devsub loop/tcp medians"
     echo "repo_commit=$(git rev-parse HEAD 2>/dev/null || echo unknown)"
     echo "roles: mds=$N_MDS oss=$N_OSS client=$N_CLIENT spare=$N_SPARE"
     echo "discipline: spot interruption mid-battery => COUNT ABORTED, restart from zero (never splice)"
@@ -1622,11 +1635,11 @@ EOS
   local row_cmd
   row_cmd="SQZ_BIN=$REMOTE_DIR/squeezefs SQZ_MWMATRIX_MOUNTS=$mounts_csv SQZ_MWMATRIX_ROWDIR=$REMOTE_DIR/mw-rows bash $REMOTE_DIR/repo/tests/run_mw_matrix.sh s11-mpiio --procs=$MW_IOR_PROCS"
   mw_manifest() {
-    echo "cluster=$CID preset=$PRESET instance_type=$INSTANCE_TYPE az=$AWS_AZ region=$AWS_REGION market=spot placement=$PLACEMENT_STRATEGY"
+    echo "cluster=$CID preset=$PRESET instance_type=$INSTANCE_TYPE az=$AWS_AZ region=$AWS_REGION market=$MARKET placement=$PLACEMENT_STRATEGY"
     echo "row=s11-mpiio shared-vs-disjoint (tests/run_mw_matrix.sh external-mounts mode)"
     echo "fleet: 1 authority + $MW_COWRITERS co-writers co-located on client0; mounts=$mounts_csv; procs/mount=$MW_IOR_PROCS"
     echo "instrument=pinned ior 4.0.0 + mpirun (exact versions printed by the leg in the row output)"
-    echo "substrate=aws-spot/$INSTANCE_TYPE/$AWS_AZ (instance-store NVMe over nvmet-tcp, single NIC) — cloud substrate, a THIRD class: never spliced into devsub loop/tcp medians (docs/rc-manifest.md tiers)"
+    echo "substrate=aws-$MARKET/$INSTANCE_TYPE/$AWS_AZ (instance-store NVMe over nvmet-tcp, single NIC) — cloud substrate, a THIRD class: never spliced into devsub loop/tcp medians (docs/rc-manifest.md tiers)"
     echo "repo_commit=$(git rev-parse HEAD 2>/dev/null || echo unknown)"
     echo "discipline: spot interruption mid-row => COUNT ABORTED, restart from zero (never splice)"
     echo "ts=$ts"
@@ -1635,7 +1648,7 @@ EOS
     echo "# row=s11-mpiio-shared-vs-disjoint"
     echo "# order=$BENCH_ORDER"
     echo "# instrument=pinned ior 4.0.0 + mpirun (exact versions in the leg output below)"
-    echo "# substrate=aws-spot/$INSTANCE_TYPE/$AWS_AZ/pg-$PLACEMENT_STRATEGY (instance-store NVMe over nvmet-tcp, single NIC) — cloud substrate (third class — never spliced into devsub medians)"
+    echo "# substrate=aws-$MARKET/$INSTANCE_TYPE/$AWS_AZ/pg-$PLACEMENT_STRATEGY (instance-store NVMe over nvmet-tcp, single NIC) — cloud substrate (third class — never spliced into devsub medians)"
     echo "# venue=cloud-bench-cluster/$PRESET cluster=$CID cowriters=$MW_COWRITERS procs=$MW_IOR_PROCS"
     echo "# ts=$(date -u +%FT%TZ)"
     echo "# cmd=$row_cmd"

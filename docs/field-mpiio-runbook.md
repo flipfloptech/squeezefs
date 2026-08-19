@@ -239,16 +239,22 @@ Only) with `regctl >= 1`, and the authority's `.stats` reads
 
 ## Cloud venue (cheapest shape)
 
-When the field cluster is off-limits, the same row runs on AWS EC2 spot
+When the field cluster is off-limits, the same row runs on AWS EC2
 via `tests/cloud_bench_cluster.sh` — the standing cloud tool grew an MW
 arm (`PRESET=mw`; user ruling: "it's really about CHEAPNESS when we do
-cloud testing"): **1 client + 1 mds + 2 oss = 4 × i4i.2xlarge spot
-instances, no spare**. The fleet is the co-located v5-mw shape (1
+cloud testing"): **1 client + 1 mds + 2 oss = 4 × i4i.2xlarge
+instances, no spare**. **Market default is ON-DEMAND since 2026-08-19**
+(~$2.75/hr for the 4-node mw cluster; user ruling after a spot reclaim
+20 minutes into an acceptance session aborted the count — the multi-run
+discipline restarts counted runs from zero, so determinism beats the
+discount for counted work; `MARKET=spot` stays the opt-in for
+uncounted/exploratory sessions, and every row label stamps the market).
+The fleet is the co-located v5-mw shape (1
 authority + `MW_COWRITERS` co-writers, default 2 — the leg's floor,
 sized for the 8-vCPU client; the field/design shape stays 8, so state
 the co-writer width on any row that compares the two). One tool, one
 state dir: the MW cluster rides the same max-spend guard
-(`MAX_CLUSTER_HOURS`), teardown-at-deadline process, spot-interruption
+(`MAX_CLUSTER_HOURS`), teardown-at-deadline process, instance-loss
 abort, and tag-scoped teardown sweep as every other preset.
 
 The one-command sequence (pass `PRESET=mw` on **every** subcommand — it

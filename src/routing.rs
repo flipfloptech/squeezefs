@@ -3611,6 +3611,22 @@ pub(crate) struct FillResult {
     /// downstream rule as the primary: get_block_for_index rechecks the
     /// binding; `false` forces re-resolve (unchanged semantics).
     pub serve_valid: bool,
+    /// The incarnation word the verdict was computed against —
+    /// `Some(before)` for a tracked key whose final still-check passed,
+    /// `None` for untracked keys (never freed/reallocated/patched) and for
+    /// already-invalid verdicts. The generic/209 flake fix
+    /// (`tests/write_visibility_tests.rs::patched_block_never_serves_a_held_flight_snapshot`):
+    /// the verdict is a fill-TIME snapshot, but the stored flight value
+    /// outlives the fill by the whole deferred-publish window (PERF-11 —
+    /// the guard rides the publish), and a W1 in-place patch is the one
+    /// content mutation that moves neither the binding nor any tier key
+    /// its purge can sweep. A waiter serving the STORED value must
+    /// therefore re-run the still-check against this word at ITS OWN
+    /// serve time — word unchanged ⇒ no retire/publish happened since the
+    /// fill's device read, so the bytes are current at the serve instant;
+    /// word moved ⇒ `serve_valid=false` and the caller's rebind/escalate
+    /// ladder owns convergence (the existing discipline).
+    pub verdict_word: Option<u64>,
 }
 
 /// Test seam (§5.2, the `FAIL_NEXT_WRITES` / `SIMULATE_CORRUPTION` shim
@@ -7020,13 +7036,38 @@ impl DataRouter {
                         // reintroduce the refetch churn. Same downstream
                         // rule as the primary: serve_valid=false makes the
                         // caller re-resolve the binding.
+                        //
+                        // STORED-SNAPSHOT REVALIDATION (the generic/209
+                        // held-flight fix, 2026-08-19 — pinned by
+                        // write_visibility_tests::patched_block_never_serves_a_held_flight_snapshot):
+                        // the carried verdict is a fill-TIME truth, but this
+                        // flight value outlives the fill by the whole
+                        // deferred-publish window (PERF-11 — the guard rides
+                        // the publish closure), and a W1 in-place patch
+                        // retire→DMA→publish moves neither the binding nor
+                        // any key the patch's tier purge can sweep — the
+                        // stored value is not a tier. Re-run the still-check
+                        // against the fill's own word at THIS serve instant:
+                        // unchanged ⇒ no retire/publish touched the offset
+                        // since the fill's device read, so the bytes are
+                        // current for a read that began after any earlier
+                        // ACK; moved ⇒ hand the caller the invalid verdict
+                        // and let the rebind/escalate ladder converge (its
+                        // escalated attempts fetch device-direct under the
+                        // block stripe — the arm legal churn cannot beat).
+                        // One lock-free scc probe, waiter serves only.
+                        let serve_valid = res.serve_valid
+                            && res.verdict_word.is_none_or(|before| {
+                                self.backend_router
+                                    .fill_incarnation_still(block_key, before)
+                            });
                         METRICS
                             .singleflight_waiter_result_serves
                             .fetch_add(1, Ordering::Relaxed);
                         read_serve_phase_record(ReadServePhase::SfWait, sf_t0);
                         return Ok((
                             crate::cache::pool::ReadBlockValue::Bytes(res.bytes),
-                            res.serve_valid,
+                            serve_valid,
                         ));
                     }
                     Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {
@@ -7353,7 +7394,10 @@ impl DataRouter {
                     }
                     // R1a (§5.2): hand the cohort its fill — after the RAM
                     // deposits and the final still-check, so waiters receive
-                    // exactly the primary's serve-validity verdict.
+                    // exactly the primary's serve-validity verdict PLUS the
+                    // word it was computed against (`verdict_word` — waiters
+                    // re-run the still-check at their own serve time, the
+                    // generic/209 held-flight fix).
                     // `Bytes` clone = refcount bump. Then flip the guard to
                     // close-only: the success drop must never send a second
                     // value (a late subscriber that raced the send is served
@@ -7361,6 +7405,7 @@ impl DataRouter {
                     guard.tx.send(Some(FillResult {
                         bytes: downloaded_bytes.clone(),
                         serve_valid,
+                        verdict_word: publishable.filter(|_| serve_valid),
                     }));
                     guard.completed.set(true);
                     read_fill_phase_record(ReadFillPhase::FillTotal, fill_t0);
@@ -8640,6 +8685,7 @@ impl DataRouter {
         // Guard drop broadcasts None on the error path above (waiters
         // fail fast into the re-check loop — the §5.2 contract).
         let mut serve_valid = !self.backend_router.key_incarnation_tracked(block_key);
+        let mut verdict_word: Option<u64> = None;
         if let Some(before) =
             incarnation.filter(|&b| self.backend_router.fill_incarnation_still(block_key, b))
         {
@@ -8657,7 +8703,9 @@ impl DataRouter {
             serve_valid = self
                 .backend_router
                 .fill_incarnation_still(block_key, before);
-            if !serve_valid {
+            if serve_valid {
+                verdict_word = Some(before);
+            } else {
                 self.cache.purge_block_key(block_key);
             }
         }
@@ -8672,6 +8720,7 @@ impl DataRouter {
         guard.tx.send(Some(FillResult {
             bytes: downloaded,
             serve_valid,
+            verdict_word,
         }));
         guard.completed.set(true);
         read_fill_phase_record(ReadFillPhase::FillTotal, fill_t0);

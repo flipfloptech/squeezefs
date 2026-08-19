@@ -23,6 +23,9 @@ pkgs.mkShell {
     pkgs.openmpi
     pkgs.python3
     pkgs.nvme-cli
+
+    # Cloud venue (tests/cloud_bench_cluster.sh — PRESET=mw spot clusters).
+    pkgs.awscli2
   ];
 
   # tikv-jemalloc-sys (jemalloc 5.3.0) returns `char *` from an

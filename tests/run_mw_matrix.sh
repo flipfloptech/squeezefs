@@ -3890,25 +3890,42 @@ ensure_ior() {
     log "pinned ior $IOR_VERSION ready ($IOR_BIN, sha256 $IOR_SHA256)"
 }
 
-# One MPMD ior invocation over the co-writer mounts: every app context
-# carries IDENTICAL options apart from -o (its own mount's path of the
-# SAME file — global ranks compose one shared-file layout; proven
-# semantics: `tasks: K*P`, single-shared-file, one inode). stdout to $1.
+# One ior invocation over the co-writer mounts: every rank carries
+# IDENTICAL options apart from -o (its own mount's path of the SAME
+# file — global ranks compose one shared-file layout; proven semantics:
+# `tasks: K*P`, single-shared-file, one inode). Launched single-context
+# with a rank-dispatch wrapper (see inside). stdout to $1.
 run_ior() { # outfile procs_per_mount fname extra-ior-args...
     local outfile="$1" procs="$2" fname="$3"
     shift 3
-    local args=() idx first=1
-    for idx in $(cowriter_idxs); do
-        [ "$first" = "1" ] || args+=(":")
-        first=0
-        args+=(-np "$procs" "$IOR_BIN" -a POSIX -o "$(mnt_of "$idx")/$fname" "$@")
-    done
+    # ONE app context + a rank-dispatch wrapper, NOT colon-MPMD: Ubuntu
+    # 26.04's OpenMPI 5.0.10 packaging segfaults on EVERY MPMD spelling
+    # (colon contexts AND --app appfiles — prterun GP fault in libc,
+    # convicted on the 2026-08-19 cloud venue with `-np 1 ior : -np 1
+    # ior`; single-context runs fine). Rank r opens
+    # mounts[r / procs]/fname — exactly the global-rank -> app-context
+    # assignment the MPMD form produced (context k owned ranks
+    # k*procs .. k*procs+procs-1), so the composed shared-file semantics
+    # (`tasks: K*P`, one inode) are unchanged and the launcher works on
+    # any MPI packaging.
+    local mounts=() idx
+    for idx in $(cowriter_idxs); do mounts+=("$(mnt_of "$idx")"); done
+    local total=$((${#mounts[@]} * procs))
+    local wrapper="${outfile%.out}.dispatch.sh"
+    {
+        printf '#!/bin/bash\nset -eu\n'
+        printf 'mounts=(%s)\n' "${mounts[*]}"
+        printf 'r="${OMPI_COMM_WORLD_RANK:-${PMIX_RANK:-${PMI_RANK:-0}}}"\n'
+        printf 'exec "$@" -o "${mounts[$((r / %s))]}/%s"\n' "$procs" "$fname"
+    } >"$wrapper"
+    chmod +x "$wrapper"
     # --bind-to none: 32 ranks + N daemons share the cores — MPI core
     # binding would pin ranks onto the daemons' lanes. Root launch is the
     # matrix's own posture (ensure_root), hence --allow-run-as-root.
     # --map-by :OVERSUBSCRIBE: PRRTE's default slot count is PHYSICAL
     # cores; the row's ranks are IO-blocked and legitimately exceed it.
-    timeout 1200 mpirun --allow-run-as-root --bind-to none --map-by :OVERSUBSCRIBE "${args[@]}" >"$outfile" 2>&1 || {
+    timeout 1200 mpirun --allow-run-as-root --bind-to none --map-by :OVERSUBSCRIBE \
+        -np "$total" "$wrapper" "$IOR_BIN" -a POSIX "$@" >"$outfile" 2>&1 || {
         tail -5 "$outfile" >&2
         die "ior invocation failed (rc=$? — full output in $outfile)"
     }

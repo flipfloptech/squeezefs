@@ -7,6 +7,7 @@ pkgs.mkShell {
     pkgs.rustfmt
     pkgs.clippy
     pkgs.go-task
+    pkgs.cargo-audit # task audit (the ENG-2 gate leg) — both lockfiles
 
     # System deps per AGENTS.md §Build (pkg-config, libfuse3, clang/libclang).
     pkgs.pkg-config

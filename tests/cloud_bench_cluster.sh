@@ -84,6 +84,10 @@ set -euo pipefail
 # --- AWS placement --------------------------------------------------------
 AWS_REGION="${AWS_REGION:-us-east-1}"
 AWS_AZ="${AWS_AZ:-us-east-1a}"
+# cluster (default: same-rack, narrowest spot pool) | partition | spread |
+# none (no placement group — the fallback when the cluster-PG spot pool is
+# dry; same-AZ networking only, and the row label carries the placement).
+PLACEMENT_STRATEGY="${PLACEMENT_STRATEGY:-cluster}"
 
 # --- Instance preset ------------------------------------------------------
 # i4i    = i4i.4xlarge  x N  (~$3-4/hr cluster on spot)   — the IOPS venue
@@ -619,11 +623,17 @@ cmd_launch() {
     --query 'Subnets[0].VpcId' --output text)"
   echo "  ami=$ami subnet=$SUBNET_ID vpc=$VPC_ID"
 
-  log "launch 3/7: placement group (cluster strategy) + security group"
+  log "launch 3/7: placement group ($PLACEMENT_STRATEGY strategy) + security group"
   # cluster placement = same-rack networking; note: it narrows the spot pool,
-  # which capacity-optimized allocation partially compensates for.
-  awsc ec2 create-placement-group --group-name "$PG_NAME" --strategy cluster \
-    --tag-specifications "ResourceType=placement-group,Tags=[{Key=$TAG_KEY,Value=$CID}]"
+  # which capacity-optimized allocation partially compensates for. When the
+  # cluster-PG spot pool is dry across AZs (the 2026-08-19 1/4-delivered
+  # shape in three AZs), PLACEMENT_STRATEGY=none launches without a PG —
+  # same-AZ networking only; the row's LABEL carries the placement, so a
+  # PG-less row is honest, just a different substrate line.
+  if [ "$PLACEMENT_STRATEGY" != "none" ]; then
+    awsc ec2 create-placement-group --group-name "$PG_NAME" --strategy "$PLACEMENT_STRATEGY" \
+      --tag-specifications "ResourceType=placement-group,Tags=[{Key=$TAG_KEY,Value=$CID}]"
+  fi
   SG_ID="$(awsq "sg-dryrun" ec2 create-security-group \
     --group-name "$CID" --description "squeezefs bench cluster $CID" --vpc-id "$VPC_ID" \
     --tag-specifications "ResourceType=security-group,Tags=[{Key=$TAG_KEY,Value=$CID}]" \
@@ -639,7 +649,7 @@ cmd_launch() {
   LT_ID="$(awsq "lt-dryrun" ec2 create-launch-template \
     --launch-template-name "$CID" \
     --tag-specifications "ResourceType=launch-template,Tags=[{Key=$TAG_KEY,Value=$CID}]" \
-    --launch-template-data "{\"ImageId\":\"$ami\",\"KeyName\":\"$KEY_NAME\",\"SecurityGroupIds\":[\"$SG_ID\"],\"Placement\":{\"GroupName\":\"$PG_NAME\"},\"TagSpecifications\":[{\"ResourceType\":\"instance\",\"Tags\":[{\"Key\":\"$TAG_KEY\",\"Value\":\"$CID\"}]}]}" \
+    --launch-template-data "{\"ImageId\":\"$ami\",\"KeyName\":\"$KEY_NAME\",\"SecurityGroupIds\":[\"$SG_ID\"]$([ "$PLACEMENT_STRATEGY" != none ] && printf ',"Placement":{"GroupName":"%s"}' "$PG_NAME"),\"TagSpecifications\":[{\"ResourceType\":\"instance\",\"Tags\":[{\"Key\":\"$TAG_KEY\",\"Value\":\"$CID\"}]}]}" \
     --query 'LaunchTemplate.LaunchTemplateId' --output text)"
   # capacity-optimized = fewest interruptions, which is what protects the
   # counted-run discipline. type=instant returns instance ids synchronously.
@@ -1408,7 +1418,7 @@ row_stamp() { # row_stamp <label> <cmd> — the house labeling discipline, per r
   echo "# row=$1"
   echo "# order=$BENCH_ORDER"
   echo "# instrument=$ELB_VER (dynamic; sync drivers unless --iodepth stated in cmd)"
-  echo "# substrate=aws-spot/$INSTANCE_TYPE/$AWS_AZ (instance-store NVMe over nvmet-tcp, single NIC)"
+  echo "# substrate=aws-spot/$INSTANCE_TYPE/$AWS_AZ/pg-$PLACEMENT_STRATEGY (instance-store NVMe over nvmet-tcp, single NIC)"
   echo "# venue=cloud-bench-cluster/$PRESET cluster=$CID"
   echo "# ts=$(date -u +%FT%TZ)"
   echo "# cmd=$2"
@@ -1484,9 +1494,9 @@ EOS
   local G="$MOUNTPOINT/bench/g{1..$BENCH_THREADS}"
 
   manifest() {
-    echo "cluster=$CID preset=$PRESET instance_type=$INSTANCE_TYPE az=$AWS_AZ region=$AWS_REGION market=spot"
+    echo "cluster=$CID preset=$PRESET instance_type=$INSTANCE_TYPE az=$AWS_AZ region=$AWS_REGION market=spot placement=$PLACEMENT_STRATEGY"
     echo "instrument=$ELB_VER"
-    echo "substrate=aws-spot/$INSTANCE_TYPE/$AWS_AZ — a THIRD substrate class: never mix into devsub loop/tcp medians"
+    echo "substrate=aws-spot/$INSTANCE_TYPE/$AWS_AZ/pg-$PLACEMENT_STRATEGY — a THIRD substrate class: never mix into devsub loop/tcp medians"
     echo "repo_commit=$(git rev-parse HEAD 2>/dev/null || echo unknown)"
     echo "roles: mds=$N_MDS oss=$N_OSS client=$N_CLIENT spare=$N_SPARE"
     echo "discipline: spot interruption mid-battery => COUNT ABORTED, restart from zero (never splice)"
@@ -1607,7 +1617,7 @@ EOS
   local row_cmd
   row_cmd="SQZ_BIN=$REMOTE_DIR/squeezefs SQZ_MWMATRIX_MOUNTS=$mounts_csv SQZ_MWMATRIX_ROWDIR=$REMOTE_DIR/mw-rows bash $REMOTE_DIR/repo/tests/run_mw_matrix.sh s11-mpiio --procs=$MW_IOR_PROCS"
   mw_manifest() {
-    echo "cluster=$CID preset=$PRESET instance_type=$INSTANCE_TYPE az=$AWS_AZ region=$AWS_REGION market=spot"
+    echo "cluster=$CID preset=$PRESET instance_type=$INSTANCE_TYPE az=$AWS_AZ region=$AWS_REGION market=spot placement=$PLACEMENT_STRATEGY"
     echo "row=s11-mpiio shared-vs-disjoint (tests/run_mw_matrix.sh external-mounts mode)"
     echo "fleet: 1 authority + $MW_COWRITERS co-writers co-located on client0; mounts=$mounts_csv; procs/mount=$MW_IOR_PROCS"
     echo "instrument=pinned ior 4.0.0 + mpirun (exact versions printed by the leg in the row output)"
@@ -1620,7 +1630,7 @@ EOS
     echo "# row=s11-mpiio-shared-vs-disjoint"
     echo "# order=$BENCH_ORDER"
     echo "# instrument=pinned ior 4.0.0 + mpirun (exact versions in the leg output below)"
-    echo "# substrate=aws-spot/$INSTANCE_TYPE/$AWS_AZ (instance-store NVMe over nvmet-tcp, single NIC) — cloud substrate (third class — never spliced into devsub medians)"
+    echo "# substrate=aws-spot/$INSTANCE_TYPE/$AWS_AZ/pg-$PLACEMENT_STRATEGY (instance-store NVMe over nvmet-tcp, single NIC) — cloud substrate (third class — never spliced into devsub medians)"
     echo "# venue=cloud-bench-cluster/$PRESET cluster=$CID cowriters=$MW_COWRITERS procs=$MW_IOR_PROCS"
     echo "# ts=$(date -u +%FT%TZ)"
     echo "# cmd=$row_cmd"

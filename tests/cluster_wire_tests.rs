@@ -147,7 +147,7 @@ fn framing_is_binary_and_smaller_than_the_json_it_replaces() {
         freshness_ms: 30_000,
     };
     let body = encode(&handshake);
-    for token in [b'{', b'}', b'"'] {
+    for token in *b"{}\"" {
         assert!(
             !body.contains(&token),
             "JSON structure in the body means the codec did not change: {:?}",

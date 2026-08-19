@@ -933,10 +933,29 @@ async fn completed_overwrites_never_serve_the_previous_pass() {
                                 // that never composed RAM overlays over the
                                 // base tiers — both transient, self-healing
                                 // serves of one-write-behind acked bytes.)
+                                //
+                                // Round-6 forensics (the 2026-08-19 flake
+                                // conviction): discriminate a TRANSIENT
+                                // race window (the next read heals) from a
+                                // STICKY poisoned serve, and carry the
+                                // write-vehicle counters inline — the
+                                // round-5 mandate (panic-inline, immune to
+                                // exit-path stream loss).
+                                let mut heal = String::new();
+                                for attempt in 0..3u32 {
+                                    tokio::task::yield_now().await;
+                                    let again = read_at(&h, ino, off, len).await;
+                                    let cur = again.get(i).copied();
+                                    heal.push_str(&format!(" reread{attempt}={cur:?}"));
+                                    if cur.is_some_and(|c| c >= pass) {
+                                        break;
+                                    }
+                                }
                                 panic!(
                                     "READER FOUND OLD BYTE {b} at pos {pos} \
                                      (pass {pass}, completed_end {end}) — \
-                                     generic/209",
+                                     generic/209;{heal}\n{}",
+                                    storm_stats_line()
                                 );
                             }
                         }
@@ -988,6 +1007,119 @@ async fn serialized_overwrite_never_reverts_neighbors() {
     }
 }
 
+/// Deterministic repro of the generic/209 flake's convicted window
+/// (2026-08-19 conviction — the ~5/10 storm flake, "OLD BYTE at pos 0,
+/// completed_end 4096"): a W1 in-place patch is the ONE content
+/// mutation that moves neither the block-map binding nor any key the
+/// single-flight registry is indexed by, and the PERF-11 deferred tier
+/// publish OWNS the flight guard — so the registry entry (and the
+/// flight's STORED `FillResult`) outlives the patch's tier purge. A
+/// read that begins strictly AFTER the patch's ACK misses every purged
+/// tier, joins the held flight, and is served the pre-patch snapshot
+/// with the fill-TIME `serve_valid=true` verdict — which the binding
+/// recheck cannot catch (the binding is unchanged by construction).
+///
+/// Protocol (every step's engagement asserted):
+///   1. striped 2-block file, settled (fsync);
+///   2. read block 0 — fill #1 records the ghost (first touch);
+///   3. patch #1 (0x22 at page 0) — purges tiers;
+///   4. hold the tier publish open (the §5.2 named seam — the PERF-11
+///      guard rides it, so the NEXT fill's registry entry stays live);
+///   5. read block 0 — fill #2 (ghost hit ⇒ deferred publish ⇒ HELD
+///      flight) serves the post-patch-#1 image;
+///   6. patch #2 (0x33 at page 0) — ACK;
+///   7. read block 0 AFTER the ACK: every byte of page 0 must read
+///      0x33. Pre-fix this read is served fill #2's stored snapshot
+///      (0x22) with a stale-but-true verdict — the storm's OLD BYTE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn patched_block_never_serves_a_held_flight_snapshot() {
+    use squeezefs::routing::TEST_TIER_PUBLISH_DELAY_MS;
+    use std::sync::atomic::Ordering as O;
+
+    // Seam guard: restore both seams on every exit path (panic included).
+    struct SeamReset;
+    impl Drop for SeamReset {
+        fn drop(&mut self) {
+            TEST_TIER_PUBLISH_DELAY_MS.store(0, O::Relaxed);
+            squeezefs::device_overlay::clear_device_overlay_for_tests();
+        }
+    }
+    let _reset = SeamReset;
+    // The convicted window needs no device overlay (the A/B matrix:
+    // DEVICE_OVERLAY=0 still fails 9/100) — pin it off so the repro's
+    // write vehicles are exactly {W1 patch, write-through}.
+    squeezefs::device_overlay::set_device_overlay_for_tests(false, false);
+
+    let h = make().await;
+    let ino = create(&h, "flight209").await;
+    const PAGE: usize = 4096;
+
+    // 1. One whole-file write → striped write-through both blocks; fsync
+    //    settles writeback so both mappings are whole-block and no
+    //    RAM/staged overlay is live (the patch predicates' premise).
+    write_at(&h, ino, 0, &vec![0x11u8; (2 * BS) as usize]).await;
+    fsync(&h, ino).await;
+
+    // 2. Fill #1: first-touch miss records the R1b ghost for block 0's
+    //    key (second-touch admission is the shipped default — the next
+    //    miss of the SAME key takes the deferred-publish arm).
+    let got = read_at(&h, ino, 0, BS as u32).await;
+    assert!(
+        got.iter().all(|&b| b == 0x11),
+        "settled base must read 0x11"
+    );
+
+    let m = &squeezefs::fuse_client::METRICS;
+    let patches0 = m.patch_writes.load(O::Relaxed);
+
+    // 3. Patch #1: page 0 := 0x22 (aligned, non-adjacent, sub-cap,
+    //    non-extending ⇒ the W1 in-place DMA; purges block 0's tiers).
+    write_at(&h, ino, 0, &[0x22u8; PAGE]).await;
+    assert_eq!(
+        m.patch_writes.load(O::Relaxed) - patches0,
+        1,
+        "step 3 must ride the W1 patch (engagement, not assumption)"
+    );
+
+    // 4+5. Hold the tier publish open, then fill #2: the ghost hit
+    //    routes this fill's publish through the deferred arm, whose
+    //    closure owns the single-flight guard — the registry entry now
+    //    stays live for the whole held window.
+    TEST_TIER_PUBLISH_DELAY_MS.store(2_000, O::Relaxed);
+    let got = read_at(&h, ino, 0, BS as u32).await;
+    assert!(
+        got[..PAGE].iter().all(|&b| b == 0x22),
+        "fill #2 must serve the post-patch-#1 page"
+    );
+
+    // 6. Patch #2: page 0 := 0x33, ACKed. The purge sweeps every tier —
+    //    but the held flight's stored FillResult is not a tier.
+    write_at(&h, ino, 0, &[0x33u8; PAGE]).await;
+    assert_eq!(
+        m.patch_writes.load(O::Relaxed) - patches0,
+        2,
+        "step 6 must ride the W1 patch (engagement, not assumption)"
+    );
+
+    // 7. The contract: this read BEGINS after patch #2's ACK, so every
+    //    byte of page 0 must read 0x33 — the stored flight snapshot
+    //    (0x22, verdict computed before the patch) is not servable.
+    let got = read_at(&h, ino, 0, BS as u32).await;
+    if let Some(pos) = got[..PAGE].iter().position(|&b| b != 0x33) {
+        panic!(
+            "READER FOUND OLD BYTE {:#x} at pos {pos} after the patch's ACK \
+             — the held single-flight snapshot served a pre-patch image \
+             (generic/209 convicted window)\n{}",
+            got[pos],
+            storm_stats_line()
+        );
+    }
+    assert!(
+        got[PAGE..].iter().all(|&b| b == 0x11),
+        "bytes beyond the patched page stay at the base pattern"
+    );
+}
+
 /// fstests generic/795 repro-port (VL10 release gate, the cat-race
 /// face): one stable source pattern; a writer loop that unlinks,
 /// re-creates, and SEQUENTIALLY rewrites the copy (the `cat orig >
@@ -1014,7 +1146,11 @@ fn storm_stats_line() -> String {
          overlay_claim_conflicts={} overlay_ack_early_lost={} \
          overlay_enospc_declines={} invariant_tripwires={} \
          write_through_fallbacks={} writeback_orphan_discards={} \
-         writeback_stale_token_retries={} stale_binding_rebinds={}",
+         writeback_stale_token_retries={} stale_binding_rebinds={} \
+         patch_writes={} patch_ineligible_shared={} patch_ineligible_overlay={} \
+         extent_parks={} write_block_revisits={} write_through_blocks={} \
+         hot_block_hits={} read_lane_serves={} singleflight_waiter_result_serves={} \
+         read_tier_admissions={}",
         m.overlay_window_escalations.load(O::Relaxed),
         m.stale_binding_escalations.load(O::Relaxed),
         m.overlay_read_drains.load(O::Relaxed),
@@ -1031,6 +1167,16 @@ fn storm_stats_line() -> String {
         m.writeback_orphan_discards.load(O::Relaxed),
         m.writeback_stale_token_retries.load(O::Relaxed),
         m.stale_binding_rebinds.load(O::Relaxed),
+        m.patch_writes.load(O::Relaxed),
+        m.patch_ineligible_shared.load(O::Relaxed),
+        m.patch_ineligible_overlay.load(O::Relaxed),
+        m.extent_parks.load(O::Relaxed),
+        m.write_block_revisits.load(O::Relaxed),
+        m.write_through_blocks.load(O::Relaxed),
+        m.hot_block_hits.load(O::Relaxed),
+        m.read_lane_serves.load(O::Relaxed),
+        m.singleflight_waiter_result_serves.load(O::Relaxed),
+        m.read_tier_admissions.load(O::Relaxed),
     )
 }
 

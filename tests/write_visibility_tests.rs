@@ -945,6 +945,11 @@ async fn completed_overwrites_never_serve_the_previous_pass() {
                                 // write-vehicle counters inline — the
                                 // round-5 mandate (panic-inline, immune to
                                 // exit-path stream loss).
+                                // Arm attribution FIRST (the delta must
+                                // cover the failing read ONLY — the heal
+                                // rereads below take their own arms and
+                                // would smear it).
+                                let arm = read_probe_delta(&probe0);
                                 let mut heal = String::new();
                                 for attempt in 0..3u32 {
                                     tokio::task::yield_now().await;
@@ -958,8 +963,7 @@ async fn completed_overwrites_never_serve_the_previous_pass() {
                                 panic!(
                                     "READER FOUND OLD BYTE {b} at pos {pos} \
                                      (pass {pass}, completed_end {end}) — \
-                                     generic/209;{heal}\nREAD-ARM {}\n{}",
-                                    read_probe_delta(&probe0),
+                                     generic/209;{heal}\nREAD-ARM {arm}\n{}",
                                     storm_stats_line()
                                 );
                             }
@@ -1041,19 +1045,22 @@ async fn patched_block_never_serves_a_held_flight_snapshot() {
     use squeezefs::routing::TEST_TIER_PUBLISH_DELAY_MS;
     use std::sync::atomic::Ordering as O;
 
-    // Seam guard: restore both seams on every exit path (panic included).
+    // Seam guard: restore the seam on every exit path (panic included).
+    // Deliberately NO device-overlay pin: the W1 patch outranks the
+    // overlay in the write ladder on a record-free block, so the repro
+    // needs no global overlay state — and pinning it here raced the
+    // sibling overlay tests mid-body under default parallelism.
     struct SeamReset;
     impl Drop for SeamReset {
         fn drop(&mut self) {
             TEST_TIER_PUBLISH_DELAY_MS.store(0, O::Relaxed);
-            squeezefs::device_overlay::clear_device_overlay_for_tests();
         }
     }
     let _reset = SeamReset;
-    // The convicted window needs no device overlay (the A/B matrix:
-    // DEVICE_OVERLAY=0 still fails 9/100) — pin it off so the repro's
-    // write vehicles are exactly {W1 patch, write-through}.
-    squeezefs::device_overlay::set_device_overlay_for_tests(false, false);
+    // Knob-pin serialization: this repro REQUIRES the W1 patch, and the
+    // suite's sibling pinners zero its cap process-wide for their own
+    // windows (see `knob_pin_gate`).
+    let _pin_gate = knob_pin_gate().lock().await;
 
     let h = make().await;
     let ino = create(&h, "flight209").await;
@@ -1077,26 +1084,45 @@ async fn patched_block_never_serves_a_held_flight_snapshot() {
     // Setup helper: a page-0 write that must ride the W1 patch (the
     // window is only reachable through the in-place vehicle). Engagement
     // is checked on the process-global ledger, so under DEFAULT-
-    // PARALLELISM a foreign suite's load can classify one attempt away
-    // from the ladder (stale attr-arm heuristics, cache churn) — settle
-    // (fsync drains any accumulation vehicle the attempt landed on;
-    // content is value-idempotent) and retry, loud on exhaustion.
-    // Single-threaded this engages on the first try (0/300 retries
-    // across the conviction brackets).
+    // PARALLELISM a foreign test's load can classify one attempt away
+    // from the ladder (cache churn; the knob-pin gate already excludes
+    // the cap-zeroing sibling) — settle (fsync drains whatever vehicle
+    // the attempt landed on; content is value-exact either way), back
+    // off, and retry — loud on exhaustion with the decision ledger
+    // inline. Single-threaded (the authoritative gate venue) this
+    // engages on the first try (0 retries across 300+ bracket runs).
     async fn patch_engaged(h: &H, ino: u64, val: u8) {
         use std::sync::atomic::Ordering as O;
         let m = &squeezefs::fuse_client::METRICS;
-        for _ in 0..25 {
+        for attempt in 0..40u32 {
             let before = m.patch_writes.load(O::Relaxed);
             write_at(h, ino, 0, &[val; 4096]).await;
             if m.patch_writes.load(O::Relaxed) > before {
                 return;
             }
             fsync(h, ino).await;
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(
+                (1u64 << attempt.min(6)).min(100),
+            ))
+            .await;
         }
         panic!(
-            "W1 patch never engaged for the held-flight repro setup\n{}",
+            "W1 patch never engaged for the held-flight repro setup \
+             (cap={}; a sibling's knob pin may have leaked): \
+             range_shared={} unmapped={} decorated={} unaligned={} \
+             overlay={} device_overlay={} shared={} transform={} \
+             adjacent={} oversize={}\n{}",
+            squeezefs::fuse_client::patch_max_bytes(),
+            m.patch_ineligible_range_shared.load(O::Relaxed),
+            m.patch_ineligible_unmapped.load(O::Relaxed),
+            m.patch_ineligible_decorated.load(O::Relaxed),
+            m.patch_ineligible_unaligned.load(O::Relaxed),
+            m.patch_ineligible_overlay.load(O::Relaxed),
+            m.patch_ineligible_device_overlay.load(O::Relaxed),
+            m.patch_ineligible_shared.load(O::Relaxed),
+            m.patch_ineligible_transform.load(O::Relaxed),
+            m.patch_ineligible_adjacent.load(O::Relaxed),
+            m.patch_ineligible_oversize.load(O::Relaxed),
             storm_stats_line()
         );
     }
@@ -1193,6 +1219,21 @@ fn read_probe_delta(before: &[u64; 12]) -> String {
         .map(|(n, (a, b))| format!("{n}={}", a - b))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Process-global KNOB-PIN gate: tests that pin process-wide write-vehicle
+/// knobs (the W1 patch cap, the settle failure seam) serialize on this
+/// mutex so a sibling's pin window cannot reclassify another test's writes
+/// under default parallelism (the convicted shape:
+/// `write_meeting_a_transiently_failing_settle_converges_never_eio` holds
+/// `set_patch_max_bytes(0)` across its whole body, which silently rerouted
+/// the held-flight repro's patches onto accumulation — 6-12/15 parallel
+/// exhaustions, cap=0 in every tape; no backoff can outwait an
+/// unserialized sibling). Serialize the PINNERS only; the storm/contract
+/// tests stay fully parallel.
+fn knob_pin_gate() -> &'static tokio::sync::Mutex<()> {
+    static GATE: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 /// One greppable line of the discriminator counters ("STORM-STATS …").
@@ -2035,6 +2076,10 @@ async fn tail_resident_short_old_image_never_wedges_the_settle() {
 /// bytes must serve.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn write_meeting_a_transiently_failing_settle_converges_never_eio() {
+    // Knob-pin serialization (see `knob_pin_gate`): this test zeroes the
+    // process-global W1 patch cap for its whole body — unserialized, that
+    // window silently reroutes a concurrent patch-dependent sibling.
+    let _pin_gate = knob_pin_gate().lock().await;
     let h = Arc::new(make().await);
     squeezefs::device_overlay::set_device_overlay_for_tests(true, true);
     // Patch OFF (the §6 A/B lever): the W1 in-place patch would absorb

@@ -2345,9 +2345,15 @@ impl BlockAllocator {
     /// offset** (DLM S9 — the 2026-08-19 post-fence storm fix). The
     /// error-cleanup class — a pipeline upload whose DMA or publish
     /// failed, the RES-9 mint guard, the lane-reservation give-back, the
-    /// mover's destination undo — holds an offset NO map names, and calls
-    /// the allocator directly by offset (the router's ship seam routes
-    /// KEYS, which these offsets never earned).
+    /// mover's destination undo, and (the follow-up sweep of d575be03's
+    /// named residual) the staged legs: the fsync/dismount flush funnel
+    /// (`upload_active_block_bytes` / `fold_upload_block` /
+    /// `flush_one_active_block`), the staged promotion's commit undo, the
+    /// rider-fold / staged-clone durable-spill undos, the truncate
+    /// durable-clip undo and `write_striped`'s stored-image-fits refusal
+    /// — holds an offset NO map names, and calls the allocator directly
+    /// by offset (the router's ship seam routes KEYS, which these offsets
+    /// never earned).
     ///
     /// On the **authority / solo** (and reader) postures this is
     /// [`Self::free_block`] verbatim. On a **CO-WRITER** it ABANDONS the

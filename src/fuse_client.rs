@@ -756,8 +756,9 @@ pub(crate) fn read_only_refusal(what: &str) -> crate::error::SqueezefsError {
 /// The allocator-level arms below the router keep refusing here as
 /// defense-in-depth — but they ARE reachable by the error-cleanup class
 /// (a pipeline upload whose DMA or publish failed, the RES-9 mint guard,
-/// the lane-reservation give-back: never-published offsets no map names,
-/// which the router's key-routed ship seam cannot carry), and the
+/// the lane-reservation give-back, the staged flush/fold/promotion/spill
+/// undos: never-published offsets no map names, which the router's
+/// key-routed ship seam cannot carry), and the
 /// 2026-08-19 mw-fleet capture proved a custody loss turns that class
 /// into an ERROR-per-block storm through this refusal. Those arms'
 /// sanctioned exit is
@@ -5308,7 +5309,12 @@ pub struct Metrics {
     /// ([`crate::block_allocator::BlockAllocator::abandon_unpublished_offset`]:
     /// a pipeline upload whose DMA or publish failed, the RES-9 mint
     /// guard, the lane-reservation give-back, the mover's destination
-    /// undo). The offset was minted but no map ever named it, so the
+    /// undo, and — the d575be03 residual sweep — the staged flush funnel
+    /// (`upload_active_block_bytes` / `fold_upload_block` /
+    /// `flush_one_active_block`), the staged promotion's commit undo, the
+    /// rider-fold / staged-clone durable-spill undos, the truncate
+    /// durable-clip undo and `write_striped`'s stored-image-fits
+    /// refusal). The offset was minted but no map ever named it, so the
     /// design's recovery owns it: it stays durably unreferenced and the
     /// next derivation (mount recovery / fsck C6) returns it to the free
     /// supply — the `free_ship_failures` pattern. Expected nonzero ONLY
@@ -26156,7 +26162,11 @@ impl SqueezefsFilesystem {
         let _inflight = block_allocator.inflight_register(offset);
         if let Err(e) = nvme_writer.write_block(offset, processed_block).await {
             minted.disarm();
-            let _ = block_allocator.free_block(offset).await;
+            // Never-published cleanup (the d575be03 abandon-sweep): on a
+            // co-writer this abandons quietly instead of storming the
+            // plane gate — the post-fence flush sweep is the same funnel
+            // as the pipeline's, one custody layer lower.
+            let _ = block_allocator.abandon_unpublished_offset(offset).await;
             return Err(e);
         }
         block_allocator.publish_block(offset);
@@ -26176,10 +26186,12 @@ impl SqueezefsFilesystem {
         let displaced = match merge_res {
             Ok(d) => d,
             Err(e) => {
-                // The uploaded block never reached the map: free it before
-                // propagating (same leak rule as flush_one_active_block).
+                // The uploaded block never reached the map: release it
+                // before propagating (same leak rule as
+                // flush_one_active_block) — co-writer-aware abandon, since
+                // no map ever named the offset.
                 minted.disarm();
-                let _ = block_allocator.free_block(offset).await;
+                let _ = block_allocator.abandon_unpublished_offset(offset).await;
                 return Err(e);
             }
         };
@@ -26220,7 +26232,8 @@ async fn fold_upload_block(
     let _inflight = block_allocator.inflight_register(offset);
     if let Err(e) = nvme_writer.write_block(offset, processed_block).await {
         minted.disarm();
-        let _ = block_allocator.free_block(offset).await;
+        // Never-published: co-writer-aware abandon (d575be03 sweep).
+        let _ = block_allocator.abandon_unpublished_offset(offset).await;
         return Err(e);
     }
     block_allocator.publish_block(offset);
@@ -26244,7 +26257,8 @@ async fn fold_upload_block(
         Ok(d) => d,
         Err(e) => {
             minted.disarm();
-            let _ = block_allocator.free_block(offset).await;
+            // Never-published: co-writer-aware abandon (d575be03 sweep).
+            let _ = block_allocator.abandon_unpublished_offset(offset).await;
             return Err(e);
         }
     };
@@ -26401,9 +26415,10 @@ async fn flush_one_active_block(
             Some(s) => s,
             None => {
                 // Purged between probe and capture (truncate/punch/newer
-                // write): nothing to flush.
+                // write): nothing to flush. Never-published: co-writer-
+                // aware abandon (d575be03 sweep).
                 minted.disarm();
-                let _ = block_allocator.free_block(offset).await;
+                let _ = block_allocator.abandon_unpublished_offset(offset).await;
                 return Ok(());
             }
         };
@@ -26431,7 +26446,10 @@ async fn flush_one_active_block(
                 b, ino, e
             );
             minted.disarm();
-            let _ = block_allocator.free_block(offset).await;
+            // Never-published: co-writer-aware abandon (d575be03 sweep —
+            // a fenced co-writer's flush sweep is the convicted
+            // ERROR-per-block storm shape through the plane gate).
+            let _ = block_allocator.abandon_unpublished_offset(offset).await;
             return Err(e);
         }
         block_allocator.publish_block(offset);
@@ -26469,12 +26487,15 @@ async fn flush_one_active_block(
         let displaced = match merge_res {
             Ok(d) => d,
             Err(e) => {
-                // The uploaded block never reached the map: free it before
-                // propagating, or every retry of a failing merge (e.g. a
-                // superseded fencing token between release and reopen)
-                // leaks one published block of device space.
+                // The uploaded block never reached the map: release it
+                // before propagating, or every retry of a failing merge
+                // (e.g. a superseded fencing token between release and
+                // reopen) leaks one published block of device space.
+                // Never-published: co-writer-aware abandon (d575be03
+                // sweep) — on a co-writer a refused shipped merge is
+                // exactly the post-fence storm's per-block cleanup.
                 minted.disarm();
-                let _ = block_allocator.free_block(offset).await;
+                let _ = block_allocator.abandon_unpublished_offset(offset).await;
                 // NotFound face of FIND-M11-A: the merge's layout save
                 // fails `Io(NotFound "Inode N not found")` when the ino
                 // was unlinked + reclaimed after this block staged (the
@@ -26509,9 +26530,10 @@ async fn flush_one_active_block(
         };
         let Some(displaced) = displaced else {
             // A prune invalidated this capture (hazard 2): the uploaded
-            // block is unreachable — free it and re-capture.
+            // block is unreachable — release it and re-capture.
+            // Never-published: co-writer-aware abandon (d575be03 sweep).
             minted.disarm();
-            let _ = block_allocator.free_block(offset).await;
+            let _ = block_allocator.abandon_unpublished_offset(offset).await;
             continue;
         };
         // Publish landed: the map owns the block (a cancel from here

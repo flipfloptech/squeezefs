@@ -9938,7 +9938,8 @@ impl DataRouter {
             processed.len()
         );
         if let Err(e) = writer.write_block(offset, processed).await {
-            let _ = allocator.free_block(offset).await;
+            // Never-published: co-writer-aware abandon (d575be03 sweep).
+            let _ = allocator.abandon_unpublished_offset(offset).await;
             return Err(e);
         }
         allocator.publish_block(offset);
@@ -10020,15 +10021,18 @@ impl DataRouter {
         // RES-1: the commit's guard is gone with its future — free now.
         self.free_deferred_keys(deferred).await;
 
-        // TEMP-PROBE (leg5-v2 rail a; stripped before commit)
+        // The promotion's blob never took the mapping (identity moved /
+        // commit refused): the offset is never-published — co-writer-aware
+        // abandon (d575be03 sweep; a co-writer's refused shipped commit is
+        // the post-fence storm's per-block cleanup).
         match commit {
             Ok(true) => Ok(true),
             Ok(false) => {
-                let _ = allocator.free_block(offset).await;
+                let _ = allocator.abandon_unpublished_offset(offset).await;
                 Ok(false)
             }
             Err(e) => {
-                let _ = allocator.free_block(offset).await;
+                let _ = allocator.abandon_unpublished_offset(offset).await;
                 Err(e)
             }
         }
@@ -12823,10 +12827,12 @@ impl DataRouter {
                     block_allocator.chunk_size(),
                     "striped RMW block write",
                 ) {
-                    // Synchronous free (pre-existing behavior); disarm so
-                    // the mint guard does not double-free.
+                    // Synchronous release (pre-existing behavior); disarm
+                    // so the mint guard does not double-free.
+                    // Never-published: co-writer-aware abandon (d575be03
+                    // sweep).
                     minted.disarm();
-                    let _ = block_allocator.free_block(offset).await;
+                    let _ = block_allocator.abandon_unpublished_offset(offset).await;
                     return Err(e);
                 }
                 nvme_writer.write_block(offset, processed_block).await?;
@@ -14909,7 +14915,9 @@ impl DataRouter {
                     processed.len()
                 );
                 if let Err(e) = nvme_writer.write_block(be_offset, processed).await {
-                    let _ = block_allocator.free_block(be_offset).await;
+                    // Never-published: co-writer-aware abandon (d575be03
+                    // sweep).
+                    let _ = block_allocator.abandon_unpublished_offset(be_offset).await;
                     return Err(e);
                 }
                 block_allocator.publish_block(be_offset);
@@ -14928,9 +14936,11 @@ impl DataRouter {
                 if !still_ours {
                     // Identity moved under the fold (promotion/re-stage
                     // committed meanwhile): that commit folded-first, so
-                    // the record is stale-duplicate custody — free our
+                    // the record is stale-duplicate custody — release our
                     // orphan upload and let the next drain re-resolve.
-                    let _ = block_allocator.free_block(be_offset).await;
+                    // Never-published: co-writer-aware abandon (d575be03
+                    // sweep).
+                    let _ = block_allocator.abandon_unpublished_offset(be_offset).await;
                     return Ok(false);
                 }
                 let mut block_map = std::collections::HashMap::new();
@@ -15208,7 +15218,9 @@ impl DataRouter {
                             processed.len()
                         );
                         if let Err(e) = nvme_writer.write_block(be_offset, processed).await {
-                            let _ = block_allocator.free_block(be_offset).await;
+                            // Never-published: co-writer-aware abandon
+                            // (d575be03 sweep).
+                            let _ = block_allocator.abandon_unpublished_offset(be_offset).await;
                             return Err(e);
                         }
                         block_allocator.publish_block(be_offset);
@@ -15571,7 +15583,9 @@ impl DataRouter {
                             processed.len()
                         );
                         if let Err(e) = writer.write_block(offset, processed).await {
-                            let _ = allocator.free_block(offset).await;
+                            // Never-published: co-writer-aware abandon
+                            // (d575be03 sweep).
+                            let _ = allocator.abandon_unpublished_offset(offset).await;
                             return Err(e);
                         }
                         allocator.publish_block(offset);

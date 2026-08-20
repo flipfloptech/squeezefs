@@ -101,6 +101,8 @@ impl Drop for Restore {
         // the conveyor hold): restored even on an assertion unwind, so a
         // panicking pin can never leak posture into its neighbors.
         squeezefs::routing::set_publish_commit_group_override(None);
+        // The 1e section's chain-cap lever (the compaction-arm forcer).
+        squeezefs::routing::set_layout_delta_chain_override(None);
         squeezefs::meta_backend::kv::backend::TEST_LAYOUT_MERGE_HOLD_MS.store(0, Ordering::Relaxed);
         squeezefs::data_custody::test_reset_custody_generation();
         squeezefs::data_custody::test_clear_poison();
@@ -121,9 +123,9 @@ fn make_file(dir: &Path, name: &str, len: u64) -> PathBuf {
     p
 }
 
-fn opts() -> squeezefs::meta_backend::kv::builder::FormatV3Options {
+fn opts_sized(node_size: usize) -> squeezefs::meta_backend::kv::builder::FormatV3Options {
     squeezefs::meta_backend::kv::builder::FormatV3Options {
-        node_size: squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE,
+        node_size,
         journal_len_override: None,
         force: true,
         full_wipe: false,
@@ -136,12 +138,32 @@ fn opts() -> squeezefs::meta_backend::kv::builder::FormatV3Options {
 /// accounting oracle real) between format and open, the KD-MW-1 fleet
 /// format shape.
 async fn sandbox(dir: &Path, tag: &str, stamp: bool) -> (Arc<RoutedMetaBackend>, PathBuf) {
+    sandbox_sized(
+        dir,
+        tag,
+        stamp,
+        squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE,
+    )
+    .await
+}
+
+/// [`sandbox`] with an explicit node size — the 1e crossing pins format
+/// at the 64 KiB floor so the inline ceiling (`xattr_value_cap −
+/// LAYOUT_INLINE_HEADROOM` = 16,384 − 4,096) is crossable with a few
+/// hundred map entries instead of the default cap's ~2,500 (the
+/// `--meta-node-kib 64` format-knob shape).
+async fn sandbox_sized(
+    dir: &Path,
+    tag: &str,
+    stamp: bool,
+    node_size: usize,
+) -> (Arc<RoutedMetaBackend>, PathBuf) {
     let plan = plan_meta_slot_set(1).expect("derived plan");
     let p = make_file(dir, &format!("{tag}-meta0"), VOL_LEN);
     squeezefs::meta_backend::kv::builder::format_v3_stamped(
         &p,
         VOL_LEN,
-        &opts(),
+        &opts_sized(node_size),
         plan.stamps[0].clone(),
     )
     .await
@@ -336,6 +358,11 @@ async fn ledger(be: &Arc<RoutedMetaBackend>) -> Vec<(u64, u64, u32)> {
 }
 
 fn base_layout_bytes(size: u64, map: &[(u32, &str)]) -> Vec<u8> {
+    let owned: Vec<(u32, String)> = map.iter().map(|(b, k)| (*b, k.to_string())).collect();
+    base_layout_bytes_owned(size, &owned)
+}
+
+fn base_layout_bytes_owned(size: u64, map: &[(u32, String)]) -> Vec<u8> {
     bincode::serialize(&LayoutMetadata {
         file_type: "striped".into(),
         size,
@@ -343,12 +370,17 @@ fn base_layout_bytes(size: u64, map: &[(u32, &str)]) -> Vec<u8> {
         block_prefix: Some("be://data".into()),
         file_id: None,
         data_key: None,
-        block_map: Some(map.iter().map(|(b, k)| (*b, k.to_string())).collect()),
+        block_map: Some(map.iter().cloned().collect()),
     })
     .expect("serialize base layout")
 }
 
 fn delta(size: u64, entries: &[(u32, &str)], versions: (u64, u64)) -> LayoutDelta {
+    let owned: Vec<(u32, String)> = entries.iter().map(|(b, k)| (*b, k.to_string())).collect();
+    delta_owned(size, &owned, versions)
+}
+
+fn delta_owned(size: u64, entries: &[(u32, String)], versions: (u64, u64)) -> LayoutDelta {
     let mut d = LayoutDelta::from_final_state(
         "striped",
         size,
@@ -356,10 +388,7 @@ fn delta(size: u64, entries: &[(u32, &str)], versions: (u64, u64)) -> LayoutDelt
         Some("be://data"),
         None,
         None,
-        entries
-            .iter()
-            .map(|(b, k)| (*b, k.to_string()))
-            .collect::<Vec<_>>(),
+        entries.to_vec(),
     );
     d.set_versions(versions.0, versions.1);
     d
@@ -1383,6 +1412,448 @@ async fn an_unarmed_chained_merge_still_refuses_the_indirect_head() {
         head.block_map_id.as_deref(),
         Some("indirect:be://data:999"),
         "nothing staged, nothing composed"
+    );
+
+    for vol in &be.volumes {
+        vol.shutdown().await.expect("shutdown");
+    }
+}
+
+// ===========================================================================
+// 1e. The inline→oversize CROSSING (the 2026-08-19 AlreadyFreezing wedge's
+//     trigger — the owner-side chain compaction past the record cap)
+// ===========================================================================
+//
+// The rung-20 compose arms above handle a head that is ALREADY indirect.
+// What the 2026-08-19 field wedge convicted is the crossing itself: the
+// owner-side chain compaction (`chained_full = delta.apply(folded)`)
+// composed a 10 GiB shared file's map onto an INLINE head with NO cap
+// check — the oversize record passed admission, reached the node
+// overlay, and could only be refused at FREEZE time ("record value
+// length 66121 exceeds the per-volume cap 65792"), wedging the volume's
+// checkpoint forever. The law: the compaction arm makes the SAME spill
+// decision the router's save path and the custody-scoped Put make
+// (site (c)'s arithmetic — `encoded > xattr_value_cap −
+// LAYOUT_INLINE_HEADROOM`): armed it composes to a fresh indirect blob;
+// unarmed it refuses retried-class and stages NOTHING. These pins run on
+// 64 KiB nodes (inline ceiling 12,288 B) so a few hundred entries cross.
+
+/// The 1e fixture: a 64 KiB-node armed sandbox with a `base_n`-entry
+/// inline durable head committed (every base take staged), chain-cap
+/// compaction forced (`set_layout_delta_chain_override(Some(0))` — every
+/// chained merge takes the owner-side compaction arm, the field's
+/// at-the-cap shape without 64 filler deltas).
+async fn crossing_sandbox(
+    dir: &Path,
+    tag: &str,
+    base_n: u32,
+) -> (Arc<RoutedMetaBackend>, u64, Vec<(u32, String)>) {
+    let (be, _p) = sandbox_sized(dir, tag, true, 64 * 1024).await;
+    install_test_resolver();
+    squeezefs::routing::set_layout_delta_chain_override(Some(0));
+    let vol = &be.volumes[0];
+    let ino = {
+        use squeezefs::meta_backend::Metadata as _;
+        vol.create(1, "crossing.bin", libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .expect("inode")
+            .ino
+    };
+    let base: Vec<(u32, String)> = (0..base_n)
+        .map(|i| (i, format!("be://data:K{i:05}")))
+        .collect();
+    let refs: Vec<BlockRefOp> = base
+        .iter()
+        .map(|(b, k)| {
+            BlockRefOp::taken(BlockRef {
+                vol_tag: TEST_TAG,
+                block_idx: kid(k),
+                owner_ino: ino,
+                block_index: *b,
+            })
+        })
+        .collect();
+    let size = u64::from(base_n) * BLOCK;
+    vol.set_layout_and_size(ino, &base_layout_bytes_owned(size, &base), size, &refs)
+        .await
+        .expect("the inline base head lands");
+    (be, ino, base)
+}
+
+/// The delta that drives the composed map past the inline ceiling, plus
+/// the crossing precondition proof: base fits inline, composed does not.
+fn crossing_delta(
+    vol: &Arc<squeezefs::meta_backend::kv::backend::KvMetaBackend>,
+    base: &[(u32, String)],
+    add_n: u32,
+) -> (Vec<(u32, String)>, Vec<(u32, String)>, u64) {
+    let base_n = base.len() as u32;
+    let added: Vec<(u32, String)> = (base_n..base_n + add_n)
+        .map(|i| (i, format!("be://data:N{i:05}")))
+        .collect();
+    let mut composed = base.to_vec();
+    composed.extend(added.iter().cloned());
+    let size = u64::from(base_n + add_n) * BLOCK;
+    let ceiling = vol
+        .xattr_value_cap()
+        .saturating_sub(squeezefs::routing::LAYOUT_INLINE_HEADROOM);
+    assert!(
+        base_layout_bytes_owned(u64::from(base_n) * BLOCK, base).len() <= ceiling,
+        "precondition: the BASE head fits inline"
+    );
+    assert!(
+        base_layout_bytes_owned(size, &composed).len() > ceiling,
+        "precondition: the COMPOSED map crosses the inline ceiling ({ceiling} B)"
+    );
+    (added, composed, size)
+}
+
+/// The expected post-crossing ledger: every base take, every added take
+/// (nothing displaced — the delta only extends the map), and the fresh
+/// blob's MAP_BLOB take. NO release op anywhere: the head was INLINE, so
+/// the compose displaces no blob.
+fn crossing_ledger_want(
+    ino: u64,
+    base: &[(u32, String)],
+    added: &[(u32, String)],
+    fresh: &str,
+) -> Vec<(u64, u64, u32)> {
+    let mut want: Vec<(u64, u64, u32)> = base
+        .iter()
+        .chain(added.iter())
+        .map(|(b, k)| (kid(k), ino, *b))
+        .collect();
+    want.push((kid(fresh), ino, block_refs::BLOCK_INDEX_MAP_BLOB));
+    want.sort_unstable();
+    want
+}
+
+/// Contract (the trigger, site (b) — the direct chained merge): an ARMED
+/// owner whose chain compaction composes past the inline ceiling SPILLS
+/// — fresh CoW blob, full Put naming `indirect:{key}`, the MAP_BLOB take
+/// staged in the same commit, NO released op (the head was inline), and
+/// the engagement gauge counts the compose. The oversize inline record
+/// is never staged, so the freeze-time `ValueTooLarge` (the 2026-08-19
+/// checkpoint wedge) is unreachable from this arm.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_armed_chained_merge_crossing_the_inline_cap_composes_to_indirect() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let io = install_test_map_io();
+    let (be, ino, base) = crossing_sandbox(dir.path(), "own-cross-b", 300).await;
+    // Site (b): the direct path.
+    squeezefs::routing::set_publish_commit_group_override(Some(1));
+    let vol = &be.volumes[0];
+    let (added, composed, size) = crossing_delta(vol, &base, 250);
+    let composes0 = squeezefs::fuse_client::METRICS
+        .publish_blob_composes
+        .load(Ordering::Relaxed);
+
+    let d = delta_owned(size, &added, (0, squeezefs::dlm::mint_layout_version()));
+    let caller_refs: Vec<BlockRefOp> = added
+        .iter()
+        .map(|(b, k)| {
+            BlockRefOp::taken(BlockRef {
+                vol_tag: TEST_TAG,
+                block_idx: kid(k),
+                owner_ino: ino,
+                block_index: *b,
+            })
+        })
+        .collect();
+    let (used, version) = vol
+        .merge_layout_and_size_chained(
+            ino,
+            ino,
+            &d,
+            bytes::Bytes::from(base_layout_bytes_owned(size, &added)),
+            size,
+            caller_refs,
+        )
+        .await
+        .expect("the armed crossing compaction composes instead of staging oversize");
+    assert!(!used, "a compose stages a full Put, never a delta");
+    assert_eq!(version, 0, "a full Put carries no staged link version");
+
+    // The durable head names the fresh CoW blob; no inline map.
+    let head = raw_head(&be, ino).await;
+    assert_eq!(
+        head.block_map_id.as_deref(),
+        Some("indirect:be://data:fresh-1"),
+        "the composed head crossed to INDIRECT — the oversize inline \
+         record (the checkpoint-wedge mint) was never staged"
+    );
+    assert!(head.block_map.is_none(), "no inline map on an indirect head");
+
+    // The fresh blob holds the FULL composed map.
+    let mut want_map = composed.clone();
+    want_map.sort_unstable_by_key(|&(b, _)| b);
+    assert_eq!(
+        io.blobs
+            .lock()
+            .unwrap()
+            .get("be://data:fresh-1")
+            .cloned()
+            .expect("the fresh blob was written"),
+        want_map,
+        "the blob is the FULL composed map (base + delta entries)"
+    );
+
+    // Accounting: base takes intact, delta entries taken, the fresh
+    // blob's MAP_BLOB take — and NO released op (the head was inline).
+    assert_eq!(
+        ledger(&be).await,
+        crossing_ledger_want(ino, &base, &added, "be://data:fresh-1"),
+        "delta entries present + MAP_BLOB take, no released op"
+    );
+    assert!(
+        io.freed.lock().unwrap().is_empty(),
+        "nothing freed: an inline head displaces no blob"
+    );
+    assert_eq!(
+        squeezefs::fuse_client::METRICS
+            .publish_blob_composes
+            .load(Ordering::Relaxed)
+            - composes0,
+        1,
+        "the engagement gauge counts the crossing compose"
+    );
+
+    for vol in &be.volumes {
+        vol.shutdown().await.expect("shutdown");
+    }
+}
+
+/// Contract (the trigger's fail-safe half): an UNARMED mount whose chain
+/// compaction crosses the inline ceiling REFUSES retried-class — the
+/// error names the cap arithmetic and the compaction arm — and stages
+/// NOTHING: the durable head keeps the base map, the ledger keeps the
+/// base takes, and the volume's checkpoint stays healthy. Never the
+/// oversize record (which admission passed and only the freeze could
+/// refuse — the 2026-08-19 permanent wedge).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unarmed_chained_merge_crossing_the_inline_cap_refuses_and_stages_nothing() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    // NO map hook installed — the unarmed shape.
+    let (be, ino, base) = crossing_sandbox(dir.path(), "own-cross-un", 300).await;
+    squeezefs::routing::set_publish_commit_group_override(Some(1));
+    let vol = &be.volumes[0];
+    let (added, _composed, size) = crossing_delta(vol, &base, 250);
+
+    let d = delta_owned(size, &added, (0, squeezefs::dlm::mint_layout_version()));
+    let err = vol
+        .merge_layout_and_size_chained(
+            ino,
+            ino,
+            &d,
+            bytes::Bytes::from(base_layout_bytes_owned(size, &added)),
+            size,
+            vec![],
+        )
+        .await
+        .expect_err(
+            "an unarmed crossing must REFUSE — staging the oversize record \
+             wedges the volume's checkpoint at freeze time, forever",
+        );
+    let text = format!("{err}");
+    assert!(
+        text.contains("layout delta base unusable"),
+        "the refusal carries the retried-class marker (the writeback \
+         ladder's classifier keys on it): {text}"
+    );
+    let ceiling = vol
+        .xattr_value_cap()
+        .saturating_sub(squeezefs::routing::LAYOUT_INLINE_HEADROOM);
+    assert!(
+        text.contains(&format!("{ceiling}")),
+        "the refusal names the inline ceiling it refused against: {text}"
+    );
+
+    // Nothing staged: the durable head is still the base inline map and
+    // the ledger still holds exactly the base takes.
+    let map = owner_map(&be, ino).await;
+    assert_eq!(map.len(), base.len(), "the base map survives untouched");
+    assert!(
+        map.keys().all(|b| *b < base.len() as u32),
+        "no delta entry leaked into the durable head"
+    );
+    let mut want: Vec<(u64, u64, u32)> = base.iter().map(|(b, k)| (kid(k), ino, *b)).collect();
+    want.sort_unstable();
+    assert_eq!(ledger(&be).await, want, "the ledger is untouched");
+
+    for vol in &be.volumes {
+        vol.shutdown().await.expect("shutdown");
+    }
+}
+
+/// Contract (the trigger, site (a) — the aggregated conveyor member):
+/// the SAME crossing law through the layout-merge pass (the default
+/// aggregated path — the field's convicted site). One member, one pass:
+/// composes to indirect, MAP_BLOB take staged, no released op, gauge
+/// counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_armed_crossing_composes_via_the_aggregated_pass() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let io = install_test_map_io();
+    let (be, ino, base) = crossing_sandbox(dir.path(), "own-cross-a", 300).await;
+    // NO group override: the aggregated conveyor path — site (a).
+    let vol = &be.volumes[0];
+    let (added, composed, size) = crossing_delta(vol, &base, 250);
+    let composes0 = squeezefs::fuse_client::METRICS
+        .publish_blob_composes
+        .load(Ordering::Relaxed);
+
+    let d = delta_owned(size, &added, (0, squeezefs::dlm::mint_layout_version()));
+    let (used, version) = vol
+        .merge_layout_and_size_chained(
+            ino,
+            ino,
+            &d,
+            bytes::Bytes::from(base_layout_bytes_owned(size, &added)),
+            size,
+            vec![],
+        )
+        .await
+        .expect("the aggregated crossing member composes instead of staging oversize");
+    assert!(!used, "a compose stages a full Put, never a delta");
+    assert_eq!(version, 0);
+
+    let head = raw_head(&be, ino).await;
+    assert_eq!(
+        head.block_map_id.as_deref(),
+        Some("indirect:be://data:fresh-1"),
+        "the aggregated pass's compaction member crossed to INDIRECT"
+    );
+    let mut want_map = composed.clone();
+    want_map.sort_unstable_by_key(|&(b, _)| b);
+    assert_eq!(
+        io.blobs
+            .lock()
+            .unwrap()
+            .get("be://data:fresh-1")
+            .cloned()
+            .expect("the fresh blob was written"),
+        want_map,
+    );
+    assert_eq!(
+        ledger(&be).await,
+        crossing_ledger_want(ino, &base, &added, "be://data:fresh-1"),
+        "delta entries + MAP_BLOB take, no released op"
+    );
+    assert!(io.freed.lock().unwrap().is_empty());
+    assert_eq!(
+        squeezefs::fuse_client::METRICS
+            .publish_blob_composes
+            .load(Ordering::Relaxed)
+            - composes0,
+        1,
+    );
+
+    for vol in &be.volumes {
+        vol.shutdown().await.expect("shutdown");
+    }
+}
+
+/// Contract (the crossing member joins the pass-local memo — the
+/// batch-prior law's crossing face): a crossing member's composed state
+/// SEEDS `composed_heads`, so a same-ino batch mate composes onto the
+/// ACCUMULATED view (fresh-2 over fresh-1) instead of staging a delta
+/// onto the just-staged indirect head — which the fold layer classifies
+/// as corruption ("layout delta base unusable", every subsequent
+/// checkpoint of the key refusing forever: the exact 1c poison, minted
+/// from INSIDE one pass).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_armed_crossing_member_seeds_the_pass_memo_for_its_batch_mates() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let io = install_test_map_io();
+    let (be, ino, base) = crossing_sandbox(dir.path(), "own-cross-m", 300).await;
+    let vol = &be.volumes[0];
+    let (added, _composed, size) = crossing_delta(vol, &base, 250);
+    let late: Vec<(u32, String)> = (700..703u32)
+        .map(|i| (i, format!("be://data:L{i:05}")))
+        .collect();
+
+    // Hold the pass so both members drain in ONE batch, FIFO: the
+    // crossing member first (enqueued first), its small mate second.
+    squeezefs::meta_backend::kv::backend::TEST_LAYOUT_MERGE_HOLD_MS.store(200, Ordering::Relaxed);
+    let d_a = delta_owned(size, &added, (0, squeezefs::dlm::mint_layout_version()));
+    let d_b = delta_owned(size, &late, (0, squeezefs::dlm::mint_layout_version()));
+    let vol_a = Arc::clone(vol);
+    let fb_a = bytes::Bytes::from(base_layout_bytes_owned(size, &added));
+    let a = tokio::spawn(async move {
+        vol_a
+            .merge_layout_and_size_chained(ino, ino, &d_a, fb_a, size, vec![])
+            .await
+    });
+    // The stagger: A is queued (and the held pass elected) before B.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let vol_b = Arc::clone(vol);
+    let fb_b = bytes::Bytes::from(base_layout_bytes_owned(size, &late));
+    let b = tokio::spawn(async move {
+        vol_b
+            .merge_layout_and_size_chained(ino, ino, &d_b, fb_b, size, vec![])
+            .await
+    });
+    let ra = a.await.expect("task a").expect("crossing member composes");
+    let rb = b.await.expect("task b").expect("batch mate composes");
+    squeezefs::meta_backend::kv::backend::TEST_LAYOUT_MERGE_HOLD_MS.store(0, Ordering::Relaxed);
+    assert!(!ra.0 && !rb.0, "both members stage full Puts, never deltas");
+
+    // The final head names the SECOND fresh blob (accumulated view).
+    let head = raw_head(&be, ino).await;
+    assert_eq!(
+        head.block_map_id.as_deref(),
+        Some("indirect:be://data:fresh-2"),
+        "the mate composed onto the crossing member's memo entry"
+    );
+    let mut want_map: Vec<(u32, String)> = base
+        .iter()
+        .chain(added.iter())
+        .chain(late.iter())
+        .cloned()
+        .collect();
+    want_map.sort_unstable_by_key(|&(b, _)| b);
+    assert_eq!(
+        io.blobs
+            .lock()
+            .unwrap()
+            .get("be://data:fresh-2")
+            .cloned()
+            .expect("the final blob was written"),
+        want_map,
+        "BOTH members' entries in the final blob"
+    );
+
+    // Ledger net: base + both members' entries + the FINAL blob take;
+    // the intermediate fresh blob's take+release nets to absent, and
+    // NOTHING releases an inline head.
+    let mut want: Vec<(u64, u64, u32)> = base
+        .iter()
+        .chain(added.iter())
+        .chain(late.iter())
+        .map(|(b, k)| (kid(k), ino, *b))
+        .collect();
+    want.push((
+        kid("be://data:fresh-2"),
+        ino,
+        block_refs::BLOCK_INDEX_MAP_BLOB,
+    ));
+    want.sort_unstable();
+    assert_eq!(ledger(&be).await, want);
+
+    // Freed: exactly the superseded intermediate blob — never an "old"
+    // blob (the head was inline), never the final one.
+    assert_eq!(
+        io.freed.lock().unwrap().clone(),
+        vec!["be://data:fresh-1".to_string()],
+        "the pass-superseded intermediate blob freed after the ONE commit"
     );
 
     for vol in &be.volumes {

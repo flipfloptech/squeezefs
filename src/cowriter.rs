@@ -1228,7 +1228,7 @@ pub async fn arm(
 /// survive. The loop rides the dedicated `sqz-lease` lane (never the
 /// shared sqz-meta pool a workload-class poll can occupy past `T_self`),
 /// each attempt is deadline-bounded
-/// ([`WriteCustodyClient::renew_tick_bound_ms`] —
+/// ([`crate::data_grant::WriteCustodyClient::renew_tick_bound_ms`] —
 /// `max(remaining-to-T_self / 3, one cadence)`), and the wire itself is
 /// the client's DEDICATED lease session, never the acquire storm's (the
 /// second fate-sharing the field's 35-attempt POSIX-5 ladders exposed).

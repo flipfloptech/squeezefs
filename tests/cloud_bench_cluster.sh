@@ -654,10 +654,21 @@ cmd_launch() {
     --protocol tcp --port 22 --cidr "$OPERATOR_CIDR"
 
   log "launch 4/7: launch template + spot fleet (capacity-optimized)"
+  # Package installs ride cloud-init USER DATA — they run during boot, in
+  # parallel across every node, overlapped with the launch waits and the
+  # binary pushes (the 2026-08-19 lesson: a serial deploy-time apt against
+  # a slow mirror held a billing cluster idle for 40+ minutes). deploy
+  # WAITS on cloud-init and verifies, with an apt fallback only if
+  # user-data failed. The mw client set installs on every node — a few
+  # idle MiB on storage nodes buys the one-template simplicity.
+  local extra_pkgs=""
+  [ "$PRESET" = "mw" ] && extra_pkgs=" openmpi-bin libopenmpi-dev python3 curl gcc make"
+  local user_data
+  user_data="$(printf '#!/bin/bash\nexport DEBIAN_FRONTEND=noninteractive\napt-get -qq update\napt-get -qq install -y fuse3 nvme-cli%s\n' "$extra_pkgs" | base64 -w0)"
   LT_ID="$(awsq "lt-dryrun" ec2 create-launch-template \
     --launch-template-name "$CID" \
     --tag-specifications "ResourceType=launch-template,Tags=[{Key=$TAG_KEY,Value=$CID}]" \
-    --launch-template-data "{\"ImageId\":\"$ami\",\"KeyName\":\"$KEY_NAME\",\"SecurityGroupIds\":[\"$SG_ID\"]$([ "$PLACEMENT_STRATEGY" != none ] && printf ',"Placement":{"GroupName":"%s"}' "$PG_NAME"),\"TagSpecifications\":[{\"ResourceType\":\"instance\",\"Tags\":[{\"Key\":\"$TAG_KEY\",\"Value\":\"$CID\"}]}]}" \
+    --launch-template-data "{\"ImageId\":\"$ami\",\"KeyName\":\"$KEY_NAME\",\"SecurityGroupIds\":[\"$SG_ID\"],\"UserData\":\"$user_data\"$([ "$PLACEMENT_STRATEGY" != none ] && printf ',"Placement":{"GroupName":"%s"}' "$PG_NAME"),\"TagSpecifications\":[{\"ResourceType\":\"instance\",\"Tags\":[{\"Key\":\"$TAG_KEY\",\"Value\":\"$CID\"}]}]}" \
     --query 'LaunchTemplate.LaunchTemplateId' --output text)"
   # on-demand (default): no interruption risk — what protects the
   # counted-run discipline outright. spot: capacity-optimized = fewest
@@ -790,11 +801,24 @@ cmd_deploy() {
   for idx in "${!NODE_NAMES[@]}"; do
     name="${NODE_NAMES[$idx]}"; ip="${NODE_PUB[$idx]}"
     log "deploy: $name ($ip)"
-    remote "$ip" <<'EOS'
+    # Packages were installed by cloud-init user-data during boot (in
+    # parallel, overlapped with launch waits) — deploy WAITS on cloud-init
+    # (bounded) and verifies, falling back to a direct apt only if
+    # user-data failed. Never a serial mirror fetch on billed idle time.
+    remote "$ip" NEED_MW="$([ "$PRESET" = "mw" ] && echo 1 || echo 0)" <<'EOS'
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
-apt-get -qq update
-apt-get -qq install -y fuse3 nvme-cli >/dev/null
+cloud-init status --wait --long >/dev/null 2>&1 || true
+need="fuse3 nvme-cli"
+[ "$NEED_MW" = "1" ] && need="$need openmpi-bin libopenmpi-dev python3 curl gcc make"
+missing=""
+for p in $need; do dpkg -s "$p" >/dev/null 2>&1 || missing="$missing $p"; done
+if [ -n "$missing" ]; then
+  echo "cloud-init did not deliver:$missing — falling back to direct apt" >&2
+  apt-get -qq update
+  # shellcheck disable=SC2086
+  apt-get -qq install -y $missing >/dev/null
+fi
 EOS
     push "$sqz" "$ip" "$REMOTE_DIR/squeezefs"
     # sha256 verification: same-commit artifact on every node (KD-7 spirit)
@@ -814,17 +838,9 @@ EOS
         warn "no il shim at $shim — il rows unavailable on this cluster (kernel-FUSE rows unaffected)"
       fi
     fi
-    if [ "$PRESET" = "mw" ] && [ "$(role_of "$name")" = "client" ]; then
-      # bench-mw prerequisites: the s11-mpiio leg builds the pinned ior 4.0.0
-      # on the client (mpicc + curl + gcc + make, fetched from github over
-      # the client's internet) and runs it under mpirun; python3 drives the
-      # leg's row emitter and the .stats readiness/engagement gates.
-      remote "$ip" <<'EOS'
-set -euo pipefail
-export DEBIAN_FRONTEND=noninteractive
-apt-get -qq install -y openmpi-bin libopenmpi-dev python3 curl gcc make >/dev/null
-EOS
-    fi
+    # (mw bench prerequisites — openmpi/python3/curl/gcc/make — ride the
+    # launch-time cloud-init user-data and the verify above; the former
+    # deploy-time apt leg is retired.)
   done
   echo
   echo "Artifacts deployed (sha256 $sqz_sha). Next: tests/cloud_bench_cluster.sh assemble"

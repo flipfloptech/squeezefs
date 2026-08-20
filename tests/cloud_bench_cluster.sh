@@ -618,11 +618,33 @@ cmd_launch() {
     echo "  detected $OPERATOR_CIDR"
   fi
 
-  log "launch 2/7: AMI via SSM ($AMI_SSM_PARAM) + default subnet in $AWS_AZ"
-  local ami
-  ami="$(awsq "ami-dryrun" ssm get-parameter \
-    --name "$AMI_SSM_PARAM" \
-    --query Parameter.Value --output text)"
+  log "launch 2/7: AMI (baked base preferred) + default subnet in $AWS_AZ"
+  # Baked-base preference (2026-08-19/20: session-time apt lost 40+ billed
+  # minutes to a wedged regional mirror TWICE): prefer the newest available
+  # self-owned image tagged squeezefs-bench-base=$PRESET — packages
+  # preinstalled at bake time, zero apt on the session clock (deploy's
+  # dpkg -s verify + fallback still guards a stale bake). BASE_AMI=<id>
+  # pins explicitly; BASE_AMI=none forces the stock SSM AMI. Re-bake:
+  #   aws ec2 create-image --instance-id <provisioned node> --no-reboot \
+  #     --tag-specifications 'ResourceType=image,Tags=[{Key=squeezefs-bench-base,Value=mw}]' ...
+  local ami=""
+  if [ "${BASE_AMI:-}" = "none" ]; then
+    :
+  elif [ -n "${BASE_AMI:-}" ]; then
+    ami="$BASE_AMI"
+  else
+    ami="$(awsq "" ec2 describe-images --owners self \
+      --filters "Name=tag:squeezefs-bench-base,Values=$PRESET" "Name=state,Values=available" \
+      --query 'sort_by(Images,&CreationDate)[-1].ImageId' --output text)"
+    [ "$ami" = "None" ] && ami=""
+  fi
+  if [ -n "$ami" ]; then
+    echo "  using baked base AMI $ami (tag squeezefs-bench-base=$PRESET; BASE_AMI=none opts out)"
+  else
+    ami="$(awsq "ami-dryrun" ssm get-parameter \
+      --name "$AMI_SSM_PARAM" \
+      --query Parameter.Value --output text)"
+  fi
   SUBNET_ID="$(awsq "subnet-dryrun" ec2 describe-subnets \
     --filters "Name=availability-zone,Values=$AWS_AZ" "Name=default-for-az,Values=true" \
     --query 'Subnets[0].SubnetId' --output text)"
@@ -1687,14 +1709,18 @@ EOS
   else
     mw_manifest >"$BENCH_DIR/manifest.txt"
     mw_row_stamp >"$rowfile"
-    remote "$CLIENT_IP" <<EOS | tee -a "$rowfile"
+    # EVIDENCE BEFORE VERDICT (2026-08-19 lesson: a failing row died under
+    # set -e before the pull below ever ran, and the teardown then
+    # destroyed the on-cluster A1.out that named the failure): capture the
+    # row's rc, pull the artifacts UNCONDITIONALLY, and only then fail.
+    row_rc=0
+    remote "$CLIENT_IP" <<EOS | tee -a "$rowfile" || row_rc=$?
 set -euo pipefail
 mkdir -p "$REMOTE_DIR/mw-rows" "$REMOTE_DIR/repo/target"
 $row_cmd
 EOS
   fi
   spot_monitor_stop
-  assert_fleet_running   # the row counts only if the fleet survived it
 
   log "bench-mw: pull rows + fleet logs"
   if ! $DRY_RUN; then
@@ -1711,6 +1737,9 @@ EOS
   fi
   run scp -r "${SSH_OPTS[@]}" -i "$SSH_KEY_FILE" \
     "$REMOTE_USER@$CLIENT_IP:$REMOTE_DIR/mw-rows" "$BENCH_DIR/mw-rows"
+  [ "${row_rc:-0}" -eq 0 ] \
+    || die "s11-mpiio row FAILED (rc=$row_rc) — artifacts pulled to $BENCH_DIR/mw-rows before this verdict (evidence before verdict)"
+  assert_fleet_running   # the row counts only if the fleet survived it
   echo
   echo "s11-mpiio row complete. Results: $BENCH_DIR (stamped row + manifest; per-phase ior outputs, stats snapshots and fsck report under mw-rows/; fleet verified running end-to-end — count valid)"
 }

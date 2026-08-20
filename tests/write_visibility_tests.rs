@@ -915,6 +915,10 @@ async fn completed_overwrites_never_serve_the_previous_pass() {
                     let want = if end > BS + PAGE { BS - PAGE } else { 0 };
                     let off = want.min(end - PAGE);
                     let len = (end - off).min(4 * PAGE) as u32;
+                    // Round-6 forensics: snapshot the read-arm counters so
+                    // a failure names the SERVE ARM the failing read took
+                    // (deltas travel in the panic — the round-5 mandate).
+                    let probe0 = read_probe_snapshot();
                     let got = read_at(&h, ino, off, len).await;
                     // Every byte in a COMPLETED range must be >= pass
                     // (a racing next-pass byte is legal; pass-1 is not).
@@ -954,7 +958,8 @@ async fn completed_overwrites_never_serve_the_previous_pass() {
                                 panic!(
                                     "READER FOUND OLD BYTE {b} at pos {pos} \
                                      (pass {pass}, completed_end {end}) — \
-                                     generic/209;{heal}\n{}",
+                                     generic/209;{heal}\nREAD-ARM {}\n{}",
+                                    read_probe_delta(&probe0),
                                     storm_stats_line()
                                 );
                             }
@@ -1069,17 +1074,36 @@ async fn patched_block_never_serves_a_held_flight_snapshot() {
         "settled base must read 0x11"
     );
 
-    let m = &squeezefs::fuse_client::METRICS;
-    let patches0 = m.patch_writes.load(O::Relaxed);
+    // Setup helper: a page-0 write that must ride the W1 patch (the
+    // window is only reachable through the in-place vehicle). Engagement
+    // is checked on the process-global ledger, so under DEFAULT-
+    // PARALLELISM a foreign suite's load can classify one attempt away
+    // from the ladder (stale attr-arm heuristics, cache churn) — settle
+    // (fsync drains any accumulation vehicle the attempt landed on;
+    // content is value-idempotent) and retry, loud on exhaustion.
+    // Single-threaded this engages on the first try (0/300 retries
+    // across the conviction brackets).
+    async fn patch_engaged(h: &H, ino: u64, val: u8) {
+        use std::sync::atomic::Ordering as O;
+        let m = &squeezefs::fuse_client::METRICS;
+        for _ in 0..25 {
+            let before = m.patch_writes.load(O::Relaxed);
+            write_at(h, ino, 0, &[val; 4096]).await;
+            if m.patch_writes.load(O::Relaxed) > before {
+                return;
+            }
+            fsync(h, ino).await;
+            tokio::task::yield_now().await;
+        }
+        panic!(
+            "W1 patch never engaged for the held-flight repro setup\n{}",
+            storm_stats_line()
+        );
+    }
 
     // 3. Patch #1: page 0 := 0x22 (aligned, non-adjacent, sub-cap,
     //    non-extending ⇒ the W1 in-place DMA; purges block 0's tiers).
-    write_at(&h, ino, 0, &[0x22u8; PAGE]).await;
-    assert_eq!(
-        m.patch_writes.load(O::Relaxed) - patches0,
-        1,
-        "step 3 must ride the W1 patch (engagement, not assumption)"
-    );
+    patch_engaged(&h, ino, 0x22).await;
 
     // 4+5. Hold the tier publish open, then fill #2: the ghost hit
     //    routes this fill's publish through the deferred arm, whose
@@ -1094,12 +1118,7 @@ async fn patched_block_never_serves_a_held_flight_snapshot() {
 
     // 6. Patch #2: page 0 := 0x33, ACKed. The purge sweeps every tier —
     //    but the held flight's stored FillResult is not a tier.
-    write_at(&h, ino, 0, &[0x33u8; PAGE]).await;
-    assert_eq!(
-        m.patch_writes.load(O::Relaxed) - patches0,
-        2,
-        "step 6 must ride the W1 patch (engagement, not assumption)"
-    );
+    patch_engaged(&h, ino, 0x33).await;
 
     // 7. The contract: this read BEGINS after patch #2's ACK, so every
     //    byte of page 0 must read 0x33 — the stored flight snapshot
@@ -1130,6 +1149,52 @@ async fn patched_block_never_serves_a_held_flight_snapshot() {
 /// pattern: 795's readers filter EOF and still caught wrong bytes
 /// (zeros / foreign) at stable offsets, self-healing on remount —
 /// a daemon-side transient wrong serve.
+/// Per-read serve-arm probe (round-6 forensics): the counters whose DELTA
+/// across one read names which arm served it.
+const READ_PROBE_NAMES: [&str; 12] = [
+    "overlay_read_serves",
+    "overlay_read_gap_serves",
+    "overlay_read_drains",
+    "overlay_window_escalations",
+    "stale_binding_rebinds",
+    "singleflight_waiter_result_serves",
+    "cache_hits",
+    "cache_misses",
+    "ranged_reads",
+    "hot_block_hits",
+    "read_lane_serves",
+    "overwrite_seed_materialized",
+];
+
+fn read_probe_snapshot() -> [u64; 12] {
+    use std::sync::atomic::Ordering as O;
+    let m = &squeezefs::fuse_client::METRICS;
+    [
+        m.overlay_read_serves.load(O::Relaxed),
+        m.overlay_read_gap_serves.load(O::Relaxed),
+        m.overlay_read_drains.load(O::Relaxed),
+        m.overlay_window_escalations.load(O::Relaxed),
+        m.stale_binding_rebinds.load(O::Relaxed),
+        m.singleflight_waiter_result_serves.load(O::Relaxed),
+        m.cache_hits.load(O::Relaxed),
+        m.cache_misses.load(O::Relaxed),
+        m.ranged_reads.load(O::Relaxed),
+        m.hot_block_hits.load(O::Relaxed),
+        m.read_lane_serves.load(O::Relaxed),
+        m.overwrite_seed_materialized.load(O::Relaxed),
+    ]
+}
+
+fn read_probe_delta(before: &[u64; 12]) -> String {
+    let now = read_probe_snapshot();
+    READ_PROBE_NAMES
+        .iter()
+        .zip(now.iter().zip(before.iter()))
+        .map(|(n, (a, b))| format!("{n}={}", a - b))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// One greppable line of the discriminator counters ("STORM-STATS …").
 /// Round-5 mandate: the round-4 falsification tape STILL carried no
 /// gauge line (whatever the exit path did to the drop guard's stream),

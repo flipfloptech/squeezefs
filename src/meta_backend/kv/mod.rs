@@ -614,6 +614,19 @@ pub enum KvError {
     )]
     ValueTooLarge { len: usize, cap: usize },
 
+    /// A §4.6 freeze-swap refused by the node's lifecycle word
+    /// ([`node_state_core::FreezeRefused`]) — a PROTOCOL state on the
+    /// serialized writeback/SMO task (superseded / already-freezing /
+    /// not-dirty), never an encoding corruption. Historically wrapped in
+    /// [`Self::Corrupt`], whose "corrupt KV encoding" text sent the
+    /// 2026-08-19 AlreadyFreezing-wedge field hunt after phantom device
+    /// corruption.
+    #[error("freeze refused on node {node_addr:#x}: {refusal:?}")]
+    FreezeRefused {
+        node_addr: u64,
+        refusal: node_state_core::FreezeRefused,
+    },
+
     /// A bset append that does not fit the node's unwritten tail — the
     /// signal for the caller (the K5/K6b writeback task) to compact
     /// (design §4.6 pt 1: "on-disk log area full ⇒ compact").

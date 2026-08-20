@@ -924,7 +924,28 @@ impl KvTree {
         if node.state().is_superseded() || node.tree_id() != self.tree_id {
             return Ok(false);
         }
-        let (floor, forced_freeze) = {
+        // W-B drop guard (the 2026-08-19 AlreadyFreezing wedge's sibling
+        // window): the forced-freeze bit is OWNED — `end_freeze` on drop
+        // unless the success path disarms, so a dropped future (job
+        // cancel) or an unwind mid-`smo_replace` can no longer leave
+        // `FREEZING` latched on a live node (every later freeze then
+        // refused `AlreadyFreezing` until remount). A SUPERSEDED node is
+        // skipped: the SMO consumed the freeze in its lock window and
+        // `smo_replace`'s own `end_freeze` bookkeeping ran (or the bit
+        // is terminal-moot) — ending it again is the double-`end_freeze`
+        // the state core's debug_assert refuses.
+        struct ForcedFreezeGuard {
+            node: Arc<CachedNode>,
+            armed: bool,
+        }
+        impl Drop for ForcedFreezeGuard {
+            fn drop(&mut self) {
+                if self.armed && !self.node.state().is_superseded() {
+                    self.node.state().end_freeze();
+                }
+            }
+        }
+        let (floor, mut forced_guard) = {
             let mut guard = node.lock().write().await;
             let frozen = node.freeze_locked(&mut guard, &self.cache.config().layout)?;
             // No delta to swap (the common nudge target — a clean node
@@ -941,16 +962,22 @@ impl KvTree {
             } else {
                 false
             };
-            (node.take_dirty_floor(), forced)
+            (
+                node.take_dirty_floor(),
+                ForcedFreezeGuard {
+                    node: Arc::clone(&node),
+                    armed: forced,
+                },
+            )
         };
         node.restore_dirty_floor(floor);
         // Admission posture (not the flush pass): the defrag nudge keeps
         // the FIFO valve + its bounded cycle-and-retry protocol.
         let out = self.smo_replace(ctx, &node, out, false).await;
-        if out.is_err() && forced_freeze {
-            // Undo the empty forced freeze so the node stays writable —
-            // there was no frozen delta to restore.
-            node.state().end_freeze();
+        if out.is_ok() {
+            // The SMO consumed the freeze (supersede + its own
+            // `end_freeze`): the guard stands down.
+            forced_guard.armed = false;
         }
         out?;
         Ok(true)

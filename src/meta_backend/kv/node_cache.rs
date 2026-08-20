@@ -1674,12 +1674,72 @@ impl CachedNode {
         if guard.frozen.is_some() {
             return Ok(guard.frozen.clone());
         }
+        // Self-heal tripwire (RES-22, the 2026-08-19 AlreadyFreezing
+        // wedge): `FREEZING` latched with NO frozen delta on a live node
+        // is a freeze that never completed. The two known windows — the
+        // W-A error escape below and the W-B forced-freeze drop
+        // (`compact_node_forced`) — are closed structurally, so
+        // observing the shape means a THIRD unknown window: report loud,
+        // restore, and proceed — one line instead of a permanent
+        // per-node checkpoint wedge (the field capture: every tick
+        // refusing forever, journal tail pinned). Safe HERE, under the
+        // held node write lock on the serialized writeback/SMO task
+        // (§4.6 — all freeze drivers share the SMO serialization
+        // domain): a latched bit with no frozen delta cannot belong to a
+        // live freeze.
+        if self.state.is_freezing() && !self.state.is_superseded() {
+            crate::note_invariant_tripwire(
+                "kv_freeze_latched_recovered",
+                &format!(
+                    "node {:#x}: FREEZING latched with no frozen delta ({} overlay records) — \
+                     lifecycle word restored, freeze retried",
+                    self.addr,
+                    guard.overlay.len()
+                ),
+            );
+            if guard.overlay.is_empty() {
+                // The forced-freeze shape (no delta to restore):
+                // `end_freeze` is the designated undo.
+                self.state.end_freeze();
+            } else {
+                self.state.abort_freeze();
+            }
+        }
         if guard.overlay.is_empty() {
             return Ok(None);
         }
-        self.state.begin_freeze().map_err(|e| {
-            KvError::Corrupt(format!("freeze refused on node {:#x}: {e:?}", self.addr))
-        })?;
+        self.state
+            .begin_freeze()
+            .map_err(|refusal| KvError::FreezeRefused {
+                node_addr: self.addr,
+                refusal,
+            })?;
+        // W-A restore guard (the 2026-08-19 wedge's latch): between the
+        // successful `begin_freeze` above and the `guard.frozen =
+        // Some(..)` publication below, EVERY error path leaves the
+        // overlay untouched — so the only state to restore is the
+        // lifecycle word. Without the restore, an escaping error (the
+        // field's oversize record failing `encode_bset_frame`) latched
+        // `FREEZING` with `frozen == None`, and every later freeze of
+        // the node refused `AlreadyFreezing` until remount.
+        // `abort_freeze` is the designated restore (node_state_core):
+        // FREEZING cleared, DIRTY re-set, the records still in the open
+        // delta for a later cycle's retry.
+        struct FreezeRestore<'a> {
+            state: &'a NodeState,
+            armed: bool,
+        }
+        impl Drop for FreezeRestore<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    self.state.abort_freeze();
+                }
+            }
+        }
+        let mut restore = FreezeRestore {
+            state: &self.state,
+            armed: true,
+        };
         // Test seam: fail the serialization right AFTER the lifecycle
         // word transitioned — the exact W-A window the 2026-08-19 field
         // wedge escaped through (an oversize record failing
@@ -1739,6 +1799,10 @@ impl CachedNode {
         let bset_image = frame.slice(BSET_FRAME_LEN..BSET_FRAME_LEN + bset_len);
         let cur = self.snapshot.load();
         let base = Arc::new(cur.base.extend_with(bset_image)?);
+        // The last fallible step succeeded — the freeze WILL publish
+        // (everything below is infallible RAM bookkeeping): the W-A
+        // restore guard stands down before the overlay is consumed.
+        restore.armed = false;
         guard.overlay.clear();
         guard.overlay_bytes = 0;
         // D7.a: the heads freeze away with their records (the overlay is

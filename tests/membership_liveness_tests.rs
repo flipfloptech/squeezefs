@@ -54,9 +54,7 @@ use squeezefs::cluster_wire as cw;
 use squeezefs::data_grant::{self, WriteCustodyClient, WriteCustodyOwner};
 use squeezefs::dlm::LockMode;
 use squeezefs::fuse_client::METRICS;
-use squeezefs::membership::{
-    self, LeaseClock, LeaseClocks, MembershipOwner, OwnerRecord,
-};
+use squeezefs::membership::{self, LeaseClock, LeaseClocks, MembershipOwner, OwnerRecord};
 use squeezefs::membership_wire::{MembershipPlane, MembershipPlaneConfig};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -265,6 +263,15 @@ async fn membership_heartbeat_survives_meta_lane_occupancy_past_t_self() {
         owner.epoch_of("liveness-node").is_some(),
         "the member's lease is still custody at the owner"
     );
+    let lag = METRICS
+        .membership_renew_sched_lag_ms
+        .load(Ordering::Relaxed);
+    assert!(
+        lag < 1_300,
+        "the renewal tick's own scheduling lag (max-gauge {lag} ms) must stay far \
+         below T_self while the meta lanes are wedged — this is the instrument that \
+         surfaces venue starvation BEFORE it becomes a fence"
+    );
 
     arm.disarm().await;
     plane.shutdown();
@@ -366,10 +373,8 @@ async fn custody_heartbeat_rides_its_own_wire_session_not_the_acquire_storms() {
             let stop = Arc::clone(&stop);
             tokio::spawn(async move {
                 while !stop.load(Ordering::Acquire) {
-                    squeezefs_ipc::sqz_time::sleep(Duration::from_millis(
-                        client.renewal_due_ms(),
-                    ))
-                    .await;
+                    squeezefs_ipc::sqz_time::sleep(Duration::from_millis(client.renewal_due_ms()))
+                        .await;
                     if stop.load(Ordering::Acquire) {
                         return;
                     }
@@ -412,4 +417,263 @@ async fn custody_heartbeat_rides_its_own_wire_session_not_the_acquire_storms() {
         "renewals must keep their cadence under the storm (got {landed} across two \
          clients in {window:?} at a ~433 ms cadence)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 3. The custody renewal LOOP survives meta-lane occupancy past T_self
+// ---------------------------------------------------------------------------
+
+/// **The custody twin of contract 1** — same venue conviction, the REAL
+/// cadence loop (`cowriter::spawn_custody_renewal`): with every sqz-meta
+/// lane wedged past `T_self` by workload-class blocking polls, the
+/// co-writer's custody heartbeat must keep renewing on the dedicated
+/// `sqz-lease` lane — the authority never expires it, and nothing
+/// poisons process data custody.
+///
+/// (Red-by-construction against the pre-fix tree: the loop rode
+/// `sqz-meta` and this suite's contract 1 reproduced the sweep on the
+/// membership twin; the loop was not public before the fix, so this
+/// contract lands with it.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn custody_renewal_loop_survives_meta_lane_occupancy_past_t_self() {
+    let _serial = serial();
+    let _restore = restore();
+    let clocks = short_clocks();
+    let t_owner_ms = clocks.t_owner.as_millis() as u64;
+    let term = squeezefs::dlm::durable_term();
+    let owner = WriteCustodyOwner::arm(
+        "authority-venue",
+        term + 1,
+        term,
+        clocks.clone(),
+        LeaseClock::monotonic(),
+        None,
+    )
+    .expect("the custody authority arms");
+    let router = data_grant::AsyncVerbRouter::new().with_custody(Arc::clone(&owner));
+    let cfg = cw::RpcListenerConfig {
+        bind_addr: "127.0.0.1:0".parse().expect("literal addr"),
+        service_threads: 2,
+        ..cw::RpcListenerConfig::default()
+    };
+    let listener = cw::RpcListener::start_async(cfg, SECRET.to_vec(), Arc::new(router))
+        .expect("the authority listens");
+    let endpoint = listener.endpoint().to_string();
+
+    let client = WriteCustodyClient::connect_with_clock(
+        &endpoint,
+        SECRET,
+        "node-venue",
+        LeaseClock::monotonic(),
+        0,
+    )
+    .await
+    .expect("the co-writer joins");
+    let renewals_before = data_grant::stats().renewals;
+    let stop = Arc::new(AtomicBool::new(false));
+    squeezefs::cowriter::spawn_custody_renewal(Arc::clone(&client), Arc::clone(&stop));
+
+    // Prove the loop is alive before wedging the lanes.
+    let alive_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while data_grant::stats().renewals == renewals_before {
+        assert!(
+            std::time::Instant::now() < alive_deadline,
+            "the custody renewal loop must land its first heartbeat on a healthy host"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let hold = occupy_meta_lanes();
+    let renewals_at_hold = data_grant::stats().renewals;
+    let mut dead: Vec<String> = Vec::new();
+    let window = Duration::from_millis(2 * t_owner_ms + 500);
+    let t0 = std::time::Instant::now();
+    while t0.elapsed() < window {
+        for d in owner.expire_due() {
+            dead.push(d.client.clone());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    drop(hold);
+    stop.store(true, Ordering::Release);
+
+    assert!(
+        dead.is_empty(),
+        "a co-writer on an otherwise-healthy host must NEVER lose custody because \
+         the sqz-meta lanes are occupied — the heartbeat is isolated from the \
+         workload whose stall it survives (expired: {dead:?})"
+    );
+    assert!(
+        !squeezefs::data_custody::poisoned(),
+        "no self-fence: the lease never died, so nothing poisoned custody"
+    );
+    let landed = data_grant::stats().renewals - renewals_at_hold;
+    assert!(
+        landed >= 3,
+        "custody renewals must keep landing while the meta lanes are wedged (got \
+         {landed} in {window:?} at a ~433 ms cadence)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 4. A wedged renewal attempt never occupies the lease venue past its
+//    bound — and the §6.7 fence semantics stay byte-identical
+// ---------------------------------------------------------------------------
+
+/// Drop guard: a panicking test must never leak a 60 s tick hold into the
+/// binary's later tests.
+struct TickHoldGuard;
+
+impl Drop for TickHoldGuard {
+    fn drop(&mut self) {
+        membership::TEST_RENEW_TICK_HOLD_MS.store(0, Ordering::Relaxed);
+    }
+}
+
+/// The TIME side of the isolation law: one lease-class loop's wedged
+/// attempt (emulated by the `TEST_RENEW_TICK_HOLD_MS` seam — the shape of
+/// an RPC parked forever behind a hung owner) must be deadline-bounded at
+/// `max(remaining-to-T_self/3, one cadence)`, so the OTHER lease-class
+/// loop sharing the ONE `sqz-lease` venue keeps its cadence. And §6.7 is
+/// byte-identical: once the hold lifts, the swept member's next attempt
+/// completes, is refused, and self-fences exactly once — the fix makes
+/// the fence unnecessary under load, never weaker.
+///
+/// (Red-by-construction against the pre-fix tree: with no per-attempt
+/// deadline, the FIRST wedged attempt parks the loop forever — no retry
+/// warnings, and no fence even after the wire recovers.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wedged_renewal_attempt_never_occupies_the_lease_venue_past_its_bound() {
+    let _serial = serial();
+    let _restore = restore();
+    let _hold_guard = TickHoldGuard;
+    let clocks = short_clocks();
+    let t_owner_ms = clocks.t_owner.as_millis() as u64;
+
+    // The membership plane whose member's ticks will wedge.
+    let m_owner = MembershipOwner::arm(
+        "owner-wedged",
+        7,
+        6,
+        clocks.clone(),
+        LeaseClock::monotonic(),
+    )
+    .expect("the owner arms");
+    let plane = MembershipPlane::start(
+        MembershipPlaneConfig::loopback(),
+        SECRET.to_vec(),
+        Arc::clone(&m_owner),
+    )
+    .expect("plane binds loopback");
+    let rec = OwnerRecord {
+        v: 1,
+        id: "owner-wedged".to_string(),
+        term: 7,
+        endpoint: plane.endpoint().to_string(),
+        ttl_ms: t_owner_ms,
+        owner_claim_id: String::new(),
+        ts: 0,
+        pid: std::process::id(),
+        boot: "boot-wedged".to_string(),
+    };
+
+    // The custody plane whose heartbeat shares the sqz-lease venue.
+    let term = squeezefs::dlm::durable_term();
+    let c_owner = WriteCustodyOwner::arm(
+        "authority-wedged",
+        term + 1,
+        term,
+        clocks.clone(),
+        LeaseClock::monotonic(),
+        None,
+    )
+    .expect("the custody authority arms");
+    let router = data_grant::AsyncVerbRouter::new().with_custody(Arc::clone(&c_owner));
+    let cfg = cw::RpcListenerConfig {
+        bind_addr: "127.0.0.1:0".parse().expect("literal addr"),
+        service_threads: 2,
+        ..cw::RpcListenerConfig::default()
+    };
+    let listener = cw::RpcListener::start_async(cfg, SECRET.to_vec(), Arc::new(router))
+        .expect("the authority listens");
+    let custody = WriteCustodyClient::connect_with_clock(
+        &listener.endpoint().to_string(),
+        SECRET,
+        "node-beside-the-wedge",
+        LeaseClock::monotonic(),
+        0,
+    )
+    .await
+    .expect("the co-writer joins");
+    let stop = Arc::new(AtomicBool::new(false));
+    squeezefs::cowriter::spawn_custody_renewal(Arc::clone(&custody), Arc::clone(&stop));
+
+    let fences_before = METRICS.membership_self_fences.load(Ordering::Relaxed);
+    let arm = membership::join_as_writer_member(&rec, SECRET.to_vec(), "wedged-node", 0, None)
+        .await
+        .expect("the join must be admitted")
+        .expect("a rendezvous record exists, so a member arms");
+    let renewals_before = METRICS.membership_renewals.load(Ordering::Relaxed);
+    let alive_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while METRICS.membership_renewals.load(Ordering::Relaxed) == renewals_before {
+        assert!(
+            std::time::Instant::now() < alive_deadline,
+            "the member's renewal loop must land its first heartbeat before the wedge"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Wedge every subsequent membership tick (the hung-attempt shape),
+    // and let both owners' TTL clocks run.
+    membership::TEST_RENEW_TICK_HOLD_MS.store(60_000, Ordering::Relaxed);
+    let custody_renewals_at_wedge = data_grant::stats().renewals;
+    let mut custody_dead: Vec<String> = Vec::new();
+    let window = Duration::from_millis(2 * t_owner_ms + 500);
+    let t0 = std::time::Instant::now();
+    while t0.elapsed() < window {
+        for d in c_owner.expire_due() {
+            custody_dead.push(d.client.clone());
+        }
+        // The membership owner sweeps the wedged member — that is the
+        // DESIGNED outcome for a member whose attempts genuinely cannot
+        // complete; this test asserts its neighbor's isolation.
+        let _ = m_owner.expire_due();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    assert!(
+        custody_dead.is_empty(),
+        "the custody heartbeat shares the ONE sqz-lease venue with the wedged \
+         membership loop — the per-attempt deadline bound is what keeps its \
+         cadence (expired: {custody_dead:?})"
+    );
+    let landed = data_grant::stats().renewals - custody_renewals_at_wedge;
+    assert!(
+        landed >= 3,
+        "custody renewals must keep landing beside the wedged membership ticks \
+         (got {landed} in {window:?} at a ~433 ms cadence)"
+    );
+
+    // Lift the wedge: the member's next attempt completes, the owner
+    // refuses it (swept), and the §6.7 self-fence fires EXACTLY as before
+    // the fix — same ladder, same counters.
+    membership::TEST_RENEW_TICK_HOLD_MS.store(0, Ordering::Relaxed);
+    let fence_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while METRICS.membership_self_fences.load(Ordering::Relaxed) == fences_before {
+        assert!(
+            std::time::Instant::now() < fence_deadline,
+            "once the wire recovers, the swept member must reach the §6.7 \
+             self-fence through the ordinary ladder — the fix never weakens it"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        METRICS.membership_self_fences.load(Ordering::Relaxed) - fences_before,
+        1,
+        "the fence fires exactly once (a WRITER member's deadline fence is terminal)"
+    );
+
+    stop.store(true, Ordering::Release);
+    arm.disarm().await;
+    plane.shutdown();
 }

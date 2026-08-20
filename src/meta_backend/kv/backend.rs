@@ -5095,6 +5095,24 @@ impl KvMetaBackend {
         for (tree_id, r) in &recs {
             super::node::debug_audit_records(*tree_id, 0, std::slice::from_ref(r));
         }
+        // Admission honesty (the 2026-08-19 AlreadyFreezing wedge's third
+        // leg): the per-volume record-value cap (§4.2 — the very check
+        // `encode_bset_frame` runs at FREEZE time) is enforced HERE, the
+        // one commit-side choke point every `KvTx` passes, so an
+        // over-cap record fails ITS OWN commit loudly instead of being
+        // acked into a node overlay the checkpoint can then never
+        // serialize (the field capture: admission passed, the freeze
+        // refused, the volume's checkpoint wedged forever). Direct
+        // node-layer writers (`KvTree::insert`) and the user xattr path
+        // already enforce it upstream — this is the backstop for every
+        // OTHER staging site, present and future.
+        let cap = self.cache.config().layout.record_value_cap();
+        if let Some((_, r)) = recs.iter().find(|(_, r)| r.value.len() > cap) {
+            return Err(KvError::ValueTooLarge {
+                len: r.value.len(),
+                cap,
+            });
+        }
         let len = entry_len_for(&recs)?;
 
         // (2) Enqueue + leader-elect. The pass task holds the QUEUE

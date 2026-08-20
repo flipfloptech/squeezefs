@@ -49,7 +49,9 @@ use fuse3::raw::Request;
 use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::cache::TieredCache;
 use squeezefs::dlm::DlmClient;
-use squeezefs::fuse_client::{set_patch_max_bytes, SqueezefsFilesystem, METRICS};
+use squeezefs::fuse_client::{
+    set_mount_posture, set_patch_max_bytes, MountPosture, SqueezefsFilesystem, METRICS,
+};
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::builder::{BuilderConfig, ImageBuilder};
 use squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE;
@@ -1878,4 +1880,90 @@ async fn read_survives_perpetual_patch_storm_no_rebind_eio() {
 
     stop.store(true, Ordering::Release);
     storm.await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Exclusion: the CO-WRITER posture (DLM S9 — W1 stays authority-only)
+// ---------------------------------------------------------------------------
+
+/// Restores the process-global mount posture on drop, so a failing
+/// assertion never leaves this shared-process binary latched CoWriter
+/// (the mw_cowriter_free_tests `Restore` discipline).
+struct PostureRestore;
+
+impl Drop for PostureRestore {
+    fn drop(&mut self) {
+        set_mount_posture(MountPosture::Writer);
+    }
+}
+
+/// **The 2026-08-19 mw-fleet storm** (sqz-mw-cw2: one ERROR-level `W1
+/// in-place sub-block patch refused: this mount is a CO-WRITER…` per
+/// eligible overwrite of a 4 MiB-aligned ior write storm): on a CO-WRITER,
+/// W1 never executes — that is the DECIDED posture (a lifetime retire is
+/// durable ownership state, §6.2 item 6, and the §5.1 clone/patch fence is
+/// process-local) — but the decline must be a **counted DECISION** in the
+/// §5.4 ledger (`patch_ineligible_posture`), taken BEFORE any allocator arm
+/// can reach `plane_gate`'s ERROR-per-attempt refusal. It must move neither
+/// `cowriter_accounting_refusals` (a documented must-stay-≈0 bug tripwire
+/// on rewriting co-writers) nor `patch_ineligible_shared` (where the
+/// refused allocator probe's fallback was misattributed — predicate-rot
+/// ledger pollution). The write itself falls back to the accumulation path
+/// (CoW-rewrite + shipped free on a real co-writer) and stays byte-exact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_co_writers_w1_probe_is_a_counted_ineligible_not_an_accounting_refusal() {
+    let _g = serial().await;
+    let h = make(*b"rw2-posture-0001", "rw2_ns_posture").await;
+    let (ino, _base) = durable_striped(&h, "posture.dat", 4, 0x21).await;
+
+    // Premise: the shape is W1-ELIGIBLE — as the WRITER it patches, so the
+    // co-writer decline below is attributable to POSTURE alone, never to a
+    // rotted predicate.
+    let before = snap();
+    write_at(&h, ino, 2 * BS + 8192, &pattern(4096, 0xC1)).await;
+    let mid = snap();
+    assert_eq!(
+        delta!(mid, before, patch_writes),
+        1,
+        "premise: the identical shape patches on the writer posture"
+    );
+
+    // Latch CO-WRITER (panic-safe restore) and drive the SAME eligible
+    // shape at a different, non-stream-adjacent block.
+    let _posture = PostureRestore;
+    set_mount_posture(MountPosture::CoWriter);
+    let posture_before = METRICS.patch_ineligible_posture.load(Ordering::Relaxed);
+    let refusals_before = METRICS.cowriter_accounting_refusals.load(Ordering::Relaxed);
+    let p = pattern(4096, 0xC2);
+    write_at(&h, ino, BS + 8192, &p).await; // ACKed: a fallback, never an error
+    let after = snap();
+
+    assert_eq!(
+        delta!(after, mid, patch_writes),
+        0,
+        "W1 never executes on a co-writer (the DECIDED posture)"
+    );
+    assert_eq!(
+        METRICS.patch_ineligible_posture.load(Ordering::Relaxed) - posture_before,
+        1,
+        "the decline is a counted DECISION: exactly one patch_ineligible_posture"
+    );
+    assert_eq!(
+        METRICS.cowriter_accounting_refusals.load(Ordering::Relaxed) - refusals_before,
+        0,
+        "a posture-shaped W1 probe must not move the accounting-refusal bug \
+         tripwire (the 2026-08-19 storm: one ERROR + one refusal per eligible \
+         overwrite)"
+    );
+    assert_eq!(
+        delta!(after, mid, shared),
+        0,
+        "…and must not be misattributed to patch_ineligible_shared (the refused \
+         allocator probe's fallback bucket on dev — ledger pollution)"
+    );
+
+    // The fallback ACKed through the accumulation path and serves the bytes.
+    set_mount_posture(MountPosture::Writer);
+    let got = read_at(&h, ino, BS + 8192, 4096).await;
+    assert_bytes(&got, &p, "co-writer fallback write is byte-exact");
 }

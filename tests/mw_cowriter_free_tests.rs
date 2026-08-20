@@ -1814,3 +1814,106 @@ async fn a_reclaim_shaped_release_batch_is_exact_idempotent_and_frees_read_freed
     drop(cwr);
     auth.stop().await;
 }
+
+// ===========================================================================
+// 9. Error-cleanup on a co-writer: leak-safe quiet abandon, never a storm
+// ===========================================================================
+
+/// Contract (the 2026-08-19 field conviction, sqz-mw-cw2: after a custody
+/// poison/self-fence, EVERY in-flight upload's publish refused and its
+/// cleanup hit the allocator's ERROR-logging plane gate — one `block free
+/// refused: this mount is a CO-WRITER…` per in-flight block, plus one
+/// `cowriter_accounting_refusals` each): the error-cleanup arms (a pipeline
+/// upload whose DMA/publish failed, the RES-9 mint guard, the
+/// lane-reservation give-back, the mover's destination undo) hold a
+/// minted-but-NEVER-PUBLISHED offset no map names, and their ONE sanctioned
+/// exit is [`BlockAllocator::abandon_unpublished_offset`]: on a co-writer it
+/// ABANDONS the offset leak-safe to the next derivation (the
+/// `data_grant::check_free` recovery statement — "stays durably unreferenced
+/// and the next derivation (mount recovery / fsck C6) returns them to the
+/// free supply" — i.e. the `free_ship_failures` pattern), counts
+/// `cowriter_unpublished_abandons`, and moves neither the
+/// `cowriter_accounting_refusals` bug tripwire nor the local free list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unpublished_offset_cleanup_on_a_co_writer_abandons_quietly() {
+    let _serial = serial();
+    let _restore = restore();
+
+    // Mint as the WRITER (the offset's custody existed; its PUBLISH is what
+    // failed), then latch the co-writer posture for the cleanup — the
+    // post-fence shape, where the in-flight upload's publish verb refused.
+    fuse_client::set_mount_posture(MountPosture::Writer);
+    let alloc = allocator("vol-00000000000000f3").await;
+    let off = alloc.allocate_block().await.expect("mint as the writer");
+    fuse_client::set_mount_posture(MountPosture::CoWriter);
+
+    let abandons_before = METRICS
+        .cowriter_unpublished_abandons
+        .load(Ordering::Relaxed);
+    let refusals_before = METRICS.cowriter_accounting_refusals.load(Ordering::Relaxed);
+    alloc
+        .abandon_unpublished_offset(off)
+        .await
+        .expect("the abandon is QUIET — a cleanup arm has no error to surface");
+    assert_eq!(
+        METRICS
+            .cowriter_unpublished_abandons
+            .load(Ordering::Relaxed)
+            - abandons_before,
+        1,
+        "one abandon, counted (expected nonzero ONLY around custody loss)"
+    );
+    assert_eq!(
+        METRICS.cowriter_accounting_refusals.load(Ordering::Relaxed) - refusals_before,
+        0,
+        "the must-stay-≈0 accounting tripwire does not move for sanctioned cleanup"
+    );
+    assert!(
+        !alloc
+            .free_block_indices()
+            .contains(&(off / alloc.chunk_size())),
+        "ABANDONED, not freed: a co-writer's local free list is a private opinion \
+         about shared hardware — the offset stays durably unreferenced until the \
+         next derivation (mount recovery / fsck C6) returns it to the free supply"
+    );
+}
+
+/// Contract: on the AUTHORITY / solo-writer posture the same helper IS
+/// [`BlockAllocator::free_block`] verbatim — begin + finish with nothing
+/// between, the offset back on the free list, zero abandon-gauge movement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_authority_posture_keeps_the_verbatim_free() {
+    let _serial = serial();
+    let _restore = restore();
+    fuse_client::set_mount_posture(MountPosture::Writer);
+    let alloc = allocator("vol-00000000000000f4").await;
+    let off = alloc.allocate_block().await.expect("mint");
+
+    let abandons_before = METRICS
+        .cowriter_unpublished_abandons
+        .load(Ordering::Relaxed);
+    let refusals_before = METRICS.cowriter_accounting_refusals.load(Ordering::Relaxed);
+    alloc
+        .abandon_unpublished_offset(off)
+        .await
+        .expect("the authority arm is free_block verbatim");
+    assert!(
+        alloc
+            .free_block_indices()
+            .contains(&(off / alloc.chunk_size())),
+        "the offset returned to the free list exactly as free_block leaves it"
+    );
+    assert_eq!(
+        METRICS
+            .cowriter_unpublished_abandons
+            .load(Ordering::Relaxed)
+            - abandons_before,
+        0,
+        "the abandon gauge is a CO-WRITER instrument: 0 on every other posture"
+    );
+    assert_eq!(
+        METRICS.cowriter_accounting_refusals.load(Ordering::Relaxed) - refusals_before,
+        0,
+        "no refusal on the authority arm either"
+    );
+}

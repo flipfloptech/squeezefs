@@ -4781,6 +4781,23 @@ struct QueuedLayoutMerge {
     done: squeezefs_ipc::sqz_channel::oneshot::Sender<crate::error::Result<(bool, u64)>>,
 }
 
+/// [`KvMetaBackend::spill_oversize_chained_full`]'s spill result — the
+/// inline→oversize crossing arm's product (2026-08-19 wedge trigger fix).
+struct SpilledChainedFull {
+    /// The re-encoded head naming `indirect:{fresh_key}` — what the
+    /// commit stages instead of the oversize inline value.
+    encoded: Vec<u8>,
+    /// The composed head (`block_map: None`, `block_map_id` = the fresh
+    /// name) — the aggregated pass's memo seed.
+    head: crate::layout_wire::LayoutMetadata,
+    /// The FULL composed map — the memo's accumulated view.
+    map: std::collections::HashMap<u32, String>,
+    /// The fresh CoW blob's key (the MAP_BLOB take + memo `prior_fresh`).
+    fresh_key: String,
+    /// RES-9 custody for the fresh blob until the naming commit lands.
+    guard: super::indirect_map::IndirectBlobGuard,
+}
+
 struct QueuedTx {
     /// The tx's records, seqs stamped by the pass inside the lock window.
     recs: Vec<(u8, Record)>,
@@ -7298,8 +7315,11 @@ impl KvMetaBackend {
             /// `block_map: None` + the fresh blob's name).
             layout: crate::layout_wire::LayoutMetadata,
             /// The COMMITTED head's blob — displaced once, by the first
-            /// successful compose.
-            old_blob: String,
+            /// successful compose. `None` when the chain entered the
+            /// memo at an inline→oversize CROSSING (2026-08-19 wedge
+            /// trigger fix): an INLINE head names no blob, so there is
+            /// nothing to release and nothing to free.
+            old_blob: Option<String>,
             /// The latest staged-but-uncommitted fresh blob for this ino
             /// (a successor member releases + frees it).
             prior_fresh: Option<String>,
@@ -7357,6 +7377,11 @@ impl KvMetaBackend {
             // Rung 20 residual 1: this member's fresh-blob RES-9 guard
             // (compose arm only) — disarmed with the batch commit.
             let mut member_blob_guard: Option<super::indirect_map::IndirectBlobGuard> = None;
+            // The inline→oversize crossing's fresh blob (2026-08-19
+            // wedge trigger fix): its MAP_BLOB take joins the recomputed
+            // refs below. NO released twin and nothing joins
+            // `displaced_blobs` — the displaced head was INLINE.
+            let mut crossing_fresh: Option<String> = None;
             if existing {
                 match self.xattrs.lookup(&key).await {
                     Ok(Some(cur)) => {
@@ -7398,15 +7423,24 @@ impl KvMetaBackend {
                         // indirect truth. Solo/un-chained members are
                         // untouched (their caller half already gates on
                         // its own RAM `block_map_id`).
+                        //
+                        // A memo entry counts as an indirect head TOO
+                        // (2026-08-19 wedge trigger fix): a batch-prior
+                        // member that CROSSED to indirect staged a head
+                        // `xattrs.lookup` cannot see — a mate that took
+                        // the delta arm here would stage a delta onto
+                        // the just-staged indirect head, the exact
+                        // fold-poison the rung-19 gate exists to refuse.
                         let head_indirect = op.chain
                             && versions_stamped
                             && base_ok
-                            && XattrValue::decode(&cur).is_ok_and(|x| {
-                                matches!(
-                                    crate::layout_wire::decode_base_layout(&x.value),
-                                    Err(e) if format!("{e}").contains("indirect")
-                                )
-                            });
+                            && (composed_heads.contains_key(&op.ino)
+                                || XattrValue::decode(&cur).is_ok_and(|x| {
+                                    matches!(
+                                        crate::layout_wire::decode_base_layout(&x.value),
+                                        Err(e) if format!("{e}").contains("indirect")
+                                    )
+                                }));
                         if head_indirect {
                             // Rung 20 residual 1: UNARMED keeps the
                             // refusal verbatim; an ARMED authority
@@ -7493,7 +7527,7 @@ impl KvMetaBackend {
                                     layout.block_map = Some(full.into_iter().collect());
                                     vacant.insert(ComposedState {
                                         layout,
-                                        old_blob,
+                                        old_blob: Some(old_blob),
                                         prior_fresh: None,
                                     })
                                 }
@@ -7565,18 +7599,22 @@ impl KvMetaBackend {
                             // The blob custody transfer: the PRIOR staged
                             // name (this pass's latest fresh key, else
                             // the committed blob) released, the fresh
-                            // taken.
-                            let prior_named = state
-                                .prior_fresh
-                                .clone()
-                                .unwrap_or_else(|| state.old_blob.clone());
+                            // taken. `None` prior = the chain entered
+                            // the memo at an inline CROSSING and this is
+                            // unreachable (the crossing seeds
+                            // `prior_fresh`), kept structural: an inline
+                            // head releases nothing.
+                            let prior_named =
+                                state.prior_fresh.clone().or_else(|| state.old_blob.clone());
                             if let Some(refs) = composed_refs.as_mut() {
-                                super::indirect_map::push_map_blob_transfer_op(
-                                    refs,
-                                    &prior_named,
-                                    op.refs_owner,
-                                    false,
-                                );
+                                if let Some(prior) = prior_named.as_deref() {
+                                    super::indirect_map::push_map_blob_transfer_op(
+                                        refs,
+                                        prior,
+                                        op.refs_owner,
+                                        false,
+                                    );
+                                }
                                 super::indirect_map::push_map_blob_transfer_op(
                                     refs,
                                     &new_key,
@@ -7592,7 +7630,11 @@ impl KvMetaBackend {
                             // the commit stops carrying.
                             match state.prior_fresh.replace(new_key) {
                                 Some(prev) => displaced_blobs.push(prev),
-                                None => displaced_blobs.push(state.old_blob.clone()),
+                                None => {
+                                    if let Some(old) = state.old_blob.clone() {
+                                        displaced_blobs.push(old);
+                                    }
+                                }
                             }
                             state.layout = candidate;
                             state.layout.block_map = Some(candidate_map);
@@ -7680,7 +7722,47 @@ impl KvMetaBackend {
                                     crate::layout_wire::LayoutDelta::decode(&op.delta_wire)
                                         .and_then(|d| d.apply(&folded));
                                 match applied {
-                                    Ok(full) => chained_full = Some(full),
+                                    Ok(full) => {
+                                        // The inline→oversize CROSSING
+                                        // (2026-08-19 wedge trigger fix):
+                                        // spill (armed) or refuse
+                                        // (unarmed) — NEVER stage the
+                                        // oversize record.
+                                        match self.spill_oversize_chained_full(op.ino, &full).await
+                                        {
+                                            Ok(None) => chained_full = Some(full),
+                                            Ok(Some(spill)) => {
+                                                // Seed the pass-local
+                                                // memo (the batch-prior
+                                                // law's crossing face):
+                                                // a same-ino mate must
+                                                // compose onto THIS
+                                                // accumulated view —
+                                                // never stage a delta
+                                                // onto the just-staged
+                                                // indirect head, never
+                                                // re-read the committed
+                                                // (still-inline) blob.
+                                                let mut memo_layout = spill.head;
+                                                memo_layout.block_map = Some(spill.map);
+                                                composed_heads.insert(
+                                                    op.ino,
+                                                    ComposedState {
+                                                        layout: memo_layout,
+                                                        old_blob: None,
+                                                        prior_fresh: Some(spill.fresh_key.clone()),
+                                                    },
+                                                );
+                                                chained_full = Some(spill.encoded);
+                                                member_blob_guard = Some(spill.guard);
+                                                crossing_fresh = Some(spill.fresh_key);
+                                            }
+                                            Err(e) => {
+                                                failed.push((op.done, e));
+                                                continue;
+                                            }
+                                        }
+                                    }
                                     Err(e) => {
                                         failed.push((
                                             op.done,
@@ -7743,6 +7825,17 @@ impl KvMetaBackend {
                                 ) {
                                     op.block_refs = refs;
                                 }
+                            }
+                            // The crossing's blob custody: ONE take for
+                            // the fresh blob — no released twin (the
+                            // displaced head was INLINE, not a blob).
+                            if let Some(fresh) = crossing_fresh.as_deref() {
+                                super::indirect_map::push_map_blob_transfer_op(
+                                    &mut op.block_refs,
+                                    fresh,
+                                    op.refs_owner,
+                                    true,
+                                );
                             }
                         }
                     }
@@ -7950,6 +8043,88 @@ impl KvMetaBackend {
         Some(out)
     }
 
+    /// **The inline→oversize CROSSING arm** (the 2026-08-19
+    /// AlreadyFreezing wedge's TRIGGER — this is the fix's site-(a)/(b)
+    /// half; site (c), `PublishService::custody_scoped_layout`, and the
+    /// router's save path already spill): the owner-side chain
+    /// compaction composed `chained_full = delta.apply(folded)` onto an
+    /// INLINE head with **no cap check** — the oversize record passed
+    /// commit admission, reached the node overlay, and could only be
+    /// refused at FREEZE time ("record value length 66121 exceeds the
+    /// per-volume cap 65792"), from which tick the node latched
+    /// `AlreadyFreezing` and the volume's checkpoint wedged forever
+    /// (journal tail pinned, conveyor degraded, fleet cascade).
+    ///
+    /// The decision arithmetic is site (c)'s VERBATIM: spill when the
+    /// encoded value exceeds this volume's `xattr_value_cap −
+    /// LAYOUT_INLINE_HEADROOM` (PR K8's inline ceiling — its 4 KiB
+    /// headroom covers the record envelope, so a value that passes here
+    /// always freezes).
+    ///
+    /// `Ok(None)` = fits inline: stage `full` verbatim (the pre-fix
+    /// shape, byte-identical). `Ok(Some(..))` = spilled: a fresh CoW
+    /// blob was written and FLUSHED (the hook's DUR-6 §3 contract —
+    /// the naming commit never points at bytes that can vanish on power
+    /// loss); stage the returned re-encode, hold the RES-9 guard until
+    /// the commit lands, and the compose is counted. `Err` = a crossing
+    /// with no `indirect_map_io` hook armed: the fail-safe retried-class
+    /// refusal (the rung-19 "layout delta base unusable" pattern) — the
+    /// caller must stage NOTHING.
+    async fn spill_oversize_chained_full(
+        &self,
+        ino: Ino,
+        full: &[u8],
+    ) -> Result<Option<SpilledChainedFull>> {
+        let inline_cap = self
+            .xattr_value_cap()
+            .saturating_sub(crate::routing::LAYOUT_INLINE_HEADROOM);
+        if full.len() <= inline_cap {
+            return Ok(None);
+        }
+        let Some(io) = super::indirect_map::indirect_map_io() else {
+            return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                "layout delta base unusable: the owner-side chain compaction for ino {ino} \
+                 composed a {} B inline layout, past this volume's inline ceiling \
+                 {inline_cap} B (xattr value cap {} − {} B layout headroom) — staging it \
+                 would wedge the volume's checkpoint at freeze time (the record-value cap), \
+                 and no indirect-map hook is armed to spill it (rung 20: refetch and \
+                 recompose)",
+                full.len(),
+                self.xattr_value_cap(),
+                crate::routing::LAYOUT_INLINE_HEADROOM,
+            )));
+        };
+        let mut head = crate::layout_wire::decode_base_layout(full).map_err(|e| {
+            crate::error::SqueezefsError::InvalidOperation(format!(
+                "chain-compaction crossing: undecodable composed layout for ino {ino}: {e}"
+            ))
+        })?;
+        let map = head.block_map.take().unwrap_or_default();
+        let mut sorted: Vec<(u32, String)> = map.iter().map(|(b, k)| (*b, k.clone())).collect();
+        sorted.sort_unstable_by_key(|&(b, _)| b);
+        // The blob write happens BEFORE any KvTx staging — no node locks
+        // are held here; the held 4a I-guard across data I/O follows the
+        // conveyor precedent (the rung-20 compose arms' discipline).
+        let (fresh_key, guard) = (io.write)(ino, sorted).await?;
+        head.block_map_id = Some(format!("indirect:{fresh_key}"));
+        let encoded = crate::layout_wire::encode_layout(&head).map_err(|e| {
+            crate::error::SqueezefsError::InvalidOperation(format!(
+                "chain-compaction crossing: composed indirect head re-encode failed for \
+                 ino {ino}: {e}"
+            ))
+        })?;
+        crate::fuse_client::METRICS
+            .publish_blob_composes
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(Some(SpilledChainedFull {
+            encoded,
+            head,
+            map,
+            fresh_key,
+            guard,
+        }))
+    }
+
     /// The pre-aggregation single-ino body (the
     /// `SQUEEZEFS_PUBLISH_COMMIT_GROUP_MAX=1` A/B path, verbatim; `chain`
     /// selects the rung-17 chain-onto-head arm — see
@@ -8005,6 +8180,11 @@ impl KvMetaBackend {
         // predecessor's post-commit free.
         let mut fresh_blob_guard: Option<super::indirect_map::IndirectBlobGuard> = None;
         let mut displaced_blob: Option<String> = None;
+        // The inline→oversize crossing's fresh blob (2026-08-19 wedge
+        // trigger fix): its MAP_BLOB take joins the recomputed refs
+        // below. NO released twin and `displaced_blob` stays `None` —
+        // the displaced head was INLINE, so nothing is freed.
+        let mut crossing_fresh: Option<String> = None;
         if existing {
             if let Some(cur) = self.xattrs.lookup(&key).await? {
                 let base_ok = XattrValue::decode(&cur)
@@ -8138,7 +8318,18 @@ impl KvMetaBackend {
                                 "rung 17: owner-side chain compaction failed for ino {ino}: {e}"
                             ))
                         })?;
-                        chained_full = Some(full);
+                        // The inline→oversize CROSSING (2026-08-19 wedge
+                        // trigger fix): the composed map may no longer
+                        // fit inline — spill (armed) or refuse (unarmed),
+                        // NEVER stage the oversize record.
+                        match self.spill_oversize_chained_full(ino, &full).await? {
+                            None => chained_full = Some(full),
+                            Some(spill) => {
+                                chained_full = Some(spill.encoded);
+                                fresh_blob_guard = Some(spill.guard);
+                                crossing_fresh = Some(spill.fresh_key);
+                            }
+                        }
                     }
                 } else if use_delta && self.layout_versions_stamped() {
                     // Spec §6.2 item 9: the durable base-name gate — Stage /
@@ -8159,6 +8350,16 @@ impl KvMetaBackend {
                 if chain && self.block_refs.is_some() && !head_indirect {
                     refs_override =
                         Self::recompute_chained_refs(&cur, &delta.entries, refs_owner, block_refs);
+                    // The crossing's blob custody: ONE take for the
+                    // fresh blob — no released twin (the displaced head
+                    // was INLINE, not a blob).
+                    if let Some(fresh) = crossing_fresh.as_deref() {
+                        if let Some(refs) = refs_override.as_mut() {
+                            super::indirect_map::push_map_blob_transfer_op(
+                                refs, fresh, refs_owner, true,
+                            );
+                        }
+                    }
                 }
             }
         }

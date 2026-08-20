@@ -264,6 +264,8 @@ fn install_test_resolver() {
 
 /// The 1d pins' in-memory blob store (key → decoded map entries).
 type BlobStore = Arc<Mutex<HashMap<String, Vec<(u32, String)>>>>;
+/// One `(block index, block key)` entry list (the 1e builders' form).
+type Entries = Vec<(u32, String)>;
 /// A boxed hook future (the `IndirectMapIo` closure shapes).
 type MapIoFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
@@ -1447,7 +1449,7 @@ async fn crossing_sandbox(
     dir: &Path,
     tag: &str,
     base_n: u32,
-) -> (Arc<RoutedMetaBackend>, u64, Vec<(u32, String)>) {
+) -> (Arc<RoutedMetaBackend>, u64, Entries) {
     let (be, _p) = sandbox_sized(dir, tag, true, 64 * 1024).await;
     install_test_resolver();
     squeezefs::routing::set_layout_delta_chain_override(Some(0));
@@ -1486,7 +1488,7 @@ fn crossing_delta(
     vol: &Arc<squeezefs::meta_backend::kv::backend::KvMetaBackend>,
     base: &[(u32, String)],
     add_n: u32,
-) -> (Vec<(u32, String)>, Vec<(u32, String)>, u64) {
+) -> (Entries, Entries, u64) {
     let base_n = base.len() as u32;
     let added: Vec<(u32, String)> = (base_n..base_n + add_n)
         .map(|i| (i, format!("be://data:N{i:05}")))
@@ -1584,7 +1586,10 @@ async fn an_armed_chained_merge_crossing_the_inline_cap_composes_to_indirect() {
         "the composed head crossed to INDIRECT — the oversize inline \
          record (the checkpoint-wedge mint) was never staged"
     );
-    assert!(head.block_map.is_none(), "no inline map on an indirect head");
+    assert!(
+        head.block_map.is_none(),
+        "no inline map on an indirect head"
+    );
 
     // The fresh blob holds the FULL composed map.
     let mut want_map = composed.clone();

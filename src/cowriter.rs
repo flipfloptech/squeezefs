@@ -1220,11 +1220,29 @@ pub async fn arm(
 /// completing — poisoning process data custody so nothing can land after
 /// the authority may have granted those bytes elsewhere (§6.7's stricter
 /// client clock, S6's law reused verbatim).
-fn spawn_custody_renewal(
+///
+/// **Liveness isolation** (finding 2, the 2026-08-19 mw fleet run — the
+/// membership twin's law applied verbatim; contracts
+/// `tests/membership_liveness_tests.rs`): a lease renewal is a heartbeat
+/// — it must be isolated from the workload whose stall it is supposed to
+/// survive. The loop rides the dedicated `sqz-lease` lane (never the
+/// shared sqz-meta pool a workload-class poll can occupy past `T_self`),
+/// each attempt is deadline-bounded
+/// ([`WriteCustodyClient::renew_tick_bound_ms`] —
+/// `max(remaining-to-T_self / 3, one cadence)`), and the wire itself is
+/// the client's DEDICATED lease session, never the acquire storm's (the
+/// second fate-sharing the field's 35-attempt POSIX-5 ladders exposed).
+/// A bounded attempt that expires past `T_self` still fences — §6.7 is
+/// byte-identical; the isolation makes the fence unnecessary under load,
+/// never weaker.
+///
+/// Public so the liveness contracts can drive the REAL cadence loop
+/// against an in-process authority.
+pub fn spawn_custody_renewal(
     client: Arc<crate::data_grant::WriteCustodyClient>,
     stop: Arc<AtomicBool>,
 ) {
-    crate::meta_exec::spawn_meta_contained("cowriter_custody_renewal", async move {
+    crate::meta_exec::spawn_lease("cowriter_custody_renewal", async move {
         loop {
             // Rung-10 finding #1: the due distance is the CLIENT's own
             // clock's (`renewal_due_ms`) — a fresh monotonic clock here
@@ -1237,16 +1255,43 @@ fn spawn_custody_renewal(
             if stop.load(Ordering::Acquire) {
                 return;
             }
-            if let Err(e) = client.renew_all().await {
-                if client.self_fence_due() {
-                    client.self_fence(&format!("custody renewal failed: {e}"));
-                    return;
+            let bound = client.renew_tick_bound_ms();
+            match squeezefs_ipc::sqz_time::timeout(Duration::from_millis(bound), client.renew_all())
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if client.self_fence_due() {
+                        client.self_fence(&format!("custody renewal failed: {e}"));
+                        return;
+                    }
+                    log::warn!(
+                        "co-writer custody renewal failed ({e}) — retrying before my own \
+                         deadline (T_self, strictly earlier than the authority's TTL)"
+                    );
+                    squeezefs_ipc::sqz_time::sleep(Duration::from_millis(25)).await;
                 }
-                log::warn!(
-                    "co-writer custody renewal failed ({e}) — retrying before my own deadline \
-                     (T_self, strictly earlier than the authority's TTL)"
-                );
-                squeezefs_ipc::sqz_time::sleep(Duration::from_millis(25)).await;
+                Err(_) => {
+                    // The per-attempt warning the field lacked. Unlike an
+                    // Err, a hang carries no owner verdict — but §6.7 does
+                    // not wait for one: past T_self the fence fires HERE
+                    // (it needs no wire), because a permanently hung
+                    // attempt would otherwise never reach the Err arm.
+                    if client.self_fence_due() {
+                        client.self_fence(&format!(
+                            "custody renewal attempt still incomplete at T_self (bounded at \
+                             {bound} ms per attempt)"
+                        ));
+                        return;
+                    }
+                    log::warn!(
+                        "co-writer custody renewal attempt exceeded its {bound} ms deadline \
+                         (max(remaining-to-T_self/3, one cadence)) — abandoning it so the \
+                         lease venue keeps its cadence; the abandoned wire session \
+                         reconnects on the next attempt"
+                    );
+                    squeezefs_ipc::sqz_time::sleep(Duration::from_millis(25)).await;
+                }
             }
         }
     })

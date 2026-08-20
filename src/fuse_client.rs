@@ -5370,6 +5370,13 @@ pub struct Metrics {
     /// membership changes, never by beats**: growth proportional to
     /// `membership_renewals` is the regression S6 exists to prevent.
     pub membership_registration_commits: Align64<AtomicU64>,
+    /// **Max-gauge**: the worst observed scheduling lag of the member
+    /// renewal tick, ms — intended wake instant vs the tick actually
+    /// running (finding 2, 2026-08-20: the renewal loop lost its cadence
+    /// to meta-plane congestion for >45 s with ZERO warnings). Growth
+    /// toward `T_self` is lease-venue starvation surfacing in stats
+    /// BEFORE it becomes a §6.7 self-fence.
+    pub membership_renew_sched_lag_ms: Align64<AtomicU64>,
     // Idea 2 — latest-wins supersession (design-rewrite-program §4;
     // tests/write_supersession_tests.rs): the overlapping-face
     // loop-rewrite engagement instrument.
@@ -9435,6 +9442,12 @@ impl SqueezefsFilesystem {
                 "membership_grace_refusals": METRICS.membership_grace_refusals.load(Ordering::Relaxed),
                 "membership_grace_reclaims": METRICS.membership_grace_reclaims.load(Ordering::Relaxed),
                 "membership_registration_commits": METRICS.membership_registration_commits.load(Ordering::Relaxed),
+                // Finding 2 (2026-08-20): the lease-venue starvation
+                // instrument — max intended-wake → actual-run lag of the
+                // member renewal tick. Growth toward T_self means the
+                // heartbeat venue is losing its cadence; read it BEFORE
+                // `membership_self_fences` moves.
+                "membership_renew_sched_lag_ms": METRICS.membership_renew_sched_lag_ms.load(Ordering::Relaxed),
                 // Idea 2 — latest-wins supersession
                 // (design-rewrite-program §4).
                 "write_pipeline_supersessions": METRICS.write_pipeline_supersessions.load(Ordering::Relaxed),

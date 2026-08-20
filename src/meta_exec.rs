@@ -82,6 +82,54 @@ where
     spawn_meta(site, fut);
 }
 
+/// The dedicated **lease-heartbeat lane** (`sqz-lease`): ONE OS thread,
+/// hosting exactly the lease-class renewal cadences (the S6 membership
+/// renewal, the S9 custody renewal).
+///
+/// The design principle (finding 2, the 2026-08-19 mw fleet run —
+/// `.benchmarks/2026-08-20-fabric-confirm-sessions.md` §3): **a lease
+/// renewal is a heartbeat — it must be isolated from the workload whose
+/// stall it is supposed to survive.** On the shared 2-thread sqz-meta
+/// pool the heartbeat's timer wake only ENQUEUES it; delivery waits for a
+/// lane thread, and any meta-plane poll occupying its OS thread past
+/// `T_self` (a blocking section a stalled authority makes unbounded — the
+/// finding-1 coupling class) silenced the cadence with zero warnings
+/// until the owner swept the member and the §6.7 self-fence fired.
+///
+/// Why a lane and not the `sqz-timer` thread: the timer thread fires
+/// wakers ONLY — it must never run arbitrary polls, and a heartbeat tick
+/// performs wire work. Why exactly ONE thread (derived, never a knob):
+/// the population is exactly the two renewal loops, both mostly parked,
+/// and each tick's occupancy is deadline-bounded by its own caller
+/// (~remaining-to-`T_self`/3 — see `spawn_member_renewal` /
+/// `spawn_custody_renewal`), so one lane cannot lose the cadence to its
+/// only peer.
+static LEASE_EXEC: once_cell::sync::Lazy<LaneExec> = once_cell::sync::Lazy::new(|| {
+    let exec = LaneExec::new();
+    let ex = exec.clone();
+    std::thread::Builder::new()
+        .name(squeezefs_ipc::comm_core::comm_name("sqz-lease"))
+        .spawn(move || {
+            // Same posture as the sqz-meta lanes: timers ride the
+            // sqz-timer thread, delivery rides this lane.
+            ex.run();
+        })
+        .expect("sqz-lease lane thread spawns");
+    exec
+});
+
+/// Spawn a **lease-class heartbeat loop** onto the dedicated `sqz-lease`
+/// lane, panic-contained and counted (the RES-8 discipline, same as
+/// [`spawn_meta`]). Venue rule: ONLY lease renewal cadences spawn here —
+/// anything workload-class would reintroduce the fate-sharing this lane
+/// exists to end.
+pub fn spawn_lease<F>(site: &'static str, fut: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    LEASE_EXEC.spawn(crate::detached::contain(site, fut));
+}
+
 pub fn spawn_meta<F>(site: &'static str, fut: F)
 where
     F: Future<Output = ()> + Send + 'static,

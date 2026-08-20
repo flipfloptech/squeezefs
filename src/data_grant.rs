@@ -2602,7 +2602,17 @@ pub struct WriteCustodyClient {
     id: String,
     endpoint: String,
     secret: Vec<u8>,
+    /// The WORKLOAD wire session: acquires (which the authority parks in
+    /// arbitration for up to one renewal cadence each) serialize here.
     session: crate::sqz_sync::SqzMutex<Option<RpcClient>>,
+    /// The **lease-heartbeat wire session** (finding 2, 2026-08-20 —
+    /// `tests/membership_liveness_tests.rs`): the idempotent lease-class
+    /// verbs (renew / release / reclaim / the renewal-carried acks) ride
+    /// their own session, because a heartbeat that queues behind the
+    /// write path's acquire storm on the ONE shared session starves past
+    /// `T_self` behind the very workload its stall-detection exists to
+    /// survive. Dialed lazily on the first lease verb.
+    lease_session: crate::sqz_sync::SqzMutex<Option<RpcClient>>,
     /// This client's lease view — S6's [`MemberSession`], reused verbatim
     /// so the stricter-clock law and the writer's self-fence (which poisons
     /// process data custody) have exactly one implementation.
@@ -2675,6 +2685,7 @@ impl WriteCustodyClient {
             endpoint: endpoint.to_string(),
             secret: secret.to_vec(),
             session: crate::sqz_sync::SqzMutex::new(Some(session)),
+            lease_session: crate::sqz_sync::SqzMutex::new(None),
             lease: arc_swap::ArcSwap::from_pointee(member),
             lease_epoch: AtomicU64::new(lease.epoch),
             lane: std::sync::atomic::AtomicU32::new(pack_lane(lease.writer_lane, lease.writers)),
@@ -2759,6 +2770,21 @@ impl WriteCustodyClient {
     /// — before the authority's TTL lets those bytes be granted elsewhere.
     pub fn self_fence_due(&self) -> bool {
         self.lease.load().self_fence_due()
+    }
+
+    /// The per-attempt deadline bound for one renewal tick, ms (finding 2,
+    /// 2026-08-20 — the lease-venue liveness law): `max(remaining-to-T_self
+    /// / 3, one renewal cadence)`, in the client's own clock domain. Three
+    /// bounded attempts always fit before `T_self`, and no single attempt
+    /// can occupy the shared `sqz-lease` venue past one cadence.
+    pub fn renew_tick_bound_ms(&self) -> u64 {
+        let lease = self.lease.load();
+        (lease
+            .t_self_deadline_ms()
+            .saturating_sub(self.clock.now_ms())
+            / 3)
+        .max(lease.renew_interval_ms())
+        .max(1)
     }
 
     /// **Fail-stop our own custody** (§6.7's stricter client clock): a
@@ -3360,12 +3386,23 @@ impl WriteCustodyClient {
         ));
     }
 
+    /// One roundtrip on the WORKLOAD session (acquires — the verbs the
+    /// authority may park in arbitration).
     async fn call_once(
         &self,
         verb: u16,
         body: Vec<u8>,
     ) -> Result<crate::cluster_wire::RpcResponse> {
-        let mut guard = self.session.lock().await;
+        self.call_once_on(&self.session, verb, body).await
+    }
+
+    async fn call_once_on(
+        &self,
+        session: &crate::sqz_sync::SqzMutex<Option<RpcClient>>,
+        verb: u16,
+        body: Vec<u8>,
+    ) -> Result<crate::cluster_wire::RpcResponse> {
+        let mut guard = session.lock().await;
         if guard.is_none() {
             *guard = Some(RpcClient::connect(&self.endpoint, &self.secret, &self.id, None).await?);
         }
@@ -3381,15 +3418,21 @@ impl WriteCustodyClient {
         out
     }
 
-    /// [`Self::call_once`] with ONE reconnect+resend. Safe only for the
-    /// idempotent verbs (join / renew / release / reclaim); an acquire never
-    /// takes this path.
+    /// One roundtrip, with ONE reconnect+resend, on the **lease-heartbeat
+    /// session** ([`Self::lease_session`]) — never the workload session an
+    /// acquire storm holds for a full arbitration park per attempt. Safe
+    /// only for the idempotent lease-class verbs (renew / release /
+    /// reclaim / the renewal-carried acks); an acquire never takes this
+    /// path.
     async fn call_retrying(
         &self,
         verb: u16,
         body: Vec<u8>,
     ) -> Result<crate::cluster_wire::RpcResponse> {
-        match self.call_once(verb, body.clone()).await {
+        match self
+            .call_once_on(&self.lease_session, verb, body.clone())
+            .await
+        {
             Ok(r) => Ok(r),
             Err(first) => {
                 log::warn!(
@@ -3397,7 +3440,7 @@ impl WriteCustodyClient {
                      resending (the verb is idempotent)",
                     self.endpoint
                 );
-                self.call_once(verb, body).await
+                self.call_once_on(&self.lease_session, verb, body).await
             }
         }
     }

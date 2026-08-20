@@ -1723,6 +1723,13 @@ impl MemberSession {
         self.words.renew_at_ms()
     }
 
+    /// The grant's renewal cadence, ms — the renewal loop's per-attempt
+    /// deadline floor (finding 2, 2026-08-20: one attempt must never
+    /// occupy the lease venue past one cadence).
+    pub fn renew_interval_ms(&self) -> u64 {
+        self.words.renew_interval_ms()
+    }
+
     /// `true` ⇔ the member is past its own deadline and MUST fail-stop now
     /// — before the owner's TTL lets the objects be granted elsewhere.
     pub fn self_fence_due(&self) -> bool {
@@ -2437,6 +2444,13 @@ pub enum RenewalTick {
     RejoinRefused,
 }
 
+/// TEST seam ONLY (0 in production, one relaxed load — the
+/// `TEST_SHIP_DRAIN_HOLD_MS` precedent): holds the renewal tick at its
+/// head so the liveness suite (`tests/membership_liveness_tests.rs`) can
+/// emulate a wedged renewal attempt deterministically and prove the
+/// cadence shell's per-attempt deadline bound keeps the lease venue live.
+pub static TEST_RENEW_TICK_HOLD_MS: AtomicU64 = AtomicU64::new(0);
+
 /// One member renewal-cadence decision — the body of the renewal loop
 /// ([`spawn_member_renewal`] is the cadence shell around it): renew, and
 /// on failure re-join (a RECLAIM — it presents the epoch it holds, which
@@ -2451,6 +2465,10 @@ pub async fn member_renewal_tick(
     clock: &LeaseClock,
     on_purge: Option<&Arc<dyn Fn() + Send + Sync>>,
 ) -> RenewalTick {
+    let hold = TEST_RENEW_TICK_HOLD_MS.load(Ordering::Relaxed);
+    if hold > 0 {
+        squeezefs_ipc::sqz_time::sleep(Duration::from_millis(hold)).await;
+    }
     let session = Arc::clone(client.session());
     let Err(e) = client.renew().await else {
         return RenewalTick::Renewed;
@@ -2583,6 +2601,31 @@ async fn fresh_join_after_fence(
 /// The member's renewal cadence shell: sleep to the renewal due instant,
 /// honor the stop latch, and run [`member_renewal_tick`] — which owns the
 /// whole renew / reclaim / self-fence decision.
+///
+/// **Liveness isolation** (finding 2, the 2026-08-19 mw fleet run —
+/// `.benchmarks/2026-08-20-fabric-confirm-sessions.md` §3; contracts
+/// `tests/membership_liveness_tests.rs`): a lease renewal is a HEARTBEAT
+/// — it must be isolated from the workload whose stall it is supposed to
+/// survive. Three sides of that law here:
+///
+/// * **Venue** — the loop rides the dedicated `sqz-lease` lane
+///   ([`crate::meta_exec::spawn_lease`]), never the shared 2-thread
+///   sqz-meta pool, where a workload-class poll occupying its lane past
+///   `T_self` silenced the cadence with ZERO per-attempt warnings (the
+///   warnings live inside the tick that was not being polled) until the
+///   owner swept the member and the §6.7 fence fired.
+/// * **Time** — each tick is deadline-bounded at
+///   `max(remaining-to-T_self / 3, one renewal cadence)`: a hung wire
+///   attempt logs the ladder warning and retries instead of occupying
+///   the lease venue past its cadence. Abandoning an attempt mid-call
+///   forfeits that wire session (`RpcClient::call` cannot restore a
+///   cancelled roundtrip's I/O), so the NEXT attempt fails FAST and
+///   takes the ordinary reclaim / deadline-fence ladder — which is why
+///   the timeout arm itself never fences: every real hang shape reaches
+///   the tick's own §6.7 arms one attempt later.
+/// * **Instrument** — `membership_renew_sched_lag_ms` (stats inode) is
+///   the max observed intended-wake → actual-run lag, so a future venue
+///   starvation shows in stats BEFORE it becomes a fence.
 fn spawn_member_renewal(
     mut client: crate::membership_wire::MemberClient,
     endpoint: String,
@@ -2592,30 +2635,58 @@ fn spawn_member_renewal(
     stop: Arc<AtomicBool>,
     on_purge: Option<Arc<dyn Fn() + Send + Sync>>,
 ) {
-    crate::meta_exec::spawn_meta_contained("membership_renewal", async move {
+    crate::meta_exec::spawn_lease("membership_renewal", async move {
         loop {
             let now = clock.now_ms();
-            let due = client.session().renew_at_ms().saturating_sub(now);
-            squeezefs_ipc::sqz_time::sleep(Duration::from_millis(due.max(1))).await;
+            let due = client.session().renew_at_ms().saturating_sub(now).max(1);
+            squeezefs_ipc::sqz_time::sleep(Duration::from_millis(due)).await;
             if stop.load(Ordering::Acquire) {
                 let _ = client.leave().await;
                 return;
             }
-            match member_renewal_tick(
-                &mut client,
-                &endpoint,
-                &secret,
-                &req,
-                &clock,
-                on_purge.as_ref(),
+            // One clock read per tick: the scheduling-lag instrument and
+            // the deadline bound share it.
+            let woke = clock.now_ms();
+            METRICS
+                .membership_renew_sched_lag_ms
+                .fetch_max(woke.saturating_sub(now + due), Ordering::Relaxed);
+            let session = Arc::clone(client.session());
+            let bound = (session.t_self_deadline_ms().saturating_sub(woke) / 3)
+                .max(session.renew_interval_ms())
+                .max(1);
+            match squeezefs_ipc::sqz_time::timeout(
+                Duration::from_millis(bound),
+                member_renewal_tick(
+                    &mut client,
+                    &endpoint,
+                    &secret,
+                    &req,
+                    &clock,
+                    on_purge.as_ref(),
+                ),
             )
             .await
             {
-                RenewalTick::Fenced => return,
-                RenewalTick::Renewed
-                | RenewalTick::Rejoined
-                | RenewalTick::FencedAndRejoined
-                | RenewalTick::RejoinRefused => {}
+                Ok(RenewalTick::Fenced) => return,
+                Ok(
+                    RenewalTick::Renewed
+                    | RenewalTick::Rejoined
+                    | RenewalTick::FencedAndRejoined
+                    | RenewalTick::RejoinRefused,
+                ) => {}
+                Err(_) => {
+                    // The per-attempt warning the field lacked (finding 2:
+                    // >45 s of silence). No fence here — a cancelled
+                    // in-flight call forfeits its wire session, so the
+                    // next attempt fails fast and reaches the tick's own
+                    // reclaim / deadline-fence ladder.
+                    log::warn!(
+                        "membership: renewal attempt exceeded its {bound} ms deadline \
+                         (max(remaining-to-T_self/3, one cadence)) — abandoning it so the \
+                         lease venue keeps its cadence; the next attempt reconnects and \
+                         takes the ordinary reclaim/self-fence ladder"
+                    );
+                }
             }
         }
     })

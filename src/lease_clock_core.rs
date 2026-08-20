@@ -81,6 +81,11 @@ pub struct MemberLeaseWords {
     epoch: AtomicU64,
     t_self_deadline_ms: AtomicU64,
     renew_at_ms: AtomicU64,
+    /// The grant's renewal cadence, ms — kept so the renewal loop's
+    /// per-attempt deadline bound (finding 2, 2026-08-20: an attempt must
+    /// never occupy the lease venue past one cadence) is the plane's own
+    /// number rather than a second derivation.
+    renew_ms: AtomicU64,
     acked_free_epoch: AtomicU64,
     /// §6.8 item 3: the causal LABEL the last grant carried — the owner's
     /// own monotonic instant of that grant, echoed back once the member
@@ -116,6 +121,7 @@ impl MemberLeaseWords {
             epoch: AtomicU64::new(epoch),
             t_self_deadline_ms: AtomicU64::new(anchor_ms + t_self_ms),
             renew_at_ms: AtomicU64::new(anchor_ms + renew_ms),
+            renew_ms: AtomicU64::new(renew_ms),
             acked_free_epoch: AtomicU64::new(0),
             learned_label: AtomicU64::new(label),
             learned_at_ms: AtomicU64::new(anchor_ms),
@@ -143,6 +149,7 @@ impl MemberLeaseWords {
             .store(anchor_ms + t_self_ms, Ordering::Release);
         self.renew_at_ms
             .store(anchor_ms + renew_ms, Ordering::Release);
+        self.renew_ms.store(renew_ms, Ordering::Release);
         self.skew_max_ms.store(skew_max_ms, Ordering::Release);
         self.d_purge_ms.store(d_purge_ms, Ordering::Release);
         if label > self.learned_label.load(Ordering::Acquire) {
@@ -188,6 +195,13 @@ impl MemberLeaseWords {
     /// When the next renewal is due.
     pub fn renew_at_ms(&self) -> u64 {
         self.renew_at_ms.load(Ordering::Acquire)
+    }
+
+    /// The grant's renewal cadence, ms — the renewal loop's per-attempt
+    /// deadline floor (an attempt never occupies the lease venue past one
+    /// cadence).
+    pub fn renew_interval_ms(&self) -> u64 {
+        self.renew_ms.load(Ordering::Acquire)
     }
 
     /// `true` ⇔ the member is past its own deadline and MUST fail-stop

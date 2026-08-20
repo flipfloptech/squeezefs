@@ -131,6 +131,16 @@ pub const DEFAULT_WRITEBACK_DELTA_BYTES: usize = 4096;
 /// 1"); the per-node memory bound the §5.7 budget accounting relies on.
 pub const FOLD_MEMO_CAPACITY: usize = 8;
 
+/// Test seam (the freeze-wedge suite, 2026-08-19 field conviction; the
+/// `TEST_SMO_BUILD_PAUSE_TREE` precedent): how many
+/// [`CachedNode::freeze_locked`] serializations to FAIL right after
+/// `begin_freeze` succeeds — the W-A window, where an encode/extend error
+/// historically escaped between the lifecycle-word transition and the
+/// frozen-delta publication and latched the node `AlreadyFreezing`
+/// forever. Each engaged freeze decrements it. Unarmed cost: one relaxed
+/// load per freeze.
+pub static TEST_FREEZE_ENCODE_FAIL: AtomicU64 = AtomicU64::new(0);
+
 /// Placement + policy for one volume's node cache. Everything is a
 /// parameter by design: the superblock/CLI plumbing is PR K6a's.
 #[derive(Debug, Clone)]
@@ -1670,6 +1680,19 @@ impl CachedNode {
         self.state.begin_freeze().map_err(|e| {
             KvError::Corrupt(format!("freeze refused on node {:#x}: {e:?}", self.addr))
         })?;
+        // Test seam: fail the serialization right AFTER the lifecycle
+        // word transitioned — the exact W-A window the 2026-08-19 field
+        // wedge escaped through (an oversize record failing
+        // `encode_bset_frame` below).
+        if TEST_FREEZE_ENCODE_FAIL
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1))
+            .is_ok()
+        {
+            return Err(KvError::Corrupt(format!(
+                "test seam: injected freeze-encode failure on node {:#x}",
+                self.addr
+            )));
+        }
         // The overlay is sorted by (key, seq) ascending (apply_locked's
         // partition_point insert), so shadow-folding is one linear pass
         // over per-key runs.

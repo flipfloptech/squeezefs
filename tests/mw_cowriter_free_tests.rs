@@ -65,8 +65,11 @@
 //! the explicit authority-accounting scope this file also pins the
 //! non-reachability of.
 
+use fuse3::raw::prelude::Filesystem;
+use fuse3::raw::Request;
 use squeezefs::alloc_lane_grant::{self as grant, LaneFloor};
 use squeezefs::block_allocator::BlockAllocator;
+use squeezefs::cache::TieredCache;
 use squeezefs::cluster_wire as cw;
 use squeezefs::cowriter::{
     self, AdmissionRequest, AuthorityLeaseEvidence, RegistrantEvidence, VolumeAdmissionEvidence,
@@ -74,26 +77,31 @@ use squeezefs::cowriter::{
 use squeezefs::data_alloc_lane as lane;
 use squeezefs::data_custody;
 use squeezefs::data_grant::{self, WriteCustodyClient, WriteCustodyOwner};
+use squeezefs::dlm::DlmClient;
 use squeezefs::free_grace;
-use squeezefs::fuse_client::{self, MountPosture, METRICS};
+use squeezefs::fuse_client::{self, MountPosture, SqueezefsFilesystem, METRICS};
 use squeezefs::membership::{
     self, ClaimSet, ClaimSetMember, JoinOutcome, JoinRequest, LeaseClock, LeaseClocks,
     MemberIdentity, MemberRole, MembershipOwner, RenewOutcome,
 };
-use squeezefs::meta_backend::kv::backend::WriterClaim;
+use squeezefs::meta_backend::kv::backend::{KvMetaBackend, WriterClaim};
 use squeezefs::meta_backend::kv::block_refs::{volume_tag, BlockRef, BlockRefOp};
-use squeezefs::meta_backend::kv::builder::{format_v3, FormatV3Options};
+use squeezefs::meta_backend::kv::builder::{
+    format_v3, BuilderConfig, FormatV3Options, ImageBuilder,
+};
 use squeezefs::meta_backend::kv::journal::AppendPartition;
+use squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE;
 use squeezefs::meta_backend::kv::superblock as sb;
 use squeezefs::meta_backend::RoutedMetaBackend;
 use squeezefs::meta_ship::{self as ship, publish, OwnerMap, PeerOwner};
-use squeezefs::nvme_dev::NvmeBlockDev;
-use squeezefs::routing::BackendRouter;
+use squeezefs::nvme_dev::{self, NvmeBlockDev};
+use squeezefs::routing::{BackendRouter, DataRouter};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tempfile::TempDir;
+use tempfile::{tempdir, NamedTempFile, TempDir};
 
 const VOL_LEN: u64 = 64 * 1024 * 1024;
 /// Sparse data-device backing: big enough that every lane index this file
@@ -1915,5 +1923,288 @@ async fn the_authority_posture_keeps_the_verbatim_free() {
         METRICS.cowriter_accounting_refusals.load(Ordering::Relaxed) - refusals_before,
         0,
         "no refusal on the authority arm either"
+    );
+}
+
+// ===========================================================================
+// 10. The staged legs' error cleanup (the d575be03 residual sweep): a
+//     co-writer's staged flush/fold/promotion/spill undo abandons quietly
+// ===========================================================================
+
+/// In-process FUSE-layer fixture (the `rw5a_never_lossy_tests` /
+/// `fsync_writeback_tail_loss_tests` house shape): a real
+/// [`SqueezefsFilesystem`] over file-backed data + meta sandboxes with a
+/// live staging dir — the venue the staged flush/fold/spill legs run in
+/// (co-writers DO stage: writer-scoped staging, incompat bit 10, exists
+/// exactly so multiple writers' staged payloads coexist). The allocator
+/// handle stays out so a test can engage the granted co-writer lane the
+/// S9 posture allocates from.
+struct FsH {
+    fs: SqueezefsFilesystem,
+    req: Request,
+    alloc: Arc<BlockAllocator>,
+    _b: NamedTempFile,
+    _m: NamedTempFile,
+    _s: TempDir,
+}
+
+/// Drops the write-failure injection and the block-size env pin on every
+/// exit (panic hygiene — the file's [`Restore`] restores the posture;
+/// this guard owns the seams only the fs-level tests below arm).
+struct SeamGuard;
+
+impl Drop for SeamGuard {
+    fn drop(&mut self) {
+        nvme_dev::clear_fail_next_writes();
+        std::env::remove_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE");
+    }
+}
+
+async fn fs_fixture(uuid: [u8; 16], alloc_ns: &str, block_size: u64, write_cap: &str) -> FsH {
+    std::env::set_var("SQUEEZEFS_DEFAULT_BLOCK_SIZE", block_size.to_string());
+    let dlm = DlmClient::new().unwrap();
+    let b = NamedTempFile::new().unwrap();
+    std::fs::File::create(b.path())
+        .unwrap()
+        .set_len(256 * 1024 * 1024)
+        .unwrap();
+    let nvme = Arc::new(NvmeBlockDev::new(b.path().to_str().unwrap()));
+    let ba = allocator(alloc_ns).await;
+    let s = tempdir().unwrap();
+    let cache = TieredCache::new(
+        vec![s.path().to_path_buf()],
+        Some("64MB"),
+        Some("64MB"),
+        Some("16MB"),
+        Some(write_cap),
+        ba.clone(),
+        nvme.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let router = DataRouter::new(dlm.clone(), cache, ba.clone(), nvme);
+    let mut fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);
+    let m = NamedTempFile::new().unwrap();
+    m.as_file().set_len(128 * 1024 * 1024).unwrap();
+    let routed: Arc<RoutedMetaBackend> = {
+        ImageBuilder::new(BuilderConfig {
+            node_size: DEFAULT_NODE_SIZE,
+            journal_len_override: None,
+            hash_seed: 0x51EE_9A6E_2026_0820,
+            uuid,
+        })
+        .unwrap()
+        .build(m.path(), 128 * 1024 * 1024)
+        .await
+        .unwrap();
+        let be = KvMetaBackend::open(m.path()).await.unwrap();
+        Arc::new(RoutedMetaBackend::new(vec![be]))
+    };
+    fs.router.set_meta_backend(routed.clone());
+    fs.meta_backend = Some(routed);
+    let req = Request {
+        unique: 1,
+        uid: unsafe { libc::getuid() },
+        gid: unsafe { libc::getgid() },
+        pid: 1,
+        ..Default::default()
+    };
+    FsH {
+        fs,
+        req,
+        alloc: ba,
+        _b: b,
+        _m: m,
+        _s: s,
+    }
+}
+
+async fn fs_create(h: &FsH, name: &str) -> u64 {
+    h.fs.create(h.req, 1, OsStr::new(name), libc::S_IFREG | 0o644, 0)
+        .await
+        .unwrap()
+        .attr
+        .ino
+}
+
+async fn fs_write(h: &FsH, ino: u64, off: u64, data: &[u8]) {
+    let w =
+        h.fs.write(
+            h.req,
+            ino,
+            0,
+            off,
+            bytes::Bytes::copy_from_slice(data),
+            0,
+            0,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("write ino {ino} off {off} failed: {e:?}"));
+    assert_eq!(w.written as usize, data.len(), "short write at {off}");
+}
+
+fn pat(len: usize, tag: u8) -> Vec<u8> {
+    (0..len).map(|i| (i as u8) ^ tag | 1).collect()
+}
+
+/// Contract (the d575be03 landing report's UNSWEPT residual, leg class 1
+/// — the `fuse_client` staged flush funnel: `upload_active_block_bytes` /
+/// `fold_upload_block` / `flush_one_active_block`): a co-writer's staged
+/// flush whose DMA or merge fails holds a minted-but-NEVER-PUBLISHED
+/// offset no map names, and its cleanup must exit through the ONE
+/// sanctioned abandon arm ([`BlockAllocator::abandon_unpublished_offset`]
+/// — quiet, counted `cowriter_unpublished_abandons`), never through the
+/// allocator-level `free_block` whose plane gate turns a post-fence flush
+/// sweep into the convicted ERROR-per-block refusal storm (2026-08-19,
+/// sqz-mw-cw2 — the same funnel, one custody layer lower).
+///
+/// RED against d575be03: the staged flush legs still call
+/// `allocator.free_block(offset)` directly — the refusal tripwire moves
+/// and the abandon gauge stays 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fenced_co_writers_staged_flush_cleanup_abandons_quietly() {
+    let _serial = serial();
+    let _restore = restore();
+    let _seams = SeamGuard;
+    fuse_client::set_mount_posture(MountPosture::Writer);
+    // The fsync-tail-loss fixture pins (house pattern): W1 patch OFF (a
+    // 64 KiB block would make sub-block segments patch-eligible and
+    // bypass the parked-ActiveBlockBuf ladder under test; the co-writer
+    // posture also declines W1 upstream, but the SETUP writes run as the
+    // writer), overlay fresh-write store OFF (an overlay-stored fresh
+    // write parks no custody, so no flush unit would form).
+    fuse_client::set_patch_max_bytes(0);
+    squeezefs::device_overlay::set_device_overlay_for_tests(false, false);
+    const BS: u64 = 65536;
+    let h = fs_fixture(*b"mw-abandon-flush", "mw_abandon_flush", BS, "64MB").await;
+
+    // As the WRITER: a striped base (blocks 0-1 published) plus one
+    // PARTIAL block-2 write that parks in RAM custody (coverage union
+    // incomplete — no write-through, no DMA yet).
+    let ino = fs_create(&h, "flushee").await;
+    fs_write(&h, ino, 0, &pat(2 * BS as usize, 0x11)).await;
+    h.fs.fsync(h.req, ino, 0, false).await.expect("base fsync");
+    assert!(
+        h.fs.write_pipeline.quiesce(Duration::from_secs(30)).await,
+        "fixture pipeline must drain"
+    );
+    fs_write(&h, ino, 2 * BS, &pat(8192, 0x5C)).await;
+
+    // The post-fence shape: the co-writer posture latches with a granted
+    // lane (a laned co-writer allocates — the landed lane-grant seam;
+    // reservation raises stay RAM-only without a durable sink, stated by
+    // `reserve_lane_frontier`), and the flush's one DMA fails (the
+    // injected device completion — classless, so no fence/poison latch).
+    h.alloc
+        .engage_alloc_lanes(part(2, 1))
+        .expect("engage the granted lane");
+    fuse_client::set_mount_posture(MountPosture::CoWriter);
+    let abandons_before = METRICS
+        .cowriter_unpublished_abandons
+        .load(Ordering::Relaxed);
+    let refusals_before = METRICS.cowriter_accounting_refusals.load(Ordering::Relaxed);
+    nvme_dev::set_fail_next_writes(1);
+    let res = h.fs.fsync(h.req, ino, 0, false).await;
+    nvme_dev::clear_fail_next_writes();
+    assert!(
+        res.is_err(),
+        "the injected DMA failure surfaces (never-lossy: the acked bytes keep \
+         their staged custody behind the loud fsync error)"
+    );
+    assert_eq!(
+        METRICS
+            .cowriter_unpublished_abandons
+            .load(Ordering::Relaxed)
+            - abandons_before,
+        1,
+        "the staged flush's never-published cleanup exits through the ONE \
+         sanctioned abandon arm (quiet, counted)"
+    );
+    assert_eq!(
+        METRICS.cowriter_accounting_refusals.load(Ordering::Relaxed) - refusals_before,
+        0,
+        "and the must-stay-≈0 accounting tripwire does not move — the \
+         2026-08-19 post-fence storm shape, closed for the staged flush legs"
+    );
+}
+
+/// Contract (leg class 2 — the `DataRouter` staged legs: the promotion
+/// commit undo, the rider-fold / staged-clone durable-spill undos, the
+/// truncate durable-clip undo, `write_striped`'s stored-image-fits
+/// refusal): the same law for the router's allocator-direct error
+/// cleanups. Driven through the rider-fold spill (the rw5a arm-B shape:
+/// full ring forces the durable-spill escalation, whose DMA then fails
+/// injected) — one leg stands in for the class, all of whose members share
+/// the identical `allocate → device write → free-on-error` shape against
+/// an offset no map ever named.
+///
+/// RED against d575be03: the spill undo calls
+/// `block_allocator.free_block(be_offset)` — refusal counted, no abandon.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_co_writers_staged_spill_cleanup_abandons_quietly() {
+    let _serial = serial();
+    let _restore = restore();
+    let _seams = SeamGuard;
+    fuse_client::set_mount_posture(MountPosture::Writer);
+    const BS: u64 = 1024 * 1024;
+    let h = fs_fixture(*b"mw-abandon-spill", "mw_abandon_spill", BS, "4MB").await;
+
+    // The rw5a arm-B shape, as the WRITER: a staged rider file plus a
+    // ring oversubscribed by live staged files (each pinned ring-resident
+    // by its own rider record — the W2 rider fence defers promotion), so
+    // the fold's same-key replace is refused and the durable-spill
+    // escalation engages.
+    let ino = fs_create(&h, "rider").await;
+    let img_len = 700 * 1024;
+    fs_write(&h, ino, 0, &pat(img_len, 0xA1)).await;
+    fs_write(&h, ino, 128 * 1024, &pat(4096, 0xB2)).await;
+    assert!(
+        METRICS.staged_rider_extent_writes.load(Ordering::Relaxed) > 0,
+        "fixture: the sub-image overwrite must have parked as a rider record"
+    );
+    for i in 0..8 {
+        let filler = fs_create(&h, &format!("spill_filler_{i}")).await;
+        fs_write(&h, filler, 0, &pat(img_len, 0xC3)).await;
+        fs_write(&h, filler, 4096, &pat(2048, 0xCC)).await;
+    }
+
+    // Co-writer latch + granted lane; the spill's one DMA fails injected.
+    h.alloc
+        .engage_alloc_lanes(part(2, 1))
+        .expect("engage the granted lane");
+    fuse_client::set_mount_posture(MountPosture::CoWriter);
+    let abandons_before = METRICS
+        .cowriter_unpublished_abandons
+        .load(Ordering::Relaxed);
+    let refusals_before = METRICS.cowriter_accounting_refusals.load(Ordering::Relaxed);
+    let spills_before = METRICS.staged_spill_escalations.load(Ordering::Relaxed);
+    nvme_dev::set_fail_next_writes(1);
+    let res = h.fs.fold_extent_block(ino, 0).await;
+    nvme_dev::clear_fail_next_writes();
+    assert!(
+        res.is_err(),
+        "the injected spill DMA failure surfaces loud (the fold's own error \
+         contract; StorageFull is what must never surface, not EIO)"
+    );
+    assert!(
+        METRICS.staged_spill_escalations.load(Ordering::Relaxed) > spills_before,
+        "engagement: the fold under a full ring must take the counted \
+         durable-spill leg — otherwise this row tested nothing"
+    );
+    assert_eq!(
+        METRICS
+            .cowriter_unpublished_abandons
+            .load(Ordering::Relaxed)
+            - abandons_before,
+        1,
+        "the spill's never-published cleanup exits through the ONE sanctioned \
+         abandon arm (quiet, counted)"
+    );
+    assert_eq!(
+        METRICS.cowriter_accounting_refusals.load(Ordering::Relaxed) - refusals_before,
+        0,
+        "and the must-stay-≈0 accounting tripwire does not move — the router's \
+         staged legs no longer storm the plane gate"
     );
 }

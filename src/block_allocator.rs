@@ -1577,10 +1577,17 @@ impl BlockAllocator {
         //
         // No `patch_ineligible_*` counter joins the §5.4 decision ledger
         // here on purpose: a reader's write path is closed at the FUSE
-        // door (EROFS) and at the allocator, so this arm is structurally
-        // unreachable in production — a counter that can only ever read 0
-        // is exactly the dead weight the ledger's rot-detection value
-        // depends on not having.
+        // door (EROFS) and at the allocator, and a CO-WRITER's W1 probes
+        // decline UPSTREAM as the counted `patch_ineligible_posture`
+        // decision (the `try_sole_owner_patch` posture clause, its
+        // whole-block twin in `try_inplace_rewrite`, and the dd shape
+        // probe — the 2026-08-19 mw-fleet storm fix: this gate's
+        // ERROR-per-attempt refusal fired per eligible overwrite and
+        // moved the `cowriter_accounting_refusals` tripwire). So this arm
+        // stays DEFENSE-IN-DEPTH — structurally unreachable from the
+        // product ladders on both postures — and a counter that can only
+        // ever read 0 is exactly the dead weight the ledger's
+        // rot-detection value depends on not having.
         if Self::plane_gate("W1 in-place sub-block patch").is_err() {
             return false;
         }

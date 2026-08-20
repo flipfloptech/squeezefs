@@ -5864,6 +5864,18 @@ pub struct Metrics {
     /// must grow ⇒ a meta commit is owed ⇒ ineligible) — the size/window
     /// class, one bucket by design (§5.4 family list).
     pub patch_ineligible_oversize: Align64<AtomicU64>,
+    /// Posture-clause declines (DLM S9 — the 2026-08-19 mw-fleet storm
+    /// fix): the mount is a **CO-WRITER**, and W1 stays authority-only
+    /// **BY DECISION** — the patch retires a LIFETIME (durable ownership
+    /// state, §6.2 item 6) and the §5.1 clone/patch fence is a two-word
+    /// process-local protocol no wire can compose, so a co-writer's small
+    /// overwrite rides CoW-rewrite + shipped free instead. Counted as a
+    /// DECISION here, before any allocator arm runs, so the probe never
+    /// reaches `plane_gate`'s ERROR-per-attempt refusal (which moves
+    /// `cowriter_accounting_refusals`, a must-stay-≈0 bug tripwire on
+    /// rewriting co-writers) and never pollutes `patch_ineligible_shared`
+    /// with its fallback. 0 on every non-co-writer mount by construction.
+    pub patch_ineligible_posture: Align64<AtomicU64>,
     /// Patch DMA failures (EIO surfaced to exactly this write; tiers
     /// purged + incarnation re-stabilized — nothing acked, nothing lost).
     pub patch_dma_errors: Align64<AtomicU64>,
@@ -9610,6 +9622,7 @@ impl SqueezefsFilesystem {
                 "patch_ineligible_transform": METRICS.patch_ineligible_transform.load(Ordering::Relaxed),
                 "patch_ineligible_adjacent": METRICS.patch_ineligible_adjacent.load(Ordering::Relaxed),
                 "patch_ineligible_oversize": METRICS.patch_ineligible_oversize.load(Ordering::Relaxed),
+                "patch_ineligible_posture": METRICS.patch_ineligible_posture.load(Ordering::Relaxed),
                 "patch_dma_errors": METRICS.patch_dma_errors.load(Ordering::Relaxed),
                 // RW4 W2 extent overlay / spill records / batched fold
                 // families (design-random-small-writes §5.2 / §5.4).
@@ -11574,6 +11587,16 @@ impl SqueezefsFilesystem {
         if crate::write_verification_enabled() {
             return Err(I::Shape);
         }
+        // DLM S9 posture screen — the W1 posture clause's dd face: a
+        // CO-WRITER never patches in place (authority-only BY DECISION),
+        // so its dd write is never patch-eligible. Decline QUIET here (one
+        // relaxed load; the op rides the handler descent, whose ladder
+        // counts `patch_ineligible_posture`) instead of letting the
+        // submit's §5.1 fence step reach the allocator's ERROR-logging
+        // accounting gate per shim write.
+        if co_writer_mount() {
+            return Err(I::Shape);
+        }
         // Passthrough only (a compressed/encrypted image cannot be
         // patched in place).
         if !self.router.get_crypto().is_passthrough() {
@@ -13308,9 +13331,13 @@ impl SqueezefsFilesystem {
     /// striped blocks). Called with the block's [`BLOCK_FLUSH_LOCKS`]
     /// guard HELD and the request-shape predicates (5: aligned / sized /
     /// non-extending / single-block; 6: not stream-adjacent) already
-    /// passed. Runs the remaining predicates in this order — **7: the
+    /// passed. Runs the remaining predicates in this order — **the DLM S9
+    /// posture clause** (a CO-WRITER never patches — W1 is authority-only
+    /// BY DECISION, counted `patch_ineligible_posture`, checked before
+    /// anything else because posture is the precondition for the mount
+    /// holding the accounting authority the patch retires); **7: the
     /// block's bytes are not under foreign byte-range custody** (DLM S11
-    /// clause 7, checked first because custody is the precondition for
+    /// clause 7, checked next because custody is the precondition for
     /// considering an in-place mutation at all; inert on every shipped
     /// mount, where the write path holds a whole-file lease); 2: no
     /// RAM/staged overlay — lock-free probes; 3: passthrough; 1:
@@ -13350,6 +13377,23 @@ impl SqueezefsFilesystem {
         file_path: &str,
         fencing_token: u64,
     ) -> Result<bool, SqueezefsError> {
+        // DLM S9 posture clause (the 2026-08-19 mw-fleet storm fix): W1
+        // stays AUTHORITY-ONLY BY DECISION — the patch retires a LIFETIME
+        // (durable ownership state, §6.2 item 6) and the §5.1 clone/patch
+        // fence is process-local — so on a CO-WRITER the eligible shape is
+        // a counted DECISION in this ladder, never an accounting refusal:
+        // decline FIRST, before any allocator arm can reach `plane_gate`'s
+        // ERROR-per-attempt refusal (one log line + one
+        // `cowriter_accounting_refusals` per eligible overwrite in the
+        // field capture, with the fallback misattributed to
+        // `patch_ineligible_shared`). The write falls through to the
+        // accumulation path — CoW-rewrite + shipped free.
+        if co_writer_mount() {
+            METRICS
+                .patch_ineligible_posture
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        }
         // Clause 7 (DLM S11 — spec §6.7): the patch requires whole-inode
         // exclusive custody. Under byte-range custody the writer must own
         // the whole block's bytes; a foreign overlapping range (or its own
@@ -16978,6 +17022,20 @@ impl SqueezefsFilesystem {
         pipeline_t0: std::time::Instant,
         space_pressure: bool,
     ) -> Result<bool, SqueezefsError> {
+        // DLM S9 posture clause — the whole-block face of
+        // `try_sole_owner_patch`'s first predicate (same bucket, the
+        // `patch_ineligible_range_shared` reuse precedent): a CO-WRITER
+        // never rewrites in place (the retire is durable ownership state),
+        // so both arms — the opt-in eligible-overwrite lever and the
+        // contract-9 brim — decline as a counted DECISION instead of
+        // reaching the allocator's ERROR-logging gate. The caller's CoW /
+        // StorageFull ladder continues exactly as on any other decline.
+        if co_writer_mount() {
+            METRICS
+                .patch_ineligible_posture
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        }
         // Passthrough only: an in-place image must occupy exactly the
         // undecorated mapping's whole-block window; a transformed image's
         // stored length varies with content.

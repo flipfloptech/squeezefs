@@ -691,9 +691,16 @@ the S10 gate; the rest are carried, priced, and loud where they can fire.
    `range_custody_tail_shrinks`; sticky demotion is now reserved for
    TRUE sharing (contracts: `tests/dlm_range_custody_tests.rs` +
    `tests/mw_ranged_lease_ladder_tests.rs`, rung-18 pins preserved).
-   **Fabric confirmation OPEN**: one cheap-preset cloud row expecting
-   engagement-gate GREEN (demotions 0, tail_shrinks > 0) where the
-   2026-08-19 row was INVALID.
+   **Fabric confirmation: probe-CONFIRMED 2026-08-20** (same venue,
+   `.benchmarks/2026-08-20-fabric-confirm-sessions.md`): probe 42.58 →
+   937–1,018 MiB/s (**24×**), demotions/conflicts 0 (pre-fix: 9/822),
+   trims 41 = the benign clip arm — the fabrication class is gone at
+   real RTT and the fabric venue now clears the ≥ 750 MiB/s acceptance
+   bar. The FORMAL engagement row (full-row snapshot deltas,
+   `tail_shrinks > 0`, gate GREEN) stays open: both sessions died
+   mid-row on the finding-1 checkpoint wedge (its own campaign), and
+   further AWS sessions require explicit user approval (standing ruling
+   2026-08-20).
 8. **The S8 serial-residual decomposition** (rungs 13/14 residuals): per-verb
    owner-side attribution of the ~11.7 shipped verbs/entry (a verb histogram
    on `meta_ship_owner_phase_ns`'s keying), the applied-name attr-serve

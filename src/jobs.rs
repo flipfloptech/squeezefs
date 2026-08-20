@@ -2767,8 +2767,12 @@ impl JobFabric {
         // whole copy→publish window; the guard drops after every
         // referencer published (or the failure path freed the block).
         let _dst_inflight = dst_alloc.inflight_register(dst_off);
+        // The destination undo is a never-published cleanup (the offset was
+        // pre-allocated and its publish never happened) — co-writer-aware
+        // through the abandon arm (belt-and-suspenders: movers run on the
+        // D0 coordinator, which a co-writer never is).
         let fail_dst = |off: u64, alloc: Arc<crate::block_allocator::BlockAllocator>| async move {
-            let _ = alloc.free_block(off).await;
+            let _ = alloc.abandon_unpublished_offset(off).await;
         };
         if let Err(e) = dst_dev.write_block(dst_off, data.clone()).await {
             log::warn!("mover: destination write on '{dst_id}' failed: {e}");

@@ -103,6 +103,29 @@ pub fn free_forensics_enabled() -> bool {
     *ON.get_or_init(|| crate::env_knobs::bool_knob("SQUEEZEFS_FREE_FORENSICS", false))
 }
 
+/// One warn-level line per co-writer abandon BURST at most (the storm
+/// shape is hundreds of in-flight cleanups landing together after a
+/// custody loss — the 2026-08-19 field capture logged one ERROR per
+/// in-flight block): suppress repeat warns inside a 5 s window; the
+/// per-offset detail rides debug. Race-benign — a lost CAS at the window
+/// edge costs at most one extra warn, never a storm.
+fn abandon_warn_due() -> bool {
+    static LAST_WARN_MS: AtomicU64 = AtomicU64::new(0);
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let now_ms = EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+        + 1; // +1: 0 stays the never-warned sentinel
+    let last = LAST_WARN_MS.load(Ordering::Relaxed);
+    if last != 0 && now_ms.saturating_sub(last) < 5_000 {
+        return false;
+    }
+    LAST_WARN_MS
+        .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
+
 /// Physical allocation stride of every data-volume allocator: block
 /// offsets are minted as `block_idx * CHUNK_SIZE`, so a stored block
 /// image longer than this tramples the NEXT chunk's bytes on the device
@@ -1788,7 +1811,12 @@ impl BlockAllocator {
                  successor of this lane mint it again (DLM S9)",
                 self._volume_id
             );
-            let _ = self.free_block(offset).await;
+            // The give-back is co-writer-aware: a laned mount IS a
+            // co-writer, whose local free would refuse at the plane gate
+            // (loud, per offset). The un-covered offset abandons quietly —
+            // exactly the recovery the failed reservation implies: the
+            // frontier never covered it, so a successor may re-mint it.
+            let _ = self.abandon_unpublished_offset(offset).await;
             return Err(e);
         }
         Ok(offset)
@@ -2311,6 +2339,56 @@ impl BlockAllocator {
             self.finish_free(offset);
         }
         Ok(())
+    }
+
+    /// **The co-writer-aware cleanup arm for a minted-but-NEVER-PUBLISHED
+    /// offset** (DLM S9 — the 2026-08-19 post-fence storm fix). The
+    /// error-cleanup class — a pipeline upload whose DMA or publish
+    /// failed, the RES-9 mint guard, the lane-reservation give-back, the
+    /// mover's destination undo — holds an offset NO map names, and calls
+    /// the allocator directly by offset (the router's ship seam routes
+    /// KEYS, which these offsets never earned).
+    ///
+    /// On the **authority / solo** (and reader) postures this is
+    /// [`Self::free_block`] verbatim. On a **CO-WRITER** it ABANDONS the
+    /// offset leak-safe instead of storming the plane gate: the design's
+    /// answer ([`crate::data_grant`]'s `check_free` refusal text, the
+    /// `free_ship_failures` pattern) is that a co-writer's unfreeable
+    /// offset *stays durably unreferenced and the next derivation (mount
+    /// recovery / fsck C6) returns it to the free supply* — so the arm
+    /// counts `cowriter_unpublished_abandons` (expected nonzero ONLY
+    /// around custody loss, when every in-flight upload's publish refuses
+    /// at once), logs at most ONE warn per burst (per-offset detail at
+    /// debug), and touches neither the free list nor the refusal
+    /// tripwire. Never wire the HAPPY displaced-free path through this —
+    /// published keys ship via
+    /// [`crate::cowriter::ship_displaced_frees`].
+    pub async fn abandon_unpublished_offset(&self, offset: u64) -> Result<()> {
+        if crate::fuse_client::co_writer_mount()
+            && !crate::cowriter::authority_accounting_scope_active()
+        {
+            crate::fuse_client::METRICS
+                .cowriter_unpublished_abandons
+                .fetch_add(1, Ordering::Relaxed);
+            if abandon_warn_due() {
+                log::warn!(
+                    "co-writer: abandoning never-published block offset(s) leak-safe (volume \
+                     '{}', first offset {offset}): the publish that would have named them \
+                     failed or refused, and a co-writer may not mutate ownership accounting — \
+                     the next derivation (mount recovery / fsck C6) returns them to the free \
+                     supply (cowriter_unpublished_abandons; further offsets at debug level)",
+                    self._volume_id
+                );
+            } else {
+                log::debug!(
+                    "co-writer abandon: never-published offset {offset} on volume '{}' left \
+                     to the next derivation",
+                    self._volume_id
+                );
+            }
+            return Ok(());
+        }
+        self.free_block(offset).await
     }
 
     pub fn get_used_blocks(&self) -> u64 {

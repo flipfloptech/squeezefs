@@ -375,14 +375,18 @@ impl Drop for MintedBlockGuard {
         let alloc = Arc::clone(&self.alloc);
         let offset = self.offset;
         // Detached by design (documented rationale): `Drop` cannot
-        // await and `free_block` is async. Bounded single free on the
+        // await and the free is async. Bounded single free on the
         // sqz-meta pool (no ambient runtime needed; at process teardown
         // the remount allocator rebuild reclaims the offset regardless).
+        // Co-writer-aware: the guarded window is allocate→publish, so the
+        // offset is never-published BY CONSTRUCTION — on a co-writer it
+        // abandons quietly to the next derivation instead of storming the
+        // plane gate (the 2026-08-19 post-fence conviction's class).
         crate::meta_exec::spawn_meta("mint_guard_free", async move {
             log::debug!(
                 "mint guard: freeing unsurfaced block offset {offset} (task errored or aborted)"
             );
-            let _ = alloc.free_block(offset).await;
+            let _ = alloc.abandon_unpublished_offset(offset).await;
         });
     }
 }

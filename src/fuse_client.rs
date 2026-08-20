@@ -752,11 +752,23 @@ pub(crate) fn read_only_refusal(what: &str) -> crate::error::SqueezefsError {
 /// **Terminal frees are no longer on the PRODUCT path's list either** (DLM
 /// S9's co-writer free path — `crate::cowriter::ship_displaced_frees`): the
 /// router-level free SHIPS to the authority, which runs the whole ladder.
+///
 /// The allocator-level arms below the router keep refusing here as
-/// defense-in-depth (no product surface reaches them on this posture), so
-/// this counter's steady state is the arms that stay local by DECISION:
-/// the specific claim, the W1 incarnation retire, the recovery walk, and
-/// direct device reclaim.
+/// defense-in-depth — but they ARE reachable by the error-cleanup class
+/// (a pipeline upload whose DMA or publish failed, the RES-9 mint guard,
+/// the lane-reservation give-back: never-published offsets no map names,
+/// which the router's key-routed ship seam cannot carry), and the
+/// 2026-08-19 mw-fleet capture proved a custody loss turns that class
+/// into an ERROR-per-block storm through this refusal. Those arms'
+/// sanctioned exit is
+/// [`crate::block_allocator::BlockAllocator::abandon_unpublished_offset`]
+/// (quiet, counted `cowriter_unpublished_abandons` — the leak-safe
+/// abandon the `free_ship_failures` pattern states). So this counter's
+/// steady state is the arms that stay local by DECISION — the specific
+/// claim, the W1 incarnation retire (whose product ladders decline
+/// upstream as `patch_ineligible_posture`), the recovery walk, direct
+/// device reclaim — plus any free arm not yet routed through either
+/// sanctioned exit, which is a bug worth the loud error.
 pub(crate) fn co_writer_refusal(what: &str) -> crate::error::SqueezefsError {
     METRICS
         .cowriter_accounting_refusals
@@ -771,10 +783,12 @@ pub(crate) fn co_writer_refusal(what: &str) -> crate::error::SqueezefsError {
          data-plane allocation LANE the authority grants on the custody lease \
          (docs/design-mw-data-alloc-partition.md) — so if this was an allocation, this mount \
          holds no lane on this volume. A TERMINAL FREE is admitted too, by SHIPPING: the \
-         router-level free travels as a publish verb and the authority runs the ladder — so a \
-         free reaching this text came through an allocator-level arm no product path uses on \
-         this posture. Mount this node as the authority (unset SQUEEZEFS_MW_ROLE) to own the \
-         accounting here."
+         router-level free travels as a publish verb and the authority runs the ladder — and a \
+         minted-but-never-published offset's error cleanup is admitted through the quiet \
+         abandon arm (abandon_unpublished_offset, counted cowriter_unpublished_abandons) — so \
+         a free reaching this text came through an allocator-level arm routed through neither \
+         sanctioned exit. Mount this node as the authority (unset SQUEEZEFS_MW_ROLE) to own \
+         the accounting here."
     ))
 }
 
@@ -5277,13 +5291,32 @@ pub struct Metrics {
     /// claim (`allocate_specific_block` — lane-blind), the **W1
     /// incarnation retire** (a lifetime retire is durable ownership state
     /// and the §5.1 fence is process-local — a co-writer's small
-    /// overwrite rides CoW-rewrite + shipped free instead), the ownership
-    /// recovery walk, direct device reclaim, and any ALLOCATOR-level free
-    /// a surface reaches without the router (the product write path never
-    /// does — its displaced frees SHIP, `meta_ship_publish.
-    /// free_shipped_blocks`). **Steady growth on a rewriting co-writer is
-    /// therefore a bug again**, not the honest gap it used to be.
+    /// overwrite rides CoW-rewrite + shipped free instead; the product
+    /// W1 ladders decline UPSTREAM as `patch_ineligible_posture` and
+    /// never reach this counter), the ownership recovery walk, direct
+    /// device reclaim, and any ALLOCATOR-level free a surface reaches
+    /// without the router (the product write path never does — its
+    /// displaced frees SHIP, `meta_ship_publish.free_shipped_blocks`, and
+    /// its never-published error cleanups exit through
+    /// `BlockAllocator::abandon_unpublished_offset`, counted apart as
+    /// `cowriter_unpublished_abandons`). **Steady growth on a rewriting
+    /// co-writer is therefore a bug again**, not the honest gap it used
+    /// to be.
     pub cowriter_accounting_refusals: Align64<AtomicU64>,
+    /// Never-published block offsets a co-writer ABANDONED leak-safe
+    /// instead of freeing — the error-cleanup arms' one sanctioned exit
+    /// ([`crate::block_allocator::BlockAllocator::abandon_unpublished_offset`]:
+    /// a pipeline upload whose DMA or publish failed, the RES-9 mint
+    /// guard, the lane-reservation give-back, the mover's destination
+    /// undo). The offset was minted but no map ever named it, so the
+    /// design's recovery owns it: it stays durably unreferenced and the
+    /// next derivation (mount recovery / fsck C6) returns it to the free
+    /// supply — the `free_ship_failures` pattern. Expected nonzero ONLY
+    /// around custody loss (poison / self-fence / authority failover),
+    /// when every in-flight upload's publish refuses at once; steady
+    /// growth on a healthy co-writer means an upload path keeps failing
+    /// its publishes.
+    pub cowriter_unpublished_abandons: Align64<AtomicU64>,
     /// LOCAL metadata commits refused on a co-writer — the mutations that
     /// reached the backend's write gate instead of the shipped publish
     /// path. **Should stay 0 on a healthy co-writer**: a nonzero value
@@ -16545,8 +16578,11 @@ impl SqueezefsFilesystem {
                 // Superseded (newer merge) or retired (a durable flush
                 // won): free the orphan — it was never named by any map
                 // — and leave the parked buffer (the retained dirty
-                // authority) to the newest generation.
-                let _ = dma.allocator.free_block(dma.offset).await;
+                // authority) to the newest generation. The co-writer-aware
+                // abandon arm: a superseded never-published offset is
+                // exactly the class a co-writer abandons to the next
+                // derivation instead of refusing loud.
+                let _ = dma.allocator.abandon_unpublished_offset(dma.offset).await;
                 METRICS
                     .write_pipeline_supersessions
                     .fetch_add(1, Ordering::Relaxed);
@@ -17410,7 +17446,11 @@ impl SqueezefsFilesystem {
             .await;
         pipeline_phase_record(PipelinePhase::Dma, t_dma);
         if let Err(e) = dma_res {
-            let _ = block_allocator.free_block(offset).await;
+            // Never-published cleanup, co-writer-aware: on a fenced
+            // co-writer every in-flight upload's authorization refuses
+            // HERE — the same storm funnel as the publish-failure arm,
+            // one phase earlier.
+            let _ = block_allocator.abandon_unpublished_offset(offset).await;
             return Err(e);
         }
         // Publish after the device write (incarnation ordering). No
@@ -17550,8 +17590,12 @@ impl SqueezefsFilesystem {
             Ok(d) => d,
             Err(e) => {
                 // The DMA'd block is unreachable (never published to the
-                // map): free it before surfacing the error.
-                let _ = dma.allocator.free_block(dma.offset).await;
+                // map): free it before surfacing the error — through the
+                // co-writer-aware abandon arm (the 2026-08-19 post-fence
+                // storm engine: after a custody loss EVERY in-flight
+                // upload's shipped publish refuses, and each cleanup used
+                // to hit the plane gate's ERROR-per-block refusal).
+                let _ = dma.allocator.abandon_unpublished_offset(dma.offset).await;
                 return Err(e);
             }
         };

@@ -125,7 +125,14 @@
 //! ALLOCATOR-level free reached without the router. Those are what
 //! `cowriter.accounting_refusals` keeps counting; allocation and the
 //! router-level terminal free no longer appear there — the free SHIPS
-//! ([`ship_displaced_frees`], the module block at the end of this file).
+//! ([`ship_displaced_frees`], the module block at the end of this file) —
+//! and neither do the two posture-shaped hot paths the 2026-08-19 fleet
+//! capture convicted: the W1 probe declines upstream as the counted
+//! `patch_ineligible_posture` decision, and a minted-but-never-published
+//! offset's error cleanup exits through the quiet leak-safe abandon arm
+//! (`BlockAllocator::abandon_unpublished_offset`, counted
+//! `cowriter.unpublished_abandons` — the `free_ship_failures` recovery
+//! pattern: the next derivation returns the offset to the free supply).
 
 use crate::error::{Result, SqueezefsError};
 use crate::fuse_client::METRICS;
@@ -1727,6 +1734,7 @@ pub fn stats_json() -> serde_json::Value {
         "admissions": METRICS.cowriter_admissions.load(Ordering::Relaxed),
         "admission_refusals": METRICS.cowriter_admission_refusals.load(Ordering::Relaxed),
         "accounting_refusals": METRICS.cowriter_accounting_refusals.load(Ordering::Relaxed),
+        "unpublished_abandons": METRICS.cowriter_unpublished_abandons.load(Ordering::Relaxed),
         "local_commit_refusals": METRICS.cowriter_local_commit_refusals.load(Ordering::Relaxed),
         "custody_endpoint": declared_authority().unwrap_or_else(|| "none".to_string()),
     })

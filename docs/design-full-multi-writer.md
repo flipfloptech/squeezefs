@@ -678,11 +678,22 @@ the S10 gate; the rest are carried, priced, and loud where they can fire.
    `dlm_custody_conflicts` + 2,367 `desired_trims` + 9 demotions in one
    8-rank 4 MiB-aligned row, with demotion-barrier waits reaching the
    ≤4 s buckets (pull-based revocation waits for the holder's renewal).
-   The s11-mpiio engagement gate correctly INVALIDATES such rows, which
-   means every fabric-venue s11 acceptance is blocked behind this fix.
-   Deserves its own red-first campaign; evidence + harvested per-phase
-   snapshots: `.benchmarks/2026-08-19-blob-aware-merge-and-fabric-venue.md`
-   §3 + `.benchmarks/cloud/2026-08-19-171824/rows/`.
+   Evidence + harvested per-phase snapshots:
+   `.benchmarks/2026-08-19-blob-aware-merge-and-fabric-venue.md` §3 +
+   `.benchmarks/cloud/2026-08-19-171824/rows/`. **FIX LANDED 2026-08-19
+   (`a4d893c0` — the §9.3a tail shrink)**: grants carry a required-union
+   watermark; a foreign REQUIRED overlapping only a grant's
+   desired-minted tail marks a renewal-carried SHRINK (incumbent acks
+   with its written high-water; escalation to the honest demotion
+   barrier only when the tail was truly written), and the client learns
+   a per-ino stretch ceiling so steady interleaves stop colliding at the
+   source. Ledger `tail_shrinks ≡ acks + fence_resolves`; engagement
+   `range_custody_tail_shrinks`; sticky demotion is now reserved for
+   TRUE sharing (contracts: `tests/dlm_range_custody_tests.rs` +
+   `tests/mw_ranged_lease_ladder_tests.rs`, rung-18 pins preserved).
+   **Fabric confirmation OPEN**: one cheap-preset cloud row expecting
+   engagement-gate GREEN (demotions 0, tail_shrinks > 0) where the
+   2026-08-19 row was INVALID.
 8. **The S8 serial-residual decomposition** (rungs 13/14 residuals): per-verb
    owner-side attribution of the ~11.7 shipped verbs/entry (a verb histogram
    on `meta_ship_owner_phase_ns`'s keying), the applied-name attr-serve

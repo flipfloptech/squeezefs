@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 # Squeezefs integration runner for the pjdfstest POSIX conformance suite

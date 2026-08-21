@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Two-process IPC-hop measurement runner — the G-L4-1 go/no-go surface
 # (docs/design-preload-interception.md §5.8 / PR L4-2).
 #

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 # Squeezefs integration script for fstests (xfstests).
@@ -147,7 +147,7 @@ sed -i 's/setfattr -h --restore=/setfattr -hP --restore=/' tests/generic/062
 echo "Installing FUSE helpers in /sbin..."
 
 cat << EOF > /sbin/mount.fuse.squeezefs
-#!/bin/bash
+#!/usr/bin/env bash
 # mount(8) helper for -t fuse.squeezefs. Contract: silent on success (stdout
 # leaks into xfstests golden output), non-zero + stderr on failure, and the
 # mount is usable when we return.
@@ -307,7 +307,7 @@ EOF
 chmod +x /sbin/mount.fuse.squeezefs
 
 cat << EOF > /sbin/mkfs.fuse.squeezefs
-#!/bin/bash
+#!/usr/bin/env bash
 set -u
 SQUEEZEFS_BIN="$SQUEEZEFS_BIN"
 META_SIZE="$META_SIZE"
@@ -350,7 +350,7 @@ chmod +x /sbin/mkfs.fuse.squeezefs
 # noise reaches golden output.
 UMOUNT_REAL="$(type -P umount)"
 cat << EOF > /sbin/umount.squeezefs-fstests
-#!/bin/bash
+#!/usr/bin/env bash
 UMOUNT_REAL="$UMOUNT_REAL"
 EOF
 cat << 'EOF' >> /sbin/umount.squeezefs-fstests

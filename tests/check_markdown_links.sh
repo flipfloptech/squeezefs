@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # The docs-class gate's enforcement point (ENG-7).
 #
 # AGENTS.md's verification table has said "docs/markdown only ⇒ markdown

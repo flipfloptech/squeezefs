@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 # The CANONICAL lifecycle soak — PR VL9 centerpiece

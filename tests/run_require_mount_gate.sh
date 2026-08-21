@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # The require-mount gate (spec §11 TEST-2) — the release-gate leg that
 # makes "all green" mean "the live-mount surface actually ran".
 #

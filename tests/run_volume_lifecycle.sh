@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 # Volume-lifecycle rig — PR VL3 skeleton + PR VL4 drain/remove legs

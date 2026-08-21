@@ -4448,7 +4448,7 @@ run_ior() { # outfile procs_per_mount fname extra-ior-args...
     local total=$((${#mounts[@]} * procs))
     local wrapper="${outfile%.out}.dispatch.sh"
     {
-        printf '#!/bin/bash\nset -eu\n'
+        printf '#!/usr/bin/env bash\nset -eu\n'
         printf 'mounts=(%s)\n' "${mounts[*]}"
         printf 'r="${OMPI_COMM_WORLD_RANK:-${PMIX_RANK:-${PMI_RANK:-0}}}"\n'
         printf 'exec "$@" -o "${mounts[$((r / %s))]}/%s"\n' "$procs" "$fname"

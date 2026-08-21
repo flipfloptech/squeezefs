@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # SqueezeFS multi-reference scoreboard — the standing top-3 proof surface.
 #
 # PERFORMANCE IS PRIMARY (user directive, 2026-07-18): "if we are not one of

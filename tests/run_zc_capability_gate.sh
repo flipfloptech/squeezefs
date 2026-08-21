@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # The zc-capability gate (TEST-2's capability half) — the root-run leg
 # that makes "all green" mean "the zero-copy kernel surface actually ran".
 #

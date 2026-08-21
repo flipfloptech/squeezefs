@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 # L4-5 preload-shim gate (docs/design-preload-interception.md §5.4, PR

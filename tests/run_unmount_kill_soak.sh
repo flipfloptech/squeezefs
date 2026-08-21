@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Unmount/kill teardown soak — the K7-era SIGABRT regression check.
 #
 # K7-era fstests runs SIGABRT'd daemons (tokio-rt-worker, SI_TKILL) under

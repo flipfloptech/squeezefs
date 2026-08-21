@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # run_mdstorm.sh — the packaged mdstorm instrument (reconstructed 2026-08-16
 # from the 2026-07-14 baseline's ad-hoc harness, committed this time).
 #

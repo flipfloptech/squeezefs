@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 # Rocky 8 libaio-ABI repro rig — the 2026-07-25 field segfault

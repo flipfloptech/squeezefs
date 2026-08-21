@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # tests/l1a_sweep.sh — the FIND-L1-A sweep harness (PR RW1 of
 # docs/design-random-small-writes.md; §5.3 W3 forensics grid; G-RW4's
 # acceptance instrument; G-RW1's deferral-signature source).

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Exhaustive loom model-checking of the lock-free protocol cores
 # (inode allocator bitmap, block-key incarnation seqlock, staging budget
 # gauge, exclusive-owner CoW active-block cell). See loom-models/src/lib.rs

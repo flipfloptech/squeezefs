@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # SqueezeFS: elbencho Integration Benchmark Script
 #
 # This script formats and mounts squeezefs, runs elbencho against it,

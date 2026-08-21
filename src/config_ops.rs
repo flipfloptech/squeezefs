@@ -2202,6 +2202,149 @@ pub async fn enable_multi_writer_with(
     })
 }
 
+/// [`OwnerAssignMarker`] wire version. Anything else refuses **loud**
+/// (forward-only, the [`crate::MwUpgradeMarker`] law): an unknown version
+/// means a newer binary began an assignment this one cannot reason about,
+/// and guessing would name the wrong remedy at the mount gate.
+pub const OWNER_ASSIGN_MARKER_VERSION: u8 = 1;
+
+/// One volume's entry in an [`OwnerAssignMarker`]: which durable volume
+/// gets which owner (`None` = the `--clear` act, restoring the unassigned
+/// record), plus its KD-PV-12 successors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerAssignment {
+    /// The volume's durable `vol-{hex}` identity (KD-5) — never a path,
+    /// an ordinal, or a set position.
+    pub volume_id: String,
+    /// The durable member id that will append to that volume.
+    pub owner: Option<String>,
+    /// Ordered, statically-declared adoption candidates (KD-PV-12).
+    pub successors: Vec<String>,
+}
+
+/// The `owner_assign:` intent marker's content
+/// (`docs/design-per-volume-claim-admission.md` §5.2.1/§7, KD-PV-2): the
+/// per-volume assignment `squeezefs volume set-owners` is applying, so a
+/// resume can verify it is completing the **same** act and a mount
+/// refusal can name the remedy precisely.
+///
+/// It brackets the verb: written to ino 1 of the slot-0 volume first,
+/// deleted last. Nothing writes it yet — PR 7 lands the verb; PR 4 lands
+/// the mount-side probe that refuses a writable mount while it exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerAssignMarker {
+    /// The act, one entry per volume the invocation names, in the set's
+    /// canonical member order.
+    pub assignments: Vec<OwnerAssignment>,
+}
+
+impl OwnerAssignMarker {
+    /// Versioned + checksummed record image (the [`crate::MwUpgradeMarker`]
+    /// pattern): `version u8 | count u16 LE | (volume_id | owner |
+    /// successors) × count | xxh3-64 LE of everything before`, where every
+    /// string is `len u16 LE | bytes` and `successors` is itself
+    /// `count u16 LE | (len u16 LE | bytes) ×`. An absent owner is the
+    /// empty string.
+    pub fn encode(&self) -> Vec<u8> {
+        fn put(out: &mut Vec<u8>, s: &str) {
+            out.extend_from_slice(&(s.len() as u16).to_le_bytes());
+            out.extend_from_slice(s.as_bytes());
+        }
+        let mut out = Vec::with_capacity(1 + 2 + self.assignments.len() * 32 + 8);
+        out.push(OWNER_ASSIGN_MARKER_VERSION);
+        out.extend_from_slice(&(self.assignments.len() as u16).to_le_bytes());
+        for a in &self.assignments {
+            put(&mut out, &a.volume_id);
+            put(&mut out, a.owner.as_deref().unwrap_or(""));
+            out.extend_from_slice(&(a.successors.len() as u16).to_le_bytes());
+            for s in &a.successors {
+                put(&mut out, s);
+            }
+        }
+        let sum = xxhash_rust::xxh3::xxh3_64(&out);
+        out.extend_from_slice(&sum.to_le_bytes());
+        out
+    }
+
+    /// Decode + verify. Torn (checksum), truncated, trailing-byte,
+    /// future-version and duplicate-volume images all refuse loud —
+    /// presence alone is the mount gate's refusal predicate, so a marker
+    /// that cannot be interpreted still refuses, but never silently
+    /// misnames the act it is bracketing.
+    pub fn decode(raw: &[u8]) -> std::result::Result<Self, String> {
+        if raw.len() < 1 + 2 + 8 {
+            return Err(format!(
+                "owner_assign marker too short ({} B) — torn or foreign",
+                raw.len()
+            ));
+        }
+        let (body, sum_bytes) = raw.split_at(raw.len() - 8);
+        let want = u64::from_le_bytes(sum_bytes.try_into().expect("8 B split"));
+        if xxhash_rust::xxh3::xxh3_64(body) != want {
+            return Err(
+                "owner_assign marker checksum mismatch — torn write or corruption".to_string(),
+            );
+        }
+        if body[0] != OWNER_ASSIGN_MARKER_VERSION {
+            return Err(format!(
+                "owner_assign marker version {} is not the supported version {} — a newer \
+                 binary began this assignment; finish it with that binary",
+                body[0], OWNER_ASSIGN_MARKER_VERSION
+            ));
+        }
+        let mut pos = 3usize;
+        let take = |body: &[u8], pos: &mut usize| -> std::result::Result<String, String> {
+            if *pos + 2 > body.len() {
+                return Err("owner_assign marker truncated before a field".to_string());
+            }
+            let len = u16::from_le_bytes(body[*pos..*pos + 2].try_into().expect("2 B")) as usize;
+            *pos += 2;
+            if *pos + len > body.len() {
+                return Err("owner_assign marker truncated inside a field".to_string());
+            }
+            let s = std::str::from_utf8(&body[*pos..*pos + len])
+                .map_err(|_| "owner_assign marker field is not UTF-8".to_string())?
+                .to_string();
+            *pos += len;
+            Ok(s)
+        };
+        let count = u16::from_le_bytes(body[1..3].try_into().expect("2 B")) as usize;
+        let mut assignments = Vec::with_capacity(count);
+        for _ in 0..count {
+            let volume_id = take(body, &mut pos)?;
+            let owner = take(body, &mut pos)?;
+            if pos + 2 > body.len() {
+                return Err("owner_assign marker truncated before a successor count".to_string());
+            }
+            let succ_count =
+                u16::from_le_bytes(body[pos..pos + 2].try_into().expect("2 B")) as usize;
+            pos += 2;
+            let mut successors = Vec::with_capacity(succ_count);
+            for _ in 0..succ_count {
+                successors.push(take(body, &mut pos)?);
+            }
+            assignments.push(OwnerAssignment {
+                volume_id,
+                owner: Some(owner).filter(|o| !o.is_empty()),
+                successors,
+            });
+        }
+        if pos != body.len() {
+            return Err("owner_assign marker carries trailing bytes — torn or foreign".to_string());
+        }
+        for (i, a) in assignments.iter().enumerate() {
+            if assignments[..i].iter().any(|p| p.volume_id == a.volume_id) {
+                return Err(format!(
+                    "owner_assign marker names volume {} twice — which assignment is the \
+                     act cannot be answered, so it is refused rather than guessed",
+                    a.volume_id
+                ));
+            }
+        }
+        Ok(Self { assignments })
+    }
+}
+
 /// `squeezefs volume add-meta` — the OFFLINE D0-guarded coordinator
 /// (design-volume-lifecycle §5.5.2 Add, the VL4 `remove_data_volume_
 /// offline` posture): KD-8 staging barrier → format the new member →

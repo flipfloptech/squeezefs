@@ -2562,11 +2562,11 @@ async fn an_undecodable_claim_set_on_an_assigned_volume_refuses_rather_than_rese
         endpoint: None,
         pr_key: 0,
     };
-    let garble = |be: &KvMetaBackend| async move {
+    async fn garble(be: &KvMetaBackend) {
         be.setxattr_internal(1, CLAIM_SET_XATTR, b"{\"members\":")
             .await
             .expect("write a torn record");
-    };
+    }
 
     // (a) No assignment evidence: today's behaviour, unchanged — the
     //     unattributable record is replaced by this member's own set.

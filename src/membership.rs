@@ -244,6 +244,23 @@ pub struct ClaimSet {
     pub term: u64,
     /// The member writers.
     pub members: Vec<ClaimSetMember>,
+    /// **The durable member id that appends to THIS volume**
+    /// (`docs/design-per-volume-claim-admission.md` §5.2, KD-PV-2).
+    /// `None` = the legacy shape — the set's sole authority appends to
+    /// every volume — which is every set today: nothing in the product
+    /// writes this field yet (PR 7's offline `volume set-owners` verb is
+    /// the first writer) and nothing reads it to make a decision.
+    ///
+    /// Ownership lives on the volume it describes, beside that volume's
+    /// own `writer_claim`, precisely so that one record cannot disagree
+    /// with itself; a set-wide table would elevate a cache divergence
+    /// into durable state.
+    pub owner: Option<String>,
+    /// KD-PV-12 (opt-in): ordered, statically-declared adoption
+    /// candidates for this volume. Empty by default — **ownership does
+    /// not fail over**; a successor still has to be granted the claim by
+    /// the unchanged D0 ladder.
+    pub successors: Vec<String>,
     /// `true` = decoded from the durable `claim_set` record; `false` = the
     /// projection of a singular `writer_claim`. Never serialized — it is a
     /// property of where the answer came from.
@@ -258,6 +275,8 @@ impl ClaimSet {
             v: 1,
             term,
             members: Vec::new(),
+            owner: None,
+            successors: Vec::new(),
             durable: false,
         }
     }
@@ -265,10 +284,17 @@ impl ClaimSet {
     /// The **projection** every un-engaged volume answers with: the
     /// singular `writer_claim` as a one-member set. Consumers therefore
     /// never branch on engagement.
+    ///
+    /// It never carries an `owner`: an un-engaged volume cannot hold an
+    /// assignment (the record it would live in is refused by
+    /// [`ClaimSet::store`]), so a projected owner would be an ownership
+    /// claim nothing wrote.
     pub fn from_writer_claim(claim: &WriterClaim) -> Self {
         Self {
             v: 1,
             term: claim.term,
+            owner: None,
+            successors: Vec::new(),
             members: vec![ClaimSetMember {
                 identity: MemberIdentity {
                     id: claim.id.clone(),
@@ -287,8 +313,15 @@ impl ClaimSet {
     /// Encode the durable record (compact JSON — the `writer_claim` /
     /// `client:{id}` family's format, so an operator can read it with the
     /// same tools).
+    ///
+    /// `owner` and `successors` are emitted **only when non-empty**, so an
+    /// unassigned set's bytes are byte-identical to the pre-ownership
+    /// image — the law that keeps every volume in the field unchanged on
+    /// disk because this code exists
+    /// (design-per-volume-claim-admission §5.2.2, pinned against a frozen
+    /// literal in `tests/dlm_membership_tests.rs`).
     pub fn encode(&self) -> Vec<u8> {
-        serde_json::json!({
+        let mut obj = serde_json::json!({
             "v": self.v,
             "term": self.term,
             "members": self.members.iter().map(|m| serde_json::json!({
@@ -300,9 +333,16 @@ impl ClaimSet {
                 "pr_key": m.identity.pr_key,
                 "ts": m.ts,
             })).collect::<Vec<_>>(),
-        })
-        .to_string()
-        .into_bytes()
+        });
+        if let Some(map) = obj.as_object_mut() {
+            if let Some(owner) = &self.owner {
+                map.insert("owner".to_string(), serde_json::json!(owner));
+            }
+            if !self.successors.is_empty() {
+                map.insert("successors".to_string(), serde_json::json!(self.successors));
+            }
+        }
+        obj.to_string().into_bytes()
     }
 
     /// Decode a stored record. `None` for anything unparseable — a claim
@@ -331,6 +371,26 @@ impl ClaimSet {
             v: v.get("v").and_then(|x| x.as_u64()).unwrap_or(1) as u32,
             term: v.get("term").and_then(|x| x.as_u64()).unwrap_or(0),
             members,
+            // Tolerant in BOTH directions (the existing
+            // `get(...).and_then(...)` law): a pre-ownership record
+            // decodes unassigned, and an assigned record written by a
+            // newer binary decodes here rather than refusing.
+            owner: v
+                .get("owner")
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            successors: v
+                .get("successors")
+                .and_then(|x| x.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|s| s.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
             durable: true,
         })
     }
@@ -406,6 +466,92 @@ impl ClaimSet {
     }
 }
 
+/// The read half of every claim-set **read-modify-write**: the durable
+/// record when one decodes, an empty set when there is none — and a loud
+/// **refusal** when the record is undecodable on a volume that may carry
+/// a per-volume ownership assignment.
+///
+/// That last arm is the fail-closed direction
+/// (design-per-volume-claim-admission §5.2.2, Issue 16). The plain
+/// fallback rewrites the record from an empty set, which on an assigned
+/// volume drops `owner` and converts a multi-owner volume into the legacy
+/// "one authority appends to everything" shape — an ownership loss that
+/// reads as a legitimate posture rather than as damage. Where no
+/// assignment can exist, the fallback is unchanged: an unattributable
+/// record proves nothing and this member's own set replaces it.
+async fn load_for_update(be: &KvMetaBackend, term: u64) -> Result<ClaimSet> {
+    let Ok(Some(raw)) = be.getxattr(1, CLAIM_SET_XATTR).await else {
+        return Ok(ClaimSet::empty(term));
+    };
+    if let Some(set) = ClaimSet::decode(&raw) {
+        return Ok(set);
+    }
+    if assignment_evidence(be).await {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "refusing to rewrite the undecodable claim_set record on {}: this volume may \
+             carry a per-volume ownership assignment (an ownership plane is armed, or an \
+             owner_assign: bracket is open), and resetting the record would silently drop \
+             its owner — converting a peer-owned volume into the legacy shape. Resolve the \
+             record (re-run `squeezefs volume set-owners`, which rewrites it under the \
+             offline coordinator) before mounting",
+            be.device_path().display()
+        )));
+    }
+    log::warn!(
+        "claim_set record on {} is undecodable and this volume carries no ownership \
+         assignment evidence — replacing it with this member's own set (an unattributable \
+         set proves nothing)",
+        be.device_path().display()
+    );
+    Ok(ClaimSet::empty(term))
+}
+
+/// Could this volume's `claim_set` carry a per-volume ownership
+/// assignment? Read only when the record itself cannot answer, because
+/// it is undecodable.
+///
+/// The two evidences are the design's (§5.2.2): an **armed ownership
+/// plane** — this process is running under a multi-owner map — or an open
+/// **`owner_assign:` bracket**, the intent marker the offline assignment
+/// verb writes first and deletes last. Neither can exist on a
+/// single-writer mount, which is why [`load_for_update`]'s fallback stays
+/// exactly today's behaviour for every set in the field.
+async fn assignment_evidence(be: &KvMetaBackend) -> bool {
+    if crate::meta_ship::owners::ownership_armed() {
+        return true;
+    }
+    matches!(
+        be.getxattr(1, crate::OWNER_ASSIGN_MARKER_XATTR).await,
+        Ok(Some(_))
+    )
+}
+
+/// Record (or, with `owner = None`, clear) **this volume's** per-volume
+/// ownership assignment, preserving the member roster
+/// (design-per-volume-claim-admission §5.2, KD-PV-2).
+///
+/// The only caller today is the test suite: under **D19** ownership is
+/// assigned by an operator verb and stays put, and that verb — the
+/// offline, D0-guarded `squeezefs volume set-owners` — is PR 7. Refuses
+/// on a volume without incompat bit 14 (through [`ClaimSet::store`]), and
+/// clearing restores the unassigned record byte-identically.
+pub async fn set_volume_owner(
+    be: &KvMetaBackend,
+    owner: Option<&str>,
+    successors: &[String],
+    term: u64,
+) -> Result<()> {
+    let mut set = load_for_update(be, term).await?;
+    set.term = set.term.max(term);
+    set.owner = owner.filter(|o| !o.is_empty()).map(str::to_string);
+    set.successors = successors
+        .iter()
+        .filter(|s| !s.is_empty())
+        .cloned()
+        .collect();
+    ClaimSet::store(be, &set).await
+}
+
 /// Record `identity` as a member of `be`'s claim set (§6.2 **item 7**),
 /// preserving every other member's entry — ONE commit per membership
 /// CHANGE, never per beat.
@@ -423,10 +569,11 @@ pub async fn upsert_writer_member(
     if !claim_set_engaged(be.superblock().features_incompat) {
         return Ok(false);
     }
-    let mut set = match be.getxattr(1, CLAIM_SET_XATTR).await {
-        Ok(Some(raw)) => ClaimSet::decode(&raw).unwrap_or_else(|| ClaimSet::empty(term)),
-        _ => ClaimSet::empty(term),
-    };
+    // The RMW read: fail-closed where an ownership assignment may exist,
+    // today's fallback everywhere else (`load_for_update`). The mutation
+    // below touches MEMBERS only, so `owner`/`successors` ride through
+    // the store untouched.
+    let mut set = load_for_update(be, term).await?;
     set.term = set.term.max(term);
     // Rung-8 finding #3: PRUNE same-host provably-dead writer entries —
     // the D0 dead-holder proof (boot-id match scopes the pid to this
@@ -499,7 +646,13 @@ pub async fn withdraw_writer_member(be: &KvMetaBackend, id: &str) -> Result<bool
     if set.members.len() == before {
         return Ok(false);
     }
-    if set.members.is_empty() {
+    // A departing LAST member deletes the record, so a departed set
+    // presents as unclaimed — unless the volume carries a per-volume
+    // ownership assignment. Under D19 that assignment is durable operator
+    // state which outlives every mount (only `volume set-owners --clear`
+    // removes it), so the memberless record is stored rather than
+    // deleted; unassigned sets vanish exactly as before.
+    if set.members.is_empty() && set.owner.is_none() && set.successors.is_empty() {
         ClaimSet::clear(be).await?;
     } else {
         ClaimSet::store(be, &set).await?;

@@ -1045,6 +1045,21 @@ pub const MW_UPGRADE_MARKER_XATTR: &str = "mw_upgrade:intent";
 /// binary began an upgrade this one cannot reason about.
 pub const MW_UPGRADE_MARKER_VERSION: u8 = 1;
 
+/// The durable **per-volume ownership assignment intent marker** record
+/// name (KD-PV-2, `docs/design-per-volume-claim-admission.md` §5.2.1/§7):
+/// the [`MW_UPGRADE_MARKER_XATTR`] mechanism verbatim, one namespace over.
+/// `squeezefs volume set-owners` writes one
+/// [`config_ops::OwnerAssignMarker`] on **ino 1 of the slot-0 volume**
+/// (the KD-2 plane — whole-tx atomic, torn-immune, offline
+/// probe-readable; VAL-2-allowlist-invisible like `mw_upgrade:` / `job:` /
+/// `alloc_lane:` / `fabric_endpoint:`) as its FIRST act and deletes it as
+/// its LAST, so an interrupted assignment is resumable and a writable
+/// mount refuses while a set is half-assigned. Per-volume ownership takes
+/// **no incompat bit** — it is gated on bit 14 — so this bracket plus the
+/// admission ladder, not the format, is what keeps a partial assignment
+/// unmountable.
+pub const OWNER_ASSIGN_MARKER_XATTR: &str = "owner_assign:intent";
+
 /// The `mw_upgrade:` intent marker's content (§6.2 mechanism i): the
 /// TARGET bit set and the canonical volume list the crashed-or-running
 /// upgrade covers, so a resume can verify it is completing the SAME act

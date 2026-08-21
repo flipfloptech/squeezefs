@@ -575,6 +575,10 @@ PV_NODE_CACHE_MB="${SQZ_MWMATRIX_PV_NODE_CACHE_MB:-}"
 # shipped 1 s TTLs a re-stat sweep never reaches the daemon at all).
 PV_TTL_MS="${SQZ_MWMATRIX_PV_TTL_MS:-0}"
 PV_TAG="${SQZ_MWMATRIX_PV_TAG:-derived}"
+# Paced-quiet thresholds (the thermally-capped-box law): rows resume
+# below PV_RESUME_C and never wait longer than PV_WAIT_MAX_S.
+PV_RESUME_C="${SQZ_MWMATRIX_PV_RESUME_C:-68}"
+PV_WAIT_MAX_S="${SQZ_MWMATRIX_PV_WAIT_MAX_S:-1800}"
 for a in "$@"; do
     case "$a" in
     --require-host-scoped-subsys) REQUIRE_HS=1 ;;
@@ -666,20 +670,36 @@ pv_foreign_work() { # comm-exact (pgrep -f false-positives on our own line)
         pgrep -x fio >/dev/null || pgrep -x elbencho >/dev/null
 }
 
-pv_quiet_or_die() { # the run_bench_baseline.sh discipline: never measure hot
+# The run_bench_baseline.sh discipline, paced form: FOREIGN work refuses
+# immediately (poll, never contend), while the box's own heat and the
+# previous row's load decay are WAITED OUT — a thermally-capped box would
+# otherwise abort a sweep half-way through and leave the widths measured
+# under different conditions, which is worse than waiting.
+pv_quiet_or_die() {
     pv_foreign_work &&
         die "foreign cargo/rustc/fio work running — refuse the measured row"
-    local mc
-    mc="$(pv_cpu_temp_mc)"
-    if [ "$mc" = "0" ]; then
-        warn "no CPU temperature sensor — thermal gate skipped"
-    elif [ "$mc" -ge 80000 ]; then
-        die "CPU at $((mc / 1000)) °C (>= 80) — let the box cool before measuring"
-    fi
-    local load
-    load="$(cut -d' ' -f1 /proc/loadavg)"
-    awk -v l="$load" 'BEGIN{exit !(l < 4.0)}' ||
-        die "load1=$load >= 4.0 — refuse the measured row"
+    local waited=0 mc load announced=0
+    while :; do
+        mc="$(pv_cpu_temp_mc)"
+        load="$(cut -d' ' -f1 /proc/loadavg)"
+        if { [ "$mc" = "0" ] || [ "$mc" -lt "$((PV_RESUME_C * 1000))" ]; } &&
+            awk -v l="$load" 'BEGIN{exit !(l < 4.0)}'; then
+            [ "$mc" = "0" ] && [ "$announced" = "0" ] &&
+                warn "no CPU temperature sensor — thermal gate skipped"
+            [ "$waited" -gt 0 ] &&
+                log "quiet after ${waited}s (cpu $((mc / 1000)) °C, load1=$load)"
+            return 0
+        fi
+        [ "$announced" = "0" ] &&
+            log "pacing: cpu $((mc / 1000)) °C (resume < $PV_RESUME_C), load1=$load — waiting"
+        announced=1
+        sleep 15
+        waited=$((waited + 15))
+        [ "$waited" -ge "$PV_WAIT_MAX_S" ] &&
+            die "box never went quiet in ${PV_WAIT_MAX_S}s (cpu $((mc / 1000)) °C, load1=$load)"
+        pv_foreign_work &&
+            die "foreign cargo/rustc/fio work started — refuse the measured row"
+    done
 }
 
 pv_snap() { # pid mnt out-prefix

@@ -1,8 +1,9 @@
 # Upstream bug report draft — zero-length `IORING_OP_READ_FIXED` NULL deref
 
-**Status:** btrfs leg VERIFIED locally 2026-08-21 with the attached
-reproducer (splat below is the real capture, not a sample); the other
-filesystems remain to be swept before sending.
+**Status:** btrfs and f2fs legs VERIFIED locally 2026-08-21 with the
+attached reproducer (the splat below is the real btrfs capture, not a
+sample; f2fs's is in §Second confirmed filesystem). ext4/ext2/xfs/exfat
+still to sweep before sending.
 **Send to:** `io-uring@vger.kernel.org`
 **Cc:** `linux-btrfs@vger.kernel.org`, `linux-fsdevel@vger.kernel.org`,
 Jens Axboe `<axboe@kernel.dk>`
@@ -129,6 +130,32 @@ address `0x8`.
 Note `iov_iter_alignment_iovec()` has the same do/while shape, but the
 iovec/kvec arms are not reachable with a NULL base from this path.
 
+### Second confirmed filesystem: f2fs (a wider entry point)
+
+Same kernel, same reproducer, `mkfs.f2fs` loopback image — and the fault
+arrives through the *eligibility decision* rather than a DIO-internal
+alignment check:
+
+```
+BUG: kernel NULL pointer dereference, address: 0000000000000008
+Oops: Oops: 0000 [#2] SMP NOPTI
+RIP: 0010:iov_iter_alignment_bvec+0xf/0x70
+Call Trace:
+ <TASK>
+ f2fs_should_use_dio+0xcd/0x120 [f2fs]
+ f2fs_file_read_iter+0x59/0x480 [f2fs]
+ __io_read+0x19f/0x600
+ io_read_fixed+0x9e/0x150
+ io_submit_sqes+0x43e/0x990
+ __se_sys_io_uring_enter+0x23e/0xa20
+```
+
+`f2fs_should_use_dio()` answers "should this read use direct I/O at
+all?", so on f2fs the crash does not require the DIO path to be taken —
+only for the question to be asked, which `f2fs_file_read_iter()` does
+unconditionally for an `IOCB_DIRECT` read. Two filesystems, two
+independent call sites, one shared root cause in `lib/iov_iter.c`.
+
 ### Reachability is per-filesystem
 
 A filesystem is affected iff its `O_DIRECT` read path reaches
@@ -138,8 +165,9 @@ Callers of `iov_iter_alignment()` in 7.1.8:
 | Site | Note |
 |---|---|
 | `fs/btrfs/direct-io.c:837` (`check_direct_IO`) | **AFFECTED, reproduced** — `btrfs_file_read_iter()` dispatches to `btrfs_direct_read()` with no zero-count guard (splat above; probe exits 137/SIGKILL) |
+| `fs/f2fs/file.c:4788` (`f2fs_should_use_dio`) | **AFFECTED, reproduced** — through a *wider* door than btrfs: this is the **DIO eligibility decision**, called unconditionally from `f2fs_file_read_iter()` (`:4904`) before any zero-count check, so the fault happens while merely deciding whether direct I/O applies. Its write-path call (`:5264`) is shielded by `generic_write_checks()` returning 0 first |
 | `fs/ext4/file.c:66`, `:201` | guarded on read — `ext4_file_read_iter()` has `if (!iov_iter_count(to)) return 0;`. The **write** site (`:201`) is worth a second look for zero-length `WRITE_FIXED` |
-| `fs/ext2/file.c:240`, `fs/exfat/file.c:696`, `fs/f2fs/file.c:4788`, `fs/ntfs3/file.c:59` | untested by me — same shape, guards not audited |
+| `fs/ext2/file.c:240`, `fs/exfat/file.c:696`, `fs/ntfs3/file.c:59` | untested by me — same shape, guards not audited |
 | `fs/direct-io.c:1121` (legacy `do_blockdev_direct_IO`) | untested; any filesystem still on the legacy DIO path inherits it |
 | `block/blk-map.c:511`, `block/bio-integrity.c:394` | untested; different entry (passthrough / integrity) |
 

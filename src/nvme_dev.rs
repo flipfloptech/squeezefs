@@ -2326,6 +2326,21 @@ impl NvmeBlockDev {
         dest_addr: Option<u64>,
         count_in_get_obj: bool,
     ) -> Result<bytes::Bytes> {
+        // Zero-length DMA guard (7.1-kernel-venue bring-up, 2026-08-21;
+        // contract tests/nvme_zero_len_dma_tests.rs): `size == 0` is a
+        // legitimate degenerate ask (a zero-length durable clip resolves
+        // here) and is served EMPTY at the door — the exact-length law
+        // holds trivially, and no SQE is ever built for zero bytes. On
+        // the sqz 7.1.8 kernel a 0-len `ReadFixed` against the registered
+        // read-bounce slab oopses (`iov_iter_alignment_bvec` NULL deref
+        // via `io_read_fixed` → `btrfs_direct_read`) and the oops path
+        // SIGKILLs the WORKER THREAD alone: the lane's channel strands
+        // with its callers' oneshots pinned forever — the
+        // `extend_vs_promotion_never_strands_payload` wedge. Even on
+        // kernels that survive it, the submission is a wasted syscall.
+        if size == 0 {
+            return Ok(bytes::Bytes::new());
+        }
         if dest_addr.is_none() && size > crate::cache::pool::ALIGNED_BUF_POOL.buf_size() {
             return Err(crate::error::SqueezefsError::InvalidOperation(format!(
                 "Read size {} exceeds pool buffer size {}",

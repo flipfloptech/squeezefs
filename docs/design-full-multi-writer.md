@@ -641,7 +641,13 @@ the S10 gate; the rest are carried, priced, and loud where they can fire.
    disjoint writes (item 7's capture) — the flip now ALSO reads that
    finding's fix, or a recorded ruling that localhost-gate green
    suffices, as an input (the evidence note's verdict 4).
-3. **Per-volume claim admission — the fleet-of-authorities recipe** (§6.10
+3. **Per-volume claim admission — the fleet-of-authorities recipe**
+   — **DESIGNED 2026-08-21**: `docs/design-per-volume-claim-admission.md`
+   (writer/reviewer consensus over four rounds, 29 issues resolved, 0 open;
+   rulings D18 cross-owner rename/link scoped out with a measured refusal
+   rate, D19 static ownership with live cross-owner slot migration deferred,
+   D20 the slot-0 owner is the set authority; KD-PV-1…16; a 10-rung PR plan
+   whose PR 0 is the ~46-volume viability gate). Implementation not started. (§6.10
    R4): a client holding the D0 claim on ≥ 1 volume of a shared set is what
    makes the S10 tar-x gate meetable and inverts `mint_redirects` for real.
    Needs the D0 Layer-B2 per-volume admission + partial-writer open + the

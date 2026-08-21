@@ -161,6 +161,13 @@ widths under different conditions — it emitted no rows and is not reported).
 Arms B and D ran start-to-finish afterwards. Same binary throughout; the
 change affects only when a row starts.
 
+**Artifacts.** Every phase snapshot (the full stats JSON plus the `/proc`
+CPU/RSS sample) is preserved by the leg under
+`$SQZ_MWMATRIX_PV_ROOT/rows-<tag>-<epoch>/` — for this note
+`/tmp/pvscale/rows-{A-derived,B-budget2G,D-divided-n*}-*`, 21 MB, ephemeral
+(the tables here are the durable record). The fixture tears down to zero
+residue: no daemon, no mount, no image survives a row.
+
 **Evidence tiers** (`docs/rc-manifest.md` §2): every table cell is
 **measured-real** unless the column is named in the arithmetic list
 (`ncTarget/vol`, `ncTargetAgg`, `aggXbudget` — **arithmetic-on-measured-

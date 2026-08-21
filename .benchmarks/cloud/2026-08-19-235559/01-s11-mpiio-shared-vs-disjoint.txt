@@ -1,0 +1,15 @@
+# row=s11-mpiio-shared-vs-disjoint
+# order=1
+# instrument=pinned ior 4.0.0 + mpirun (exact versions in the leg output below)
+# substrate=aws-on-demand/i4i.2xlarge/us-east-1b/pg-cluster (instance-store NVMe over nvmet-tcp, single NIC) — cloud substrate (third class — never spliced into devsub medians)
+# venue=cloud-bench-cluster/mw cluster=sqzbench-20260819-235059 cowriters=2 procs=4
+# ts=2026-08-20T03:56:01Z
+# cmd=SQZ_BIN=/opt/squeezefs-bench/squeezefs SQZ_MWMATRIX_MOUNTS=/scratch/mnt,/scratch/mnt-cw1,/scratch/mnt-cw2 SQZ_MWMATRIX_ROWDIR=/opt/squeezefs-bench/mw-rows bash /opt/squeezefs-bench/repo/tests/run_mw_matrix.sh s11-mpiio --procs=4
+[mwmatrix] external mounts verified: authority=/scratch/mnt (posture=writer, fence_mode=1, membership=owner) + 2 co-writers (posture=co-writer, membership=member)
+[mwmatrix] fetching pinned ior 4.0.0
+[mwmatrix] pinned ior 4.0.0 ready (/opt/squeezefs-bench/repo/target/mw-ior/ior-4.0.0/src/ior, sha256 510b7d4ad0f287375848121aa5a1f9842db077c1d81ad0dde738e96255298158)
+[mwmatrix] s11-mpiio: 2 co-writer mounts x 4 procs = 8 ranks, ONE shared file, 4 MiB-aligned block-cyclic segments (ior 4.0.0 POSIX MPMD, -G 96878611); baseline = -F file-per-proc, SAME fleet/geometry; A-B-B-A
+[mwmatrix] instrument: ior 4.0.0 (sha256 510b7d4ad0f287375848121aa5a1f9842db077c1d81ad0dde738e96255298158) + --------------------------------------------------------------------------; substrate: EXTERNAL mounts (/scratch/mnt,/scratch/mnt-cw1,/scratch/mnt-cw2) — the row's substrate/tier is the HARNESS's to state (a real-fabric field row is a different evidence tier from the local fleet's measured-simulated rows; docs/rc-manifest.md)
+[mwmatrix] range-custody conviction: every co-writer's ranged ledger moved across the probe pass
+[mwmatrix] self-sizer wanted 20608 MiB — CAPPED to 10240 MiB (s=320): the 10 GiB zram-budget clamp (the indirect domain COMPOSES now — the rung-20 blob-aware owner-side merge; this cap is substrate budget, not a correctness boundary). Iteration ceiling raised to 128 to preserve the sustained window.
+[mwmatrix] probe: 937.80 MiB/s aggregate -> file 10240 MiB (s=320), 8 iterations/phase (sustained window sized >=60 s + >=3 steady iterations)

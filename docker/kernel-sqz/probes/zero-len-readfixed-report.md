@@ -174,6 +174,48 @@ Callers of `iov_iter_alignment()` in 7.1.8:
 XFS does not appear in that list (its iomap path checks alignment
 differently), so it should be a clean negative control.
 
+### Security impact
+
+**Not a memory-corruption / RCE candidate.** The faulting access is a
+*read* of a fixed offset (`NULL + 8`, `bv_len`), the value read only
+feeds an alignment comparison, and nothing attacker-controlled is
+written anywhere. Pointing the read at attacker data would require
+mapping page 0, which `vm.mmap_min_addr` (65536 by default) forbids and
+lowering it needs privilege; even then the iter still carries
+`count == 0`, so the follow-on I/O transfers nothing.
+
+**It is an unprivileged local denial of service**, in three escalating
+tiers:
+
+1. **Task death.** The oops kills the submitting task. No caps are
+   needed to reach it — an ordinary user with io_uring, one registered
+   buffer and an `O_DIRECT` file on an affected filesystem.
+2. **A wedged ring, and leaked pinned memory.** `io_uring_enter()` holds
+   `ctx->uring_lock` across `io_submit_sqes()`
+   (`io_uring/io_uring.c:2650`), and a task killed by an oops releases no
+   mutexes. Any other thread sharing that ring then blocks on it
+   indefinitely, and the ring's teardown path — which also takes that
+   mutex — cannot complete, so the registered buffer's **pinned** pages,
+   the file reference and the mount reference are not reclaimed. Repeated
+   triggering therefore leaks locked memory and can leave the filesystem
+   unmountable, which is a resource-exhaustion vector rather than a
+   one-shot crash. (Verified: the lock is held at the fault point.
+   Inferred, not measured: the exact teardown blocking behavior.)
+3. **Full system DoS where `kernel.panic_on_oops=1`** — a common
+   hardened/production setting — turns an unprivileged local user's
+   zero-length read into an immediate panic.
+
+**Remote reach is indirect but real for storage services.** Any
+network-facing daemon that turns client input into a zero-length direct
+read inherits a remotely-triggerable version of tier 1/2. That is not
+hypothetical for this class of software: the bug was found by a
+distributed filesystem whose device layer legitimately asks for 0 bytes.
+
+Exposure is reduced where io_uring is restricted (Docker's default
+seccomp profile blocks it; `kernel.io_uring_disabled=2` disables it) and
+is limited to filesystems whose direct-read path reaches
+`iov_iter_alignment()` unguarded — btrfs and f2fs so far.
+
 ### Blast radius note
 
 The oops kills **only the submitting task**. In a threaded program (mine

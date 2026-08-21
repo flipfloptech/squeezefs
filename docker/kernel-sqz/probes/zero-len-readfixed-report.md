@@ -182,16 +182,16 @@ Thanks,
 
 ## Verification checklist (do this before sending)
 
-1. **Build the probe**
-   ```sh
-   nix-shell -p liburing gcc --run \
-     "gcc -O2 -Wall -o /tmp/zlrf docker/kernel-sqz/probes/zero_len_readfixed_oops.c -luring"
+1. **Build the probe as your user** (inside `nix-shell`/direnv — a compile
+   under `sudo` loses `NIX_CFLAGS_COMPILE` and cannot find `liburing.h`):
+   ```fish
+   fish docker/kernel-sqz/probes/zero_len_readfixed_matrix.fish --build
    ```
-2. **Reproduce on btrfs** (your root fs is btrfs, so a plain path works —
-   or use the matrix harness for an isolated loop image):
-   ```sh
-   sudo nix-shell -p liburing gcc btrfs-progs util-linux fish --run \
-     'fish docker/kernel-sqz/probes/zero_len_readfixed_matrix.fish btrfs'
+2. **Reproduce on btrfs as root** (the run reuses the binary from step 1;
+   `env "PATH=$PATH"` carries the shell's mkfs/mount tools through sudo):
+   ```fish
+   sudo env "PATH=$PATH" fish \
+     docker/kernel-sqz/probes/zero_len_readfixed_matrix.fish btrfs
    ```
    Expect: process killed, splat in `dmesg`, taint word non-zero.
 3. **Sweep the others**, one per boot for clean attribution (`ext4`,

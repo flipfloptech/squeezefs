@@ -26,6 +26,22 @@ pkgs.mkShell {
 
     # Cloud venue (tests/cloud_bench_cluster.sh — PRESET=mw spot clusters).
     pkgs.awscli2
+
+    # Kernel probes (docker/kernel-sqz/probes/): gcc + liburing build the
+    # io_uring reproducers, and the filesystem sweep needs the mkfs tools
+    # + loop mounting. BUILD AS YOUR USER, RUN AS ROOT — `sudo env
+    # "PATH=$PATH"` carries binaries but NOT NIX_CFLAGS_COMPILE, so a
+    # compile under sudo cannot find liburing.h:
+    #   fish docker/kernel-sqz/probes/zero_len_readfixed_matrix.fish --build
+    #   sudo env "PATH=$PATH" fish .../zero_len_readfixed_matrix.fish btrfs
+    pkgs.gcc
+    pkgs.liburing
+    pkgs.e2fsprogs
+    pkgs.xfsprogs
+    pkgs.btrfs-progs
+    pkgs.f2fs-tools
+    pkgs.exfatprogs
+    pkgs.util-linux
   ];
 
   # tikv-jemalloc-sys (jemalloc 5.3.0) returns `char *` from an

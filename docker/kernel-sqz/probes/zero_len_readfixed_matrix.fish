@@ -7,16 +7,19 @@
 # filesystem in one boot stacks oopses and muddies attribution — run one,
 # read dmesg, decide, reboot if you want a clean taint state.
 #
-#   sudo fish zero_len_readfixed_matrix.fish btrfs
-#   sudo fish zero_len_readfixed_matrix.fish ext4
-#   sudo fish zero_len_readfixed_matrix.fish xfs        # expected negative control
-#   fish zero_len_readfixed_matrix.fish --list          # no root needed
+# BUILD AS YOUR USER, RUN AS ROOT. `sudo` carries binaries through
+# `env "PATH=$PATH"` but NOT NIX_CFLAGS_COMPILE, so a compile under sudo
+# cannot find liburing.h — hence the two steps (the root run reuses the
+# binary the first step left in $STATE):
 #
-# Requires root (loop mount) and the mkfs tool for the target filesystem.
-# On NixOS, pull the tools into the root shell for the run:
-#   sudo nix-shell -p liburing gcc e2fsprogs xfsprogs btrfs-progs \
-#        f2fs-tools exfatprogs util-linux fish \
-#        --run 'fish docker/kernel-sqz/probes/zero_len_readfixed_matrix.fish ext4'
+#   fish zero_len_readfixed_matrix.fish --build              # in nix-shell
+#   sudo env "PATH=$PATH" fish zero_len_readfixed_matrix.fish btrfs
+#   sudo env "PATH=$PATH" fish zero_len_readfixed_matrix.fish xfs   # negative control
+#   fish zero_len_readfixed_matrix.fish --list               # no root needed
+#
+# The repo's shell.nix carries gcc, liburing and every mkfs tool the sweep
+# uses, so `nix-shell` (or direnv) + the two lines above is the whole
+# story. PROBE_BIN=<path> overrides the binary if you built it elsewhere.
 
 set -g FS_LIST btrfs ext4 ext2 xfs f2fs exfat
 set -g IMG_MB 512
@@ -43,8 +46,44 @@ function _zerolen_cleanup --on-event fish_exit
     set -q IMG; and rm -f $IMG
 end
 
+set -g PROBE "$STATE/zero_len_readfixed_oops"
+set -q PROBE_BIN; and set -g PROBE $PROBE_BIN
+
+# Build the probe: unprivileged, inside nix-shell, where the compiler
+# wrapper still has its NIX_CFLAGS_COMPILE. Reused by the root run.
+function build_probe
+    set -l cc
+    for candidate in $CC gcc cc clang
+        if command -q $candidate
+            set cc $candidate
+            break
+        end
+    end
+    test -n "$cc"; or die "no C compiler on PATH — run inside nix-shell (shell.nix carries gcc)"
+    set -l dir (path dirname $PROBE)
+    mkdir -p $dir 2>/dev/null
+    # A previous ROOT run leaves $STATE root-owned, which then refuses the
+    # unprivileged --build this workflow depends on. Name the remedy.
+    set -l who (whoami)
+    test -w $dir
+    or die "state dir $dir is not writable by $who — a previous root run owns it:
+    sudo rm -rf $dir      # then re-run --build as your user
+  or set STATE=<path> to build somewhere else"
+    log "building the probe with $cc"
+    $cc -O2 -Wall -o $PROBE $PROBE_SRC -luring
+    or die "build failed — run this step UNPRIVILEGED inside nix-shell (a compile under sudo loses NIX_CFLAGS_COMPILE and cannot find liburing.h)"
+    log "built $PROBE"
+end
+
 if test "$argv[1]" = --list
     echo $FS_LIST
+    exit 0
+end
+
+if test "$argv[1]" = --build
+    test (id -u) -ne 0
+    or log "note: building as root — prefer your own user so the binary is not root-owned"
+    build_probe
     exit 0
 end
 
@@ -54,13 +93,18 @@ contains -- $FS $FS_LIST; or die "unknown filesystem '$FS' (known: $FS_LIST)"
 test (id -u) -eq 0; or die "must run as root (loop mount)"
 command -q mkfs.$FS; or die "mkfs.$FS not found — install its tools (see the header)"
 
-# The probe binary: built into $STATE so a read-only tree still works.
-# gcc + the liburing dev headers must be present.
-set -g PROBE "$STATE/zero_len_readfixed_oops"
-mkdir -p $STATE
-log "building the probe"
-gcc -O2 -Wall -o $PROBE $PROBE_SRC -luring
-or die "build failed (need liburing dev headers)"
+# Reuse the binary the --build step left behind; rebuild only if it is
+# missing or older than its source (and only if a compiler is reachable —
+# under sudo it usually is not, which is exactly why --build exists).
+if test -x $PROBE; and test $PROBE -nt $PROBE_SRC
+    log "using the prebuilt probe $PROBE"
+else if command -q gcc; or command -q cc
+    build_probe
+else
+    die "no probe binary at $PROBE and no compiler on PATH — build it first:
+    fish "(status basename)" --build     # unprivileged, inside nix-shell
+  then re-run this command as root"
+end
 
 set -g IMG "$STATE/$FS.img"
 set -g MNT "$STATE/mnt-$FS"

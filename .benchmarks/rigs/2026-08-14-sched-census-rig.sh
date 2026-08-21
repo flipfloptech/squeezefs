@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Scheduler-truth census: per-thread-class runqueue-delay attribution during an il row.
 # /proc/<tid>/schedstat: cputime_ns waittime_ns timeslices — waittime is THE run-delay term.
 set -euo pipefail

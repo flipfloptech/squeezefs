@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # nic_restore.sh — undo every nic_prep.sh change on the client (to recorded state).
 set -u
 IF=ens1f0np0

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # fusion field-confirmation leg: kernel-lane rand-4k WRITE 32xqd8
 set -u
 LEG=$1

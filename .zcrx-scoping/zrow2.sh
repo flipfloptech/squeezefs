@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # zrow2.sh — dual-port row: one receiver process per NIC port, NUMA-matched pins.
 #   zrow2.sh <label> <mode> <threads_per_port> <conns_per_thread> <secs>
 # Port A: ens1f0np0 (node0, even cpus), sender .193 -> 10.181.177.194, ports 5301+

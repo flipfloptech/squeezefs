@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # nic_prep.sh — client-local NIC steering for the zcrx bracket (RECORD + apply).
 #   nic_prep.sh <nports>   — steer bench dst-ports 5301..5300+n -> queues 24..23+n
 # All state recorded to /scratch/tmp/zcrx/nic_state_before.txt; nic_restore.sh undoes.

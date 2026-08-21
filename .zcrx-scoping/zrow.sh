@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # zrow.sh — one Phase-1 bracket row on the client (runs ON squeeze-test).
 #   zrow.sh <label> <mode:copy|zcrx> <threads> <conns_per_thread> <secs> [sender_host]
 # Receiver here, sender triggered over ssh on the storage node. Collects:

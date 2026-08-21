@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -u
 OUT=/scratch/tmp/profile-0808
 MNT=/scratch/tmp/test

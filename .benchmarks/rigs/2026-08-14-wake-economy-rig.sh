@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Wake-economy campaign rig (docs/design-il-wake-economy.md, PR 1).
 #
 # One row = one clean cell: fresh TCP devsub substrate (zram ages across

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # r5 field ingress profile — the owed measurement (r5 note §6).
 set -u
 OUT=/scratch/tmp/profile-0808

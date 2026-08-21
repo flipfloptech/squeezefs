@@ -190,8 +190,8 @@ Thanks,
 2. **Reproduce on btrfs** (your root fs is btrfs, so a plain path works —
    or use the matrix harness for an isolated loop image):
    ```sh
-   sudo nix-shell -p liburing gcc btrfs-progs util-linux --run \
-     'bash docker/kernel-sqz/probes/zero_len_readfixed_matrix.sh btrfs'
+   sudo nix-shell -p liburing gcc btrfs-progs util-linux fish --run \
+     'fish docker/kernel-sqz/probes/zero_len_readfixed_matrix.fish btrfs'
    ```
    Expect: process killed, splat in `dmesg`, taint word non-zero.
 3. **Sweep the others**, one per boot for clean attribution (`ext4`,

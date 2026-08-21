@@ -1,6 +1,8 @@
 # Upstream bug report draft — zero-length `IORING_OP_READ_FIXED` NULL deref
 
-**Status:** draft, awaiting local verification on the reporter's box.
+**Status:** btrfs leg VERIFIED locally 2026-08-21 with the attached
+reproducer (splat below is the real capture, not a sample); the other
+filesystems remain to be swept before sending.
 **Send to:** `io-uring@vger.kernel.org`
 **Cc:** `linux-btrfs@vger.kernel.org`, `linux-fsdevel@vger.kernel.org`,
 Jens Axboe `<axboe@kernel.dk>`
@@ -33,23 +35,43 @@ also carries an out-of-tree series (which touches neither
 
 ### Splat
 
+Captured on 7.1.8 (x86_64, Zen 5) running the attached reproducer
+against btrfs on a 512 MiB loopback image:
+
 ```
 BUG: kernel NULL pointer dereference, address: 0000000000000008
 #PF: supervisor read access in kernel mode
 #PF: error_code(0x0000) - not-present page
+PGD 0 P4D 0
+Oops: Oops: 0000 [#1] SMP NOPTI
+CPU: 6 UID: 0 PID: 1502655 Comm: zero_len_readfi Tainted: G        W           7.1.8 #1 PREEMPT(full)
 RIP: 0010:iov_iter_alignment_bvec+0xf/0x70
+Code: ... 55 48 89 e5 48 8b 4f 10 8b 77 08 48 8b 57 18 <8b> 41 08 29 f0 48 39 c2 ...
+RSP: 0018:ffffd179e244bae0 EFLAGS: 00010246
+RAX: 0000000000000000 RBX: 0000000000000fff RCX: 0000000000000000
+RDX: 0000000000000000 RSI: 0000000000000000 RDI: ffff8cf6d38aef18
+CR2: 0000000000000008
 Call Trace:
  <TASK>
- iov_iter_alignment
- btrfs_direct_read
- btrfs_file_read_iter
- __io_read
- io_read_fixed
- io_issue_sqe
- io_submit_sqes
- __do_sys_io_uring_enter
- do_syscall_64
+ btrfs_direct_read+0x65/0x210 [btrfs]
+ btrfs_file_read_iter+0x5a/0x90 [btrfs]
+ __io_read+0x19f/0x600
+ io_read_fixed+0x9e/0x150
+ __io_issue_sqe+0x50/0x160
+ io_issue_sqe+0x47/0x4d0
+ io_submit_sqes+0x43e/0x990
+ __se_sys_io_uring_enter+0x23e/0xa20
+ do_syscall_64+0x13f/0xad0
+ entry_SYSCALL_64_after_hwframe+0x76/0x7e
+ </TASK>
+---[ end trace 0000000000000000 ]---
 ```
+
+Two registers corroborate the analysis below: `RAX = 0` is the NULL
+`bvec` being dereferenced at `+8` (`bv_len`), and `RBX = 0xfff` is
+btrfs's `blocksize_mask` (`sectorsize - 1`), i.e. we are inside
+`check_direct_IO()`'s alignment test. `iov_iter_alignment()` itself is
+inlined into `btrfs_direct_read()`, which is why it has no frame.
 
 ### Mechanism
 
@@ -115,7 +137,7 @@ Callers of `iov_iter_alignment()` in 7.1.8:
 
 | Site | Note |
 |---|---|
-| `fs/btrfs/direct-io.c:837` (`check_direct_IO`) | **affected** — `btrfs_file_read_iter()` dispatches to `btrfs_direct_read()` with no zero-count guard (verified: oops above) |
+| `fs/btrfs/direct-io.c:837` (`check_direct_IO`) | **AFFECTED, reproduced** — `btrfs_file_read_iter()` dispatches to `btrfs_direct_read()` with no zero-count guard (splat above; probe exits 137/SIGKILL) |
 | `fs/ext4/file.c:66`, `:201` | guarded on read — `ext4_file_read_iter()` has `if (!iov_iter_count(to)) return 0;`. The **write** site (`:201`) is worth a second look for zero-length `WRITE_FIXED` |
 | `fs/ext2/file.c:240`, `fs/exfat/file.c:696`, `fs/f2fs/file.c:4788`, `fs/ntfs3/file.c:59` | untested by me — same shape, guards not audited |
 | `fs/direct-io.c:1121` (legacy `do_blockdev_direct_IO`) | untested; any filesystem still on the legacy DIO path inherits it |
@@ -197,9 +219,10 @@ Thanks,
 3. **Sweep the others**, one per boot for clean attribution (`ext4`,
    `ext2`, `f2fs`, `exfat`, and `xfs` as the negative control). Record
    each result in the table above, replacing "untested by me".
-4. **Capture the real splat**: `dmesg | sed -n '/BUG: kernel NULL/,+25p'`
-   and paste it over the sample; add `uname -a` and, if you want to be
-   thorough, confirm your three files match vanilla:
+4. **Capture each splat**: the harness saves the full block to
+   `$STATE/splat-<fs>.txt`; `journalctl -k | sed -n '/BUG: kernel
+   NULL/,/end trace/p'` reads it unprivileged too. Add `uname -a`, and
+   if you want to be thorough, confirm your three files match vanilla:
    ```sh
    diff <vanilla>/lib/iov_iter.c $SP/lib/iov_iter.c   # $SP = linux-src-patched
    ```

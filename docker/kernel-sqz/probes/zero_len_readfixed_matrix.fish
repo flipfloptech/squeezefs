@@ -145,10 +145,21 @@ else
     log "RESULT: $FS probe exited rc=$rc (137/killed = the oops path)"
 end
 
-echo "kernel messages since the marker:"
-set -l splat (dmesg | sed -n "/$MARK/,\$p" | grep -iE 'BUG:|RIP:|Call Trace|iov_iter|io_uring|Oops|Tainted' | head -20)
+# The WHOLE splat, not a grep of interesting-looking lines: the frames
+# that matter most for an upstream report (btrfs_direct_read, __io_read,
+# io_read_fixed) match no obvious keyword, and a filtered trace is not
+# reportable. Saved verbatim beside the image for pasting into the bug.
+set -g SPLAT_OUT "$STATE/splat-$FS.txt"
+set -l splat (dmesg | sed -n "/$MARK/,\$p" | sed -n '/BUG: kernel NULL/,/end trace\|^$/p' | head -60)
+if test -z "$splat"
+    # No NULL-deref block: fall back to everything since the marker, so a
+    # different failure shape is still visible rather than silently empty.
+    set splat (dmesg | sed -n "/$MARK/,\$p" | tail -40)
+end
 if test -n "$splat"
-    printf '%s\n' $splat
+    printf '%s\n' $splat | tee $SPLAT_OUT
+    echo
+    log "full splat saved to $SPLAT_OUT (paste this into the report)"
 else
     echo "  (none — no oops recorded for this run)"
 end

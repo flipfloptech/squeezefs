@@ -117,6 +117,43 @@
 #                       migration policy's shipped-topology dark posture
 #                       live (candidates == 0 on a one-authority fleet).
 #                       Quiet-gated (cargo + loadavg).
+#   pv-volume-scaling [--ns=1,4,16,46] [--files=N] [--idle-secs=S]
+#                       [--repeats=R] [--threads=T] [--budget=SIZE]
+#                       [--node-cache-mb=MB] [--tag=NAME]
+#                       (design-per-volume-claim-admission PR 0 — THE
+#                       VIABILITY GATE; risks R9/R15) THE VOLUME-SCALING
+#                       SWEEP. UNPRIVILEGED and fleet-free: it drives its
+#                       own fixture (tests/pv_volume_set.sh — ONE daemon
+#                       over N metadata volumes, file-backed by default,
+#                       device-backed via SQZ_PVSET_META_DEVS) and needs
+#                       no root, so it dispatches ahead of the fleet
+#                       preamble. Per N: (1) aggregate daemon RSS/anon at
+#                       mount and after a fixed mdstorm workload, (2) the
+#                       idle-window daemon CPU + meta_kv_checkpoints rate
+#                       — the per-volume background-task cost, (3) R5
+#                       level/yellow/red/hard_backstops + the
+#                       kv_node_cache component's bytes AND shed count,
+#                       (4) the meta_kv_journal_entries_per_volume
+#                       balance (spec-R4's own row: max, mean, max/mean,
+#                       volumes moved/carrying), (5) the R15 read-tier
+#                       row — node-cache hit rate over a cold and a warm
+#                       stat pass, re-runnable with --node-cache-mb set
+#                       to a DIVIDED per-volume budget to price the
+#                       set-aware derivation PR 9 would land. Row
+#                       validity: the daemon must have opened exactly N
+#                       volumes (the per-volume journal array's length),
+#                       every phase engaged, dlm_rpcs == 0 (the solo
+#                       re-gate), invariant_tripwires and
+#                       meta_kv_revalidate_dirty_skips flat. No product
+#                       change: the arithmetic columns
+#                       (ncTarget/vol, aggXbudget) are
+#                       arithmetic-on-measured-constants over the LIVE
+#                       mem_budget_bytes. Quiet-gated (foreign cargo/
+#                       rustc/fio, loadavg, the >= 80 °C thermal refusal).
+#                       Evidence tier: the memory rows are
+#                       substrate-independent measured-real; the CPU and
+#                       journal rows are barrier-sensitive and owe a
+#                       root + tests/dev_substrate.sh re-run.
 #   cowriters-admission GATED (the 5b gate): the multi-identity legs rungs
 #                       7-10 build on. Probes the recorded host-scoped
 #                       verdict; on this kernel it SKIPs loud with the
@@ -453,6 +490,9 @@
 #         [--window=S] [--netem=MS] [--victim=IDX]   (the s6-* legs)
 #         [--rounds=N]                               (s7-kill-matrix, s11-killrange)
 #         [--procs=P]                                (s11-mpiio)
+#         bash tests/run_mw_matrix.sh pv-volume-scaling [--ns=…] [--files=N]
+#              [--idle-secs=S] [--repeats=R] [--threads=T] [--budget=SIZE]
+#              [--node-cache-mb=MB] [--tag=NAME]     (unprivileged, fleet-free)
 # Exit:   0 green (or a loud SKIP), nonzero on any INVALID row / violation.
 #
 # EXTERNAL-MOUNTS MODE (SQZ_MWMATRIX_MOUNTS — the FIELD venue; s11-mpiio
@@ -523,6 +563,18 @@ S9A_MB_CAP="${SQZ_MWMATRIX_S9A_MB:-1024}"
 S11_MB_CAP="${SQZ_MWMATRIX_S11_MB:-256}"
 S10C_MB="${SQZ_MWMATRIX_S10C_MB:-3072}"
 S10C_RUNS="${SQZ_MWMATRIX_S10C_RUNS:-3}"
+PV_NS="${SQZ_MWMATRIX_PV_NS:-1,4,16,46}"
+PV_FILES="${SQZ_MWMATRIX_PV_FILES:-20000}"
+PV_IDLE_S="${SQZ_MWMATRIX_PV_IDLE_S:-30}"
+PV_THREADS="${SQZ_MWMATRIX_PV_THREADS:-8}"
+PV_REPEATS="${SQZ_MWMATRIX_PV_REPEATS:-3}"
+PV_BUDGET="${SQZ_MWMATRIX_PV_BUDGET:-}"
+PV_NODE_CACHE_MB="${SQZ_MWMATRIX_PV_NODE_CACHE_MB:-}"
+# The read rows measure the DAEMON's metadata plane, so the kernel's
+# per-class attr/entry caches are pinned OFF (instrument alignment: at the
+# shipped 1 s TTLs a re-stat sweep never reaches the daemon at all).
+PV_TTL_MS="${SQZ_MWMATRIX_PV_TTL_MS:-0}"
+PV_TAG="${SQZ_MWMATRIX_PV_TAG:-derived}"
 for a in "$@"; do
     case "$a" in
     --require-host-scoped-subsys) REQUIRE_HS=1 ;;
@@ -538,6 +590,15 @@ for a in "$@"; do
     --corpus-mb=*) S10C_MB="${a#--corpus-mb=}" ;;
     --runs=*) S10C_RUNS="${a#--runs=}" ;;
     --procs=*) S11_PROCS="${a#--procs=}" ;;
+    --ns=*) PV_NS="${a#--ns=}" ;;
+    --files=*) PV_FILES="${a#--files=}" ;;
+    --idle-secs=*) PV_IDLE_S="${a#--idle-secs=}" ;;
+    --threads=*) PV_THREADS="${a#--threads=}" ;;
+    --repeats=*) PV_REPEATS="${a#--repeats=}" ;;
+    --budget=*) PV_BUDGET="${a#--budget=}" ;;
+    --node-cache-mb=*) PV_NODE_CACHE_MB="${a#--node-cache-mb=}" ;;
+    --kernel-ttl-ms=*) PV_TTL_MS="${a#--kernel-ttl-ms=}" ;;
+    --tag=*) PV_TAG="${a#--tag=}" ;;
     *) die "unknown argument '$a'" ;;
     esac
 done
@@ -552,6 +613,460 @@ S11_PROCS="${S11_PROCS:-4}"
 [[ "$S8B_SECS" =~ ^[0-9]+$ ]] && [ "$S8B_SECS" -ge 60 ] || die "--secs takes seconds >= 60 (got '$S8B_SECS')"
 [[ "$S10C_MB" =~ ^[0-9]+$ ]] && [ "$S10C_MB" -ge 256 ] || die "--corpus-mb takes MiB >= 256 (got '$S10C_MB')"
 [[ "$S10C_RUNS" =~ ^[0-9]+$ ]] && [ "$S10C_RUNS" -ge 1 ] || die "--runs takes a positive integer (got '$S10C_RUNS')"
+
+# =============================================================================
+# pv-volume-scaling — the PR 0 VIABILITY GATE leg
+# (design-per-volume-claim-admission PR 0; risks R9 and R15)
+#
+# It sits AHEAD of the fleet preamble on purpose: this leg drives its own
+# fixture (tests/pv_volume_set.sh — one daemon, N metadata volumes) and
+# needs no fleet, no fabric and no root, so `ensure_root` and the live-
+# fleet CONF requirement below must not apply to it. Everything it uses
+# (log/die/skip, the arg parse) is already defined above.
+#
+# Rows, per N in --ns (default 1,4,16,46 — the PR 0 widths):
+#   1  aggregate daemon RSS/anon at mount and after a fixed metadata
+#      workload (plus smaps_rollup anon + AnonHugePages),
+#   2  checkpoint CPU: idle-window daemon CPU (utime+stime deltas) and the
+#      meta_kv_checkpoints rate — the per-volume background-task cost,
+#   3  R5: mem_budget level / yellow / red / hard_backstops and the
+#      kv_node_cache component (current bytes AND its shed count),
+#   4  meta_kv_journal_entries_per_volume balance (spec-R4's own row):
+#      max, mean, max/mean and the count of volumes that MOVED,
+#   5  the R15 read-tier row: node-cache hit rate over a cold and a warm
+#      stat pass — run again with --node-cache-mb=<divided> to price the
+#      set-aware derivation PR 9 would land.
+#
+# Substrate: whatever the fixture is given (SQZ_PVSET_META_DEVS switches
+# it to devices). Every row carries the label. The memory-plane rows
+# (1/3/5) are substrate-independent by construction; the CPU and journal
+# rows are barrier-sensitive and need the devsub re-run before they are
+# acceptance evidence — the emitter prints that with the table.
+# =============================================================================
+pv_cpu_temp_mc() { # max Tctl/Tdie in millidegrees, 0 when no sensor
+    local hw name t v max_mc=0
+    for hw in /sys/class/hwmon/hwmon*; do
+        [ -r "$hw/name" ] || continue
+        name="$(cat "$hw/name")"
+        case "$name" in
+        zenpower | k10temp | coretemp)
+            for t in "$hw"/temp[12]_input; do
+                [ -r "$t" ] || continue
+                v="$(cat "$t")"
+                [ "$v" -gt "$max_mc" ] && max_mc="$v"
+            done
+            ;;
+        esac
+    done
+    echo "$max_mc"
+}
+
+pv_foreign_work() { # comm-exact (pgrep -f false-positives on our own line)
+    pgrep -x cargo >/dev/null || pgrep -x rustc >/dev/null ||
+        pgrep -x fio >/dev/null || pgrep -x elbencho >/dev/null
+}
+
+pv_quiet_or_die() { # the run_bench_baseline.sh discipline: never measure hot
+    pv_foreign_work &&
+        die "foreign cargo/rustc/fio work running — refuse the measured row"
+    local mc
+    mc="$(pv_cpu_temp_mc)"
+    if [ "$mc" = "0" ]; then
+        warn "no CPU temperature sensor — thermal gate skipped"
+    elif [ "$mc" -ge 80000 ]; then
+        die "CPU at $((mc / 1000)) °C (>= 80) — let the box cool before measuring"
+    fi
+    local load
+    load="$(cut -d' ' -f1 /proc/loadavg)"
+    awk -v l="$load" 'BEGIN{exit !(l < 4.0)}' ||
+        die "load1=$load >= 4.0 — refuse the measured row"
+}
+
+pv_snap() { # pid mnt out-prefix
+    local pid="$1" mnt="$2" out="$3"
+    cat "$mnt/.stats" >"$out.json" || die "cannot read $mnt/.stats"
+    {
+        echo "ts_ns $(date +%s%N)"
+        awk '{print "utime " $14; print "stime " $15}' "/proc/$pid/stat"
+        sed -nE 's/^(VmRSS|VmHWM|Threads):[[:space:]]*([0-9]+).*/\1 \2/p' \
+            "/proc/$pid/status"
+        sed -nE 's/^(Rss|Pss|Anonymous|AnonHugePages):[[:space:]]*([0-9]+).*/smaps_\1 \2/p' \
+            "/proc/$pid/smaps_rollup" 2>/dev/null || true
+    } >"$out.proc"
+}
+
+pv_ops_s() { # <mdstorm output line> -> ops/s  ("create ops=N wall_s=W ops_s=X")
+    awk '{for (i = 1; i <= NF; i++) if ($i ~ /^ops_s=/) { sub(/^ops_s=/, "", $i); print $i }}' <<<"$1"
+}
+
+# The phase plan (each snapshot is stats JSON + /proc CPU/RSS):
+#   p0  mount + settle                     (fresh, clean daemon)
+#   p1  after the CLEAN idle window        -> per-volume background tick cost
+#   p2  after the create workload          -> journal balance, node-cache fill
+#   p3  after the WARM stat pass           -> warm node-cache hit rate
+#   p4  after the POST-WORK idle window    -> checkpoint drain cost + rate
+#   p5  after a REMOUNT (timed, NEW pid)   -> mount/replay cost at width N
+#   p6  after the COLD stat pass           -> cold node-cache hit rate
+# The remount is what makes "cold" honest: counters and caches restart with
+# the daemon, so p5->p6 is a clean-cache read pass (kernel TTLs are pinned
+# to 0 by the fixture, so the stat sweep reaches the daemon at all).
+pv_one_row() { # n rep rowdir storm fixture
+    local n="$1" rep="$2" rowdir="$3" storm="$4" fixture="$5"
+    local st="$PV_ROOT/n${n}r${rep}" pfx="$rowdir/n${n}r${rep}"
+    local -a create_args=("$n" "--tag=pv-n$n-r$rep" "--kernel-ttl-ms=$PV_TTL_MS")
+    [ -n "$PV_BUDGET" ] && create_args+=("--mem-budget=$PV_BUDGET")
+    [ -n "$PV_NODE_CACHE_MB" ] && create_args+=("--node-cache-mb=$PV_NODE_CACHE_MB")
+
+    SQZ_PVSET_STATE_DIR="$st" bash "$fixture" teardown >/dev/null 2>&1 || true
+    local t0 t1 mount_s remount_s
+    t0="$(date +%s.%N)"
+    SQZ_PVSET_STATE_DIR="$st" bash "$fixture" create "${create_args[@]}" \
+        >"$pfx.fixture.log" 2>&1 || {
+        cat "$pfx.fixture.log" >&2
+        die "fixture create N=$n failed"
+    }
+    t1="$(date +%s.%N)"
+    mount_s="$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.3f", b - a}')"
+
+    local mnt pid
+    mnt="$(SQZ_PVSET_STATE_DIR="$st" bash "$fixture" mnt)"
+    pid="$(SQZ_PVSET_STATE_DIR="$st" bash "$fixture" pid)"
+
+    sleep 3 # settle: the 1 Hz R5 sampler + the first checkpoint ticks
+    pv_snap "$pid" "$mnt" "$pfx.p0"
+    sleep "$PV_IDLE_S" # the CLEAN idle window: background-task cost only
+    pv_snap "$pid" "$mnt" "$pfx.p1"
+
+    local work="$mnt/storm" line create_s stat_warm_s stat_cold_s
+    mkdir -p "$work"
+    line="$("$storm" "$work" "$PV_THREADS" "$PV_FILES" create)" ||
+        die "mdstorm create failed at N=$n"
+    create_s="$(pv_ops_s "$line")"
+    pv_snap "$pid" "$mnt" "$pfx.p2"
+    line="$("$storm" "$work" "$PV_THREADS" "$PV_FILES" stat)" ||
+        die "mdstorm stat (warm) failed at N=$n"
+    stat_warm_s="$(pv_ops_s "$line")"
+    pv_snap "$pid" "$mnt" "$pfx.p3"
+    sleep "$PV_IDLE_S" # the POST-WORK idle window: the checkpoint drain
+    pv_snap "$pid" "$mnt" "$pfx.p4"
+
+    t0="$(date +%s.%N)"
+    SQZ_PVSET_STATE_DIR="$st" bash "$fixture" remount >>"$pfx.fixture.log" 2>&1 ||
+        die "fixture remount N=$n failed"
+    t1="$(date +%s.%N)"
+    remount_s="$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.3f", b - a}')"
+    local remount_open_s
+    remount_open_s="$(SQZ_PVSET_STATE_DIR="$st" bash "$fixture" remount-times |
+        sed -nE 's/^PVSET_LAST_MOUNT_S=(.*)$/\1/p')"
+    pid="$(SQZ_PVSET_STATE_DIR="$st" bash "$fixture" pid)"
+    pv_snap "$pid" "$mnt" "$pfx.p5"
+    line="$("$storm" "$work" "$PV_THREADS" "$PV_FILES" stat)" ||
+        die "mdstorm stat (cold) failed at N=$n"
+    stat_cold_s="$(pv_ops_s "$line")"
+    pv_snap "$pid" "$mnt" "$pfx.p6"
+
+    {
+        echo "n $n"
+        echo "rep $rep"
+        echo "files $PV_FILES"
+        echo "threads $PV_THREADS"
+        echo "idle_s $PV_IDLE_S"
+        echo "mount_s $mount_s"
+        echo "remount_s $remount_s"
+        echo "remount_open_s ${remount_open_s:-0}"
+        echo "create_ops_s $create_s"
+        echo "stat_warm_ops_s $stat_warm_s"
+        echo "stat_cold_ops_s $stat_cold_s"
+        echo "substrate ${SQZ_PVSET_SUBSTRATE:-file}"
+        echo "budget_label ${PV_BUDGET:-derived}"
+        echo "node_cache_label ${PV_NODE_CACHE_MB:-derived}"
+        echo "ttl_ms $PV_TTL_MS"
+        echo "tag $PV_TAG"
+    } >"$pfx.meta"
+
+    SQZ_PVSET_STATE_DIR="$st" bash "$fixture" teardown >>"$pfx.fixture.log" 2>&1 ||
+        die "fixture teardown N=$n failed"
+}
+
+pv_emit() { # rowdir
+    python3 - "$1" <<'PYEOF'
+import glob, json, os, re, statistics, sys
+
+rowdir = sys.argv[1]
+
+def load_stats(p):
+    m = json.load(open(p))["metrics"]
+    return m
+
+def load_proc(p):
+    out = {}
+    for line in open(p):
+        k, _, v = line.strip().partition(" ")
+        try:
+            out[k] = int(v)
+        except ValueError:
+            out[k] = v
+    return out
+
+def meta(p):
+    out = {}
+    for line in open(p):
+        k, _, v = line.strip().partition(" ")
+        out[k] = v
+    return out
+
+HZ = os.sysconf("SC_CLK_TCK")
+MIB = 1024 * 1024
+
+PHASES = 7
+
+rows, violations = [], []
+for mpath in sorted(glob.glob(os.path.join(rowdir, "*.meta"))):
+    pfx = mpath[: -len(".meta")]
+    md = meta(mpath)
+    n = int(md["n"])
+    files = int(md["files"])
+    s = {ph: load_stats(f"{pfx}.p{ph}.json") for ph in range(PHASES)}
+    pr = {ph: load_proc(f"{pfx}.p{ph}.proc") for ph in range(PHASES)}
+
+    def comp(ph, name, field="current"):
+        return s[ph]["mem_budget_components"].get(name, {}).get(field, 0)
+
+    def cpu_s(a, b):
+        return ((pr[b]["utime"] + pr[b]["stime"]) - (pr[a]["utime"] + pr[a]["stime"])) / HZ
+
+    def wall_s(a, b):
+        return (pr[b]["ts_ns"] - pr[a]["ts_ns"]) / 1e9
+
+    def total(v):  # per-volume arrays sum; scalars pass through
+        return sum(v) if isinstance(v, list) else v
+
+    def d(a, b, key):
+        return total(s[b].get(key, 0)) - total(s[a].get(key, 0))
+
+    idle_wall = wall_s(0, 1)
+    idle_cpu = cpu_s(0, 1)
+    work_idle_wall = wall_s(3, 4)
+    work_idle_cpu = cpu_s(3, 4)
+    jrnl0 = s[0]["meta_kv_journal_entries_per_volume"]
+    jrnl1 = s[1]["meta_kv_journal_entries_per_volume"]
+    jrnl2 = s[2]["meta_kv_journal_entries_per_volume"]
+    if len(jrnl2) != n:
+        violations.append(f"N={n} r{md['rep']}: the daemon opened {len(jrnl2)} volumes, not {n}")
+    # Row 4 — spec-R4 balance over the CREATE phase (p1 -> p2).
+    work_jrnl = [b - a for a, b in zip(jrnl1, jrnl2)]
+    jmax, jsum = max(work_jrnl), sum(work_jrnl)
+    jmean = jsum / len(work_jrnl)
+    moved = sum(1 for v in work_jrnl if v > 0)
+    # A volume "carries the stream" when it takes >= 10% of the mean-fair
+    # share; the count is the honest balance statement, not a pass/fail.
+    carrying = sum(1 for v in work_jrnl if v >= 0.1 * jmean)
+    # Row 5 — node-cache hit rate over the WARM (p2->p3, same daemon) and
+    # COLD (p5->p6, post-remount daemon) stat passes.
+    def hitrate(a, b):
+        h, m_ = d(a, b, "meta_kv_node_cache_hits"), d(a, b, "meta_kv_node_cache_misses")
+        return (100.0 * h / (h + m_)) if (h + m_) else float("nan"), h + m_
+    hr_warm, probes_warm = hitrate(2, 3)
+    hr_cold, probes_cold = hitrate(5, 6)
+    misses_cold = d(5, 6, "meta_kv_node_cache_misses")
+    if probes_cold == 0 or probes_warm == 0:
+        violations.append(f"N={n} r{md['rep']}: no node-cache probes in a stat pass (row 5 not engaged)")
+    if d(1, 2, "meta_kv_journal_entries") <= 0:
+        violations.append(f"N={n} r{md['rep']}: the create phase emitted no journal entries (row not engaged)")
+    if s[6].get("dlm_rpcs", 0) != 0:
+        violations.append(f"N={n} r{md['rep']}: dlm_rpcs != 0 (solo re-gate violated)")
+    if d(0, 4, "invariant_tripwires") != 0 or s[6].get("invariant_tripwires", 0) != 0:
+        violations.append(f"N={n} r{md['rep']}: invariant_tripwires moved")
+    if s[4].get("meta_kv_revalidate_dirty_skips", 0) != 0:
+        violations.append(f"N={n} r{md['rep']}: meta_kv_revalidate_dirty_skips != 0")
+    if total(s[6].get("meta_kv_replay_dropped_torn", 0)) != 0:
+        violations.append(f"N={n} r{md['rep']}: the remount dropped torn journal entries")
+
+    budget = s[4]["mem_budget_bytes"]
+    # The R9 arithmetic, on the constants this mount actually resolved:
+    # per-volume target = max(budget/16, 512 MiB) unless the knob pins it
+    # (backend::resolve_node_cache_budget). Labeled arithmetic-on-
+    # measured-constants wherever it is published.
+    knob = md["node_cache_label"]
+    per_vol = int(knob) * MIB if knob.isdigit() else max(budget // 16, 512 * MIB)
+    agg = per_vol * n
+
+    rows.append({
+        "n": n,
+        "rep": int(md["rep"]),
+        "files": files,
+        "substrate": md["substrate"],
+        "budget_lbl": md["budget_label"],
+        "nc_lbl": knob,
+        "mount_s": float(md["mount_s"]),
+        "remount_s": float(md["remount_s"]),
+        "remount_open_s": float(md["remount_open_s"]),
+        "rss_mount_mb": pr[0]["VmRSS"] / 1024,
+        "anon_mount_mb": pr[0].get("smaps_Anonymous", 0) / 1024,
+        "rss_work_mb": pr[4]["VmRSS"] / 1024,
+        "anon_work_mb": pr[4].get("smaps_Anonymous", 0) / 1024,
+        "thr": pr[0]["Threads"],
+        "idle_cpu_pct": 100.0 * idle_cpu / idle_wall,
+        "widle_cpu_pct": 100.0 * work_idle_cpu / work_idle_wall,
+        "idle_ckpt_s": d(0, 1, "meta_kv_checkpoints") / idle_wall,
+        "widle_ckpt_s": d(3, 4, "meta_kv_checkpoints") / work_idle_wall,
+        "idle_jrnl_s": (sum(jrnl1) - sum(jrnl0)) / idle_wall,
+        "work_cpu_s": cpu_s(1, 2),
+        "create_ops_s": float(md["create_ops_s"]),
+        "stat_cold_ops_s": float(md["stat_cold_ops_s"]),
+        "stat_warm_ops_s": float(md["stat_warm_ops_s"]),
+        "nc_mb": comp(4, "kv_node_cache") / MIB,
+        "nc_b_per_file": comp(4, "kv_node_cache") / files,
+        "nc_evict": d(0, 4, "meta_kv_node_cache_evictions"),
+        "nc_sheds": comp(4, "kv_node_cache", "sheds"),
+        "cold_miss": misses_cold,
+        "r5_lvl": s[4]["mem_budget_level"],
+        "r5_yellow": d(0, 4, "mem_budget_yellow_events"),
+        "r5_red": d(0, 4, "mem_budget_red_events"),
+        "r5_backstop": d(0, 4, "mem_budget_hard_backstops"),
+        "budget_gb": budget / (1 << 30),
+        "pervol_target_mb": per_vol / MIB,
+        "agg_target_gb": agg / (1 << 30),
+        "agg_over_budget": agg / budget,
+        "j_max": jmax,
+        "j_mean": jmean,
+        "j_maxmean": (jmax / jmean) if jmean else float("nan"),
+        "j_moved": moved,
+        "j_carrying": carrying,
+        "hr_cold": hr_cold,
+        "hr_warm": hr_warm,
+    })
+
+if not rows:
+    print("no rows collected", file=sys.stderr)
+    sys.exit(1)
+
+MED = [
+    ("mount_s", "mount_s", "{:.2f}"),
+    ("remount_open_s", "reopen_s", "{:.2f}"),
+    ("rss_mount_mb", "rssMnt_MB", "{:.0f}"),
+    ("anon_mount_mb", "anonMnt_MB", "{:.0f}"),
+    ("rss_work_mb", "rssWrk_MB", "{:.0f}"),
+    ("anon_work_mb", "anonWrk_MB", "{:.0f}"),
+    ("thr", "thr", "{:.0f}"),
+    ("idle_cpu_pct", "idleCPU_%core", "{:.2f}"),
+    ("widle_cpu_pct", "wIdleCPU_%core", "{:.2f}"),
+    ("idle_ckpt_s", "ckptIdle/s", "{:.2f}"),
+    ("widle_ckpt_s", "ckptWIdle/s", "{:.2f}"),
+    ("idle_jrnl_s", "jrnlIdle/s", "{:.2f}"),
+    ("work_cpu_s", "createCPU_s", "{:.2f}"),
+    ("create_ops_s", "create_ops/s", "{:.0f}"),
+    ("stat_warm_ops_s", "statW_ops/s", "{:.0f}"),
+    ("stat_cold_ops_s", "statC_ops/s", "{:.0f}"),
+    ("nc_mb", "nodeCache_MB", "{:.1f}"),
+    ("nc_b_per_file", "nc_B/file", "{:.0f}"),
+    ("nc_evict", "ncEvict", "{:.0f}"),
+    ("nc_sheds", "ncSheds", "{:.0f}"),
+    ("cold_miss", "coldMisses", "{:.0f}"),
+    ("r5_lvl", "r5lvl", "{:.0f}"),
+    ("r5_yellow", "r5yellow", "{:.0f}"),
+    ("r5_red", "r5red", "{:.0f}"),
+    ("r5_backstop", "r5backstop", "{:.0f}"),
+    ("pervol_target_mb", "ncTarget/vol_MB", "{:.0f}"),
+    ("agg_target_gb", "ncTargetAgg_GB", "{:.1f}"),
+    ("agg_over_budget", "aggXbudget", "{:.2f}"),
+    ("j_max", "jrnlMax", "{:.0f}"),
+    ("j_mean", "jrnlMean", "{:.0f}"),
+    ("j_maxmean", "jrnlMax/Mean", "{:.1f}"),
+    ("j_moved", "volsMoved", "{:.0f}"),
+    ("j_carrying", "volsCarrying", "{:.0f}"),
+    ("hr_cold", "ncHitCold_%", "{:.2f}"),
+    ("hr_warm", "ncHitWarm_%", "{:.2f}"),
+]
+
+ns = sorted({r["n"] for r in rows})
+reps = max(r["rep"] for r in rows)
+head = rows[0]
+print(f"== pv-volume-scaling (substrate={head['substrate']}, budget={head['budget_lbl']}, "
+      f"node_cache_mb={head['nc_lbl']}, files={head['files']}, "
+      f"repeats={reps}, medians) ==")
+print(f"   R5 budget resolved: {head['budget_gb']:.1f} GiB")
+cols = ["N"] + [c for _, c, _ in MED]
+table = []
+for n in ns:
+    sel = [r for r in rows if r["n"] == n]
+    row = [str(n)]
+    for key, _, fmt in MED:
+        vals = [r[key] for r in sel]
+        row.append(fmt.format(statistics.median(vals)))
+    table.append(row)
+w = {i: max(len(cols[i]), max(len(r[i]) for r in table)) for i in range(len(cols))}
+print("  ".join(cols[i].ljust(w[i]) for i in range(len(cols))))
+for r in table:
+    print("  ".join(r[i].ljust(w[i]) for i in range(len(cols))))
+
+print()
+print("TIERS: memory rows (RSS/anon, R5, node-cache) are substrate-independent")
+print("       and measured-real on this venue; the CPU and journal-balance")
+print("       rows are barrier-sensitive on a file substrate — re-run under")
+print("       root on tests/dev_substrate.sh before citing them as acceptance.")
+print("       ncTarget*/aggXbudget are arithmetic-on-measured-constants")
+print("       (backend::resolve_node_cache_budget over the LIVE mem_budget_bytes).")
+
+if violations:
+    print("INVALID ROW(S):", file=sys.stderr)
+    for v in violations:
+        print(f"  {v}", file=sys.stderr)
+    sys.exit(1)
+print("rows VALID (set width asserted, phases engaged, solo re-gate held, tripwires flat)")
+PYEOF
+}
+
+leg_pv_volume_scaling() {
+    local fixture="$REPO/tests/pv_volume_set.sh"
+    [ -f "$fixture" ] || die "missing $fixture (the N-volume fixture)"
+    [ -x "$SQZ" ] || die "missing $SQZ (cargo build --release)"
+    command -v python3 >/dev/null 2>&1 || die "python3 is required (the row emitter)"
+    command -v cc >/dev/null 2>&1 || die "cc is required (tests/mdstorm.c — the workload)"
+    [[ "$PV_FILES" =~ ^[0-9]+$ ]] && [ "$PV_FILES" -ge 100 ] ||
+        die "--files takes an integer >= 100 (got '$PV_FILES')"
+    [[ "$PV_IDLE_S" =~ ^[0-9]+$ ]] && [ "$PV_IDLE_S" -ge 5 ] ||
+        die "--idle-secs takes seconds >= 5 (got '$PV_IDLE_S')"
+    [[ "$PV_REPEATS" =~ ^[0-9]+$ ]] && [ "$PV_REPEATS" -ge 1 ] ||
+        die "--repeats takes a positive integer (got '$PV_REPEATS')"
+    [[ "$PV_THREADS" =~ ^[0-9]+$ ]] && [ "$PV_THREADS" -ge 1 ] ||
+        die "--threads takes a positive integer (got '$PV_THREADS')"
+    [[ "$PV_TTL_MS" =~ ^[0-9]+$ ]] ||
+        die "--kernel-ttl-ms takes milliseconds (got '$PV_TTL_MS')"
+    local -a ns=()
+    IFS=, read -r -a ns <<<"$PV_NS"
+    local n
+    for n in "${ns[@]}"; do
+        [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le 256 ] ||
+            die "--ns takes comma-separated widths in 1..256 (got '$n')"
+    done
+
+    PV_ROOT="${SQZ_MWMATRIX_PV_ROOT:-${TMPDIR:-/tmp}/squeezefs-pvscale}"
+    mkdir -p "$PV_ROOT"
+    local rowdir
+    rowdir="$PV_ROOT/rows-$PV_TAG-$(date +%s)"
+    mkdir -p "$rowdir"
+    local storm="$REPO/target/pv-mdstorm"
+    cc -O2 -pthread -o "$storm" "$REPO/tests/mdstorm.c" ||
+        die "cc tests/mdstorm.c failed"
+
+    log "pv-volume-scaling: ns=$PV_NS files=$PV_FILES idle=${PV_IDLE_S}s repeats=$PV_REPEATS budget=${PV_BUDGET:-derived} node_cache_mb=${PV_NODE_CACHE_MB:-derived} kernel_ttl_ms=$PV_TTL_MS"
+    local rep
+    for rep in $(seq 1 "$PV_REPEATS"); do
+        for n in "${ns[@]}"; do
+            pv_quiet_or_die
+            log "row: N=$n rep=$rep"
+            pv_one_row "$n" "$rep" "$rowdir" "$storm" "$fixture"
+        done
+    done
+    log "snapshots: $rowdir"
+    pv_emit "$rowdir"
+}
+
+if [ "$LEG" = "pv-volume-scaling" ]; then
+    leg_pv_volume_scaling
+    exit 0
+fi
 
 ensure_root "$LEG" "$@"
 # The admin-lane client half of the KD-7 dev override (the daemon half is
@@ -5644,5 +6159,5 @@ s10-placement-tarx) leg_s10_placement_tarx ;;
 cowriters-admission) leg_cowriters_admission ;;
 vm-hostscope-validate) leg_vm_hostscope_validate ;;
 vm-multi-identity) leg_vm_multi_identity ;;
-*) die "unknown leg '$LEG' (smoke|multipath-negative|s6-journal|s6-fence|s6-vm-fence|s7-device-fence|s7-kill-matrix|s8-serial-ab|s8-crucible|s9-fanout|s9-failover|s9-colocated-fence|s11-range|s11-subblock|s11-mpiio|s11-blockcyclic|s11-tiny|s11-killrange|s10c-fsck-scale|s10c-kill-shard|s10-delegation|s10-intents|s10-intents-tarx|s10-placement-tarx|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
+*) die "unknown leg '$LEG' (pv-volume-scaling|smoke|multipath-negative|s6-journal|s6-fence|s6-vm-fence|s7-device-fence|s7-kill-matrix|s8-serial-ab|s8-crucible|s9-fanout|s9-failover|s9-colocated-fence|s11-range|s11-subblock|s11-mpiio|s11-blockcyclic|s11-tiny|s11-killrange|s10c-fsck-scale|s10c-kill-shard|s10-delegation|s10-intents|s10-intents-tarx|s10-placement-tarx|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
 esac

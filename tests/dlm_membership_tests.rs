@@ -96,7 +96,9 @@ use squeezefs::membership_wire::{
     peers_from_census, MemberClient, MembershipPlane, MembershipPlaneConfig, VerbRouter,
     RPC_MEMBERSHIP_REFUSED, RPC_MEMBERSHIP_UNKNOWN_LEASE, VERB_MEMBERSHIP_CENSUS,
 };
-use squeezefs::meta_backend::kv::backend::{KvMetaBackend, WriterClaim, WRITER_CLAIM_XATTR};
+use squeezefs::meta_backend::kv::backend::{
+    xattr_name_allowed, KvMetaBackend, WriterClaim, WRITER_CLAIM_XATTR,
+};
 use squeezefs::meta_backend::kv::builder::{format_v3_single_writer, FormatV3Options};
 use squeezefs::meta_backend::kv::superblock as sb;
 use squeezefs::meta_backend::kv::META_KV_JOURNAL_ENTRIES;
@@ -2110,4 +2112,820 @@ async fn a_clean_member_disarm_leaves_the_census_before_process_exit() {
     );
     plane.shutdown();
     be.shutdown().await.expect("clean shutdown");
+}
+
+// ---------------------------------------------------------------------------
+// 12. Per-volume claim admission (PR 2) — the durable ownership fields
+// ---------------------------------------------------------------------------
+//
+// `docs/design-per-volume-claim-admission.md` §5.2 (KD-PV-2): a set's
+// metadata volumes may be owned by DIFFERENT nodes, and the truth lives in
+// **each volume's own** `claim_set` record — `owner` names the durable
+// member id that appends to THIS volume, `successors` are KD-PV-12's
+// ordered, statically-declared adoption candidates (ownership does NOT
+// fail over by default). One record per volume cannot disagree with
+// itself, which a set-wide table could.
+//
+// PR 2 lands the fields and the `owner_assign:` bracket record and
+// **nothing else**: no mount reads them to make a decision (PR 3's ladder,
+// PR 5's derivation) and no production path writes them (PR 7's offline
+// `volume set-owners` verb is the first writer). So the whole rung is a
+// byte-identity + RMW-preservation contract:
+//
+// * an UNASSIGNED set's record is byte-identical to the pre-program image
+//   and sector 0 never moves — this program takes no incompat bit, it
+//   gates on bit 14;
+// * every RMW site that rewrites the record preserves the fields, because
+//   that is where an assignment can be silently LOST — and a loss reads as
+//   a legitimate legacy posture rather than as damage (§5.2.2, Issue 16);
+// * an undecodable record on a volume that may carry an assignment
+//   **refuses** instead of resetting to the legacy shape.
+
+/// The **pre-program** `claim_set` image, frozen as a literal: exactly
+/// what `dev`'s `ClaimSet::encode` produced before `owner`/`successors`
+/// existed. A hand-written literal is the point — comparing against
+/// `encode()` would pin the encoder to itself and could not catch the
+/// field that must not appear.
+const PRE_PROGRAM_CLAIM_SET: &str = concat!(
+    r#"{"members":[{"boot":"","endpoint":null,"id":"node_0000000000000001.m00000001","#,
+    r#""pid":0,"pr_key":0,"role":"writer","ts":1700000000},"#,
+    r#"{"boot":"boot-b","endpoint":"10.0.0.2:7100","id":"node_0000000000000002.m00000001","#,
+    r#""pid":4242,"pr_key":4660,"role":"writer","ts":1700000001}],"term":7,"v":1}"#,
+);
+
+/// The set whose encoding is [`PRE_PROGRAM_CLAIM_SET`]: the pid-less
+/// roster form KD-PV-4 enrolls plus one live writer.
+fn pre_program_set() -> ClaimSet {
+    let mut set = ClaimSet::empty(7);
+    set.members.push(ClaimSetMember {
+        identity: membership::MemberIdentity {
+            id: "node_0000000000000001.m00000001".into(),
+            role: MemberRole::Writer,
+            pid: 0,
+            boot: String::new(),
+            endpoint: None,
+            pr_key: 0,
+        },
+        ts: 1_700_000_000,
+    });
+    set.members.push(ClaimSetMember {
+        identity: membership::MemberIdentity {
+            id: "node_0000000000000002.m00000001".into(),
+            role: MemberRole::Writer,
+            pid: 4242,
+            boot: "boot-b".into(),
+            endpoint: Some("10.0.0.2:7100".into()),
+            pr_key: 0x1234,
+        },
+        ts: 1_700_000_001,
+    });
+    set
+}
+
+/// A bit-14 volume with no `claim_set` record yet.
+async fn engaged_volume() -> NamedTempFile {
+    let meta = formatted_volume().await;
+    assert!(
+        sb::set_claim_set_bit(meta.path())
+            .await
+            .expect("stamp bit 14 offline"),
+        "the bit must be newly set"
+    );
+    meta
+}
+
+/// **The headline byte-identity law**: a set that names no owner encodes
+/// to the pre-program image, byte for byte. An existing volume must not
+/// change on disk because this program's code exists.
+#[test]
+fn a_set_with_no_owner_encodes_byte_identically_to_the_pre_program_record() {
+    let set = pre_program_set();
+    assert!(set.owner.is_none(), "an unassigned set names no owner");
+    assert!(set.successors.is_empty());
+    assert_eq!(
+        String::from_utf8(set.encode()).expect("utf-8 record"),
+        PRE_PROGRAM_CLAIM_SET,
+        "an unassigned claim_set must encode BYTE-IDENTICALLY to the pre-program image \
+         (design-per-volume-claim-admission §5.2.2): the fields are emitted only when \
+         non-empty, so every volume in the field keeps its exact bytes"
+    );
+
+    // …and the assigned shape is a strict addition that round-trips.
+    let mut assigned = pre_program_set();
+    assigned.owner = Some("node_0000000000000002.m00000001".into());
+    assigned.successors = vec!["node_0000000000000001.m00000001".into()];
+    let img = assigned.encode();
+    assert_ne!(img, set.encode(), "an assignment must be durable");
+    let back = ClaimSet::decode(&img).expect("assigned record round-trips");
+    assert_eq!(
+        back.owner.as_deref(),
+        Some("node_0000000000000002.m00000001")
+    );
+    assert_eq!(back.successors, vec!["node_0000000000000001.m00000001"]);
+    assert_eq!(back.members, assigned.members);
+    assert_eq!(back.term, assigned.term);
+
+    // The `--clear` law (PR 7's `volume set-owners --clear`): clearing the
+    // assignment restores the pre-program bytes exactly.
+    let mut cleared = assigned;
+    cleared.owner = None;
+    cleared.successors.clear();
+    assert_eq!(
+        String::from_utf8(cleared.encode()).expect("utf-8 record"),
+        PRE_PROGRAM_CLAIM_SET,
+        "clearing an assignment must restore the unassigned image byte-identically"
+    );
+}
+
+/// Forward tolerance: a record written by a pre-program binary decodes
+/// with no owner and no successors — never a guess, never a refusal.
+#[test]
+fn a_pre_program_record_decodes_with_owner_none() {
+    let set = ClaimSet::decode(PRE_PROGRAM_CLAIM_SET.as_bytes()).expect("pre-program record");
+    assert!(set.durable);
+    assert_eq!(set.members.len(), 2);
+    assert!(
+        set.owner.is_none(),
+        "a pre-program record names no owner — the legacy shape is 'the set's sole \
+         authority appends to everything'"
+    );
+    assert!(set.successors.is_empty());
+    assert_eq!(set.term, 7);
+    // An owner-carrying image written by a NEWER binary decodes here too
+    // (the same tolerant `get(...).and_then(...)` law, both directions).
+    let raw = br#"{"members":[],"owner":"node_00000000000000ab.m00000001","successors":["node_00000000000000cd.m00000002"],"term":9,"v":1}"#;
+    let newer = ClaimSet::decode(raw).expect("a newer record decodes");
+    assert_eq!(
+        newer.owner.as_deref(),
+        Some("node_00000000000000ab.m00000001")
+    );
+    assert_eq!(newer.successors, vec!["node_00000000000000cd.m00000002"]);
+}
+
+/// Projection purity: the singleton projection of `writer_claim` — what
+/// every un-engaged volume answers with — can never carry an owner. An
+/// unstamped volume has no assignment by construction, and a projection
+/// that invented one would be an ownership claim nothing wrote.
+#[tokio::test]
+async fn the_singleton_projection_never_carries_an_owner() {
+    let _serial = serial();
+    let meta = formatted_volume().await;
+    let be = KvMetaBackend::open(meta.path()).await.expect("open volume");
+    be.setxattr_internal(
+        1,
+        WRITER_CLAIM_XATTR,
+        &WriterClaim {
+            id: "writer-solo".into(),
+            ts: now_secs(),
+            pid: std::process::id(),
+            boot: "boot-test".into(),
+            term: 3,
+        }
+        .encode(),
+    )
+    .await
+    .expect("the gate's claim commit");
+
+    let set = ClaimSet::load(&be).await.expect("the projection answers");
+    assert!(!set.durable);
+    assert!(
+        set.owner.is_none() && set.successors.is_empty(),
+        "the projection of a singular writer_claim names no per-volume owner"
+    );
+    assert!(membership::ClaimSet::from_writer_claim(&WriterClaim {
+        id: "w".into(),
+        ts: 1,
+        pid: 1,
+        boot: "b".into(),
+        term: 1,
+    })
+    .owner
+    .is_none());
+    be.shutdown().await.expect("clean shutdown");
+}
+
+/// The bit-14 law extends to ownership: an assignment on an un-engaged
+/// volume is refused loud, so no unstamped volume can grow a record.
+#[tokio::test]
+async fn store_refuses_an_owner_without_bit_14() {
+    let _serial = serial();
+    let meta = formatted_volume().await;
+    let be = KvMetaBackend::open(meta.path()).await.expect("open volume");
+    let mut set = ClaimSet::empty(4);
+    set.owner = Some("node_00000000000000ab.m00000001".into());
+    let err = ClaimSet::store(&be, &set)
+        .await
+        .expect_err("storing an owner without bit 14 must refuse");
+    assert!(err.to_string().contains("bit 14"), "{err}");
+
+    let err = membership::set_volume_owner(&be, Some("node_00000000000000ab.m00000001"), &[], 4)
+        .await
+        .expect_err("the assignment writer must refuse an un-engaged volume");
+    assert!(err.to_string().contains("bit 14"), "{err}");
+    assert!(
+        !be.listxattr(1)
+            .await
+            .expect("listxattr")
+            .iter()
+            .any(|k| k == CLAIM_SET_XATTR),
+        "a refused assignment writes NOTHING"
+    );
+    be.shutdown().await.expect("clean shutdown");
+}
+
+/// The gate's second half: assigning an owner takes **no incompat bit**,
+/// so sector 0 is byte-identical across the assignment, and `--clear`
+/// restores the record's bytes exactly.
+#[tokio::test]
+async fn an_assignment_moves_no_superblock_byte_and_clears_byte_identically() {
+    let _serial = serial();
+    let meta = engaged_volume().await;
+
+    // The unassigned baseline, written and settled.
+    let be = KvMetaBackend::open(meta.path()).await.expect("open volume");
+    membership::upsert_writer_member(
+        &be,
+        &membership::MemberIdentity {
+            id: "node_0000000000000001.m00000001".into(),
+            role: MemberRole::Writer,
+            pid: 0,
+            boot: String::new(),
+            endpoint: None,
+            pr_key: 0,
+        },
+        6,
+    )
+    .await
+    .expect("enroll the pid-less roster member");
+    be.checkpoint_now().await.expect("settle");
+    let baseline_record = be
+        .getxattr(1, CLAIM_SET_XATTR)
+        .await
+        .expect("read")
+        .expect("the record exists");
+    be.shutdown().await.expect("clean shutdown");
+    let sector0_before =
+        std::fs::read(meta.path()).expect("read the volume")[..sb::SUPERBLOCK_V3_LEN].to_vec();
+
+    // Assign, then clear.
+    let be = KvMetaBackend::open(meta.path()).await.expect("reopen");
+    membership::set_volume_owner(
+        &be,
+        Some("node_0000000000000001.m00000001"),
+        &["node_0000000000000002.m00000001".to_string()],
+        6,
+    )
+    .await
+    .expect("assign this volume's owner");
+    be.checkpoint_now().await.expect("settle");
+    let assigned = ClaimSet::load(&be).await.expect("durable set");
+    assert_eq!(
+        assigned.owner.as_deref(),
+        Some("node_0000000000000001.m00000001")
+    );
+    assert_eq!(assigned.successors, vec!["node_0000000000000002.m00000001"]);
+    be.shutdown().await.expect("clean shutdown");
+    let sector0_assigned =
+        std::fs::read(meta.path()).expect("read the volume")[..sb::SUPERBLOCK_V3_LEN].to_vec();
+    assert_eq!(
+        sector0_before, sector0_assigned,
+        "per-volume ownership takes NO incompat bit (§7: gated on bit 14) — sector 0 \
+         must not move because a volume was assigned"
+    );
+
+    let be = KvMetaBackend::open(meta.path()).await.expect("reopen");
+    membership::set_volume_owner(&be, None, &[], 6)
+        .await
+        .expect("--clear");
+    be.checkpoint_now().await.expect("settle");
+    assert_eq!(
+        be.getxattr(1, CLAIM_SET_XATTR)
+            .await
+            .expect("read")
+            .expect("the record survives a clear"),
+        baseline_record,
+        "`volume set-owners --clear` must restore the unassigned record BYTE-IDENTICALLY"
+    );
+    be.shutdown().await.expect("clean shutdown");
+    assert_eq!(
+        std::fs::read(meta.path()).expect("read the volume")[..sb::SUPERBLOCK_V3_LEN].to_vec(),
+        sector0_before,
+        "…and sector 0 still has not moved"
+    );
+}
+
+/// **RMW pin 1** (§5.2.2, Issue 16): the enrollment upsert decodes,
+/// mutates and stores the whole record — an owner it does not know about
+/// must survive it. This is the site an assignment is most likely to be
+/// silently lost at, because every mount performs it.
+#[tokio::test]
+async fn an_upsert_preserves_the_owner_and_successors() {
+    let _serial = serial();
+    let meta = engaged_volume().await;
+    let be = KvMetaBackend::open(meta.path()).await.expect("open volume");
+    let ident = |id: &str| membership::MemberIdentity {
+        id: id.to_string(),
+        role: MemberRole::Writer,
+        pid: std::process::id(),
+        boot: "boot-test".into(),
+        endpoint: None,
+        pr_key: 0x77,
+    };
+    membership::upsert_writer_member(&be, &ident("node_0000000000000001.m00000001"), 5)
+        .await
+        .expect("seed a member");
+    membership::set_volume_owner(
+        &be,
+        Some("node_0000000000000001.m00000001"),
+        &["node_0000000000000002.m00000001".to_string()],
+        5,
+    )
+    .await
+    .expect("assign");
+
+    // A peer enrolls (KD-PV-4's roster shape) — the assignment is not its
+    // business and must be untouched.
+    membership::upsert_writer_member(&be, &ident("node_0000000000000002.m00000001"), 6)
+        .await
+        .expect("peer upsert");
+    let set = ClaimSet::load(&be).await.expect("durable set");
+    assert_eq!(set.members.len(), 2);
+    assert_eq!(
+        set.owner.as_deref(),
+        Some("node_0000000000000001.m00000001"),
+        "upsert_writer_member's decode→mutate→store RMW must PRESERVE the owner"
+    );
+    assert_eq!(set.successors, vec!["node_0000000000000002.m00000001"]);
+
+    // Withdrawal is the same RMW.
+    membership::withdraw_writer_member(&be, "node_0000000000000002.m00000001")
+        .await
+        .expect("withdraw");
+    let set = ClaimSet::load(&be).await.expect("durable set");
+    assert_eq!(set.members.len(), 1);
+    assert_eq!(
+        set.owner.as_deref(),
+        Some("node_0000000000000001.m00000001"),
+        "a withdrawal must not carry the assignment away with the member"
+    );
+    be.shutdown().await.expect("clean shutdown");
+}
+
+/// **RMW pin 2**: the rung-8 same-boot dead-writer prune rewrites the
+/// member list under the D0 dead-holder proof. It must not drop the
+/// ownership fields — a crashed peer's residue and a volume's assignment
+/// are different facts.
+#[tokio::test]
+async fn the_dead_writer_prune_preserves_the_owner_and_successors() {
+    let _serial = serial();
+    let meta = engaged_volume().await;
+    let be = KvMetaBackend::open(meta.path()).await.expect("open volume");
+    let my_boot = squeezefs::meta_backend::kv::backend::read_boot_id();
+    let dead_pid = {
+        let mut child = std::process::Command::new("true").spawn().expect("spawn");
+        let pid = child.id();
+        child.wait().expect("reap");
+        pid
+    };
+    membership::upsert_writer_member(
+        &be,
+        &membership::MemberIdentity {
+            id: "uuid-dead-incarnation".into(),
+            role: MemberRole::Writer,
+            pid: dead_pid,
+            boot: my_boot.clone(),
+            endpoint: None,
+            pr_key: 0x0dead,
+        },
+        3,
+    )
+    .await
+    .expect("seed the dead predecessor");
+    membership::set_volume_owner(
+        &be,
+        Some("node_0000000000000009.m00000001"),
+        &["node_000000000000000a.m00000001".to_string()],
+        3,
+    )
+    .await
+    .expect("assign");
+
+    membership::upsert_writer_member(
+        &be,
+        &membership::MemberIdentity {
+            id: "node_0000000000000009.m00000001".into(),
+            role: MemberRole::Writer,
+            pid: std::process::id(),
+            boot: my_boot,
+            endpoint: None,
+            pr_key: 0x51,
+        },
+        4,
+    )
+    .await
+    .expect("the successor's upsert prunes the dead entry");
+
+    let set = ClaimSet::load(&be).await.expect("durable set");
+    let ids: Vec<&str> = set.members.iter().map(|m| m.identity.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["node_0000000000000009.m00000001"],
+        "engagement: the prune must actually have fired"
+    );
+    assert_eq!(
+        set.owner.as_deref(),
+        Some("node_0000000000000009.m00000001"),
+        "the rung-8 prune rewrites MEMBERS; the assignment is not membership residue"
+    );
+    assert_eq!(set.successors, vec!["node_000000000000000a.m00000001"]);
+    be.shutdown().await.expect("clean shutdown");
+}
+
+/// **RMW pin 3 — the fail-closed direction.** The decode-failure fallback
+/// (`ClaimSet::decode(&raw).unwrap_or_else(|| ClaimSet::empty(term))`)
+/// would silently drop `owner` and convert a multi-owner volume into the
+/// legacy shape: an ownership LOSS that reads as a legitimate posture. On
+/// a volume that may carry an assignment — an armed ownership plane, or an
+/// open `owner_assign:` bracket — the fallback is a loud refusal instead.
+/// Unassigned volumes keep today's behaviour exactly.
+#[tokio::test]
+async fn an_undecodable_claim_set_on_an_assigned_volume_refuses_rather_than_resetting() {
+    use squeezefs::meta_ship::owners::{self as ship, OwnerMap};
+    let _serial = serial();
+    let meta = engaged_volume().await;
+    let be = KvMetaBackend::open(meta.path()).await.expect("open volume");
+    let ident = membership::MemberIdentity {
+        id: "node_0000000000000001.m00000001".into(),
+        role: MemberRole::Writer,
+        pid: std::process::id(),
+        boot: "boot-test".into(),
+        endpoint: None,
+        pr_key: 0,
+    };
+    let garble = |be: &KvMetaBackend| async move {
+        be.setxattr_internal(1, CLAIM_SET_XATTR, b"{\"members\":")
+            .await
+            .expect("write a torn record");
+    };
+
+    // (a) No assignment evidence: today's behaviour, unchanged — the
+    //     unattributable record is replaced by this member's own set.
+    garble(&be).await;
+    assert!(membership::upsert_writer_member(&be, &ident, 5)
+        .await
+        .expect("an unassigned volume still self-heals"));
+    assert_eq!(
+        ClaimSet::load(&be).await.expect("set").members.len(),
+        1,
+        "the unassigned fallback must still reset — nothing is at risk there"
+    );
+
+    // (b) An open `owner_assign:` bracket ⇒ refuse, and touch nothing.
+    garble(&be).await;
+    be.setxattr_internal(1, squeezefs::OWNER_ASSIGN_MARKER_XATTR, b"any-image")
+        .await
+        .expect("write the bracket marker");
+    let err = membership::upsert_writer_member(&be, &ident, 6)
+        .await
+        .expect_err("an undecodable record under an assignment bracket must REFUSE");
+    let text = err.to_string();
+    assert!(
+        text.contains("claim_set") && text.contains("owner"),
+        "the refusal must name the record and what is at risk: {text}"
+    );
+    assert_eq!(
+        be.getxattr(1, CLAIM_SET_XATTR)
+            .await
+            .expect("read")
+            .as_deref(),
+        Some(&b"{\"members\":"[..]),
+        "a refusal must leave the evidence in place, never overwrite it"
+    );
+    be.removexattr_internal(1, squeezefs::OWNER_ASSIGN_MARKER_XATTR)
+        .await
+        .expect("drop the bracket");
+
+    // (c) An ARMED ownership plane ⇒ refuse for the same reason, with no
+    //     marker anywhere: a running multi-owner fleet is itself the
+    //     evidence that a volume may be assigned.
+    let routed = Arc::new(squeezefs::meta_backend::RoutedMetaBackend::new(vec![
+        Arc::clone(&be),
+    ]));
+    ship::arm_ownership(OwnerMap::for_volumes(&routed, Vec::new()).expect("owner map"));
+    let armed = membership::upsert_writer_member(&be, &ident, 7).await;
+    ship::disarm_ownership();
+    let err = armed.expect_err("an undecodable record under an armed plane must REFUSE");
+    assert!(err.to_string().contains("claim_set"), "{err}");
+
+    // …and with the plane down and no marker, the fallback returns.
+    assert!(membership::upsert_writer_member(&be, &ident, 8)
+        .await
+        .expect("the unassigned path is unchanged"));
+    be.shutdown().await.expect("clean shutdown");
+}
+
+/// **RMW pin 4 (the fifth site, found in the code rather than the design
+/// — see the PR report): the last member's departure.** `withdraw` deletes
+/// the record once the set empties, so a departing last member would carry
+/// the volume's assignment away with it. Under D19 the assignment is
+/// durable OPERATOR state that outlives every mount: it survives, and only
+/// `volume set-owners --clear` removes it. An UNASSIGNED set still
+/// vanishes exactly as before.
+#[tokio::test]
+async fn a_last_member_withdrawal_preserves_the_assignment() {
+    let _serial = serial();
+    let meta = engaged_volume().await;
+    let be = KvMetaBackend::open(meta.path()).await.expect("open volume");
+    let ident = membership::MemberIdentity {
+        id: "node_0000000000000003.m00000001".into(),
+        role: MemberRole::Writer,
+        pid: std::process::id(),
+        boot: "boot-test".into(),
+        endpoint: None,
+        pr_key: 0,
+    };
+    membership::upsert_writer_member(&be, &ident, 5)
+        .await
+        .expect("enroll");
+    membership::set_volume_owner(&be, Some("node_0000000000000003.m00000001"), &[], 5)
+        .await
+        .expect("assign");
+    assert!(
+        membership::withdraw_writer_member(&be, "node_0000000000000003.m00000001")
+            .await
+            .expect("the last member departs")
+    );
+    let set = ClaimSet::load(&be).await.expect("the record survives");
+    assert!(set.durable, "an assigned volume's record is not deleted");
+    assert!(set.members.is_empty());
+    assert_eq!(
+        set.owner.as_deref(),
+        Some("node_0000000000000003.m00000001"),
+        "a mount's departure must not unassign the volume it was mounted on"
+    );
+
+    // The unassigned set still disappears — the departed-set-presents-as-
+    // unclaimed law is untouched where no assignment exists.
+    membership::set_volume_owner(&be, None, &[], 5)
+        .await
+        .expect("--clear");
+    membership::upsert_writer_member(&be, &ident, 5)
+        .await
+        .expect("re-enroll");
+    assert!(
+        membership::withdraw_writer_member(&be, "node_0000000000000003.m00000001")
+            .await
+            .expect("withdraw")
+    );
+    assert!(
+        !be.listxattr(1)
+            .await
+            .expect("listxattr")
+            .iter()
+            .any(|k| k == CLAIM_SET_XATTR),
+        "an UNASSIGNED set still deletes its record when it empties"
+    );
+    be.shutdown().await.expect("clean shutdown");
+}
+
+/// **RMW pin 5**: `claim_set` is a PER-VOLUME control record and
+/// `is_pinned_control_record` already excludes it from a slot's travel set
+/// (`slot_migration.rs:275`) — pinned here as a CONTRACT rather than left
+/// as an inference, because an owner field that travelled into another
+/// volume's guest keyspace would be an assignment nobody wrote, on the one
+/// record whose whole safety argument is "one record, one volume".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_field_survives_a_migrate_slot_of_any_other_slot() {
+    use squeezefs::meta_backend::slot_migration::{
+        migrate_slot, MigrationOptions, MigrationTestHooks,
+    };
+    use squeezefs::meta_backend::{
+        guest_local_ino, open_routed_meta_set, plan_meta_slot_set_with_width,
+    };
+    let _serial = serial();
+    const MIG_VOL_LEN: u64 = 256 * 1024 * 1024;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let metas: Vec<std::path::PathBuf> = ["m0", "m1"]
+        .iter()
+        .map(|n| {
+            let p = dir.path().join(n);
+            std::fs::File::create(&p)
+                .expect("create")
+                .set_len(MIG_VOL_LEN)
+                .expect("size");
+            p
+        })
+        .collect();
+    // W = 2N so a flip never leaves a member hostless (the VL5b fixture).
+    let plan = plan_meta_slot_set_with_width(metas.len(), 4).expect("plan admits the bounds");
+    for (i, m) in metas.iter().enumerate() {
+        squeezefs::meta_backend::kv::builder::format_v3_stamped(
+            m,
+            MIG_VOL_LEN,
+            &FormatV3Options {
+                node_size: squeezefs::meta_backend::kv::node::DEFAULT_NODE_SIZE,
+                journal_len_override: None,
+                force: true,
+                full_wipe: false,
+                format_config_xattr: None,
+            },
+            plan.stamps[i].clone(),
+        )
+        .await
+        .expect("format a stamped member");
+    }
+    let paths: Vec<String> = metas.iter().map(|p| p.display().to_string()).collect();
+
+    let routed = open_routed_meta_set(&paths).await.expect("open the set");
+    assert!(
+        membership::claim_set_engaged(routed.volumes[1].superblock().features_incompat),
+        "the default format is multi-writer-capable: bit 14 is stamped"
+    );
+    // Volume 1 is assigned to a peer; volume 0 to this node (D20's set
+    // authority hosts slot 0).
+    membership::set_volume_owner(
+        &routed.volumes[0],
+        Some("node_000000000000000a.m00000001"),
+        &[],
+        3,
+    )
+    .await
+    .expect("assign volume 0");
+    membership::set_volume_owner(
+        &routed.volumes[1],
+        Some("node_000000000000000b.m00000001"),
+        &["node_000000000000000a.m00000001".to_string()],
+        3,
+    )
+    .await
+    .expect("assign volume 1");
+
+    // Migrate slot 1 — volume 1's NATIVE keyspace — onto volume 0.
+    let report = migrate_slot(
+        &routed,
+        1,
+        0,
+        &MigrationOptions::default(),
+        &MigrationTestHooks::default(),
+    )
+    .await
+    .expect("the migration succeeds");
+    assert!(
+        report.records_copied > 0,
+        "engagement: the migration must have copied records"
+    );
+
+    // The source volume keeps its own assignment…
+    let src = ClaimSet::load(&routed.volumes[1])
+        .await
+        .expect("volume 1's record");
+    assert_eq!(
+        src.owner.as_deref(),
+        Some("node_000000000000000b.m00000001"),
+        "a slot migration must not carry a volume's OWNER away from the only place \
+         anything looks for it (is_pinned_control_record)"
+    );
+    assert_eq!(src.successors, vec!["node_000000000000000a.m00000001"]);
+    // …the destination keeps its own, unchanged…
+    let dst = ClaimSet::load(&routed.volumes[0])
+        .await
+        .expect("volume 0's record");
+    assert_eq!(
+        dst.owner.as_deref(),
+        Some("node_000000000000000a.m00000001"),
+        "the destination's assignment is its own and must not be overwritten by the \
+         travelling slot"
+    );
+    // …and no copy landed in the host's guest keyspace, where it would be
+    // an assignment nobody wrote.
+    assert_eq!(
+        routed.volumes[0]
+            .getxattr(guest_local_ino(1, 1), CLAIM_SET_XATTR)
+            .await
+            .expect("read the guest keyspace root"),
+        None,
+        "a claim_set copy in a guest keyspace is residue that names an owner nobody \
+         assigned"
+    );
+
+    for vol in &routed.volumes {
+        vol.shutdown().await.expect("clean shutdown");
+    }
+}
+
+/// The `owner_assign:` bracket record (KD-PV-2, §7): the `mw_upgrade:`
+/// mechanism verbatim — versioned, checksummed, and refusing every image
+/// it cannot fully interpret, because presence alone is the refusal
+/// predicate a writable mount will read (PR 4) and a misread would name
+/// the wrong remedy.
+#[test]
+fn the_owner_assign_marker_round_trips_and_refuses_torn_or_foreign_images() {
+    use squeezefs::config_ops::{OwnerAssignMarker, OwnerAssignment, OWNER_ASSIGN_MARKER_VERSION};
+    let marker = OwnerAssignMarker {
+        assignments: vec![
+            OwnerAssignment {
+                volume_id: "vol-0a1b2c3d4e5f6071".into(),
+                owner: Some("node_000000000000000a.m00000001".into()),
+                successors: vec!["node_000000000000000b.m00000001".into()],
+            },
+            OwnerAssignment {
+                volume_id: "vol-1122334455667788".into(),
+                owner: Some("node_000000000000000b.m00000001".into()),
+                successors: Vec::new(),
+            },
+        ],
+    };
+    let img = marker.encode();
+    assert_eq!(
+        OwnerAssignMarker::decode(&img).expect("round trip"),
+        marker,
+        "the bracket must round-trip exactly — a resume compares it against the act it \
+         is completing"
+    );
+
+    // The `--clear` act is expressible: an assignment with no owner.
+    let cleared = OwnerAssignMarker {
+        assignments: vec![OwnerAssignment {
+            volume_id: "vol-0a1b2c3d4e5f6071".into(),
+            owner: None,
+            successors: Vec::new(),
+        }],
+    };
+    assert_eq!(
+        OwnerAssignMarker::decode(&cleared.encode()).expect("round trip"),
+        cleared
+    );
+
+    // Torn: one flipped byte anywhere fails the checksum.
+    let mut torn = img.clone();
+    torn[5] ^= 0xff;
+    assert!(OwnerAssignMarker::decode(&torn)
+        .expect_err("a torn image must refuse")
+        .contains("checksum"));
+
+    // Truncated in every prefix — never a panic, never a partial answer.
+    for cut in 0..img.len() {
+        assert!(
+            OwnerAssignMarker::decode(&img[..cut]).is_err(),
+            "a truncated image must refuse (cut at {cut})"
+        );
+    }
+
+    // Trailing bytes: foreign or torn, never silently ignored.
+    let mut trailing = img.clone();
+    let sum = trailing.split_off(trailing.len() - 8);
+    trailing.push(0);
+    trailing.extend_from_slice(&sum);
+    assert!(OwnerAssignMarker::decode(&trailing).is_err());
+
+    // A future version refuses loud instead of guessing (forward-only).
+    let mut future = img.clone();
+    future[0] = OWNER_ASSIGN_MARKER_VERSION + 1;
+    let sum = xxhash_rust::xxh3::xxh3_64(&future[..future.len() - 8]);
+    let n = future.len();
+    future[n - 8..].copy_from_slice(&sum.to_le_bytes());
+    let err = OwnerAssignMarker::decode(&future).expect_err("a future version must refuse");
+    assert!(err.contains("version"), "{err}");
+
+    // A duplicate volume id cannot be interpreted (which assignment wins?).
+    let dup = OwnerAssignMarker {
+        assignments: vec![
+            OwnerAssignment {
+                volume_id: "vol-0a1b2c3d4e5f6071".into(),
+                owner: Some("node_000000000000000a.m00000001".into()),
+                successors: Vec::new(),
+            },
+            OwnerAssignment {
+                volume_id: "vol-0a1b2c3d4e5f6071".into(),
+                owner: Some("node_000000000000000b.m00000001".into()),
+                successors: Vec::new(),
+            },
+        ],
+    };
+    assert!(OwnerAssignMarker::decode(&dup.encode()).is_err());
+}
+
+/// The new record is invisible through the mount: `owner_assign:` is
+/// outside the VAL-2 positive allowlist, so it can never be read, written,
+/// listed or removed from an unprivileged shell — the same posture
+/// `mw_upgrade:` / `job:` / `alloc_lane:` / `claim_set` hold.
+#[test]
+fn the_owner_assign_marker_is_invisible_through_the_fuse_boundary() {
+    for name in [
+        squeezefs::OWNER_ASSIGN_MARKER_XATTR,
+        squeezefs::MW_UPGRADE_MARKER_XATTR,
+        CLAIM_SET_XATTR,
+    ] {
+        assert!(
+            !xattr_name_allowed(name),
+            "{name} carries SqueezeFS-internal durable state and must never cross the \
+             FUSE boundary (VAL-2 allowlist)"
+        );
+    }
+    assert!(
+        squeezefs::OWNER_ASSIGN_MARKER_XATTR.starts_with("owner_assign:"),
+        "the record name is the design's (§5.2.1/§7) — the mount gate and the operator \
+         verb both name it"
+    );
 }

@@ -978,13 +978,21 @@ async fn readers_acknowledge_while_the_writer_frees_and_reallocates() {
 // 13–18 — the pressure-coupled release valve (rung-20 residual 6)
 // ---------------------------------------------------------------------------
 
-/// One rewrite storm, driven deterministically on the manual clock.
+/// One rewrite storm's OTHER half, driven deterministically on the manual
+/// clock: the reader and the owner's own cadences, modelled exactly as
+/// production runs them.
 ///
-/// The reader is modelled exactly as production runs it: `spawn_member_
-/// renewal` sleeps until `renew_at_ms`, which is `anchor + Grant::renew_ms`
-/// — so the cadence THE OWNER GRANTS is literally the reader's beat, and
-/// the value it carries home is the label its ladder promoted a beat
-/// earlier (`ack` lags `learned` by one beat, the ladder's own pipeline).
+/// * The beat is `Grant::renew_ms` — literally what `MemberSession::
+///   renew_at_ms` (and hence `spawn_member_renewal`'s sleep) is computed
+///   from, which is what makes rung (a) deliverable at all.
+/// * A member can only acknowledge a label it LEARNED (labels arrive on
+///   beats, nowhere else), and only once its ladder's qualification and
+///   drain windows have elapsed since it learned it — `2 × staleness +
+///   skew_max + D_purge`, the two `AckInputs` lags added.
+/// * The owner republishes the reallocation bound on its SWEEP cadence,
+///   never per renewal (`refresh_free_grace_bound`'s own doc comment).
+///   Rung (a)'s second half is what shortens that term under pressure,
+///   and it is the daemon's own code doing it — not this harness.
 struct Storm {
     owner: Arc<MembershipOwner>,
     clock: LeaseClock,
@@ -994,10 +1002,21 @@ struct Storm {
     /// `false` ⇒ the member beats but never advances its acknowledgement
     /// (the operator page's "renewing but not acknowledging" laggard).
     acknowledges: bool,
+    /// `(instant learned, label)` per beat, oldest first.
+    learned: std::collections::VecDeque<(u64, u64)>,
+    ladder_lag_ms: u64,
     beat_at: u64,
-    learned: u64,
     cadence: u64,
+    /// The shortest cadence the owner ever granted — rung (a)'s engagement
+    /// as the MEMBER experienced it.
+    min_cadence: u64,
     beats: u64,
+    /// `true` once the owner has evicted this member (rung (c)): a fenced
+    /// member's next beat is refused, and in production it self-fences and
+    /// re-joins rather than continuing.
+    fenced: bool,
+    sweep_at: u64,
+    sweep_ms: u64,
 }
 
 impl Storm {
@@ -1009,6 +1028,8 @@ impl Storm {
         grant: &Grant,
         acknowledges: bool,
     ) -> Self {
+        let clocks = owner.clocks();
+        let staleness = squeezefs::ro_coherence::reader_staleness_bound().as_millis() as u64;
         Self {
             owner: Arc::clone(owner),
             clock: clock.clone(),
@@ -1016,30 +1037,72 @@ impl Storm {
             id,
             epoch: grant.epoch,
             acknowledges,
+            learned: std::collections::VecDeque::new(),
+            // qualify (`staleness + skew_max`) + drain (`staleness +
+            // D_purge`) — the ladder's fixed cost, which no cadence can
+            // shrink and which rung (a)'s floor exists to respect.
+            ladder_lag_ms: staleness * 2
+                + clocks.skew_max.as_millis() as u64
+                + clocks.d_purge.as_millis() as u64,
             beat_at: clock.now_ms(),
-            learned: 0,
             cadence: grant.renew_ms,
+            min_cadence: grant.renew_ms,
             beats: 0,
+            fenced: false,
+            sweep_at: clock.now_ms() + clocks.renew_interval.as_millis() as u64,
+            sweep_ms: clocks.renew_interval.as_millis() as u64,
         }
     }
 
-    /// Advance the storm's clock by `step_ms` and run every beat that falls
-    /// due — the member's renewal loop, in the test's frame.
+    /// The label this member can honestly carry now: the newest one it
+    /// learned at least a whole ladder cycle ago.
+    fn carriable(&mut self, now: u64) -> u64 {
+        if !self.acknowledges {
+            return 0;
+        }
+        let mut best = 0;
+        while let Some(&(at, label)) = self.learned.front() {
+            if at + self.ladder_lag_ms > now {
+                break;
+            }
+            best = label;
+            self.learned.pop_front();
+        }
+        if best != 0 {
+            // Keep it available: a later beat with nothing newer ready
+            // re-presents the same value, exactly as a monotone ack does.
+            self.learned.push_front((0, best));
+        }
+        best
+    }
+
+    /// Advance the storm's clock by `step_ms` and run every cadence that
+    /// falls due.
     fn advance(&mut self, step_ms: u64) {
         self.ticks.fetch_add(step_ms, Ordering::SeqCst);
-        while self.clock.now_ms() >= self.beat_at {
-            let carried = if self.acknowledges { self.learned } else { 0 };
+        let now = self.clock.now_ms();
+        while !self.fenced && self.clock.now_ms() >= self.beat_at {
+            let carried = self.carriable(self.clock.now_ms());
             let grant = match self.owner.renew(self.id, self.epoch, carried) {
                 RenewOutcome::Renewed(g) => g,
-                RenewOutcome::UnknownLease { reason } => {
-                    panic!("the member's beat was refused: {reason}")
+                // Rung (c) landed on this member: in production it
+                // self-fences and re-joins; here the storm simply stops
+                // hearing from it, which is what the writer sees.
+                RenewOutcome::UnknownLease { .. } => {
+                    self.fenced = true;
+                    break;
                 }
             };
-            self.learned = grant.granted_at_owner_ms;
+            let at = self.clock.now_ms();
+            self.learned.push_back((at, grant.granted_at_owner_ms));
             self.cadence = grant.renew_ms.max(1);
-            self.beat_at = self.clock.now_ms() + self.cadence;
+            self.min_cadence = self.min_cadence.min(self.cadence);
+            self.beat_at = at + self.cadence;
             self.beats += 1;
+        }
+        if now >= self.sweep_at {
             self.owner.refresh_free_grace_bound();
+            self.sweep_at = now + self.sweep_ms;
         }
     }
 }
@@ -1067,15 +1130,18 @@ async fn a_rewrite_storm_prods_readers_instead_of_stalling_allocation() {
     let grant = join(&owner, "r-storm", MemberRole::Reader);
     owner.refresh_free_grace_bound();
 
-    // A 24-block store rewritten through an 8-block working set: every
-    // pass mints one block and terminally frees one, which is the CoW
-    // rewrite shape whose displacement stream fills the ring. Scaled down
-    // from the field's 32 GiB lane; the RATIO (supply ÷ per-pass
-    // displacement) is what the signal reads.
-    const STORE_BLOCKS: u64 = 24;
-    const WORKING_SET: usize = 8;
-    const PASSES: usize = 200;
-    const STEP_MS: u64 = 500;
+    // A 32-block store rewritten through a 4-block working set: every pass
+    // mints one block and terminally frees one, which is the CoW rewrite
+    // shape whose displacement stream fills the ring. Scaled down from the
+    // field's 32 GiB lane; what the signal reads is the RATIO — supply
+    // against the measured displacement rate — and this one is sized so
+    // the store outlives the ladder's own fixed cost (≈ 6 s of
+    // qualification + drain) but NOT the routine cadence's (≈ 26 s of
+    // beat + sweep + ladder), which is exactly the field's shape.
+    const STORE_BLOCKS: u64 = 32;
+    const WORKING_SET: usize = 4;
+    const PASSES: usize = 300;
+    const STEP_MS: u64 = 1_000;
 
     let ba = allocator("grace-storm").await;
     ba.set_capacity_bytes(STORE_BLOCKS * ba.chunk_size());
@@ -1110,9 +1176,9 @@ async fn a_rewrite_storm_prods_readers_instead_of_stalling_allocation() {
         "the fence deadline never tightened under pressure (rung b)"
     );
     assert!(
-        storm.cadence < grant.renew_ms,
+        storm.min_cadence < grant.renew_ms,
         "the prodded beat ({} ms) must be shorter than the routine one ({} ms)",
-        storm.cadence,
+        storm.min_cadence,
         grant.renew_ms
     );
     // ...so that rung (c) and the ENOSPC ruling are never reached.
@@ -1167,14 +1233,20 @@ async fn a_member_that_never_acknowledges_is_prodded_then_fenced() {
     owner.refresh_free_grace_bound();
 
     let ba = allocator("grace-storm-mute").await;
-    ba.set_capacity_bytes(16 * ba.chunk_size());
+    ba.set_capacity_bytes(32 * ba.chunk_size());
     let mut storm = Storm::new(&owner, &clock, &ticks, "r-mute-storm", &grant, false);
 
-    // Run the storm until the store is genuinely out of supply. Every
-    // allocation that refuses is the RULING working (counted, never a
-    // silent early release).
+    // Run the storm past the store's supply. Every allocation that refuses
+    // is the RULING working (counted, never a silent early release), and
+    // the member keeps beating throughout — it is alive, it just never
+    // answers.
+    let evictions0 = METRICS.membership_evictions.load(Ordering::Relaxed);
+    let cycle_ms = free_grace::ack_cycle(owner.clocks()).as_millis() as u64;
+    let armed_at = clock.now_ms();
     let mut live: Vec<u64> = Vec::new();
-    for _ in 0..64 {
+    let mut refusals = 0u64;
+    let mut prods_before_fence = 0u64;
+    for _ in 0..200 {
         match ba.allocate_block().await {
             Ok(fresh) => live.push(fresh),
             Err(e) => {
@@ -1183,47 +1255,50 @@ async fn a_member_that_never_acknowledges_is_prodded_then_fenced() {
                         if io.kind() == std::io::ErrorKind::StorageFull),
                     "the verdict on a mute reader is StorageFull, got {e:?}"
                 );
-                break;
+                refusals += 1;
             }
         }
         if live.len() > 4 {
             let victim = live.remove(0);
             ba.free_block(victim).await.expect("free");
         }
-        storm.advance(250);
+        // Everything below rung (c) must hold right up to the fence.
+        if free_grace::laggard_fences() == 0 {
+            prods_before_fence = free_grace::prods();
+            assert_eq!(
+                free_grace::forced_releases(),
+                0,
+                "nothing may be released unacknowledged before the deadline"
+            );
+        }
+        storm.advance(1_000);
+        if storm.fenced {
+            break;
+        }
     }
 
     assert!(
-        free_grace::prods() > 0,
+        refusals > 0,
+        "a member that never acknowledges must eventually cost the writer ENOSPC — that is \
+         the ruling, and it is what makes rung (c) necessary"
+    );
+    assert!(free_grace::alloc_stalls() > 0, "the stalls are counted");
+    assert!(
+        prods_before_fence > 0,
         "the ladder must ASK before it fences (rung a precedes rung c)"
     );
     assert!(
         storm.beats > 1,
-        "the member kept beating; it just never acked"
+        "the member kept beating; it just never acknowledged"
     );
-    assert_eq!(
-        free_grace::forced_releases(),
-        0,
-        "nothing may be released unacknowledged before the deadline"
-    );
-    assert_eq!(free_grace::laggard_fences(), 0);
 
-    // Past the deadline in force the laggard is fenced — with its S6
-    // eviction — and the writer progresses.
-    let evictions0 = METRICS.membership_evictions.load(Ordering::Relaxed);
-    let effective = free_grace::effective_bound_ms();
-    assert!(
-        effective >= free_grace::ack_cycle(owner.clocks()).as_millis() as u64,
-        "the tightened deadline ({effective} ms) fell below one honest acknowledgement cycle"
-    );
-    ticks.fetch_add(effective + 1, Ordering::SeqCst);
-    let _recovered = ba
-        .allocate_block()
-        .await
-        .expect("the writer must progress once the laggard is fenced");
-    assert!(
-        free_grace::laggard_fences() >= 1,
-        "progress came from something other than a fence"
+    // Rung (c): the fence, WITH the eviction, and never inside one honest
+    // acknowledgement cycle of the writer starting to wait.
+    assert!(storm.fenced, "the mute member was never fenced");
+    assert_eq!(
+        free_grace::laggard_fences(),
+        1,
+        "one member was holding the free list, so exactly one is fenced"
     );
     assert!(free_grace::forced_releases() >= 1);
     assert!(
@@ -1231,6 +1306,16 @@ async fn a_member_that_never_acknowledges_is_prodded_then_fenced() {
         "a forced release must happen WITH that member's eviction, never without it"
     );
     assert!(owner.epoch_of("r-mute-storm").is_none());
+    assert!(
+        clock.now_ms().saturating_sub(armed_at) >= cycle_ms,
+        "the fence landed inside one honest acknowledgement cycle"
+    );
+
+    // ...and the writer progresses.
+    let _recovered = ba
+        .allocate_block()
+        .await
+        .expect("the writer must progress once the laggard is fenced");
 }
 
 /// **Contract 15 — the published bound is the bound in force.** A
@@ -1477,7 +1562,7 @@ fn a_tightened_renewal_cadence_never_starves_the_ack_ladder() {
     let mut label = 1_000u64;
     for step in 1..=200u64 {
         let now = step * POLL_MS;
-        if now % BEAT_MS == 0 {
+        if now.is_multiple_of(BEAT_MS) {
             // The beat re-learns a fresher label, exactly as
             // `MemberSession::renewed` does.
             learned_at = now;

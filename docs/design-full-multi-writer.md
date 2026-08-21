@@ -668,6 +668,42 @@ the S10 gate; the rest are carried, priced, and loud where they can fire.
    **First live capture 2026-08-19** (the real-fabric mw venue):
    `free_grace_offsets` 0 → 825 across one 8-rank row, never draining
    (`.benchmarks/2026-08-19-blob-aware-merge-and-fabric-venue.md` §3).
+   **VALVE LANDED 2026-08-21** (`feat/free-grace-pressure-valve`,
+   `src/free_grace.rs`, contracts 13–18 of
+   `tests/reader_free_grace_tests.rs`): the graded ladder — the ring's own
+   measured deferral rate against the smaller of its headroom and the
+   volume's free supply gives a RUNWAY in ms, which (a) grants the members
+   the writer is waiting on a shorter renewal cadence (the plane's
+   `ack_cycle` inverted against the runway, floored at the reader's
+   revalidation interval) plus an immediate bound recomputation, and (b)
+   slides the fence deadline from the routine bound toward the pressure
+   bound (floor = one honest acknowledgement cycle). Rung (c) unchanged
+   and still last. New gauges `free_grace_{prods,bound_tightenings,
+   pressure_pct,prod_renew_ms,fence_bound_base_ms}`; A/B control
+   `SQUEEZEFS_FREE_GRACE_VALVE=0`, which reproduces the convicted shape on
+   demand (the storm contract stalls at 28 of 32 blocks held, and survives
+   300 passes with the valve on). **Convicted en route and fixed with it:**
+   the reader's ack ladder qualified against the label the NEWEST renewal
+   carried, and every renewal re-learns one — so any renewal cadence below
+   `staleness + skew_max` starves qualification outright and the reader
+   acknowledges nothing for ever. Reachable with no valve at all (a writer
+   at `SQUEEZEFS_META_FLUSH_INTERVAL_MS=5000` derives a ~6 s lag plus a 5 s
+   pass cadence against a 10 s beat), and a plausible root cause of the
+   "never draining" capture itself. The ladder now snapshots a CANDIDATE.
+   **Still owed / named exposures**: (i) the field row — the valve is
+   proven on the deterministic contract and the local gate, never yet on
+   the fabric venue; (ii) rung (a)'s first delivery still waits out the
+   member's CURRENT beat, so a store whose entire runway is shorter than
+   one routine cadence reaches ENOSPC regardless (stated in
+   `docs/operations.md` as a sizing rule, not hidden); (iii) **the ack is
+   liveness-class work riding a workload-class venue** — the prod itself
+   rides the isolated `sqz-lease` lane (finding 2's fix), but the
+   PROMOTION it is asking for happens in `ro_coherence::
+   spawn_reader_revalidation` on the shared `sqz-meta` pool, so a reader
+   whose meta lanes are starved cannot answer however hard it is asked and
+   rung (c) would fence it for the storm's congestion rather than its own.
+   The pass is genuine metadata work and does not belong on the lease
+   lane; a scoped ack-only promotion that could is the follow-on.
 7. **The kernel-split sequential-frontier extend RTT** (the v2 desired
    stretch): live dd streams pay ~1 extend round trip per block (63/64
    extensions on `s11-range`; sub-1 % at localhost). The R2-classifier

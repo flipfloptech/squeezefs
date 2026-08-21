@@ -1848,10 +1848,45 @@ proceeds. Eviction costs that reader availability (it must re-join, and it
 self-fences its own caches on its stricter deadline); it never costs anyone
 correctness.
 
+**The pressure-coupled release valve.** The rule above says what happens
+when the supply runs out; the valve is what stops it running out. A rewrite
+storm displaces blocks far faster than a reader answers on its routine
+10 s beat, and the field showed the consequence: `free_grace_offsets`
+climbing monotonically until the lane's share ENOSPCs (0 → 825 across one
+8-rank row, never draining). Capacity was never the constraint, so the
+writer instead makes the readers **answer sooner**, on a graded ladder:
+
+1. **Prod.** The ring's own two end labels give the storm's measured
+   deferral rate; against the smaller of the ring's headroom and the
+   volume's free blocks that is a **runway** in milliseconds. When the
+   runway is shorter than one acknowledgement cycle, the members the
+   writer is waiting on are granted a **shorter renewal cadence** — the
+   plane's own cycle inverted against the runway, floored at the shortest
+   interval a reader's answer can actually change in (its revalidation
+   cadence) — and their answers already in hand are read at once instead
+   of at the owner's next sweep. Costs nobody any coherence.
+2. **Tighten.** The fence deadline slides from the routine bound toward
+   the pressure bound as the runway shortens — linearly, so there is no
+   threshold to oscillate across. The pressure bound is the **floor**, and
+   it is at minimum one honest acknowledgement cycle, so this rung can
+   never fence a reader that is answering as designed.
+3. **Force.** Unchanged, and still the last rung: a release without an
+   acknowledgement, always together with that member's eviction.
+
+Rungs 1 and 2 exist to make rung 3 and `free_grace_alloc_stalls`
+unreachable on a healthy fleet. The prod rides the renewal a reader is
+already making (on the isolated `sqz-lease` lane), so it needs no extra
+round trip and is deliverable under exactly the storm that provokes it —
+but its first delivery still waits out the member's CURRENT beat, so a
+store whose whole runway is shorter than one routine cadence will still
+reach ENOSPC. Size the free supply for at least one acknowledgement cycle
+of displacement.
+
 | Knob | Default | Purpose |
 |---|---|---|
 | `SQUEEZEFS_FREE_GRACE_MAX_MS` | derived (2 × one acknowledgement cycle ≈ 76 s with the shipped clocks) | How long a freed offset waits on a reader before that reader is fenced. One *cycle* is `3 × renewal interval + 3 × reader staleness bound + skew_max + D_purge` — every term a published number. A value **below one cycle refuses** rather than fencing readers that are answering as designed. |
 | `SQUEEZEFS_FREE_GRACE_MAX_OFFSETS` | derived `max(budget/1024/24 B, 131072)` | Per-volume cap on held offsets. The floor is field-derived: 12.7 GB/s of saturated ingest over one cycle displaces ≈ 120 k 4 MiB blocks. At the cap the writer forces progress through the same fence act — never by quietly releasing something unacknowledged. |
+| `SQUEEZEFS_FREE_GRACE_VALVE` | `on` | The pressure ladder above. `0` disarms rungs 1 and 2 (the A/B control): readers keep their routine cadence under write pressure and the fence deadline never tightens, which is the pre-valve shape whose measured signature is the monotone climb. Rung 3 and the ENOSPC ruling are unaffected either way. |
 
 **Space pressure: ENOSPC, not corruption.** If the free list is entirely in
 grace, allocation refuses `ENOSPC` — promptly, loudly, counted in
@@ -1872,7 +1907,10 @@ plane — the shipped default), `idle` (armed, no members) or `armed`:
 | `free_grace_forced_releases` | **the tripwire:** offsets released *without* an acknowledgement, i.e. past the bound or at the ring cap. 0 on a healthy fleet; nonzero means at least one reader was fenced, and only that reader's coherence was ever at stake |
 | `free_grace_laggard_fences` | readers evicted for not acknowledging. Investigate alongside `membership_renewals` — a reader renewing but not acknowledging is a revalidation problem, not a network one |
 | `free_grace_alloc_stalls` | allocations that refused ENOSPC with offsets held. Expected only on a genuinely full store; sustained growth means the readers are too slow for the write rate (raise capacity, or shorten the cycle with `SQUEEZEFS_MEMBERSHIP_LEASE_TTL_MS` / `SQUEEZEFS_META_REVALIDATE_MS`) |
-| `free_grace_bound` | the label the writer may reallocate up to; `free_grace_fence_bound_ms` / `free_grace_pressure_bound_ms` / `free_grace_ring_cap` publish the derived numbers in force so this page cannot drift from them |
+| `free_grace_bound` | the label the writer may reallocate up to; `free_grace_fence_bound_ms` / `free_grace_pressure_bound_ms` / `free_grace_ring_cap` publish the derived numbers in force so this page cannot drift from them. **`free_grace_fence_bound_ms` is the deadline IN FORCE** — it moves as rung 2 tightens it — and `free_grace_fence_bound_base_ms` is the un-tightened derivation beside it |
+| `free_grace_pressure_pct` | the graded pressure reading: `0` = the supply outlives the routine bound at the measured deferral rate (quiet), `100` = it is already gone. It is a RATE-derived forecast, not an occupancy: a nearly-empty ring under a violent storm reads high, which is the point |
+| `free_grace_prods` (rung 1) | grants that carried a shortened renewal cadence to a member the writer was waiting on. `0` on a quiet writer; growth under a storm is the ladder working, and `free_grace_prod_renew_ms` is the cadence currently being handed out (`0` = none in force). **Growth with `free_grace_bound` flat is the stop-and-read signal**: the ask is being delivered and not answered, so expect the fence next — check that reader's `meta_kv_revalidate_epochs` and its `free_grace_reader_acks` |
+| `free_grace_bound_tightenings` (rung 2) | harvests that evaluated a deadline below the routine bound. Its ratio against `free_grace_forced_releases` is the whole point of the valve: tightenings are supposed to be many and forced releases none. Both `0` while `free_grace_offsets` climbs means the valve is disarmed (`SQUEEZEFS_FREE_GRACE_VALVE=0`) |
 | `free_grace_reader_acks` (reader side — a reader's `.stats` reads `free_grace_mode: "reader"`, beside `free_grace_{learned,acked,reader_pending}_label`) | acknowledgements this reader has emitted. **Flat while the writer churns is the failure to look for** — it means this reader is holding the writer's free list. `learned` moving with `acked` flat says the revalidation pass is not advancing (check `meta_kv_revalidate_epochs`); a standing `reader_pending_label` says an acknowledgement is waiting out its drain window, which is normal |
 
 ## Observability

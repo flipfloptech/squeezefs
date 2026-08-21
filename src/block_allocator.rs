@@ -2277,12 +2277,37 @@ impl BlockAllocator {
     /// allocation funnel.
     ///
     /// Cost on a mount with no reader plane: one relaxed load
-    /// (`GraceRing::harvest` returns on an empty ring's published length).
+    /// (the empty-ring probe below), and nothing else — the free supply is
+    /// computed only once something is actually held.
     #[inline]
     fn harvest_grace(&self) {
-        for offset in self.grace.harvest(crate::free_grace::HARVEST_BATCH) {
+        if self.grace.is_empty() {
+            return;
+        }
+        let supply = self.free_supply_blocks();
+        for offset in self
+            .grace
+            .harvest_with_supply(crate::free_grace::HARVEST_BATCH, supply)
+        {
             self.publish_free_list(offset);
         }
+    }
+
+    /// Blocks this allocator could hand out right now — the SPACE half of
+    /// the §6.8 item-3 pressure signal (rung-20 residual 6): the free list
+    /// plus the virgin tail, which on a lane-partitioned volume is already
+    /// this writer's LANE share ([`Self::virgin_bytes`] divides by the
+    /// partition width), because lane-share exhaustion is the shape the
+    /// field convicted.
+    ///
+    /// `u64::MAX` on an unbounded allocator (offline tools, tests): space
+    /// is then not a constraint and only the ring's own headroom is.
+    fn free_supply_blocks(&self) -> u64 {
+        let virgin = self.virgin_bytes();
+        if virgin == u64::MAX {
+            return u64::MAX;
+        }
+        (virgin / self.chunk_size).saturating_add(self.free_blocks_count())
     }
 
     /// The PRESSURE harvest: what allocation runs when it is about to

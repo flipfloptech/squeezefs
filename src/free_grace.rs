@@ -108,6 +108,53 @@
 //! FENCED — never bypassed. Progress therefore comes from an eviction that
 //! is logged and counted, never from a silently broken promise.
 //!
+//! # The pressure-coupled release valve (rung-20 residual 6)
+//!
+//! The ruling above says what happens when the supply runs out; it does
+//! not stop the supply running out. The field showed it does, on the
+//! cadence alone: a rewrite storm's deferrals outrun the readers'
+//! releases on their natural beat, `free_grace_offsets` climbs
+//! monotonically and the lane's share follows it down
+//! (`.benchmarks/2026-08-19-blob-aware-merge-and-fabric-venue.md` §3 —
+//! 0 → 825 across one 8-rank row, never draining;
+//! `.benchmarks/2026-08-18-mw-field-mpiio-prep.md` §Residuals — 21,001
+//! deferrals against 17,751 releases with the machinery otherwise
+//! healthy). Ring capacity was never the binding constraint, so a bigger
+//! ring answers nothing: the writer must make the readers ANSWER SOONER.
+//!
+//! The valve is one graded signal feeding a three-rung ladder, cheapest
+//! coherence cost first. **The signal** ([`runway_ms`]) is arithmetic the
+//! ring can do on itself: its two end labels give the storm's own
+//! deferral rate, and the smaller of its headroom and the volume's free
+//! supply gives how many more offsets that rate may consume — so the
+//! reading is a TIME, comparable against the very bounds the plane
+//! publishes, and no threshold is a free-floating constant.
+//!
+//! | Rung | Act | Counted | Derivation |
+//! |---|---|---|---|
+//! | **(a) prod** | members the writer is waiting on are granted a SHORTER renewal cadence, and their answers already in hand are read at once instead of at the owner's sweep | `free_grace_prods` | [`ProdParams::cadence_for`] — the plane's own [`ack_cycle`] inverted against the runway, clamped into `[`[`ack_refresh_floor`]`, the routine cadence]` |
+//! | **(b) tighten** | the fence deadline slides from the routine bound toward the pressure bound as the runway shortens | `free_grace_bound_tightenings` | [`effective_bound_ms_from`] — linear between the two numbers the plane already derives; the FLOOR is one honest ack cycle, so a healthy reader is never fenced by the tightening |
+//! | **(c) force** | the existing arm: a forced release, always WITH the responsible member's eviction | `free_grace_forced_releases` / `free_grace_laggard_fences` | unchanged |
+//!
+//! Rung (a) needs no new wire field and no push channel: `Grant::renew_ms`
+//! IS what [`crate::membership::MemberSession::renew_at_ms`] — and hence
+//! the renewal loop's sleep — is computed from, so handing a laggard a
+//! shorter cadence on the beat it is already making is the ask. It rides
+//! the dedicated `sqz-lease` lane (finding 2's isolation), which is why a
+//! prod is deliverable under exactly the storm that provokes it.
+//!
+//! **What rung (a) may NOT do** is beat faster than the reader's ladder
+//! can produce a new answer, and the sharp edge there is not economy but
+//! correctness: every renewal re-learns a fresher label, so a cadence
+//! shorter than the ladder's qualification lag would refresh the target
+//! out from under every pass and the reader would acknowledge *nothing*
+//! (see [`ReaderAckLadder`], which snapshots a CANDIDATE precisely so that
+//! cannot happen, and [`ack_refresh_floor`], which is the cadence floor).
+//!
+//! `SQUEEZEFS_FREE_GRACE_VALVE=0` disarms rungs (a) and (b) — the A/B
+//! control, which restores the pre-campaign shape verbatim: the routine
+//! bound, the pressure bound at the allocation cliff, and nothing else.
+//!
 //! # Cost when unarmed (the shipped default)
 //!
 //! `SQUEEZEFS_MEMBERSHIP_BIND=off` is the default, so the common mount must
@@ -151,6 +198,36 @@ static HELD_OFFSETS: AtomicU64 = AtomicU64::new(0);
 static HELD_BYTES: AtomicU64 = AtomicU64::new(0);
 static READER_ACKS: AtomicU64 = AtomicU64::new(0);
 
+// -- the pressure valve's words (rung-20 residual 6) ------------------------
+
+/// Rung (a): grants handed a tightened renewal cadence.
+static PRODS: AtomicU64 = AtomicU64::new(0);
+/// Rung (b): harvests that evaluated a deadline below the routine bound.
+static BOUND_TIGHTENINGS: AtomicU64 = AtomicU64::new(0);
+/// The live pressure reading — how long the writer's supply lasts at the
+/// storm's measured deferral rate. `u64::MAX` = no reading.
+static RUNWAY_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Owner-clock instant past which [`RUNWAY_MS`] is stale (a pressured
+/// writer refreshes it at every free; a quiet one lets it expire).
+static RUNWAY_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+/// The tightened renewal cadence in force, ms (`0` = no prod).
+static PROD_RENEW_MS: AtomicU64 = AtomicU64::new(0);
+/// Owner-clock expiry of the prod (same lifetime rule as the reading).
+static PROD_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+/// The NEWEST label the plane is holding: a member that has acknowledged
+/// past it is holding nothing and is not prodded.
+///
+/// Deliberately the newest and not the oldest — the label at the front is
+/// the one this very harvest is about to release, so a member that just
+/// answered it reads as "caught up" for the instant between its beat and
+/// the writer's next free, and under a storm that instant is every beat.
+/// "Is there anything held that this member has not acknowledged" is the
+/// question that survives the storm.
+static PROD_LABEL: AtomicU64 = AtomicU64::new(0);
+/// Owner-clock instant of the last pressure-driven bound recomputation —
+/// the rate limiter for rung (a)'s second half (the minimum is O(members)).
+static LAST_BOUND_REFRESH_MS: AtomicU64 = AtomicU64::new(0);
+
 /// The owner-side plane parameters. Held behind an `ArcSwapOption` (the
 /// `membership::INSTALLED` / `dlm_slot::SLOT_OWNERS` precedent): replaced
 /// wholesale at arm, dropped at disarm, read lock-free.
@@ -163,8 +240,21 @@ struct Plane {
     /// before the laggard is evicted.
     fence_ms: u64,
     /// The pressure fence bound (≤ `fence_ms`, never below one ack cycle):
-    /// what allocation evaluates when it is about to refuse `StorageFull`.
+    /// what allocation evaluates when it is about to refuse `StorageFull`,
+    /// and the FLOOR rung (b) tightens toward.
     pressure_fence_ms: u64,
+    /// Rung (a)'s cadence law — `None` when the plane was armed without
+    /// its clocks (the deterministic test seam) or when the operator
+    /// disarmed the valve.
+    prod: Option<ProdParams>,
+    /// `false` ⇒ rungs (a) and (b) stand down (`SQUEEZEFS_FREE_GRACE_VALVE=0`,
+    /// the A/B control): the routine and pressure bounds behave exactly as
+    /// they did before the valve landed.
+    valve: bool,
+    /// How long one pressure reading stays live without a refresh. The
+    /// routine renewal cadence where it is known: past one beat with no
+    /// harvest, whatever the storm was doing is over.
+    reading_ttl_ms: u64,
 }
 
 static PLANE: once_cell::sync::Lazy<ArcSwapOption<Plane>> =
@@ -186,7 +276,7 @@ pub fn bound() -> u64 {
 }
 
 /// The routine fence bound in ms (`0` = no plane).
-pub fn fence_bound_ms() -> u64 {
+pub fn fence_bound_base_ms() -> u64 {
     PLANE.load().as_ref().map(|p| p.fence_ms).unwrap_or(0)
 }
 
@@ -228,21 +318,50 @@ pub fn arm_owner_plane(clock: LeaseClock, clocks: &LeaseClocks) -> Result<()> {
     let fence = resolve_fence_bound(clocks)?;
     // The pressure deadline is half the routine bound, floored at one ack
     // cycle: allocation is entitled to progress sooner than the routine
-    // sweep, but never sooner than a healthy reader can answer.
+    // sweep, but never sooner than a healthy reader can answer. It is also
+    // rung (b)'s floor.
     let cycle = ack_cycle(clocks);
     let pressure = (fence / 2).max(cycle).min(fence);
-    arm_owner_plane_with(clock, fence, pressure);
+    arm_plane(clock, fence, pressure, Some(ProdParams::derive(clocks)));
     Ok(())
 }
 
 /// Arm with explicit bounds — the deterministic test seam (and the form
 /// [`arm_owner_plane`] resolves into).
+///
+/// Rung (a) stands down here: the prodded cadence is a statement about the
+/// READER's ladder, and a plane armed without the clocks that ladder runs
+/// on has nothing honest to say about it. Rung (b) and the fence arm are
+/// fully live.
 pub fn arm_owner_plane_with(clock: LeaseClock, fence: Duration, pressure: Duration) {
+    arm_plane(clock, fence, pressure, None);
+}
+
+fn arm_plane(clock: LeaseClock, fence: Duration, pressure: Duration, prod: Option<ProdParams>) {
+    // The A/B control is read ONCE, at arm: the valve's hot path is the
+    // free path, and a knob read there would be a getenv per free.
+    let valve = crate::env_knobs::bool_knob("SQUEEZEFS_FREE_GRACE_VALVE", true);
+    let prod = if valve { prod } else { None };
+    let reading_ttl_ms = prod
+        .map(|p| p.renew_ms)
+        .unwrap_or_else(|| pressure.as_millis() as u64);
     PLANE.store(Some(Arc::new(Plane {
         clock,
         fence_ms: fence.as_millis() as u64,
         pressure_fence_ms: pressure.as_millis() as u64,
+        prod,
+        valve,
+        reading_ttl_ms,
     })));
+    if !valve {
+        log::warn!(
+            "freed-offset grace period: the pressure-coupled release valve is DISARMED \
+             (SQUEEZEFS_FREE_GRACE_VALVE=0, the A/B control) — readers keep their routine \
+             renewal cadence under write pressure and the fence deadline never tightens, so a \
+             storm whose deferrals outrun the releases reaches ENOSPC (free_grace_alloc_stalls) \
+             and then the fence, exactly as it did before rung-20 residual 6"
+        );
+    }
     log::info!(
         "freed-offset grace period armed (spec §6.8 item 3): a terminally-freed offset is not \
          reallocatable until every live reader has acknowledged passing it. Grace bound {:?} \
@@ -391,6 +510,116 @@ pub fn resolve_fence_bound(clocks: &LeaseClocks) -> Result<Duration> {
 }
 
 // ---------------------------------------------------------------------------
+// The pressure valve's derivations (rung-20 residual 6)
+// ---------------------------------------------------------------------------
+
+/// **The graded pressure signal**: how long the writer's supply lasts at
+/// the storm's own measured deferral rate, in ms. `None` = no reading.
+///
+/// Every term comes from state the ring already holds, so the signal costs
+/// two peeks of a deque the harvest locks anyway:
+///
+/// * the **rate** is `held ÷ (newest label − oldest label)` — the labels
+///   are owner-clock milliseconds and the deque is label-ordered by
+///   construction, so its two ends ARE the measurement window. Fewer than
+///   two entries carry no rate at all, and reading one as a cliff would
+///   fence a reader for a single free;
+/// * the **supply** is the smaller of the ring's headroom (`cap − held`,
+///   the RAM bound) and the volume's free blocks (the space bound — the
+///   one the field's 32 GiB lane hit; on a lane-partitioned volume this is
+///   the LANE's share, because `virgin_bytes` already divides by the
+///   partition width).
+///
+/// A burst that lands inside one millisecond reads as a zero runway rather
+/// than a division by zero, which is honest: at that rate the supply is
+/// already gone.
+pub fn runway_ms(held: u64, span_ms: u64, cap: usize, free_supply_blocks: u64) -> Option<u64> {
+    if held < 2 {
+        return None;
+    }
+    let headroom = (cap as u64).saturating_sub(held);
+    let supply = headroom.min(free_supply_blocks);
+    // `span/held` is the mean inter-arrival time of the measurement
+    // window; a sub-millisecond window rounds to 0 and the answer with it.
+    Some(supply.saturating_mul(span_ms) / held)
+}
+
+/// **Rung (b)**: the fence deadline in force for a given runway — the
+/// routine bound when there is nothing to say, the pressure bound at the
+/// cliff, and a straight line between (so there is no threshold cliff to
+/// oscillate across).
+///
+/// `pressure_ms` is the FLOOR by construction (`arm_owner_plane` derives
+/// it as at least one honest [`ack_cycle`]), which is what keeps rung (b)
+/// from ever fencing a reader that is answering as designed.
+pub fn effective_bound_ms_from(runway_ms: Option<u64>, fence_ms: u64, pressure_ms: u64) -> u64 {
+    let Some(runway) = runway_ms else {
+        return fence_ms;
+    };
+    if fence_ms <= pressure_ms {
+        return fence_ms;
+    }
+    let runway = runway.min(fence_ms);
+    // u128 so a long runway against a long bound cannot overflow the
+    // product on the way to a value that is at most `fence_ms`.
+    let slack = (u128::from(fence_ms - pressure_ms) * u128::from(runway)) / u128::from(fence_ms);
+    pressure_ms.saturating_add(slack as u64)
+}
+
+/// The shortest interval at which a member's acknowledgement can carry
+/// something NEW: its revalidation pass cadence (nothing about a reader's
+/// answer changes between two passes) floored at the clock-skew/RTT bound
+/// (nothing about the wire's answer changes faster than that).
+///
+/// This is rung (a)'s cadence floor, and it is a correctness floor as much
+/// as an economy one — see [`ReaderAckLadder`].
+pub fn ack_refresh_floor(clocks: &LeaseClocks) -> Duration {
+    crate::ro_coherence::reader_revalidate_interval().max(clocks.skew_max)
+}
+
+/// **Rung (a)'s law**: the plane's own [`ack_cycle`] inverted against the
+/// measured runway, resolved ONCE at arm because the free path may not pay
+/// a knob read or a poller construction per free.
+#[derive(Debug, Clone, Copy)]
+pub struct ProdParams {
+    /// The routine renewal cadence — the prod's ceiling (a "prod" that
+    /// slowed a member down would not be one).
+    renew_ms: u64,
+    /// The terms of the cycle a faster beat CANNOT shrink: the reader's
+    /// three staleness bounds, the skew and `D_purge`.
+    reader_lag_ms: u64,
+    /// [`ack_refresh_floor`].
+    floor_ms: u64,
+}
+
+impl ProdParams {
+    /// Resolve from the plane's clocks (one poller construction, at arm).
+    pub fn derive(clocks: &LeaseClocks) -> Self {
+        let renew_ms = clocks.renew_interval.as_millis() as u64;
+        let cycle_ms = ack_cycle(clocks).as_millis() as u64;
+        Self {
+            renew_ms,
+            reader_lag_ms: cycle_ms.saturating_sub(renew_ms.saturating_mul(3)),
+            floor_ms: ack_refresh_floor(clocks).as_millis() as u64,
+        }
+    }
+
+    /// The cadence to grant a member the writer is waiting on, or `None`
+    /// when the routine one already fits inside the runway.
+    ///
+    /// `ack_cycle = 3 × beat + reader_lag`, so the beat that lets a whole
+    /// acknowledgement cycle complete before the supply runs out is
+    /// `(runway − reader_lag) / 3`. Below the floor the answer cannot
+    /// arrive any sooner however hard the writer asks — that is when rung
+    /// (b) takes over.
+    pub fn cadence_for(&self, runway_ms: u64) -> Option<u64> {
+        let want = runway_ms.saturating_sub(self.reader_lag_ms) / 3;
+        let cadence = want.clamp(self.floor_ms.min(self.renew_ms), self.renew_ms);
+        (cadence < self.renew_ms).then_some(cadence)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The ring: one per allocator
 // ---------------------------------------------------------------------------
 
@@ -501,7 +730,16 @@ impl GraceRing {
     /// at the allocation funnel. The returned offsets are OWED a free-list
     /// publish by the caller (the allocator, which owns the free list).
     pub fn harvest(&self, max: usize) -> Vec<u64> {
-        self.harvest_with(max, false)
+        self.harvest_with(max, false, u64::MAX)
+    }
+
+    /// The routine harvest with the volume's free supply attached — the
+    /// allocator's form, and the one that can read SPACE pressure (the
+    /// field's binding constraint: the ring was nowhere near its cap when
+    /// the 32 GiB lane ran out). `u64::MAX` = space is not a constraint
+    /// here (an unbounded/offline allocator).
+    pub fn harvest_with_supply(&self, max: usize, free_supply_blocks: u64) -> Vec<u64> {
+        self.harvest_with(max, false, free_supply_blocks)
     }
 
     /// The pressure harvest: identical, except the fence deadline is the
@@ -510,36 +748,62 @@ impl GraceRing {
     /// member responsible — pressure buys promptness, never a broken
     /// promise (see the module docs' pressure ruling).
     pub fn harvest_pressure(&self, max: usize) -> Vec<u64> {
-        self.harvest_with(max, true)
+        // Allocation is about to refuse: the supply IS gone, whatever the
+        // ring's own arithmetic would have estimated.
+        self.harvest_with(max, true, 0)
     }
 
-    fn harvest_with(&self, max: usize, pressure: bool) -> Vec<u64> {
+    fn harvest_with(&self, max: usize, pressure: bool, free_supply_blocks: u64) -> Vec<u64> {
         if self.len.load(Ordering::Acquire) == 0 {
             return Vec::new();
         }
         let mut bound = bound();
-        let oldest = {
+        let (oldest, newest, runway) = {
             let guard = self.entries.lock();
-            guard.front().map(|e| e.label)
+            let ends = guard.front().zip(guard.back());
+            let runway = ends.and_then(|(f, b)| {
+                runway_ms(
+                    guard.len() as u64,
+                    b.label.saturating_sub(f.label),
+                    self.cap,
+                    free_supply_blocks,
+                )
+            });
+            (
+                guard.front().map(|e| e.label),
+                guard.back().map(|e| e.label).unwrap_or(0),
+                runway,
+            )
         };
+        // The cliff reads as a zero runway (see `harvest_pressure`), which
+        // is exactly the pressure bound through the graded form — the
+        // pre-valve behaviour of this arm, reproduced rather than special-cased.
+        let runway = if pressure { Some(0) } else { runway };
+        note_pressure(runway, newest);
         let mut forced = false;
         if let Some(oldest) = oldest {
             if oldest > bound {
                 let over_cap = self.len.load(Ordering::Acquire) >= self.cap;
-                let deadline_ms = if pressure {
-                    pressure_bound_ms()
-                } else {
-                    fence_bound_ms()
-                };
+                let deadline_ms = tightened_bound_ms(runway);
                 let now = owner_now_ms().unwrap_or(0);
                 let expired = deadline_ms > 0 && now.saturating_sub(deadline_ms) >= oldest;
                 if expired || over_cap {
-                    let why = if expired {
-                        "the grace bound expired"
+                    // Name the deadline that actually fired: an operator
+                    // reading a fence at 40 s against a routine bound of
+                    // 76 s must be told rung (b) moved it, and why.
+                    let base = fence_bound_base_ms();
+                    let why = if !expired {
+                        "the grace ring reached its cap".to_string()
+                    } else if deadline_ms < base {
+                        format!(
+                            "the grace bound expired at {deadline_ms} ms — TIGHTENED from \
+                             {base} ms by the pressure valve, because the writer's supply \
+                             would not have lasted the routine bound"
+                        )
                     } else {
-                        "the grace ring reached its cap"
+                        format!("the grace bound expired ({deadline_ms} ms)")
                     };
-                    force_progress(oldest, why);
+                    force_progress(oldest, &why);
                     // Re-read: `force_progress` recomputes the true minimum
                     // (which may simply have been a stale cadence-published
                     // value) and republishes it after any eviction.
@@ -610,6 +874,115 @@ impl GraceRing {
         }
         self.entries.lock().iter().any(|e| e.offset == offset)
     }
+}
+
+/// **Rung (b)** — the fence deadline this harvest evaluates, and the
+/// counting of the act.
+///
+/// The counter is incremented HERE rather than in [`effective_bound_ms`]
+/// (the gauge) on purpose: a tightening is a decision a harvest made, not
+/// a number an operator read.
+fn tightened_bound_ms(runway: Option<u64>) -> u64 {
+    let plane = PLANE.load();
+    let Some(plane) = plane.as_ref() else {
+        return 0;
+    };
+    if !plane.valve {
+        // The A/B control: the routine bound, and the pressure bound only
+        // at the allocation cliff — the pre-valve arm, verbatim.
+        return match runway {
+            Some(0) => plane.pressure_fence_ms,
+            _ => plane.fence_ms,
+        };
+    }
+    let eff = effective_bound_ms_from(runway, plane.fence_ms, plane.pressure_fence_ms);
+    if eff < plane.fence_ms {
+        BOUND_TIGHTENINGS.fetch_add(1, Ordering::Relaxed);
+    }
+    eff
+}
+
+/// **Rung (a)** — publish the pressure reading and, when the runway is
+/// short enough that the routine beat cannot fit an acknowledgement cycle
+/// inside it, ask the members the writer is waiting on to come back
+/// sooner.
+///
+/// Two acts, both cheap and both bounded:
+///
+/// 1. the tightened cadence is deposited for [`take_prod_cadence`], which
+///    the owner's renewal path hands to a member that is actually behind;
+/// 2. the bound is recomputed ONCE PER PRODDED CADENCE — the interval at
+///    which a member's answer can change — so a storm does not pay the
+///    O(members) minimum per free to learn what the owner's sweep would
+///    have told it anyway.
+///
+/// The reading is deliberately last-writer-wins across volumes rather than
+/// a maintained minimum: a pressured volume harvests orders of magnitude
+/// more often than a quiet one, so the busy answer dominates by frequency,
+/// and a stale one expires on its own within one routine beat.
+fn note_pressure(runway: Option<u64>, newest_label: u64) {
+    let plane = PLANE.load();
+    let Some(plane) = plane.as_ref() else {
+        return;
+    };
+    if !plane.valve {
+        return;
+    }
+    let Some(runway) = runway else {
+        // This ring has no rate to report. Never relax a live reading from
+        // a busier volume on the strength of a quiet one — let it expire.
+        return;
+    };
+    let now = plane.clock.now_ms();
+    RUNWAY_MS.store(runway, Ordering::Relaxed);
+    RUNWAY_UNTIL_MS.store(now.saturating_add(plane.reading_ttl_ms), Ordering::Relaxed);
+    let Some(cadence) = plane.prod.as_ref().and_then(|p| p.cadence_for(runway)) else {
+        return;
+    };
+    PROD_RENEW_MS.store(cadence, Ordering::Relaxed);
+    PROD_LABEL.fetch_max(newest_label, Ordering::Relaxed);
+    PROD_UNTIL_MS.store(now.saturating_add(plane.reading_ttl_ms), Ordering::Relaxed);
+    let last = LAST_BOUND_REFRESH_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= cadence {
+        LAST_BOUND_REFRESH_MS.store(now, Ordering::Relaxed);
+        if let Some(owner) = crate::membership::installed_owner() {
+            owner.refresh_free_grace_bound();
+        }
+    }
+}
+
+/// The tightened renewal cadence to grant `acked_free_epoch`'s member, and
+/// the act of counting the ask (rung (a)'s engagement instrument) —
+/// called at the ONE place a cadence is handed out, the owner's renewal.
+///
+/// `None` when no prod is in force, when the reading has expired, or when
+/// this member has already acknowledged past everything the plane holds:
+/// prodding a member that is not holding the free list would buy nothing
+/// and cost it beats.
+pub fn take_prod_cadence(acked_free_epoch: u64) -> Option<u64> {
+    let cadence = PROD_RENEW_MS.load(Ordering::Relaxed);
+    if cadence == 0 {
+        return None;
+    }
+    let now = owner_now_ms()?;
+    if now >= PROD_UNTIL_MS.load(Ordering::Relaxed) {
+        return None;
+    }
+    if acked_free_epoch >= PROD_LABEL.load(Ordering::Relaxed) {
+        return None;
+    }
+    PRODS.fetch_add(1, Ordering::Relaxed);
+    Some(cadence)
+}
+
+/// The live pressure reading in ms (`None` = none, or stale).
+fn live_runway_ms() -> Option<u64> {
+    let runway = RUNWAY_MS.load(Ordering::Relaxed);
+    if runway == u64::MAX {
+        return None;
+    }
+    let now = owner_now_ms()?;
+    (now < RUNWAY_UNTIL_MS.load(Ordering::Relaxed)).then_some(runway)
 }
 
 /// **"A reader that fails to acknowledge is fenced, not waited on."**
@@ -735,8 +1108,27 @@ pub struct AckInputs {
 /// A newer label never displaces a pending one until it has been
 /// acknowledged, so the ladder cannot starve when the renewal cadence is
 /// shorter than the drain window.
+///
+/// **The candidate, and why it is a word of its own** (rung-20 residual 6):
+/// condition (2) is measured against the instant the label was LEARNED,
+/// and every renewal re-learns a fresher label. Qualifying against
+/// whatever the newest renewal carries therefore starves the ladder
+/// outright whenever the renewal cadence is shorter than
+/// `staleness + skew_max` — each beat moves the target further away than
+/// the passes can walk, no pass ever qualifies, and the reader
+/// acknowledges NOTHING while the writer's ring climbs for ever. That is
+/// reachable with no valve at all (a writer at
+/// `SQUEEZEFS_META_FLUSH_INTERVAL_MS=5000` derives a 6 s qualification lag
+/// plus a 5 s pass cadence against a 10 s beat), and rung (a) would make
+/// it reachable by design. So the ladder SNAPSHOTS the label it is working
+/// on: fresher labels wait their turn, and a faster beat only ever makes
+/// the snapshot fresher.
 #[derive(Debug)]
 pub struct ReaderAckLadder {
+    /// The label the ladder is currently working on, and the member-clock
+    /// instant IT was learned at — fixed until it is acknowledged.
+    candidate: AtomicU64,
+    candidate_at_ms: AtomicU64,
     qualified: AtomicU64,
     ready_at_ms: AtomicU64,
     acked: AtomicU64,
@@ -752,6 +1144,8 @@ impl ReaderAckLadder {
     /// An empty ladder (nothing qualified, nothing acknowledged).
     pub const fn new() -> Self {
         Self {
+            candidate: AtomicU64::new(0),
+            candidate_at_ms: AtomicU64::new(0),
             qualified: AtomicU64::new(0),
             ready_at_ms: AtomicU64::new(0),
             acked: AtomicU64::new(0),
@@ -763,26 +1157,40 @@ impl ReaderAckLadder {
     pub fn note_pass(&self, i: AckInputs) -> Option<u64> {
         let pending = self.qualified.load(Ordering::Acquire);
         let acked = self.acked.load(Ordering::Acquire);
-        // (1) + (2): qualify a NEW label only when the previous candidate
-        // has been acknowledged — a pending candidate is always the oldest
-        // (and therefore the soonest-ready) statement we can make.
+        // (0) Adopt a candidate when nothing is in flight. From here the
+        // ladder aims at THIS label until it is acknowledged — a later,
+        // fresher label is a better statement, but chasing it is how a
+        // short renewal cadence starves the ladder (see the type docs).
+        let mut candidate = self.candidate.load(Ordering::Acquire);
+        if pending <= acked && candidate <= acked && i.label > acked {
+            self.candidate.store(i.label, Ordering::Release);
+            self.candidate_at_ms
+                .store(i.learned_at_ms, Ordering::Release);
+            candidate = i.label;
+        }
+        // (1) + (2): qualify the CANDIDATE — a pending one is always the
+        // oldest (and therefore the soonest-ready) statement we can make.
         if i.advanced
-            && i.label > pending
+            && candidate > acked
             && pending <= acked
-            && i.pass_start_ms >= i.learned_at_ms.saturating_add(i.qualify_lag_ms)
+            && i.pass_start_ms
+                >= self
+                    .candidate_at_ms
+                    .load(Ordering::Acquire)
+                    .saturating_add(i.qualify_lag_ms)
         {
-            self.qualified.store(i.label, Ordering::Release);
+            self.qualified.store(candidate, Ordering::Release);
             self.ready_at_ms
                 .store(i.now_ms.saturating_add(i.drain_lag_ms), Ordering::Release);
         }
         // (3): promote once the drain window has elapsed.
-        let candidate = self.qualified.load(Ordering::Acquire);
-        if candidate > self.acked.load(Ordering::Acquire)
+        let qualified = self.qualified.load(Ordering::Acquire);
+        if qualified > self.acked.load(Ordering::Acquire)
             && i.now_ms >= self.ready_at_ms.load(Ordering::Acquire)
         {
-            self.acked.store(candidate, Ordering::Release);
+            self.acked.store(qualified, Ordering::Release);
             READER_ACKS.fetch_add(1, Ordering::Relaxed);
-            return Some(candidate);
+            return Some(qualified);
         }
         None
     }
@@ -888,6 +1296,57 @@ pub fn reader_acks() -> u64 {
     READER_ACKS.load(Ordering::Relaxed)
 }
 
+/// **Rung (a)**: grants that carried a tightened renewal cadence to a
+/// member the writer was waiting on. 0 on a quiet writer; growth under a
+/// storm is the ladder working. Growth with `free_grace_bound` flat means
+/// the ask is being delivered and not answered — expect rung (c) next.
+pub fn prods() -> u64 {
+    PRODS.load(Ordering::Relaxed)
+}
+
+/// **Rung (b)**: harvests that evaluated a deadline below the routine
+/// bound. 0 on a quiet writer; the ratio against
+/// `free_grace_forced_releases` is the point of the whole valve —
+/// tightenings are supposed to be many and forced releases none.
+pub fn bound_tightenings() -> u64 {
+    BOUND_TIGHTENINGS.load(Ordering::Relaxed)
+}
+
+/// The graded pressure reading, 0 (quiet) … 100 (the supply is gone at the
+/// measured deferral rate) — `100 − runway ÷ the routine bound`, so it is
+/// the same comparison rung (b) makes, expressed for a human.
+pub fn pressure_pct() -> u64 {
+    let fence = fence_bound_base_ms();
+    match (live_runway_ms(), fence) {
+        (Some(runway), f) if f > 0 => 100 - (runway.min(f) * 100 / f),
+        _ => 0,
+    }
+}
+
+/// The fence deadline IN FORCE (the `write_pipeline_depth_target` /
+/// `..._base` precedent: the unadorned name is what the machinery is
+/// enforcing, `fence_bound_base_ms` is the un-tightened derivation).
+pub fn effective_bound_ms() -> u64 {
+    let plane = PLANE.load();
+    let Some(plane) = plane.as_ref() else {
+        return 0;
+    };
+    if !plane.valve {
+        return plane.fence_ms;
+    }
+    effective_bound_ms_from(live_runway_ms(), plane.fence_ms, plane.pressure_fence_ms)
+}
+
+/// The tightened renewal cadence being handed to laggards right now, ms
+/// (`0` = none in force).
+pub fn prod_renew_ms() -> u64 {
+    let cadence = PROD_RENEW_MS.load(Ordering::Relaxed);
+    match owner_now_ms() {
+        Some(now) if now < PROD_UNTIL_MS.load(Ordering::Relaxed) => cadence,
+        _ => 0,
+    }
+}
+
 /// The item-3 block of the stats inode (merged by `fuse_client`, the
 /// `membership::stats_snapshot` precedent): an unarmed mount exports the
 /// posture word alone rather than a block of zeroes that would read like a
@@ -924,9 +1383,17 @@ pub fn stats_snapshot() -> serde_json::Value {
         "free_grace_laggard_fences": laggard_fences(),
         "free_grace_alloc_stalls": alloc_stalls(),
         "free_grace_reader_acks": reader_acks(),
-        "free_grace_fence_bound_ms": fence_bound_ms(),
+        // The bound IN FORCE, and the un-tightened derivation beside it:
+        // a tightening only the machinery knows about is a promise the
+        // operator cannot read (rung-20 residual 6).
+        "free_grace_fence_bound_ms": effective_bound_ms(),
+        "free_grace_fence_bound_base_ms": fence_bound_base_ms(),
         "free_grace_pressure_bound_ms": pressure_bound_ms(),
         "free_grace_ring_cap": derived_ring_cap(),
+        "free_grace_pressure_pct": pressure_pct(),
+        "free_grace_prods": prods(),
+        "free_grace_bound_tightenings": bound_tightenings(),
+        "free_grace_prod_renew_ms": prod_renew_ms(),
     })
 }
 
@@ -945,9 +1412,19 @@ pub fn reset_for_test() {
         &HELD_OFFSETS,
         &HELD_BYTES,
         &READER_ACKS,
+        &PRODS,
+        &BOUND_TIGHTENINGS,
+        &RUNWAY_UNTIL_MS,
+        &PROD_RENEW_MS,
+        &PROD_UNTIL_MS,
+        &PROD_LABEL,
+        &LAST_BOUND_REFRESH_MS,
     ] {
         c.store(0, Ordering::Relaxed);
     }
+    RUNWAY_MS.store(u64::MAX, Ordering::Relaxed);
+    LADDER.candidate.store(0, Ordering::Relaxed);
+    LADDER.candidate_at_ms.store(0, Ordering::Relaxed);
     LADDER.qualified.store(0, Ordering::Relaxed);
     LADDER.ready_at_ms.store(0, Ordering::Relaxed);
     LADDER.acked.store(0, Ordering::Relaxed);

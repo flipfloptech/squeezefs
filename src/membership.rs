@@ -1251,6 +1251,7 @@ impl MembershipOwner {
         let now = self.clock.now_ms();
         let ttl = self.clocks.t_owner.as_millis() as u64;
         let mut seen_epoch = None;
+        let mut seen_acked = 0u64;
         let updated = self
             .members
             .update_sync(id, |_, st| {
@@ -1261,6 +1262,7 @@ impl MembershipOwner {
                 st.renewed_ms = now;
                 st.deadline_ms = now + ttl;
                 st.acked_free_epoch = st.acked_free_epoch.max(acked_free_epoch);
+                seen_acked = st.acked_free_epoch;
                 true
             })
             .unwrap_or(false);
@@ -1284,7 +1286,22 @@ impl MembershipOwner {
             return RenewOutcome::UnknownLease { reason };
         }
         METRICS.membership_renewals.fetch_add(1, Ordering::Relaxed);
-        RenewOutcome::Renewed(self.grant_for(epoch, now))
+        let mut grant = self.grant_for(epoch, now);
+        // **§6.8 item 3's pressure valve, rung (a)** (rung-20 residual 6):
+        // when the writer's freed-offset supply is running out faster than
+        // this member is acknowledging, it comes back SOONER. The grant's
+        // `renew_ms` is what `MemberSession::renew_at_ms` — and therefore
+        // the renewal loop's sleep — is computed from, so the ask needs no
+        // wire field and no push channel (a reader advertises no endpoint;
+        // there is nothing to push to), and it rides the isolated
+        // `sqz-lease` lane, which is why it is deliverable under exactly
+        // the storm that provokes it. A member that has already
+        // acknowledged past the label the writer is waiting on is not
+        // holding the free list and is not asked.
+        if let Some(prod_ms) = crate::free_grace::take_prod_cadence(seen_acked) {
+            grant.renew_ms = prod_ms;
+        }
+        RenewOutcome::Renewed(grant)
     }
 
     /// A clean departure (unmount): the member leaves the census

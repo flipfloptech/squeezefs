@@ -91,7 +91,19 @@ set -g FS $argv[1]
 test -n "$FS"; or die "usage: "(status basename)" <"(string join '|' $FS_LIST)"> | --list"
 contains -- $FS $FS_LIST; or die "unknown filesystem '$FS' (known: $FS_LIST)"
 test (id -u) -eq 0; or die "must run as root (loop mount)"
-command -q mkfs.$FS; or die "mkfs.$FS not found — install its tools (see the header)"
+# The mkfs tools ride shell.nix, and `sudo` does NOT carry the caller's
+# PATH — so a plain `sudo ./script.fish ext4` finds only the system-wide
+# tools (on a btrfs-root NixOS box that is btrfs-progs alone, which is
+# exactly why the btrfs leg works and the others do not). Name the fix
+# here rather than in a header the operator already scrolled past.
+if not command -q mkfs.$FS
+    set -l hint "install its tools, or run inside nix-shell"
+    if set -q SUDO_USER
+        set hint "you ran sudo WITHOUT carrying your shell PATH — re-run:
+    sudo env \"PATH=\$PATH\" fish "(status basename)" $FS"
+    end
+    die "mkfs.$FS not found — $hint"
+end
 
 # Reuse the binary the --build step left behind; rebuild only if it is
 # missing or older than its source (and only if a compiler is reachable —

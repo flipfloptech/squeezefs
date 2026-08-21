@@ -1,4 +1,15 @@
-#!/usr/bin/env fish
+#!/usr/bin/env -S fish --no-config
+#
+# `--no-config` is load-bearing under sudo on NixOS: fish sources
+# /etc/fish/config.fish even non-interactively, whose preinit re-runs the
+# system `set-environment` whenever __NIXOS_SET_ENVIRONMENT_DONE is absent
+# (sudo scrubs it) — and that script REPLACES PATH wholesale
+# (`export PATH="$HOME/.local/...:/run/current-system/sw/bin"`). The PATH
+# `sudo env "PATH=$PATH"` carefully carried in was therefore discarded
+# before the first line of this script ran, leaving only the system-wide
+# tools: btrfs-progs present, every other mkfs gone. Verified by
+# reproduction (`env -i PATH=… HOME=/root fish -c 'command -q mkfs.ext4'`
+# answers NO; the same with --no-config answers YES).
 # zero_len_readfixed_matrix — run the zero-length READ_FIXED probe across
 # filesystems on loopback images, one filesystem per invocation.
 #
@@ -13,13 +24,21 @@
 # binary the first step left in $STATE):
 #
 #   fish zero_len_readfixed_matrix.fish --build              # in nix-shell
-#   sudo env "PATH=$PATH" fish zero_len_readfixed_matrix.fish btrfs
-#   sudo env "PATH=$PATH" fish zero_len_readfixed_matrix.fish xfs   # negative control
+#   sudo env "PATH=$PATH" ./zero_len_readfixed_matrix.fish btrfs
+#   sudo env "PATH=$PATH" ./zero_len_readfixed_matrix.fish xfs   # negative control
 #   fish zero_len_readfixed_matrix.fish --list               # no root needed
 #
 # The repo's shell.nix carries gcc, liburing and every mkfs tool the sweep
 # uses, so `nix-shell` (or direnv) + the two lines above is the whole
 # story. PROBE_BIN=<path> overrides the binary if you built it elsewhere.
+
+# Belt and braces for the invocation forms that DO load fish's config
+# (`sudo env "PATH=$PATH" fish this-script …`, or any distro with the same
+# habit): SQZ_TOOLS_PATH is a name nothing in the system environment
+# rewrites, so its entries are re-prepended here after the damage.
+if set -q SQZ_TOOLS_PATH
+    set -gx PATH (string split ':' -- $SQZ_TOOLS_PATH) $PATH
+end
 
 set -g FS_LIST btrfs ext4 ext2 xfs f2fs exfat
 set -g IMG_MB 512
@@ -99,8 +118,13 @@ test (id -u) -eq 0; or die "must run as root (loop mount)"
 if not command -q mkfs.$FS
     set -l hint "install its tools, or run inside nix-shell"
     if set -q SUDO_USER
-        set hint "you ran sudo WITHOUT carrying your shell PATH — re-run:
-    sudo env \"PATH=\$PATH\" fish "(status basename)" $FS"
+        set hint "the PATH sudo carried was lost before this script ran (fish's
+  NixOS config replaces it — see the shebang comment). Invoke the script
+  DIRECTLY so its --no-config shebang applies:
+    sudo env \"PATH=\$PATH\" ./"(status basename)" $FS
+  or, if you must run it through an explicit `fish`, pass the tools path
+  under a name the system environment does not rewrite:
+    sudo env \"SQZ_TOOLS_PATH=\$PATH\" fish "(status basename)" $FS"
     end
     die "mkfs.$FS not found — $hint"
 end

@@ -212,8 +212,8 @@ Thanks,
 2. **Reproduce on btrfs as root** (the run reuses the binary from step 1;
    `env "PATH=$PATH"` carries the shell's mkfs/mount tools through sudo):
    ```fish
-   sudo env "PATH=$PATH" fish \
-     docker/kernel-sqz/probes/zero_len_readfixed_matrix.fish btrfs
+   sudo env "PATH=$PATH" \
+     ./docker/kernel-sqz/probes/zero_len_readfixed_matrix.fish btrfs
    ```
    Expect: process killed, splat in `dmesg`, taint word non-zero.
 3. **Sweep the others**, one per boot for clean attribution (`ext4`,

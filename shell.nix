@@ -33,7 +33,9 @@ pkgs.mkShell {
     # "PATH=$PATH"` carries binaries but NOT NIX_CFLAGS_COMPILE, so a
     # compile under sudo cannot find liburing.h:
     #   fish docker/kernel-sqz/probes/zero_len_readfixed_matrix.fish --build
-    #   sudo env "PATH=$PATH" fish .../zero_len_readfixed_matrix.fish btrfs
+    #   sudo env "PATH=$PATH" ./docker/.../zero_len_readfixed_matrix.fish btrfs
+    # (invoke it DIRECTLY under sudo — its `--no-config` shebang is what
+    # stops fish's NixOS config from replacing the PATH sudo carried)
     pkgs.gcc
     pkgs.liburing
     pkgs.e2fsprogs

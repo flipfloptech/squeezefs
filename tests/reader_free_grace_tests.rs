@@ -90,6 +90,44 @@
 //! free_grace` does not exist, the allocator has no grace ring,
 //! `MembershipOwner::refresh_free_grace_bound` / `membership::
 //! installed_owner` / `MemberSession::learned_label` do not exist.
+//!
+//! ## The pressure-coupled release valve (rung-20 residual 6)
+//!
+//! The field convicted the cadence, not the mechanism: under a rewrite
+//! storm a writer's deferrals outrun the readers' releases on their
+//! NATURAL beat, `free_grace_offsets` climbs monotonically and the lane's
+//! share runs out (`.benchmarks/2026-08-19-blob-aware-merge-and-fabric-venue.md`
+//! §3 — 0 → 825 across one 8-rank row, never draining; the 2026-08-18
+//! prep row's 21,001 deferrals vs 17,751 releases is the same shape with
+//! the cadence merely slower than the rewrite rate). Contracts 13–18 pin
+//! the graded ladder that answers it:
+//!
+//! 13. **The convicted storm never reaches rung (c)**: the pressure signal
+//!     (the ring's own measured deferral rate against BOTH supplies — ring
+//!     headroom and the volume's free blocks) engages rungs (a) prod and
+//!     (b) tighten, allocation never stalls, and nothing is fenced.
+//! 14. **Rung (c) is intact**: a member that beats but never acknowledges
+//!     is prodded first and FENCED after — with its eviction, exactly as
+//!     the law says, and the writer progresses.
+//! 15. **The published bound is the bound in force**: the tightened
+//!     deadline is what `free_grace_fence_bound_ms` reads (the routine
+//!     derivation stays visible as `..._base_ms`), and the tightening
+//!     never crosses the floor of one honest acknowledgement cycle — the
+//!     number the READER's published staleness bound derives, which the
+//!     valve never moves.
+//! 16. **Unarmed engages no rung**: every valve gauge is 0 and no prod is
+//!     ever in force on the shipped default.
+//! 17. **Every threshold is derived**: the runway reading, the graded
+//!     deadline interpolation and the prodded cadence are pure functions
+//!     of numbers the plane already publishes (drift-is-red).
+//! 18. **A tightened cadence can never starve the ladder**: the
+//!     acknowledgement qualifies against the label the ladder SNAPSHOTTED,
+//!     never against whatever the newest renewal has since learned — a
+//!     beat faster than `staleness + skew_max` would otherwise refresh the
+//!     label out from under every pass and the reader would ack NOTHING,
+//!     which is the failure the valve exists to prevent (and which an
+//!     ordinary `SQUEEZEFS_META_FLUSH_INTERVAL_MS` already makes reachable
+//!     without any valve at all).
 
 use squeezefs::block_allocator::BlockAllocator;
 use squeezefs::block_reclaim::{ReclaimEntry, ReclaimQueue};
@@ -933,5 +971,545 @@ async fn readers_acknowledge_while_the_writer_frees_and_reallocates() {
         METRICS.block_double_frees.load(Ordering::Relaxed),
         doubles0,
         "no offset was published twice"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 13–18 — the pressure-coupled release valve (rung-20 residual 6)
+// ---------------------------------------------------------------------------
+
+/// One rewrite storm, driven deterministically on the manual clock.
+///
+/// The reader is modelled exactly as production runs it: `spawn_member_
+/// renewal` sleeps until `renew_at_ms`, which is `anchor + Grant::renew_ms`
+/// — so the cadence THE OWNER GRANTS is literally the reader's beat, and
+/// the value it carries home is the label its ladder promoted a beat
+/// earlier (`ack` lags `learned` by one beat, the ladder's own pipeline).
+struct Storm {
+    owner: Arc<MembershipOwner>,
+    clock: LeaseClock,
+    ticks: Arc<AtomicU64>,
+    id: &'static str,
+    epoch: u64,
+    /// `false` ⇒ the member beats but never advances its acknowledgement
+    /// (the operator page's "renewing but not acknowledging" laggard).
+    acknowledges: bool,
+    beat_at: u64,
+    learned: u64,
+    cadence: u64,
+    beats: u64,
+}
+
+impl Storm {
+    fn new(
+        owner: &Arc<MembershipOwner>,
+        clock: &LeaseClock,
+        ticks: &Arc<AtomicU64>,
+        id: &'static str,
+        grant: &Grant,
+        acknowledges: bool,
+    ) -> Self {
+        Self {
+            owner: Arc::clone(owner),
+            clock: clock.clone(),
+            ticks: Arc::clone(ticks),
+            id,
+            epoch: grant.epoch,
+            acknowledges,
+            beat_at: clock.now_ms(),
+            learned: 0,
+            cadence: grant.renew_ms,
+            beats: 0,
+        }
+    }
+
+    /// Advance the storm's clock by `step_ms` and run every beat that falls
+    /// due — the member's renewal loop, in the test's frame.
+    fn advance(&mut self, step_ms: u64) {
+        self.ticks.fetch_add(step_ms, Ordering::SeqCst);
+        while self.clock.now_ms() >= self.beat_at {
+            let carried = if self.acknowledges { self.learned } else { 0 };
+            let grant = match self.owner.renew(self.id, self.epoch, carried) {
+                RenewOutcome::Renewed(g) => g,
+                RenewOutcome::UnknownLease { reason } => {
+                    panic!("the member's beat was refused: {reason}")
+                }
+            };
+            self.learned = grant.granted_at_owner_ms;
+            self.cadence = grant.renew_ms.max(1);
+            self.beat_at = self.clock.now_ms() + self.cadence;
+            self.beats += 1;
+            self.owner.refresh_free_grace_bound();
+        }
+    }
+}
+
+/// **Contract 13 — the convicted shape** (rung-20 residual 6, first live
+/// capture 2026-08-19): a rewrite storm defers faster than a reader
+/// acknowledges on its natural 10 s beat, so `free_grace_offsets` climbs
+/// monotonically and the store's own supply runs out underneath it.
+///
+/// The fix is a graded ladder, not a bigger ring: the pressure signal (the
+/// ring's measured deferral rate against the SMALLER of its headroom and
+/// the volume's free supply) engages rung (a) — the writer asks the
+/// members it is waiting on to come back sooner, on a cadence derived by
+/// inverting the plane's own acknowledgement cycle against the measured
+/// runway — and rung (b) — the fence deadline slides from its routine
+/// value toward the pressure floor. Rungs (a)+(b) must make rung (c) (a
+/// forced release + the reader's eviction) and `free_grace_alloc_stalls`
+/// UNREACHABLE on this shape.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rewrite_storm_prods_readers_instead_of_stalling_allocation() {
+    let _serial = serial();
+    let (clock, ticks) = manual_clock();
+    let owner = armed_owner(&clock);
+    free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("derived bound");
+    let grant = join(&owner, "r-storm", MemberRole::Reader);
+    owner.refresh_free_grace_bound();
+
+    // A 24-block store rewritten through an 8-block working set: every
+    // pass mints one block and terminally frees one, which is the CoW
+    // rewrite shape whose displacement stream fills the ring. Scaled down
+    // from the field's 32 GiB lane; the RATIO (supply ÷ per-pass
+    // displacement) is what the signal reads.
+    const STORE_BLOCKS: u64 = 24;
+    const WORKING_SET: usize = 8;
+    const PASSES: usize = 200;
+    const STEP_MS: u64 = 500;
+
+    let ba = allocator("grace-storm").await;
+    ba.set_capacity_bytes(STORE_BLOCKS * ba.chunk_size());
+    let mut storm = Storm::new(&owner, &clock, &ticks, "r-storm", &grant, true);
+
+    let mut live: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+    for pass in 0..PASSES {
+        let fresh = ba.allocate_block().await.unwrap_or_else(|e| {
+            panic!(
+                "pass {pass}: the storm stalled ({e}) with {} offset(s) held in grace and \
+                 {} stall(s) counted — the pressure ladder must reach the reader before the \
+                 supply does (rung-20 residual 6)",
+                ba.grace_len(),
+                free_grace::alloc_stalls(),
+            )
+        });
+        live.push_back(fresh);
+        if live.len() > WORKING_SET {
+            let victim = live.pop_front().expect("a live block");
+            ba.free_block(victim).await.expect("free");
+        }
+        storm.advance(STEP_MS);
+    }
+
+    // Rung (a) and rung (b) engaged...
+    assert!(
+        free_grace::prods() > 0,
+        "the writer never asked the reader to come back sooner (rung a)"
+    );
+    assert!(
+        free_grace::bound_tightenings() > 0,
+        "the fence deadline never tightened under pressure (rung b)"
+    );
+    assert!(
+        storm.cadence < grant.renew_ms,
+        "the prodded beat ({} ms) must be shorter than the routine one ({} ms)",
+        storm.cadence,
+        grant.renew_ms
+    );
+    // ...so that rung (c) and the ENOSPC ruling are never reached.
+    assert_eq!(
+        free_grace::alloc_stalls(),
+        0,
+        "allocation stalled on space the readers owed back"
+    );
+    assert_eq!(
+        free_grace::forced_releases(),
+        0,
+        "a release without an acknowledgement is rung (c): the ladder must not have needed it"
+    );
+    assert_eq!(free_grace::laggard_fences(), 0, "nobody was fenced");
+    assert!(
+        owner.epoch_of("r-storm").is_some(),
+        "a reader that keeps up must survive the storm"
+    );
+
+    // The ring stayed bounded far below its cap (the climb is what the
+    // field convicted), and the ledger closes.
+    assert!(
+        ba.grace_len() < STORE_BLOCKS as usize,
+        "the grace ring held {} offset(s) on a {STORE_BLOCKS}-block store — it is climbing, \
+         not oscillating",
+        ba.grace_len()
+    );
+    assert_eq!(
+        free_grace::deferrals(),
+        free_grace::releases() + free_grace::held_offsets(),
+        "the closure law must hold across the storm"
+    );
+    assert!(
+        free_grace::deferrals() >= PASSES as u64 - WORKING_SET as u64,
+        "the storm must actually have exercised the ring"
+    );
+}
+
+/// **Contract 14 — rung (c) is intact.** The valve buys promptness, never
+/// a broken promise: a member that keeps beating but never acknowledges is
+/// prodded first (rung a), refused ENOSPC rather than served an offset it
+/// may still resolve (the ruling), and only then FENCED — together with
+/// its eviction, past a deadline that is at minimum one honest
+/// acknowledgement cycle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_member_that_never_acknowledges_is_prodded_then_fenced() {
+    let _serial = serial();
+    let (clock, ticks) = manual_clock();
+    let owner = armed_owner(&clock);
+    free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("derived bound");
+    let grant = join(&owner, "r-mute-storm", MemberRole::Reader);
+    owner.refresh_free_grace_bound();
+
+    let ba = allocator("grace-storm-mute").await;
+    ba.set_capacity_bytes(16 * ba.chunk_size());
+    let mut storm = Storm::new(&owner, &clock, &ticks, "r-mute-storm", &grant, false);
+
+    // Run the storm until the store is genuinely out of supply. Every
+    // allocation that refuses is the RULING working (counted, never a
+    // silent early release).
+    let mut live: Vec<u64> = Vec::new();
+    for _ in 0..64 {
+        match ba.allocate_block().await {
+            Ok(fresh) => live.push(fresh),
+            Err(e) => {
+                assert!(
+                    matches!(&e, SqueezefsError::Io(io)
+                        if io.kind() == std::io::ErrorKind::StorageFull),
+                    "the verdict on a mute reader is StorageFull, got {e:?}"
+                );
+                break;
+            }
+        }
+        if live.len() > 4 {
+            let victim = live.remove(0);
+            ba.free_block(victim).await.expect("free");
+        }
+        storm.advance(250);
+    }
+
+    assert!(
+        free_grace::prods() > 0,
+        "the ladder must ASK before it fences (rung a precedes rung c)"
+    );
+    assert!(
+        storm.beats > 1,
+        "the member kept beating; it just never acked"
+    );
+    assert_eq!(
+        free_grace::forced_releases(),
+        0,
+        "nothing may be released unacknowledged before the deadline"
+    );
+    assert_eq!(free_grace::laggard_fences(), 0);
+
+    // Past the deadline in force the laggard is fenced — with its S6
+    // eviction — and the writer progresses.
+    let evictions0 = METRICS.membership_evictions.load(Ordering::Relaxed);
+    let effective = free_grace::effective_bound_ms();
+    assert!(
+        effective >= free_grace::ack_cycle(owner.clocks()).as_millis() as u64,
+        "the tightened deadline ({effective} ms) fell below one honest acknowledgement cycle"
+    );
+    ticks.fetch_add(effective + 1, Ordering::SeqCst);
+    let _recovered = ba
+        .allocate_block()
+        .await
+        .expect("the writer must progress once the laggard is fenced");
+    assert!(
+        free_grace::laggard_fences() >= 1,
+        "progress came from something other than a fence"
+    );
+    assert!(free_grace::forced_releases() >= 1);
+    assert!(
+        METRICS.membership_evictions.load(Ordering::Relaxed) > evictions0,
+        "a forced release must happen WITH that member's eviction, never without it"
+    );
+    assert!(owner.epoch_of("r-mute-storm").is_none());
+}
+
+/// **Contract 15 — the published bound is the bound in force.** A
+/// tightening that only the machinery knows about is a promise an operator
+/// cannot read, so `free_grace_fence_bound_ms` publishes the EFFECTIVE
+/// deadline (the `write_pipeline_depth_target` / `..._base` precedent) and
+/// the routine derivation stays visible beside it. The floor is one honest
+/// acknowledgement cycle — computed from the READER's published staleness
+/// bound, which the valve never moves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_tightened_bound_is_published_and_never_crosses_the_ack_cycle() {
+    let _serial = serial();
+    let (clock, ticks) = manual_clock();
+    let owner = armed_owner(&clock);
+    free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("derived bound");
+    let _reader = join(&owner, "r-honest", MemberRole::Reader);
+    owner.refresh_free_grace_bound();
+
+    let staleness_before = squeezefs::ro_coherence::reader_staleness_bound();
+    let cycle = free_grace::ack_cycle(owner.clocks());
+    let base = free_grace::fence_bound_base_ms();
+
+    // Quiet: the effective bound IS the routine one.
+    assert_eq!(free_grace::effective_bound_ms(), base);
+    assert_eq!(
+        free_grace::pressure_pct(),
+        0,
+        "a quiet plane reads no pressure"
+    );
+
+    // Under pressure: a tiny store, freed into grace.
+    let ba = allocator("grace-honest").await;
+    ba.set_capacity_bytes(6 * ba.chunk_size());
+    let mut offs = Vec::new();
+    for _ in 0..4 {
+        offs.push(ba.allocate_block().await.expect("allocate"));
+    }
+    for (i, o) in offs.iter().enumerate() {
+        ticks.fetch_add(10 * (i as u64 + 1), Ordering::SeqCst);
+        ba.free_block(*o).await.expect("free");
+    }
+
+    let effective = free_grace::effective_bound_ms();
+    assert!(
+        effective < base,
+        "the deadline did not tighten under pressure ({effective} vs base {base})"
+    );
+    assert!(
+        effective >= cycle.as_millis() as u64,
+        "the tightening crossed the floor of one honest acknowledgement cycle"
+    );
+    assert!(
+        free_grace::pressure_pct() > 0,
+        "the graded signal must read"
+    );
+
+    let stats = free_grace::stats_snapshot();
+    assert_eq!(
+        stats["free_grace_fence_bound_ms"], effective,
+        "the published bound must be the one in force"
+    );
+    assert_eq!(stats["free_grace_fence_bound_base_ms"], base);
+    assert_eq!(stats["free_grace_pressure_pct"], free_grace::pressure_pct());
+    assert_eq!(stats["free_grace_prods"], free_grace::prods());
+    assert_eq!(
+        stats["free_grace_bound_tightenings"],
+        free_grace::bound_tightenings()
+    );
+    assert_eq!(
+        stats["free_grace_prod_renew_ms"],
+        free_grace::prod_renew_ms()
+    );
+    assert!(
+        stats["free_grace_fence_bound_ms"].as_u64()
+            >= stats["free_grace_pressure_bound_ms"].as_u64(),
+        "the pressure bound is the FLOOR of the tightening, never below it"
+    );
+
+    // The reader's own published guarantee is untouched by the valve: the
+    // number the acknowledgement cycle derives from cannot drift from the
+    // number the reader publishes.
+    assert_eq!(
+        squeezefs::ro_coherence::reader_staleness_bound(),
+        staleness_before,
+        "the valve must never move the reader's published staleness bound"
+    );
+    assert_eq!(free_grace::ack_cycle(owner.clocks()), cycle);
+}
+
+/// **Contract 16 — unarmed engages no rung.** The shipped default is
+/// `SQUEEZEFS_MEMBERSHIP_BIND=off`; the valve must add nothing to the free
+/// path there — no reading, no prod, no counter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unarmed_mount_engages_no_rung_of_the_pressure_ladder() {
+    let _serial = serial();
+    let ba = allocator("grace-valve-off").await;
+    ba.set_capacity_bytes(8 * ba.chunk_size());
+    for _ in 0..16 {
+        let off = ba.allocate_block().await.expect("allocate");
+        ba.free_block(off).await.expect("free");
+    }
+
+    assert_eq!(free_grace::prods(), 0);
+    assert_eq!(free_grace::bound_tightenings(), 0);
+    assert_eq!(free_grace::pressure_pct(), 0);
+    assert_eq!(free_grace::prod_renew_ms(), 0, "no prod is ever in force");
+    assert!(
+        free_grace::take_prod_cadence(0).is_none(),
+        "an unarmed plane must hand out no tightened cadence"
+    );
+    assert_eq!(free_grace::effective_bound_ms(), 0, "no plane, no deadline");
+    let stats = free_grace::stats_snapshot();
+    assert_eq!(stats["free_grace_mode"], "off");
+    assert!(
+        stats.get("free_grace_pressure_pct").is_none(),
+        "an unarmed mount exports the posture word alone"
+    );
+}
+
+/// **Contract 17 — every threshold derives** (drift-is-red). The signal is
+/// the ring's OWN arithmetic: the deferral rate it can measure from its
+/// two end labels, applied to the smaller of its headroom and the volume's
+/// free supply. The response interpolates between two numbers the plane
+/// already publishes, and the prodded cadence is the plane's own
+/// acknowledgement cycle INVERTED against the runway.
+#[test]
+fn the_pressure_signal_and_its_ladder_are_derived() {
+    let _serial = serial();
+
+    // A rate needs two samples: one entry carries none, so it reads as no
+    // pressure rather than as a cliff.
+    assert_eq!(free_grace::runway_ms(0, 0, 1024, 100), None);
+    assert_eq!(free_grace::runway_ms(1, 0, 1024, 100), None);
+    // Four offsets over 1 s = 1 per 250 ms. The ring's headroom (1020) is
+    // the larger supply, so the volume's 10 free blocks bind: 2.5 s.
+    assert_eq!(free_grace::runway_ms(4, 1_000, 1024, 10), Some(2_500));
+    // ...and with unbounded space the ring's own headroom binds.
+    assert_eq!(
+        free_grace::runway_ms(4, 1_000, 1024, u64::MAX),
+        Some(1_020 * 250)
+    );
+    // A burst inside one millisecond is maximum pressure, not a division
+    // by zero.
+    assert_eq!(free_grace::runway_ms(8, 0, 8, 0), Some(0));
+
+    // The graded deadline: no reading ⇒ the routine bound; at the cliff ⇒
+    // the pressure floor; linear between, so there is no threshold cliff.
+    let (fence, pressure) = (80_000u64, 40_000u64);
+    assert_eq!(
+        free_grace::effective_bound_ms_from(None, fence, pressure),
+        fence
+    );
+    assert_eq!(
+        free_grace::effective_bound_ms_from(Some(0), fence, pressure),
+        pressure
+    );
+    assert_eq!(
+        free_grace::effective_bound_ms_from(Some(fence), fence, pressure),
+        fence
+    );
+    assert_eq!(
+        free_grace::effective_bound_ms_from(Some(fence * 4), fence, pressure),
+        fence,
+        "a runway longer than the bound is not pressure"
+    );
+    assert_eq!(
+        free_grace::effective_bound_ms_from(Some(fence / 2), fence, pressure),
+        pressure + (fence - pressure) / 2
+    );
+
+    // The prodded cadence: `runway = 3 × beats + (the terms a faster beat
+    // cannot shrink)`, solved for the beat, clamped into
+    // [the shortest interval that can carry a NEW answer, the routine
+    // cadence].
+    let clocks = shipped_clocks();
+    let prod = free_grace::ProdParams::derive(&clocks);
+    let cycle = free_grace::ack_cycle(&clocks).as_millis() as u64;
+    let renew = clocks.renew_interval.as_millis() as u64;
+    let floor = free_grace::ack_refresh_floor(&clocks).as_millis() as u64;
+    assert_eq!(
+        floor,
+        squeezefs::ro_coherence::reader_revalidate_interval()
+            .max(clocks.skew_max)
+            .as_millis() as u64,
+        "the floor is the shortest interval at which the reader's answer can change"
+    );
+    assert_eq!(
+        prod.cadence_for(cycle),
+        None,
+        "a runway of one whole cycle needs no prod: the routine beat already fits"
+    );
+    assert_eq!(
+        prod.cadence_for(u64::MAX),
+        None,
+        "no runway pressure, no prod"
+    );
+    assert_eq!(
+        prod.cadence_for(0),
+        Some(floor),
+        "at the cliff the beat is the fastest one that can carry a new answer"
+    );
+    let mid = prod
+        .cadence_for(cycle - renew)
+        .expect("a mid-pressure prod");
+    assert!(
+        (floor..renew).contains(&mid),
+        "the prodded cadence {mid} must sit between the floor {floor} and the routine {renew}"
+    );
+    assert!(
+        prod.cadence_for(cycle - renew * 2).expect("more pressure") <= mid,
+        "the cadence must tighten monotonically as the runway shortens"
+    );
+}
+
+/// **Contract 18 — a tightened cadence can never starve the ladder.**
+///
+/// The ladder's qualification is "a purging pass that BEGAN at least
+/// `staleness + skew_max` after the label was learned", and every renewal
+/// re-learns a fresher label. Qualify against whatever the newest renewal
+/// carries and a beat faster than that lag refreshes the target out from
+/// under every pass — the reader then acknowledges NOTHING, for ever,
+/// which is precisely the "climbs and never drains" signature. So the
+/// ladder must snapshot a CANDIDATE and qualify that.
+///
+/// (This is not only the valve's problem: with the shipped clocks the
+/// routine beat is 10 s against a 2.02 s lag, but a writer running
+/// `SQUEEZEFS_META_FLUSH_INTERVAL_MS=5000` derives a 6.02 s lag plus a 5 s
+/// pass cadence against the same 10 s beat and closes the window on its
+/// own.)
+#[test]
+fn a_tightened_renewal_cadence_never_starves_the_ack_ladder() {
+    let _serial = serial();
+    let ladder = ReaderAckLadder::new();
+
+    // A prodded 500 ms beat against a 2 s qualification lag, with the
+    // reader polling every 250 ms.
+    const BEAT_MS: u64 = 500;
+    const POLL_MS: u64 = 250;
+    const QUALIFY_LAG_MS: u64 = 2_000;
+    const DRAIN_LAG_MS: u64 = 4_000;
+
+    let mut acked = Vec::new();
+    let mut learned_at = 0u64;
+    let mut label = 1_000u64;
+    for step in 1..=200u64 {
+        let now = step * POLL_MS;
+        if now % BEAT_MS == 0 {
+            // The beat re-learns a fresher label, exactly as
+            // `MemberSession::renewed` does.
+            learned_at = now;
+            label = 1_000 + now;
+        }
+        if let Some(l) = ladder.note_pass(AckInputs {
+            label,
+            learned_at_ms: learned_at,
+            pass_start_ms: now,
+            now_ms: now,
+            advanced: true,
+            qualify_lag_ms: QUALIFY_LAG_MS,
+            drain_lag_ms: DRAIN_LAG_MS,
+        }) {
+            acked.push(l);
+        }
+    }
+
+    assert!(
+        !acked.is_empty(),
+        "the ladder acknowledged NOTHING across 50 s of beats: a cadence shorter than the \
+         qualification lag starved it, so the writer's grace ring can only climb"
+    );
+    assert!(
+        acked.windows(2).all(|w| w[1] > w[0]),
+        "acknowledgements must be monotone: {acked:?}"
+    );
+    // Each promotion must still be an HONEST one: its label was learned at
+    // least the qualification lag before the pass that adopted it, and the
+    // drain window elapsed after that pass.
+    assert!(
+        acked.len() >= 4,
+        "with a 500 ms beat the ladder should promote repeatedly, got {acked:?}"
     );
 }

@@ -2385,7 +2385,7 @@ fn owns_slot_0_volume(meta: &Arc<crate::meta_backend::RoutedMetaBackend>) -> boo
 }
 
 /// The rendezvous records a member would actually SELECT from, in the
-/// order [`rendezvous_volumes`] scopes them to — the observable face of
+/// order `rendezvous_volumes` scopes them to — the observable face of
 /// sweep row 17, so the scoping is pinned rather than inferred from a
 /// join that needs a live plane.
 pub async fn test_rendezvous_records(

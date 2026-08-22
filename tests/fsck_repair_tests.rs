@@ -327,6 +327,7 @@ fn dry_run() -> RepairOptions {
     RepairOptions {
         apply: false,
         quarantine_dir: None,
+        multi_owner: false,
     }
 }
 
@@ -334,6 +335,7 @@ fn apply() -> RepairOptions {
     RepairOptions {
         apply: true,
         quarantine_dir: None,
+        multi_owner: false,
     }
 }
 

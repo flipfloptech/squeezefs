@@ -353,17 +353,15 @@ impl ShardDeviceSeam for MemberSeam {
     fn run_fleet_shard(
         &self,
         job: &JobType,
-        shard_k: u32,
-        shard_count: u32,
-        throttle_pct: u32,
+        spec: squeezefs::job_wire::FleetShardSpec,
     ) -> std::io::Result<Vec<u8>> {
         if let Some(why) = &self.refuse {
             return Err(std::io::Error::other(why.clone()));
         }
         let mut o = FsckOptions::offline();
-        o.shard = Some((shard_k, shard_count));
+        o.shard = Some((spec.k, spec.n));
         o.staging_full = true;
-        o.throttle_pct = throttle_pct;
+        o.throttle_pct = spec.throttle_pct;
         if let JobType::Fsck {
             scrub, scrub_only, ..
         } = job
@@ -1140,14 +1138,12 @@ impl ShardDeviceSeam for TimeShiftedSeam {
     fn run_fleet_shard(
         &self,
         job: &JobType,
-        shard_k: u32,
-        shard_count: u32,
-        throttle_pct: u32,
+        spec: squeezefs::job_wire::FleetShardSpec,
     ) -> std::io::Result<Vec<u8>> {
         let mut o = FsckOptions::offline();
-        o.shard = Some((shard_k, shard_count));
+        o.shard = Some((spec.k, spec.n));
         o.staging_full = true;
-        o.throttle_pct = throttle_pct;
+        o.throttle_pct = spec.throttle_pct;
         if let JobType::Fsck {
             scrub, scrub_only, ..
         } = job

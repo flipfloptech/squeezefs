@@ -274,6 +274,7 @@ fn dry_run() -> RepairOptions {
     RepairOptions {
         apply: false,
         quarantine_dir: None,
+        multi_owner: false,
     }
 }
 
@@ -281,6 +282,7 @@ fn apply() -> RepairOptions {
     RepairOptions {
         apply: true,
         quarantine_dir: None,
+        multi_owner: false,
     }
 }
 
@@ -1535,6 +1537,130 @@ async fn test_links_and_unlinks_racing_a_scan_produce_no_findings() {
         c10(&report).is_empty(),
         "link/rename/unlink racing the scan produced C10 findings: {:?}",
         report.findings
+    );
+    fx.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// §5.9.3 / KD-PV-8 — the repair-CONSEQUENCE split under a multi-owner plane
+// ---------------------------------------------------------------------------
+
+/// The online posture of a node that owns SOME of a set's volumes
+/// (`docs/design-per-volume-claim-admission.md` §5.9.3).
+fn multi_owner_opts() -> FsckOptions {
+    let mut o = online_opts();
+    o.owned_volumes = Some(vec![0]);
+    o.multi_owner = true;
+    o
+}
+
+fn multi_owner_apply() -> RepairOptions {
+    RepairOptions {
+        apply: true,
+        quarantine_dir: None,
+        multi_owner: true,
+    }
+}
+
+/// Contract (KD-PV-8): the SAFE RAISES stay online. Their false-positive
+/// source is an OVERCOUNTED reference set — the direction a
+/// monotone-behind reader projection errs in — and their FP consequence
+/// is a leak the next pass corrects, while their true-positive
+/// consequence is restoring an inode a live path still resolves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn c10_low_and_zero_named_raises_still_apply_online() {
+    let _serial = serial().await;
+    let dir = tempfile::tempdir().unwrap();
+    let meta = make_file(dir.path(), "meta", 256 * 1024 * 1024);
+    let oss1 = make_file(dir.path(), "oss1", 4 << 30);
+    format_meta(&meta, &[&oss1]).await;
+    let recs = base_format_config(&[&oss1]).resolved_data_volumes();
+
+    let fx = open_fixture(&meta, &recs).await;
+    let too_low = create_file(&fx, "low.bin").await;
+    hardlink(&fx, too_low, "low.link").await;
+    force_nlink(&fx, too_low, 1).await;
+    let zero_named = create_file(&fx, "zero.bin").await;
+    force_nlink(&fx, zero_named, 0).await;
+
+    let report = run_fsck(&fx.ctx(), &multi_owner_opts())
+        .await
+        .expect("fsck");
+    assert_eq!(
+        c10(&report).len(),
+        2,
+        "detection is unchanged under multi-owner: {:?}",
+        report.findings
+    );
+    let rep = run_repair(&fx.ctx(), &report, &multi_owner_apply())
+        .await
+        .expect("apply");
+    assert_eq!(
+        rep.counters.refused_multi_owner, 0,
+        "a RAISE is never declined for the multi-owner cause: {rep:?}"
+    );
+    assert_eq!(
+        rep.counters.applied, 2,
+        "both raises apply online: {:?}",
+        rep.refused
+    );
+    assert_eq!(read_record(&fx, too_low).await.expect("record").nlink, 2);
+    assert_eq!(read_record(&fx, zero_named).await.expect("record").nlink, 1);
+    fx.close().await;
+}
+
+/// Contract (KD-PV-8 / §5.9.1): the DESTRUCTIVE-and-DANGEROUS pair of
+/// C10 — `lower-nlink-to-counted-names` (the code's own text: *"the one
+/// C10 repair that could make a named inode reclaimable if the count
+/// were wrong"*) and `remove-dangling-dentry` (a live name disappears) —
+/// go report-only under a multi-owner plane, counted, naming the offline
+/// pass. Detection is untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn c10_lower_and_dangling_removal_refuse_online_under_multi_owner() {
+    let _serial = serial().await;
+    let dir = tempfile::tempdir().unwrap();
+    let meta = make_file(dir.path(), "meta", 256 * 1024 * 1024);
+    let oss1 = make_file(dir.path(), "oss1", 4 << 30);
+    format_meta(&meta, &[&oss1]).await;
+    let recs = base_format_config(&[&oss1]).resolved_data_volumes();
+
+    let fx = open_fixture(&meta, &recs).await;
+    let too_high = create_file(&fx, "high.bin").await;
+    hardlink(&fx, too_high, "high.link").await;
+    drop_one_name(&fx, too_high).await;
+    let dangling = create_file(&fx, "dangling.bin").await;
+    destroy_record_keep_name(&fx, dangling).await;
+
+    let report = run_fsck(&fx.ctx(), &multi_owner_opts())
+        .await
+        .expect("fsck");
+    assert_eq!(
+        c10(&report).len(),
+        2,
+        "both shapes are still DETECTED under multi-owner: {:?}",
+        report.findings
+    );
+    let rep = run_repair(&fx.ctx(), &report, &multi_owner_apply())
+        .await
+        .expect("repair runs and refuses");
+    assert_eq!(rep.counters.applied, 0, "{rep:?}");
+    assert_eq!(rep.counters.refused_multi_owner, 2, "{rep:?}");
+    for action in &rep.refused {
+        let detail = action.detail.to_lowercase();
+        assert!(
+            detail.contains("offline") && detail.contains("multi-owner"),
+            "each refusal names its cause and the pass with full teeth: {action:?}"
+        );
+    }
+    assert_eq!(
+        read_record(&fx, too_high).await.expect("record").nlink,
+        2,
+        "the count is untouched — lowering it is what could strand the inode"
+    );
+    assert_eq!(
+        name_records(&fx, "dangling.bin").await,
+        1,
+        "the name is untouched — removing it is how a live path disappears"
     );
     fx.close().await;
 }

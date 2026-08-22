@@ -274,6 +274,7 @@ fn dry_run() -> RepairOptions {
     RepairOptions {
         apply: false,
         quarantine_dir: None,
+        multi_owner: false,
     }
 }
 
@@ -281,6 +282,7 @@ fn apply() -> RepairOptions {
     RepairOptions {
         apply: true,
         quarantine_dir: None,
+        multi_owner: false,
     }
 }
 
@@ -1054,4 +1056,140 @@ fn test_ino_set_byte_budget_is_derived_not_tuned() {
         "the budget must be able to hold the ≥ 100 M-inode cap's bits ({} B)",
         budget
     );
+}
+
+// ---------------------------------------------------------------------------
+// §5.9.3 / KD-PV-8 — the repair-CONSEQUENCE split under a multi-owner plane
+// ---------------------------------------------------------------------------
+
+/// The online posture of a node that owns SOME of a set's volumes
+/// (`docs/design-per-volume-claim-admission.md` §5.9.3): the candidate
+/// set is this node's own volumes, and the plane is armed.
+fn multi_owner_opts() -> FsckOptions {
+    let mut o = online_opts();
+    o.owned_volumes = Some(vec![0]);
+    o.multi_owner = true;
+    o
+}
+
+fn multi_owner_apply() -> RepairOptions {
+    RepairOptions {
+        apply: true,
+        quarantine_dir: None,
+        multi_owner: true,
+    }
+}
+
+/// Contract (KD-PV-8, rewritten in rev 2): C9's repair is
+/// `destroy-unreferenced-inode` — the most destructive act in the fsck
+/// surface — so under a multi-owner plane it is **report-only**, on the
+/// C8 precedent (detection ungated, repair never automatic). Rev 1 had
+/// this backwards: it called C9 "the safe half".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn c9_repair_refuses_online_under_multi_owner_naming_the_offline_pass() {
+    use std::sync::atomic::Ordering;
+    let _serial = serial().await;
+    let dir = tempfile::tempdir().unwrap();
+    let meta = make_file(dir.path(), "meta", 256 * 1024 * 1024);
+    let oss1 = make_file(dir.path(), "oss1", 4 << 30);
+    format_meta(&meta, &[&oss1]).await;
+    let recs = base_format_config(&[&oss1]).resolved_data_volumes();
+
+    let fx = open_fixture(&meta, &recs).await;
+    let doomed = create_file(&fx, "damaged.bin").await;
+    striped_burst(&fx, doomed, 2).await;
+    orphan_inode(&fx, doomed).await;
+    fx.close().await;
+
+    let fx = open_fixture(&meta, &recs).await;
+    // DETECTION is unchanged — the finding is visible either way, which
+    // is exactly why declining the repair costs the operator nothing.
+    let report = run_fsck(&fx.ctx(), &multi_owner_opts())
+        .await
+        .expect("fsck");
+    assert_eq!(
+        c9_findings(&report).len(),
+        1,
+        "detection stays ON under multi-owner (scoped, gated on the freeze precondition): {:?}",
+        report.findings
+    );
+
+    let before = squeezefs::fuse_client::METRICS
+        .fsck_repair_refused_multi_owner
+        .load(Ordering::Relaxed);
+    let rep = run_repair(&fx.ctx(), &report, &multi_owner_apply())
+        .await
+        .expect("repair runs and refuses");
+    assert_eq!(
+        rep.counters.applied, 0,
+        "nothing destructive is applied online under multi-owner: {rep:?}"
+    );
+    assert_eq!(rep.counters.refused_multi_owner, 1, "{rep:?}");
+    let refusal = rep
+        .refused
+        .iter()
+        .find(|a| a.class == "C9")
+        .expect("the C9 action is refused");
+    let detail = refusal.detail.to_lowercase();
+    assert!(
+        detail.contains("offline") && detail.contains("multi-owner"),
+        "the refusal must name its cause AND the pass that has full teeth: {refusal:?}"
+    );
+    assert!(
+        squeezefs::fuse_client::METRICS
+            .fsck_repair_refused_multi_owner
+            .load(Ordering::Relaxed)
+            > before,
+        "fsck_repair_refused_multi_owner is the gauge — expected NONZERO on a multi-owner \
+         online pass with findings, and 0 on the offline pass (the inverted reading is the point)"
+    );
+    assert!(
+        fx.meta.getattr(doomed).await.is_ok(),
+        "the inode must still exist: a report-only class never destroys"
+    );
+    fx.close().await;
+}
+
+/// Contract (KD-PV-8): the OFFLINE whole-set pass keeps full teeth over
+/// the same damage — which is what makes the online refusal a deferral
+/// rather than a coverage hole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_offline_whole_set_pass_over_the_same_damaged_tree_finds_and_repairs_all_of_them() {
+    let _serial = serial().await;
+    let dir = tempfile::tempdir().unwrap();
+    let meta = make_file(dir.path(), "meta", 256 * 1024 * 1024);
+    let oss1 = make_file(dir.path(), "oss1", 4 << 30);
+    format_meta(&meta, &[&oss1]).await;
+    let recs = base_format_config(&[&oss1]).resolved_data_volumes();
+
+    let fx = open_fixture(&meta, &recs).await;
+    let doomed = create_file(&fx, "damaged.bin").await;
+    striped_burst(&fx, doomed, 2).await;
+    orphan_inode(&fx, doomed).await;
+    fx.close().await;
+
+    let fx = open_fixture(&meta, &recs).await;
+    let report = run_fsck(&fx.ctx(), &offline_opts()).await.expect("fsck");
+    assert_eq!(c9_findings(&report).len(), 1, "{:?}", report.findings);
+    // The offline pass runs with every owner unmounted (a fleet-wide
+    // maintenance window — `docs/operations.md`), so it is a whole-set
+    // pass with no peer projections in it and no multi-owner posture.
+    let rep = run_repair(&fx.ctx(), &report, &apply())
+        .await
+        .expect("apply");
+    assert_eq!(
+        rep.counters.refused_multi_owner, 0,
+        "the offline pass never declines for this cause: {rep:?}"
+    );
+    assert!(
+        rep.applied
+            .iter()
+            .any(|a| a.class == "C9" && a.action == "destroy-unreferenced-inode"),
+        "full teeth offline: {rep:?}"
+    );
+    assert!(
+        fx.meta.getattr(doomed).await.is_err(),
+        "the orphan is destroyed by the offline pass"
+    );
+    fx.close().await;
 }

@@ -956,11 +956,13 @@ async fn a_member_shards_inode_plane_findings_are_still_stripped_loudly() {
 async fn mirage_report(fx: &Fx) -> FsckReport {
     use squeezefs::fsck::{FindingId, FsckCounters, FsckFinding};
     let ino_on_1 = fx.meta.volumes.len(); // any ino; the identity is what matters
-    let mut counters = FsckCounters::default();
-    counters.nlink_zero_named = 3;
-    counters.dangling_dentries = 2;
-    counters.findings = 2;
-    counters.inode_plane_volumes_covered = 4;
+    let counters = FsckCounters {
+        nlink_zero_named: 3,
+        dangling_dentries: 2,
+        findings: 2,
+        inode_plane_volumes_covered: 4,
+        ..Default::default()
+    };
     FsckReport {
         schema: squeezefs::fsck::FSCK_REPORT_SCHEMA,
         mode: "offline".to_string(),

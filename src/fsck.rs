@@ -437,7 +437,11 @@ impl FsckOptions {
         match &self.owned_volumes {
             None => (0..volume_count).collect(),
             Some(owned) => {
-                let mut v: Vec<usize> = owned.iter().copied().filter(|v| *v < volume_count).collect();
+                let mut v: Vec<usize> = owned
+                    .iter()
+                    .copied()
+                    .filter(|v| *v < volume_count)
+                    .collect();
                 v.sort_unstable();
                 v.dedup();
                 v
@@ -2153,8 +2157,7 @@ pub async fn run_fleet(
             .await;
             fin_counters.dentry_refs_indexed += ip_indexed;
             let ip_census = walk_census(ctx, &fin_opts, &mut fin_counters).await?;
-            let frozen =
-                !fin_opts.multi_owner || peer_volumes_are_assigned(ctx, &fin_opts).await;
+            let frozen = !fin_opts.multi_owner || peer_volumes_are_assigned(ctx, &fin_opts).await;
             match (
                 ip_refs.as_ref().filter(|_| frozen),
                 ip_census.live.truncated(),
@@ -2264,6 +2267,16 @@ pub async fn run_fleet(
     crate::fuse_client::METRICS
         .fsck_scan_secs
         .store(merged.counters.scan_secs, Ordering::Relaxed);
+    // The coverage gauge is the PASS's answer, so the coordinator stores
+    // the composed union rather than any one shard's share (the local
+    // shards published their own inside `run`, and a fleet pass's answer
+    // is the union or it is nothing).
+    crate::fuse_client::METRICS
+        .fsck_inode_plane_volumes_covered
+        .store(
+            merged.counters.inode_plane_volumes_covered,
+            Ordering::Relaxed,
+        );
 
     Ok(merged)
 }

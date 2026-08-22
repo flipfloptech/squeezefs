@@ -126,25 +126,24 @@ impl ShardDeviceSeam for MountFleetSeam {
             // posture is derived from this process's OWN ownership map —
             // never from the frame, which says only *that* the plane was
             // asked for, not which volumes this node owns.
-            let owned: Vec<usize> = match crate::meta_ship::owners::owner_map()
-                .filter(|m| m.multi_owner())
-            {
-                Some(map) => (0..map.volume_count())
-                    .filter(|v| map.owner_of_volume(*v).is_none())
-                    .collect(),
-                None => {
-                    // The coordinator believes this node owns volumes and
-                    // this node's own plane says it owns none: refuse
-                    // loud (the shard re-leases / its volumes read as
-                    // uncovered) rather than answer about a set it has no
-                    // authority over.
-                    return Err(std::io::Error::other(
+            let owned: Vec<usize> =
+                match crate::meta_ship::owners::owner_map().filter(|m| m.multi_owner()) {
+                    Some(map) => (0..map.volume_count())
+                        .filter(|v| map.owner_of_volume(*v).is_none())
+                        .collect(),
+                    None => {
+                        // The coordinator believes this node owns volumes and
+                        // this node's own plane says it owns none: refuse
+                        // loud (the shard re-leases / its volumes read as
+                        // uncovered) rather than answer about a set it has no
+                        // authority over.
+                        return Err(std::io::Error::other(
                         "an inode-plane shard was assigned to a node with no armed multi-owner \
                          ownership map — refused (KD-PV-16: only an owner may judge its own \
                          inos, and this node owns nothing here)",
                     ));
-                }
-            };
+                    }
+                };
             opts.inode_plane = true;
             opts.inode_plane_only = true;
             opts.multi_owner = true;

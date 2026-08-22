@@ -1412,6 +1412,16 @@ and K = 4. Contract:
 `the_union_of_online_owner_shards_covers_every_volumes_inode_plane_at_k4`,
 and the coverage guarantee is stated in `docs/operations.md` (PR 7).
 
+> **CLARIFICATION (PR 6 implementation, rev 7): "INCOMPLETE" is the
+> PASS's verdict, not the findings'.** An owner shard that does not report
+> leaves its volumes unevaluated; it does not invalidate the volumes that
+> WERE evaluated, because each owner's candidates are its own records and
+> its reference set is a whole-set dentry pass. So the findings that came
+> back stand, the coverage gauge states what was reached, and the loud
+> line names the unreachable owners and their volumes. The "records no
+> verdict" law keeps its original scope: a pass whose OWN referenced set,
+> live set or freeze precondition failed (§5.9.2's box).
+
 #### 5.8.2 The site KD-PV-16 must invert, and the predicate that admits it (rev 4, Issue 27)
 
 KD-PV-16 is a sound *decision* that runs straight through a mechanism built
@@ -1471,6 +1481,69 @@ that closes without an admitted proposal came from nowhere — and
 `fsck_inode_plane_proposals_stripped`, which **must stay 0 on a homogeneous
 fleet** and whose growth means a non-owner is proposing the plane, i.e. the
 mirage path is live.
+
+> **CORRECTION (PR 6 implementation, rev 7) — the fan-out needed a
+> MECHANISM this section did not name, and three of its parts are places
+> the pass silently loses its own proposals.** Rev 4 gave the predicate
+> the sweep's treatment and left the *dispatch* to inference. Landed:
+>
+> 1. **A targeted dispatch verb.** `dispatch_read_shard` picks *any* idle
+>    read-capable session, which is right for an ownership-blind residue
+>    and wrong for the plane: an inode-plane shard has exactly ONE
+>    legitimate venue. `FleetDispatch::dispatch_inode_plane_shard(job_id,
+>    shard_no, worker_id, …)` picks the session whose `worker_id` matches,
+>    over a disjoint shard-number space (`jobs::INODE_PLANE_SHARD_BASE =
+>    1 << 20`, unreachable by a residue), so the wire's shard map, lease
+>    law, fencing identity and durable `job:{id}:shard:{k}` records are the
+>    existing ones. The frame gains one tolerant row —
+>    `ShardDescriptor.inode_plane` (`#[serde(default)]`) — and the seam's
+>    argument list becomes `FleetShardSpec`.
+> 2. **The shard must be plane-ONLY** (`FsckOptions::inode_plane_only`).
+>    A plane shard that also reported a census would double-count the
+>    residue partition at the merge — KD-MW-16 gate 1's exactly-once law —
+>    so it skips C1/C2/C3/C6/C8, the staging scan, the scrub and the
+>    partial census, and its census walk skips the per-inode `layout` read
+>    (which is what a census actually costs). Its report is folded for its
+>    inode-plane counters alone.
+> 3. **Ordering and the collect loop.** The plane fan-out runs BEFORE the
+>    census partition and `n` is sized by what is still idle: a node has
+>    one session, so an owner serving its plane shard is not also a census
+>    venue this pass. And the collect loop is keyed on BOTH populations —
+>    with K−1 owners and no other members the census partition is EMPTY,
+>    and a residue-keyed loop returns before the plane ever answers,
+>    silently losing every proposal (found by
+>    `the_union_of_online_owner_shards_covers_every_volumes_inode_plane_at_k4`).
+> 4. **A lost plane shard is not relocal-able.** The census's "host gone ⇒
+>    run the residue locally" arm is the natural thing to reuse and is
+>    exactly wrong here: judging a peer's inos locally is the
+>    false-positive generator KD-PV-7 refuses. One re-lease to the SAME
+>    owner, then UNCOVERED and loud.
+> 5. **The ledger is per PROPOSAL, not per finding.** This section's own
+>    reading — *"must be > 0 on any K ≥ 2 fleet pass"* — is unsatisfiable
+>    if `fsck_inode_plane_proposals_admitted` counts findings: a healthy
+>    fleet has none, which is precisely when the gate passes. It counts
+>    admitted owner REPORTS; `…_stripped` counts reports that had any
+>    finding dropped.
+> 6. **Coverage travels as identities.** `FsckReport.inode_plane_covered`
+>    (a volume-index list, `#[serde(default)]`) is what the coordinator
+>    UNIONs — intersected with what its own map grants that holder, so a
+>    declaration can only narrow. A summed count would let one volume
+>    covered twice read as two.
+> 7. **F3's site detail**: at `job_wire.rs:2170` the holder is cleared
+>    (`*shard.holder.lock() = None`) BEFORE the outcome is sent, so the id
+>    is captured with `take()` on that same line rather than read after.
+>
+> **And the DETECTION side must mirror clause 3.** A `C10DanglingDentry`
+> whose dentry record lives on a peer's volume while its child ino homes
+> here is admissible to neither owner (this node cannot commit the name's
+> removal; the peer cannot read the ino's record as anything but a
+> projection). If the owner shard reported it anyway, the coordinator
+> would strip it — and `fsck_inode_plane_proposals_stripped` is a
+> must-stay-0 tripwire, so a healthy fleet would grow it forever. The
+> owner therefore DECLINES that shape at detection and counts it
+> (`fsck_inode_plane_cross_owner_declined`); the offline whole-set pass is
+> its only detector, stated rather than left invisible. KD-PV-7's routine
+> scoping gets the same treatment (`fsck_inode_plane_foreign_scoped`).
 
 **Contracts (PR 6), including the negative direction:**
 
@@ -1563,6 +1636,16 @@ One durable, observable fact. No wire object, no ack ledger, no timeout, no
 new failure mode. If it does not hold, the pass is **INCOMPLETE** and records
 no verdict — the existing law (`fsck.rs:1257-1260`).
 
+> **CORRECTION (PR 6 implementation, rev 7): "no verdict" must also mean
+> "no COVERAGE".** The precondition is read per pass (one `ClaimSet::load`
+> per peer-owned volume, before the plane runs). Recording no verdict but
+> still crediting the pass with its own volumes would let an unfrozen pass
+> satisfy the coverage half of the gate it just failed the verdict half
+> of, so `fsck_inode_plane_volumes_covered` is 0 whenever the plane
+> records nothing — for this cause, for a truncated ino set, and for an
+> incomplete dentry pass alike. Pinned by
+> `a_peer_volume_projection_predating_its_assignment_records_no_verdict`.
+
 #### 5.9.3 KD-PV-8, rewritten
 
 | | Online, multi-owner | Offline whole-set |
@@ -1578,6 +1661,28 @@ newly-introduced total-refusal property, when the offline pass costs a
 maintenance window and the finding is visible either way, is not a trade
 worth taking. The C8 precedent (detection ungated, repair never automatic) is
 the house's own answer to exactly this shape.
+
+> **CORRECTION (PR 6 implementation, rev 7): the posture reaches `repair`
+> through its OWN option, never through the report.** §6.3 listed the two
+> new `FsckOptions` fields and stopped there, but `repair` consumes a
+> `RepairReport`-shaped input and takes `RepairOptions`. Reading the
+> posture from the report would be the destructive repair trusting a
+> payload — precisely the direction this decision exists to close — and a
+> report can arrive from a file (`merge-reports`, an older binary). So
+> `RepairOptions.multi_owner` is set by the caller from its own truth: the
+> mount's executor derives it from the live `OwnerMap`; the offline
+> harness is always `false`, because the whole-set pass runs under the
+> D0-guarded open with every owner unmounted and has no peer projection in
+> it to be wrong about.
+>
+> The classification was **re-verified against the repair arms
+> themselves** before it was encoded (the rev-1 inversion is why): the
+> three C10 count-arm classes share ONE apply arm that dispatches on
+> `lowering = value.nlink > names` and refuses when the direction
+> disagrees with the finding's class (`fsck.rs`
+> `C10NlinkTooHigh|TooLow|ZeroNlinkNamed`), so a `TooLow`/`ZeroNlinkNamed`
+> identity can only ever RAISE — which is what makes a class-keyed split
+> of that shared arm sound.
 
 **Red-first contracts (PR 6):**
 - `a_multi_owner_online_pass_over_a_healthy_tree_produces_zero_inode_plane_findings` (the `fix/mw-xv-unlink-c10` mirage, reproduced and then refused);
@@ -1983,7 +2088,27 @@ pub fn derive_owner_map(routed: &RoutedMetaBackend) -> Result<Arc<OwnerMap>>;  /
 pub fn poison_volume(v_idx: usize, why: &str);
 
 // src/fsck.rs
-pub struct FsckOptions { /* … */ pub owned_volumes: Option<Vec<usize>>, pub multi_owner: bool }
+pub struct FsckOptions { /* … */ pub owned_volumes: Option<Vec<usize>>, pub multi_owner: bool,
+                         pub inode_plane_only: bool }              // rev 7: the owner shard
+pub struct FsckReport  { /* … */ pub inode_plane_covered: Vec<usize> }   // the coverage UNION
+pub struct RepairOptions { /* … */ pub multi_owner: bool }               // KD-PV-8's posture
+
+// src/jobs.rs — KD-PV-16's fan-out + KD-PV-14's predicate (rev 7)
+pub const INODE_PLANE_SHARD_BASE: u32 = 1 << 20;
+pub struct FleetOutcome { /* … */ pub worker_id: Option<String> }   // the lease HOLDER's id
+pub trait FleetDispatch { /* … */
+    fn dispatch_inode_plane_shard(&self, job_id: &str, shard_no: u32, worker_id: &str,
+                                  job_type: &JobType, throttle_pct: u32,
+                                  tx: &FleetOutcomeTx) -> bool;    // TARGETED at the owner
+}
+pub fn maintenance_coordinator_refusal() -> Option<String>;
+
+// src/job_wire.rs
+pub struct ShardDescriptor { /* … */ #[serde(default)] pub inode_plane: bool }
+pub struct FleetShardSpec { pub k: u32, pub n: u32, pub throttle_pct: u32, pub inode_plane: bool }
+
+// src/meta_ship/owners.rs
+impl OwnerMap { pub fn set_authority(&self) -> Option<&Arc<PeerOwner>>; }  // the slot-0 owner
 ```
 
 ---
@@ -2177,7 +2302,9 @@ viability answer before any posture is built.
 | `cross_owner_names_at_assignment` | `meta_ship` | the M3 census, published so the undeletable-in-place population is never invisible. On the supported shape it equals **K** (one per subtree root, §5.5.1); materially more means an existing tree was assigned as-is |
 | **`fsck_inode_plane_volumes_covered`** | fsck | KD-PV-16's coverage assertion. A completed fleet pass must satisfy `== volume_count`; a short count makes the pass INCOMPLETE rather than silently narrowing to 1/K (§5.8.1). **This is what stops `fsck_findings == 0` from passing trivially** |
 | **`fsck_inode_plane_proposals_admitted`** | fsck | §5.8.2's engagement instrument. **Must be > 0 on any K ≥ 2 fleet pass** — coverage that closes without an admitted owner proposal came from nowhere |
-| **`fsck_inode_plane_proposals_stripped`** | fsck | **MUST STAY 0 on a homogeneous fleet.** Growth means a non-owner (a reader/co-writer member, or an older/foreign binary) is proposing the inode plane — i.e. the `fix/mw-xv-unlink-c10` mirage path is live and the §5.8.2 predicate is the only thing holding it |
+| **`fsck_inode_plane_proposals_stripped`** | fsck | **MUST STAY 0 on a homogeneous fleet.** Growth means a non-owner (a reader/co-writer member, or an older/foreign binary) is proposing the inode plane — i.e. the `fix/mw-xv-unlink-c10` mirage path is live and the §5.8.2 predicate is the only thing holding it. **Per PROPOSAL** (rev 7): reports that had any inode-plane finding dropped, not findings |
+| `fsck_inode_plane_foreign_scoped` *(added rev 7, PR 6)* | fsck | KD-PV-7's engagement gauge: inode-plane candidates left to their own volume's owner. 0 on every single-authority mount; the division of labour made visible instead of a silent narrowing |
+| **`fsck_inode_plane_cross_owner_declined`** *(added rev 7, PR 6)* | fsck | The population whose verdict is **undecidable online under multi-owner** — a dangling name whose dentry record lives on a peer's volume while its child ino homes here. Neither owner may decide it (§5.8.2's clause-3 shape), so it is declined at detection rather than reported-then-stripped, and the **offline whole-set pass is its only detector**. Nonzero is not a fault; it is the size of the population the maintenance window owes |
 | `subtree_roots_minted` | `meta_ship` | the assignment verb's KD-PV-15 ledger; `0` with `volumes_owned > 0` on a peer is the Issue-23 shape and the verb warns at assignment time |
 | **`fsck_repair_refused_multi_owner`** | fsck | the destructive trio declined online (§5.9.3). **Expected nonzero** on a multi-owner online pass with findings; **must be 0** on the offline pass — the inverted reading is the point |
 | `free_grace_bound_source` | `free_grace` | `owner` on the set authority; **`none` with `free_grace_deferrals == 0`** on a partial authority. **`free_grace_deferrals != 0` on a partial authority is a must-stay-0 violation** — a local terminal free escaped the ship path |
@@ -2353,7 +2480,7 @@ smoke). Size is a rough order of magnitude: **S** ≈ days, **M** ≈ 1–2 week
 | **3** | `feat/pv-admission-ladder` | M | new `src/partial_authority.rs` (`classify_set_admission`, `SetAdmission`, `VolumeMode`, seven rungs), `src/cowriter.rs` (shared rung helpers extracted, behaviour-preserving), `src/env_knobs.rs` (two enum values + the three neighbour texts, §6.2); `tests/pv_admission_tests.rs` | 2 | **The decision, unreachable from `main`.** One red-first case per rung, both directions; the per-volume verdict vector; rung 4's per-volume term comparison; rung 6's assignment ∧ evidence; rung 7's freeze precondition. Pins: the ladder is the ONLY `SetAdmission` constructor; `covers` refuses a cross-set admission; **`a_set_admission_resolves_modes_by_durable_volume_id_not_by_position`** exercised with a URI order ≠ the canonical order (Issue 8) |
 | **4** | `feat/pv-partial-open` **+ `fix/pv-cross-owner-child-precheck`** | **L** | `src/meta_backend/mod.rs` (`OpenMode::PartialWrite`, `open_meta_volume_set_partial`, **`open_routed_meta_set_partial`**, the rollback ladder, the `owner_assign:` probe, ownership-scoped intent recovery, **the M1 pre-check in `unlink`/`rename`/`link`**), `src/meta_backend/kv/backend.rs` (`PeerAuthority`, `PeerOwnedVolume`, `open_peer_owned`, `write_gate` arm, `writer_guard_mode` row), `src/fuse_client.rs` (two postures + the `PARTIAL_META` latch + the un-gated staleness gauge), `src/ro_coherence.rs` + the arming call site (per-volume revalidation, sweep row 15), `src/membership.rs` (rendezvous scoping, sweep row 17), `src/meta_backend/slot_migration.rs` (row 13 refusals); `tests/pv_partial_open_tests.rs`, `tests/pv_cross_owner_tests.rs` | 3 | **The sweep, all 18 rows.** Must-stay-0: `peer_volume_local_commit_refusals`, `xv_cross_owner_intents`, `meta_kv_revalidate_dirty_skips`. **Headline pin (R12): `the_fresh_foreign_refusal_is_byte_identical_for_an_undeclared_mount`.** Plus: **`a_cross_owner_unlink_refuses_before_the_plan_is_minted`** and its seam-injected negative twin (Issue 1); **`every_ino_minted_under_an_armed_plane_shares_its_parents_owner`** (M2); the four arms of `the_cross_owner_dentry_set_is_frozen_under_an_armed_plane`; `a_partial_set_open_failure_releases_exactly_the_owned_volumes_guards`; `a_peer_owned_volume_spawns_no_checkpoint_or_times_drain_task`; `guard_heartbeat_self_skips_on_a_peer_owned_volume`; **both** arming pins — `a_partial_authority_arms_revalidation_on_peer_volumes_only_and_dirty_skips_stays_zero` **and `a_set_authority_arms_revalidation_on_its_peer_owned_volumes_and_dirty_skips_stays_zero`** (rev 3, Issue 26: the set authority latches neither latch, so the existing `if reader_mount || co_writer` site skips it entirely — the two arms are split, `arm_reader_data_plane` iff `CO_WRITER`, revalidation over the peer-owned subset for any posture holding one); `the_rename_precheck_covers_the_moved_ino_the_overwrite_victim_and_both_exchange_participants` (rev 3, Issue 1 residual — the precedent's loop at `service.rs:1140-1150`, not "the child" singular); `a_member_joins_the_slot_0_owner_and_never_a_stale_peer_rendezvous`; the §5.1.1 `Peer`-mode `Reclaimable`/`StaleForeign` refusals; the `co_writer_mount()` consumer-by-posture audit table. **M1 lands unconditionally** (it is correct on a single-authority mount too, where it is a never-taken branch) |
 | **5** | `feat/pv-owner-map-derivation` | M | `src/meta_ship/owners.rs` (`derive_owner_map`, `poison_volume`), `src/meta_ship/placement.rs` (**disarm the migration half**, KD-PV-13), `src/meta_backend/mod.rs` (**the owned-candidate filter in `pick_mint_volume` when armed**, §5.5.1), `src/multi_writer.rs` (derive instead of `for_volumes(…, Vec::new())`; the D20 splits for lanes/custody/membership), `src/main.rs` (the mount path selects the posture); possibly `src/owner_map_core.rs` + `loom-models/src/lib.rs`; **`tests/mw_slot_placement_tests.rs` — BOTH pins re-scoped** | 4 | **The plane goes live and `mint_redirects` inverts.** Red-first: assignment-vs-evidence disagreement refuses and poisons (`owner_map_poisoned_volumes` must-stay-0); never adopts on silence; `ownership_assignment_never_changes_route_ino_width`; slot 0 refuses migration while armed; a non-set-authority never derives a lane assignment; **`the_migration_half_is_disarmed_under_multi_owner`** with `migrations_triggered == 0`; **rev 3 adds the owned-candidate filter's pins, rev 4 a third** — `an_armed_mint_pick_never_proposes_a_peer_owned_volume`, `a_two_volume_owner_balances_across_both_of_its_own_volumes`, and **`an_armed_mint_pick_with_every_owned_volume_disabled_falls_back_to_the_parents_volume`** (Issue 29: the filter is a PREFERENCE, never a gate — the empty arm is reachable at runtime via `disabled_volumes` and must fall back, never panic) — which together return `mint_redirects` to a must-stay-≈0 gauge (§11.2) and restore balance among a node's own volumes. **The pin flip is ONE act covering `:501-555` AND `:560-576`**, with the in-process engine coverage preserved as a directly-invoked engine test. **Milestone wording (rev 2, Issue 19b): liveness here is TEST-CONSTRUCTOR-ONLY** — the only supported way to create an assignment is PR 7's verb, so nothing is production-reachable until then. Loom weakening-verified ×3 if a core is extracted. **LANDED (rev 6)**: no core was extracted — the poison latch is a per-volume `AtomicBool` inside the arc-swapped, immutable-once-built map (the `PlacementTable` precedent), with no cross-word invariant and no new ordering protocol, so it carries no loom model. Six corrections folded back: the disarm is TOTAL (§5.5's box), the runtime trigger must re-READ (§5.10's box), the derivation splits pure-core-plus-gather, the gather is this rung's, rung 5 is unsatisfiable for a set authority as written, and **the partial-authority arm is a named prerequisite of PR 8** (§5.7's box) |
-| **6** | `feat/pv-fsck-and-coordinator` | **L** | `src/fsck.rs` (`owned_volumes`, `multi_owner`, the repair-consequence split, `fsck_repair_refused_multi_owner`), **the KD-PV-16 owner-shard fan-out + `fsck_inode_plane_volumes_covered`; §5.8.2's sites F1 `strip_inode_plane_proposals` `:1801-1816`, F2 its merge-loop call site `:1580-1589`, F4 `fold_finalize_counters` `:1421`, F5 `FsckOptions::inode_plane`'s doc `:331-345`; §5.8.0's candidate-vs-referenced split**), `src/jobs.rs` (**F3 — `FleetOutcome` gains the lease holder's `worker_id`, `:1015-1018`**), `src/job_wire.rs` (**fill it from `holder.worker_id` at `:2170` and `:2392`**; the inode-plane shard/proposal rows on the existing wire), `src/jobs.rs` + `src/defrag.rs` (the KD-PV-14 coordinator predicate + the narrowed refusal + ownership-aware shard planning); `tests/fsck_c9_tests.rs` / `tests/fsck_c10_tests.rs` extended, `tests/pv_coordinator_tests.rs` | 5 | **The R2/R3 safety work + the coordinator identity.** Red-first: `a_multi_owner_online_pass_over_a_healthy_tree_produces_zero_inode_plane_findings` (the mirage reproduced then refused); `an_offline_whole_set_pass_over_the_same_damaged_tree_finds_and_repairs_all_of_them`; `c9_repair_refuses_online_under_multi_owner_naming_the_offline_pass`; `c10_low_and_zero_named_raises_still_apply_online`; `a_peer_volume_projection_predating_its_assignment_records_no_verdict`; `exactly_one_node_coordinates_on_a_k_node_fleet`; `a_non_set_authority_refuses_to_coordinate_naming_the_set_authority`; **rev 3 (Issue 25) adds `the_union_of_online_owner_shards_covers_every_volumes_inode_plane_at_k4` and `a_missing_owner_shard_makes_the_pass_INCOMPLETE_not_narrower`; rev 4 adds the §5.8.2 admission set — `an_owner_shards_inode_plane_findings_merge_and_move_the_coordinators_counters`, **`a_member_shards_inode_plane_findings_are_still_stripped_loudly`** (the mirage's regression test), `an_owner_shards_finding_about_a_volume_it_does_not_own_is_stripped`, `the_admission_predicate_never_reads_the_shards_own_claim`, `an_admitted_shards_counters_fold_exactly_once` (the F4 double-count pin) — and the §5.8.0 pair **`a_verb_minted_subtree_root_is_never_a_c9_candidate_on_its_owners_shard`** and `an_owner_shards_dentry_pass_covers_every_volume_not_only_its_own`**. Gate: `fsck_findings == 0` **AND `fsck_inode_plane_volumes_covered == volume_count`** on a healthy multi-owner fleet at K = 2 and K = 4 — the coverage half is what stops the findings half from passing trivially at 1/K coverage. **Note (rev 2, Issue 19a): the R10 free-grace work that rev 1 put here is GONE** — §5.11(b) is structural and its pins live in PR 4 |
+| **6** | `feat/pv-fsck-and-coordinator` | **L** | `src/fsck.rs` (`owned_volumes`, `multi_owner`, the repair-consequence split, `fsck_repair_refused_multi_owner`), **the KD-PV-16 owner-shard fan-out + `fsck_inode_plane_volumes_covered`; §5.8.2's sites F1 `strip_inode_plane_proposals` `:1801-1816`, F2 its merge-loop call site `:1580-1589`, F4 `fold_finalize_counters` `:1421`, F5 `FsckOptions::inode_plane`'s doc `:331-345`; §5.8.0's candidate-vs-referenced split**), `src/jobs.rs` (**F3 — `FleetOutcome` gains the lease holder's `worker_id`, `:1015-1018`**), `src/job_wire.rs` (**fill it from `holder.worker_id` at `:2170` and `:2392`**; the inode-plane shard/proposal rows on the existing wire), `src/jobs.rs` + `src/defrag.rs` (the KD-PV-14 coordinator predicate + the narrowed refusal + ownership-aware shard planning); `tests/fsck_c9_tests.rs` / `tests/fsck_c10_tests.rs` extended, `tests/pv_coordinator_tests.rs` | 5 | **The R2/R3 safety work + the coordinator identity.** Red-first: `a_multi_owner_online_pass_over_a_healthy_tree_produces_zero_inode_plane_findings` (the mirage reproduced then refused); `an_offline_whole_set_pass_over_the_same_damaged_tree_finds_and_repairs_all_of_them`; `c9_repair_refuses_online_under_multi_owner_naming_the_offline_pass`; `c10_low_and_zero_named_raises_still_apply_online`; `a_peer_volume_projection_predating_its_assignment_records_no_verdict`; `exactly_one_node_coordinates_on_a_k_node_fleet`; `a_non_set_authority_refuses_to_coordinate_naming_the_set_authority`; **rev 3 (Issue 25) adds `the_union_of_online_owner_shards_covers_every_volumes_inode_plane_at_k4` and `a_missing_owner_shard_makes_the_pass_INCOMPLETE_not_narrower`; rev 4 adds the §5.8.2 admission set — `an_owner_shards_inode_plane_findings_merge_and_move_the_coordinators_counters`, **`a_member_shards_inode_plane_findings_are_still_stripped_loudly`** (the mirage's regression test), `an_owner_shards_finding_about_a_volume_it_does_not_own_is_stripped`, `the_admission_predicate_never_reads_the_shards_own_claim`, `an_admitted_shards_counters_fold_exactly_once` (the F4 double-count pin) — and the §5.8.0 pair **`a_verb_minted_subtree_root_is_never_a_c9_candidate_on_its_owners_shard`** and `an_owner_shards_dentry_pass_covers_every_volume_not_only_its_own`**. Gate: `fsck_findings == 0` **AND `fsck_inode_plane_volumes_covered == volume_count`** on a healthy multi-owner fleet at K = 2 and K = 4 — the coverage half is what stops the findings half from passing trivially at 1/K coverage. **Note (rev 2, Issue 19a): the R10 free-grace work that rev 1 put here is GONE** — §5.11(b) is structural and its pins live in PR 4. **LANDED (rev 7)**: 13 contracts in `tests/pv_coordinator_tests.rs` (over a real K-volume set, the real job wire and in-process owner workers) plus the four repair-split contracts in the C9/C10 suites; seven corrections folded back into §5.8.2, §5.9.2 and §5.9.3 — the fan-out needed a TARGETED dispatch verb + a disjoint shard-number space, an `inode_plane_only` shard shape, a collect loop keyed on BOTH shard populations (a residue-keyed one silently loses every plane proposal when the owners are the only members), a never-relocal rule for a lost plane shard, a per-PROPOSAL ledger, coverage carried as volume IDENTITIES, and a DETECTION-side mirror of clause 3 (`fsck_inode_plane_cross_owner_declined`). `RepairOptions.multi_owner` carries KD-PV-8's posture from the caller's own truth, never from the report |
 | **7** | `feat/pv-owner-verb` + `docs/pv-guarantees` | M | `src/main.rs` (`volume set-owners` / `get-owners` / **`volume locate`** / `--dry-run` / `--accept-cross-owner-names` / **`:<subtree-root-path>`**), `src/config_ops.rs` (bracketed offline coordinator, **the KD-PV-15 subtree-root mint via the preset-ino create path**, the cross-owner name census, intent barrier, rendezvous cleanup, idempotent resume), `docs/operations.md`, `docs/rc-manifest.md`, AGENTS.md; `tests/pv_owner_verb_tests.rs` | 5 (6 for the doc rows) | **The operator surface — and the first production-reachable rung.** Red-first: `set_owners_refuses_while_any_volume_carries_a_fresh_foreign_claim` (the D0-guarded open, **not** `live()`); refuses a bit-14-less set, an unenrollable member, a partial map, an open cross-volume intent, an unacknowledged cross-owner name census, > 16 members; a kill between adjacent volumes resumes idempotently; `--clear` restores byte-identical unassigned records; `get-owners` renders drift. **Rev 3 (Issue 23) adds the KD-PV-15 half**: `the_verb_mints_each_subtree_root_on_the_volume_it_assigns`; `an_existing_root_path_whose_ino_homes_elsewhere_refuses_naming_volume_locate`; `a_volume_assigned_without_a_subtree_root_warns_that_the_node_will_own_no_new_work`; `volume_locate_names_the_hosting_volume_and_its_owner`; and a resumability pin covering a kill between the root mint and the owner record — which also records the pre-existing, bounded residual the round-3 review named: cross-volume `create` is un-wrapped by design, so a crash between a root's inode commit and its dentry commit leaves a C9-detectable orphan, cleaned by the offline pass and re-minted by an idempotent re-run. Docs: the two new guarantee rows, **the R13 no-failover row and its maintenance-window cost**, the R14 W1 posture, the §5.7 lane-width/stranded-capacity table, the offline-fsck-requires-a-fleet-outage note, **§5.5.2's owner-partitioned-namespace product statement**, and **KD-PV-16's coverage guarantee** |
 | **7b** *(added rev 6, PR 5's correction 6)* | `feat/pv-partial-arm` | M | `src/multi_writer.rs` (the partial-authority arm: custody-lease client half + lane install + an owner half over its OWN volumes), `src/partial_authority.rs`, `src/cowriter.rs` (the client halves it composes); `tests/pv_partial_arm_tests.rs` | 5, 7 | **The arm no rung owned.** PR 5 convicted this: §5.7 described the partial-authority posture's steady state but no rung built the act that ENTERS it, and `arm_multi_writer` now refuses a non-set-authority outright rather than half-arming. A fleet cannot be stood up without this, so it is PR 8's hard prerequisite. Red-first: the arm composes the co-writer client halves (custody lease over peer-owned volumes, lane grant from the set authority) with an owner half over the volumes it appends to; a set authority's arm stays the shipped path unchanged; an arm that cannot reach the set authority refuses loud rather than half-arming; `note_era_relearn` gains its end-to-end fleet pin (PR 5's other owed item) |
 | **8** | `test/pv-acceptance` | M | `tests/run_mw_matrix.sh` (a `s10-placement-tarx --partial-authority` arm + a rewrite/overwrite arm + an `rm -rf` arm), `tests/mw_fleet.sh` (`--owners`), the evidence note `.benchmarks/2026-…-pv-claim-admission.md` | 6, 7, **7b** | **The acceptance rung**, and it gates on one thing PR 5 did NOT build: **the partial-authority arm** (§5.7's rev-6 box — the co-writer client halves composed with an owner half over the volumes it appends to). A fleet cannot be stood up without it. **(0) The setup precondition is part of the gate (rev 3, Issue 23):** the extraction target must be the extracting node's own verb-minted subtree root, asserted by `volume locate` before the timed run — a row extracted into a root-descended directory reproduces 6.73× *by construction* and is INVALID, not disappointing. (a) the `tar -x` gate vs 6.73×, engagement law per §5.13, honest statement if it misses; (b) **the per-verb cross-owner refusal table incl. `unlink`/`rmdir`** and the undeletable-in-place population; (c) **the rewrite/overwrite funnel row** (§5.12, `free_shipped_blocks` as the instrument) or the explicit out-of-scope statement; (d) **the R14 rand-4k W1 row** (partial authority vs set authority vs single-authority today); (e) fsck + C8 oracle clean; (f) every row labeled with its tier per §5.13. **Closure wording (rev 2, Issue 19c): this rung closes residual item 3's ADMISSION half.** The item's own text ends *"Cross-owner slot migration … rides with it"*, which D19 defers — so PR 8 **re-files the remainder as a named follow-on** on the residual board in the same act, together with the offline re-homing pass (open question 3), the R15 purge scoping, and R14's W1 recovery |

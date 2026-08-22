@@ -957,8 +957,8 @@ async fn a_cross_owner_unlink_refuses_before_the_plan_is_minted() {
         .err()
         .expect("unlinking a peer-owned child must refuse");
     assert_eq!(
-        err.errno(),
-        Some(libc::EXDEV),
+        err.to_errno(),
+        libc::EXDEV,
         "the refusal is EXDEV — the errno POSIX already gives for two names that are not on \
          one object graph: {err}"
     );
@@ -990,21 +990,41 @@ async fn a_cross_owner_unlink_refuses_before_the_plan_is_minted() {
     }
 }
 
-/// The negative twin (§5.4a): with the pre-check bypassed through its test
-/// seam, the SAME `rm` reaches the cross-volume machinery — which is what
-/// records *why* M1 exists rather than asserting it in a comment.
+/// The negative twin (§5.4a): with the pre-check bypassed through its
+/// test seam, the SAME `rm` on a REAL partial mount — the peer's volume
+/// opened `PeerOwnedVolume`, its write gate live — reaches the
+/// cross-volume machinery, commits step 0, refuses step 1, and fail-stops
+/// BOTH volumes. That is what records *why* M1 exists rather than a
+/// comment claiming it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_pre_check_absent_shape_is_what_fail_stops_two_volumes() {
     let dir = TempDir::new().unwrap();
     let (vol0, vol1) = two_volume_set(dir.path(), "m1-absent").await;
+    let (id0, id1) = (vol_id(&vol0).await, vol_id(&vol1).await);
     let uris = vec![vol0.display().to_string(), vol1.display().to_string()];
-    let routed = squeezefs::meta_backend::open_routed_meta_set(&uris)
-        .await
-        .expect("write mount");
-    let parent = mkdir_on(&routed, 1, 0, "m1x").await;
-    let (_child, name) = mkfile_on(&routed, parent, 1, "m1x").await;
 
+    let (parent, name) = {
+        let routed = squeezefs::meta_backend::open_routed_meta_set(&uris)
+            .await
+            .expect("an ordinary write mount builds the pre-assignment tree");
+        let parent = mkdir_on(&routed, 1, 0, "m1x").await;
+        let (_child, name) = mkfile_on(&routed, parent, 1, "m1x").await;
+        for vol in &routed.volumes {
+            vol.shutdown().await.expect("release");
+        }
+        (parent, name)
+    };
+
+    let claim = foreign_claim();
+    store_set(&vol0, &own_set()).await;
+    store_set(&vol1, &peer_owned_set(&claim, true)).await;
+    plant(&vol1, &claim, false).await;
+    let admission = set_authority_admission(&vol0, &id0, &vol1, &id1, Some(&claim));
+    let routed = squeezefs::meta_backend::open_routed_meta_set_partial(&uris, &admission)
+        .await
+        .expect("the partial mount comes up");
     let _plane = arm_peer_owns_volume_1(&routed);
+
     squeezefs::meta_backend::test_disable_cross_owner_precheck(true);
     let out = routed.unlink(parent, &name).await;
     squeezefs::meta_backend::test_disable_cross_owner_precheck(false);
@@ -1014,9 +1034,16 @@ async fn the_pre_check_absent_shape_is_what_fail_stops_two_volumes() {
         "without M1 the plan is minted and the peer-owned half refuses mid-plan"
     );
     assert!(
-        routed.disabled_volumes.contains_key(&0) || routed.disabled_volumes.contains_key(&1),
-        "the pre-M1 shape is the one that fail-stops volumes mid-plan — if this stops being \
-         true, M1's justification has changed and the design owes a re-reading"
+        routed.disabled_volumes.contains_key(&0) && routed.disabled_volumes.contains_key(&1),
+        "the pre-M1 shape fail-stops BOTH volumes mid-plan and leaves a durable intent — if \
+         this stops being true, M1's justification has changed and the design owes a \
+         re-reading"
+    );
+    assert_eq!(
+        open_intent_count(&routed).await,
+        1,
+        "the half-committed transaction's intent is durable, and it spans two owners: the \
+         next mount refuses on it (§5.4a case (c))"
     );
     for vol in &routed.volumes {
         let _ = vol.shutdown().await;
@@ -1070,8 +1097,8 @@ async fn the_rename_precheck_covers_the_moved_ino_the_overwrite_victim_and_both_
             .err()
             .unwrap_or_else(|| panic!("[{what}] a cross-owner rename must refuse"));
         assert_eq!(
-            err.errno(),
-            Some(libc::EXDEV),
+            err.to_errno(),
+            libc::EXDEV,
             "[{what}] the refusal must be EXDEV: {err}"
         );
     }

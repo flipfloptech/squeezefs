@@ -303,6 +303,21 @@ pub async fn open_meta_volume_set(
     Ok(opened)
 }
 
+/// The §5.4a M1 pre-check's test seam (the `TEST_XV_SEAM_AFTER_STEPS`
+/// precedent — a suite arms and disarms it per case, so it cannot be an
+/// env knob): `true` bypasses the check, which is the ONLY way to
+/// exercise the pre-M1 behaviour the repro exists to record. Nothing in
+/// the product ever sets it.
+static TEST_DISABLE_CROSS_OWNER_PRECHECK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Arm/disarm the M1 seam above — see
+/// `tests/pv_partial_open_tests.rs::the_pre_check_absent_shape_is_what_fail_stops_two_volumes`,
+/// the negative twin that records why the pre-check exists.
+pub fn test_disable_cross_owner_precheck(on: bool) {
+    TEST_DISABLE_CROSS_OWNER_PRECHECK.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The **offline-bracket probes** every writable mount runs on the slot-0
 /// volume before it serves: `mw_upgrade:` (KD-MW-1 §6.2 mechanism i) and
 /// its sibling `owner_assign:` (per-volume claim admission §5.2.1 / sweep
@@ -1054,6 +1069,57 @@ impl RoutedMetaBackend {
         self.volumes[idx]
             .routed_find_dentry(local_parent, name)
             .await
+    }
+
+    /// **§5.4a M1 — the local cross-owner pre-check** (KD-PV-11,
+    /// correctness-class, landed unconditionally).
+    ///
+    /// `route_verb` inspects a call's **named** inos only, and
+    /// `MetaCall::named_inos` answers the PARENT ALONE for `Unlink`: the
+    /// child and rename's moved/overwritten inodes are DISCOVERED under
+    /// guards, so no router can see them. Without this check an ordinary
+    /// `rm` of a peer-owned child builds an `XvPlan`, commits step 0 (the
+    /// dentry removal, carrying the intent record) on the parent's volume,
+    /// and refuses the child's half at the peer-owned write gate —
+    /// `escalate_midplan` then fail-stops BOTH volumes and leaves a
+    /// durable intent spanning two owners that no process in the fleet can
+    /// roll forward. One `rm`, two volumes offline, the next mount
+    /// refused.
+    ///
+    /// So the refusal happens **before any plan is minted**: `EXDEV`, no
+    /// durable effect, no intent, no fail-stop. It mirrors the owner-side
+    /// post-discovery checks (`meta_ship::service`) so the two paths
+    /// cannot drift.
+    ///
+    /// Unarmed — every mount that ships — this is `owns_volume`'s single
+    /// relaxed load per participant feeding a never-taken branch.
+    fn refuse_cross_owner_participants(
+        &self,
+        verb: crate::meta_ship::MetaVerb,
+        participants: &[Ino],
+    ) -> Result<()> {
+        if !crate::meta_ship::owners::ownership_armed()
+            || TEST_DISABLE_CROSS_OWNER_PRECHECK.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(());
+        }
+        for ino in participants {
+            let (v_idx, _) = self.route_ino(*ino);
+            if let Some(owner) = crate::meta_ship::owners::owner_of_volume(v_idx) {
+                return Err(crate::meta_ship::cross_owner_refusal(
+                    verb,
+                    *ino,
+                    &format!(
+                        "it lives on metadata volume {v_idx}, which peer '{}' appends to, \
+                         while this node executes the operation. The participant was \
+                         DISCOVERED under this op's guards, so the router could not see it \
+                         (§5.4a M1)",
+                        owner.peer_id
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// §4.4 pt 4 escalation mirror: after any mutation error, latch the
@@ -2242,6 +2308,14 @@ impl Metadata for RoutedMetaBackend {
             }
         };
 
+        // **§5.4a M1** — the DISCOVERED participant the router could not
+        // see (`named_inos` answers the parent alone for `Unlink`), pinned
+        // here rather than at the plan: refuse before any durable effect.
+        self.refuse_cross_owner_participants(
+            crate::meta_ship::MetaVerb::Unlink,
+            &[global_child_ino],
+        )?;
+
         let is_dir = file_type == libc::S_IFDIR;
         if parent_v_idx == child_v_idx {
             // Same-volume unlink: ONE whole-tx entry with the routed
@@ -2336,6 +2410,10 @@ impl Metadata for RoutedMetaBackend {
         // declared before any 4a acquisition (and before route
         // derivation: a park can span a flip).
         let _gate = self.slot_gate_enter(&[ino, new_parent]).await;
+        // §5.4a M1: `link`'s participants ARE named, so `route_verb` and
+        // the owner side already refuse a shipped one — this is the same
+        // refusal on the LOCAL path, where no router runs.
+        self.refuse_cross_owner_participants(crate::meta_ship::MetaVerb::Link, &[ino, new_parent])?;
         let (parent_v_idx, local_parent) = self.route_ino(new_parent);
         let (child_v_idx, local_child) = self.route_ino(ino);
         self.check_volume_enabled(parent_v_idx)?;
@@ -2619,6 +2697,23 @@ impl Metadata for RoutedMetaBackend {
                 join.push(c);
             }
             self.slot_gate_join(&mut _gate, &join);
+        }
+
+        // **§5.4a M1**, with the PLURAL participant set the owner side
+        // already uses (`service.rs`'s loop over both `(parent, name)`
+        // pairs): the moved ino, the overwrite victim, and — under
+        // `RENAME_EXCHANGE` — both participants. The parents themselves
+        // are named, so `route_verb` covered them; these are the
+        // discovered ones no router can see.
+        {
+            let mut discovered = Vec::new();
+            if let Some((c, _)) = old_dentry_opt {
+                discovered.push(c);
+            }
+            if let Some((c, _)) = new_dentry_opt {
+                discovered.push(c);
+            }
+            self.refuse_cross_owner_participants(crate::meta_ship::MetaVerb::Rename, &discovered)?;
         }
 
         if old_parent_v_idx == new_parent_v_idx {

@@ -511,6 +511,49 @@ pub async fn migrate_slot(
     }
     let map = routed.slot_map_snapshot();
     let src_idx = map[usize::from(slot)];
+    // **Per-volume claim admission, sweep row 13** (D19 + KD-PV-6). Two
+    // refusals, both load-bearing for §5.9.2's frozen-cross-owner-
+    // reference law: a migration whose endpoints have different owners is
+    // a CROSS-OWNER slot migration, which D19 defers to the named
+    // follow-on (and which would move a child's inode record without its
+    // parent's dentry — creating cross-owner names rather than removing
+    // them); and slot 0 cannot move at all while the plane is armed,
+    // because ino 1 pins to it and the owner of its volume IS the set
+    // authority.
+    if crate::meta_ship::owners::ownership_armed() {
+        if slot == 0 {
+            return Err(SqueezefsError::InvalidOperation(
+                "refusing to migrate slot 0 while a multi-owner plane is armed: ino 1 pins to \
+                 slot 0 (route_ino_width), and the owner of slot 0's volume IS the SET \
+                 AUTHORITY — it assigns allocation lanes, serves the S9 custody endpoint, \
+                 owns the only freed-offset grace ring and coordinates maintenance. Moving \
+                 the slot would silently relocate all of that (KD-PV-6)"
+                    .to_string(),
+            ));
+        }
+        let src_owner = crate::meta_ship::owners::owner_of_volume(src_idx);
+        let dst_owner = crate::meta_ship::owners::owner_of_volume(target_idx);
+        let named = |o: &Option<std::sync::Arc<crate::meta_ship::PeerOwner>>| {
+            o.as_ref()
+                .map(|p| p.peer_id.clone())
+                .unwrap_or_else(|| "this node".to_string())
+        };
+        if src_owner.as_ref().map(|p| p.peer_id.clone())
+            != dst_owner.as_ref().map(|p| p.peer_id.clone())
+        {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "refusing a cross-owner slot migration: slot {slot} homes on volume {src_idx} \
+                 (owner {}) and the target volume {target_idx} is owned by {}. Moving a slot \
+                 between OWNERS needs the two-party hand-off D19 defers to the named \
+                 follow-on — and it would move inode records away from the dentries that name \
+                 them, creating cross-owner names rather than removing them \
+                 (design-per-volume-claim-admission §5.4a). Intra-owner migrations are \
+                 unaffected",
+                named(&src_owner),
+                named(&dst_owner)
+            )));
+        }
+    }
     let mut report = MigrationReport::default();
     if src_idx == target_idx {
         // Already flipped (a window-1/2/3 crash re-run): complete the

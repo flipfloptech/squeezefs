@@ -6754,7 +6754,22 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             if let Some(membership) = membership_arm {
                 membership.disarm().await;
             }
-            drop(pv_preflight);
+            // A SET authority's per-volume preflight still holds what its
+            // own rung 5 took — the standing WERO hold (the partial arm
+            // above consumed the other posture's). Released OFF-RUNTIME
+            // rather than dropped at scope end: the reservation ioctls are
+            // blocking.
+            if let Some(pre) = pv_preflight {
+                if let Some(arm) = pre.membership {
+                    arm.disarm().await;
+                }
+                if let Some(hold) = pre.hold {
+                    squeezefs::data_custody::release_hold(hold).await;
+                }
+                if let Some(join) = pre.registrant {
+                    squeezefs_ipc::sqz_blocking::run_blocking(move || drop(join)).await;
+                }
+            }
             mount_result?;
         }
         Commands::Bench {

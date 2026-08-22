@@ -85,6 +85,18 @@ per-owner shards with an asserted gauge), the revalidation-arming predicate
 (a `set-authority` latches neither latch and was skipped entirely), and the
 `successors` opt-in's interaction with rung 6 and the poison predicate.
 
+**What rev 5 changed (PR 4's implementation).** Four corrections, folded
+back from the landed rung: **KD-PV-17** supplies the holder resolution PR 3
+left owed (`claim_set.holder`, an attestation the holder writes about its
+OWN claim — §5.1.1's correction box carries the adjudication of the three
+candidates and their cold-start behaviour); the partial set open takes the
+**admission** rather than a forgeable `&[VolumeMode]`; the durable
+`vol-{hex}` identity of a META volume **does not exist** in the tree and is
+derived from the superblock uuid, which PR 7's operator verbs must match;
+and `shutdown()` was convicted of WRITING on every authority-less posture
+(reader, co-writer, peer-owned) — a shipped-path bug the "a Peer-mode
+backend's shutdown is a no-op" law exposed. §5.4 carries the last three.
+
 **What rev 4 changed.** Round 3 found no criticals and narrowed the remaining
 work to KD-PV-16's *implementation path*. Three gaps are closed. **§5.8.2**
 now gives the owner-shard fan-out the C4 sweep's treatment — five named sites
@@ -370,6 +382,32 @@ decision exists ("declared, never inferred", `src/cowriter.rs:41-49`).
 > claim itself, or a rendezvous-record read. The design names none of them,
 > and no implementation of `recognizes` that compares the UUID directly can
 > work.
+>
+> **RESOLVED (PR 4 implementation, `5e44c360`) — KD-PV-17, the holder
+> attestation.** The holder ATTESTS ITSELF: `claim_set` gains an optional
+> `holder = { id, writer_id, pid, boot }` (`src/membership.rs`), written by
+> the partial open on the volumes it OWNS, after the D0 ladder committed
+> their claims, and emitted only when present so an unassigned record stays
+> byte-identical. `ClaimSet::resolve_holder(&claim)` admits it **only when
+> the `(writer_id, pid, boot)` triple matches the claim actually replayed**,
+> so a dead predecessor's leftover attestation resolves NOTHING (the open
+> refuses) instead of naming the wrong node — it is an attestation about one
+> specific claim, never a second truth able to disagree with the claim
+> beside it. The two alternatives were rejected on their cold-start
+> behaviour and their meaning: a **membership-census lookup** answers *who
+> is alive*, not *who wrote this claim*, and it needs the census formed and
+> the set authority reachable at the instant a peer mounts — mount ordering
+> becomes load-bearing beyond §5.1.1's own requirement, and two incarnations
+> of one node id are indistinguishable in it; a **rendezvous read** names
+> one owner PER SET (and, since sweep row 17, only on the slot-0 volume), so
+> it cannot name a per-volume holder at all. A member-ROSTER entry carrying
+> the live pid was rejected too, and this is the sharp one: KD-PV-4 requires
+> the roster form to stay **pid-less** so the rung-8 same-boot prune exempts
+> it, so writing live pids there would re-manufacture exactly the
+> assignment-vs-enrollment disagreement that precision exists to prevent.
+> Cold start is unaffected: the attestation is written by the holder on its
+> own volume with no peer involved, and it is read only when a peer volume
+> carries a FRESH claim — which by definition means its owner is up.
 
 **The complete open-behaviour table (rev 2, Issue 17 — `classify_claim`
 reaches `Reclaimable` BEFORE the freshness branch, including the
@@ -638,6 +676,36 @@ holds no flock, claim or reservation, so its `shutdown()` is a no-op —
 correct, and pinned in both directions
 (`a_partial_set_open_failure_releases_exactly_the_owned_volumes_guards`).
 
+> **CORRECTIONS (PR 4 implementation, `8792aacb`).**
+>
+> 1. **The set-level open takes the `SetAdmission`, not `modes: &[VolumeMode]`.**
+>    `VolumeMode` is a plain public enum any caller can construct, so a mode
+>    vector would make the peer door reachable with a FABRICATED decision —
+>    the exact property `SetAdmission`'s private fields exist to prevent
+>    (`open_peer_owned` re-checks the decision itself). Landed signature:
+>    `open_meta_volume_set_partial(ordered: &[String], vol_ids: &[String],
+>    admission: &SetAdmission)`.
+> 2. **The durable `vol-{hex}` identity of a META volume does not exist in
+>    the tree.** §5.3 and §6.1 both key modes on it (KD-5, "never a path, an
+>    ordinal, or a set position") but the only `vol-{hex}` a metadata volume
+>    carries is `FormatConfig.meta_volumes`, a documented MIRROR: absent on
+>    every set the lifecycle verbs never touched and synthesized as
+>    `meta-pos-{position}` by `config_ops` — keying admission on it would key
+>    it on a POSITION after all. PR 4 therefore derives the identity from the
+>    volume's **superblock uuid** (`kv::backend::durable_volume_id_of` —
+>    `vol-{xxh3(uuid):016x}`), which is the sole per-volume durable identity a
+>    mount can read before any tree is routed and which `MetaSetDiscovery`
+>    already carries in canonical order. **PR 7's `set-owners`/`get-owners`/
+>    `locate` must print the SAME derivation**, or an operator's `<vol-id>`
+>    will not match the one admission resolves.
+> 3. **A shipped-path bug the rollback law convicted**: `shutdown()` ran
+>    `checkpoint_now()` whenever no checkpoint task existed — which is
+>    exactly the reader, co-writer and (new) peer-owned postures — so a mount
+>    whose contract is *"cannot and will not write"* WROTE at teardown. Now
+>    those three causes tear down without touching the volume; §4.11's
+>    unknown-ro degradation (a WRITE mount holding Layer A) keeps its shipped
+>    path.
+
 #### The sweep — 18 rows
 
 | # | Site | Anchor | Verdict |
@@ -649,16 +717,16 @@ correct, and pinned in both directions
 | 5 | Checkpoint + times-drain tasks | `backend.rs:1148-1149` | **Structural**: the `Peer` path does not run `open()`'s tail. Pin `a_peer_owned_volume_spawns_no_checkpoint_or_times_drain_task` |
 | 6 | Conveyor pass-task identity | `backend.rs:1105-1107` | **Keep** — construction identity; no pass can run because `write_gate` refuses first |
 | 7 | Claim heartbeat + B2 refresh | `backend.rs:4383`, `:4487-4505` | **No change**: already returns early on `guard_fd.is_none() \|\| read_only`. Pin it |
-| 8 | Membership: `upsert_writer_member` + the owner branch | `membership.rs:2037-2043`, `:2202` | **Change**: the "write mount ⇒ lease AUTHORITY" branch keys on **owning the slot-0 volume** (D20); `upsert_writer_member` runs on owned volumes only |
+| 8 | Membership: `upsert_writer_member` + the owner branch | `membership.rs:2037-2043`, `:2202` | **Change**: the "write mount ⇒ lease AUTHORITY" branch keys on **owning the slot-0 volume** (D20); `upsert_writer_member` runs on owned volumes only. **LANDED (PR 4)**: the branch tests the slot-0 volume's own posture (`owns_slot_0_volume` — it APPENDS to it, rather than a declared role that could disagree with the open), so a partial authority joins as a WRITER MEMBER; the upsert loop filters to `!is_read_only()` volumes |
 | 9 | Lane derivation over ALL volumes' claim sets | `multi_writer.rs:953-1000` | **Change**: only the set authority derives (D20, §5.7) |
 | 10 | fsck / defrag / jobs coordinator | `fsck.rs:1111, 2011, 2049, 2332, 6065, 6107`; `defrag.rs:194, 486, 526`; `jobs.rs:714, 1971` | **§5.4b** — the predicate, in rev 2 |
 | 11 | `config_ops` offline volume verbs | `config_ops.rs:1052, 1100, 1337` | **Change, and rev 2 corrects the stated mechanism.** `live = \|t\| !t.starts_with("sqmeta://")` (`main.rs:4362`, `:4638`) is a **target-FORM test**, not a liveness probe — it is false for any URI regardless of what is mounted anywhere. The real enforcement is the **D0-guarded coordinator open**, which refuses on a peer's fresh claim. The "every owner of this set must be unmounted" wording belongs in *that* refusal (naming the volume and the observed holder), never on `live()` |
 | 12 | `cluster_wire::discover_peers` | `cluster_wire.rs:1206` | **Keep** — reads only; `peers_from_registrations` dedupes by id and requires a fresh heartbeat |
 | 13 | `slot_migration::finish_flip`'s set-wide write loop | `slot_migration.rs:840-870` | **Change**: `migrate_slot` refuses when either endpoint volume is peer-owned (D19's follow-on) and refuses slot 0 outright while armed (KD-PV-6). **This refusal is load-bearing for §5.9's freeze** |
 | 14 | `plane_gate` / `alloc_plane_gate` | `block_allocator.rs:760, 809` | **No edit — and rev 2 makes it a two-posture statement.** A `set-authority` latches neither `READ_ONLY` nor `CO_WRITER`, so its data plane is byte-identical to `writer`. A `partial-authority` latches `CO_WRITER`, so both gates keep their exact classes and texts. **New sub-row:** PR 4 walks every `co_writer_mount()` / `read_only_mount()` consumer and states, per site, which posture it is correct for |
-| **15** | **Reader-revalidation arming is per-MOUNT and must become per-VOLUME — and the predicate itself must change, because a `set-authority` latches NEITHER latch** | `fuse_client.rs:20612-20621` — `if reader_mount \|\| co_writer { arm_reader_data_plane(…); arm_reader_coherence(&routed.volumes, …); spawn_reader_revalidation(routed.volumes.clone(), …) }`; obligation stated at `backend.rs:1268-1271` | **Change, correctness-class — rewritten in rev 3 (Issue 26).** Rev 2 named only the partial authority, but §5.1.3's table gives a `set-authority` `READ_ONLY = 0` and `CO_WRITER = 0`, so this branch does not run for it **at all** — and a set authority holds K−1 peer-owned volumes. Un-armed, its node caches for those volumes never step epochs: it serves its mount-time read indefinitely and never runs the R-6 purge, on the node that coordinates maintenance, serves custody and owns ino 1. **The two arms must be split and re-predicated:** `arm_reader_data_plane` iff `CO_WRITER` (reader, co-writer, partial-authority — **never** set-authority, which has a full data plane); `arm_reader_coherence` + `spawn_reader_revalidation` **over the peer-owned subset** for *any* mount that holds one — reader (all volumes), co-writer (all), partial-authority (peer subset), **set-authority (peer subset)**. Arming an OWNED volume in either posture trips `meta_kv_revalidate_dirty_skips`, a must-stay-0 counter. §5.11(a)'s formulation ("this mount runs a revalidation cadence") is the right predicate and row 15 now uses it. Pins: `a_partial_authority_arms_revalidation_on_peer_volumes_only_and_dirty_skips_stays_zero` **and** `a_set_authority_arms_revalidation_on_its_peer_owned_volumes_and_dirty_skips_stays_zero`; the set-authority row joins row 14's posture-by-site audit table |
+| **15** | **Reader-revalidation arming is per-MOUNT and must become per-VOLUME — and the predicate itself must change, because a `set-authority` latches NEITHER latch** | `fuse_client.rs:20612-20621` — `if reader_mount \|\| co_writer { arm_reader_data_plane(…); arm_reader_coherence(&routed.volumes, …); spawn_reader_revalidation(routed.volumes.clone(), …) }`; obligation stated at `backend.rs:1268-1271` | **Change, correctness-class — rewritten in rev 3 (Issue 26).** Rev 2 named only the partial authority, but §5.1.3's table gives a `set-authority` `READ_ONLY = 0` and `CO_WRITER = 0`, so this branch does not run for it **at all** — and a set authority holds K−1 peer-owned volumes. Un-armed, its node caches for those volumes never step epochs: it serves its mount-time read indefinitely and never runs the R-6 purge, on the node that coordinates maintenance, serves custody and owns ino 1. **The two arms must be split and re-predicated:** `arm_reader_data_plane` iff `CO_WRITER` (reader, co-writer, partial-authority — **never** set-authority, which has a full data plane); `arm_reader_coherence` + `spawn_reader_revalidation` **over the peer-owned subset** for *any* mount that holds one — reader (all volumes), co-writer (all), partial-authority (peer subset), **set-authority (peer subset)**. Arming an OWNED volume in either posture trips `meta_kv_revalidate_dirty_skips`, a must-stay-0 counter. §5.11(a)'s formulation ("this mount runs a revalidation cadence") is the right predicate and row 15 now uses it. Pins: `a_partial_authority_arms_revalidation_on_peer_volumes_only_and_dirty_skips_stays_zero` **and** `a_set_authority_arms_revalidation_on_its_peer_owned_volumes_and_dirty_skips_stays_zero`; the set-authority row joins row 14's posture-by-site audit table. **LANDED (PR 4)** as a per-VOLUME predicate keyed on each volume's own `ReadOnlyCause` (`ro_coherence::volume_wants_revalidation`) rather than on a posture word: a mount arms exactly the volumes it does not append to, which is every volume on a reader/co-writer (unchanged), the peer-owned subset on both partial-writer postures, and none on a writer. `arm_reader_data_plane`'s own predicate is unchanged, because `reader_mount \|\| co_writer` already IS "iff CO_WRITER (∪ reader)" once a partial authority latches it |
 | **16** | **R-6 purge amplification** | `ro_coherence::purge_reader_block_keys` (`:101-128`) drops the **entire** cached block census per epoch step, deliberately un-scoped | **Named cost, measured not fixed.** With K−1 armed peer caches each checkpointing at up to `CHECKPOINT_MAX_AGE_MS = 1000` (`kv/checkpoint.rs:933`), a partial authority pays up to K−1 whole-tier purges/second. Scoping the purge needs the per-offset attribution item 3 exists to avoid inventing. **PR 0 measures it** (read-tier hit-rate collapse vs K) and PR 8 carries the row; if it dominates, it is the follow-on's first item |
-| **17** | **The membership rendezvous record** | `arm_owner` writes `publish_owner_record` to **every** volume (`membership.rs:2189-2201`); `arm_member` selects the record with the **highest term across all volumes** (`:2313-2320`); `prior_term` is a max over volumes (`:2131-2141`) | **Change, correctness-class.** Under multi-owner only the set authority may write, so peer volumes retain **stale** `membership_owner` records that nobody can remove (pinned against slot travel, `slot_migration.rs:275`) and that max-term selection may pick — pointing members at a dead endpoint. Fix: (a) the owner writes its record **only to the slot-0 volume** while a multi-owner plane is armed; (b) `arm_member` selects **the slot-0 volume's record**, not a max; (c) `prior_term` reads the slot-0 volume only. Pin `a_member_joins_the_slot_0_owner_and_never_a_stale_peer_rendezvous`; the assignment verb **deletes** stale rendezvous records from non-slot-0 volumes as part of its bracket |
+| **17** | **The membership rendezvous record** | `arm_owner` writes `publish_owner_record` to **every** volume (`membership.rs:2189-2201`); `arm_member` selects the record with the **highest term across all volumes** (`:2313-2320`); `prior_term` is a max over volumes (`:2131-2141`) | **Change, correctness-class.** Under multi-owner only the set authority may write, so peer volumes retain **stale** `membership_owner` records that nobody can remove (pinned against slot travel, `slot_migration.rs:275`) and that max-term selection may pick — pointing members at a dead endpoint. Fix: (a) the owner writes its record **only to the slot-0 volume** while a multi-owner plane is armed; (b) `arm_member` selects **the slot-0 volume's record**, not a max; (c) `prior_term` reads the slot-0 volume only. Pin `a_member_joins_the_slot_0_owner_and_never_a_stale_peer_rendezvous`; the assignment verb **deletes** stale rendezvous records from non-slot-0 volumes as part of its bracket. **LANDED (PR 4)**: `rendezvous_volumes` scopes (a)(b)(c) while `partial_meta_mount()` is latched; every other posture reads the whole set verbatim |
 | **18** | **The routed open itself** | `open_routed_meta_set` (`mod.rs:312-397`) is what the mount path calls; every site in rows 2/3/4 lives inside it | **Change**: the partial twin `open_routed_meta_set_partial` above, modeled on `open_routed_meta_set_co_writer` (`:444-469`) |
 
 ---
@@ -1809,7 +1877,7 @@ pub struct FsckOptions { /* … */ pub owned_volumes: Option<Vec<usize>>, pub mu
 
 | Object | Change | Compatibility |
 |---|---|---|
-| `claim_set` (bit 14, ino 1 of **each** volume) | `+ "owner"`, `+ "successors"`, both emitted only when non-empty | **Byte-identical** when unassigned; tolerant decode. The real gate is the marker + the ladder, not the format |
+| `claim_set` (bit 14, ino 1 of **each** volume) | `+ "owner"`, `+ "successors"`, `+ "holder"` (KD-PV-17, PR 4), all emitted only when non-empty | **Byte-identical** when unassigned; tolerant decode. The real gate is the marker + the ladder, not the format |
 | `owner_assign:` marker (ino 1, slot-0 volume) | **New**, versioned + checksummed, KD-2 plane | Present only during a run; refuses writable mounts; VAL-2-allowlist-invisible |
 | `membership_owner` rendezvous record | **Scoped**: written only to the slot-0 volume while a multi-owner plane is armed; stale copies deleted by the assignment verb | Single-owner sets unchanged |
 | Membership `Grant` wire object | **NO CHANGE** (rev 2 — the `min_acked_free_epoch` field is withdrawn, §5.11(b)) | — |
@@ -1998,7 +2066,7 @@ viability answer before any posture is built.
 | `subtree_roots_minted` | `meta_ship` | the assignment verb's KD-PV-15 ledger; `0` with `volumes_owned > 0` on a peer is the Issue-23 shape and the verb warns at assignment time |
 | **`fsck_repair_refused_multi_owner`** | fsck | the destructive trio declined online (§5.9.3). **Expected nonzero** on a multi-owner online pass with findings; **must be 0** on the offline pass — the inverted reading is the point |
 | `free_grace_bound_source` | `free_grace` | `owner` on the set authority; **`none` with `free_grace_deferrals == 0`** on a partial authority. **`free_grace_deferrals != 0` on a partial authority is a must-stay-0 violation** — a local terminal free escaped the ship path |
-| `reader_staleness_bound_owners` / `reader_owner_unreachable` | reader family | the §5.11(a) tripwire pair (not a max); the bound gauge is un-gated for co-writer, partial-authority **and set-authority** mounts (rev 3 — a set authority runs the cadence over its peer-owned subset, sweep row 15) |
+| `reader_staleness_bound_owners` / `reader_owner_unreachable` (**`reader_owner_unreachable` is OWED — PR 4 landed the un-gating and the owners gauge; the unreachability signal needs a per-volume poll-advance stamp the revalidation task does not keep yet**) | reader family | the §5.11(a) tripwire pair (not a max); the bound gauge is un-gated for co-writer, partial-authority **and set-authority** mounts (rev 3 — a set authority runs the cadence over its peer-owned subset, sweep row 15) |
 | `meta_kv_revalidate_dirty_skips` | existing, must-stay-0 | **rev 3 gives it a second reading**: it is now also the tripwire for sweep row 15's per-volume arming. Nonzero means a mount armed revalidation on a volume it appends to — the failure mode the row's split predicate exists to prevent |
 
 ### 11.2 Counters whose MEANING changes (R11)
@@ -2149,6 +2217,7 @@ single-authority mount.
 | **KD-PV-13** *(new in rev 2)* | **The S10 migration policy's migration half is DISARMED while a multi-owner plane is armed** (candidates still counted; nothing triggered). | Every migration the policy can select is cross-owner by construction (`target = owned[0]`, victim not in `owned`) and row 13 refuses it — so leaving it armed is a permanent trigger→refuse→fail retry loop and a counter that grows forever on a healthy fleet. Both existing pins re-scope in the same act |
 | **KD-PV-14** *(new in rev 2, scoped in rev 3)* | **The maintenance coordinator is the owner of the slot-0 volume** (D20); a non-coordinator's fsck/defrag/job invocation refuses loud naming it — **but the refusal covers coordinator-class acts only, never an owner's participation as a detection SHARD** (KD-PV-16). | "Do I hold the claim?" is true on all K nodes under the recipe, giving K concurrent coordinators. The slot-0 predicate is already where the job records live, so there is nothing to elect. Rev 3 narrows the refusal because composing it with KD-PV-7 otherwise left peer-owned volumes with zero inode-plane coverage |
 | **KD-PV-15** *(new in rev 3)* | **Ownership is a property of a SUBTREE, and the assignment verb mints each owner's subtree root on the volume it is assigning** (`:<subtree-root-path>`), in the same offline bracket, through the existing preset-ino create path. Every descendant inherits that owner by M2. The namespace becomes **owner-partitioned at the top level** (§5.5.2), and `pick_mint_volume` gains an owned-candidate filter when armed | Without it the program cannot demonstrate its own purpose: M2 plus the disarmed migration half means every ino descends from root and belongs to the set authority, so `mint_redirects` inverts for nobody and PR 8 reproduces the 6.73×. M2 is not the defect — it is what keeps `rm` working — so the fix is the right *initial condition*, not lifting the invariant. A second-hop mint (redirecting a shipped create onward to the child's volume owner) is explicitly **rejected**, not deferred: it would put a child's ino and its parent's dentry on different owners, recreating the undeletable class M1 exists to refuse. The owned-candidate filter rides along because the redirect also destroyed health/balance placement among a node's own volumes |
+| **KD-PV-17** *(new in rev 5, PR 4)* | **The live claim holder ATTESTS its own durable identity**: `claim_set.holder = { id, writer_id, pid, boot }`, written by the partial open on the volumes it owns, admitted by `resolve_holder` only when the `(writer_id, pid, boot)` triple matches the claim actually replayed; an unattested or mismatched holder is SILENCE and refuses | §5.1.1's `recognizes` cannot compare `WriterClaim.id` (a per-mount uuid) to `claim_set.owner` (a durable member id) — the rung-9 finding #3 mistake. A census lookup answers *who is alive* rather than *who wrote this claim* and makes mount ordering load-bearing on a forming fleet; a rendezvous read names one owner per SET; a live-pid ROSTER entry would break KD-PV-4's pid-less form and re-manufacture the assignment-vs-enrollment disagreement the rung-8 prune exemption exists to prevent. An attestation about ONE claim, verified against that claim, is the only candidate that is both cold-start-safe and incapable of disagreeing with the evidence beside it |
 | **KD-PV-16** *(new in rev 3)* | **The inode plane becomes an OWNER SHARD**: the coordinator fans one shard per owner, each owner evaluates its own volumes on its own coherent view and returns fencing-checked proposals over the existing job-shard wire; the one-view law is restated as *one coherent view per OWNER over its OWN inos*. Coverage is asserted (`fsck_inode_plane_volumes_covered == volume_count`), not claimed | KD-PV-7 ∧ KD-PV-14 otherwise leave 1/K coverage and a gate that passes trivially. This does not undo the `fix/mw-xv-unlink-c10` fix, because that mirage came from *reader-view* shards reading projections at different instants; an **owner** shard reads records it appends to, plus the frozen (unchangeable) cross-owner set — authoritative, not projected. Repair stays owner-applied and coordinator-planned, and the destructive trio stays report-only online regardless |
 
 ---

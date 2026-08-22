@@ -1196,93 +1196,25 @@ pub async fn arm(
         .collect();
     let map = crate::meta_ship::OwnerMap::for_volumes(meta, foreign)?;
     crate::meta_ship::arm_ownership(map);
-    crate::meta_ship::publish::install_client(crate::meta_ship::publish::PublishClient::new(
-        &admission.node_id,
-        secret.clone(),
-    ));
-    // Rung 9 — the S8 arm's client half: the daemon verb router. The FUSE
-    // daemon's `Metadata`-trait verbs (unlink/rename/setattr/xattrs/…)
-    // consult it at the trait impl itself (`meta_backend/mod.rs`), so on
-    // this mount every one of them SHIPS to the authority instead of
-    // refusing at the co-writer write gate — closing "S8's un-routed-daemon
-    // gap": `cowriter.local_commit_refusals` growth on a real workload is a
-    // BUG from here on, exactly as the S8-b falsifier demands.
-    crate::meta_ship::install_daemon_verb_router(crate::meta_ship::MetaShipRouter::new(
-        Arc::clone(meta),
-        &admission.node_id,
-        secret.clone(),
-    ));
-
-    // The custody client: the acquire travels, and what comes back is
-    // custody the authority ISSUED (adopted with the owner's own token).
-    let client = crate::data_grant::WriteCustodyClient::connect_with_clock(
-        &admission.custody_endpoint,
-        &secret,
-        &admission.node_id,
-        crate::membership::LeaseClock::monotonic(),
-        admission.pr_key,
-    )
-    .await
-    .map_err(|e| {
-        crate::meta_ship::publish::uninstall_client();
-        crate::meta_ship::uninstall_daemon_verb_router();
-        crate::meta_ship::disarm_ownership();
-        SqueezefsError::InvalidOperation(format!(
-            "co-writer arm failed: the custody authority at {} refused or could not be reached \
-             ({e}). The admission ladder passed, so this is a transport or authority-state \
-             problem, not a posture one",
-            admission.custody_endpoint
-        ))
-    })?;
-    crate::data_grant::install_custody_client(Arc::clone(&client));
-
-    // The accounting latch: a co-writer DEALLOCATES nothing locally —
-    // §6.3's reclaim/discard hazard applies verbatim, and the offsets
-    // belong to the authority's ledger. Its terminal frees SHIP
-    // (`ship_displaced_frees`, wired at the router's free seam), and the
-    // device reclaim they imply runs on the AUTHORITY's reclaimer — so
-    // this queue is ceased, not merely idle.
-    router.backend_router.reclaim_cease();
-
-    // DLM S9 blocker #3's ADMISSION (`crate::alloc_lane_grant`): the lease we
-    // just adopted names this mount's data-plane allocation lane, so engage
-    // it — the residue class this mount alone mints in, the routed
-    // reservation sink (a co-writer's raises SHIP: the record is a metadata
-    // commit and the authority is the only node that may write it), and a
-    // floor OPENED by the authority (this mount runs no ownership-recovery
-    // walk, so it must be told where the set's live data ends).
-    //
-    // Deliberately AFTER the publish client is installed — the raise routes
-    // through it — and after the custody client, whose lease is the only
-    // source of the lane. A SOLO lease (an authority that has enrolled
-    // nobody) engages nothing, and then allocation stays refused exactly as
-    // it was before this seam closed.
-    let lane = client.lane_partition();
-    if lane.is_solo() {
-        log::warn!(
-            "CO-WRITER: the authority granted no allocation lane (its era runs no data-plane \
-             partition), so this mount can place NO fresh block — every ownership-accounting arm \
-             stays refused (cowriter.accounting_refusals). Enroll this node in \
-             SQUEEZEFS_MW_MEMBERS on the authority and re-arm it"
-        );
-    } else if let Err(e) =
-        crate::alloc_lane_grant::engage_co_writer_lanes(lane, &router.backend_router, meta).await
-    {
-        crate::data_grant::uninstall_custody_client();
-        crate::meta_ship::publish::uninstall_client();
-        crate::meta_ship::uninstall_daemon_verb_router();
-        crate::meta_ship::disarm_ownership();
-        return Err(SqueezefsError::InvalidOperation(format!(
-            "co-writer arm failed: the allocation lane {} of {} the authority granted could not \
-             be engaged ({e}). Refusing the mount rather than serving one that would either \
-             place no block at all or place one over another writer's",
-            lane.writer_id(),
-            lane.writers()
-        )));
-    }
 
     let stop = Arc::new(AtomicBool::new(false));
-    spawn_custody_renewal(Arc::clone(&client), Arc::clone(&stop));
+    let client = install_client_halves(
+        meta,
+        router,
+        &ClientHalfParams {
+            posture: "co-writer",
+            node_id: &admission.node_id,
+            authority_endpoint: &admission.custody_endpoint,
+            pr_key: admission.pr_key,
+            lane_remedy: "Enroll this node in SQUEEZEFS_MW_MEMBERS on the authority and re-arm it",
+        },
+        secret,
+        &stop,
+    )
+    .await
+    .inspect_err(|_| crate::meta_ship::disarm_ownership())?;
+
+    let lane = client.lane_partition();
     log::warn!(
         "CO-WRITER ARMED (DLM S9): metadata verbs ship to '{}' at {}, write custody is acquired \
          there, fresh blocks are placed in allocation lane {} of {} (durable reservations \
@@ -1301,6 +1233,162 @@ pub async fn arm(
         wero: Some(wero),
         stop,
     })
+}
+
+/// What distinguishes one client-half arm from another — everything else
+/// [`install_client_halves`] does is identical by law, not by coincidence.
+pub(crate) struct ClientHalfParams<'a> {
+    /// The posture word every log line and refusal names (`co-writer` /
+    /// `partial authority`), so an operator reading one line knows which
+    /// arm produced it.
+    pub posture: &'a str,
+    /// This mount's durable enrollment identity (KD-MW-2).
+    pub node_id: &'a str,
+    /// Where the SET AUTHORITY serves custody + the shipped publish path
+    /// (D20: the owner of the slot-0 volume).
+    pub authority_endpoint: &'a str,
+    /// This node's device registrant key under the standing WERO hold.
+    pub pr_key: u64,
+    /// What an operator does about a SOLO lease — the roster that would
+    /// have widened the partition differs by posture (`SQUEEZEFS_MW_MEMBERS`
+    /// for a co-writer, the offline assignment verb for a partial
+    /// authority), and naming the wrong one sends them to the wrong node.
+    pub lane_remedy: &'a str,
+}
+
+/// **The client halves of the multi-writer plane**, installed identically
+/// by both CLIENT postures: DLM S9's co-writer ([`arm`]) and per-volume
+/// claim admission's PARTIAL AUTHORITY
+/// ([`crate::multi_writer::arm_partial_authority`] — §5.7's *"the co-writer
+/// client halves … composed with an owner half"*, which is a composition
+/// instruction, not a licence to fork).
+///
+/// In order, and the order is load-bearing:
+///
+/// 1. the **publish client** — S9's vocabulary, and the transport the lane
+///    raise below rides;
+/// 2. the **daemon verb router** — rung 9's client half, consulted at the
+///    `Metadata` trait impl itself so no call site can bypass it. A verb
+///    whose participants all home locally still executes locally
+///    ([`crate::meta_ship::daemon_verb_router`]'s third condition), which
+///    is what makes one router correct for a mount that owns SOME volumes;
+/// 3. the **custody client** — the acquire travels and what comes back is
+///    custody the authority ISSUED;
+/// 4. the **closed local accounting** — the reclaim queue is ceased, not
+///    merely idle: terminal frees SHIP and the device reclaim they imply
+///    runs on the authority's reclaimer;
+/// 5. the **allocation lane** the lease carries, engaged with a floor
+///    OPENED by the authority (neither posture walks the tree);
+/// 6. the **renewal cadence**, which self-fences at this mount's own
+///    (strictly earlier) deadline before the authority may re-grant.
+///
+/// **The ownership map must already be armed** — the lane OPEN ships
+/// through it ([`crate::meta_ship::publish::raise_alloc_lane`] routes on
+/// the owner of ino 1) — and it is the CALLER's, because the two postures
+/// derive it differently: a co-writer's is all-foreign by construction, a
+/// partial authority's is DERIVED per volume (KD-PV-3). A failure here
+/// uninstalls exactly what this function installed; the map is the
+/// caller's to disarm.
+pub(crate) async fn install_client_halves(
+    meta: &Arc<RoutedMetaBackend>,
+    router: &crate::routing::DataRouter,
+    params: &ClientHalfParams<'_>,
+    secret: Vec<u8>,
+    stop: &Arc<AtomicBool>,
+) -> Result<Arc<crate::data_grant::WriteCustodyClient>> {
+    let ClientHalfParams {
+        posture,
+        node_id,
+        authority_endpoint,
+        pr_key,
+        lane_remedy,
+    } = *params;
+
+    crate::meta_ship::publish::install_client(crate::meta_ship::publish::PublishClient::new(
+        node_id,
+        secret.clone(),
+    ));
+    // Rung 9 — the S8 arm's client half: the daemon verb router. The FUSE
+    // daemon's `Metadata`-trait verbs (unlink/rename/setattr/xattrs/…)
+    // consult it at the trait impl itself (`meta_backend/mod.rs`), so on
+    // this mount every FOREIGN-home one SHIPS instead of refusing at the
+    // write gate — closing "S8's un-routed-daemon gap":
+    // `cowriter.local_commit_refusals` growth on a real workload is a BUG
+    // from here on, exactly as the S8-b falsifier demands.
+    crate::meta_ship::install_daemon_verb_router(crate::meta_ship::MetaShipRouter::new(
+        Arc::clone(meta),
+        node_id,
+        secret.clone(),
+    ));
+
+    // The custody client: the acquire travels, and what comes back is
+    // custody the authority ISSUED (adopted with the owner's own token).
+    let client = crate::data_grant::WriteCustodyClient::connect_with_clock(
+        authority_endpoint,
+        &secret,
+        node_id,
+        crate::membership::LeaseClock::monotonic(),
+        pr_key,
+    )
+    .await
+    .map_err(|e| {
+        crate::meta_ship::publish::uninstall_client();
+        crate::meta_ship::uninstall_daemon_verb_router();
+        SqueezefsError::InvalidOperation(format!(
+            "{posture} arm failed: the custody authority at {authority_endpoint} refused or \
+             could not be reached ({e}). The admission ladder passed, so this is a transport or \
+             authority-state problem, not a posture one"
+        ))
+    })?;
+    crate::data_grant::install_custody_client(Arc::clone(&client));
+
+    // The accounting latch: neither client posture DEALLOCATES locally —
+    // §6.3's reclaim/discard hazard applies verbatim, and the offsets
+    // belong to the authority's ledger. Terminal frees SHIP
+    // (`ship_displaced_frees`, wired at the router's free seam), and the
+    // device reclaim they imply runs on the AUTHORITY's reclaimer — so
+    // this queue is ceased, not merely idle.
+    router.backend_router.reclaim_cease();
+
+    // DLM S9 blocker #3's ADMISSION (`crate::alloc_lane_grant`): the lease we
+    // just adopted names this mount's data-plane allocation lane, so engage
+    // it — the residue class this mount alone mints in, the routed
+    // reservation sink (a client's raises SHIP: the record is a metadata
+    // commit on ino 1, and the set authority is the only node that may
+    // write it), and a floor OPENED by the authority (neither client
+    // posture runs an ownership-recovery walk, so it must be told where
+    // the set's live data ends).
+    //
+    // Deliberately AFTER the publish client is installed — the raise routes
+    // through it — and after the custody client, whose lease is the only
+    // source of the lane. A SOLO lease (an authority that has enrolled
+    // nobody) engages nothing, and then allocation stays refused exactly as
+    // it was before this seam closed.
+    let lane = client.lane_partition();
+    if lane.is_solo() {
+        log::warn!(
+            "{}: the authority granted no allocation lane (its era runs no data-plane \
+             partition), so this mount can place NO fresh block — every ownership-accounting arm \
+             stays refused (cowriter.accounting_refusals). {lane_remedy}",
+            posture.to_uppercase()
+        );
+    } else if let Err(e) =
+        crate::alloc_lane_grant::engage_co_writer_lanes(lane, &router.backend_router, meta).await
+    {
+        crate::data_grant::uninstall_custody_client();
+        crate::meta_ship::publish::uninstall_client();
+        crate::meta_ship::uninstall_daemon_verb_router();
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "{posture} arm failed: the allocation lane {} of {} the authority granted could not \
+             be engaged ({e}). Refusing the mount rather than serving one that would either \
+             place no block at all or place one over another writer's",
+            lane.writer_id(),
+            lane.writers()
+        )));
+    }
+
+    spawn_custody_renewal(Arc::clone(&client), Arc::clone(stop));
+    Ok(client)
 }
 
 /// The co-writer's renewal cadence: renew before the authority's TTL, and

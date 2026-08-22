@@ -245,6 +245,19 @@ impl OwnerMap {
         self.volume_owners.iter().filter(|o| o.is_none()).count()
     }
 
+    /// The INDICES of the volumes this node appends to — the authority set
+    /// [`MetaShipService::with_authority`] serves and refuses outside of.
+    ///
+    /// [`MetaShipService::with_authority`]: crate::meta_ship::MetaShipService::with_authority
+    pub fn local_volume_set(&self) -> Vec<usize> {
+        self.volume_owners
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.is_none())
+            .map(|(v, _)| v)
+            .collect()
+    }
+
     /// Does this map name at least one PEER-owned volume — i.e. is a
     /// multi-owner plane armed? The predicate KD-PV-13's disarm and the
     /// §5.4 sweep's cross-owner refusals read.
@@ -297,6 +310,36 @@ impl OwnerMap {
         self.assignment
             .get(v_idx)
             .is_some_and(|names| names.iter().any(|n| member_id_matches(n, id)))
+    }
+
+    /// A REPLACEMENT for this map with `foreign` as its owner vector —
+    /// the `PlacementTable` precedent: an installed table is immutable and
+    /// a change republishes the whole thing rather than mutating one verbs
+    /// are reading.
+    ///
+    /// Everything derived from the set (the assignment sets, the local
+    /// slot vector, the slot-0 anchor, the frozen width) rides through
+    /// unchanged, because none of them can move without a re-derivation.
+    /// Every poison latch rides through too, except `cleared` — the one
+    /// volume whose own fresh read just agreed.
+    fn respun(&self, foreign: &[(usize, PeerOwner)], cleared: Option<usize>) -> Arc<Self> {
+        Arc::new(Self {
+            volume_owners: (0..self.volume_count())
+                .map(|v| {
+                    foreign
+                        .iter()
+                        .find(|(idx, _)| *idx == v)
+                        .map(|(_, p)| Arc::new(p.clone()))
+                })
+                .collect(),
+            assignment: self.assignment.clone(),
+            poisoned: (0..self.volume_count())
+                .map(|v| AtomicBool::new(Some(v) != cleared && self.is_poisoned(v)))
+                .collect(),
+            local_slots: self.local_slots.clone(),
+            slot_0_volume: self.slot_0_volume,
+            routing_width: self.routing_width,
+        })
     }
 
     /// Latch the poison. `true` ⇔ this call set it (idempotent), which is
@@ -690,29 +733,67 @@ fn adopt_holder(v_idx: usize, holder: &str) {
             *peer = PeerOwner::new(holder, endpoint.clone());
         }
     }
-    let fresh = Arc::new(OwnerMap {
-        volume_owners: (0..map.volume_count())
-            .map(|v| {
-                foreign
-                    .iter()
-                    .find(|(idx, _)| *idx == v)
-                    .map(|(_, p)| Arc::new(p.clone()))
-            })
-            .collect(),
-        assignment: (0..map.volume_count())
-            .map(|v| map.assignment.get(v).cloned().unwrap_or_default())
-            .collect(),
-        // The adoption clears THIS volume's latch (its re-derivation
-        // agreed) and carries every other volume's forward: a poisoned
-        // sibling stays poisoned until its own fresh read agrees.
-        poisoned: (0..map.volume_count())
-            .map(|v| AtomicBool::new(v != v_idx && map.is_poisoned(v)))
-            .collect(),
-        local_slots: map.local_slots.clone(),
-        slot_0_volume: map.slot_0_volume,
-        routing_width: map.routing_width,
-    });
-    arm_ownership(fresh);
+    // The adoption clears THIS volume's latch (its re-derivation agreed)
+    // and carries every other volume's forward: a poisoned sibling stays
+    // poisoned until its own fresh read agrees.
+    arm_ownership(map.respun(&foreign, Some(v_idx)));
+}
+
+/// **Fill in the endpoints a derivation could not resolve** — the
+/// first-node-of-a-fleet shape, closed rather than merely announced.
+///
+/// [`derive_owner_map_from`] installs a peer entry WITHOUT an endpoint
+/// when nothing published one yet, and says so loudly. On a fleet that
+/// window is not a corner: a partial authority cannot even be admitted
+/// until the set authority's membership plane is live (rung 4), so the
+/// SET AUTHORITY always derives its own map BEFORE its peers exist — and
+/// without this pass its entries for them would stay endpoint-less for
+/// the life of the mount, refusing every verb about a volume a peer
+/// legitimately owns.
+///
+/// This moves nothing about WHO owns a volume: the peer identity and the
+/// assignment set are untouched and only an EMPTY endpoint is filled, so
+/// it cannot express an ownership change (that is a derivation's job, or
+/// `reconcile_owner_from`'s). Returns how many entries it resolved; a
+/// nonzero answer republished the table.
+pub fn refresh_peer_endpoints(resolve: &dyn Fn(&str) -> Option<String>) -> usize {
+    let Some(map) = owner_map() else {
+        return 0;
+    };
+    let mut foreign = map.foreign_assignments();
+    let mut filled = 0usize;
+    for (v_idx, peer) in foreign.iter_mut() {
+        if !peer.endpoint.is_empty() {
+            continue;
+        }
+        let Some(endpoint) = resolve(&peer.peer_id).filter(|e| !e.is_empty()) else {
+            continue;
+        };
+        log::warn!(
+            "ownership map: metadata volume {v_idx}'s owner '{}' published its endpoint \
+             ({endpoint}) — verbs on that volume now ship there instead of refusing",
+            peer.peer_id
+        );
+        peer.endpoint = endpoint;
+        filled += 1;
+    }
+    if filled > 0 {
+        arm_ownership(map.respun(&foreign, None));
+    }
+    filled
+}
+
+/// Volumes whose owner is known but whose endpoint is not — what the
+/// refresh pass above is still waiting for (`0` ⇒ nothing to wait for, so
+/// no cadence needs to run at all).
+pub fn unresolved_peer_endpoints() -> usize {
+    let Some(map) = owner_map() else {
+        return 0;
+    };
+    map.foreign_assignments()
+        .iter()
+        .filter(|(_, p)| p.endpoint.is_empty())
+        .count()
 }
 
 /// **The era-relearn follow-up** (§5.10, extending the existing

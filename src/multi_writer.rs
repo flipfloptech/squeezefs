@@ -552,6 +552,23 @@ pub async fn arm_mount_multi_writer(
         );
         return Ok(None);
     }
+    // Per-volume claim admission, PR 7b: the same split one grain finer. A
+    // PARTIAL AUTHORITY appends to a subset and ships the rest, so under
+    // D20 it must take none of the set-singular planes this arm takes —
+    // its own arm ([`arm_partial_authority`]) composes the co-writer
+    // client halves with an owner half over the volumes it appends to.
+    // Reaching this arm anyway is refused inside it (the exclusive-door
+    // law), and routing here keeps the refusal for the shape that means
+    // it: a mount whose DERIVATION disagrees with its declaration.
+    if crate::cowriter::requested_role() == crate::cowriter::MwRole::PartialAuthority {
+        log::info!(
+            "multi-writer: this mount declared PARTIAL AUTHORITY \
+             (SQUEEZEFS_MW_ROLE=partial-authority), so the SET authority's arm is not run — the \
+             partial arm installs the client halves toward the set authority plus an owner half \
+             serving only the volumes this node appends to (D20, §5.7)"
+        );
+        return Ok(None);
+    }
     arm_multi_writer(meta, data_paths, read_only, quarantine, backend, pv).await
 }
 
@@ -868,7 +885,15 @@ pub async fn arm_multi_writer(
     // (`crate::dlm::durable_term()` — rung 5 above proved it nonzero),
     // so a successor authority's higher term makes every old-era
     // frame stale by construction (S8's era gate).
-    let meta_svc = crate::meta_ship::MetaShipService::new(Arc::clone(meta));
+    //
+    // Scoped to the volumes THIS node appends to (PR 7b): on the all-local
+    // map every set in the field derives, that is every volume — the
+    // shipped shape, `MetaShipService::new`'s own definition — while under
+    // a multi-owner map a frame about a PEER's volume must meet the
+    // `not_owner` refusal rather than be executed here, because a set
+    // authority holds peer-owned volumes too (§5.7's correction 3).
+    let meta_svc =
+        crate::meta_ship::MetaShipService::with_authority(Arc::clone(meta), &map.local_volume_set());
     // Rung 12 — the S10 delegation host: the SAME service serves the
     // DelegRecall/DelegReassert block, and installing it is what arms the
     // coherence gate on this backend's mutation surface (grants may only
@@ -974,6 +999,16 @@ pub async fn arm_multi_writer(
 
     let stop = Arc::new(AtomicBool::new(false));
     spawn_cadence(Arc::clone(&owner), wero.clone(), Arc::clone(&stop), renew);
+    // PR 7b: the endpoint halves. A set authority under a multi-owner map
+    // both PUBLISHES where it serves (its own roster entry carries the
+    // membership plane's port, not this listener's) and WAITS for its
+    // peers to publish theirs — every peer is admitted after this arm ran,
+    // so a map derived here can only be missing them. Both are structural
+    // no-ops on the all-local map every set in the field derives.
+    if map.multi_owner() {
+        publish_owner_endpoint(meta, &map, &node_id, &endpoint, term).await;
+        spawn_endpoint_refresh(Arc::clone(meta), None, Arc::clone(&stop), renew);
+    }
 
     log::warn!(
         "MULTI-WRITER ARMED (DLM S9) on {endpoint}: era {term}, custody authority '{}', \
@@ -994,6 +1029,485 @@ pub async fn arm_multi_writer(
     }))
 }
 
+// ===========================================================================
+// PR 7b — the PARTIAL-AUTHORITY arm
+// (docs/design-per-volume-claim-admission.md §5.7's rev-6 correction 2;
+// contracts `tests/pv_partial_arm_tests.rs`).
+// ===========================================================================
+
+/// What a partial-authority mount armed, and the teardown that undoes it.
+///
+/// It holds BOTH halves, which is the posture: the client half's custody
+/// lease (and the membership lease + device registration its admission
+/// took) and the owner half's listener.
+pub struct PartialAuthorityArm {
+    listener: Option<Arc<crate::cluster_wire::RpcListener>>,
+    client: Arc<data_grant::WriteCustodyClient>,
+    membership: Option<crate::membership::MembershipArm>,
+    registrant: Option<crate::data_custody::WeroRegistrantJoin>,
+    stop: Arc<AtomicBool>,
+    endpoint: String,
+    authority_endpoint: String,
+    owned: usize,
+    shipped: usize,
+}
+
+impl std::fmt::Debug for PartialAuthorityArm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PartialAuthorityArm")
+            .field("endpoint", &self.endpoint)
+            .field("authority", &self.authority_endpoint)
+            .field("owned", &self.owned)
+            .field("shipped", &self.shipped)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialAuthorityArm {
+    /// The address peers reach the volumes this mount OWNS on (its owner
+    /// half's listener).
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// The custody client every write of this mount acquires through.
+    pub fn client(&self) -> &Arc<data_grant::WriteCustodyClient> {
+        &self.client
+    }
+
+    /// Stop being a partial authority, **outside in**: stop serving the
+    /// volumes we own before we stop holding what lets us write, and stop
+    /// both before this node stops being a member — the same order the
+    /// two shipped arms tear down in, for the same reason (no window in
+    /// which a peer is answered by a mount that has already gone).
+    pub async fn disarm(mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(listener) = self.listener.take() {
+            listener.shutdown();
+        }
+        crate::meta_ship::uninstall_delegation_host();
+        data_grant::uninstall_custody_client();
+        publish::uninstall_client();
+        crate::meta_ship::uninstall_daemon_verb_router();
+        crate::alloc_lane_grant::uninstall_frontier_source();
+        crate::meta_backend::kv::block_refs::uninstall_block_ref_resolver();
+        crate::meta_backend::kv::indirect_map::uninstall_indirect_map_io();
+        crate::extent_ship::uninstall_quiesce_hook();
+        crate::extent_ship::uninstall_release_hook();
+        crate::extent_ship::uninstall_spill_sink();
+        crate::meta_ship::disarm_ownership();
+        if let Some(arm) = self.membership.take() {
+            arm.disarm().await;
+        }
+        if let Some(join) = self.registrant.take() {
+            squeezefs_ipc::sqz_blocking::run_blocking(move || drop(join)).await;
+        }
+        log::warn!(
+            "PARTIAL AUTHORITY DISARMED: the volumes this mount appended to are served by \
+             nobody until their owner mounts again, nothing ships, no custody is held, and this \
+             node is no longer a registrant of the data namespaces' WERO hold"
+        );
+    }
+}
+
+/// **Arm the partial-authority posture, or refuse naming what is missing**
+/// (§5.7's rev-6 correction 2 — the arm no rung owned).
+///
+/// A partial authority appends to SOME volumes of the set and ships the
+/// rest, so it is the only posture that is a CLIENT and an OWNER at once,
+/// and both halves must come up together:
+///
+/// | half | over | what it installs |
+/// |---|---|---|
+/// | **client** | the volumes a PEER appends to | the S9 custody lease from the SET authority, the allocation lane that lease carries, the publish client, the daemon verb router, the closed local free/reclaim accounting, the renewal cadence — [`crate::cowriter::install_client_halves`], composed and never forked |
+/// | **owner** | the volumes THIS node appends to | the S8 `MetaShipService` scoped to exactly those volumes (its dedup window, its era gate and its failover grace window come with it), the S9 `PublishService`, the S10 delegation host, and the owner-side compose hooks — on a listener with **no custody service** |
+///
+/// **D20 draws the line, and it is what this arm must not cross**: the
+/// allocation-lane assignment, the S9 custody endpoint, the one WERO
+/// hold, the membership OWNER role, the freed-offset grace ring and
+/// maintenance coordination are the SET authority's. This arm takes none
+/// of them: it installs no custody owner, derives no lane assignment
+/// (`derive_lane_assignment` refuses a non-set-authority at the site),
+/// serves no custody verb, and runs no free/harvest executor — a peer's
+/// shipped free travels to the custody endpoint, which is the set
+/// authority by construction.
+///
+/// **It refuses rather than half-arming** (KD-PV-3's fail-closed law, the
+/// arming face). Every refusal below happens before anything is installed
+/// except where noted, and the one that happens after tears down what it
+/// took:
+///
+/// 1. the admission is a PARTIAL authority's, over THIS set;
+/// 2. every volume carries the six capability bits (shared with the set
+///    authority's rung 2);
+/// 3. the DERIVED map agrees with the admission — same owned set, and it
+///    does not make us the set authority. A disagreement refuses with
+///    both sides named, because the map is the only thing that can catch
+///    an assignment that moved under a decision already taken;
+/// 4. the SET AUTHORITY is REACHED — not merely named. The endpoint comes
+///    from the derived map (D20's declaration for the slot-0 owner), and
+///    the custody connect is the proof: a mount that armed its owner half
+///    without it would serve peers' verbs while unable to write a byte of
+///    data, so that failure unwinds BOTH halves;
+/// 5. a durable writer era (this mount APPENDS: era-less fencing tokens
+///    on the volumes it owns are the shape S2 exists to prevent);
+/// 6. a bind for the owner half — `off` is a refusal, because the volumes
+///    this node owns would then be unreachable to every peer, which is a
+///    set with a hole.
+pub async fn arm_partial_authority(
+    meta: &Arc<RoutedMetaBackend>,
+    router: &crate::routing::DataRouter,
+    preflight: crate::partial_authority::SetPreflight,
+) -> Result<PartialAuthorityArm> {
+    use crate::cowriter::MwRole;
+
+    let crate::partial_authority::SetPreflight {
+        admission,
+        membership,
+        registrant,
+        hold,
+        secret,
+    } = preflight;
+
+    // Rung 1: the decision this arm stands on must be a partial
+    // authority's, and it must be about THIS set.
+    if admission.role() != MwRole::PartialAuthority || admission.is_set_authority() {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "the partial-authority arm refuses: the admission it was handed is a '{}' \
+             decision{}. This arm installs the CLIENT halves toward a set authority and an \
+             owner half over a SUBSET — a set authority's arm is `arm_multi_writer`, which \
+             takes the planes D20 gives it exclusively",
+            admission.role().as_str(),
+            if admission.is_set_authority() {
+                " that owns the slot-0 volume"
+            } else {
+                ""
+            }
+        )));
+    }
+    let paths: Vec<String> = meta
+        .volumes
+        .iter()
+        .map(|v| v.device_path().display().to_string())
+        .collect();
+    if !admission.covers(&paths) {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "the partial-authority arm refuses: the admission was decided over {:?}, and this \
+             mount opened {paths:?}. An admission decided over one set may never arm another \
+             (the `open_peer_owned` law, one layer up)",
+            admission.volumes()
+        )));
+    }
+    if hold.is_some() {
+        return Err(SqueezefsError::InvalidOperation(
+            "the partial-authority arm refuses: its preflight took a WERO HOLD rather than a \
+             registrant join. Under D20 the set authority holds the one reservation and every \
+             other writer registers under it; a second holder would conflict at the device and \
+             silently take the fence away from the authority"
+                .to_string(),
+        ));
+    }
+
+    // Rung 2: the format's capability bits — before anything is acquired
+    // (shared verbatim with the set authority's arm).
+    check_capabilities(meta)?;
+
+    // Rung 3: the DERIVED map (assignment ∧ evidence, KD-PV-3) must agree
+    // with the decision the open was taken under. The admission was
+    // decided over PROBE reads before the set was opened; this reads the
+    // OPEN set, including the D0 grants this mount actually holds, so it
+    // is the stronger evidence and the last chance to catch an assignment
+    // that moved under us.
+    let node_id = admission.node_id().to_string();
+    let map = derive_ownership(meta, &node_id, Some(&admission)).await?;
+    if map.owns_slot_0() {
+        return Err(SqueezefsError::InvalidOperation(
+            "the partial-authority arm refuses: the derived ownership map says this node \
+             appends to the volume hosting slot 0, which makes it the SET AUTHORITY under D20 \
+             — the posture that keeps the lane assignment, the custody endpoint, the WERO hold \
+             and the grace ring. The admission said otherwise, so assignment and evidence moved \
+             apart between the probe and the open: remount, and declare \
+             SQUEEZEFS_MW_ROLE=set-authority if the assignment really is this node's"
+                .to_string(),
+        ));
+    }
+    let owned = map.local_volume_set();
+    let admitted: Vec<usize> = (0..meta.volumes.len())
+        .filter(|&v| {
+            matches!(
+                admission.mode_for(&meta.volumes[v].durable_volume_id()),
+                Some(crate::partial_authority::VolumeMode::Own)
+            )
+        })
+        .collect();
+    if owned != admitted {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "the partial-authority arm refuses: the seven-rung admission decided this mount \
+             appends to volume(s) {admitted:?} and the DERIVED ownership map says {owned:?}. \
+             Assignment and evidence disagree, and half a posture is not a posture — this mount \
+             would either serve a volume it does not own or ship one it does. Re-run `squeezefs \
+             volume get-owners` (it prints assignment beside evidence) and remount"
+        )));
+    }
+    if owned.is_empty() || !map.multi_owner() {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "the partial-authority arm refuses: the derived map gives this mount {} owned and \
+             {} peer-owned volume(s). A partial authority is by definition both — with no \
+             peer-owned volume it is an ordinary authority mount, and with no owned volume it \
+             is a co-writer (built, measured and cheaper)",
+            owned.len(),
+            map.volume_count() - owned.len()
+        )));
+    }
+
+    // Rung 4: WHERE the set authority is. Its endpoint is the custody
+    // source, the lane grant's origin and where every peer-owned volume's
+    // verbs ship. It comes from the derived map (which resolved it from
+    // the durable claim set, or — for the slot-0 owner — from the
+    // operator's declaration under D20), and its tail is the admission's
+    // own declared endpoint, which rung 1 of the ladder guarantees is
+    // present for this posture.
+    //
+    // REACHABILITY is not asserted here, because a string is not a peer:
+    // the custody connect below is the proof, and its failure unwinds
+    // BOTH halves rather than leaving one standing.
+    let authority_endpoint = map
+        .set_authority()
+        .map(|p| p.endpoint.clone())
+        .filter(|e| !e.is_empty())
+        .unwrap_or_else(|| admission.set_authority_endpoint().to_string());
+
+    // Rung 5: a durable era. Unlike a co-writer, a partial authority
+    // APPENDS — every fencing token it mints on its own volumes carries
+    // this era, and a zero era is one S2's ladder never published.
+    let term = crate::dlm::durable_term();
+    if term == 0 {
+        return Err(SqueezefsError::InvalidOperation(
+            "the partial-authority arm refuses: this process has no durable writer era \
+             (dlm_term = 0), so every fencing token it minted on the volumes it appends to \
+             would be era-less and every custody epoch a constant. The era is published by the \
+             D0 mount gate's claim barrier on a volume carrying incompat bit 7 — arm after it"
+                .to_string(),
+        ));
+    }
+
+    // Rung 6: where the OWNER half serves. `off` is a refusal for the
+    // same reason it is one on a set authority, one grain finer: the
+    // volumes this node owns would be unreachable, and a set whose peers
+    // cannot reach one of its owners is a set with a hole.
+    let bind = match resolve_bind()? {
+        Bind::Off => {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "the partial-authority arm refuses: {MW_BIND_ENV}=off, so no peer could reach \
+                 the {} volume(s) this mount appends to — their metadata verbs and layout \
+                 publishes have nowhere to land, and the set would have volumes no node can \
+                 serve. Give it `auto` (an ephemeral port on every interface — ruling D2) or an \
+                 addr:port",
+                owned.len()
+            )));
+        }
+        Bind::Auto => "0.0.0.0:0".parse().expect("literal addr"),
+        Bind::Addr(a) => a,
+    };
+
+    // ---- Everything demanded is present. Arm, in dependency order. ----
+
+    // The ownership plane FIRST: every routing decision below reads it —
+    // the owner half's authority set, the client half's ship targets, and
+    // the lane OPEN, which routes on the owner of ino 1.
+    crate::meta_ship::arm_ownership(Arc::clone(&map));
+
+    let armed = match arm_partial_halves(
+        meta,
+        router,
+        &map,
+        &admission,
+        PartialHalves {
+            bind,
+            node_id: &node_id,
+            authority_endpoint: &authority_endpoint,
+            secret,
+            term,
+        },
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(e) => {
+            // Fail-closed: a refusal here leaves NOTHING installed. A
+            // mount holding one half is the shape §5.7's correction
+            // named, and it is worse than a refusal — it grants peers a
+            // metadata authority whose data plane cannot write.
+            crate::meta_ship::disarm_ownership();
+            return Err(e);
+        }
+    };
+
+    let shipped = map.volume_count() - owned.len();
+    log::warn!(
+        "PARTIAL AUTHORITY ARMED (per-volume claim admission, D20) on {}: era {term}, node \
+         '{node_id}'. It APPENDS to {} volume(s) — served to peers on this endpoint through the \
+         S8 metadata verbs and the S9 publish path, with no custody service — and SHIPS {} \
+         volume(s) to their owners, holding write custody and allocation lane {} of {} from the \
+         SET AUTHORITY at {authority_endpoint}. Terminal frees, device reclaim, the WERO hold, \
+         the grace ring and maintenance coordination all stay the set authority's (D20)",
+        armed.endpoint,
+        owned.len(),
+        shipped,
+        armed.client.lane_partition().writer_id(),
+        armed.client.lane_partition().writers(),
+    );
+    Ok(PartialAuthorityArm {
+        listener: Some(armed.listener),
+        client: armed.client,
+        membership,
+        registrant,
+        stop: armed.stop,
+        endpoint: armed.endpoint,
+        authority_endpoint,
+        owned: owned.len(),
+        shipped,
+    })
+}
+
+/// [`arm_partial_authority`]'s inputs after its ladder passed.
+struct PartialHalves<'a> {
+    bind: std::net::SocketAddr,
+    node_id: &'a str,
+    authority_endpoint: &'a str,
+    secret: Vec<u8>,
+    term: u64,
+}
+
+/// What the two halves installed.
+struct ArmedHalves {
+    listener: Arc<crate::cluster_wire::RpcListener>,
+    client: Arc<data_grant::WriteCustodyClient>,
+    stop: Arc<AtomicBool>,
+    endpoint: String,
+}
+
+/// Install the owner half then the client half, unwinding **everything**
+/// on any failure — the fail-closed law's arming face, expressed as one
+/// function so no early return can leave a mount holding half a posture.
+async fn arm_partial_halves(
+    meta: &Arc<RoutedMetaBackend>,
+    router: &crate::routing::DataRouter,
+    map: &Arc<OwnerMap>,
+    admission: &crate::partial_authority::SetAdmission,
+    params: PartialHalves<'_>,
+) -> Result<ArmedHalves> {
+    let PartialHalves {
+        bind,
+        node_id,
+        authority_endpoint,
+        secret,
+        term,
+    } = params;
+
+    // ---- The OWNER half: the volumes this node appends to. ----
+    //
+    // Scoped to exactly those volumes, so a frame about a peer's volume
+    // meets the `not_owner` refusal instead of being executed by a node
+    // the record does not entitle (the S8 service's own gate, given the
+    // per-volume answer it was always written for).
+    let meta_svc =
+        crate::meta_ship::MetaShipService::with_authority(Arc::clone(meta), &map.local_volume_set());
+    // The S10 delegation host on the same service: grants may only exist
+    // where the recall-before-conflicting-publish law is enforced, and
+    // installing it is what arms that gate on this backend's mutation
+    // surface (the set authority's arm's rung 12, over a subset).
+    crate::meta_ship::install_delegation_host(Arc::clone(&meta_svc));
+    // NO custody service, deliberately (D20): custody is granted by the
+    // set authority alone, and a second grantor is two nodes handing out
+    // the same bytes.
+    let svc = AsyncVerbRouter::new()
+        .with_publish(publish::PublishService::new(Arc::clone(meta)))
+        .with_meta(meta_svc);
+    let listener = crate::cluster_wire::RpcListener::start_async(
+        crate::cluster_wire::RpcListenerConfig {
+            bind_addr: bind,
+            security: None,
+            service_threads: crate::cluster_wire::default_service_threads(),
+            ..crate::cluster_wire::RpcListenerConfig::default()
+        },
+        secret.clone(),
+        Arc::new(svc),
+    )
+    .inspect_err(|_| crate::meta_ship::uninstall_delegation_host())?;
+    let endpoint = format!(
+        "{}:{}",
+        crate::cluster_wire::local_advertise_ip(),
+        listener.endpoint().port()
+    );
+
+    // The owner-side compose hooks (rungs 19/20), for the same reason the
+    // set authority installs them: a SERVED layout publish recomputes its
+    // durable accounting from the composition, and an indirect head must
+    // be rehydrated rather than refused. They are data-router functions
+    // over the volumes this node appends to, not accounting acts, so the
+    // co-writer latch does not reach them.
+    let backend = Arc::clone(&router.backend_router);
+    let refs_backend = Arc::clone(&backend);
+    crate::meta_backend::kv::block_refs::install_block_ref_resolver(Arc::new(
+        move |key: &str, ino: u64, idx: u32| refs_backend.block_ref_for(key, ino, idx),
+    ));
+    crate::meta_backend::kv::indirect_map::install_indirect_map_io(indirect_map_io_for(Arc::clone(
+        &backend,
+    )));
+    // The dense-frontier source its own lane OPEN and any served lane
+    // question read from THIS mount's cursors.
+    crate::alloc_lane_grant::install_frontier_source(
+        crate::alloc_lane_grant::router_frontier_source(Arc::clone(&backend)),
+    );
+    // Publish WHERE this mount serves, on the volumes it owns, so peers
+    // (the set authority above all) can ship to it at all.
+    publish_owner_endpoint(meta, map, node_id, &endpoint, term).await;
+
+    // ---- The CLIENT half: the volumes a PEER appends to. ----
+    let stop = Arc::new(AtomicBool::new(false));
+    let client = crate::cowriter::install_client_halves(
+        meta,
+        router,
+        &crate::cowriter::ClientHalfParams {
+            posture: "partial authority",
+            node_id,
+            authority_endpoint,
+            pr_key: admission.pr_key(),
+            lane_remedy: "The set authority derives the lane width from the durable claim set \
+                          the offline `squeezefs volume set-owners` verb writes — re-run it so \
+                          this node is an enrolled writer member, then re-arm the authority",
+        },
+        secret,
+        &stop,
+    )
+    .await
+    .inspect_err(|_| {
+        listener.shutdown();
+        crate::meta_ship::uninstall_delegation_host();
+        crate::alloc_lane_grant::uninstall_frontier_source();
+        crate::meta_backend::kv::block_refs::uninstall_block_ref_resolver();
+        crate::meta_backend::kv::indirect_map::uninstall_indirect_map_io();
+    })?;
+
+    // The peers this mount ships to may not have published their
+    // endpoints yet (the set authority always derives its map before its
+    // peers exist — see [`spawn_endpoint_refresh`]).
+    spawn_endpoint_refresh(
+        Arc::clone(meta),
+        Some(authority_endpoint.to_string()),
+        Arc::clone(&stop),
+        crate::membership::LeaseClocks::derive(Duration::ZERO)?.renew_interval,
+    );
+
+    Ok(ArmedHalves {
+        listener,
+        client,
+        stop,
+        endpoint,
+    })
+}
+
 /// **Derive this mount's ownership map** (§5.10, KD-PV-3): assignment ∧
 /// evidence, per volume, fail-closed.
 ///
@@ -1009,40 +1523,192 @@ async fn derive_ownership(
     node_id: &str,
     pv: Option<&crate::partial_authority::SetAdmission>,
 ) -> Result<Arc<OwnerMap>> {
-    let mut published: Vec<(String, String)> = Vec::new();
-    for vol in &meta.volumes {
-        let Some(set) = crate::membership::ClaimSet::load(vol).await else {
-            continue;
-        };
-        for m in &set.members {
-            if let Some(ep) = m.identity.endpoint.as_ref().filter(|e| !e.is_empty()) {
-                if !published.iter().any(|(id, _)| *id == m.identity.id) {
-                    published.push((m.identity.id.clone(), ep.clone()));
+    let book = EndpointBook::gather(meta, pv).await;
+    crate::meta_ship::owners::derive_owner_map(meta, node_id, &|id| book.resolve(id)).await
+}
+
+/// **Where each durable member id serves its metadata plane** — the one
+/// place both arms and the refresh cadence resolve a `PeerOwner`'s
+/// endpoint, so the three cannot answer differently about one peer.
+pub(crate) struct EndpointBook {
+    /// `(member id, endpoint)` as the durable claim sets publish it.
+    published: Vec<(String, String)>,
+    /// The durable id assigned to append to the slot-0 volume (D20's set
+    /// authority), when the record names one.
+    slot_0_owner: Option<String>,
+    /// The operator-declared set-authority endpoint
+    /// (`SQUEEZEFS_MW_AUTHORITY`, or the admission that carried it).
+    declared: Option<String>,
+}
+
+impl EndpointBook {
+    /// Read every volume's durable claim set, plus the declared
+    /// set-authority endpoint. One pass over the open set; no wire.
+    pub(crate) async fn gather(
+        meta: &Arc<RoutedMetaBackend>,
+        pv: Option<&crate::partial_authority::SetAdmission>,
+    ) -> Self {
+        let mut published: Vec<(String, String)> = Vec::new();
+        for vol in &meta.volumes {
+            let Some(set) = crate::membership::ClaimSet::load(vol).await else {
+                continue;
+            };
+            for m in &set.members {
+                if let Some(ep) = m.identity.endpoint.as_ref().filter(|e| !e.is_empty()) {
+                    if !published.iter().any(|(id, _)| *id == m.identity.id) {
+                        published.push((m.identity.id.clone(), ep.clone()));
+                    }
                 }
             }
         }
+        Self {
+            published,
+            slot_0_owner: crate::membership::ClaimSet::load(&meta.volumes[meta.route_ino(1).0])
+                .await
+                .and_then(|set| set.owner),
+            // D20: whoever appends to the slot-0 volume is the SET
+            // AUTHORITY, and that is the one endpoint an operator declares.
+            declared: pv
+                .map(|a| a.set_authority_endpoint().to_string())
+                .filter(|e| !e.is_empty())
+                .or_else(crate::cowriter::declared_authority),
+        }
     }
-    // D20: whoever appends to the slot-0 volume is the SET AUTHORITY, and
-    // that is the one endpoint an operator declares.
-    let declared = pv
-        .map(|a| a.set_authority_endpoint().to_string())
-        .filter(|e| !e.is_empty())
-        .or_else(crate::cowriter::declared_authority);
-    let slot_0_owner = crate::membership::ClaimSet::load(&meta.volumes[meta.route_ino(1).0])
-        .await
-        .and_then(|set| set.owner);
-    let resolve = move |id: &str| -> Option<String> {
-        if let Some((_, ep)) = published.iter().find(|(pid, _)| pid == id) {
-            return Some(ep.clone());
-        }
-        match (&slot_0_owner, &declared) {
-            (Some(owner), Some(ep)) if crate::membership::member_id_matches(owner, id) => {
-                Some(ep.clone())
+
+    /// The endpoint to ship `id`'s volumes to, or `None` = not published
+    /// yet (announced, never refused — a verb toward an empty endpoint
+    /// refuses loud at the ship site, and
+    /// [`crate::meta_ship::owners::refresh_peer_endpoints`] fills it in
+    /// when the peer publishes).
+    ///
+    /// **The DECLARED endpoint wins for the slot-0 owner**, and that
+    /// order is load-bearing: `SQUEEZEFS_MW_AUTHORITY` names the set
+    /// authority's `SQUEEZEFS_MW_BIND` — the listener that serves custody,
+    /// the shipped publish path and the S8 metadata verbs — while the
+    /// endpoint the claim-set roster carries for a membership OWNER is its
+    /// MEMBERSHIP plane's (`arm_owner` writes it there, and that listener
+    /// serves membership verbs only). Reading the roster first sent every
+    /// metadata verb of a multi-owner set to a port that answers
+    /// `RPC_UNKNOWN_VERB`.
+    pub(crate) fn resolve(&self, id: &str) -> Option<String> {
+        if let (Some(owner), Some(ep)) = (&self.slot_0_owner, &self.declared) {
+            if crate::membership::member_id_matches(owner, id) {
+                return Some(ep.clone());
             }
-            _ => None,
         }
-    };
-    crate::meta_ship::owners::derive_owner_map(meta, node_id, &resolve).await
+        self.published
+            .iter()
+            .find(|(pid, _)| pid == id)
+            .map(|(_, ep)| ep.clone())
+    }
+}
+
+/// Keep filling in peer endpoints until every owned-elsewhere volume has
+/// one (§5.10's "announced, never refused" made temporary).
+///
+/// The cadence exists because the fleet's own admission order guarantees
+/// the window: a partial authority is refused at rung 4 until the set
+/// authority's membership plane is live, so the set authority always
+/// derives its map before any peer has published an endpoint. Structurally
+/// inert on every mount that ships — an unassigned set derives an
+/// all-local map, which has no foreign entry to resolve — and it exits for
+/// good the moment the last one is filled.
+fn spawn_endpoint_refresh(
+    meta: Arc<RoutedMetaBackend>,
+    pv_endpoint: Option<String>,
+    stop: Arc<AtomicBool>,
+    cadence: Duration,
+) {
+    if crate::meta_ship::owners::unresolved_peer_endpoints() == 0 {
+        return;
+    }
+    crate::meta_exec::spawn_meta_contained("mw_endpoint_refresh", async move {
+        loop {
+            squeezefs_ipc::sqz_time::sleep(cadence).await;
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+            let mut book = EndpointBook::gather(&meta, None).await;
+            book.declared = book.declared.or_else(|| pv_endpoint.clone());
+            crate::meta_ship::owners::refresh_peer_endpoints(&|id| book.resolve(id));
+            if crate::meta_ship::owners::unresolved_peer_endpoints() == 0 {
+                log::info!(
+                    "ownership map: every peer-owned volume's owner has published an endpoint — \
+                     the refresh cadence is done"
+                );
+                return;
+            }
+        }
+    })
+}
+
+/// **Publish where this mount serves the volumes it OWNS**, so peers can
+/// resolve it (the other half of [`EndpointBook`]).
+///
+/// Written into the claim set of each OWNED volume — this mount is that
+/// volume's appender, so the commit is its own to make and a peer-owned
+/// volume's write gate never sees it (sweep row 8).
+///
+/// **It EDITS the existing enrollment rather than composing a new one**,
+/// and both halves of that matter:
+///
+/// * the entry's `id` is carried verbatim, because KD-MW-2's bare-node
+///   form is a slot WILDCARD — composing this mount's exact
+///   `node_….m…` id beside a bare `node_…` enrollment would add a
+///   member rather than replace one, and the member count is the
+///   allocation partition's width;
+/// * `pid`/`boot`/`pr_key` are carried verbatim, because they are other
+///   mechanisms' facts: KD-PV-4's pid-less form is what exempts an
+///   assignee from the rung-8 same-boot dead-writer prune (pruning a node
+///   the record still ASSIGNS a volume to manufactures exactly the
+///   assignment-vs-enrollment disagreement rung 3 then refuses the whole
+///   set over), and `pr_key` is the registrant a successor's drain proof
+///   preempts.
+///
+/// A node the set does not enroll writes NOTHING: self-enrollment is the
+/// self-assertion the whole plane refuses (rung 3 has already proved we
+/// are enrolled on every volume, so this arm is unreachable in practice
+/// and loud if it ever is not).
+async fn publish_owner_endpoint(
+    meta: &Arc<RoutedMetaBackend>,
+    map: &OwnerMap,
+    node_id: &str,
+    endpoint: &str,
+    term: u64,
+) {
+    for (v_idx, vol) in meta.volumes.iter().enumerate() {
+        if map.owner_of_volume(v_idx).is_some() {
+            continue;
+        }
+        let enrolled = crate::membership::ClaimSet::load(vol).await.and_then(|set| {
+            set.members
+                .iter()
+                .find(|m| crate::membership::member_id_matches(&m.identity.id, node_id))
+                .map(|m| m.identity.clone())
+        });
+        let Some(mut identity) = enrolled else {
+            log::warn!(
+                "ownership map: metadata volume {} does not enroll this node '{node_id}', so \
+                 there is no member entry to publish this mount's endpoint {endpoint} on. Peers \
+                 will refuse verbs about it until `squeezefs volume set-owners` re-runs",
+                vol.device_path().display()
+            );
+            continue;
+        };
+        if identity.endpoint.as_deref() == Some(endpoint) {
+            continue; // idempotent: a remount at the same address writes nothing
+        }
+        identity.endpoint = Some(endpoint.to_string());
+        if let Err(e) = crate::membership::upsert_writer_member(vol, &identity, term).await {
+            log::warn!(
+                "ownership map: publishing this mount's endpoint {endpoint} on volume {} failed \
+                 ({e}) — peers will refuse verbs about the {} volume(s) this node appends to \
+                 until a later mount publishes it",
+                vol.device_path().display(),
+                map.local_volumes()
+            );
+        }
+    }
 }
 
 /// Derive this era's allocation lane map from the volume set's **durable**

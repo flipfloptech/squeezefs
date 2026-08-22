@@ -5361,6 +5361,17 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // assignment: an operator who typed nothing and got a
             // per-volume open would learn nothing.
             let pv_posture = squeezefs::partial_authority::requested();
+            // PR 7b: the PARTIAL authority is a CLIENT posture as well as
+            // an owner one, so every mount-path site that exists because a
+            // client must not act on the set's singular planes — the WERO
+            // acquire, the ownership-recovery walk, the maintenance
+            // coordinator, the membership OWNER arm — reads this beside
+            // `co_writer_mount`. A SET authority reads none of them: it IS
+            // those planes (D20).
+            let partial_authority_mount = pv_posture
+                && squeezefs::cowriter::requested_role()
+                    == squeezefs::cowriter::MwRole::PartialAuthority;
+            let mw_client_mount = co_writer_mount || partial_authority_mount;
             squeezefs::fuse_client::set_mount_posture(if reader_mount {
                 squeezefs::fuse_client::MountPosture::Reader
             } else if co_writer_mount {
@@ -6163,7 +6174,13 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // the admission preflight (rung 5) and held for the mount's life.
             // Calling the authority's arm here would try to ACQUIRE a second
             // reservation on namespaces the authority already holds.
-            let _data_plane_fence = if co_writer_mount {
+            //
+            // PR 7b: a PARTIAL AUTHORITY is the same shape — its preflight
+            // took `join_wero_as_registrant` (rung 5), and under D20 the ONE
+            // reservation is the set authority's. A SET authority's preflight
+            // took the hold itself, so it skips this arm's acquire path by
+            // joining the standing hold instead (`arm_multi_writer`'s rung 3).
+            let _data_plane_fence = if mw_client_mount {
                 None
             } else {
                 squeezefs::data_custody::arm_mount_data_plane(
@@ -6208,11 +6225,18 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // whose gaps are offsets the authority owns. It allocates nothing
             // and frees nothing locally (its accounting ships), so the pass
             // would only fabricate state it may not use.
-            if reader_mount || co_writer_mount {
+            //
+            // PR 7b: a PARTIAL AUTHORITY skips it too, and for the co-writer's
+            // reason exactly — under D20 the data plane is the SET authority's:
+            // this mount allocates only inside a granted residue class whose
+            // floor the authority OPENS, and its frees ship. The walk here
+            // would declare every gap below the cursor free over offsets its
+            // peers own.
+            if reader_mount || mw_client_mount {
                 log::info!(
                     "{} mount: block-ownership recovery skipped entirely (this mount \
-                     allocates nothing and frees nothing; the walk's free-completing arm \
-                     must never run on a snapshot view)",
+                     allocates nothing outside a granted lane and frees nothing locally; the \
+                     walk's free-completing arm must never run on a snapshot view)",
                     squeezefs::fuse_client::mount_posture().as_str()
                 );
             } else {
@@ -6291,7 +6315,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // `job:` xattrs on ino 1 — the coordinator role belongs to the
             // D0 writer-claim holder by definition (VL2/VL2b), which a
             // reader is not and must never appear to be.
-            if reader_mount || co_writer_mount {
+            if reader_mount || mw_client_mount {
                 // Rung-9 finding #4: a CO-WRITER took the coordinator arm
                 // here and died at mount — JobWireHost::start writes
                 // `job:enroll` and the fabric's crash-resume adoption
@@ -6301,15 +6325,19 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 // A co-writer takes the READER posture on this surface;
                 // fleet-parallel job WORKERS arrive by membership
                 // (KD-MW-16, rung 10c), never by hosting a coordinator.
+                //
+                // PR 7b: KD-PV-14 says the same thing about a PARTIAL
+                // AUTHORITY in per-volume terms — the maintenance
+                // coordinator is the owner of the SLOT-0 volume (D20), and
+                // `job:` records live on ino 1, which routes to slot 0. A
+                // partial authority hosting a fabric would meet the peer
+                // write gate on the very first record; it participates as
+                // an owner SHARD (KD-PV-16) through the fleet worker below.
                 log::info!(
                     "{} mount: job fabric, job wire and the frag-gauge worker are NOT armed \
-                     (maintenance coordination is the writer-claim holder's; this mount \
+                     (maintenance coordination is the slot-0 volume owner's; this mount \
                      cannot write their durable records)",
-                    if reader_mount {
-                        "Read-only"
-                    } else {
-                        "Co-writer"
-                    }
+                    squeezefs::fuse_client::mount_posture().as_str()
                 );
             } else {
                 // Worker width from the fleet-share-DIVIDED root
@@ -6435,9 +6463,17 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // member session for one mount (two leases, two self-fence
             // deadlines, one of them un-renewed), so the preflight's arm is
             // carried forward instead.
-            let membership_arm: Option<squeezefs::membership::MembershipArm> = if co_writer_mount {
-                // The preflight's arm is carried inside `co_writer_preflight`
-                // and handed to `cowriter::arm`, whose disarm leaves the plane.
+            //
+            // PR 7b: a PARTIAL AUTHORITY joined in ITS preflight for the same
+            // reason (the live lease IS the per-volume ladder's rung 4, taken
+            // before the set was opened), and its arm carries that session.
+            // A SET authority arms here as the plane's OWNER — under D20 it is
+            // the membership owner, which is why its own preflight only READ
+            // the rendezvous record.
+            let membership_arm: Option<squeezefs::membership::MembershipArm> = if mw_client_mount {
+                // The preflight's arm is carried inside the posture's own
+                // preflight and handed to its arm, whose disarm leaves the
+                // plane.
                 None
             } else {
                 squeezefs::membership::arm_mount_membership(
@@ -6521,11 +6557,42 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 None => None,
             };
 
+            // **PR 7b — the PARTIAL AUTHORITY's own arm** (§5.7's rev-6
+            // correction 2): the co-writer client halves toward the SET
+            // authority composed with an OWNER half serving only the volumes
+            // this node appends to. Deliberately here, beside the two arms it
+            // is made of and after both answered for their own postures: the
+            // authority arm returned `Ok(None)` naming this one, and a
+            // co-writer preflight cannot coexist with a per-volume one (the
+            // roles are mutually exclusive at rung 1).
+            //
+            // The preflight is MOVED in: the arm owns the membership lease and
+            // the device registration its admission took, so one disarm
+            // releases the whole posture.
+            let (pv_preflight, partial_authority_arm) = match pv_preflight {
+                Some(pre) if partial_authority_mount => (
+                    None,
+                    Some(
+                        squeezefs::multi_writer::arm_partial_authority(
+                            &routed_meta_backend,
+                            &fs_engine.router,
+                            pre,
+                        )
+                        .await
+                        .map_err(|e| format!("partial authority refused to arm: {e}"))?,
+                    ),
+                ),
+                other => (other, None),
+            };
+
             // Rung 17 (KD-MW-8): the CO-WRITER's extent hooks — the
             // demotion quiesce barrier and the coverage-release cache
             // invalidation (read-your-writes hands off to the covering
-            // publish the moment retention releases).
-            if co_writer_arm.is_some() {
+            // publish the moment retention releases). A partial authority
+            // takes them for the same reason it takes the rest of the client
+            // half: on the volumes it does not own, its write path IS a
+            // co-writer's.
+            if co_writer_arm.is_some() || partial_authority_arm.is_some() {
                 fs_engine.install_cowriter_extent_hooks();
             }
 
@@ -6538,8 +6605,14 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // and co-writer arms: an unjoined mount is not a member and
             // must not appear as a fleet worker. SQUEEZEFS_FLEET_JOBS=0
             // disarms this mount's half.
+            //
+            // PR 7b: a PARTIAL AUTHORITY arms one too — KD-PV-16's owner-shard
+            // fan-out is leased over exactly this wire, and the coordinator
+            // (the slot-0 owner) cannot cover a peer's inode plane itself
+            // (KD-PV-7 scopes the candidate set to volumes the evaluating node
+            // OWNS).
             let mut fleet_worker_arm: Option<squeezefs::fleet_worker::FleetWorkerArm> =
-                if (reader_mount || co_writer_mount)
+                if (reader_mount || mw_client_mount)
                     && squeezefs::env_knobs::fleet_jobs_enabled()
                     && squeezefs::membership::installed_member_session().is_some()
                 {
@@ -6654,9 +6727,18 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             if let Some(co) = co_writer_arm {
                 co.disarm().await;
             }
+            // PR 7b: the PARTIAL AUTHORITY's teardown, in the same
+            // outside-in order — it stops SERVING the volumes it owns, then
+            // stops holding custody and shipping, then leaves the membership
+            // plane it joined in its admission preflight and unregisters its
+            // key from the standing WERO hold.
+            if let Some(pa) = partial_authority_arm {
+                pa.disarm().await;
+            }
             if let Some(membership) = membership_arm {
                 membership.disarm().await;
             }
+            drop(pv_preflight);
             mount_result?;
         }
         Commands::Bench {

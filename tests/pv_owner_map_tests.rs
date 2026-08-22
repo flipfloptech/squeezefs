@@ -773,6 +773,90 @@ async fn a_successor_adoption_does_not_poison_peers_map_entries() {
     shutdown(&routed).await;
 }
 
+/// **The regression this rung's own wiring caused, pinned.** A map built
+/// by [`OwnerMap::for_volumes`] — the CO-WRITER arm's constructor, where
+/// every volume belongs to the authority it dialed — has no durable
+/// `claim_set.owner` behind it, so a fresh read has nothing to disagree
+/// WITH. Before the fix, the era relearn that follows an ordinary
+/// authority restart re-derived every volume, resolved no holder (or a
+/// durable id that is not the incarnation uuid the map names — the rung-9
+/// finding #3 class) and POISONED the whole set, fail-stopping a healthy
+/// co-writer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_map_with_no_durable_assignment_is_never_poisoned_by_a_re_derivation() {
+    let _plane = PLANE.lock().await;
+    let dir = TempDir::new().unwrap();
+    let vols = volume_set(dir.path(), "cowriter-map", 2).await;
+    let routed = squeezefs::meta_backend::open_routed_meta_set(&uris(&vols))
+        .await
+        .expect("write mount (the slot map's source)");
+    let _guard = arm_peer_owns(&routed, &[0, 1]);
+
+    // Whatever a fresh read says — an unattested claim, a stranger, no
+    // claim at all — this map states no assignment, so the conjunction
+    // has no verdict and nothing is poisoned.
+    let claim = foreign_claim(20);
+    for fresh in [
+        ownership("vol-a", None, Some(claim.clone()), false),
+        ownership(
+            "vol-a",
+            Some(assigned_set(PEER, Some(&claim), Some(STRANGER), &[])),
+            Some(claim.clone()),
+            false,
+        ),
+        ownership("vol-a", None, None, false),
+    ] {
+        assert!(
+            owners::reconcile_owner_from(0, &fresh),
+            "a map with no durable assignment must reach no verdict"
+        );
+    }
+    assert_eq!(owners::poisoned_volumes(), 0);
+    assert!(owners::route_volume(0).expect("still routes").is_some());
+    shutdown(&routed).await;
+}
+
+/// SILENCE at runtime is not the poison predicate (§5.10 poisons on *"a
+/// holder the assignment set does not name"*). A successor writes its
+/// KD-PV-17 attestation just after its claim commit, so an unresolved
+/// holder is usually that window: nothing is ADOPTED — the installed
+/// entry stands — and the next read decides. A verb shipped to a peer
+/// that no longer holds the claim is refused by that peer's own era gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn silence_at_runtime_leaves_the_entry_standing_and_never_poisons() {
+    let _plane = PLANE.lock().await;
+    let dir = TempDir::new().unwrap();
+    let vols = volume_set(dir.path(), "runtime-silence", 2).await;
+    let routed = squeezefs::meta_backend::open_routed_meta_set(&uris(&vols))
+        .await
+        .expect("write mount (the slot map's source)");
+    let claim = foreign_claim(21);
+    let _guard = arm_derived(&routed, &claim, PEER, &[]);
+
+    let unattested = foreign_claim(22);
+    assert!(
+        owners::reconcile_owner_from(
+            1,
+            &ownership(
+                "vol-b",
+                Some(assigned_set(PEER, None, None, &[])),
+                Some(unattested),
+                false,
+            ),
+        ),
+        "silence reaches no verdict"
+    );
+    assert_eq!(owners::poisoned_volumes(), 0, "and poisons nothing");
+    assert_eq!(
+        owners::owner_of_volume(1)
+            .expect("the entry stands")
+            .peer_id,
+        PEER,
+        "silence must not move ownership either — that is the other half of the law"
+    );
+    shutdown(&routed).await;
+}
+
 /// Poison is per VOLUME and only its own fresh read clears it. An
 /// adoption republishes the map (the `PlacementTable` precedent — the
 /// table is replaced, never mutated under readers), and a rebuild that

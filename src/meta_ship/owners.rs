@@ -124,10 +124,16 @@ impl OwnerMap {
     ) -> Result<Arc<Self>> {
         let count = routed.volumes.len();
         let mut volume_owners: Vec<Option<Arc<PeerOwner>>> = vec![None; count];
-        // A caller-named peer IS the assignment this map was built
-        // against: there is no durable record behind it, so the poison
-        // predicate reads exactly what the constructor asserted.
-        let mut assignment: Vec<Vec<String>> = vec![Vec::new(); count];
+        // **No durable ASSIGNMENT stands behind a caller-named peer.**
+        // This constructor is the co-writer arm's (every volume owned by
+        // the authority it dialed) and the suites'; neither reads a
+        // `claim_set.owner`, so the runtime conjunction has nothing to
+        // read and [`reconcile_owner_from`] stays inert on these maps.
+        // Recording the caller's assertion here instead would make a
+        // co-writer poison its whole set the first time its authority
+        // failed over — the per-mount-uuid-vs-durable-id mismatch is
+        // exactly the rung-9 finding #3 class.
+        let assignment: Vec<Vec<String>> = vec![Vec::new(); count];
         for (v_idx, peer) in foreign {
             if v_idx >= count {
                 return Err(SqueezefsError::InvalidOperation(format!(
@@ -136,7 +142,6 @@ impl OwnerMap {
                      grain and a wrong one cannot be interpreted)"
                 )));
             }
-            assignment[v_idx] = vec![peer.peer_id.clone()];
             volume_owners[v_idx] = Some(Arc::new(peer));
         }
         Ok(Self::build(routed, volume_owners, assignment))
@@ -595,13 +600,29 @@ pub fn reconcile_owner_from(v_idx: usize, fresh: &VolumeOwnership) -> bool {
         // guard's own heartbeat/fence path owns.
         return true;
     }
+    if map.assignment.get(v_idx).is_none_or(|a| a.is_empty()) {
+        // No durable assignment stands behind this entry (a co-writer's
+        // map, a test constructor's): there is nothing for a fresh read
+        // to disagree WITH, so the conjunction has no verdict to give.
+        // Poisoning here would fail-stop a healthy co-writer the first
+        // time its authority failed over.
+        return true;
+    }
     let Some(holder) = fresh.holder() else {
-        poison_volume(
-            v_idx,
-            "the live claim resolves to no durable identity (silence — the KD-PV-17 attestation \
-             is absent or stale), and ownership never moves on silence",
+        // SILENCE. It never ADOPTS — nothing moves — but it is not the
+        // poison predicate either (§5.10 poisons on "a holder the
+        // assignment set does not name"): a successor's attestation is
+        // written just after its claim commit, so an unresolved holder is
+        // most often that window. The installed entry stands, loudly, and
+        // a verb shipped to a peer that no longer holds the claim is
+        // refused by that peer's own era gate.
+        log::warn!(
+            "ownership map: metadata volume {v_idx}'s live claim resolves to no durable \
+             identity (the KD-PV-17 attestation is absent or is about an older claim), so this \
+             re-derivation reaches no verdict. The installed entry STANDS — silence never moves \
+             ownership — and the next read decides"
         );
-        return false;
+        return true;
     };
     // The assignment SET, not the singleton: read from the FRESH record
     // when it carries one, else from the map the derivation installed.

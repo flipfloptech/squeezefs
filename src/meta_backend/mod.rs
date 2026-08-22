@@ -1100,6 +1100,15 @@ impl RoutedMetaBackend {
     ) -> Result<()> {
         if !crate::meta_ship::owners::ownership_armed()
             || TEST_DISABLE_CROSS_OWNER_PRECHECK.load(std::sync::atomic::Ordering::Relaxed)
+            // Executing AS THE OWNER for a shipping client: the authority
+            // in force is the owner service's own per-volume vector, and
+            // its post-discovery cross-owner checks have already run on
+            // this very call. A dual-role node is both client and owner
+            // (which is what the S8 service is designed for), so reading
+            // the CLIENT-side map here would refuse verbs the owner half
+            // is authoritative for — pinned by `tests/meta_ship_tests.rs`,
+            // which is exactly that shape in one process.
+            || crate::meta_ship::executing_for_ship_client()
         {
             return Ok(());
         }

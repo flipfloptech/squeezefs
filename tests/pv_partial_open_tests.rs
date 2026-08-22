@@ -676,7 +676,7 @@ async fn a_partial_set_open_failure_releases_exactly_the_owned_volumes_guards() 
     )
     .await
     .err()
-    .expect("a peer volume with no appender refuses the whole set open");
+    .unwrap_or_else(|| panic!("a peer volume with no appender refuses the whole set open"));
     assert!(
         err.to_string().contains("NOTHING claims it"),
         "the set open must propagate the volume's own refusal: {err}"
@@ -733,7 +733,7 @@ async fn any_writable_mount_refuses_while_an_owner_assign_bracket_is_open() {
     let plain = squeezefs::meta_backend::open_routed_meta_set(&uris)
         .await
         .err()
-        .expect("an ordinary writable mount refuses mid-assignment");
+        .unwrap_or_else(|| panic!("an ordinary writable mount refuses mid-assignment"));
     assert!(
         plain.to_string().contains("owner_assign:")
             && plain.to_string().contains("volume set-owners"),
@@ -745,7 +745,7 @@ async fn any_writable_mount_refuses_while_an_owner_assign_bracket_is_open() {
     let partial = squeezefs::meta_backend::open_routed_meta_set_partial(&uris, &admission)
         .await
         .err()
-        .expect("the partial twin refuses the same way");
+        .unwrap_or_else(|| panic!("the partial twin refuses the same way"));
     assert!(
         partial.to_string().contains("owner_assign:"),
         "the partial open must run the sibling probe too: {partial}"
@@ -800,7 +800,7 @@ async fn a_cross_owner_open_intent_refuses_the_partial_mount() {
     let err = squeezefs::meta_backend::open_routed_meta_set_partial(&uris, &admission)
         .await
         .err()
-        .expect("an intent spanning two owners must refuse the mount");
+        .unwrap_or_else(|| panic!("an intent spanning two owners must refuse the mount"));
     assert!(
         err.to_string().contains("two metadata OWNERS"),
         "the refusal must say what makes the intent unrecoverable here: {err}"
@@ -955,7 +955,7 @@ async fn a_cross_owner_unlink_refuses_before_the_plan_is_minted() {
         .unlink(parent, &name)
         .await
         .err()
-        .expect("unlinking a peer-owned child must refuse");
+        .unwrap_or_else(|| panic!("unlinking a peer-owned child must refuse"));
     assert_eq!(
         err.to_errno(),
         libc::EXDEV,
@@ -1168,7 +1168,7 @@ async fn slot_migration_refuses_cross_owner_endpoints_and_slot_zero_while_armed(
         squeezefs::meta_backend::slot_migration::migrate_slot(&routed, peer_slot, 0, &opts, &hooks)
             .await
             .err()
-            .expect("a cross-owner slot migration must refuse");
+            .unwrap_or_else(|| panic!("a cross-owner slot migration must refuse"));
     assert!(
         cross.to_string().contains("cross-owner"),
         "the refusal must name what it is: {cross}"
@@ -1177,7 +1177,7 @@ async fn slot_migration_refuses_cross_owner_endpoints_and_slot_zero_while_armed(
     let slot0 = squeezefs::meta_backend::slot_migration::migrate_slot(&routed, 0, 1, &opts, &hooks)
         .await
         .err()
-        .expect("slot 0 is non-migratable while a multi-owner plane is armed");
+        .unwrap_or_else(|| panic!("slot 0 is non-migratable while a multi-owner plane is armed"));
     assert!(
         slot0.to_string().contains("slot 0"),
         "the refusal must name slot 0 and the set authority: {slot0}"
@@ -1416,6 +1416,85 @@ async fn a_member_joins_the_slot_0_owner_and_never_a_stale_peer_rendezvous() {
         2,
         "every other posture reads the whole set, exactly as shipped"
     );
+    for vol in &routed.volumes {
+        vol.shutdown().await.expect("release");
+    }
+}
+
+/// **§5.9.2's frozen-cross-owner-reference law, all four arms in one
+/// place** — the property the online inode plane rests on (KD-PV-8): while
+/// a multi-owner plane is armed, no cross-owner dentry can be CREATED
+/// (M2's mint constraint), REMOVED (M1 on `unlink`/`rmdir`), ADDED by name
+/// (M1 on `link`/`rename`, which the router and the owner side also
+/// refuse) or RELOCATED (row 13's cross-owner slot-migration refusal). The
+/// cross-owner reference set is fixed at the assignment instant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_cross_owner_dentry_set_is_frozen_under_an_armed_plane() {
+    let dir = TempDir::new().unwrap();
+    let (vol0, vol1) = two_volume_set(dir.path(), "freeze").await;
+    let uris = vec![vol0.display().to_string(), vol1.display().to_string()];
+    let routed = squeezefs::meta_backend::open_routed_meta_set(&uris)
+        .await
+        .expect("write mount");
+    let home = mkdir_on(&routed, 1, 0, "fz").await;
+    // Pre-assignment residue: a name on OUR volume for an inode on the
+    // peer's — the population M3 counts and this law freezes.
+    let (peer_child, peer_name) = mkfile_on(&routed, home, 1, "fz").await;
+
+    let _plane = arm_peer_owns_volume_1(&routed);
+
+    // Arm 1 — CREATE: every new ino shares its parent's owner.
+    let fresh = routed
+        .create(home, "fz_new", libc::S_IFREG | 0o644, 0, 0)
+        .await
+        .expect("create")
+        .ino;
+    assert!(
+        squeezefs::meta_ship::owners::owns_volume(routed.route_ino(fresh).0),
+        "arm 1: a create under an owned parent minted into a peer's volume"
+    );
+
+    // Arm 2 — REMOVE.
+    assert_eq!(
+        routed
+            .unlink(home, &peer_name)
+            .await
+            .err()
+            .map(|e| e.to_errno()),
+        Some(libc::EXDEV),
+        "arm 2: a cross-owner name must not be removable in place"
+    );
+
+    // Arm 3 — ADD (link; rename is pinned by its own case).
+    assert_eq!(
+        routed
+            .link(peer_child, home, "fz_link")
+            .await
+            .err()
+            .map(|e| e.to_errno()),
+        Some(libc::EXDEV),
+        "arm 3: no NEW cross-owner name may be created"
+    );
+
+    // Arm 4 — RELOCATE.
+    let peer_slot = routed
+        .slot_map_snapshot()
+        .iter()
+        .position(|&v| v == 1)
+        .expect("volume 1 hosts a slot") as u16;
+    assert!(
+        squeezefs::meta_backend::slot_migration::migrate_slot(
+            &routed,
+            peer_slot,
+            0,
+            &squeezefs::meta_backend::slot_migration::MigrationOptions::default(),
+            &squeezefs::meta_backend::slot_migration::MigrationTestHooks::default(),
+        )
+        .await
+        .is_err(),
+        "arm 4: a cross-owner slot migration would MOVE a name's inode away from it"
+    );
+
     for vol in &routed.volumes {
         vol.shutdown().await.expect("release");
     }

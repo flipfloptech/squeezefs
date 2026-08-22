@@ -2374,6 +2374,16 @@ fn rendezvous_volumes(
     }
 }
 
+/// Does this mount APPEND to the volume hosting slot 0 — i.e. is it the
+/// SET AUTHORITY (D20)? Read from the volume's own posture rather than
+/// from a declared role, so it cannot disagree with the open that took
+/// (or did not take) the claim.
+fn owns_slot_0_volume(meta: &Arc<crate::meta_backend::RoutedMetaBackend>) -> bool {
+    meta.volumes
+        .get(meta.route_ino(1).0)
+        .is_some_and(|v| !v.is_read_only())
+}
+
 /// The rendezvous records a member would actually SELECT from, in the
 /// order [`rendezvous_volumes`] scopes them to — the observable face of
 /// sweep row 17, so the scoping is pinned rather than inferred from a
@@ -2419,6 +2429,24 @@ pub async fn arm_mount_membership(
             secret,
             MemberRole::Reader,
             0,
+            on_purge,
+        )
+        .await;
+    }
+    // **Sweep row 8** (per-volume claim admission §5.4, D20): the "write
+    // mount ⇒ lease AUTHORITY" branch keys on owning the SLOT-0 volume,
+    // not on being writable. Under a per-volume posture every partial
+    // authority is a write mount, so the shipped predicate would arm K
+    // owners of one plane — members holding leases from one node while
+    // custody, lane assignment and the grace ring live on another. The
+    // test is the volume's own posture: a set authority APPENDS to the
+    // slot-0 volume; a partial authority reads it as peer-owned.
+    if crate::fuse_client::partial_meta_mount() && !owns_slot_0_volume(meta) {
+        return arm_member(
+            &rendezvous_volumes(meta),
+            secret,
+            MemberRole::Writer,
+            crate::data_custody::live_wero_key().unwrap_or(0),
             on_purge,
         )
         .await;

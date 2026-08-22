@@ -125,6 +125,7 @@ pub use owners::{
     ownership_armed, owns_volume, rearm_ownership, OwnerMap, PeerOwner,
 };
 pub use router::{MetaShipRouter, VerbRoute, TEST_SHIP_DRAIN_HOLD_MS};
+pub(crate) use service::executing_for_ship_client;
 pub use service::{
     owner_authority_token, MetaShipService, ServiceStats, TEST_DELEG_COHERENCE_LAW,
     TEST_INTENT_APPLY_ERRNO, TEST_INTENT_READ_GATE, TEST_INTENT_SUPPLY_CHUNK,

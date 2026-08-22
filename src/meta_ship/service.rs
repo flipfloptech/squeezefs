@@ -108,6 +108,22 @@ squeezefs_ipc::sqz_task_local! {
     static SHIP_REVOKES: RefCell<Vec<u64>>;
 }
 
+/// Is this task executing a verb an owner service accepted **on behalf of
+/// a shipping client** (per-volume claim admission §5.4a)?
+///
+/// Distinct from [`current_ship_client`], which answers `None` for the
+/// empty client id ("the client wants no delegations") — this asks only
+/// whether the OWNER-EXECUTE scope is active. The §5.4a M1 pre-check reads
+/// it: inside this scope the authority in force is the owner service's own
+/// per-volume `authority` vector (and its post-discovery cross-owner
+/// checks, which have already run), never this node's client-side
+/// `OwnerMap` — a dual-role node is BOTH, and consulting the client half
+/// while executing as the owner would refuse a verb the owner is
+/// authoritative for.
+pub(crate) fn executing_for_ship_client() -> bool {
+    SHIP_CLIENT.try_with(|_| ()).is_ok()
+}
+
 /// The shipping client whose verb is executing on THIS task, if any —
 /// rung 14's placement hint reads it at the mint-slot pick (the same
 /// deep-inside-the-backend position the mutation gate reads it from).

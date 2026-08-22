@@ -117,6 +117,15 @@ impl Drop for Restore {
         squeezefs::meta_backend::kv::indirect_map::uninstall_indirect_map_io();
         squeezefs::data_alloc_lane::test_reset_mount_partition();
         ship::disarm_ownership();
+        // The mount-path selection pin below declares a posture through
+        // the environment, and every knob here is process-global.
+        for k in [
+            "SQUEEZEFS_MULTI_WRITER",
+            "SQUEEZEFS_MW_ROLE",
+            "SQUEEZEFS_MW_AUTHORITY",
+        ] {
+            std::env::remove_var(k);
+        }
     }
 }
 
@@ -1242,4 +1251,78 @@ async fn a_peer_that_publishes_late_is_resolved_by_the_refresh_pass() {
     for v in &meta.volumes {
         v.shutdown().await.expect("clean shutdown");
     }
+}
+
+// ===========================================================================
+// The MOUNT PATH's own gate (PR 8's blocker)
+// ===========================================================================
+
+/// Contract: **a declared per-volume posture is SELECTABLE by the mount
+/// path.** `src/main.rs` resolves `cowriter::co_writer_requested()` before
+/// it reads `partial_authority::requested()`, so anything that refuse
+/// there makes both per-volume roles unreachable no matter how complete
+/// the ladder, the partial open and the arms are — which is exactly what
+/// PR 3's scaffolding did, and what every in-process contract in this file
+/// stepped over by calling the arm directly. A per-volume role is not a
+/// co-writer declaration: this reader answers `false` for it and the
+/// seven-rung ladder owns every refusal about it (rung 1 owns the missing
+/// opt-in, pinned in `tests/pv_admission_tests.rs`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declared_per_volume_posture_is_selectable_by_the_mount_path() {
+    let _serial = SERIAL.lock().await;
+    let _restore = Restore;
+
+    for (role, authority) in [
+        ("partial-authority", Some("127.0.0.1:7100")),
+        ("set-authority", None),
+    ] {
+        std::env::set_var("SQUEEZEFS_MULTI_WRITER", "1");
+        std::env::set_var("SQUEEZEFS_MW_ROLE", role);
+        match authority {
+            Some(a) => std::env::set_var("SQUEEZEFS_MW_AUTHORITY", a),
+            None => std::env::remove_var("SQUEEZEFS_MW_AUTHORITY"),
+        }
+        assert!(
+            pv::requested(),
+            "{role} is a per-volume declaration the mount path must route to the partial door"
+        );
+        assert_eq!(
+            squeezefs::cowriter::co_writer_requested()
+                .unwrap_or_else(|e| panic!("{role} is refused before the ladder ever runs: {e}")),
+            false,
+            "{role} is not the CO-WRITER posture, so the co-writer door stays shut"
+        );
+
+        // Without the opt-in the answer is the same: not a co-writer. The
+        // refusal belongs to rung 1, which names SQUEEZEFS_MULTI_WRITER —
+        // answering it here would refuse the posture instead of the
+        // missing half.
+        std::env::remove_var("SQUEEZEFS_MULTI_WRITER");
+        assert_eq!(
+            squeezefs::cowriter::co_writer_requested().unwrap_or_else(|e| panic!(
+                "{role} without the opt-in must reach rung 1, not a mount-path refusal: {e}"
+            )),
+            false,
+            "{role} is not the CO-WRITER posture with the opt-in off either"
+        );
+        assert!(
+            pv::requested(),
+            "{role} is still a declaration — rung 1 is what refuses it"
+        );
+    }
+
+    // The co-writer arms are untouched by that widening.
+    std::env::set_var("SQUEEZEFS_MULTI_WRITER", "1");
+    std::env::set_var("SQUEEZEFS_MW_ROLE", "co-writer");
+    assert!(
+        squeezefs::cowriter::co_writer_requested().expect("a declared co-writer is admitted"),
+        "the co-writer door is unchanged"
+    );
+    assert!(!pv::requested(), "and it is not a per-volume declaration");
+    std::env::remove_var("SQUEEZEFS_MULTI_WRITER");
+    assert!(
+        squeezefs::cowriter::co_writer_requested().is_err(),
+        "a co-writer without the opt-in still refuses at the mount path — that arm has no \
+         ladder of its own to defer to"
+    );
 }

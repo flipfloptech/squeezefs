@@ -2344,6 +2344,52 @@ impl MembershipArm {
 /// `on_purge` is the reader's fail-stop action (drop every cached block —
 /// `ro_coherence::purge_reader_block_keys`), invoked if the member ever
 /// misses its own `T_self` deadline.
+/// **Sweep row 17 (per-volume claim admission §5.4): the volumes the
+/// membership RENDEZVOUS record lives on.**
+///
+/// Today an owner publishes its record to EVERY volume and a member picks
+/// the highest-term record across all of them. Under a per-volume posture
+/// only the set authority may write, so peer-owned volumes would retain
+/// **stale** `membership_owner` records that nobody can remove (they are
+/// pinned against slot travel) and that max-term selection may pick —
+/// pointing members at a dead endpoint.
+///
+/// So while this mount runs a per-volume posture, the rendezvous is the
+/// **slot-0 volume alone** (D20: its owner IS the set authority, and ino 1
+/// homes there by `route_ino_width`). Every other posture is unchanged:
+/// the whole set, exactly as shipped.
+fn rendezvous_volumes(
+    meta: &Arc<crate::meta_backend::RoutedMetaBackend>,
+) -> Vec<Arc<KvMetaBackend>> {
+    if !crate::fuse_client::partial_meta_mount() {
+        return meta.volumes.clone();
+    }
+    let slot_0 = meta.route_ino(1).0;
+    match meta.volumes.get(slot_0) {
+        Some(v) => vec![Arc::clone(v)],
+        // Unreachable through the routed backend's own invariants; falling
+        // back to the whole set keeps a member joinable rather than
+        // silently invisible.
+        None => meta.volumes.clone(),
+    }
+}
+
+/// The rendezvous records a member would actually SELECT from, in the
+/// order [`rendezvous_volumes`] scopes them to — the observable face of
+/// sweep row 17, so the scoping is pinned rather than inferred from a
+/// join that needs a live plane.
+pub async fn test_rendezvous_records(
+    meta: &Arc<crate::meta_backend::RoutedMetaBackend>,
+) -> Vec<OwnerRecord> {
+    let mut out = Vec::new();
+    for be in rendezvous_volumes(meta) {
+        if let Some(rec) = read_owner_record(&be).await {
+            out.push(rec);
+        }
+    }
+    out
+}
+
 pub async fn arm_mount_membership(
     meta: &Arc<crate::meta_backend::RoutedMetaBackend>,
     read_only: bool,
@@ -2368,7 +2414,14 @@ pub async fn arm_mount_membership(
     };
 
     if read_only {
-        return arm_member(&volumes, secret, MemberRole::Reader, 0, on_purge).await;
+        return arm_member(
+            &rendezvous_volumes(meta),
+            secret,
+            MemberRole::Reader,
+            0,
+            on_purge,
+        )
+        .await;
     }
     let bind_addr = match bind {
         MembershipBind::Off => {
@@ -2438,8 +2491,13 @@ async fn arm_owner(
     let term = crate::dlm::durable_term();
     // The predecessor's era, from its own durable evidence: the rendezvous
     // record it left behind (a crash) and the claim set (§6.2 item 7).
+    // Sweep row 17(c): the predecessor's era is read from the RENDEZVOUS
+    // volumes — under a per-volume posture a peer volume's own era belongs
+    // to its owner and advances independently, so maxing over it would
+    // import a foreign clock into this plane's term ladder.
+    let rendezvous = rendezvous_volumes(meta);
     let mut prior_term = 0u64;
-    for be in &volumes {
+    for be in &rendezvous {
         if let Some(rec) = read_owner_record(be).await {
             prior_term = prior_term.max(rec.term);
         }
@@ -2496,8 +2554,14 @@ async fn arm_owner(
         pr_key: crate::data_custody::live_wero_key().unwrap_or(0),
     };
     let mut expected: Vec<String> = Vec::new();
-    for be in &volumes {
+    // Sweep row 17(a): the record goes to the rendezvous volumes only, and
+    // the claim-set upsert goes to the volumes this mount APPENDS to
+    // (sweep row 8) — a peer-owned volume's write gate would refuse it
+    // loud, and correctly: its roster is its owner's to maintain.
+    for be in &rendezvous {
         publish_owner_record(be, &rec).await?;
+    }
+    for be in volumes.iter().filter(|v| !v.is_read_only()) {
         if let Some(set) = ClaimSet::load(be).await {
             for m in set.writers() {
                 // Compare against the DURABLE claim identity: our own

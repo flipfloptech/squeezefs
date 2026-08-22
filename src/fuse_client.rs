@@ -7621,6 +7621,23 @@ impl SqueezefsFilesystem {
             .unwrap_or(0)
     }
 
+    /// `volumes_peer_owned` — the volumes of this set a PEER authority
+    /// appends to (§11.1's partition-at-a-glance gauge).
+    fn peer_owned_volume_count(&self) -> usize {
+        self.meta_backend
+            .as_ref()
+            .map(|r| {
+                r.volumes
+                    .iter()
+                    .filter(|v| {
+                        v.read_only_cause()
+                            == crate::meta_backend::kv::backend::ReadOnlyCause::PeerOwnedVolume
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
     /// `reader_staleness_bound_owners` — how many distinct OWNERS the
     /// mount's projection depends on. `0` when it depends on none;
     /// otherwise the ownership plane's peer count when armed, and 1
@@ -9435,6 +9452,19 @@ impl SqueezefsFilesystem {
                 "writeback_stale_token_retries": METRICS.writeback_stale_token_retries.load(Ordering::Relaxed),
                 "writeback_orphan_discards": METRICS.writeback_orphan_discards.load(Ordering::Relaxed),
                 "writeback_fence_noops": METRICS.writeback_fence_noops.load(Ordering::Relaxed),
+                // Per-volume claim admission (§11.1): three top-level
+                // counters, all 0 on every shipped mount. The first two
+                // are MUST-STAY-0 tripwires; `peer_volume_unclaimed_refusals`
+                // is R13's operational face — nonzero means an assigned
+                // owner is not claiming, i.e. a dead owner and a
+                // fleet-wide stop.
+                "peer_volume_local_commit_refusals": METRICS.peer_volume_local_commit_refusals.load(Ordering::Relaxed),
+                "peer_volume_unclaimed_refusals": METRICS.peer_volume_unclaimed_refusals.load(Ordering::Relaxed),
+                "xv_cross_owner_intents": METRICS.xv_cross_owner_intents.load(Ordering::Relaxed),
+                // The partition at a glance: how many of this set's
+                // volumes a PEER authority appends to (0 on every posture
+                // but the two partial-writer ones).
+                "volumes_peer_owned": self.peer_owned_volume_count(),
                 // DLM S5 — the reader-coherence family (0 on write mounts).
                 "read_only_mount": read_only_mount(),
                 // The reader's two DERIVED numbers, machine-readable so the

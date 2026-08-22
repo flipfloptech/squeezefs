@@ -1334,3 +1334,89 @@ async fn a_partial_and_a_set_authority_arm_revalidation_on_peer_volumes_only() {
         vol.shutdown().await.expect("release");
     }
 }
+
+/// **Sweep row 17** — the membership rendezvous under a per-volume
+/// posture. An owner publishes its record to EVERY volume today and a
+/// member picks the highest-term record across all of them; under
+/// multi-owner only the set authority may write, so peer volumes would
+/// keep **stale** records nobody can remove (they are pinned against slot
+/// travel) and max-term selection could point a member at a dead endpoint.
+/// The rendezvous is therefore the slot-0 volume alone (D20).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_member_joins_the_slot_0_owner_and_never_a_stale_peer_rendezvous() {
+    let dir = TempDir::new().unwrap();
+    let (vol0, vol1) = two_volume_set(dir.path(), "rendezvous").await;
+    let uris = vec![vol0.display().to_string(), vol1.display().to_string()];
+    let routed = squeezefs::meta_backend::open_routed_meta_set(&uris)
+        .await
+        .expect("write mount");
+    assert_eq!(
+        routed.route_ino(1).0,
+        0,
+        "ino 1 pins to slot 0, which homes on volume 0 (KD-PV-6)"
+    );
+
+    let _restore = PostureGuard;
+    // A STALE record on the peer's volume, carrying a HIGHER term than the
+    // live one: exactly the shape max-term selection would pick.
+    squeezefs::membership::publish_owner_record(
+        &routed.volumes[1],
+        &squeezefs::membership::OwnerRecord {
+            v: 1,
+            id: "dead-incarnation".to_string(),
+            term: 99,
+            endpoint: "10.9.9.9:9999".to_string(),
+            owner_claim_id: PEER.to_string(),
+            ttl_ms: 45_000,
+            ts: 1_700_000_000,
+            pid: 4242,
+            boot: "ffffffff-ffff-ffff-ffff-ffffffffffff".to_string(),
+        },
+    )
+    .await
+    .expect("plant the stale peer rendezvous");
+    squeezefs::membership::publish_owner_record(
+        &routed.volumes[0],
+        &squeezefs::membership::OwnerRecord {
+            v: 1,
+            id: "live-set-authority".to_string(),
+            term: 7,
+            endpoint: "127.0.0.1:7100".to_string(),
+            owner_claim_id: NODE.to_string(),
+            ttl_ms: 45_000,
+            ts: 1_700_000_000,
+            pid: std::process::id(),
+            boot: String::new(),
+        },
+    )
+    .await
+    .expect("plant the live slot-0 rendezvous");
+
+    squeezefs::fuse_client::set_mount_posture(
+        squeezefs::fuse_client::MountPosture::PartialAuthority,
+    );
+    let scoped = squeezefs::membership::test_rendezvous_records(&routed).await;
+    assert_eq!(
+        scoped.len(),
+        1,
+        "under a per-volume posture the rendezvous is the slot-0 volume ALONE"
+    );
+    assert_eq!(
+        scoped[0].id, "live-set-authority",
+        "a member must join the slot-0 owner, never the higher-term stale record a peer \
+         volume kept: {:?}",
+        scoped[0]
+    );
+
+    squeezefs::fuse_client::set_mount_posture(squeezefs::fuse_client::MountPosture::Writer);
+    assert_eq!(
+        squeezefs::membership::test_rendezvous_records(&routed)
+            .await
+            .len(),
+        2,
+        "every other posture reads the whole set, exactly as shipped"
+    );
+    for vol in &routed.volumes {
+        vol.shutdown().await.expect("release");
+    }
+}

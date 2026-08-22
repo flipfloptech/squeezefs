@@ -49,6 +49,36 @@
 //! it refuses, because "never adopt on silence" (KD-PV-3) is exactly the
 //! law that a `None` here must not be allowed to soften.
 //!
+//! # The `co_writer_mount()` consumer-by-posture audit (PR 4, sweep row 14)
+//!
+//! §5.1.3 adds `PARTIAL_META` as an **additive** latch precisely so that no
+//! existing predicate changes meaning at ~40 sites at once (the S9 latch
+//! discipline). That is a claim about SEMANTICS, not about text, so the PR
+//! walks every consumer of `co_writer_mount()` and states which posture it
+//! is correct for. A `set-authority` latches `CO_WRITER = 0` and a
+//! `partial-authority` latches `CO_WRITER = 1`, so each row below reads:
+//! *what the site does for a co-writer* — and whether that is right for
+//! the posture that inherits it.
+//!
+//! | Site | What it gates | `set-authority` (latch 0 ⇒ behaves as `writer`) | `partial-authority` (latch 1 ⇒ behaves as `co-writer`) |
+//! |---|---|---|---|
+//! | `block_allocator::plane_gate` | ownership ACCOUNTING (allocation-level frees, the recovery walk, incarnation retire) | **correct**: it owns device offsets for the set — its ledger IS the authority's, and a fleet where no node runs these arms has no W1 patch and no recovery walk (the gate's own production assumption) | **correct**: a device offset's ownership is METADATA, which it lacks for peer volumes; its accounting ships |
+//! | `block_allocator::alloc_plane_gate` | fresh ALLOCATION (relaxed by an owned lane) | **correct**: allocates directly, as a writer does | **correct**: allocates inside its granted residue class, refuses without one |
+//! | `block_allocator::abandon_unpublished_offset` | the unpublished-offset abandon path | **correct**: abandons locally | **correct**: counts the abandon; the authority's derivation reclaims |
+//! | `block_reclaim` enqueue gate | direct device reclaim (`BLKDISCARD`/`PUNCH_HOLE`) | **correct**: it is the set's reclaimer, and §5.11(b) puts the ONE grace ring here | **correct**: its terminal frees SHIP, so it must never issue device reclaims |
+//! | `routing::free_block` / `free_blocks` | terminal frees: ship vs local ladder | **correct**: runs the whole ladder locally (begin_free → purge → reclaim → finish_free) | **correct**: ships `PublishCall::FreeBlocks`, which is what keeps exactly one grace ring in the fleet |
+//! | the three W1 patch declines (`fuse_client`, dd + handler + in-place overwrite) | the sole-owner in-place patch | **correct**: it patches, and R14's cost is precisely that only it does | **correct**: a lifetime incarnation retire is durable ownership state and the §5.1 clone/patch fence is process-local — no wire composes it, so it rides CoW-rewrite + a shipped free (R14, priced not hidden) |
+//! | `ro_coherence::arm_reader_data_plane` (the mount arming site) | the reader data-plane lockdown | **correct**: NOT armed — a set authority's data plane is `writer`'s | **correct**: armed, as for a co-writer |
+//! | `main`'s fleet-worker arm (`reader_mount \|\| co_writer_mount`) | whether this mount can be LEASED an fsck shard | **correct**: does not arm one — it is the coordinator (KD-PV-14) and runs its own shard through the local path | **correct**: arms one, which is what KD-PV-16's owner-shard fan-out leases |
+//!
+//! Two consumers are NOT `co_writer_mount()`'s and are listed because the
+//! same audit question applies: every `read_only_mount()` site keeps its
+//! exact meaning (neither new posture latches it), and the revalidation
+//! arming site is the one place where the mount-level predicate was
+//! genuinely WRONG for a set authority — see sweep row 15 / risk R18,
+//! which is why that site now decides per VOLUME
+//! ([`crate::ro_coherence::volume_wants_revalidation`]).
+//!
 //! # Why the decision is unforgeable
 //!
 //! [`SetAdmission`]'s fields are private and [`classify_set_admission`] is

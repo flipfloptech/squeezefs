@@ -14,11 +14,13 @@
 //! * **The migration policy**: sustained concentration (the supply-event
 //!   run — the rung-11 pattern-vs-coincidence constant) toward a client
 //!   that OWNS a volume (the ownership-map inversion — the
-//!   fleet-of-authorities shape, §6.10 R4's recipe) triggers the EXISTING
-//!   online `migrate-meta-slot` engine, moving the client's hot slots to
-//!   its volume so its metadata verbs run locally (the S8 owner path).
-//!   With no client-owned candidate volume — every shipped fleet today —
-//!   the policy is structurally dark.
+//!   fleet-of-authorities shape, §6.10 R4's recipe) counts a CANDIDATE and
+//!   — since **KD-PV-13** — triggers nothing: every migration this policy
+//!   can select is cross-owner by construction and sweep row 13 refuses
+//!   it, so the launch arm is inert while a multi-owner plane is armed
+//!   (`docs/design-per-volume-claim-admission.md` §5.5). With no
+//!   client-owned candidate volume the policy is dark one step earlier —
+//!   the inversion finds nothing at all.
 //! * **The valve (never thrash)**: two clients alternating on one
 //!   directory must not ping-pong its slot — migration episodes inside the
 //!   thrash window count cycles, and at the rung-11 constant the slot
@@ -79,6 +81,7 @@ impl Drop for ArmGuard {
         ship::TEST_DELEGATION_OVERRIDE.store(0, Ordering::SeqCst);
         intents::TEST_INTENTS_OVERRIDE.store(0, Ordering::SeqCst);
         placement::TEST_PLACEMENT_OVERRIDE.store(0, Ordering::SeqCst);
+        placement::TEST_MIGRATION_DISARM_OVERRIDE.store(0, Ordering::SeqCst);
         ship::TEST_INTENT_SUPPLY_CHUNK.store(0, Ordering::SeqCst);
         placement::uninstall_migration_executor();
         placement::test_clear_placement();
@@ -493,28 +496,34 @@ async fn two_placement_armed_clients_get_distinct_dedicated_slots() {
 // 3. The migration policy
 // ===========================================================================
 
-/// Sustained concentration from a client that OWNS a volume (the
-/// fleet-of-authorities inversion) drives the policy through the authority
-/// executor — and the executor now **REFUSES**, because every migration
-/// this policy can select is a CROSS-OWNER one by construction: its target
-/// is a client-owned volume (`owned[0]`) and its victim's home is not, so
-/// the two endpoints always have different owners.
+/// **KD-PV-13 — `the_migration_half_is_disarmed_under_multi_owner`.**
 ///
-/// That refusal is sweep row 13 of
-/// `docs/design-per-volume-claim-admission.md` (D19 defers the two-party
-/// hand-off; a cross-owner slot migration would also move a child's inode
-/// record away from the dentry naming it, CREATING cross-owner names). The
-/// pin is therefore re-scoped from "the engine completes" to the honest
-/// composition: candidate found, migration triggered, engine refused,
-/// nothing moved. KD-PV-13 removes the trigger itself in the next rung —
-/// the policy's launch arm goes inert under a multi-owner plane, so
-/// `migrations_triggered`/`migrations_failed` become 0 by construction
-/// rather than a refuse-and-retry loop. The ENGINE's own coverage, which
-/// this case used to carry, is preserved by
+/// Sustained concentration from a client that OWNS a volume (the
+/// fleet-of-authorities inversion) still counts its CANDIDATE — that is the
+/// follow-on's demand signal — but launches nothing at all.
+///
+/// The reason is structural, not a policy preference: the policy's target
+/// is a client-owned volume (`owned[0]`) and its victim's home is by
+/// construction NOT in that set, so **every** migration it can select is a
+/// CROSS-OWNER one, which sweep row 13 of
+/// `docs/design-per-volume-claim-admission.md` refuses (D19 defers the
+/// two-party hand-off; the move would also relocate an inode record away
+/// from the dentry naming it, CREATING cross-owner names). Left armed, the
+/// composition is a permanent trigger → refuse → fail retry loop and a
+/// counter that grows for ever on a healthy fleet. So the launch arm is
+/// inert while a multi-owner plane is armed, and
+/// `migrations_triggered`/`migrations_failed`/`migrations_completed` are
+/// **structurally 0** (§11.2: nonzero means the disarm broke).
+///
+/// PR 4 re-scoped this pin from "the engine completes" to "the engine
+/// refuses"; this is the second half of the same flip. The ENGINE's own
+/// coverage lives in
 /// `the_migration_engine_moves_a_slot_when_no_multi_owner_plane_is_armed`
-/// below, so the follow-on that builds cross-owner migration inherits it.
+/// and the POLICY's launch machinery — the valve the follow-on inherits —
+/// in `two_clients_alternating_on_one_directory_never_ping_pong_the_slot`,
+/// which drives it through the declared test override.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_migration_policy_engages_on_sustained_client_concentration() {
+async fn the_migration_half_is_disarmed_under_multi_owner() {
     let _plane = PLANE.lock().await;
     // Volume 1 is OWNED BY THE CLIENT (the §6.10 R4 recipe, in-process).
     let fx = fixture(2, &[(1, NODE)]).await;
@@ -524,37 +533,33 @@ async fn the_migration_policy_engages_on_sustained_client_concentration() {
     ship::TEST_INTENT_SUPPLY_CHUNK.store(2, Ordering::SeqCst);
 
     let (d, _f0) = earn_update(&fx, "pl-policy").await;
-    // Drive supply events (grant + refills) to the sustain threshold: mint
-    // through the real machinery, fsync forcing each refill.
+    // Drive supply events (grant + refills) well past the sustain
+    // threshold: mint through the real machinery, fsync forcing each
+    // refill.
     for i in 0..10 {
         let _ = Metadata::create(fx.client_be.as_ref(), d, &format!("c{i}"), FILE, 0, 0).await;
         intents::fsync_dir_barrier(d).await.expect("flush");
-        if pstats().migrations_triggered > 0 {
-            break;
-        }
     }
-    wait_for("the policy to trigger and the engine to answer", || {
-        let s = pstats();
-        s.migrations_failed >= 1 || s.migrations_completed >= 1
+    wait_for("the candidate inversion to fire", || {
+        pstats().migration_candidates >= 1
     })
     .await;
     let s = pstats();
     assert!(
         s.migration_candidates >= 1,
-        "the candidate inversion found the client-owned volume"
-    );
-    assert!(
-        s.migrations_triggered >= 1,
-        "the policy still triggers at this rung (KD-PV-13 disarms it next)"
+        "the candidate inversion found the client-owned volume — the follow-on's demand signal \
+         keeps counting"
     );
     assert_eq!(
-        s.migrations_completed, 0,
-        "a CROSS-OWNER slot migration must not complete: D19 defers the hand-off, and moving \
-         the slot would create cross-owner names rather than remove them (sweep row 13)"
+        s.migrations_triggered, 0,
+        "KD-PV-13: nothing may be TRIGGERED while a multi-owner plane is armed"
     );
-    assert!(
-        s.migrations_failed >= 1,
-        "the engine's refusal is what the policy sees"
+    assert_eq!(s.migrations_failed, 0, "and therefore nothing fails");
+    assert_eq!(s.migrations_completed, 0, "and nothing completes");
+    assert_eq!(
+        s.thrash_demotions, 0,
+        "a valve that charges episodes for moves that never launch would demote slots on a \
+         healthy fleet"
     );
 
     // Nothing moved: the client's assignment stands where it was.
@@ -562,7 +567,7 @@ async fn the_migration_policy_engages_on_sustained_client_concentration() {
     let assigned = placement::client_assigned_slots(NODE);
     assert!(
         assigned.iter().all(|&s| map[usize::from(s)] != 1),
-        "a refused migration must leave the slot map untouched (assigned {assigned:?})"
+        "a disarmed policy must leave the slot map untouched (assigned {assigned:?})"
     );
     shutdown(&fx).await;
 }
@@ -606,9 +611,12 @@ async fn the_migration_engine_moves_a_slot_when_no_multi_owner_plane_is_armed() 
     shutdown(&fx).await;
 }
 
-/// With NO client-owned candidate volume — every shipped fleet today — the
-/// policy is structurally dark: sustained concentration accumulates no
-/// candidates, triggers no migration, and the valve never engages.
+/// With NO client-owned candidate volume the policy is dark for a reason
+/// INDEPENDENT of KD-PV-13's disarm: the candidate inversion itself finds
+/// nothing, so no demand is even signalled. Both halves matter and this pin
+/// carries the first — `migration_candidates` is the follow-on's demand
+/// signal, and a fleet where the shipping client owns nothing must not
+/// manufacture one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_policy_stays_dark_when_no_client_owned_volume_exists() {
     let _plane = PLANE.lock().await;
@@ -636,12 +644,20 @@ async fn the_policy_stays_dark_when_no_client_owned_volume_exists() {
 /// migration episodes inside the thrash window count cycles, the slot
 /// demotes at the rung-11 constant, holds through the cooldown, and
 /// re-promotes with the evidence reset after it.
+///
+/// **This is the launch machinery KD-PV-13 disarms and D19's named
+/// follow-on inherits**, so the case drives it through the declared
+/// override (`TEST_MIGRATION_DISARM_OVERRIDE = 2`, the `arm_ownership`
+/// law: reachable so the behaviour is TESTED rather than commented). The
+/// disarm itself is pinned by `the_migration_half_is_disarmed_under_multi_owner`
+/// above, which runs the same fixture with the override off.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_clients_alternating_on_one_directory_never_ping_pong_the_slot() {
     let _plane = PLANE.lock().await;
     // X owns volume 1, Y owns volume 2 — the contended slot is a shared
     // directory's, associated to BOTH clients.
     let fx = fixture(3, &[(1, NODE), (2, NODE_B)]).await;
+    placement::TEST_MIGRATION_DISARM_OVERRIDE.store(2, Ordering::SeqCst);
     let calls: Arc<parking_lot::Mutex<Vec<(u16, usize)>>> =
         Arc::new(parking_lot::Mutex::new(Vec::new()));
     {

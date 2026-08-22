@@ -397,27 +397,37 @@ armed rows plus `pv-rand4k-verdict.txt`. The leg asserts the postures
 themselves — the partial authority must perform **zero** W1 patch writes
 and the set authority must perform some.
 
-### Step 6 — the third R14 arm, on a single-authority fleet (~8 min)
+### Step 6 — the end-of-run cross-owner census (~2 min)
+
+Take it **before** the fleet is replaced, and take it OFFLINE: the census
+walks every directory entry under the D0-guarded coordinator, so the fleet
+must be down first — partial authorities before the set authority, which
+is ops.md's reverse-of-bring-up order.
+
+```bash
+. /run/squeezefs-mwfleet/config.env      # META_PATHS, OWNER_CENSUS_AT_ASSIGNMENT
+sudo -E tests/mw_fleet.sh unmount 20     # every partial authority first...
+sudo -E tests/mw_fleet.sh unmount 0      # ...the set authority last
+sudo -E $SQZ_BIN volume get-owners "sqmeta://$META_PATHS" --census
+```
+
+**Harvest into [(b)](#b-the-cross-owner-refusal-table-d18s-obligation)**:
+the printed `Cross-owner names: N` beside `OWNER_CENSUS_AT_ASSIGNMENT` —
+those two are the undeletable-in-place population at both ends of the run.
+
+### Step 7 — the third R14 arm, on a single-authority fleet, then down (~10 min)
 
 ```bash
 sudo -E tests/mw_fleet.sh teardown                       # zero-residue asserted
 sudo -E tests/mw_fleet.sh create N=1 --multi-writer
 sudo -E tests/run_mw_matrix.sh pv-rand4k-w1 --w1-secs=30 --w1-mb=256
+sudo -E tests/mw_fleet.sh teardown
 ```
 
 The leg detects the unassigned fleet and emits the
 `single-authority-today` arm — the third row of §5.1.3's table. A fleet
 cannot be both shapes at once, which is why this is a second incarnation
 and not a third arm of step 5.
-
-### Step 7 — the end-of-run census, then down
-
-```bash
-sudo -E tests/mw_fleet.sh teardown
-# on the assigned set only (step 6 tore it down — re-create + re-assign if
-# the closing count is wanted, or take it before step 6 instead):
-sudo -E $SQZ_BIN volume get-owners "sqmeta://<meta-uri>" --census
-```
 
 Then, on the operator box:
 
@@ -435,8 +445,8 @@ tests/cloud_bench_cluster.sh teardown    # idempotent; fails loud if anything st
 | 3 rewrite funnel | ~10 min |
 | 4 cross-owner | ~5 min |
 | 5 rand-4k (multi-owner) | ~5 min |
-| 6 rand-4k (single-authority) | ~8 min |
-| 7 teardown | ~5 min |
+| 6 end-of-run census | ~2 min |
+| 7 rand-4k (single-authority) + teardown | ~10 min |
 | **total** | **~75 min** ⇒ under 2 cluster-hours |
 
 ### If a leg exits nonzero
@@ -480,7 +490,18 @@ Filled in as the run proceeds. Landed with this branch:
    uses the cloud only for a root box and builds the fleet with
    `mw_fleet.sh`'s own devsub. Raising `N_MDS` would also need
    `assemble-mw` to stop hard-coding the co-writer mount shape.
-4. **An undeclared write mount of an ASSIGNED set is admitted and does
+4. **`SQUEEZEFS_FLEET_SHARE` under-counts co-located daemons.** KD-MW-14's
+   root divisor should be the number of daemons sharing the box; the fleet
+   rig sets it from `FLEET_N`, which counts the reader slice only — so a
+   `--cowriters=K` fleet has run every daemon believing it owns a
+   `1/(N)` share of a machine hosting `N+K`. The multi-owner shape records
+   the honest divisor (`FLEET_SHARE = N + owners − 1`) so PR 8's own rows
+   are not oversubscribed; the co-writer shape's under-count is **named
+   here, not fixed here** — changing it moves the R5 budget under every
+   existing s9/s10/s11 row, which is a different rung's decision. Read the
+   R5 columns (`mem_budget_red_events`, `hard_backstops`,
+   `parked_gate_timeouts`) on any co-writer row taken before that lands.
+5. **An undeclared write mount of an ASSIGNED set is admitted and does
    not honour M2** (observed, unprivileged, file-backed). With the whole
    fleet down, a plain `squeezefs mount` of an assigned set takes every
    volume's claim and mints children of a peer's subtree root onto any

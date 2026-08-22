@@ -774,7 +774,14 @@ mount_member() { # idx [--netns[=<delay_ms>]]
     # scrub of the rig's own SQZ_* control variables — they are not
     # SqueezeFS knobs and would trip the registry's typo announcement.
     local env_args=("${SCRUB_ENV[@]}")
-    env_args+=("SQUEEZEFS_FLEET_SHARE=$FLEET_N") # options before assignments
+    # KD-MW-14's root divisor. It should be the number of CO-LOCATED
+    # daemons; the shape-specific `FLEET_SHARE` a multi-owner create
+    # records counts the partial authorities, which `FLEET_N` (the
+    # reader-slice width) does not. Other shapes keep `FLEET_N` verbatim
+    # — changing their divisor would move every existing leg's R5 budget,
+    # which is a different rung's decision (the co-writer shape's own
+    # under-count is named in PR 8's evidence note, not fixed here).
+    env_args+=("SQUEEZEFS_FLEET_SHARE=${FLEET_SHARE:-$FLEET_N}") # options before assignments
     # Rung 18 (the width-N conveyor-composition standing-red's A/B lever):
     # SQZ_MWFLEET_PUBLISH_GROUP_MAX=N at create rides into every daemon as
     # SQUEEZEFS_PUBLISH_COMMIT_GROUP_MAX — `1` is the registered
@@ -1621,6 +1628,9 @@ create_fleet() {
         # support.
         echo "OWNERS='$owners'"
         echo "OWNERS_ASSIGNED='0'"
+        # The honest divisor for THIS shape: a K-owner fleet runs K
+        # daemons on one box, and FLEET_N counts only the reader slice.
+        [ "$owners" -gt 0 ] && echo "FLEET_SHARE='$((n + owners - 1))'"
         # Rung 15 (KD-MW-7): SQZ_MWFLEET_RANGE_CUSTODY=1 at create arms
         # SQUEEZEFS_RANGE_CUSTODY on every co-writer mount (the lever
         # ships default-OFF until rungs 16/17 land the concurrent same-ino

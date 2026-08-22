@@ -902,3 +902,280 @@ async fn a_partial_routed_open_serves_and_attests_only_the_volumes_it_owns() {
         "a partial mount wrote to a peer-owned volume"
     );
 }
+
+// ---------------------------------------------------------------------------
+// §5.4a — the M1 cross-owner pre-check, M2's placement invariant, and the
+// frozen cross-owner reference set (§5.9.2's four arms)
+// ---------------------------------------------------------------------------
+
+/// Arms an ownership plane in which volume 1 belongs to a PEER, and
+/// disarms it however the test ends (the plane is process-global).
+struct ArmedPlane;
+
+impl Drop for ArmedPlane {
+    fn drop(&mut self) {
+        squeezefs::meta_ship::disarm_ownership();
+    }
+}
+
+fn arm_peer_owns_volume_1(routed: &squeezefs::meta_backend::RoutedMetaBackend) -> ArmedPlane {
+    let map = squeezefs::meta_ship::OwnerMap::for_volumes(
+        routed,
+        vec![(
+            1,
+            squeezefs::meta_ship::PeerOwner::new(PEER, "127.0.0.1:7100"),
+        )],
+    )
+    .expect("a per-volume map over this set");
+    squeezefs::meta_ship::arm_ownership(map);
+    ArmedPlane
+}
+
+/// **§5.4a M1** — the correctness-class fix that lands unconditionally.
+/// `unlink` discovers its child under the guards it already holds, so the
+/// ROUTER cannot see it (`named_inos` returns the parent alone) and an
+/// ordinary `rm` of a peer-owned child would build an `XvPlan`, commit its
+/// first half, fail-stop BOTH volumes and leave a durable intent that
+/// refuses the next mount. The pre-check refuses EXDEV **before any plan
+/// is minted**, so there is no durable effect at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cross_owner_unlink_refuses_before_the_plan_is_minted() {
+    let dir = TempDir::new().unwrap();
+    let (vol0, vol1) = two_volume_set(dir.path(), "m1-unlink").await;
+    let uris = vec![vol0.display().to_string(), vol1.display().to_string()];
+    let routed = squeezefs::meta_backend::open_routed_meta_set(&uris)
+        .await
+        .expect("write mount");
+    let parent = mkdir_on(&routed, 1, 0, "m1").await;
+    let (child, name) = mkfile_on(&routed, parent, 1, "m1").await;
+
+    let _plane = arm_peer_owns_volume_1(&routed);
+    let intents_before = open_intent_count(&routed).await;
+    let err = routed
+        .unlink(parent, &name)
+        .await
+        .err()
+        .expect("unlinking a peer-owned child must refuse");
+    assert_eq!(
+        err.errno(),
+        Some(libc::EXDEV),
+        "the refusal is EXDEV — the errno POSIX already gives for two names that are not on \
+         one object graph: {err}"
+    );
+    assert!(
+        err.to_string().contains("S3.5"),
+        "the refusal must name the machinery that is NOT built: {err}"
+    );
+
+    // No durable effect: the name is still there, the inode still has its
+    // link, and — the corruption vector itself — NO intent was minted and
+    // neither volume was fail-stopped.
+    assert_eq!(
+        lookup_child(&routed, parent, &name).await,
+        Some(child),
+        "the name must survive a refused cross-owner unlink"
+    );
+    assert_eq!(
+        open_intent_count(&routed).await,
+        intents_before,
+        "an XvPlan was minted for a cross-owner unlink — this is the shape that fail-stops \
+         two volumes and bricks the next mount (§5.4a, R1)"
+    );
+    assert!(
+        !routed.disabled_volumes.contains_key(&0) && !routed.disabled_volumes.contains_key(&1),
+        "a refused cross-owner unlink must not fail-stop anything"
+    );
+    for vol in &routed.volumes {
+        vol.shutdown().await.expect("release");
+    }
+}
+
+/// The negative twin (§5.4a): with the pre-check bypassed through its test
+/// seam, the SAME `rm` reaches the cross-volume machinery — which is what
+/// records *why* M1 exists rather than asserting it in a comment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_pre_check_absent_shape_is_what_fail_stops_two_volumes() {
+    let dir = TempDir::new().unwrap();
+    let (vol0, vol1) = two_volume_set(dir.path(), "m1-absent").await;
+    let uris = vec![vol0.display().to_string(), vol1.display().to_string()];
+    let routed = squeezefs::meta_backend::open_routed_meta_set(&uris)
+        .await
+        .expect("write mount");
+    let parent = mkdir_on(&routed, 1, 0, "m1x").await;
+    let (_child, name) = mkfile_on(&routed, parent, 1, "m1x").await;
+
+    let _plane = arm_peer_owns_volume_1(&routed);
+    squeezefs::meta_backend::test_disable_cross_owner_precheck(true);
+    let out = routed.unlink(parent, &name).await;
+    squeezefs::meta_backend::test_disable_cross_owner_precheck(false);
+
+    assert!(
+        out.is_err(),
+        "without M1 the plan is minted and the peer-owned half refuses mid-plan"
+    );
+    assert!(
+        routed.disabled_volumes.contains_key(&0) || routed.disabled_volumes.contains_key(&1),
+        "the pre-M1 shape is the one that fail-stops volumes mid-plan — if this stops being \
+         true, M1's justification has changed and the design owes a re-reading"
+    );
+    for vol in &routed.volumes {
+        let _ = vol.shutdown().await;
+    }
+}
+
+/// §5.4a's plural participant set: the rename pre-check covers the MOVED
+/// ino, the OVERWRITE VICTIM and — on `RENAME_EXCHANGE` — both
+/// participants, mirroring the owner-side loop at `service.rs:1140-1150`
+/// rather than checking "the child", singular.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_rename_precheck_covers_the_moved_ino_the_overwrite_victim_and_both_exchange_participants(
+) {
+    let dir = TempDir::new().unwrap();
+    let (vol0, vol1) = two_volume_set(dir.path(), "m1-rename").await;
+    let uris = vec![vol0.display().to_string(), vol1.display().to_string()];
+    let routed = squeezefs::meta_backend::open_routed_meta_set(&uris)
+        .await
+        .expect("write mount");
+    let home = mkdir_on(&routed, 1, 0, "rn").await;
+    // Three participants, each on the volume its arm needs.
+    let (_peer_moved, peer_moved_name) = mkfile_on(&routed, home, 1, "moved").await;
+    let (_local_a, local_a) = mkfile_on(&routed, home, 0, "locala").await;
+    let (_peer_victim, peer_victim) = mkfile_on(&routed, home, 1, "victim").await;
+    let (_local_b, local_b) = mkfile_on(&routed, home, 0, "localb").await;
+
+    let _plane = arm_peer_owns_volume_1(&routed);
+    for (what, old, new, flags) in [
+        (
+            "the moved ino",
+            peer_moved_name.as_str(),
+            "fresh-name",
+            0u32,
+        ),
+        (
+            "the overwrite victim",
+            local_a.as_str(),
+            peer_victim.as_str(),
+            0,
+        ),
+        (
+            "an exchange participant",
+            local_b.as_str(),
+            peer_victim.as_str(),
+            libc::RENAME_EXCHANGE,
+        ),
+    ] {
+        let err = routed
+            .rename(home, old, home, new, flags)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("[{what}] a cross-owner rename must refuse"));
+        assert_eq!(
+            err.errno(),
+            Some(libc::EXDEV),
+            "[{what}] the refusal must be EXDEV: {err}"
+        );
+    }
+    for vol in &routed.volumes {
+        vol.shutdown().await.expect("release");
+    }
+}
+
+/// **M2** (§5.4a): every ino minted under an armed plane shares its
+/// parent's owner. This is the invariant that makes cross-owner
+/// parent→child pairs unreachable for everything the fleet CREATES — and
+/// therefore the invariant that keeps `rm` working.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_ino_minted_under_an_armed_plane_shares_its_parents_owner() {
+    let dir = TempDir::new().unwrap();
+    let (vol0, vol1) = two_volume_set(dir.path(), "m2").await;
+    let uris = vec![vol0.display().to_string(), vol1.display().to_string()];
+    let routed = squeezefs::meta_backend::open_routed_meta_set(&uris)
+        .await
+        .expect("write mount");
+    let parent = mkdir_on(&routed, 1, 0, "m2").await;
+    let parent_vol = routed.route_ino(parent).0;
+
+    let _plane = arm_peer_owns_volume_1(&routed);
+    for i in 0..48 {
+        let ino = routed
+            .create(parent, &format!("m2_{i}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .expect("create")
+            .ino;
+        let child_vol = routed.route_ino(ino).0;
+        assert_eq!(
+            squeezefs::meta_ship::owners::owns_volume(child_vol),
+            squeezefs::meta_ship::owners::owns_volume(parent_vol),
+            "child {ino} landed on volume {child_vol}, whose owner differs from its parent's \
+             ({parent_vol}) — M2 is what makes cross-owner unlink unreachable for new work"
+        );
+    }
+    for vol in &routed.volumes {
+        vol.shutdown().await.expect("release");
+    }
+}
+
+/// Sweep row 13 / the freeze law's third arm: while a multi-owner plane is
+/// armed, no cross-owner dentry can be RELOCATED — `migrate_slot` refuses
+/// when either endpoint is peer-owned (D19's follow-on), and refuses slot
+/// 0 outright (KD-PV-6: the set authority cannot silently relocate).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slot_migration_refuses_cross_owner_endpoints_and_slot_zero_while_armed() {
+    let dir = TempDir::new().unwrap();
+    let (vol0, vol1) = two_volume_set(dir.path(), "row13").await;
+    let uris = vec![vol0.display().to_string(), vol1.display().to_string()];
+    let routed = squeezefs::meta_backend::open_routed_meta_set(&uris)
+        .await
+        .expect("write mount");
+    let peer_slot = routed
+        .slot_map_snapshot()
+        .iter()
+        .position(|&v| v == 1)
+        .expect("volume 1 hosts a slot") as u16;
+
+    let _plane = arm_peer_owns_volume_1(&routed);
+    let opts = squeezefs::meta_backend::slot_migration::MigrationOptions::default();
+    let hooks = squeezefs::meta_backend::slot_migration::MigrationTestHooks::default();
+
+    let cross =
+        squeezefs::meta_backend::slot_migration::migrate_slot(&routed, peer_slot, 0, &opts, &hooks)
+            .await
+            .err()
+            .expect("a cross-owner slot migration must refuse");
+    assert!(
+        cross.to_string().contains("cross-owner"),
+        "the refusal must name what it is: {cross}"
+    );
+
+    let slot0 = squeezefs::meta_backend::slot_migration::migrate_slot(&routed, 0, 1, &opts, &hooks)
+        .await
+        .err()
+        .expect("slot 0 is non-migratable while a multi-owner plane is armed");
+    assert!(
+        slot0.to_string().contains("slot 0"),
+        "the refusal must name slot 0 and the set authority: {slot0}"
+    );
+    for vol in &routed.volumes {
+        vol.shutdown().await.expect("release");
+    }
+}
+
+async fn open_intent_count(routed: &squeezefs::meta_backend::RoutedMetaBackend) -> usize {
+    let mut n = 0;
+    for vol in &routed.volumes {
+        n += vol.xv_scan_intents().await.expect("intent scan").len();
+    }
+    n
+}
+
+async fn lookup_child(
+    routed: &squeezefs::meta_backend::RoutedMetaBackend,
+    parent: u64,
+    name: &str,
+) -> Option<u64> {
+    routed
+        .lookup_dentry(parent, name)
+        .await
+        .expect("lookup")
+        .map(|(ino, _)| ino)
+}

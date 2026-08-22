@@ -233,26 +233,15 @@ pub fn co_writer_requested() -> Result<bool> {
             "SQUEEZEFS_MULTI_WRITER"
         ))),
         (MwRole::Authority, _) => Ok(false),
-        // Per-volume claim admission (PR 3 of
-        // `docs/design-per-volume-claim-admission.md`): the DECISION
-        // exists ([`crate::partial_authority::classify_set_admission`]) but
-        // the partial open that consumes it is PR 4, so no mount path can
-        // select either posture yet. Refusing is the only fail-closed
-        // answer: mounting such a declaration as a full authority would
-        // take the D0 ladder — flock + PR WEX + claim — on every volume of
-        // a set whose volumes a peer may own, which is the exact outcome
-        // the ladder exists to prevent.
-        (MwRole::SetAuthority | MwRole::PartialAuthority, _) => {
-            Err(SqueezefsError::InvalidOperation(format!(
-                "{MW_ROLE_ENV}={} is not selectable by this binary yet: the per-volume \
-                 admission ladder is landed (src/partial_authority.rs) but the partial-writer \
-                 open that consumes its decision is not. Refusing rather than mounting as a \
-                 full authority — that would run the D0 ladder on every volume of the set, \
-                 including volumes a peer is assigned to append to. Use \
-                 {MW_ROLE_ENV}=authority or {MW_ROLE_ENV}=co-writer",
-                role.as_str()
-            )))
-        }
+        // Per-volume claim admission: neither per-volume posture is a
+        // CO-WRITER declaration, so this reader answers `false` and says
+        // nothing else about them. Their door is
+        // `partial_authority::requested()`, which the mount path reads
+        // next, and every refusal about them belongs to the seven-rung
+        // ladder — including the missing opt-in, which is rung 1's and
+        // names it. Answering here instead would refuse the POSTURE where
+        // the ladder refuses the missing HALF.
+        (MwRole::SetAuthority | MwRole::PartialAuthority, _) => Ok(false),
     }
 }
 

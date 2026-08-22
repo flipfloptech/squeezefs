@@ -5,7 +5,7 @@
 | **Title** | Per-volume claim admission: partial-writer opens, per-volume metadata owners, and the inversion of `mint_redirects` |
 | **Author** | (design agent; adjudication owner: user) |
 | **Date** | 2026-08-21 |
-| **Status** | **IMPLEMENTATION-READY (rev 4)** — three review rounds, 29 issues (4 critical), all addressed and independently verified against the tree; no open issues. The remaining unknowns are *measurements* (PR 0's volume-scaling row, PR 8's gate) and two product calls raised as open questions 2, 3 and 3b — not design gaps. Revision logs at the bottom of the PR plan; the review file carries the per-issue responses |
+| **Status** | **IMPLEMENTATION-READY (rev 6 — PRs 2–5 landed)** — three review rounds, 29 issues (4 critical), all addressed and independently verified against the tree; no open issues. The remaining unknowns are *measurements* (PR 0's volume-scaling row, PR 8's gate) and two product calls raised as open questions 2, 3 and 3b — not design gaps. Revision logs at the bottom of the PR plan; the review file carries the per-issue responses |
 | **Repo state audited** | branch `dev`, tip `4a877c78`; the free-grace pressure valve (`39047c70`, residual 6) is in the tree |
 | **Program input** | `docs/design-full-multi-writer.md` **rung-20 residual board item 3** (`:644-651`) — *"Per-volume claim admission — the fleet-of-authorities recipe (§6.10 R4): a client holding the D0 claim on ≥ 1 volume of a shared set is what makes the S10 tar-x gate meetable and inverts `mint_redirects` for real."* |
 | **Binding inputs** | AGENTS.md (one source of truth); `docs/pre-rc-engineering-spec.md` §6.7 decisions 1/2, §6.9 S4/S8/S9, §6.10 **spec-R1/spec-R4/spec-R8**, §6.12; `docs/design-full-multi-writer.md` (the closed predecessor — KD-MW-1…16); `docs/design-mw-data-alloc-partition.md`; `docs/design-dynamic-meta-routing.md`; `docs/design-mw-fleet-jobs.md`; `docs/rc-manifest.md` §evidence tiers |
@@ -84,6 +84,34 @@ Three further compositions were repaired: the inode plane's coverage
 per-owner shards with an asserted gauge), the revalidation-arming predicate
 (a `set-authority` latches neither latch and was skipped entirely), and the
 `successors` opt-in's interaction with rung 6 and the poison predicate.
+
+**What rev 6 changed (PR 5's implementation).** Six corrections, folded
+back from the landed rung. **(1) KD-PV-13's disarm is TOTAL, not partial**:
+a candidate requires a peer-owned entry, which is the disarm's own
+predicate, so the launch arm (executor, one-in-flight bound, never-thrash
+valve) has no reachable production caller at all — §5.5 says so now, and
+the valve's coverage rides a declared test override on the
+`arm_ownership` precedent so D19's follow-on inherits it. **(2) §5.10's
+runtime trigger has no wire-borne holder**: `STATUS_STALE_TERM` carries
+`owner_term` and nothing else, so a relearn must re-READ the volume's
+durable record; silence poisons at runtime where it refuses at admission.
+**(3) The derivation's refusal arms are unreachable over an OPEN set** —
+PR 4's `open_peer_owned` refuses every disagreeing peer volume at the door
+— so the derivation splits into a pure core plus a gather, and the ONE
+disagreement reachable end to end is the shape §5.10 never named: an
+assigned set mounted by a node that declared nothing while no peer runs,
+where the D0 ladder grants it every claim. **(4) The gather is PR 5's**,
+not PR 4's as `partial_authority`'s module doc claimed. **(5) Rung 5 is
+unsatisfiable for a SET AUTHORITY as written** (`registrant_detail`
+demands a held reservation; a fresh fleet's first authority holds none
+until it arms one, which happens after the open) — the gather takes the
+hold for that posture and `arm_multi_writer`'s rung 3 joins it. **(6) The
+partial-authority ARM does not exist** and PR 5 does not build it: §5.7's
+splits say which planes it must not take, but its own arm is the
+co-writer client half composed with an owner half over its own volumes,
+which no rung owns — the set-authority arm refuses a non-set-authority
+loudly rather than half-arming, and the composition is now a named
+prerequisite of PR 8.
 
 **What rev 5 changed (PR 4's implementation).** Four corrections, folded
 back from the landed rung: **KD-PV-17** supplies the holder resolution PR 3
@@ -927,6 +955,24 @@ So:
 - `note_supply_event`'s launch arm is **inert while a multi-owner plane is
   armed** — evidence and `migration_candidates` may still count (they are
   the follow-on's demand signal), but nothing is triggered and nothing fails.
+
+> **CORRECTION (PR 5 implementation, rev 6): the disarm is TOTAL, and the
+> launch machinery therefore has no reachable production caller.** A
+> candidate exists only when `volumes_owned_by(client)` is non-empty, which
+> requires a PEER-owned entry in the map — which is exactly the disarm's
+> predicate (`OwnerMap::multi_owner`). So "candidates counted, nothing
+> triggered" is not a policy narrowing that leaves the rest of the arm
+> live: **the executor, the one-migration-in-flight bound and the
+> never-thrash valve become unreachable together**, and the valve's own pin
+> (`two_clients_alternating_on_one_directory_never_ping_pong_the_slot`)
+> would have died with them. They are kept — D19's named follow-on is what
+> re-arms them — behind the declared
+> `placement::TEST_MIGRATION_DISARM_OVERRIDE`, on the `arm_ownership`
+> precedent (*"public and reachable so the shipped and refused behaviours
+> are tested rather than commented"*). The alternative was deleting the
+> half outright under the no-dead-code law; that would have made §11.2's
+> "nonzero = the disarm broke" reading vacuous and left the follow-on to
+> rebuild the valve from git history.
 - `SQUEEZEFS_SLOT_PLACEMENT`'s registry text says so (§6.2).
 - §11.2 records that `migrations_triggered` / `migrations_failed` are
   **structurally 0 under multi-owner** until the follow-on lands.
@@ -1161,6 +1207,40 @@ And a **hard fleet-width bound**: `MAX_LANES = journal::MAX_APPENDERS = 16`
 input is not untouched**, and this table goes in `docs/operations.md`
 §Multi-writer capacity planning (PR 7). Operators are advised to size fleets
 at powers of two.
+
+> **CORRECTIONS (PR 5 implementation, rev 6).**
+>
+> 1. **Rung 5 is unsatisfiable for a SET AUTHORITY as §5.3 writes it.**
+>    `registrant_detail` demands `reservation_held` — but a fresh fleet's
+>    first set authority holds no reservation until it arms one, and the
+>    arm runs *after* the open. The gather therefore takes the WERO hold
+>    for the `set-authority` posture (a granted rtype-3 hold IS the
+>    device's answer to all four of rung 5's questions: the arm refuses a
+>    namespace with no reservation support, and the holder of a
+>    Write-Exclusive-Registrants-Only reservation is by construction one of
+>    its registrants) and `arm_multi_writer`'s rung 3 then JOINS the
+>    standing hold, which is what its own doc always said it does. A
+>    `partial-authority` keeps the co-writer shape: `join_wero_as_registrant`.
+> 2. **The partial-authority ARM does not exist, and PR 5 does not build
+>    it.** This table says which set-singular planes a partial authority
+>    must not take; it does not say what it *does* arm, and no rung owns
+>    that composition: the co-writer client halves (a custody lease from
+>    the set authority, the lane installed from it, the publish client and
+>    the daemon verb router) composed with an OWNER half serving only the
+>    volumes it appends to (a listener with the meta + publish services and
+>    **no** custody service). `arm_multi_writer` is the SET authority's
+>    arm; reaching it without owning the slot-0 volume now **refuses
+>    loudly** rather than half-arming a mount that would grant custody
+>    nobody may hold or mint lanes nobody granted. **PR 8 cannot run a
+>    fleet until that arm lands** — it is a named prerequisite of the
+>    acceptance rung, not a residual.
+> 3. **A multi-owner map needs the daemon verb router on BOTH postures.**
+>    §5.6 reads it as the co-writer's client half, but a set authority also
+>    holds peer-owned volumes, and its own daemon writes on them (the
+>    `client:{id}` heartbeat, job records, ino-1 traffic) would otherwise
+>    meet the peer write gate and count
+>    `peer_volume_local_commit_refusals`. `arm_multi_writer` installs it
+>    whenever the derived map is multi-owner.
 
 #### 5.7.1 Failover — corrected (rev 2, Issue 9)
 
@@ -1549,6 +1629,41 @@ flowchart LR
 - **Never adopt on silence.** Ownership moves because an operator ran the
   verb (D19), or because a declared successor's D0 ladder granted it
   (KD-PV-12) — never because a node is slow.
+
+> **CORRECTIONS (PR 5 implementation, rev 6).**
+>
+> 1. **The runtime trigger cannot read a holder off the wire.** A
+>    `STATUS_STALE_TERM` reply carries `owner_term` and nothing else, so
+>    "a relearn on a volume whose live holder is not in that volume's
+>    assignment set" has to be a fresh READ of that volume's durable
+>    record. Landed as `owners::note_era_relearn` (fire-and-forget from the
+>    relearn site, which is a refusal path that must not await I/O) →
+>    `reconcile_volume_owner` → `reconcile_owner_from`, the pure predicate.
+> 2. **At runtime, silence POISONS**; at admission it refuses. The
+>    asymmetry is the fail-closed direction: a running mount cannot refuse,
+>    and an entry whose holder can no longer be resolved is one whose verbs
+>    must stop rather than continue on the strength of an old reading.
+> 3. **The refusal arms are unreachable over an OPEN set.** A disagreeing
+>    or unattested peer volume cannot be part of one — `open_peer_owned`
+>    refuses it at the door (PR 4) and a plain `KvMetaBackend::open`
+>    refuses its live foreign claim — so the derivation is split into the
+>    pure `derive_owner_map_from` over a public `VolumeOwnership` plus the
+>    `derive_owner_map` gather that reads a live set, the
+>    `SetAdmissionRequest` precedent exactly.
+> 4. **The one disagreement reachable end to end is the shape this section
+>    never named**, and it is the dangerous one: an operator assigns
+>    ownership offline and then mounts a node that declared NO per-volume
+>    posture while its peers are down. The D0 ladder grants that node every
+>    claim — correctly, it is doing its job — and the derived map is the
+>    only thing that catches it, refusing with both sides named
+>    (`a_local_claim_on_a_peer_assigned_volume_refuses_the_derivation`).
+>    PR 7's verb must therefore keep its own `set-owners`-time refusal, and
+>    an operator's remedy is to declare the posture, not to retry.
+> 5. **"Assigned" is `durable && owner.is_some()`**: on a bit-14 volume
+>    with no record `ClaimSet::load` answers the singular PROJECTION, whose
+>    `owner` is `None` — but a future projection that ever carried one must
+>    not read as an assignment, so the derivation filters on `durable`
+>    before reading `owner`.
 
 Loom: the map swap is the `PlacementTable` `ArcSwapOption` precedent; the new
 lock-free object is the poison latch's interaction with the per-lane term
@@ -2237,10 +2352,10 @@ smoke). Size is a rough order of magnitude: **S** ≈ days, **M** ≈ 1–2 week
 | **2** | `feat/pv-claim-set-owner` | S | `src/membership.rs` (`owner`, `successors`, `set_volume_owner`), `src/config_ops.rs` (the `owner_assign:` record), `src/lib.rs` (constant + the invisibility pin — VAL-2 is a positive allowlist, nothing to edit); `tests/dlm_membership_tests.rs` extended | 1 | **The durable fields, written by nothing.** Contracts: the four byte-identity pins **plus the four RMW pins of §5.2.2** — `an_upsert_preserves_the_owner_and_successors`, `the_dead_writer_prune_preserves_…`, `an_undecodable_claim_set_on_an_ASSIGNED_volume_refuses_rather_than_resetting`, `an_owner_field_survives_a_migrate_slot_of_any_other_slot`. Gate: full cargo gate + sector-0 and `claim_set` byte-identity on an unassigned set |
 | **3** | `feat/pv-admission-ladder` | M | new `src/partial_authority.rs` (`classify_set_admission`, `SetAdmission`, `VolumeMode`, seven rungs), `src/cowriter.rs` (shared rung helpers extracted, behaviour-preserving), `src/env_knobs.rs` (two enum values + the three neighbour texts, §6.2); `tests/pv_admission_tests.rs` | 2 | **The decision, unreachable from `main`.** One red-first case per rung, both directions; the per-volume verdict vector; rung 4's per-volume term comparison; rung 6's assignment ∧ evidence; rung 7's freeze precondition. Pins: the ladder is the ONLY `SetAdmission` constructor; `covers` refuses a cross-set admission; **`a_set_admission_resolves_modes_by_durable_volume_id_not_by_position`** exercised with a URI order ≠ the canonical order (Issue 8) |
 | **4** | `feat/pv-partial-open` **+ `fix/pv-cross-owner-child-precheck`** | **L** | `src/meta_backend/mod.rs` (`OpenMode::PartialWrite`, `open_meta_volume_set_partial`, **`open_routed_meta_set_partial`**, the rollback ladder, the `owner_assign:` probe, ownership-scoped intent recovery, **the M1 pre-check in `unlink`/`rename`/`link`**), `src/meta_backend/kv/backend.rs` (`PeerAuthority`, `PeerOwnedVolume`, `open_peer_owned`, `write_gate` arm, `writer_guard_mode` row), `src/fuse_client.rs` (two postures + the `PARTIAL_META` latch + the un-gated staleness gauge), `src/ro_coherence.rs` + the arming call site (per-volume revalidation, sweep row 15), `src/membership.rs` (rendezvous scoping, sweep row 17), `src/meta_backend/slot_migration.rs` (row 13 refusals); `tests/pv_partial_open_tests.rs`, `tests/pv_cross_owner_tests.rs` | 3 | **The sweep, all 18 rows.** Must-stay-0: `peer_volume_local_commit_refusals`, `xv_cross_owner_intents`, `meta_kv_revalidate_dirty_skips`. **Headline pin (R12): `the_fresh_foreign_refusal_is_byte_identical_for_an_undeclared_mount`.** Plus: **`a_cross_owner_unlink_refuses_before_the_plan_is_minted`** and its seam-injected negative twin (Issue 1); **`every_ino_minted_under_an_armed_plane_shares_its_parents_owner`** (M2); the four arms of `the_cross_owner_dentry_set_is_frozen_under_an_armed_plane`; `a_partial_set_open_failure_releases_exactly_the_owned_volumes_guards`; `a_peer_owned_volume_spawns_no_checkpoint_or_times_drain_task`; `guard_heartbeat_self_skips_on_a_peer_owned_volume`; **both** arming pins — `a_partial_authority_arms_revalidation_on_peer_volumes_only_and_dirty_skips_stays_zero` **and `a_set_authority_arms_revalidation_on_its_peer_owned_volumes_and_dirty_skips_stays_zero`** (rev 3, Issue 26: the set authority latches neither latch, so the existing `if reader_mount || co_writer` site skips it entirely — the two arms are split, `arm_reader_data_plane` iff `CO_WRITER`, revalidation over the peer-owned subset for any posture holding one); `the_rename_precheck_covers_the_moved_ino_the_overwrite_victim_and_both_exchange_participants` (rev 3, Issue 1 residual — the precedent's loop at `service.rs:1140-1150`, not "the child" singular); `a_member_joins_the_slot_0_owner_and_never_a_stale_peer_rendezvous`; the §5.1.1 `Peer`-mode `Reclaimable`/`StaleForeign` refusals; the `co_writer_mount()` consumer-by-posture audit table. **M1 lands unconditionally** (it is correct on a single-authority mount too, where it is a never-taken branch) |
-| **5** | `feat/pv-owner-map-derivation` | M | `src/meta_ship/owners.rs` (`derive_owner_map`, `poison_volume`), `src/meta_ship/placement.rs` (**disarm the migration half**, KD-PV-13), `src/meta_backend/mod.rs` (**the owned-candidate filter in `pick_mint_volume` when armed**, §5.5.1), `src/multi_writer.rs` (derive instead of `for_volumes(…, Vec::new())`; the D20 splits for lanes/custody/membership), `src/main.rs` (the mount path selects the posture); possibly `src/owner_map_core.rs` + `loom-models/src/lib.rs`; **`tests/mw_slot_placement_tests.rs` — BOTH pins re-scoped** | 4 | **The plane goes live and `mint_redirects` inverts.** Red-first: assignment-vs-evidence disagreement refuses and poisons (`owner_map_poisoned_volumes` must-stay-0); never adopts on silence; `ownership_assignment_never_changes_route_ino_width`; slot 0 refuses migration while armed; a non-set-authority never derives a lane assignment; **`the_migration_half_is_disarmed_under_multi_owner`** with `migrations_triggered == 0`; **rev 3 adds the owned-candidate filter's pins, rev 4 a third** — `an_armed_mint_pick_never_proposes_a_peer_owned_volume`, `a_two_volume_owner_balances_across_both_of_its_own_volumes`, and **`an_armed_mint_pick_with_every_owned_volume_disabled_falls_back_to_the_parents_volume`** (Issue 29: the filter is a PREFERENCE, never a gate — the empty arm is reachable at runtime via `disabled_volumes` and must fall back, never panic) — which together return `mint_redirects` to a must-stay-≈0 gauge (§11.2) and restore balance among a node's own volumes. **The pin flip is ONE act covering `:501-555` AND `:560-576`**, with the in-process engine coverage preserved as a directly-invoked engine test. **Milestone wording (rev 2, Issue 19b): liveness here is TEST-CONSTRUCTOR-ONLY** — the only supported way to create an assignment is PR 7's verb, so nothing is production-reachable until then. Loom weakening-verified ×3 if a core is extracted |
+| **5** | `feat/pv-owner-map-derivation` | M | `src/meta_ship/owners.rs` (`derive_owner_map`, `poison_volume`), `src/meta_ship/placement.rs` (**disarm the migration half**, KD-PV-13), `src/meta_backend/mod.rs` (**the owned-candidate filter in `pick_mint_volume` when armed**, §5.5.1), `src/multi_writer.rs` (derive instead of `for_volumes(…, Vec::new())`; the D20 splits for lanes/custody/membership), `src/main.rs` (the mount path selects the posture); possibly `src/owner_map_core.rs` + `loom-models/src/lib.rs`; **`tests/mw_slot_placement_tests.rs` — BOTH pins re-scoped** | 4 | **The plane goes live and `mint_redirects` inverts.** Red-first: assignment-vs-evidence disagreement refuses and poisons (`owner_map_poisoned_volumes` must-stay-0); never adopts on silence; `ownership_assignment_never_changes_route_ino_width`; slot 0 refuses migration while armed; a non-set-authority never derives a lane assignment; **`the_migration_half_is_disarmed_under_multi_owner`** with `migrations_triggered == 0`; **rev 3 adds the owned-candidate filter's pins, rev 4 a third** — `an_armed_mint_pick_never_proposes_a_peer_owned_volume`, `a_two_volume_owner_balances_across_both_of_its_own_volumes`, and **`an_armed_mint_pick_with_every_owned_volume_disabled_falls_back_to_the_parents_volume`** (Issue 29: the filter is a PREFERENCE, never a gate — the empty arm is reachable at runtime via `disabled_volumes` and must fall back, never panic) — which together return `mint_redirects` to a must-stay-≈0 gauge (§11.2) and restore balance among a node's own volumes. **The pin flip is ONE act covering `:501-555` AND `:560-576`**, with the in-process engine coverage preserved as a directly-invoked engine test. **Milestone wording (rev 2, Issue 19b): liveness here is TEST-CONSTRUCTOR-ONLY** — the only supported way to create an assignment is PR 7's verb, so nothing is production-reachable until then. Loom weakening-verified ×3 if a core is extracted. **LANDED (rev 6)**: no core was extracted — the poison latch is a per-volume `AtomicBool` inside the arc-swapped, immutable-once-built map (the `PlacementTable` precedent), with no cross-word invariant and no new ordering protocol, so it carries no loom model. Six corrections folded back: the disarm is TOTAL (§5.5's box), the runtime trigger must re-READ (§5.10's box), the derivation splits pure-core-plus-gather, the gather is this rung's, rung 5 is unsatisfiable for a set authority as written, and **the partial-authority arm is a named prerequisite of PR 8** (§5.7's box) |
 | **6** | `feat/pv-fsck-and-coordinator` | **L** | `src/fsck.rs` (`owned_volumes`, `multi_owner`, the repair-consequence split, `fsck_repair_refused_multi_owner`), **the KD-PV-16 owner-shard fan-out + `fsck_inode_plane_volumes_covered`; §5.8.2's sites F1 `strip_inode_plane_proposals` `:1801-1816`, F2 its merge-loop call site `:1580-1589`, F4 `fold_finalize_counters` `:1421`, F5 `FsckOptions::inode_plane`'s doc `:331-345`; §5.8.0's candidate-vs-referenced split**), `src/jobs.rs` (**F3 — `FleetOutcome` gains the lease holder's `worker_id`, `:1015-1018`**), `src/job_wire.rs` (**fill it from `holder.worker_id` at `:2170` and `:2392`**; the inode-plane shard/proposal rows on the existing wire), `src/jobs.rs` + `src/defrag.rs` (the KD-PV-14 coordinator predicate + the narrowed refusal + ownership-aware shard planning); `tests/fsck_c9_tests.rs` / `tests/fsck_c10_tests.rs` extended, `tests/pv_coordinator_tests.rs` | 5 | **The R2/R3 safety work + the coordinator identity.** Red-first: `a_multi_owner_online_pass_over_a_healthy_tree_produces_zero_inode_plane_findings` (the mirage reproduced then refused); `an_offline_whole_set_pass_over_the_same_damaged_tree_finds_and_repairs_all_of_them`; `c9_repair_refuses_online_under_multi_owner_naming_the_offline_pass`; `c10_low_and_zero_named_raises_still_apply_online`; `a_peer_volume_projection_predating_its_assignment_records_no_verdict`; `exactly_one_node_coordinates_on_a_k_node_fleet`; `a_non_set_authority_refuses_to_coordinate_naming_the_set_authority`; **rev 3 (Issue 25) adds `the_union_of_online_owner_shards_covers_every_volumes_inode_plane_at_k4` and `a_missing_owner_shard_makes_the_pass_INCOMPLETE_not_narrower`; rev 4 adds the §5.8.2 admission set — `an_owner_shards_inode_plane_findings_merge_and_move_the_coordinators_counters`, **`a_member_shards_inode_plane_findings_are_still_stripped_loudly`** (the mirage's regression test), `an_owner_shards_finding_about_a_volume_it_does_not_own_is_stripped`, `the_admission_predicate_never_reads_the_shards_own_claim`, `an_admitted_shards_counters_fold_exactly_once` (the F4 double-count pin) — and the §5.8.0 pair **`a_verb_minted_subtree_root_is_never_a_c9_candidate_on_its_owners_shard`** and `an_owner_shards_dentry_pass_covers_every_volume_not_only_its_own`**. Gate: `fsck_findings == 0` **AND `fsck_inode_plane_volumes_covered == volume_count`** on a healthy multi-owner fleet at K = 2 and K = 4 — the coverage half is what stops the findings half from passing trivially at 1/K coverage. **Note (rev 2, Issue 19a): the R10 free-grace work that rev 1 put here is GONE** — §5.11(b) is structural and its pins live in PR 4 |
 | **7** | `feat/pv-owner-verb` + `docs/pv-guarantees` | M | `src/main.rs` (`volume set-owners` / `get-owners` / **`volume locate`** / `--dry-run` / `--accept-cross-owner-names` / **`:<subtree-root-path>`**), `src/config_ops.rs` (bracketed offline coordinator, **the KD-PV-15 subtree-root mint via the preset-ino create path**, the cross-owner name census, intent barrier, rendezvous cleanup, idempotent resume), `docs/operations.md`, `docs/rc-manifest.md`, AGENTS.md; `tests/pv_owner_verb_tests.rs` | 5 (6 for the doc rows) | **The operator surface — and the first production-reachable rung.** Red-first: `set_owners_refuses_while_any_volume_carries_a_fresh_foreign_claim` (the D0-guarded open, **not** `live()`); refuses a bit-14-less set, an unenrollable member, a partial map, an open cross-volume intent, an unacknowledged cross-owner name census, > 16 members; a kill between adjacent volumes resumes idempotently; `--clear` restores byte-identical unassigned records; `get-owners` renders drift. **Rev 3 (Issue 23) adds the KD-PV-15 half**: `the_verb_mints_each_subtree_root_on_the_volume_it_assigns`; `an_existing_root_path_whose_ino_homes_elsewhere_refuses_naming_volume_locate`; `a_volume_assigned_without_a_subtree_root_warns_that_the_node_will_own_no_new_work`; `volume_locate_names_the_hosting_volume_and_its_owner`; and a resumability pin covering a kill between the root mint and the owner record — which also records the pre-existing, bounded residual the round-3 review named: cross-volume `create` is un-wrapped by design, so a crash between a root's inode commit and its dentry commit leaves a C9-detectable orphan, cleaned by the offline pass and re-minted by an idempotent re-run. Docs: the two new guarantee rows, **the R13 no-failover row and its maintenance-window cost**, the R14 W1 posture, the §5.7 lane-width/stranded-capacity table, the offline-fsck-requires-a-fleet-outage note, **§5.5.2's owner-partitioned-namespace product statement**, and **KD-PV-16's coverage guarantee** |
-| **8** | `test/pv-acceptance` | M | `tests/run_mw_matrix.sh` (a `s10-placement-tarx --partial-authority` arm + a rewrite/overwrite arm + an `rm -rf` arm), `tests/mw_fleet.sh` (`--owners`), the evidence note `.benchmarks/2026-…-pv-claim-admission.md` | 6, 7 | **The acceptance rung.** **(0) The setup precondition is part of the gate (rev 3, Issue 23):** the extraction target must be the extracting node's own verb-minted subtree root, asserted by `volume locate` before the timed run — a row extracted into a root-descended directory reproduces 6.73× *by construction* and is INVALID, not disappointing. (a) the `tar -x` gate vs 6.73×, engagement law per §5.13, honest statement if it misses; (b) **the per-verb cross-owner refusal table incl. `unlink`/`rmdir`** and the undeletable-in-place population; (c) **the rewrite/overwrite funnel row** (§5.12, `free_shipped_blocks` as the instrument) or the explicit out-of-scope statement; (d) **the R14 rand-4k W1 row** (partial authority vs set authority vs single-authority today); (e) fsck + C8 oracle clean; (f) every row labeled with its tier per §5.13. **Closure wording (rev 2, Issue 19c): this rung closes residual item 3's ADMISSION half.** The item's own text ends *"Cross-owner slot migration … rides with it"*, which D19 defers — so PR 8 **re-files the remainder as a named follow-on** on the residual board in the same act, together with the offline re-homing pass (open question 3), the R15 purge scoping, and R14's W1 recovery |
+| **8** | `test/pv-acceptance` | M | `tests/run_mw_matrix.sh` (a `s10-placement-tarx --partial-authority` arm + a rewrite/overwrite arm + an `rm -rf` arm), `tests/mw_fleet.sh` (`--owners`), the evidence note `.benchmarks/2026-…-pv-claim-admission.md` | 6, 7 | **The acceptance rung**, and it gates on one thing PR 5 did NOT build: **the partial-authority arm** (§5.7's rev-6 box — the co-writer client halves composed with an owner half over the volumes it appends to). A fleet cannot be stood up without it. **(0) The setup precondition is part of the gate (rev 3, Issue 23):** the extraction target must be the extracting node's own verb-minted subtree root, asserted by `volume locate` before the timed run — a row extracted into a root-descended directory reproduces 6.73× *by construction* and is INVALID, not disappointing. (a) the `tar -x` gate vs 6.73×, engagement law per §5.13, honest statement if it misses; (b) **the per-verb cross-owner refusal table incl. `unlink`/`rmdir`** and the undeletable-in-place population; (c) **the rewrite/overwrite funnel row** (§5.12, `free_shipped_blocks` as the instrument) or the explicit out-of-scope statement; (d) **the R14 rand-4k W1 row** (partial authority vs set authority vs single-authority today); (e) fsck + C8 oracle clean; (f) every row labeled with its tier per §5.13. **Closure wording (rev 2, Issue 19c): this rung closes residual item 3's ADMISSION half.** The item's own text ends *"Cross-owner slot migration … rides with it"*, which D19 defers — so PR 8 **re-files the remainder as a named follow-on** on the residual board in the same act, together with the offline re-homing pass (open question 3), the R15 purge scoping, and R14's W1 recovery |
 | **9** | `perf/pv-node-cache-derivation` | S | `src/meta_backend/kv/backend.rs` (`resolve_node_cache_budget` set-aware), `tests/derivation_sweep_tests.rs` (tie row + the per-volume physical-minimum pin) | 0, **+ the open-question-2 ruling** | **The derivation change, split out of PR 0 in rev 2.** Lands only with (i) PR 0's measurement, (ii) a counted A/B at the shipped 2–4-volume widths showing no regression, and (iii) the explicit never-regress-floor ruling (open question 2). Parallel-safe with 3–8 |
 
 **Dependency shape.** **0** runs first and alone — it is the viability gate

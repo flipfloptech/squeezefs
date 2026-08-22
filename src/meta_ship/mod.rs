@@ -401,6 +401,31 @@ pub(crate) static OWNER_PANICS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static DLM_RPCS_META: AtomicU64 = AtomicU64::new(0);
 /// Mints redirected to an owned volume (the §6.10 R4 constraint engaging).
 pub(crate) static MINT_REDIRECTS: AtomicU64 = AtomicU64::new(0);
+/// Volume ownership records WRITTEN by the offline `volume set-owners`
+/// verb (§11.1). 0 on every mount by construction — a mount never
+/// assigns; only the verb's own process moves this.
+static OWNER_ASSIGNMENTS: AtomicU64 = AtomicU64::new(0);
+/// `volume set-owners` invocations refused, each naming its cause.
+static OWNER_ASSIGN_REFUSALS: AtomicU64 = AtomicU64::new(0);
+/// KD-PV-15's ledger: subtree roots the verb minted. `0` beside a nonzero
+/// `volumes_owned` on a peer is the Issue-23 shape (risk R16) — a node
+/// owning a volume but no work.
+static SUBTREE_ROOTS_MINTED: AtomicU64 = AtomicU64::new(0);
+
+/// One volume's ownership record was written by the assignment verb.
+pub fn note_owner_assignment() {
+    OWNER_ASSIGNMENTS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// One `volume set-owners` invocation was refused.
+pub fn note_owner_assign_refusal() {
+    OWNER_ASSIGN_REFUSALS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// One subtree root was minted (KD-PV-15).
+pub fn note_subtree_root_minted() {
+    SUBTREE_ROOTS_MINTED.fetch_add(1, Ordering::Relaxed);
+}
 
 /// The shipped-vs-local ledger, the pipelining factor, the idempotency
 /// window and the failover ledger — one snapshot.
@@ -427,6 +452,12 @@ pub struct ShipStatsSnapshot {
     /// GAUGE (**must stay 0**): volumes whose ownership entry the runtime
     /// re-derivation POISONED — §5.10's fail-closed law engaging.
     pub owner_map_poisoned_volumes: u64,
+    /// The `volume set-owners` ledger (§11.1) — volume records written,
+    /// invocations refused, and KD-PV-15 roots minted. All three are 0 on
+    /// every mount: the verb is an offline process of its own.
+    pub owner_assignments: u64,
+    pub owner_assign_refusals: u64,
+    pub subtree_roots_minted: u64,
 }
 
 /// Read the ledger.
@@ -451,6 +482,9 @@ pub fn stats() -> ShipStatsSnapshot {
         dlm_rpcs_meta: DLM_RPCS_META.load(Ordering::Relaxed),
         mint_redirects: MINT_REDIRECTS.load(Ordering::Relaxed),
         owner_map_poisoned_volumes: owners::poisoned_volumes(),
+        owner_assignments: OWNER_ASSIGNMENTS.load(Ordering::Relaxed),
+        owner_assign_refusals: OWNER_ASSIGN_REFUSALS.load(Ordering::Relaxed),
+        subtree_roots_minted: SUBTREE_ROOTS_MINTED.load(Ordering::Relaxed),
     }
 }
 
@@ -475,6 +509,11 @@ pub fn stats_json() -> serde_json::Value {
         "owner_panics": s.owner_panics,
         "mint_redirects": s.mint_redirects,
         "owner_map_poisoned_volumes": s.owner_map_poisoned_volumes,
+        // The offline verb's ledger (§11.1). A mount never assigns, so
+        // all three staying 0 on a live mount is the law, not the load.
+        "owner_assignments": s.owner_assignments,
+        "owner_assign_refusals": s.owner_assign_refusals,
+        "subtree_roots_minted": s.subtree_roots_minted,
         "dlm_rpcs_meta": s.dlm_rpcs_meta,
         "dlm_grace_reclaims": s.grace_reclaims,
         "dlm_grace_conflicts": s.grace_conflicts,

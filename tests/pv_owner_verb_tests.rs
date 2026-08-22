@@ -74,9 +74,13 @@ async fn stamp_capabilities(path: &Path, claim_set: bool) {
     sb::set_block_refcounts_bit(path).await.expect("bit 9");
     sb::set_layout_versions_bit(path).await.expect("bit 15");
     sb::set_ino_lanes_bit(path).await.expect("bit 12");
-    sb::set_block_key_incarnation_bit(path).await.expect("bit 13");
+    sb::set_block_key_incarnation_bit(path)
+        .await
+        .expect("bit 13");
     sb::set_partitioned_append_bit(path).await.expect("bit 8");
-    sb::set_writer_scoped_staging_bit(path).await.expect("bit 10");
+    sb::set_writer_scoped_staging_bit(path)
+        .await
+        .expect("bit 10");
     if claim_set {
         sb::set_claim_set_bit(path).await.expect("bit 14");
     }
@@ -156,6 +160,32 @@ fn accepting(n: u64) -> SetOwnersOptions {
         accept_cross_owner_names: Some(n),
         ..SetOwnersOptions::default()
     }
+}
+
+fn dry() -> SetOwnersOptions {
+    SetOwnersOptions {
+        dry_run: true,
+        ..SetOwnersOptions::default()
+    }
+}
+
+/// The operator's documented two-step workflow — `--dry-run` to learn the
+/// number, then acknowledge exactly it — used as a fixture so every root
+/// test also pins that the two runs COUNT THE SAME.
+async fn plan(u: &[String], specs: &[config_ops::OwnerAssignSpec]) -> config_ops::SetOwnersReport {
+    config_ops::set_owners(u, specs, &dry())
+        .await
+        .expect("a dry run reports the plan rather than refusing on the census")
+}
+
+async fn assign(
+    u: &[String],
+    specs: &[config_ops::OwnerAssignSpec],
+) -> config_ops::SetOwnersReport {
+    let n = plan(u, specs).await.census.total;
+    config_ops::set_owners(u, specs, &accepting(n))
+        .await
+        .expect("the acknowledged assignment applies")
 }
 
 fn now_secs() -> u64 {
@@ -303,8 +333,7 @@ async fn set_owners_refuses_while_any_volume_carries_a_fresh_foreign_claim() {
         &plain(),
     )
     .await
-    .err()
-    .expect("a fresh foreign claim must refuse the assignment");
+    .expect_err("a fresh foreign claim must refuse the assignment");
     let text = err.to_string();
     assert!(
         text.contains(&vols[1].display().to_string()),
@@ -318,7 +347,10 @@ async fn set_owners_refuses_while_any_volume_carries_a_fresh_foreign_claim() {
         squeezefs::meta_ship::stats().owner_assign_refusals > before,
         "owner_assign_refusals is the verb's refusal ledger"
     );
-    assert!(!marker_present(&vols[0]).await, "a refusal writes NO marker");
+    assert!(
+        !marker_present(&vols[0]).await,
+        "a refusal writes NO marker"
+    );
     assert!(
         raw_claim_set(&vols[0]).await.is_none() && raw_claim_set(&vols[1]).await.is_none(),
         "a refusal writes NO ownership record"
@@ -339,8 +371,7 @@ async fn set_owners_refuses_a_set_without_the_claim_set_capability() {
         &plain(),
     )
     .await
-    .err()
-    .expect("a bit-14-less set must refuse");
+    .expect_err("a bit-14-less set must refuse");
     let text = err.to_string();
     assert!(text.contains("bit 14"), "{text}");
     assert!(
@@ -365,8 +396,7 @@ async fn set_owners_refuses_an_unenrollable_member() {
         &plain(),
     )
     .await
-    .err()
-    .expect("an unenrollable member id must refuse");
+    .expect_err("an unenrollable member id must refuse");
     let text = err.to_string();
     assert!(text.contains("node-b"), "name the id it refused: {text}");
     assert!(
@@ -386,8 +416,7 @@ async fn set_owners_refuses_a_partial_map() {
 
     let err = config_ops::set_owners(&uris(&vols), &[spec(&id0, NODE_A, None)], &plain())
         .await
-        .err()
-        .expect("an assignment that names only part of the set must refuse");
+        .expect_err("an assignment that names only part of the set must refuse");
     let text = err.to_string();
     assert!(
         text.contains(&id1),
@@ -410,8 +439,7 @@ async fn set_owners_refuses_a_partial_map() {
         &plain(),
     )
     .await
-    .err()
-    .expect("naming a foreign volume id must refuse");
+    .expect_err("naming a foreign volume id must refuse");
     assert!(
         err.to_string().contains("vol-0000000000000000"),
         "{err} must quote the id it could not place"
@@ -433,7 +461,9 @@ async fn set_owners_refuses_an_open_cross_volume_intent() {
     with_write_set(&u, |routed| async move {
         let mut tree = Tree::default();
         let parent = loop {
-            let ino = tree.mkdir(&routed, 1, &format!("d{}", tree.dentries.len())).await;
+            let ino = tree
+                .mkdir(&routed, 1, &format!("d{}", tree.dentries.len()))
+                .await;
             if routed.route_ino(ino).0 == 0 {
                 break ino;
             }
@@ -461,8 +491,7 @@ async fn set_owners_refuses_an_open_cross_volume_intent() {
         },
     )
     .await
-    .err()
-    .expect("an open cross-volume intent must refuse the assignment");
+    .expect_err("an open cross-volume intent must refuse the assignment");
     let text = err.to_string();
     assert!(
         text.contains("intent"),
@@ -511,8 +540,7 @@ async fn set_owners_refuses_an_unacknowledged_cross_owner_name_census() {
         &plain(),
     )
     .await
-    .err()
-    .expect("an existing cross-owner population must be acknowledged");
+    .expect_err("an existing cross-owner population must be acknowledged");
     let text = err.to_string();
     assert!(
         text.contains(&format!("{cross}")),
@@ -533,8 +561,7 @@ async fn set_owners_refuses_an_unacknowledged_cross_owner_name_census() {
         &accepting(cross + 1),
     )
     .await
-    .err()
-    .expect("a mismatched acknowledgement must refuse");
+    .expect_err("a mismatched acknowledgement must refuse");
     let text = err.to_string();
     assert!(
         text.contains(&format!("{}", cross + 1)) && text.contains(&format!("{cross}")),
@@ -576,8 +603,7 @@ async fn set_owners_refuses_more_than_sixteen_members() {
     first.successors = successors;
     let err = config_ops::set_owners(&uris(&vols), &[first, spec(&id1, NODE_B, None)], &plain())
         .await
-        .err()
-        .expect("more than 16 members must refuse");
+        .expect_err("more than 16 members must refuse");
     let text = err.to_string();
     assert!(text.contains("16"), "the refusal prints the bound: {text}");
     assert!(
@@ -611,8 +637,7 @@ async fn a_kill_between_adjacent_volumes_resumes_idempotently() {
         },
     )
     .await
-    .err()
-    .expect("the crash seam fails the run");
+    .expect_err("the crash seam fails the run");
     assert!(err.to_string().contains("crash injection"), "{err}");
 
     assert_eq!(owner_of(&vols[0]).await.as_deref(), Some(NODE_A));
@@ -623,7 +648,7 @@ async fn a_kill_between_adjacent_volumes_resumes_idempotently() {
     let mount_err = squeezefs::meta_backend::open_routed_meta_set(&u)
         .await
         .err()
-        .expect("a writable mount must refuse while the bracket is open");
+        .unwrap_or_else(|| panic!("a writable mount must refuse while the bracket is open"));
     let text = mount_err.to_string();
     assert!(
         text.contains("set-owners"),
@@ -631,10 +656,13 @@ async fn a_kill_between_adjacent_volumes_resumes_idempotently() {
     );
 
     // A resume must name the SAME act.
-    let wrong = config_ops::set_owners(&u, &[spec(&id0, NODE_C, None), spec(&id1, NODE_B, None)], &plain())
-        .await
-        .err()
-        .expect("a resume naming a different act must refuse");
+    let wrong = config_ops::set_owners(
+        &u,
+        &[spec(&id0, NODE_C, None), spec(&id1, NODE_B, None)],
+        &plain(),
+    )
+    .await
+    .expect_err("a resume naming a different act must refuse");
     assert!(
         wrong.to_string().contains(&id0),
         "the refusal names the volume whose assignment differs: {wrong}"
@@ -677,18 +705,19 @@ async fn a_kill_between_the_root_mint_and_the_owner_record_resumes_idempotently(
         spec(&id0, NODE_A, Some("/projects/a")),
         spec(&id1, NODE_B, Some("/projects/b")),
     ];
+    let acknowledged = plan(&u, &specs).await.census.total;
 
-    config_ops::set_owners_with(
+    let err = config_ops::set_owners_with(
         &u,
         &specs,
-        &accepting(u64::MAX),
+        &accepting(acknowledged),
         &SetOwnersHooks {
             crash_after: Some(SetOwnersCrash::AfterRootMint { volume: 1 }),
         },
     )
     .await
-    .err()
-    .expect("the crash seam fails the run");
+    .expect_err("the crash seam fails the run");
+    assert!(err.to_string().contains("crash injection"), "{err}");
     assert_eq!(
         owner_of(&vols[1]).await,
         None,
@@ -700,9 +729,13 @@ async fn a_kill_between_the_root_mint_and_the_owner_record_resumes_idempotently(
         .expect("the root survived the crash")
         .ino;
 
-    let report = config_ops::set_owners(&u, &specs, &accepting(u64::MAX))
+    let report = config_ops::set_owners(&u, &specs, &accepting(acknowledged))
         .await
-        .expect("the re-run converges");
+        .expect(
+            "the re-run converges — and the census it counts is UNCHANGED by the crash, \
+                 because a root that moved from 'would mint' to 'already in the tree' is the \
+                 same one name",
+        );
     assert_eq!(owner_of(&vols[1]).await.as_deref(), Some(NODE_B));
     assert_eq!(
         config_ops::locate_path(&u, "/projects/b")
@@ -713,7 +746,10 @@ async fn a_kill_between_the_root_mint_and_the_owner_record_resumes_idempotently(
         "an idempotent re-run ADOPTS the root it already minted"
     );
     assert!(
-        report.roots.iter().any(|r| r.path == "/projects/b" && r.minted_ino.is_none()),
+        report
+            .roots
+            .iter()
+            .any(|r| r.path == "/projects/b" && r.minted_ino.is_none()),
         "and reports it as adopted rather than minted"
     );
 }
@@ -744,17 +780,15 @@ async fn the_verb_mints_each_subtree_root_on_the_volume_it_assigns() {
     .await;
 
     let before = squeezefs::meta_ship::stats().subtree_roots_minted;
-    let report = config_ops::set_owners(
+    let report = assign(
         &u,
         &[
             spec(&ids[0], NODE_A, Some("/projects/a")),
             spec(&ids[1], NODE_B, Some("/projects/b")),
             spec(&ids[2], NODE_C, Some("/projects/c")),
         ],
-        &accepting(u64::MAX),
     )
-    .await
-    .expect("the assignment mints the roots");
+    .await;
 
     assert_eq!(report.roots_minted, 3);
     assert_eq!(
@@ -821,11 +855,10 @@ async fn an_existing_root_path_whose_ino_homes_elsewhere_refuses_naming_volume_l
     let err = config_ops::set_owners(
         &u,
         &[spec(&id0, NODE_A, None), spec(&id1, NODE_B, Some(&home))],
-        &accepting(u64::MAX),
+        &accepting(0),
     )
     .await
-    .err()
-    .expect("a root whose ino homes elsewhere must refuse");
+    .expect_err("a root whose ino homes elsewhere must refuse");
     let text = err.to_string();
     assert!(
         text.contains("volume locate"),
@@ -844,11 +877,10 @@ async fn an_existing_root_path_whose_ino_homes_elsewhere_refuses_naming_volume_l
             spec(&id0, NODE_A, None),
             spec(&id1, NODE_B, Some("/nowhere/b")),
         ],
-        &accepting(u64::MAX),
+        &accepting(0),
     )
     .await
-    .err()
-    .expect("a missing parent must refuse");
+    .expect_err("a missing parent must refuse");
     assert!(
         err.to_string().contains("/nowhere"),
         "naming the parent it could not resolve: {err}"
@@ -902,16 +934,14 @@ async fn volume_locate_names_the_hosting_volume_and_its_owner() {
             .expect("mkdir /projects");
     })
     .await;
-    config_ops::set_owners(
+    assign(
         &u,
         &[
             spec(&id0, NODE_A, Some("/projects/a")),
             spec(&id1, NODE_B, Some("/projects/b")),
         ],
-        &accepting(u64::MAX),
     )
-    .await
-    .expect("assign");
+    .await;
 
     let root = config_ops::locate_path(&u, "/").await.expect("locate /");
     assert_eq!(root.ino, 1);
@@ -927,8 +957,7 @@ async fn volume_locate_names_the_hosting_volume_and_its_owner() {
 
     let err = config_ops::locate_path(&u, "/projects/nope")
         .await
-        .err()
-        .expect("an unresolvable path refuses");
+        .expect_err("an unresolvable path refuses");
     assert!(err.to_string().contains("/projects/nope"), "{err}");
 }
 
@@ -1013,6 +1042,11 @@ async fn a_dry_run_shows_the_plan_and_writes_no_ownership_state() {
     assert_eq!(report.records_written, 0);
     assert_eq!(report.roots_minted, 0);
     assert_eq!(report.roots.len(), 2, "it names the roots it WOULD mint");
+    assert!(
+        report.census.dentries_scanned > 0,
+        "the M3 pass RAN: a dry run REPORTS an unacknowledged population — refusing here \
+         would make the plan unprintable exactly when the operator needs the number"
+    );
     assert_eq!(report.set_authority.as_deref(), Some(NODE_A));
     assert!(
         report.volumes.iter().all(|v| v.previous_owner.is_none()),
@@ -1188,10 +1222,8 @@ async fn the_verb_counts_its_assignments_and_a_complete_re_run_writes_nothing() 
         "owner_assignments counts the volumes assigned"
     );
 
-    let raw: Vec<Option<Vec<u8>>> = vec![
-        raw_claim_set(&vols[0]).await,
-        raw_claim_set(&vols[1]).await,
-    ];
+    let raw: Vec<Option<Vec<u8>>> =
+        vec![raw_claim_set(&vols[0]).await, raw_claim_set(&vols[1]).await];
     let report = config_ops::set_owners(&u, &specs, &plain())
         .await
         .expect("re-running the same act converges");

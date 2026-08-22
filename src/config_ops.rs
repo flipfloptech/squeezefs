@@ -2345,6 +2345,1250 @@ impl OwnerAssignMarker {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `squeezefs volume set-owners` / `get-owners` / `locate` — the per-volume
+// claim admission operator surface (design-per-volume-claim-admission
+// §5.6/§6.1, KD-PV-15, rulings D19/D20; PR 7)
+// ---------------------------------------------------------------------------
+
+/// One volume's requested assignment, as the CLI grammar spells it:
+/// `<vol-id>=<member-id>[+<successor-id>...][:<subtree-root-path>]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerAssignSpec {
+    /// The DURABLE `vol-{hex}` identity (KD-5), as
+    /// [`crate::meta_backend::kv::backend::durable_volume_id_of`] derives
+    /// it and as `get-owners` / `locate` print it — never a path, an
+    /// ordinal or a set position.
+    pub volume_id: String,
+    /// The durable member id that will append to that volume (KD-MW-2).
+    pub owner: String,
+    /// Ordered, statically-declared adoption candidates (KD-PV-12).
+    pub successors: Vec<String>,
+    /// The owner's subtree root (KD-PV-15). Absent is legal and WARNS:
+    /// a node owning a volume but no subtree owns no new work (R16).
+    pub subtree_root: Option<String>,
+}
+
+/// Parse one `<vol-id>=<member-id>[+<succ>...][:<path>]` argument.
+///
+/// The `:` split is unambiguous by construction: a member id is
+/// `node_{hex}[.m{hex}]` (no colon) and a subtree root is an ABSOLUTE
+/// path, which is refused here rather than resolved relative to
+/// something the operator cannot see.
+pub fn parse_owner_assign_spec(spec: &str) -> Result<OwnerAssignSpec> {
+    let refuse = |why: &str| {
+        SqueezefsError::InvalidOperation(format!(
+            "volume set-owners: cannot read the assignment '{spec}': {why}. The spelling is \
+             <vol-id>=<member-id>[+<successor-id>...][:<subtree-root-path>] — for example \
+             vol-0a1b2c3d4e5f6071=node_00000000deadbeef.m00000001:/projects/a (ids come from \
+             `squeezefs volume get-owners`)"
+        ))
+    };
+    let (volume_id, rest) = spec
+        .split_once('=')
+        .ok_or_else(|| refuse("no '=' separates the volume id from its owner"))?;
+    if volume_id.is_empty() {
+        return Err(refuse("the volume id is empty"));
+    }
+    let (members, subtree_root) = match rest.split_once(':') {
+        Some((m, path)) => {
+            if !path.starts_with('/') {
+                return Err(refuse(
+                    "the subtree root must be an ABSOLUTE path inside the filesystem",
+                ));
+            }
+            (m, Some(path.to_string()))
+        }
+        None => (rest, None),
+    };
+    let mut ids = members.split('+').map(str::trim);
+    let owner = ids
+        .next()
+        .filter(|o| !o.is_empty())
+        .ok_or_else(|| refuse("no owner member id follows the '='"))?;
+    let successors: Vec<String> = ids.map(str::to_string).collect();
+    if successors.iter().any(String::is_empty) {
+        return Err(refuse("an empty successor id"));
+    }
+    Ok(OwnerAssignSpec {
+        volume_id: volume_id.to_string(),
+        owner: owner.to_string(),
+        successors,
+        subtree_root,
+    })
+}
+
+/// The KD-MW-2 durable member id grammar: `node_{16 hex}` (the
+/// slot-wildcard roster form) or `node_{16 hex}.m{8 hex}` (a mount).
+///
+/// Checked because an id outside it can never equal any mount's
+/// [`crate::cowriter::node_member_id`], so a volume assigned to one is a
+/// volume no node may ever append to — a set that refuses every mount
+/// until an offline re-run.
+fn member_id_is_enrollable(id: &str) -> bool {
+    let hex = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_hexdigit());
+    let Some(body) = id.strip_prefix("node_") else {
+        return false;
+    };
+    match body.split_once(".m") {
+        Some((node, slot)) => hex(node, 16) && hex(slot, 8),
+        None => hex(body, 16),
+    }
+}
+
+/// `--clear` / `--dry-run` / `--accept-cross-owner-names <N>`.
+#[derive(Debug, Clone, Default)]
+pub struct SetOwnersOptions {
+    /// Unassign every volume of the set (the §7 rollback).
+    pub clear: bool,
+    /// Print the plan — including the M3 census — and write nothing.
+    pub dry_run: bool,
+    /// The operator's acknowledgement of the cross-owner name population
+    /// (KD-PV-11 M3). It must MATCH the counted number.
+    pub accept_cross_owner_names: Option<u64>,
+}
+
+/// The named crash windows of [`set_owners_with`] (the [`EnableMwCrash`]
+/// pattern): each injects a hard error AFTER the named durable write, so
+/// the on-media state is exactly the kill-9 window's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SetOwnersCrash {
+    /// After the `owner_assign:` intent marker landed durably, before any
+    /// record — the window a writable mount must refuse in.
+    AfterMarker,
+    /// After `volume`'s subtree root was minted, before its owner record
+    /// (the KD-PV-15 resumability window §5.6 names).
+    AfterRootMint { volume: usize },
+    /// After `volume`'s owner record + enrollment landed, before the next
+    /// volume — the half-assigned shape.
+    AfterVolume { volume: usize },
+}
+
+/// Test seams for [`set_owners_with`].
+#[derive(Default)]
+pub struct SetOwnersHooks {
+    pub crash_after: Option<SetOwnersCrash>,
+}
+
+/// One volume's row in a [`SetOwnersReport`].
+#[derive(Debug, Clone)]
+pub struct VolumeAssignmentRow {
+    pub volume_id: String,
+    pub path: String,
+    /// `true` ⇔ this volume hosts slot 0, so its owner is the SET
+    /// AUTHORITY (D20 / KD-PV-6).
+    pub hosts_slot_0: bool,
+    /// What the record said before this invocation.
+    pub previous_owner: Option<String>,
+    /// What it says after (or would, on a dry run). `None` = `--clear`.
+    pub owner: Option<String>,
+    pub successors: Vec<String>,
+    pub subtree_root: Option<String>,
+}
+
+/// One subtree root the invocation minted or adopted (KD-PV-15).
+#[derive(Debug, Clone)]
+pub struct SubtreeRootPlan {
+    pub path: String,
+    pub volume_id: String,
+    pub volume_idx: usize,
+    pub owner: String,
+    /// The ino found already in place and homing on the assigned volume
+    /// (an idempotent re-run ADOPTS it).
+    pub existing_ino: Option<u64>,
+    /// The ino this run minted.
+    pub minted_ino: Option<u64>,
+    /// Does this root's own name span two owners? (Its dentry lives in
+    /// the parent's volume, its inode on the assignee's — the one
+    /// cross-owner name per root the supported shape pays.)
+    pub cross_owner_name: bool,
+}
+
+/// KD-PV-11 **M3**: the cross-owner dentry population the proposed
+/// assignment would create — measured in ONE pass over `TREE_DENTRIES`,
+/// the pass fsck's C9 already runs.
+#[derive(Debug, Clone, Default)]
+pub struct CrossOwnerCensus {
+    /// Names already in the tree whose parent's owner ≠ their inode's.
+    pub existing: u64,
+    /// Roots this run would mint that land cross-owner (one per root on
+    /// the supported shape).
+    pub roots: u64,
+    /// `existing + roots` — the number the operator acknowledges.
+    pub total: u64,
+    /// Per PARENT volume (`vol-{hex}`, count) — where the names live.
+    pub per_volume: Vec<(String, u64)>,
+    /// A bounded sample, so the refusal shows WHICH names.
+    pub sample: Vec<String>,
+    /// Dentries walked — the pass's own engagement gauge.
+    pub dentries_scanned: u64,
+}
+
+/// What [`set_owners`] did (or, on a dry run, would do).
+#[derive(Debug, Clone)]
+pub struct SetOwnersReport {
+    pub volumes: Vec<VolumeAssignmentRow>,
+    pub census: CrossOwnerCensus,
+    pub roots: Vec<SubtreeRootPlan>,
+    /// Loud, operator-facing notes that are NOT refusals (R16's unrooted
+    /// assignment above all).
+    pub warnings: Vec<String>,
+    /// The owner of the slot-0 volume — the SET AUTHORITY (D20).
+    pub set_authority: Option<String>,
+    /// That volume's durable id.
+    pub set_authority_volume: String,
+    pub dry_run: bool,
+    /// Volume ownership records written by this run.
+    pub records_written: usize,
+    pub roots_minted: usize,
+    /// Distinct members enrolled on every volume (KD-PV-4).
+    pub members_enrolled: usize,
+}
+
+/// `squeezefs volume set-owners <sqmeta-uri> <vol-id>=<member-id>…` — the
+/// **OFFLINE, D0-guarded, bracketed** assignment coordinator (ruling
+/// **D19**; design-per-volume-claim-admission §5.6/§6.1).
+///
+/// # Why this verb exists at all, and why it is offline
+///
+/// Ownership is DERIVED at every mount from `claim_set.owner` conjoined
+/// with the live claim (KD-PV-3). Nothing in the product writes the
+/// assignment half — deliberately, because a live hand-off between two
+/// nodes is a two-party protocol with its own failure matrix. D19
+/// dissolves it: this verb takes the D0 claim on EVERY volume, so for the
+/// length of the bracket the process is the sole authority of the whole
+/// set and writes every record itself. There is no peer to agree with.
+///
+/// # The bracket, in order
+///
+/// 1. every volume's live-client preflight, then the **D0-guarded open of
+///    the whole set** — the enforcement point: a heartbeat-fresh foreign
+///    claim on any volume refuses the run and releases what it took;
+/// 2. the declarative refusals, before any write: bit 14 on every volume,
+///    a complete map, enrollable member ids, ≤ `MAX_LANES` members, no
+///    `mw_upgrade:` bracket, **no open cross-volume intent** (§5.4a), and
+///    a subtree-root plan whose paths resolve;
+/// 3. the **M3 census** — one `TREE_DENTRIES` pass — refused unless
+///    `--accept-cross-owner-names <N>` matches the counted number;
+/// 4. the `owner_assign:` intent marker on ino 1 of volume 0 (written
+///    FIRST, deleted LAST — a writable mount refuses while it stands, so
+///    a half-assigned set is never something an operator can mount);
+/// 5. per volume in canonical order: mint its subtree root (KD-PV-15,
+///    through the preset-ino create path — deterministic, no round-robin
+///    luck), enroll every member **pid-less** (KD-PV-4), write the owner
+///    record, delete the stale rendezvous record from non-slot-0 volumes
+///    (sweep row 17), checkpoint (so the assignment is projection-visible
+///    — the §5.9.2 precondition);
+/// 6. delete the marker, checkpoint, release every guard.
+///
+/// Idempotent and crash-resumable throughout: a re-run must name the SAME
+/// act (the marker is compared), an already-minted root is adopted rather
+/// than re-minted, and a fully-applied assignment with no open bracket
+/// writes nothing at all.
+pub async fn set_owners(
+    meta_lvs: &[String],
+    specs: &[OwnerAssignSpec],
+    opts: &SetOwnersOptions,
+) -> Result<SetOwnersReport> {
+    set_owners_with(meta_lvs, specs, opts, &SetOwnersHooks::default()).await
+}
+
+/// [`set_owners`] with the named crash windows exposed.
+pub async fn set_owners_with(
+    meta_lvs: &[String],
+    specs: &[OwnerAssignSpec],
+    opts: &SetOwnersOptions,
+    hooks: &SetOwnersHooks,
+) -> Result<SetOwnersReport> {
+    let out = set_owners_inner(meta_lvs, specs, opts, hooks).await;
+    if out.is_err() {
+        crate::meta_ship::note_owner_assign_refusal();
+    }
+    out
+}
+
+/// The set-authority announcement every successful assignment prints
+/// (D20): one volume's owner runs the planes the set has exactly one of.
+pub fn set_authority_announcement(vol_id: &str, owner: &str) -> String {
+    format!(
+        "volume {vol_id} hosts slot 0 — its owner {owner} is the SET AUTHORITY: it assigns \
+         allocation lanes, serves the S9 custody endpoint, owns the ONLY freed-offset grace \
+         ring, coordinates maintenance, and homes ino 1"
+    )
+}
+
+async fn set_owners_inner(
+    meta_lvs: &[String],
+    specs: &[OwnerAssignSpec],
+    opts: &SetOwnersOptions,
+    hooks: &SetOwnersHooks,
+) -> Result<SetOwnersReport> {
+    use crate::meta_backend::kv::backend::durable_volume_id_of;
+
+    // ---- 0. the spec itself, before any I/O -------------------------
+    if opts.clear && !specs.is_empty() {
+        return Err(SqueezefsError::InvalidOperation(
+            "volume set-owners --clear unassigns the WHOLE set and takes no per-volume \
+             assignments — run it alone, or drop --clear to assign"
+                .to_string(),
+        ));
+    }
+    if !opts.clear && specs.is_empty() {
+        return Err(SqueezefsError::InvalidOperation(
+            "volume set-owners: no assignments given. Name every volume of the set \
+             (<vol-id>=<member-id>[+<successor-id>...][:<subtree-root-path>]), or pass \
+             --clear to unassign the whole set"
+                .to_string(),
+        ));
+    }
+    for (i, s) in specs.iter().enumerate() {
+        if let Some(dup) = specs[..i].iter().find(|p| p.volume_id == s.volume_id) {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "volume set-owners: volume {} is named twice ('{}' and '{}') — which \
+                 assignment is the act cannot be answered, so it is refused rather than \
+                 guessed",
+                dup.volume_id, dup.owner, s.owner
+            )));
+        }
+        for id in std::iter::once(&s.owner).chain(s.successors.iter()) {
+            if !member_id_is_enrollable(id) {
+                return Err(SqueezefsError::InvalidOperation(format!(
+                    "volume set-owners: '{id}' (named for volume {}) is not a durable member \
+                     identity, so no mount could ever match it and the volume would be \
+                     assigned to nobody. The form is KD-MW-2's node_{{16 hex}} or \
+                     node_{{16 hex}}.m{{8 hex}} — read a node's id from `squeezefs clients \
+                     <sqmeta-uri>` or from its mount log",
+                    s.volume_id
+                )));
+            }
+        }
+        if let Some(root) = &s.subtree_root {
+            if !root.starts_with('/') {
+                return Err(SqueezefsError::InvalidOperation(format!(
+                    "volume set-owners: the subtree root '{root}' for volume {} is not an \
+                     absolute path inside the filesystem",
+                    s.volume_id
+                )));
+            }
+        }
+    }
+    let mut members: Vec<String> = Vec::new();
+    for s in specs {
+        for id in std::iter::once(&s.owner).chain(s.successors.iter()) {
+            if !members.iter().any(|m| m == id) {
+                members.push(id.clone());
+            }
+        }
+    }
+    if members.len() > crate::alloc_lane_grant::MAX_LANES as usize {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "volume set-owners: this assignment names {} distinct members ({}), but a \
+             volume set's journal admits at most MAX_LANES = {} appenders \
+             (design-per-volume-claim-admission §5.7 — the allocation-lane width is \
+             next_power_of_two(members) and the format's own bound is {}). Assign at most \
+             {} members, ideally a power of two",
+            members.len(),
+            members.join(", "),
+            crate::alloc_lane_grant::MAX_LANES,
+            crate::alloc_lane_grant::MAX_LANES,
+            crate::alloc_lane_grant::MAX_LANES
+        )));
+    }
+
+    // ---- 1. the live-client preflight on every volume ---------------
+    for path in meta_lvs {
+        crate::meta_backend::kv::builder::format_preflight(Path::new(path), true)
+            .await
+            .map_err(|e| {
+                SqueezefsError::InvalidOperation(format!(
+                    "volume set-owners refused: metadata volume '{path}' is not exclusively \
+                     claimable — every owner of this set must be unmounted before ownership \
+                     is assigned (ruling D19: the assignment runs as the momentary sole \
+                     authority of the whole set): {e}"
+                ))
+            })?;
+    }
+
+    // ---- 2. discovery + the per-volume plan -------------------------
+    let disc = crate::meta_backend::discover_meta_set(meta_lvs).await?;
+    let ordered = disc.ordered_paths.clone();
+    let vol_ids: Vec<String> = disc.uuids.iter().map(durable_volume_id_of).collect();
+    let mut plan: Vec<Option<&OwnerAssignSpec>> = vec![None; ordered.len()];
+    for s in specs {
+        let Some(idx) = vol_ids.iter().position(|v| *v == s.volume_id) else {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "volume set-owners: no volume of this set carries the durable id {} — the \
+                 set's volumes are {}. Ownership is keyed on the durable identity (KD-5), \
+                 never on a path or a position; `squeezefs volume get-owners <sqmeta-uri>` \
+                 prints it",
+                s.volume_id,
+                vol_ids.join(", ")
+            )));
+        };
+        plan[idx] = Some(s);
+    }
+    if !opts.clear {
+        if let Some(missing) = plan.iter().position(Option::is_none) {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "volume set-owners: metadata volume {} ({}) is not named by this assignment. \
+                 A partial map has no coherent appender story — the unassigned volume \
+                 belongs to everyone and to nobody, and every mount of the set would refuse \
+                 (KD-PV-3). Re-run over the WHOLE set: {} volume(s), {}",
+                vol_ids[missing],
+                ordered[missing],
+                vol_ids.len(),
+                vol_ids.join(", ")
+            )));
+        }
+    }
+
+    // Bit 14 gates the whole program (KD-PV-9) — checked from the
+    // superblocks, before a guard is taken.
+    for (idx, path) in ordered.iter().enumerate() {
+        let features =
+            match crate::meta_backend::kv::superblock::classify_volume(Path::new(path)).await? {
+                crate::meta_backend::kv::superblock::VolumeFormat::V3(s) => s.features_incompat,
+                _ => 0,
+            };
+        if !crate::membership::claim_set_engaged(features) {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "volume set-owners: metadata volume {} ({}) does not carry the claim-set \
+                 capability (incompat bit 14), which is what expresses a SET of writers — \
+                 per-volume ownership is gated on it and takes no bit of its own (KD-PV-9). \
+                 Upgrade the set offline first: `squeezefs volume enable-multi-writer \
+                 <sqmeta-uri>`",
+                vol_ids[idx], path
+            )));
+        }
+    }
+
+    // ---- 3. the D0-guarded coordinator open of the WHOLE set --------
+    let backends = crate::meta_backend::open_meta_volume_set(&ordered)
+        .await
+        .map_err(|e| {
+            SqueezefsError::InvalidOperation(format!(
+                "volume set-owners refused: {e}. The assignment runs under the D0-guarded \
+                 coordinator open of the whole set (ruling D19), so every owner of this set \
+                 must be unmounted — a heartbeat-fresh claim from another node is exactly \
+                 what this refusal reports"
+            ))
+        })?;
+    let routed = match crate::meta_backend::RoutedMetaBackend::with_slot_map_and_natives(
+        backends,
+        disc.routing_width,
+        disc.slot_to_volume.clone(),
+        disc.native_slots.clone(),
+    ) {
+        Ok(r) => std::sync::Arc::new(r),
+        Err(e) => {
+            return Err(e);
+        }
+    };
+    let body = set_owners_body(&routed, &vol_ids, &plan, &members, opts, hooks).await;
+    for vol in &routed.volumes {
+        if let Err(e) = vol.shutdown().await {
+            log::warn!("releasing guard after volume set-owners: {e}");
+        }
+    }
+    body
+}
+
+/// [`set_owners_inner`]'s body, split so the D0 guards are released on
+/// every path (the `clone_path_offline` posture).
+async fn set_owners_body(
+    routed: &std::sync::Arc<crate::meta_backend::RoutedMetaBackend>,
+    vol_ids: &[String],
+    plan: &[Option<&OwnerAssignSpec>],
+    members: &[String],
+    opts: &SetOwnersOptions,
+    hooks: &SetOwnersHooks,
+) -> Result<SetOwnersReport> {
+    let slot_0_v = routed.route_ino(1).0;
+    // The marker lives on CANONICAL volume 0 because that is where every
+    // writable mount's bracket probe reads it
+    // (`open_intent_marker_refusal(&backends[0])`); on every set the
+    // derived slot plan produces, that is also the slot-0 host. Writing
+    // it anywhere else would make the bracket invisible to the gate it
+    // exists to close.
+    let marker_vol = &routed.volumes[0];
+
+    // The `mw_upgrade:` bracket is somebody else's unfinished act.
+    if marker_vol
+        .getxattr(1, crate::MW_UPGRADE_MARKER_XATTR)
+        .await?
+        .is_some()
+    {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "volume set-owners: a multi-writer upgrade-intent marker (`{}`) is present on \
+             volume 0 — a `squeezefs volume enable-multi-writer` run crashed mid-upgrade and \
+             this set's capability bits may be mixed. Finish it first (`squeezefs volume \
+             enable-multi-writer <sqmeta-uri>`, idempotent)",
+            crate::MW_UPGRADE_MARKER_XATTR
+        )));
+    }
+
+    // The act this invocation is applying, in canonical volume order.
+    let marker = OwnerAssignMarker {
+        assignments: (0..routed.volumes.len())
+            .map(|v| OwnerAssignment {
+                volume_id: vol_ids[v].clone(),
+                owner: plan[v].map(|s| s.owner.clone()).filter(|_| !opts.clear),
+                successors: plan[v]
+                    .map(|s| s.successors.clone())
+                    .filter(|_| !opts.clear)
+                    .unwrap_or_default(),
+            })
+            .collect(),
+    };
+    let resuming = match marker_vol
+        .getxattr(1, crate::OWNER_ASSIGN_MARKER_XATTR)
+        .await?
+    {
+        Some(raw) => {
+            let open = OwnerAssignMarker::decode(&raw).map_err(|e| {
+                SqueezefsError::InvalidOperation(format!(
+                    "volume set-owners: the crashed run's intent marker is unusable ({e}) — \
+                     refusing to guess which assignment it was applying. The bracket must be \
+                     completed or cleared by a binary that can read it"
+                ))
+            })?;
+            if open != marker {
+                let differing: Vec<String> = marker
+                    .assignments
+                    .iter()
+                    .filter(|a| !open.assignments.iter().any(|o| *o == **a))
+                    .map(|a| {
+                        format!(
+                            "{} → {}",
+                            a.volume_id,
+                            a.owner.as_deref().unwrap_or("(unassigned)")
+                        )
+                    })
+                    .collect();
+                return Err(SqueezefsError::InvalidOperation(format!(
+                    "volume set-owners: an ownership-assignment bracket is already open on \
+                     this set and names a DIFFERENT act — the open one assigns [{}], this \
+                     invocation would assign [{}] (differing: {}). Re-run the verb with \
+                     exactly the open act's arguments to complete it, or with --clear to \
+                     unassign the set",
+                    open.assignments
+                        .iter()
+                        .map(|a| format!(
+                            "{}={}",
+                            a.volume_id,
+                            a.owner.as_deref().unwrap_or("(unassigned)")
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    marker
+                        .assignments
+                        .iter()
+                        .map(|a| format!(
+                            "{}={}",
+                            a.volume_id,
+                            a.owner.as_deref().unwrap_or("(unassigned)")
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    differing.join(", ")
+                )));
+            }
+            true
+        }
+        None => false,
+    };
+
+    // §5.4a's barrier: an open cross-volume intent spans a transaction
+    // this assignment could strand across two owners.
+    for (v, vol) in routed.volumes.iter().enumerate() {
+        let intents = vol.xv_scan_intents().await?;
+        if !intents.is_empty() {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "volume set-owners: metadata volume {} ({}) carries {} open cross-volume \
+                 intent(s) (tx {:?}). Assigning ownership now would leave a half-applied \
+                 transaction spanning two OWNERS, which no node in the fleet could roll \
+                 forward and which refuses the next mount. Mount the set once as a single \
+                 authority so the intents recover (they roll forward at open), then re-run \
+                 this verb",
+                vol_ids[v],
+                vol.device_path().display(),
+                intents.len(),
+                intents.iter().map(|(id, _)| *id).collect::<Vec<_>>()
+            )));
+        }
+    }
+
+    // ---- the per-volume rows + the subtree-root plan ----------------
+    let mut rows: Vec<VolumeAssignmentRow> = Vec::with_capacity(routed.volumes.len());
+    let mut owner_by_volume: Vec<Option<String>> = Vec::with_capacity(routed.volumes.len());
+    for (v, vol) in routed.volumes.iter().enumerate() {
+        let previous = crate::membership::ClaimSet::load(vol)
+            .await
+            .filter(|s| s.durable)
+            .and_then(|s| s.owner);
+        let owner = plan[v].map(|s| s.owner.clone()).filter(|_| !opts.clear);
+        owner_by_volume.push(owner.clone());
+        rows.push(VolumeAssignmentRow {
+            volume_id: vol_ids[v].clone(),
+            path: vol.device_path().display().to_string(),
+            hosts_slot_0: v == slot_0_v,
+            previous_owner: previous,
+            owner,
+            successors: plan[v]
+                .map(|s| s.successors.clone())
+                .filter(|_| !opts.clear)
+                .unwrap_or_default(),
+            subtree_root: plan[v].and_then(|s| s.subtree_root.clone()),
+        });
+    }
+    let set_authority = owner_by_volume[slot_0_v].clone();
+
+    let mut roots: Vec<SubtreeRootPlan> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    if !opts.clear {
+        for (v, spec) in plan.iter().enumerate() {
+            let Some(spec) = spec else { continue };
+            let Some(path) = &spec.subtree_root else {
+                warnings.push(format!(
+                    "volume {} is assigned to {} with NO subtree root: that node will own a \
+                     volume but no new work — every ino descends from root and belongs to \
+                     the set authority (KD-PV-15/R16), so it will ship 100 % of its metadata \
+                     verbs. Re-run with {}={}:<absolute-path> to mint one",
+                    vol_ids[v], spec.owner, vol_ids[v], spec.owner
+                ));
+                continue;
+            };
+            let (parent, name) = resolve_subtree_parent(routed, path).await?;
+            let existing = routed.lookup_dentry(parent, &name).await?;
+            if let Some((ino, _)) = existing {
+                let home = routed.route_ino(ino).0;
+                if home != v {
+                    return Err(SqueezefsError::InvalidOperation(format!(
+                        "volume set-owners: the subtree root '{path}' already exists and its \
+                         inode (ino {ino}) homes on metadata volume {} — not on {}, the \
+                         volume it would be the root of. A root's inode must live on the \
+                         volume its owner appends to, or every descendant would inherit the \
+                         WRONG owner (KD-PV-15/M2). Confirm with `squeezefs volume locate \
+                         <sqmeta-uri> {path}`, then either assign {} to {} or name a path \
+                         that does not exist yet (the verb mints it)",
+                        vol_ids[home], vol_ids[v], vol_ids[home], spec.owner
+                    )));
+                }
+            }
+            let parent_v = routed.route_ino(parent).0;
+            let cross = !same_owner(
+                owner_by_volume[parent_v].as_deref(),
+                owner_by_volume[v].as_deref(),
+            );
+            roots.push(SubtreeRootPlan {
+                path: path.clone(),
+                volume_id: vol_ids[v].clone(),
+                volume_idx: v,
+                owner: spec.owner.clone(),
+                existing_ino: existing.map(|(ino, _)| ino),
+                minted_ino: None,
+                cross_owner_name: cross,
+            });
+        }
+    }
+
+    // ---- is the act already fully applied? --------------------------
+    if !resuming {
+        let mut applied = true;
+        for (v, vol) in routed.volumes.iter().enumerate() {
+            let set = crate::membership::ClaimSet::load(vol)
+                .await
+                .filter(|s| s.durable);
+            let want_owner = owner_by_volume[v].clone();
+            let want_succ = rows[v].successors.clone();
+            let have_owner = set.as_ref().and_then(|s| s.owner.clone());
+            let have_succ = set
+                .as_ref()
+                .map(|s| s.successors.clone())
+                .unwrap_or_default();
+            let enrolled = set.as_ref().is_some_and(|s| {
+                members.iter().all(|m| {
+                    s.members
+                        .iter()
+                        .any(|e| e.identity.id == *m && e.identity.pid == 0)
+                })
+            }) || opts.clear;
+            if have_owner != want_owner || have_succ != want_succ || !enrolled {
+                applied = false;
+                break;
+            }
+        }
+        if applied && roots.iter().all(|r| r.existing_ino.is_some()) {
+            return Ok(SetOwnersReport {
+                volumes: rows,
+                census: CrossOwnerCensus::default(),
+                roots,
+                warnings,
+                set_authority,
+                set_authority_volume: vol_ids[slot_0_v].clone(),
+                dry_run: opts.dry_run,
+                records_written: 0,
+                roots_minted: 0,
+                members_enrolled: members.len(),
+            });
+        }
+    }
+
+    // ---- 3. the M3 census, and its acknowledgement ------------------
+    let mut census = if opts.clear {
+        CrossOwnerCensus::default()
+    } else {
+        cross_owner_census(routed, vol_ids, &owner_by_volume).await?
+    };
+    census.roots = roots
+        .iter()
+        .filter(|r| r.cross_owner_name && r.existing_ino.is_none())
+        .count() as u64;
+    census.total = census.existing + census.roots;
+
+    // The dry run REPORTS the census rather than refusing on it: showing
+    // the operator the number they must acknowledge is the whole point of
+    // the flag, and a refusal here would make the plan unprintable
+    // exactly when it matters most.
+    if opts.dry_run {
+        return Ok(SetOwnersReport {
+            volumes: rows,
+            census,
+            roots,
+            warnings,
+            set_authority,
+            set_authority_volume: vol_ids[slot_0_v].clone(),
+            dry_run: true,
+            records_written: 0,
+            roots_minted: 0,
+            members_enrolled: members.len(),
+        });
+    }
+
+    if census.total > 0 && opts.accept_cross_owner_names != Some(census.total) {
+        let named = opts.accept_cross_owner_names;
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "volume set-owners: {} existing name(s) resolve to inodes on a volume their \
+             parent's owner will not own{}. Those names cannot be unlinked, renamed or \
+             relinked in place while this assignment stands: `unlink`/`rmdir` on them will \
+             return EXDEV, and unlike `rename` there is no copy+unlink fallback. Remedies: \
+             assign ownership on a set with no such names (the fresh-fleet recipe), reduce \
+             the count by re-homing offline, or clear the assignment (`volume set-owners \
+             --clear`), delete, and re-assign. To proceed, acknowledge the exact number: \
+             --accept-cross-owner-names {}.\n  by parent volume: {}\n  sample: {}",
+            census.total,
+            match named {
+                Some(n) => format!(
+                    " — this invocation acknowledged {n}, which does not match the counted {}",
+                    census.total
+                ),
+                None => format!(
+                    " ({} already in the tree + {} subtree root(s) this run would mint)",
+                    census.existing, census.roots
+                ),
+            },
+            census.total,
+            census
+                .per_volume
+                .iter()
+                .map(|(v, n)| format!("{v}={n}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            if census.sample.is_empty() {
+                "(the roots this run mints)".to_string()
+            } else {
+                census.sample.join("; ")
+            }
+        )));
+    }
+
+    // ---- 4. the bracket's FIRST act: the intent marker --------------
+    if !resuming {
+        marker_vol
+            .setxattr_internal(1, crate::OWNER_ASSIGN_MARKER_XATTR, &marker.encode())
+            .await?;
+        marker_vol.checkpoint_now().await.map_err(|e| {
+            SqueezefsError::InvalidOperation(format!(
+                "volume set-owners: the intent marker did not land durably: {e}"
+            ))
+        })?;
+    }
+    if hooks.crash_after == Some(SetOwnersCrash::AfterMarker) {
+        return Err(SqueezefsError::InvalidOperation(
+            "crash injection (set-owners: after the intent marker)".to_string(),
+        ));
+    }
+
+    // ---- 5. per volume, in canonical order --------------------------
+    let (uid, gid) = invoking_owner();
+    let mut records_written = 0usize;
+    let mut roots_minted = 0usize;
+    for v in 0..routed.volumes.len() {
+        // (a) KD-PV-15: the subtree root, minted through the preset-ino
+        // create path so its inode lands on the volume being assigned.
+        if let Some(slot) = roots.iter().position(|r| r.volume_idx == v) {
+            if roots[slot].existing_ino.is_none() {
+                let path = roots[slot].path.clone();
+                let (parent, name) = resolve_subtree_parent(routed, &path).await?;
+                let ino = mint_subtree_root(routed, parent, &name, v, uid, gid).await?;
+                roots[slot].minted_ino = Some(ino);
+                roots_minted += 1;
+                crate::meta_ship::note_subtree_root_minted();
+                log::info!(
+                    "volume set-owners: minted subtree root '{path}' (ino {ino}) on metadata \
+                     volume {} — every descendant inherits its owner {} by M2",
+                    vol_ids[v],
+                    roots[slot].owner
+                );
+            }
+            if hooks.crash_after == Some(SetOwnersCrash::AfterRootMint { volume: v }) {
+                return Err(SqueezefsError::InvalidOperation(format!(
+                    "crash injection (set-owners: volume {v} after the subtree-root mint)"
+                )));
+            }
+        }
+
+        let vol = &routed.volumes[v];
+        let term = vol.writer_term();
+        // (b) KD-PV-4: the roster enrollment is PID-LESS — deliberately
+        // process-less, so the rung-8 same-boot prune (which exempts it)
+        // can never manufacture an assignment-vs-enrollment disagreement.
+        if !opts.clear {
+            for id in members {
+                crate::membership::upsert_writer_member(
+                    vol,
+                    &crate::membership::MemberIdentity {
+                        id: id.clone(),
+                        role: crate::membership::MemberRole::Writer,
+                        pid: 0,
+                        boot: String::new(),
+                        endpoint: None,
+                        pr_key: 0,
+                    },
+                    term,
+                )
+                .await?;
+            }
+        }
+        // (c) the assignment itself.
+        crate::membership::set_volume_owner(
+            vol,
+            owner_by_volume[v].as_deref(),
+            &rows[v].successors,
+            term,
+        )
+        .await?;
+        records_written += 1;
+        crate::meta_ship::note_owner_assignment();
+        // (d) sweep row 17: under a per-volume posture only the slot-0
+        // volume carries the membership rendezvous, and a stale copy on a
+        // peer-owned volume is one NOBODY can remove later (the peer
+        // never writes there and its owner never reads it). This is the
+        // one moment in the set's life at which it can be deleted.
+        if !opts.clear && v != slot_0_v {
+            crate::membership::clear_owner_record(vol).await?;
+        }
+        // (e) §5.9.2's precondition: the assignment must be visible to a
+        // peer's PROJECTION, which reads checkpoints.
+        vol.checkpoint_now().await.map_err(|e| {
+            SqueezefsError::InvalidOperation(format!(
+                "volume set-owners: volume {}'s assignment did not land durably: {e}",
+                vol_ids[v]
+            ))
+        })?;
+        if hooks.crash_after == Some(SetOwnersCrash::AfterVolume { volume: v }) {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "crash injection (set-owners: after volume {v}'s owner record)"
+            )));
+        }
+    }
+
+    // ---- 6. the bracket's LAST act ----------------------------------
+    marker_vol
+        .removexattr_internal(1, crate::OWNER_ASSIGN_MARKER_XATTR)
+        .await?;
+    marker_vol.checkpoint_now().await.map_err(|e| {
+        SqueezefsError::InvalidOperation(format!(
+            "volume set-owners: the marker delete did not land durably: {e}"
+        ))
+    })?;
+
+    if let Some(owner) = &set_authority {
+        log::warn!("{}", set_authority_announcement(&vol_ids[slot_0_v], owner));
+    }
+    for w in &warnings {
+        log::warn!("volume set-owners: {w}");
+    }
+    Ok(SetOwnersReport {
+        volumes: rows,
+        census,
+        roots,
+        warnings,
+        set_authority,
+        set_authority_volume: vol_ids[slot_0_v].clone(),
+        dry_run: false,
+        records_written,
+        roots_minted,
+        members_enrolled: if opts.clear { 0 } else { members.len() },
+    })
+}
+
+/// Two assignment entries name the same owner? A bare `node_{hex}` roster
+/// entry is the slot WILDCARD form (`member_id_matches`), so it is the
+/// same owner as any of that node's mounts — never a cross-owner name.
+fn same_owner(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            crate::membership::member_id_matches(a, b) || crate::membership::member_id_matches(b, a)
+        }
+        _ => false,
+    }
+}
+
+/// Resolve a subtree root path to `(parent ino, leaf name)`. A missing
+/// parent REFUSES rather than being created implicitly (§6.1) — an
+/// operator who mistyped `/projcets/a` must be told, not given a new
+/// top-level directory.
+async fn resolve_subtree_parent(
+    routed: &crate::meta_backend::RoutedMetaBackend,
+    path: &str,
+) -> Result<(u64, String)> {
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    let Some((name, dirs)) = parts.split_last() else {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "volume set-owners: '{path}' is the filesystem root, which is ino 1 and homes on \
+             the slot-0 volume by construction (KD-PV-6) — name a directory under it"
+        )));
+    };
+    let mut parent = 1u64;
+    let mut walked = String::new();
+    for dir in dirs {
+        walked.push('/');
+        walked.push_str(dir);
+        let found = routed.lookup_dentry(parent, dir).await?;
+        let Some((ino, mode)) = found else {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "volume set-owners: the subtree root '{path}' cannot be minted because its \
+                 parent directory '{walked}' does not exist. The verb never creates \
+                 intermediate directories implicitly — create the parent through a mount \
+                 first, then re-run"
+            )));
+        };
+        if mode & libc::S_IFMT != libc::S_IFDIR {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "volume set-owners: '{walked}' (ino {ino}) on the way to the subtree root \
+                 '{path}' is not a directory"
+            )));
+        }
+        parent = ino;
+    }
+    Ok((parent, (*name).to_string()))
+}
+
+/// Mint one subtree root ON `volume_idx` (KD-PV-15) through the existing
+/// preset-ino create path: pick a mint slot hosted by that volume, mint
+/// the ino from it (`make_global_ino_width` then routes it to that volume
+/// by construction), and create the directory with the ino pre-supplied.
+///
+/// Deterministic by construction — the alternative (create, inspect,
+/// retry) depends on round-robin luck and leaves rejects behind.
+async fn mint_subtree_root(
+    routed: &crate::meta_backend::RoutedMetaBackend,
+    parent: u64,
+    name: &str,
+    volume_idx: usize,
+    uid: u32,
+    gid: u32,
+) -> Result<u64> {
+    let mint_slot = routed.pick_mint_slot(volume_idx);
+    let (_local, global) = routed.allocate_local_ino_in_slot(volume_idx, mint_slot)?;
+    if routed.route_ino(global).0 != volume_idx {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "volume set-owners: the mint of subtree root '{name}' produced ino {global}, \
+             which routes to metadata volume {} rather than the assigned {volume_idx} — \
+             refusing to create a root whose descendants would inherit the wrong owner",
+            routed.route_ino(global).0
+        )));
+    }
+    let ts_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let inode = routed
+        .create_with_rdev_preset(
+            parent,
+            name,
+            libc::S_IFDIR | 0o755,
+            uid,
+            gid,
+            0,
+            0,
+            Some(crate::meta_backend::IntentCreatePreset {
+                global_ino: global,
+                ts_ns,
+            }),
+        )
+        .await?;
+    Ok(inode.ino)
+}
+
+/// KD-PV-11 **M3**: ONE sequential pass over `TREE_DENTRIES` on every
+/// volume, counting the names whose PARENT's owner differs from the
+/// owner of the volume hosting the named inode.
+///
+/// The walk direction is fsck C9's: a dentry lives on its parent's volume
+/// and its value names a child that may live on another, so the parent's
+/// owner comes from the volume being scanned and the child's from
+/// `route_ino`. Bounded memory: counts plus a small sample, never a set.
+async fn cross_owner_census(
+    routed: &crate::meta_backend::RoutedMetaBackend,
+    vol_ids: &[String],
+    owner_by_volume: &[Option<String>],
+) -> Result<CrossOwnerCensus> {
+    use crate::meta_backend::kv::record::{decode_dentry_key, DentryValue};
+    const SAMPLE_MAX: usize = 8;
+    const PAGE: usize = 512;
+
+    let mut census = CrossOwnerCensus {
+        per_volume: vol_ids.iter().map(|v| (v.clone(), 0)).collect(),
+        ..CrossOwnerCensus::default()
+    };
+    for (v, kv) in routed.volumes.iter().enumerate() {
+        let dentries = kv.trees()[1];
+        let mut cursor: Vec<u8> = vec![0u8];
+        loop {
+            let page = dentries
+                .range(&cursor, &crate::meta_backend::kv::tree::KEY_SPACE_MAX, PAGE)
+                .await?;
+            let Some((last, _)) = page.last() else { break };
+            cursor = crate::meta_backend::kv::node::key_successor(last);
+            for (k, value) in &page {
+                let Ok(d) = DentryValue::decode(value) else {
+                    continue; // fsck C1's business, never this census's
+                };
+                census.dentries_scanned += 1;
+                let child_v = routed.route_ino(d.child_ino).0;
+                if same_owner(
+                    owner_by_volume.get(v).and_then(|o| o.as_deref()),
+                    owner_by_volume.get(child_v).and_then(|o| o.as_deref()),
+                ) {
+                    continue;
+                }
+                census.existing += 1;
+                if let Some(entry) = census.per_volume.get_mut(v) {
+                    entry.1 += 1;
+                }
+                if census.sample.len() < SAMPLE_MAX {
+                    let parent = decode_dentry_key(k)
+                        .ok()
+                        .and_then(|(local_parent, _, _)| {
+                            routed.try_make_global_ino(local_parent, v)
+                        })
+                        .unwrap_or(0);
+                    census.sample.push(format!(
+                        "ino {parent}/{} → ino {} on {} (owner {}), parent on {} (owner {})",
+                        String::from_utf8_lossy(&d.name),
+                        d.child_ino,
+                        vol_ids[child_v],
+                        owner_by_volume[child_v]
+                            .as_deref()
+                            .unwrap_or("(unassigned)"),
+                        vol_ids[v],
+                        owner_by_volume[v].as_deref().unwrap_or("(unassigned)"),
+                    ));
+                }
+            }
+        }
+    }
+    census.total = census.existing;
+    Ok(census)
+}
+
+/// One volume's row in `squeezefs volume get-owners` — the DRIFT
+/// instrument: the durable assignment printed beside the live evidence
+/// the derivation would conjoin it with (KD-PV-3).
+#[derive(Debug, Clone)]
+pub struct OwnerStatusRow {
+    pub volume_id: String,
+    pub path: String,
+    pub hosts_slot_0: bool,
+    pub owner: Option<String>,
+    pub successors: Vec<String>,
+    /// The live claim's holder, resolved to its DURABLE member id through
+    /// the KD-PV-17 attestation. `None` with a live claim = silence.
+    pub holder: Option<String>,
+    /// The live claim's per-mount uuid, when one exists.
+    pub claim_id: Option<String>,
+    /// The durable writer era the claim names.
+    pub term: u64,
+    /// Seconds since the claim's last heartbeat.
+    pub claim_age_secs: Option<u64>,
+    pub claim_fresh: bool,
+    /// The assignment-vs-evidence verdict, in words. `None` = they agree.
+    pub drift: Option<String>,
+}
+
+/// `squeezefs volume get-owners <sqmeta-uri>` — assignment beside
+/// evidence, through read-only probe opens (no guard, no claim, nothing
+/// written: it answers on a live set as well as an idle one).
+pub async fn get_owners(meta_lvs: &[String]) -> Result<Vec<OwnerStatusRow>> {
+    use crate::partial_authority::ClaimStanding;
+    let probes = crate::meta_backend::open_probe_routed_meta_set(meta_lvs).await?;
+    let slot_0_v = probes.route_ino(1).0;
+    let now = crate::membership::unix_now_secs();
+    let mut rows = Vec::with_capacity(probes.volumes.len());
+    for (v, vol) in probes.volumes.iter().enumerate() {
+        let claim = vol.read_writer_claim().await;
+        let set = crate::membership::ClaimSet::load(vol)
+            .await
+            .filter(|s| s.durable);
+        let holder = claim
+            .as_ref()
+            .zip(set.as_ref())
+            .and_then(|(c, s)| s.resolve_holder(c))
+            .map(str::to_string);
+        let owner = set.as_ref().and_then(|s| s.owner.clone());
+        let standing = vol.claim_standing().await;
+        let drift = match (&owner, &claim, &holder) {
+            (None, _, _) => None,
+            (Some(_), None, _) => Some(
+                "DRIFT: assigned owner is not claiming — that node is down, was never \
+                 started, or the assignment is stale. Every mount of this set refuses \
+                 while a volume has no appender (ownership does not fail over: declare a \
+                 successor, or re-assign offline)"
+                    .to_string(),
+            ),
+            (Some(_), Some(_), None) => Some(
+                "DRIFT: a live claim whose holder resolves to nothing — the claim's own id \
+                 is a per-mount uuid and no KD-PV-17 holder attestation names it. Silence \
+                 never moves ownership, so a peer refuses this volume"
+                    .to_string(),
+            ),
+            (Some(owner), Some(_), Some(holder)) => {
+                let entitled = crate::membership::member_id_matches(owner, holder)
+                    || set.as_ref().is_some_and(|s| {
+                        s.successors
+                            .iter()
+                            .any(|n| crate::membership::member_id_matches(n, holder))
+                    });
+                if entitled {
+                    None
+                } else {
+                    Some(format!(
+                        "DRIFT: the live claim is held by '{holder}', which this volume's \
+                         durable assignment set does not name — a mount derives this as a \
+                         POISONED entry and refuses (owner_map_poisoned_volumes)"
+                    ))
+                }
+            }
+        };
+        rows.push(OwnerStatusRow {
+            volume_id: vol.durable_volume_id(),
+            path: vol.device_path().display().to_string(),
+            hosts_slot_0: v == slot_0_v,
+            owner,
+            successors: set
+                .as_ref()
+                .map(|s| s.successors.clone())
+                .unwrap_or_default(),
+            holder,
+            claim_id: claim.as_ref().map(|c| c.id.clone()),
+            term: claim.as_ref().map(|c| c.term).unwrap_or(0),
+            claim_age_secs: claim.as_ref().map(|c| now.saturating_sub(c.ts)),
+            claim_fresh: standing == ClaimStanding::Fresh,
+            drift,
+        });
+    }
+    Ok(rows)
+}
+
+/// What `squeezefs volume locate` answers.
+#[derive(Debug, Clone)]
+pub struct LocateReport {
+    /// The path as asked for (or `ino <n>` when resolved from a live
+    /// mount's `stat`).
+    pub path: String,
+    pub ino: u64,
+    /// The routing slot the ino homes in (`slot_of_ino`).
+    pub slot: u64,
+    pub volume_id: String,
+    pub volume_idx: usize,
+    /// `true` ⇔ that volume hosts slot 0 (its owner is the SET AUTHORITY).
+    pub hosts_slot_0: bool,
+    /// The volume's assigned owner (`None` = unassigned: this node's).
+    pub owner: Option<String>,
+    /// The live claim holder's durable id, when attested.
+    pub holder: Option<String>,
+}
+
+/// `squeezefs volume locate <sqmeta-uri> <path>` — the question nothing
+/// in the CLI could answer before (§5.5.1: the manual bootstrap's missing
+/// instrument, PR 8's setup assertion, and the first thing to reach for
+/// when `cross_owner_refusals` moves).
+///
+/// Read-only probe opens: no guard, no claim, nothing written.
+pub async fn locate_path(meta_lvs: &[String], path: &str) -> Result<LocateReport> {
+    let probes = crate::meta_backend::open_probe_routed_meta_set(meta_lvs).await?;
+    let mut ino = 1u64;
+    let mut walked = String::new();
+    for part in path.split('/').filter(|p| !p.is_empty()) {
+        walked.push('/');
+        walked.push_str(part);
+        let Some((child, _)) = probes.lookup_dentry(ino, part).await? else {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "volume locate: '{path}' does not resolve — '{walked}' was not found. (A \
+                 path created through a live mount becomes visible to this offline read at \
+                 the writer's next checkpoint.)"
+            )));
+        };
+        ino = child;
+    }
+    locate_report(&probes, path.to_string(), ino).await
+}
+
+/// [`locate_path`] for an ino resolved elsewhere — the live-mountpoint
+/// form, where `stat(2)` on the mount answers with the GLOBAL ino
+/// directly and is current rather than checkpoint-lagged.
+pub async fn locate_ino(meta_lvs: &[String], ino: u64, label: &str) -> Result<LocateReport> {
+    let probes = crate::meta_backend::open_probe_routed_meta_set(meta_lvs).await?;
+    locate_report(&probes, label.to_string(), ino).await
+}
+
+async fn locate_report(
+    probes: &std::sync::Arc<crate::meta_backend::RoutedMetaBackend>,
+    path: String,
+    ino: u64,
+) -> Result<LocateReport> {
+    let (volume_idx, _) = probes.route_ino(ino);
+    let vol = probes.volumes.get(volume_idx).ok_or_else(|| {
+        SqueezefsError::InvalidOperation(format!(
+            "volume locate: ino {ino} routes to volume {volume_idx}, which this set does not \
+             have ({} volumes)",
+            probes.volumes.len()
+        ))
+    })?;
+    let claim = vol.read_writer_claim().await;
+    let set = crate::membership::ClaimSet::load(vol)
+        .await
+        .filter(|s| s.durable);
+    let holder = claim
+        .as_ref()
+        .zip(set.as_ref())
+        .and_then(|(c, s)| s.resolve_holder(c))
+        .map(str::to_string);
+    Ok(LocateReport {
+        path,
+        ino,
+        slot: probes.slot_of_ino(ino),
+        volume_id: vol.durable_volume_id(),
+        volume_idx,
+        hosts_slot_0: volume_idx == probes.route_ino(1).0,
+        owner: set.and_then(|s| s.owner),
+        holder,
+    })
+}
+
 /// `squeezefs volume add-meta` — the OFFLINE D0-guarded coordinator
 /// (design-volume-lifecycle §5.5.2 Add, the VL4 `remove_data_volume_
 /// offline` posture): KD-8 staging barrier → format the new member →

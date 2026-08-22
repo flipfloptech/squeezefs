@@ -1406,6 +1406,90 @@ enum VolumeActions {
         /// Target metadata volume index (canonical member order)
         target_volume: usize,
     },
+    // Anchors: design-per-volume-claim-admission §5.6/§6.1 (PR 7),
+    // KD-PV-15 (the subtree-root mint), rulings D19/D20. Offline
+    // D0-guarded coordinator, bracketed by the ownership-intent marker.
+    /// Assign per-volume metadata owners across a fleet
+    ///
+    /// Records which node appends to each metadata volume, so several
+    /// nodes can be metadata authorities for one volume set (one
+    /// appender per volume, a different node per volume). Each
+    /// assignment is <vol-id>=<member-id>[+<successor-id>...]
+    /// [:<subtree-root-path>]; the whole set must be named in one
+    /// invocation.
+    ///
+    /// The subtree root is what makes the recipe work: the verb creates
+    /// that directory with its inode on the volume being assigned, and
+    /// everything created under it inherits that owner. A volume
+    /// assigned without one owns no new work.
+    ///
+    /// Inside a subtree everything is ordinary POSIX. Across subtrees,
+    /// rename and link return EXDEV and the roots cannot be removed in
+    /// place; existing names that would span two owners are counted and
+    /// must be acknowledged with --accept-cross-owner-names.
+    ///
+    /// Offline verb: unmount every node first and pass the sqmeta://
+    /// URI. The coordinator takes the exclusive writer guard on every
+    /// volume, and a writable mount refuses while the assignment is
+    /// incomplete. Idempotent and crash-resumable: re-run with the same
+    /// arguments.
+    SetOwners {
+        /// sqmeta:// URI of the metadata volume set
+        target: String,
+        /// Per-volume assignments, one per volume of the set
+        ///
+        /// Each is <vol-id>=<member-id>, optionally +<successor-id> for
+        /// each declared adoption candidate and :<absolute-path> for the
+        /// owner's subtree root — for example
+        /// vol-0a1b2c3d4e5f6071=node_00000000deadbeef.m00000001:/projects/a
+        #[arg(value_name = "ASSIGNMENT")]
+        assignments: Vec<String>,
+        /// Unassign every volume, restoring the single-authority set
+        #[arg(long, conflicts_with = "assignments")]
+        clear: bool,
+        /// Print the plan and the cross-owner name census; write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Acknowledge the counted cross-owner name population
+        ///
+        /// The number must match the count the verb reports. Those
+        /// names cannot be unlinked, renamed or relinked in place while
+        /// the assignment stands.
+        #[arg(long, value_name = "N")]
+        accept_cross_owner_names: Option<u64>,
+    },
+    /// Print each metadata volume's owner beside its live claim
+    ///
+    /// The drift instrument: an assigned volume nobody is claiming, or
+    /// one claimed by a node the record does not name, is reported in
+    /// words. Read-only; safe on a mounted set.
+    GetOwners {
+        /// sqmeta:// URI of the metadata volume set
+        target: String,
+        /// Also run the cross-owner name census (one pass over every
+        /// directory entry in the set)
+        #[arg(long)]
+        census: bool,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show which metadata volume hosts a path, and who owns it
+    ///
+    /// Answers where a directory or file's inode lives: its routing
+    /// slot, the hosting volume's durable id, and that volume's
+    /// assigned owner. Use it to confirm a subtree root landed where it
+    /// was meant to, and when cross-owner refusals appear.
+    Locate {
+        /// Live mountpoint or sqmeta:// URI
+        target: String,
+        /// Absolute path inside the filesystem (or a path under the
+        /// mountpoint)
+        path: String,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
     // Anchors: design-volume-lifecycle §5.5.2, §5.2 meta-side capacity
     // preflight, KD-8 generation barrier; offline D0-guarded coordinator.
     /// Remove a metadata volume from the set
@@ -1881,6 +1965,136 @@ fn parse_block_uri(uri: &str, scheme: &str) -> Result<Vec<String>, String> {
 /// bootstrap xattr on the mountpoint root (armed on every mount since
 /// VL2), open an ADMIN session (peercred-gated daemon-side), run one
 /// verb.
+/// The metadata volume paths of a LIVE mount, read from the `.config`
+/// virtual inode's canonical joined-member URI — so the per-volume
+/// ownership read verbs accept a mountpoint without inventing a second
+/// spelling of the set (design-per-volume-claim-admission §6.1).
+fn meta_uri_of_live_mount(mountpoint: &str) -> Result<Vec<String>, String> {
+    let path = std::path::Path::new(mountpoint).join(".config");
+    let raw = std::fs::read_to_string(&path).map_err(|e| {
+        format!(
+            "cannot read {}: {e} — is this a SqueezeFS mount?",
+            path.display()
+        )
+    })?;
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("undecodable {}: {e}", path.display()))?;
+    let uri = v["sqmeta_uri"].as_str().ok_or_else(|| {
+        format!(
+            "{} names no metadata set (sqmeta_uri absent) — pass the sqmeta:// URI directly",
+            path.display()
+        )
+    })?;
+    parse_block_uri(uri, "sqmeta://")
+}
+
+/// The M3 census, printed the way a refusal prints it: the number the
+/// operator acknowledges, where the names live, and a bounded sample.
+fn print_cross_owner_census(census: &squeezefs::config_ops::CrossOwnerCensus) {
+    println!(
+        "Cross-owner names: {} ({} already in the tree + {} subtree root(s) this run mints) \
+         over {} directory entries",
+        census.total, census.existing, census.roots, census.dentries_scanned
+    );
+    let by_volume: Vec<String> = census
+        .per_volume
+        .iter()
+        .filter(|(_, n)| *n > 0)
+        .map(|(v, n)| format!("{v}={n}"))
+        .collect();
+    if !by_volume.is_empty() {
+        println!("  by parent volume: {}", by_volume.join(" "));
+    }
+    for s in &census.sample {
+        println!("  {s}");
+    }
+    if census.total > 0 {
+        println!(
+            "  These names return EXDEV on unlink/rmdir/rename/link while the assignment \
+             stands (there is no copy+unlink fallback for unlink)."
+        );
+    }
+}
+
+/// What `volume set-owners` did (or, with --dry-run, would do).
+fn print_owner_assignment(report: &squeezefs::config_ops::SetOwnersReport) {
+    let verb = if report.dry_run {
+        "WOULD assign"
+    } else {
+        "Assigned"
+    };
+    for row in &report.volumes {
+        println!(
+            "{verb} {} → {}{}{}{}",
+            row.volume_id,
+            row.owner.as_deref().unwrap_or("(unassigned)"),
+            if row.successors.is_empty() {
+                String::new()
+            } else {
+                format!("  successors: {}", row.successors.join(","))
+            },
+            match &row.subtree_root {
+                Some(p) => format!("  subtree root: {p}"),
+                None => String::new(),
+            },
+            if row.hosts_slot_0 { "  [slot 0]" } else { "" }
+        );
+        if row.previous_owner.is_some() && row.previous_owner != row.owner {
+            println!(
+                "    was: {}",
+                row.previous_owner.as_deref().unwrap_or("(unassigned)")
+            );
+        }
+    }
+    for root in &report.roots {
+        match (root.minted_ino, root.existing_ino) {
+            (Some(ino), _) => println!(
+                "Minted subtree root {} (ino {ino}) on {} for {}",
+                root.path, root.volume_id, root.owner
+            ),
+            (None, Some(ino)) => println!(
+                "Subtree root {} (ino {ino}) already homes on {} — adopted",
+                root.path, root.volume_id
+            ),
+            (None, None) => println!(
+                "WOULD mint subtree root {} on {} for {}",
+                root.path, root.volume_id, root.owner
+            ),
+        }
+    }
+    print_cross_owner_census(&report.census);
+    if let Some(owner) = &report.set_authority {
+        println!(
+            "{}",
+            squeezefs::config_ops::set_authority_announcement(&report.set_authority_volume, owner)
+        );
+    }
+    for w in &report.warnings {
+        println!("WARNING: {w}");
+    }
+    if report.dry_run {
+        if report.census.total > 0 {
+            println!(
+                "--dry-run: nothing was written. Re-run without it and with \
+                 --accept-cross-owner-names {} to apply.",
+                report.census.total
+            );
+        } else {
+            println!("--dry-run: nothing was written. Re-run without it to apply.");
+        }
+    } else if report.records_written == 0 {
+        println!("Nothing to do: this assignment is already in force.");
+    } else {
+        println!(
+            "Wrote {} volume ownership record(s), enrolled {} member(s) on every volume, \
+             minted {} subtree root(s). Mount each node with SQUEEZEFS_MULTI_WRITER=1 and \
+             SQUEEZEFS_MW_ROLE=set-authority (the slot-0 volume's owner) or \
+             partial-authority; verify placement with `squeezefs volume locate`.",
+            report.records_written, report.members_enrolled, report.roots_minted
+        );
+    }
+}
+
 fn admin_roundtrip(mountpoint: &str, verb: &str, arg: &str) -> Result<String, String> {
     // Read the bootstrap blob via plain getxattr on the mountpoint.
     let cpath = std::ffi::CString::new(mountpoint).map_err(|_| "bad path".to_string())?;
@@ -4587,6 +4801,197 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                          survivors; the victim carries a retirement tombstone). Mount with \
                          the SURVIVOR URI — listing the victim refuses loud."
                     );
+                }
+                VolumeActions::SetOwners {
+                    target,
+                    assignments,
+                    clear,
+                    dry_run,
+                    accept_cross_owner_names,
+                } => {
+                    if live(&target) {
+                        return Err("volume set-owners is an OFFLINE verb \
+                             (design-per-volume-claim-admission §5.6, ruling D19: the \
+                             assignment runs under a D0-guarded coordinator that is \
+                             momentarily the sole authority of every volume): unmount EVERY \
+                             node of the fleet and pass the sqmeta:// URI"
+                            .into());
+                    }
+                    let meta_lvs = parse_block_uri(&target, "sqmeta://")?;
+                    let mut specs = Vec::new();
+                    for a in &assignments {
+                        specs.push(squeezefs::config_ops::parse_owner_assign_spec(a)?);
+                    }
+                    let opts = squeezefs::config_ops::SetOwnersOptions {
+                        clear,
+                        dry_run,
+                        accept_cross_owner_names,
+                    };
+                    let report =
+                        squeezefs::config_ops::set_owners(&meta_lvs, &specs, &opts).await?;
+                    print_owner_assignment(&report);
+                }
+                VolumeActions::GetOwners {
+                    target,
+                    census,
+                    json,
+                } => {
+                    let meta_lvs = if live(&target) {
+                        meta_uri_of_live_mount(&target)?
+                    } else {
+                        parse_block_uri(&target, "sqmeta://")?
+                    };
+                    let rows = squeezefs::config_ops::get_owners(&meta_lvs).await?;
+                    if json {
+                        let out: Vec<serde_json::Value> = rows
+                            .iter()
+                            .map(|r| {
+                                serde_json::json!({
+                                    "volume_id": r.volume_id,
+                                    "path": r.path,
+                                    "hosts_slot_0": r.hosts_slot_0,
+                                    "owner": r.owner,
+                                    "successors": r.successors,
+                                    "holder": r.holder,
+                                    "claim_id": r.claim_id,
+                                    "term": r.term,
+                                    "claim_age_secs": r.claim_age_secs,
+                                    "claim_fresh": r.claim_fresh,
+                                    "drift": r.drift,
+                                })
+                            })
+                            .collect();
+                        println!("{}", serde_json::to_string_pretty(&out)?);
+                    } else {
+                        for r in &rows {
+                            println!(
+                                "{}{}  owner={}  succ={}  claim={}{}  term={}",
+                                r.volume_id,
+                                if r.hosts_slot_0 {
+                                    "  slot 0 (SET AUTHORITY)"
+                                } else {
+                                    "                       "
+                                },
+                                r.owner.as_deref().unwrap_or("(unassigned)"),
+                                if r.successors.is_empty() {
+                                    "-".to_string()
+                                } else {
+                                    r.successors.join(",")
+                                },
+                                r.holder
+                                    .as_deref()
+                                    .or(r.claim_id.as_deref())
+                                    .unwrap_or("(none)"),
+                                match r.claim_age_secs {
+                                    Some(age) if r.claim_fresh => format!(" fresh {age}s"),
+                                    Some(age) => format!(" STALE {age}s"),
+                                    None => String::new(),
+                                },
+                                r.term
+                            );
+                            if let Some(drift) = &r.drift {
+                                println!("    {drift}");
+                            }
+                        }
+                        if rows.iter().all(|r| r.owner.is_none()) {
+                            println!(
+                                "No per-volume owners assigned: this set has ONE metadata \
+                                 authority (`squeezefs volume set-owners` assigns them)."
+                            );
+                        }
+                    }
+                    if census {
+                        if live(&target) {
+                            return Err("volume get-owners --census walks every directory \
+                                 entry in the set and needs the D0-guarded offline \
+                                 coordinator: unmount and pass the sqmeta:// URI"
+                                .into());
+                        }
+                        let specs: Vec<squeezefs::config_ops::OwnerAssignSpec> = rows
+                            .iter()
+                            .filter_map(|r| {
+                                r.owner
+                                    .as_ref()
+                                    .map(|o| squeezefs::config_ops::OwnerAssignSpec {
+                                        volume_id: r.volume_id.clone(),
+                                        owner: o.clone(),
+                                        successors: r.successors.clone(),
+                                        subtree_root: None,
+                                    })
+                            })
+                            .collect();
+                        if specs.len() != rows.len() {
+                            return Err("volume get-owners --census: this set is not fully \
+                                 assigned, so there is no owner partition to measure \
+                                 against"
+                                .into());
+                        }
+                        let report = squeezefs::config_ops::set_owners(
+                            &meta_lvs,
+                            &specs,
+                            &squeezefs::config_ops::SetOwnersOptions {
+                                dry_run: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                        print_cross_owner_census(&report.census);
+                    }
+                }
+                VolumeActions::Locate { target, path, json } => {
+                    let report = if live(&target) {
+                        // A live mount answers with the CURRENT ino via
+                        // stat(2) — an offline read serves the writer's
+                        // last checkpoint, which can lag a fresh mkdir.
+                        let meta_lvs = meta_uri_of_live_mount(&target)?;
+                        let under =
+                            std::path::Path::new(&target).join(path.trim_start_matches('/'));
+                        let md = std::fs::metadata(&under).map_err(|e| {
+                            format!("volume locate: cannot stat {}: {e}", under.display())
+                        })?;
+                        use std::os::unix::fs::MetadataExt;
+                        squeezefs::config_ops::locate_ino(&meta_lvs, md.ino(), &path).await?
+                    } else {
+                        let meta_lvs = parse_block_uri(&target, "sqmeta://")?;
+                        squeezefs::config_ops::locate_path(&meta_lvs, &path).await?
+                    };
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "path": report.path,
+                                "ino": report.ino,
+                                "slot": report.slot,
+                                "volume_id": report.volume_id,
+                                "volume_index": report.volume_idx,
+                                "hosts_slot_0": report.hosts_slot_0,
+                                "owner": report.owner,
+                                "holder": report.holder,
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "{}  ino {}  slot {}  volume {} (index {}){}",
+                            report.path,
+                            report.ino,
+                            report.slot,
+                            report.volume_id,
+                            report.volume_idx,
+                            if report.hosts_slot_0 {
+                                "  [hosts slot 0 — its owner is the SET AUTHORITY]"
+                            } else {
+                                ""
+                            }
+                        );
+                        println!(
+                            "  owner: {}   live claim holder: {}",
+                            report
+                                .owner
+                                .as_deref()
+                                .unwrap_or("(unassigned — one authority appends to every volume)"),
+                            report.holder.as_deref().unwrap_or("(none attested)")
+                        );
+                    }
                 }
                 VolumeActions::List { target, json } => {
                     let rows: serde_json::Value = if live(&target) {

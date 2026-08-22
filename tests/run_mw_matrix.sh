@@ -6357,8 +6357,11 @@ pvo_setup_gate() { # idx label [creates]
     [ -n "$root" ] ||
         die "$label: member $idx has no recorded subtree root — a node that owns a volume but no SUBTREE owns no new work (§5.5.1), and every row it produces measures the shipped path"
     [ -n "$owner" ] || die "$label: member $idx has no recorded member id"
+    # The gate's own log goes to STDERR: this function's stdout is the
+    # subtree root its caller captures, and interleaving the two would
+    # hand the venue a destination path with log lines in it.
     SQZ_BIN="$SQZ" "$PVO_LOCATE_GATE" "$mnt" "$root" \
-        --owner "$owner" --creates "$creates" --label "$label" ||
+        --owner "$owner" --creates "$creates" --label "$label" >&2 ||
         die "$label: THE SETUP IS INVALID — see the refusal above. The row that would follow measures nothing (design §5.13, PR 8 item 0)"
     echo "$root"
 }
@@ -6367,7 +6370,7 @@ pvo_setup_gate() { # idx label [creates]
 # every owner, plus the two placement statements the disarmed migration
 # half (KD-PV-13) makes structural. A row without this is INVALID.
 pvo_engagement_gate() { # label
-    local label="$1" idx mnt v
+    local label="$1" idx mnt v key
     while IFS= read -r idx; do
         [ -n "$idx" ] || continue
         mnt="$(mnt_of "$idx")"
@@ -6445,6 +6448,13 @@ leg_pv_rewrite_funnel() {
     files="$PVO_REWRITE_FILES"
     p_root="$(pvo_setup_gate "$p" "pv-rewrite/partial")"
     a_root="$(pvo_setup_gate 0 "pv-rewrite/set-authority")"
+    # Two host-side sources, generated ONCE: /dev/urandom in the timed
+    # loop would measure the entropy pool, and /dev/zero would measure
+    # zram's compressor instead of the device (the data namespaces are
+    # zram — same content class on both passes or the row is about
+    # compressibility, not about displacement).
+    dd if=/dev/urandom of="$rowdir/src-a" bs=1M count="$mb" status=none
+    dd if=/dev/urandom of="$rowdir/src-b" bs=1M count="$mb" status=none
     log "pv-rewrite-funnel: ${files} x ${mb} MiB per arm, first write then FULL overwrite (the funnel); A-B-B-A"
 
     # One arm: fresh write (untimed — it builds the blocks the overwrite
@@ -6455,7 +6465,7 @@ leg_pv_rewrite_funnel() {
         rm -rf "$dir"
         mkdir -p "$dir"
         for ((i = 0; i < files; i++)); do
-            dd if=/dev/zero of="$dir/f$i.dat" bs=1M count="$mb" \
+            dd if="$rowdir/src-a" of="$dir/f$i.dat" bs=1M count="$mb" \
                 conv=fsync status=none || die "pv-rewrite $label: fresh write failed"
         done
         sync
@@ -6464,7 +6474,7 @@ leg_pv_rewrite_funnel() {
         snap 0 "${label}0" "$rowdir"
         t0="$(date +%s.%N)"
         for ((i = 0; i < files; i++)); do
-            dd if=/dev/urandom of="$dir/f$i.dat" bs=1M count="$mb" \
+            dd if="$rowdir/src-b" of="$dir/f$i.dat" bs=1M count="$mb" \
                 conv=fsync,notrunc status=none ||
                 die "pv-rewrite $label: OVERWRITE failed (a shipped free errored — see the daemon logs)"
         done
@@ -6550,12 +6560,13 @@ leg_pv_cross_owner() {
 
     # One verb phase, in its own snapshot window: the whole delta of the
     # single cross_owner_refusals counter belongs to this verb.
-    xo_phase() { # label ops-fn -> "label verb ops refusals rate errors wall_s"
+    xo_phase() { # label verb "ops-fn [args]" -> row line
         local label="$1" verb="$2" fn="$3" t0 t1 errs d wall
         sleep 1
         snap "$p" "${label}0" "$rowdir"
         t0="$(date +%s.%N)"
-        errs="$("$fn")"
+        # shellcheck disable=SC2086 # $fn is "function arg…", split on purpose
+        errs="$($fn)"
         t1="$(date +%s.%N)"
         sleep 1
         snap "$p" "${label}1" "$rowdir"
@@ -6729,7 +6740,9 @@ leg_pv_rand4k_w1() {
         mnt="$(mnt_of "$idx")"
         f="$mnt$root/pvw1-$label.dat"
         rm -f "$f"
-        dd if=/dev/zero of="$f" bs=1M count="$mb" conv=fsync status=none ||
+        # urandom, not /dev/zero: the data namespaces are zram, and an
+        # all-zero file would price the compressor rather than the path.
+        dd if=/dev/urandom of="$f" bs=1M count="$mb" conv=fsync status=none ||
             die "pv-rand4k-w1 $label: could not lay the file down"
         sync
         sleep 2
@@ -6740,11 +6753,18 @@ leg_pv_rand4k_w1() {
         rm -f "$f"
         pw="$(s8a_delta "$rowdir" "$idx" "$label" patch_writes)"
         acc="$(s8a_delta "$rowdir" "$idx" "$label" cowriter.accounting_refusals)"
-        for key in unmapped decorated unaligned overlay shared transform adjacent oversize; do
+        # The whole decision ledger, plus `posture` broken out: that arm
+        # IS R14 — the W1 ladders declining upstream because this mount
+        # may not retire an incarnation (`src/block_allocator.rs:1604`),
+        # which is what a partial authority's small overwrites hit.
+        local posture_d
+        posture_d="$(s8a_delta "$rowdir" "$idx" "$label" patch_ineligible_posture)"
+        for key in unmapped decorated unaligned overlay device_overlay shared \
+            range_shared transform adjacent oversize posture; do
             v="$(s8a_delta "$rowdir" "$idx" "$label" "patch_ineligible_$key")"
             sum=$((sum + v))
         done
-        echo "$label $iops patch=$pw ineligible=$sum acct_refusals=$acc"
+        echo "$label $iops patch=$pw ineligible=$sum posture=$posture_d acct_refusals=$acc"
     }
 
     local -a rows=() p a_root p_root

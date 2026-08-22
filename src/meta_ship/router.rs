@@ -745,6 +745,11 @@ impl LaneDrain {
                 // ISSUED as an owner, so a node that is both would
                 // otherwise double-count one event.
                 super::ERA_RELEARNS.fetch_add(1, Ordering::Relaxed);
+                // §5.10's runtime conjunction: a relearn means this owner
+                // failed over, so re-derive its volumes from a FRESH read
+                // — an adoption by a declared successor is followed, a
+                // holder the assignment set does not name POISONS.
+                owners::note_era_relearn(&self.lane.peer.peer_id);
                 Err(SqueezefsError::InvalidOperation(format!(
                     "S8: owner {} refused the batch — it named a stale writer era; the owner is \
                      now in era {} (a successor bumps `term` durably before arming, so every \

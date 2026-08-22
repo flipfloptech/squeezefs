@@ -675,6 +675,47 @@ fn adopt_holder(v_idx: usize, holder: &str) {
     arm_ownership(fresh);
 }
 
+/// **The era-relearn follow-up** (§5.10, extending the existing
+/// `stale_term_refusals` / `era_relearns` pair rather than duplicating
+/// it): this client learned a NEW era from `peer_id`, which means that
+/// peer failed over — so every volume the map says it appends to is
+/// re-derived from a FRESH read, and any that no longer agrees is
+/// poisoned.
+///
+/// Fire-and-forget on the caller's side: the relearn happens on a refusal
+/// path that must stay allocation-light and cannot await I/O, and the
+/// reconcile's own verdict is published through the poison latch and its
+/// gauge. A no-op on an unarmed mount, on a map with no entry for that
+/// peer, and when no daemon router is installed (no live set to re-read).
+pub fn note_era_relearn(peer_id: &str) {
+    let Some(map) = owner_map() else {
+        return;
+    };
+    let volumes = map.volumes_owned_by(peer_id);
+    if volumes.is_empty() {
+        return;
+    }
+    let Some(router) = super::DAEMON_VERB_ROUTER.load_full() else {
+        return;
+    };
+    let routed = Arc::clone(router.inner());
+    let peer = peer_id.to_string();
+    crate::meta_exec::spawn_meta("owner_map_relearn_reconcile", async move {
+        for v_idx in volumes {
+            match reconcile_volume_owner(&routed, v_idx).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    // `reconcile_owner_from` already logged and poisoned.
+                }
+                Err(e) => log::warn!(
+                    "ownership map: re-reading metadata volume {v_idx} after '{peer}' relearned \
+                     its era failed ({e}) — the installed entry stands until a read succeeds"
+                ),
+            }
+        }
+    });
+}
+
 /// Re-read volume `v_idx` from the live set and reconcile it — the era
 /// relearn's follow-up (§5.10: *"a relearn on a volume whose live holder
 /// is not in that volume's durable ASSIGNMENT SET poisons the entry …

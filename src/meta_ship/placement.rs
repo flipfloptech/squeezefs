@@ -68,6 +68,18 @@ pub const PLACEMENT_ENV: &str = "SQUEEZEFS_SLOT_PLACEMENT";
 /// env knob, `1` = force on, `2` = force off.
 pub static TEST_PLACEMENT_OVERRIDE: AtomicU8 = AtomicU8::new(0);
 
+/// **Test seam for KD-PV-13's disarm**: `0` = the law (disarmed while a
+/// multi-owner plane is armed), `1` = force disarmed, `2` = force ARMED.
+///
+/// Value `2` exists for the [`super::owners::arm_ownership`] reason —
+/// reachable so the behaviour is TESTED rather than commented. The launch
+/// machinery below (the executor, the one-in-flight bound and the
+/// never-thrash valve) is what D19's named cross-owner-migration follow-on
+/// inherits; under the law it can no longer be reached, because every
+/// migration this policy can select is cross-owner and sweep row 13
+/// refuses it.
+pub static TEST_MIGRATION_DISARM_OVERRIDE: AtomicU8 = AtomicU8::new(0);
+
 /// Is the placement plane live on this process? One relaxed load on every
 /// unarmed mount — the dark-posture gate.
 pub fn slot_placement_enabled() -> bool {
@@ -291,6 +303,21 @@ pub fn authority_migration_executor(meta: Arc<RoutedMetaBackend>) -> MigrationEx
     })
 }
 
+/// **KD-PV-13's predicate**: is the migration half inert on this mount?
+///
+/// True while the installed map names at least one PEER-owned volume,
+/// which is exactly the condition under which `migrate_slot` refuses a
+/// policy-selected move (its endpoints then have different owners — sweep
+/// row 13). The A/B-style override exists so the launch machinery the
+/// follow-on inherits stays under test.
+fn migration_half_disarmed(map: &super::OwnerMap) -> bool {
+    match TEST_MIGRATION_DISARM_OVERRIDE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => map.multi_owner(),
+    }
+}
+
 /// Associate `client` with a hot directory slot (the owner records it at
 /// UPDATE-grant issuance): the policy's migration set is the client's
 /// dedicated mint slots PLUS these — "the subtree's hot slots".
@@ -342,6 +369,24 @@ pub fn note_supply_event(
             return;
         }
         MIGRATION_CANDIDATES.fetch_add(1, Ordering::Relaxed);
+        // **KD-PV-13 — the migration half is DISARMED under multi-owner.**
+        // The target is a volume the CLIENT owns and the victim's home is
+        // by construction not in that set, so every migration selectable
+        // here is a CROSS-OWNER one, which `migrate_slot` refuses (sweep
+        // row 13, D19's deferred two-party hand-off). Left armed the
+        // composition is a permanent trigger → refuse → fail retry loop on
+        // a healthy fleet. The candidate above still counts — it is the
+        // follow-on's demand signal — and nothing else happens.
+        if migration_half_disarmed(&map) {
+            log::debug!(
+                "S10 placement: client '{client}' is sustained toward volume {} it owns, but \
+                 the migration half is DISARMED while a multi-owner plane is armed (KD-PV-13): \
+                 the move would be cross-owner, which the engine refuses. Counted as demand, \
+                 nothing triggered",
+                owned[0]
+            );
+            return;
+        }
         let target = owned[0];
         // The hot set: the client's dedicated mint slots, then its
         // associated directory slots — first one not already home.

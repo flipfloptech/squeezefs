@@ -1014,3 +1014,254 @@ pub fn classify_set_admission(req: &SetAdmissionRequest) -> Result<SetAdmission>
     );
     Ok(admission)
 }
+
+// ---------------------------------------------------------------------------
+// The gather — the mount path's ONE call before it opens the set (PR 5)
+// ---------------------------------------------------------------------------
+
+/// What a per-volume posture decided, and what it holds while it serves.
+///
+/// The `cowriter::CoWriterPreflight` shape, one grain finer: the
+/// admission the partial open consumes, plus the two live things the
+/// ladder's own rungs took — a membership lease (a partial authority's
+/// liveness proof) and the device presence rung 5 read.
+pub struct SetPreflight {
+    /// The gate's outcome — `open_routed_meta_set_partial` takes it.
+    pub admission: SetAdmission,
+    /// The live member session (a partial authority joins the SET
+    /// authority's membership plane as a writer member).
+    pub membership: Option<crate::membership::MembershipArm>,
+    /// A partial authority's registration under the set authority's
+    /// standing WERO hold. `None` on a set authority, which HOLDS the
+    /// reservation rather than registering under one.
+    pub registrant: Option<crate::data_custody::WeroRegistrantJoin>,
+    /// The set authority's own WERO hold, taken at rung 5 because the
+    /// device evidence must exist BEFORE the ladder decides (`None` on a
+    /// partial authority).
+    pub hold: Option<crate::data_custody::WeroHold>,
+    /// The `job:enroll` storage-trust secret (ruling D2's root of trust).
+    pub secret: Vec<u8>,
+}
+
+impl std::fmt::Debug for SetPreflight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SetPreflight")
+            .field("admission", &self.admission)
+            .finish_non_exhaustive()
+    }
+}
+
+/// `true` ⇔ this mount DECLARED a per-volume posture
+/// (`SQUEEZEFS_MW_ROLE=set-authority|partial-authority`).
+///
+/// One env read, and the whole of R12 rides on it: a mount that has not
+/// declared never reaches [`gather_set_admission`], so the D0 gate it
+/// meets is byte-identical to the pre-program one.
+pub fn requested() -> bool {
+    matches!(
+        crate::cowriter::requested_role(),
+        MwRole::SetAuthority | MwRole::PartialAuthority
+    )
+}
+
+/// **Gather the ladder's evidence and decide** — the mount path's one call
+/// before it opens the metadata set through the partial door.
+///
+/// Evidence is gathered in ladder order, so nothing that mutates state
+/// runs before every declarative rung has passed: rungs 1–3 read the env
+/// and probe opens only (never blocked, never writing), and only then does
+/// the device half run. On every set no operator has assigned — which is
+/// every set in the field until PR 7's `squeezefs volume set-owners`
+/// exists — rung 2 or rung 3 refuses here, before any device or membership
+/// mutation: that is what makes this rung's liveness test-constructor-only.
+pub async fn gather_set_admission(
+    meta_lvs: &[String],
+    data_paths: &[PathBuf],
+) -> Result<SetPreflight> {
+    let mut req = SetAdmissionRequest {
+        multi_writer: crate::data_custody::multi_writer_requested(),
+        role: crate::cowriter::requested_role(),
+        read_only: crate::fuse_client::read_only_mount(),
+        node_id: crate::cowriter::node_member_id()?,
+        set_authority_endpoint: crate::cowriter::declared_authority(),
+        volumes: Vec::new(),
+        authority: None,
+        registrant: None,
+    };
+    let (posture, _) = rung_1_declaration(&req)?;
+
+    // Rungs 2/3 — probe opens: read-only, lock-free, never blocked by the
+    // owners' flocks, and they write nothing on any path below.
+    let probes = crate::meta_backend::open_probe_routed_meta_set(meta_lvs).await?;
+    let slot_0_v = probes.route_ino(1).0;
+    for (idx, be) in probes.volumes.iter().enumerate() {
+        let claim = be.read_writer_claim().await;
+        let claim_set = ClaimSet::load(be).await;
+        let holder_member_id = claim
+            .as_ref()
+            .zip(claim_set.as_ref())
+            .and_then(|(c, s)| s.resolve_holder(c))
+            .map(str::to_string);
+        let path = be.device_path().to_path_buf();
+        let probe_path = path.clone();
+        let pr_capable = squeezefs_ipc::sqz_blocking::run_blocking(move || {
+            crate::meta_backend::reservation::resolve_for_mount(&probe_path).is_some()
+        })
+        .await;
+        let owner_endpoint = claim_set.as_ref().and_then(|s| {
+            s.owner.as_ref().and_then(|o| {
+                s.members
+                    .iter()
+                    .find(|m| crate::membership::member_id_matches(&m.identity.id, o))
+                    .and_then(|m| m.identity.endpoint.clone())
+            })
+        });
+        req.volumes.push(PvVolumeEvidence {
+            path,
+            vol_id: be.durable_volume_id(),
+            hosts_slot_0: idx == slot_0_v,
+            features_incompat: be.superblock().features_incompat,
+            pr_capable,
+            // The gate's own classification, never a second spelling of
+            // the dead-pid proof and the TTL window.
+            standing: be.claim_standing().await,
+            claim,
+            holder_member_id,
+            // A probe open replays the journal and serves the same
+            // checkpoint-consistent view a peer-owned open would, so the
+            // rung-7 freeze evidence IS this reading.
+            projected_claim_set: claim_set.clone(),
+            claim_set,
+            owner_endpoint: owner_endpoint.or_else(|| {
+                (idx == slot_0_v)
+                    .then(|| req.set_authority_endpoint.clone())
+                    .flatten()
+            }),
+        });
+    }
+    // The declarative rungs, BEFORE any mutation: on an unassigned set one
+    // of these refuses and the device is never touched.
+    {
+        let readings = rung_2_engaged_claim_set(&req)?;
+        rung_3_assignment_and_enrollment(&req, posture, &readings)?;
+    }
+    let first = probes
+        .volumes
+        .first()
+        .ok_or_else(|| refuse(2, "the metadata set has no volumes".to_string()))?;
+    let secret = crate::membership::cluster_secret(first)
+        .await
+        .ok_or_else(|| {
+            refuse(
+                4,
+                "the volume set carries no `job:enroll` record, which is this cluster's root of \
+             trust (possession of volume access IS cluster membership — ruling D2). It is \
+             written when a cluster listener starts (SQUEEZEFS_JOB_WIRE_BIND)"
+                    .to_string(),
+            )
+        })?;
+    let rendezvous = crate::membership::read_owner_record(&probes.volumes[slot_0_v]).await;
+    drop(probes);
+
+    // Rung 5's device half. A partial authority REGISTERS under the set
+    // authority's standing hold; a set authority IS the holder, so it
+    // takes the hold here — the evidence rung 5 decides over must exist
+    // before the decision, and `arm_multi_writer`'s own rung 3 then joins
+    // the standing hold rather than forking a second one.
+    let paths = data_paths.to_vec();
+    let (registrant, hold) = match posture {
+        Posture::PartialAuthority => {
+            let join = squeezefs_ipc::sqz_blocking::run_blocking(move || {
+                crate::data_custody::join_wero_as_registrant(&paths)
+            })
+            .await?;
+            req.registrant = Some(join.evidence());
+            (Some(join), None)
+        }
+        Posture::SetAuthority => {
+            let held = squeezefs_ipc::sqz_blocking::run_blocking(move || {
+                crate::data_custody::arm_data_plane(
+                    crate::data_custody::CustodyPosture::MultiWriter,
+                    &paths,
+                    true,
+                )
+            })
+            .await?;
+            // A granted WERO hold IS the device's answer to all four
+            // questions rung 5 asks: `arm_data_plane` refuses a namespace
+            // with no reservation support, takes rtype 3, and the holder
+            // of a Write-Exclusive-Registrants-Only reservation is by
+            // construction one of its registrants.
+            req.registrant = held.as_ref().map(|h| RegistrantEvidence {
+                pr_capable: true,
+                wero: true,
+                reservation_held: true,
+                registered: true,
+                key: h.key(),
+                namespaces: data_paths.len(),
+            });
+            (None, held)
+        }
+    };
+
+    // Rung 4's membership half: a partial authority JOINS the set
+    // authority's plane (the liveness proof), while a set authority owns
+    // it — and only needs the rendezvous record to refuse a provably
+    // foreign live owner of the same set.
+    let mut membership = None;
+    if let Some(rec) = rendezvous {
+        match posture {
+            Posture::PartialAuthority => {
+                let joined = crate::membership::join_as_writer_member(
+                    &rec,
+                    secret.clone(),
+                    &req.node_id,
+                    req.registrant.as_ref().map(|r| r.key).unwrap_or(0),
+                    None,
+                )
+                .await?;
+                req.authority = Some(AuthorityLeaseEvidence {
+                    owner_id: rec.id.clone(),
+                    endpoint: rec.endpoint.clone(),
+                    owner_claim_id: rec.owner_claim_id.clone(),
+                    term: rec.term,
+                    live: joined.is_some(),
+                    member_epoch: crate::membership::installed_member_epoch(),
+                });
+                membership = joined;
+            }
+            Posture::SetAuthority => {
+                req.authority = Some(AuthorityLeaseEvidence {
+                    owner_id: rec.id.clone(),
+                    endpoint: rec.endpoint.clone(),
+                    owner_claim_id: rec.owner_claim_id.clone(),
+                    term: rec.term,
+                    // A rendezvous record only says an owner ONCE armed;
+                    // freshness is what makes it a live plane, and rung 4
+                    // refuses only a provably foreign LIVE one.
+                    live: rec.is_fresh(),
+                    member_epoch: 0,
+                });
+            }
+        }
+    }
+
+    // A refusal from here on drops `registrant`/`hold`, which unregisters
+    // or releases — the device is left exactly as we found it.
+    let admission = match classify_set_admission(&req) {
+        Ok(a) => a,
+        Err(e) => {
+            if let Some(arm) = membership {
+                arm.disarm().await;
+            }
+            return Err(e);
+        }
+    };
+    Ok(SetPreflight {
+        admission,
+        membership,
+        registrant,
+        hold,
+        secret,
+    })
+}

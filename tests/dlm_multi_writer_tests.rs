@@ -818,6 +818,8 @@ async fn the_mount_arm_refuses_a_non_pr_substrate() {
         // (and refuses LOUDLY if a claim set ever enrolls co-writers without
         // one — `tests/mw_cowriter_lane_tests.rs`).
         None,
+        // No per-volume admission: the ordinary authority arm.
+        None,
     )
     .await
     .expect_err("multi-writer must refuse a detection-grade substrate");
@@ -868,6 +870,9 @@ async fn the_mount_arm_refuses_an_unstamped_format_naming_the_bit() {
         std::slice::from_ref(&data),
         false,
         None,
+        None,
+        // No per-volume admission: this is the ordinary authority arm,
+        // whose ownership map derives all-local on an unassigned set.
         None,
     )
     .await

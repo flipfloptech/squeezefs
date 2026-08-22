@@ -1122,11 +1122,28 @@ pub fn uninstall_client() {
 // The routing helpers the daemon calls
 // ---------------------------------------------------------------------------
 
-/// The owner of `ino`'s volume, or `None` when this node owns it.
+/// The owner of `ino`'s volume, or `None` when this node owns it — and a
+/// loud refusal when the volume's ownership entry is POISONED (§5.10: a
+/// re-derivation found a holder the durable assignment set does not name,
+/// so neither appending locally nor shipping is an answer this mount may
+/// give).
 ///
 /// One relaxed load on an unarmed mount, which is every mount that ships.
 #[inline]
-fn owner_of(be: &Arc<RoutedMetaBackend>, ino: Ino) -> Option<Arc<super::PeerOwner>> {
+fn owner_of(be: &Arc<RoutedMetaBackend>, ino: Ino) -> Result<Option<Arc<super::PeerOwner>>> {
+    if !super::ownership_armed() {
+        return Ok(None);
+    }
+    let (v_idx, _) = be.route_ino(ino);
+    super::owners::route_volume(v_idx)
+}
+
+/// [`owner_of`] for the PREDICATE sites: a poisoned volume reads as "not
+/// local", so the merge takes its chain-onto-head arm and the publish that
+/// follows is what refuses. A predicate cannot refuse, and inventing a
+/// second refusal here would let one poisoned volume answer two ways.
+#[inline]
+fn owner_of_unchecked(be: &Arc<RoutedMetaBackend>, ino: Ino) -> Option<Arc<super::PeerOwner>> {
     if !super::ownership_armed() {
         return None;
     }
@@ -1173,7 +1190,7 @@ fn wire_refs(refs: &[BlockRefOp]) -> Vec<WireBlockRefOp> {
 /// ladder on every solo mount (`ownership_armed` false, `custody_owner`
 /// None).
 pub fn merge_is_chained(be: &Arc<RoutedMetaBackend>, ino: Ino) -> bool {
-    owner_of(be, ino).is_some()
+    owner_of_unchecked(be, ino).is_some()
         || crate::data_grant::custody_owner()
             .map(|o| o.ino_granted(ino))
             .unwrap_or(false)
@@ -1268,7 +1285,7 @@ pub async fn set_layout_and_size(
     size: u64,
     refs: &[BlockRefOp],
 ) -> Result<()> {
-    match owner_of(be, ino) {
+    match owner_of(be, ino)? {
         None => {
             note_local();
             let _serve_window = local_publish_guard(ino).await;
@@ -1308,7 +1325,7 @@ pub async fn merge_layout_and_size(
     size: u64,
     refs: Vec<BlockRefOp>,
 ) -> Result<(bool, u64)> {
-    match owner_of(be, ino) {
+    match owner_of(be, ino)? {
         None => {
             note_local();
             // Rung 17: the AUTHORITY's own publishes on an ino with live
@@ -1370,7 +1387,7 @@ pub async fn write_extent(
     token: u64,
     request_id: u64,
 ) -> Result<Option<u64>> {
-    match owner_of(be, ino) {
+    match owner_of(be, ino)? {
         None => Err(SqueezefsError::InvalidOperation(format!(
             "S11: write_extent for ino {ino} routes LOCALLY — the authority assembles its \
              own writes through its write path, never through the extent wire (a local \
@@ -1406,7 +1423,7 @@ pub async fn write_extent(
 /// every extent the authority holds for `ino`, returning the covering
 /// layout version. Witnessed and retried (idempotent).
 pub async fn flush_extents(be: &Arc<RoutedMetaBackend>, ino: Ino) -> Result<u64> {
-    match owner_of(be, ino) {
+    match owner_of(be, ino)? {
         None => Err(SqueezefsError::InvalidOperation(format!(
             "S11: flush_extents for ino {ino} routes LOCALLY — nothing was ever shipped \
              (the authority's own fsync is its ordinary flush path)"
@@ -1438,7 +1455,7 @@ pub async fn commit_block_refs(
     ino: Ino,
     refs: &[BlockRefOp],
 ) -> Result<()> {
-    match owner_of(be, ino) {
+    match owner_of(be, ino)? {
         None => {
             note_local();
             be.commit_block_refs(ino, refs).await
@@ -1469,7 +1486,7 @@ pub async fn park_write_times(
     mtime: u64,
     ctime: u64,
 ) -> Result<()> {
-    match owner_of(be, ino) {
+    match owner_of(be, ino)? {
         None => {
             note_local();
             be.park_write_times(ino, mtime, ctime).await
@@ -1505,7 +1522,7 @@ pub async fn destroy_inodes(be: &Arc<RoutedMetaBackend>, inos: &[Ino]) -> Result
     let mut local: Vec<Ino> = Vec::new();
     let mut remote: Vec<(Arc<super::PeerOwner>, Vec<Ino>)> = Vec::new();
     for &ino in inos {
-        match owner_of(be, ino) {
+        match owner_of(be, ino)? {
             None => local.push(ino),
             Some(peer) => match remote.iter_mut().find(|(p, _)| p.endpoint == peer.endpoint) {
                 Some((_, batch)) => batch.push(ino),
@@ -1546,7 +1563,7 @@ pub async fn create_with_rdev_size(
     rdev: u32,
     initial_size: u64,
 ) -> Result<Inode> {
-    match owner_of(be, parent) {
+    match owner_of(be, parent)? {
         None => {
             note_local();
             be.create_with_rdev_size(parent, name, mode, uid, gid, rdev, initial_size)
@@ -1602,7 +1619,7 @@ pub async fn create_with_rdev_size(
 /// volume's geometry for an object another volume stores would size the
 /// caller's own record against the wrong cap.
 pub async fn xattr_value_cap(be: &Arc<RoutedMetaBackend>, ino: Ino) -> Result<usize> {
-    match owner_of(be, ino) {
+    match owner_of(be, ino)? {
         None => {
             note_local();
             Ok(be.xattr_value_cap(ino))
@@ -1649,7 +1666,7 @@ pub async fn raise_alloc_lane(
     writers: u16,
     upto: u64,
 ) -> Result<u64> {
-    match owner_of(be, 1) {
+    match owner_of(be, 1)? {
         None => {
             note_local();
             crate::data_alloc_lane::commit_lane_raise(be, vol_tag, lane, writers, upto, None).await
@@ -1988,7 +2005,7 @@ pub async fn readdir_stream(
     offset: u64,
     max: usize,
 ) -> Result<Vec<(u64, DirEntry)>> {
-    match owner_of(be, dir) {
+    match owner_of(be, dir)? {
         None => {
             note_local();
             be.readdir_stream(dir, offset, max).await

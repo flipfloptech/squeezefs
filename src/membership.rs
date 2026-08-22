@@ -857,6 +857,23 @@ pub struct OwnerRecord {
 }
 
 impl OwnerRecord {
+    /// Is the plane this record announces still LIVE — i.e. was it armed
+    /// within its own published TTL?
+    ///
+    /// A rendezvous record only says an owner ONCE armed (nothing
+    /// refreshes it), so "a record exists" proves nothing. The per-volume
+    /// admission's rung 4 reads this to refuse a **provably** foreign live
+    /// membership owner of the same set (D20: two set authorities is two
+    /// planes) while leaving a dead predecessor's record inert.
+    pub fn is_fresh(&self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let ttl = self.ttl_ms.div_ceil(1_000);
+        self.ts != 0 && now.saturating_sub(self.ts) <= ttl
+    }
+
     /// Encode as compact JSON (the record family's format).
     pub fn encode(&self) -> Vec<u8> {
         serde_json::json!({

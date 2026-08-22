@@ -4912,10 +4912,25 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("\x1b[91mERROR\x1b[0m {msg}");
                 return Err(msg.into());
             }
+            // **Per-volume claim admission (PR 5): the mount path selects
+            // the posture.** A mount that DECLARED `set-authority` or
+            // `partial-authority` takes the partial door — the D0 gate is
+            // untouched for everybody else, which is R12's solo re-gate
+            // law. The posture is never inferred from the durable
+            // assignment: an operator who typed nothing and got a
+            // per-volume open would learn nothing.
+            let pv_posture = squeezefs::partial_authority::requested();
             squeezefs::fuse_client::set_mount_posture(if reader_mount {
                 squeezefs::fuse_client::MountPosture::Reader
             } else if co_writer_mount {
                 squeezefs::fuse_client::MountPosture::CoWriter
+            } else if pv_posture {
+                match squeezefs::cowriter::requested_role() {
+                    squeezefs::cowriter::MwRole::SetAuthority => {
+                        squeezefs::fuse_client::MountPosture::SetAuthority
+                    }
+                    _ => squeezefs::fuse_client::MountPosture::PartialAuthority,
+                }
             } else {
                 squeezefs::fuse_client::MountPosture::Writer
             });
@@ -5602,10 +5617,41 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
 
+            // Per-volume claim admission (PR 5): the DECLARED per-volume
+            // posture runs the seven-rung ladder before it opens anything
+            // for real, exactly as the co-writer preflight above does. Its
+            // rungs 1–3 read the environment and probe opens only, so on
+            // every set no operator has assigned — which is every set in
+            // the field until PR 7's `squeezefs volume set-owners` verb
+            // exists — it refuses here, before any device or membership
+            // mutation, naming that verb.
+            let pv_preflight = if pv_posture {
+                match squeezefs::partial_authority::gather_set_admission(
+                    &meta_lvs,
+                    &resolved_data_lvs
+                        .iter()
+                        .map(std::path::PathBuf::from)
+                        .collect::<Vec<_>>(),
+                )
+                .await
+                {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        eprintln!("\x1b[91mERROR\x1b[0m mount refused: {e}");
+                        return Err(e.into());
+                    }
+                }
+            } else {
+                None
+            };
+
             let routed_meta_backend = match if reader_mount {
                 squeezefs::meta_backend::open_routed_meta_set_read_only(&meta_lvs).await
             } else if let Some(pre) = co_writer_preflight.as_ref() {
                 squeezefs::meta_backend::open_routed_meta_set_co_writer(&meta_lvs, &pre.admission)
+                    .await
+            } else if let Some(pre) = pv_preflight.as_ref() {
+                squeezefs::meta_backend::open_routed_meta_set_partial(&meta_lvs, &pre.admission)
                     .await
             } else {
                 squeezefs::meta_backend::open_routed_meta_set(&meta_lvs).await
@@ -5997,6 +6043,12 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 // it refuses, rather than minting dense offsets across their
                 // residue classes.
                 Some(&fs_engine.router.backend_router),
+                // Per-volume claim admission: the decision the partial
+                // open was taken under. It supplies the SET authority's
+                // declared endpoint and this node's registrant key —
+                // never the ownership itself, which the arm DERIVES from
+                // the durable records (KD-PV-3).
+                pv_preflight.as_ref().map(|p| &p.admission),
             )
             .await
             .map_err(|e| format!("multi-writer refused to arm: {e}"))?;

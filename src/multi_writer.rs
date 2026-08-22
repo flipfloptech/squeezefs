@@ -457,6 +457,10 @@ impl MultiWriterArm {
         data_grant::uninstall_custody_client();
         data_grant::uninstall_custody_owner();
         publish::uninstall_client();
+        // The client half of the ownership plane dies with it: a stale
+        // router over a disarmed plane is inert (the armed load gates
+        // first), but leaving one installed would outlive its map.
+        crate::meta_ship::uninstall_daemon_verb_router();
         crate::meta_ship::uninstall_delegation_host();
         // Rung 14: the placement policy's vehicle dies with the authority
         // (its runtime state dies inside disarm_ownership).
@@ -511,6 +515,7 @@ pub async fn arm_mount_multi_writer(
     read_only: bool,
     quarantine: Option<Arc<dyn CustodyQuarantine>>,
     backend: Option<&Arc<crate::routing::BackendRouter>>,
+    pv: Option<&crate::partial_authority::SetAdmission>,
 ) -> Result<Option<MultiWriterArm>> {
     if !requested() {
         log::debug!(
@@ -547,7 +552,7 @@ pub async fn arm_mount_multi_writer(
         );
         return Ok(None);
     }
-    arm_multi_writer(meta, data_paths, read_only, quarantine, backend).await
+    arm_multi_writer(meta, data_paths, read_only, quarantine, backend, pv).await
 }
 
 /// **Arm the multi-writer planes, or refuse naming what is missing.**
@@ -561,6 +566,7 @@ pub async fn arm_multi_writer(
     read_only: bool,
     quarantine: Option<Arc<dyn CustodyQuarantine>>,
     backend: Option<&Arc<crate::routing::BackendRouter>>,
+    pv: Option<&crate::partial_authority::SetAdmission>,
 ) -> Result<Option<MultiWriterArm>> {
     // Rung 1: a reader.
     if read_only {
@@ -574,6 +580,46 @@ pub async fn arm_multi_writer(
     }
     // Rung 2: the format's capability bits — before anything is acquired.
     check_capabilities(meta)?;
+
+    // **The DERIVED ownership plane** (per-volume claim admission
+    // §5.10/KD-PV-3), read here — before anything is acquired — because
+    // **D20** decides from it WHICH planes this mount arms at all: the
+    // owner of the volume hosting slot 0 is the SET AUTHORITY, and the
+    // allocation-lane assignment, the custody endpoint, the WERO hold,
+    // the roster enrollment and the freed-offset grace ring are its
+    // singular planes. On an unassigned set — every set in the field
+    // until `squeezefs volume set-owners` runs — the derivation answers
+    // all-local, which is the shipped posture verbatim.
+    let node_id = crate::cowriter::node_member_id()?;
+    let map = derive_ownership(meta, &node_id, pv).await?;
+    let set_authority = map.owns_slot_0();
+    let peer_owned = map.volume_count() - map.local_volumes();
+    if !set_authority {
+        // A PARTIAL AUTHORITY: it appends to a subset and ships the rest,
+        // and under D20 it must not take the set-singular planes. The
+        // posture's own arm is the co-writer client half composed with an
+        // owner half over its OWN volumes; refusing here is the
+        // fail-closed answer until that composition lands with the fleet
+        // rung that first runs it (PR 8), because arming half of it would
+        // leave a mount that grants custody nobody may hold or that mints
+        // lanes nobody granted.
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "multi-writer refuses to arm: the volume hosting slot 0 is owned by '{}', so this \
+             mount is a PARTIAL AUTHORITY under D20 — the set authority assigns allocation \
+             lanes, serves the S9 custody endpoint, holds the one WERO reservation, enrolls the \
+             roster and owns the only freed-offset grace ring. This arm is the SET authority's; \
+             a partial authority's own arm (its custody lease from {}, the lane it installs \
+             from that lease, and an owner half serving only the {} volume(s) it appends to) is \
+             the fleet rung's, and half of it is not a posture",
+            map.owner_of_volume(meta.route_ino(1).0)
+                .map(|p| p.peer_id.clone())
+                .unwrap_or_else(|| "an unresolved peer".to_string()),
+            pv.map(|a| a.set_authority_endpoint())
+                .filter(|e| !e.is_empty())
+                .unwrap_or("SQUEEZEFS_MW_AUTHORITY"),
+            map.local_volumes(),
+        )));
+    }
 
     // Rung 3: the substrate. S7's own arm takes (or JOINS) the WERO hold and
     // refuses a namespace that advertises no reservation support, naming it.
@@ -714,7 +760,7 @@ pub async fn arm_multi_writer(
     // With NO enrolled co-writer this is lane 0 of 1 = SOLO, which installs
     // nothing at all: the authority's own allocation is then not "equivalent
     // to" the shipped path, it IS the shipped path.
-    let assignment = match derive_lane_assignment(meta).await {
+    let assignment = match derive_lane_assignment(meta, &map).await {
         Ok(a) => a,
         Err(e) => {
             if let Some(hold) = wero {
@@ -894,20 +940,28 @@ pub async fn arm_multi_writer(
         ));
     }
     data_grant::install_custody_owner(Arc::clone(&owner));
+    let secret_for_router = secret.clone();
     publish::install_client(publish::PublishClient::new(owner.id(), secret));
 
-    // The ownership plane (S8's un-called arm). The map is derived from what
-    // the set durably says about custody: this node holds the D0 claim on
-    // every volume it mounted — the gate refuses otherwise — so the derived
-    // map is all-local today, and the honest consequence is that publish
-    // routing and lock homing take their local arms while the SHIPPING
-    // halves stay exercised only where a foreign volume exists. What would
-    // populate foreign entries is the claim-set's per-volume ownership,
-    // which needs the D0 Layer-B2 gate to admit a co-member (see the module
-    // docs).
-    let map = OwnerMap::for_volumes(meta, Vec::new())?;
-    let foreign = map.volume_count() - map.local_volumes();
-    crate::meta_ship::arm_ownership(map);
+    // The ownership plane, from the map derived at the top of this arm
+    // (assignment ∧ evidence — KD-PV-3). On an unassigned set every entry
+    // is local and this is S8's shipped all-local arm verbatim; on an
+    // assigned one the foreign entries are real, and `mint_redirects`
+    // becomes the health gauge §11.2 describes rather than a structural
+    // constant.
+    let foreign = peer_owned;
+    crate::meta_ship::arm_ownership(Arc::clone(&map));
+    if map.multi_owner() {
+        // The client half of the same plane: this mount's OWN daemon
+        // verbs on a peer-owned volume must SHIP, and the trait boundary
+        // is the one place no call site can bypass (rung 9's argument,
+        // reached here by a set authority rather than a co-writer).
+        crate::meta_ship::install_daemon_verb_router(crate::meta_ship::MetaShipRouter::new(
+            Arc::clone(meta),
+            &node_id,
+            secret_for_router,
+        ));
+    }
     // Rung 14 (client-owned-slot placement): the policy's migration
     // vehicle — the existing online migrate-meta-slot engine over this
     // authority's own set, re-arming the ownership map at cutover (the
@@ -940,6 +994,57 @@ pub async fn arm_multi_writer(
     }))
 }
 
+/// **Derive this mount's ownership map** (§5.10, KD-PV-3): assignment ∧
+/// evidence, per volume, fail-closed.
+///
+/// The endpoint of a peer that appends to one of this set's volumes is
+/// resolved from DURABLE state — its own claim-set member record — and,
+/// for the owner of the slot-0 volume, from the declared set-authority
+/// endpoint (D20's `SQUEEZEFS_MW_AUTHORITY`) or the admission that named
+/// it. An unresolvable endpoint is announced, never refused: refusing
+/// would make the first node of a fleet unmountable, and a verb toward an
+/// empty endpoint refuses loud at the ship site.
+async fn derive_ownership(
+    meta: &Arc<RoutedMetaBackend>,
+    node_id: &str,
+    pv: Option<&crate::partial_authority::SetAdmission>,
+) -> Result<Arc<OwnerMap>> {
+    let mut published: Vec<(String, String)> = Vec::new();
+    for vol in &meta.volumes {
+        let Some(set) = crate::membership::ClaimSet::load(vol).await else {
+            continue;
+        };
+        for m in &set.members {
+            if let Some(ep) = m.identity.endpoint.as_ref().filter(|e| !e.is_empty()) {
+                if !published.iter().any(|(id, _)| *id == m.identity.id) {
+                    published.push((m.identity.id.clone(), ep.clone()));
+                }
+            }
+        }
+    }
+    // D20: whoever appends to the slot-0 volume is the SET AUTHORITY, and
+    // that is the one endpoint an operator declares.
+    let declared = pv
+        .map(|a| a.set_authority_endpoint().to_string())
+        .filter(|e| !e.is_empty())
+        .or_else(crate::cowriter::declared_authority);
+    let slot_0_owner = crate::membership::ClaimSet::load(&meta.volumes[meta.route_ino(1).0])
+        .await
+        .and_then(|set| set.owner);
+    let resolve = move |id: &str| -> Option<String> {
+        if let Some((_, ep)) = published.iter().find(|(pid, _)| pid == id) {
+            return Some(ep.clone());
+        }
+        match (&slot_0_owner, &declared) {
+            (Some(owner), Some(ep)) if crate::membership::member_id_matches(owner, id) => {
+                Some(ep.clone())
+            }
+            _ => None,
+        }
+    };
+    crate::meta_ship::owners::derive_owner_map(meta, node_id, &resolve).await
+}
+
 /// Derive this era's allocation lane map from the volume set's **durable**
 /// claim sets (DLM S9 blocker #3's admission).
 ///
@@ -950,9 +1055,31 @@ pub async fn arm_multi_writer(
 /// entry. Without an armed membership owner there is no such identity, and
 /// then this authority runs SOLO rather than guessing which entry is itself
 /// (guessing wrong would hand a co-writer the authority's own lane).
-async fn derive_lane_assignment(
+///
+/// **D20 (§5.7): only the SET AUTHORITY derives.** The width rounds up to
+/// a power of two over the union of Writer members, so two nodes deriving
+/// it from rosters they read at different instants can hand two writers
+/// the same residue class — the collision the data-plane allocation
+/// partition exists to prevent. A mount that does not append to the
+/// slot-0 volume installs the `(writer_lane, writers)` pair its CUSTODY
+/// LEASE carries (`install_mount_partition`, which already refuses a
+/// second, different partition loud), so reaching this derivation at all
+/// is the error, and it refuses rather than answering.
+pub async fn derive_lane_assignment(
     meta: &Arc<RoutedMetaBackend>,
+    map: &OwnerMap,
 ) -> Result<Arc<crate::alloc_lane_grant::LaneAssignment>> {
+    if !map.owns_slot_0() {
+        return Err(SqueezefsError::InvalidOperation(
+            "refusing to derive an allocation-lane assignment: this mount does not append to \
+             the volume hosting slot 0, so under D20 it is not the SET AUTHORITY. Only the set \
+             authority derives an era's lane width from the durable claim sets; every other \
+             writer installs the `(writer_lane, writers)` pair its custody lease carries. Two \
+             nodes deriving a width from one roster is exactly the collision the data-plane \
+             allocation partition exists to prevent"
+                .to_string(),
+        ));
+    }
     let me = match crate::membership::installed_owner() {
         // Rung-8 finding #4: the ONE-identity law — the derivation must use
         // the same DURABLE claim identity `arm_owner` upserted (the owner's

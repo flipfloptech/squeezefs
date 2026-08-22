@@ -46,7 +46,7 @@ use squeezefs::membership::{ClaimHolder, ClaimSet, ClaimSetMember, MemberIdentit
 use squeezefs::meta_backend::kv::backend::{KvMetaBackend, WriterClaim, WRITER_CLAIM_XATTR};
 use squeezefs::meta_backend::kv::builder::FormatV3Options;
 use squeezefs::meta_backend::kv::superblock as sb;
-use squeezefs::meta_backend::RoutedMetaBackend;
+use squeezefs::meta_backend::{Metadata, RoutedMetaBackend};
 use squeezefs::meta_ship::owners::{self, VolumeOwnership};
 use squeezefs::meta_ship::{OwnerMap, PeerOwner};
 use squeezefs::partial_authority::{
@@ -476,7 +476,12 @@ async fn the_derivation_never_adopts_on_silence() {
         &routed,
         NODE,
         &[
-            ownership("vol-a", Some(assigned_set(NODE, None, None, &[])), None, true),
+            ownership(
+                "vol-a",
+                Some(assigned_set(NODE, None, None, &[])),
+                None,
+                true,
+            ),
             // Assigned to the peer, claimed by SOMEBODY, attested by nobody.
             ownership(
                 "vol-b",
@@ -511,7 +516,12 @@ async fn an_assigned_volume_no_node_claims_refuses_the_derivation() {
         &routed,
         NODE,
         &[
-            ownership("vol-a", Some(assigned_set(NODE, None, None, &[])), None, true),
+            ownership(
+                "vol-a",
+                Some(assigned_set(NODE, None, None, &[])),
+                None,
+                true,
+            ),
             ownership(
                 "vol-b",
                 Some(assigned_set(PEER, None, None, &[])),
@@ -547,7 +557,12 @@ async fn a_holder_outside_the_assignment_set_refuses_the_derivation() {
         &routed,
         NODE,
         &[
-            ownership("vol-a", Some(assigned_set(NODE, None, None, &[])), None, true),
+            ownership(
+                "vol-a",
+                Some(assigned_set(NODE, None, None, &[])),
+                None,
+                true,
+            ),
             ownership(
                 "vol-b",
                 Some(assigned_set(PEER, Some(&claim), Some(STRANGER), &[])),
@@ -638,7 +653,12 @@ fn arm_derived(
         routed,
         NODE,
         &[
-            ownership("vol-a", Some(assigned_set(NODE, None, None, &[])), None, true),
+            ownership(
+                "vol-a",
+                Some(assigned_set(NODE, None, None, &[])),
+                None,
+                true,
+            ),
             ownership(
                 "vol-b",
                 Some(assigned_set(PEER, Some(claim), Some(holder), successors)),
@@ -782,6 +802,11 @@ async fn an_armed_mint_pick_never_proposes_a_peer_owned_volume() {
     let routed = squeezefs::meta_backend::open_routed_meta_set(&uris(&vols))
         .await
         .expect("write mount");
+    // Arm FIRST: the directory's own mint is filtered too, so a
+    // multi-volume set places the parent on the volume this node keeps
+    // rather than leaving it to the rotor's luck.
+    let _guard = arm_peer_owns(&routed, &[1]);
+    let redirects_before = squeezefs::meta_ship::stats().mint_redirects;
     let parent = routed
         .create(1, "mintdir", libc::S_IFDIR | 0o755, 0, 0)
         .await
@@ -790,11 +815,8 @@ async fn an_armed_mint_pick_never_proposes_a_peer_owned_volume() {
     assert_eq!(
         routed.route_ino(parent).0,
         0,
-        "the fixture needs its parent on the volume this node keeps"
+        "a DIRECTORY mint must be filtered to an owned volume too"
     );
-
-    let _guard = arm_peer_owns(&routed, &[1]);
-    let redirects_before = squeezefs::meta_ship::stats().mint_redirects;
     for i in 0..32 {
         let ino = routed
             .create(parent, &format!("f{i}"), libc::S_IFREG | 0o644, 0, 0)

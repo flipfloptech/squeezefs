@@ -4021,6 +4021,29 @@ impl KvMetaBackend {
         self.guard_trace.lock().unwrap().push(ev);
     }
 
+    /// The Layer-B2 standing of this volume's claim, in the per-volume
+    /// admission ladder's vocabulary — **the gate's own classification**,
+    /// not a second spelling of it.
+    ///
+    /// `crate::partial_authority`'s module doc states why this exists:
+    /// the dead-pid proof, the boot-id scope and the `CLIENT_STALE_TTL_SECS`
+    /// window are the D0 gate's law and must have exactly one
+    /// implementation, so the gather asks the gate rather than re-deriving
+    /// it. Read through a probe open (never blocked, never writes); no
+    /// witness is passed, so the `PeerAuthority` arm stays structurally
+    /// unreachable here (R12).
+    pub async fn claim_standing(&self) -> crate::partial_authority::ClaimStanding {
+        use crate::partial_authority::ClaimStanding;
+        let raw = self.getxattr(1, WRITER_CLAIM_XATTR).await.ok().flatten();
+        match self.classify_claim(raw, unix_now_secs(), None) {
+            ClaimEvidence::Reclaimable => ClaimStanding::Reclaimable,
+            ClaimEvidence::FreshForeign(_) | ClaimEvidence::PeerAuthority(_) => {
+                ClaimStanding::Fresh
+            }
+            ClaimEvidence::StaleForeign(_) => ClaimStanding::Stale,
+        }
+    }
+
     /// Classify the replayed claim evidence for the mount gate.
     ///
     /// `witness` is `None` for every caller but the per-volume peer open

@@ -1259,9 +1259,29 @@ impl RoutedMetaBackend {
         if self.volumes.len() <= 1 {
             return parent_v_idx;
         }
+        // **The owned-candidate filter** (per-volume claim admission
+        // §5.5.1): while a multi-owner plane is armed, propose only
+        // volumes this node OWNS. Without it the health rotor proposes a
+        // peer's volume on (K−1)/K of picks and `constrain_mint_volume`
+        // redirects them to the PARENT's — so `mint_redirects` grows
+        // structurally on every node (carrying no signal at all) and a
+        // node owning two volumes gets no balance among its own.
+        //
+        // A PREFERENCE, never a gate (Issue 29): `disabled_volumes` is
+        // populated at RUNTIME by the fail-stop lattice, so the filtered
+        // set can be empty on a node that owned volumes at admission
+        // time. The empty case falls through to the existing
+        // `candidates.is_empty()` arm below — the parent's volume, which
+        // M2 makes owned by construction — and `check_volume_enabled`
+        // turns "that one is disabled too" into a clean typed error.
+        // Never a panic, never a new refusal.
+        let armed = crate::meta_ship::ownership_armed();
         let mut candidates = Vec::new();
         for (i, _) in self.volumes.iter().enumerate() {
             if self.disabled_volumes.contains_key(&i) {
+                continue;
+            }
+            if armed && !crate::meta_ship::owners::owns_volume(i) {
                 continue;
             }
             let health = self.get_volume_health(i).await;

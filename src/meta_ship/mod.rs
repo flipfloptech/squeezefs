@@ -424,6 +424,9 @@ pub struct ShipStatsSnapshot {
     pub owner_panics: u64,
     pub dlm_rpcs_meta: u64,
     pub mint_redirects: u64,
+    /// GAUGE (**must stay 0**): volumes whose ownership entry the runtime
+    /// re-derivation POISONED — §5.10's fail-closed law engaging.
+    pub owner_map_poisoned_volumes: u64,
 }
 
 /// Read the ledger.
@@ -447,6 +450,7 @@ pub fn stats() -> ShipStatsSnapshot {
         owner_panics: OWNER_PANICS.load(Ordering::Relaxed),
         dlm_rpcs_meta: DLM_RPCS_META.load(Ordering::Relaxed),
         mint_redirects: MINT_REDIRECTS.load(Ordering::Relaxed),
+        owner_map_poisoned_volumes: owners::poisoned_volumes(),
     }
 }
 
@@ -470,6 +474,7 @@ pub fn stats_json() -> serde_json::Value {
         "cross_owner_refusals": s.cross_owner_refusals,
         "owner_panics": s.owner_panics,
         "mint_redirects": s.mint_redirects,
+        "owner_map_poisoned_volumes": s.owner_map_poisoned_volumes,
         "dlm_rpcs_meta": s.dlm_rpcs_meta,
         "dlm_grace_reclaims": s.grace_reclaims,
         "dlm_grace_conflicts": s.grace_conflicts,

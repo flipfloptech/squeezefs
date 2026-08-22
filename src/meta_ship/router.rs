@@ -233,7 +233,10 @@ impl MetaShipRouter {
         let mut have_local = false;
         for ino in call.named_inos() {
             let (v_idx, _) = self.inner.route_ino(ino);
-            match owners::owner_of_volume(v_idx) {
+            // §5.10: a POISONED entry answers neither "local" nor "ship
+            // there" — both would be a guess about who may append — so
+            // the verb refuses loud here.
+            match owners::route_volume(v_idx)? {
                 None => {
                     if let Some(peer) = &owner {
                         return Err(super::cross_owner_refusal(

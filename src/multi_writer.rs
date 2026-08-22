@@ -892,8 +892,10 @@ pub async fn arm_multi_writer(
     // a multi-owner map a frame about a PEER's volume must meet the
     // `not_owner` refusal rather than be executed here, because a set
     // authority holds peer-owned volumes too (§5.7's correction 3).
-    let meta_svc =
-        crate::meta_ship::MetaShipService::with_authority(Arc::clone(meta), &map.local_volume_set());
+    let meta_svc = crate::meta_ship::MetaShipService::with_authority(
+        Arc::clone(meta),
+        &map.local_volume_set(),
+    );
     // Rung 12 — the S10 delegation host: the SAME service serves the
     // DelegRecall/DelegReassert block, and installing it is what arms the
     // coherence gate on this backend's mutation surface (grants may only
@@ -1119,7 +1121,7 @@ impl PartialAuthorityArm {
 ///
 /// | half | over | what it installs |
 /// |---|---|---|
-/// | **client** | the volumes a PEER appends to | the S9 custody lease from the SET authority, the allocation lane that lease carries, the publish client, the daemon verb router, the closed local free/reclaim accounting, the renewal cadence — [`crate::cowriter::install_client_halves`], composed and never forked |
+/// | **client** | the volumes a PEER appends to | the S9 custody lease from the SET authority, the allocation lane that lease carries, the publish client, the daemon verb router, the closed local free/reclaim accounting, the renewal cadence — `cowriter::install_client_halves`, composed and never forked |
 /// | **owner** | the volumes THIS node appends to | the S8 `MetaShipService` scoped to exactly those volumes (its dedup window, its era gate and its failover grace window come with it), the S9 `PublishService`, the S10 delegation host, and the owner-side compose hooks — on a listener with **no custody service** |
 ///
 /// **D20 draws the line, and it is what this arm must not cross**: the
@@ -1170,8 +1172,14 @@ pub async fn arm_partial_authority(
     } = preflight;
 
     // Rung 1: the decision this arm stands on must be a partial
-    // authority's, and it must be about THIS set.
+    // authority's, and it must be about THIS set. A `set-authority`
+    // preflight also carries the standing WERO hold its own rung 5 took —
+    // RELEASED here rather than dropped, because the reservation ioctls
+    // are blocking and a drop would run them on the runtime.
     if admission.role() != MwRole::PartialAuthority || admission.is_set_authority() {
+        if let Some(hold) = hold {
+            data_custody::release_hold(hold).await;
+        }
         return Err(SqueezefsError::InvalidOperation(format!(
             "the partial-authority arm refuses: the admission it was handed is a '{}' \
              decision{}. This arm installs the CLIENT halves toward a set authority and an \
@@ -1184,6 +1192,16 @@ pub async fn arm_partial_authority(
                 ""
             }
         )));
+    }
+    if let Some(hold) = hold {
+        data_custody::release_hold(hold).await;
+        return Err(SqueezefsError::InvalidOperation(
+            "the partial-authority arm refuses: its preflight took a WERO HOLD rather than a \
+             registrant join. Under D20 the set authority holds the one reservation and every \
+             other writer registers under it; a second holder would conflict at the device and \
+             silently take the fence away from the authority"
+                .to_string(),
+        ));
     }
     let paths: Vec<String> = meta
         .volumes
@@ -1198,16 +1216,6 @@ pub async fn arm_partial_authority(
             admission.volumes()
         )));
     }
-    if hold.is_some() {
-        return Err(SqueezefsError::InvalidOperation(
-            "the partial-authority arm refuses: its preflight took a WERO HOLD rather than a \
-             registrant join. Under D20 the set authority holds the one reservation and every \
-             other writer registers under it; a second holder would conflict at the device and \
-             silently take the fence away from the authority"
-                .to_string(),
-        ));
-    }
-
     // Rung 2: the format's capability bits — before anything is acquired
     // (shared verbatim with the set authority's arm).
     check_capabilities(meta)?;
@@ -1309,6 +1317,7 @@ pub async fn arm_partial_authority(
         Bind::Auto => "0.0.0.0:0".parse().expect("literal addr"),
         Bind::Addr(a) => a,
     };
+    let refresh_cadence = crate::membership::LeaseClocks::derive(Duration::ZERO)?.renew_interval;
 
     // ---- Everything demanded is present. Arm, in dependency order. ----
 
@@ -1328,6 +1337,7 @@ pub async fn arm_partial_authority(
             authority_endpoint: &authority_endpoint,
             secret,
             term,
+            refresh_cadence,
         },
     )
     .await
@@ -1377,6 +1387,11 @@ struct PartialHalves<'a> {
     authority_endpoint: &'a str,
     secret: Vec<u8>,
     term: u64,
+    /// How often the endpoint-refresh pass re-reads while a peer's
+    /// address is still unpublished. Resolved in the LADDER, before
+    /// anything is installed: a derivation that can fail must never be
+    /// the last statement of an arm that has already armed both halves.
+    refresh_cadence: Duration,
 }
 
 /// What the two halves installed.
@@ -1390,6 +1405,11 @@ struct ArmedHalves {
 /// Install the owner half then the client half, unwinding **everything**
 /// on any failure — the fail-closed law's arming face, expressed as one
 /// function so no early return can leave a mount holding half a posture.
+///
+/// One durable act survives a failed arm and is meant to: the endpoint
+/// this mount published on the volumes it owns. It cannot be unwritten
+/// atomically, it is leak-safe (a peer dialling a dead listener refuses
+/// loud rather than guessing), and the next successful arm rewrites it.
 async fn arm_partial_halves(
     meta: &Arc<RoutedMetaBackend>,
     router: &crate::routing::DataRouter,
@@ -1403,6 +1423,7 @@ async fn arm_partial_halves(
         authority_endpoint,
         secret,
         term,
+        refresh_cadence,
     } = params;
 
     // ---- The OWNER half: the volumes this node appends to. ----
@@ -1411,8 +1432,10 @@ async fn arm_partial_halves(
     // meets the `not_owner` refusal instead of being executed by a node
     // the record does not entitle (the S8 service's own gate, given the
     // per-volume answer it was always written for).
-    let meta_svc =
-        crate::meta_ship::MetaShipService::with_authority(Arc::clone(meta), &map.local_volume_set());
+    let meta_svc = crate::meta_ship::MetaShipService::with_authority(
+        Arc::clone(meta),
+        &map.local_volume_set(),
+    );
     // The S10 delegation host on the same service: grants may only exist
     // where the recall-before-conflicting-publish law is enforced, and
     // installing it is what arms that gate on this backend's mutation
@@ -1452,9 +1475,9 @@ async fn arm_partial_halves(
     crate::meta_backend::kv::block_refs::install_block_ref_resolver(Arc::new(
         move |key: &str, ino: u64, idx: u32| refs_backend.block_ref_for(key, ino, idx),
     ));
-    crate::meta_backend::kv::indirect_map::install_indirect_map_io(indirect_map_io_for(Arc::clone(
-        &backend,
-    )));
+    crate::meta_backend::kv::indirect_map::install_indirect_map_io(indirect_map_io_for(
+        Arc::clone(&backend),
+    ));
     // The dense-frontier source its own lane OPEN and any served lane
     // question read from THIS mount's cursors.
     crate::alloc_lane_grant::install_frontier_source(
@@ -1497,7 +1520,7 @@ async fn arm_partial_halves(
         Arc::clone(meta),
         Some(authority_endpoint.to_string()),
         Arc::clone(&stop),
-        crate::membership::LeaseClocks::derive(Duration::ZERO)?.renew_interval,
+        refresh_cadence,
     );
 
     Ok(ArmedHalves {
@@ -1680,12 +1703,14 @@ async fn publish_owner_endpoint(
         if map.owner_of_volume(v_idx).is_some() {
             continue;
         }
-        let enrolled = crate::membership::ClaimSet::load(vol).await.and_then(|set| {
-            set.members
-                .iter()
-                .find(|m| crate::membership::member_id_matches(&m.identity.id, node_id))
-                .map(|m| m.identity.clone())
-        });
+        let enrolled = crate::membership::ClaimSet::load(vol)
+            .await
+            .and_then(|set| {
+                set.members
+                    .iter()
+                    .find(|m| crate::membership::member_id_matches(&m.identity.id, node_id))
+                    .map(|m| m.identity.clone())
+            });
         let Some(mut identity) = enrolled else {
             log::warn!(
                 "ownership map: metadata volume {} does not enroll this node '{node_id}', so \

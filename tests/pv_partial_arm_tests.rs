@@ -54,9 +54,7 @@ use squeezefs::config_ops::{self, SetOwnersOptions};
 use squeezefs::cowriter::{AuthorityLeaseEvidence, MwRole, RegistrantEvidence};
 use squeezefs::data_grant::{self, WriteCustodyOwner};
 use squeezefs::dlm::DlmClient;
-use squeezefs::membership::{
-    ClaimHolder, ClaimSet, LeaseClock, LeaseClocks, MemberRole,
-};
+use squeezefs::membership::{ClaimHolder, ClaimSet, LeaseClock, LeaseClocks, MemberRole};
 use squeezefs::meta_backend::kv::backend::{KvMetaBackend, WriterClaim, WRITER_CLAIM_XATTR};
 use squeezefs::meta_backend::kv::builder::FormatV3Options;
 use squeezefs::meta_backend::kv::superblock as sb;
@@ -261,7 +259,9 @@ fn spec(vol_id: &str, owner: &str, root: &str) -> config_ops::OwnerAssignSpec {
 /// and then the claim itself.
 async fn plant_authority_claim(path: &Path, claim: &WriterClaim) {
     let be = KvMetaBackend::open(path).await.expect("open to plant");
-    let mut set = ClaimSet::load(&be).await.expect("the verb wrote a claim set");
+    let mut set = ClaimSet::load(&be)
+        .await
+        .expect("the verb wrote a claim set");
     assert!(set.durable, "the verb writes a DURABLE record");
     set.holder = Some(ClaimHolder {
         id: AUTH.to_string(),
@@ -322,11 +322,9 @@ impl Authority {
         .expect("the custody authority arms");
         // D20: ONLY the set authority derives the era's lane width, from
         // the durable claim set the offline verb wrote.
-        let assignment = squeezefs::alloc_lane_grant::LaneAssignment::derive(
-            AUTH,
-            std::slice::from_ref(roster),
-        )
-        .expect("the roster fits the lane space");
+        let assignment =
+            squeezefs::alloc_lane_grant::LaneAssignment::derive(AUTH, std::slice::from_ref(roster))
+                .expect("the roster fits the lane space");
         owner.install_lane_assignment(assignment);
         data_grant::install_custody_owner(Arc::clone(&owner));
         let svc = ship::MetaShipService::new(Arc::clone(&meta));
@@ -542,10 +540,9 @@ impl Fleet {
             squeezefs::fuse_client::MountPosture::PartialAuthority,
         );
         let admission = partial_admission(&vols, &claim, &authority.endpoint).await;
-        let meta =
-            squeezefs::meta_backend::open_routed_meta_set_partial(&uris(&vols), &admission)
-                .await
-                .expect("the partial open serves the volumes this node owns");
+        let meta = squeezefs::meta_backend::open_routed_meta_set_partial(&uris(&vols), &admission)
+            .await
+            .expect("the partial open serves the volumes this node owns");
         let data_lv = dir.path().join("oss1");
         std::fs::File::create(&data_lv)
             .unwrap()
@@ -637,10 +634,15 @@ async fn a_partial_authority_arms_both_halves_over_a_verb_created_assignment() {
          membership decoy {MEMBERSHIP_DECOY} its member entry carries"
     );
 
-    // The CLIENT half.
+    // The CLIENT half. The arm's own handle and the process-global one are
+    // the same client — the arm holds what it installed.
     let client = data_grant::custody_client().expect("the custody client is installed");
+    assert!(
+        Arc::ptr_eq(&client, arm.client()),
+        "the arm holds the custody client it installed"
+    );
     assert_eq!(client.endpoint(), fleet.authority.endpoint);
-    let lane = client.lane_partition();
+    let lane = arm.client().lane_partition();
     assert!(
         !lane.is_solo() && lane.writers() == 2 && lane.writer_id() == 1,
         "the allocation lane is the one the SET AUTHORITY granted on the lease, never one this \
@@ -1030,7 +1032,10 @@ async fn an_authority_restart_relearns_the_era_without_poisoning_the_derived_map
     // so every frame the client still builds on the old era is stale by
     // construction.
     let before = ship::stats();
-    fleet.authority.svc.bump_term(squeezefs::dlm::durable_term() + 5);
+    fleet
+        .authority
+        .svc
+        .bump_term(squeezefs::dlm::durable_term() + 5);
     let stale = fleet
         .meta
         .create(1, "old-era", libc::S_IFREG | 0o644, 0, 0)
@@ -1117,7 +1122,10 @@ async fn the_same_relearn_never_poisons_a_map_built_for_a_co_writer() {
         .await
         .expect("a shipped create executes on the authority");
     let before = ship::stats();
-    fleet.authority.svc.bump_term(squeezefs::dlm::durable_term() + 9);
+    fleet
+        .authority
+        .svc
+        .bump_term(squeezefs::dlm::durable_term() + 9);
     assert!(
         fleet
             .meta
@@ -1223,7 +1231,10 @@ async fn a_peer_that_publishes_late_is_resolved_by_the_refresh_pass() {
     );
     let map = owners::owner_map().expect("armed");
     let peer = map.owner_of_volume(0).expect("still peer-owned");
-    assert_eq!(peer.peer_id, AUTH, "ownership did not move — only the address");
+    assert_eq!(
+        peer.peer_id, AUTH,
+        "ownership did not move — only the address"
+    );
     assert_eq!(peer.endpoint, "127.0.0.1:7100");
     assert_eq!(owners::unresolved_peer_endpoints(), 0);
 

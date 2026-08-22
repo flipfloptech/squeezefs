@@ -5404,6 +5404,22 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                      docs/operations.md §Multi-writer co-writer mounts."
                 );
             }
+            if pv_posture {
+                println!(
+                    "Mounting as a {} (per-volume claim admission, ruling D20): this mount \
+                     appends to the volumes the durable assignment gives it and ships every \
+                     other volume's metadata to that volume's owner. Admission runs a \
+                     seven-rung ladder over an ASSIGNMENT an operator made offline (`squeezefs \
+                     volume set-owners`) and refuses loudly naming the rung; the mount order of \
+                     a fleet is not optional — see docs/operations.md §Bringing a multi-owner \
+                     fleet up.",
+                    if partial_authority_mount {
+                        "PARTIAL AUTHORITY"
+                    } else {
+                        "SET AUTHORITY"
+                    }
+                );
+            }
 
             // KD-MW-2 (design-full-multi-writer §5.1): the CLIENT identity
             // is the pair `(node_token, mount_slot)`. The slot is derived

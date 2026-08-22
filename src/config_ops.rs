@@ -2538,6 +2538,8 @@ pub struct SetOwnersReport {
     /// That volume's durable id.
     pub set_authority_volume: String,
     pub dry_run: bool,
+    /// `--clear`: this run unassigned the set rather than assigning it.
+    pub cleared: bool,
     /// Volume ownership records written by this run.
     pub records_written: usize,
     pub roots_minted: usize,
@@ -2958,13 +2960,20 @@ async fn set_owners_body(
         for (v, spec) in plan.iter().enumerate() {
             let Some(spec) = spec else { continue };
             let Some(path) = &spec.subtree_root else {
-                warnings.push(format!(
-                    "volume {} is assigned to {} with NO subtree root: that node will own a \
-                     volume but no new work — every ino descends from root and belongs to \
-                     the set authority (KD-PV-15/R16), so it will ship 100 % of its metadata \
-                     verbs. Re-run with {}={}:<absolute-path> to mint one",
-                    vol_ids[v], spec.owner, vol_ids[v], spec.owner
-                ));
+                // The slot-0 volume's owner needs no root: ino 1 homes
+                // there, so every ino that is not under some other
+                // owner's subtree is already its work. Warning about it
+                // would be false, and a false warning is how a true one
+                // stops being read.
+                if v != slot_0_v {
+                    warnings.push(format!(
+                        "volume {} is assigned to {} with NO subtree root: that node will own \
+                         a volume but no new work — every ino descends from root and inherits \
+                         its parent's owner, so it will ship 100 % of its metadata verbs. \
+                         Re-run with {}={}:<absolute-path> to mint one",
+                        vol_ids[v], spec.owner, vol_ids[v], spec.owner
+                    ));
+                }
                 continue;
             };
             let (parent, name) = resolve_subtree_parent(routed, path).await?;
@@ -3036,6 +3045,7 @@ async fn set_owners_body(
                 set_authority,
                 set_authority_volume: vol_ids[slot_0_v].clone(),
                 dry_run: opts.dry_run,
+                cleared: opts.clear,
                 records_written: 0,
                 roots_minted: 0,
                 members_enrolled: members.len(),
@@ -3068,6 +3078,7 @@ async fn set_owners_body(
             set_authority,
             set_authority_volume: vol_ids[slot_0_v].clone(),
             dry_run: true,
+            cleared: opts.clear,
             records_written: 0,
             roots_minted: 0,
             members_enrolled: members.len(),
@@ -3236,6 +3247,7 @@ async fn set_owners_body(
         set_authority,
         set_authority_volume: vol_ids[slot_0_v].clone(),
         dry_run: false,
+        cleared: opts.clear,
         records_written,
         roots_minted,
         members_enrolled: if opts.clear { 0 } else { members.len() },
@@ -3516,6 +3528,21 @@ pub async fn get_owners(meta_lvs: &[String]) -> Result<Vec<OwnerStatusRow>> {
             claim_fresh: standing == ClaimStanding::Fresh,
             drift,
         });
+    }
+    // An assigned set with NO claim anywhere is a fleet that is not
+    // running — the state every assignment is in the moment it is made.
+    // Calling that "drift" per volume cries wolf on the expected shape
+    // and teaches the operator to skip the line that matters: ONE volume
+    // unclaimed while its siblings are held.
+    if rows.iter().all(|r| r.claim_id.is_none()) {
+        for row in rows.iter_mut().filter(|r| r.owner.is_some()) {
+            row.drift = Some(
+                "not mounted: no volume of this set carries a live claim, so this volume's \
+                 assigned owner is not claiming it either. Expected while the fleet is down — \
+                 each owner's mount is what makes this row live"
+                    .to_string(),
+            );
+        }
     }
     Ok(rows)
 }

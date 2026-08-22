@@ -2018,16 +2018,20 @@ fn print_cross_owner_census(census: &squeezefs::config_ops::CrossOwnerCensus) {
 
 /// What `volume set-owners` did (or, with --dry-run, would do).
 fn print_owner_assignment(report: &squeezefs::config_ops::SetOwnersReport) {
-    let verb = if report.dry_run {
-        "WOULD assign"
-    } else {
-        "Assigned"
+    let verb = match (report.dry_run, report.cleared) {
+        (true, true) => "WOULD unassign",
+        (true, false) => "WOULD assign",
+        (false, true) => "Unassigned",
+        (false, false) => "Assigned",
     };
     for row in &report.volumes {
         println!(
-            "{verb} {} → {}{}{}{}",
+            "{verb} {}{}{}{}{}",
             row.volume_id,
-            row.owner.as_deref().unwrap_or("(unassigned)"),
+            match &row.owner {
+                Some(owner) => format!(" → {owner}"),
+                None => String::new(),
+            },
             if row.successors.is_empty() {
                 String::new()
             } else {
@@ -2062,7 +2066,12 @@ fn print_owner_assignment(report: &squeezefs::config_ops::SetOwnersReport) {
             ),
         }
     }
-    print_cross_owner_census(&report.census);
+    if !report.cleared {
+        // A cleared set has one owner again, so the cross-owner
+        // population it would create is zero by construction — printing
+        // the census here would be noise, not information.
+        print_cross_owner_census(&report.census);
+    }
     if let Some(owner) = &report.set_authority {
         println!(
             "{}",
@@ -2083,7 +2092,21 @@ fn print_owner_assignment(report: &squeezefs::config_ops::SetOwnersReport) {
             println!("--dry-run: nothing was written. Re-run without it to apply.");
         }
     } else if report.records_written == 0 {
-        println!("Nothing to do: this assignment is already in force.");
+        println!(
+            "{}",
+            if report.cleared {
+                "Nothing to do: this set carries no ownership assignment."
+            } else {
+                "Nothing to do: this assignment is already in force."
+            }
+        );
+    } else if report.cleared {
+        println!(
+            "Unassigned {} volume(s). The set has ONE metadata authority again: mount it \
+             exactly as before, with no multi-writer role. Subtree roots the assignment \
+             minted are ordinary directories and were left in place.",
+            report.records_written
+        );
     } else {
         println!(
             "Wrote {} volume ownership record(s), enrolled {} member(s) on every volume, \

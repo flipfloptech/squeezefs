@@ -913,6 +913,12 @@ async fn a_volume_assigned_without_a_subtree_root_warns_that_the_node_will_own_n
         warned.contains("no new work") || warned.contains("no NEW work"),
         "…and what it costs: {warned}"
     );
+    assert!(
+        !warned.contains(&id0),
+        "…and NOT the slot-0 volume: ino 1 homes there, so its owner owns every ino that is \
+         not under another owner's subtree. A false warning is how a true one stops being \
+         read: {warned}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -984,19 +990,29 @@ async fn get_owners_renders_assignment_beside_evidence_and_names_drift() {
     assert_eq!(rows[0].successors, vec![NODE_C.to_string()]);
     assert_eq!(rows[1].volume_id, id1);
     for row in &rows {
+        let drift = row.drift.clone().unwrap_or_default();
         assert!(
-            row.drift
-                .as_deref()
-                .is_some_and(|d| d.contains("not claiming")),
-            "an assigned volume nobody claims IS drift: {:?}",
-            row.drift
+            drift.contains("not claiming"),
+            "an assigned volume nobody claims is reported: {drift}"
+        );
+        assert!(
+            drift.contains("not mounted"),
+            "…and while NO volume of the set is claimed, it is reported as the fleet being \
+             down rather than as drift — crying wolf on the state every assignment is made \
+             in is how the row that matters stops being read: {drift}"
         );
     }
 
-    // A live claim held by a node the record does not name is the sharper
-    // drift: the map's fail-closed poison predicate, seen offline.
+    // One volume claimed and the other not IS the drift shape, and a live
+    // claim whose holder resolves to nothing is the sharper one: the
+    // map's fail-closed poison predicate, seen offline.
     plant_claim(&vols[1], &foreign_claim()).await;
     let rows = config_ops::get_owners(&u).await.expect("get-owners");
+    let idle = rows[0].drift.clone().unwrap_or_default();
+    assert!(
+        idle.contains("not claiming") && !idle.contains("not mounted"),
+        "with a sibling claimed, an unclaimed assigned volume is real drift: {idle}"
+    );
     let drift = rows[1].drift.clone().unwrap_or_default();
     assert!(
         drift.contains("holder") || drift.contains("resolves"),

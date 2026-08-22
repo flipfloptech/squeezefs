@@ -303,6 +303,152 @@ pub async fn open_meta_volume_set(
     Ok(opened)
 }
 
+/// The **offline-bracket probes** every writable mount runs on the slot-0
+/// volume before it serves: `mw_upgrade:` (KD-MW-1 §6.2 mechanism i) and
+/// its sibling `owner_assign:` (per-volume claim admission §5.2.1 / sweep
+/// row 2, KD-PV-2 — *"the `MW_UPGRADE_MARKER_XATTR` pattern verbatim"*).
+///
+/// Both mark an offline verb that is mid-act: an interrupted
+/// `enable-multi-writer` upgrade, or an interrupted `volume set-owners`
+/// assignment. A writable mount refuses while either exists, naming the
+/// idempotent re-run; read-only mounts keep serving. A probe that cannot
+/// be READ refuses too — never guess about a bracket.
+///
+/// `None` = clear, which is every set that is not mid-verb.
+async fn open_intent_marker_refusal(
+    be: &std::sync::Arc<kv::backend::KvMetaBackend>,
+) -> Option<crate::error::SqueezefsError> {
+    let refuse = |m: String| Some(crate::error::SqueezefsError::InvalidOperation(m));
+    match be.getxattr(1, crate::MW_UPGRADE_MARKER_XATTR).await {
+        Ok(Some(raw)) => {
+            let named = match crate::MwUpgradeMarker::decode(&raw) {
+                Ok(m) => format!("covering volumes {:?}", m.volumes),
+                Err(e) => format!("(marker undecodable: {e})"),
+            };
+            return refuse(format!(
+                "refusing a writable mount: a multi-writer upgrade-intent marker \
+                 (`{}`) is present on volume 0 {named} — a `squeezefs volume \
+                 enable-multi-writer` run crashed mid-upgrade. Re-run `squeezefs \
+                 volume enable-multi-writer <sqmeta-uri>` (idempotent, resumes \
+                 from the crash point); read-only mounts keep serving",
+                crate::MW_UPGRADE_MARKER_XATTR
+            ));
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return refuse(format!(
+                "refusing a writable mount: the multi-writer upgrade-intent marker \
+                 probe on volume 0 failed ({e})"
+            ));
+        }
+    }
+    match be.getxattr(1, crate::OWNER_ASSIGN_MARKER_XATTR).await {
+        Ok(Some(raw)) => {
+            let named = match crate::config_ops::OwnerAssignMarker::decode(&raw) {
+                Ok(m) => format!(
+                    "covering volumes {:?}",
+                    m.assignments
+                        .iter()
+                        .map(|a| a.volume_id.as_str())
+                        .collect::<Vec<_>>()
+                ),
+                Err(e) => format!("(marker undecodable: {e})"),
+            };
+            refuse(format!(
+                "refusing a writable mount: a per-volume ownership-assignment intent marker \
+                 (`{}`) is present on the slot-0 volume {named} — a `squeezefs volume \
+                 set-owners` run crashed mid-assignment, so some volumes may name an owner \
+                 and others may not. Re-run `squeezefs volume set-owners <sqmeta-uri> …` \
+                 (idempotent, resumes from the crash point) or `--clear` it; read-only \
+                 mounts keep serving",
+                crate::OWNER_ASSIGN_MARKER_XATTR
+            ))
+        }
+        Ok(None) => None,
+        Err(e) => refuse(format!(
+            "refusing a writable mount: the ownership-assignment intent marker probe on the \
+             slot-0 volume failed ({e})"
+        )),
+    }
+}
+
+/// **Per-volume claim admission — open a set this mount appends to only
+/// PART of** (`docs/design-per-volume-claim-admission.md` §5.4, PR 4):
+/// [`open_meta_volume_set`]'s partial twin, one mode per volume.
+///
+/// `vol_ids` are the DURABLE `vol-{hex}` identities of `ordered` in the
+/// same order (KD-5 — the mode is resolved by identity, never by
+/// position: an index-keyed vector plus a permuted URI list would take
+/// the full D0 ladder on a volume a peer owns, the worst outcome in the
+/// program, reached by an off-by-permutation rather than a race).
+///
+/// The `admission` is carried rather than a `&[VolumeMode]` (the design's
+/// §6.3 sketch) for one reason: [`kv::backend::KvMetaBackend::open_peer_owned`]
+/// re-checks the decision itself, and `VolumeMode` is a plain public enum
+/// any caller could build — passing modes alone would make the peer door
+/// reachable with a fabricated mode vector, which is exactly what
+/// `SetAdmission`'s private fields exist to prevent.
+///
+/// **The rollback ladder releases exactly what it took.** An `Own` volume
+/// holds a flock, a `writer_claim` and (on a PR namespace) a reservation,
+/// released by its `shutdown()`; a `Peer` volume holds none of the three,
+/// so its shutdown is a no-op — correct, and pinned in both directions.
+pub async fn open_meta_volume_set_partial(
+    ordered: &[String],
+    vol_ids: &[String],
+    admission: &crate::partial_authority::SetAdmission,
+) -> Result<Vec<std::sync::Arc<kv::backend::KvMetaBackend>>> {
+    if ordered.len() != vol_ids.len() {
+        return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+            "partial set open: {} volume paths against {} durable ids — the mode of a volume \
+             is keyed on its identity, so a mismatched pairing cannot be interpreted",
+            ordered.len(),
+            vol_ids.len()
+        )));
+    }
+    let mut opened: Vec<std::sync::Arc<kv::backend::KvMetaBackend>> = Vec::new();
+    for (path, vol_id) in ordered.iter().zip(vol_ids) {
+        let out = match admission.mode_for(vol_id) {
+            Some(crate::partial_authority::VolumeMode::Own) => {
+                open_volume_for_mount(path).await.map_err(|e| {
+                    // The own-mode arm is the shipped D0 ladder, verbatim.
+                    e
+                })
+            }
+            Some(crate::partial_authority::VolumeMode::Peer { .. }) => {
+                kv::backend::KvMetaBackend::open_peer_owned(
+                    std::path::Path::new(path),
+                    admission,
+                    vol_id,
+                )
+                .await
+                .map_err(Into::into)
+            }
+            None => Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                "partial set open: the admission does not name metadata volume {path} \
+                 ({vol_id}). A volume a decision does not cover is a refusal, never a \
+                 default — re-run `squeezefs volume set-owners` over the WHOLE set"
+            ))),
+        };
+        match out {
+            Ok(be) => opened.push(be),
+            Err(e) => {
+                for prior in &opened {
+                    if let Err(te) = prior.shutdown().await {
+                        log::warn!(
+                            "releasing guard on {:?} after a failed partial set open failed \
+                             too: {te}",
+                            prior.device_path()
+                        );
+                    }
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(opened)
+}
+
 /// Open a whole metadata volume set as the routed backend (PR VL5a): the
 /// §5.5.1a stamp discovery first (canonical `member_position` ordering,
 /// loud disagreement refusals), then the guarded [`open_meta_volume_set`]
@@ -330,36 +476,7 @@ pub async fn open_routed_meta_set(paths: &[String]) -> Result<std::sync::Arc<Rou
     // precedes any bit write). The `volume enable-multi-writer` verb's own
     // D0-guarded per-volume opens are the ONE marker-tolerant writable
     // open; they never route through this gate by construction.
-    let marker = backends[0]
-        .getxattr(1, crate::MW_UPGRADE_MARKER_XATTR)
-        .await;
-    let refusal = match &marker {
-        Ok(Some(raw)) => {
-            let named = match crate::MwUpgradeMarker::decode(raw) {
-                Ok(m) => format!("covering volumes {:?}", m.volumes),
-                Err(e) => format!("(marker undecodable: {e})"),
-            };
-            Some(crate::error::SqueezefsError::InvalidOperation(format!(
-                "refusing a writable mount: a multi-writer upgrade-intent marker \
-                 (`{}`) is present on volume 0 {named} — a `squeezefs volume \
-                 enable-multi-writer` run crashed mid-upgrade. Re-run `squeezefs \
-                 volume enable-multi-writer <sqmeta-uri>` (idempotent, resumes \
-                 from the crash point); read-only mounts keep serving",
-                crate::MW_UPGRADE_MARKER_XATTR
-            )))
-        }
-        Ok(None) => None,
-        // A marker probe that cannot be READ refuses too (never guess).
-        Err(_) => Some(crate::error::SqueezefsError::InvalidOperation(format!(
-            "refusing a writable mount: the multi-writer upgrade-intent marker \
-             probe on volume 0 failed ({})",
-            marker
-                .as_ref()
-                .err()
-                .map(|e| e.to_string())
-                .unwrap_or_default()
-        ))),
-    };
+    let refusal = open_intent_marker_refusal(&backends[0]).await;
     if let Some(err) = refusal {
         for be in &backends {
             if let Err(te) = be.shutdown().await {
@@ -466,6 +583,131 @@ pub async fn open_routed_meta_set_co_writer(
             disc.native_slots,
         )?,
     ))
+}
+
+/// **Per-volume claim admission — [`open_routed_meta_set`]'s PARTIAL twin
+/// and the mount path's entry point** (§5.4 sweep row 18, PR 4), modeled
+/// on [`open_routed_meta_set_co_writer`]:
+///
+/// discovery → canonical order → resolve each volume's mode by its
+/// DURABLE id → the partial set open (rollback ladder included) → the two
+/// offline-bracket probes → **ownership-scoped** intent recovery → the
+/// bring-up cover on OWNED volumes only → the KD-PV-17 holder attestation
+/// → `RoutedMetaBackend`.
+///
+/// Four of those differ from the write twin, each because a peer's volume
+/// is not this mount's to touch:
+///
+/// * **row 3** — `recover_open_intents` becomes
+///   [`crossvol_tx::recover_open_intents_scoped`]: roll forward what we
+///   own, skip what a peer owns, refuse loud on an intent spanning two
+///   owners;
+/// * **row 4** — `cover_bring_up_residue` WRITES, so it runs on owned
+///   volumes only;
+/// * **row 2** — the `owner_assign:` probe joins `mw_upgrade:`;
+/// * KD-PV-17 — each owned volume's claim gets its holder attestation, the
+///   durable fact that lets a PEER resolve this mount's per-mount claim
+///   uuid to its enrollment identity.
+pub async fn open_routed_meta_set_partial(
+    paths: &[String],
+    admission: &crate::partial_authority::SetAdmission,
+) -> Result<std::sync::Arc<RoutedMetaBackend>> {
+    let disc = discover_meta_set(paths).await?;
+    validate_slot_map(
+        disc.ordered_paths.len(),
+        disc.routing_width,
+        &disc.slot_to_volume,
+    )?;
+    refuse_mixed_multi_writer_set(&disc.ordered_paths).await?;
+    if !admission.covers(&disc.ordered_paths) {
+        return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+            "refusing a partial-writer mount: the admission was decided over {:?}, but this \
+             set's canonical membership is {:?}. An admission is per-SET — bit 14 and a \
+             durable claim set on every volume, one complete assignment map, one set \
+             authority — so it may never be carried across sets",
+            admission.volumes(),
+            disc.ordered_paths
+        )));
+    }
+    // KD-5, and the reason discovery runs FIRST: modes are keyed on the
+    // durable identity, resolved against the CANONICAL order rather than
+    // the caller's URI order.
+    let vol_ids: Vec<String> = disc
+        .uuids
+        .iter()
+        .map(kv::backend::durable_volume_id_of)
+        .collect();
+    let backends = open_meta_volume_set_partial(&disc.ordered_paths, &vol_ids, admission).await?;
+    let owned: Vec<bool> = vol_ids
+        .iter()
+        .map(|id| admission.mode_for(id) == Some(&crate::partial_authority::VolumeMode::Own))
+        .collect();
+
+    if let Some(err) = open_intent_marker_refusal(&backends[0]).await {
+        for be in &backends {
+            if let Err(te) = be.shutdown().await {
+                log::warn!(
+                    "releasing guard on {:?} after an intent-marker refusal failed: {te}",
+                    be.device_path()
+                );
+            }
+        }
+        return Err(err);
+    }
+    let routed = std::sync::Arc::new(RoutedMetaBackend::with_slot_map_and_natives(
+        backends,
+        disc.routing_width,
+        disc.slot_to_volume,
+        disc.native_slots,
+    )?);
+    let mut bring_up: Result<()> = crossvol_tx::recover_open_intents_scoped(&routed, &owned)
+        .await
+        .map(|_| ());
+    if bring_up.is_ok() {
+        for (vol, mine) in routed.volumes.iter().zip(&owned) {
+            if *mine {
+                bring_up = vol.cover_bring_up_residue().await.map_err(Into::into);
+                if bring_up.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    if let Err(e) = bring_up {
+        for be in &routed.volumes {
+            if let Err(te) = be.shutdown().await {
+                log::warn!(
+                    "releasing guard on {:?} after a partial bring-up failure: {te}",
+                    be.device_path()
+                );
+            }
+        }
+        return Err(e);
+    }
+    // KD-PV-17, last: the attestation names a claim this mount now holds,
+    // so it can only be written after the D0 ladder committed it — and
+    // only on volumes we own, where we are the appender.
+    for (vol, mine) in routed.volumes.iter().zip(&owned) {
+        if !*mine {
+            continue;
+        }
+        if let Err(e) = crate::membership::publish_claim_holder(
+            vol,
+            admission.node_id(),
+            crate::dlm::durable_term(),
+        )
+        .await
+        {
+            log::warn!(
+                "meta volume {}: publishing this mount's holder attestation failed ({e}) — \
+                 peers will read an unresolvable holder for this volume and REFUSE it \
+                 (KD-PV-17: silence never adopts), so this mount serves but the fleet cannot \
+                 grow until it succeeds",
+                vol.device_path().display()
+            );
+        }
+    }
+    Ok(routed)
 }
 
 /// [`open_routed_meta_set`]'s **read-only probe** twin (the clients/df/

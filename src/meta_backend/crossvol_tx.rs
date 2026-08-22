@@ -1026,6 +1026,83 @@ pub async fn recover_open_intents(routed: &RoutedMetaBackend) -> Result<usize> {
     Ok(n)
 }
 
+/// **Ownership-scoped recovery** (per-volume claim admission §5.4 sweep
+/// row 3): [`recover_open_intents`] for a mount that appends to only PART
+/// of the set. `owned[v]` is `true` for a volume this mount holds the D0
+/// claim on.
+///
+/// The three arms are §5.4a's, unchanged in substance:
+///
+/// * an intent wholly inside volumes THIS node owns → rolled forward;
+/// * wholly inside a peer's → **skipped and logged once**, because
+///   rolling it forward is a WRITE to trees this mount has no authority
+///   over; its owner's own mount recovers it;
+/// * spanning two owners → **refuse the mount loud**, and count it.
+///   `xv_cross_owner_intents` is a must-stay-0 tripwire: the M1 pre-check
+///   is what keeps it 0, so a nonzero value means a cross-owner mutation
+///   escaped that check and half-committed (case (c) is reachable-by-bug,
+///   not unreachable).
+pub async fn recover_open_intents_scoped(
+    routed: &RoutedMetaBackend,
+    owned: &[bool],
+) -> Result<usize> {
+    let mut open: Vec<(usize, IntentRecord)> = Vec::new();
+    for (idx, vol) in routed.volumes.iter().enumerate() {
+        for (tx_id, image) in vol.xv_scan_intents().await? {
+            let rec = IntentRecord::decode(&image).map_err(|e| {
+                SqueezefsError::InvalidOperation(format!(
+                    "metadata volume {}: open cross-volume intent {tx_id:016x} does not \
+                     decode ({e}) — refusing to mount a set with an unreadable half-applied \
+                     transaction; run `squeezefs fsck` and see docs/operations.md \
+                     (cross-volume transactions)",
+                    vol.device_path().display()
+                ))
+            })?;
+            open.push((idx, rec));
+        }
+    }
+    if open.is_empty() {
+        return Ok(0);
+    }
+    open.sort_by_key(|(_, r)| r.tx_id);
+    let mine = |v: usize| owned.get(v).copied().unwrap_or(false);
+    let mut rolled = 0usize;
+    for (host, rec) in open {
+        let mut vols: Vec<usize> = rec.steps.iter().map(|s| localise(routed, s).0).collect();
+        vols.push(host);
+        vols.sort_unstable();
+        vols.dedup();
+        let ours = vols.iter().filter(|v| mine(**v)).count();
+        if ours == vols.len() {
+            recover_one(routed, host, &rec).await?;
+            rolled += 1;
+        } else if ours == 0 {
+            log::warn!(
+                "cross-volume transaction {:016x} is wholly inside volumes {vols:?}, which a \
+                 PEER authority of this set appends to — SKIPPED at this mount. Rolling it \
+                 forward would be a write to trees this node has no authority over; its \
+                 owner's own mount recovers it",
+                rec.tx_id
+            );
+        } else {
+            crate::fuse_client::METRICS
+                .xv_cross_owner_intents
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "refusing to mount: open cross-volume transaction {:016x} ({:?}) spans two \
+                 metadata OWNERS (volumes {vols:?}) — no process in this fleet can roll it \
+                 forward, because each half needs the D0 claim of a different node. This is \
+                 reachable only by a bug in the M1 cross-owner pre-check \
+                 (xv_cross_owner_intents, a must-stay-0 counter): the remedy is the offline \
+                 whole-set pass — unmount every owner and run `squeezefs fsck` — never a \
+                 partial roll-forward",
+                rec.tx_id, rec.op
+            )));
+        }
+    }
+    Ok(rolled)
+}
+
 async fn recover_one(routed: &RoutedMetaBackend, host: usize, rec: &IntentRecord) -> Result<()> {
     let localised: Vec<(usize, XvLocalStep)> =
         rec.steps.iter().map(|s| localise(routed, s)).collect();

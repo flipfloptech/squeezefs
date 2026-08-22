@@ -5348,6 +5348,12 @@ pub struct Metrics {
     /// ownership does not fail over, so the repair is the offline
     /// `squeezefs volume set-owners`).
     pub peer_volume_unclaimed_refusals: Align64<AtomicU64>,
+    /// Open cross-volume intents found at mount whose steps span two
+    /// metadata OWNERS (§5.4a case (c)). **MUST STAY 0** — the M1
+    /// cross-owner pre-check is what keeps it there; a nonzero value means
+    /// a cross-owner mutation escaped that check and half-committed, which
+    /// no process in the fleet can roll forward.
+    pub xv_cross_owner_intents: Align64<AtomicU64>,
     // DLM **S6** (pre-RC spec §6.5 item 3, §6.9 S6): the membership plane.
     // Liveness is RAM state renewed over `cluster_wire`, so these are the
     // instruments that say so — the gauges (`membership_mode`,

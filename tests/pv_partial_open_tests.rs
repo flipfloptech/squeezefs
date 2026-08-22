@@ -37,6 +37,7 @@ use squeezefs::meta_backend::kv::backend::{
 };
 use squeezefs::meta_backend::kv::builder::{format_v3, FormatV3Options};
 use squeezefs::meta_backend::kv::superblock as sb;
+use squeezefs::meta_backend::Metadata;
 use squeezefs::partial_authority::{
     self as pv, ClaimStanding, PvVolumeEvidence, SetAdmission, SetAdmissionRequest,
 };
@@ -674,7 +675,8 @@ async fn a_partial_set_open_failure_releases_exactly_the_owned_volumes_guards() 
         &admission,
     )
     .await
-    .expect_err("a peer volume with no appender refuses the whole set open");
+    .err()
+    .expect("a peer volume with no appender refuses the whole set open");
     assert!(
         err.to_string().contains("NOTHING claims it"),
         "the set open must propagate the volume's own refusal: {err}"
@@ -703,7 +705,8 @@ async fn any_writable_mount_refuses_while_an_owner_assign_bracket_is_open() {
     let (vol0, vol1) = two_volume_set(dir.path(), "assign-marker").await;
     let (id0, id1) = (vol_id(&vol0).await, vol_id(&vol1).await);
     store_set(&vol0, &own_set()).await;
-    store_set(&vol1, &peer_owned_set(&foreign_claim(), true)).await;
+    let claim = foreign_claim();
+    store_set(&vol1, &peer_owned_set(&claim, true)).await;
     {
         let be = KvMetaBackend::open(&vol0).await.expect("marker open");
         be.setxattr_internal(
@@ -725,6 +728,8 @@ async fn any_writable_mount_refuses_while_an_owner_assign_bracket_is_open() {
     }
 
     let uris = vec![vol0.display().to_string(), vol1.display().to_string()];
+    // The plain arm runs BEFORE the peer's claim is planted: with one
+    // there, D0's own `FreshForeign` refusal (correctly) fires first.
     let plain = squeezefs::meta_backend::open_routed_meta_set(&uris)
         .await
         .err()
@@ -735,7 +740,8 @@ async fn any_writable_mount_refuses_while_an_owner_assign_bracket_is_open() {
         "the refusal must name the record and the idempotent re-run: {plain}"
     );
 
-    let admission = set_authority_admission(&vol0, &id0, &vol1, &id1, None);
+    plant(&vol1, &claim, false).await;
+    let admission = set_authority_admission(&vol0, &id0, &vol1, &id1, Some(&claim));
     let partial = squeezefs::meta_backend::open_routed_meta_set_partial(&uris, &admission)
         .await
         .err()
@@ -750,60 +756,51 @@ async fn any_writable_mount_refuses_while_an_owner_assign_bracket_is_open() {
 /// OWNERS refuses the mount loud and moves the must-stay-0
 /// `xv_cross_owner_intents` counter — it is reachable-by-bug (M1 is what
 /// keeps it 0), never rolled forward by a node that owns half of it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+///
+/// The intent is produced by the REAL path — a genuine cross-volume
+/// unlink severed at its commit-boundary seam after step 0 — because a
+/// hand-planted record would prove the refusal reads a record, not that
+/// the shape one ordinary `rm` produces is the shape that refuses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cross_owner_open_intent_refuses_the_partial_mount() {
-    use squeezefs::meta_backend::crossvol_tx::{intent_name, IntentRecord, XvOp, XvStep};
     let dir = TempDir::new().unwrap();
     let (vol0, vol1) = two_volume_set(dir.path(), "xv-cross").await;
     let (id0, id1) = (vol_id(&vol0).await, vol_id(&vol1).await);
-    store_set(&vol0, &own_set()).await;
+    let uris = vec![vol0.display().to_string(), vol1.display().to_string()];
+
+    {
+        let routed = squeezefs::meta_backend::open_routed_meta_set(&uris)
+            .await
+            .expect("an ordinary write mount builds the fixture");
+        let parent = mkdir_on(&routed, 1, 0, "xv").await;
+        let (child, name) = mkfile_on(&routed, parent, 1, "xv").await;
+        assert_ne!(
+            routed.route_ino(parent).0,
+            routed.route_ino(child).0,
+            "the fixture must produce a CROSS-volume unlink"
+        );
+        // Window 2: the parent-side commit (which CARRIES the intent) is
+        // durable, the child-side nlink step is not — a dead process, not
+        // a device error.
+        squeezefs::meta_backend::crossvol_tx::TEST_XV_SEAM_AFTER_STEPS.store(2, Ordering::Relaxed);
+        let _ = routed.unlink(parent, &name).await;
+        squeezefs::meta_backend::crossvol_tx::TEST_XV_SEAM_AFTER_STEPS.store(0, Ordering::Relaxed);
+        for vol in &routed.volumes {
+            vol.shutdown().await.expect("release the fixture's guards");
+        }
+    }
+
     let claim = foreign_claim();
+    store_set(&vol0, &own_set()).await;
     store_set(&vol1, &peer_owned_set(&claim, true)).await;
     plant(&vol1, &claim, false).await;
 
-    // A plan whose first step homes on OUR volume (ino 1 → slot 0) and
-    // whose second homes on the PEER's: the shape one ordinary `rm`
-    // produced before M1 existed.
-    let peer_ino = squeezefs::meta_backend::make_global_ino_width(
-        1,
-        7,
-        u64::from(squeezefs::meta_backend::DERIVED_ROUTING_WIDTH),
-    );
-    let rec = IntentRecord {
-        tx_id: 0x5151_5151_5151_5151,
-        op: XvOp::Unlink,
-        steps: vec![
-            XvStep::RemoveDentry {
-                parent: 1,
-                name: "victim".to_string(),
-                expect_child: peer_ino,
-                parent_update: 0,
-            },
-            XvStep::SetNlink {
-                ino: peer_ino,
-                pre: 1,
-                post: 0,
-                ctime: None,
-            },
-        ],
-    };
-    {
-        let be = KvMetaBackend::open(&vol0).await.expect("intent open");
-        be.setxattr_internal(1, &intent_name(rec.tx_id), &rec.encode().unwrap())
-            .await
-            .expect("plant the intent");
-        be.sync_device().await.expect("barrier");
-        be.shutdown().await.expect("release");
-    }
-
     let admission = set_authority_admission(&vol0, &id0, &vol1, &id1, Some(&claim));
     let before = METRICS.xv_cross_owner_intents.load(Ordering::Relaxed);
-    let err = squeezefs::meta_backend::open_routed_meta_set_partial(
-        &[vol0.display().to_string(), vol1.display().to_string()],
-        &admission,
-    )
-    .await
-    .expect_err("an intent spanning two owners must refuse the mount");
+    let err = squeezefs::meta_backend::open_routed_meta_set_partial(&uris, &admission)
+        .await
+        .err()
+        .expect("an intent spanning two owners must refuse the mount");
     assert!(
         err.to_string().contains("two metadata OWNERS"),
         "the refusal must say what makes the intent unrecoverable here: {err}"
@@ -813,6 +810,48 @@ async fn a_cross_owner_open_intent_refuses_the_partial_mount() {
         before + 1,
         "xv_cross_owner_intents is the must-stay-0 tripwire M1 exists to hold at zero"
     );
+}
+
+/// A directory under `parent` whose ino routes to `want_vol` (the
+/// crossvol suite's helper — placement is a health round-robin, so the
+/// fixture asks for the volume it needs rather than hoping).
+async fn mkdir_on(
+    routed: &squeezefs::meta_backend::RoutedMetaBackend,
+    parent: u64,
+    want_vol: usize,
+    tag: &str,
+) -> u64 {
+    for i in 0..64 {
+        let ino = routed
+            .create(parent, &format!("{tag}_d{i}"), libc::S_IFDIR | 0o755, 0, 0)
+            .await
+            .expect("mkdir")
+            .ino;
+        if routed.route_ino(ino).0 == want_vol {
+            return ino;
+        }
+    }
+    panic!("directory striping never placed a directory on volume {want_vol}");
+}
+
+async fn mkfile_on(
+    routed: &squeezefs::meta_backend::RoutedMetaBackend,
+    parent: u64,
+    want_vol: usize,
+    tag: &str,
+) -> (u64, String) {
+    for i in 0..64 {
+        let name = format!("{tag}_f{i}");
+        let ino = routed
+            .create(parent, &name, libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .expect("create")
+            .ino;
+        if routed.route_ino(ino).0 == want_vol {
+            return (ino, name);
+        }
+    }
+    panic!("inode placement never minted a file on volume {want_vol}");
 }
 
 /// Sweep rows 3/4/18 plus KD-PV-17's publisher: a healthy partial mount

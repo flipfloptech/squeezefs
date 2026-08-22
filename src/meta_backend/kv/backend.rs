@@ -1496,17 +1496,11 @@ impl KvMetaBackend {
         }
     }
 
-    /// The durable per-volume identity every per-volume admission mode is
-    /// keyed on (KD-5: *never a path, an ordinal, or a set position*).
-    ///
-    /// Derived from this volume's **superblock uuid** — the sole durable
-    /// per-volume identity a mount can read before any tree is routed
-    /// (AGENTS.md §Filesystem generation identity; the `meta_volumes`
-    /// config record is a documented MIRROR and is absent or synthesized
-    /// on sets the lifecycle verbs never touched). Rendered in the house
-    /// `vol-{16 hex}` style so operator output is one shape.
+    /// This volume's durable `vol-{hex}` identity — see
+    /// [`durable_volume_id_of`], which the mount path calls over the
+    /// discovery's uuids before any backend exists.
     pub fn durable_volume_id(&self) -> String {
-        format!("vol-{:016x}", xxhash_rust::xxh3::xxh3_64(&self.sb.uuid))
+        durable_volume_id_of(&self.sb.uuid)
     }
 
     /// Whether this volume withholds mutations, and why.
@@ -3433,6 +3427,29 @@ impl KvMetaBackend {
     /// kill-9 skips both by construction: the claim is reclaimed by the
     /// dead-pid proof / TTL, the reservation by the successor's preempt.
     pub async fn shutdown(&self) -> std::result::Result<(), KvError> {
+        // A mount with NO local metadata authority over this volume
+        // (reader / co-writer / peer-owned) writes nothing at teardown
+        // either. Without this arm the `else` branch below — taken exactly
+        // when no checkpoint task exists, which is precisely these three
+        // postures — would run `checkpoint_now()` and WRITE to a volume
+        // whose whole contract is that it does not: the S5 reader's
+        // *"this mount cannot and will not write"*, S9's co-writer, and
+        // per-volume claim admission's own law that a `Peer`-mode
+        // backend's shutdown is a NO-OP because it took nothing (§5.4's
+        // rollback ladder). §4.11's unknown-ro degradation keeps its
+        // shipped path: it is a WRITE mount holding Layer A, and its
+        // replay residue is its own to make durable.
+        if matches!(
+            self.ro_cause,
+            ReadOnlyCause::ReaderMount
+                | ReadOnlyCause::CoWriterMount
+                | ReadOnlyCause::PeerOwnedVolume
+        ) {
+            self.shutting_down.store(true, Ordering::Release);
+            self.ring.wake_parked();
+            self.ckpt_wake.notify_waiters();
+            return Ok(());
+        }
         // PR M6: make parked pending-times refinements durable while the
         // write gate is still open (best-effort — they are µs-grade time
         // polish; a failing volume loses them like a kill-9 would).
@@ -3783,6 +3800,23 @@ pub(crate) fn pid_provably_dead(pid: u32) -> bool {
     // SAFETY: signal 0 probes process existence without delivering.
     let rc = unsafe { libc::kill(pid as i32, 0) };
     rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// The durable per-volume identity every per-volume admission mode is
+/// keyed on (KD-5: *never a path, an ordinal, or a set position*).
+///
+/// Derived from the volume's **superblock uuid** — the sole durable
+/// per-volume identity a mount can read before any tree is routed
+/// (AGENTS.md §Filesystem generation identity), and the one
+/// `MetaSetDiscovery` already carries in canonical order. Rendered in the
+/// house `vol-{16 hex}` style so the operator surface is one shape.
+///
+/// The `meta_volumes` FormatConfig record also carries a `vol-{hex}` id,
+/// but it is a documented MIRROR: absent on sets the lifecycle verbs never
+/// touched and synthesized as `meta-pos-N` by `config_ops`, so keying
+/// admission on it would key it on a position after all.
+pub fn durable_volume_id_of(sb_uuid: &[u8; 16]) -> String {
+    format!("vol-{:016x}", xxhash_rust::xxh3::xxh3_64(sb_uuid))
 }
 
 /// The Layer B2 mount-gate classification of the replayed claim evidence.

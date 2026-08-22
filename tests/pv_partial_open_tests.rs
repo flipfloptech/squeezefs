@@ -1206,3 +1206,131 @@ async fn lookup_child(
         .expect("lookup")
         .map(|(ino, _)| ino)
 }
+
+// ---------------------------------------------------------------------------
+// §5.1.3 + sweep rows 14/15 — the two postures, and per-VOLUME revalidation
+// arming (risk R18: a set authority latches NEITHER latch)
+// ---------------------------------------------------------------------------
+
+/// Restores the process-global posture whatever a case does to it.
+struct PostureGuard;
+
+impl Drop for PostureGuard {
+    fn drop(&mut self) {
+        squeezefs::fuse_client::set_mount_posture(squeezefs::fuse_client::MountPosture::Writer);
+    }
+}
+
+/// §5.1.3's latch table, in full. `PARTIAL_META` is ADDITIVE — every
+/// data-plane consumer of `read_only_mount()` / `co_writer_mount()` keeps
+/// its exact meaning — and the two new postures differ from each other in
+/// exactly the co-writer latch, which is what gives a set authority a
+/// `writer`-identical data plane and a partial authority a co-writer one.
+#[test]
+fn the_two_new_postures_latch_exactly_what_the_table_says() {
+    use squeezefs::fuse_client::{
+        co_writer_mount, mount_posture, partial_meta_mount, read_only_mount, set_mount_posture,
+        MountPosture,
+    };
+    let _restore = PostureGuard;
+    for (posture, ro, cw, pm, word) in [
+        (MountPosture::Writer, false, false, false, "writer"),
+        (MountPosture::Reader, true, false, false, "reader"),
+        (MountPosture::CoWriter, false, true, false, "co-writer"),
+        (
+            MountPosture::SetAuthority,
+            false,
+            false,
+            true,
+            "set-authority",
+        ),
+        (
+            MountPosture::PartialAuthority,
+            false,
+            true,
+            true,
+            "partial-authority",
+        ),
+    ] {
+        set_mount_posture(posture);
+        assert_eq!(read_only_mount(), ro, "{word}: READ_ONLY latch");
+        assert_eq!(co_writer_mount(), cw, "{word}: CO_WRITER latch");
+        assert_eq!(partial_meta_mount(), pm, "{word}: PARTIAL_META latch");
+        assert_eq!(mount_posture(), posture, "{word}: posture round-trip");
+        assert_eq!(mount_posture().as_str(), word);
+    }
+}
+
+/// **Sweep row 15 / risk R18** — the arming predicate is per VOLUME, not
+/// per mount, and it is derived from each volume's own cause rather than
+/// from a process latch. A set authority latches neither `READ_ONLY` nor
+/// `CO_WRITER`, so the shipped `if reader_mount || co_writer` site skipped
+/// it entirely — and it holds K−1 peer-owned volumes whose node caches
+/// would then never step an epoch, serving its mount-time read for ever
+/// and never running the R-6 purge, on the node that coordinates
+/// maintenance and homes ino 1.
+#[test]
+fn revalidation_arms_over_the_volumes_a_mount_does_not_append_to() {
+    use squeezefs::meta_backend::kv::backend::ReadOnlyCause as C;
+    // The selector answers the four causes exactly: a volume this mount
+    // APPENDS to is never armed (arming one trips
+    // `meta_kv_revalidate_dirty_skips`, a must-stay-0 counter), and the
+    // §4.11 degradation is not a coherence posture at all — it is a WRITE
+    // mount holding Layer A whose volume has no other appender.
+    assert!(squeezefs::ro_coherence::volume_wants_revalidation(
+        C::ReaderMount
+    ));
+    assert!(squeezefs::ro_coherence::volume_wants_revalidation(
+        C::CoWriterMount
+    ));
+    assert!(squeezefs::ro_coherence::volume_wants_revalidation(
+        C::PeerOwnedVolume
+    ));
+    assert!(!squeezefs::ro_coherence::volume_wants_revalidation(
+        C::Writable
+    ));
+    assert!(!squeezefs::ro_coherence::volume_wants_revalidation(
+        C::UnknownRoFeatureBits
+    ));
+}
+
+/// Both arming pins of the PR row, on real mounts: a partial authority and
+/// a SET authority each arm revalidation over their peer-owned subset and
+/// nothing else, and `meta_kv_revalidate_dirty_skips` — the tripwire that
+/// fires when a mount arms a volume it appends to — stays 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_partial_and_a_set_authority_arm_revalidation_on_peer_volumes_only() {
+    let dir = TempDir::new().unwrap();
+    let (vol0, vol1) = two_volume_set(dir.path(), "reval").await;
+    let (id0, id1) = (vol_id(&vol0).await, vol_id(&vol1).await);
+    let uris = vec![vol0.display().to_string(), vol1.display().to_string()];
+    let claim = foreign_claim();
+    store_set(&vol0, &own_set()).await;
+    store_set(&vol1, &peer_owned_set(&claim, true)).await;
+    plant(&vol1, &claim, false).await;
+
+    let admission = set_authority_admission(&vol0, &id0, &vol1, &id1, Some(&claim));
+    let routed = squeezefs::meta_backend::open_routed_meta_set_partial(&uris, &admission)
+        .await
+        .expect("the set authority's partial mount");
+    let wants: Vec<bool> = routed
+        .volumes
+        .iter()
+        .map(|v| squeezefs::ro_coherence::volume_wants_revalidation(v.read_only_cause()))
+        .collect();
+    assert_eq!(
+        wants,
+        vec![false, true],
+        "a set authority must arm revalidation over its PEER-OWNED subset and nothing else \
+         (R18) — it appends to volume 0"
+    );
+    assert_eq!(
+        squeezefs::meta_backend::kv::revalidate::revalidation_stats().dirty_skips,
+        0,
+        "meta_kv_revalidate_dirty_skips is the tripwire for arming a volume this mount \
+         appends to"
+    );
+    for vol in &routed.volumes {
+        vol.shutdown().await.expect("release");
+    }
+}

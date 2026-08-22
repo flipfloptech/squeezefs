@@ -238,6 +238,23 @@ impl SetAdmission {
                 .all(|v| paths.iter().any(|p| Path::new(p) == v))
     }
 
+    /// The volume paths this decision was taken over — named in the
+    /// cross-set refusal, exactly as `CoWriterAdmission::volumes` is.
+    pub fn volumes(&self) -> &[PathBuf] {
+        &self.volumes
+    }
+
+    /// `true` ⇔ this decision was taken over a set containing `path`.
+    ///
+    /// The per-volume half of [`Self::covers`]: the open takes one volume
+    /// at a time, and the whole-set check has already run by then. A path
+    /// the decision never saw is refused rather than opened on the
+    /// strength of a vol id it happens to name (the `open_co_writer`
+    /// precedent, one grain finer).
+    pub fn covers_path(&self, path: &Path) -> bool {
+        self.volumes.iter().any(|v| v == path)
+    }
+
     /// What this mount does with the volume of DURABLE id `vol_id`.
     /// `None` = this decision does not name that volume, which the open
     /// must read as a refusal, never as a default.

@@ -5330,6 +5330,24 @@ pub struct Metrics {
     /// through `meta_ship`, i.e. S8's "the daemon is not switched onto the
     /// router" gap reaching a real workload.
     pub cowriter_local_commit_refusals: Align64<AtomicU64>,
+    // Per-volume claim admission (`docs/design-per-volume-claim-admission.md`
+    // §11.1): the two top-level counters of the partial-writer open. Both
+    // are 0 on every shipped mount, because the posture is opt-in twice
+    // over and nothing selects it until PR 5.
+    /// LOCAL metadata commits refused on a **peer-owned** volume — the
+    /// mutations that reached the backend's write gate instead of the
+    /// shipped path. **MUST STAY 0**: distinct from
+    /// `cowriter_local_commit_refusals` because a partial authority DOES
+    /// hold metadata authority (over the volumes it owns), so the two
+    /// classes name different bugs and folding them would rot both.
+    pub peer_volume_local_commit_refusals: Align64<AtomicU64>,
+    /// Mount-open refusals because a volume's ASSIGNED peer owner is not
+    /// claiming it — dead, never started, or a stale assignment (§5.1.1's
+    /// `Peer` + `Reclaimable`/`StaleForeign` rows). **Nonzero is a dead
+    /// owner and a fleet-wide stop** (risk R13's operational face:
+    /// ownership does not fail over, so the repair is the offline
+    /// `squeezefs volume set-owners`).
+    pub peer_volume_unclaimed_refusals: Align64<AtomicU64>,
     // DLM **S6** (pre-RC spec §6.5 item 3, §6.9 S6): the membership plane.
     // Liveness is RAM state renewed over `cluster_wire`, so these are the
     // instruments that say so — the gauges (`membership_mode`,

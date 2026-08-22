@@ -1323,6 +1323,192 @@ impl KvMetaBackend {
         Ok(be)
     }
 
+    /// **Per-volume claim admission — open one volume a PEER authority of
+    /// this set appends to** (`docs/design-per-volume-claim-admission.md`
+    /// §5.1, PR 4; the decision is
+    /// [`crate::partial_authority::classify_set_admission`]).
+    ///
+    /// The THIRD door beside [`Self::open`] and [`Self::open_co_writer`],
+    /// and like the second it is a door rather than a hole: `open`'s
+    /// Layer-A flock, its `FreshForeign` refusal and its whole B1/B2
+    /// ladder are byte-identical to what they were, and a mount that has
+    /// not passed the seven-rung ladder cannot reach this function at all
+    /// (a [`crate::partial_authority::SetAdmission`] is unforgeable).
+    ///
+    /// | Step of [`Self::open`] | Peer-owned |
+    /// |---|---|
+    /// | Layer A `flock(LOCK_EX)` | **not taken** — a retained lock would deny the volume's OWNER its `LOCK_EX` on a shared host. The released `LOCK_SH` probe runs for classification only |
+    /// | DUR-5 primary-superblock repair | **skipped** — it WRITES sector 0, which is the owner's business |
+    /// | Bootstrap replay | same, verbatim (read-only by construction) |
+    /// | Layer B2 claim classification | **evaluated, through the `PeerAuthority` arm**: the claim must be the ADMITTED holder's, resolved to a durable member id by the volume's own attestation. A fresh claim from anyone else, no claim at all, or a TTL-stale one all refuse (§5.1.1's `Peer` column) |
+    /// | Layer B1 PR register + WEX acquire | **not performed** — a WEX acquire would preempt the owner |
+    /// | `writer_claim` commit + barrier | **never written** |
+    /// | checkpoint + times-drain tasks | **not spawned** (both write) |
+    ///
+    /// What the mount path must still do (PR 5): derive the ownership map
+    /// so this volume's verbs SHIP, and arm revalidation over it so the
+    /// snapshot tracks its owner's checkpoints (sweep row 15).
+    pub async fn open_peer_owned(
+        path: &Path,
+        admission: &crate::partial_authority::SetAdmission,
+        vol_id: &str,
+    ) -> std::result::Result<Arc<Self>, KvError> {
+        if !admission.covers_path(path) {
+            return Err(KvError::Corrupt(format!(
+                "{}: refusing a peer-owned open under an admission decided over a DIFFERENT \
+                 volume set ({:?}). The ladder's evidence is per-set — bit 14 and a durable \
+                 claim set on EVERY volume, one assignment map, one set authority — so an \
+                 admission may never be carried across sets",
+                path.display(),
+                admission.volumes()
+            )));
+        }
+        let admitted_holder = match admission.mode_for(vol_id) {
+            Some(crate::partial_authority::VolumeMode::Peer { owner_id, .. }) => owner_id.clone(),
+            Some(crate::partial_authority::VolumeMode::Own) => {
+                return Err(KvError::Corrupt(format!(
+                    "{}: the admission decided this volume is this node's OWN — it must run \
+                     the full D0 ladder (Layer A + B1 + the claim commit + the checkpoint \
+                     task), never the peer door, or the set would have a volume no node \
+                     appends to",
+                    path.display()
+                )));
+            }
+            None => {
+                return Err(KvError::Corrupt(format!(
+                    "{}: the admission does not name volume {vol_id}. A volume a decision \
+                     does not cover is a REFUSAL, never a default: opening it either way \
+                     would be an ownership guess",
+                    path.display()
+                )));
+            }
+        };
+        match Self::probe_shared_lock(path) {
+            SharedProbe::LocalExclusiveHolder => log::info!(
+                "meta volume {}: peer-owned open — a LOCAL exclusive holder (its owner's write \
+                 mount on this host, or a guarded offline verb) holds this volume; this mount \
+                 takes no lock and refuses nothing",
+                path.display()
+            ),
+            SharedProbe::NoLocalExclusiveHolder => log::info!(
+                "meta volume {}: peer-owned open — no local exclusive holder (its owner is on \
+                 another host)",
+                path.display()
+            ),
+            SharedProbe::Unknown => {}
+        }
+        let mut inner = Self::open_inner(path).await?;
+        inner.read_only = true;
+        inner.ro_cause = ReadOnlyCause::PeerOwnedVolume;
+        let be = Arc::new(inner);
+        // PR M7: no local commit can ever run here, but the conveyor
+        // identity is part of construction (a commit without it fails
+        // loud, never UB).
+        let _ = be.conveyor_self.set(Arc::downgrade(&be));
+
+        // Layer B2, through the per-volume arm: the claim on this volume
+        // must belong to the durable identity the admission admitted.
+        let raw = be
+            .getxattr(1, WRITER_CLAIM_XATTR)
+            .await
+            .map_err(KvError::Io)?;
+        let set = crate::membership::ClaimSet::load(&be).await;
+        let witness = PeerAuthorityWitness {
+            admitted_holder: &admitted_holder,
+            claim_set: set.as_ref().filter(|s| s.durable),
+        };
+        match be.classify_claim(raw, unix_now_secs(), Some(&witness)) {
+            ClaimEvidence::PeerAuthority(claim) => {
+                be.trace_guard_event("peer_owned_admitted");
+                log::warn!(
+                    "meta volume {} ({vol_id}): mounted PEER-OWNED — '{admitted_holder}' \
+                     appends to it under writer_claim '{}' (era {}). No flock, no \
+                     writer_claim, no metadata-namespace reservation, no checkpoint task: \
+                     this mount holds metadata authority over the volumes it OWNS and ships \
+                     every mutation of this one. Guarantee class: {}",
+                    path.display(),
+                    claim.id,
+                    claim.term,
+                    be.writer_guard_mode()
+                );
+                Ok(be)
+            }
+            ClaimEvidence::FreshForeign(claim) => {
+                let seen = set
+                    .as_ref()
+                    .and_then(|s| s.resolve_holder(&claim))
+                    .map(str::to_string);
+                Err(KvError::Busy(match seen {
+                    Some(seen) => format!(
+                        "{} ({vol_id}): the live writer_claim is held by '{seen}', but this \
+                         mount's admission decided '{admitted_holder}' appends here. \
+                         Assignment and evidence DISAGREE, so the ownership map fails closed \
+                         (§5.10): shipping this volume's verbs to a node the record does not \
+                         entitle would make it an appender nobody assigned. Re-assign offline \
+                         (`squeezefs volume set-owners`), or stop the holder",
+                        path.display()
+                    ),
+                    None => format!(
+                        "{} ({vol_id}): the live writer_claim (id={}, pid={}, boot={}) could \
+                         not be resolved to a durable member id — the claim's own id is a \
+                         per-mount uuid and this volume's claim_set carries no matching \
+                         holder attestation. An unresolvable holder is SILENCE, and ownership \
+                         never moves on silence (KD-PV-3): this mount would be shipping every \
+                         verb for the volume to a node it cannot name. Remount its owner \
+                         (which attests itself at its own open), or re-assign offline",
+                        path.display(),
+                        claim.id,
+                        claim.pid,
+                        claim.boot
+                    ),
+                }))
+            }
+            ClaimEvidence::Reclaimable => {
+                crate::fuse_client::METRICS
+                    .peer_volume_unclaimed_refusals
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(KvError::Busy(format!(
+                    "{} ({vol_id}): the assignment names peer '{admitted_holder}' as this \
+                     volume's owner, but NOTHING claims it — that owner is dead, was never \
+                     started, or the assignment is stale. This mount is not the assignee, so \
+                     it must not take the claim; and it must not serve a set with a volume no \
+                     node appends to. Start the owner, or re-assign offline with `squeezefs \
+                     volume set-owners` (`squeezefs volume get-owners` prints assignment \
+                     beside evidence)",
+                    path.display()
+                )))
+            }
+            ClaimEvidence::StaleForeign(claim) => {
+                crate::fuse_client::METRICS
+                    .peer_volume_unclaimed_refusals
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(KvError::Busy(format!(
+                    "{} ({vol_id}): the assigned owner '{admitted_holder}' left a TTL-stale \
+                     writer_claim{}. A partial writer must NEVER preempt a peer's claim — \
+                     preempting would make it the appender of a volume it is not assigned, \
+                     which is the one thing per-volume admission exists to prevent. Start \
+                     that owner, or re-assign the volume offline (`squeezefs volume \
+                     set-owners`)",
+                    path.display(),
+                    holder_suffix(&claim.map(|c| (c, unix_now_secs())))
+                )))
+            }
+        }
+    }
+
+    /// The durable per-volume identity every per-volume admission mode is
+    /// keyed on (KD-5: *never a path, an ordinal, or a set position*).
+    ///
+    /// Derived from this volume's **superblock uuid** — the sole durable
+    /// per-volume identity a mount can read before any tree is routed
+    /// (AGENTS.md §Filesystem generation identity; the `meta_volumes`
+    /// config record is a documented MIRROR and is absent or synthesized
+    /// on sets the lifecycle verbs never touched). Rendered in the house
+    /// `vol-{16 hex}` style so operator output is one shape.
+    pub fn durable_volume_id(&self) -> String {
+        format!("vol-{:016x}", xxhash_rust::xxh3::xxh3_64(&self.sb.uuid))
+    }
+
     /// Whether this volume withholds mutations, and why.
     pub fn read_only_cause(&self) -> ReadOnlyCause {
         self.ro_cause
@@ -3522,6 +3708,17 @@ pub enum ReadOnlyCause {
     /// unlike a reader its refusal points at the shipped publish path
     /// rather than at a mount option.
     CoWriterMount,
+    /// **Per-volume claim admission** (§5.1.2): a PEER authority of this
+    /// same set appends to THIS volume, under an admission decided before
+    /// the open.
+    ///
+    /// Deliberately NOT [`ReadOnlyCause::CoWriterMount`]. A partial
+    /// authority *does* hold metadata authority — over the volumes it
+    /// owns — so the co-writer refusal's *"holds NO metadata authority
+    /// over it"* would be false, and folding the two would rot the
+    /// meaning of `cowriter_local_commit_refusals`, whose whole job is to
+    /// say that a co-writer's daemon surface is un-routed.
+    PeerOwnedVolume,
 }
 
 /// The reader's Layer-A classification (DLM S5). `flock(LOCK_SH)` is taken
@@ -3599,6 +3796,46 @@ enum ClaimEvidence {
     /// dead-pid-prove: PR volumes preempt it; non-PR volumes refuse
     /// (operator attestation only).
     StaleForeign(Option<WriterClaim>),
+    /// **Per-volume claim admission** (§5.1.1): a heartbeat-fresh claim
+    /// held by the node this volume's durable `claim_set` names as its
+    /// owner, opened under a [`crate::partial_authority::SetAdmission`]
+    /// taken BEFORE the open.
+    ///
+    /// Not a weakening of [`ClaimEvidence::FreshForeign`] — a different
+    /// door. It is produced only when a [`PeerAuthorityWitness`] is
+    /// passed, which only [`KvMetaBackend::open_peer_owned`] does, so
+    /// every other caller's classification is bit-identical.
+    PeerAuthority(WriterClaim),
+}
+
+/// What [`KvMetaBackend::classify_claim`]'s `PeerAuthority` arm recognizes
+/// a live holder by (§5.1.1's `recognizes`, with PR 3's correction).
+///
+/// `WriterClaim.id` is a per-mount uuid, so the recognition is against the
+/// holder's **durable** member id: the volume's own `claim_set` attests it
+/// ([`crate::membership::ClaimHolder`]), and the admission says which
+/// durable identity it decided was appending here. An unattested claim
+/// resolves to nothing and is therefore NOT recognized — silence refuses,
+/// it never adopts (KD-PV-3).
+struct PeerAuthorityWitness<'a> {
+    /// The durable member id the admission's `VolumeMode::Peer` names.
+    admitted_holder: &'a str,
+    /// The volume's durable claim set, as replayed at this very open.
+    claim_set: Option<&'a crate::membership::ClaimSet>,
+}
+
+impl PeerAuthorityWitness<'_> {
+    /// Is `claim` the claim of the durable identity this admission
+    /// admitted? Re-checked against the record actually replayed, never
+    /// against the gather's copy.
+    fn recognizes(&self, claim: &WriterClaim) -> bool {
+        self.claim_set
+            .and_then(|s| s.resolve_holder(claim))
+            .is_some_and(|holder| {
+                crate::membership::member_id_matches(holder, self.admitted_holder)
+                    || crate::membership::member_id_matches(self.admitted_holder, holder)
+            })
+    }
 }
 
 impl KvMetaBackend {
@@ -3751,7 +3988,17 @@ impl KvMetaBackend {
     }
 
     /// Classify the replayed claim evidence for the mount gate.
-    fn classify_claim(&self, raw: Option<Vec<u8>>, now: u64) -> ClaimEvidence {
+    ///
+    /// `witness` is `None` for every caller but the per-volume peer open
+    /// (§5.1.1): without it the freshness branch answers
+    /// [`ClaimEvidence::FreshForeign`] exactly as it always has, which is
+    /// the solo re-gate law (R12) expressed in one parameter.
+    fn classify_claim(
+        &self,
+        raw: Option<Vec<u8>>,
+        now: u64,
+        witness: Option<&PeerAuthorityWitness<'_>>,
+    ) -> ClaimEvidence {
         let Some(raw) = raw else {
             return ClaimEvidence::Reclaimable; // absent: first guard-aware mount claims it
         };
@@ -3780,7 +4027,13 @@ impl KvMetaBackend {
             return ClaimEvidence::Reclaimable;
         }
         if claim.age_secs(now) <= crate::fuse_client::CLIENT_STALE_TTL_SECS {
-            ClaimEvidence::FreshForeign(claim)
+            match witness {
+                Some(w) if w.recognizes(&claim) => ClaimEvidence::PeerAuthority(claim),
+                // Byte-identical to the pre-program arm — including for a
+                // witness that does NOT recognize the holder, which is
+                // §5.10's fail-closed direction rather than a new class.
+                _ => ClaimEvidence::FreshForeign(claim),
+            }
         } else {
             ClaimEvidence::StaleForeign(Some(claim))
         }
@@ -3816,7 +4069,9 @@ impl KvMetaBackend {
             .and_then(WriterClaim::decode)
             .map(|c| c.term)
             .unwrap_or(0);
-        let evidence = self.classify_claim(raw, now);
+        // The D0 write mount never passes a witness: `PeerAuthority` is
+        // structurally unreachable from this gate (R12).
+        let evidence = self.classify_claim(raw, now, None);
 
         match (&evidence, &self.reservations) {
             // Fresh foreign holders refuse on every substrate — the PR
@@ -3850,6 +4105,15 @@ impl KvMetaBackend {
                      claim is never auto-taken",
                     self.path.display(),
                     named,
+                )));
+            }
+            // Unreachable without a witness, and a witness is only ever
+            // built by the peer-owned open, which does not run this gate.
+            (ClaimEvidence::PeerAuthority(c), _) => {
+                return Err(KvError::Corrupt(format!(
+                    "{}: the D0 write gate classified a claim held by '{}' as a PEER                      AUTHORITY's — the per-volume admission arm reached the single-writer                      ladder, which must never happen (R12: it is a different door, not a                      hole in this one)",
+                    self.path.display(),
+                    c.id
                 )));
             }
             // Stale foreign WITH enforcement: B1's preempt arbitrates
@@ -4220,6 +4484,14 @@ impl KvMetaBackend {
         // grant plus the data namespaces' WERO registration.
         if self.ro_cause == ReadOnlyCause::CoWriterMount {
             return "co-writer";
+        }
+        // Per-volume claim admission (§11.1): the same cause-not-lock-state
+        // reasoning again. A partial authority shows a MIX of rows across
+        // the set — uniform `peer-owned` means the node owns nothing and
+        // should be mounted as a co-writer, which the ladder's rung 3
+        // refuses on its behalf.
+        if self.ro_cause == ReadOnlyCause::PeerOwnedVolume {
+            return "peer-owned";
         }
         let guarded = self.guard_fd.lock().unwrap().is_some();
         match (guarded, &self.reservations) {
@@ -5003,6 +5275,35 @@ impl KvMetaBackend {
                          (`meta_ship::publish` / the S8 metadata verbs) rather than commit \
                          here; a surface that reached this gate is one the daemon has not yet \
                          routed (cowriter_local_commit_refusals)",
+                        self.path.display()
+                    ))
+                }
+                // Per-volume claim admission (§5.1.2): the mutation is not
+                // FORBIDDEN, it is ROUTED — to a PEER of this same set,
+                // not to "the authority", because this mount IS an
+                // authority for the volumes it owns. Counted apart from
+                // the co-writer class so neither counter's meaning rots.
+                ReadOnlyCause::PeerOwnedVolume => {
+                    crate::fuse_client::METRICS
+                        .peer_volume_local_commit_refusals
+                        .fetch_add(1, Ordering::Relaxed);
+                    // Must-stay-0, so what matters when it moves is WHICH
+                    // surface reached the gate (the S8-b capture's
+                    // reasoning, verbatim: callers absorb the error).
+                    log::error!(
+                        "peer_volume_local_commit_refusals: an un-routed daemon surface \
+                         reached the peer-owned write gate on {} — a metadata mutation on a \
+                         volume a PEER appends to must SHIP. Backtrace:\n{}",
+                        self.path.display(),
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                    crate::error::SqueezefsError::InvalidOperation(format!(
+                        "metadata mutation on meta volume {} refused: this volume is appended \
+                         to by a PEER authority of this set — its journal ring, extent bitmap \
+                         and root ledger have exactly one appender, and it is not this mount. \
+                         Mutations must SHIP (`meta_ship`'s verbs / `meta_ship::publish`) \
+                         rather than commit here; this mount commits locally on the volumes it \
+                         OWNS (peer_volume_local_commit_refusals)",
                         self.path.display()
                     ))
                 }

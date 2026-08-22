@@ -33,9 +33,14 @@
 //! The ladder is **pure**: it opens nothing, reads no environment and
 //! mutates nothing. Producing the evidence — the probe opens, the D0
 //! classification, a peer volume's checkpoint-consistent projection, the
-//! durable identity of a live claim holder — is the mount path's job, and
-//! the partial open that consumes the decision is PR 4. Nothing calls this
-//! from `main` yet.
+//! durable identity of a live claim holder — is the mount path's job
+//! ([`gather_set_admission`]), the open that consumes the decision is PR
+//! 4's `open_routed_meta_set_partial`, and each posture's ARM is PR 7b's:
+//! `multi_writer::arm_multi_writer` for a set authority,
+//! `multi_writer::arm_partial_authority` for a partial one. What still
+//! refuses on every set in the field is rung 2/3 — an UNASSIGNED set has
+//! no durable basis for either posture, and the remedy they name is the
+//! offline `squeezefs volume set-owners` verb.
 //!
 //! # Two identities, and the one this ladder decides over
 //!
@@ -69,7 +74,7 @@
 //! | `routing::free_block` / `free_blocks` | terminal frees: ship vs local ladder | **correct**: runs the whole ladder locally (begin_free → purge → reclaim → finish_free) | **correct**: ships `PublishCall::FreeBlocks`, which is what keeps exactly one grace ring in the fleet |
 //! | the three W1 patch declines (`fuse_client`, dd + handler + in-place overwrite) | the sole-owner in-place patch | **correct**: it patches, and R14's cost is precisely that only it does | **correct**: a lifetime incarnation retire is durable ownership state and the §5.1 clone/patch fence is process-local — no wire composes it, so it rides CoW-rewrite + a shipped free (R14, priced not hidden) |
 //! | `ro_coherence::arm_reader_data_plane` (the mount arming site) | the reader data-plane lockdown | **correct**: NOT armed — a set authority's data plane is `writer`'s | **correct**: armed, as for a co-writer |
-//! | `main`'s fleet-worker arm (`reader_mount \|\| co_writer_mount`) | whether this mount can be LEASED an fsck shard | **correct**: does not arm one — it is the coordinator (KD-PV-14) and runs its own shard through the local path | **correct**: arms one, which is what KD-PV-16's owner-shard fan-out leases |
+//! | `main`'s fleet-worker arm (`reader_mount \|\| mw_client_mount`) | whether this mount can be LEASED an fsck shard | **correct**: does not arm one — it is the coordinator (KD-PV-14) and runs its own shard through the local path | **correct**: arms one, which is what KD-PV-16's owner-shard fan-out leases. **The predicate was `co_writer_mount` — the LOCAL variable, false for this posture — until PR 7b swept it**, so the row described an intent the code did not have |
 //!
 //! Two consumers are NOT `co_writer_mount()`'s and are listed because the
 //! same audit question applies: every `read_only_mount()` site keeps its

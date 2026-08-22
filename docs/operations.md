@@ -1661,20 +1661,22 @@ regression can be attributed to a term instead of to "the network".
 
 ### Per-volume metadata owners (`squeezefs volume set-owners`)
 
-**Status: the verb ships; nothing uses it until an operator runs it — and one
-half of the fleet it enables is still landing.** A set with no owner records
-behaves exactly as it always has: one node holds every volume's claim,
-`meta_ship.armed` is false, and every record on disk is byte-identical to a set
-formatted before this feature existed. Running the verb is an explicit,
-offline, fleet-wide act. **On an assigned set today, the node that owns the
-slot-0 volume mounts as `set-authority`; a mount that owns a subset NOT
-including that volume refuses to arm, loudly, naming the set authority** — its
-own arming path (a custody lease from the set authority composed with an owner
-half over its own volumes) lands with the fleet rung that first runs it. So an
-assignment made now is durable, verifiable (`get-owners`, `locate`) and
-reversible (`--clear`), but a multi-node fleet cannot be stood up until that
-arm ships. Design: `docs/design-per-volume-claim-admission.md`; contracts
-`tests/pv_owner_verb_tests.rs`.
+**Status: the verb ships and both mount postures arm; nothing happens until an
+operator runs it.** A set with no owner records behaves exactly as it always
+has: one node holds every volume's claim, `meta_ship.armed` is false, and every
+record on disk is byte-identical to a set formatted before this feature
+existed. Running the verb is an explicit, offline, fleet-wide act. On an
+assigned set the node that owns the slot-0 volume mounts as `set-authority` and
+every other owner as `partial-authority` — the latter arms the client halves
+toward the set authority (its custody lease, the allocation lane that lease
+carries, the shipped publish path) composed with an owner half serving only the
+volumes it appends to. An assignment is durable, verifiable (`get-owners`,
+`locate`) and reversible (`--clear`). Design:
+`docs/design-per-volume-claim-admission.md`; contracts
+`tests/pv_owner_verb_tests.rs`, `tests/pv_partial_arm_tests.rs`. **Acceptance
+is not in yet**: the fleet rows (the `tar -x` gate, the cross-owner refusal
+table, the rewrite funnel) are the acceptance rung's, so treat a multi-owner
+fleet as unproven at scale until that evidence note lands.
 
 What it is: each metadata volume of a set gets a **durable owner** — the node
 that appends to it. One appender per volume never changes; what changes is that
@@ -1730,13 +1732,62 @@ squeezefs volume locate     sqmeta://<dev0>,<dev1> /projects/b
   lanes, serves the custody endpoint, owns the only freed-offset grace ring,
   coordinates maintenance jobs, and homes the filesystem root. The verb prints
   which node that is; mount it with `SQUEEZEFS_MW_ROLE=set-authority` and every
-  other owner with `SQUEEZEFS_MW_ROLE=partial-authority` — the second of which
-  refuses to arm until its own arming path lands (see the status note above).
+  other owner with `SQUEEZEFS_MW_ROLE=partial-authority`. **Mount order is not
+  optional** — see the bring-up sequence below.
 * **`--clear` is the rollback.** Offline, whole-set, and it restores the
   unassigned record byte-for-byte (the roster enrollment the assignment wrote
   is separate durable state and stays). The set then mounts as a single
   authority exactly as before. Subtree roots are ordinary directories and are
   left in place — deleting them is the operator's act.
+
+#### Bringing a multi-owner fleet up (the order, and why it is the order)
+
+Every node of the fleet exports the SAME multi-writer opt-in and the SAME set
+authority endpoint; only the role differs. The sequence is forced by the
+admission ladder, not by preference.
+
+```bash
+# --- on EVERY node, identically -------------------------------------------
+export SQUEEZEFS_MULTI_WRITER=1
+export SQUEEZEFS_MW_AUTHORITY=<set-authority-host>:7100   # its SQUEEZEFS_MW_BIND
+export SQUEEZEFS_MW_BIND=<this-host>:7100                 # a KNOWN port, not `auto`
+export SQUEEZEFS_MEMBERSHIP_BIND=<set-authority-host>:7200  # the owner's bind value
+export SQUEEZEFS_JOB_WIRE_BIND=<this-host>:0              # writes job:enroll, the trust root
+
+# --- 1. the SET AUTHORITY first (the owner of the slot-0 volume) ----------
+SQUEEZEFS_MW_ROLE=set-authority squeezefs mount sqmeta://<dev0>,<dev1> /mnt/sqz --daemon
+
+# --- 2. then each PARTIAL AUTHORITY ---------------------------------------
+SQUEEZEFS_MW_ROLE=partial-authority squeezefs mount sqmeta://<dev0>,<dev1> /mnt/sqz --daemon
+```
+
+1. **The set authority must be up first.** A partial authority's admission
+   rung 4 demands a LIVE membership lease, and the set authority is the
+   membership owner (D20) — so a partial authority cannot even open the set
+   before it. There is no ordering among the partial authorities themselves.
+2. **Bind a known port on every node** (`SQUEEZEFS_MW_BIND=<host>:<port>`, not
+   `auto`). Each owner publishes its endpoint in the claim-set record of the
+   volumes it owns at arm, and its peers resolve it from there; an ephemeral
+   port moves on every restart, so peers would keep dialling a dead address
+   until their own next remount.
+3. **The set authority learns its peers a moment after they arrive.** It
+   derives its ownership map before any peer exists (see 1), so its entries
+   for them carry no endpoint until each peer publishes one. It fills them in
+   on its membership renewal cadence; until then a verb about that peer's
+   volume refuses loudly at the ship site rather than guessing. Expect a short
+   window of such refusals during bring-up, and none afterwards.
+4. **Verify before you use it.** On every node: `mount_posture` reads
+   `set-authority` or `partial-authority`, `meta_ship.armed` is `true`,
+   `meta_ship.not_owner_refusals` and `meta_ship.owner_panics` are 0, and
+   `alloc_lane_writers` is the same width everywhere (rounded up to a power of
+   two over the fleet — see the capacity table). On a partial authority
+   `alloc_lane_shipped_reservations` grows and `alloc_lane_raise_refusals`
+   stays 0.
+5. **Take the fleet down in reverse**: partial authorities first, the set
+   authority last. A partial authority whose set authority has gone loses its
+   custody lease and self-fences at its own deadline; the volumes it owned then
+   have no appender and every mount of the set refuses until it returns
+   ([ownership does not fail over](#ownership-does-not-fail-over)).
 
 #### The namespace becomes owner-partitioned — read this before assigning
 

@@ -684,6 +684,51 @@ async fn a_kill_between_adjacent_volumes_resumes_idempotently() {
     }
 }
 
+/// The bracket's FIRST window: killed after the marker landed and before
+/// any record. Nothing is assigned, and yet the set is already closed to
+/// writable mounts — which is the property that makes "a half-assigned
+/// set is unreachable" true at every point of the run, not just between
+/// volumes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kill_right_after_the_marker_leaves_nothing_assigned_and_refuses_mounts() {
+    let dir = TempDir::new().unwrap();
+    let vols = two_volumes(dir.path(), "marker-window").await;
+    let (id0, id1) = (vol_id(&vols[0]).await, vol_id(&vols[1]).await);
+    let u = uris(&vols);
+    let specs = [spec(&id0, NODE_A, None), spec(&id1, NODE_B, None)];
+
+    config_ops::set_owners_with(
+        &u,
+        &specs,
+        &plain(),
+        &SetOwnersHooks {
+            crash_after: Some(SetOwnersCrash::AfterMarker),
+        },
+    )
+    .await
+    .expect_err("the crash seam fails the run");
+
+    assert!(marker_present(&vols[0]).await, "the bracket is open");
+    assert!(
+        owner_of(&vols[0]).await.is_none() && owner_of(&vols[1]).await.is_none(),
+        "and NOTHING was assigned in this window"
+    );
+    let mount_err = squeezefs::meta_backend::open_routed_meta_set(&u)
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("a writable mount must refuse on the marker alone"));
+    assert!(
+        mount_err.to_string().contains("set-owners"),
+        "naming the idempotent re-run: {mount_err}"
+    );
+
+    let report = config_ops::set_owners(&u, &specs, &plain())
+        .await
+        .expect("the re-run completes the act it started");
+    assert_eq!(report.records_written, 2);
+    assert!(!marker_present(&vols[0]).await);
+}
+
 /// `--clear` is the terminal state and the remedy the mismatch refusal
 /// names, so it must be able to SUPERSEDE an open bracket — otherwise an
 /// operator whose run crashed is told to finish the assignment they no

@@ -684,6 +684,51 @@ async fn a_kill_between_adjacent_volumes_resumes_idempotently() {
     }
 }
 
+/// `--clear` is the terminal state and the remedy the mismatch refusal
+/// names, so it must be able to SUPERSEDE an open bracket — otherwise an
+/// operator whose run crashed is told to finish the assignment they no
+/// longer want before they may undo it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_clear_supersedes_an_open_assignment_bracket() {
+    let dir = TempDir::new().unwrap();
+    let vols = two_volumes(dir.path(), "clear-supersedes").await;
+    let (id0, id1) = (vol_id(&vols[0]).await, vol_id(&vols[1]).await);
+    let u = uris(&vols);
+
+    config_ops::set_owners_with(
+        &u,
+        &[spec(&id0, NODE_A, None), spec(&id1, NODE_B, None)],
+        &plain(),
+        &SetOwnersHooks {
+            crash_after: Some(SetOwnersCrash::AfterVolume { volume: 0 }),
+        },
+    )
+    .await
+    .expect_err("the crash seam fails the run");
+    assert!(marker_present(&vols[0]).await);
+
+    let report = config_ops::set_owners(
+        &u,
+        &[],
+        &SetOwnersOptions {
+            clear: true,
+            ..SetOwnersOptions::default()
+        },
+    )
+    .await
+    .expect("--clear supersedes the open bracket");
+    assert_eq!(report.records_written, 2);
+    assert!(report.cleared);
+    assert!(!marker_present(&vols[0]).await, "and closes it");
+    assert!(owner_of(&vols[0]).await.is_none() && owner_of(&vols[1]).await.is_none());
+    let routed = squeezefs::meta_backend::open_routed_meta_set(&u)
+        .await
+        .expect("the set mounts again");
+    for vol in &routed.volumes {
+        vol.shutdown().await.expect("release");
+    }
+}
+
 /// The KD-PV-15 resumability window the design names explicitly: a kill
 /// between a subtree root's mint and its volume's owner record. The
 /// re-run ADOPTS the existing root (it does not mint a second one) and

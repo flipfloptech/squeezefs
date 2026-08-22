@@ -2863,7 +2863,22 @@ async fn set_owners_body(
                      completed or cleared by a binary that can read it"
                 ))
             })?;
-            if open != marker {
+            if open == marker {
+                true
+            } else if opts.clear {
+                // `--clear` is the terminal state, and it is the remedy
+                // the mismatch refusal below names: a set with no owners
+                // is the shipped shape, so it may always supersede a
+                // half-applied assignment rather than being refused into
+                // "complete the act you no longer want, then undo it".
+                log::warn!(
+                    "volume set-owners --clear: an ownership-assignment bracket was open on \
+                     this set naming [{}]; the clear SUPERSEDES it — every volume is \
+                     unassigned and the bracket closes on this run",
+                    act(&open)
+                );
+                false
+            } else {
                 let differing: Vec<String> = marker
                     .assignments
                     .iter()
@@ -2882,29 +2897,11 @@ async fn set_owners_body(
                      invocation would assign [{}] (differing: {}). Re-run the verb with \
                      exactly the open act's arguments to complete it, or with --clear to \
                      unassign the set",
-                    open.assignments
-                        .iter()
-                        .map(|a| format!(
-                            "{}={}",
-                            a.volume_id,
-                            a.owner.as_deref().unwrap_or("(unassigned)")
-                        ))
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                    marker
-                        .assignments
-                        .iter()
-                        .map(|a| format!(
-                            "{}={}",
-                            a.volume_id,
-                            a.owner.as_deref().unwrap_or("(unassigned)")
-                        ))
-                        .collect::<Vec<_>>()
-                        .join(" "),
+                    act(&open),
+                    act(&marker),
                     differing.join(", ")
                 )));
             }
-            true
         }
         None => false,
     };
@@ -3252,6 +3249,23 @@ async fn set_owners_body(
         roots_minted,
         members_enrolled: if opts.clear { 0 } else { members.len() },
     })
+}
+
+/// One assignment act, rendered the way both bracket messages name it:
+/// `vol-…=<owner>` per volume, in canonical order.
+fn act(marker: &OwnerAssignMarker) -> String {
+    marker
+        .assignments
+        .iter()
+        .map(|a| {
+            format!(
+                "{}={}",
+                a.volume_id,
+                a.owner.as_deref().unwrap_or("(unassigned)")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Two assignment entries name the same owner? A bare `node_{hex}` roster

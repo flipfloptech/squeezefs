@@ -184,6 +184,12 @@ pub mod nvmeof;
 // core — laws 1-3/6/9 as pure transitions, the §2.3 range-claim overlap
 // exclusion (the `placed_core` protocol reused), the §5.2 read words.
 pub mod overlay_core;
+// Per-volume claim admission (docs/design-per-volume-claim-admission.md
+// §5.1/§5.3, D18/D19/D20): the seven-rung ladder that decides, per volume,
+// whether this mount is the appender or a peer is — the co-writer ladder
+// EXTENDED, never forked. The decision is unforgeable and the partial open
+// that consumes it is the next rung of the program.
+pub mod partial_authority;
 pub(crate) mod patch_clone_core;
 pub(crate) mod placed_core;
 pub(crate) mod placed_sever;

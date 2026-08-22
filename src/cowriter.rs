@@ -165,6 +165,16 @@ pub enum MwRole {
     /// Metadata read-only locally (mutations shipped), data read-write
     /// under a granted custody lease.
     CoWriter,
+    /// Per-volume claim admission (`docs/design-per-volume-claim-admission.md`
+    /// §5.1.3, ruling **D20**): this mount appends to the volume hosting
+    /// slot 0 — so it is the SET AUTHORITY (lane assignment, the custody
+    /// endpoint, the one grace ring, maintenance coordination, ino 1) —
+    /// and ships its verbs for every volume a peer owns.
+    SetAuthority,
+    /// Per-volume claim admission: this mount appends to a SUBSET of the
+    /// set and ships the rest to their owners. Its data plane is the
+    /// co-writer class (custody + a granted lane; terminal frees ship).
+    PartialAuthority,
 }
 
 impl MwRole {
@@ -173,6 +183,8 @@ impl MwRole {
         match self {
             MwRole::Authority => "authority",
             MwRole::CoWriter => "co-writer",
+            MwRole::SetAuthority => "set-authority",
+            MwRole::PartialAuthority => "partial-authority",
         }
     }
 }
@@ -181,8 +193,19 @@ impl MwRole {
 /// `env_knobs`' startup gate refuses the process on an unregistered word,
 /// and this reader is the enum's one consumer.
 pub fn requested_role() -> MwRole {
-    match crate::env_knobs::enum_knob(MW_ROLE_ENV, &["authority", "co-writer"], "authority") {
+    match crate::env_knobs::enum_knob(
+        MW_ROLE_ENV,
+        &[
+            "authority",
+            "co-writer",
+            "set-authority",
+            "partial-authority",
+        ],
+        "authority",
+    ) {
         "co-writer" => MwRole::CoWriter,
+        "set-authority" => MwRole::SetAuthority,
+        "partial-authority" => MwRole::PartialAuthority,
         _ => MwRole::Authority,
     }
 }
@@ -210,6 +233,26 @@ pub fn co_writer_requested() -> Result<bool> {
             "SQUEEZEFS_MULTI_WRITER"
         ))),
         (MwRole::Authority, _) => Ok(false),
+        // Per-volume claim admission (PR 3 of
+        // `docs/design-per-volume-claim-admission.md`): the DECISION
+        // exists ([`crate::partial_authority::classify_set_admission`]) but
+        // the partial open that consumes it is PR 4, so no mount path can
+        // select either posture yet. Refusing is the only fail-closed
+        // answer: mounting such a declaration as a full authority would
+        // take the D0 ladder — flock + PR WEX + claim — on every volume of
+        // a set whose volumes a peer may own, which is the exact outcome
+        // the ladder exists to prevent.
+        (MwRole::SetAuthority | MwRole::PartialAuthority, _) => {
+            Err(SqueezefsError::InvalidOperation(format!(
+                "{MW_ROLE_ENV}={} is not selectable by this binary yet: the per-volume \
+                 admission ladder is landed (src/partial_authority.rs) but the partial-writer \
+                 open that consumes its decision is not. Refusing rather than mounting as a \
+                 full authority — that would run the D0 ladder on every volume of the set, \
+                 including volumes a peer is assigned to append to. Use \
+                 {MW_ROLE_ENV}=authority or {MW_ROLE_ENV}=co-writer",
+                role.as_str()
+            )))
+        }
     }
 }
 
@@ -425,13 +468,124 @@ impl CoWriterAdmission {
 // The ladder
 // ---------------------------------------------------------------------------
 
+/// The refusal shape both admission ladders speak: `{posture} admission
+/// REFUSED at rung {rung}: {detail}`, logged at error level.
+///
+/// Shared with [`crate::partial_authority`] (its ladder EXTENDS this one,
+/// §5.3) so the two cannot drift into two spellings of one refusal; the
+/// per-posture counter stays with the posture, because the co-writer
+/// gauge must keep counting co-writer refusals only.
+pub(crate) fn admission_refusal(posture: &str, rung: u8, detail: String) -> SqueezefsError {
+    let msg = format!("{posture} admission REFUSED at rung {rung}: {detail}");
+    log::error!("{msg}");
+    SqueezefsError::InvalidOperation(msg)
+}
+
 fn refuse(rung: u8, detail: String) -> SqueezefsError {
     METRICS
         .cowriter_admission_refusals
         .fetch_add(1, Ordering::Relaxed);
-    let msg = format!("co-writer admission REFUSED at rung {rung}: {detail}");
-    log::error!("{msg}");
-    SqueezefsError::InvalidOperation(msg)
+    admission_refusal("co-writer", rung, detail)
+}
+
+/// Rung 2's format check, shared by both ladders: the capability bits this
+/// set must carry, answered as the refusal DETAIL naming the volume, the
+/// first missing bit and the required mask.
+pub(crate) fn required_incompat_detail(path: &Path, features_incompat: u64) -> Option<String> {
+    let missing = REQUIRED_INCOMPAT & !features_incompat;
+    if missing == 0 {
+        return None;
+    }
+    let bit = missing.trailing_zeros();
+    Some(format!(
+        "metadata volume {} does not carry incompat bit {bit} (missing mask {:#x} of the \
+         required {:#x}), so the format cannot express a second writer safely. Bit 14 \
+         (KV_CLAIM_SET) is the one this posture consumes directly: a half-engaged set is not a \
+         claim set. Nothing stamps these bits today (ruling D9) — the Phase-8 reformat window \
+         stamps them offline, and every volume of the set must carry all of them",
+        path.display(),
+        missing,
+        REQUIRED_INCOMPAT
+    ))
+}
+
+/// What a durable claim set says about one node — rung 3's lookup, shared
+/// by both ladders (KD-MW-2: entries match exactly, or as a bare-node SLOT
+/// WILDCARD naming every mount slot of that node).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MemberStanding {
+    /// Named as a `Writer` member.
+    Writer,
+    /// Named, but as a `Reader` — it holds no custody and writes nothing.
+    Reader,
+    /// Not named at all.
+    Absent,
+}
+
+pub(crate) fn member_standing(set: &ClaimSet, id: &str) -> MemberStanding {
+    match set
+        .members
+        .iter()
+        .find(|m| crate::membership::member_id_matches(&m.identity.id, id))
+    {
+        Some(m) if m.identity.role == MemberRole::Writer => MemberStanding::Writer,
+        Some(_) => MemberStanding::Reader,
+        None => MemberStanding::Absent,
+    }
+}
+
+/// Rung 5, shared verbatim by both ladders (§5.3: *"unchanged in
+/// substance"*): the DEVICE must name this node a registrant of the
+/// standing WERO hold, or the mount is one nothing can fence. Answers the
+/// refusal DETAIL; the caller wraps it in its own posture's refusal.
+pub(crate) fn registrant_detail(
+    ev: Option<&RegistrantEvidence>,
+) -> std::result::Result<&RegistrantEvidence, String> {
+    let Some(ev) = ev else {
+        return Err(
+            "no NVMe reservation evidence for the data namespaces. §6.7 requires ENFORCEMENT \
+             for multi-writer (\"refused on non-PR\"), and that governs the admission decision, \
+             not only the data plane: a co-writer whose DMA the device cannot reject is a \
+             co-writer nothing can fence, and its death could never produce a drain proof"
+                .to_string(),
+        );
+    };
+    if !ev.pr_capable {
+        return Err(
+            "a data namespace advertises no NVMe reservation support (RESCAP=0) — the shape of \
+             every loop-device substrate, including tests/dev_substrate.sh's default. A fenced \
+             co-writer could then only be DETECTED, never rejected. Use a PR-capable namespace \
+             (SQZ_DEVSUB_TRANSPORT=tcp, or real hardware)"
+                .to_string(),
+        );
+    }
+    if !ev.reservation_held {
+        return Err(
+            "no reservation is held on the data namespaces: nobody is fencing this data plane, \
+             so a co-writer would be writing beside hosts the device does not authenticate. The \
+             AUTHORITY takes the WERO hold at its multi-writer arm — arm it first"
+                .to_string(),
+        );
+    }
+    if !ev.wero {
+        return Err(
+            "the held reservation is not Write Exclusive – Registrants Only (rtype 3). Under any \
+             other type this node's registration grants no write access, so admitting would \
+             produce a mount whose every DMA the device rejects — fail-closed, but a lie about \
+             the posture"
+                .to_string(),
+        );
+    }
+    if !ev.registered || ev.key == 0 {
+        return Err(
+            "this node's key is not among the standing WERO hold's registrants, so the device \
+             would reject its writes AND the authority's preempt could never name it — no \
+             registrant key means no drain proof, which means a dead co-writer's offsets could \
+             never be released from quarantine"
+                .to_string(),
+        );
+    }
+    Ok(ev)
 }
 
 /// Rung 1 — the posture is DECLARED, not inferred.
@@ -487,23 +641,8 @@ fn rung_2_engaged_claim_set(req: &AdmissionRequest) -> Result<()> {
         return Err(refuse(2, "the metadata set has no volumes".to_string()));
     }
     for vol in &req.volumes {
-        let missing = REQUIRED_INCOMPAT & !vol.features_incompat;
-        if missing != 0 {
-            let bit = missing.trailing_zeros();
-            return Err(refuse(
-                2,
-                format!(
-                    "metadata volume {} does not carry incompat bit {bit} (missing mask {:#x} of \
-                     the required {:#x}), so the format cannot express a second writer safely. \
-                     Bit 14 (KV_CLAIM_SET) is the one this posture consumes directly: a \
-                     half-engaged set is not a claim set. Nothing stamps these bits today \
-                     (ruling D9) — the Phase-8 reformat window stamps them offline, and every \
-                     volume of the set must carry all of them",
-                    vol.path.display(),
-                    missing,
-                    REQUIRED_INCOMPAT
-                ),
-            ));
+        if let Some(detail) = required_incompat_detail(&vol.path, vol.features_incompat) {
+            return Err(refuse(2, detail));
         }
         match &vol.claim_set {
             Some(set) if set.durable => {}
@@ -556,13 +695,9 @@ fn rung_3_durable_enrollment(req: &AdmissionRequest) -> Result<()> {
         // KD-MW-2: entries match exactly, or as a bare-node SLOT WILDCARD
         // (`node_{16 hex}` names every mount slot of that node — the
         // single-mount-host convenience the §11 grammar keeps).
-        let named = set
-            .members
-            .iter()
-            .find(|m| crate::membership::member_id_matches(&m.identity.id, &req.node_id));
-        match named {
-            Some(m) if m.identity.role == MemberRole::Writer => {}
-            Some(_) => {
+        match member_standing(set, &req.node_id) {
+            MemberStanding::Writer => {}
+            MemberStanding::Reader => {
                 return Err(refuse(
                     3,
                     format!(
@@ -575,7 +710,7 @@ fn rung_3_durable_enrollment(req: &AdmissionRequest) -> Result<()> {
                     ),
                 ));
             }
-            None => {
+            MemberStanding::Absent => {
                 return Err(refuse(
                     3,
                     format!(
@@ -672,57 +807,10 @@ fn rung_4_live_authority(req: &AdmissionRequest) -> Result<&AuthorityLeaseEviden
 }
 
 /// Rung 5 — the DEVICE names this node a registrant of the standing hold.
+/// The checks and their texts are [`registrant_detail`], shared verbatim
+/// with the per-volume ladder (§5.3: rung 5 is *"unchanged in substance"*).
 fn rung_5_device_registrant(req: &AdmissionRequest) -> Result<&RegistrantEvidence> {
-    let Some(ev) = req.registrant.as_ref() else {
-        return Err(refuse(
-            5,
-            "no NVMe reservation evidence for the data namespaces. §6.7 requires ENFORCEMENT \
-             for multi-writer (\"refused on non-PR\"), and that governs the admission decision, \
-             not only the data plane: a co-writer whose DMA the device cannot reject is a \
-             co-writer nothing can fence, and its death could never produce a drain proof"
-                .to_string(),
-        ));
-    };
-    if !ev.pr_capable {
-        return Err(refuse(
-            5,
-            "a data namespace advertises no NVMe reservation support (RESCAP=0) — the shape of \
-             every loop-device substrate, including tests/dev_substrate.sh's default. A fenced \
-             co-writer could then only be DETECTED, never rejected. Use a PR-capable namespace \
-             (SQZ_DEVSUB_TRANSPORT=tcp, or real hardware)"
-                .to_string(),
-        ));
-    }
-    if !ev.reservation_held {
-        return Err(refuse(
-            5,
-            "no reservation is held on the data namespaces: nobody is fencing this data plane, \
-             so a co-writer would be writing beside hosts the device does not authenticate. The \
-             AUTHORITY takes the WERO hold at its multi-writer arm — arm it first"
-                .to_string(),
-        ));
-    }
-    if !ev.wero {
-        return Err(refuse(
-            5,
-            "the held reservation is not Write Exclusive – Registrants Only (rtype 3). Under any \
-             other type this node's registration grants no write access, so admitting would \
-             produce a mount whose every DMA the device rejects — fail-closed, but a lie about \
-             the posture"
-                .to_string(),
-        ));
-    }
-    if !ev.registered || ev.key == 0 {
-        return Err(refuse(
-            5,
-            "this node's key is not among the standing WERO hold's registrants, so the device \
-             would reject its writes AND the authority's preempt could never name it — no \
-             registrant key means no drain proof, which means a dead co-writer's offsets could \
-             never be released from quarantine"
-                .to_string(),
-        ));
-    }
-    Ok(ev)
+    registrant_detail(req.registrant.as_ref()).map_err(|detail| refuse(5, detail))
 }
 
 /// **Decide.** Runs the five rungs in order and returns the admission, or

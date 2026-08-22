@@ -209,8 +209,7 @@ fn at<'a>(req: &'a mut SetAdmissionRequest, vol_id: &str) -> &'a mut PvVolumeEvi
 /// admission carries the per-volume verdict vector keyed by durable id.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_seven_rung_ladder_admits_a_partial_authority() {
-    let admission =
-        pv::classify_set_admission(&partial_request()).expect("the full ladder admits");
+    let admission = pv::classify_set_admission(&partial_request()).expect("the full ladder admits");
 
     assert_eq!(admission.node_id(), NODE);
     assert_eq!(admission.role(), MwRole::PartialAuthority);
@@ -521,6 +520,22 @@ async fn rung_3_verifies_the_declared_role_against_the_slot_0_assignment() {
         err.contains("rung 3") && err.contains("co-writer"),
         "the refusal names the rung and the posture that fits: {err}"
     );
+
+    // And the evidence the role check consumes: ino 1 pins to slot 0 and
+    // slot 0 pins to one volume (KD-PV-6), so a set that names none — or
+    // two — leaves the SET AUTHORITY underivable. Refuse rather than pick.
+    for hosts in [false, true] {
+        let mut req = partial_request();
+        at(&mut req, VOL_A).hosts_slot_0 = hosts;
+        at(&mut req, VOL_SLOT0).hosts_slot_0 = hosts;
+        let err = pv::classify_set_admission(&req)
+            .expect_err("exactly one volume hosts slot 0")
+            .to_string();
+        assert!(
+            err.contains("rung 3") && err.contains("slot 0"),
+            "the refusal names the rung and what is underivable: {err}"
+        );
+    }
 }
 
 /// Rung 4 — a LIVE authority for a partial authority (custody source and,
@@ -706,10 +721,7 @@ async fn rung_6_refuses_a_peer_volume_that_is_unclaimed_stale_or_claimed_by_a_st
     let err = pv::classify_set_admission(&req)
         .expect_err("an unresolvable holder is not evidence")
         .to_string();
-    assert!(
-        err.contains("rung 6"),
-        "the refusal names its rung: {err}"
-    );
+    assert!(err.contains("rung 6"), "the refusal names its rung: {err}");
 }
 
 /// Rung 6 + KD-PV-12 — the successor opt-in. A declared successor adopts
@@ -741,8 +753,7 @@ async fn a_declared_successor_adopts_only_what_the_d0_ladder_would_grant() {
     let mut req = partial_request();
     at(&mut req, VOL_SLOT0).claim_set = Some(assigned_set(PEER, &[NODE]));
     at(&mut req, VOL_SLOT0).projected_claim_set = Some(assigned_set(PEER, &[NODE]));
-    let admission =
-        pv::classify_set_admission(&req).expect("a live owner keeps its volume");
+    let admission = pv::classify_set_admission(&req).expect("a live owner keeps its volume");
     assert!(matches!(
         admission.mode_for(VOL_SLOT0),
         Some(VolumeMode::Peer { owner_id, .. }) if owner_id == PEER
@@ -916,7 +927,15 @@ fn the_ladder_is_the_only_set_admission_constructor() {
     ))
     .expect("the ladder's source");
 
-    let literals = src.matches("SetAdmission {").count();
+    // Struct literals only: the declaration (`pub struct SetAdmission {`)
+    // and the inherent impl (`impl SetAdmission {`) wear the same shape.
+    let literals = src
+        .match_indices("SetAdmission {")
+        .filter(|(at, _)| {
+            let before = src[..*at].trim_end();
+            !before.ends_with("struct") && !before.ends_with("impl")
+        })
+        .count();
     assert_eq!(
         literals, 1,
         "exactly one `SetAdmission {{` literal (in classify_set_admission); found {literals}"

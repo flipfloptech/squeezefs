@@ -117,6 +117,60 @@
 #                       migration policy's shipped-topology dark posture
 #                       live (candidates == 0 on a one-authority fleet).
 #                       Quiet-gated (cargo + loadavg).
+#   s10-placement-tarx --partial-authority
+#                       (PR 8 gate (a) — per-volume claim admission
+#                       §5.13) THE ACCEPTANCE ROW. Same instrument, same
+#                       A-B-B-A, same <=1.10x gate — but the netns client
+#                       is a PARTIAL AUTHORITY extracting into its OWN
+#                       verb-minted subtree root, where its publishes are
+#                       LOCAL, against the same authority-local S0
+#                       baseline. Needs the multi-owner fleet
+#                       (mw_fleet.sh create N=1 --owners=2). Item 0's
+#                       SETUP PRECONDITION is asserted before anything is
+#                       timed (tests/pv_locate_gate.sh: the target is a
+#                       volume this node OWNS and its first ten children
+#                       land there too) and so is §5.13's INVERSION
+#                       column (wire verbs/entry -> ~0) — a row extracted
+#                       into a root-descended directory reproduces 6.73x
+#                       by construction and exits NONZERO as INVALID,
+#                       never as a disappointing number.
+#   pv-rewrite-funnel [--rewrite-mb=M] [--rewrite-files=F]
+#                       (PR 8 gate (c) — §5.12) THE RELOCATED WALL. Full
+#                       overwrite of a pre-written file set on a partial
+#                       authority (every displaced free SHIPS to the set
+#                       authority under D20) vs the same on the set
+#                       authority (local), A-B-B-A.
+#                       `meta_ship_publish.free_shipped_blocks` is the
+#                       engagement instrument §5.12 names and
+#                       `free_served_blocks` its closure; NO GATE — the
+#                       number IS the deliverable, because §5.12 states
+#                       this term is unmeasured and may be where the
+#                       recipe moves the wall to.
+#   pv-cross-owner [--xo-ops=N]
+#                       (PR 8 gate (b) — D18's published refusal rate,
+#                       §5.13's widened denominator) The per-VERB table:
+#                       rename / link / unlink, each in its OWN snapshot
+#                       window so the single `cross_owner_refusals`
+#                       counter is attributable, in three placements
+#                       (all-own / 50-50 / adversarial); plus the `rm -rf`
+#                       arm — a subtree root's own name spans two owners
+#                       by construction, so `rm -rf` must descend cleanly
+#                       and then refuse the ROOT with EXDEV having
+#                       destroyed nothing it could not finish — and the
+#                       undeletable-in-place population at assignment.
+#   pv-rand4k-w1 [--w1-secs=S] [--w1-mb=M]
+#                       (PR 8 gate (d) — R14, §5.1.3) THE PRICE OF THE
+#                       LOST W1 PATCH. Rand-4k O_DIRECT overwrites on a
+#                       partial authority (which may NOT patch: a
+#                       lifetime incarnation retire is durable ownership
+#                       state) vs the set authority (which must), A-B-B-A,
+#                       with `patch_writes` / `patch_ineligible_*` /
+#                       `cowriter.accounting_refusals` as the ledger. On a
+#                       fleet with NO assignment the same leg emits the
+#                       third arm — single-authority-today — so the
+#                       design's three-row table is two runs, not one
+#                       impossible fleet. NO GATE: R14 is a named,
+#                       accepted regression; this row publishes its size.
 #   pv-volume-scaling [--ns=1,4,16,46] [--files=N] [--idle-secs=S]
 #                       [--repeats=R] [--threads=T] [--budget=SIZE]
 #                       [--node-cache-mb=MB] [--tag=NAME]
@@ -490,6 +544,10 @@
 #         [--window=S] [--netem=MS] [--victim=IDX]   (the s6-* legs)
 #         [--rounds=N]                               (s7-kill-matrix, s11-killrange)
 #         [--procs=P]                                (s11-mpiio)
+#         [--partial-authority]                      (s10-placement-tarx, PR 8)
+#         [--rewrite-mb=M --rewrite-files=F]         (pv-rewrite-funnel)
+#         [--xo-ops=N]                               (pv-cross-owner)
+#         [--w1-secs=S --w1-mb=M]                    (pv-rand4k-w1)
 #         bash tests/run_mw_matrix.sh pv-volume-scaling [--ns=…] [--files=N]
 #              [--idle-secs=S] [--repeats=R] [--threads=T] [--budget=SIZE]
 #              [--node-cache-mb=MB] [--tag=NAME]     (unprivileged, fleet-free)
@@ -575,6 +633,15 @@ PV_NODE_CACHE_MB="${SQZ_MWMATRIX_PV_NODE_CACHE_MB:-}"
 # shipped 1 s TTLs a re-stat sweep never reaches the daemon at all).
 PV_TTL_MS="${SQZ_MWMATRIX_PV_TTL_MS:-0}"
 PV_TAG="${SQZ_MWMATRIX_PV_TAG:-derived}"
+# PR 8 (per-volume claim admission acceptance): the multi-owner legs.
+# `--partial-authority` switches the s10 gate row's client venue from the
+# co-writer to a PARTIAL AUTHORITY extracting into its OWN subtree root.
+PVO_PARTIAL=0
+PVO_REWRITE_MB="${SQZ_MWMATRIX_PVO_REWRITE_MB:-64}"
+PVO_REWRITE_FILES="${SQZ_MWMATRIX_PVO_REWRITE_FILES:-8}"
+PVO_XO_OPS="${SQZ_MWMATRIX_PVO_XO_OPS:-200}"
+PVO_W1_SECS="${SQZ_MWMATRIX_PVO_W1_SECS:-30}"
+PVO_W1_MB="${SQZ_MWMATRIX_PVO_W1_MB:-256}"
 # Paced-quiet thresholds (the thermally-capped-box law): rows resume
 # below PV_RESUME_C and never wait longer than PV_WAIT_MAX_S.
 PV_RESUME_C="${SQZ_MWMATRIX_PV_RESUME_C:-68}"
@@ -603,6 +670,12 @@ for a in "$@"; do
     --node-cache-mb=*) PV_NODE_CACHE_MB="${a#--node-cache-mb=}" ;;
     --kernel-ttl-ms=*) PV_TTL_MS="${a#--kernel-ttl-ms=}" ;;
     --tag=*) PV_TAG="${a#--tag=}" ;;
+    --partial-authority) PVO_PARTIAL=1 ;;
+    --rewrite-mb=*) PVO_REWRITE_MB="${a#--rewrite-mb=}" ;;
+    --rewrite-files=*) PVO_REWRITE_FILES="${a#--rewrite-files=}" ;;
+    --xo-ops=*) PVO_XO_OPS="${a#--xo-ops=}" ;;
+    --w1-secs=*) PVO_W1_SECS="${a#--w1-secs=}" ;;
+    --w1-mb=*) PVO_W1_MB="${a#--w1-mb=}" ;;
     *) die "unknown argument '$a'" ;;
     esac
 done
@@ -617,6 +690,11 @@ S11_PROCS="${S11_PROCS:-4}"
 [[ "$S8B_SECS" =~ ^[0-9]+$ ]] && [ "$S8B_SECS" -ge 60 ] || die "--secs takes seconds >= 60 (got '$S8B_SECS')"
 [[ "$S10C_MB" =~ ^[0-9]+$ ]] && [ "$S10C_MB" -ge 256 ] || die "--corpus-mb takes MiB >= 256 (got '$S10C_MB')"
 [[ "$S10C_RUNS" =~ ^[0-9]+$ ]] && [ "$S10C_RUNS" -ge 1 ] || die "--runs takes a positive integer (got '$S10C_RUNS')"
+[[ "$PVO_REWRITE_MB" =~ ^[0-9]+$ ]] && [ "$PVO_REWRITE_MB" -ge 8 ] || die "--rewrite-mb takes MiB >= 8 (got '$PVO_REWRITE_MB')"
+[[ "$PVO_REWRITE_FILES" =~ ^[0-9]+$ ]] && [ "$PVO_REWRITE_FILES" -ge 1 ] || die "--rewrite-files takes a positive integer (got '$PVO_REWRITE_FILES')"
+[[ "$PVO_XO_OPS" =~ ^[0-9]+$ ]] && [ "$PVO_XO_OPS" -ge 10 ] || die "--xo-ops takes >= 10 (got '$PVO_XO_OPS') — a refusal RATE needs a denominator"
+[[ "$PVO_W1_SECS" =~ ^[0-9]+$ ]] && [ "$PVO_W1_SECS" -ge 10 ] || die "--w1-secs takes seconds >= 10 (got '$PVO_W1_SECS')"
+[[ "$PVO_W1_MB" =~ ^[0-9]+$ ]] && [ "$PVO_W1_MB" -ge 64 ] || die "--w1-mb takes MiB >= 64 (got '$PVO_W1_MB')"
 
 # =============================================================================
 # pv-volume-scaling — the PR 0 VIABILITY GATE leg
@@ -2772,10 +2850,17 @@ PYEOF
 
 # One serial tar -x venue: extract the leg's tarball onto `mnt` under a
 # fresh dir, timed; snapshot writer+cowriter around it; emit the row line.
-s8a_venue() { # rowdir label mnt cw_idx entries tarball
+s8a_venue() { # rowdir label mnt cw_idx entries tarball [subtree-root]
     local rowdir="$1" label="$2" mnt="$3" cw="$4" entries="$5" tarball="$6"
+    # PR 8: the extraction destination may be scoped to a SUBTREE ROOT
+    # inside the mount — on a multi-owner fleet the target must be the
+    # extracting node's OWN root or the row reproduces the baseline by
+    # construction (design §5.13's setup precondition, gated by
+    # tests/pv_locate_gate.sh before anything is timed). Empty = the
+    # mount root, which is every pre-PR-8 caller's venue unchanged.
+    local subtree="${7:-}"
     local dest t0 t1 wall ops
-    dest="$mnt/s8a-$label"
+    dest="$mnt${subtree}/s8a-$label"
     mkdir -p "$dest"
     # In-flight settle, then CLIENT-first snapshot order (both ends): a
     # `.stats` read through the co-writer mount SHIPS its own kernel
@@ -6040,7 +6125,23 @@ leg_s10_placement_tarx() {
     # local_median. A miss is a PUBLISHED honest outcome (exit 0 — the
     # charter's explicit alternative: operations.md + rc-manifest carry
     # the statement); an INVALID row (engagement, oracle) exits nonzero.
-    require_cowriters 1
+    #
+    # **PR 8's `--partial-authority` arm** (per-volume claim admission
+    # §5.13, gate (a)): the SAME row over the multi-owner fleet, with the
+    # client venue changed from a co-writer — which ships EVERY metadata
+    # verb, and whose 6.73x this recipe exists to beat — to a PARTIAL
+    # AUTHORITY extracting into its OWN verb-minted subtree root, where
+    # the publishes are LOCAL. The baseline stays the authority-local S0
+    # extraction, so the two rows are comparable to each other and to the
+    # 6.73x. Item 0's setup precondition is asserted before anything is
+    # timed and its failure is nonzero, never a disappointing number.
+    local client_label="co-writer" cw_root="" auth_root=""
+    if [ "$PVO_PARTIAL" = "1" ]; then
+        require_owners 1
+        client_label="partial-authority"
+    else
+        require_cowriters 1
+    fi
     if pgrep -x cargo >/dev/null 2>&1; then
         die "s10-placement-tarx: a cargo build is running — the measured row needs a quiet box"
     fi
@@ -6053,35 +6154,59 @@ leg_s10_placement_tarx() {
     local rowdir cw w_mnt cw_mnt tarball entries
     rowdir="$STATE/rows/s10pl-$(date +%s)"
     mkdir -p "$rowdir"
-    cw="$(cowriter_idxs | head -1)"
+    if [ "$PVO_PARTIAL" = "1" ]; then
+        cw="$(pvo_partial_idxs | head -1)"
+    else
+        cw="$(cowriter_idxs | head -1)"
+    fi
     w_mnt="$(mnt_of 0)"
     tarball="$STATE/s10pl-src.tar"
     tar -cf "$tarball" -C "$(dirname "$src")" "$(basename "$src")"
     entries="$(tar -tf "$tarball" | wc -l)"
-    log "s10pl-tarx instrument: REAL tree $src ($entries entries); venue = netns co-writer at netem 125us/end (250us wire RTT) vs authority-local S0; A-B-B-A"
+    log "s10pl-tarx instrument: REAL tree $src ($entries entries); venue = netns $client_label at netem 125us/end (250us wire RTT) vs authority-local S0; A-B-B-A"
 
-    # The co-writer at the gate's RTT, shipped-default levers (placement
-    # AND intents ON — the row under test IS the default posture).
+    # The client at the gate's RTT, shipped-default levers (placement AND
+    # intents ON — the row under test IS the default posture). PR 8's arm
+    # additionally asserts item 0 BEFORE anything is timed, and pins the
+    # extraction into the node's own verb-minted subtree root.
     "$MWFLEET" unmount "$cw" || die "s10pl: unmount failed"
-    "$MWFLEET" mount "$cw" --netns || die "s10pl: netns co-writer mount failed"
+    "$MWFLEET" mount "$cw" --netns || die "s10pl: netns $client_label mount failed"
     "$MWFLEET" netem "$cw" 125us || die "s10pl: netem failed"
     cw_mnt="$(mnt_of "$cw")"
+    if [ "$PVO_PARTIAL" = "1" ]; then
+        cw_root="$(pvo_setup_gate "$cw" "s10pl/partial-authority")"
+        auth_root="$(pvo_setup_gate 0 "s10pl/set-authority")"
+    fi
 
     pl_arm() { # label -> row line (engagement-checked, both planes)
         local label="$1" out mints_d ship_d pub_d place_d verbs_per
-        out="$(s8a_venue "$rowdir" "$label" "$cw_mnt" "$cw" "$entries" "$tarball")"
+        out="$(s8a_venue "$rowdir" "$label" "$cw_mnt" "$cw" "$entries" "$tarball" "$cw_root")"
         mints_d="$(s8a_delta "$rowdir" "$cw" "$label" meta_ship_intent.meta_ship_intent_mints)"
         ship_d="$(s8a_delta "$rowdir" "$cw" "$label" meta_ship.shipped_verbs)"
         pub_d="$(s8a_delta "$rowdir" "$cw" "$label" meta_ship_publish.shipped)"
         place_d="$(s8a_delta "$rowdir" 0 "$label" meta_ship_placement.meta_ship_placement_client_slot_mints)"
-        [ "$mints_d" -gt 0 ] || die "s10pl $label: 0 intent mints — the row did not engage the intent plane"
-        [ "$place_d" -gt 0 ] || die "s10pl $label: 0 client-targeted mints on the owner — placement did not engage"
         verbs_per="$(python3 -c "print(f'{($ship_d+$pub_d)/$entries:.2f}')")"
-        echo "$out mints=$mints_d ship=$ship_d pub=$pub_d place=$place_d verbs/entry=$verbs_per"
+        if [ "$PVO_PARTIAL" = "1" ]; then
+            # §5.13's ENGAGEMENT column, the one that decides whether this
+            # row means anything: **the inversion**. A partial authority
+            # extracting into its OWN subtree ships ~nothing — the whole
+            # point of the recipe — so `verbs/entry -> ~0` is the pass and
+            # the co-writer's 14.5 is what it replaces. `mint_redirects`
+            # is ~0 per posture once the owned-candidate filter is armed.
+            local redir_d
+            redir_d="$(s8a_delta "$rowdir" "$cw" "$label" meta_ship.mint_redirects)"
+            python3 -c "import sys; sys.exit(0 if ($ship_d+$pub_d)/$entries < 1.0 else 1)" ||
+                die "s10pl $label: the partial authority paid $verbs_per wire verbs per entry extracting into its OWN subtree — the inversion §5.13 requires (-> ~0) did not happen, so this row is INVALID rather than slow. Check \`squeezefs volume locate\` on the target and the owned-candidate mint filter"
+            echo "$out ship=$ship_d pub=$pub_d place=$place_d redirects=$redir_d verbs/entry=$verbs_per"
+        else
+            [ "$mints_d" -gt 0 ] || die "s10pl $label: 0 intent mints — the row did not engage the intent plane"
+            [ "$place_d" -gt 0 ] || die "s10pl $label: 0 client-targeted mints on the owner — placement did not engage"
+            echo "$out mints=$mints_d ship=$ship_d pub=$pub_d place=$place_d verbs/entry=$verbs_per"
+        fi
     }
     local_arm() { # label -> row line (the S0 shape)
         local label="$1" out
-        out="$(s8a_venue "$rowdir" "$label" "$w_mnt" "" "$entries" "$tarball")"
+        out="$(s8a_venue "$rowdir" "$label" "$w_mnt" "" "$entries" "$tarball" "$auth_root")"
         echo "$out local-S0"
     }
 
@@ -6092,16 +6217,29 @@ leg_s10_placement_tarx() {
     rows+=("$(pl_arm pl-on-2)")
     "$MWFLEET" netem "$cw" off || true
 
-    # The shipped-topology dark posture, proven LIVE: on a one-authority
-    # fleet no shipping client owns a metadata volume, so the policy's
-    # migration half must never fire (the honest-statement's live face).
-    local cand trig
+    # The migration policy's posture, proven LIVE. On a ONE-AUTHORITY
+    # fleet no shipping client owns a metadata volume, so the inversion
+    # never even finds a candidate. Under a MULTI-OWNER map the candidate
+    # inversion legitimately finds them — and KD-PV-13 DISARMS the
+    # migration half outright (D19: ownership is static to the gate), so
+    # what must be 0 there is triggered/failed, not candidates.
+    local cand trig failed
     cand="$(stat_field 0 meta_ship_placement.meta_ship_placement_migration_candidates)"
     trig="$(stat_field 0 meta_ship_placement.meta_ship_placement_migrations_triggered)"
-    [ "$cand" = "0" ] || die "s10pl: migration_candidates=$cand on a one-authority fleet (must be structurally 0)"
-    [ "$trig" = "0" ] || die "s10pl: migrations_triggered=$trig on a one-authority fleet (must be structurally 0)"
+    failed="$(stat_field 0 meta_ship_placement.meta_ship_placement_migrations_failed)"
+    if [ "$PVO_PARTIAL" = "1" ]; then
+        [ "$trig" = "0" ] || die "s10pl: migrations_triggered=$trig under an armed multi-owner map — KD-PV-13 disarms the migration half (D19), so this is a live escape of a disarmed mechanism"
+        [ "$failed" = "0" ] || die "s10pl: migrations_failed=$failed under an armed multi-owner map (KD-PV-13's disarm makes both structurally 0)"
+    else
+        [ "$cand" = "0" ] || die "s10pl: migration_candidates=$cand on a one-authority fleet (must be structurally 0)"
+        [ "$trig" = "0" ] || die "s10pl: migrations_triggered=$trig on a one-authority fleet (must be structurally 0)"
+    fi
 
     echo ""
+    if [ "$PVO_PARTIAL" = "1" ]; then
+        echo "== PR 8 (a): tar -x on a PARTIAL AUTHORITY's own subtree @250us RTT vs authority-local S0 (entries=$entries; A-B-B-A) =="
+        echo "== tier: $(pvo_tier "$OWNERS"); baseline to beat: the S10 co-writer row's 6.73x; gate <= 1.10x =="
+    fi
     echo "== S10 rung-14 FORMAL GATE: tar -x, placement+intents ON @250us RTT vs authority-local S0 (entries=$entries; A-B-B-A) =="
     printf '%-10s %-8s %-8s %s\n' ARM WALL_S OPS_S ENGAGEMENT
     local r
@@ -6117,13 +6255,16 @@ leg_s10_placement_tarx() {
     lo1="$(echo "${rows[1]}" | awk '{print $2}')"
     lo2="$(echo "${rows[2]}" | awk '{print $2}')"
     pl2="$(echo "${rows[3]}" | awk '{print $2}')"
-    python3 - "$pl1" "$pl2" "$lo1" "$lo2" <<'PYGATE' | tee "$rowdir/s10pl-verdict.txt"
+    python3 - "$pl1" "$pl2" "$lo1" "$lo2" "$client_label" <<'PYGATE' | tee "$rowdir/s10pl-verdict.txt"
 import sys
 pl = (float(sys.argv[1]) + float(sys.argv[2])) / 2
 lo = (float(sys.argv[3]) + float(sys.argv[4])) / 2
+who = sys.argv[5]
 r = pl / lo
 verdict = "GATE MET" if r <= 1.10 else "GATE NOT MET"
-print(f"gate: co-writer {pl:.2f}s vs local {lo:.2f}s -> {r:.2f}x of S0 (gate <= 1.10x): {verdict}")
+print(f"gate: {who} {pl:.2f}s vs local {lo:.2f}s -> {r:.2f}x of S0 (gate <= 1.10x): {verdict}")
+if who == "partial-authority":
+    print(f"baseline this replaces: the S10 co-writer row's 6.73x -> {6.73 / r:.2f}x better")
 if verdict == "GATE NOT MET":
     print("the honest product statement governs (the charter's alternative): "
           "docs/operations.md #Metadata function shipping + docs/rc-manifest.md carry the measured number")
@@ -6139,7 +6280,522 @@ $out"
     drift="$(stat_field 0 meta_kv_block_refs_drift)"
     [ "$drift" = "0" ] || die "s10pl: drift=$drift"
     [ "$(stat_field 0 "meta_ship.owner_panics")" = "0" ] || die "s10pl: owner_panics != 0"
+    [ "$PVO_PARTIAL" = "1" ] && pvo_engagement_gate s10-placement-tarx
     log "s10-placement-tarx PUBLISHED (table + verdict + snapshots in $rowdir)"
+}
+
+# ===========================================================================
+# PR 8 — the per-volume claim admission ACCEPTANCE legs
+# (docs/design-per-volume-claim-admission.md PR 8: item 0 the setup
+# precondition, (a) the tar -x gate, (b) the cross-owner refusal table,
+# (c) the rewrite/overwrite funnel, (d) the R14 rand-4k W1 row, (e) the
+# fsck/C8 oracle, (f) a tier label on every row)
+#
+# THE VENUE. All four legs drive the MULTI-OWNER fleet
+# `tests/mw_fleet.sh create N=1 --owners=K` builds: member 0 owns the
+# slot-0 volume and is the SET AUTHORITY (D20), members 20.. are PARTIAL
+# AUTHORITIES. That is one box, K daemons, one nvmet-tcp devsub — the
+# SAME venue class as the 6.73x baseline these rows exist to beat, which
+# is what §5.13 requires of the gate row.
+#
+# THE TIER LABEL is printed with every table (§5.13 / docs/rc-manifest.md):
+# K = 2 rows are measured-real, K >= 4 fan-out on one box is
+# measured-simulated, and no row here is ever a projection.
+# ===========================================================================
+
+PVO_LOCATE_GATE="$REPO/tests/pv_locate_gate.sh"
+
+pvo_partial_idxs() {
+    awk -F'\t' '$2=="partial-authority" {print $1}' "$MEMBERS" 2>/dev/null | sort -n
+}
+
+# One recorded per-owner field the fleet wrote (`OWNER_ROOT_20`, …).
+pvo_owner_field() { # field idx
+    local var="OWNER_${1}_${2}"
+    echo "${!var-}"
+}
+
+# Every owner index, set authority first.
+pvo_owner_idxs() {
+    printf '%s\n' 0
+    pvo_partial_idxs
+}
+
+pvo_tier() { # K -> the row's evidence tier, per §5.13's declared table
+    local k="$1"
+    if [ "$k" -le 2 ]; then
+        echo "measured-real (1 set authority + 1 partial authority, one box, nvmet-tcp devsub)"
+    else
+        echo "measured-simulated (K=$k owners fanned out on ONE box, one memory bus)"
+    fi
+}
+
+require_owners() { # min-partials
+    [ "$EXT_MODE" = "0" ] ||
+        die "the PR 8 legs drive fleet-lifecycle verbs (remount, netem, the offline assignment) that external-mounts mode does not expose"
+    [ "${OWNERS:-0}" != "0" ] ||
+        die "this leg needs a MULTI-OWNER fleet — build one with: sudo tests/mw_fleet.sh create N=1 --owners=2"
+    [ "${OWNERS_ASSIGNED:-0}" = "1" ] ||
+        die "this fleet was created with --owners but the assignment never landed (OWNERS_ASSIGNED=0) — tear down and re-create"
+    local n
+    n="$(pvo_partial_idxs | wc -l)"
+    [ "$n" -ge "${1:-1}" ] ||
+        die "this leg needs ${1:-1} partial authorit(y/ies) (found $n) — create the fleet with --owners=$((${1:-1} + 1))"
+}
+
+# ITEM 0 — THE SETUP PRECONDITION, before anything is timed. A row
+# extracted into a root-descended directory reproduces the 6.73x baseline
+# BY CONSTRUCTION and is INVALID, not disappointing (§5.13, rev 3 Issue
+# 23). The gate itself is tests/pv_locate_gate.sh — one implementation,
+# exercisable unprivileged against an offline set, so the assertion this
+# whole rung rests on is not one only a root fleet can run.
+pvo_setup_gate() { # idx label [creates]
+    local idx="$1" label="$2" creates="${3:-10}" mnt root owner
+    mnt="$(mnt_of "$idx")"
+    root="$(pvo_owner_field ROOT "$idx")"
+    owner="$(pvo_owner_field ID "$idx")"
+    [ -n "$root" ] ||
+        die "$label: member $idx has no recorded subtree root — a node that owns a volume but no SUBTREE owns no new work (§5.5.1), and every row it produces measures the shipped path"
+    [ -n "$owner" ] || die "$label: member $idx has no recorded member id"
+    SQZ_BIN="$SQZ" "$PVO_LOCATE_GATE" "$mnt" "$root" \
+        --owner "$owner" --creates "$creates" --label "$label" ||
+        die "$label: THE SETUP IS INVALID — see the refusal above. The row that would follow measures nothing (design §5.13, PR 8 item 0)"
+    echo "$root"
+}
+
+# §5.13's ENGAGEMENT LAW, as a gate. Absolute gauges that must be 0 on
+# every owner, plus the two placement statements the disarmed migration
+# half (KD-PV-13) makes structural. A row without this is INVALID.
+pvo_engagement_gate() { # label
+    local label="$1" idx mnt v
+    while IFS= read -r idx; do
+        [ -n "$idx" ] || continue
+        mnt="$(mnt_of "$idx")"
+        for key in \
+            peer_volume_local_commit_refusals \
+            cowriter.local_commit_refusals \
+            alloc_lane_raise_refusals \
+            meta_ship.owner_map_poisoned_volumes \
+            xv_cross_owner_intents \
+            meta_ship_publish.refusals \
+            meta_ship_publish.owner_panics \
+            meta_ship.owner_panics \
+            meta_kv_revalidate_dirty_skips \
+            meta_ship_placement.meta_ship_placement_migrations_triggered \
+            meta_ship_placement.meta_ship_placement_migrations_failed \
+            meta_ship_placement.meta_ship_placement_rotor_fallbacks; do
+            v="$(stat_field "$idx" "$key")"
+            [ "$v" = "0" ] || [ -z "$v" ] ||
+                die "$label: member $idx $key=$v — §5.13's must-stay-0 engagement set moved, so the row is INVALID whatever its wall clock says"
+        done
+        # `free_grace_deferrals` is must-stay-0 on a PARTIAL authority
+        # specifically: the ONE freed-offset grace ring is the set
+        # authority's (D20), so a partial authority deferring frees means
+        # a second ring exists.
+        if [ "$idx" != "0" ]; then
+            v="$(stat_field "$idx" free_grace_deferrals)"
+            [ "$v" = "0" ] || [ -z "$v" ] ||
+                die "$label: partial authority $idx free_grace_deferrals=$v — the one grace ring is the set authority's (D20)"
+        fi
+    done < <(pvo_owner_idxs)
+    log "$label: engagement law holds (must-stay-0 set flat, migrations disarmed, rotor_fallbacks 0)"
+}
+
+# ITEM (e) — the oracle, after every measured sweep. Cold-ish: the online
+# pass runs on the SET AUTHORITY, which coordinates maintenance (D20; a
+# partial authority refuses the coordinator-class verbs by design).
+pvo_oracle() { # label rowdir
+    local label="$1" rowdir="$2" out drift idx
+    out="$("$SQZ" fsck "$(mnt_of 0)" 2>&1)" || die "$label: fsck FAILED:
+$out"
+    echo "$out" >"$rowdir/fsck.out"
+    echo "$out" | grep -q "findings: 0" || die "$label: fsck findings != 0:
+$out"
+    while IFS= read -r idx; do
+        [ -n "$idx" ] || continue
+        drift="$(stat_field "$idx" meta_kv_block_refs_drift)"
+        [ "$drift" = "0" ] ||
+            die "$label: member $idx meta_kv_block_refs_drift=$drift (C8 must stay 0)"
+    done < <(pvo_owner_idxs)
+    log "$label: oracle clean (fsck findings 0, C8 drift 0 on every owner)"
+}
+
+# ---------------------------------------------------------------------------
+# (c) the REWRITE/OVERWRITE funnel row — design §5.12
+#
+# The recipe removes the metadata-publish term for self-owned work. It
+# does NOT remove the set-authority term: under D20 every partial
+# authority's terminal frees SHIP (`PublishCall::FreeBlocks`), and a
+# rewrite-heavy workload's frees track its ingest, so the recipe may
+# simply RELOCATE the wall. This row measures that, with
+# `meta_ship_publish.free_shipped_blocks` as the engagement instrument
+# (§5.12's own choice) and the authority's `free_served_blocks` as its
+# closure.
+# ---------------------------------------------------------------------------
+leg_pv_rewrite_funnel() {
+    require_owners 1
+    pv_quiet_or_die
+    local rowdir p auth_mnt p_mnt p_root a_root mb files
+    rowdir="$STATE/rows/pv-rewrite-$(date +%s)"
+    mkdir -p "$rowdir"
+    p="$(pvo_partial_idxs | head -1)"
+    auth_mnt="$(mnt_of 0)"
+    p_mnt="$(mnt_of "$p")"
+    mb="$PVO_REWRITE_MB"
+    files="$PVO_REWRITE_FILES"
+    p_root="$(pvo_setup_gate "$p" "pv-rewrite/partial")"
+    a_root="$(pvo_setup_gate 0 "pv-rewrite/set-authority")"
+    log "pv-rewrite-funnel: ${files} x ${mb} MiB per arm, first write then FULL overwrite (the funnel); A-B-B-A"
+
+    # One arm: fresh write (untimed — it builds the blocks the overwrite
+    # will displace), then the timed OVERWRITE of the same offsets.
+    rw_arm() { # label idx mnt root -> "label wall_s mibs shipped=N served=M"
+        local label="$1" idx="$2" mnt="$3" root="$4"
+        local dir="$mnt$root/pvrw-$label" i t0 t1 wall mibs ship serve fail
+        rm -rf "$dir"
+        mkdir -p "$dir"
+        for ((i = 0; i < files; i++)); do
+            dd if=/dev/zero of="$dir/f$i.dat" bs=1M count="$mb" \
+                conv=fsync status=none || die "pv-rewrite $label: fresh write failed"
+        done
+        sync
+        sleep 2
+        snap "$idx" "${label}0" "$rowdir"
+        snap 0 "${label}0" "$rowdir"
+        t0="$(date +%s.%N)"
+        for ((i = 0; i < files; i++)); do
+            dd if=/dev/urandom of="$dir/f$i.dat" bs=1M count="$mb" \
+                conv=fsync,notrunc status=none ||
+                die "pv-rewrite $label: OVERWRITE failed (a shipped free errored — see the daemon logs)"
+        done
+        t1="$(date +%s.%N)"
+        sleep 2
+        snap "$idx" "${label}1" "$rowdir"
+        snap 0 "${label}1" "$rowdir"
+        rm -rf "$dir"
+        wall="$(python3 -c "print(f'{$t1-$t0:.2f}')")"
+        mibs="$(python3 -c "print(f'{($files*$mb)/($t1-$t0):.1f}')")"
+        ship="$(s8a_delta "$rowdir" "$idx" "$label" meta_ship_publish.free_shipped_blocks)"
+        serve="$(s8a_delta "$rowdir" 0 "$label" meta_ship_publish.free_served_blocks)"
+        fail="$(s8a_delta "$rowdir" "$idx" "$label" meta_ship_publish.free_ship_failures)"
+        [ "$fail" = "0" ] ||
+            die "pv-rewrite $label: free_ship_failures=$fail — each is a durably-free offset the authority will not see again until its next derivation"
+        if [ "$idx" = "0" ]; then
+            [ "$ship" = "0" ] ||
+                die "pv-rewrite $label: the SET AUTHORITY shipped $ship free block(s) — it executes its own free ladder locally (D20), so this is a routing bug"
+        else
+            [ "$ship" -gt 0 ] ||
+                die "pv-rewrite $label: the partial authority shipped 0 free blocks over a full overwrite of $((files * mb)) MiB — the §5.12 funnel did not engage, so the row measures nothing"
+            [ "$serve" -ge "$ship" ] ||
+                die "pv-rewrite $label: the partial shipped $ship free block(s) and the authority served $serve — the ledgers must close"
+        fi
+        echo "$label $wall $mibs shipped=$ship served=$serve"
+    }
+
+    local -a rows=()
+    rows+=("$(rw_arm partial-1 "$p" "$p_mnt" "$p_root")")
+    rows+=("$(rw_arm setauth-1 0 "$auth_mnt" "$a_root")")
+    rows+=("$(rw_arm setauth-2 0 "$auth_mnt" "$a_root")")
+    rows+=("$(rw_arm partial-2 "$p" "$p_mnt" "$p_root")")
+
+    echo ""
+    echo "== PR 8 (c): the REWRITE/OVERWRITE funnel (§5.12) — partial authority vs set authority =="
+    echo "== tier: $(pvo_tier "$OWNERS"); instrument: dd conv=fsync,notrunc full-file overwrite, $files x $mb MiB; A-B-B-A =="
+    printf '%-11s %-8s %-9s %s\n' ARM WALL_S MIB_S ENGAGEMENT
+    local r
+    for r in "${rows[@]}"; do
+        # shellcheck disable=SC2086 # deliberate word split of the row line
+        printf '%-11s %-8s %-9s %s\n' $r
+    done | tee "$rowdir/pv-rewrite-table.txt"
+    python3 - "${rows[0]}" "${rows[3]}" "${rows[1]}" "${rows[2]}" <<'PYRW' | tee "$rowdir/pv-rewrite-verdict.txt"
+import sys
+p = [float(r.split()[2]) for r in (sys.argv[1], sys.argv[2])]
+a = [float(r.split()[2]) for r in (sys.argv[3], sys.argv[4])]
+pm, am = sum(p) / 2, sum(a) / 2
+print(f"rewrite funnel: partial authority {pm:.1f} MiB/s vs set authority {am:.1f} MiB/s "
+      f"-> {pm / am:.2f}x")
+print("NO GATE: §5.12 states this term is UNMEASURED and names it the recipe's most likely "
+      "relocated wall. The number is the deliverable; a ratio below 1.0 is the honest cost of "
+      "shipping every terminal free to one node, and belongs in the closing note verbatim.")
+PYRW
+    pvo_engagement_gate pv-rewrite-funnel
+    pvo_oracle pv-rewrite-funnel "$rowdir"
+    log "pv-rewrite-funnel PUBLISHED (table + verdict + snapshots in $rowdir)"
+}
+
+# ---------------------------------------------------------------------------
+# (b) the CROSS-OWNER REFUSAL TABLE and the `rm -rf` arm — D18's obligation,
+# §5.13's widened denominator (rev 2: rev 1's "rename+link ops" would not
+# have caught Issue 1).
+#
+# `meta_ship.cross_owner_refusals` is ONE scalar, so the split BY VERB is
+# produced by the venue, not the counter: each verb class runs in its own
+# snapshot window, so the window's delta is attributable to exactly one
+# verb. Three placements per verb (all-own / 50-50 / adversarial), the
+# rate per verb, the `rm -rf` of a subtree whose root is a cross-owner
+# name, and the undeletable-in-place population at both ends of the run.
+# ---------------------------------------------------------------------------
+leg_pv_cross_owner() {
+    require_owners 1
+    local rowdir p p_mnt p_root a_root n
+    rowdir="$STATE/rows/pv-xo-$(date +%s)"
+    mkdir -p "$rowdir"
+    p="$(pvo_partial_idxs | head -1)"
+    p_mnt="$(mnt_of "$p")"
+    p_root="$(pvo_setup_gate "$p" "pv-cross-owner/partial")"
+    a_root="$(pvo_owner_field ROOT 0)"
+    n="$PVO_XO_OPS"
+    [ -n "$a_root" ] || die "pv-cross-owner: the set authority has no recorded subtree root"
+    log "pv-cross-owner: $n ops per verb per placement, driven from partial authority $p ($p_root -> $a_root)"
+
+    # One verb phase, in its own snapshot window: the whole delta of the
+    # single cross_owner_refusals counter belongs to this verb.
+    xo_phase() { # label ops-fn -> "label verb ops refusals rate errors wall_s"
+        local label="$1" verb="$2" fn="$3" t0 t1 errs d wall
+        sleep 1
+        snap "$p" "${label}0" "$rowdir"
+        t0="$(date +%s.%N)"
+        errs="$("$fn")"
+        t1="$(date +%s.%N)"
+        sleep 1
+        snap "$p" "${label}1" "$rowdir"
+        d="$(s8a_delta "$rowdir" "$p" "$label" meta_ship.cross_owner_refusals)"
+        wall="$(python3 -c "print(f'{$t1-$t0:.2f}')")"
+        echo "$label $verb $n $d $(python3 -c "print(f'{$d/$n:.2f}')") $errs $wall"
+    }
+
+    # Each ops function prints the number of ops that returned an ERROR.
+    # A refused cross-owner op is an error to the application: for rename
+    # `mv` falls back to copy+unlink, for unlink/rmdir/link there is no
+    # fallback at all (D18's published cost).
+    xo_mkset() { # dir count
+        local d="$1" c="$2" i
+        rm -rf "$d"
+        mkdir -p "$d"
+        for ((i = 0; i < c; i++)); do echo "$i" >"$d/f$i"; done
+    }
+    rename_own() {
+        local d="$p_mnt$p_root/xo-ro" i e=0
+        xo_mkset "$d" "$n"
+        mkdir -p "$d.dst"
+        for ((i = 0; i < n; i++)); do mv "$d/f$i" "$d.dst/f$i" 2>/dev/null || e=$((e + 1)); done
+        rm -rf "$d" "$d.dst"
+        echo "$e"
+    }
+    rename_cross() { # fraction-numerator fraction-denominator
+        local num="$1" den="$2" d="$p_mnt$p_root/xo-rx" i e=0 dst
+        xo_mkset "$d" "$n"
+        mkdir -p "$p_mnt$a_root/xo-rx-dst" "$d.own"
+        for ((i = 0; i < n; i++)); do
+            if [ $((i % den)) -lt "$num" ]; then dst="$p_mnt$a_root/xo-rx-dst/f$i"; else dst="$d.own/f$i"; fi
+            # coreutils mv falls back to copy+unlink on EXDEV, so `mv`
+            # SUCCEEDS where rename(2) refused — the user-visible cost is
+            # the bytes, not an error. The refusal is counted by the
+            # ledger either way, which is why the ledger is the instrument.
+            mv "$d/f$i" "$dst" 2>/dev/null || e=$((e + 1))
+        done
+        rm -rf "$d" "$d.own" "$p_mnt$a_root/xo-rx-dst"
+        echo "$e"
+    }
+    link_cross() {
+        local d="$p_mnt$p_root/xo-lk" i e=0
+        xo_mkset "$d" "$n"
+        mkdir -p "$p_mnt$a_root/xo-lk-dst"
+        for ((i = 0; i < n; i++)); do
+            ln "$d/f$i" "$p_mnt$a_root/xo-lk-dst/f$i" 2>/dev/null || e=$((e + 1))
+        done
+        rm -rf "$d" "$p_mnt$a_root/xo-lk-dst"
+        echo "$e"
+    }
+    unlink_own() {
+        local d="$p_mnt$p_root/xo-ul" i e=0
+        xo_mkset "$d" "$n"
+        for ((i = 0; i < n; i++)); do rm -f "$d/f$i" 2>/dev/null || e=$((e + 1)); done
+        rmdir "$d"
+        echo "$e"
+    }
+
+    local -a rows=()
+    rows+=("$(xo_phase xo-rename-own rename rename_own)")
+    rows+=("$(xo_phase xo-rename-50 rename "rename_cross 1 2")")
+    rows+=("$(xo_phase xo-rename-all rename "rename_cross 1 1")")
+    rows+=("$(xo_phase xo-link-all link link_cross)")
+    rows+=("$(xo_phase xo-unlink-own unlink unlink_own)")
+
+    echo ""
+    echo "== PR 8 (b): the CROSS-OWNER REFUSAL RATE, per verb, per placement (D18) =="
+    echo "== tier: $(pvo_tier "$OWNERS"); driver: partial authority $p; denominator: ops of THAT verb =="
+    printf '%-15s %-8s %-6s %-10s %-6s %-8s %s\n' PHASE VERB OPS REFUSALS RATE APP_ERRS WALL_S
+    local r
+    for r in "${rows[@]}"; do
+        # shellcheck disable=SC2086 # deliberate word split of the row line
+        printf '%-15s %-8s %-6s %-10s %-6s %-8s %s\n' $r
+    done | tee "$rowdir/pv-xo-table.txt"
+
+    # --- the `rm -rf` arm: the shape Issue 1 exposed ---------------------
+    # A subtree ROOT's own name spans two owners BY CONSTRUCTION (its
+    # dentry is in `/`, which the set authority owns; its inode is on the
+    # owner's volume) — that is the whole M3 census on a fresh set, and
+    # `rm -rf` of such a subtree must descend cleanly and then refuse the
+    # root itself with EXDEV, having destroyed nothing it could not
+    # finish. A refusal AFTER a durable effect is the failure this arm
+    # exists to detect.
+    local victim="$p_mnt$p_root/rmrf" rc=0 out
+    xo_mkset "$victim" "$n"
+    mkdir -p "$victim/sub"
+    echo x >"$victim/sub/deep"
+    rm -rf "$victim" || die "pv-cross-owner: rm -rf of an OWN subtree failed — nothing here is cross-owner"
+    [ ! -e "$victim" ] || die "pv-cross-owner: rm -rf left $victim standing"
+    log "rm -rf of an own-subtree tree: clean"
+    out="$(rm -rf "$p_mnt$p_root" 2>&1)" || rc=$?
+    if [ "$rc" -eq 0 ] && [ ! -e "$p_mnt$p_root" ]; then
+        die "pv-cross-owner: \`rm -rf $p_root\` REMOVED a partial authority's subtree root — its name spans two owners and must refuse EXDEV (ops.md: removing a root is a teardown act, \`volume set-owners --clear\` first)"
+    fi
+    [ -d "$p_mnt$p_root" ] ||
+        die "pv-cross-owner: the subtree root is gone but rm reported failure — a refusal after a durable effect is exactly what §5.4a's total-refusal law forbids"
+    echo "rm -rf <subtree root>: REFUSED, root intact: $out" | tee "$rowdir/pv-xo-rmrf.txt"
+
+    # --- the undeletable-in-place population, at both ends ---------------
+    echo ""
+    echo "undeletable-in-place population: ${OWNER_CENSUS_AT_ASSIGNMENT:-?} cross-owner name(s) at assignment"
+    echo "  (on a fresh verb-minted set that population IS the subtree roots — one name per root,"
+    echo "   which is the supported shape's stated cost; \`squeezefs volume get-owners --census\`"
+    echo "   re-counts it OFFLINE, so the end-of-run count is taken by the closing note's own"
+    echo "   teardown step rather than by this leg, which must not unmount the fleet under itself.)"
+
+    pvo_engagement_gate pv-cross-owner
+    pvo_oracle pv-cross-owner "$rowdir"
+    log "pv-cross-owner PUBLISHED (table + rm -rf arm + snapshots in $rowdir)"
+}
+
+# ---------------------------------------------------------------------------
+# (d) the R14 rand-4k W1 row — §5.1.3's priced regression
+#
+# On a K-node fleet, K-1 nodes are partial authorities and therefore lose
+# the W1 sole-owner extent patch (a lifetime incarnation retire is durable
+# ownership state; the §5.1 clone/patch fence is a two-word process-local
+# protocol no wire composes). Their isolated small overwrites ride
+# CoW-rewrite plus a shipped free instead of one in-place sub-block DMA.
+# This row PRICES it. Three arms, all labeled: partial authority, set
+# authority, and single-authority-today — the last one measured by running
+# this same leg on a plain `--multi-writer` fleet (it detects the shape and
+# emits the arm it can see), because a fleet cannot be both at once.
+#
+# INSTRUMENT: a python3 O_DIRECT random-4 KiB pwrite loop. It is the same
+# instrument in every arm — which is what the comparison needs — and it is
+# NOT an IOPS-ceiling instrument: the 61-67 k figure the W1 program
+# published came from elbencho/fio and this row must never be spliced with
+# it (the standing instrument-alignment lesson).
+# ---------------------------------------------------------------------------
+pvo_rand4k() { # mnt-path file-path secs -> iops
+    python3 - "$1" "$2" "$3" <<'PYRW4K'
+import os, random, sys, time
+path, secs = sys.argv[2], float(sys.argv[3])
+fd = os.open(path, os.O_WRONLY | os.O_DIRECT)
+try:
+    size = os.fstat(fd).st_size
+    blocks = size // 4096
+    buf = bytearray(os.urandom(4096))
+    # O_DIRECT needs a page-aligned buffer: mmap gives one (the
+    # instrument-alignment lesson — an unaligned buffer would be split).
+    import mmap
+    m = mmap.mmap(-1, 4096)
+    m.write(bytes(buf))
+    view = memoryview(m)
+    rnd = random.Random(1234)
+    n, t0 = 0, time.monotonic()
+    while time.monotonic() - t0 < secs:
+        for _ in range(64):
+            os.pwrite(fd, view, rnd.randrange(blocks) * 4096)
+            n += 1
+    dt = time.monotonic() - t0
+finally:
+    os.close(fd)
+print(f"{n/dt:.0f}")
+PYRW4K
+}
+
+leg_pv_rand4k_w1() {
+    pv_quiet_or_die
+    local rowdir secs mb multi=0
+    rowdir="$STATE/rows/pv-rand4k-$(date +%s)"
+    mkdir -p "$rowdir"
+    secs="$PVO_W1_SECS"
+    mb="$PVO_W1_MB"
+    [ "${OWNERS:-0}" != "0" ] && [ "${OWNERS_ASSIGNED:-0}" = "1" ] && multi=1
+
+    w1_arm() { # label idx root -> "label iops patch_writes ineligible accounting_refusals"
+        local label="$1" idx="$2" root="$3" mnt f iops pw inel acc key sum=0 v
+        mnt="$(mnt_of "$idx")"
+        f="$mnt$root/pvw1-$label.dat"
+        rm -f "$f"
+        dd if=/dev/zero of="$f" bs=1M count="$mb" conv=fsync status=none ||
+            die "pv-rand4k-w1 $label: could not lay the file down"
+        sync
+        sleep 2
+        snap "$idx" "${label}0" "$rowdir"
+        iops="$(pvo_rand4k "$mnt" "$f" "$secs")"
+        sleep 2
+        snap "$idx" "${label}1" "$rowdir"
+        rm -f "$f"
+        pw="$(s8a_delta "$rowdir" "$idx" "$label" patch_writes)"
+        acc="$(s8a_delta "$rowdir" "$idx" "$label" cowriter.accounting_refusals)"
+        for key in unmapped decorated unaligned overlay shared transform adjacent oversize; do
+            v="$(s8a_delta "$rowdir" "$idx" "$label" "patch_ineligible_$key")"
+            sum=$((sum + v))
+        done
+        echo "$label $iops patch=$pw ineligible=$sum acct_refusals=$acc"
+    }
+
+    local -a rows=() p a_root p_root
+    if [ "$multi" = "1" ]; then
+        p="$(pvo_partial_idxs | head -1)"
+        p_root="$(pvo_setup_gate "$p" "pv-rand4k/partial")"
+        a_root="$(pvo_setup_gate 0 "pv-rand4k/set-authority")"
+        rows+=("$(w1_arm partial-1 "$p" "$p_root")")
+        rows+=("$(w1_arm setauth-1 0 "$a_root")")
+        rows+=("$(w1_arm setauth-2 0 "$a_root")")
+        rows+=("$(w1_arm partial-2 "$p" "$p_root")")
+    else
+        log "pv-rand4k-w1: this fleet has no ownership assignment — emitting the SINGLE-AUTHORITY-TODAY arm (the third row of §5.1.3's table; run the leg again on an --owners fleet for the other two)"
+        rows+=("$(w1_arm single-1 0 "")")
+        rows+=("$(w1_arm single-2 0 "")")
+    fi
+
+    echo ""
+    echo "== PR 8 (d): the R14 rand-4k row — W1 sole-owner patch, priced per posture (§5.1.3) =="
+    echo "== tier: $([ "$multi" = "1" ] && pvo_tier "$OWNERS" || echo 'measured-real (single-authority control fleet)') =="
+    echo "== instrument: python3 O_DIRECT rand-4k pwrite, ${secs}s over a ${mb} MiB file — NEVER spliced with the elbencho/fio 61-67k W1 figures =="
+    printf '%-11s %-9s %s\n' ARM IOPS LEDGER
+    local r
+    for r in "${rows[@]}"; do
+        # shellcheck disable=SC2086 # deliberate word split of the row line
+        printf '%-11s %-9s %s\n' $r
+    done | tee "$rowdir/pv-rand4k-table.txt"
+    if [ "$multi" = "1" ]; then
+        # The R14 statement, made falsifiable: the set authority is
+        # data-plane byte-identical to a writer and MUST patch; the
+        # partial authority is co-writer class and must NOT.
+        local a_patch p_patch
+        a_patch="$(echo "${rows[1]}" | sed -n 's/.*patch=\([0-9]*\).*/\1/p')"
+        p_patch="$(echo "${rows[0]}" | sed -n 's/.*patch=\([0-9]*\).*/\1/p')"
+        [ "$p_patch" = "0" ] ||
+            die "pv-rand4k-w1: the PARTIAL authority performed $p_patch W1 patch write(s) — a lifetime incarnation retire is durable ownership state and this posture may not do it (§5.1.3, R14)"
+        [ "$a_patch" -gt 0 ] ||
+            die "pv-rand4k-w1: the SET AUTHORITY performed 0 W1 patch writes — its data plane is byte-identical to a writer's by contract, so either the shape was ineligible (read the ineligible ledger) or the posture regressed"
+        python3 - "${rows[0]}" "${rows[3]}" "${rows[1]}" "${rows[2]}" <<'PYW1' | tee "$rowdir/pv-rand4k-verdict.txt"
+import sys
+p = [float(r.split()[1]) for r in (sys.argv[1], sys.argv[2])]
+a = [float(r.split()[1]) for r in (sys.argv[3], sys.argv[4])]
+pm, am = sum(p) / 2, sum(a) / 2
+print(f"R14 price: partial authority {pm:.0f} IOPS vs set authority {am:.0f} IOPS -> {pm/am:.2f}x")
+print("NO GATE: R14 is a NAMED, ACCEPTED regression (design §8) — this row publishes its size "
+      "on this venue. It is not recoverable inside this program.")
+PYW1
+    fi
+    [ "$multi" = "1" ] && pvo_engagement_gate pv-rand4k-w1
+    pvo_oracle pv-rand4k-w1 "$rowdir"
+    log "pv-rand4k-w1 PUBLISHED (table + snapshots in $rowdir)"
 }
 
 leg_cowriters_admission() {
@@ -6176,8 +6832,11 @@ s10-delegation) leg_s10_delegation ;;
 s10-intents) leg_s10_intents ;;
 s10-intents-tarx) leg_s10_intents_tarx ;;
 s10-placement-tarx) leg_s10_placement_tarx ;;
+pv-rewrite-funnel) leg_pv_rewrite_funnel ;;
+pv-cross-owner) leg_pv_cross_owner ;;
+pv-rand4k-w1) leg_pv_rand4k_w1 ;;
 cowriters-admission) leg_cowriters_admission ;;
 vm-hostscope-validate) leg_vm_hostscope_validate ;;
 vm-multi-identity) leg_vm_multi_identity ;;
-*) die "unknown leg '$LEG' (pv-volume-scaling|smoke|multipath-negative|s6-journal|s6-fence|s6-vm-fence|s7-device-fence|s7-kill-matrix|s8-serial-ab|s8-crucible|s9-fanout|s9-failover|s9-colocated-fence|s11-range|s11-subblock|s11-mpiio|s11-blockcyclic|s11-tiny|s11-killrange|s10c-fsck-scale|s10c-kill-shard|s10-delegation|s10-intents|s10-intents-tarx|s10-placement-tarx|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
+*) die "unknown leg '$LEG' (pv-volume-scaling|smoke|multipath-negative|s6-journal|s6-fence|s6-vm-fence|s7-device-fence|s7-kill-matrix|s8-serial-ab|s8-crucible|s9-fanout|s9-failover|s9-colocated-fence|s11-range|s11-subblock|s11-mpiio|s11-blockcyclic|s11-tiny|s11-killrange|s10c-fsck-scale|s10c-kill-shard|s10-delegation|s10-intents|s10-intents-tarx|s10-placement-tarx|pv-rewrite-funnel|pv-cross-owner|pv-rand4k-w1|cowriters-admission|vm-hostscope-validate|vm-multi-identity)" ;;
 esac

@@ -2045,13 +2045,22 @@ async fn run_job_worker(meta_uri: &str) -> Result<(), Box<dyn std::error::Error>
         fn run_fleet_shard(
             &self,
             job: &squeezefs::jobs::JobType,
-            shard_k: u32,
-            shard_count: u32,
-            throttle_pct: u32,
+            spec: squeezefs::job_wire::FleetShardSpec,
         ) -> std::io::Result<Vec<u8>> {
+            if spec.inode_plane {
+                // KD-PV-16: only a volume's OWNER may judge its inode
+                // plane, and a standalone storage-trust worker owns
+                // nothing (its `worker_id` is `{hostname}:{pid}`, which
+                // no `OwnerMap` can name). Refused loud rather than
+                // answered from a probe's view.
+                return Err(std::io::Error::other(
+                    "the probe fleet seam is not a metadata owner: it never judges the inode \
+                     plane (KD-PV-16)",
+                ));
+            }
             let mut o = squeezefs::fsck::FsckOptions::offline();
-            o.shard = Some((shard_k, shard_count));
-            o.throttle_pct = throttle_pct;
+            o.shard = Some((spec.k, spec.n));
+            o.throttle_pct = spec.throttle_pct;
             if let squeezefs::jobs::JobType::Fsck {
                 scrub, scrub_only, ..
             } = job
@@ -2252,6 +2261,10 @@ async fn run_fsck_verb(
         let ropts = squeezefs::fsck::RepairOptions {
             apply: repair_args.apply,
             quarantine_dir: repair_args.quarantine_dir.clone().map(Into::into),
+            // KD-PV-8: the OFFLINE whole-set pass keeps full teeth — it
+            // runs under the D0-guarded open with every owner unmounted,
+            // so there is no peer projection in it to be wrong about.
+            multi_owner: false,
         };
         squeezefs::fsck::run_offline_repair(&meta_lvs, &opts, &ropts).await?
     } else {

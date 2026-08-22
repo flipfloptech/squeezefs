@@ -254,6 +254,30 @@ pub struct ShardDescriptor {
     /// [`WireFrame::ReadShardResult`]. `None` = the whole-job mutating
     /// shape (destinations + checksums), unchanged.
     pub fleet: Option<(u32, u32)>,
+    /// **KD-PV-16**: this fleet shard is an **inode-plane** shard, not a
+    /// census residue — the worker evaluates C9/C10 over the volumes IT
+    /// owns and reports no census. `#[serde(default)]`: a pre-PR-6
+    /// coordinator's frame decodes to `false`, which is the census shape
+    /// verbatim, and a pre-PR-6 worker ignores the field and answers a
+    /// residue-labelled report the coordinator then treats as a LOST
+    /// plane shard (it never silently counts as coverage).
+    #[serde(default)]
+    pub inode_plane: bool,
+}
+
+/// What a fleet shard asks of the worker's seam
+/// ([`ShardDeviceSeam::run_fleet_shard`]).
+#[derive(Debug, Clone, Copy)]
+pub struct FleetShardSpec {
+    /// The ino residue this shard covers (`k` of `n`) — meaningless, and
+    /// ignored, when [`Self::inode_plane`] is set.
+    pub k: u32,
+    pub n: u32,
+    /// KD-3's duty cycle, applied per worker inside the walk.
+    pub throttle_pct: u32,
+    /// KD-PV-16: run the INODE PLANE over the volumes this node owns
+    /// instead of the census residue.
+    pub inode_plane: bool,
 }
 
 /// The §5.1.6 job-shard wire vocabulary — the frames, not the transport
@@ -433,19 +457,14 @@ pub trait ShardDeviceSeam: Send + Sync {
     /// Coordinator-side verify-read before publish.
     fn read_block(&self, dest: &DestTuple) -> std::io::Result<Vec<u8>>;
     /// KD-MW-16 (rung 10c): execute one fleet READ shard — the
-    /// ino-residue `shard_k` of `shard_count` of `job`'s detect pass —
-    /// and return the serialized shard report. Runs on the worker's own
-    /// blocking lane; the KD-3 duty cycle (`throttle_pct`) applies PER
-    /// WORKER inside the walk. Default: refused loud — a seam that does
-    /// not implement the read class must never fake a report
-    /// (capability classing is routing; the refusal re-leases).
-    fn run_fleet_shard(
-        &self,
-        _job: &JobType,
-        _shard_k: u32,
-        _shard_count: u32,
-        _throttle_pct: u32,
-    ) -> std::io::Result<Vec<u8>> {
+    /// ino-residue `spec.k` of `spec.n` of `job`'s detect pass, or (since
+    /// KD-PV-16) this owner's INODE PLANE when `spec.inode_plane` is set
+    /// — and return the serialized shard report. Runs on the worker's own
+    /// blocking lane; the KD-3 duty cycle applies PER WORKER inside the
+    /// walk. Default: refused loud — a seam that does not implement the
+    /// read class must never fake a report (capability classing is
+    /// routing; the refusal re-leases).
+    fn run_fleet_shard(&self, _job: &JobType, _spec: FleetShardSpec) -> std::io::Result<Vec<u8>> {
         Err(std::io::Error::other(
             "this seam does not execute fleet read shards (KD-MW-16)",
         ))
@@ -2075,8 +2094,12 @@ impl JobWireHost {
             .cloned()
     }
 
-    /// KD-MW-16: an idle, non-expired session advertising `cap`.
-    fn pick_idle_capable_session(&self, cap: u32) -> Option<Arc<Session>> {
+    /// KD-MW-16: an idle, non-expired session advertising `cap` —
+    /// optionally the one
+    /// belonging to a NAMED worker (KD-PV-16: an inode-plane shard has
+    /// exactly one legitimate venue, the owner of the volumes it asks
+    /// about, so "any idle member" is not a substitute).
+    fn pick_session(&self, cap: u32, worker_id: Option<&str>) -> Option<Arc<Session>> {
         self.sessions
             .lock()
             .values()
@@ -2084,6 +2107,7 @@ impl JobWireHost {
                 s.caps & cap == cap
                     && !s.busy.load(Ordering::SeqCst)
                     && !s.expired.load(Ordering::SeqCst)
+                    && worker_id.is_none_or(|id| s.worker_id == id)
             })
             .cloned()
     }
@@ -2157,7 +2181,11 @@ impl JobWireHost {
         }
 
         shard.done.store(true, Ordering::SeqCst);
-        *shard.holder.lock() = None;
+        // §5.8.2 clause 2: the outcome carries the LEASE HOLDER's id from
+        // this table, captured before the lease is released — the
+        // coordinator's inode-plane admission reads it, never the
+        // payload's own account of who sent it.
+        let holder_id = shard.holder.lock().take().map(|h| h.worker_id);
         session.busy.store(false, Ordering::SeqCst);
         METRICS
             .job_remote_submissions
@@ -2170,6 +2198,7 @@ impl JobWireHost {
             let _ = tx.send(crate::jobs::FleetOutcome {
                 shard: shard_no,
                 payload: Some(payload),
+                worker_id: holder_id,
             });
         }
         let mut w = session.writer.lock();
@@ -2280,6 +2309,7 @@ impl JobWireHost {
             throttle_pct: ctl.throttle.load(Ordering::Relaxed),
             lease_ttl_ms: self.cfg.lease_ttl.as_millis() as u64,
             fleet: None,
+            inode_plane: false,
         };
         let mut w = session.writer.lock();
         w.send(&WireFrame::ShardAssign { shard: descriptor })
@@ -2392,6 +2422,7 @@ impl JobWireHost {
                 let _ = tx.send(crate::jobs::FleetOutcome {
                     shard: shard.shard,
                     payload: None,
+                    worker_id: Some(holder.worker_id.clone()),
                 });
             }
             return;
@@ -2682,10 +2713,66 @@ impl crate::jobs::FleetDispatch for JobWireHost {
         throttle_pct: u32,
         tx: &crate::jobs::FleetOutcomeTx,
     ) -> bool {
+        self.dispatch_fleet_shard(
+            job_id,
+            shard_no,
+            shard_count,
+            job_type,
+            throttle_pct,
+            tx,
+            None,
+        )
+    }
+
+    fn dispatch_inode_plane_shard(
+        &self,
+        job_id: &str,
+        shard_no: u32,
+        worker_id: &str,
+        job_type: &JobType,
+        throttle_pct: u32,
+        tx: &crate::jobs::FleetOutcomeTx,
+    ) -> bool {
+        // `shard_count` is carried unchanged for the record/frame shape;
+        // a plane shard covers volumes, not a residue of `n`.
+        self.dispatch_fleet_shard(
+            job_id,
+            shard_no,
+            1,
+            job_type,
+            throttle_pct,
+            tx,
+            Some(worker_id),
+        )
+    }
+
+    fn retire_fleet_shards(&self, job_id: &str) {
+        self.shards
+            .lock()
+            .retain(|(jid, _), s| jid != job_id || s.fleet.is_none());
+    }
+}
+
+impl JobWireHost {
+    /// The shared body of both fleet dispatch verbs: `plane_owner`
+    /// `Some(worker_id)` makes this an inode-plane shard bound to that
+    /// owner's session (KD-PV-16); `None` is the census residue's
+    /// any-idle-member shape, unchanged.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_fleet_shard(
+        &self,
+        job_id: &str,
+        shard_no: u32,
+        shard_count: u32,
+        job_type: &JobType,
+        throttle_pct: u32,
+        tx: &crate::jobs::FleetOutcomeTx,
+        plane_owner: Option<&str>,
+    ) -> bool {
         if self.shutdown.load(Ordering::SeqCst) || !self.listening {
             return false;
         }
-        let Some(session) = self.pick_idle_capable_session(CAP_FLEET_READ) else {
+        let Some(session) = self.pick_session(CAP_FLEET_READ, plane_owner) else {
             return false;
         };
         // Re-dispatches of a lost residue REUSE the shard state (and its
@@ -2733,6 +2820,7 @@ impl crate::jobs::FleetDispatch for JobWireHost {
             throttle_pct,
             lease_ttl_ms: self.cfg.lease_ttl.as_millis() as u64,
             fleet: Some((shard_no, shard_count)),
+            inode_plane: plane_owner.is_some(),
         };
         let sent = {
             let mut w = session.writer.lock();
@@ -2767,6 +2855,7 @@ impl crate::jobs::FleetDispatch for JobWireHost {
             "shard_fencing": fencing,
             "lease_ttl_ms": self.cfg.lease_ttl.as_millis() as u64,
             "fleet": [shard_no, shard_count],
+            "inode_plane": plane_owner.is_some(),
         })
         .to_string();
         let name = format!("job:{job_id}:shard:{shard_no}");
@@ -2776,12 +2865,6 @@ impl crate::jobs::FleetDispatch for JobWireHost {
             }
         });
         true
-    }
-
-    fn retire_fleet_shards(&self, job_id: &str) {
-        self.shards
-            .lock()
-            .retain(|(jid, _), s| jid != job_id || s.fleet.is_none());
     }
 }
 
@@ -3139,9 +3222,14 @@ impl JobWireWorker {
                 }
                 let seam2 = Arc::clone(&seam);
                 let jt = shard.job_type.clone();
-                let pct = shard.throttle_pct;
+                let spec = FleetShardSpec {
+                    k,
+                    n,
+                    throttle_pct: shard.throttle_pct,
+                    inode_plane: shard.inode_plane,
+                };
                 let outcome =
-                    sqz_blocking::run_blocking(move || seam2.run_fleet_shard(&jt, k, n, pct)).await;
+                    sqz_blocking::run_blocking(move || seam2.run_fleet_shard(&jt, spec)).await;
                 match outcome {
                     Ok(payload) => {
                         // The pause-before-submit test hook (the zombie

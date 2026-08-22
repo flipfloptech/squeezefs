@@ -22,7 +22,7 @@
 use crate::fsck::{self, FsckCtx, FsckOptions};
 use crate::fuse_client::METRICS;
 use crate::job_wire::{
-    self, DestTuple, JobWireWorker, ShardDeviceSeam, WorkerOptions, CAP_FLEET_READ,
+    self, DestTuple, FleetShardSpec, JobWireWorker, ShardDeviceSeam, WorkerOptions, CAP_FLEET_READ,
     HEARTBEAT_INTERVAL,
 };
 use crate::jobs::JobType;
@@ -110,13 +110,7 @@ impl ShardDeviceSeam for MountFleetSeam {
         ))
     }
 
-    fn run_fleet_shard(
-        &self,
-        job: &JobType,
-        shard_k: u32,
-        shard_count: u32,
-        throttle_pct: u32,
-    ) -> std::io::Result<Vec<u8>> {
+    fn run_fleet_shard(&self, job: &JobType, spec: FleetShardSpec) -> std::io::Result<Vec<u8>> {
         // R5 at admission: Red refuses before any work (counted).
         if let Err(e) = refuse_on_red((self.level)()) {
             METRICS
@@ -125,16 +119,55 @@ impl ShardDeviceSeam for MountFleetSeam {
             return Err(e);
         }
         let mut opts = FsckOptions::offline();
-        opts.shard = Some((shard_k, shard_count));
+        opts.throttle_pct = spec.throttle_pct;
+        if spec.inode_plane {
+            // **KD-PV-16's OWNER shard**: the coordinator asked THIS node
+            // for the inode plane over the volumes it appends to. The
+            // posture is derived from this process's OWN ownership map —
+            // never from the frame, which says only *that* the plane was
+            // asked for, not which volumes this node owns.
+            let owned: Vec<usize> = match crate::meta_ship::owners::owner_map()
+                .filter(|m| m.multi_owner())
+            {
+                Some(map) => (0..map.volume_count())
+                    .filter(|v| map.owner_of_volume(*v).is_none())
+                    .collect(),
+                None => {
+                    // The coordinator believes this node owns volumes and
+                    // this node's own plane says it owns none: refuse
+                    // loud (the shard re-leases / its volumes read as
+                    // uncovered) rather than answer about a set it has no
+                    // authority over.
+                    return Err(std::io::Error::other(
+                        "an inode-plane shard was assigned to a node with no armed multi-owner \
+                         ownership map — refused (KD-PV-16: only an owner may judge its own \
+                         inos, and this node owns nothing here)",
+                    ));
+                }
+            };
+            opts.inode_plane = true;
+            opts.inode_plane_only = true;
+            opts.multi_owner = true;
+            opts.owned_volumes = Some(owned);
+            let ctx = FsckCtx {
+                meta: self.meta.clone(),
+                router: self.router.clone(),
+                staging_dirs: Vec::new(), // the plane touches no staging
+                expected_generation: self.expected_generation.clone(),
+            };
+            let report = sqz_blocking::block_on(fsck::run(&ctx, &opts))
+                .map_err(|e| std::io::Error::other(format!("owner inode-plane shard: {e}")))?;
+            return serde_json::to_vec(&report).map_err(std::io::Error::other);
+        }
+        opts.shard = Some((spec.k, spec.n));
         opts.staging_full = true;
-        opts.throttle_pct = throttle_pct;
         // The one-view law (`FsckOptions::inode_plane`): this member's
         // coherent view is staleness-bounded (S5) and its per-volume
         // checkpoint projections sit at different instants mid-churn, so
         // C9/C10 verdicts taken here manufacture the count/name loss
-        // shapes from a healthy tree. The coordinator's finalize judges
-        // the whole plane from its one view; this shard contributes the
-        // census/refs the block-plane finalize needs and nothing else.
+        // shapes from a healthy tree. A CENSUS residue shard therefore
+        // never judges the plane whatever this node owns — it contributes
+        // the census/refs the block-plane finalize needs and nothing else.
         opts.inode_plane = false;
         if let JobType::Fsck {
             scrub, scrub_only, ..

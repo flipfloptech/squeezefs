@@ -1015,6 +1015,16 @@ pub fn fabric_workers_default(cpus: usize) -> usize {
 pub struct FleetOutcome {
     pub shard: u32,
     pub payload: Option<Vec<u8>>,
+    /// **KD-PV-16 / §5.8.2 clause 2**: the lease HOLDER's `worker_id`,
+    /// filled by the wire from its OWN lease table — never from the
+    /// payload. This is what makes the coordinator's inode-plane
+    /// admission predicate evidence-based instead of self-declared: a
+    /// fleet worker's `worker_id` IS its durable KD-MW-2 enrollment id
+    /// (`cowriter::node_member_id`), the same identity space as
+    /// `claim_set.owner` and `PeerOwner::peer_id`, so it is one owner-map
+    /// lookup on an id the coordinator already trusts. `None` when no
+    /// lease was held (a shard that never dispatched).
+    pub worker_id: Option<String>,
 }
 
 /// The outcome channel a fleet shard set collects on (unbounded: a
@@ -1048,12 +1058,81 @@ pub trait FleetDispatch: Send + Sync {
         throttle_pct: u32,
         tx: &FleetOutcomeTx,
     ) -> bool;
+    /// **KD-PV-16**: assign one INODE-PLANE shard to the session whose
+    /// `worker_id` is `worker_id` — the owner of the volumes this shard
+    /// is being asked about. Targeted, deliberately: the census fan-out
+    /// picks any idle capable member because a residue is
+    /// ownership-blind, while the inode plane's candidate scope IS
+    /// ownership (KD-PV-7), so "some idle member" is never the right
+    /// venue. Returns `false` when that owner has no idle, non-expired,
+    /// read-capable session — the coordinator then reports its volumes
+    /// UNCOVERED rather than judging them here (a peer's inos judged
+    /// locally is the false-positive generator the scoping refuses).
+    fn dispatch_inode_plane_shard(
+        &self,
+        job_id: &str,
+        shard_no: u32,
+        worker_id: &str,
+        job_type: &JobType,
+        throttle_pct: u32,
+        tx: &FleetOutcomeTx,
+    ) -> bool;
     /// Drop the job's fleet shard state at pass end (the coordinator's
     /// live map is per-`(job, shard)`; without retirement every fleet
     /// pass would grow it by N-1 forever). A zombie's LATE proposal
     /// still refuses stale after retirement — the unknown-shard arm is
     /// the same refusal class.
     fn retire_fleet_shards(&self, job_id: &str);
+}
+
+/// The shard-number space KD-PV-16's inode-plane shards live in, disjoint
+/// from the census residues `1..n` by construction (a set can never have
+/// 2^20 metadata volumes: the routing width is `2^16` slots and a volume
+/// hosts at least one). Keeping one number space means the wire's shard
+/// map, lease law, fencing identity and durable `job:{id}:shard:{k}`
+/// records are the EXISTING ones, unchanged.
+pub const INODE_PLANE_SHARD_BASE: u32 = 1 << 20;
+
+/// **KD-PV-14** (`docs/design-per-volume-claim-admission.md` §5.4b): the
+/// maintenance coordinator is the owner of the volume hosting **slot 0**
+/// — D20's set authority, which is also where the `job:` records live
+/// (they are written through the routed `setxattr(ROOT_INO, …)`, so
+/// `daemon_verb_router` already ships them there). One predicate over
+/// already-durable state; no election.
+///
+/// `None` = this node may coordinate, which is EVERY unarmed mount (the
+/// shipped posture: `owner_map()` is `None`, one relaxed load, and the
+/// answer is unchanged). `Some(refusal)` names the set authority, its
+/// endpoint, and — because the two are easy to confuse — WHICH of the two
+/// acts the operator hit: coordinator-class acts (minting a job record,
+/// planning shards, applying repairs) are refused, an owner's
+/// participation as a detection SHARD is not (KD-PV-16 fans the inode
+/// plane out to every owner precisely because the alternative is 1/K
+/// coverage; a shard is a fencing-checked result proposal on the existing
+/// wire, not a second coordinator).
+///
+/// Why it exists: under the recipe EVERY partial authority holds a D0
+/// claim on some volume, so the pre-recipe "do I hold the claim?"
+/// predicate is true on all K nodes — K concurrent coordinators over one
+/// set.
+pub fn maintenance_coordinator_refusal() -> Option<String> {
+    let map = crate::meta_ship::owners::owner_map()?;
+    if !map.multi_owner() || map.owns_slot_0() {
+        return None;
+    }
+    let authority = map
+        .set_authority()
+        .map(|p| format!("'{}' at {}", p.peer_id, p.endpoint))
+        .unwrap_or_else(|| "the owner of the slot-0 volume (unknown to this map)".to_string());
+    Some(format!(
+        "refusing to COORDINATE maintenance on this volume set: the maintenance coordinator is \
+         the SET AUTHORITY — the owner of the volume hosting metadata slot 0 — and that is \
+         {authority}, not this node (design-per-volume-claim-admission KD-PV-14/D20). Submit \
+         fsck/defrag/job verbs there (`squeezefs volume get-owners` renders the map). This \
+         refusal covers COORDINATOR-CLASS acts only — minting a job record, planning shards, \
+         applying repairs; this node still SERVES the inode-plane and census shards the \
+         coordinator leases to it (KD-PV-16), which is participation, not a second coordinator"
+    ))
 }
 
 pub struct JobFabric {
@@ -1161,6 +1240,11 @@ impl JobFabric {
 
     /// Submit a job: durable record first (whole-tx), then enqueue.
     pub async fn submit(&self, spec: JobSpec) -> crate::error::Result<String> {
+        // KD-PV-14: minting a job record IS the coordinator-class act, so
+        // this is where a second coordinator over one set is refused.
+        if let Some(refusal) = maintenance_coordinator_refusal() {
+            return Err(crate::error::SqueezefsError::InvalidOperation(refusal));
+        }
         let job_id = uuid::Uuid::new_v4().to_string();
         let throttle = if spec.throttle_pct == 0 {
             self.default_throttle
@@ -1714,6 +1798,10 @@ impl JobFabric {
                 let ropts = repair.then(|| crate::fsck::RepairOptions {
                     apply,
                     quarantine_dir: quarantine_dir.map(std::path::PathBuf::from),
+                    // Filled from this mount's own ownership map inside
+                    // `run_fsck_job` (KD-PV-8) — the executor is where
+                    // the live posture is read.
+                    multi_owner: false,
                 });
                 self.run_fsck_job(job_id, ctl, scrub, scrub_only, ropts)
                     .await
@@ -1749,6 +1837,21 @@ impl JobFabric {
         opts.scrub = scrub;
         opts.scrub_only = scrub_only;
         opts.throttle_pct = ctl.throttle.load(Ordering::Relaxed);
+        // KD-PV-7/KD-PV-8: this mount's inode-plane posture, derived from
+        // its OWN ownership map (unarmed ⇒ `None`/`false`, i.e. the
+        // shipped whole-set pass, byte-identical).
+        if let Some(map) = crate::meta_ship::owners::owner_map().filter(|m| m.multi_owner()) {
+            opts.multi_owner = true;
+            opts.owned_volumes = Some(
+                (0..map.volume_count())
+                    .filter(|v| map.owner_of_volume(*v).is_none())
+                    .collect(),
+            );
+        }
+        let repair_opts = repair_opts.map(|r| crate::fsck::RepairOptions {
+            multi_owner: opts.multi_owner,
+            ..r
+        });
         let fsck_ctx = crate::fsck::FsckCtx {
             meta: self.meta.clone(),
             router: ctx.router.clone(),

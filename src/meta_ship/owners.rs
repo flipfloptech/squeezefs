@@ -106,6 +106,11 @@ pub struct OwnerMap {
     /// slot map at build time — what the S4 lock plane installs so both
     /// planes answer one question.
     local_slots: Vec<u16>,
+    /// The volume hosting **slot 0** — D20's set-authority anchor,
+    /// derived from the same live slot map. KD-PV-6 pins slot 0
+    /// non-migratable while the plane is armed, which is what keeps this
+    /// index true for the map's whole lifetime.
+    slot_0_volume: usize,
     /// The set's frozen routing width, recorded so a re-arm can be
     /// detected against a set whose width differs (a different set).
     routing_width: u64,
@@ -165,11 +170,13 @@ impl OwnerMap {
             .iter()
             .map(|_| AtomicBool::new(false))
             .collect();
+        let slot_0_volume = slot_map.first().copied().unwrap_or(0);
         Arc::new(Self {
             volume_owners,
             assignment,
             poisoned,
             local_slots,
+            slot_0_volume,
             routing_width: routed.routing_width(),
         })
     }
@@ -251,6 +258,14 @@ impl OwnerMap {
     /// KD-PV-6 pins slot 0 to its volume while the plane is armed.
     pub fn owns_slot_0(&self) -> bool {
         self.local_slots.contains(&0)
+    }
+
+    /// **The SET AUTHORITY** (D20): the owner of the volume hosting slot
+    /// 0 — `None` when that is this node. What KD-PV-14's maintenance
+    /// refusal names so an operator learns where to go instead of being
+    /// told only where not to be.
+    pub fn set_authority(&self) -> Option<&Arc<PeerOwner>> {
+        self.owner_of_volume(self.slot_0_volume)
     }
 
     /// Is this volume's entry POISONED (§5.10)? A poisoned entry answers
@@ -694,6 +709,7 @@ fn adopt_holder(v_idx: usize, holder: &str) {
             .map(|v| AtomicBool::new(v != v_idx && map.is_poisoned(v)))
             .collect(),
         local_slots: map.local_slots.clone(),
+        slot_0_volume: map.slot_0_volume,
         routing_width: map.routing_width,
     });
     arm_ownership(fresh);

@@ -5026,6 +5026,37 @@ pub struct Metrics {
     /// `fsck_inflight_exempted`: growth under concurrent
     /// link/unlink/rename traffic is the proof the shield is not vacuous.
     pub fsck_nlink_transient_cleared: Align64<AtomicU64>,
+    /// **KD-PV-16's coverage assertion**
+    /// (`docs/design-per-volume-claim-admission.md` §5.8.1) — a GAUGE
+    /// (the last pass's answer, not a running total): how many of the
+    /// set's volumes the last inode-plane pass actually judged. A
+    /// completed fleet pass must satisfy `== volume_count`; a short count
+    /// means the pass was INCOMPLETE (an owner shard did not report),
+    /// never that the plane is healthier than it looks. **This is what
+    /// stops `fsck_findings == 0` from passing trivially at 1/K
+    /// coverage.**
+    pub fsck_inode_plane_volumes_covered: Align64<AtomicU64>,
+    /// KD-PV-7 engagement: inode-plane candidates left to their own
+    /// volume's OWNER (this node does not append there, so its writer-era
+    /// ino floor for that keyspace is a snapshot of a cursor another node
+    /// advances). 0 on every single-authority mount.
+    pub fsck_inode_plane_foreign_scoped: Align64<AtomicU64>,
+    /// The population whose verdict is **undecidable online under
+    /// multi-owner**: a dangling name whose dentry record lives on a
+    /// peer's volume while its child ino homes here. Declined rather than
+    /// guessed at; the offline whole-set pass is its only detector.
+    pub fsck_inode_plane_cross_owner_declined: Align64<AtomicU64>,
+    /// §5.8.2 engagement, per PROPOSAL: owner shards whose inode-plane
+    /// report this coordinator ADMITTED — coverage that closes without
+    /// one came from nowhere.
+    pub fsck_inode_plane_proposals_admitted: Align64<AtomicU64>,
+    /// §5.8.2 tripwire, per PROPOSAL — **MUST STAY 0 on a homogeneous
+    /// fleet**: shard reports whose inode-plane findings were dropped
+    /// because this coordinator's own lease table + owner map do not
+    /// entitle the proposer to them. Growth means a non-owner is
+    /// proposing the plane, i.e. the `fix/mw-xv-unlink-c10` mirage path
+    /// is live.
+    pub fsck_inode_plane_proposals_stripped: Align64<AtomicU64>,
     /// Verified findings (class-labeled C1–C10 in the report). MUST stay
     /// 0 on healthy volumes.
     pub fsck_findings: Align64<AtomicU64>,
@@ -5048,6 +5079,13 @@ pub struct Metrics {
     pub fsck_repairs_planned: Align64<AtomicU64>,
     pub fsck_repairs_applied: Align64<AtomicU64>,
     pub fsck_repairs_refused: Align64<AtomicU64>,
+    /// KD-PV-8: the subset of `fsck_repairs_refused` declined because a
+    /// multi-owner plane is armed and the action is one of the
+    /// destructive trio (C9 destroy, C10 lower, C10 remove-name).
+    /// **Expected nonzero** on a multi-owner online pass with such
+    /// findings; **0 on the offline whole-set pass** — the inverted
+    /// reading is the point.
+    pub fsck_repair_refused_multi_owner: Align64<AtomicU64>,
     /// Quarantine-first accounting: records (meta/custody images +
     /// move-aside files), blocks (device-block byte copies), and total
     /// bytes copied into the per-run quarantine before anything was
@@ -9389,6 +9427,15 @@ impl SqueezefsFilesystem {
                 "fsck_nlink_zero_named": METRICS.fsck_nlink_zero_named.load(Ordering::Relaxed),
                 "fsck_dangling_dentries": METRICS.fsck_dangling_dentries.load(Ordering::Relaxed),
                 "fsck_nlink_transient_cleared": METRICS.fsck_nlink_transient_cleared.load(Ordering::Relaxed),
+                // KD-PV-16 (per-volume claim admission §5.8.1/§5.8.2):
+                // the coverage assertion and the admission ledger.
+                // `covered == volume_count` is half the gate; `stripped`
+                // must stay 0 on a homogeneous fleet.
+                "fsck_inode_plane_volumes_covered": METRICS.fsck_inode_plane_volumes_covered.load(Ordering::Relaxed),
+                "fsck_inode_plane_foreign_scoped": METRICS.fsck_inode_plane_foreign_scoped.load(Ordering::Relaxed),
+                "fsck_inode_plane_cross_owner_declined": METRICS.fsck_inode_plane_cross_owner_declined.load(Ordering::Relaxed),
+                "fsck_inode_plane_proposals_admitted": METRICS.fsck_inode_plane_proposals_admitted.load(Ordering::Relaxed),
+                "fsck_inode_plane_proposals_stripped": METRICS.fsck_inode_plane_proposals_stripped.load(Ordering::Relaxed),
                 "fsck_findings": METRICS.fsck_findings.load(Ordering::Relaxed),
                 "fsck_scan_secs": METRICS.fsck_scan_secs.load(Ordering::Relaxed),
                 "scrub_blocks_scanned": METRICS.scrub_blocks_scanned.load(Ordering::Relaxed),
@@ -9401,6 +9448,7 @@ impl SqueezefsFilesystem {
                 "fsck_repairs_planned": METRICS.fsck_repairs_planned.load(Ordering::Relaxed),
                 "fsck_repairs_applied": METRICS.fsck_repairs_applied.load(Ordering::Relaxed),
                 "fsck_repairs_refused": METRICS.fsck_repairs_refused.load(Ordering::Relaxed),
+                "fsck_repair_refused_multi_owner": METRICS.fsck_repair_refused_multi_owner.load(Ordering::Relaxed),
                 "fsck_quarantined_records": METRICS.fsck_quarantined_records.load(Ordering::Relaxed),
                 "fsck_quarantined_blocks": METRICS.fsck_quarantined_blocks.load(Ordering::Relaxed),
                 "fsck_quarantined_bytes": METRICS.fsck_quarantined_bytes.load(Ordering::Relaxed),

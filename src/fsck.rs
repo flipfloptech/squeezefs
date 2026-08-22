@@ -329,21 +329,63 @@ pub struct FsckOptions {
     /// contracts; never set this outside a held-latch scope.
     pub assume_latched: bool,
     /// Evaluate the INODE-PLANE classes (C9/C10) in this run. `true`
-    /// everywhere except the FLEET plane (KD-MW-16), where the plane is
-    /// a **one-view plane**: its verdicts are census-vs-dentry-pass
-    /// AGREEMENT, so both walks and every verification read must share
-    /// one authority's coherent instant. A fleet member's shard runs
-    /// over its S5 staleness-bounded reader view, whose per-volume
-    /// checkpoint projections sit at DIFFERENT instants mid-churn — a
-    /// dentry read at volume A's older instant beside its record at
-    /// volume B's newer one manufactures exactly the
-    /// `C10ZeroNlinkNamed`/`C10DanglingDentry` loss shapes from a
+    /// everywhere except a fleet MEMBER's shard (KD-MW-16), where the
+    /// plane is a **one-view plane**: its verdicts are
+    /// census-vs-dentry-pass AGREEMENT, so both walks and every
+    /// verification read must share one authority's coherent instant. A
+    /// fleet member's shard runs over its S5 staleness-bounded reader
+    /// view, whose per-volume checkpoint projections sit at DIFFERENT
+    /// instants mid-churn — a dentry read at volume A's older instant
+    /// beside its record at volume B's newer one manufactures exactly
+    /// the `C10ZeroNlinkNamed`/`C10DanglingDentry` loss shapes from a
     /// healthy tree, and the member-side ladder re-reads the same
     /// shifted view, so verification cannot clear it (the 2026-08-17
     /// tarx conviction: 25 findings, all self-healed once the reader's
-    /// poll caught up). Fleet shards therefore skip the plane and
-    /// `run_fleet`'s finalize judges it whole, on the coordinator.
+    /// poll caught up).
+    ///
+    /// **The skip is POSTURE-conditional since KD-PV-16**
+    /// (`docs/design-per-volume-claim-admission.md` §5.8.1/§5.8.2 F5):
+    /// an **OWNER** shard evaluates the plane over [`Self::owned_volumes`]
+    /// while a **member/reader** shard still skips it. The distinction is
+    /// one of KIND, not of degree — an owner reads records it APPENDS to
+    /// (authoritative, not projected) plus a cross-owner reference set
+    /// the §5.9.2 freeze law makes unchangeable, so the one-view law is
+    /// restated as *one coherent view per OWNER over its OWN inos*
+    /// rather than weakened. Without the restatement, KD-PV-7's scoping
+    /// composed with KD-PV-14's single coordinator would leave 1/K of
+    /// the set's inodes unevaluated online (R17), and PR 6's
+    /// `fsck_findings == 0` gate would pass trivially.
     pub inode_plane: bool,
+    /// KD-PV-16: run the inode plane and NOTHING else — the owner
+    /// shard's shape. The block plane's census residue is the
+    /// coordinator's own shard set (`shard`); a plane shard that also
+    /// reported a census would double-count it at the merge, and the
+    /// layout extraction the census pays for is work this shard has no
+    /// use for.
+    pub inode_plane_only: bool,
+    /// **KD-PV-7**: the volume indices this node APPENDS to — the
+    /// inode-plane CANDIDATE scope. `None` = every volume, which is
+    /// every mount that has not armed a multi-owner plane (the shipped
+    /// posture, byte-identical).
+    ///
+    /// Scoping the candidates is not a weakening: it is the "residue
+    /// from the current mount is reported by the next one" law one axis
+    /// over — *residue on a volume this node does not append to is
+    /// reported by that volume's owner* — because C9's zero-FP shield is
+    /// the writer era's ino floor, and a peer's floor is a snapshot of a
+    /// cursor another node advances.
+    ///
+    /// **The REFERENCED set stays whole-set** (§5.8.0): a name living on
+    /// a peer's volume can reference an ino this owner is responsible
+    /// for, and KD-PV-15's subtree roots are exactly that population.
+    /// Scoping both halves reports `C9Unreferenced` for every subtree
+    /// root on the supported deployment.
+    pub owned_volumes: Option<Vec<usize>>,
+    /// `true` ⇔ a multi-owner plane is armed on this mount (§5.9.3):
+    /// detection is unchanged, the destructive/dangerous repair trio
+    /// goes report-only, and the freeze precondition is checked before
+    /// the plane records any verdict.
+    pub multi_owner: bool,
 }
 
 impl FsckOptions {
@@ -367,6 +409,9 @@ impl FsckOptions {
             staging_full: false,
             assume_latched: false,
             inode_plane: true,
+            inode_plane_only: false,
+            owned_volumes: None,
+            multi_owner: false,
         }
     }
 
@@ -374,6 +419,29 @@ impl FsckOptions {
         Self {
             mode: FsckMode::Offline,
             ..Self::online()
+        }
+    }
+
+    /// Does this pass judge inodes homed on `v_idx`? Unscoped (`None`) =
+    /// every volume — the shipped single-authority answer.
+    fn owns_volume(&self, v_idx: usize) -> bool {
+        match &self.owned_volumes {
+            None => true,
+            Some(owned) => owned.contains(&v_idx),
+        }
+    }
+
+    /// The volumes this pass's inode plane covers, ascending — the
+    /// KD-PV-16 coverage assertion's local half.
+    fn covered_volumes(&self, volume_count: usize) -> Vec<usize> {
+        match &self.owned_volumes {
+            None => (0..volume_count).collect(),
+            Some(owned) => {
+                let mut v: Vec<usize> = owned.iter().copied().filter(|v| *v < volume_count).collect();
+                v.sort_unstable();
+                v.dedup();
+                v
+            }
         }
     }
 }
@@ -513,6 +581,43 @@ pub struct FsckCounters {
     /// `inflight_exempted`): nonzero under concurrent link/unlink/rename
     /// traffic, and its growth is the proof the shield is not vacuous.
     pub nlink_transient_cleared: u64,
+    /// **KD-PV-16's coverage assertion**
+    /// (`docs/design-per-volume-claim-admission.md` §5.8.1): how many of
+    /// the set's volumes this pass's inode plane actually judged. A
+    /// completed pass must satisfy `== volume_count`; a short count makes
+    /// the pass INCOMPLETE rather than silently narrowing to 1/K, and it
+    /// is what stops `fsck_findings == 0` from passing trivially on a
+    /// fleet. `0` on a pass that recorded no verdict.
+    pub inode_plane_volumes_covered: u64,
+    /// **KD-PV-7 engagement**: inode-plane candidates left to their own
+    /// volume's owner (this node does not append there, so its era floor
+    /// is a snapshot of a cursor another node advances). The division of
+    /// labour, counted rather than silent; 0 on every unscoped pass.
+    pub inode_plane_foreign_scoped: u64,
+    /// The population whose verdict is **undecidable online under
+    /// multi-owner**: a dangling name whose dentry lives on a peer's
+    /// volume while its child ino homes here. Neither owner may decide
+    /// it — this node cannot commit the name's removal and cannot read
+    /// the peer's dentry tree as anything but a projection, and the peer
+    /// cannot read this ino's record as anything but one — so it is
+    /// DECLINED, never guessed at, and the offline whole-set pass is its
+    /// only detector. Stated here rather than left invisible.
+    pub inode_plane_cross_owner_declined: u64,
+    /// §5.8.2's engagement instrument, counted per PROPOSAL: owner
+    /// shards whose inode-plane report the coordinator ADMITTED. **Must
+    /// be > 0 on any K ≥ 2 fleet pass** — coverage that closes without an
+    /// admitted proposal came from nowhere. (Per proposal, not per
+    /// finding: a healthy fleet has no findings, and the question this
+    /// gauge answers is whether the owners actually reported.)
+    pub inode_plane_proposals_admitted: u64,
+    /// §5.8.2's tripwire, counted per PROPOSAL: shard reports that had
+    /// inode-plane findings DROPPED because the coordinator's own lease
+    /// table + `OwnerMap` do not say the proposer owns the volume those
+    /// findings are about. **Must stay 0 on a homogeneous fleet**; growth
+    /// means a non-owner is proposing the plane, i.e. the
+    /// `fix/mw-xv-unlink-c10` mirage path is live and this predicate is
+    /// the only thing holding it.
+    pub inode_plane_proposals_stripped: u64,
     pub blocks_checked: u64,
     pub refcounts_checked: u64,
     pub suspects: u64,
@@ -734,6 +839,18 @@ pub struct FsckReport {
     /// with `--repair` (dry run) or `--repair --apply`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repair: Option<RepairReport>,
+    /// **KD-PV-16**: the volume indices whose inode plane this run
+    /// judged — the identities behind
+    /// [`FsckCounters::inode_plane_volumes_covered`], carried so a
+    /// coordinator can UNION them across owner shards. Empty when the
+    /// plane recorded no verdict.
+    ///
+    /// A shard's declaration can only ever NARROW what the coordinator
+    /// credits it with: the admission predicate intersects this list
+    /// with the volumes the **coordinator's own** `OwnerMap` says that
+    /// worker owns (§5.8.2 clause 2 — never the shard's own claim).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inode_plane_covered: Vec<usize>,
 }
 
 impl FsckReport {
@@ -1089,6 +1206,10 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
 
     let mut suspects: Vec<Suspect> = Vec::new();
     let mut shard_refs: Option<PartialCensus> = None;
+    // KD-PV-16: the volumes whose inode plane this run judged. Empty
+    // until the plane actually records a verdict — a pass that covers
+    // nothing must never read as covering something.
+    let mut inode_plane_covered: Vec<usize> = Vec::new();
 
     if !opts.scrub_only {
         // ---- Pass 1: C1 walk + census + staging + accounting ----
@@ -1106,7 +1227,30 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
         // pass could not complete, which SKIPS the class (a partial set is
         // never guessed from).
         let unthrottled = opts.throttle_pct == 0 || opts.throttle_pct >= 100;
-        let (census, referenced) = if unthrottled {
+        let (census, referenced) = if opts.inode_plane_only {
+            // KD-PV-16's OWNER SHARD: the inode plane and nothing else.
+            // The census residue partition (and with it C1/C2/C3/C6/C8,
+            // the staging scan and the mapping list) belongs to the
+            // coordinator's own shard set — a plane shard that reported
+            // one would double-count it at the merge — so this walk skips
+            // the layout extraction entirely and costs one inode-key scan
+            // plus the whole-set dentry pass §5.8.0 states.
+            let refs_pass = crate::meta_exec::spawn_meta_join("fsck_c9_refs", {
+                let meta = ctx.meta.clone();
+                let pct = opts.throttle_pct;
+                let cancel = opts.cancel.clone();
+                async move { build_referenced_inos(meta, None, pct, cancel, None).await }
+            });
+            let census = walk_census(ctx, opts, &mut counters).await?;
+            let (refs, indexed) = refs_pass.await.map_err(|e| {
+                crate::error::SqueezefsError::InvalidOperation(format!(
+                    "fsck C9 referenced-ino pass failed: {e}"
+                ))
+            })?;
+            counters.dentry_refs_indexed += indexed;
+            counters.inodes_scanned = census.inodes_scanned;
+            (census, refs)
+        } else if unthrottled {
             let mut walks = Vec::new();
             for (vol_idx, kv) in ctx.meta.volumes.iter().enumerate() {
                 for tree_idx in 0..kv.trees().len() {
@@ -1212,7 +1356,9 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
         };
 
         // C2/C3/C6 evaluation against the live allocator state.
-        evaluate_allocator_classes(&vols, &census, opts, &mut counters, &mut suspects);
+        if !opts.inode_plane_only {
+            evaluate_allocator_classes(&vols, &census, opts, &mut counters, &mut suspects);
+        }
         // C8 (pre-RC spec §6.2 item 1): durable-vs-derived block-reference
         // drift. The durable ledger holds one record per layout map entry and
         // the oracle counts one reference per layout map entry — through the
@@ -1241,7 +1387,7 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
         // owe, which is exactly why it can be unconditional HERE while
         // MOUNT keeps it behind `SQUEEZEFS_BLOCK_REFS_VERIFY=1` (there the
         // walk is the whole cost the durable records exist to delete).
-        if opts.shard.is_none() {
+        if opts.shard.is_none() && !opts.inode_plane_only {
             evaluate_c8(ctx, &mut suspects).await;
         }
 
@@ -1255,16 +1401,30 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
         // everything the referenced set names that the live set does not.
         //
         // The inode plane is a ONE-VIEW plane (see `FsckOptions::
-        // inode_plane`): fleet shards skip it here — their referenced
-        // set still feeds the census merge — and `run_fleet`'s finalize
-        // judges it whole over the coordinator's own coherent view.
+        // inode_plane`): a fleet MEMBER's shard skips it here — its
+        // referenced set still feeds the census merge — while an OWNER
+        // shard evaluates it over the volumes it appends to (KD-PV-16),
+        // and `run_fleet` merges the two through the §5.8.2 predicate.
+        //
+        // §5.9.2's freeze precondition is checked FIRST and it is
+        // self-certifying: a monotone checkpoint-consistent projection
+        // that shows a peer volume's own `owner` field shows every commit
+        // that preceded it there, including every cross-owner dentry that
+        // will ever exist. Unassigned ⇒ the cross-owner reference set is
+        // not frozen ⇒ no verdict (the existing incomplete-pass law), not
+        // a verdict taken over a set that may still be growing names.
+        let frozen = !opts.multi_owner || peer_volumes_are_assigned(ctx, opts).await;
         match (
-            referenced.as_ref().filter(|_| opts.inode_plane),
+            referenced
+                .as_ref()
+                .filter(|_| opts.inode_plane)
+                .filter(|_| frozen),
             census.live.truncated(),
         ) {
             (Some(refs), false) => {
                 evaluate_c9_unreferenced(
                     ctx,
+                    opts,
                     &census.live,
                     &refs.refs,
                     &mut counters,
@@ -1273,6 +1433,7 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
                 .await;
                 evaluate_c10_inode_plane(ctx, opts, &census, refs, &mut counters, &mut suspects)
                     .await;
+                inode_plane_covered = opts.covered_volumes(ctx.meta.volumes.len());
             }
             (Some(_), true) => log::warn!(
                 "fsck C9/C10: the live-inode set reached its derived byte budget ({} B) — \
@@ -1297,7 +1458,7 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
     }
 
     // ---- C7 scrub (KD-17) ----
-    if opts.scrub || opts.scrub_only {
+    if (opts.scrub || opts.scrub_only) && !opts.inode_plane_only {
         // Fresh mapping set (post-settle when checks ran): scrub what is
         // referenced NOW.
         let census = walk_census(ctx, opts, &mut counters).await?;
@@ -1315,6 +1476,21 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
     }
 
     counters.findings = findings.len() as u64;
+    counters.inode_plane_volumes_covered = inode_plane_covered.len() as u64;
+    // KD-PV-16: a scoped pass says so. On a mount that owns part of a set
+    // the local run covers its own volumes and NOTHING else — the peers'
+    // planes are their owners' shards (`run_fleet`), so a bare `run` here
+    // is an INCOMPLETE pass over the set, never a narrower verdict.
+    if opts.multi_owner && counters.inode_plane_volumes_covered < ctx.meta.volumes.len() as u64 {
+        log::warn!(
+            "fsck: the inode plane covered {} of {} volumes ({:?}) — this pass is INCOMPLETE \
+             for the SET: the remaining volumes are judged by their own owners' shards \
+             (design-per-volume-claim-admission §5.8.1)",
+            counters.inode_plane_volumes_covered,
+            ctx.meta.volumes.len(),
+            inode_plane_covered
+        );
+    }
     counters.scan_secs = started.elapsed().as_secs();
     findings.sort();
     findings.dedup();
@@ -1331,7 +1507,46 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
         counters: counters.clone(),
         partial: shard_refs,
         repair: None,
+        inode_plane_covered,
     })
+}
+
+/// §5.9.2's **freeze precondition**, read as ONE durable observable fact
+/// per peer-owned volume: does its (monotone, checkpoint-consistent)
+/// projection carry a durable `claim_set.owner`?
+///
+/// While a multi-owner plane is armed no cross-owner dentry can be
+/// created (M2 constrains `create`, M1 refuses cross-owner
+/// `link`/`rename`/`unlink`/`rmdir`, row 13 refuses cross-owner slot
+/// migration), so the cross-owner reference set is FIXED at the
+/// assignment instant. A projection showing the assignment therefore
+/// shows every cross-owner name that will ever exist on that volume —
+/// which is what makes an owner's plane pass read only records it
+/// appends to plus records that CANNOT change. No barrier verb, no ack
+/// ledger, no timeout: one fact, monotone thereafter.
+///
+/// `false` ⇒ the plane records NO verdict for this run (the existing
+/// incomplete-pass law).
+async fn peer_volumes_are_assigned(ctx: &FsckCtx, opts: &FsckOptions) -> bool {
+    for (v_idx, kv) in ctx.meta.volumes.iter().enumerate() {
+        if opts.owns_volume(v_idx) {
+            continue;
+        }
+        let assigned = crate::membership::ClaimSet::load(kv)
+            .await
+            .is_some_and(|s| s.durable && s.owner.is_some());
+        if !assigned {
+            log::warn!(
+                "fsck C9/C10: peer-owned volume {v_idx} ({}) shows no durable ownership \
+                 assignment in this mount's projection — the cross-owner reference set is \
+                 not yet frozen (design-per-volume-claim-admission §5.9.2), so the \
+                 inode-plane classes record NO verdict for this run",
+                kv.device_path().display()
+            );
+            return false;
+        }
+    }
+    true
 }
 
 /// Union shard reports (`--shards k/N` outputs): findings dedupe by
@@ -1344,6 +1559,7 @@ pub fn merge_reports(reports: &[FsckReport]) -> FsckReport {
     let mut mappings: Vec<MappingRef> = Vec::new();
     let mut mappings_complete = true;
     let mut mode = "offline".to_string();
+    let mut inode_plane_covered: Vec<usize> = Vec::new();
     for r in reports {
         findings.extend(r.findings.iter().cloned());
         mode.clone_from(&r.mode);
@@ -1359,6 +1575,19 @@ pub fn merge_reports(reports: &[FsckReport]) -> FsckReport {
         counters.nlink_zero_named += r.counters.nlink_zero_named;
         counters.dangling_dentries += r.counters.dangling_dentries;
         counters.nlink_transient_cleared += r.counters.nlink_transient_cleared;
+        counters.inode_plane_foreign_scoped += r.counters.inode_plane_foreign_scoped;
+        counters.inode_plane_cross_owner_declined += r.counters.inode_plane_cross_owner_declined;
+        counters.inode_plane_proposals_admitted += r.counters.inode_plane_proposals_admitted;
+        counters.inode_plane_proposals_stripped += r.counters.inode_plane_proposals_stripped;
+        // KD-PV-16: coverage is a UNION of volume identities, never a
+        // sum — two shards that judged the same volume covered ONE
+        // volume, and a sum would let a duplicated shard read as full
+        // coverage of a set it never reached.
+        for v in &r.inode_plane_covered {
+            if !inode_plane_covered.contains(v) {
+                inode_plane_covered.push(*v);
+            }
+        }
         counters.blocks_checked += r.counters.blocks_checked;
         counters.refcounts_checked += r.counters.refcounts_checked;
         counters.suspects += r.counters.suspects;
@@ -1396,6 +1625,8 @@ pub fn merge_reports(reports: &[FsckReport]) -> FsckReport {
     findings.sort();
     findings.dedup();
     counters.findings = findings.len() as u64;
+    inode_plane_covered.sort_unstable();
+    counters.inode_plane_volumes_covered = inode_plane_covered.len() as u64;
     FsckReport {
         schema: FSCK_REPORT_SCHEMA,
         mode,
@@ -1408,6 +1639,7 @@ pub fn merge_reports(reports: &[FsckReport]) -> FsckReport {
             mappings_complete,
         }),
         repair: None,
+        inode_plane_covered,
     }
 }
 
@@ -1428,10 +1660,15 @@ fn fold_finalize_counters(dst: &mut FsckCounters, fin: &FsckCounters) {
     dst.inflight_exempted += fin.inflight_exempted;
     dst.mover_ledger_exempted += fin.mover_ledger_exempted;
     dst.foreign_lane_exempted += fin.foreign_lane_exempted;
-    // The inode plane is judged exclusively at finalize (one-view law):
-    // its counters exist only here — shards skip the classes and member
-    // proposals are stripped — so the fold is exact, never a double
-    // count.
+    // **The inode plane's counters are the union of the ADMITTED shards
+    // and this finalize** (KD-PV-16, §5.8.2 F4 — the premise that the
+    // plane "exists only here" is what that decision retires). The two
+    // halves are disjoint by construction and each is folded exactly
+    // once: an admitted owner shard's counters ride its REPORT through
+    // `merge_reports` (a stripped shard's are zeroed there), and the
+    // coordinator's own plane — over the volumes IT appends to — rides
+    // this fold. Adding an admitted shard's counters here as well would
+    // double-count every owner's findings.
     dst.dentry_refs_indexed += fin.dentry_refs_indexed;
     dst.current_era_exempted += fin.current_era_exempted;
     dst.nlink_names_counted += fin.nlink_names_counted;
@@ -1440,6 +1677,12 @@ fn fold_finalize_counters(dst: &mut FsckCounters, fin: &FsckCounters) {
     dst.nlink_zero_named += fin.nlink_zero_named;
     dst.dangling_dentries += fin.dangling_dentries;
     dst.nlink_transient_cleared += fin.nlink_transient_cleared;
+    dst.inode_plane_foreign_scoped += fin.inode_plane_foreign_scoped;
+    dst.inode_plane_cross_owner_declined += fin.inode_plane_cross_owner_declined;
+    // `inode_plane_volumes_covered` is deliberately NOT folded: coverage
+    // is a UNION of volume identities the caller composes (§5.8.1), and
+    // adding two shards' counts would let a set covered twice read as a
+    // set covered whole.
 }
 
 /// The **fleet fsck detect pass** (KD-MW-16, `docs/design-mw-fleet-jobs.md`
@@ -1471,8 +1714,6 @@ pub async fn run_fleet(
         return run(ctx, opts).await;
     }
     let started = std::time::Instant::now();
-    let workers = fleet.read_capacity() as u32;
-    let n = workers.saturating_add(1);
 
     // Arm the allocator scan latch for the WHOLE fleet window: the
     // C2/C3 allocation-epoch side map must span every shard walk, and
@@ -1500,6 +1741,57 @@ pub async fn run_fleet(
         quarantine_dir: None,
     };
     let (tx, mut rx) = squeezefs_ipc::sqz_channel::mpsc::unbounded_channel();
+
+    // ---- KD-PV-16: one INODE-PLANE shard per peer OWNER ----
+    //
+    // The census fan-out above shards by ino RESIDUE across whatever
+    // read-capable members exist; the inode plane cannot ride it, because
+    // its candidate scope is OWNERSHIP (KD-PV-7) and a residue-scoped
+    // pass over a subset of an owner's inos would cover 1/n of each of
+    // its volumes. So the plane is dispatched separately and TARGETED:
+    // the coordinator asks each peer that its own `OwnerMap` names, and
+    // an owner it cannot reach leaves that owner's volumes UNCOVERED
+    // (loud) rather than silently unevaluated. A lost plane shard is
+    // deliberately NOT relocal-able: evaluating a peer's inos here is the
+    // false-positive generator KD-PV-7 exists to refuse.
+    let owner_map = crate::meta_ship::owners::owner_map().filter(|m| m.multi_owner());
+    let mut plane_outstanding: std::collections::HashMap<u32, String> =
+        std::collections::HashMap::new();
+    let mut plane_retried: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut plane_unreachable: Vec<(String, Vec<usize>)> = Vec::new();
+    if let Some(map) = owner_map.as_ref() {
+        for (i, peer) in map.peers().iter().enumerate() {
+            let shard_no = crate::jobs::INODE_PLANE_SHARD_BASE + i as u32;
+            let owned = map.volumes_owned_by(&peer.peer_id);
+            if fleet.dispatch_inode_plane_shard(
+                job_id,
+                shard_no,
+                &peer.peer_id,
+                &job_type,
+                opts.throttle_pct,
+                &tx,
+            ) {
+                plane_outstanding.insert(shard_no, peer.peer_id.clone());
+            } else {
+                plane_unreachable.push((peer.peer_id.clone(), owned));
+            }
+        }
+        log::info!(
+            "fsck fleet ({job_id}): inode plane fanned out to {} owner shard(s), {} owner(s) \
+             unreachable (KD-PV-16); this coordinator judges volumes {:?}",
+            plane_outstanding.len(),
+            plane_unreachable.len(),
+            opts.covered_volumes(ctx.meta.volumes.len())
+        );
+    }
+
+    // The census partition is sized by what is STILL idle: a node has one
+    // session, so an owner serving its plane shard is not also a census
+    // venue this pass. Sizing `n` after the plane fan-out is what keeps
+    // the residue partition exactly-once instead of handing residues to
+    // sessions that are already busy (they would fall back to relocal).
+    let workers = fleet.read_capacity() as u32;
+    let n = workers.saturating_add(1);
     let mut outstanding: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut local_residues: Vec<u32> = Vec::new();
     for k in 1..n {
@@ -1543,7 +1835,15 @@ pub async fn run_fleet(
     // Collect worker proposals; a lost/refused residue RE-LEASES —
     // another idle capable worker first, else locally.
     let mut worker_counters = FsckCounters::default();
-    while !outstanding.is_empty() {
+    // KD-PV-16's ledger: what the owner shards contributed.
+    let mut plane_admitted = 0u64;
+    let mut plane_stripped = 0u64;
+    let mut plane_covered: Vec<usize> = Vec::new();
+    // Both shard populations land on ONE channel, so the collect runs
+    // while EITHER is outstanding: with every capable session serving a
+    // plane shard the census partition is empty, and a loop keyed on the
+    // residues alone would return before the plane answered.
+    while !outstanding.is_empty() || !plane_outstanding.is_empty() {
         if opts.cancel.load(Ordering::Relaxed) {
             // Fabric cancel/pause: stop collecting — the job layer owns
             // the terminal state, and a cancelled detect pass's partial
@@ -1558,6 +1858,127 @@ pub async fn run_fleet(
         let Some(out) = recv else {
             break; // channel closed: the host is gone — relocal below
         };
+        if let Some(peer_id) = plane_outstanding.get(&out.shard).cloned() {
+            // ---- KD-PV-16: an OWNER's inode-plane proposal ----
+            //
+            // Clause 2 of the §5.8.2 predicate: the owned set comes from
+            // the lease HOLDER's `worker_id` — read from the wire's own
+            // lease table, never from the payload — looked up in THIS
+            // node's `OwnerMap`. A worker the map does not name (a
+            // reader, a co-writer, `{hostname}:{pid}`, an older binary)
+            // resolves to the empty set, which is the pre-KD-PV-16 drop
+            // path verbatim.
+            let holder = out.worker_id.clone().unwrap_or_default();
+            let owned = owner_map
+                .as_ref()
+                .map(|m| m.volumes_owned_by(&holder))
+                .unwrap_or_default();
+            let mut lost_reason: Option<String> = None;
+            match out.payload {
+                Some(bytes) => match serde_json::from_slice::<FsckReport>(&bytes) {
+                    // A plane shard carries no ino residue: a report
+                    // labelled with one answered a question nobody asked.
+                    Ok(mut r) if r.shard.is_none() => {
+                        plane_outstanding.remove(&out.shard);
+                        let (admitted, stripped) =
+                            admit_inode_plane_proposals(&mut r, &owned, &ctx.meta);
+                        if stripped > 0 {
+                            log::warn!(
+                                "fsck fleet ({job_id}): inode-plane shard {} (holder '{holder}', \
+                                 dispatched to '{peer_id}') proposed {stripped} finding(s) this \
+                                 coordinator's own owner map does not entitle it to — dropped \
+                                 (fsck_inode_plane_proposals_stripped; §5.8.2). Owned per this \
+                                 map: {owned:?}",
+                                out.shard
+                            );
+                        }
+                        // The ledger is per PROPOSAL, not per finding: a
+                        // healthy fleet has no findings at all, and
+                        // "coverage that closes without an admitted
+                        // proposal came from nowhere" is the reading
+                        // §5.8.2 asks for.
+                        plane_admitted += u64::from(!owned.is_empty());
+                        plane_stripped += u64::from(stripped > 0);
+                        log::debug!(
+                            "fsck fleet ({job_id}): inode-plane shard {} admitted {admitted}                              finding(s) from owner '{holder}' over volumes {owned:?}",
+                            out.shard
+                        );
+                        for v in &r.inode_plane_covered {
+                            if !plane_covered.contains(v) {
+                                plane_covered.push(*v);
+                            }
+                        }
+                        // The plane shard walks inodes to build its own
+                        // coherent view; that walk is NOT census coverage
+                        // (the residue shards own that partition), so its
+                        // census counters are dropped rather than summed
+                        // — the exactly-once law of gate 1.
+                        let mut c = FsckCounters {
+                            dentry_refs_indexed: r.counters.dentry_refs_indexed,
+                            current_era_exempted: r.counters.current_era_exempted,
+                            nlink_names_counted: r.counters.nlink_names_counted,
+                            nlink_mismatch_high: r.counters.nlink_mismatch_high,
+                            nlink_mismatch_low: r.counters.nlink_mismatch_low,
+                            nlink_zero_named: r.counters.nlink_zero_named,
+                            dangling_dentries: r.counters.dangling_dentries,
+                            nlink_transient_cleared: r.counters.nlink_transient_cleared,
+                            inode_plane_foreign_scoped: r.counters.inode_plane_foreign_scoped,
+                            inode_plane_cross_owner_declined: r
+                                .counters
+                                .inode_plane_cross_owner_declined,
+                            ..Default::default()
+                        };
+                        std::mem::swap(&mut r.counters, &mut c);
+                        r.partial = None;
+                        r.inode_plane_covered.clear();
+                        r.counters.findings = r.findings.len() as u64;
+                        fold_worker_counters(&mut worker_counters, &r.counters);
+                        reports.push(r);
+                    }
+                    Ok(r) => {
+                        lost_reason = Some(format!(
+                            "an inode-plane shard proposed a census residue label '{}'",
+                            r.shard.as_deref().unwrap_or("<none>")
+                        ));
+                    }
+                    Err(e) => lost_reason = Some(format!("undecodable shard report: {e}")),
+                },
+                None => lost_reason = Some("lease lost (expiry/abandon)".to_string()),
+            }
+            if let Some(why) = lost_reason {
+                let retry = plane_retried.insert(out.shard)
+                    && fleet.dispatch_inode_plane_shard(
+                        job_id,
+                        out.shard,
+                        &peer_id,
+                        &job_type,
+                        opts.throttle_pct,
+                        &tx,
+                    );
+                log::warn!(
+                    "fsck fleet ({job_id}): inode-plane shard {} of owner '{peer_id}' was LOST \
+                     ({why}) — {}",
+                    out.shard,
+                    if retry {
+                        "re-leased to the same owner (only an owner may judge its own inos)"
+                    } else {
+                        "its volumes stay UNCOVERED: a peer's inode plane is never evaluated \
+                         here (KD-PV-7), so the pass is INCOMPLETE rather than narrowed"
+                    }
+                );
+                if !retry {
+                    plane_outstanding.remove(&out.shard);
+                    plane_unreachable.push((
+                        peer_id.clone(),
+                        owner_map
+                            .as_ref()
+                            .map(|m| m.volumes_owned_by(&peer_id))
+                            .unwrap_or_default(),
+                    ));
+                }
+            }
+            continue;
+        }
         if !outstanding.contains(&out.shard) {
             continue; // a duplicate notification for a settled residue
         }
@@ -1568,22 +1989,25 @@ pub async fn run_fleet(
                     if r.shard.as_deref() == Some(format!("{}/{}", out.shard, n).as_str()) =>
                 {
                     outstanding.remove(&out.shard);
-                    // The inode plane is inadmissible FROM A MEMBER by
-                    // construction (one-view law — the module doc on
-                    // `FsckOptions::inode_plane`): a fleet worker of this
-                    // binary never proposes it, so anything stripped here
-                    // is an older/foreign binary's time-shifted verdict —
-                    // dropped LOUDLY, never merged, never counted on the
-                    // coordinator's C9/C10 tripwires. The finalize below
-                    // re-judges the whole plane from one coherent view,
-                    // so no coverage is lost.
-                    let stripped = strip_inode_plane_proposals(&mut r);
+                    // The inode plane is inadmissible from a CENSUS
+                    // residue shard by construction (one-view law — the
+                    // module doc on `FsckOptions::inode_plane`): a fleet
+                    // worker of this binary never proposes it here, so
+                    // anything stripped is an older/foreign binary's
+                    // time-shifted verdict — dropped LOUDLY, never
+                    // merged, never counted on the coordinator's C9/C10
+                    // tripwires. No coverage is lost: the plane is judged
+                    // by the coordinator's finalize over its OWN volumes
+                    // plus the KD-PV-16 owner shards above.
+                    let (_, stripped) = admit_inode_plane_proposals(&mut r, &[], &ctx.meta);
                     if stripped > 0 {
+                        plane_stripped += 1;
                         log::warn!(
-                            "fsck fleet ({job_id}): shard {}/{n} proposed {stripped} \
-                             inode-plane (C9/C10) finding(s) — inadmissible from a \
-                             member's staleness-bounded view (one-view law); dropped, \
-                             and the coordinator finalize re-judges the plane",
+                            "fsck fleet ({job_id}): census shard {}/{n} proposed {stripped} \
+                             inode-plane (C9/C10) finding(s) — a residue shard's view is \
+                             ino-residue-scoped and staleness-bounded, so it is inadmissible \
+                             whatever the proposer owns (one-view law); dropped, and the \
+                             coordinator + its owner shards judge the plane",
                             out.shard
                         );
                     }
@@ -1640,6 +2064,21 @@ pub async fn run_fleet(
             .fetch_add(1, Ordering::Relaxed);
         reports.push(run(ctx, &local_shard(k)).await?);
     }
+    // The same event on the PLANE side has the opposite answer: an
+    // owner's inos are judged by that owner or by nobody (KD-PV-7), so a
+    // plane shard that never answered leaves its volumes uncovered and
+    // the pass INCOMPLETE — never relocal, never narrowed silently.
+    for (shard_no, peer_id) in std::mem::take(&mut plane_outstanding) {
+        let owned = owner_map
+            .as_ref()
+            .map(|m| m.volumes_owned_by(&peer_id))
+            .unwrap_or_default();
+        log::warn!(
+            "fsck fleet ({job_id}): inode-plane shard {shard_no} of owner '{peer_id}' never \
+             answered — volumes {owned:?} are UNCOVERED for this pass"
+        );
+        plane_unreachable.push((peer_id, owned));
+    }
 
     let mut merged = merge_reports(&reports);
 
@@ -1683,18 +2122,21 @@ pub async fn run_fleet(
         );
         evaluate_c8(ctx, &mut fin_suspects).await;
 
-        // ---- The INODE PLANE, judged WHOLE and from ONE view (the
-        // 2026-08-17 tarx C10 conviction; `FsckOptions::inode_plane`) ----
+        // ---- The INODE PLANE, judged from ONE view PER OWNER (the
+        // 2026-08-17 tarx C10 conviction, restated by KD-PV-16;
+        // `FsckOptions::inode_plane`) ----
         //
-        // Every shard — member and local alike — skipped C9/C10: their
-        // verdicts are census-vs-dentry-pass AGREEMENT, which only means
-        // something when both walks and every verification read share one
-        // authority's coherent instant. A member's S5 reader view mixes
-        // per-volume checkpoint instants mid-churn and manufactures the
-        // loss-direction shapes from a healthy tree (25 self-healing
-        // findings on the leg2 capture); the coordinator's own walk is the
-        // one view that exists. Cost: one census + one dentry pass on the
-        // coordinator — the stated Amdahl term of the fleet fan-out
+        // Every CENSUS shard — member and local alike — skipped C9/C10:
+        // their verdicts are census-vs-dentry-pass AGREEMENT, which only
+        // means something when both walks and every verification read
+        // share one authority's coherent instant. A member's S5 reader
+        // view mixes per-volume checkpoint instants mid-churn and
+        // manufactures the loss-direction shapes from a healthy tree (25
+        // self-healing findings on the leg2 capture). What this pass adds
+        // is the coordinator's OWN half — the volumes IT appends to (its
+        // whole set on a single-authority mount) — while the owner shards
+        // collected above cover the rest. Cost: one census + one dentry
+        // pass on the coordinator, the stated Amdahl term of the fan-out
         // (design-mw-fleet-jobs §4), paid so the plane's teeth stay exact.
         // The verification ladder below (settle → witness bracket → fresh
         // pass → 4a lease re-check → intent exemption) is the unchanged
@@ -1711,10 +2153,16 @@ pub async fn run_fleet(
             .await;
             fin_counters.dentry_refs_indexed += ip_indexed;
             let ip_census = walk_census(ctx, &fin_opts, &mut fin_counters).await?;
-            match (ip_refs.as_ref(), ip_census.live.truncated()) {
+            let frozen =
+                !fin_opts.multi_owner || peer_volumes_are_assigned(ctx, &fin_opts).await;
+            match (
+                ip_refs.as_ref().filter(|_| frozen),
+                ip_census.live.truncated(),
+            ) {
                 (Some(refs), false) => {
                     evaluate_c9_unreferenced(
                         ctx,
+                        &fin_opts,
                         &ip_census.live,
                         &refs.refs,
                         &mut fin_counters,
@@ -1730,6 +2178,11 @@ pub async fn run_fleet(
                         &mut fin_suspects,
                     )
                     .await;
+                    for v in fin_opts.covered_volumes(ctx.meta.volumes.len()) {
+                        if !plane_covered.contains(&v) {
+                            plane_covered.push(v);
+                        }
+                    }
                 }
                 (Some(_), true) => log::warn!(
                     "fsck fleet ({job_id}): the live-inode set reached its derived byte \
@@ -1771,6 +2224,32 @@ pub async fn run_fleet(
     merged.shard = None;
     merged.mode = "online".to_string();
 
+    // ---- KD-PV-16: coverage is an ASSERTION, not a claim ----
+    //
+    // `covered == volume_count` is half of PR 6's gate precisely because
+    // the other half (`findings == 0`) would otherwise pass trivially
+    // over 1/K of the inodes. The union is coordinator-derived: its own
+    // plane's volumes plus, per admitted shard, the intersection of what
+    // that shard reported with what THIS node's owner map says its holder
+    // owns.
+    plane_covered.sort_unstable();
+    plane_covered.dedup();
+    merged.counters.inode_plane_volumes_covered = plane_covered.len() as u64;
+    merged.counters.inode_plane_proposals_admitted += plane_admitted;
+    merged.counters.inode_plane_proposals_stripped += plane_stripped;
+    merged.inode_plane_covered = plane_covered;
+    if merged.counters.inode_plane_volumes_covered < ctx.meta.volumes.len() as u64 {
+        log::warn!(
+            "fsck fleet ({job_id}): the inode plane covered {} of {} volumes — this pass is \
+             INCOMPLETE, not a narrower verdict (design-per-volume-claim-admission §5.8.1). \
+             Covered: {:?}; unreachable owner(s): {:?}",
+            merged.counters.inode_plane_volumes_covered,
+            ctx.meta.volumes.len(),
+            merged.inode_plane_covered,
+            plane_unreachable
+        );
+    }
+
     // Publish the WORKER + FINALIZE shares on the coordinator's stats
     // inode (the local shards published themselves inside `run`): the
     // coordinator's `fsck_*` deltas account for the whole fleet pass
@@ -1789,30 +2268,84 @@ pub async fn run_fleet(
     Ok(merged)
 }
 
-/// Drop every INODE-PLANE (C9/C10) finding a fleet member proposed and
-/// zero its inode-plane counters — the one-view law's wire face (see
-/// `FsckOptions::inode_plane`): a member's verdicts on this plane are
-/// inadmissible by construction (its S5 view mixes per-volume instants),
-/// this binary's workers never produce them, and the coordinator's
-/// finalize re-judges the plane whole — so anything arriving here is an
-/// older/foreign binary's time-shifted mirage and must neither merge nor
-/// move the coordinator's `fsck_nlink_zero_named`/`fsck_dangling_dentries`
-/// stop-and-read tripwires. Returns how many findings were dropped.
-fn strip_inode_plane_proposals(r: &mut FsckReport) -> usize {
+/// **The §5.8.2 admission predicate** — the one place a faithful-but-wrong
+/// implementation of KD-PV-16 would re-admit the `fix/mw-xv-unlink-c10`
+/// mirage.
+///
+/// `owned` is what the **coordinator's own** `OwnerMap` says the shard's
+/// lease HOLDER owns, read from the coordinator's own lease table and
+/// never from the payload (clause 2). An inode-plane finding is retained
+/// only when the volume the coordinator's OWN `route_ino` derives from
+/// its ino is in that set — and for `C10DanglingDentry`, which carries an
+/// explicit `vol` beside its `child_ino`, BOTH must be (clause 3: the
+/// dentry record's removal is a commit on the name's volume).
+///
+/// `owned.is_empty()` — every member/reader shard, every worker the map
+/// does not name, every older or foreign binary — takes the pre-KD-PV-16
+/// path VERBATIM: every C9/C10 finding dropped and the six inode-plane
+/// counters zeroed, so a time-shifted verdict can neither merge nor move
+/// the coordinator's `fsck_nlink_zero_named`/`fsck_dangling_dentries`
+/// stop-and-read tripwires. That preservation is the regression barrier:
+/// a fleet worker of this binary only ever proposes the plane when the
+/// coordinator asked it to as an OWNER.
+///
+/// Returns `(admitted, stripped)`.
+fn admit_inode_plane_proposals(
+    r: &mut FsckReport,
+    owned: &[usize],
+    meta: &RoutedMetaBackend,
+) -> (usize, usize) {
     let before = r.findings.len();
-    r.findings
-        .retain(|f| !matches!(f.class.as_str(), "C9" | "C10"));
-    let stripped = before - r.findings.len();
-    let c = &mut r.counters;
-    c.nlink_mismatch_high = 0;
-    c.nlink_mismatch_low = 0;
-    c.nlink_zero_named = 0;
-    c.dangling_dentries = 0;
-    c.nlink_names_counted = 0;
-    c.nlink_transient_cleared = 0;
-    c.current_era_exempted = 0;
-    c.findings = r.findings.len() as u64;
-    stripped
+    if owned.is_empty() {
+        r.findings
+            .retain(|f| !matches!(f.class.as_str(), "C9" | "C10"));
+        let stripped = before - r.findings.len();
+        let c = &mut r.counters;
+        c.nlink_mismatch_high = 0;
+        c.nlink_mismatch_low = 0;
+        c.nlink_zero_named = 0;
+        c.dangling_dentries = 0;
+        c.nlink_names_counted = 0;
+        c.nlink_transient_cleared = 0;
+        c.current_era_exempted = 0;
+        c.inode_plane_volumes_covered = 0;
+        c.findings = r.findings.len() as u64;
+        r.inode_plane_covered.clear();
+        return (0, stripped);
+    }
+    // The volume is derived by the COORDINATOR's own routing — ino →
+    // slot → volume through its own durable slot map — never taken from
+    // the finding's text or the shard's claim.
+    let owns = |ino: u64| owned.contains(&meta.route_ino(ino).0);
+    let mut admitted = 0usize;
+    r.findings.retain(|f| {
+        if !matches!(f.class.as_str(), "C9" | "C10") {
+            return true;
+        }
+        let keep = match &f.identity {
+            Some(FindingId::C9Unreferenced { ino })
+            | Some(FindingId::C10NlinkTooHigh { ino })
+            | Some(FindingId::C10NlinkTooLow { ino })
+            | Some(FindingId::C10ZeroNlinkNamed { ino }) => owns(*ino),
+            Some(FindingId::C10DanglingDentry { vol, child_ino, .. }) => {
+                owned.contains(vol) && owns(*child_ino)
+            }
+            // An inode-plane finding with no structured identity cannot
+            // be attributed to a volume, so it cannot be admitted (repair
+            // refuses it anyway — an older binary's report).
+            _ => false,
+        };
+        admitted += usize::from(keep);
+        keep
+    });
+    // Coverage is the INTERSECTION of what the shard reports with what
+    // the coordinator's map grants it: a declaration can only narrow.
+    r.inode_plane_covered.retain(|v| owned.contains(v));
+    r.inode_plane_covered.sort_unstable();
+    r.inode_plane_covered.dedup();
+    r.counters.inode_plane_volumes_covered = r.inode_plane_covered.len() as u64;
+    r.counters.findings = r.findings.len() as u64;
+    (admitted, before - r.findings.len())
 }
 
 /// Sum a worker shard's census counters into the coordinator-published
@@ -1829,6 +2362,8 @@ fn fold_worker_counters(dst: &mut FsckCounters, src: &FsckCounters) {
     dst.nlink_zero_named += src.nlink_zero_named;
     dst.dangling_dentries += src.dangling_dentries;
     dst.nlink_transient_cleared += src.nlink_transient_cleared;
+    dst.inode_plane_foreign_scoped += src.inode_plane_foreign_scoped;
+    dst.inode_plane_cross_owner_declined += src.inode_plane_cross_owner_declined;
     dst.blocks_checked += src.blocks_checked;
     dst.refcounts_checked += src.refcounts_checked;
     dst.suspects += src.suspects;
@@ -2108,6 +2643,13 @@ async fn walk_census(
                     } else {
                         out.odd_nlink.insert(global_ino, val.nlink);
                     }
+                }
+                // KD-PV-16's plane shard has no use for the block map —
+                // and the per-inode `layout` read is what a census
+                // actually costs, so skipping it is what makes an owner
+                // shard cheap enough to run beside the residue partition.
+                if opts.inode_plane_only {
+                    continue;
                 }
                 let Ok(Some(bytes)) = kv.getxattr(local_ino, "layout").await else {
                     continue;
@@ -2427,6 +2969,7 @@ async fn build_referenced_inos(
 /// so a healthy volume pays exactly the bitmap scan.
 async fn evaluate_c9_unreferenced(
     ctx: &FsckCtx,
+    opts: &FsckOptions,
     live: &InoBitmap,
     refs: &InoBitmap,
     counters: &mut FsckCounters,
@@ -2463,6 +3006,16 @@ async fn evaluate_c9_unreferenced(
         let Some(kv) = ctx.meta.volumes.get(vol_idx) else {
             continue;
         };
+        // KD-PV-7: an ino homed on a volume this node does not append to
+        // is that volume's OWNER's candidate, never this pass's — the
+        // era floor here is a snapshot of a cursor another node advances,
+        // so a record the owner minted after this mount's open would read
+        // as prior-era residue. Counted, so the division of labour is
+        // visible rather than a silent narrowing.
+        if !opts.owns_volume(vol_idx) {
+            counters.inode_plane_foreign_scoped += 1;
+            continue;
+        }
         // THE guard: an inode this mount minted is never a candidate,
         // because a create legitimately holds its record before its name.
         if !kv.minted_in_prior_era(local) {
@@ -2514,6 +3067,14 @@ async fn evaluate_c10_inode_plane(
         let mut nominated: Vec<(u64, u32, u32)> = Vec::new();
         // Side A — live non-directory inodes whose nlink is not 1.
         for (&ino, &nlink) in &census.odd_nlink {
+            // KD-PV-7: candidates are scoped to the volumes this node
+            // appends to (its own records are authoritative; a peer's are
+            // a projection). The NAME side stays whole-set — that is the
+            // §5.8.0 asymmetry.
+            if !opts.owns_volume(ctx.meta.route_ino(ino).0) {
+                counters.inode_plane_foreign_scoped += 1;
+                continue;
+            }
             let records = pass.record_names_of(ino);
             // No name at all is C9's object, never C10's (reporting both
             // would double-claim one inode).
@@ -2531,6 +3092,10 @@ async fn evaluate_c10_inode_plane(
                 continue;
             }
             let (vol_idx, local) = ctx.meta.route_ino(ino);
+            if !opts.owns_volume(vol_idx) {
+                counters.inode_plane_foreign_scoped += 1;
+                continue;
+            }
             let Some(kv) = ctx.meta.volumes.get(vol_idx) else {
                 continue;
             };
@@ -2599,6 +3164,10 @@ async fn evaluate_c10_inode_plane(
     let mut dangling: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for ino in candidates {
         let (vol_idx, local) = ctx.meta.route_ino(ino);
+        if !opts.owns_volume(vol_idx) {
+            counters.inode_plane_foreign_scoped += 1;
+            continue;
+        }
         let Some(kv) = ctx.meta.volumes.get(vol_idx) else {
             continue;
         };
@@ -2650,6 +3219,21 @@ async fn evaluate_c10_inode_plane(
         v
     } {
         for name in identities.collected(ino) {
+            // The one inode-plane verdict that is UNDECIDABLE online
+            // under multi-owner: the object of this arm is the dentry
+            // RECORD, which lives on the parent's volume — and when that
+            // volume is a peer's, this node can neither commit its
+            // removal nor read it as anything but a projection, while the
+            // peer cannot read this ino's record as anything but one.
+            // Declined and counted, never guessed at; the offline
+            // whole-set pass is its detector (§5.8.2's clause 3 strips
+            // exactly this shape at the coordinator, so reporting it here
+            // would also make `fsck_inode_plane_proposals_stripped` — a
+            // must-stay-0 tripwire — grow on a healthy fleet).
+            if !opts.owns_volume(name.vol) {
+                counters.inode_plane_cross_owner_declined += 1;
+                continue;
+            }
             suspects.push(Suspect {
                 kind: SuspectKind::C10Dangling {
                     vol: name.vol,
@@ -4072,6 +4656,22 @@ fn publish_metrics(c: &FsckCounters) {
         .fetch_add(c.dangling_dentries, Ordering::Relaxed);
     m.fsck_nlink_transient_cleared
         .fetch_add(c.nlink_transient_cleared, Ordering::Relaxed);
+    // KD-PV-16's coverage gauge is the LAST pass's answer, not a running
+    // total: "did this pass reach the whole plane?" has no cumulative
+    // reading. The two scoping counters and the two admission counters
+    // accumulate like every other engagement gauge.
+    if c.inode_plane_volumes_covered > 0 {
+        m.fsck_inode_plane_volumes_covered
+            .store(c.inode_plane_volumes_covered, Ordering::Relaxed);
+    }
+    m.fsck_inode_plane_foreign_scoped
+        .fetch_add(c.inode_plane_foreign_scoped, Ordering::Relaxed);
+    m.fsck_inode_plane_cross_owner_declined
+        .fetch_add(c.inode_plane_cross_owner_declined, Ordering::Relaxed);
+    m.fsck_inode_plane_proposals_admitted
+        .fetch_add(c.inode_plane_proposals_admitted, Ordering::Relaxed);
+    m.fsck_inode_plane_proposals_stripped
+        .fetch_add(c.inode_plane_proposals_stripped, Ordering::Relaxed);
     m.fsck_blocks_checked
         .fetch_add(c.blocks_checked, Ordering::Relaxed);
     m.fsck_refcounts_checked
@@ -4120,6 +4720,14 @@ pub struct RepairOptions {
     /// `<first staging dir>/quarantine/`; REQUIRED on cache-less
     /// filesystems when any action needs quarantine.
     pub quarantine_dir: Option<PathBuf>,
+    /// **KD-PV-8**: a multi-owner plane is armed on the repairing mount,
+    /// so the destructive/dangerous trio is REPORT-ONLY (§5.9.3). Set
+    /// from the caller's OWN truth — the mount derives it from its live
+    /// `OwnerMap`; the offline harness is always `false` because the
+    /// whole-set pass requires every owner unmounted. Never read from a
+    /// report: a payload-declared posture would be a repair trusting the
+    /// thing it is supposed to be protected from.
+    pub multi_owner: bool,
 }
 
 /// One planned / applied / refused action (§5.6a table verbs).
@@ -4146,6 +4754,14 @@ pub struct RepairCounters {
     /// identity, unreachable authority). Never an error: the state
     /// moved on and the repair honestly declined.
     pub refused: u64,
+    /// The SUBSET of [`Self::refused`] declined because a multi-owner
+    /// plane is armed and the action is one of the destructive trio
+    /// (§5.9.3): C9's `destroy-unreferenced-inode`, C10's
+    /// `lower-nlink-to-counted-names`, C10's `remove-dangling-dentry`.
+    /// **Expected NONZERO** on a multi-owner online pass with such
+    /// findings and **0 on the offline whole-set pass** — the inverted
+    /// reading is the point.
+    pub refused_multi_owner: u64,
     pub quarantined_records: u64,
     pub quarantined_blocks: u64,
     pub quarantined_bytes: u64,
@@ -4324,6 +4940,29 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
 
 /// The §5.6a table verb a finding plans to (dry run and apply share the
 /// planner — the plan IS what apply executes).
+/// **The destructive/dangerous trio** (§5.9.1's table, verified against
+/// the repair arms themselves): the actions whose FALSE POSITIVE
+/// destroys data or reachability, as opposed to leaking it.
+///
+/// * `C9Unreferenced` → `destroy-unreferenced-inode` — a live file is
+///   destroyed. The most destructive act in the fsck surface.
+/// * `C10NlinkTooHigh` → `lower-nlink-to-counted-names` — a named inode
+///   becomes reclaimable.
+/// * `C10DanglingDentry` → `remove-dangling-dentry` — a live name
+///   disappears.
+///
+/// Everything else either leaks (the safe raises: an over-count delays
+/// reclaim, and the next pass corrects it) or is already report-only
+/// (C8) or quarantine-first over an object the finding fully identifies.
+fn destroys_under_multi_owner(id: &FindingId) -> bool {
+    matches!(
+        id,
+        FindingId::C9Unreferenced { .. }
+            | FindingId::C10NlinkTooHigh { .. }
+            | FindingId::C10DanglingDentry { .. }
+    )
+}
+
 fn planned_action(id: &FindingId) -> (&'static str, String) {
     match id {
         FindingId::C1Torn { .. } => (
@@ -4736,6 +5375,49 @@ pub async fn repair(
 
     for (f, id) in actionable {
         let what = format!("{}:{}", f.class, f.object);
+        // ---- KD-PV-8 / §5.9.3: the repair-CONSEQUENCE split ----
+        //
+        // Under an armed multi-owner plane the three repairs whose FALSE
+        // POSITIVE destroys something — C9's `destroy-unreferenced-inode`
+        // (a live file), C10's `lower-nlink-to-counted-names` (the code's
+        // own text: "the one C10 repair that could make a named inode
+        // reclaimable if the count were wrong") and C10's
+        // `remove-dangling-dentry` (a live name) — are REPORT-ONLY, on
+        // the C8 precedent (detect always, repair never automatic).
+        //
+        // The safe raises (C10-low, C10-zero-named) stay online: their
+        // false-positive source is an OVERCOUNTED reference set, the
+        // direction a monotone-behind projection errs in, and their FP
+        // consequence is a leak the next pass corrects. The split is by
+        // consequence, not by leak-vs-loss direction — those two axes
+        // point OPPOSITE ways here, which is the mistake rev 1 made.
+        //
+        // Why report-only rather than trusting the §5.9.2 freeze: the
+        // freeze argument is sound but rests on the M1 pre-check being
+        // TOTAL, and that pre-check is introduced by the same program.
+        // The finding is visible either way and the offline pass costs a
+        // maintenance window, so the trade is not worth taking.
+        if opts.multi_owner && destroys_under_multi_owner(id) {
+            let (verb, _) = planned_action(id);
+            out.refused.push(RepairAction {
+                class: f.class.clone(),
+                object: f.object.clone(),
+                action: "refused".to_string(),
+                detail: format!(
+                    "'{verb}' is REPORT-ONLY while a multi-owner plane is armed: a false \
+                     positive here destroys an inode, a name, or a link count that still \
+                     covers a live path, and this node's view of a peer-owned volume is a \
+                     monotone-behind projection whose only error direction produces exactly \
+                     this class. The finding stands — run the OFFLINE whole-set pass \
+                     (`squeezefs fsck --repair --apply <sqmeta-uri>` with every owner \
+                     unmounted) to apply it (design-per-volume-claim-admission §5.9.3, \
+                     KD-PV-8)"
+                ),
+            });
+            out.counters.refused += 1;
+            out.counters.refused_multi_owner += 1;
+            continue;
+        }
         // An applied inode-plane raise re-attached blocks the census walked
         // as unreferenced, so the block classes must not verify against it:
         // re-walk ONCE, here, where the ordering above guarantees the inode
@@ -6030,6 +6712,8 @@ fn publish_repair_metrics(c: &RepairCounters) {
         .fetch_add(c.applied, Ordering::Relaxed);
     m.fsck_repairs_refused
         .fetch_add(c.refused, Ordering::Relaxed);
+    m.fsck_repair_refused_multi_owner
+        .fetch_add(c.refused_multi_owner, Ordering::Relaxed);
     m.fsck_quarantined_records
         .fetch_add(c.quarantined_records, Ordering::Relaxed);
     m.fsck_quarantined_blocks

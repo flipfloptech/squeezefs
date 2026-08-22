@@ -773,6 +773,89 @@ async fn a_successor_adoption_does_not_poison_peers_map_entries() {
     shutdown(&routed).await;
 }
 
+/// Poison is per VOLUME and only its own fresh read clears it. An
+/// adoption republishes the map (the `PlacementTable` precedent — the
+/// table is replaced, never mutated under readers), and a rebuild that
+/// dropped every latch would silently un-poison a sibling nobody
+/// re-derived.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_adoption_on_one_volume_never_clears_a_siblings_poison() {
+    let _plane = PLANE.lock().await;
+    let dir = TempDir::new().unwrap();
+    let vols = volume_set(dir.path(), "sibling", 3).await;
+    let routed = squeezefs::meta_backend::open_routed_meta_set(&uris(&vols))
+        .await
+        .expect("write mount (the slot map's source)");
+    let claim_b = foreign_claim(10);
+    let claim_c = foreign_claim(11);
+    let map = owners::derive_owner_map_from(
+        &routed,
+        NODE,
+        &[
+            ownership(
+                "vol-a",
+                Some(assigned_set(NODE, None, None, &[])),
+                None,
+                true,
+            ),
+            ownership(
+                "vol-b",
+                Some(assigned_set(PEER, Some(&claim_b), Some(PEER), &[STRANGER])),
+                Some(claim_b),
+                false,
+            ),
+            ownership(
+                "vol-c",
+                Some(assigned_set(PEER, Some(&claim_c), Some(PEER), &[])),
+                Some(claim_c),
+                false,
+            ),
+        ],
+        &endpoints,
+    )
+    .expect("assignment and evidence agree on both peer volumes");
+    squeezefs::meta_ship::arm_ownership(map);
+    let _guard = ArmGuard;
+
+    // Volume 2 is poisoned by a usurper; volume 1 then legitimately
+    // adopts its declared successor.
+    let usurper = foreign_claim(12);
+    assert!(!owners::reconcile_owner_from(
+        2,
+        &ownership(
+            "vol-c",
+            Some(assigned_set(PEER, Some(&usurper), Some(STRANGER), &[])),
+            Some(usurper),
+            false,
+        ),
+    ));
+    let adopted = foreign_claim(13);
+    assert!(owners::reconcile_owner_from(
+        1,
+        &ownership(
+            "vol-b",
+            Some(assigned_set(
+                PEER,
+                Some(&adopted),
+                Some(STRANGER),
+                &[STRANGER],
+            )),
+            Some(adopted),
+            false,
+        ),
+    ));
+    assert!(
+        owners::volume_poisoned(2),
+        "the adoption's republished map dropped a SIBLING's poison latch"
+    );
+    assert!(
+        !owners::volume_poisoned(1),
+        "the adopted volume routes again"
+    );
+    assert_eq!(owners::poisoned_volumes(), 1);
+    shutdown(&routed).await;
+}
+
 // ===========================================================================
 // 3. The mint funnel (§5.5.1) — a PREFERENCE, never a gate
 // ===========================================================================

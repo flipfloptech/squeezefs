@@ -666,8 +666,11 @@ fn adopt_holder(v_idx: usize, holder: &str) {
         assignment: (0..map.volume_count())
             .map(|v| map.assignment.get(v).cloned().unwrap_or_default())
             .collect(),
+        // The adoption clears THIS volume's latch (its re-derivation
+        // agreed) and carries every other volume's forward: a poisoned
+        // sibling stays poisoned until its own fresh read agrees.
         poisoned: (0..map.volume_count())
-            .map(|_| AtomicBool::new(false))
+            .map(|v| AtomicBool::new(v != v_idx && map.is_poisoned(v)))
             .collect(),
         local_slots: map.local_slots.clone(),
         routing_width: map.routing_width,
@@ -702,11 +705,10 @@ pub fn note_era_relearn(peer_id: &str) {
     let peer = peer_id.to_string();
     crate::meta_exec::spawn_meta("owner_map_relearn_reconcile", async move {
         for v_idx in volumes {
+            // A disagreeing verdict logged and poisoned inside the
+            // reconcile; only a failed READ needs a word here.
             match reconcile_volume_owner(&routed, v_idx).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    // `reconcile_owner_from` already logged and poisoned.
-                }
+                Ok(_) => {}
                 Err(e) => log::warn!(
                     "ownership map: re-reading metadata volume {v_idx} after '{peer}' relearned \
                      its era failed ({e}) — the installed entry stands until a read succeeds"

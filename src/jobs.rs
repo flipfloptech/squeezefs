@@ -1086,11 +1086,12 @@ pub trait FleetDispatch: Send + Sync {
 }
 
 /// The shard-number space KD-PV-16's inode-plane shards live in, disjoint
-/// from the census residues `1..n` by construction (a set can never have
-/// 2^20 metadata volumes: the routing width is `2^16` slots and a volume
-/// hosts at least one). Keeping one number space means the wire's shard
-/// map, lease law, fencing identity and durable `job:{id}:shard:{k}`
-/// records are the EXISTING ones, unchanged.
+/// from the census residues by construction: those are `1..n` where `n`
+/// is one more than the enrolled read-capable SESSION population, which
+/// the claim set's own member cap (≤ 16 writers) and any plausible fleet
+/// keep many orders of magnitude below 2^20. Keeping one number space
+/// means the wire's shard map, lease law, fencing identity and durable
+/// `job:{id}:shard:{k}` records are the EXISTING ones, unchanged.
 pub const INODE_PLANE_SHARD_BASE: u32 = 1 << 20;
 
 /// **KD-PV-14** (`docs/design-per-volume-claim-admission.md` §5.4b): the

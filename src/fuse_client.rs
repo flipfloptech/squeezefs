@@ -648,6 +648,28 @@ static READ_ONLY_MOUNT: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// writer, so both keep their exact shape.
 static CO_WRITER_MOUNT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// **Per-volume claim admission** (§5.1.3, KD-PV-5): the PARTIAL-METADATA
+/// latch — this mount appends to SOME volumes of the set and ships the
+/// rest.
+///
+/// A third additive word, for the S9 reason restated one rung on: the two
+/// latches above have exactly one meaning each across their ~40 consumers,
+/// and a partial-writer mount is a different shape from both. It is read
+/// **only** by [`mount_posture`] and the per-volume metadata gate; every
+/// data-plane consumer is unedited, so:
+///
+/// * a `set-authority` latches NEITHER of the other two, and its data
+///   plane is byte-identical to `writer`'s — the W1 in-place patch, the
+///   ownership recovery walk, direct reclaim, the grace ring;
+/// * a `partial-authority` latches `CO_WRITER`, so `plane_gate` and
+///   `alloc_plane_gate` keep their exact classes and texts.
+///
+/// A blanket co-writer latch across the fleet would leave NO node
+/// performing the W1 patch or the recovery walk — `plane_gate`'s own
+/// comment states the production assumption it would break.
+static PARTIAL_META_MOUNT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Which posture this mount took — the `mount_posture` stats gauge and the
 /// one word the data-plane gates classify against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -660,6 +682,20 @@ pub enum MountPosture {
     /// authority under a granted custody lease, and NO ownership-accounting
     /// authority (the authority's ledger owns every device offset).
     CoWriter,
+    /// Per-volume claim admission (§5.1.3): this mount appends to the
+    /// volume hosting **slot 0**, which under D20 makes it the SET
+    /// AUTHORITY — it assigns allocation lanes, serves the S9 custody
+    /// endpoint, owns the only freed-offset grace ring, coordinates
+    /// maintenance and homes ino 1. Its DATA plane is byte-identical to
+    /// [`MountPosture::Writer`]'s; its metadata plane is local on the
+    /// volumes it owns and shipped on the rest.
+    SetAuthority,
+    /// Per-volume claim admission (§5.1.3): this mount appends to a
+    /// SUBSET of the set that does not include the slot-0 volume. Its
+    /// data plane is the co-writer class (custody + a granted lane;
+    /// terminal frees SHIP), and its metadata plane is local on the
+    /// volumes it owns.
+    PartialAuthority,
 }
 
 impl MountPosture {
@@ -669,6 +705,8 @@ impl MountPosture {
             MountPosture::Writer => "writer",
             MountPosture::Reader => "reader",
             MountPosture::CoWriter => "co-writer",
+            MountPosture::SetAuthority => "set-authority",
+            MountPosture::PartialAuthority => "partial-authority",
         }
     }
 }
@@ -692,11 +730,27 @@ pub fn co_writer_mount() -> bool {
     CO_WRITER_MOUNT.load(Ordering::Relaxed)
 }
 
+/// Per-volume claim admission (§5.1.3): whether this mount holds metadata
+/// authority over only PART of its volume set. Read by [`mount_posture`]
+/// and the per-volume metadata gate — never by a data-plane consumer.
+#[inline]
+pub fn partial_meta_mount() -> bool {
+    PARTIAL_META_MOUNT.load(Ordering::Relaxed)
+}
+
 /// This mount's posture.
 #[inline]
 pub fn mount_posture() -> MountPosture {
     if read_only_mount() {
         MountPosture::Reader
+    } else if partial_meta_mount() {
+        // The additive latch decides the metadata shape; the co-writer
+        // latch then says which DATA plane rides with it (§5.1.3).
+        if co_writer_mount() {
+            MountPosture::PartialAuthority
+        } else {
+            MountPosture::SetAuthority
+        }
     } else if co_writer_mount() {
         MountPosture::CoWriter
     } else {
@@ -715,7 +769,20 @@ pub fn set_read_only_mount(on: bool) {
 /// set together so no window exists in which a mount is both.
 pub fn set_mount_posture(posture: MountPosture) {
     READ_ONLY_MOUNT.store(posture == MountPosture::Reader, Ordering::Relaxed);
-    CO_WRITER_MOUNT.store(posture == MountPosture::CoWriter, Ordering::Relaxed);
+    CO_WRITER_MOUNT.store(
+        matches!(
+            posture,
+            MountPosture::CoWriter | MountPosture::PartialAuthority
+        ),
+        Ordering::Relaxed,
+    );
+    PARTIAL_META_MOUNT.store(
+        matches!(
+            posture,
+            MountPosture::SetAuthority | MountPosture::PartialAuthority
+        ),
+        Ordering::Relaxed,
+    );
 }
 
 /// The standard refusal for a data-plane mutation attempted on a reader.
@@ -7537,6 +7604,37 @@ impl Clone for SqueezefsFilesystem {
 }
 
 impl SqueezefsFilesystem {
+    /// How many volumes this mount serves from a POLLED projection rather
+    /// than appending to (§5.11(a) / sweep row 15): 0 on an ordinary write
+    /// mount, every volume on a reader or co-writer, the peer-owned subset
+    /// on either partial-writer posture. The predicate the staleness
+    /// gauges are published under.
+    fn revalidating_volume_count(&self) -> usize {
+        self.meta_backend
+            .as_ref()
+            .map(|r| {
+                r.volumes
+                    .iter()
+                    .filter(|v| crate::ro_coherence::volume_wants_revalidation(v.read_only_cause()))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// `reader_staleness_bound_owners` — how many distinct OWNERS the
+    /// mount's projection depends on. `0` when it depends on none;
+    /// otherwise the ownership plane's peer count when armed, and 1
+    /// (today's reader/co-writer shape: one authority) when it is not.
+    fn revalidating_owner_count(&self) -> usize {
+        if self.revalidating_volume_count() == 0 {
+            return 0;
+        }
+        match crate::meta_ship::owners::owner_map() {
+            Some(map) => map.peers().len(),
+            None => 1,
+        }
+    }
+
     pub fn new(router: DataRouter, dlm: DlmClient, uid: u32, gid: u32) -> Self {
         let queue_cap = std::env::var("SQUEEZEFS_WRITEBACK_QUEUE_CAP")
             .ok()
@@ -9344,12 +9442,24 @@ impl SqueezefsFilesystem {
                 // in force. Both 0 on a write mount. The reader's activity
                 // counters are the meta_kv_revalidate_* family (below) —
                 // one mechanism, one family.
-                "reader_revalidate_interval_ms": if read_only_mount() {
+                // §5.11(a): the gauge is gated on "this mount runs a
+                // revalidation cadence", not on the reader latch. A
+                // co-writer's own docs already say its bound IS a
+                // reader's, and both partial-writer postures serve
+                // peer-owned volumes from a polled projection — reporting
+                // 0 for them published a guarantee nobody holds.
+                "reader_revalidate_interval_ms": if self.revalidating_volume_count() > 0 {
                     crate::ro_coherence::reader_revalidate_interval().as_millis() as u64
                 } else { 0 },
-                "reader_staleness_bound_ms": if read_only_mount() {
+                "reader_staleness_bound_ms": if self.revalidating_volume_count() > 0 {
                     crate::ro_coherence::reader_staleness_bound().as_millis() as u64
                 } else { 0 },
+                // How many distinct OWNERS this mount's projection depends
+                // on (§5.11(a)'s tripwire pair, not a max): 0 on a write
+                // mount, 1 on today's reader/co-writer shape, K−1 on a
+                // partial-writer posture once the ownership plane is
+                // derived (PR 5).
+                "reader_staleness_bound_owners": self.revalidating_owner_count(),
                 "active_block_cow_copies": METRICS.active_block_cow_copies.load(Ordering::Relaxed),
                 "write_through_blocks": METRICS.write_through_blocks.load(Ordering::Relaxed),
                 "write_through_bytes": METRICS.write_through_bytes.load(Ordering::Relaxed),
@@ -20633,12 +20743,26 @@ impl Filesystem for SqueezefsFilesystem {
         // serve bytes for offsets the authority has since reallocated. The
         // data-plane lockdown arm is right for it too: a co-writer frees
         // nothing and deallocates nothing (its accounting ships).
+        //
+        // Per-volume claim admission (§5.4 sweep row 15, risk R18) SPLITS
+        // the two arms, because the mount-level predicate is wrong in both
+        // directions once a mount can append to part of its set. The
+        // DATA-plane lockdown keeps the latch test verbatim — a
+        // partial-authority latches `CO_WRITER` and needs it, a
+        // set-authority latches neither and must NOT have it (its data
+        // plane is `writer`'s) — while the coherence + cadence arms move
+        // to the volumes this mount does not append to, decided by each
+        // volume's own read-only cause. On a reader or a co-writer that is
+        // every volume, so their behaviour is unchanged.
         if reader_mount || co_writer {
             crate::ro_coherence::arm_reader_data_plane(&self.router);
-            if let Some(routed) = self.meta_backend.as_ref() {
-                crate::ro_coherence::arm_reader_coherence(&routed.volumes, &self.router);
+        }
+        if let Some(routed) = self.meta_backend.as_ref() {
+            let tracked = crate::ro_coherence::revalidating_volumes(&routed.volumes);
+            if !tracked.is_empty() {
+                crate::ro_coherence::arm_reader_coherence(&tracked, &self.router);
                 crate::ro_coherence::spawn_reader_revalidation(
-                    routed.volumes.clone(),
+                    tracked,
                     self.dismount_once.clone(),
                     self.dismount_done.clone(),
                 );

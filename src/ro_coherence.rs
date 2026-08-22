@@ -71,7 +71,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::cache::TieredCache;
-use crate::meta_backend::kv::backend::KvMetaBackend;
+use crate::meta_backend::kv::backend::{KvMetaBackend, ReadOnlyCause};
 use crate::meta_backend::kv::node_cache::EpochPurgeSink;
 use crate::meta_backend::kv::revalidate::RevalidationPoller;
 
@@ -197,6 +197,45 @@ pub fn arm_reader_data_plane(router: &crate::routing::DataRouter) {
          reclaim, the W1 in-place patch and in-place overwrites are all refused on this \
          mount; the reclaim queue is latched halted"
     );
+}
+
+/// **Sweep row 15 (per-volume claim admission §5.4, risk R18): does THIS
+/// volume need a revalidation cadence?**
+///
+/// The predicate is the volume's own read-only CAUSE, not a process latch,
+/// because the mount-level `reader_mount || co_writer` test is wrong in
+/// both directions once a mount can append to part of its set:
+///
+/// * a **set authority** latches neither latch, so the mount-level test
+///   skipped it entirely — and it holds K−1 peer-owned volumes whose node
+///   caches would then never step an epoch: it would serve its mount-time
+///   read for ever and never run the R-6 purge, on the node that
+///   coordinates maintenance, serves custody and homes ino 1;
+/// * a **partial authority** would arm every volume including the ones it
+///   APPENDS to, which trips `meta_kv_revalidate_dirty_skips` — a
+///   must-stay-0 counter whose whole meaning is "revalidation armed on a
+///   mount that writes".
+///
+/// `UnknownRoFeatureBits` is excluded deliberately: §4.11 is a WRITE mount
+/// holding Layer A whose volume has no other appender, so there are no
+/// foreign checkpoints for it to track.
+pub fn volume_wants_revalidation(cause: ReadOnlyCause) -> bool {
+    matches!(
+        cause,
+        ReadOnlyCause::ReaderMount | ReadOnlyCause::CoWriterMount | ReadOnlyCause::PeerOwnedVolume
+    )
+}
+
+/// The subset of `volumes` this mount does NOT append to — the exact set
+/// [`arm_reader_coherence`] and [`spawn_reader_revalidation`] operate over
+/// (empty on an ordinary write mount, every volume on a reader or a
+/// co-writer, the peer-owned subset on either partial-writer posture).
+pub fn revalidating_volumes(volumes: &[Arc<KvMetaBackend>]) -> Vec<Arc<KvMetaBackend>> {
+    volumes
+        .iter()
+        .filter(|v| volume_wants_revalidation(v.read_only_cause()))
+        .cloned()
+        .collect()
 }
 
 /// **§6.8 item 2's declaration** — make every mounted volume a *coherent

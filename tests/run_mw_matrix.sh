@@ -6408,7 +6408,7 @@ pvo_engagement_gate() { # label
 # pass runs on the SET AUTHORITY, which coordinates maintenance (D20; a
 # partial authority refuses the coordinator-class verbs by design).
 pvo_oracle() { # label rowdir
-    local label="$1" rowdir="$2" out drift idx
+    local label="$1" rowdir="$2" out drift idx covered refused
     out="$("$SQZ" fsck "$(mnt_of 0)" 2>&1)" || die "$label: fsck FAILED:
 $out"
     echo "$out" >"$rowdir/fsck.out"
@@ -6420,7 +6420,12 @@ $out"
         [ "$drift" = "0" ] ||
             die "$label: member $idx meta_kv_block_refs_drift=$drift (C8 must stay 0)"
     done < <(pvo_owner_idxs)
-    log "$label: oracle clean (fsck findings 0, C8 drift 0 on every owner)"
+    # KD-PV-16's coverage gauge, REPORTED beside the verdict: "findings: 0"
+    # over a narrowed inode plane is a weaker statement than over the whole
+    # one, and the note must be able to say which it got.
+    covered="$(stat_field 0 fsck_inode_plane_volumes_covered)"
+    refused="$(stat_field 0 fsck_repair_refused_multi_owner)"
+    log "$label: oracle clean (fsck findings 0, C8 drift 0 on every owner; inode-plane volumes covered=$covered, multi-owner repairs refused=$refused)"
 }
 
 # ---------------------------------------------------------------------------

@@ -198,11 +198,16 @@ ride CoW-rewrite plus a shipped free. **R14 is a named, accepted
 regression** — this row publishes its size on this venue, and there is no
 gate.
 
-| ARM | IOPS | `patch_writes` | `patch_ineligible_*` (sum) | `cowriter.accounting_refusals` |
-|---|---|---|---|---|
-| partial authority | `PENDING` | 0 (asserted) | `PENDING` | `PENDING` |
-| set authority | `PENDING` | `PENDING` (> 0, asserted) | `PENDING` | `PENDING` |
-| single authority today (separate fleet) | `PENDING` | `PENDING` | `PENDING` | `PENDING` |
+| ARM | IOPS | `patch_writes` | `patch_ineligible_*` (sum) | of which `posture` | `cowriter.accounting_refusals` |
+|---|---|---|---|---|---|
+| partial authority | `PENDING` | 0 (asserted) | `PENDING` | `PENDING` | `PENDING` |
+| set authority | `PENDING` | `PENDING` (> 0, asserted) | `PENDING` | `PENDING` | `PENDING` |
+| single authority today (separate fleet) | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `PENDING` |
+
+`patch_ineligible_posture` is R14's own arm of the decision ledger — the
+W1 ladders declining upstream because this mount may not retire an
+incarnation (`src/block_allocator.rs:1604`). On the partial authority it
+should account for the row; on the set authority it should be 0.
 
 **Ratio**: `PENDING` × (partial vs set authority).
 
@@ -223,7 +228,8 @@ exactly one coordinator).
 |---|---|
 | `fsck` findings on the set | `PENDING` (must be 0) |
 | `meta_kv_block_refs_drift`, per owner | `PENDING` (C8 must be 0) |
-| `fsck_repair_refused_multi_owner` | `PENDING` |
+| `fsck_inode_plane_volumes_covered` (KD-PV-16) | `PENDING` — reported, not gated: "findings: 0" over a NARROWED inode plane is a weaker statement than over the whole one, and this note has to be able to say which it got |
+| `fsck_repair_refused_multi_owner` | `PENDING` (report-only repairs under several owners is the designed posture, not a fault) |
 
 ---
 

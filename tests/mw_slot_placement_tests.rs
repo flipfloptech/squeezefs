@@ -494,10 +494,25 @@ async fn two_placement_armed_clients_get_distinct_dedicated_slots() {
 // ===========================================================================
 
 /// Sustained concentration from a client that OWNS a volume (the
-/// fleet-of-authorities inversion) triggers the REAL online
-/// `migrate-meta-slot` engine through the authority executor: the client's
-/// dedicated slot moves to the client-owned volume, after which its inos
-/// route to that client — the S8 owner path, no shipping.
+/// fleet-of-authorities inversion) drives the policy through the authority
+/// executor — and the executor now **REFUSES**, because every migration
+/// this policy can select is a CROSS-OWNER one by construction: its target
+/// is a client-owned volume (`owned[0]`) and its victim's home is not, so
+/// the two endpoints always have different owners.
+///
+/// That refusal is sweep row 13 of
+/// `docs/design-per-volume-claim-admission.md` (D19 defers the two-party
+/// hand-off; a cross-owner slot migration would also move a child's inode
+/// record away from the dentry naming it, CREATING cross-owner names). The
+/// pin is therefore re-scoped from "the engine completes" to the honest
+/// composition: candidate found, migration triggered, engine refused,
+/// nothing moved. KD-PV-13 removes the trigger itself in the next rung —
+/// the policy's launch arm goes inert under a multi-owner plane, so
+/// `migrations_triggered`/`migrations_failed` become 0 by construction
+/// rather than a refuse-and-retry loop. The ENGINE's own coverage, which
+/// this case used to carry, is preserved by
+/// `the_migration_engine_moves_a_slot_when_no_multi_owner_plane_is_armed`
+/// below, so the follow-on that builds cross-owner migration inherits it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_migration_policy_engages_on_sustained_client_concentration() {
     let _plane = PLANE.lock().await;
@@ -518,8 +533,9 @@ async fn the_migration_policy_engages_on_sustained_client_concentration() {
             break;
         }
     }
-    wait_for("the policy to trigger and the engine to complete", || {
-        pstats().migrations_completed >= 1
+    wait_for("the policy to trigger and the engine to answer", || {
+        let s = pstats();
+        s.migrations_failed >= 1 || s.migrations_completed >= 1
     })
     .await;
     let s = pstats();
@@ -527,29 +543,65 @@ async fn the_migration_policy_engages_on_sustained_client_concentration() {
         s.migration_candidates >= 1,
         "the candidate inversion found the client-owned volume"
     );
-    assert_eq!(s.migrations_failed, 0, "the real engine succeeded");
+    assert!(
+        s.migrations_triggered >= 1,
+        "the policy still triggers at this rung (KD-PV-13 disarms it next)"
+    );
+    assert_eq!(
+        s.migrations_completed, 0,
+        "a CROSS-OWNER slot migration must not complete: D19 defers the hand-off, and moving \
+         the slot would create cross-owner names rather than remove them (sweep row 13)"
+    );
+    assert!(
+        s.migrations_failed >= 1,
+        "the engine's refusal is what the policy sees"
+    );
 
-    // The client's dedicated slot now homes on ITS volume: its inos route
-    // to the client (the S8 owner path from the authority's view).
+    // Nothing moved: the client's assignment stands where it was.
+    let map = fx.owner_be.slot_map_snapshot();
     let assigned = placement::client_assigned_slots(NODE);
     assert!(
-        !assigned.is_empty(),
-        "the client's assignment survives the move"
+        assigned.iter().all(|&s| map[usize::from(s)] != 1),
+        "a refused migration must leave the slot map untouched (assigned {assigned:?})"
     );
-    let map = fx.owner_be.slot_map_snapshot();
-    let moved: Vec<u16> = assigned
+    shutdown(&fx).await;
+}
+
+/// The ENGINE's own coverage, preserved from the case above: with NO
+/// multi-owner plane armed — every shipped fleet — `migrate_slot` moves a
+/// slot between volumes exactly as it always has. Row 13's refusal is
+/// scoped to the armed plane, and this is what says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_migration_engine_moves_a_slot_when_no_multi_owner_plane_is_armed() {
+    let _plane = PLANE.lock().await;
+    let fx = fixture(2, &[(1, NODE)]).await;
+    // The engine runs on the physically-local owner set; the plane is the
+    // policy's input, not the engine's, so disarming it is exactly the
+    // shipped topology.
+    ship::disarm_ownership();
+    // Never slot 0: ino 1 pins to it and KD-PV-6 makes it non-migratable
+    // under an armed plane — the engine's coverage is about any OTHER slot.
+    let victim = fx
+        .owner_be
+        .slot_map_snapshot()
         .iter()
-        .copied()
-        .filter(|&s| map[usize::from(s)] == 1)
-        .collect();
-    assert!(
-        !moved.is_empty(),
-        "≥1 client slot migrated to the client-owned volume (assigned {assigned:?})"
-    );
-    let owner = ship::owner_of_volume(1).expect("volume 1 has an owner");
+        .enumerate()
+        .find(|&(slot, &v)| slot != 0 && v == 0)
+        .map(|(slot, _)| slot as u16)
+        .expect("volume 0 hosts a non-zero slot");
+    squeezefs::meta_backend::slot_migration::migrate_slot(
+        &fx.owner_be,
+        victim,
+        1,
+        &squeezefs::meta_backend::slot_migration::MigrationOptions::default(),
+        &squeezefs::meta_backend::slot_migration::MigrationTestHooks::default(),
+    )
+    .await
+    .expect("the online migration engine still moves a slot");
     assert_eq!(
-        owner.peer_id, NODE,
-        "inos in the moved slot now belong to the client's authority"
+        fx.owner_be.slot_map_snapshot()[usize::from(victim)],
+        1,
+        "the slot's home volume moved"
     );
     shutdown(&fx).await;
 }

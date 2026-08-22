@@ -1908,6 +1908,19 @@ no bit). The protection is operator discipline:
 * `squeezefs volume set-owners --clear` before deliberately going back to an
   older release.
 
+**The same-release sibling hazard: a mount that declares no role.** With the
+whole fleet DOWN, a plain `squeezefs mount` of an assigned set is admitted —
+correctly, since no peer holds a claim and the D0 guard has nothing to refuse
+— and it behaves as the single authority it always was. What it does *not* do
+is honour the owner partition: the owned-candidate mint filter engages only
+when the ownership plane is armed, so files created under **another owner's**
+subtree root land on whatever volume the ordinary rotor picks, minting fresh
+cross-owner names that then return `EXDEV` on unlink in place. In a live fleet
+this cannot happen (the owners hold their claims and an undeclared mount meets
+the unchanged `FreshForeign` refusal). The discipline is the same as above:
+on an assigned set, mount with a role — `set-authority` or
+`partial-authority` — or `--clear` first.
+
 ### Subtree delegations & UPDATE intents (DLM stage S10)
 
 **Status: built, proven live on the fleet rig, and default-ON — but read

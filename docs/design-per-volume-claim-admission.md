@@ -355,6 +355,22 @@ the holder as `owner` and this node as a `Writer` member; (b) the holder's
 claim is heartbeat-fresh (same predicate, inverted verdict); (c) an admission
 decision exists ("declared, never inferred", `src/cowriter.rs:41-49`).
 
+> **CORRECTION (PR 3 implementation, `2ccd7326`) — clause (a) cannot be
+> written as sketched, and PR 4 owes the missing mechanism.** `recognizes`
+> compares the live holder against `claim_set.owner`, but the two are not the
+> same kind of name: **`WriterClaim.id` is a per-mount UUID**
+> (`backend.rs:1093`, `Uuid::new_v4()` at every open) while `owner` is a
+> durable KD-MW-2 member id. This is the *identical* mistake rung-9 finding #3
+> already fixed once for the co-writer ladder, where it "refused every healthy
+> fleet's first co-writer". PR 3's ladder therefore decides over a distinct
+> evidence field `holder_member_id: Option<String>` — the gather's durable
+> resolution of the live holder — and treats `None` as **silence, refused**
+> (ownership never moves on silence). **PR 4 must supply that resolution**: a
+> membership-census lookup, an `owner_claim_id`-style durable field on the
+> claim itself, or a rendezvous-record read. The design names none of them,
+> and no implementation of `recognizes` that compares the UUID directly can
+> work.
+
 **The complete open-behaviour table (rev 2, Issue 17 — `classify_claim`
 reaches `Reclaimable` BEFORE the freshness branch, including the
 `same_host && pid_provably_dead` arm that fires routinely on the single-node
@@ -538,10 +554,30 @@ The ladder is `src/cowriter.rs:734-775` **extended, never forked**.
 | **1** declaration | `:438-481` | new role values **`set-authority`** and **`partial-authority`**. `SQUEEZEFS_MW_AUTHORITY` = the SET authority's endpoint (D20); a `set-authority` role needs none (it *is* the endpoint) |
 | **2** engaged claim set | `:485-545` — iterates volumes demanding a **uniform** verdict | **per-volume verdict vector.** Bit 14 + a durable record still required on every volume; the OWNER reading becomes per volume |
 | **3** durable enrollment | `:550-596` | per volume, plus: a volume this node will own must name it as `owner` (or list it in `successors`, KD-PV-12); a peer-owned volume's `owner` must be a `Writer` member. `owner == None` on one volume of a set where another names one ⇒ **refuse loud** (the incomplete-assignment shape the marker also covers) |
-| **4** live authority | `:600-660` — `max` over every volume's claim term | **per volume**, because terms diverge per owner. The membership authority's term is compared against the **slot-0 volume's** claim term (D20); each peer-owned volume's own claim term is learned/refused independently through `era_relearns` |
+| **4** live authority | `:600-660` — `max` over every volume's claim term | **per volume**, because terms diverge per owner. The membership authority's term is compared against the **slot-0 volume's** claim term (D20); each peer-owned volume's own claim term is learned/refused independently through `era_relearns`. **CORRECTION (PR 3): this row describes only the PARTIAL-authority arm.** A set authority *is* the membership owner under D20, so demanding a granted lease of it makes the posture unreachable — it requires none, and refuses only on a **provably foreign** live membership owner (a non-empty `owner_claim_id` that is not this node; a legacy empty value proves nothing and must not refuse) |
 | **5** device registrant | `:675-720` | unchanged in substance; the WERO hold is joined, never forked (`data_custody::acquire_wero:774-790`) |
 | **6** *(new)* ownership coherence | — | **assignment ∧ evidence per volume**, per §5.1.1's complete table. An own-mode volume must classify `Reclaimable`, **or `StaleForeign` on a PR substrate where the D0 ladder's preempt would grant it** (rev 3, Issue 24: rev 2's text said `Reclaimable` only, which was narrower than both §5.1.1's `Own`/`StaleForeign` cell and KD-PV-12 clause (ii), and would have made the successor opt-in unusable). A peer-mode volume must classify `PeerAuthority` with the live holder's id **in that volume's assignment set** (`owner` ∪ `successors`, §5.10). Anything else refuses (never adopts) |
 | **7** *(new)* the freeze precondition | — | **every peer-owned volume's projected `claim_set` must carry an `owner`.** This is what §5.9 rests on and it is self-certifying: a monotone projection that shows the assignment record shows every commit that preceded it on that volume (§5.9.2). Refuse if any peer volume's projection predates its own assignment |
+
+**Three more PR 3 corrections to this section.** (a) The **verdict vector is
+produced by rung 3, not rung 2**: rung 2 answers the per-volume *owner
+reading*, and a mode cannot be resolved before rung 3 has refused a partial
+assignment map — resolving earlier would require an "unassigned mode" that is
+never legal. (b) **Rung 2 does not demand a live `writer_claim` per volume**
+(the co-writer ladder's clause does): under per-volume admission an own-mode
+volume is legitimately unclaimed, so the claim evidence belongs to rung 6,
+where §5.1.1's table already puts it. (c) **`VolumeMode::Peer.owner_id` is the
+live HOLDER, not the record's `owner`** — §5.10's adoption reading taken to
+its conclusion, since after a KD-PV-12 adoption the record still names the
+dead predecessor and shipping to `owner` would ship to a corpse;
+`owner_endpoint` is best-effort and its absence is announced, never refused
+(a peer's endpoint is only in the live census, so refusing would make the
+FIRST node of a fleet unmountable).
+
+**Contract-table gap (PR 3):** §5.1 has no contract table — PR 3's contract
+names came from the PR-plan row plus §5.3's single pin. PR 4 should not expect
+one here either; the authoritative per-rung list for the admission ladder is
+`tests/pv_admission_tests.rs` as landed.
 
 **The ladder's output — keyed by durable identity, not by position
 (rev 2 — Issue 8):**

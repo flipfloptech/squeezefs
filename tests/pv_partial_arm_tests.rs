@@ -1286,10 +1286,9 @@ async fn a_declared_per_volume_posture_is_selectable_by_the_mount_path() {
             pv::requested(),
             "{role} is a per-volume declaration the mount path must route to the partial door"
         );
-        assert_eq!(
-            squeezefs::cowriter::co_writer_requested()
+        assert!(
+            !squeezefs::cowriter::co_writer_requested()
                 .unwrap_or_else(|e| panic!("{role} is refused before the ladder ever runs: {e}")),
-            false,
             "{role} is not the CO-WRITER posture, so the co-writer door stays shut"
         );
 
@@ -1298,11 +1297,10 @@ async fn a_declared_per_volume_posture_is_selectable_by_the_mount_path() {
         // answering it here would refuse the posture instead of the
         // missing half.
         std::env::remove_var("SQUEEZEFS_MULTI_WRITER");
-        assert_eq!(
-            squeezefs::cowriter::co_writer_requested().unwrap_or_else(|e| panic!(
+        assert!(
+            !squeezefs::cowriter::co_writer_requested().unwrap_or_else(|e| panic!(
                 "{role} without the opt-in must reach rung 1, not a mount-path refusal: {e}"
             )),
-            false,
             "{role} is not the CO-WRITER posture with the opt-in off either"
         );
         assert!(

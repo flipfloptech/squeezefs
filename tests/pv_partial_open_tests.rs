@@ -601,3 +601,265 @@ async fn a_peer_owned_open_refuses_an_admission_that_does_not_name_the_volume() 
         "the refusal must name the mode the decision actually took: {err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The SET-level partial open (§5.4 sweep rows 2/3/4/18): the rollback
+// ladder, the `owner_assign:` probe, and ownership-scoped intent recovery
+// ---------------------------------------------------------------------------
+
+/// The set-authority admission over the two-volume set: `vol0` (slot 0) is
+/// OURS — which under D20 makes this mount the set authority — and `vol1`
+/// belongs to `PEER`. Opening in canonical order therefore takes a real D0
+/// guard BEFORE it reaches the volume that refuses, which is the only shape
+/// in which a rollback ladder has anything to release.
+fn set_authority_admission(
+    vol0: &Path,
+    id0: &str,
+    vol1: &Path,
+    id1: &str,
+    claim1: Option<&WriterClaim>,
+) -> SetAdmission {
+    let peer_set = claim1
+        .map(|c| peer_owned_set(c, true))
+        .unwrap_or_else(|| peer_owned_set(&foreign_claim(), false));
+    let req = SetAdmissionRequest {
+        multi_writer: true,
+        role: MwRole::SetAuthority,
+        read_only: false,
+        node_id: NODE.to_string(),
+        set_authority_endpoint: None,
+        volumes: vec![
+            evidence(vol0, id0, true, None, None, own_set()),
+            evidence(
+                vol1,
+                id1,
+                false,
+                Some(claim1.cloned().unwrap_or_else(foreign_claim)),
+                Some(PEER),
+                peer_set,
+            ),
+        ],
+        authority: None,
+        registrant: Some(RegistrantEvidence {
+            pr_capable: true,
+            wero: true,
+            reservation_held: true,
+            registered: true,
+            key: 0xB0B0,
+            namespaces: 1,
+        }),
+    };
+    pv::classify_set_admission(&req).expect("the ladder admits the set-authority fixture")
+}
+
+/// §5.4: **the rollback ladder releases exactly the guards it took.** The
+/// own volume's Layer-A flock, its `writer_claim` and its reservation are
+/// released when a later volume refuses; the peer volume — which took no
+/// guard at all — has nothing to release and is not written to either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_partial_set_open_failure_releases_exactly_the_owned_volumes_guards() {
+    let dir = TempDir::new().unwrap();
+    let (vol0, vol1) = two_volume_set(dir.path(), "rollback").await;
+    let (id0, id1) = (vol_id(&vol0).await, vol_id(&vol1).await);
+    store_set(&vol0, &own_set()).await;
+    // The peer volume is ASSIGNED but unclaimed: its owner is dead, which
+    // §5.1.1 makes a loud refusal rather than a degraded serve.
+    store_set(&vol1, &peer_owned_set(&foreign_claim(), true)).await;
+    let admission = set_authority_admission(&vol0, &id0, &vol1, &id1, None);
+
+    let peer_before = digest(&vol1);
+    let err = squeezefs::meta_backend::open_meta_volume_set_partial(
+        &[vol0.display().to_string(), vol1.display().to_string()],
+        &[id0.clone(), id1.clone()],
+        &admission,
+    )
+    .await
+    .expect_err("a peer volume with no appender refuses the whole set open");
+    assert!(
+        err.to_string().contains("NOTHING claims it"),
+        "the set open must propagate the volume's own refusal: {err}"
+    );
+
+    // Exactly what it took: the own volume's guard is FREE again, proven
+    // by taking it (the flock is the guard's own instrument).
+    let reopened = KvMetaBackend::open(&vol0)
+        .await
+        .expect("the owned volume's Layer-A flock and claim were released by the rollback");
+    reopened.shutdown().await.expect("release");
+    assert_eq!(
+        digest(&vol1),
+        peer_before,
+        "the rollback wrote to a peer-owned volume — a Peer-mode backend's shutdown must be a \
+         no-op because it took nothing"
+    );
+}
+
+/// Sweep row 2: the `owner_assign:` bracket is the `mw_upgrade:` mechanism
+/// verbatim — a writable mount refuses while it exists, in BOTH the
+/// ordinary routed open and the partial twin, naming the idempotent re-run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn any_writable_mount_refuses_while_an_owner_assign_bracket_is_open() {
+    let dir = TempDir::new().unwrap();
+    let (vol0, vol1) = two_volume_set(dir.path(), "assign-marker").await;
+    let (id0, id1) = (vol_id(&vol0).await, vol_id(&vol1).await);
+    store_set(&vol0, &own_set()).await;
+    store_set(&vol1, &peer_owned_set(&foreign_claim(), true)).await;
+    {
+        let be = KvMetaBackend::open(&vol0).await.expect("marker open");
+        be.setxattr_internal(
+            1,
+            squeezefs::OWNER_ASSIGN_MARKER_XATTR,
+            &squeezefs::config_ops::OwnerAssignMarker {
+                assignments: vec![squeezefs::config_ops::OwnerAssignment {
+                    volume_id: id0.clone(),
+                    owner: Some(NODE.to_string()),
+                    successors: Vec::new(),
+                }],
+            }
+            .encode(),
+        )
+        .await
+        .expect("plant the bracket");
+        be.sync_device().await.expect("barrier");
+        be.shutdown().await.expect("release");
+    }
+
+    let uris = vec![vol0.display().to_string(), vol1.display().to_string()];
+    let plain = squeezefs::meta_backend::open_routed_meta_set(&uris)
+        .await
+        .err()
+        .expect("an ordinary writable mount refuses mid-assignment");
+    assert!(
+        plain.to_string().contains("owner_assign:")
+            && plain.to_string().contains("volume set-owners"),
+        "the refusal must name the record and the idempotent re-run: {plain}"
+    );
+
+    let admission = set_authority_admission(&vol0, &id0, &vol1, &id1, None);
+    let partial = squeezefs::meta_backend::open_routed_meta_set_partial(&uris, &admission)
+        .await
+        .err()
+        .expect("the partial twin refuses the same way");
+    assert!(
+        partial.to_string().contains("owner_assign:"),
+        "the partial open must run the sibling probe too: {partial}"
+    );
+}
+
+/// Sweep row 3 / §5.4a case (c): an open intent whose steps span TWO
+/// OWNERS refuses the mount loud and moves the must-stay-0
+/// `xv_cross_owner_intents` counter — it is reachable-by-bug (M1 is what
+/// keeps it 0), never rolled forward by a node that owns half of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cross_owner_open_intent_refuses_the_partial_mount() {
+    use squeezefs::meta_backend::crossvol_tx::{intent_name, IntentRecord, XvOp, XvStep};
+    let dir = TempDir::new().unwrap();
+    let (vol0, vol1) = two_volume_set(dir.path(), "xv-cross").await;
+    let (id0, id1) = (vol_id(&vol0).await, vol_id(&vol1).await);
+    store_set(&vol0, &own_set()).await;
+    let claim = foreign_claim();
+    store_set(&vol1, &peer_owned_set(&claim, true)).await;
+    plant(&vol1, &claim, false).await;
+
+    // A plan whose first step homes on OUR volume (ino 1 → slot 0) and
+    // whose second homes on the PEER's: the shape one ordinary `rm`
+    // produced before M1 existed.
+    let peer_ino = squeezefs::meta_backend::make_global_ino_width(
+        1,
+        7,
+        u64::from(squeezefs::meta_backend::DERIVED_ROUTING_WIDTH),
+    );
+    let rec = IntentRecord {
+        tx_id: 0x5151_5151_5151_5151,
+        op: XvOp::Unlink,
+        steps: vec![
+            XvStep::RemoveDentry {
+                parent: 1,
+                name: "victim".to_string(),
+                expect_child: peer_ino,
+                parent_update: 0,
+            },
+            XvStep::SetNlink {
+                ino: peer_ino,
+                pre: 1,
+                post: 0,
+                ctime: None,
+            },
+        ],
+    };
+    {
+        let be = KvMetaBackend::open(&vol0).await.expect("intent open");
+        be.setxattr_internal(1, &intent_name(rec.tx_id), &rec.encode().unwrap())
+            .await
+            .expect("plant the intent");
+        be.sync_device().await.expect("barrier");
+        be.shutdown().await.expect("release");
+    }
+
+    let admission = set_authority_admission(&vol0, &id0, &vol1, &id1, Some(&claim));
+    let before = METRICS.xv_cross_owner_intents.load(Ordering::Relaxed);
+    let err = squeezefs::meta_backend::open_routed_meta_set_partial(
+        &[vol0.display().to_string(), vol1.display().to_string()],
+        &admission,
+    )
+    .await
+    .expect_err("an intent spanning two owners must refuse the mount");
+    assert!(
+        err.to_string().contains("two metadata OWNERS"),
+        "the refusal must say what makes the intent unrecoverable here: {err}"
+    );
+    assert_eq!(
+        METRICS.xv_cross_owner_intents.load(Ordering::Relaxed),
+        before + 1,
+        "xv_cross_owner_intents is the must-stay-0 tripwire M1 exists to hold at zero"
+    );
+}
+
+/// Sweep rows 3/4/18 plus KD-PV-17's publisher: a healthy partial mount
+/// comes up, recovers only what it owns, covers bring-up residue on owned
+/// volumes only, and ATTESTS itself as the holder of the claims it took —
+/// which is what lets a peer resolve this node's per-mount uuid later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_partial_routed_open_serves_and_attests_only_the_volumes_it_owns() {
+    let dir = TempDir::new().unwrap();
+    let (vol0, vol1) = two_volume_set(dir.path(), "routed-partial").await;
+    let (id0, id1) = (vol_id(&vol0).await, vol_id(&vol1).await);
+    store_set(&vol0, &own_set()).await;
+    let claim = foreign_claim();
+    store_set(&vol1, &peer_owned_set(&claim, true)).await;
+    plant(&vol1, &claim, false).await;
+    let admission = set_authority_admission(&vol0, &id0, &vol1, &id1, Some(&claim));
+
+    let peer_before = digest(&vol1);
+    let routed = squeezefs::meta_backend::open_routed_meta_set_partial(
+        &[vol0.display().to_string(), vol1.display().to_string()],
+        &admission,
+    )
+    .await
+    .expect("a healthy partial set opens");
+    assert_eq!(routed.volumes[0].writer_guard_mode(), "flock+claim");
+    assert_eq!(routed.volumes[1].writer_guard_mode(), "peer-owned");
+
+    // The attestation is on the OWNED volume and nowhere else.
+    let attested = ClaimSet::load(&routed.volumes[0])
+        .await
+        .expect("the owned volume answers a claim set");
+    let held = routed.volumes[0]
+        .read_writer_claim()
+        .await
+        .expect("we hold the claim we took");
+    assert_eq!(
+        attested.resolve_holder(&held),
+        Some(NODE),
+        "an owned volume must attest THIS mount as its holder, or no peer can ever resolve \
+         our per-mount uuid to a durable member id (KD-PV-17)"
+    );
+    for vol in &routed.volumes {
+        vol.shutdown().await.expect("release");
+    }
+    assert_eq!(
+        digest(&vol1),
+        peer_before,
+        "a partial mount wrote to a peer-owned volume"
+    );
+}

@@ -16,10 +16,9 @@
 //!
 //! It is the co-writer ladder ([`crate::cowriter::classify_admission`])
 //! **extended, never forked** — the shared rungs are literally shared
-//! ([`crate::cowriter::required_incompat_detail`],
-//! [`crate::cowriter::member_standing`],
-//! [`crate::cowriter::registrant_detail`]) — with two new rungs and one
-//! structural change:
+//! (`cowriter::required_incompat_detail`, `cowriter::member_standing`,
+//! `cowriter::registrant_detail`, all `pub(crate)`) — with two new rungs
+//! and one structural change:
 //!
 //! | Rung | Requirement | The threat it answers |
 //! |---|---|---|
@@ -226,10 +225,17 @@ impl SetAdmission {
     /// set may never open a volume of another
     /// (the `open_co_writer` precedent).
     pub fn covers(&self, paths: &[String]) -> bool {
+        // Both directions, not just "every path is one of mine": a list
+        // that repeats one volume and omits another has the right length
+        // and every entry covered, and it must not pass.
         paths.len() == self.volumes.len()
             && paths
                 .iter()
                 .all(|p| self.volumes.iter().any(|v| v == Path::new(p)))
+            && self
+                .volumes
+                .iter()
+                .all(|v| paths.iter().any(|p| Path::new(p) == v))
     }
 
     /// What this mount does with the volume of DURABLE id `vol_id`.

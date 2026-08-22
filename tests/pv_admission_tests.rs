@@ -908,6 +908,16 @@ async fn covers_refuses_a_cross_set_admission() {
         "a subset is not the set the decision was taken over"
     );
     assert!(!admission.covers(&[]), "an empty set covers nothing");
+
+    // A list that REPEATS one volume and omits another has the right
+    // length and every entry covered — and must still be refused, or a
+    // permuted-and-deduped path list would open a volume twice while a
+    // peer's went unnamed.
+    let duplicated = vec![mine[0].clone(), mine[0].clone()];
+    assert!(
+        !admission.covers(&duplicated),
+        "a repeated volume never stands in for the one it displaced"
+    );
 }
 
 /// **The ladder is the ONLY `SetAdmission` constructor.** The decision must

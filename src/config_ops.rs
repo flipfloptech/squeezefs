@@ -2774,13 +2774,22 @@ async fn set_owners_inner(
             ))
         })?;
     let routed = match crate::meta_backend::RoutedMetaBackend::with_slot_map_and_natives(
-        backends,
+        backends.clone(),
         disc.routing_width,
         disc.slot_to_volume.clone(),
         disc.native_slots.clone(),
     ) {
         Ok(r) => std::sync::Arc::new(r),
         Err(e) => {
+            // The guards are already taken; release exactly what the
+            // open took before propagating (the `open_meta_volume_set`
+            // rollback law, which cannot run for us because the routed
+            // constructor consumed the vector).
+            for be in &backends {
+                if let Err(te) = be.shutdown().await {
+                    log::warn!("releasing guard after a refused routed build failed too: {te}");
+                }
+            }
             return Err(e);
         }
     };
@@ -3386,16 +3395,24 @@ async fn cross_owner_census(
                             routed.try_make_global_ino(local_parent, v)
                         })
                         .unwrap_or(0);
+                    // A dentry VALUE is never an authority (fsck C9's
+                    // law): an out-of-range child index renders as `?`
+                    // rather than indexing this census off a cliff.
+                    let named = |idx: usize| vol_ids.get(idx).map(String::as_str).unwrap_or("?");
+                    let owner = |idx: usize| {
+                        owner_by_volume
+                            .get(idx)
+                            .and_then(|o| o.as_deref())
+                            .unwrap_or("(unassigned)")
+                    };
                     census.sample.push(format!(
                         "ino {parent}/{} → ino {} on {} (owner {}), parent on {} (owner {})",
                         String::from_utf8_lossy(&d.name),
                         d.child_ino,
-                        vol_ids[child_v],
-                        owner_by_volume[child_v]
-                            .as_deref()
-                            .unwrap_or("(unassigned)"),
-                        vol_ids[v],
-                        owner_by_volume[v].as_deref().unwrap_or("(unassigned)"),
+                        named(child_v),
+                        owner(child_v),
+                        named(v),
+                        owner(v),
                     ));
                 }
             }

@@ -556,9 +556,7 @@ async fn a_peer_owned_volume_with_no_live_claim_opens_degraded() {
     let refused_before = METRICS
         .peer_volume_unclaimed_refusals
         .load(Ordering::Relaxed);
-    let admitted_before = METRICS
-        .peer_volume_unclaimed_admits
-        .load(Ordering::Relaxed);
+    let admitted_before = METRICS.peer_volume_unclaimed_admits.load(Ordering::Relaxed);
     let before = digest(&vol0);
     let be = KvMetaBackend::open_peer_owned(&vol0, &admission, &id0)
         .await
@@ -589,9 +587,7 @@ async fn a_peer_owned_volume_with_no_live_claim_opens_degraded() {
         "the degraded open took the absent claim — that is the adoption KD-PV-3 forbids"
     );
     assert_eq!(
-        METRICS
-            .peer_volume_unclaimed_admits
-            .load(Ordering::Relaxed),
+        METRICS.peer_volume_unclaimed_admits.load(Ordering::Relaxed),
         admitted_before + 1,
         "the degraded admission is COUNTED: an operator must be able to see that this set came \
          up with an owner missing"
@@ -626,18 +622,14 @@ async fn a_stale_peer_claim_admits_only_when_it_attributes_to_the_admitted_holde
     // no live appender, and the open admits it degraded.
     store_set(&vol0, &peer_owned_set(&claim, true)).await;
     plant(&vol0, &claim, false).await;
-    let admitted_before = METRICS
-        .peer_volume_unclaimed_admits
-        .load(Ordering::Relaxed);
+    let admitted_before = METRICS.peer_volume_unclaimed_admits.load(Ordering::Relaxed);
     let be = KvMetaBackend::open_peer_owned(&vol0, &admission, &id0)
         .await
         .expect("a dead owner's own stale claim opens degraded");
     assert_eq!(be.read_only_cause(), ReadOnlyCause::PeerOwnedVolume);
     drop(be);
     assert_eq!(
-        METRICS
-            .peer_volume_unclaimed_admits
-            .load(Ordering::Relaxed),
+        METRICS.peer_volume_unclaimed_admits.load(Ordering::Relaxed),
         admitted_before + 1
     );
 
@@ -757,15 +749,24 @@ fn set_authority_admission(
 /// own volume's Layer-A flock, its `writer_claim` and its reservation are
 /// released when a later volume refuses; the peer volume — which took no
 /// guard at all — has nothing to release and is not written to either.
+///
+/// The refusal it is driven by is a peer volume carrying a claim NOTHING
+/// attests: an unclaimed peer volume no longer refuses (it is the degraded
+/// not-yet-up state), while a claim the assignment cannot account for
+/// still does — and that is the shape a rollback must survive anyway,
+/// since it is reachable at any mount rather than only at a cold start.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_partial_set_open_failure_releases_exactly_the_owned_volumes_guards() {
     let dir = TempDir::new().unwrap();
     let (vol0, vol1) = two_volume_set(dir.path(), "rollback").await;
     let (id0, id1) = (vol_id(&vol0).await, vol_id(&vol1).await);
     store_set(&vol0, &own_set()).await;
-    // The peer volume is ASSIGNED but unclaimed: its owner is dead, which
-    // §5.1.1 makes a loud refusal rather than a degraded serve.
-    store_set(&vol1, &peer_owned_set(&foreign_claim(), true)).await;
+    // The peer volume is ASSIGNED, and something is appending to it that
+    // no KD-PV-17 attestation names — silence about WHO, which fails
+    // closed (§5.1.1's `Peer` column).
+    let claim = foreign_claim();
+    store_set(&vol1, &peer_owned_set(&claim, false)).await;
+    plant(&vol1, &claim, false).await;
     let admission = set_authority_admission(&vol0, &id0, &vol1, &id1, None);
 
     let peer_before = digest(&vol1);
@@ -776,9 +777,9 @@ async fn a_partial_set_open_failure_releases_exactly_the_owned_volumes_guards() 
     )
     .await
     .err()
-    .unwrap_or_else(|| panic!("a peer volume with no appender refuses the whole set open"));
+    .unwrap_or_else(|| panic!("an unattributable claim refuses the whole set open"));
     assert!(
-        err.to_string().contains("NOTHING claims it"),
+        err.to_string().contains("durable member id"),
         "the set open must propagate the volume's own refusal: {err}"
     );
 

@@ -1340,7 +1340,7 @@ impl KvMetaBackend {
     /// | Layer A `flock(LOCK_EX)` | **not taken** — a retained lock would deny the volume's OWNER its `LOCK_EX` on a shared host. The released `LOCK_SH` probe runs for classification only |
     /// | DUR-5 primary-superblock repair | **skipped** — it WRITES sector 0, which is the owner's business |
     /// | Bootstrap replay | same, verbatim (read-only by construction) |
-    /// | Layer B2 claim classification | **evaluated, through the `PeerAuthority` arm**: the claim must be the ADMITTED holder's, resolved to a durable member id by the volume's own attestation. A fresh claim from anyone else, no claim at all, or a TTL-stale one all refuse (§5.1.1's `Peer` column) |
+    /// | Layer B2 claim classification | **evaluated, through the `PeerAuthority` arm**: where the volume HAS a claim it must be the ADMITTED holder's, resolved to a durable member id by the volume's own attestation — a claim from anyone else, or one nothing attests, refuses. A volume with NO claim opens DEGRADED (its owner is not up; nothing is adopted) — §5.1.1's `Peer` column |
     /// | Layer B1 PR register + WEX acquire | **not performed** — a WEX acquire would preempt the owner |
     /// | `writer_claim` commit + barrier | **never written** |
     /// | checkpoint + times-drain tasks | **not spawned** (both write) |
@@ -1463,32 +1463,73 @@ impl KvMetaBackend {
                     ),
                 }))
             }
+            // **The DEGRADED open** (§5.1.1's corrected `Peer` +
+            // `Reclaimable` row): nothing claims the volume, because its
+            // owner has not started yet or has gone. This open takes no
+            // lock, writes no claim and appends nowhere, so admitting
+            // adopts nothing — it degrades exactly ONE owner's subtree,
+            // which is the blast radius `docs/operations.md`'s "ownership
+            // does not fail over" states. Refusing degraded the whole
+            // namespace instead, and at a cold fleet start (no volume
+            // carries a claim) it made an assigned set unmountable by any
+            // node at all.
             ClaimEvidence::Reclaimable => {
                 crate::fuse_client::METRICS
-                    .peer_volume_unclaimed_refusals
+                    .peer_volume_unclaimed_admits
                     .fetch_add(1, Ordering::Relaxed);
-                Err(KvError::Busy(format!(
-                    "{} ({vol_id}): the assignment names peer '{admitted_holder}' as this \
-                     volume's owner, but NOTHING claims it — that owner is dead, was never \
-                     started, or the assignment is stale. This mount is not the assignee, so \
-                     it must not take the claim; and it must not serve a set with a volume no \
-                     node appends to. Start the owner, or re-assign offline with `squeezefs \
-                     volume set-owners` (`squeezefs volume get-owners` prints assignment \
-                     beside evidence)",
-                    path.display()
-                )))
+                be.trace_guard_event("peer_owned_unclaimed_admitted");
+                log::warn!(
+                    "meta volume {} ({vol_id}): mounted PEER-OWNED and DEGRADED — the \
+                     assignment names '{admitted_holder}' as its owner and NOTHING claims it, \
+                     so that owner has not started yet or is down. This mount neither takes the \
+                     claim nor appends here; every verb about this volume refuses loud at the \
+                     ship site until its owner arrives (`meta_ship.volumes_peer_unclaimed`, \
+                     `peer_volume_unclaimed_admits`; `squeezefs volume get-owners` prints \
+                     assignment beside evidence). Guarantee class: {}",
+                    path.display(),
+                    be.writer_guard_mode()
+                );
+                Ok(be)
             }
+            // A TTL-stale claim is evidence that something appended here,
+            // so it must still ATTRIBUTE to the holder the admission
+            // admitted (the same `recognizes` predicate the fresh arm
+            // takes, which age does not change). Attributable ⇒ the owner
+            // is down and this is the degraded open again — never a
+            // preempt, since nothing here takes the claim.
             ClaimEvidence::StaleForeign(claim) => {
+                if let Some(claim) = claim.as_ref().filter(|c| witness.recognizes(c)) {
+                    crate::fuse_client::METRICS
+                        .peer_volume_unclaimed_admits
+                        .fetch_add(1, Ordering::Relaxed);
+                    be.trace_guard_event("peer_owned_unclaimed_admitted");
+                    log::warn!(
+                        "meta volume {} ({vol_id}): mounted PEER-OWNED and DEGRADED — its owner \
+                         '{admitted_holder}' left a TTL-stale writer_claim (id {}, era {}), so \
+                         it is down or partitioned. This mount does NOT preempt it and appends \
+                         nowhere here; the volume's verbs refuse loud at the ship site until \
+                         that owner returns (`meta_ship.volumes_peer_unclaimed`). Guarantee \
+                         class: {}",
+                        path.display(),
+                        claim.id,
+                        claim.term,
+                        be.writer_guard_mode()
+                    );
+                    return Ok(be);
+                }
                 crate::fuse_client::METRICS
                     .peer_volume_unclaimed_refusals
                     .fetch_add(1, Ordering::Relaxed);
                 Err(KvError::Busy(format!(
-                    "{} ({vol_id}): the assigned owner '{admitted_holder}' left a TTL-stale \
-                     writer_claim{}. A partial writer must NEVER preempt a peer's claim — \
-                     preempting would make it the appender of a volume it is not assigned, \
-                     which is the one thing per-volume admission exists to prevent. Start \
-                     that owner, or re-assign the volume offline (`squeezefs volume \
-                     set-owners`)",
+                    "{} ({vol_id}): this volume carries a TTL-stale writer_claim{} that does \
+                     NOT attribute to '{admitted_holder}', the owner the assignment names — no \
+                     KD-PV-17 attestation binds it, or it binds another node. Something \
+                     appended here that the record cannot account for, and silence about WHO \
+                     is never resolved in a peer's favour (KD-PV-3): a volume with NO claim is \
+                     the degraded not-yet-up state and mounts, this one does not. Verify the \
+                     holder is gone and run `squeezefs claim clear`, or re-assign offline with \
+                     `squeezefs volume set-owners` (`squeezefs volume get-owners` prints \
+                     assignment beside evidence)",
                     path.display(),
                     holder_suffix(&claim.map(|c| (c, unix_now_secs())))
                 )))

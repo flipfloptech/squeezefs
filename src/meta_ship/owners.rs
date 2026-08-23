@@ -102,6 +102,12 @@ pub struct OwnerMap {
     /// cleared only by installing a freshly derived map, which is what
     /// "until a re-derivation from a fresh read agrees" means.
     poisoned: Vec<AtomicBool>,
+    /// Per volume: a PEER's volume that NOTHING appended to when this map
+    /// was derived — its owner had not started yet (a cold fleet), or was
+    /// down. The state is the derivation's, so it lives as long as the map
+    /// does and a fresh derivation (a remount) is what re-reads it; the
+    /// gauge is `meta_ship.volumes_peer_unclaimed`.
+    unclaimed: Vec<bool>,
     /// The slots this node's authority homes, derived from the set's live
     /// slot map at build time — what the S4 lock plane installs so both
     /// planes answer one question.
@@ -149,7 +155,10 @@ impl OwnerMap {
             }
             volume_owners[v_idx] = Some(Arc::new(peer));
         }
-        Ok(Self::build(routed, volume_owners, assignment))
+        // No evidence was read here either, so no volume is KNOWN to lack
+        // an appender: the degraded gauge belongs to the derivation.
+        let unclaimed = vec![false; count];
+        Ok(Self::build(routed, volume_owners, assignment, unclaimed))
     }
 
     /// The shared tail of both constructors: derive the local slot set
@@ -158,6 +167,7 @@ impl OwnerMap {
         routed: &RoutedMetaBackend,
         volume_owners: Vec<Option<Arc<PeerOwner>>>,
         assignment: Vec<Vec<String>>,
+        unclaimed: Vec<bool>,
     ) -> Arc<Self> {
         let slot_map = routed.slot_map_snapshot();
         let local_slots: Vec<u16> = slot_map
@@ -175,6 +185,7 @@ impl OwnerMap {
             volume_owners,
             assignment,
             poisoned,
+            unclaimed,
             local_slots,
             slot_0_volume,
             routing_width: routed.routing_width(),
@@ -292,6 +303,19 @@ impl OwnerMap {
             .unwrap_or(false)
     }
 
+    /// The `volumes_peer_unclaimed` gauge: peer-owned volumes that NOTHING
+    /// appended to when this map was derived.
+    ///
+    /// **Not a tripwire** — it is the honest name for a legitimate state
+    /// (an owner that has not started, or one that is down). Read it
+    /// against `volumes_peer_owned`: the difference is how many of this
+    /// set's other owners were present, and a nonzero value means those
+    /// subtrees' verbs refuse loud at the ship site until their owner
+    /// arrives.
+    pub fn unclaimed_count(&self) -> u64 {
+        self.unclaimed.iter().filter(|u| **u).count() as u64
+    }
+
     /// The `owner_map_poisoned_volumes` gauge (**must stay 0**).
     pub fn poisoned_count(&self) -> u64 {
         self.poisoned
@@ -336,6 +360,7 @@ impl OwnerMap {
             poisoned: (0..self.volume_count())
                 .map(|v| AtomicBool::new(Some(v) != cleared && self.is_poisoned(v)))
                 .collect(),
+            unclaimed: self.unclaimed.clone(),
             local_slots: self.local_slots.clone(),
             slot_0_volume: self.slot_0_volume,
             routing_width: self.routing_width,
@@ -373,6 +398,16 @@ pub struct VolumeOwnership {
     pub claim_set: Option<ClaimSet>,
     /// The replayed `writer_claim` — the live EVIDENCE half.
     pub claim: Option<WriterClaim>,
+    /// What the D0 Layer-B2 gate says about that claim — the gate's own
+    /// classification (`KvMetaBackend::claim_standing`), never a second
+    /// spelling of the dead-pid proof and the TTL window.
+    ///
+    /// The derivation needs it because `claim.is_some()` is not the same
+    /// question as *is anything appending here*: a claim left by a holder
+    /// this boot can prove dead reads `Reclaimable`, and the ladder and
+    /// the peer door both admit that volume DEGRADED. Deciding it
+    /// differently here would refuse the mount they just admitted.
+    pub standing: crate::partial_authority::ClaimStanding,
     /// `true` ⇔ **this mount** holds this volume's claim, i.e. the D0
     /// ladder granted it here and this process is its appender. The
     /// strongest evidence there is for an own-mode volume, and the one a
@@ -407,6 +442,14 @@ impl VolumeOwnership {
         let claim = self.claim.as_ref()?;
         self.claim_set.as_ref()?.resolve_holder(claim)
     }
+
+    /// Is NOTHING appending to this volume — no claim, our own residue, or
+    /// a holder this boot proved dead? The D0 gate's `Reclaimable`, which
+    /// is the one reading under which a peer's volume is admitted DEGRADED
+    /// rather than shipped to a live holder.
+    fn no_live_appender(&self) -> bool {
+        self.standing == crate::partial_authority::ClaimStanding::Reclaimable
+    }
 }
 
 /// The installed map, or `None` = **solo**: this node owns every volume
@@ -440,9 +483,18 @@ fn refuse(detail: String) -> SqueezefsError {
 /// | none, on SOME volume | any | **refuse** — a partial map has no coherent appender story |
 /// | this node | this mount appends | LOCAL |
 /// | a peer (∪ successors) | that peer holds the claim | ship to the HOLDER |
-/// | anything | nothing claims it | **refuse** — a set with a hole |
-/// | anything | an unattested claim | **refuse** — silence never adopts |
+/// | a peer | **nothing appends there** | the peer's entry, **DEGRADED** — its owner is not up |
+/// | this node | nothing appends there, and this mount did not open it `Own` | **refuse** — a peer entry naming ourselves ships every verb to our own endpoint |
+/// | anything | an unattested LIVE claim | **refuse** — silence never adopts |
 /// | anything | a holder the set does not name | **refuse** — the R5 divergence itself |
+///
+/// The DEGRADED row is the cold-start correction: "never adopt on silence"
+/// forbids TAKING a volume this node is not assigned, and this row takes
+/// nothing. Refusing it made an assigned set unmountable by construction —
+/// at a cold fleet start nothing claims anything — and cost the whole
+/// namespace over one absent owner, where the product's stated blast
+/// radius (`docs/operations.md`, *ownership does not fail over*) is that
+/// owner's subtree alone.
 ///
 /// `endpoint_of` resolves a durable member id to where it serves. An
 /// absent endpoint is announced, never refused: refusing would make the
@@ -469,11 +521,15 @@ pub fn derive_owner_map_from(
             routed,
             vec![None; count],
             vec![Vec::new(); count],
+            vec![false; count],
         ));
     }
 
     let mut volume_owners: Vec<Option<Arc<PeerOwner>>> = Vec::with_capacity(count);
     let mut assignment: Vec<Vec<String>> = Vec::with_capacity(count);
+    // Per volume: is this a peer's volume that NOTHING appends to — the
+    // degraded state `meta_ship.volumes_peer_unclaimed` publishes.
+    let mut unclaimed: Vec<bool> = Vec::with_capacity(count);
     for vol in evidence {
         let Some(owner) = vol.assigned_owner() else {
             return Err(refuse(format!(
@@ -503,17 +559,58 @@ pub fn derive_owner_map_from(
             }
             volume_owners.push(None);
             assignment.push(names);
+            unclaimed.push(false);
+            continue;
+        }
+        if vol.no_live_appender() {
+            // **DEGRADED, not refused.** Nothing appends to a volume this
+            // node is not assigned: its owner has not started yet (every
+            // volume of a cold fleet reads exactly this) or it is down.
+            // The entry stays the ASSIGNED owner's — never ours, which is
+            // the adoption KD-PV-3 forbids — and a verb about it refuses
+            // loud at the ship site, the same not-yet-up path an owner
+            // that has not published an endpoint already takes.
+            if member_id_matches(owner, node_id) {
+                return Err(refuse(format!(
+                    "metadata volume {} ({}) is assigned to THIS node, nothing appends to it, \
+                     and this mount did not open it `Own`. Shipping its verbs to the record's \
+                     owner would ship them to ourselves, and taking its claim here would be an \
+                     adoption outside the D0 ladder — so this fails closed. Mount as \
+                     `set-authority` / `partial-authority` so per-volume admission opens it, or \
+                     re-assign it offline",
+                    vol.path.display(),
+                    vol.vol_id
+                )));
+            }
+            log::warn!(
+                "ownership map: metadata volume {} ({}) is assigned to '{owner}' and NOTHING \
+                 appends to it — that owner has not started yet, or it is down. Its entry is \
+                 installed DEGRADED: this mount never appends there and never takes the claim, \
+                 and every verb about it refuses loud at the ship site until its owner arrives \
+                 (gauge `meta_ship.volumes_peer_unclaimed`)",
+                vol.path.display(),
+                vol.vol_id
+            );
+            let endpoint = endpoint_of(owner).unwrap_or_default();
+            volume_owners.push(Some(Arc::new(PeerOwner::new(owner, endpoint))));
+            assignment.push(names);
+            unclaimed.push(true);
             continue;
         }
         let Some(claim) = vol.claim.as_ref() else {
+            // The D0 gate says something appended here ({:?}) while no
+            // `writer_claim` DECODES — unattributable bytes in the record
+            // (the gate's own `StaleForeign(None)`), or two readings of
+            // one volume that disagree. Either way nothing can name the
+            // appender, and a map built on one reading alone is a guess.
             return Err(refuse(format!(
-                "metadata volume {} ({}) is assigned to '{owner}', but NOTHING claims it: that \
-                 owner is dead, was never started, or the assignment is stale. This mount is \
-                 not its assignee, so it must neither take the claim nor serve a set with a \
-                 volume no node appends to (ownership does not fail over — declare a successor \
-                 or re-assign offline)",
+                "metadata volume {} ({}) is assigned to '{owner}' and carries no decodable \
+                 `writer_claim`, yet the D0 gate classified it {:?}. Unattributable bytes name \
+                 nobody, and this mount will not decide who appends to a volume it is not \
+                 assigned: verify the holder is gone, then `squeezefs claim clear`",
                 vol.path.display(),
-                vol.vol_id
+                vol.vol_id,
+                vol.standing
             )));
         };
         let Some(holder) = vol.holder() else {
@@ -567,8 +664,14 @@ pub fn derive_owner_map_from(
         }
         volume_owners.push(Some(Arc::new(PeerOwner::new(holder, endpoint))));
         assignment.push(names);
+        unclaimed.push(false);
     }
-    Ok(OwnerMap::build(routed, volume_owners, assignment))
+    Ok(OwnerMap::build(
+        routed,
+        volume_owners,
+        assignment,
+        unclaimed,
+    ))
 }
 
 /// [`derive_owner_map_from`]'s gather: read every volume's durable claim
@@ -598,6 +701,7 @@ async fn gather_volume(
         path: vol.device_path().to_path_buf(),
         claim_set: ClaimSet::load(vol).await,
         claim: vol.read_writer_claim().await,
+        standing: vol.claim_standing().await,
         appended_locally: !vol.is_read_only(),
     }
 }
@@ -636,6 +740,13 @@ pub fn volume_poisoned(v_idx: usize) -> bool {
 /// The `owner_map_poisoned_volumes` gauge.
 pub fn poisoned_volumes() -> u64 {
     owner_map().map(|m| m.poisoned_count()).unwrap_or(0)
+}
+
+/// The `volumes_peer_unclaimed` gauge — how many of this set's peer-owned
+/// volumes had no appender when this mount derived its map. 0 on every
+/// unarmed mount, and on every fully-present fleet.
+pub fn unclaimed_peer_volumes() -> u64 {
+    owner_map().map(|m| m.unclaimed_count()).unwrap_or(0)
 }
 
 /// **The runtime conjunction** (§5.10): reconcile ONE volume's installed
@@ -878,6 +989,7 @@ pub fn arm_ownership(map: Arc<OwnerMap>) {
     // through `ArcSwapOption`).
     OWNERSHIP_ARMED.store(true, Ordering::Release);
     OWNERSHIP_ARMS.fetch_add(1, Ordering::Relaxed);
+    let unclaimed = map.unclaimed_count();
     log::warn!(
         "metadata function shipping ARMED (DLM S8): {local} of {} volumes owned locally, \
          {foreign} shipped to {} peer(s) {:?}; {} slots home locally. Metadata verbs on a \
@@ -888,6 +1000,15 @@ pub fn arm_ownership(map: Arc<OwnerMap>) {
         peers.iter().map(|p| &p.peer_id).collect::<Vec<_>>(),
         map.local_slots().len(),
     );
+    if unclaimed > 0 {
+        log::warn!(
+            "ownership map: this set came up DEGRADED — {unclaimed} of the {foreign} peer-owned \
+             volume(s) had NO appender at derivation, so those owners have not started yet or \
+             are down. Their subtrees' verbs refuse loud at the ship site until they arrive; \
+             everything else serves (gauge `meta_ship.volumes_peer_unclaimed`, and `squeezefs \
+             volume get-owners` prints assignment beside evidence)"
+        );
+    }
 }
 
 /// Restore solo mode in both planes: every volume local, every slot

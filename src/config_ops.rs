@@ -3496,10 +3496,11 @@ pub async fn get_owners(meta_lvs: &[String]) -> Result<Vec<OwnerStatusRow>> {
         let drift = match (&owner, &claim, &holder) {
             (None, _, _) => None,
             (Some(_), None, _) => Some(
-                "DRIFT: assigned owner is not claiming — that node is down, was never \
-                 started, or the assignment is stale. Every mount of this set refuses \
-                 while a volume has no appender (ownership does not fail over: declare a \
-                 successor, or re-assign offline)"
+                "DEGRADED: assigned owner is not claiming — that node has not started yet, \
+                 is down, or the assignment is stale. Other nodes still mount; every verb \
+                 about THIS volume's subtree refuses loud at the ship site until its owner \
+                 arrives (ownership does not fail over: start it, declare a successor, or \
+                 re-assign offline)"
                     .to_string(),
             ),
             (Some(_), Some(_), None) => Some(

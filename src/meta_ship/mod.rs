@@ -452,6 +452,11 @@ pub struct ShipStatsSnapshot {
     /// GAUGE (**must stay 0**): volumes whose ownership entry the runtime
     /// re-derivation POISONED — §5.10's fail-closed law engaging.
     pub owner_map_poisoned_volumes: u64,
+    /// GAUGE, **not a tripwire**: peer-owned volumes that had NO appender
+    /// when this mount derived its map — owners that have not started yet
+    /// (a cold fleet) or are down. `volumes_peer_owned` minus this is how
+    /// many of the set's other owners were present.
+    pub volumes_peer_unclaimed: u64,
     /// The `volume set-owners` ledger (§11.1) — volume records written,
     /// invocations refused, and KD-PV-15 roots minted. All three are 0 on
     /// every mount: the verb is an offline process of its own.
@@ -482,6 +487,7 @@ pub fn stats() -> ShipStatsSnapshot {
         dlm_rpcs_meta: DLM_RPCS_META.load(Ordering::Relaxed),
         mint_redirects: MINT_REDIRECTS.load(Ordering::Relaxed),
         owner_map_poisoned_volumes: owners::poisoned_volumes(),
+        volumes_peer_unclaimed: owners::unclaimed_peer_volumes(),
         owner_assignments: OWNER_ASSIGNMENTS.load(Ordering::Relaxed),
         owner_assign_refusals: OWNER_ASSIGN_REFUSALS.load(Ordering::Relaxed),
         subtree_roots_minted: SUBTREE_ROOTS_MINTED.load(Ordering::Relaxed),
@@ -509,6 +515,11 @@ pub fn stats_json() -> serde_json::Value {
         "owner_panics": s.owner_panics,
         "mint_redirects": s.mint_redirects,
         "owner_map_poisoned_volumes": s.owner_map_poisoned_volumes,
+        // The DEGRADED-set gauge (§11.1): how many peer-owned volumes had
+        // no appender when this map was derived. Nonzero is a set running
+        // with an owner missing — those subtrees refuse loud at the ship
+        // site — never a fault in this mount.
+        "volumes_peer_unclaimed": s.volumes_peer_unclaimed,
         // The offline verb's ledger (§11.1). A mount never assigns, so
         // all three staying 0 on a live mount is the law, not the load.
         "owner_assignments": s.owner_assignments,

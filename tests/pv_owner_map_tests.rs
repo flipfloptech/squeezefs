@@ -600,7 +600,10 @@ async fn an_assigned_volume_no_node_claims_derives_a_degraded_peer_entry() {
     // before, and is restarting): still degraded, still shipped there.
     let map = owners::derive_owner_map_from(&routed, NODE, &cold, &endpoints)
         .expect("a known-but-absent owner derives too");
-    assert_eq!(map.owner_of_volume(1).map(|p| p.endpoint.clone()), Some(PEER_ENDPOINT.to_string()));
+    assert_eq!(
+        map.owner_of_volume(1).map(|p| p.endpoint.clone()),
+        Some(PEER_ENDPOINT.to_string())
+    );
     assert_eq!(map.unclaimed_count(), 1);
     shutdown(&routed).await;
 }
@@ -638,10 +641,14 @@ async fn an_unclaimed_volume_assigned_to_this_node_refuses_the_derivation() {
         &endpoints,
     )
     .err()
-    .unwrap_or_else(|| panic!("a volume assigned HERE that this mount does not append to \
-                               cannot be shipped to ourselves"));
+    .unwrap_or_else(|| {
+        panic!(
+            "a volume assigned HERE that this mount does not append to \
+                               cannot be shipped to ourselves"
+        )
+    });
     assert!(
-        err.to_string().contains("this node"),
+        err.to_string().contains("THIS node"),
         "the refusal must name who the record assigns it to: {err}"
     );
     shutdown(&routed).await;
@@ -673,7 +680,7 @@ async fn an_unclaimed_volume_assigned_to_this_node_refuses_the_derivation() {
 async fn a_cold_assigned_set_comes_up_through_the_mount_paths_own_reads() {
     let dir = TempDir::new().unwrap();
     let vols = volume_set(dir.path(), "coldfleet", 2).await;
-    let ids = vec![vol_id(&vols[0]).await, vol_id(&vols[1]).await];
+    let ids = [vol_id(&vols[0]).await, vol_id(&vols[1]).await];
     // The REAL offline verb: volume 0 (slot 0) to this node, volume 1 to a
     // peer that has not been started — the fleet builder's own act.
     assign(

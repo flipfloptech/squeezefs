@@ -27,7 +27,7 @@
 //! | **3** | this node is a `Writer` member everywhere; the assignment map is COMPLETE; each peer volume's `owner` is an enrolled writer; the declared role matches the slot-0 volume's assignment (D20) | self-assertion, and a partial map — a set where one volume names an owner and its sibling does not has no coherent appender story |
 //! | **4** | a live membership lease (partial authority) whose era is not older than the **slot-0 volume's** claim | a mount with no live authority has no custody source and no evictor. Terms diverge per owner, so the comparison is against slot 0 only — a peer volume's own era is learned at runtime through `era_relearns` |
 //! | **5** | the standing WERO hold names this node a registrant | §6.7's *"refused on non-PR"* governs the admission decision too: a mount whose DMA the device cannot reject is one nothing can fence |
-//! | **6** | **assignment ∧ evidence, per volume** (KD-PV-3) | two nodes with different maps is two appenders or an orphaned volume. An own volume must be one the D0 ladder would GRANT; a peer volume must be one a NAMED peer is actually appending to. Anything else refuses — never adopts |
+//! | **6** | **assignment ∧ evidence, per volume** (KD-PV-3) | two nodes with different maps is two appenders. An own volume must be one the D0 ladder would GRANT; a peer volume's claim, where it HAS one, must belong to a node the assignment set names — a claim held by a stranger or by nobody nameable refuses. A peer volume with NO claim is the DEGRADED not-yet-up state and admits: nothing is ever adopted either way |
 //! | **7** | every peer volume's **projected** `claim_set` shows its own assignment | the freeze precondition §5.9's online inode plane rests on: a monotone projection that shows the assignment record shows every commit that preceded it on that volume (§5.9.2). Self-certifying — no barrier verb |
 //!
 //! The ladder is **pure**: it opens nothing, reads no environment and
@@ -775,6 +775,19 @@ fn rung_5_device_registrant(req: &SetAdmissionRequest) -> Result<&RegistrantEvid
 /// complete classification table). Disagreement refuses the mount naming
 /// both the record's owner and the observed holder; nothing is ever
 /// adopted on silence.
+///
+/// | peer volume's evidence | verdict |
+/// |---|---|
+/// | a claim held by a member of its assignment set (fresh or TTL-stale) | ship to that holder |
+/// | a claim held by a node the set does not name | **refuse** — the divergence itself |
+/// | a claim whose holder resolves to nothing | **refuse** — silence about WHO appended |
+/// | no claim at all | **admit, DEGRADED** — its owner is not up; never adopt, never claim |
+///
+/// "Never adopt on silence" forbids TAKING a volume this node is not
+/// assigned. It never required refusing to mount because a peer has not
+/// started: reading it that way made an assigned set unmountable by
+/// construction (at a cold start no volume carries a claim, and the arm
+/// was symmetric).
 fn rung_6_ownership_coherence(
     req: &SetAdmissionRequest,
     readings: &[VolumeReading<'_>],
@@ -828,76 +841,96 @@ fn rung_6_ownership_coherence(
                     ));
                 }
             },
-            VolumeMode::Peer { .. } => match r.vol.standing {
-                ClaimStanding::Fresh => {
-                    let Some(holder) = r.vol.holder_member_id.as_deref() else {
-                        return Err(refuse(
-                            6,
-                            format!(
-                                "metadata volume {} ({}) carries a fresh `writer_claim` whose \
-                                 holder could not be resolved to a durable member id (the \
-                                 claim's own `id` is a per-mount uuid, not an enrollment \
-                                 identity). An unresolvable holder is SILENCE, and ownership \
-                                 never moves on silence: this mount would be shipping every \
-                                 verb for the volume to a node it cannot name",
-                                r.vol.path.display(),
-                                r.vol.vol_id
-                            ),
-                        ));
-                    };
-                    if !r.assignment_names(holder) {
-                        return Err(refuse(
-                            6,
-                            format!(
-                                "metadata volume {} ({}) is assigned to '{owner}' (successors: \
-                                 {}), but the live claim is held by '{holder}'. Assignment ∧ \
-                                 evidence DISAGREE, so the ownership map fails closed: shipping \
-                                 this volume's verbs to a node the record does not entitle \
-                                 would make it an appender nobody assigned. Re-assign offline, \
-                                 or stop the holder",
-                                r.vol.path.display(),
-                                r.vol.vol_id,
-                                if r.set.successors.is_empty() {
-                                    "none".to_string()
-                                } else {
-                                    r.set.successors.join(", ")
-                                }
-                            ),
-                        ));
-                    }
-                }
-                ClaimStanding::Reclaimable => {
+            // **The DEGRADED admission.** Silence on a peer's volume is not
+            // a disagreement: nothing claims it because its owner has not
+            // started yet (a cold fleet), or has gone (a dead owner). This
+            // mount never appends there under either reading, so it admits
+            // and lets the SHIP path refuse — the not-yet-up state PR 7b
+            // already carries, with a bounded window of loud refusals and
+            // an endpoint refresh behind it.
+            //
+            // Refusing instead exceeded the blast radius the product
+            // states: `docs/operations.md` ships "ownership does not fail
+            // over", i.e. ONE absent owner's subtree is unavailable —
+            // refusing the whole mount takes the ENTIRE namespace down over
+            // it. And at a cold fleet start it was worse than a policy
+            // choice: NO volume carries a claim then, so the arm was
+            // unsatisfiable in both directions at once and no node could
+            // ever mount an assigned set.
+            VolumeMode::Peer { .. } if r.vol.standing == ClaimStanding::Reclaimable => {
+                log::warn!(
+                    "per-volume claim admission: metadata volume {} ({}) is assigned to peer \
+                     '{owner}' and NOTHING claims it — that owner has not started yet, or it is \
+                     down. ADMITTING it DEGRADED: this mount neither takes the claim nor \
+                     appends there, and every verb about it refuses loud at the ship site until \
+                     its owner arrives (gauge `meta_ship.volumes_peer_unclaimed`; `squeezefs \
+                     volume get-owners` prints assignment beside evidence)",
+                    r.vol.path.display(),
+                    r.vol.vol_id
+                );
+            }
+            // A claim EXISTS on a peer's volume, so assignment ∧ evidence
+            // must AGREE — that half of KD-PV-3 is untouched, whether the
+            // claim is heartbeat-fresh or TTL-stale. Age never makes an
+            // unattributable claim readable, and a stale claim from a
+            // stranger is the same divergence a fresh one is.
+            VolumeMode::Peer { .. } => {
+                let aged = r.vol.standing == ClaimStanding::Stale;
+                let age = if aged { "TTL-stale" } else { "heartbeat-fresh" };
+                let Some(holder) = r.vol.holder_member_id.as_deref() else {
                     return Err(refuse(
                         6,
                         format!(
-                            "metadata volume {} ({}) is assigned to peer '{owner}', but NOTHING \
-                             claims it: that owner is dead, was never started, or the \
-                             assignment is stale. This mount is not the assignee, so it must \
-                             not take the claim — and it must not serve a set with a volume no \
-                             node appends to. Start the owner, declare a successor and \
-                             re-assign offline, or clear the assignment; `squeezefs volume \
-                             get-owners` prints assignment beside evidence",
+                            "metadata volume {} ({}) carries a {age} `writer_claim` whose \
+                             holder could not be resolved to a durable member id (the claim's \
+                             own `id` is a per-mount uuid, not an enrollment identity). An \
+                             unresolvable holder is SILENCE, and ownership never moves on \
+                             silence: this mount would be shipping every verb for the volume to \
+                             a node it cannot name. A volume with NO claim is the degraded \
+                             not-yet-up state and admits; one with a claim nobody can name does \
+                             not — verify the holder is gone, then `squeezefs claim clear`",
                             r.vol.path.display(),
                             r.vol.vol_id
                         ),
                     ));
-                }
-                ClaimStanding::Stale => {
+                };
+                if !r.assignment_names(holder) {
                     return Err(refuse(
                         6,
                         format!(
-                            "metadata volume {} ({}) is assigned to peer '{owner}', whose \
-                             `writer_claim` is TTL-stale. A partial writer must never preempt a \
-                             peer's claim: preempting would make it the appender of a volume it \
-                             is not assigned, which is the one thing per-volume admission \
-                             exists to prevent. Start that owner, or re-assign the volume \
-                             offline (`squeezefs volume get-owners`)",
+                            "metadata volume {} ({}) is assigned to '{owner}' (successors: {}), \
+                             but the {age} claim is held by '{holder}'. Assignment ∧ evidence \
+                             DISAGREE, so the ownership map fails closed: shipping this \
+                             volume's verbs to a node the record does not entitle would make it \
+                             an appender nobody assigned. Re-assign offline, or stop the holder",
                             r.vol.path.display(),
-                            r.vol.vol_id
+                            r.vol.vol_id,
+                            if r.set.successors.is_empty() {
+                                "none".to_string()
+                            } else {
+                                r.set.successors.join(", ")
+                            }
                         ),
                     ));
                 }
-            },
+                if aged {
+                    // The assigned owner's OWN claim, aged out: the same
+                    // degraded state the `Reclaimable` arm above admits,
+                    // read on a substrate where no dead-pid proof exists.
+                    // Admitting is not preempting — nothing here takes the
+                    // claim, and the volume stays its owner's.
+                    log::warn!(
+                        "per-volume claim admission: metadata volume {} ({}) is assigned to peer \
+                         '{owner}', whose `writer_claim` is TTL-stale — that owner is down or \
+                         partitioned. ADMITTING it DEGRADED: this mount never preempts a peer's \
+                         claim and never appends there, and its verbs refuse loud at the ship \
+                         site until the owner returns (gauge \
+                         `meta_ship.volumes_peer_unclaimed`)",
+                        r.vol.path.display(),
+                        r.vol.vol_id
+                    );
+                }
+            }
         }
     }
     Ok(())
@@ -1069,6 +1102,74 @@ pub fn requested() -> bool {
     )
 }
 
+/// **Read one probe-opened set's per-volume evidence** — the ladder's whole
+/// input, produced by the mount path itself.
+///
+/// Separate from [`gather_set_admission`] so a contract can drive the
+/// EVIDENCE the product reads off a real set instead of describing it:
+/// a suite that hand-builds `PvVolumeEvidence` pins the decision, never
+/// the reading, and the cold-start defect lived precisely in the reading's
+/// verdict (nothing claims anything, so every peer volume is
+/// `Reclaimable` with no resolvable holder). Nothing here writes, locks or
+/// mutates — a probe open is read-only by construction.
+///
+/// `declared_authority` is D20's `SQUEEZEFS_MW_AUTHORITY`: the fallback
+/// endpoint for the slot-0 volume's owner, used only when the durable
+/// record published none.
+pub async fn gather_volume_evidence(
+    probes: &crate::meta_backend::RoutedMetaBackend,
+    declared_authority: Option<String>,
+) -> Vec<PvVolumeEvidence> {
+    let slot_0_v = probes.route_ino(1).0;
+    let mut out = Vec::with_capacity(probes.volumes.len());
+    for (idx, be) in probes.volumes.iter().enumerate() {
+        let claim = be.read_writer_claim().await;
+        let claim_set = ClaimSet::load(be).await;
+        let holder_member_id = claim
+            .as_ref()
+            .zip(claim_set.as_ref())
+            .and_then(|(c, s)| s.resolve_holder(c))
+            .map(str::to_string);
+        let path = be.device_path().to_path_buf();
+        let probe_path = path.clone();
+        let pr_capable = squeezefs_ipc::sqz_blocking::run_blocking(move || {
+            crate::meta_backend::reservation::resolve_for_mount(&probe_path).is_some()
+        })
+        .await;
+        let owner_endpoint = claim_set.as_ref().and_then(|s| {
+            s.owner.as_ref().and_then(|o| {
+                s.members
+                    .iter()
+                    .find(|m| crate::membership::member_id_matches(&m.identity.id, o))
+                    .and_then(|m| m.identity.endpoint.clone())
+            })
+        });
+        out.push(PvVolumeEvidence {
+            path,
+            vol_id: be.durable_volume_id(),
+            hosts_slot_0: idx == slot_0_v,
+            features_incompat: be.superblock().features_incompat,
+            pr_capable,
+            // The gate's own classification, never a second spelling of
+            // the dead-pid proof and the TTL window.
+            standing: be.claim_standing().await,
+            claim,
+            holder_member_id,
+            // A probe open replays the journal and serves the same
+            // checkpoint-consistent view a peer-owned open would, so the
+            // rung-7 freeze evidence IS this reading.
+            projected_claim_set: claim_set.clone(),
+            claim_set,
+            owner_endpoint: owner_endpoint.or_else(|| {
+                (idx == slot_0_v)
+                    .then(|| declared_authority.clone())
+                    .flatten()
+            }),
+        });
+    }
+    out
+}
+
 /// **Gather the ladder's evidence and decide** — the mount path's one call
 /// before it opens the metadata set through the partial door.
 ///
@@ -1099,51 +1200,7 @@ pub async fn gather_set_admission(
     // owners' flocks, and they write nothing on any path below.
     let probes = crate::meta_backend::open_probe_routed_meta_set(meta_lvs).await?;
     let slot_0_v = probes.route_ino(1).0;
-    for (idx, be) in probes.volumes.iter().enumerate() {
-        let claim = be.read_writer_claim().await;
-        let claim_set = ClaimSet::load(be).await;
-        let holder_member_id = claim
-            .as_ref()
-            .zip(claim_set.as_ref())
-            .and_then(|(c, s)| s.resolve_holder(c))
-            .map(str::to_string);
-        let path = be.device_path().to_path_buf();
-        let probe_path = path.clone();
-        let pr_capable = squeezefs_ipc::sqz_blocking::run_blocking(move || {
-            crate::meta_backend::reservation::resolve_for_mount(&probe_path).is_some()
-        })
-        .await;
-        let owner_endpoint = claim_set.as_ref().and_then(|s| {
-            s.owner.as_ref().and_then(|o| {
-                s.members
-                    .iter()
-                    .find(|m| crate::membership::member_id_matches(&m.identity.id, o))
-                    .and_then(|m| m.identity.endpoint.clone())
-            })
-        });
-        req.volumes.push(PvVolumeEvidence {
-            path,
-            vol_id: be.durable_volume_id(),
-            hosts_slot_0: idx == slot_0_v,
-            features_incompat: be.superblock().features_incompat,
-            pr_capable,
-            // The gate's own classification, never a second spelling of
-            // the dead-pid proof and the TTL window.
-            standing: be.claim_standing().await,
-            claim,
-            holder_member_id,
-            // A probe open replays the journal and serves the same
-            // checkpoint-consistent view a peer-owned open would, so the
-            // rung-7 freeze evidence IS this reading.
-            projected_claim_set: claim_set.clone(),
-            claim_set,
-            owner_endpoint: owner_endpoint.or_else(|| {
-                (idx == slot_0_v)
-                    .then(|| req.set_authority_endpoint.clone())
-                    .flatten()
-            }),
-        });
-    }
+    req.volumes = gather_volume_evidence(&probes, req.set_authority_endpoint.clone()).await;
     // The declarative rungs, BEFORE any mutation: on an unassigned set one
     // of these refuses and the device is never touched.
     {

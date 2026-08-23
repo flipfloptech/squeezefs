@@ -5446,13 +5446,25 @@ pub struct Metrics {
     /// hold metadata authority (over the volumes it owns), so the two
     /// classes name different bugs and folding them would rot both.
     pub peer_volume_local_commit_refusals: Align64<AtomicU64>,
-    /// Mount-open refusals because a volume's ASSIGNED peer owner is not
-    /// claiming it — dead, never started, or a stale assignment (§5.1.1's
-    /// `Peer` + `Reclaimable`/`StaleForeign` rows). **Nonzero is a dead
-    /// owner and a fleet-wide stop** (risk R13's operational face:
-    /// ownership does not fail over, so the repair is the offline
-    /// `squeezefs volume set-owners`).
+    /// Mount-open refusals on a peer-owned volume whose CLAIM cannot be
+    /// reconciled with the assignment: a TTL-stale claim that attributes
+    /// to nobody, or to a node the record does not entitle (§5.1.1's
+    /// `Peer` column). Something appended there that the record cannot
+    /// account for, so the mount fails closed and the remedy is
+    /// `squeezefs claim clear` or an offline re-assignment.
+    ///
+    /// A volume with NO claim is NOT this class any more — that is the
+    /// degraded not-yet-up state, which admits and is counted by
+    /// `peer_volume_unclaimed_admits`.
     pub peer_volume_unclaimed_refusals: Align64<AtomicU64>,
+    /// Peer-owned volumes ADMITTED with no appender: nothing claims them,
+    /// so their owner has not started yet (every volume of a cold fleet)
+    /// or is down. Not a tripwire — it is the count of subtrees this mount
+    /// came up DEGRADED over, and the live state beside it is the
+    /// `meta_ship.volumes_peer_unclaimed` gauge. Nonzero after the fleet
+    /// is fully up means an owner never arrived (`squeezefs volume
+    /// get-owners` prints assignment beside evidence).
+    pub peer_volume_unclaimed_admits: Align64<AtomicU64>,
     /// Open cross-volume intents found at mount whose steps span two
     /// metadata OWNERS (§5.4a case (c)). **MUST STAY 0** — the M1
     /// cross-owner pre-check is what keeps it there; a nonzero value means
@@ -9500,14 +9512,17 @@ impl SqueezefsFilesystem {
                 "writeback_stale_token_retries": METRICS.writeback_stale_token_retries.load(Ordering::Relaxed),
                 "writeback_orphan_discards": METRICS.writeback_orphan_discards.load(Ordering::Relaxed),
                 "writeback_fence_noops": METRICS.writeback_fence_noops.load(Ordering::Relaxed),
-                // Per-volume claim admission (§11.1): three top-level
-                // counters, all 0 on every shipped mount. The first two
-                // are MUST-STAY-0 tripwires; `peer_volume_unclaimed_refusals`
-                // is R13's operational face — nonzero means an assigned
-                // owner is not claiming, i.e. a dead owner and a
-                // fleet-wide stop.
+                // Per-volume claim admission (§11.1): four top-level
+                // counters, all 0 on every shipped mount.
+                // `peer_volume_local_commit_refusals` and
+                // `xv_cross_owner_intents` are MUST-STAY-0 tripwires;
+                // `peer_volume_unclaimed_refusals` is a claim the
+                // assignment cannot account for; `peer_volume_unclaimed_admits`
+                // is R13's operational face — this set came up with an
+                // owner absent, and only that owner's subtree is degraded.
                 "peer_volume_local_commit_refusals": METRICS.peer_volume_local_commit_refusals.load(Ordering::Relaxed),
                 "peer_volume_unclaimed_refusals": METRICS.peer_volume_unclaimed_refusals.load(Ordering::Relaxed),
+                "peer_volume_unclaimed_admits": METRICS.peer_volume_unclaimed_admits.load(Ordering::Relaxed),
                 "xv_cross_owner_intents": METRICS.xv_cross_owner_intents.load(Ordering::Relaxed),
                 // The partition at a glance: how many of this set's
                 // volumes a PEER authority appends to (0 on every posture

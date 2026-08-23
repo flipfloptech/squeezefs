@@ -1170,6 +1170,44 @@ pub async fn gather_volume_evidence(
     out
 }
 
+/// Is the SET AUTHORITY — the standing WERO holder (D20: one holder, N
+/// registrants) — CO-LOCATED with this mount (rung-9 finding #1, resurfaced
+/// by the first `--owners` fleet bring-up on the PR 7b path, 2026-08-23)?
+///
+/// The test is the **slot-0 volume's** D0 `writer_claim` boot id against
+/// this kernel's — the same law [`crate::cowriter::co_located_with_authority`]
+/// applies to the single-authority shape, scoped to the ONE volume whose
+/// owner holds the data plane's reservation. Peer volumes' claims are their
+/// own owners' and never decide this: a remote peer beside a co-located set
+/// authority is still the adoption shape. Empty evidence (no slot-0 claim)
+/// answers `false` — the register path stays, and its own gates decide.
+pub fn co_located_with_set_authority(req: &SetAdmissionRequest) -> bool {
+    let Ok(our_boot) = std::fs::read_to_string("/proc/sys/kernel/random/boot_id") else {
+        return false;
+    };
+    let our_boot = our_boot.trim();
+    req.volumes
+        .iter()
+        .any(|v| v.hosts_slot_0 && v.claim.as_ref().is_some_and(|c| c.boot == our_boot))
+}
+
+/// Rung 5's device half for a PARTIAL AUTHORITY: join the set authority's
+/// standing WERO hold and answer the evidence rung 5 decides over.
+///
+/// Extracted from [`gather_set_admission`] so the contract suite can drive
+/// it over a hand-built request (the co-writer `AdmissionRequest`
+/// precedent) against the fake namespace.
+pub async fn partial_wero_join(
+    _req: &SetAdmissionRequest,
+    data_paths: &[PathBuf],
+) -> Result<crate::data_custody::WeroRegistrantJoin> {
+    let paths = data_paths.to_vec();
+    squeezefs_ipc::sqz_blocking::run_blocking(move || {
+        crate::data_custody::join_wero_as_registrant(&paths)
+    })
+    .await
+}
+
 /// **Gather the ladder's evidence and decide** — the mount path's one call
 /// before it opens the metadata set through the partial door.
 ///
@@ -1225,18 +1263,16 @@ pub async fn gather_set_admission(
     let rendezvous = crate::membership::read_owner_record(&probes.volumes[slot_0_v]).await;
     drop(probes);
 
-    // Rung 5's device half. A partial authority REGISTERS under the set
-    // authority's standing hold; a set authority IS the holder, so it
-    // takes the hold here — the evidence rung 5 decides over must exist
-    // before the decision, and `arm_multi_writer`'s own rung 3 then joins
-    // the standing hold rather than forking a second one.
+    // Rung 5's device half. A partial authority joins the set authority's
+    // standing hold ([`partial_wero_join`] — adopt when co-located,
+    // register when remote); a set authority IS the holder, so it takes
+    // the hold here — the evidence rung 5 decides over must exist before
+    // the decision, and `arm_multi_writer`'s own rung 3 then joins the
+    // standing hold rather than forking a second one.
     let paths = data_paths.to_vec();
     let (registrant, hold) = match posture {
         Posture::PartialAuthority => {
-            let join = squeezefs_ipc::sqz_blocking::run_blocking(move || {
-                crate::data_custody::join_wero_as_registrant(&paths)
-            })
-            .await?;
+            let join = partial_wero_join(&req, data_paths).await?;
             req.registrant = Some(join.evidence());
             (Some(join), None)
         }

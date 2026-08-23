@@ -462,3 +462,228 @@ async fn a_foreign_usurped_hold_poisons_instead_of_healing_over() {
     );
     drop(hold);
 }
+
+// ===========================================================================
+// The PARTIAL AUTHORITY's device half (PR 7b) — rung-9 finding #1
+// resurfaced by the first `--owners` fleet bring-up (2026-08-23): the
+// preflight's rung 5 called `join_wero_as_registrant` UNCONDITIONALLY, so a
+// co-located partial authority's PR mutations rode the box's shared
+// association and the register ladder's "own-stale" proof named the LIVE
+// set authority's holder key — unregistering it released the reservation
+// for the whole set, and the refusal then read back the rtype-0 state the
+// join itself had just created ("Arm the authority's multi-writer plane
+// first", about an authority that WAS armed). The fix is the co-writer
+// arm's law verbatim: co-located ⇒ ADOPT the standing hold; remote ⇒ the
+// register path, where the head is the mount's own and the ladder's proof
+// is sound.
+// ===========================================================================
+
+use squeezefs::cowriter::MwRole;
+use squeezefs::partial_authority::{
+    self as pv, ClaimStanding, PvVolumeEvidence, SetAdmissionRequest,
+};
+
+fn our_boot() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .expect("boot_id readable on Linux")
+        .trim()
+        .to_string()
+}
+
+/// One volume's PV evidence: a claim in `boot`, a durable claim set
+/// enrolling the AUTHORITY's registrant key.
+fn pv_vol(vol_id: &str, hosts_slot_0: bool, boot: &str) -> PvVolumeEvidence {
+    let mut set = ClaimSet::empty(7);
+    set.durable = true;
+    set.members.push(ClaimSetMember {
+        identity: MemberIdentity {
+            id: "node_00000000aaaaaaaa.m00000099".into(),
+            role: MemberRole::Writer,
+            pid: 0,
+            boot: String::new(),
+            endpoint: None,
+            pr_key: AUTHORITY_KEY,
+        },
+        ts: 0,
+    });
+    PvVolumeEvidence {
+        path: PathBuf::from(format!("/dev/fake-pv-{vol_id}")),
+        vol_id: vol_id.to_string(),
+        hosts_slot_0,
+        features_incompat: cowriter::REQUIRED_INCOMPAT,
+        pr_capable: true,
+        claim: Some(WriterClaim {
+            id: "authority-claim".into(),
+            ts: 0,
+            pid: 4242,
+            boot: boot.to_string(),
+            term: 7,
+        }),
+        holder_member_id: Some("node_00000000aaaaaaaa.m00000099".into()),
+        standing: ClaimStanding::Fresh,
+        claim_set: Some(set.clone()),
+        projected_claim_set: Some(set),
+        owner_endpoint: None,
+    }
+}
+
+fn pv_request(volumes: Vec<PvVolumeEvidence>) -> SetAdmissionRequest {
+    SetAdmissionRequest {
+        multi_writer: true,
+        role: MwRole::PartialAuthority,
+        read_only: false,
+        node_id: "node_00000000bbbbbbbb.m00000001".into(),
+        set_authority_endpoint: Some("127.0.0.1:7100".into()),
+        volumes,
+        authority: None,
+        registrant: None,
+    }
+}
+
+/// The `--owners` fleet bring-up pin, at the device: a CO-LOCATED partial
+/// authority's preflight ADOPTS the standing hold — the evidence names the
+/// authority's enrolled key, and the authority's fence SURVIVES the
+/// member's admission (nothing registered, nothing unregistered). The
+/// member's PR ioctls ride the SHARED association (the writer-identity
+/// controllers are the box's only data controllers), which is exactly the
+/// shape whose register ladder destroyed the live hold in the field.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_co_located_partial_authoritys_preflight_adopts_and_the_fence_survives() {
+    let _s = serial();
+    let ns = FakeNvmeNamespace::new(); // spec-strict: the destroying shape
+    let authority = FakeReservationClient::new(
+        ns.clone(),
+        "nqn.2014-08.org.nvmexpress:uuid:writer",
+        "cafef1e7-0000-4000-8000-000000000001",
+    );
+    authority
+        .register(AUTHORITY_KEY)
+        .expect("authority register");
+    authority
+        .acquire_write_exclusive_registrants_only(AUTHORITY_KEY)
+        .expect("authority WERO acquire");
+    let p = ns_path("pv-colocated");
+    // The member's ioctls travel the SAME host association as the
+    // authority's (co-located, shared identity — the field's m20 shape).
+    let member = FakeReservationClient::new(
+        ns.clone(),
+        "nqn.2014-08.org.nvmexpress:uuid:writer",
+        "cafef1e7-0000-4000-8000-000000000001",
+    );
+    reservation::install_override(&p, member);
+    let _r = Restore(vec![p.clone()]);
+
+    let boot = our_boot();
+    let req = pv_request(vec![
+        pv_vol("vol-0000000000000001", true, &boot),
+        pv_vol("vol-0000000000000002", false, &boot),
+    ]);
+    let join = pv::partial_wero_join(&req, std::slice::from_ref(&p))
+        .await
+        .expect(
+            "a co-located partial authority ADOPTS the standing hold — the register \
+             ladder through the shared association destroys the live fence (rung-9 \
+             finding #1, the --owners bring-up)",
+        );
+    let ev = join.evidence();
+    assert_eq!(
+        ev.key, AUTHORITY_KEY,
+        "the adopted key IS the authority's (same PR arbitration domain)"
+    );
+    assert_eq!(
+        ns.holder(),
+        Some(AUTHORITY_KEY),
+        "the authority's fence SURVIVES the member's admission"
+    );
+    assert_eq!(
+        ns.unregister_count(),
+        0,
+        "the admission unregisters NOTHING — unregistering the holder's key \
+         releases the whole set's reservation"
+    );
+    drop(join);
+    assert_eq!(
+        ns.holder(),
+        Some(AUTHORITY_KEY),
+        "an adopted hold's teardown leaves the device exactly as found"
+    );
+}
+
+/// The remote shape keeps the register path: its head is its own, the
+/// ladder's proof is sound, and the standing hold admits the new
+/// registrant without moving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_remote_partial_authority_keeps_the_register_path() {
+    let _s = serial();
+    let ns = FakeNvmeNamespace::new();
+    let authority = FakeReservationClient::new(
+        ns.clone(),
+        "nqn.2014-08.org.nvmexpress:uuid:writer",
+        "cafef1e7-0000-4000-8000-000000000001",
+    );
+    authority
+        .register(AUTHORITY_KEY)
+        .expect("authority register");
+    authority
+        .acquire_write_exclusive_registrants_only(AUTHORITY_KEY)
+        .expect("authority WERO acquire");
+    let p = ns_path("pv-remote");
+    // A remote member: its OWN association.
+    let member = FakeReservationClient::new(
+        ns.clone(),
+        "nqn.2014-08.org.nvmexpress:uuid:partial",
+        "cafef1e7-0000-4000-8000-000000000002",
+    );
+    reservation::install_override(&p, member);
+    let _r = Restore(vec![p.clone()]);
+
+    let req = pv_request(vec![pv_vol(
+        "vol-0000000000000001",
+        true,
+        "ffffffff-ffff-ffff-ffff-ffffffffffff", // a foreign boot: remote
+    )]);
+    let join = pv::partial_wero_join(&req, std::slice::from_ref(&p))
+        .await
+        .expect("a remote partial authority registers under the standing hold");
+    let ev = join.evidence();
+    assert_ne!(ev.key, AUTHORITY_KEY, "a remote member mints its own key");
+    assert!(ns.is_registered(ev.key), "and the device registered it");
+    assert_eq!(
+        ns.holder(),
+        Some(AUTHORITY_KEY),
+        "the authority's fence is untouched by a remote registration"
+    );
+    drop(join);
+}
+
+/// The classifier: co-location is the SLOT-0 volume's claim boot id — the
+/// standing WERO holder is the SET AUTHORITY (D20: one holder), so peer
+/// volumes' claims never decide it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pv_co_location_is_decided_by_the_slot_0_claim_boot_id() {
+    let boot = our_boot();
+    let foreign = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+
+    assert!(
+        pv::co_located_with_set_authority(&pv_request(vec![pv_vol("vol-1", true, &boot)])),
+        "same-boot slot-0 claim = co-located set authority"
+    );
+    assert!(
+        !pv::co_located_with_set_authority(&pv_request(vec![pv_vol("vol-1", true, foreign)])),
+        "a foreign-boot set authority is remote — the register path stays"
+    );
+    let mut unclaimed = pv_vol("vol-1", true, &boot);
+    unclaimed.claim = None;
+    assert!(
+        !pv::co_located_with_set_authority(&pv_request(vec![unclaimed])),
+        "no slot-0 claim answers false — the register path's own gates decide"
+    );
+    assert!(
+        pv::co_located_with_set_authority(&pv_request(vec![
+            pv_vol("vol-1", true, &boot),
+            pv_vol("vol-2", false, foreign),
+        ])),
+        "a foreign-boot PEER volume beside a co-located set authority is still \
+         the adoption shape — the standing holder is the SET authority (D20)"
+    );
+}

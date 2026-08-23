@@ -675,6 +675,43 @@ async fn test_c2_leaked_block_detected() {
     fx.close().await;
 }
 
+/// A corpse awaiting its kernel FORGET (unlinked, `nlink == 0`, its
+/// reclaim not yet run) is LEGAL POSIX state that still OWNS its blocks —
+/// the acceptance run's live oracle read every such block as C2 "leaked"
+/// and (bit-9 volumes) its ledger record as C8 drift, a false positive on
+/// every unlink-heavy live mount (2026-08-23: 152 findings on a healthy
+/// fleet seconds after a tar-x/rm pass). The census must count
+/// corpse-owned blocks for the BLOCK plane; the inode-plane semantics
+/// (C9/C10's deliberate `nlink == 0` exclusions) are untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_an_unforgotten_corpses_blocks_are_not_c2_leaked() {
+    let _serial = serial().await;
+    let dir = tempfile::tempdir().unwrap();
+    let meta = make_file(dir.path(), "meta", 256 * 1024 * 1024);
+    let oss1 = make_file(dir.path(), "oss1", 4 << 30);
+    format_meta(&meta, &[&oss1]).await;
+    let recs = base_format_config(&[&oss1]).resolved_data_volumes();
+    let fx = open_fixture(&meta, &recs).await;
+
+    let ino = create_file(&fx, "corpse.bin").await;
+    striped_burst(&fx, ino, 4).await;
+    // The lost-FORGET shape: unlink drives nlink to 0, no FORGET arrives,
+    // so no reclaim runs — the corpse still owns its blocks.
+    fx.fs
+        .unlink(req(), 1, OsStr::new("corpse.bin"))
+        .await
+        .expect("unlink");
+
+    let report = run_fsck(&fx.ctx(), &online_opts()).await.expect("fsck");
+    assert!(
+        report.findings.is_empty(),
+        "an unlinked-but-unFORGOTTEN corpse is healthy live state — its \
+         blocks are owned, not leaked (ino {ino}): {:?}",
+        report.findings
+    );
+    fx.close().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_c2_lost_block_detected() {
     let _serial = serial().await;

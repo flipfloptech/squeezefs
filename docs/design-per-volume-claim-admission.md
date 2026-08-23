@@ -437,6 +437,28 @@ decision exists ("declared, never inferred", `src/cowriter.rs:41-49`).
 > own volume with no peer involved, and it is read only when a peer volume
 > carries a FRESH claim — which by definition means its owner is up.
 
+> **CORRECTION (rev 10 — the partial authority's device half destroyed the
+> live fence, found by the third real fleet bring-up, 2026-08-23).** Rung 5's
+> device half in `gather_set_admission` called `join_wero_as_registrant`
+> UNCONDITIONALLY — the co-writer arm's rung-9 finding-#1 split (co-located ⇒
+> ADOPT the standing hold, remote ⇒ register; `9f0ba3df`) never reached the
+> PR 7b path. On the co-located `--owners` fleet the member's PR ioctls ride
+> the box's shared host association, where a Register is destructive under
+> either target semantics (spec-strict: the register ladder's own-stale proof
+> names the LIVE set authority's holder key and unregistering it releases the
+> whole set's reservation; lenient: IEKEY replaces the authority's key in
+> place, usurping its fence) — so m20's admission destroyed m0's WERO and
+> then refused over the rtype-0 state it had itself created ("Arm the
+> authority's multi-writer plane first", about an authority that WAS armed).
+> Fix, red-first (`tests/mw_colocated_wero_tests.rs`, the finding-#1 home):
+> `partial_wero_join` (rung 5's device half, extracted) routes by
+> `co_located_with_set_authority` — the co-writer classifier's boot-id law
+> scoped to the SLOT-0 volume's claim, because the standing WERO holder is
+> the SET authority under D20 and peer volumes' claims never decide it — and
+> the co-located arm adopts with the holder key cross-checked against the
+> slot-0 volume's durable claim set. Remote members keep the register path,
+> where the head is their own and the ladder's proof is sound.
+
 > **CORRECTION (rev 9 — the membership-arm self-refusal, found by the second
 > real fleet bring-up, 2026-08-23).** The attestation as landed did one thing
 > more than this resolution specifies: `set.term = set.term.max(term)`, with
@@ -2629,6 +2651,15 @@ the unconditional M1 correctness fix; 5 = live via the test constructor
 only). **6 and 7 parallelize off 5**, except that 7's guarantee rows want 6's
 fsck posture settled. **8 gates on both 6 and 7.** **9 gates on 0 plus a
 ruling** and shares no files with 3–8.
+
+**Revision log — rev 10 (2026-08-23)** records the third real-fleet bring-up
+catch: rung 5's device half registered unconditionally, so a co-located
+partial authority's admission destroyed the set authority's live WERO through
+the shared host association and refused over its own wreckage (rung-9
+finding #1, resurfaced on the PR 7b path — the §5.1.1 box's rev-10
+correction). `partial_wero_join` now adopts when co-located
+(`co_located_with_set_authority`, the slot-0 claim's boot id) and registers
+only when remote.
 
 **Revision log — rev 9 (2026-08-23)** records the second real-fleet bring-up
 catch: the KD-PV-17 attestation's `set.term` raise made the set authority

@@ -1192,20 +1192,64 @@ pub fn co_located_with_set_authority(req: &SetAdmissionRequest) -> bool {
 }
 
 /// Rung 5's device half for a PARTIAL AUTHORITY: join the set authority's
-/// standing WERO hold and answer the evidence rung 5 decides over.
+/// standing WERO hold and answer the evidence rung 5 decides over —
+/// **adopt when co-located, register when remote** (rung-9 finding #1's
+/// law, applied to the PR 7b path the first `--owners` bring-up convicted,
+/// 2026-08-23).
+///
+/// A co-located member's PR ioctls travel the box's SHARED host
+/// association, where a Register is destructive whichever semantics the
+/// target has: a spec-strict target conflicts and the register ladder's
+/// "own-stale" proof then names the LIVE set authority's holder key
+/// (unregistering it releases the whole set's reservation — the refusal
+/// that follows reads back the rtype-0 state the join itself created); a
+/// lenient target IEKEY-replaces the authority's key in place, usurping
+/// its fence. So the co-located shape ADOPTS
+/// ([`crate::data_custody::adopt_wero_colocated`]) — read-only evidence,
+/// zero device mutations, the holder key cross-checked against the slot-0
+/// volume's durable claim set — exactly as the co-writer arm does. Remote
+/// members keep the register path: the head is their own and the ladder's
+/// proof is sound there.
 ///
 /// Extracted from [`gather_set_admission`] so the contract suite can drive
 /// it over a hand-built request (the co-writer `AdmissionRequest`
 /// precedent) against the fake namespace.
 pub async fn partial_wero_join(
-    _req: &SetAdmissionRequest,
+    req: &SetAdmissionRequest,
     data_paths: &[PathBuf],
 ) -> Result<crate::data_custody::WeroRegistrantJoin> {
     let paths = data_paths.to_vec();
-    squeezefs_ipc::sqz_blocking::run_blocking(move || {
-        crate::data_custody::join_wero_as_registrant(&paths)
-    })
-    .await
+    if co_located_with_set_authority(req) {
+        // The enrolled writer keys the adoption cross-checks the holder
+        // against come from the SLOT-0 volume's durable claim set — the
+        // roster the set authority's own arm upserts its registrant key
+        // into (the co-writer arm reads the same source).
+        let enrolled: Vec<u64> = req
+            .volumes
+            .iter()
+            .find(|v| v.hosts_slot_0)
+            .and_then(|v| v.claim_set.as_ref())
+            .map(|set| {
+                set.members
+                    .iter()
+                    .filter(|m| {
+                        m.identity.role == crate::membership::MemberRole::Writer
+                            && m.identity.pr_key != 0
+                    })
+                    .map(|m| m.identity.pr_key)
+                    .collect()
+            })
+            .unwrap_or_default();
+        squeezefs_ipc::sqz_blocking::run_blocking(move || {
+            crate::data_custody::adopt_wero_colocated(&paths, &enrolled)
+        })
+        .await
+    } else {
+        squeezefs_ipc::sqz_blocking::run_blocking(move || {
+            crate::data_custody::join_wero_as_registrant(&paths)
+        })
+        .await
+    }
 }
 
 /// **Gather the ladder's evidence and decide** — the mount path's one call

@@ -485,6 +485,96 @@ async fn a_transient_shared_probe_over_a_dead_holders_claim_is_waited_out() {
     be.shutdown().await.unwrap();
 }
 
+/// The `mw_fleet.sh create --owners` bring-up failure (2026-08-23): a held
+/// flock with **no on-volume `writer_claim` at all** refused instantly —
+/// `await`'s `holder.as_ref()?` made the claim-less holder the ONE shape
+/// that never waits. But a claim-less holder is by construction NOT a live
+/// squeezefs writer (the claim tx is the volume's first post-replay
+/// mutation, ms after the flock): it is udevd's BLOCK_DEVICE_LOCKING
+/// change-event probe (the kernel synthesizes a `change` uevent on every
+/// write-close of the node — the `--owners` flow write-closes the meta
+/// device three times back-to-back before remounting), a reader's /
+/// co-writer's released-by-contract `LOCK_SH` probe, or a concurrent mount
+/// still inside its pre-claim window. The first two release in
+/// milliseconds; the third commits its claim and keeps holding, so the
+/// bounded wait still refuses it — and can then name it. Same bounded
+/// window as the same-process teardown race.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_anonymous_transient_flock_holder_is_waited_out() {
+    let vol = fresh_volume().await; // freshly formatted: no claim exists
+
+    // The udev shape: an exclusive BSD flock on the device node from a
+    // foreign fd (udevd takes LOCK_EX while re-probing after a change
+    // uevent), released ~300 ms in — a probe's lifetime, stretched.
+    let holder_fd = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(vol.path())
+        .expect("open for the udev-shaped holder");
+    let rc = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&holder_fd), libc::LOCK_EX) };
+    assert_eq!(rc, 0, "the anonymous holder's LOCK_EX");
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        drop(holder_fd); // release: the probe ends
+    });
+
+    let be = KvMetaBackend::open(vol.path()).await.expect(
+        "an anonymous transient flock holder (no writer_claim on the volume) \
+         must be waited out bounded, never refused instantly",
+    );
+    let claim = be.read_writer_claim().await.expect("claimed");
+    assert_eq!(claim.pid, std::process::id(), "the claim now names us");
+    releaser.join().unwrap();
+    be.shutdown().await.unwrap();
+}
+
+/// The refusal half of the anonymous-holder arm: a RETAINED claim-less
+/// flock holder still refuses — at the bound, not instantly — and the
+/// refusal stops asserting "another squeezefs process", which no evidence
+/// supports when the volume carries no claim (QUICKSTART's udev note
+/// called that exact message out as naming the wrong holder). The message
+/// names the honest shape: an anonymous holder that left no writer_claim
+/// and outlived the wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retained_anonymous_flock_holder_refuses_honestly_at_the_bound() {
+    let vol = fresh_volume().await; // no claim exists
+    let holder_fd = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(vol.path())
+        .expect("open for the retained holder");
+    let rc = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&holder_fd), libc::LOCK_EX) };
+    assert_eq!(rc, 0, "the retained holder's LOCK_EX");
+
+    let t0 = std::time::Instant::now();
+    let err = match KvMetaBackend::open(vol.path()).await {
+        Ok(_) => panic!("a retained flock holder must refuse the mount"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        t0.elapsed() >= Duration::from_millis(1900),
+        "the anonymous arm waits the bounded window before refusing \
+         (elapsed {:?})",
+        t0.elapsed()
+    );
+    assert!(
+        !err.contains("another squeezefs process"),
+        "a claim-less holder must not be attributed to squeezefs: {err}"
+    );
+    assert!(
+        err.contains("no") && err.contains("writer_claim") && err.contains("single-writer"),
+        "the refusal names the anonymous shape and the guard: {err}"
+    );
+
+    // The holder was never perturbed; releasing it makes the volume
+    // mountable again.
+    drop(holder_fd);
+    let be = KvMetaBackend::open(vol.path())
+        .await
+        .expect("mounts once the anonymous holder releases");
+    be.shutdown().await.unwrap();
+}
+
 /// A live same-host pid (boot matches, `kill(pid,0)` succeeds) is NOT a
 /// dead-pid proof: a fresh claim refuses naming the holder.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

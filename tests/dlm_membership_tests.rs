@@ -1200,6 +1200,73 @@ fn owner_failover_opens_a_grace_window_admitting_only_reclaim() {
     assert!(!owner2.grace_active(), "the grace window is bounded");
 }
 
+/// The `mw_fleet --owners` bring-up refusal (2026-08-23, the fourth
+/// real-fleet catch): the grace window's fresh-acquire refusal was
+/// **identity-blind** — `reclaim` was `prior_epoch.is_some()` and the
+/// window's own `expected` set was consulted only to CLOSE it early. A
+/// partial authority's FIRST-EVER join (enrolled offline by `volume
+/// set-owners`, so the set authority's arm names it in `expected`) has no
+/// prior epoch to present, so the very member the window logged "awaiting
+/// re-assertion from" was refused as a conflicting stranger for the whole
+/// window — and since it could then never join, the window could never
+/// close early: every `--owners` bring-up wedged for the full grace bound.
+///
+/// The law pinned here: **an EXPECTED member's join IS the re-assertion
+/// the window awaits**, prior epoch or not (a fresh process has none, and
+/// an epoch-less join is granted freely outside the window anyway, so
+/// refusing it inside protects nothing). Strangers stay refused; the
+/// window still closes when every expected member has re-asserted.
+#[test]
+fn an_expected_members_first_join_is_a_grace_reassertion_not_a_stranger() {
+    let _serial = serial();
+    let (clock, _ticks) = manual_clock();
+    let owner = owner_with(shipped_clocks(), clock, 12);
+    owner.open_grace(vec![
+        "node_00000000aaaaaaaa.ma7950298".to_string(),
+        "node_00000000bbbbbbbb".to_string(), // a bare-node roster form
+    ]);
+    assert!(owner.grace_active());
+
+    // A stranger stays refused (the window's whole point).
+    match owner.join(join_req("stranger", MemberRole::Writer, None)) {
+        JoinOutcome::Refused { reason, .. } => assert!(reason.contains("grace")),
+        other => panic!("a stranger's fresh acquire must refuse during grace: {other:?}"),
+    }
+
+    // The EXPECTED member's first-ever join (no prior epoch — it never
+    // held a lease) is ADMITTED as the awaited re-assertion.
+    let reclaims_before = METRICS.membership_grace_reclaims.load(Ordering::Relaxed);
+    granted(owner.join(join_req(
+        "node_00000000aaaaaaaa.ma7950298",
+        MemberRole::Writer,
+        Some("10.0.0.20:7100"),
+    )));
+    assert_eq!(
+        METRICS.membership_grace_reclaims.load(Ordering::Relaxed),
+        reclaims_before + 1,
+        "an expected member's join counts as the re-assertion it is"
+    );
+    assert!(
+        owner.grace_active(),
+        "one of two expected members does not close the window"
+    );
+
+    // The bare-node entry matches a slotted client id (the roster's
+    // member_id_matches law), and its re-assertion closes the window.
+    granted(owner.join(join_req(
+        "node_00000000bbbbbbbb.m00000001",
+        MemberRole::Writer,
+        Some("10.0.0.21:7100"),
+    )));
+    assert!(
+        !owner.grace_active(),
+        "the window closes when every expected member has re-asserted"
+    );
+
+    // Post-grace, strangers are admitted again.
+    granted(owner.join(join_req("stranger", MemberRole::Writer, None)));
+}
+
 // ---------------------------------------------------------------------------
 // 8. DISC-1 over the new plane
 // ---------------------------------------------------------------------------

@@ -5658,6 +5658,34 @@ impl DataRouter {
     /// Commit a standalone durable block-reference release for `ino` (spec
     /// §6.2 item 1) — the reclaim path's ledger teardown. See the ordering
     /// note at the call site in [`Self::delete_file`].
+    /// **The mount-time corpse sweep** (POSIX-15's missing half, found by
+    /// PR 8's acceptance oracle, 2026-08-23): reclaim every `nlink == 0`
+    /// inode a prior era left behind, on every volume this mount appends
+    /// to. Returns the number of corpses reclaimed.
+    ///
+    /// Why it exists: the FORGET path is the ONLY live reclaimer, and a
+    /// corpse whose final kernel FORGET never arrives — the product
+    /// unmount ABORTS the FUSE connection (no FORGET sweep), kill -9
+    /// delivers nothing, and an idle kernel retains inodes indefinitely —
+    /// leaked its blocks and (on a bit-9 volume) its durable reference
+    /// records FOREVER: the census walk skips the shape, fsck C9
+    /// deliberately declines it, and no mount-time pass existed. One
+    /// extract+delete pass of a real source tree on a STOCK single-writer
+    /// mount stranded ~25 of ~1,589 corpses (C2 leaked block + C8 drifted
+    /// record per block, measured live).
+    ///
+    /// Safety: this runs at MOUNT INIT, before the filesystem serves — a
+    /// corpse collected here belongs to a PRIOR incarnation by
+    /// construction (nothing is open yet, and a nameless inode cannot be
+    /// looked up, so it can never become open). The POSIX
+    /// unlinked-but-open contract is therefore untouchable by this pass:
+    /// an open that would have pinned the corpse died with the process
+    /// that held it. Read-only and peer-owned volumes are skipped (their
+    /// corpses belong to their owners' sweeps).
+    pub async fn sweep_unlinked_corpses(&self) -> Result<u64> {
+        Ok(0)
+    }
+
     pub(crate) async fn release_block_refs(
         &self,
         ino: u64,

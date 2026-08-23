@@ -1791,3 +1791,86 @@ async fn reclaim_of_an_ino_with_an_open_rewrite_epoch_orphans_no_durable_referen
         .await
         .expect("clean shutdown");
 }
+
+// ---------------------------------------------------------------------------
+// The mount-time corpse sweep (POSIX-15's missing half, 2026-08-23 — found
+// by PR 8's acceptance oracle and reproduced on a STOCK single-writer
+// mount: one extract+delete pass of a real source tree stranded ~25 of
+// ~1,589 corpses).
+// ---------------------------------------------------------------------------
+
+/// The lost-FORGET corpse: unlink drives `nlink` to 0, but the kernel's
+/// final FORGET never arrives (the product unmount ABORTS the FUSE
+/// connection, kill -9 delivers nothing, an idle kernel retains inodes
+/// indefinitely) — and the FORGET path is the ONLY live reclaimer, the
+/// census walk skips the shape, and fsck C9 deliberately declines it. The
+/// corpse's blocks (C2) and durable reference records (C8) leaked FOREVER.
+/// The contract: the next writable mount's sweep reclaims them, and a LIVE
+/// sibling is untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prior_eras_unforgotten_corpse_is_reclaimed_at_mount() {
+    let meta = NamedTempFile::new().unwrap();
+    format_meta_stamped(meta.path()).await;
+    let data = data_file();
+
+    let (corpse_block, live_block) = {
+        let rig = mount(meta.path(), data.path()).await;
+        let corpse = rig.mk_file("corpse").await;
+        let corpse_block = rig.publish_block(corpse, 0).await;
+        let live = rig.mk_file("survivor").await;
+        let live_block = rig.publish_block(live, 0).await;
+        assert_eq!(rig.durable_refcount(corpse_block).await, 1);
+        // The lost FORGET: nlink reaches 0 and NOTHING reclaims — the
+        // record, its layout and its durable reference all persist.
+        rig.routed.unlink(1, "corpse").await.expect("unlink");
+        rig.shutdown().await;
+        (corpse_block, live_block)
+    };
+
+    let rig = mount(meta.path(), data.path()).await;
+    assert_eq!(
+        rig.durable_refcount(corpse_block).await,
+        1,
+        "fixture honest: the corpse survived the remount un-reclaimed"
+    );
+
+    let swept = rig
+        .router
+        .sweep_unlinked_corpses()
+        .await
+        .expect("the mount-time corpse sweep");
+    assert_eq!(swept, 1, "exactly the corpse is swept, not the survivor");
+    assert_eq!(
+        rig.durable_refcount(corpse_block).await,
+        0,
+        "the corpse's durable reference is released (the C8 half)"
+    );
+    assert!(
+        !rig
+            .alloc
+            .tracked_offsets()
+            .iter()
+            .any(|(off, _)| *off == corpse_block),
+        "the corpse's block is FREE again (the C2 half)"
+    );
+    assert_eq!(
+        rig.durable_refcount(live_block).await,
+        1,
+        "the live sibling's reference is untouched"
+    );
+    assert!(
+        rig.drift().await.is_empty(),
+        "durable == derived after the sweep"
+    );
+
+    // Idempotent: a second pass finds nothing.
+    assert_eq!(
+        rig.router
+            .sweep_unlinked_corpses()
+            .await
+            .expect("second sweep"),
+        0,
+        "a swept volume carries no corpses"
+    );
+    rig.shutdown().await;
+}

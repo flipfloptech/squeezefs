@@ -712,6 +712,86 @@ async fn test_an_unforgotten_corpses_blocks_are_not_c2_leaked() {
     fx.close().await;
 }
 
+/// The gauge half of the same law: `meta_kv_block_refs_drift` is a
+/// must-stay-0 tripwire, so it must count CONFIRMED drift only — the raw
+/// pre-settle comparison legitimately sees the mid-reclaim window (a
+/// corpse whose references are released while its record destroy is a
+/// commit behind), and feeding the gauge from every verification pass
+/// turned a healthy tar-x/rm fleet into `drift=1147` while the very same
+/// run's findings read 0 (the restarted PR-8 acceptance, 2026-08-23).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_the_drift_gauge_counts_confirmed_findings_only() {
+    use squeezefs::meta_backend::kv::META_KV_BLOCK_REFS_DRIFT;
+    use std::sync::atomic::Ordering;
+    let _serial = serial().await;
+    let dir = tempfile::tempdir().unwrap();
+    let meta = make_file(dir.path(), "meta", 256 * 1024 * 1024);
+    let oss1 = make_file(dir.path(), "oss1", 4 << 30);
+    format_meta(&meta, &[&oss1]).await;
+    let recs = base_format_config(&[&oss1]).resolved_data_volumes();
+    let fx = open_fixture(&meta, &recs).await;
+
+    let ino = create_file(&fx, "gauge.bin").await;
+    striped_burst(&fx, ino, 4).await;
+    fx.fs
+        .unlink(req(), 1, OsStr::new("gauge.bin"))
+        .await
+        .expect("unlink");
+
+    let before = META_KV_BLOCK_REFS_DRIFT.load(Ordering::Relaxed);
+    let report = run_fsck(&fx.ctx(), &online_opts()).await.expect("fsck");
+    assert!(report.findings.is_empty(), "{:?}", report.findings);
+    assert_eq!(
+        META_KV_BLOCK_REFS_DRIFT.load(Ordering::Relaxed),
+        before,
+        "a zero-finding pass must leave the must-stay-0 gauge untouched"
+    );
+
+    // The raw comparison is an OBSERVATION, not a verdict: on genuinely
+    // drifting state it reports the drift but must not feed the gauge —
+    // fsck's CONFIRMED findings are what feed it (the live leg's fsck
+    // confirm arm re-runs the comparison PER SUSPECT, so a feeding raw
+    // pass multiplies a transient window into drift=1147 on a healthy
+    // fleet while the same run's findings read 0).
+    let victim = create_file(&fx, "frozen.bin").await;
+    striped_burst(&fx, victim, 2).await;
+    // Freeze a genuine drift shape: the layout vanishes while the durable
+    // records stand (nothing moves in this fixture — no reclaim, no
+    // destroy — so the settle cannot clear it).
+    fx.meta.volumes[0]
+        .removexattr_internal(victim, "layout")
+        .await
+        .expect("drop the layout, keep the records");
+
+    let before = META_KV_BLOCK_REFS_DRIFT.load(Ordering::Relaxed);
+    let raw = fx
+        .fs
+        .router
+        .backend_router
+        .verify_durable_block_refs(&fx.meta)
+        .await
+        .expect("raw comparison");
+    assert_eq!(raw.len(), 2, "the frozen drift is visible to the comparison");
+    assert_eq!(
+        META_KV_BLOCK_REFS_DRIFT.load(Ordering::Relaxed),
+        before,
+        "the raw comparison observes; it does not convict"
+    );
+
+    // fsck CONFIRMS the frozen drift (nothing moves in this fixture, so
+    // the settle cannot clear it) — and the confirmed findings are what
+    // feed the gauge, exactly once each.
+    let report = run_fsck(&fx.ctx(), &online_opts()).await.expect("fsck");
+    let c8: Vec<_> = report.findings.iter().filter(|f| f.class == "C8").collect();
+    assert_eq!(c8.len(), 2, "{:?}", report.findings);
+    assert_eq!(
+        META_KV_BLOCK_REFS_DRIFT.load(Ordering::Relaxed),
+        before + 2,
+        "confirmed findings feed the tripwire, once each"
+    );
+    fx.close().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_c2_lost_block_detected() {
     let _serial = serial().await;

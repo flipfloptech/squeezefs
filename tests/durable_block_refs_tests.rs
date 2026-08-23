@@ -756,12 +756,19 @@ async fn durable_matches_derived_across_a_mixed_workload() {
         .expect("punch");
     assert!(rig.drift().await.is_empty(), "after punch");
 
-    // (vi) reclaim `b` entirely (unlink → reclaim's data teardown)
+    // (vi) reclaim `b` entirely (unlink → reclaim's data teardown → the
+    // record destroy). The destroy is part of the pair: production's
+    // reclaim batch always follows `delete_file` with `destroy_inodes`,
+    // and since the corpse-census correction (2026-08-23) the derived
+    // walk counts a corpse's layout — so the mid-window state
+    // (references released, layout not yet erased) honestly reads as
+    // transient drift until the destroy lands.
     rig.routed.unlink(1, "mixed_b").await.expect("unlink");
     rig.router
         .delete_file(&squeezefs::keys::inode_path(b))
         .await
         .expect("delete_file");
+    rig.routed.destroy_inodes(&[b]).await.expect("destroy");
     assert!(rig.drift().await.is_empty(), "after reclaim");
 
     rig.shutdown().await;

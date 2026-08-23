@@ -773,17 +773,21 @@ async fn test_raising_a_zero_count_runs_before_the_block_classes_and_saves_the_b
     assert_eq!(offsets.len(), 2, "the fixture owns two blocks");
     force_nlink(&fx, doomed, 0).await;
 
-    // The census skips `nlink == 0` records, so this inode's blocks read
-    // as allocated-unreferenced: the block plane reports them leaked.
-    // That is the census's rule, not a C10 defect — but it makes the
-    // repair ORDER load-bearing: freeing them would destroy data the
-    // inode-plane repair is about to re-attach.
+    // Since the corpse-census correction (2026-08-23) the census COUNTS a
+    // `nlink == 0` inode's layout — a corpse owns its blocks until reclaim
+    // — so this shape has no block-plane face at all: the blocks were
+    // never "unreferenced", and the ordering hazard this test was born to
+    // guard (a C2 repair freeing blocks the C10 raise re-attaches) is now
+    // unreachable from it BY CONSTRUCTION. The strictly stronger contract
+    // pinned here: zero C2 findings, the raise applies, and the blocks
+    // survive untouched.
     let fx_ctx = fx.ctx();
     let report = run_fsck(&fx_ctx, &online_opts()).await.expect("fsck");
     assert_eq!(c10(&report).len(), 1, "{:?}", report.findings);
     assert!(
-        !class_findings(&report, "C2").is_empty(),
-        "the shape's block-plane face must be present for this test to mean anything: {:?}",
+        class_findings(&report, "C2").is_empty(),
+        "a zero-count-with-a-name inode's blocks are OWNED (the corpse-census \
+         correction) — the block plane must not read them leaked: {:?}",
         report.findings
     );
 

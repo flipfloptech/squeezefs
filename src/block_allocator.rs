@@ -2816,9 +2816,19 @@ pub(crate) async fn collect_corpse_inos(
     Ok(out)
 }
 
-/// Walk every LIVE inode's decoded `"layout"` xattr on one metadata volume
-/// (paged range scans, `nlink == 0` corpses skipped — the reclaim
-/// contract), handing each `(ino, layout)` to `visit`.
+/// Walk every layout-OWNING inode's decoded `"layout"` xattr on one
+/// metadata volume (paged range scans), handing each `(ino, layout)` to
+/// `visit`.
+///
+/// **`nlink == 0` corpses are INCLUDED** (2026-08-23, the corpse-census
+/// correction): an unlinked inode awaiting its kernel FORGET is legal
+/// POSIX state that still OWNS its blocks until reclaim runs — the old
+/// skip made the derived seed hand corpse blocks out as free, the oracle
+/// read every corpse's ledger record as drift (the fsck C8 false positive
+/// on healthy live mounts), and the backfill dropped them. The block
+/// plane counts owners; WHO may destroy the owner is the inode plane's
+/// question (fsck C9/C10 keep their own walks and their deliberate
+/// `nlink == 0` exclusions).
 ///
 /// The shared engine of three things that must never disagree: the
 /// mount-time refcount seed, its durable-vs-derived **oracle**, and the
@@ -2851,13 +2861,12 @@ where
             let Ok(ino) = decode_inode_key(k) else {
                 continue;
             };
-            let Ok(val) = InodeValue::decode(v) else {
+            // A corpse (nlink == 0) still owns its blocks — see the
+            // function doc. Decode success is the record-validity gate.
+            let Ok(_val) = InodeValue::decode(v) else {
                 continue;
             };
             summary.checked += 1;
-            if val.nlink == 0 {
-                continue;
-            }
             summary.valid_inodes += 1;
             if let Ok(Some(bytes)) = kv.getxattr(ino, "layout").await {
                 summary.layouts_found += 1;

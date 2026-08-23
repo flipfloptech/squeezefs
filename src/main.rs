@@ -6248,6 +6248,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // floor the authority OPENS, and its frees ship. The walk here
             // would declare every gap below the cursor free over offsets its
             // peers own.
+            let mut verify_block_refs_after_sweep = false;
             if reader_mount || mw_client_mount {
                 log::info!(
                     "{} mount: block-ownership recovery skipped entirely (this mount \
@@ -6266,23 +6267,11 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         log::info!(
                         "block ownership recovered from DURABLE records: {seeded}                          reference(s), no inode-tree walk (incompat bit 8)"
                     );
-                        if squeezefs::env_knobs::bool_knob("SQUEEZEFS_BLOCK_REFS_VERIFY", false) {
-                            match fs_engine
-                            .router
-                            .backend_router
-                            .verify_durable_block_refs(&routed_meta_backend)
-                            .await
-                        {
-                            Ok(drift) if drift.is_empty() => log::info!(
-                                "durable-vs-derived block-reference verification: EXACT"
-                            ),
-                            Ok(drift) => log::error!(
-                                "durable-vs-derived block-reference verification found {}                                  drifting block(s) — run `squeezefs fsck` (class C8)",
-                                drift.len()
-                            ),
-                            Err(e) => log::error!("block-reference verification failed: {e}"),
-                        }
-                        }
+                        // The corpse sweep runs BETWEEN the seed and the
+                        // verifier (see the sweep comment below): the
+                        // verifier should judge the healed state, not the
+                        // prior era's un-reclaimed corpses.
+                        verify_block_refs_after_sweep = true;
                     }
                     Ok(None) => {
                         for kv in &routed_meta_backend.volumes {
@@ -6338,6 +6327,28 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         "mount-time corpse sweep failed: {e} (the corpses stay leaked; \
                          fsck C2/C8 name them and the next mount retries)"
                     ),
+                }
+            }
+            // The optional verifier, AFTER the sweep: it judges the healed
+            // state (a prior era's corpses are damage the sweep just
+            // repaired, not drift worth an ERROR).
+            if verify_block_refs_after_sweep
+                && squeezefs::env_knobs::bool_knob("SQUEEZEFS_BLOCK_REFS_VERIFY", false)
+            {
+                match fs_engine
+                    .router
+                    .backend_router
+                    .verify_durable_block_refs(&routed_meta_backend)
+                    .await
+                {
+                    Ok(drift) if drift.is_empty() => {
+                        log::info!("durable-vs-derived block-reference verification: EXACT")
+                    }
+                    Ok(drift) => log::error!(
+                        "durable-vs-derived block-reference verification found {}                          drifting block(s) — run `squeezefs fsck` (class C8)",
+                        drift.len()
+                    ),
+                    Err(e) => log::error!("block-reference verification failed: {e}"),
                 }
             }
             fs_engine.meta_backend = Some(routed_meta_backend.clone());

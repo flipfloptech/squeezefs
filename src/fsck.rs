@@ -2625,9 +2625,17 @@ async fn walk_census(
                 let Ok(val) = InodeValue::decode(v) else {
                     continue;
                 };
-                if val.nlink == 0 {
-                    continue;
-                }
+                // A `nlink == 0` corpse (unlinked, its kernel FORGET not
+                // yet arrived, reclaim not yet run) is LEGAL live state
+                // that still OWNS its blocks: it stays OUT of every
+                // inode-plane set below (C9's live bitmap, C10's count
+                // arms — their `nlink == 0` exclusions are deliberate and
+                // documented) but its layout DOES feed the block census.
+                // The old whole-record skip read every such block as C2
+                // "leaked" and its ledger record as C8 drift — 152 false
+                // positives on a healthy fleet seconds after a tar-x/rm
+                // pass (2026-08-23, the corpse-census correction).
+                let corpse = val.nlink == 0;
                 // Guest-only members carry raw CONTROL records with no
                 // global encoding — skip them (VL9 soak-found panic).
                 let Some(global_ino) = ctx.meta.try_make_global_ino(local_ino, vol_idx) else {
@@ -2638,23 +2646,26 @@ async fn walk_census(
                         continue;
                     }
                 }
-                out.inodes_scanned += 1;
-                // C9: this live inode's bit. One bit per visited inode,
-                // on a walk that already reads every inode record — the
-                // set difference happens after the (independent) dentry
-                // pass, so nothing here depends on scan order.
-                out.live.mark(global_ino);
-                // C10: the count arms' small side — non-directory live
-                // inodes whose nlink is not 1. Directories are excluded
-                // BY CONSTRUCTION (their nlink counts `.` and every
-                // child's `..`, which are synthesized and never records),
-                // which is also what keeps this map the hardlink
-                // population instead of the whole tree.
-                if val.nlink != 1 && val.mode & libc::S_IFMT != libc::S_IFDIR {
-                    if out.odd_nlink.len() as u64 >= odd_budget {
-                        out.odd_nlink_complete = false;
-                    } else {
-                        out.odd_nlink.insert(global_ino, val.nlink);
+                if !corpse {
+                    out.inodes_scanned += 1;
+                    // C9: this live inode's bit. One bit per visited
+                    // inode, on a walk that already reads every inode
+                    // record — the set difference happens after the
+                    // (independent) dentry pass, so nothing here depends
+                    // on scan order.
+                    out.live.mark(global_ino);
+                    // C10: the count arms' small side — non-directory
+                    // live inodes whose nlink is not 1. Directories are
+                    // excluded BY CONSTRUCTION (their nlink counts `.`
+                    // and every child's `..`, which are synthesized and
+                    // never records), which is also what keeps this map
+                    // the hardlink population instead of the whole tree.
+                    if val.nlink != 1 && val.mode & libc::S_IFMT != libc::S_IFDIR {
+                        if out.odd_nlink.len() as u64 >= odd_budget {
+                            out.odd_nlink_complete = false;
+                        } else {
+                            out.odd_nlink.insert(global_ino, val.nlink);
+                        }
                     }
                 }
                 // KD-PV-16's plane shard has no use for the block map —

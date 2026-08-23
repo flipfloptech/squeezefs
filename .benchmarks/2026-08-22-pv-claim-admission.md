@@ -540,31 +540,40 @@ Filled in as the run proceeds. Landed with this branch:
    needs `SQZ_MWFLEET_OSS_GB=32` (zram is virtual; the RAM cost is the
    compressed payload only). The recipe's Step 2 must say so.
 9. **The 2026-08-23 gate-(a) attempt STOPPED at its trailing oracle —
-   C8 drift, the rung-9 finding-#6 class on the CLEAN path.** The measured
-   arms completed and the inversion happened (`verbs/entry 0.02`,
+   C8 drift, reclassified and FIXED as the lost-FORGET corpse leak
+   (POSIX-15's missing half; NOT the rung-9 finding-#6 class).** The
+   measured arms completed and the inversion happened (`verbs/entry 0.02`,
    `redirects 0`, `ship` 2–3 per whole extraction; wall 5.08 s partial vs
    3.44 s local = **1.48× of S0** against the ≤ 1.10× formal gate, vs the
    6.73× baseline — the verdict names the charter's
    honest-product-statement alternative), but the oracle reported **C8
-   durable block-reference drift** on ~100 blocks across both data
-   namespaces (`1 durable record vs 0 counted layout references`, stable
-   across both scan epochs) after the tar-x / rm -rf cycles, with
-   `fsck_findings == 0` in every live snapshot. This is the drift half of
-   `.benchmarks/2026-08-16-mw-s9-arm.md` finding **#6** (OPEN,
-   STOP-and-report: no era gate on the layout-publish verbs, no
-   idempotence witness for the publish class) — with the NEW datum that it
-   fires with **no fence and no zombie in the run at all**: a healthy
-   partial authority's extract/delete churn is enough, so the
-   lost-reply/duplicate-application half stands convicted independently of
-   the era-gate half. Per the counted-run law the campaign stops here: the
-   rows above are label-only, the fix belongs to the finding-#6
-   adjudication (design-mw-layout-versions / the orchestrator) with its
-   red-first cargo repro, and the acceptance run restarts from zero after
-   it lands. Evidence: `.benchmarks/rows-s10pl-1787503934-evidence/` (the
-   row directory: per-arm stats snapshots, table, verdict). A second
-   online `fsck` on the live authority could not even report the finding
-   list — "reply too large; use the offline probe" — its own small CLI
-   wart.
+   durable block-reference drift** on ~100 blocks (each paired with a C2
+   leaked block at the same offset) after the tar-x / rm -rf cycles. The
+   investigation walked it OUT of the multi-writer program entirely: a
+   STOCK single-writer mount reproduces it (one extract+delete pass of the
+   real linux `fs/` tree stranded 25 of 1,589 corpses, measured live), and
+   the mechanism is the one the code's own comments state — the FORGET
+   path is the ONLY reclaimer of `nlink == 0` corpses, the product unmount
+   ABORTS the FUSE connection (no FORGET sweep), kill -9 delivers nothing,
+   an idle kernel retains inodes indefinitely, the census walk skips the
+   shape and fsck C9 deliberately declines it. Every such corpse leaked
+   its blocks (C2) and, on a bit-9 volume, its durable reference records
+   (C8) FOREVER — invisible until the rung-10b default format stamped the
+   ledger. **Fixed** (`fix/mount-corpse-sweep`, red-first): the mount-time
+   corpse sweep (`DataRouter::sweep_unlinked_corpses`, wired before
+   serving — a nameless inode cannot be looked up, so the pass can never
+   race an open) reclaims every prior-era corpse; the first live cut also
+   caught the width-routing trap (the record walk answers volume-LOCAL
+   inos, every routed verb takes GLOBAL ones — the identity-width test
+   constructor hid it, and the routed re-route destroyed nothing,
+   silently). Verified live on the leaked stock volume: 152 corpses swept,
+   the next mount finds zero corpses, zero drift, an empty ledger. Rows
+   above stay label-only per the counted-run law; the acceptance run
+   restarts from zero on the fixed binary. Evidence:
+   `.benchmarks/rows-s10pl-1787503934-evidence/` (per-arm stats snapshots,
+   table, verdict). A second online `fsck` could not even report the
+   finding list — "reply too large; use the offline probe" — its own small
+   CLI wart, still open.
 
 ---
 

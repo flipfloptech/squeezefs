@@ -6316,6 +6316,30 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     Err(e) => log::error!("durable block-reference recovery failed: {e:?}"),
                 }
             }
+            // The mount-time corpse sweep (POSIX-15's missing half,
+            // 2026-08-23): reclaim every `nlink == 0` inode a prior era
+            // never got a final FORGET for — the FORGET path is the only
+            // live reclaimer, so abort-unmounts, kill -9 and kernel cache
+            // retention stranded their blocks (fsck C2) and durable
+            // reference records (fsck C8) forever. Before serving, so a
+            // corpse can never race an open (a nameless inode cannot be
+            // looked up); after ownership recovery, so the frees land on a
+            // seeded allocator. Readers skip it (they cannot write); a
+            // co-writer's writable-volume filter yields nothing; a partial
+            // authority sweeps exactly the volumes it appends to.
+            if !reader_mount {
+                match fs_engine.router.sweep_unlinked_corpses().await {
+                    Ok(0) => {}
+                    Ok(n) => log::info!(
+                        "mount-time corpse sweep reclaimed {n} unlinked inode(s) a prior \
+                         era left behind (references released, blocks freed)"
+                    ),
+                    Err(e) => log::warn!(
+                        "mount-time corpse sweep failed: {e} (the corpses stay leaked; \
+                         fsck C2/C8 name them and the next mount retries)"
+                    ),
+                }
+            }
             fs_engine.meta_backend = Some(routed_meta_backend.clone());
             fs_engine.dismount_wait = resolved_dismount_wait;
 

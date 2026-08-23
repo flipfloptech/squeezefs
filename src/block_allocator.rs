@@ -2770,6 +2770,52 @@ impl BlockAllocator {
     }
 }
 
+/// Collect every `nlink == 0` CORPSE ino on one metadata volume — the
+/// complement of [`walk_live_layouts`]'s skip, over the same paged range
+/// scan.
+///
+/// The population this names (POSIX-15's missing half, found by PR 8's
+/// acceptance oracle, 2026-08-23): unlinked inodes whose final kernel
+/// FORGET never arrived before the mount died — connection-abort unmount,
+/// kill -9, or plain kernel cache retention. The FORGET path is the ONLY
+/// live reclaimer, the census walk skips the shape, and fsck C9
+/// deliberately declines it, so every such corpse leaked its blocks and
+/// (on a bit-9 volume) its durable reference records FOREVER — the C2+C8
+/// pair per block the tar-x oracle went red on.
+/// [`crate::routing::DataRouter::sweep_unlinked_corpses`] is the consumer.
+pub(crate) async fn collect_corpse_inos(
+    kv: &crate::meta_backend::kv::backend::KvMetaBackend,
+) -> Result<Vec<u64>> {
+    use crate::meta_backend::kv::record::{decode_inode_key, inode_key, InodeValue};
+    let inodes = kv.trees()[0];
+    let mut out = Vec::new();
+    let mut cursor: Vec<u8> = inode_key(2).to_vec();
+    let end = inode_key(u64::MAX - 1);
+    loop {
+        let page = inodes.range(&cursor, &end, 512).await.map_err(|e| {
+            crate::error::SqueezefsError::InvalidOperation(format!(
+                "v3 corpse-sweep inode walk failed: {e}"
+            ))
+        })?;
+        let Some((last_key, _)) = page.last() else {
+            break;
+        };
+        cursor = crate::meta_backend::kv::node::key_successor(last_key);
+        for (k, v) in &page {
+            let Ok(ino) = decode_inode_key(k) else {
+                continue;
+            };
+            let Ok(val) = InodeValue::decode(v) else {
+                continue;
+            };
+            if val.nlink == 0 {
+                out.push(ino);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Walk every LIVE inode's decoded `"layout"` xattr on one metadata volume
 /// (paged range scans, `nlink == 0` corpses skipped — the reclaim
 /// contract), handing each `(ino, layout)` to `visit`.

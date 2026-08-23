@@ -5682,8 +5682,75 @@ impl DataRouter {
     /// an open that would have pinned the corpse died with the process
     /// that held it. Read-only and peer-owned volumes are skipped (their
     /// corpses belong to their owners' sweeps).
+    ///
+    /// The teardown per corpse is the FORGET-driven reclaim's own ladder
+    /// (`fuse_client::reclaim_orphaned_batch`), minus the parts that
+    /// cannot exist at mount init: no RAM-parked overlays, no open
+    /// handles, no reclaim-latch contention (the latch is FUSE-wired and
+    /// nothing publishes yet). `delete_file` releases the durable
+    /// references and frees the blocks; `destroy_inodes` erases the
+    /// records — its live-nlink skip is a second guard on the corpse
+    /// classification.
     pub async fn sweep_unlinked_corpses(&self) -> Result<u64> {
-        Ok(0)
+        let Some(backend) = self.inner.meta_backend.get() else {
+            return Ok(0);
+        };
+        let mut swept = 0u64;
+        for (v_idx, be) in backend
+            .volumes
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| !v.is_read_only())
+        {
+            // The record walk answers volume-LOCAL inos; every routed verb
+            // below takes GLOBAL ones (`route_ino` decomposes them again).
+            // The identity-width test constructor hid this — the first
+            // live sweep re-routed locals onto nonexistent records and
+            // destroyed nothing, silently (`doomed == 0` is an early Ok).
+            // `try_make_global_ino` is the tree-walk inverse fsck uses; a
+            // local this volume's stamps cannot express is skipped loud.
+            let corpses: Vec<u64> = crate::block_allocator::collect_corpse_inos(be)
+                .await?
+                .into_iter()
+                .filter_map(|local| {
+                    let global = backend.try_make_global_ino(local, v_idx);
+                    if global.is_none() {
+                        log::warn!(
+                            "corpse sweep: local ino {local} on {} maps to no global ino \
+                             (membership stamps do not cover it) — left for fsck",
+                            be.device_path().display()
+                        );
+                    }
+                    global
+                })
+                .collect();
+            if corpses.is_empty() {
+                continue;
+            }
+            log::warn!(
+                "mount-time corpse sweep: {} unlinked inode(s) a prior era never \
+                 reclaimed on {} (lost final FORGET — abort-unmount, kill -9, or \
+                 kernel cache retention); releasing their references and blocks",
+                corpses.len(),
+                be.device_path().display()
+            );
+            for &ino in &corpses {
+                let file_path = crate::keys::inode_path(ino);
+                if let Err(e) = self.delete_file(&file_path).await {
+                    // Log-and-proceed, the reclaim batch's own posture:
+                    // whatever this corpse's teardown could not release is
+                    // exactly what fsck C2/C8 name, and the destroy below
+                    // still erases the record.
+                    log::warn!(
+                        "corpse sweep: delete_file(ino {ino}) failed (proceeding to \
+                         destroy): {e:?}"
+                    );
+                }
+            }
+            crate::meta_ship::publish::destroy_inodes(backend, &corpses).await?;
+            swept += corpses.len() as u64;
+        }
+        Ok(swept)
     }
 
     pub(crate) async fn release_block_refs(

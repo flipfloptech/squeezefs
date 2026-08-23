@@ -1846,8 +1846,7 @@ async fn a_prior_eras_unforgotten_corpse_is_reclaimed_at_mount() {
         "the corpse's durable reference is released (the C8 half)"
     );
     assert!(
-        !rig
-            .alloc
+        !rig.alloc
             .tracked_offsets()
             .iter()
             .any(|(off, _)| *off == corpse_block),
@@ -1872,5 +1871,26 @@ async fn a_prior_eras_unforgotten_corpse_is_reclaimed_at_mount() {
         0,
         "a swept volume carries no corpses"
     );
+    rig.shutdown().await;
+
+    // The sweep is DURABLE (the live-fleet catch, same day: the first
+    // implementation's reclaim applied in RAM and the next mount found
+    // the same corpses again): a remount finds nothing to sweep and no
+    // drift.
+    let rig = mount(meta.path(), data.path()).await;
+    assert_eq!(
+        rig.durable_refcount(corpse_block).await,
+        0,
+        "the corpse's reference release survived the remount"
+    );
+    assert_eq!(
+        rig.router
+            .sweep_unlinked_corpses()
+            .await
+            .expect("post-remount sweep"),
+        0,
+        "the destroy survived the remount — no corpse record remains"
+    );
+    assert!(rig.drift().await.is_empty());
     rig.shutdown().await;
 }

@@ -41,6 +41,7 @@
 //! and is untouched by this rung — a plain mount arms nothing, so every
 //! derivation here is reached through a decision or a test constructor.
 
+use squeezefs::config_ops::{self, SetOwnersOptions};
 use squeezefs::cowriter::{MwRole, RegistrantEvidence};
 use squeezefs::membership::{ClaimHolder, ClaimSet, ClaimSetMember, MemberIdentity, MemberRole};
 use squeezefs::meta_backend::kv::backend::{KvMetaBackend, WriterClaim, WRITER_CLAIM_XATTR};
@@ -301,6 +302,41 @@ fn uris(vols: &[PathBuf]) -> Vec<String> {
     vols.iter().map(|v| v.display().to_string()).collect()
 }
 
+/// PR 7's offline verb, run the way `docs/operations.md` documents it (and
+/// the way `tests/mw_fleet.sh` runs it): a dry run to learn the
+/// cross-owner census, then the acknowledged assignment.
+async fn assign(u: &[String], specs: &[config_ops::OwnerAssignSpec]) {
+    let plan = config_ops::set_owners(
+        u,
+        specs,
+        &SetOwnersOptions {
+            dry_run: true,
+            ..SetOwnersOptions::default()
+        },
+    )
+    .await
+    .expect("the dry run reports the plan");
+    config_ops::set_owners(
+        u,
+        specs,
+        &SetOwnersOptions {
+            accept_cross_owner_names: Some(plan.census.total),
+            ..SetOwnersOptions::default()
+        },
+    )
+    .await
+    .expect("the acknowledged assignment applies");
+}
+
+fn spec(vol_id: &str, owner: &str, root: &str) -> config_ops::OwnerAssignSpec {
+    config_ops::OwnerAssignSpec {
+        volume_id: vol_id.to_string(),
+        owner: owner.to_string(),
+        successors: Vec::new(),
+        subtree_root: Some(root.to_string()),
+    }
+}
+
 /// The endpoint resolver the mount path supplies: a peer's published
 /// endpoint, when the gather knew one.
 fn endpoints(id: &str) -> Option<String> {
@@ -313,7 +349,9 @@ async fn shutdown(routed: &Arc<RoutedMetaBackend>) {
     }
 }
 
-/// One volume's fabricated ownership evidence.
+/// One volume's fabricated ownership evidence. A volume carrying a claim
+/// is `Fresh` (the D0 gate's own vocabulary — the gather asks it, never a
+/// second spelling); `no_live_appender` builds the other standing.
 fn ownership(
     vol_id: &str,
     set: Option<ClaimSet>,
@@ -323,6 +361,11 @@ fn ownership(
     VolumeOwnership {
         vol_id: vol_id.to_string(),
         path: PathBuf::from(format!("/dev/null/{vol_id}")),
+        standing: if claim.is_some() {
+            ClaimStanding::Fresh
+        } else {
+            ClaimStanding::Reclaimable
+        },
         claim_set: set,
         claim,
         appended_locally,
@@ -501,13 +544,76 @@ async fn the_derivation_never_adopts_on_silence() {
     shutdown(&routed).await;
 }
 
-/// An assigned volume nothing claims has no appender: the derivation
-/// refuses rather than serving a set with a hole (R13's operational face —
-/// a dead owner is a fleet-wide stop, loud and immediate).
+/// **An assigned volume nothing claims stays its OWNER's, degraded** (the
+/// cold-start correction). The peer has not mounted yet — at a cold fleet
+/// start that is true of every volume, so refusing here made an assigned
+/// set unmountable by construction — and the entry the derivation installs
+/// is the not-yet-up one: the peer's, with whatever endpoint resolves (none
+/// at cold start), never this node's. Verbs about it refuse loud at the
+/// ship site until its owner arrives, which is the blast radius
+/// `docs/operations.md`'s "ownership does not fail over" already states.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_assigned_volume_no_node_claims_refuses_the_derivation() {
+async fn an_assigned_volume_no_node_claims_derives_a_degraded_peer_entry() {
     let dir = TempDir::new().unwrap();
     let vols = volume_set(dir.path(), "unclaimed", 2).await;
+    let routed = squeezefs::meta_backend::open_routed_meta_set(&uris(&vols))
+        .await
+        .expect("write mount (the slot map's source)");
+    let cold = [
+        ownership(
+            "vol-a",
+            Some(assigned_set(NODE, None, None, &[])),
+            None,
+            true,
+        ),
+        ownership(
+            "vol-b",
+            Some(assigned_set(PEER, None, None, &[])),
+            None,
+            false,
+        ),
+    ];
+
+    // Cold: nothing has published an endpoint yet either.
+    let map = owners::derive_owner_map_from(&routed, NODE, &cold, &|_| None)
+        .expect("a cold set derives — the peer has not mounted, which is not a disagreement");
+    assert_eq!(map.local_volumes(), 1, "the peer's volume is NOT adopted");
+    assert!(map.multi_owner());
+    assert!(map.owns_slot_0(), "we still hold slot 0");
+    let peer = map
+        .owner_of_volume(1)
+        .unwrap_or_else(|| panic!("the unclaimed volume keeps its assigned owner"));
+    assert_eq!(peer.peer_id, PEER);
+    assert!(
+        peer.endpoint.is_empty(),
+        "nothing published an endpoint at cold start — the entry is installed WITHOUT one and \
+         the ship site refuses loud, which is PR 7b's not-yet-up path"
+    );
+    assert_eq!(
+        map.unclaimed_count(),
+        1,
+        "the degraded state is a GAUGE, not a refusal: an operator must be able to read how \
+         many of this set's owners are absent"
+    );
+
+    // The same shape once the owner's endpoint is known (a peer that armed
+    // before, and is restarting): still degraded, still shipped there.
+    let map = owners::derive_owner_map_from(&routed, NODE, &cold, &endpoints)
+        .expect("a known-but-absent owner derives too");
+    assert_eq!(map.owner_of_volume(1).map(|p| p.endpoint.clone()), Some(PEER_ENDPOINT.to_string()));
+    assert_eq!(map.unclaimed_count(), 1);
+    shutdown(&routed).await;
+}
+
+/// The one unclaimed shape that still REFUSES: a volume assigned to **this
+/// node** that this mount did not open `Own`. Installing a peer entry
+/// naming ourselves would ship every verb about it to our own endpoint,
+/// and adopting it here would take a claim outside the D0 ladder — so the
+/// derivation fails closed, exactly as it does for a live disagreement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unclaimed_volume_assigned_to_this_node_refuses_the_derivation() {
+    let dir = TempDir::new().unwrap();
+    let vols = volume_set(dir.path(), "unclaimed-ours", 2).await;
     let routed = squeezefs::meta_backend::open_routed_meta_set(&uris(&vols))
         .await
         .expect("write mount (the slot map's source)");
@@ -524,7 +630,7 @@ async fn an_assigned_volume_no_node_claims_refuses_the_derivation() {
             ),
             ownership(
                 "vol-b",
-                Some(assigned_set(PEER, None, None, &[])),
+                Some(assigned_set(NODE, None, None, &[])),
                 None,
                 false,
             ),
@@ -532,10 +638,129 @@ async fn an_assigned_volume_no_node_claims_refuses_the_derivation() {
         &endpoints,
     )
     .err()
-    .unwrap_or_else(|| panic!("an assigned-but-unclaimed volume must refuse"));
+    .unwrap_or_else(|| panic!("a volume assigned HERE that this mount does not append to \
+                               cannot be shipped to ourselves"));
     assert!(
-        err.to_string().contains("NOTHING claims it"),
-        "the refusal must name the shape: {err}"
+        err.to_string().contains("this node"),
+        "the refusal must name who the record assigns it to: {err}"
+    );
+    shutdown(&routed).await;
+}
+
+/// **The end-to-end cold start** — the pin this class kept escaping.
+///
+/// Every per-volume contract before it either armed through
+/// `arm_partial_authority` directly or hand-built its evidence, so nothing
+/// walked the sequence a first `squeezefs mount` of a freshly assigned set
+/// walks: assign offline → probe → gather evidence → decide → open → derive.
+/// All three gates on that sequence refused a state no fleet can escape,
+/// because at a cold start NO volume carries a claim.
+///
+/// What this exercises, all product code: `config_ops::set_owners` (the
+/// offline assignment, run exactly as `tests/mw_fleet.sh` runs it),
+/// `open_probe_routed_meta_set` + `partial_authority::gather_volume_evidence`
+/// (the mount path's OWN per-volume reads — the same function
+/// `gather_set_admission` calls), `classify_set_admission`,
+/// `open_routed_meta_set_partial` and `derive_owner_map`.
+///
+/// What one unprivileged process cannot exercise, stated rather than
+/// hidden: rung 4's LIVE membership plane and rung 5's device WERO hold
+/// need a peer and a PR-capable namespace, so those two rungs' evidence is
+/// supplied (the suite-wide `SetAdmissionRequest` precedent); the FUSE
+/// mount and the posture arms are `sudo tests/mw_fleet.sh create N=1
+/// --owners=2`'s job.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cold_assigned_set_comes_up_through_the_mount_paths_own_reads() {
+    let dir = TempDir::new().unwrap();
+    let vols = volume_set(dir.path(), "coldfleet", 2).await;
+    let ids = vec![vol_id(&vols[0]).await, vol_id(&vols[1]).await];
+    // The REAL offline verb: volume 0 (slot 0) to this node, volume 1 to a
+    // peer that has not been started — the fleet builder's own act.
+    assign(
+        &uris(&vols),
+        &[spec(&ids[0], NODE, "/n0"), spec(&ids[1], PEER, "/n1")],
+    )
+    .await;
+
+    // The mount path's first act: probe opens, and its own evidence read.
+    let probes = squeezefs::meta_backend::open_probe_routed_meta_set(&uris(&vols))
+        .await
+        .expect("the probe set opens");
+    let evidence = pv::gather_volume_evidence(&probes, None).await;
+    assert_eq!(evidence.len(), 2);
+    assert!(
+        evidence
+            .iter()
+            .all(|v| v.standing == ClaimStanding::Reclaimable && v.holder_member_id.is_none()),
+        "a cold set carries no live appender anywhere — that is the state the ladder must \
+         admit, and the state that made the old arm unsatisfiable"
+    );
+    assert!(
+        evidence[0].hosts_slot_0 && !evidence[1].hosts_slot_0,
+        "the gather resolves the slot-0 host from the live slot map (D20)"
+    );
+
+    let req = SetAdmissionRequest {
+        multi_writer: true,
+        role: MwRole::SetAuthority,
+        read_only: false,
+        node_id: NODE.to_string(),
+        set_authority_endpoint: None,
+        volumes: evidence,
+        // Rung 4: a set authority OWNS the membership plane, so it joins
+        // none — the real gather passes `None` here too when no rendezvous
+        // record exists yet, which is the cold-start shape.
+        authority: None,
+        // Rung 5's device half, supplied: no unprivileged file-backed
+        // volume can hold an NVMe reservation.
+        registrant: Some(RegistrantEvidence {
+            pr_capable: true,
+            wero: true,
+            reservation_held: true,
+            registered: true,
+            key: 0xB0B0,
+            namespaces: 1,
+        }),
+    };
+    let admission = pv::classify_set_admission(&req)
+        .expect("the cold SET AUTHORITY is admitted — the fleet's documented first mount");
+    assert!(admission.is_set_authority());
+    assert!(
+        matches!(
+            admission.mode_for(&ids[1]),
+            Some(squeezefs::partial_authority::VolumeMode::Peer { owner_id, .. })
+                if owner_id == PEER
+        ),
+        "the absent peer's volume stays the PEER's"
+    );
+    drop(probes);
+
+    // The real partial open, and the real derivation over the OPEN set.
+    let routed = squeezefs::meta_backend::open_routed_meta_set_partial(&uris(&vols), &admission)
+        .await
+        .expect("the cold partial set OPENS: the peer door admits a volume nothing claims");
+    assert!(
+        routed.volumes[1].is_read_only(),
+        "the peer-owned volume is opened read-only — this mount appends to it nowhere"
+    );
+    assert!(
+        routed.volumes[1].read_writer_claim().await.is_none(),
+        "the cold open ADOPTED the unclaimed volume — the one thing KD-PV-3 forbids"
+    );
+
+    let map = owners::derive_owner_map(&routed, NODE, &|_| None)
+        .await
+        .expect("the derivation admits the cold set too");
+    assert_eq!(map.local_volumes(), 1);
+    assert!(map.owns_slot_0(), "this mount is the SET AUTHORITY (D20)");
+    assert_eq!(
+        map.owner_of_volume(1).map(|p| p.peer_id.clone()),
+        Some(PEER.to_string())
+    );
+    assert_eq!(
+        map.unclaimed_count(),
+        1,
+        "the set came up DEGRADED — one owner absent — and says so"
     );
     shutdown(&routed).await;
 }

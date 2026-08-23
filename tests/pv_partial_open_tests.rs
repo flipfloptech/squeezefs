@@ -535,26 +535,126 @@ async fn an_unattested_holder_refuses_the_peer_owned_open() {
     );
 }
 
-/// §5.1.1's `Peer` + `Reclaimable` row: an assigned peer owner that is not
-/// claiming means a dead owner, and the mount refuses loud rather than
-/// serving a set with a volume no node appends to (R13's visible face).
+/// §5.1.1's `Peer` + `Reclaimable` row, **corrected**: an assigned peer
+/// owner that is not claiming has not started yet (or is down), and the
+/// open ADMITS the volume degraded — read-only, unclaimed, unadopted —
+/// rather than taking the whole namespace down over one absent owner. It
+/// is the cold-start state every fleet passes through: the set authority
+/// mounts first, by the documented order, with every peer volume
+/// unclaimed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_peer_owned_volume_with_no_live_claim_refuses_the_open() {
+async fn a_peer_owned_volume_with_no_live_claim_opens_degraded() {
     let dir = TempDir::new().unwrap();
     let (vol0, vol1) = two_volume_set(dir.path(), "peer-dead").await;
     let (id0, id1) = (vol_id(&vol0).await, vol_id(&vol1).await);
     let claim = foreign_claim();
     let admission = partial_admission(&vol0, &id0, &claim, &vol1, &id1);
-    // The assignment stands; the owner's claim is gone (it died between
-    // the gather and the open).
+    // The assignment stands; nothing claims the volume (its owner has not
+    // mounted, or it died between the gather and the open).
     store_set(&vol0, &peer_owned_set(&claim, true)).await;
 
-    let before = METRICS
+    let refused_before = METRICS
         .peer_volume_unclaimed_refusals
         .load(Ordering::Relaxed);
-    let err = KvMetaBackend::open_peer_owned(&vol0, &admission, &id0)
+    let admitted_before = METRICS
+        .peer_volume_unclaimed_admits
+        .load(Ordering::Relaxed);
+    let before = digest(&vol0);
+    let be = KvMetaBackend::open_peer_owned(&vol0, &admission, &id0)
         .await
-        .expect_err("a peer-owned volume with no appender must refuse the mount");
+        .expect("a peer-owned volume with no appender opens DEGRADED, never refused");
+    assert_eq!(
+        be.read_only_cause(),
+        ReadOnlyCause::PeerOwnedVolume,
+        "the degraded open is still a peer-owned open — nothing about it appends"
+    );
+    let trace = be.open_trace();
+    assert!(
+        !trace.contains(&"flock_acquired") && !trace.contains(&"claim_committed"),
+        "a degraded peer-owned open must NEVER adopt the volume it found unclaimed: {trace:?}"
+    );
+    drop(be);
+    assert_eq!(
+        digest(&vol0),
+        before,
+        "the degraded open wrote to a volume it does not append to"
+    );
+    assert!(
+        KvMetaBackend::open_probe(&vol0)
+            .await
+            .expect("probe")
+            .read_writer_claim()
+            .await
+            .is_none(),
+        "the degraded open took the absent claim — that is the adoption KD-PV-3 forbids"
+    );
+    assert_eq!(
+        METRICS
+            .peer_volume_unclaimed_admits
+            .load(Ordering::Relaxed),
+        admitted_before + 1,
+        "the degraded admission is COUNTED: an operator must be able to see that this set came \
+         up with an owner missing"
+    );
+    assert_eq!(
+        METRICS
+            .peer_volume_unclaimed_refusals
+            .load(Ordering::Relaxed),
+        refused_before,
+        "an absent claim is not a refusal any more"
+    );
+}
+
+/// The other half of the correction: where a claim EXISTS it must still be
+/// attributable to the admitted holder. A TTL-stale claim the volume's own
+/// record cannot attribute (no KD-PV-17 attestation) refuses — silence
+/// about WHO appended is evidence this mount cannot reconcile, and it is
+/// counted by `peer_volume_unclaimed_refusals`, whose narrowed meaning is
+/// exactly this class.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_peer_claim_admits_only_when_it_attributes_to_the_admitted_holder() {
+    let dir = TempDir::new().unwrap();
+    let (vol0, vol1) = two_volume_set(dir.path(), "peer-stale").await;
+    let (id0, id1) = (vol_id(&vol0).await, vol_id(&vol1).await);
+    // TTL-stale: older than CLIENT_STALE_TTL_SECS, from another host's
+    // boot (so no dead-pid proof reclaims it).
+    let mut claim = foreign_claim();
+    claim.ts = now_secs() - 10_000;
+    let admission = partial_admission(&vol0, &id0, &claim, &vol1, &id1);
+
+    // (a) ATTESTED to the admitted holder: its owner died, the volume has
+    // no live appender, and the open admits it degraded.
+    store_set(&vol0, &peer_owned_set(&claim, true)).await;
+    plant(&vol0, &claim, false).await;
+    let admitted_before = METRICS
+        .peer_volume_unclaimed_admits
+        .load(Ordering::Relaxed);
+    let be = KvMetaBackend::open_peer_owned(&vol0, &admission, &id0)
+        .await
+        .expect("a dead owner's own stale claim opens degraded");
+    assert_eq!(be.read_only_cause(), ReadOnlyCause::PeerOwnedVolume);
+    drop(be);
+    assert_eq!(
+        METRICS
+            .peer_volume_unclaimed_admits
+            .load(Ordering::Relaxed),
+        admitted_before + 1
+    );
+
+    // (b) UNATTESTED: the same aged claim with nothing naming its holder.
+    // The mount cannot say whether the assignment is being honoured, so it
+    // fails closed exactly as the fresh arm does.
+    let (vol2, _) = two_volume_set(dir.path(), "peer-stale-mute").await;
+    let id2 = vol_id(&vol2).await;
+    let admission = partial_admission(&vol2, &id2, &claim, &vol1, &id1);
+    store_set(&vol2, &peer_owned_set(&claim, false)).await;
+    plant(&vol2, &claim, false).await;
+    let refused_before = METRICS
+        .peer_volume_unclaimed_refusals
+        .load(Ordering::Relaxed);
+    let err = KvMetaBackend::open_peer_owned(&vol2, &admission, &id2)
+        .await
+        .expect_err("an unattributable claim must refuse");
     assert!(
         err.to_string().contains("volume set-owners"),
         "the refusal must name the operator remedy: {err}"
@@ -563,7 +663,7 @@ async fn a_peer_owned_volume_with_no_live_claim_refuses_the_open() {
         METRICS
             .peer_volume_unclaimed_refusals
             .load(Ordering::Relaxed),
-        before + 1
+        refused_before + 1
     );
 }
 

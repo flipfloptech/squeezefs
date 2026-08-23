@@ -137,6 +137,25 @@ fn peer_volume(vol_id: &str, hosts_slot_0: bool) -> PvVolumeEvidence {
     }
 }
 
+/// A volume assigned to `owner` that **nothing claims** — the cold-fleet
+/// shape: that owner has not mounted yet (or is down), so the D0 ladder
+/// classifies its volume `Reclaimable` and no holder resolves.
+fn cold_peer_volume(vol_id: &str, owner: &str, hosts_slot_0: bool) -> PvVolumeEvidence {
+    PvVolumeEvidence {
+        path: PathBuf::from(format!("/dev/fake/{vol_id}")),
+        vol_id: vol_id.to_string(),
+        hosts_slot_0,
+        features_incompat: squeezefs::cowriter::REQUIRED_INCOMPAT,
+        pr_capable: true,
+        claim: None,
+        holder_member_id: None,
+        standing: ClaimStanding::Reclaimable,
+        claim_set: Some(assigned_set(owner, &[])),
+        projected_claim_set: Some(assigned_set(owner, &[])),
+        owner_endpoint: None,
+    }
+}
+
 fn authority_evidence() -> AuthorityLeaseEvidence {
     AuthorityLeaseEvidence {
         owner_id: "membership-owner-incarnation".to_string(),
@@ -667,40 +686,84 @@ async fn rung_6_admits_an_own_volume_the_d0_ladder_would_grant_and_refuses_a_liv
     );
 }
 
-/// Rung 6 — **assignment ∧ evidence on a PEER volume** (§5.1.1's `Peer`
-/// column, complete): `PeerAuthority` admits only when the live holder is
-/// in that volume's assignment set; `Reclaimable` and `StaleForeign`
-/// refuse loud, because a partial writer must neither serve a volume with
-/// no appender nor preempt a peer's claim.
+/// Rung 6 — **a peer-assigned volume NOTHING claims is ADMITTED, degraded**
+/// (the cold-start correction to §5.1.1's `Peer` column).
+///
+/// "Never adopt on silence" (KD-PV-3) forbids TAKING a volume this node is
+/// not assigned. It never required refusing to mount because a peer has
+/// not started yet — and reading it that way made an assigned set
+/// **unmountable by construction**: at a cold fleet start NO volume carries
+/// a claim, so the set authority could not mount before its peers and the
+/// peers could not mount before it (the arm was symmetric, so the deadlock
+/// was total). The verdict here is the one `docs/operations.md`'s own
+/// bring-up recipe already documents: admit, never adopt, and let the ship
+/// path refuse loud until the owner arrives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rung_6_refuses_a_peer_volume_that_is_unclaimed_stale_or_claimed_by_a_stranger() {
-    // Nothing claims the peer-assigned volume: its owner is dead, was
-    // never started, or the assignment is stale.
-    let mut req = partial_request();
-    at(&mut req, VOL_SLOT0).standing = ClaimStanding::Reclaimable;
-    at(&mut req, VOL_SLOT0).claim = None;
-    at(&mut req, VOL_SLOT0).holder_member_id = None;
-    let err = pv::classify_set_admission(&req)
-        .expect_err("a volume with no appender is not servable")
-        .to_string();
+async fn rung_6_admits_a_peer_volume_with_no_live_appender_and_never_adopts_it() {
+    // The COLD SET AUTHORITY — the first node of the fleet, mounting in
+    // exactly the order operations.md prescribes. Its peer's volume is
+    // unclaimed because that peer has not mounted yet.
+    let mut req = set_authority_request();
+    *at(&mut req, VOL_A) = cold_peer_volume(VOL_A, PEER, false);
+    let admission = pv::classify_set_admission(&req).expect(
+        "a cold set authority must admit: refusing here makes the fleet's own bring-up order \
+         unsatisfiable",
+    );
     assert!(
-        err.contains("rung 6") && err.contains(PEER) && err.contains("get-owners"),
-        "the refusal names the rung, the assigned owner and the instrument: {err}"
+        admission.is_set_authority(),
+        "the slot-0 volume is still this mount's"
+    );
+    assert!(
+        matches!(
+            admission.mode_for(VOL_A),
+            Some(VolumeMode::Peer { owner_id, owner_endpoint })
+                if owner_id == PEER && owner_endpoint.is_empty()
+        ),
+        "the unclaimed volume stays the PEER's, with no resolved endpoint — the not-yet-up \
+         state, never an adoption: {:?}",
+        admission.mode_for(VOL_A)
+    );
+    assert_ne!(
+        admission.mode_for(VOL_A),
+        Some(&VolumeMode::Own),
+        "admitting a cold peer volume must never make this mount its appender"
     );
 
-    // TTL-stale: the assigned owner's claim aged out. A partial writer
-    // must NOT preempt it — that would make it the appender of a volume
-    // it is not assigned.
+    // A cold PARTIAL AUTHORITY: the set authority is up (rung 4 demands a
+    // live lease from it), and a THIRD owner's volume is unclaimed because
+    // that node has not mounted yet. Nothing orders the partials among
+    // themselves, so refusing here deadlocked every fleet of K ≥ 3.
+    let mut req = partial_request();
+    req.volumes.push(cold_peer_volume(VOL_B, THIRD, false));
+    let admission = pv::classify_set_admission(&req).expect("a cold partial authority admits");
+    assert_eq!(admission.mode_for(VOL_A), Some(&VolumeMode::Own));
+    assert!(matches!(
+        admission.mode_for(VOL_B),
+        Some(VolumeMode::Peer { owner_id, .. }) if owner_id == THIRD
+    ));
+
+    // A TTL-stale claim left by the volume's OWN assigned owner is the
+    // same degraded state read on a cross-host substrate (where no
+    // dead-pid proof exists): the owner is gone, nothing appends there,
+    // and this mount neither preempts the claim nor takes the volume.
     let mut req = partial_request();
     at(&mut req, VOL_SLOT0).standing = ClaimStanding::Stale;
-    let err = pv::classify_set_admission(&req)
-        .expect_err("never preempt a peer's claim")
-        .to_string();
-    assert!(
-        err.contains("rung 6") && err.contains(PEER),
-        "the refusal names the rung and the owner to restart: {err}"
-    );
+    let admission =
+        pv::classify_set_admission(&req).expect("a dead owner's stale claim admits, degraded");
+    assert!(matches!(
+        admission.mode_for(VOL_SLOT0),
+        Some(VolumeMode::Peer { owner_id, .. }) if owner_id == PEER
+    ));
+}
 
+/// Rung 6 — **assignment ∧ evidence on a PEER volume** (§5.1.1's `Peer`
+/// column): where a claim EXISTS it must agree with the assignment. A
+/// holder the assignment set does not name, and a holder that cannot be
+/// resolved at all, both refuse — fresh or TTL-stale — because each is a
+/// statement that SOMETHING appended to that volume which the record
+/// cannot account for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rung_6_refuses_a_peer_volume_whose_claim_disagrees_with_the_assignment() {
     // A live holder the assignment does not name: assignment ∧ evidence
     // DISAGREE, which is two appenders or an orphaned volume (§5.10).
     let mut req = partial_request();
@@ -722,6 +785,32 @@ async fn rung_6_refuses_a_peer_volume_that_is_unclaimed_stale_or_claimed_by_a_st
         .expect_err("an unresolvable holder is not evidence")
         .to_string();
     assert!(err.contains("rung 6"), "the refusal names its rung: {err}");
+
+    // The same over a TTL-STALE claim: age does not make an unattributable
+    // claim readable. A volume with NO claim admits (above); a volume with
+    // a claim nobody can name does not.
+    let mut req = partial_request();
+    at(&mut req, VOL_SLOT0).standing = ClaimStanding::Stale;
+    at(&mut req, VOL_SLOT0).holder_member_id = None;
+    let err = pv::classify_set_admission(&req)
+        .expect_err("a stale claim this mount cannot attribute is not silence — it is evidence")
+        .to_string();
+    assert!(
+        err.contains("rung 6") && err.contains(VOL_SLOT0),
+        "the refusal names its rung and the volume: {err}"
+    );
+
+    // And a stale claim held by a STRANGER: the disagreement arm, aged.
+    let mut req = partial_request();
+    at(&mut req, VOL_SLOT0).standing = ClaimStanding::Stale;
+    at(&mut req, VOL_SLOT0).holder_member_id = Some(THIRD.to_string());
+    let err = pv::classify_set_admission(&req)
+        .expect_err("an aged claim from a node the record does not entitle still disagrees")
+        .to_string();
+    assert!(
+        err.contains("rung 6") && err.contains(THIRD) && err.contains(PEER),
+        "the refusal prints BOTH identities: {err}"
+    );
 }
 
 /// Rung 6 + KD-PV-12 — the successor opt-in. A declared successor adopts

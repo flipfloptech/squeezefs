@@ -1,0 +1,6 @@
+pl-on-1    8.56     302      ship=3
+pub=50     place=0  redirects=0 verbs/entry=0.02
+local-1    5.31     486      local-S0
+local-2    1.57     1650     local-S0
+pl-on-2    1.59     1629     ship=2
+pub=48     place=0  redirects=0 verbs/entry=0.02

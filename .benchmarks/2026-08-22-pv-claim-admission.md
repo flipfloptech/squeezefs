@@ -511,6 +511,60 @@ Filled in as the run proceeds. Landed with this branch:
    so this is an operator hazard in the same class as
    operations.md's "an older binary does not refuse an assigned set", not a
    plane that failed. Worth a sentence in that section.
+6. **The first four bring-up attempts each found a product bug** (the
+   2026-08-23 fix chain, all red-first on `dev`; the fleet stands up end to
+   end as of `fe32bfe5`): the D0 flock refusing over udev's anonymous
+   change-event hold (`0b658904`), the membership owner refusing to arm
+   over its OWN era — the KD-PV-17 attestation raised `set.term` between
+   the gate and the arm's predecessor read (`e2f8362e`), the partial
+   authority's rung-5 device half DESTROYING the set authority's live WERO
+   through the shared association — rung-9 finding #1 resurfaced on the
+   PR 7b path (`306df1ef`), and the §6.7 grace window refusing the very
+   offline-enrolled member it was awaiting (`fe32bfe5`). Design doc revs
+   9–11 carry the correction boxes.
+7. **`pv_locate_gate.sh` merged stderr into the JSON stream** (fixed on
+   this rig, 2026-08-23): `locate_row` captured `--json` output with
+   `2>&1`, so the daemon's stderr diagnostics — the ENG-10
+   unregistered-knob announcements for the rig's own `SQZ_BIN` /
+   `SQZ_MWMATRIX_TAR_SRC`, and the VAL-7i PATH line — preceded the JSON
+   and the gate refused a VALID setup. The recipe itself exports
+   `SQZ_BIN`, so the cloud run would have hit it too. Streams stay
+   separate now; stderr is shown only in refusals.
+8. **The devsub's default data sizing cannot host the real-tree
+   instrument.** `SQZ_MWFLEET_OSS_GB=4` gives 1,024 four-MiB blocks per
+   data volume; the linux-6.14 `fs/` tree is 2,384 files, each occupying a
+   whole 4 MiB striped block at rest (≈ 9.3 GiB), and the allocation-lane
+   partition halves each volume's reachable supply per writer — the first
+   sized run ENOSPC'd mid-extraction (`alloc_lane_enospc_refusals` firing
+   honestly: lane exhausted with 0 foreign-lane free blocks). Gate (a)
+   needs `SQZ_MWFLEET_OSS_GB=32` (zram is virtual; the RAM cost is the
+   compressed payload only). The recipe's Step 2 must say so.
+9. **The 2026-08-23 gate-(a) attempt STOPPED at its trailing oracle —
+   C8 drift, the rung-9 finding-#6 class on the CLEAN path.** The measured
+   arms completed and the inversion happened (`verbs/entry 0.02`,
+   `redirects 0`, `ship` 2–3 per whole extraction; wall 5.08 s partial vs
+   3.44 s local = **1.48× of S0** against the ≤ 1.10× formal gate, vs the
+   6.73× baseline — the verdict names the charter's
+   honest-product-statement alternative), but the oracle reported **C8
+   durable block-reference drift** on ~100 blocks across both data
+   namespaces (`1 durable record vs 0 counted layout references`, stable
+   across both scan epochs) after the tar-x / rm -rf cycles, with
+   `fsck_findings == 0` in every live snapshot. This is the drift half of
+   `.benchmarks/2026-08-16-mw-s9-arm.md` finding **#6** (OPEN,
+   STOP-and-report: no era gate on the layout-publish verbs, no
+   idempotence witness for the publish class) — with the NEW datum that it
+   fires with **no fence and no zombie in the run at all**: a healthy
+   partial authority's extract/delete churn is enough, so the
+   lost-reply/duplicate-application half stands convicted independently of
+   the era-gate half. Per the counted-run law the campaign stops here: the
+   rows above are label-only, the fix belongs to the finding-#6
+   adjudication (design-mw-layout-versions / the orchestrator) with its
+   red-first cargo repro, and the acceptance run restarts from zero after
+   it lands. Evidence: `.benchmarks/rows-s10pl-1787503934-evidence/` (the
+   row directory: per-arm stats snapshots, table, verdict). A second
+   online `fsck` on the live authority could not even report the finding
+   list — "reply too large; use the offline probe" — its own small CLI
+   wart.
 
 ---
 

@@ -152,17 +152,31 @@ id_matches() { # actual expected
 
 # One `volume locate` answer, flattened to `owner<TAB>volume_id<TAB>ino`.
 # A locate that FAILS is the gate failing: the target must resolve.
+#
+# Streams stay SEPARATE (the first real --owners acceptance run, 2026-08-23):
+# stdout is the machine-readable answer; stderr carries the daemon's startup
+# diagnostics — the ENG-10 unregistered-knob announcements (the rig's own
+# SQZ_BIN / SQZ_MWMATRIX_TAR_SRC land there by design) and the VAL-7i PATH
+# line — and the merged `2>&1` form put those ahead of the JSON, failing the
+# gate on a VALID setup. Stderr is still shown, but only in refusals.
 locate_row() { # path -> owner \t volume_id \t ino
-    local p="$1" out rc=0
-    out="$("$SQZ" volume locate "$TARGET" "$p" --json 2>&1)" || rc=$?
-    [ "$rc" -eq 0 ] ||
+    local p="$1" out errf rc=0
+    errf="$(mktemp)"
+    out="$("$SQZ" volume locate "$TARGET" "$p" --json 2>"$errf")" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        local diag
+        diag="$(cat "$errf")"
+        rm -f "$errf"
         die "\`volume locate $TARGET $p\` failed — the extraction target must resolve before anything is timed:
-$out"
+$out
+$diag"
+    fi
+    rm -f "$errf"
     printf '%s' "$out" | python3 -c '
 import json, sys
 r = json.load(sys.stdin)
 print("%s\t%s\t%s" % (r.get("owner") or "", r.get("volume_id") or "?", r.get("ino") or "?"))' ||
-        die "\`volume locate $TARGET $p --json\` did not answer JSON:
+        die "\`volume locate $TARGET $p --json\` did not answer JSON on stdout:
 $out"
 }
 

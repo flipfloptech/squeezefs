@@ -1,0 +1,3 @@
+gate: partial-authority 5.08s vs local 3.44s -> 1.48x of S0 (gate <= 1.10x): GATE NOT MET
+baseline this replaces: the S10 co-writer row's 6.73x -> 4.56x better
+the honest product statement governs (the charter's alternative): docs/operations.md #Metadata function shipping + docs/rc-manifest.md carry the measured number

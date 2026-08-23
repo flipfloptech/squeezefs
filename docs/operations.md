@@ -124,7 +124,7 @@ The v3 metadata engine is single-writer by construction, and the mount enforces 
 | File-backed volume shared cross-host (NFS et al.), or containers with private `/dev` nodes | **Unsupported for concurrent-mount protection** — single-host operation of such volumes remains fully guarded by flock (former) / PR-if-available (latter) |
 | **Co-writer mount** (`SQUEEZEFS_MULTI_WRITER=1` + `SQUEEZEFS_MW_ROLE=co-writer`, admitted by the five-rung ladder) | **A second write-capable mount, admitted — and the first row in this table that is** (DLM S9; guarantee class `co-writer`). It is NOT a second *appender*: it takes no `flock`, writes no `writer_claim`, registers no key on the metadata namespaces and spawns no checkpoint task, and its metadata write gate refuses every LOCAL commit — every metadata mutation is **shipped** to the authority, whose ladder above runs unchanged. Its DATA writes are its own, admitted only under a custody lease that authority granted. **What ENFORCES it:** on a PR substrate the authority's rtype-1 Write Exclusive on the metadata namespaces means a co-writer *on another host* is device-blocked from writing metadata at all, and the rtype-3 WERO hold on the data namespaces means a preempted co-writer's DMA is rejected by the namespace; which bytes each co-writer may write is the authority's custody arbitration. **What only DETECTS:** the durable claim-set enrollment and the membership census (they answer *who is attached* and mint the dead epoch a failure is quarantined under — they stop nothing by themselves), and — the honest residual — a co-writer sharing a HOST with its authority is inside the same PR host identity, so nothing device-side distinguishes them: on that shape the metadata read-only half is enforced by this mount's own code, not by the device. **What an operator must have configured:** every rung of the ladder, listed in [Multi-writer co-writer mounts](#multi-writer-co-writer-mounts-dlm-stage-s9). Volumes formatted since the rung-10b Phase-B flip pass rung 2 by default (the format stamps the nine capability bits); pre-flip sets and `--single-writer` formats upgrade offline with `squeezefs volume enable-multi-writer` |
 | **Set-authority mount** (`SQUEEZEFS_MULTI_WRITER=1` + `SQUEEZEFS_MW_ROLE=set-authority`, on a set with per-volume owners assigned — see [Per-volume metadata owners](#per-volume-metadata-owners-squeezefs-volume-set-owners)) | **The classic writer row, on a SUBSET of the set.** On the volumes it owns — which include the one hosting the filesystem root — every guarantee above is unchanged, byte for byte: `flock`, `writer_claim`, the reservation where the namespace supports one, the fresh-foreign refusal, the recovery ladder. On the volumes a **peer** owns it takes none of the three (guarantee class `peer-owned` in `writer_guard_mode`) and every metadata mutation there is shipped to that peer, whose own row in this table is the guarantee. **What makes it safe:** the volume it does not claim is one the durable assignment says it must not append to, and a mount whose assignment and live evidence disagree is refused at open, not reconciled |
-| **Partial-authority mount** (`SQUEEZEFS_MULTI_WRITER=1` + `SQUEEZEFS_MW_ROLE=partial-authority`) — **its arming path is not landed yet: such a mount refuses today, naming the set authority** | **The same row for a node that does not own the root's volume.** Identical per-volume guarantees — full writer on its own volumes, `peer-owned` on the rest — with the set-singular planes belonging to the set authority instead: allocation-lane assignment, the custody endpoint, the freed-offset grace ring, maintenance coordination. **What it costs beyond the set authority's row:** the sole-owner in-place small-overwrite path is not available to it (a lifetime ownership retire is durable ownership state), so isolated small overwrites take the copy-on-write path; and terminal frees are shipped to the set authority rather than performed locally. **Ownership does not fail over** — if this node dies, the volumes it owns have no appender and every other mount refuses until an operator re-assigns them offline |
+| **Partial-authority mount** (`SQUEEZEFS_MULTI_WRITER=1` + `SQUEEZEFS_MW_ROLE=partial-authority`) — **the ladder, the open and the arm are landed and the mount path selects the posture; no fleet acceptance run has been published for it yet** | **The same row for a node that does not own the root's volume.** Identical per-volume guarantees — full writer on its own volumes, `peer-owned` on the rest — with the set-singular planes belonging to the set authority instead: allocation-lane assignment, the custody endpoint, the freed-offset grace ring, maintenance coordination. **What it costs beyond the set authority's row:** the sole-owner in-place small-overwrite path is not available to it (a lifetime ownership retire is durable ownership state), so isolated small overwrites take the copy-on-write path; and terminal frees are shipped to the set authority rather than performed locally. **Ownership does not fail over** — if this node dies, the volumes it owns have no appender, so its subtree stops (every verb about it refuses at the ship site, loudly and counted) while the rest of the set keeps serving; the repair is an offline re-assignment |
 | **Read-only mount** (`-o ro` / `--read-only`, any substrate) | **Not a writer, and not an obstacle to one** — guarantee class `reader`. A read-only mount takes NO `flock`, writes NO `writer_claim` and registers NO PR key, so (a) it is admitted while a writer holds the volume — including a *fresh foreign* claim, which refuses a write mount — (b) it never refuses a write mount, in either mount order, and (c) it changes nothing about the rows above: a second WRITER is still refused by exactly the same ladder. It mutates no plane (metadata, block allocation, frees, device reclaim, in-place patch/overwrite are all refused) and the kernel mounts it `MS_RDONLY`. Its *consistency* guarantee — which is a separate question from exclusion — is in [Read-only coherent mounts](#read-only-coherent-mounts--o-ro--one-writer-plus-n-readers) |
 
 **What DLM S9 changed, and what it did not.** Every row above except the
@@ -1771,11 +1771,17 @@ SQUEEZEFS_MW_ROLE=partial-authority squeezefs mount sqmeta://<dev0>,<dev1> /mnt/
    port moves on every restart, so peers would keep dialling a dead address
    until their own next remount.
 3. **The set authority learns its peers a moment after they arrive.** It
-   derives its ownership map before any peer exists (see 1), so its entries
-   for them carry no endpoint until each peer publishes one. It fills them in
-   on its membership renewal cadence; until then a verb about that peer's
-   volume refuses loudly at the ship site rather than guessing. Expect a short
-   window of such refusals during bring-up, and none afterwards.
+   mounts before any peer exists (see 1), so at that instant NOTHING claims
+   the peer-owned volumes: it admits them **degraded** — it never appends to
+   them and never takes their claims — and its entries for them carry no
+   endpoint until each peer publishes one. It fills them in on its membership
+   renewal cadence; until then a verb about that peer's volume refuses loudly
+   at the ship site rather than guessing. Expect a short window of such
+   refusals during bring-up, and none afterwards. The degraded state is
+   readable while it lasts: `peer_volume_unclaimed_admits` on the mount that
+   came up early, and the gauge `meta_ship.volumes_peer_unclaimed`
+   (`volumes_peer_owned` minus it is how many of the set's other owners were
+   present when the map was derived — a remount re-reads it).
 4. **Verify before you use it.** On every node: `mount_posture` reads
    `set-authority` or `partial-authority`, `meta_ship.armed` is `true`,
    `meta_ship.not_owner_refusals` and `meta_ship.owner_panics` are 0, and
@@ -1786,8 +1792,8 @@ SQUEEZEFS_MW_ROLE=partial-authority squeezefs mount sqmeta://<dev0>,<dev1> /mnt/
 5. **Take the fleet down in reverse**: partial authorities first, the set
    authority last. A partial authority whose set authority has gone loses its
    custody lease and self-fences at its own deadline; the volumes it owned then
-   have no appender and every mount of the set refuses until it returns
-   ([ownership does not fail over](#ownership-does-not-fail-over)).
+   have no appender, so its subtree stops while the rest of the set keeps
+   serving ([ownership does not fail over](#ownership-does-not-fail-over)).
 
 #### The namespace becomes owner-partitioned — read this before assigning
 
@@ -1827,15 +1833,26 @@ name per root — the root's own name).
 
 #### Ownership does not fail over
 
-**If a node that owns volumes dies, those volumes have no appender, and every
-other node's mount refuses at open rather than serving a set with a hole.** The
-failure is immediate and visible (`peer_volume_unclaimed_refusals`, and
-`squeezefs volume get-owners` prints the drift in words), and the repair is an
-**offline verb requiring every node unmounted** — a fleet-wide maintenance
-window. Compared with a single authority, where the next mount simply reclaims
-a dead holder's claim, this is an availability regression of the same order as
-the throughput gain: failure probability grows with the number of owners while
-recovery goes from "restart it" to "schedule an outage".
+**If a node that owns volumes dies, those volumes have no appender: its
+subtree stops, and the rest of the set keeps serving.** Every verb about a
+volume whose owner is absent refuses loudly at the ship site; every other node
+still mounts, admitting that volume **degraded** — no node ever takes a claim
+it was not assigned. The failure is immediate and visible
+(`peer_volume_unclaimed_admits` and the `meta_ship.volumes_peer_unclaimed`
+gauge at each mount, plus `squeezefs volume get-owners`, which prints the
+drift in words), and the repair is an **offline verb requiring every node
+unmounted** — a fleet-wide maintenance window. Compared with a single
+authority, where the next mount simply reclaims a dead holder's claim, this is
+an availability regression of the same order as the throughput gain: failure
+probability grows with the number of owners while recovery goes from "restart
+it" to "schedule an outage".
+
+What still **refuses** a mount is a peer-owned volume whose `writer_claim`
+cannot be reconciled with the assignment — a claim no holder attestation
+names, or one naming a node the record does not entitle. That is not an absent
+owner; it is something appending to a volume the set cannot account for, and
+it counts on `peer_volume_unclaimed_refusals`. Verify the holder is gone and
+run `squeezefs claim clear <sqmeta-uri>`, or re-assign offline.
 
 The bounded opt-in is a **declared successor**: `vol-…=<owner>+<successor>`
 records an ordered adoption candidate. A successor may take the volume only

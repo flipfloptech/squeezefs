@@ -445,11 +445,48 @@ proving fleet).**
 | Mode | `Reclaimable` | `FreshForeign` / `PeerAuthority` | `StaleForeign` |
 |---|---|---|---|
 | **`Own`** | proceed — full D0 ladder, unchanged | `FreshForeign` ⇒ refuse (unchanged); `PeerAuthority` unreachable (the admission does not name a peer for this volume) | unchanged (PR preempt, or the non-PR attestation refusal) |
-| **`Peer`** | **REFUSE the open, loud** — the assignment names a peer as owner but nothing claims the volume (its owner is dead, was never started, or the assignment is stale). This mount is not the assignee, so it must not take the claim; and it must not serve over a volume with no appender. The refusal names the assigned owner, the absent claim, and `squeezefs volume get-owners`. Counter `peer_volume_unclaimed_refusals` | `PeerAuthority` ⇒ proceed with the peer-mode open (this is the admitted path). A `FreshForeign` here means `recognizes` rejected the live holder — i.e. the claim's id ≠ the record's `owner` — which is the §5.10 fail-closed refusal | **REFUSE the open, loud** — the assigned owner's claim is TTL-stale. A partial writer must never preempt a peer's claim (preempting would make it the appender of a volume it is not assigned). Same refusal text, distinguished by the stale age; the remedy is to start the owner, or reassign offline |
+| **`Peer`** | **PROCEED, DEGRADED** *(corrected — see below)* — nothing claims the volume, so nothing appends to it: its owner has not started yet (every volume of a cold fleet reads exactly this) or it is down. The open already takes no lock, writes no claim and appends nowhere, so admitting adopts nothing. It is announced loudly and counted (`peer_volume_unclaimed_admits`, gauge `meta_ship.volumes_peer_unclaimed`), and every verb about that volume refuses at the ship site until its owner arrives | `PeerAuthority` ⇒ proceed with the peer-mode open (this is the admitted path). A `FreshForeign` here means `recognizes` rejected the live holder — i.e. the claim's id ≠ the record's `owner` — which is the §5.10 fail-closed refusal | **ATTRIBUTABLE to the admitted holder ⇒ proceed, DEGRADED** (the same absent-owner state read where no dead-pid proof exists — admitting is not preempting: nothing here takes the claim). **Otherwise REFUSE the open, loud**: a TTL-stale claim that attributes to nobody, or to a node the record does not entitle, says something appended here that the assignment cannot account for. Counter `peer_volume_unclaimed_refusals`; the remedy is `squeezefs claim clear` or an offline re-assignment |
 
-Both `Peer`-mode refusals are **fail-closed and fleet-visible**: the mount
-does not come up, so the operator learns immediately rather than through a
-half-served set. They are the operational face of Issue 9's posture (§5.7.1).
+> **CORRECTION (rev 8 — the cold-start deadlock, found by the first real
+> fleet bring-up).** Rev 2–7's `Peer`+`Reclaimable` row was **unsatisfiable
+> by construction** and made the whole program unusable: `sudo
+> tests/mw_fleet.sh create N=1 --owners=2` formats, assigns and then mounts
+> the set authority first exactly as `docs/operations.md` prescribes, and
+> the mount is refused at rung 6 because the peer's volume carries no
+> claim. At a cold fleet start **no volume carries a claim** — the arm was
+> symmetric, so the set authority could not mount before its peers and no
+> peer could mount before it. Every PR 7b contract armed through
+> `arm_partial_authority` or hand-built its evidence, so the suite was green
+> over a product no node could start.
+>
+> The rule KD-PV-3 states is *never adopt on silence*, which forbids TAKING
+> a volume this node is not assigned. It does not require refusing to mount
+> because a peer has not started, and the two were conflated. The corrected
+> law is one sentence, applied identically at all three sites (rung 6, the
+> peer door, the map derivation): **where a peer volume HAS a claim it must
+> agree with the assignment; where it has NONE, nothing appends there — so
+> admit, adopt nothing, and let the ship path refuse.** The `StaleForeign`
+> row moves with it because it is the same state read on a substrate with no
+> dead-pid proof (a cross-host dead owner), and admitting as a peer is not
+> preempting; what still refuses there is an unattributable claim, since age
+> never makes one readable.
+>
+> **The availability argument, which is the whole of it:** refusing the
+> mount because one owner is down takes the ENTIRE namespace down over a
+> single degraded subtree, while admitting degrades only that owner's
+> subtree and does so loudly. §5.7.1 / R13 already ship *"ownership does not
+> fail over"* as a known availability regression — this makes the blast
+> radius match that statement instead of exceeding it. Contracts:
+> `rung_6_admits_a_peer_volume_with_no_live_appender_and_never_adopts_it`,
+> `a_peer_owned_volume_with_no_live_claim_opens_degraded`,
+> `an_assigned_volume_no_node_claims_derives_a_degraded_peer_entry`, and the
+> end-to-end `a_cold_assigned_set_comes_up_through_the_mount_paths_own_reads`.
+
+The remaining `Peer`-mode refusals are **fail-closed and fleet-visible**:
+the mount does not come up, so the operator learns immediately rather than
+through a half-served set. They are the operational face of Issue 9's
+posture (§5.7.1) — narrowed, by the correction above, to the volumes whose
+evidence the assignment cannot account for.
 
 **Layer A and Layer B1 become per-volume**, decided by the mode vector:
 
@@ -622,7 +659,7 @@ The ladder is `src/cowriter.rs:734-775` **extended, never forked**.
 | **3** durable enrollment | `:550-596` | per volume, plus: a volume this node will own must name it as `owner` (or list it in `successors`, KD-PV-12); a peer-owned volume's `owner` must be a `Writer` member. `owner == None` on one volume of a set where another names one ⇒ **refuse loud** (the incomplete-assignment shape the marker also covers) |
 | **4** live authority | `:600-660` — `max` over every volume's claim term | **per volume**, because terms diverge per owner. The membership authority's term is compared against the **slot-0 volume's** claim term (D20); each peer-owned volume's own claim term is learned/refused independently through `era_relearns`. **CORRECTION (PR 3): this row describes only the PARTIAL-authority arm.** A set authority *is* the membership owner under D20, so demanding a granted lease of it makes the posture unreachable — it requires none, and refuses only on a **provably foreign** live membership owner (a non-empty `owner_claim_id` that is not this node; a legacy empty value proves nothing and must not refuse) |
 | **5** device registrant | `:675-720` | unchanged in substance; the WERO hold is joined, never forked (`data_custody::acquire_wero:774-790`) |
-| **6** *(new)* ownership coherence | — | **assignment ∧ evidence per volume**, per §5.1.1's complete table. An own-mode volume must classify `Reclaimable`, **or `StaleForeign` on a PR substrate where the D0 ladder's preempt would grant it** (rev 3, Issue 24: rev 2's text said `Reclaimable` only, which was narrower than both §5.1.1's `Own`/`StaleForeign` cell and KD-PV-12 clause (ii), and would have made the successor opt-in unusable). A peer-mode volume must classify `PeerAuthority` with the live holder's id **in that volume's assignment set** (`owner` ∪ `successors`, §5.10). Anything else refuses (never adopts) |
+| **6** *(new)* ownership coherence | — | **assignment ∧ evidence per volume**, per §5.1.1's complete table. An own-mode volume must classify `Reclaimable`, **or `StaleForeign` on a PR substrate where the D0 ladder's preempt would grant it** (rev 3, Issue 24: rev 2's text said `Reclaimable` only, which was narrower than both §5.1.1's `Own`/`StaleForeign` cell and KD-PV-12 clause (ii), and would have made the successor opt-in unusable). A peer-mode volume that CARRIES a claim must resolve its holder to a durable id **in that volume's assignment set** (`owner` ∪ `successors`, §5.10) — fresh or TTL-stale alike; anything else refuses (never adopts). **A peer-mode volume with NO claim is admitted DEGRADED** (rev 8's cold-start correction — nothing appends there, so there is nothing to disagree with and nothing is taken) |
 | **7** *(new)* the freeze precondition | — | **every peer-owned volume's projected `claim_set` must carry an `owner`.** This is what §5.9 rests on and it is self-certifying: a monotone projection that shows the assignment record shows every commit that preceded it on that volume (§5.9.2). Refuse if any peer volume's projection predates its own assignment |
 
 **Three more PR 3 corrections to this section.** (a) The **verdict vector is
@@ -1306,14 +1343,18 @@ node id restarting can use it.
 **The default posture, stated plainly and put in the guarantee table:**
 
 > **Ownership does not fail over.** If a partial authority dies, the volumes
-> it owns have no appender. Every other node's mount **refuses at open**
-> (§5.1.1's `Peer`+`Reclaimable`/`StaleForeign` rows) rather than serving a
-> set with a hole, so the failure is immediate and visible. The repair is
-> `squeezefs volume set-owners`, an **offline** verb requiring every node
-> unmounted — a fleet-wide maintenance window. Failure probability scales
-> with K while MTTR goes from "the next mount reclaims" to "schedule an
-> outage". Compared with today's single authority, this is an **availability
-> regression of the same order as the throughput gain** (risk R13, S2).
+> it owns have no appender: **that owner's subtree stops** — every verb about
+> it refuses loud at the ship site — while the rest of the set keeps serving,
+> and every other node still MOUNTS (§5.1.1's rev-8 correction; the degraded
+> state is announced at admission, at the open and as
+> `meta_ship.volumes_peer_unclaimed`, so the failure stays immediate and
+> visible). The repair is `squeezefs volume set-owners`, an **offline** verb
+> requiring every node unmounted — a fleet-wide maintenance window. Failure
+> probability scales with K while MTTR goes from "the next mount reclaims" to
+> "schedule an outage". Compared with today's single authority, this is an
+> **availability regression of the same order as the throughput gain** (risk
+> R13, S2) — bounded, since rev 8, to the dead owner's own subtree rather
+> than to the whole namespace.
 
 **KD-PV-12 — the bounded, still-static opt-in.** `claim_set.successors:
 Vec<String>` (ordered, empty by default, written by the same offline verb).
@@ -1784,7 +1825,13 @@ flowchart LR
   `a_successor_adoption_does_not_poison_peers_map_entries`.
 - **Never adopt on silence.** Ownership moves because an operator ran the
   verb (D19), or because a declared successor's D0 ladder granted it
-  (KD-PV-12) — never because a node is slow.
+  (KD-PV-12) — never because a node is slow. **That is a rule about
+  TAKING, not about mounting** (rev 8): a volume nothing appends to keeps
+  its assigned owner's entry, with whatever endpoint resolves, and this
+  mount neither claims it nor appends to it. The derivation reads the D0
+  gate's `ClaimStanding` rather than `claim.is_some()` for exactly this,
+  because a claim from a holder this boot proved dead is not an appender
+  and the ladder and the peer door both admit that volume.
 
 > **CORRECTIONS (PR 5 implementation, rev 6).**
 >
@@ -1820,6 +1867,19 @@ flowchart LR
 >    `owner` is `None` — but a future projection that ever carried one must
 >    not read as an assignment, so the derivation filters on `durable`
 >    before reading `owner`.
+>
+> **CORRECTION 6 (rev 8 — the cold-start deadlock).** The derivation's
+> *"nothing claims it ⇒ refuse — a set with a hole"* row was the third face
+> of §5.1.1's unsatisfiable arm (the ladder and the peer door were the other
+> two), so fixing either alone still left the mount refused. It now installs
+> the **assigned owner's** entry, DEGRADED, and counts it
+> (`meta_ship.volumes_peer_unclaimed`); the endpoint is resolved if the
+> record published one and left empty otherwise, which is PR 7b's existing
+> not-yet-up path — loud ship refusals plus `refresh_peer_endpoints`. One
+> unclaimed shape still refuses: a volume assigned to **this node** that
+> this mount did not open `Own`, because a peer entry naming ourselves would
+> ship every verb to our own endpoint, and taking the claim here would be an
+> adoption outside the D0 ladder.
 
 Loom: the map swap is the `PlacementTable` `ArcSwapOption` precedent; the new
 lock-free object is the poison latch's interaction with the per-lane term
@@ -2237,7 +2297,7 @@ guarantee-class regression · **S3** = performance / operability.
 | **R10** | Reader coherence + free grace across owners | S1 → **resolved structurally** | §5.11: the bound is a per-volume number plus two tripwires (not a max), the gauge is un-gated; the free-grace ring is **singular by construction** because all terminal frees ship — pinned by `free_grace_deferrals == 0` on partial authorities. The `Grant` wire change is withdrawn |
 | **R11** | Tripwire semantics change meaning | S3 (silent rot) | §11.2, published with the mechanism |
 | **R12** | **The SOLO RE-GATE LAW** — this program touches the SHIPPED D0 mount path | **S1/S2** | `the_fresh_foreign_refusal_is_byte_identical_for_an_undeclared_mount`; `PeerAuthority` structurally unreachable without a `SetAdmission`; every rung re-runs the solo re-gate |
-| **R13** | **Ownership does not fail over.** A dead partial authority's volumes have no appender; every other node refuses at open; the repair is an offline verb requiring a fleet-wide maintenance window. Failure probability scales with K while MTTR goes from "next mount reclaims" to "schedule an outage" | **S2** | §5.7.1: the posture is **stated** in `docs/operations.md`'s guarantee table (PR 7) with its operational cost, the refusals are loud and immediate (§5.1.1's `Peer` rows), and **KD-PV-12** offers the bounded static opt-in (`successors` + the unchanged D0 ladder as arbiter). Counters `owner_adoptions` / `owner_adoption_refusals` |
+| **R13** *(bounded in rev 8)* | **Ownership does not fail over.** A dead partial authority's volumes have no appender, so ITS SUBTREE stops (verbs about it refuse at the ship site); the repair is an offline verb requiring a fleet-wide maintenance window. Failure probability scales with K while MTTR goes from "next mount reclaims" to "schedule an outage" | **S2** | §5.7.1: the posture is **stated** in `docs/operations.md`'s guarantee table (PR 7) with its operational cost, the degradation is loud and immediate (§5.1.1's `Peer` rows + `peer_volume_unclaimed_admits` / `meta_ship.volumes_peer_unclaimed`), and **KD-PV-12** offers the bounded static opt-in (`successors` + the unchanged D0 ladder as arbiter). Counters `owner_adoptions` / `owner_adoption_refusals`. **Rev 8 removed the amplification**: refusing every mount over one absent owner took the whole namespace down and — since a cold fleet has no claims anywhere — made an assigned set unmountable by any node |
 | **R14** | **K−1 nodes lose the W1 sole-owner extent patch** (a lifetime incarnation retire is durable ownership state; the §5.1 fence is process-local and no wire composes it). On a product whose terminal requirement is performance, this is a real regression on partial authorities' isolated small overwrites | **S3** | §5.1.3: **priced** by a PR 8 rand-4k row (partial authority vs set authority vs single-authority today, all labeled), **instrumented** by `patch_ineligible_*` + `cowriter_accounting_refusals`, and **filed** as a named residual. Not recoverable inside this program |
 | **R16** | **The inversion does not happen unless a node OWNS A SUBTREE.** M2 + the disarmed migration half pin every ino to its parent's owner, and every ino descends from root, so a set assigned without subtree roots gives K−1 nodes empty volumes and reproduces the 6.73× baseline | **S2** (the program fails its purpose) | §5.5.1 / KD-PV-15: the assignment verb mints each owner's subtree root on the volume it assigns; `subtree_roots_minted` and the verb's loud warning make an unrooted assignment visible at the moment it is made; §5.13 makes the setup an explicit gate precondition asserted by `volume locate`; §5.5.2 states the resulting namespace posture |
 | **R17** | **The inode plane covers 1/K of the set.** KD-PV-7's owned-volume scoping composed with KD-PV-14's single coordinator leaves peer-owned volumes unevaluated online, and PR 6's findings gate would pass trivially | **S1** (a detector that covers nothing) | §5.8.1 / KD-PV-16: per-owner detection shards over the existing job wire; `fsck_inode_plane_volumes_covered == volume_count` asserted; a missing shard makes the pass INCOMPLETE, never narrower |
@@ -2345,7 +2405,9 @@ viability answer before any posture is built.
 | `writer_guard_mode` | per volume | gains **`peer-owned`**. A partial authority shows a MIX; uniform `peer-owned` means the node owns nothing and should be a co-writer |
 | `volumes_owned` / `volumes_peer_owned` | `meta_ship` | the partition at a glance; `volumes_owned == 0` on a partial-authority mount is refused by the ladder |
 | **`peer_volume_local_commit_refusals`** | top level | **MUST STAY 0** — an un-routed daemon surface committed locally on a peer-owned volume. Distinct from `cowriter_local_commit_refusals` |
-| **`peer_volume_unclaimed_refusals`** | top level | mount-open refusals because an assigned peer owner is not claiming (§5.1.1). **Nonzero = a dead owner and a fleet-wide stop** (R13's operational face) |
+| **`peer_volume_unclaimed_refusals`** *(narrowed in rev 8)* | top level | mount-open refusals on a peer-owned volume whose CLAIM cannot be reconciled with the assignment: a TTL-stale claim attributing to nobody, or to a node the record does not entitle (§5.1.1). Something appended there the record cannot account for; the remedy is `squeezefs claim clear` or an offline re-assignment. A volume with NO claim is no longer this class |
+| **`peer_volume_unclaimed_admits`** *(new in rev 8)* | top level | peer-owned volumes ADMITTED with no appender — their owner has not started yet (every volume of a cold fleet) or is down. **Not a tripwire**: it is the number of subtrees this mount came up DEGRADED over. Nonzero once the fleet is fully up means an owner never arrived — read it with `squeezefs volume get-owners` |
+| **`volumes_peer_unclaimed`** *(new in rev 8)* | `meta_ship` | the same state as a GAUGE, derived when the map was derived: `volumes_peer_owned` minus it is how many of the set's other owners were present ("K owners, J of them present"). It is a derivation-time reading — a remount re-reads it — and the live signal beside it is the ship-site refusal rate |
 | **`owner_map_poisoned_volumes`** | `meta_ship` | **MUST STAY 0** (§5.10) |
 | **`xv_cross_owner_intents`** | top level | **MUST STAY 0** — reachable-by-bug since rev 2; the M1 pre-check is what keeps it 0 |
 | `owner_adoptions` / `owner_adoption_refusals` | `meta_ship` | KD-PV-12; `owner_adoptions` **expected 0** on a healthy fleet |
@@ -2410,7 +2472,8 @@ and — on a partial authority — the W1-patch and free-shipping posture (R14).
 | `partial-authority` on a set with no owners assigned | rung 3 refusal naming `squeezefs volume set-owners` |
 | `partial-authority` on a set where this node owns nothing | rung 3 refusal: mount as `co-writer` |
 | `set-authority` on a node that does not own the slot-0 volume | rung 6 refusal naming the real set authority |
-| a peer-owned volume with **no** live claim, or a stale one | **mount refused** (§5.1.1) — R13's visible face |
+| a peer-owned volume with **no** live claim (or a stale one its own owner left) | **mounts, DEGRADED** (§5.1.1's rev-8 correction) — that owner's subtree refuses at the ship site, loudly and counted; R13's visible face, bounded to one subtree |
+| a peer-owned volume whose claim attributes to nobody, or to a node the record does not entitle | **mount refused** (§5.1.1) — the divergence itself, fresh or aged |
 | any writable mount while `owner_assign:` exists | refused, naming the idempotent re-run |
 | a peer volume whose projection predates its own assignment | rung 7 refusal |
 | non-PR substrate | rung 5 refusal (unchanged S9 law) |
@@ -2497,7 +2560,7 @@ single-authority mount.
 |---|---|---|
 | **KD-PV-1** | **Ownership granularity is the VOLUME; the appender count per volume stays exactly ONE.** | The durable single-appender structures are what make bit 8 necessary for intra-volume sharing, and the node-cache third gate state does not exist. Volume grain needs **no format change**, which is why the whole runtime plane already speaks it |
 | **KD-PV-2** | **Per-volume `claim_set.owner`, not a set-wide table.** | One record per volume cannot disagree with itself; a table elevates R5's cache divergence into durable state. The atomicity it buys is worthless under D19, and the `owner_assign:` bracket is the `mw_upgrade:` mechanism verbatim |
-| **KD-PV-3** | **The `OwnerMap` is DERIVED from assignment ∧ evidence (∧ PR) — refuse at admission, poison at runtime, never adopt on silence.** | Two peers with different maps is two appenders or an orphaned volume. A derived map cannot be edited into disagreement |
+| **KD-PV-3** *(clarified in rev 8)* | **The `OwnerMap` is DERIVED from assignment ∧ evidence (∧ PR) — refuse at admission, poison at runtime, never adopt on silence.** *"Never adopt on silence" is a rule about **taking** a volume, not about mounting beside an absent owner*: where a peer volume HAS a claim it must agree with the assignment (a stranger, or a holder nothing attests, refuses); where it has NONE, nothing appends there, so the volume keeps its assigned owner's entry, DEGRADED — admitted, never adopted, with its verbs refusing loud at the ship site | Two peers with different maps is two appenders or an orphaned volume. A derived map cannot be edited into disagreement. The clarification is not a weakening: it removes a refusal that was **unsatisfiable by construction** (at a cold fleet start no volume carries a claim, so no node could mount an assigned set at all — §5.1.1's rev-8 correction) and whose blast radius exceeded the product's own stated one (R13: one absent owner degrades ONE subtree, not the namespace) |
 | **KD-PV-4** | **The offline verb writes ownership AND pid-less roster enrollment in one bracket**, and deletes stale rendezvous records. | Live enrollment is inherently two-party; D19's offline verb is momentarily the sole authority. The **pid-less** form is required so the rung-8 same-boot prune (which exempts it) cannot manufacture an assignment-vs-enrollment disagreement on the single-node proving fleet |
 | **KD-PV-5** *(rewritten in rev 2)* | **TWO postures, not one.** `set-authority` keeps `MountPosture::Writer`'s data plane byte-identically; `partial-authority` latches `CO_WRITER`. A new additive `PARTIAL_META` latch is read only by `mount_posture()` and the per-volume metadata gate; every data-plane consumer is unedited. `ReadOnlyCause::PeerOwnedVolume` is distinct from `CoWriterMount` | A blanket co-writer latch would leave a fleet with **no** node performing the W1 patch, the ownership recovery walk or direct reclaim — `plane_gate`'s own comment states the production assumption it would break. Splitting the posture keeps the S9 latch discipline (no meaning change at ~40 sites) and makes R14's cost explicit instead of accidental |
 | **KD-PV-6** | **Slot 0 is non-migratable while a multi-owner plane is armed**; the SET AUTHORITY is the owner of the volume hosting slot 0. | D20 says "volume 0"; the code's invariant is ino 1 → slot 0 → `slot_to_volume[0]`. A refusal makes the derivation total without adding a mechanism |

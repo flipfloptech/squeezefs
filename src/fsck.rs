@@ -3781,6 +3781,13 @@ async fn recheck_suspects(
     // Phase C: per-suspect final verification.
     static EMPTY: once_cell::sync::Lazy<HashMap<u64, u32>> =
         once_cell::sync::Lazy::new(HashMap::new);
+    // C8's fresh comparison, computed ONCE for the whole confirm pass
+    // (the drift-gauge law, 2026-08-23): the per-suspect re-run paid one
+    // full layout walk PER SUSPECT — 1,147 walks on the leg that found
+    // this — and each raw pass used to feed the must-stay-0 gauge with
+    // its transients. One pass judges every C8 suspect against one
+    // consistent view.
+    let mut c8_fresh: Option<Vec<(String, u64, u32, u32)>> = None;
     for s in pending {
         if opts.cancel.load(Ordering::Relaxed) {
             break;
@@ -3888,33 +3895,41 @@ async fn recheck_suspects(
                 durable,
                 derived,
             } => {
-                // Verify-before-report (KD-9): re-run the comparison and
-                // keep the finding only if THIS block still disagrees. The
-                // ledger and the layout ride one journal entry, so a
-                // transient disagreement is not a shape this can produce —
-                // the re-check is the zero-FP discipline, not a settle
-                // window.
-                let fresh = ctx
-                    .router
-                    .backend_router
-                    .verify_durable_block_refs(&ctx.meta)
-                    .await
-                    .unwrap_or_default();
+                // Verify-before-report (KD-9): re-run the comparison ONCE
+                // per confirm pass (memoized above) and keep the finding
+                // only if THIS block still disagrees in it. A CONFIRMED
+                // finding is what feeds the must-stay-0
+                // `meta_kv_block_refs_drift` tripwire — the raw comparison
+                // observes and convicts nothing (the drift-gauge law).
+                if c8_fresh.is_none() {
+                    c8_fresh = Some(
+                        ctx.router
+                            .backend_router
+                            .verify_durable_block_refs(&ctx.meta)
+                            .await
+                            .unwrap_or_default(),
+                    );
+                }
+                let fresh = c8_fresh.as_deref().unwrap_or(&[]);
                 let chunk = ctx.router.backend_router.default_allocator.chunk_size();
                 let idx = offset / chunk.max(1);
                 fresh
                     .iter()
                     .any(|(v, i, _, _)| v == vol && *i == idx)
-                    .then(|| FsckFinding {
-                        class: "C8".to_string(),
-                        object: format!("{vol}:{offset}"),
-                        evidence: format!(
-                            "durable block-reference drift: {durable} durable record(s)                              vs {derived} counted layout reference(s), stable across                              both scan epochs — the durable ledger and the layouts that                              justify it diverged"
-                        ),
-                        identity: Some(FindingId::C8DurableRefDrift {
-                            vol: vol.clone(),
-                            offset: *offset,
-                        }),
+                    .then(|| {
+                        crate::meta_backend::kv::META_KV_BLOCK_REFS_DRIFT
+                            .fetch_add(1, Ordering::Relaxed);
+                        FsckFinding {
+                            class: "C8".to_string(),
+                            object: format!("{vol}:{offset}"),
+                            evidence: format!(
+                                "durable block-reference drift: {durable} durable record(s)                              vs {derived} counted layout reference(s), stable across                              both scan epochs — the durable ledger and the layouts that                              justify it diverged"
+                            ),
+                            identity: Some(FindingId::C8DurableRefDrift {
+                                vol: vol.clone(),
+                                offset: *offset,
+                            }),
+                        }
                     })
             }
             SuspectKind::C6Drift { vol, .. } => {

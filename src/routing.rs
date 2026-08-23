@@ -2958,8 +2958,17 @@ impl BackendRouter {
             }
         }
         if !drift.is_empty() {
-            crate::meta_backend::kv::META_KV_BLOCK_REFS_DRIFT
-                .fetch_add(drift.len() as u64, Ordering::Relaxed);
+            // OBSERVE, never convict (the drift-gauge feeding law,
+            // 2026-08-23): this comparison legitimately sees the
+            // mid-reclaim window on a LIVE volume (a corpse's references
+            // released while its record destroy is a commit behind), and
+            // fsck's suspect/confirm passes call it repeatedly — feeding
+            // `meta_kv_block_refs_drift` from here turned a healthy
+            // tar-x/rm fleet into drift=1147 while the same run's settled
+            // findings read 0. The must-stay-0 tripwire is fed by the
+            // VERDICT sites only: fsck's confirmed C8 findings, and the
+            // mount-init post-sweep verify (quiesced, so its observation
+            // IS a verdict).
             log::error!(
                 "DURABLE BLOCK-REFERENCE DRIFT: {} block(s) whose durable reference \
                  population disagrees with the layout walk — the ledger and the layouts \

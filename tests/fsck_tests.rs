@@ -771,7 +771,11 @@ async fn test_the_drift_gauge_counts_confirmed_findings_only() {
         .verify_durable_block_refs(&fx.meta)
         .await
         .expect("raw comparison");
-    assert_eq!(raw.len(), 2, "the frozen drift is visible to the comparison");
+    assert_eq!(
+        raw.len(),
+        2,
+        "the frozen drift is visible to the comparison"
+    );
     assert_eq!(
         META_KV_BLOCK_REFS_DRIFT.load(Ordering::Relaxed),
         before,

@@ -6344,10 +6344,18 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     Ok(drift) if drift.is_empty() => {
                         log::info!("durable-vs-derived block-reference verification: EXACT")
                     }
-                    Ok(drift) => log::error!(
-                        "durable-vs-derived block-reference verification found {}                          drifting block(s) — run `squeezefs fsck` (class C8)",
-                        drift.len()
-                    ),
+                    Ok(drift) => {
+                        // Mount init is quiesced (nothing serves yet, the
+                        // corpse sweep already ran), so this observation
+                        // IS a verdict — one of the gauge's two feeding
+                        // sites (the other: fsck's confirmed C8 findings).
+                        squeezefs::meta_backend::kv::META_KV_BLOCK_REFS_DRIFT
+                            .fetch_add(drift.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                        log::error!(
+                            "durable-vs-derived block-reference verification found {}                              drifting block(s) — run `squeezefs fsck` (class C8)",
+                            drift.len()
+                        )
+                    }
                     Err(e) => log::error!("block-reference verification failed: {e}"),
                 }
             }

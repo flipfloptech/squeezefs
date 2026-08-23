@@ -437,6 +437,26 @@ decision exists ("declared, never inferred", `src/cowriter.rs:41-49`).
 > own volume with no peer involved, and it is read only when a peer volume
 > carries a FRESH claim — which by definition means its owner is up.
 
+> **CORRECTION (rev 11 — the grace window refused the member it was
+> awaiting, found by the fourth real fleet bring-up, 2026-08-23).** The set
+> authority's arm opens the §6.7 failover grace window over the claim set's
+> OTHER writers — which under a per-volume assignment includes members
+> enrolled OFFLINE by `volume set-owners` that have never held a lease. The
+> window's fresh-acquire refusal was identity-blind (`reclaim =
+> prior_epoch.is_some()`; the `expected` set was consulted only to close
+> the window early), so the partial authority's FIRST-EVER join — no epoch
+> to present — was refused as a conflicting stranger for the whole 45 s
+> bound, rung 4 refused the mount, and the window could never close early
+> because its awaited member could never join. Fix, red-first
+> (`tests/dlm_membership_tests.rs`): an EXPECTED member's join IS the
+> re-assertion the window awaits (`grace_expects`, the roster's
+> `member_id_matches` grammar in both directions — a bare-node expected
+> entry matches a slotted client id), admitted and counted as a reclaim,
+> with `note_reclaim` retiring expected entries by the same grammar.
+> Strangers stay refused; an epoch-less join was always granted freely
+> outside the window, so admitting the awaited member inside it weakens
+> nothing.
+
 > **CORRECTION (rev 10 — the partial authority's device half destroyed the
 > live fence, found by the third real fleet bring-up, 2026-08-23).** Rung 5's
 > device half in `gather_set_admission` called `join_wero_as_registrant`
@@ -2651,6 +2671,14 @@ the unconditional M1 correctness fix; 5 = live via the test constructor
 only). **6 and 7 parallelize off 5**, except that 7's guarantee rows want 6's
 fsck posture settled. **8 gates on both 6 and 7.** **9 gates on 0 plus a
 ruling** and shares no files with 3–8.
+
+**Revision log — rev 11 (2026-08-23)** records the fourth real-fleet
+bring-up catch: the §6.7 grace window's identity-blind fresh-acquire
+refusal turned the offline-enrolled partial authority's first-ever join —
+the very re-assertion the window was awaiting — into a refused stranger,
+wedging every `--owners` bring-up for the full grace bound (the §5.1.1
+box's rev-11 correction). `MembershipOwner::join` now admits an expected
+member's join as the awaited re-assertion, epoch or not.
 
 **Revision log — rev 10 (2026-08-23)** records the third real-fleet bring-up
 catch: rung 5's device half registered unconditionally, so a co-located

@@ -1482,7 +1482,17 @@ impl MembershipOwner {
             };
         }
         let now = self.clock.now_ms();
-        let reclaim = req.prior_epoch.is_some();
+        // A re-assertion is EITHER a presented prior lease epoch OR a join
+        // by a member the window itself EXPECTS (the mw_fleet --owners
+        // finding, 2026-08-23): the expected set is the predecessor's
+        // durable evidence — under a per-volume assignment that includes
+        // members enrolled OFFLINE by `volume set-owners` whose first-ever
+        // join has no epoch to present. Refusing the very member the
+        // window logs "awaiting re-assertion from" wedges the bring-up for
+        // the whole grace bound (the window can never close early: its
+        // awaited member cannot join), and protects nothing — an
+        // epoch-less join is granted freely outside the window.
+        let reclaim = req.prior_epoch.is_some() || self.grace_expects(&req.id);
         if self.grace_active() && !reclaim {
             METRICS
                 .membership_grace_refusals
@@ -1951,12 +1961,34 @@ impl MembershipOwner {
             .unwrap_or(0)
     }
 
+    /// `true` ⇔ an open grace window names `id` among the prior members it
+    /// awaits — by the roster's [`member_id_matches`] grammar (both
+    /// directions: an expected bare-node entry matches a slotted client id
+    /// and vice versa), because `expected` comes from claim-set writer
+    /// entries, which carry either form.
+    fn grace_expects(&self, id: &str) -> bool {
+        let guard = self.grace.lock();
+        let Some(g) = guard.as_ref() else {
+            return false;
+        };
+        if self.clock.now_ms() >= g.until_ms {
+            return false; // expired: `grace_active` reaps it on its next read
+        }
+        g.expected
+            .iter()
+            .any(|e| member_id_matches(e, id) || member_id_matches(id, e))
+    }
+
     fn note_reclaim(&self, id: &str) {
         let mut guard = self.grace.lock();
         let Some(g) = guard.as_mut() else {
             return;
         };
-        g.expected.remove(id);
+        // The same matching grammar `grace_expects` reads by: an exact
+        // remove would strand a bare-node expected entry that a slotted
+        // client id just re-asserted.
+        g.expected
+            .retain(|e| !(member_id_matches(e, id) || member_id_matches(id, e)));
         if g.expected.is_empty() {
             log::info!(
                 "membership owner '{}': every prior member has re-asserted — grace window \

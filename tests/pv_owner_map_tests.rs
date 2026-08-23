@@ -608,6 +608,61 @@ async fn an_assigned_volume_no_node_claims_derives_a_degraded_peer_entry() {
     shutdown(&routed).await;
 }
 
+/// Two absent owners are TWO peers, not one. `peers()` is what the fsck
+/// inode-plane fan-out dispatches over, what
+/// `reader_staleness_bound_owners` counts and what the arm line names, and
+/// every one of them keys on the durable id — so deduping by ENDPOINT
+/// collapsed two owners whose endpoints are both unresolved into a single
+/// entry, and a collapsed owner is a shard nobody dispatches. Unreachable
+/// before the cold-start correction (a set with one absent owner refused
+/// outright); reachable on every three-owner fleet's first mount now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_owners_that_have_not_published_an_endpoint_stay_two_peers() {
+    let dir = TempDir::new().unwrap();
+    let vols = volume_set(dir.path(), "twoabsent", 3).await;
+    let routed = squeezefs::meta_backend::open_routed_meta_set(&uris(&vols))
+        .await
+        .expect("write mount (the slot map's source)");
+
+    let map = owners::derive_owner_map_from(
+        &routed,
+        NODE,
+        &[
+            ownership(
+                "vol-a",
+                Some(assigned_set(NODE, None, None, &[])),
+                None,
+                true,
+            ),
+            ownership(
+                "vol-b",
+                Some(assigned_set(PEER, None, None, &[])),
+                None,
+                false,
+            ),
+            ownership(
+                "vol-c",
+                Some(assigned_set(STRANGER, None, None, &[])),
+                None,
+                false,
+            ),
+        ],
+        &|_| None,
+    )
+    .expect("a cold three-owner set derives");
+    assert_eq!(map.unclaimed_count(), 2);
+    let peers: Vec<String> = map.peers().iter().map(|p| p.peer_id.clone()).collect();
+    assert_eq!(
+        peers.len(),
+        2,
+        "two absent owners collapsed into one entry: {peers:?}"
+    );
+    assert!(peers.contains(&PEER.to_string()) && peers.contains(&STRANGER.to_string()));
+    assert_eq!(map.volumes_owned_by(PEER), vec![1]);
+    assert_eq!(map.volumes_owned_by(STRANGER), vec![2]);
+    shutdown(&routed).await;
+}
+
 /// The one unclaimed shape that still REFUSES: a volume assigned to **this
 /// node** that this mount did not open `Own`. Installing a peer entry
 /// naming ourselves would ship every verb about it to our own endpoint,

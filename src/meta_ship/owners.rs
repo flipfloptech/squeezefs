@@ -241,10 +241,22 @@ impl OwnerMap {
     }
 
     /// Distinct peers named by this map.
+    ///
+    /// Distinct by durable **identity**, not by endpoint: every consumer
+    /// asks *which owners are there* and keys on `peer_id` (the fsck
+    /// inode-plane fan-out dispatches per owner, `reader_staleness_bound_owners`
+    /// counts them, the arm log names them). Deduping by endpoint
+    /// collapsed two owners whose endpoints are both UNRESOLVED into one —
+    /// reachable whenever more than one owner has not published yet, which
+    /// is a three-owner fleet's cold start — and a collapsed owner is a
+    /// shard never dispatched.
     pub fn peers(&self) -> Vec<Arc<PeerOwner>> {
         let mut out: Vec<Arc<PeerOwner>> = Vec::new();
         for peer in self.volume_owners.iter().flatten() {
-            if !out.iter().any(|p| p.endpoint == peer.endpoint) {
+            if !out
+                .iter()
+                .any(|p| member_id_matches(&p.peer_id, &peer.peer_id))
+            {
                 out.push(Arc::clone(peer));
             }
         }

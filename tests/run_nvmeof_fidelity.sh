@@ -1338,8 +1338,9 @@ leg_g2_spdk() {
         { bad "G2S: format"; return; }
     # Settle udev before mounting: format's write-then-close fires a change
     # uevent and systemd-udevd holds a BSD flock on the node while probing
-    # (BLOCK_DEVICE_LOCKING) — a mount racing that probe trips the guard's
-    # Layer-A flock as a phantom "another process holds the writer lock".
+    # (BLOCK_DEVICE_LOCKING). The guard's anonymous-holder arm waits such
+    # claim-less transients out bounded; settling keeps the timing rows
+    # from absorbing that wait (determinism polish, not correctness).
     udevadm settle --timeout=10 2>/dev/null || true
     RUST_LOG=info "$FIDELI_BIN" --log-file "$dlog" mount "sqmeta://$dev_m" "$mnt" \
         --daemon --allow-other >> "$out" 2>&1

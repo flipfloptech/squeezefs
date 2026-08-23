@@ -55,7 +55,8 @@ run_one() { # cell binary_label binary rep threads bs size_per_thread sync shim
     echo "=== $tag"
     "$bin" format "$META" "$DATA" --force >>"$RESULTS/$tag.log" 2>&1 || { echo "format FAILED"; exit 1; }
     # Post-format, udevd's change-event probe holds its own BSD flock on
-    # the device node briefly; the D0 writer guard refuses while it does.
+    # the device node briefly; the D0 writer guard waits that claim-less
+    # transient out bounded — settling just keeps the bracket deterministic.
     udevadm settle --timeout=10 2>/dev/null || true
     local mount_flags=(--daemon --allow-others --log-file "$RESULTS/$tag.daemon.log")
     [ "$shim" = shim ] && mount_flags+=(-o interception)

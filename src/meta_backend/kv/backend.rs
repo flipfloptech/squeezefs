@@ -1045,27 +1045,50 @@ impl KvMetaBackend {
             Ok(fd) => fd,
             Err(FlockOutcome::Held) => {
                 let holder = Self::probe_claim_best_effort(path).await;
-                // Teardown-race absorption (2026-07-26): `drop`-without-
-                // `shutdown` releases the flock only when the LAST Arc
-                // dies, and the detached checkpoint / times-drain /
-                // conveyor pass tasks each pin an upgraded Arc for the
-                // duration of one pass — so an instant SAME-PROCESS
-                // reopen (remount paths, crash-equivalent drop→reopen)
-                // can find the flock held by a holder that is provably
-                // in teardown. When the on-volume claim names THIS
-                // process (pid + boot), wait the release out bounded; a
-                // genuinely live same-process double mount never
-                // releases and still refuses at the bound. Foreign
-                // holders (any other pid/boot) never wait.
-                match Self::await_same_process_teardown_flock(path, &holder).await {
+                // Transient-holder absorption (the three waitable arms —
+                // see `await_transient_flock_release`): a SAME-PROCESS
+                // teardown pin (2026-07-26 — `drop`-without-`shutdown`
+                // releases the flock only when the LAST Arc dies, and the
+                // detached checkpoint / times-drain / conveyor pass tasks
+                // each pin an upgraded Arc for one pass), a dead same-host
+                // holder under a transient probe (rung-9 finding #5), or
+                // an ANONYMOUS claim-less holder (udev's change-event
+                // flock — the mw_fleet --owners finding). A live FOREIGN
+                // claimed holder never waits; a live same-process double
+                // mount waits once and still refuses at the bound.
+                match Self::await_transient_flock_release(path, &holder).await {
                     Some(fd) => fd,
                     None => {
-                        return Err(KvError::Busy(format!(
-                            "{}: another squeezefs process holds the writer lock{} — concurrent \
-                             mounts of one metadata volume are refused (single-writer guard)",
-                            path.display(),
-                            holder_suffix(&holder),
-                        )));
+                        // A claim-less first probe re-probes once: a
+                        // concurrent mount that won the flock inside its
+                        // pre-claim window has committed its claim by now,
+                        // and the refusal should name it, never guess.
+                        let holder = if holder.is_some() {
+                            holder
+                        } else {
+                            Self::probe_claim_best_effort(path).await
+                        };
+                        return Err(KvError::Busy(if holder.is_some() {
+                            format!(
+                                "{}: another squeezefs process holds the writer lock{} — \
+                                 concurrent mounts of one metadata volume are refused \
+                                 (single-writer guard)",
+                                path.display(),
+                                holder_suffix(&holder),
+                            )
+                        } else {
+                            format!(
+                                "{}: the writer lock is held by a process that left no \
+                                 on-volume writer_claim and did not release within {}s — \
+                                 squeezefs writers commit their claim within milliseconds \
+                                 of taking the lock, so the holder is an external flock on \
+                                 the device node (udevd's change-event probe releases \
+                                 quickly; this one did not). Concurrent mounts of one \
+                                 metadata volume are refused (single-writer guard)",
+                                path.display(),
+                                TRANSIENT_FLOCK_WAIT.as_secs(),
+                            )
+                        }));
                     }
                 }
             }
@@ -3742,6 +3765,14 @@ enum FlockOutcome {
     Io(std::io::Error),
 }
 
+/// The bounded window [`KvMetaBackend::await_transient_flock_release`]
+/// polls a transient flock holder for before falling back to the loud
+/// refusal. Generous vs. the ms-grade shapes it absorbs (one checkpoint /
+/// conveyor pass pin, a udev change-event re-probe, a released `LOCK_SH`
+/// classification probe); a genuinely live holder pays it once before the
+/// refusal.
+const TRANSIENT_FLOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Why a mounted volume withholds mutations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadOnlyCause {
@@ -4001,42 +4032,69 @@ impl KvMetaBackend {
         SharedProbe::NoLocalExclusiveHolder
     }
 
-    /// Layer A teardown-race absorption (2026-07-26; pinned by
-    /// `tests/mount_writer_guard_tests.rs::
-    /// test_reopen_waits_out_same_process_teardown_pin`): when the flock
-    /// holder's claim names THIS process (pid + boot) — a backend whose
-    /// last external `Arc` was dropped but whose struct is still pinned
-    /// by a mid-pass background task, OR a genuinely live same-process
-    /// double mount — poll the flock for a bounded window. A dying
-    /// holder frees it within one pass (ms-grade); a live one never does
-    /// and the caller falls back to the loud refusal. Returns the
-    /// acquired guard fd, or `None` (refuse) on any other holder, an
-    /// absent/unreadable claim, or bound expiry.
-    async fn await_same_process_teardown_flock(
+    /// Layer A transient-holder absorption: poll the flock for a bounded
+    /// window ([`TRANSIENT_FLOCK_WAIT`]) when the holder is provably or
+    /// plausibly transient; refuse instantly otherwise. The three waitable
+    /// arms, each pinned in `tests/mount_writer_guard_tests.rs`:
+    ///
+    /// 1. **Same-process teardown pin** (2026-07-26;
+    ///    `test_reopen_waits_out_same_process_teardown_pin`): the claim
+    ///    names THIS process (pid + boot) — a backend whose last external
+    ///    `Arc` was dropped but whose struct is still pinned by a mid-pass
+    ///    background task, or a genuinely live same-process double mount.
+    ///    A dying holder frees it within one pass (ms-grade); a live one
+    ///    never does and the caller falls back to the loud refusal.
+    /// 2. **Dead same-host holder under a transient probe** (rung-9
+    ///    finding #5, documented at its arm below).
+    /// 3. **Anonymous holder — no claim at all** (the mw_fleet `--owners`
+    ///    finding, 2026-08-23; documented at its arm below): udev's
+    ///    change-event flock and released-by-contract probes, which no
+    ///    squeezefs record can ever name.
+    ///
+    /// Returns the acquired guard fd, or `None` (refuse) on a live/foreign
+    /// claimed holder or bound expiry.
+    async fn await_transient_flock_release(
         path: &Path,
         holder: &Option<(WriterClaim, u64)>,
     ) -> Option<std::fs::File> {
-        /// Generous vs. the ms-grade pin (one checkpoint/conveyor pass);
-        /// a live same-process holder pays it once before the refusal.
-        const TEARDOWN_FLOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
         const POLL: std::time::Duration = std::time::Duration::from_millis(5);
 
-        let (claim, _) = holder.as_ref()?;
-        let same_process = claim.pid == std::process::id() && claim.boot == read_boot_id();
-        // Rung-9 finding #5 (the S8-b E2 leg, live): a successor mounting
-        // over a PROVABLY-DEAD same-host holder can meet a *transient*
-        // `LOCK_SH` at its one-shot NB acquire — a reader's / co-writer's
-        // released-immediately mount probe (5 rejoining co-writers hammer
-        // them while the authority is dark). The dead holder cannot own
-        // the flock and SH probes release by contract, so this shape gets
-        // the SAME bounded wait-out as the same-process teardown race. A
-        // LIVE same-boot holder and every foreign-boot claim still refuse
-        // instantly (unchanged posture).
-        let dead_same_host = claim.boot == read_boot_id() && pid_provably_dead(claim.pid);
-        if !same_process && !dead_same_host {
-            return None; // live/foreign holder: refuse instantly (unchanged posture)
+        let waitable = match holder {
+            Some((claim, _)) => {
+                let same_process = claim.pid == std::process::id() && claim.boot == read_boot_id();
+                // Rung-9 finding #5 (the S8-b E2 leg, live): a successor
+                // mounting over a PROVABLY-DEAD same-host holder can meet a
+                // *transient* `LOCK_SH` at its one-shot NB acquire — a
+                // reader's / co-writer's released-immediately mount probe
+                // (5 rejoining co-writers hammer them while the authority
+                // is dark). The dead holder cannot own the flock and SH
+                // probes release by contract, so this shape gets the SAME
+                // bounded wait-out as the same-process teardown race. A
+                // LIVE same-boot holder and every foreign-boot claim still
+                // refuse instantly (unchanged posture).
+                let dead_same_host = claim.boot == read_boot_id() && pid_provably_dead(claim.pid);
+                same_process || dead_same_host
+            }
+            // The mw_fleet --owners finding (2026-08-23): a held flock with
+            // NO on-volume claim is an ANONYMOUS holder — udevd's
+            // BLOCK_DEVICE_LOCKING change-event probe (the kernel
+            // synthesizes a `change` uevent on every write-close of the
+            // node, and udevd flocks it while re-probing), a reader's /
+            // co-writer's released-by-contract `LOCK_SH` probe, or a
+            // concurrent mount still inside its pre-claim window. The
+            // first two release in milliseconds; the third commits its
+            // claim (the volume's first post-replay mutation) and keeps
+            // holding — the bound expiry refuses it, and the caller
+            // re-probes so the refusal names it. A live squeezefs writer
+            // is never claim-less past its pre-claim window, so instant
+            // refusal here attributed udev's lock to a squeezefs process
+            // that did not exist.
+            None => true,
+        };
+        if !waitable {
+            return None; // live/foreign claimed holder: refuse instantly
         }
-        let deadline = std::time::Instant::now() + TEARDOWN_FLOCK_WAIT;
+        let deadline = std::time::Instant::now() + TRANSIENT_FLOCK_WAIT;
         loop {
             match Self::acquire_writer_flock(path) {
                 Ok(fd) => return Some(fd),

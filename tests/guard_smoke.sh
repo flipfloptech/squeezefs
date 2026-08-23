@@ -160,8 +160,10 @@ mount_it() {
     # Drain the udev queue first: our own wipe/format write-then-close fires
     # a `change` uevent, and systemd-udevd holds a BSD flock on the block
     # node while re-probing it (systemd BLOCK_DEVICE_LOCKING) — colliding
-    # with the guard's Layer-A LOCK_EX|LOCK_NB and refusing the mount as
-    # "another squeezefs process holds the writer lock". Settling is causal
+    # with the guard's Layer-A LOCK_EX|LOCK_NB. The guard now waits such
+    # claim-less transient holders out bounded (the anonymous-holder arm),
+    # so this settle is determinism polish, not correctness: it keeps the
+    # matrix's timing rows from absorbing a ~ms wait-out. Settling is causal
     # (never a retry that could mask a REAL double-mount refusal).
     udevadm settle --timeout=10 2>/dev/null || true
     RUST_LOG=info run "$SQZ" --log-file "$DLOG" mount "sqmeta://$META" "$MNT" --daemon --allow-other

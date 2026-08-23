@@ -4545,7 +4545,7 @@ pub fn hold_staging_root_lock(dir: &Path) -> Result<()> {
 /// meet its OWN root held by a holder that is milliseconds from gone. A
 /// dying holder frees the flock within one poll pass; a genuinely live
 /// co-located collision never does and pays the bound ONCE before the
-/// unchanged loud refusal (the `await_same_process_teardown_flock`
+/// unchanged loud refusal (the `await_transient_flock_release`
 /// posture, applied to the staging plane — the lock file carries no
 /// holder claim, and every holder of a mount's OWN root is same-mount-
 /// point class, so the bound applies to all of them). Used ONLY for the

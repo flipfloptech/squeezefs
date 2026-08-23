@@ -178,7 +178,7 @@ Two rows go the other way and are reported honestly in the note: seq write 1 MiB
 >
 > (The script only *emits* the unit — installing it is your choice.)
 
-> **Scripted format→mount flows:** after `squeezefs format` closes a block device, udevd's change-event probe briefly holds an exclusive `flock` on the node, which the single-writer mount guard correctly refuses ("another squeezefs process holds the writer lock" names the wrong holder — the lock is udev's). Interactive use never notices; back-to-back scripts should run `udevadm settle` between format and mount.
+> **Scripted format→mount flows:** after `squeezefs format` (or any verb that write-closes a block device) the kernel synthesizes a `change` uevent, and udevd's re-probe briefly holds an exclusive `flock` on the node. The single-writer mount guard **waits such anonymous transient holders out** (bounded, ~2 s): a held lock with no on-volume `writer_claim` cannot be a live squeezefs writer, so the mount polls until the probe releases instead of refusing. A holder that outlives the wait still refuses loudly — naming the claim when one exists, or the anonymous no-`writer_claim` shape when none does. `udevadm settle` between format and mount is no longer required (it remains a harmless way to keep scripted bring-up deterministic).
 
 ---
 

@@ -5720,6 +5720,12 @@ pub struct Metrics {
     /// tail (KD-4.6) and the paced drain engaged under foreground.
     /// ≈ 0 on stores with fresh headroom.
     pub block_free_debt_pressure_drains: Align64<AtomicU64>,
+    /// Debt-drainer passes (one per inner-loop sweep over the targets) —
+    /// the drainer's pacing instrument (finding 12, 2026-08-23: a fully
+    /// grace-held backlog spun this at ~5,000/s on an IDLE daemon,
+    /// holding the box at 88 °C). Bounded growth at idle is the law: a
+    /// pass that reclaims nothing must tick coarsely, never loop hot.
+    pub block_free_debt_drain_passes: Align64<AtomicU64>,
     /// Seed-time memset bytes elided by §5.3 coverage tracking: for every
     /// Fresh accumulation buffer reaching content-validity, the block size
     /// minus the complement bytes actually zeroed. Sequential fills elide
@@ -9855,6 +9861,7 @@ impl SqueezefsFilesystem {
                 "block_free_trim_discards": METRICS.block_free_trim_discards.load(Ordering::Relaxed),
                 "block_free_trim_bytes": METRICS.block_free_trim_bytes.load(Ordering::Relaxed),
                 "block_free_debt_pressure_drains": METRICS.block_free_debt_pressure_drains.load(Ordering::Relaxed),
+                "block_free_debt_drain_passes": METRICS.block_free_debt_drain_passes.load(Ordering::Relaxed),
                 // RW1 rand-write device-byte ledger (design-random-small-
                 // writes §1.2 buckets; always-on — the G-RW2 gate's
                 // attribution source).

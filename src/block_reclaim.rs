@@ -351,6 +351,9 @@ impl DebtDrainer {
                     if d.reclaim.fence_halted() {
                         return; // fenced: destructive commands cease permanently
                     }
+                    METRICS
+                        .block_free_debt_drain_passes
+                        .fetch_add(1, Ordering::Relaxed);
                     let targets = d.targets_snapshot();
                     let mut outstanding = 0u64;
                     let mut drained_any = false;

@@ -439,3 +439,117 @@ async fn fenced_daemon_never_trims() {
     assert_eq!(trim_blocks() - t0, 0);
     assert_eq!(punches() - p0, 0);
 }
+
+// ---------------------------------------------------------------------------
+// Contract 8 — a fully GRACE-HELD backlog paces the drainer (finding 12,
+// 2026-08-23): with the freed-offset grace plane armed, every elided
+// offset is held OUT of the free list until readers acknowledge, so the
+// drainer's trim claims all lose and `take_debt_batch` correctly filters
+// every candidate. The shipped loop counted "a batch ran" as progress and
+// looped hot — ~5,000 empty passes/s of blocking-pool churn on an IDLE
+// set authority, holding the box at 85–88 °C and tripping the acceptance
+// rig's quiet-box gate. The law: a pass that reclaims nothing ticks
+// coarsely (never a hot loop); grace releases ride allocation demand and
+// the next tick sees them.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fully_grace_held_backlog_paces_the_drainer() {
+    use squeezefs::membership::{
+        self, JoinOutcome, JoinRequest, LeaseClock, LeaseClocks, MemberRole, MembershipOwner,
+    };
+    let _g = serial().await;
+    let _l = LeverGuard;
+    squeezefs::block_reclaim::set_discard_elision(true);
+    squeezefs::block_reclaim::set_elision_class_all(true);
+
+    // Arm the freed-offset grace plane in-process (the
+    // reader_free_grace_tests fixture shape): an installed OWNER plus one
+    // member that acknowledges nothing, so the bound stays 0 and every
+    // deferred offset is held for the whole test.
+    struct GraceGuard;
+    impl Drop for GraceGuard {
+        fn drop(&mut self) {
+            squeezefs::free_grace::reset_for_test();
+            membership::uninstall();
+        }
+    }
+    squeezefs::free_grace::reset_for_test();
+    membership::uninstall();
+    let _grace = GraceGuard;
+    let ticks = Arc::new(std::sync::atomic::AtomicU64::new(10_000));
+    let clock = LeaseClock::manual(Arc::clone(&ticks));
+    let clocks = LeaseClocks::derive(std::time::Duration::from_micros(250))
+        .expect("the shipped derivation must be safe");
+    let owner = MembershipOwner::arm("drain-pace-owner", 3, 2, clocks, clock).expect("owner arms");
+    membership::install_owner(Arc::clone(&owner));
+    match owner.join(JoinRequest {
+        id: "drain-pace-member".to_string(),
+        role: MemberRole::Reader,
+        endpoint: None,
+        pid: std::process::id(),
+        boot: "boot-drain-pace".to_string(),
+        prior_epoch: None,
+        pr_key: 0,
+        mount: None,
+    }) {
+        JoinOutcome::Granted(_) => {}
+        other => panic!("member join must be granted: {other:?}"),
+    }
+    squeezefs::free_grace::arm_owner_plane(LeaseClock::manual(Arc::clone(&ticks)), owner.clocks())
+        .expect("the derived bound is safe");
+    owner.refresh_free_grace_bound();
+    assert!(
+        squeezefs::free_grace::armed(),
+        "the plane must be armed for the holds to exist"
+    );
+
+    let (router, ba, _b, _s) = make_router().await;
+    // A CONSTANT foreground signal (the inverse of `pin_foreground`): the
+    // bug's arm is the IDLE posture, reached once the manners law's
+    // confirm horizon (IDLE_CONFIRM_TICKS × 50 ms = 1 s) sees a stable
+    // signal — the deferred arm before it already ticks at 50 ms by
+    // design.
+    router
+        .backend_router
+        .set_reclaim_foreground_signal(Arc::new(|| 0));
+
+    // Terminal frees whose elided debt defers into grace: held out of the
+    // free list, unclaimable by the trim, un-taken by take_debt_batch.
+    for _ in 0..4 {
+        let offset = ba.allocate_block().await.expect("alloc");
+        ba.publish_block(offset);
+        router
+            .backend_router
+            .free_block(&offset.to_string())
+            .await
+            .expect("terminal free");
+    }
+    assert!(
+        squeezefs::free_grace::held_offsets() >= 4,
+        "the fixture is honest only if the frees are grace-held"
+    );
+    assert!(debt_gauge() > 0, "the elided debt is outstanding");
+
+    // The frees woke the drainer. Let the confirm horizon pass (1 s of
+    // stable signal), then measure a 1 s idle window: a paced drainer
+    // runs a bounded handful of passes there; the hot loop ran thousands
+    // per second.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let before = METRICS.block_free_debt_drain_passes.load(Ordering::Relaxed);
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    let passes = METRICS
+        .block_free_debt_drain_passes
+        .load(Ordering::Relaxed)
+        .saturating_sub(before);
+    assert!(
+        passes <= 25,
+        "an unclaimable (grace-held) backlog must tick coarsely, never \
+         loop hot: {passes} drainer passes in 1 s of idle"
+    );
+    assert!(
+        debt_gauge() > 0,
+        "the grace-held debt is still outstanding (nothing was lost to \
+         the pacing — the ledger stays honest)"
+    );
+}

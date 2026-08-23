@@ -5459,11 +5459,11 @@ pub struct Metrics {
     pub peer_volume_unclaimed_refusals: Align64<AtomicU64>,
     /// Peer-owned volumes ADMITTED with no appender: nothing claims them,
     /// so their owner has not started yet (every volume of a cold fleet)
-    /// or is down. Not a tripwire — it is the count of subtrees this mount
-    /// came up DEGRADED over, and the live state beside it is the
-    /// `meta_ship.volumes_peer_unclaimed` gauge. Nonzero after the fleet
-    /// is fully up means an owner never arrived (`squeezefs volume
-    /// get-owners` prints assignment beside evidence).
+    /// or is down. Not a tripwire — it is the number of subtrees this
+    /// mount came up DEGRADED over, and `meta_ship.volumes_peer_unclaimed`
+    /// is the same reading as a gauge. Both are mount-time facts, never
+    /// liveness: `squeezefs volume get-owners` answers who is appending
+    /// now.
     pub peer_volume_unclaimed_admits: Align64<AtomicU64>,
     /// Open cross-volume intents found at mount whose steps span two
     /// metadata OWNERS (§5.4a case (c)). **MUST STAY 0** — the M1

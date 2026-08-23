@@ -452,10 +452,13 @@ pub struct ShipStatsSnapshot {
     /// GAUGE (**must stay 0**): volumes whose ownership entry the runtime
     /// re-derivation POISONED — §5.10's fail-closed law engaging.
     pub owner_map_poisoned_volumes: u64,
-    /// GAUGE, **not a tripwire**: peer-owned volumes that had NO appender
-    /// when this mount derived its map — owners that have not started yet
-    /// (a cold fleet) or are down. `volumes_peer_owned` minus this is how
-    /// many of the set's other owners were present.
+    /// GAUGE, **not a tripwire and not a liveness monitor**: peer-owned
+    /// volumes that had NO appender when this mount DERIVED its map —
+    /// owners that had not started yet (a cold fleet) or were down.
+    /// `volumes_peer_owned` minus this is how many of the set's other
+    /// owners were present at that instant; the set authority mounts
+    /// first by the documented order, so it reports `K − 1` for the life
+    /// of the mount. `squeezefs volume get-owners` is the live instrument.
     pub volumes_peer_unclaimed: u64,
     /// The `volume set-owners` ledger (§11.1) — volume records written,
     /// invocations refused, and KD-PV-15 roots minted. All three are 0 on

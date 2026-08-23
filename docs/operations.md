@@ -1778,10 +1778,13 @@ SQUEEZEFS_MW_ROLE=partial-authority squeezefs mount sqmeta://<dev0>,<dev1> /mnt/
    renewal cadence; until then a verb about that peer's volume refuses loudly
    at the ship site rather than guessing. Expect a short window of such
    refusals during bring-up, and none afterwards. The degraded state is
-   readable while it lasts: `peer_volume_unclaimed_admits` on the mount that
-   came up early, and the gauge `meta_ship.volumes_peer_unclaimed`
-   (`volumes_peer_owned` minus it is how many of the set's other owners were
-   present when the map was derived — a remount re-reads it).
+   readable: `peer_volume_unclaimed_admits` and the gauge
+   `meta_ship.volumes_peer_unclaimed` — both **mount-time** readings, so the
+   set authority reports one per peer for the life of that mount (it derived
+   its map before any peer existed) and a peer mounting later reports only the
+   owners still missing. Neither is a liveness monitor: `squeezefs volume
+   get-owners` answers who is appending NOW, and it is what to read when a
+   ship-site refusal outlasts the bring-up window.
 4. **Verify before you use it.** On every node: `mount_posture` reads
    `set-authority` or `partial-authority`, `meta_ship.armed` is `true`,
    `meta_ship.not_owner_refusals` and `meta_ship.owner_panics` are 0, and

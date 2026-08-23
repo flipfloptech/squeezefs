@@ -304,14 +304,17 @@ impl OwnerMap {
     }
 
     /// The `volumes_peer_unclaimed` gauge: peer-owned volumes that NOTHING
-    /// appended to when this map was derived.
+    /// appended to when this map was DERIVED.
     ///
-    /// **Not a tripwire** — it is the honest name for a legitimate state
-    /// (an owner that has not started, or one that is down). Read it
-    /// against `volumes_peer_owned`: the difference is how many of this
-    /// set's other owners were present, and a nonzero value means those
-    /// subtrees' verbs refuse loud at the ship site until their owner
-    /// arrives.
+    /// **Not a tripwire, and not a liveness monitor** — it is the honest
+    /// name for a legitimate state (an owner that has not started, or one
+    /// that is down), read once, at the instant this mount derived its
+    /// map. On the documented bring-up order the SET AUTHORITY mounts
+    /// first, so it reports `K − 1` for the life of that mount by
+    /// construction; a peer mounting afterwards reports only the owners
+    /// still missing. The live drift instrument is `squeezefs volume
+    /// get-owners`, which reads the durable records at the moment it is
+    /// asked.
     pub fn unclaimed_count(&self) -> u64 {
         self.unclaimed.iter().filter(|u| **u).count() as u64
     }

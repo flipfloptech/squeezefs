@@ -99,7 +99,7 @@ use squeezefs::membership_wire::{
 use squeezefs::meta_backend::kv::backend::{
     xattr_name_allowed, KvMetaBackend, WriterClaim, WRITER_CLAIM_XATTR,
 };
-use squeezefs::meta_backend::kv::builder::{format_v3_single_writer, FormatV3Options};
+use squeezefs::meta_backend::kv::builder::{format_v3, format_v3_single_writer, FormatV3Options};
 use squeezefs::meta_backend::kv::superblock as sb;
 use squeezefs::meta_backend::kv::META_KV_JOURNAL_ENTRIES;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -176,6 +176,19 @@ fn manual_clock() -> (LeaseClock, Arc<AtomicU64>) {
 /// with a fixed observed RTT so the arithmetic is deterministic.
 fn shipped_clocks() -> LeaseClocks {
     LeaseClocks::derive(Duration::from_micros(250)).expect("the shipped derivation must be safe")
+}
+
+/// A writer `MemberIdentity` fixture (a foreign-boot roster entry — the
+/// rung-8 prune never touches it).
+fn ident(id: &str, key: u64) -> membership::MemberIdentity {
+    membership::MemberIdentity {
+        id: id.to_string(),
+        role: MemberRole::Writer,
+        pid: 7,
+        boot: "boot-test".into(),
+        endpoint: Some("10.0.0.7:7100".into()),
+        pr_key: key,
+    }
 }
 
 fn owner_with(clocks: LeaseClocks, clock: LeaseClock, term: u64) -> Arc<MembershipOwner> {
@@ -771,14 +784,6 @@ async fn claim_set_membership_upserts_and_withdraws_one_member_at_a_time() {
     let be = KvMetaBackend::open(plain.path())
         .await
         .expect("open volume");
-    let ident = |id: &str, key: u64| membership::MemberIdentity {
-        id: id.to_string(),
-        role: MemberRole::Writer,
-        pid: 7,
-        boot: "boot-test".into(),
-        endpoint: Some("10.0.0.7:7100".into()),
-        pr_key: key,
-    };
     assert!(
         !membership::upsert_writer_member(&be, &ident("w-1", 1), 4)
             .await
@@ -863,6 +868,198 @@ async fn claim_set_membership_upserts_and_withdraws_one_member_at_a_time() {
         "the record is deleted when the set empties"
     );
     be.shutdown().await.expect("clean shutdown");
+}
+
+/// The `mw_fleet --owners` set-authority remount refusal (2026-08-23),
+/// half 1 — **the KD-PV-17 holder attestation must not advance the claim
+/// set's era.** The partial open attests the holder with this mount's OWN
+/// new term (`crate::dlm::durable_term()`), and the shipped
+/// `set.term = set.term.max(term)` raised the record's era to it — which
+/// `arm_owner` then read back as "the predecessor's durable term" and
+/// refused ITSELF (`term 5 <= prior_term 5`), deterministically, on every
+/// `--owners` bring-up. KD-PV-17's own words: the attestation is "an
+/// attestation about ONE claim, verified against that claim" — it is not
+/// a membership change, and the era it would stamp is implicit in the
+/// claim it names.
+#[tokio::test]
+async fn a_holder_attestation_never_advances_the_claim_sets_era() {
+    let _serial = serial();
+    let meta = formatted_volume().await;
+    assert!(sb::set_claim_set_bit(meta.path())
+        .await
+        .expect("stamp bit 14 offline"));
+    let be = KvMetaBackend::open(meta.path()).await.expect("open volume");
+
+    // The set as `volume set-owners` leaves it: enrolled members, era 4.
+    assert!(membership::upsert_writer_member(&be, &ident("node-a", 0), 4)
+        .await
+        .expect("enroll"));
+    assert_eq!(ClaimSet::load(&be).await.expect("set").term, 4);
+
+    // The partial open's attestation, at this mount's own (newer) era.
+    assert!(
+        membership::publish_claim_holder(&be, "node-a", 9)
+            .await
+            .expect("attest"),
+        "the holder attestation writes"
+    );
+    let set = ClaimSet::load(&be).await.expect("set");
+    assert_eq!(
+        set.holder.as_ref().map(|h| h.id.as_str()),
+        Some("node-a"),
+        "the holder is attested"
+    );
+    assert_eq!(
+        set.term, 4,
+        "the attestation must not advance the set's era — the raised era is \
+         what arm_owner reads back as a phantom predecessor and refuses itself over"
+    );
+    be.shutdown().await.expect("clean shutdown");
+}
+
+/// A volume that carries **no durable claim set** takes no attestation:
+/// there is no assignment to resolve a holder against, and creating the
+/// record here would stamp this mount's own era into a fresh set — the
+/// same self-poison as half 1 through a different door.
+#[tokio::test]
+async fn a_holder_attestation_on_a_recordless_volume_writes_nothing() {
+    let _serial = serial();
+    let meta = formatted_volume().await;
+    assert!(sb::set_claim_set_bit(meta.path())
+        .await
+        .expect("stamp bit 14 offline"));
+    let be = KvMetaBackend::open(meta.path()).await.expect("open volume");
+    assert!(
+        !membership::publish_claim_holder(&be, "node-a", 9)
+            .await
+            .expect("attest is a no-op"),
+        "no durable set ⇒ nothing to attest into"
+    );
+    assert!(
+        !be.listxattr(1)
+            .await
+            .expect("listxattr")
+            .iter()
+            .any(|k| k == CLAIM_SET_XATTR),
+        "no record is created by an attestation"
+    );
+    be.shutdown().await.expect("clean shutdown");
+}
+
+/// The `mw_fleet --owners` refusal, half 2 — **the D0 claim barrier
+/// publishes a term above every era recorded on the volume**, exactly what
+/// `MembershipOwner::arm`'s refusal message promises ("Arm after the D0
+/// gate's claim barrier, which is what publishes the new term"). The
+/// membership plane records eras in two more places than the gate read:
+/// the claim set (whose stores stamp the PROCESS-wide era — a full
+/// writer's arm imports the max across all volumes) and the rendezvous
+/// record a crashed owner leaves behind. A successor whose slot-0-only
+/// ladder bump lands at-or-below such a recorded era could never arm
+/// (§6.7), and retrying could never heal it.
+#[tokio::test]
+async fn the_claim_barrier_publishes_a_term_above_every_recorded_era() {
+    let _serial = serial();
+    let meta = NamedTempFile::new().expect("temp volume");
+    meta.as_file().set_len(VOL_LEN).expect("size the volume");
+    // The DEFAULT format: bit 7 (durable term) + bit 14 (claim set).
+    format_v3(meta.path(), VOL_LEN, &opts())
+        .await
+        .expect("format v3 default");
+
+    let be = KvMetaBackend::open(meta.path()).await.expect("first open");
+    let t1 = be.writer_term();
+    assert!(t1 >= 1, "bit 7 volumes mint a durable era");
+    // A full-writer incarnation's residue: the claim set stamped with a
+    // process-wide era ABOVE this volume's own ladder, and a crashed
+    // owner's rendezvous record above even that.
+    assert!(
+        membership::upsert_writer_member(&be, &ident("node-a", 0), t1 + 3)
+            .await
+            .expect("enroll at an imported era")
+    );
+    membership::publish_owner_record(
+        &be,
+        &OwnerRecord {
+            v: 1,
+            id: "dead-owner".into(),
+            term: t1 + 5,
+            endpoint: "10.0.0.1:7100".into(),
+            ttl_ms: 45_000,
+            owner_claim_id: "node-a".into(),
+            ts: now_secs(),
+            pid: 1,
+            boot: "another-boot".into(),
+        },
+    )
+    .await
+    .expect("leave a crashed owner's rendezvous behind");
+    be.shutdown().await.expect("clean shutdown");
+
+    let re = KvMetaBackend::open(meta.path()).await.expect("remount");
+    assert!(
+        re.writer_term() > t1 + 5,
+        "the claim barrier must publish an era above every era recorded on \
+         the volume (claim set {} / rendezvous {}), got {}",
+        t1 + 3,
+        t1 + 5,
+        re.writer_term()
+    );
+    re.shutdown().await.expect("clean shutdown");
+}
+
+/// The composed field shape, end to end at the record level: a set
+/// authority remounting over records only it and its own offline verbs
+/// wrote — `volume set-owners`' enrollment (era T), then its own gate
+/// (era T+1), then its own KD-PV-17 attestation — must find
+/// `writer_term() > prior_term` when `arm_owner` recomputes the
+/// predecessor era from the volume's records, and the arm must succeed.
+#[tokio::test]
+async fn a_set_authority_remount_over_its_own_attestation_arms() {
+    let _serial = serial();
+    let meta = NamedTempFile::new().expect("temp volume");
+    meta.as_file().set_len(VOL_LEN).expect("size the volume");
+    format_v3(meta.path(), VOL_LEN, &opts())
+        .await
+        .expect("format v3 default");
+
+    // `volume set-owners`: enroll at the verb's own era, clean exit.
+    let be = KvMetaBackend::open(meta.path()).await.expect("verb open");
+    let verb_term = be.writer_term();
+    assert!(
+        membership::upsert_writer_member(&be, &ident("node-a", 0), verb_term)
+            .await
+            .expect("enroll")
+    );
+    be.shutdown().await.expect("clean unmount");
+
+    // The set-authority remount: gate, then the KD-PV-17 attestation at
+    // this mount's own era (exactly `open_routed_meta_set_partial`'s call).
+    let re = KvMetaBackend::open(meta.path()).await.expect("remount");
+    let term = re.writer_term();
+    assert!(term > verb_term);
+    assert!(membership::publish_claim_holder(&re, "node-a", term)
+        .await
+        .expect("attest"));
+
+    // `arm_owner`'s predecessor read over this volume's records.
+    let mut prior_term = 0u64;
+    if let Some(rec) = membership::read_owner_record(&re).await {
+        prior_term = prior_term.max(rec.term);
+    }
+    if let Some(set) = ClaimSet::load(&re).await {
+        if set.durable {
+            prior_term = prior_term.max(set.term);
+        }
+    }
+    assert!(
+        term > prior_term,
+        "a set authority's own records must never read as a newer predecessor \
+         (term {term}, prior {prior_term}) — the mw_fleet --owners self-refusal"
+    );
+    let (clock, _) = manual_clock();
+    MembershipOwner::arm("owner-remount", term, prior_term, shipped_clocks(), clock)
+        .expect("the remounted set authority arms over its own records");
+    re.shutdown().await.expect("clean shutdown");
 }
 
 /// Bit 14 is single-bit, disjoint, and never stamped by a production

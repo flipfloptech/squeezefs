@@ -4510,7 +4510,19 @@ impl KvMetaBackend {
                 ))
             })?,
         };
-        let prior = prior_claim_term.max(stored);
+        // The membership plane records eras on this volume in two more
+        // places than the ladder record: the claim set (whose stores
+        // stamp the storing PROCESS's era — a full writer's arm imports
+        // the max across every volume it appends to) and a crashed
+        // owner's rendezvous record. The barrier below must publish a
+        // term above ALL of them — §6.7's arm law refuses an owner whose
+        // era does not exceed every recorded predecessor's, and its
+        // remedy message names this gate ("Arm after the D0 gate's claim
+        // barrier, which is what publishes the new term"). Same-volume
+        // records only (sweep row 17(c): a peer volume's era belongs to
+        // its owner). The mw_fleet --owners finding, 2026-08-23.
+        let recorded = crate::membership::max_recorded_era(self).await;
+        let prior = prior_claim_term.max(stored).max(recorded);
         if prior >= crate::dlm::TERM_MAX {
             return Err(KvError::Corrupt(format!(
                 "{}: writer term space exhausted (prior term {prior} of a {}-bit budget, max \

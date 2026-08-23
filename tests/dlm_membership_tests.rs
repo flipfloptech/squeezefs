@@ -891,9 +891,11 @@ async fn a_holder_attestation_never_advances_the_claim_sets_era() {
     let be = KvMetaBackend::open(meta.path()).await.expect("open volume");
 
     // The set as `volume set-owners` leaves it: enrolled members, era 4.
-    assert!(membership::upsert_writer_member(&be, &ident("node-a", 0), 4)
-        .await
-        .expect("enroll"));
+    assert!(
+        membership::upsert_writer_member(&be, &ident("node-a", 0), 4)
+            .await
+            .expect("enroll")
+    );
     assert_eq!(ClaimSet::load(&be).await.expect("set").term, 4);
 
     // The partial open's attestation, at this mount's own (newer) era.

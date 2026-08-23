@@ -437,6 +437,27 @@ decision exists ("declared, never inferred", `src/cowriter.rs:41-49`).
 > own volume with no peer involved, and it is read only when a peer volume
 > carries a FRESH claim — which by definition means its owner is up.
 
+> **CORRECTION (rev 9 — the membership-arm self-refusal, found by the second
+> real fleet bring-up, 2026-08-23).** The attestation as landed did one thing
+> more than this resolution specifies: `set.term = set.term.max(term)`, with
+> `term` = the attesting mount's own fresh era. Written between the D0 gate
+> and `arm_owner`'s predecessor read, that self-stamp made the set authority
+> read its OWN era back as "the predecessor's durable term" and refuse to arm
+> against itself (`term 5 <= prior_term 5`) on every `--owners` remount —
+> deterministically, and retries could never heal it because each retry
+> re-stamped. Two-part fix, red-first (`tests/dlm_membership_tests.rs`):
+> **the attestation never advances `set.term`** (it is an attestation about
+> ONE claim — not a membership change — and its era is implicit in the claim
+> it names; on a record-less volume it now writes nothing, since there is no
+> assignment to resolve a holder against), and **the D0 gate's
+> `resolve_writer_term` maxes in every era recorded on the volume**
+> (`membership::max_recorded_era` — the claim set's term, which full-writer
+> arms stamp with the PROCESS-wide era, and a crashed owner's rendezvous
+> term), so the claim barrier publishes a term strictly above every recorded
+> predecessor's — which is exactly the remedy `MembershipOwner::arm`'s
+> refusal message had been promising. Same-volume records only (sweep row
+> 17(c)'s scope holds: a peer volume's era is never imported).
+
 **The complete open-behaviour table (rev 2, Issue 17 — `classify_claim`
 reaches `Reclaimable` BEFORE the freshness branch, including the
 `same_host && pid_provably_dead` arm that fires routinely on the single-node
@@ -2608,6 +2629,13 @@ the unconditional M1 correctness fix; 5 = live via the test constructor
 only). **6 and 7 parallelize off 5**, except that 7's guarantee rows want 6's
 fsck posture settled. **8 gates on both 6 and 7.** **9 gates on 0 plus a
 ruling** and shares no files with 3–8.
+
+**Revision log — rev 9 (2026-08-23)** records the second real-fleet bring-up
+catch: the KD-PV-17 attestation's `set.term` raise made the set authority
+refuse its own membership arm (the §5.1.1 box's rev-9 correction). The
+attestation no longer advances the era and the D0 gate's term resolution now
+absorbs every era recorded on the volume (`membership::max_recorded_era`),
+restoring the arm law's own stated remedy.
 
 **Revision log — rev 7 (2026-08-22)** records PR 6's, PR 7's and **PR 7b's**
 landings. 7b built the arm §5.7's rev-6 correction 2 named and no rung owned

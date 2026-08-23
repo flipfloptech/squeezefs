@@ -671,9 +671,20 @@ pub async fn set_volume_owner(
 /// declared a per-volume posture writes nothing here, so every set in the
 /// field keeps its exact `claim_set` bytes. Returns `false` (writing
 /// nothing) on a volume without bit 14 — the same law
-/// [`upsert_writer_member`] obeys — and on a volume this mount holds no
+/// [`upsert_writer_member`] obeys — on a volume this mount holds no
 /// claim on, because attesting a claim we did not write would be the
-/// self-assertion the whole plane refuses.
+/// self-assertion the whole plane refuses, and on a volume with no
+/// durable claim set at all, because there is no assignment to resolve a
+/// holder against.
+///
+/// **The attestation never advances `set.term`** (the mw_fleet `--owners`
+/// finding, 2026-08-23): it is "an attestation about ONE claim, verified
+/// against that claim" (KD-PV-17) — not a membership change — and its era
+/// is implicit in the claim it names. The shipped `set.term.max(term)`
+/// stamped this mount's OWN new era into the record between the D0 gate
+/// and `arm_owner`'s predecessor read, so the set authority read its own
+/// stamp back as a newer predecessor and refused to arm against itself
+/// (`term <= prior_term`), deterministically, on every remount.
 pub async fn publish_claim_holder(be: &KvMetaBackend, member_id: &str, term: u64) -> Result<bool> {
     if !claim_set_engaged(be.superblock().features_incompat) {
         return Ok(false);
@@ -686,6 +697,9 @@ pub async fn publish_claim_holder(be: &KvMetaBackend, member_id: &str, term: u64
     {
         return Ok(false);
     }
+    if !matches!(be.getxattr(1, CLAIM_SET_XATTR).await, Ok(Some(_))) {
+        return Ok(false); // no durable set — nothing to attest into
+    }
     let holder = ClaimHolder {
         id: member_id.to_string(),
         writer_id: claim.id.clone(),
@@ -696,7 +710,6 @@ pub async fn publish_claim_holder(be: &KvMetaBackend, member_id: &str, term: u64
     if set.holder.as_ref() == Some(&holder) {
         return Ok(false); // idempotent: a remount of the same claim writes nothing
     }
-    set.term = set.term.max(term);
     set.holder = Some(holder);
     ClaimSet::store(be, &set).await?;
     log::info!(
@@ -940,6 +953,35 @@ pub async fn read_owner_record(be: &KvMetaBackend) -> Option<OwnerRecord> {
         Ok(Some(raw)) => OwnerRecord::decode(&raw),
         _ => None,
     }
+}
+
+/// The highest writer era the membership plane has recorded ON `be` —
+/// the claim set's term (§6.2 item 7; its stores stamp the storing
+/// process's era, which for a full writer is the max across every volume
+/// it appends to) and the rendezvous record's term (left behind by a
+/// crashed owner). `0` when neither record exists or decodes.
+///
+/// **This is the D0 gate's read** (the mw_fleet `--owners` finding,
+/// 2026-08-23): `resolve_writer_term` maxes it into the volume's own era
+/// ladder so the claim barrier publishes a term strictly above every era
+/// ever recorded on the volume — which is exactly what
+/// [`MembershipOwner::arm`]'s refusal message promises ("Arm after the D0
+/// gate's claim barrier, which is what publishes the new term"). Without
+/// it, a successor whose ladder bump landed at-or-below an imported era
+/// could never arm, and retrying could never heal it. Same-volume records
+/// only — sweep row 17(c)'s scope: a PEER volume's era belongs to its
+/// owner and is never imported.
+pub async fn max_recorded_era(be: &KvMetaBackend) -> u64 {
+    let mut era = 0u64;
+    if let Ok(Some(raw)) = be.getxattr(1, CLAIM_SET_XATTR).await {
+        if let Some(set) = ClaimSet::decode(&raw) {
+            era = era.max(set.term);
+        }
+    }
+    if let Some(rec) = read_owner_record(be).await {
+        era = era.max(rec.term);
+    }
+    era
 }
 
 /// Remove the rendezvous record (clean disarm). A crashed owner leaves it

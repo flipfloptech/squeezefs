@@ -459,6 +459,26 @@ tearing down — **evidence before verdict**.
 
 ---
 
+## Run log — 2026-08-23 (the acceptance restart, in progress)
+
+**Gate (a) PUBLISHED, exit 0** (`rows-s10pl-1787521024-published/`,
+committed): `partial-authority 1.75 s vs local 1.78 s → 0.98× of S0
+(gate ≤ 1.10×): GATE MET` — statistical parity with the local baseline,
+replacing the S10 co-writer row's 6.73× (6.86× better). Engagement:
+`verbs/entry 0.02`, `redirects 0`, `ship` 2 per whole 2,583-entry
+extraction. Oracle clean: `fsck findings: 0`, `meta_kv_block_refs_drift
+0`. Venue: 1 set authority + 1 partial authority, one box, nvmet-tcp
+devsub `resv_enable=1`, `SQZ_MWFLEET_OSS_GB=32`, netem 250 µs wire RTT,
+A-B-B-A. Reached on the third from-zero attempt after corrections 9–11
+below landed (counted-restart discipline: the first two attempts'
+measured arms are label-only).
+
+**Legs (b)/(c)/(d) + the census PENDING, blocked by finding 12** (the
+idle block-worker spin: the fleet's own idle heat trips the rig's
+quiet-box gate — `box never went quiet in 1800 s, cpu 88 °C` with load1
+≈ 1 from the daemon itself). They run after that fix, on a fresh fleet,
+from zero.
+
 ## Design and rig corrections
 
 Filled in as the run proceeds. Landed with this branch:
@@ -574,6 +594,31 @@ Filled in as the run proceeds. Landed with this branch:
    table, verdict). A second online `fsck` could not even report the
    finding list — "reply too large; use the offline probe" — its own small
    CLI wart, still open.
+10. **The corpse-census correction** (fixed, `d04fef59`): with the sweep
+    landed, the SECOND from-zero attempt met the gate (1.08×) and its
+    oracle still reported 152 findings on a HEALTHY fleet — fsck's block
+    census skipped `nlink == 0` layouts, so every corpse awaiting its
+    kernel FORGET after the tar-x/rm pass (legal POSIX state that still
+    owns its blocks) read as C2 "leaked" + C8 drift. The block-plane
+    walks (census, derived seed, oracle, backfill) now count corpse
+    layouts; the inode-plane classes keep their deliberate exclusions.
+11. **The drift-gauge feeding law** (fixed, `822e757b`): the third
+    failure face — gate met (1.08×), findings 0, and the leg still died
+    on `meta_kv_block_refs_drift = 1147`. The raw durable-vs-derived
+    comparison fed the must-stay-0 gauge on every pass (the suspect pass
+    legitimately observes the mid-reclaim window), and the C8 confirm arm
+    re-ran the WHOLE comparison per suspect (1,147 layout walks). The
+    gauge is now fed at the two VERDICT sites only — fsck's confirmed C8
+    findings (the confirm pass memoizes one fresh comparison) and the
+    quiesced mount-init post-sweep verify.
+12. **OPEN — the idle block-worker spin** (found by the rig's own
+    quiet-box gate blocking leg (c)): an IDLE fleet daemon burns ~1 core
+    in the `sqz-blk*` NvmeBlockDev io_uring workers — futex-parked stacks
+    but ~1,000 park/wake cycles per second per worker
+    (`voluntary_ctxt_switches` ≈ 1.85 M in ~30 min) — which holds the box
+    at 85–88 °C and makes the thermal pacing refuse every measured leg
+    that follows. A wake-economy defect in the block workers' park
+    discipline; the next fix loop before legs (b)/(c)/(d) can run.
 
 ---
 

@@ -1,0 +1,2 @@
+gate: partial-authority 1.75s vs local 1.78s -> 0.98x of S0 (gate <= 1.10x): GATE MET
+baseline this replaces: the S10 co-writer row's 6.73x -> 6.86x better

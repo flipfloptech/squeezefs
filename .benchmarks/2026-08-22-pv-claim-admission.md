@@ -629,6 +629,37 @@ Filled in as the run proceeds. Landed with this branch:
     refused; the reclaim queue is latched halted") — a posture
     classification worth checking before the serve path. The next fix
     loop; legs (c)/(b)/(d) + the census still owe their from-zero run.
+13a. **Finding 13 FIXED** (`bebe2a78`; contracts
+    `tests/pv_shipped_free_ledger_tests.rs`, red at `d7265e2f`). The
+    reader-plane arm was a red herring (the posture table says a partial
+    arms it, correctly). The mechanism: the shipped-free validation
+    (`cowriter::durable_block_refcount`) summed `TREE_BLOCK_REFS` over
+    EVERY volume of the routed set LOCALLY — but under D20 the partial's
+    layout publishes (the ref deletes) commit on ITS OWN volume, which
+    the set authority holds only as a peer-owned reader snapshot. A
+    released reference still counted in the lagged copy ⇒ population > 0
+    ⇒ every verdict `NonTerminal` ⇒ `free_served_blocks` pinned at 0 and
+    the displaced blocks stranded (the observed shape, exactly:
+    ship=128/serve=0/failures=0, no refusal log). The red test proved
+    the DESTRUCTIVE twin too: a reference ADDED on the partial's live
+    tree after the snapshot read as population 0 ⇒ a false `Freed` on a
+    live inode's block (§6.3's reclaim hazard) — the two verdicts came
+    back exactly inverted (`[NonTerminal, Freed]` for a truth of
+    `[Freed, NonTerminal]`). Fix: the read is owner-partitioned
+    (`durable_block_refcounts_with`) — owned volumes read the live tree
+    verbatim, peer-owned volumes ship ONE batched
+    `PublishCall::BlockRefPopulation` per distinct peer, the serve
+    answers over the serving node's OWNED volumes only (both arm sites
+    now scope their `PublishService` with the map's local volume set,
+    the meta service's own §5.7-correction-3 discipline), and
+    `PUBLISH_SCHEMA` bumped 6 → 7. The ownership view binds at
+    executor-INSTALL time (`OwnerView`: production = `live_owner_view`,
+    following rearm across slot migration; the one-process rigs =
+    `local_owner_view`) because the mw_cowriter_free venue proved a
+    run-time global-map read ships the authority's ledger read to
+    ITSELF — the co-writer's all-foreign map is the process-global one
+    there — and wedges the meta pool on the self-serve. Legs (c)/(b)/(d)
+    + the census still owe their from-zero run on the fixed binary.
 12. **The idle block-worker spin (superseded by 12a — kept for the
     record)** (found by the rig's own
     quiet-box gate blocking leg (c)): an IDLE fleet daemon burns ~1 core

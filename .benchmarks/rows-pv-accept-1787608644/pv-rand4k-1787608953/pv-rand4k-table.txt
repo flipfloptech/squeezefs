@@ -1,0 +1,4 @@
+single-1    15989     patch=436134
+ineligible=43546 posture=0 acct_refusals=0
+single-2    16246     patch=442528
+ineligible=44896 posture=0 acct_refusals=0

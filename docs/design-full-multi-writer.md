@@ -642,19 +642,20 @@ the S10 gate; the rest are carried, priced, and loud where they can fire.
    finding's fix, or a recorded ruling that localhost-gate green
    suffices, as an input (the evidence note's verdict 4).
 3. **Per-volume claim admission — the fleet-of-authorities recipe**
-   — **DESIGNED 2026-08-21**: `docs/design-per-volume-claim-admission.md`
-   (writer/reviewer consensus over four rounds, 29 issues resolved, 0 open;
-   rulings D18 cross-owner rename/link scoped out with a measured refusal
-   rate, D19 static ownership with live cross-owner slot migration deferred,
-   D20 the slot-0 owner is the set authority; KD-PV-1…16; a 10-rung PR plan
-   whose PR 0 is the ~46-volume viability gate). Implementation not started. (§6.10
-   R4): a client holding the D0 claim on ≥ 1 volume of a shared set is what
-   makes the S10 tar-x gate meetable and inverts `mint_redirects` for real.
-   Needs the D0 Layer-B2 per-volume admission + partial-writer open + the
-   claim set naming per-volume owners; the placement machinery is landed,
-   dark, and pinned against the shape (`tests/mw_slot_placement_tests.rs`).
-   Cross-owner slot migration (a shipped migration form through the
-   `install_migration_executor` seam) rides with it.
+   — **ADMISSION HALF CLOSED 2026-08-24**:
+   `docs/design-per-volume-claim-admission.md` ran its full PR ladder
+   (PRs 2–8; rulings D18/D19/D20, KD-PV-1…17) and the acceptance rung
+   PUBLISHED every row with oracles clean (closing record
+   `.benchmarks/2026-08-22-pv-claim-admission.md`): the S10 tar-x gate is
+   **MET at 0.98× of S0** on a 2-owner fleet (vs the 6.73× this item was
+   filed against), the §5.12 relocated wall measured at 0.92×, the D18
+   refusal table at its designed rates, and the shipped-free ledgers
+   close live (finding 13's owner-partitioned ledger read,
+   `PUBLISH_SCHEMA` 7). **Re-filed from its closure**, still open:
+   cross-owner slot migration (D19's deferral — a shipped migration form
+   through the `install_migration_executor` seam), the offline subtree
+   re-homing pass (its OQ 3), the R15 purge scoping's purge half, and
+   R14's W1 recovery on partial authorities.
    `.benchmarks/2026-08-17-s10-slot-placement.md`.
 4. **Automatic co-writer re-admission** (S9-b's documented deferral):
    un-poisoning a fenced mount is a designed transition needing the

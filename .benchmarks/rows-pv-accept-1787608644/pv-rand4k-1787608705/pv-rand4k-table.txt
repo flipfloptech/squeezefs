@@ -1,0 +1,8 @@
+partial-1   22405     patch=0
+ineligible=672192 posture=672176 acct_refusals=0
+setauth-1   17489     patch=473346
+ineligible=51326 posture=0 acct_refusals=0
+setauth-2   16418     patch=446766
+ineligible=45778 posture=0 acct_refusals=0
+partial-2   17427     patch=0
+ineligible=522816 posture=522802 acct_refusals=0

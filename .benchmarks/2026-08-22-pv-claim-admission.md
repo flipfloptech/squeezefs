@@ -473,11 +473,47 @@ A-B-B-A. Reached on the third from-zero attempt after corrections 9–11
 below landed (counted-restart discipline: the first two attempts'
 measured arms are label-only).
 
-**Legs (b)/(c)/(d) + the census PENDING, blocked by finding 12** (the
-idle block-worker spin: the fleet's own idle heat trips the rig's
-quiet-box gate — `box never went quiet in 1800 s, cpu 88 °C` with load1
-≈ 1 from the daemon itself). They run after that fix, on a fresh fleet,
-from zero.
+**Legs (b)/(c)/(d) + the census + step 7 PUBLISHED, exit 0** (2026-08-24,
+binary `367ad855` — findings 12 and 13 fixed; fresh
+`SQZ_MWFLEET_OSS_GB=32` fleet, from zero; rows harvested to
+`rows-pv-accept-1787608644/`, dd source payloads dropped):
+
+* **(c) the rewrite funnel** (`pv-rewrite-1787608644`): partial authority
+  **1016.5 MiB/s** vs set authority **1102.0 MiB/s → 0.92×** — §5.12's
+  UNMEASURED term now measured; the sub-1.0 ratio is the honest cost of
+  shipping every terminal free to one node, published verbatim (no
+  gate). **The finding-13 ledgers close live: `shipped=128 served=128`
+  on BOTH partial arms** (was served=0), set-authority arms 0/0,
+  `free_ship_failures` 0, oracle clean (findings 0, drift 0).
+* **(b) the cross-owner refusal table** (`pv-xo-1787608680`, 200 ops per
+  verb per placement, driven from the partial): rename own-placement
+  rate **0.00**, 50 % mixed **0.50**, all-foreign **1.00**; link
+  all-foreign 1.00 (EXDEV surfaced to the app, 200 app errors as
+  designed); unlink own 0.00. `rm -rf` of an own subtree clean; the
+  subtree ROOT refuses EXDEV with the root intact. Oracle clean.
+* **(d) the R14 rand-4k row** (`pv-rand4k-1787608705`, python3 O_DIRECT
+  rand-4k pwrite 30 s / 256 MiB — never spliced with the elbencho W1
+  figures): partial authority **19,916 IOPS** (patch=0,
+  `patch_ineligible_posture` accounts every ineligible — R14 engaged)
+  vs set authority **16,954 IOPS** (W1 patch engaged, 473k/447k
+  patches). On THIS venue (zram/nvmet-tcp devsub) the no-W1 posture
+  outruns the patch-engaged one — the note publishes the number, not a
+  narrative; no gate (R14 is a named, accepted regression).
+* **step 6, the end-of-run census** (offline, fleet down in
+  reverse-of-bring-up order): **`Cross-owner names: 1`** — byte-equal to
+  `OWNER_CENSUS_AT_ASSIGNMENT=1` (the one verb-minted subtree root,
+  `ino 1/owner-m20`), ZERO growth across all four legs.
+* **step 7, the single-authority-today arm** (`pv-rand4k-1787608953`,
+  fresh `--multi-writer` fleet): **15,989 / 16,246 IOPS** (patch
+  engaged, posture=0) — §5.1.3's third row, consistent with the
+  multi-owner set-authority arms. Teardown zero-residue, twice.
+
+Every leg's engagement law held (must-stay-0 set flat, migrations
+disarmed, rotor_fallbacks 0) and every oracle ran clean. Leg (a)'s row
+(above) stands as published at `e7eeab20`: findings 12/13 changed idle
+pacing and the shipped-free serve, neither of which is inside gate (a)'s
+timed tar-x arms; the (c)/(b)/(d) rows are the ones the fixed paths
+feed, and they ran from zero on the fixed binary.
 
 ## Design and rig corrections
 
@@ -658,8 +694,10 @@ Filled in as the run proceeds. Landed with this branch:
     `local_owner_view`) because the mw_cowriter_free venue proved a
     run-time global-map read ships the authority's ledger read to
     ITSELF — the co-writer's all-foreign map is the process-global one
-    there — and wedges the meta pool on the self-serve. Legs (c)/(b)/(d)
-    + the census still owe their from-zero run on the fixed binary.
+    there — and wedges the meta pool on the self-serve. Legs (c)/(b)/(d),
+    the census and step 7 all ran from zero on the fixed binary and
+    PUBLISHED (run log above) — the ledgers close live: shipped=128
+    served=128 on both partial arms of the rewrite funnel.
 12. **The idle block-worker spin (superseded by 12a — kept for the
     record)** (found by the rig's own
     quiet-box gate blocking leg (c)): an IDLE fleet daemon burns ~1 core
@@ -674,9 +712,24 @@ Filled in as the run proceeds. Landed with this branch:
 
 ## Closure (PR 8's own wording, rev 2 / Issue 19c)
 
-`PENDING` until the rows land. When they do, this rung closes **residual
-item 3's ADMISSION half**, and the same act re-files the remainder as a
-named follow-on on the residual board of
+**CLOSED 2026-08-24, binary `367ad855`.** Every row landed: gate (a)
+**0.98× of S0** (gate ≤ 1.10× MET — the honest product statement the S10
+tar-x gate adjudicated as structurally unmeetable at 6.73× while one node
+owned every volume); leg (c) the §5.12 funnel measured at **0.92×** with
+the shipped-free ledgers closing live (shipped=128 served=128); leg (b)
+the D18 refusal table at its designed rates (0.00 / 0.50 / 1.00 by
+placement); leg (d) the R14 price published on its venue (partial
+19,916 IOPS vs set authority 16,954, patch ledger accounting every op);
+the end-of-run census byte-equal to the at-assignment count (1 —
+zero cross-owner growth); step 7's single-authority arm consistent
+(15,989/16,246 IOPS). Every leg's engagement law held and every oracle
+ran clean (fsck findings 0, C8 drift 0). Thirteen findings were driven
+red-first to fixes on `dev` along the way (the numbered list above);
+rows in `rows-s10pl-1787521024-published/` and
+`rows-pv-accept-1787608644/`.
+
+This rung closes **residual item 3's ADMISSION half**, and the same act
+re-files the remainder as a named follow-on on the residual board of
 `docs/design-full-multi-writer.md`:
 
 * cross-owner slot migration (D19 defers it — the item's own text ends

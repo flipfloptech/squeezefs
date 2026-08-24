@@ -1,0 +1,2 @@
+rewrite funnel: partial authority 1016.5 MiB/s vs set authority 1102.0 MiB/s -> 0.92x
+NO GATE: §5.12 states this term is UNMEASURED and names it the recipe's most likely relocated wall. The number is the deliverable; a ratio below 1.0 is the honest cost of shipping every terminal free to one node, and belongs in the closing note verbatim.

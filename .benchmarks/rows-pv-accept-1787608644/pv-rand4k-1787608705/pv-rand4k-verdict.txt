@@ -1,0 +1,2 @@
+R14 price: partial authority 19916 IOPS vs set authority 16954 IOPS -> 1.17x
+NO GATE: R14 is a NAMED, ACCEPTED regression (design §8) — this row publishes its size on this venue. It is not recoverable inside this program.

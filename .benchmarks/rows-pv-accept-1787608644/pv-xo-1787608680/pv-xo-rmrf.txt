@@ -1,0 +1,1 @@
+rm -rf <subtree root>: REFUSED, root intact: rm: cannot remove '/mnt/sqz-mwfleet/m20/owner-m20': Invalid cross-device link

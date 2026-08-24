@@ -1,0 +1,5 @@
+xo-rename-own   rename   200    0          0.00   0        0.30
+xo-rename-50    rename   200    100        0.50   0        0.56
+xo-rename-all   rename   200    200        1.00   0        0.55
+xo-link-all     link     200    200        1.00   200      0.30
+xo-unlink-own   unlink   200    0          0.00   0        0.27

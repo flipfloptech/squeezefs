@@ -857,6 +857,11 @@ pub async fn arm_multi_writer(
         publish::install_free_executor(crate::cowriter::router_free_executor(
             Arc::clone(backend),
             Arc::clone(meta),
+            // Finding 13: the ledger reader follows the LIVE ownership
+            // plane — this process's map is this authority's own (and
+            // rearm_ownership keeps it current across slot migration), so
+            // peer-owned volumes' populations ship to their owners.
+            crate::cowriter::live_owner_view(),
         ));
         // The free's REUSE half (rung 10, residual 2): the lane free
         // HARVEST executor — what makes a co-writer's freed supply
@@ -903,7 +908,15 @@ pub async fn arm_multi_writer(
     crate::meta_ship::install_delegation_host(Arc::clone(&meta_svc));
     let router = AsyncVerbRouter::new()
         .with_custody(Arc::clone(&owner))
-        .with_publish(publish::PublishService::new(Arc::clone(meta)))
+        // Scoped like the meta service above (§5.7 correction 3, finding
+        // 13): a served block-ref population answers from OWNED volumes
+        // only — this node's peer-owned copies are lagged snapshots whose
+        // truth belongs to their owners. On an unassigned set the local
+        // set is every volume, the shipped shape verbatim.
+        .with_publish(publish::PublishService::with_authority(
+            Arc::clone(meta),
+            &map.local_volume_set(),
+        ))
         .with_meta(meta_svc);
     let listener = match crate::cluster_wire::RpcListener::start_async(
         crate::cluster_wire::RpcListenerConfig {
@@ -1445,7 +1458,13 @@ async fn arm_partial_halves(
     // set authority alone, and a second grantor is two nodes handing out
     // the same bytes.
     let svc = AsyncVerbRouter::new()
-        .with_publish(publish::PublishService::new(Arc::clone(meta)))
+        // Scoped exactly as the set authority's is (finding 13): a
+        // partial answers population reads for the volumes it appends to,
+        // never from its lagged copies of a peer's.
+        .with_publish(publish::PublishService::with_authority(
+            Arc::clone(meta),
+            &map.local_volume_set(),
+        ))
         .with_meta(meta_svc);
     let listener = crate::cluster_wire::RpcListener::start_async(
         crate::cluster_wire::RpcListenerConfig {

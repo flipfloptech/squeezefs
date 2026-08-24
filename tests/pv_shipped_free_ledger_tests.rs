@@ -490,14 +490,14 @@ async fn the_population_read_is_owner_partitioned_not_a_local_snapshot_sum() {
             .commit_block_refs(ino_v1, &[taken(tag, 7, ino_v1)])
             .await
             .expect("seed vol1's reference");
-        // The solo re-gate, pinned in passing: an UNARMED mount reads the
-        // ledger locally and must see both seeds.
+        // The local census (the pre-finding read, kept verbatim as the
+        // single-authority instrument) must see both seeds.
         assert_eq!(
             squeezefs::cowriter::durable_block_refcount(routed, tag, 7)
                 .await
-                .expect("the unarmed local read answers"),
+                .expect("the local census answers"),
             2,
-            "the seeding fixture must be visible to the unarmed local read"
+            "the seeding fixture must be visible to the local census"
         );
     })
     .await;
@@ -511,9 +511,14 @@ async fn the_population_read_is_owner_partitioned_not_a_local_snapshot_sum() {
         .await
         .expect("the partial releases its reference locally");
 
-    let population = squeezefs::cowriter::durable_block_refcount(&stage.a_meta, stage.tag, 7)
-        .await
-        .expect("the owner-partitioned read answers");
+    let population = squeezefs::cowriter::durable_block_refcounts_with(
+        &stage.a_meta,
+        stage.tag,
+        &[7],
+        &squeezefs::cowriter::live_owner_view(),
+    )
+    .await
+    .expect("the owner-partitioned read answers")[0];
     stage.stop().await;
     assert_eq!(
         population, 1,
@@ -562,10 +567,17 @@ async fn shipped_free_verdicts_come_from_the_owners_live_ledger() {
         .expect("the partial moves its live ledger");
 
     let (_alloc, br) = data_plane(&dev_file(dir.path())).await;
-    let verdicts =
-        squeezefs::cowriter::execute_shipped_frees(&br, &stage.a_meta, stage.tag, &[7, 9])
-            .await
-            .expect("the authority executes the shipped frees");
+    // The production binding: the live ownership plane — this process's
+    // armed map IS the set authority's here.
+    let verdicts = squeezefs::cowriter::execute_shipped_frees(
+        &br,
+        &stage.a_meta,
+        stage.tag,
+        &[7, 9],
+        &squeezefs::cowriter::live_owner_view(),
+    )
+    .await
+    .expect("the authority executes the shipped frees");
     stage.stop().await;
     assert_eq!(
         verdicts,

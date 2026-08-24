@@ -1726,11 +1726,17 @@ pub async fn ship_displaced_frees(
 /// * **anything else**: the double-release lineage — routed through the
 ///   ladder UNSEEDED so the existing untracked-free tripwire counts it,
 ///   and answered `Refused`.
+///
+/// `view` is the ledger reader's ownership binding (finding 13 — see
+/// [`OwnerView`]): production passes [`live_owner_view`]; a venue where
+/// one process plays both nodes passes [`local_owner_view`], because the
+/// process-global map there belongs to the OTHER posture.
 pub async fn execute_shipped_frees(
     backend: &Arc<crate::routing::BackendRouter>,
     meta: &Arc<RoutedMetaBackend>,
     vol_tag: u64,
     blocks: &[u64],
+    view: &OwnerView,
 ) -> Result<Vec<crate::meta_ship::publish::FreeVerdict>> {
     use crate::meta_ship::publish::FreeVerdict;
     let Some((be_id, alloc)) = backend.allocator_for_volume_tag(vol_tag) else {
@@ -1742,11 +1748,16 @@ pub async fn execute_shipped_frees(
     let backend = Arc::clone(backend);
     let meta = Arc::clone(meta);
     let blocks = blocks.to_vec();
+    let view = Arc::clone(view);
     with_authority_accounting(async move {
         let chunk = alloc.chunk_size();
         let mut verdicts = Vec::with_capacity(blocks.len());
         let mut discharged: Vec<u64> = Vec::new();
-        for idx in blocks {
+        // Finding 13: ONE owner-partitioned ledger read for the whole
+        // batch (a round trip per distinct peer, not per block) — the
+        // untracked arm below consumes it.
+        let populations = durable_block_refcounts_with(&meta, vol_tag, &blocks, &view).await?;
+        for (slot, idx) in blocks.iter().copied().enumerate() {
             let offset = idx.saturating_mul(chunk);
             let key = backend.persist_block_key(&be_id, offset);
             let verdict = match alloc.refcount(offset) {
@@ -1773,8 +1784,7 @@ pub async fn execute_shipped_frees(
                     FreeVerdict::Refused
                 }
                 None => {
-                    let population = durable_block_refcount(&meta, vol_tag, idx).await?;
-                    if population > 0 {
+                    if populations[slot] > 0 {
                         FreeVerdict::NonTerminal
                     } else if alloc.free_list_contains(idx)
                         || alloc.grace_holds(offset)
@@ -1901,37 +1911,136 @@ pub fn router_harvest_executor(
 
 /// A [`crate::meta_ship::publish::FreeExecutor`] over this authority's data
 /// router + metadata set — what `multi_writer::arm_multi_writer` installs
-/// beside the frontier source (and the rigs install directly).
+/// beside the frontier source (and the rigs install directly). The
+/// INSTALLER binds the ledger reader's ownership view (finding 13):
+/// production passes [`live_owner_view`], the one-process rigs
+/// [`local_owner_view`].
 pub fn router_free_executor(
     backend: Arc<crate::routing::BackendRouter>,
     meta: Arc<RoutedMetaBackend>,
+    view: OwnerView,
 ) -> crate::meta_ship::publish::FreeExecutor {
     Arc::new(move |vol_tag: u64, blocks: Vec<u64>| {
         let backend = Arc::clone(&backend);
         let meta = Arc::clone(&meta);
-        Box::pin(async move { execute_shipped_frees(&backend, &meta, vol_tag, &blocks).await })
+        let view = Arc::clone(&view);
+        Box::pin(
+            async move { execute_shipped_frees(&backend, &meta, vol_tag, &blocks, &view).await },
+        )
     })
 }
 
-/// The durable reference population of one block across the metadata set —
-/// `refcount(block) == records under the (vol_tag, block_idx) prefix`
-/// (`TREE_BLOCK_REFS`'s own law). The shipped-free executor's owner-side
-/// validation, and the census the free-path tests read back.
+/// The ledger reader's view of metadata-volume ownership — **bound at ARM
+/// time by the node that installs the shipped-free executor** (finding
+/// 13's venue law): the process-global ownership map belongs to whichever
+/// posture armed last, which in the one-process test rigs is not
+/// necessarily the node whose ladder runs — an executor reading it there
+/// ships the population read to ITSELF (self-serve on the same meta pool,
+/// the wedge the mw_cowriter_free venue exposed). Production binds
+/// [`live_owner_view`] because there the global map IS the installing
+/// node's own; the single-authority rigs bind [`local_owner_view`].
+pub type OwnerView = Arc<dyn Fn(usize) -> Option<Arc<crate::meta_ship::PeerOwner>> + Send + Sync>;
+
+/// The live ownership plane's view — production's binding: reads the
+/// global map at RUN time, so it follows `rearm_ownership` (slot
+/// migration) instead of rotting on an arm-time snapshot.
+pub fn live_owner_view() -> OwnerView {
+    Arc::new(crate::meta_ship::owner_of_volume)
+}
+
+/// An all-local view — the single-authority binding (every volume of the
+/// routed set is the installing node's own; classic S9's shape).
+pub fn local_owner_view() -> OwnerView {
+    Arc::new(|_| None)
+}
+
+/// The durable reference populations of a batch of blocks across the
+/// metadata set — `refcount(block) == records under the (vol_tag,
+/// block_idx) prefix` (`TREE_BLOCK_REFS`'s own law), **read where each
+/// volume's ledger LIVES** (finding 13, per-volume claim admission PR 8;
+/// contracts `tests/pv_shipped_free_ledger_tests.rs`):
+///
+/// * an OWNED volume (or every volume on an unarmed mount — the solo
+///   re-gate: the view answers `None` there) reads its local live tree,
+///   verbatim the pre-finding behaviour;
+/// * a PEER-OWNED volume's count SHIPS to its owner
+///   ([`crate::meta_ship::publish::ship_block_ref_population`], one
+///   batched round trip per distinct peer), because this mount's copy is
+///   a lagged reader snapshot — reading it answered a released reference
+///   as still held (`NonTerminal` forever, the ship=128/serve=0 strand)
+///   and a fresh one as absent (a false `Freed`, §6.3's destructive
+///   face).
+///
+/// A peer that cannot answer is a loud error, never a fallback to the
+/// snapshot: the shipped-free serve that needed the count refuses, and
+/// the shipper's bounded retry ladder owns the leak-safe abandon.
+pub async fn durable_block_refcounts_with(
+    meta: &Arc<RoutedMetaBackend>,
+    vol_tag: u64,
+    block_idxs: &[u64],
+    view: &OwnerView,
+) -> Result<Vec<usize>> {
+    let mut out = vec![0usize; block_idxs.len()];
+    let mut peers: Vec<Arc<crate::meta_ship::PeerOwner>> = Vec::new();
+    for (v_idx, kv) in meta.volumes.iter().enumerate() {
+        match view(v_idx) {
+            None => {
+                for (slot, idx) in block_idxs.iter().enumerate() {
+                    out[slot] += kv.block_ref_count(vol_tag, *idx).await.map_err(|e| {
+                        SqueezefsError::InvalidOperation(format!(
+                            "durable block-reference count failed on {} while serving a \
+                             shipped free: {e}",
+                            kv.device_path().display()
+                        ))
+                    })?;
+                }
+            }
+            Some(peer) => {
+                // One round trip per DISTINCT peer: the serve answers for
+                // every volume that peer owns at once.
+                if !peers
+                    .iter()
+                    .any(|p| p.peer_id == peer.peer_id && p.endpoint == peer.endpoint)
+                {
+                    peers.push(peer);
+                }
+            }
+        }
+    }
+    for peer in peers {
+        if peer.endpoint.is_empty() {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "S9: the block-reference population of vol_tag {vol_tag:#016x} needs peer \
+                 '{}', whose endpoint is not yet resolved — refusing rather than validating a \
+                 free against this mount's lagged snapshot of that peer's volume (finding 13)",
+                peer.peer_id
+            )));
+        }
+        let counts = crate::meta_ship::publish::ship_block_ref_population(
+            &peer.endpoint,
+            vol_tag,
+            block_idxs.to_vec(),
+        )
+        .await?;
+        for (slot, c) in counts.iter().enumerate() {
+            out[slot] += *c as usize;
+        }
+    }
+    Ok(out)
+}
+
+/// The LOCAL ledger census of one block — this mount's own trees only,
+/// the pre-finding-13 read verbatim: the single-authority venues' truth
+/// (classic S9, where every volume of the routed set is the authority's
+/// own) and the instrument the free-path tests read back. The shipped-free
+/// VALIDATION never calls this — it rides
+/// [`durable_block_refcounts_with`] under the view its installer bound.
 pub async fn durable_block_refcount(
     meta: &Arc<RoutedMetaBackend>,
     vol_tag: u64,
     block_idx: u64,
 ) -> Result<usize> {
-    let mut population = 0usize;
-    for kv in &meta.volumes {
-        population += kv.block_ref_count(vol_tag, block_idx).await.map_err(|e| {
-            SqueezefsError::InvalidOperation(format!(
-                "durable block-reference count failed on {} while serving a shipped free: {e}",
-                kv.device_path().display()
-            ))
-        })?;
-    }
-    Ok(population)
+    Ok(durable_block_refcounts_with(meta, vol_tag, &[block_idx], &local_owner_view()).await?[0])
 }
 
 /// The `cowriter` stats-inode object. Every field is inert (`off` / 0) on

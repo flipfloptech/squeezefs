@@ -117,7 +117,15 @@ use std::sync::Arc;
 /// `MergeLayoutAndSize` reply gained the STAGED LINK'S VERSION
 /// ([`PublishReply::DeltaUsed`] became a struct variant) — the
 /// chain-without-refetch input a 5-speaker cannot decode.
-pub const PUBLISH_SCHEMA: u32 = 6;
+///
+/// **7 since the owner-partitioned block-ref population read landed**
+/// (finding 13, per-volume claim admission PR 8): `BlockRefPopulation` +
+/// [`PublishReply::Populations`] joined — the shipped-free validation
+/// reads the ledger where the ledger LIVES (each volume's owner), because
+/// a 6-speaker set authority answered a peer's shipped free from its own
+/// lagged snapshot of the peer's volume (the `NonTerminal` strand / false
+/// `Freed` pair `tests/pv_shipped_free_ledger_tests.rs` pins).
+pub const PUBLISH_SCHEMA: u32 = 7;
 
 /// First verb of S9's publish block. S3's ping is 0, S8's metadata verbs
 /// are 16/17, S6's membership owns `0x0100..=0x01FF`, S9's custody
@@ -415,6 +423,30 @@ pub enum PublishCall {
         /// The witness's other half.
         request_id: u64,
     },
+    /// **The durable reference population of blocks, answered from the
+    /// volumes the SERVING node owns** — the owner-partitioned read half
+    /// of the shipped-free validation (finding 13, per-volume claim
+    /// admission PR 8; contracts `tests/pv_shipped_free_ledger_tests.rs`).
+    ///
+    /// Under D20 the `TREE_BLOCK_REFS` ledger is DISTRIBUTED: a partial
+    /// authority's layout publishes commit on its OWN volumes, so a peer's
+    /// copy of those volumes is a lagged reader snapshot, and validating a
+    /// shipped free against it answers from state the owner has already
+    /// moved — a released reference still counted (`NonTerminal` forever,
+    /// the leg's ship=128/serve=0 strand) or a fresh reference invisible
+    /// (a false `Freed`, §6.3's destructive face). The read therefore
+    /// SHIPS to each volume's owner, and the serve answers for its OWNED
+    /// volumes only — the reply is scoped, never refused, which is why
+    /// this verb names no inos.
+    ///
+    /// Pure read (the `XattrValueCap`/`ReaddirStream` class): no era
+    /// gate, no witness, transport-resend-safe.
+    BlockRefPopulation {
+        /// The durable data-volume identity (KD-5, as above).
+        vol_tag: u64,
+        /// Dense block indices — `TREE_BLOCK_REFS`'s own key grain.
+        block_idxs: Vec<u64>,
+    },
 }
 
 /// One block's outcome inside a served [`PublishCall::FreeBlocks`].
@@ -451,6 +483,7 @@ impl PublishCall {
             Self::HarvestLaneFree { .. } => "harvest_lane_free",
             Self::WriteExtent { .. } => "write_extent",
             Self::FlushExtents { .. } => "flush_extents",
+            Self::BlockRefPopulation { .. } => "block_ref_population",
         }
     }
 
@@ -473,7 +506,9 @@ impl PublishCall {
             | Self::HarvestLaneFree { lease_epoch, .. }
             | Self::WriteExtent { lease_epoch, .. }
             | Self::FlushExtents { lease_epoch, .. } => Some(*lease_epoch),
-            Self::XattrValueCap { .. } | Self::ReaddirStream { .. } => None,
+            Self::XattrValueCap { .. }
+            | Self::ReaddirStream { .. }
+            | Self::BlockRefPopulation { .. } => None,
         }
     }
 
@@ -546,6 +581,7 @@ impl PublishCall {
                     | Self::HarvestLaneFree { .. }
                     | Self::XattrValueCap { .. }
                     | Self::ReaddirStream { .. }
+                    | Self::BlockRefPopulation { .. }
             )
     }
 
@@ -609,6 +645,10 @@ impl PublishCall {
             | Self::HarvestLaneFree { .. } => {
                 vec![1]
             }
+            // The reply is SCOPED to the serving node's owned volumes by
+            // construction (finding 13), so the authority screen is
+            // inapplicable: any owner answers for what it owns.
+            Self::BlockRefPopulation { .. } => Vec::new(),
         }
     }
 }
@@ -653,6 +693,9 @@ pub enum PublishReply {
     /// offsets of the CALLER's lane, removed from the authority's own
     /// list (exactly-once) and recorded against the caller's lease epoch.
     LaneFreeGrant(Vec<u64>),
+    /// `block_ref_population`: per-index reference populations summed over
+    /// the SERVING node's owned volumes, in request order.
+    Populations(Vec<u64>),
 }
 
 /// A publish request frame.
@@ -1998,6 +2041,48 @@ pub async fn ship_free_blocks(
     }
 }
 
+/// **Ship one block-ref population read** to the owner at `endpoint` —
+/// the owner-partitioned half of [`crate::cowriter::durable_block_refcounts`]
+/// (finding 13): the answer is the peer's LIVE-tree count over the volumes
+/// it owns, in request order.
+///
+/// Pure read, transport-resend-safe; a failure is returned loud — the
+/// shipped-free serve that needed it refuses rather than validating
+/// against a lagged local snapshot (the caller's retry ladder owns the
+/// leak-safe abandon).
+pub async fn ship_block_ref_population(
+    endpoint: &str,
+    vol_tag: u64,
+    block_idxs: Vec<u64>,
+) -> Result<Vec<u64>> {
+    let expected = block_idxs.len();
+    let Some(client) = CLIENT.load_full() else {
+        return Err(SqueezefsError::InvalidOperation(format!(
+            "S9: a block-reference population read for vol_tag {vol_tag:#016x} cannot be \
+             shipped — no publish client is installed. Answering from the local lagged \
+             snapshot instead would validate a free against state the volume's owner has \
+             already moved (finding 13), so this refuses"
+        )));
+    };
+    let call = PublishCall::BlockRefPopulation {
+        vol_tag,
+        block_idxs,
+    };
+    match client.ship(endpoint, call).await? {
+        PublishReply::Populations(counts) if counts.len() == expected => Ok(counts),
+        PublishReply::Populations(counts) => Err(SqueezefsError::InvalidOperation(format!(
+            "S9: the owner at {endpoint} answered {} population(s) for {expected} block \
+             index(es) — refusing a reply that cannot be paired with its request",
+            counts.len()
+        ))),
+        other => Err(protocol_error(
+            "block_ref_population",
+            &format!("{other:?}"),
+            "per-index reference populations",
+        )),
+    }
+}
+
 /// Routed [`RoutedMetaBackend::readdir_stream`].
 pub async fn readdir_stream(
     be: &Arc<RoutedMetaBackend>,
@@ -3107,6 +3192,31 @@ impl PublishService {
             }
             PublishCall::XattrValueCap { ino } => {
                 Ok(PublishReply::Cap(self.inner.xattr_value_cap(ino) as u64))
+            }
+            PublishCall::BlockRefPopulation {
+                vol_tag,
+                block_idxs,
+            } => {
+                // Finding 13: answered from the volumes THIS node holds
+                // authority over — its own peer-owned copies are lagged
+                // snapshots whose truth belongs to their owners, so they
+                // are deliberately not counted here.
+                let mut out = vec![0u64; block_idxs.len()];
+                for (v_idx, kv) in self.inner.volumes.iter().enumerate() {
+                    if !self.authority.get(v_idx).copied().unwrap_or(false) {
+                        continue;
+                    }
+                    for (slot, idx) in block_idxs.iter().enumerate() {
+                        out[slot] += kv.block_ref_count(vol_tag, *idx).await.map_err(|e| {
+                            SqueezefsError::InvalidOperation(format!(
+                                "S9: the block-reference population read failed on {} while \
+                                 serving a shipped-free validation: {e}",
+                                kv.device_path().display()
+                            ))
+                        })? as u64;
+                    }
+                }
+                Ok(PublishReply::Populations(out))
             }
             PublishCall::ReaddirStream { dir, offset, max } => {
                 let rows = self.inner.readdir_stream(dir, offset, max as usize).await?;

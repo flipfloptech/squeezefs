@@ -395,6 +395,12 @@ impl Authority {
         publish::install_free_executor(cowriter::router_free_executor(
             Arc::clone(&br),
             Arc::clone(&meta),
+            // One process plays both nodes (this file's module docs): the
+            // process-global ownership map is the CO-WRITER's all-foreign
+            // one, so the live view would ship the authority's ledger read
+            // to itself. The authority's set is entirely its own here —
+            // the all-local binding is its truth (finding 13's venue law).
+            cowriter::local_owner_view(),
         ));
         publish::install_harvest_executor(cowriter::router_harvest_executor(Arc::clone(&br)));
 

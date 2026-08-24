@@ -346,6 +346,9 @@ impl DebtDrainer {
         crate::meta_exec::spawn_meta("debt_drain_worker", async move {
             loop {
                 notify.notified().await;
+                // Consecutive FRUITLESS passes (outstanding debt, zero
+                // blocks reclaimed) — the escalation input below.
+                let mut fruitless = 0u32;
                 loop {
                     let Some(d) = weak.upgrade() else { return };
                     if d.reclaim.fence_halted() {
@@ -356,7 +359,7 @@ impl DebtDrainer {
                         .fetch_add(1, Ordering::Relaxed);
                     let targets = d.targets_snapshot();
                     let mut outstanding = 0u64;
-                    let mut drained_any = false;
+                    let mut reclaimed_blocks = 0u64;
                     let mut deferred_any = false;
                     let fg = d.must_defer();
                     for (device_path, allocator) in targets {
@@ -375,30 +378,50 @@ impl DebtDrainer {
                                 .block_free_debt_pressure_drains
                                 .fetch_add(1, Ordering::Relaxed);
                         }
-                        // One paced batch per pass (idle passes loop back
-                        // immediately and converge to zero).
+                        // One paced batch per pass.
                         let a = allocator.clone();
                         let dev = device_path.clone();
                         let max = d.batch_blocks as usize;
-                        let _ = squeezefs_ipc::sqz_blocking::run_blocking(move || {
-                            drain_debt_sync(&a, &dev, max, false)
-                        })
-                        .await;
-                        drained_any = true;
+                        let (blocks, _bytes) =
+                            squeezefs_ipc::sqz_blocking::run_blocking(move || {
+                                drain_debt_sync(&a, &dev, max, false)
+                            })
+                            .await;
+                        reclaimed_blocks += blocks;
                     }
+                    // The pass verdict keys on what was RECLAIMED, never
+                    // on whether a batch merely RAN (finding 12,
+                    // 2026-08-23): a grace-held backlog — every offset
+                    // held out of the free list until readers acknowledge
+                    // — makes `take_debt_batch` filter every candidate,
+                    // so a "ran a batch" verdict looped hot forever
+                    // (~5,000 empty blocking-pool jobs/s on an IDLE set
+                    // authority, ~1 core, 88 °C). Fruitless passes tick
+                    // with an escalating sleep capped at 1 s: grace
+                    // releases ride allocation demand, so the next tick
+                    // sees them, and an idle mount pays ≤ 1 wake/s.
                     let park = outstanding == 0;
-                    let defer_tick = deferred_any && !drained_any;
+                    let progressed = reclaimed_blocks > 0;
                     // No Arc across the sleep (the health-worker sentinel
                     // discipline).
                     drop(d);
                     if park {
                         break; // park on notify
                     }
-                    if defer_tick {
-                        // Deferred under foreground: coarse re-evaluation
-                        // tick (the reclaim worker's manners loop pattern).
-                        squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(50)).await;
+                    if progressed {
+                        fruitless = 0;
+                        continue; // real progress: drain on immediately
                     }
+                    // Deferred under foreground keeps its designed 50 ms
+                    // re-evaluation cadence; an unclaimable backlog
+                    // escalates past it toward the 1 s cap.
+                    let ms = if deferred_any {
+                        50
+                    } else {
+                        fruitless = fruitless.saturating_add(1);
+                        (50u64 << fruitless.min(5)).min(1000)
+                    };
+                    squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(ms)).await;
                 }
             }
         });

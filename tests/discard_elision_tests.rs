@@ -483,7 +483,7 @@ async fn a_fully_grace_held_backlog_paces_the_drainer() {
         .expect("the shipped derivation must be safe");
     let owner = MembershipOwner::arm("drain-pace-owner", 3, 2, clocks, clock).expect("owner arms");
     membership::install_owner(Arc::clone(&owner));
-    match owner.join(JoinRequest {
+    let grant = match owner.join(JoinRequest {
         id: "drain-pace-member".to_string(),
         role: MemberRole::Reader,
         endpoint: None,
@@ -493,9 +493,9 @@ async fn a_fully_grace_held_backlog_paces_the_drainer() {
         pr_key: 0,
         mount: None,
     }) {
-        JoinOutcome::Granted(_) => {}
+        JoinOutcome::Granted(g) => g,
         other => panic!("member join must be granted: {other:?}"),
-    }
+    };
     squeezefs::free_grace::arm_owner_plane(LeaseClock::manual(Arc::clone(&ticks)), owner.clocks())
         .expect("the derived bound is safe");
     owner.refresh_free_grace_bound();
@@ -552,4 +552,24 @@ async fn a_fully_grace_held_backlog_paces_the_drainer() {
         "the grace-held debt is still outstanding (nothing was lost to \
          the pacing — the ledger stays honest)"
     );
+
+    // Gauge hygiene for the suite's siblings: the GLOBAL debt gauge must
+    // not carry this test's grace-held bytes into the next test. Release
+    // the holds through the PRODUCTION path — the member acknowledges
+    // everything, the bound republishes, an allocation harvests the ring
+    // back onto the free list — then take the now-claimable debt, which
+    // decrements the gauge.
+    // A large FINITE ack (u64::MAX is min_acked_free_epoch's
+    // "acknowledged nothing" sentinel and reads as 0).
+    assert!(
+        matches!(
+            owner.renew("drain-pace-member", grant.epoch, 1_000_000_000),
+            squeezefs::membership::RenewOutcome::Renewed(_)
+        ),
+        "the acknowledging renewal must be admitted"
+    );
+    owner.refresh_free_grace_bound();
+    let _ = ba.allocate_block().await.expect("harvesting allocation");
+    let _ = ba.take_debt_batch(usize::MAX);
+    assert_eq!(debt_gauge(), 0, "suite-clean: no leaked debt gauge bytes");
 }

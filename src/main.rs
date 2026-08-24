@@ -2559,12 +2559,28 @@ fn print_fsck_report(report: &squeezefs::fsck::FsckReport, json: bool) {
             c.scrub_failures,
         );
     }
-    if report.findings.is_empty() {
+    if report.findings.is_empty() && report.findings_elided == 0 {
         println!("findings: 0 (clean)");
     } else {
-        println!("findings: {}:", report.findings.len());
+        println!(
+            "findings: {}{}:",
+            report.findings.len() as u64 + report.findings_elided,
+            if report.findings_elided > 0 {
+                format!(" (showing {})", report.findings.len())
+            } else {
+                String::new()
+            }
+        );
         for f in &report.findings {
             println!("  [{}] {} — {}", f.class, f.object, f.evidence);
+        }
+        if report.findings_elided > 0 {
+            println!(
+                "  … {} more finding(s) elided from this online view (admin wire cap) — \
+                 the durable report is complete; read it offline: `squeezefs fsck \
+                 sqmeta://…` on the unmounted set",
+                report.findings_elided
+            );
         }
     }
     if let Some(rep) = &report.repair {

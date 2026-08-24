@@ -989,6 +989,7 @@ async fn mirage_report(fx: &Fx) -> FsckReport {
         partial: None,
         repair: None,
         inode_plane_covered: vec![0, 1],
+        findings_elided: 0,
     }
 }
 

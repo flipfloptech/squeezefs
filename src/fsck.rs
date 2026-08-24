@@ -855,11 +855,74 @@ pub struct FsckReport {
     /// worker owns (§5.8.2 clause 2 — never the shard's own claim).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inode_plane_covered: Vec<usize>,
+    /// Findings the ADMIN-LANE view elided to fit the wire cap
+    /// ([`Self::to_bounded_json`]) — 0 on every durable/offline report,
+    /// which is why it never serializes there. Truncation is COUNTED,
+    /// never silent: the CLI names what the view did not show and the
+    /// durable `job:{id}:report` record stays complete.
+    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    pub findings_elided: u64,
+}
+
+fn u64_is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 impl FsckReport {
     pub fn has_findings(&self) -> bool {
-        !self.findings.is_empty()
+        // Elided findings ARE findings: a bounded view must keep the
+        // CLI's exit-1 verdict even for the part it did not print.
+        !self.findings.is_empty() || self.findings_elided > 0
+    }
+
+    /// Render this report as JSON **bounded to `max_bytes` by
+    /// construction** — the admin-lane view (the PR 8 campaign's "reply
+    /// too large" wart): counters and every other field travel intact,
+    /// the finding LIST is truncated to the longest prefix that fits,
+    /// and [`Self::findings_elided`] carries the exact count dropped.
+    ///
+    /// Deliberate bounding is what keeps the wire cap's
+    /// refuse-never-truncate law intact for everything else: an
+    /// oversize reply still refuses unless it was bounded HERE, where
+    /// the truncation is counted and the caller is told.
+    ///
+    /// `None` when even the finding-free skeleton exceeds `max_bytes`
+    /// (a pathological caller bound — the admin cap is 60 KiB and the
+    /// skeleton is O(counters)), so the caller can fall through to the
+    /// loud refusal rather than serve a lie.
+    pub fn to_bounded_json(&self, max_bytes: usize) -> Option<String> {
+        let full = serde_json::to_string(self).ok()?;
+        if full.len() <= max_bytes {
+            return Some(full);
+        }
+        // Binary-search the longest fitting prefix. Encoding is
+        // monotone in the prefix length (findings only ever add bytes),
+        // so the search is sound; O(log n) encodes of a ≤ 60 KiB body.
+        let mut view = self.clone();
+        let (mut lo, mut hi) = (0usize, self.findings.len());
+        let mut best: Option<String> = None;
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            view.findings = self.findings[..mid].to_vec();
+            view.findings_elided = self.findings_elided + (self.findings.len() - mid) as u64;
+            match serde_json::to_string(&view) {
+                Ok(body) if body.len() <= max_bytes => {
+                    best = Some(body);
+                    lo = mid;
+                }
+                _ => hi = mid - 1,
+            }
+        }
+        if best.is_none() && lo == 0 {
+            // No finding fits — serve the counted skeleton if IT fits.
+            view.findings = Vec::new();
+            view.findings_elided = self.findings_elided + self.findings.len() as u64;
+            let body = serde_json::to_string(&view).ok()?;
+            if body.len() <= max_bytes {
+                best = Some(body);
+            }
+        }
+        best
     }
 }
 
@@ -1512,6 +1575,9 @@ pub async fn run(ctx: &FsckCtx, opts: &FsckOptions) -> Result<FsckReport> {
         partial: shard_refs,
         repair: None,
         inode_plane_covered,
+        // A durable/offline report never elides — only the admin-lane
+        // VIEW (`to_bounded_json`) mints a nonzero count.
+        findings_elided: 0,
     })
 }
 
@@ -1644,6 +1710,10 @@ pub fn merge_reports(reports: &[FsckReport]) -> FsckReport {
         }),
         repair: None,
         inode_plane_covered,
+        // Shard/offline reports never elide (the admin VIEW's field);
+        // summing would double-speak if a bounded view were ever fed
+        // back in, and merge inputs are durable reports by contract.
+        findings_elided: 0,
     }
 }
 

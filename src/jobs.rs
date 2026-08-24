@@ -1426,6 +1426,14 @@ impl JobFabric {
             if rest.contains(':') {
                 continue; // shard/progress sub-record
             }
+            if name == crate::job_wire::JOB_ENROLL_XATTR {
+                // The storage-trust secret record — a CONTROL record
+                // sharing the prefix by design (the VL2 reserved-name
+                // screen covers it), never a job: skipped by identity so
+                // every enrolled fleet's census stops logging it as an
+                // undecodable record.
+                continue;
+            }
             if let Some(bytes) = meta.getxattr(ROOT_INO, &name).await? {
                 match serde_json::from_slice::<JobRecord>(&bytes) {
                     Ok(rec) if rec.schema == 1 => out.push(rec),
@@ -1967,6 +1975,12 @@ impl JobFabric {
                 while bytes.len() > cap && !to_store.findings.is_empty() {
                     to_store.findings.pop();
                     truncated += 1;
+                    // COUNTED into the record itself (the admin view's
+                    // `findings_elided` law): the CLI names what the
+                    // stored artifact could not carry, and
+                    // `has_findings` keeps the exit-1 verdict for the
+                    // elided part.
+                    to_store.findings_elided = truncated as u64;
                     bytes = serde_json::to_vec(&to_store).unwrap_or_default();
                 }
                 if truncated > 0 {

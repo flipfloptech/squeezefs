@@ -1607,8 +1607,33 @@ impl crate::ipc_host::AdminSink for FabricAdminSink {
                         .await
                         .map_err(|e| e.to_string())?
                     {
-                        Some(bytes) => String::from_utf8(bytes)
-                            .map_err(|_| "report payload not UTF-8".to_string()),
+                        Some(bytes) => {
+                            let raw = String::from_utf8(bytes)
+                                .map_err(|_| "report payload not UTF-8".to_string())?;
+                            if raw.len() <= squeezefs_ipc::wire::ADMIN_BODY_MAX {
+                                return Ok(raw);
+                            }
+                            // A large finding list must serve a BOUNDED
+                            // view, never meet the generic wire-cap
+                            // refusal (the PR 8 campaign's 152-finding
+                            // "reply too large" wart): counters intact,
+                            // the longest fitting finding prefix, and
+                            // `findings_elided` counting the rest — the
+                            // durable record stays complete for the
+                            // offline probe. An undecodable oversize
+                            // payload falls through to the refusal.
+                            let report: crate::fsck::FsckReport = serde_json::from_str(&raw)
+                                .map_err(|e| format!("undecodable durable report: {e}"))?;
+                            report
+                                .to_bounded_json(squeezefs_ipc::wire::ADMIN_BODY_MAX)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "report for job {job_id} cannot be bounded to the \
+                                         admin wire cap — read it offline (`squeezefs fsck \
+                                         sqmeta://…` on the unmounted set)"
+                                    )
+                                })
+                        }
                         None => Err(format!(
                             "no report for job {job_id} (still running? see job-status)"
                         )),

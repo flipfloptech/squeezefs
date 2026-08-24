@@ -1110,41 +1110,48 @@ async fn an_oversize_fsck_report_serves_a_bounded_view_not_a_refusal() {
     let host = IpcHost::spawn(cfg.clone(), Arc::new(NoDataPlane)).expect("host");
     host.set_admin_sink(Arc::new(FabricAdminSink::new(fab.clone())));
 
-    // A report whose raw JSON is well past the admin wire cap: 2,000
-    // findings with the verbose evidence strings a real C2/C8 sweep
-    // writes (the acceptance run's 152 were enough at ~600 B each).
-    let total_findings = 2_000usize;
-    let report = squeezefs::fsck::FsckReport {
+    // A report whose raw JSON exceeds the ADMIN wire cap (60 KiB) while
+    // still fitting the per-volume xattr value cap (64 KiB) — the window
+    // where the durable record persists whole and only the online VIEW
+    // must bound (the acceptance run's 152 verbose findings were ~66 KB
+    // and hit BOTH; the store site counts its own truncation on the same
+    // field, so this test isolates the view half).
+    let finding = |i: usize| squeezefs::fsck::FsckFinding {
+        class: "C2".to_string(),
+        object: format!("vol-00000000000000aa block {i}"),
+        evidence: format!(
+            "allocated block {i} is referenced by no live inode layout (leak): refcount \
+             census says 1, reverse walk found no owner"
+        ),
+        identity: None,
+    };
+    let mut findings = Vec::new();
+    let mut report = squeezefs::fsck::FsckReport {
         schema: squeezefs::fsck::FSCK_REPORT_SCHEMA,
         mode: "online".to_string(),
         shard: None,
-        findings: (0..total_findings)
-            .map(|i| squeezefs::fsck::FsckFinding {
-                class: "C2".to_string(),
-                object: format!("vol-00000000000000aa block {i}"),
-                evidence: format!(
-                    "allocated block {i} is referenced by no live inode layout (leak): \
-                     refcount census says 1, reverse walk found no owner — padding so each \
-                     finding costs what a field finding costs on the wire"
-                ),
-                identity: None,
-            })
-            .collect(),
+        findings: Vec::new(),
         counters: squeezefs::fsck::FsckCounters {
             inodes_scanned: 12_345,
-            findings: total_findings as u64,
             ..Default::default()
         },
         partial: None,
         repair: None,
         inode_plane_covered: Vec::new(),
+        findings_elided: 0,
     };
-    let raw = serde_json::to_string(&report).expect("report serializes");
+    let mut raw = String::new();
+    while raw.len() <= squeezefs_ipc::wire::ADMIN_BODY_MAX + 2048 {
+        findings.push(finding(findings.len()));
+        report.findings = findings.clone();
+        report.counters.findings = findings.len() as u64;
+        raw = serde_json::to_string(&report).expect("report serializes");
+    }
+    let total_findings = findings.len();
     assert!(
-        raw.len() > squeezefs_ipc::wire::ADMIN_BODY_MAX,
-        "fixture must exceed the admin wire cap (raw {} B, cap {} B)",
+        raw.len() > squeezefs_ipc::wire::ADMIN_BODY_MAX && raw.len() < 64 * 1024,
+        "fixture must exceed the admin wire cap yet fit the xattr value cap (raw {} B)",
         raw.len(),
-        squeezefs_ipc::wire::ADMIN_BODY_MAX
     );
     fx.meta
         .setxattr(1, "job:bigfsck:report", raw.as_bytes())
@@ -1153,7 +1160,10 @@ async fn an_oversize_fsck_report_serves_a_bounded_view_not_a_refusal() {
 
     let sock = abstract_connect(&cfg.socket_name).expect("connect");
     let reply = admin_hello(&sock, &host, &cfg.build_commit);
-    assert!(matches!(reply, CtlMsg::AdminOk), "admin admitted: {reply:?}");
+    assert!(
+        matches!(reply, CtlMsg::AdminOk),
+        "admin admitted: {reply:?}"
+    );
 
     let (ok, body) = admin_req(&sock, "fsck-report", "bigfsck");
     assert!(

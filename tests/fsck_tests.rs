@@ -1567,6 +1567,7 @@ fn test_report_json_roundtrip_and_merge_dedupe() {
         partial: None,
         repair: None,
         inode_plane_covered: Vec::new(),
+        findings_elided: 0,
     };
     let r2 = FsckReport {
         schema: 1,
@@ -1581,6 +1582,7 @@ fn test_report_json_roundtrip_and_merge_dedupe() {
         partial: None,
         repair: None,
         inode_plane_covered: Vec::new(),
+        findings_elided: 0,
     };
     let json = serde_json::to_string(&r1).unwrap();
     let back: FsckReport = serde_json::from_str(&json).unwrap();

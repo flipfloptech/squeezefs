@@ -1077,3 +1077,185 @@ async fn cancel_inside_the_park_window_stays_terminal() {
         st.state
     );
 }
+
+// ---------------------------------------------------------------------------
+// The bounded fsck-report view + the enroll control record (the two CLI
+// warts the PR 8 acceptance campaign named — `.benchmarks/
+// 2026-08-22-pv-claim-admission.md` findings 9's tail and the fleet log's
+// `job fabric: undecodable record job:enroll` WARN)
+// ---------------------------------------------------------------------------
+
+/// **The online fsck verb must serve a finding list of ANY size as a
+/// BOUNDED view, never a refusal.** The acceptance run's second online
+/// fsck (152 verbose findings) blew the `ADMIN_BODY_MAX` wire cap and the
+/// whole reply refused with "reply too large" — the verb failing at its
+/// one job precisely when it matters (a volume with many findings).
+///
+/// The contract: the DURABLE report (the `job:{id}:report` xattr) stays
+/// complete; the admin-lane VIEW is bounded BY CONSTRUCTION — counters
+/// intact, as many findings as fit, and `findings_elided` carrying the
+/// exact truncation count so the CLI can name what it did not show. The
+/// wire-cap refusal stays for every reply that is not deliberately
+/// bounded (truncation must never be silent — that law is unchanged).
+///
+/// RED against dev (5c921cf2): the verb returns the stored JSON verbatim
+/// and the oversize arm refuses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_oversize_fsck_report_serves_a_bounded_view_not_a_refusal() {
+    let fx = fixture("fsck-bounded").await;
+    let fab = fabric(&fx, 1).await;
+    // SAFETY: getuid is trivially safe.
+    let owner = unsafe { libc::getuid() };
+    let cfg = admin_host_cfg("fsck-bounded", false, owner);
+    let host = IpcHost::spawn(cfg.clone(), Arc::new(NoDataPlane)).expect("host");
+    host.set_admin_sink(Arc::new(FabricAdminSink::new(fab.clone())));
+
+    // A report whose raw JSON is well past the admin wire cap: 2,000
+    // findings with the verbose evidence strings a real C2/C8 sweep
+    // writes (the acceptance run's 152 were enough at ~600 B each).
+    let total_findings = 2_000usize;
+    let report = squeezefs::fsck::FsckReport {
+        schema: squeezefs::fsck::FSCK_REPORT_SCHEMA,
+        mode: "online".to_string(),
+        shard: None,
+        findings: (0..total_findings)
+            .map(|i| squeezefs::fsck::FsckFinding {
+                class: "C2".to_string(),
+                object: format!("vol-00000000000000aa block {i}"),
+                evidence: format!(
+                    "allocated block {i} is referenced by no live inode layout (leak): \
+                     refcount census says 1, reverse walk found no owner — padding so each \
+                     finding costs what a field finding costs on the wire"
+                ),
+                identity: None,
+            })
+            .collect(),
+        counters: squeezefs::fsck::FsckCounters {
+            inodes_scanned: 12_345,
+            findings: total_findings as u64,
+            ..Default::default()
+        },
+        partial: None,
+        repair: None,
+        inode_plane_covered: Vec::new(),
+    };
+    let raw = serde_json::to_string(&report).expect("report serializes");
+    assert!(
+        raw.len() > squeezefs_ipc::wire::ADMIN_BODY_MAX,
+        "fixture must exceed the admin wire cap (raw {} B, cap {} B)",
+        raw.len(),
+        squeezefs_ipc::wire::ADMIN_BODY_MAX
+    );
+    fx.meta
+        .setxattr(1, "job:bigfsck:report", raw.as_bytes())
+        .await
+        .expect("plant the durable report");
+
+    let sock = abstract_connect(&cfg.socket_name).expect("connect");
+    let reply = admin_hello(&sock, &host, &cfg.build_commit);
+    assert!(matches!(reply, CtlMsg::AdminOk), "admin admitted: {reply:?}");
+
+    let (ok, body) = admin_req(&sock, "fsck-report", "bigfsck");
+    assert!(
+        ok,
+        "an oversize finding list must serve a bounded view, not refuse: {body}"
+    );
+    assert!(
+        body.len() <= squeezefs_ipc::wire::ADMIN_BODY_MAX,
+        "the bounded view must fit the wire cap ({} B > {} B)",
+        body.len(),
+        squeezefs_ipc::wire::ADMIN_BODY_MAX
+    );
+    let view: squeezefs::fsck::FsckReport =
+        serde_json::from_str(&body).expect("the bounded view is a valid FsckReport");
+    assert!(
+        !view.findings.is_empty(),
+        "the bounded view carries as many findings as fit — never zero when findings exist"
+    );
+    assert!(
+        view.findings_elided > 0,
+        "the truncation must be COUNTED, never silent"
+    );
+    assert_eq!(
+        view.findings.len() as u64 + view.findings_elided,
+        total_findings as u64,
+        "served + elided must account for every durable finding"
+    );
+    assert_eq!(
+        view.findings[..],
+        report.findings[..view.findings.len()],
+        "the served prefix is the durable report's own findings, verbatim and in order"
+    );
+    assert_eq!(
+        view.counters, report.counters,
+        "counters travel intact — only the finding LIST is bounded"
+    );
+    assert!(
+        view.has_findings(),
+        "a bounded view with elided findings still reads as has-findings (the CLI's exit-1)"
+    );
+
+    // A report that FITS keeps serving verbatim: no elision field minted.
+    let small = squeezefs::fsck::FsckReport {
+        findings: report.findings[..2].to_vec(),
+        counters: report.counters.clone(),
+        ..report
+    };
+    let small_raw = serde_json::to_string(&small).expect("serializes");
+    fx.meta
+        .setxattr(1, "job:smallfsck:report", small_raw.as_bytes())
+        .await
+        .expect("plant the small report");
+    let (ok, body) = admin_req(&sock, "fsck-report", "smallfsck");
+    assert!(ok, "a fitting report serves: {body}");
+    assert_eq!(
+        body, small_raw,
+        "a fitting report serves VERBATIM — bounding engages only past the cap"
+    );
+}
+
+/// **`job:enroll` is a CONTROL record, not an undecodable job.** The
+/// storage-trust secret record shares the `job:` prefix (deliberately —
+/// the VL2 reserved-namespace screen covers it), has no `:` sub-record
+/// separator, and is NOT a `JobRecord` — so every `list_records` pass on
+/// every enrolled fleet logged `job fabric: undecodable record
+/// job:enroll` forever. The listing must skip it by IDENTITY (the
+/// `JOB_ENROLL_XATTR` constant, one name shared with the writer), and
+/// the jobs census must be exactly the submitted jobs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_enroll_record_is_a_control_record_not_an_undecodable_job() {
+    let fx = fixture("enroll-record").await;
+    let fab = fabric(&fx, 1).await;
+    // The real record shape `job_wire::read_enroll_secret` writes/reads.
+    fx.meta
+        .setxattr(
+            1,
+            squeezefs::job_wire::JOB_ENROLL_XATTR,
+            br#"{"secret":"00112233445566778899aabbccddeeff"}"#,
+        )
+        .await
+        .expect("plant the enroll record");
+
+    let job_id = fab
+        .submit(JobSpec {
+            job_type: JobType::Noop {
+                tasks: 1,
+                task_ms: 1,
+            },
+            throttle_pct: 100,
+        })
+        .await
+        .expect("submit");
+    fab.wait_terminal(&job_id, Duration::from_secs(30))
+        .await
+        .expect("terminal");
+
+    let recs = squeezefs::jobs::JobFabric::list_records(fab.meta_handle())
+        .await
+        .expect("list_records");
+    assert_eq!(
+        recs.iter().map(|r| r.job_id.as_str()).collect::<Vec<_>>(),
+        vec![job_id.as_str()],
+        "the census is exactly the submitted jobs — the enroll record is skipped by identity"
+    );
+}

@@ -611,7 +611,26 @@ Filled in as the run proceeds. Landed with this branch:
     gauge is now fed at the two VERDICT sites only — fsck's confirmed C8
     findings (the confirm pass memoizes one fresh comparison) and the
     quiesced mount-init post-sweep verify.
-12. **OPEN — the idle block-worker spin** (found by the rig's own
+12a. **Finding 12 FIXED** (`834654ef`): the spin was the discard-debt
+    drainer — a grace-held backlog makes `take_debt_batch` filter every
+    candidate (correct), but the loop counted "a batch ran" as progress
+    and neither parked nor paced: 188,578 empty passes/s in the pin's
+    sandbox, ~5,000 blocking-pool jobs/s live (gdb breakpoint conviction
+    at `ensure_worker`'s `run_blocking`). The pass verdict now keys on
+    RECLAIMED blocks; fruitless passes tick with an escalating sleep
+    capped at 1 s (`block_free_debt_drain_passes` is the pacing
+    instrument). Verified live: the triggering extract+delete leaves the
+    set authority at ~0 % idle CPU, no hot threads.
+13. **OPEN — leg (c)'s ships≡serves refusal**: on the fixed binary the
+    rewrite-funnel leg refuses with "the partial shipped 128 free
+    block(s) and the authority served 0 — the ledgers must close".
+    Suspicious neighbor in m20's remount log: `ro_coherence` armed the
+    READER-class data plane on the partial authority ("terminal frees …
+    refused; the reclaim queue is latched halted") — a posture
+    classification worth checking before the serve path. The next fix
+    loop; legs (c)/(b)/(d) + the census still owe their from-zero run.
+12. **The idle block-worker spin (superseded by 12a — kept for the
+    record)** (found by the rig's own
     quiet-box gate blocking leg (c)): an IDLE fleet daemon burns ~1 core
     in the `sqz-blk*` NvmeBlockDev io_uring workers — futex-parked stacks
     but ~1,000 park/wake cycles per second per worker

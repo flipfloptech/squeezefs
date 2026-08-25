@@ -1849,7 +1849,38 @@ pub async fn execute_lane_harvest(
     with_authority_accounting(async move {
         let max = max.max(1) as usize;
         let mut out: Vec<u64> = Vec::new();
-        for pass in 0..2u8 {
+        for pass in 0..3u8 {
+            // Finding 15 (`.benchmarks/2026-08-25-s11-freeloop-stall.md`):
+            // this is a REMOTE allocation funnel, so it runs the same
+            // grace-ring head the local one does (`try_allocate_block`) —
+            // without it, a grace-armed fleet's displaced offsets were
+            // releasable yet unreachable (the ring is harvested only from
+            // the authority's own allocation/free contexts, which stop
+            // running exactly when the fleet's writers are the starving
+            // ones), and the s11 row ENOSPC'd on a healthy volume with
+            // the pressure gauge reading 0.
+            match pass {
+                0 => alloc.harvest_grace(),
+                1 => {
+                    // Nothing free in the lane: the supply may still be
+                    // queued behind the reclaim manners law — drain, run
+                    // the ring head again (the drain's finish_free defers
+                    // INTO the ring on an armed plane), and rescan.
+                    backend.reclaim_drain().await;
+                    alloc.harvest_grace();
+                }
+                _ => {
+                    // Still nothing: this writer is at its allocation
+                    // cliff, which is exactly what the PRESSURE deadline
+                    // exists for (the pressure ruling: prompt progress
+                    // past one honest ack cycle, a fenced laggard —
+                    // never a broken promise). This is also what makes
+                    // the valve's reading honest fleet-wide: the capture
+                    // ran a whole ENOSPC storm at pressure_pct 0 because
+                    // only the authority's OWN cliff ever fed it.
+                    alloc.harvest_grace_pressure();
+                }
+            }
             let mut candidates: Vec<u64> = alloc
                 .free_block_indices()
                 .into_iter()
@@ -1868,12 +1899,9 @@ pub async fn execute_lane_harvest(
                     out.push(idx);
                 }
             }
-            if !out.is_empty() || pass == 1 {
+            if !out.is_empty() {
                 break;
             }
-            // Nothing free in the lane: the supply may still be queued
-            // behind the reclaim manners law — drain and rescan once.
-            backend.reclaim_drain().await;
         }
         if !out.is_empty() {
             let chunk = alloc.chunk_size();

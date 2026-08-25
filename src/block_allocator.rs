@@ -2279,8 +2279,11 @@ impl BlockAllocator {
     /// Cost on a mount with no reader plane: one relaxed load
     /// (the empty-ring probe below), and nothing else — the free supply is
     /// computed only once something is actually held.
+    /// `pub(crate)`: the shipped LANE HARVEST is a remote allocation
+    /// funnel and runs the same head (finding 15 —
+    /// `crate::cowriter::execute_lane_harvest`).
     #[inline]
-    fn harvest_grace(&self) {
+    pub(crate) fn harvest_grace(&self) {
         if self.grace.is_empty() {
             return;
         }
@@ -2315,7 +2318,9 @@ impl BlockAllocator {
     /// acknowledgement cycle instead of the routine bound) — it never
     /// releases an unacknowledged offset without evicting the member
     /// responsible. Returns the number published.
-    fn harvest_grace_pressure(&self) -> usize {
+    /// `pub(crate)`: an EMPTY lane harvest is `StorageFull`-imminent on
+    /// the remote writer, so it evaluates this same deadline (finding 15).
+    pub(crate) fn harvest_grace_pressure(&self) -> usize {
         let released = self
             .grace
             .harvest_pressure(crate::free_grace::HARVEST_BATCH);

@@ -627,12 +627,21 @@ the S10 gate; the rest are carried, priced, and loud where they can fire.
    and the s11-mpiio rig sizes back into the 10 GiB domain. Ran the
    indirect domain LIVE (probe 1,582 MiB/s → 10,240 MiB shared file,
    12 iterations, zero fsync EIO — structurally impossible pre-branch).
-   **The acceptance row itself stays OPEN**: the only venue measured that
-   reaches ≥ 750 MiB/s probe (the strixhalo laptop) fails the sustained
-   flatness gate thermally, and the cheap fabric venue reaches neither
-   the bandwidth nor a valid engagement (see item 7). Re-run under
-   thermal mitigation is the open path.
-   `.benchmarks/2026-08-18-s11-widthn-refs-fix.md`.
+   **The acceptance row itself stays OPEN — and the blocker was
+   re-attributed 2026-08-25** (`.benchmarks/2026-08-25-s11-freeloop-stall.md`,
+   finding 15): the thermal story is retired — at stock clocks the box
+   probes 2,240 MiB/s (above the 2026-08-19 number; the clock-cap
+   mitigation arm collapsed the probe 95× and is falsified) — and the
+   row now aborts on **lane ENOSPC under sustained rewrite**: the
+   freed-offset loop (grace ring → release → lane harvest) recycles at
+   ~65 MiB/s against 2.2 GiB/s of displacement demand (~34× short),
+   with `free_grace_pressure_pct` pinned at 0 throughout because the
+   valve's scarcity forecast reads the volume-GLOBAL free supply while
+   allocation starves per-LANE (rung-19 residual 3's predicted shape,
+   first captured on the acceptance row, post-valve). The open path is
+   the free-loop sustain campaign: a lane-aware pressure signal + a
+   demand-coupled release/harvest path, red-first, then this row from
+   zero. `.benchmarks/2026-08-18-s11-widthn-refs-fix.md`.
 2. **The `SQUEEZEFS_RANGE_CUSTODY` default flip** — upheld OFF three times
    (rungs 15/17/18). Preconditions now exactly two: residual 1 closed, and
    the `s11-range` + §9.5 row gates green ×3 from zero on the flipped
@@ -640,7 +649,10 @@ the S10 gate; the rest are carried, priced, and loud where they can fire.
    the ranged plane fabricating custody contention on fully-aligned
    disjoint writes (item 7's capture) — the flip now ALSO reads that
    finding's fix, or a recorded ruling that localhost-gate green
-   suffices, as an input (the evidence note's verdict 4).
+   suffices, as an input (the evidence note's verdict 4). **2026-08-25
+   addendum**: finding 15 (residual 1's re-attributed blocker — the
+   free-loop rewrite-rate stall) gates the same row and is therefore a
+   flip input too.
 3. **Per-volume claim admission — the fleet-of-authorities recipe**
    — **ADMISSION HALF CLOSED 2026-08-24**:
    `docs/design-per-volume-claim-admission.md` ran its full PR ladder

@@ -1170,6 +1170,23 @@ pub struct AckInputs {
     pub qualify_lag_ms: u64,
     /// `staleness_bound + D_purge`.
     pub drain_lag_ms: u64,
+    /// The acknowledgement-refresh floor (`ack_refresh_floor` — the pass
+    /// cadence's own floor): the PIPELINE DEPTH derivation's input
+    /// (sustain campaign §5.1 — depth is derived, never a knob).
+    pub refresh_floor_ms: u64,
+}
+
+/// One in-flight acknowledgement candidate (sustain campaign §5.1): its
+/// own learned-at snapshot (the anti-starvation law, per candidate) and
+/// its own qualify/drain state — no label's gates ever move.
+#[derive(Debug, Clone, Copy)]
+struct AckCandidate {
+    label: u64,
+    learned_at_ms: u64,
+    /// `now` of the pass that qualified it (`0` = unqualified).
+    qualified_pass_now_ms: u64,
+    /// `qualified_pass_now + drain_lag` (`0` = unset).
+    ready_at_ms: u64,
 }
 
 /// The reader's acknowledgement ladder: it decides WHEN an echoed label
@@ -1214,74 +1231,111 @@ pub struct AckInputs {
 /// it reachable by design. So the ladder SNAPSHOTS the label it is working
 /// on: fresher labels wait their turn, and a faster beat only ever makes
 /// the snapshot fresher.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ReaderAckLadder {
-    /// The label the ladder is currently working on, and the member-clock
-    /// instant IT was learned at — fixed until it is acknowledged.
-    candidate: AtomicU64,
-    candidate_at_ms: AtomicU64,
-    qualified: AtomicU64,
-    ready_at_ms: AtomicU64,
+    /// The in-flight candidates, learn-ordered (sustain campaign §5.1 —
+    /// the bounded pipeline; the shipped single-candidate ladder is the
+    /// depth-1 special case the A/B lever restores). `note_pass` runs once
+    /// per second on the revalidation task — nowhere near a hot path.
+    queue: parking_lot::Mutex<std::collections::VecDeque<AckCandidate>>,
+    /// The published word the renewal reader loads.
     acked: AtomicU64,
-}
-
-impl Default for ReaderAckLadder {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// Gauge: promote-instant `now − learned_at(acked)` — the reader's own
+    /// contribution to the loop latency (`free_grace_acked_lag_ms`, §8).
+    acked_lag_ms: AtomicU64,
+    /// Gauge: candidates in flight after the last pass
+    /// (`free_grace_ack_pipeline_depth`, §8).
+    depth: AtomicU64,
 }
 
 impl ReaderAckLadder {
     /// An empty ladder (nothing qualified, nothing acknowledged).
-    pub const fn new() -> Self {
-        Self {
-            candidate: AtomicU64::new(0),
-            candidate_at_ms: AtomicU64::new(0),
-            qualified: AtomicU64::new(0),
-            ready_at_ms: AtomicU64::new(0),
-            acked: AtomicU64::new(0),
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Feed one completed revalidation pass. `Some(label)` ⇔ this pass
     /// promoted an acknowledgement, which the caller carries to the plane.
+    ///
+    /// Every candidate keeps the shipped ladder's three gates VERBATIM —
+    /// pipelining changes only how many labels ride concurrently (§5.1's
+    /// correctness argument): (1) an epoch-step purge, (2) a pass that
+    /// began ≥ `learned_at + qualify_lag`, (3) `drain_lag` elapsed since
+    /// that pass. Labels adopt in learn order, so promotion is monotone.
     pub fn note_pass(&self, i: AckInputs) -> Option<u64> {
-        let pending = self.qualified.load(Ordering::Acquire);
+        // Depth: derived, never a knob — enough slots to keep adopting for
+        // one full qualify+drain window at the pass cadence, plus slack
+        // (= 9 on the shipped s11-venue derivation). The lever's depth-1
+        // arm is the pre-campaign ladder verbatim.
+        let cap = if ack_pipeline_enabled() {
+            (((i.qualify_lag_ms.saturating_add(i.drain_lag_ms)).div_ceil(i.refresh_floor_ms.max(1))
+                as usize)
+                .saturating_add(2))
+            .clamp(2, 16)
+        } else {
+            1
+        };
         let acked = self.acked.load(Ordering::Acquire);
-        // (0) Adopt a candidate when nothing is in flight. From here the
-        // ladder aims at THIS label until it is acknowledged — a later,
-        // fresher label is a better statement, but chasing it is how a
-        // short renewal cadence starves the ladder (see the type docs).
-        let mut candidate = self.candidate.load(Ordering::Acquire);
-        if pending <= acked && candidate <= acked && i.label > acked {
-            self.candidate.store(i.label, Ordering::Release);
-            self.candidate_at_ms
-                .store(i.learned_at_ms, Ordering::Release);
-            candidate = i.label;
+        let mut q = self.queue.lock();
+        // (0) Adopt: a label fresher than the newest candidate joins with
+        // its OWN learned-at snapshot (the anti-starvation law per
+        // candidate — a faster beat only ever makes the NEWEST candidate
+        // fresher, never moves an adopted one's target).
+        let newest = q.back().map(|c| c.label).unwrap_or(acked);
+        if i.label > newest && i.label > acked {
+            if q.len() >= cap && cap > 1 {
+                // The high-water rule: drop the oldest UNQUALIFIED
+                // candidate in favour of the newest label (acking a
+                // fresher label subsumes the older). Qualified candidates
+                // are never dropped — anything that reached qualification
+                // always promotes, which is the no-wedge half. At depth 1
+                // (the lever) nothing is ever displaced: the shipped
+                // snapshot law.
+                if let Some(pos) = q.iter().position(|c| c.qualified_pass_now_ms == 0) {
+                    q.remove(pos);
+                }
+            }
+            if q.len() < cap {
+                q.push_back(AckCandidate {
+                    label: i.label,
+                    learned_at_ms: i.learned_at_ms,
+                    qualified_pass_now_ms: 0,
+                    ready_at_ms: 0,
+                });
+            }
         }
-        // (1) + (2): qualify the CANDIDATE — a pending one is always the
-        // oldest (and therefore the soonest-ready) statement we can make.
-        if i.advanced
-            && candidate > acked
-            && pending <= acked
-            && i.pass_start_ms
-                >= self
-                    .candidate_at_ms
-                    .load(Ordering::Acquire)
-                    .saturating_add(i.qualify_lag_ms)
-        {
-            self.qualified.store(candidate, Ordering::Release);
-            self.ready_at_ms
-                .store(i.now_ms.saturating_add(i.drain_lag_ms), Ordering::Release);
+        // (1) + (2): an advancing pass qualifies EVERY candidate whose
+        // learn instant is old enough — each on its own gate, verbatim.
+        if i.advanced {
+            for c in q
+                .iter_mut()
+                .filter(|c| c.qualified_pass_now_ms == 0)
+                .filter(|c| i.pass_start_ms >= c.learned_at_ms.saturating_add(i.qualify_lag_ms))
+            {
+                c.qualified_pass_now_ms = i.now_ms;
+                c.ready_at_ms = i.now_ms.saturating_add(i.drain_lag_ms);
+            }
         }
-        // (3): promote once the drain window has elapsed.
-        let qualified = self.qualified.load(Ordering::Acquire);
-        if qualified > self.acked.load(Ordering::Acquire)
-            && i.now_ms >= self.ready_at_ms.load(Ordering::Acquire)
-        {
-            self.acked.store(qualified, Ordering::Release);
+        // (3): promote the deepest qualified-and-drained prefix (learn
+        // order = label order, and an advancing pass qualifies front-first,
+        // so the prefix is the whole promotable set). ONE ack is emitted —
+        // the max — because acking it subsumes everything beneath.
+        let mut promoted: Option<AckCandidate> = None;
+        while let Some(front) = q.front() {
+            if front.qualified_pass_now_ms != 0 && i.now_ms >= front.ready_at_ms {
+                promoted = q.pop_front();
+            } else {
+                break;
+            }
+        }
+        self.depth.store(q.len() as u64, Ordering::Relaxed);
+        drop(q);
+        if let Some(c) = promoted {
+            self.acked.store(c.label, Ordering::Release);
+            self.acked_lag_ms
+                .store(i.now_ms.saturating_sub(c.learned_at_ms), Ordering::Relaxed);
             READER_ACKS.fetch_add(1, Ordering::Relaxed);
-            return Some(qualified);
+            return Some(c.label);
         }
         None
     }
@@ -1291,20 +1345,78 @@ impl ReaderAckLadder {
         self.acked.load(Ordering::Acquire)
     }
 
-    /// The label awaiting its drain window (`0` = none pending).
+    /// The highest label awaiting its drain window (`0` = none pending).
     pub fn pending(&self) -> u64 {
-        let q = self.qualified.load(Ordering::Acquire);
-        if q > self.acked() {
-            q
-        } else {
-            0
+        self.queue
+            .lock()
+            .iter()
+            .rev()
+            .find(|c| c.qualified_pass_now_ms != 0)
+            .map(|c| c.label)
+            .unwrap_or(0)
+    }
+
+    /// Candidates in flight (`free_grace_ack_pipeline_depth` — ≤ the
+    /// derived cap; ≤ 1 under the depth-1 lever).
+    pub fn depth(&self) -> u64 {
+        self.depth.load(Ordering::Relaxed)
+    }
+
+    /// Promote-instant `now − learned_at(acked)` — the reader's own
+    /// contribution to the loop latency (`free_grace_acked_lag_ms`).
+    pub fn acked_lag_ms(&self) -> u64 {
+        self.acked_lag_ms.load(Ordering::Relaxed)
+    }
+
+    /// Test seam: drop every in-flight candidate and zero the words.
+    fn reset(&self) {
+        self.queue.lock().clear();
+        self.acked.store(0, Ordering::Relaxed);
+        self.acked_lag_ms.store(0, Ordering::Relaxed);
+        self.depth.store(0, Ordering::Relaxed);
+    }
+}
+
+/// The `SQUEEZEFS_FREE_GRACE_ACK_PIPELINE` lever's latch: 0 = unread,
+/// 1 = on, 2 = off. Latched on first use (the knob registry refuses bad
+/// values at startup; ENG-10), overridable by the test seam.
+static ACK_PIPELINE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn ack_pipeline_enabled() -> bool {
+    match ACK_PIPELINE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = crate::env_knobs::bool_knob("SQUEEZEFS_FREE_GRACE_ACK_PIPELINE", true);
+            ACK_PIPELINE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
         }
     }
 }
 
+/// Test seam (the contracts drive both lever arms in one process):
+/// `Some(on)` presets the latch; `None` returns it to the knob.
+pub fn test_set_ack_pipeline(on: Option<bool>) {
+    ACK_PIPELINE.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Test seam: `true` ⇔ a preset was in force; the latch returns to the
+/// knob either way.
+pub fn test_clear_ack_pipeline() -> bool {
+    ACK_PIPELINE.swap(0, Ordering::Relaxed) != 0
+}
+
 /// The mount's ladder (one reader per process — the
 /// `membership::INSTALLED` shape).
-static LADDER: ReaderAckLadder = ReaderAckLadder::new();
+static LADDER: once_cell::sync::Lazy<ReaderAckLadder> =
+    once_cell::sync::Lazy::new(ReaderAckLadder::default);
 
 /// **The reader's hook**: called by the S5 revalidation task after every
 /// pass ([`crate::ro_coherence::spawn_reader_revalidation`]).
@@ -1328,6 +1440,10 @@ pub fn reader_pass_completed(pass_start_ms: u64, advanced: bool) -> Option<u64> 
         advanced,
         qualify_lag_ms: staleness + session.skew_max_ms(),
         drain_lag_ms: staleness + session.d_purge_ms(),
+        // The pass cadence's own floor (`ack_refresh_floor`'s arithmetic,
+        // reader-side): the pipeline-depth derivation's input.
+        refresh_floor_ms: (crate::ro_coherence::reader_revalidate_interval().as_millis() as u64)
+            .max(session.skew_max_ms()),
     });
     if let Some(label) = out {
         session.ack_free_epoch(label);
@@ -1492,6 +1608,11 @@ pub fn stats_snapshot() -> serde_json::Value {
                 "free_grace_acked_label": session.acked_free_epoch(),
                 "free_grace_learned_label": label,
                 "free_grace_reader_pending_label": LADDER.pending(),
+                // PR 2 (L1): the pipeline's reader gauges — candidates in
+                // flight (≤ the derived cap; ≤ 1 under the depth-1 lever)
+                // and the reader's own promote lag.
+                "free_grace_ack_pipeline_depth": LADDER.depth(),
+                "free_grace_acked_lag_ms": LADDER.acked_lag_ms(),
             });
         }
         return serde_json::json!({ "free_grace_mode": "off" });
@@ -1558,9 +1679,6 @@ pub fn reset_for_test() {
         b.store(0, Ordering::Relaxed);
     }
     RUNWAY_MS.store(u64::MAX, Ordering::Relaxed);
-    LADDER.candidate.store(0, Ordering::Relaxed);
-    LADDER.candidate_at_ms.store(0, Ordering::Relaxed);
-    LADDER.qualified.store(0, Ordering::Relaxed);
-    LADDER.ready_at_ms.store(0, Ordering::Relaxed);
-    LADDER.acked.store(0, Ordering::Relaxed);
+    LADDER.reset();
+    test_set_ack_pipeline(None);
 }

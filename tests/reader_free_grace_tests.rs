@@ -1582,6 +1582,7 @@ fn a_tightened_renewal_cadence_never_starves_the_ack_ladder() {
             advanced: true,
             qualify_lag_ms: QUALIFY_LAG_MS,
             drain_lag_ms: DRAIN_LAG_MS,
+            refresh_floor_ms: POLL_MS,
         }) {
             acked.push(l);
         }

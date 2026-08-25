@@ -694,6 +694,7 @@ fn a_reader_acknowledges_only_after_the_purge_and_the_drain() {
         advanced,
         qualify_lag_ms: 2_000,
         drain_lag_ms: 4_000,
+        refresh_floor_ms: 1_000,
     };
 
     // Too early: the dereference need not be checkpointed yet.
@@ -1610,16 +1611,10 @@ fn a_tightened_renewal_cadence_never_starves_the_ack_ladder() {
 // pinned-current-behavior contracts the later PRs invert
 // ===========================================================================
 
-/// **PINNED CURRENT BEHAVIOR — inverted by PR 2 (`ack-pipeline`).** The
-/// shipped ladder holds ONE candidate in flight: a fresher label arriving
-/// mid-qualification does not open a second cycle, so acks advance at most
-/// one label per full qualify+drain cycle (the T6 quantization §3.2
-/// derives). PR 2's tests-first commit flips this assertion red.
-#[test]
-fn pinned_ack_advance_is_beat_quantized_at_depth_one() {
-    let _serial = serial();
-    let ladder = ReaderAckLadder::new();
-    let inputs = |label: u64, learned: u64, pass: u64, now: u64, adv: bool| AckInputs {
+/// A shared inputs builder for the ladder contracts (PR 2's shape: the
+/// refresh floor rides the inputs so the depth can derive).
+fn ack_inputs(label: u64, learned: u64, pass: u64, now: u64, adv: bool) -> AckInputs {
+    AckInputs {
         label,
         learned_at_ms: learned,
         pass_start_ms: pass,
@@ -1627,36 +1622,258 @@ fn pinned_ack_advance_is_beat_quantized_at_depth_one() {
         advanced: adv,
         qualify_lag_ms: 2_000,
         drain_lag_ms: 4_000,
-    };
+        refresh_floor_ms: 1_000,
+    }
+}
 
-    // Candidate A (label 5_000, learned at 1_000) starts qualifying.
+/// **PR 2 (L1), the inversion of PR 1's pinned contract (i): the ladder
+/// PIPELINES candidates, each on its own unchanged gates.** A fresher
+/// label arriving mid-qualification is adopted as a SECOND candidate
+/// (its own learned-at snapshot — the anti-starvation law per candidate,
+/// verbatim), qualifies on its own condition-(2) pass and promotes after
+/// its own drain window — CONCURRENTLY with the first, never serialized
+/// behind its ack (the T6 quantization §3.2 derived, removed).
+#[test]
+fn ack_pipeline_advances_concurrent_candidates_each_on_its_own_gates() {
+    let _serial = serial();
+    free_grace::test_set_ack_pipeline(Some(true));
+    let ladder = ReaderAckLadder::new();
+
+    // Candidate A (label 5_000, learned 1_000) starts qualifying.
     assert_eq!(
-        ladder.note_pass(inputs(5_000, 1_000, 2_500, 2_600, true)),
+        ladder.note_pass(ack_inputs(5_000, 1_000, 2_500, 2_600, true)),
         None
     );
-    // A fresher label B arrives mid-cycle: the snapshot law keeps A as the
-    // candidate (rung-20 residual 6's anti-starvation fix), and — the
-    // depth-1 pin — NO second cycle opens for B.
+    // A fresher label B (9_000, learned 3_200) arrives mid-cycle: ADOPTED
+    // as a second candidate (depth 2), while A keeps its snapshot.
     assert_eq!(
-        ladder.note_pass(inputs(9_000, 3_200, 3_500, 3_600, true)),
+        ladder.note_pass(ack_inputs(9_000, 3_200, 3_500, 3_600, true)),
         None
     );
-    // A's drain elapses: A is emitted — not B, and not both.
     assert_eq!(
-        ladder.note_pass(inputs(9_000, 3_200, 7_700, 7_800, false)),
+        ladder.depth(),
+        2,
+        "two candidates in flight — the pipeline is what PR 1's pin denied"
+    );
+    // B qualifies on ITS own gate (pass ≥ 3_200 + 2_000 = 5_200), while
+    // A's drain is still running — B's ready_at becomes 5_400 + 4_000.
+    assert_eq!(
+        ladder.note_pass(ack_inputs(9_000, 3_200, 5_300, 5_400, true)),
+        None
+    );
+    // A's drain elapses (3_600 + 4_000): A promotes first — monotone.
+    assert_eq!(
+        ladder.note_pass(ack_inputs(9_000, 3_200, 7_700, 7_800, false)),
+        Some(5_000),
+        "the oldest qualified candidate promotes first (label order)"
+    );
+    // B promotes when ITS drain elapses (9_400) — one qualify+drain after
+    // ITS OWN learn instant, NOT a full serial cycle after A's ack (the
+    // shipped ladder answers None here: B was never even adopted).
+    assert_eq!(
+        ladder.note_pass(ack_inputs(9_000, 3_200, 9_450, 9_500, false)),
+        Some(9_000),
+        "the pipelined candidate rides its OWN windows — the inverted pin"
+    );
+    assert_eq!(ladder.acked(), 9_000);
+    assert_eq!(
+        ladder.acked_lag_ms(),
+        9_500 - 3_200,
+        "the reader-lag gauge: member-clock promote instant − learned_at(acked)"
+    );
+    assert!(
+        free_grace::test_clear_ack_pipeline(),
+        "the seam was in force for this contract"
+    );
+}
+
+/// **The depth-1 lever restores the shipped ladder VERBATIM**
+/// (`SQUEEZEFS_FREE_GRACE_ACK_PIPELINE=0` — the A/B lever; the design's
+/// bit-compatibility contract): PR 1's pinned schedule replays with the
+/// pre-campaign outcomes exactly, and the depth gauge pins at ≤ 1.
+#[test]
+fn the_ack_pipeline_lever_off_is_the_shipped_ladder_verbatim() {
+    let _serial = serial();
+    free_grace::test_set_ack_pipeline(Some(false));
+    let ladder = ReaderAckLadder::new();
+
+    assert_eq!(
+        ladder.note_pass(ack_inputs(5_000, 1_000, 2_500, 2_600, true)),
+        None
+    );
+    // The snapshot law at depth 1: the fresher label is NOT adopted while
+    // A is in flight.
+    assert_eq!(
+        ladder.note_pass(ack_inputs(9_000, 3_200, 3_500, 3_600, true)),
+        None
+    );
+    assert!(ladder.depth() <= 1, "depth pinned at 1 under the lever");
+    assert_eq!(
+        ladder.note_pass(ack_inputs(9_000, 3_200, 7_700, 7_800, false)),
         Some(5_000),
         "one candidate in flight: the cycle emits its snapshot label only"
     );
-    // B's OWN full cycle must now run from ITS snapshot: a pass one tick
-    // later cannot emit B (its qualify window has not elapsed since it
-    // became the candidate).
+    // B pays a FULL second cycle from its own adoption — the shipped
+    // quantization, restored exactly.
     assert_eq!(
-        ladder.note_pass(inputs(9_000, 7_800, 7_900, 8_000, true)),
+        ladder.note_pass(ack_inputs(9_000, 7_800, 7_900, 8_000, true)),
         None,
-        "the depth-1 pin: label B pays a FULL second cycle (PR 2's pipeline \
-         is what removes this quantization)"
+        "the depth-1 lever: label B pays a full second cycle"
     );
     assert_eq!(ladder.acked(), 5_000);
+    assert!(free_grace::test_clear_ack_pipeline());
+}
+
+/// **The never-early-ack law under arbitrary schedules** (the design's
+/// proptest gate, 1,000 cases): whatever the learn/pass schedule, an ack
+/// for label `L` is emitted only after (i) an ADVANCING pass whose start
+/// was ≥ `L`'s learn instant + the qualify lag, and (ii) the drain window
+/// elapsed since that pass — no label's gates ever move, pipelined or not.
+#[test]
+fn prop_an_ack_is_never_emitted_before_its_labels_own_gates() {
+    use proptest::prelude::*;
+    let _serial = serial();
+    free_grace::test_set_ack_pipeline(Some(true));
+    let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {
+        cases: 1_000,
+        ..ProptestConfig::default()
+    });
+    runner
+        .run(
+            &proptest::collection::vec(
+                // (learn a fresher label?, time step ms 1..4000, advanced?)
+                (any::<bool>(), 1u64..4_000, any::<bool>()),
+                1..40,
+            ),
+            |steps| {
+                let ladder = ReaderAckLadder::new();
+                let mut now = 1_000u64;
+                let mut label = 0u64;
+                let mut learned_at = 0u64;
+                // Per-label learn instants + per-label earliest qualifying
+                // ADVANCING pass (the oracle's evidence).
+                let mut learn: std::collections::HashMap<u64, u64> = Default::default();
+                let mut qualified_at: std::collections::HashMap<u64, u64> = Default::default();
+                for (fresh, step, advanced) in steps {
+                    now += step;
+                    if fresh || label == 0 {
+                        label = now; // labels are owner instants: monotone
+                        learned_at = now;
+                        learn.insert(label, learned_at);
+                    }
+                    let pass_start = now;
+                    now += 50; // the pass takes 50 ms
+                    if advanced {
+                        // The oracle: this pass qualifies every learned
+                        // label whose learn instant + qualify lag ≤ start.
+                        for (l, at) in &learn {
+                            if pass_start >= at + 2_000 {
+                                qualified_at.entry(*l).or_insert(now + 4_000);
+                            }
+                        }
+                    }
+                    let out = ladder.note_pass(AckInputs {
+                        label,
+                        learned_at_ms: learned_at,
+                        pass_start_ms: pass_start,
+                        now_ms: now,
+                        advanced,
+                        qualify_lag_ms: 2_000,
+                        drain_lag_ms: 4_000,
+                        refresh_floor_ms: 1_000,
+                    });
+                    if let Some(acked) = out {
+                        let ready = qualified_at.get(&acked).ok_or_else(|| {
+                            proptest::test_runner::TestCaseError::fail(format!(
+                                "ack {acked} emitted with NO qualifying advancing pass"
+                            ))
+                        })?;
+                        prop_assert!(
+                            now >= *ready,
+                            "ack {acked} emitted at {now} before its drain window {ready}"
+                        );
+                    }
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert!(free_grace::test_clear_ack_pipeline());
+}
+
+/// **The bounded queue never wedges** (the design's second proptest law,
+/// 1,000 cases): under an arbitrary label storm the depth never exceeds
+/// the derived cap, a QUALIFIED candidate is never dropped, and once the
+/// storm stops the ladder always makes progress (quiet advancing passes
+/// promote an ack — the high-water drop rule cannot strand it).
+#[test]
+fn prop_the_candidate_queue_is_bounded_and_never_wedges() {
+    use proptest::prelude::*;
+    let _serial = serial();
+    free_grace::test_set_ack_pipeline(Some(true));
+    // cap = clamp(ceil((2000+4000)/1000)+2, 2, 16) = 8 for these lags.
+    let cap = 8u64;
+    let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {
+        cases: 1_000,
+        ..ProptestConfig::default()
+    });
+    runner
+        .run(
+            &proptest::collection::vec((1u64..1_500, any::<bool>()), 1..60),
+            |storm| {
+                let ladder = ReaderAckLadder::new();
+                let mut now = 1_000u64;
+                for (step, advanced) in storm {
+                    now += step;
+                    // Every step learns a fresher label: the storm shape.
+                    let out = ladder.note_pass(AckInputs {
+                        label: now,
+                        learned_at_ms: now,
+                        pass_start_ms: now,
+                        now_ms: now + 10,
+                        advanced,
+                        qualify_lag_ms: 2_000,
+                        drain_lag_ms: 4_000,
+                        refresh_floor_ms: 1_000,
+                    });
+                    let _ = out;
+                    now += 10;
+                    prop_assert!(
+                        ladder.depth() <= cap,
+                        "depth {} exceeded the derived cap {cap}",
+                        ladder.depth()
+                    );
+                }
+                // The storm stops: quiet advancing passes must drain the
+                // ladder to an ack (progress — the no-wedge half).
+                let target = now;
+                let mut promoted = false;
+                for _ in 0..12 {
+                    now += 3_000;
+                    if ladder
+                        .note_pass(AckInputs {
+                            label: target,
+                            learned_at_ms: target,
+                            pass_start_ms: now,
+                            now_ms: now + 10,
+                            advanced: true,
+                            qualify_lag_ms: 2_000,
+                            drain_lag_ms: 4_000,
+                            refresh_floor_ms: 1_000,
+                        })
+                        .is_some()
+                    {
+                        promoted = true;
+                    }
+                    now += 10;
+                }
+                prop_assert!(promoted, "the ladder wedged: no ack after the storm");
+                prop_assert!(ladder.acked() > 0);
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert!(free_grace::test_clear_ack_pipeline());
 }
 
 /// **PINNED CURRENT BEHAVIOR — inverted by PR 3 (`demand-arm`, L3).** An

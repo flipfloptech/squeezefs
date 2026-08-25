@@ -205,7 +205,7 @@ pub enum PinOutcome {
 pub struct BlockAllocator {
     _volume_id: Box<str>,
     chunk_size: u64,
-    free_blocks: dashmap::DashSet<u64>,
+    free_blocks: LaneCountedSet,
     highest_block: AtomicU64,
     /// Device capacity in whole chunks (0 = unbounded: offline tools /
     /// tests without a real device). Set at mount registration from the
@@ -385,6 +385,95 @@ struct LanePartition {
     harvest: std::sync::OnceLock<crate::data_alloc_lane::LaneHarvestSink>,
 }
 
+/// **The lane-counted free set** (sustain campaign KD-FG-10,
+/// design-free-grace-sustain §5.4): the free list plus a lane-owned
+/// population maintained INSIDE insert/remove — one modulo per mutation —
+/// so the LANE-REACHABLE supply (the quantity that actually troughs on a
+/// recycle-bound stream, where the global count accumulates foreign-lane
+/// releases nobody here can consume) is correct by construction across
+/// the full ten-site mutation census (the `pending_block_refs`
+/// deferred-op-accumulator precedent; an eleventh site cannot drift).
+/// Unpartitioned mounts (`writers == 0`) count everything, so the two
+/// quantities coincide there. The fsck C6 per-lane recount is the drift
+/// tripwire (`tests/mw_cowriter_free_tests.rs`).
+#[derive(Debug, Default)]
+struct LaneCountedSet {
+    set: dashmap::DashSet<u64>,
+    /// Free-listed blocks in lanes this mount owns.
+    lane_owned: AtomicU64,
+    /// Partition width in force (0 = unpartitioned — everything is ours).
+    writers: AtomicU64,
+    /// Owned-lane bitmask (meaningful only when `writers > 0`).
+    owned_mask: AtomicU64,
+}
+
+impl LaneCountedSet {
+    #[inline]
+    fn is_ours(&self, idx: u64) -> bool {
+        let writers = self.writers.load(Ordering::Acquire);
+        if writers == 0 {
+            return true;
+        }
+        self.owned_mask.load(Ordering::Acquire)
+            & (1u64 << crate::data_alloc_lane::block_lane_of(idx, writers as u16))
+            != 0
+    }
+
+    /// `DashSet::insert` shape: `true` ⇔ newly inserted (and then, and only
+    /// then, the lane-owned count moves — each mutator adjusts by exactly
+    /// its own membership delta, so the count stays exact under races).
+    fn insert(&self, idx: u64) -> bool {
+        let new = self.set.insert(idx);
+        if new && self.is_ours(idx) {
+            self.lane_owned.fetch_add(1, Ordering::AcqRel);
+        }
+        new
+    }
+
+    /// `DashSet::remove` shape: `Some` ⇔ this caller removed it.
+    fn remove(&self, idx: &u64) -> Option<u64> {
+        let out = self.set.remove(idx);
+        if out.is_some() && self.is_ours(*idx) {
+            self.lane_owned.fetch_sub(1, Ordering::AcqRel);
+        }
+        out
+    }
+
+    #[inline]
+    fn contains(&self, idx: &u64) -> bool {
+        self.set.contains(idx)
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    #[inline]
+    fn iter(&self) -> impl Iterator<Item = dashmap::setref::multiple::RefMulti<'_, u64>> {
+        self.set.iter()
+    }
+
+    /// (Re)declare the partition in force and RECOUNT — the two
+    /// control-plane sites (`engage_alloc_lanes`, `adopt_lane`) call this
+    /// after moving the mask; mutations racing the recount converge on the
+    /// next one (both sites are rare, and the tripwire contract pins the
+    /// quiescent equality).
+    fn set_partition(&self, writers: u16, owned_mask: u64) {
+        self.writers.store(u64::from(writers), Ordering::Release);
+        self.owned_mask.store(owned_mask, Ordering::Release);
+        let count = self.set.iter().filter(|idx| self.is_ours(**idx)).count() as u64;
+        self.lane_owned.store(count, Ordering::Release);
+    }
+
+    /// The lane-owned free-list population (the counting half of the
+    /// lane-reachable supply).
+    #[inline]
+    fn lane_owned(&self) -> u64 {
+        self.lane_owned.load(Ordering::Acquire)
+    }
+}
+
 /// One offset's incarnation state: the loom-verified seqlock word plus,
 /// since spec §6.2 item 6, its live lifetime stamp (0 = none recorded).
 #[derive(Debug)]
@@ -416,7 +505,7 @@ impl BlockAllocator {
         Ok(Self {
             _volume_id: volume_id.to_string().into_boxed_str(),
             chunk_size: CHUNK_SIZE,
-            free_blocks: dashmap::DashSet::new(),
+            free_blocks: LaneCountedSet::default(),
             highest_block: AtomicU64::new(0),
             capacity_blocks: AtomicU64::new(0),
             refcounts: scc::HashMap::new(),
@@ -487,6 +576,11 @@ impl BlockAllocator {
         if self.lanes.set(installed).is_err() {
             return Ok(());
         }
+        // KD-FG-10: the counting-set learns the partition and recounts —
+        // from here the lane-owned population is the lane-reachable
+        // supply's free-list half.
+        self.free_blocks
+            .set_partition(part.writers(), 1u64 << part.writer_id());
         let metrics = &crate::fuse_client::METRICS;
         metrics
             .alloc_lane_writers
@@ -613,6 +707,9 @@ impl BlockAllocator {
             return false;
         }
         let owned = prev | bit;
+        // KD-FG-10: the adopted lane's free blocks join the lane-owned
+        // population — recount under the new mask.
+        self.free_blocks.set_partition(lanes.part.writers(), owned);
         let metrics = &crate::fuse_client::METRICS;
         metrics
             .alloc_lanes_owned
@@ -1121,6 +1218,30 @@ impl BlockAllocator {
     /// The free-list population (fsck C6 accounting).
     pub fn free_blocks_count(&self) -> u64 {
         self.free_blocks.len() as u64
+    }
+
+    /// The LANE-OWNED free-list population (sustain campaign KD-FG-10 —
+    /// the counting-set's maintained count; equals `free_blocks_count` on
+    /// unpartitioned mounts). The drift contract asserts it against the
+    /// C6-style per-lane recount.
+    pub fn lane_owned_free_blocks(&self) -> u64 {
+        self.free_blocks.lane_owned()
+    }
+
+    /// **The lane-reachable supply** (design-free-grace-sustain §5.4/§8):
+    /// exactly `try_allocate_block`'s own reachable set — the lane-owned
+    /// free-list population plus the lane-scoped virgin remainder
+    /// (`virgin_bytes` already divides by the partition width). This is
+    /// the quantity that troughs on a recycle-bound stream; the
+    /// passed-global `free_supply_blocks` accumulates foreign-lane
+    /// releases and provably never did on the motivating row.
+    /// `u64::MAX` on an unbounded allocator (space is not a constraint).
+    pub fn lane_reachable_blocks(&self) -> u64 {
+        let virgin = self.virgin_bytes();
+        if virgin == u64::MAX {
+            return u64::MAX;
+        }
+        (virgin / self.chunk_size).saturating_add(self.free_blocks.lane_owned())
     }
 
     /// PR VL6b (design-volume-lifecycle §5.6a, C3 **recount-and-set** /
@@ -1964,6 +2085,11 @@ impl BlockAllocator {
                     "allocate_block: offset {} (freelist)",
                     idx * self.chunk_size
                 );
+                // The attribution split PR 1 exists for (sustain §8):
+                // which stream is recycle-bound.
+                crate::fuse_client::METRICS
+                    .alloc_from_freelist
+                    .fetch_add(1, Ordering::Relaxed);
                 return Ok(self.claim_block_idx(idx));
             }
             // Lost the claim race: rescan for the next candidate.
@@ -1973,6 +2099,9 @@ impl BlockAllocator {
             "allocate_block: offset {} (fresh)",
             block_idx * self.chunk_size
         );
+        crate::fuse_client::METRICS
+            .alloc_fresh_mints
+            .fetch_add(1, Ordering::Relaxed);
         Ok(self.claim_block_idx(block_idx))
     }
 
@@ -2288,9 +2417,13 @@ impl BlockAllocator {
             return;
         }
         let supply = self.free_supply_blocks();
-        for offset in self
-            .grace
-            .harvest_with_supply(crate::free_grace::HARVEST_BATCH, supply)
+        // The lane-reachable number rides beside the passed-global one:
+        // PR 1's site-0 observation input (KD-FG-10); PR 3 re-bases the
+        // runway on it under the `DEMAND` lever.
+        let lane_reachable = self.lane_reachable_blocks();
+        for offset in
+            self.grace
+                .harvest_with_supply(crate::free_grace::HARVEST_BATCH, supply, lane_reachable)
         {
             self.publish_free_list(offset);
         }

@@ -1630,11 +1630,17 @@ fn pinned_ack_advance_is_beat_quantized_at_depth_one() {
     };
 
     // Candidate A (label 5_000, learned at 1_000) starts qualifying.
-    assert_eq!(ladder.note_pass(inputs(5_000, 1_000, 2_500, 2_600, true)), None);
+    assert_eq!(
+        ladder.note_pass(inputs(5_000, 1_000, 2_500, 2_600, true)),
+        None
+    );
     // A fresher label B arrives mid-cycle: the snapshot law keeps A as the
     // candidate (rung-20 residual 6's anti-starvation fix), and — the
     // depth-1 pin — NO second cycle opens for B.
-    assert_eq!(ladder.note_pass(inputs(9_000, 3_200, 3_500, 3_600, true)), None);
+    assert_eq!(
+        ladder.note_pass(inputs(9_000, 3_200, 3_500, 3_600, true)),
+        None
+    );
     // A's drain elapses: A is emitted — not B, and not both.
     assert_eq!(
         ladder.note_pass(inputs(9_000, 3_200, 7_700, 7_800, false)),
@@ -1670,7 +1676,15 @@ fn pinned_the_bound_advances_only_on_the_sweep_quantum() {
     let before = free_grace::bound();
 
     ticks.fetch_add(5_000, Ordering::SeqCst);
-    ack(&owner, "r-sweep", grant.epoch, 14_000);
+    // The bare renewal (NOT the suite's `ack()` helper, which refreshes):
+    // the ack is RECORDED at the owner…
+    assert!(
+        matches!(
+            owner.renew("r-sweep", grant.epoch, 14_000),
+            RenewOutcome::Renewed(_)
+        ),
+        "the renewal that carries the acknowledgement is admitted"
+    );
     assert_eq!(
         free_grace::bound(),
         before,
@@ -1686,8 +1700,8 @@ fn pinned_the_bound_advances_only_on_the_sweep_quantum() {
     );
 }
 
-/// **The site-0 demand observation (PR 1's own instrument, consumer-less)
-/// + PINNED: the addendum row's shape never prods (inverted by PR 3).**
+/// **The site-0 demand observation (PR 1's own instrument, consumer-less),
+/// PLUS the pin: the addendum row's shape never prods (inverted by PR 3).**
 /// The motivating row reached no refusal edge — long PASSED-global runway,
 /// prods 0, pressure 0 — while the ring aged past the physics floor and
 /// the lane-reachable supply sat at the trough. Site 0 (inside

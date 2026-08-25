@@ -2523,7 +2523,9 @@ async fn the_lane_reachable_count_never_drifts_from_the_recount() {
     // from here the count is the LANE-owned population only.
     let part = squeezefs::meta_backend::kv::journal::AppendPartition::new(2, 0)
         .expect("a 2-writer partition");
-    alloc.engage_alloc_lanes(part).expect("the partition engages");
+    alloc
+        .engage_alloc_lanes(part)
+        .expect("the partition engages");
     assert_no_drift(1, 2, "the partition engagement recount");
 
     // The lane-grant take (the authority serving a peer's harvest) removes
@@ -2561,8 +2563,9 @@ async fn the_lane_reachable_count_never_drifts_from_the_recount() {
     }
 
     // Lane adoption (the owned-mask change): the recount follows the mask.
+    let proof = squeezefs::data_custody::declare_dead_epoch("drift-contract adoption");
     assert!(
-        alloc.adopt_lane(1, squeezefs::data_custody::DeadEpoch::test_epoch(7)),
+        alloc.adopt_lane(1, proof),
         "lane 1 adopts under a proof of death"
     );
     assert_no_drift(0b11, 2, "the lane adoption recount");

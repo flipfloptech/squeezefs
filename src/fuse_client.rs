@@ -5378,6 +5378,14 @@ pub struct Metrics {
     /// ledger's `harvest_shipped_blocks` (a sustained-rewrite row past the
     /// lane share must grow both, or the mount is burning frontier).
     pub alloc_lane_harvested_blocks: Align64<AtomicU64>,
+    /// Sustain campaign §8 (**the attribution split PR 1 exists for**):
+    /// allocations served from the FREE LIST at `try_allocate_block`'s
+    /// reuse exit. With `alloc_fresh_mints` and
+    /// `alloc_lane_harvested_blocks` these decompose every allocation's
+    /// source, so a capture can name which stream is recycle-bound.
+    pub alloc_from_freelist: Align64<AtomicU64>,
+    /// The split's other arm: virgin-tail mints at the fresh exit.
+    pub alloc_fresh_mints: Align64<AtomicU64>,
     // DLM **S9** (spec §6.2 item 7's consumer half): the CO-WRITER mount
     // posture. All four are 0 on every shipped mount — the posture is
     // opt-in twice over (`SQUEEZEFS_MULTI_WRITER=1` +
@@ -9644,6 +9652,12 @@ impl SqueezefsFilesystem {
                 "alloc_lane_harvested_blocks": METRICS
                     .alloc_lane_harvested_blocks
                     .load(Ordering::Relaxed),
+                // The sustain campaign's allocation-source split (§8):
+                // always-on per-process counters at try_allocate_block's
+                // two exits (alloc_lane_reachable_blocks — the engagement-
+                // gated gauge — is inserted post-macro below).
+                "alloc_from_freelist": METRICS.alloc_from_freelist.load(Ordering::Relaxed),
+                "alloc_fresh_mints": METRICS.alloc_fresh_mints.load(Ordering::Relaxed),
                 // DLM S9 (spec §6.2 item 7's consumer half): the mount
                 // POSTURE and the co-writer ledger. `mount_posture` is the
                 // one word that says which of the three shapes this daemon
@@ -10452,6 +10466,14 @@ impl SqueezefsFilesystem {
                 for (k, v) in gauges {
                     metrics.insert(k.clone(), v.clone());
                 }
+            }
+            // Sustain campaign §8/KD-FG-10: the lane-reachable supply —
+            // exported only when a lane partition or the grace plane is
+            // engaged (the alloc_lane_* family's solo-inert convention;
+            // absent otherwise, keeping the every-gauge-0-unarmed law
+            // exception-free).
+            if let Some(reachable) = self.router.backend_router.lane_reachable_blocks_sum() {
+                metrics.insert("alloc_lane_reachable_blocks".to_string(), reachable.into());
             }
         }
 

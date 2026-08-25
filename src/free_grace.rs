@@ -197,6 +197,18 @@ static ALLOC_STALLS: AtomicU64 = AtomicU64::new(0);
 static HELD_OFFSETS: AtomicU64 = AtomicU64::new(0);
 static HELD_BYTES: AtomicU64 = AtomicU64::new(0);
 static READER_ACKS: AtomicU64 = AtomicU64::new(0);
+/// Sustain campaign site 0 (KD-FG-9): harvest passes that OBSERVED recycle
+/// coupling — ring aging past the physics floor while the lane-reachable
+/// supply sat at the trough. Counter-only until PR 3 arms a consumer.
+static DEMAND_WAITS: AtomicU64 = AtomicU64::new(0);
+/// The per-offset residence histogram (`free_grace_residence_ms`, §8):
+/// stamped at each release with `now − (label − 1)` — the measured loop
+/// latency whose p50 must agree with `bound_age` under storm.
+static RESIDENCE_MS: once_cell::sync::Lazy<crate::fuse_client::LatencyHistogram> =
+    once_cell::sync::Lazy::new(crate::fuse_client::LatencyHistogram::default);
+/// Residence samples recorded (the histogram's own total — the contracts'
+/// cheap accessor).
+static RESIDENCE_SAMPLES: AtomicU64 = AtomicU64::new(0);
 
 // -- the pressure valve's words (rung-20 residual 6) ------------------------
 
@@ -255,6 +267,15 @@ struct Plane {
     /// routine renewal cadence where it is known: past one beat with no
     /// harvest, whatever the storm was doing is over.
     reading_ttl_ms: u64,
+    /// **The physics floor** (the sustain campaign's site-0 input,
+    /// design-free-grace-sustain §5.4/KD-FG-9): the age past which a held
+    /// offset SHOULD have released on a healthy loop — the reader's
+    /// qualify (`staleness + skew`) + drain (`staleness + D_purge`)
+    /// windows plus two acknowledgement-refresh beats. Resolved once at
+    /// arm (production derives it from the same published numbers the
+    /// ack ladder runs on; the explicit-bounds test seam approximates it
+    /// with the pressure bound).
+    demand_floor_ms: u64,
 }
 
 static PLANE: once_cell::sync::Lazy<ArcSwapOption<Plane>> =
@@ -322,7 +343,22 @@ pub fn arm_owner_plane(clock: LeaseClock, clocks: &LeaseClocks) -> Result<()> {
     // rung (b)'s floor.
     let cycle = ack_cycle(clocks);
     let pressure = (fence / 2).max(cycle).min(fence);
-    arm_plane(clock, fence, pressure, Some(ProdParams::derive(clocks)));
+    // The site-0 physics floor (sustain campaign, KD-FG-9): the reader's
+    // own qualify + drain windows plus two refresh beats — the age past
+    // which a held offset SHOULD have released on a healthy loop. Derived
+    // from the same published numbers the ack ladder runs on (≈ 8.02 s on
+    // the shipped s11-venue derivation, §3.2).
+    let staleness = crate::ro_coherence::reader_staleness_bound();
+    let floor = (staleness + clocks.skew_max)
+        + (staleness + clocks.d_purge)
+        + ack_refresh_floor(clocks) * 2;
+    arm_plane(
+        clock,
+        fence,
+        pressure,
+        Some(ProdParams::derive(clocks)),
+        floor,
+    );
     Ok(())
 }
 
@@ -334,10 +370,19 @@ pub fn arm_owner_plane(clock: LeaseClock, clocks: &LeaseClocks) -> Result<()> {
 /// on has nothing honest to say about it. Rung (b) and the fence arm are
 /// fully live.
 pub fn arm_owner_plane_with(clock: LeaseClock, fence: Duration, pressure: Duration) {
-    arm_plane(clock, fence, pressure, None);
+    // The seam approximates the site-0 physics floor with the pressure
+    // bound (one honest cycle-class number); production derives the real
+    // one in `arm_owner_plane`.
+    arm_plane(clock, fence, pressure, None, pressure);
 }
 
-fn arm_plane(clock: LeaseClock, fence: Duration, pressure: Duration, prod: Option<ProdParams>) {
+fn arm_plane(
+    clock: LeaseClock,
+    fence: Duration,
+    pressure: Duration,
+    prod: Option<ProdParams>,
+    demand_floor: Duration,
+) {
     // The A/B control is read ONCE, at arm: the valve's hot path is the
     // free path, and a knob read there would be a getenv per free.
     let valve = crate::env_knobs::bool_knob("SQUEEZEFS_FREE_GRACE_VALVE", true);
@@ -352,6 +397,7 @@ fn arm_plane(clock: LeaseClock, fence: Duration, pressure: Duration, prod: Optio
         prod,
         valve,
         reading_ttl_ms,
+        demand_floor_ms: demand_floor.as_millis() as u64,
     })));
     if !valve {
         log::warn!(
@@ -730,7 +776,7 @@ impl GraceRing {
     /// at the allocation funnel. The returned offsets are OWED a free-list
     /// publish by the caller (the allocator, which owns the free list).
     pub fn harvest(&self, max: usize) -> Vec<u64> {
-        self.harvest_with(max, false, u64::MAX)
+        self.harvest_with(max, false, u64::MAX, u64::MAX)
     }
 
     /// The routine harvest with the volume's free supply attached — the
@@ -738,8 +784,19 @@ impl GraceRing {
     /// field's binding constraint: the ring was nowhere near its cap when
     /// the 32 GiB lane ran out). `u64::MAX` = space is not a constraint
     /// here (an unbounded/offline allocator).
-    pub fn harvest_with_supply(&self, max: usize, free_supply_blocks: u64) -> Vec<u64> {
-        self.harvest_with(max, false, free_supply_blocks)
+    /// `lane_reachable_blocks` is the SUSTAIN campaign's site-0 input
+    /// (KD-FG-10): the supply of the caller's own residue class — what
+    /// actually troughs on a recycle-bound stream, where the passed-global
+    /// number accumulates foreign-lane releases and never does. PR 1
+    /// consumes it as a counted observation only; PR 3 re-bases the runway
+    /// on it under the `DEMAND` lever.
+    pub fn harvest_with_supply(
+        &self,
+        max: usize,
+        free_supply_blocks: u64,
+        lane_reachable_blocks: u64,
+    ) -> Vec<u64> {
+        self.harvest_with(max, false, free_supply_blocks, lane_reachable_blocks)
     }
 
     /// The pressure harvest: identical, except the fence deadline is the
@@ -750,10 +807,16 @@ impl GraceRing {
     pub fn harvest_pressure(&self, max: usize) -> Vec<u64> {
         // Allocation is about to refuse: the supply IS gone, whatever the
         // ring's own arithmetic would have estimated.
-        self.harvest_with(max, true, 0)
+        self.harvest_with(max, true, 0, 0)
     }
 
-    fn harvest_with(&self, max: usize, pressure: bool, free_supply_blocks: u64) -> Vec<u64> {
+    fn harvest_with(
+        &self,
+        max: usize,
+        pressure: bool,
+        free_supply_blocks: u64,
+        lane_reachable_blocks: u64,
+    ) -> Vec<u64> {
         if self.len.load(Ordering::Acquire) == 0 {
             return Vec::new();
         }
@@ -780,6 +843,23 @@ impl GraceRing {
         // pre-valve behaviour of this arm, reproduced rather than special-cased.
         let runway = if pressure { Some(0) } else { runway };
         note_pressure(runway, newest);
+        // Site 0 — the standing recycle-coupling detector (sustain
+        // campaign, KD-FG-9): the ring is non-empty AND the oldest held
+        // offset has aged past the PHYSICS floor (a healthy loop would
+        // have released it) AND the caller's LANE-REACHABLE supply sits
+        // at the trough (releases consumed within a beat of publish).
+        // Refusal-edge-independent by design — the motivating row reached
+        // no ENOSPC, no empty lane harvest, no stall, and still decayed.
+        // Counter-only here (the consumer-less observation PR 3 arms);
+        // two compares on values this pass already holds.
+        if let (Some(oldest), Some(plane)) = (oldest, PLANE.load_full()) {
+            let now = plane.clock.now_ms();
+            if now.saturating_sub(plane.demand_floor_ms) > oldest
+                && lane_reachable_blocks <= HARVEST_BATCH as u64
+            {
+                DEMAND_WAITS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         let mut forced = false;
         if let Some(oldest) = oldest {
             if oldest > bound {
@@ -815,12 +895,23 @@ impl GraceRing {
         let mut out = Vec::new();
         let mut released_bytes = 0u64;
         {
+            let release_now = owner_now_ms();
             let mut guard = self.entries.lock();
             while out.len() < max {
                 match guard.front() {
                     Some(e) if e.label <= bound => {
                         let e = guard.pop_front().expect("front peeked");
                         released_bytes += e.size;
+                        // `free_grace_residence_ms` (sustain campaign §8):
+                        // the measured per-offset loop latency, stamped at
+                        // release — `now − (label − 1)` (the label is the
+                        // deferral instant + 1).
+                        if let Some(now) = release_now {
+                            RESIDENCE_MS.record(Duration::from_millis(
+                                now.saturating_sub(e.label.saturating_sub(1)),
+                            ));
+                            RESIDENCE_SAMPLES.fetch_add(1, Ordering::Relaxed);
+                        }
                         out.push(e.offset);
                     }
                     _ => break,
@@ -1312,6 +1403,41 @@ pub fn bound_tightenings() -> u64 {
     BOUND_TIGHTENINGS.load(Ordering::Relaxed)
 }
 
+/// Sustain-campaign site 0 (KD-FG-9): harvest passes that observed recycle
+/// coupling — the ring aging past the physics floor while the caller's
+/// lane-reachable supply sat at the trough. 0 on solo/unarmed mounts;
+/// growth is the *coupled* statement the s11 row's gauges lacked.
+/// Counter-only until PR 3 arms a consumer.
+pub fn demand_waits() -> u64 {
+    DEMAND_WAITS.load(Ordering::Relaxed)
+}
+
+/// **The loop-latency instrument** (`free_grace_bound_age_ms`, §8):
+/// owner-clock `now − BOUND` while armed and holding — how far behind the
+/// clock the published reallocation bound is running. 0 with no plane, 0
+/// when nothing is held (the ring drained), 0 when nothing is owed
+/// (`BOUND == u64::MAX`). Post-campaign target on the s11 venue: ≤ 12 s
+/// sustained under storm (was ≈ 28.6 s measured).
+pub fn bound_age_ms() -> u64 {
+    if HELD_OFFSETS.load(Ordering::Relaxed) == 0 {
+        return 0;
+    }
+    let bound = bound();
+    let Some(now) = owner_now_ms() else {
+        return 0;
+    };
+    if bound == u64::MAX {
+        return 0;
+    }
+    now.saturating_sub(bound)
+}
+
+/// Residence samples recorded (the `free_grace_residence_ms` histogram's
+/// total — one per released offset).
+pub fn residence_samples() -> u64 {
+    RESIDENCE_SAMPLES.load(Ordering::Relaxed)
+}
+
 /// The graded pressure reading, 0 (quiet) … 100 (the supply is gone at the
 /// measured deferral rate) — `100 − runway ÷ the routine bound`, so it is
 /// the same comparison rung (b) makes, expressed for a human.
@@ -1394,6 +1520,10 @@ pub fn stats_snapshot() -> serde_json::Value {
         "free_grace_prods": prods(),
         "free_grace_bound_tightenings": bound_tightenings(),
         "free_grace_prod_renew_ms": prod_renew_ms(),
+        // The sustain campaign's attribution instruments (PR 1, §8).
+        "free_grace_bound_age_ms": bound_age_ms(),
+        "free_grace_demand_waits": demand_waits(),
+        "free_grace_residence_ms": RESIDENCE_MS.to_json(),
     })
 }
 
@@ -1419,8 +1549,13 @@ pub fn reset_for_test() {
         &PROD_UNTIL_MS,
         &PROD_LABEL,
         &LAST_BOUND_REFRESH_MS,
+        &DEMAND_WAITS,
+        &RESIDENCE_SAMPLES,
     ] {
         c.store(0, Ordering::Relaxed);
+    }
+    for b in &RESIDENCE_MS.buckets {
+        b.store(0, Ordering::Relaxed);
     }
     RUNWAY_MS.store(u64::MAX, Ordering::Relaxed);
     LADDER.candidate.store(0, Ordering::Relaxed);

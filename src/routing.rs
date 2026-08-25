@@ -3055,6 +3055,35 @@ impl BackendRouter {
     /// `vol_tag` (KD-5) — DLM S9's owner-side resolution for a shipped
     /// free (`crate::cowriter::execute_shipped_frees`): the wire carries
     /// the tag `TREE_BLOCK_REFS` keys on, never a path or an ordinal.
+    /// **The lane-reachable free supply, summed across this router's
+    /// distinct allocators** — the `alloc_lane_reachable_blocks` gauge
+    /// (design-free-grace-sustain §8/KD-FG-10). `None` when neither a lane
+    /// partition nor the freed-offset grace plane is engaged: the gauge is
+    /// then ABSENT from the stats JSON (the `alloc_lane_*` family's
+    /// solo-inert convention), so a plain mount exports nothing new.
+    /// Unbounded allocators (space not a constraint) saturate the sum.
+    pub fn lane_reachable_blocks_sum(&self) -> Option<u64> {
+        let mut allocs: Vec<std::sync::Arc<crate::block_allocator::BlockAllocator>> =
+            vec![self.default_allocator.clone()];
+        for entry in self.backends.iter() {
+            let a = entry.value().block_allocator.clone();
+            if !allocs.iter().any(|seen| std::sync::Arc::ptr_eq(seen, &a)) {
+                allocs.push(a);
+            }
+        }
+        let engaged =
+            crate::free_grace::armed() || allocs.iter().any(|a| a.lane_partition().is_some());
+        if !engaged {
+            return None;
+        }
+        Some(
+            allocs
+                .iter()
+                .map(|a| a.lane_reachable_blocks())
+                .fold(0u64, u64::saturating_add),
+        )
+    }
+
     pub fn allocator_for_volume_tag(
         &self,
         vol_tag: u64,

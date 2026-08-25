@@ -5,8 +5,10 @@
 nvmet-tcp devsub, `SQZ_MWFLEET_OSS_GB=32` (2 × 32 GiB data namespaces) ·
 **Instrument:** `tests/run_mw_matrix.sh s11-mpiio` (ior 4.0.0 pinned, 32
 ranks, one shared file, 4 MiB block-cyclic; A-B-B-A vs file-per-proc) ·
-**Evidence:** `rows-s11-freeloop-evidence/` (both runs' per-phase stats
-snapshots + m53's ENOSPC log)
+**Evidence:** `rows-s11-freeloop-evidence/` (the stock-clock run's
+snapshots, probe and aborted-phase output + m53's ENOSPC log; the capped
+run's row directory was cleaned by the control fleet's create before the
+harvest — its numbers below are quoted from the leg's published table)
 
 ## What this session set out to do, and what it found instead
 

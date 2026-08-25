@@ -1923,3 +1923,100 @@ async fn an_idle_reaped_publish_session_reconnects_and_the_raise_lands() {
     drop(cw);
     auth.stop().await;
 }
+
+/// **The width-8 re-run conviction (2026-08-25, finding 14): a custody
+/// ACQUIRE on an idle-reaped session must reconnect BEFORE sending —
+/// dead-on-arrival is not the lost-reply ambiguity.** The s9-fanout
+/// re-grade's second leg opened an existing file (`dd` O_TRUNC) on a
+/// co-writer whose fleet had sat quiet past the wire's 60 s idle-session
+/// reaper: the write-open's custody acquire rode the pooled WORKLOAD
+/// session (`call_once` — one attempt, no reconnect, deliberately: an
+/// acquire storm must not double-park arbitration), burned its only
+/// attempt on a socket whose FIN had been queued for minutes, and the
+/// application saw EINVAL ("cluster wire: the coordinator closed the
+/// session") on a healthy fleet.
+///
+/// The law this pins: the one-attempt class refuses only the TRUE
+/// ambiguity — a frame sent whose reply was lost. A pooled session the
+/// reaper closed queues its FIN long before the next verb arrives, so a
+/// non-blocking peek proves the frame was NEVER SENT, and replacing the
+/// session before the send costs no attempt and re-parks nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_custody_acquire_on_an_idle_reaped_session_reconnects_before_sending() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "cw-idleacq").await;
+    let auth = Authority::start_idle(&vol, &[NODE_A], Some(Duration::from_millis(300))).await;
+    let client = data_grant::WriteCustodyClient::connect(&auth.endpoint, SECRET, NODE_A)
+        .await
+        .expect("the co-writer joins");
+    client
+        .acquire(
+            42,
+            None,
+            squeezefs::dlm::LockMode::Exclusive,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("the first acquire lands on the live session");
+
+    // The venue is the SERVER's own clock (the rung-18 residual-(d)
+    // discipline): nothing client-side can observe the reap without
+    // sending a frame, so this sleep IS the venue.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+
+    client
+        .acquire(
+            43,
+            None,
+            squeezefs::dlm::LockMode::Exclusive,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "a custody acquire on an idle-reaped session must RECONNECT BEFORE \
+                 SENDING (the frame was never sent on the reaped socket — no retry \
+                 law is touched, and the application must never see a healthy fleet \
+                 refuse a write-open): {e:?}"
+            )
+        });
+
+    auth.stop().await;
+}
+
+/// **Finding 14's publish face: the un-witnessed one-attempt class gets
+/// the same dead-on-arrival screen.** `ParkWriteTimes` (era-gated,
+/// un-witnessed, deliberately never resent — a resend after a lost reply
+/// is the double-apply class) burned its single attempt on the reaped
+/// pooled session exactly as the acquire did. The screen replaces the
+/// session only when the peek PROVES the send never happened; the
+/// sent-then-lost ambiguity keeps refusing, verbatim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unwitnessed_publish_on_an_idle_reaped_session_reconnects_before_sending() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "cw-idlepark").await;
+    let auth = Authority::start_idle(&vol, &[NODE_A], Some(Duration::from_millis(300))).await;
+    let cw = CoWriter::join(&auth, &vol, NODE_A, 0).await;
+    cw.engage().await; // ships the OPEN raise — the session now exists
+
+    // Outlive the server's reaper (the venue, not a sync shortcut).
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+
+    publish::park_write_times(&cw.meta, 1, 7_000_000_000, 7_000_000_000)
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "an un-witnessed park on an idle-reaped session must RECONNECT \
+                 BEFORE SENDING (dead-on-arrival is provable — the FIN was queued \
+                 minutes ago — so no attempt is spent and no double-apply window \
+                 opens): {e:?}"
+            )
+        });
+
+    drop(cw);
+    auth.stop().await;
+}

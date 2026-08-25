@@ -86,3 +86,44 @@ the wrong suspect; the box was never the bottleneck.
 - The next fix loop is red-first per the TDD law: a repro pinning
   per-lane starvation invisible to `free_grace_pressure_pct` while
   ENOSPC fires, then the lane-aware signal, then this row from zero.
+
+## Part 1 landed; the row re-graded (addendum, same day)
+
+**Part 1** (`8d2bcd3b`, red tests `76ec1cf4`, full gate green, merged):
+the structural half. `execute_lane_harvest` — the co-writers' ONLY
+refill, polled 860× against an empty free list in the capture — never
+ran the grace funnel: the ring is harvested only from the authority's
+own allocation/free contexts, which stop running exactly when the
+fleet's writers are the starving ones. It now runs the same ring head
+the local allocation funnel does, as a three-pass ladder (routine →
+reclaim-drain + routine → PRESSURE), so an empty lane harvest evaluates
+the pressure deadline (promise kept pre-deadline, reading at the cliff,
+laggard fenced past it) and feeds the valve's gauge. Contracts:
+`tests/mw_cowriter_free_tests.rs` §finding 15. This CORRECTS one line of
+the attribution above: the forecast's supply input was already
+lane-scoped (`virgin_bytes` divides by the partition width) — the
+missing piece was the remote funnel arm, not the supply arithmetic.
+
+**The from-zero row on the fixed binary fails EARLIER, and quantifies
+part 2.** Quiet box, fresh fleet: probe 202 MiB/s → phase A1 refused by
+the sustained-window gate — steady iterations DECAY 138 → 80 MiB/s.
+Fleet gauges at the failure: `alloc_lane_harvests` **0 on every mount**
+(part 1 inert on this shape — no regression and no engagement: the lanes
+never exhausted this time), `free_grace` deferrals 4,773 / releases
+4,201 / held 572 / tightenings 2,073 / `pressure_pct` 0. The releases
+(~16.4 GiB over the run) bracket exactly the 80 MiB/s floor the phase
+decayed to: **the sustained shared-rewrite ceiling IS the grace loop's
+release rate** — the ring re-supplies at the ack-qualification cadence
+(staleness + purge + drain, seconds per cycle) regardless of demand, so
+throughput decays to it long before any lane ENOSPCs. Part 2 is
+therefore a DESIGN question, not a wiring gap: making the release rate
+track the deferral rate (the ack ladder's qualification lag is the loop
+latency; Little's law bounds throughput at held ÷ latency) without
+breaking the never-release-unacknowledged promise. That wants the
+design/review loop, not a point fix.
+
+**Instrument honesty:** the probe itself swung 33 → 202 → 2,240 MiB/s
+across box states (one attempt was launched into a leftover writeback
+storm — io PSI ~100 %, load 19 from D-state tasks — and is label-only;
+the quiet-box 202-probe run is the counted one). Any future row on this
+venue must gate on io PSI as well as load/thermals.

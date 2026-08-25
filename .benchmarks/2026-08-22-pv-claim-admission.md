@@ -629,7 +629,14 @@ Filled in as the run proceeds. Landed with this branch:
    `.benchmarks/rows-s10pl-1787503934-evidence/` (per-arm stats snapshots,
    table, verdict). A second online `fsck` could not even report the
    finding list — "reply too large; use the offline probe" — its own small
-   CLI wart, still open.
+   CLI wart. **Fixed post-closure** (`e1acb855`, contracts
+   `tests/job_fabric_tests.rs`): the admin lane serves a BOUNDED view —
+   counters intact, the longest verbatim finding prefix that fits, and
+   `findings_elided` counting the rest (never silent; `has_findings`
+   keeps the exit-1 verdict) — while the durable record stays complete
+   for the offline probe; the same commit stopped every enrolled fleet's
+   job census logging `job:enroll` as an undecodable record (skipped by
+   identity, the writer's own constant).
 10. **The corpse-census correction** (fixed, `d04fef59`): with the sweep
     landed, the SECOND from-zero attempt met the gate (1.08×) and its
     oracle still reported 152 findings on a HEALTHY fleet — fsck's block

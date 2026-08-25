@@ -2214,3 +2214,225 @@ async fn a_co_writers_staged_spill_cleanup_abandons_quietly() {
          staged legs no longer storm the plane gate"
     );
 }
+
+// ===========================================================================
+// Finding 15 (the s11-mpiio acceptance row's blocker,
+// `.benchmarks/2026-08-25-s11-freeloop-stall.md`): the LANE HARVEST is a
+// remote allocation funnel — it must reach the grace ring
+// ===========================================================================
+
+/// One grace-armed authority + one reader member + one co-writer whose
+/// rewrite displaced `old` into the grace ring — the finding-15 stage,
+/// shared by both contracts below. Returns everything a contract needs to
+/// drive the reader's acknowledgement and the owner clock.
+struct GraceStage {
+    auth: Authority,
+    m_owner: Arc<MembershipOwner>,
+    ticks: Arc<AtomicU64>,
+    reader_epoch: u64,
+    old_off: u64,
+    old_idx: u64,
+}
+
+async fn grace_stage(dir: &Path, tag: &str) -> GraceStage {
+    let vol = fresh_volume(dir, tag).await;
+    let dev = data_device(dir, &format!("{tag}.dev"));
+    let auth = Authority::start(&vol, &dev, &[NODE_A]).await;
+
+    let old_off = auth.alloc.allocate_block().await.expect("mint");
+    let old_idx = old_off / auth.alloc.chunk_size();
+    let ino = authority_file_with_block(&auth, &format!("{tag}.bin"), old_idx).await;
+
+    // The membership owner + one reader that has acknowledged nothing,
+    // with EXPLICIT bounds on a manual clock (the deterministic seam):
+    // routine fence 60 s, pressure bound 5 s.
+    let ticks = Arc::new(AtomicU64::new(10_000));
+    let clock = LeaseClock::manual(Arc::clone(&ticks));
+    let m_owner = MembershipOwner::arm(
+        "f15-owner",
+        3,
+        2,
+        LeaseClocks::derive(Duration::from_micros(250)).expect("shipped derivation"),
+        clock.clone(),
+    )
+    .expect("the membership owner arms");
+    membership::install_owner(Arc::clone(&m_owner));
+    free_grace::arm_owner_plane_with(
+        clock,
+        Duration::from_millis(60_000),
+        Duration::from_millis(5_000),
+    );
+    let reader = match m_owner.join(JoinRequest {
+        id: "f15-reader".to_string(),
+        role: MemberRole::Reader,
+        endpoint: None,
+        pid: std::process::id(),
+        boot: "boot-f15".to_string(),
+        prior_epoch: None,
+        pr_key: 0,
+        mount: None,
+    }) {
+        JoinOutcome::Granted(g) => g,
+        JoinOutcome::Refused { reason, .. } => panic!("join refused: {reason}"),
+        JoinOutcome::UnknownLease { reason } => panic!("join answered UnknownLease: {reason}"),
+    };
+    m_owner.refresh_free_grace_bound();
+    assert!(free_grace::armed(), "the grace plane is armed");
+
+    // The co-writer displaces `old` and ships the free: the ring holds it.
+    let cwr = CoWriter::join(&auth, &vol, &dev, NODE_A).await;
+    let _new = cwr.rewrite_block(ino, 0, old_idx).await;
+    cwr.br
+        .free_block(&old_off.to_string())
+        .await
+        .expect("the displaced free ships");
+    auth.br.reclaim_drain().await;
+    assert!(
+        auth.alloc.grace_holds(old_off),
+        "the fixture's displaced offset is IN the grace ring"
+    );
+    assert!(!auth.free_listed(old_idx), "and not on the free list");
+    drop(cwr);
+
+    GraceStage {
+        auth,
+        m_owner,
+        ticks,
+        reader_epoch: reader.epoch,
+        old_off,
+        old_idx,
+    }
+}
+
+/// **A lane harvest must reach ACKNOWLEDGED offsets in the grace ring.**
+/// The captured stall: on a grace-armed fleet every displaced offset
+/// enters the ring, and the ring is harvested ONLY from the authority's
+/// own allocation/free contexts — which stop running exactly when the
+/// fleet's writers are the ones starving. `execute_lane_harvest` (the
+/// co-writers' ONLY refill; polled 860× against an empty free list in
+/// the capture) scanned the free list and drained the reclaim queue but
+/// never ran the grace funnel, so a fully-acknowledged, releasable
+/// offset was unreachable forever and the co-writer ENOSPC'd on a
+/// healthy volume.
+///
+/// The law: the remote funnel harvests the ring exactly as the local
+/// allocation funnel does (`try_allocate_block`'s head), so
+/// "reallocatable" means the same thing on both funnels.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lane_harvest_reaches_acknowledged_offsets_in_the_grace_ring() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let st = grace_stage(dir.path(), "f15-ack").await;
+
+    // The reader acknowledges the held label; the bound now covers it.
+    let label = st
+        .auth
+        .alloc
+        .grace_oldest_label()
+        .expect("the held entry carries a label");
+    assert!(
+        matches!(
+            st.m_owner.renew("f15-reader", st.reader_epoch, label),
+            RenewOutcome::Renewed(_)
+        ),
+        "the acknowledgement rides the reader's renewal"
+    );
+    st.m_owner.refresh_free_grace_bound();
+
+    let handed = cowriter::execute_lane_harvest(
+        &st.auth.br,
+        volume_tag(DATA_VOL),
+        0, // writers=1 ⇒ every block is lane 0: the funnel is under test,
+        1, // not the residue arithmetic (the lane suites own that)
+        8,
+        7,
+    )
+    .await
+    .expect("the lane harvest executes");
+    assert_eq!(
+        handed,
+        vec![st.old_idx],
+        "an ACKNOWLEDGED grace-held offset is part of the lane's supply — the remote funnel \
+         must harvest the ring exactly as the local allocation funnel does (finding 15: the \
+         capture's co-writers polled an empty free list forever while the ring held their \
+         releasable supply)"
+    );
+    assert!(
+        !st.auth.alloc.grace_holds(st.old_off),
+        "the ring entry retired with the harvest"
+    );
+}
+
+/// **An empty lane harvest IS allocation pressure, and walks the valve's
+/// ladder.** The capture's second face: `free_grace_pressure_pct` read 0
+/// for the whole run while eight writers ENOSPC'd, because the remote
+/// funnel never told the valve anything — the pressure signal only ever
+/// fired from the authority's OWN allocation cliff, which was never the
+/// starving one.
+///
+/// The law, in the pressure ruling's own words: a co-writer's lane
+/// harvest finding nothing is `StorageFull`-imminent on that writer, so
+/// it evaluates the PRESSURE deadline — never a broken promise (an
+/// unacknowledged offset pre-deadline stays held and the reading goes to
+/// 100), and past the deadline the laggard is FENCED, not waited on
+/// (forced release + eviction), with the offset handed to the lane.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_empty_lane_harvest_is_allocation_pressure_and_walks_the_valve_ladder() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let st = grace_stage(dir.path(), "f15-press").await;
+    let tag = volume_tag(DATA_VOL);
+
+    // PRE-DEADLINE (2 s past the label; pressure bound 5 s), reader
+    // holding: the harvest answers EMPTY — never a broken promise — but
+    // the valve must now KNOW (the reading goes to the cliff and the
+    // tightening is counted).
+    st.ticks.store(12_000, Ordering::SeqCst);
+    let tightenings_before = free_grace::bound_tightenings();
+    let handed = cowriter::execute_lane_harvest(&st.auth.br, tag, 0, 1, 8, 7)
+        .await
+        .expect("the pre-deadline harvest executes");
+    assert!(
+        handed.is_empty(),
+        "an unacknowledged offset before the pressure deadline is NEVER released (the \
+         pressure ruling), got {handed:?}"
+    );
+    assert!(
+        st.auth.alloc.grace_holds(st.old_off),
+        "the promise held: the offset is still in the ring"
+    );
+    assert_eq!(
+        free_grace::pressure_pct(),
+        100,
+        "an empty lane harvest is a writer at its allocation cliff — the valve's reading \
+         must say so (the capture ran a whole ENOSPC storm at pressure_pct 0)"
+    );
+    assert!(
+        free_grace::bound_tightenings() > tightenings_before,
+        "the empty harvest evaluated the tightened deadline (rung b engaged)"
+    );
+
+    // PAST THE PRESSURE DEADLINE: the laggard is fenced, not waited on —
+    // forced release WITH the eviction, and the offset reaches the lane.
+    st.ticks.store(16_000, Ordering::SeqCst);
+    let forced_before = free_grace::forced_releases();
+    let fences_before = free_grace::laggard_fences();
+    let handed = cowriter::execute_lane_harvest(&st.auth.br, tag, 0, 1, 8, 7)
+        .await
+        .expect("the post-deadline harvest executes");
+    assert_eq!(
+        handed,
+        vec![st.old_idx],
+        "past the pressure deadline the lane harvest forces progress and hands the offset out"
+    );
+    assert!(
+        free_grace::forced_releases() > forced_before,
+        "the release was FORCED (counted)"
+    );
+    assert!(
+        free_grace::laggard_fences() > fences_before,
+        "and the responsible laggard was fenced WITH it — never a silently broken promise"
+    );
+}

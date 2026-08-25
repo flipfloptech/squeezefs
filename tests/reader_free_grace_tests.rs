@@ -265,6 +265,11 @@ async fn an_unarmed_mount_publishes_frees_immediately_and_moves_no_gauge() {
     assert_eq!(free_grace::forced_releases(), 0);
     assert_eq!(free_grace::laggard_fences(), 0);
     assert_eq!(free_grace::bound(), u64::MAX, "no plane ⇒ no bound");
+    // The sustain campaign's instruments obey the same solo re-gate
+    // (design-free-grace-sustain §8): zero movement on an unarmed mount.
+    assert_eq!(free_grace::demand_waits(), 0);
+    assert_eq!(free_grace::bound_age_ms(), 0);
+    assert_eq!(free_grace::residence_samples(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1596,5 +1601,195 @@ fn a_tightened_renewal_cadence_never_starves_the_ack_ladder() {
     assert!(
         acked.len() >= 4,
         "with a 500 ms beat the ladder should promote repeatedly, got {acked:?}"
+    );
+}
+
+// ===========================================================================
+// The free-grace sustain campaign, PR 1 (docs/design-free-grace-sustain.md
+// §5.4/§8; finding 15 part 2): the attribution instruments + the GREEN
+// pinned-current-behavior contracts the later PRs invert
+// ===========================================================================
+
+/// **PINNED CURRENT BEHAVIOR — inverted by PR 2 (`ack-pipeline`).** The
+/// shipped ladder holds ONE candidate in flight: a fresher label arriving
+/// mid-qualification does not open a second cycle, so acks advance at most
+/// one label per full qualify+drain cycle (the T6 quantization §3.2
+/// derives). PR 2's tests-first commit flips this assertion red.
+#[test]
+fn pinned_ack_advance_is_beat_quantized_at_depth_one() {
+    let _serial = serial();
+    let ladder = ReaderAckLadder::new();
+    let inputs = |label: u64, learned: u64, pass: u64, now: u64, adv: bool| AckInputs {
+        label,
+        learned_at_ms: learned,
+        pass_start_ms: pass,
+        now_ms: now,
+        advanced: adv,
+        qualify_lag_ms: 2_000,
+        drain_lag_ms: 4_000,
+    };
+
+    // Candidate A (label 5_000, learned at 1_000) starts qualifying.
+    assert_eq!(ladder.note_pass(inputs(5_000, 1_000, 2_500, 2_600, true)), None);
+    // A fresher label B arrives mid-cycle: the snapshot law keeps A as the
+    // candidate (rung-20 residual 6's anti-starvation fix), and — the
+    // depth-1 pin — NO second cycle opens for B.
+    assert_eq!(ladder.note_pass(inputs(9_000, 3_200, 3_500, 3_600, true)), None);
+    // A's drain elapses: A is emitted — not B, and not both.
+    assert_eq!(
+        ladder.note_pass(inputs(9_000, 3_200, 7_700, 7_800, false)),
+        Some(5_000),
+        "one candidate in flight: the cycle emits its snapshot label only"
+    );
+    // B's OWN full cycle must now run from ITS snapshot: a pass one tick
+    // later cannot emit B (its qualify window has not elapsed since it
+    // became the candidate).
+    assert_eq!(
+        ladder.note_pass(inputs(9_000, 7_800, 7_900, 8_000, true)),
+        None,
+        "the depth-1 pin: label B pays a FULL second cycle (PR 2's pipeline \
+         is what removes this quantization)"
+    );
+    assert_eq!(ladder.acked(), 5_000);
+}
+
+/// **PINNED CURRENT BEHAVIOR — inverted by PR 3 (`demand-arm`, L3).** An
+/// acknowledgement recorded by a renewal does NOT advance the published
+/// bound by itself: the bound moves only when `refresh_free_grace_bound`
+/// runs (the owner's sweep quantum — §3.2's T7). PR 3 widens the valve's
+/// existing rate-limited refresh gate so a live demand mark republishes
+/// within the floor beat; its tests-first commit flips this red.
+#[test]
+fn pinned_the_bound_advances_only_on_the_sweep_quantum() {
+    let _serial = serial();
+    let (clock, ticks) = manual_clock();
+    let owner = armed_owner(&clock);
+    free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("derived bound");
+    let grant = join(&owner, "r-sweep", MemberRole::Reader);
+    owner.refresh_free_grace_bound();
+    let before = free_grace::bound();
+
+    ticks.fetch_add(5_000, Ordering::SeqCst);
+    ack(&owner, "r-sweep", grant.epoch, 14_000);
+    assert_eq!(
+        free_grace::bound(),
+        before,
+        "the recorded ack is NOT published until the sweep runs — the T7 \
+         quantization this contract pins (PR 3's demand-coupled refresh \
+         inverts it)"
+    );
+    owner.refresh_free_grace_bound();
+    assert_eq!(
+        free_grace::bound(),
+        14_000,
+        "the sweep publishes the recorded minimum"
+    );
+}
+
+/// **The site-0 demand observation (PR 1's own instrument, consumer-less)
+/// + PINNED: the addendum row's shape never prods (inverted by PR 3).**
+/// The motivating row reached no refusal edge — long PASSED-global runway,
+/// prods 0, pressure 0 — while the ring aged past the physics floor and
+/// the lane-reachable supply sat at the trough. Site 0 (inside
+/// `GraceRing::harvest_with`, KD-FG-9) must OBSERVE that coupling from
+/// day one (`free_grace_demand_waits` counts), while the pre-PR-3 valve
+/// stays exactly as shipped: no prod, scarcity face 0, nothing released.
+#[test]
+fn pinned_a_coupled_storm_with_long_runway_never_prods_but_site_zero_counts() {
+    let _serial = serial();
+    let (clock, ticks) = manual_clock();
+    let owner = armed_owner(&clock);
+    free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("derived bound");
+    let grant = join(&owner, "r-hold", MemberRole::Reader);
+    let _ = grant;
+    owner.refresh_free_grace_bound();
+
+    // Two held offsets (the runway needs ≥ 2 samples), deferred now…
+    let ring = GraceRing::new(1024);
+    assert!(ring.defer(4 * 1024 * 1024, 4 * 1024 * 1024));
+    ticks.fetch_add(200, Ordering::SeqCst);
+    assert!(ring.defer(8 * 1024 * 1024, 4 * 1024 * 1024));
+
+    // …aged past the physics floor (qualify + drain + 2×refresh ≈ 8.02 s
+    // on the shipped derivation) but far inside the 76 s routine fence.
+    ticks.fetch_add(20_000, Ordering::SeqCst);
+
+    let waits_before = free_grace::demand_waits();
+    let prods_before = free_grace::prods();
+    // The addendum shape: passed-global supply HIGH (foreign-lane
+    // accumulation, §2.2's corrected note), lane-reachable at the trough.
+    let released = ring.harvest_with_supply(64, 1_000, 4);
+    assert!(
+        released.is_empty(),
+        "nothing is acknowledged and no deadline expired: the promise holds"
+    );
+    assert_eq!(
+        free_grace::prods() - prods_before,
+        0,
+        "PINNED (inverted by PR 3): the space runway is long, so rung (a) \
+         never engages on this shape — the row's measured prods-0"
+    );
+    assert!(
+        free_grace::demand_waits() > waits_before,
+        "site 0 OBSERVES the coupling the row decayed under: ring aging \
+         past the physics floor while the lane-reachable supply sits at \
+         the trough (the consumer-less observation PR 3 arms)"
+    );
+
+    // The same harvest with a HEALTHY lane-reachable supply is not demand.
+    let waits_mid = free_grace::demand_waits();
+    let _ = ring.harvest_with_supply(64, 1_000, 1_000);
+    assert_eq!(
+        free_grace::demand_waits(),
+        waits_mid,
+        "a lane with supply is not coupled — site 0 stays quiet"
+    );
+}
+
+/// **The loop-latency instruments (PR 1, §8 rows 1–2).** `bound_age_ms`
+/// is owner-clock `now − BOUND` while armed and holding (0 unarmed, 0
+/// when drained); `residence` records `now − (label−1)` at each release.
+#[test]
+fn bound_age_and_residence_follow_the_ring() {
+    let _serial = serial();
+    assert_eq!(
+        free_grace::bound_age_ms(),
+        0,
+        "no plane: the loop-latency instrument reads 0"
+    );
+    let (clock, ticks) = manual_clock();
+    let owner = armed_owner(&clock);
+    free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("derived bound");
+    let grant = join(&owner, "r-age", MemberRole::Reader);
+    owner.refresh_free_grace_bound();
+
+    let ring = GraceRing::new(1024);
+    let label_at = clock.now_ms() + 1;
+    assert!(ring.defer(4 * 1024 * 1024, 4 * 1024 * 1024));
+    ticks.fetch_add(3_000, Ordering::SeqCst);
+
+    // Holding, reader acked nothing: the bound has never advanced, so its
+    // age is the clock's own reading (maximally old — honest).
+    assert!(
+        free_grace::bound_age_ms() >= 3_000,
+        "armed + holding: the age is now − BOUND (got {})",
+        free_grace::bound_age_ms()
+    );
+
+    // The reader acknowledges; the release records residence.
+    let samples_before = free_grace::residence_samples();
+    ack(&owner, "r-age", grant.epoch, label_at);
+    owner.refresh_free_grace_bound();
+    let released = ring.harvest_with_supply(64, u64::MAX, u64::MAX);
+    assert_eq!(released.len(), 1, "the acknowledged offset releases");
+    assert_eq!(
+        free_grace::residence_samples() - samples_before,
+        1,
+        "each release stamps one residence sample (now − (label−1))"
+    );
+    assert_eq!(
+        free_grace::bound_age_ms(),
+        0,
+        "the ring drained: the instrument falls to 0"
     );
 }

@@ -2436,3 +2436,177 @@ async fn an_empty_lane_harvest_is_allocation_pressure_and_walks_the_valve_ladder
         "and the responsible laggard was fenced WITH it — never a silently broken promise"
     );
 }
+
+// ===========================================================================
+// The free-grace sustain campaign, PR 1 (docs/design-free-grace-sustain.md
+// §5.4, KD-FG-10): the lane-reachable counting-set + the allocation split
+// ===========================================================================
+
+/// **The lane-reachable count never drifts from the recount** (KD-FG-10's
+/// drift tripwire). The free list's mutation census is TEN sites and two
+/// of the missed ones run continuously in production (the trim walk, the
+/// VL7 mover picks), so the count is maintained INSIDE the set's own
+/// insert/remove (the counting-set wrapper — the `pending_block_refs`
+/// correct-by-construction precedent) and this contract asserts
+/// counter ≡ recount after every stage of a sweep that exercises the
+/// census: frees, allocation claims, trim claim+return, both mover picks,
+/// the lane-grant take, the harvest adoption, and a lane adoption's
+/// repartition recount.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_lane_reachable_count_never_drifts_from_the_recount() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let dev = data_device(dir.path(), "drift.dev");
+    let (alloc, br) = data_plane(&dev).await;
+
+    // The recount half: the C6 walk's own arithmetic — every free-listed
+    // index whose lane this mount owns.
+    let recount = |owned: u64, writers: u16| -> u64 {
+        alloc
+            .free_block_indices()
+            .into_iter()
+            .filter(|idx| {
+                writers == 0
+                    || owned & (1u64 << squeezefs::data_alloc_lane::block_lane_of(*idx, writers))
+                        != 0
+            })
+            .count() as u64
+    };
+    let assert_no_drift = |owned: u64, writers: u16, stage: &str| {
+        assert_eq!(
+            alloc.lane_owned_free_blocks(),
+            recount(owned, writers),
+            "the counting-set's lane-owned count drifted from the C6-style \
+             recount after {stage} (KD-FG-10's tripwire)"
+        );
+    };
+
+    // Unpartitioned: the count IS the free-list population.
+    let mut offs = Vec::new();
+    for _ in 0..8 {
+        offs.push(alloc.allocate_block().await.expect("mint"));
+    }
+    for o in &offs {
+        br.free_block(&o.to_string()).await.expect("free");
+    }
+    br.reclaim_drain().await;
+    assert_no_drift(u64::MAX, 0, "eight terminal frees (unpartitioned)");
+    assert_eq!(alloc.lane_owned_free_blocks(), 8);
+
+    // The allocation claim (try_allocate_block's free-list exit).
+    let claimed = alloc.allocate_block().await.expect("reclaim");
+    assert_no_drift(u64::MAX, 0, "a free-list claim");
+
+    // The trim walk: claim + return (two census sites).
+    let victim = offs.iter().find(|o| **o != claimed).copied().unwrap();
+    let guard = alloc
+        .claim_free_for_trim(victim)
+        .expect("the trim claim wins");
+    assert_no_drift(u64::MAX, 0, "a trim claim");
+    alloc.return_from_trim(victim);
+    drop(guard);
+    assert_no_drift(u64::MAX, 0, "the trim return");
+
+    // The VL7 mover picks (two more sites).
+    let below = alloc
+        .allocate_block_below(u64::MAX)
+        .expect("the contiguity pick claims");
+    assert_no_drift(u64::MAX, 0, "the contiguity pick");
+    let above = alloc
+        .allocate_block_at_or_above(0)
+        .expect("the ascending pick claims");
+    assert_no_drift(u64::MAX, 0, "the ascending pick");
+    let _ = (below, above);
+
+    // Engage a 2-writer partition as lane 0: the repartition recounts, and
+    // from here the count is the LANE-owned population only.
+    let part = squeezefs::meta_backend::kv::journal::AppendPartition::new(2, 0)
+        .expect("a 2-writer partition");
+    alloc.engage_alloc_lanes(part).expect("the partition engages");
+    assert_no_drift(1, 2, "the partition engagement recount");
+
+    // The lane-grant take (the authority serving a peer's harvest) removes
+    // a LANE-1 block — foreign to us, so the count must NOT move.
+    let lane1_idx = alloc
+        .free_block_indices()
+        .into_iter()
+        .find(|idx| squeezefs::data_alloc_lane::block_lane_of(*idx, 2) == 1);
+    if let Some(idx) = lane1_idx {
+        let before = alloc.lane_owned_free_blocks();
+        assert!(alloc.take_free_for_lane_grant(idx), "the grant takes");
+        assert_eq!(
+            alloc.lane_owned_free_blocks(),
+            before,
+            "a foreign-lane take moves nothing (one modulo per mutation)"
+        );
+        assert_no_drift(1, 2, "the lane-grant take");
+        // The harvest ADOPTION on the receiving side is lane-checked, so
+        // adopting our own lane-0 block back is refused — exercise the
+        // adopt census site with a lane-0 candidate instead.
+        let lane0_idx = alloc
+            .free_block_indices()
+            .into_iter()
+            .find(|idx| squeezefs::data_alloc_lane::block_lane_of(*idx, 2) == 0);
+        if let Some(own) = lane0_idx {
+            assert!(alloc.take_free_for_lane_grant(own), "take our own");
+            assert_no_drift(1, 2, "an own-lane take");
+            assert_eq!(
+                alloc.adopt_lane_free_grant(&[own]),
+                1,
+                "the harvest adoption re-inserts"
+            );
+            assert_no_drift(1, 2, "the harvest adoption");
+        }
+    }
+
+    // Lane adoption (the owned-mask change): the recount follows the mask.
+    assert!(
+        alloc.adopt_lane(1, squeezefs::data_custody::DeadEpoch::test_epoch(7)),
+        "lane 1 adopts under a proof of death"
+    );
+    assert_no_drift(0b11, 2, "the lane adoption recount");
+}
+
+/// **The allocation-source split** (§8: `alloc_from_freelist` /
+/// `alloc_fresh_mints` — "the attribution split PR 1 exists for"): every
+/// allocation exits `try_allocate_block` through exactly one of the two
+/// counted arms, so the capture can decompose which stream is
+/// recycle-bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_allocation_source_split_accounts_every_allocation() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let dev = data_device(dir.path(), "split.dev");
+    let (alloc, br) = data_plane(&dev).await;
+    let m = &squeezefs::fuse_client::METRICS;
+
+    let fresh0 = m.alloc_fresh_mints.load(Ordering::Relaxed);
+    let list0 = m.alloc_from_freelist.load(Ordering::Relaxed);
+
+    let a = alloc.allocate_block().await.expect("fresh mint");
+    let b = alloc.allocate_block().await.expect("fresh mint");
+    assert_eq!(
+        m.alloc_fresh_mints.load(Ordering::Relaxed) - fresh0,
+        2,
+        "two virgin-tail mints ride the fresh arm"
+    );
+    assert_eq!(m.alloc_from_freelist.load(Ordering::Relaxed), list0);
+
+    br.free_block(&a.to_string()).await.expect("free");
+    br.reclaim_drain().await;
+    let c = alloc.allocate_block().await.expect("freelist reuse");
+    assert_eq!(a, c, "the free list serves the offset back");
+    assert_eq!(
+        m.alloc_from_freelist.load(Ordering::Relaxed) - list0,
+        1,
+        "the reuse rides the freelist arm"
+    );
+    assert_eq!(
+        m.alloc_fresh_mints.load(Ordering::Relaxed) - fresh0,
+        2,
+        "and never the fresh one"
+    );
+    let _ = b;
+}

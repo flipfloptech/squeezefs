@@ -126,4 +126,57 @@ design/review loop, not a point fix.
 across box states (one attempt was launched into a leftover writeback
 storm — io PSI ~100 %, load 19 from D-state tasks — and is label-only;
 the quiet-box 202-probe run is the counted one). Any future row on this
-venue must gate on io PSI as well as load/thermals.
+venue must gate on io PSI as well as load/thermals — with the caveat the
+capture below added: THIS laptop's io-PSI `some` reading is structurally
+poisoned by a permanently-D-state touchpad IRQ thread
+(`irq/117-SYNA3133`), so the gate must read the DISK's own delta, not
+the PSI aggregate.
+
+## The PR 1 instrumented capture (α/β/γ — the design's capture step)
+
+Binary `f992c2e1` (PR 1's instruments), fresh fleet, quiet box; all four
+phases ran (the ratio gate's failure is expected — the capture is an
+input, not a pass/fail gate); row `rows-f15-capture-1787694808/`
+(per-phase snapshots; ior outputs dropped). Rig columns, m0 p0→p4:
+bound_age 23,009 ms; residence p50/p90 > 16 s over 3,738 samples;
+deferrals 4,043 / releases 3,738 / held 305 (closure OK);
+**alloc split: fresh 0 / freelist 0 / harvested 0** (m50: fresh 544 /
+freelist 0 / harvested 0); lane_reachable 1,024 (m50: 448);
+demand_waits 0; prods 274 / tightenings 3,659 / pressure 6.
+
+* **γ — the loop-latency model is CONFIRMED by the new instruments**:
+  `bound_age` 23 s and residence p50 > 16 s sit inside §3.2's derived
+  24–29 s band (the T1–T8 composition) on live gauges rather than
+  arithmetic. PR 2/PR 3's latency levers stand justified as designed.
+* **α — hypothesis (a) is FALSIFIED on the self-sized row**: NOTHING was
+  recycle-bound — the whole fleet allocated virgin-only (freelist 0,
+  harvested 0 on every mount; the authority allocated nothing at all),
+  the ring released 3,738 of 4,043 shipped displacements, and nobody
+  consumed a single recycled block (the 1 GiB self-sized file never
+  approached the 8 GiB lane shares). The §3.3 exclusion argument's
+  premise (some stream consumed recycled supply) does not hold on THIS
+  shape; it held on the ENOSPC row (32 GiB churn against 4 GiB lanes),
+  so finding 15's recycle-bound class remains real WHERE lanes exhaust —
+  but it is not what paces the self-sized row.
+* **β — no trough, and site 0 correctly stayed silent**: lane-reachable
+  never dropped below 448 blocks (≫ `HARVEST_BATCH` = 64), and
+  `demand_waits` read 0 — the detector's specificity half proven live;
+  its sensitivity half (the trough) needs the lane-exhaustion venue.
+* **The row's ACTUAL pacer is residual item 7 — fabricated range-custody
+  contention — now reproduced ON LOCALHOST with instruments beside it**:
+  602 `dlm_custody_conflicts` + 2,505 `range_custody_desired_trims` +
+  demotions waiting 1–4 s each (the demotion-wait histogram) on a fully
+  4 MiB-aligned, rank-disjoint shared file, with the iteration series
+  BIMODAL (32.8/33.1/… floors against 100–2,260 MiB/s bursts — the 33
+  floor is the demotion-wait cadence, not a bandwidth). The 2026-08-19
+  fabric capture's shape, no fabric required.
+
+**Campaign consequence (recorded here, to fold into the design doc as
+the PR 1 capture's output): the s11 acceptance row is gated by residual
+7 REGARDLESS of the free-grace levers.** The loop's 24–29 s latency is
+real and confirmed (PR 2/PR 3 proceed), the lane-exhaustion ENOSPC class
+is real and part-1-fixed at reachability, but the self-sized row's
+ceiling is the ranged-custody desire/trim/demotion churn on aligned
+disjoint writes — the fabricated-contention fix (rung-20 residual 7)
+must join this campaign's path before PR 5's acceptance rung can run in
+the ≥ 750 MiB/s domain.

@@ -2613,3 +2613,60 @@ async fn the_allocation_source_split_accounts_every_allocation() {
     );
     let _ = b;
 }
+
+/// **KD-FG-10's supply re-base + its restore-exactly lever** (PR 3): under
+/// `SQUEEZEFS_FREE_GRACE_DEMAND` the grace runway's supply input is the
+/// LANE-REACHABLE number (the quantity that troughs on a recycle-bound
+/// stream); `DEMAND=0` restores the passed-global pre-campaign input
+/// verbatim — whose free-list half accumulates foreign-lane releases
+/// nobody here can consume (the original finding-15 global-vs-lane skew,
+/// both halves now closed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_demand_lever_rebases_the_grace_supply_on_the_lane_reachable_number() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let dev = data_device(dir.path(), "rebase.dev");
+    let (alloc, _br) = data_plane(&dev).await;
+    // A BOUNDED device (the fixture's allocator is otherwise unbounded and
+    // both supply quantities read u64::MAX — space not a constraint).
+    alloc.set_capacity_bytes(DEV_LEN);
+
+    // Lane 0 of 2; plant a FOREIGN-lane free-list entry (the trim-return
+    // census site inserts without a claim — the accumulation shape).
+    let part = squeezefs::meta_backend::kv::journal::AppendPartition::new(2, 0)
+        .expect("a 2-writer partition");
+    alloc.engage_alloc_lanes(part).expect("engages");
+    let chunk = alloc.chunk_size();
+    let foreign_idx = (0..64u64)
+        .find(|i| squeezefs::data_alloc_lane::block_lane_of(*i, 2) == 1)
+        .expect("a lane-1 index exists");
+    alloc.return_from_trim(foreign_idx * chunk);
+    assert_eq!(
+        alloc.lane_owned_free_blocks(),
+        0,
+        "the foreign entry is not lane-owned"
+    );
+
+    let global = alloc.free_supply_blocks();
+    let lane = alloc.lane_reachable_blocks();
+    assert_eq!(
+        global,
+        lane + 1,
+        "the fixture separates the two quantities by exactly the foreign entry"
+    );
+
+    squeezefs::free_grace::test_set_demand(Some(true));
+    assert_eq!(
+        alloc.grace_supply_blocks(),
+        lane,
+        "under the DEMAND lever the runway reads the lane-reachable supply"
+    );
+    squeezefs::free_grace::test_set_demand(Some(false));
+    assert_eq!(
+        alloc.grace_supply_blocks(),
+        global,
+        "DEMAND=0 restores the passed-global input verbatim"
+    );
+    assert!(squeezefs::free_grace::test_clear_demand());
+}

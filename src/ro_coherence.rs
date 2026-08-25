@@ -320,7 +320,16 @@ pub fn spawn_reader_revalidation(
             // Park until the poll cadence elapses or a wake nudges us
             // early (the retired two-arm `select!` — a notify is only a
             // promptness hint, so the timeout IS the authority's cadence).
-            let _ = squeezefs_ipc::sqz_time::timeout(interval, wake.notified()).await;
+            // L2b (design-free-grace-sustain §5.2b): under a prodded
+            // renewal the cadence tightens toward the checkpoint ceiling —
+            // the qualify/promote vehicle runs more often; the qualify and
+            // drain WINDOWS stay at their routine derivations, so the S5
+            // staleness contract (an upper bound) only ever tightens.
+            let member_now = crate::membership::installed_member()
+                .map(|s| s.now_ms())
+                .unwrap_or(0);
+            let sleep_for = crate::free_grace::reader_pass_interval(interval, member_now);
+            let _ = squeezefs_ipc::sqz_time::timeout(sleep_for, wake.notified()).await;
             if stop_flag.load(Ordering::Acquire) {
                 log::info!("reader revalidation stopping (dismount)");
                 return;

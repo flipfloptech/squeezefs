@@ -2091,6 +2091,12 @@ impl MemberSession {
             grant.granted_at_owner_ms,
             anchor_ms,
         );
+        // L2b (design-free-grace-sustain §5.2b, OQ 3): the grant's
+        // `renew_ms` IS the pass-cadence ask — a prodded (shortened) value
+        // tightens the revalidation pass cadence too, clamped at the
+        // checkpoint ceiling; a routine value clamps to the routine pass
+        // interval and is inert. No wire field, no push channel.
+        crate::free_grace::note_prodded_renewal(grant.renew_ms, anchor_ms);
     }
 
     /// §6.8 item 3: the label last learned from the owner and the

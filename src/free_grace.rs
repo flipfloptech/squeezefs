@@ -199,8 +199,36 @@ static HELD_BYTES: AtomicU64 = AtomicU64::new(0);
 static READER_ACKS: AtomicU64 = AtomicU64::new(0);
 /// Sustain campaign site 0 (KD-FG-9): harvest passes that OBSERVED recycle
 /// coupling — ring aging past the physics floor while the lane-reachable
-/// supply sat at the trough. Counter-only until PR 3 arms a consumer.
+/// supply sat at the trough. The counter is the PR 1 observation (always
+/// live); the MARK below is what PR 3's consumers arm off.
 static DEMAND_WAITS: AtomicU64 = AtomicU64::new(0);
+/// The demand MARK's expiry (owner clock; TTL'd exactly like the runway
+/// reading). A live mark arms rung a′ (§5.2) and the L3 widened refresh
+/// gate; it NEVER feeds rung (b)'s deadline.
+static DEMAND_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+/// The graded coupling face (`free_grace_demand_pct`): how far past the
+/// physics floor the ring's front had aged at the last site-0 observation,
+/// capped at 100. Read beside the scarcity face `free_grace_pressure_pct`.
+static DEMAND_AGE_PCT: AtomicU64 = AtomicU64::new(0);
+/// Rung a′'s engagement: prods issued BECAUSE the demand mark was live
+/// (⊆ `free_grace_prods`).
+static DEMAND_PRODS: AtomicU64 = AtomicU64::new(0);
+/// 1 ⇔ the cadence in `PROD_RENEW_MS` came from the demand arm (rung a′)
+/// rather than the space runway — what splits `DEMAND_PRODS` from `PRODS`.
+static PROD_FROM_DEMAND: AtomicU64 = AtomicU64::new(0);
+/// L3's engagement: bound recomputes run on the demand/prod harvest path
+/// (the valve's existing rate-limited refresh; law ≤ elapsed ÷ the floor).
+static BOUND_REFRESHES: AtomicU64 = AtomicU64::new(0);
+/// L2b (§5.2b): the prodded RENEWAL cadence last adopted by this member
+/// (ms), and its expiry on the member clock — the revalidation loop's
+/// pass-cadence ask (no wire field: the grant's `renew_ms` IS the ask).
+static PASS_PROD_MS: AtomicU64 = AtomicU64::new(0);
+static PASS_PROD_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+/// L2b's engagement: revalidation passes run on a tightened cadence.
+static PASS_PRODS: AtomicU64 = AtomicU64::new(0);
+/// The pass cadence in force, ms (routine when no prod is live — the
+/// `prod_renew_ms` precedent).
+static PASS_INTERVAL_MS: AtomicU64 = AtomicU64::new(0);
 /// The per-offset residence histogram (`free_grace_residence_ms`, §8):
 /// stamped at each release with `now − (label − 1)` — the measured loop
 /// latency whose p50 must agree with `bound_age` under storm.
@@ -838,11 +866,6 @@ impl GraceRing {
                 runway,
             )
         };
-        // The cliff reads as a zero runway (see `harvest_pressure`), which
-        // is exactly the pressure bound through the graded form — the
-        // pre-valve behaviour of this arm, reproduced rather than special-cased.
-        let runway = if pressure { Some(0) } else { runway };
-        note_pressure(runway, newest);
         // Site 0 — the standing recycle-coupling detector (sustain
         // campaign, KD-FG-9): the ring is non-empty AND the oldest held
         // offset has aged past the PHYSICS floor (a healthy loop would
@@ -850,16 +873,40 @@ impl GraceRing {
         // at the trough (releases consumed within a beat of publish).
         // Refusal-edge-independent by design — the motivating row reached
         // no ENOSPC, no empty lane harvest, no stall, and still decayed.
-        // Counter-only here (the consumer-less observation PR 3 arms);
+        // Evaluated BEFORE `note_pressure` so the mark it deposits is
+        // consumed by THIS pass's rung a′ / L3 arms (same-pass coupling);
         // two compares on values this pass already holds.
         if let (Some(oldest), Some(plane)) = (oldest, PLANE.load_full()) {
             let now = plane.clock.now_ms();
-            if now.saturating_sub(plane.demand_floor_ms) > oldest
-                && lane_reachable_blocks <= HARVEST_BATCH as u64
-            {
+            let coupled = (now.saturating_sub(plane.demand_floor_ms) > oldest
+                && lane_reachable_blocks <= HARVEST_BATCH as u64)
+                // The refusal edges (§5.4 sites 1–3): every one funnels
+                // through the PRESSURE harvest — allocation about to
+                // refuse / an empty lane harvest's last pass — and a
+                // non-empty ring there IS the coupling, whatever the age.
+                || pressure;
+            if coupled {
                 DEMAND_WAITS.fetch_add(1, Ordering::Relaxed);
+                // PR 3's consumer: the MARK (TTL'd like the runway
+                // reading) + the graded coupling face. The mark never
+                // feeds rung (b) — see `note_pressure`.
+                if demand_enabled() {
+                    DEMAND_UNTIL_MS
+                        .store(now.saturating_add(plane.reading_ttl_ms), Ordering::Relaxed);
+                    let age = now.saturating_sub(oldest);
+                    let floor = plane.demand_floor_ms.max(1);
+                    DEMAND_AGE_PCT.store(
+                        (age.saturating_sub(floor)).saturating_mul(100) / floor,
+                        Ordering::Relaxed,
+                    );
+                }
             }
         }
+        // The cliff reads as a zero runway (see `harvest_pressure`), which
+        // is exactly the pressure bound through the graded form — the
+        // pre-valve behaviour of this arm, reproduced rather than special-cased.
+        let runway = if pressure { Some(0) } else { runway };
+        note_pressure(runway, newest);
         let mut forced = false;
         if let Some(oldest) = oldest {
             if oldest > bound {
@@ -1027,15 +1074,49 @@ fn note_pressure(runway: Option<u64>, newest_label: u64) {
     let now = plane.clock.now_ms();
     RUNWAY_MS.store(runway, Ordering::Relaxed);
     RUNWAY_UNTIL_MS.store(now.saturating_add(plane.reading_ttl_ms), Ordering::Relaxed);
-    let Some(cadence) = plane.prod.as_ref().and_then(|p| p.cadence_for(runway)) else {
+    // Rung a′ (§5.2, the demand arm): a live demand mark asks the FLOOR
+    // cadence of every member behind the held labels — the same gate, the
+    // same delivery, the same lane as rung (a). The space arm's cadence,
+    // where one computed, is only ever tightened by it (the floor is the
+    // shortest interval a member's answer can change in). The mark NEVER
+    // feeds rung (b): the fence deadline below tightens off the space
+    // runway alone — a demand-prodded healthy reader is asked to answer
+    // sooner, never fenced sooner (constraint 2, by construction).
+    let space_cadence = plane.prod.as_ref().and_then(|p| p.cadence_for(runway));
+    let demand = demand_enabled() && demand_live();
+    let floor_ms = plane
+        .prod
+        .as_ref()
+        .map(|p| p.floor_ms)
+        .unwrap_or(plane.reading_ttl_ms)
+        .max(1);
+    // `cadence_for` clamps into [floor, renew], so under demand the
+    // effective cadence is exactly the floor — the strongest honest ask.
+    let cadence = match (space_cadence, demand) {
+        (Some(c), true) => Some(c.min(floor_ms)),
+        (Some(c), false) => Some(c),
+        (None, true) => Some(floor_ms),
+        (None, false) => None,
+    };
+    let Some(cadence) = cadence else {
         return;
     };
+    PROD_FROM_DEMAND.store(
+        u64::from(demand && space_cadence.is_none()),
+        Ordering::Relaxed,
+    );
     PROD_RENEW_MS.store(cadence, Ordering::Relaxed);
     PROD_LABEL.fetch_max(newest_label, Ordering::Relaxed);
     PROD_UNTIL_MS.store(now.saturating_add(plane.reading_ttl_ms), Ordering::Relaxed);
+    // L3 (§5.3): the valve's existing rate-limited refresh, its gate
+    // widened from "a prod cadence was computed" to "…or the demand mark
+    // is live" — the rate limit stays the cadence in force (under demand
+    // that IS the floor), so the law `refreshes ≤ elapsed ÷ floor` holds
+    // verbatim. The sweep stays as the idle-fleet backstop.
     let last = LAST_BOUND_REFRESH_MS.load(Ordering::Relaxed);
     if now.saturating_sub(last) >= cadence {
         LAST_BOUND_REFRESH_MS.store(now, Ordering::Relaxed);
+        BOUND_REFRESHES.fetch_add(1, Ordering::Relaxed);
         if let Some(owner) = crate::membership::installed_owner() {
             owner.refresh_free_grace_bound();
         }
@@ -1063,6 +1144,11 @@ pub fn take_prod_cadence(acked_free_epoch: u64) -> Option<u64> {
         return None;
     }
     PRODS.fetch_add(1, Ordering::Relaxed);
+    // Rung a′'s share of the ledger (⊆ prods): the cadence in force came
+    // from the demand arm, not the space runway.
+    if PROD_FROM_DEMAND.load(Ordering::Relaxed) == 1 {
+        DEMAND_PRODS.fetch_add(1, Ordering::Relaxed);
+    }
     Some(cadence)
 }
 
@@ -1413,6 +1499,128 @@ pub fn test_clear_ack_pipeline() -> bool {
     ACK_PIPELINE.swap(0, Ordering::Relaxed) != 0
 }
 
+/// The `SQUEEZEFS_FREE_GRACE_DEMAND` lever's latch (the `ACK_PIPELINE`
+/// pattern): the demand arm — site 0's consumer, rung a′, the L3 widened
+/// refresh, AND the KD-FG-10 runway supply re-base. `0` restores the
+/// pre-campaign valve verbatim (the observation counter stays live —
+/// the instrument is not the mechanism).
+static DEMAND_LEVER: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub(crate) fn demand_enabled() -> bool {
+    match DEMAND_LEVER.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = crate::env_knobs::bool_knob("SQUEEZEFS_FREE_GRACE_DEMAND", true);
+            DEMAND_LEVER.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Test seam (the `test_set_ack_pipeline` shape).
+pub fn test_set_demand(on: Option<bool>) {
+    DEMAND_LEVER.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Test seam: `true` ⇔ a preset was in force.
+pub fn test_clear_demand() -> bool {
+    DEMAND_LEVER.swap(0, Ordering::Relaxed) != 0
+}
+
+/// The `SQUEEZEFS_FREE_GRACE_PASS_ELASTIC` lever's latch (L2b, §5.2b —
+/// OQ 3's user decision): a prodded member also tightens its revalidation
+/// pass cadence. `0` = the routine pass cadence always (the pre-campaign
+/// S5 behavior verbatim).
+static PASS_ELASTIC: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn pass_elastic_enabled() -> bool {
+    match PASS_ELASTIC.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = crate::env_knobs::bool_knob("SQUEEZEFS_FREE_GRACE_PASS_ELASTIC", true);
+            PASS_ELASTIC.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Test seam (the `test_set_ack_pipeline` shape).
+pub fn test_set_pass_elastic(on: Option<bool>) {
+    PASS_ELASTIC.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Test seam: `true` ⇔ a preset was in force.
+pub fn test_clear_pass_elastic() -> bool {
+    PASS_ELASTIC.swap(0, Ordering::Relaxed) != 0
+}
+
+/// `true` ⇔ the demand mark is live (owner clock; TTL'd like the runway).
+fn demand_live() -> bool {
+    let Some(now) = owner_now_ms() else {
+        return false;
+    };
+    now < DEMAND_UNTIL_MS.load(Ordering::Relaxed)
+}
+
+/// **L2b, the member side** (§5.2b): a renewal grant adopted with a
+/// tightened `renew_ms` IS the pass-cadence ask — deposit it, TTL'd like
+/// the prod (two beats of the prodded cadence, so a quiet window restores
+/// the routine cadence within one reading TTL).
+pub fn note_prodded_renewal(renew_ms: u64, member_now_ms: u64) {
+    PASS_PROD_MS.store(renew_ms, Ordering::Relaxed);
+    PASS_PROD_UNTIL_MS.store(
+        member_now_ms.saturating_add(renew_ms.saturating_mul(2)),
+        Ordering::Relaxed,
+    );
+}
+
+/// **L2b, the pass-cadence resolver** — called by the revalidation loop
+/// once per iteration: `clamp(prodded renew_ms, CHECKPOINT_MAX_AGE_MS,
+/// routine)` while the deposit is live and the lever is on; the routine
+/// cadence otherwise. The floor is physics, not tuning (polling faster
+/// than the writer's checkpoint ceiling observes nothing new), and on a
+/// venue whose routine interval already sits AT the floor this is
+/// structurally inert (nothing to tighten — no engagement counted).
+pub fn reader_pass_interval(routine: Duration, member_now_ms: u64) -> Duration {
+    let routine_ms = routine.as_millis() as u64;
+    let out = 'tightened: {
+        if !pass_elastic_enabled() {
+            break 'tightened routine_ms;
+        }
+        if member_now_ms >= PASS_PROD_UNTIL_MS.load(Ordering::Relaxed) {
+            break 'tightened routine_ms;
+        }
+        let asked = PASS_PROD_MS.load(Ordering::Relaxed);
+        if asked == 0 {
+            break 'tightened routine_ms;
+        }
+        let floor = crate::meta_backend::kv::checkpoint::CHECKPOINT_MAX_AGE_MS as u64;
+        let tightened = asked.max(floor).min(routine_ms);
+        if tightened < routine_ms {
+            PASS_PRODS.fetch_add(1, Ordering::Relaxed);
+        }
+        tightened
+    };
+    PASS_INTERVAL_MS.store(out, Ordering::Relaxed);
+    Duration::from_millis(out)
+}
+
 /// The mount's ladder (one reader per process — the
 /// `membership::INSTALLED` shape).
 static LADDER: once_cell::sync::Lazy<ReaderAckLadder> =
@@ -1523,9 +1731,47 @@ pub fn bound_tightenings() -> u64 {
 /// coupling — the ring aging past the physics floor while the caller's
 /// lane-reachable supply sat at the trough. 0 on solo/unarmed mounts;
 /// growth is the *coupled* statement the s11 row's gauges lacked.
-/// Counter-only until PR 3 arms a consumer.
 pub fn demand_waits() -> u64 {
     DEMAND_WAITS.load(Ordering::Relaxed)
+}
+
+/// The graded coupling face (`free_grace_demand_pct`, §5.4) — read beside
+/// the scarcity face `free_grace_pressure_pct`: the s11 failure shape
+/// (decay at scarcity 0) must read ≈ 100 HERE. 0 when the mark expired or
+/// the `DEMAND` lever is off.
+pub fn demand_pct() -> u64 {
+    if !demand_live() {
+        return 0;
+    }
+    DEMAND_AGE_PCT.load(Ordering::Relaxed).min(100)
+}
+
+/// Rung a′'s engagement (`free_grace_demand_prods`, ⊆ `free_grace_prods`):
+/// growth with `bound` advancing is the arm working; growth with `bound`
+/// flat = expect rung (c), the same reading as rung (a).
+pub fn demand_prods() -> u64 {
+    DEMAND_PRODS.load(Ordering::Relaxed)
+}
+
+/// L3's engagement (`free_grace_bound_refreshes`): bound recomputes run on
+/// the demand/prod harvest path. Law: ≤ elapsed ÷ the floor rate limit —
+/// a breach is a bug.
+pub fn bound_refreshes() -> u64 {
+    BOUND_REFRESHES.load(Ordering::Relaxed)
+}
+
+/// L2b's engagement (`free_grace_pass_prods`): revalidation passes run on
+/// a tightened cadence. 0 on quiet fleets, under `PASS_ELASTIC=0`, and —
+/// structurally — on venues whose routine interval already sits at the
+/// checkpoint floor (the s11 venue).
+pub fn pass_prods() -> u64 {
+    PASS_PRODS.load(Ordering::Relaxed)
+}
+
+/// The revalidation pass cadence in force, ms (`free_grace_pass_interval_ms`
+/// — routine when no prod is live; 0 until the first resolve).
+pub fn pass_interval_ms() -> u64 {
+    PASS_INTERVAL_MS.load(Ordering::Relaxed)
 }
 
 /// **The loop-latency instrument** (`free_grace_bound_age_ms`, §8):
@@ -1613,6 +1859,10 @@ pub fn stats_snapshot() -> serde_json::Value {
                 // and the reader's own promote lag.
                 "free_grace_ack_pipeline_depth": LADDER.depth(),
                 "free_grace_acked_lag_ms": LADDER.acked_lag_ms(),
+                // L2b (PR 3): the elastic pass cadence's engagement and
+                // the cadence in force.
+                "free_grace_pass_prods": pass_prods(),
+                "free_grace_pass_interval_ms": pass_interval_ms(),
             });
         }
         return serde_json::json!({ "free_grace_mode": "off" });
@@ -1645,6 +1895,12 @@ pub fn stats_snapshot() -> serde_json::Value {
         "free_grace_bound_age_ms": bound_age_ms(),
         "free_grace_demand_waits": demand_waits(),
         "free_grace_residence_ms": RESIDENCE_MS.to_json(),
+        // The demand arm (PR 3, §5.2–§5.4): the coupling face beside the
+        // scarcity face, rung a′'s share of the prod ledger, and L3's
+        // refresh engagement.
+        "free_grace_demand_pct": demand_pct(),
+        "free_grace_demand_prods": demand_prods(),
+        "free_grace_bound_refreshes": bound_refreshes(),
     })
 }
 
@@ -1672,9 +1928,20 @@ pub fn reset_for_test() {
         &LAST_BOUND_REFRESH_MS,
         &DEMAND_WAITS,
         &RESIDENCE_SAMPLES,
+        &DEMAND_UNTIL_MS,
+        &DEMAND_AGE_PCT,
+        &DEMAND_PRODS,
+        &PROD_FROM_DEMAND,
+        &BOUND_REFRESHES,
+        &PASS_PROD_MS,
+        &PASS_PROD_UNTIL_MS,
+        &PASS_PRODS,
+        &PASS_INTERVAL_MS,
     ] {
         c.store(0, Ordering::Relaxed);
     }
+    test_set_demand(None);
+    test_set_pass_elastic(None);
     for b in &RESIDENCE_MS.buckets {
         b.store(0, Ordering::Relaxed);
     }

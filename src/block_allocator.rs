@@ -2416,16 +2416,31 @@ impl BlockAllocator {
         if self.grace.is_empty() {
             return;
         }
-        let supply = self.free_supply_blocks();
-        // The lane-reachable number rides beside the passed-global one:
-        // PR 1's site-0 observation input (KD-FG-10); PR 3 re-bases the
-        // runway on it under the `DEMAND` lever.
+        // KD-FG-10 (PR 3): under the `DEMAND` lever the runway's supply
+        // input is the LANE-REACHABLE number — the quantity that troughs
+        // on a recycle-bound stream, where the passed-global one
+        // accumulates foreign-lane releases and provably never did on the
+        // motivating row. `DEMAND=0` restores the passed-global input
+        // verbatim (the lever's restore-exactly contract). Site 0's
+        // conjunct always reads the lane-reachable number.
+        let supply = self.grace_supply_blocks();
         let lane_reachable = self.lane_reachable_blocks();
         for offset in
             self.grace
                 .harvest_with_supply(crate::free_grace::HARVEST_BATCH, supply, lane_reachable)
         {
             self.publish_free_list(offset);
+        }
+    }
+
+    /// The supply number the grace runway reads (KD-FG-10's re-base):
+    /// lane-reachable under the `DEMAND` lever, the passed-global
+    /// pre-campaign number under `DEMAND=0`.
+    pub fn grace_supply_blocks(&self) -> u64 {
+        if crate::free_grace::demand_enabled() {
+            self.lane_reachable_blocks()
+        } else {
+            self.free_supply_blocks()
         }
     }
 
@@ -2438,7 +2453,10 @@ impl BlockAllocator {
     ///
     /// `u64::MAX` on an unbounded allocator (offline tools, tests): space
     /// is then not a constraint and only the ring's own headroom is.
-    fn free_supply_blocks(&self) -> u64 {
+    /// `pub`: the PASSED-GLOBAL supply — the pre-campaign runway input
+    /// (`grace_supply_blocks` resolves the `DEMAND` lever between this and
+    /// the lane-reachable number; the restore-exactly contract reads both).
+    pub fn free_supply_blocks(&self) -> u64 {
         let virgin = self.virgin_bytes();
         if virgin == u64::MAX {
             return u64::MAX;

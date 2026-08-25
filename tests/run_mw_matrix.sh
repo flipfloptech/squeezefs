@@ -3427,7 +3427,7 @@ def wall(tag, i):
 bad = []
 user_bytes = 0
 print(f"== S9-a fan-out row: authority + {k} co-writer(s), phase-W {mb}MiB + phase-R {rw_mb}MiB per member, conv=fsync ==")
-print(f"{'member':<8}{'role':<10}{'W_MBps':<9}{'R_MBps':<9}{'wt_MiB_d':<10}{'rw_MiB_d':<10}{'seeds_d':<8}{'pub_ship_d':<11}{'free_ship_d':<12}{'harvest_d':<10}{'lcr':<5}{'enospc':<7}")
+print(f"{'member':<8}{'role':<10}{'W_MBps':<9}{'R_MBps':<9}{'fresh_MiB_d':<12}{'rw_MiB_d':<10}{'seeds_d':<8}{'pub_ship_d':<11}{'free_ship_d':<12}{'harvest_d':<10}{'lcr':<5}{'enospc':<7}")
 members = [("0", "authority")] + [(i, "cowriter") for i in cws]
 sum_pub_ship = 0
 sum_free_ship = 0
@@ -3437,7 +3437,18 @@ for i, role in members:
     ww, wn = wall("w", i)
     rw, rn = wall("r", i)
     user_bytes += (wn + rn) * 1024 * 1024
-    wt_d = dd("write_through_bytes") // (1024 * 1024)
+    # The FRESH-write vehicle: the device overlay (SQUEEZEFS_DEVICE_OVERLAY,
+    # default ON — the shipped one-path write store) carries eligible fresh
+    # segments since the B2 flip, so complete-block write-through reads 0 on
+    # every default mount and the fresh column is the overlay's own ledger
+    # NET of its overwrite-arm subset (overlay_overwrite_bytes rides the
+    # REWRITE column's plane). write_through_bytes stays summed for the
+    # `SQUEEZEFS_DEVICE_OVERLAY=0` A/B posture, where it is the vehicle.
+    wt_d = (
+        dd("write_through_bytes")
+        + dd("overlay_store_bytes")
+        - dd("overlay_overwrite_bytes")
+    ) // (1024 * 1024)
     rw_d = dd("rewrite_user_bytes") // (1024 * 1024)
     seeds = dd("overwrite_seed_materialized")
     pub_ship = dd("meta_ship_publish.shipped")
@@ -3445,11 +3456,13 @@ for i, role in members:
     harv = dd("meta_ship_publish.harvest_shipped_blocks")
     lcr = int(d1.get("cowriter.local_commit_refusals", 0) or 0)
     enospc = dd("alloc_lane_enospc_refusals")
-    print(f"m{i:<7}{role:<10}{wn/ww:<9.1f}{rn/rw:<9.1f}{wt_d:<10}{rw_d:<10}{seeds:<8}{pub_ship:<11}{free_ship:<12}{harv:<10}{lcr:<5}{enospc:<7}")
+    print(f"m{i:<7}{role:<10}{wn/ww:<9.1f}{rn/rw:<9.1f}{wt_d:<12}{rw_d:<10}{seeds:<8}{pub_ship:<11}{free_ship:<12}{harv:<10}{lcr:<5}{enospc:<7}")
     # Engagement gates (charter: each co-writer's shipped publish/free
     # ledger deltas must account for its blocks). The written bytes ride
-    # THREE vehicles on a buffered dd venue — complete-block write-through,
-    # the rewrite vehicle (in-place overwrites of a mapped block), and
+    # THREE vehicles on a buffered dd venue — the FRESH vehicle (the
+    # device overlay on default mounts, complete-block write-through on
+    # the OVERLAY=0 posture — the composed column above), the rewrite
+    # vehicle (in-place overwrites of a mapped block), and
     # partial-coverage residue (seed-materialized overwrites, OOO-split
     # active blocks) — so the accounting gate is the SUM of the two byte
     # ledgers, and the seed count is a REPORTED column (the buffered
@@ -3462,7 +3475,7 @@ for i, role in members:
     # an instrument-noise tripwire.
     total_mb = wn + rn
     if wt_d + rw_d < total_mb // 2:
-        bad.append(f"m{i}: write_through {wt_d}MiB + rewrite {rw_d}MiB < 50% of the {total_mb}MiB written — the row's bytes are not accounted by the write vehicles")
+        bad.append(f"m{i}: fresh-vehicle {wt_d}MiB + rewrite {rw_d}MiB < 50% of the {total_mb}MiB written — the row's bytes are not accounted by the write vehicles")
     if role == "cowriter":
         rw_blocks = rn * 1024 * 1024 // BLOCK
         if pub_ship < 1:

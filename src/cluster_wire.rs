@@ -2551,6 +2551,51 @@ impl RpcClient {
         &self.authn
     }
 
+    /// **Is this pooled session provably dead before a send** (finding
+    /// 14 — the idle-reap class)? The coordinator's 60 s idle-session
+    /// reaper closes a quiet session's socket, so its FIN sits queued
+    /// long before the next verb: a non-blocking `MSG_PEEK` answers EOF
+    /// without consuming anything. On a request/reply wire NOTHING is
+    /// legitimately readable between calls, so readable bytes here are
+    /// a desynchronized session — dead too.
+    ///
+    /// This is what lets the ONE-ATTEMPT verb classes (custody acquires,
+    /// the un-witnessed publish mutators) replace a reaped session
+    /// BEFORE their single send: the no-retry law binds a frame once
+    /// SENT — the true sent-then-lost ambiguity keeps refusing — while a
+    /// dead-on-arrival session costs no attempt at all. `false` on any
+    /// probe error other than would-block: the send itself is the
+    /// honest classifier there, and this must never eat a live session.
+    pub fn dead_on_arrival(&self) -> bool {
+        let Some(io) = self.io.as_ref() else {
+            // Lost to a panicked call: `call` refuses loud by its own
+            // law; reporting dead here lets a pooled caller replace it.
+            return true;
+        };
+        let fd = {
+            use std::os::fd::AsRawFd;
+            io.stream.sock().as_raw_fd()
+        };
+        let mut byte = 0u8;
+        // SAFETY: recv on an owned, open fd with a valid 1-byte buffer;
+        // MSG_PEEK consumes nothing, MSG_DONTWAIT never blocks.
+        let n = unsafe {
+            libc::recv(
+                fd,
+                std::ptr::from_mut(&mut byte).cast(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        match n {
+            0 => true,   // EOF queued — the reaper closed it.
+            1.. => true, // unsolicited bytes between calls — desynchronized.
+            // WouldBlock (EAGAIN/EWOULDBLOCK) = alive and quiet; any
+            // other errno is a broken socket.
+            _ => std::io::Error::last_os_error().kind() != std::io::ErrorKind::WouldBlock,
+        }
+    }
+
     /// Issue one authenticated request and await its reply. Async API
     /// preserved; the roundtrip runs on the blocking pool with the reply
     /// wait bounded by the socket read timeout.

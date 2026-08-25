@@ -1013,6 +1013,16 @@ impl PublishClient {
         )?;
         let lane = self.lane(endpoint);
         let mut guard = lane.lock().await;
+        // Finding 14 (the width-8 re-grade's conviction): a POOLED session
+        // the idle reaper closed is provably dead BEFORE the send — the
+        // queued FIN answers a non-blocking peek — so replacing it here
+        // costs no attempt and touches no retry law (the one-attempt
+        // classes refuse only the true sent-then-lost ambiguity). Without
+        // this screen, every un-witnessed mutator following a ≥ 60 s
+        // quiet spell surfaced EINVAL to the application.
+        if guard.as_ref().is_some_and(|c| c.dead_on_arrival()) {
+            *guard = None;
+        }
         // Rung 18 (residual d — the idle-reap conviction): a TRANSPORT
         // failure on a resend-safe call reconnects and resends the SAME
         // frame once (the S8 batch precedent; classification is

@@ -3403,6 +3403,16 @@ impl WriteCustodyClient {
         body: Vec<u8>,
     ) -> Result<crate::cluster_wire::RpcResponse> {
         let mut guard = session.lock().await;
+        // Finding 14 (the width-8 re-grade's conviction): a pooled session
+        // the wire's 60 s idle reaper closed is provably dead BEFORE the
+        // send (its FIN answers a non-blocking peek), so replacing it here
+        // costs none of this verb's ONE attempt and re-parks no
+        // arbitration — without it, the first write-open after any quiet
+        // spell failed EINVAL on a healthy fleet (the custody acquire is
+        // this path's first carrier).
+        if guard.as_ref().is_some_and(|c| c.dead_on_arrival()) {
+            *guard = None;
+        }
         if guard.is_none() {
             *guard = Some(RpcClient::connect(&self.endpoint, &self.secret, &self.id, None).await?);
         }

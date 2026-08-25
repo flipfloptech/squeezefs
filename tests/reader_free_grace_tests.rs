@@ -1877,15 +1877,17 @@ fn prop_the_candidate_queue_is_bounded_and_never_wedges() {
     assert!(free_grace::test_clear_ack_pipeline());
 }
 
-/// **PINNED CURRENT BEHAVIOR — inverted by PR 3 (`demand-arm`, L3).** An
-/// acknowledgement recorded by a renewal does NOT advance the published
-/// bound by itself: the bound moves only when `refresh_free_grace_bound`
-/// runs (the owner's sweep quantum — §3.2's T7). PR 3 widens the valve's
-/// existing rate-limited refresh gate so a live demand mark republishes
-/// within the floor beat; its tests-first commit flips this red.
+/// **PR 3 (L3), the inversion of PR 1's pinned contract (ii): a live
+/// demand mark republishes the bound within the floor beat.** Without
+/// demand the T7 quantization stands (a recorded ack waits for the sweep);
+/// with the demand mark live, the very harvest that observes the coupling
+/// runs the valve's existing rate-limited refresh (the gate widened from
+/// "a prod cadence was computed" to "…or the demand mark is live"), so
+/// recorded acks publish within one floor beat of arrival.
 #[test]
-fn pinned_the_bound_advances_only_on_the_sweep_quantum() {
+fn a_live_demand_mark_republishes_the_bound_within_the_floor() {
     let _serial = serial();
+    free_grace::test_set_demand(Some(true));
     let (clock, ticks) = manual_clock();
     let owner = armed_owner(&clock);
     free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("derived bound");
@@ -1893,9 +1895,15 @@ fn pinned_the_bound_advances_only_on_the_sweep_quantum() {
     owner.refresh_free_grace_bound();
     let before = free_grace::bound();
 
-    ticks.fetch_add(5_000, Ordering::SeqCst);
-    // The bare renewal (NOT the suite's `ack()` helper, which refreshes):
-    // the ack is RECORDED at the owner…
+    // The coupled shape (the ENOSPC capture's): the ring holds offsets
+    // aged past the physics floor while the lane-reachable supply is 0.
+    let ring = GraceRing::new(1024);
+    assert!(ring.defer(4 * 1024 * 1024, 4 * 1024 * 1024));
+    ticks.fetch_add(200, Ordering::SeqCst);
+    assert!(ring.defer(8 * 1024 * 1024, 4 * 1024 * 1024));
+    ticks.fetch_add(20_000, Ordering::SeqCst);
+
+    // The bare renewal RECORDS the ack (no manual sweep anywhere below).
     assert!(
         matches!(
             owner.renew("r-sweep", grant.epoch, 14_000),
@@ -1903,32 +1911,45 @@ fn pinned_the_bound_advances_only_on_the_sweep_quantum() {
         ),
         "the renewal that carries the acknowledgement is admitted"
     );
-    assert_eq!(
-        free_grace::bound(),
-        before,
-        "the recorded ack is NOT published until the sweep runs — the T7 \
-         quantization this contract pins (PR 3's demand-coupled refresh \
-         inverts it)"
+    assert_eq!(free_grace::bound(), before, "recorded, not yet published");
+
+    // The harvest observes the coupling (site 0) and — the L3 inversion —
+    // republishes the bound itself, within the floor's rate limit.
+    let refreshes_before = free_grace::bound_refreshes();
+    let released = ring.harvest_with_supply(64, u64::MAX, 0);
+    assert!(
+        free_grace::bound_refreshes() > refreshes_before,
+        "the demand-coupled refresh ran on the harvest path (L3's gate)"
     );
-    owner.refresh_free_grace_bound();
     assert_eq!(
         free_grace::bound(),
         14_000,
-        "the sweep publishes the recorded minimum"
+        "the recorded ack published WITHOUT the owner's sweep — T7 \
+         collapsed to the floor beat (PR 1's pin (ii), inverted)"
     );
+    // …and the now-covered offsets released in the same pass or the next.
+    let released2 = ring.harvest_with_supply(64, u64::MAX, 0);
+    assert_eq!(
+        released.len() + released2.len(),
+        2,
+        "the acknowledged offsets reach the free list without a sweep"
+    );
+    assert!(free_grace::test_clear_demand());
 }
 
-/// **The site-0 demand observation (PR 1's own instrument, consumer-less),
-/// PLUS the pin: the addendum row's shape never prods (inverted by PR 3).**
+/// **PR 3 (L2 + L4), the inversion of PR 1's pinned contract (iii): the
+/// coupled storm PRODS at the floor while the fence stays runway-only.**
 /// The motivating row reached no refusal edge — long PASSED-global runway,
 /// prods 0, pressure 0 — while the ring aged past the physics floor and
-/// the lane-reachable supply sat at the trough. Site 0 (inside
-/// `GraceRing::harvest_with`, KD-FG-9) must OBSERVE that coupling from
-/// day one (`free_grace_demand_waits` counts), while the pre-PR-3 valve
-/// stays exactly as shipped: no prod, scarcity face 0, nothing released.
+/// the lane-reachable supply sat at the trough (the ENOSPC capture's
+/// shape). Site 0 observes the coupling (PR 1's counter), the demand mark
+/// arms rung a′ (the floor cadence to members holding the free list) and
+/// the coupling face reads the cliff — while rung (b)'s LAW is untouched:
+/// the fence deadline stays the space runway's, verbatim.
 #[test]
-fn pinned_a_coupled_storm_with_long_runway_never_prods_but_site_zero_counts() {
+fn a_coupled_storm_prods_at_the_floor_and_the_fence_stays_runway_only() {
     let _serial = serial();
+    free_grace::test_set_demand(Some(true));
     let (clock, ticks) = manual_clock();
     let owner = armed_owner(&clock);
     free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("derived bound");
@@ -1947,7 +1968,6 @@ fn pinned_a_coupled_storm_with_long_runway_never_prods_but_site_zero_counts() {
     ticks.fetch_add(20_000, Ordering::SeqCst);
 
     let waits_before = free_grace::demand_waits();
-    let prods_before = free_grace::prods();
     // The addendum shape: passed-global supply HIGH (foreign-lane
     // accumulation, §2.2's corrected note), lane-reachable at the trough.
     let released = ring.harvest_with_supply(64, 1_000, 4);
@@ -1955,17 +1975,43 @@ fn pinned_a_coupled_storm_with_long_runway_never_prods_but_site_zero_counts() {
         released.is_empty(),
         "nothing is acknowledged and no deadline expired: the promise holds"
     );
-    assert_eq!(
-        free_grace::prods() - prods_before,
-        0,
-        "PINNED (inverted by PR 3): the space runway is long, so rung (a) \
-         never engages on this shape — the row's measured prods-0"
-    );
     assert!(
         free_grace::demand_waits() > waits_before,
         "site 0 OBSERVES the coupling the row decayed under: ring aging \
          past the physics floor while the lane-reachable supply sits at \
-         the trough (the consumer-less observation PR 3 arms)"
+         the trough"
+    );
+    // PR 3 (L2/L4), the inversion of PR 1's pin (iii): the demand mark is
+    // now LIVE — rung a′ answers the FLOOR cadence for a member behind the
+    // held labels, the coupling face reads the cliff, and — the law pin —
+    // the FENCE deadline stays runway-only (a demand-prodded healthy
+    // reader is asked to answer sooner, never fenced sooner).
+    assert_eq!(
+        free_grace::demand_pct(),
+        100,
+        "the coupling face reads the cliff (the s11 shape: decay at \
+         scarcity 0 must read ≈ 100 HERE)"
+    );
+    let prods_before = free_grace::prods();
+    let demand_prods_before = free_grace::demand_prods();
+    let cadence = free_grace::take_prod_cadence(0)
+        .expect("a member holding the free list is prodded under demand (rung a′)");
+    assert_eq!(
+        cadence, 1_000,
+        "the demand prod is the FLOOR cadence (ack_refresh_floor ≈ 1 s on \
+         the shipped derivation)"
+    );
+    assert!(free_grace::prods() > prods_before);
+    assert!(
+        free_grace::demand_prods() > demand_prods_before,
+        "the demand arm's engagement is counted apart (⊆ prods)"
+    );
+    assert_eq!(
+        free_grace::effective_bound_ms(),
+        free_grace::fence_bound_base_ms(),
+        "the demand mark NEVER feeds rung (b): with a long space runway \
+         the fence deadline stays the routine bound (constraint 2 — asked \
+         sooner, never fenced sooner)"
     );
 
     // The same harvest with a HEALTHY lane-reachable supply is not demand.
@@ -1976,6 +2022,134 @@ fn pinned_a_coupled_storm_with_long_runway_never_prods_but_site_zero_counts() {
         waits_mid,
         "a lane with supply is not coupled — site 0 stays quiet"
     );
+    assert!(free_grace::test_clear_demand());
+}
+
+/// **The `DEMAND=0` restore-exactly contract** (KD-FG-10's lever law):
+/// with the lever off, the coupled shape is the PRE-CAMPAIGN valve
+/// verbatim — no demand mark, no rung-a′ prod, the coupling face 0 —
+/// while site 0's OBSERVATION (PR 1's counter) keeps counting, because
+/// the instrument is not the mechanism.
+#[test]
+fn the_demand_lever_off_restores_the_shipped_valve_verbatim() {
+    let _serial = serial();
+    free_grace::test_set_demand(Some(false));
+    let (clock, ticks) = manual_clock();
+    let owner = armed_owner(&clock);
+    free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("derived bound");
+    let _grant = join(&owner, "r-off", MemberRole::Reader);
+    owner.refresh_free_grace_bound();
+
+    let ring = GraceRing::new(1024);
+    assert!(ring.defer(4 * 1024 * 1024, 4 * 1024 * 1024));
+    ticks.fetch_add(200, Ordering::SeqCst);
+    assert!(ring.defer(8 * 1024 * 1024, 4 * 1024 * 1024));
+    ticks.fetch_add(20_000, Ordering::SeqCst);
+
+    let waits_before = free_grace::demand_waits();
+    let _ = ring.harvest_with_supply(64, 1_000, 0);
+    assert!(
+        free_grace::demand_waits() > waits_before,
+        "the OBSERVATION still counts under the lever (the instrument is \
+         not the mechanism)"
+    );
+    assert_eq!(free_grace::demand_pct(), 0, "no coupling face");
+    assert_eq!(
+        free_grace::take_prod_cadence(0),
+        None,
+        "no rung-a′ prod: the pre-campaign valve verbatim (the long space \
+         runway never prods, exactly as PR 1 pinned)"
+    );
+    assert!(free_grace::test_clear_demand());
+}
+
+/// **L2b — a prodded grant tightens the revalidation pass cadence, with
+/// the checkpoint ceiling as its physics floor** (OQ 3, user decision):
+/// `pass_interval = clamp(prodded renew_ms, CHECKPOINT_MAX_AGE_MS,
+/// routine)`, TTL'd like the prod; expiry restores the routine cadence;
+/// `PASS_ELASTIC=0` is the routine cadence always; and on a venue whose
+/// routine interval already sits AT the floor the lever is structurally
+/// inert (`free_grace_pass_prods` stays 0 — the s11 venue's own shape).
+#[test]
+fn a_prodded_grant_tightens_the_pass_cadence_with_the_checkpoint_floor() {
+    let _serial = serial();
+    free_grace::test_set_pass_elastic(Some(true));
+
+    // A slow-flush venue: routine pass interval 5 s, prodded renew 1 s.
+    let routine = Duration::from_millis(5_000);
+    let prods_before = free_grace::pass_prods();
+    free_grace::note_prodded_renewal(1_000, 10_000);
+    assert_eq!(
+        free_grace::reader_pass_interval(routine, 10_500),
+        Duration::from_millis(1_000),
+        "the prodded ask tightens the pass cadence (5 s → 1 s per stage)"
+    );
+    assert!(
+        free_grace::pass_prods() > prods_before,
+        "the tightened pass is counted (the engagement gauge)"
+    );
+    assert_eq!(
+        free_grace::pass_interval_ms(),
+        1_000,
+        "the cadence in force is published (the prod_renew_ms precedent)"
+    );
+
+    // The physics floor: an ask below the checkpoint ceiling clamps UP —
+    // polling faster than the writer's 1 s checkpoint observes nothing.
+    free_grace::note_prodded_renewal(200, 11_000);
+    assert_eq!(
+        free_grace::reader_pass_interval(routine, 11_100),
+        Duration::from_millis(1_000),
+        "the floor is CHECKPOINT_MAX_AGE_MS — physics, not tuning"
+    );
+
+    // Expiry: the routine cadence recovers within one reading TTL.
+    assert_eq!(
+        free_grace::reader_pass_interval(routine, 60_000),
+        routine,
+        "a quiet window restores the routine cadence"
+    );
+    assert_eq!(free_grace::pass_interval_ms(), 5_000);
+
+    // The floor venue (routine == ceiling): structurally inert.
+    let floor_routine = Duration::from_millis(1_000);
+    let prods_mid = free_grace::pass_prods();
+    free_grace::note_prodded_renewal(1_000, 70_000);
+    assert_eq!(
+        free_grace::reader_pass_interval(floor_routine, 70_100),
+        floor_routine,
+        "routine already AT the floor: nothing to tighten (the s11 venue)"
+    );
+    assert_eq!(
+        free_grace::pass_prods(),
+        prods_mid,
+        "structural inertness: no engagement counted where routine = floor"
+    );
+
+    // The lever: routine verbatim, engagement 0.
+    free_grace::test_set_pass_elastic(Some(false));
+    free_grace::note_prodded_renewal(1_000, 80_000);
+    assert_eq!(
+        free_grace::reader_pass_interval(routine, 80_100),
+        routine,
+        "PASS_ELASTIC=0: the pre-campaign S5 cadence verbatim"
+    );
+    assert!(free_grace::test_clear_pass_elastic());
+
+    // The three numbers that deliberately DO NOT move under a prodded
+    // window (§5.2b's never-weakens argument): the published staleness
+    // bound is the ROUTINE derivation — structurally independent of the
+    // pass word (it reads no prodded state).
+    let bound_before = squeezefs::ro_coherence::reader_staleness_bound();
+    free_grace::test_set_pass_elastic(Some(true));
+    free_grace::note_prodded_renewal(1_000, 90_000);
+    assert_eq!(
+        squeezefs::ro_coherence::reader_staleness_bound(),
+        bound_before,
+        "the PUBLISHED staleness bound never flickers with load — it is \
+         the guarantee in force, not the cadence in force"
+    );
+    assert!(free_grace::test_clear_pass_elastic());
 }
 
 /// **The loop-latency instruments (PR 1, §8 rows 1–2).** `bound_age_ms`

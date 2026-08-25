@@ -662,11 +662,23 @@ the S10 gate; the rest are carried, priced, and loud where they can fire.
    S6/S7/S9 planes' adjudication — "a fenced holder is dead until remount"
    is load-bearing. Posture until then: supervise + remount on the
    self-fence gauges (operations.md carries it).
-5. **The width-8+ fan-out venue**: `s9-fanout` at width 8 on a
-   custody-armed fleet wedged in shipped-free double-release churn (recorded
-   at rungs 18/19 as new territory, not a regression — the leg's proven
-   venue is width 2 and it is green there from zero). The width-N family's
-   remaining live shape.
+5. **The width-8+ fan-out venue — RETIRED 2026-08-25**
+   (`.benchmarks/2026-08-25-s9-fanout-width8-regrade.md`): the rung-18/19
+   width-8 wedge (shipped-free double-release churn) DID NOT REPRODUCE on
+   the current binary — two programs rewrote the paths under it since the
+   capture (the free-grace pressure valve, finding 13's owner-partitioned
+   shipped-free ledger read) — and `s9-fanout` is GREEN from zero at
+   width 8 (8 concurrent writers ~1 GB/s each, engagement exact, amp
+   1.037×, oracle clean). The re-grade's own conviction, **finding 14**,
+   is fixed on the same record (`a7ac0062`): the one-attempt wire classes
+   (custody acquires, un-witnessed publish mutators) burned their single
+   attempt on idle-reaped pooled sessions — EINVAL on a healthy fleet
+   after any 60 s quiet spell — closed by `RpcClient::dead_on_arrival`
+   (a dead-before-send session is replaced at zero attempts; the
+   sent-then-lost ambiguity refuses verbatim). What remains in this
+   family is capacity arithmetic, not a wedge: the free funnel's cost at
+   K > 8 is unmeasured (the per-volume leg (c) row, 0.92× at K = 2, is
+   the standing instrument).
 6. **Free-grace ack cadence under rewrite churn** (rung-17 finding 5c,
    reproduced at scale): a storm's deferrals outrun reader releases —
    `free_grace_offsets` climbs and lane-share ENOSPC follows (a 32 GiB

@@ -4795,6 +4795,18 @@ pub struct Metrics {
     /// evidence of a double-release lineage upstream (leak-safe: the block
     /// leaks until fsck C6, it is never handed to two owners).
     pub block_untracked_free_refusals: Align64<AtomicU64>,
+    /// Finding 23's SHIELD (the tracked twin of the untracked refusal
+    /// above): a SHIPPED free named an offset whose every RAM reference
+    /// the durable ledger still JUSTIFIES (`population ≥ refcount`) —
+    /// the offset was freed and REALLOCATED, and the verb names the dead
+    /// lifetime (the wire carries indices, no incarnation witness). The
+    /// executor refuses instead of freeing the live successor's block
+    /// (attempt 4's `read_settle_lost_serialized` storm + fsync EIO +
+    /// aggregate-size loss). Should stay ≈ 0 once the finding-23 mint
+    /// gate stops producing duplicates; growth means a stale free
+    /// lineage upstream — investigate beside
+    /// `block_untracked_free_refusals`, leak-safe either way.
+    pub block_live_free_refusals: Align64<AtomicU64>,
     /// Pre-RC engineering spec §6.2 item 6 / §6.3: reads and frees REFUSED
     /// because the block key named a **dead incarnation** of its device
     /// offset — the offset was freed and reissued to a different file, and
@@ -5656,6 +5668,17 @@ pub struct Metrics {
     /// recomposed the same over-cap value for ever). Distinct from
     /// `publish_blob_composes` on purpose: no rehydration happens here.
     pub publish_compose_spills: Align64<AtomicU64>,
+    /// Finding 23 (`.benchmarks/2026-08-25-s11-freeloop-stall.md`): a
+    /// range-shared co-writer save whose cached indirect head was a
+    /// REFETCH of the owner-composed durable base skipped its
+    /// `old_indirect_to_free` tail — that blob's lifecycle (ledger
+    /// release + device free) belongs to the OWNER's compose, and
+    /// claiming it here shipped one duplicate free per co-writer per
+    /// compose (the attempt-4 storm: 3–9 refusal bursts per offset).
+    /// The mint-gate engagement gauge: growth on a range-shared rewrite
+    /// row IS the gate working; a leak would show as `fsck` C2 findings
+    /// instead, never here.
+    pub publish_blob_foreign_free_skips: Align64<AtomicU64>,
     // Terminal-free device reclaim economy (the shim-write-amplification
     // fix — `.benchmarks/2026-07-27-shim-write-amplification.md`;
     // classification `routing::free_reclaim_op`, contract
@@ -9364,6 +9387,7 @@ impl SqueezefsFilesystem {
                 "staged_spill_escalations": METRICS.staged_spill_escalations.load(Ordering::Relaxed),
                 "block_double_frees": METRICS.block_double_frees.load(Ordering::Relaxed),
                 "block_untracked_free_refusals": METRICS.block_untracked_free_refusals.load(Ordering::Relaxed),
+                "block_live_free_refusals": METRICS.block_live_free_refusals.load(Ordering::Relaxed),
                 "block_key_incarnation_refusals": METRICS.block_key_incarnation_refusals.load(Ordering::Relaxed),
                 "block_key_incarnation_unknown": METRICS.block_key_incarnation_unknown.load(Ordering::Relaxed),
                 "block_key_incarnation_exhausted": METRICS.block_key_incarnation_exhausted.load(Ordering::Relaxed),
@@ -9891,6 +9915,7 @@ impl SqueezefsFilesystem {
                 "layout_indirect_map_read_bytes": METRICS.layout_indirect_map_read_bytes.load(Ordering::Relaxed),
                 "publish_blob_composes": METRICS.publish_blob_composes.load(Ordering::Relaxed),
                 "publish_compose_spills": METRICS.publish_compose_spills.load(Ordering::Relaxed),
+                "publish_blob_foreign_free_skips": METRICS.publish_blob_foreign_free_skips.load(Ordering::Relaxed),
                 "layout_delta_commits": crate::meta_backend::kv::META_KV_LAYOUT_DELTA_COMMITS.load(Ordering::Relaxed),
                 "layout_full_commits": crate::meta_backend::kv::META_KV_LAYOUT_FULL_COMMITS.load(Ordering::Relaxed),
                 "layout_delta_bytes": crate::meta_backend::kv::META_KV_LAYOUT_DELTA_BYTES.load(Ordering::Relaxed),
@@ -21335,6 +21360,7 @@ impl Filesystem for SqueezefsFilesystem {
                     // (§6.2 item 9).
                     layout_base_token: 0,
                     layout_version: 0,
+                    block_map_id_own_mint: false,
                 },
             );
             self.bump_dir_generation(parent);

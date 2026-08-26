@@ -1742,6 +1742,11 @@ pub async fn ship_displaced_frees(
 /// Per block, the verdict derivation — RAM first, the durable ledger for
 /// what RAM never tracked:
 ///
+/// * **RAM-tracked, durably justified** (`population ≥ refcount` —
+///   finding 23's SHIELD): the shipper names a DEAD lifetime of a
+///   freed-and-reallocated offset (a legitimate free's release rode its
+///   publish, so population runs below refcount) — `Refused`, counted on
+///   `block_live_free_refusals`, the live successor untouched;
 /// * **RAM-tracked** (the authority minted or recovered it): the standard
 ///   [`crate::routing::BackendRouter::free_block`] ladder runs and the
 ///   refcount decides terminal vs not — byte-identical to a local free;
@@ -1791,6 +1796,30 @@ pub async fn execute_shipped_frees(
             let offset = idx.saturating_mul(chunk);
             let key = backend.persist_block_key(&be_id, offset);
             let verdict = match alloc.refcount(offset) {
+                // Finding 23's SHIELD: a legitimate shipped free follows
+                // its displacing publish (the durable ordering point), so
+                // the shipper's reference is already released — the
+                // durable population runs BELOW the RAM refcount. A verb
+                // whose named offset has every RAM reference durably
+                // justified (`population ≥ refcount`) names a DEAD
+                // lifetime of a freed-and-REALLOCATED offset (the wire
+                // carries indices, no incarnation witness): executing it
+                // freed the live successor's block on the attempt-4 row
+                // (the `read_settle_lost_serialized` storm, fsync EIO, a
+                // 112 MiB aggregate loss). Refuse — leak-safe, counted.
+                Some(n) if n > 0 && populations[slot] >= n as usize => {
+                    log::error!(
+                        "S9: shipped free of block {idx} (vol_tag {vol_tag:#016x}) names an \
+                         offset whose {n} RAM reference(s) the durable ledger still justifies \
+                         (population {}) — a stale duplicate of a dead lifetime; refused \
+                         (block_live_free_refusals)",
+                        populations[slot]
+                    );
+                    crate::fuse_client::METRICS
+                        .block_live_free_refusals
+                        .fetch_add(1, Ordering::Relaxed);
+                    FreeVerdict::Refused
+                }
                 Some(n) if n > 0 => {
                     backend.free_block(&key).await?;
                     if n == 1 {

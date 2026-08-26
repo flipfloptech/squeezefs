@@ -236,6 +236,18 @@ pub struct CachedMetadata {
     /// changes at every persisted link (fork detection needs per-STATE
     /// uniqueness, not per-era).
     pub layout_version: u64,
+    /// Finding 23 (`.benchmarks/2026-08-25-s11-freeloop-stall.md`): `true`
+    /// ⇔ THIS mount's own save minted the blob `block_map_id` names —
+    /// stamped only by the save republish in
+    /// `save_metadata_to_backend_ext` (the one site that mints). Every
+    /// fetched/refetched/synthesized entry is `false`: on a RANGE-SHARED
+    /// ino a refetched head names the OWNER-composed durable blob, whose
+    /// lifecycle (ledger release + device free) belongs to the owner's
+    /// scoped compose — a co-writer claiming it as its
+    /// `old_indirect_to_free` shipped one duplicate free per co-writer
+    /// per compose, and a duplicate landing after reallocation freed the
+    /// LIVE successor lifetime.
+    pub block_map_id_own_mint: bool,
 }
 
 /// [`CachedMetadata::layout_delta_chain`] sentinel: the persisted base
@@ -267,6 +279,7 @@ impl Default for CachedMetadata {
             layout_delta_chain: LAYOUT_DELTA_CHAIN_INELIGIBLE,
             layout_base_token: 0,
             layout_version: 0,
+            block_map_id_own_mint: false,
         }
     }
 }
@@ -5639,6 +5652,10 @@ impl DataRouter {
                         // (first-touch rule) rather than let it name a
                         // base it never saw.
                         layout_version: 0,
+                        // Finding 23: a FETCHED head's blob is not this
+                        // mount's mint — on a range-shared ino its
+                        // lifecycle is the owner's compose.
+                        block_map_id_own_mint: false,
                     };
                     // Idea 1 refetch-compose (KD-1.9 — the eviction-hole
                     // belt): an open epoch's shadow bindings overlay the
@@ -6102,6 +6119,26 @@ impl DataRouter {
             publish_phase_record(PublishPhase::SaveEncode, t_encode);
         }
 
+        // Finding 23 (`.benchmarks/2026-08-25-s11-freeloop-stall.md`): on a
+        // RANGE-SHARED ino the owner's scoped compose recomputes blob
+        // custody on every served Put — it frees the durable predecessor
+        // itself (`custody_scoped_layout`'s `free_after_commit`) and DROPS
+        // the caller's blob frame ops. A co-writer whose cached head was a
+        // REFETCH of that owner-composed base therefore does not own the
+        // blob it names: claiming it as `old_indirect_to_free` shipped one
+        // duplicate free per co-writer per compose, and a duplicate landing
+        // after reallocation freed the LIVE successor lifetime. Only blobs
+        // THIS mount's own save minted are its lifecycle here; the skip is
+        // leak-safe (the owner's compose free covers the durable-old, and
+        // the executor's ledger shield backstops the race). Whole-file
+        // custody (no live range grants) keeps today's behavior — there the
+        // shipper's view is exclusive and its tail IS the designed
+        // lifecycle owner.
+        let foreign_blob_lifecycle = crate::fuse_client::co_writer_mount()
+            && !crate::cowriter::authority_accounting_scope_active()
+            && crate::meta_ship::tokens::range_span_hull(ino).is_some()
+            && !m.block_map_id_own_mint;
+
         // PR VL6a: a freshly allocated indirect blob is registered
         // in-flight until this function's `set_layout_and_size` publishes
         // the layout naming it (the guard drops at function end).
@@ -6152,7 +6189,13 @@ impl DataRouter {
             // every publish relocates.
             if let Some(ref map_id) = m.block_map_id {
                 if let Some(old_block_key) = map_id.strip_prefix("indirect:") {
-                    old_indirect_to_free = Some(old_block_key.to_string());
+                    if foreign_blob_lifecycle {
+                        METRICS
+                            .publish_blob_foreign_free_skips
+                            .fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        old_indirect_to_free = Some(old_block_key.to_string());
+                    }
                 }
             }
             let (be_id, block_allocator, nvme_writer) = self.backend_router.get_active_backend()?;
@@ -6199,8 +6242,14 @@ impl DataRouter {
             // block; the inline layout value is already serialized above.
             if let Some(ref map_id) = m.block_map_id {
                 if map_id.starts_with("indirect:") {
-                    let old_block_key = map_id.strip_prefix("indirect:").unwrap();
-                    old_indirect_to_free = Some(old_block_key.to_string());
+                    if foreign_blob_lifecycle {
+                        METRICS
+                            .publish_blob_foreign_free_skips
+                            .fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        let old_block_key = map_id.strip_prefix("indirect:").unwrap();
+                        old_indirect_to_free = Some(old_block_key.to_string());
+                    }
                 }
             }
             inline_bytes
@@ -6441,6 +6490,10 @@ impl DataRouter {
         // versioned-volume re-base or any eligibility miss), the minted
         // version was never persisted and must not be claimed.
         cached.layout_version = if delta_used { minted_version } else { 0 };
+        // Finding 23: the blob-lifecycle provenance — TRUE only when THIS
+        // save minted the head's blob (the one mint site). A collapsed
+        // (inline) head clears it; a kept foreign head keeps it false.
+        cached.block_map_id_own_mint = new_indirect_key.is_some();
         self.metadata_cache.insert(ino, cached);
 
         if let Some(ref old_key) = old_indirect_to_free {
@@ -9985,6 +10038,7 @@ impl DataRouter {
             // publish base.
             layout_base_token: 0,
             layout_version: 0,
+            block_map_id_own_mint: false,
         };
         self.metadata_cache.insert(ino, m.clone());
         Ok(m)
@@ -10024,7 +10078,11 @@ impl DataRouter {
         updated.cached_at = std::time::Instant::now();
         self.save_metadata_to_backend(ino, &updated, fencing_token)
             .await?;
-        self.metadata_cache.insert(ino, updated);
+        // Finding 23 (the CLOBBER face): the save's own republish is the
+        // authoritative cache entry — it carries the freshly minted blob
+        // id and its lifecycle provenance. Re-inserting the pre-save
+        // clone here erased that head, so the NEXT save re-released the
+        // old record and leaked the fresh blob.
         Ok(())
     }
 
@@ -10052,7 +10110,9 @@ impl DataRouter {
         clean.cached_at = std::time::Instant::now();
         self.save_metadata_to_backend(ino, &clean, fencing_token)
             .await?;
-        self.metadata_cache.insert(ino, clean);
+        // Finding 23 (the CLOBBER face): no re-insert — the save's own
+        // republish already carries `clean` plus the persisted head's
+        // minted blob id and provenance (see `grow_layout_size`).
         Ok(())
     }
 

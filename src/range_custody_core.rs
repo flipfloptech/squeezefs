@@ -519,6 +519,43 @@ impl FileCustody {
             required_target = Some(g);
         }
         if required_scope_overlaps > 1 {
+            // Finding 22: a required covered by the UNION of the holder's
+            // own same-mode grants is COVERED custody — every byte is
+            // already this holder's, so the answer serves (naming the
+            // first overlapping grant; the caller's per-grant watermark
+            // marks ride the cache probe's segment law) and mutates
+            // NOTHING: both records and their release handles stand. The
+            // trim teacher's clamp makes abutting same-holder pairs the
+            // steady state at the learned ceiling, and a straddling
+            // kernel write's required bridges them — pre-fix the refusal
+            // fed the retry ladder an identically-refused span for ever
+            // (285 k refusal lines on the attempt-3 row). A required that
+            // ESCAPES the union keeps the loud refusal below (merging
+            // live records is still never done).
+            let mut cursor = required.0;
+            let mut first: Option<&Grant> = None;
+            for g in self.candidates(required.0, required.1) {
+                if g.owner_nonce != scope || g.mode != mode || !g.overlaps(required.0, required.1) {
+                    continue;
+                }
+                if g.start > cursor {
+                    break; // a gap inside required — not covered
+                }
+                if first.is_none() {
+                    first = Some(g);
+                }
+                cursor = cursor.max(g.end);
+                if cursor >= required.1 {
+                    let g = first.expect("at least one overlapping grant");
+                    return RangeDecision {
+                        plan: RangePlan::Covered {
+                            token: g.token,
+                            span: (g.start, g.end),
+                        },
+                        trimmed: false,
+                    };
+                }
+            }
             return RangeDecision {
                 plan: RangePlan::BridgeRefused,
                 trimmed: false,

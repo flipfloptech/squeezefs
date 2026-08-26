@@ -383,13 +383,43 @@ pub fn range_token_covering(ino: u64, start: u64, end: u64) -> Option<u64> {
     }
     RANGE_CACHE
         .read_sync(&ino, |_, spans| {
-            spans
+            if let Some(s) = spans.iter().find(|s| s.start <= start && s.end >= end) {
+                s.written.fetch_max(end, Ordering::Relaxed);
+                return Some(s.token);
+            }
+            // Finding 22: a straddling window covered by the UNION of
+            // this holder's own cached spans is served too — the trim
+            // teacher's clamp makes abutting own pairs the steady state,
+            // and a probe miss here was one wire ask per straddling
+            // write (the 285 k-refusal storm's engine). The mark is
+            // SEGMENT-WISE: each overlapped grant's written high-water
+            // rises to ITS OWN segment end — a straddle marked on one
+            // grant only would let the other's tail shrink release
+            // bytes the holder wrote (§9.3a's zeros class). Marks land
+            // before the token answers, the single-span law verbatim.
+            let mut sorted: Vec<&RangeSpan> = spans
                 .iter()
-                .find(|s| s.start <= start && s.end >= end)
-                .map(|s| {
-                    s.written.fetch_max(end, Ordering::Relaxed);
-                    s.token
-                })
+                .filter(|s| s.end > start && s.start < end)
+                .collect();
+            sorted.sort_unstable_by_key(|s| s.start);
+            let mut cursor = start;
+            let mut first: Option<u64> = None;
+            for s in &sorted {
+                if s.start > cursor {
+                    return None; // a gap inside the window
+                }
+                if first.is_none() {
+                    first = Some(s.token);
+                }
+                cursor = cursor.max(s.end);
+                if cursor >= end {
+                    for s in &sorted {
+                        s.written.fetch_max(end.min(s.end), Ordering::Relaxed);
+                    }
+                    return first;
+                }
+            }
+            None
         })
         .flatten()
 }

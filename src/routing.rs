@@ -3679,6 +3679,27 @@ pub static TEST_TIER_PUBLISH_DELAY_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Test seam (same contract as [`TEST_TIER_PUBLISH_DELAY_MS`]): artificial
+/// delay, in milliseconds, injected in the deferred tier-publish closure
+/// BETWEEN its fast-path pre-check and its validated insert — the
+/// deterministic stand-in for a blocking-pool backlog descheduling the
+/// closure across a W1 patch's retire→DMA→publish→purge (finding 17,
+/// `.benchmarks/2026-08-25-s11-freeloop-stall.md` §Finding 17: the
+/// data_path_correctness ~5 %/run flake). One relaxed load per deferred
+/// publish, zero-cost when unset.
+pub static TEST_TIER_PUBLISH_MID_WINDOW_STALL_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Test seam (same contract as [`TEST_TIER_PUBLISH_DELAY_MS`]): artificial
+/// delay, in milliseconds, injected in the deferred tier-publish closure
+/// AFTER its insert attempt, before the single-flight guard drops — holds
+/// the post-insert state observable so the finding-17 pin can read it
+/// deterministically (pre-fix: the stale entry was reader-visible here;
+/// post-fix: the validated insert refused, so there is nothing to see).
+/// One relaxed load per deferred publish, zero-cost when unset.
+pub static TEST_TIER_PUBLISH_POST_PUT_STALL_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Test seam (same contract as [`TEST_TIER_PUBLISH_DELAY_MS`]): artificial
 /// delay, in milliseconds, injected between a binding-validated fetch's
 /// bytes-in-hand point and its binding recheck
 /// ([`DataRouter::get_block_for_index`]). Lets the FIND-RW5-A churn suite
@@ -7588,7 +7609,21 @@ impl DataRouter {
                             if !backend_router.fill_incarnation_still(&bk, before) {
                                 return;
                             }
+                            // Finding-17 seam: the blocking-pool deschedule
+                            // between the pre-check and the insert.
+                            let mid = TEST_TIER_PUBLISH_MID_WINDOW_STALL_MS
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                            if mid > 0 {
+                                std::thread::sleep(Duration::from_millis(mid));
+                            }
                             let _ = nvme_clone.cache_read_block(&bk, dl);
+                            // Finding-17 seam: hold the post-insert state
+                            // observable before the guard drops.
+                            let post = TEST_TIER_PUBLISH_POST_PUT_STALL_MS
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                            if post > 0 {
+                                std::thread::sleep(Duration::from_millis(post));
+                            }
                             if !backend_router.fill_incarnation_still(&bk, before) {
                                 nvme_clone.remove_cached_read_block(&bk);
                             }

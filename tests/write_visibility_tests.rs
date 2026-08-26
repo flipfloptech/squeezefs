@@ -1016,6 +1016,53 @@ async fn serialized_overwrite_never_reverts_neighbors() {
     }
 }
 
+/// Shared setup helper for the W1-patch visibility pins: a page-0 write
+/// that must ride the W1 patch (each pin's window is only reachable
+/// through the in-place vehicle). Engagement is checked on the
+/// process-global ledger, so under DEFAULT-PARALLELISM a foreign test's
+/// load can classify one attempt away from the ladder (cache churn; the
+/// knob-pin gate already excludes the cap-zeroing sibling) — settle
+/// (fsync drains whatever vehicle the attempt landed on; content is
+/// value-exact either way), back off, and retry — loud on exhaustion with
+/// the decision ledger inline. Single-threaded (the authoritative gate
+/// venue) this engages on the first try (0 retries across 300+ bracket
+/// runs).
+async fn patch_engaged(h: &H, ino: u64, val: u8) {
+    use std::sync::atomic::Ordering as O;
+    let m = &squeezefs::fuse_client::METRICS;
+    for attempt in 0..40u32 {
+        let before = m.patch_writes.load(O::Relaxed);
+        write_at(h, ino, 0, &[val; 4096]).await;
+        if m.patch_writes.load(O::Relaxed) > before {
+            return;
+        }
+        fsync(h, ino).await;
+        tokio::time::sleep(std::time::Duration::from_millis(
+            (1u64 << attempt.min(6)).min(100),
+        ))
+        .await;
+    }
+    panic!(
+        "W1 patch never engaged for the visibility-pin setup \
+         (cap={}; a sibling's knob pin may have leaked): \
+         range_shared={} unmapped={} decorated={} unaligned={} \
+         overlay={} device_overlay={} shared={} transform={} \
+         adjacent={} oversize={}\n{}",
+        squeezefs::fuse_client::patch_max_bytes(),
+        m.patch_ineligible_range_shared.load(O::Relaxed),
+        m.patch_ineligible_unmapped.load(O::Relaxed),
+        m.patch_ineligible_decorated.load(O::Relaxed),
+        m.patch_ineligible_unaligned.load(O::Relaxed),
+        m.patch_ineligible_overlay.load(O::Relaxed),
+        m.patch_ineligible_device_overlay.load(O::Relaxed),
+        m.patch_ineligible_shared.load(O::Relaxed),
+        m.patch_ineligible_transform.load(O::Relaxed),
+        m.patch_ineligible_adjacent.load(O::Relaxed),
+        m.patch_ineligible_oversize.load(O::Relaxed),
+        storm_stats_line()
+    );
+}
+
 /// Deterministic repro of the generic/209 flake's convicted window
 /// (2026-08-19 conviction — the ~5/10 storm flake, "OLD BYTE at pos 0,
 /// completed_end 4096"): a W1 in-place patch is the ONE content
@@ -1081,52 +1128,6 @@ async fn patched_block_never_serves_a_held_flight_snapshot() {
         "settled base must read 0x11"
     );
 
-    // Setup helper: a page-0 write that must ride the W1 patch (the
-    // window is only reachable through the in-place vehicle). Engagement
-    // is checked on the process-global ledger, so under DEFAULT-
-    // PARALLELISM a foreign test's load can classify one attempt away
-    // from the ladder (cache churn; the knob-pin gate already excludes
-    // the cap-zeroing sibling) — settle (fsync drains whatever vehicle
-    // the attempt landed on; content is value-exact either way), back
-    // off, and retry — loud on exhaustion with the decision ledger
-    // inline. Single-threaded (the authoritative gate venue) this
-    // engages on the first try (0 retries across 300+ bracket runs).
-    async fn patch_engaged(h: &H, ino: u64, val: u8) {
-        use std::sync::atomic::Ordering as O;
-        let m = &squeezefs::fuse_client::METRICS;
-        for attempt in 0..40u32 {
-            let before = m.patch_writes.load(O::Relaxed);
-            write_at(h, ino, 0, &[val; 4096]).await;
-            if m.patch_writes.load(O::Relaxed) > before {
-                return;
-            }
-            fsync(h, ino).await;
-            tokio::time::sleep(std::time::Duration::from_millis(
-                (1u64 << attempt.min(6)).min(100),
-            ))
-            .await;
-        }
-        panic!(
-            "W1 patch never engaged for the held-flight repro setup \
-             (cap={}; a sibling's knob pin may have leaked): \
-             range_shared={} unmapped={} decorated={} unaligned={} \
-             overlay={} device_overlay={} shared={} transform={} \
-             adjacent={} oversize={}\n{}",
-            squeezefs::fuse_client::patch_max_bytes(),
-            m.patch_ineligible_range_shared.load(O::Relaxed),
-            m.patch_ineligible_unmapped.load(O::Relaxed),
-            m.patch_ineligible_decorated.load(O::Relaxed),
-            m.patch_ineligible_unaligned.load(O::Relaxed),
-            m.patch_ineligible_overlay.load(O::Relaxed),
-            m.patch_ineligible_device_overlay.load(O::Relaxed),
-            m.patch_ineligible_shared.load(O::Relaxed),
-            m.patch_ineligible_transform.load(O::Relaxed),
-            m.patch_ineligible_adjacent.load(O::Relaxed),
-            m.patch_ineligible_oversize.load(O::Relaxed),
-            storm_stats_line()
-        );
-    }
-
     // 3. Patch #1: page 0 := 0x22 (aligned, non-adjacent, sub-cap,
     //    non-extending ⇒ the W1 in-place DMA; purges block 0's tiers).
     patch_engaged(&h, ino, 0x22).await;
@@ -1155,6 +1156,139 @@ async fn patched_block_never_serves_a_held_flight_snapshot() {
             "READER FOUND OLD BYTE {:#x} at pos {pos} after the patch's ACK \
              — the held single-flight snapshot served a pre-patch image \
              (generic/209 convicted window)\n{}",
+            got[pos],
+            storm_stats_line()
+        );
+    }
+    assert!(
+        got[PAGE..].iter().all(|&b| b == 0x11),
+        "bytes beyond the patched page stay at the base pattern"
+    );
+}
+
+/// Deterministic repro of finding 17's convicted window (the
+/// data_path_correctness ~5 %/run flake,
+/// `.benchmarks/2026-08-25-s11-freeloop-stall.md` §Finding 17): the
+/// PERF-11 deferred tier publish is put-then-revalidate-then-undo, so its
+/// pre-check→put window is READER-VISIBLE — a blocking-pool backlog
+/// deschedules the closure between its pre-check and its put, a W1
+/// in-place patch runs retire→DMA→publish→purge INSIDE that gap (the
+/// purge finds nothing: the put has not landed), the put then deposits
+/// the DEAD incarnation's bytes into the NVMe read cache, and a read that
+/// begins strictly AFTER the patch's ACK serves them as a trusted tier
+/// hit. The closure's own undo removes the entry moments later — which is
+/// why the flake healed on the very next read and every post-mortem tier
+/// probe came back empty.
+///
+/// Protocol (the generic/209 pin's fixture, the deposit-window face):
+///   1. striped 2-block file, settled; fill #1 records the ghost;
+///   2. patch #1 (0x22) — the next miss of block 0's key takes the
+///      deferred-publish arm (second-touch admission);
+///   3. hold the closure open BETWEEN its pre-check and its put
+///      (`TEST_TIER_PUBLISH_MID_WINDOW_STALL_MS`) and read — fill #2
+///      serves 0x22 and queues the held deferred publish;
+///   4. patch #2 (0x33) — ACKs; its purge sweeps every tier (nothing to
+///      sweep: the held put has not landed);
+///   5. the closure resumes: PRE-FIX its unvalidated put lands the 0x22
+///      image; `TEST_TIER_PUBLISH_POST_PUT_STALL_MS` holds the undo off
+///      so the window is deterministically observable; POST-FIX the
+///      validated insert refuses under the tier's own insert lock and no
+///      entry ever becomes visible;
+///   6. a read that begins after the ACK must see 0x33 — pre-fix it
+///      serves the dead deposit (the flake's base+patch image).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn patched_block_never_serves_a_mid_publish_tier_deposit() {
+    use squeezefs::routing::{
+        TEST_TIER_PUBLISH_MID_WINDOW_STALL_MS, TEST_TIER_PUBLISH_POST_PUT_STALL_MS,
+    };
+    use std::sync::atomic::Ordering as O;
+
+    struct SeamReset;
+    impl Drop for SeamReset {
+        fn drop(&mut self) {
+            TEST_TIER_PUBLISH_MID_WINDOW_STALL_MS.store(0, O::Relaxed);
+            TEST_TIER_PUBLISH_POST_PUT_STALL_MS.store(0, O::Relaxed);
+        }
+    }
+    let _reset = SeamReset;
+    let _pin_gate = knob_pin_gate().lock().await;
+
+    let h = make().await;
+    let ino = create(&h, "f17window").await;
+    const PAGE: usize = 4096;
+
+    // 1. Settled striped base + fill #1 (ghost record for block 0's key).
+    write_at(&h, ino, 0, &vec![0x11u8; (2 * BS) as usize]).await;
+    fsync(&h, ino).await;
+    let got = read_at(&h, ino, 0, BS as u32).await;
+    assert!(
+        got.iter().all(|&b| b == 0x11),
+        "settled base must read 0x11"
+    );
+
+    // 2. Patch #1 — the ghost is recorded, so the NEXT fill of this key
+    //    rides the deferred-publish arm.
+    patch_engaged(&h, ino, 0x22).await;
+
+    // 3. Fill #2 with the closure held open between pre-check and put.
+    TEST_TIER_PUBLISH_MID_WINDOW_STALL_MS.store(1_500, O::Relaxed);
+    TEST_TIER_PUBLISH_POST_PUT_STALL_MS.store(3_000, O::Relaxed);
+    let got = read_at(&h, ino, 0, BS as u32).await;
+    assert!(
+        got[..PAGE].iter().all(|&b| b == 0x22),
+        "fill #2 must serve the post-patch-#1 page"
+    );
+
+    // Engagement gate: the deferred publish must actually be in flight
+    // (the guard rides the closure — registry entry live). Without this,
+    // a foreign admission decision would make the pin vacuously green.
+    let key = {
+        let meta =
+            h.fs.router
+                .fetch_metadata(&format!("inode_{ino}"))
+                .await
+                .expect("striped metadata");
+        meta.block_map
+            .as_ref()
+            .and_then(|bm| bm.get(&0).cloned())
+            .expect("block 0 is mapped")
+    };
+    assert!(
+        h.fs.router.block_fill_inflight(&key),
+        "the deferred publish must be holding the single-flight guard \
+         (fill #2 did not take the deferred arm — ghost/admission drift)"
+    );
+
+    // 4. Patch #2 lands INSIDE the closure's pre-check→put gap.
+    patch_engaged(&h, ino, 0x33).await;
+
+    // 5. The put's landing instant is scheduler-owned; poll for EITHER
+    //    outcome on a bounded deadline: pre-fix the dead entry becomes
+    //    visible in the NVMe read cache; post-fix nothing ever appears
+    //    and the closure finishes (guard drops).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if h.fs.router.cache.nvme.has_cached_read_block(&key)
+            || !h.fs.router.block_fill_inflight(&key)
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the held deferred publish neither deposited nor finished"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    // 6. The contract: this read BEGINS after patch #2's ACK, so every
+    //    byte of page 0 must read 0x33 — a mid-publish tier deposit of
+    //    the pre-patch image is not servable.
+    let got = read_at(&h, ino, 0, BS as u32).await;
+    if let Some(pos) = got[..PAGE].iter().position(|&b| b != 0x33) {
+        panic!(
+            "READER FOUND OLD BYTE {:#x} at pos {pos} after the patch's ACK \
+             — the deferred tier publish deposited a dead incarnation's \
+             bytes into the read cache (finding 17's convicted window)\n{}",
             got[pos],
             storm_stats_line()
         );

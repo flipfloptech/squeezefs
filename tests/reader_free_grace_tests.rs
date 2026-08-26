@@ -1223,6 +1223,225 @@ async fn a_rewrite_storm_prods_readers_instead_of_stalling_allocation() {
     );
 }
 
+/// **Finding 18 — an expired prod DECAYS toward routine; it never snaps**
+/// (`.benchmarks/2026-08-25-s11-freeloop-stall.md` §Finding 18): under a
+/// real storm the runway reading sawtooths — every release crest lets the
+/// prod's reading lapse, and pre-fix the very next renewal beat drew the
+/// ROUTINE cadence. One routine grant = one routine-beat acknowledgement
+/// hole, and the owner's min-composition inherits the widest member's
+/// hole: the f16a row measured `bound_age` 15.5–22.6 s against PR 5's
+/// ≤ 12 s gate with the member ladder itself ON budget (6.3 s). The law:
+/// while the plane still HOLDS offsets, an expired ask relaxes one
+/// doubling step per reading-TTL window (the write-pipeline probe
+/// governor's bleed-to-routine pattern — derived, never a knob) instead
+/// of lapsing, re-tightens fully on the next pressure reading, and
+/// retires only at routine or when the ring drains.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_expired_prod_decays_toward_routine_while_offsets_are_held() {
+    let _serial = serial();
+    let (clock, ticks) = manual_clock();
+    let owner = armed_owner(&clock);
+    free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("derived bound");
+    let grant = join(&owner, "r-decay", MemberRole::Reader);
+    owner.refresh_free_grace_bound();
+    let routine = grant.renew_ms;
+
+    let ba = allocator("grace-decay").await;
+    ba.set_capacity_bytes(32 * ba.chunk_size());
+    let mut storm = Storm::new(&owner, &clock, &ticks, "r-decay", &grant, true);
+
+    // Phase 1 — storm until rung (a) is in force (the ask at a tightened
+    // cadence). Bounded loud.
+    let mut live: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+    let mut tightened = 0u64;
+    for pass in 0..120 {
+        let fresh = ba
+            .allocate_block()
+            .await
+            .unwrap_or_else(|e| panic!("pass {pass}: the storm stalled ({e})"));
+        live.push_back(fresh);
+        if live.len() > 4 {
+            let victim = live.pop_front().expect("a live block");
+            ba.free_block(victim).await.expect("free");
+        }
+        storm.advance(1_000);
+        tightened = free_grace::prod_renew_ms();
+        if tightened > 0 {
+            break;
+        }
+    }
+    assert!(
+        tightened > 0 && tightened < routine,
+        "the storm must arm rung (a) with a tightened cadence \
+         (got {tightened} vs routine {routine})"
+    );
+
+    assert!(
+        tightened < routine / 2,
+        "premise: the tightened ask ({tightened} ms) must sit below \
+         routine/2 ({} ms) or the ladder cannot be discriminated",
+        routine / 2
+    );
+    assert!(
+        free_grace::held_offsets() > 0,
+        "the storm must leave offsets held — otherwise the decay law has \
+         nothing to protect"
+    );
+
+    // Phase 2 — the release CREST: no ring traffic, no readings, no
+    // member beats. Probe the DELIVERY POINT once per second exactly as
+    // the owner's renewal path would for a member that is behind, and
+    // record the asked cadences until the ask retires (None).
+    let mut seq: Vec<u64> = Vec::new();
+    for _ in 0..240 {
+        ticks.fetch_add(1_000, Ordering::SeqCst);
+        match free_grace::take_prod_cadence(0) {
+            Some(c) => seq.push(c),
+            None => break,
+        }
+    }
+    // THE CONTRACT (pre-fix RED): while offsets are held, the ask RELAXES
+    // window by window — it never lapses straight from the tightened
+    // cadence to the routine hole. Pre-fix the reading expires once and
+    // every later beat draws routine (the f16a row's 15.5–22.6 s
+    // bound_age against the ≤ 12 s gate, with the member ladder itself on
+    // budget); post-fix the recorded sequence walks its doublings to at
+    // least routine/2 before retiring at routine.
+    assert!(
+        free_grace::held_offsets() > 0,
+        "the crest phase must not have drained the ring"
+    );
+    let last = *seq.last().unwrap_or(&0);
+    assert!(
+        last >= routine / 2,
+        "finding 18: the ask LAPSED at {last} ms (tightened {tightened}, \
+         routine {routine}) while {} offset(s) were still held — the very \
+         next renewal beat draws the ROUTINE cadence and the \
+         min-composition inherits the hole; the decay ladder must walk to \
+         at least routine/2 before retiring",
+        free_grace::held_offsets()
+    );
+    let mut prev = 0u64;
+    for &c in &seq {
+        assert!(
+            c >= prev && c < routine,
+            "the decay ladder must relax monotonically below routine \
+             ({prev} → {c} vs {routine})"
+        );
+        prev = c;
+    }
+    assert!(
+        free_grace::prod_decays() > 0,
+        "the decay's engagement gauge must count the relax steps"
+    );
+
+    // Integrity: the decay bought promptness without touching the fence,
+    // and the ladder RETIRED (the loop broke on None) — a permanent
+    // elevated ask on a quiet plane is the inverted economy.
+    assert!(
+        seq.len() < 240,
+        "the ladder must retire at routine, never ask for ever"
+    );
+    assert_eq!(free_grace::forced_releases(), 0);
+    assert_eq!(free_grace::laggard_fences(), 0);
+    assert_eq!(
+        free_grace::deferrals(),
+        free_grace::releases() + free_grace::held_offsets(),
+        "the closure law holds across the decay"
+    );
+}
+
+/// **Finding 18's economy half — a drained ring retires the ask at once.**
+/// The decay law exists for a plane that HOLDS offsets; a ring that has
+/// drained to zero asks nothing (prodding a member that is not holding
+/// the free list buys nothing and costs it beats — the shipped law,
+/// unchanged).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drained_ring_retires_the_expired_ask_immediately() {
+    let _serial = serial();
+    let (clock, ticks) = manual_clock();
+    let owner = armed_owner(&clock);
+    free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("derived bound");
+    let grant = join(&owner, "r-drained", MemberRole::Reader);
+    owner.refresh_free_grace_bound();
+    let routine = grant.renew_ms;
+
+    let ba = allocator("grace-drained").await;
+    ba.set_capacity_bytes(32 * ba.chunk_size());
+    let mut storm = Storm::new(&owner, &clock, &ticks, "r-drained", &grant, true);
+
+    // Storm until the ask is in force, then DRAIN: the member
+    // acknowledges everything (one renewal carrying a max label) and the
+    // harvest releases the ring to zero.
+    let mut live: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+    for pass in 0..120 {
+        let fresh = ba
+            .allocate_block()
+            .await
+            .unwrap_or_else(|e| panic!("pass {pass}: the storm stalled ({e})"));
+        live.push_back(fresh);
+        if live.len() > 4 {
+            let victim = live.pop_front().expect("a live block");
+            ba.free_block(victim).await.expect("free");
+        }
+        storm.advance(1_000);
+        if free_grace::prod_renew_ms() > 0 {
+            break;
+        }
+    }
+    assert!(
+        free_grace::prod_renew_ms() > 0,
+        "the storm must arm the ask"
+    );
+    // A label past everything issued (labels are owner-clock ms — never
+    // `u64::MAX`, which is `min_acked_free_epoch`'s no-members sentinel).
+    ack(&owner, "r-drained", storm.epoch, clock.now_ms() + 1_000_000);
+    // Allocation-head harvests release the fully-acknowledged ring (the
+    // production drain path — no test-only hook). Bounded poll: the tail
+    // frees ride the background reclaim worker into the ring, so the
+    // drain needs a real-time beat or two to converge.
+    for _ in 0..400 {
+        if free_grace::held_offsets() == 0 {
+            break;
+        }
+        // A capacity refusal here is fine — the head harvest still ran,
+        // and the next beat retries once the background reclaim worker
+        // lands the tail frees into the ring (its batch cadence is real
+        // milliseconds, which is what this poll waits out).
+        if let Ok(fresh) = ba.allocate_block().await {
+            live.push_back(fresh);
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        free_grace::held_offsets(),
+        0,
+        "the full acknowledgement must drain the ring"
+    );
+
+    // Quiet crest on the DRAINED ring: the delivery point retires the ask
+    // (bounded — one reading window at most) and the decay gauge never
+    // moves. No ask on a plane holding nothing.
+    let decays0 = free_grace::prod_decays();
+    let mut retired = false;
+    for _ in 0..240 {
+        ticks.fetch_add(1_000, Ordering::SeqCst);
+        if free_grace::take_prod_cadence(0).is_none() {
+            retired = true;
+            break;
+        }
+    }
+    assert!(
+        retired,
+        "a drained ring must retire the ask, never decay it"
+    );
+    assert_eq!(
+        free_grace::prod_decays(),
+        decays0,
+        "no decay step on a drained ring"
+    );
+}
+
 /// **Contract 14 — rung (c) is intact.** The valve buys promptness, never
 /// a broken promise: a member that keeps beating but never acknowledges is
 /// prodded first (rung a), refused ENOSPC rather than served an offset it

@@ -252,6 +252,13 @@ static RUNWAY_MS: AtomicU64 = AtomicU64::new(u64::MAX);
 static RUNWAY_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
 /// The tightened renewal cadence in force, ms (`0` = no prod).
 static PROD_RENEW_MS: AtomicU64 = AtomicU64::new(0);
+/// Finding 18's engagement gauge: expiry windows in which a live ask
+/// RELAXED one doubling step toward routine (while the plane still held
+/// offsets) instead of lapsing to the routine cadence — each pre-fix
+/// lapse was a routine-beat acknowledgement hole the min-composition
+/// inherited (the f16a row's 15.5–22.6 s `bound_age` against PR 5's
+/// ≤ 12 s gate, with the member ladder itself on budget).
+static PROD_DECAYS: AtomicU64 = AtomicU64::new(0);
 /// Owner-clock expiry of the prod (same lifetime rule as the reading).
 static PROD_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
 /// The NEWEST label the plane is holding: a member that has acknowledged
@@ -1825,6 +1832,12 @@ pub fn effective_bound_ms() -> u64 {
     effective_bound_ms_from(live_runway_ms(), plane.fence_ms, plane.pressure_fence_ms)
 }
 
+/// Finding 18's engagement gauge: decay steps taken by an expired ask
+/// (see [`PROD_DECAYS`]).
+pub fn prod_decays() -> u64 {
+    PROD_DECAYS.load(Ordering::Relaxed)
+}
+
 /// The tightened renewal cadence being handed to laggards right now, ms
 /// (`0` = none in force).
 pub fn prod_renew_ms() -> u64 {
@@ -1923,6 +1936,7 @@ pub fn reset_for_test() {
         &BOUND_TIGHTENINGS,
         &RUNWAY_UNTIL_MS,
         &PROD_RENEW_MS,
+        &PROD_DECAYS,
         &PROD_UNTIL_MS,
         &PROD_LABEL,
         &LAST_BOUND_REFRESH_MS,

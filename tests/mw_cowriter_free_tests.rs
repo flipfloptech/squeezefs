@@ -2670,3 +2670,234 @@ async fn the_demand_lever_rebases_the_grace_supply_on_the_lane_reachable_number(
     );
     assert!(squeezefs::free_grace::test_clear_demand());
 }
+
+// ===========================================================================
+// PR 4 — ahead-of-stall lane refill (L5 + the OQ 2 measured horizon;
+// design-free-grace-sustain §5.5)
+// ===========================================================================
+
+/// **The owed ledger is per-allocator and closes end to end** (§5.5): each
+/// `Freed` verdict a shipped displaced free brings back increments the
+/// SHIPPING allocator's owed word (the authority's list now holds supply
+/// this mount is owed); each harvest adoption decrements it. The
+/// process-global gauge is the sum; a second volume's allocator never
+/// moves (the per-`(vol_tag, lane)` accounting the two-volume venue needs —
+/// a global number cannot say WHICH volume's authority holds the supply).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_owed_ledger_tracks_freed_verdicts_and_harvest_adoptions() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "owed").await;
+    let dev = data_device(dir.path(), "owed.dev");
+    let auth = Authority::start(&vol, &dev, &[NODE_A]).await;
+    let cwr = CoWriter::join(&auth, &vol, &dev, NODE_A).await;
+    let chunk = cwr.alloc.chunk_size();
+    let m = &squeezefs::fuse_client::METRICS;
+
+    assert_eq!(cwr.alloc.lane_owed_blocks(), 0, "fresh: nothing owed");
+    let owed_gauge0 = m.alloc_lane_owed_blocks.load(Ordering::Relaxed);
+
+    // A displaced block whose free ships and comes back `Freed`.
+    let a_off = cwr.alloc.allocate_block().await.expect("mint A");
+    let a_idx = a_off / chunk;
+    let ino = authority_file_with_block(&auth, "owed.bin", a_idx).await;
+    cwr.rewrite_block(ino, 0, a_idx).await;
+    cwr.br
+        .free_block(&a_off.to_string())
+        .await
+        .expect("the displaced free ships");
+    assert_eq!(
+        cwr.alloc.lane_owed_blocks(),
+        1,
+        "one Freed verdict ⇒ one owed block on the SHIPPING allocator"
+    );
+    assert_eq!(
+        m.alloc_lane_owed_blocks.load(Ordering::Relaxed) - owed_gauge0,
+        1,
+        "the process gauge is the sum of the per-allocator words"
+    );
+
+    // A second volume's allocator is untouched — per-allocator by
+    // construction (the routing half of §5.5's two-volume law).
+    let other = Arc::new(
+        squeezefs::block_allocator::BlockAllocator::new("vol-00000000000000f9")
+            .await
+            .expect("a second allocator"),
+    );
+    assert_eq!(other.lane_owed_blocks(), 0);
+
+    // The harvest adoption pays the debt down.
+    auth.br.reclaim_drain().await;
+    assert!(auth.free_listed(a_idx), "the supply sits on the authority");
+    let epoch = cwr.client.lease_epoch();
+    let tag = volume_tag(DATA_VOL);
+    let (got, _hint) =
+        publish::ship_harvest_lane_free(&auth.endpoint, tag, 1, 2, 16, epoch, 9101)
+            .await
+            .expect("the harvest ships");
+    assert!(got.contains(&a_idx));
+    assert_eq!(cwr.alloc.adopt_lane_free_grant(&got), got.len() as u64);
+    assert_eq!(
+        cwr.alloc.lane_owed_blocks(),
+        0,
+        "the adoption closes the owed ledger"
+    );
+    assert_eq!(
+        m.alloc_lane_owed_blocks.load(Ordering::Relaxed),
+        owed_gauge0,
+        "and the sum gauge closes with it"
+    );
+}
+
+/// **The ahead-harvest decision is rate-gated, watermark-bounded, and
+/// routes only to the owing, starving volume** (§5.5): harvest when
+/// `reachable < watermark ∧ owed > 0` for THAT allocator, where
+/// `watermark = ceil(rate × horizon)` capped at lane-share/4 — derived,
+/// never a knob. A quiet writer (rate 0) never harvests ahead; a volume
+/// owed nothing is never asked (no wasted RTT); `AHEAD=0` restores the
+/// ENOSPC-only shape verbatim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_ahead_decision_harvests_only_the_owing_starved_volume() {
+    let _serial = serial();
+    let _restore = restore();
+    squeezefs::block_allocator::test_set_harvest_ahead(Some(true));
+    let a = Arc::new(
+        squeezefs::block_allocator::BlockAllocator::new("vol-00000000000000fa")
+            .await
+            .expect("allocator A"),
+    );
+    let chunk = a.chunk_size();
+    // 64-block device, 2 writers ⇒ 32-block lane share ⇒ watermark cap 8.
+    a.set_capacity_bytes(64 * chunk);
+    let part = squeezefs::meta_backend::kv::journal::AppendPartition::new(2, 0)
+        .expect("a 2-writer partition");
+    a.engage_alloc_lanes(part).expect("engages");
+
+    // Burn most of the lane so the reachable supply is small.
+    for _ in 0..30 {
+        a.allocate_block().await.expect("mint");
+    }
+    // The rate EWMA: 30 claims over one second.
+    a.sample_alloc_rate(10_000);
+    for _ in 0..2 {
+        let _ = a.allocate_block().await;
+    }
+    a.sample_alloc_rate(11_000);
+    assert!(
+        a.watermark_blocks() > 0,
+        "a claiming writer derives a nonzero watermark"
+    );
+    assert!(
+        a.watermark_blocks() <= 8,
+        "the watermark caps at lane-share/4 (got {})",
+        a.watermark_blocks()
+    );
+
+    // Nothing owed yet: never ask (the no-wasted-RTT half).
+    assert_eq!(
+        a.should_harvest_ahead(),
+        None,
+        "a volume owed nothing is never harvested"
+    );
+    a.note_owed_freed(4);
+    assert!(
+        a.should_harvest_ahead().is_some(),
+        "owed > 0 ∧ reachable < watermark ⇒ the refill fires BEFORE the cliff"
+    );
+
+    // A quiet writer (rate decays to 0) stands the refill down.
+    for t in 1..40u64 {
+        a.sample_alloc_rate(11_000 + t * 1_000);
+    }
+    assert_eq!(
+        a.should_harvest_ahead(),
+        None,
+        "rate-gated: a quiet writer never harvests ahead"
+    );
+
+    // The lever restores the ENOSPC-only shape verbatim.
+    for _ in 0..2 {
+        let _ = a.allocate_block().await;
+    }
+    a.sample_alloc_rate(60_000);
+    squeezefs::block_allocator::test_set_harvest_ahead(Some(false));
+    assert_eq!(a.should_harvest_ahead(), None, "AHEAD=0: shipped shape");
+    assert!(squeezefs::block_allocator::test_clear_harvest_ahead());
+}
+
+/// **The refill horizon is a MEASUREMENT with the derivation as its
+/// fallback** (OQ 2, user decision): a harvest reply carrying a nonzero
+/// bound-age hint sets `horizon = hint + RTT + one refresh floor` and is
+/// counted (`alloc_lane_horizon_hints`); a zero hint (nothing held) and
+/// the pre-first-reply state both read the member-local derivation — so a
+/// refused or absent reply can never mis-size the watermark, and a lying
+/// hint is bounded by the lane-share/4 cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_harvest_horizon_is_a_measurement_with_the_derivation_fallback() {
+    let _serial = serial();
+    let _restore = restore();
+    let a = Arc::new(
+        squeezefs::block_allocator::BlockAllocator::new("vol-00000000000000fb")
+            .await
+            .expect("allocator"),
+    );
+    let m = &squeezefs::fuse_client::METRICS;
+    let fallback = a.harvest_horizon_ms();
+    assert!(
+        fallback > 0,
+        "the horizon starts at the member-local derivation"
+    );
+
+    let hints0 = m.alloc_lane_horizon_hints.load(Ordering::Relaxed);
+    a.note_harvest_hint(23_000, 40);
+    assert_eq!(
+        a.harvest_horizon_ms(),
+        23_040 + a.horizon_floor_ms(),
+        "a nonzero hint: horizon = measured bound age + harvest RTT + one \
+         refresh floor"
+    );
+    assert_eq!(
+        m.alloc_lane_horizon_hints.load(Ordering::Relaxed) - hints0,
+        1,
+        "hinted replies are counted"
+    );
+
+    a.note_harvest_hint(0, 40);
+    assert_eq!(
+        a.harvest_horizon_ms(),
+        fallback,
+        "a zero hint (nothing held) falls back to the derivation — a quiet \
+         ring is never over-trusted"
+    );
+    assert_eq!(
+        m.alloc_lane_horizon_hints.load(Ordering::Relaxed) - hints0,
+        1,
+        "zero hints are not counted as measurements"
+    );
+}
+
+/// **The harvest reply carries the authority's live bound age** (OQ 2's
+/// wire half, `PUBLISH_SCHEMA` 7 → 8): on a grace-armed authority whose
+/// ring holds an unacknowledged offset, the reply's hint is the loop
+/// latency actually in force — nonzero here, 0 on a drained ring.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_harvest_reply_carries_the_authoritys_bound_age() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let st = grace_stage(dir.path(), "hint").await;
+    let tag = volume_tag(DATA_VOL);
+
+    // The ring holds an unacknowledged offset: the bound has never
+    // advanced, so its age is the owner clock's own reading.
+    st.ticks.store(40_000, Ordering::SeqCst);
+    let (_blocks, hint) =
+        publish::ship_harvest_lane_free(&st.auth.endpoint, tag, 0, 1, 8, 7, 9201)
+            .await
+            .expect("the harvest ships");
+    assert!(
+        hint >= 30_000,
+        "the reply's hint is the authority's live bound age (got {hint})"
+    );
+}

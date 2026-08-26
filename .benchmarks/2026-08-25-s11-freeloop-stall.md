@@ -218,6 +218,40 @@ the owner-side min-composition across 8 readers under CONTINUOUS
 deferral churn (each release re-arms the window). The loop is no longer
 the row's constraint, so that residue is priced, not chased.
 
+## Finding 16 — residual 7's remaining mechanism, attributed from row 2's own ledger (2026-08-26)
+
+Residual 7 already has a landed fix layer (MW rungs 17/18 + §9.3a: the
+v2 desired law, the tail-shrink barrier reserving sticky demotion for
+true sharing, and the LEARNED STRETCH CEILING that is supposed to cap
+re-collisions at one shrink round per episode). Row 2's range ledger
+says why it still fabricates at scale:
+
+| Gauge (row 2, m0) | Δ | Reading |
+|---|---|---|
+| `range_custody_tail_shrinks` | +51 | the barrier classifies correctly (demotions stayed ~0) |
+| `range_custody_tail_shrink_acks` | +11 | …but only 11 notices ever REACHED their incumbent |
+| `range_custody_tail_shrink_fence_resolves` | **+40** | **the healthy-fleet law says 0**: 40 of 51 notices died with their grant — the incumbent released before its next renewal carried the notice |
+| `range_custody_stretch_ceiling_clamps` | **0** | the ceiling NEVER learned, so every stride episode re-collides |
+| `range_custody_desired_trims` | +8,610 | the authority clips the stretched desire on the acquire REPLY itself — a teacher the client currently ignores |
+| `range_custody_grants` ≡ `releases` | 3,105 | grants churn (the per-file geometry cap retires spans constantly at 32 ranks), so the renewal-riding notice structurally misses |
+| `dlm_custody_conflicts` | +5,449 | each a full-budget arbitration park — the row's stall engine |
+
+**The defect class: the shrink notice's only carrier is the incumbent's
+RENEWAL reply, but under the block-cyclic interleave grants live shorter
+than a renewal cadence** (the geometry cap churns them), so §9.3a's
+learning loop is structurally dark on exactly the workload it was built
+for — the ceiling stays unlearned, the desire keeps minting into peers'
+future stripes, and every episode pays the full park.
+
+**The fix shape (the next red-first loop):** (a) widen the notice
+CARRIER — shrink/demotion notices ride EVERY custody-channel reply to
+the incumbent (acquire/extend/release acks, not just renewals), so a
+stride-churning writer hears within one interaction instead of one
+cadence; and (b) teach the ceiling from the acquire reply's OWN TRIM
+(granted span < stretched desired ⇒ the surviving stretch length is the
+lesson, zero wire change) — the 8,610-trims teacher that covers the
+steady state even when no shrink round ever runs.
+
 **Campaign consequence (recorded here, to fold into the design doc as
 the PR 1 capture's output): the s11 acceptance row is gated by residual
 7 REGARDLESS of the free-grace levers.** The loop's 24–29 s latency is

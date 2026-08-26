@@ -390,3 +390,68 @@ reads everyone as behind, yet delivered prods cover ~⅓ of beats — either
 the prod is rate-limited below the fleet's need or its waiting-on set is
 computed against the wrong watermark), and the min-composition's
 publish-per-beat quantization. Both are owner-side, venue-independent.
+
+**Finding 18's landed half (2026-08-26, dev `6ce59456`):** the precise
+lapse mechanism was the ASK'S EXPIRY ARM — under a storm the runway
+reading sawtooths, every release crest let the prod lapse, and the very
+next renewal beat drew the ROUTINE cadence (one routine grant = one
+routine-beat acknowledgement hole; the min-composition inherits the
+widest member's hole). `take_prod_cadence` now DECAYS an expired ask one
+doubling step per reading window while the plane holds offsets (the
+probe governor's bleed-to-routine pattern — derived, never a knob),
+re-tightens fully at the next reading, retires at routine, and a drained
+ring retires immediately (contracts
+`an_expired_prod_decays_toward_routine_while_offsets_are_held` +
+`a_drained_ring_retires_the_expired_ask_immediately`; engagement gauge
+`free_grace_prod_decays`). Full gate green.
+
+## PR 5 acceptance attempt 1 — FAILED at A2 (2026-08-26; fail-fast, fix, restart from zero)
+
+Row `s11mpiio-1787762878`, binary `6ce59456` (carrier + trim teacher +
+tier fix + prod decay), 2×64 GiB, quiet box (load 1.0, Tctl 57 °C),
+archived at `.benchmarks/rows-pr5-attempt1/`. Probe **1,592.9 MiB/s**
+(precondition ≥ 750 met). A1 shared 698.1 steady (bimodal — ~310
+iterations with 2,288/2,713 bursts); B1 193.3; B2 211.7; **A2 aborted**
+(rank 24, fsync EIO).
+
+**What the row PROVED for the campaign:**
+- Gate (d) HOLDS end to end: `forced_releases` 0, `laggard_fences` 0,
+  `alloc_stalls` 0.
+- The decay fix ENGAGED (`prod_decays` 20, prods 5,506), and a mid-row
+  live read during B1 showed the loop at its ideal: `bound_age` **0**
+  with the ring EMPTY under storm (deferrals ≡ releases at 52,550).
+- BUT cumulatively 96.5 k of 134.8 k released offsets resided **> 16 s**
+  (the burst phases still outrun the loop), so gate (c) — bound_age
+  ≤ 12 s sustained — is NOT demonstrably met; end-of-row bound_age read
+  12.8 s with 1,729 offsets stranded by the abort.
+
+**What killed A2 — the ENOSPC spiral, now decomposed:** a burst
+iteration's displaced inventory fills one volume → write-through falls
+back to STAGING (the fsync-durability degrade) → rewrite epoch closes
+fail transiently on allocation and RETRY (m55: 455 retries) → displaced
+frees ship late or never (m55 shipped **1,392** blocks against m56's
+18,844 — its lane starves: 36,075 `alloc_lane_enospc_refusals`, 71,757
+ENOSPC log lines) → the lane never refills → fsync EIO → abort. The
+free-grace loop is no longer the first domino; the spiral's entry is
+burst-rate inventory against the 64 GiB volume and its non-recovery is
+the frees not shipping under the degraded posture.
+
+**Two NEW findings filed from this row (both must-fix before attempt 2):**
+- **Finding 19 — the double-release lineage at scale**: the authority
+  refused **6,321** shipped frees fleet-wide as "already
+  free/graced/quarantined" (m0 log census; `free_replays` 0 and
+  `free_stale_refusals` 0, so these are neither wire retries nor era
+  fences — one offset genuinely enters the free pipeline twice).
+  Correlates per-mount with the epoch-close retry census (m55: 455
+  retries / 135 refusals logged locally … every co-writer shows both).
+  Leak-safe at the authority BY CONSTRUCTION, but the second local act
+  on the co-writer is suspect — see finding 20.
+- **Finding 20 — `read_settle_lost_serialized` tripwires (must-stay-0)**:
+  m56 counted **48** `invariant_tripwires` — the incarnation word moved
+  under `BLOCK_FLUSH_LOCKS + INODE_META_LOCKS`, the outcome the design
+  says cannot happen — escalating to "did not settle after 4 serialized
+  attempts" EIO, the latched writeback error (POSIX-16 working as
+  designed), and the ior abort. Working hypothesis: findings 19 and 20
+  share a root — a double-entered free retires the offset's incarnation
+  word a second time while its next owner is mid-settle. Red-first loop
+  next; the counted-run law restarts the acceptance count after the fix.

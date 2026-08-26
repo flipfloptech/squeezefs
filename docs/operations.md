@@ -661,8 +661,11 @@ holders ship their writes to that block as extents
 law), the authority merges via the extent overlay and publishes once, single
 publisher per block at every instant. The transition is barriered **at grant
 issuance**: the overlapping grant is not issued until the incumbent
-acknowledged the demotion (carried on its next renewal reply) or its lease
-expired on the authority's clock — the closed ledger is
+acknowledged the demotion (the notice rides the incumbent's next
+custody-channel reply — acquire, release, or renewal, so a churn-shaped
+incumbent hears within one interaction; the renewal is the worst-case
+carrier for a quiet one) or its lease expired on the authority's clock —
+the closed ledger is
 `range_custody_demotions ≡ demotion_acks + demotion_fence_resolves`
 (healthy fleet: `fence_resolves == 0`), with
 `range_custody_demotion_fenced_publishes` the ≈ 0 crash-window tripwire.
@@ -671,15 +674,20 @@ expired on the authority's clock — the closed ledger is
 instead (§9.3a, 2026-08-19).** A grant remembers the union of the REQUIRED
 spans it was asked for; a peer's required landing only in the
 desired-minted stretch beyond that union marks the grant *shrink-pending*
-(`range_custody_tail_shrinks`) — the incumbent's next renewal carries the
-notice, its client stops serving the tail, answers its written high-water,
+(`range_custody_tail_shrinks`) — the incumbent's next custody-channel
+reply carries the notice (acquire/release/renewal — widened from
+renewal-only by finding 16 half (a), because block-cyclic grants churn
+faster than a renewal cadence and 40 of 51 notices were dying with their
+grant), its client stops serving the tail, answers its written high-water,
 and the tail is released: the asker gets exclusive custody with **no
 demotion and no shared clauses**. Only an incumbent that truly wrote into
 the contested tail escalates to the demotion barrier
 (`range_custody_shrink_demotions`, ≈ 0 on disjoint workloads). The closed
 ledger is `range_custody_tail_shrinks ≡ tail_shrink_acks +
 tail_shrink_fence_resolves` (healthy fleet: `fence_resolves == 0`), and the
-client learns a per-file stretch ceiling from each shrink
+client learns a per-file stretch ceiling from each shrink notice AND from
+the acquire reply's own desired trim (finding 16 half (b) — the trim
+teacher, so the lesson lands even when no shrink round ever runs)
 (`range_custody_stretch_ceiling_clamps`) so a steady block-cyclic
 interleave pays at most one shrink round per custody episode.
 A shipper **retains** each extent until the covering layout version is

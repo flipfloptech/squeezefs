@@ -12588,12 +12588,15 @@ impl SqueezefsFilesystem {
         // the whole-file path (MW rung 18; rung-17 findings 5a/5b): a
         // LOST `DLM_LEASE_WAIT` is a retry, never EIO, for the watchdog
         // budget. This is what reconciles the §9.3 demotion barrier's
-        // RENEWAL-BOUNDED resolution (the notice rides the incumbent's
-        // next renewal reply — up to TTL/3 ≈ 15 s at the shipped 45 s
-        // membership TTL) with the 5 s per-attempt wait: the attempt
-        // stays bounded, the BUDGET (SQUEEZEFS_TIMEOUT, default 30 s)
-        // covers the barrier's bound, and a holder that never lets go
-        // still fails loud (`lease_retry_exhaustions`).
+        // resolution bound with the 5 s per-attempt wait: since finding
+        // 16 half (a) the notice rides EVERY custody-channel reply to the
+        // incumbent (acquire/release/renewal), so an interacting
+        // incumbent resolves within one round trip — but the WORST case
+        // (an incumbent gone quiet) stays renewal-bounded (up to TTL/3 ≈
+        // 15 s at the shipped 45 s membership TTL). The attempt stays
+        // bounded, the BUDGET (SQUEEZEFS_TIMEOUT, default 30 s) covers
+        // that worst-case bound, and a holder that never lets go still
+        // fails loud (`lease_retry_exhaustions`).
         acquire_lease_with_retry(ino, get_fuse_timeout(), |wait| {
             self.ranged_lease_attempt(ino, start, end, sequential, wait)
         })
@@ -12671,17 +12674,19 @@ impl SqueezefsFilesystem {
         }
         let file_path = crate::keys::inode_path(ino);
         // Finding 16 (residual 7's steady-state half): the acquire
-        // reply's OWN TRIM is a ceiling lesson. The shrink notice's only
-        // carrier is the incumbent's renewal reply, and block-cyclic
-        // grants churn faster than a renewal cadence — so the granted
-        // span coming back CLIPPED below the stretched desire teaches the
-        // SURVIVING stretch length right here (`granted.1 −
-        // aligned_ask_end`, 0 when nothing survived — the stop-doubling
-        // posture), and the next stride's doubling clamps at the source
-        // instead of re-colliding with the neighbor every episode (the
-        // 8,610-trims treadmill row 2 measured). Repeat lessons converge
-        // tighter (`note_stretch_ceiling`'s min law); a genuine shrink
-        // notice keeps teaching the same ceiling when it does arrive.
+        // reply's OWN TRIM is a ceiling lesson. Block-cyclic grants churn
+        // faster than a renewal cadence, so a lesson that waits for a
+        // shrink round can die with its grant — the granted span coming
+        // back CLIPPED below the stretched desire teaches the SURVIVING
+        // stretch length right here (`granted.1 − aligned_ask_end`, 0
+        // when nothing survived — the stop-doubling posture), and the
+        // next stride's doubling clamps at the source instead of
+        // re-colliding with the neighbor every episode (the 8,610-trims
+        // treadmill row 2 measured). Repeat lessons converge tighter
+        // (`note_stretch_ceiling`'s min law); a genuine shrink notice —
+        // which since half (a) rides every custody-channel reply, not
+        // just renewals — keeps teaching the same ceiling when it
+        // arrives.
         let learn_trim = |granted: (u64, u64)| {
             if desired.1 > pre_stretch_end && granted.1 < desired.1 {
                 crate::meta_ship::tokens::note_stretch_ceiling(

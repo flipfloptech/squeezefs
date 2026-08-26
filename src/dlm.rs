@@ -517,8 +517,9 @@ pub struct RangeCustodyStats {
     /// §9.3 demotion episodes MARKED (a block-sharing acquire parked
     /// behind the grant-issuance barrier).
     pub demotions: u64,
-    /// Demotions resolved by the incumbent's ACK (renewal-carried
-    /// notice → quiesce → client-initiated ack RPC) — the clean path.
+    /// Demotions resolved by the incumbent's ACK (reply-carried notice —
+    /// every custody-channel reply since finding 16 half (a) → quiesce →
+    /// client-initiated ack RPC) — the clean path.
     pub demotion_acks: u64,
     /// Demotions resolved by the incumbent's grant DEATH (release /
     /// revocation / lease expiry on the OWNER's clock) — the fence
@@ -532,9 +533,10 @@ pub struct RangeCustodyStats {
     /// barrier instead of fabricating a demotion) — the fix's engagement
     /// gauge. Closed ledger: `tail_shrinks ≡ acks + fence_resolves`.
     pub tail_shrinks: u64,
-    /// Shrinks resolved by the incumbent's ACK (renewal-carried notice →
-    /// cache shrink → watermark answer) — the clean path, whichever
-    /// resolution the watermark selected.
+    /// Shrinks resolved by the incumbent's ACK (reply-carried notice —
+    /// every custody-channel reply since finding 16 half (a) → cache
+    /// shrink → watermark answer) — the clean path, whichever resolution
+    /// the watermark selected.
     pub tail_shrink_acks: u64,
     /// Shrinks resolved by the incumbent's grant DEATH (release /
     /// revocation / lease expiry) — the fence column; 0 on a healthy
@@ -611,9 +613,11 @@ pub fn range_custody_stats_json() -> serde_json::Value {
 // ---------------------------------------------------------------------------
 
 /// The UNACKED demotion notices naming `incumbent_token` on `ino` — the
-/// renewal reply's read, composed under the SAME `FileCustody` entry
-/// serialization that parked the waiter (the in-flight-renewal race pin:
-/// a reply composed after the pending-mark always observes it).
+/// reply-carried notice's read (every custody-channel reply since finding
+/// 16 half (a): acquire/release/renewal), composed under the SAME
+/// `FileCustody` entry serialization that parked the waiter (the
+/// in-flight-renewal race pin: a reply composed after the pending-mark
+/// always observes it).
 pub fn demotion_notices_for(ino: u64, incumbent_token: u64) -> Vec<(u64, u64)> {
     LOCK_MAP
         .read_sync(&ObjectKey::Ino(ino), |_, custody| {
@@ -649,10 +653,11 @@ pub fn ack_demotion(ino: u64, incumbent_token: u64, region: (u64, u64)) -> bool 
 // ---------------------------------------------------------------------------
 
 /// The pending SHRINK notice naming `incumbent_token` on `ino` — the
-/// renewal reply's read (composed under the same `FileCustody` entry
-/// serialization that parked the asker, the demotion notice's
-/// in-flight-renewal race pin verbatim). The answer is the block-hulled
-/// FLOOR the incumbent's tail is asked to release back to.
+/// reply-carried notice's read (every custody-channel reply since finding
+/// 16 half (a); composed under the same `FileCustody` entry serialization
+/// that parked the asker, the demotion notice's in-flight-renewal race
+/// pin verbatim). The answer is the block-hulled FLOOR the incumbent's
+/// tail is asked to release back to.
 pub fn shrink_notice_for(ino: u64, incumbent_token: u64) -> Option<u64> {
     LOCK_MAP
         .read_sync(&ObjectKey::Ino(ino), |_, custody| {
@@ -1338,8 +1343,10 @@ impl LocalLockManager {
         let deadline = std::time::Instant::now() + ttl;
         let mut parked = false;
         // Rung 17: set when THIS ask parks behind the demotion barrier —
-        // the admit records the renewal-bounded window it waited
-        // (`range_custody_demotion_wait_ns`).
+        // the admit records the reply-bounded window it waited
+        // (`range_custody_demotion_wait_ns`; one interaction on a
+        // churn-shaped incumbent since finding 16 half (a), one renewal
+        // cadence worst case).
         let mut barrier_parked_at: Option<std::time::Instant> = None;
 
         /// The one-critical-section outcome (plan AND apply under the
@@ -1441,7 +1448,8 @@ impl LocalLockManager {
                 // `ask` is the span whose issuance would share a block
                 // with a live foreign grant: mark one pending per
                 // un-acked sharer (the incumbent learns on its next
-                // renewal reply) and PARK — the grant is withheld until
+                // custody-channel reply — acquire/release/renewal since
+                // finding 16 half (a)) and PARK — the grant is withheld until
                 // every sharer acked (its region then reads demoted and
                 // the sharer probe excludes it) or died (the retire
                 // sweep resolves through the fence column).
@@ -1568,7 +1576,7 @@ impl LocalLockManager {
             match outcome {
                 RangeMint::New { token, span } => {
                     if let Some(t0) = barrier_parked_at {
-                        // The demotion barrier's renewal-bounded window,
+                        // The demotion barrier's reply-bounded window,
                         // priced (§13's `wait_ns`).
                         RANGE_DEMOTION_WAIT.record(t0.elapsed());
                     }

@@ -1474,9 +1474,7 @@ async fn shrink_notices_ride_acquire_and_release_replies_not_just_renewals() {
         9,
         "phase A: the shrink notice never rode the far acquire's reply — \
          the carrier is still renewal-only (finding 16 half (a))",
-        || {
-            squeezefs::dlm::range_custody_stats().tail_shrink_acks > s0.tail_shrink_acks
-        },
+        || squeezefs::dlm::range_custody_stats().tail_shrink_acks > s0.tail_shrink_acks,
     )
     .await;
     let grant_a = tokio::time::timeout(Duration::from_secs(10), peer_a)
@@ -1503,7 +1501,12 @@ async fn shrink_notices_ride_acquire_and_release_replies_not_just_renewals() {
     // A far-span grant held BEFORE the contention exists — the handle
     // whose queued release will be the mount's next custody interaction.
     let far = client
-        .acquire_range(ino_b, (8 * BLK, 9 * BLK), (8 * BLK, 9 * BLK), Duration::from_secs(5))
+        .acquire_range(
+            ino_b,
+            (8 * BLK, 9 * BLK),
+            (8 * BLK, 9 * BLK),
+            Duration::from_secs(5),
+        )
         .await
         .expect("phase B: the far-span grant issues uncontended");
     let far_lease = match far {
@@ -1550,16 +1553,16 @@ async fn shrink_notices_ride_acquire_and_release_replies_not_just_renewals() {
 
     // The mount's next custody interaction is the queued-release drain —
     // no acquire, no renewal. The release reply is the carrier.
-    far_lease.release().await.expect("phase B: queue the far release");
+    far_lease
+        .release()
+        .await
+        .expect("phase B: queue the far release");
     client.drain_releases().await;
     wait_until(
         9,
         "phase B: the shrink notice never rode the release reply — the \
          carrier is still renewal-only (finding 16 half (a))",
-        || {
-            squeezefs::dlm::range_custody_stats().tail_shrink_acks
-                > s1.tail_shrink_acks
-        },
+        || squeezefs::dlm::range_custody_stats().tail_shrink_acks > s1.tail_shrink_acks,
     )
     .await;
     let grant_b = tokio::time::timeout(Duration::from_secs(10), peer_b)

@@ -144,7 +144,19 @@ use std::time::{Duration, Instant};
 /// silently drop the notice and hold the asker to the incumbent's lease
 /// TTL — the retry-amplification shape the fix deletes — so the mismatch
 /// stays a loud refusal.
-pub const CUSTODY_SCHEMA: u32 = 5;
+///
+/// **6 since finding 16 half (a)** — the notice CARRIER widened
+/// (`.benchmarks/2026-08-25-s11-freeloop-stall.md` §Finding 16: 40 of 51
+/// shrink notices died with their grant because the only carrier was the
+/// renewal reply and, under the block-cyclic interleave, grants live
+/// shorter than a renewal cadence): the acquire reply became
+/// [`AcquireReplyFrame`] and the release reply [`ReleaseReplyFrame`],
+/// each carrying the same demotion/shrink notice sets the renewal reply
+/// does, so a churn-shaped incumbent hears within ONE interaction. A
+/// 5-speaker would decode the acquire reply's leading schema word as a
+/// bare [`GrantRecord`]'s and adopt garbage custody, so the mismatch
+/// stays a loud refusal.
+pub const CUSTODY_SCHEMA: u32 = 6;
 
 /// First verb of S9's block. S3 reserved 0 for its ping, S8's metadata
 /// vocabulary took 16/17, S6's membership owns `0x0100..=0x01FF`; custody
@@ -403,6 +415,42 @@ pub struct RenewReplyFrame {
     pub extent_covered: Vec<(u64, u64)>,
     /// **§9.3a** (schema 5): the tail-shrink notices addressed to this
     /// client's grants — the same pull channel the demotion notices ride.
+    pub shrinks: Vec<ShrinkNotice>,
+}
+
+/// **Schema 6 (finding 16 half (a)): the acquire's answer** — the grant
+/// plus the demotion/shrink notices addressed to the asking client's OTHER
+/// live grants. The notices are gathered AFTER the acquire's own
+/// arbitration completes (same-ino gathers therefore serialize behind the
+/// pending-mark on the `FileCustody` entry — the renewal reply's
+/// composed-after-the-mark argument, verbatim), so an incumbent whose
+/// custody interactions are all acquires still hears a shrink within one
+/// interaction instead of one renewal cadence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcquireReplyFrame {
+    pub schema: u32,
+    /// The acquire's own outcome — semantics unchanged from the schema-5
+    /// bare record.
+    pub grant: GrantRecord,
+    /// The §9.3 demotion notices addressed to this client's grants.
+    pub demotions: Vec<DemotionNotice>,
+    /// The §9.3a tail-shrink notices addressed to this client's grants.
+    pub shrinks: Vec<ShrinkNotice>,
+}
+
+/// **Schema 6 (finding 16 half (a)): the release's answer** — the retired
+/// count plus the same notice sets [`AcquireReplyFrame`] carries (the
+/// notices name the client's SURVIVING grants; a notice whose incumbent
+/// grant was in the released set resolves through the fence column as
+/// before). Replaces the schema-5 raw little-endian count body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseReplyFrame {
+    pub schema: u32,
+    /// How many of the named grants the authority actually held.
+    pub released: u64,
+    /// The §9.3 demotion notices addressed to this client's grants.
+    pub demotions: Vec<DemotionNotice>,
+    /// The §9.3a tail-shrink notices addressed to this client's grants.
     pub shrinks: Vec<ShrinkNotice>,
 }
 
@@ -1726,8 +1774,27 @@ impl WriteCustodyOwner {
         // O(live grants) on the heartbeat cadence — bounded by the §9.2
         // caps; a per-client index is the 1-TiB-shape residual, priced
         // when rung 18's rows demand it.
-        let ranges: Vec<RangeVecEntry> = self
-            .table
+        let ranges = self.range_entries_of(client);
+        let (demotions, shrinks) = Self::notices_for(&ranges);
+        // Rung 17: the coverage watermarks — the retention release's
+        // renewal-observation surface (pull only).
+        let extent_covered = crate::extent_ship::owner_covered_watermarks(client);
+        Ok(RenewReplyFrame {
+            schema: CUSTODY_SCHEMA,
+            lease: self.lease_frame(client, lease_epoch, now),
+            dead_grants,
+            ranges,
+            demotions,
+            extent_covered,
+            shrinks,
+        })
+    }
+
+    /// This client's live RANGE grants from the authority's own table —
+    /// the renewal reply's range vector and every notice gather's address
+    /// book. O(live grants), bounded by the §9.2 caps.
+    fn range_entries_of(&self, client: &str) -> Vec<RangeVecEntry> {
+        self.table
             .grants_snapshot_with(|id, g| {
                 (g.client == client)
                     .then(|| {
@@ -1742,14 +1809,20 @@ impl WriteCustodyOwner {
             })
             .into_iter()
             .flatten()
-            .collect();
-        // Rung 17 (§9.3): the demotion notices addressed to this client's
-        // grants. The read serializes on the SAME `FileCustody` entry the
-        // pending-mark mutated (the arbiter's LOCK_MAP), so a reply
-        // composed after the mark ALWAYS carries the notice — the
-        // in-flight-renewal race pin's mechanism.
+            .collect()
+    }
+
+    /// The §9.3 demotion + §9.3a tail-shrink notices addressed to
+    /// `entries`' grants. The reads serialize on the SAME `FileCustody`
+    /// entry the pending-mark mutated (the arbiter's LOCK_MAP), so a reply
+    /// composed after the mark ALWAYS carries the notice — the
+    /// in-flight-renewal race pin's mechanism, shared verbatim by every
+    /// carrier since finding 16 half (a) widened the set to the acquire
+    /// and release replies.
+    fn notices_for(entries: &[RangeVecEntry]) -> (Vec<DemotionNotice>, Vec<ShrinkNotice>) {
         let mut demotions = Vec::new();
-        for entry in &ranges {
+        let mut shrinks = Vec::new();
+        for entry in entries {
             for region in crate::dlm::demotion_notices_for(entry.ino, entry.token) {
                 demotions.push(DemotionNotice {
                     ino: entry.ino,
@@ -1757,13 +1830,6 @@ impl WriteCustodyOwner {
                     incumbent_token: entry.token,
                 });
             }
-        }
-        // §9.3a: the tail-shrink notices addressed to this client's
-        // grants — the same serialization argument as the demotion read
-        // above (a reply composed after the pending-mark always carries
-        // the notice).
-        let mut shrinks = Vec::new();
-        for entry in &ranges {
             if let Some(floor) = crate::dlm::shrink_notice_for(entry.ino, entry.token) {
                 shrinks.push(ShrinkNotice {
                     ino: entry.ino,
@@ -1772,18 +1838,14 @@ impl WriteCustodyOwner {
                 });
             }
         }
-        // Rung 17: the coverage watermarks — the retention release's
-        // renewal-observation surface (pull only).
-        let extent_covered = crate::extent_ship::owner_covered_watermarks(client);
-        Ok(RenewReplyFrame {
-            schema: CUSTODY_SCHEMA,
-            lease: self.lease_frame(client, lease_epoch, now),
-            dead_grants,
-            ranges,
-            demotions,
-            extent_covered,
-            shrinks,
-        })
+        (demotions, shrinks)
+    }
+
+    /// Finding 16 half (a): the notice sets addressed to `client`'s live
+    /// grants — the acquire/release replies' gather (the renewal builds
+    /// its own entries because it ships them as the range vector too).
+    fn notices_for_client(&self, client: &str) -> (Vec<DemotionNotice>, Vec<ShrinkNotice>) {
+        Self::notices_for(&self.range_entries_of(client))
     }
 
     /// Rung 17 (§9.3): serve one demotion ACK — validate the lease, mark
@@ -2188,6 +2250,20 @@ impl CustodyService {
         }
     }
 
+    /// Finding 16 half (a): compose the acquire's answer — the grant plus
+    /// the notices addressed to `client`'s live grants, gathered AFTER the
+    /// acquire's own arbitration completed (the composed-after-the-mark
+    /// serialization argument — see [`AcquireReplyFrame`]).
+    fn acquire_reply(&self, client: &str, grant: GrantRecord) -> AcquireReplyFrame {
+        let (demotions, shrinks) = self.owner.notices_for_client(client);
+        AcquireReplyFrame {
+            schema: CUSTODY_SCHEMA,
+            grant,
+            demotions,
+            shrinks,
+        }
+    }
+
     async fn serve(&self, req: RpcRequest) -> RpcResponse {
         match req.verb {
             VERB_CUSTODY_JOIN => match decode::<JoinFrame>(&req.body, "join") {
@@ -2216,7 +2292,11 @@ impl CustodyService {
                 Ok(frame) if frame.desired.is_some() => {
                     let desired = frame.desired.expect("guarded");
                     match self.owner.grant_ranged(&frame, desired).await {
-                        Ok(grant) => reply(req.id, &grant, "range grant"),
+                        Ok(grant) => reply(
+                            req.id,
+                            &self.acquire_reply(&frame.client, grant),
+                            "range grant",
+                        ),
                         Err((status, detail)) => Self::refuse(
                             req.id,
                             status,
@@ -2231,7 +2311,7 @@ impl CustodyService {
                     }
                 }
                 Ok(frame) => match self.owner.grant(&frame).await {
-                    Ok(grant) => reply(req.id, &grant, "grant"),
+                    Ok(grant) => reply(req.id, &self.acquire_reply(&frame.client, grant), "grant"),
                     Err(status) => Self::refuse(
                         req.id,
                         status,
@@ -2270,11 +2350,20 @@ impl CustodyService {
                 Err(e) => Self::refuse(req.id, CUSTODY_MALFORMED, format!("{e}")),
                 Ok(frame) => {
                     let n = self.owner.release(&frame.client, &frame.grant_ids);
-                    RpcResponse {
-                        id: req.id,
-                        status: CUSTODY_OK,
-                        body: (n as u64).to_le_bytes().to_vec(),
-                    }
+                    // Finding 16 half (a): the release reply is a notice
+                    // carrier too — gathered AFTER the release, so the
+                    // notices name the client's SURVIVING grants only.
+                    let (demotions, shrinks) = self.owner.notices_for_client(&frame.client);
+                    reply(
+                        req.id,
+                        &ReleaseReplyFrame {
+                            schema: CUSTODY_SCHEMA,
+                            released: n as u64,
+                            demotions,
+                            shrinks,
+                        },
+                        "release reply",
+                    )
                 }
             },
             VERB_CUSTODY_DEMOTE_ACK => match decode::<DemoteAckFrame>(&req.body, "demote ack") {
@@ -2861,7 +2950,8 @@ impl WriteCustodyClient {
                 ),
             });
         }
-        let grant: GrantRecord = decode(&reply.body, "grant")?;
+        let r: AcquireReplyFrame = decode(&reply.body, "grant")?;
+        let grant = r.grant;
         let t_adopt = Instant::now();
         let handle = Arc::new(ClientGrant {
             grant_id: grant.grant_id,
@@ -2883,6 +2973,11 @@ impl WriteCustodyClient {
         )?;
         phase_record(CustodyPhase::Adopt, t_adopt);
         GRANTS.fetch_add(1, Ordering::Relaxed);
+        // Finding 16 half (a): the acquire reply is a notice carrier —
+        // absorbed AFTER this acquire's own outcome adopts, so a notice
+        // about another of this client's grants can never reorder ahead
+        // of the custody it rode in on.
+        self.absorb_notices(&r.demotions, &r.shrinks).await;
         Ok(lease)
     }
 
@@ -2944,7 +3039,8 @@ impl WriteCustodyClient {
                 ),
             });
         }
-        let grant: GrantRecord = decode(&reply.body, "range grant")?;
+        let r: AcquireReplyFrame = decode(&reply.body, "range grant")?;
+        let grant = r.grant;
         let Some(span) = grant.span else {
             return Err(SqueezefsError::InvalidOperation(format!(
                 "S11: the authority answered a range acquire on inode_{ino} with a \
@@ -2977,6 +3073,8 @@ impl WriteCustodyClient {
             }
             crate::meta_ship::tokens::record_range_grant(ino, span, grant.token);
             RANGE_EXTENSIONS_CLIENT.fetch_add(1, Ordering::Relaxed);
+            // Finding 16 half (a): the extension reply carries notices too.
+            self.absorb_notices(&r.demotions, &r.shrinks).await;
             return Ok(RangeAcquireOutcome::Extended {
                 token: grant.token,
                 span,
@@ -3006,6 +3104,9 @@ impl WriteCustodyClient {
         phase_record(CustodyPhase::Adopt, t_adopt);
         GRANTS.fetch_add(1, Ordering::Relaxed);
         RANGE_ACQUIRES_CLIENT.fetch_add(1, Ordering::Relaxed);
+        // Finding 16 half (a): the acquire reply is a notice carrier —
+        // absorbed after this acquire's own outcome adopts (see `acquire`).
+        self.absorb_notices(&r.demotions, &r.shrinks).await;
         Ok(RangeAcquireOutcome::New {
             lease,
             span,
@@ -3096,14 +3197,41 @@ impl WriteCustodyClient {
                 .map(|e| (e.ino, e.span, e.token))
                 .collect::<Vec<_>>(),
         );
-        // Rung 17 (§9.3): the renewal-carried DEMOTION NOTICES — the
-        // §9.3 order is load-bearing: (1) mark the region demoted in the
-        // LOCAL table so every subsequent write to it classifies
-        // extent-ship, (2) QUIESCE the in-flight direct publishes, (3)
-        // only then ACK — the authority issues the parked grant the
-        // moment the ack lands, so a single publisher holds at every
-        // instant.
-        for notice in &r.demotions {
+        // The reply-carried demotion/shrink notices — since finding 16
+        // half (a) the SAME absorption every custody-channel reply runs.
+        self.absorb_notices(&r.demotions, &r.shrinks).await;
+        // Rung 17: the coverage watermarks release retained extents
+        // (release path 2 — pull only, never on ack).
+        for (ino, upto) in &r.extent_covered {
+            crate::extent_ship::release_covered(*ino, *upto);
+        }
+        Ok(())
+    }
+
+    /// **Absorb reply-carried notices** — the client half of the §9.3/§9.3a
+    /// pull channel, shared by every carrier since finding 16 half (a)
+    /// widened the set from the renewal reply alone to the acquire and
+    /// release replies (row 2's ledger: 40 of 51 shrink notices died with
+    /// their grant waiting for a renewal that never came first).
+    ///
+    /// Rung 17 (§9.3) DEMOTION order is load-bearing: (1) mark the region
+    /// demoted in the LOCAL table so every subsequent write to it
+    /// classifies extent-ship, (2) QUIESCE the in-flight direct publishes,
+    /// (3) only then ACK — the authority issues the parked grant the
+    /// moment the ack lands, so a single publisher holds at every instant.
+    ///
+    /// §9.3a TAIL-SHRINK order is load-bearing: (1) the covering cache
+    /// stops serving the released tail (so no later write can be served
+    /// custody of bytes this ack gives away), (2) the written high-water
+    /// is read AFTER that shrink (any serve that beat it is visible in
+    /// the mark — the fetch_max happens under the serve itself), (3) the
+    /// local adopted record narrows, (4) the ino learns its stretch
+    /// ceiling (the repeat-collision prevention), (5) only then does the
+    /// ack travel. A missing cache entry (an R5 shed) answers `u64::MAX`
+    /// — "unknown, treat my whole span as written" — which the authority
+    /// resolves as an escalation, never a release.
+    async fn absorb_notices(&self, demotions: &[DemotionNotice], shrinks: &[ShrinkNotice]) {
+        for notice in demotions {
             crate::extent_ship::note_demotion(notice.ino, notice.region).await;
             if let Err(e) = self
                 .ack_demotion(notice.ino, notice.incumbent_token, notice.region)
@@ -3120,23 +3248,7 @@ impl WriteCustodyClient {
                 );
             }
         }
-        // Rung 17: the coverage watermarks release retained extents
-        // (release path 2 — pull only, never on ack).
-        for (ino, upto) in &r.extent_covered {
-            crate::extent_ship::release_covered(*ino, *upto);
-        }
-        // §9.3a: the renewal-carried TAIL-SHRINK notices. The order is
-        // load-bearing: (1) the covering cache stops serving the released
-        // tail (so no later write can be served custody of bytes this ack
-        // gives away), (2) the written high-water is read AFTER that
-        // shrink (any serve that beat it is visible in the mark — the
-        // fetch_max happens under the serve itself), (3) the local
-        // adopted record narrows, (4) the ino learns its stretch ceiling
-        // (the repeat-collision prevention), (5) only then does the ack
-        // travel. A missing cache entry (an R5 shed) answers `u64::MAX` —
-        // "unknown, treat my whole span as written" — which the authority
-        // resolves as an escalation, never a release.
-        for notice in &r.shrinks {
+        for notice in shrinks {
             let watermark = crate::meta_ship::tokens::shrink_range_grant(
                 notice.ino,
                 notice.incumbent_token,
@@ -3170,7 +3282,6 @@ impl WriteCustodyClient {
                 );
             }
         }
-        Ok(())
     }
 
     /// Rung 17 (§9.3): ship one demotion ACK — the client-initiated RPC
@@ -3310,8 +3421,26 @@ impl WriteCustodyClient {
             return;
         };
         match self.call_retrying(VERB_CUSTODY_RELEASE, body).await {
-            Ok(_) => {
+            Ok(reply) => {
                 RELEASES.fetch_add(ids.len() as u64, Ordering::Relaxed);
+                // Finding 16 half (a): the release reply is a notice
+                // carrier — the notices name this client's SURVIVING
+                // grants (a notice whose incumbent was in the released
+                // set resolves through the fence column, as before). A
+                // refused or undecodable reply loses only the ride, never
+                // the release accounting above; the notice re-travels on
+                // the next interaction or renewal.
+                if reply.status == CUSTODY_OK {
+                    match decode::<ReleaseReplyFrame>(&reply.body, "release reply") {
+                        Ok(r) => self.absorb_notices(&r.demotions, &r.shrinks).await,
+                        Err(e) => log::warn!(
+                            "S9: release reply from {} undecodable ({e}) — reply-carried \
+                             notices lost this ride (they re-travel on the next \
+                             interaction or renewal)",
+                            self.endpoint
+                        ),
+                    }
+                }
             }
             Err(e) => {
                 // A release that could not be delivered is NOT lost work:

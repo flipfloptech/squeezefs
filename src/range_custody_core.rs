@@ -229,12 +229,13 @@ pub struct BlockSharer {
 /// hull touches the grant's required-union hull), so instead of the
 /// demotion barrier the grant is marked for a TAIL SHRINK back to
 /// `floor`: the asker parks on the same wait machinery, the notice rides
-/// the incumbent's next renewal reply, and the incumbent answers its own
-/// written high-water inside the contested tail. RAM state, like
-/// [`DemotionPending`] — it dies with the authority.
+/// the incumbent's next custody-channel reply (acquire/release/renewal —
+/// widened from renewal-only by finding 16 half (a)), and the incumbent
+/// answers its own written high-water inside the contested tail. RAM
+/// state, like [`DemotionPending`] — it dies with the authority.
 #[derive(Clone, Copy, Debug)]
 pub struct ShrinkPending {
-    /// The addressee grant's token (the renewal notice's key).
+    /// The addressee grant's token (the reply-carried notice's key).
     pub incumbent_token: u64,
     /// The block-hulled boundary that frees every parked ask: the grant's
     /// tail shrinks back to it iff the incumbent's written high-water is
@@ -267,7 +268,7 @@ pub enum ShrinkResolution {
 pub struct DemotionPending {
     /// The block-aligned region being demoted.
     pub region: (u64, u64),
-    /// The incumbent grant's token (the renewal notice's key — the
+    /// The incumbent grant's token (the reply-carried notice's key — the
     /// incumbent acks by naming it; its retire sweeps the pending
     /// through the fence column).
     pub incumbent_token: u64,
@@ -888,8 +889,9 @@ impl FileCustody {
         true
     }
 
-    /// The UNACKED pendings naming `incumbent_token` — the renewal
-    /// notice's read (composed under this same entry serialization).
+    /// The UNACKED pendings naming `incumbent_token` — the reply-carried
+    /// notice's read, every custody-channel carrier (composed under this
+    /// same entry serialization).
     pub fn demotion_notices_for_token(&self, incumbent_token: u64) -> Vec<(u64, u64)> {
         self.pending
             .iter()
@@ -965,9 +967,10 @@ impl FileCustody {
         true
     }
 
-    /// The pending shrink floor naming `incumbent_token` — the renewal
-    /// notice's read (composed under this same entry serialization, the
-    /// demotion notice's in-flight-renewal race pin verbatim).
+    /// The pending shrink floor naming `incumbent_token` — the
+    /// reply-carried notice's read, every custody-channel carrier
+    /// (composed under this same entry serialization, the demotion
+    /// notice's in-flight-renewal race pin verbatim).
     pub fn shrink_notice_for_token(&self, incumbent_token: u64) -> Option<u64> {
         self.shrink_pending
             .iter()

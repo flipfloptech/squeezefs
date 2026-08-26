@@ -301,3 +301,59 @@ the remaining +505 conflicts and the A2 sustained-window decay — with
 the range treadmill gone these are the next constraint, and A2's
 311→33 shape says something still degrades within the phase; (3) only
 then PR 5's acceptance rung from zero.
+
+## Finding 16 verification — fix half (a), the carrier widening, live (2026-08-26)
+
+Fix half (a) landed as dev `e08893be` (custody schema 6 — shrink/demotion
+notices ride EVERY custody-channel reply: `AcquireReplyFrame`,
+`ReleaseReplyFrame`, the renewal unchanged; contract
+`shrink_notices_ride_acquire_and_release_replies_not_just_renewals`; full
+gate green). The SAME gate also caught and fixed **finding 17** — a
+pre-existing read-tier deposit-window wrong-data race, its own note at
+`.benchmarks/2026-08-26-read-tier-deposit-window.md` (dev `976ddca8`) —
+so this verification row carries BOTH fixes. Row `s11mpiio-1787746893`,
+2×64 GiB venue, binary `976ddca8`, archived at
+`.benchmarks/rows-f16a-carrier/` (m0 deltas p0→live from the archived
+JSON; per-phase splits from p0..p3):
+
+| Gauge (m0) | Trim-teacher row | This row | Reading |
+|---|---|---|---|
+| `tail_shrinks` / `_acks` / `_fence_resolves` | +31 / +2 / +29 | **+85 / +84 / +1** | **the carrier works**: the fence column collapsed 94 % → 1.2 % — notices now reach their incumbents within one interaction, and the ledger closes exactly (85 ≡ 84 + 1) |
+| `range_custody_waits` | +46 | +85 (≡ shrinks) | every wait is an honest shrink round — zero fabricated parks on the ranged phase |
+| `desired_trims` | +29 | +86 | foreign clips only (same instrument as the trim-teacher row); ~10× the work, ~3× the trims |
+| `range_custody_grants` / `extensions` | +1,163 / +2,507 | +17,728 / +65,149 | ~15× the row's work moved through the plane |
+| `dlm_custody_conflicts` | +505 | +84,770 — **but split per phase: A1 (shared, ranged) +1,050; B1 +43,435; B2 +40,145; A2 +140** | 98.6 % of the conflicts sit in the FILE-PER-PROCESS phases, which carry no byte-range sharing at all — a whole-file/allocation-pressure class, NOT range custody; the ranged phase's own conflicts are ~1 k at 12.4 k grants |
+
+Throughput faces: **probe 1,729 MiB/s** (was 32.9 — the ≥ 750 MiB/s
+acceptance precondition domain is now REACHED; the self-sizer wanted
+38 GiB and was capped at the 10 GiB zram-budget clamp). **A1 shared
+915.6 MiB/s steady** (was 105.2 — ~9×), with an honestly BIMODAL
+iteration table (~300 MiB/s iterations alternating with ~2,700 bursts;
+the flatness gate passed on first-vs-last steady, both bursts). B1
+261.5, B2 255.5 (lower than the prior row's 620–700 — the venue re-sized
+10× larger, not same-shape). **A2 died on honest capacity**: rank 7's
+mount (m51) hit `alloc_lane_enospc_refusals` — `nvme3n1` full at
+16,374/16,384 blocks, lane 5 of 16 exhausted with **0 foreign-lane free
+blocks** (so NOT the lane-reachability class finding 15 part-1 fixed) —
+fsync failed, ior aborted. The free-grace board at death: deferrals
+142,896 ≡ releases 141,588 + offsets 1,308 (closed), residence dominated
+by the >16 s bucket, `free_grace_bound_age_ms` 21.5 s. The arithmetic is
+the design's own inventory-margin statement at the NEW rate: ~900 MiB/s
+of rewrite churn × ~21 s of grace residence ≈ 19 GiB of deferred
+inventory per wave against 2×64 GiB — the fixes raised throughput ~9×,
+so the venue that survived the old rate starves at the new one. One new
+tripwire observed once: the authority refused 1 shipped free as
+"already free/graced/quarantined" (the double-release lineage,
+leak-safe direction) — filed for the next loop.
+
+**Verdict: finding 16 is CLOSED — both halves live.** The §9.3a learning
+loop is no longer structurally dark: notices arrive (fence 1/85), the
+teacher fires at the source, the ranged phase runs at 9× with its
+conflicts down to noise. **Residual board, in order:** (1) the s11 row's
+constraint is now GRACE-INVENTORY CAPACITY at the fixed rate — either a
+venue sized to churn_rate × residence (≥ 2×128 GiB at ~900 MiB/s) or the
+free-grace residence itself (bound_age ~21 s under churn = the
+owner-side min-composition already named in the PR 2/3 residue); (2) the
+fpp phases' whole-file conflict class (+83 k, no ranges involved); (3)
+the once-seen double-release refusal; (4) PR 5's acceptance rung from
+zero on a venue that closes A-B-B-A.

@@ -98,6 +98,10 @@ impl Drop for Restore {
         ship::disarm_ownership();
         squeezefs::data_custody::test_reset_custody_generation();
         squeezefs::data_custody::test_clear_poison();
+        // Finding 16's trim teacher learns ceilings from acquire replies,
+        // and the ceiling map is keyed by ino — which RECURS across this
+        // binary's fresh volumes.
+        squeezefs::meta_ship::tokens::test_clear_stretch_ceilings();
     }
 }
 
@@ -1210,12 +1214,18 @@ async fn the_acquire_replys_trim_teaches_the_ceiling_without_a_shrink_round() {
         "ladder-authority-8",
         Some(h.fs.meta_backend.as_ref().unwrap().clone()),
     );
+    // SEVEN pads (the suite's private-inode-band convention — a distinct
+    // count per test, so the process-global per-ino range/ceiling caches
+    // never collide across the binary's fresh volumes; 2/3/4/5/6 are
+    // taken).
     for pad_name in [
         "pad-o.dat",
         "pad-p.dat",
         "pad-q.dat",
         "pad-r.dat",
         "pad-s.dat",
+        "pad-t.dat",
+        "pad-u.dat",
     ] {
         let pad =
             h.fs.create(h.req, 1, OsStr::new(pad_name), libc::S_IFREG | 0o644, 0)

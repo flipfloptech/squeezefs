@@ -187,8 +187,15 @@ pub enum RangePlan {
 }
 
 /// [`FileCustody::plan_range`]'s answer: the plan plus whether desired
-/// was TRIMMED against live custody (the `range_custody_desired_trims`
-/// ledger's predicate — required is structurally never trimmed).
+/// was TRIMMED against **foreign** custody (the
+/// `range_custody_desired_trims` ledger's predicate — required is
+/// structurally never trimmed). Same-scope window clips are deliberately
+/// NOT trims (finding 16's gauge half): the client's abutting union
+/// names its own span, plan step 3 clips it back and step 4 extends that
+/// same grant to the union — the admit-time merge's own mechanics, zero
+/// contention. Counting them made the fabrication ledger unreadable
+/// (row 2's 8,610 "trims" mixed benign self-clips with the real
+/// desire-vs-peer collisions the gauge exists to name).
 #[derive(Debug)]
 pub struct RangeDecision {
     pub plan: RangePlan,
@@ -523,18 +530,26 @@ impl FileCustody {
         // DESIRED sees every candidate.
         let target_token = required_target.map(|g| g.token);
         let mut window = desired;
+        // The trim gauge counts FOREIGN clips only (finding 16): a
+        // same-scope wall is the merge's own bookkeeping, never
+        // contention evidence.
+        let mut foreign_trimmed = false;
         for g in self.candidates(desired.0, desired.1) {
             if Some(g.token) == target_token || !g.overlaps(window.0, window.1) {
                 continue;
             }
+            let before = window;
             if g.end <= required.0 {
                 window.0 = window.0.max(g.end);
             } else if g.start >= required.1 {
                 window.1 = window.1.min(g.start);
             }
+            if window != before && g.owner_nonce != scope {
+                foreign_trimmed = true;
+            }
         }
         debug_assert!(window.0 <= required.0 && window.1 >= required.1);
-        let trimmed = window != desired;
+        let trimmed = foreign_trimmed;
 
         // 4. The merge target: the grant overlapping required, or a
         // same-scope grant overlapping/abutting the clipped window (its

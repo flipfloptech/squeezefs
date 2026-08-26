@@ -457,6 +457,14 @@ pub fn stretch_ceiling(ino: u64) -> Option<u64> {
     STRETCH_CEILINGS.read_sync(&ino, |_, c| c.stretch_len)
 }
 
+/// Test seam: drop every learned stretch ceiling. The map is keyed by
+/// ino and inos RECUR across a test binary's fresh volumes, so a suite
+/// that teaches a ceiling must clear it or the next fixture inherits a
+/// stop-doubling posture it never earned.
+pub fn test_clear_stretch_ceilings() {
+    STRETCH_CEILINGS.clear_sync();
+}
+
 /// Is `token` a STILL-LIVE cached range grant of `ino` (rung 18)? The
 /// §9.2 fencing law's probe — "a range writer fences on its own lease
 /// token": a writeback unit whose grant is alive is CURRENT custody even

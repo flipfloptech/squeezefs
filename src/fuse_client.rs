@@ -12640,6 +12640,7 @@ impl SqueezefsFilesystem {
             desired.0 = desired.0.min(adj.0);
             desired.1 = desired.1.max(adj.1);
         }
+        let pre_stretch_end = desired.1;
         if sequential {
             let held_len = desired.1 - desired.0;
             let stretched =
@@ -12669,15 +12670,37 @@ impl SqueezefsFilesystem {
             desired.0 = stretched.0;
         }
         let file_path = crate::keys::inode_path(ino);
+        // Finding 16 (residual 7's steady-state half): the acquire
+        // reply's OWN TRIM is a ceiling lesson. The shrink notice's only
+        // carrier is the incumbent's renewal reply, and block-cyclic
+        // grants churn faster than a renewal cadence — so the granted
+        // span coming back CLIPPED below the stretched desire teaches the
+        // SURVIVING stretch length right here (`granted.1 −
+        // aligned_ask_end`, 0 when nothing survived — the stop-doubling
+        // posture), and the next stride's doubling clamps at the source
+        // instead of re-colliding with the neighbor every episode (the
+        // 8,610-trims treadmill row 2 measured). Repeat lessons converge
+        // tighter (`note_stretch_ceiling`'s min law); a genuine shrink
+        // notice keeps teaching the same ceiling when it does arrive.
+        let learn_trim = |granted: (u64, u64)| {
+            if desired.1 > pre_stretch_end && granted.1 < desired.1 {
+                crate::meta_ship::tokens::note_stretch_ceiling(
+                    ino,
+                    granted.1.max(pre_stretch_end),
+                    pre_stretch_end,
+                );
+            }
+        };
         let start_dlm = std::time::Instant::now();
         let outcome = self
             .dlm
             .acquire_lock_range(&file_path, (start, end), desired, wait, None)
             .await;
         match outcome {
-            Ok(crate::dlm::RangeAcquired::New { lease, .. }) => {
+            Ok(crate::dlm::RangeAcquired::New { lease, span }) => {
                 METRICS.lease_acquire_ok.fetch_add(1, Ordering::Relaxed);
                 METRICS.dlm_acquire_time.record(start_dlm.elapsed());
+                learn_trim(span);
                 let token = lease.fencing_token();
                 self.active_range_leases.entry(ino).or_default().push(lease);
                 // §9.3a: this write's custody arrived as a wire answer,
@@ -12688,11 +12711,12 @@ impl SqueezefsFilesystem {
                 Ok(token)
             }
             Ok(
-                crate::dlm::RangeAcquired::Extended { token, .. }
-                | crate::dlm::RangeAcquired::Covered { token, .. },
+                crate::dlm::RangeAcquired::Extended { token, span }
+                | crate::dlm::RangeAcquired::Covered { token, span },
             ) => {
                 METRICS.lease_acquire_ok.fetch_add(1, Ordering::Relaxed);
                 METRICS.dlm_acquire_time.record(start_dlm.elapsed());
+                learn_trim(span);
                 crate::meta_ship::tokens::note_range_write(ino, token, end);
                 Ok(token)
             }

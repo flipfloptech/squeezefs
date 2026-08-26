@@ -1273,6 +1273,178 @@ async fn adversarial_tiny_adjacent_asks_coalesce_to_one_span() {
     whole.release().await.expect("release whole");
 }
 
+/// **Finding 22 — a required covered by the UNION of the holder's own
+/// grants is COVERED custody, never a refusal loop**
+/// (`.benchmarks/2026-08-25-s11-freeloop-stall.md` §attempt 3): the trim
+/// teacher's clamp creates abutting same-holder grant pairs at the
+/// learned ceiling, and a straddling ~1 MiB kernel write's required then
+/// overlaps BOTH — the bridge refusal fired per ask and the POSIX-5
+/// ladder re-asked the identical span forever (285,495 refusal lines,
+/// +92.6 k conflicts on the fpp phases, and the overflow traffic's
+/// fallback is what moved the authority's range-shared clauses and
+/// settle tripwires). Every byte of the required IS this holder's live
+/// custody: the answer is Covered (mutating nothing — both records and
+/// their release handles stand), and the loud bridge refusal survives
+/// only for a required that ESCAPES the union (genuinely unbuildable).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_required_covered_by_the_union_of_own_grants_is_covered() {
+    let _g = RANGE_SERIAL.lock().await;
+    let ino = 72_000_010u64;
+    let path = format!("inode_{ino}");
+    let d = dlm();
+    let geometry = Some((64 * BLK, BLK));
+
+    // Two live records abutting at 2*BLK: [0,BLK) extends to [0,2*BLK)
+    // via the admit-time merge; [2*BLK,3*BLK) is its own record (minted
+    // before the gap closed, so the merge could never absorb it — the
+    // trim-teacher steady state's exact shape).
+    let g1 = d
+        .acquire_lock_range(&path, (0, BLK), (0, BLK), Duration::from_secs(3), geometry)
+        .await
+        .expect("the first span");
+    let (lease1, token1) = match g1 {
+        RangeAcquired::New { lease, .. } => {
+            let t = lease.fencing_token();
+            (lease, t)
+        }
+        other => panic!("first ask is NEW: {other:?}"),
+    };
+    let g2 = d
+        .acquire_lock_range(
+            &path,
+            (2 * BLK, 3 * BLK),
+            (2 * BLK, 3 * BLK),
+            Duration::from_secs(3),
+            geometry,
+        )
+        .await
+        .expect("the gapped span");
+    let (lease2, token2) = match g2 {
+        RangeAcquired::New { lease, .. } => {
+            let t = lease.fencing_token();
+            (lease, t)
+        }
+        other => panic!("gapped ask is NEW: {other:?}"),
+    };
+    match d
+        .acquire_lock_range(
+            &path,
+            (BLK, 2 * BLK),
+            (BLK, 2 * BLK),
+            Duration::from_secs(3),
+            geometry,
+        )
+        .await
+        .expect("the gap-closing ask")
+    {
+        RangeAcquired::Extended { token, span } => {
+            assert_eq!(token, token1, "the left neighbor extends");
+            assert_eq!(span, (0, 2 * BLK));
+        }
+        other => panic!("the gap-closing ask extends: {other:?}"),
+    }
+    assert_eq!(
+        squeezefs::dlm::live_range_records(ino),
+        2,
+        "two abutting live records — the shape under test"
+    );
+
+    // THE CONTRACT (pre-fix RED): a straddling required inside the union
+    // is served COVERED — no refusal, no retry storm, nothing mutated.
+    let straddle = (2 * BLK - 4096, 2 * BLK + 4096);
+    let covered = d
+        .acquire_lock_range(&path, straddle, straddle, Duration::from_secs(3), geometry)
+        .await
+        .expect(
+            "finding 22: a required covered by the UNION of this holder's own two live \
+             grants must be served COVERED — the bridge refusal here is the 285k-line \
+             retry storm (the ladder re-asks an identically-refused span for ever)",
+        );
+    match covered {
+        RangeAcquired::Covered { token, .. } => {
+            assert!(
+                token == token1 || token == token2,
+                "the covering answer names one of the holder's own live grants"
+            );
+        }
+        other => panic!("the straddling required is COVERED custody: {other:?}"),
+    }
+    assert_eq!(
+        squeezefs::dlm::live_range_records(ino),
+        2,
+        "Covered mutates nothing — both records and their release handles stand"
+    );
+
+    // The loud arm survives: a required that ESCAPES the union (crosses
+    // g2's end into unowned bytes while still overlapping both grants)
+    // stays the bridge refusal.
+    let escape = (2 * BLK - 4096, 3 * BLK + 4096);
+    assert!(
+        d.acquire_lock_range(&path, escape, escape, Duration::from_secs(1), geometry)
+            .await
+            .is_err(),
+        "a bridging required that escapes the union keeps the loud refusal"
+    );
+
+    lease2.release().await.expect("release g2");
+    lease1.release().await.expect("release g1");
+}
+
+/// **Finding 22's cache half — the covering probe answers from the union
+/// of own cached spans, with SEGMENT-WISE watermark marks.** The probe IS
+/// the write path's custody serve, so a union hit must `fetch_max` EACH
+/// overlapped grant's written high-water to its own segment end — a
+/// straddling write marked only on one grant would let a later tail
+/// shrink of the OTHER release bytes the holder wrote (§9.3a's zeros
+/// class). Pre-fix the probe answered single-span only, so every
+/// straddling write missed the cache and asked the wire — the storm's
+/// per-ask engine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_covering_probe_answers_the_union_and_marks_each_segment() {
+    let _g = RANGE_SERIAL.lock().await;
+    use squeezefs::meta_ship::tokens;
+    let ino = 72_000_011u64;
+    tokens::test_clear_range_cache();
+
+    tokens::record_range_grant(ino, (0, 2 * BLK), 9001);
+    tokens::record_range_grant(ino, (2 * BLK, 3 * BLK), 9002);
+
+    // Single-span hits keep their exact behavior.
+    assert_eq!(
+        tokens::range_token_covering(ino, 4096, 8192),
+        Some(9001),
+        "a single-span cover serves as before"
+    );
+
+    // THE CONTRACT (pre-fix RED): the straddle is served from the union…
+    let straddle = tokens::range_token_covering(ino, 2 * BLK - 4096, 2 * BLK + 4096);
+    assert!(
+        straddle == Some(9001) || straddle == Some(9002),
+        "finding 22: a straddling write covered by the union of this holder's own cached \
+         spans must be SERVED (got {straddle:?}) — a probe miss here is one wire ask per \
+         straddling write, the storm's engine"
+    );
+
+    // …and BOTH grants' watermarks carry their own segment (the §9.3a
+    // shrink answers must see every served byte).
+    assert!(
+        tokens::shrink_range_grant(ino, 9001, 0).is_some_and(|w| w >= 2 * BLK),
+        "the left grant's watermark covers its segment of the straddle"
+    );
+    assert!(
+        tokens::shrink_range_grant(ino, 9002, 2 * BLK).is_some_and(|w| w >= 2 * BLK + 4096),
+        "the right grant's watermark covers its segment of the straddle"
+    );
+
+    // A probe past the union still misses (the caller acquires).
+    assert_eq!(
+        tokens::range_token_covering(ino, 2 * BLK + 4096, 4 * BLK),
+        None,
+        "beyond the union the probe misses honestly"
+    );
+    tokens::test_clear_range_cache();
+}
+
 // ---------------------------------------------------------------------------
 // 10. The R5 byte-budget ceiling — refuse-loud naming the arithmetic (pin a)
 // ---------------------------------------------------------------------------

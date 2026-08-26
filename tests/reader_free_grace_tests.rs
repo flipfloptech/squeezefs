@@ -1364,7 +1364,6 @@ async fn a_drained_ring_retires_the_expired_ask_immediately() {
     free_grace::arm_owner_plane(clock.clone(), owner.clocks()).expect("derived bound");
     let grant = join(&owner, "r-drained", MemberRole::Reader);
     owner.refresh_free_grace_bound();
-    let routine = grant.renew_ms;
 
     let ba = allocator("grace-drained").await;
     ba.set_capacity_bytes(32 * ba.chunk_size());

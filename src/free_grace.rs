@@ -1134,18 +1134,74 @@ fn note_pressure(runway: Option<u64>, newest_label: u64) {
 /// the act of counting the ask (rung (a)'s engagement instrument) —
 /// called at the ONE place a cadence is handed out, the owner's renewal.
 ///
-/// `None` when no prod is in force, when the reading has expired, or when
-/// this member has already acknowledged past everything the plane holds:
-/// prodding a member that is not holding the free list would buy nothing
-/// and cost it beats.
+/// `None` when no prod is in force, when this member has already
+/// acknowledged past everything the plane holds (prodding a member that
+/// is not holding the free list would buy nothing and cost it beats), or
+/// when an expired ask has finished its decay.
+///
+/// **Finding 18 — an expired ask DECAYS, it never snaps**
+/// (`.benchmarks/2026-08-25-s11-freeloop-stall.md` §Finding 18): under a
+/// storm the runway reading sawtooths — every release crest lets the
+/// reading lapse — and the pre-fix expiry arm handed the very next
+/// renewal beat the ROUTINE cadence. One routine grant is one
+/// routine-beat acknowledgement hole, and the owner's min-composition
+/// inherits the widest member's hole (the f16a row: `bound_age`
+/// 15.5–22.6 s against PR 5's ≤ 12 s gate with the member ladder itself
+/// on budget). So while the plane still HOLDS offsets, an expired ask
+/// relaxes ONE DOUBLING STEP per reading window (the write-pipeline
+/// probe governor's bleed-to-routine pattern — derived, never a knob),
+/// re-tightens fully at the next pressure reading (`note_pressure`
+/// overwrites unconditionally), and retires at routine. A ring that has
+/// drained retires the ask immediately — no ask on a plane holding
+/// nothing, the shipped economy law unchanged.
 pub fn take_prod_cadence(acked_free_epoch: u64) -> Option<u64> {
-    let cadence = PROD_RENEW_MS.load(Ordering::Relaxed);
+    let mut cadence = PROD_RENEW_MS.load(Ordering::Relaxed);
     if cadence == 0 {
         return None;
     }
     let now = owner_now_ms()?;
-    if now >= PROD_UNTIL_MS.load(Ordering::Relaxed) {
-        return None;
+    let until = PROD_UNTIL_MS.load(Ordering::Relaxed);
+    if now >= until {
+        if HELD_OFFSETS.load(Ordering::Relaxed) == 0 {
+            // Drained: retire at once. A racing fresh reading re-arms
+            // right after — one lost window at worst, never a wrong ask.
+            PROD_RENEW_MS.store(0, Ordering::Relaxed);
+            return None;
+        }
+        let plane = PLANE.load();
+        let routine = plane
+            .as_ref()
+            .and_then(|p| p.prod.as_ref().map(|p| p.renew_ms))?;
+        let ttl = plane.as_ref().map(|p| p.reading_ttl_ms).unwrap_or(0).max(1);
+        // One relax step per window: the CAS on the expiry word elects
+        // exactly one decayer; losers re-read whatever won (the decayed
+        // value, or a fresh reading's tighter one).
+        if PROD_UNTIL_MS
+            .compare_exchange(
+                until,
+                now.saturating_add(ttl),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            let next = cadence.saturating_mul(2);
+            if next >= routine {
+                // The ladder reached routine: hand back to the routine
+                // machinery (a permanent elevated ask on a quiet plane
+                // is the inverted economy).
+                PROD_RENEW_MS.store(0, Ordering::Relaxed);
+                return None;
+            }
+            PROD_RENEW_MS.store(next, Ordering::Relaxed);
+            PROD_DECAYS.fetch_add(1, Ordering::Relaxed);
+            cadence = next;
+        } else {
+            cadence = PROD_RENEW_MS.load(Ordering::Relaxed);
+            if cadence == 0 || now >= PROD_UNTIL_MS.load(Ordering::Relaxed) {
+                return None;
+            }
+        }
     }
     if acked_free_epoch >= PROD_LABEL.load(Ordering::Relaxed) {
         return None;
@@ -1902,6 +1958,7 @@ pub fn stats_snapshot() -> serde_json::Value {
         "free_grace_ring_cap": derived_ring_cap(),
         "free_grace_pressure_pct": pressure_pct(),
         "free_grace_prods": prods(),
+        "free_grace_prod_decays": prod_decays(),
         "free_grace_bound_tightenings": bound_tightenings(),
         "free_grace_prod_renew_ms": prod_renew_ms(),
         // The sustain campaign's attribution instruments (PR 1, §8).

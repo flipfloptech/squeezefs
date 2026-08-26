@@ -261,3 +261,43 @@ ceiling is the ranged-custody desire/trim/demotion churn on aligned
 disjoint writes — the fabricated-contention fix (rung-20 residual 7)
 must join this campaign's path before PR 5's acceptance rung can run in
 the ≥ 750 MiB/s domain.
+
+## Finding 16 verification — fix half (b), the trim teacher, live (2026-08-26)
+
+Fix half (b) landed as dev `0afabcff` (contract
+`the_acquire_replys_trim_teaches_the_ceiling_without_a_shrink_round`,
+`tests/mw_ranged_lease_ladder_tests.rs`; full gate green, clock-capped):
+the acquire reply's own trim teaches the learned stretch ceiling, and
+the `desired_trims` gauge was redefined in the same commit to count
+FOREIGN clips only (a same-scope wall — the client's own earlier grant
+clipping its abutting-union window — is the admit-time merge's own
+bookkeeping, not contention evidence). Verification row
+`s11mpiio-1787731593` on the same 2×64 GiB venue, binary `0afabcff`,
+rows archived at `.benchmarks/rows-f16-trim-teacher/` (m0 deltas
+p0→live, recomputed from the archived JSON):
+
+| Gauge (m0) | Row 2 (pre-fix) | This row | Reading |
+|---|---|---|---|
+| `dlm_custody_conflicts` | +5,449 | **+505** | the same-instrument verdict: full-budget arbitration parks down ~10.8× — the treadmill collapsed |
+| `range_custody_desired_trims` | +8,610 | +29 | NOT same-instrument (the gauge now counts foreign clips only) — read it as "29 true foreign collisions", not an 8,610→29 fix delta |
+| `range_custody_grants` | +3,105 (≡ releases) | +1,163 (releases +1,153) | grant churn ~2.7× lower; `extensions` +2,507 — spans now live and EXTEND instead of being re-minted |
+| `range_custody_stretch_ceiling_clamps` | 0 | **0** | the teacher fires on the trim itself, and with foreign trims down to 29 the doubling rarely re-collides — a clamp only counts when a LATER stretch hits the learned ceiling, so 0 here is consistent with the teacher working, not proof of it (the cargo contract is the proof the clamp arm fires) |
+| `range_custody_tail_shrinks` / `_acks` / `_fence_resolves` | +51 / +11 / +40 | +31 / +2 / **+29** | **fix half (a) is still owed**: 29 of 31 shrink notices again died with their grant — the renewal-riding carrier still structurally misses under grant churn |
+| `range_custody_waits` | — | +46 | residual arbitration, see below |
+
+Throughput faces (same venue, same phases): probe 32.90 MiB/s — the
+probe writes a self-sized ~1 GiB file into the 2×64 GiB venue, so this
+is a small-domain number, NOT the ≥ 750 MiB/s acceptance precondition
+domain (venue-state honesty: PR 5's rung still needs the properly-sized
+probe). A1 105.2 MiB/s; B1 622.9; B2 707.3 steady; **A2 FAILED the
+sustained-window gate** (311 → 33 MiB/s decay across the window).
+
+**Verdict: finding 16's half (b) is live and the fabricated-contention
+treadmill collapsed** (conflicts −90.7 %, grant churn −63 %, spans
+extending instead of re-minting). **Residual, in order:** (1) fix half
+(a) — widen the shrink/demotion notice carrier to every custody-channel
+reply (the 29/31 fence-resolves are its standing proof); (2) attribute
+the remaining +505 conflicts and the A2 sustained-window decay — with
+the range treadmill gone these are the next constraint, and A2's
+311→33 shape says something still degrades within the phase; (3) only
+then PR 5's acceptance rung from zero.

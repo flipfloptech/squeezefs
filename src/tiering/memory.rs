@@ -144,6 +144,7 @@ impl MemoryCacheShard {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn put(
         &self,
         key: Bytes,
@@ -151,6 +152,7 @@ impl MemoryCacheShard {
         protected: bool,
         referenced: bool,
         stream: bool,
+        validate: Option<&dyn Fn() -> bool>,
         evicted: &mut Vec<(Bytes, Bytes, EvictClass)>,
     ) {
         let val_len = value.len();
@@ -162,10 +164,25 @@ impl MemoryCacheShard {
         }
 
         let mut old_len = None;
-        let _ = self
-            .map
-            .entry_sync(key.clone())
-            .and_modify(|(old_val, state)| {
+        match self.map.entry_sync(key.clone()) {
+            scc::hash_map::Entry::Occupied(mut occ) => {
+                // Finding 17: the validation runs while the bucket's writer
+                // lock is held — the entry's visibility point — so a deposit
+                // whose incarnation moved can never be observed by a reader
+                // (the put-then-revalidate-then-undo shape exposed its undo
+                // window). Invalid over an existing entry REMOVES it: the
+                // key's word moved, so whatever sits there is stale or
+                // about to be purged, and absence is always correctness-safe
+                // for a read cache.
+                if let Some(validate) = validate {
+                    if !validate() {
+                        let (value, _state) = occ.remove();
+                        self.current_bytes.fetch_sub(value.len(), Ordering::Relaxed);
+                        self.entries.fetch_sub(1, Ordering::Relaxed);
+                        return;
+                    }
+                }
+                let (old_val, state) = occ.get_mut();
                 let old = std::mem::replace(old_val, value.clone());
                 state.referenced.store(true, Ordering::Relaxed);
                 if protected {
@@ -179,12 +196,17 @@ impl MemoryCacheShard {
                     state.stream_admitted.store(stream, Ordering::Relaxed);
                 }
                 old_len = Some(old.len());
-            })
-            .or_insert_with(|| {
+            }
+            scc::hash_map::Entry::Vacant(vac) => {
+                if let Some(validate) = validate {
+                    if !validate() {
+                        return;
+                    }
+                }
                 self.eviction_queue.push(key.clone());
                 self.current_bytes.fetch_add(val_len, Ordering::Relaxed);
                 self.entries.fetch_add(1, Ordering::Relaxed);
-                (
+                let _ = vac.insert_entry((
                     value,
                     EntryState {
                         // Plain probationary inserts start with NO second
@@ -199,8 +221,9 @@ impl MemoryCacheShard {
                         served_bytes: AtomicU64::new(0),
                         stream_admitted: AtomicBool::new(stream),
                     },
-                )
-            });
+                ));
+            }
+        }
 
         if let Some(old) = old_len {
             self.current_bytes.fetch_add(val_len, Ordering::Relaxed);
@@ -500,6 +523,24 @@ impl MemoryCache {
         referenced: bool,
         stream: bool,
     ) -> Vec<(Bytes, Bytes, EvictClass)> {
+        self.put_with_class_validated(key, value, protected, referenced, stream, None)
+    }
+
+    /// [`Self::put_with_class`] with the finding-17 ATOMIC insert-time
+    /// validation: `validate` (when present) runs under the entry's bucket
+    /// writer lock immediately before the insert becomes visible; a refusal
+    /// inserts nothing and removes any existing entry under the key (its
+    /// incarnation moved — absence is always correctness-safe for a read
+    /// cache).
+    pub fn put_with_class_validated(
+        &self,
+        key: Bytes,
+        value: Bytes,
+        protected: bool,
+        referenced: bool,
+        stream: bool,
+        validate: Option<&dyn Fn() -> bool>,
+    ) -> Vec<(Bytes, Bytes, EvictClass)> {
         let idx = self.get_shard_idx(&key);
         thread_local! {
             static EVICT_BUF: std::cell::RefCell<Vec<(Bytes, Bytes, EvictClass)>> =
@@ -508,7 +549,15 @@ impl MemoryCache {
         EVICT_BUF.with(|cell| {
             let mut evicted = cell.borrow_mut();
             evicted.clear();
-            self.shards[idx].put(key, value, protected, referenced, stream, &mut evicted);
+            self.shards[idx].put(
+                key,
+                value,
+                protected,
+                referenced,
+                stream,
+                validate,
+                &mut evicted,
+            );
             if evicted.is_empty() {
                 Vec::new()
             } else {

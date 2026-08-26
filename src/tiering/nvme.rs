@@ -497,17 +497,44 @@ impl NvmeShard {
     }
 
     pub fn put(&self, key: Bytes, value: Bytes) -> Vec<(Bytes, Bytes)> {
-        self.put_impl(key, value, true)
+        self.put_impl(key, value, true, None).0
     }
 
     /// [`Self::put`] for callers that discard evictions (the read-cache hot
     /// path): identical placement/eviction/index semantics, but victims are
     /// dropped index-only — no mmap page-in, no memcpy, nothing returned.
     pub fn put_discard_evicted(&self, key: Bytes, value: Bytes) {
-        let _ = self.put_impl(key, value, false);
+        let _ = self.put_impl(key, value, false, None);
     }
 
-    fn put_impl(&self, key: Bytes, value: Bytes, materialize_evicted: bool) -> Vec<(Bytes, Bytes)> {
+    /// [`Self::put_discard_evicted`] with an ATOMIC insert-time validation
+    /// (finding 17): `validate` runs under the shard's write lock
+    /// immediately before the index insert — the entry's visibility point —
+    /// so an entry that would fail validation can never be observed by a
+    /// reader. This is what a put-then-revalidate-then-undo caller cannot
+    /// provide: its undo window is reader-visible. A refused insert drops
+    /// the reservation and zeroes the already-written header magic; any
+    /// prior entry under the key was already unindexed in phase 1, which is
+    /// the remove-on-invalid semantic (absence ⇒ the next reader goes to
+    /// the device — always correctness-safe for a read cache).
+    ///
+    /// Returns whether the entry became visible.
+    pub fn put_discard_evicted_validated(
+        &self,
+        key: Bytes,
+        value: Bytes,
+        validate: &dyn Fn() -> bool,
+    ) -> bool {
+        self.put_impl(key, value, false, Some(validate)).1
+    }
+
+    fn put_impl(
+        &self,
+        key: Bytes,
+        value: Bytes,
+        materialize_evicted: bool,
+        validate: Option<&dyn Fn() -> bool>,
+    ) -> (Vec<(Bytes, Bytes)>, bool) {
         let key_len = key.len();
         let val_len = value.len();
 
@@ -521,7 +548,7 @@ impl NvmeShard {
             let block_size = (val_offset - target_offset) + val_len;
 
             if block_size > inner.capacity {
-                return Vec::new();
+                return (Vec::new(), false);
             }
 
             let mut evicted = Vec::new();
@@ -553,7 +580,7 @@ impl NvmeShard {
                     break;
                 };
                 if bumps == 0 {
-                    return Vec::new();
+                    return (Vec::new(), false);
                 }
                 bumps -= 1;
                 target_offset = (conflict_end + alignment - 1) & !(alignment - 1);
@@ -648,9 +675,35 @@ impl NvmeShard {
             );
         }
 
-        // Phase 2: Insert into tracking map
+        // Phase 2: Insert into tracking map. The index insert is the
+        // entry's VISIBILITY point, so the finding-17 validation runs here,
+        // under the same write lock every remove/purge takes: an insert
+        // whose validation observed the pre-retire word completes before
+        // any post-retire purge can run (the purge parks on this lock), and
+        // one that runs after the retire fails validation — no interleave
+        // exposes a dead incarnation's bytes.
         {
             let mut inner = self.inner.write();
+            if let Some(validate) = validate {
+                if !validate() {
+                    // Refused: zero the header magic while the pending
+                    // reservation still guards the extent (a concurrent
+                    // put cannot have reused it), then drop the
+                    // reservation. No index entry ever existed, so no
+                    // reader can observe the bytes; the zeroed magic
+                    // keeps any scan honest.
+                    unsafe {
+                        std::ptr::write_bytes(mmap_ptr.add(target_offset), 0, 4);
+                        libc::msync(
+                            mmap_ptr.add(target_offset) as *mut libc::c_void,
+                            4,
+                            libc::MS_ASYNC,
+                        );
+                    }
+                    inner.pending.retain(|&(s, _)| s != target_offset);
+                    return (evicted, false);
+                }
+            }
             let meta = BlockMeta {
                 offset: target_offset,
                 len: block_size,
@@ -659,7 +712,7 @@ impl NvmeShard {
             inner.map.insert(key, meta);
         }
 
-        evicted
+        (evicted, true)
     }
 
     /// Admit `key` into the staging segment **without ever destroying live
@@ -1342,6 +1395,23 @@ impl NvmeCache {
     pub fn put_discard_evicted(&self, key: Bytes, value: Bytes) {
         if let Some((dev, shard_idx)) = self.route_put(&key) {
             dev.shards[shard_idx].put_discard_evicted(key, value);
+        }
+    }
+
+    /// [`Self::put_discard_evicted`] with the finding-17 ATOMIC insert-time
+    /// validation (see [`NvmeShard::put_discard_evicted_validated`]).
+    /// Returns whether the entry became visible.
+    pub fn put_discard_evicted_validated(
+        &self,
+        key: Bytes,
+        value: Bytes,
+        validate: &dyn Fn() -> bool,
+    ) -> bool {
+        match self.route_put(&key) {
+            Some((dev, shard_idx)) => {
+                dev.shards[shard_idx].put_discard_evicted_validated(key, value, validate)
+            }
+            None => false,
         }
     }
 

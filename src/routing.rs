@@ -7364,13 +7364,26 @@ impl DataRouter {
                         } else if downloaded_bytes.len() >= 64 * 1024 {
                             METRICS.read_tier_admissions.fetch_add(1, Ordering::Relaxed);
                         }
+                        // Finding 17: every tier deposit below validates AT
+                        // its insert's visibility point (under the tier's
+                        // own insert lock) instead of the retired
+                        // put-then-revalidate-then-undo shape, whose undo
+                        // window was reader-visible — a blocking-pool
+                        // deschedule across a W1 patch deposited the dead
+                        // incarnation's bytes and a post-ACK read served
+                        // them (the data_path_correctness ~5 %/run flake).
+                        let deposit_still = || {
+                            self.backend_router
+                                .fill_incarnation_still(block_key, before)
+                        };
                         if !ghost_admit {
                             // no disk publish
                         } else if downloaded_bytes.len() < 64 * 1024 {
-                            let _ = self
-                                .cache
-                                .nvme
-                                .cache_read_block(block_key, downloaded_bytes.clone());
+                            let _ = self.cache.nvme.cache_read_block_if(
+                                block_key,
+                                downloaded_bytes.clone(),
+                                &deposit_still,
+                            );
                         } else {
                             // **PERF-11 — the tier publish is DEFERRED, not
                             // awaited.** The publish must be tier-visible
@@ -7451,16 +7464,22 @@ impl DataRouter {
                             // ledger-visibility fix) — a hold serve
                             // after this fill's hot copy is evicted is
                             // the pre-lane refetch in serve form.
-                            self.cache.read_lane_hold.insert_demand(
+                            self.cache.read_lane_hold.insert_demand_validated(
                                 block_key,
                                 downloaded_bytes.clone(),
                                 self.read_lane_hold_budget(),
+                                &deposit_still,
                             );
                         }
                         // Avoid flooding RAM LRU with full 4 MiB blocks under
                         // multi-GB sequential reads. Small blocks still cache.
                         if downloaded_bytes.len() <= READ_SIZE_CLASS_BOUNDARY_BYTES {
-                            self.cache.read_lru.put(block_key, downloaded_bytes.clone());
+                            self.cache.read_lru.put_class_validated(
+                                block_key,
+                                downloaded_bytes.clone(),
+                                crate::cache::lru::PutClass::Protected,
+                                Some(&deposit_still),
+                            );
                         } else {
                             // R4 (§5.4): the > 256 KiB population finally
                             // gets a RAM tier — a `Bytes` refcount clone,
@@ -7475,7 +7494,9 @@ impl DataRouter {
                             // fills enter probation (first in eviction
                             // line; any read promotes in place, sticky).
                             METRICS.hot_block_misses.fetch_add(1, Ordering::Relaxed);
-                            if ghost_admit && self.tier_admission == TierAdmission::SecondTouch {
+                            let hot_class = if ghost_admit
+                                && self.tier_admission == TierAdmission::SecondTouch
+                            {
                                 if class.streaming() {
                                     // Governor-granted stream admission:
                                     // protected, MARKED — its within-pass
@@ -7483,13 +7504,9 @@ impl DataRouter {
                                     // put_protected_stream), so the clamp
                                     // keeps seeing beyond-budget stream
                                     // admissions honestly.
-                                    self.cache
-                                        .hot_block
-                                        .put_protected_stream(block_key, downloaded_bytes.clone());
+                                    crate::cache::lru::PutClass::ProtectedStream
                                 } else {
-                                    self.cache
-                                        .hot_block
-                                        .put(block_key, downloaded_bytes.clone());
+                                    crate::cache::lru::PutClass::Protected
                                 }
                             } else if class.streaming() {
                                 // §5.5 pipeline fill: probation class WITH
@@ -7508,15 +7525,16 @@ impl DataRouter {
                                 // sustained bracket: kern seq-1M −9 %,
                                 // fetch ratio 1.19× vs the protected
                                 // baseline's 1.07×).
-                                self.cache.hot_block.put_probationary_referenced(
-                                    block_key,
-                                    downloaded_bytes.clone(),
-                                );
+                                crate::cache::lru::PutClass::ProbationReferenced
                             } else {
-                                self.cache
-                                    .hot_block
-                                    .put_probationary(block_key, downloaded_bytes.clone());
-                            }
+                                crate::cache::lru::PutClass::Probation
+                            };
+                            self.cache.hot_block.put_class_validated(
+                                block_key,
+                                downloaded_bytes.clone(),
+                                hot_class,
+                                Some(&deposit_still),
+                            );
                         }
                         // Seqlock completion (publish-then-revalidate): the
                         // pre-publish check alone is check-then-act — this
@@ -7610,22 +7628,30 @@ impl DataRouter {
                                 return;
                             }
                             // Finding-17 seam: the blocking-pool deschedule
-                            // between the pre-check and the insert.
+                            // between the fast-path pre-check and the
+                            // insert — the convicted window.
                             let mid = TEST_TIER_PUBLISH_MID_WINDOW_STALL_MS
                                 .load(std::sync::atomic::Ordering::Relaxed);
                             if mid > 0 {
                                 std::thread::sleep(Duration::from_millis(mid));
                             }
-                            let _ = nvme_clone.cache_read_block(&bk, dl);
+                            // Finding 17: the insert validates at its own
+                            // visibility point (under the tier's insert
+                            // lock) — a W1 patch landing inside the gap
+                            // above now refuses the deposit instead of
+                            // exposing a dead incarnation's bytes until an
+                            // undo. Post-insert movement is owned by the
+                            // mover's purge (every retire path purges the
+                            // tiers after publish), so no undo leg exists.
+                            let _ = nvme_clone.cache_read_block_if(&bk, dl, &|| {
+                                backend_router.fill_incarnation_still(&bk, before)
+                            });
                             // Finding-17 seam: hold the post-insert state
                             // observable before the guard drops.
                             let post = TEST_TIER_PUBLISH_POST_PUT_STALL_MS
                                 .load(std::sync::atomic::Ordering::Relaxed);
                             if post > 0 {
                                 std::thread::sleep(Duration::from_millis(post));
-                            }
-                            if !backend_router.fill_incarnation_still(&bk, before) {
-                                nvme_clone.remove_cached_read_block(&bk);
                             }
                         });
                         if class == FillClass::Escalation {
@@ -8364,39 +8390,42 @@ impl DataRouter {
             let bk_clone = block_key.to_string();
             let held_clone = held.clone();
             squeezefs_ipc::sqz_blocking::run_blocking(move || {
-                if !backend_router.fill_incarnation_still(&bk_clone, before) {
-                    return;
-                }
-                let _ = nvme_clone.cache_read_block(&bk_clone, held_clone);
-                if !backend_router.fill_incarnation_still(&bk_clone, before) {
-                    nvme_clone.remove_cached_read_block(&bk_clone);
-                }
+                // Finding 17: validated at the insert's visibility point
+                // (see the fill path's deferred publish) — the former
+                // put-then-undo shape exposed its undo window to readers.
+                let _ = nvme_clone.cache_read_block_if(&bk_clone, held_clone, &|| {
+                    backend_router.fill_incarnation_still(&bk_clone, before)
+                });
             })
             .await;
         }
         // Hot landing — the pre-lane refetch's warmth propagation
         // (class ladder identical to the fill path's > 256 KiB arm).
+        // Finding 17: validated at the insert's visibility point.
         METRICS.hot_block_misses.fetch_add(1, Ordering::Relaxed);
-        if ghost_admit && self.tier_admission == TierAdmission::SecondTouch {
+        let deposit_still = || {
+            self.backend_router
+                .fill_incarnation_still(block_key, before)
+        };
+        let hot_class = if ghost_admit && self.tier_admission == TierAdmission::SecondTouch {
             if class.streaming() {
-                self.cache
-                    .hot_block
-                    .put_protected_stream(block_key, held.clone());
+                crate::cache::lru::PutClass::ProtectedStream
             } else {
-                self.cache.hot_block.put(block_key, held.clone());
+                crate::cache::lru::PutClass::Protected
             }
         } else if class.streaming() {
-            self.cache
-                .hot_block
-                .put_probationary_referenced(block_key, held.clone());
+            crate::cache::lru::PutClass::ProbationReferenced
         } else {
-            self.cache
-                .hot_block
-                .put_probationary(block_key, held.clone());
-        }
-        // Seqlock completion (publish-then-revalidate): undo across
-        // every tier on movement — the unified purge, exactly the fill
-        // path's rule.
+            crate::cache::lru::PutClass::Probation
+        };
+        self.cache.hot_block.put_class_validated(
+            block_key,
+            held.clone(),
+            hot_class,
+            Some(&deposit_still),
+        );
+        // Seqlock completion: undo across every tier on movement — the
+        // unified purge, exactly the fill path's failure-path rule.
         if !self
             .backend_router
             .fill_incarnation_still(block_key, before)
@@ -8859,11 +8888,16 @@ impl DataRouter {
         {
             // Deposit inside the publishable window; Red pauses new
             // deposits (the R5 posture — in-flight/hold converge).
+            // Finding 17: validated at the insert's visibility point.
             if crate::mem_budget::level() != crate::mem_budget::Level::Red {
-                self.cache.read_lane_hold.insert(
+                self.cache.read_lane_hold.insert_validated(
                     block_key,
                     downloaded.clone(),
                     self.read_lane_hold_budget(),
+                    &|| {
+                        self.backend_router
+                            .fill_incarnation_still(block_key, before)
+                    },
                 );
             }
             // Publish-then-revalidate (the seqlock completion rule):

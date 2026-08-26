@@ -17,7 +17,11 @@ pub fn shard_count_from(cores: usize) -> usize {
 
 /// Insert flavor: the (protected, referenced) bit pairs the clock shard
 /// distinguishes (§5.4/§5.5).
-enum PutClass {
+/// The insert class every [`LruCache`] put names (pub since finding 17 so
+/// the validated fill deposits can pass their class through ONE entry
+/// point instead of four validated wrappers).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PutClass {
     /// referenced=true, protected=true — keep-worthy by definition.
     Protected,
     /// referenced=true, protected=true, stream-admitted marker set (the
@@ -253,22 +257,11 @@ impl LruCache {
 
     /// Insert as PROBATION (R4 §5.4): first in eviction line, promoted in
     /// place (sticky) by any `get`. Streaming/one-pass fills use this so a
-    /// scan cannot displace protected warmth.
+    /// scan cannot displace protected warmth. (The other insert classes
+    /// ride [`Self::put_class_validated`] — every fill deposit carries the
+    /// finding-17 validation, so the bare class wrappers retired.)
     pub fn put_probationary(&self, key: &str, data: Bytes) {
         self.put_with(key, data, PutClass::Probation);
-    }
-
-    /// Probation class WITH the one-lap clock grace (§5.5 pipeline fills):
-    /// clock parity with consumed stream residue — see
-    /// [`crate::tiering::memory::MemoryCache::put_probationary_referenced`].
-    pub fn put_probationary_referenced(&self, key: &str, data: Bytes) {
-        self.put_with(key, data, PutClass::ProbationReferenced);
-    }
-
-    /// [`crate::tiering::memory::MemoryCache::put_protected_stream`] —
-    /// the transient stream window's GRANTED arm (2026-07-29).
-    pub fn put_protected_stream(&self, key: &str, data: Bytes) {
-        self.put_with(key, data, PutClass::ProtectedStream);
     }
 
     /// R5 Red clamp (§5.7): force-evict toward `target` bytes. Victims are
@@ -292,6 +285,23 @@ impl LruCache {
     }
 
     fn put_with(&self, key: &str, data: Bytes, class: PutClass) {
+        self.put_class_validated(key, data, class, None)
+    }
+
+    /// Class-named put with the finding-17 ATOMIC insert-time validation:
+    /// `validate` (when present) runs under the entry's bucket writer lock
+    /// immediately before the insert becomes visible — the only ordering
+    /// that keeps a fill deposit from exposing a dead incarnation's bytes
+    /// (the put-then-revalidate-then-undo shape's undo window is
+    /// reader-visible). A refusal inserts nothing and removes any existing
+    /// entry under the key.
+    pub fn put_class_validated(
+        &self,
+        key: &str,
+        data: Bytes,
+        class: PutClass,
+        validate: Option<&dyn Fn() -> bool>,
+    ) {
         if (data.len() as u64) <= self.max_bytes {
             // R5 Yellow+ (§5.7 "stop growth: hot-tier inserts evict-first"):
             // net-zero growth — after the insert, clamp back to the
@@ -302,14 +312,15 @@ impl LruCache {
                 None
             };
             let key_bytes = Bytes::copy_from_slice(key.as_bytes());
-            let mut evicted = match class {
-                PutClass::Protected => self.inner.put(key_bytes, data),
-                PutClass::ProtectedStream => self.inner.put_protected_stream(key_bytes, data),
-                PutClass::Probation => self.inner.put_probationary(key_bytes, data),
-                PutClass::ProbationReferenced => {
-                    self.inner.put_probationary_referenced(key_bytes, data)
-                }
+            let (protected, referenced, stream) = match class {
+                PutClass::Protected => (true, true, false),
+                PutClass::ProtectedStream => (true, true, true),
+                PutClass::Probation => (false, false, false),
+                PutClass::ProbationReferenced => (false, true, false),
             };
+            let mut evicted = self
+                .inner
+                .put_with_class_validated(key_bytes, data, protected, referenced, stream, validate);
             if let Some(pre) = freeze_at {
                 evicted.extend(self.inner.shed_to(pre as usize));
             }

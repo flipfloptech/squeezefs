@@ -2217,6 +2217,34 @@ impl NvmeStaging {
         Ok(())
     }
 
+    /// [`Self::cache_read_block`] with the finding-17 ATOMIC insert-time
+    /// validation: `validate` runs under the target shard's write lock
+    /// immediately before the entry becomes index-visible, so a deposit
+    /// whose incarnation moved can never be observed by a reader — the
+    /// put-then-revalidate-then-undo shape this replaces exposed its undo
+    /// window (the data_path_correctness ~5 %/run stale-serve flake).
+    /// Returns whether the entry is published; a refusal is a plain cache
+    /// miss for the next reader.
+    pub fn cache_read_block_if(
+        &self,
+        block_key: &str,
+        data: Bytes,
+        validate: &dyn Fn() -> bool,
+    ) -> bool {
+        if self.staging_dirs.is_empty() {
+            return false;
+        }
+        if crate::mem_budget::tier_publish_paused() {
+            crate::fuse_client::METRICS
+                .read_tier_publishes_paused
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
+        let key_bytes = Bytes::copy_from_slice(block_key.as_bytes());
+        self.read_nvme_cache
+            .put_discard_evicted_validated(key_bytes, data, validate)
+    }
+
     /// INCARNATION-VALIDATED read-cache publish — the only legal route for
     /// non-owner publishes (RAM-LRU dehydration). Their
     /// payloads can be arbitrarily stale (an evicted entry parked in the
@@ -2224,11 +2252,13 @@ impl NvmeStaging {
     /// `cache_read_block` could stick a DEAD incarnation's bytes under a
     /// freed-and-reallocated key — served for the key's next owner (the
     /// generic/074 fstest.3 stale-fill family). Same discipline as the
-    /// routing validated fill: snapshot the key's incarnation, publish only
-    /// while it is stable, and undo if it moved across the put. Untracked
-    /// legacy keys (never freed/reallocated) are vacuously valid.
+    /// routing validated fill: snapshot the key's incarnation and publish
+    /// through the ATOMIC insert-time validation (finding 17 — the former
+    /// publish-then-undo shape exposed its undo window to readers).
+    /// Untracked legacy keys (never freed/reallocated) are vacuously
+    /// valid.
     ///
-    /// Returns whether the entry is (still) published.
+    /// Returns whether the entry is published.
     pub fn cache_read_block_validated(
         &self,
         block_key: &str,
@@ -2242,14 +2272,9 @@ impl NvmeStaging {
             // Unstable (mid-write or retired): never publish.
             return false;
         };
-        if self.cache_read_block(block_key, data).is_err() {
-            return false;
-        }
-        if !backend_router.fill_incarnation_still(block_key, before) {
-            self.remove_cached_read_block(block_key);
-            return false;
-        }
-        true
+        self.cache_read_block_if(block_key, data, &|| {
+            backend_router.fill_incarnation_still(block_key, before)
+        })
     }
 
     /// [`Self::cache_read_block_validated`] against this staging's own wired

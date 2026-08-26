@@ -334,7 +334,21 @@ impl ReadLaneHold {
     /// `read_lane_hold_evicted_unconsumed` (the lane's refetch-spiral
     /// detector).
     pub fn insert(&self, block_key: &str, bytes: Bytes, budget: u64) {
-        self.insert_class(block_key, bytes, budget, false);
+        self.insert_class(block_key, bytes, budget, false, None);
+    }
+
+    /// [`Self::insert`] with the finding-17 ATOMIC insert-time validation:
+    /// `validate` runs under the entry's bucket writer lock immediately
+    /// before the insert becomes visible (the put-then-revalidate-then-undo
+    /// shape's undo window is reader-visible). A refusal inserts nothing.
+    pub fn insert_validated(
+        &self,
+        block_key: &str,
+        bytes: Bytes,
+        budget: u64,
+        validate: &dyn Fn() -> bool,
+    ) {
+        self.insert_class(block_key, bytes, budget, false, Some(validate));
     }
 
     /// [`Self::insert`] with DEMAND provenance: serves of this entry
@@ -345,28 +359,52 @@ impl ReadLaneHold {
     /// next reader goes to the device — the GhostTable's racy-tolerant
     /// class).
     pub fn insert_demand(&self, block_key: &str, bytes: Bytes, budget: u64) {
-        self.insert_class(block_key, bytes, budget, true);
+        self.insert_class(block_key, bytes, budget, true, None);
     }
 
-    fn insert_class(&self, block_key: &str, bytes: Bytes, budget: u64, ledger_visible: bool) {
+    /// [`Self::insert_demand`] with the finding-17 validation (see
+    /// [`Self::insert_validated`]).
+    pub fn insert_demand_validated(
+        &self,
+        block_key: &str,
+        bytes: Bytes,
+        budget: u64,
+        validate: &dyn Fn() -> bool,
+    ) {
+        self.insert_class(block_key, bytes, budget, true, Some(validate));
+    }
+
+    fn insert_class(
+        &self,
+        block_key: &str,
+        bytes: Bytes,
+        budget: u64,
+        ledger_visible: bool,
+        validate: Option<&dyn Fn() -> bool>,
+    ) {
         let len = bytes.len() as u64;
         if len == 0 || budget == 0 {
             return;
         }
         let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
-        if self
-            .entries
-            .insert_sync(
-                block_key.to_string(),
-                HoldEntry {
+        let inserted = match self.entries.entry_sync(block_key.to_string()) {
+            scc::hash_map::Entry::Occupied(_) => false,
+            scc::hash_map::Entry::Vacant(vac) => {
+                // Finding 17: validate at the visibility point, under the
+                // bucket's writer lock (see `LruCache::put_class_validated`).
+                if validate.is_some_and(|v| !v()) {
+                    return;
+                }
+                let _ = vac.insert_entry(HoldEntry {
                     bytes,
                     served: AtomicU64::new(0),
                     seq,
                     ledger_visible,
-                },
-            )
-            .is_ok()
-        {
+                });
+                true
+            }
+        };
+        if inserted {
             self.bytes.fetch_add(len, Ordering::Relaxed);
             self.live.fetch_add(1, Ordering::Relaxed);
             self.fifo.push((seq, block_key.to_string()));

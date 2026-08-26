@@ -95,7 +95,9 @@ use squeezefs::meta_backend::kv::superblock as sb;
 use squeezefs::meta_backend::RoutedMetaBackend;
 use squeezefs::meta_ship::{self as ship, publish, OwnerMap, PeerOwner};
 use squeezefs::nvme_dev::{self, NvmeBlockDev};
-use squeezefs::routing::{BackendRouter, DataRouter};
+use squeezefs::routing::{
+    BackendRouter, CachedMetadata, DataRouter, LAYOUT_DELTA_CHAIN_INELIGIBLE,
+};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -3088,4 +3090,372 @@ async fn the_harvest_reply_carries_the_authoritys_bound_age() {
         hint >= 10_000,
         "the reply's hint is the authority's live bound age (got {hint})"
     );
+}
+
+// ===========================================================================
+// 9. Finding 23 — the indirect-map blob's free has ONE owner
+// ===========================================================================
+//
+// The PR 5 attempt-4 row (`.benchmarks/2026-08-25-s11-freeloop-stall.md`
+// finding 23): on a RANGE-SHARED ino the owner's scoped compose
+// (`custody_scoped_layout`) recomputes blob custody on every served Put —
+// it re-spills to a fresh blob and frees the DURABLE predecessor itself
+// (`free_after_commit`), dropping the caller's blob frame ops. A co-writer
+// whose cache was invalidated (the release/served-layout hooks) REFETCHES
+// that owner-composed head, and its next save's `old_indirect_to_free`
+// then claims the OWNER's blob as its own lifecycle — one shipped free per
+// co-writer per compose (the live row: 3–9 refusal bursts per offset, 325
+// `block_untracked_free_refusals`), and once the offset is REALLOCATED the
+// executor's RAM-tracked arm frees the LIVE successor lifetime (192
+// `read_settle_lost_serialized` tripwires on block 547, fsync EIO, a
+// 112 MiB aggregate-size loss). Two halves under contract:
+//
+// * the MINT: a range-shared save frees only blobs THIS mount minted —
+//   a refetched head's blob is the owner's lifecycle (leak-safe skip);
+// * the SHIELD: the shipped-free executor refuses a tracked free whose
+//   every RAM reference the durable ledger still justifies (population ≥
+//   refcount ⇒ the shipper names a DEAD lifetime of a reallocated offset).
+
+/// A `DataRouter` over one side's existing data plane — the save-funnel
+/// drive (`persist_dirty_layout_if_needed` is the pub entry every layout
+/// persist funnels through). The caller keeps the `DlmClient` clone: the
+/// save's fencing gate compares against ITS reading, so the tests present
+/// `dlm.get_fencing_token_ino(ino)` rather than a guessed 0 (the durable
+/// term composes into the floor once any set in the process claimed D0).
+async fn save_router(
+    dlm: &DlmClient,
+    alloc: &Arc<BlockAllocator>,
+    dev: &Path,
+    meta: &Arc<RoutedMetaBackend>,
+    stage: &Path,
+) -> DataRouter {
+    let dlm = dlm.clone();
+    let nvme = Arc::new(NvmeBlockDev::new(dev.to_str().unwrap()));
+    let cache = TieredCache::new(
+        vec![stage.to_path_buf()],
+        Some("64MB"),
+        Some("64MB"),
+        Some("16MB"),
+        Some("16MB"),
+        Arc::clone(alloc),
+        Arc::clone(&nvme),
+        None,
+    )
+    .await
+    .expect("tiered cache");
+    let router = DataRouter::new(dlm, cache, Arc::clone(alloc), nvme);
+    router.set_meta_backend(Arc::clone(meta));
+    router
+}
+
+/// A dirty cached striped head naming `blob_key` as its indirect map —
+/// the shape a co-writer's cache holds after a durable REFETCH (chain
+/// ineligible: indirect provenance).
+fn refetched_indirect_entry(size: u64, data_key: &str, blob_key: &str) -> CachedMetadata {
+    let mut map = std::collections::HashMap::new();
+    map.insert(0u32, data_key.to_string());
+    CachedMetadata {
+        file_type: "striped".into(),
+        size,
+        block_map_id: Some(std::sync::Arc::from(
+            format!("indirect:{blob_key}").as_str(),
+        )),
+        block_map: Some(std::sync::Arc::new(map)),
+        layout_dirty: true,
+        layout_delta_chain: LAYOUT_DELTA_CHAIN_INELIGIBLE,
+        ..Default::default()
+    }
+}
+
+/// Contract (finding 23, the MINT): a range-shared co-writer save whose
+/// cached indirect head was REFETCHED from the durable base ships **no
+/// free** for that blob — its lifecycle (ledger release + device free)
+/// belongs to the owner's compose. RED against dev: the save's
+/// `old_indirect_to_free` tail ships exactly the duplicate free the live
+/// row stormed on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_range_shared_saves_refetched_blob_free_never_ships() {
+    let _serial = serial();
+    let _restore = restore();
+    squeezefs::meta_ship::tokens::test_clear_range_cache();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "f23-mint").await;
+    let dev = data_device(dir.path(), "f23-mint.dev");
+    let auth = Authority::start(&vol, &dev, &[NODE_A]).await;
+
+    // The durable truth: a file whose data block AND map blob the
+    // AUTHORITY minted and tracks — exactly what a co-writer's refetch
+    // of the owner-composed head observes.
+    let data_off = auth.alloc.allocate_block().await.expect("data block");
+    let data_idx = data_off / auth.alloc.chunk_size();
+    let ino = authority_file_with_block(&auth, "shared.bin", data_idx).await;
+    let blob_off = auth.alloc.allocate_block().await.expect("map blob");
+    let blob_idx = blob_off / auth.alloc.chunk_size();
+    auth.meta
+        .commit_block_refs(
+            ino,
+            &[BlockRefOp::taken(BlockRef {
+                vol_tag: volume_tag(DATA_VOL),
+                block_idx: blob_idx,
+                owner_ino: ino,
+                block_index: squeezefs::meta_backend::kv::block_refs::BLOCK_INDEX_MAP_BLOB,
+            })],
+        )
+        .await
+        .expect("the durable MAP_BLOB record commits");
+
+    let cwr = CoWriter::join(&auth, &vol, &dev, NODE_A).await;
+    let stage = tempdir().unwrap();
+    let dlm = DlmClient::new().expect("dlm");
+    let router = save_router(&dlm, &cwr.alloc, &dev, &cwr.meta, stage.path()).await;
+
+    // The ino is RANGE-SHARED on this mount (rung 15's client cache is
+    // the co-writer-side discriminator), and the cached head is the
+    // REFETCHED durable base.
+    squeezefs::meta_ship::tokens::record_range_grant(ino, (0, 4 * 1024 * 1024), 9001);
+    router.metadata_cache.insert(
+        ino,
+        refetched_indirect_entry(
+            4 * 1024 * 1024,
+            &data_off.to_string(),
+            &blob_off.to_string(),
+        ),
+    );
+
+    let shipped_before = publish::stats().free_shipped_blocks;
+    let tok = dlm.get_fencing_token_ino(ino);
+    router
+        .persist_dirty_layout_if_needed(&format!("inode_{ino}"), tok)
+        .await
+        .expect("the save lands (the Put ships to the authority)");
+    assert_eq!(
+        publish::stats().free_shipped_blocks - shipped_before,
+        0,
+        "the refetched blob's free never ships — the owner's compose owns that \
+         lifecycle (finding 23's mint: one shipped free per co-writer per compose)"
+    );
+    assert_eq!(
+        auth.alloc.refcount(blob_off),
+        Some(1),
+        "the authority still tracks its own blob — nobody freed a lifetime they \
+         do not own"
+    );
+
+    squeezefs::meta_ship::tokens::test_clear_range_cache();
+    drop(cwr);
+    auth.stop().await;
+}
+
+/// Contract (finding 23's posture scope, pinned green): a SOLO writer's
+/// save keeps freeing the refetched blob LOCALLY — on a single-writer
+/// mount every durable blob is this mount's own lifecycle, and the gate
+/// must not turn the collapse arm into a leak.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_solo_writers_refetched_blob_free_stays_local() {
+    let _serial = serial();
+    let _restore = restore();
+    squeezefs::meta_ship::tokens::test_clear_range_cache();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "f23-solo").await;
+    let dev = data_device(dir.path(), "f23-solo.dev");
+    fuse_client::set_mount_posture(MountPosture::Writer);
+    let meta = squeezefs::meta_backend::open_routed_meta_set(&[vol.display().to_string()])
+        .await
+        .expect("the solo writer mounts");
+    let (alloc, _br) = data_plane(&dev).await;
+    let stage = tempdir().unwrap();
+    let dlm = DlmClient::new().expect("dlm");
+    let router = save_router(&dlm, &alloc, &dev, &meta, stage.path()).await;
+
+    let ino = meta
+        .create_with_rdev_size(1, "solo.bin", 0o100644, 0, 0, 0, 0)
+        .await
+        .expect("create")
+        .ino;
+    let data_off = alloc.allocate_block().await.expect("data block");
+    let blob_off = alloc.allocate_block().await.expect("map blob");
+    let blob_idx = blob_off / alloc.chunk_size();
+    router.metadata_cache.insert(
+        ino,
+        refetched_indirect_entry(
+            4 * 1024 * 1024,
+            &data_off.to_string(),
+            &blob_off.to_string(),
+        ),
+    );
+
+    let shipped_before = publish::stats().free_shipped_blocks;
+    let tok = dlm.get_fencing_token_ino(ino);
+    router
+        .persist_dirty_layout_if_needed(&format!("inode_{ino}"), tok)
+        .await
+        .expect("the solo save lands");
+    assert_eq!(
+        publish::stats().free_shipped_blocks - shipped_before,
+        0,
+        "a solo save ships nothing"
+    );
+    router.backend_router.reclaim_drain().await;
+    assert!(
+        alloc.free_block_indices().contains(&blob_idx),
+        "the displaced blob re-entered the free supply locally — the solo \
+         collapse arm is byte-identical to the shipped shape"
+    );
+    for v in &meta.volumes {
+        v.shutdown().await.expect("clean unmount");
+    }
+}
+
+/// Contract (finding 23, the SHIELD): a shipped free naming an offset
+/// whose every RAM reference the durable ledger still JUSTIFIES is the
+/// stale-duplicate lineage — the offset was freed and REALLOCATED, and
+/// the verb names the dead lifetime. The executor refuses; the live
+/// successor's block, refcount and durable reference are untouched. RED
+/// against dev: the RAM-tracked arm frees the live block (the row's 192
+/// `read_settle_lost_serialized` tripwires and the fsync EIO wedge).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shipped_free_the_durable_ledger_still_justifies_is_refused() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "f23-shield").await;
+    let dev = data_device(dir.path(), "f23-shield.dev");
+    let auth = Authority::start(&vol, &dev, &[NODE_A]).await;
+
+    let old_off = auth.alloc.allocate_block().await.expect("mint");
+    let old_idx = old_off / auth.alloc.chunk_size();
+    let ino = authority_file_with_block(&auth, "victim.bin", old_idx).await;
+
+    // A legitimate displaced free: the co-writer's rewrite releases the
+    // reference on the publish, then ships the free — Freed, and the
+    // offset returns to the supply.
+    let cwr = CoWriter::join(&auth, &vol, &dev, NODE_A).await;
+    let _new_idx = cwr.rewrite_block(ino, 0, old_idx).await;
+    cwr.br
+        .free_block(&old_off.to_string())
+        .await
+        .expect("the displaced free ships");
+    auth.br.reclaim_drain().await;
+    assert!(auth.free_listed(old_idx), "the first free executed");
+
+    // The offset is REALLOCATED: a new lifetime, tracked in RAM and
+    // durably referenced by a new file.
+    let reused = auth.alloc.allocate_block().await.expect("reallocate");
+    assert_eq!(reused, old_off, "free-list-first hands the offset back");
+    let ino2 = authority_file_with_block(&auth, "reborn.bin", old_idx).await;
+    assert_eq!(auth.population(old_idx).await, 1);
+    assert_eq!(auth.alloc.refcount(old_off), Some(1));
+
+    // The stale duplicate (the cross-mount shape: a DIFFERENT request id,
+    // same epoch — the dedup window cannot absorb it).
+    let verdicts = publish::ship_free_blocks(
+        &auth.endpoint,
+        volume_tag(DATA_VOL),
+        vec![old_idx],
+        cwr.client.lease_epoch(),
+        0xF23_0001,
+    )
+    .await
+    .expect("the verb travels");
+    assert_eq!(
+        verdicts,
+        vec![publish::FreeVerdict::Refused],
+        "a free the durable ledger still justifies is REFUSED — the shipper \
+         names a dead lifetime of a reallocated offset"
+    );
+    assert_eq!(
+        auth.alloc.refcount(old_off),
+        Some(1),
+        "the live successor's RAM reference is untouched"
+    );
+    assert_eq!(
+        auth.population(old_idx).await,
+        1,
+        "the live successor's durable reference is untouched (ino {ino2})"
+    );
+    auth.br.reclaim_drain().await;
+    assert!(
+        !auth.free_listed(old_idx),
+        "the live successor's block never re-entered the free list"
+    );
+
+    drop(cwr);
+    auth.stop().await;
+}
+
+/// Contract (finding 23's leak direction, pinned green): a range-shared
+/// co-writer save still frees the blob it MINTED ITSELF — the shipper's
+/// own predecessor is the bounded one-blob residue the design assigns to
+/// its `old_indirect_to_free` tail, and the provenance gate must not
+/// widen into a per-save leak.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_range_shared_save_still_frees_its_own_minted_blob() {
+    let _serial = serial();
+    let _restore = restore();
+    squeezefs::meta_ship::tokens::test_clear_range_cache();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "f23-own").await;
+    let dev = data_device(dir.path(), "f23-own.dev");
+    let auth = Authority::start(&vol, &dev, &[NODE_A]).await;
+    let ino = authority_file_with_block(&auth, "own.bin", 0).await;
+
+    let cwr = CoWriter::join(&auth, &vol, &dev, NODE_A).await;
+    let stage = tempdir().unwrap();
+    let dlm = DlmClient::new().expect("dlm");
+    let router = save_router(&dlm, &cwr.alloc, &dev, &cwr.meta, stage.path()).await;
+    squeezefs::meta_ship::tokens::record_range_grant(ino, (0, 4 * 1024 * 1024), 9002);
+
+    // Save 1: a map past the inline ceiling (64 KiB nodes ⇒ ~16 KiB cap)
+    // MINTS this mount's own blob.
+    let mut big = std::collections::HashMap::new();
+    for i in 0..900u32 {
+        big.insert(i, format!("be://data:k{i:05}"));
+    }
+    let entry = CachedMetadata {
+        file_type: "striped".into(),
+        size: 4 * 1024 * 1024,
+        block_map: Some(std::sync::Arc::new(big)),
+        layout_dirty: true,
+        layout_delta_chain: LAYOUT_DELTA_CHAIN_INELIGIBLE,
+        ..Default::default()
+    };
+    router.metadata_cache.insert(ino, entry);
+    let tok = dlm.get_fencing_token_ino(ino);
+    router
+        .persist_dirty_layout_if_needed(&format!("inode_{ino}"), tok)
+        .await
+        .expect("the over-cap save mints and ships");
+    let minted = router
+        .metadata_cache
+        .get(&ino)
+        .and_then(|m| m.block_map_id.clone())
+        .expect("save 1 republished an indirect head");
+    assert!(minted.starts_with("indirect:"), "{minted}");
+
+    // Save 2: the map collapses back inline — the displaced blob is THIS
+    // mount's own mint, and its free SHIPS (the leak direction stays
+    // closed).
+    let mut m2 = router.metadata_cache.get(&ino).expect("cached");
+    let mut small = std::collections::HashMap::new();
+    small.insert(0u32, "be://data:k00000".to_string());
+    m2.block_map = Some(std::sync::Arc::new(small));
+    m2.layout_dirty = true;
+    router.metadata_cache.insert(ino, m2);
+
+    let shipped_before = publish::stats().free_shipped_blocks;
+    let tok = dlm.get_fencing_token_ino(ino);
+    router
+        .persist_dirty_layout_if_needed(&format!("inode_{ino}"), tok)
+        .await
+        .expect("the collapse save lands");
+    assert_eq!(
+        publish::stats().free_shipped_blocks - shipped_before,
+        1,
+        "the own-minted predecessor's free ships — bounded one-blob residue, \
+         never a per-save leak"
+    );
+
+    squeezefs::meta_ship::tokens::test_clear_range_cache();
+    drop(cwr);
+    auth.stop().await;
 }

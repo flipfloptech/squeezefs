@@ -5647,6 +5647,15 @@ pub struct Metrics {
     /// construction (the `indirect_map_io` hook installs only at
     /// multi-writer arm; unarmed the sites keep the rung-19 refusal).
     pub publish_blob_composes: Align64<AtomicU64>,
+    /// Finding 21 (`.benchmarks/2026-08-25-s11-freeloop-stall.md`): the
+    /// NON-rehydrated scoped compose whose result crossed the value cap
+    /// and SPILLED to a fresh CoW blob — both inputs individually
+    /// respected the cap, the composition did not (32 scoped writers of
+    /// one shared file), and pre-fix the verbatim inline encode was a
+    /// permanent fsync failure (the KV refused it, the never-lossy retry
+    /// recomposed the same over-cap value for ever). Distinct from
+    /// `publish_blob_composes` on purpose: no rehydration happens here.
+    pub publish_compose_spills: Align64<AtomicU64>,
     // Terminal-free device reclaim economy (the shim-write-amplification
     // fix — `.benchmarks/2026-07-27-shim-write-amplification.md`;
     // classification `routing::free_reclaim_op`, contract
@@ -9881,6 +9890,7 @@ impl SqueezefsFilesystem {
                 "layout_indirect_map_reads": METRICS.layout_indirect_map_reads.load(Ordering::Relaxed),
                 "layout_indirect_map_read_bytes": METRICS.layout_indirect_map_read_bytes.load(Ordering::Relaxed),
                 "publish_blob_composes": METRICS.publish_blob_composes.load(Ordering::Relaxed),
+                "publish_compose_spills": METRICS.publish_compose_spills.load(Ordering::Relaxed),
                 "layout_delta_commits": crate::meta_backend::kv::META_KV_LAYOUT_DELTA_COMMITS.load(Ordering::Relaxed),
                 "layout_full_commits": crate::meta_backend::kv::META_KV_LAYOUT_FULL_COMMITS.load(Ordering::Relaxed),
                 "layout_delta_bytes": crate::meta_backend::kv::META_KV_LAYOUT_DELTA_BYTES.load(Ordering::Relaxed),

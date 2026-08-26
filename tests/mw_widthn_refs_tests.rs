@@ -1630,6 +1630,187 @@ async fn an_armed_chained_merge_crossing_the_inline_cap_composes_to_indirect() {
     }
 }
 
+/// Contract (finding 21 — PR 5 acceptance attempt 2's A1 killer,
+/// `.benchmarks/2026-08-25-s11-freeloop-stall.md`): a range holder's
+/// SCOPED PUT over an INLINE head whose COMPOSED map crosses the value
+/// cap SPILLS to a fresh CoW blob exactly like the rehydrated and
+/// chained-merge arms — never the verbatim inline encode whose Put the
+/// KV refuses ("record value length 66,109 exceeds the per-volume cap
+/// 65,792"). Pre-fix the non-rehydrated compose tail had NO spill arm:
+/// both inputs individually respected the cap, the COMPOSITION did not,
+/// and the ack-early publish's never-lossy retry recomposed the same
+/// over-cap value forever — a permanent fsync failure (errno 7 latched,
+/// ior abort at 32-rank block-cyclic scale, where every co-writer's
+/// scoped Put composes with 31 peers' entries).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_armed_scoped_put_crossing_the_inline_cap_composes_to_indirect() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let (owner_be, _p) = sandbox_sized(dir.path(), "own-scross", true, 64 * 1024).await;
+    let (client_be, _p2) = sandbox_sized(dir.path(), "cli-scross", false, 64 * 1024).await;
+    let auth = start_authority(Arc::clone(&owner_be), "widthn-authority-scross");
+    let (client, pc) = arm_client(&auth, &client_be).await;
+    install_test_resolver();
+    let io = install_test_map_io();
+    let epoch = client.lease_epoch();
+    let ino = shipped_create(&client_be, "scross.bin").await;
+
+    // Size the base so IT respects the cap while base + the holder's one
+    // long-keyed entry crosses it — the composition-over-cap shape (every
+    // input under cap, the composed result over it). Derived from the
+    // volume's own cap, never a constant. The base stays INSIDE the
+    // authority's 16-block geometry (blocks 1..=15 with growing key
+    // lengths), so the scope preserves every peer entry.
+    let kv_cap = owner_be.volumes[0].xattr_value_cap();
+    let new_key = format!("be://data:{}", "N".repeat(512));
+    let size = 16 * BLOCK;
+    let base_at = |key_len: usize| -> Vec<(u32, String)> {
+        (1..=15u32)
+            .map(|b| (b, format!("be://data:{b:02}{}", "K".repeat(key_len))))
+            .collect()
+    };
+    let mut key_len = 16;
+    let base = loop {
+        let base = base_at(key_len);
+        let mut composed = base.clone();
+        composed.push((0, new_key.clone()));
+        if base_layout_bytes_owned(size, &composed).len() > kv_cap {
+            break base;
+        }
+        // 15 entries × 16 B/step = 240 B per iteration — strictly less
+        // than the holder entry's ~530 B, so at the first crossing the
+        // BASE is still under the cap by construction (asserted below).
+        key_len += 16;
+    };
+    assert!(
+        base_layout_bytes_owned(size, &base).len() <= kv_cap,
+        "precondition: the base head respects the cap"
+    );
+    {
+        let mut composed = base.clone();
+        composed.push((0, new_key.clone()));
+        assert!(
+            base_layout_bytes_owned(size, &composed).len() > kv_cap,
+            "precondition: the COMPOSED map crosses the cap ({kv_cap} B)"
+        );
+    }
+
+    // The pre-custody verbatim plant: the base head + its takes.
+    let base_refs: Vec<publish::WireBlockRefOp> = base
+        .iter()
+        .map(|(b, k)| frame_op(k, ino, *b, true))
+        .collect();
+    let reply = pc
+        .ship(
+            &auth.endpoint,
+            publish::PublishCall::SetLayoutAndSize {
+                ino,
+                layout: base_layout_bytes_owned(size, &base),
+                size,
+                refs: base_refs,
+                lease_epoch: epoch,
+                request_id: 0xC1,
+            },
+        )
+        .await
+        .expect("the inline base head lands (pre-custody verbatim)");
+    assert!(matches!(reply, publish::PublishReply::Unit), "{reply:?}");
+
+    // The holder's custody: block 0 only. Its scoped Put composes with
+    // every peer entry the head holds — past the cap.
+    let _g = client
+        .acquire_range(ino, (0, BLOCK), (0, BLOCK), Duration::from_secs(1))
+        .await
+        .expect("block 0 range custody");
+    let composes0 = squeezefs::fuse_client::METRICS
+        .publish_blob_composes
+        .load(Ordering::Relaxed);
+    let reply = pc
+        .ship(
+            &auth.endpoint,
+            publish::PublishCall::SetLayoutAndSize {
+                ino,
+                layout: base_layout_bytes(size, &[(0, new_key.as_str())]),
+                size,
+                refs: vec![frame_op(&new_key, ino, 0, true)],
+                lease_epoch: epoch,
+                request_id: 0xC2,
+            },
+        )
+        .await
+        .expect(
+            "finding 21: the scoped Put whose COMPOSITION crosses the cap must SPILL to a \
+             fresh CoW blob — the verbatim inline encode is the permanent-fsync-failure \
+             class (the KV refuses it, the retry recomposes it, for ever)",
+        );
+    assert!(matches!(reply, publish::PublishReply::Unit), "{reply:?}");
+
+    // The durable head names the fresh blob; the blob holds the FULL
+    // composed map (the holder's entry + every peer entry).
+    let head = raw_head(&owner_be, ino).await;
+    assert_eq!(
+        head.block_map_id.as_deref(),
+        Some("indirect:be://data:fresh-1"),
+        "the composed head crossed to INDIRECT"
+    );
+    assert!(
+        head.block_map.is_none(),
+        "no inline map on an indirect head"
+    );
+    let mut want_map: Vec<(u32, String)> = base.clone();
+    want_map.push((0, new_key.clone()));
+    want_map.sort_unstable_by_key(|&(b, _)| b);
+    assert_eq!(
+        io.blobs
+            .lock()
+            .unwrap()
+            .get("be://data:fresh-1")
+            .cloned()
+            .expect("the fresh blob was written"),
+        want_map,
+        "the blob is the FULL composed map"
+    );
+
+    // Accounting: every base take intact, the holder's take, the fresh
+    // blob's MAP_BLOB take — and nothing freed (the head was inline).
+    let mut want: Vec<(u64, u64, u32)> = base.iter().map(|(b, k)| (kid(k), ino, *b)).collect();
+    want.push((kid(&new_key), ino, 0));
+    want.push((
+        kid("be://data:fresh-1"),
+        ino,
+        block_refs::BLOCK_INDEX_MAP_BLOB,
+    ));
+    want.sort_unstable();
+    assert_eq!(
+        ledger(&owner_be).await,
+        want,
+        "base takes + the holder's take + the MAP_BLOB take"
+    );
+    assert!(
+        io.freed.lock().unwrap().is_empty(),
+        "nothing freed: an inline head displaces no blob"
+    );
+    assert_eq!(
+        squeezefs::fuse_client::METRICS
+            .publish_compose_spills
+            .load(Ordering::Relaxed),
+        1,
+        "the non-rehydrated spill's engagement gauge counts it"
+    );
+    assert_eq!(
+        squeezefs::fuse_client::METRICS
+            .publish_blob_composes
+            .load(Ordering::Relaxed),
+        composes0,
+        "the rehydrated-compose gauge keeps its meaning (no rehydration here)"
+    );
+
+    auth.listener.shutdown();
+    shutdown(&owner_be).await;
+    shutdown(&client_be).await;
+}
+
 /// Contract (the trigger's fail-safe half): an UNARMED mount whose chain
 /// compaction crosses the inline ceiling REFUSES retried-class — the
 /// error names the cap arithmetic and the compaction arm — and stages

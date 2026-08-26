@@ -871,6 +871,183 @@ async fn a_second_free_of_the_same_block_is_refused_on_the_double_release_tripwi
     auth.stop().await;
 }
 
+/// **Finding 19/20 — a `Refused` verdict retires NOTHING locally**
+/// (`.benchmarks/2026-08-25-s11-freeloop-stall.md` §PR 5 attempt 1): the
+/// client's success arm retired local tracking VERDICT-BLIND — every
+/// entry of a served ship got its read tiers purged, its refcount entry
+/// removed, and its incarnation word marked unstable, including entries
+/// the authority answered `Refused` (the double-release lineage; 6,321
+/// fleet-wide on the attempt-1 row). By the time the refused second ship
+/// lands, the offset can already be LIVE CUSTODY AGAIN — the authority
+/// freed it on the first ship and any next owner (including this very
+/// mount, via lane harvest) may hold it — so the blind retire moves a
+/// live block's incarnation word out from under its owner: m56's 48
+/// `read_settle_lost_serialized` tripwires ("incarnation moved under
+/// BLOCK_FLUSH_LOCKS + INODE_META_LOCKS"), the 4-attempt settle EIO, the
+/// latched writeback error, the ior abort.
+///
+/// The law: local retirement is a PER-VERDICT act — `Freed` retires
+/// (the offset is dead), `Refused` touches nothing (the authority
+/// refused the accounting act; the offset's local state belongs to its
+/// CURRENT owner).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_free_verdict_retires_nothing_locally() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "refretire").await;
+    let dev = data_device(dir.path(), "refretire.dev");
+    let auth = Authority::start(&vol, &dev, &[NODE_A]).await;
+
+    let old_off = auth.alloc.allocate_block().await.expect("mint");
+    let old_idx = old_off / auth.alloc.chunk_size();
+    let ino = authority_file_with_block(&auth, "refused.bin", old_idx).await;
+
+    let cwr = CoWriter::join(&auth, &vol, &dev, NODE_A).await;
+    let _new = cwr.rewrite_block(ino, 0, old_idx).await;
+
+    // Ship #1 through the PRODUCT path: Freed, and the sanctioned local
+    // retire runs.
+    cwr.br
+        .free_block(&old_off.to_string())
+        .await
+        .expect("the displaced free ships");
+    auth.br.reclaim_drain().await;
+    assert!(auth.free_listed(old_idx), "freed on the authority");
+
+    // The offset becomes someone's LIVE custody again — the test stands
+    // in for the next owner on this mount (a lane-harvest re-mint):
+    // stable word, tracked reference.
+    cwr.alloc.publish_block(old_off);
+    assert!(
+        cwr.alloc.seed_shipped_free_reference(old_off),
+        "the next owner's tracking seeds"
+    );
+    let word = cwr
+        .alloc
+        .fill_incarnation(old_off)
+        .expect("the live owner's word is stable");
+
+    // Ship #2 — the double-release lineage's client face (the epoch/spiral
+    // shape: one offset re-enters the free pipeline). The authority
+    // REFUSES it; the call itself serves (per-block verdicts).
+    cwr.br
+        .free_block(&old_off.to_string())
+        .await
+        .expect("the verb serves — the refusal is the VERDICT, not an error");
+
+    // THE CONTRACT (pre-fix RED): the refused entry moved NOTHING locally.
+    assert!(
+        cwr.alloc.fill_incarnation_still(old_off, word),
+        "finding 20's mechanism, distilled: the verdict-blind retire moved a LIVE owner's \
+         incarnation word on a Refused verdict — the mid-settle 'moved under both locks' \
+         tripwire (48 counts on the attempt-1 row's m56)"
+    );
+    assert_eq!(
+        cwr.alloc.refcount(old_off),
+        Some(1),
+        "the live owner's reference tracking survives a refused ship"
+    );
+
+    drop(cwr);
+    auth.stop().await;
+}
+
+/// **Finding 19's `NonTerminal` face — a still-referenced block's word is
+/// never destabilized.** A `NonTerminal` verdict means the durable ledger
+/// still holds references (a clone sibling — possibly on THIS very mount —
+/// keeps the block alive), so the client may release its own tracking of
+/// the displaced reference but must never mark the incarnation unstable:
+/// an unstable-without-republish word poisons every later fill of the
+/// still-live block and is the same mid-settle hazard as the Refused arm.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_nonterminal_free_verdict_never_destabilizes_the_word() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "nonterm").await;
+    let dev = data_device(dir.path(), "nonterm.dev");
+    let auth = Authority::start(&vol, &dev, &[NODE_A]).await;
+
+    let cwr = CoWriter::join(&auth, &vol, &dev, NODE_A).await;
+
+    // A co-writer-minted block with TWO durable references (the clone
+    // shape: two inos share it) — the ship of one displaced reference
+    // answers NonTerminal.
+    let off = cwr
+        .alloc
+        .allocate_block()
+        .await
+        .expect("a laned co-writer mints");
+    // The mint's word stabilizes at the durable write's publish; the
+    // fixture stands in for the completed DMA.
+    cwr.alloc.publish_block(off);
+    let idx = off / cwr.alloc.chunk_size();
+    let tag = volume_tag(DATA_VOL);
+    publish::commit_block_refs(
+        &cwr.meta,
+        90,
+        &[BlockRefOp::taken(BlockRef {
+            vol_tag: tag,
+            block_idx: idx,
+            owner_ino: 90,
+            block_index: 0,
+        })],
+    )
+    .await
+    .expect("ino 90's reference commits");
+    publish::commit_block_refs(
+        &cwr.meta,
+        91,
+        &[BlockRefOp::taken(BlockRef {
+            vol_tag: tag,
+            block_idx: idx,
+            owner_ino: 91,
+            block_index: 0,
+        })],
+    )
+    .await
+    .expect("ino 91's reference commits");
+    // Ino 90 displaces its reference (the rewrite's durable delete).
+    publish::commit_block_refs(
+        &cwr.meta,
+        90,
+        &[BlockRefOp::released(BlockRef {
+            vol_tag: tag,
+            block_idx: idx,
+            owner_ino: 90,
+            block_index: 0,
+        })],
+    )
+    .await
+    .expect("ino 90's release commits");
+    assert_eq!(auth.population(idx).await, 1, "the sibling keeps it alive");
+
+    let word = cwr
+        .alloc
+        .fill_incarnation(off)
+        .expect("the minted block's word is stable");
+
+    // The displaced free ships; the authority answers NonTerminal (durable
+    // population > 0, no RAM tracking of a co-writer mint).
+    cwr.br
+        .free_block(&off.to_string())
+        .await
+        .expect("the displaced free ships");
+
+    // THE CONTRACT (pre-fix RED): the sibling's block stays servable —
+    // the word never moved.
+    assert!(
+        cwr.alloc.fill_incarnation_still(off, word),
+        "a NonTerminal verdict destabilized a still-referenced block's incarnation word — \
+         every later fill of the live sibling's block now refuses to publish, and a \
+         mid-settle owner trips the finding-20 invariant"
+    );
+
+    drop(cwr);
+    auth.stop().await;
+}
+
 // ===========================================================================
 // 3. Fencing composes: era refusal, and what a dead co-writer leaves
 // ===========================================================================

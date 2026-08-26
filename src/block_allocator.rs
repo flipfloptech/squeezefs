@@ -1914,16 +1914,45 @@ impl BlockAllocator {
     }
 
     /// **Retire a co-writer's LOCAL view of a displaced block whose free
-    /// SHIPPED** (`crate::cowriter::ship_displaced_frees`, after the
-    /// authority's acknowledgement): drop the local refcount entry (the
-    /// accounting lives on the authority now) and retire the local
-    /// incarnation word, so a straggler validated fill of the dead
-    /// binding fails its seqlock re-check here exactly as it would on the
-    /// authority. Touches NO free list and NO device — this is the free's
-    /// local *hygiene*, never its accounting.
+    /// SHIPPED and was answered `Freed`**
+    /// (`crate::cowriter::ship_displaced_frees`, after the authority's
+    /// acknowledgement): drop the local refcount entry (the accounting
+    /// lives on the authority now) and retire the local incarnation word,
+    /// so a straggler validated fill of the dead binding fails its seqlock
+    /// re-check here exactly as it would on the authority. Touches NO free
+    /// list and NO device — this is the free's local *hygiene*, never its
+    /// accounting.
+    ///
+    /// Finding 19/20: `Freed` verdicts ONLY. A `Refused` entry (the
+    /// double-release lineage) must touch nothing — the offset may be live
+    /// custody again, and destabilizing a live owner's word is the
+    /// `read_settle_lost_serialized` tripwire. A `NonTerminal` entry rides
+    /// [`Self::release_shipped_free_tracking`].
     pub fn retire_shipped_free_tracking(&self, offset: u64) {
         let _ = self.refcounts.remove_sync(&offset);
         self.mark_incarnation_unstable(offset);
+    }
+
+    /// **Release ONE local reference of a shipped displaced block whose
+    /// free was answered `NonTerminal`** (finding 19): the durable ledger
+    /// still holds references — a clone sibling, possibly on this very
+    /// mount, keeps the block alive — so this mount's displaced reference
+    /// releases (decrement, entry removed at zero) and the incarnation
+    /// word is NEVER touched: an unstable-without-republish word would
+    /// poison every later fill of the still-live block and moves a
+    /// mid-settle owner's word (the finding-20 hazard). W1's sole-owner
+    /// probe degrades safely either way (an untracked or >1 count
+    /// refuses the patch).
+    pub fn release_shipped_free_tracking(&self, offset: u64) {
+        let drop_entry = self
+            .refcounts
+            .read_sync(&offset, |_, c| {
+                c.fetch_sub(1, Ordering::AcqRel).saturating_sub(1) == 0
+            })
+            .unwrap_or(false);
+        if drop_entry {
+            let _ = self.refcounts.remove_sync(&offset);
+        }
     }
 
     /// W1 patch fence, steps 1a+1b of the §5.1 mechanism (the normative

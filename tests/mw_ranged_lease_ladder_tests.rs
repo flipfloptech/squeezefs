@@ -1346,3 +1346,247 @@ async fn the_acquire_replys_trim_teaches_the_ceiling_without_a_shrink_round() {
         "and no demotion was ever fabricated"
     );
 }
+
+/// **Finding 16 half (a) — the notice carrier is every custody-channel
+/// reply, not just the renewal** (`.benchmarks/2026-08-25-s11-freeloop-stall.md`
+/// §Finding 16): row 2's ledger proved 40 of 51 shrink notices DIED with
+/// their grant (`tail_shrink_fence_resolves`) because the only carrier was
+/// the incumbent's renewal reply and, under the block-cyclic interleave,
+/// grants live shorter than a renewal cadence. The §9.3a learning loop was
+/// structurally dark on exactly the workload it was built for.
+///
+/// Two carriers pinned, one fixture (no `renew_all` anywhere in this
+/// test):
+///
+/// * **Phase A — the ACQUIRE reply**: a peer's required parks in the
+///   mount's stretch tail; the mount's next custody interaction is an
+///   acquire for a DISTANT span of the same file, and that reply must
+///   carry the shrink notice — the client shrinks, acks, and the peer's
+///   grant issues within one interaction instead of one cadence.
+/// * **Phase B — the RELEASE reply**: same setup on a second file, and
+///   the mount's next interaction is a queued-release drain; the release
+///   reply is the carrier.
+///
+/// Both phases close through the ACK column with the fence column FLAT —
+/// the ledger law `tail_shrinks ≡ acks + fence_resolves` holding on the
+/// healthy side, which is the entire point of the fix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shrink_notices_ride_acquire_and_release_replies_not_just_renewals() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let _serial = serial();
+    let _restore = Restore;
+    let h = Arc::new(make(*b"ranged-ladder-09", "ranged-ladder-9").await);
+    let auth = start_authority_be(
+        "ladder-authority-9",
+        Some(h.fs.meta_backend.as_ref().unwrap().clone()),
+    );
+    // Private inode band: eight pads (the suite convention) — subjects at
+    // the band's 9th and 10th inos, colliding with no sibling test.
+    for pad_name in [
+        "pad-v.dat",
+        "pad-w.dat",
+        "pad-x.dat",
+        "pad-y.dat",
+        "pad-z.dat",
+        "pad-aa.dat",
+        "pad-ab.dat",
+        "pad-ac.dat",
+    ] {
+        let pad =
+            h.fs.create(h.req, 1, OsStr::new(pad_name), libc::S_IFREG | 0o644, 0)
+                .await
+                .unwrap();
+        h.fs.release(h.req, pad.attr.ino, pad.fh, 0, 0, false)
+            .await
+            .unwrap();
+    }
+    let (ino_a, fh_a) = create_striped_open(&h, "carrier-a.dat").await;
+    let (ino_b, fh_b) = create_striped_open(&h, "carrier-b.dat").await;
+    let client = arm_cowriter(&auth, &h).await;
+
+    const BLK: u64 = 4 * 1024 * 1024;
+    let geometry = Some((64 * BLK, BLK));
+    let peer = squeezefs::dlm::LocalLockManager::new().expect("peer manager");
+    let s0 = squeezefs::dlm::range_custody_stats();
+
+    // ---------------- Phase A: the ACQUIRE reply carries the notice ----
+    // The mount's sequential blocks 0-1 stretch its grant to [0, 16M)
+    // while it only ever writes [0, 8M).
+    for off in [0u64, BLK] {
+        let written =
+            h.fs.write(
+                h.req,
+                ino_a,
+                fh_a,
+                off,
+                bytes::Bytes::from(vec![0x66u8; BLK as usize]),
+                0,
+                0,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("phase-A write at {off} failed: {e:?}"))
+            .written;
+        assert_eq!(written as u64, BLK);
+    }
+    // The peer's block-2 required lands in the stretch tail and parks on
+    // the SHRINK barrier.
+    let peer_a = {
+        let peer = peer.clone();
+        let path = squeezefs::keys::inode_path(ino_a);
+        tokio::spawn(async move {
+            peer.acquire_lock_range_scoped(
+                &path,
+                (2 * BLK, 3 * BLK),
+                (2 * BLK, 3 * BLK),
+                Duration::from_secs(30),
+                geometry,
+                Some(0xC),
+            )
+            .await
+        })
+    };
+    wait_until(
+        9,
+        "phase A: the peer's tail required never marked a SHRINK pending",
+        || squeezefs::dlm::range_custody_stats().tail_shrinks > s0.tail_shrinks,
+    )
+    .await;
+
+    // The mount's NEXT custody interaction is an acquire for a distant
+    // span of the same file (nothing queued a release, so the acquire is
+    // the first reply composed after the pending-mark). Its reply must
+    // carry the notice; the client's absorb ships the ack inline.
+    let written =
+        h.fs.write(
+            h.req,
+            ino_a,
+            fh_a,
+            8 * BLK,
+            bytes::Bytes::from(vec![0x77u8; BLK as usize]),
+            0,
+            0,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("phase-A far write failed: {e:?}"))
+        .written;
+    assert_eq!(written as u64, BLK);
+    wait_until(
+        9,
+        "phase A: the shrink notice never rode the far acquire's reply — \
+         the carrier is still renewal-only (finding 16 half (a))",
+        || {
+            squeezefs::dlm::range_custody_stats().tail_shrink_acks > s0.tail_shrink_acks
+        },
+    )
+    .await;
+    let grant_a = tokio::time::timeout(Duration::from_secs(10), peer_a)
+        .await
+        .expect("phase A: the peer resolves after the acquire-carried ack")
+        .expect("join")
+        .expect("phase A: the peer's grant issues");
+    match grant_a {
+        squeezefs::dlm::RangeAcquired::New { lease, span } => {
+            assert_eq!(span, (2 * BLK, 3 * BLK), "the peer gets exactly its ask");
+            lease.release().await.expect("peer A releases");
+        }
+        other => panic!("phase A: the peer's grant is NEW exclusive custody: {other:?}"),
+    }
+    let s1 = squeezefs::dlm::range_custody_stats();
+    assert_eq!(
+        s1.tail_shrink_fence_resolves, s0.tail_shrink_fence_resolves,
+        "phase A closed through the ACK column — a fence resolve means the \
+         notice died with the grant again"
+    );
+    assert_eq!(s1.demotions, s0.demotions, "no fabricated demotion");
+
+    // ---------------- Phase B: the RELEASE reply carries the notice ----
+    // A far-span grant held BEFORE the contention exists — the handle
+    // whose queued release will be the mount's next custody interaction.
+    let far = client
+        .acquire_range(ino_b, (8 * BLK, 9 * BLK), (8 * BLK, 9 * BLK), Duration::from_secs(5))
+        .await
+        .expect("phase B: the far-span grant issues uncontended");
+    let far_lease = match far {
+        squeezefs::data_grant::RangeAcquireOutcome::New { lease, .. } => lease,
+        other => panic!("phase B: the far span is NEW custody: {other:?}"),
+    };
+    for off in [0u64, BLK] {
+        let written =
+            h.fs.write(
+                h.req,
+                ino_b,
+                fh_b,
+                off,
+                bytes::Bytes::from(vec![0x88u8; BLK as usize]),
+                0,
+                0,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("phase-B write at {off} failed: {e:?}"))
+            .written;
+        assert_eq!(written as u64, BLK);
+    }
+    let peer_b = {
+        let peer = peer.clone();
+        let path = squeezefs::keys::inode_path(ino_b);
+        tokio::spawn(async move {
+            peer.acquire_lock_range_scoped(
+                &path,
+                (2 * BLK, 3 * BLK),
+                (2 * BLK, 3 * BLK),
+                Duration::from_secs(30),
+                geometry,
+                Some(0xC),
+            )
+            .await
+        })
+    };
+    wait_until(
+        9,
+        "phase B: the peer's tail required never marked a SHRINK pending",
+        || squeezefs::dlm::range_custody_stats().tail_shrinks > s1.tail_shrinks,
+    )
+    .await;
+
+    // The mount's next custody interaction is the queued-release drain —
+    // no acquire, no renewal. The release reply is the carrier.
+    far_lease.release().await.expect("phase B: queue the far release");
+    client.drain_releases().await;
+    wait_until(
+        9,
+        "phase B: the shrink notice never rode the release reply — the \
+         carrier is still renewal-only (finding 16 half (a))",
+        || {
+            squeezefs::dlm::range_custody_stats().tail_shrink_acks
+                > s1.tail_shrink_acks
+        },
+    )
+    .await;
+    let grant_b = tokio::time::timeout(Duration::from_secs(10), peer_b)
+        .await
+        .expect("phase B: the peer resolves after the release-carried ack")
+        .expect("join")
+        .expect("phase B: the peer's grant issues");
+    match grant_b {
+        squeezefs::dlm::RangeAcquired::New { lease, span } => {
+            assert_eq!(span, (2 * BLK, 3 * BLK), "the peer gets exactly its ask");
+            lease.release().await.expect("peer B releases");
+        }
+        other => panic!("phase B: the peer's grant is NEW exclusive custody: {other:?}"),
+    }
+
+    // The ledger law on the healthy side: both rounds closed through the
+    // ACK column, the fence column never moved.
+    let s2 = squeezefs::dlm::range_custody_stats();
+    assert_eq!(s2.tail_shrinks - s0.tail_shrinks, 2, "two shrink rounds");
+    assert_eq!(s2.tail_shrink_acks - s0.tail_shrink_acks, 2, "two acks");
+    assert_eq!(
+        s2.tail_shrink_fence_resolves, s0.tail_shrink_fence_resolves,
+        "zero fence resolves — the healthy-fleet law, restored on a \
+         churn-shaped interaction pattern"
+    );
+    assert_eq!(s2.demotions, s0.demotions, "zero demotions throughout");
+
+    drop(client);
+    auth.listener.shutdown();
+}

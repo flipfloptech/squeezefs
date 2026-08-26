@@ -171,6 +171,50 @@ demand_waits 0; prods 274 / tightenings 3,659 / pressure 6.
   floor is the demotion-wait cadence, not a bandwidth). The 2026-08-19
   fabric capture's shape, no fabric required.
 
+## The PRs 2–4 live verification (2026-08-26, binary `69b2fe16`)
+
+Two counted rows on fresh range-custody fleets (both committed at
+`rows-f15-levers-live/`, ior outputs dropped, live stats snapshots
+beside the per-phase ones):
+
+**Row 1 (2 × 32 GiB, the original venue):** the probe reached
+**1,695 MiB/s over the FULL 10 GiB domain** (the recycle-bound shape the
+finding was captured on) and every lever verified live before A1
+aborted: ack pipeline depth 3 with **`acked_lag_ms` ≈ 6.7 s** (the
+reader's whole qualify+drain+promote path — the beat-quantized ladder
+could not go below ~12 s and measured ~28 s end-to-end); reader acks
+~120/member (was ~60 for a whole run); demand site-0 counted 2,258 with
+**rung a′ prods issued (`demand_prods` 9, prods 797)** and **112
+demand-path bound refreshes**; the loop recycled **10,867 releases
+(~42 GiB) with `alloc_from_freelist` 300–950 per member** (the original
+capture: 0 everywhere); every one of the 300–600 harvests per co-writer
+carried the measured horizon hint (`horizon_hints ≡ harvests`), and
+19–24 AHEAD harvests fired per member. The abort is §5.7's own stated
+**inventory margin** (per-lane spare vs rate × loop latency ≈ 98 % at
+full probe rate): co-writers ENOSPC'd with owed supply still inside the
+in-flight window — the design's named answer is the venue-sizing lever,
+never a gate relaxation.
+
+**Row 2 (2 × 64 GiB — the venue-sizing lever):** all four phases ran to
+completion, **zero ENOSPC, zero forced releases, zero laggard fences**,
+closure exact (15,364 ≡ 13,671 + 1,693; ~53 GiB recycled). The ratio
+gate still fails (1.484/0.401) — and the pacer is now UNAMBIGUOUSLY
+residual 7: **+5,449 fabricated custody conflicts and +8,610 desired
+trims** on fully-aligned disjoint writes, with 67 GiB of RAM free and
+the free loop a bystander (the 64 GiB zram pair also softens the venue:
+probe 137 MiB/s — substrate arithmetic, stated for honesty).
+
+**Verdict: finding 15's loop half is FIXED and verified live; the
+acceptance row's remaining gate is residual 7 alone** (plus the
+substrate-sizing arithmetic the row itself prints). One residual note:
+`bound_age` still reads ~14–23 s under storm because the ~2 s
+checkpoint-qualification physics plus the reader's promote cadence
+dominate once the beat quantization is gone — `acked_lag` ≈ 6.7 s is
+the reader-side truth, and the ~12 s target's remaining gap lives in
+the owner-side min-composition across 8 readers under CONTINUOUS
+deferral churn (each release re-arms the window). The loop is no longer
+the row's constraint, so that residue is priced, not chased.
+
 **Campaign consequence (recorded here, to fold into the design doc as
 the PR 1 capture's output): the s11 acceptance row is gated by residual
 7 REGARDLESS of the free-grace levers.** The loop's 24–29 s latency is

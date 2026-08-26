@@ -173,9 +173,12 @@ demand_waits 0; prods 274 / tightenings 3,659 / pressure 6.
 
 ## The PRs 2–4 live verification (2026-08-26, binary `69b2fe16`)
 
-Two counted rows on fresh range-custody fleets (both committed at
-`rows-f15-levers-live/`, ior outputs dropped, live stats snapshots
-beside the per-phase ones):
+Two counted rows on fresh range-custody fleets. Row 2's per-phase
+snapshots + the end-of-run live read are committed at
+`rows-f15-levers-live/` (ior outputs dropped); **row 1's directory was
+cleaned by row 2's fleet create before the harvest** (the same trap the
+first capture hit — its numbers below are quoted from the live stats
+reads taken at the abort, recorded verbatim in the session transcript):
 
 **Row 1 (2 × 32 GiB, the original venue):** the probe reached
 **1,695 MiB/s over the FULL 10 GiB domain** (the recycle-bound shape the

@@ -1191,3 +1191,148 @@ async fn zero_true_sharing_keeps_the_shared_clauses_silent() {
     drop(client);
     auth.listener.shutdown();
 }
+
+/// **Finding 16's trim teacher** (residual 7, the steady-state half —
+/// `.benchmarks/2026-08-25-s11-freeloop-stall.md` §finding 16): the
+/// acquire reply's OWN TRIM is a ceiling lesson. The shrink-notice
+/// teacher rides renewals, but block-cyclic grants churn faster than a
+/// renewal cadence (row 2: 40 of 51 notices died through the fence, the
+/// ceiling never learned, 8,610 trims were ignored). A stretched ask
+/// whose granted span comes back CLIPPED teaches the surviving stretch
+/// length immediately — zero wire change, no shrink round, no park.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_acquire_replys_trim_teaches_the_ceiling_without_a_shrink_round() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let _serial = serial();
+    let _restore = Restore;
+    let h = Arc::new(make(*b"ranged-ladder-08", "ranged-ladder-8").await);
+    let auth = start_authority_be(
+        "ladder-authority-8",
+        Some(h.fs.meta_backend.as_ref().unwrap().clone()),
+    );
+    for pad_name in [
+        "pad-o.dat",
+        "pad-p.dat",
+        "pad-q.dat",
+        "pad-r.dat",
+        "pad-s.dat",
+    ] {
+        let pad =
+            h.fs.create(h.req, 1, OsStr::new(pad_name), libc::S_IFREG | 0o644, 0)
+                .await
+                .unwrap();
+        h.fs.release(h.req, pad.attr.ino, pad.fh, 0, 0, false)
+            .await
+            .unwrap();
+    }
+    let (ino, fh) = create_striped_open(&h, "trimtaught.dat").await;
+    let _client = arm_cowriter(&auth, &h).await;
+
+    const BLK: u64 = 4 * 1024 * 1024;
+    let geometry = Some((64 * BLK, BLK));
+    let path = squeezefs::keys::inode_path(ino);
+    let s0 = squeezefs::dlm::range_custody_stats();
+
+    // Two peers hold the stripes AHEAD of each of the mount's runs — the
+    // block-cyclic neighbor shape (their REQUIRED never overlaps anything
+    // the mount writes; only its stretched DESIRE ever reaches them).
+    let peer = squeezefs::dlm::LocalLockManager::new().expect("peer manager");
+    let _peer_a = match peer
+        .acquire_lock_range_scoped(
+            &path,
+            (2 * BLK, 4 * BLK),
+            (2 * BLK, 4 * BLK),
+            Duration::from_secs(10),
+            geometry,
+            Some(0xC),
+        )
+        .await
+        .expect("peer A's custody issues")
+    {
+        squeezefs::dlm::RangeAcquired::New { lease, .. } => lease,
+        other => panic!("peer A expected NEW custody: {other:?}"),
+    };
+    let _peer_b = match peer
+        .acquire_lock_range_scoped(
+            &path,
+            (6 * BLK, 8 * BLK),
+            (6 * BLK, 8 * BLK),
+            Duration::from_secs(10),
+            geometry,
+            Some(0xD),
+        )
+        .await
+        .expect("peer B's custody issues")
+    {
+        squeezefs::dlm::RangeAcquired::New { lease, .. } => lease,
+        other => panic!("peer B expected NEW custody: {other:?}"),
+    };
+
+    // Run 1: blocks 0-1, sequential — the doubling stretches the desire
+    // to [0, 16M), which the authority TRIMS against peer A's [8M, 16M).
+    // The reply's clipped span IS the lesson: surviving stretch = 0.
+    for off in [0u64, BLK] {
+        let written =
+            h.fs.write(
+                h.req,
+                ino,
+                fh,
+                off,
+                bytes::Bytes::from(vec![0x44u8; BLK as usize]),
+                0,
+                0,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("run-1 write at {off} failed: {e:?}"))
+            .written;
+        assert_eq!(written as u64, BLK);
+    }
+    let s1 = squeezefs::dlm::range_custody_stats();
+    assert!(
+        s1.desired_trims > s0.desired_trims,
+        "run 1's stretched desire was trimmed against peer A (the fixture's premise)"
+    );
+
+    // Run 2: blocks 4-5 (the mount's next stride). The TAUGHT ceiling
+    // clamps the doubling before it reaches peer B — the ask goes out
+    // exactly required-sized, so run 2 pays ZERO trims and ZERO shrink
+    // rounds (pre-fix: the un-taught stretch reaches [16M,32M), overlaps
+    // peer B, pays another trim — the 8,610-trims-per-row treadmill).
+    for off in [4 * BLK, 5 * BLK] {
+        let written =
+            h.fs.write(
+                h.req,
+                ino,
+                fh,
+                off,
+                bytes::Bytes::from(vec![0x55u8; BLK as usize]),
+                0,
+                0,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("run-2 write at {off} failed: {e:?}"))
+            .written;
+        assert_eq!(written as u64, BLK);
+    }
+    let s2 = squeezefs::dlm::range_custody_stats();
+    assert!(
+        s2.stretch_ceiling_clamps > s1.stretch_ceiling_clamps,
+        "the trim TAUGHT the ceiling — run 2's doubling clamps at the source \
+         (pre-fix the lesson only ever arrived on a renewal-carried shrink \
+         notice, which a churning grant never lives to hear)"
+    );
+    assert_eq!(
+        s2.desired_trims, s1.desired_trims,
+        "the clamped ask never reaches peer B: zero trims in run 2 — the \
+         treadmill is off"
+    );
+    assert_eq!(
+        s2.tail_shrinks, s0.tail_shrinks,
+        "no shrink round anywhere: required spans never overlapped, and the \
+         lesson came from the reply itself"
+    );
+    assert_eq!(
+        s2.demotions, s0.demotions,
+        "and no demotion was ever fabricated"
+    );
+}

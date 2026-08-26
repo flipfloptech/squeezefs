@@ -499,8 +499,21 @@ pub type LaneReserveSink = Arc<
 /// learn the metadata plane's types, and the harvest must be `await`ed on
 /// the allocating task (honest backpressure on exactly the starved
 /// writer).
+/// One harvest's outcome: the granted blocks plus the OQ 2 horizon inputs
+/// (the authority's live bound-age hint and this harvest's own measured
+/// round trip) — what makes the co-writer's refill horizon a measurement.
+#[derive(Debug, Clone)]
+pub struct LaneHarvest {
+    pub blocks: Vec<u64>,
+    /// The authority's `free_grace_bound_age_ms` at serve time (0 =
+    /// nothing held — the caller keeps its derivation).
+    pub bound_age_hint_ms: u64,
+    /// This harvest's measured round trip, ms.
+    pub rtt_ms: u64,
+}
+
 pub type LaneHarvestSink = Arc<
-    dyn Fn(u64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u64>>> + Send>>
+    dyn Fn(u64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<LaneHarvest>> + Send>>
         + Send
         + Sync,
 >;
@@ -527,6 +540,7 @@ pub fn routed_harvest_sink(volume_id: &str, part: AppendPartition) -> LaneHarves
             let request_id = crate::cowriter::next_ship_request_id();
             let mut attempt = 0u32;
             loop {
+                let t0 = std::time::Instant::now();
                 match crate::meta_ship::publish::ship_harvest_lane_free(
                     &endpoint,
                     vol_tag,
@@ -538,7 +552,13 @@ pub fn routed_harvest_sink(volume_id: &str, part: AppendPartition) -> LaneHarves
                 )
                 .await
                 {
-                    Ok(idxs) => return Ok(idxs),
+                    Ok((blocks, bound_age_hint_ms)) => {
+                        return Ok(LaneHarvest {
+                            blocks,
+                            bound_age_hint_ms,
+                            rtt_ms: t0.elapsed().as_millis() as u64,
+                        });
+                    }
                     Err(e) => {
                         attempt += 1;
                         if client.lease_epoch() != epoch || attempt >= 3 {

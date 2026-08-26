@@ -1565,7 +1565,7 @@ async fn a_harvest_is_exactly_once_lane_scoped_and_quarantines_undischarged_hand
     );
 
     // The harvest: lane-scoped, exactly-once, removed from the source list.
-    let got = publish::ship_harvest_lane_free(&auth.endpoint, tag, 1, 2, 16, epoch, 9001)
+    let (got, _hint) = publish::ship_harvest_lane_free(&auth.endpoint, tag, 1, 2, 16, epoch, 9001)
         .await
         .expect("the harvest ships");
     assert!(got.contains(&a_idx), "the lane-1 supply came back: {got:?}");
@@ -1577,9 +1577,10 @@ async fn a_harvest_is_exactly_once_lane_scoped_and_quarantines_undischarged_hand
 
     // Replay (the lost-reply retry): the SAME witness answers the SAME grant.
     let replays_before = publish::stats().harvest_replays;
-    let again = publish::ship_harvest_lane_free(&auth.endpoint, tag, 1, 2, 16, epoch, 9001)
-        .await
-        .expect("the replay is absorbed");
+    let (again, _hint) =
+        publish::ship_harvest_lane_free(&auth.endpoint, tag, 1, 2, 16, epoch, 9001)
+            .await
+            .expect("the replay is absorbed");
     assert_eq!(
         again, got,
         "the dedup window answered the winner's own grant"
@@ -1587,9 +1588,10 @@ async fn a_harvest_is_exactly_once_lane_scoped_and_quarantines_undischarged_hand
     assert_eq!(publish::stats().harvest_replays - replays_before, 1);
 
     // A fresh id finds the supply gone.
-    let empty = publish::ship_harvest_lane_free(&auth.endpoint, tag, 1, 2, 16, epoch, 9002)
-        .await
-        .expect("the second harvest ships");
+    let (empty, _hint) =
+        publish::ship_harvest_lane_free(&auth.endpoint, tag, 1, 2, 16, epoch, 9002)
+            .await
+            .expect("the second harvest ships");
     assert!(empty.is_empty(), "exactly-once: {empty:?}");
 
     // DISCHARGE: the co-writer reuses A, rewrites away again, and ships its
@@ -1636,7 +1638,7 @@ async fn a_harvest_is_exactly_once_lane_scoped_and_quarantines_undischarged_hand
     // Harvest A once more and let the epoch DIE with the handout
     // undischarged: A must be named in the death cohort (the quarantine's
     // input), exactly like a declared in-flight destination.
-    let got2 = publish::ship_harvest_lane_free(&auth.endpoint, tag, 1, 2, 16, epoch, 9003)
+    let (got2, _hint) = publish::ship_harvest_lane_free(&auth.endpoint, tag, 1, 2, 16, epoch, 9003)
         .await
         .expect("the third harvest ships");
     assert!(got2.contains(&a_idx));
@@ -2230,6 +2232,9 @@ struct GraceStage {
     m_owner: Arc<MembershipOwner>,
     ticks: Arc<AtomicU64>,
     reader_epoch: u64,
+    /// The co-writer's custody lease epoch (still live server-side after
+    /// the CoWriter struct drops — revocation is explicit, never a Drop).
+    lease_epoch: u64,
     old_off: u64,
     old_idx: u64,
 }
@@ -2292,6 +2297,7 @@ async fn grace_stage(dir: &Path, tag: &str) -> GraceStage {
         "the fixture's displaced offset is IN the grace ring"
     );
     assert!(!auth.free_listed(old_idx), "and not on the free list");
+    let lease_epoch = cwr.client.lease_epoch();
     drop(cwr);
 
     GraceStage {
@@ -2299,6 +2305,7 @@ async fn grace_stage(dir: &Path, tag: &str) -> GraceStage {
         m_owner,
         ticks,
         reader_epoch: reader.epoch,
+        lease_epoch,
         old_off,
         old_idx,
     }
@@ -2732,10 +2739,9 @@ async fn the_owed_ledger_tracks_freed_verdicts_and_harvest_adoptions() {
     assert!(auth.free_listed(a_idx), "the supply sits on the authority");
     let epoch = cwr.client.lease_epoch();
     let tag = volume_tag(DATA_VOL);
-    let (got, _hint) =
-        publish::ship_harvest_lane_free(&auth.endpoint, tag, 1, 2, 16, epoch, 9101)
-            .await
-            .expect("the harvest ships");
+    let (got, _hint) = publish::ship_harvest_lane_free(&auth.endpoint, tag, 1, 2, 16, epoch, 9101)
+        .await
+        .expect("the harvest ships");
     assert!(got.contains(&a_idx));
     assert_eq!(cwr.alloc.adopt_lane_free_grant(&got), got.len() as u64);
     assert_eq!(
@@ -2890,14 +2896,19 @@ async fn the_harvest_reply_carries_the_authoritys_bound_age() {
     let tag = volume_tag(DATA_VOL);
 
     // The ring holds an unacknowledged offset: the bound has never
-    // advanced, so its age is the owner clock's own reading.
-    st.ticks.store(40_000, Ordering::SeqCst);
+    // advanced, so its age is the owner clock's own reading. The jump
+    // stays INSIDE the stage's 5 s pressure deadline relative to the
+    // held label (~10.2 s) — the serve's own harvest ladder runs before
+    // the reply is built, and past that deadline it would correctly
+    // force-release the offset (rung c) and the hint would honestly read
+    // a drained ring's 0.
+    st.ticks.store(14_000, Ordering::SeqCst);
     let (_blocks, hint) =
-        publish::ship_harvest_lane_free(&st.auth.endpoint, tag, 0, 1, 8, 7, 9201)
+        publish::ship_harvest_lane_free(&st.auth.endpoint, tag, 1, 2, 8, st.lease_epoch, 9201)
             .await
             .expect("the harvest ships");
     assert!(
-        hint >= 30_000,
+        hint >= 10_000,
         "the reply's hint is the authority's live bound age (got {hint})"
     );
 }

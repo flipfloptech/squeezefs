@@ -5386,6 +5386,23 @@ pub struct Metrics {
     pub alloc_from_freelist: Align64<AtomicU64>,
     /// The split's other arm: virgin-tail mints at the fresh exit.
     pub alloc_fresh_mints: Align64<AtomicU64>,
+    /// §5.5 (PR 4): the SUM of the per-allocator owed words — blocks this
+    /// mount's `Freed` verdicts left on authorities' free lists, not yet
+    /// harvested back. Climbing while `alloc_lane_harvested_blocks` is
+    /// flat = the refill is not keeping up (or `HARVEST_AHEAD=0`).
+    pub alloc_lane_owed_blocks: Align64<AtomicU64>,
+    /// Ahead-of-stall harvests fired by the watermark task (0 under
+    /// `SQUEEZEFS_ALLOC_LANE_HARVEST_AHEAD=0` — the ENOSPC-only shape).
+    pub alloc_lane_ahead_harvests: Align64<AtomicU64>,
+    /// The derived watermark in force (blocks; `ceil(rate × horizon)`
+    /// capped at lane-share/4 — derived, never a knob).
+    pub alloc_lane_harvest_watermark: Align64<AtomicU64>,
+    /// Harvest replies that carried a nonzero bound-age hint (OQ 2). 0
+    /// with harvests flowing = the fallback derivation is the horizon.
+    pub alloc_lane_horizon_hints: Align64<AtomicU64>,
+    /// The refill horizon in force, ms (the `depth_target` publication
+    /// precedent: the measured composition when hinted).
+    pub alloc_lane_harvest_horizon_ms: Align64<AtomicU64>,
     // DLM **S9** (spec §6.2 item 7's consumer half): the CO-WRITER mount
     // posture. All four are 0 on every shipped mount — the posture is
     // opt-in twice over (`SQUEEZEFS_MULTI_WRITER=1` +
@@ -9658,6 +9675,22 @@ impl SqueezefsFilesystem {
                 // gated gauge — is inserted post-macro below).
                 "alloc_from_freelist": METRICS.alloc_from_freelist.load(Ordering::Relaxed),
                 "alloc_fresh_mints": METRICS.alloc_fresh_mints.load(Ordering::Relaxed),
+                // §5.5 (PR 4): the ahead-of-stall lane refill's ledger —
+                // owed = the sum of the per-allocator words; the watermark
+                // and horizon are the derived numbers in force.
+                "alloc_lane_owed_blocks": METRICS.alloc_lane_owed_blocks.load(Ordering::Relaxed),
+                "alloc_lane_ahead_harvests": METRICS
+                    .alloc_lane_ahead_harvests
+                    .load(Ordering::Relaxed),
+                "alloc_lane_harvest_watermark": METRICS
+                    .alloc_lane_harvest_watermark
+                    .load(Ordering::Relaxed),
+                "alloc_lane_horizon_hints": METRICS
+                    .alloc_lane_horizon_hints
+                    .load(Ordering::Relaxed),
+                "alloc_lane_harvest_horizon_ms": METRICS
+                    .alloc_lane_harvest_horizon_ms
+                    .load(Ordering::Relaxed),
                 // DLM S9 (spec §6.2 item 7's consumer half): the mount
                 // POSTURE and the co-writer ledger. `mount_posture` is the
                 // one word that says which of the three shapes this daemon

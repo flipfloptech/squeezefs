@@ -345,6 +345,27 @@ pub struct BlockAllocator {
     /// them. Untouched (one relaxed load) on every mount without a reader
     /// plane, which is every mount by default.
     grace: crate::free_grace::GraceRing,
+    // --- The ahead-of-stall lane refill (design-free-grace-sustain §5.5,
+    // PR 4) — all zero-cost words on unpartitioned mounts. ---
+    /// Blocks this mount is OWED on the authority's list: +1 per `Freed`
+    /// verdict its shipped displaced frees bring back, −1 per harvest
+    /// adoption. Per-allocator BY CONSTRUCTION (the two-volume law: a
+    /// global number cannot say which volume's authority holds supply).
+    lane_owed: AtomicU64,
+    /// The COMPOSED measured refill horizon (`hint + RTT + one refresh
+    /// floor`), 0 = use the member-local derivation (OQ 2's fallback —
+    /// the pre-first-reply state, a zero hint, and a refused reply all
+    /// land here).
+    horizon_composed_ms: AtomicU64,
+    /// Allocation claims (the rate EWMA's input — every funnel exit).
+    alloc_claims: AtomicU64,
+    rate_last_sample_ms: AtomicU64,
+    rate_last_claims: AtomicU64,
+    /// EWMA allocation rate, milli-blocks/s.
+    rate_mblk_per_s: AtomicU64,
+    /// `ceil(rate × horizon)` capped at lane-share/4 — derived, never a
+    /// knob (the A/B lever disarms the mechanism, not the number).
+    harvest_watermark: AtomicU64,
     /// DLM **S9** blocker #3: this volume's **allocation partition**
     /// ([`crate::data_alloc_lane`]) — `None` on every mount today AND on
     /// every solo mount forever, which is what makes single-writer
@@ -383,6 +404,41 @@ struct LanePartition {
     /// on the authority (its own free list already carries lane-0's
     /// supply) and everywhere unpartitioned.
     harvest: std::sync::OnceLock<crate::data_alloc_lane::LaneHarvestSink>,
+}
+
+/// The `SQUEEZEFS_ALLOC_LANE_HARVEST_AHEAD` lever's latch (the free-grace
+/// campaign's `ACK_PIPELINE` pattern): the ahead-of-stall lane refill
+/// (design-free-grace-sustain §5.5). `0` = ENOSPC-triggered harvests
+/// only, the shipped shape verbatim.
+static HARVEST_AHEAD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn harvest_ahead_enabled() -> bool {
+    match HARVEST_AHEAD.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = crate::env_knobs::bool_knob("SQUEEZEFS_ALLOC_LANE_HARVEST_AHEAD", true);
+            HARVEST_AHEAD.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Test seam (the `free_grace::test_set_ack_pipeline` shape).
+pub fn test_set_harvest_ahead(on: Option<bool>) {
+    HARVEST_AHEAD.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Test seam: `true` ⇔ a preset was in force.
+pub fn test_clear_harvest_ahead() -> bool {
+    HARVEST_AHEAD.swap(0, Ordering::Relaxed) != 0
 }
 
 /// **The lane-counted free set** (sustain campaign KD-FG-10,
@@ -522,6 +578,13 @@ impl BlockAllocator {
             incarnation_minter: std::sync::OnceLock::new(),
             quarantine: crate::data_custody::BlockQuarantine::new(),
             grace: crate::free_grace::GraceRing::derived(),
+            lane_owed: AtomicU64::new(0),
+            horizon_composed_ms: AtomicU64::new(0),
+            alloc_claims: AtomicU64::new(0),
+            rate_last_sample_ms: AtomicU64::new(0),
+            rate_last_claims: AtomicU64::new(0),
+            rate_mblk_per_s: AtomicU64::new(0),
+            harvest_watermark: AtomicU64::new(0),
             lanes: std::sync::OnceLock::new(),
         })
     }
@@ -1637,8 +1700,178 @@ impl BlockAllocator {
             let m = &crate::fuse_client::METRICS;
             m.alloc_lane_harvested_blocks
                 .fetch_add(adopted, Ordering::Relaxed);
+            // §5.5: the adoption pays the owed ledger down (clamped — the
+            // ENOSPC path can adopt supply the ledger never counted, e.g.
+            // frees shipped before this binary), mirroring the actually
+            // subtracted amount into the process sum gauge.
+            let paid = loop {
+                let owed = self.lane_owed.load(Ordering::Acquire);
+                let pay = owed.min(adopted);
+                if self
+                    .lane_owed
+                    .compare_exchange(owed, owed - pay, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    break pay;
+                }
+            };
+            if paid > 0 {
+                m.alloc_lane_owed_blocks.fetch_sub(paid, Ordering::Relaxed);
+            }
         }
         adopted
+    }
+
+    /// §5.5 (the owed ledger's increment): `n` of this mount's shipped
+    /// displaced frees came back `Freed` — the authority's list now holds
+    /// supply this mount is owed. Called by
+    /// `crate::cowriter::ship_displaced_frees` per acknowledged group.
+    pub fn note_owed_freed(&self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        self.lane_owed.fetch_add(n, Ordering::AcqRel);
+        crate::fuse_client::METRICS
+            .alloc_lane_owed_blocks
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Blocks this mount is owed on the authority's free list (§5.5).
+    pub fn lane_owed_blocks(&self) -> u64 {
+        self.lane_owed.load(Ordering::Acquire)
+    }
+
+    /// One refresh-floor beat, ms — the horizon's slack term (the reader's
+    /// own pass-cadence floor; §5.5's `+ one ack_refresh_floor`).
+    pub fn horizon_floor_ms(&self) -> u64 {
+        (crate::ro_coherence::reader_revalidate_interval().as_millis() as u64).max(1)
+    }
+
+    /// The member-local horizon derivation — OQ 2's FALLBACK (the
+    /// pre-first-reply state, a zero hint, and every refused reply):
+    /// `qualify_lag + drain_lag + 2 × refresh floor`, from the same
+    /// published numbers the ack ladder runs on (session clock terms when
+    /// a member session exists; the staleness bound alone otherwise).
+    fn fallback_horizon_ms(&self) -> u64 {
+        let staleness = crate::ro_coherence::reader_staleness_bound().as_millis() as u64;
+        let (skew, d_purge) = match crate::membership::installed_member() {
+            Some(s) => (s.skew_max_ms(), s.d_purge_ms()),
+            None => (0, staleness),
+        };
+        (staleness + skew) + (staleness + d_purge) + 2 * self.horizon_floor_ms()
+    }
+
+    /// §5.5 (OQ 2): deposit a harvest reply's horizon inputs. A nonzero
+    /// hint composes `hint + RTT + one refresh floor` and is COUNTED
+    /// (`alloc_lane_horizon_hints`); a zero hint (nothing held) clears the
+    /// word back to the derivation — a quiet ring is never over-trusted.
+    pub fn note_harvest_hint(&self, bound_age_hint_ms: u64, rtt_ms: u64) {
+        if bound_age_hint_ms == 0 {
+            self.horizon_composed_ms.store(0, Ordering::Relaxed);
+            return;
+        }
+        let composed = bound_age_hint_ms
+            .saturating_add(rtt_ms)
+            .saturating_add(self.horizon_floor_ms());
+        self.horizon_composed_ms.store(composed, Ordering::Relaxed);
+        let m = &crate::fuse_client::METRICS;
+        m.alloc_lane_horizon_hints.fetch_add(1, Ordering::Relaxed);
+        m.alloc_lane_harvest_horizon_ms
+            .store(composed, Ordering::Relaxed);
+    }
+
+    /// The refill horizon in force, ms: the composed measurement when a
+    /// hinted reply set one, the member-local derivation otherwise.
+    pub fn harvest_horizon_ms(&self) -> u64 {
+        match self.horizon_composed_ms.load(Ordering::Relaxed) {
+            0 => self.fallback_horizon_ms(),
+            v => v,
+        }
+    }
+
+    /// §5.5: fold one rate sample (claims since the last sample ÷ elapsed)
+    /// into the EWMA and re-derive the watermark —
+    /// `ceil(rate × horizon)` capped at lane-share/4. Called by the
+    /// ahead-refill task each tick (and by the contracts directly).
+    pub fn sample_alloc_rate(&self, now_ms: u64) {
+        let claims = self.alloc_claims.load(Ordering::Relaxed);
+        let last_ms = self.rate_last_sample_ms.swap(now_ms, Ordering::Relaxed);
+        let last_claims = self.rate_last_claims.swap(claims, Ordering::Relaxed);
+        if last_ms == 0 || now_ms <= last_ms {
+            return; // the first sample only seeds the snapshots
+        }
+        let dt_ms = now_ms - last_ms;
+        let inst_mblk = claims.saturating_sub(last_claims).saturating_mul(1_000_000) / dt_ms;
+        // EWMA α = 1/4: three parts memory, one part instant. The decay
+        // divides CEILING-wise so a quiet writer's rate reaches exactly 0
+        // (a floor division wedges the integer EWMA at 3 forever).
+        let old = self.rate_mblk_per_s.load(Ordering::Relaxed);
+        let ewma = old.saturating_sub(old.div_ceil(4)) + inst_mblk / 4;
+        self.rate_mblk_per_s.store(ewma, Ordering::Relaxed);
+        // watermark = ceil(rate × horizon), capped at lane-share/4 (the
+        // partitioned share; 0 unpartitioned — the task never runs there).
+        let Some(lanes) = self.lanes.get() else {
+            self.harvest_watermark.store(0, Ordering::Relaxed);
+            return;
+        };
+        let share = crate::data_alloc_lane::lane_capacity_blocks(
+            self.capacity_blocks.load(Ordering::Relaxed),
+            lanes.part.writers(),
+            lanes.part.writer_id(),
+        );
+        // blocks = (milli-blocks/s × ms) / 1e6; ceil so a slow-but-live
+        // writer keeps a nonzero watermark. A zero rate derives zero.
+        let horizon = self.harvest_horizon_ms();
+        let want = if ewma == 0 {
+            0
+        } else {
+            ewma.saturating_mul(horizon)
+                .div_ceil(1_000_000)
+                .min(share / 4)
+        };
+        self.harvest_watermark.store(want, Ordering::Relaxed);
+        crate::fuse_client::METRICS
+            .alloc_lane_harvest_watermark
+            .store(want, Ordering::Relaxed);
+    }
+
+    /// The derived watermark in force (blocks).
+    pub fn watermark_blocks(&self) -> u64 {
+        self.harvest_watermark.load(Ordering::Relaxed)
+    }
+
+    /// §5.5's decision: harvest ahead ⇔ the lever is armed, this allocator
+    /// is OWED supply, and its lane-reachable stock sits below the
+    /// watermark. `Some(ask)` = the grain-bounded batch to request; `None`
+    /// = nothing to do (owed nothing / stocked / quiet / lever off).
+    pub fn should_harvest_ahead(&self) -> Option<u64> {
+        if !harvest_ahead_enabled() {
+            return None;
+        }
+        let lanes = self.lanes.get()?;
+        if self.lane_owed.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let watermark = self.harvest_watermark.load(Ordering::Relaxed);
+        if watermark == 0 || self.lane_reachable_blocks() >= watermark {
+            return None;
+        }
+        Some(lanes.grain.max(1))
+    }
+
+    /// One ahead-refill tick (§5.5's background single-flight task body —
+    /// `crate::alloc_lane_grant` spawns one per laned co-writer
+    /// engagement): sample the rate, and when the decision fires run the
+    /// SAME harvest the ENOSPC arm runs (sink → adopt → hint deposit).
+    pub async fn ahead_refill_tick(&self, now_ms: u64) -> u64 {
+        self.sample_alloc_rate(now_ms);
+        if self.should_harvest_ahead().is_none() {
+            return 0;
+        }
+        crate::fuse_client::METRICS
+            .alloc_lane_ahead_harvests
+            .fetch_add(1, Ordering::Relaxed);
+        self.harvest_lane_supply().await
     }
 
     /// **The lane free harvest** (rung 10): when this mount's lane is
@@ -1662,7 +1895,12 @@ impl BlockAllocator {
             .alloc_lane_harvests
             .fetch_add(1, Ordering::Relaxed);
         match sink(lanes.grain.max(1)).await {
-            Ok(idxs) => self.adopt_lane_free_grant(&idxs),
+            Ok(harvest) => {
+                // OQ 2: every harvest reply refreshes the refill horizon —
+                // the measured loop latency plus this trip's own RTT.
+                self.note_harvest_hint(harvest.bound_age_hint_ms, harvest.rtt_ms);
+                self.adopt_lane_free_grant(&harvest.blocks)
+            }
             Err(e) => {
                 log::warn!(
                     "lane free harvest failed on volume '{}' ({e}) — the allocation verdict \
@@ -2110,6 +2348,9 @@ impl BlockAllocator {
     /// PR VL6a fsck epoch-latch record. Returns the byte offset.
     fn claim_block_idx(&self, block_idx: u64) -> u64 {
         let offset = block_idx * self.chunk_size;
+        // The ahead-refill rate EWMA's input (§5.5): one relaxed add per
+        // funnel exit.
+        self.alloc_claims.fetch_add(1, Ordering::Relaxed);
         // Claim-cancels-debt (Idea 4, KD-4.3): the new owner's
         // write-before-publish rewrites the range — it owes no discard.
         self.cancel_elided_debt(offset);

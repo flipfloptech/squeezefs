@@ -125,7 +125,17 @@ use std::sync::Arc;
 /// a 6-speaker set authority answered a peer's shipped free from its own
 /// lagged snapshot of the peer's volume (the `NonTerminal` strand / false
 /// `Freed` pair `tests/pv_shipped_free_ledger_tests.rs` pins).
-pub const PUBLISH_SCHEMA: u32 = 7;
+///
+/// **8 since the harvest reply carries the authority's bound age** (the
+/// free-grace sustain campaign PR 4, OQ 2 — user decision 2026-08-25):
+/// [`PublishReply::LaneFreeGrant`] became a struct variant whose
+/// `bound_age_ms` is the authority's live loop latency, so the
+/// co-writer's ahead-refill horizon is a MEASUREMENT instead of a
+/// derivation. A 7-speaker cannot decode the widened reply — the
+/// mismatch refuses loud in both directions (this wire's standing
+/// posture), and the co-writer's horizon word then simply keeps its
+/// derivation default, which is the design's fallback by construction.
+pub const PUBLISH_SCHEMA: u32 = 8;
 
 /// First verb of S9's publish block. S3's ping is 0, S8's metadata verbs
 /// are 16/17, S6's membership owns `0x0100..=0x01FF`, S9's custody
@@ -692,7 +702,13 @@ pub enum PublishReply {
     /// `harvest_lane_free`: the handed-out block indices — free-listed
     /// offsets of the CALLER's lane, removed from the authority's own
     /// list (exactly-once) and recorded against the caller's lease epoch.
-    LaneFreeGrant(Vec<u64>),
+    /// Since schema 8 the reply also carries the authority's live
+    /// `free_grace_bound_age_ms` (0 = nothing held), so the co-writer's
+    /// refill horizon reads the loop latency actually in force (OQ 2).
+    LaneFreeGrant {
+        blocks: Vec<u64>,
+        bound_age_ms: u64,
+    },
     /// `block_ref_population`: per-index reference populations summed over
     /// the SERVING node's owned volumes, in request order.
     Populations(Vec<u64>),
@@ -1948,6 +1964,9 @@ fn extent_flush_executor() -> Option<ExtentFlushExec> {
 /// [`ship_free_blocks`]'s does: `(lease_epoch, request_id)` is the owner's
 /// dedup key — a resend after a lost reply answers the winner's own grant,
 /// and a retry never re-keys across a re-join.
+/// Returns `(handed-out block indices, the authority's bound-age hint in
+/// ms)` — the hint is schema 8's OQ 2 field (0 = the authority's ring
+/// holds nothing; the caller falls back to its derivation).
 pub async fn ship_harvest_lane_free(
     endpoint: &str,
     vol_tag: u64,
@@ -1956,7 +1975,7 @@ pub async fn ship_harvest_lane_free(
     max: u64,
     lease_epoch: u64,
     request_id: u64,
-) -> Result<Vec<u64>> {
+) -> Result<(Vec<u64>, u64)> {
     let Some(client) = CLIENT.load_full() else {
         REFUSALS.fetch_add(1, Ordering::Relaxed);
         let msg = format!(
@@ -1975,9 +1994,12 @@ pub async fn ship_harvest_lane_free(
         request_id,
     };
     match client.ship(endpoint, call).await? {
-        PublishReply::LaneFreeGrant(idxs) => {
-            HARVEST_SHIPPED_BLOCKS.fetch_add(idxs.len() as u64, Ordering::Relaxed);
-            Ok(idxs)
+        PublishReply::LaneFreeGrant {
+            blocks,
+            bound_age_ms,
+        } => {
+            HARVEST_SHIPPED_BLOCKS.fetch_add(blocks.len() as u64, Ordering::Relaxed);
+            Ok((blocks, bound_age_ms))
         }
         other => Err(protocol_error(
             "harvest_lane_free",
@@ -2682,7 +2704,14 @@ impl PublishService {
         SERVED.fetch_add(1, Ordering::Relaxed);
         let frame = PublishReplyFrame {
             schema: PUBLISH_SCHEMA,
-            outcome: outcome.map(PublishReply::LaneFreeGrant),
+            // OQ 2 (schema 8): the reply carries the authority's LIVE
+            // bound age — the loop latency in force — so the co-writer's
+            // refill horizon is a measurement (0 = nothing held, and the
+            // ship side then keeps its derivation).
+            outcome: outcome.map(|blocks| PublishReply::LaneFreeGrant {
+                blocks,
+                bound_age_ms: crate::free_grace::bound_age_ms(),
+            }),
         };
         match encode(&frame, "harvest_lane_free") {
             Ok(body) => RpcResponse {

@@ -1669,7 +1669,7 @@ pub async fn ship_displaced_frees(
             }
         };
         match shipped {
-            Ok(_verdicts) => {
+            Ok(verdicts) => {
                 // The authority owns the accounting now; retire this
                 // mount's local, non-accounting view of the displaced
                 // blocks — the read tiers (a reused offset must never
@@ -1679,6 +1679,15 @@ pub async fn ship_displaced_frees(
                     router.purge_read_tiers(key);
                     group.alloc.retire_shipped_free_tracking(*offset);
                 }
+                // §5.5 (the ahead refill's owed ledger): each `Freed`
+                // verdict is supply the authority's list now holds FOR
+                // THIS allocator — the per-volume word the watermark
+                // decision routes on.
+                let freed = verdicts
+                    .iter()
+                    .filter(|v| matches!(v, crate::meta_ship::publish::FreeVerdict::Freed))
+                    .count() as u64;
+                group.alloc.note_owed_freed(freed);
             }
             Err(e) => {
                 crate::meta_ship::publish::note_free_ship_failure(group.entries.len() as u64);

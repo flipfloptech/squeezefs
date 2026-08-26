@@ -335,6 +335,32 @@ pub async fn engage_allocator_lane(
             alloc.volume_id(),
             part,
         ));
+        // The ahead-of-stall refill task (design-free-grace-sustain §5.5,
+        // PR 4): single-flight per volume BY CONSTRUCTION (one task per
+        // laned co-writer engagement), off the allocation path — it
+        // samples the claim rate each tick and harvests when this
+        // allocator is OWED supply and its lane-reachable stock sits
+        // below the derived watermark, so the refill RTT leaves the
+        // writer's critical path. Tick = the 1 s checkpoint ceiling (the
+        // same physics floor the elastic passes clamp to — nothing about
+        // the loop's answers changes faster). Exits when the allocator
+        // drops (the Weak upgrade fails) — nothing joins it, so
+        // `detached::contain` owns its panic accounting (RES-8).
+        let weak = Arc::downgrade(alloc);
+        crate::meta_exec::spawn_meta_join("alloc_lane_ahead_refill", async move {
+            let origin = std::time::Instant::now();
+            loop {
+                squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(
+                    crate::meta_backend::kv::checkpoint::CHECKPOINT_MAX_AGE_MS as u64,
+                ))
+                .await;
+                let Some(alloc) = weak.upgrade() else {
+                    return;
+                };
+                let now_ms = origin.elapsed().as_millis() as u64;
+                let _ = alloc.ahead_refill_tick(now_ms).await;
+            }
+        });
     }
     let floor_kind = floor;
     let floor = match floor {

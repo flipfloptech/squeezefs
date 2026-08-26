@@ -3045,6 +3045,52 @@ impl PublishService {
                  zeros-interleave C8 mint)"
             ))
         })?;
+        // Finding 21 (PR 5 attempt 2's A1 killer): the NON-rehydrated
+        // composition can cross the value cap even when both inputs
+        // individually respected it — 32 scoped writers of one shared
+        // file compose here, and the verbatim inline encode was a
+        // permanent fsync failure (the KV refuses the record, the
+        // never-lossy retry recomposes the same over-cap value for
+        // ever; on a volume whose admission passes it, the record is
+        // the 2026-08-19 checkpoint-wedge mint instead). Same ceiling,
+        // same spill, as the rehydrated arm above.
+        let inline_cap = self
+            .inner
+            .xattr_value_cap(ino)
+            .saturating_sub(crate::routing::LAYOUT_INLINE_HEADROOM);
+        if encoded.len() > inline_cap {
+            let io = map_io.ok_or_else(|| {
+                SqueezefsError::InvalidOperation(format!(
+                    "S11: composed layout for ino {ino} crosses the inline ceiling \
+                     ({} B > {inline_cap} B) with no indirect-map hook — refusing \
+                     rather than staging the over-cap record (finding 21's \
+                     permanent-retry class)",
+                    encoded.len()
+                ))
+            })?;
+            let full_map = new.block_map.take().unwrap_or_default();
+            let mut sorted: Vec<(u32, String)> = full_map.into_iter().collect();
+            sorted.sort_unstable_by_key(|&(b, _)| b);
+            let (fresh, guard) = (io.write)(ino, sorted).await?;
+            new.block_map_id = Some(format!("indirect:{fresh}"));
+            if let Some(r) = refs.as_mut() {
+                crate::meta_backend::kv::indirect_map::push_map_blob_transfer_op(
+                    r, &fresh, ino, true,
+                );
+            }
+            blob_custody.fresh = Some(guard);
+            let encoded = crate::layout_wire::encode_layout(&new).map_err(|e| {
+                SqueezefsError::InvalidOperation(format!(
+                    "S11: custody-scoped layout re-encode failed for ino {ino} ({e}) — \
+                     refusing rather than applying range holder '{client}'s Put verbatim \
+                     (the zeros-interleave C8 mint)"
+                ))
+            })?;
+            crate::fuse_client::METRICS
+                .publish_compose_spills
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok((encoded, refs, blob_custody));
+        }
         Ok((encoded, refs, blob_custody))
     }
 

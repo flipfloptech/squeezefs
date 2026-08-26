@@ -1,0 +1,274 @@
+IOR-4.0.0: MPI Coordinated Test of Parallel I/O
+Began               : Wed Aug 26 16:54:28 2026
+Command line        : /home/justin/Source/squeezefs/target/mw-ior/ior-4.0.0/src/ior -a POSIX -b 4m -t 4m -s 80 -w -e -k -E -G 78613020 -i 15 -o /mnt/sqz-mwfleet/m50/s11-mpiio.dat
+Machine             : Linux strixhalo
+TestID              : 0
+StartTime           : Wed Aug 26 16:54:28 2026
+Path                : /mnt/sqz-mwfleet/m50/s11-mpiio.dat
+FS                  : 128.0 GiB   Used FS: 98.8%   Inodes: 1.0 Mi   Used Inodes: 0.0%
+
+Options: 
+api                 : POSIX
+apiVersion          : 
+test filename       : /mnt/sqz-mwfleet/m50/s11-mpiio.dat
+access              : single-shared-file
+type                : independent
+segments            : 80
+ordering in a file  : sequential
+ordering inter file : no tasks offsets
+nodes               : 1
+tasks               : 32
+clients per node    : 32
+repetitions         : 15
+xfersize            : 4 MiB
+blocksize           : 4 MiB
+aggregate filesize  : 10 GiB
+
+Results: 
+WARNING: The file "/mnt/sqz-mwfleet/m50/s11-mpiio.dat" exists already and will be overwritten
+
+access    bw(MiB/s)  IOPS       Latency(s)  block(KiB) xfer(KiB)  open(s)    wr/rd(s)   close(s)   total(s)   iter
+------    ---------  ----       ----------  ---------- ---------  --------   --------   --------   --------   ----
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 10737418240
+WARNING: Stat() of aggregate file size      = 10619977728
+WARNING: Using actual aggregate bytes moved = 10737418240
+write     265.95     75.40      4.59        4096       4096       0.002279   33.95      34.72      38.50      0   
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 10737418240
+WARNING: Stat() of aggregate file size      = 10619977728
+WARNING: Using actual aggregate bytes moved = 10737418240
+write     302.10     78.17      32.22       4096       4096       0.000316   32.75      31.42      33.90      1   
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 10737418240
+WARNING: Stat() of aggregate file size      = 10619977728
+WARNING: Using actual aggregate bytes moved = 10737418240
+write     309.63     78.29      2.64        4096       4096       0.000315   32.70      30.66      33.07      2   
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 10737418240
+WARNING: Stat() of aggregate file size      = 10619977728
+WARNING: Using actual aggregate bytes moved = 10737418240
+write     315.69     80.21      3.89        4096       4096       0.000305   31.92      31.11      32.44      3   
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 10737418240
+WARNING: Stat() of aggregate file size      = 10619977728
+WARNING: Using actual aggregate bytes moved = 10737418240
+write     321.91     81.24      3.09        4096       4096       0.000389   31.51      29.59      31.81      4   
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 10737418240
+WARNING: Stat() of aggregate file size      = 10619977728
+WARNING: Using actual aggregate bytes moved = 10737418240
+write     316.65     80.30      3.90        4096       4096       0.000360   31.88      29.68      32.34      5   
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 10737418240
+WARNING: Stat() of aggregate file size      = 10619977728
+WARNING: Using actual aggregate bytes moved = 10737418240
+write     306.53     76.64      3.11        4096       4096       0.000352   33.40      31.61      33.41      6   
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 10737418240
+WARNING: Stat() of aggregate file size      = 10619977728
+WARNING: Using actual aggregate bytes moved = 10737418240
+write     312.61     80.03      3.47        4096       4096       0.000263   31.99      31.28      32.76      7   
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 10737418240
+WARNING: Stat() of aggregate file size      = 10619977728
+WARNING: Using actual aggregate bytes moved = 10737418240
+write     301.04     82.72      3.31        4096       4096       0.000374   30.95      31.89      34.02      8   
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 10737418240
+WARNING: Stat() of aggregate file size      = 10619977728
+WARNING: Using actual aggregate bytes moved = 10737418240
+write     1975.71    494.17     3.27        4096       4096       0.000355   5.18       3.82       5.18       9   
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 10737418240
+WARNING: Stat() of aggregate file size      = 10619977728
+WARNING: Using actual aggregate bytes moved = 10737418240
+write     241.26     81.24      1.65        4096       4096       0.000292   31.51      41.28      42.44      10  
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 10737418240
+WARNING: Stat() of aggregate file size      = 10619977728
+WARNING: Using actual aggregate bytes moved = 10737418240
+write     316.37     80.91      6.68        4096       4096       0.000382   31.64      30.71      32.37      11  
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 10737418240
+WARNING: Stat() of aggregate file size      = 10619977728
+WARNING: Using actual aggregate bytes moved = 10737418240
+write     307.92     78.93      3.49        4096       4096       0.000311   32.43      31.42      33.26      12  
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 10737418240
+WARNING: Stat() of aggregate file size      = 10619977728
+WARNING: Using actual aggregate bytes moved = 10737418240
+write     307.31     77.68      3.05        4096       4096       0.000316   32.95      31.86      33.32      13  
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 10737418240
+WARNING: Stat() of aggregate file size      = 10619977728
+WARNING: Using actual aggregate bytes moved = 10737418240
+write     314.80     82.32      3.76        4096       4096       0.000548   31.10      30.97      32.53      14  
+
+Summary of all tests:
+Operation   Max(MiB)   Min(MiB)  Mean(MiB)     StdDev   Max(OPs)   Min(OPs)  Mean(OPs)     StdDev    Mean(s) Stonewall(s) Stonewall(MiB) Test# #Tasks tPN reps fPP reord reordoff reordrand seed segcnt   blksiz    xsize aggs(MiB)   API RefNum
+write        1975.71     241.26     414.36     417.80     493.93      60.31     103.59     104.45   32.08899         NA            NA     0     32  32   15   0     0        1         0    0     80  4194304  4194304   10240.0 POSIX      0
+Finished            : Wed Aug 26 17:02:29 2026

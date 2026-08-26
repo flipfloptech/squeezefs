@@ -455,3 +455,64 @@ the frees not shipping under the degraded posture.
   share a root — a double-entered free retires the offset's incarnation
   word a second time while its next owner is mid-settle. Red-first loop
   next; the counted-run law restarts the acceptance count after the fix.
+
+## Findings 19/20 fixed; attempt 2 (2026-08-26, dev `c344e517`) — a NEW class, finding 21
+
+Findings 19/20 landed as the verdict-aware shipped-free retire (dev
+`c344e517`: `Refused` retires nothing locally, `NonTerminal` releases one
+reference and never touches the word; contracts
+`a_refused_free_verdict_retires_nothing_locally` +
+`a_nonterminal_free_verdict_never_destabilizes_the_word`; full gate
+green). **Attempt 2** (row `s11mpiio-1787770373`, archived at
+`.benchmarks/rows-pr5-attempt2/`): probe **2,083 MiB/s** (highest yet),
+fleet-wide error census ZERO tripwires / ZERO double-releases / ZERO
+ENOSPC at the abort instant — findings 19/20's classes are DEAD. A1
+itself then died on **finding 21**: the ack-early overlay publish's
+coalesced record breached the KV per-volume value cap ("record value
+length 66,109 exceeds the per-volume cap 65,792") and the never-lossy
+retry recomposed the SAME over-cap value for ever — a permanent fsync
+failure (errno 7 latched, ior abort). Attributed code-exact: the
+NON-rehydrated tail of `custody_scoped_layout` composed 32 scoped
+writers' Puts past the cap with NO spill arm (the K2 fix's site-(c)
+comment claimed it spilled; it did not). Fixed as dev `1ddc9fda` —
+the tail runs the SAME ceiling + CoW-blob spill as the rehydrated arm,
+counted `publish_compose_spills`; contract
+`an_armed_scoped_put_crossing_the_inline_cap_composes_to_indirect`.
+
+## PR 5 acceptance attempt 3 (2026-08-26, dev `1ddc9fda`) — ALL FOUR PHASES COMPLETE; the A-B-B-A gate PASSES; the row is INVALID on engagement — finding 22
+
+Row `s11mpiio-1787775532`, 2×64 GiB, archived at
+`.benchmarks/rows-pr5-attempt3/`. **The first row in the campaign to
+complete A-B-B-A end to end**: probe 1,918 MiB/s; A1 shared 605.9 steady;
+B1 248.1; B2 264.3; A2 shared 425.0 — **shared ≥ 0.8× disjoint in BOTH
+brackets (min 1.608×)**, engagement per-mount exact on the ranged
+ledgers (acquires+extensions ≈ 15.7 k/mount, publishes ≈ 121 k/mount),
+authority `conflicts d=0` on the ranged phases, and the shrink ledgers
+PERFECT (A1: 82 ≡ 82 acks + 0 fence; A2: 80 ≡ 80 + 0 — finding 16's
+carrier at steady state). Free-grace: `forced_releases` 0,
+`laggard_fences` 0, `alloc_stalls` 0 across the row; `prod_decays` +18
+(finding 18 engaging); compose spills 0 with `publish_blob_composes`
++5,055 (the rehydrated arm carried every compose — finding 21's arm is
+the guard, not the steady path, on this shape).
+
+**The row is INVALID on the matrix's own engagement gate**: the
+range-shared clauses moved on the AUTHORITY's mount (prs +26, ors +8)
+plus 24 `read_settle_lost_serialized` tripwires — ALL in the fpp phases
+(per-phase split: B1 carries prs/ors + 12 tripwires, B2 the other 12;
+the ranged phases are clean), all on m0, all co-writers at 0.
+
+**Finding 22 — the bridge-ask refusal storm on the fpp shape**: m0's log
+carries **285,495** "bridge ask" refusal lines — a co-writer's required
+span overlapping TWO of its own live grants, the §9.2 shape the design
+says "a client whose range cache answers covering probes never builds";
+the fpp clients build it in a LOOP (the POSIX-5 retry ladder re-asks the
+same span), driving `dlm_custody_conflicts` +92.6 k in the fpp phases,
+and the unacquirable writes fall through to the authority-assembled
+path — which is what moves prs/ors and races m0's settle reads (the 24
+tripwires, one wedged block retried across both phases). Root-cause
+directions for the red loop: (a) the client's covering probe must
+answer from the union of its OWN two grants; (b) the admit-time merge
+left two abutting same-holder grants unmerged (why?); (c) the bridge
+ask could legally be admitted by splitting the required across the
+holder's own grants. The fpp inos' grants come from the doubling/trim
+interplay on single-writer files — no peer is involved at all.

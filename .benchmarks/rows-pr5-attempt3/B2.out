@@ -1,0 +1,492 @@
+IOR-4.0.0: MPI Coordinated Test of Parallel I/O
+Began               : Wed Aug 26 16:44:44 2026
+Command line        : /home/justin/Source/squeezefs/target/mw-ior/ior-4.0.0/src/ior -a POSIX -b 4m -t 4m -s 80 -w -e -k -E -G 78613020 -i 15 -F -o /mnt/sqz-mwfleet/m50/s11-mpiio-fpp.dat
+Machine             : Linux strixhalo
+TestID              : 0
+StartTime           : Wed Aug 26 16:44:44 2026
+WARNING: The file "/mnt/sqz-mwfleet/m56/s11-mpiio-fpp.dat.00000027" exists already and will be overwritten
+WARNING: The file "/mnt/sqz-mwfleet/m57/s11-mpiio-fpp.dat.00000030" exists already and will be overwritten
+WARNING: The file "/mnt/sqz-mwfleet/m54/s11-mpiio-fpp.dat.00000017" exists already and will be overwritten
+WARNING: The file "/mnt/sqz-mwfleet/m54/s11-mpiio-fpp.dat.00000019" exists already and will be overwritten
+WARNING: The file "/mnt/sqz-mwfleet/m51/s11-mpiio-fpp.dat.00000005" exists already and will be overwritten
+WARNING: The file "/mnt/sqz-mwfleet/m54/s11-mpiio-fpp.dat.00000018" exists already and will be overwritten
+WARNING: The file "/mnt/sqz-mwfleet/m51/s11-mpiio-fpp.dat.00000004" exists already and will be overwritten
+WARNING: The file "/mnt/sqz-mwfleet/m51/s11-mpiio-fpp.dat.00000006" exists already and will be overwritten
+WARNING: The file "/mnt/sqz-mwfleet/m50/s11-mpiio-fpp.dat.00000001" exists already and will be overwritten
+WARNING: The file "/mnt/sqz-mwfleet/m52/s11-mpiio-fpp.dat.00000010" exists already and will be overwritten
+WARNING: The file "/mnt/sqz-mwfleet/m50/s11-mpiio-fpp.dat.00000002" exists already and will be overwritten
+WARNING: The file "/mnt/sqz-mwfleet/m50/s11-mpiio-fpp.dat.00000003" exists already and will be overwritten
+WARNING: The file "/mnt/sqz-mwfleet/m56/s11-mpiio-fpp.dat.00000026" exists already and will be overwritten
+WARNING: The file "/mnt/sqz-mwfleet/m55/s11-mpiio-fpp.dat.00000021" exists already and will be overwritten
+WARNING: The file "/mnt/sqz-mwfleet/m56/s11-mpiio-fpp.dat.00000024" exists already and will be overwritten
+WARNING: The file "/mnt/sqz-mwfleet/m55/s11-mpiio-fpp.dat.00000022" exists already and will be overwritten
+WARNING: The file "/mnt/sqz-mwfleet/m55/s11-mpiio-fpp.dat.00000023" exists already and will be overwritten
+WARNING: The file "/mnt/sqz-mwfleet/m53/s11-mpiio-fpp.dat.00000012" exists already and will be overwritten
+WARNING: The file "/mnt/sqz-mwfleet/m53/s11-mpiio-fpp.dat.00000013" exists already and will be overwritten
+WARNING: The file "/mnt/sqz-mwfleet/m54/s11-mpiio-fpp.dat.00000016" exists already and will be overwritten
+WARNING: The file "/mnt/sqz-mwfleet/m57/s11-mpiio-fpp.dat.00000029" exists already and will be overwritten
+WARNING: The file "/mnt/sqz-mwfleet/m57/s11-mpiio-fpp.dat.00000031" exists already and will be overwritten
+WARNING: The file "/mnt/sqz-mwfleet/m55/s11-mpiio-fpp.dat.00000020" exists already and will be overwritten
+WARNING: The file "/mnt/sqz-mwfleet/m52/s11-mpiio-fpp.dat.00000009" exists already and will be overwritten
+WARNING: The file "/mnt/sqz-mwfleet/m57/s11-mpiio-fpp.dat.00000028" exists already and will be overwritten
+WARNING: The file "/mnt/sqz-mwfleet/m52/s11-mpiio-fpp.dat.00000008" exists already and will be overwritten
+WARNING: The file "/mnt/sqz-mwfleet/m51/s11-mpiio-fpp.dat.00000007" exists already and will be overwritten
+WARNING: The file "/mnt/sqz-mwfleet/m53/s11-mpiio-fpp.dat.00000014" exists already and will be overwritten
+WARNING: The file "/mnt/sqz-mwfleet/m52/s11-mpiio-fpp.dat.00000011" exists already and will be overwritten
+WARNING: The file "/mnt/sqz-mwfleet/m56/s11-mpiio-fpp.dat.00000025" exists already and will be overwritten
+WARNING: The file "/mnt/sqz-mwfleet/m53/s11-mpiio-fpp.dat.00000015" exists already and will be overwritten
+Path                : /mnt/sqz-mwfleet/m50/s11-mpiio-fpp.dat.00000000
+FS                  : 128.0 GiB   Used FS: 99.2%   Inodes: 1.0 Mi   Used Inodes: 0.0%
+
+Options: 
+api                 : POSIX
+apiVersion          : 
+test filename       : /mnt/sqz-mwfleet/m50/s11-mpiio-fpp.dat
+access              : file-per-process
+type                : independent
+segments            : 80
+ordering in a file  : sequential
+ordering inter file : no tasks offsets
+nodes               : 1
+tasks               : 32
+clients per node    : 32
+repetitions         : 15
+xfersize            : 4 MiB
+blocksize           : 4 MiB
+aggregate filesize  : 10 GiB
+
+Results: 
+WARNING: The file "/mnt/sqz-mwfleet/m50/s11-mpiio-fpp.dat.00000000" exists already and will be overwritten
+
+access    bw(MiB/s)  IOPS       Latency(s)  block(KiB) xfer(KiB)  open(s)    wr/rd(s)   close(s)   total(s)   iter
+------    ---------  ----       ----------  ---------- ---------  --------   --------   --------   --------   ----
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+write     262.65     73.12      33.77       4096       4096       0.000299   35.01      34.24      38.99      0   
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+write     270.79     73.22      33.71       4096       4096       0.000299   34.96      34.59      37.82      1   
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+write     261.66     74.22      33.90       4096       4096       0.000382   34.49      35.53      39.13      2   
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+write     264.55     74.03      33.91       4096       4096       0.000924   34.58      36.96      38.71      3   
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+write     269.19     73.17      34.22       4096       4096       0.000405   34.98      34.54      38.04      4   
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+write     266.57     74.33      33.36       4096       4096       0.000406   34.44      37.15      38.41      5   
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+write     262.24     73.66      33.63       4096       4096       0.000358   34.75      36.31      39.05      6   
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+write     262.66     73.87      34.20       4096       4096       0.000443   34.66      34.32      38.99      7   
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+write     261.31     73.85      33.95       4096       4096       0.000383   34.66      37.61      39.19      8   
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+write     265.46     73.69      34.24       4096       4096       0.000405   34.74      34.76      38.58      9   
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+write     271.06     73.47      33.67       4096       4096       0.000308   34.84      34.35      37.78      10  
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+write     267.46     74.49      33.90       4096       4096       0.000354   34.37      35.42      38.29      11  
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+write     241.18     63.94      33.02       4096       4096       0.000461   40.04      41.01      42.46      12  
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+write     270.53     73.52      32.74       4096       4096       0.000351   34.82      36.54      37.85      13  
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+write     265.44     74.12      33.46       4096       4096       0.000410   34.54      35.40      38.58      14  
+
+Summary of all tests:
+Operation   Max(MiB)   Min(MiB)  Mean(MiB)     StdDev   Max(OPs)   Min(OPs)  Mean(OPs)     StdDev    Mean(s) Stonewall(s) Stonewall(MiB) Test# #Tasks tPN reps fPP reord reordoff reordrand seed segcnt   blksiz    xsize aggs(MiB)   API RefNum
+write         271.06     241.18     264.18       6.97      67.76      60.29      66.05       1.74   38.78971         NA            NA     0     32  32   15   1     0        1         0    0     80  4194304  4194304   10240.0 POSIX      0
+Finished            : Wed Aug 26 16:54:26 2026

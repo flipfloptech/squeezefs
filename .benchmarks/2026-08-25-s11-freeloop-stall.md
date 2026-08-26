@@ -357,3 +357,36 @@ owner-side min-composition already named in the PR 2/3 residue); (2) the
 fpp phases' whole-file conflict class (+83 k, no ranges involved); (3)
 the once-seen double-release refusal; (4) PR 5's acceptance rung from
 zero on a venue that closes A-B-B-A.
+
+## Finding 18 — the beat terms miss their budgets: bound_age 15.5–22.6 s vs PR 5's ≤ 12 s gate (2026-08-26, attributed from the f16a row's own words)
+
+PR 5's gate (c) demands `free_grace_bound_age_ms` ≤ 12 s sustained. The
+f16a row ran 15.5–22.6 s at every phase snapshot — so the acceptance
+rung cannot pass today regardless of venue sizing. The row's own words
+decompose the overrun (all from `.benchmarks/rows-f16a-carrier/`,
+m51@p3 + m0 phase snaps):
+
+| Term | Design budget (§5.7 post-fix) | Measured | Reading |
+|---|---|---|---|
+| member ladder (qualify+drain+pass grain) | ~6–8 s | `free_grace_acked_lag_ms` **6,293** | ON budget — the PR 2 pipeline works (`ack_pipeline_depth` 3, promote lag ≈ its own arithmetic) |
+| learn→acked label distance (member-side end-to-end) | — | learned 1,648,211 − acked 1,633,864 = **14,347 label-ms** | ~8 s of beat terms stack AROUND the on-budget ladder |
+| T1 learn + T5 carry (the renewal beat, both directions) | ≤ 1 s each (prodded) | mean membership beat ≈ **2.3 s** (m0 renewals p1→p3: 4,005 over 1,167 s ÷ 8 members) while `free_grace_prod_renew_ms` = 1,000 is in force and 4,113 prods fired | the 1 s prodded cadence covers only ~3 of 8 members at any instant (prods ÷ wall ≈ 2.6/s); on a fleet where EVERY member defers frees continuously, the waiting-on set rotates across all 8, so most beats run wider than the prod's ask |
+| T8 min-composition + publish | ≤ +1–2 s | bound (min across 8) trails m51's own acked (1,633,640 vs 1,633,864 at p3); `bound_age` 15,475–22,621 | the min inherits the WIDEST member's stacked beats, not the mean |
+
+Also live in the row: `free_grace_pressure_pct` 94 at p3 with
+`fence_bound_ms` 40,396 tightened from base 76,045 (the valve at work),
+tightenings 172 k, and the never-corrupt arms 0 throughout
+(`forced_releases`/`laggard_fences`/`alloc_stalls`). m51's
+`free_grace_pass_prods` = 0 — L2b correctly inert (pass interval already
+at the 1 s floor).
+
+**The finding:** the ladder (PR 2) meets its budget; the BEAT terms
+(T1/T5/T8 — the prod's coverage, not its cadence) do not. The prod
+reaches the members the owner is CURRENTLY waiting on, but on an
+all-writers fleet the min rotates, so the composed bound_age lands at
+15–22 s. Fix shape to investigate red-first: prod COVERAGE on a fleet
+where every member holds deferred labels (the "newest label" watermark
+reads everyone as behind, yet delivered prods cover ~⅓ of beats — either
+the prod is rate-limited below the fleet's need or its waiting-on set is
+computed against the wrong watermark), and the min-composition's
+publish-per-beat quantization. Both are owner-side, venue-independent.

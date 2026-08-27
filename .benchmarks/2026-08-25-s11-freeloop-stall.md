@@ -571,3 +571,51 @@ wrappers. Residual (board): the free wire still carries no incarnation
 witness — the narrow freed→reallocated→unpublished window is closed by
 no known mint but not by construction; a witness is a publish-schema
 candidate if `block_live_free_refusals` ever moves in the field.
+
+## Attempt 5 (2026-08-27, binary `a434b856` — f23 landed): f23 verified engaged; finding 24 found
+
+From zero at the fixed 2.2 GHz posture (row `s11mpiio-1787872718`,
+archived `/tmp/rows-pr5-attempt5` + m0/m56 logs; watchdog silent).
+**f22 and f23 both verified live**: bridge asks 0, the mint gate skipped
+97 foreign blob frees on m50 alone, untracked-free refusals **325 → 4**,
+zero fsync-EIO wedges on six of eight co-writers. A1 opened at **2,746
+MiB/s** (~3× attempt 3) and still failed the sustained gate (→ 1,325).
+
+## Finding 24 — the residual duplicate's full causal chain (fixed `fcc13c50`, red `a4a13332`)
+
+The four residual duplicates came through f23's DOCUMENTED holes, and
+one of them toppled the fleet:
+
+1. **The mint's sampling gap**: the gate keyed on `range_span_hull` —
+   LIVE grants — and the trim/doubling churn retires an ino's whole
+   grant set for an instant; a save in that gap ships the refetched-blob
+   duplicate again (the 4 refusals).
+2. **The shield's unpublished window**: one duplicate landed after the
+   offset was freed → reallocated → written-but-unpublished. No ledger
+   reference exists yet (`population 0 < refcount 1`), so the f23 guard
+   passed and the executor freed the MID-WRITE block (block 2266 of the
+   shared ino — 32 `read_settle_lost_serialized` tripwires, m56's 16
+   settle-EIO fsync failures).
+3. **The amplification** (designed behavior meeting a wedged member):
+   m56's wedge stalled its freed-offset acks at 23:19:26; the grace
+   ring's min-acked release lag ballooned to **17.5 s** while the row
+   displaced ~675 blocks/s ⇒ ~47 GiB of freed-but-unreleased supply on a
+   64 GiB volume; by 23:19:40 the fleet hit lane ENOSPC on a
+   99.96 %-allocated volume ("0 free blocks belong to lanes this mount
+   does not own"), 28 fsync `StorageFull` failures, the same 112 MiB
+   (28 × 4 MiB) aggregate shortfall, and the throughput sawtooth the
+   sustained gate refused. The valve gauges (`pressure_pct` 0,
+   `alloc_stalls` 0, `forced_releases` 0) are honest: the ring itself
+   was nowhere near its designed limits — the laggard-fence ladder
+   (76 s) would have fenced m56 had the row lived that long.
+
+Fix (contracts in `tests/mw_cowriter_free_tests.rs`, both red on the
+exact mechanisms): the mint gate's discriminator is now the **monotone
+per-mount range-episode latch** (`tokens::range_episode` — set at every
+grant record, never cleared in production; a stale latch costs one
+leak-safe skipped free), and the executor refuses a tracked free whose
+**incarnation word is unstable** (claimed/mid-write; the claim tail
+marks it, the DMA-complete publish stabilizes it — no legitimate
+displaced free names an unstable offset). Fixture truth:
+`authority_file_with_block` now stabilizes the word the way production's
+publish does.

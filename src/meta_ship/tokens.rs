@@ -325,10 +325,35 @@ static STRETCH_CEILINGS: Lazy<scc::HashMap<u64, StretchCeiling>> = Lazy::new(scc
 /// estimate's shape).
 const STRETCH_CEILING_BYTES: u64 = 24;
 
+/// Finding 24 (`.benchmarks/2026-08-25-s11-freeloop-stall.md`): per-ino
+/// RANGE-EPISODE latch — MONOTONE for the mount's life. The f23 blob-
+/// lifecycle gate keyed on [`range_span_hull`], which samples the LIVE
+/// grants: the trim/doubling churn retires an ino's whole grant set for
+/// an instant, and a save landing in that gap claimed the refetched
+/// owner-composed blob again (attempt 5's 4 residual duplicate frees —
+/// one of which freed a mid-write reallocated block and ENOSPC'd the
+/// fleet). "This ino has been range-shared on this mount" is a monotone
+/// fact, so the latch never clears in production (deliberately not part
+/// of [`clear_range_grants`] — a custody-era end does not un-share the
+/// blobs a stale cached head may still name); the cost of a stale latch
+/// is one leak-safe skipped blob free per save, counted on
+/// `publish_blob_foreign_free_skips`. ~8 B per ever-granted ino.
+static RANGE_EPISODES: Lazy<scc::HashSet<u64>> = Lazy::new(scc::HashSet::new);
+
+/// `true` ⇔ `ino` has held a byte-range grant at ANY point in this
+/// mount's life — the f24 sticky discriminator the blob-lifecycle gate
+/// keys on (a live-grant probe is [`range_span_hull`]).
+pub fn range_episode(ino: u64) -> bool {
+    RANGE_EPISODES.contains_sync(&ino)
+}
+
 /// Record (or WIDEN — same token, wider span: the admit-time merge's
 /// client face) a granted range.
 pub fn record_range_grant(ino: u64, span: (u64, u64), token: u64) {
     ensure_token_cache_r5();
+    // Finding 24: the monotone episode latch — set here, cleared only by
+    // the test-hygiene reset.
+    let _ = RANGE_EPISODES.insert_sync(ino);
     let mut added = 0i64;
     let mut update = |spans: &mut Vec<RangeSpan>| {
         if let Some(existing) = spans.iter_mut().find(|s| s.token == token) {
@@ -629,6 +654,7 @@ pub fn replace_range_grants(entries: &[(u64, (u64, u64), u64)]) {
 /// arm and the renewal rebuild deliberately.
 pub fn test_clear_range_cache() {
     clear_range_grants();
+    RANGE_EPISODES.retain_sync(|_| false);
 }
 
 /// Register `dlm_token_cache_bytes` with the R5 authority (§9.2: the

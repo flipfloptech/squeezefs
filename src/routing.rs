@@ -6146,9 +6146,13 @@ impl DataRouter {
         // custody (no live range grants) keeps today's behavior — there the
         // shipper's view is exclusive and its tail IS the designed
         // lifecycle owner.
+        // Finding 24: the discriminator is the STICKY per-mount range
+        // EPISODE, never the live-grant hull — the trim/doubling churn
+        // retires an ino's whole grant set for an instant, and a save in
+        // that gap re-opened the duplicate free (attempt 5's residual).
         let foreign_blob_lifecycle = crate::fuse_client::co_writer_mount()
             && !crate::cowriter::authority_accounting_scope_active()
-            && crate::meta_ship::tokens::range_span_hull(ino).is_some()
+            && crate::meta_ship::tokens::range_episode(ino)
             && !m.block_map_id_own_mint;
 
         // PR VL6a: a freshly allocated indirect blob is registered

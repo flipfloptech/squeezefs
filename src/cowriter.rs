@@ -1807,6 +1807,29 @@ pub async fn execute_shipped_frees(
                 // freed the live successor's block on the attempt-4 row
                 // (the `read_settle_lost_serialized` storm, fsync EIO, a
                 // 112 MiB aggregate loss). Refuse — leak-safe, counted.
+                // Finding 24's arm of the same shield: a tracked offset
+                // whose incarnation word is UNSTABLE is CLAIMED and
+                // mid-write — the claim tail marks it, the DMA-complete
+                // publish stabilizes it — so its live successor has no
+                // ledger reference yet and the population guard below
+                // cannot see it (attempt 5's block-2266 kill: the freed
+                // mid-write block wedged its holder's settle reads, the
+                // stalled acks flooded the grace ring, and the fleet
+                // ENOSPC'd). No legitimate displaced free names an
+                // unstable offset: the displaced block's last event was
+                // its own publish.
+                Some(n) if n > 0 && alloc.fill_incarnation(offset).is_none() => {
+                    log::error!(
+                        "S9: shipped free of block {idx} (vol_tag {vol_tag:#016x}) names an \
+                         offset whose incarnation word is UNSTABLE (claimed/mid-write by its \
+                         current owner, {n} RAM reference(s)) — a stale duplicate of a dead \
+                         lifetime; refused (block_live_free_refusals)"
+                    );
+                    crate::fuse_client::METRICS
+                        .block_live_free_refusals
+                        .fetch_add(1, Ordering::Relaxed);
+                    FreeVerdict::Refused
+                }
                 Some(n) if n > 0 && populations[slot] >= n as usize => {
                     log::error!(
                         "S9: shipped free of block {idx} (vol_tag {vol_tag:#016x}) names an \

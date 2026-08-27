@@ -542,6 +542,12 @@ impl CoWriter {
 /// reference committed and the authority's RAM map tracking it — the state
 /// an authority-written striped file leaves behind.
 async fn authority_file_with_block(auth: &Authority, name: &str, idx: u64) -> u64 {
+    // Production truth (finding 24's instability arm): an authority-
+    // written striped block's incarnation word is STABLE by the time any
+    // displaced free can name it — the claim tail marked it unstable and
+    // the DMA-complete publish stabilized it. The fixtures skip the DMA,
+    // so the stabilization is explicit here.
+    auth.alloc.publish_block(idx * auth.alloc.chunk_size());
     let ino = auth
         .meta
         .create_with_rdev_size(1, name, 0o100644, 0, 0, 0, 0)

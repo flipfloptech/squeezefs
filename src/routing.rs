@@ -3722,6 +3722,18 @@ pub static TEST_TIER_PUBLISH_POST_PUT_STALL_MS: std::sync::atomic::AtomicU64 =
 pub static TEST_BINDING_RECHECK_DELAY_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Test seam (same contract as [`TEST_BINDING_RECHECK_DELAY_MS`], the
+/// throttled-box storm-stall flake's round 3 — 2026-08-26): a nonzero
+/// value OVERRIDES the rebind ladder's non-escalating exhaustion cap
+/// (`MAX_REBINDS`, 24) so the engagement contracts in
+/// `tests/rebind_starvation_tests.rs` can force the settle-arm handoff
+/// deterministically — 24 CONSECUTIVE storm wins is a schedule lottery on
+/// a clock-capped box (pre-fix 3/20 misses), while the arm's LAW (loss
+/// exhaustion escalates, never EIO) is cap-independent. One relaxed load
+/// per ladder entry, zero-cost when unset; never a `#[cfg(test)]` fork.
+pub static TEST_REBIND_LADDER_CAP: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Test seam (same contract as [`TEST_TIER_PUBLISH_DELAY_MS`]): artificial
 /// delay, in milliseconds, injected in the single-flight PRIMARY between
 /// its completed device fetch and its cache deposits — the window where the
@@ -9258,7 +9270,10 @@ impl DataRouter {
         let ladder_cap = if escalate_contended {
             SETTLE_HANDOFF
         } else {
-            MAX_REBINDS
+            match TEST_REBIND_LADDER_CAP.load(Ordering::Relaxed) {
+                0 => MAX_REBINDS,
+                cap => cap,
+            }
         };
         // Fill provenance (the transient stream window, 2026-07-29):
         // computed ONCE per call — a file holding a fresh §5.3 streaming

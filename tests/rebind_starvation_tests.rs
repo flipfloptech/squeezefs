@@ -97,10 +97,35 @@ impl SeamGuard {
         squeezefs::routing::TEST_BINDING_RECHECK_DELAY_MS.store(ms, Ordering::Relaxed);
         SeamGuard
     }
+
+    /// Widen the seam for an ENGAGEMENT retry round (the throttled-box
+    /// storm-stall flake, round 2 — 2026-08-26, attributed pre-f23 at
+    /// 3/20 on the 1.8 GHz-capped box): the settle arm engages only when
+    /// the storm's merge cycle beats the ladder's recheck 24 consecutive
+    /// times, and a stalled cycle (conveyor barriers on a slow clock) can
+    /// outlast a FIXED window in every one of 12 rounds. Doubling the
+    /// window as unengaged rounds pass makes some round's window larger
+    /// than any legal stall — engagement becomes bounded instead of
+    /// probabilistic, and the never-EIO half is still pinned per round at
+    /// every width.
+    fn set(&self, ms: u64) {
+        squeezefs::routing::TEST_BINDING_RECHECK_DELAY_MS.store(ms, Ordering::Relaxed);
+    }
+
+    /// Round 3 of the storm-stall fix: shrink the NON-escalating ladder
+    /// cap (24 → `cap`) so the stripe-held exhaustion handoff needs `cap`
+    /// window wins instead of 24 CONSECUTIVE ones — the widened window
+    /// (round 2) still lost 1/20 when the STORM itself stalled mid-round.
+    /// The law under contract (exhaustion escalates, never EIO) is
+    /// cap-independent; 24 is the correctness envelope, not the law.
+    fn ladder_cap(&self, cap: usize) {
+        squeezefs::routing::TEST_REBIND_LADDER_CAP.store(cap, Ordering::Relaxed);
+    }
 }
 impl Drop for SeamGuard {
     fn drop(&mut self) {
         squeezefs::routing::TEST_BINDING_RECHECK_DELAY_MS.store(0, Ordering::Relaxed);
+        squeezefs::routing::TEST_REBIND_LADDER_CAP.store(0, Ordering::Relaxed);
     }
 }
 
@@ -365,6 +390,9 @@ async fn read_survives_stripe_free_displacement_storm_no_rebind_eio() {
     // legal-generation halves verbatim.
     let mut engaged = false;
     for round in 0..12u32 {
+        // Round 2 of the storm-stall fix: double the seam every 3
+        // unengaged rounds (100 -> 800 ms) — see `SeamGuard::set`.
+        _seam.set(SEAM_STRIPE_FREE_MS << (round / 3).min(3));
         purge_read_tiers(&h, ino).await;
         // The read-path posture: escalate_contended = true (no caller-held
         // stripe) — exactly what the FUSE/ipc read handlers pass.
@@ -595,12 +623,16 @@ async fn fold_seed_survives_stripe_free_displacement_storm_no_rebind_eio() {
     };
 
     let _seam = SeamGuard::arm(SEAM_STRIPE_FREE_MS);
+    _seam.ladder_cap(4);
     let before = METRICS.seed_settle_escalations.load(Ordering::Relaxed);
     // Engagement rounds (the face-1 venue-sensitivity note applies
     // verbatim): every round pins the never-EIO half; the loop retries —
     // bounded — until the caller-stripe settle arm provably engaged.
     let mut engaged = false;
     for round in 0..12u32 {
+        // Round 2 of the storm-stall fix: double the seam every 3
+        // unengaged rounds (100 -> 800 ms) — see `SeamGuard::set`.
+        _seam.set(SEAM_STRIPE_FREE_MS << (round / 3).min(3));
         // Park a fresh extent overlay with a DEFERRED seed in the stormed
         // block (an unaligned sub-block span is patch-ineligible — the W2
         // park; write-path seed fetches are deleted, so the seed defers

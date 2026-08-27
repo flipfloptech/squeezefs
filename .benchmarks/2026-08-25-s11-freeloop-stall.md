@@ -516,3 +516,58 @@ left two abutting same-holder grants unmerged (why?); (c) the bridge
 ask could legally be admitted by splitting the required across the
 holder's own grants. The fpp inos' grants come from the doubling/trim
 interplay on single-writer files — no peer is involved at all.
+
+## Attempt 4 (2026-08-26, binary `80c2430e` — f22 landed): finding 22 CLOSED live; finding 23 found
+
+Two launches, both from zero (counted-run law):
+
+* **Launch 1** (stock clocks): the probe ran 1,918 → phase A1 opened at
+  **2,626 MiB/s** — the f22 union-cover live for the first time — and
+  the package hit **94 °C**: the boost clock decayed and the sustained
+  gate correctly refused the row (2,626 → 1,421 MiB/s > 30 %). A venue
+  artifact, not a product decay; rows archived
+  (`/tmp/rows-pr5-attempt4a-venuefail`). Posture correction: acceptance
+  rows now run at a FIXED 2.2 GHz all-core cap (boost off) so the clock
+  cannot be the decaying term.
+* **Launch 2** (fixed 2.2 GHz, row `s11mpiio-1787784901`, archived
+  `/tmp/rows-pr5-attempt4b` + fleet logs): **finding 22 verified closed
+  live** — "bridge ask" refusal lines **285,495 → 0**, A1 opened ~3× the
+  attempt-3 rate. A1 still failed the sustained gate (1,799 → 1,211
+  MiB/s) — and this time the decay is real: **finding 23**.
+
+## Finding 23 — the indirect-map blob's free has ONE owner (fixed `1de4f86a`, red `99ea60c6`)
+
+The f22 fix unmasked a blob double-free lineage at full rate — the
+`f19-root` board item's double-ENTRY source, found:
+
+* **The mint**: the owner's scoped compose (`custody_scoped_layout`)
+  re-spills a fresh blob per served Put and frees the durable
+  predecessor itself (`free_after_commit`) — m0 ran **1,314 composes**.
+  Every co-writer whose cache invalidation refetched that
+  owner-composed head then claimed the SAME blob as its own
+  `old_indirect_to_free` lifecycle: up to 9 frees of one offset
+  (1 owner + 8 co-writers — the observed 3–9× refusal bursts, 325
+  `block_untracked_free_refusals`, ~40 refused frees per co-writer).
+* **The blast**: a duplicate landing after the offset was REALLOCATED
+  hit the executor's RAM-tracked arm (`refcount > 0`) and freed the
+  LIVE successor's block — **192 `read_settle_lost_serialized`
+  tripwires** all on block 547 of the shared ino, 48 settle-EIO each on
+  m50/m55, fsync EIO into ior, and a **112 MiB aggregate-size loss**
+  (28 × 4 MiB abandoned publishes downstream of the EIO churn).
+* **The third face** (found by the red loop's own fixture):
+  `persist_dirty_layout_if_needed`/`grow_layout_size` re-inserted their
+  pre-save clones after the save, clobbering the save's republished
+  entry — the cache then lied about the persisted head (next save
+  re-releases the old record, leaks the fresh blob).
+
+Fix (contracts `tests/mw_cowriter_free_tests.rs`, 3 red + 2 pins):
+provenance-gated mint (`CachedMetadata::block_map_id_own_mint`, stamped
+only by the save republish; a range-shared save frees only its OWN
+mints — skip counted on `publish_blob_foreign_free_skips`; solo and
+whole-file custody verbatim), ledger-shielded executor (a tracked free
+with `population ≥ refcount` names a dead lifetime — `Refused`, counted
+on `block_live_free_refusals`, must-stay-≈0), and clobber-free save
+wrappers. Residual (board): the free wire still carries no incarnation
+witness — the narrow freed→reallocated→unpublished window is closed by
+no known mint but not by construction; a witness is a publish-schema
+candidate if `block_live_free_refusals` ever moves in the field.

@@ -3459,3 +3459,183 @@ async fn a_range_shared_save_still_frees_its_own_minted_blob() {
     drop(cwr);
     auth.stop().await;
 }
+
+// ===========================================================================
+// 10. Finding 24 — the f23 gate's two documented residuals, closed
+// ===========================================================================
+//
+// Attempt 5 (`.benchmarks/2026-08-25-s11-freeloop-stall.md` finding 24):
+// f23 cut the duplicate mint 325 → 4 refusals, and one of the four
+// landed in the shield's documented narrow window — freed → REALLOCATED →
+// written-but-UNPUBLISHED (the ledger cannot justify the live reference
+// yet, so `population ≥ refcount` reads 0 ≥ 1 false and the executor
+// freed the mid-write block). The wedged holder's settle EIO then
+// stopped its freed-offset acks, the grace ring's release lag ballooned
+// to 17.5 s at ~675 displaced blocks/s, and the whole fleet ENOSPC'd on
+// a 99.96 %-allocated volume (28 fsync StorageFull failures, the same
+// 112 MiB shortfall). Two rungs:
+//
+// * the MINT's discriminator becomes STICKY: `range_span_hull` samples
+//   the LIVE grants, and under churn an ino's grants can all momentarily
+//   retire — the save in that gap claims the refetched blob again. A
+//   range EPISODE is a monotone per-mount fact;
+// * the SHIELD gains the instability arm: a tracked offset whose
+//   incarnation word is UNSTABLE (claimed / written-unpublished — the
+//   claim tail marks it, the publish stabilizes it) is mid-write by its
+//   CURRENT owner, and no legitimate displaced free names one (the
+//   displaced block's last event was its own publish).
+
+/// Contract (finding 24, the sticky episode): the blob-lifecycle gate
+/// holds through a grant-retirement gap — an ino that has EVER been
+/// range-shared on this mount keeps foreign-blob frees skipped even at
+/// an instant when no grant happens to be live. RED against dev: retire
+/// the grant and the hull-sampled gate ships the duplicate again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_range_episode_outlives_its_grants_for_the_blob_gate() {
+    let _serial = serial();
+    let _restore = restore();
+    squeezefs::meta_ship::tokens::test_clear_range_cache();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "f24-episode").await;
+    let dev = data_device(dir.path(), "f24-episode.dev");
+    let auth = Authority::start(&vol, &dev, &[NODE_A]).await;
+
+    let data_off = auth.alloc.allocate_block().await.expect("data block");
+    let data_idx = data_off / auth.alloc.chunk_size();
+    let ino = authority_file_with_block(&auth, "episodic.bin", data_idx).await;
+    let blob_off = auth.alloc.allocate_block().await.expect("map blob");
+    let blob_idx = blob_off / auth.alloc.chunk_size();
+    auth.meta
+        .commit_block_refs(
+            ino,
+            &[BlockRefOp::taken(BlockRef {
+                vol_tag: volume_tag(DATA_VOL),
+                block_idx: blob_idx,
+                owner_ino: ino,
+                block_index: squeezefs::meta_backend::kv::block_refs::BLOCK_INDEX_MAP_BLOB,
+            })],
+        )
+        .await
+        .expect("the durable MAP_BLOB record commits");
+
+    let cwr = CoWriter::join(&auth, &vol, &dev, NODE_A).await;
+    let stage = tempdir().unwrap();
+    let dlm = DlmClient::new().expect("dlm");
+    let router = save_router(&dlm, &cwr.alloc, &dev, &cwr.meta, stage.path()).await;
+
+    // The episode: a grant was recorded — and RETIRED before the save
+    // (the churn gap the trim/doubling interplay produces at every
+    // learned ceiling). The hull is empty at save time.
+    squeezefs::meta_ship::tokens::record_range_grant(ino, (0, 4 * 1024 * 1024), 9401);
+    squeezefs::meta_ship::tokens::retire_range_grant(ino, 9401);
+    assert!(
+        squeezefs::meta_ship::tokens::range_span_hull(ino).is_none(),
+        "fixture: no LIVE grant remains — the gap under contract"
+    );
+    router.metadata_cache.insert(
+        ino,
+        refetched_indirect_entry(
+            4 * 1024 * 1024,
+            &data_off.to_string(),
+            &blob_off.to_string(),
+        ),
+    );
+
+    let shipped_before = publish::stats().free_shipped_blocks;
+    let tok = dlm.get_fencing_token_ino(ino);
+    router
+        .persist_dirty_layout_if_needed(&format!("inode_{ino}"), tok)
+        .await
+        .expect("the save lands");
+    assert_eq!(
+        publish::stats().free_shipped_blocks - shipped_before,
+        0,
+        "the episode is STICKY: a grant-retirement gap never re-opens the \
+         refetched-blob free (attempt 5's 4 residual refusals)"
+    );
+    assert_eq!(auth.alloc.refcount(blob_off), Some(1));
+
+    squeezefs::meta_ship::tokens::test_clear_range_cache();
+    drop(cwr);
+    auth.stop().await;
+}
+
+/// Contract (finding 24, the shield's instability arm): a shipped free
+/// naming a tracked offset whose incarnation word is UNSTABLE — claimed
+/// and mid-write, not yet published — is REFUSED: the ledger cannot
+/// justify the live reference yet (population 0 < refcount 1), but the
+/// instability IS the evidence of a live successor. RED against dev: the
+/// executor frees the mid-write block (attempt 5's block-2266 kill — the
+/// settle wedge, the ack stall, the fleet ENOSPC).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shipped_free_of_a_mid_write_reallocated_offset_is_refused() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "f24-shield").await;
+    let dev = data_device(dir.path(), "f24-shield.dev");
+    let auth = Authority::start(&vol, &dev, &[NODE_A]).await;
+
+    let old_off = auth.alloc.allocate_block().await.expect("mint");
+    let old_idx = old_off / auth.alloc.chunk_size();
+    let ino = authority_file_with_block(&auth, "victim24.bin", old_idx).await;
+    auth.alloc.publish_block(old_off);
+
+    // The legitimate free: rewrite releases the reference, the verb runs
+    // the ladder, the offset returns to the supply.
+    let cwr = CoWriter::join(&auth, &vol, &dev, NODE_A).await;
+    let _new_idx = cwr.rewrite_block(ino, 0, old_idx).await;
+    cwr.br
+        .free_block(&old_off.to_string())
+        .await
+        .expect("the displaced free ships");
+    auth.br.reclaim_drain().await;
+    assert!(auth.free_listed(old_idx), "the first free executed");
+
+    // The REALLOCATION, caught mid-write: the claim tail tracked the
+    // offset (refcount 1) and marked its incarnation UNSTABLE; no
+    // durable reference exists yet (the publish has not run).
+    let reused = auth.alloc.allocate_block().await.expect("reallocate");
+    assert_eq!(reused, old_off, "free-list-first hands the offset back");
+    assert_eq!(auth.alloc.refcount(old_off), Some(1));
+    assert_eq!(
+        auth.alloc.fill_incarnation(old_off),
+        None,
+        "fixture: the claim tail left the word UNSTABLE (mid-write)"
+    );
+    assert_eq!(
+        auth.population(old_idx).await,
+        0,
+        "unpublished: no ledger ref yet"
+    );
+
+    // The stale duplicate lands exactly in the window.
+    let verdicts = publish::ship_free_blocks(
+        &auth.endpoint,
+        volume_tag(DATA_VOL),
+        vec![old_idx],
+        cwr.client.lease_epoch(),
+        0xF24_0001,
+    )
+    .await
+    .expect("the verb travels");
+    assert_eq!(
+        verdicts,
+        vec![publish::FreeVerdict::Refused],
+        "a free of a mid-write (unstable-incarnation) tracked offset is \
+         REFUSED — the live successor's DMA is in flight"
+    );
+    assert_eq!(
+        auth.alloc.refcount(old_off),
+        Some(1),
+        "the live successor's RAM reference is untouched"
+    );
+    auth.br.reclaim_drain().await;
+    assert!(
+        !auth.free_listed(old_idx),
+        "the mid-write block never re-entered the free list"
+    );
+
+    drop(cwr);
+    auth.stop().await;
+}

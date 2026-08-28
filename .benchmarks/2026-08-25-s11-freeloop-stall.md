@@ -867,3 +867,27 @@ rate × lag product ≥ supply, assert the valve's graded signal rises and
 the tightening floors the bound BEFORE allocation refuses (today:
 pressure 0, ENOSPC, fsync EIO, MPI abort). Note: gate (c)'s bound_age
 ≤ 12 s fails on this venue for the same reason — one fix, two gates.
+
+### Finding 29 corrected (instrument honesty + code walk)
+
+The "pressure read 0 the whole time" claim was a SNAPSHOT ARTIFACT: the
+runway reading is TTL-gated (`live_runway_ms` expires within one
+routine beat), and the gauges were read AFTER the abort — a stopped
+row's pressure always reads 0. The routine harvest DOES carry the real
+free supply (`harvest_grace` → `harvest_with_supply`), so the graded
+signal was likely high mid-row. What the CUMULATIVE counters prove
+(valid post-abort): at the allocation cliff, with the in-transit
+population holding ~99.9 % of both volumes and `bound_age` 22.4 s, the
+ladder's LAST-RESORT arms never fired — `free_grace_forced_releases` 0,
+`free_grace_laggard_fences` 0, `free_grace_alloc_stalls` 0 — while
+StorageFull escaped through 47 retries into the application's fsync as
+EIO (rank abort). §6.8's own law ("a reader that fails to acknowledge
+is FENCED, not waited on, because an unbounded wait converts a slow
+reader into the writer's ENOSPC") says exactly this shape must resolve
+by release-or-evict at the pressure bound. Red-loop shape (venue
+`tests/reader_free_grace_tests.rs`): a cliff harvest
+(`harvest_pressure`) against held offsets older than the pressure
+bound with a member that has not acked — today the refusal escapes to
+the caller with forced_releases 0; the law: the offsets release, the
+laggard is evicted, and the allocation retry succeeds — ENOSPC is
+reserved for genuinely-live data.

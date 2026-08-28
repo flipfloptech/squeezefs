@@ -314,8 +314,15 @@ case "$PRESET" in
     # it is a same-substrate shared-vs-disjoint RATIO with internal A-B-B-A
     # brackets, and the leg's flatness/self-sizing gates catch credit sag —
     # but the row stamp records the instance types so the label stays honest.
-    INSTANCE_TYPE="i4i.2xlarge"
-    EST_CLUSTER_HOURLY="~\$2.7-2.8/hr on-demand / ~\$0.5-0.8/hr spot (4 nodes; planning numbers)"
+    #
+    # INSTANCE_TYPE is an OVERRIDE here (the one preset that honors it):
+    # the 8-co-writer field/design shape needs a bigger client (the comment
+    # on MW_COWRITERS above — "raise it together with the client instance
+    # size"), and the fleet stays UNIFORM one-type by the same one-template
+    # rationale. i4i.4xlarge (16 vCPU) matches the proven local venue;
+    # i4i.8xlarge (32 vCPU) removes the client CPU-starvation question.
+    INSTANCE_TYPE="${INSTANCE_TYPE:-i4i.2xlarge}"
+    EST_CLUSTER_HOURLY="~\$2.7-2.8/hr on-demand at the i4i.2xlarge default / ~\$11/hr at i4i.8xlarge (4 nodes; planning numbers)"
     ;;
   custom)
     [ -n "$INSTANCE_TYPE" ] || die "PRESET=custom requires INSTANCE_TYPE"

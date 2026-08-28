@@ -39,10 +39,12 @@ use tempfile::{tempdir, NamedTempFile, TempDir};
 
 const BS: u64 = 1024 * 1024; // 1 MiB logical blocks (whole-block write-through)
 
-static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-fn serial() -> std::sync::MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|p| p.into_inner())
+/// One test at a time: the suite mutates process-global custody state
+/// (LOCK_MAP grants, demoted regions, the clause counters).
+async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().await
 }
 
 struct H {
@@ -176,7 +178,7 @@ async fn new_range_grant(
 /// pass), and the extent's bytes must land durably.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_arbiters_fold_of_a_single_holders_extents_keeps_the_fast_paths() {
-    let _g = serial();
+    let _g = serial().await;
     let h = make(*b"arbiter-fold-001", "arb_ns_1").await;
     let ino = striped_file(&h, "fpp.dat", 2).await;
     let path = format!("inode_{ino}");
@@ -238,7 +240,7 @@ async fn the_arbiters_fold_of_a_single_holders_extents_keeps_the_fast_paths() {
 /// writes TO this fold, not to block it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_arbiters_fold_under_a_demoted_region_keeps_the_fast_paths() {
-    let _g = serial();
+    let _g = serial().await;
     let h = make(*b"arbiter-fold-002", "arb_ns_2").await;
     let ino = striped_file(&h, "shared.dat", 2).await;
 
@@ -279,7 +281,7 @@ async fn the_arbiters_fold_under_a_demoted_region_keeps_the_fast_paths() {
 /// over-relaxation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_two_holder_span_still_declines_the_arbiters_fast_paths() {
-    let _g = serial();
+    let _g = serial().await;
     let h = make(*b"arbiter-fold-003", "arb_ns_3").await;
     let ino = striped_file(&h, "contended.dat", 2).await;
     let path = format!("inode_{ino}");

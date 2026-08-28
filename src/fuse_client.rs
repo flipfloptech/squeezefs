@@ -4807,6 +4807,15 @@ pub struct Metrics {
     /// lineage upstream — investigate beside
     /// `block_untracked_free_refusals`, leak-safe either way.
     pub block_live_free_refusals: Align64<AtomicU64>,
+    /// Finding 25: a serialized settle attempt resolved from a CACHED
+    /// head that a served direct commit had already superseded (the
+    /// invalidation-vs-refill race on a serving authority) — the loss is
+    /// a legal race, healed by dropping the entry and refetching the
+    /// backend head on the retry. A latency signal under served-publish
+    /// churn, never a correctness one; the `read_settle_lost_serialized`
+    /// tripwire is reserved for backend-fresh losses (the only shape
+    /// that still means a mutator outside the stripe/merge disciplines).
+    pub read_settle_stale_head_refetches: Align64<AtomicU64>,
     /// Pre-RC engineering spec §6.2 item 6 / §6.3: reads and frees REFUSED
     /// because the block key named a **dead incarnation** of its device
     /// offset — the offset was freed and reissued to a different file, and
@@ -9388,6 +9397,7 @@ impl SqueezefsFilesystem {
                 "block_double_frees": METRICS.block_double_frees.load(Ordering::Relaxed),
                 "block_untracked_free_refusals": METRICS.block_untracked_free_refusals.load(Ordering::Relaxed),
                 "block_live_free_refusals": METRICS.block_live_free_refusals.load(Ordering::Relaxed),
+                "read_settle_stale_head_refetches": METRICS.read_settle_stale_head_refetches.load(Ordering::Relaxed),
                 "block_key_incarnation_refusals": METRICS.block_key_incarnation_refusals.load(Ordering::Relaxed),
                 "block_key_incarnation_unknown": METRICS.block_key_incarnation_unknown.load(Ordering::Relaxed),
                 "block_key_incarnation_exhausted": METRICS.block_key_incarnation_exhausted.load(Ordering::Relaxed),

@@ -9489,6 +9489,9 @@ impl DataRouter {
             )
             .await;
             let _map_guard = meta_lock_acquire(ino).await;
+            // Finding 25 rung A: exclude SERVED publishes from the window
+            // (order (3) → (3.5) → serve stripe; None on solo mounts).
+            let _serve_window = crate::meta_ship::publish::settle_serve_window(ino).await;
             match self.settled_resolve_fetch_locked(file_path, b).await? {
                 SettledFetchOutcome::Hole => return Ok(None),
                 SettledFetchOutcome::Fetched(val) => return Ok(Some(val)),
@@ -9536,6 +9539,9 @@ impl DataRouter {
                     .await;
             }
             let _map_guard = meta_lock_acquire(ino).await;
+            // Finding 25 rung A: exclude SERVED publishes from the window
+            // (the caller's (3) → this (3.5) → serve stripe; None solo).
+            let _serve_window = crate::meta_ship::publish::settle_serve_window(ino).await;
             match self.settled_resolve_fetch_locked(file_path, b).await? {
                 SettledFetchOutcome::Hole => return Ok(None),
                 SettledFetchOutcome::Fetched(val) => return Ok(Some(val)),
@@ -9570,9 +9576,9 @@ impl DataRouter {
         // cached entry is ≥ every completed merge (republished under
         // the lock we hold); a miss reads the backend serialized ≥
         // merges, exactly like the refill.
-        let meta = match self.metadata_cache.get(&ino) {
-            Some(m) => Some(m),
-            None => self.fetch_metadata_from_backend(ino).await?,
+        let (meta, head_from_cache) = match self.metadata_cache.get(&ino) {
+            Some(m) => (Some(m), true),
+            None => (self.fetch_metadata_from_backend(ino).await?, false),
         };
         let Some(meta) = meta else {
             // No layout at all — the block is a hole in the current
@@ -9610,17 +9616,36 @@ impl DataRouter {
         match self.fetch_block_device_true(&cur_key).await {
             Ok((val, true)) => Ok(SettledFetchOutcome::Fetched(val)),
             Ok((_, false)) => {
-                // The key's incarnation word moved while both custody
-                // domains were held — a mutator outside the
-                // stripe/merge disciplines (RES-22: loud, never
-                // fatal; the caller re-resolves from scratch).
-                crate::note_invariant_tripwire(
-                    "read_settle_lost_serialized",
-                    &format!(
-                        "block {b} of {file_path}: incarnation moved under \
-                         BLOCK_FLUSH_LOCKS + INODE_META_LOCKS"
-                    ),
-                );
+                if head_from_cache {
+                    // Finding 25: the head came from the CACHE, and on an
+                    // authority serving peers a served publish commits the
+                    // backend head OUTSIDE the merge domain — its separate
+                    // invalidation can lose to a racing refill, so a stale
+                    // cached head is a LEGAL race, not a violation. Heal:
+                    // drop the entry so the retry resolves from the
+                    // backend (serialized ≥ every commit). The tripwire is
+                    // reserved for the backend-fresh arm below — the only
+                    // shape that still means a mutator outside the
+                    // disciplines. Attempt 6 burned 480 tripwires and
+                    // wedged four blocks into fsync EIO on this shape.
+                    METRICS
+                        .read_settle_stale_head_refetches
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.metadata_cache.remove(&ino);
+                } else {
+                    // The key's incarnation word moved while both custody
+                    // domains were held AND the head was read from the
+                    // backend inside the window — a mutator outside the
+                    // stripe/merge disciplines (RES-22: loud, never
+                    // fatal; the caller re-resolves from scratch).
+                    crate::note_invariant_tripwire(
+                        "read_settle_lost_serialized",
+                        &format!(
+                            "block {b} of {file_path}: incarnation moved under \
+                             BLOCK_FLUSH_LOCKS + INODE_META_LOCKS"
+                        ),
+                    );
+                }
                 Ok(SettledFetchOutcome::Lost)
             }
             Err(e) => {

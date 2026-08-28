@@ -1169,6 +1169,22 @@ async fn local_publish_guard(ino: Ino) -> Option<crate::sqz_sync::SqzMutexGuard<
     }
 }
 
+/// Finding 25 (rung A): the SETTLE arms' serve-window participation —
+/// the serialized settle resolve holds (3) + (3.5), but a SERVED publish
+/// commits under neither, so a serve landing mid-window could still move
+/// the binding under a backend-fresh resolve and burn the tripwire on
+/// legal traffic. The settle takes the SAME per-ino serve stripe (order:
+/// (3) → (3.5) → serve stripe — consistent with the local-publish order,
+/// where the router's save holds (3.5) and `set_layout_and_size` takes
+/// the stripe inside). `None` exactly when `local_publish_guard` answers
+/// `None` (no custody owner / no range custody): a solo mount pays one
+/// relaxed probe.
+pub(crate) async fn settle_serve_window(
+    ino: Ino,
+) -> Option<crate::sqz_sync::SqzMutexGuard<'static, ()>> {
+    local_publish_guard(ino).await
+}
+
 /// Test seam (the structural pin's venue): the serve stripe for `ino`,
 /// so a suite can hold the serve window open and prove a local publish
 /// of a range-granted ino PARKS on it.

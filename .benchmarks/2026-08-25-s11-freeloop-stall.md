@@ -938,3 +938,26 @@ Verdict per the cheap-first pipeline: the FUNCTIONAL probe is green —
 attempt 11 (the sustained verdict) belongs to the cloud venue
 (3.75 TB devices ⇒ no transit wall; datacenter cooling ⇒ honest
 sustain).
+
+## Attempt 11 (2026-08-28, binary `b36af0b7` — f28+f30 landed): PERF PARITY — the row is one 0.015 % engagement residual from acceptance
+
+Cloud venue (4 × i4i.8xlarge, cluster `sqzbench-20260828-180332`, rows
+`.benchmarks/cloud/2026-08-28-180917/`, torn down at verdict). **Every
+phase completed flat, no aborts, and the A-B-B-A brackets read 1.001× /
+1.072×** — the shared file at PARITY with (and in the second bracket
+FASTER than) the private-file baseline; the f27 dip is gone (demotion
+waits now bucket at ≤512 µs), f28/f30's abort classes are gone. The
+S11 gate min 1.001 (floor 0.8).
+
+The row failed ONLY the engagement screen — **finding 31**: 3 fabricated
+demotions + prs 10 / ors 3, all in the SHARED phases (A1: 1+3+1, A2:
+2+7+2; B-phases zero), beside `range_custody_shrink_demotions` 1/2 in
+the same phases — a residual interleave of the f16 fabrication class
+(the trim teacher closed 44 → 3 per row; the §9.3a tail-shrink arm
+resolves most stretch-tail sharing, and some rare ask still marks a
+true DEMOTION on an aligned row). 3 in ~20k grants = 0.015 %; the
+sticky f24 episode latch + f26's arbiter scope then propagate each
+fabricated demotion into the prs/ors counts the gate reads. Red-loop
+shape: the interleave where `foreign_block_sharers` classifies an
+aligned-row sharer as region-sharing (not stretch-tail) — likely the
+extension/widen race on the learned ceiling.

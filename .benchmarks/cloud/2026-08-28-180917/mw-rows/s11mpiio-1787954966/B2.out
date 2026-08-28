@@ -1,0 +1,80 @@
+IOR-4.0.0: MPI Coordinated Test of Parallel I/O
+Began               : Fri Aug 28 22:11:59 2026
+Command line        : /opt/squeezefs-bench/repo/target/mw-ior/ior-4.0.0/src/ior -a POSIX -b 4m -t 4m -s 80 -w -e -k -E -G 1038205605 -i 13 -F -o /scratch/mnt-cw1/s11-mpiio-fpp.dat
+Machine             : Linux ip-172-31-19-225
+TestID              : 0
+StartTime           : Fri Aug 28 22:11:59 2026
+Path                : /scratch/mnt-cw1/s11-mpiio-fpp.dat.00000000
+FS                  : 13.6 TiB   Used FS: 4.0%   Inodes: 1.0 Mi   Used Inodes: 0.0%
+
+Options: 
+api                 : POSIX
+apiVersion          : 
+test filename       : /scratch/mnt-cw1/s11-mpiio-fpp.dat
+access              : file-per-process
+WARNING: The file "/scratch/mnt-cw7/s11-mpiio-fpp.dat.00000027" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw4/s11-mpiio-fpp.dat.00000014" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw3/s11-mpiio-fpp.dat.00000011" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw1/s11-mpiio-fpp.dat.00000003" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw3/s11-mpiio-fpp.dat.00000008" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw6/s11-mpiio-fpp.dat.00000022" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw2/s11-mpiio-fpp.dat.00000006" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw5/s11-mpiio-fpp.dat.00000018" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw3/s11-mpiio-fpp.dat.00000010" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw1/s11-mpiio-fpp.dat.00000002" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw4/s11-mpiio-fpp.dat.00000013" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw6/s11-mpiio-fpp.dat.00000021" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw5/s11-mpiio-fpp.dat.00000016" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw1/s11-mpiio-fpp.dat.00000001" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw2/s11-mpiio-fpp.dat.00000005" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw8/s11-mpiio-fpp.dat.00000031" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw4/s11-mpiio-fpp.dat.00000012" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw7/s11-mpiio-fpp.dat.00000025" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw6/s11-mpiio-fpp.dat.00000020" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw8/s11-mpiio-fpp.dat.00000028" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw7/s11-mpiio-fpp.dat.00000026" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw5/s11-mpiio-fpp.dat.00000019" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw3/s11-mpiio-fpp.dat.00000009" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw8/s11-mpiio-fpp.dat.00000029" exists already and will be overwritten
+type                : independent
+segments            : 80
+ordering in a file  : sequential
+ordering inter file : no tasks offsets
+nodes               : 1
+tasks               : 32
+clients per node    : 32
+repetitions         : 13
+xfersize            : 4 MiB
+blocksize           : 4 MiB
+aggregate filesize  : 10 GiB
+
+Results: 
+WARNING: The file "/scratch/mnt-cw2/s11-mpiio-fpp.dat.00000004" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw8/s11-mpiio-fpp.dat.00000030" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw5/s11-mpiio-fpp.dat.00000017" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw2/s11-mpiio-fpp.dat.00000007" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw7/s11-mpiio-fpp.dat.00000024" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw6/s11-mpiio-fpp.dat.00000023" exists already and will be overwritten
+WARNING: The file "/scratch/mnt-cw1/s11-mpiio-fpp.dat.00000000" exists already and will be overwritten
+
+access    bw(MiB/s)  IOPS       Latency(s)  block(KiB) xfer(KiB)  open(s)    wr/rd(s)   close(s)   total(s)   iter
+------    ---------  ----       ----------  ---------- ---------  --------   --------   --------   --------   ----
+WARNING: The file "/scratch/mnt-cw4/s11-mpiio-fpp.dat.00000015" exists already and will be overwritten
+write     1953.01    488.28     5.05        4096       4096       0.000372   5.24       2.13       5.24       0   
+write     1933.57    483.42     5.28        4096       4096       0.000307   5.30       1.66       5.30       1   
+write     1988.29    497.09     5.15        4096       4096       0.000405   5.15       1.22       5.15       2   
+write     1930.02    482.53     5.04        4096       4096       0.000339   5.31       1.99       5.31       3   
+write     1919.53    479.90     4.92        4096       4096       0.001012   5.33       1.60       5.33       4   
+write     1898.09    474.55     4.23        4096       4096       0.000266   5.39       1.64       5.39       5   
+write     1913.82    478.49     3.28        4096       4096       0.000253   5.35       2.47       5.35       6   
+write     1945.52    486.41     4.63        4096       4096       0.007463   5.26       1.02       5.26       7   
+write     1899.99    475.02     5.19        4096       4096       0.000297   5.39       1.76       5.39       8   
+write     1927.32    481.86     4.96        4096       4096       0.001052   5.31       2.41       5.31       9   
+write     1976.85    494.24     4.81        4096       4096       0.000336   5.18       1.31       5.18       10  
+write     1929.61    482.43     4.96        4096       4096       0.000327   5.31       1.97       5.31       11  
+write     1944.18    486.07     2.52        4096       4096       0.002458   5.27       2.75       5.27       12  
+
+Summary of all tests:
+Operation   Max(MiB)   Min(MiB)  Mean(MiB)     StdDev   Max(OPs)   Min(OPs)  Mean(OPs)     StdDev    Mean(s) Stonewall(s) Stonewall(MiB) Test# #Tasks tPN reps fPP reord reordoff reordrand seed segcnt   blksiz    xsize aggs(MiB)   API RefNum
+write        1988.29    1898.09    1935.37      25.57     497.07     474.52     483.84       6.39    5.29190         NA            NA     0     32  32   13   1     0        1         0    0     80  4194304  4194304   10240.0 POSIX      0
+Finished            : Fri Aug 28 22:13:08 2026

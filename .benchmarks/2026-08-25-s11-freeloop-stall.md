@@ -961,3 +961,23 @@ fabricated demotion into the prs/ors counts the gate reads. Red-loop
 shape: the interleave where `foreign_block_sharers` classifies an
 aligned-row sharer as region-sharing (not stretch-tail) — likely the
 extension/widen race on the learned ceiling.
+
+### Finding 31 named (probe 5, local, instrument `fix/f31-fabricated-demotion`)
+
+The new demotion-mark forensics caught all four marks on one local row
+(`/tmp/rows-probe15/m0.log`): every fabricated demotion is a
+REQUIRED-vs-REQUIRED same-block conflict on the shared ino — e.g. ask
+[8824815616,8825864192) (the first 1 MiB of block 2104, block-aligned)
+against a sharer whose required hull is EXACTLY that whole block
+(hull_end = the block's end). On a block-cyclic row one rank owns each
+block, so the "foreign" holder of the asker's own block can only be the
+ASKER ITSELF under a dead lease era: the A1-phase lease churn
+(FlushExtents "Lock expired"/FencingTokenExpired retries) makes a rank
+re-join with a NEW owner_nonce, its old grant's scope no longer
+matches, and `foreign_block_sharers`' `g.owner_nonce == scope` skip
+reads the rank's own orphan as a foreign required-sharer — a fabricated
+demotion of its own block. Fix surface (next red loop): the epoch
+succession — either the re-join adopts/retires the predecessor epoch's
+grants (JoinFrame already carries `prior_epoch`), or the barrier
+resolves a DEAD-LEASE sharer by retiring the orphan (the sweep's act,
+inline) instead of demoting.

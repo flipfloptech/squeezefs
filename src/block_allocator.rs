@@ -1931,6 +1931,15 @@ impl BlockAllocator {
     pub fn retire_shipped_free_tracking(&self, offset: u64) {
         let _ = self.refcounts.remove_sync(&offset);
         self.mark_incarnation_unstable(offset);
+        // Finding 30: restore stability under a NEW generation (the W1
+        // patch-fence idiom) — the poison above already invalidated every
+        // racing fill's `still()` re-check (f19's law), and a co-writer
+        // never re-claims a foreign offset, so a word LEFT unstable is
+        // orphaned forever: when the authority re-mints this offset (its
+        // fold of this very mount's shipped extents), every fetch here
+        // loses its fill validation to the orphan, the settle exhausts,
+        // and the fsync barrier EIOs (probes 2-4's MPI_ABORT).
+        self.publish_block(offset);
     }
 
     /// **Release ONE local reference of a shipped displaced block whose

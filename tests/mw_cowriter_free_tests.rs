@@ -3847,8 +3847,14 @@ async fn the_freed_retire_restores_the_word_under_a_new_generation() {
         .fill_incarnation(off)
         .expect("fixture: stable pre-retire word");
 
-    // The displaced free ships, the authority answers Freed, and the
-    // co-writer's verdict-aware retire runs (the f19 path).
+    // The LEGITIMATE displaced-free shape (the suite's test-1 flow): the
+    // rewrite's shipped merge releases the durable reference first, so
+    // the authority answers Freed and the co-writer's verdict-aware
+    // retire runs (the f19 path). A bare free would hit the f23 shield
+    // (population ≥ refcount) and retire nothing.
+    let _new_idx = cwr
+        .rewrite_block(ino, 0, off / auth.alloc.chunk_size())
+        .await;
     cwr.br
         .free_block(&off.to_string())
         .await

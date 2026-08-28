@@ -2339,6 +2339,33 @@ impl BackendRouter {
     ///   the case that is silent today: the offset was freed and reissued
     ///   to a different file, and the stale binding would serve — or free —
     ///   another file's block with no error and no counter.
+    /// Finding 30 forensics: name the STATE of a block key's offset at
+    /// the instant a serialized settle attempt lost — the tripwire's
+    /// attribution bundle (which mover class retired/moved the word).
+    /// Cold path only (a settle loss), never on a serve.
+    pub(crate) fn binding_move_diagnosis(&self, block_key: &str) -> String {
+        let Ok(parts) = self.parse_block_key_parts(&clean_block_key(block_key)) else {
+            return "unparseable key".to_string();
+        };
+        let alloc = match self.allocator_for_be_id(&parts.be_id) {
+            Some(a) => a,
+            None => return format!("no allocator for be_id '{}'", parts.be_id),
+        };
+        let off = parts.offset;
+        let idx = off / alloc.chunk_size().max(1);
+        format!(
+            "offset {off}: live_incarnation {:?}, fill(word) {:?}, refcount {:?}, \
+             free_listed {}, inflight {}, quarantined {}, key_names {}",
+            alloc.live_incarnation(off),
+            alloc.fill_incarnation(off),
+            alloc.refcount(off),
+            alloc.free_list_contains(idx),
+            alloc.inflight_contains(off),
+            alloc.is_quarantined(off),
+            parts.incarnation,
+        )
+    }
+
     pub fn block_key_incarnation_ok(&self, block_key: &str) -> bool {
         let Ok(parts) = self.parse_block_key_parts(&clean_block_key(block_key)) else {
             return true; // unparseable keys are refused by the resolver itself
@@ -9642,7 +9669,10 @@ impl DataRouter {
                         "read_settle_lost_serialized",
                         &format!(
                             "block {b} of {file_path}: incarnation moved under \
-                             BLOCK_FLUSH_LOCKS + INODE_META_LOCKS"
+                             BLOCK_FLUSH_LOCKS + INODE_META_LOCKS (key '{cur_key}' — {}; \
+                             co_writer {})",
+                            self.backend_router.binding_move_diagnosis(&cur_key),
+                            crate::fuse_client::co_writer_mount(),
                         ),
                     );
                 }

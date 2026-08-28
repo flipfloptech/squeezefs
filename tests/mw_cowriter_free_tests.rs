@@ -3806,3 +3806,70 @@ async fn a_stale_merge_never_regresses_a_block_to_a_dead_binding() {
     drop(cwr);
     auth.stop().await;
 }
+
+// ===========================================================================
+// 12. Finding 30 — the Freed retire never strands the word UNSTABLE
+// ===========================================================================
+
+/// Finding 30 (`.benchmarks/2026-08-25-s11-freeloop-stall.md`, probes
+/// 2–4): `retire_shipped_free_tracking` (the f19 Freed-verdict retire)
+/// marks the offset's incarnation word UNSTABLE and leaves it — and a
+/// co-writer never re-claims a foreign offset, so nothing ever heals the
+/// word. When the AUTHORITY re-mints that offset (its rung-17 fold of
+/// this very co-writer's shipped extents), every fetch of the new key on
+/// this mount loses its fill validation to the mount's own ORPHANED word
+/// (`fill None, refcount None, live 0` — the enriched tripwire's exact
+/// bundle), the settle exhausts, and the fsync barrier EIOs (rank
+/// MPI_ABORT). The law is the W1 patch-fence idiom: poison THEN restore
+/// stability under a NEW generation (`publish_block`) — racing in-flight
+/// fills still fail their `still()` re-check (the f19 poison holds),
+/// and future fills of the offset's next lifetime validate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_freed_retire_restores_the_word_under_a_new_generation() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "f30-retire").await;
+    let dev = data_device(dir.path(), "f30-retire.dev");
+    let auth = Authority::start(&vol, &dev, &[NODE_A]).await;
+    let off = auth.alloc.allocate_block().await.expect("mint");
+    auth.alloc.publish_block(off);
+    let ino = authority_file_with_block(&auth, "retire.bin", off / auth.alloc.chunk_size()).await;
+    let cwr = CoWriter::join(&auth, &vol, &dev, NODE_A).await;
+
+    // The co-writer's view of the offset before its displaced free: a
+    // stable word (the fixture models the co-writer's own tracking of a
+    // block it wrote — seeded the way mount recovery seeds walked keys).
+    cwr.alloc.recover_block(off).await.expect("tracked");
+    cwr.alloc.publish_block(off);
+    let before = cwr
+        .alloc
+        .fill_incarnation(off)
+        .expect("fixture: stable pre-retire word");
+
+    // The displaced free ships, the authority answers Freed, and the
+    // co-writer's verdict-aware retire runs (the f19 path).
+    cwr.br
+        .free_block(&off.to_string())
+        .await
+        .expect("the displaced free ships (verdict Freed → retire)");
+
+    // The f19 poison HELD: an in-flight fill that snapshotted the
+    // pre-retire generation can never validate across the retire.
+    assert!(
+        !cwr.alloc.fill_incarnation_still(off, before),
+        "the retire moved the word — a racing fill's re-check fails (f19's law)"
+    );
+    // Finding 30's law: the word is not STRANDED — a FUTURE fill (the
+    // offset's next lifetime, minted by the authority's fold) sees a
+    // stable witness and validates instead of losing forever.
+    assert!(
+        cwr.alloc.fill_incarnation(off).is_some(),
+        "the Freed retire restores stability under a NEW generation — an \
+         orphaned unstable word starves every later fetch of the offset's \
+         next lifetime into settle-exhaustion EIO (finding 30, ino {ino})"
+    );
+
+    drop(cwr);
+    auth.stop().await;
+}

@@ -839,3 +839,31 @@ through the served-layout invalidation it already rides. Venue:
 `tests/mw_authority_assembler_tests.rs` (owner + compose + demotion
 machinery): assemble + fold-publish B2 + free B1, ship a merge naming
 B1, assert the head still names B2 and the fold serves clean.
+
+## Local probe of `71f7d749` (f28, 2026-08-28): f28 verified; finding 29 — the transit wall the valve never saw
+
+Evidence `/tmp/rows-probe12` (row `s11mpiio-1787944833`, m0/m53 logs +
+live stats). **f28 verified live**: the "dead incarnation" class is
+GONE fleet-wide (0 on all nine mounts; A1 completed at 2,519 MiB/s
+local — the wedge class is dead). The row then died in B1 (fpp) on
+**ENOSPC**: both 64 GiB volumes at 16,372/16,384 blocks with only
+~20 GiB live — and `df` AFTER the abort read **11 % used**: the supply
+RECOVERED, so this is the free pipeline's TRANSIT population, never a
+leak. At the churn rate (~2.5 GB/s) with `free_grace_bound_age_ms`
+22,371 (the PR 5 gate (c) ceiling is 12,000), ≈ 55 GiB per volume sat
+between `begin_free` and reallocatable; the fleet ate the whole device.
+
+**The valve read 0 the entire time**: `free_grace_pressure_pct` 0 at
+99.9 % allocated (its own spec: "100 = the supply is gone at the ring's
+own measured deferral rate against the smaller of its headroom and the
+volume's free supply"), `forced_releases` 0, `alloc_stalls` 0 — while
+`prods` 1,577 and `bound_tightenings` 113,207 churned without ever
+biting (bound_age stayed 22 s, fence_bound 76 s). Post-abort gauges
+show grace holding only 251 offsets — the transit population lives
+DOWNSTREAM of the ring too (release → reclaim → finish_free), so the
+pressure model's supply term must count the WHOLE in-transit
+population, not the ring occupancy. Red-loop shape: drive churn at a
+rate × lag product ≥ supply, assert the valve's graded signal rises and
+the tightening floors the bound BEFORE allocation refuses (today:
+pressure 0, ENOSPC, fsync EIO, MPI abort). Note: gate (c)'s bound_age
+≤ 12 s fails on this venue for the same reason — one fix, two gates.

@@ -221,6 +221,10 @@ pub struct BlockSharer {
     pub region: (u64, u64),
     /// The sharer grant's REQUIRED-union block hull end.
     pub required_hull_end: u64,
+    /// The sharer grant's holder identity (finding 31 forensics: the
+    /// mark log names both parties' scopes, so a dead-era orphan or a
+    /// cross-rank collision is attributable from one log line).
+    pub owner_nonce: u64,
 }
 
 /// One §9.3a **shrink-pending** record (residual board item 7's fix): a
@@ -894,6 +898,7 @@ impl FileCustody {
                 token: g.token,
                 region: (s, e),
                 required_hull_end: block_align_out(g.required, block_size).1,
+                owner_nonce: g.owner_nonce,
             });
         }
         out

@@ -1526,14 +1526,15 @@ impl LocalLockManager {
                             // classifier inputs (region vs required hull).
                             log::warn!(
                                 "S11 demotion marked on {file_path}: ask=[{},{}) required=[{},{}) \
-                                 sharer token {} region=[{},{}) required_hull_end {} \
-                                 (region.0 < hull ⇒ region-sharing; fabricated on aligned rows — \
-                                 finding 31)",
+                                 ask_scope {scope:#x} sharer token {} scope {:#x} \
+                                 region=[{},{}) required_hull_end {} (region.0 < hull ⇒ \
+                                 region-sharing; fabricated on aligned rows — finding 31)",
                                 ask.0,
                                 ask.1,
                                 required.0,
                                 required.1,
                                 sharer.token,
+                                sharer.owner_nonce,
                                 sharer.region.0,
                                 sharer.region.1,
                                 sharer.required_hull_end,

@@ -1793,3 +1793,101 @@ async fn the_notice_polls_park_never_starves_the_clients_own_verbs() {
     drop(c);
     listener.shutdown();
 }
+
+/// Finding 31 (`.benchmarks/2026-08-25-s11-freeloop-stall.md`, attempt
+/// 11's ONLY failure — the 0.015 % engagement residual): a client whose
+/// lease churned (expired mid-row, re-joined with a NEW epoch) collides
+/// with **its own orphaned grant from the dead era** — the grant's merge
+/// scope is `range_scope_for_epoch(old_epoch)`, the re-joined ask's scope
+/// is the new epoch's, and `foreign_block_sharers` reads the rank's own
+/// leftover as a foreign REQUIRED-sharer of its own block: a fabricated
+/// demotion on a block-aligned row (the mark forensics named all four
+/// live marks as exactly this shape). The law: a grant whose scope names
+/// a DEAD lease era is an ORPHAN — the arbiter retires it inline (the
+/// same act lease-expiry reclamation performs, made prompt) and the ask
+/// proceeds; demotion is reserved for LIVE-era required-sharing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dead_era_orphan_never_buys_a_demotion() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let _serial = serial();
+    let _restore = Restore;
+    const INO: u64 = 77_000_161;
+    const MIB: u64 = 1024 * 1024;
+
+    let ms = Arc::new(AtomicU64::new(1_000));
+    let clock = LeaseClock::manual(Arc::clone(&ms));
+    let clocks = LeaseClocks::with_params(
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+    )
+    .expect("positive T_self");
+    let owner = WriteCustodyOwner::arm(
+        "f31-authority",
+        squeezefs::dlm::durable_term() + 1,
+        squeezefs::dlm::durable_term(),
+        clocks,
+        clock,
+        None,
+    )
+    .expect("the custody authority arms");
+    owner.install_range_geometry(data_grant::fixed_range_geometry(
+        64 * 4 * 1024 * 1024,
+        4 * 1024 * 1024,
+    ));
+    data_grant::install_custody_owner(Arc::clone(&owner));
+    let router = data_grant::AsyncVerbRouter::new().with_custody(owner);
+    let listener = squeezefs::cluster_wire::RpcListener::start_async(
+        squeezefs::cluster_wire::RpcListenerConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            service_threads: 2,
+            ..squeezefs::cluster_wire::RpcListenerConfig::default()
+        },
+        SECRET.to_vec(),
+        Arc::new(router),
+    )
+    .expect("the authority listens");
+    let endpoint = listener.endpoint().to_string();
+
+    // Era 1: the client holds a block-aligned grant.
+    let c1 = WriteCustodyClient::connect(&endpoint, SECRET, "f31-node")
+        .await
+        .expect("era-1 join");
+    let _g1 = c1
+        .acquire_range(INO, (0, 4 * MIB), (0, 4 * MIB), Duration::from_secs(3))
+        .await
+        .expect("the era-1 grant");
+
+    // The lease churns: the SAME node re-joins (a new epoch supersedes
+    // the old lease — the A1-phase "Lock expired" retry shape). The
+    // era-1 grant is now a dead-era orphan in the arbiter's table.
+    let c2 = WriteCustodyClient::connect(&endpoint, SECRET, "f31-node")
+        .await
+        .expect("era-2 re-join");
+
+    let s0 = squeezefs::dlm::range_custody_stats();
+    let t0 = std::time::Instant::now();
+    let r = c2
+        .acquire_range(INO, (0, 4 * MIB), (0, 4 * MIB), Duration::from_secs(3))
+        .await;
+    let waited = t0.elapsed();
+    assert!(
+        r.is_ok(),
+        "the re-joined client's ask for ITS OWN block must issue — the dead-era \
+         orphan retires inline, never fabricates a demotion (after {waited:?}: {r:?})"
+    );
+    assert!(
+        waited < Duration::from_secs(2),
+        "resolution is prompt (the orphan retire is the arbiter's own act), got {waited:?}"
+    );
+    let s1 = squeezefs::dlm::range_custody_stats();
+    assert_eq!(
+        s1.demotions - s0.demotions,
+        0,
+        "a dead-era orphan never buys a demotion (attempt 11's fabricated marks)"
+    );
+
+    drop(c2);
+    drop(c1);
+    listener.shutdown();
+}

@@ -1519,6 +1519,25 @@ impl LocalLockManager {
                             }
                         } else if custody.mark_demotion_pending(sharer.region, sharer.token) {
                             RANGE_DEMOTIONS.fetch_add(1, Ordering::Relaxed);
+                            // Finding 31 forensics: on a block-aligned row
+                            // NOTHING should genuinely share a block, so
+                            // every demotion mark names its parties loud —
+                            // the ask, the sharer's grant geometry, and the
+                            // classifier inputs (region vs required hull).
+                            log::warn!(
+                                "S11 demotion marked on {file_path}: ask=[{},{}) required=[{},{}) \
+                                 sharer token {} region=[{},{}) required_hull_end {} \
+                                 (region.0 < hull ⇒ region-sharing; fabricated on aligned rows — \
+                                 finding 31)",
+                                ask.0,
+                                ask.1,
+                                required.0,
+                                required.1,
+                                sharer.token,
+                                sharer.region.0,
+                                sharer.region.1,
+                                sharer.required_hull_end,
+                            );
                         }
                     }
                     true

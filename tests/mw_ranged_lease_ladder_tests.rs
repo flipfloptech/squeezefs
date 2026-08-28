@@ -1717,3 +1717,79 @@ async fn a_quiet_incumbents_demotion_resolves_at_poll_latency_not_renewal() {
     drop(a);
     listener.shutdown();
 }
+
+/// Finding 27's own regression (attempt 10: aggregate collapsed to
+/// 3 MiB/s, write latency 250–300 s): the standing poll rode
+/// `call_once`, whose lock is the client's WORKLOAD session mutex — a
+/// 10 s park held it for 10 s, and every custody verb queued behind the
+/// parked poll. The law: the poll rides its OWN dedicated session (the
+/// `lease_session` precedent — renewals already learned this exact
+/// lesson), so a parked poll never adds a microsecond to the client's
+/// own verbs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_notice_polls_park_never_starves_the_clients_own_verbs() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let _serial = serial();
+    let _restore = Restore;
+    const INO: u64 = 77_000_151;
+    const MIB: u64 = 1024 * 1024;
+
+    let ms = Arc::new(AtomicU64::new(1_000));
+    let clock = LeaseClock::manual(Arc::clone(&ms));
+    let clocks = LeaseClocks::with_params(
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+    )
+    .expect("positive T_self");
+    let owner = WriteCustodyOwner::arm(
+        "f27b-authority",
+        squeezefs::dlm::durable_term() + 1,
+        squeezefs::dlm::durable_term(),
+        clocks,
+        clock,
+        None,
+    )
+    .expect("the custody authority arms");
+    owner.install_range_geometry(data_grant::fixed_range_geometry(
+        64 * 4 * 1024 * 1024,
+        4 * 1024 * 1024,
+    ));
+    data_grant::install_custody_owner(Arc::clone(&owner));
+    let router = data_grant::AsyncVerbRouter::new().with_custody(owner);
+    let listener = squeezefs::cluster_wire::RpcListener::start_async(
+        squeezefs::cluster_wire::RpcListenerConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            service_threads: 2,
+            ..squeezefs::cluster_wire::RpcListenerConfig::default()
+        },
+        SECRET.to_vec(),
+        Arc::new(router),
+    )
+    .expect("the authority listens");
+    let endpoint = listener.endpoint().to_string();
+
+    let c = WriteCustodyClient::connect(&endpoint, SECRET, "f27b-node")
+        .await
+        .expect("client joins");
+    // Let the standing poll reach its park (nothing is pending, so it
+    // sits the full bound).
+    squeezefs_ipc::sqz_time::sleep(Duration::from_millis(300)).await;
+
+    // The client's OWN verb must be unaffected by the parked poll.
+    let t0 = std::time::Instant::now();
+    let r = c
+        .acquire_range(INO, (0, MIB), (0, MIB), Duration::from_secs(3))
+        .await;
+    let waited = t0.elapsed();
+    assert!(r.is_ok(), "the uncontended acquire grants: {r:?}");
+    assert!(
+        waited < Duration::from_secs(1),
+        "a PARKED notice poll may not add its park to the client's own verbs \
+         (attempt 10's 3 MiB/s collapse: the poll camped the workload session \
+         mutex) — the acquire took {waited:?}"
+    );
+
+    drop(c);
+    listener.shutdown();
+}

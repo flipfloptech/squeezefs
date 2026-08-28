@@ -2835,6 +2835,12 @@ pub struct WriteCustodyClient {
     /// `T_self` behind the very workload its stall-detection exists to
     /// survive. Dialed lazily on the first lease verb.
     lease_session: crate::sqz_sync::SqzMutex<Option<RpcClient>>,
+    /// Finding 27b: the standing notice poll's OWN session — the poll
+    /// PARKS on the authority for up to a renewal cadence, and a park
+    /// holding the workload session's mutex starved every custody verb
+    /// behind it (attempt 10's 3 MiB/s collapse). The `lease_session`
+    /// precedent, applied to the third long-lived caller class.
+    notice_session: crate::sqz_sync::SqzMutex<Option<RpcClient>>,
     /// This client's lease view — S6's [`MemberSession`], reused verbatim
     /// so the stricter-clock law and the writer's self-fence (which poisons
     /// process data custody) have exactly one implementation.
@@ -2908,6 +2914,7 @@ impl WriteCustodyClient {
             secret: secret.to_vec(),
             session: crate::sqz_sync::SqzMutex::new(Some(session)),
             lease_session: crate::sqz_sync::SqzMutex::new(None),
+            notice_session: crate::sqz_sync::SqzMutex::new(None),
             lease: arc_swap::ArcSwap::from_pointee(member),
             lease_epoch: AtomicU64::new(lease.epoch),
             lane: std::sync::atomic::AtomicU32::new(pack_lane(lease.writer_lane, lease.writers)),
@@ -3923,7 +3930,12 @@ async fn notice_poll_run(weak: std::sync::Weak<WriteCustodyClient>) {
             Ok(b) => b,
             Err(_) => return,
         };
-        let outcome = client.call_once(VERB_CUSTODY_NOTICE_POLL, body).await;
+        // Finding 27b: the poll's park rides its OWN session — never the
+        // workload session, whose mutex a 10 s park would hold against
+        // every custody verb (attempt 10's collapse).
+        let outcome = client
+            .call_once_on(&client.notice_session, VERB_CUSTODY_NOTICE_POLL, body)
+            .await;
         let mut backoff = None;
         match outcome {
             Ok(r) if r.status == CUSTODY_OK => {

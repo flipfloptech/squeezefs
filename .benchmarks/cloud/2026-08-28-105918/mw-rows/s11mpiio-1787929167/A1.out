@@ -1,0 +1,34 @@
+IOR-4.0.0: MPI Coordinated Test of Parallel I/O
+Began               : Fri Aug 28 15:04:57 2026
+Command line        : /opt/squeezefs-bench/repo/target/mw-ior/ior-4.0.0/src/ior -a POSIX -b 4m -t 4m -s 8 -w -e -k -E -G 3658256 -i 4 -o /scratch/mnt-cw1/s11-mpiio.dat
+Machine             : Linux ip-172-31-28-104
+TestID              : 0
+StartTime           : Fri Aug 28 15:04:57 2026
+Path                : /scratch/mnt-cw1/s11-mpiio.dat
+FS                  : 13.6 TiB   Used FS: 0.0%   Inodes: 1.0 Mi   Used Inodes: 0.0%
+
+Options: 
+api                 : POSIX
+apiVersion          : 
+test filename       : /scratch/mnt-cw1/s11-mpiio.dat
+access              : single-shared-file
+type                : independent
+segments            : 8
+ordering in a file  : sequential
+ordering inter file : no tasks offsets
+nodes               : 1
+tasks               : 32
+clients per node    : 32
+repetitions         : 4
+xfersize            : 4 MiB
+blocksize           : 4 MiB
+aggregate filesize  : 1 GiB
+
+Results: 
+WARNING: The file "/scratch/mnt-cw1/s11-mpiio.dat" exists already and will be overwritten
+
+access    bw(MiB/s)  IOPS       Latency(s)  block(KiB) xfer(KiB)  open(s)    wr/rd(s)   close(s)   total(s)   iter
+------    ---------  ----       ----------  ---------- ---------  --------   --------   --------   --------   ----
+write     3.20       0.801195   299.52      4096       4096       0.002072   319.52     196.30     319.52     0   
+write     3.23       0.808500   250.00      4096       4096       0.000545   316.64     197.10     316.64     1   
+write     3.20       0.799978   293.37      4096       4096       0.000580   320.01     186.64     320.01     2   

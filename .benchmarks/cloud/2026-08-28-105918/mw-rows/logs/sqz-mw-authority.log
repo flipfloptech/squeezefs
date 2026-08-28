@@ -1,0 +1,321 @@
+SqueezeFS version 1.1.0 (92ac6c37b48c / 92ac6c37b48cb53c8a89a8cc272611dd20b8a2e0) built 2026-08-28T14:45:49Z
+======================================================================
+  Mount Configuration Summary
+----------------------------------------------------------------------
+  Volume Name:         squeezefs
+  Capacity:            13.64 TiB
+  Block Size:          4.00 MiB
+  Compression:         none
+  Encryption:          none
+----------------------------------------------------------------------
+Metadata Volumes:
+  - [enabled] /dev/nvme3n1 (health: 1000)
+Data Volumes:
+  - [enabled] /dev/nvme4n1 (health: 1000)
+  - [enabled] /dev/nvme5n1 (health: 1000)
+  - [enabled] /dev/nvme6n1 (health: 1000)
+  - [enabled] /dev/nvme7n1 (health: 1000)
+----------------------------------------------------------------------
+Cache/Staging:
+  Memory Cache Size:   1GB
+  Disk Cache Size:     10GB
+  Staging Paths:       /scratch/cache
+----------------------------------------------------------------------
+Mount Options:
+  Mountpoint:          "/scratch/mnt"
+  Writeback Cache:     enabled
+  Allow Other:         enabled
+======================================================================
+[2026-08-28T14:56:35Z INFO  squeezefs::nvme_dev] data volume /dev/nvme4n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-08-28T14:56:35Z INFO  squeezefs] writer-scoped staging ENGAGED: client scope w_e56e47de7cb413eb.mae9dc892 (staging generation "v3:ca61910fb37c4b2fbe0b01cbf48b3bf3@node:e56e47de7cb413eb.mae9dc892") — staging keys carry the scope and this client's staging roots are bound to it
+[2026-08-28T14:56:35Z INFO  squeezefs::cache::gds] GPU Direct Storage: No discrete GPU environment found. GDS bypassed.
+[2026-08-28T14:56:35Z INFO  squeezefs] Registering data volume 'nvme4n1' at path /dev/nvme4n1 (state active)
+[2026-08-28T14:56:35Z INFO  squeezefs] Registering data volume 'nvme5n1' at path /dev/nvme5n1 (state active)
+[2026-08-28T14:56:35Z INFO  squeezefs::nvme_dev] data volume /dev/nvme5n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-08-28T14:56:35Z INFO  squeezefs] Registering data volume 'nvme6n1' at path /dev/nvme6n1 (state active)
+[2026-08-28T14:56:35Z INFO  squeezefs::nvme_dev] data volume /dev/nvme6n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-08-28T14:56:35Z INFO  squeezefs] Registering data volume 'nvme7n1' at path /dev/nvme7n1 (state active)
+[2026-08-28T14:56:35Z INFO  squeezefs::nvme_dev] data volume /dev/nvme7n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-08-28T14:56:35Z INFO  squeezefs::dlm] fencing: durable writer term 1 adopted (was 0); every token this process mints now dominates every earlier era's (spec §6.7 decision 4)
+[2026-08-28T14:56:35Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme3n1: writer claim taken (id=b87bc85f-9c9a-41de-9289-c30240d5cf29, term=1, mode=flock+pr)
+[2026-08-28T14:56:35Z INFO  squeezefs] meta volume /dev/nvme3n1: format=3 ledger_seq=1 replay_entries=0 replay_dropped_torn=0 replay_ms=30 free_extents=14304967 next_ino=2 meta_volume_atomicity=cow-checksummed meta_volume_atomicity_physical=unknown writer_guard_mode=flock+pr
+[2026-08-28T14:56:35Z INFO  squeezefs::fuse_client] Dynamic reclaim concurrency limit configured: 4
+[2026-08-28T14:56:35Z INFO  squeezefs::routing] block-key incarnations engaged (spec §6.2 item 6): era 1, appender 0/1 — persisted block keys now name the lifetime of their device offset
+[2026-08-28T14:56:35Z INFO  squeezefs::data_custody] data-plane WERO (rtype 3) acquired on 4 namespace(s), key 0xd81cd40bf1047d28 — guarantee class pr: an unregistered (fenced) host's writes are rejected by the device
+[2026-08-28T14:56:35Z INFO  squeezefs::routing] durable block-reference ledger is EMPTY — declining to treat it as                  authoritative (an un-backfilled stamp reads every live block as free):                  falling back to the layout walk, which then backfills
+[2026-08-28T14:56:35Z INFO  squeezefs] Running block allocator recovery for data volume...
+[2026-08-28T14:56:35Z INFO  squeezefs::block_allocator] Recovery scan summary (v3): checked=1, valid_inodes=1, layouts_found=0
+[2026-08-28T14:56:35Z INFO  squeezefs] Running block allocator recovery for data volume...
+[2026-08-28T14:56:35Z INFO  squeezefs::block_allocator] Recovery scan summary (v3): checked=1, valid_inodes=1, layouts_found=0
+[2026-08-28T14:56:35Z INFO  squeezefs] Running block allocator recovery for data volume...
+[2026-08-28T14:56:35Z INFO  squeezefs::block_allocator] Recovery scan summary (v3): checked=1, valid_inodes=1, layouts_found=0
+[2026-08-28T14:56:35Z INFO  squeezefs] Running block allocator recovery for data volume...
+[2026-08-28T14:56:35Z INFO  squeezefs::block_allocator] Recovery scan summary (v3): checked=1, valid_inodes=1, layouts_found=0
+[2026-08-28T14:56:35Z WARN  squeezefs::job_wire] job wire: listener 0.0.0.0:42643 is PLAINTEXT TCP (no ClusterSecurityConfig) — sessions are AUTHENTICATED (storage-trust challenge proof + per-frame session MAC, S3 cluster_wire) but not private, so mutating publishes pay mandatory-100 % verify-reads (Issue-30; ≈2× device reads on remote-mutated bytes). Set SQUEEZEFS_JOB_WIRE_CA_KEY (+ optional SQUEEZEFS_JOB_WIRE_CA_CERT) for CA-pinned mTLS + sampled verification, or SQUEEZEFS_JOB_WIRE_BIND to narrow/disable the listener.
+[2026-08-28T14:56:35Z INFO  squeezefs::job_wire] job wire: bounds — max 64 concurrent connections, 8192 pre-enrollment frame cap, handshake deadline 10s, challenge freshness 30s
+[2026-08-28T14:56:35Z INFO  squeezefs] job wire: endpoint 172.31.28.104:42643 (published via the mount registration)
+[2026-08-28T14:56:35Z INFO  squeezefs::free_grace] freed-offset grace period armed (spec §6.8 item 3): a terminally-freed offset is not reallocatable until every live reader has acknowledged passing it. Grace bound 76.045s (under space pressure 38.0225s), ring cap 841785 offsets per volume — past the bound a laggard is FENCED, not waited on
+[2026-08-28T14:56:35Z INFO  squeezefs::membership] membership owner '39cbe267-2054-4b35-b793-6f32ce615c0b' armed in term 1 (was 0): lease TTL 45s, member deadline T_self 42.955s, renewal cadence 10s, grace 45s — liveness is RAM state renewed over cluster_wire and costs ZERO journal transactions (DLM S6, spec §6.5 item 3)
+[2026-08-28T14:56:35Z INFO  squeezefs::cluster_wire] cluster wire: listener 0.0.0.0:35301 (plaintext) — thread-per-connection, max 64 connections, 8192 B pre-authn frame cap, handshake deadline 10s, challenge freshness 30s; every admitted frame carries a session MAC derived from the shared volume's job:enroll secret
+[2026-08-28T14:56:35Z INFO  squeezefs::membership_wire] membership plane listening on 0.0.0.0:35301 (owner '39cbe267-2054-4b35-b793-6f32ce615c0b', term 1) — liveness for every member is RAM state renewed over this wire, so a beat costs ZERO journal transactions (DLM S6)
+[2026-08-28T14:56:35Z INFO  squeezefs::membership] claim set on /dev/nvme3n1: writer 'node_e56e47de7cb413eb.mae9dc892' is a durable member in term 1 (1 member(s),          registrant key 0xd81cd40bf1047d28) — §6.2 item 7
+[2026-08-28T14:56:35Z INFO  squeezefs::membership] membership OWNER armed on 172.31.28.104:35301 (id '39cbe267-2054-4b35-b793-6f32ce615c0b', term 1, superseding 0): members hold RAM leases renewed over cluster_wire, so liveness costs ZERO journal transactions and `squeezefs clients` reads ONE record plus a paged census instead of one getxattr per client (DLM S6, spec §6.5 item 3)
+[2026-08-28T14:56:35Z INFO  squeezefs::data_custody] data-plane WERO: joining the standing hold on 4 namespace(s) (key 0xd81cd40bf1047d28) — a second reservation would conflict at the device
+[2026-08-28T14:56:35Z INFO  squeezefs::data_grant] write-custody authority 'mw-6456f8f1-4963-433f-b13d-0ee8e74ff263' armed in era 1 (superseding 0): client lease TTL 45s, member deadline T_self 42.955s, renewal cadence 10s, grace 45s. Only CUSTODY travels here — a co-writer's bytes go straight to the device (DLM S9, spec §6.9)
+[2026-08-28T14:56:35Z WARN  squeezefs::data_grant] S9: custody authority 'mw-6456f8f1-4963-433f-b13d-0ee8e74ff263' runs era 1 with a 1-way data-plane allocation partition (0 enrolled co-writer lane(s); this node is lane 0). Every member's lane travels on its lease — no knob can put two writers in one residue class
+[2026-08-28T14:56:35Z INFO  squeezefs::cluster_wire] cluster wire: listener 0.0.0.0:45999 (plaintext) — thread-per-connection, max 64 connections, 8192 B pre-authn frame cap, handshake deadline 10s, challenge freshness 30s; every admitted frame carries a session MAC derived from the shared volume's job:enroll secret
+[2026-08-28T14:56:35Z WARN  squeezefs::meta_ship::owners] metadata function shipping ARMED (DLM S8): 1 of 1 volumes owned locally, 0 shipped to 0 peer(s) []; 65536 slots home locally. Metadata verbs on a foreign volume now travel to its owner; the DATA plane still refuses foreign-home custody loud (S9 ships that half)
+[2026-08-28T14:56:35Z WARN  squeezefs::multi_writer] MULTI-WRITER ARMED (DLM S9) on 172.31.28.104:45999: era 1, custody authority 'mw-6456f8f1-4963-433f-b13d-0ee8e74ff263', data-plane fence class pr, 0 of 1 metadata volume(s) owned elsewhere. Peers may now acquire write custody here and DMA directly to the shared namespaces — only custody travels, never data (spec §6.9 S9)
+Mounting Squeezefs at "/scratch/mnt"...
+[2026-08-28T14:56:35Z INFO  squeezefs::fuse_client] Transport payload-buffer cap: 2466 MiB (memory budget 19729 MiB)
+[2026-08-28T14:56:35Z WARN  squeezefs::ipc_host] SQUEEZEFS_IPC_ALLOW_DEV is set — the KD-7 build-commit skew gate is RELAXED for this mount (degenerate `unknown`/`-dirty` identities will be admitted, counted in ipc_binds_dev_override). Dev boxes only: a mismatched daemon/shim pair is undefined behavior.
+[2026-08-28T14:56:35Z INFO  squeezefs::ipc_host] ipc host: path ctl socket at /run/squeezefs/sqz-il0-2928-ccfa60c6.sock
+[2026-08-28T14:56:35Z INFO  squeezefs::fuse_client] IPC session host armed (socket sqz-il0-2928-ccfa60c6, session shm cap 2466 MiB)
+[2026-08-28T14:56:35Z INFO  squeezefs::fuse_client] SqueezeFS version 1.1.0 (92ac6c37b48c / 92ac6c37b48cb53c8a89a8cc272611dd20b8a2e0) built 2026-08-28T14:45:49Z initializing mount
+[2026-08-28T14:56:35Z INFO  squeezefs::fuse_client] FUSE Daemon: Mounting squeezefs at "/scratch/mnt"...
+[2026-08-28T14:56:35Z INFO  squeezefs::fuse_client] FUSE Daemon: Metadata connection active.
+[2026-08-28T14:56:35Z INFO  squeezefs::fuse_client] device-overlay armed: transport streaming holds enabled (SQUEEZEFS_DEVICE_OVERLAY)
+[92mOK[0m Squeezefs is ready at "/scratch/mnt"
+[2026-08-28T14:56:35Z INFO  squeezefs::fuse_client] FUSE Daemon: Initialized Squeezefs Filesystem mount (version 1.1.0 (92ac6c37b48c / 92ac6c37b48cb53c8a89a8cc272611dd20b8a2e0) built 2026-08-28T14:45:49Z).
+squeezefs: mount ready (version [2026-08-28T14:56:35Z INFO  squeezefs::fuse_client] IPC session host: mount st_dev resolved (56)
+1.1.0 (92ac6c37b48c / 92ac6c37b48cb53c8a89a8cc272611dd20b8a2e0) built 2026-08-28T14:45:49Z, exe hint: rebuild target/release and reinstall)
+[2026-08-28T14:56:35Z INFO  squeezefs::fuse_client] FUSE kernel protocol 7.45 (init flags 0x5ff73fffffb): FOPEN_NOFLUSH advertised + honored on non-writeback opens (kernel ≥ 7.35) (D2.a; under writeback cache the elision switch is the clean-FLUSH ENOSYS latch — uapi: NOFLUSH applies 'unless FUSE_WRITEBACK_CACHE'); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+squeezefs: FUSE kernel 7.45 — FOPEN_NOFLUSH advertised (wb-cache elision = clean-FLUSH ENOSYS latch); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+[2026-08-28T14:56:35Z INFO  squeezefs::fuse_client] FUSE_HANDLE_KILLPRIV_V2 negotiated (kernel killpriv probe deleted; daemon owns suid/sgid/caps clearing) for this mount
+[2026-08-28T14:56:35Z INFO  fuse3::raw::connection::fuse_over_uring] enabled kernel fuse.enable_uring=Y
+[2026-08-28T14:56:35Z WARN  fuse3::raw::connection::kmbuf] SQUEEZEFS_FUSE_ZC=1 declined: the kmbuf/zc io_uring surface is Absent on this kernel — continuing on the userspace-ent path (fuse3_zc_replies stays 0; the sqz kernel series carries the surface)
+[2026-08-28T14:56:35Z INFO  fuse3::raw::connection::fuse_over_uring] fuse-over-uring queue-ring setup probe: SINGLE_ISSUER+DEFER_TASKRUN available
+FUSE-over-io_uring registered: queues=32 depth=32 payload_sz=1048576 max_write=1048576 max_pages=256 buffers=user-ents kmbuf_ops=absent fd=72 sqpoll=off drain_groups=4(width<=8)
+[2026-08-28T14:56:35Z INFO  fuse3::raw::connection::fuse_over_uring] FUSE-over-io_uring registered: queues=32 depth=32 payload_sz=1048576 max_write=1048576 max_pages=256 buffers=user-ents kmbuf_ops=absent fd=72 sqpoll=off drain_groups=4(width<=8)
+FUSE-over-io_uring session path armed (ready=true, queues=32)
+FUSE-over-io_uring transport armed for this session
+[2026-08-28T14:56:35Z INFO  fuse3::raw::session] FUSE-over-io_uring transport armed for this session
+FUSE-over-io_uring: classical sideband servicer armed (primary session; FORGET/INTERRUPT/resend + switchover stragglers)
+[SIG] Received SIGTERM (or signal watcher exited); shutting down.
+[SIG] Shutdown resolved. Running shutdown logic...
+[2026-08-28T14:57:41Z INFO  squeezefs::fuse_client] Received shutdown signal. Force flushing memory buffers to staging...
+[2026-08-28T14:57:41Z INFO  squeezefs::fuse_client] FUSE Daemon: Force flushing all in-memory write buffers to local NVMe staging...
+[2026-08-28T14:57:41Z INFO  squeezefs::fuse_client] FUSE Daemon: All in-memory write buffers flushed to local NVMe staging.
+[2026-08-28T14:57:41Z INFO  squeezefs::fuse_client] FUSE Daemon: Destroying mount. Force flushing all staged and memory data...
+[2026-08-28T14:57:41Z INFO  squeezefs::fuse_client] FUSE Daemon: Force flushing all in-memory write buffers to local NVMe staging...
+[2026-08-28T14:57:41Z INFO  squeezefs::fuse_client] FUSE Daemon: All in-memory write buffers flushed to local NVMe staging.
+[2026-08-28T14:57:41Z INFO  squeezefs::fuse_client] FUSE Daemon: Force flushing all staged active blocks to NVMe-oF backend...
+[2026-08-28T14:57:41Z INFO  squeezefs::fuse_client] FUSE Daemon: No staged active blocks to flush.
+[2026-08-28T14:57:41Z INFO  squeezefs::fuse_client] FUSE Daemon: Dismount clean. All write staged blocks successfully flushed to backend.
+[2026-08-28T14:57:51Z INFO  fuse3::raw::connection::fuse_over_uring] fuse-over-uring qid=0 ent=0: disconnect CQE err=107; shutting down
+[2026-08-28T14:57:51Z INFO  fuse3::raw::connection::fuse_over_uring] fuse-over-uring watch: /dev/fuse revents=0x8 (abort/unmount); shutting down
+[2026-08-28T14:57:51Z INFO  fuse3::raw::connection::fuse_over_uring] FUSE-over-io_uring shutting down (fd=72)
+[2026-08-28T14:57:51Z WARN  squeezefs::meta_ship::owners] metadata function shipping DISARMED (DLM S8): solo authority restored
+[2026-08-28T14:57:51Z WARN  squeezefs::multi_writer] multi-writer DISARMED: solo authority restored, no custody is granted to peers, and the data-namespace WERO hold is released
+[2026-08-28T14:57:52Z WARN  squeezefs::membership] membership: could not withdraw writer 'node_e56e47de7cb413eb.mae9dc892' from the claim set on                          /dev/nvme3n1: I/O error: meta volume /dev/nvme3n1: volume is shutting down (a stale member entry classifies by its own liveness, so                          this is honest residue rather than a lie)
+[2026-08-28T14:57:52Z WARN  squeezefs::membership] membership: could not remove the rendezvous record from /dev/nvme3n1: I/O error: meta volume /dev/nvme3n1: volume is shutting down (a stale record names an endpoint that no longer answers, which the next reader detects on its first renewal)
+SqueezeFS version 1.1.0 (92ac6c37b48c / 92ac6c37b48cb53c8a89a8cc272611dd20b8a2e0) built 2026-08-28T14:45:49Z
+======================================================================
+  Mount Configuration Summary
+----------------------------------------------------------------------
+  Volume Name:         squeezefs
+  Capacity:            13.64 TiB
+  Block Size:          4.00 MiB
+  Compression:         none
+  Encryption:          none
+----------------------------------------------------------------------
+Metadata Volumes:
+  - [enabled] /dev/nvme3n1 (health: 1000)
+Data Volumes:
+  - [enabled] /dev/nvme4n1 (health: 1000)
+  - [enabled] /dev/nvme5n1 (health: 1000)
+  - [enabled] /dev/nvme6n1 (health: 1000)
+  - [enabled] /dev/nvme7n1 (health: 1000)
+----------------------------------------------------------------------
+Cache/Staging:
+  Memory Cache Size:   1GB
+  Disk Cache Size:     10GB
+  Staging Paths:       /scratch/cache
+----------------------------------------------------------------------
+Mount Options:
+  Mountpoint:          "/scratch/mnt"
+  Writeback Cache:     enabled
+  Allow Other:         enabled
+======================================================================
+[2026-08-28T14:57:52Z INFO  squeezefs::nvme_dev] data volume /dev/nvme4n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-08-28T14:57:52Z INFO  squeezefs] writer-scoped staging ENGAGED: client scope w_e56e47de7cb413eb.mae9dc892 (staging generation "v3:ca61910fb37c4b2fbe0b01cbf48b3bf3@node:e56e47de7cb413eb.mae9dc892") — staging keys carry the scope and this client's staging roots are bound to it
+[2026-08-28T14:58:10Z INFO  squeezefs::cache::gds] GPU Direct Storage: No discrete GPU environment found. GDS bypassed.
+[2026-08-28T14:58:10Z INFO  squeezefs::cache::nvme] staging init: discarded 16 read-cache segment file(s) (5368709120 B) from a previous session — read cache starts cold (block-key offsets are not incarnation-stable across mounts)
+[2026-08-28T14:58:11Z INFO  squeezefs] Registering data volume 'nvme4n1' at path /dev/nvme4n1 (state active)
+[2026-08-28T14:58:11Z INFO  squeezefs] Registering data volume 'nvme5n1' at path /dev/nvme5n1 (state active)
+[2026-08-28T14:58:11Z INFO  squeezefs::nvme_dev] data volume /dev/nvme5n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-08-28T14:58:11Z INFO  squeezefs] Registering data volume 'nvme6n1' at path /dev/nvme6n1 (state active)
+[2026-08-28T14:58:11Z INFO  squeezefs::nvme_dev] data volume /dev/nvme6n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-08-28T14:58:11Z INFO  squeezefs] Registering data volume 'nvme7n1' at path /dev/nvme7n1 (state active)
+[2026-08-28T14:58:11Z INFO  squeezefs::nvme_dev] data volume /dev/nvme7n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-08-28T14:58:11Z INFO  squeezefs::dlm] fencing: durable writer term 2 adopted (was 0); every token this process mints now dominates every earlier era's (spec §6.7 decision 4)
+[2026-08-28T14:58:11Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme3n1: writer claim taken (id=8f58118c-4096-41e6-a5fa-50bf5df565a7, term=2, mode=flock+pr)
+[2026-08-28T14:58:11Z INFO  squeezefs] meta volume /dev/nvme3n1: format=3 ledger_seq=17 replay_entries=0 replay_dropped_torn=0 replay_ms=49 free_extents=14304967 next_ino=2 meta_volume_atomicity=cow-checksummed meta_volume_atomicity_physical=unknown writer_guard_mode=flock+pr
+[2026-08-28T14:58:11Z INFO  squeezefs::fuse_client] Dynamic reclaim concurrency limit configured: 4
+[2026-08-28T14:58:11Z INFO  squeezefs::routing] block-key incarnations engaged (spec §6.2 item 6): era 2, appender 0/1 — persisted block keys now name the lifetime of their device offset
+[2026-08-28T14:58:11Z INFO  squeezefs::data_custody] data-plane WERO (rtype 3) acquired on 4 namespace(s), key 0x5307d1749a7e05fe — guarantee class pr: an unregistered (fenced) host's writes are rejected by the device
+[2026-08-28T14:58:11Z INFO  squeezefs::routing] durable block-reference ledger is EMPTY — declining to treat it as                  authoritative (an un-backfilled stamp reads every live block as free):                  falling back to the layout walk, which then backfills
+[2026-08-28T14:58:11Z INFO  squeezefs] Running block allocator recovery for data volume...
+[2026-08-28T14:58:11Z INFO  squeezefs::block_allocator] Recovery scan summary (v3): checked=1, valid_inodes=1, layouts_found=0
+[2026-08-28T14:58:11Z INFO  squeezefs] Running block allocator recovery for data volume...
+[2026-08-28T14:58:11Z INFO  squeezefs::block_allocator] Recovery scan summary (v3): checked=1, valid_inodes=1, layouts_found=0
+[2026-08-28T14:58:11Z INFO  squeezefs] Running block allocator recovery for data volume...
+[2026-08-28T14:58:11Z INFO  squeezefs::block_allocator] Recovery scan summary (v3): checked=1, valid_inodes=1, layouts_found=0
+[2026-08-28T14:58:11Z INFO  squeezefs] Running block allocator recovery for data volume...
+[2026-08-28T14:58:11Z INFO  squeezefs::block_allocator] Recovery scan summary (v3): checked=1, valid_inodes=1, layouts_found=0
+[2026-08-28T14:58:11Z WARN  squeezefs::job_wire] job wire: listener 0.0.0.0:39285 is PLAINTEXT TCP (no ClusterSecurityConfig) — sessions are AUTHENTICATED (storage-trust challenge proof + per-frame session MAC, S3 cluster_wire) but not private, so mutating publishes pay mandatory-100 % verify-reads (Issue-30; ≈2× device reads on remote-mutated bytes). Set SQUEEZEFS_JOB_WIRE_CA_KEY (+ optional SQUEEZEFS_JOB_WIRE_CA_CERT) for CA-pinned mTLS + sampled verification, or SQUEEZEFS_JOB_WIRE_BIND to narrow/disable the listener.
+[2026-08-28T14:58:11Z INFO  squeezefs::job_wire] job wire: bounds — max 64 concurrent connections, 8192 pre-enrollment frame cap, handshake deadline 10s, challenge freshness 30s
+[2026-08-28T14:58:11Z INFO  squeezefs] job wire: endpoint 172.31.28.104:39285 (published via the mount registration)
+[2026-08-28T14:58:11Z INFO  squeezefs::free_grace] freed-offset grace period armed (spec §6.8 item 3): a terminally-freed offset is not reallocatable until every live reader has acknowledged passing it. Grace bound 76.045s (under space pressure 38.0225s), ring cap 841785 offsets per volume — past the bound a laggard is FENCED, not waited on
+[2026-08-28T14:58:11Z INFO  squeezefs::membership] membership owner '370e6332-f13d-461e-aa0d-2f3321035ee7' armed in term 2 (was 1): lease TTL 45s, member deadline T_self 42.955s, renewal cadence 10s, grace 45s — liveness is RAM state renewed over cluster_wire and costs ZERO journal transactions (DLM S6, spec §6.5 item 3)
+[2026-08-28T14:58:11Z INFO  squeezefs::cluster_wire] cluster wire: listener 0.0.0.0:45175 (plaintext) — thread-per-connection, max 64 connections, 8192 B pre-authn frame cap, handshake deadline 10s, challenge freshness 30s; every admitted frame carries a session MAC derived from the shared volume's job:enroll secret
+[2026-08-28T14:58:11Z INFO  squeezefs::membership_wire] membership plane listening on 0.0.0.0:45175 (owner '370e6332-f13d-461e-aa0d-2f3321035ee7', term 2) — liveness for every member is RAM state renewed over this wire, so a beat costs ZERO journal transactions (DLM S6)
+[2026-08-28T14:58:11Z INFO  squeezefs::membership] claim set on /dev/nvme3n1: writer 'node_e56e47de7cb413eb.mae9dc892' is a durable member in term 2 (1 member(s),          registrant key 0x5307d1749a7e05fe) — §6.2 item 7
+[2026-08-28T14:58:11Z INFO  squeezefs::membership] membership OWNER armed on 172.31.28.104:45175 (id '370e6332-f13d-461e-aa0d-2f3321035ee7', term 2, superseding 1): members hold RAM leases renewed over cluster_wire, so liveness costs ZERO journal transactions and `squeezefs clients` reads ONE record plus a paged census instead of one getxattr per client (DLM S6, spec §6.5 item 3)
+[2026-08-28T14:58:11Z INFO  squeezefs::data_custody] data-plane WERO: joining the standing hold on 4 namespace(s) (key 0x5307d1749a7e05fe) — a second reservation would conflict at the device
+[2026-08-28T14:58:11Z INFO  squeezefs::membership] claim set on /dev/nvme3n1: writer 'node_e56e47de7cb413eb.mede43def' is a durable member in term 2 (2 member(s),          registrant key 0x0) — §6.2 item 7
+[2026-08-28T14:58:11Z INFO  squeezefs::membership] claim set on /dev/nvme3n1: writer 'node_e56e47de7cb413eb.mad13c96f' is a durable member in term 2 (3 member(s),          registrant key 0x0) — §6.2 item 7
+[2026-08-28T14:58:11Z INFO  squeezefs::membership] claim set on /dev/nvme3n1: writer 'node_e56e47de7cb413eb.m0cb1fc55' is a durable member in term 2 (4 member(s),          registrant key 0x0) — §6.2 item 7
+[2026-08-28T14:58:11Z INFO  squeezefs::membership] claim set on /dev/nvme3n1: writer 'node_e56e47de7cb413eb.m2d45e9c3' is a durable member in term 2 (5 member(s),          registrant key 0x0) — §6.2 item 7
+[2026-08-28T14:58:11Z INFO  squeezefs::membership] claim set on /dev/nvme3n1: writer 'node_e56e47de7cb413eb.m5bc655d3' is a durable member in term 2 (6 member(s),          registrant key 0x0) — §6.2 item 7
+[2026-08-28T14:58:11Z INFO  squeezefs::membership] claim set on /dev/nvme3n1: writer 'node_e56e47de7cb413eb.m11bafcbf' is a durable member in term 2 (7 member(s),          registrant key 0x0) — §6.2 item 7
+[2026-08-28T14:58:11Z INFO  squeezefs::membership] claim set on /dev/nvme3n1: writer 'node_e56e47de7cb413eb.mad7c5113' is a durable member in term 2 (8 member(s),          registrant key 0x0) — §6.2 item 7
+[2026-08-28T14:58:11Z INFO  squeezefs::membership] claim set on /dev/nvme3n1: writer 'node_e56e47de7cb413eb.me2d0c742' is a durable member in term 2 (9 member(s),          registrant key 0x0) — §6.2 item 7
+[2026-08-28T14:58:11Z WARN  squeezefs::cowriter] claim set: 8 durable co-writer enrollment(s) committed for ["node_e56e47de7cb413eb.mede43def", "node_e56e47de7cb413eb.mad13c96f", "node_e56e47de7cb413eb.m0cb1fc55", "node_e56e47de7cb413eb.m2d45e9c3", "node_e56e47de7cb413eb.m5bc655d3", "node_e56e47de7cb413eb.m11bafcbf", "node_e56e47de7cb413eb.mad7c5113", "node_e56e47de7cb413eb.me2d0c742"] in term 2 — each named node may now be ADMITTED as a co-writer of this set (§6.2 item 7; the authority is the only writer of this record)
+[2026-08-28T14:58:11Z WARN  squeezefs::multi_writer] multi-writer: 8 durable co-writer enrollment(s) committed for ["node_e56e47de7cb413eb.mede43def", "node_e56e47de7cb413eb.mad13c96f", "node_e56e47de7cb413eb.m0cb1fc55", "node_e56e47de7cb413eb.m2d45e9c3", "node_e56e47de7cb413eb.m5bc655d3", "node_e56e47de7cb413eb.m11bafcbf", "node_e56e47de7cb413eb.mad7c5113", "node_e56e47de7cb413eb.me2d0c742"] in era 2 — each named node may now pass admission rung 3
+[2026-08-28T14:58:11Z INFO  squeezefs::data_grant] write-custody authority 'mw-88db09ab-aba8-47c2-8394-05d6fdeb7b8e' armed in era 2 (superseding 0): client lease TTL 45s, member deadline T_self 42.955s, renewal cadence 10s, grace 45s. Only CUSTODY travels here — a co-writer's bytes go straight to the device (DLM S9, spec §6.9)
+[2026-08-28T14:58:11Z WARN  squeezefs::data_grant] S9: custody authority 'mw-88db09ab-aba8-47c2-8394-05d6fdeb7b8e' runs era 2 with a 16-way data-plane allocation partition (15 enrolled co-writer lane(s); this node is lane 0). Every member's lane travels on its lease — no knob can put two writers in one residue class
+[2026-08-28T14:58:11Z INFO  squeezefs::block_allocator] data-plane allocation partition engaged on volume 'nvme4n1': lane 0 of 16, reservation grain 96 blocks, 838189 block(s) of this device belong to other lanes (alloc_lane_stranded_bytes)
+[2026-08-28T14:58:11Z WARN  squeezefs::alloc_lane_grant] data-plane allocation lane ENGAGED on volume 'nvme4n1': lane 0 of 16, resuming at block 0 (floor from this mount's own ownership recovery). Fresh allocation is this mount's residue class; frees stay lane-blind
+[2026-08-28T14:58:11Z WARN  squeezefs::alloc_lane_grant] data-plane allocation lane ENGAGED on volume 'nvme4n1': lane 0 of 16, resuming at block 0 (floor from this mount's own ownership recovery). Fresh allocation is this mount's residue class; frees stay lane-blind
+[2026-08-28T14:58:11Z INFO  squeezefs::block_allocator] data-plane allocation partition engaged on volume 'nvme7n1': lane 0 of 16, reservation grain 96 blocks, 838189 block(s) of this device belong to other lanes (alloc_lane_stranded_bytes)
+[2026-08-28T14:58:11Z WARN  squeezefs::alloc_lane_grant] data-plane allocation lane ENGAGED on volume 'nvme7n1': lane 0 of 16, resuming at block 0 (floor from this mount's own ownership recovery). Fresh allocation is this mount's residue class; frees stay lane-blind
+[2026-08-28T14:58:11Z INFO  squeezefs::block_allocator] data-plane allocation partition engaged on volume 'nvme6n1': lane 0 of 16, reservation grain 96 blocks, 838189 block(s) of this device belong to other lanes (alloc_lane_stranded_bytes)
+[2026-08-28T14:58:11Z WARN  squeezefs::alloc_lane_grant] data-plane allocation lane ENGAGED on volume 'nvme6n1': lane 0 of 16, resuming at block 0 (floor from this mount's own ownership recovery). Fresh allocation is this mount's residue class; frees stay lane-blind
+[2026-08-28T14:58:11Z INFO  squeezefs::block_allocator] data-plane allocation partition engaged on volume 'nvme5n1': lane 0 of 16, reservation grain 96 blocks, 838189 block(s) of this device belong to other lanes (alloc_lane_stranded_bytes)
+[2026-08-28T14:58:11Z WARN  squeezefs::alloc_lane_grant] data-plane allocation lane ENGAGED on volume 'nvme5n1': lane 0 of 16, resuming at block 0 (floor from this mount's own ownership recovery). Fresh allocation is this mount's residue class; frees stay lane-blind
+[2026-08-28T14:58:11Z INFO  squeezefs::cluster_wire] cluster wire: listener 0.0.0.0:45999 (plaintext) — thread-per-connection, max 64 connections, 8192 B pre-authn frame cap, handshake deadline 10s, challenge freshness 30s; every admitted frame carries a session MAC derived from the shared volume's job:enroll secret
+[2026-08-28T14:58:11Z WARN  squeezefs::meta_ship::owners] metadata function shipping ARMED (DLM S8): 1 of 1 volumes owned locally, 0 shipped to 0 peer(s) []; 65536 slots home locally. Metadata verbs on a foreign volume now travel to its owner; the DATA plane still refuses foreign-home custody loud (S9 ships that half)
+[2026-08-28T14:58:11Z WARN  squeezefs::multi_writer] MULTI-WRITER ARMED (DLM S9) on 172.31.28.104:45999: era 2, custody authority 'mw-88db09ab-aba8-47c2-8394-05d6fdeb7b8e', data-plane fence class pr, 0 of 1 metadata volume(s) owned elsewhere. Peers may now acquire write custody here and DMA directly to the shared namespaces — only custody travels, never data (spec §6.9 S9)
+Mounting Squeezefs at "/scratch/mnt"...
+[2026-08-28T14:58:11Z INFO  squeezefs::fuse_client] Transport payload-buffer cap: 2466 MiB (memory budget 19729 MiB)
+[2026-08-28T14:58:11Z WARN  squeezefs::ipc_host] SQUEEZEFS_IPC_ALLOW_DEV is set — the KD-7 build-commit skew gate is RELAXED for this mount (degenerate `unknown`/`-dirty` identities will be admitted, counted in ipc_binds_dev_override). Dev boxes only: a mismatched daemon/shim pair is undefined behavior.
+[2026-08-28T14:58:11Z INFO  squeezefs::ipc_host] ipc host: path ctl socket at /run/squeezefs/sqz-il0-3759-6e52b34e.sock
+[2026-08-28T14:58:11Z INFO  squeezefs::fuse_client] IPC session host armed (socket sqz-il0-3759-6e52b34e, session shm cap 2466 MiB)
+[2026-08-28T14:58:11Z INFO  squeezefs::fuse_client] SqueezeFS version 1.1.0 (92ac6c37b48c / 92ac6c37b48cb53c8a89a8cc272611dd20b8a2e0) built 2026-08-28T14:45:49Z initializing mount
+[2026-08-28T14:58:11Z INFO  squeezefs::fuse_client] FUSE Daemon: Mounting squeezefs at "/scratch/mnt"...
+[2026-08-28T14:58:11Z INFO  squeezefs::fuse_client] FUSE Daemon: Metadata connection active.
+[2026-08-28T14:58:11Z INFO  squeezefs::fuse_client] device-overlay armed: transport streaming holds enabled (SQUEEZEFS_DEVICE_OVERLAY)
+[92mOK[0m Squeezefs is ready at "/scratch/mnt"
+[2026-08-28T14:58:11Z INFO  squeezefs::fuse_client] IPC session host: mount st_dev resolved (56)
+[2026-08-28T14:58:11Z INFO  squeezefs::fuse_client] FUSE Daemon: Initialized Squeezefs Filesystem mount (version 1.1.0 (92ac6c37b48c / 92ac6c37b48cb53c8a89a8cc272611dd20b8a2e0) built 2026-08-28T14:45:49Z).
+squeezefs: mount ready (version 1.1.0 (92ac6c37b48c / 92ac6c37b48cb53c8a89a8cc272611dd20b8a2e0) built 2026-08-28T14:45:49Z, exe hint: rebuild target/release and reinstall)
+[2026-08-28T14:58:11Z INFO  squeezefs::fuse_client] FUSE kernel protocol 7.45 (init flags 0x7ff73fffffb): FOPEN_NOFLUSH advertised + honored on non-writeback opens (kernel ≥ 7.35) (D2.a; under writeback cache the elision switch is the clean-FLUSH ENOSYS latch — uapi: NOFLUSH applies 'unless FUSE_WRITEBACK_CACHE'); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+squeezefs: FUSE kernel 7.45 — FOPEN_NOFLUSH advertised (wb-cache elision = clean-FLUSH ENOSYS latch); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+[2026-08-28T14:58:11Z INFO  squeezefs::fuse_client] FUSE_HANDLE_KILLPRIV_V2 negotiated (kernel killpriv probe deleted; daemon owns suid/sgid/caps clearing) for this mount
+[2026-08-28T14:58:11Z WARN  fuse3::raw::connection::kmbuf] SQUEEZEFS_FUSE_ZC=1 declined: the kmbuf/zc io_uring surface is Absent on this kernel — continuing on the userspace-ent path (fuse3_zc_replies stays 0; the sqz kernel series carries the surface)
+[2026-08-28T14:58:11Z INFO  fuse3::raw::connection::fuse_over_uring] fuse-over-uring queue-ring setup probe: SINGLE_ISSUER+DEFER_TASKRUN available
+FUSE-over-io_uring registered: queues=32 depth=32 payload_sz=1048576 max_write=1048576 max_pages=256 buffers=user-ents kmbuf_ops=absent fd=320 sqpoll=off drain_groups=4(width<=8)
+[2026-08-28T14:58:11Z INFO  fuse3::raw::connection::fuse_over_uring] FUSE-over-io_uring registered: queues=32 depth=32 payload_sz=1048576 max_write=1048576 max_pages=256 buffers=user-ents kmbuf_ops=absent fd=320 sqpoll=off drain_groups=4(width<=8)
+FUSE-over-io_uring session path armed (ready=true, queues=32)
+FUSE-over-io_uring transport armed for this session
+[2026-08-28T14:58:11Z INFO  fuse3::raw::session] FUSE-over-io_uring transport armed for this session
+FUSE-over-io_uring: classical sideband servicer armed (primary session; FORGET/INTERRUPT/resend + switchover stragglers)
+[2026-08-28T14:58:26Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mede43def' admitted from 172.31.28.104:36630 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:58:26Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mede43def' admitted from 172.31.28.104:55076 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:58:26Z INFO  squeezefs::data_grant] S9: co-writer 'node_e56e47de7cb413eb.mede43def' joined authority 'mw-88db09ab-aba8-47c2-8394-05d6fdeb7b8e' in era 2 with lease epoch 1 (custody epoch 0x20000000001, registrant key 0x5307d1749a7e05fe)
+[2026-08-28T14:58:26Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mede43def' admitted from 172.31.28.104:55088 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:58:27Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mede43def' admitted from 172.31.28.104:55102 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:58:27Z INFO  squeezefs::data_custody] data-plane WERO: joining the standing hold on 4 namespace(s) (key 0x5307d1749a7e05fe) — a second reservation would conflict at the device
+[2026-08-28T14:58:27Z INFO  squeezefs::job_wire] job wire: WERO (rtype 3) held on the data namespaces (key 0x5307d1749a7e05fe) — guarantee class pr (expired worker hosts will be PR-preempted). The hold is the process's ONE data-plane reservation (DLM S7, data_custody::acquire_wero): an S7-armed mount and this fence share it rather than conflicting at the device
+[2026-08-28T14:58:27Z INFO  squeezefs::job_wire] job wire: worker node_e56e47de7cb413eb.mede43def enrolled from 172.31.28.104:55128 (session 1, pr_key None, fence pr, channel plaintext, session MAC)
+[2026-08-28T14:58:27Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mede43def' admitted from 172.31.28.104:55114 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:58:27Z INFO  squeezefs::meta_ship::service] S10 delegation: holder 'node_e56e47de7cb413eb.mede43def' re-asserted 1 object(s), 1 re-admitted in era 2 (grace closed)
+[2026-08-28T14:58:36Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mede43def' admitted from 172.31.28.104:44218 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:58:40Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mad13c96f' admitted from 172.31.28.104:44538 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:58:40Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mad13c96f' admitted from 172.31.28.104:50314 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:58:40Z INFO  squeezefs::data_grant] S9: co-writer 'node_e56e47de7cb413eb.mad13c96f' joined authority 'mw-88db09ab-aba8-47c2-8394-05d6fdeb7b8e' in era 2 with lease epoch 2 (custody epoch 0x20000000002, registrant key 0x5307d1749a7e05fe)
+[2026-08-28T14:58:40Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mad13c96f' admitted from 172.31.28.104:50320 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:58:40Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mad13c96f' admitted from 172.31.28.104:50334 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:58:40Z INFO  squeezefs::job_wire] job wire: worker node_e56e47de7cb413eb.mad13c96f enrolled from 172.31.28.104:35342 (session 2, pr_key None, fence pr, channel plaintext, session MAC)
+[2026-08-28T14:58:40Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mad13c96f' admitted from 172.31.28.104:50342 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:58:40Z INFO  squeezefs::meta_ship::service] S10 delegation: holder 'node_e56e47de7cb413eb.mad13c96f' re-asserted 1 object(s), 1 re-admitted in era 2 (grace closed)
+[2026-08-28T14:58:50Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mad13c96f' admitted from 172.31.28.104:38044 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:58:51Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m0cb1fc55' admitted from 172.31.28.104:34036 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:58:51Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m0cb1fc55' admitted from 172.31.28.104:38046 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:58:51Z INFO  squeezefs::data_grant] S9: co-writer 'node_e56e47de7cb413eb.m0cb1fc55' joined authority 'mw-88db09ab-aba8-47c2-8394-05d6fdeb7b8e' in era 2 with lease epoch 3 (custody epoch 0x20000000003, registrant key 0x5307d1749a7e05fe)
+[2026-08-28T14:58:52Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m0cb1fc55' admitted from 172.31.28.104:38052 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:58:52Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m0cb1fc55' admitted from 172.31.28.104:38054 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:58:52Z INFO  squeezefs::job_wire] job wire: worker node_e56e47de7cb413eb.m0cb1fc55 enrolled from 172.31.28.104:40750 (session 3, pr_key None, fence pr, channel plaintext, session MAC)
+[2026-08-28T14:58:52Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m0cb1fc55' admitted from 172.31.28.104:38056 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:58:52Z INFO  squeezefs::meta_ship::service] S10 delegation: holder 'node_e56e47de7cb413eb.m0cb1fc55' re-asserted 1 object(s), 1 re-admitted in era 2 (grace closed)
+[2026-08-28T14:59:01Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m2d45e9c3' admitted from 172.31.28.104:44998 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:59:01Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m2d45e9c3' admitted from 172.31.28.104:35260 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:59:01Z INFO  squeezefs::data_grant] S9: co-writer 'node_e56e47de7cb413eb.m2d45e9c3' joined authority 'mw-88db09ab-aba8-47c2-8394-05d6fdeb7b8e' in era 2 with lease epoch 4 (custody epoch 0x20000000004, registrant key 0x5307d1749a7e05fe)
+[2026-08-28T14:59:01Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m2d45e9c3' admitted from 172.31.28.104:35270 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:59:01Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m2d45e9c3' admitted from 172.31.28.104:35272 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:59:01Z WARN  squeezefs::meta_ship::tokens] S10 recall valve: object ino 1 demoted to owner-served for 270.035456s — 3 grant→recall cycles inside 33.754432s (spec R5's thrash shape; grants resume after the cooldown)
+[2026-08-28T14:59:01Z INFO  squeezefs::job_wire] job wire: worker node_e56e47de7cb413eb.m2d45e9c3 enrolled from 172.31.28.104:44828 (session 4, pr_key None, fence pr, channel plaintext, session MAC)
+[2026-08-28T14:59:01Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m0cb1fc55' admitted from 172.31.28.104:35284 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:59:08Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m5bc655d3' admitted from 172.31.28.104:50928 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:59:08Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m5bc655d3' admitted from 172.31.28.104:44474 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:59:08Z INFO  squeezefs::data_grant] S9: co-writer 'node_e56e47de7cb413eb.m5bc655d3' joined authority 'mw-88db09ab-aba8-47c2-8394-05d6fdeb7b8e' in era 2 with lease epoch 5 (custody epoch 0x20000000005, registrant key 0x5307d1749a7e05fe)
+[2026-08-28T14:59:08Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m5bc655d3' admitted from 172.31.28.104:44480 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:59:08Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m5bc655d3' admitted from 172.31.28.104:44494 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:59:08Z INFO  squeezefs::job_wire] job wire: worker node_e56e47de7cb413eb.m5bc655d3 enrolled from 172.31.28.104:58074 (session 5, pr_key None, fence pr, channel plaintext, session MAC)
+[2026-08-28T14:59:11Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m2d45e9c3' admitted from 172.31.28.104:44504 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:59:13Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m11bafcbf' admitted from 172.31.28.104:50930 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:59:13Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m11bafcbf' admitted from 172.31.28.104:44508 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:59:13Z INFO  squeezefs::data_grant] S9: co-writer 'node_e56e47de7cb413eb.m11bafcbf' joined authority 'mw-88db09ab-aba8-47c2-8394-05d6fdeb7b8e' in era 2 with lease epoch 6 (custody epoch 0x20000000006, registrant key 0x5307d1749a7e05fe)
+[2026-08-28T14:59:13Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m11bafcbf' admitted from 172.31.28.104:44520 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:59:13Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m11bafcbf' admitted from 172.31.28.104:44522 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:59:13Z INFO  squeezefs::job_wire] job wire: worker node_e56e47de7cb413eb.m11bafcbf enrolled from 172.31.28.104:58080 (session 6, pr_key None, fence pr, channel plaintext, session MAC)
+[2026-08-28T14:59:16Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mad7c5113' admitted from 172.31.28.104:50934 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:59:16Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mad7c5113' admitted from 172.31.28.104:44538 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:59:16Z INFO  squeezefs::data_grant] S9: co-writer 'node_e56e47de7cb413eb.mad7c5113' joined authority 'mw-88db09ab-aba8-47c2-8394-05d6fdeb7b8e' in era 2 with lease epoch 7 (custody epoch 0x20000000007, registrant key 0x5307d1749a7e05fe)
+[2026-08-28T14:59:16Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mad7c5113' admitted from 172.31.28.104:44546 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:59:16Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mad7c5113' admitted from 172.31.28.104:44552 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:59:16Z INFO  squeezefs::job_wire] job wire: worker node_e56e47de7cb413eb.mad7c5113 enrolled from 172.31.28.104:58088 (session 7, pr_key None, fence pr, channel plaintext, session MAC)
+[2026-08-28T14:59:16Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.me2d0c742' admitted from 172.31.28.104:50948 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:59:16Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.me2d0c742' admitted from 172.31.28.104:44560 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:59:16Z INFO  squeezefs::data_grant] S9: co-writer 'node_e56e47de7cb413eb.me2d0c742' joined authority 'mw-88db09ab-aba8-47c2-8394-05d6fdeb7b8e' in era 2 with lease epoch 8 (custody epoch 0x20000000008, registrant key 0x5307d1749a7e05fe)
+[2026-08-28T14:59:17Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.me2d0c742' admitted from 172.31.28.104:44572 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:59:17Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.me2d0c742' admitted from 172.31.28.104:44582 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:59:17Z INFO  squeezefs::job_wire] job wire: worker node_e56e47de7cb413eb.me2d0c742 enrolled from 172.31.28.104:58090 (session 8, pr_key None, fence pr, channel plaintext, session MAC)
+[2026-08-28T14:59:18Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m5bc655d3' admitted from 172.31.28.104:44000 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:59:23Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m11bafcbf' admitted from 172.31.28.104:44012 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:59:26Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mad7c5113' admitted from 172.31.28.104:44022 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:59:27Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.me2d0c742' admitted from 172.31.28.104:44032 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:59:28Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mad7c5113' admitted from 172.31.28.104:41330 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:59:28Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.me2d0c742' admitted from 172.31.28.104:41322 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:59:28Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m11bafcbf' admitted from 172.31.28.104:41328 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:59:28Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m2d45e9c3' admitted from 172.31.28.104:41344 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:59:28Z INFO  squeezefs::meta_ship::service] S10 delegation: holder 'node_e56e47de7cb413eb.mad7c5113' re-asserted 1 object(s), 1 re-admitted in era 2 (grace closed)
+[2026-08-28T14:59:28Z INFO  squeezefs::meta_ship::service] S10 delegation: holder 'node_e56e47de7cb413eb.m11bafcbf' re-asserted 1 object(s), 1 re-admitted in era 2 (grace closed)
+[2026-08-28T14:59:28Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m5bc655d3' admitted from 172.31.28.104:41356 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T14:59:28Z INFO  squeezefs::meta_ship::service] S10 delegation: holder 'node_e56e47de7cb413eb.m2d45e9c3' re-asserted 1 object(s), 1 re-admitted in era 2 (grace closed)
+[2026-08-28T14:59:28Z INFO  squeezefs::meta_ship::service] S10 delegation: holder 'node_e56e47de7cb413eb.m5bc655d3' re-asserted 1 object(s), 1 re-admitted in era 2 (grace closed)
+[2026-08-28T14:59:28Z INFO  squeezefs::meta_ship::service] S10 delegation: holder 'node_e56e47de7cb413eb.me2d0c742' re-asserted 1 object(s), 1 re-admitted in era 2 (grace closed)
+[2026-08-28T14:59:28Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mede43def' sent no frame within 60s — closing the idle session
+[2026-08-28T14:59:36Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mede43def' admitted from 172.31.28.104:41368 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T15:04:41Z WARN  squeezefs::meta_ship::tokens] S10 recall valve: object ino 2 demoted to owner-served for 270.035456s — 3 grant→recall cycles inside 33.754432s (spec R5's thrash shape; grants resume after the cooldown)
+[2026-08-28T15:04:56Z WARN  fuse3::raw::connection::fuse_over_uring] fuse-over-uring qid=20 ent=31: unique=220 delivered 9108 ms ago and still unreplied — the caller is in uninterruptible sleep (transport_slots_overdue; not-fused, fused_ready_total=0, zc_bridge_pends=0, scan_passes=0, scan_pends_seen=0, scan_orphans_seen=0, pend_max_age_ms=0, cancel_latched=0, park_backstop_ticks=0, zc_msgs_sent=0, zc_msgs_taken=0)
+[2026-08-28T15:09:02Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m2d45e9c3' sent no frame within 60s — closing the idle session
+[2026-08-28T15:09:47Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m5bc655d3' sent no frame within 60s — closing the idle session
+[2026-08-28T15:09:56Z WARN  squeezefs::meta_ship::tokens] S10 recall valve: object ino 2 demoted to owner-served for 270.035456s — 3 grant→recall cycles inside 33.754432s (spec R5's thrash shape; grants resume after the cooldown)
+[2026-08-28T15:10:21Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m2d45e9c3' admitted from 172.31.28.104:49978 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T15:10:23Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m5bc655d3' admitted from 172.31.28.104:49988 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T15:14:56Z WARN  squeezefs::meta_ship::tokens] S10 recall valve: object ino 2 demoted to owner-served for 270.035456s — 3 grant→recall cycles inside 33.754432s (spec R5's thrash shape; grants resume after the cooldown)
+[2026-08-28T15:14:58Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m11bafcbf' sent no frame within 60s — closing the idle session
+[2026-08-28T15:15:19Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mad7c5113' sent no frame within 60s — closing the idle session
+[2026-08-28T15:15:31Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m2d45e9c3' sent no frame within 60s — closing the idle session
+[2026-08-28T15:15:35Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m0cb1fc55' sent no frame within 60s — closing the idle session
+[2026-08-28T15:15:36Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m11bafcbf' admitted from 172.31.28.104:57662 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T15:15:36Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mad7c5113' admitted from 172.31.28.104:57674 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T15:15:41Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m2d45e9c3' admitted from 172.31.28.104:60796 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T15:15:42Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.m0cb1fc55' admitted from 172.31.28.104:60810 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T15:19:08Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mad7c5113' sent no frame within 60s — closing the idle session
+[2026-08-28T15:20:32Z WARN  squeezefs::meta_ship::tokens] S10 recall valve: object ino 2 demoted to owner-served for 270.035456s — 3 grant→recall cycles inside 33.754432s (spec R5's thrash shape; grants resume after the cooldown)
+[2026-08-28T15:20:56Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mad7c5113' admitted from 172.31.28.104:52992 (plaintext, storage-trust proof, per-frame MAC)
+[2026-08-28T15:24:36Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mad13c96f' sent no frame within 60s — closing the idle session
+[2026-08-28T15:24:48Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mad7c5113' sent no frame within 60s — closing the idle session

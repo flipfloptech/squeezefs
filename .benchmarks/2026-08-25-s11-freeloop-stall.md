@@ -817,3 +817,25 @@ extent, displace the block with a newer publish + free, force the fold
 attempt (or a newer covering publish supersedes/retires the assembly).
 Second face (possibly the same root seen from the settle arm): m51's
 12 backend-fresh tripwires on ino 101360 block 19.
+
+### Finding 28 corrected (code walk): head REGRESSION, not a pinned seed
+
+`fetch_seed_image` re-resolves the head per attempt (cache ≤1 s, else
+the routed fetch), and the "STALE BLOCK-KEY BINDING refused" text is the
+ladder's PROPAGATE arm — a fetch refusal on a binding the ladder proved
+CURRENT. So the durable head itself named the dead key for a minute:
+the authority's fold published a NEW binding for the block and (post-
+publish, legally) freed the old offset — then a co-writer's shipped
+MERGE whose cached map still named the OLD binding REGRESSED the head
+(per-block last-writer-wins in the compose; the rung-20 demoted-region
+retention protects assembled blocks only while the region stays
+demoted). Every subsequent fold/read of that block then propagates EIO,
+and the head cannot heal because the co-writer's next publish is parked
+behind the failing fsync. The law for the red test: **the arbiter's
+compose never adopts a caller's block binding whose stamped incarnation
+is dead** (or older than the durable entry's) — the caller's entry
+drops, the durable's stands, and the shipper's stale cache heals
+through the served-layout invalidation it already rides. Venue:
+`tests/mw_authority_assembler_tests.rs` (owner + compose + demotion
+machinery): assemble + fold-publish B2 + free B1, ship a merge naming
+B1, assert the head still names B2 and the fold serves clean.

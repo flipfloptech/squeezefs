@@ -3645,3 +3645,144 @@ async fn a_shipped_free_of_a_mid_write_reallocated_offset_is_refused() {
     drop(cwr);
     auth.stop().await;
 }
+
+// ===========================================================================
+// 11. Finding 28 — a stale merge never regresses a block to a dead binding
+// ===========================================================================
+
+/// Finding 28 (`.benchmarks/2026-08-25-s11-freeloop-stall.md`, the first
+/// cheap-first local probe): the authority's fold published a NEW binding
+/// for a block and legally freed the displaced offset (re-minted by
+/// another lifetime) — then a co-writer's shipped MERGE whose cached map
+/// still named the OLD binding REGRESSED the durable head (per-block
+/// last-writer-wins in the compose). Every subsequent fold/read of the
+/// block propagated "names a dead incarnation" EIO for a full minute
+/// (the head cannot heal: the shipper's next publish is parked behind the
+/// failing fsync), and ior's rank called MPI_ABORT. The law: **the
+/// arbiter never adopts a caller's block binding whose stamped
+/// incarnation is DEAD** — the caller's entry drops, the durable's
+/// stands, and the shipper's stale cache heals through the served-layout
+/// invalidation it already rides.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_merge_never_regresses_a_block_to_a_dead_binding() {
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "f28-regress").await;
+    let dev = data_device(dir.path(), "f28-regress.dev");
+    let auth = Authority::start(&vol, &dev, &[NODE_A]).await;
+
+    // Authority-side mints happen BEFORE the co-writer join (fresh mints
+    // raise the lane frontier; a joined process's raises ship under the
+    // CO-WRITER's identity and refuse for the authority's lane — the
+    // suite's established order. The post-free RE-mint below is
+    // free-list-first and needs no raise).
+    //
+    // The block's FIRST lifetime: minted, published (word live), and the
+    // stamped key the co-writer's cache captured.
+    let off_old = auth.alloc.allocate_block().await.expect("first mint");
+    auth.alloc.publish_block(off_old);
+    let gen_old = auth
+        .alloc
+        .fill_incarnation(off_old)
+        .expect("published word is stable");
+    let dead_key_body = off_old.to_string();
+    let stale_key = squeezefs::routing::block_key_with_incarnation(&dead_key_body, gen_old);
+
+    // The durable head the fold established AFTER displacing it: a NEW
+    // binding at a fresh offset.
+    let off_new = auth.alloc.allocate_block().await.expect("fold's mint");
+    auth.alloc.publish_block(off_new);
+    let gen_new = auth
+        .alloc
+        .fill_incarnation(off_new)
+        .expect("published word is stable");
+    let live_key = squeezefs::routing::block_key_with_incarnation(&off_new.to_string(), gen_new);
+
+    let cwr = CoWriter::join(&auth, &vol, &dev, NODE_A).await;
+    let epoch = cwr.client.lease_epoch();
+    let ino = publish::create_with_rdev_size(&cwr.meta, 1, "regress.bin", 0o100644, 0, 0, 0, 0)
+        .await
+        .expect("shipped create")
+        .ino;
+    let head = bincode::serialize(&squeezefs::layout_wire::LayoutMetadata {
+        file_type: "striped".into(),
+        size: 4 * 1024 * 1024,
+        block_map_id: None,
+        block_prefix: None,
+        file_id: None,
+        data_key: None,
+        block_map: Some([(0u32, live_key.clone())].into_iter().collect()),
+    })
+    .expect("head bytes");
+    squeezefs::meta_ship::publish::set_layout_and_size(&cwr.meta, ino, &head, 4 * 1024 * 1024, &[])
+        .await
+        .expect("the fold's head lands");
+
+    // The displaced offset's first lifetime DIES (legal post-publish
+    // free) and the offset is re-minted by another lifetime.
+    cwr.br
+        .free_block(&dead_key_body)
+        .await
+        .expect("the displaced free ships");
+    auth.br.reclaim_drain().await;
+    let reused = auth.alloc.allocate_block().await.expect("re-mint");
+    assert_eq!(reused, off_old, "free-list-first re-mints the offset");
+    auth.alloc.publish_block(off_old);
+    assert_ne!(
+        auth.alloc.fill_incarnation(off_old),
+        Some(gen_old),
+        "fixture: the stale key's incarnation is DEAD (a new lifetime owns the offset)"
+    );
+
+    // The co-writer's STALE merge: its cached map still names the dead
+    // binding for block 0 (the probe's field shape).
+    let pc = publish::PublishClient::new(NODE_A, SECRET.to_vec());
+    let mut d = squeezefs::layout_wire::LayoutDelta::from_final_state(
+        "striped",
+        4 * 1024 * 1024,
+        None,
+        None,
+        None,
+        None,
+        vec![(0u32, stale_key.clone())],
+    );
+    d.set_versions(0, squeezefs::dlm::mint_layout_version());
+    let frame = publish::PublishCall::MergeLayoutAndSize {
+        ino,
+        delta: d.encode(),
+        full_layout: head.clone(),
+        size: 4 * 1024 * 1024,
+        refs: Vec::new(),
+        lease_epoch: epoch,
+        request_id: 0xF28_0001,
+    };
+    pc.ship(&auth.endpoint, frame)
+        .await
+        .expect("the stale merge is SERVED (the drop is per-entry, never a frame refusal)");
+
+    // The law: the durable head still names the LIVE binding.
+    use squeezefs::meta_backend::Metadata;
+    let raw = auth
+        .meta
+        .getxattr(ino, "layout")
+        .await
+        .expect("head read")
+        .expect("layout present");
+    let after = squeezefs::layout_wire::decode_base_layout(&raw).expect("decodable head");
+    let got = after
+        .block_map
+        .as_ref()
+        .and_then(|m| m.get(&0))
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        got, live_key,
+        "a caller's block binding whose stamped incarnation is DEAD is never \
+         adopted — the head regressing to '{stale_key}' is finding 28's \
+         EIO-forever wedge (fsync MPI_ABORT on the probe)"
+    );
+
+    drop(cwr);
+    auth.stop().await;
+}

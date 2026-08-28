@@ -891,3 +891,28 @@ bound with a member that has not acked — today the refusal escapes to
 the caller with forced_releases 0; the law: the offsets release, the
 laggard is evicted, and the allocation retry succeeds — ENOSPC is
 reserved for genuinely-live data.
+
+## Probe 3 of `71f7d749` (110 GiB substrate): capacity acquitted; finding 30 isolated
+
+Evidence `/tmp/rows-probe13` (row `s11mpiio-1787945982`). With 2×110 GiB
+volumes the ENOSPC class is GONE (2 % used at the abort — finding 29's
+cliff was VENUE OVERSUBSCRIPTION at the new post-f27 churn rate; its
+filed law, the cliff ladder's release-or-evict, stays on the board as a
+correctness item but is not this row's killer). A1 completed at 2,815
+MiB/s (13 flat iterations). B1 (fpp) still aborts — **finding 30**, the
+f28 note's "second face", now isolated: co-writer m55's fsync died
+"block 13 of inode_58464 did not settle after 4 serialized stripe-held
+settle attempts" with ZERO dead-incarnation refusals fleet-wide (f28
+holds). Mechanism (the f25 heal's posture blindness): on a CO-WRITER
+the settle's backend head is the SHIPPED durable — the authority's
+committed truth, which lags the co-writer's own in-flight publishes —
+while the f25 heal actively DROPS the co-writer's coherent cache in
+favor of that lagging durable; under fpp rewrite churn the four
+attempts each fetch a binding the mount's own writes already retired,
+and the exhaustion EIOs the fsync barrier (rank abort). The law for the
+red loop: the f25 cache-drop heal applies only where served publishes
+exist (the authority); a CO-WRITER's cached head is its own coherent
+truth (its merges republish under the very merge domain the settle
+holds), and a backend-fresh loss there is the mount's own publish LAG —
+resolved by draining/awaiting its own in-flight publish, never by
+exhaustion EIO.

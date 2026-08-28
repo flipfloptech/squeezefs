@@ -1593,3 +1593,127 @@ async fn shrink_notices_ride_acquire_and_release_replies_not_just_renewals() {
     drop(client);
     auth.listener.shutdown();
 }
+
+// ===========================================================================
+// Finding 27 — the quiet incumbent hears at POLL latency, not its renewal
+// ===========================================================================
+
+/// Finding 27 (`.benchmarks/2026-08-25-s11-freeloop-stall.md`, PR 5
+/// acceptance attempt 9): the §9.3 demotion barrier resolves at the
+/// incumbent's ACK, and every notice carrier (f16a: acquire, release,
+/// renewal replies) is a reply on a verb the incumbent must SEND — a
+/// rank idling at an ior barrier sends nothing until its renewal cadence
+/// (min(10 s, T_self/3) — 10 s on the fleet), so the asker parks up to
+/// its full wait budget and the lockstep iteration's aggregate halves
+/// (the every-4th-iteration ~half-bandwidth dip in EVERY shared phase;
+/// attempt 9's A2 died on dip placement: 2,106 → 976 MiB/s, one
+/// `dlm_custody_phase_ns.arbitrate.<=8s`).
+///
+/// The law under contract: a custody client keeps ONE standing NOTICE
+/// POLL parked on its authority (a client-initiated RPC whose REPLY
+/// carries the notice — the §9.3 barrier's own vocabulary, the
+/// delegation recall channel's exact shape; never a push backchannel),
+/// so a QUIET incumbent hears a pending demotion at poll latency and
+/// the barrier resolves in milliseconds. The ledger is unchanged:
+/// `demotions ≡ acks + fence_resolves`, closed through the ACK column.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_quiet_incumbents_demotion_resolves_at_poll_latency_not_renewal() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let _serial = serial();
+    let _restore = Restore;
+    const INO: u64 = 77_000_141;
+    const MIB: u64 = 1024 * 1024;
+
+    // The quiet-clock authority: renewal CANNOT rescue the row inside the
+    // test budget (t_owner 60 s ⇒ renew cadence min(10 s, T_self/3) =
+    // 10 s), geometry armed — the barrier is "no geometry, no barrier".
+    let ms = Arc::new(AtomicU64::new(1_000));
+    let clock = LeaseClock::manual(Arc::clone(&ms));
+    let clocks = LeaseClocks::with_params(
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+    )
+    .expect("positive T_self");
+    let owner = WriteCustodyOwner::arm(
+        "f27-authority",
+        squeezefs::dlm::durable_term() + 1,
+        squeezefs::dlm::durable_term(),
+        clocks,
+        clock,
+        None,
+    )
+    .expect("the custody authority arms");
+    owner.install_range_geometry(data_grant::fixed_range_geometry(
+        64 * 4 * 1024 * 1024,
+        4 * 1024 * 1024,
+    ));
+    data_grant::install_custody_owner(Arc::clone(&owner));
+    let router = data_grant::AsyncVerbRouter::new().with_custody(owner);
+    let listener = squeezefs::cluster_wire::RpcListener::start_async(
+        squeezefs::cluster_wire::RpcListenerConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            service_threads: 2,
+            ..squeezefs::cluster_wire::RpcListenerConfig::default()
+        },
+        SECRET.to_vec(),
+        Arc::new(router),
+    )
+    .expect("the authority listens");
+    let endpoint = listener.endpoint().to_string();
+
+    // The incumbent: a sub-block grant inside block 0, then QUIET — no
+    // writes, no acquires, nothing until a 10 s-away renewal (the
+    // rank-at-the-ior-barrier shape).
+    let a = WriteCustodyClient::connect(&endpoint, SECRET, "f27-node-a")
+        .await
+        .expect("incumbent joins");
+    data_grant::install_custody_client(Arc::clone(&a));
+    let _ga = a
+        .acquire_range(INO, (0, MIB), (0, MIB), Duration::from_secs(3))
+        .await
+        .expect("the incumbent's grant");
+
+    // The asker: byte-DISJOINT, SAME block — the §9.3 demotion barrier
+    // parks this ask until the incumbent acks.
+    let b = WriteCustodyClient::connect(&endpoint, SECRET, "f27-node-b")
+        .await
+        .expect("asker joins");
+    let s0 = squeezefs::dlm::range_custody_stats();
+    let t0 = std::time::Instant::now();
+    let rb = b
+        .acquire_range(
+            INO,
+            (2 * MIB, 3 * MIB),
+            (2 * MIB, 3 * MIB),
+            Duration::from_secs(3),
+        )
+        .await;
+    let waited = t0.elapsed();
+    assert!(
+        rb.is_ok(),
+        "the asker's grant must issue at NOTICE-POLL latency — a QUIET incumbent \
+         hears the pending demotion on its standing poll, never at its renewal \
+         cadence (finding 27's dip; after {waited:?} of a 3 s budget: {rb:?})"
+    );
+    assert!(
+        waited < Duration::from_secs(2),
+        "resolution must be poll-latency, not a renewal-bounded park (waited {waited:?})"
+    );
+    let s1 = squeezefs::dlm::range_custody_stats();
+    assert_eq!(
+        s1.demotions - s0.demotions,
+        1,
+        "the barrier engaged (one region demoted)"
+    );
+    assert_eq!(
+        s1.demotion_acks - s0.demotion_acks,
+        1,
+        "the ledger closes through the ACK column — the quiet incumbent ACKED \
+         (never the fence column)"
+    );
+
+    drop(b);
+    drop(a);
+    listener.shutdown();
+}

@@ -619,3 +619,42 @@ marks it, the DMA-complete publish stabilizes it — no legitimate
 displaced free names an unstable offset). Fixture truth:
 `authority_file_with_block` now stabilizes the word the way production's
 publish does.
+
+## Attempt 6 (2026-08-27, binary `7d38e33a` — f24 landed): correctness signal valid, perf contaminated; finding 25
+
+From zero at 2.2 GHz — but the watchdog fired 3× mid-row (92–98 °C,
+cap dropped to 1.8 GHz mid-phase): the PERF verdict is venue-invalid.
+The correctness columns stand (row `s11mpiio-1787880454`, archived
+`/tmp/rows-pr5-attempt6` + logs): **f24 verified** — bridge asks 0,
+foreign-blob skips engaged (m50: 47), duplicate refusals present but
+both shields SILENT (`block_live_free_refusals` 0 — no duplicate
+executed; the 11 untracked refusals are the harmless free-list arm).
+Remaining: **480 `read_settle_lost_serialized` tripwires across FOUR
+blocks, settle-exhaustion fsync EIO on six of eight co-writers** — with
+no duplicate free executed, a different class entirely.
+
+## Finding 25 — the stale-cached-head settle wedge (fixed on `fix/f25-settle-stale-head`, red `08ff1e62`)
+
+An S9 SERVED publish commits the ino's layout DIRECTLY on the backend
+(outside the router's merge domain) and invalidates the authority's RAM
+cache as a SEPARATE act — a refill racing the pair leaves the router's
+`metadata_cache` holding a superseded head, permanently. The settle
+interior's premise ("any cached entry is ≥ every completed merge") is
+FALSE on a serving authority: every attempt re-read the same stale
+entry, resolved the dead binding, lost to its retired incarnation, and
+the 4-loss exhaustion EIO'd the co-writer's fsync barrier while the
+tripwire mis-attributed legal serve traffic (the per-block persistence —
+m50 retried block 1834 for seconds — is the stale cache's signature).
+Fix: loss classification by HEAD PROVENANCE (cache-served loss = legal
+race → `read_settle_stale_head_refetches` + entry drop + backend retry;
+tripwire reserved for backend-fresh losses) and the settle arms take the
+per-ino serve stripe for custody-armed inos (a served commit cannot move
+the binding mid-window). Red contract
+`a_stale_cached_head_never_wedges_the_settle_into_eio`
+(tests/rebind_starvation_tests.rs) — red on the exact live signature.
+
+Thermal note: the box now trips 92 °C+ even at the 2.2 GHz cap under
+fleet rows (it survived two full gates at this cap earlier the same
+day) — attempt 7 runs at a FIXED 1.8 GHz all-core posture, whose floor
+throughput (≈1,400 MiB/s observed while throttled) still clears the
+750 MiB/s domain gate with margin.

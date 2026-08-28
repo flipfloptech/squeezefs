@@ -703,3 +703,32 @@ Cloud-venue notes: the mw preset now honors `INSTANCE_TYPE` (uniform
 fleet, bigger client — `a4fe9617`); campaign cost ≈ $9 (55 min of
 4 × i4i.8xlarge + margin). The laptop stays the correctness-crucible
 venue; sustained verdicts are cloud rows from here.
+
+## Attempt 9 (2026-08-28, binary `6a616bf4` — f26 landed): f26 verified live; finding 27 named
+
+Same venue/shape as attempt 8 (rows `.benchmarks/cloud/2026-08-28-085328/`,
+cluster `sqzbench-20260828-084808`, ~$9). **Finding 26 verified live: no
+engagement failure** — the arbiter-fold clauses stayed quiet across all
+four phases. A1 1,991 MiB/s (the best shared figure yet), B-phases flat
+1,933/1,947. The row failed ONLY A2's sustained window: iteration 14 ran
+976 MiB/s (total 10.5 s vs the steady 4.9 s).
+
+**Finding 27 — the recurring shared-phase dip** (a dip-placement lottery
+that attempt 8 happened to win): every shared phase carries 2–3
+iterations at roughly HALF bandwidth (+~6 s wall). The instrument
+columns for A1 (the same shape in every shared phase):
+`meta_ship_owner_phase_ns.total.<=8s +122` where every sub-phase
+(admit/dispatch/execute/reply_encode) stays sub-16 ms — the 4–8 s lives
+BEFORE the first stamped sub-phase (pre-admit queueing) — beside
+`dlm_custody_phase_ns.arbitrate.<=8s +1` and the A2-only appearance of
+the delegation/recall plane (201 grants, 27 revokes with ack_wait).
+Working hypothesis: a custody arbitration that triggers the §9.3
+demotion barrier parks waiting for incumbent acks while the ranks run
+lockstep (ior inter-iteration barriers) — one ~8 s arbitration stalls
+one rank, the iteration's aggregate halves, and ~122 sibling serves
+ride out the window queued pre-admit. The red loop owns the exact lock.
+
+Standing shared-phase shape (board, benign-or-not unadjudicated): ior's
+"inconsistent file size" warning (stat 112 MiB short — likely attr-cache
+lag across mounts, present on PASSING rows) + 4–8 "fsync(15) failed"
+warnings per shared phase — identical columns on attempt 8's green row.

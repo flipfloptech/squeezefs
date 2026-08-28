@@ -2344,7 +2344,15 @@ async fn a_foreign_required_over_the_stretch_tail_shrinks_instead_of_demoting() 
         .expect("A's stretched grant issues uncontended");
     let (a_lease, a_token) = match a {
         RangeAcquired::New { lease, span } => {
-            assert_eq!(span, (0, 8 * BLK), "the uncontended desired grants whole");
+            // Finding 31: HEAD stretch below the required's own block is
+            // never minted (no honest custody there and the shrink
+            // machinery is tail-only); the tail keeps the whole doubled
+            // window — the law this test pins operates on the TAIL.
+            assert_eq!(
+                span,
+                (3 * BLK, 8 * BLK),
+                "the uncontended desired grants the required's block + the tail"
+            );
             let t = lease.fencing_token();
             (lease, t)
         }
@@ -2769,9 +2777,12 @@ async fn a_strided_holders_required_hull_never_fabricates_a_demotion() {
          the required-union HULL manufactured the coverage (finding 31; ask \
          waited {waited:?}, outcome {r:?})"
     );
+    // With the head-stretch mint clip, A's second record never claimed
+    // block 1 at all — B's ask sails as NEW custody, no barrier, no
+    // shrink ceremony.
     assert!(
         r.is_ok(),
-        "B's ask for the never-required block issues (after {waited:?}): {r:?}"
+        "B's ask for the never-required block issues promptly (after {waited:?}): {r:?}"
     );
 
     squeezefs::meta_ship::tokens::test_clear_range_cache();

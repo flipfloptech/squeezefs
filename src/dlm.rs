@@ -238,6 +238,10 @@ pub fn adopt_remote_grant(
             span.map(|(s, _)| s).unwrap_or(0),
             span.map(|(_, e)| e).unwrap_or(u64::MAX),
         ),
+        required_segments: vec![(
+            span.map(|(s, _)| s).unwrap_or(0),
+            span.map(|(_, e)| e).unwrap_or(u64::MAX),
+        )],
     };
     grant_floor(&key).fetch_max(token, Ordering::AcqRel);
     let mut conflicted = false;
@@ -1478,6 +1482,7 @@ impl LocalLockManager {
                                             // its hull is shrinkable
                                             // stretch.
                                             required,
+                                            required_segments: vec![required],
                                         },
                                     )
                                 });
@@ -1513,7 +1518,7 @@ impl LocalLockManager {
                         return false;
                     }
                     for sharer in sharers {
-                        if sharer.region.0 >= sharer.required_hull_end {
+                        if !sharer.shares_required && sharer.tail_share {
                             if custody.mark_shrink_pending(sharer.token, sharer.region.0, bs) {
                                 RANGE_TAIL_SHRINKS.fetch_add(1, Ordering::Relaxed);
                             }
@@ -1543,7 +1548,8 @@ impl LocalLockManager {
                     }
                     true
                 };
-                let decision = custody.plan_range(required, desired, scope);
+                let decision =
+                    custody.plan_range(required, desired, scope, block_size.unwrap_or(0));
                 match decision.plan {
                     RangePlan::HeldForeign => {
                         // Rung 17: foreign custody overlaps REQUIRED. If
@@ -1775,6 +1781,7 @@ impl LocalLockManager {
             // span IS the required ask (§9.3a's identity case — no
             // shrinkable tail exists, classifications stay byte-identical).
             required: (start, end),
+            required_segments: vec![(start, end)],
         }
     }
 }

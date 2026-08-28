@@ -90,7 +90,7 @@ impl LockMode {
 /// globally unique (S1's single mint), which makes it the grant's exact
 /// removal identity — two grants of the same span by the same client
 /// (possible only under compatible modes) can never be confused.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Grant {
     pub start: u64,
     pub end: u64,
@@ -108,6 +108,17 @@ pub struct Grant {
     /// grants, adopted client records, plain moded admits) — which is
     /// what keeps every pre-§9.3a classification byte-identical there.
     pub required: (u64, u64),
+    /// Finding 31: the HONEST per-ask claim segments whose hull `required`
+    /// is — maintained beside it (byte-coalesced, capped at
+    /// [`REQUIRED_SEGMENTS_CAP`] with closest-pair coalescing on overflow,
+    /// which degrades exactly to the pre-f31 hull behavior). The demotion
+    /// classifier consults THESE: a span/hull can bridge blocks the holder
+    /// never asked for (a Covered serve's `note_required` union, a merged
+    /// stretch), and classifying a peer's ask against the BRIDGE
+    /// fabricated demotions on block-aligned rows (attempt 11's only
+    /// failure). Every other law (shrink floors, own-partial, §9.3a
+    /// watermarks) keeps reading the hull.
+    pub required_segments: Vec<(u64, u64)>,
 }
 
 impl Grant {
@@ -131,6 +142,68 @@ impl Grant {
 /// ceils (the §9.2 rounding doctrine: *"desired rounds UP to 4 MiB block
 /// alignment (rounding doctrine: allocations round up)"*). `block_size`
 /// of 0 (a defensive caller) returns the span unchanged.
+/// Finding 31: the per-grant honest-claim segment cap — overflow
+/// coalesces the closest pair, degrading toward the hull (the pre-f31
+/// conservative shape), never past it.
+pub const REQUIRED_SEGMENTS_CAP: usize = 8;
+
+/// Union `ask` into `segs` (byte-grain coalesce of overlap/abutment),
+/// enforcing [`REQUIRED_SEGMENTS_CAP`] by closest-pair coalescing.
+pub fn union_required_segment(segs: &mut Vec<(u64, u64)>, ask: (u64, u64)) {
+    let mut lo = ask.0;
+    let mut hi = ask.1;
+    segs.retain(|&(s, e)| {
+        if e >= lo && s <= hi {
+            lo = lo.min(s);
+            hi = hi.max(e);
+            false
+        } else {
+            true
+        }
+    });
+    let at = segs.partition_point(|&(s, _)| s < lo);
+    segs.insert(at, (lo, hi));
+    while segs.len() > REQUIRED_SEGMENTS_CAP {
+        let mut best = 0;
+        let mut best_gap = u64::MAX;
+        for i in 0..segs.len() - 1 {
+            let gap = segs[i + 1].0.saturating_sub(segs[i].1);
+            if gap < best_gap {
+                best_gap = gap;
+                best = i;
+            }
+        }
+        let merged = (segs[best].0, segs[best + 1].1.max(segs[best].1));
+        segs[best] = merged;
+        segs.remove(best + 1);
+    }
+}
+
+/// Clamp `segs` to `hull` (the shrink/raise laws mutate the hull; the
+/// segments follow — truncated at the new end, and a RAISED end extends
+/// the last segment, the covered-serve watermark's continuity-of-claim).
+pub fn clamp_segments_to_hull(segs: &mut Vec<(u64, u64)>, hull: (u64, u64)) {
+    segs.retain_mut(|seg| {
+        seg.0 = seg.0.max(hull.0);
+        seg.1 = seg.1.min(hull.1);
+        seg.0 < seg.1
+    });
+    if segs.is_empty() {
+        segs.push(hull);
+        return;
+    }
+    if let Some(last) = segs.last_mut() {
+        if hull.1 > last.1 {
+            last.1 = hull.1;
+        }
+    }
+    if let Some(first) = segs.first_mut() {
+        if hull.0 < first.0 {
+            first.0 = hull.0;
+        }
+    }
+}
+
 pub fn block_align_out(span: (u64, u64), block_size: u64) -> (u64, u64) {
     if block_size == 0 {
         return span;
@@ -225,6 +298,17 @@ pub struct BlockSharer {
     /// mark log names both parties' scopes, so a dead-era orphan or a
     /// cross-rank collision is attributable from one log line).
     pub owner_nonce: u64,
+    /// Finding 31: does the shared region's block hull intersect any of
+    /// the sharer's HONEST claim segments? `false` ⇒ the share lies in
+    /// span/hull bridge or stretch — resolvable without demoting a block
+    /// the holder never asked for.
+    pub shares_required: bool,
+    /// Finding 31: does the shared region lie wholly ABOVE the sharer's
+    /// LAST claim segment's block hull (a true shrinkable TAIL)? The
+    /// shrink machinery trims tails only, so a non-required share that is
+    /// NOT a tail (a bridge interior) keeps the conservative demotion —
+    /// correct, just never fabricated for pure tails.
+    pub tail_share: bool,
 }
 
 /// One §9.3a **shrink-pending** record (residual board item 7's fix): a
@@ -458,6 +542,7 @@ impl FileCustody {
         required: (u64, u64),
         desired: (u64, u64),
         scope: u64,
+        block_size: u64,
     ) -> RangeDecision {
         debug_assert!(required.0 < required.1);
         debug_assert!(desired.0 <= required.0 && desired.1 >= required.1);
@@ -591,6 +676,19 @@ impl FileCustody {
             }
         }
         debug_assert!(window.0 <= required.0 && window.1 >= required.1);
+        // Finding 31: never MINT whole foreign blocks of HEAD stretch —
+        // a span claiming blocks below the required's own block carries
+        // no honest custody there, and the shrink machinery is tail-only,
+        // so a peer's aligned ask for such a block had no resolution
+        // vocabulary (the fabricated-demotion class). Writes stream
+        // forward; the doubling's value is the TAIL. Sub-block head slack
+        // within the required's own block survives.
+        if block_size > 0 {
+            let head_floor = required.0 - required.0 % block_size;
+            if window.0 < head_floor {
+                window.0 = head_floor;
+            }
+        }
         let trimmed = foreign_trimmed;
 
         // 4. The merge target: the grant overlapping required, or a
@@ -598,10 +696,31 @@ impl FileCustody {
         // clip left it exactly adjacent). Left neighbor preferred; the
         // right wall already clipped the window, so the union absorbs
         // nothing.
+        // Finding 31: the abutment merge may only union requireds whose
+        // BLOCK HULLS touch — a strided holder's asks (blocks 0 and 2,
+        // nothing in 1: the block-cyclic rank shape) merged through a
+        // doubled stretch would otherwise store a required union whose
+        // hull manufactures "coverage" of the in-between block, and a
+        // peer's aligned ask for that never-required block then reads as
+        // REGION-sharing at the demotion classifier (`required_hull_end`)
+        // — attempt 11's fabricated demotions. Gap-separated custody
+        // stays SEPARATE records under one scope (the never-bridge law's
+        // record shape; f22's union-cover serves cross-record asks).
+        // `required_target` needs no gate: it overlaps `required` by
+        // bytes, so the hulls touch by construction. `block_size == 0`
+        // (no geometry) keeps the pre-f31 merge verbatim.
+        let hull_touches = |g: &Grant| {
+            if block_size == 0 {
+                return true;
+            }
+            let gh = block_align_out(g.required, block_size);
+            let rh = block_align_out(required, block_size);
+            gh.1 >= rh.0 && rh.1 >= gh.0
+        };
         let target = required_target.or_else(|| {
             self.ranges
                 .iter()
-                .filter(|g| g.owner_nonce == scope && g.mode == mode)
+                .filter(|g| g.owner_nonce == scope && g.mode == mode && hull_touches(g))
                 .find(|g| g.end == window.0 || g.start == window.1)
         });
         if let Some(g) = target {
@@ -640,6 +759,7 @@ impl FileCustody {
         g.end = span.1;
         g.required.0 = g.required.0.min(required.0);
         g.required.1 = g.required.1.max(required.1);
+        union_required_segment(&mut g.required_segments, required);
         let at = self
             .ranges
             .partition_point(|r| (r.start, r.token) < (g.start, g.token));
@@ -661,6 +781,7 @@ impl FileCustody {
         if let Some(g) = self.ranges.iter_mut().find(|g| g.token == token) {
             g.required.0 = g.required.0.min(required.0);
             g.required.1 = g.required.1.max(required.1);
+            union_required_segment(&mut g.required_segments, required);
         }
     }
 
@@ -684,6 +805,7 @@ impl FileCustody {
         g.end = new_end;
         g.required.1 = g.required.1.min(new_end);
         g.required.0 = g.required.0.min(g.required.1);
+        clamp_segments_to_hull(&mut g.required_segments, g.required);
         if old_len == self.widest {
             self.widest = self.ranges.iter().map(Grant::len).max().unwrap_or_default();
         }
@@ -894,11 +1016,22 @@ impl FileCustody {
             if s >= e || self.span_within_demoted(s, e) {
                 continue;
             }
+            let shares_required = g.required_segments.iter().any(|&seg| {
+                let sh = block_align_out(seg, block_size);
+                sh.1 > s && sh.0 < e
+            });
+            let tail_share = g
+                .required_segments
+                .last()
+                .map(|&seg| s >= block_align_out(seg, block_size).1)
+                .unwrap_or(false);
             out.push(BlockSharer {
                 token: g.token,
                 region: (s, e),
                 required_hull_end: block_align_out(g.required, block_size).1,
                 owner_nonce: g.owner_nonce,
+                shares_required,
+                tail_share,
             });
         }
         out
@@ -1101,6 +1234,7 @@ impl FileCustody {
                 let floor = pending.floor.min(g.end).max(g.start);
                 g.end = floor;
                 g.required.1 = g.required.1.min(floor);
+                clamp_segments_to_hull(&mut g.required_segments, g.required);
                 (old_len, ShrinkResolution::Shrunk { floor }, floor)
             } else {
                 // The incumbent truly wrote into the tail: keep the
@@ -1110,6 +1244,7 @@ impl FileCustody {
                 // barrier arbitrate the still-contested blocks.
                 g.end = honest_end;
                 g.required.1 = g.required.1.max(watermark.min(honest_end));
+                clamp_segments_to_hull(&mut g.required_segments, g.required);
                 (
                     old_len,
                     ShrinkResolution::Demoted {

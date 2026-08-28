@@ -661,3 +661,115 @@ async fn fold_seed_survives_stripe_free_displacement_storm_no_rebind_eio() {
     stop.store(true, Ordering::Release);
     storm.await.unwrap();
 }
+
+/// Face 5 — finding 25 (`.benchmarks/2026-08-25-s11-freeloop-stall.md`,
+/// PR 5 acceptance attempt 6): the STALE-CACHED-HEAD settle wedge. An S9
+/// SERVED publish commits an ino's layout directly on the backend —
+/// outside the router's merge domain — and its cache invalidation is a
+/// separate act, so a refill racing the pair leaves the router's
+/// `metadata_cache` holding a head a served commit already superseded.
+/// Every settle attempt then re-reads the SAME stale entry ("any cached
+/// entry is ≥ every completed merge" — false on an authority serving
+/// peers), resolves the dead binding, loses to its retired incarnation,
+/// and after 4 losses the arm EIOs the co-writer's fsync barrier (the
+/// live row: 480 `read_settle_lost_serialized` tripwires mis-attributing
+/// LEGAL serve traffic, fsync EIO on six of eight co-writers, four
+/// wedged blocks). The law: a loss whose head came from the CACHE is a
+/// legal race — drop the entry, refetch the backend head (serialized ≥
+/// commits), retry; the tripwire is reserved for losses on a
+/// BACKEND-FRESH head, the only shape that still means a mutator outside
+/// the disciplines.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_cached_head_never_wedges_the_settle_into_eio() {
+    let _g = serial().await;
+    let h = Arc::new(make(*b"rebind-starve-05", "rbs_ns_5").await);
+    let (ino, _base) = durable_striped(&h, "stale.dat").await;
+    let file_path = squeezefs::keys::inode_path(ino);
+
+    // Warm the router's cache with the CURRENT head and take the old
+    // binding from it.
+    let warm = h.fs.router.fetch_metadata(&file_path).await.unwrap();
+    let old_key = warm
+        .block_map
+        .as_ref()
+        .expect("striped fixture")
+        .get(&BLK)
+        .expect("block mapped")
+        .clone();
+
+    // The served-commit shape: a NEW head lands DIRECTLY on the backend
+    // (the S9 executor's bypass — no router merge, no cache republish),
+    // while the router's cached head still names the old binding: the
+    // inval-vs-refill race's outcome, held deterministically.
+    let (be_id, alloc, writer) = h.fs.router.backend_router.get_active_backend().unwrap();
+    let new_off = alloc.allocate_block().await.unwrap();
+    let img =
+        h.fs.router
+            .get_crypto()
+            .process_write_async(bytes::Bytes::from(vec![0xEEu8; BS as usize]))
+            .await
+            .unwrap();
+    writer.write_block(new_off, img).await.unwrap();
+    alloc.publish_block(new_off);
+    let new_key =
+        h.fs.router
+            .backend_router
+            .persist_block_key(&be_id, new_off);
+    h.fs.router.cache.purge_block_key(&new_key);
+    let mut new_map: std::collections::HashMap<u32, String> = warm
+        .block_map
+        .as_ref()
+        .map(|m| (**m).clone())
+        .expect("striped fixture");
+    new_map.insert(BLK, new_key);
+    let new_layout = bincode::serialize(&squeezefs::layout_wire::LayoutMetadata {
+        file_type: "striped".into(),
+        size: 4 * BS,
+        block_map_id: None,
+        block_prefix: warm.block_prefix.as_ref().map(|p| p.to_string()),
+        file_id: None,
+        data_key: None,
+        block_map: Some(new_map),
+    })
+    .expect("serialize the served head");
+    squeezefs::meta_ship::publish::set_layout_and_size(
+        h.fs.meta_backend.as_ref().expect("backend"),
+        ino,
+        &new_layout,
+        4 * BS,
+        &[],
+    )
+    .await
+    .expect("the direct backend commit (the served shape)");
+
+    // The displaced binding is freed and its incarnation retired — the
+    // stale cached head now names a dead lifetime.
+    let _ =
+        h.fs.router
+            .backend_router
+            .free_block(&clean_block_key(&old_key))
+            .await;
+    h.fs.router.backend_router.reclaim_drain().await;
+    purge_read_tiers(&h, ino).await;
+
+    let trips_before = METRICS.invariant_tripwires.load(Ordering::Relaxed);
+    let val =
+        h.fs.router
+            .get_block_for_index(&file_path, BLK, None, false, true)
+            .await
+            .expect(
+                "a stale cached head is a LEGAL race the settle must heal by refetching — \
+                 never the 4-loss exhaustion EIO (attempt 6's fsync wedge)",
+            )
+            .expect("the block is mapped");
+    assert!(
+        val.iter().all(|&x| x == 0xEE),
+        "the serve is the SERVED commit's generation — the healed head, never the stale one"
+    );
+    assert_eq!(
+        METRICS.invariant_tripwires.load(Ordering::Relaxed) - trips_before,
+        0,
+        "a cache-served loss is legal serve traffic: the tripwire is reserved for \
+         losses on a backend-fresh head (attempt 6 burned 480 tripwires on this shape)"
+    );
+}

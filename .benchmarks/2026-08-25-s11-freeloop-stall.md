@@ -766,3 +766,35 @@ the poll parks on its OWN dedicated `RpcClient` (`notice_session` — the
 class); contract
 `the_notice_polls_park_never_starves_the_clients_own_verbs` red on the
 starvation, green with both f27 contracts after.
+
+## Local probe of `db4e01c8` (f27+f27b, 2026-08-28): f27 verified engaged; finding 28 found FOR FREE
+
+New economy policy (user ruling): every binary passes a FREE local
+fleet probe before any cloud spend; the i4i.8xlarge shape runs only the
+final sustained verdict. The first probe paid immediately (evidence
+`/tmp/rows-probe11`: row `s11mpiio-1787936707`, m0/m51 logs + live
+stats; teardown zero-residue):
+
+* **f27 verified engaged**: `dlm_custody_notice_polls` 73 (the standing
+  channel lives), `dlm_custody_notice_poll_notices` 1 — and no
+  session-starvation (f27b holds).
+* **Finding 28** (a shape the fast cloud substrate never surfaced —
+  the slow local nvmet-tcp stretches publish latency): in the B2 fpp
+  phase, co-writer m51's fold seed-fetch for block 19 of ITS OWN
+  private ino (101360) lost 12 settle rounds BACKEND-FRESH
+  (`read_settle_lost_serialized` ×12 after 4 f25 stale-head refetches),
+  then the fsync `FlushExtents` barrier failed loud — "block key
+  '6039797760@163bqi5c9' names a dead incarnation of its device
+  offset" — the writeback error latched (POSIX-16), `close()` reported
+  EIO, and ior's rank 5 called MPI_ABORT.
+
+  Working hypothesis for the red loop: the f25 heal is
+  AUTHORITY-motivated (served commits bypass the merge domain there) —
+  on a CO-WRITER a cache-served loss drops the client's own newest
+  truth and refetches the SHIPPED durable head, which lags the
+  co-writer's in-flight/coalesced publishes; the loop then loses
+  backend-fresh forever because the durable cannot name the new binding
+  until the very publish parked behind this fsync lands. The settle
+  interior's loss handling needs posture awareness: a co-writer's
+  cached head is its own coherent truth (its merges republish under
+  the merge domain), never the stale-cache class.

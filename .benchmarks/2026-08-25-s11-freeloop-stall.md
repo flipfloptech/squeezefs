@@ -732,3 +732,23 @@ Standing shared-phase shape (board, benign-or-not unadjudicated): ior's
 "inconsistent file size" warning (stat 112 MiB short — likely attr-cache
 lag across mounts, present on PASSING rows) + 4–8 "fsync(15) failed"
 warnings per shared phase — identical columns on attempt 8's green row.
+
+## Finding 27 — the standing custody notice poll (red `15c4dee2`, fix `4d1d4b0f`)
+
+Custody schema 7, `VERB_CUSTODY_NOTICE_POLL`: every custody client parks
+ONE client-initiated RPC on its authority (spawned at connect,
+Weak-held); the authority clamps the park to one renewal cadence,
+gathers the client's demotion/shrink notice sets under the same
+`FileCustody` serialization every f16a carrier uses, and answers the
+instant the barrier's pending-mark hook fires
+(`dlm::install_range_pending_hook`, installed at owner arm). The client
+absorbs through the same quiesce+ack ladder — the §9.3 ledger still
+closes through the ACK column, the renewal remains the worst-case
+carrier, the fence column remains the crash backstop, and no push
+backchannel exists (the §9.3 paragraph's own vocabulary: "reply-carried
+on a client-initiated RPC is not a push" — the delegation recall
+channel's exact shape). Contract:
+`a_quiet_incumbents_demotion_resolves_at_poll_latency_not_renewal`
+(red: the asker burned its full 3 s budget; green: resolution in
+milliseconds, ledger closed through acks). New gauges
+`dlm_custody_notice_polls` / `dlm_custody_notice_poll_notices`.

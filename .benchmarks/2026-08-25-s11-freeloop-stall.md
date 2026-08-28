@@ -798,3 +798,22 @@ stats; teardown zero-residue):
   interior's loss handling needs posture awareness: a co-writer's
   cached head is its own coherent truth (its merges republish under
   the merge domain), never the stale-cache class.
+
+### Finding 28 refined (log forensics, same probe)
+
+The refusal originates on the AUTHORITY (m0, 48× "STALE BLOCK-KEY
+BINDING refused: key '6039797760@163bqi5c9' names incarnation
+3298534883721 (era 3) ... whose live incarnation is 3298534888..."),
+one second BEFORE m51 logs its barrier failure — and the SAME stamped
+key repeats across retries a minute apart. A re-resolve-per-attempt
+would pick up the current head, so the fold's seed reference is
+CAPTURED state: the rung-17 assembly for (ino 35825, block) pinned the
+block's binding when the extent arrived; the co-writer's later rewrite
+displaced that binding (its old offset legally freed post-publish and
+re-minted), and every subsequent fold retry re-presents the pinned dead
+key — fsync EIO forever on that ino. Red-loop shape: assemble an
+extent, displace the block with a newer publish + free, force the fold
+— today EIO-forever; the law: the fold re-resolves the CURRENT head per
+attempt (or a newer covering publish supersedes/retires the assembly).
+Second face (possibly the same root seen from the settle arm): m51's
+12 backend-fresh tripwires on ino 101360 block 19.

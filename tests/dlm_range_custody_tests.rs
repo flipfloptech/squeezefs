@@ -2687,3 +2687,92 @@ async fn the_tail_shrink_ledger_closes_through_the_fence_column() {
         other => panic!("B's grant is NEW: {other:?}"),
     }
 }
+
+/// Finding 31 (`.benchmarks/2026-08-25-s11-freeloop-stall.md`, attempt
+/// 11's only failure — the scoped mark forensics' exact shape): a grant's
+/// REQUIRED union is stored as ONE span, so a STRIDED holder (the
+/// block-cyclic shape: real asks in blocks 0 and 2, nothing in block 1)
+/// manufactures required "coverage" of every foreign block BETWEEN its
+/// real asks — `required_hull_end` then reads past a block the holder
+/// never asked for, and a second client's block-aligned ask for that
+/// in-between block classifies as REGION-sharing: a fabricated demotion
+/// (live: ask_scope epoch-1 required=[block 96], sharer epoch-8 whose
+/// required hull swallowed block 96 while its real asks lay elsewhere).
+/// The law: the demotion classifier consults the grant's ACTUAL required
+/// asks, never the hull between them — an ask for a block the holder
+/// never REQUIRED resolves through the stretch-tail/trim vocabulary
+/// (shrink), reserving demotion for genuine required-vs-required
+/// sharing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_strided_holders_required_hull_never_fabricates_a_demotion() {
+    let _serial = RANGE_SERIAL.lock().await;
+    squeezefs::meta_ship::tokens::test_clear_range_cache();
+    let mgr = squeezefs::dlm::LocalLockManager::new().expect("local manager");
+    const BLK: u64 = 4 * MIB;
+    let geometry = Some((64 * BLK, BLK));
+    let ino: u64 = 31_310_001;
+    let path = format!("inode_{ino}");
+
+    // Holder A (scope 0xA): STRIDED real asks — block 0 and block 2,
+    // NOTHING in block 1 (the block-cyclic rank shape). The grants
+    // coalesce under one scope; the union's hull now SPANS block 1.
+    let _a0 = mgr
+        .acquire_lock_range_scoped(
+            &path,
+            (0, MIB),
+            (0, MIB),
+            Duration::from_secs(3),
+            geometry,
+            Some(0xA),
+        )
+        .await
+        .expect("A's block-0 ask");
+    // The second ask's DESIRED overlaps the first grant (the doubled
+    // stretch at the learned ceiling — f22's steady state), so the admit
+    // MERGES the two records: ONE grant whose required union is
+    // {block 0 bytes} ∪ {block 2 bytes} and whose HULL therefore spans
+    // block 1 — a block A never asked for.
+    let _a2 = mgr
+        .acquire_lock_range_scoped(
+            &path,
+            (2 * BLK, 2 * BLK + MIB),
+            (0, 3 * BLK),
+            Duration::from_secs(3),
+            geometry,
+            Some(0xA),
+        )
+        .await
+        .expect("A's block-2 ask (merging stretch)");
+
+    // Client B (scope 0xB): a block-aligned ask for block 1 — a block A
+    // NEVER required. Today the classifier reads A's required HULL
+    // (blocks 0..3) and fabricates a demotion of A; the law is a prompt
+    // grant (or at most a shrink of A's stretch) with demotions +0.
+    let s0 = squeezefs::dlm::range_custody_stats();
+    let t0 = std::time::Instant::now();
+    let r = mgr
+        .acquire_lock_range_scoped(
+            &path,
+            (BLK, BLK + MIB),
+            (BLK, BLK + MIB),
+            Duration::from_secs(3),
+            geometry,
+            Some(0xB),
+        )
+        .await;
+    let waited = t0.elapsed();
+    let s1 = squeezefs::dlm::range_custody_stats();
+    assert_eq!(
+        s1.demotions - s0.demotions,
+        0,
+        "an in-between block the holder never REQUIRED is not region-shared — \
+         the required-union HULL manufactured the coverage (finding 31; ask \
+         waited {waited:?}, outcome {r:?})"
+    );
+    assert!(
+        r.is_ok(),
+        "B's ask for the never-required block issues (after {waited:?}): {r:?}"
+    );
+
+    squeezefs::meta_ship::tokens::test_clear_range_cache();
+}

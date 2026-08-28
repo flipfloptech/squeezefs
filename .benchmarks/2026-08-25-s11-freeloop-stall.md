@@ -916,3 +916,25 @@ truth (its merges republish under the very merge domain the settle
 holds), and a backend-fresh loss there is the mount's own publish LAG —
 resolved by draining/awaiting its own in-flight publish, never by
 exhaustion EIO.
+
+## Probe 4 of `198dbbea` (f30, 2026-08-28): the abort class is DEAD — the local venue is now the binding constraint
+
+Row from zero (2×110 GiB, 8 co-writers): **zero settle tripwires, zero
+"did not settle" exhaustions, NO MPI abort** — finding 30's class is
+gone (the enriched tripwire named the mover in one probe: the Freed
+retire's orphaned unstable word; fix = the W1 restore idiom). A1
+completed at 2,774.9 MiB/s (15 iterations); B1 ran ALL 15 iterations
+and failed only the SUSTAINED gate (1,343 → ~600 MiB/s), with the decay
+tracking (a) the thermal driver's clamp (3.0 → 2.14 GHz, Tctl 68 °C)
+and (b) the free-pipeline transit population refilling the 110 GiB
+volumes to 28,153/28,160 blocks by B1's tail (three fsync StorageFull
+EIOs on the last iterations, absorbed without abort). Both terms are
+the VENUE's: the laptop cannot hold the post-f30 churn rate inside its
+RAM budget or its thermal envelope. Residual (standing board): two
+FlushExtents "Lock expired or invalid fencing token" retries on the
+shared ino during A1, absorbed by the POSIX-5 ladder.
+
+Verdict per the cheap-first pipeline: the FUNCTIONAL probe is green —
+attempt 11 (the sustained verdict) belongs to the cloud venue
+(3.75 TB devices ⇒ no transit wall; datacenter cooling ⇒ honest
+sustain).

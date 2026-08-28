@@ -49,7 +49,6 @@ async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
 
 struct H {
     fs: SqueezefsFilesystem,
-    dlm: DlmClient,
     req: Request,
     _b: NamedTempFile,
     _m: NamedTempFile,
@@ -110,7 +109,6 @@ async fn make(uuid: [u8; 16], alloc_ns: &str) -> H {
     };
     H {
         fs,
-        dlm,
         req,
         _b: b,
         _m: m,

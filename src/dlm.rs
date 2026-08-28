@@ -319,6 +319,29 @@ pub fn live_custody_generation(ino: u64) -> Option<u64> {
     LOCK_MAP.read_sync(&ObjectKey::Ino(ino), |_, custody| custody.max_token())
 }
 
+/// Finding 27: the range PENDING-MARK hook — installed by the custody
+/// authority ([`crate::data_grant::WriteCustodyOwner::arm`]) so the §9.3
+/// demotion barrier's pending marks wake the STANDING notice polls the
+/// instant an incumbent owes an ack (this module sits below `data_grant`
+/// and cannot name the owner). Wake-all semantics; absent = no pollers.
+static RANGE_PENDING_HOOK: parking_lot::RwLock<Option<Arc<dyn Fn() + Send + Sync>>> =
+    parking_lot::RwLock::new(None);
+
+/// Install the pending-mark hook (the custody authority's arm; a re-arm
+/// replaces — the newest authority owns the wake).
+pub fn install_range_pending_hook(hook: Arc<dyn Fn() + Send + Sync>) {
+    *RANGE_PENDING_HOOK.write() = Some(hook);
+}
+
+/// Fire the pending-mark hook (called OUTSIDE the custody entry lock —
+/// a cold path: one read-lock per barrier park round).
+pub(crate) fn note_range_pending() {
+    let hook = RANGE_PENDING_HOOK.read().clone();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 pub fn span_range_shared(ino: u64, start: u64, end: u64, holder_token: u64) -> bool {
     if start >= end {
         return false;
@@ -1684,8 +1707,14 @@ impl LocalLockManager {
                     return Err(crate::error::SqueezefsError::LockFailed { reason });
                 }
                 held @ (RangeMint::Held | RangeMint::HeldDemotion) => {
-                    if matches!(held, RangeMint::HeldDemotion) && barrier_parked_at.is_none() {
-                        barrier_parked_at = Some(std::time::Instant::now());
+                    if matches!(held, RangeMint::HeldDemotion) {
+                        // Finding 27: the barrier just marked (or re-holds)
+                        // pendings — wake the standing notice polls so a
+                        // QUIET incumbent hears NOW, not at its renewal.
+                        note_range_pending();
+                        if barrier_parked_at.is_none() {
+                            barrier_parked_at = Some(std::time::Instant::now());
+                        }
                     }
                     if !parked {
                         parked = true;

@@ -156,7 +156,16 @@ use std::time::{Duration, Instant};
 /// 5-speaker would decode the acquire reply's leading schema word as a
 /// bare [`GrantRecord`]'s and adopt garbage custody, so the mismatch
 /// stays a loud refusal.
-pub const CUSTODY_SCHEMA: u32 = 6;
+/// **7 (finding 27,** `.benchmarks/2026-08-25-s11-freeloop-stall.md`**)**:
+/// [`VERB_CUSTODY_NOTICE_POLL`] joined — the STANDING notice poll. Every
+/// f16a carrier is a reply on a verb the incumbent must SEND, so a QUIET
+/// incumbent (a rank at an MPI barrier) heard a pending demotion only at
+/// its renewal cadence and the asker parked its full budget (the
+/// shared-phase half-bandwidth dip). The poll is a client-initiated RPC
+/// the authority PARKS and answers the instant a notice lands — the §9.3
+/// barrier's own vocabulary ("reply-carried on a client-initiated RPC is
+/// not a push"), the delegation recall channel's exact shape.
+pub const CUSTODY_SCHEMA: u32 = 7;
 
 /// First verb of S9's block. S3 reserved 0 for its ping, S8's metadata
 /// vocabulary took 16/17, S6's membership owns `0x0100..=0x01FF`; custody
@@ -185,6 +194,13 @@ pub const VERB_CUSTODY_DEMOTE_ACK: u16 = VERB_CUSTODY_BASE + 5;
 /// asker's grant issues (exclusive on an unwritten tail, or through the
 /// existing demotion barrier on a written one).
 pub const VERB_CUSTODY_SHRINK_ACK: u16 = VERB_CUSTODY_BASE + 6;
+/// Finding 27: the STANDING notice poll — parked by the authority,
+/// answered the instant a demotion/shrink notice lands for the client
+/// (or at the bounded park), so a QUIET incumbent hears at poll latency
+/// instead of its renewal cadence. The reply carries the same notice
+/// sets every f16a carrier does, gathered under the same `FileCustody`
+/// serialization.
+pub const VERB_CUSTODY_NOTICE_POLL: u16 = VERB_CUSTODY_BASE + 7;
 
 /// Status: the call succeeded.
 pub const CUSTODY_OK: u16 = RPC_OK;
@@ -454,6 +470,32 @@ pub struct ReleaseReplyFrame {
     pub shrinks: Vec<ShrinkNotice>,
 }
 
+/// Finding 27: the standing notice poll's ask — "park me until a notice
+/// lands for my grants (or `park_ms`)".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoticePollFrame {
+    pub schema: u32,
+    pub client: String,
+    pub lease_epoch: u64,
+    /// The client's requested park bound; the authority clamps it to one
+    /// renewal cadence (the S6 venue discipline — no unbounded parks on a
+    /// service lane).
+    pub park_ms: u64,
+}
+
+/// Finding 27: the poll's reply — the same notice sets every f16a
+/// carrier bears, gathered under the same `FileCustody` serialization
+/// (the composed-after-the-mark argument transfers verbatim). Both
+/// vectors empty = the bounded park elapsed quietly; the client re-parks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoticePollReply {
+    pub schema: u32,
+    pub demotions: Vec<DemotionNotice>,
+    pub shrinks: Vec<ShrinkNotice>,
+    /// The park the authority actually applied (its clamp made visible).
+    pub park_ms: u64,
+}
+
 /// Rung 17: the incumbent's demotion ack.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DemoteAckFrame {
@@ -565,6 +607,14 @@ static SELF_FENCES: AtomicU64 = AtomicU64::new(0);
 // S11 rung 15 — the client's wire-face range ledger (the authority-side
 // family lives in `crate::dlm::range_custody_stats`).
 static RANGE_ACQUIRES_CLIENT: AtomicU64 = AtomicU64::new(0);
+/// Finding 27: standing notice-poll rounds this client COMPLETED (parked
+/// or answered — the channel-liveness gauge; a co-writer whose custody
+/// plane is armed and whose polls stay 0 has a dead channel).
+static NOTICE_POLL_ROUNDS: AtomicU64 = AtomicU64::new(0);
+/// Finding 27: notices ABSORBED via the standing poll (the quiet-incumbent
+/// engagement instrument — the renewal remains the worst-case carrier, so
+/// growth here is the poll beating the cadence).
+static NOTICE_POLL_NOTICES: AtomicU64 = AtomicU64::new(0);
 static RANGE_EXTENSIONS_CLIENT: AtomicU64 = AtomicU64::new(0);
 
 /// The client-side view of the custody ledger (the owner's own per-instance
@@ -625,6 +675,10 @@ pub fn stats_json() -> serde_json::Value {
         // authority-side family is the `range_custody` object).
         "dlm_custody_range_acquires": RANGE_ACQUIRES_CLIENT.load(Ordering::Relaxed),
         "dlm_custody_range_extensions": RANGE_EXTENSIONS_CLIENT.load(Ordering::Relaxed),
+        // Finding 27: the standing notice poll (rounds = channel
+        // liveness; notices = the quiet-incumbent engagement).
+        "dlm_custody_notice_polls": NOTICE_POLL_ROUNDS.load(Ordering::Relaxed),
+        "dlm_custody_notice_poll_notices": NOTICE_POLL_NOTICES.load(Ordering::Relaxed),
         "dlm_custody_held": OWNER
             .load()
             .as_ref()
@@ -979,6 +1033,10 @@ pub struct WriteCustodyOwner {
     reclaims: AtomicU64,
     grace_conflicts: AtomicU64,
     unknown_leases: AtomicU64,
+    /// Finding 27: the standing notice polls park here; the dlm barrier's
+    /// pending-mark hook wakes every parked poll (wake-all is deliberate —
+    /// each poll re-gathers ITS client's notices and re-parks on empty).
+    notice_notify: Arc<squeezefs_ipc::sqz_notify::Notify>,
 }
 
 impl std::fmt::Debug for WriteCustodyOwner {
@@ -1053,6 +1111,16 @@ impl WriteCustodyOwner {
             clocks.renew_interval,
             clocks.grace,
         );
+        // Finding 27: the barrier's pending-mark wakes every parked
+        // notice poll (a process-global hook — the arbiter's mark sites
+        // live below this module and cannot name the owner).
+        let notice_notify = Arc::new(squeezefs_ipc::sqz_notify::Notify::new());
+        {
+            let notify = Arc::clone(&notice_notify);
+            crate::dlm::install_range_pending_hook(Arc::new(move || {
+                notify.notify_waiters();
+            }));
+        }
         Ok(Arc::new(Self {
             id: id.to_string(),
             term,
@@ -1073,6 +1141,7 @@ impl WriteCustodyOwner {
             reclaims: AtomicU64::new(0),
             grace_conflicts: AtomicU64::new(0),
             unknown_leases: AtomicU64::new(0),
+            notice_notify,
         }))
     }
 
@@ -2441,6 +2510,70 @@ impl CustodyService {
                     ),
                 },
             },
+            VERB_CUSTODY_NOTICE_POLL => {
+                match decode::<NoticePollFrame>(&req.body, "notice poll") {
+                    Err(e) => Self::refuse(req.id, CUSTODY_MALFORMED, format!("{e}")),
+                    Ok(frame) if frame.schema != CUSTODY_SCHEMA => Self::refuse(
+                        req.id,
+                        CUSTODY_SCHEMA_MISMATCH,
+                        format!(
+                            "peer speaks custody schema {} and this authority speaks \
+                             {CUSTODY_SCHEMA}",
+                            frame.schema
+                        ),
+                    ),
+                    Ok(frame) => {
+                        if !self.owner.lease_current(&frame.client, frame.lease_epoch) {
+                            return Self::refuse(
+                                req.id,
+                                CUSTODY_UNKNOWN_LEASE,
+                                format!(
+                                    "notice poll from '{}' names a lease epoch {} that is \
+                                     not custody",
+                                    frame.client, frame.lease_epoch
+                                ),
+                            );
+                        }
+                        // The park is bounded by ONE renewal cadence (the
+                        // S6 venue discipline: no unbounded parks on a
+                        // service lane) — a client asking for more gets
+                        // the clamp echoed in the reply and re-parks.
+                        let park = Duration::from_millis(frame.park_ms)
+                            .min(self.owner.clocks.renew_interval);
+                        let deadline = Instant::now() + park;
+                        let (demotions, shrinks) = loop {
+                            let notified = self.owner.notice_notify.notified();
+                            let (d, sh) = self.owner.notices_for_client(&frame.client);
+                            if !d.is_empty() || !sh.is_empty() {
+                                break (d, sh);
+                            }
+                            let remaining = deadline.saturating_duration_since(Instant::now());
+                            if remaining.is_zero() {
+                                break (Vec::new(), Vec::new());
+                            }
+                            // The 250 ms re-check slice is the deleg
+                            // poll's shape: a wake lost to a race is
+                            // re-gathered on the next slice, never
+                            // stranded to the deadline.
+                            let _ = squeezefs_ipc::sqz_time::timeout(
+                                remaining.min(Duration::from_millis(250)),
+                                notified,
+                            )
+                            .await;
+                        };
+                        reply(
+                            req.id,
+                            &NoticePollReply {
+                                schema: CUSTODY_SCHEMA,
+                                demotions,
+                                shrinks,
+                                park_ms: park.as_millis() as u64,
+                            },
+                            "notice poll reply",
+                        )
+                    }
+                }
+            }
             VERB_CUSTODY_RECLAIM => match decode::<ReclaimFrame>(&req.body, "reclaim") {
                 Err(e) => Self::refuse(req.id, CUSTODY_MALFORMED, format!("{e}")),
                 Ok(frame) => match self.owner.reclaim(&frame).await {
@@ -2769,7 +2902,7 @@ impl WriteCustodyClient {
             lease.custody_epoch,
         ));
         crate::dlm::adopt_durable_term(lease.term);
-        Ok(Arc::new(Self {
+        let client = Arc::new(Self {
             id: id.to_string(),
             endpoint: endpoint.to_string(),
             secret: secret.to_vec(),
@@ -2782,7 +2915,15 @@ impl WriteCustodyClient {
             pending_releases: Arc::new(parking_lot::Mutex::new(Vec::new())),
             inflight: parking_lot::Mutex::new(Vec::new()),
             clock,
-        }))
+        });
+        // Finding 27: the STANDING notice poll — one parked RPC per
+        // custody client, so a QUIET incumbent (no verbs in flight)
+        // hears a pending demotion/shrink at poll latency instead of its
+        // renewal cadence. The task holds a Weak: the client's last drop
+        // ends the channel.
+        let weak = Arc::downgrade(&client);
+        crate::meta_exec::spawn_meta("custody_notice_poll", notice_poll_run(weak));
+        Ok(client)
     }
 
     async fn join_on(session: &mut RpcClient, frame: &JoinFrame) -> Result<LeaseFrame> {
@@ -3759,6 +3900,56 @@ pub fn discharge_lane_handouts(offsets: &[u64]) {
 /// owner (the [`acquire_remote`] pattern for the range face), mapping the
 /// wire outcome back into the local [`crate::dlm::RangeAcquired`] shape
 /// the homing entry point answers with.
+/// Finding 27: the standing notice poll's client loop. Each round parks
+/// one RPC on the authority (bounded there by one renewal cadence) and
+/// absorbs whatever notices the reply carries — `absorb_notices` runs the
+/// same quiesce+ack ladder every f16a carrier feeds, so the §9.3 ledger
+/// still closes through the ACK column. Wire errors back off and retry
+/// (the authority may be failing over — the renewal path owns re-join);
+/// the loop ends when the client drops or the plane poisons.
+async fn notice_poll_run(weak: std::sync::Weak<WriteCustodyClient>) {
+    loop {
+        let Some(client) = weak.upgrade() else { return };
+        if crate::data_custody::poisoned() {
+            return;
+        }
+        let frame = NoticePollFrame {
+            schema: CUSTODY_SCHEMA,
+            client: client.id.clone(),
+            lease_epoch: client.lease_epoch.load(Ordering::Acquire),
+            park_ms: 10_000,
+        };
+        let body = match encode(&frame, "notice poll") {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let outcome = client.call_once(VERB_CUSTODY_NOTICE_POLL, body).await;
+        let mut backoff = None;
+        match outcome {
+            Ok(r) if r.status == CUSTODY_OK => {
+                NOTICE_POLL_ROUNDS.fetch_add(1, Ordering::Relaxed);
+                if let Ok(np) = decode::<NoticePollReply>(&r.body, "notice poll reply") {
+                    let n = (np.demotions.len() + np.shrinks.len()) as u64;
+                    if n > 0 {
+                        NOTICE_POLL_NOTICES.fetch_add(n, Ordering::Relaxed);
+                        client.absorb_notices(&np.demotions, &np.shrinks).await;
+                    }
+                }
+            }
+            Ok(_) | Err(_) => {
+                // Unknown lease / schema refusal / wire error: the
+                // renewal path owns diagnosis and re-join — this channel
+                // only backs off so a flapping authority is not hammered.
+                backoff = Some(Duration::from_millis(500));
+            }
+        }
+        drop(client);
+        if let Some(b) = backoff {
+            squeezefs_ipc::sqz_time::sleep(b).await;
+        }
+    }
+}
+
 pub async fn acquire_remote_range(
     ino: u64,
     required: (u64, u64),

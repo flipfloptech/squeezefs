@@ -658,3 +658,48 @@ fleet rows (it survived two full gates at this cap earlier the same
 day) — attempt 7 runs at a FIXED 1.8 GHz all-core posture, whose floor
 throughput (≈1,400 MiB/s observed while throttled) still clears the
 750 MiB/s domain gate with margin.
+
+## Attempt 8 (2026-08-28, binary `a4fe9617` = f25 tip + the cloud-driver override): THE PERF GATE PASSES — the venue was the decay
+
+The row moved to AWS (user ruling: sustained verdicts need a thermally
+honest venue; this laptop heat-soaks on the same timescale the
+sustained window measures). Fleet: 4 × i4i.8xlarge on-demand
+(1 client + 1 mds + 2 oss, uniform one-template shape), baked AMI
+`squeezefs-mw-base-v2-2026-08-20`, artifacts `task build:ubuntu2604`
+at the tip, 8 co-writers + 32 ior ranks co-located on the client —
+the field/design shape. Rows `.benchmarks/cloud/2026-08-28-001801/`.
+
+* **A-B-B-A: 0.966 / 0.937 — the S11 gate holds** (shared ≥ 0.8×
+  disjoint in BOTH brackets); B-phases dead flat (1,931/1,937 MiB/s
+  over 74–75 s windows), A-phases steady 1,865/1,816 with brief dips.
+  Probe 1,839 MiB/s (the ≥750 domain gate clears ×2.4).
+* **Every correctness column clean**: zero tripwires, zero fsync
+  failures, zero settle EIOs, zero untracked/live free refusals, zero
+  cap refusals/demotion storms — findings 22–25 all verified live at
+  the 8-writer fan-in.
+* **ONE engagement failure — finding 26**: the authority's
+  `patch/overlay_ineligible_range_shared` moved (prs 15 / ors 29 across
+  ~121k ranged acquires), phase-exact with `fold_passes` ≡
+  `extent_parks` (A1 2, B1 15, B2 12, A2 0): the fold of
+  shipped-assembly extents consulted the range-shared clauses with its
+  OWN token, so the holder whose bytes it executed read foreign — the
+  clause declined its own designed vehicle on every pass, and the
+  demoted-region arm blocked the very publisher the demotion machinery
+  routes work to.
+
+## Finding 26 — the arbiter's fold is the holder's proxy (red `b095260f`, fix `e8c56ad4`)
+
+Contracts `tests/mw_arbiter_fold_tests.rs` (single-holder proxy fold
+keeps the fast paths; demoted-region fold keeps them; a TWO-holder span
+still declines — the over-relaxation pin). Fix: the `sqz_task_local`
+arbiter-fold scope (the `AUTHORITY_FREE_SCOPE` precedent) armed by the
+rung-17 executors; inside it the clauses ask
+`span_range_shared_for_arbiter` — grants from two or more DISTINCT
+holders (`owner_nonce`, the merge-scope identity) overlap the span.
+Holder-side semantics untouched; spawned subtasks fall back to the
+conservative holder form by construction.
+
+Cloud-venue notes: the mw preset now honors `INSTANCE_TYPE` (uniform
+fleet, bigger client — `a4fe9617`); campaign cost ≈ $9 (55 min of
+4 × i4i.8xlarge + margin). The laptop stays the correctness-crucible
+venue; sustained verdicts are cloud rows from here.

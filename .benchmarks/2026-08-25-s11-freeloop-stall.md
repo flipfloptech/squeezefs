@@ -752,3 +752,17 @@ channel's exact shape). Contract:
 (red: the asker burned its full 3 s budget; green: resolution in
 milliseconds, ledger closed through acks). New gauges
 `dlm_custody_notice_polls` / `dlm_custody_notice_poll_notices`.
+
+## Attempt 10 (2026-08-28, binary `92ac6c37` — f27 landed): finding 27b, the poll starved its own client
+
+The row collapsed at the probe (3.2 MiB/s aggregate, 250–300 s write
+latencies — rows `.benchmarks/cloud/2026-08-28-105918/`, torn down at
+the probe verdict, ~$4): the f27 standing poll rode `call_once`, whose
+lock is the client's WORKLOAD session mutex — a 10 s park held the
+session for 10 s and every custody verb queued behind the parked poll.
+Fixed on `fix/f27b-notice-session` (red `2f7717e5`, fix `ec6a6612`):
+the poll parks on its OWN dedicated `RpcClient` (`notice_session` — the
+`lease_session` precedent applied to the third long-lived caller
+class); contract
+`the_notice_polls_park_never_starves_the_clients_own_verbs` red on the
+starvation, green with both f27 contracts after.

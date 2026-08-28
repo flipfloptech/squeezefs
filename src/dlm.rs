@@ -330,6 +330,26 @@ pub fn span_range_shared(ino: u64, start: u64, end: u64, holder_token: u64) -> b
         .unwrap_or(false)
 }
 
+/// Finding 26: the ARBITER-side form of [`span_range_shared`] — TRUE only
+/// when grants from two or more DISTINCT holders overlap the span. The
+/// fast-path clauses consult it exclusively under the authority's
+/// fold-of-shipped-assembly scope
+/// ([`crate::meta_ship::publish::arbiter_fold_active`]): there the fold
+/// executes the single overlapping holder's own bytes by proxy, and a
+/// demoted region is the fold's own vehicle — declining either blocked
+/// the demotion machinery's designed publisher on every pass (attempt 8's
+/// engagement failure).
+pub fn span_range_shared_for_arbiter(ino: u64, start: u64, end: u64) -> bool {
+    if start >= end {
+        return false;
+    }
+    LOCK_MAP
+        .read_sync(&ObjectKey::Ino(ino), |_, custody| {
+            custody.span_is_range_shared_beyond_one_holder(start, end)
+        })
+        .unwrap_or(false)
+}
+
 // ---------------------------------------------------------------------------
 // DLM S11 rung 15 — the §9.2 bounds/R5 policy (KD-MW-7,
 // docs/design-full-multi-writer.md; PR-plan row 15)

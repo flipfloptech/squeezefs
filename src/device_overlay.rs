@@ -158,7 +158,14 @@ pub fn set_overlay_overwrite_for_tests(enabled: bool) {
 /// solo/dark cost is one O(1) empty-table probe (the KD-MW-12 fast-path
 /// tax row's structural half).
 pub fn overlay_range_shared(ino: u64, block_start: u64, block_end: u64, holder_token: u64) -> bool {
-    if !crate::dlm::span_range_shared(ino, block_start, block_end, holder_token) {
+    // Finding 26: the arbiter-fold scope asks the two-or-more-distinct-
+    // holders form (see `BlockAllocator::patch_range_shared`).
+    let shared = if crate::meta_ship::publish::arbiter_fold_active() {
+        crate::dlm::span_range_shared_for_arbiter(ino, block_start, block_end)
+    } else {
+        crate::dlm::span_range_shared(ino, block_start, block_end, holder_token)
+    };
+    if !shared {
         return false;
     }
     crate::fuse_client::METRICS

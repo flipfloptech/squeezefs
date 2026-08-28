@@ -2037,7 +2037,16 @@ impl BlockAllocator {
         block_end: u64,
         holder_token: u64,
     ) -> bool {
-        if !crate::dlm::span_range_shared(ino, block_start, block_end, holder_token) {
+        // Finding 26: under the authority's fold-of-shipped-assembly
+        // scope the question is the ARBITER's — two-or-more distinct
+        // holders — because the fold executes the single holder's own
+        // bytes by proxy and a demoted region is this fold's own vehicle.
+        let shared = if crate::meta_ship::publish::arbiter_fold_active() {
+            crate::dlm::span_range_shared_for_arbiter(ino, block_start, block_end)
+        } else {
+            crate::dlm::span_range_shared(ino, block_start, block_end, holder_token)
+        };
+        if !shared {
             return false;
         }
         crate::fuse_client::METRICS

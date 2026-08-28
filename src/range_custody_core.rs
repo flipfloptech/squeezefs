@@ -784,6 +784,39 @@ impl FileCustody {
             .any(|g| g.overlaps(start, end) && (g.token != holder_token || !g.covers(start, end)))
     }
 
+    /// Finding 26 (`.benchmarks/2026-08-25-s11-freeloop-stall.md`) — the
+    /// ARBITER's form of the sharing question: do grants from TWO OR
+    /// MORE distinct HOLDERS (`owner_nonce`, the merge-scope identity
+    /// grants coalesce under — grant TOKENS are per-mint unique, so one
+    /// holder's abutting pair would read as two) overlap `[start, end)`?
+    ///
+    /// The authority folding shipped-assembly extents is the single
+    /// overlapping holder's PROXY — the fold publishes that holder's own
+    /// bytes, serialized against its shipped publishes by the per-ino
+    /// serve stripe — and a DEMOTED region is the arbiter's own vehicle
+    /// (every holder's writes there ship TO this fold, KD-MW-8), so
+    /// neither is "shared" seen from the arbiter; attempt 8's engagement
+    /// failure was [`Self::span_is_range_shared`] declining that fold on
+    /// every pass. TWO distinct holders stay shared: the fold cannot be
+    /// both writers' proxy at once, and the sharing-safe CoW/demotion
+    /// vehicle keeps that shape. Holder-side semantics are untouched.
+    pub fn span_is_range_shared_beyond_one_holder(&self, start: u64, end: u64) -> bool {
+        let mut holder: Option<u64> = None;
+        for g in self
+            .wholes
+            .iter()
+            .chain(self.candidates(start, end).iter())
+            .filter(|g| g.overlaps(start, end))
+        {
+            match holder {
+                None => holder = Some(g.owner_nonce),
+                Some(n) if n != g.owner_nonce => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
     // -----------------------------------------------------------------
     // Rung 17 (§9.3) — the demotion barrier's core state transitions.
     // Callers hold the entry lock (the plan/admit discipline).

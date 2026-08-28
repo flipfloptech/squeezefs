@@ -1169,6 +1169,32 @@ async fn local_publish_guard(ino: Ino) -> Option<crate::sqz_sync::SqzMutexGuard<
     }
 }
 
+squeezefs_ipc::sqz_task_local! {
+    /// Finding 26: the ARBITER-FOLD scope — armed by the authority's
+    /// rung-17 executors (`assemble_shipped_extent` /
+    /// `flush_shipped_extents`) around the write/fold ladder that
+    /// executes SHIPPED-ASSEMBLY bytes. Inside it the range-shared
+    /// fast-path clauses ask the arbiter's form of the sharing question
+    /// (`dlm::span_range_shared_for_arbiter` — two-or-more distinct
+    /// holders) instead of the holder-token form, which read the folded
+    /// holder's own grant as foreign and declined the fold's fast paths
+    /// on every pass. Task-scoped (the ladder awaits in-task; a spawned
+    /// subtask deliberately falls back to the conservative holder form —
+    /// the `AUTHORITY_FREE_SCOPE` precedent, same rail: no tokio in the
+    /// lib).
+    static ARBITER_FOLD: ();
+}
+
+/// Run `f` under the arbiter-fold scope (see [`ARBITER_FOLD`]).
+pub async fn with_arbiter_fold<F: std::future::Future>(f: F) -> F::Output {
+    ARBITER_FOLD.scope((), f).await
+}
+
+/// Is the current task inside the arbiter-fold scope?
+pub fn arbiter_fold_active() -> bool {
+    ARBITER_FOLD.try_with(|_| ()).is_ok()
+}
+
 /// Finding 25 (rung A): the SETTLE arms' serve-window participation —
 /// the serialized settle resolve holds (3) + (3.5), but a SERVED publish
 /// commits under neither, so a serve landing mid-window could still move

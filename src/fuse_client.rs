@@ -12490,8 +12490,13 @@ impl SqueezefsFilesystem {
             .await
             .map(|m| m.size)
             .unwrap_or(0);
-        self.write_file_staged(ino, abs, data, existing, token)
-            .await?;
+        // Finding 26: the assembly write executes the shipping holder's
+        // bytes by proxy — the fast-path clauses ask the arbiter's form
+        // of the sharing question inside this scope.
+        crate::meta_ship::publish::with_arbiter_fold(
+            self.write_file_staged(ino, abs, data, existing, token),
+        )
+        .await?;
         Ok(None)
     }
 
@@ -12501,7 +12506,11 @@ impl SqueezefsFilesystem {
     /// version.
     pub async fn flush_shipped_extents(&self, ino: u64) -> Result<u64, SqueezefsError> {
         let token = self.dlm.get_fencing_token_ino(ino);
-        self.flush_inode_to_backend(ino, token).await?;
+        // Finding 26: the verb-forced fold publishes shipped-assembly
+        // bytes — the arbiter-fold scope covers the whole ladder (the
+        // clauses fire at the park/patch/overlay decisions inside).
+        crate::meta_ship::publish::with_arbiter_fold(self.flush_inode_to_backend(ino, token))
+            .await?;
         let Some(backend) = self.meta_backend.as_ref() else {
             return Err(SqueezefsError::InvalidOperation(
                 "flush_shipped_extents needs a routed meta backend".to_string(),

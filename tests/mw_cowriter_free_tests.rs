@@ -405,6 +405,13 @@ impl Authority {
             cowriter::local_owner_view(),
         ));
         publish::install_harvest_executor(cowriter::router_harvest_executor(Arc::clone(&br)));
+        // Finding 28: the production mount arm installs the binding
+        // probe beside the executors — the harness mirrors it (the
+        // fixture-truth discipline), wired to this authority's router.
+        {
+            let br = Arc::clone(&br);
+            publish::install_binding_probe(Arc::new(move |k: &str| br.block_key_incarnation_ok(k)));
+        }
 
         let router = data_grant::AsyncVerbRouter::new()
             .with_custody(Arc::clone(&owner))
@@ -3671,6 +3678,13 @@ async fn a_stale_merge_never_regresses_a_block_to_a_dead_binding() {
     let vol = fresh_volume(dir.path(), "f28-regress").await;
     let dev = data_device(dir.path(), "f28-regress.dev");
     let auth = Authority::start(&vol, &dev, &[NODE_A]).await;
+    // The stamped-key plane must be ENGAGED for lifetimes to exist in
+    // keys at all (the item-6 era gate — un-stamped volumes carry bare
+    // offsets and the probe passes them verbatim).
+    auth.alloc.engage_incarnations(
+        3,
+        squeezefs::meta_backend::kv::journal::AppendPartition::new(1, 0).expect("partition"),
+    );
 
     // Authority-side mints happen BEFORE the co-writer join (fresh mints
     // raise the lane frontier; a joined process's raises ship under the
@@ -3682,10 +3696,12 @@ async fn a_stale_merge_never_regresses_a_block_to_a_dead_binding() {
     // stamped key the co-writer's cache captured.
     let off_old = auth.alloc.allocate_block().await.expect("first mint");
     auth.alloc.publish_block(off_old);
-    let gen_old = auth
-        .alloc
-        .fill_incarnation(off_old)
-        .expect("published word is stable");
+    let gen_old = auth.alloc.live_incarnation(off_old);
+    assert_ne!(
+        gen_old,
+        squeezefs::routing::INCARNATION_NONE,
+        "fixture: the engaged mint stamps a lifetime"
+    );
     let dead_key_body = off_old.to_string();
     let stale_key = squeezefs::routing::block_key_with_incarnation(&dead_key_body, gen_old);
 
@@ -3693,10 +3709,7 @@ async fn a_stale_merge_never_regresses_a_block_to_a_dead_binding() {
     // binding at a fresh offset.
     let off_new = auth.alloc.allocate_block().await.expect("fold's mint");
     auth.alloc.publish_block(off_new);
-    let gen_new = auth
-        .alloc
-        .fill_incarnation(off_new)
-        .expect("published word is stable");
+    let gen_new = auth.alloc.live_incarnation(off_new);
     let live_key = squeezefs::routing::block_key_with_incarnation(&off_new.to_string(), gen_new);
 
     let cwr = CoWriter::join(&auth, &vol, &dev, NODE_A).await;
@@ -3730,9 +3743,16 @@ async fn a_stale_merge_never_regresses_a_block_to_a_dead_binding() {
     assert_eq!(reused, off_old, "free-list-first re-mints the offset");
     auth.alloc.publish_block(off_old);
     assert_ne!(
-        auth.alloc.fill_incarnation(off_old),
-        Some(gen_old),
+        auth.alloc.live_incarnation(off_old),
+        gen_old,
         "fixture: the stale key's incarnation is DEAD (a new lifetime owns the offset)"
+    );
+
+    // Fixture pin: the authority's own probe judges the stale key DEAD
+    // (the filter consumes exactly this judgment).
+    assert!(
+        !auth.br.block_key_incarnation_ok(&stale_key),
+        "fixture: '{stale_key}' must read DEAD on the authority's router"
     );
 
     // The co-writer's STALE merge: its cached map still names the dead

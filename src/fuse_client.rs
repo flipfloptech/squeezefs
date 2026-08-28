@@ -5688,6 +5688,15 @@ pub struct Metrics {
     /// row IS the gate working; a leak would show as `fsck` C2 findings
     /// instead, never here.
     pub publish_blob_foreign_free_skips: Align64<AtomicU64>,
+    /// Finding 28: caller map entries DROPPED by the served publish's
+    /// binding probe — the entry's stamped incarnation was DEAD (the
+    /// offset freed and re-minted after the arbiter's fold displaced the
+    /// block), so adopting it would REGRESS the head and wedge every
+    /// later fold/read into "names a dead incarnation" EIO (the first
+    /// cheap-first probe's MPI_ABORT). Growth is the shield working
+    /// under stale-cache churn; the shipper heals via the served-layout
+    /// invalidation.
+    pub publish_stale_binding_drops: Align64<AtomicU64>,
     // Terminal-free device reclaim economy (the shim-write-amplification
     // fix — `.benchmarks/2026-07-27-shim-write-amplification.md`;
     // classification `routing::free_reclaim_op`, contract
@@ -9926,6 +9935,7 @@ impl SqueezefsFilesystem {
                 "publish_blob_composes": METRICS.publish_blob_composes.load(Ordering::Relaxed),
                 "publish_compose_spills": METRICS.publish_compose_spills.load(Ordering::Relaxed),
                 "publish_blob_foreign_free_skips": METRICS.publish_blob_foreign_free_skips.load(Ordering::Relaxed),
+                "publish_stale_binding_drops": METRICS.publish_stale_binding_drops.load(Ordering::Relaxed),
                 "layout_delta_commits": crate::meta_backend::kv::META_KV_LAYOUT_DELTA_COMMITS.load(Ordering::Relaxed),
                 "layout_full_commits": crate::meta_backend::kv::META_KV_LAYOUT_FULL_COMMITS.load(Ordering::Relaxed),
                 "layout_delta_bytes": crate::meta_backend::kv::META_KV_LAYOUT_DELTA_BYTES.load(Ordering::Relaxed),
@@ -12523,6 +12533,13 @@ impl SqueezefsFilesystem {
     /// (the mount arm's act, beside the free/harvest executors; the
     /// multi-writer disarm uninstalls them).
     pub fn install_extent_assembler(&self) {
+        // Finding 28: the served publish's binding probe — a caller's
+        // stale map entry naming a DEAD incarnation is dropped instead
+        // of regressing the head (the durable entry stands).
+        let br = std::sync::Arc::clone(&self.router.backend_router);
+        crate::meta_ship::publish::install_binding_probe(std::sync::Arc::new(move |k: &str| {
+            br.block_key_incarnation_ok(k)
+        }));
         let fs = self.clone();
         crate::meta_ship::publish::install_extent_merge_executor(std::sync::Arc::new(
             move |frame: crate::meta_ship::publish::ExtentFrame| {

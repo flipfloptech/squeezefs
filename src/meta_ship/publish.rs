@@ -1195,6 +1195,52 @@ pub fn arbiter_fold_active() -> bool {
     ARBITER_FOLD.try_with(|_| ()).is_ok()
 }
 
+/// Finding 28: the BINDING PROBE — answers "may this block key be
+/// adopted into a durable head?" (`false` ⇔ its stamped incarnation is
+/// DEAD on this authority). Installed by the mount arm (wired to
+/// `BackendRouter::block_key_incarnation_ok`); absent = adopt everything
+/// (the pre-f28 shape — solo mounts never serve merges). The law it
+/// enforces: a caller's stale map entry never REGRESSES a block the
+/// arbiter's fold already displaced — the probe's refusal drops the
+/// ENTRY (the durable's stands, the frame still serves), because
+/// adopting it wedged every later fold/read of the block into
+/// "names a dead incarnation" EIO until the shipper's parked publish
+/// could never heal it (the first cheap-first probe's MPI_ABORT).
+static BINDING_PROBE: parking_lot::RwLock<Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>> =
+    parking_lot::RwLock::new(None);
+
+/// Install the finding-28 binding probe (the mount arm; a re-arm
+/// replaces).
+pub fn install_binding_probe(probe: Arc<dyn Fn(&str) -> bool + Send + Sync>) {
+    *BINDING_PROBE.write() = Some(probe);
+}
+
+/// Drop dead-incarnation entries from a caller's map-entry set; returns
+/// how many dropped (counted on `publish_stale_binding_drops`).
+fn retain_live_bindings(entries: &mut Vec<(u32, String)>, ino: Ino) -> u64 {
+    let probe = BINDING_PROBE.read().clone();
+    let Some(probe) = probe else { return 0 };
+    let before = entries.len();
+    entries.retain(|(b, k)| {
+        let live = probe(k);
+        if !live {
+            log::warn!(
+                "S9 publish: dropping caller entry block {b} of ino {ino} — key '{k}' \
+                 names a DEAD incarnation (finding 28: adopting it would regress the \
+                 head past the arbiter's own displacement; the durable entry stands)"
+            );
+        }
+        live
+    });
+    let dropped = (before - entries.len()) as u64;
+    if dropped > 0 {
+        crate::fuse_client::METRICS
+            .publish_stale_binding_drops
+            .fetch_add(dropped, Ordering::Relaxed);
+    }
+    dropped
+}
+
 /// Finding 25 (rung A): the SETTLE arms' serve-window participation —
 /// the serialized settle resolve holds (3) + (3.5), but a SERVED publish
 /// commits under neither, so a serve landing mid-window could still move
@@ -2962,10 +3008,15 @@ impl PublishService {
         // against (the map the composition displaces FROM).
         let head = map.clone();
         map.retain(|b, _| !(in_custody(*b) && !new_map.contains_key(b)));
-        for (b, k) in new_map {
-            if in_custody(b) {
-                map.insert(b, k);
-            }
+        // Finding 28: the caller's adopted entries pass the binding probe
+        // (a dead-incarnation entry drops; the durable's stands).
+        let mut adopt: Vec<(u32, String)> = new_map
+            .into_iter()
+            .filter(|(b, _)| in_custody(*b))
+            .collect();
+        retain_live_bindings(&mut adopt, ino);
+        for (b, k) in adopt {
+            map.insert(b, k);
         }
         // Rung 19 (the width-N refs composition): the accounting IS the
         // head→composed diff. With no resolver armed the caller's frame
@@ -3193,11 +3244,32 @@ impl PublishService {
                 refs,
                 ..
             } => {
-                let delta = crate::layout_wire::LayoutDelta::decode(&delta).map_err(|e| {
+                let mut delta = crate::layout_wire::LayoutDelta::decode(&delta).map_err(|e| {
                     SqueezefsError::InvalidOperation(format!(
                         "S9 publish: undecodable layout delta for ino {ino}: {e}"
                     ))
                 })?;
+                // Finding 28: a stale caller entry never regresses a
+                // block to a dead binding — filter the delta AND the
+                // re-base fallback map (per-entry drop, never a frame
+                // refusal; the shipper's cache heals via the served-
+                // layout invalidation it already rides).
+                let full_layout = {
+                    let mut full_layout = full_layout;
+                    if retain_live_bindings(&mut delta.entries, ino) > 0 {
+                        if let Ok(mut base) = crate::layout_wire::decode_base_layout(&full_layout) {
+                            if let Some(map) = base.block_map.as_mut() {
+                                let mut ents: Vec<(u32, String)> = map.drain().collect();
+                                retain_live_bindings(&mut ents, ino);
+                                *map = ents.into_iter().collect();
+                            }
+                            if let Ok(re) = bincode::serialize(&base) {
+                                full_layout = re;
+                            }
+                        }
+                    }
+                    full_layout
+                };
                 let refs: Vec<BlockRefOp> = refs.into_iter().map(BlockRefOp::from).collect();
                 // Rung 17 (KD-MW-8's composition law): a SHIPPED merge
                 // CHAINS ONTO THE DURABLE HEAD — the claim re-stamps

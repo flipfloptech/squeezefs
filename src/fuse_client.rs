@@ -5688,6 +5688,13 @@ pub struct Metrics {
     /// row IS the gate working; a leak would show as `fsck` C2 findings
     /// instead, never here.
     pub publish_blob_foreign_free_skips: Align64<AtomicU64>,
+    /// Finding 33: own-mint blob lifecycles reclaimed at cache DISCARD —
+    /// the entry being dropped was the mint's last holder (rung 20: the
+    /// durable never names a shipped mint on the compose path), so
+    /// without this reclaim the mint leaked until fsck C2 (attempt 13's
+    /// one finding). Growth tracks invalidation churn on range-shared
+    /// co-writers; the leak face is `fsck` C2 staying 0.
+    pub publish_blob_orphan_reclaims: Align64<AtomicU64>,
     /// Finding 28: caller map entries DROPPED by the served publish's
     /// binding probe — the entry's stamped incarnation was DEAD (the
     /// offset freed and re-minted after the arbiter's fold displaced the
@@ -9935,6 +9942,7 @@ impl SqueezefsFilesystem {
                 "publish_blob_composes": METRICS.publish_blob_composes.load(Ordering::Relaxed),
                 "publish_compose_spills": METRICS.publish_compose_spills.load(Ordering::Relaxed),
                 "publish_blob_foreign_free_skips": METRICS.publish_blob_foreign_free_skips.load(Ordering::Relaxed),
+                "publish_blob_orphan_reclaims": METRICS.publish_blob_orphan_reclaims.load(Ordering::Relaxed),
                 "publish_stale_binding_drops": METRICS.publish_stale_binding_drops.load(Ordering::Relaxed),
                 "layout_delta_commits": crate::meta_backend::kv::META_KV_LAYOUT_DELTA_COMMITS.load(Ordering::Relaxed),
                 "layout_full_commits": crate::meta_backend::kv::META_KV_LAYOUT_FULL_COMMITS.load(Ordering::Relaxed),
@@ -12593,7 +12601,9 @@ impl SqueezefsFilesystem {
         }));
         let router = self.router.clone();
         crate::extent_ship::install_release_hook(std::sync::Arc::new(move |ino: u64| {
-            router.metadata_cache.remove(&ino);
+            // Finding 33: the discard funnel reclaims an own-mint head the
+            // entry alone knows about (the orphaned-blob leak).
+            router.discard_layout_cache(ino);
         }));
     }
 
@@ -20165,7 +20175,8 @@ impl SqueezefsFilesystem {
             }
         }
         self.range_stream_frontier.remove(&ino);
-        self.router.metadata_cache.remove(&ino);
+        // Finding 33: the discard funnel (own-mint orphan reclaim).
+        self.router.discard_layout_cache(ino);
         self.attr_cache.invalidate(&ino);
         self.last_write_end.remove_sync(&ino);
     }

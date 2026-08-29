@@ -3950,11 +3950,29 @@ async fn an_invalidation_never_orphans_the_shippers_own_blob_mint() {
     let minted_off: u64 = minted_key.parse().expect("plain offset key in this rig");
     let minted_idx = minted_off / cwr.alloc.chunk_size();
 
-    // The served-layout invalidation lands (the hook's act), and the next
-    // touch REFETCHES the durable head — the owner-composed truth, which
-    // NEVER names the shipped mint on the compose path. The entry that
-    // knew the mint was ours is replaced.
-    router.metadata_cache.remove(&ino);
+    // The rig's serve is VERBATIM (no custody shape armed server-side),
+    // so the shipped refs committed a MAP_BLOB take the REAL range-shared
+    // compose would have DROPPED (rung 20: caller blob ops are
+    // recomputed). Model the compose's drop so the ledger matches the
+    // field shape the leak fired under.
+    auth.meta
+        .commit_block_refs(
+            ino,
+            &[BlockRefOp::released(BlockRef {
+                vol_tag: volume_tag(DATA_VOL),
+                block_idx: minted_idx,
+                owner_ino: ino,
+                block_index: squeezefs::meta_backend::kv::block_refs::BLOCK_INDEX_MAP_BLOB,
+            })],
+        )
+        .await
+        .expect("the compose-drop model releases the record");
+
+    // The invalidation lands through the PRODUCTION discard funnel (the
+    // release hook's act), and the next touch REFETCHES the durable head
+    // — the owner-composed truth, which NEVER names the shipped mint on
+    // the compose path. The entry that knew the mint was ours is gone.
+    router.discard_layout_cache(ino);
     let refetched = router
         .fetch_metadata(&format!("inode_{ino}"))
         .await
@@ -3967,15 +3985,23 @@ async fn an_invalidation_never_orphans_the_shippers_own_blob_mint() {
 
     // The law: the replacement reclaimed the orphan — its offset returns
     // to the shared free supply (the shipped free's untracked→seed→Freed
-    // arm). Today NOTHING frees it: fsck C2 is the only observer left
-    // (attempt 13's leaked block).
-    auth.br.reclaim_drain().await;
-    assert!(
-        auth.free_listed(minted_idx),
-        "the shipper's own mint (offset {minted_off}) must return to the free \
-         supply when the refetch replaces its owning entry — the orphan is \
-         finding 33's leaked block"
-    );
+    // arm; DETACHED by design, so the check polls bounded). Today NOTHING
+    // frees it: fsck C2 is the only observer left (attempt 13's leaked
+    // block).
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        auth.br.reclaim_drain().await;
+        if auth.free_listed(minted_idx) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the shipper's own mint (offset {minted_off}) must return to the free \
+             supply when the refetch replaces its owning entry — the orphan is \
+             finding 33's leaked block"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     squeezefs::meta_ship::tokens::test_clear_range_cache();
     drop(cwr);

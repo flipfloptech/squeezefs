@@ -5741,6 +5741,55 @@ impl DataRouter {
     /// this only ever costs one full save after a failure. Callers hold
     /// `INODE_META_LOCKS` (every save site does), so the read-modify-
     /// insert cannot race a concurrent publish of the same ino.
+    /// Finding 33: discard the ino's cached layout head, RECLAIMING a
+    /// range-shared co-writer's OWN blob mint that the entry alone knows
+    /// about. Rung 20's law makes the reclaim safe: on the compose path
+    /// the durable head NEVER names a shipped mint ("it stays the
+    /// shipper's own lifecycle — its `old_indirect_to_free` tail reclaims
+    /// it"), and that tail lives in THIS cache entry's `own_mint` bit —
+    /// discarding the entry without the reclaim orphaned the mint forever
+    /// (attempt 13's `[C2] leaked block`, the fsck oracle's only
+    /// observer). The free is DETACHED (`spawn_meta`) so no caller's lock
+    /// context is held across a terminal free (RES-1); on a co-writer it
+    /// ships and lands in the untracked→seed→Freed arm. Counted on
+    /// `publish_blob_orphan_reclaims`.
+    pub fn discard_layout_cache(&self, ino: u64) {
+        if crate::fuse_client::co_writer_mount()
+            && !crate::cowriter::authority_accounting_scope_active()
+            && crate::meta_ship::tokens::range_episode(ino)
+        {
+            if let Some(m) = self.metadata_cache.get(&ino) {
+                if m.block_map_id_own_mint {
+                    if let Some(key) = m
+                        .block_map_id
+                        .as_deref()
+                        .and_then(|id| id.strip_prefix("indirect:"))
+                    {
+                        let key = key.to_string();
+                        let br = std::sync::Arc::clone(&self.backend_router);
+                        METRICS
+                            .publish_blob_orphan_reclaims
+                            .fetch_add(1, Ordering::Relaxed);
+                        log::debug!(
+                            "finding 33: reclaiming the outgoing own-mint blob '{key}' of \
+                             ino {ino} at cache discard (the entry is this lifecycle's \
+                             last holder)"
+                        );
+                        crate::meta_exec::spawn_meta("blob_orphan_reclaim", async move {
+                            if let Err(e) = br.free_block(&key).await {
+                                log::warn!(
+                                    "finding 33: orphan-mint reclaim of '{key}' failed ({e}) — \
+                                     leak-safe (fsck C2 remains the backstop)"
+                                );
+                            }
+                        });
+                    }
+                }
+            }
+        }
+        self.metadata_cache.remove(&ino);
+    }
+
     pub(crate) fn reset_layout_provenance(&self, ino: u64) {
         if let Some(mut m) = self.metadata_cache.get(&ino) {
             if m.layout_version != 0 {
@@ -9658,7 +9707,7 @@ impl DataRouter {
                     METRICS
                         .read_settle_stale_head_refetches
                         .fetch_add(1, Ordering::Relaxed);
-                    self.metadata_cache.remove(&ino);
+                    self.discard_layout_cache(ino);
                 } else {
                     // The key's incarnation word moved while both custody
                     // domains were held AND the head was read from the
@@ -10840,7 +10889,7 @@ impl DataRouter {
             Err(e @ SqueezefsError::FencingTokenExpired { .. }) => {
                 while epoch.displaced.pop().is_some() {}
                 while epoch.guards.pop().is_some() {}
-                self.metadata_cache.remove(&ino);
+                self.discard_layout_cache(ino);
                 METRICS
                     .rewrite_shadow_fence_drops
                     .fetch_add(1, Ordering::Relaxed);

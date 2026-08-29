@@ -1023,3 +1023,14 @@ the assemble cycle locally with the cloud deltas
 (`--allow-other`, FLEET_SHARE=9), and pin the lost reply. Per the
 2026-08-28 mandate (AGENTS.md): NO further cloud run without expressed
 per-run approval — attempt 13 asks first.
+
+### Finding 32 addendum (the driver's own tail): the wedge is the ROSTER RE-ARM's unmount
+
+The assemble's last line before the hang: "re-arming the authority with
+the roster (a new era): node_….m…×8" — the re-arm cycle unmounts the
+FIRST authority mount to remount it roster-armed, and THAT unmount is
+what sat behind op 86 for 59 minutes. Local repro recipe: authority
+mount → enroll the 8-co-writer roster → the re-arm's umount+remount,
+with the cloud deltas (`--allow-other`, `FLEET_SHARE=9`) applied — the
+local fleet's own assemble (probe 6) ran this shape clean, so the
+deltas are the discriminating variables.

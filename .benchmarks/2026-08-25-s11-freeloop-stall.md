@@ -1149,3 +1149,75 @@ the aborted ranks' designed abandons (`cowriter.unpublished_abandons`)
 as leaks, which is why the matrix runs its oracle after green rows
 only. The clean-row C2 verdict belongs to the next cloud roll
 (per-run approval standing).
+
+## Attempt 14 (2026-08-29, cloud i4i.8xlarge, binary `1e916c8c` — f33/f33b landed): PERF + ENGAGEMENT GREEN; 12 C8 drifts (finding 34's field face)
+
+Approved run. A-B-B-A 1.035 / 0.980 (PASS), engagement green (zero
+fabricated sharing, prs/ors 0), read-back exact — and the fsck oracle
+red with **12 `[C8]` drifts** (`1 durable record vs 0 counted layout
+references`, 11 at real data indices on ino 2 + 1 blob-sentinel), beside
+14 `authority refused shipped free(s): already free/graced/quarantined`
+lines in the co-writer logs. First attributed to the f33b reclaim racing
+its own take (f33c, `e490a143`: the orphan reclaim quiesces the ino's
+publish pipeline first) — correct for the BLOB face, but the local
+verification probe proved the data-index face is a separate, larger
+class.
+
+## Finding 34 (red `819ae93c`, fix `1f144af9`): the custody-less verbatim Put — the C8 storm's root
+
+The f33c verification probe (8 co-writers, s11-mpiio at 64 GiB) read
+**2,234 C8 + 13 C2** with ~1,870 refused shipped frees — far beyond the
+blob class (`publish_blob_orphan_reclaims` ran 8× fleet-wide). A
+purpose-built repro (`/tmp/f34-repro.sh`: 8 co-writers × 4 ranks, ONE
+10 GiB shared file past the indirect boundary, 8 rewrite iterations,
+~4 min) reproduced 134–149 C8 at will, and a ledger TAPE (every staged
+`TREE_BLOCK_REFS` op logged with identity + provenance) convicted the
+arm exactly:
+
+- map idx 1177's history: takes/releases pair correctly through five
+  generations until a `recomputed=false` serve — a full Put whose
+  custody shape at serve time was NOT `Ranges` — applied VERBATIM,
+  clobbering the binding with the caller's stale view and staging the
+  caller's stale refs frame. Every later compose then released ancient
+  identities (no-op deletes) while live takes stranded (C8) and the
+  duplicate displaced-frees came back refused (the storm).
+- census: **38 `recomputed=false` serves ≡ 38 custody-shape-not-Ranges
+  Puts** — every one a release verb outrunning the releasing mount's
+  own BACKGROUNDED close-time flush (`release()` drops range leases
+  synchronously after `spawn_bg`-ing the flush ladder; the release verb
+  then departs on the next drain, often before the flush's Put lands).
+
+Two rungs landed (`1f144af9`):
+
+1. **The release gate (client)** — `drain_releases` consults the
+   installed `ReleaseGateHook` per released ranged ino: a synchronous
+   quiescence probe (dirty layout / deferred ledger ops / open rewrite
+   shadow / held 3.5 stripe — no order-1 locks: the drain runs under
+   the acquire path's order-2 lease stripe). Busy ⇒ the verbs REQUEUE
+   (`dlm_custody_releases_deferred`) and the gate kicks ONE latched
+   detached fsync-grade flush; the renewal cadence re-drains behind it.
+   Whole-file grants and gate-less mounts ship as before.
+2. **The owner shield** — the scoped-Put arm REFUSES a
+   `ClientCustodyShape::None` publish when the ino has live range
+   grants (`ino_has_range_grants`), counted on the new
+   `meta_ship_publish.unscoped_put_refusals` (must stay 0 post-rung-1).
+
+Red proof: the owner-rung contract fails on pre-fix src by stash A/B
+(verbatim apply → Err assertion + idx-1 read-back both red); the
+client-rung contract is compile-blocked red (the gate API is the fix's
+own seam — the f30 precedent). Both green with the fix
+(`tests/mw_cowriter_free_tests.rs::a_custodyless_put_on_a_range_held_ino_refuses_instead_of_clobbering`,
+`tests/dlm_range_custody_tests.rs::a_ranged_release_verb_departs_only_behind_the_publish_drain`).
+
+Field verification (the same repro, fixed binary): **149 → 6 C8 and
+32 → 6 C2 at 32 GiB; 11 C8 + 7 C2 at 64 GiB** — refusal storm 1,900 →
+~6, gate engaged (2,206 deferrals), owner shield 0 (departures now
+ordered). The residue is a NARROWER class (~1/300th the rate),
+ENOSPC-correlated on this oversubscribed venue (626–2,029 `volume
+full` errors per run — the 10 GiB × 8-rewrite churn against 2×32–64 GiB
+zram with grace-ring holds): mostly blob-sentinel strands (idx
+u32::MAX — the f33 lineage's compose-venue face) plus a few tail-index
+data strands beside failed-fsync ENOSPC exits. BOARD (finding 35
+candidate): classify the blob-strand residue on a non-ENOSPC venue —
+attempt 14's cloud row carried exactly ONE blob-sentinel drift among
+its 12, so the class exists off-ENOSPC at ~1/row scale.

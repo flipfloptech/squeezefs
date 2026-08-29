@@ -6949,6 +6949,115 @@ fn queue_worker(
         // an EINTR'd submit) left in the SQ — a no-op enter when none.
         let _ = ring.submit();
     }
+
+    // Finding 32 — the REPLY RESIDENCY. The row-8 drain above answered
+    // every op delivered SO FAR, but the kernel keeps this worker's
+    // REGISTERed/re-armed ents live until the connection actually dies,
+    // and an op delivered AFTER the drain (the unmount's own
+    // FLUSH/RELEASE against this very session — the dismount ritual
+    // completes, THEN umount runs) had no consumer: the caller sat in
+    // uninterruptible sleep, the overdue scanner warned every 5 s, the
+    // kernel's umount waited on the reply, and the daemon's exit waited
+    // on the umount — the cloud assemble's 59-minute wedge (the local
+    // rolls never hit the window; the cloud venue did, every time).
+    //
+    // Stay resident: keep reaping CQEs and answer every FRESH delivery
+    // with ENOTCONN until the ring reports the connection dead (the
+    // `is_disconnect_errno` class — the umount completing is exactly
+    // what kills it) or the bounded backstop lapses (a shutdown while
+    // the mount is still actively used must not hold the worker thread
+    // forever; what the backstop abandons is counted on
+    // `transport_requests_abandoned`, never silent). Poll cadence over
+    // EXT_ARG plumbing on purpose: this loop runs only at teardown.
+    let residency_deadline = Instant::now() + Duration::from_secs(30);
+    'residency: loop {
+        let mut answered = 0usize;
+        // Non-blocking reap: submit anything the pass below pushed, then
+        // walk the CQ.
+        if let Err(e) = ring.submit() {
+            if FuseOverUring::is_disconnect_errno(e.raw_os_error().unwrap_or(0)) {
+                break 'residency;
+            }
+        }
+        let cqes: Vec<(u64, i32)> = ring
+            .completion()
+            .map(|c| (c.user_data(), c.result()))
+            .collect();
+        for (user_data, res) in cqes {
+            if res < 0 && FuseOverUring::is_disconnect_errno(-res) {
+                debug!(
+                    "fuse-over-uring qids={qids:?}: residency saw disconnect ({res}) — \
+                     the connection is dead, exiting"
+                );
+                break 'residency;
+            }
+            let Some((_op, gent)) = decode_user_data(user_data) else {
+                continue;
+            };
+            let (mi, idx) = (gent / depth, gent % depth);
+            let Some(m) = members.get_mut(mi) else {
+                continue;
+            };
+            if res < 0 {
+                continue;
+            }
+            // A fresh delivery landed on a re-armed ent: answer it with
+            // ENOTCONN so its caller (the unmount path itself, or a last
+            // straggler) returns instead of stranding.
+            let unique = u64::from_le_bytes(m.ents[idx].hdr().in_out[8..16].try_into().unwrap());
+            let mut commit_id = m.ents[idx].hdr().ring_ent_in_out.commit_id;
+            if commit_id == 0 {
+                commit_id = unique;
+            }
+            if unique == 0 && commit_id == 0 {
+                continue;
+            }
+            let qid = m.qid;
+            warn!(
+                "fuse-over-uring qid={qid} ent={idx}: delivery unique={unique} arrived AFTER \
+                 the teardown drain — answering ENOTCONN (finding 32's reply residency; the \
+                 pre-residency shape stranded this caller in uninterruptible sleep and wedged \
+                 the umount)"
+            );
+            let _ = m.slots.on_deliver(idx, unique, commit_id);
+            match fail_ent(
+                &mut ring,
+                &mut batch,
+                &mut m.slots,
+                &mut m.ents[idx],
+                &m.lease_states[idx],
+                pool.slot_watch_cell(qid, idx),
+                qid,
+                gent,
+                libc::ENOTCONN,
+            ) {
+                Ok(true) => answered += 1,
+                Ok(false) => {}
+                Err(_) => break 'residency,
+            }
+        }
+        if answered > 0 {
+            let _ = batch.note_flush();
+            if ring.submit_and_wait(0).is_err() {
+                break 'residency;
+            }
+            // Fresh deliveries can chase the re-arm — loop immediately.
+            continue 'residency;
+        }
+        if Instant::now() >= residency_deadline {
+            let owed: usize = members.iter().map(|m| m.slots.owing().count()).sum();
+            if owed > 0 {
+                warn!(
+                    "fuse-over-uring qids={qids:?}: residency backstop lapsed with {owed} \
+                     slot(s) still owing — abandoned (transport_requests_abandoned)"
+                );
+                TRANSPORT_REQUESTS_ABANDONED.fetch_add(owed as u64, Ordering::Relaxed);
+            }
+            break 'residency;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
     debug!("fuse-over-uring qids={qids:?} worker exit");
     Ok(())
 }

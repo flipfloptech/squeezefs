@@ -3995,3 +3995,134 @@ async fn an_invalidation_never_orphans_the_shippers_own_blob_mint() {
     drop(cwr);
     auth.stop().await;
 }
+
+// ---------------------------------------------------------------------------
+// Finding 34 (rung 2): the custody-less-Put shield — a grant-less full Put
+// on an ino other writers hold ranges on refuses instead of clobbering
+// ---------------------------------------------------------------------------
+
+/// Finding 34, rung 2 (RED pre-fix: the serve applied the Put VERBATIM —
+/// this test's Err assertion and its read-back both fail on `dev`): a
+/// range-custody-less client's full Put for an ino with LIVE range grants
+/// held by OTHER writers must REFUSE, loud and counted
+/// (`unscoped_put_refusals`), with the durable head untouched. Applied
+/// verbatim it replaced the whole composed map with the shipper's stale
+/// view and staged the shipper's stale refs frame — every reverted peer
+/// entry's durable take stranded ("1 durable record vs 0 counted layout
+/// references", the s11-blockcyclic C8 storm: 2,234 findings on the local
+/// repro row) and the shipper's duplicate displaced-frees came back
+/// "already free/graced/quarantined". The field shape: the close path
+/// releases range custody while its flush is BACKGROUNDED, so the flush's
+/// Put arrives after the grants died (rung 1 gates that departure; this
+/// shield is the owner's half for every ordering it cannot see).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_custodyless_put_on_a_range_held_ino_refuses_instead_of_clobbering() {
+    use squeezefs::meta_backend::Metadata as _;
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "f34-shield").await;
+    let dev = data_device(dir.path(), "f34-shield.dev");
+    let auth = Authority::start(&vol, &dev, &[NODE_A, NODE_B]).await;
+    auth.alloc.engage_incarnations(
+        3,
+        squeezefs::meta_backend::kv::journal::AppendPartition::new(1, 0).expect("partition"),
+    );
+
+    // Authority-side mints BEFORE the co-writer join (the suite's
+    // established order): two live blocks — the head the stale Put will
+    // try to revert.
+    let off_a = auth.alloc.allocate_block().await.expect("block A");
+    auth.alloc.publish_block(off_a);
+    let key_a = squeezefs::routing::block_key_with_incarnation(
+        &off_a.to_string(),
+        auth.alloc.live_incarnation(off_a),
+    );
+    let off_b = auth.alloc.allocate_block().await.expect("block B");
+    auth.alloc.publish_block(off_b);
+    let key_b = squeezefs::routing::block_key_with_incarnation(
+        &off_b.to_string(),
+        auth.alloc.live_incarnation(off_b),
+    );
+
+    let cwr = CoWriter::join(&auth, &vol, &dev, NODE_A).await;
+    let ino = publish::create_with_rdev_size(&cwr.meta, 1, "f34.bin", 0o100644, 0, 0, 0, 0)
+        .await
+        .expect("shipped create")
+        .ino;
+    let head = |map: Vec<(u32, String)>| {
+        bincode::serialize(&squeezefs::layout_wire::LayoutMetadata {
+            file_type: "striped".into(),
+            size: 8 * 1024 * 1024,
+            block_map_id: None,
+            block_prefix: None,
+            file_id: None,
+            data_key: None,
+            block_map: Some(map.into_iter().collect()),
+        })
+        .expect("head bytes")
+    };
+
+    // The establishing Put: NO grants exist on the ino anywhere, so the
+    // grant-less arm stays the legal pre-custody publish class (verbatim).
+    let both = head(vec![(0u32, key_a.clone()), (1u32, key_b.clone())]);
+    publish::set_layout_and_size(&cwr.meta, ino, &both, 8 * 1024 * 1024, &[])
+        .await
+        .expect("the pre-custody establishing Put lands");
+
+    // A PEER takes live RANGE custody of the ino.
+    let peer = WriteCustodyClient::connect(&auth.endpoint, SECRET, NODE_B)
+        .await
+        .expect("the peer dials the custody authority");
+    let peer_grant = match peer
+        .acquire_range(ino, (0, 4 * 1024 * 1024), (0, 4 * 1024 * 1024), Duration::from_secs(3))
+        .await
+        .expect("the peer's ranged grant")
+    {
+        data_grant::RangeAcquireOutcome::New { lease, .. } => lease,
+        other => panic!("a fresh ino's first ranged ask must be NEW, got {other:?}"),
+    };
+
+    // The grant-less client's STALE full Put (idx 1 gone — the reverting
+    // clobber): it must REFUSE, counted, with the durable head untouched.
+    let refusals_before = squeezefs::meta_ship::publish::stats_json()
+        ["unscoped_put_refusals"]
+        .as_u64()
+        .unwrap_or(0);
+    let stale = head(vec![(0u32, key_a.clone())]);
+    let out = publish::set_layout_and_size(&cwr.meta, ino, &stale, 8 * 1024 * 1024, &[]).await;
+    assert!(
+        out.is_err(),
+        "a custody-less full Put on a range-held ino must refuse (finding 34) — got {out:?}"
+    );
+    let refusals_after = squeezefs::meta_ship::publish::stats_json()
+        ["unscoped_put_refusals"]
+        .as_u64()
+        .unwrap_or(0);
+    assert_eq!(
+        refusals_after,
+        refusals_before + 1,
+        "the shield's engagement is counted (unscoped_put_refusals)"
+    );
+    let durable = auth
+        .meta
+        .getxattr(ino, "layout")
+        .await
+        .expect("layout read")
+        .expect("the establishing head persists");
+    let decoded =
+        squeezefs::layout_wire::decode_base_layout(&durable).expect("the head decodes inline");
+    let map = decoded.block_map.expect("the head carries its map");
+    assert_eq!(
+        map.get(&1).map(String::as_str),
+        Some(key_b.as_str()),
+        "the refused Put must leave the durable head UNTOUCHED — idx 1's \
+         binding reverting is exactly the C8-minting clobber"
+    );
+
+    drop(peer_grant);
+    peer.drain_releases().await;
+    squeezefs::meta_ship::tokens::test_clear_range_cache();
+    drop(cwr);
+    auth.stop().await;
+}

@@ -2831,3 +2831,93 @@ async fn a_hull_raise_never_mints_classifier_claim() {
         "a hull SHRINK truncates the claims"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Finding 34 (rung 1): the release gate — a ranged release verb departs
+// only behind the ino's publish drain
+// ---------------------------------------------------------------------------
+
+/// RAII gate uninstall: a panicking assertion must not leave the
+/// process-global release gate armed for the file's other tests.
+struct GateGuard;
+impl Drop for GateGuard {
+    fn drop(&mut self) {
+        data_grant::uninstall_release_gate();
+    }
+}
+
+/// Finding 34, rung 1 (RED pre-fix — compile-blocked: the release gate
+/// API is the fix's own seam, the f30 precedent): a RANGED grant's queued
+/// release verb must not depart while the installed gate judges its ino's
+/// publish pipeline BUSY — the un-gated departure handed the bytes back
+/// while the releasing mount's own backgrounded flush was still
+/// traveling, and the owner then served that flush's full Put
+/// custody-less + verbatim (the s11-blockcyclic C8/C2 storm). The verb
+/// REQUEUES (counted, `dlm_custody_releases_deferred`) and departs on the
+/// drain after the gate reads quiescent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ranged_release_verb_departs_only_behind_the_publish_drain() {
+    let _g = RANGE_SERIAL.lock().await;
+    let _gate_guard = GateGuard;
+    let (listener, _owner, endpoint) = range_authority(64 * BLK);
+    let client = range_client(&endpoint, "cw-f34-gate").await;
+    let ino = 72_034_001u64;
+
+    // The gate probe: BUSY until flipped, every verdict recorded.
+    let quiescent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let calls: Arc<std::sync::Mutex<Vec<(u64, u64)>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let q = Arc::clone(&quiescent);
+        let c = Arc::clone(&calls);
+        data_grant::install_release_gate(Arc::new(move |gate_ino, token| {
+            c.lock().expect("probe log").push((gate_ino, token));
+            q.load(Ordering::SeqCst)
+        }));
+    }
+
+    let releases_before = data_grant::stats().releases;
+    let out = client
+        .acquire_range(ino, (0, BLK), (0, BLK), Duration::from_secs(3))
+        .await
+        .expect("the ranged grant");
+    let (lease, token) = match out {
+        RangeAcquireOutcome::New { lease, .. } => {
+            let token = lease.fencing_token();
+            (lease, token)
+        }
+        other => panic!("a fresh ino's first ask must be a NEW grant, got {other:?}"),
+    };
+    assert_ne!(token, 0, "fixture: a ranged grant carries a nonzero token");
+
+    // The lease drops (the close path's shape) — the release QUEUES.
+    drop(lease);
+
+    // Drain 1: the gate reads BUSY — the verb must NOT depart.
+    client.drain_releases().await;
+    {
+        let seen = calls.lock().expect("probe log");
+        assert!(
+            seen.iter().any(|&(i, t)| i == ino && t == token),
+            "the gate must be consulted with the releasing ino + its token \
+             (saw {seen:?})"
+        );
+    }
+    assert_eq!(
+        data_grant::stats().releases,
+        releases_before,
+        "a BUSY verdict must DEFER the release verb — an un-gated departure \
+         is exactly the ordering that served the flush's Put custody-less \
+         (finding 34)"
+    );
+
+    // Drain 2: quiescent — the requeued verb departs.
+    quiescent.store(true, Ordering::SeqCst);
+    client.drain_releases().await;
+    assert_eq!(
+        data_grant::stats().releases,
+        releases_before + 1,
+        "the quiescent drain ships the requeued release verb"
+    );
+
+    listener.shutdown();
+}

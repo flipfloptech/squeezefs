@@ -1254,11 +1254,18 @@ impl FileCustody {
                 // an in-between block the holder really wrote
                 // self-corrects through ITS OWN ack cycle (that pending's
                 // watermark lands inside it and mints its claim).
-                // `u64::MAX` = the shed-cache degradation: the whole span
-                // is potentially written — claim it all (conservative).
-                if watermark == u64::MAX {
-                    union_required_segment(&mut g.required_segments, (g.start, honest_end));
-                } else if watermark > 0 {
+                // `u64::MAX` = the shed-cache degradation: the whole
+                // span is potentially written, so the HULL holds it all
+                // (the resolution stays Demoted, no byte releases —
+                // release safety unchanged) — but it ATTESTS nothing and
+                // mints NO claim: roll 2's capture showed MAX acks under
+                // R5 shed pressure minting perfect whole-span claims,
+                // and every later peer ask inside them demoted (the
+                // fabrication, resurrected by degradation). Sharing
+                // state is UNKNOWN here; this pending's own demotion is
+                // the honest conservative vehicle, and the claim ledger
+                // stays honest asks only.
+                if watermark != u64::MAX && watermark > 0 {
                     let w_seg_start =
                         (watermark.saturating_sub(1) / pending.block.max(1)) * pending.block.max(1);
                     union_required_segment(

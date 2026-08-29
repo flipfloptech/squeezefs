@@ -1128,3 +1128,24 @@ cycle that wedged 59 minutes** (zero overdue warns), row 5.7 min.
   candidates: a shipped free abandoned on a wire retry edge, a fold's
   superseded mint dropped between allocate and publish, or an f24-
   shield refusal whose offset never re-entered anyone's ledger.
+
+## Finding 33/33b (red `51968d04`, fixes `8f52a974` + `9e825b71`): the orphaned own-mint blob
+
+Attempt 13's `[C2]` decoded: every invalidation path that removed a
+range-shared co-writer's cache entry discarded the ONLY holder of the
+"this mint is ours" bit (rung 20: the durable never adopts a shipped
+mint; the `old_indirect_to_free` tail was the reclaim, and it lived in
+the entry). `discard_layout_cache` is now the one discard funnel — all
+four removal sites route through it, and an outgoing own-mint head's
+blob is reclaimed at discard: LEDGER RECORD RELEASE first (f33b — the
+first oracle-forced probe showed freeing alone flips the leak into C8
+drift, records with zero layout references), then the detached block
+free (RES-1 honored), counted on `publish_blob_orphan_reclaims`.
+
+Oracle verification: the C8 face is CLEAN on the post-fix probe (the
+drift class was deterministic per-row) and the reclaim engages; the C2
+face is only measurable on a CLEAN row — a post-ABORT warm scan reads
+the aborted ranks' designed abandons (`cowriter.unpublished_abandons`)
+as leaks, which is why the matrix runs its oracle after green rows
+only. The clean-row C2 verdict belongs to the next cloud roll
+(per-run approval standing).

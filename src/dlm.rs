@@ -46,7 +46,9 @@ use xxhash_rust::xxh3::xxh3_64;
 // obligation, KD-MW-10; `#[path]`-included by `loom-models`). This module
 // keeps the POLICY: the lock table, the mint, the waiter protocol, the
 // R5 byte-budget ceiling and the geometry cap enforcement.
-pub use crate::range_custody_core::{block_align_out, range_span_cap, LockMode, ShrinkResolution};
+pub use crate::range_custody_core::{
+    block_align_out, clamp_segments_to_hull, range_span_cap, LockMode, ShrinkResolution,
+};
 
 /// Typed lock/fencing object key — the **file identity**.
 ///

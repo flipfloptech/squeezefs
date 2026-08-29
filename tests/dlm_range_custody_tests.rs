@@ -2787,3 +2787,47 @@ async fn a_strided_holders_required_hull_never_fabricates_a_demotion() {
 
     squeezefs::meta_ship::tokens::test_clear_range_cache();
 }
+
+/// Finding 31b (the capture loop's segments, roll 1): the §9.3a
+/// watermark RAISE at shrink resolution inflates the grant's required
+/// HULL past the holder's honest asks (the written watermark is one
+/// max over the whole grant — hull-shaped by construction), and the
+/// f31 segment clamp's raise arm copied that inflation into the
+/// classifier's claim segments — the captured mark's justifying
+/// segment spanned TWO whole blocks the holder never asked for
+/// ((1891.25, 1893.25) blocks), so a peer's aligned ask inside it
+/// demoted. The law: claim segments follow hull SHRINKS only
+/// (truncation — a shrunk claim is gone); a hull RAISE is the shrink-
+/// floor law's business (the ack race) and never mints classifier
+/// claim. Segments = honest asks ∩ hull.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hull_raise_never_mints_classifier_claim() {
+    use squeezefs::dlm::clamp_segments_to_hull;
+    // Honest asks: two 1 MiB claims in adjacent blocks.
+    let mut segs = vec![
+        (4 * MIB + MIB, 4 * MIB + 2 * MIB),
+        (8 * MIB + MIB, 8 * MIB + 2 * MIB),
+    ];
+    // The watermark raise lifted the hull's END two blocks past the last
+    // honest ask (and its start below the first).
+    clamp_segments_to_hull(&mut segs, (4 * MIB, 16 * MIB + MIB));
+    assert_eq!(
+        segs,
+        vec![
+            (4 * MIB + MIB, 4 * MIB + 2 * MIB),
+            (8 * MIB + MIB, 8 * MIB + 2 * MIB)
+        ],
+        "a hull RAISE mints no claim — the segments stay the honest asks \
+         (the captured mark's two-block phantom claim)"
+    );
+    // A hull SHRINK truncates (the shrunk claim is gone).
+    clamp_segments_to_hull(&mut segs, (4 * MIB, 8 * MIB + MIB + 512 * 1024));
+    assert_eq!(
+        segs,
+        vec![
+            (4 * MIB + MIB, 4 * MIB + 2 * MIB),
+            (8 * MIB + MIB, 8 * MIB + MIB + 512 * 1024)
+        ],
+        "a hull SHRINK truncates the claims"
+    );
+}

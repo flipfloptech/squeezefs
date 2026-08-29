@@ -998,3 +998,28 @@ unions only hull-touching requireds. Probe 6 (local, 8 co-writers):
 stayed silent) — the sustained failure is the laptop's thermal clamp
 (probe 4's standing adjudication; the cloud owns sustain). 144 tests
 green across the seven custody suites.
+
+## Attempt 12 (2026-08-28, binary `39fd9bb1` — f31 landed): ABORTED PRE-ROW — finding 32 (the assemble umount wedge)
+
+The user's skepticism caught it: the row never started. The cloud
+assemble wedged for ~59 minutes on `squeezefs umount` (the assemble's
+early mount/umount cycle): ONE FUSE op (`unique=86`, qid 0 ent 31,
+delivered at assemble start) sat unreplied the whole time —
+`transport_slots_overdue` warned every 5 s with the caller in
+uninterruptible sleep — while the REST of the mount kept serving (the
+stats inode read fine at capture). The umount's `fusermount3` child
+blocked behind the wedged inode; the driver's `--yes` chain never
+reached bench-mw. Cluster `sqzbench-20260828-211103` torn down at
+discovery (~$13 burned on a wedged assemble; the same commit's LOCAL
+assemble ran clean on probe 6, so the shape is cloud-venue-specific —
+device size / `--allow-other` / FLEET_SHARE=9 are the candidate
+deltas). Forensics archived at `/tmp/attempt12-wedge/` (811-line
+authority log, stats head, umount stack: `wait4` on fusermount3).
+
+**The lost-reply class is a first-class product bug** (the
+transport_slots_overdue family exists precisely for it). Red-loop next
+stretch: identify op 86's type from the log's early sequence, reproduce
+the assemble cycle locally with the cloud deltas
+(`--allow-other`, FLEET_SHARE=9), and pin the lost reply. Per the
+2026-08-28 mandate (AGENTS.md): NO further cloud run without expressed
+per-run approval — attempt 13 asks first.

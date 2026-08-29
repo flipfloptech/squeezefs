@@ -981,3 +981,20 @@ succession — either the re-join adopts/retires the predecessor epoch's
 grants (JoinFrame already carries `prior_epoch`), or the barrier
 resolves a DEAD-LEASE sharer by retiring the orphan (the sweep's act,
 inline) instead of demoting.
+
+## Finding 31 closed (red `edcc1d68`-series, fix `10949ead`); verified live on probe 6
+
+The strided-hull red (`a_strided_holders_required_hull_never_fabricates
+_a_demotion`) reproduced the class deterministically: a merged/stretched
+grant's required union stored as ONE span manufactures claim over
+blocks the holder never asked for, and the classifier demoted every
+share inside the bridge. Fix: honest per-ask claim SEGMENTS beside the
+hull (capped 8, closest-pair coalesce degrades toward the pre-f31
+behavior; every other law keeps the hull), the classifier demotes only
+on real segment intersection (tail shares shrink), the mint never
+claims whole foreign blocks of HEAD stretch, and the abutment merge
+unions only hull-touching requireds. Probe 6 (local, 8 co-writers):
+**zero demotion marks** through the full A1 churn (the forensics line
+stayed silent) — the sustained failure is the laptop's thermal clamp
+(probe 4's standing adjudication; the cloud owns sustain). 144 tests
+green across the seven custody suites.

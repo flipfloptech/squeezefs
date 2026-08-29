@@ -1066,3 +1066,18 @@ connection is dead, or the teardown closes/aborts the fuse fd promptly
 so the KERNEL fails the in-flight callers itself (the supervise path's
 FUSE-connection-abort precedent). Venue: the fork's own suite
 (`crates/fuse3`), late-delivery-after-shutdown contract.
+
+## Probes 7–8 of the f31/f32 train (2026-08-29): f32 landed; the f31 residual is intermittent ≤1/row
+
+Probe 7 (`10949ead`): fabricated demotions **3 → 1** per row; the
+survivor's mark named a cross-scope shape (ask under the AUTHORITY's own
+lease epoch 1 — its fold/assembly machinery — against a co-writer
+epoch's claim whose segments covered the ask's whole block). Probe 8
+(`32565380`, with f32's teardown residency + the claim-segment
+forensics column): **zero marks** — the survivor is intermittent, and
+the next firing will name its justifying claim verbatim. A1 opened at
+3,033 MiB/s (the campaign's highest); the sustained decays remain the
+laptop's thermal clamp (standing adjudication — the cloud owns
+sustain). f32's residency is merged (`4a5f1039`); its live verification
+is the assemble cycle, which the cloud venue exercises on the wedge
+window every time.

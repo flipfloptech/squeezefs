@@ -1050,3 +1050,19 @@ teardown): a DELIVERED ent must always receive SOME reply — the
 teardown must keep a reply path (ENOTCONN-class) for late-delivered
 ops until the connection is actually closed, never strand one. Local
 rolls never hit the window (timing); the cloud venue did.
+
+### Finding 32, the hole named (fork code walk): the drain is a snapshot, not a residency
+
+`FuseOverUring::shutdown` (FUSE-2 row 8) drains owed slots ONCE — but
+the kernel keeps the REGISTERed ents armed until the fd closes, so an
+op delivered AFTER the drain pass (the unmount's own final
+FLUSH/RELEASE) has no consumer: the worker has exited its loop, the
+overdue scanner warns forever, the kernel's unmount waits on the reply,
+and the daemon's exit waits on the unmount — the wedge triangle. The
+fix law (fork red loop, next stretch): between shutdown and the ACTUAL
+fd close, every delivered ent still gets a reply — either the worker's
+exit path keeps consuming CQEs and answering ENOTCONN until the
+connection is dead, or the teardown closes/aborts the fuse fd promptly
+so the KERNEL fails the in-flight callers itself (the supervise path's
+FUSE-connection-abort precedent). Venue: the fork's own suite
+(`crates/fuse3`), late-delivery-after-shutdown contract.

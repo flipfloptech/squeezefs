@@ -5767,6 +5767,21 @@ impl DataRouter {
                     {
                         let key = key.to_string();
                         let br = std::sync::Arc::clone(&self.backend_router);
+                        // f33b: the mint's LEDGER record may have committed
+                        // (a verbatim-served Put's take), so the complete
+                        // reclaim is release-the-record THEN free-the-block
+                        // — freeing alone left a C8 drift (a record with
+                        // zero layout references: the ledger lying is
+                        // worse than the leak). The release ships to the
+                        // ino's owner like every accounting act; a record
+                        // the compose already dropped releases as a no-op
+                        // (counted unresolved, never an error).
+                        let release = br.block_ref_for(
+                            &key,
+                            ino,
+                            crate::meta_backend::kv::block_refs::BLOCK_INDEX_MAP_BLOB,
+                        );
+                        let backend = self.inner.meta_backend.get().cloned();
                         METRICS
                             .publish_blob_orphan_reclaims
                             .fetch_add(1, Ordering::Relaxed);
@@ -5776,6 +5791,21 @@ impl DataRouter {
                              last holder)"
                         );
                         crate::meta_exec::spawn_meta("blob_orphan_reclaim", async move {
+                            if let (Some(be), Some(r)) = (backend, release) {
+                                if let Err(e) = crate::meta_ship::publish::commit_block_refs(
+                                    &be,
+                                    ino,
+                                    &[crate::meta_backend::kv::block_refs::BlockRefOp::released(r)],
+                                )
+                                .await
+                                {
+                                    log::warn!(
+                                        "finding 33: orphan-mint record release of '{key}' \
+                                         failed ({e}) — the free still runs (a lingering \
+                                         record is C8-visible, never data)"
+                                    );
+                                }
+                            }
                             if let Err(e) = br.free_block(&key).await {
                                 log::warn!(
                                     "finding 33: orphan-mint reclaim of '{key}' failed ({e}) — \

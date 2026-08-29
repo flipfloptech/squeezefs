@@ -179,9 +179,15 @@ pub fn union_required_segment(segs: &mut Vec<(u64, u64)>, ask: (u64, u64)) {
     }
 }
 
-/// Clamp `segs` to `hull` (the shrink/raise laws mutate the hull; the
-/// segments follow — truncated at the new end, and a RAISED end extends
-/// the last segment, the covered-serve watermark's continuity-of-claim).
+/// Clamp `segs` to `hull` — SHRINK-ONLY (finding 31b): a hull shrink
+/// truncates the claims (a shrunk claim is gone), and a hull RAISE
+/// mints NO claim — the §9.3a watermark raise is hull-shaped by
+/// construction (one `written` max over the whole grant), so copying it
+/// into the segments handed the classifier whole blocks the holder
+/// never asked for (the captured two-block phantom claim; a peer's
+/// aligned ask inside it demoted — the last fabrication class). The
+/// raise's own law (the shrink-floor ack race) reads the HULL, which
+/// keeps rising exactly as before; the segments stay the honest asks.
 pub fn clamp_segments_to_hull(segs: &mut Vec<(u64, u64)>, hull: (u64, u64)) {
     segs.retain_mut(|seg| {
         seg.0 = seg.0.max(hull.0);
@@ -189,18 +195,9 @@ pub fn clamp_segments_to_hull(segs: &mut Vec<(u64, u64)>, hull: (u64, u64)) {
         seg.0 < seg.1
     });
     if segs.is_empty() {
+        // Every honest ask was truncated away: the hull itself is the
+        // only claim statement left (the conservative pre-f31 shape).
         segs.push(hull);
-        return;
-    }
-    if let Some(last) = segs.last_mut() {
-        if hull.1 > last.1 {
-            last.1 = hull.1;
-        }
-    }
-    if let Some(first) = segs.first_mut() {
-        if hull.0 < first.0 {
-            first.0 = hull.0;
-        }
     }
 }
 
@@ -1249,6 +1246,26 @@ impl FileCustody {
                 // barrier arbitrate the still-contested blocks.
                 g.end = honest_end;
                 g.required.1 = g.required.1.max(watermark.min(honest_end));
+                // Finding 31b: the ack's watermark ATTESTS writes, but
+                // only its own block is provably written (the watermark
+                // is a MAX — the gap between the last honest ask and the
+                // watermark's block is unknown, and claiming it was the
+                // captured two-block phantom). Mint the attested segment;
+                // an in-between block the holder really wrote
+                // self-corrects through ITS OWN ack cycle (that pending's
+                // watermark lands inside it and mints its claim).
+                // `u64::MAX` = the shed-cache degradation: the whole span
+                // is potentially written — claim it all (conservative).
+                if watermark == u64::MAX {
+                    union_required_segment(&mut g.required_segments, (g.start, honest_end));
+                } else if watermark > 0 {
+                    let w_seg_start =
+                        (watermark.saturating_sub(1) / pending.block.max(1)) * pending.block.max(1);
+                    union_required_segment(
+                        &mut g.required_segments,
+                        (w_seg_start.max(g.start), watermark.min(honest_end)),
+                    );
+                }
                 clamp_segments_to_hull(&mut g.required_segments, g.required);
                 (
                     old_len,

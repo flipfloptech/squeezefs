@@ -5782,6 +5782,7 @@ impl DataRouter {
                             crate::meta_backend::kv::block_refs::BLOCK_INDEX_MAP_BLOB,
                         );
                         let backend = self.inner.meta_backend.get().cloned();
+                        let router = self.clone();
                         METRICS
                             .publish_blob_orphan_reclaims
                             .fetch_add(1, Ordering::Relaxed);
@@ -5791,6 +5792,15 @@ impl DataRouter {
                              last holder)"
                         );
                         crate::meta_exec::spawn_meta("blob_orphan_reclaim", async move {
+                            // f33c (attempt 14's 12 C8 drifts): the discard
+                            // can land while THIS MOUNT's publish naming the
+                            // mint's TAKE is still in flight — a release
+                            // racing ahead of its own take no-ops, the take
+                            // then lands, and the record lies forever.
+                            // Quiesce the ino's publish pipeline first: after
+                            // the drain, every take this mount minted has
+                            // landed, so the release resolves.
+                            router.quiesce_ino_meta(ino).await;
                             if let (Some(be), Some(r)) = (backend, release) {
                                 if let Err(e) = crate::meta_ship::publish::commit_block_refs(
                                     &be,

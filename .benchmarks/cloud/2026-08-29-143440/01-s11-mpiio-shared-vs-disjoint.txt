@@ -1,0 +1,33 @@
+# row=s11-mpiio-shared-vs-disjoint
+# order=1
+# instrument=pinned ior 4.0.0 + mpirun (exact versions in the leg output below)
+# substrate=aws-on-demand/i4i.8xlarge/us-east-1a/pg-cluster (instance-store NVMe over nvmet-tcp, single NIC) — cloud substrate (third class — never spliced into devsub medians)
+# venue=cloud-bench-cluster/mw cluster=sqzbench-20260829-142849 cowriters=8 procs=4
+# ts=2026-08-29T18:34:44Z
+# cmd=SQZ_BIN=/opt/squeezefs-bench/squeezefs SQZ_MWMATRIX_MOUNTS=/scratch/mnt,/scratch/mnt-cw1,/scratch/mnt-cw2,/scratch/mnt-cw3,/scratch/mnt-cw4,/scratch/mnt-cw5,/scratch/mnt-cw6,/scratch/mnt-cw7,/scratch/mnt-cw8 SQZ_MWMATRIX_ROWDIR=/opt/squeezefs-bench/mw-rows bash /opt/squeezefs-bench/repo/tests/run_mw_matrix.sh s11-mpiio --procs=4
+[mwmatrix] external mounts verified: authority=/scratch/mnt (posture=writer, fence_mode=1, membership=owner) + 8 co-writers (posture=co-writer, membership=member)
+[mwmatrix] fetching pinned ior 4.0.0
+[mwmatrix] pinned ior 4.0.0 ready (/opt/squeezefs-bench/repo/target/mw-ior/ior-4.0.0/src/ior, sha256 510b7d4ad0f287375848121aa5a1f9842db077c1d81ad0dde738e96255298158)
+[mwmatrix] s11-mpiio: 8 co-writer mounts x 4 procs = 32 ranks, ONE shared file, 4 MiB-aligned block-cyclic segments (ior 4.0.0 POSIX MPMD, -G 503288571); baseline = -F file-per-proc, SAME fleet/geometry; A-B-B-A
+[mwmatrix] instrument: ior 4.0.0 (sha256 510b7d4ad0f287375848121aa5a1f9842db077c1d81ad0dde738e96255298158) + --------------------------------------------------------------------------; substrate: EXTERNAL mounts (/scratch/mnt,/scratch/mnt-cw1,/scratch/mnt-cw2,/scratch/mnt-cw3,/scratch/mnt-cw4,/scratch/mnt-cw5,/scratch/mnt-cw6,/scratch/mnt-cw7,/scratch/mnt-cw8) — the row's substrate/tier is the HARNESS's to state (a real-fabric field row is a different evidence tier from the local fleet's measured-simulated rows; docs/rc-manifest.md)
+[mwmatrix] range-custody conviction: every co-writer's ranged ledger moved across the probe pass
+[mwmatrix] self-sizer wanted 41728 MiB — CAPPED to 10240 MiB (s=80): the 10 GiB zram-budget clamp (the indirect domain COMPOSES now — the rung-20 blob-aware owner-side merge; this cap is substrate budget, not a correctness boundary). Iteration ceiling raised to 128 to preserve the sustained window.
+[mwmatrix] probe: 1900.60 MiB/s aggregate -> file 10240 MiB (s=80), 14 iterations/phase (sustained window sized >=60 s + >=3 steady iterations)
+[mwmatrix] phase A1 (shared): steady 2008.9 MiB/s over 72s wall (iters: 1964.29 1716.93 2099.90 1774.87 2137.37 2072.18 2046.40 1974.99 2030.64 2026.57 2072.22 2061.36 2111.38 1990.90 )
+[mwmatrix] phase B1 (fpp): steady 1940.3 MiB/s over 74s wall (iters: 1955.83 1951.30 1916.33 1952.94 1969.15 1929.45 1962.39 1928.98 1949.68 1922.39 1912.39 1962.65 1940.04 1926.23 )
+[mwmatrix] phase B2 (fpp): steady 1920.4 MiB/s over 75s wall (iters: 1972.51 1910.20 1952.50 1857.99 1933.56 1936.67 1923.49 1935.24 1937.76 1952.68 1911.95 1895.22 1895.10 1922.63 )
+[mwmatrix] phase A2 (shared): steady 1881.3 MiB/s over 81s wall (iters: 1770.79 1890.65 921.33 2094.10 2105.86 2106.00 2086.30 2082.59 2090.54 2051.02 1182.04 1754.40 2107.13 1984.71 )
+A-B-B-A: shared 2009 / disjoint 1940 = 1.035; shared 1881 / disjoint 1920 = 0.980
+S11 MPI-IO GATE: shared >= 0.8x disjoint in BOTH brackets (min 0.980)
+m50: ranged acquires+extensions d=15389 publish shipped d=96666
+m51: ranged acquires+extensions d=15196 publish shipped d=96601
+m52: ranged acquires+extensions d=15238 publish shipped d=97477
+m53: ranged acquires+extensions d=15303 publish shipped d=96708
+m54: ranged acquires+extensions d=15162 publish shipped d=97268
+m55: ranged acquires+extensions d=15313 publish shipped d=97433
+m56: ranged acquires+extensions d=15347 publish shipped d=97495
+m57: ranged acquires+extensions d=15326 publish shipped d=97114
+authority: grants d=22277 cap_refusals d=0 demotions d=0 conflicts d=1 desired_trims d=191 prs d=0 ors d=0
+S11 MPI-IO engagement GREEN (ranged engaged on every mount, Issue-19 column 0, zero fabricated sharing)
+[mwmatrix] read-back exact: 38981 MiB/s aggregate reorder-read, zero data-check errors
+[mwmatrix] external mounts: WARM-authority fsck oracle (no remount owner; the local fleet leg's oracle is cold-remounted)

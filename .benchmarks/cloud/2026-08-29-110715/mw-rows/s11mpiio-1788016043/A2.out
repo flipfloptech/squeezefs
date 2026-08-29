@@ -1,0 +1,111 @@
+IOR-4.0.0: MPI Coordinated Test of Parallel I/O
+Began               : Sat Aug 29 15:11:32 2026
+Command line        : /opt/squeezefs-bench/repo/target/mw-ior/ior-4.0.0/src/ior -a POSIX -b 4m -t 4m -s 80 -w -e -k -E -G 788438700 -i 14 -o /scratch/mnt-cw1/s11-mpiio.dat
+Machine             : Linux ip-172-31-16-183
+TestID              : 0
+StartTime           : Sat Aug 29 15:11:32 2026
+Path                : /scratch/mnt-cw1/s11-mpiio.dat
+FS                  : 13.6 TiB   Used FS: 6.5%   Inodes: 1.0 Mi   Used Inodes: 0.0%
+
+Options: 
+api                 : POSIX
+apiVersion          : 
+test filename       : /scratch/mnt-cw1/s11-mpiio.dat
+access              : single-shared-file
+type                : independent
+segments            : 80
+ordering in a file  : sequential
+ordering inter file : no tasks offsets
+nodes               : 1
+tasks               : 32
+clients per node    : 32
+repetitions         : 14
+xfersize            : 4 MiB
+blocksize           : 4 MiB
+aggregate filesize  : 10 GiB
+
+Results: 
+WARNING: The file "/scratch/mnt-cw1/s11-mpiio.dat" exists already and will be overwritten
+
+access    bw(MiB/s)  IOPS       Latency(s)  block(KiB) xfer(KiB)  open(s)    wr/rd(s)   close(s)   total(s)   iter
+------    ---------  ----       ----------  ---------- ---------  --------   --------   --------   --------   ----
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 10737418240
+WARNING: Stat() of aggregate file size      = 10619977728
+WARNING: Using actual aggregate bytes moved = 10737418240
+write     2115.07    528.80     4.75        4096       4096       0.000891   4.84       2.36       4.84       0   
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 10737418240
+WARNING: Stat() of aggregate file size      = 10619977728
+WARNING: Using actual aggregate bytes moved = 10737418240
+write     1749.06    437.29     4.96        4096       4096       0.000358   5.85       2.52       5.85       1   
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 10737418240
+WARNING: Stat() of aggregate file size      = 10619977728
+WARNING: Using actual aggregate bytes moved = 10737418240
+write     2102.23    525.58     4.87        4096       4096       0.000256   4.87       1.65       4.87       2   
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 10737418240
+WARNING: Stat() of aggregate file size      = 10619977728
+WARNING: Using actual aggregate bytes moved = 10737418240
+write     2085.05    521.29     4.64        4096       4096       0.000230   4.91       1.35       4.91       3   
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 10737418240
+WARNING: Stat() of aggregate file size      = 10619977728
+WARNING: Using actual aggregate bytes moved = 10737418240
+write     2082.28    520.60     4.54        4096       4096       0.000551   4.92       1.14       4.92       4   
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 10737418240
+WARNING: Stat() of aggregate file size      = 10619977728
+WARNING: Using actual aggregate bytes moved = 10737418240
+write     2082.53    520.67     4.48        4096       4096       0.000287   4.92       1.70       4.92       5   
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 10737418240
+WARNING: Stat() of aggregate file size      = 10619977728
+WARNING: Using actual aggregate bytes moved = 10737418240
+write     2090.94    522.76     3.80        4096       4096       0.000801   4.90       2.52       4.90       6   
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 10737418240
+WARNING: Stat() of aggregate file size      = 10619977728
+WARNING: Using actual aggregate bytes moved = 10737418240
+write     2103.66    525.94     4.44        4096       4096       0.000296   4.87       0.999593   4.87       7   
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 10737418240
+WARNING: Stat() of aggregate file size      = 10619977728
+WARNING: Using actual aggregate bytes moved = 10737418240
+write     2103.62    525.94     4.20        4096       4096       0.000264   4.87       1.33       4.87       8   
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: fsync(15) failed
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 10737418240
+WARNING: Stat() of aggregate file size      = 10619977728
+WARNING: Using actual aggregate bytes moved = 10737418240
+write     2078.49    523.47     4.82        4096       4096       0.000413   4.89       1.50       4.93       9   
+WARNING: fsync(15) failed
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 10737418240
+WARNING: Stat() of aggregate file size      = 10619977728
+WARNING: Using actual aggregate bytes moved = 10737418240
+write     1823.52    455.90     4.86        4096       4096       0.000261   5.62       2.01       5.62       10  
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 10737418240
+WARNING: Stat() of aggregate file size      = 10619977728
+WARNING: Using actual aggregate bytes moved = 10737418240
+write     2091.88    522.99     4.34        4096       4096       0.000262   4.89       2.56       4.90       11  
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 10737418240
+WARNING: Stat() of aggregate file size      = 10619977728
+WARNING: Using actual aggregate bytes moved = 10737418240
+write     2076.63    519.19     4.83        4096       4096       0.000460   4.93       1.79       4.93       12  
+WARNING: inconsistent file size by different tasks
+WARNING: Expected aggregate file size       = 10737418240
+WARNING: Stat() of aggregate file size      = 10619977728
+WARNING: Using actual aggregate bytes moved = 10737418240
+write     2102.62    525.68     4.74        4096       4096       0.000249   4.87       1.64       4.87       13  
+
+Summary of all tests:
+Operation   Max(MiB)   Min(MiB)  Mean(MiB)     StdDev   Max(OPs)   Min(OPs)  Mean(OPs)     StdDev    Mean(s) Stonewall(s) Stonewall(MiB) Test# #Tasks tPN reps fPP reord reordoff reordrand seed segcnt   blksiz    xsize aggs(MiB)   API RefNum
+write        2115.07    1749.06    2049.11     108.76     528.77     437.26     512.28      27.19    5.01316         NA            NA     0     32  32   14   0     0        1         0    0     80  4194304  4194304   10240.0 POSIX      0
+Finished            : Sat Aug 29 15:12:42 2026

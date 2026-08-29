@@ -1,0 +1,8 @@
+Warning: SQZ_BIN is not a SqueezeFS knob (typo? `src/env_knobs.rs` is the registry) — ignored
+Warning: SQZ_MWMATRIX_MOUNTS is not a SqueezeFS knob (typo? `src/env_knobs.rs` is the registry) — ignored
+Warning: SQZ_MWMATRIX_ROWDIR is not a SqueezeFS knob (typo? `src/env_knobs.rs` is the registry) — ignored
+fsck job 0473607f-0ca6-4cba-827c-a431fd3914df running (report-only; watch `squeezefs job list`)…
+fsck (online mode): 14 inode(s), 6 tree page(s), 7442 block(s), 2 refcount(s) checked in 5 s
+suspects: 13 raised, 12 cleared (0 epoch-exempt, 0 in-flight-exempt, 0 mover-ledger-exempt)
+findings: 1:
+  [C2] nvme5n1:3288334336 — leaked block: allocated (tracked) with zero referencers, registry-cleared across two scan epochs

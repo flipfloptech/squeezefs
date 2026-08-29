@@ -1098,3 +1098,33 @@ own ack cycle); the MAX ack keeps the hull whole (release safety — the
 resolution stays Demoted, no byte releases) and mints no claim.
 **Verification from zero: 3/3 rolls with ZERO demotion marks** (the
 pre-fix rate was 3/row on attempt 11, 0–3/row on the capture rolls).
+
+## Attempt 13 (2026-08-29, binary `7da4837e` — f31b+f32 landed): PERF PASSED + ENGAGEMENT GREEN; one C2 leak (finding 33)
+
+Cluster `sqzbench-20260829-110202` (1 h guard, per-phase watch; billed
+life ~25 min ≈ $4.6; rows `.benchmarks/cloud/2026-08-29-110715/`).
+Every phase-watch budget held: launch 51 s, deploy 59 s, assemble
+**3 min — the f32 residency's live verification on the exact venue and
+cycle that wedged 59 minutes** (zero overdue warns), row 5.7 min.
+
+* **Perf: PASSED** — A-B-B-A 0.922 / 1.060 (min 0.922 vs the 0.8
+  floor), all four phases flat (B-phases 1,927/1,928 dead flat; A2
+  2,044 steady).
+* **ENGAGEMENT: GREEN — the first fully valid engagement screen of the
+  campaign**: ranged custody engaged on every mount (~15.3k acquires ×
+  8), zero cap refusals, **zero demotions, zero fabricated sharing,
+  prs/ors 0** (findings 22/23/24/25/26/27/27b/28/30/31/31b all verified
+  live at once), conflicts 2, desired_trims 184 (the teacher working).
+* **Data: read-back exact** (39.9 GB/s aggregate reorder-read, zero
+  check errors).
+* **Finding 33 — the row's ONE red**: the post-run fsck oracle found
+  `[C2] nvme5n1:3288334336 — leaked block: allocated (tracked) with
+  zero referencers, registry-cleared across two scan epochs` — ONE
+  4 MiB block leaked across ~780k shipped publishes (leak-safe: space,
+  never data; the C2 ladder is zero-FP by construction). The local
+  probes never reached this gate (they die at the thermal sustained
+  gate first), so the class is newly visible. Red-loop shape: a
+  displaced/superseded block whose terminal free never completed —
+  candidates: a shipped free abandoned on a wire retry edge, a fold's
+  superseded mint dropped between allocate and publish, or an f24-
+  shield refusal whose offset never re-entered anyone's ledger.

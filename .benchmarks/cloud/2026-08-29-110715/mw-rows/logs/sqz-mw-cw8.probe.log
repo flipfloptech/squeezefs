@@ -1,0 +1,44 @@
+SqueezeFS version 1.1.0 (7da4837e8443 / 7da4837e8443f4d45c52909f967d57ac1a0e7d34) built 2026-08-29T14:45:10Z
+======================================================================
+  Mount Configuration Summary
+----------------------------------------------------------------------
+  Volume Name:         squeezefs
+  Capacity:            13.64 TiB
+  Block Size:          4.00 MiB
+  Compression:         none
+  Encryption:          none
+----------------------------------------------------------------------
+Metadata Volumes:
+  - [enabled] /dev/nvme3n1 (health: 1000)
+Data Volumes:
+  - [enabled] /dev/nvme4n1 (health: 1000)
+  - [enabled] /dev/nvme5n1 (health: 1000)
+  - [enabled] /dev/nvme6n1 (health: 1000)
+  - [enabled] /dev/nvme7n1 (health: 1000)
+----------------------------------------------------------------------
+Cache/Staging:
+  Memory Cache Size:   1GB
+  Disk Cache Size:     10GB
+  Staging Paths:       /scratch/cache
+----------------------------------------------------------------------
+Mount Options:
+  Mountpoint:          "/scratch/mnt-cw8"
+  Writeback Cache:     enabled
+  Allow Other:         enabled
+======================================================================
+Mounting as a CO-WRITER (DLM stage S9): this mount holds NO metadata authority — every metadata mutation ships to the authority that holds the D0 claim — and writes data only under custody that authority grants. Admission runs a five-rung ladder and refuses loudly naming the rung; see docs/operations.md §Multi-writer co-writer mounts.
+[2026-08-29T15:05:14Z INFO  squeezefs::nvme_dev] data volume /dev/nvme4n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-08-29T15:05:14Z INFO  squeezefs] writer-scoped staging ENGAGED: client scope w_e56e47de7cb413eb.me2d0c742 (staging generation "v3:1a3f02f98053433d97c4f5d422879878@node:e56e47de7cb413eb.me2d0c742") — staging keys carry the scope and this client's staging roots are bound to it
+[2026-08-29T15:05:29Z INFO  squeezefs::cache::gds] GPU Direct Storage: No discrete GPU environment found. GDS bypassed.
+STAGING GENERATION MISMATCH at /scratch/cache/squeezefs/scratch_mnt_cw8: discarding staging content from a dead filesystem generation (no readable generation marker, mounted generation "v3:1a3f02f98053433d97c4f5d422879878@node:e56e47de7cb413eb.me2d0c742") — removed 0 staging segment file(s) (0 bytes), 16 read-cache segment file(s) (5368709120 bytes), 0 gds cache file(s) (0 bytes); staged writes and active blocks stamped by the old generation are gone by design (reformat discards data)
+[2026-08-29T15:05:29Z WARN  squeezefs::cache::nvme] STAGING GENERATION MISMATCH at /scratch/cache/squeezefs/scratch_mnt_cw8: discarding staging content from a dead filesystem generation (no readable generation marker, mounted generation "v3:1a3f02f98053433d97c4f5d422879878@node:e56e47de7cb413eb.me2d0c742") — removed 0 staging segment file(s) (0 bytes), 16 read-cache segment file(s) (5368709120 bytes), 0 gds cache file(s) (0 bytes); staged writes and active blocks stamped by the old generation are gone by design (reformat discards data)
+[2026-08-29T15:05:29Z INFO  squeezefs] Registering data volume 'nvme4n1' at path /dev/nvme4n1 (state active)
+[2026-08-29T15:05:29Z INFO  squeezefs] Registering data volume 'nvme5n1' at path /dev/nvme5n1 (state active)
+[2026-08-29T15:05:29Z INFO  squeezefs::nvme_dev] data volume /dev/nvme5n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-08-29T15:05:29Z INFO  squeezefs] Registering data volume 'nvme6n1' at path /dev/nvme6n1 (state active)
+[2026-08-29T15:05:29Z INFO  squeezefs::nvme_dev] data volume /dev/nvme6n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-08-29T15:05:29Z INFO  squeezefs] Registering data volume 'nvme7n1' at path /dev/nvme7n1 (state active)
+[2026-08-29T15:05:29Z INFO  squeezefs::nvme_dev] data volume /dev/nvme7n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-08-29T15:05:29Z ERROR squeezefs::cowriter] co-writer admission REFUSED at rung 3: the durable claim set on /dev/nvme3n1 does not name this node 'node_e56e47de7cb413eb.me2d0c742'. Admission is by durable ENROLLMENT, never by a claim a joining node makes about itself: the `claim_set` record is a metadata commit, and a co-writer holds no metadata authority, so it CANNOT enroll itself. Add 'node_e56e47de7cb413eb.me2d0c742' to the AUTHORITY's SQUEEZEFS_MW_MEMBERS roster and re-arm it (one durable entry per rostered node, §6.2 item 7), then remount this node
+[91mERROR[0m mount refused: Invalid operation: co-writer admission REFUSED at rung 3: the durable claim set on /dev/nvme3n1 does not name this node 'node_e56e47de7cb413eb.me2d0c742'. Admission is by durable ENROLLMENT, never by a claim a joining node makes about itself: the `claim_set` record is a metadata commit, and a co-writer holds no metadata authority, so it CANNOT enroll itself. Add 'node_e56e47de7cb413eb.me2d0c742' to the AUTHORITY's SQUEEZEFS_MW_MEMBERS roster and re-arm it (one durable entry per rostered node, §6.2 item 7), then remount this node
+Error: InvalidOperation("co-writer admission REFUSED at rung 3: the durable claim set on /dev/nvme3n1 does not name this node 'node_e56e47de7cb413eb.me2d0c742'. Admission is by durable ENROLLMENT, never by a claim a joining node makes about itself: the `claim_set` record is a metadata commit, and a co-writer holds no metadata authority, so it CANNOT enroll itself. Add 'node_e56e47de7cb413eb.me2d0c742' to the AUTHORITY's SQUEEZEFS_MW_MEMBERS roster and re-arm it (one durable entry per rostered node, §6.2 item 7), then remount this node")

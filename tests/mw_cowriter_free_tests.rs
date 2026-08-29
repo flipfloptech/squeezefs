@@ -3879,3 +3879,105 @@ async fn the_freed_retire_restores_the_word_under_a_new_generation() {
     drop(cwr);
     auth.stop().await;
 }
+
+// ===========================================================================
+// 13. Finding 33 — an invalidation never orphans the shipper's own mint
+// ===========================================================================
+
+/// Finding 33 (attempt 13's ONE fsck finding — `[C2] leaked block:
+/// allocated with zero referencers`): on a RANGE-SHARED ino the owner's
+/// compose never adopts a shipped blob (rung 20: "it stays the shipper's
+/// own lifecycle — its `old_indirect_to_free` tail reclaims it"), and the
+/// f23 provenance gate correctly stops the shipper from freeing
+/// REFETCHED heads. But the reclamation tail lives in the CACHE ENTRY:
+/// when the served-layout invalidation lands between a blob mint and the
+/// next save, the REFETCH replaces the entry that knew the mint was ours
+/// (`block_map_id_own_mint` = true) with the owner-composed head
+/// (own_mint = false) — and the mint is ORPHANED forever (no live path
+/// frees it; only fsck C2 ever sees it again). The law: replacing an
+/// own-mint head with a DIFFERENT refetched head on a range-shared ino
+/// reclaims the outgoing mint at replacement time — safe BY the rung-20
+/// law (the durable never names a shipped blob on the compose path), and
+/// counted (`publish_blob_orphan_reclaims`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_invalidation_never_orphans_the_shippers_own_blob_mint() {
+    let _serial = serial();
+    let _restore = restore();
+    squeezefs::meta_ship::tokens::test_clear_range_cache();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "f33-orphan").await;
+    let dev = data_device(dir.path(), "f33-orphan.dev");
+    let auth = Authority::start(&vol, &dev, &[NODE_A]).await;
+    let ino = authority_file_with_block(&auth, "orphan.bin", 0).await;
+
+    let cwr = CoWriter::join(&auth, &vol, &dev, NODE_A).await;
+    let stage = tempdir().unwrap();
+    let dlm = DlmClient::new().expect("dlm");
+    let router = save_router(&dlm, &cwr.alloc, &dev, &cwr.meta, stage.path()).await;
+    squeezefs::meta_ship::tokens::record_range_grant(ino, (0, 4 * 1024 * 1024), 9033);
+
+    // Save 1: the over-cap map MINTS this mount's own blob (the f23
+    // keep-direction fixture).
+    let mut big = std::collections::HashMap::new();
+    for i in 0..900u32 {
+        big.insert(i, format!("be://data:k{i:05}"));
+    }
+    router.metadata_cache.insert(
+        ino,
+        CachedMetadata {
+            file_type: "striped".into(),
+            size: 4 * 1024 * 1024,
+            block_map: Some(std::sync::Arc::new(big)),
+            layout_dirty: true,
+            layout_delta_chain: LAYOUT_DELTA_CHAIN_INELIGIBLE,
+            ..Default::default()
+        },
+    );
+    let tok = dlm.get_fencing_token_ino(ino);
+    router
+        .persist_dirty_layout_if_needed(&format!("inode_{ino}"), tok)
+        .await
+        .expect("the over-cap save mints and ships");
+    let minted = router
+        .metadata_cache
+        .get(&ino)
+        .and_then(|m| m.block_map_id.clone())
+        .expect("save 1 republished an indirect head");
+    let minted_key = minted
+        .strip_prefix("indirect:")
+        .expect("indirect head")
+        .to_string();
+    let minted_off: u64 = minted_key.parse().expect("plain offset key in this rig");
+    let minted_idx = minted_off / cwr.alloc.chunk_size();
+
+    // The served-layout invalidation lands (the hook's act), and the next
+    // touch REFETCHES the durable head — the owner-composed truth, which
+    // NEVER names the shipped mint on the compose path. The entry that
+    // knew the mint was ours is replaced.
+    router.metadata_cache.remove(&ino);
+    let refetched = router
+        .fetch_metadata(&format!("inode_{ino}"))
+        .await
+        .expect("the refetch lands");
+    assert_ne!(
+        refetched.block_map_id.as_deref(),
+        Some(minted.as_ref()),
+        "fixture: the durable head is NOT the shipped mint (rung 20's law)"
+    );
+
+    // The law: the replacement reclaimed the orphan — its offset returns
+    // to the shared free supply (the shipped free's untracked→seed→Freed
+    // arm). Today NOTHING frees it: fsck C2 is the only observer left
+    // (attempt 13's leaked block).
+    auth.br.reclaim_drain().await;
+    assert!(
+        auth.free_listed(minted_idx),
+        "the shipper's own mint (offset {minted_off}) must return to the free \
+         supply when the refetch replaces its owning entry — the orphan is \
+         finding 33's leaked block"
+    );
+
+    squeezefs::meta_ship::tokens::test_clear_range_cache();
+    drop(cwr);
+    auth.stop().await;
+}

@@ -1081,3 +1081,20 @@ laptop's thermal clamp (standing adjudication — the cloud owns
 sustain). f32's residency is merged (`4a5f1039`); its live verification
 is the assemble cycle, which the cloud venue exercises on the wedge
 window every time.
+
+## Finding 31b closed (red `1566a53c`, fixes `ec149eef` + `d751e3ea`): the last fabrication class
+
+Path-1 capture rolls named BOTH residual mints from the claim-segment
+forensics: (a) the shrink-ack's written-tail raise unioned
+(old required end → watermark) into the claim — the watermark is a MAX
+over the whole grant, so strided holders claimed in-between blocks they
+never touched; (b) under R5 shed pressure the `u64::MAX` degradation
+ack minted perfect whole-span claims from an attestation of NOTHING
+(roll 2's capture: three hull-shaped segments, venue at its memory
+wall). Fix: the segment clamp is SHRINK-ONLY; the written-tail arm
+mints the ATTESTED segment (the watermark's own block — provably
+written; an in-between truly-written block self-corrects through its
+own ack cycle); the MAX ack keeps the hull whole (release safety — the
+resolution stays Demoted, no byte releases) and mints no claim.
+**Verification from zero: 3/3 rolls with ZERO demotion marks** (the
+pre-fix rate was 3/row on attempt 11, 0–3/row on the capture rolls).

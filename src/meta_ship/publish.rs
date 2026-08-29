@@ -2877,9 +2877,7 @@ impl PublishService {
         };
         let spans = match owner.client_custody_on(client, ino) {
             crate::data_grant::ClientCustodyShape::Ranges(spans) => spans,
-            crate::data_grant::ClientCustodyShape::None
-                if owner.ino_has_range_grants(ino) =>
-            {
+            crate::data_grant::ClientCustodyShape::None if owner.ino_has_range_grants(ino) => {
                 // Finding 34 (the s11-blockcyclic C8/C2 storm's root): a
                 // full Put from a client with NO grants on an ino OTHER
                 // holders hold ranges on. Applied verbatim (the pre-f34

@@ -3641,8 +3641,7 @@ impl WriteCustodyClient {
                         *t = (*t).max(token);
                     }
                 }
-                let mut deferred: std::collections::HashSet<u64> =
-                    std::collections::HashSet::new();
+                let mut deferred: std::collections::HashSet<u64> = std::collections::HashSet::new();
                 for (&ino, &token) in &inos {
                     if !gate(ino, token) {
                         deferred.insert(ino);

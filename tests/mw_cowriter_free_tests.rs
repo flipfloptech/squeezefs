@@ -4075,7 +4075,12 @@ async fn a_custodyless_put_on_a_range_held_ino_refuses_instead_of_clobbering() {
         .await
         .expect("the peer dials the custody authority");
     let peer_grant = match peer
-        .acquire_range(ino, (0, 4 * 1024 * 1024), (0, 4 * 1024 * 1024), Duration::from_secs(3))
+        .acquire_range(
+            ino,
+            (0, 4 * 1024 * 1024),
+            (0, 4 * 1024 * 1024),
+            Duration::from_secs(3),
+        )
         .await
         .expect("the peer's ranged grant")
     {
@@ -4085,8 +4090,7 @@ async fn a_custodyless_put_on_a_range_held_ino_refuses_instead_of_clobbering() {
 
     // The grant-less client's STALE full Put (idx 1 gone — the reverting
     // clobber): it must REFUSE, counted, with the durable head untouched.
-    let refusals_before = squeezefs::meta_ship::publish::stats_json()
-        ["unscoped_put_refusals"]
+    let refusals_before = squeezefs::meta_ship::publish::stats_json()["unscoped_put_refusals"]
         .as_u64()
         .unwrap_or(0);
     let stale = head(vec![(0u32, key_a.clone())]);
@@ -4095,8 +4099,7 @@ async fn a_custodyless_put_on_a_range_held_ino_refuses_instead_of_clobbering() {
         out.is_err(),
         "a custody-less full Put on a range-held ino must refuse (finding 34) — got {out:?}"
     );
-    let refusals_after = squeezefs::meta_ship::publish::stats_json()
-        ["unscoped_put_refusals"]
+    let refusals_after = squeezefs::meta_ship::publish::stats_json()["unscoped_put_refusals"]
         .as_u64()
         .unwrap_or(0);
     assert_eq!(

@@ -795,6 +795,8 @@ static EXTENT_REPLAYS: AtomicU64 = AtomicU64::new(0);
 static EXTENT_STALE_REFUSALS: AtomicU64 = AtomicU64::new(0);
 static EXTENT_FLUSH_FORCES: AtomicU64 = AtomicU64::new(0);
 static EXTENT_SPILLS: AtomicU64 = AtomicU64::new(0);
+// Finding 34: the custody-less-Put shield's engagement (must stay 0).
+static UNSCOPED_PUT_REFUSALS: AtomicU64 = AtomicU64::new(0);
 
 /// The at-budget W2 spill's counter (incremented by
 /// [`crate::extent_ship`]'s spill arm — release path 4's engagement).
@@ -886,6 +888,11 @@ pub struct PublishStats {
     pub extent_flush_forces: u64,
     /// At-budget W2 spills of retained extents (release path 4).
     pub extent_spills: u64,
+    /// Finding 34: range-custody-less full Puts REFUSED on an ino other
+    /// writers hold ranges on (the verbatim-clobber shield). **Must stay
+    /// 0** — growth means some client shipped a layout publish after its
+    /// range release outran it (the rung-1 drain ordering broken).
+    pub unscoped_put_refusals: u64,
 }
 
 /// Read the publish ledger.
@@ -914,6 +921,7 @@ pub fn stats() -> PublishStats {
         extent_stale_refusals: EXTENT_STALE_REFUSALS.load(Ordering::Relaxed),
         extent_flush_forces: EXTENT_FLUSH_FORCES.load(Ordering::Relaxed),
         extent_spills: EXTENT_SPILLS.load(Ordering::Relaxed),
+        unscoped_put_refusals: UNSCOPED_PUT_REFUSALS.load(Ordering::Relaxed),
     }
 }
 
@@ -946,6 +954,7 @@ pub fn stats_json() -> serde_json::Value {
         "extent_stale_refusals": s.extent_stale_refusals,
         "extent_flush_forces": s.extent_flush_forces,
         "extent_spills": s.extent_spills,
+        "unscoped_put_refusals": s.unscoped_put_refusals,
         // §9.3's live retention gauge (→ 0 at quiesce — falsifiable
         // against the four release paths).
         "extent_retained_bytes": crate::extent_ship::retained_bytes(),
@@ -2868,6 +2877,35 @@ impl PublishService {
         };
         let spans = match owner.client_custody_on(client, ino) {
             crate::data_grant::ClientCustodyShape::Ranges(spans) => spans,
+            crate::data_grant::ClientCustodyShape::None
+                if owner.ino_has_range_grants(ino) =>
+            {
+                // Finding 34 (the s11-blockcyclic C8/C2 storm's root): a
+                // full Put from a client with NO grants on an ino OTHER
+                // holders hold ranges on. Applied verbatim (the pre-f34
+                // shape) it replaced the whole composed map with the
+                // shipper's stale view AND staged the shipper's stale
+                // refs frame — every peer entry it reverted stranded its
+                // durable take ("1 durable vs 0 layout" — the C8 face)
+                // and the shipper's duplicate displaced-frees came back
+                // refused ("double-release lineage"). Reachable when the
+                // shipper's release verb outruns its own backgrounded
+                // close-time flush (rung 1 closes that ordering at the
+                // release-verb departure gate; this refusal is the
+                // owner's shield for every ordering it cannot see).
+                // Leak-safe: nothing staged, nothing composed — the
+                // shipper's never-lossy ladder keeps custody of the
+                // bytes and its retry (or its drained release) resolves.
+                UNSCOPED_PUT_REFUSALS.fetch_add(1, Ordering::Relaxed);
+                return Err(SqueezefsError::InvalidOperation(format!(
+                    "S11 (finding 34): range-custody-less full Put for ino {ino} from \
+                     '{client}' refused — the ino has live range grants held by other \
+                     writers, and a custody-less Put applied verbatim reverts their \
+                     entries to this shipper's stale base while stranding the durable \
+                     ledger (the s11-blockcyclic C8 mint). Drain publishes before \
+                     releasing range custody (unscoped_put_refusals)"
+                )));
+            }
             _ => return Ok((shipped, None, ScopedBlobCustody::default())),
         };
         let block = match owner.geometry_of(ino).await {

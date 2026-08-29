@@ -1135,6 +1135,7 @@ impl CoWriterArm {
         crate::extent_ship::uninstall_quiesce_hook();
         crate::extent_ship::uninstall_release_hook();
         crate::extent_ship::uninstall_spill_sink();
+        crate::data_grant::uninstall_release_gate();
         if let Some(arm) = self.membership.take() {
             arm.disarm().await;
         }

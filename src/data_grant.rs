@@ -616,6 +616,40 @@ static NOTICE_POLL_ROUNDS: AtomicU64 = AtomicU64::new(0);
 /// growth here is the poll beating the cadence).
 static NOTICE_POLL_NOTICES: AtomicU64 = AtomicU64::new(0);
 static RANGE_EXTENSIONS_CLIENT: AtomicU64 = AtomicU64::new(0);
+/// Finding 34 (rung 1): ranged release verbs DEFERRED by the release gate
+/// because their ino's publish pipeline was not yet quiescent — each one
+/// is the ordering fix engaging (the verb re-queues and departs on a
+/// later drain, behind the flush the gate kicked). Sustained growth with
+/// releases flat means a flush that never completes (read it beside the
+/// writeback error latches).
+static RELEASES_DEFERRED: AtomicU64 = AtomicU64::new(0);
+
+/// Finding 34 (rung 1): the RELEASE GATE — answers whether `ino`'s
+/// publish pipeline is QUIESCENT (synchronously, lock-order-free: the
+/// drain runs under the acquire path's order-2 `lease_locks` stripe, so
+/// the gate may only PROBE, never take order-1 locks or await device
+/// I/O). A `false` verdict both defers the ino's queued releases and is
+/// the gate's cue to KICK a detached flush; `token` is the newest token
+/// among the ino's releasing grants — the flush-kick's fencing hint.
+pub type ReleaseGateHook = Arc<dyn Fn(u64, u64) -> bool + Send + Sync>;
+
+static RELEASE_GATE: Lazy<arc_swap::ArcSwapOption<ReleaseGateHook>> =
+    Lazy::new(arc_swap::ArcSwapOption::empty);
+
+/// Install the finding-34 release gate (the co-writer mount arm's act; a
+/// re-arm replaces).
+pub fn install_release_gate(hook: ReleaseGateHook) {
+    RELEASE_GATE.store(Some(Arc::new(hook)));
+}
+
+/// Uninstall the release gate (unmount teardown / tests).
+pub fn uninstall_release_gate() {
+    RELEASE_GATE.store(None);
+}
+
+fn release_gate() -> Option<ReleaseGateHook> {
+    RELEASE_GATE.load_full().map(|h| h.as_ref().clone())
+}
 
 /// The client-side view of the custody ledger (the owner's own per-instance
 /// counters are [`WriteCustodyOwner::stats`]).
@@ -675,6 +709,9 @@ pub fn stats_json() -> serde_json::Value {
         // authority-side family is the `range_custody` object).
         "dlm_custody_range_acquires": RANGE_ACQUIRES_CLIENT.load(Ordering::Relaxed),
         "dlm_custody_range_extensions": RANGE_EXTENSIONS_CLIENT.load(Ordering::Relaxed),
+        // Finding 34 (rung 1): release verbs deferred behind the ino's
+        // publish drain — the ordering fix's engagement gauge.
+        "dlm_custody_releases_deferred": RELEASES_DEFERRED.load(Ordering::Relaxed),
         // Finding 27: the standing notice poll (rounds = channel
         // liveness; notices = the quiet-incumbent engagement).
         "dlm_custody_notice_polls": NOTICE_POLL_ROUNDS.load(Ordering::Relaxed),
@@ -1790,6 +1827,19 @@ impl WriteCustodyOwner {
         }
     }
 
+    /// Finding 34: does ANY holder carry a live RANGE grant on `ino`?
+    /// The custody-less-Put shield's predicate (`custody_scoped_layout`):
+    /// a grant-less client's full Put on an ino with live ranged holders
+    /// is refused rather than applied verbatim — verbatim it reverts the
+    /// live holders' entries to the shipper's stale base while both refs
+    /// streams land (the s11-blockcyclic C8 mint). O(live grants).
+    pub fn ino_has_range_grants(&self, ino: u64) -> bool {
+        self.table
+            .grants_snapshot_with(|_, g| (g.ino == ino && g.span.is_some()).then_some(()))
+            .into_iter()
+            .any(|hit| hit.is_some())
+    }
+
     /// The installed §9.2 geometry source's answer for `ino` (`None` = no
     /// source / unresolvable — the scoping arm then stands down).
     pub async fn geometry_of(&self, ino: u64) -> Option<(u64, u64)> {
@@ -2766,7 +2816,7 @@ struct ClientGrant {
     /// `Drop` is synchronous and the release must travel, so the wire hop
     /// is deferred to [`WriteCustodyClient::drain_releases`] (the renewal
     /// cadence drains it, and so does the next acquire).
-    pending: Arc<parking_lot::Mutex<Vec<u64>>>,
+    pending: Arc<parking_lot::Mutex<Vec<(u64, u64, u64)>>>,
     /// S11 rung 15: the grant's object + token, so a range grant's death
     /// (release or revocation) retires its client-cache span immediately —
     /// a dead grant serving a covering probe is the one wrong answer the
@@ -2789,7 +2839,9 @@ impl crate::dlm::RemoteGrant for ClientGrant {
     fn release(&self) {
         if self.live.swap(false, Ordering::AcqRel) {
             self.retire_cached_span();
-            self.pending.lock().push(self.grant_id);
+            self.pending
+                .lock()
+                .push((self.grant_id, self.ino, self.token));
         }
     }
     fn live(&self) -> bool {
@@ -2852,7 +2904,10 @@ pub struct WriteCustodyClient {
     /// co-writer answers.
     lane: std::sync::atomic::AtomicU32,
     grants: scc::HashMap<u64, Arc<ClientGrant>>,
-    pending_releases: Arc<parking_lot::Mutex<Vec<u64>>>,
+    /// Queued release verbs: `(grant_id, ino, token)` — the ino + token
+    /// ride along so the finding-34 release gate can judge (and flush)
+    /// the ino's publish pipeline before the verb departs.
+    pending_releases: Arc<parking_lot::Mutex<Vec<(u64, u64, u64)>>>,
     inflight: parking_lot::Mutex<Vec<u64>>,
     clock: LeaseClock,
 }
@@ -3551,8 +3606,63 @@ impl WriteCustodyClient {
     /// Flush queued releases to the authority. Called by the renewal
     /// cadence, by the next acquire, and directly by a caller that wants
     /// the release to have LANDED (a test, or unmount teardown).
+    ///
+    /// **Finding 34 (rung 1 — the release gate):** a RANGED grant's
+    /// release verb departs only when the installed [`ReleaseGateHook`]
+    /// judges its ino's publish pipeline QUIESCENT (no dirty layout, no
+    /// open rewrite-epoch shadow, no in-flight publish). A release that
+    /// outran its own backgrounded close-time flush handed the bytes back
+    /// while the flush's full Put was still traveling — the owner then
+    /// served that Put custody-less and VERBATIM: the whole-map clobber
+    /// that stranded every reverted peer entry's durable take (the
+    /// s11-blockcyclic C8 storm) and minted the refused duplicate frees.
+    /// A non-quiescent ino's entries REQUEUE (the gate kicks a detached
+    /// flush; the renewal cadence re-drains), so the verb's departure is
+    /// ordered behind the publishes its custody justified. Whole-file
+    /// grants (`token == 0`) and gate-less mounts (solo, tests, arms
+    /// without the hook) ship exactly as before.
     pub async fn drain_releases(&self) {
-        let ids: Vec<u64> = std::mem::take(&mut *self.pending_releases.lock());
+        let batch: Vec<(u64, u64, u64)> = std::mem::take(&mut *self.pending_releases.lock());
+        if batch.is_empty() {
+            return;
+        }
+        let gate = release_gate();
+        let mut ids: Vec<u64> = Vec::with_capacity(batch.len());
+        let mut requeue: Vec<(u64, u64, u64)> = Vec::new();
+        match gate {
+            Some(gate) => {
+                // One gate verdict per distinct ino: the max released
+                // token rides as the flush-kick's fencing hint.
+                let mut inos: std::collections::BTreeMap<u64, u64> =
+                    std::collections::BTreeMap::new();
+                for &(_, ino, token) in &batch {
+                    if token != 0 {
+                        let t = inos.entry(ino).or_insert(0);
+                        *t = (*t).max(token);
+                    }
+                }
+                let mut deferred: std::collections::HashSet<u64> =
+                    std::collections::HashSet::new();
+                for (&ino, &token) in &inos {
+                    if !gate(ino, token) {
+                        deferred.insert(ino);
+                    }
+                }
+                for entry in batch {
+                    let (id, ino, token) = entry;
+                    if token != 0 && deferred.contains(&ino) {
+                        requeue.push(entry);
+                    } else {
+                        ids.push(id);
+                    }
+                }
+                if !requeue.is_empty() {
+                    RELEASES_DEFERRED.fetch_add(requeue.len() as u64, Ordering::Relaxed);
+                    self.pending_releases.lock().extend(requeue);
+                }
+            }
+            None => ids.extend(batch.into_iter().map(|(id, _, _)| id)),
+        }
         if ids.is_empty() {
             return;
         }

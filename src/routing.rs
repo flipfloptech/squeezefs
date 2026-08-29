@@ -6055,6 +6055,48 @@ impl DataRouter {
         drop(crate::routing::meta_lock_acquire(ino).await);
     }
 
+    /// Finding 34 (rung 1): the SYNCHRONOUS publish-quiescence probe the
+    /// range-custody release gate runs before a ranged release verb
+    /// departs — `true` only when NOTHING on this ino can still emit a
+    /// layout publish justified by the releasing custody: no dirty
+    /// layout, no deferred ledger ops, no open rewrite-epoch shadow, and
+    /// the §5.3 merge stripe momentarily free (a held stripe may be a
+    /// publish mid-commit/ship — judged busy, conservatively: a stripe
+    /// COLLISION only ever defers a release one drain cadence). Never
+    /// blocks and takes no order-1 locks: the drain runs under the
+    /// acquire path's order-2 `lease_locks` stripe.
+    pub fn ino_publishes_quiescent(&self, ino: u64) -> bool {
+        if self
+            .metadata_cache
+            .peek_with(&ino, |m| m.layout_dirty)
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        if self
+            .pending_block_refs
+            .read_sync(&ino, |_, v| !v.is_empty())
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        if self
+            .inner
+            .rewrite_epochs
+            .read_sync(&ino, |_, e| !e.shadow.is_empty() || !e.displaced.is_empty())
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        match INODE_META_LOCKS.get_inode_lock(ino).try_lock() {
+            Ok(guard) => {
+                drop(guard);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     pub(crate) fn note_block_ref_ops(
         &self,
         ino: u64,

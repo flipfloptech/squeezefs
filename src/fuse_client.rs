@@ -2922,6 +2922,12 @@ pub const WP_OV_POOLED: u32 = 17;
 static WRITE_PHASE_MAP: Lazy<scc::HashMap<(u64, u64, u32), (u32, u64)>> =
     Lazy::new(scc::HashMap::new);
 
+/// Finding 34 (rung 1): per-ino latch of a KICKED release-gate flush —
+/// the gate's `false` verdict spawns at most one detached flush per ino
+/// at a time (drain passes run at renewal cadence AND per acquire, so an
+/// un-latched kick would fan a flush storm at exactly the busy moment).
+static RELEASE_FLUSH_KICKS: Lazy<scc::HashSet<u64>> = Lazy::new(scc::HashSet::new);
+
 /// The unit-level (pre-block-loop) phase key's block sentinel.
 pub const WP_UNIT: u32 = u32::MAX;
 
@@ -12588,9 +12594,11 @@ impl SqueezefsFilesystem {
     /// Rung 17: install the CO-WRITER's extent hooks (the mount arm's
     /// act): the demotion QUIESCE (drain in-flight publishes of the ino —
     /// the §5.3 merge-discipline mutex is the barrier every in-flight
-    /// layout publish holds) and the RELEASE notifier (a covered ino's
+    /// layout publish holds), the RELEASE notifier (a covered ino's
     /// cached layout may be stale — drop it so the next read refetches
-    /// the covering publish).
+    /// the covering publish), and the finding-34 range-custody release
+    /// gate (a ranged release verb departs only behind the ino's publish
+    /// drain).
     pub fn install_cowriter_extent_hooks(&self) {
         let router = self.router.clone();
         crate::extent_ship::install_quiesce_hook(std::sync::Arc::new(move |ino: u64| {
@@ -12605,6 +12613,54 @@ impl SqueezefsFilesystem {
             // entry alone knows about (the orphaned-blob leak).
             router.discard_layout_cache(ino);
         }));
+        // Finding 34 (rung 1): the range-custody RELEASE GATE — a ranged
+        // release verb departs only when the ino's publish pipeline is
+        // quiescent. The close path releases custody while its flush is
+        // BACKGROUNDED, so an un-gated release verb outran the flush's
+        // full Put and the owner served that Put custody-less + verbatim
+        // (the s11-blockcyclic C8/C2 storm). The gate PROBES synchronously
+        // (the drain runs under the acquire path's order-2 lease stripe —
+        // no order-1 locks, no awaits) and, when busy, kicks ONE detached
+        // fsync-grade flush per ino (latched) and defers the verb to the
+        // next drain cadence.
+        let fs = self.clone();
+        crate::data_grant::install_release_gate(std::sync::Arc::new(
+            move |ino: u64, token_hint: u64| {
+                if fs.router.ino_publishes_quiescent(ino)
+                    && fs.collect_flushable_block_indices(ino).is_empty()
+                {
+                    return true;
+                }
+                if RELEASE_FLUSH_KICKS.insert_sync(ino).is_ok() {
+                    let fs = fs.clone();
+                    crate::bg_admit::spawn_bg(async move {
+                        // The releasing grant's own token is the floor; a
+                        // newer live grant's token wins (monotone law —
+                        // the save's fencing revalidation refuses stale).
+                        let token = fs.newest_range_token(ino).unwrap_or(0).max(token_hint);
+                        let r = fs.flush_memory_buffers_for_inode(ino, token).await;
+                        fs.note_writeback_result(ino, &r);
+                        let r = fs.flush_active_blocks_with_retry(ino, token).await;
+                        fs.note_writeback_result(ino, &r);
+                        // Custody is leaving: the open epoch's RAM-only
+                        // shadow bindings must publish under it, not after
+                        // it (W5's stay-open law yields to the custody
+                        // boundary — an unpublished shadow past the
+                        // release is exactly the custody-less Put the
+                        // owner now refuses).
+                        let r = fs.router.close_rewrite_epoch(ino, token).await;
+                        fs.note_writeback_result(ino, &r);
+                        let r = fs
+                            .router
+                            .persist_dirty_layout_if_needed(&crate::keys::inode_path(ino), token)
+                            .await;
+                        fs.note_writeback_result(ino, &r);
+                        let _ = RELEASE_FLUSH_KICKS.remove_sync(&ino);
+                    });
+                }
+                false
+            },
+        ));
     }
 
     /// The newest token among this mount's live RANGE leases on `ino`

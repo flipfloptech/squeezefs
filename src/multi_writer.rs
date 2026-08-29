@@ -1110,6 +1110,7 @@ impl PartialAuthorityArm {
         crate::extent_ship::uninstall_quiesce_hook();
         crate::extent_ship::uninstall_release_hook();
         crate::extent_ship::uninstall_spill_sink();
+        crate::data_grant::uninstall_release_gate();
         crate::meta_ship::disarm_ownership();
         if let Some(arm) = self.membership.take() {
             arm.disarm().await;

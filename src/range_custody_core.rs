@@ -287,7 +287,7 @@ pub struct RangeDecision {
 /// classification input (`region.0 >= required_hull_end` ⇔ the share lies
 /// wholly in the grant's desired-minted tail — the shrink arm; anything
 /// else is honest custody — the demotion barrier).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct BlockSharer {
     pub token: u64,
     /// The shared block-aligned region.
@@ -309,6 +309,10 @@ pub struct BlockSharer {
     /// NOT a tail (a bridge interior) keeps the conservative demotion —
     /// correct, just never fabricated for pure tails.
     pub tail_share: bool,
+    /// Finding 31b forensics: the sharer's claim segments verbatim (the
+    /// mark log names WHICH claim justified a demotion — a bounded copy,
+    /// taken only for sharers, which exist only on contended asks).
+    pub segments: Vec<(u64, u64)>,
 }
 
 /// One §9.3a **shrink-pending** record (residual board item 7's fix): a
@@ -1032,6 +1036,7 @@ impl FileCustody {
                 owner_nonce: g.owner_nonce,
                 shares_required,
                 tail_share,
+                segments: g.required_segments.clone(),
             });
         }
         out

@@ -1533,7 +1533,8 @@ impl LocalLockManager {
                                 "S11 demotion marked on {file_path}: ask=[{},{}) required=[{},{}) \
                                  ask_scope {scope:#x} sharer token {} scope {:#x} \
                                  region=[{},{}) required_hull_end {} (region.0 < hull ⇒ \
-                                 region-sharing; fabricated on aligned rows — finding 31)",
+                                 region-sharing; fabricated on aligned rows — finding 31) \
+                                 claim segments {:?}",
                                 ask.0,
                                 ask.1,
                                 required.0,
@@ -1543,6 +1544,7 @@ impl LocalLockManager {
                                 sharer.region.0,
                                 sharer.region.1,
                                 sharer.required_hull_end,
+                                sharer.segments,
                             );
                         }
                     }

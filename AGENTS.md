@@ -650,6 +650,16 @@ fstests/LTP are **wall-clock-bound** (fixed-duration fsx/fsstress soaks, mount-c
 
 ## Benchmarks & Profiling
 
+### Cloud runs require EXPRESSED approval (user mandate 2026-08-28)
+
+**No AWS/cloud cluster may be launched without the user's expressed
+approval for THAT run.** The cheap-first pipeline (2026-08-28) is the
+standing order of operations: every binary passes a FREE local fleet
+probe first; the cloud venue exists ONLY for the final sustained
+verdict, and each launch is individually approved by the user before
+`tests/cloud_bench_cluster.sh launch` is invoked. A gate/fix train never
+implies cloud approval.
+
 ### Benchmark substrates: the two-substrate rule (2026-07-27)
 
 The 2026-07-27 amplification campaign proved the nvmet-**loop** rig HIDES bandwidth-economy and network-stack effects (the 1.85×-amplification field capture reproduced on nvmet-tcp and was invisible on loop — `.benchmarks/2026-07-27-shim-write-amplification.md`). Both substrates come from `tests/dev_substrate.sh` (same backings — memory-backed null_blk mds + zram oss; same create/teardown/status verbs; the two coexist on one box via disjoint names/state dirs/ports):

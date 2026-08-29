@@ -1034,3 +1034,19 @@ mount → enroll the 8-co-writer roster → the re-arm's umount+remount,
 with the cloud deltas (`--allow-other`, `FLEET_SHARE=9`) applied — the
 local fleet's own assemble (probe 6) ran this shape clean, so the
 deltas are the discriminating variables.
+
+### Finding 32 decoded: an op delivered AFTER "Dismount clean" strands forever
+
+The archived authority log is decisive: the daemon's dismount ritual
+COMPLETED ("Dismount clean. All write staged blocks successfully
+flushed" at 01:14:24), and op `unique=86` was delivered ~10 s LATER
+(first overdue warn 01:14:43 at age 9,237 ms) — the kernel handed the
+armed over-uring session one more request after the daemon side had
+quiesced its handlers, and nothing ever replied. The uninterruptible
+caller is the unmount's own path (fusermount3's final op against the
+half-torn session), so the unmount wedges ITSELF and `unmount_and_reap`
+hangs forever. The law for the red loop (fuse3 fork, over-uring
+teardown): a DELIVERED ent must always receive SOME reply — the
+teardown must keep a reply path (ENOTCONN-class) for late-delivered
+ops until the connection is actually closed, never strand one. Local
+rolls never hit the window (timing); the cloud venue did.

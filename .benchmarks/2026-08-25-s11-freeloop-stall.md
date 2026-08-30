@@ -1294,3 +1294,36 @@ remains the local wall). One pre-35b roll read 3 C2 (space-only blob
 residue, ≤1-in-3 rolls) — BOARD: the funnel-escape blob orphan, to be
 re-measured on a clean venue post-35b. 117 tests across six
 compose-adjacent suites green.
+
+## Attempt 15 (2026-08-30, cloud i4i.8xlarge, binary `da47bd95` — f33c+f34+f35+f35b landed): THE FSCK ORACLE IS CLEAN; a pre-existing A2 stall class is the new (and only) red
+
+Approved run (~$4, ~20 min, teardown clean). The verdict pair:
+
+- **fsck oracle: `findings: 0 (clean)`** — run live on the authority
+  after the row (34 inodes, 10,242 blocks, 17 refcounts, 3 s). The
+  corruption chain that owned attempts 13/14 (f33 → f35b) is DEAD on
+  the real-fabric venue. `unscoped_put_refusals` 0, zero refused
+  shipped frees, zero ENOSPC.
+- **Perf gate: A2 FAILED the sustained window** ("decay 1832 → 859").
+  The iteration table re-reads as FLAT ~2,080 MiB/s with three isolated
+  single-iteration stalls (1048 / 717 / 859 — one slow rank per ior
+  barrier, ~7 s each). Attempt 14's A2 carried the SAME three-stall
+  shape (921 / 1182 / 1754) and PASSED at 0.980 — the gate verdict
+  flips on WHERE the stalls land in the steady window. Phase means:
+  A1 2,074 (min 1,971 — FLATTER than attempt 14's min 1,717), B1
+  1,936, B2 1,943, A2 1,784 vs attempt 14's 1,873. The f34/f35 train
+  regressed nothing; A1 improved.
+
+**Finding 36 (BOARD, the acceptance's last blocker): the A2 aged-shared
+intermittent stall.** Evidence: ~7 s single-iteration stalls, 2–3 per
+re-shared aged phase on BOTH attempts, none in fpp phases, A1 ≤ 1.
+Candidate signature: `free_grace_acked_lag_ms` ≈ 6.2–6.4 s on the
+co-writers during A2 while the authority's grace ring held 14,120
+offsets / 59 GiB (p3) — a lane-harvest allocation that must wait on a
+grace release is a whole-rank stall of exactly this magnitude, and A2
+is the phase whose displaced-free churn feeds the ring while the
+harvest is the reuse supply. Phase-normal storms EXCLUDED by attempt-14
+comparison: the 31k tail-shrink demotions and the authority's ~5 GiB of
+indirect-map re-reads are identical on the passing row. Likely the same
+lineage as the boarded ior fsync(15)/size warnings. Artifacts:
+`.benchmarks/cloud/2026-08-30-070620/` + `/tmp/attempt15-post/`.

@@ -26,7 +26,7 @@ echo "Repo: $REPO_DIR  Mount: $MOUNT_DIR"
 # 1. Build Squeezefs release binary
 cd "$REPO_DIR"
 if [ "$RUNUSER" != "root" ] && id "$RUNUSER" &>/dev/null; then
-    su -s /bin/bash "$RUNUSER" -c "cd '$REPO_DIR' && cargo build --release"
+    su -s "$BASH" "$RUNUSER" -c "export PATH='$PATH'; cd '$REPO_DIR' && cargo build --release"
 else
     cargo build --release
 fi

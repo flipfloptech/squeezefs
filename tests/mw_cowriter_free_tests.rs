@@ -4129,3 +4129,150 @@ async fn a_custodyless_put_on_a_range_held_ino_refuses_instead_of_clobbering() {
     drop(cwr);
     auth.stop().await;
 }
+
+/// Finding 35 (RED pre-fix: the scope adopted EVERY in-custody caller
+/// entry — this test's idx-0 read-back fails on the pre-claim compose): a
+/// range holder's full Put names its WHOLE map, and the entries it never
+/// wrote are its VIEW — legitimately stale on an aged file. Adoption must
+/// require the caller's OWN take claim (its refs frame — the §6.2 law
+/// that every real transition carries its ledger op), because a stale
+/// view entry can name a prior still-LIVE key (not yet freed), which the
+/// finding-28 dead-incarnation probe cannot drop: adopted, it regressed
+/// the live binding (take → release → release → re-take across three
+/// holders' serves on the two-pass aged-file repro — 27–38 C8 + ~10 C2
+/// per row) and stranded the durable ledger.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scoped_put_adopts_claimed_transitions_never_the_callers_stale_view() {
+    use squeezefs::meta_backend::Metadata as _;
+    let _serial = serial();
+    let _restore = restore();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "f35-claims").await;
+    let dev = data_device(dir.path(), "f35-claims.dev");
+    let auth = Authority::start(&vol, &dev, &[NODE_A, NODE_B]).await;
+    // The §9.2 geometry source — the scoped compose refuses without it
+    // (the production mount arm installs the router-backed one).
+    auth.owner
+        .install_range_geometry(data_grant::fixed_range_geometry(
+            8 * 1024 * 1024,
+            4 * 1024 * 1024,
+        ));
+    auth.alloc.engage_incarnations(
+        3,
+        squeezefs::meta_backend::kv::journal::AppendPartition::new(1, 0).expect("partition"),
+    );
+
+    // Three live lifetimes: k_old (the aged view), k_new (the current
+    // binding a peer minted after the holder's last refetch), k3 (the
+    // holder's genuine write). ALL live — the f28 probe passes each.
+    let mut key_of = Vec::new();
+    let mut idx_of = Vec::new();
+    for _ in 0..3 {
+        let off = auth.alloc.allocate_block().await.expect("mint");
+        auth.alloc.publish_block(off);
+        key_of.push(squeezefs::routing::block_key_with_incarnation(
+            &off.to_string(),
+            auth.alloc.live_incarnation(off),
+        ));
+        idx_of.push(off / auth.alloc.chunk_size());
+    }
+    let (k_old, k_new, k3) = (key_of[0].clone(), key_of[1].clone(), key_of[2].clone());
+
+    let cwr = CoWriter::join(&auth, &vol, &dev, NODE_A).await;
+    let ino = publish::create_with_rdev_size(&cwr.meta, 1, "f35.bin", 0o100644, 0, 0, 0, 0)
+        .await
+        .expect("shipped create")
+        .ino;
+    let head = |map: Vec<(u32, String)>| {
+        bincode::serialize(&squeezefs::layout_wire::LayoutMetadata {
+            file_type: "striped".into(),
+            size: 8 * 1024 * 1024,
+            block_map_id: None,
+            block_prefix: None,
+            file_id: None,
+            data_key: None,
+            block_map: Some(map.into_iter().collect()),
+        })
+        .expect("head bytes")
+    };
+
+    // The durable head: idx 0 = k_new (the CURRENT binding).
+    publish::set_layout_and_size(
+        &cwr.meta,
+        ino,
+        &head(vec![(0u32, k_new.clone())]),
+        8 * 1024 * 1024,
+        &[],
+    )
+    .await
+    .expect("the pre-custody establishing Put lands");
+
+    // The peer takes range custody of blocks 0..2 and ships a full Put
+    // whose map carries a STALE view of idx 0 (k_old — live incarnation)
+    // beside its genuine write at idx 1 (k3). Its claims name ONLY idx 1.
+    let peer = WriteCustodyClient::connect(&auth.endpoint, SECRET, NODE_B)
+        .await
+        .expect("the peer dials the custody authority");
+    let peer_grant = match peer
+        .acquire_range(
+            ino,
+            (0, 8 * 1024 * 1024),
+            (0, 8 * 1024 * 1024),
+            Duration::from_secs(3),
+        )
+        .await
+        .expect("the peer's ranged grant")
+    {
+        data_grant::RangeAcquireOutcome::New { lease, .. } => lease,
+        other => panic!("a fresh ino's first ranged ask must be NEW, got {other:?}"),
+    };
+    let tag = volume_tag(DATA_VOL);
+    // Shipped AS the range holder (NODE_B) — the f34 shield refuses a
+    // custody-less shipper, and the scope must see the HOLDER's spans.
+    let pc = publish::PublishClient::new(NODE_B, SECRET.to_vec());
+    let put = publish::PublishCall::SetLayoutAndSize {
+        ino,
+        layout: head(vec![(0u32, k_old.clone()), (1u32, k3.clone())]),
+        size: 8 * 1024 * 1024,
+        refs: vec![publish::WireBlockRefOp {
+            vol_tag: tag,
+            block_idx: idx_of[2],
+            owner_ino: ino,
+            block_index: 1,
+            take: true,
+        }],
+        lease_epoch: peer.lease_epoch(),
+        request_id: 0xF35,
+    };
+    pc.ship(&auth.endpoint, put)
+        .await
+        .expect("the scoped Put composes");
+
+    let durable = auth
+        .meta
+        .getxattr(ino, "layout")
+        .await
+        .expect("layout read")
+        .expect("the composed head persists");
+    let decoded =
+        squeezefs::layout_wire::decode_base_layout(&durable).expect("the head decodes inline");
+    let map = decoded.block_map.expect("the head carries its map");
+    assert_eq!(
+        map.get(&1).map(String::as_str),
+        Some(k3.as_str()),
+        "the CLAIMED transition adopts (idx 1 -> the holder's genuine write)"
+    );
+    assert_eq!(
+        map.get(&0).map(String::as_str),
+        Some(k_new.as_str()),
+        "the UN-CLAIMED in-custody entry is the holder's stale VIEW — it must \
+         never regress the live binding (finding 35: the aged-file strand mint; \
+         the stale key's incarnation is LIVE, so the f28 probe cannot drop it)"
+    );
+
+    drop(peer_grant);
+    peer.drain_releases().await;
+    squeezefs::meta_ship::tokens::test_clear_range_cache();
+    drop(cwr);
+    auth.stop().await;
+}

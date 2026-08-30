@@ -1221,3 +1221,48 @@ data strands beside failed-fsync ENOSPC exits. BOARD (finding 35
 candidate): classify the blob-strand residue on a non-ENOSPC venue —
 attempt 14's cloud row carried exactly ONE blob-sentinel drift among
 its 12, so the class exists off-ENOSPC at ~1/row scale.
+
+## Finding 35 (first half landed: red `61cf6f22`, fix `34fb4887` on `fix/f35-claim-scoped-compose`): view is not claim
+
+With f34 landed, the two-pass AGED-FILE repro (8 co-writers, one 10 GiB
+shared file, two 4-iteration ior passes with a close/re-open between —
+`/tmp/f35-dispatch.sh`, ~3 min/roll, ZERO ENOSPC at 110 GiB) still
+minted 27–38 C8 + ~10 C2 per row. The tape convicted TWO arms; the
+first is landed:
+
+1. **The claim filter** (`custody_scoped_layout`): the scope adopted
+   EVERY in-custody caller entry, but a full Put names the caller's
+   WHOLE map and the un-written remainder is its VIEW — legitimately
+   stale on an aged file, and a stale entry can name a prior
+   still-LIVE key the f28 dead-incarnation probe cannot drop (the
+   take → release → release → re-take interleave at one index across
+   three holders' serves). Adoption now requires the caller's OWN take
+   claim at the index (its refs frame — §6.2's law that every real
+   transition carries its ledger op); removal requires a release
+   claim. Stash-A/B red; five compose-adjacent suites green (115
+   tests).
+2. **The sticky range-episode latch** (`dlm::RANGE_EPISODE_INOS`, set
+   before any range grant mints): the serve-window guard and the
+   local-merge chain decision keyed on LIVE grants — grant-lapse
+   windows (pass boundaries, close storms) let the authority's own
+   publishes skip the serve stripe / re-base unchained. Plus the
+   whole-file arm: a WholeFile holder's Put on an EPISODE ino now
+   composes claims-scoped over the full span instead of verbatim (the
+   end-of-row closer's whole-file flush was a `recomputed=false`
+   verbatim serve carrying take-only blob ops — one stranded blob per
+   flush).
+
+Field across the rungs: refusal storm 24 → 12 → 16, pass-2 min
+bandwidth healed (934 → 2,297 MiB/s pass-1 parity), read-back EXACT
+(32-rank `-r -R -C`), residue 27–38 → **10 C8 + 9 C2**. The remaining
+vector is TAPE-NAMED but unfixed (the second half): the residue
+clusters at single staging instants where a LOCAL full Put composed
+from a pre-serve snapshot (under the ino's 3.5 section; the serve
+stripe is only taken inside the backend call) clobbers a JUST-COMMITTED
+serve's entries — six data takes stranded at one instant plus the
+blob-pair fork the same window produces. Rung 18 serialized the LOCK;
+the local Put's map must RE-COMPOSE under it (share the serve's
+claims-scoped algebra) instead of persisting its stale snapshot.
+Corpses: `/tmp/f35-corpse` (pre-fix), `/tmp/f35-corpse2` (post-first-
+half, taped); the tape diagnostics stand re-armed UNCOMMITTED in the
+working tree.

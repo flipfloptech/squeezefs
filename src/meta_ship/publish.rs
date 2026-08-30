@@ -1171,11 +1171,56 @@ static SERVE_INO_LOCKS: Lazy<
 /// exempts the EXTENT verbs so their executors' folds can take this
 /// guard at the funnel without self-deadlocking.
 async fn local_publish_guard(ino: Ino) -> Option<crate::sqz_sync::SqzMutexGuard<'static, ()>> {
+    // Finding 35b: the routing save's compose window already HOLDS this
+    // ino's stripe for the whole fetch→compose→commit span — re-acquiring
+    // here would self-deadlock (the stripe is not re-entrant).
+    if serve_window_already_held() {
+        return None;
+    }
     if crate::data_grant::custody_owner().is_some() && crate::dlm::ino_has_range_custody(ino) {
         Some(SERVE_INO_LOCKS.get_inode_lock(ino).lock().await)
     } else {
         None
     }
+}
+
+squeezefs_ipc::sqz_task_local! {
+    /// Finding 35b: marks a task that already holds the ino's serve
+    /// stripe — the routing save's compose window spans fetch → compose →
+    /// commit, and the publish layer's own guard must stand down inside
+    /// it instead of self-deadlocking. Task-scoped like [`ARBITER_FOLD`].
+    static SERVE_WINDOW_HELD: ();
+}
+
+/// Is the current task inside a held serve window (finding 35b)?
+pub(crate) fn serve_window_already_held() -> bool {
+    SERVE_WINDOW_HELD.try_with(|_| ()).is_ok()
+}
+
+/// Finding 35b: does `ino`'s layout publish commit LOCALLY on this
+/// mount? The routing save's compose window is an AUTHORITY-side act —
+/// a save that SHIPS must never hold the serve stripe across the wire
+/// (the owner's serve of that very publish parks on the same stripe:
+/// the ladder-suite self-deadlock).
+pub(crate) fn publishes_locally(be: &Arc<RoutedMetaBackend>, ino: Ino) -> bool {
+    owner_of_unchecked(be, ino).is_none()
+}
+
+/// Acquire `ino`'s serve stripe for a routing-side compose window
+/// (finding 35b): the AUTHORITY's local save of a range-episode ino must
+/// read the durable head, compose its claims onto it, and commit — all
+/// under the SAME stripe hold the served scoped Puts serialize on, or a
+/// serve landing mid-window is clobbered by the save's pre-serve
+/// snapshot (the aged-file strand cluster: six takes stranded at one
+/// staging instant).
+pub(crate) async fn hold_serve_window(ino: Ino) -> crate::sqz_sync::SqzMutexGuard<'static, ()> {
+    SERVE_INO_LOCKS.get_inode_lock(ino).lock().await
+}
+
+/// Run `f` with the held-serve-window marker set (finding 35b — the
+/// caller holds the guard from [`hold_serve_window`] across it).
+pub(crate) async fn with_serve_window_held<F: std::future::Future>(f: F) -> F::Output {
+    SERVE_WINDOW_HELD.scope((), f).await
 }
 
 squeezefs_ipc::sqz_task_local! {
@@ -2891,8 +2936,27 @@ impl PublishService {
         let Some(owner) = crate::data_grant::custody_owner() else {
             return Ok((shipped, None, ScopedBlobCustody::default()));
         };
+        // Finding 35 (second half): the sticky range-episode predicate.
+        // A WHOLE-FILE holder's Put was "fully authoritative" (verbatim)
+        // — safe when whole-file custody is the ino's ONLY custody story,
+        // a stale-view clobber once the ino has run a RANGE episode: the
+        // end-of-row closer's flush acquires whole-file custody AFTER
+        // every range released, and its map legitimately lags its peers'
+        // final publishes (the take-only blob strands + reverted entries
+        // the two-pass repro's tape convicted at `recomputed=false`
+        // serves). On an episode ino BOTH the whole-file arm and the
+        // grant-less arm compose CLAIMS-SCOPED over the whole span —
+        // claimed transitions adopt onto the CURRENT durable head, the
+        // stale view keeps nothing.
+        let episode = crate::dlm::ino_has_range_custody(ino);
         let spans = match owner.client_custody_on(client, ino) {
             crate::data_grant::ClientCustodyShape::Ranges(spans) => spans,
+            crate::data_grant::ClientCustodyShape::WholeFile if episode => vec![(0, u64::MAX)],
+            crate::data_grant::ClientCustodyShape::None
+                if episode && !owner.ino_has_range_grants(ino) =>
+            {
+                vec![(0, u64::MAX)]
+            }
             crate::data_grant::ClientCustodyShape::None if owner.ino_has_range_grants(ino) => {
                 // Finding 34 (the s11-blockcyclic C8/C2 storm's root): a
                 // full Put from a client with NO grants on an ino OTHER

@@ -6151,6 +6151,201 @@ impl DataRouter {
         publish_entries: Option<&[(u32, String)]>,
         block_refs: &[crate::meta_backend::kv::block_refs::BlockRefOp],
     ) -> Result<()> {
+        // Finding 35b (the aged-file strand cluster's second half): the
+        // AUTHORITY's local save of a RANGE-EPISODE ino persists a whole
+        // map computed from a RAM snapshot taken under (3.5) — but served
+        // scoped Puts commit under the SERVE STRIPE, not (3.5), so a
+        // serve landing between the snapshot and this save's commit was
+        // reverted wholesale (six takes stranded at one staging instant,
+        // plus the blob-pair fork: `old_indirect_to_free` named the
+        // snapshot's stale belief, not the durable predecessor). The
+        // episode save therefore COMPOSES: hold the stripe across
+        // fetch → compose → commit, adopt only this save's CLAIMED
+        // transitions (its refs — the same view-is-not-claim law the
+        // serve compose enforces) onto the DURABLE head, recompute the
+        // staged accounting as the head→composed swap diff, and free the
+        // durable predecessor's blob rather than the snapshot's belief.
+        // Solo mounts and non-episode inos take the body verbatim (one
+        // relaxed probe).
+        let episode_compose = !crate::fuse_client::co_writer_mount()
+            && crate::data_grant::custody_owner().is_some()
+            && crate::dlm::ino_has_range_custody(ino)
+            && m.block_map.is_some()
+            // A save that SHIPS must not hold the serve stripe across the
+            // wire — the owner's serve of that very publish parks on the
+            // same stripe (the ladder-suite self-deadlock). A shipped
+            // save's compose is the OWNER's job (`custody_scoped_layout`).
+            && self
+                .inner
+                .meta_backend
+                .get()
+                .is_some_and(|be| crate::meta_ship::publish::publishes_locally(be, ino));
+        if episode_compose {
+            let _serve_window = crate::meta_ship::publish::hold_serve_window(ino).await;
+            if let Some((composed, swap_refs)) =
+                self.compose_episode_save(ino, m, block_refs).await?
+            {
+                // publish_entries = None: the composed map is full-save
+                // class BY LAW (the swap diff is exact against the whole
+                // head; a delta would re-stage the caller's claim list).
+                return crate::meta_ship::publish::with_serve_window_held(
+                    self.save_metadata_to_backend_body(
+                        ino,
+                        &composed,
+                        fencing_token,
+                        None,
+                        &swap_refs,
+                    ),
+                )
+                .await;
+            }
+            // No durable head yet (the establishing save): the snapshot
+            // IS the truth — the body runs verbatim, stripe still held.
+            return crate::meta_ship::publish::with_serve_window_held(
+                self.save_metadata_to_backend_body(
+                    ino,
+                    m,
+                    fencing_token,
+                    publish_entries,
+                    block_refs,
+                ),
+            )
+            .await;
+        }
+        self.save_metadata_to_backend_body(ino, m, fencing_token, publish_entries, block_refs)
+            .await
+    }
+
+    /// Finding 35b: compose the save's CLAIMED transitions onto the
+    /// DURABLE head (caller holds the ino's serve stripe). `None` = no
+    /// durable head exists yet (the establishing save — the snapshot is
+    /// the truth). Consumes the ino's deferred ledger notes (they join
+    /// the claims; the recomputed swap diff replaces them as the staged
+    /// accounting).
+    async fn compose_episode_save(
+        &self,
+        ino: u64,
+        m: &CachedMetadata,
+        block_refs: &[crate::meta_backend::kv::block_refs::BlockRefOp],
+    ) -> Result<
+        Option<(
+            CachedMetadata,
+            Vec<crate::meta_backend::kv::block_refs::BlockRefOp>,
+        )>,
+    > {
+        let Some((head_map, head_blob, head_size)) = self.fetch_durable_layout_head(ino).await?
+        else {
+            return Ok(None);
+        };
+        // The claims: this save's own transitions — the deferred ledger
+        // notes (drained HERE; the swap diff below is their carrier) plus
+        // the call-site ops. Map-blob ops are custody transfers, not map
+        // transitions; foreign-ino ops are not this ino's.
+        let mut claims = self.take_block_ref_ops(ino);
+        claims.extend_from_slice(block_refs);
+        let mut claim_take: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut claim_release: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for op in &claims {
+            if op.reference.is_map_blob() || op.reference.owner_ino != ino {
+                continue;
+            }
+            if op.take {
+                claim_take.insert(op.reference.block_index);
+            } else {
+                claim_release.insert(op.reference.block_index);
+            }
+        }
+        let snapshot = m
+            .block_map
+            .as_deref()
+            .expect("episode_compose requires a map");
+        let mut composed = head_map.clone();
+        for b in &claim_take {
+            if let Some(k) = snapshot.get(b) {
+                composed.insert(*b, k.clone());
+            }
+        }
+        let mut shrank = false;
+        for b in &claim_release {
+            if !claim_take.contains(b) && !snapshot.contains_key(b) {
+                composed.remove(b);
+                shrank = true;
+            }
+        }
+        let swap_refs = self.block_ref_ops_for_map_swap(ino, Some(&head_map), Some(&composed));
+        let mut mc = m.clone();
+        mc.block_map = Some(std::sync::Arc::new(composed));
+        // The durable predecessor is what this commit stops naming — the
+        // snapshot's belief may lag a serve's compose (the blob-pair
+        // fork). Not this mount's mint: the head's blob is the durable
+        // lifecycle this commit's CoW displaces.
+        mc.block_map_id = head_blob.map(|b| format!("indirect:{b}").into());
+        mc.block_map_id_own_mint = false;
+        // Size law: peers' growth never regresses (the serve compose's
+        // max law); a claimed shrink (release-without-take beyond the
+        // snapshot) keeps the caller's size — the truncate signature.
+        mc.size = if shrank && m.size < head_size {
+            m.size
+        } else {
+            m.size.max(head_size)
+        };
+        // The composed head is full-save class: chain provenance resets.
+        mc.layout_version = 0;
+        Ok(Some((mc, swap_refs)))
+    }
+
+    /// Finding 35b: the DURABLE layout head — map, indirect blob key and
+    /// size — read raw (no epoch overlay, no cache), for the episode
+    /// compose. `None` = no persisted layout.
+    async fn fetch_durable_layout_head(
+        &self,
+        ino: u64,
+    ) -> Result<Option<(std::collections::HashMap<u32, String>, Option<String>, u64)>> {
+        let Some(backend) = self.inner.meta_backend.get() else {
+            return Ok(None);
+        };
+        let Some(bytes) = backend.getxattr(ino, "layout").await? else {
+            return Ok(None);
+        };
+        let layout_opt = if bytes.starts_with(b"{") {
+            serde_json::from_slice::<LayoutMetadata>(&bytes).ok()
+        } else {
+            bincode::deserialize::<LayoutMetadata>(&bytes).ok()
+        };
+        let Some(layout) = layout_opt else {
+            return Ok(None);
+        };
+        let mut blob_key: Option<String> = None;
+        let map = if let Some(id) = layout
+            .block_map_id
+            .as_deref()
+            .and_then(|id| id.strip_prefix("indirect:"))
+        {
+            let block_size = self.block_size.load(std::sync::atomic::Ordering::Relaxed) as usize;
+            let raw = self.backend_router.read_block(id, block_size).await?;
+            METRICS
+                .layout_indirect_map_reads
+                .fetch_add(1, Ordering::Relaxed);
+            METRICS
+                .layout_indirect_map_read_bytes
+                .fetch_add(raw.len() as u64, Ordering::Relaxed);
+            blob_key = Some(id.to_string());
+            let entries = decode_indirect_block_map(&raw)?;
+            entries.into_iter().collect()
+        } else {
+            layout.block_map.clone().unwrap_or_default()
+        };
+        Ok(Some((map, blob_key, layout.size)))
+    }
+
+    async fn save_metadata_to_backend_body(
+        &self,
+        ino: u64,
+        m: &CachedMetadata,
+        fencing_token: u64,
+        publish_entries: Option<&[(u32, String)]>,
+        block_refs: &[crate::meta_backend::kv::block_refs::BlockRefOp],
+    ) -> Result<()> {
         let backend = self.inner.meta_backend.get().ok_or_else(|| {
             SqueezefsError::InvalidOperation("Metadata backend not initialized".to_string())
         })?;

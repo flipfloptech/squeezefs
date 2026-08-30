@@ -124,6 +124,13 @@ rewrite_fhs_literal() { # $1 = FHS path, $2 = resolved replacement
 }
 if [ ! -x /bin/bash ]; then
     rewrite_fhs_literal /bin/bash "$(type -P bash)"
+    # The flag-GLUED form (`su -s/bin/bash`, generic/128's idiom) — the
+    # guard class above excludes word-char-preceded literals for
+    # idempotency, so it needs its own pass (space-separated after the
+    # rewrite, hence itself idempotent).
+    { grep -rlIZ --exclude='*.out' -e '-s/bin/bash' "$XFSTESTS_DIR" 2>/dev/null || true; } |
+        REAL="$(type -P bash)" xargs -0 -r perl -pi -e \
+            's{-s/bin/bash(?![\w.\-])}{-s $ENV{REAL}}g'
 fi
 if [ ! -x /bin/true ]; then
     rewrite_fhs_literal /bin/true "$(type -P true)"

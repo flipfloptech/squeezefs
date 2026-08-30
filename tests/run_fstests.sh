@@ -108,6 +108,23 @@ if [ ! -d "$XFSTESTS_DIR" ]; then
     git clone --depth 1 https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git "$XFSTESTS_DIR"
 fi
 
+# Non-FHS hosts (NixOS): the suite's scripts, helpers and every test
+# hardcode '#!/bin/bash' (and a few '#!/usr/bin/perl'), which do not
+# exist outside FHS — group-list builds die 'bad interpreter' and every
+# test would follow. Rewrite the shebang line to the resolved
+# interpreter wherever the FHS path is absent; idempotent, and a plain
+# FHS host never enters either arm.
+if [ ! -x /bin/bash ]; then
+    BASH_REAL="$(command -v bash)"
+    grep -rlIZ '^#!/bin/bash' "$XFSTESTS_DIR" 2>/dev/null |
+        xargs -0 -r sed -i "1s|^#!/bin/bash|#!$BASH_REAL|"
+fi
+if [ ! -x /usr/bin/perl ] && command -v perl >/dev/null; then
+    PERL_REAL="$(command -v perl)"
+    grep -rlIZ '^#!/usr/bin/perl' "$XFSTESTS_DIR" 2>/dev/null |
+        xargs -0 -r sed -i "1s|^#!/usr/bin/perl|#!$PERL_REAL|"
+fi
+
 cd "$XFSTESTS_DIR"
 # xfstests requires the fsgqa user/group; keep this OUTSIDE the
 # compile-once guard so cached-suite runs repair it too. -m / the home

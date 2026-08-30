@@ -108,23 +108,28 @@ if [ ! -d "$XFSTESTS_DIR" ]; then
     git clone --depth 1 https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git "$XFSTESTS_DIR"
 fi
 
-# Non-FHS hosts (NixOS): the suite's scripts, helpers and every test
-# hardcode '#!/bin/bash' (and a few '#!/usr/bin/perl'), which do not
-# exist outside FHS — group-list builds die 'bad interpreter' and every
-# test would follow. Rewrite the shebang line to the resolved
-# interpreter wherever the FHS path is absent; idempotent, and a plain
-# FHS host never enters either arm.
+# Non-FHS hosts (NixOS): the suite hardcodes FHS binary paths that do
+# not exist outside FHS — '#!/bin/bash' shebangs AND inline uses
+# (`su -s /bin/bash`, the `/bin/true` return-success idiom; the engine
+# census is exactly /bin/bash, /bin/true, /usr/bin/perl beyond the
+# host-provided /bin/sh + /usr/bin/env). Rewrite every literal to the
+# resolved tool wherever the FHS path is absent. Idempotent BY THE
+# GUARD CLASS: the replacement itself ends in .../bin/<tool>, so the
+# pattern only matches occurrences NOT preceded by a path character.
+# Golden outputs (*.out) are excluded; a plain FHS host never enters.
+rewrite_fhs_literal() { # $1 = FHS path, $2 = resolved replacement
+    { grep -rlIZ --exclude='*.out' -e "$1" "$XFSTESTS_DIR" 2>/dev/null || true; } |
+        FHS="$1" REAL="$2" xargs -0 -r perl -pi -e \
+            's{(?<![\w/.\-])$ENV{FHS}(?![\w.\-])}{$ENV{REAL}}g'
+}
 if [ ! -x /bin/bash ]; then
-    BASH_REAL="$(command -v bash)"
-    # `|| true`: an already-rewritten checkout matches nothing and
-    # grep's exit-1 must not kill the runner under `set -e`.
-    { grep -rlIZ '^#!/bin/bash' "$XFSTESTS_DIR" 2>/dev/null || true; } |
-        xargs -0 -r sed -i "1s|^#!/bin/bash|#!$BASH_REAL|"
+    rewrite_fhs_literal /bin/bash "$(type -P bash)"
+fi
+if [ ! -x /bin/true ]; then
+    rewrite_fhs_literal /bin/true "$(type -P true)"
 fi
 if [ ! -x /usr/bin/perl ] && command -v perl >/dev/null; then
-    PERL_REAL="$(command -v perl)"
-    { grep -rlIZ '^#!/usr/bin/perl' "$XFSTESTS_DIR" 2>/dev/null || true; } |
-        xargs -0 -r sed -i "1s|^#!/usr/bin/perl|#!$PERL_REAL|"
+    rewrite_fhs_literal /usr/bin/perl "$(type -P perl)"
 fi
 
 cd "$XFSTESTS_DIR"

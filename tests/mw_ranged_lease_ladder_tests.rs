@@ -1891,3 +1891,85 @@ async fn a_dead_era_orphan_never_buys_a_demotion() {
     drop(c1);
     listener.shutdown();
 }
+
+/// Finding 36 (RED pre-fix: the fsync ships a WHOLE-FILE EX acquire that
+/// conflicts with the still-live owner-side grant and spins the 5 s
+/// refusal ladder — attempt 15's A2 rank stall): an EPISODE ino whose
+/// LOCAL range leases lapsed (close, invalidate, shrink churn) while its
+/// release verbs are gate-deferred (finding 34's ordering — the owner
+/// still holds the grants) must serve its non-span custody (fsync /
+/// flush class) from the ino's CURRENT fencing token — rung 15's law
+/// carried across the lapse — never by acquiring whole-file exclusive
+/// custody against the live holders. On the cloud row this ladder idled
+/// all 32 ranks behind one ior barrier for 7–22 s per stall.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_episode_inos_fsync_never_acquires_whole_file_against_live_grants() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let _serial = serial();
+    let _restore = Restore;
+    let h = Arc::new(make(*b"ranged-ladder-36", "ranged-ladder-f36").await);
+    let auth = start_authority_be(
+        "ladder-authority-f36",
+        Some(h.fs.meta_backend.as_ref().unwrap().clone()),
+    );
+    let (ino, fh) = create_striped_open(&h, "f36.dat").await;
+    let _client = arm_cowriter(&auth, &h).await;
+
+    // A ranged write mints the grant + latches the episode.
+    const BLK: u64 = 4 * 1024 * 1024;
+    let written =
+        h.fs.write(
+            h.req,
+            ino,
+            fh,
+            0,
+            bytes::Bytes::from(vec![0x36u8; BLK as usize]),
+            0,
+            0,
+        )
+        .await
+        .expect("the ranged stripe write")
+        .written;
+    assert_eq!(written as u64, BLK);
+
+    // The lapse, field-shaped: the release gate reads BUSY (finding 34's
+    // deferral — the verb never departs), then the LOCAL leases drop.
+    // Owner-side the grant is guaranteed live.
+    struct GateGuard;
+    impl Drop for GateGuard {
+        fn drop(&mut self) {
+            data_grant::uninstall_release_gate();
+        }
+    }
+    let _gate_guard = GateGuard;
+    data_grant::install_release_gate(Arc::new(|_ino, _tok| false));
+    h.fs.invalidate_local_lease(ino);
+
+    // The contract: fsync completes promptly from the ino's CURRENT
+    // fencing token — zero whole-file acquisition, zero owner-side
+    // conflicts. Pre-fix: `acquire_write_lease` fell through to a
+    // shipped whole-file EX acquire, the owner refused it against the
+    // live grant on the 5 s wait budget, and the ladder retried.
+    let conflicts_before = data_grant::stats().conflicts;
+    let t0 = std::time::Instant::now();
+    h.fs.fsync(h.req, ino, fh, false)
+        .await
+        .expect("the episode fsync completes");
+    let wall = t0.elapsed();
+    assert!(
+        wall < Duration::from_secs(3),
+        "the episode fsync must not ride the whole-file conflict ladder \
+         (finding 36: took {wall:?} — one 5 s budget per retry idled all \
+         32 ranks per ior barrier on the acceptance row)"
+    );
+    assert_eq!(
+        data_grant::stats().conflicts,
+        conflicts_before,
+        "zero owner-side custody conflicts — the fsync never asked for \
+         whole-file custody over live grants"
+    );
+
+    drop(_gate_guard);
+    h.fs.release(h.req, ino, fh, 0, 0, false).await.unwrap();
+    auth.listener.shutdown();
+}

@@ -1266,3 +1266,31 @@ claims-scoped algebra) instead of persisting its stale snapshot.
 Corpses: `/tmp/f35-corpse` (pre-fix), `/tmp/f35-corpse2` (post-first-
 half, taped); the tape diagnostics stand re-armed UNCOMMITTED in the
 working tree.
+
+## Finding 35b closed (red `3f2ea31e`, fix `01089d92`): the local save's snapshot clobber — the venue's first clean oracles
+
+The tape's instant-cluster residue decoded: the AUTHORITY's LOCAL full
+Put persisted a whole map computed from a RAM snapshot under the ino's
+(3.5) section, and a served scoped Put that committed in between (serves
+hold the stripe, never 3.5) was reverted wholesale — six takes stranded
+per instant plus the blob-pair fork (`old_indirect_to_free` named the
+snapshot's belief, not the durable predecessor). The fix:
+`save_metadata_to_backend_ext`'s episode arm holds the serve stripe
+across fetch → compose → commit, adopts only the save's CLAIMED
+transitions onto the raw durable head, recomputes the accounting as the
+head→composed swap diff, and frees the durable predecessor's blob. A
+save that SHIPS never takes the window (`publishes_locally`) — the
+first cut held the stripe across the wire and self-deadlocked the
+owner's serve of that very publish (the ladder-suite wedge, caught by
+the suite in 90 s and fixed before commit).
+
+Verification: the two-pass aged-file repro read **0 C2 + 0 C8 on two
+consecutive from-zero rolls** — the first fully clean fsck oracles this
+venue has ever produced — with refused shipped frees at 0 and the
+32-rank read-back exact. The acceptance-shaped matrix probe read
+**C8 = 0 through a thermal A1 abort** (12 post-abort C2s are the
+adjudicated wrong-instrument artifact; the laptop's sustained gate
+remains the local wall). One pre-35b roll read 3 C2 (space-only blob
+residue, ≤1-in-3 rolls) — BOARD: the funnel-escape blob orphan, to be
+re-measured on a clean venue post-35b. 117 tests across six
+compose-adjacent suites green.

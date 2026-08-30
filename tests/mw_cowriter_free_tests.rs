@@ -4276,3 +4276,167 @@ async fn a_scoped_put_adopts_claimed_transitions_never_the_callers_stale_view() 
     drop(cwr);
     auth.stop().await;
 }
+
+/// Finding 35b (RED pre-fix: the local save persisted its whole RAM
+/// snapshot — the idx-0 read-back regresses to the stale key): the
+/// AUTHORITY's local save of a RANGE-EPISODE ino must COMPOSE its
+/// claimed transitions onto the DURABLE head under the serve stripe. A
+/// served scoped Put commits under the stripe but NOT under the ino's
+/// (3.5) section, so a local save whose dirty RAM snapshot predates the
+/// serve reverted the serve's entries wholesale (the two-pass aged-file
+/// residue: six takes stranded at one staging instant, the blob-pair
+/// fork beside them). The snapshot's unclaimed entries are its VIEW; the
+/// durable head keeps them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_episode_save_composes_onto_the_durable_head() {
+    use squeezefs::meta_backend::Metadata as _;
+    let _serial = serial();
+    let _restore = restore();
+    squeezefs::meta_ship::tokens::test_clear_range_cache();
+    let dir = TempDir::new().unwrap();
+    let vol = fresh_volume(dir.path(), "f35b-compose").await;
+    let dev = data_device(dir.path(), "f35b-compose.dev");
+    fuse_client::set_mount_posture(MountPosture::Writer);
+    let meta = squeezefs::meta_backend::open_routed_meta_set(&[vol.display().to_string()])
+        .await
+        .expect("the authority mounts");
+    let (alloc, _br) = data_plane(&dev).await;
+    alloc.engage_incarnations(
+        3,
+        squeezefs::meta_backend::kv::journal::AppendPartition::new(1, 0).expect("partition"),
+    );
+    let stage = tempdir().unwrap();
+    let dlm = DlmClient::new().expect("dlm");
+    let router = save_router(&dlm, &alloc, &dev, &meta, stage.path()).await;
+
+    // The custody plane: an armed owner + one RANGE grant latches the
+    // ino's sticky episode (the compose's gate); the grant then drops —
+    // stickiness is the point (the strand cluster fired in grant-lapse
+    // windows).
+    let owner = WriteCustodyOwner::arm(
+        "f35b-owner",
+        squeezefs::dlm::durable_term() + 1,
+        squeezefs::dlm::durable_term(),
+        LeaseClocks::with_params(
+            Duration::from_millis(3_000),
+            Duration::from_millis(200),
+            Duration::from_millis(400),
+        )
+        .expect("positive T_self"),
+        LeaseClock::manual(Arc::new(AtomicU64::new(1_000))),
+        None,
+    )
+    .expect("the custody authority arms");
+    data_grant::install_custody_owner(Arc::clone(&owner));
+
+    let ino = meta
+        .create_with_rdev_size(1, "f35b.bin", 0o100644, 0, 0, 0, 0)
+        .await
+        .expect("create")
+        .ino;
+    let lease = dlm
+        .acquire_lock_range(
+            &format!("inode_{ino}"),
+            (0, 4 * 1024 * 1024),
+            (0, 4 * 1024 * 1024),
+            Duration::from_secs(3),
+            Some((8 * 1024 * 1024, 4 * 1024 * 1024)),
+        )
+        .await
+        .expect("the episode-latching grant");
+    drop(lease);
+
+    // Three live lifetimes: the snapshot's stale idx-0 view, the SERVE's
+    // newer idx-0 binding, and this save's genuine idx-1 write.
+    let mut key_of = Vec::new();
+    for _ in 0..3 {
+        let off = alloc.allocate_block().await.expect("mint");
+        alloc.publish_block(off);
+        key_of.push(squeezefs::routing::block_key_with_incarnation(
+            &off.to_string(),
+            alloc.live_incarnation(off),
+        ));
+    }
+    let (k_old, k_serve, k_new) = (key_of[0].clone(), key_of[1].clone(), key_of[2].clone());
+
+    // The "serve": a direct backend commit the router's cache never saw
+    // (a served scoped Put bypasses the fs RAM plane — rung 18's shape).
+    let serve_head = bincode::serialize(&squeezefs::layout_wire::LayoutMetadata {
+        file_type: "striped".into(),
+        size: 8 * 1024 * 1024,
+        block_map_id: None,
+        block_prefix: None,
+        file_id: None,
+        data_key: None,
+        block_map: Some([(0u32, k_serve.clone())].into_iter().collect()),
+    })
+    .expect("head bytes");
+    meta.set_layout_and_size(ino, &serve_head, 8 * 1024 * 1024, &[])
+        .await
+        .expect("the serve's commit lands");
+
+    // The STALE dirty snapshot (predates the serve): idx 0 still names
+    // k_old. The dirty-authority law makes it the merge's base.
+    let mut stale_map = std::collections::HashMap::new();
+    stale_map.insert(0u32, k_old.clone());
+    router.metadata_cache.insert(
+        ino,
+        CachedMetadata {
+            file_type: "striped".into(),
+            size: 8 * 1024 * 1024,
+            block_map_id: None,
+            block_prefix: None,
+            file_id: None,
+            cached_at: std::time::Instant::now(),
+            data_key: None,
+            block_map: Some(Arc::new(stale_map)),
+            layout_dirty: true,
+            layout_delta_chain: 0,
+            layout_base_token: 0,
+            layout_version: 0,
+            block_map_id_own_mint: false,
+        },
+    );
+
+    // The local save: ONE claimed transition (idx 1 → k_new) through the
+    // one merge discipline.
+    let token = dlm.get_fencing_token_ino(ino);
+    let entries = [(1u32, k_new.clone())];
+    router
+        .merge_block_mappings(
+            ino,
+            squeezefs::routing::BlockMapOp::Merge(&entries),
+            0,
+            squeezefs::routing::LayoutFlip::KeepLayout,
+            token,
+        )
+        .await
+        .expect("the local episode save composes");
+
+    let durable = meta
+        .getxattr(ino, "layout")
+        .await
+        .expect("layout read")
+        .expect("the composed head persists");
+    let decoded =
+        squeezefs::layout_wire::decode_base_layout(&durable).expect("the head decodes inline");
+    let map = decoded.block_map.expect("the head carries its map");
+    assert_eq!(
+        map.get(&1).map(String::as_str),
+        Some(k_new.as_str()),
+        "the CLAIMED transition adopts (idx 1 -> this save's write)"
+    );
+    assert_eq!(
+        map.get(&0).map(String::as_str),
+        Some(k_serve.as_str()),
+        "the UN-CLAIMED snapshot entry is the save's stale VIEW — the durable \
+         head's serve-committed binding survives the local save (finding 35b: \
+         the aged-file strand cluster's mint)"
+    );
+
+    data_grant::uninstall_custody_owner();
+    squeezefs::meta_ship::tokens::test_clear_range_cache();
+    for v in &meta.volumes {
+        v.shutdown().await.expect("clean unmount");
+    }
+}

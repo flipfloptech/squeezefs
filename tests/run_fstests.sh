@@ -162,7 +162,10 @@ if ! grep -q 'squeezefs runner: force delegation fallback' src/locktest.c; then
         src/locktest.c
 fi
 
-if [ ! -f "src/open_by_handle" ]; then
+if [ ! -f "src/open_by_handle" ] || [ ! -f "tests/generic/group.list" ]; then
+    # Both halves: a make that died mid tests/ (e.g. the group-list
+    # build) leaves src/ complete but the auto group EMPTY — the
+    # compile-once guard must demand the group lists too.
     echo "Compiling xfstests..."
     # xfstests' m4/package_utilies.m4 resolves its build tools with
     # AC_PATH_PROG over HARDCODED FHS dirs (/bin:/usr/bin:...), which are

@@ -803,15 +803,35 @@ pub fn demoted_regions(ino: u64) -> Vec<(u64, u64)> {
         .unwrap_or_default()
 }
 
-/// Does `ino` carry any LIVE byte-range grant (rung 18)? The local-
-/// publish serve-window guard's predicate: an authority's OWN layout
-/// publish of a range-granted ino must serialize with the served scoped
-/// Puts (whose read→compose→commit spans the serve stripe) — one map
-/// probe, `false` on every file without range custody.
+/// Finding 35: inos that have EVER minted a byte-range grant this mount
+/// session — the serve-window guard's sticky predicate (one u64 per
+/// ranged ino, mount-lifetime; the client-side twin is
+/// `meta_ship::tokens::RANGE_EPISODES`).
+static RANGE_EPISODE_INOS: once_cell::sync::Lazy<scc::HashSet<u64>> =
+    once_cell::sync::Lazy::new(scc::HashSet::new);
+
+/// Test seam: drop the sticky range-episode latches (rides
+/// `meta_ship::tokens::test_clear_range_cache` — suites share one
+/// process and re-mint low inos).
+#[doc(hidden)]
+pub fn test_clear_range_episodes() {
+    RANGE_EPISODE_INOS.retain_sync(|_| false);
+}
+
+/// Does `ino` carry any LIVE byte-range grant (rung 18), or has it ever
+/// minted one this session (finding 35 — the STICKY episode half)? The
+/// local-publish serve-window guard's predicate: an authority's OWN
+/// layout publish of a range-episode ino must serialize with the served
+/// scoped Puts (whose read→compose→commit spans the serve stripe). Live
+/// grants alone left grant-lapse windows (pass boundaries, close storms)
+/// where a local publish skipped the stripe and forked the ino's blob
+/// chain mid-serve — the aged-file strand mint. One set probe; `false`
+/// on every file that never carried range custody.
 pub fn ino_has_range_custody(ino: u64) -> bool {
-    LOCK_MAP
-        .read_sync(&ObjectKey::Ino(ino), |_, custody| custody.ranges_len() > 0)
-        .unwrap_or(false)
+    RANGE_EPISODE_INOS.contains_sync(&ino)
+        || LOCK_MAP
+            .read_sync(&ObjectKey::Ino(ino), |_, custody| custody.ranges_len() > 0)
+            .unwrap_or(false)
 }
 
 /// The §9.3 loser-law tripwire: a version-gate-fenced direct publish
@@ -1380,6 +1400,16 @@ impl LocalLockManager {
             );
             log::error!("{reason}");
             return Err(crate::error::SqueezefsError::LockFailed { reason });
+        }
+        // Finding 35: the STICKY range-episode latch (the owner-side twin
+        // of the client's `tokens::range_episode`) — set BEFORE the grant
+        // mints so `ino_in_range_episode` has no un-latched window. The
+        // serve-window guard keys on it: gating on LIVE grants alone left
+        // grant-lapse windows (pass boundaries, close storms) where the
+        // authority's local publishes skipped the serve stripe and forked
+        // an ino's blob chain mid-serve (the aged-file strand mint).
+        if let Some(ino) = ino_of_path(file_path) {
+            let _ = RANGE_EPISODE_INOS.insert_sync(ino);
         }
         let scope = merge_scope.unwrap_or(self.client_nonce);
         let span_cap = geometry.map(|(size, block)| range_span_cap(size, block));

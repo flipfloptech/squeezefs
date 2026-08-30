@@ -1500,8 +1500,12 @@ pub async fn merge_layout_and_size(
             // the un-chained gate would refuse (then full-Put-clobber the
             // peers' blocks). One relaxed probe on every solo mount
             // (`custody_owner()` is None).
+            // Finding 35: the chain decision is STICKY like the serve
+            // window (dlm::ino_has_range_custody carries the episode
+            // latch) — a lapse-window unchained local merge full-Put
+            // re-bases with a private view, forking the ino's chain.
             let granted = crate::data_grant::custody_owner()
-                .map(|o| o.ino_granted(ino))
+                .map(|o| o.ino_granted(ino) || crate::dlm::ino_has_range_custody(ino))
                 .unwrap_or(false);
             let _serve_window = local_publish_guard(ino).await;
             if granted {
@@ -2866,11 +2870,23 @@ impl PublishService {
     /// The third return value is the compose's blob custody (RES-9
     /// guard, post-commit frees, and the drop-caller-blob-ops verdict) —
     /// `Default` on every verbatim arm.
+    /// Finding 35 (`claims`): the caller's OWN refs frame — the exact
+    /// transitions its writes performed (the deferred-delta drain + this
+    /// save's ops). The compose adopts an in-custody caller entry ONLY
+    /// where the frame CLAIMS a take at that index, and removes an
+    /// in-custody absent binding only where it claims a release: a full
+    /// Put names the caller's WHOLE map, and the un-claimed remainder is
+    /// its VIEW of blocks it never wrote — legitimately stale on an aged
+    /// file, and adopting it regressed live bindings to prior
+    /// still-live keys (the f28 probe only drops DEAD incarnations),
+    /// stranding the durable ledger (the two-pass aged-file C8/C2 mint:
+    /// take → release → release → re-take across three holders' serves).
     async fn custody_scoped_layout(
         &self,
         client: &str,
         ino: u64,
         shipped: Vec<u8>,
+        claims: &[BlockRefOp],
     ) -> Result<(Vec<u8>, Option<Vec<BlockRefOp>>, ScopedBlobCustody)> {
         let Some(owner) = crate::data_grant::custody_owner() else {
             return Ok((shipped, None, ScopedBlobCustody::default()));
@@ -3040,15 +3056,46 @@ impl PublishService {
             spans.iter().any(|&(s, e)| e > bs && s < be)
                 && !demoted.iter().any(|&(s, e)| e > bs && s < be)
         };
+        // Finding 35: the caller's CLAIM sets — the indices its refs
+        // frame says it took / released. View ≠ claim: everything else
+        // in its full-Put map is a snapshot of blocks it never wrote.
+        let mut claim_take: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut claim_release: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for op in claims {
+            if op.reference.is_map_blob() || op.reference.owner_ino != ino {
+                continue;
+            }
+            if op.take {
+                claim_take.insert(op.reference.block_index);
+            } else {
+                claim_release.insert(op.reference.block_index);
+            }
+        }
         // Rung 19: the pre-compose head — what the accounting diffs
         // against (the map the composition displaces FROM).
         let head = map.clone();
-        map.retain(|b, _| !(in_custody(*b) && !new_map.contains_key(b)));
+        // Finding 35 (the removal half): an in-custody binding ABSENT
+        // from the caller's map is removed only under a RELEASE claim
+        // with no take (a truncate/punch the caller performed) — absence
+        // alone is its stale view (an aged-file holder legitimately
+        // lacks bindings its peers minted after its last refetch).
+        map.retain(|b, _| {
+            !(in_custody(*b)
+                && !new_map.contains_key(b)
+                && claim_release.contains(b)
+                && !claim_take.contains(b))
+        });
         // Finding 28: the caller's adopted entries pass the binding probe
         // (a dead-incarnation entry drops; the durable's stands).
+        // Finding 35 (the adoption half): adoption additionally requires
+        // the caller's TAKE claim at the index — an in-custody entry
+        // without one is its stale VIEW of a block it never wrote, and
+        // adopting it regressed live bindings to prior still-LIVE keys
+        // (the f28 probe cannot catch a not-yet-freed displaced key),
+        // minting the aged-file strand storm.
         let mut adopt: Vec<(u32, String)> = new_map
             .into_iter()
-            .filter(|(b, _)| in_custody(*b))
+            .filter(|(b, _)| in_custody(*b) && claim_take.contains(b))
             .collect();
         retain_live_bindings(&mut adopt, ino);
         for (b, k) in adopt {
@@ -3233,8 +3280,9 @@ impl PublishService {
                 ..
             } => {
                 let refs: Vec<BlockRefOp> = refs.into_iter().map(BlockRefOp::from).collect();
-                let (layout, recomputed, mut blob_custody) =
-                    self.custody_scoped_layout(client, ino, layout).await?;
+                let (layout, recomputed, mut blob_custody) = self
+                    .custody_scoped_layout(client, ino, layout, &refs)
+                    .await?;
                 // Rung 19: on the SCOPED arm the accounting is the
                 // composition's own diff; the caller's MAP-BLOB ops (the
                 // indirect blob custody transfer — index-disjoint from

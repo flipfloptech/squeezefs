@@ -655,6 +655,9 @@ pub fn replace_range_grants(entries: &[(u64, (u64, u64), u64)]) {
 pub fn test_clear_range_cache() {
     clear_range_grants();
     RANGE_EPISODES.retain_sync(|_| false);
+    // Finding 35: the owner-side sticky episode latch clears with the
+    // client's (one seam — suites share one process and re-mint low inos).
+    crate::dlm::test_clear_range_episodes();
 }
 
 /// Register `dlm_token_cache_bytes` with the R5 authority (§9.2: the

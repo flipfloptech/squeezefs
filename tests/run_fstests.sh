@@ -95,6 +95,14 @@ SQUEEZEFS_BIN="$REPO_DIR/target/release/squeezefs"
 
 # 3. Clone and compile xfstests-dev if not already done
 XFSTESTS_DIR="/tmp/xfstests-dev"
+# A cached checkout that never produced include/builddefs is a FAILED
+# configure's residue — its config.cache pins the stale host environment
+# and every retry dies with a misleading "make does not seem to be
+# installed". Refresh it; a fully built checkout is still reused.
+if [ -d "$XFSTESTS_DIR" ] && [ ! -f "$XFSTESTS_DIR/include/builddefs" ]; then
+    echo "Refreshing stale xfstests checkout (configure residue, no builddefs)..."
+    rm -rf "$XFSTESTS_DIR"
+fi
 if [ ! -d "$XFSTESTS_DIR" ]; then
     echo "Cloning xfstests-dev..."
     git clone --depth 1 https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git "$XFSTESTS_DIR"

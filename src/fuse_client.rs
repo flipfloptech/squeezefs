@@ -12378,6 +12378,21 @@ impl SqueezefsFilesystem {
         if let Some(token) = self.newest_range_token(ino) {
             return Ok(token);
         }
+        // Finding 36 (attempt 15's A2 rank stall): rung 15's law carried
+        // across the GRANT LAPSE — an EPISODE ino whose local range
+        // leases retired (close, invalidate, shrink churn) while its
+        // release verbs are gate-deferred (finding 34's ordering: the
+        // owner still holds the grants) serves its non-span custody
+        // (fsync/flush class) from the ino's CURRENT fencing token. The
+        // whole-file EX fallback shipped an acquire that CONFLICTED with
+        // the live holders — this mount's own deferred grants included —
+        // and its 5 s refusal ladder idled all 32 ranks behind one ior
+        // barrier for 7–22 s per stall. Fencing checks arbitrate
+        // staleness downstream exactly as they do for the live-grant
+        // token above; span writes still acquire real ranged custody.
+        if crate::meta_ship::tokens::range_episode(ino) {
+            return Ok(self.dlm.get_fencing_token_ino(ino));
+        }
 
         let file_path = crate::keys::inode_path(ino);
         let start_dlm = std::time::Instant::now();

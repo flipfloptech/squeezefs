@@ -258,7 +258,8 @@ case ",$OPTS," in
     # the existing fuse params on reconfigure, which kernel fuse refuses
     # ("No changes allowed in reconfigure"); the classic mount(2)
     # MS_REMOUNT path flips the VFS flags only.
-    LIBMOUNT_FORCE_MOUNT2=always exec /usr/bin/mount -i -o "$OPTS" "$MNT"
+    # `mount` from the helper's baked PATH — /usr/bin/mount is FHS-only.
+    LIBMOUNT_FORCE_MOUNT2=always exec mount -i -o "$OPTS" "$MNT"
     ;;
 esac
 
@@ -279,7 +280,7 @@ LOG="/tmp/squeezefs_fstests_${TAG}.log"
 LIVE_MNT="$(pgrep -af "squeezefs mount sqmeta://$DEV " 2>/dev/null | head -1 | \
     sed -nE "s#.*squeezefs mount sqmeta://$DEV ([^ ]+) .*#\1#p")"
 if [ -n "$LIVE_MNT" ] && [ "$LIVE_MNT" != "$MNT" ] && mountpoint -q "$LIVE_MNT" 2>/dev/null; then
-    exec /usr/bin/mount --bind "$LIVE_MNT" "$MNT"
+    exec mount --bind "$LIVE_MNT" "$MNT"
 fi
 
 # xfstests' `umount` returns while the previous daemon is still draining

@@ -183,9 +183,27 @@ fi
 sed -i 's/setfattr -h --restore=/setfattr -hP --restore=/' tests/generic/062
 
 # 4. Install mount and mkfs helpers
-echo "Installing FUSE helpers in /sbin..."
+# libmount resolves `mount -t fuse.squeezefs` through its COMPILED
+# fs-search path — plain /sbin on FHS hosts, but e.g. NixOS builds it
+# with /run/wrappers/bin:/run/current-system/sw/bin:/sbin and ships no
+# /sbin at all. Install the helpers into the first root-writable
+# member so mount(8) actually finds them; FHS hosts keep /sbin.
+HELPER_DIR=/sbin
+if [ ! -d "$HELPER_DIR" ]; then
+    for d in /run/wrappers/bin /run/current-system/sw/bin; do
+        if [ -d "$d" ] && [ -w "$d" ]; then
+            HELPER_DIR="$d"
+            break
+        fi
+    done
+fi
+if [ ! -d "$HELPER_DIR" ]; then
+    echo "ERROR: no writable mount-helper dir (tried /sbin, /run/wrappers/bin)" >&2
+    exit 1
+fi
+echo "Installing FUSE helpers in $HELPER_DIR..."
 
-cat << EOF > /sbin/mount.fuse.squeezefs
+cat << EOF > $HELPER_DIR/mount.fuse.squeezefs
 #!/usr/bin/env bash
 # mount(8) helper for -t fuse.squeezefs. Contract: silent on success (stdout
 # leaks into xfstests golden output), non-zero + stderr on failure, and the
@@ -193,8 +211,9 @@ cat << EOF > /sbin/mount.fuse.squeezefs
 set -u
 SQUEEZEFS_BIN="$SQUEEZEFS_BIN"
 SCRATCH_DEV="$SCRATCH_DEV"
+HELPER_DIR="$HELPER_DIR"
 EOF
-cat << 'EOF' >> /sbin/mount.fuse.squeezefs
+cat << 'EOF' >> $HELPER_DIR/mount.fuse.squeezefs
 DEV="$1"
 MNT="$2"
 shift 2
@@ -292,7 +311,7 @@ if [ "$DEV" = "$SCRATCH_DEV" ] && [ -e "$DEV" ]; then
             echo "mount.fuse.squeezefs: scratch superblock magic gone" \
                  "(raw-clobber class, e.g. generic/515) — re-mkfs $DEV"
         } >> "$LOG" 2>&1
-        if ! /sbin/mkfs.fuse.squeezefs "$DEV" >> "$LOG" 2>&1; then
+        if ! $HELPER_DIR/mkfs.fuse.squeezefs "$DEV" >> "$LOG" 2>&1; then
             echo "mount.fuse.squeezefs: raw-clobber re-mkfs of $DEV failed; see $LOG" >&2
             exit 32
         fi
@@ -343,9 +362,9 @@ if [ $rc -ne 0 ]; then
 fi
 exit 0
 EOF
-chmod +x /sbin/mount.fuse.squeezefs
+chmod +x $HELPER_DIR/mount.fuse.squeezefs
 
-cat << EOF > /sbin/mkfs.fuse.squeezefs
+cat << EOF > $HELPER_DIR/mkfs.fuse.squeezefs
 #!/usr/bin/env bash
 set -u
 SQUEEZEFS_BIN="$SQUEEZEFS_BIN"
@@ -353,7 +372,7 @@ META_SIZE="$META_SIZE"
 DATA_SIZE="$DATA_SIZE"
 FORMAT_EXTRA_ARGS="${SQUEEZEFS_FSTESTS_FORMAT_ARGS:-}"
 EOF
-cat << 'EOF' >> /sbin/mkfs.fuse.squeezefs
+cat << 'EOF' >> $HELPER_DIR/mkfs.fuse.squeezefs
 DEV="$1"
 DATA_DEV="${DEV/_meta/_data}"
 
@@ -379,7 +398,7 @@ exec "$SQUEEZEFS_BIN" format \
     --disk-cache-paths "$STAGING_DIR" \
     --force $FORMAT_EXTRA_ARGS
 EOF
-chmod +x /sbin/mkfs.fuse.squeezefs
+chmod +x $HELPER_DIR/mkfs.fuse.squeezefs
 
 # UMOUNT_PROG wrapper: a freshly armed FUSE-over-io_uring mount holds a
 # kernel-side reference for up to ~100ms after mount(8) returns, so the
@@ -388,11 +407,11 @@ chmod +x /sbin/mkfs.fuse.squeezefs
 # leak still fails after the 5s budget. Silent on eventual success so no
 # noise reaches golden output.
 UMOUNT_REAL="$(type -P umount)"
-cat << EOF > /sbin/umount.squeezefs-fstests
+cat << EOF > $HELPER_DIR/umount.squeezefs-fstests
 #!/usr/bin/env bash
 UMOUNT_REAL="$UMOUNT_REAL"
 EOF
-cat << 'EOF' >> /sbin/umount.squeezefs-fstests
+cat << 'EOF' >> $HELPER_DIR/umount.squeezefs-fstests
 rc=0
 for _ in $(seq 1 100); do
     ERR=$("$UMOUNT_REAL" "$@" 2>&1)
@@ -410,7 +429,7 @@ done
 [ -n "$ERR" ] && echo "$ERR" >&2
 exit $rc
 EOF
-chmod +x /sbin/umount.squeezefs-fstests
+chmod +x $HELPER_DIR/umount.squeezefs-fstests
 
 # 5. Create local.config
 echo "Configuring xfstests local.config..."
@@ -427,12 +446,12 @@ export SCRATCH_DEV=$SCRATCH_DEV
 # common/config sets UMOUNT_PROG before sourcing this file; override it so
 # every harness unmount rides the EBUSY-retry wrapper installed by
 # tests/run_fstests.sh.
-export UMOUNT_PROG=/sbin/umount.squeezefs-fstests
+export UMOUNT_PROG=$HELPER_DIR/umount.squeezefs-fstests
 EOF
 
 # Pre-format TEST_DEV and SCRATCH_DEV once since xfstests doesn't mkfs them for FUSE
-/sbin/mkfs.fuse.squeezefs "$TEST_DEV"
-/sbin/mkfs.fuse.squeezefs "$SCRATCH_DEV"
+$HELPER_DIR/mkfs.fuse.squeezefs "$TEST_DEV"
+$HELPER_DIR/mkfs.fuse.squeezefs "$SCRATCH_DEV"
 
 # 6. Run fstests
 #

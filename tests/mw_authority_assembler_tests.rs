@@ -110,6 +110,12 @@ impl Drop for Restore {
         extent_ship::test_swap_retention_budget(None);
         extent_ship::uninstall_spill_sink();
         extent_ship::uninstall_quiesce_hook();
+        // Finding 35: the sticky range-episode latches (client cache +
+        // the owner-side dlm set) are process-global and this suite's
+        // sandboxes re-mint low inos — a prior test's episode must not
+        // put a later test's pre-custody establishing Put on the
+        // claims-scoped compose arm.
+        squeezefs::meta_ship::tokens::test_clear_range_cache();
     }
 }
 
@@ -1751,7 +1757,15 @@ async fn a_shipped_full_put_is_custody_scoped_and_never_erases_a_peer() {
             ino,
             layout: base_layout_bytes(4 * BLOCK, &[(0, "be://data:mine0")]),
             size: 4 * BLOCK,
-            refs: Vec::new(),
+            // Finding 35: adoption requires the shipper's take CLAIM at
+            // the index — production saves always carry them (§6.2).
+            refs: vec![publish::WireBlockRefOp {
+                vol_tag: 1,
+                block_idx: 0,
+                owner_ino: ino,
+                block_index: 0,
+                take: true,
+            }],
             lease_epoch: epoch,
             request_id: 0xF2,
         },
@@ -1779,7 +1793,14 @@ async fn a_shipped_full_put_is_custody_scoped_and_never_erases_a_peer() {
             ino,
             layout: base_layout_bytes(4 * BLOCK, &[]),
             size: 4 * BLOCK,
-            refs: Vec::new(),
+            // Finding 35: removal-by-absence requires the release CLAIM.
+            refs: vec![publish::WireBlockRefOp {
+                vol_tag: 1,
+                block_idx: 0,
+                owner_ino: ino,
+                block_index: 0,
+                take: false,
+            }],
             lease_epoch: epoch,
             request_id: 0xF3,
         },
@@ -2123,7 +2144,14 @@ async fn the_production_range_geometry_arms_the_scoped_put() {
             ino,
             layout: base_layout_bytes(4 * BLOCK, &[(0, "be://data:mine0v2")]),
             size: 4 * BLOCK,
-            refs: Vec::new(),
+            // Finding 35: the claim frame rides every production save.
+            refs: vec![publish::WireBlockRefOp {
+                vol_tag: 1,
+                block_idx: 0,
+                owner_ino: ino,
+                block_index: 0,
+                take: true,
+            }],
             lease_epoch: epoch,
             request_id: 0xE4,
         },
@@ -2304,7 +2332,25 @@ async fn a_scoped_put_never_reverts_a_demoted_blocks_assembly() {
                 ino,
                 layout: put,
                 size: 2 * BLOCK,
-                refs: vec![],
+                // Finding 35: claims for BOTH indices — the demoted
+                // region must outrank even a CLAIMED adoption (the
+                // authority is a demoted block's single publisher).
+                refs: vec![
+                    publish::WireBlockRefOp {
+                        vol_tag: 1,
+                        block_idx: 0,
+                        owner_ino: ino,
+                        block_index: 0,
+                        take: true,
+                    },
+                    publish::WireBlockRefOp {
+                        vol_tag: 1,
+                        block_idx: 1,
+                        owner_ino: ino,
+                        block_index: 1,
+                        take: true,
+                    },
+                ],
                 lease_epoch: epoch,
                 request_id: 0xD3,
             },

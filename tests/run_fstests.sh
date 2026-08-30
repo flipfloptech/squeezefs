@@ -219,6 +219,7 @@ cat << EOF > $HELPER_DIR/mount.fuse.squeezefs
 # leaks into xfstests golden output), non-zero + stderr on failure, and the
 # mount is usable when we return.
 set -u
+export PATH="$PATH"
 SQUEEZEFS_BIN="$SQUEEZEFS_BIN"
 SCRATCH_DEV="$SCRATCH_DEV"
 HELPER_DIR="$HELPER_DIR"
@@ -377,6 +378,7 @@ chmod +x $HELPER_DIR/mount.fuse.squeezefs
 cat << EOF > $HELPER_DIR/mkfs.fuse.squeezefs
 #!/usr/bin/env bash
 set -u
+export PATH="$PATH"
 SQUEEZEFS_BIN="$SQUEEZEFS_BIN"
 META_SIZE="$META_SIZE"
 DATA_SIZE="$DATA_SIZE"
@@ -419,6 +421,7 @@ chmod +x $HELPER_DIR/mkfs.fuse.squeezefs
 UMOUNT_REAL="$(type -P umount)"
 cat << EOF > $HELPER_DIR/umount.squeezefs-fstests
 #!/usr/bin/env bash
+export PATH="$PATH"
 UMOUNT_REAL="$UMOUNT_REAL"
 EOF
 cat << 'EOF' >> $HELPER_DIR/umount.squeezefs-fstests

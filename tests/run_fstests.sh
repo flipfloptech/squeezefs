@@ -725,13 +725,18 @@ SQUEEZEFS_FSTESTS_QUICK=(
     generic/504 generic/525 generic/533 generic/551 generic/590
     generic/616 generic/617
     generic/618 generic/631 generic/683 generic/732 generic/795
+    generic/798
 )
 
 # ---------------------------------------------------------------------------
 # FAIL FAST (standing user rule, 2026-07-22): full and QUICK runs abort at
 # the FIRST unexpected failure — nonzero exit, artifacts preserved, the
 # failing test named loudly. The adjudicated by-design set (003/192 noatime,
-# 213 thin provisioning) continues ONLY when its failure diff matches the
+# 213 thin provisioning, 798 write-through — no FUSE_WRITEBACK_CACHE, so a
+# buffered write's kernel page is CLEAN the instant write(2) returns: the
+# daemon owns the bytes under the never-lossy custody law and 'Dirty: 0'
+# is the honest cachestat report; adjudicated 2026-08-30) continues ONLY
+# when its failure diff matches the
 # pinned expected shape EXACTLY; any other diff on those tests aborts too.
 # Single-test invocations (explicit args) keep the classic one-shot check.
 # xfstests' check has no first-class fail-fast, so the full run expands
@@ -820,6 +825,29 @@ EOF
     generic/213) cat <<'EOF'
 4d3
 < fallocate: No space left on device
+EOF
+        ;;
+    generic/798) cat <<'EOF'
+3c3
+< Cached: 1, Dirty: 1, Writeback: 0, Evicted: 0, Recently Evicted: 0
+---
+> Cached: 1, Dirty: 0, Writeback: 0, Evicted: 0, Recently Evicted: 0
+6c6
+< Cached: 2, Dirty: 2, Writeback: 0, Evicted: 0, Recently Evicted: 0
+---
+> Cached: 2, Dirty: 0, Writeback: 0, Evicted: 0, Recently Evicted: 0
+9c9
+< Cached: 4, Dirty: 4, Writeback: 0, Evicted: 0, Recently Evicted: 0
+---
+> Cached: 4, Dirty: 0, Writeback: 0, Evicted: 0, Recently Evicted: 0
+12c12
+< Cached: 8, Dirty: 8, Writeback: 0, Evicted: 0, Recently Evicted: 0
+---
+> Cached: 8, Dirty: 0, Writeback: 0, Evicted: 0, Recently Evicted: 0
+15c15
+< Cached: 16, Dirty: 16, Writeback: 0, Evicted: 0, Recently Evicted: 0
+---
+> Cached: 16, Dirty: 0, Writeback: 0, Evicted: 0, Recently Evicted: 0
 EOF
         ;;
     generic/634) cat <<'EOF'

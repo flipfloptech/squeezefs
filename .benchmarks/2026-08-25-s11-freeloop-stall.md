@@ -1357,3 +1357,38 @@ whole-file conflict parks 5+ → **0** fleet-wide across two 14-iteration
 passes; pass-2's 2–3 deep stalls (465–1,060 MiB/s) → one mild 710 dip
 on a thermally-loaded box; the oracle stays C8-clean. 136 tests across
 six suites green.
+
+## Attempt 16 / 16b (2026-08-30, cloud i4i.8xlarge, binary `8e4a2cab` — f36 landed): **THE S11-MPIIO ACCEPTANCE ROW IS GREEN**
+
+One cluster, two rows (~50 min total, torn down, nothing billing).
+
+**16 (first row):** oracle CLEAN (findings: 0), engagement green, zero
+custody-conflict ladders anywhere (finding 36's class dead on the
+wire), A2 steady mean 1,992 MiB/s at PARITY with A1's 1,986 — and the
+sustained gate still failed it: the flatness check compared two SINGLE
+endpoint samples (first vs last steady iteration) and one residual
+2–4 s device-side dip (`write_pipeline_phase_ns.dma <=2s/<=4s` — no
+custody involvement, present on passing rows too) landed on the last
+sample. The instrument violated its own documented law ("no decay
+beyond noise between the first and last THIRD" — the 2026-07-29
+sustained-state rule): fixed to the thirds-mean comparison, verified
+against three known rows (attempt-16-A2 PASS, attempt-15-A2 PASS,
+the laptop's genuine thermal 3069→1464 slide FAIL).
+
+**16b (same cluster, re-run):** `s11-mpiio GREEN` end to end —
+- **Perf**: A-B-B-A shared/disjoint **0.964 / 1.043** (gate ≥ 0.8×
+  both brackets); all four phases through the sustained thirds gate
+  (A1 1,854 / B1 1,923 / B2 1,924 / A2 2,007 MiB/s steady).
+- **Engagement**: GREEN — ranged custody engaged on every mount
+  (~15k acquires+extensions, ~96k shipped publishes per co-writer),
+  authority conflicts d=2 across the whole row, prs/ors 0, zero
+  fabricated sharing, Issue-19 column 0.
+- **Oracle**: `findings: 0 (clean)` (7 suspects raised, 7 cleared).
+- **Read-back exact**: 41,495 MiB/s aggregate reorder-read, zero
+  data-check errors.
+
+Artifacts: `.benchmarks/cloud/2026-08-30-093249` (16) +
+`.benchmarks/cloud/2026-08-30-094130` (16b, the GREEN row). The PR 5
+acceptance rung (design-full-multi-writer §s11-mpiio, the free-grace-
+sustain campaign's gate) is **MET** on the real-fabric venue with
+findings 22–36 closed under it.

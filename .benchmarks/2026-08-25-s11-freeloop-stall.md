@@ -1327,3 +1327,33 @@ comparison: the 31k tail-shrink demotions and the authority's ~5 GiB of
 indirect-map re-reads are identical on the passing row. Likely the same
 lineage as the boarded ior fsync(15)/size warnings. Artifacts:
 `.benchmarks/cloud/2026-08-30-070620/` + `/tmp/attempt15-post/`.
+
+## Finding 36 closed (red `70fdf114`, fix `e3f20090`): the A2 rank stall was a whole-file custody ladder
+
+The 1 Hz sampler + timestamped iterations decoded attempt 15's stalls:
+a 14–22 s fleet-wide QUIET window per stall — every counter flat, the
+grace ring parked at 79–86 % pressure — while ONE rank sat in
+`data_grant` refusals: `refusing custody of inode_2 None … still held
+after 5s wait budget`, three per stall, timestamps exactly inside the
+window. The free-grace suspicion was the wrong branch (alloc_stalls 0;
+the ring's quiet was the SYMPTOM of the fleet idling, not the cause);
+the phase histograms named the write/custody path (37 transport totals
+at 8–16 s, custody RTTs at 4–8 s).
+
+Mechanism: the aged-shared phase's shrink/demotion churn retires a
+rank's LOCAL range leases; its next fsync finds no live range token
+(`newest_range_token` = None) and falls back to WHOLE-FILE EX
+acquisition — shipped, CONFLICTING with 31 live holders (its own
+finding-34 gate-deferred grants included), refused on the 5 s budget,
+retried. One rank's ladder idles all 32 at the ior barrier.
+
+Fix: rung 15's law carried across the lapse — `acquire_write_lease`'s
+non-span fallback serves an EPISODE ino (`tokens::range_episode`) from
+the ino's CURRENT fencing token; fencing checks arbitrate staleness
+downstream verbatim, span writes still acquire real ranged custody.
+Red: deterministic (busy release gate pins the owner-side grant live,
+local leases dropped, fsync burned the ladder to EIO in 13 s). Field:
+whole-file conflict parks 5+ → **0** fleet-wide across two 14-iteration
+passes; pass-2's 2–3 deep stalls (465–1,060 MiB/s) → one mild 710 dip
+on a thermally-loaded box; the oracle stays C8-clean. 136 tests across
+six suites green.

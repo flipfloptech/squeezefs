@@ -139,6 +139,27 @@ if [ ! -x /usr/bin/perl ] && command -v perl >/dev/null; then
     rewrite_fhs_literal /usr/bin/perl "$(type -P perl)"
 fi
 
+# generic/452 copies `$(type -P ls)` onto the scratch fs and EXECUTES
+# the copy under a different name — a multi-call coreutils (nix)
+# dispatches on argv[0] and refuses ("unknown program 'ls_on_scratch'").
+# Behavior-gated shim: when the host's ls cannot run renamed, a
+# standalone-ls script resolves first in PATH; copied under any name it
+# still works, and the test's intent (exec a file living on the tested
+# filesystem) is fully preserved. FHS hosts with single-call coreutils
+# never enter.
+LS_REAL="$(type -P ls)"
+LS_PROBE="$(mktemp /tmp/.sqz_ls_probe.XXXXXX)"
+cp "$LS_REAL" "$LS_PROBE" && chmod +x "$LS_PROBE"
+if ! "$LS_PROBE" -d / >/dev/null 2>&1; then
+    SHIM_DIR=/tmp/squeezefs-fstests-shims
+    mkdir -p "$SHIM_DIR"
+    printf '#!%s\nexec %s --coreutils-prog=ls "$@"\n' \
+        "$(type -P bash)" "$(dirname "$LS_REAL")/coreutils" > "$SHIM_DIR/ls"
+    chmod +x "$SHIM_DIR/ls"
+    export PATH="$SHIM_DIR:$PATH"
+fi
+rm -f "$LS_PROBE"
+
 cd "$XFSTESTS_DIR"
 # xfstests requires the fsgqa user/group; keep this OUTSIDE the
 # compile-once guard so cached-suite runs repair it too. -m / the home
